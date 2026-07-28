@@ -178,10 +178,12 @@ void test('snapshotte les entrées mutables pour conserver l’événement et so
   const snapshottedValues = snapshottedMetadata.values;
   assert.ok(Array.isArray(snapshottedValues));
   assert.ok(Object.isFrozen(snapshottedValues));
+  assert.ok(Object.isFrozen(launchEvent.payload));
   assert.equal(tradeEvent.id, tradeId);
   assert.equal(tradeEvent.cursor.innerInstructionIndex, 0);
   assert.equal(tradeEvent.payload.trade.cursor.innerInstructionIndex, 0);
   assert.equal(tradeEvent.payload.trade.quoteAsset.mint, SOL.mint);
+  assert.ok(Object.isFrozen(tradeEvent.payload));
 });
 
 void test('rejette les valeurs de paramètres non normalisées avec leur chemin', () => {
@@ -190,6 +192,9 @@ void test('rejette les valeurs de paramètres non normalisées avec leur chemin'
     new Map([['value', 1]]),
     1.5,
     Number.MAX_SAFE_INTEGER + 1,
+    undefined,
+    Symbol('parameter'),
+    () => undefined,
   ]) {
     assert.throws(
       () => createTokenLaunchDetectedEvent({
@@ -204,6 +209,40 @@ void test('rejette les valeurs de paramètres non normalisées avec leur chemin'
       (error: unknown) =>
         error instanceof UnsupportedLaunchParameterValueError
         && error.message.includes('parameters.invalid'),
+    );
+  }
+});
+
+void test('préserve __proto__ comme donnée propre et rejette les clés ou structures non normalisées', () => {
+  const protoParameter: Record<string, unknown> = {};
+  Object.defineProperty(protoParameter, '__proto__', {
+    value: 'preserved', enumerable: true, configurable: true, writable: true,
+  });
+  const protoEvent = createTokenLaunchDetectedEvent({
+    source: 'pumpfun', program: PROGRAM, transaction,
+    launch: { ...launch, parameters: protoParameter as TokenLaunch['parameters'] },
+  });
+  assert.equal(Object.getPrototypeOf(protoEvent.payload.launch.parameters), Object.prototype);
+  assert.equal(Object.hasOwn(protoEvent.payload.launch.parameters, '__proto__'), true);
+  assert.equal(protoEvent.payload.launch.parameters.__proto__, 'preserved');
+
+  const symbolParameter = Symbol('hidden');
+  const withSymbolKey = { valid: true, [symbolParameter]: true };
+  const sparse = [1] as unknown[];
+  sparse.length = 2;
+  const objectCycle: Record<string, unknown> = {};
+  objectCycle.self = objectCycle;
+  const arrayCycle: unknown[] = [];
+  arrayCycle.push(arrayCycle);
+  for (const invalidValue of [withSymbolKey, sparse, objectCycle, arrayCycle]) {
+    assert.throws(
+      () => createTokenLaunchDetectedEvent({
+        source: 'pumpfun', program: PROGRAM, transaction,
+        launch: { ...launch, parameters: { invalid: invalidValue } as TokenLaunch['parameters'] },
+      }),
+      (error: unknown) =>
+        error instanceof UnsupportedLaunchParameterValueError
+        && error.path.startsWith('parameters.invalid'),
     );
   }
 });

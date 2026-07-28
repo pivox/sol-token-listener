@@ -75,7 +75,7 @@ export function createTokenLaunchDetectedEvent(
     blockchainTimeMs: transaction.blockTimeMs,
     observedAtMs: transaction.observedAtMs,
     payloadVersion: 1,
-    payload: { launch },
+    payload: freezeSnapshot({ launch }),
   });
 }
 
@@ -107,7 +107,7 @@ export function createBondingCurveTradeObservedEvent(
     blockchainTimeMs: transaction.blockTimeMs,
     observedAtMs: transaction.observedAtMs,
     payloadVersion: 1,
-    payload: { trade },
+    payload: freezeSnapshot({ trade }),
   });
 }
 
@@ -162,8 +162,18 @@ function snapshotLaunchParameterObject(
   if (ancestors.has(value)) throw new UnsupportedLaunchParameterValueError(path);
   ancestors.add(value);
   const snapshot: Record<string, LaunchParameterValue> = {};
-  for (const [key, nestedValue] of Object.entries(value)) {
-    snapshot[key] = snapshotLaunchParameterValue(nestedValue, `${path}.${key}`, ancestors);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key === 'symbol') throw new UnsupportedLaunchParameterValueError(path);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new UnsupportedLaunchParameterValueError(`${path}.${key}`);
+    }
+    Object.defineProperty(snapshot, key, {
+      value: snapshotLaunchParameterValue(descriptor.value, `${path}.${key}`, ancestors),
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
   }
   ancestors.delete(value);
   return freezeSnapshot(snapshot);
@@ -184,13 +194,37 @@ function snapshotLaunchParameterValue(
   if (Array.isArray(value)) {
     if (ancestors.has(value)) throw new UnsupportedLaunchParameterValueError(path);
     ancestors.add(value);
-    const snapshot = value.map((nestedValue, index) =>
-      snapshotLaunchParameterValue(nestedValue, `${path}[${index}]`, ancestors));
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key === 'symbol' || (key !== 'length' && !isArrayIndex(key))) {
+        throw new UnsupportedLaunchParameterValueError(path);
+      }
+      if (key === 'length') continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+        throw new UnsupportedLaunchParameterValueError(`${path}[${key}]`);
+      }
+    }
+    const snapshot: LaunchParameterValue[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) {
+        throw new UnsupportedLaunchParameterValueError(`${path}[${index}]`);
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+        throw new UnsupportedLaunchParameterValueError(`${path}[${index}]`);
+      }
+      snapshot.push(snapshotLaunchParameterValue(descriptor.value, `${path}[${index}]`, ancestors));
+    }
     ancestors.delete(value);
     return freezeSnapshot(snapshot);
   }
   if (isPlainObject(value)) return snapshotLaunchParameterObject(value, path, ancestors);
   throw new UnsupportedLaunchParameterValueError(path);
+}
+
+function isArrayIndex(key: string): boolean {
+  const index = Number(key);
+  return Number.isInteger(index) && index >= 0 && index < 4_294_967_295 && String(index) === key;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
