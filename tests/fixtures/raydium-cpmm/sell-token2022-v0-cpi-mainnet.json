@@ -1,0 +1,19 @@
+{
+  "provenance": {
+    "kind": "MAINNET_CAPTURE_NORMALIZED",
+    "cluster": "mainnet-beta",
+    "signature": "2bhr1FWqeL28zH1BJR1h3PxkVorh5GD3koPUgzKMKFtxUKK5k3R3UraU8YRoB5yxKDi5AZafp3Xf74AXTf9LDqWc",
+    "slot": "290615369",
+    "note": "Swap CPMM V0 invoqué par CPI, token Token-2022 en entrée."
+  },
+  "pool": {
+    "dex":"RAYDIUM_CPMM","programId":"CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C","pool":"8THC7UQN8zPXRL61o75fP4gcwRyB5W3o74yHyqarkqZ9","tokenMint":"7atgF8KQo4wJrD5ATGX7t1V2zVvykPJbFfNeVf1icFv1","wsolMint":"So11111111111111111111111111111111111111112","tokenVault":"f2YzFdR5MhdqdQRN8F8tWLSabD8LuRUoFGJTgnKMJ9h","wsolVault":"Gn7ZGtdFZzPRR2wogi6a33o31Dp2aPaVTL6CdgoYYD98","lpMint":"11111111111111111111111111111111","tokenProgram":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb","wsolTokenProgram":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","creator":null,"openTimeUnix":"0","createdSlot":"290615000","createdSignature":"fixture","createdInstructionIndex":0,"discoveredAtMs":0
+  },
+  "transaction": {
+    "signature":"2bhr1FWqeL28zH1BJR1h3PxkVorh5GD3koPUgzKMKFtxUKK5k3R3UraU8YRoB5yxKDi5AZafp3Xf74AXTf9LDqWc","slot":"290615369","transactionIndex":478,"confirmationStatus":"FINALIZED","version":0,"blockTimeMs":1726000000000,"accountKeys":[],"signerKeys":["Buyer111111111111111111111111111111111111111"],
+    "instructions":[{"programId":"CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C","accounts":["Buyer111111111111111111111111111111111111111","GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL","D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2","8THC7UQN8zPXRL61o75fP4gcwRyB5W3o74yHyqarkqZ9","5BZ9RYb3sJvwgWZXFjUZdkrTDFeSPqRTe59LCGUEitpg","2rikd7tzPbmowhUJzPNVtX7fuUGcnBa8jqJnx6HbtHeE","f2YzFdR5MhdqdQRN8F8tWLSabD8LuRUoFGJTgnKMJ9h","Gn7ZGtdFZzPRR2wogi6a33o31Dp2aPaVTL6CdgoYYD98","TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb","TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","7atgF8KQo4wJrD5ATGX7t1V2zVvykPJbFfNeVf1icFv1","So11111111111111111111111111111111111111112","8Ujbvi5a9vU2bG4SYP4eyhNtg966F1B3iuBnvgnqJbFu"],"dataHex":"8fbe5adac41e33de90790500000000000000000000000000","instructionIndex":3,"innerInstructionIndex":11,"parentInstructionIndex":3,"stackHeight":3}],
+    "preTokenBalances":[{"accountIndex":1,"account":"f2YzFdR5MhdqdQRN8F8tWLSabD8LuRUoFGJTgnKMJ9h","mint":"7atgF8KQo4wJrD5ATGX7t1V2zVvykPJbFfNeVf1icFv1","owner":"GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL","tokenProgram":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb","amountRaw":"14702114651765","decimals":6},{"accountIndex":2,"account":"Gn7ZGtdFZzPRR2wogi6a33o31Dp2aPaVTL6CdgoYYD98","mint":"So11111111111111111111111111111111111111112","owner":"GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL","tokenProgram":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","amountRaw":"673640085213","decimals":9}],
+    "postTokenBalances":[{"accountIndex":1,"account":"f2YzFdR5MhdqdQRN8F8tWLSabD8LuRUoFGJTgnKMJ9h","mint":"7atgF8KQo4wJrD5ATGX7t1V2zVvykPJbFfNeVf1icFv1","owner":"GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL","tokenProgram":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb","amountRaw":"14702114996213","decimals":6},{"accountIndex":2,"account":"Gn7ZGtdFZzPRR2wogi6a33o31Dp2aPaVTL6CdgoYYD98","mint":"So11111111111111111111111111111111111111112","owner":"GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL","tokenProgram":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","amountRaw":"673640069471","decimals":9}],
+    "preBalancesLamports":[],"postBalancesLamports":[],"feeLamports":"5000","computeUnits":"155000","logs":[],"error":null
+  }
+}

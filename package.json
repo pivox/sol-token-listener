@@ -1,0 +1,39 @@
+{
+  "name": "solana-token-listener",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Surveillance de nouveaux pools Raydium CPMM Token/WSOL avec analyse de risque et exécution dry-run par défaut.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/app.ts",
+    "start": "node dist/src/app.js",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsx scripts/lint.ts",
+    "test": "tsx --test tests/*.test.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "rpc:check": "tsx scripts/check-rpc.ts",
+    "pool:diagnose": "tsx scripts/diagnose-pool.ts",
+    "tx:diagnose": "tsx scripts/diagnose-transaction.ts",
+    "fixture:capture": "tsx scripts/capture-fixture.ts"
+  },
+  "dependencies": {
+    "@raydium-io/raydium-sdk-v2": "0.2.59-alpha",
+    "@solana/spl-token": "0.4.15",
+    "@solana/web3.js": "1.98.4",
+    "bn.js": "5.2.2",
+    "bs58": "6.0.0",
+    "dotenv": "17.4.2",
+    "pg": "8.22.0",
+    "pino": "10.3.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/bn.js": "5.1.6",
+    "@types/node": "24.0.0",
+    "@types/pg": "8.15.0",
+    "tsx": "4.23.1",
+    "typescript": "5.8.3"
+  },
+  "engines": { "node": ">=22.0.0" }
+}

@@ -1,0 +1,69 @@
+{
+  "provenance": {
+    "kind": "MAINNET_CAPTURE_NORMALIZED",
+    "cluster": "mainnet-beta",
+    "signature": "2eC4dqwrrChNNihW8NE6NBn7EYK6EzbPVvuCkYgMLmmJgGuK7zpqnD2Zkk6QMkF5113T5gMJyBKwHeUYWGAuodp4",
+    "slot": "330632699",
+    "note": "Extrait public normalisé: comptes CPMM et balances de vault conservés."
+  },
+  "pool": {
+    "dex": "RAYDIUM_CPMM",
+    "programId": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+    "pool": "H6D2hjG4z9ASYfju9mUvWheoCtSTii8FELpvNYGijUsj",
+    "tokenMint": "AJwynGxHawX14e2ZL9VQV1kpXGKxWtTdqAxWMaL53H3H",
+    "wsolMint": "So11111111111111111111111111111111111111112",
+    "tokenVault": "C9PHdBy9jo9kBr393JNgHoG575rQ8Ah65aBvvsoqGjoN",
+    "wsolVault": "9A4WEkuCKweRWK9QuxUww49rnJCUz2dKPhDVYg5RSV5L",
+    "lpMint": "11111111111111111111111111111111",
+    "tokenProgram": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "wsolTokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "creator": null,
+    "openTimeUnix": "0",
+    "createdSlot": "330632000",
+    "createdSignature": "fixture",
+    "createdInstructionIndex": 0,
+    "discoveredAtMs": 0
+  },
+  "transaction": {
+    "signature": "2eC4dqwrrChNNihW8NE6NBn7EYK6EzbPVvuCkYgMLmmJgGuK7zpqnD2Zkk6QMkF5113T5gMJyBKwHeUYWGAuodp4",
+    "slot": "330632699",
+    "transactionIndex": 17,
+    "confirmationStatus": "FINALIZED",
+    "version": 0,
+    "blockTimeMs": 1744100000000,
+    "accountKeys": [],
+    "signerKeys": ["C4mUQ2ePWnkPkCtdRqtLUhzfRxjoTyuxQCtw2qCATfRe"],
+    "instructions": [{
+      "programId": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+      "accounts": [
+        "C4mUQ2ePWnkPkCtdRqtLUhzfRxjoTyuxQCtw2qCATfRe",
+        "GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL",
+        "D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2",
+        "H6D2hjG4z9ASYfju9mUvWheoCtSTii8FELpvNYGijUsj",
+        "5D5H93kzzLRzkTPANkjL7mcCVTWSwX7ZvcnEkrpyHzBk",
+        "9hrZXQbxKmzk9mWrpyyUx2R31Xh5XSeXGGL8h3xw4bgA",
+        "9A4WEkuCKweRWK9QuxUww49rnJCUz2dKPhDVYg5RSV5L",
+        "C9PHdBy9jo9kBr393JNgHoG575rQ8Ah65aBvvsoqGjoN",
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        "So11111111111111111111111111111111111111112",
+        "AJwynGxHawX14e2ZL9VQV1kpXGKxWtTdqAxWMaL53H3H",
+        "Cd4vBAxXDKXkMasXnYQv5LK1H9FMQeJHxMzbaz9HQgsC"
+      ],
+      "dataHex": "8fbe5adac41e33de804a5d05000000000000000000000000",
+      "instructionIndex": 5,
+      "innerInstructionIndex": 8,
+      "parentInstructionIndex": 5,
+      "stackHeight": 2
+    }],
+    "preTokenBalances": [
+      {"accountIndex": 1,"account":"9A4WEkuCKweRWK9QuxUww49rnJCUz2dKPhDVYg5RSV5L","mint":"So11111111111111111111111111111111111111112","owner":"GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL","tokenProgram":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","amountRaw":"15354109951","decimals":9},
+      {"accountIndex": 2,"account":"C9PHdBy9jo9kBr393JNgHoG575rQ8Ah65aBvvsoqGjoN","mint":"AJwynGxHawX14e2ZL9VQV1kpXGKxWtTdqAxWMaL53H3H","owner":"GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL","tokenProgram":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb","amountRaw":"87283779354816738","decimals":6}
+    ],
+    "postTokenBalances": [
+      {"accountIndex": 1,"account":"9A4WEkuCKweRWK9QuxUww49rnJCUz2dKPhDVYg5RSV5L","mint":"So11111111111111111111111111111111111111112","owner":"GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL","tokenProgram":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","amountRaw":"15444109951","decimals":9},
+      {"accountIndex": 2,"account":"C9PHdBy9jo9kBr393JNgHoG575rQ8Ah65aBvvsoqGjoN","mint":"AJwynGxHawX14e2ZL9VQV1kpXGKxWtTdqAxWMaL53H3H","owner":"GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL","tokenProgram":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb","amountRaw":"86776398719995446","decimals":6}
+    ],
+    "preBalancesLamports": [],"postBalancesLamports": [],"feeLamports":"5000","computeUnits":"190000","logs":[],"error":null
+  }
+}
