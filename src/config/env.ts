@@ -17,6 +17,7 @@ export interface AppConfig {
   readonly executionMode: ExecutionMode;
   readonly paperQuoteMintAllowlist: readonly string[];
   readonly qualificationRuleSetStatus: QualificationRuleSetStatus;
+  readonly qualificationMinimumScore: number;
   readonly dataRetentionHours: number;
   readonly raydiumCpmmProgramId: string;
   readonly wsolMint: string;
@@ -79,6 +80,13 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     executionMode,
     paperQuoteMintAllowlist,
     qualificationRuleSetStatus: 'UNVALIDATED_RULE_SET',
+    qualificationMinimumScore: parseInteger(
+      environment.QUALIFICATION_MIN_SCORE,
+      60,
+      'QUALIFICATION_MIN_SCORE',
+      0,
+      100,
+    ),
     dataRetentionHours: parseInteger(environment.DATA_RETENTION_HOURS, 4, 'DATA_RETENTION_HOURS', 1, 168),
     raydiumCpmmProgramId: optional(environment.RAYDIUM_CPMM_PROGRAM_ID, DEFAULT_RAYDIUM_CPMM_PROGRAM_ID),
     wsolMint,
