@@ -1,0 +1,13 @@
+import {
+  NATIVE_MINT,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+} from '@solana/spl-token';
+
+export const PUMP_PROGRAM_ID =
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+export const DEFAULT_PUBLIC_KEY =
+  '11111111111111111111111111111111';
+export const WSOL_MINT = NATIVE_MINT.toBase58();
+export const SPL_TOKEN_PROGRAM_ID = TOKEN_PROGRAM_ID.toBase58();
+export const TOKEN_2022_PROGRAM_ADDRESS = TOKEN_2022_PROGRAM_ID.toBase58();

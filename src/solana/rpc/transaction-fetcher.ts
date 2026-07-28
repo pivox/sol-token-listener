@@ -14,6 +14,10 @@ import type {
   NormalizedTransaction,
 } from './types.js';
 
+interface RpcInnerInstruction extends CompiledInstruction {
+  readonly stackHeight?: number | null;
+}
+
 export class TransactionFetcher {
   constructor(private readonly rpc: SolanaRpcClient) {}
 
@@ -122,7 +126,7 @@ function normalizeOuterInstruction(
 }
 
 function normalizeInnerInstruction(
-  instruction: CompiledInstruction,
+  instruction: RpcInnerInstruction,
   instructionIndex: number,
   innerInstructionIndex: number,
   accountKeys: readonly string[],
@@ -134,7 +138,7 @@ function normalizeInnerInstruction(
     instructionIndex,
     innerInstructionIndex,
     parentInstructionIndex: instructionIndex,
-    stackHeight: 2,
+    stackHeight: instruction.stackHeight ?? null,
   };
 }
 

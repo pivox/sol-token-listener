@@ -21,13 +21,24 @@ l’arrivée du token et conserve les événements nécessaires jusqu’à la fe
 du suivi. L’observation accepte plusieurs quote mints ; le paper trading est
 initialement limité à SOL/WSOL par `PAPER_QUOTE_MINT_ALLOWLIST`.
 
-## État de la PR A
+## État après PR C
 
-Cette PR installe les contrats, la sécurité et la persistance. Elle n’implémente
-pas encore `PumpFunLaunchpadAdapter` ni `PumpSwapMarketAdapter`. Le décodeur de
-swaps Raydium CPMM est conservé et testé comme infrastructure secondaire. Les
-wrappers de cotation et construction Raydium incomplets sont isolés et échouent
-explicitement ; ils ne sont pas importés par `src/app.ts`.
+La PR C épingle l’IDL officiel Pump.fun au commit
+`9c82f61cb711b044a17f770ab8ce9f9bdf78f333` et décode localement `create`,
+`create_v2`, `buy`, `buy_v2`, `buy_exact_sol_in`,
+`buy_exact_quote_in_v2`, `sell` et `sell_v2`. Les montants réels, réserves et
+frais viennent exclusivement des événements CPI `CreateEvent` et `TradeEvent`
+appairés ; aucun delta global de transaction n’est utilisé comme estimation.
+
+L’observation multi-quote est conservée (SPL Token et Token-2022), tandis que
+le paper trading reste limité à SOL/WSOL par configuration. Le décodeur ne fait
+aucun appel RPC à l’exécution. `PumpFunLaunchpadAdapter` est présent mais non
+composé dans `src/app.ts`; il ne déclenche donc aucun abonnement, lecture RPC ou
+ordre réel. Raydium CPMM demeure un adaptateur secondaire isolé et testé.
+
+La résolution canonique du `transactionIndex`, la lecture de compte de bonding
+curve, la persistance Pump.fun, la migration et le suivi PumpSwap restent des
+travaux ultérieurs.
 
 ## Dépendances autorisées
 
@@ -84,7 +95,7 @@ effectiveQuoteReserves = quoteVaultAmount + virtualQuoteReserves
 Le quote mint est toujours une valeur de domaine (`mint`, `decimals`,
 `tokenProgram`), jamais une hypothèse globale SOL.
 
-## Source officielle du futur décodeur
+## Source officielle et décodeur Pump.fun
 
 Vérification effectuée le 28 juillet 2026. La documentation publique officielle
 indique une interface multi-quote avec `buy_v2`, `sell_v2` et
@@ -92,20 +103,12 @@ indique une interface multi-quote avec `buy_v2`, `sell_v2` et
 documente également `migrate` comme migration permissionless et idempotente
 vers PumpSwap.
 
-La PR de décodage devra :
-
-1. épingler une révision de
-   [pump-fun/pump-public-docs](https://github.com/pump-fun/pump-public-docs) ;
-2. générer/valider les discriminators depuis
-   [l’IDL Pump officiel](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump.json) ;
-3. vérifier `create`, `create_v2`, `buy`, `buy_v2`,
-   `buy_exact_quote_in`, `buy_exact_quote_in_v2`, `sell`, `sell_v2` et
-   `migrate` contre cette révision ;
-4. utiliser le SDK officiel pour les frais dynamiques au lieu de constantes ;
-5. ajouter des fixtures assainies couvrant instructions externes, CPI,
-   multi-instructions et achat initial dans la transaction de création.
-
-Aucun discriminator Pump.fun tiers n’est copié dans la PR A.
+La source épinglée est
+[pump-fun/pump-public-docs](https://github.com/pump-fun/pump-public-docs),
+commit `9c82f61cb711b044a17f770ab8ce9f9bdf78f333`. Les discriminators et schémas
+sont générés depuis cet IDL, jamais copiés depuis un projet tiers. Les fixtures
+normalisées publiques couvrent une création avec achat initial, une vente CPI
+et un achat V2 CPI ; elles se rejouent hors ligne.
 
 ## Qualification
 
