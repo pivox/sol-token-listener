@@ -66,6 +66,9 @@ export async function migrateDatabase(options: {
 }
 
 export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool()): Promise<{
+  readonly metadataSnapshots: number;
+  readonly bondingCurveSnapshots: number;
+  readonly launchTrades: number;
   readonly stateTransitions: number;
   readonly domainEvents: number;
   readonly rawChainEvents: number;
@@ -74,6 +77,15 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const metadataSnapshots = await client.query(
+      'DELETE FROM token_metadata_snapshots WHERE purge_after <= NOW()',
+    );
+    const bondingCurveSnapshots = await client.query(
+      'DELETE FROM bonding_curve_snapshots WHERE purge_after <= NOW()',
+    );
+    const launchTrades = await client.query(
+      'DELETE FROM launch_trades WHERE purge_after <= NOW()',
+    );
     const transitions = await client.query(
       'DELETE FROM state_transitions WHERE purge_after <= NOW()',
     );
@@ -92,6 +104,9 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     );
     await client.query('COMMIT');
     return {
+      metadataSnapshots: metadataSnapshots.rowCount ?? 0,
+      bondingCurveSnapshots: bondingCurveSnapshots.rowCount ?? 0,
+      launchTrades: launchTrades.rowCount ?? 0,
       stateTransitions: transitions.rowCount ?? 0,
       domainEvents: domainEvents.rowCount ?? 0,
       rawChainEvents: rawEvents.rowCount ?? 0,
