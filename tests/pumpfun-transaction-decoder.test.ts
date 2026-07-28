@@ -189,10 +189,26 @@ void test('refuse les contradictions mint, user, sens, quote et programme', () =
       }),
       eventAt(createEventInstruction(), cursor(2, 0, 2)),
     ],
+    [
+      action('create_v2', cursor(2, null, 1), { user: OTHER }),
+      eventAt(createEventInstruction(), cursor(2, 0, 2)),
+    ],
   ];
   for (const instructions of mismatches) {
     assert.throws(
       () => decodePumpTransaction(transaction(instructions)),
+      isPumpError('PUMP_EVENT_MISMATCH'),
+    );
+  }
+});
+
+void test('refuse un ix_name ambigu ou inconnu', () => {
+  for (const ixName of ['buy_sell', 'notbuy']) {
+    assert.throws(
+      () => decodePumpTransaction(transaction([
+        action('buy_v2', cursor(3, null, 1)),
+        eventAt(tradeEventInstruction(new Uint8Array(), { ix_name: ixName }), cursor(3, 0, 2)),
+      ])),
       isPumpError('PUMP_EVENT_MISMATCH'),
     );
   }

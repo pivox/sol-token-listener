@@ -29,6 +29,15 @@ interface IndexedEvent {
   readonly decoded: DecodedPumpCpiEvent;
 }
 
+const BUY_IX_NAMES = new Set([
+  'buy',
+  'buy_v2',
+  'buy_exact_sol_in',
+  'buy_exact_quote_in',
+  'buy_exact_quote_in_v2',
+]);
+const SELL_IX_NAMES = new Set(['sell', 'sell_v2']);
+
 export function decodePumpTransaction(
   transaction: NormalizedTransaction,
 ): DecodedPumpTransaction {
@@ -234,6 +243,7 @@ function validateCreation(
   requireEqual(event.name, stringArg(action, 'name'), transaction, 'name');
   requireEqual(event.symbol, stringArg(action, 'symbol'), transaction, 'symbol');
   requireEqual(event.uri, stringArg(action, 'uri'), transaction, 'uri');
+  requireEqual(event.user, account(action, 'user'), transaction, 'user');
   requireEqual(
     event.creator,
     stringArg(action, 'creator'),
@@ -332,10 +342,9 @@ function requireTradeIxSemantic(
   shouldBuy: boolean,
   transaction: NormalizedTransaction,
 ): void {
-  const normalized = ixName.toLowerCase();
   const valid = shouldBuy
-    ? normalized.includes('buy')
-    : normalized.includes('sell');
+    ? BUY_IX_NAMES.has(ixName)
+    : SELL_IX_NAMES.has(ixName);
   if (!valid) throw mismatch(transaction, 'Sens ix_name contradictoire.');
 }
 

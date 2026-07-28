@@ -157,10 +157,11 @@ export function createEventInstruction(
 
 export function tradeEventInstruction(
   trailing: Uint8Array = new Uint8Array(),
+  overrides: Readonly<Record<string, unknown>> = {},
 ): NormalizedInstruction {
   return eventInstruction(
     Uint8Array.from(PUMP_EVENTS.TradeEvent.discriminator),
-    encodeNamedType('TradeEvent', TRADE_VALUES),
+    encodeNamedType('TradeEvent', { ...TRADE_VALUES, ...overrides }),
     trailing,
   );
 }

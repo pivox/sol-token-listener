@@ -22,18 +22,31 @@ export async function loadPumpFixture(name: string): Promise<PumpFixture> {
     throw new Error(`Nom de fixture Pump invalide: ${name}.`);
   }
   const path = new URL(`../fixtures/pumpfun/${name}`, import.meta.url);
-  const root = object(JSON.parse(await readFile(path, 'utf8')), 'fixture');
+  return parsePumpFixture(JSON.parse(await readFile(path, 'utf8')));
+}
+
+export function parsePumpFixture(parsed: unknown): PumpFixture {
+  const root = object(parsed, 'fixture');
   const provenance = object(root.provenance, 'provenance');
   const transaction = object(root.transaction, 'transaction');
+  const parsedTransaction = parseTransaction(transaction);
+  const parsedProvenance = Object.freeze({
+    source: fixed(provenance.source, 'solana-mainnet', 'provenance.source'),
+    signature: string(provenance.signature, 'provenance.signature'),
+    slot: bigint(provenance.slot, 'provenance.slot'),
+    transactionIndex: index(provenance.transactionIndex, 'provenance.transactionIndex'),
+    capturedAt: isoTimestamp(provenance.capturedAt, 'provenance.capturedAt'),
+  });
+  if (
+    parsedProvenance.signature !== parsedTransaction.signature
+    || parsedProvenance.slot !== parsedTransaction.slot
+    || parsedProvenance.transactionIndex !== parsedTransaction.transactionIndex
+  ) {
+    throw new Error('provenance.signature, slot ou transactionIndex ne correspond pas à la transaction.');
+  }
   return Object.freeze({
-    provenance: Object.freeze({
-      source: fixed(provenance.source, 'solana-mainnet', 'provenance.source'),
-      signature: string(provenance.signature, 'provenance.signature'),
-      slot: bigint(provenance.slot, 'provenance.slot'),
-      transactionIndex: index(provenance.transactionIndex, 'provenance.transactionIndex'),
-      capturedAt: isoTimestamp(provenance.capturedAt, 'provenance.capturedAt'),
-    }),
-    transaction: parseTransaction(transaction),
+    provenance: parsedProvenance,
+    transaction: parsedTransaction,
   });
 }
 
