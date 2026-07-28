@@ -8,7 +8,7 @@
     "dev": "tsx watch src/app.ts",
     "start": "node dist/src/app.js",
     "build": "tsc -p tsconfig.json",
-    "check": "npm run pumpfun:check-generated && tsc -p tsconfig.json --noEmit",
+    "check": "npm run pumpfun:check-generated && npm run pumpswap:check-generated && tsc -p tsconfig.json --noEmit",
     "lint": "eslint . --max-warnings=0",
     "test": "tsx --test tests/*.test.ts",
     "db:migrate": "tsx scripts/migrate.ts",
@@ -17,9 +17,12 @@
     "tx:diagnose": "tsx scripts/diagnose-transaction.ts",
     "fixture:capture": "tsx scripts/capture-fixture.ts",
     "pumpfun:generate": "tsx scripts/generate-pumpfun-idl.ts",
-    "pumpfun:check-generated": "tsx scripts/generate-pumpfun-idl.ts --check"
+    "pumpfun:check-generated": "tsx scripts/generate-pumpfun-idl.ts --check",
+    "pumpswap:generate": "tsx scripts/generate-pumpswap-idl.ts",
+    "pumpswap:check-generated": "tsx scripts/generate-pumpswap-idl.ts --check"
   },
   "dependencies": {
+    "@pump-fun/pump-swap-sdk": "1.19.0",
     "@raydium-io/raydium-sdk-v2": "0.2.59-alpha",
     "@solana/spl-token": "0.4.15",
     "@solana/web3.js": "1.98.4",

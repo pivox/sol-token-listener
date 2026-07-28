@@ -10,3 +10,7 @@
 `npm run pumpfun:generate` reads only this local snapshot. Updating the
 snapshot requires a new explicit commit, checksum, generated diff, fixture
 verification, and protocol review.
+
+PumpSwap uses `idl/pump-amm-9c82f61.json` from the same revision, program
+`pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`, SHA-256
+`6b5c7ec4e5ef9742fa99dc57b0d75b1031b379bba02a7e1b3c5a4cad68d77e56`.

@@ -3069,6 +3069,964 @@ export const PUMP_INSTRUCTIONS = {
       }
     ]
   },
+  "migrate": {
+    "name": "migrate",
+    "discriminator": [
+      155,
+      234,
+      231,
+      146,
+      236,
+      158,
+      162,
+      30
+    ],
+    "accounts": [
+      {
+        "name": "global",
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                103,
+                108,
+                111,
+                98,
+                97,
+                108
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "withdraw_authority",
+        "writable": true,
+        "relations": [
+          "global"
+        ]
+      },
+      {
+        "name": "mint"
+      },
+      {
+        "name": "bonding_curve",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                98,
+                111,
+                110,
+                100,
+                105,
+                110,
+                103,
+                45,
+                99,
+                117,
+                114,
+                118,
+                101
+              ]
+            },
+            {
+              "kind": "account",
+              "path": "mint"
+            }
+          ]
+        }
+      },
+      {
+        "name": "associated_bonding_curve",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "bonding_curve"
+            },
+            {
+              "kind": "account",
+              "path": "mint"
+            },
+            {
+              "kind": "account",
+              "path": "mint"
+            }
+          ],
+          "program": {
+            "kind": "const",
+            "value": [
+              140,
+              151,
+              37,
+              143,
+              78,
+              36,
+              137,
+              241,
+              187,
+              61,
+              16,
+              41,
+              20,
+              142,
+              13,
+              131,
+              11,
+              90,
+              19,
+              153,
+              218,
+              255,
+              16,
+              132,
+              4,
+              142,
+              123,
+              216,
+              219,
+              233,
+              248,
+              89
+            ]
+          }
+        }
+      },
+      {
+        "name": "user",
+        "signer": true
+      },
+      {
+        "name": "system_program",
+        "address": "11111111111111111111111111111111"
+      },
+      {
+        "name": "token_program",
+        "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+      },
+      {
+        "name": "pump_amm",
+        "address": "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+      },
+      {
+        "name": "pool",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                112,
+                111,
+                111,
+                108
+              ]
+            },
+            {
+              "kind": "const",
+              "value": [
+                0,
+                0
+              ]
+            },
+            {
+              "kind": "account",
+              "path": "pool_authority"
+            },
+            {
+              "kind": "account",
+              "path": "mint"
+            },
+            {
+              "kind": "account",
+              "path": "wsol_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "pump_amm"
+          }
+        }
+      },
+      {
+        "name": "pool_authority",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                112,
+                111,
+                111,
+                108,
+                45,
+                97,
+                117,
+                116,
+                104,
+                111,
+                114,
+                105,
+                116,
+                121
+              ]
+            },
+            {
+              "kind": "account",
+              "path": "mint"
+            }
+          ]
+        }
+      },
+      {
+        "name": "pool_authority_mint_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool_authority"
+            },
+            {
+              "kind": "account",
+              "path": "mint"
+            },
+            {
+              "kind": "account",
+              "path": "mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "pool_authority_wsol_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool_authority"
+            },
+            {
+              "kind": "account",
+              "path": "token_program"
+            },
+            {
+              "kind": "account",
+              "path": "wsol_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "amm_global_config",
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                103,
+                108,
+                111,
+                98,
+                97,
+                108,
+                95,
+                99,
+                111,
+                110,
+                102,
+                105,
+                103
+              ]
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "pump_amm"
+          }
+        }
+      },
+      {
+        "name": "wsol_mint",
+        "address": "So11111111111111111111111111111111111111112"
+      },
+      {
+        "name": "lp_mint",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                112,
+                111,
+                111,
+                108,
+                95,
+                108,
+                112,
+                95,
+                109,
+                105,
+                110,
+                116
+              ]
+            },
+            {
+              "kind": "account",
+              "path": "pool"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "pump_amm"
+          }
+        }
+      },
+      {
+        "name": "user_pool_token_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool_authority"
+            },
+            {
+              "kind": "account",
+              "path": "token_2022_program"
+            },
+            {
+              "kind": "account",
+              "path": "lp_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "pool_base_token_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool"
+            },
+            {
+              "kind": "account",
+              "path": "mint"
+            },
+            {
+              "kind": "account",
+              "path": "mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "pool_quote_token_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool"
+            },
+            {
+              "kind": "account",
+              "path": "token_program"
+            },
+            {
+              "kind": "account",
+              "path": "wsol_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "token_2022_program",
+        "address": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+      },
+      {
+        "name": "associated_token_program",
+        "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+      },
+      {
+        "name": "pump_amm_event_authority",
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                95,
+                95,
+                101,
+                118,
+                101,
+                110,
+                116,
+                95,
+                97,
+                117,
+                116,
+                104,
+                111,
+                114,
+                105,
+                116,
+                121
+              ]
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "pump_amm"
+          }
+        }
+      },
+      {
+        "name": "event_authority",
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                95,
+                95,
+                101,
+                118,
+                101,
+                110,
+                116,
+                95,
+                97,
+                117,
+                116,
+                104,
+                111,
+                114,
+                105,
+                116,
+                121
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "program",
+        "address": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+      },
+      {
+        "name": "rent",
+        "address": "SysvarRent111111111111111111111111111111111"
+      }
+    ],
+    "args": []
+  },
+  "migrate_v2": {
+    "name": "migrate_v2",
+    "discriminator": [
+      187,
+      203,
+      18,
+      31,
+      206,
+      237,
+      254,
+      41
+    ],
+    "accounts": [
+      {
+        "name": "global",
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                103,
+                108,
+                111,
+                98,
+                97,
+                108
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "withdraw_authority",
+        "writable": true,
+        "relations": [
+          "global"
+        ]
+      },
+      {
+        "name": "base_mint"
+      },
+      {
+        "name": "quote_mint"
+      },
+      {
+        "name": "bonding_curve",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                98,
+                111,
+                110,
+                100,
+                105,
+                110,
+                103,
+                45,
+                99,
+                117,
+                114,
+                118,
+                101
+              ]
+            },
+            {
+              "kind": "account",
+              "path": "base_mint"
+            }
+          ]
+        }
+      },
+      {
+        "name": "associated_base_bonding_curve",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "bonding_curve"
+            },
+            {
+              "kind": "account",
+              "path": "base_token_program"
+            },
+            {
+              "kind": "account",
+              "path": "base_mint"
+            }
+          ],
+          "program": {
+            "kind": "const",
+            "value": [
+              140,
+              151,
+              37,
+              143,
+              78,
+              36,
+              137,
+              241,
+              187,
+              61,
+              16,
+              41,
+              20,
+              142,
+              13,
+              131,
+              11,
+              90,
+              19,
+              153,
+              218,
+              255,
+              16,
+              132,
+              4,
+              142,
+              123,
+              216,
+              219,
+              233,
+              248,
+              89
+            ]
+          }
+        }
+      },
+      {
+        "name": "associated_quote_bonding_curve",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "bonding_curve"
+            },
+            {
+              "kind": "account",
+              "path": "quote_token_program"
+            },
+            {
+              "kind": "account",
+              "path": "quote_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "user",
+        "signer": true
+      },
+      {
+        "name": "system_program",
+        "address": "11111111111111111111111111111111"
+      },
+      {
+        "name": "pump_amm",
+        "address": "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+      },
+      {
+        "name": "pool",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                112,
+                111,
+                111,
+                108
+              ]
+            },
+            {
+              "kind": "const",
+              "value": [
+                0,
+                0
+              ]
+            },
+            {
+              "kind": "account",
+              "path": "pool_authority"
+            },
+            {
+              "kind": "account",
+              "path": "base_mint"
+            },
+            {
+              "kind": "account",
+              "path": "quote_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "pump_amm"
+          }
+        }
+      },
+      {
+        "name": "pool_authority",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                112,
+                111,
+                111,
+                108,
+                45,
+                97,
+                117,
+                116,
+                104,
+                111,
+                114,
+                105,
+                116,
+                121
+              ]
+            },
+            {
+              "kind": "account",
+              "path": "base_mint"
+            }
+          ]
+        }
+      },
+      {
+        "name": "pool_authority_mint_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool_authority"
+            },
+            {
+              "kind": "account",
+              "path": "base_token_program"
+            },
+            {
+              "kind": "account",
+              "path": "base_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "pool_authority_quote_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool_authority"
+            },
+            {
+              "kind": "account",
+              "path": "quote_token_program"
+            },
+            {
+              "kind": "account",
+              "path": "quote_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "amm_global_config",
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                103,
+                108,
+                111,
+                98,
+                97,
+                108,
+                95,
+                99,
+                111,
+                110,
+                102,
+                105,
+                103
+              ]
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "pump_amm"
+          }
+        }
+      },
+      {
+        "name": "lp_mint",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                112,
+                111,
+                111,
+                108,
+                95,
+                108,
+                112,
+                95,
+                109,
+                105,
+                110,
+                116
+              ]
+            },
+            {
+              "kind": "account",
+              "path": "pool"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "pump_amm"
+          }
+        }
+      },
+      {
+        "name": "user_pool_token_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool_authority"
+            },
+            {
+              "kind": "account",
+              "path": "token_2022_program"
+            },
+            {
+              "kind": "account",
+              "path": "lp_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "pool_base_token_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool"
+            },
+            {
+              "kind": "account",
+              "path": "base_token_program"
+            },
+            {
+              "kind": "account",
+              "path": "base_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "pool_quote_token_account",
+        "writable": true,
+        "pda": {
+          "seeds": [
+            {
+              "kind": "account",
+              "path": "pool"
+            },
+            {
+              "kind": "account",
+              "path": "quote_token_program"
+            },
+            {
+              "kind": "account",
+              "path": "quote_mint"
+            }
+          ],
+          "program": {
+            "kind": "account",
+            "path": "associated_token_program"
+          }
+        }
+      },
+      {
+        "name": "base_token_program"
+      },
+      {
+        "name": "quote_token_program"
+      },
+      {
+        "name": "token_2022_program",
+        "address": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+      },
+      {
+        "name": "associated_token_program",
+        "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+      },
+      {
+        "name": "pump_amm_event_authority"
+      },
+      {
+        "name": "rent",
+        "address": "SysvarRent111111111111111111111111111111111"
+      },
+      {
+        "name": "event_authority",
+        "pda": {
+          "seeds": [
+            {
+              "kind": "const",
+              "value": [
+                95,
+                95,
+                101,
+                118,
+                101,
+                110,
+                116,
+                95,
+                97,
+                117,
+                116,
+                104,
+                111,
+                114,
+                105,
+                116,
+                121
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "program"
+      }
+    ],
+    "args": []
+  },
   "sell": {
     "name": "sell",
     "discriminator": [
