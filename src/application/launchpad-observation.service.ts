@@ -24,7 +24,7 @@ const EMPTY_BATCH_RESULT: LaunchpadEventBatchResult = Object.freeze({
 });
 
 export class LaunchpadObservationService<
-  TTransaction extends ObservedChainTransaction,
+  TTransaction extends ObservedChainTransaction = ObservedChainTransaction,
 > {
   public constructor(
     private readonly adapter: LaunchpadAdapter<TTransaction>,
@@ -35,33 +35,43 @@ export class LaunchpadObservationService<
     transaction: TTransaction,
     alreadyTrackedMints: ReadonlySet<string>,
   ): Promise<LaunchpadEventBatchResult> {
-    const trackedMints = new Set(alreadyTrackedMints);
-    const launches = await this.runStage(
-      'detect_launches',
+    const envelope = createObservationEnvelope(
+      this.adapter.source,
+      this.adapter.programId,
       transaction,
+    );
+    const authoritativeTrackedMints = new Set(alreadyTrackedMints);
+    const detectedLaunches = await this.runStage(
+      'detect_launches',
+      envelope,
       () => this.adapter.detectLaunches(transaction),
     );
-    for (const launch of launches) trackedMints.add(launch.mint);
-    const trades = await this.runStage(
-      'decode_trades',
-      transaction,
-      () => this.adapter.decodeTrades(transaction, trackedMints),
-    );
-
-    const launchEvents = launches.map((launch) =>
+    const launchEvents = detectedLaunches.map((launch) =>
       createTokenLaunchDetectedEvent({
-        source: this.adapter.source,
-        program: this.adapter.programId,
-        transaction,
+        source: envelope.source,
+        program: envelope.program,
+        transaction: envelope.transaction,
         launch,
       }));
+    for (const event of launchEvents) {
+      authoritativeTrackedMints.add(event.payload.launch.mint);
+    }
+    const trades = await this.runStage(
+      'decode_trades',
+      envelope,
+      () => this.adapter.decodeTrades(
+        transaction,
+        new Set(authoritativeTrackedMints),
+      ),
+    );
+
     const events = Object.freeze([
       ...launchEvents,
       ...trades.map((trade) =>
         createBondingCurveTradeObservedEvent({
-          source: this.adapter.source,
-          program: this.adapter.programId,
-          transaction,
+          source: envelope.source,
+          program: envelope.program,
+          transaction: envelope.transaction,
           trade,
         })),
     ].sort(compareObservationEvents));
@@ -73,23 +83,23 @@ export class LaunchpadObservationService<
         .map(createInitialDetectedTransition),
     );
     const batch: LaunchpadEventBatch = Object.freeze({
-      source: this.adapter.source,
-      program: this.adapter.programId,
-      signature: transaction.signature,
-      confirmationStatus: transaction.confirmationStatus,
+      source: envelope.source,
+      program: envelope.program,
+      signature: envelope.transaction.signature,
+      confirmationStatus: envelope.transaction.confirmationStatus,
       events,
       transitions,
     });
     return this.runStage(
       'record_batch',
-      transaction,
+      envelope,
       () => this.sink.record(batch),
     );
   }
 
   private async runStage<TResult>(
     stage: LaunchpadObservationStage,
-    transaction: TTransaction,
+    envelope: ObservationEnvelope,
     operation: () => Promise<TResult>,
   ): Promise<TResult> {
     try {
@@ -97,13 +107,42 @@ export class LaunchpadObservationService<
     } catch (cause) {
       throw new LaunchpadObservationError(
         stage,
-        this.adapter.source,
-        this.adapter.programId,
-        transaction.signature,
+        envelope.source,
+        envelope.program,
+        envelope.transaction.signature,
         cause,
       );
     }
   }
+}
+
+interface ObservationEnvelope {
+  readonly source: string;
+  readonly program: string;
+  readonly transaction: ObservedChainTransaction;
+}
+
+function createObservationEnvelope(
+  source: string,
+  program: string,
+  transaction: ObservedChainTransaction,
+): ObservationEnvelope {
+  const transactionSnapshot: ObservedChainTransaction = Object.freeze({
+    signature: transaction.signature,
+    confirmationStatus: transaction.confirmationStatus,
+    blockTimeMs: transaction.blockTimeMs,
+    observedAtMs: transaction.observedAtMs,
+    cursor: Object.freeze({
+      slot: transaction.cursor.slot,
+      transactionIndex: transaction.cursor.transactionIndex,
+    }),
+    raw: null,
+  });
+  return Object.freeze({
+    source,
+    program,
+    transaction: transactionSnapshot,
+  });
 }
 
 function compareObservationEvents(

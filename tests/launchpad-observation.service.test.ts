@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { LaunchpadObservationError } from '../src/application/launchpad-observation-errors.js';
 import { LaunchpadObservationService } from '../src/application/launchpad-observation.service.js';
 import { createBondingCurveTradeObservedEvent } from '../src/domain/launchpad-events.js';
 import type {
@@ -37,6 +38,25 @@ interface StrictTransaction extends ObservedChainTransaction {
     readonly fixture: 'strict-launchpad-transaction';
   };
 }
+
+interface MutableStrictTransaction {
+  signature: string;
+  confirmationStatus: ChainConfirmationStatus;
+  blockTimeMs: number | null;
+  observedAtMs: number;
+  cursor: {
+    slot: bigint;
+    transactionIndex: number;
+  };
+  raw: {
+    fixture: 'strict-launchpad-transaction';
+  };
+}
+
+const assertDefaultServiceType = (
+  _service: LaunchpadObservationService,
+): void => undefined;
+void assertDefaultServiceType;
 
 function transactionFixture(
   input: {
@@ -105,8 +125,8 @@ function tradeFixture(input: {
 }
 
 class FakeAdapter implements LaunchpadAdapter<StrictTransaction> {
-  public readonly source = SOURCE;
-  public readonly programId = PROGRAM;
+  public source: string = SOURCE;
+  public programId: string = PROGRAM;
   public readonly detectCalls: StrictTransaction[] = [];
   public readonly decodeCalls: {
     readonly transaction: StrictTransaction;
@@ -114,6 +134,7 @@ class FakeAdapter implements LaunchpadAdapter<StrictTransaction> {
   }[] = [];
   public detectError: Error | undefined;
   public decodeError: Error | undefined;
+  public beforeDecode: (() => void) | undefined;
 
   public constructor(
     private readonly launches: readonly TokenLaunch[],
@@ -129,6 +150,7 @@ class FakeAdapter implements LaunchpadAdapter<StrictTransaction> {
 
   public readonly decodeTrades: LaunchpadAdapter<StrictTransaction>['decodeTrades'] =
     async (transaction, trackedMints) => {
+      this.beforeDecode?.();
       this.decodeCalls.push({
         transaction,
         trackedMints: new Set(trackedMints),
@@ -213,6 +235,95 @@ void test('records out-of-order launches once in full-cursor order with their in
     result.events,
     batch.events.map((event) => ({ eventId: event.id, outcome: 'created' })),
   );
+});
+
+void test('snapshots launches and observation metadata before a mutating decoder runs', async () => {
+  const mutableTransaction: MutableStrictTransaction = {
+    signature: 'EntrySignature111111111111111111111111111111',
+    confirmationStatus: 'confirmed',
+    blockTimeMs: 1_753_710_000_000,
+    observedAtMs: 1_753_710_000_500,
+    cursor: { slot: 500n, transactionIndex: 2 },
+    raw: { fixture: 'strict-launchpad-transaction' },
+  };
+  const originalLaunchMint = 'StableMint111111111111111111111111111111111';
+  const originalCreator = 'StableCreator1111111111111111111111111111111';
+  const mutableLaunch = {
+    mint: originalLaunchMint,
+    creator: originalCreator,
+    tokenProgram: 'SPL_TOKEN' as const,
+    quoteAssets: [{ ...SOL }],
+    launchpad: SOURCE,
+    createdAt: {
+      slot: 500n,
+      transactionIndex: 2,
+      instructionIndex: 2,
+      innerInstructionIndex: null,
+    },
+    parameters: { strictFixture: true },
+  };
+  const adapter = new FakeAdapter([mutableLaunch], []);
+  const sink = new RecordingSink();
+  const recordFailure = new Error('record failed after mutation');
+  sink.recordError = recordFailure;
+  adapter.beforeDecode = () => {
+    mutableLaunch.mint = 'MutatedMint11111111111111111111111111111111';
+    mutableLaunch.creator = 'MutatedCreator1111111111111111111111111111';
+    const mutableQuoteAsset = mutableLaunch.quoteAssets[0];
+    assert.ok(mutableQuoteAsset);
+    mutableQuoteAsset.mint = 'MutatedQuote111111111111111111111111111111111';
+    mutableLaunch.createdAt.instructionIndex = 99;
+    adapter.source = 'mutated-source';
+    adapter.programId = 'MutatedProgram111111111111111111111111111111';
+    mutableTransaction.signature = 'MutatedSignature1111111111111111111111111111';
+    mutableTransaction.confirmationStatus = 'orphaned';
+    mutableTransaction.blockTimeMs = null;
+    mutableTransaction.observedAtMs = 9_999_999_999_999;
+    mutableTransaction.cursor.slot = 999n;
+    mutableTransaction.cursor.transactionIndex = 99;
+  };
+
+  await assert.rejects(
+    new LaunchpadObservationService(adapter, sink).observe(
+      mutableTransaction,
+      new Set([EXISTING_MINT]),
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof LaunchpadObservationError);
+      assert.equal(error.stage, 'record_batch');
+      assert.equal(error.source, SOURCE);
+      assert.equal(error.program, PROGRAM);
+      assert.equal(error.signature, 'EntrySignature111111111111111111111111111111');
+      assert.equal(error.cause, recordFailure);
+      return true;
+    },
+  );
+
+  assert.deepEqual(
+    adapter.decodeCalls[0]?.trackedMints,
+    new Set([EXISTING_MINT, originalLaunchMint]),
+  );
+  const batch = sink.batches[0];
+  assert.ok(batch);
+  assert.equal(batch.source, SOURCE);
+  assert.equal(batch.program, PROGRAM);
+  assert.equal(batch.signature, 'EntrySignature111111111111111111111111111111');
+  assert.equal(batch.confirmationStatus, 'confirmed');
+  const event = batch.events[0];
+  assert.equal(event?.type, 'TokenLaunchDetected');
+  if (event?.type !== 'TokenLaunchDetected') {
+    assert.fail('Expected a launch event');
+  }
+  assert.equal(event.source, SOURCE);
+  assert.equal(event.program, PROGRAM);
+  assert.equal(event.signature, 'EntrySignature111111111111111111111111111111');
+  assert.equal(event.confirmationStatus, 'confirmed');
+  assert.equal(event.blockchainTimeMs, 1_753_710_000_000);
+  assert.equal(event.observedAtMs, 1_753_710_000_500);
+  assert.equal(event.payload.launch.mint, originalLaunchMint);
+  assert.equal(event.payload.launch.creator, originalCreator);
+  assert.equal(event.payload.launch.quoteAssets[0]?.mint, SOL.mint);
+  assert.equal(event.payload.launch.createdAt.instructionIndex, 2);
 });
 
 void test('orders a launch before its initial buy at an identical cursor', async () => {
@@ -320,7 +431,7 @@ void test('sorts outer and inner trades by the complete cursor', async () => {
   );
 });
 
-void test('returns the shared frozen empty result without recording while still running both adapter passes', async () => {
+void test('returns a frozen empty result without recording while still running both adapter passes', async () => {
   const transaction = transactionFixture();
   const adapter = new FakeAdapter([], []);
   const sink = new RecordingSink();
@@ -335,12 +446,6 @@ void test('returns the shared frozen empty result without recording while still 
   assert.deepEqual(result, { events: [] });
   assert.ok(Object.isFrozen(result));
   assert.ok(Object.isFrozen(result.events));
-
-  const otherResult = await new LaunchpadObservationService(
-    new FakeAdapter([], []),
-    new RecordingSink(),
-  ).observe(transaction, new Set());
-  assert.equal(otherResult, result);
 });
 
 void test('records adapter and transaction metadata on the complete batch', async () => {
