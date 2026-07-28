@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { AppConfig } from '../config/env.js';
 import type { DomainEvent } from '../domain/events.js';
+import { assertValidChainCursor } from '../domain/cursor.js';
 import type {
   QualificationReport,
   QualificationScore,
@@ -15,7 +16,10 @@ import {
   type PaperPositionOpenedEventV1,
   type PaperTrade,
 } from '../domain/paper-trading.js';
-import { assertValidTimestampMs } from '../domain/timestamp.js';
+import {
+  assertValidNullableTimestampMs,
+  assertValidTimestampMs,
+} from '../domain/timestamp.js';
 import type {
   PaperTradingRepository,
   PaperTradingTransaction,
@@ -381,6 +385,9 @@ function snapshotQualification(report: QualificationReport): QualificationReport
 }
 
 function snapshotTrigger(trigger: DomainEvent): DomainEvent {
+  assertValidChainCursor(trigger.cursor);
+  assertValidNullableTimestampMs('blockchainTimeMs', trigger.blockchainTimeMs);
+  assertValidTimestampMs('observedAtMs', trigger.observedAtMs);
   return freeze({
     ...trigger,
     cursor: freeze({ ...trigger.cursor }),

@@ -152,6 +152,30 @@ void test('refuse un événement déclencheur orphaned', async () => {
   assert.equal(repository.writeCount, 0);
 });
 
+void test('refuse un curseur ou temps déclencheur non canonique', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand();
+
+  await assert.rejects(
+    makeEngine(repository, 'paper').open({
+      ...command,
+      trigger: { ...command.trigger, observedAtMs: -1 },
+    }),
+    /Invalid observedAtMs timestamp/u,
+  );
+  await assert.rejects(
+    makeEngine(repository, 'paper').open({
+      ...command,
+      trigger: {
+        ...command.trigger,
+        cursor: { ...command.trigger.cursor, instructionIndex: -1 },
+      },
+    }),
+    /Invalid chain cursor instructionIndex/u,
+  );
+  assert.equal(repository.writeCount, 0);
+});
+
 void test('rétracte une position si son déclencheur devient orphaned', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
