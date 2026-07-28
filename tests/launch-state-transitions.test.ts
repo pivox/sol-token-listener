@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
   assertInitialLaunchTransitionAllowed,
@@ -34,6 +35,14 @@ const launchDetected: TokenLaunchDetectedEventV1 = {
 
 void test('initial detected transition is deterministic on replay', () => {
   assert.deepEqual(createInitialDetectedTransition(launchDetected), createInitialDetectedTransition(launchDetected));
+});
+
+void test('initial detected transition identity uses the event, none, and detected inputs', () => {
+  const expectedId = `transition_${createHash('sha256')
+    .update([launchDetected.id, 'none', 'DETECTED'].join('\u001f'))
+    .digest('hex')}`;
+
+  assert.equal(createInitialDetectedTransition(launchDetected).id, expectedId);
 });
 
 void test('initial detected transition records its triggering event and evidence', () => {
