@@ -17,6 +17,7 @@ import {
   type QualificationReasonCode,
 } from '../domain/qualification-reasons.js';
 import { assertValidTimestampMs } from '../domain/timestamp.js';
+import type { AppConfig } from '../config/env.js';
 
 const DIMENSION_MAXIMUMS: Readonly<Record<QualificationDimension, number>> = Object.freeze({
   preparation: 15,
@@ -42,6 +43,12 @@ export function createDefaultQualificationRuleSet(minimumTotalScore: number): Qu
   });
 }
 
+export function createQualificationEngine(
+  config: Pick<AppConfig, 'qualificationMinimumScore'>,
+): QualificationEngine {
+  return new QualificationEngine(createDefaultQualificationRuleSet(config.qualificationMinimumScore));
+}
+
 export class QualificationConfigurationError extends Error {
   public constructor(message: string) {
     super(message);
@@ -50,8 +57,15 @@ export class QualificationConfigurationError extends Error {
 }
 
 export class QualificationEngine {
-  public constructor(private readonly ruleSet: QualificationRuleSet) {
+  private readonly ruleSet: QualificationRuleSet;
+
+  public constructor(ruleSet: QualificationRuleSet) {
     validateRuleSet(ruleSet);
+    this.ruleSet = snapshotRuleSet(ruleSet);
+  }
+
+  public get minimumTotalScore(): number {
+    return this.ruleSet.minimumTotalScore;
   }
 
   public evaluate(input: QualificationEvaluationInput): QualificationReport {
@@ -123,6 +137,22 @@ function validateRuleSet(ruleSet: QualificationRuleSet): void {
       throw new QualificationConfigurationError(`Poids total invalide pour ${dimension}.`);
     }
   }
+}
+
+function snapshotRuleSet(ruleSet: QualificationRuleSet): QualificationRuleSet {
+  return freeze({
+    id: ruleSet.id,
+    version: ruleSet.version,
+    status: ruleSet.status,
+    minimumTotalScore: ruleSet.minimumTotalScore,
+    rules: freeze(ruleSet.rules.map((item) => freeze({
+      signal: item.signal,
+      dimension: item.dimension,
+      weight: item.weight,
+      required: item.required,
+      message: item.message,
+    }))),
+  });
 }
 
 function evidenceFor(ruleDefinition: QualificationRule, input: QualificationEvaluationInput): QualificationEvidence {

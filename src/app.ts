@@ -1,10 +1,12 @@
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config/env.js';
+import { createQualificationEngine } from './qualification/qualification-engine.js';
 import { closeDatabase, migrateDatabase } from './storage/database.js';
 import { logger } from './utils/logger.js';
 
 export async function main(): Promise<void> {
   const config = loadConfig();
+  const qualificationEngine = createQualificationEngine(config);
   if (config.autoMigrate) {
     const appliedMigrations = await migrateDatabase();
     logger.info({ appliedMigrations }, 'Migrations PostgreSQL appliquées.');
@@ -15,6 +17,7 @@ export async function main(): Promise<void> {
     cluster: config.cluster,
     paperQuoteMintAllowlist: config.paperQuoteMintAllowlist,
     qualificationRuleSetStatus: config.qualificationRuleSetStatus,
+    qualificationMinimumScore: qualificationEngine.minimumTotalScore,
     pumpFunListenerActive: false,
     transactionSubmissionEnabled: false,
   }, 'Socle d’observation prêt; l’adaptateur Pump.fun sera activé dans une PR ultérieure.');
