@@ -1,20 +1,30 @@
 import type {
-  MarketPool,
+  CanonicalMarketPool,
   MarketQuote,
+  MarketQuoteRequest,
   MarketReserves,
   MarketTrade,
+} from '../domain/market.js';
+import type {
   ObservedChainTransaction,
 } from '../domain/types.js';
 
-export interface MarketAdapter {
+export interface MarketAdapter<
+  in TTransaction extends ObservedChainTransaction =
+    ObservedChainTransaction,
+> {
   readonly source: string;
   readonly programId: string;
 
-  detectPools(transaction: ObservedChainTransaction): Promise<readonly MarketPool[]>;
-  decodeTrades(
-    transaction: ObservedChainTransaction,
-    trackedPools: ReadonlyMap<string, MarketPool>,
-  ): Promise<readonly MarketTrade[]>;
-  readReserves(pool: MarketPool): Promise<MarketReserves>;
-  quote(pool: MarketPool, inputMint: string, amountInRaw: bigint): Promise<MarketQuote>;
+  readonly detectPools: (
+    transaction: TTransaction,
+  ) => Promise<readonly CanonicalMarketPool[]>;
+  readonly decodeTrades: (
+    transaction: TTransaction,
+    trackedPools: ReadonlyMap<string, CanonicalMarketPool>,
+  ) => Promise<readonly MarketTrade[]>;
+  readonly readReserves: (
+    pool: CanonicalMarketPool,
+  ) => Promise<MarketReserves>;
+  readonly quote: (request: MarketQuoteRequest) => Promise<MarketQuote>;
 }
