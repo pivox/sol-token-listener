@@ -71,7 +71,13 @@ vérifient notamment les instructions officielles suivantes :
 
 - `migrate` : `[155, 234, 231, 146, 236, 158, 162, 30]` ;
 - `migrate_v2` : `[187, 203, 18, 31, 206, 237, 254, 41]` ;
-- `create_pool`, `buy` et `sell` PumpSwap depuis l'IDL Pump AMM épinglé.
+- `create_pool`, `buy`, `buy_exact_quote_in` et `sell` PumpSwap depuis l'IDL
+  Pump AMM épinglé.
+
+L'IDL publique épinglée est l'autorité de décodage. L'IDL embarquée dans
+`@pump-fun/pump-swap-sdk@1.19.0` ne contient pas encore le champ append-only
+`base_supply` des événements `BuyEvent` et `SellEvent` présents dans l'IDL
+publique. Elle ne doit donc pas être utilisée pour décoder ces événements.
 
 Le générateur échoue si une révision, une somme, un programme, une instruction,
 un compte ou un type requis diverge.
