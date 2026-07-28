@@ -98,6 +98,15 @@ export class LaunchpadObservationService<
     try {
       return await operation();
     } catch (cause) {
+      if (
+        cause instanceof LaunchpadObservationError
+        && cause.stage === stage
+        && cause.source === envelope.source
+        && cause.program === envelope.program
+        && cause.signature === envelope.transaction.signature
+      ) {
+        throw cause;
+      }
       throw new LaunchpadObservationError(
         stage,
         envelope.source,

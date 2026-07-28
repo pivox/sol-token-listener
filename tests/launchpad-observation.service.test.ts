@@ -525,6 +525,16 @@ void test('replays deterministic IDs across finality changes', async () => {
   );
   assert.equal(processedBatch.confirmationStatus, 'processed');
   assert.equal(finalizedBatch.confirmationStatus, 'finalized');
+  for (const event of processedBatch.events) {
+    assert.equal(event.confirmationStatus, 'processed');
+    assert.equal(event.blockchainTimeMs, null);
+    assert.equal(event.observedAtMs, 1_753_720_000_000);
+  }
+  for (const event of finalizedBatch.events) {
+    assert.equal(event.confirmationStatus, 'finalized');
+    assert.equal(event.blockchainTimeMs, 1_753_719_999_000);
+    assert.equal(event.observedAtMs, 1_753_720_999_000);
+  }
   assert.equal(processedBatch.events.length, 2);
   assert.equal(processedBatch.transitions.length, 1);
   assert.equal(processedSink.batches.length, 1);
@@ -846,4 +856,120 @@ void test('preserves stage causes and makes no later calls after a failed stage'
 
     assert.equal(sink.batches.length, 1);
   });
+});
+
+void test('preserves a matching observation error at each external boundary', async (t) => {
+  const transaction = transactionFixture();
+
+  await t.test('detection', async () => {
+    const rootCause = new Error('typed detect root cause');
+    const boundaryError = new LaunchpadObservationError(
+      'detect_launches',
+      SOURCE,
+      PROGRAM,
+      transaction.signature,
+      rootCause,
+    );
+    const adapter = new FakeAdapter([], []);
+    adapter.detectError = boundaryError;
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, new RecordingSink()).observe(
+        transaction,
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.equal(error, boundaryError);
+        assert.equal(boundaryError.stage, 'detect_launches');
+        assert.equal(boundaryError.cause, rootCause);
+        return true;
+      },
+    );
+  });
+
+  await t.test('decoding', async () => {
+    const rootCause = new Error('typed decode root cause');
+    const boundaryError = new LaunchpadObservationError(
+      'decode_trades',
+      SOURCE,
+      PROGRAM,
+      transaction.signature,
+      rootCause,
+    );
+    const adapter = new FakeAdapter([], []);
+    adapter.decodeError = boundaryError;
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, new RecordingSink()).observe(
+        transaction,
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.equal(error, boundaryError);
+        assert.equal(boundaryError.stage, 'decode_trades');
+        assert.equal(boundaryError.cause, rootCause);
+        return true;
+      },
+    );
+  });
+
+  await t.test('recording', async () => {
+    const rootCause = new Error('typed record root cause');
+    const boundaryError = new LaunchpadObservationError(
+      'record_batch',
+      SOURCE,
+      PROGRAM,
+      transaction.signature,
+      rootCause,
+    );
+    const mint = 'TypedRecordFailureMint11111111111111111111111111';
+    const adapter = new FakeAdapter([
+      launchFixture({ mint, cursor: cursorFixture(1, null) }),
+    ], []);
+    const sink = new RecordingSink();
+    sink.recordError = boundaryError;
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, sink).observe(
+        transaction,
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.equal(error, boundaryError);
+        assert.equal(boundaryError.stage, 'record_batch');
+        assert.equal(boundaryError.cause, rootCause);
+        return true;
+      },
+    );
+  });
+});
+
+void test('wraps a mismatched typed error with trustworthy current boundary context', async () => {
+  const transaction = transactionFixture();
+  const foreignError = new LaunchpadObservationError(
+    'record_batch',
+    SOURCE,
+    PROGRAM,
+    'SpoofedSignature11111111111111111111111111111',
+    new Error('foreign root cause'),
+  );
+  const adapter = new FakeAdapter([], []);
+  adapter.detectError = foreignError;
+
+  await assert.rejects(
+    new LaunchpadObservationService(adapter, new RecordingSink()).observe(
+      transaction,
+      new Set(),
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof LaunchpadObservationError);
+      assert.notEqual(error, foreignError);
+      assert.equal(error.stage, 'detect_launches');
+      assert.equal(error.source, SOURCE);
+      assert.equal(error.program, PROGRAM);
+      assert.equal(error.signature, transaction.signature);
+      assert.equal(error.cause, foreignError);
+      return true;
+    },
+  );
 });
