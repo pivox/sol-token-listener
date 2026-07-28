@@ -135,6 +135,18 @@ Les états publics sont définis dans `src/domain/launch-status.ts`. Chaque
 transition persistée contient date, événement déclencheur, ancien/nouvel état,
 reason code, message humain et preuves.
 
+## Paper trading
+
+Le moteur Pump.fun V1 est un ledger comptable indépendant du
+`TradeExecutor` Raydium historique. Il ne construit et ne simule aucune
+transaction Solana et ne dépend d’aucun wallet. Il ouvre uniquement en mode
+`paper`, après qualification sans blocker et pour un quote mint autorisé.
+
+Les entrées et sorties utilisent `minimumAmountOutRaw`. Frais, slippage,
+perte aller-retour et PnL restent en `bigint`. Position, trade et événement
+métier sont persistés atomiquement ; les replays sont idempotents. Une
+position fermée est conservée quatre heures avant purge.
+
 Les événements métier sont source-indépendants :
 
 - `TokenLaunchDetected`, `TokenMetadataResolved`, `TokenMetadataFailed` ;
