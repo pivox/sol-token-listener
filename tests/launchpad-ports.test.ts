@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createTokenLaunchDetectedEvent } from '../src/domain/launchpad-events.js';
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
+import {
+  assertValidLaunchpadEventBatch,
+  InvalidLaunchpadEventBatchError,
+} from '../src/ports/launchpad-event-sink.js';
 import type {
   LaunchpadEventBatch,
   LaunchpadEventSink,
@@ -94,6 +98,30 @@ const retractAction: StateTransitionBatchAction = 'retract';
 const invalidAction: StateTransitionBatchAction = 'replace';
 void invalidAction;
 
+// @ts-expect-error A finalized batch cannot request transition retraction.
+const finalizedRetractBatch: LaunchpadEventBatch = {
+  source: 'pumpfun',
+  program: 'Pump111111111111111111111111111111111111111',
+  signature: 'signature',
+  confirmationStatus: 'finalized',
+  events: [],
+  stateTransitionAction: 'retract',
+  transitions: [],
+};
+void finalizedRetractBatch;
+
+// @ts-expect-error An orphaned batch cannot request transition application.
+const orphanedApplyBatch: LaunchpadEventBatch = {
+  source: 'pumpfun',
+  program: 'Pump111111111111111111111111111111111111111',
+  signature: 'signature',
+  confirmationStatus: 'orphaned',
+  events: [],
+  stateTransitionAction: 'apply',
+  transitions: [],
+};
+void orphanedApplyBatch;
+
 void test('accepts specialized adapter transactions and retains its complete contract', async () => {
   const transaction: DecodedTransaction = {
     signature: 'signature',
@@ -148,7 +176,7 @@ void test('preserves input event identity and order in the event-batch result sh
     source: adapter.source,
     program: adapter.programId,
     signature: transaction.signature,
-    confirmationStatus: transaction.confirmationStatus,
+    confirmationStatus: 'processed',
     events: [event],
     stateTransitionAction: applyAction,
     transitions: [createInitialDetectedTransition(event)],
@@ -156,4 +184,243 @@ void test('preserves input event identity and order in the event-batch result sh
 
   assert.equal(retractAction, 'retract');
   assert.deepEqual(result.events, [{ eventId: event.id, outcome: 'created' }]);
+});
+
+void test('makes retract batches empty at compile time', () => {
+  const transaction: DecodedTransaction = {
+    signature: 'orphaned-signature',
+    confirmationStatus: 'orphaned',
+    blockTimeMs: null,
+    observedAtMs: 3,
+    cursor: { slot: 3n, transactionIndex: 0 },
+    raw: null,
+    decodedProgram: 'pumpfun',
+  };
+  const event = createTokenLaunchDetectedEvent({
+    source: adapter.source,
+    program: adapter.programId,
+    transaction,
+    launch: {
+      ...launch,
+      createdAt: {
+        ...launch.createdAt,
+        slot: transaction.cursor.slot,
+        transactionIndex: transaction.cursor.transactionIndex,
+      },
+    },
+  });
+  const transition = createInitialDetectedTransition(event);
+
+  // @ts-expect-error A retract batch carries an exactly empty transition tuple.
+  const invalidRetractBatch: LaunchpadEventBatch = {
+    source: adapter.source,
+    program: adapter.programId,
+    signature: transaction.signature,
+    confirmationStatus: 'orphaned',
+    events: [event],
+    stateTransitionAction: 'retract',
+    transitions: [transition],
+  };
+  void invalidRetractBatch;
+});
+
+void test('runtime validation rejects contradictory action and status combinations', () => {
+  const shared = {
+    source: adapter.source,
+    program: adapter.programId,
+    signature: 'invalid-shape-signature',
+    events: [],
+    transitions: [],
+  };
+  for (const invalid of [
+    {
+      ...shared,
+      confirmationStatus: 'finalized',
+      stateTransitionAction: 'retract',
+    },
+    {
+      ...shared,
+      confirmationStatus: 'orphaned',
+      stateTransitionAction: 'apply',
+    },
+    {
+      ...shared,
+      confirmationStatus: 'orphaned',
+      stateTransitionAction: 'retract',
+      transitions: [{}],
+    },
+    {
+      ...shared,
+      confirmationStatus: 'processed',
+      stateTransitionAction: 'replace',
+    },
+  ]) {
+    assert.throws(
+      () => {
+        assertValidLaunchpadEventBatch(
+          invalid as unknown as LaunchpadEventBatch,
+        );
+      },
+      InvalidLaunchpadEventBatchError,
+    );
+  }
+});
+
+void test('runtime validation rejects event metadata that differs from its batch', () => {
+  const transaction: DecodedTransaction = {
+    signature: 'metadata-signature',
+    confirmationStatus: 'processed',
+    blockTimeMs: null,
+    observedAtMs: 4,
+    cursor: { slot: 4n, transactionIndex: 0 },
+    raw: null,
+    decodedProgram: 'pumpfun',
+  };
+  const event = createTokenLaunchDetectedEvent({
+    source: adapter.source,
+    program: adapter.programId,
+    transaction,
+    launch: {
+      ...launch,
+      createdAt: {
+        ...launch.createdAt,
+        slot: transaction.cursor.slot,
+        transactionIndex: transaction.cursor.transactionIndex,
+      },
+    },
+  });
+  const transition = createInitialDetectedTransition(event);
+  const validBatch = {
+    source: event.source,
+    program: event.program,
+    signature: event.signature,
+    confirmationStatus: event.confirmationStatus,
+    events: [event],
+    stateTransitionAction: 'apply',
+    transitions: [transition],
+  } as const;
+
+  for (const mismatchedEvent of [
+    { ...event, source: 'other-source' },
+    { ...event, program: 'OtherProgram11111111111111111111111111111111' },
+    { ...event, signature: 'other-signature' },
+    { ...event, confirmationStatus: 'confirmed' as const },
+  ]) {
+    assert.throws(
+      () => {
+        assertValidLaunchpadEventBatch({
+          ...validBatch,
+          events: [mismatchedEvent],
+        } as unknown as LaunchpadEventBatch);
+      },
+      InvalidLaunchpadEventBatchError,
+    );
+  }
+});
+
+void test('runtime validation rejects missing, outside, mismatched, or duplicate launch transitions', () => {
+  const transaction: DecodedTransaction = {
+    signature: 'transition-signature',
+    confirmationStatus: 'confirmed',
+    blockTimeMs: 5,
+    observedAtMs: 6,
+    cursor: { slot: 5n, transactionIndex: 0 },
+    raw: null,
+    decodedProgram: 'pumpfun',
+  };
+  const event = createTokenLaunchDetectedEvent({
+    source: adapter.source,
+    program: adapter.programId,
+    transaction,
+    launch: {
+      ...launch,
+      createdAt: {
+        ...launch.createdAt,
+        slot: transaction.cursor.slot,
+        transactionIndex: transaction.cursor.transactionIndex,
+      },
+    },
+  });
+  const transition = createInitialDetectedTransition(event);
+  const validBatch = {
+    source: event.source,
+    program: event.program,
+    signature: event.signature,
+    confirmationStatus: event.confirmationStatus,
+    events: [event],
+    stateTransitionAction: 'apply',
+  } as const;
+
+  for (const transitions of [
+    [],
+    [{ ...transition, triggeringEventId: 'event-outside-this-batch' }],
+    [{ ...transition, mint: 'OtherMint1111111111111111111111111111111111' }],
+    [{ ...transition, triggeringEventType: 'BondingCurveTradeObserved' as const }],
+    [transition, transition],
+  ]) {
+    assert.throws(
+      () => {
+        assertValidLaunchpadEventBatch({
+          ...validBatch,
+          transitions,
+        } as unknown as LaunchpadEventBatch);
+      },
+      InvalidLaunchpadEventBatchError,
+    );
+  }
+});
+
+void test('runtime validation accepts valid apply and retract batches', () => {
+  const transaction: DecodedTransaction = {
+    signature: 'valid-batch-signature',
+    confirmationStatus: 'processed',
+    blockTimeMs: null,
+    observedAtMs: 7,
+    cursor: { slot: 7n, transactionIndex: 0 },
+    raw: null,
+    decodedProgram: 'pumpfun',
+  };
+  const event = createTokenLaunchDetectedEvent({
+    source: adapter.source,
+    program: adapter.programId,
+    transaction,
+    launch: {
+      ...launch,
+      createdAt: {
+        ...launch.createdAt,
+        slot: transaction.cursor.slot,
+        transactionIndex: transaction.cursor.transactionIndex,
+      },
+    },
+  });
+  const transition = createInitialDetectedTransition(event);
+  const applyBatch: LaunchpadEventBatch = {
+    source: event.source,
+    program: event.program,
+    signature: event.signature,
+    confirmationStatus: 'processed',
+    events: [event],
+    stateTransitionAction: 'apply',
+    transitions: [transition],
+  };
+  const orphanedEvent = {
+    ...event,
+    confirmationStatus: 'orphaned' as const,
+  };
+  const retractBatch: LaunchpadEventBatch = {
+    source: orphanedEvent.source,
+    program: orphanedEvent.program,
+    signature: orphanedEvent.signature,
+    confirmationStatus: 'orphaned',
+    events: [orphanedEvent],
+    stateTransitionAction: 'retract',
+    transitions: [],
+  };
+
+  assert.doesNotThrow(() => {
+    assertValidLaunchpadEventBatch(applyBatch);
+  });
+  assert.doesNotThrow(() => {
+    assertValidLaunchpadEventBatch(retractBatch);
+  });
 });

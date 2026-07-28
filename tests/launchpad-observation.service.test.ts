@@ -262,7 +262,7 @@ void test('records a first-seen orphaned launch for audit without applying DETEC
   assert.ok(Object.isFrozen(batch.transitions));
 });
 
-void test('retracts a previously applied launch transition when its transaction becomes orphaned', async () => {
+void test('emits a retract request when a previously observed launch becomes orphaned', async () => {
   const signature = 'OrphanReplaySignature11111111111111111111111111';
   const launch = launchFixture({
     mint: 'OrphanReplayMint111111111111111111111111111111',

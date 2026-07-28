@@ -44,3 +44,18 @@ void test('terminal confirmation conflicts expose both statuses', () => {
     );
   }
 });
+
+void test('finalized to orphaned rejects before a retract request can be applied', () => {
+  let retractionApplied = false;
+
+  assert.throws(
+    () => {
+      reconcileConfirmationStatus('finalized', 'orphaned');
+      retractionApplied = true;
+    },
+    (error: unknown) => error instanceof ConfirmationStatusConflictError
+      && error.current === 'finalized'
+      && error.incoming === 'orphaned',
+  );
+  assert.equal(retractionApplied, false);
+});

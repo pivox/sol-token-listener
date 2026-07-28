@@ -146,16 +146,23 @@ Les événements métier sont source-indépendants :
 `token_launches` et `state_transitions` sont des projections métier. Les
 checkpoints sont indépendants de la source.
 
-Le traitement réclame un événement avec un lease et reste idempotent. Le contrat
-du sink conserve les événements bruts et métier pour audit. Une réconciliation
-vers `orphaned` rétracte les transitions liées aux événements de la projection
-active, sans effacer leur historique ni celui de l’invalidation ; un événement
-orphelin vu pour la première fois ne crée donc aucun état de lancement actif.
-Lors d’une mise à niveau vers `confirmed` ou `finalized`, l’identité de la
-transition reste stable et ses données non identitaires sont réconciliées avec
-le snapshot canonique entrant : le temps blockchain peut notamment remplacer
-le temps d’observation de secours. Ces garanties décrivent le port atomique ;
-aucun sink PostgreSQL correspondant n’est encore implémenté.
+Le traitement réclame un événement avec un lease et reste idempotent.
+`raw_chain_events` est alimenté séparément : le batch du sink conserve les
+événements métier et leur lien vers cette entrée d’audit, sans embarquer le
+payload brut. Un événement `orphaned` vu pour la première fois ne crée aucun
+état actif. Pour un événement existant, la rétraction de ses transitions
+n’intervient qu’après une réconciliation réussie de `processed` ou `confirmed`
+vers `orphaned`, sans effacer l’événement ni l’historique d’invalidation.
+`finalized -> orphaned` et toute sortie de `orphaned` rejettent atomiquement le
+batch avant rétraction.
+
+L’identité de la transition reste stable lors des replays. Indépendamment du
+résultat d’écriture de l’événement, le temps blockchain prime sur le temps
+d’observation de secours et le plus petit temps gagne à source égale. La fusion
+est ainsi commutative : un replay de même confirmation peut enrichir la
+transition avec le temps blockchain, qu’un fallback ultérieur ne remplace
+jamais. Ces garanties décrivent le port atomique ; aucun sink PostgreSQL
+correspondant n’est encore implémenté.
 
 Quand un lancement est terminal et qu’aucune position paper n’est ouverte,
 `terminal_at` est fixé et `purge_after = terminal_at + 4 heures`. Le purgeur ne

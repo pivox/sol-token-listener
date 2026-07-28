@@ -9,13 +9,19 @@ export interface TransitionEvidence {
   readonly program: string;
 }
 
-export interface StateTransition {
+export type TransitionOccurrenceSource = 'blockchain' | 'observation';
+
+export interface TransitionOccurrence {
+  readonly occurredAtMs: number;
+  readonly occurredAtSource: TransitionOccurrenceSource;
+}
+
+export interface StateTransition extends TransitionOccurrence {
   readonly id: string;
   readonly payloadVersion: 1;
   readonly mint: string;
   readonly triggeringEventId: string;
   readonly triggeringEventType: DomainEventType;
-  readonly occurredAtMs: number;
   readonly previousStatus: LaunchStatus | null;
   readonly newStatus: LaunchStatus;
   readonly reasonCode: QualificationReasonCode | null;
@@ -54,6 +60,9 @@ export function createInitialDetectedTransition(
   const newStatus = 'DETECTED';
   assertInitialLaunchTransitionAllowed(previousStatus, newStatus);
   const evidence = Object.freeze({ source: event.source, program: event.program });
+  const occurredAtSource = event.blockchainTimeMs === null
+    ? 'observation'
+    : 'blockchain';
   return Object.freeze({
     id: createDeterministicTransitionId(event.id, previousStatus, newStatus),
     payloadVersion: 1,
@@ -61,11 +70,25 @@ export function createInitialDetectedTransition(
     triggeringEventId: event.id,
     triggeringEventType: event.type,
     occurredAtMs: event.blockchainTimeMs ?? event.observedAtMs,
+    occurredAtSource,
     previousStatus,
     newStatus,
     reasonCode: null,
     message: 'Token launch detected',
     evidence,
+  });
+}
+
+export function reconcileTransitionOccurrence(
+  current: TransitionOccurrence,
+  incoming: TransitionOccurrence,
+): TransitionOccurrence {
+  const winner = current.occurredAtSource === incoming.occurredAtSource
+    ? (current.occurredAtMs <= incoming.occurredAtMs ? current : incoming)
+    : (current.occurredAtSource === 'blockchain' ? current : incoming);
+  return Object.freeze({
+    occurredAtMs: winner.occurredAtMs,
+    occurredAtSource: winner.occurredAtSource,
   });
 }
 

@@ -4,48 +4,197 @@ import type { ChainConfirmationStatus } from '../domain/types.js';
 
 export type EventRecordOutcome = 'created' | 'duplicate' | 'confirmation_updated';
 export type StateTransitionBatchAction = 'apply' | 'retract';
+type ActiveConfirmationStatus = Exclude<ChainConfirmationStatus, 'orphaned'>;
 
 export interface EventRecordResult {
   readonly eventId: string;
   readonly outcome: EventRecordOutcome;
 }
 
-export interface LaunchpadEventBatch {
+interface LaunchpadEventBatchBase {
   readonly source: string;
   readonly program: string;
   readonly signature: string;
-  readonly confirmationStatus: ChainConfirmationStatus;
   readonly events: readonly LaunchpadObservationEventV1[];
-  /**
-   * `apply` atomically applies or upserts the supplied transitions linked by
-   * `triggeringEventId`. `retract` is valid only for an orphaned batch, requires
-   * an empty `transitions` array, and atomically invalidates or removes from the
-   * active launch projection every transition triggered by an input event ID.
-   * Retraction must preserve auditable raw/domain events and invalidation
-   * history; it must not silently delete history. Thus, a first-seen orphaned
-   * event creates no active launch state.
-   */
-  readonly stateTransitionAction: StateTransitionBatchAction;
+}
+
+export interface ApplyLaunchpadEventBatch extends LaunchpadEventBatchBase {
+  readonly confirmationStatus: ActiveConfirmationStatus;
+  readonly stateTransitionAction: 'apply';
   readonly transitions: readonly StateTransition[];
 }
 
+export interface RetractLaunchpadEventBatch extends LaunchpadEventBatchBase {
+  readonly confirmationStatus: 'orphaned';
+  readonly stateTransitionAction: 'retract';
+  readonly transitions: readonly [];
+}
+
+export type LaunchpadEventBatch =
+  | ApplyLaunchpadEventBatch
+  | RetractLaunchpadEventBatch;
+
 export interface LaunchpadEventBatchResult {
   readonly events: readonly EventRecordResult[];
+}
+
+export class InvalidLaunchpadEventBatchError extends Error {
+  public constructor(public readonly reason: string) {
+    super(`Invalid launchpad event batch: ${reason}`);
+    this.name = 'InvalidLaunchpadEventBatchError';
+  }
+}
+
+export function assertValidLaunchpadEventBatch(
+  batch: unknown,
+): asserts batch is LaunchpadEventBatch {
+  if (!isRecord(batch)) {
+    throw new InvalidLaunchpadEventBatchError('batch must be an object');
+  }
+  const {
+    source,
+    program,
+    signature,
+    confirmationStatus,
+    stateTransitionAction,
+    events,
+    transitions,
+  } = batch;
+  if (
+    typeof source !== 'string'
+    || typeof program !== 'string'
+    || typeof signature !== 'string'
+    || !Array.isArray(events)
+    || !Array.isArray(transitions)
+  ) {
+    throw new InvalidLaunchpadEventBatchError(
+      'batch metadata, events, and transitions must have valid shapes',
+    );
+  }
+  if (
+    stateTransitionAction === 'apply'
+    && (
+      confirmationStatus !== 'processed'
+      && confirmationStatus !== 'confirmed'
+      && confirmationStatus !== 'finalized'
+    )
+  ) {
+    throw new InvalidLaunchpadEventBatchError(
+      'apply requires processed, confirmed, or finalized confirmation',
+    );
+  }
+  if (
+    stateTransitionAction === 'retract'
+    && (confirmationStatus !== 'orphaned' || transitions.length !== 0)
+  ) {
+    throw new InvalidLaunchpadEventBatchError(
+      'retract requires orphaned confirmation and no transitions',
+    );
+  }
+  if (stateTransitionAction !== 'apply' && stateTransitionAction !== 'retract') {
+    throw new InvalidLaunchpadEventBatchError(
+      'stateTransitionAction must be apply or retract',
+    );
+  }
+
+  const launchEvents: {
+    readonly id: string;
+    readonly mint: string;
+    readonly type: 'TokenLaunchDetected';
+  }[] = [];
+  for (const event of events) {
+    if (
+      !isRecord(event)
+      || event.source !== source
+      || event.program !== program
+      || event.signature !== signature
+      || event.confirmationStatus !== confirmationStatus
+    ) {
+      throw new InvalidLaunchpadEventBatchError(
+        'every event must match batch source, program, signature, and confirmation',
+      );
+    }
+    if (event.type === 'TokenLaunchDetected') {
+      if (typeof event.id !== 'string' || typeof event.mint !== 'string') {
+        throw new InvalidLaunchpadEventBatchError(
+          'launch events must have string IDs and mints',
+        );
+      }
+      launchEvents.push({
+        id: event.id,
+        mint: event.mint,
+        type: event.type,
+      });
+    }
+  }
+
+  if (stateTransitionAction === 'retract') return;
+  if (transitions.length !== launchEvents.length) {
+    throw new InvalidLaunchpadEventBatchError(
+      'apply requires exactly one transition per launch event',
+    );
+  }
+  const transitionCountByEventId = new Map<string, number>();
+  for (const transition of transitions) {
+    if (!isRecord(transition)) {
+      throw new InvalidLaunchpadEventBatchError('transitions must be objects');
+    }
+    const launchEvent = launchEvents.find(
+      (event) => event.id === transition.triggeringEventId,
+    );
+    if (launchEvent === undefined) {
+      throw new InvalidLaunchpadEventBatchError(
+        'every transition must reference a launch event in the batch',
+      );
+    }
+    if (
+      transition.mint !== launchEvent.mint
+      || transition.triggeringEventType !== launchEvent.type
+    ) {
+      throw new InvalidLaunchpadEventBatchError(
+        'transition mint and type must match its launch event',
+      );
+    }
+    transitionCountByEventId.set(
+      launchEvent.id,
+      (transitionCountByEventId.get(launchEvent.id) ?? 0) + 1,
+    );
+  }
+  if (
+    launchEvents.some(
+      (event) => transitionCountByEventId.get(event.id) !== 1,
+    )
+  ) {
+    throw new InvalidLaunchpadEventBatchError(
+      'each launch event must have exactly one transition',
+    );
+  }
 }
 
 export interface LaunchpadEventSink {
   /**
    * Reconciles event confirmation and the requested transition action in one
    * durable all-or-nothing transaction, returning exactly one result per input
-   * event in input order. For processed/confirmed/finalized replay, deterministic
-   * transition IDs are stable. If event reconciliation keeps or duplicates the
-   * stored event, the sink keeps its stored transition snapshot. If reconciliation
-   * returns `confirmation_updated` to confirmed or finalized, the sink updates
-   * non-identity transition data from the incoming canonical snapshot, including
-   * `occurredAtMs` when blockchain time replaces the observation fallback. An
-   * orphaned batch retracts regardless of any previous apply. Resolves only after
-   * the durable commit; rejection leaves no partial event, transition, projection,
-   * or invalidation-history writes.
+   * event in input order. `apply` atomically upserts transitions linked by
+   * `triggeringEventId`. A first-seen orphaned event is retained for audit but
+   * creates no active transition. For an existing event, retraction occurs only
+   * after successful processed/confirmed-to-orphaned reconciliation and
+   * atomically invalidates or removes that event's transitions from the active
+   * projection while retaining auditable event and invalidation history.
+   * Finalized-to-orphaned and every transition out of orphaned reject the whole
+   * transaction without retraction.
+   *
+   * Deterministic transition IDs remain stable on replay. Independently of
+   * `EventRecordOutcome`, the sink enriches transition occurrence with
+   * `reconcileTransitionOccurrence`: blockchain time outranks observation time,
+   * and the earlier time wins within one source. Thus a same-status replay can
+   * add blockchain time, while an observation fallback can never replace it.
+   * Resolves only after the durable commit; rejection leaves no partial event,
+   * transition, projection, or invalidation-history writes.
    */
   readonly record: (batch: LaunchpadEventBatch) => Promise<LaunchpadEventBatchResult>;
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null;
 }

@@ -88,7 +88,7 @@ Transition identity contains:
 
 - deterministic ID and payload version;
 - mint and triggering event ID/type;
-- occurrence time;
+- occurrence time and its `blockchain` or `observation` source;
 - previous and new state;
 - optional stable qualification reason code;
 - human-readable message;
@@ -110,6 +110,12 @@ both a terminal tracking decision and no open paper position.
 The initial transition is exclusively `null -> DETECTED` for a non-orphaned
 observation. A first-seen orphaned launch retains its domain event for audit but
 does not apply that transition or create active launch state.
+
+`reconcileTransitionOccurrence(current, incoming)` enriches occurrence metadata
+independently of the event-record outcome. Blockchain time always outranks an
+observation-time fallback. Within the same source, the smaller timestamp wins.
+The merge is therefore commutative and order-independent: a late same-status
+replay may add blockchain time, while a later fallback can never replace it.
 
 ## Generic adapter contract
 
@@ -147,8 +153,10 @@ adapter to require a normalized Solana transaction rather than casting
 7. reject duplicate deterministic IDs inside the batch;
 8. sort events by cursor, then place launch detection before a trade on an
    identical cursor;
-9. call the sink once with the complete immutable batch;
-10. return the sink result.
+9. validate the complete batch contract, including event-envelope consistency
+   and exact launch-event/transition membership;
+10. call the sink once with the complete immutable batch;
+11. return the sink result.
 
 This ordering allows a future Pump.fun adapter to emit both creation and initial
 buy from one transaction. Calling the decoder once also prevents repeated use of
@@ -164,7 +172,7 @@ the sink.
 - adapter source and program;
 - signature and input confirmation status;
 - ordered events;
-- a state-transition action, `apply` or `retract`;
+- a discriminated state-transition action, `apply` or `retract`;
 - initial state transitions.
 
 It returns one outcome per event:
@@ -177,13 +185,22 @@ The contract requires a concrete sink to persist the entire batch atomically.
 The sink owns durable idempotency and confirmation upgrades; deterministic IDs
 make those guarantees testable before the PostgreSQL implementation exists.
 
+The batch is a discriminated union. An `apply` batch has `processed`,
+`confirmed`, or `finalized` confirmation and a transition array. A `retract`
+batch has `orphaned` confirmation and an exactly empty transition tuple. The
+exported runtime assertion defends JavaScript and cast boundaries by validating
+that action and status agree, every event shares the batch envelope, and every
+launch event in an `apply` batch has exactly one matching transition with no
+transition linked outside the batch.
+
 For `apply`, the sink atomically applies or upserts the supplied transitions,
-linked to events by `triggeringEventId`. `retract` is valid only for an orphaned
-batch and carries an empty transition array. It atomically invalidates or
-removes from the active launch projection every transition triggered by an
-input event ID while preserving auditable raw/domain events and durable
-invalidation history. Thus both first-seen and replayed orphaned events remain
-auditable without leaving an active `DETECTED` projection.
+linked to events by `triggeringEventId`. A first-seen orphaned event is retained
+for audit and creates no active transition. For an existing event, `retract`
+atomically invalidates or removes its transitions from the active launch
+projection only after successful `processed | confirmed -> orphaned`
+reconciliation, while preserving the domain event and durable invalidation
+history. Raw chain input is ingested separately; the domain event preserves its
+link to that audit history rather than carrying a raw payload in this batch.
 
 This transition action and event confirmation reconciliation belong to the same
 durable all-or-nothing transaction, which still returns exactly one result per
@@ -202,15 +219,16 @@ Allowed upgrades:
 Repeated status and late lower-confirmation observations return `keep`.
 `finalized` and `orphaned` are terminal confirmation states. A conflicting
 transition out of either throws `ConfirmationStatusConflictError` so the system
-cannot silently rewrite finalized history.
+cannot silently rewrite finalized history. In particular,
+`finalized -> orphaned` and every transition out of `orphaned` reject the entire
+batch atomically before any active-projection retraction.
 
-On processed/confirmed/finalized replay, transition identity remains stable. If
-event reconciliation keeps or duplicates the stored event, the sink keeps its
-stored transition snapshot. When reconciliation returns
-`confirmation_updated` to confirmed or finalized, the sink updates non-identity
-transition data from the incoming canonical snapshot; in particular, blockchain
-time may replace an earlier observation-time fallback in `occurredAtMs`.
-Orphaned input retracts the active projection regardless of a previous `apply`.
+On processed/confirmed/finalized replay, transition identity remains stable.
+Independently of whether the event result is `created`, `duplicate`, or
+`confirmation_updated`, the sink merges transition occurrence metadata with
+`reconcileTransitionOccurrence`. Blockchain time outranks observation time and
+the earlier timestamp wins within one source, so enrichment is deterministic
+regardless of replay order.
 
 ## Validation and errors
 
@@ -219,6 +237,8 @@ Errors are typed:
 - `LaunchpadObservationError` identifies `detect_launches`, `decode_trades`,
   `validate_batch`, or `record_batch`, plus source, program, and signature;
 - `InvalidLaunchTransitionError` includes previous and requested states;
+- `InvalidLaunchpadEventBatchError` identifies a contradictory or internally
+  inconsistent batch at a JavaScript or cast boundary;
 - `ConfirmationStatusConflictError` includes current and incoming statuses.
 
 If detection, trade decoding, or validation fails, the sink is not called. If
@@ -254,7 +274,13 @@ Tests run without network or PostgreSQL and cover:
     `retract`, and carry no transitions;
 14. trade-only orphaned batches request `retract`;
 15. processed-to-finalized replay keeps event/transition IDs while exposing the
-    incoming canonical transition timestamp.
+    incoming canonical transition timestamp;
+16. invalid action/status shapes are rejected at compile time and runtime;
+17. mismatched event envelopes and missing, extra, or mismatched launch
+    transitions are rejected;
+18. occurrence enrichment is commutative, prefers blockchain time, and chooses
+    the earlier timestamp within one source;
+19. finalized-to-orphaned reconciliation rejects before any retraction.
 
 The existing build, strict type-check, lint, migration-contract, Raydium fixture,
 risk, session, and paper-execution tests must remain green.
@@ -273,4 +299,6 @@ risk, session, and paper-execution tests must remain green.
 - replay produces identical IDs;
 - normal observations request transition `apply`, while orphaned observations
   request `retract` with a frozen empty transition list;
+- contradictory batch shapes are unrepresentable in TypeScript and rejected at
+  runtime boundaries;
 - all existing and new tests pass.

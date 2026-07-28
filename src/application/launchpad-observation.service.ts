@@ -19,6 +19,7 @@ import type {
   TokenLaunch,
 } from '../domain/types.js';
 import type { LaunchpadAdapter } from '../ports/launchpad-adapter.js';
+import { assertValidLaunchpadEventBatch } from '../ports/launchpad-event-sink.js';
 import type {
   EventRecordResult,
   LaunchpadEventBatch,
@@ -212,23 +213,37 @@ function createValidatedBatch(
   const frozenEvents: readonly LaunchpadObservationEventV1[] = Object.freeze(events);
   if (frozenEvents.length === 0) return null;
 
-  const isOrphaned = envelope.transaction.confirmationStatus === 'orphaned';
-  const transitions = isOrphaned
-    ? Object.freeze([])
-    : Object.freeze(
-      frozenEvents
-        .filter((event) => event.type === 'TokenLaunchDetected')
-        .map(createInitialDetectedTransition),
-    );
-  return Object.freeze({
+  const confirmationStatus = envelope.transaction.confirmationStatus;
+  if (confirmationStatus === 'orphaned') {
+    const transitions: readonly [] = Object.freeze([]);
+    const batch: LaunchpadEventBatch = Object.freeze({
+      source: envelope.source,
+      program: envelope.program,
+      signature: envelope.transaction.signature,
+      confirmationStatus,
+      events: frozenEvents,
+      stateTransitionAction: 'retract',
+      transitions,
+    });
+    assertValidLaunchpadEventBatch(batch);
+    return batch;
+  }
+
+  const batch: LaunchpadEventBatch = Object.freeze({
     source: envelope.source,
     program: envelope.program,
     signature: envelope.transaction.signature,
-    confirmationStatus: envelope.transaction.confirmationStatus,
+    confirmationStatus,
     events: frozenEvents,
-    stateTransitionAction: isOrphaned ? 'retract' : 'apply',
-    transitions,
+    stateTransitionAction: 'apply',
+    transitions: Object.freeze(
+      frozenEvents
+        .filter((event) => event.type === 'TokenLaunchDetected')
+        .map(createInitialDetectedTransition),
+    ),
   });
+  assertValidLaunchpadEventBatch(batch);
+  return batch;
 }
 
 function createValidatedTradeEvents(

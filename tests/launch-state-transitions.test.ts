@@ -5,6 +5,7 @@ import {
   assertInitialLaunchTransitionAllowed,
   createInitialDetectedTransition,
   InvalidLaunchTransitionError,
+  reconcileTransitionOccurrence,
 } from '../src/domain/state-transitions.js';
 import type { TokenLaunchDetectedEventV1 } from '../src/domain/launchpad-events.js';
 
@@ -54,6 +55,7 @@ void test('initial detected transition records its triggering event and evidence
   assert.equal(transition.triggeringEventId, launchDetected.id);
   assert.equal(transition.triggeringEventType, launchDetected.type);
   assert.equal(transition.occurredAtMs, launchDetected.blockchainTimeMs);
+  assert.equal(transition.occurredAtSource, 'blockchain');
   assert.equal(transition.previousStatus, null);
   assert.equal(transition.newStatus, 'DETECTED');
   assert.equal(transition.reasonCode, null);
@@ -86,8 +88,69 @@ void test('initial detected transition falls back to observed time and remains i
   const transition = createInitialDetectedTransition({ ...launchDetected, blockchainTimeMs: null });
 
   assert.equal(transition.occurredAtMs, launchDetected.observedAtMs);
+  assert.equal(transition.occurredAtSource, 'observation');
   assert.throws(() => {
     (transition.evidence as { source: string }).source = 'changed';
   }, TypeError);
   assert.equal(transition.evidence.source, launchDetected.source);
+});
+
+void test('enriches occurrence deterministically across fallback and blockchain replays', () => {
+  const processedFallback = createInitialDetectedTransition({
+    ...launchDetected,
+    confirmationStatus: 'processed',
+    blockchainTimeMs: null,
+    observedAtMs: 1_753_700_000_500,
+  });
+  const confirmedEarlierFallback = createInitialDetectedTransition({
+    ...launchDetected,
+    confirmationStatus: 'confirmed',
+    blockchainTimeMs: null,
+    observedAtMs: 1_753_700_000_400,
+  });
+  const confirmedBlockchain = createInitialDetectedTransition({
+    ...launchDetected,
+    confirmationStatus: 'confirmed',
+    blockchainTimeMs: 1_753_700_000_450,
+    observedAtMs: 1_753_700_000_600,
+  });
+  const laterFallback = createInitialDetectedTransition({
+    ...launchDetected,
+    confirmationStatus: 'confirmed',
+    blockchainTimeMs: null,
+    observedAtMs: 1_753_700_000_300,
+  });
+
+  const fallbackOccurrence = reconcileTransitionOccurrence(
+    processedFallback,
+    confirmedEarlierFallback,
+  );
+  assert.deepEqual(fallbackOccurrence, {
+    occurredAtMs: confirmedEarlierFallback.occurredAtMs,
+    occurredAtSource: 'observation',
+  });
+  assert.deepEqual(
+    reconcileTransitionOccurrence(
+      confirmedEarlierFallback,
+      processedFallback,
+    ),
+    fallbackOccurrence,
+  );
+
+  const blockchainOccurrence = reconcileTransitionOccurrence(
+    fallbackOccurrence,
+    confirmedBlockchain,
+  );
+  assert.deepEqual(blockchainOccurrence, {
+    occurredAtMs: confirmedBlockchain.occurredAtMs,
+    occurredAtSource: 'blockchain',
+  });
+  assert.deepEqual(
+    reconcileTransitionOccurrence(confirmedBlockchain, fallbackOccurrence),
+    blockchainOccurrence,
+  );
+  assert.deepEqual(
+    reconcileTransitionOccurrence(blockchainOccurrence, laterFallback),
+    blockchainOccurrence,
+  );
 });
