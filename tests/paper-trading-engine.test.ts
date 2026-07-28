@@ -78,6 +78,22 @@ void test('rejoue une ouverture identique devenue visible après le verrou', asy
   assert.equal(concurrentRepository.writeCount, 0);
 });
 
+void test('rejoue une position déjà terminale devenue visible après le verrou', async () => {
+  const seedRepository = new MemoryPaperRepository();
+  const command = openCommand();
+  const opened = await makeEngine(seedRepository, 'paper').open(command);
+  const terminal = await makeEngine(seedRepository, 'paper').close(
+    closeCommand(opened.id),
+  );
+  const concurrentRepository = new TerminalReplayRepository(terminal);
+
+  const replay = await makeEngine(concurrentRepository, 'paper').open(command);
+
+  assert.equal(replay.id, terminal.id);
+  assert.equal(replay.status, 'PAPER_CLOSED');
+  assert.equal(concurrentRepository.writeCount, 0);
+});
+
 void test('refuse une qualification non acceptée', async () => {
   const repository = new MemoryPaperRepository();
   const command = openCommand();
@@ -430,6 +446,35 @@ class ConcurrentReplayRepository implements PaperTradingRepository {
     return operation({
       findPosition: async () => null,
       findActivePosition: async () => this.active,
+      insertOpened: async () => {
+        this.writeCount += 1;
+      },
+      updateClosed: async () => {
+        this.writeCount += 1;
+      },
+      reconcileEventConfirmation: async () => undefined,
+      retractPosition: async () => {
+        this.writeCount += 1;
+      },
+    });
+  }
+}
+
+class TerminalReplayRepository implements PaperTradingRepository {
+  public writeCount = 0;
+  private positionReadCount = 0;
+
+  public constructor(private readonly terminal: PaperPosition) {}
+
+  public async transact<T>(
+    operation: (transaction: PaperTradingTransaction) => Promise<T>,
+  ): Promise<T> {
+    return operation({
+      findPosition: async () => {
+        this.positionReadCount += 1;
+        return this.positionReadCount === 1 ? null : this.terminal;
+      },
+      findActivePosition: async () => null,
       insertOpened: async () => {
         this.writeCount += 1;
       },

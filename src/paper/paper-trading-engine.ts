@@ -93,6 +93,15 @@ export class PaperTradingEngine {
         }
         conflict();
       }
+      const terminalReplay = await transaction.findPosition(positionId);
+      if (terminalReplay !== null) {
+        return this.reconcileOpenReplay(
+          transaction,
+          terminalReplay,
+          openCommandHash,
+          snapshot.trigger,
+        );
+      }
       rejectOrphanedTrigger(snapshot.trigger);
       const tradeId = hashId('paper_trade', [positionId, 'BUY']);
       const trade = freeze({
