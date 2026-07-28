@@ -9,9 +9,11 @@ void test('classe un BUY Token-2022 par deltas réels des vaults', async () => {
   const { pool, transaction } = await loadSwapFixture('buy-token2022-mainnet.json');
   const events = classifyTransactionSwaps(transaction, PROGRAM, [pool]);
   assert.equal(events.length, 1);
-  assert.equal(events[0].kind, 'BUY');
-  assert.equal(events[0].amountWsolRaw, 90_000_000n);
-  assert.equal(events[0].amountTokenRaw, 507_380_634_821_292n);
+  const event = events[0];
+  assert.ok(event);
+  assert.equal(event.kind, 'BUY');
+  assert.equal(event.amountWsolRaw, 90_000_000n);
+  assert.equal(event.amountTokenRaw, 507_380_634_821_292n);
 });
 
 void test('classe un SELL V0 invoqué par CPI et conserve les index intra-slot', async () => {

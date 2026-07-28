@@ -62,11 +62,11 @@ export interface DecodedPoolState {
   readonly tokenProgramA: string;
   readonly tokenProgramB: string;
   readonly observation: string;
-  readonly bump: number | undefined;
-  readonly status: number | undefined;
-  readonly lpDecimals: number | undefined;
-  readonly mintDecimalsA: number | undefined;
-  readonly mintDecimalsB: number | undefined;
+  readonly bump: number;
+  readonly status: number;
+  readonly lpDecimals: number;
+  readonly mintDecimalsA: number;
+  readonly mintDecimalsB: number;
   readonly lpSupplyRaw: bigint;
   readonly protocolFeesA: bigint;
   readonly protocolFeesB: bigint;
@@ -74,7 +74,7 @@ export interface DecodedPoolState {
   readonly fundFeesB: bigint;
   readonly openTimeUnix: bigint;
   readonly recentEpoch: bigint;
-  readonly feeOn: number | undefined;
+  readonly feeOn: number;
   readonly enableCreatorFee: boolean;
   readonly creatorFeesA: bigint;
   readonly creatorFeesB: bigint;

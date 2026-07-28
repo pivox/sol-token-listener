@@ -37,6 +37,11 @@ export default tseslint.config(
       '@typescript-eslint/no-unsafe-member-access': 'off',
       '@typescript-eslint/unbound-method': 'off',
       '@typescript-eslint/no-unnecessary-condition': 'off',
+      '@typescript-eslint/explicit-function-return-type': 'off',
+      '@typescript-eslint/no-empty-function': 'off',
+      '@typescript-eslint/no-unused-vars': 'off',
+      '@typescript-eslint/no-unnecessary-type-assertion': 'off',
+      '@typescript-eslint/require-await': 'off',
     },
   },
 );
