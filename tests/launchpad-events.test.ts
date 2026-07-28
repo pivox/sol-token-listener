@@ -5,6 +5,7 @@ import {
   createTokenLaunchDetectedEvent,
   UnsupportedLaunchParameterValueError,
 } from '../src/domain/launchpad-events.js';
+import { InvalidChainCursorError } from '../src/domain/cursor.js';
 import type {
   LaunchpadTrade,
   ObservedChainTransaction,
@@ -211,6 +212,51 @@ void test('rejette les valeurs de paramètres non normalisées avec leur chemin'
         && error.message.includes('parameters.invalid'),
     );
   }
+});
+
+void test('normalise -0 en zéro positif dans les paramètres émis', () => {
+  const event = createTokenLaunchDetectedEvent({
+    source: 'pumpfun',
+    program: PROGRAM,
+    transaction,
+    launch: {
+      ...launch,
+      parameters: {
+        scalar: -0,
+        nested: [-0, { value: -0 }],
+      },
+    },
+  });
+
+  assert.equal(event.payload.launch.parameters.scalar, 0);
+  assert.equal(Object.is(event.payload.launch.parameters.scalar, -0), false);
+  const nested = event.payload.launch.parameters.nested;
+  assert.ok(Array.isArray(nested));
+  assert.equal(Object.is(nested[0], -0), false);
+  const nestedObject = nested[1];
+  assert.ok(nestedObject && typeof nestedObject === 'object' && !Array.isArray(nestedObject));
+  assert.equal(Object.is(nestedObject.value, -0), false);
+});
+
+void test('la fabrique d’événement rejette directement un curseur non canonique', () => {
+  assert.throws(
+    () => createTokenLaunchDetectedEvent({
+      source: 'pumpfun',
+      program: PROGRAM,
+      transaction,
+      launch: {
+        ...launch,
+        createdAt: {
+          ...launch.createdAt,
+          instructionIndex: Number.NaN,
+        },
+      },
+    }),
+    (error: unknown) =>
+      error instanceof InvalidChainCursorError
+      && error.field === 'instructionIndex'
+      && Number.isNaN(error.value),
+  );
 });
 
 void test('préserve __proto__ comme donnée propre et rejette les clés ou structures non normalisées', () => {

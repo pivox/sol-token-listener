@@ -1,5 +1,9 @@
 import { isDeepStrictEqual } from 'node:util';
-import { compareCursors } from '../domain/cursor.js';
+import {
+  assertValidChainCursor,
+  assertValidTransactionCursor,
+  compareCursors,
+} from '../domain/cursor.js';
 import {
   createBondingCurveTradeObservedEvent,
   createTokenLaunchDetectedEvent,
@@ -49,6 +53,13 @@ export class LaunchpadObservationService<
       transaction,
     );
     const authoritativeTrackedMints = new Set(alreadyTrackedMints);
+    await this.runStage(
+      'validate_batch',
+      envelope,
+      () => {
+        assertValidTransactionCursor(envelope.transaction.cursor);
+      },
+    );
     const detectedLaunches = await this.runStage(
       'detect_launches',
       envelope,
@@ -245,6 +256,7 @@ function assertCursorBelongsToTransaction(
   cursor: ChainCursor,
   transaction: ObservedChainTransaction,
 ): void {
+  assertValidChainCursor(cursor);
   if (cursor.slot !== transaction.cursor.slot) {
     throw new Error(
       `${observationType} cursor slot ${cursor.slot} does not match transaction slot ${transaction.cursor.slot}`,

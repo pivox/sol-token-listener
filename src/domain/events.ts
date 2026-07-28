@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { assertValidChainCursor } from './cursor.js';
 import type { ChainConfirmationStatus, ChainCursor } from './types.js';
 
 export const DOMAIN_EVENT_TYPES = [
@@ -56,7 +57,8 @@ export interface ChainEventIdentity {
 
 export function createDeterministicChainEventId(identity: ChainEventIdentity): string {
   const { cursor } = identity;
-  const canonical = [
+  assertValidChainCursor(cursor);
+  const canonical = JSON.stringify([
     identity.type,
     identity.mint,
     identity.source,
@@ -66,6 +68,6 @@ export function createDeterministicChainEventId(identity: ChainEventIdentity): s
     cursor.transactionIndex.toString(),
     cursor.instructionIndex.toString(),
     cursor.innerInstructionIndex === null ? 'outer' : cursor.innerInstructionIndex.toString(),
-  ].join('\u001f');
+  ]);
   return `evt_${createHash('sha256').update(canonical).digest('hex')}`;
 }

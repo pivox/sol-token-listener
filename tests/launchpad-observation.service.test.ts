@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { LaunchpadObservationError } from '../src/application/launchpad-observation-errors.js';
 import { LaunchpadObservationService } from '../src/application/launchpad-observation.service.js';
+import { InvalidChainCursorError } from '../src/domain/cursor.js';
 import { createBondingCurveTradeObservedEvent } from '../src/domain/launchpad-events.js';
 import type {
   BondingCurveState,
@@ -574,6 +575,128 @@ void test('collapses identical launch definitions while preserving every quote a
     assert.fail('Expected one normalized launch event');
   }
   assert.deepEqual(event.payload.launch.quoteAssets, [SOL, USDC]);
+});
+
+void test('collapses launch definitions whose parameters differ only by 0 and -0', async () => {
+  const launch = {
+    ...launchFixture({
+      mint: 'CanonicalZeroMint11111111111111111111111111111',
+      cursor: cursorFixture(1, null),
+    }),
+    parameters: { initialVirtualReserve: 0 },
+  };
+  const duplicate = {
+    ...launch,
+    createdAt: { ...launch.createdAt },
+    parameters: { initialVirtualReserve: -0 },
+  };
+  const adapter = new FakeAdapter([launch, duplicate], []);
+  const sink = new RecordingSink();
+
+  await new LaunchpadObservationService(adapter, sink).observe(
+    transactionFixture(),
+    new Set(),
+  );
+
+  const batch = sink.batches[0];
+  assert.ok(batch);
+  assert.equal(batch.events.length, 1);
+  const event = batch.events[0];
+  assert.equal(event?.type, 'TokenLaunchDetected');
+  if (event?.type !== 'TokenLaunchDetected') {
+    assert.fail('Expected one normalized launch event');
+  }
+  assert.equal(event.payload.launch.parameters.initialVirtualReserve, 0);
+  assert.equal(
+    Object.is(event.payload.launch.parameters.initialVirtualReserve, -0),
+    false,
+  );
+});
+
+void test('rejette les curseurs non canoniques à la bonne étape sans appel ultérieur', async (t) => {
+  await t.test('transaction before detection', async () => {
+    const adapter = new FakeAdapter([], []);
+    const sink = new RecordingSink();
+    const transaction: StrictTransaction = {
+      ...transactionFixture(),
+      cursor: { slot: 500n, transactionIndex: -0 },
+    };
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, sink).observe(
+        transaction,
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof LaunchpadObservationError);
+        assert.equal(error.stage, 'validate_batch');
+        assert.ok(error.cause instanceof InvalidChainCursorError);
+        assert.equal(error.cause.field, 'transactionIndex');
+        assert.equal(Object.is(error.cause.value, -0), true);
+        return true;
+      },
+    );
+
+    assert.equal(adapter.detectCalls.length, 0);
+    assert.equal(adapter.decodeCalls.length, 0);
+    assert.equal(sink.batches.length, 0);
+  });
+
+  await t.test('launch before trade decoding', async () => {
+    const invalidLaunch = launchFixture({
+      mint: 'InvalidCursorLaunch111111111111111111111111111',
+      cursor: cursorFixture(-0, null),
+    });
+    const adapter = new FakeAdapter([invalidLaunch], []);
+    const sink = new RecordingSink();
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, sink).observe(
+        transactionFixture(),
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof LaunchpadObservationError);
+        assert.equal(error.stage, 'validate_batch');
+        assert.ok(error.cause instanceof InvalidChainCursorError);
+        assert.equal(error.cause.field, 'instructionIndex');
+        return true;
+      },
+    );
+
+    assert.equal(adapter.detectCalls.length, 1);
+    assert.equal(adapter.decodeCalls.length, 0);
+    assert.equal(sink.batches.length, 0);
+  });
+
+  await t.test('trade before recording', async () => {
+    const trackedMint = 'InvalidCursorTradeMint111111111111111111111111';
+    const invalidTrade = tradeFixture({
+      id: 'invalid-cursor-trade',
+      launchMint: trackedMint,
+      cursor: cursorFixture(2, Number.NaN),
+    });
+    const adapter = new FakeAdapter([], [invalidTrade]);
+    const sink = new RecordingSink();
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, sink).observe(
+        transactionFixture(),
+        new Set([trackedMint]),
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof LaunchpadObservationError);
+        assert.equal(error.stage, 'validate_batch');
+        assert.ok(error.cause instanceof InvalidChainCursorError);
+        assert.equal(error.cause.field, 'innerInstructionIndex');
+        return true;
+      },
+    );
+
+    assert.equal(adapter.detectCalls.length, 1);
+    assert.equal(adapter.decodeCalls.length, 1);
+    assert.equal(sink.batches.length, 0);
+  });
 });
 
 void test('rejects invalid launch definitions before trade decoding or recording', async (t) => {

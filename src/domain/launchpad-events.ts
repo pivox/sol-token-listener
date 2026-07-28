@@ -189,7 +189,7 @@ function snapshotLaunchParameterValue(
   }
   if (typeof value === 'number') {
     if (!Number.isSafeInteger(value)) throw new UnsupportedLaunchParameterValueError(path);
-    return value;
+    return Object.is(value, -0) ? 0 : value;
   }
   if (Array.isArray(value)) {
     if (ancestors.has(value)) throw new UnsupportedLaunchParameterValueError(path);

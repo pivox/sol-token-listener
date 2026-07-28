@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { compareCursors } from '../src/domain/cursor.js';
+import {
+  assertValidChainCursor,
+  assertValidTransactionCursor,
+  compareCursors,
+  InvalidChainCursorError,
+} from '../src/domain/cursor.js';
 import { createDeterministicChainEventId } from '../src/domain/events.js';
 import { isTerminalLaunchStatus, LAUNCH_STATUSES } from '../src/domain/launch-status.js';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
@@ -83,6 +88,181 @@ void test('l’identifiant métier est déterministe et inclut l’index interne
   assert.match(first, /^evt_[a-f0-9]{64}$/u);
   assert.notEqual(first, nextInner);
   assert.notEqual(first, otherMint);
+});
+
+void test('l’identité métier encode sans ambiguïté les champs contenant le séparateur historique', () => {
+  const base = {
+    type: 'TokenLaunchDetected',
+    mint: 'Mint111111111111111111111111111111111111111',
+    signature: '5NfSignature',
+    cursor: {
+      slot: 123n,
+      transactionIndex: 9,
+      instructionIndex: 2,
+      innerInstructionIndex: null,
+    },
+  } as const;
+
+  const separatorInSource = createDeterministicChainEventId({
+    ...base,
+    source: 'a\u001fb',
+    program: 'c',
+  });
+  const separatorInProgram = createDeterministicChainEventId({
+    ...base,
+    source: 'a',
+    program: 'b\u001fc',
+  });
+
+  assert.notEqual(separatorInSource, separatorInProgram);
+});
+
+void test('valide les bornes canoniques des curseurs de transaction et de chaîne', () => {
+  assert.doesNotThrow(() => {
+    assertValidTransactionCursor({
+      slot: 0n,
+      transactionIndex: 0,
+    });
+  });
+  assert.doesNotThrow(() => {
+    assertValidChainCursor({
+      slot: 0n,
+      transactionIndex: Number.MAX_SAFE_INTEGER,
+      instructionIndex: Number.MAX_SAFE_INTEGER,
+      innerInstructionIndex: 0,
+    });
+  });
+  assert.doesNotThrow(() => {
+    assertValidChainCursor({
+      slot: 1n,
+      transactionIndex: 0,
+      instructionIndex: 0,
+      innerInstructionIndex: null,
+    });
+  });
+});
+
+void test('rejette chaque forme non canonique de curseur avec le champ et la valeur fautifs', () => {
+  const invalidCursors: readonly {
+    readonly field: InvalidChainCursorError['field'];
+    readonly value: bigint | number;
+    readonly cursor: ChainCursor;
+  }[] = [
+    {
+      field: 'slot',
+      value: -1n,
+      cursor: {
+        slot: -1n,
+        transactionIndex: 0,
+        instructionIndex: 0,
+        innerInstructionIndex: null,
+      },
+    },
+    {
+      field: 'transactionIndex',
+      value: -0,
+      cursor: {
+        slot: 0n,
+        transactionIndex: -0,
+        instructionIndex: 0,
+        innerInstructionIndex: null,
+      },
+    },
+    {
+      field: 'instructionIndex',
+      value: Number.NaN,
+      cursor: {
+        slot: 0n,
+        transactionIndex: 0,
+        instructionIndex: Number.NaN,
+        innerInstructionIndex: null,
+      },
+    },
+    {
+      field: 'instructionIndex',
+      value: 1.5,
+      cursor: {
+        slot: 0n,
+        transactionIndex: 0,
+        instructionIndex: 1.5,
+        innerInstructionIndex: null,
+      },
+    },
+    {
+      field: 'instructionIndex',
+      value: Number.POSITIVE_INFINITY,
+      cursor: {
+        slot: 0n,
+        transactionIndex: 0,
+        instructionIndex: Number.POSITIVE_INFINITY,
+        innerInstructionIndex: null,
+      },
+    },
+    {
+      field: 'instructionIndex',
+      value: Number.MAX_SAFE_INTEGER + 1,
+      cursor: {
+        slot: 0n,
+        transactionIndex: 0,
+        instructionIndex: Number.MAX_SAFE_INTEGER + 1,
+        innerInstructionIndex: null,
+      },
+    },
+    {
+      field: 'innerInstructionIndex',
+      value: -1,
+      cursor: {
+        slot: 0n,
+        transactionIndex: 0,
+        instructionIndex: 0,
+        innerInstructionIndex: -1,
+      },
+    },
+  ];
+
+  for (const invalid of invalidCursors) {
+    assert.throws(
+      () => {
+        assertValidChainCursor(invalid.cursor);
+      },
+      (error: unknown) =>
+        error instanceof InvalidChainCursorError
+        && error.field === invalid.field
+        && Object.is(error.value, invalid.value),
+    );
+  }
+});
+
+void test('le hachage et la comparaison refusent directement les curseurs non canoniques', () => {
+  const validCursor: ChainCursor = {
+    slot: 1n,
+    transactionIndex: 0,
+    instructionIndex: 0,
+    innerInstructionIndex: null,
+  };
+  const invalidCursor: ChainCursor = {
+    ...validCursor,
+    instructionIndex: -0,
+  };
+
+  assert.throws(
+    () => createDeterministicChainEventId({
+      type: 'TokenLaunchDetected',
+      mint: 'Mint111111111111111111111111111111111111111',
+      source: 'solana',
+      program: 'Program111111111111111111111111111111111111',
+      signature: '5NfSignature',
+      cursor: invalidCursor,
+    }),
+    (error: unknown) =>
+      error instanceof InvalidChainCursorError
+      && error.field === 'instructionIndex'
+      && Object.is(error.value, -0),
+  );
+  assert.throws(
+    () => compareCursors(validCursor, invalidCursor),
+    InvalidChainCursorError,
+  );
 });
 
 void test('les états métier et reason codes V1 sont stables et explicites', () => {
