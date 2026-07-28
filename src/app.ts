@@ -1,31 +1,35 @@
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config/env.js';
+import { closeDatabase, migrateDatabase } from './storage/database.js';
+import { logger } from './utils/logger.js';
 
-export function main(): void {
+export async function main(): Promise<void> {
   const config = loadConfig();
-  const startup = {
-    component: 'sol-token-listener',
-    event: 'listener.starting',
+  if (config.autoMigrate) {
+    const appliedMigrations = await migrateDatabase();
+    logger.info({ appliedMigrations }, 'Migrations PostgreSQL appliquées.');
+  }
+  logger.info({
+    event: 'listener.foundation_ready',
     executionMode: config.executionMode,
     cluster: config.cluster,
     paperQuoteMintAllowlist: config.paperQuoteMintAllowlist,
     qualificationRuleSetStatus: config.qualificationRuleSetStatus,
-  };
-
-  process.stdout.write(`${JSON.stringify(startup)}\n`);
+    pumpFunListenerActive: false,
+    transactionSubmissionEnabled: false,
+  }, 'Socle d’observation prêt; l’adaptateur Pump.fun sera activé dans une PR ultérieure.');
+  await closeDatabase();
 }
 
 const entrypoint = process.argv[1];
 if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {
-  try {
-    main();
-  } catch (error: unknown) {
+  void main().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`${JSON.stringify({
-      component: 'sol-token-listener',
+    logger.fatal({
       event: 'listener.start_failed',
       error: message,
-    })}\n`);
+    }, 'Initialisation du socle impossible.');
     process.exitCode = 1;
-  }
+    return closeDatabase();
+  });
 }

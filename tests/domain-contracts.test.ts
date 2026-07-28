@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { compareCursors } from '../src/domain/cursor.js';
 import { createDeterministicChainEventId } from '../src/domain/events.js';
+import { isTerminalLaunchStatus, LAUNCH_STATUSES } from '../src/domain/launch-status.js';
+import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
 import type { ChainCursor, QuoteAsset, TokenLaunch } from '../src/domain/types.js';
 
 const SOL: QuoteAsset = {
@@ -75,4 +77,13 @@ void test('l’identifiant métier est déterministe et inclut l’index interne
   assert.equal(first, same);
   assert.match(first, /^evt_[a-f0-9]{64}$/u);
   assert.notEqual(first, nextInner);
+});
+
+void test('les états métier et reason codes V1 sont stables et explicites', () => {
+  assert.ok(LAUNCH_STATUSES.includes('BONDING_CURVE_COMPLETE'));
+  assert.ok(LAUNCH_STATUSES.includes('PUMPSWAP_ACTIVE'));
+  assert.equal(isTerminalLaunchStatus('PAPER_CLOSED'), true);
+  assert.equal(isTerminalLaunchStatus('PAPER_HOLDING'), false);
+  assert.ok(QUALIFICATION_REASON_CODES.includes('CREATOR_EARLY_SELL'));
+  assert.ok(QUALIFICATION_REASON_CODES.includes('UNSUPPORTED_QUOTE_MINT'));
 });

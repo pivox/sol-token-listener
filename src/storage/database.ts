@@ -65,6 +65,46 @@ export async function migrateDatabase(options: {
   return applied;
 }
 
+export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool()): Promise<{
+  readonly stateTransitions: number;
+  readonly domainEvents: number;
+  readonly rawChainEvents: number;
+  readonly tokenLaunches: number;
+}> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const transitions = await client.query(
+      'DELETE FROM state_transitions WHERE purge_after <= NOW()',
+    );
+    const domainEvents = await client.query(
+      'DELETE FROM domain_events WHERE purge_after <= NOW()',
+    );
+    const rawEvents = await client.query(
+      `DELETE FROM raw_chain_events raw
+       WHERE raw.purge_after <= NOW()
+         AND NOT EXISTS (
+           SELECT 1 FROM domain_events domain_event WHERE domain_event.raw_event_id = raw.event_id
+         )`,
+    );
+    const launches = await client.query(
+      'DELETE FROM token_launches WHERE purge_after <= NOW()',
+    );
+    await client.query('COMMIT');
+    return {
+      stateTransitions: transitions.rowCount ?? 0,
+      domainEvents: domainEvents.rowCount ?? 0,
+      rawChainEvents: rawEvents.rowCount ?? 0,
+      tokenLaunches: launches.rowCount ?? 0,
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function migrationExists(client: PoolClient, version: string): Promise<boolean> {
   const result = await client.query<{ readonly exists: boolean }>(
     'SELECT EXISTS(SELECT 1 FROM migration_history WHERE version = $1) AS exists',
