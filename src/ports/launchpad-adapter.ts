@@ -6,15 +6,15 @@ import type {
 } from '../domain/types.js';
 
 export interface LaunchpadAdapter<
-  TTransaction extends ObservedChainTransaction = ObservedChainTransaction,
+  in TTransaction extends ObservedChainTransaction = ObservedChainTransaction,
 > {
   readonly source: string;
   readonly programId: string;
 
-  detectLaunches(transaction: TTransaction): Promise<readonly TokenLaunch[]>;
-  decodeTrades(
+  readonly detectLaunches: (transaction: TTransaction) => Promise<readonly TokenLaunch[]>;
+  readonly decodeTrades: (
     transaction: TTransaction,
     trackedMints: ReadonlySet<string>,
-  ): Promise<readonly LaunchpadTrade[]>;
-  readBondingCurveState(launch: TokenLaunch): Promise<BondingCurveState>;
+  ) => Promise<readonly LaunchpadTrade[]>;
+  readonly readBondingCurveState: (launch: TokenLaunch) => Promise<BondingCurveState>;
 }

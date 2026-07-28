@@ -23,5 +23,11 @@ export interface LaunchpadEventBatchResult {
 }
 
 export interface LaunchpadEventSink {
-  record(batch: LaunchpadEventBatch): Promise<LaunchpadEventBatchResult>;
+  /**
+   * Writes events and transitions atomically: either the whole batch commits durably or none does.
+   * Resolves only after that durable commit. Deterministic IDs make replay idempotent; an existing
+   * event's confirmation may reconcile only monotonically under domain rules. Returns exactly one
+   * result per input event in input order. Rejection leaves no partial batch writes.
+   */
+  readonly record: (batch: LaunchpadEventBatch) => Promise<LaunchpadEventBatchResult>;
 }

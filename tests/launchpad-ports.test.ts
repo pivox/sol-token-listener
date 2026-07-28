@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { LaunchpadEventSink } from '../src/ports/launchpad-event-sink.js';
+import { createTokenLaunchDetectedEvent } from '../src/domain/launchpad-events.js';
+import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
+import type {
+  LaunchpadEventBatch,
+  LaunchpadEventSink,
+} from '../src/ports/launchpad-event-sink.js';
 import type { LaunchpadAdapter } from '../src/ports/launchpad-adapter.js';
 import type {
   BondingCurveState,
@@ -60,11 +65,27 @@ const adapter: LaunchpadAdapter<DecodedTransaction> = {
   },
 };
 
+// @ts-expect-error A decoded-only adapter cannot consume every observed transaction.
+const broadlyTypedAdapter: LaunchpadAdapter = adapter;
+void broadlyTypedAdapter;
+
 class Sink implements LaunchpadEventSink {
-  public async record(batch: Parameters<LaunchpadEventSink['record']>[0]) {
+  public readonly record = async (batch: Parameters<LaunchpadEventSink['record']>[0]) => {
     return { events: batch.events.map((event) => ({ eventId: event.id, outcome: 'created' as const })) };
-  }
+  };
 }
+
+type FinalizedBatch = LaunchpadEventBatch & { readonly confirmationStatus: 'finalized' };
+
+const finalizedOnlySink = {
+  async record(batch: FinalizedBatch) {
+    return { events: batch.events.map((event) => ({ eventId: event.id, outcome: 'created' as const })) };
+  },
+};
+
+// @ts-expect-error A sink must accept every valid confirmation status.
+const universallyUsableSink: LaunchpadEventSink = finalizedOnlySink;
+void universallyUsableSink;
 
 void test('accepts specialized adapter transactions and retains its complete contract', async () => {
   const transaction: DecodedTransaction = {
@@ -84,15 +105,45 @@ void test('accepts specialized adapter transactions and retains its complete con
   assert.equal(await adapter.readBondingCurveState(launch), bondingCurveState);
 });
 
-void test('accepts an empty processed atomic event batch', async () => {
-  const result = await new Sink().record({
+void test('accepts an empty processed event-batch contract', async () => {
+  const batch: LaunchpadEventBatch = {
     source: 'pumpfun',
     program: 'Pump111111111111111111111111111111111111111',
     signature: 'signature',
     confirmationStatus: 'processed',
     events: [],
     transitions: [],
-  });
+  };
+
+  const result = await new Sink().record(batch);
 
   assert.deepEqual(result, { events: [] });
+});
+
+void test('preserves input event identity and order in the event-batch result shape', async () => {
+  const transaction: DecodedTransaction = {
+    signature: 'non-empty-signature',
+    confirmationStatus: 'processed',
+    blockTimeMs: null,
+    observedAtMs: 2,
+    cursor: { slot: 2n, transactionIndex: 0 },
+    raw: null,
+    decodedProgram: 'pumpfun',
+  };
+  const event = createTokenLaunchDetectedEvent({
+    source: adapter.source,
+    program: adapter.programId,
+    transaction,
+    launch,
+  });
+  const result = await new Sink().record({
+    source: adapter.source,
+    program: adapter.programId,
+    signature: transaction.signature,
+    confirmationStatus: transaction.confirmationStatus,
+    events: [event],
+    transitions: [createInitialDetectedTransition(event)],
+  });
+
+  assert.deepEqual(result.events, [{ eventId: event.id, outcome: 'created' }]);
 });
