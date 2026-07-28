@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   createBondingCurveTradeObservedEvent,
   createTokenLaunchDetectedEvent,
+  UnsupportedLaunchParameterValueError,
 } from '../src/domain/launchpad-events.js';
 import type {
   LaunchpadTrade,
@@ -114,7 +115,13 @@ void test('snapshotte les entrées mutables pour conserver l’événement et so
     instructionIndex: 2,
     innerInstructionIndex: null,
   };
-  const mutableParameters = { metadata: { verified: true } };
+  const mutableParameterObject = { amount: 1n };
+  const mutableParameters = {
+    metadata: {
+      verified: true,
+      values: [1n, mutableParameterObject],
+    },
+  };
   const mutableLaunch = {
     mint: launch.mint,
     creator: launch.creator,
@@ -152,6 +159,7 @@ void test('snapshotte les entrées mutables pour conserver l’événement et so
   mutableLaunchCursor.instructionIndex = 99;
   mutableQuoteAsset.mint = 'ChangedQuoteMint';
   mutableParameters.metadata.verified = false;
+  mutableParameterObject.amount = 2n;
   mutableTradeCursor.innerInstructionIndex = 8;
 
   assert.equal(launchEvent.id, launchId);
@@ -160,9 +168,42 @@ void test('snapshotte les entrées mutables pour conserver l’événement et so
   const snapshottedLaunchQuote = launchEvent.payload.launch.quoteAssets[0];
   assert.ok(snapshottedLaunchQuote);
   assert.equal(snapshottedLaunchQuote.mint, SOL.mint);
-  assert.deepEqual(launchEvent.payload.launch.parameters, { metadata: { verified: true } });
+  assert.deepEqual(launchEvent.payload.launch.parameters, {
+    metadata: { verified: true, values: [1n, { amount: 1n }] },
+  });
+  assert.ok(Object.isFrozen(launchEvent.payload.launch.parameters));
+  const snapshottedMetadata = launchEvent.payload.launch.parameters.metadata;
+  assert.ok(snapshottedMetadata && typeof snapshottedMetadata === 'object');
+  assert.ok(Object.isFrozen(snapshottedMetadata));
+  const snapshottedValues = snapshottedMetadata.values;
+  assert.ok(Array.isArray(snapshottedValues));
+  assert.ok(Object.isFrozen(snapshottedValues));
   assert.equal(tradeEvent.id, tradeId);
   assert.equal(tradeEvent.cursor.innerInstructionIndex, 0);
   assert.equal(tradeEvent.payload.trade.cursor.innerInstructionIndex, 0);
   assert.equal(tradeEvent.payload.trade.quoteAsset.mint, SOL.mint);
+});
+
+void test('rejette les valeurs de paramètres non normalisées avec leur chemin', () => {
+  for (const invalidValue of [
+    new Uint8Array([1]),
+    new Map([['value', 1]]),
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
+    assert.throws(
+      () => createTokenLaunchDetectedEvent({
+        source: 'pumpfun',
+        program: PROGRAM,
+        transaction,
+        launch: {
+          ...launch,
+          parameters: { invalid: invalidValue } as unknown as TokenLaunch['parameters'],
+        },
+      }),
+      (error: unknown) =>
+        error instanceof UnsupportedLaunchParameterValueError
+        && error.message.includes('parameters.invalid'),
+    );
+  }
 });

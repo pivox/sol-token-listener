@@ -17,6 +17,19 @@ export interface QuoteAsset {
   readonly tokenProgram: TokenProgramKind;
 }
 
+export type LaunchParameterValue =
+  | null
+  | string
+  | boolean
+  | bigint
+  | number
+  | readonly LaunchParameterValue[]
+  | LaunchParameterObject;
+
+export interface LaunchParameterObject {
+  readonly [key: string]: LaunchParameterValue;
+}
+
 export interface TokenLaunch {
   readonly mint: string;
   readonly creator: string;
@@ -24,7 +37,7 @@ export interface TokenLaunch {
   readonly quoteAssets: readonly QuoteAsset[];
   readonly launchpad: string;
   readonly createdAt: ChainCursor;
-  readonly parameters: Readonly<Record<string, unknown>>;
+  readonly parameters: LaunchParameterObject;
 }
 
 export interface ObservedChainTransaction {
