@@ -5,13 +5,15 @@ import type {
   TokenLaunch,
 } from '../domain/types.js';
 
-export interface LaunchpadAdapter {
+export interface LaunchpadAdapter<
+  TTransaction extends ObservedChainTransaction = ObservedChainTransaction,
+> {
   readonly source: string;
   readonly programId: string;
 
-  detectLaunches(transaction: ObservedChainTransaction): Promise<readonly TokenLaunch[]>;
+  detectLaunches(transaction: TTransaction): Promise<readonly TokenLaunch[]>;
   decodeTrades(
-    transaction: ObservedChainTransaction,
+    transaction: TTransaction,
     trackedMints: ReadonlySet<string>,
   ): Promise<readonly LaunchpadTrade[]>;
   readBondingCurveState(launch: TokenLaunch): Promise<BondingCurveState>;
