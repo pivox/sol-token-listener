@@ -46,9 +46,10 @@ export class InvalidLaunchpadEventBatchError extends Error {
 }
 
 export function assertValidLaunchpadEventBatch(
-  batch: unknown,
-): asserts batch is LaunchpadEventBatch {
-  if (!isRecord(batch)) {
+  batch: LaunchpadEventBatch,
+): void {
+  const candidate: unknown = batch;
+  if (!isRecord(candidate)) {
     throw new InvalidLaunchpadEventBatchError('batch must be an object');
   }
   const {
@@ -59,7 +60,7 @@ export function assertValidLaunchpadEventBatch(
     stateTransitionAction,
     events,
     transitions,
-  } = batch;
+  } = candidate;
   if (
     typeof source !== 'string'
     || typeof program !== 'string'

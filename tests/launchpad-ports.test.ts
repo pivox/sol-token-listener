@@ -98,6 +98,12 @@ const retractAction: StateTransitionBatchAction = 'retract';
 const invalidAction: StateTransitionBatchAction = 'replace';
 void invalidAction;
 
+const assertRejectsUnknownBatch = (batch: unknown): void => {
+  // @ts-expect-error Callers must explicitly establish or cast the batch contract.
+  assertValidLaunchpadEventBatch(batch);
+};
+void assertRejectsUnknownBatch;
+
 // @ts-expect-error A finalized batch cannot request transition retraction.
 const finalizedRetractBatch: LaunchpadEventBatch = {
   source: 'pumpfun',
@@ -233,6 +239,7 @@ void test('runtime validation rejects contradictory action and status combinatio
     transitions: [],
   };
   for (const invalid of [
+    null,
     {
       ...shared,
       confirmationStatus: 'finalized',
