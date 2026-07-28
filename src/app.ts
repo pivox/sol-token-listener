@@ -1,7 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config/env.js';
 
-export async function main(): Promise<void> {
+export function main(): void {
   const config = loadConfig();
   const startup = {
     component: 'sol-token-listener',
@@ -17,7 +17,9 @@ export async function main(): Promise<void> {
 
 const entrypoint = process.argv[1];
 if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {
-  void main().catch((error: unknown) => {
+  try {
+    main();
+  } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`${JSON.stringify({
       component: 'sol-token-listener',
@@ -25,5 +27,5 @@ if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).hr
       error: message,
     })}\n`);
     process.exitCode = 1;
-  });
+  }
 }

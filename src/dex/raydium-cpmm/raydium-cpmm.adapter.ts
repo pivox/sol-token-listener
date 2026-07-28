@@ -9,7 +9,7 @@ import type { AppConfig } from '../../config/env.js';
 import type { DexAdapter } from '../dex-adapter.js';
 import type { BuiltTransaction, PoolInfo, PoolRuntimeState, QuoteResult, SwapEvent } from '../../domain/types.js';
 import type { NormalizedTransaction } from '../../solana/rpc/types.js';
-import { SolanaRpcClient } from '../../solana/rpc/rpc-client.js';
+import type { SolanaRpcClient } from '../../solana/rpc/rpc-client.js';
 import { decodeInitializeInstruction } from './instruction-decoder.js';
 import { readPoolState, swapsEnabled } from './pool-decoder.js';
 import { classifyTransactionSwaps } from './swap-classifier.js';
@@ -74,8 +74,8 @@ export class RaydiumCpmmAdapter implements DexAdapter {
     return result;
   }
 
-  async decodeSwaps(transaction: NormalizedTransaction, activePools: readonly PoolInfo[]): Promise<SwapEvent[]> {
-    return classifyTransactionSwaps(transaction, this.programId, activePools);
+  decodeSwaps(transaction: NormalizedTransaction, activePools: readonly PoolInfo[]): Promise<SwapEvent[]> {
+    return Promise.resolve(classifyTransactionSwaps(transaction, this.programId, activePools));
   }
 
   async quoteBuy(pool: PoolInfo, amountInLamports: bigint): Promise<QuoteResult> {
