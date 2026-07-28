@@ -14,6 +14,7 @@ void test('persiste un snapshot de courbe avec bigint et clé idempotente', asyn
     confirmationStatus: 'confirmed',
   });
 
+  assert.match(database.calls[0]?.text ?? '', /EXCLUDED\.confirmation_status = 'orphaned'/u);
   assert.match(database.calls[0]?.text ?? '', /ON CONFLICT/u);
   assert.ok(database.calls[0]?.values?.includes('9007199254740993'));
   assert.equal(database.calls[0]?.values?.some((value) => typeof value === 'bigint'), false);
@@ -30,6 +31,20 @@ void test('persiste séparément la résolution ou l’échec de metadata', asyn
 
   assert.match(database.calls[0]?.text ?? '', /token_metadata_snapshots/u);
   assert.equal(database.calls[0]?.values?.includes('JSON_INVALID'), true);
+});
+
+void test('réconcilie la finalité des trades sans régression', async () => {
+  const database = new RecordingDatabase();
+  const repository = new PumpFunObservationRepository(database);
+  await repository.upsertTrade({
+    id: 'trade', launchMint: 'mint', kind: 'BUY', trader: 'wallet',
+    baseAmountRaw: 1n, quoteAmountRaw: 2n, quoteAsset: quoteAsset(),
+    cursor: { slot: 1n, transactionIndex: 2, instructionIndex: 3, innerInstructionIndex: null },
+    confirmationStatus: 'finalized',
+  });
+
+  assert.match(database.calls[0]?.text ?? '', /launch_trades\.confirmation_status = 'orphaned'/u);
+  assert.match(database.calls[0]?.text ?? '', /EXCLUDED\.confirmation_status = 'finalized'/u);
 });
 
 function quoteAsset() {

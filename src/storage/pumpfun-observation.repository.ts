@@ -34,11 +34,7 @@ export class PumpFunObservationRepository {
         snapshot_id, mint, uri, resolution_status, failure_reason, failure_message,
         payload_version, payload_hash, metadata, fetched_at
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-      ON CONFLICT (snapshot_id) DO UPDATE SET
-        resolution_status = EXCLUDED.resolution_status,
-        failure_reason = EXCLUDED.failure_reason,
-        failure_message = EXCLUDED.failure_message,
-        metadata = EXCLUDED.metadata`,
+      ON CONFLICT (snapshot_id) DO NOTHING`,
       [
         snapshotId, snapshot.mint, snapshot.uri,
         snapshot.resolution.status.toLowerCase(),
@@ -62,13 +58,15 @@ export class PumpFunObservationRepository {
         instruction_index, inner_instruction_index, confirmation_status
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
       ON CONFLICT (snapshot_id) DO UPDATE SET
-        confirmation_status = EXCLUDED.confirmation_status,
-        complete = EXCLUDED.complete,
-        real_base_reserves_raw = EXCLUDED.real_base_reserves_raw,
-        real_quote_reserves_raw = EXCLUDED.real_quote_reserves_raw,
-        virtual_base_reserves_raw = EXCLUDED.virtual_base_reserves_raw,
-        virtual_quote_reserves_raw = EXCLUDED.virtual_quote_reserves_raw,
-        progress_bps = EXCLUDED.progress_bps`,
+        confirmation_status = CASE
+          WHEN bonding_curve_snapshots.confirmation_status = 'orphaned'
+            OR EXCLUDED.confirmation_status = 'orphaned' THEN 'orphaned'
+          WHEN bonding_curve_snapshots.confirmation_status = 'finalized'
+            OR EXCLUDED.confirmation_status = 'finalized' THEN 'finalized'
+          WHEN bonding_curve_snapshots.confirmation_status = 'confirmed'
+            OR EXCLUDED.confirmation_status = 'confirmed' THEN 'confirmed'
+          ELSE 'processed'
+        END`,
       [
         snapshotId, snapshot.launchMint, snapshot.quoteAsset.mint,
         snapshot.quoteAsset.decimals, snapshot.quoteAsset.tokenProgram,
@@ -89,7 +87,15 @@ export class PumpFunObservationRepository {
         instruction_index, inner_instruction_index, confirmation_status
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       ON CONFLICT (trade_id) DO UPDATE SET
-        confirmation_status = EXCLUDED.confirmation_status`,
+        confirmation_status = CASE
+          WHEN launch_trades.confirmation_status = 'orphaned'
+            OR EXCLUDED.confirmation_status = 'orphaned' THEN 'orphaned'
+          WHEN launch_trades.confirmation_status = 'finalized'
+            OR EXCLUDED.confirmation_status = 'finalized' THEN 'finalized'
+          WHEN launch_trades.confirmation_status = 'confirmed'
+            OR EXCLUDED.confirmation_status = 'confirmed' THEN 'confirmed'
+          ELSE 'processed'
+        END`,
       [
         trade.id, trade.launchMint, trade.kind, trade.trader,
         trade.baseAmountRaw.toString(), trade.quoteAmountRaw.toString(),

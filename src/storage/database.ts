@@ -78,13 +78,16 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   try {
     await client.query('BEGIN');
     const metadataSnapshots = await client.query(
-      'DELETE FROM token_metadata_snapshots WHERE purge_after <= NOW()',
+      `DELETE FROM token_metadata_snapshots snapshot USING token_launches launch
+       WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()`,
     );
     const bondingCurveSnapshots = await client.query(
-      'DELETE FROM bonding_curve_snapshots WHERE purge_after <= NOW()',
+      `DELETE FROM bonding_curve_snapshots snapshot USING token_launches launch
+       WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()`,
     );
     const launchTrades = await client.query(
-      'DELETE FROM launch_trades WHERE purge_after <= NOW()',
+      `DELETE FROM launch_trades trade USING token_launches launch
+       WHERE trade.mint = launch.mint AND launch.purge_after <= NOW()`,
     );
     const transitions = await client.query(
       'DELETE FROM state_transitions WHERE purge_after <= NOW()',

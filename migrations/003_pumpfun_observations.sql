@@ -13,8 +13,6 @@ CREATE TABLE IF NOT EXISTS token_metadata_snapshots (
   CHECK ((resolution_status = 'resolved' AND metadata IS NOT NULL AND failure_reason IS NULL)
     OR (resolution_status = 'failed' AND metadata IS NULL AND failure_reason IS NOT NULL))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS token_metadata_snapshots_mint_hash_idx
-  ON token_metadata_snapshots(mint, payload_hash);
 CREATE INDEX IF NOT EXISTS token_metadata_snapshots_purge_idx
   ON token_metadata_snapshots(purge_after) WHERE purge_after IS NOT NULL;
 
@@ -61,5 +59,7 @@ CREATE TABLE IF NOT EXISTS launch_trades (
 );
 CREATE INDEX IF NOT EXISTS launch_trades_mint_cursor_idx
   ON launch_trades(mint, slot, transaction_index, instruction_index);
+CREATE UNIQUE INDEX IF NOT EXISTS launch_trades_cursor_idx
+  ON launch_trades(mint, slot, transaction_index, instruction_index, COALESCE(inner_instruction_index, -1));
 CREATE INDEX IF NOT EXISTS launch_trades_purge_idx
   ON launch_trades(purge_after) WHERE purge_after IS NOT NULL;

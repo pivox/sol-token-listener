@@ -19,6 +19,8 @@ void test('la migration crée les projections Pump.fun immuables', async () => {
   assert.match(sql, /ON DELETE CASCADE/u);
   assert.match(sql, /COALESCE\(inner_instruction_index, -1\)/u);
   assert.match(sql, /purge_after TIMESTAMPTZ/u);
+  assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS launch_trades_cursor_idx/u);
+  assert.doesNotMatch(sql, /token_metadata_snapshots_mint_hash_idx/u);
 });
 
 void test('la migration ne contient ni secret ni exécution réelle', async () => {
