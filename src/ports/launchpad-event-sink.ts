@@ -3,6 +3,7 @@ import type { StateTransition } from '../domain/state-transitions.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 
 export type EventRecordOutcome = 'created' | 'duplicate' | 'confirmation_updated';
+export type StateTransitionBatchAction = 'apply' | 'retract';
 
 export interface EventRecordResult {
   readonly eventId: string;
@@ -15,6 +16,16 @@ export interface LaunchpadEventBatch {
   readonly signature: string;
   readonly confirmationStatus: ChainConfirmationStatus;
   readonly events: readonly LaunchpadObservationEventV1[];
+  /**
+   * `apply` atomically applies or upserts the supplied transitions linked by
+   * `triggeringEventId`. `retract` is valid only for an orphaned batch, requires
+   * an empty `transitions` array, and atomically invalidates or removes from the
+   * active launch projection every transition triggered by an input event ID.
+   * Retraction must preserve auditable raw/domain events and invalidation
+   * history; it must not silently delete history. Thus, a first-seen orphaned
+   * event creates no active launch state.
+   */
+  readonly stateTransitionAction: StateTransitionBatchAction;
   readonly transitions: readonly StateTransition[];
 }
 
@@ -24,10 +35,17 @@ export interface LaunchpadEventBatchResult {
 
 export interface LaunchpadEventSink {
   /**
-   * Writes events and transitions atomically: either the whole batch commits durably or none does.
-   * Resolves only after that durable commit. Deterministic IDs make replay idempotent; an existing
-   * event's confirmation may reconcile only monotonically under domain rules. Returns exactly one
-   * result per input event in input order. Rejection leaves no partial batch writes.
+   * Reconciles event confirmation and the requested transition action in one
+   * durable all-or-nothing transaction, returning exactly one result per input
+   * event in input order. For processed/confirmed/finalized replay, deterministic
+   * transition IDs are stable. If event reconciliation keeps or duplicates the
+   * stored event, the sink keeps its stored transition snapshot. If reconciliation
+   * returns `confirmation_updated` to confirmed or finalized, the sink updates
+   * non-identity transition data from the incoming canonical snapshot, including
+   * `occurredAtMs` when blockchain time replaces the observation fallback. An
+   * orphaned batch retracts regardless of any previous apply. Resolves only after
+   * the durable commit; rejection leaves no partial event, transition, projection,
+   * or invalidation-history writes.
    */
   readonly record: (batch: LaunchpadEventBatch) => Promise<LaunchpadEventBatchResult>;
 }

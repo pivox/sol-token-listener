@@ -107,7 +107,9 @@ may continue through `BONDING_CURVE_COMPLETE`, `MIGRATION_PENDING`, and
 `PUMPSWAP_ACTIVE`. Retention eligibility remains a separate decision requiring
 both a terminal tracking decision and no open paper position.
 
-The initial transition is exclusively `null -> DETECTED`.
+The initial transition is exclusively `null -> DETECTED` for a non-orphaned
+observation. A first-seen orphaned launch retains its domain event for audit but
+does not apply that transition or create active launch state.
 
 ## Generic adapter contract
 
@@ -139,7 +141,8 @@ adapter to require a normalized Solana transaction rather than casting
    mints;
 3. call `decodeTrades` exactly once with that set;
 4. validate that every launch and trade cursor belongs to the input transaction;
-5. create one launch event and initial transition per launch;
+5. create one launch event per launch and, unless the observation is orphaned,
+   its initial transition;
 6. create one trade event per decoded trade;
 7. reject duplicate deterministic IDs inside the batch;
 8. sort events by cursor, then place launch detection before a trade on an
@@ -161,6 +164,7 @@ the sink.
 - adapter source and program;
 - signature and input confirmation status;
 - ordered events;
+- a state-transition action, `apply` or `retract`;
 - initial state transitions.
 
 It returns one outcome per event:
@@ -172,6 +176,19 @@ It returns one outcome per event:
 The contract requires a concrete sink to persist the entire batch atomically.
 The sink owns durable idempotency and confirmation upgrades; deterministic IDs
 make those guarantees testable before the PostgreSQL implementation exists.
+
+For `apply`, the sink atomically applies or upserts the supplied transitions,
+linked to events by `triggeringEventId`. `retract` is valid only for an orphaned
+batch and carries an empty transition array. It atomically invalidates or
+removes from the active launch projection every transition triggered by an
+input event ID while preserving auditable raw/domain events and durable
+invalidation history. Thus both first-seen and replayed orphaned events remain
+auditable without leaving an active `DETECTED` projection.
+
+This transition action and event confirmation reconciliation belong to the same
+durable all-or-nothing transaction, which still returns exactly one result per
+input event. PR B defines this port contract only; it does not implement a
+database sink.
 
 ## Confirmation reconciliation
 
@@ -186,6 +203,14 @@ Repeated status and late lower-confirmation observations return `keep`.
 `finalized` and `orphaned` are terminal confirmation states. A conflicting
 transition out of either throws `ConfirmationStatusConflictError` so the system
 cannot silently rewrite finalized history.
+
+On processed/confirmed/finalized replay, transition identity remains stable. If
+event reconciliation keeps or duplicates the stored event, the sink keeps its
+stored transition snapshot. When reconciliation returns
+`confirmation_updated` to confirmed or finalized, the sink updates non-identity
+transition data from the incoming canonical snapshot; in particular, blockchain
+time may replace an earlier observation-time fallback in `occurredAtMs`.
+Orphaned input retracts the active projection regardless of a previous `apply`.
 
 ## Validation and errors
 
@@ -224,7 +249,12 @@ Tests run without network or PostgreSQL and cover:
 9. invalid cursor or untracked trade rejection;
 10. adapter failure with zero sink calls;
 11. empty observation with zero sink calls;
-12. one sink call for a complete non-empty batch.
+12. one sink call for a complete non-empty batch;
+13. first-seen and replayed orphaned launch batches retain events, request
+    `retract`, and carry no transitions;
+14. trade-only orphaned batches request `retract`;
+15. processed-to-finalized replay keeps event/transition IDs while exposing the
+    incoming canonical transition timestamp.
 
 The existing build, strict type-check, lint, migration-contract, Raydium fixture,
 risk, session, and paper-execution tests must remain green.
@@ -241,4 +271,6 @@ risk, session, and paper-execution tests must remain green.
   observation;
 - creation-plus-initial-buy is represented in one ordered batch;
 - replay produces identical IDs;
+- normal observations request transition `apply`, while orphaned observations
+  request `retract` with a frozen empty transition list;
 - all existing and new tests pass.

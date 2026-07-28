@@ -224,6 +224,7 @@ void test('records out-of-order launches once in full-cursor order with their in
     assert.fail('Expected the first event to describe a launch');
   }
   assert.deepEqual(firstEvent.payload.launch.quoteAssets, [SOL, USDC]);
+  assert.equal(batch.stateTransitionAction, 'apply');
   assert.equal(batch.transitions.length, 2);
   assert.deepEqual(
     batch.transitions.map((transition) => transition.triggeringEventId),
@@ -236,6 +237,62 @@ void test('records out-of-order launches once in full-cursor order with their in
     result.events,
     batch.events.map((event) => ({ eventId: event.id, outcome: 'created' })),
   );
+});
+
+void test('records a first-seen orphaned launch for audit without applying DETECTED state', async () => {
+  const transaction = transactionFixture({ confirmationStatus: 'orphaned' });
+  const launch = launchFixture({
+    mint: 'FirstSeenOrphanMint111111111111111111111111111',
+    cursor: cursorFixture(1, null),
+  });
+  const sink = new RecordingSink();
+
+  await new LaunchpadObservationService(
+    new FakeAdapter([launch], []),
+    sink,
+  ).observe(transaction, new Set());
+
+  assert.equal(sink.batches.length, 1);
+  const batch = sink.batches[0];
+  assert.ok(batch);
+  assert.equal(batch.events.length, 1);
+  assert.equal(batch.events[0]?.confirmationStatus, 'orphaned');
+  assert.equal(batch.stateTransitionAction, 'retract');
+  assert.deepEqual(batch.transitions, []);
+  assert.ok(Object.isFrozen(batch.transitions));
+});
+
+void test('retracts a previously applied launch transition when its transaction becomes orphaned', async () => {
+  const signature = 'OrphanReplaySignature11111111111111111111111111';
+  const launch = launchFixture({
+    mint: 'OrphanReplayMint111111111111111111111111111111',
+    cursor: cursorFixture(1, null),
+  });
+  const sink = new RecordingSink();
+  const service = new LaunchpadObservationService(
+    new FakeAdapter([launch], []),
+    sink,
+  );
+
+  await service.observe(
+    transactionFixture({ signature, confirmationStatus: 'processed' }),
+    new Set(),
+  );
+  await service.observe(
+    transactionFixture({ signature, confirmationStatus: 'orphaned' }),
+    new Set(),
+  );
+
+  assert.equal(sink.batches.length, 2);
+  const processedBatch = sink.batches[0];
+  const orphanedBatch = sink.batches[1];
+  assert.ok(processedBatch);
+  assert.ok(orphanedBatch);
+  assert.equal(processedBatch.stateTransitionAction, 'apply');
+  assert.equal(processedBatch.transitions.length, 1);
+  assert.equal(orphanedBatch.stateTransitionAction, 'retract');
+  assert.deepEqual(orphanedBatch.transitions, []);
+  assert.equal(processedBatch.events[0]?.id, orphanedBatch.events[0]?.id);
 });
 
 void test('snapshots launches and observation metadata before a mutating decoder runs', async () => {
@@ -475,7 +532,35 @@ void test('records adapter and transaction metadata on the complete batch', asyn
   assert.equal(batch.signature, transaction.signature);
   assert.equal(batch.confirmationStatus, transaction.confirmationStatus);
   assert.equal(batch.events.length, 1);
+  assert.equal(batch.stateTransitionAction, 'apply');
   assert.equal(batch.transitions.length, 0);
+});
+
+void test('marks a trade-only orphaned batch for retraction without transitions', async () => {
+  const mint = 'OrphanedTradeMint11111111111111111111111111111';
+  const trade = tradeFixture({
+    id: 'orphaned-trade',
+    launchMint: mint,
+    cursor: cursorFixture(6, 0),
+  });
+  const sink = new RecordingSink();
+
+  await new LaunchpadObservationService(
+    new FakeAdapter([], [trade]),
+    sink,
+  ).observe(
+    transactionFixture({ confirmationStatus: 'orphaned' }),
+    new Set([mint]),
+  );
+
+  assert.equal(sink.batches.length, 1);
+  const batch = sink.batches[0];
+  assert.ok(batch);
+  assert.equal(batch.events.length, 1);
+  assert.equal(batch.events[0]?.confirmationStatus, 'orphaned');
+  assert.equal(batch.stateTransitionAction, 'retract');
+  assert.deepEqual(batch.transitions, []);
+  assert.ok(Object.isFrozen(batch.transitions));
 });
 
 void test('replays deterministic IDs across finality changes', async () => {
@@ -524,6 +609,8 @@ void test('replays deterministic IDs across finality changes', async () => {
     processedBatch.transitions.map((transition) => transition.id),
     finalizedBatch.transitions.map((transition) => transition.id),
   );
+  assert.equal(processedBatch.stateTransitionAction, 'apply');
+  assert.equal(finalizedBatch.stateTransitionAction, 'apply');
   assert.equal(processedBatch.confirmationStatus, 'processed');
   assert.equal(finalizedBatch.confirmationStatus, 'finalized');
   for (const event of processedBatch.events) {
@@ -538,6 +625,18 @@ void test('replays deterministic IDs across finality changes', async () => {
   }
   assert.equal(processedBatch.events.length, 2);
   assert.equal(processedBatch.transitions.length, 1);
+  assert.equal(
+    processedBatch.transitions[0]?.occurredAtMs,
+    processedTransaction.observedAtMs,
+  );
+  assert.equal(
+    finalizedBatch.transitions[0]?.occurredAtMs,
+    finalizedTransaction.blockTimeMs,
+  );
+  assert.notEqual(
+    processedBatch.transitions[0]?.occurredAtMs,
+    finalizedBatch.transitions[0]?.occurredAtMs,
+  );
   assert.equal(processedSink.batches.length, 1);
   assert.equal(finalizedSink.batches.length, 1);
 });

@@ -5,6 +5,7 @@ import { createInitialDetectedTransition } from '../src/domain/state-transitions
 import type {
   LaunchpadEventBatch,
   LaunchpadEventSink,
+  StateTransitionBatchAction,
 } from '../src/ports/launchpad-event-sink.js';
 import type { LaunchpadAdapter } from '../src/ports/launchpad-adapter.js';
 import type {
@@ -87,6 +88,12 @@ const finalizedOnlySink = {
 const universallyUsableSink: LaunchpadEventSink = finalizedOnlySink;
 void universallyUsableSink;
 
+const applyAction: StateTransitionBatchAction = 'apply';
+const retractAction: StateTransitionBatchAction = 'retract';
+// @ts-expect-error State-transition batches accept only apply or retract.
+const invalidAction: StateTransitionBatchAction = 'replace';
+void invalidAction;
+
 void test('accepts specialized adapter transactions and retains its complete contract', async () => {
   const transaction: DecodedTransaction = {
     signature: 'signature',
@@ -112,6 +119,7 @@ void test('accepts an empty processed event-batch contract', async () => {
     signature: 'signature',
     confirmationStatus: 'processed',
     events: [],
+    stateTransitionAction: applyAction,
     transitions: [],
   };
 
@@ -142,8 +150,10 @@ void test('preserves input event identity and order in the event-batch result sh
     signature: transaction.signature,
     confirmationStatus: transaction.confirmationStatus,
     events: [event],
+    stateTransitionAction: applyAction,
     transitions: [createInitialDetectedTransition(event)],
   });
 
+  assert.equal(retractAction, 'retract');
   assert.deepEqual(result.events, [{ eventId: event.id, outcome: 'created' }]);
 });

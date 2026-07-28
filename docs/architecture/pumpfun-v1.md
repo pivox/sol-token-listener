@@ -146,9 +146,16 @@ Les événements métier sont source-indépendants :
 `token_launches` et `state_transitions` sont des projections métier. Les
 checkpoints sont indépendants de la source.
 
-Le traitement réclame un événement avec un lease et reste idempotent. Une
-réconciliation ultérieure propage `finalized` ou `orphaned` sans supprimer
-silencieusement la trace.
+Le traitement réclame un événement avec un lease et reste idempotent. Le contrat
+du sink conserve les événements bruts et métier pour audit. Une réconciliation
+vers `orphaned` rétracte les transitions liées aux événements de la projection
+active, sans effacer leur historique ni celui de l’invalidation ; un événement
+orphelin vu pour la première fois ne crée donc aucun état de lancement actif.
+Lors d’une mise à niveau vers `confirmed` ou `finalized`, l’identité de la
+transition reste stable et ses données non identitaires sont réconciliées avec
+le snapshot canonique entrant : le temps blockchain peut notamment remplacer
+le temps d’observation de secours. Ces garanties décrivent le port atomique ;
+aucun sink PostgreSQL correspondant n’est encore implémenté.
 
 Quand un lancement est terminal et qu’aucune position paper n’est ouverte,
 `terminal_at` est fixé et `purge_after = terminal_at + 4 heures`. Le purgeur ne

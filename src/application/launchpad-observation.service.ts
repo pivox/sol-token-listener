@@ -212,17 +212,21 @@ function createValidatedBatch(
   const frozenEvents: readonly LaunchpadObservationEventV1[] = Object.freeze(events);
   if (frozenEvents.length === 0) return null;
 
-  const transitions = Object.freeze(
-    frozenEvents
-      .filter((event) => event.type === 'TokenLaunchDetected')
-      .map(createInitialDetectedTransition),
-  );
+  const isOrphaned = envelope.transaction.confirmationStatus === 'orphaned';
+  const transitions = isOrphaned
+    ? Object.freeze([])
+    : Object.freeze(
+      frozenEvents
+        .filter((event) => event.type === 'TokenLaunchDetected')
+        .map(createInitialDetectedTransition),
+    );
   return Object.freeze({
     source: envelope.source,
     program: envelope.program,
     signature: envelope.transaction.signature,
     confirmationStatus: envelope.transaction.confirmationStatus,
     events: frozenEvents,
+    stateTransitionAction: isOrphaned ? 'retract' : 'apply',
     transitions,
   });
 }
