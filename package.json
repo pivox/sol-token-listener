@@ -2,14 +2,14 @@
   "name": "solana-token-listener",
   "version": "0.1.0",
   "private": true,
-  "description": "Surveillance de nouveaux pools Raydium CPMM Token/WSOL avec analyse de risque et exécution dry-run par défaut.",
+  "description": "Observation et paper trading de nouveaux tokens Pump.fun, avec Raydium CPMM conservé comme adaptateur secondaire.",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/app.ts",
     "start": "node dist/src/app.js",
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "lint": "tsx scripts/lint.ts",
+    "lint": "eslint . --max-warnings=0",
     "test": "tsx --test tests/*.test.ts",
     "db:migrate": "tsx scripts/migrate.ts",
     "rpc:check": "tsx scripts/check-rpc.ts",
@@ -29,11 +29,16 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/bn.js": "5.1.6",
     "@types/node": "24.0.0",
     "@types/pg": "8.15.0",
+    "eslint": "^9.39.5",
     "tsx": "4.23.1",
-    "typescript": "5.8.3"
+    "typescript": "5.8.3",
+    "typescript-eslint": "^8.65.0"
   },
-  "engines": { "node": ">=22.0.0" }
+  "engines": {
+    "node": ">=22.0.0"
+  }
 }
