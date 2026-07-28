@@ -81,9 +81,11 @@ export class TradeExecutor {
 
   sell(session: TokenSession): Promise<ExitExecution> {
     return this.queue.enqueue(`${session.id}:SELL`, async () => {
-      const balance = await this.venue.readTokenBalance(session.pool.tokenMint, session.pool.tokenProgram, this.wallet.address);
-      if (balance <= 0n) throw new Error('Solde token nul: vente impossible.');
-      const quote = await this.venue.quoteSell(session.pool, balance);
+      const amountInTokenRaw = this.config.executionMode === 'dry-run'
+        ? session.entry?.amountOutTokenRaw ?? 0n
+        : await this.venue.readTokenBalance(session.pool.tokenMint, session.pool.tokenProgram, this.wallet.address);
+      if (amountInTokenRaw <= 0n) throw new Error('Quantité token nulle: vente impossible.');
+      const quote = await this.venue.quoteSell(session.pool, amountInTokenRaw);
       const built = await this.venue.buildSell(session.pool, quote, this.wallet.address);
       const simulation = await this.simulator.simulate(built, false);
       if (!simulation.ok) {
@@ -93,7 +95,7 @@ export class TradeExecutor {
       if (this.config.executionMode === 'dry-run') {
         const execution: ExitExecution = {
           mode: 'dry-run',
-          amountInTokenRaw: balance,
+          amountInTokenRaw,
           amountOutLamports: quote.amountOutRaw - quote.transferFeeRaw,
           quotedOutLamports: quote.amountOutRaw,
           confirmedAtMs: Date.now(),
@@ -114,7 +116,7 @@ export class TradeExecutor {
       const wsolDelta = tokenOwnerDelta(transaction, session.pool.wsolMint, this.wallet.address);
       const execution: ExitExecution = {
         mode: 'live',
-        amountInTokenRaw: balance,
+        amountInTokenRaw,
         amountOutLamports: wsolDelta > 0n ? wsolDelta : quote.amountOutRaw - quote.transferFeeRaw,
         quotedOutLamports: quote.amountOutRaw,
         signature: sent.signature,
@@ -142,7 +144,7 @@ export class TradeExecutor {
     quote: QuoteResult,
     status: TradeRecord['status'],
   ): Promise<void> {
-    await this.trades.save(makeTrade(session, 'BUY', status, execution.amountInLamports, execution.amountOutTokenRaw,
+    await this.trades.save(makeTrade(session, 'BUY', this.config.executionMode, status, execution.amountInLamports, execution.amountOutTokenRaw,
       execution.quotedOutTokenRaw, execution.signature, execution.cursor.slot, execution.feeLamports,
       execution.rentDeltaLamports, execution.priorityFeeLamports, execution.computeUnits, { quote, simulation: execution.simulation }));
   }
@@ -153,13 +155,13 @@ export class TradeExecutor {
     quote: QuoteResult,
     status: TradeRecord['status'],
   ): Promise<void> {
-    await this.trades.save(makeTrade(session, 'SELL', status, execution.amountInTokenRaw, execution.amountOutLamports,
+    await this.trades.save(makeTrade(session, 'SELL', this.config.executionMode, status, execution.amountInTokenRaw, execution.amountOutLamports,
       execution.quotedOutLamports, execution.signature, undefined, execution.feeLamports,
       execution.rentDeltaLamports, execution.priorityFeeLamports, execution.computeUnits, { quote, simulation: execution.simulation }));
   }
 
   private async persistFailure(session: TokenSession, side: 'BUY' | 'SELL', quote: QuoteResult, error: string): Promise<void> {
-    await this.trades.save(makeTrade(session, side, 'FAILED', quote.amountInRaw, 0n, quote.amountOutRaw,
+    await this.trades.save(makeTrade(session, side, this.config.executionMode, 'FAILED', quote.amountInRaw, 0n, quote.amountOutRaw,
       undefined, undefined, undefined, undefined, undefined, undefined, { quote }, error));
   }
 }
@@ -167,6 +169,7 @@ export class TradeExecutor {
 function makeTrade(
   session: TokenSession,
   side: 'BUY' | 'SELL',
+  mode: TradeRecord['mode'],
   status: TradeRecord['status'],
   amountInRaw: bigint,
   amountOutRaw: bigint,
@@ -188,7 +191,7 @@ function makeTrade(
     pool: session.pool.pool,
     tokenMint: session.pool.tokenMint,
     side,
-    mode: status === 'SIMULATED' ? 'dry-run' : 'live',
+    mode,
     status,
     amountInRaw,
     amountOutRaw,
