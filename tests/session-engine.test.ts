@@ -68,16 +68,27 @@ function makeHarness(options: { target: number; sellFails: boolean }) {
   const swapRepo = new MemorySwapRepository();
   const tradeRepo = new MemoryTradeRepository();
   const buyCalls = { value: 0 };
-  const venue = { readPoolRuntimeState: async () => ({ pool:'pool',statusBits:0,swapsEnabled:true,openTimeUnix:0n,tokenVaultBalanceRaw:1n,wsolVaultBalanceRaw:1n,observedSlot:1n }) } as any;
-  const risk = { analyze: async () => ({ id:'risk',verdict:'ALLOW',score:100 }) } as any;
+  const venue = { readPoolRuntimeState: async () => ({ pool:'pool',statusBits:0,swapsEnabled:true,openTimeUnix:0n,tokenVaultBalanceRaw:1n,wsolVaultBalanceRaw:1n,observedSlot:1n }) } as never;
+  const risk = { analyze: async () => ({ id:'risk',verdict:'ALLOW',score:100 }) } as never;
   const executor = {
     buy: async () => { buyCalls.value += 1; return { mode:'paper',amountInLamports:1n,amountOutTokenRaw:2n,quotedOutTokenRaw:2n,cursor:{slot:2n,transactionIndex:-1,instructionIndex:-1,innerInstructionIndex:null},confirmedAtMs:Date.now(),simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null} }; },
     sell: async () => { if (options.sellFails) throw new Error('vente impossible'); return { mode:'paper',amountInTokenRaw:2n,amountOutLamports:1n,quotedOutLamports:1n,confirmedAtMs:Date.now(),simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null} }; },
-  } as any;
+  } as never;
   const config = { targetBuysAfterEntry:options.target,poolMonitorTtlMinutes:90,maxConcurrentPositions:1 } as AppConfig;
-  const logger = { info(){}, warn(){}, error(){}, debug(){} } as any;
-  const reportRepo = { latestBySession: async () => null } as any;
-  const engine = new SessionEngine(venue,risk,executor,{address:'wallet'} as any,sessionRepo as any,swapRepo as any,tradeRepo as any,reportRepo,config,logger);
+  const logger = { info(){}, warn(){}, error(){}, debug(){} } as never;
+  const reportRepo = { latestBySession: async () => null } as never;
+  const engine = new SessionEngine(
+    venue,
+    risk,
+    executor,
+    {address:'wallet'} as never,
+    sessionRepo as never,
+    swapRepo as never,
+    tradeRepo as never,
+    reportRepo,
+    config,
+    logger,
+  );
   return { engine, sessionRepo, tradeRepo, buyCalls };
 }
 
