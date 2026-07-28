@@ -24,7 +24,6 @@ export type LaunchStatus = (typeof LAUNCH_STATUSES)[number];
 
 const TERMINAL_LAUNCH_STATUSES = new Set<LaunchStatus>([
   'REJECTED',
-  'PAPER_CLOSED',
   'EXPIRED',
 ]);
 

@@ -88,8 +88,10 @@ void test('l’identifiant métier est déterministe et inclut l’index interne
 void test('les états métier et reason codes V1 sont stables et explicites', () => {
   assert.ok(LAUNCH_STATUSES.includes('BONDING_CURVE_COMPLETE'));
   assert.ok(LAUNCH_STATUSES.includes('PUMPSWAP_ACTIVE'));
-  assert.equal(isTerminalLaunchStatus('PAPER_CLOSED'), true);
+  assert.equal(isTerminalLaunchStatus('PAPER_CLOSED'), false);
   assert.equal(isTerminalLaunchStatus('PAPER_HOLDING'), false);
+  assert.equal(isTerminalLaunchStatus('REJECTED'), true);
+  assert.equal(isTerminalLaunchStatus('EXPIRED'), true);
   assert.ok(QUALIFICATION_REASON_CODES.includes('CREATOR_EARLY_SELL'));
   assert.ok(QUALIFICATION_REASON_CODES.includes('UNSUPPORTED_QUOTE_MINT'));
 });
