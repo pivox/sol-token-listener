@@ -65,3 +65,20 @@ export interface DecodedPumpSwapTransaction {
   readonly poolCreations: readonly DecodedPumpSwapPoolCreation[];
   readonly trades: readonly DecodedPumpSwapTrade[];
 }
+
+export interface DecodedPumpSwapPoolAccount {
+  readonly poolBump: number;
+  readonly index: number;
+  readonly creator: string;
+  readonly baseMint: string;
+  readonly quoteMint: string;
+  readonly lpMint: string;
+  readonly baseVault: string;
+  readonly quoteVault: string;
+  readonly lpSupplyRaw: bigint;
+  readonly coinCreator: string;
+  readonly isMayhemMode: boolean;
+  readonly isCashbackCoin: boolean;
+  readonly virtualQuoteReservesRaw: bigint;
+  readonly trailingDataHex: string;
+}
