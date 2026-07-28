@@ -37,6 +37,27 @@ void test('ignore un pool ou des vaults qui ne correspondent pas à l’instruct
   assert.deepEqual(classifyTransactionSwaps(transaction, PROGRAM, [pool]), []);
 });
 
+void test('n’émet qu’un événement agrégé par pool lorsqu’une transaction contient plusieurs swaps', async () => {
+  const { pool, transaction } = await loadSwapFixture('buy-token2022-mainnet.json');
+  const instruction = transaction.instructions[0];
+  assert.ok(instruction);
+  const transactionWithTwoSwaps = {
+    ...transaction,
+    instructions: [
+      instruction,
+      { ...instruction, innerInstructionIndex: 9 },
+    ],
+  };
+
+  const events = classifyTransactionSwaps(transactionWithTwoSwaps, PROGRAM, [pool]);
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.kind, 'BUY');
+  assert.equal(events[0]?.amountWsolRaw, 90_000_000n);
+  assert.equal(events[0]?.amountTokenRaw, 507_380_634_821_292n);
+  assert.equal(events[0]?.cursor.innerInstructionIndex, 9);
+});
+
 void test('construit un identifiant de swap déterministe et distinct par instruction interne', () => {
   const a = createSwapEventId('pool', 'signature', 2, 3);
   const b = createSwapEventId('pool', 'signature', 2, 4);
