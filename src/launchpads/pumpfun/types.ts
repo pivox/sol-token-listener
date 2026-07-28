@@ -13,10 +13,12 @@ export type PumpInstructionName =
   | 'buy_v2'
   | 'create'
   | 'create_v2'
+  | 'migrate'
+  | 'migrate_v2'
   | 'sell'
   | 'sell_v2';
 
-export type PumpInstructionFamily = 'CREATE' | 'BUY' | 'SELL';
+export type PumpInstructionFamily = 'CREATE' | 'BUY' | 'SELL' | 'MIGRATE';
 
 export interface PumpIdlObject {
   readonly [key: string]: PumpIdlValue;
@@ -133,8 +135,19 @@ export interface DecodedPumpTrade {
   readonly quoteAsset: QuoteAsset;
 }
 
+export interface DecodedPumpMigration {
+  readonly action: DecodedPumpInstruction & { readonly family: 'MIGRATE' };
+  readonly instruction: 'MIGRATE' | 'MIGRATE_V2';
+  readonly mint: string;
+  readonly bondingCurve: string;
+  readonly announcedPool: string;
+  readonly baseTokenProgram: import('../../domain/types.js').TokenProgramKind;
+  readonly quoteAsset: QuoteAsset;
+}
+
 export interface DecodedPumpTransaction {
   readonly transaction: NormalizedTransaction;
   readonly creations: readonly DecodedPumpCreation[];
   readonly trades: readonly DecodedPumpTrade[];
+  readonly migrations: readonly DecodedPumpMigration[];
 }
