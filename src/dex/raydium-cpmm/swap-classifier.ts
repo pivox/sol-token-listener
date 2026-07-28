@@ -1,3 +1,7 @@
+import {
+  assertValidTransactionCursor,
+  InvalidChainCursorError,
+} from '../../domain/cursor.js';
 import type { PoolInfo, SwapEvent, SwapKind } from '../../domain/types.js';
 import type { NormalizedTokenBalance, NormalizedTransaction } from '../../solana/rpc/types.js';
 import { decodeSwapInstruction } from './instruction-decoder.js';
@@ -18,6 +22,14 @@ export function classifyTransactionSwaps(
   activePools: readonly PoolInfo[],
 ): SwapEvent[] {
   if (transaction.error !== null) return [];
+  const { transactionIndex } = transaction;
+  if (transactionIndex === null) {
+    throw new InvalidChainCursorError('transactionIndex', transactionIndex);
+  }
+  assertValidTransactionCursor({
+    slot: transaction.slot,
+    transactionIndex,
+  });
   const pools = new Map(activePools.map((pool) => [pool.pool, pool]));
   const matches = new Map<string, PoolSwapAggregate>();
 
@@ -72,7 +84,7 @@ export function classifyTransactionSwaps(
       amountTokenRaw: absolute(tokenDelta),
       cursor: {
         slot: transaction.slot,
-        transactionIndex: transaction.transactionIndex,
+        transactionIndex,
         instructionIndex: aggregate.instructionIndex,
         innerInstructionIndex: aggregate.innerInstructionIndex,
       },

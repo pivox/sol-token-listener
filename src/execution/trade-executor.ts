@@ -40,12 +40,7 @@ export class TradeExecutor {
         amountInLamports: quote.amountInRaw,
         amountOutTokenRaw: quote.amountOutRaw - quote.transferFeeRaw,
         quotedOutTokenRaw: quote.amountOutRaw,
-        cursor: {
-          slot: quote.observedSlot,
-          transactionIndex: -1,
-          instructionIndex: -1,
-          innerInstructionIndex: null,
-        },
+        cursor: null,
         confirmedAtMs: Date.now(),
         computeUnits: simulation.unitsConsumed ?? undefined,
         simulation,

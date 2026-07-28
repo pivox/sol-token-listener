@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { InvalidChainCursorError } from '../src/domain/cursor.js';
 import { classifyTransactionSwaps, createSwapEventId } from '../src/dex/raydium-cpmm/swap-classifier.js';
 import { loadSwapFixture } from './helpers/fixture.js';
 
@@ -31,6 +32,22 @@ void test('ignore une transaction échouée', async () => {
   const { pool, transaction } = await loadSwapFixture('buy-token2022-mainnet.json');
   transaction.error = { InstructionError: [1, 'Custom'] };
   assert.deepEqual(classifyTransactionSwaps(transaction, PROGRAM, [pool]), []);
+});
+
+void test('refuse de produire un swap sans index de transaction canonique', async () => {
+  const { pool, transaction } = await loadSwapFixture('buy-token2022-mainnet.json');
+  const transactionWithoutIndex = {
+    ...transaction,
+    transactionIndex: null,
+  };
+
+  assert.throws(
+    () => classifyTransactionSwaps(transactionWithoutIndex, PROGRAM, [pool]),
+    (error: unknown) =>
+      error instanceof InvalidChainCursorError
+      && error.field === 'transactionIndex'
+      && error.value === null,
+  );
 });
 
 void test('ignore un pool ou des vaults qui ne correspondent pas à l’instruction', async () => {

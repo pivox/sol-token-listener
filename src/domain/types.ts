@@ -17,6 +17,19 @@ export interface QuoteAsset {
   readonly tokenProgram: TokenProgramKind;
 }
 
+export type LaunchParameterValue =
+  | null
+  | string
+  | boolean
+  | bigint
+  | number
+  | readonly LaunchParameterValue[]
+  | LaunchParameterObject;
+
+export interface LaunchParameterObject {
+  readonly [key: string]: LaunchParameterValue;
+}
+
 export interface TokenLaunch {
   readonly mint: string;
   readonly creator: string;
@@ -24,7 +37,7 @@ export interface TokenLaunch {
   readonly quoteAssets: readonly QuoteAsset[];
   readonly launchpad: string;
   readonly createdAt: ChainCursor;
-  readonly parameters: Readonly<Record<string, unknown>>;
+  readonly parameters: LaunchParameterObject;
 }
 
 export interface ObservedChainTransaction {
@@ -180,7 +193,7 @@ export interface EntryExecution {
   readonly rentDeltaLamports?: bigint | undefined;
   readonly priorityFeeLamports?: bigint | undefined;
   readonly computeUnits?: bigint | undefined;
-  readonly cursor: ChainCursor;
+  readonly cursor: ChainCursor | null;
   readonly confirmedAtMs: number;
   readonly simulation: TransactionSimulation;
 }

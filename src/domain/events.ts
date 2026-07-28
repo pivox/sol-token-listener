@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { assertValidChainCursor } from './cursor.js';
 import type { ChainConfirmationStatus, ChainCursor } from './types.js';
 
 export const DOMAIN_EVENT_TYPES = [
@@ -21,7 +22,7 @@ export const DOMAIN_EVENT_TYPES = [
 
 export type DomainEventType = (typeof DOMAIN_EVENT_TYPES)[number];
 
-export interface DomainEvent<TPayload extends Readonly<Record<string, unknown>> = Readonly<Record<string, unknown>>> {
+export interface DomainEvent<TPayload extends object = Readonly<Record<string, unknown>>> {
   readonly id: string;
   readonly type: DomainEventType;
   readonly mint: string;
@@ -36,8 +37,18 @@ export interface DomainEvent<TPayload extends Readonly<Record<string, unknown>> 
   readonly payload: TPayload;
 }
 
+export type TypedDomainEvent<
+  TType extends DomainEventType,
+  TPayload extends object,
+  TPayloadVersion extends number,
+> = Omit<DomainEvent<TPayload>, 'type' | 'payloadVersion'> & {
+  readonly type: TType;
+  readonly payloadVersion: TPayloadVersion;
+};
+
 export interface ChainEventIdentity {
   readonly type: string;
+  readonly mint: string;
   readonly source: string;
   readonly program: string;
   readonly signature: string;
@@ -46,8 +57,10 @@ export interface ChainEventIdentity {
 
 export function createDeterministicChainEventId(identity: ChainEventIdentity): string {
   const { cursor } = identity;
-  const canonical = [
+  assertValidChainCursor(cursor);
+  const canonical = JSON.stringify([
     identity.type,
+    identity.mint,
     identity.source,
     identity.program,
     identity.signature,
@@ -55,6 +68,6 @@ export function createDeterministicChainEventId(identity: ChainEventIdentity): s
     cursor.transactionIndex.toString(),
     cursor.instructionIndex.toString(),
     cursor.innerInstructionIndex === null ? 'outer' : cursor.innerInstructionIndex.toString(),
-  ].join('\u001f');
+  ]);
   return `evt_${createHash('sha256').update(canonical).digest('hex')}`;
 }
