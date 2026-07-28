@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { AppConfig } from '../config/env.js';
 import type { DomainEvent } from '../domain/events.js';
+import type {
+  QualificationReport,
+  QualificationScore,
+} from '../domain/qualification.js';
 import {
   PaperTradingError,
   type ClosePaperPositionCommand,
@@ -53,7 +57,10 @@ export class PaperTradingEngine {
       snapshot.strategy.version,
       snapshot.trigger.id,
     ]);
-    const openCommandHash = hashValue('paper_open_command', snapshot);
+    const openCommandHash = hashValue('paper_open_command', {
+      ...snapshot,
+      trigger: snapshot.trigger.id,
+    });
     const openedAtMs = this.clock.now();
     assertValidTimestampMs('occurredAtMs', openedAtMs);
 
@@ -112,7 +119,10 @@ export class PaperTradingEngine {
     this.requirePaperMode();
     const snapshot = snapshotCloseCommand(command);
     validatePaperQuote(snapshot.sellQuote);
-    const closeCommandHash = hashValue('paper_close_command', snapshot);
+    const closeCommandHash = hashValue('paper_close_command', {
+      ...snapshot,
+      trigger: snapshot.trigger.id,
+    });
     const closedAtMs = this.clock.now();
     assertValidTimestampMs('occurredAtMs', closedAtMs);
 
@@ -173,6 +183,7 @@ function validateOpenCommand(
   command: OpenPaperPositionCommand,
   allowlist: readonly string[],
 ): void {
+  rejectOrphanedTrigger(command.trigger);
   if (command.mint.trim() === '' || command.trigger.mint !== command.mint) invalidQuote('mint');
   if (command.strategy.id.trim() === '' || !Number.isSafeInteger(command.strategy.version) || command.strategy.version <= 0) {
     invalidQuote('strategy');
@@ -198,6 +209,7 @@ function validateCloseCommand(
   command: ClosePaperPositionCommand,
   position: PaperPosition,
 ): void {
+  rejectOrphanedTrigger(command.trigger);
   if (command.trigger.mint !== position.mint) invalidQuote('trigger.mint');
   if (command.reason.trim() === '') invalidQuote('reason');
   if (
@@ -209,13 +221,29 @@ function validateCloseCommand(
   }
 }
 
+function rejectOrphanedTrigger(trigger: DomainEvent): void {
+  if (trigger.confirmationStatus === 'orphaned') {
+    throw new PaperTradingError(
+      'TRIGGER_ORPHANED',
+      'Un événement orphaned ne peut pas déclencher une action paper.',
+    );
+  }
+}
+
 function snapshotOpenCommand(command: OpenPaperPositionCommand): OpenPaperPositionCommand {
   return freeze({
     mint: command.mint,
-    quoteAsset: freeze({ ...command.quoteAsset }),
-    strategy: freeze({ ...command.strategy }),
+    quoteAsset: freeze({
+      mint: command.quoteAsset.mint,
+      decimals: command.quoteAsset.decimals,
+      tokenProgram: command.quoteAsset.tokenProgram,
+    }),
+    strategy: freeze({
+      id: command.strategy.id,
+      version: command.strategy.version,
+    }),
     trigger: snapshotTrigger(command.trigger),
-    qualification: command.qualification,
+    qualification: snapshotQualification(command.qualification),
     buyQuote: snapshotQuote(command.buyQuote),
     reverseSellQuote: snapshotQuote(command.reverseSellQuote),
     maximumRoundTripLossBps: command.maximumRoundTripLossBps,
@@ -232,7 +260,54 @@ function snapshotCloseCommand(command: ClosePaperPositionCommand): ClosePaperPos
 }
 
 function snapshotQuote(quote: PaperExecutionQuote): PaperExecutionQuote {
-  return freeze({ ...quote });
+  return freeze({
+    id: quote.id,
+    inputMint: quote.inputMint,
+    outputMint: quote.outputMint,
+    amountInRaw: quote.amountInRaw,
+    amountOutRaw: quote.amountOutRaw,
+    minimumAmountOutRaw: quote.minimumAmountOutRaw,
+    feesRaw: quote.feesRaw,
+    slippageBps: quote.slippageBps,
+    priceImpactBps: quote.priceImpactBps,
+    observedAtMs: quote.observedAtMs,
+    observedSlot: quote.observedSlot,
+  });
+}
+
+function snapshotQualification(report: QualificationReport): QualificationReport {
+  const score = (value: QualificationScore): QualificationScore => freeze({
+    score: value.score,
+    maximum: value.maximum,
+  });
+  return freeze({
+    ruleSet: freeze({
+      id: report.ruleSet.id,
+      version: report.ruleSet.version,
+      status: report.ruleSet.status,
+      minimumTotalScore: report.ruleSet.minimumTotalScore,
+    }),
+    scores: freeze({
+      preparation: score(report.scores.preparation),
+      socialAuthenticity: score(report.scores.socialAuthenticity),
+      onchainHealth: score(report.scores.onchainHealth),
+      total: score(report.scores.total),
+    }),
+    evidence: freeze(report.evidence.map((item) => freeze({
+      signal: item.signal,
+      dimension: item.dimension,
+      status: item.status,
+      required: item.required,
+      weight: item.weight,
+      message: item.message,
+    }))),
+    blockers: freeze(report.blockers.map((item) => freeze({
+      code: item.code,
+      message: item.message,
+    }))),
+    verdict: report.verdict,
+    evaluatedAtMs: report.evaluatedAtMs,
+  });
 }
 
 function snapshotTrigger(trigger: DomainEvent): DomainEvent {

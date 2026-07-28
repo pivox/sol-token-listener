@@ -61,6 +61,11 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     mint: string,
     strategy: PaperStrategyIdentity,
   ): Promise<PaperPosition | null> {
+    const lockKey = `${mint}\u001f${strategy.id}\u001f${strategy.version}`;
+    await this.client.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [lockKey],
+    );
     const result = await this.client.query(
       `SELECT payload FROM paper_positions
        WHERE mint = $1 AND strategy_id = $2 AND strategy_version = $3
@@ -107,7 +112,8 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
       ],
     );
     await this.insertTrade(trade);
-    await this.insertEvent(event);
+    await this.markPositionEventsTerminal(position);
+    await this.insertEvent(event, position.closedAtMs, position.purgeAfterMs);
   }
 
   private async insertPosition(position: PaperPosition): Promise<void> {
@@ -161,13 +167,16 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
 
   private async insertEvent(
     event: PaperPositionOpenedEventV1 | PaperPositionClosedEventV1,
+    terminalAtMs: number | null = null,
+    purgeAfterMs: number | null = null,
   ): Promise<void> {
     await this.client.query(
       `INSERT INTO domain_events (
         event_id, raw_event_id, type, mint, source, program, signature, slot,
         transaction_index, instruction_index, inner_instruction_index,
-        confirmation_status, blockchain_time, observed_at, payload_version, payload
-      ) VALUES ($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        confirmation_status, blockchain_time, observed_at, payload_version, payload,
+        terminal_at, purge_after
+      ) VALUES ($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
       ON CONFLICT (event_id) DO NOTHING`,
       [
         event.id, event.type, event.mint, event.source, event.program,
@@ -175,7 +184,19 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
         event.cursor.instructionIndex, event.cursor.innerInstructionIndex,
         event.confirmationStatus, date(event.blockchainTimeMs),
         new Date(event.observedAtMs), event.payloadVersion, toJsonValue(event.payload),
+        date(terminalAtMs), date(purgeAfterMs),
       ],
+    );
+  }
+
+  private async markPositionEventsTerminal(position: PaperPosition): Promise<void> {
+    await this.client.query(
+      `UPDATE domain_events
+       SET terminal_at = $2, purge_after = $3
+       WHERE source = 'paper-trading'
+         AND payload #>> '{position,id}' = $1
+         AND purge_after IS NULL`,
+      [position.id, date(position.closedAtMs), date(position.purgeAfterMs)],
     );
   }
 }
@@ -186,17 +207,79 @@ function decodePosition(row: unknown): PaperPosition | null {
     throw new TypeError('Projection paper position invalide.');
   }
   const value = fromJsonValue(row.payload);
-  if (
-    typeof value !== 'object'
-    || value === null
-    || !('id' in value)
-    || typeof value.id !== 'string'
-    || !('status' in value)
-    || (value.status !== 'PAPER_HOLDING' && value.status !== 'PAPER_CLOSED')
-  ) {
+  if (!isRecord(value)) {
     throw new TypeError('Payload paper position invalide.');
   }
-  return value as unknown as PaperPosition;
+  const quoteAsset = record(value.quoteAsset, 'quoteAsset');
+  const strategy = record(value.strategy, 'strategy');
+  const status = value.status;
+  if (status !== 'PAPER_HOLDING' && status !== 'PAPER_CLOSED') invalidPayload('status');
+  return Object.freeze({
+    id: text(value.id, 'id'),
+    mint: text(value.mint, 'mint'),
+    quoteAsset: Object.freeze({
+      mint: text(quoteAsset.mint, 'quoteAsset.mint'),
+      decimals: integer(quoteAsset.decimals, 'quoteAsset.decimals'),
+      tokenProgram: tokenProgram(quoteAsset.tokenProgram),
+    }),
+    strategy: Object.freeze({
+      id: text(strategy.id, 'strategy.id'),
+      version: integer(strategy.version, 'strategy.version'),
+    }),
+    status,
+    baseFilledRaw: bigint(value.baseFilledRaw, 'baseFilledRaw'),
+    remainingBaseRaw: bigint(value.remainingBaseRaw, 'remainingBaseRaw'),
+    quoteCostRaw: bigint(value.quoteCostRaw, 'quoteCostRaw'),
+    quoteProceedsRaw: nullableBigint(value.quoteProceedsRaw, 'quoteProceedsRaw'),
+    grossPnlQuoteRaw: nullableBigint(value.grossPnlQuoteRaw, 'grossPnlQuoteRaw'),
+    netPnlQuoteRaw: nullableBigint(value.netPnlQuoteRaw, 'netPnlQuoteRaw'),
+    roundTripLossBps: bigint(value.roundTripLossBps, 'roundTripLossBps'),
+    entryTradeId: text(value.entryTradeId, 'entryTradeId'),
+    exitTradeId: nullableText(value.exitTradeId, 'exitTradeId'),
+    openCommandHash: text(value.openCommandHash, 'openCommandHash'),
+    closeCommandHash: nullableText(value.closeCommandHash, 'closeCommandHash'),
+    triggerEventId: text(value.triggerEventId, 'triggerEventId'),
+    openedAtMs: integer(value.openedAtMs, 'openedAtMs'),
+    closedAtMs: nullableInteger(value.closedAtMs, 'closedAtMs'),
+    purgeAfterMs: nullableInteger(value.purgeAfterMs, 'purgeAfterMs'),
+    payloadVersion: value.payloadVersion === 1 ? 1 : invalidPayload('payloadVersion'),
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function record(value: unknown, field: string): Record<string, unknown> {
+  if (!isRecord(value)) invalidPayload(field);
+  return value;
+}
+function text(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value === '') invalidPayload(field);
+  return value;
+}
+function nullableText(value: unknown, field: string): string | null {
+  return value === null ? null : text(value, field);
+}
+function integer(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) invalidPayload(field);
+  return value;
+}
+function nullableInteger(value: unknown, field: string): number | null {
+  return value === null ? null : integer(value, field);
+}
+function bigint(value: unknown, field: string): bigint {
+  if (typeof value !== 'bigint') invalidPayload(field);
+  return value;
+}
+function nullableBigint(value: unknown, field: string): bigint | null {
+  return value === null ? null : bigint(value, field);
+}
+function tokenProgram(value: unknown): 'SPL_TOKEN' | 'TOKEN_2022' {
+  if (value !== 'SPL_TOKEN' && value !== 'TOKEN_2022') invalidPayload('quoteAsset.tokenProgram');
+  return value;
+}
+function invalidPayload(field: string): never {
+  throw new TypeError(`Payload paper position invalide: ${field}.`);
 }
 
 function decimal(value: bigint | null): string | null {

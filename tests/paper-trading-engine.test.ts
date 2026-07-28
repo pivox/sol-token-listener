@@ -43,6 +43,25 @@ void test('ouvre une position au fill conservateur et rejoue sans doublon', asyn
   assert.equal(repository.writeCount, 1);
 });
 
+void test('rejoue la même commande après montée de finalité sans conflit', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = openCommand();
+
+  const first = await engine.open(command);
+  const replay = await engine.open({
+    ...command,
+    trigger: {
+      ...command.trigger,
+      confirmationStatus: 'finalized',
+      observedAtMs: 2,
+    },
+  });
+
+  assert.equal(replay.id, first.id);
+  assert.equal(repository.writeCount, 1);
+});
+
 void test('refuse une qualification non acceptée', async () => {
   const repository = new MemoryPaperRepository();
   const command = openCommand();
@@ -53,6 +72,19 @@ void test('refuse une qualification non acceptée', async () => {
       qualification: { ...command.qualification, verdict: 'WATCHLISTED' },
     }),
     hasCode('QUALIFICATION_NOT_ACCEPTED'),
+  );
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('refuse un événement déclencheur orphaned', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand();
+  await assert.rejects(
+    makeEngine(repository, 'paper').open({
+      ...command,
+      trigger: { ...command.trigger, confirmationStatus: 'orphaned' },
+    }),
+    hasCode('TRIGGER_ORPHANED'),
   );
   assert.equal(repository.writeCount, 0);
 });
