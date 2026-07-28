@@ -193,7 +193,7 @@ export interface EntryExecution {
   readonly rentDeltaLamports?: bigint | undefined;
   readonly priorityFeeLamports?: bigint | undefined;
   readonly computeUnits?: bigint | undefined;
-  readonly cursor: ChainCursor;
+  readonly cursor: ChainCursor | null;
   readonly confirmedAtMs: number;
   readonly simulation: TransactionSimulation;
 }

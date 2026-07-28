@@ -23,7 +23,7 @@ export interface NormalizedTokenBalance {
 export interface NormalizedTransaction {
   readonly signature: string;
   readonly slot: bigint;
-  readonly transactionIndex: number;
+  readonly transactionIndex: number | null;
   confirmationStatus: LegacyConfirmationStatus;
   readonly version: number | 'legacy';
   readonly blockTimeMs: number | null;

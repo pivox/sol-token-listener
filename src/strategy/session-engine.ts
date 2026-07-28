@@ -338,7 +338,7 @@ function entryFromTrade(trade: TradeRecord): EntryExecution {
     rentDeltaLamports: trade.rentDeltaLamports,
     priorityFeeLamports: trade.priorityFeeLamports,
     computeUnits: trade.computeUnits,
-    cursor: { slot: trade.slot ?? 0n, transactionIndex: -1, instructionIndex: -1, innerInstructionIndex: null },
+    cursor: null,
     confirmedAtMs: trade.updatedAtMs,
     simulation: simulationFromTrade(trade),
   };

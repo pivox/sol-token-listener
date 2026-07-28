@@ -58,7 +58,10 @@ void test('reprend un BUY_PENDING depuis un trade simulé sans refaire un achat'
   harness.sessionRepo.active.push(session);
   harness.tradeRepo.records.set(`${session.id}:BUY`, makeTrade(session, 'BUY'));
   await harness.engine.restore();
-  assert.equal(onlySession(harness.engine).status, 'HOLDING');
+  const restored = onlySession(harness.engine);
+  assert.equal(restored.status, 'HOLDING');
+  assert.ok(restored.entry);
+  assert.equal(restored.entry.cursor, null);
   assert.equal(harness.buyCalls.value, 0);
   harness.engine.stop();
 });
@@ -71,7 +74,7 @@ function makeHarness(options: { target: number; sellFails: boolean }) {
   const venue = { readPoolRuntimeState: async () => ({ pool:'pool',statusBits:0,swapsEnabled:true,openTimeUnix:0n,tokenVaultBalanceRaw:1n,wsolVaultBalanceRaw:1n,observedSlot:1n }) } as never;
   const risk = { analyze: async () => ({ id:'risk',verdict:'ALLOW',score:100 }) } as never;
   const executor = {
-    buy: async () => { buyCalls.value += 1; return { mode:'paper',amountInLamports:1n,amountOutTokenRaw:2n,quotedOutTokenRaw:2n,cursor:{slot:2n,transactionIndex:-1,instructionIndex:-1,innerInstructionIndex:null},confirmedAtMs:Date.now(),simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null} }; },
+    buy: async () => { buyCalls.value += 1; return { mode:'paper',amountInLamports:1n,amountOutTokenRaw:2n,quotedOutTokenRaw:2n,cursor:null,confirmedAtMs:Date.now(),simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null} }; },
     sell: async () => { if (options.sellFails) throw new Error('vente impossible'); return { mode:'paper',amountInTokenRaw:2n,amountOutLamports:1n,quotedOutLamports:1n,confirmedAtMs:Date.now(),simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null} }; },
   } as never;
   const config = { targetBuysAfterEntry:options.target,poolMonitorTtlMinutes:90,maxConcurrentPositions:1 } as AppConfig;

@@ -5,6 +5,7 @@ import type {
   TokenBalance,
   VersionedTransactionResponse,
 } from '@solana/web3.js';
+import { assertValidTransactionCursor } from '../../domain/cursor.js';
 import type { SolanaRpcClient } from './rpc-client.js';
 import type {
   LegacyConfirmationStatus,
@@ -19,7 +20,7 @@ export class TransactionFetcher {
   async fetch(
     signature: string,
     confirmationStatus: LegacyConfirmationStatus = 'CONFIRMED',
-    transactionIndex = -1,
+    transactionIndex: number | null = null,
   ): Promise<NormalizedTransaction | null> {
     if (confirmationStatus === 'ORPHANED') return null;
     const response = await this.rpc.http.getTransaction(signature, {
@@ -36,8 +37,12 @@ export class TransactionFetcher {
 export function normalizeTransaction(
   response: VersionedTransactionResponse,
   confirmationStatus: LegacyConfirmationStatus,
-  transactionIndex: number,
+  transactionIndex: number | null,
 ): NormalizedTransaction {
+  const slot = BigInt(response.slot);
+  if (transactionIndex !== null) {
+    assertValidTransactionCursor({ slot, transactionIndex });
+  }
   const message = response.transaction.message;
   const loadedAddresses = response.meta?.loadedAddresses;
   const keys = loadedAddresses === undefined
@@ -56,7 +61,7 @@ export function normalizeTransaction(
   const meta = response.meta;
   return {
     signature: requiredSignature(response.transaction.signatures[0]),
-    slot: BigInt(response.slot),
+    slot,
     transactionIndex,
     confirmationStatus,
     version: response.version ?? 'legacy',

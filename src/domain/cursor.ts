@@ -46,7 +46,10 @@ export function compareCursors(left: ChainCursor, right: ChainCursor): -1 | 0 | 
   const instruction = compareNumber(left.instructionIndex, right.instructionIndex);
   if (instruction !== 0) return instruction;
 
-  return compareNumber(left.innerInstructionIndex ?? -1, right.innerInstructionIndex ?? -1);
+  return compareInnerInstructionIndex(
+    left.innerInstructionIndex,
+    right.innerInstructionIndex,
+  );
 }
 
 function compareBigInt(left: bigint, right: bigint): -1 | 0 | 1 {
@@ -59,6 +62,15 @@ function compareNumber(left: number, right: number): -1 | 0 | 1 {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
+}
+
+function compareInnerInstructionIndex(
+  left: number | null,
+  right: number | null,
+): -1 | 0 | 1 {
+  if (left === null) return right === null ? 0 : -1;
+  if (right === null) return 1;
+  return compareNumber(left, right);
 }
 
 function assertValidCursorIndex(

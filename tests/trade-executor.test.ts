@@ -16,6 +16,21 @@ const SESSION = {
   },
 } as unknown as TokenSession;
 
+void test('un achat paper réussi n’invente aucun curseur de chaîne', async () => {
+  const savedTrade: { value: TradeRecord | null } = { value: null };
+  const executor = makeExecutor({
+    simulationOk: true,
+    onSave: (trade) => { savedTrade.value = trade; },
+  });
+
+  const execution = await executor.buy(SESSION);
+
+  assert.equal(execution.cursor, null);
+  assert.equal(execution.amountInLamports, 100n);
+  assert.equal(execution.amountOutTokenRaw, 194n);
+  assert.equal(savedTrade.value?.status, 'SIMULATED');
+});
+
 void test('utilise la quantité simulée de l’entrée pour une vente paper', async () => {
   let walletBalanceRead = false;
   let quotedAmount: bigint | null = null;
@@ -61,6 +76,13 @@ function makeExecutor(options: {
       options.onReadBalance?.();
       return 999n;
     },
+    quoteBuy: async (..._args: unknown[]) => ({
+      amountInRaw: 100n,
+      amountOutRaw: 200n,
+      transferFeeRaw: 6n,
+      observedSlot: 42n,
+    }),
+    buildBuy: async (..._args: unknown[]) => ({ transaction: {} }),
     quoteSell: async (_pool: unknown, amount: bigint) => {
       options.onQuoteSell?.(amount);
       return {
