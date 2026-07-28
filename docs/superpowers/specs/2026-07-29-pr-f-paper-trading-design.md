@@ -110,7 +110,16 @@ Le repository exécute chaque commande dans une transaction PostgreSQL :
 6. commit atomique.
 
 Un replay identique renvoie la projection existante. Un replay contradictoire
-échoue avec une erreur typée et n’écrit rien.
+échoue avec une erreur typée et n’écrit rien. Le verrou advisory sérialise aussi
+deux ouvertures concurrentes lorsqu’aucune ligne n’existait au premier
+`SELECT`.
+
+Une montée `processed -> confirmed -> finalized` enrichit atomiquement
+l’événement paper existant. Un déclencheur non finalisé ensuite réconcilié
+`orphaned` rend la position `PAPER_RETRACTED`, sans inventer de trade
+compensatoire. La position, ses trades et ses événements deviennent terminaux
+et purgeables après la fenêtre de rétention. Une transition
+`finalized -> orphaned` reste un conflit de finalité.
 
 ## Persistance
 
@@ -123,7 +132,8 @@ Une seule position active est autorisée par mint et stratégie V1. Les colonnes
 financières utilisent `NUMERIC(78,0)`. Les payloads conservent la quote et les
 preuves versionnées.
 
-Une position ouverte n’a pas de `purge_after`. À la fermeture :
+Une position ouverte n’a pas de `purge_after`. À la fermeture ou à la
+rétractation :
 
 ```text
 purge_after = closed_at + DATA_RETENTION_HOURS
@@ -140,7 +150,8 @@ Le repository persiste un événement source-indépendant :
 
 `PaperPositionUpdated` reste réservé aux futures sorties partielles et
 réévaluations. Les événements réutilisent l’événement déclencheur comme preuve
-et n’inventent aucun curseur on-chain.
+et n’inventent aucun curseur on-chain. Leur statut de confirmation est
+réconcilié sur replay, y compris jusqu’à `orphaned`.
 
 ## Tests et acceptation
 

@@ -5,7 +5,10 @@ import type {
   PaperStrategyIdentity,
   PaperTrade,
 } from '../domain/paper-trading.js';
+import { reconcileConfirmationStatus } from '../domain/confirmation-status.js';
+import type { ChainConfirmationStatus } from '../domain/types.js';
 import type {
+  PaperConfirmationObservation,
   PaperTradingRepository,
   PaperTradingTransaction,
 } from '../ports/paper-trading-repository.js';
@@ -116,6 +119,53 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     await this.insertEvent(event, position.closedAtMs, position.purgeAfterMs);
   }
 
+  public async reconcileEventConfirmation(
+    eventId: string,
+    trigger: PaperConfirmationObservation,
+  ): Promise<void> {
+    const result = await this.client.query(
+      'SELECT confirmation_status FROM domain_events WHERE event_id = $1 FOR UPDATE',
+      [eventId],
+    );
+    const current = decodeConfirmationStatus(result.rows[0]);
+    const next = reconcileConfirmationStatus(current, trigger.confirmationStatus) === 'update'
+      ? trigger.confirmationStatus
+      : current;
+    await this.client.query(
+      `UPDATE domain_events SET
+        confirmation_status = $2,
+        blockchain_time = CASE
+          WHEN $3::timestamptz IS NULL THEN blockchain_time
+          WHEN blockchain_time IS NULL THEN $3
+          ELSE LEAST(blockchain_time, $3)
+        END,
+        observed_at = LEAST(observed_at, $4)
+       WHERE event_id = $1`,
+      [
+        eventId,
+        next,
+        date(trigger.blockchainTimeMs),
+        new Date(trigger.observedAtMs),
+      ],
+    );
+  }
+
+  public async retractPosition(position: PaperPosition): Promise<void> {
+    await this.client.query(
+      `UPDATE paper_positions SET
+        status = $2, payload = $3, closed_at = $4, purge_after = $5
+       WHERE position_id = $1`,
+      [
+        position.id,
+        position.status,
+        toJsonValue(position),
+        date(position.closedAtMs),
+        date(position.purgeAfterMs),
+      ],
+    );
+    await this.markPositionEventsTerminal(position);
+  }
+
   private async insertPosition(position: PaperPosition): Promise<void> {
     await this.client.query(
       `INSERT INTO paper_positions (
@@ -213,27 +263,33 @@ function decodePosition(row: unknown): PaperPosition | null {
   const quoteAsset = record(value.quoteAsset, 'quoteAsset');
   const strategy = record(value.strategy, 'strategy');
   const status = value.status;
-  if (status !== 'PAPER_HOLDING' && status !== 'PAPER_CLOSED') invalidPayload('status');
-  return Object.freeze({
+  if (
+    status !== 'PAPER_HOLDING'
+    && status !== 'PAPER_CLOSED'
+    && status !== 'PAPER_RETRACTED'
+  ) {
+    invalidPayload('status');
+  }
+  const position: PaperPosition = {
     id: text(value.id, 'id'),
     mint: text(value.mint, 'mint'),
     quoteAsset: Object.freeze({
       mint: text(quoteAsset.mint, 'quoteAsset.mint'),
-      decimals: integer(quoteAsset.decimals, 'quoteAsset.decimals'),
+      decimals: boundedInteger(quoteAsset.decimals, 'quoteAsset.decimals', 0, 255),
       tokenProgram: tokenProgram(quoteAsset.tokenProgram),
     }),
     strategy: Object.freeze({
       id: text(strategy.id, 'strategy.id'),
-      version: integer(strategy.version, 'strategy.version'),
+      version: boundedInteger(strategy.version, 'strategy.version', 1),
     }),
     status,
-    baseFilledRaw: bigint(value.baseFilledRaw, 'baseFilledRaw'),
-    remainingBaseRaw: bigint(value.remainingBaseRaw, 'remainingBaseRaw'),
-    quoteCostRaw: bigint(value.quoteCostRaw, 'quoteCostRaw'),
+    baseFilledRaw: positiveBigint(value.baseFilledRaw, 'baseFilledRaw'),
+    remainingBaseRaw: nonNegativeBigint(value.remainingBaseRaw, 'remainingBaseRaw'),
+    quoteCostRaw: positiveBigint(value.quoteCostRaw, 'quoteCostRaw'),
     quoteProceedsRaw: nullableBigint(value.quoteProceedsRaw, 'quoteProceedsRaw'),
     grossPnlQuoteRaw: nullableBigint(value.grossPnlQuoteRaw, 'grossPnlQuoteRaw'),
     netPnlQuoteRaw: nullableBigint(value.netPnlQuoteRaw, 'netPnlQuoteRaw'),
-    roundTripLossBps: bigint(value.roundTripLossBps, 'roundTripLossBps'),
+    roundTripLossBps: boundedBigint(value.roundTripLossBps, 'roundTripLossBps', 0n, 10_000n),
     entryTradeId: text(value.entryTradeId, 'entryTradeId'),
     exitTradeId: nullableText(value.exitTradeId, 'exitTradeId'),
     openCommandHash: text(value.openCommandHash, 'openCommandHash'),
@@ -243,7 +299,9 @@ function decodePosition(row: unknown): PaperPosition | null {
     closedAtMs: nullableInteger(value.closedAtMs, 'closedAtMs'),
     purgeAfterMs: nullableInteger(value.purgeAfterMs, 'purgeAfterMs'),
     payloadVersion: value.payloadVersion === 1 ? 1 : invalidPayload('payloadVersion'),
-  });
+  };
+  validatePositionState(position);
+  return Object.freeze(position);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -261,8 +319,25 @@ function nullableText(value: unknown, field: string): string | null {
   return value === null ? null : text(value, field);
 }
 function integer(value: unknown, field: string): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) invalidPayload(field);
+  if (
+    typeof value !== 'number'
+    || !Number.isSafeInteger(value)
+    || value < 0
+    || Object.is(value, -0)
+  ) {
+    invalidPayload(field);
+  }
   return value;
+}
+function boundedInteger(
+  value: unknown,
+  field: string,
+  minimum: number,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number {
+  const decoded = integer(value, field);
+  if (decoded < minimum || decoded > maximum) invalidPayload(field);
+  return decoded;
 }
 function nullableInteger(value: unknown, field: string): number | null {
   return value === null ? null : integer(value, field);
@@ -271,12 +346,106 @@ function bigint(value: unknown, field: string): bigint {
   if (typeof value !== 'bigint') invalidPayload(field);
   return value;
 }
+function positiveBigint(value: unknown, field: string): bigint {
+  const decoded = bigint(value, field);
+  if (decoded <= 0n) invalidPayload(field);
+  return decoded;
+}
+function nonNegativeBigint(value: unknown, field: string): bigint {
+  const decoded = bigint(value, field);
+  if (decoded < 0n) invalidPayload(field);
+  return decoded;
+}
+function boundedBigint(
+  value: unknown,
+  field: string,
+  minimum: bigint,
+  maximum: bigint,
+): bigint {
+  const decoded = bigint(value, field);
+  if (decoded < minimum || decoded > maximum) invalidPayload(field);
+  return decoded;
+}
 function nullableBigint(value: unknown, field: string): bigint | null {
   return value === null ? null : bigint(value, field);
 }
 function tokenProgram(value: unknown): 'SPL_TOKEN' | 'TOKEN_2022' {
   if (value !== 'SPL_TOKEN' && value !== 'TOKEN_2022') invalidPayload('quoteAsset.tokenProgram');
   return value;
+}
+function decodeConfirmationStatus(row: unknown): ChainConfirmationStatus {
+  if (!isRecord(row)) throw new TypeError('Événement paper introuvable.');
+  const value = row.confirmation_status;
+  if (
+    value !== 'processed'
+    && value !== 'confirmed'
+    && value !== 'finalized'
+    && value !== 'orphaned'
+  ) {
+    throw new TypeError('Statut de confirmation paper invalide.');
+  }
+  return value;
+}
+function validatePositionState(position: PaperPosition): void {
+  if (position.remainingBaseRaw > position.baseFilledRaw) {
+    invalidPayload('remainingBaseRaw');
+  }
+  if (position.status === 'PAPER_HOLDING') {
+    if (
+      position.remainingBaseRaw === 0n
+      || position.quoteProceedsRaw !== null
+      || position.grossPnlQuoteRaw !== null
+      || position.netPnlQuoteRaw !== null
+      || position.exitTradeId !== null
+      || position.closeCommandHash !== null
+      || position.closedAtMs !== null
+      || position.purgeAfterMs !== null
+    ) {
+      invalidPayload('status');
+    }
+    return;
+  }
+  if (position.status === 'PAPER_CLOSED' && (
+    position.remainingBaseRaw !== 0n
+    || position.quoteProceedsRaw === null
+    || position.quoteProceedsRaw < 0n
+    || position.grossPnlQuoteRaw === null
+    || position.netPnlQuoteRaw === null
+    || position.exitTradeId === null
+    || position.closeCommandHash === null
+    || position.closedAtMs === null
+    || position.purgeAfterMs === null
+    || position.purgeAfterMs < position.closedAtMs
+  )) {
+    invalidPayload('status');
+  }
+  if (position.status === 'PAPER_RETRACTED') {
+    if (
+      position.closedAtMs === null
+      || position.purgeAfterMs === null
+      || position.purgeAfterMs < position.closedAtMs
+    ) {
+      invalidPayload('status');
+    }
+    const retractedBeforeSell = (
+      position.remainingBaseRaw > 0n
+      && position.quoteProceedsRaw === null
+      && position.grossPnlQuoteRaw === null
+      && position.netPnlQuoteRaw === null
+      && position.exitTradeId === null
+      && position.closeCommandHash === null
+    );
+    const retractedAfterSell = (
+      position.remainingBaseRaw === 0n
+      && position.quoteProceedsRaw !== null
+      && position.quoteProceedsRaw >= 0n
+      && position.grossPnlQuoteRaw !== null
+      && position.netPnlQuoteRaw !== null
+      && position.exitTradeId !== null
+      && position.closeCommandHash !== null
+    );
+    if (!retractedBeforeSell && !retractedAfterSell) invalidPayload('status');
+  }
 }
 function invalidPayload(field: string): never {
   throw new TypeError(`Payload paper position invalide: ${field}.`);

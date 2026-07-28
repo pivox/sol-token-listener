@@ -145,7 +145,11 @@ transaction Solana et ne dépend d’aucun wallet. Il ouvre uniquement en mode
 Les entrées et sorties utilisent `minimumAmountOutRaw`. Frais, slippage,
 perte aller-retour et PnL restent en `bigint`. Position, trade et événement
 métier sont persistés atomiquement ; les replays sont idempotents. Une
-position fermée est conservée quatre heures avant purge.
+position fermée est conservée quatre heures avant purge. Une montée de finalité
+enrichit l’événement paper existant. Si le déclencheur d’une ouverture ou d’une
+fermeture non finalisée devient `orphaned`, la projection passe à
+`PAPER_RETRACTED`, devient inactive et reste auditable pendant la même fenêtre
+de rétention.
 
 Les événements métier sont source-indépendants :
 

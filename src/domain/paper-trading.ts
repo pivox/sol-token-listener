@@ -24,7 +24,10 @@ export interface PaperRoundTrip {
   readonly lossBps: bigint;
 }
 
-export type PaperPositionStatus = 'PAPER_HOLDING' | 'PAPER_CLOSED';
+export type PaperPositionStatus =
+  | 'PAPER_HOLDING'
+  | 'PAPER_CLOSED'
+  | 'PAPER_RETRACTED';
 export type PaperTradeSide = 'BUY' | 'SELL';
 
 export interface PaperStrategyIdentity {

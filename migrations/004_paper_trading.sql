@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS paper_positions (
   quote_token_program TEXT NOT NULL,
   strategy_id TEXT NOT NULL,
   strategy_version INTEGER NOT NULL CHECK (strategy_version > 0),
-  status TEXT NOT NULL CHECK (status IN ('PAPER_HOLDING', 'PAPER_CLOSED')),
+  status TEXT NOT NULL
+    CHECK (status IN ('PAPER_HOLDING', 'PAPER_CLOSED', 'PAPER_RETRACTED')),
   base_filled_raw NUMERIC(78,0) NOT NULL,
   remaining_base_raw NUMERIC(78,0) NOT NULL,
   quote_cost_raw NUMERIC(78,0) NOT NULL,
@@ -28,6 +29,8 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     (status = 'PAPER_HOLDING' AND closed_at IS NULL AND purge_after IS NULL)
     OR
     (status = 'PAPER_CLOSED' AND closed_at IS NOT NULL AND purge_after IS NOT NULL)
+    OR
+    (status = 'PAPER_RETRACTED' AND closed_at IS NOT NULL AND purge_after IS NOT NULL)
   )
 );
 CREATE UNIQUE INDEX IF NOT EXISTS paper_positions_active_strategy_idx

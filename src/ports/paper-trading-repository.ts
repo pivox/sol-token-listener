@@ -5,6 +5,12 @@ import type {
   PaperStrategyIdentity,
   PaperTrade,
 } from '../domain/paper-trading.js';
+import type { DomainEvent } from '../domain/events.js';
+
+export type PaperConfirmationObservation = Pick<
+  DomainEvent,
+  'confirmationStatus' | 'blockchainTimeMs' | 'observedAtMs'
+>;
 
 export interface PaperTradingTransaction {
   findPosition(id: string): Promise<PaperPosition | null>;
@@ -22,6 +28,11 @@ export interface PaperTradingTransaction {
     trade: PaperTrade,
     event: PaperPositionClosedEventV1,
   ): Promise<void>;
+  reconcileEventConfirmation(
+    eventId: string,
+    trigger: PaperConfirmationObservation,
+  ): Promise<void>;
+  retractPosition(position: PaperPosition): Promise<void>;
 }
 
 export interface PaperTradingRepository {

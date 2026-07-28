@@ -16,6 +16,7 @@ void test('crée les tables paper avec bigint, unicité et cascade', async () =>
   assert.match(sql, /UNIQUE\(position_id, side\)/u);
   assert.match(sql, /PAPER_HOLDING/u);
   assert.match(sql, /PAPER_CLOSED/u);
+  assert.match(sql, /PAPER_RETRACTED/u);
 });
 
 void test('ne contient aucun chemin d’exécution Solana', async () => {

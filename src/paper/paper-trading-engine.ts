@@ -16,7 +16,10 @@ import {
   type PaperTrade,
 } from '../domain/paper-trading.js';
 import { assertValidTimestampMs } from '../domain/timestamp.js';
-import type { PaperTradingRepository } from '../ports/paper-trading-repository.js';
+import type {
+  PaperTradingRepository,
+  PaperTradingTransaction,
+} from '../ports/paper-trading-repository.js';
 import { stringifyJson } from '../utils/json.js';
 import { calculateRoundTrip, validatePaperQuote } from './paper-math.js';
 
@@ -67,11 +70,26 @@ export class PaperTradingEngine {
     return this.repository.transact(async (transaction) => {
       const existing = await transaction.findPosition(positionId);
       if (existing !== null) {
-        if (existing.openCommandHash !== openCommandHash) conflict();
-        return existing;
+        return this.reconcileOpenReplay(
+          transaction,
+          existing,
+          openCommandHash,
+          snapshot.trigger,
+        );
       }
       const active = await transaction.findActivePosition(snapshot.mint, snapshot.strategy);
-      if (active !== null) conflict();
+      if (active !== null) {
+        if (active.id === positionId && active.openCommandHash === openCommandHash) {
+          return this.reconcileOpenReplay(
+            transaction,
+            active,
+            openCommandHash,
+            snapshot.trigger,
+          );
+        }
+        conflict();
+      }
+      rejectOrphanedTrigger(snapshot.trigger);
       const tradeId = hashId('paper_trade', [positionId, 'BUY']);
       const trade = freeze({
         id: tradeId,
@@ -131,8 +149,21 @@ export class PaperTradingEngine {
       if (current === null) {
         throw new PaperTradingError('POSITION_NOT_FOUND', 'Position paper introuvable.');
       }
-      if (current.status === 'PAPER_CLOSED') {
+      if (current.status !== 'PAPER_HOLDING') {
         if (current.closeCommandHash !== closeCommandHash) conflict();
+        if (current.exitTradeId === null) conflict();
+        await transaction.reconcileEventConfirmation(
+          paperEventId(
+            'PaperPositionClosed',
+            current.id,
+            current.exitTradeId,
+            snapshot.trigger.id,
+          ),
+          snapshot.trigger,
+        );
+        if (snapshot.trigger.confirmationStatus === 'orphaned') {
+          return this.retract(transaction, current);
+        }
         return current;
       }
       validateCloseCommand(snapshot, current);
@@ -169,6 +200,46 @@ export class PaperTradingEngine {
     });
   }
 
+  private async reconcileOpenReplay(
+    transaction: PaperTradingTransaction,
+    position: PaperPosition,
+    openCommandHash: string,
+    trigger: DomainEvent,
+  ): Promise<PaperPosition> {
+    if (position.openCommandHash !== openCommandHash) conflict();
+    await transaction.reconcileEventConfirmation(
+      paperEventId(
+        'PaperPositionOpened',
+        position.id,
+        position.entryTradeId,
+        trigger.id,
+      ),
+      trigger,
+    );
+    if (trigger.confirmationStatus === 'orphaned') {
+      return this.retract(transaction, position);
+    }
+    return position;
+  }
+
+  private async retract(
+    transaction: PaperTradingTransaction,
+    current: PaperPosition,
+  ): Promise<PaperPosition> {
+    if (current.status === 'PAPER_RETRACTED') return current;
+    const terminalAtMs = this.clock.now();
+    assertValidTimestampMs('occurredAtMs', terminalAtMs);
+    const retentionMs = this.config.dataRetentionHours * 60 * 60 * 1_000;
+    const position = freeze({
+      ...current,
+      status: 'PAPER_RETRACTED',
+      closedAtMs: current.closedAtMs ?? terminalAtMs,
+      purgeAfterMs: terminalAtMs + retentionMs,
+    } satisfies PaperPosition);
+    await transaction.retractPosition(position);
+    return position;
+  }
+
   private requirePaperMode(): void {
     if (this.config.executionMode !== 'paper') {
       throw new PaperTradingError(
@@ -183,7 +254,6 @@ function validateOpenCommand(
   command: OpenPaperPositionCommand,
   allowlist: readonly string[],
 ): void {
-  rejectOrphanedTrigger(command.trigger);
   if (command.mint.trim() === '' || command.trigger.mint !== command.mint) invalidQuote('mint');
   if (command.strategy.id.trim() === '' || !Number.isSafeInteger(command.strategy.version) || command.strategy.version <= 0) {
     invalidQuote('strategy');
@@ -337,7 +407,7 @@ function createPaperEvent(
   trigger: DomainEvent,
 ): PaperPositionOpenedEventV1 | PaperPositionClosedEventV1 {
   return freeze({
-    id: hashId('evt', [type, position.id, trade.id, trigger.id]),
+    id: paperEventId(type, position.id, trade.id, trigger.id),
     type,
     mint: position.mint,
     source: 'paper-trading',
@@ -350,6 +420,15 @@ function createPaperEvent(
     payloadVersion: 1,
     payload: freeze({ position, trade }),
   });
+}
+
+function paperEventId(
+  type: 'PaperPositionOpened' | 'PaperPositionClosed',
+  positionId: string,
+  tradeId: string,
+  triggerId: string,
+): string {
+  return hashId('evt', [type, positionId, tradeId, triggerId]);
 }
 
 function hashId(namespace: string, parts: readonly (string | number)[]): string {

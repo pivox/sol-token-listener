@@ -7,6 +7,7 @@ import type {
   PaperTrade,
 } from '../src/domain/paper-trading.js';
 import { PostgresPaperTradingRepository } from '../src/storage/paper-trading.repository.js';
+import { toJsonValue } from '../src/utils/json.js';
 
 void test('persiste position, trade et événement dans une transaction', async () => {
   const client = new RecordingClient();
@@ -86,6 +87,53 @@ void test('rend les événements paper purgeables à la fermeture', async () => 
   assert.equal(client.values[4]?.[16] instanceof Date, true);
 });
 
+void test('réconcilie durablement la finalité d’un événement paper', async () => {
+  const client = new RecordingClient(false, [{ confirmation_status: 'confirmed' }]);
+  const repository = new PostgresPaperTradingRepository({
+    connect: async () => client,
+  });
+
+  await repository.transact(async (transaction) => {
+    await transaction.reconcileEventConfirmation('event', {
+      ...event(),
+      confirmationStatus: 'finalized',
+      observedAtMs: 2,
+    });
+  });
+
+  assert.deepEqual(client.commands, [
+    'BEGIN',
+    'SELECT domain_events',
+    'UPDATE domain_events',
+    'COMMIT',
+  ]);
+  assert.equal(client.values[2]?.[1], 'finalized');
+});
+
+void test('termine une projection paper rétractée sans inventer de trade', async () => {
+  const client = new RecordingClient();
+  const repository = new PostgresPaperTradingRepository({
+    connect: async () => client,
+  });
+  const retracted: PaperPosition = {
+    ...position(),
+    status: 'PAPER_RETRACTED',
+    closedAtMs: 1_000,
+    purgeAfterMs: 14_401_000,
+  };
+
+  await repository.transact(async (transaction) => {
+    await transaction.retractPosition(retracted);
+  });
+
+  assert.deepEqual(client.commands, [
+    'BEGIN',
+    'UPDATE paper_positions',
+    'UPDATE domain_events',
+    'COMMIT',
+  ]);
+});
+
 void test('refuse un payload de position corrompu', async () => {
   const client = new RecordingClient(false, [{ payload: { id: 'position' } }]);
   const repository = new PostgresPaperTradingRepository({
@@ -97,6 +145,41 @@ void test('refuse un payload de position corrompu', async () => {
     /Payload paper position invalide/u,
   );
   assert.equal(client.commands.at(-1), 'ROLLBACK');
+});
+
+void test('refuse les invariants financiers corrompus relus en base', async () => {
+  const corruptions: readonly PaperPosition[] = [
+    { ...position(), baseFilledRaw: -1n },
+    { ...position(), quoteCostRaw: -1n },
+    { ...position(), roundTripLossBps: 10_001n },
+    { ...position(), strategy: { ...position().strategy, version: 0 } },
+    { ...position(), quoteAsset: { ...position().quoteAsset, decimals: 256 } },
+    {
+      ...position(),
+      status: 'PAPER_CLOSED',
+      closedAtMs: null,
+      purgeAfterMs: null,
+    },
+    {
+      ...position(),
+      status: 'PAPER_RETRACTED',
+      closedAtMs: null,
+      purgeAfterMs: null,
+    },
+  ];
+
+  for (const corrupted of corruptions) {
+    const client = new RecordingClient(false, [{
+      payload: toJsonValue(corrupted),
+    }]);
+    const repository = new PostgresPaperTradingRepository({
+      connect: async () => client,
+    });
+    await assert.rejects(
+      repository.transact(async (transaction) => transaction.findPosition('position')),
+      /Payload paper position invalide/u,
+    );
+  }
 });
 
 function position(): PaperPosition {
