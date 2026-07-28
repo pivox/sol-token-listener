@@ -39,8 +39,10 @@ export interface DomainEvent<TPayload extends object = Readonly<Record<string, u
 export type TypedDomainEvent<
   TType extends DomainEventType,
   TPayload extends object,
-> = Omit<DomainEvent<TPayload>, 'type'> & {
+  TPayloadVersion extends number,
+> = Omit<DomainEvent<TPayload>, 'type' | 'payloadVersion'> & {
   readonly type: TType;
+  readonly payloadVersion: TPayloadVersion;
 };
 
 export interface ChainEventIdentity {

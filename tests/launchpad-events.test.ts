@@ -74,13 +74,17 @@ void test('construit des événements V1 typés sans perdre le multi-quote', () 
 
   assert.equal(launchEvent.type, 'TokenLaunchDetected');
   assert.equal(launchEvent.payloadVersion, 1);
+  const launchPayloadVersion: 1 = launchEvent.payloadVersion;
+  assert.equal(launchPayloadVersion, 1);
   assert.deepEqual(launchEvent.payload.launch.quoteAssets, [SOL, USDC]);
   assert.equal(tradeEvent.type, 'BondingCurveTradeObserved');
   assert.equal(tradeEvent.payloadVersion, 1);
+  const tradePayloadVersion: 1 = tradeEvent.payloadVersion;
+  assert.equal(tradePayloadVersion, 1);
   assert.equal(tradeEvent.payload.trade.quoteAmountRaw, 250_000_000n);
 });
 
-void test('conserve le même ID lors d’une montée de confirmation', () => {
+void test('conserve le même ID lors d’une montée de confirmation et d’un nouveau relevé temporel', () => {
   const processed = createTokenLaunchDetectedEvent({
     source: 'pumpfun',
     program: PROGRAM,
@@ -90,10 +94,75 @@ void test('conserve le même ID lors d’une montée de confirmation', () => {
   const finalized = createTokenLaunchDetectedEvent({
     source: 'pumpfun',
     program: PROGRAM,
-    transaction: { ...transaction, confirmationStatus: 'finalized' },
+    transaction: {
+      ...transaction,
+      confirmationStatus: 'finalized',
+      blockTimeMs: 1_753_700_060_000,
+      observedAtMs: transaction.observedAtMs + 60_000,
+    },
     launch,
   });
 
   assert.equal(processed.id, finalized.id);
   assert.equal(finalized.confirmationStatus, 'finalized');
+});
+
+void test('snapshotte les entrées mutables pour conserver l’événement et son identité', () => {
+  const mutableQuoteAsset = { ...SOL };
+  const mutableLaunchCursor = {
+    ...transaction.cursor,
+    instructionIndex: 2,
+    innerInstructionIndex: null,
+  };
+  const mutableParameters = { metadata: { verified: true } };
+  const mutableLaunch = {
+    mint: launch.mint,
+    creator: launch.creator,
+    tokenProgram: launch.tokenProgram,
+    quoteAssets: [mutableQuoteAsset],
+    launchpad: launch.launchpad,
+    createdAt: mutableLaunchCursor,
+    parameters: mutableParameters,
+  };
+  const mutableTradeCursor = {
+    ...transaction.cursor,
+    instructionIndex: 3,
+    innerInstructionIndex: 0,
+  };
+  const mutableTrade = {
+    ...trade,
+    quoteAsset: mutableQuoteAsset,
+    cursor: mutableTradeCursor,
+  };
+  const launchEvent = createTokenLaunchDetectedEvent({
+    source: 'pumpfun',
+    program: PROGRAM,
+    transaction,
+    launch: mutableLaunch,
+  });
+  const tradeEvent = createBondingCurveTradeObservedEvent({
+    source: 'pumpfun',
+    program: PROGRAM,
+    transaction,
+    trade: mutableTrade,
+  });
+  const launchId = launchEvent.id;
+  const tradeId = tradeEvent.id;
+
+  mutableLaunchCursor.instructionIndex = 99;
+  mutableQuoteAsset.mint = 'ChangedQuoteMint';
+  mutableParameters.metadata.verified = false;
+  mutableTradeCursor.innerInstructionIndex = 8;
+
+  assert.equal(launchEvent.id, launchId);
+  assert.equal(launchEvent.cursor.instructionIndex, 2);
+  assert.equal(launchEvent.payload.launch.createdAt.instructionIndex, 2);
+  const snapshottedLaunchQuote = launchEvent.payload.launch.quoteAssets[0];
+  assert.ok(snapshottedLaunchQuote);
+  assert.equal(snapshottedLaunchQuote.mint, SOL.mint);
+  assert.deepEqual(launchEvent.payload.launch.parameters, { metadata: { verified: true } });
+  assert.equal(tradeEvent.id, tradeId);
+  assert.equal(tradeEvent.cursor.innerInstructionIndex, 0);
+  assert.equal(tradeEvent.payload.trade.cursor.innerInstructionIndex, 0);
+  assert.equal(tradeEvent.payload.trade.quoteAsset.mint, SOL.mint);
 });
