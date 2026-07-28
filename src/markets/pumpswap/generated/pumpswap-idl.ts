@@ -1955,6 +1955,15 @@ export const PUMPSWAP_TYPES = {
       ]
     }
   },
+  "OptionBool": {
+    "name": "OptionBool",
+    "type": {
+      "kind": "struct",
+      "fields": [
+        "bool"
+      ]
+    }
+  },
   "Pool": {
     "name": "Pool",
     "type": {

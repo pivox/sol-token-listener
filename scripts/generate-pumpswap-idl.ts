@@ -23,6 +23,7 @@ const REQUIRED_TYPES = [
   'FeeConfig',
   'FeeTier',
   'Fees',
+  'OptionBool',
   'Pool',
   'SellEvent',
 ] as const;

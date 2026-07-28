@@ -61,6 +61,7 @@ void test('épingle et régénère le sous-ensemble IDL PumpSwap officiel', asyn
     'FeeConfig',
     'FeeTier',
     'Fees',
+    'OptionBool',
     'Pool',
     'SellEvent',
   ]);
