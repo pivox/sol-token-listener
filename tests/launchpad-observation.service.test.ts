@@ -134,7 +134,7 @@ class FakeAdapter implements LaunchpadAdapter<StrictTransaction> {
   }[] = [];
   public detectError: Error | undefined;
   public decodeError: Error | undefined;
-  public beforeDecode: (() => void) | undefined;
+  public beforeDecode: ((trackedMints: ReadonlySet<string>) => void) | undefined;
 
   public constructor(
     private readonly launches: readonly TokenLaunch[],
@@ -150,7 +150,7 @@ class FakeAdapter implements LaunchpadAdapter<StrictTransaction> {
 
   public readonly decodeTrades: LaunchpadAdapter<StrictTransaction>['decodeTrades'] =
     async (transaction, trackedMints) => {
-      this.beforeDecode?.();
+      this.beforeDecode?.(trackedMints);
       this.decodeCalls.push({
         transaction,
         trackedMints: new Set(trackedMints),
@@ -475,4 +475,375 @@ void test('records adapter and transaction metadata on the complete batch', asyn
   assert.equal(batch.confirmationStatus, transaction.confirmationStatus);
   assert.equal(batch.events.length, 1);
   assert.equal(batch.transitions.length, 0);
+});
+
+void test('replays deterministic IDs across finality changes', async () => {
+  const signature = 'ReplaySignature111111111111111111111111111111';
+  const processedTransaction: StrictTransaction = {
+    ...transactionFixture({ signature, confirmationStatus: 'processed' }),
+    blockTimeMs: null,
+    observedAtMs: 1_753_720_000_000,
+  };
+  const finalizedTransaction: StrictTransaction = {
+    ...transactionFixture({ signature, confirmationStatus: 'finalized' }),
+    blockTimeMs: 1_753_719_999_000,
+    observedAtMs: 1_753_720_999_000,
+  };
+  const mint = 'ReplayMint1111111111111111111111111111111111';
+  const launch = launchFixture({
+    mint,
+    cursor: cursorFixture(1, null),
+  });
+  const trade = tradeFixture({
+    id: 'replayed-trade',
+    launchMint: mint,
+    cursor: cursorFixture(2, 0),
+  });
+  const processedSink = new RecordingSink();
+  const finalizedSink = new RecordingSink();
+
+  await new LaunchpadObservationService(
+    new FakeAdapter([launch], [trade]),
+    processedSink,
+  ).observe(processedTransaction, new Set());
+  await new LaunchpadObservationService(
+    new FakeAdapter([launch], [trade]),
+    finalizedSink,
+  ).observe(finalizedTransaction, new Set());
+
+  const processedBatch = processedSink.batches[0];
+  const finalizedBatch = finalizedSink.batches[0];
+  assert.ok(processedBatch);
+  assert.ok(finalizedBatch);
+  assert.deepEqual(
+    processedBatch.events.map((event) => event.id),
+    finalizedBatch.events.map((event) => event.id),
+  );
+  assert.deepEqual(
+    processedBatch.transitions.map((transition) => transition.id),
+    finalizedBatch.transitions.map((transition) => transition.id),
+  );
+  assert.equal(processedBatch.confirmationStatus, 'processed');
+  assert.equal(finalizedBatch.confirmationStatus, 'finalized');
+  assert.equal(processedBatch.events.length, 2);
+  assert.equal(processedBatch.transitions.length, 1);
+  assert.equal(processedSink.batches.length, 1);
+  assert.equal(finalizedSink.batches.length, 1);
+});
+
+void test('collapses identical launch definitions while preserving every quote asset exactly', async () => {
+  const launch = launchFixture({
+    mint: 'MultiQuoteMint1111111111111111111111111111111',
+    cursor: cursorFixture(1, null),
+    quoteAssets: [SOL, USDC],
+  });
+  const duplicate = {
+    ...launch,
+    quoteAssets: launch.quoteAssets.map((quoteAsset) => ({ ...quoteAsset })),
+    createdAt: { ...launch.createdAt },
+    parameters: { ...launch.parameters },
+  };
+  const adapter = new FakeAdapter([launch, duplicate], []);
+  const sink = new RecordingSink();
+
+  await new LaunchpadObservationService(adapter, sink).observe(
+    transactionFixture(),
+    new Set(),
+  );
+
+  assert.equal(adapter.detectCalls.length, 1);
+  assert.equal(adapter.decodeCalls.length, 1);
+  assert.equal(sink.batches.length, 1);
+  const batch = sink.batches[0];
+  assert.ok(batch);
+  assert.equal(batch.events.length, 1);
+  assert.equal(batch.transitions.length, 1);
+  const event = batch.events[0];
+  assert.equal(event?.type, 'TokenLaunchDetected');
+  if (event?.type !== 'TokenLaunchDetected') {
+    assert.fail('Expected one normalized launch event');
+  }
+  assert.deepEqual(event.payload.launch.quoteAssets, [SOL, USDC]);
+});
+
+void test('rejects invalid launch definitions before trade decoding or recording', async (t) => {
+  const invalidCases: readonly {
+    readonly name: string;
+    readonly launches: readonly TokenLaunch[];
+    readonly causePattern: RegExp;
+  }[] = [
+    {
+      name: 'launch cursor from another slot',
+      launches: [
+        launchFixture({
+          mint: 'WrongSlotMint111111111111111111111111111111',
+          cursor: cursorFixture(1, null, { slot: 501n }),
+        }),
+      ],
+      causePattern: /slot/i,
+    },
+    {
+      name: 'launch without a quote asset',
+      launches: [
+        launchFixture({
+          mint: 'NoQuoteMint1111111111111111111111111111111',
+          cursor: cursorFixture(1, null),
+          quoteAssets: [],
+        }),
+      ],
+      causePattern: /quote asset/i,
+    },
+    {
+      name: 'conflicting definitions for one mint',
+      launches: [
+        launchFixture({
+          mint: 'ConflictingMint11111111111111111111111111111',
+          cursor: cursorFixture(1, null),
+        }),
+        {
+          ...launchFixture({
+            mint: 'ConflictingMint11111111111111111111111111111',
+            cursor: cursorFixture(1, null),
+          }),
+          creator: 'DifferentCreator1111111111111111111111111111',
+        },
+      ],
+      causePattern: /conflicting.*mint/i,
+    },
+  ];
+
+  for (const invalidCase of invalidCases) {
+    await t.test(invalidCase.name, async () => {
+      const adapter = new FakeAdapter(invalidCase.launches, []);
+      const sink = new RecordingSink();
+
+      await assert.rejects(
+        new LaunchpadObservationService(adapter, sink).observe(
+          transactionFixture(),
+          new Set(),
+        ),
+        (error: unknown) => {
+          assert.ok(error instanceof LaunchpadObservationError);
+          assert.equal(error.stage, 'validate_batch');
+          assert.ok(error.cause instanceof Error);
+          assert.match(error.cause.message, invalidCase.causePattern);
+          return true;
+        },
+      );
+
+      assert.equal(adapter.detectCalls.length, 1);
+      assert.equal(adapter.decodeCalls.length, 0);
+      assert.equal(sink.batches.length, 0);
+    });
+  }
+});
+
+void test('rejects invalid or duplicate trades before recording', async (t) => {
+  const trackedMint = 'TrackedValidationMint11111111111111111111111111';
+  const invalidCases: readonly {
+    readonly name: string;
+    readonly trackedMints: ReadonlySet<string>;
+    readonly trades: readonly LaunchpadTrade[];
+    readonly causePattern: RegExp;
+  }[] = [
+    {
+      name: 'trade cursor from another transaction index',
+      trackedMints: new Set([trackedMint]),
+      trades: [
+        tradeFixture({
+          id: 'wrong-transaction-index',
+          launchMint: trackedMint,
+          cursor: cursorFixture(2, null, { transactionIndex: 3 }),
+        }),
+      ],
+      causePattern: /transaction index/i,
+    },
+    {
+      name: 'trade for an untracked mint',
+      trackedMints: new Set(),
+      trades: [
+        tradeFixture({
+          id: 'untracked-trade',
+          launchMint: 'UntrackedMint111111111111111111111111111111',
+          cursor: cursorFixture(2, null),
+        }),
+      ],
+      causePattern: /untracked.*mint/i,
+    },
+    {
+      name: 'two logical trades with one deterministic event ID',
+      trackedMints: new Set([trackedMint]),
+      trades: [
+        tradeFixture({
+          id: 'adapter-trade-a',
+          launchMint: trackedMint,
+          cursor: cursorFixture(2, null),
+        }),
+        tradeFixture({
+          id: 'adapter-trade-b',
+          launchMint: trackedMint,
+          cursor: cursorFixture(2, null),
+        }),
+      ],
+      causePattern: /duplicate.*event id/i,
+    },
+  ];
+
+  for (const invalidCase of invalidCases) {
+    await t.test(invalidCase.name, async () => {
+      const adapter = new FakeAdapter([], invalidCase.trades);
+      const sink = new RecordingSink();
+
+      await assert.rejects(
+        new LaunchpadObservationService(adapter, sink).observe(
+          transactionFixture(),
+          invalidCase.trackedMints,
+        ),
+        (error: unknown) => {
+          assert.ok(error instanceof LaunchpadObservationError);
+          assert.equal(error.stage, 'validate_batch');
+          assert.ok(error.cause instanceof Error);
+          assert.match(error.cause.message, invalidCase.causePattern);
+          return true;
+        },
+      );
+
+      assert.equal(adapter.detectCalls.length, 1);
+      assert.equal(adapter.decodeCalls.length, 1);
+      assert.equal(sink.batches.length, 0);
+    });
+  }
+});
+
+void test('keeps the authoritative tracked mints isolated from a malicious decoder', async () => {
+  const injectedMint = 'InjectedMint1111111111111111111111111111111';
+  const adapter = new FakeAdapter([], [
+    tradeFixture({
+      id: 'injected-trade',
+      launchMint: injectedMint,
+      cursor: cursorFixture(2, null),
+    }),
+  ]);
+  adapter.beforeDecode = (trackedMints) => {
+    (trackedMints as Set<string>).add(injectedMint);
+  };
+  const sink = new RecordingSink();
+
+  await assert.rejects(
+    new LaunchpadObservationService(adapter, sink).observe(
+      transactionFixture(),
+      new Set([EXISTING_MINT]),
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof LaunchpadObservationError);
+      assert.equal(error.stage, 'validate_batch');
+      assert.ok(error.cause instanceof Error);
+      assert.match(error.cause.message, /untracked.*mint/i);
+      return true;
+    },
+  );
+
+  assert.equal(adapter.decodeCalls.length, 1);
+  assert.ok(adapter.decodeCalls[0]?.trackedMints.has(injectedMint));
+  assert.equal(sink.batches.length, 0);
+});
+
+void test('preserves stage causes and makes no later calls after a failed stage', async (t) => {
+  await t.test('detect failure', async () => {
+    const adapter = new FakeAdapter([], []);
+    const cause = new Error('detect failed');
+    adapter.detectError = cause;
+    const sink = new RecordingSink();
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, sink).observe(
+        transactionFixture(),
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof LaunchpadObservationError);
+        assert.equal(error.stage, 'detect_launches');
+        assert.equal(error.cause, cause);
+        return true;
+      },
+    );
+
+    assert.equal(adapter.detectCalls.length, 1);
+    assert.equal(adapter.decodeCalls.length, 0);
+    assert.equal(sink.batches.length, 0);
+  });
+
+  await t.test('decode failure', async () => {
+    const adapter = new FakeAdapter([], []);
+    const cause = new Error('decode failed');
+    adapter.decodeError = cause;
+    const sink = new RecordingSink();
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, sink).observe(
+        transactionFixture(),
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof LaunchpadObservationError);
+        assert.equal(error.stage, 'decode_trades');
+        assert.equal(error.cause, cause);
+        return true;
+      },
+    );
+
+    assert.equal(adapter.detectCalls.length, 1);
+    assert.equal(adapter.decodeCalls.length, 1);
+    assert.equal(sink.batches.length, 0);
+  });
+
+  await t.test('validation failure', async () => {
+    const adapter = new FakeAdapter([], [
+      tradeFixture({
+        id: 'untracked',
+        launchMint: 'UntrackedStageMint111111111111111111111111111',
+        cursor: cursorFixture(2, null),
+      }),
+    ]);
+    const sink = new RecordingSink();
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, sink).observe(
+        transactionFixture(),
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof LaunchpadObservationError);
+        assert.equal(error.stage, 'validate_batch');
+        return true;
+      },
+    );
+
+    assert.equal(sink.batches.length, 0);
+  });
+
+  await t.test('sink failure', async () => {
+    const mint = 'SinkFailureMint111111111111111111111111111111';
+    const adapter = new FakeAdapter([
+      launchFixture({ mint, cursor: cursorFixture(1, null) }),
+    ], []);
+    const cause = new Error('record failed');
+    const sink = new RecordingSink();
+    sink.recordError = cause;
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, sink).observe(
+        transactionFixture(),
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof LaunchpadObservationError);
+        assert.equal(error.stage, 'record_batch');
+        assert.equal(error.cause, cause);
+        return true;
+      },
+    );
+
+    assert.equal(sink.batches.length, 1);
+  });
 });
