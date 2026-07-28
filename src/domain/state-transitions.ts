@@ -3,6 +3,10 @@ import type { DomainEventType } from './events.js';
 import type { LaunchStatus } from './launch-status.js';
 import type { TokenLaunchDetectedEventV1 } from './launchpad-events.js';
 import type { QualificationReasonCode } from './qualification-reasons.js';
+import {
+  assertValidNullableTimestampMs,
+  assertValidTimestampMs,
+} from './timestamp.js';
 
 export interface TransitionEvidence {
   readonly source: string;
@@ -29,6 +33,17 @@ export interface StateTransition extends TransitionOccurrence {
   readonly evidence: TransitionEvidence;
 }
 
+export const INITIAL_DETECTED_TRANSITION_MESSAGE = 'Token launch detected';
+
+export interface InitialDetectedStateTransition extends StateTransition {
+  readonly payloadVersion: 1;
+  readonly triggeringEventType: 'TokenLaunchDetected';
+  readonly previousStatus: null;
+  readonly newStatus: 'DETECTED';
+  readonly reasonCode: null;
+  readonly message: typeof INITIAL_DETECTED_TRANSITION_MESSAGE;
+}
+
 export class InvalidLaunchTransitionError extends Error {
   public readonly previous: LaunchStatus | null;
   public readonly new: LaunchStatus;
@@ -44,6 +59,13 @@ export class InvalidLaunchTransitionError extends Error {
   }
 }
 
+export class InvalidTransitionOccurrenceSourceError extends Error {
+  public constructor(public readonly source: unknown) {
+    super(`Invalid transition occurrence source: ${String(source)}`);
+    this.name = 'InvalidTransitionOccurrenceSourceError';
+  }
+}
+
 export function assertInitialLaunchTransitionAllowed(
   previousStatus: LaunchStatus | null,
   newStatus: LaunchStatus,
@@ -55,7 +77,12 @@ export function assertInitialLaunchTransitionAllowed(
 
 export function createInitialDetectedTransition(
   event: TokenLaunchDetectedEventV1,
-): StateTransition {
+): InitialDetectedStateTransition {
+  assertValidTimestampMs('observedAtMs', event.observedAtMs);
+  assertValidNullableTimestampMs(
+    'blockchainTimeMs',
+    event.blockchainTimeMs,
+  );
   const previousStatus = null;
   const newStatus = 'DETECTED';
   assertInitialLaunchTransitionAllowed(previousStatus, newStatus);
@@ -63,18 +90,20 @@ export function createInitialDetectedTransition(
   const occurredAtSource = event.blockchainTimeMs === null
     ? 'observation'
     : 'blockchain';
+  const occurredAtMs = event.blockchainTimeMs ?? event.observedAtMs;
+  assertValidTimestampMs('occurredAtMs', occurredAtMs);
   return Object.freeze({
     id: createDeterministicTransitionId(event.id, previousStatus, newStatus),
     payloadVersion: 1,
     mint: event.mint,
     triggeringEventId: event.id,
     triggeringEventType: event.type,
-    occurredAtMs: event.blockchainTimeMs ?? event.observedAtMs,
+    occurredAtMs,
     occurredAtSource,
     previousStatus,
     newStatus,
     reasonCode: null,
-    message: 'Token launch detected',
+    message: INITIAL_DETECTED_TRANSITION_MESSAGE,
     evidence,
   });
 }
@@ -83,6 +112,8 @@ export function reconcileTransitionOccurrence(
   current: TransitionOccurrence,
   incoming: TransitionOccurrence,
 ): TransitionOccurrence {
+  assertValidTransitionOccurrence(current);
+  assertValidTransitionOccurrence(incoming);
   const winner = current.occurredAtSource === incoming.occurredAtSource
     ? (current.occurredAtMs <= incoming.occurredAtMs ? current : incoming)
     : (current.occurredAtSource === 'blockchain' ? current : incoming);
@@ -92,7 +123,33 @@ export function reconcileTransitionOccurrence(
   });
 }
 
-function createDeterministicTransitionId(
+export function assertValidTransitionOccurrence(
+  occurrence: TransitionOccurrence,
+): void {
+  const candidate: unknown = occurrence;
+  if (
+    typeof candidate !== 'object'
+    || candidate === null
+    || !('occurredAtSource' in candidate)
+    || (
+      candidate.occurredAtSource !== 'blockchain'
+      && candidate.occurredAtSource !== 'observation'
+    )
+  ) {
+    const source = typeof candidate === 'object'
+      && candidate !== null
+      && 'occurredAtSource' in candidate
+      ? candidate.occurredAtSource
+      : undefined;
+    throw new InvalidTransitionOccurrenceSourceError(source);
+  }
+  const occurredAtMs = 'occurredAtMs' in candidate
+    ? candidate.occurredAtMs
+    : undefined;
+  assertValidTimestampMs('occurredAtMs', occurredAtMs);
+}
+
+export function createDeterministicTransitionId(
   eventId: string,
   previousStatus: LaunchStatus | null,
   newStatus: LaunchStatus,

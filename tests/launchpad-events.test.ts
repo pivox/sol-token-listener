@@ -6,6 +6,7 @@ import {
   UnsupportedLaunchParameterValueError,
 } from '../src/domain/launchpad-events.js';
 import { InvalidChainCursorError } from '../src/domain/cursor.js';
+import { InvalidTimestampError } from '../src/domain/timestamp.js';
 import type {
   LaunchpadTrade,
   ObservedChainTransaction,
@@ -107,6 +108,40 @@ void test('conserve le même ID lors d’une montée de confirmation et d’un n
 
   assert.equal(processed.id, finalized.id);
   assert.equal(finalized.confirmationStatus, 'finalized');
+});
+
+void test('rejette directement les temps non canoniques avant de créer un événement', () => {
+  for (const [field, invalidTransaction] of [
+    [
+      'observedAtMs',
+      { ...transaction, observedAtMs: Number.NaN },
+    ],
+    [
+      'blockchainTimeMs',
+      { ...transaction, blockTimeMs: -0 },
+    ],
+  ] as const) {
+    for (const createEvent of [
+      () => createTokenLaunchDetectedEvent({
+        source: 'pumpfun',
+        program: PROGRAM,
+        transaction: invalidTransaction,
+        launch,
+      }),
+      () => createBondingCurveTradeObservedEvent({
+        source: 'pumpfun',
+        program: PROGRAM,
+        transaction: invalidTransaction,
+        trade,
+      }),
+    ]) {
+      assert.throws(
+        createEvent,
+        (error: unknown) => error instanceof InvalidTimestampError
+          && error.field === field,
+      );
+    }
+  }
 });
 
 void test('snapshotte les entrées mutables pour conserver l’événement et son identité', () => {

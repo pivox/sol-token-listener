@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createTokenLaunchDetectedEvent } from '../src/domain/launchpad-events.js';
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
+import type { StateTransition } from '../src/domain/state-transitions.js';
 import {
   assertValidLaunchpadEventBatch,
   InvalidLaunchpadEventBatchError,
 } from '../src/ports/launchpad-event-sink.js';
 import type {
+  ApplyLaunchpadEventBatch,
   LaunchpadEventBatch,
   LaunchpadEventSink,
   StateTransitionBatchAction,
@@ -192,6 +194,41 @@ void test('preserves input event identity and order in the event-batch result sh
   assert.deepEqual(result.events, [{ eventId: event.id, outcome: 'created' }]);
 });
 
+void test('accepts only initial DETECTED transitions in apply batches at compile time', () => {
+  const transaction: DecodedTransaction = {
+    signature: 'non-initial-transition-signature',
+    confirmationStatus: 'processed',
+    blockTimeMs: null,
+    observedAtMs: 2,
+    cursor: { slot: 2n, transactionIndex: 0 },
+    raw: null,
+    decodedProgram: 'pumpfun',
+  };
+  const event = createTokenLaunchDetectedEvent({
+    source: adapter.source,
+    program: adapter.programId,
+    transaction,
+    launch: {
+      ...launch,
+      createdAt: {
+        ...launch.createdAt,
+        slot: transaction.cursor.slot,
+        transactionIndex: transaction.cursor.transactionIndex,
+      },
+    },
+  });
+  const nonInitialTransition = {
+    ...createInitialDetectedTransition(event),
+    previousStatus: 'DETECTED',
+    newStatus: 'OBSERVING',
+    message: 'Start observing',
+  } satisfies StateTransition;
+
+  // @ts-expect-error PR B apply batches accept only initial DETECTED transitions.
+  const invalidTransitions: ApplyLaunchpadEventBatch['transitions'] = [nonInitialTransition];
+  void invalidTransitions;
+});
+
 void test('makes retract batches empty at compile time', () => {
   const transaction: DecodedTransaction = {
     signature: 'orphaned-signature',
@@ -363,6 +400,25 @@ void test('runtime validation rejects missing, outside, mismatched, or duplicate
     [{ ...transition, triggeringEventId: 'event-outside-this-batch' }],
     [{ ...transition, mint: 'OtherMint1111111111111111111111111111111111' }],
     [{ ...transition, triggeringEventType: 'BondingCurveTradeObserved' as const }],
+    [{ ...transition, id: 'transition_forged' }],
+    [{ ...transition, payloadVersion: 2 }],
+    [{
+      ...transition,
+      previousStatus: 'DETECTED' as const,
+      newStatus: 'OBSERVING' as const,
+    }],
+    [{ ...transition, reasonCode: 'MINT_AUTHORITY_ACTIVE' as const }],
+    [{ ...transition, message: 'Forged transition message' }],
+    [{ ...transition, evidence: { ...transition.evidence, source: 'other-source' } }],
+    [{
+      ...transition,
+      evidence: {
+        ...transition.evidence,
+        program: 'OtherProgram11111111111111111111111111111111',
+      },
+    }],
+    [{ ...transition, occurredAtMs: Number.NaN }],
+    [{ ...transition, occurredAtSource: 'rpc' }],
     [transition, transition],
   ]) {
     assert.throws(

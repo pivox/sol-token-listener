@@ -1,5 +1,17 @@
 import type { LaunchpadObservationEventV1 } from '../domain/launchpad-events.js';
-import type { StateTransition } from '../domain/state-transitions.js';
+import {
+  assertValidTransitionOccurrence,
+  createDeterministicTransitionId,
+  INITIAL_DETECTED_TRANSITION_MESSAGE,
+} from '../domain/state-transitions.js';
+import type {
+  InitialDetectedStateTransition,
+  TransitionOccurrence,
+} from '../domain/state-transitions.js';
+import {
+  assertValidNullableTimestampMs,
+  assertValidTimestampMs,
+} from '../domain/timestamp.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 
 export type EventRecordOutcome = 'created' | 'duplicate' | 'confirmation_updated';
@@ -21,7 +33,7 @@ interface LaunchpadEventBatchBase {
 export interface ApplyLaunchpadEventBatch extends LaunchpadEventBatchBase {
   readonly confirmationStatus: ActiveConfirmationStatus;
   readonly stateTransitionAction: 'apply';
-  readonly transitions: readonly StateTransition[];
+  readonly transitions: readonly InitialDetectedStateTransition[];
 }
 
 export interface RetractLaunchpadEventBatch extends LaunchpadEventBatchBase {
@@ -102,6 +114,8 @@ export function assertValidLaunchpadEventBatch(
     readonly id: string;
     readonly mint: string;
     readonly type: 'TokenLaunchDetected';
+    readonly blockchainTimeMs: number | null;
+    readonly observedAtMs: number;
   }[] = [];
   for (const event of events) {
     if (
@@ -121,10 +135,23 @@ export function assertValidLaunchpadEventBatch(
           'launch events must have string IDs and mints',
         );
       }
+      try {
+        assertValidTimestampMs('observedAtMs', event.observedAtMs);
+        assertValidNullableTimestampMs(
+          'blockchainTimeMs',
+          event.blockchainTimeMs,
+        );
+      } catch {
+        throw new InvalidLaunchpadEventBatchError(
+          'launch event timestamps must be canonical',
+        );
+      }
       launchEvents.push({
         id: event.id,
         mint: event.mint,
         type: event.type,
+        blockchainTimeMs: event.blockchainTimeMs,
+        observedAtMs: event.observedAtMs,
       });
     }
   }
@@ -154,6 +181,59 @@ export function assertValidLaunchpadEventBatch(
     ) {
       throw new InvalidLaunchpadEventBatchError(
         'transition mint and type must match its launch event',
+      );
+    }
+    if (
+      transition.payloadVersion !== 1
+      || transition.previousStatus !== null
+      || transition.newStatus !== 'DETECTED'
+      || transition.reasonCode !== null
+      || transition.message !== INITIAL_DETECTED_TRANSITION_MESSAGE
+    ) {
+      throw new InvalidLaunchpadEventBatchError(
+        'transitions must use the initial null-to-DETECTED contract',
+      );
+    }
+    if (
+      transition.id !== createDeterministicTransitionId(
+        launchEvent.id,
+        null,
+        'DETECTED',
+      )
+    ) {
+      throw new InvalidLaunchpadEventBatchError(
+        'transition ID must be deterministic from its launch event',
+      );
+    }
+    if (
+      !isRecord(transition.evidence)
+      || transition.evidence.source !== source
+      || transition.evidence.program !== program
+    ) {
+      throw new InvalidLaunchpadEventBatchError(
+        'transition evidence must match batch source and program',
+      );
+    }
+    try {
+      assertValidTransitionOccurrence(
+        transition as unknown as TransitionOccurrence,
+      );
+    } catch {
+      throw new InvalidLaunchpadEventBatchError(
+        'transition occurrence must be canonical',
+      );
+    }
+    const expectedOccurrenceSource = launchEvent.blockchainTimeMs === null
+      ? 'observation'
+      : 'blockchain';
+    const expectedOccurrenceMs = launchEvent.blockchainTimeMs
+      ?? launchEvent.observedAtMs;
+    if (
+      transition.occurredAtSource !== expectedOccurrenceSource
+      || transition.occurredAtMs !== expectedOccurrenceMs
+    ) {
+      throw new InvalidLaunchpadEventBatchError(
+        'transition occurrence must match its launch event',
       );
     }
     transitionCountByEventId.set(

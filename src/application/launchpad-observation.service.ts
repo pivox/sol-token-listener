@@ -12,6 +12,10 @@ import {
   type TokenLaunchDetectedEventV1,
 } from '../domain/launchpad-events.js';
 import { createInitialDetectedTransition } from '../domain/state-transitions.js';
+import {
+  assertValidNullableTimestampMs,
+  assertValidTimestampMs,
+} from '../domain/timestamp.js';
 import type {
   ChainCursor,
   LaunchpadTrade,
@@ -58,6 +62,14 @@ export class LaunchpadObservationService<
       'validate_batch',
       envelope,
       () => {
+        assertValidTimestampMs(
+          'observedAtMs',
+          envelope.transaction.observedAtMs,
+        );
+        assertValidNullableTimestampMs(
+          'blockchainTimeMs',
+          envelope.transaction.blockTimeMs,
+        );
         assertValidTransactionCursor(envelope.transaction.cursor);
       },
     );

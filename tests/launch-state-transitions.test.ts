@@ -5,9 +5,12 @@ import {
   assertInitialLaunchTransitionAllowed,
   createInitialDetectedTransition,
   InvalidLaunchTransitionError,
+  InvalidTransitionOccurrenceSourceError,
   reconcileTransitionOccurrence,
 } from '../src/domain/state-transitions.js';
 import type { TokenLaunchDetectedEventV1 } from '../src/domain/launchpad-events.js';
+import { InvalidTimestampError } from '../src/domain/timestamp.js';
+import type { TransitionOccurrence } from '../src/domain/state-transitions.js';
 
 const launchDetected: TokenLaunchDetectedEventV1 = {
   id: 'evt_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
@@ -95,6 +98,27 @@ void test('initial detected transition falls back to observed time and remains i
   assert.equal(transition.evidence.source, launchDetected.source);
 });
 
+void test('initial transition creation rejects invalid source timestamps', () => {
+  for (const [field, event] of [
+    [
+      'observedAtMs',
+      { ...launchDetected, observedAtMs: Number.NaN },
+    ],
+    [
+      'blockchainTimeMs',
+      { ...launchDetected, blockchainTimeMs: -0 },
+    ],
+  ] as const) {
+    assert.throws(
+      () => {
+        createInitialDetectedTransition(event);
+      },
+      (error: unknown) => error instanceof InvalidTimestampError
+        && error.field === field,
+    );
+  }
+});
+
 void test('enriches occurrence deterministically across fallback and blockchain replays', () => {
   const processedFallback = createInitialDetectedTransition({
     ...launchDetected,
@@ -153,4 +177,69 @@ void test('enriches occurrence deterministically across fallback and blockchain 
     reconcileTransitionOccurrence(blockchainOccurrence, laterFallback),
     blockchainOccurrence,
   );
+});
+
+void test('occurrence merge rejects every invalid timestamp symmetrically', () => {
+  const valid: TransitionOccurrence = {
+    occurredAtMs: 0,
+    occurredAtSource: 'observation',
+  };
+  for (const invalidTimestamp of [
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    0.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    -1,
+    -0,
+  ]) {
+    const invalid: TransitionOccurrence = {
+      occurredAtMs: invalidTimestamp,
+      occurredAtSource: 'blockchain',
+    };
+    for (const [current, incoming] of [
+      [invalid, valid],
+      [valid, invalid],
+    ] as const) {
+      assert.throws(
+        () => {
+          reconcileTransitionOccurrence(current, incoming);
+        },
+        (error: unknown) => error instanceof InvalidTimestampError
+          && error.field === 'occurredAtMs'
+          && Object.is(error.value, invalidTimestamp),
+      );
+    }
+  }
+  assert.deepEqual(
+    reconcileTransitionOccurrence(valid, {
+      occurredAtMs: 0,
+      occurredAtSource: 'blockchain',
+    }),
+    { occurredAtMs: 0, occurredAtSource: 'blockchain' },
+  );
+});
+
+void test('occurrence merge rejects invalid runtime sources symmetrically', () => {
+  const valid: TransitionOccurrence = {
+    occurredAtMs: 1,
+    occurredAtSource: 'observation',
+  };
+  const invalid = {
+    occurredAtMs: 1,
+    occurredAtSource: 'rpc',
+  } as unknown as TransitionOccurrence;
+
+  for (const [current, incoming] of [
+    [invalid, valid],
+    [valid, invalid],
+  ] as const) {
+    assert.throws(
+      () => {
+        reconcileTransitionOccurrence(current, incoming);
+      },
+      (error: unknown) => error instanceof InvalidTransitionOccurrenceSourceError
+        && error.source === 'rpc',
+    );
+  }
 });

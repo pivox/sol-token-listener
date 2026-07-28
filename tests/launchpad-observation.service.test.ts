@@ -4,6 +4,7 @@ import { LaunchpadObservationError } from '../src/application/launchpad-observat
 import { LaunchpadObservationService } from '../src/application/launchpad-observation.service.js';
 import { InvalidChainCursorError } from '../src/domain/cursor.js';
 import { createBondingCurveTradeObservedEvent } from '../src/domain/launchpad-events.js';
+import { InvalidTimestampError } from '../src/domain/timestamp.js';
 import type {
   BondingCurveState,
   ChainConfirmationStatus,
@@ -182,6 +183,39 @@ class RecordingSink implements LaunchpadEventSink {
       };
     };
 }
+
+void test('rejects invalid transaction timestamps before calling the adapter or sink', async () => {
+  for (const [field, transaction] of [
+    [
+      'observedAtMs',
+      { ...transactionFixture(), observedAtMs: Number.NaN },
+    ],
+    [
+      'blockchainTimeMs',
+      { ...transactionFixture(), blockTimeMs: -0 },
+    ],
+  ] as const) {
+    const adapter = new FakeAdapter([], []);
+    const sink = new RecordingSink();
+
+    await assert.rejects(
+      new LaunchpadObservationService(adapter, sink).observe(
+        transaction,
+        new Set(),
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof LaunchpadObservationError);
+        assert.equal(error.stage, 'validate_batch');
+        assert.ok(error.cause instanceof InvalidTimestampError);
+        assert.equal(error.cause.field, field);
+        return true;
+      },
+    );
+    assert.equal(adapter.detectCalls.length, 0);
+    assert.equal(adapter.decodeCalls.length, 0);
+    assert.equal(sink.batches.length, 0);
+  }
+});
 
 void test('records out-of-order launches once in full-cursor order with their initial transitions', async () => {
   const transaction = transactionFixture();

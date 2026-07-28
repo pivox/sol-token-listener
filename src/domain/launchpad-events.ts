@@ -2,6 +2,10 @@ import {
   createDeterministicChainEventId,
   type TypedDomainEvent,
 } from './events.js';
+import {
+  assertValidNullableTimestampMs,
+  assertValidTimestampMs,
+} from './timestamp.js';
 import type {
   ChainCursor,
   LaunchpadTrade,
@@ -52,6 +56,7 @@ export class UnsupportedLaunchParameterValueError extends Error {
 export function createTokenLaunchDetectedEvent(
   input: EventFactoryContext & { readonly launch: TokenLaunch },
 ): TokenLaunchDetectedEventV1 {
+  assertValidEventTimestamps(input.transaction);
   const launch = snapshotTokenLaunch(input.launch);
   const { transaction } = input;
   const type = 'TokenLaunchDetected';
@@ -84,6 +89,7 @@ export function createBondingCurveTradeObservedEvent(
     readonly trade: LaunchpadTrade;
   },
 ): BondingCurveTradeObservedEventV1 {
+  assertValidEventTimestamps(input.transaction);
   const trade = snapshotLaunchpadTrade(input.trade);
   const { transaction } = input;
   const type = 'BondingCurveTradeObserved';
@@ -109,6 +115,16 @@ export function createBondingCurveTradeObservedEvent(
     payloadVersion: 1,
     payload: freezeSnapshot({ trade }),
   });
+}
+
+function assertValidEventTimestamps(
+  transaction: ObservedChainTransaction,
+): void {
+  assertValidTimestampMs('observedAtMs', transaction.observedAtMs);
+  assertValidNullableTimestampMs(
+    'blockchainTimeMs',
+    transaction.blockTimeMs,
+  );
 }
 
 function snapshotTokenLaunch(launch: TokenLaunch): TokenLaunch {
