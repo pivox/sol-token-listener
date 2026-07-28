@@ -3,6 +3,10 @@ import type { DomainEventType } from './events.js';
 import type { LaunchStatus } from './launch-status.js';
 import type { TokenLaunchDetectedEventV1 } from './launchpad-events.js';
 import type { QualificationReasonCode } from './qualification-reasons.js';
+import type {
+  MigrationObservedEventV1,
+  PumpSwapPoolActivatedEventV1,
+} from './migration-events.js';
 import {
   assertValidNullableTimestampMs,
   assertValidTimestampMs,
@@ -34,6 +38,8 @@ export interface StateTransition extends TransitionOccurrence {
 }
 
 export const INITIAL_DETECTED_TRANSITION_MESSAGE = 'Token launch detected';
+export const MIGRATION_PENDING_TRANSITION_MESSAGE = 'Pump.fun migration observed';
+export const PUMPSWAP_ACTIVE_TRANSITION_MESSAGE = 'Canonical PumpSwap pool activated';
 
 export interface InitialDetectedStateTransition extends StateTransition {
   readonly payloadVersion: 1;
@@ -105,6 +111,56 @@ export function createInitialDetectedTransition(
     reasonCode: null,
     message: INITIAL_DETECTED_TRANSITION_MESSAGE,
     evidence,
+  });
+}
+
+export function createMigrationPendingTransition(
+  current: 'BONDING_CURVE_COMPLETE' | 'OBSERVING',
+  event: MigrationObservedEventV1,
+): StateTransition {
+  return createEventTransition(
+    current,
+    'MIGRATION_PENDING',
+    MIGRATION_PENDING_TRANSITION_MESSAGE,
+    event,
+  );
+}
+
+export function createPumpSwapActiveTransition(
+  event: PumpSwapPoolActivatedEventV1,
+): StateTransition {
+  return createEventTransition(
+    'MIGRATION_PENDING',
+    'PUMPSWAP_ACTIVE',
+    PUMPSWAP_ACTIVE_TRANSITION_MESSAGE,
+    event,
+  );
+}
+
+function createEventTransition(
+  previousStatus: LaunchStatus,
+  newStatus: LaunchStatus,
+  message: string,
+  event: MigrationObservedEventV1 | PumpSwapPoolActivatedEventV1,
+): StateTransition {
+  assertValidTimestampMs('observedAtMs', event.observedAtMs);
+  assertValidNullableTimestampMs('blockchainTimeMs', event.blockchainTimeMs);
+  const occurredAtSource = event.blockchainTimeMs === null
+    ? 'observation'
+    : 'blockchain';
+  return Object.freeze({
+    id: createDeterministicTransitionId(event.id, previousStatus, newStatus),
+    payloadVersion: 1,
+    mint: event.mint,
+    triggeringEventId: event.id,
+    triggeringEventType: event.type,
+    occurredAtMs: event.blockchainTimeMs ?? event.observedAtMs,
+    occurredAtSource,
+    previousStatus,
+    newStatus,
+    reasonCode: null,
+    message,
+    evidence: Object.freeze({ source: event.source, program: event.program }),
   });
 }
 
