@@ -10,6 +10,8 @@ type PoolSwapAggregate = {
   innerInstructionIndex: number | null;
 };
 
+type SwapClassification = SwapKind | 'OTHER';
+
 export function classifyTransactionSwaps(
   transaction: NormalizedTransaction,
   programId: string,
@@ -82,7 +84,7 @@ export function classifyTransactionSwaps(
   return result;
 }
 
-export function classifyDeltas(wsolVaultDelta: bigint, tokenVaultDelta: bigint): SwapKind {
+export function classifyDeltas(wsolVaultDelta: bigint, tokenVaultDelta: bigint): SwapClassification {
   if (wsolVaultDelta > 0n && tokenVaultDelta < 0n) return 'BUY';
   if (wsolVaultDelta < 0n && tokenVaultDelta > 0n) return 'SELL';
   return 'OTHER';
