@@ -2,13 +2,13 @@ import type { PoolInfo, SwapEvent, SwapKind } from '../../domain/types.js';
 import type { NormalizedTokenBalance, NormalizedTransaction } from '../../solana/rpc/types.js';
 import { decodeSwapInstruction } from './instruction-decoder.js';
 
-type PoolSwapAggregate = {
+interface PoolSwapAggregate {
   pool: PoolInfo;
   payer: string | null;
   authority: string | null;
   instructionIndex: number;
   innerInstructionIndex: number | null;
-};
+}
 
 type SwapClassification = SwapKind | 'OTHER';
 
