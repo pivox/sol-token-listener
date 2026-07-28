@@ -21,7 +21,7 @@ export const DOMAIN_EVENT_TYPES = [
 
 export type DomainEventType = (typeof DOMAIN_EVENT_TYPES)[number];
 
-export interface DomainEvent<TPayload extends Readonly<Record<string, unknown>> = Readonly<Record<string, unknown>>> {
+export interface DomainEvent<TPayload extends object = Readonly<Record<string, unknown>>> {
   readonly id: string;
   readonly type: DomainEventType;
   readonly mint: string;
@@ -36,8 +36,16 @@ export interface DomainEvent<TPayload extends Readonly<Record<string, unknown>> 
   readonly payload: TPayload;
 }
 
+export type TypedDomainEvent<
+  TType extends DomainEventType,
+  TPayload extends object,
+> = Omit<DomainEvent<TPayload>, 'type'> & {
+  readonly type: TType;
+};
+
 export interface ChainEventIdentity {
   readonly type: string;
+  readonly mint: string;
   readonly source: string;
   readonly program: string;
   readonly signature: string;
@@ -48,6 +56,7 @@ export function createDeterministicChainEventId(identity: ChainEventIdentity): s
   const { cursor } = identity;
   const canonical = [
     identity.type,
+    identity.mint,
     identity.source,
     identity.program,
     identity.signature,

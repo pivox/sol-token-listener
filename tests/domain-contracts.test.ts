@@ -56,6 +56,7 @@ void test('les curseurs Solana sont ordonnés jusqu’à l’instruction interne
 void test('l’identifiant métier est déterministe et inclut l’index interne', () => {
   const base = {
     type: 'TokenLaunchDetected',
+    mint: 'Mint111111111111111111111111111111111111111',
     source: 'solana',
     program: 'Pump111111111111111111111111111111111111111',
     signature: '5NfSignature',
@@ -73,10 +74,15 @@ void test('l’identifiant métier est déterministe et inclut l’index interne
     ...base,
     cursor: { ...base.cursor, innerInstructionIndex: 1 },
   });
+  const otherMint = createDeterministicChainEventId({
+    ...base,
+    mint: 'Mint222222222222222222222222222222222222222',
+  });
 
   assert.equal(first, same);
   assert.match(first, /^evt_[a-f0-9]{64}$/u);
   assert.notEqual(first, nextInner);
+  assert.notEqual(first, otherMint);
 });
 
 void test('les états métier et reason codes V1 sont stables et explicites', () => {
