@@ -21,11 +21,11 @@ export function decodePoolState(data: Uint8Array): DecodedPoolState {
     tokenProgramA: readPublicKey(data, 232),
     tokenProgramB: readPublicKey(data, 264),
     observation: readPublicKey(data, 296),
-    bump: data[328],
-    status: data[329],
-    lpDecimals: data[330],
-    mintDecimalsA: data[331],
-    mintDecimalsB: data[332],
+    bump: readU8(data, 328),
+    status: readU8(data, 329),
+    lpDecimals: readU8(data, 330),
+    mintDecimalsA: readU8(data, 331),
+    mintDecimalsB: readU8(data, 332),
     lpSupplyRaw: readU64(data, 333),
     protocolFeesA: readU64(data, 341),
     protocolFeesB: readU64(data, 349),
@@ -33,7 +33,7 @@ export function decodePoolState(data: Uint8Array): DecodedPoolState {
     fundFeesB: readU64(data, 365),
     openTimeUnix: readU64(data, 373),
     recentEpoch: readU64(data, 381),
-    feeOn: data[389],
+    feeOn: readU8(data, 389),
     enableCreatorFee: data[390] !== 0,
     creatorFeesA: readU64(data, 397),
     creatorFeesB: readU64(data, 405),
@@ -63,4 +63,10 @@ function readPublicKey(data: Uint8Array, offset: number): string {
 
 function readU64(data: Uint8Array, offset: number): bigint {
   return new DataView(data.buffer, data.byteOffset, data.byteLength).getBigUint64(offset, true);
+}
+
+function readU8(data: Uint8Array, offset: number): number {
+  const value = data[offset];
+  if (value === undefined) throw new Error(`Compte PoolState tronqué à l’octet ${offset}.`);
+  return value;
 }

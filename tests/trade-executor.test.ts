@@ -16,16 +16,16 @@ const SESSION = {
   },
 } as unknown as TokenSession;
 
-void test('utilise la quantité simulée de l’entrée pour une vente dry-run', async () => {
+void test('utilise la quantité simulée de l’entrée pour une vente paper', async () => {
   let walletBalanceRead = false;
   let quotedAmount: bigint | null = null;
-  let savedTrade: TradeRecord | null = null;
+  const savedTrade: { value: TradeRecord | null } = { value: null };
 
   const executor = makeExecutor({
     simulationOk: true,
     onReadBalance: () => { walletBalanceRead = true; },
     onQuoteSell: (amount) => { quotedAmount = amount; },
-    onSave: (trade) => { savedTrade = trade; },
+    onSave: (trade) => { savedTrade.value = trade; },
   });
 
   const execution = await executor.sell(SESSION);
@@ -33,21 +33,21 @@ void test('utilise la quantité simulée de l’entrée pour une vente dry-run',
   assert.equal(walletBalanceRead, false);
   assert.equal(quotedAmount, 123n);
   assert.equal(execution.amountInTokenRaw, 123n);
-  assert.equal(savedTrade?.mode, 'dry-run');
-  assert.equal(savedTrade?.status, 'SIMULATED');
+  assert.equal(savedTrade.value?.mode, 'paper');
+  assert.equal(savedTrade.value?.status, 'SIMULATED');
 });
 
-void test('conserve le mode dry-run lorsqu’une simulation échoue', async () => {
-  let savedTrade: TradeRecord | null = null;
+void test('conserve le mode paper lorsqu’une simulation échoue', async () => {
+  const savedTrade: { value: TradeRecord | null } = { value: null };
   const executor = makeExecutor({
     simulationOk: false,
-    onSave: (trade) => { savedTrade = trade; },
+    onSave: (trade) => { savedTrade.value = trade; },
   });
 
   await assert.rejects(executor.sell(SESSION), /Simulation de vente échouée/);
 
-  assert.equal(savedTrade?.mode, 'dry-run');
-  assert.equal(savedTrade?.status, 'FAILED');
+  assert.equal(savedTrade.value?.mode, 'paper');
+  assert.equal(savedTrade.value?.status, 'FAILED');
 });
 
 function makeExecutor(options: {
@@ -87,7 +87,7 @@ function makeExecutor(options: {
   return new TradeExecutor(
     venue as never,
     { address: 'wallet-1' } as never,
-    { executionMode: 'dry-run', buyAmountLamports: 100n } as never,
+    { executionMode: 'paper', buyAmountLamports: 100n } as never,
     simulator as never,
     {} as never,
     {} as never,

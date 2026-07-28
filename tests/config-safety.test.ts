@@ -7,26 +7,35 @@ const base = {
   SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
 };
 
-void test('le mode par défaut est strictement dry-run', () => {
+void test('le mode par défaut est strictement observe', () => {
   const config = parseConfig(base);
-  assert.equal(config.executionMode, 'dry-run');
+  assert.equal(config.executionMode, 'observe');
 });
 
-void test('le live refuse de démarrer sans les quatre verrous explicites', () => {
-  assert.throws(() => parseConfig({ ...base, EXECUTION_MODE: 'live' }), /SOLANA_KEYPAIR_PATH/u);
-  assert.throws(() => parseConfig({ ...base, EXECUTION_MODE: 'live', SOLANA_KEYPAIR_PATH: '/tmp/id.json' }), /CONFIRM_LIVE_TRADING/u);
+void test('le mode paper est accepté avec SOL dans son allowlist initiale', () => {
+  const config = parseConfig({ ...base, EXECUTION_MODE: 'paper' });
+  assert.equal(config.executionMode, 'paper');
+  assert.deepEqual(config.paperQuoteMintAllowlist, [config.wsolMint]);
 });
 
-void test('le live refuse un secret base58 même si un fichier keypair est indiqué', () => {
+void test('le live est toujours refusé dans la V1', () => {
   assert.throws(() => parseConfig({
     ...base,
     EXECUTION_MODE: 'live',
+  }), /observe.*paper/u);
+});
+
+void test('toute configuration de clé privée est refusée', () => {
+  assert.throws(() => parseConfig({
+    ...base,
     SOLANA_KEYPAIR_PATH: '/tmp/id.json',
+  }), /private key/u);
+  assert.throws(() => parseConfig({
+    ...base,
     SOLANA_PRIVATE_KEY_BASE58: 'secret',
-    CONFIRM_LIVE_TRADING: 'I_UNDERSTAND_REAL_FUNDS',
-  }), /secret base58/u);
+  }), /private key/u);
 });
 
 void test('les actions dashboard exigent leur confirmation indépendante', () => {
-  assert.throws(() => parseConfig({ ...base, DASHBOARD_ACTIONS_ENABLED: 'true' }), /confirmation locale/u);
+  assert.throws(() => parseConfig({ ...base, DASHBOARD_ACTIONS_ENABLED: 'true' }), /read-only/u);
 });

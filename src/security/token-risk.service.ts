@@ -355,7 +355,10 @@ export function transferFeeCalculator(extensions: readonly TokenExtensionInfo[])
   const extension = extensions.find((item) => item.type === 'TransferFeeConfig');
   if (!extension) return () => 0n;
   const bps = BigInt(Number(extension.details.transferFeeBasisPoints ?? 0));
-  const maximum = BigInt(String(extension.details.maximumFeeRaw ?? '0'));
+  const maximumValue = extension.details.maximumFeeRaw;
+  const maximum = typeof maximumValue === 'bigint' || typeof maximumValue === 'string' || typeof maximumValue === 'number'
+    ? BigInt(maximumValue)
+    : 0n;
   return (amount) => {
     if (amount <= 0n || bps === 0n) return 0n;
     const fee = (amount * bps + 9999n) / 10_000n;

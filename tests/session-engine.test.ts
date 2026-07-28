@@ -16,16 +16,19 @@ void test('attend le premier achat, exclut celui-ci puis compte chaque achat ext
   await harness.engine.registerPool(pool);
   await harness.engine.processSwap(event('first', 1));
   let session = harness.engine.listSessions()[0];
+  assert.ok(session);
   assert.equal(session.status, 'HOLDING');
   assert.equal(session.subsequentBuyCount, 0);
   await harness.engine.processSwap(event('next-1', 2));
   await harness.engine.processSwap(event('next-1', 2));
   session = harness.engine.listSessions()[0];
+  assert.ok(session);
   assert.equal(session.subsequentBuyCount, 1);
   await harness.engine.processSwap(event('own', 3, 'wallet'));
-  assert.equal(harness.engine.listSessions()[0].subsequentBuyCount, 1);
+  assert.equal(onlySession(harness.engine).subsequentBuyCount, 1);
   await harness.engine.processSwap(event('next-2', 4));
   session = harness.engine.listSessions()[0];
+  assert.ok(session);
   assert.equal(session.status, 'CLOSED');
   assert.equal(session.subsequentBuyCount, 2);
 });
@@ -35,14 +38,15 @@ void test('un échec de vente fait passer la session en MANUAL_REVIEW', async ()
   await harness.engine.registerPool(pool);
   await harness.engine.processSwap(event('first', 1));
   await harness.engine.processSwap(event('next', 2));
-  assert.equal(harness.engine.listSessions()[0].status, 'MANUAL_REVIEW');
-  assert.match(harness.engine.listSessions()[0].rejectionReason ?? '', /Échec de vente/u);
+  assert.equal(onlySession(harness.engine).status, 'MANUAL_REVIEW');
+  assert.match(onlySession(harness.engine).rejectionReason ?? '', /Échec de vente/u);
 });
 
 void test('une session d’attente expirée passe à EXPIRED', async () => {
   const harness = makeHarness({ target: 2, sellFails: false });
   await harness.engine.registerPool(pool);
   const session = harness.engine.listSessions()[0];
+  assert.ok(session);
   session.expiresAtMs = Date.now() - 1;
   await harness.engine.processSwap(event('late', 1));
   assert.equal(session.status, 'EXPIRED');
@@ -54,7 +58,7 @@ void test('reprend un BUY_PENDING depuis un trade simulé sans refaire un achat'
   harness.sessionRepo.active.push(session);
   harness.tradeRepo.records.set(`${session.id}:BUY`, makeTrade(session, 'BUY'));
   await harness.engine.restore();
-  assert.equal(harness.engine.listSessions()[0].status, 'HOLDING');
+  assert.equal(onlySession(harness.engine).status, 'HOLDING');
   assert.equal(harness.buyCalls.value, 0);
   harness.engine.stop();
 });
@@ -64,16 +68,27 @@ function makeHarness(options: { target: number; sellFails: boolean }) {
   const swapRepo = new MemorySwapRepository();
   const tradeRepo = new MemoryTradeRepository();
   const buyCalls = { value: 0 };
-  const venue = { readPoolRuntimeState: async () => ({ pool:'pool',statusBits:0,swapsEnabled:true,openTimeUnix:0n,tokenVaultBalanceRaw:1n,wsolVaultBalanceRaw:1n,observedSlot:1n }) } as any;
-  const risk = { analyze: async () => ({ id:'risk',verdict:'ALLOW',score:100 }) } as any;
+  const venue = { readPoolRuntimeState: async () => ({ pool:'pool',statusBits:0,swapsEnabled:true,openTimeUnix:0n,tokenVaultBalanceRaw:1n,wsolVaultBalanceRaw:1n,observedSlot:1n }) } as never;
+  const risk = { analyze: async () => ({ id:'risk',verdict:'ALLOW',score:100 }) } as never;
   const executor = {
-    buy: async () => { buyCalls.value += 1; return { mode:'dry-run',amountInLamports:1n,amountOutTokenRaw:2n,quotedOutTokenRaw:2n,cursor:{slot:2n,transactionIndex:-1,instructionIndex:-1,innerInstructionIndex:null},confirmedAtMs:Date.now(),simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null} }; },
-    sell: async () => { if (options.sellFails) throw new Error('vente impossible'); return { mode:'dry-run',amountInTokenRaw:2n,amountOutLamports:1n,quotedOutLamports:1n,confirmedAtMs:Date.now(),simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null} }; },
-  } as any;
+    buy: async () => { buyCalls.value += 1; return { mode:'paper',amountInLamports:1n,amountOutTokenRaw:2n,quotedOutTokenRaw:2n,cursor:{slot:2n,transactionIndex:-1,instructionIndex:-1,innerInstructionIndex:null},confirmedAtMs:Date.now(),simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null} }; },
+    sell: async () => { if (options.sellFails) throw new Error('vente impossible'); return { mode:'paper',amountInTokenRaw:2n,amountOutLamports:1n,quotedOutLamports:1n,confirmedAtMs:Date.now(),simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null} }; },
+  } as never;
   const config = { targetBuysAfterEntry:options.target,poolMonitorTtlMinutes:90,maxConcurrentPositions:1 } as AppConfig;
-  const logger = { info(){}, warn(){}, error(){}, debug(){} } as any;
-  const reportRepo = { latestBySession: async () => null } as any;
-  const engine = new SessionEngine(venue,risk,executor,{address:'wallet'} as any,sessionRepo as any,swapRepo as any,tradeRepo as any,reportRepo,config,logger);
+  const logger = { info(){}, warn(){}, error(){}, debug(){} } as never;
+  const reportRepo = { latestBySession: async () => null } as never;
+  const engine = new SessionEngine(
+    venue,
+    risk,
+    executor,
+    {address:'wallet'} as never,
+    sessionRepo as never,
+    swapRepo as never,
+    tradeRepo as never,
+    reportRepo,
+    config,
+    logger,
+  );
   return { engine, sessionRepo, tradeRepo, buyCalls };
 }
 
@@ -97,5 +112,11 @@ function makeSession(status: TokenSession['status']): TokenSession {
   return { id:'raydium-cpmm:pool',pool,metadata:null,status,subsequentBuyCount:0,targetBuysAfterEntry:2,countedBuyEventIds:[],sellAttempts:0,createdAtMs:1,updatedAtMs:1,expiresAtMs:Date.now()+100000 };
 }
 function makeTrade(session:TokenSession,side:'BUY'|'SELL'):TradeRecord{
-  return {id:`${session.id}:${side}`,idempotencyKey:`${session.id}:${side}`,sessionId:session.id,pool:'pool',tokenMint:'token',side,mode:'dry-run',status:'SIMULATED',amountInRaw:1n,amountOutRaw:2n,quotedOutRaw:2n,payload:{simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null}},createdAtMs:1,updatedAtMs:2};
+  return {id:`${session.id}:${side}`,idempotencyKey:`${session.id}:${side}`,sessionId:session.id,pool:'pool',tokenMint:'token',side,mode:'paper',status:'SIMULATED',amountInRaw:1n,amountOutRaw:2n,quotedOutRaw:2n,payload:{simulation:{ok:true,error:null,logs:[],unitsConsumed:null,replacementBlockhash:null}},createdAtMs:1,updatedAtMs:2};
+}
+
+function onlySession(engine: SessionEngine): TokenSession {
+  const session = engine.listSessions()[0];
+  assert.ok(session);
+  return session;
 }

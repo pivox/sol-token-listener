@@ -2,13 +2,15 @@ import type { PoolInfo, SwapEvent, SwapKind } from '../../domain/types.js';
 import type { NormalizedTokenBalance, NormalizedTransaction } from '../../solana/rpc/types.js';
 import { decodeSwapInstruction } from './instruction-decoder.js';
 
-type PoolSwapAggregate = {
+interface PoolSwapAggregate {
   pool: PoolInfo;
   payer: string | null;
   authority: string | null;
   instructionIndex: number;
   innerInstructionIndex: number | null;
-};
+}
+
+type SwapClassification = SwapKind | 'OTHER';
 
 export function classifyTransactionSwaps(
   transaction: NormalizedTransaction,
@@ -82,7 +84,7 @@ export function classifyTransactionSwaps(
   return result;
 }
 
-export function classifyDeltas(wsolVaultDelta: bigint, tokenVaultDelta: bigint): SwapKind {
+export function classifyDeltas(wsolVaultDelta: bigint, tokenVaultDelta: bigint): SwapClassification {
   if (wsolVaultDelta > 0n && tokenVaultDelta < 0n) return 'BUY';
   if (wsolVaultDelta < 0n && tokenVaultDelta > 0n) return 'SELL';
   return 'OTHER';

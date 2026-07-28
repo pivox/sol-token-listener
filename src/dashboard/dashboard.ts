@@ -35,12 +35,15 @@ export class Dashboard {
 
   async stop(): Promise<void> {
     if (!this.server) return;
-    await new Promise<void>((resolve, reject) => this.server?.close((error) => error ? reject(error) : resolve()));
+    await new Promise<void>((resolve, reject) => this.server?.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    }));
     this.server = null;
   }
 
   private async route(request: Parameters<typeof handleDashboardAction>[0], response: Parameters<typeof handleDashboardAction>[1]): Promise<void> {
-    if (await handleDashboardAction(request, response, this.actions)) return;
+    if (handleDashboardAction(request, response, this.actions)) return;
     if (request.method === 'GET' && request.url === '/healthz') {
       writeJson(response, 200, { ok: true, heartbeat: this.heartbeat.get() });
       return;
@@ -77,11 +80,13 @@ export class Dashboard {
 export function calculatePnl(session: Awaited<ReturnType<SessionRepository['list']>>[number]): Record<string, unknown> | null {
   if (!session.entry || !session.exit) return null;
   const gross = session.exit.amountOutLamports - session.entry.amountInLamports;
-  const costsKnown = session.entry.feeLamports !== undefined && session.exit.feeLamports !== undefined
-    && session.entry.rentDeltaLamports !== undefined && session.exit.rentDeltaLamports !== undefined;
-  const net = costsKnown
-    ? gross - session.entry.feeLamports! - session.exit.feeLamports!
-      - session.entry.rentDeltaLamports! + session.exit.rentDeltaLamports!
+  const entryFee = session.entry.feeLamports;
+  const exitFee = session.exit.feeLamports;
+  const entryRent = session.entry.rentDeltaLamports;
+  const exitRent = session.exit.rentDeltaLamports;
+  const net = entryFee !== undefined && exitFee !== undefined
+    && entryRent !== undefined && exitRent !== undefined
+    ? gross - entryFee - exitFee - entryRent + exitRent
     : null;
   return {
     grossLamports: gross.toString(),
