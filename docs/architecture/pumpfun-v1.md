@@ -36,9 +36,10 @@ aucun appel RPC à l’exécution. `PumpFunLaunchpadAdapter` est présent mais n
 composé dans `src/app.ts`; il ne déclenche donc aucun abonnement, lecture RPC ou
 ordre réel. Raydium CPMM demeure un adaptateur secondaire isolé et testé.
 
-La résolution canonique du `transactionIndex`, la lecture de compte de bonding
-curve, la persistance Pump.fun, la migration et le suivi PumpSwap restent des
-travaux ultérieurs.
+La résolution canonique du `transactionIndex`, la lecture RPC de compte de
+bonding curve, la migration et le suivi PumpSwap restent des travaux ultérieurs.
+Les snapshots publics de metadata, curve et trades sont désormais persistables,
+mais aucun fournisseur n’est composé dans le listener.
 
 ## Dépendances autorisées
 

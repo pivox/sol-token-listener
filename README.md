@@ -4,10 +4,10 @@ Backend TypeScript destiné à détecter, qualifier et simuler le suivi de nouve
 tokens Pump.fun, de leur création jusqu’à leur éventuelle activation sur
 PumpSwap.
 
-La branche de fondation compile et teste les contrats génériques, la
-normalisation Solana, la persistance PostgreSQL et le décodeur Raydium CPMM
-historique. Elle ne détecte pas encore les créations Pump.fun : ce comportement
-arrivera dans une PR dédiée après validation de l’IDL officiel.
+Le projet compile et teste les contrats génériques, la normalisation Solana,
+la persistance PostgreSQL, le décodeur Pump.fun et Raydium CPMM historique.
+L’adaptateur Pump.fun reste volontairement non composé dans le bootstrap : le
+programme ne démarre donc pas encore de listener de production.
 
 ## Limites de sécurité V1
 
@@ -47,7 +47,7 @@ npm run db:migrate
 
 `npm start` valide actuellement la configuration, applique éventuellement les
 migrations et publie un événement structuré `listener.foundation_ready`. Il ne
-prétend pas démarrer un listener Pump.fun avant l’arrivée de l’adaptateur.
+compose pas encore l’adaptateur Pump.fun ni aucun listener réseau.
 
 ## Architecture
 
