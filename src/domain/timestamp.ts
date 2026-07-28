@@ -1,7 +1,8 @@
 export type TimestampField =
   | 'observedAtMs'
   | 'blockchainTimeMs'
-  | 'occurredAtMs';
+  | 'occurredAtMs'
+  | 'evaluatedAtMs';
 
 export class InvalidTimestampError extends Error {
   public constructor(
