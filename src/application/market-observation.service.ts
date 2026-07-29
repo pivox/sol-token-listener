@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { MatchedMigration } from './pumpswap-migration-matcher.js';
-import type {
-  CanonicalMarketPool,
-  MarketTrade,
-  RawMarketObservation,
+import {
+  marketPoolDefinition,
+  type CanonicalMarketPool,
+  type MarketTrade,
+  type RawMarketObservation,
 } from '../domain/market.js';
 import { compareCursors } from '../domain/cursor.js';
 import type {
@@ -55,6 +56,7 @@ export class MarketObservationService {
       ids.add(item.id);
       if (
         item.signature !== transaction.signature
+        || item.confirmationStatus !== transaction.confirmationStatus
         || item.cursor.slot !== transaction.cursor.slot
         || item.cursor.transactionIndex !== transaction.cursor.transactionIndex
       ) {
@@ -67,6 +69,8 @@ export class MarketObservationService {
       if (
         reserves.triggerCursor.slot !== transaction.cursor.slot
         || reserves.triggerCursor.transactionIndex !== transaction.cursor.transactionIndex
+        || reserves.confirmationStatus !== transaction.confirmationStatus
+        || reserves.confirmationStatus === 'orphaned'
       ) {
         throw new InvalidMarketObservationError(
           `Snapshot hors transaction: ${reserves.id}`,
@@ -91,7 +95,7 @@ export class MarketObservationService {
         payloadVersion: 1,
         payload: Object.freeze({
           kind: 'type' in item ? item.type : 'MarketTrade',
-          value: toJsonValue(item) as Readonly<Record<string, unknown>>,
+          value: stableRawValue(item),
         }),
       }))
       .sort((left, right) => compareCursors(left.cursor, right.cursor));
@@ -107,4 +111,39 @@ export class MarketObservationService {
 
 function rawId(id: string): string {
   return `raw_${createHash('sha256').update(id).digest('hex')}`;
+}
+
+function stableRawValue(
+  item: MatchedMigration['migrationEvent']
+  | NonNullable<MatchedMigration['activationEvent']>
+  | MarketTrade,
+): Readonly<Record<string, unknown>> {
+  if ('type' in item) {
+    const payload = item.type === 'PumpSwapPoolActivated'
+      ? {
+          ...item.payload,
+          pool: marketPoolDefinition(item.payload.pool),
+        }
+      : item.payload;
+    return Object.freeze({
+      id: item.id,
+      type: item.type,
+      payloadVersion: item.payloadVersion,
+      payload: toJsonValue(payload),
+    });
+  }
+  return Object.freeze({
+    id: item.id,
+    pool: item.pool,
+    mint: item.mint,
+    quoteAsset: toJsonValue(item.quoteAsset),
+    kind: item.kind,
+    trader: item.trader,
+    baseAmountRaw: toJsonValue(item.baseAmountRaw),
+    quoteAmountRaw: toJsonValue(item.quoteAmountRaw),
+    source: item.source,
+    program: item.program,
+    signature: item.signature,
+    cursor: toJsonValue(item.cursor),
+  });
 }

@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { matchPumpSwapMigrations } from '../src/application/pumpswap-migration-matcher.js';
 import type { CanonicalMarketPool, MigrationObservation } from '../src/domain/market.js';
 import type { DecodedPumpSwapTransaction } from '../src/markets/pumpswap/types.js';
 import { createSolanaObservedTransaction } from '../src/solana/rpc/observed-transaction.js';
 import type { NormalizedInstruction, NormalizedTransaction } from '../src/solana/rpc/types.js';
+import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 
 const migrationIx = instruction(
   '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
@@ -24,7 +26,7 @@ const migration: MigrationObservation = {
   cursor: { slot: 1n, transactionIndex: 0, instructionIndex: 2, innerInstructionIndex: null },
 };
 const pool: CanonicalMarketPool = {
-  address: 'pool', market: 'pumpswap', programId: 'pumpswap', baseMint: 'base',
+  address: 'pool', market: 'pumpswap', programId: PUMPSWAP_PROGRAM_ID, baseMint: 'base',
   quoteAsset: migration.quoteAsset, index: 0, creator: 'creator',
   baseVault: 'base-vault', quoteVault: 'quote-vault', lpMint: 'lp',
   baseTokenProgram: 'TOKEN_2022',
@@ -49,8 +51,51 @@ void test('conserve MIGRATION_PENDING si le pool canonique n’est pas prouvé',
   const [match] = matchPumpSwapMigrations(
     createSolanaObservedTransaction(transaction(), 2_000),
     [migration],
-    { poolCreations: [], trades: [] },
+    { poolCreations: [], trades: [], issues: [] },
     new Map(),
+  );
+  assert.equal(match?.activationEvent, null);
+});
+
+void test('ne traverse pas la frontière d’un sibling CPI', () => {
+  const innerMigration = instruction(
+    '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+    2,
+    0,
+    2,
+  );
+  const sibling = instruction('wrapper', 2, 1, 2);
+  const laterCreate = instruction(PUMPSWAP_PROGRAM_ID, 2, 2, 3);
+  const originalCreation = evidence().poolCreations[0];
+  assert.ok(originalCreation);
+  const observed = createSolanaObservedTransaction({
+    ...transaction(),
+    instructions: [innerMigration, sibling, laterCreate],
+  }, 2_000);
+  const [match] = matchPumpSwapMigrations(
+    observed,
+    [{
+      ...migration,
+      cursor: {
+        ...migration.cursor,
+        innerInstructionIndex: 0,
+      },
+    }],
+    {
+      poolCreations: [{
+        ...originalCreation,
+        action: {
+          ...originalCreation.action,
+          instruction: laterCreate,
+        },
+      }],
+      trades: [],
+      issues: [],
+    },
+    new Map([['pool', {
+      ...pool,
+      activatedAt: { ...pool.activatedAt, innerInstructionIndex: 2 },
+    }]]),
   );
   assert.equal(match?.activationEvent, null);
 });
@@ -60,7 +105,14 @@ function evidence(): DecodedPumpSwapTransaction {
     poolCreations: [{
       action: {
         name: 'create_pool', family: 'CREATE_POOL', instruction: createIx,
-        accounts: {}, args: {},
+        accounts: {
+          pool_base_token_account: 'base-vault',
+          pool_quote_token_account: 'quote-vault',
+          lp_mint: 'lp',
+          base_token_program: TOKEN_2022_PROGRAM_ID.toBase58(),
+          quote_token_program: TOKEN_PROGRAM_ID.toBase58(),
+        },
+        args: {},
       },
       event: {
         kind: 'CREATE_POOL', instruction: eventIx, fields: {}, trailingDataHex: '',
@@ -68,6 +120,7 @@ function evidence(): DecodedPumpSwapTransaction {
       pool: 'pool', index: 0n, creator: 'creator', baseMint: 'base', quoteMint: 'quote',
     }],
     trades: [],
+    issues: [],
   };
 }
 

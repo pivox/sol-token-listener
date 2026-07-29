@@ -38,26 +38,47 @@ void test('apparie BUY et SELL dans leur portée CPI sans delta global', () => {
   assert.equal(decoded.trades[1]?.quoteAmountRaw, 45n);
 });
 
-void test('refuse un événement PumpSwap orphelin ou ambigu', () => {
+void test('isole un événement PumpSwap orphelin ou ambigu', () => {
   const actionIx = instruction(2, 0, 2, 1);
   const eventA = instruction(2, 1, 3, 2);
   const eventB = instruction(2, 2, 3, 3);
-  assert.throws(
-    () => decodePumpSwapTransaction(
+  const orphaned = decodePumpSwapTransaction(
       transaction([eventA]),
       () => null,
       () => event(eventA, 'BUY'),
-    ),
-    isCode('PUMPSWAP_EVENT_ORPHANED'),
-  );
-  assert.throws(
-    () => decodePumpSwapTransaction(
+    );
+  assert.equal(orphaned.issues.some(isCode('PUMPSWAP_EVENT_ORPHANED')), true);
+  const ambiguous = decodePumpSwapTransaction(
       transaction([actionIx, eventA, eventB]),
       (ix) => ix === actionIx ? action(ix, 'BUY') : null,
       (ix) => ix === eventA || ix === eventB ? event(ix, 'BUY') : null,
-    ),
-    isCode('PUMPSWAP_EVENT_AMBIGUOUS'),
+    );
+  assert.equal(ambiguous.issues.some(isCode('PUMPSWAP_EVENT_AMBIGUOUS')), true);
+  assert.equal(ambiguous.trades.length, 0);
+});
+
+void test('conserve les trades valides lorsqu’une autre action locale échoue', () => {
+  const badAction = instruction(1, 0, 2, 1);
+  const sellAction = instruction(2, 0, 2, 2);
+  const sellEvent = instruction(2, 1, 3, 3);
+  const decoded = decodePumpSwapTransaction(
+    transaction([badAction, sellAction, sellEvent]),
+    (ix) => {
+      if (ix === badAction) return action(ix, 'BUY');
+      if (ix === sellAction) return action(ix, 'SELL');
+      return null;
+    },
+    (ix) => ix === sellEvent ? event(ix, 'SELL') : null,
   );
+  assert.equal(decoded.trades.length, 1);
+  assert.equal(decoded.trades[0]?.kind, 'SELL');
+  assert.equal(decoded.issues.some(isCode('PUMPSWAP_EVENT_MISSING')), true);
+  assert.deepEqual(decoded.issues[0]?.cursor, {
+    slot: 1n,
+    transactionIndex: 0,
+    instructionIndex: 1,
+    innerInstructionIndex: 0,
+  });
 });
 
 function action(

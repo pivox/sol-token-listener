@@ -27,11 +27,16 @@ export function decodePumpSwapTransaction(
   decodeEvent: EventDecoder = decodePumpSwapCpiEvent,
 ): DecodedPumpSwapTransaction {
   if (transaction.error !== null) return empty();
+  const issues: PumpSwapDecodingError[] = [];
   const actions = transaction.instructions
-    .map(decodeAction)
+    .map((instruction) =>
+      decodeSafely(instruction, decodeAction, transaction, issues))
     .filter((value): value is DecodedPumpSwapInstruction => value !== null);
   const events = transaction.instructions
-    .map((instruction, index) => ({ index, event: decodeEvent(instruction) }))
+    .map((instruction, index) => ({
+      index,
+      event: decodeSafely(instruction, decodeEvent, transaction, issues),
+    }))
     .filter((value): value is {
       readonly index: number;
       readonly event: DecodedPumpSwapCpiEvent;
@@ -41,43 +46,60 @@ export function decodePumpSwapTransaction(
   const trades: DecodedPumpSwapTrade[] = [];
 
   for (const action of actions) {
-    requireStack(action.instruction, transaction);
-    const candidates = events.filter(({ index, event }) =>
-      !consumed.has(index)
-      && event.kind === action.family
-      && insideScope(
+    try {
+      requireStack(action.instruction, transaction);
+      const candidates = events.filter(({ index, event }) =>
+        !consumed.has(index)
+        && event.kind === action.family
+        && insideScope(
+          action.instruction,
+          event.instruction,
+          transaction.instructions,
+        ));
+      if (candidates.length === 0) {
+        throw error('PUMPSWAP_EVENT_MISSING', transaction, action.name);
+      }
+      if (candidates.length > 1) {
+        throw error('PUMPSWAP_EVENT_AMBIGUOUS', transaction, action.name);
+      }
+      const candidate = candidates[0];
+      if (candidate === undefined) {
+        throw error('PUMPSWAP_EVENT_MISSING', transaction, action.name);
+      }
+      consumed.add(candidate.index);
+      if (isPoolAction(action) && candidate.event.kind === 'CREATE_POOL') {
+        poolCreations.push(projectPool(action, candidate.event, transaction));
+      } else if (
+        isTradeAction(action)
+        && (candidate.event.kind === 'BUY' || candidate.event.kind === 'SELL')
+      ) {
+        trades.push(projectTrade(action, candidate.event, transaction));
+      } else {
+        throw error('PUMPSWAP_EVENT_MISMATCH', transaction, action.name);
+      }
+    } catch (cause) {
+      issues.push(contextualIssue(
+        cause,
+        transaction,
+        action.name,
         action.instruction,
-        event.instruction,
-        transaction.instructions,
       ));
-    if (candidates.length === 0) {
-      throw error('PUMPSWAP_EVENT_MISSING', transaction, action.name);
-    }
-    if (candidates.length > 1) {
-      throw error('PUMPSWAP_EVENT_AMBIGUOUS', transaction, action.name);
-    }
-    const candidate = candidates[0];
-    if (candidate === undefined) {
-      throw error('PUMPSWAP_EVENT_MISSING', transaction, action.name);
-    }
-    consumed.add(candidate.index);
-    if (isPoolAction(action) && candidate.event.kind === 'CREATE_POOL') {
-      poolCreations.push(projectPool(action, candidate.event, transaction));
-    } else if (
-      isTradeAction(action)
-      && (candidate.event.kind === 'BUY' || candidate.event.kind === 'SELL')
-    ) {
-      trades.push(projectTrade(action, candidate.event, transaction));
-    } else {
-      throw error('PUMPSWAP_EVENT_MISMATCH', transaction, action.name);
     }
   }
-  if (events.some(({ index }) => !consumed.has(index))) {
-    throw error('PUMPSWAP_EVENT_ORPHANED', transaction, 'event');
+  for (const { index, event } of events) {
+    if (!consumed.has(index)) {
+      issues.push(contextualIssue(
+        error('PUMPSWAP_EVENT_ORPHANED', transaction, 'event'),
+        transaction,
+        'event',
+        event.instruction,
+      ));
+    }
   }
   return Object.freeze({
     poolCreations: Object.freeze(poolCreations),
     trades: Object.freeze(trades),
+    issues: Object.freeze(issues),
   });
 }
 
@@ -233,7 +255,52 @@ function empty(): DecodedPumpSwapTransaction {
   return Object.freeze({
     poolCreations: Object.freeze([]),
     trades: Object.freeze([]),
+    issues: Object.freeze([]),
   });
+}
+
+function decodeSafely<T>(
+  instruction: NormalizedInstruction,
+  decoder: (instruction: NormalizedInstruction) => T | null,
+  transaction: NormalizedTransaction,
+  issues: PumpSwapDecodingError[],
+): T | null {
+  try {
+    return decoder(instruction);
+  } catch (cause) {
+    issues.push(contextualIssue(
+      cause,
+      transaction,
+      'instruction',
+      instruction,
+    ));
+    return null;
+  }
+}
+
+function contextualIssue(
+  cause: unknown,
+  transaction: NormalizedTransaction,
+  detail: string,
+  instruction: NormalizedInstruction,
+): PumpSwapDecodingError {
+  if (cause instanceof PumpSwapDecodingError) {
+    return new PumpSwapDecodingError(
+      cause.code,
+      `${cause.message} (${detail})`,
+      transaction.signature,
+      { cause },
+      transaction.transactionIndex === null
+        ? null
+        : {
+            slot: transaction.slot,
+            transactionIndex: transaction.transactionIndex,
+            instructionIndex: instruction.instructionIndex,
+            innerInstructionIndex: instruction.innerInstructionIndex,
+          },
+    );
+  }
+  throw cause;
 }
 
 function isPoolAction(

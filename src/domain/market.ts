@@ -35,6 +35,30 @@ export interface CanonicalMarketPool extends MarketPool {
   readonly confirmationStatus: ChainConfirmationStatus;
 }
 
+export type MarketPoolDefinition = Omit<
+CanonicalMarketPool,
+'confirmationStatus'
+>;
+
+export function marketPoolDefinition(
+  pool: CanonicalMarketPool,
+): MarketPoolDefinition {
+  return {
+    address: pool.address,
+    market: pool.market,
+    programId: pool.programId,
+    baseMint: pool.baseMint,
+    quoteAsset: pool.quoteAsset,
+    index: pool.index,
+    creator: pool.creator,
+    baseVault: pool.baseVault,
+    quoteVault: pool.quoteVault,
+    lpMint: pool.lpMint,
+    baseTokenProgram: pool.baseTokenProgram,
+    activatedAt: pool.activatedAt,
+  };
+}
+
 export interface MarketReserves {
   readonly pool: string;
   readonly baseReservesRaw: bigint;

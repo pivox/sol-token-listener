@@ -37,6 +37,7 @@ interface Connectable {
 interface RawWrite {
   readonly firstObservation: boolean;
   readonly becameOrphaned: boolean;
+  readonly confirmationStatus: ChainConfirmationStatus;
 }
 
 export class MarketObservationPayloadConflictError extends Error {
@@ -70,6 +71,7 @@ implements MarketObservationRepository {
     try {
       await client.query('BEGIN');
       await this.lockTransactions(client, batch.rawEvents);
+      await this.lockPools(client, batch);
       const migrations: MigrationObservedEventV1[] = [];
       const activations: PumpSwapPoolActivatedEventV1[] = [];
       for (const match of batch.matches) {
@@ -81,7 +83,12 @@ implements MarketObservationRepository {
         ) {
           await this.retractMigration(client, match.migrationEvent);
         } else if (match.migrationEvent.confirmationStatus !== 'orphaned') {
-          await this.writeMigration(client, migrationRaw.id, match.migrationEvent);
+          await this.writeMigration(
+            client,
+            migrationRaw.id,
+            match.migrationEvent,
+            migrationWrite.confirmationStatus,
+          );
           migrations.push(match.migrationEvent);
         }
         if (match.activationEvent !== null) {
@@ -93,7 +100,12 @@ implements MarketObservationRepository {
           ) {
             await this.retractActivation(client, match.activationEvent);
           } else if (match.activationEvent.confirmationStatus !== 'orphaned') {
-            await this.writeActivation(client, activationRaw.id, match.activationEvent);
+            await this.writeActivation(
+              client,
+              activationRaw.id,
+              match.activationEvent,
+              activationWrite.confirmationStatus,
+            );
             activations.push(match.activationEvent);
           }
         }
@@ -107,7 +119,7 @@ implements MarketObservationRepository {
         if (write.becameOrphaned && !write.firstObservation) {
           await this.retractTrade(client, trade);
         } else if (trade.confirmationStatus !== 'orphaned') {
-          await this.writeTrade(client, trade);
+          await this.writeTrade(client, trade, write.confirmationStatus);
         }
       }
       await client.query('COMMIT');
@@ -152,6 +164,28 @@ implements MarketObservationRepository {
     }
   }
 
+  private async lockPools(
+    client: QueryClient,
+    batch: MarketObservationBatch,
+  ): Promise<void> {
+    const addresses = [...new Set([
+      ...batch.matches.map((match) =>
+        match.migrationEvent.payload.migration.announcedPool),
+      ...batch.matches.flatMap((match) =>
+        match.activationEvent === null
+          ? []
+          : [match.activationEvent.payload.pool.address]),
+      ...batch.reserveSnapshots.map((snapshot) => snapshot.reserves.pool),
+      ...batch.trades.map((trade) => trade.pool),
+    ])].sort();
+    for (const address of addresses) {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 1))',
+        [`market-pool\u001f${address}`],
+      );
+    }
+  }
+
   private async writeRaw(
     client: QueryClient,
     event: RawMarketObservation,
@@ -182,6 +216,7 @@ implements MarketObservationRepository {
       return {
         firstObservation: true,
         becameOrphaned: event.confirmationStatus === 'orphaned',
+        confirmationStatus: event.confirmationStatus,
       };
     }
     if (!sameJson(row.payload, event.payload)) {
@@ -204,6 +239,7 @@ implements MarketObservationRepository {
     return {
       firstObservation: false,
       becameOrphaned: current !== 'orphaned' && next === 'orphaned',
+      confirmationStatus: next,
     };
   }
 
@@ -211,8 +247,9 @@ implements MarketObservationRepository {
     client: QueryClient,
     rawId: string,
     event: MigrationObservedEventV1,
+    confirmationStatus: ChainConfirmationStatus,
   ): Promise<void> {
-    await writeDomainEvent(client, rawId, event);
+    await writeDomainEvent(client, rawId, event, confirmationStatus);
     const launch = await client.query(
       'SELECT current_state FROM token_launches WHERE mint = $1 FOR UPDATE',
       [event.mint],
@@ -231,7 +268,7 @@ implements MarketObservationRepository {
         event.id, event.id, event.mint, migration.bondingCurve,
         migration.announcedPool, migration.instruction, migration.quoteAsset.mint,
         migration.quoteAsset.decimals, migration.baseTokenProgram,
-        migration.quoteAsset.tokenProgram, event.confirmationStatus,
+        migration.quoteAsset.tokenProgram, confirmationStatus,
         event.payloadVersion, toJsonValue(event.payload),
       ],
     );
@@ -248,8 +285,9 @@ implements MarketObservationRepository {
     client: QueryClient,
     rawId: string,
     event: PumpSwapPoolActivatedEventV1,
+    confirmationStatus: ChainConfirmationStatus,
   ): Promise<void> {
-    await writeDomainEvent(client, rawId, event);
+    await writeDomainEvent(client, rawId, event, confirmationStatus);
     const launch = await client.query(
       'SELECT current_state FROM token_launches WHERE mint = $1 FOR UPDATE',
       [event.mint],
@@ -266,16 +304,17 @@ implements MarketObservationRepository {
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'active',
         $16,$17,$18,$19,$20,$21,$22)
       ON CONFLICT (pool_address) DO UPDATE SET
-        confirmation_status = EXCLUDED.confirmation_status`,
+        confirmation_status = EXCLUDED.confirmation_status,
+        payload = EXCLUDED.payload`,
       [
         pool.address, pool.market, pool.programId, pool.index, pool.creator,
         pool.baseMint, pool.quoteAsset.mint, pool.quoteAsset.decimals,
         pool.baseTokenProgram, pool.quoteAsset.tokenProgram, pool.baseVault,
         pool.quoteVault, pool.lpMint, event.payload.migrationEventId, event.id,
-        event.confirmationStatus, pool.activatedAt.slot.toString(),
+        confirmationStatus, pool.activatedAt.slot.toString(),
         pool.activatedAt.transactionIndex, pool.activatedAt.instructionIndex,
         pool.activatedAt.innerInstructionIndex, event.payloadVersion,
-        toJsonValue(pool),
+        toJsonValue({ ...pool, confirmationStatus }),
       ],
     );
     if (current === 'MIGRATION_PENDING') {
@@ -292,6 +331,11 @@ implements MarketObservationRepository {
     observation: MarketReserveObservation,
   ): Promise<void> {
     const { reserves } = observation;
+    await assertActivePool(client, reserves.pool);
+    const confirmationStatus = await reconcileReserveObservation(
+      client,
+      observation,
+    );
     await client.query(
       `INSERT INTO market_reserve_snapshots (
         snapshot_id,pool_address,base_reserves_raw,quote_vault_amount_raw,
@@ -312,13 +356,18 @@ implements MarketObservationRepository {
         observation.triggerCursor.transactionIndex,
         observation.triggerCursor.instructionIndex,
         observation.triggerCursor.innerInstructionIndex,
-        observation.confirmationStatus,
+        confirmationStatus,
         new Date(reserves.observedAtMs),
       ],
     );
   }
 
-  private async writeTrade(client: QueryClient, trade: MarketTrade): Promise<void> {
+  private async writeTrade(
+    client: QueryClient,
+    trade: MarketTrade,
+    confirmationStatus: ChainConfirmationStatus,
+  ): Promise<void> {
+    await assertActivePool(client, trade.pool);
     await client.query(
       `INSERT INTO market_trades (
         trade_id,pool_address,mint,quote_mint,trade_kind,trader,base_amount_raw,
@@ -326,13 +375,16 @@ implements MarketObservationRepository {
         inner_instruction_index,confirmation_status,payload_version,payload,observed_at
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1,$15,$16)
       ON CONFLICT (trade_id) DO UPDATE SET
-        confirmation_status = EXCLUDED.confirmation_status`,
+        confirmation_status = EXCLUDED.confirmation_status,
+        payload = EXCLUDED.payload`,
       [
         trade.id, trade.pool, trade.mint, trade.quoteAsset.mint, trade.kind,
         trade.trader, trade.baseAmountRaw.toString(), trade.quoteAmountRaw.toString(),
         trade.signature, trade.cursor.slot.toString(), trade.cursor.transactionIndex,
         trade.cursor.instructionIndex, trade.cursor.innerInstructionIndex,
-        trade.confirmationStatus, toJsonValue(trade), new Date(trade.observedAtMs),
+        confirmationStatus,
+        toJsonValue({ ...trade, confirmationStatus }),
+        new Date(trade.observedAtMs),
       ],
     );
   }
@@ -353,6 +405,21 @@ implements MarketObservationRepository {
     if (finalizedDependents.rows.length > 0) {
       reconcileConfirmationStatus('finalized', 'orphaned');
     }
+    const finalizedMarketData = await client.query(
+      `SELECT snapshot_id FROM market_reserve_snapshots
+       WHERE pool_address IN (
+         SELECT pool_address FROM market_pools WHERE migration_id=$1
+       ) AND confirmation_status='finalized'
+       UNION ALL
+       SELECT trade_id FROM market_trades
+       WHERE pool_address IN (
+         SELECT pool_address FROM market_pools WHERE migration_id=$1
+       ) AND confirmation_status='finalized'`,
+      [event.id],
+    );
+    if (finalizedMarketData.rows.length > 0) {
+      reconcileConfirmationStatus('finalized', 'orphaned');
+    }
     await client.query(
       `UPDATE migrations SET confirmation_status='orphaned',terminal_at=$2,purge_after=$3
        WHERE migration_id=$1`,
@@ -364,14 +431,16 @@ implements MarketObservationRepository {
       [event.id, times.terminalAt, times.purgeAfter],
     );
     await client.query(
-      `UPDATE market_reserve_snapshots SET terminal_at=$2,purge_after=$3
+      `UPDATE market_reserve_snapshots SET confirmation_status='orphaned',
+       terminal_at=$2,purge_after=$3
        WHERE pool_address IN (
          SELECT pool_address FROM market_pools WHERE migration_id=$1
        )`,
       [event.id, times.terminalAt, times.purgeAfter],
     );
     await client.query(
-      `UPDATE market_trades SET terminal_at=$2,purge_after=$3
+      `UPDATE market_trades SET confirmation_status='orphaned',
+       terminal_at=$2,purge_after=$3
        WHERE pool_address IN (
          SELECT pool_address FROM market_pools WHERE migration_id=$1
        )`,
@@ -408,18 +477,31 @@ implements MarketObservationRepository {
     event: PumpSwapPoolActivatedEventV1,
   ): Promise<void> {
     const times = this.retentionTimes();
+    const finalizedMarketData = await client.query(
+      `SELECT snapshot_id FROM market_reserve_snapshots
+       WHERE pool_address=$1 AND confirmation_status='finalized'
+       UNION ALL
+       SELECT trade_id FROM market_trades
+       WHERE pool_address=$1 AND confirmation_status='finalized'`,
+      [event.payload.pool.address],
+    );
+    if (finalizedMarketData.rows.length > 0) {
+      reconcileConfirmationStatus('finalized', 'orphaned');
+    }
     await client.query(
       `UPDATE market_pools SET pool_state='retracted',confirmation_status='orphaned',
        terminal_at=$2,purge_after=$3 WHERE activation_event_id=$1`,
       [event.id, times.terminalAt, times.purgeAfter],
     );
     await client.query(
-      `UPDATE market_reserve_snapshots SET terminal_at=$2,purge_after=$3
+      `UPDATE market_reserve_snapshots SET confirmation_status='orphaned',
+       terminal_at=$2,purge_after=$3
        WHERE pool_address=$1`,
       [event.payload.pool.address, times.terminalAt, times.purgeAfter],
     );
     await client.query(
-      `UPDATE market_trades SET terminal_at=$2,purge_after=$3
+      `UPDATE market_trades SET confirmation_status='orphaned',
+       terminal_at=$2,purge_after=$3
        WHERE pool_address=$1`,
       [event.payload.pool.address, times.terminalAt, times.purgeAfter],
     );
@@ -436,10 +518,46 @@ implements MarketObservationRepository {
     trade: MarketTrade,
   ): Promise<void> {
     const times = this.retentionTimes();
+    const reserveStatuses = await client.query(
+      `SELECT confirmation_status FROM market_reserve_snapshots
+       WHERE pool_address=$1 AND trigger_slot=$2 AND transaction_index=$3
+         AND instruction_index=$4
+         AND COALESCE(inner_instruction_index,-1)=COALESCE($5::integer,-1)
+       FOR UPDATE`,
+      [
+        trade.pool,
+        trade.cursor.slot.toString(),
+        trade.cursor.transactionIndex,
+        trade.cursor.instructionIndex,
+        trade.cursor.innerInstructionIndex,
+      ],
+    );
+    for (const row of reserveStatuses.rows) {
+      reconcileConfirmationStatus(
+        confirmation(optionalRecord(row)?.confirmation_status),
+        'orphaned',
+      );
+    }
     await client.query(
       `UPDATE market_trades SET confirmation_status='orphaned',
        terminal_at=$2,purge_after=$3 WHERE trade_id=$1`,
       [trade.id, times.terminalAt, times.purgeAfter],
+    );
+    await client.query(
+      `UPDATE market_reserve_snapshots SET confirmation_status='orphaned',
+       terminal_at=$6,purge_after=$7
+       WHERE pool_address=$1 AND trigger_slot=$2 AND transaction_index=$3
+         AND instruction_index=$4
+         AND COALESCE(inner_instruction_index,-1)=COALESCE($5::integer,-1)`,
+      [
+        trade.pool,
+        trade.cursor.slot.toString(),
+        trade.cursor.transactionIndex,
+        trade.cursor.instructionIndex,
+        trade.cursor.innerInstructionIndex,
+        times.terminalAt,
+        times.purgeAfter,
+      ],
     );
   }
 
@@ -479,6 +597,7 @@ async function writeDomainEvent(
   client: QueryClient,
   rawId: string,
   event: MigrationObservedEventV1 | PumpSwapPoolActivatedEventV1,
+  confirmationStatus: ChainConfirmationStatus,
 ): Promise<void> {
   await client.query(
     `INSERT INTO domain_events (
@@ -487,15 +606,66 @@ async function writeDomainEvent(
       confirmation_status,blockchain_time,observed_at,payload_version,payload
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
     ON CONFLICT (event_id) DO UPDATE SET
-      confirmation_status = EXCLUDED.confirmation_status`,
+      confirmation_status = EXCLUDED.confirmation_status,
+      payload = EXCLUDED.payload`,
     [
       event.id, rawId, event.type, event.mint, event.source, event.program,
       event.signature, event.cursor.slot.toString(), event.cursor.transactionIndex,
       event.cursor.instructionIndex, event.cursor.innerInstructionIndex,
-      event.confirmationStatus, date(event.blockchainTimeMs),
-      new Date(event.observedAtMs), event.payloadVersion, toJsonValue(event.payload),
+      confirmationStatus, date(event.blockchainTimeMs),
+      new Date(event.observedAtMs), event.payloadVersion,
+      toJsonValue(event.type === 'PumpSwapPoolActivated'
+        ? {
+            ...event.payload,
+            pool: { ...event.payload.pool, confirmationStatus },
+          }
+        : event.payload),
     ],
   );
+}
+
+async function reconcileReserveObservation(
+  client: QueryClient,
+  observation: MarketReserveObservation,
+): Promise<ChainConfirmationStatus> {
+  const result = await client.query(
+    `SELECT confirmation_status,pool_address,base_reserves_raw,
+       quote_vault_amount_raw,virtual_quote_reserves_raw,
+       effective_quote_reserves_raw,observed_slot,trigger_slot,
+       transaction_index,instruction_index,inner_instruction_index
+     FROM market_reserve_snapshots WHERE snapshot_id=$1 FOR UPDATE`,
+    [observation.id],
+  );
+  const row = optionalRecord(result.rows[0]);
+  if (row === null) return observation.confirmationStatus;
+  const expected: Readonly<Record<string, string | number | null>> = {
+    pool_address: observation.reserves.pool,
+    base_reserves_raw: observation.reserves.baseReservesRaw.toString(),
+    quote_vault_amount_raw:
+      observation.reserves.quoteVaultAmountRaw.toString(),
+    virtual_quote_reserves_raw:
+      observation.reserves.virtualQuoteReservesRaw.toString(),
+    effective_quote_reserves_raw:
+      observation.reserves.effectiveQuoteReservesRaw.toString(),
+    observed_slot: observation.reserves.observedSlot.toString(),
+    trigger_slot: observation.triggerCursor.slot.toString(),
+    transaction_index: observation.triggerCursor.transactionIndex,
+    instruction_index: observation.triggerCursor.instructionIndex,
+    inner_instruction_index:
+      observation.triggerCursor.innerInstructionIndex,
+  };
+  for (const [field, value] of Object.entries(expected)) {
+    if (String(row[field]) !== String(value)) {
+      throw new MarketObservationPayloadConflictError(observation.id);
+    }
+  }
+  const current = confirmation(row.confirmation_status);
+  return reconcileConfirmationStatus(
+    current,
+    observation.confirmationStatus,
+  ) === 'update'
+    ? observation.confirmationStatus
+    : current;
 }
 
 async function writeTransition(
@@ -527,6 +697,24 @@ async function updateLaunchState(
     'UPDATE token_launches SET current_state=$2,updated_at=$3 WHERE mint=$1',
     [mint, state, new Date(occurredAtMs)],
   );
+}
+
+async function assertActivePool(
+  client: QueryClient,
+  address: string,
+): Promise<void> {
+  const result = await client.query(
+    `SELECT pool_state,confirmation_status FROM market_pools
+     WHERE pool_address=$1 FOR UPDATE`,
+    [address],
+  );
+  const row = optionalRecord(result.rows[0]);
+  if (
+    row?.pool_state !== 'active'
+    || row.confirmation_status === 'orphaned'
+  ) {
+    throw new MarketObservationStateError(address, String(row?.pool_state));
+  }
 }
 
 function rawValues(event: RawMarketObservation): readonly unknown[] {

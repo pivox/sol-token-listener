@@ -40,8 +40,7 @@ CREATE TABLE IF NOT EXISTS market_pools (
   confirmation_status TEXT NOT NULL CHECK (
     confirmation_status IN ('processed','confirmed','finalized','orphaned')
   ),
-  observed_slot NUMERIC(78,0) NOT NULL,
-  trigger_slot NUMERIC(78,0) NOT NULL,
+  slot NUMERIC(78,0) NOT NULL,
   transaction_index INTEGER NOT NULL,
   instruction_index INTEGER NOT NULL,
   inner_instruction_index INTEGER,
@@ -63,7 +62,8 @@ CREATE TABLE IF NOT EXISTS market_reserve_snapshots (
   quote_vault_amount_raw NUMERIC(78,0) NOT NULL,
   virtual_quote_reserves_raw NUMERIC(78,0) NOT NULL,
   effective_quote_reserves_raw NUMERIC(78,0) NOT NULL,
-  slot NUMERIC(78,0) NOT NULL,
+  observed_slot NUMERIC(78,0) NOT NULL,
+  trigger_slot NUMERIC(78,0) NOT NULL,
   transaction_index INTEGER NOT NULL,
   instruction_index INTEGER NOT NULL,
   inner_instruction_index INTEGER,

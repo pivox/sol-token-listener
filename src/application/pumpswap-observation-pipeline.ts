@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import type {
-  CanonicalMarketPool,
-  MarketTrade,
+import {
+  marketPoolDefinition,
+  type CanonicalMarketPool,
+  type MarketTrade,
 } from '../domain/market.js';
 import { PUMP_PROGRAM_ID } from '../launchpads/pumpfun/constants.js';
 import type { PumpFunLaunchpadAdapter } from '../launchpads/pumpfun/pumpfun-launchpad.adapter.js';
@@ -79,7 +80,11 @@ export class PumpSwapObservationPipeline {
       poolsChangedBy(matches, trades, trackedPools).map(async (changed) => {
         const reserves = await this.market.readReserves(changed.pool);
         return Object.freeze({
-          id: reserveId(changed.pool.address, reserves.observedSlot),
+          id: reserveId(
+            changed.pool.address,
+            reserves.observedSlot,
+            changed.triggerCursor,
+          ),
           reserves,
           triggerCursor: changed.triggerCursor,
           confirmationStatus: observed.confirmationStatus,
@@ -115,7 +120,8 @@ function mergeTrackedPools(
     const previous = pools.get(pool.address);
     if (
       previous !== undefined
-      && stringifyJson(previous) !== stringifyJson(pool)
+      && stringifyJson(marketPoolDefinition(previous))
+        !== stringifyJson(marketPoolDefinition(pool))
     ) throw new ConflictingMarketPoolError(pool.address);
     pools.set(pool.address, pool);
   }
@@ -136,7 +142,7 @@ function poolsChangedBy(
   }>();
   for (const match of matches) {
     const event = match.activationEvent;
-    if (event !== null) {
+    if (event !== null && event.confirmationStatus !== 'orphaned') {
       changed.set(event.payload.pool.address, {
         pool: event.payload.pool,
         triggerCursor: event.cursor,
@@ -144,6 +150,7 @@ function poolsChangedBy(
     }
   }
   for (const trade of trades) {
+    if (trade.confirmationStatus === 'orphaned') continue;
     const pool = tracked.get(trade.pool);
     if (pool === undefined) throw new ConflictingMarketPoolError(trade.pool);
     if (!changed.has(pool.address)) {
@@ -153,7 +160,18 @@ function poolsChangedBy(
   return Object.freeze([...changed.values()]);
 }
 
-function reserveId(pool: string, slot: bigint): string {
-  const identity = JSON.stringify([pool, slot.toString()]);
+function reserveId(
+  pool: string,
+  slot: bigint,
+  cursor: MarketTrade['cursor'],
+): string {
+  const identity = JSON.stringify([
+    pool,
+    slot.toString(),
+    cursor.slot.toString(),
+    cursor.transactionIndex,
+    cursor.instructionIndex,
+    cursor.innerInstructionIndex,
+  ]);
   return `reserve_${createHash('sha256').update(identity).digest('hex')}`;
 }

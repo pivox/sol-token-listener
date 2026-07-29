@@ -17,8 +17,10 @@ export class PumpSwapDecodingError extends Error {
     message: string,
     public readonly signature: string | null = null,
     options?: ErrorOptions,
+    public readonly cursor: ChainCursor | null = null,
   ) {
     super(message, options);
     this.name = 'PumpSwapDecodingError';
   }
 }
+import type { ChainCursor } from '../../domain/types.js';

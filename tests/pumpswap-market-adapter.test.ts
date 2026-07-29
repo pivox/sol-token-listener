@@ -6,6 +6,7 @@ import type {
   MarketReserves,
 } from '../src/domain/market.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
+import { PumpSwapDecodingError } from '../src/markets/pumpswap/errors.js';
 import { PumpSwapMarketAdapter } from '../src/markets/pumpswap/pumpswap-market.adapter.js';
 import type {
   DecodedPumpSwapInstruction,
@@ -26,6 +27,7 @@ void test('PumpSwap market adapter shares decoding and projects tracked trades',
     { validate: () => Promise.resolve(pool) },
     { read: () => Promise.resolve(reserves()) },
     { quote: () => Promise.resolve(marketQuote()) },
+    () => undefined,
   );
   const decoded = await adapter.decodeEvidence(observed);
   const pools = await adapter.detectPools(observed);
@@ -62,6 +64,7 @@ void test('PumpSwap market adapter ignores untracked trades and delegates quote'
         return Promise.resolve(marketQuote());
       },
     },
+    () => undefined,
   );
   const observed = createSolanaObservedTransaction(transaction(), 2_000);
   assert.deepEqual(await adapter.decodeTrades(observed, new Map()), []);
@@ -74,6 +77,26 @@ void test('PumpSwap market adapter ignores untracked trades and delegates quote'
   assert.equal(result.id, 'quote');
   assert.equal(reserveReads, 1);
   assert.equal(quotedReserves?.effectiveQuoteReservesRaw, 25_000n);
+});
+
+void test('PumpSwap market adapter reports each local decoding issue once', async () => {
+  const reported: PumpSwapDecodingError[] = [];
+  const issue = new PumpSwapDecodingError(
+    'PUMPSWAP_EVENT_MISSING',
+    'missing',
+    'signature',
+  );
+  const adapter = new PumpSwapMarketAdapter(
+    () => ({ ...evidence(), issues: [issue] }),
+    { validate: () => Promise.resolve(null) },
+    { read: () => Promise.resolve(reserves()) },
+    { quote: () => Promise.resolve(marketQuote()) },
+    (value) => reported.push(value),
+  );
+  const observed = createSolanaObservedTransaction(transaction(), 2_000);
+  await adapter.decodeEvidence(observed);
+  await adapter.decodeEvidence(observed);
+  assert.deepEqual(reported, [issue]);
 });
 
 function evidence(): DecodedPumpSwapTransaction {
@@ -110,6 +133,7 @@ function evidence(): DecodedPumpSwapTransaction {
       baseAmountRaw: 10n,
       quoteAmountRaw: 20n,
     }],
+    issues: [],
   };
 }
 

@@ -11,6 +11,7 @@ import type {
   MarketObservationResult,
 } from '../src/ports/market-observation-repository.js';
 import type { SolanaObservedTransaction } from '../src/solana/rpc/observed-transaction.js';
+import type { ChainConfirmationStatus } from '../src/domain/types.js';
 
 const transaction: SolanaObservedTransaction = {
   signature: 'signature',
@@ -39,7 +40,10 @@ const transaction: SolanaObservedTransaction = {
   },
 };
 
-function match(innerInstructionIndex: number | null): MatchedMigration {
+function match(
+  innerInstructionIndex: number | null,
+  confirmationStatus: ChainConfirmationStatus = 'confirmed',
+): MatchedMigration {
   const cursor = {
     ...transaction.cursor,
     instructionIndex: 2,
@@ -54,7 +58,7 @@ function match(innerInstructionIndex: number | null): MatchedMigration {
       program: 'pump',
       signature: transaction.signature,
       cursor,
-      confirmationStatus: 'confirmed',
+      confirmationStatus,
       blockchainTimeMs: 1_000,
       observedAtMs: 2_000,
       payloadVersion: 1,
@@ -131,5 +135,36 @@ void test('market observation service rejects duplicate identities and foreign c
       trades: [],
     }),
     InvalidMarketObservationError,
+  );
+});
+
+void test('raw market payload stays stable across confirmation replay', async () => {
+  const batches: MarketObservationBatch[] = [];
+  const repository: MarketObservationRepository = {
+    record(batch) {
+      batches.push(batch);
+      return Promise.resolve({ migrations: [], activations: [] });
+    },
+    loadActivePools: () => Promise.resolve([]),
+  };
+  const service = new MarketObservationService(repository);
+  const processedTransaction: SolanaObservedTransaction = {
+    ...transaction,
+    confirmationStatus: 'processed',
+    raw: { ...transaction.raw, confirmationStatus: 'PROCESSED' },
+  };
+  await service.record(processedTransaction, {
+    matches: [match(1, 'processed')],
+    reserveSnapshots: [],
+    trades: [],
+  });
+  await service.record(transaction, {
+    matches: [match(1, 'confirmed')],
+    reserveSnapshots: [],
+    trades: [],
+  });
+  assert.deepEqual(
+    batches[0]?.rawEvents[0]?.payload,
+    batches[1]?.rawEvents[0]?.payload,
   );
 });

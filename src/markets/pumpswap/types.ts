@@ -1,4 +1,5 @@
 import type { NormalizedInstruction } from '../../solana/rpc/types.js';
+import type { PumpSwapDecodingError } from './errors.js';
 
 export type PumpSwapInstructionName =
   | 'buy'
@@ -64,6 +65,7 @@ export interface DecodedPumpSwapTrade {
 export interface DecodedPumpSwapTransaction {
   readonly poolCreations: readonly DecodedPumpSwapPoolCreation[];
   readonly trades: readonly DecodedPumpSwapTrade[];
+  readonly issues: readonly PumpSwapDecodingError[];
 }
 
 export interface DecodedPumpSwapPoolAccount {

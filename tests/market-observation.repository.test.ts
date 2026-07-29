@@ -18,6 +18,7 @@ interface QueryCall {
 class InstrumentedClient {
   public readonly calls: QueryCall[] = [];
   public readonly rawRows = new Map<string, Record<string, unknown>>();
+  public readonly reserveRows = new Map<string, Record<string, unknown>>();
   public readonly launchStates: string[] = ['OBSERVING', 'MIGRATION_PENDING'];
   public throwOn: RegExp | null = null;
   public released = false;
@@ -31,6 +32,21 @@ class InstrumentedClient {
     }
     if (text.includes('SELECT current_state FROM token_launches')) {
       return Promise.resolve({ rows: [{ current_state: this.launchStates.shift() ?? 'PUMPSWAP_ACTIVE' }], rowCount: 1 });
+    }
+    if (
+      text.includes('FROM market_reserve_snapshots WHERE snapshot_id=$1')
+    ) {
+      const row = this.reserveRows.get(String(values[0]));
+      return Promise.resolve({
+        rows: row === undefined ? [] : [row],
+        rowCount: row === undefined ? 0 : 1,
+      });
+    }
+    if (text.includes('SELECT pool_state,confirmation_status FROM market_pools')) {
+      return Promise.resolve({
+        rows: [{ pool_state: 'active', confirmation_status: 'finalized' }],
+        rowCount: 1,
+      });
     }
     return Promise.resolve({ rows: [], rowCount: 1 });
   }
@@ -190,6 +206,77 @@ void test('intermediate repository errors rollback the whole batch', async () =>
   );
   assert.equal(client.calls.at(-1)?.text, 'ROLLBACK');
   assert.equal(client.released, true);
+});
+
+void test('reserve replay rejects contradictory immutable amounts', async () => {
+  const client = new InstrumentedClient();
+  client.reserveRows.set('reserve', {
+    confirmation_status: 'confirmed',
+    pool_address: 'pool',
+    base_reserves_raw: '99',
+    quote_vault_amount_raw: '200',
+    virtual_quote_reserves_raw: '50',
+    effective_quote_reserves_raw: '250',
+    observed_slot: '10',
+    trigger_slot: '9',
+    transaction_index: 0,
+    instruction_index: 1,
+    inner_instruction_index: null,
+  });
+  await assert.rejects(
+    repositoryWith(client).record({
+      rawEvents: [],
+      matches: [],
+      trades: [],
+      reserveSnapshots: [{
+        id: 'reserve',
+        reserves: {
+          pool: 'pool',
+          baseReservesRaw: 100n,
+          quoteVaultAmountRaw: 200n,
+          virtualQuoteReservesRaw: 50n,
+          effectiveQuoteReservesRaw: 250n,
+          observedSlot: 10n,
+          observedAtMs: 2_000,
+        },
+        triggerCursor: {
+          slot: 9n,
+          transactionIndex: 0,
+          instructionIndex: 1,
+          innerInstructionIndex: null,
+        },
+        confirmationStatus: 'finalized',
+      }],
+    }),
+    MarketObservationPayloadConflictError,
+  );
+  assert.equal(client.calls.at(-1)?.text, 'ROLLBACK');
+});
+
+void test('late processed replay keeps finalized projections', async () => {
+  const fixture = matched('processed');
+  const client = new InstrumentedClient();
+  client.launchStates.splice(0, 2, 'PUMPSWAP_ACTIVE', 'PUMPSWAP_ACTIVE');
+  for (const raw of fixture.rawEvents) {
+    client.rawRows.set(raw.id, {
+      confirmation_status: 'finalized',
+      payload: toJsonValue(raw.payload),
+    });
+  }
+  await repositoryWith(client).record({
+    rawEvents: fixture.rawEvents,
+    matches: [fixture.match],
+    reserveSnapshots: [],
+    trades: [],
+  });
+  const projectionWrites = client.calls.filter((call) =>
+    call.text.includes('INSERT INTO domain_events')
+    || call.text.includes('INSERT INTO migrations')
+    || call.text.includes('INSERT INTO market_pools'));
+  assert.equal(
+    projectionWrites.every((call) => call.values.includes('finalized')),
+    true,
+  );
 });
 
 function repositoryWith(client: InstrumentedClient) {

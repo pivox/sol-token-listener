@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { MarketObservationService } from '../src/application/market-observation.service.js';
 import { PumpSwapObservationPipeline } from '../src/application/pumpswap-observation-pipeline.js';
 import type { CanonicalMarketPool } from '../src/domain/market.js';
@@ -37,6 +38,7 @@ void test('PumpSwap observation pipeline persists migration and canonical activa
       }),
     },
     { quote: () => Promise.reject(new Error('unused')) },
+    () => undefined,
   );
   const pipeline = new PumpSwapObservationPipeline(
     pump,
@@ -70,6 +72,7 @@ void test('PumpSwap observation pipeline ignores unrelated transactions without 
       { validate: () => Promise.reject(new Error('unused')) },
       { read: () => Promise.reject(new Error('unused')) },
       { quote: () => Promise.reject(new Error('unused')) },
+      () => undefined,
     ),
     new MarketObservationService(repository),
     () => 2_000,
@@ -83,10 +86,91 @@ void test('PumpSwap observation pipeline ignores unrelated transactions without 
   assert.equal(repository.recordedBatches.length, 0);
 });
 
+void test('first orphaned activation records no reserve snapshot', async () => {
+  const repository = new MemoryRepository();
+  let reserveReads = 0;
+  const orphanedPool = {
+    ...canonicalPool(),
+    confirmationStatus: 'orphaned' as const,
+  };
+  const pipeline = new PumpSwapObservationPipeline(
+    new PumpFunLaunchpadAdapter(
+      { read: () => Promise.reject(new Error('unused')) },
+      (value) => pumpEvidence(value),
+    ),
+    new PumpSwapMarketAdapter(
+      () => marketEvidence(),
+      { validate: () => Promise.resolve(orphanedPool) },
+      {
+        read: () => {
+          reserveReads += 1;
+          return Promise.reject(new Error('must not read orphan reserves'));
+        },
+      },
+      { quote: () => Promise.reject(new Error('unused')) },
+      () => undefined,
+    ),
+    new MarketObservationService(repository),
+    () => 2_000,
+  );
+  await pipeline.observe(transaction('ORPHANED'));
+  assert.equal(reserveReads, 0);
+  assert.equal(repository.recordedBatches[0]?.reserveSnapshots.length, 0);
+});
+
+void test('pipeline accepts processed to confirmed pool enrichment', async () => {
+  const repository = new MemoryRepository();
+  const validator = {
+    validate: (
+      _creation: unknown,
+      observed: { readonly confirmationStatus: CanonicalMarketPool['confirmationStatus'] },
+    ) => Promise.resolve({
+      ...canonicalPool(),
+      confirmationStatus: observed.confirmationStatus,
+    }),
+  };
+  const pipeline = new PumpSwapObservationPipeline(
+    new PumpFunLaunchpadAdapter(
+      { read: () => Promise.reject(new Error('unused')) },
+      (value) => pumpEvidence(value),
+    ),
+    new PumpSwapMarketAdapter(
+      () => marketEvidence(),
+      validator,
+      {
+        read: () => Promise.resolve({
+          pool: 'pool',
+          baseReservesRaw: 10n,
+          quoteVaultAmountRaw: 20n,
+          virtualQuoteReservesRaw: 5n,
+          effectiveQuoteReservesRaw: 25n,
+          observedSlot: 12n,
+          observedAtMs: 2_100,
+        }),
+      },
+      { quote: () => Promise.reject(new Error('unused')) },
+      () => undefined,
+    ),
+    new MarketObservationService(repository),
+    () => 2_000,
+  );
+  await pipeline.observe(transaction('PROCESSED'));
+  await assert.doesNotReject(pipeline.observe(transaction('CONFIRMED')));
+});
+
 class MemoryRepository implements MarketObservationRepository {
   public readonly recordedBatches: MarketObservationBatch[] = [];
+  private readonly activePools = new Map<string, CanonicalMarketPool>();
   public record(batch: MarketObservationBatch) {
     this.recordedBatches.push(batch);
+    for (const match of batch.matches) {
+      if (match.activationEvent !== null) {
+        this.activePools.set(
+          match.activationEvent.payload.pool.address,
+          match.activationEvent.payload.pool,
+        );
+      }
+    }
     return Promise.resolve({
       migrations: batch.matches.map((match) => match.migrationEvent),
       activations: batch.matches.flatMap((match) =>
@@ -94,7 +178,7 @@ class MemoryRepository implements MarketObservationRepository {
     });
   }
   public loadActivePools(): Promise<readonly CanonicalMarketPool[]> {
-    return Promise.resolve([]);
+    return Promise.resolve([...this.activePools.values()]);
   }
 }
 
@@ -131,7 +215,13 @@ function marketEvidence(): DecodedPumpSwapTransaction {
         name: 'create_pool',
         family: 'CREATE_POOL',
         instruction: create,
-        accounts: {},
+        accounts: {
+          pool_base_token_account: 'base-vault',
+          pool_quote_token_account: 'quote-vault',
+          lp_mint: 'lp',
+          base_token_program: TOKEN_PROGRAM_ID.toBase58(),
+          quote_token_program: TOKEN_PROGRAM_ID.toBase58(),
+        },
         args: {},
       },
       event: {
@@ -147,6 +237,7 @@ function marketEvidence(): DecodedPumpSwapTransaction {
       quoteMint: 'quote',
     }],
     trades: [],
+    issues: [],
   };
 }
 
@@ -173,12 +264,14 @@ function canonicalPool(): CanonicalMarketPool {
   };
 }
 
-function transaction(): NormalizedTransaction {
+function transaction(
+  confirmationStatus: NormalizedTransaction['confirmationStatus'] = 'CONFIRMED',
+): NormalizedTransaction {
   return {
     signature: 'signature',
     slot: 10n,
     transactionIndex: 0,
-    confirmationStatus: 'CONFIRMED',
+    confirmationStatus,
     version: 0,
     blockTimeMs: 1_000,
     accountKeys: [],

@@ -48,6 +48,7 @@ implements MarketAdapter<SolanaObservedTransaction> {
     private readonly poolValidator: PumpSwapPoolValidator,
     private readonly reserveReader: PumpSwapReservePort,
     private readonly quoteProvider: PumpSwapQuotePort,
+    private readonly reportIssue: (issue: PumpSwapDecodingError) => void,
   ) {}
 
   public decodeEvidence(
@@ -56,8 +57,12 @@ implements MarketAdapter<SolanaObservedTransaction> {
     validateEnvelope(transaction);
     const cached = this.decoded.get(transaction);
     if (cached !== undefined) return cached;
-    const decoding = Promise.resolve().then(() =>
-      this.transactionDecoder(transaction.raw));
+    const decoding = Promise.resolve()
+      .then(() => this.transactionDecoder(transaction.raw))
+      .then((evidence) => {
+        for (const issue of evidence.issues) this.reportIssue(issue);
+        return evidence;
+      });
     this.decoded.set(transaction, decoding);
     return decoding;
   }
