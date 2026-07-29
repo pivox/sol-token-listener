@@ -75,6 +75,7 @@ void test('rejects mutable analysis and basis points above the scale', () => {
       sharedFunderCount: 0,
       strongRelationshipCount: 1,
       strongEvidenceCount: 1,
+      quoteAssets: Object.freeze([]),
     })]),
     coverage: Object.freeze({
       knownBuyCount: 0,

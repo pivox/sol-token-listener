@@ -13,6 +13,7 @@ import type { ChainConfirmationStatus } from '../domain/types.js';
 export const API_VERSION = 'v1' as const;
 export const MAX_API_JSON_DEPTH = 64;
 export const MAX_API_JSON_NODES = 10_000;
+export const MAX_API_CLUSTER_QUOTE_ASSETS = 32;
 
 export type ApiJsonPrimitive = string | number | boolean | null;
 export interface ApiJsonObject {
@@ -193,6 +194,9 @@ export interface ApiWalletGraphCoverage {
 
 export interface ApiWalletCluster {
   readonly id: string;
+  readonly quoteAssetCount: number;
+  readonly quoteAssetsTruncated: boolean;
+  readonly quoteAssets: readonly ApiQuoteAsset[];
   readonly participantWalletCount: number;
   readonly auxiliaryWalletCount: number;
   readonly positiveHolderCount: number;

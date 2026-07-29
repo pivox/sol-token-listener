@@ -364,14 +364,17 @@ class PostgresWalletGraphTransaction implements WalletGraphTransaction {
       await this.client.query(
         `INSERT INTO wallet_relationships (
           mint, relationship_id, left_wallet, right_wallet, relationship_type,
-          confidence, evidence_count, quote_totals, input_fingerprint, purge_after
+          confidence, evidence_count, quote_totals, first_observed_cursor,
+          last_observed_cursor, input_fingerprint, purge_after
         )
-        SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,launch.purge_after
+        SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,launch.purge_after
         FROM token_launches AS launch WHERE launch.mint = $1`,
         [
           projection.launch.mint, relationship.id, relationship.leftWallet,
           relationship.rightWallet, relationship.type, relationship.confidence,
           relationship.evidenceCount, stringifyJson(relationship.quoteTotals),
+          stringifyJson(relationship.firstObservedCursor),
+          stringifyJson(relationship.lastObservedCursor),
           projection.inputFingerprint,
         ],
       );
@@ -386,9 +389,9 @@ class PostgresWalletGraphTransaction implements WalletGraphTransaction {
           auxiliary_wallet_count, positive_holder_count,
           observed_positive_base_raw, concentration_bps, contains_creator,
           shared_funder_count, strong_relationship_count, strong_evidence_count,
-          purge_after
+          quote_assets, purge_after
         )
-        SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,launch.purge_after
+        SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,launch.purge_after
         FROM token_launches AS launch WHERE launch.mint = $1`,
         [
           projection.launch.mint, cluster.id, projection.inputFingerprint,
@@ -396,7 +399,7 @@ class PostgresWalletGraphTransaction implements WalletGraphTransaction {
           cluster.positiveHolderCount, cluster.observedPositiveBaseRaw.toString(),
           cluster.concentrationBps.toString(), cluster.containsCreator,
           cluster.sharedFunderCount, cluster.strongRelationshipCount,
-          cluster.strongEvidenceCount,
+          cluster.strongEvidenceCount, stringifyJson(cluster.quoteAssets),
         ],
       );
     }

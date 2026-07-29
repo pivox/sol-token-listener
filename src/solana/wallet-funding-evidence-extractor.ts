@@ -112,6 +112,11 @@ implements WalletFundingEvidenceExtractor<NormalizedTransaction> {
     });
     const contexts = orderedBuys.map((buy) =>
       this.createBuyContext(transaction, buy));
+    const buyers = new Set(contexts.map((context) => context.buy.buyer));
+    const technicalAccounts = new Set(
+      contexts.flatMap((context) => [...context.technicalAccounts])
+        .filter((account) => !buyers.has(account)),
+    );
     const stateByTrade = new Map<string, MutableAssessment>(
       orderedBuys.map((buy) => [buy.tradeId, {
         inspectedTransferCount: 0,
@@ -154,8 +159,8 @@ implements WalletFundingEvidenceExtractor<NormalizedTransaction> {
         continue;
       }
       if (
-        target.technicalAccounts.has(transfer.sourceWallet)
-        || target.technicalAccounts.has(transfer.sourceAccount)
+        technicalAccounts.has(transfer.sourceWallet)
+        || technicalAccounts.has(transfer.sourceAccount)
       ) {
         state.ignoredTransferCount += 1;
         continue;
@@ -174,7 +179,7 @@ implements WalletFundingEvidenceExtractor<NormalizedTransaction> {
       if (
         payer !== null
         && payer !== context.buy.buyer
-        && !context.technicalAccounts.has(payer)
+        && !technicalAccounts.has(payer)
       ) {
         const evidence = feePayerEvidence(context.buy, payer);
         state.evidence.push(evidence);

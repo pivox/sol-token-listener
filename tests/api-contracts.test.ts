@@ -220,6 +220,13 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
     clustersTruncated: false,
     clusters: [{
       id: 'cluster',
+      quoteAssetCount: 1,
+      quoteAssetsTruncated: false,
+      quoteAssets: [{
+        mint: 'quote',
+        decimals: 9,
+        tokenProgram: 'SPL_TOKEN',
+      }],
       participantWalletCount: 2,
       auxiliaryWalletCount: 1,
       positiveHolderCount: 2,

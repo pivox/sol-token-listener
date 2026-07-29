@@ -490,7 +490,7 @@ void test('exposes current clusters with per-cluster truncation and one shared m
       cluster_count: 3,
     }];
     if (call.text.includes('FROM wallet_clusters AS cluster')) return [
-      clusterRow('cluster-high', '9000', '3'),
+      clusterRow('cluster-high', '9000', '3', 40),
       clusterRow('cluster-low', '5000', '2'),
       clusterRow('cluster-truncated', '1000', '2'),
     ];
@@ -527,6 +527,9 @@ void test('exposes current clusters with per-cluster truncation and one shared m
     'cluster-low',
   ]);
   assert.deepEqual(holders.clusters.map((cluster) => cluster.members.length), [2, 1]);
+  assert.equal(holders.clusters[0]?.quoteAssets.length, 32);
+  assert.equal(holders.clusters[0]?.quoteAssetCount, 40);
+  assert.equal(holders.clusters[0]?.quoteAssetsTruncated, true);
   assert.deepEqual(holders.clusters.map((cluster) => cluster.membersTruncated), [
     true,
     true,
@@ -713,9 +716,15 @@ function clusterRow(
   clusterId: string,
   concentrationBps: string,
   memberCount: string,
+  quoteAssetCount = 1,
 ): Record<string, unknown> {
   return {
     cluster_id: clusterId,
+    quote_assets: Array.from({ length: quoteAssetCount }, (_, index) => ({
+      mint: `quote-mint-${index.toString().padStart(3, '0')}`,
+      decimals: 9,
+      tokenProgram: 'SPL_TOKEN',
+    })),
     participant_wallet_count: 2,
     auxiliary_wallet_count: 1,
     positive_holder_count: 2,

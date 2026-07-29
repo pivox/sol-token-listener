@@ -83,6 +83,20 @@ void test('accepts medium-only and explicit no-evidence assessments without fake
   assert.doesNotThrow(() => { assertValidWalletFundingExtractionResult(noEvidence); });
 });
 
+void test('includes the target buy in deterministic evidence identity', () => {
+  const first = directEvidence();
+  const second = directEvidence({
+    buyEventId: 'later-buy-event',
+    buyTradeId: 'later-buy-trade',
+    buyCursor: Object.freeze({
+      ...cursor,
+      instructionIndex: cursor.instructionIndex + 1,
+    }),
+  });
+
+  assert.notEqual(first.id, second.id);
+});
+
 void test('rejects duplicates, foreign evidence and contradictory assessment statuses', () => {
   const canonical = directResult();
   assert.throws(

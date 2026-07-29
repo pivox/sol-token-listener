@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { assertValidChainCursor } from './cursor.js';
+import { assertValidChainCursor, compareCursors } from './cursor.js';
 import {
   assertValidParticipantAnalyticsInput,
   type ActiveParticipantConfirmationStatus,
@@ -49,6 +49,8 @@ export interface WalletRelationship {
   readonly confidence: WalletFundingConfidence;
   readonly evidenceCount: number;
   readonly quoteTotals: readonly WalletGraphQuoteTotal[];
+  readonly firstObservedCursor: ChainCursor;
+  readonly lastObservedCursor: ChainCursor;
 }
 
 export interface WalletClusterMember {
@@ -71,6 +73,7 @@ export interface WalletCluster {
   readonly sharedFunderCount: number;
   readonly strongRelationshipCount: number;
   readonly strongEvidenceCount: number;
+  readonly quoteAssets: readonly QuoteAsset[];
 }
 
 export interface WalletGraphCoverage {
@@ -297,6 +300,16 @@ function validateRelationship(relationship: WalletRelationship): void {
     validateQuoteAsset(total.quoteAsset);
     assertNonNegativeBigint(total.amountRaw, 'relationship.amountRaw');
   }
+  assertFrozen(relationship.firstObservedCursor, 'relationship.firstObservedCursor');
+  assertFrozen(relationship.lastObservedCursor, 'relationship.lastObservedCursor');
+  assertValidChainCursor(relationship.firstObservedCursor);
+  assertValidChainCursor(relationship.lastObservedCursor);
+  if (compareCursors(
+    relationship.firstObservedCursor,
+    relationship.lastObservedCursor,
+  ) > 0) {
+    throw new TypeError('Wallet graph relationship cursors are reversed.');
+  }
 }
 
 function validateCluster(cluster: WalletCluster): void {
@@ -310,6 +323,16 @@ function validateCluster(cluster: WalletCluster): void {
   assertCount(cluster.sharedFunderCount, 'cluster.sharedFunderCount');
   assertCount(cluster.strongRelationshipCount, 'cluster.strongRelationshipCount');
   assertCount(cluster.strongEvidenceCount, 'cluster.strongEvidenceCount');
+  assertFrozen(cluster.quoteAssets, 'cluster.quoteAssets');
+  let previousQuoteKey: string | null = null;
+  for (const asset of cluster.quoteAssets) {
+    validateQuoteAsset(asset);
+    const quoteKey = `${asset.mint}\0${asset.decimals}\0${asset.tokenProgram}`;
+    if (previousQuoteKey !== null && quoteKey <= previousQuoteKey) {
+      throw new TypeError('Wallet graph cluster quote assets must be canonical.');
+    }
+    previousQuoteKey = quoteKey;
+  }
   assertNonNegativeBigint(cluster.observedPositiveBaseRaw, 'cluster.observedPositiveBaseRaw');
   assertNonNegativeBigint(cluster.concentrationBps, 'cluster.concentrationBps');
   if (cluster.concentrationBps > WALLET_GRAPH_CONCENTRATION_SCALE_BPS) {

@@ -1,4 +1,5 @@
 import {
+  MAX_API_CLUSTER_QUOTE_ASSETS,
   toApiDomainPayload,
   type ApiHealth,
   type ApiHolders,
@@ -528,6 +529,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
           cluster.observed_positive_base_raw, cluster.concentration_bps,
           cluster.contains_creator, cluster.shared_funder_count,
           cluster.strong_relationship_count, cluster.strong_evidence_count,
+          cluster.quote_assets,
           (
             SELECT COUNT(*)
             FROM wallet_cluster_members AS member
@@ -591,8 +593,15 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       const members = freeze(membersByCluster.get(clusterId) ?? []);
       const memberCount = countDecimal(row.member_count);
       if (memberCount < members.length) throw invalid();
+      const storedQuoteAssets = array(json(row.quote_assets));
+      const quoteAssets = freeze(storedQuoteAssets
+        .slice(0, MAX_API_CLUSTER_QUOTE_ASSETS)
+        .map(toQuoteAsset));
       return freeze({
         id: clusterId,
+        quoteAssetCount: storedQuoteAssets.length,
+        quoteAssetsTruncated: storedQuoteAssets.length > quoteAssets.length,
+        quoteAssets,
         participantWalletCount: nonNegativeSafeNumber(row.participant_wallet_count),
         auxiliaryWalletCount: nonNegativeSafeNumber(row.auxiliary_wallet_count),
         positiveHolderCount: nonNegativeSafeNumber(row.positive_holder_count),

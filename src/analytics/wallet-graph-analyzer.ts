@@ -12,7 +12,8 @@ import {
   type WalletGraphQuoteTotal,
   type WalletRelationship,
 } from '../domain/wallet-graph.js';
-import type { QuoteAsset } from '../domain/types.js';
+import { compareCursors } from '../domain/cursor.js';
+import type { ChainCursor, QuoteAsset } from '../domain/types.js';
 import type {
   WalletFundingAssessmentStatus,
   WalletFundingEvidence,
@@ -26,6 +27,8 @@ interface MutableRelationship {
   readonly type: WalletFundingEvidenceType;
   evidenceCount: number;
   readonly quoteTotals: Map<string, { quoteAsset: QuoteAsset; amountRaw: bigint }>;
+  firstObservedCursor: ChainCursor;
+  lastObservedCursor: ChainCursor;
 }
 
 type CoverageStatus = WalletFundingAssessmentStatus | 'NOT_PROCESSED';
@@ -59,6 +62,7 @@ function buildRelationships(
       : evidence.buyer;
     const key = [evidence.mint, leftWallet, rightWallet, evidence.type].join('\0');
     let relationship = aggregate.get(key);
+    const observedCursor = evidence.transferCursor ?? evidence.buyCursor;
     if (relationship === undefined) {
       const created: MutableRelationship = {
         mint: evidence.mint,
@@ -67,11 +71,19 @@ function buildRelationships(
         type: evidence.type,
         evidenceCount: 0,
         quoteTotals: new Map(),
+        firstObservedCursor: observedCursor,
+        lastObservedCursor: observedCursor,
       };
       aggregate.set(key, created);
       relationship = created;
     }
     relationship.evidenceCount += 1;
+    if (compareCursors(observedCursor, relationship.firstObservedCursor) < 0) {
+      relationship.firstObservedCursor = observedCursor;
+    }
+    if (compareCursors(observedCursor, relationship.lastObservedCursor) > 0) {
+      relationship.lastObservedCursor = observedCursor;
+    }
     if (evidence.type === 'DIRECT_QUOTE_TRANSFER') {
       const quoteKey = quoteAssetKey(evidence.quoteAsset);
       const current = relationship.quoteTotals.get(quoteKey);
@@ -95,6 +107,8 @@ function buildRelationships(
       type: item.type,
       confidence: item.type === 'DIRECT_QUOTE_TRANSFER' ? 'STRONG' : 'MEDIUM',
       evidenceCount: item.evidenceCount,
+      firstObservedCursor: item.firstObservedCursor,
+      lastObservedCursor: item.lastObservedCursor,
       quoteTotals: Object.freeze([...item.quoteTotals.values()]
         .sort((left, right) => quoteAssetKey(left.quoteAsset)
           .localeCompare(quoteAssetKey(right.quoteAsset)))
@@ -149,6 +163,12 @@ function buildClusters(
       0n,
     );
     const sharedFunderCount = countSharedFunders(input.evidence, memberWallets);
+    const quoteAssets = new Map<string, QuoteAsset>();
+    for (const relationship of strongRelations) {
+      for (const total of relationship.quoteTotals) {
+        quoteAssets.set(quoteAssetKey(total.quoteAsset), total.quoteAsset);
+      }
+    }
     clusters.push(Object.freeze({
       id: createWalletClusterId(input.launch.mint, wallets),
       mint: input.launch.mint,
@@ -169,6 +189,9 @@ function buildClusters(
         (sum, item) => sum + item.evidenceCount,
         0,
       ),
+      quoteAssets: Object.freeze([...quoteAssets.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([, asset]) => asset)),
     }));
   }
   return Object.freeze(clusters.sort((left, right) => left.id.localeCompare(right.id)));

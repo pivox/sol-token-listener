@@ -30,6 +30,9 @@ void test('creates replayable bigint wallet-funding evidence tables', async () =
   assert.match(sql, /amount_raw IS NULL.*transfer_slot IS NULL/su);
   assert.match(sql, /UNIQUE \(mint, input_fingerprint\)/u);
   assert.match(sql, /wallet_clusters_current_rank_idx/u);
+  assert.match(sql, /first_observed_cursor JSONB NOT NULL/u);
+  assert.match(sql, /last_observed_cursor JSONB NOT NULL/u);
+  assert.match(sql, /quote_assets JSONB NOT NULL/u);
   assert.match(sql, /wallet_cluster_members_current_rank_idx/u);
   assert.match(sql, /wallet_graph_profiles_purge_idx/u);
   assert.match(sql, /wallet_graph_snapshots_purge_idx/u);

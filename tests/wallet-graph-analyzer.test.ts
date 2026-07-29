@@ -33,6 +33,20 @@ void test('builds one deterministic shared-funder cluster with bigint concentrat
   assert.equal(cluster.observedPositiveBaseRaw, 75n);
   assert.equal(cluster.concentrationBps, 7_500n);
   assert.equal(cluster.sharedFunderCount, 1);
+  assert.deepEqual(cluster.quoteAssets, [
+    {
+      mint: 'So11111111111111111111111111111111111111112',
+      decimals: 9,
+      tokenProgram: 'SPL_TOKEN',
+    },
+  ]);
+  assert.deepEqual(result.relationships.map((relationship) => [
+    relationship.firstObservedCursor.instructionIndex,
+    relationship.lastObservedCursor.instructionIndex,
+  ]).sort((left, right) => (left[0] ?? 0) - (right[0] ?? 0)), [
+    [1, 1],
+    [2, 2],
+  ]);
   assert.deepEqual(
     cluster.members.map((member) => member.wallet),
     [BUYER_A, BUYER_B, SHARED_FUNDER],
@@ -138,6 +152,14 @@ void test('groups direct amounts by quote asset without cross-asset sums', () =>
       ['So11111111111111111111111111111111111111112', 10n],
       ['usdc-mint', 20n],
     ],
+  );
+  assert.deepEqual(
+    result.relationships[0]?.firstObservedCursor,
+    solEvidence.transferCursor,
+  );
+  assert.deepEqual(
+    result.relationships[0]?.lastObservedCursor,
+    usdcEvidence.transferCursor,
   );
 });
 

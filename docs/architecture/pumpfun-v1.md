@@ -141,12 +141,16 @@ exclut `orphaned`, remplace atomiquement les projections courantes et garde un
 snapshot immuable par fingerprint. Une analyse réussie à zéro cluster reste
 `AVAILABLE`. Les événements `WalletClusterDetected` ne contiennent que des
 agrégats bornés ; les relations et membres complets restent en base.
+Chaque relation conserve ses curseurs observés premier/dernier. Chaque cluster
+persiste ses quote assets distincts ; l'API en expose au plus 32 avec compte
+total et indicateur de troncature.
 Leur `asOf` et leur finalité minimale incluent explicitement la projection I1,
 y compris lorsqu'une vente plus récente que le dernier achat modifie les
 positions observées.
 
-L'API limite par défaut la réponse à 50 clusters, 50 membres par cluster et
-500 membres au total, avec des indicateurs de troncature explicites. Les reason
+L'API limite par défaut la réponse à 50 clusters, 50 membres par cluster,
+500 membres au total et 32 quote assets par cluster, avec des indicateurs de
+troncature explicites. Les reason
 codes `SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` restent
 désactivés jusqu'au calibrage dry run : I2 ne change aucun verdict, score ou
 paper trade.

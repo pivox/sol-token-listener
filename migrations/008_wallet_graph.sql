@@ -173,6 +173,8 @@ CREATE TABLE IF NOT EXISTS wallet_relationships (
   confidence TEXT NOT NULL CHECK (confidence IN ('STRONG', 'MEDIUM')),
   evidence_count INTEGER NOT NULL CHECK (evidence_count > 0),
   quote_totals JSONB NOT NULL,
+  first_observed_cursor JSONB NOT NULL,
+  last_observed_cursor JSONB NOT NULL,
   input_fingerprint TEXT NOT NULL,
   purge_after TIMESTAMPTZ,
   PRIMARY KEY (mint, relationship_id),
@@ -198,6 +200,7 @@ CREATE TABLE IF NOT EXISTS wallet_clusters (
   shared_funder_count INTEGER NOT NULL CHECK (shared_funder_count >= 0),
   strong_relationship_count INTEGER NOT NULL CHECK (strong_relationship_count >= 0),
   strong_evidence_count INTEGER NOT NULL CHECK (strong_evidence_count >= 0),
+  quote_assets JSONB NOT NULL,
   purge_after TIMESTAMPTZ,
   PRIMARY KEY (mint, cluster_id)
 );

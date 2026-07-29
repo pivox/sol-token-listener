@@ -137,8 +137,11 @@ export function createWalletFundingEvidenceId(
     evidence.quoteAsset.mint,
     evidence.quoteAsset.decimals,
     evidence.quoteAsset.tokenProgram,
+    evidence.buyEventId,
+    evidence.buyTradeId,
+    ...cursorIdentity(evidence.buyCursor),
     ...(evidence.transferCursor === null
-      ? ['fee-payer', ...cursorIdentity(evidence.buyCursor)]
+      ? ['fee-payer']
       : cursorIdentity(evidence.transferCursor)),
   ]);
 }

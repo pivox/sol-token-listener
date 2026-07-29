@@ -430,6 +430,39 @@ void test('excludes Pump technical accounts and rejects failed transaction input
   );
 });
 
+void test('excludes technical accounts identified by another buy in the transaction', () => {
+  const transfer = normalizeInstruction(
+    SystemProgram.transfer({
+      fromPubkey: new PublicKey(TECHNICAL_FUNDER),
+      toPubkey: new PublicKey(BUYER),
+      lamports: 1_000_000n,
+    }),
+    location(1),
+  );
+  const firstBuy = pumpBuy(location(2), {
+    user: BUYER,
+    base_mint: BASE_MINT,
+    quote_mint: WSOL_MINT,
+  });
+  const secondBuy = pumpBuy(location(3), {
+    user: BUYER,
+    base_mint: BASE_MINT,
+    quote_mint: WSOL_MINT,
+    bonding_curve: TECHNICAL_FUNDER,
+  });
+  const result = extractor.extract(
+    transaction([transfer, firstBuy, secondBuy], { signerKeys: [BUYER] }),
+    Object.freeze([
+      fundingBuy(location(2), { tradeId: 'first', eventId: 'first-event' }),
+      fundingBuy(location(3), { tradeId: 'second', eventId: 'second-event' }),
+    ]),
+  );
+
+  assert.equal(result.evidence.length, 0);
+  assert.equal(result.assessments[0]?.status, 'NO_EVIDENCE');
+  assert.equal(result.assessments[0]?.ignoredTransferCount, 1);
+});
+
 function transaction(
   instructions: readonly NormalizedInstruction[],
   options: {
