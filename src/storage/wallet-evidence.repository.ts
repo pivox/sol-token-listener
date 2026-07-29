@@ -178,7 +178,7 @@ implements WalletEvidenceRepository {
         assessment.inspectedTransferCount,
         assessment.acceptedEvidenceCount,
         assessment.ignoredTransferCount,
-        toJsonValue(assessment.diagnosticCodes),
+        stringifyJson(assessment.diagnosticCodes),
         assessment.payloadVersion,
         toJsonValue(assessment),
         dateOrNull(buy.blockchainTimeMs),

@@ -133,3 +133,135 @@ CREATE INDEX IF NOT EXISTS wallet_funding_evidence_buy_cursor_idx
 CREATE INDEX IF NOT EXISTS wallet_funding_evidence_purge_idx
   ON wallet_funding_evidence(purge_after)
   WHERE purge_after IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS wallet_graph_profiles (
+  mint TEXT PRIMARY KEY REFERENCES token_launches(mint) ON DELETE CASCADE,
+  input_fingerprint TEXT NOT NULL,
+  participant_input_fingerprint TEXT NOT NULL,
+  methodology TEXT NOT NULL
+    CHECK (methodology = 'OBSERVED_PUMPFUN_TRANSACTIONS'),
+  graph_event_id TEXT NOT NULL REFERENCES domain_events(event_id),
+  as_of_event_id TEXT NOT NULL,
+  as_of_signature TEXT NOT NULL,
+  as_of_slot NUMERIC(78,0) NOT NULL CHECK (as_of_slot >= 0),
+  as_of_transaction_index INTEGER NOT NULL CHECK (as_of_transaction_index >= 0),
+  as_of_instruction_index INTEGER NOT NULL CHECK (as_of_instruction_index >= 0),
+  as_of_inner_instruction_index INTEGER CHECK (as_of_inner_instruction_index >= 0),
+  confirmation_status TEXT NOT NULL
+    CHECK (confirmation_status IN ('processed', 'confirmed', 'finalized')),
+  confirmation_counts JSONB NOT NULL,
+  coverage JSONB NOT NULL,
+  strong_relationship_count INTEGER NOT NULL CHECK (strong_relationship_count >= 0),
+  medium_relationship_count INTEGER NOT NULL CHECK (medium_relationship_count >= 0),
+  cluster_count INTEGER NOT NULL CHECK (cluster_count >= 0),
+  maximum_cluster_bps NUMERIC(78,0) NOT NULL
+    CHECK (maximum_cluster_bps >= 0 AND maximum_cluster_bps <= 10000),
+  creator_cluster_count INTEGER NOT NULL CHECK (creator_cluster_count >= 0),
+  observed_at TIMESTAMPTZ NOT NULL,
+  purge_after TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS wallet_graph_profiles_purge_idx
+  ON wallet_graph_profiles(purge_after) WHERE purge_after IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS wallet_relationships (
+  mint TEXT NOT NULL REFERENCES token_launches(mint) ON DELETE CASCADE,
+  relationship_id TEXT NOT NULL,
+  left_wallet TEXT NOT NULL,
+  right_wallet TEXT NOT NULL,
+  relationship_type TEXT NOT NULL
+    CHECK (relationship_type IN ('DIRECT_QUOTE_TRANSFER', 'FEE_PAYER_FOR_BUYER')),
+  confidence TEXT NOT NULL CHECK (confidence IN ('STRONG', 'MEDIUM')),
+  evidence_count INTEGER NOT NULL CHECK (evidence_count > 0),
+  quote_totals JSONB NOT NULL,
+  input_fingerprint TEXT NOT NULL,
+  purge_after TIMESTAMPTZ,
+  PRIMARY KEY (mint, relationship_id),
+  CHECK (left_wallet < right_wallet)
+);
+CREATE INDEX IF NOT EXISTS wallet_relationships_current_idx
+  ON wallet_relationships(mint, input_fingerprint, confidence, relationship_id);
+CREATE INDEX IF NOT EXISTS wallet_relationships_purge_idx
+  ON wallet_relationships(purge_after) WHERE purge_after IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS wallet_clusters (
+  mint TEXT NOT NULL REFERENCES token_launches(mint) ON DELETE CASCADE,
+  cluster_id TEXT NOT NULL,
+  input_fingerprint TEXT NOT NULL,
+  participant_wallet_count INTEGER NOT NULL CHECK (participant_wallet_count >= 2),
+  auxiliary_wallet_count INTEGER NOT NULL CHECK (auxiliary_wallet_count >= 0),
+  positive_holder_count INTEGER NOT NULL CHECK (positive_holder_count >= 0),
+  observed_positive_base_raw NUMERIC(78,0) NOT NULL
+    CHECK (observed_positive_base_raw >= 0),
+  concentration_bps NUMERIC(78,0) NOT NULL
+    CHECK (concentration_bps >= 0 AND concentration_bps <= 10000),
+  contains_creator BOOLEAN NOT NULL,
+  shared_funder_count INTEGER NOT NULL CHECK (shared_funder_count >= 0),
+  strong_relationship_count INTEGER NOT NULL CHECK (strong_relationship_count >= 0),
+  strong_evidence_count INTEGER NOT NULL CHECK (strong_evidence_count >= 0),
+  purge_after TIMESTAMPTZ,
+  PRIMARY KEY (mint, cluster_id)
+);
+CREATE INDEX IF NOT EXISTS wallet_clusters_current_rank_idx
+  ON wallet_clusters(mint, input_fingerprint, concentration_bps DESC, cluster_id);
+CREATE INDEX IF NOT EXISTS wallet_clusters_purge_idx
+  ON wallet_clusters(purge_after) WHERE purge_after IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS wallet_cluster_members (
+  mint TEXT NOT NULL,
+  cluster_id TEXT NOT NULL,
+  wallet TEXT NOT NULL,
+  member_role TEXT NOT NULL
+    CHECK (member_role IN ('PARTICIPANT', 'AUXILIARY_FUNDER')),
+  is_creator BOOLEAN NOT NULL,
+  observed_net_base_raw NUMERIC(78,0) NOT NULL,
+  input_fingerprint TEXT NOT NULL,
+  purge_after TIMESTAMPTZ,
+  PRIMARY KEY (mint, cluster_id, wallet),
+  FOREIGN KEY (mint, cluster_id)
+    REFERENCES wallet_clusters(mint, cluster_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS wallet_cluster_members_current_rank_idx
+  ON wallet_cluster_members(
+    mint, input_fingerprint, cluster_id, observed_net_base_raw DESC, wallet
+  );
+CREATE INDEX IF NOT EXISTS wallet_cluster_members_purge_idx
+  ON wallet_cluster_members(purge_after) WHERE purge_after IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS wallet_graph_snapshots (
+  snapshot_id TEXT PRIMARY KEY,
+  mint TEXT NOT NULL REFERENCES token_launches(mint) ON DELETE CASCADE,
+  input_fingerprint TEXT NOT NULL,
+  methodology TEXT NOT NULL
+    CHECK (methodology = 'OBSERVED_PUMPFUN_TRANSACTIONS'),
+  graph_event_id TEXT NOT NULL REFERENCES domain_events(event_id),
+  coverage JSONB NOT NULL,
+  strong_relationship_count INTEGER NOT NULL CHECK (strong_relationship_count >= 0),
+  medium_relationship_count INTEGER NOT NULL CHECK (medium_relationship_count >= 0),
+  cluster_count INTEGER NOT NULL CHECK (cluster_count >= 0),
+  maximum_cluster_bps NUMERIC(78,0) NOT NULL
+    CHECK (maximum_cluster_bps >= 0 AND maximum_cluster_bps <= 10000),
+  creator_cluster_count INTEGER NOT NULL CHECK (creator_cluster_count >= 0),
+  confirmation_status TEXT NOT NULL
+    CHECK (confirmation_status IN ('processed', 'confirmed', 'finalized')),
+  confirmation_counts JSONB NOT NULL,
+  as_of_event_id TEXT NOT NULL,
+  as_of_signature TEXT NOT NULL,
+  as_of_slot NUMERIC(78,0) NOT NULL CHECK (as_of_slot >= 0),
+  as_of_transaction_index INTEGER NOT NULL CHECK (as_of_transaction_index >= 0),
+  as_of_instruction_index INTEGER NOT NULL CHECK (as_of_instruction_index >= 0),
+  as_of_inner_instruction_index INTEGER CHECK (as_of_inner_instruction_index >= 0),
+  observed_at TIMESTAMPTZ NOT NULL,
+  purge_after TIMESTAMPTZ,
+  UNIQUE (mint, input_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS wallet_graph_snapshots_history_idx
+  ON wallet_graph_snapshots(
+    mint,
+    as_of_slot DESC,
+    as_of_transaction_index DESC,
+    as_of_instruction_index DESC,
+    COALESCE(as_of_inner_instruction_index, -1) DESC,
+    snapshot_id DESC
+  );
+CREATE INDEX IF NOT EXISTS wallet_graph_snapshots_purge_idx
+  ON wallet_graph_snapshots(purge_after) WHERE purge_after IS NOT NULL;

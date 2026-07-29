@@ -13,6 +13,11 @@ void test('creates replayable bigint wallet-funding evidence tables', async () =
   for (const table of [
     'wallet_funding_observations',
     'wallet_funding_evidence',
+    'wallet_relationships',
+    'wallet_graph_profiles',
+    'wallet_clusters',
+    'wallet_cluster_members',
+    'wallet_graph_snapshots',
   ]) {
     assert.match(sql, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`, 'u'));
   }
@@ -23,6 +28,15 @@ void test('creates replayable bigint wallet-funding evidence tables', async () =
   assert.match(sql, /DIRECT_QUOTE_TRANSFER.*FEE_PAYER_FOR_BUYER/su);
   assert.match(sql, /processed.*confirmed.*finalized.*orphaned/su);
   assert.match(sql, /amount_raw IS NULL.*transfer_slot IS NULL/su);
+  assert.match(sql, /UNIQUE \(mint, input_fingerprint\)/u);
+  assert.match(sql, /wallet_clusters_current_rank_idx/u);
+  assert.match(sql, /wallet_cluster_members_current_rank_idx/u);
+  assert.match(sql, /wallet_graph_profiles_purge_idx/u);
+  assert.match(sql, /wallet_graph_snapshots_purge_idx/u);
+  assert.match(
+    sql,
+    /FOREIGN KEY \(mint, cluster_id\)[\s\S]*ON DELETE CASCADE/u,
+  );
   assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
   assert.doesNotMatch(sql, /private[_ ]?key|keypair|send[_ ]?transaction/iu);
   assert.doesNotMatch(sql, /DROP TABLE/iu);
