@@ -62,8 +62,8 @@ function isReservedBigIntMarker(
   value: unknown,
 ): value is Record<typeof BIGINT_JSON_MARKER, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const entries = Object.entries(value);
-  return entries.length === 1 && entries[0]?.[0] === BIGINT_JSON_MARKER;
+  const keys = Object.keys(value);
+  return keys.length === 1 && keys[0] === BIGINT_JSON_MARKER;
 }
 
 function isBigIntMarker(value: unknown): value is Record<typeof BIGINT_JSON_MARKER, string> {
@@ -86,11 +86,25 @@ function markEncodedBigIntMarkers(value: unknown): void {
 }
 
 function trustBigIntMarker<T extends Record<typeof BIGINT_JSON_MARKER, string>>(value: T): T {
-  trustedBigIntMarkers.set(value, value[BIGINT_JSON_MARKER]);
+  const original = value[BIGINT_JSON_MARKER];
+  Object.defineProperty(value, BIGINT_JSON_MARKER, {
+    value: original,
+    enumerable: true,
+    writable: false,
+    configurable: false,
+  });
+  Object.freeze(value);
+  trustedBigIntMarkers.set(value, original);
   return value;
 }
 
 function isTrustedBigIntMarker(value: object): boolean {
-  if (!isBigIntMarker(value)) return false;
-  return trustedBigIntMarkers.get(value) === value[BIGINT_JSON_MARKER];
+  const original = trustedBigIntMarkers.get(value);
+  if (original === undefined || !isReservedBigIntMarker(value)) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(value, BIGINT_JSON_MARKER);
+  if (descriptor === undefined) return false;
+  return descriptor.value === original
+    && descriptor.enumerable === true
+    && descriptor.writable === false
+    && descriptor.configurable === false;
 }

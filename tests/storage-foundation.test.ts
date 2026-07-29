@@ -74,12 +74,33 @@ void test('invalide la confiance d’un marqueur encodé s’il est ensuite mut�
   const encoded = toJsonValue({ amount: 42n }) as {
     amount: { $solTokenListenerBigInt: string };
   };
-  encoded.amount.$solTokenListenerBigInt = '9'.repeat(79);
 
   assert.throws(
-    () => stringifyJson(encoded),
-    /The \$solTokenListenerBigInt singleton object is reserved for bigint serialization\./u,
+    () => { encoded.amount.$solTokenListenerBigInt = '9'.repeat(79); },
+    TypeError,
   );
+  assert.equal(stringifyJson(encoded), '{"amount":{"$solTokenListenerBigInt":"42"}}');
+});
+
+void test('verrouille le marqueur contre un getter à état entre validation et sérialisation', () => {
+  const encoded = toJsonValue({ amount: 42n }) as {
+    amount: { $solTokenListenerBigInt: string };
+  };
+  let reads = 0;
+
+  assert.throws(
+    () => Object.defineProperty(encoded.amount, '$solTokenListenerBigInt', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        reads += 1;
+        return reads <= 3 ? '42' : '99';
+      },
+    }),
+    TypeError,
+  );
+  assert.equal(stringifyJson(encoded), '{"amount":{"$solTokenListenerBigInt":"42"}}');
+  assert.equal(reads, 0);
 });
 
 void test('ne permet pas de forger la confiance en copiant les symboles internes', () => {
