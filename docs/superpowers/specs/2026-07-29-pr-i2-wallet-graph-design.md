@@ -95,7 +95,8 @@ Un transfert direct est fort seulement si :
 3. sa destination appartient exactement au wallet acheteur ;
 4. son actif correspond exactement au quote asset de l'achat ;
 5. son émetteur peut être attribué sans ambiguïté à un wallet ;
-6. aucun compte technique connu n'est utilisé comme wallet métier.
+6. le funder est différent de l'acheteur ;
+7. aucun compte technique connu n'est utilisé comme wallet métier.
 
 Plusieurs transferts valides restent plusieurs preuves. Ils ne sont pas
 additionnés entre quote assets. Une preuve conserve :
@@ -141,6 +142,11 @@ absente ou contradictoire rend la preuve inconnue.
 L'autorité ou le propriétaire source devient le funder uniquement si son
 attribution est non ambiguë. Un multisig, un owner absent ou une contradiction
 de balances ne crée aucune arête.
+
+Un transfert entre deux comptes token appartenant au même acheteur est une
+consolidation interne. Il est compté comme transfert ignoré dans le ledger
+d'extraction, mais ne produit ni `DIRECT_QUOTE_TRANSFER`, ni couverture forte,
+ni relation.
 
 Les extensions Token-2022 non reconnues ne sont pas devinées. Une future
 version pourra ajouter leurs décodeurs officiels sans modifier le port.
@@ -261,12 +267,21 @@ Elle ne signifie pas « aucun risque ».
 
 La couverture expose :
 
-- acheteurs connus ;
-- acheteurs avec preuve forte ;
-- acheteurs avec preuve moyenne seulement ;
-- acheteurs sans preuve de financement ;
+- achats et acheteurs connus ;
+- achats et acheteurs avec preuve forte ;
+- achats et acheteurs avec preuve moyenne seulement ;
+- achats et acheteurs analysés sans preuve de financement ;
+- achats et acheteurs dont l'extraction n'a pas été exécutée ;
+- achats et acheteurs explicitement indisponibles après une ambiguïté ou une
+  donnée normalisée insuffisante ;
 - transactions et preuves analysées ;
 - méthodologie `OBSERVED_PUMPFUN_TRANSACTIONS`.
+
+Les catégories par acheteur sont mutuellement exclusives. La priorité
+conservatrice est `STRONG`, `MEDIUM_ONLY`, `NOT_PROCESSED`, `UNAVAILABLE`,
+puis `NO_EVIDENCE`. Un acheteur n'est donc classé `NO_EVIDENCE` que si tous
+ses achats canoniques ont été analysés sans preuve externe. Les compteurs par
+achat restent exposés séparément pour ne pas masquer une couverture partielle.
 
 Un résultat sans reconstruction reste `NOT_AVAILABLE`.
 
@@ -278,7 +293,8 @@ Pour un mint, le repository :
 
 1. ouvre une transaction ;
 2. acquiert le verrou advisory transactionnel du mint ;
-3. relit le lancement, les positions I1 et les preuves de financement ;
+3. relit le lancement, les positions I1, le ledger d'observation et les
+   preuves de financement ;
 4. exclut les preuves `orphaned` ;
 5. calcule une empreinte des entrées canoniques ordonnées ;
 6. construit relations, clusters et couverture ;
@@ -299,6 +315,7 @@ L'empreinte inclut au minimum :
 
 - le lancement ;
 - l'empreinte courante des positions I1 ;
+- chaque observation d'achat, y compris `NO_EVIDENCE` et `UNAVAILABLE` ;
 - chaque preuve active, sa finalité et son quote asset ;
 - la version de méthodologie.
 
@@ -325,12 +342,47 @@ un résultat valide sans cluster. Son payload reste borné :
 - nombre de clusters contenant le créateur ;
 - compteurs de finalité.
 
-Les membres et relations complets restent dans PostgreSQL et dans la route
-HTTP bornée. Ils ne sont pas copiés dans l'outbox SSE.
+Son `asOf` est le dernier curseur actif parmi le lancement, la projection I1,
+les observations d'achat et les preuves contributrices. S'il ne reste aucun
+élément I2 actif, il retombe sur le curseur I1, puis sur celui du lancement.
+
+Son identité déterministe utilise :
+
+```text
+WalletClusterDetected + mint + source/programme du lancement
+  + signature et curseur asOf
+```
+
+Un replay identique ne produit aucune nouvelle révision. Si l'empreinte ou la
+finalité change au même `asOf`, l'événement existant est upserté et le trigger
+outbox crée une révision. Si un orphaning fait reculer `asOf`, l'identité
+correspondant au nouveau curseur canonique est upsertée avec la nouvelle
+empreinte, selon le même modèle que les événements analytiques I1.
+
+Les membres complets et les relations restent dans PostgreSQL. La route HTTP
+ne renvoie que des membres bornés et des compteurs de relations ; elle ne
+renvoie pas la liste complète des relations. Ils ne sont pas copiés dans
+l'outbox SSE.
 
 ## Persistance PostgreSQL
 
 La migration `008_wallet_graph.sql` crée :
+
+### `wallet_funding_observations`
+
+Ledger canonique par achat observé :
+
+- mint, identifiant du trade et signature ;
+- curseur complet et finalité de l'achat ;
+- statut `STRONG`, `MEDIUM_ONLY`, `NO_EVIDENCE` ou `UNAVAILABLE` ;
+- compteurs de transferts inspectés, acceptés et ignorés ;
+- reason codes techniques bornés, notamment ambiguïté de propriétaire,
+  instruction reconnue invalide et auto-transfert ignoré ;
+- version de méthodologie, timestamps et `purge_after`.
+
+Le graphe compare ce ledger à tous les achats canoniques I1. Un achat sans
+ligne est `NOT_PROCESSED`, distinct d'un achat analysé sans preuve. Cela reste
+vrai lorsque le service d'observation n'est pas encore composé.
 
 ### `wallet_funding_evidence`
 
@@ -423,21 +475,30 @@ Après reconstruction :
     "knownBuyerCount": 0,
     "strongEvidenceBuyerCount": 0,
     "mediumOnlyBuyerCount": 0,
-    "unknownFundingBuyerCount": 0
-  }
+    "noEvidenceBuyerCount": 0,
+    "unavailableBuyerCount": 0,
+    "notProcessedBuyerCount": 0
+  },
+  "clusterCount": 0,
+  "clustersTruncated": false
 }
 ```
 
 Les clusters sont triés par concentration décroissante puis identifiant. Les
 membres sont triés par position positive décroissante puis wallet.
 
-Deux limites configurables et bornées sont ajoutées :
+Trois limites configurables et bornées sont ajoutées :
 
-- `API_WALLET_CLUSTER_LIMIT`, défaut 100, maximum 500 ;
-- `API_WALLET_CLUSTER_MEMBER_LIMIT`, défaut 100, maximum 500.
+- `API_WALLET_CLUSTER_LIMIT`, défaut 50, maximum 100 ;
+- `API_WALLET_CLUSTER_MEMBER_LIMIT`, défaut 50, maximum 100 ;
+- `API_WALLET_CLUSTER_TOTAL_MEMBER_LIMIT`, défaut 500, maximum 1 000.
 
-Chaque cluster expose `memberCount` et `membersTruncated` afin qu'une réponse
-bornée ne paraisse jamais complète à tort. Les `bigint` sont des chaînes
+Le budget total est partagé dans l'ordre canonique des clusters après
+application de la limite par cluster. La réponse expose `clusterCount` et
+`clustersTruncated`. Chaque cluster expose `memberCount`,
+`membersTruncated` et seulement des compteurs de relations. Une réponse bornée
+ne paraît donc jamais complète à tort, et ne peut pas contenir plus de 1 000
+membres, même avec la configuration maximale. Les `bigint` sont des chaînes
 décimales et les curseurs Solana restent des chaînes.
 
 Une ligne PostgreSQL invalide produit l'erreur de projection typée existante.
