@@ -120,6 +120,7 @@ export class SseSession {
     try {
       const revisions = await this.stream.readAfter(this.lastSequence, this.batchSize);
       if (this.isClosed()) return;
+      if (revisions.length > this.batchSize) throw new TypeError('Stream batch exceeds the configured limit');
       assertIncreasingRevisions(revisions, this.lastSequence);
       for (const revision of revisions) {
         await this.enqueue(async () => {

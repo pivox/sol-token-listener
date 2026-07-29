@@ -241,8 +241,54 @@ function requireSseAccept(value: string | readonly string[] | undefined): void {
   if (value === undefined || value.length === 0 || value.length > MAX_ACCEPT_HEADER_LENGTH) {
     throw new ApiRequestError({ code: 'NOT_ACCEPTABLE', httpStatus: 406 });
   }
-  const accepted = value.split(',').some((part) => part.split(';', 1)[0]?.trim().toLowerCase() === 'text/event-stream');
+  const accepted = acceptsSse(value);
   if (!accepted) throw new ApiRequestError({ code: 'NOT_ACCEPTABLE', httpStatus: 406 });
+}
+
+function acceptsSse(value: string): boolean {
+  const ranges = splitHeader(value, ',');
+  if (ranges === null) return false;
+  return ranges.some((range) => acceptsSseRange(range));
+}
+
+function acceptsSseRange(range: string): boolean {
+  const parts = splitHeader(range, ';');
+  if (parts === null || parts.length === 0 || parts[0]?.trim().toLowerCase() !== 'text/event-stream') return false;
+  let quality = 1;
+  let sawQuality = false;
+  for (const rawParameter of parts.slice(1)) {
+    const separator = rawParameter.indexOf('=');
+    if (separator <= 0) return false;
+    const name = rawParameter.slice(0, separator).trim().toLowerCase();
+    const parameterValue = rawParameter.slice(separator + 1).trim();
+    if (name.length === 0 || parameterValue.length === 0) return false;
+    if (name !== 'q') continue;
+    if (sawQuality || !isValidQuality(parameterValue)) return false;
+    sawQuality = true;
+    quality = Number(parameterValue);
+  }
+  return quality > 0;
+}
+
+function splitHeader(value: string, separator: ',' | ';'): readonly string[] | null {
+  const parts: string[] = [];
+  let current = '';
+  let quoted = false;
+  let escaped = false;
+  for (const character of value) {
+    if (escaped) { current += character; escaped = false; continue; }
+    if (quoted && character === '\\') { current += character; escaped = true; continue; }
+    if (character === '"') { current += character; quoted = !quoted; continue; }
+    if (!quoted && character === separator) { parts.push(current); current = ''; continue; }
+    current += character;
+  }
+  if (quoted || escaped) return null;
+  parts.push(current);
+  return parts;
+}
+
+function isValidQuality(value: string): boolean {
+  return /^(?:0(?:\.\d{1,3})?|1(?:\.0{1,3})?)$/u.test(value);
 }
 
 function scheduleTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout> {

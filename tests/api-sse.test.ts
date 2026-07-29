@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, request as httpRequest, type IncomingMessage, type OutgoingHttpHeaders, type Server, type ServerResponse } from 'node:http';
 import test from 'node:test';
 import { encodeStreamCursor } from '../src/api/cursor.js';
 import type { ApiDomainEvent } from '../src/api/contracts.js';
 import { SseSession } from '../src/interfaces/http/sse-session.js';
-import { createApiRouter } from '../src/interfaces/http/api-router.js';
+import { createApiRouter, type ApiRouter } from '../src/interfaces/http/api-router.js';
 import type { ApiEventStreamRepository, ApiStreamRevision } from '../src/ports/api-event-stream-repository.js';
 import { ApiEventStreamCursorExpiredError } from '../src/ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
@@ -21,6 +21,15 @@ class FakeResponse extends EventEmitter {
   }
   public write(chunk: string): boolean { this.chunks.push(chunk); return true; }
   public end(): this { this.ended = true; return this; }
+}
+
+class BackpressureResponse extends FakeResponse {
+  public blocked = true;
+
+  public override write(chunk: string): boolean {
+    this.chunks.push(chunk);
+    return !this.blocked;
+  }
 }
 
 class FakeTimers {
@@ -47,6 +56,60 @@ const event = (eventId: string): ApiDomainEvent => ({
   confirmationStatus: 'confirmed', blockchainTime: null, observedAt: '2026-07-29T00:00:00.000Z',
   payloadVersion: 1, payload: {} as ApiDomainEvent['payload'],
 });
+
+function makeSseRouter(stream: ApiEventStreamRepository): ApiRouter {
+  return createApiRouter({
+    projections: {} as ApiProjectionRepository,
+    now: () => 0, defaultLimit: 1, maximumLimit: 1, correlationId: () => 'test', logError: () => {},
+    stream, sse: { batchSize: 2, pollIntervalMs: 50, heartbeatIntervalMs: 50,
+      schedule: (callback, delayMs) => setTimeout(callback, delayMs), cancel: (timer) => { clearTimeout(timer as NodeJS.Timeout); } },
+  });
+}
+
+async function openServer(router: ApiRouter): Promise<Readonly<{ server: Server; port: number }>> {
+  const server = createServer((incoming, outgoing) => { void router(incoming, outgoing); });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('Expected a TCP server address');
+  return { server, port: address.port };
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => server.close((error) => {
+    if (error === undefined) resolve(); else reject(error);
+  }));
+}
+
+async function requestResult(
+  port: number,
+  method: string,
+  headers: Readonly<OutgoingHttpHeaders>,
+  body?: string,
+): Promise<Readonly<{ status: number; headers: IncomingMessage['headers']; body: string }>> {
+  return new Promise((resolve, reject) => {
+    const outgoing = httpRequest({ host: '127.0.0.1', port, path: '/api/v1/events', method, headers }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on('data', (chunk: Buffer) => { chunks.push(chunk); });
+      response.once('error', reject);
+      response.once('end', () => { resolve({ status: response.statusCode ?? 0, headers: response.headers, body: Buffer.concat(chunks).toString('utf8') }); });
+    });
+    outgoing.once('error', reject);
+    if (body !== undefined) outgoing.write(body);
+    outgoing.end();
+  });
+}
+
+async function within<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => { reject(new Error(`${label} timed out`)); }, 500);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
 
 void test('SseSession streams ascending revisions with sequence transport ids', async () => {
   const timers = new FakeTimers();
@@ -131,4 +194,232 @@ void test('SseSession exposes an expired cursor as a redacted stream error after
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.match(response.chunks.join(''), /"code":"EVENT_CURSOR_EXPIRED"/u);
   assert.equal(response.ended, true);
+});
+
+void test('events route rejects an SSE media range disabled by q=0', async () => {
+  const stream: ApiEventStreamRepository = {
+    async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+    async readAfter() { return []; },
+  };
+  const router = createApiRouter({
+    projections: {} as ApiProjectionRepository,
+    now: () => 0, defaultLimit: 1, maximumLimit: 1, correlationId: () => 'test', logError: () => {},
+    stream, sse: { batchSize: 1, pollIntervalMs: 50, heartbeatIntervalMs: 50,
+      schedule: (callback, delayMs) => setTimeout(callback, delayMs), cancel: (timer) => { clearTimeout(timer as NodeJS.Timeout); } },
+  });
+  const server = createServer((incoming, outgoing) => { void router(incoming, outgoing); });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    const response = await new Promise<IncomingMessage>((resolve, reject) => {
+      const outgoing = httpRequest({ host: '127.0.0.1', port: address.port, path: '/api/v1/events', method: 'HEAD',
+        headers: { accept: 'application/json, text/event-stream; q=0' } }, resolve);
+      outgoing.once('error', reject);
+      outgoing.end();
+    });
+    await new Promise<void>((resolve) => response.resume().once('end', resolve));
+    assert.equal(response.statusCode, 406);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => {
+      if (error === undefined) resolve(); else reject(error);
+    }));
+  }
+});
+
+void test('SseSession rejects repository batches larger than its configured limit without emitting rows', async () => {
+  const timers = new FakeTimers();
+  const response = new FakeResponse();
+  const session = new SseSession({
+    stream: {
+      async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+      async readAfter() { return [
+        { sequence: 1n, streamEventId: 'stream-1', event: event('domain-1') },
+        { sequence: 2n, streamEventId: 'stream-2', event: event('domain-2') },
+      ]; },
+    },
+    response: response as unknown as ServerResponse, startAfter: 0n, batchSize: 1,
+    pollIntervalMs: 10, heartbeatIntervalMs: 100, schedule: timers.schedule, cancel: timers.cancel,
+    onClosed: () => undefined,
+  });
+  session.start();
+  timers.runOne();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const output = response.chunks.join('');
+  assert.doesNotMatch(output, /id: /u);
+  assert.match(output, /"code":"DEPENDENCY_UNAVAILABLE"/u);
+  assert.equal(response.ended, true);
+});
+
+void test('SseSession waits for drain without overlapping polls and closes idempotently', async () => {
+  const timers = new FakeTimers();
+  const response = new BackpressureResponse();
+  let reads = 0;
+  let closed = 0;
+  const session = new SseSession({
+    stream: {
+      async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+      async readAfter() { reads += 1; return [{ sequence: 1n, streamEventId: 'stream-1', event: event('event-1') }]; },
+    },
+    response: response as unknown as ServerResponse, startAfter: 0n, batchSize: 1,
+    pollIntervalMs: 10, heartbeatIntervalMs: 100, schedule: timers.schedule, cancel: timers.cancel,
+    onClosed: () => { closed += 1; },
+  });
+  session.start();
+  timers.runOne();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(reads, 1);
+  timers.runOne();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(reads, 1);
+  response.blocked = false;
+  response.emit('drain');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const firstClose = session.close('SERVER');
+  const secondClose = session.close('SERVER');
+  assert.equal(firstClose, secondClose);
+  await firstClose;
+  assert.equal(closed, 1);
+  assert.equal((response.chunks.join('').match(/event: server_shutdown/gu) ?? []).length, 1);
+});
+
+void test('events route validates cursor, negotiation, body, CORS, HEAD, and OPTIONS over node:http', async () => {
+  const resolved: bigint[] = [];
+  const stream: ApiEventStreamRepository = {
+    async highWaterMark() { return 7n; },
+    async resolve(sequence) {
+      resolved.push(sequence);
+      if (sequence === 8n) return { status: 'FUTURE' as const };
+      if (sequence === 9n) return { status: 'EXPIRED' as const };
+      return { status: 'CURRENT' as const, sequence };
+    },
+    async readAfter() { return []; },
+  };
+  const { server, port } = await openServer(makeSseRouter(stream));
+  try {
+    const accept = { accept: 'text/event-stream' };
+    const invalidCases: readonly [string, OutgoingHttpHeaders, number][] = [
+      ['missing accept', {}, 406],
+      ['disabled accept', { accept: 'text/event-stream; Q=0' }, 406],
+      ['invalid q', { accept: 'text/event-stream; q=1.1' }, 406],
+      ['duplicate q', { accept: 'text/event-stream; q=1; Q=0.5' }, 406],
+      ['deceptive token', { accept: 'text/event-streaming' }, 406],
+      ['empty cursor', { ...accept, 'last-event-id': '' }, 400],
+      ['malformed cursor', { ...accept, 'last-event-id': 'not-a-cursor' }, 400],
+      ['oversized cursor', { ...accept, 'last-event-id': 'a'.repeat(2_049) }, 400],
+      ['duplicate cursor', { ...accept, 'last-event-id': [encodeStreamCursor(1n), encodeStreamCursor(2n)] }, 400],
+      ['future cursor', { ...accept, 'last-event-id': encodeStreamCursor(8n) }, 400],
+      ['expired cursor', { ...accept, 'last-event-id': encodeStreamCursor(9n) }, 409],
+    ];
+    for (const [, headers, status] of invalidCases) {
+      const result = await requestResult(port, 'HEAD', headers);
+      assert.equal(result.status, status);
+      assert.match(result.body, /^$/u);
+      assert.notEqual(result.headers['content-type'], 'text/event-stream; charset=utf-8');
+    }
+    const head = await requestResult(port, 'HEAD', { accept: 'application/json, text/event-stream; charset=utf-8; q=0.5' });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers['content-type'], 'text/event-stream; charset=utf-8');
+    assert.equal(head.headers['access-control-allow-origin'], '*');
+    assert.equal(head.body, '');
+    const options = await requestResult(port, 'OPTIONS', {});
+    assert.equal(options.status, 204);
+    assert.equal(options.headers['access-control-allow-origin'], '*');
+    const body = await requestResult(port, 'GET', { ...accept, 'content-length': '10' }, 'unexpected');
+    assert.equal(body.status, 405);
+    assert.match(body.body, /METHOD_NOT_ALLOWED/u);
+    const current = await requestResult(port, 'HEAD', { ...accept, 'last-event-id': encodeStreamCursor(1n) });
+    assert.equal(current.status, 200);
+    assert.deepEqual(resolved, [8n, 9n, 1n]);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+void test('events GET frames high-water events over node:http and cleans up an aborted client', async () => {
+  let highWaterCalls = 0;
+  let closeSession: (() => void) | undefined;
+  const closed = new Promise<void>((resolve) => { closeSession = resolve; });
+  const stream: ApiEventStreamRepository = {
+    async highWaterMark() { highWaterCalls += 1; return 5n; },
+    async resolve() { throw new Error('an omitted cursor must use the high-water mark'); },
+    async readAfter(after) {
+      assert.equal(after, 5n);
+      return [
+        { sequence: 6n, streamEventId: 'stream-6', event: event('stable-event') },
+        { sequence: 7n, streamEventId: 'stream-7', event: event('stable-event') },
+      ];
+    },
+  };
+  const router = createApiRouter({
+    projections: {} as ApiProjectionRepository,
+    now: () => 0, defaultLimit: 1, maximumLimit: 1, correlationId: () => 'test', logError: () => {},
+    stream, sse: {
+      batchSize: 2, pollIntervalMs: 50, heartbeatIntervalMs: 50,
+      schedule: (callback, delayMs) => setTimeout(callback, delayMs),
+      cancel: (timer) => { clearTimeout(timer as NodeJS.Timeout); },
+      createSession: (options) => new SseSession({ ...options, onClosed: () => { closeSession?.(); } }),
+    },
+  });
+  const { server, port } = await openServer(router);
+  try {
+    const output = await within(new Promise<string>((resolve, reject) => {
+      const outgoing = httpRequest({ host: '127.0.0.1', port, path: '/api/v1/events', method: 'GET',
+        headers: { accept: 'text/event-stream' } }, (response) => {
+        let text = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk: string) => {
+          text += chunk;
+          if (text.includes(`id: ${encodeStreamCursor(6n)}`) && text.includes(`id: ${encodeStreamCursor(7n)}`)) {
+            response.destroy();
+            outgoing.destroy();
+            resolve(text);
+          }
+        });
+        response.once('error', reject);
+      });
+      outgoing.once('error', reject);
+      outgoing.end();
+    }), 'SSE event frames');
+    assert.equal(highWaterCalls, 1);
+    assert.match(output, new RegExp(`id: ${encodeStreamCursor(6n)}\\nevent: TokenLaunchDetected`, 'u'));
+    assert.match(output, new RegExp(`id: ${encodeStreamCursor(7n)}\\nevent: TokenLaunchDetected`, 'u'));
+    assert.equal((output.match(/"eventId":"stable-event"/gu) ?? []).length, 2);
+    await within(closed, 'aborted SSE cleanup');
+  } finally {
+    await closeServer(server);
+  }
+});
+
+void test('an SSE session sends its shutdown frame and ends a real HTTP response', async () => {
+  let resolveSession: (session: SseSession | null) => void = () => {};
+  const sessionStarted = new Promise<SseSession | null>((resolve) => { resolveSession = resolve; });
+  const stream: ApiEventStreamRepository = {
+    async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+    async readAfter() { return []; },
+  };
+  const router = makeSseRouter(stream);
+  const server = createServer((incoming, outgoing) => { void router(incoming, outgoing).then(resolveSession); });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    const body = new Promise<string>((resolve, reject) => {
+      const outgoing = httpRequest({ host: '127.0.0.1', port: address.port, path: '/api/v1/events', method: 'GET',
+        headers: { accept: 'text/event-stream' } }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => { chunks.push(chunk); });
+        response.once('error', reject);
+        response.once('end', () => { resolve(Buffer.concat(chunks).toString('utf8')); });
+      });
+      outgoing.once('error', reject);
+      outgoing.end();
+    });
+    const session = await within(sessionStarted, 'SSE session startup');
+    if (session === null) throw new Error('Expected an SSE session');
+    await within(session.close('SERVER'), 'SSE session shutdown');
+    assert.equal(await within(body, 'SSE shutdown response'), 'event: server_shutdown\ndata: {"apiVersion":"v1"}\n\n');
+  } finally {
+    await closeServer(server);
+  }
 });
