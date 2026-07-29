@@ -16,7 +16,15 @@ export class PumpSwapBorshReader {
   public readU16(): bigint {
     return BigInt(this.view(2).getUint16(0, true));
   }
+  public readU32(): bigint {
+    return BigInt(this.view(4).getUint32(0, true));
+  }
   public readU64(): bigint { return this.view(8).getBigUint64(0, true); }
+  public readU128(): bigint {
+    const low = this.view(16).getBigUint64(0, true);
+    const high = this.viewAt(16, 8).getBigUint64(0, true);
+    return (high << 64n) | low;
+  }
   public readI64(): bigint { return this.view(8).getBigInt64(0, true); }
   public readI128(): bigint {
     const low = this.view(16).getBigUint64(0, true);
