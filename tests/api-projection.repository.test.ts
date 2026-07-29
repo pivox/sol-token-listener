@@ -232,8 +232,10 @@ void test('uses the latest non-orphaned qualification event and rejects malforme
     evaluatedAt: detectedAt.toISOString(),
   });
   assert.match(database.calls[0]?.text ?? '', /confirmation_status <> 'orphaned'/u);
-  assert.match(database.calls[0]?.text ?? '', /ORDER BY slot DESC/u);
-  assert.match(database.calls[0]?.text ?? '', /COALESCE\(inner_instruction_index, -1\) DESC, event_id DESC/u);
+  assert.match(
+    database.calls[0]?.text ?? '',
+    /ORDER BY\s+slot DESC,\s*transaction_index DESC,\s*instruction_index DESC,\s*COALESCE\(inner_instruction_index, -1\) DESC,\s*event_id DESC/u,
+  );
 
   const malformed = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: '{bad json' }]));
   await assert.rejects(malformed.getLaunchRisk('mint-a'), ApiProjectionDataError);
