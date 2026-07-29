@@ -95,6 +95,7 @@ void test('exports the V1 API version and stable public error codes', () => {
   assert.deepEqual(API_ERROR_CODES, [
     'ROUTE_NOT_FOUND',
     'METHOD_NOT_ALLOWED',
+    'NOT_ACCEPTABLE',
     'INVALID_MINT',
     'INVALID_LIMIT',
     'INVALID_CURSOR',

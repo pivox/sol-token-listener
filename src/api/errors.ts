@@ -1,6 +1,7 @@
 export const API_ERROR_CODES = [
   'ROUTE_NOT_FOUND',
   'METHOD_NOT_ALLOWED',
+  'NOT_ACCEPTABLE',
   'INVALID_MINT',
   'INVALID_LIMIT',
   'INVALID_CURSOR',
@@ -15,6 +16,7 @@ export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
 export const API_ERROR_MESSAGES: Readonly<Record<ApiErrorCode, string>> = {
   ROUTE_NOT_FOUND: 'The requested route was not found',
   METHOD_NOT_ALLOWED: 'The HTTP method is not allowed for this route',
+  NOT_ACCEPTABLE: 'The requested representation is not acceptable',
   INVALID_MINT: 'The mint is invalid',
   INVALID_LIMIT: 'The limit is invalid',
   INVALID_CURSOR: 'The cursor is invalid',

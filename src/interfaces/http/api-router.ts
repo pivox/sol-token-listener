@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import bs58 from 'bs58';
-import { decodeLaunchCursor, decodePaperPositionCursor, decodeTimelineCursor } from '../../api/cursor.js';
+import { decodeLaunchCursor, decodePaperPositionCursor, decodeStreamCursor, decodeTimelineCursor, MAX_CURSOR_ENCODED_LENGTH, MAX_CURSOR_SEQUENCE } from '../../api/cursor.js';
 import { ApiError } from '../../api/errors.js';
 import type { ApiHealth, ApiLaunchDetail } from '../../api/contracts.js';
 import {
@@ -8,11 +8,14 @@ import {
   type ApiProjectionRepository,
   type PageRequest,
 } from '../../ports/api-projection-repository.js';
+import { ApiEventStreamCursorExpiredError, type ApiEventStreamRepository } from '../../ports/api-event-stream-repository.js';
 import { failure, success, writeJson } from './api-response.js';
+import { SSE_HEADERS, SseSession, type SseCancel, type SseSchedule, type SseTimer } from './sse-session.js';
 
 const ALLOW = 'GET, HEAD, OPTIONS';
 const MIN_MINT_BASE58_LENGTH = 32;
 const MAX_MINT_BASE58_LENGTH = 44;
+const MAX_ACCEPT_HEADER_LENGTH = 4_096;
 
 type LogContext = Readonly<{
   route: string;
@@ -27,9 +30,20 @@ export interface ApiRouterDependencies {
   readonly maximumLimit: number;
   readonly correlationId: () => string;
   readonly logError: (context: LogContext, error: unknown) => void;
+  readonly stream?: ApiEventStreamRepository;
+  readonly sse?: ApiRouterSseOptions;
 }
 
-export type ApiRouter = (request: IncomingMessage, response: ServerResponse) => Promise<void>;
+export interface ApiRouterSseOptions {
+  readonly batchSize: number;
+  readonly pollIntervalMs: number;
+  readonly heartbeatIntervalMs: number;
+  readonly schedule?: SseSchedule;
+  readonly cancel?: SseCancel;
+  readonly createSession?: (options: ConstructorParameters<typeof SseSession>[0]) => SseSession;
+}
+
+export type ApiRouter = (request: IncomingMessage, response: ServerResponse) => Promise<SseSession | null>;
 
 type Route =
   | Readonly<{ name: 'launches' }>
@@ -39,7 +53,8 @@ type Route =
   | Readonly<{ name: 'social'; mint: string }>
   | Readonly<{ name: 'holders'; mint: string }>
   | Readonly<{ name: 'paperPositions' }>
-  | Readonly<{ name: 'health' }>;
+  | Readonly<{ name: 'health' }>
+  | Readonly<{ name: 'eventStream' }>;
 
 type Query = ReadonlyMap<string, string>;
 
@@ -48,7 +63,7 @@ class ApiRequestError extends ApiError {}
 export function createApiRouter(deps: ApiRouterDependencies): ApiRouter {
   assertLimits(deps.defaultLimit, deps.maximumLimit);
 
-  return async (request, response): Promise<void> => {
+  return async (request, response): Promise<SseSession | null> => {
     const method = request.method ?? 'GET';
     let routeLabel = 'unknown';
     try {
@@ -59,32 +74,35 @@ export function createApiRouter(deps: ApiRouterDependencies): ApiRouter {
 
       if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
         writeFailure(response, new ApiError({ code: 'METHOD_NOT_ALLOWED', httpStatus: 405 }));
-        return;
+        return null;
       }
       if (hasRequestBody(request)) {
         writeFailure(response, new ApiError({ code: 'METHOD_NOT_ALLOWED', httpStatus: 405 }), headOnly);
-        return;
+        return null;
       }
       if (method === 'OPTIONS') {
         writeOptions(response);
-        return;
+        return null;
       }
 
       const query = parseQuery(parsed.query);
+      if (route.name === 'eventStream') return await dispatchEventStream(request, response, query, headOnly, deps);
       const result = await dispatch(route, query, deps);
       writeJson(response, 200, success(result.data, deps.now(), result.nextCursor), headOnly);
+      return null;
     } catch (error) {
       if (error instanceof ApiRequestError || (
         error instanceof ApiError && error.code === 'DEPENDENCY_UNAVAILABLE'
       )) {
         writeFailure(response, error, method === 'HEAD');
-        return;
+        return null;
       }
       const correlationId = safeCorrelationId(deps.correlationId);
       safeLog(deps.logError, { route: routeLabel, method: safeMethod(method), correlationId }, error);
       writeFailure(response, new ApiError({
         code: 'INTERNAL_ERROR', httpStatus: 500, correlationId,
       }), method === 'HEAD');
+      return null;
     }
   };
 }
@@ -139,7 +157,100 @@ async function dispatch(
     case 'health':
       requireNoQuery(query);
       return healthResponse(await deps.projections.getHealth());
+    case 'eventStream':
+      throw new ApiRequestError({ code: 'ROUTE_NOT_FOUND', httpStatus: 404 });
   }
+}
+
+async function dispatchEventStream(
+  request: IncomingMessage,
+  response: ServerResponse,
+  query: Query,
+  headOnly: boolean,
+  deps: ApiRouterDependencies,
+): Promise<SseSession | null> {
+  requireNoQuery(query);
+  requireSseAccept(request.headers.accept);
+  const stream = deps.stream;
+  const settings = deps.sse;
+  if (stream === undefined || settings === undefined) {
+    throw new ApiError({ code: 'DEPENDENCY_UNAVAILABLE', httpStatus: 503 });
+  }
+  const startAfter = await resolveStreamStart(stream, request.headers['last-event-id']);
+  if (headOnly) {
+    response.writeHead(200, SSE_HEADERS);
+    response.end();
+    return null;
+  }
+  const sessionOptions = {
+    stream,
+    response,
+    startAfter,
+    batchSize: settings.batchSize,
+    pollIntervalMs: settings.pollIntervalMs,
+    heartbeatIntervalMs: settings.heartbeatIntervalMs,
+    schedule: settings.schedule ?? scheduleTimeout,
+    cancel: settings.cancel ?? cancelTimeout,
+    onClosed: () => undefined,
+  } as const;
+  const session = settings.createSession?.(sessionOptions) ?? new SseSession(sessionOptions);
+  session.start();
+  return session;
+}
+
+async function resolveStreamStart(
+  stream: ApiEventStreamRepository,
+  header: string | readonly string[] | undefined,
+): Promise<bigint> {
+  if (header !== undefined && typeof header !== 'string') {
+    throw new ApiRequestError({ code: 'INVALID_CURSOR', httpStatus: 400 });
+  }
+  try {
+    if (header === undefined) return assertStreamSequence(await stream.highWaterMark());
+    if (header.length === 0 || header.length > MAX_CURSOR_ENCODED_LENGTH || header.includes(',')) {
+      throw new ApiRequestError({ code: 'INVALID_CURSOR', httpStatus: 400 });
+    }
+    let sequence: bigint;
+    try {
+      sequence = decodeStreamCursor(header);
+    } catch {
+      throw new ApiRequestError({ code: 'INVALID_CURSOR', httpStatus: 400 });
+    }
+    const resolution = await stream.resolve(sequence);
+    if (resolution.status === 'EXPIRED') throw new ApiRequestError({ code: 'EVENT_CURSOR_EXPIRED', httpStatus: 409 });
+    if (resolution.status === 'FUTURE') throw new ApiRequestError({ code: 'INVALID_CURSOR', httpStatus: 400 });
+    return assertStreamSequence(resolution.sequence);
+  } catch (error) {
+    if (error instanceof ApiRequestError) throw error;
+    if (error instanceof ApiEventStreamCursorExpiredError) {
+      throw new ApiRequestError({ code: 'EVENT_CURSOR_EXPIRED', httpStatus: 409 });
+    }
+    throw new ApiError({ code: 'DEPENDENCY_UNAVAILABLE', httpStatus: 503 });
+  }
+}
+
+function assertStreamSequence(sequence: bigint): bigint {
+  if (sequence < 0n || sequence > MAX_CURSOR_SEQUENCE) throw new TypeError('Invalid stream high-water mark');
+  return sequence;
+}
+
+function requireSseAccept(value: string | readonly string[] | undefined): void {
+  if (value !== undefined && typeof value !== 'string') {
+    throw new ApiRequestError({ code: 'NOT_ACCEPTABLE', httpStatus: 406 });
+  }
+  if (value === undefined || value.length === 0 || value.length > MAX_ACCEPT_HEADER_LENGTH) {
+    throw new ApiRequestError({ code: 'NOT_ACCEPTABLE', httpStatus: 406 });
+  }
+  const accepted = value.split(',').some((part) => part.split(';', 1)[0]?.trim().toLowerCase() === 'text/event-stream');
+  if (!accepted) throw new ApiRequestError({ code: 'NOT_ACCEPTABLE', httpStatus: 406 });
+}
+
+function scheduleTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout> {
+  return setTimeout(callback, delayMs);
+}
+
+function cancelTimeout(handle: SseTimer): void {
+  clearTimeout(handle);
 }
 
 async function requireLaunch(repository: ApiProjectionRepository, mint: string): Promise<ApiLaunchDetail> {
@@ -187,6 +298,7 @@ function matchRoute(pathname: string): Route {
   if (pathname === '/api/v1/launches') return { name: 'launches' };
   if (pathname === '/api/v1/paper-positions') return { name: 'paperPositions' };
   if (pathname === '/api/v1/health') return { name: 'health' };
+  if (pathname === '/api/v1/events') return { name: 'eventStream' };
   const match = /^\/api\/v1\/launches\/([^/]+)(?:\/(events|risk|social|holders))?$/u.exec(pathname);
   if (match === null) throw new ApiRequestError({ code: 'ROUTE_NOT_FOUND', httpStatus: 404 });
   const mint = parseMint(match[1]);
