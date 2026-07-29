@@ -1,0 +1,141 @@
+CREATE TABLE IF NOT EXISTS api_event_stream (
+  sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  stream_event_id TEXT UNIQUE NOT NULL,
+  domain_event_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  mint TEXT NOT NULL,
+  confirmation_status TEXT NOT NULL CHECK (
+    confirmation_status IN ('processed', 'confirmed', 'finalized', 'orphaned')
+  ),
+  payload_version INTEGER NOT NULL CHECK (payload_version > 0),
+  event JSONB NOT NULL,
+  emitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  purge_after TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS api_event_stream_mint_sequence_idx
+  ON api_event_stream(mint, sequence);
+CREATE INDEX IF NOT EXISTS api_event_stream_purge_after_idx
+  ON api_event_stream(purge_after);
+
+CREATE OR REPLACE FUNCTION enqueue_api_domain_event_revision()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY INVOKER
+AS $$
+DECLARE
+  public_event JSONB;
+BEGIN
+  IF TG_OP = 'UPDATE'
+    AND NEW.event_id IS NOT DISTINCT FROM OLD.event_id
+    AND NEW.type IS NOT DISTINCT FROM OLD.type
+    AND NEW.mint IS NOT DISTINCT FROM OLD.mint
+    AND NEW.source IS NOT DISTINCT FROM OLD.source
+    AND NEW.program IS NOT DISTINCT FROM OLD.program
+    AND NEW.signature IS NOT DISTINCT FROM OLD.signature
+    AND NEW.slot IS NOT DISTINCT FROM OLD.slot
+    AND NEW.transaction_index IS NOT DISTINCT FROM OLD.transaction_index
+    AND NEW.instruction_index IS NOT DISTINCT FROM OLD.instruction_index
+    AND NEW.inner_instruction_index IS NOT DISTINCT FROM OLD.inner_instruction_index
+    AND NEW.confirmation_status IS NOT DISTINCT FROM OLD.confirmation_status
+    AND NEW.blockchain_time IS NOT DISTINCT FROM OLD.blockchain_time
+    AND NEW.observed_at IS NOT DISTINCT FROM OLD.observed_at
+    AND NEW.payload_version IS NOT DISTINCT FROM OLD.payload_version
+    AND NEW.payload IS NOT DISTINCT FROM OLD.payload
+  THEN
+    RETURN NEW;
+  END IF;
+
+  public_event := jsonb_build_object(
+    'eventId', NEW.event_id,
+    'type', NEW.type,
+    'mint', NEW.mint,
+    'source', NEW.source,
+    'program', NEW.program,
+    'signature', NEW.signature,
+    'slot', NEW.slot::text,
+    'transactionIndex', NEW.transaction_index,
+    'instructionIndex', NEW.instruction_index,
+    'innerInstructionIndex', NEW.inner_instruction_index,
+    'confirmationStatus', NEW.confirmation_status,
+    'blockchainTime', to_jsonb(to_char(
+      NEW.blockchain_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+    )),
+    'observedAt', to_jsonb(to_char(
+      NEW.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+    )),
+    'payloadVersion', NEW.payload_version,
+    'payload', NEW.payload
+  );
+
+  INSERT INTO api_event_stream (
+    stream_event_id, domain_event_id, event_type, mint, confirmation_status,
+    payload_version, event, purge_after
+  ) VALUES (
+    NEW.event_id || ':' || NEW.confirmation_status || ':' || NEW.payload_version::text
+      || ':' || md5(public_event::text),
+    NEW.event_id,
+    NEW.type,
+    NEW.mint,
+    NEW.confirmation_status,
+    NEW.payload_version,
+    public_event,
+    NOW() + INTERVAL '4 hours'
+  ) ON CONFLICT (stream_event_id) DO NOTHING;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS enqueue_api_domain_event_revision_trigger ON domain_events;
+CREATE TRIGGER enqueue_api_domain_event_revision_trigger
+AFTER INSERT OR UPDATE ON domain_events
+FOR EACH ROW EXECUTE FUNCTION enqueue_api_domain_event_revision();
+
+INSERT INTO api_event_stream (
+  stream_event_id, domain_event_id, event_type, mint, confirmation_status,
+  payload_version, event, purge_after
+)
+SELECT
+  event_id || ':' || confirmation_status || ':' || payload_version::text
+    || ':' || md5(public_event::text),
+  event_id,
+  type,
+  mint,
+  confirmation_status,
+  payload_version,
+  public_event,
+  NOW() + INTERVAL '4 hours'
+FROM (
+  SELECT
+    event_id,
+    type,
+    mint,
+    confirmation_status,
+    payload_version,
+    jsonb_build_object(
+      'eventId', event_id,
+      'type', type,
+      'mint', mint,
+      'source', source,
+      'program', program,
+      'signature', signature,
+      'slot', slot::text,
+      'transactionIndex', transaction_index,
+      'instructionIndex', instruction_index,
+      'innerInstructionIndex', inner_instruction_index,
+      'confirmationStatus', confirmation_status,
+      'blockchainTime', to_jsonb(to_char(
+        blockchain_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+      )),
+      'observedAt', to_jsonb(to_char(
+        observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+      )),
+      'payloadVersion', payload_version,
+      'payload', payload
+    ) AS public_event
+  FROM domain_events
+  WHERE purge_after IS NULL OR purge_after > NOW()
+  ORDER BY created_at, event_id
+) AS retained_domain_events
+ON CONFLICT (stream_event_id) DO NOTHING;
