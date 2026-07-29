@@ -82,6 +82,10 @@ void test('first orphaned observation persists raw proof only', async () => {
   assert.equal(result.activations.length, 0);
   assert.equal(client.calls.some((call) => call.text.includes('INSERT INTO domain_events')), false);
   assert.equal(client.calls.filter((call) => call.text.includes('INSERT INTO raw_chain_events')).length, 2);
+  assert.equal(
+    client.calls.some((call) => call.text.includes('UPDATE token_launches')),
+    false,
+  );
 });
 
 void test('replay enriches finality but rejects payload contradiction', async () => {
@@ -140,6 +144,35 @@ void test('finalized observations cannot become orphaned', async () => {
     ConfirmationStatusConflictError,
   );
   assert.equal(client.calls.at(-1)?.text, 'ROLLBACK');
+});
+
+void test('confirmed orphaning retracts dependent market projections', async () => {
+  const fixture = matched('orphaned');
+  const client = new InstrumentedClient();
+  for (const raw of fixture.rawEvents) {
+    client.rawRows.set(raw.id, {
+      confirmation_status: 'confirmed',
+      payload: toJsonValue(raw.payload),
+    });
+  }
+  const result = await repositoryWith(client).record({
+    rawEvents: fixture.rawEvents,
+    matches: [fixture.match],
+    reserveSnapshots: [],
+    trades: [],
+  });
+  assert.deepEqual(result, { migrations: [], activations: [] });
+  assert.equal(
+    client.calls.some((call) =>
+      call.text.includes("pool_state='retracted'")),
+    true,
+  );
+  assert.equal(
+    client.calls.some((call) =>
+      call.text.includes('UPDATE state_transitions SET terminal_at')),
+    true,
+  );
+  assert.equal(client.calls.at(-1)?.text, 'COMMIT');
 });
 
 void test('intermediate repository errors rollback the whole batch', async () => {

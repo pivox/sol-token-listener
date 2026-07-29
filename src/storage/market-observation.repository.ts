@@ -75,7 +75,10 @@ implements MarketObservationRepository {
       for (const match of batch.matches) {
         const migrationRaw = findRaw(batch.rawEvents, match.migrationEvent.id);
         const migrationWrite = await this.writeRaw(client, migrationRaw);
-        if (migrationWrite.becameOrphaned) {
+        if (
+          migrationWrite.becameOrphaned
+          && !migrationWrite.firstObservation
+        ) {
           await this.retractMigration(client, match.migrationEvent);
         } else if (match.migrationEvent.confirmationStatus !== 'orphaned') {
           await this.writeMigration(client, migrationRaw.id, match.migrationEvent);
@@ -84,7 +87,10 @@ implements MarketObservationRepository {
         if (match.activationEvent !== null) {
           const activationRaw = findRaw(batch.rawEvents, match.activationEvent.id);
           const activationWrite = await this.writeRaw(client, activationRaw);
-          if (activationWrite.becameOrphaned) {
+          if (
+            activationWrite.becameOrphaned
+            && !activationWrite.firstObservation
+          ) {
             await this.retractActivation(client, match.activationEvent);
           } else if (match.activationEvent.confirmationStatus !== 'orphaned') {
             await this.writeActivation(client, activationRaw.id, match.activationEvent);
@@ -98,7 +104,7 @@ implements MarketObservationRepository {
       for (const trade of batch.trades) {
         const raw = findRaw(batch.rawEvents, trade.id);
         const write = await this.writeRaw(client, raw);
-        if (write.becameOrphaned) {
+        if (write.becameOrphaned && !write.firstObservation) {
           await this.retractTrade(client, trade);
         } else if (trade.confirmationStatus !== 'orphaned') {
           await this.writeTrade(client, trade);
@@ -336,6 +342,17 @@ implements MarketObservationRepository {
     event: MigrationObservedEventV1,
   ): Promise<void> {
     const times = this.retentionTimes();
+    const finalizedDependents = await client.query(
+      `SELECT event_id FROM domain_events
+       WHERE event_id IN (
+         SELECT activation_event_id FROM market_pools WHERE migration_id=$1
+       ) AND confirmation_status='finalized'
+       FOR UPDATE`,
+      [event.id],
+    );
+    if (finalizedDependents.rows.length > 0) {
+      reconcileConfirmationStatus('finalized', 'orphaned');
+    }
     await client.query(
       `UPDATE migrations SET confirmation_status='orphaned',terminal_at=$2,purge_after=$3
        WHERE migration_id=$1`,
@@ -360,11 +377,29 @@ implements MarketObservationRepository {
        )`,
       [event.id, times.terminalAt, times.purgeAfter],
     );
+    await client.query(
+      `UPDATE domain_events SET confirmation_status='orphaned',
+       terminal_at=$2,purge_after=$3
+       WHERE event_id IN (
+         SELECT activation_event_id FROM market_pools WHERE migration_id=$1
+       )`,
+      [event.id, times.terminalAt, times.purgeAfter],
+    );
+    await client.query(
+      `UPDATE state_transitions SET terminal_at=$2,purge_after=$3
+       WHERE event_id IN (
+         SELECT activation_event_id FROM market_pools WHERE migration_id=$1
+       )`,
+      [event.id, times.terminalAt, times.purgeAfter],
+    );
     await this.retractDomainAndTransition(client, event.id, times);
     await client.query(
-      `UPDATE token_launches SET current_state='BONDING_CURVE_COMPLETE',updated_at=$2
-       WHERE mint=$1 AND current_state IN ('MIGRATION_PENDING','PUMPSWAP_ACTIVE')`,
-      [event.mint, times.terminalAt],
+      `UPDATE token_launches SET current_state=COALESCE((
+         SELECT previous_state FROM state_transitions
+         WHERE event_id=$1 LIMIT 1
+       ),'BONDING_CURVE_COMPLETE'),updated_at=$3
+       WHERE mint=$2 AND current_state IN ('MIGRATION_PENDING','PUMPSWAP_ACTIVE')`,
+      [event.id, event.mint, times.terminalAt],
     );
   }
 
