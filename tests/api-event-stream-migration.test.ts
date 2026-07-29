@@ -268,6 +268,17 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       )).rows[0]?.last_sequence,
       checkpointBeforePurge.rows[0]?.last_sequence,
     );
+    await pool.query(`UPDATE domain_events
+      SET terminal_at = COALESCE(terminal_at, NOW()),
+          purge_after = NOW() - INTERVAL '1 second'`);
+    await pool.query(migrationSql);
+    assert.equal((await pool.query('SELECT 1 FROM api_event_stream')).rowCount, 0);
+    assert.equal(
+      (await pool.query<{ readonly last_sequence: string }>(
+        'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
+      )).rows[0]?.last_sequence,
+      checkpointBeforePurge.rows[0]?.last_sequence,
+    );
 
     const shadowClient = await pool.connect();
     try {
@@ -284,6 +295,9 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
         confirmation_status, observed_at, payload_version, payload
       ) VALUES ('schema-target-live', 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live',
         'schema-target-signature', 45, 1, 2, 'processed', NOW(), 1, '{}'::jsonb)`);
+      await shadowClient.query(`UPDATE domain_events
+        SET confirmation_status = 'confirmed'
+        WHERE event_id = 'schema-target-live'`);
       const persistentCount = await shadowClient.query<{ readonly count: string }>(
         `SELECT count(*) AS count FROM ${quoteIdentifier(schema)}.api_event_stream
          WHERE domain_event_id = 'schema-target-live'`,
@@ -291,17 +305,28 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       const temporaryCount = await shadowClient.query<{ readonly count: string }>(
         "SELECT count(*) AS count FROM api_event_stream WHERE domain_event_id = 'schema-target-live'",
       );
-      const persistentCheckpoint = await shadowClient.query<{ readonly last_sequence: string }>(
-        `SELECT last_sequence FROM ${quoteIdentifier(schema)}.api_event_stream_state WHERE id = 1`,
+      const persistentCheckpoint = await shadowClient.query<{
+        readonly last_sequence: string;
+        readonly visible_max: string;
+      }>(
+        `SELECT state.last_sequence, MAX(stream.sequence) AS visible_max
+         FROM ${quoteIdentifier(schema)}.api_event_stream_state state
+         JOIN ${quoteIdentifier(schema)}.api_event_stream stream ON TRUE
+         WHERE state.id = 1
+         GROUP BY state.id, state.last_sequence`,
       );
       const temporaryCheckpoint = await shadowClient.query<{ readonly last_sequence: string }>(
         'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
       );
-      assert.equal(persistentCount.rows[0]?.count, '1');
+      assert.equal(persistentCount.rows[0]?.count, '2');
       assert.equal(temporaryCount.rows[0]?.count, '0');
       assert.ok(
         BigInt(persistentCheckpoint.rows[0]?.last_sequence ?? '0')
           > BigInt(checkpointBeforePurge.rows[0]?.last_sequence ?? '0'),
+      );
+      assert.equal(
+        persistentCheckpoint.rows[0]?.last_sequence,
+        persistentCheckpoint.rows[0]?.visible_max,
       );
       assert.equal(temporaryCheckpoint.rows[0]?.last_sequence, '0');
     } finally {
