@@ -2,11 +2,17 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import bs58 from 'bs58';
 import { decodeLaunchCursor, decodePaperPositionCursor, decodeTimelineCursor } from '../../api/cursor.js';
 import { ApiError } from '../../api/errors.js';
-import type { ApiLaunchDetail } from '../../api/contracts.js';
-import type { ApiProjectionRepository, PageRequest } from '../../ports/api-projection-repository.js';
+import type { ApiHealth, ApiLaunchDetail } from '../../api/contracts.js';
+import {
+  MAX_API_PAGE_LIMIT,
+  type ApiProjectionRepository,
+  type PageRequest,
+} from '../../ports/api-projection-repository.js';
 import { failure, success, writeJson } from './api-response.js';
 
 const ALLOW = 'GET, HEAD, OPTIONS';
+const MIN_MINT_BASE58_LENGTH = 32;
+const MAX_MINT_BASE58_LENGTH = 44;
 
 type LogContext = Readonly<{
   route: string;
@@ -132,7 +138,7 @@ async function dispatch(
     }
     case 'health':
       requireNoQuery(query);
-      return { data: await deps.projections.getHealth(), nextCursor: null };
+      return healthResponse(await deps.projections.getHealth());
   }
 }
 
@@ -204,7 +210,8 @@ function parseMint(rawMint: string | undefined): string {
   }
   if (
     rawMint !== mint
-    || mint.length === 0
+    || mint.length < MIN_MINT_BASE58_LENGTH
+    || mint.length > MAX_MINT_BASE58_LENGTH
     || mint.includes('/')
     || !/^[1-9A-HJ-NP-Za-km-z]+$/u.test(mint)
   ) {
@@ -288,8 +295,19 @@ function assertLimits(defaultLimit: number, maximumLimit: number): void {
     || !Number.isSafeInteger(maximumLimit)
     || defaultLimit <= 0
     || maximumLimit <= 0
+    || maximumLimit > MAX_API_PAGE_LIMIT
     || defaultLimit > maximumLimit
   ) throw new TypeError('API pagination limits must be positive safe integers');
+}
+
+function healthResponse(health: ApiHealth): Readonly<{
+  data: ApiHealth;
+  nextCursor: null;
+}> {
+  if (health.postgresql.status === 'UNAVAILABLE') {
+    throw new ApiError({ code: 'DEPENDENCY_UNAVAILABLE', httpStatus: 503 });
+  }
+  return { data: health, nextCursor: null };
 }
 
 function safeCorrelationId(nextCorrelationId: () => string): string {

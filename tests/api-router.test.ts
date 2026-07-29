@@ -17,7 +17,7 @@ import { ApiError } from '../src/api/errors.js';
 import { encodeLaunchCursor, encodePaperPositionCursor, encodeTimelineCursor } from '../src/api/cursor.js';
 import { failure, success, writeJson } from '../src/interfaces/http/api-response.js';
 import { createApiRouter } from '../src/interfaces/http/api-router.js';
-import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
+import { MAX_API_PAGE_LIMIT, type ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
 
 const MINT = bs58.encode(new Uint8Array(32).fill(7));
 const OTHER_MINT = bs58.encode(new Uint8Array(32).fill(8));
@@ -225,6 +225,7 @@ void test('rejects malformed, duplicate, foreign, and non-canonical API inputs b
     ['/api/v1/launches/%ZZ', 'INVALID_MINT', '400'],
     ['/api/v1/launches/%2F', 'INVALID_MINT', '400'],
     [`/api/v1/launches/%55${MINT.slice(1)}`, 'INVALID_MINT', '400'],
+    [`/api/v1/launches/${'z'.repeat(16_384)}`, 'INVALID_MINT', '400'],
     ['/api/v1/launches/not-a-mint', 'INVALID_MINT', '400'],
     ['/api/v1/launches#fragment', 'ROUTE_NOT_FOUND', '404'],
   ];
@@ -289,10 +290,34 @@ void test('redacts unexpected errors, logs structured safe context, and turns an
   assert.equal((parseBody(invalidNow) as { error: { code: string } }).error.code, 'INTERNAL_ERROR');
 });
 
+void test('maps a returned unavailable PostgreSQL health projection to a 503 dependency envelope', async () => {
+  const repository = makeRepository();
+  const original = repository.getHealth;
+  Object.assign(repository, {
+    getHealth: async () => ({
+      ...(await original()), status: 'DEGRADED' as const, postgresql: { status: 'UNAVAILABLE' as const },
+    }),
+  });
+  const { router } = makeRouter(repository);
+  const get = await invoke(router, 'GET', '/api/v1/health');
+  const head = await invoke(router, 'HEAD', '/api/v1/health');
+  assert.equal(get.status, 503);
+  assert.deepEqual(parseBody(get), {
+    apiVersion: 'v1', error: { code: 'DEPENDENCY_UNAVAILABLE', message: 'A required service is temporarily unavailable' },
+  });
+  assert.equal(head.status, 503);
+  assert.equal(head.body, '');
+  assert.deepEqual(head.headers, get.headers);
+});
+
 void test('rejects invalid pagination configuration at construction', () => {
   const repository = makeRepository();
   const base = { projections: repository, now: () => NOW, correlationId: () => 'c', logError: () => undefined };
   assert.throws(() => createApiRouter({ ...base, defaultLimit: 0, maximumLimit: 1 }), TypeError);
   assert.throws(() => createApiRouter({ ...base, defaultLimit: 2, maximumLimit: 1 }), TypeError);
   assert.throws(() => createApiRouter({ ...base, defaultLimit: 1, maximumLimit: 1.5 }), TypeError);
+  assert.throws(() => createApiRouter({ ...base, defaultLimit: 1, maximumLimit: MAX_API_PAGE_LIMIT + 1 }), TypeError);
+  assert.doesNotThrow(() => createApiRouter({
+    ...base, defaultLimit: MAX_API_PAGE_LIMIT, maximumLimit: MAX_API_PAGE_LIMIT,
+  }));
 });

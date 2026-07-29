@@ -11,6 +11,8 @@ import type {
 } from '../api/contracts.js';
 import type { LaunchPagePosition, PaperPositionPagePosition, TimelinePagePosition } from '../api/cursor.js';
 
+export const MAX_API_PAGE_LIMIT = 200;
+
 export interface PageRequest<T> {
   readonly limit: number;
   readonly after: T | null;

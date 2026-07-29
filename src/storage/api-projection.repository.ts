@@ -24,7 +24,7 @@ import { DOMAIN_EVENT_TYPES } from '../domain/events.js';
 import { LAUNCH_STATUSES } from '../domain/launch-status.js';
 import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
 import { QUALIFICATION_SIGNAL_KEYS } from '../domain/qualification.js';
-import type { ApiProjectionRepository, PageRequest } from '../ports/api-projection-repository.js';
+import { MAX_API_PAGE_LIMIT, type ApiProjectionRepository, type PageRequest } from '../ports/api-projection-repository.js';
 import { fromJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 
@@ -598,7 +598,6 @@ function pageLimit(value: number): number {
   return limit;
 }
 
-export const MAX_API_PAGE_LIMIT = 200;
 export const HEARTBEAT_STALE_AFTER_MS = 30_000;
 
 function emptyHeartbeat(): ApiHealth['heartbeat'] {
