@@ -92,12 +92,13 @@ void test('lists launches with a stable keyset, exact decimals, and grouped proj
   }
   assert.match(database.calls[0]?.text ?? '', /confirmation_status = 'orphaned'/u);
   assert.match(database.calls[1]?.text ?? '', /DISTINCT ON \(snapshot\.mint\)[\s\S]*ORDER BY snapshot\.mint, snapshot\.fetched_at DESC/u);
-  assert.match(database.calls[2]?.text ?? '', /DISTINCT ON \(curve\.mint\)[\s\S]*confirmation_status <> 'orphaned'[\s\S]*ORDER BY curve\.mint, curve\.slot DESC/u);
+  assert.match(database.calls[1]?.text ?? '', /ORDER BY snapshot\.mint, snapshot\.fetched_at DESC, snapshot\.snapshot_id DESC/u);
+  assert.match(database.calls[2]?.text ?? '', /DISTINCT ON \(curve\.mint\)[\s\S]*curve\.confirmation_status <> 'orphaned'[\s\S]*ORDER BY curve\.mint, curve\.slot DESC, curve\.transaction_index DESC,[\s\S]*curve\.instruction_index DESC, COALESCE\(curve\.inner_instruction_index, -1\) DESC,[\s\S]*curve\.snapshot_id DESC/u);
   assert.match(database.calls[3]?.text ?? '', /JOIN domain_events AS migration_event ON migration_event\.event_id = migration\.event_id/u);
-  assert.match(database.calls[3]?.text ?? '', /ORDER BY migration\.mint, migration_event\.slot DESC/u);
-  assert.match(database.calls[3]?.text ?? '', /market_pool\.pool_address DESC/u);
-  assert.match(database.calls[3]?.text ?? '', /snapshot\.snapshot_id DESC/u);
-  assert.match(database.calls[3]?.text ?? '', /migration\.event_id DESC,[\s\S]*migration\.migration_id DESC/u);
+  assert.match(database.calls[3]?.text ?? '', /migration\.confirmation_status <> 'orphaned'/u);
+  assert.match(database.calls[3]?.text ?? '', /market_pool\.confirmation_status <> 'orphaned'[\s\S]*ORDER BY market_pool\.slot DESC, market_pool\.transaction_index DESC,[\s\S]*market_pool\.instruction_index DESC, COALESCE\(market_pool\.inner_instruction_index, -1\) DESC,[\s\S]*market_pool\.pool_address DESC/u);
+  assert.match(database.calls[3]?.text ?? '', /snapshot\.confirmation_status <> 'orphaned'[\s\S]*ORDER BY snapshot\.observed_slot DESC, snapshot\.trigger_slot DESC,[\s\S]*snapshot\.transaction_index DESC, snapshot\.instruction_index DESC,[\s\S]*COALESCE\(snapshot\.inner_instruction_index, -1\) DESC, snapshot\.snapshot_id DESC/u);
+  assert.match(database.calls[3]?.text ?? '', /ORDER BY migration\.mint, migration_event\.slot DESC, migration_event\.transaction_index DESC,[\s\S]*migration_event\.instruction_index DESC,[\s\S]*COALESCE\(migration_event\.inner_instruction_index, -1\) DESC,[\s\S]*migration\.event_id DESC,[\s\S]*migration\.migration_id DESC/u);
 });
 
 void test('keeps the database query count bounded as page size grows', async () => {
@@ -160,7 +161,15 @@ void test('returns NOT_AVAILABLE social and holders only for an existing launch'
 
 void test('orders domain events and explicit transitions by the complete cursor', async () => {
   const database = new FakeQueryable((call) => {
-    if (call.text.includes('WITH timeline')) return [{
+    if (
+      call.text.includes('WITH timeline')
+      && call.text.includes('UNION ALL')
+      && call.text.includes('FROM state_transitions AS transition')
+      && call.text.includes('transition.mint = $1')
+      && call.text.includes('domain_event.event_id = transition.event_id')
+      && call.text.includes('jsonb_build_object')
+      && call.text.includes('ORDER BY slot, transaction_index, instruction_index, inner_sort, id')
+    ) return [{
       id: 'domain-1', type: 'QualificationUpdated', occurred_at: detectedAt,
       slot: '900719925474099312345', transaction_index: 1, instruction_index: 2,
       inner_instruction_index: null, confirmation_status: 'confirmed', payload_version: 1,
@@ -192,6 +201,20 @@ void test('orders domain events and explicit transitions by the complete cursor'
   assert.equal(Object.isFrozen(entries[0]?.payload ?? {}), true);
 });
 
+void test('wraps invalid timeline payload conversion in a safe projection error', async () => {
+  const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{
+    id: 'bad', type: 'QualificationUpdated', occurred_at: detectedAt, slot: '1', transaction_index: 0,
+    instruction_index: 0, inner_instruction_index: null, confirmation_status: 'confirmed', payload_version: 1,
+    payload: { amount: 42 },
+  }]));
+  await assert.rejects(repository.listLaunchEvents('mint-a'), (error: unknown) => {
+    assert.ok(error instanceof ApiProjectionDataError);
+    assert.equal(error.message, 'Stored API projection data is invalid.');
+    assert.ok(error.cause instanceof TypeError);
+    return true;
+  });
+});
+
 void test('uses the latest non-orphaned qualification event and rejects malformed data safely', async () => {
   const report = {
     ruleSet: { id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60 },
@@ -210,6 +233,7 @@ void test('uses the latest non-orphaned qualification event and rejects malforme
   });
   assert.match(database.calls[0]?.text ?? '', /confirmation_status <> 'orphaned'/u);
   assert.match(database.calls[0]?.text ?? '', /ORDER BY slot DESC/u);
+  assert.match(database.calls[0]?.text ?? '', /COALESCE\(inner_instruction_index, -1\) DESC, event_id DESC/u);
 
   const malformed = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: '{bad json' }]));
   await assert.rejects(malformed.getLaunchRisk('mint-a'), ApiProjectionDataError);
