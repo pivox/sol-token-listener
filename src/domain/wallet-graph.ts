@@ -174,6 +174,14 @@ export function assertValidWalletGraphInput(input: WalletGraphInput): void {
     if (!buyIds.has(assessment.buy.tradeId)) {
       throw new TypeError('Wallet graph assessment must reference an input buy.');
     }
+    if (assessment.buy.confirmationStatus === 'orphaned') {
+      throw new TypeError('Wallet graph assessments must be active.');
+    }
+  }
+  for (const evidence of input.evidence) {
+    if (evidence.confirmationStatus === 'orphaned') {
+      throw new TypeError('Wallet graph evidence must be active.');
+    }
   }
 }
 
