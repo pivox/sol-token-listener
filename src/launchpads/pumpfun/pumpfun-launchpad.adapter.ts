@@ -2,14 +2,20 @@ import { createHash } from 'node:crypto';
 import { assertValidTransactionCursor } from '../../domain/cursor.js';
 import { assertValidTimestampMs } from '../../domain/timestamp.js';
 import type {
+  MigrationObservation,
+} from '../../domain/market.js';
+import type {
   BondingCurveState,
   LaunchpadTrade,
-  ObservedChainTransaction,
   TokenLaunch,
   TokenProgramKind,
 } from '../../domain/types.js';
 import type { LaunchpadAdapter } from '../../ports/launchpad-adapter.js';
 import type { NormalizedTransaction } from '../../solana/rpc/types.js';
+import {
+  createSolanaObservedTransaction,
+  type SolanaObservedTransaction,
+} from '../../solana/rpc/observed-transaction.js';
 import {
   PUMP_PROGRAM_ID,
   SPL_TOKEN_PROGRAM_ID,
@@ -30,9 +36,7 @@ const CONFIRMATION_STATUS = {
   ORPHANED: 'orphaned',
 } as const;
 
-export interface PumpFunObservedTransaction extends ObservedChainTransaction {
-  readonly raw: NormalizedTransaction;
-}
+export type PumpFunObservedTransaction = SolanaObservedTransaction;
 
 export interface PumpFunBondingCurveStateReader {
   readonly read: (launch: TokenLaunch) => Promise<BondingCurveState>;
@@ -42,26 +46,7 @@ export function createPumpFunObservedTransaction(
   raw: NormalizedTransaction,
   observedAtMs: number,
 ): PumpFunObservedTransaction {
-  if (raw.transactionIndex === null) {
-    throw new PumpDecodingError(
-      'PUMP_TRANSACTION_INDEX_REQUIRED',
-      true,
-      `Transaction ${raw.signature} sans index canonique.`,
-      raw.signature,
-    );
-  }
-  assertValidTimestampMs('observedAtMs', observedAtMs);
-  return Object.freeze({
-    signature: raw.signature,
-    confirmationStatus: CONFIRMATION_STATUS[raw.confirmationStatus],
-    blockTimeMs: raw.blockTimeMs,
-    observedAtMs,
-    cursor: Object.freeze({
-      slot: raw.slot,
-      transactionIndex: raw.transactionIndex,
-    }),
-    raw,
-  });
+  return createSolanaObservedTransaction(raw, observedAtMs);
 }
 
 export class PumpFunLaunchpadAdapter
@@ -97,6 +82,26 @@ implements LaunchpadAdapter<PumpFunObservedTransaction> {
   public readonly readBondingCurveState = async (
     launch: TokenLaunch,
   ): Promise<BondingCurveState> => this.bondingCurveReader.read(launch);
+
+  public readonly decodeMigrations = async (
+    transaction: PumpFunObservedTransaction,
+  ): Promise<readonly MigrationObservation[]> =>
+    (await this.decodeOnce(transaction)).migrations.map((migration) =>
+      Object.freeze({
+        instruction: migration.instruction,
+        mint: migration.mint,
+        bondingCurve: migration.bondingCurve,
+        announcedPool: migration.announcedPool,
+        baseTokenProgram: migration.baseTokenProgram,
+        quoteAsset: migration.quoteAsset,
+        cursor: Object.freeze({
+          slot: transaction.raw.slot,
+          transactionIndex: requiredTransactionIndex(transaction.raw),
+          instructionIndex: migration.action.instruction.instructionIndex,
+          innerInstructionIndex:
+            migration.action.instruction.innerInstructionIndex,
+        }),
+      }));
 
   private decodeOnce(
     transaction: PumpFunObservedTransaction,

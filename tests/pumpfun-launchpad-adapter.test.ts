@@ -175,7 +175,12 @@ function decoded(raw: NormalizedTransaction): DecodedPumpTransaction {
     eventCpi: Object.freeze({ kind: 'TRADE' as const, event: undefined as never, instruction: instruction(3, 0), trailingDataHex: '' }),
     quoteAsset,
   });
-  return Object.freeze({ transaction: raw, creations: Object.freeze([creation]), trades: Object.freeze([trade]) }) as DecodedPumpTransaction;
+  return Object.freeze({
+    transaction: raw,
+    creations: Object.freeze([creation]),
+    trades: Object.freeze([trade]),
+    migrations: Object.freeze([]),
+  }) as DecodedPumpTransaction;
 }
 
 function instruction(instructionIndex: number, innerInstructionIndex: number | null = null) {

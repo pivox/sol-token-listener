@@ -69,6 +69,10 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly metadataSnapshots: number;
   readonly bondingCurveSnapshots: number;
   readonly launchTrades: number;
+  readonly marketTrades: number;
+  readonly marketReserveSnapshots: number;
+  readonly marketPools: number;
+  readonly migrations: number;
   readonly paperPositions: number;
   readonly stateTransitions: number;
   readonly domainEvents: number;
@@ -89,6 +93,18 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const launchTrades = await client.query(
       `DELETE FROM launch_trades trade USING token_launches launch
        WHERE trade.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const marketTrades = await client.query(
+      'DELETE FROM market_trades WHERE purge_after <= NOW()',
+    );
+    const marketReserveSnapshots = await client.query(
+      'DELETE FROM market_reserve_snapshots WHERE purge_after <= NOW()',
+    );
+    const marketPools = await client.query(
+      'DELETE FROM market_pools WHERE purge_after <= NOW()',
+    );
+    const migrations = await client.query(
+      'DELETE FROM migrations WHERE purge_after <= NOW()',
     );
     const paperPositions = await client.query(
       'DELETE FROM paper_positions WHERE purge_after <= NOW()',
@@ -114,6 +130,10 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       metadataSnapshots: metadataSnapshots.rowCount ?? 0,
       bondingCurveSnapshots: bondingCurveSnapshots.rowCount ?? 0,
       launchTrades: launchTrades.rowCount ?? 0,
+      marketTrades: marketTrades.rowCount ?? 0,
+      marketReserveSnapshots: marketReserveSnapshots.rowCount ?? 0,
+      marketPools: marketPools.rowCount ?? 0,
+      migrations: migrations.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
       stateTransitions: transitions.rowCount ?? 0,
       domainEvents: domainEvents.rowCount ?? 0,

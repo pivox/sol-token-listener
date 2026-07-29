@@ -4,6 +4,8 @@ import test from 'node:test';
 import {
   assertInitialLaunchTransitionAllowed,
   createInitialDetectedTransition,
+  createMigrationPendingTransition,
+  createPumpSwapActiveTransition,
   InvalidLaunchTransitionError,
   InvalidTransitionOccurrenceSourceError,
   reconcileTransitionOccurrence,
@@ -11,6 +13,10 @@ import {
 import type { TokenLaunchDetectedEventV1 } from '../src/domain/launchpad-events.js';
 import { InvalidTimestampError } from '../src/domain/timestamp.js';
 import type { TransitionOccurrence } from '../src/domain/state-transitions.js';
+import type {
+  MigrationObservedEventV1,
+  PumpSwapPoolActivatedEventV1,
+} from '../src/domain/migration-events.js';
 
 const launchDetected: TokenLaunchDetectedEventV1 = {
   id: 'evt_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
@@ -242,4 +248,73 @@ void test('occurrence merge rejects invalid runtime sources symmetrically', () =
         && error.source === 'rpc',
     );
   }
+});
+
+const migrationEvent: MigrationObservedEventV1 = {
+  id: 'evt_migration',
+  type: 'MigrationObserved',
+  mint: launchDetected.mint,
+  source: 'pumpfun',
+  program: launchDetected.program,
+  signature: launchDetected.signature,
+  cursor: launchDetected.cursor,
+  confirmationStatus: 'confirmed',
+  blockchainTimeMs: launchDetected.blockchainTimeMs,
+  observedAtMs: launchDetected.observedAtMs,
+  payloadVersion: 1,
+  payload: {
+    migration: {
+      instruction: 'MIGRATE_V2',
+      mint: launchDetected.mint,
+      bondingCurve: 'Curve11111111111111111111111111111111111111',
+      announcedPool: 'Pool111111111111111111111111111111111111111',
+      baseTokenProgram: 'SPL_TOKEN',
+      quoteAsset: {
+        mint: 'So11111111111111111111111111111111111111112',
+        decimals: 9,
+        tokenProgram: 'SPL_TOKEN',
+      },
+      cursor: launchDetected.cursor,
+    },
+  },
+};
+
+const activationEvent: PumpSwapPoolActivatedEventV1 = {
+  ...migrationEvent,
+  id: 'evt_activation',
+  type: 'PumpSwapPoolActivated',
+  payload: {
+    migrationEventId: migrationEvent.id,
+    pool: {
+      address: migrationEvent.payload.migration.announcedPool,
+      market: 'pumpswap',
+      programId: 'PumpSwap1111111111111111111111111111111111',
+      baseMint: launchDetected.mint,
+      quoteAsset: migrationEvent.payload.migration.quoteAsset,
+      index: 0,
+      creator: launchDetected.payload.launch.creator,
+      baseVault: 'BaseVault111111111111111111111111111111111',
+      quoteVault: 'QuoteVault11111111111111111111111111111111',
+      lpMint: 'LpMint111111111111111111111111111111111111',
+      baseTokenProgram: 'SPL_TOKEN',
+      activatedAt: launchDetected.cursor,
+      confirmationStatus: 'confirmed',
+    },
+  },
+};
+
+void test('migration transitions are explicit, deterministic and ordered', () => {
+  for (const current of ['OBSERVING', 'BONDING_CURVE_COMPLETE'] as const) {
+    const pending = createMigrationPendingTransition(current, migrationEvent);
+    assert.equal(pending.previousStatus, current);
+    assert.equal(pending.newStatus, 'MIGRATION_PENDING');
+    assert.equal(pending.message, 'Pump.fun migration observed');
+    assert.deepEqual(pending, createMigrationPendingTransition(current, migrationEvent));
+  }
+
+  const active = createPumpSwapActiveTransition(activationEvent);
+  assert.equal(active.previousStatus, 'MIGRATION_PENDING');
+  assert.equal(active.newStatus, 'PUMPSWAP_ACTIVE');
+  assert.equal(active.message, 'Canonical PumpSwap pool activated');
+  assert.equal(active.triggeringEventId, activationEvent.id);
 });

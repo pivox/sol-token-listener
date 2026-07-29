@@ -55,6 +55,8 @@ const VALUES: Record<PumpInstructionName, Readonly<Record<string, unknown>>> = {
     is_mayhem_mode: true,
     is_cashback_enabled: [false],
   },
+  migrate: {},
+  migrate_v2: {},
   sell: {
     amount: 9_007_199_254_740_993n,
     min_sol_output: 200_000_000n,
@@ -86,6 +88,7 @@ void test('classe les variantes par famille métier', () => {
   assert.equal(decodePumpInstruction(pumpInstruction('create'))?.family, 'CREATE');
   assert.equal(decodePumpInstruction(pumpInstruction('buy_v2'))?.family, 'BUY');
   assert.equal(decodePumpInstruction(pumpInstruction('sell_v2'))?.family, 'SELL');
+  assert.equal(decodePumpInstruction(pumpInstruction('migrate_v2'))?.family, 'MIGRATE');
 });
 
 void test('décode les trois remaining accounts multi-quote de create_v2', () => {

@@ -134,6 +134,9 @@ function familyOf(name: PumpInstructionName): PumpInstructionFamily {
     case 'create':
     case 'create_v2':
       return 'CREATE';
+    case 'migrate':
+    case 'migrate_v2':
+      return 'MIGRATE';
     case 'buy':
     case 'buy_exact_quote_in_v2':
     case 'buy_exact_sol_in':

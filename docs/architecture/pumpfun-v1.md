@@ -21,7 +21,7 @@ l’arrivée du token et conserve les événements nécessaires jusqu’à la fe
 du suivi. L’observation accepte plusieurs quote mints ; le paper trading est
 initialement limité à SOL/WSOL par `PAPER_QUOTE_MINT_ALLOWLIST`.
 
-## État après PR C
+## État après PR G
 
 La PR C épingle l’IDL officiel Pump.fun au commit
 `9c82f61cb711b044a17f770ab8ce9f9bdf78f333` et décode localement `create`,
@@ -36,10 +36,19 @@ aucun appel RPC à l’exécution. `PumpFunLaunchpadAdapter` est présent mais n
 composé dans `src/app.ts`; il ne déclenche donc aucun abonnement, lecture RPC ou
 ordre réel. Raydium CPMM demeure un adaptateur secondaire isolé et testé.
 
-La résolution canonique du `transactionIndex`, la lecture RPC de compte de
-bonding curve, la migration et le suivi PumpSwap restent des travaux ultérieurs.
-Les snapshots publics de metadata, curve et trades sont désormais persistables,
-mais aucun fournisseur n’est composé dans le listener.
+La PR G ajoute un pipeline passif et invocable :
+
+```text
+Pump migration observed
+  -> preuve create_pool PumpSwap dans la même portée CPI
+  -> validation du compte et du PDA canonique index 0
+  -> MIGRATION_PENDING -> PUMPSWAP_ACTIVE
+  -> réserves, trades et quotes paper passifs
+```
+
+`src/app.ts` ne l’abonne encore à aucun flux réseau. Le bootstrap distingue
+`pumpSwapPipelineAvailable: true` de `pumpFunListenerActive: false`.
+L’activation opérationnelle et l’API de ces projections relèvent de la PR H.
 
 ## Dépendances autorisées
 
@@ -87,7 +96,7 @@ Un identifiant déterministe inclut la source, le programme, la signature et le
 curseur complet. Les deltas globaux d’une transaction ne devront être agrégés
 qu’une fois par marché/courbe.
 
-Les montants financiers restent entiers. PumpSwap devra calculer :
+Les montants financiers restent entiers. PumpSwap calcule :
 
 ```text
 effectiveQuoteReserves = quoteVaultAmount + virtualQuoteReserves
@@ -95,6 +104,13 @@ effectiveQuoteReserves = quoteVaultAmount + virtualQuoteReserves
 
 Le quote mint est toujours une valeur de domaine (`mint`, `decimals`,
 `tokenProgram`), jamais une hypothèse globale SOL.
+
+Le décodage de graduation reste multi-quote ; l’allowlist paper V1 reste
+SOL/WSOL. `PUMPSWAP_ACTIVE` exige la concordance de `create_pool`, de
+`CreatePoolEvent`, du compte pool, de ses vaults, des programmes token et du
+PDA canonique. Les frais viennent des comptes officiels ; réserves, frais,
+slippage et impact sont calculés en `bigint`. Une quote est une estimation
+issue d’un snapshot, pas une garantie de sellabilité.
 
 ## Source officielle et décodeur Pump.fun
 
@@ -165,7 +181,8 @@ Les événements métier sont source-indépendants :
 ## Persistance, reprise et rétention
 
 `raw_chain_events` garde l’entrée technique ; `domain_events`,
-`token_launches` et `state_transitions` sont des projections métier. Les
+`token_launches`, `migrations`, `market_pools`, `market_reserve_snapshots`,
+`market_trades` et `state_transitions` sont des projections métier. Les
 checkpoints sont indépendants de la source.
 
 Le traitement réclame un événement avec un lease et reste idempotent.
@@ -183,8 +200,9 @@ résultat d’écriture de l’événement, le temps blockchain prime sur le tem
 d’observation de secours et le plus petit temps gagne à source égale. La fusion
 est ainsi commutative : un replay de même confirmation peut enrichir la
 transition avec le temps blockchain, qu’un fallback ultérieur ne remplace
-jamais. Ces garanties décrivent le port atomique ; aucun sink PostgreSQL
-correspondant n’est encore implémenté.
+jamais. Le repository PumpSwap applique ces garanties dans une transaction
+PostgreSQL, avec verrou advisory par transaction. Un orphaning non finalisé
+rétracte le pool et ses projections.
 
 Quand un lancement est terminal et qu’aucune position paper n’est ouverte,
 `terminal_at` est fixé et `purge_after = terminal_at + 4 heures`. Le purgeur ne
@@ -199,5 +217,6 @@ ou Telegram n’est obligatoire.
 - aucune signature ni soumission ;
 - API et dashboard en lecture seule ;
 - aucune garantie de timing, sortie ou profit ;
+- aucune promesse de même slot entre création, graduation et snapshot RPC ;
 - simulation inverse indisponible = preuve inconnue ou blocker configuré, jamais
   affirmation de sellabilité.

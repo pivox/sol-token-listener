@@ -16,6 +16,8 @@ const REQUIRED_INSTRUCTIONS = [
   'buy_v2',
   'create',
   'create_v2',
+  'migrate',
+  'migrate_v2',
   'sell',
   'sell_v2',
 ] as const;

@@ -19,6 +19,7 @@ import type {
   DecodedPumpCpiEvent,
   DecodedPumpCreation,
   DecodedPumpInstruction,
+  DecodedPumpMigration,
   DecodedPumpTrade,
   DecodedPumpTransaction,
   PumpIdlValue,
@@ -64,7 +65,12 @@ export function decodePumpTransaction(
   const consumed = new Set<number>();
   const creations: DecodedPumpCreation[] = [];
   const trades: DecodedPumpTrade[] = [];
+  const migrations: DecodedPumpMigration[] = [];
   for (const action of actions) {
+    if (isMigrationAction(action)) {
+      migrations.push(validateMigration(action, transaction));
+      continue;
+    }
     const expectedKind = action.family === 'CREATE' ? 'CREATE' : 'TRADE';
     const candidates = events.filter((candidate) =>
       candidate.decoded.kind === expectedKind
@@ -102,6 +108,7 @@ export function decodePumpTransaction(
     transaction,
     creations: Object.freeze(creations),
     trades: Object.freeze(trades),
+    migrations: Object.freeze(migrations),
   });
 }
 
@@ -112,6 +119,43 @@ function emptyResult(
     transaction,
     creations: Object.freeze([]),
     trades: Object.freeze([]),
+    migrations: Object.freeze([]),
+  });
+}
+
+function validateMigration(
+  action: DecodedPumpInstruction & { readonly family: 'MIGRATE' },
+  transaction: NormalizedTransaction,
+): DecodedPumpMigration {
+  const isV2 = action.name === 'migrate_v2';
+  const rawQuoteMint = isV2 ? account(action, 'quote_mint') : WSOL_MINT;
+  const baseProgramAddress = isV2
+    ? account(action, 'base_token_program')
+    : account(action, 'token_program');
+  const baseTokenProgram = requireSupportedProgram(
+    baseProgramAddress,
+    transaction,
+  );
+  const quoteAsset = resolvePumpQuoteAsset(rawQuoteMint, transaction);
+  if (isV2) {
+    requireEqual(
+      quoteAsset.tokenProgram,
+      requireSupportedProgram(
+        account(action, 'quote_token_program'),
+        transaction,
+      ),
+      transaction,
+      'quote_token_program',
+    );
+  }
+  return Object.freeze({
+    action,
+    instruction: isV2 ? 'MIGRATE_V2' : 'MIGRATE',
+    mint: account(action, isV2 ? 'base_mint' : 'mint'),
+    bondingCurve: account(action, 'bonding_curve'),
+    announcedPool: account(action, 'pool'),
+    baseTokenProgram,
+    quoteAsset,
   });
 }
 
@@ -447,6 +491,12 @@ function isTradeAction(
   action: DecodedPumpInstruction,
 ): action is DecodedPumpTrade['action'] {
   return action.family === 'BUY' || action.family === 'SELL';
+}
+
+function isMigrationAction(
+  action: DecodedPumpInstruction,
+): action is DecodedPumpMigration['action'] {
+  return action.family === 'MIGRATE';
 }
 
 function cursorKey(instruction: NormalizedInstruction): string {
