@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { createServer, request as httpRequest, type IncomingMessage, type OutgoingHttpHeaders, type Server, type ServerResponse } from 'node:http';
 import test from 'node:test';
 import { encodeStreamCursor } from '../src/api/cursor.js';
-import type { ApiDomainEvent } from '../src/api/contracts.js';
+import { toApiDomainPayload, type ApiDomainEvent } from '../src/api/contracts.js';
 import { SseSession } from '../src/interfaces/http/sse-session.js';
 import { createApiRouter, type ApiRouter } from '../src/interfaces/http/api-router.js';
 import type { ApiEventStreamRepository, ApiStreamRevision } from '../src/ports/api-event-stream-repository.js';
@@ -422,4 +422,77 @@ void test('an SSE session sends its shutdown frame and ends a real HTTP response
   } finally {
     await closeServer(server);
   }
+});
+
+void test('post-header stream failures are redacted and end real HTTP responses', async () => {
+  const failures: readonly [string, () => Error, string][] = [
+    ['dependency', () => new Error('SELECT password FROM credentials: super-secret'), 'DEPENDENCY_UNAVAILABLE'],
+    ['expired cursor', () => new ApiEventStreamCursorExpiredError(), 'EVENT_CURSOR_EXPIRED'],
+  ];
+  for (const [, makeError, code] of failures) {
+    const stream: ApiEventStreamRepository = {
+      async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+      async readAfter() { throw makeError(); },
+    };
+    const { server, port } = await openServer(makeSseRouter(stream));
+    try {
+      const result = await within(requestResult(port, 'GET', { accept: 'text/event-stream' }), `${code} stream error`);
+      assert.equal(result.status, 200);
+      assert.equal(result.headers['content-type'], 'text/event-stream; charset=utf-8');
+      assert.match(result.body, /event: stream_error\n/u);
+      assert.match(result.body, new RegExp(`"code":"${code}"`, 'u'));
+      assert.doesNotMatch(result.body, /SELECT|password|super-secret/u);
+    } finally {
+      await closeServer(server);
+    }
+  }
+});
+
+void test('SseSession escapes CR/LF payload data without creating injected frames', async () => {
+  const timers = new FakeTimers();
+  const response = new FakeResponse();
+  const newlinePayloadEvent: ApiDomainEvent = {
+    ...event('newline-payload'),
+    payload: toApiDomainPayload({ message: 'line one\r\nevent: injected\nid: injected' }),
+  };
+  const session = new SseSession({
+    stream: {
+      async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+      async readAfter() { return [{ sequence: 1n, streamEventId: 'stream-1', event: newlinePayloadEvent }]; },
+    },
+    response: response as unknown as ServerResponse, startAfter: 0n, batchSize: 1,
+    pollIntervalMs: 10, heartbeatIntervalMs: 100, schedule: timers.schedule, cancel: timers.cancel,
+    onClosed: () => undefined,
+  });
+  session.start();
+  timers.runOne();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const output = response.chunks.join('');
+  assert.match(output, /"message":"line one\\r\\nevent: injected\\nid: injected"/u);
+  assert.doesNotMatch(output, /\r/u);
+  assert.doesNotMatch(output, /\nevent: injected\n|\nid: injected\n/u);
+  await session.close('CLIENT');
+});
+
+void test('SseSession rejects a runtime event type containing CR/LF without frame injection', async () => {
+  const timers = new FakeTimers();
+  const response = new FakeResponse();
+  const unsafeEvent = { ...event('unsafe-type'), type: 'TokenLaunchDetected\nevent: injected\nid: injected' } as unknown as ApiDomainEvent;
+  const session = new SseSession({
+    stream: {
+      async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+      async readAfter() { return [{ sequence: 1n, streamEventId: 'stream-1', event: unsafeEvent }]; },
+    },
+    response: response as unknown as ServerResponse, startAfter: 0n, batchSize: 1,
+    pollIntervalMs: 10, heartbeatIntervalMs: 100, schedule: timers.schedule, cancel: timers.cancel,
+    onClosed: () => undefined,
+  });
+  session.start();
+  timers.runOne();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const output = response.chunks.join('');
+  assert.match(output, /event: stream_error\n/u);
+  assert.match(output, /"code":"DEPENDENCY_UNAVAILABLE"/u);
+  assert.doesNotMatch(output, /\nevent: injected\n|\nid: injected\n/u);
+  assert.equal(response.ended, true);
 });
