@@ -124,7 +124,7 @@ export interface WalletFundingAssessment {
   readonly buy: WalletFundingBuy;
   readonly status: WalletFundingAssessmentStatus;
   readonly inspectedTransferCount: number;
-  readonly acceptedTransferCount: number;
+  readonly acceptedEvidenceCount: number;
   readonly ignoredTransferCount: number;
   readonly diagnosticCodes: readonly WalletFundingDiagnosticCode[];
   readonly payloadVersion: 1;
@@ -490,7 +490,7 @@ CREATE TABLE IF NOT EXISTS wallet_funding_observations (
   confirmation_status TEXT NOT NULL,
   assessment_status TEXT NOT NULL,
   inspected_transfer_count INTEGER NOT NULL CHECK (inspected_transfer_count >= 0),
-  accepted_transfer_count INTEGER NOT NULL CHECK (accepted_transfer_count >= 0),
+  accepted_evidence_count INTEGER NOT NULL CHECK (accepted_evidence_count >= 0),
   ignored_transfer_count INTEGER NOT NULL CHECK (ignored_transfer_count >= 0),
   payload_version INTEGER NOT NULL CHECK (payload_version = 1),
   payload JSONB NOT NULL,

@@ -378,7 +378,7 @@ Ledger canonique par achat observé :
 - mint, identifiant du trade et signature ;
 - curseur complet et finalité de l'achat ;
 - statut `STRONG`, `MEDIUM_ONLY`, `NO_EVIDENCE` ou `UNAVAILABLE` ;
-- compteurs de transferts inspectés, acceptés et ignorés ;
+- compteurs de transferts inspectés/ignorés et de preuves acceptées ;
 - reason codes techniques bornés, notamment ambiguïté de propriétaire,
   instruction reconnue invalide et auto-transfert ignoré ;
 - version de méthodologie, timestamps et `purge_after`.
