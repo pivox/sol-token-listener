@@ -296,6 +296,33 @@ void test('marks a recognized malformed token transfer unavailable', () => {
   assert.equal(result.evidence.length, 0);
 });
 
+void test('marks a recognized malformed System transfer unavailable', () => {
+  const malformed = Object.freeze({
+    programId: SystemProgram.programId.toBase58(),
+    accounts: Object.freeze([FUNDER, BUYER]),
+    data: Uint8Array.of(2, 0, 0, 0),
+    ...normalizedLocation(location(1)),
+  });
+  const buyInstruction = pumpBuy(location(2), {
+    user: BUYER,
+    base_mint: BASE_MINT,
+    quote_mint: WSOL_MINT,
+  });
+  const result = extractor.extract(
+    transaction([malformed, buyInstruction], { signerKeys: [BUYER] }),
+    Object.freeze([fundingBuy(location(2), {
+      quoteAsset: quote(WSOL_MINT, 9, 'SPL_TOKEN'),
+    })]),
+  );
+
+  assert.equal(result.assessments[0]?.status, 'UNAVAILABLE');
+  assert.deepEqual(result.assessments[0]?.diagnosticCodes, [
+    'KNOWN_TRANSFER_INVALID',
+  ]);
+  assert.equal(result.assessments[0]?.inspectedTransferCount, 1);
+  assert.equal(result.evidence.length, 0);
+});
+
 void test('keeps a different fee payer medium and never merges it as a transfer', () => {
   const buyInstruction = pumpBuy(location(2), {
     user: BUYER,

@@ -327,7 +327,23 @@ function decodeSystemTransfer(
       unavailableCode: null,
     });
   } catch {
-    return null;
+    const sourceAccount = normalized.accounts[0] ?? '';
+    const destinationAccount = normalized.accounts[1] ?? '';
+    return Object.freeze({
+      cursor,
+      amountRaw: 0n,
+      sourceWallet: sourceAccount.length === 0 ? null : sourceAccount,
+      destinationWallet:
+        destinationAccount.length === 0 ? null : destinationAccount,
+      sourceAccount,
+      destinationAccount,
+      quoteAsset: Object.freeze({
+        mint: WSOL_MINT,
+        decimals: 9,
+        tokenProgram: 'SPL_TOKEN',
+      }),
+      unavailableCode: 'KNOWN_TRANSFER_INVALID',
+    });
   }
 }
 
