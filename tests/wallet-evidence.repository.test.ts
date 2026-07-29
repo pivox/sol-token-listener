@@ -18,6 +18,7 @@ import type {
 } from '../src/ports/wallet-evidence-repository.js';
 import {
   PostgresWalletEvidenceRepository,
+  WalletEvidenceLaunchNotFoundError,
   WalletEvidencePersistenceError,
 } from '../src/storage/wallet-evidence.repository.js';
 import {
@@ -53,6 +54,21 @@ void test('rolls back and releases when an evidence statement fails', async () =
       error instanceof WalletEvidencePersistenceError
       && error.cause instanceof Error
       && error.cause.message === 'forced repository failure',
+  );
+
+  assert.deepEqual(pool.queries.slice(-1), ['ROLLBACK']);
+  assert.equal(pool.released, true);
+});
+
+void test('rolls back when the launch required by an assessment is absent', async () => {
+  const pool = new RecordingPool(null, true);
+  const repository = new PostgresWalletEvidenceRepository(pool);
+
+  await assert.rejects(
+    repository.record(noEvidenceBatch('processed')),
+    (error) =>
+      error instanceof WalletEvidencePersistenceError
+      && error.cause instanceof WalletEvidenceLaunchNotFoundError,
   );
 
   assert.deepEqual(pool.queries.slice(-1), ['ROLLBACK']);
@@ -128,7 +144,10 @@ class RecordingPool {
   public readonly queries: string[] = [];
   public released = false;
 
-  public constructor(private readonly failOn: string | null = null) {}
+  public constructor(
+    private readonly failOn: string | null = null,
+    private readonly missingLaunch = false,
+  ) {}
 
   public async connect() {
     return {
@@ -138,6 +157,12 @@ class RecordingPool {
           throw new Error('forced repository failure');
         }
         if (text.includes('FOR UPDATE')) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (
+          this.missingLaunch
+          && text.includes('INSERT INTO wallet_funding_observations')
+        ) {
           return { rows: [], rowCount: 0 };
         }
         return { rows: [], rowCount: 1 };

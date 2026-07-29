@@ -68,6 +68,16 @@ export class WalletEvidenceImmutableConflictError extends Error {
   }
 }
 
+export class WalletEvidenceLaunchNotFoundError extends Error {
+  public constructor(
+    public readonly mint: string,
+    public readonly recordType: 'assessment' | 'evidence',
+  ) {
+    super(`Wallet ${recordType} requires an existing launch.`);
+    this.name = 'WalletEvidenceLaunchNotFoundError';
+  }
+}
+
 export class PostgresWalletEvidenceRepository
 implements WalletEvidenceRepository {
   public constructor(
@@ -142,7 +152,7 @@ implements WalletEvidenceRepository {
       return;
     }
     const { buy } = assessment;
-    await client.query(
+    const result = await client.query(
       `INSERT INTO wallet_funding_observations (
         assessment_id, immutable_fingerprint, mint, trade_event_id, trade_id,
         buyer, source, program, signature, quote_mint, quote_decimals,
@@ -185,6 +195,7 @@ implements WalletEvidenceRepository {
         new Date(buy.observedAtMs),
       ],
     );
+    assertLaunchBackedInsert(result.rowCount, buy.mint, 'assessment');
   }
 
   private async upsertEvidence(
@@ -215,7 +226,7 @@ implements WalletEvidenceRepository {
       return;
     }
     const transfer = evidence.transferCursor;
-    await client.query(
+    const result = await client.query(
       `INSERT INTO wallet_funding_evidence (
         evidence_id, immutable_fingerprint, assessment_id, mint, evidence_type,
         confidence, buyer, funder, quote_mint, quote_decimals,
@@ -263,6 +274,17 @@ implements WalletEvidenceRepository {
         new Date(evidence.observedAtMs),
       ],
     );
+    assertLaunchBackedInsert(result.rowCount, evidence.mint, 'evidence');
+  }
+}
+
+function assertLaunchBackedInsert(
+  rowCount: number | null,
+  mint: string,
+  recordType: 'assessment' | 'evidence',
+): void {
+  if (rowCount !== 1) {
+    throw new WalletEvidenceLaunchNotFoundError(mint, recordType);
   }
 }
 
