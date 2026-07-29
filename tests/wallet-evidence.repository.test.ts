@@ -31,11 +31,13 @@ void test('records assessments and evidence atomically in canonical order', asyn
 
   await repository.record(directBatch('processed'));
 
-  assert.deepEqual(pool.queries.slice(0, 2), [
+  assert.deepEqual(pool.queries.slice(0, 3), [
     'BEGIN',
     pool.queries[1],
+    pool.queries[2],
   ]);
-  assert.match(pool.queries[1] ?? '', /wallet_funding_observations.*FOR UPDATE/su);
+  assert.match(pool.queries[1] ?? '', /pg_advisory_xact_lock/u);
+  assert.match(pool.queries[2] ?? '', /wallet_funding_observations.*FOR UPDATE/su);
   assert.equal(pool.queries.some((query) =>
     query.includes('INSERT INTO wallet_funding_observations')), true);
   assert.equal(pool.queries.some((query) =>
@@ -94,8 +96,10 @@ void test('replays, advances finality, rejects contradictions and persists no-ev
     await insertLaunch(pool);
     const repository = new PostgresWalletEvidenceRepository(pool);
 
-    await repository.record(directBatch('processed'));
-    await repository.record(directBatch('processed'));
+    await Promise.all([
+      repository.record(directBatch('processed')),
+      repository.record(directBatch('processed')),
+    ]);
     assert.deepEqual(await counts(pool), ['1', '1']);
 
     await repository.record(directBatch('confirmed'));

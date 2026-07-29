@@ -89,6 +89,10 @@ implements WalletEvidenceRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('wallet-evidence:' || $1, 0))",
+        [batch.signature],
+      );
       for (const assessment of [...batch.assessments].sort((left, right) =>
         left.id.localeCompare(right.id))) {
         await this.upsertAssessment(client, assessment);
