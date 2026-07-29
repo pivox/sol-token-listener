@@ -146,15 +146,72 @@ export interface ApiHoldersUnavailable {
   readonly clusterAnalysisStatus: 'NOT_AVAILABLE';
 }
 
-export interface ApiHoldersAvailable {
+export type ApiHoldersAvailable = ApiHoldersAvailableBase & (
+  | ApiWalletGraphUnavailable
+  | ApiWalletGraphAvailable
+);
+
+export interface ApiHoldersAvailableBase {
   readonly status: 'AVAILABLE';
   readonly methodology: 'OBSERVED_BONDING_CURVE_TRADES';
   readonly creatorProfile: ApiCreatorProfile;
   readonly latestSnapshot: ApiHolderSnapshot;
   readonly snapshots: readonly ApiHolderSnapshot[];
   readonly positions: readonly ApiObservedWalletPosition[];
+}
+
+export interface ApiWalletGraphUnavailable {
   readonly clusters: readonly [];
   readonly clusterAnalysisStatus: 'NOT_AVAILABLE';
+}
+
+export interface ApiWalletGraphAvailable {
+  readonly clusterAnalysisStatus: 'AVAILABLE';
+  readonly clusterMethodology: 'OBSERVED_PUMPFUN_TRANSACTIONS';
+  readonly clusterCoverage: ApiWalletGraphCoverage;
+  readonly clusterCount: number;
+  readonly clustersTruncated: boolean;
+  readonly clusters: readonly ApiWalletCluster[];
+}
+
+export interface ApiWalletGraphCoverage {
+  readonly knownBuyCount: number;
+  readonly knownBuyerCount: number;
+  readonly strongEvidenceBuyCount: number;
+  readonly strongEvidenceBuyerCount: number;
+  readonly mediumOnlyBuyCount: number;
+  readonly mediumOnlyBuyerCount: number;
+  readonly noEvidenceBuyCount: number;
+  readonly noEvidenceBuyerCount: number;
+  readonly unavailableBuyCount: number;
+  readonly unavailableBuyerCount: number;
+  readonly notProcessedBuyCount: number;
+  readonly notProcessedBuyerCount: number;
+  readonly analyzedTransactionCount: number;
+  readonly evidenceCount: number;
+}
+
+export interface ApiWalletCluster {
+  readonly id: string;
+  readonly participantWalletCount: number;
+  readonly auxiliaryWalletCount: number;
+  readonly positiveHolderCount: number;
+  readonly observedPositiveBaseRaw: string;
+  readonly concentrationBps: string;
+  readonly containsCreator: boolean;
+  readonly sharedFunderCount: number;
+  readonly strongRelationshipCount: number;
+  readonly strongEvidenceCount: number;
+  readonly memberCount: number;
+  readonly membersTruncated: boolean;
+  readonly members: readonly ApiWalletClusterMember[];
+}
+
+export interface ApiWalletClusterMember {
+  readonly wallet: string;
+  readonly role: 'PARTICIPANT' | 'AUXILIARY_FUNDER';
+  readonly isCreator: boolean;
+  readonly observedNetBaseRaw: string;
 }
 
 export interface ApiCreatorProfile {

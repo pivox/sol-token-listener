@@ -196,6 +196,49 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
     clusters: [],
     clusterAnalysisStatus: 'NOT_AVAILABLE',
   };
+  const clusteredHolders: ApiHolders = {
+    ...availableHolders,
+    clusterAnalysisStatus: 'AVAILABLE',
+    clusterMethodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+    clusterCoverage: {
+      knownBuyCount: 2,
+      knownBuyerCount: 2,
+      strongEvidenceBuyCount: 2,
+      strongEvidenceBuyerCount: 2,
+      mediumOnlyBuyCount: 0,
+      mediumOnlyBuyerCount: 0,
+      noEvidenceBuyCount: 0,
+      noEvidenceBuyerCount: 0,
+      unavailableBuyCount: 0,
+      unavailableBuyerCount: 0,
+      notProcessedBuyCount: 0,
+      notProcessedBuyerCount: 0,
+      analyzedTransactionCount: 2,
+      evidenceCount: 2,
+    },
+    clusterCount: 1,
+    clustersTruncated: false,
+    clusters: [{
+      id: 'cluster',
+      participantWalletCount: 2,
+      auxiliaryWalletCount: 1,
+      positiveHolderCount: 2,
+      observedPositiveBaseRaw: '75',
+      concentrationBps: '7500',
+      containsCreator: false,
+      sharedFunderCount: 1,
+      strongRelationshipCount: 2,
+      strongEvidenceCount: 2,
+      memberCount: 3,
+      membersTruncated: true,
+      members: [{
+        wallet: 'buyer-a',
+        role: 'PARTICIPANT',
+        isCreator: false,
+        observedNetBaseRaw: '50',
+      }],
+    }],
+  };
   const qualification: ApiQualification = {
     ruleSet: {
       id: 'rules-v1', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60,
@@ -238,6 +281,7 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(social.links.length, 0);
   assert.equal(holders.snapshots.length, 0);
   assert.equal(availableHolders.status, 'AVAILABLE');
+  assert.equal(clusteredHolders.clusterAnalysisStatus, 'AVAILABLE');
   assert.equal(qualification.verdict, 'WATCHLISTED');
   assert.equal(health.pipeline.pumpfun, 'RUNNING');
   assert.equal(sseEvent.eventId, 'evt_1');

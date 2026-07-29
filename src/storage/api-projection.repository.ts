@@ -6,6 +6,11 @@ import {
   type ApiLaunchDetail,
   type ApiLaunchSummary,
   type ApiObservedWalletPosition,
+  type ApiWalletCluster,
+  type ApiWalletClusterMember,
+  type ApiWalletGraphAvailable,
+  type ApiWalletGraphCoverage,
+  type ApiWalletGraphUnavailable,
   type ApiPage,
   type ApiParticipantQuoteFlow,
   type ApiPaperPosition,
@@ -56,6 +61,9 @@ export interface ApiProjectionPipelineState {
 export interface ApiHolderProjectionLimits {
   readonly positions: number;
   readonly snapshots: number;
+  readonly clusters: number;
+  readonly clusterMembers: number;
+  readonly totalClusterMembers: number;
 }
 
 export class ApiProjectionDataError extends Error {
@@ -107,10 +115,16 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     private readonly holderLimits: ApiHolderProjectionLimits = {
       positions: 100,
       snapshots: 100,
+      clusters: 50,
+      clusterMembers: 50,
+      totalClusterMembers: 500,
     },
   ) {
     holderLimit(holderLimits.positions);
     holderLimit(holderLimits.snapshots);
+    boundedLimit(holderLimits.clusters, 100);
+    boundedLimit(holderLimits.clusterMembers, 100);
+    boundedLimit(holderLimits.totalClusterMembers, 1_000);
   }
 
   public async listLaunches(
@@ -459,6 +473,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       const currentSnapshotRow = currentSnapshotResult.rows[0];
       if (currentSnapshotRow === undefined) throw invalid();
       const snapshots = freeze(snapshotResult.rows.map(toHolderSnapshot));
+      const graph = await this.loadWalletGraph(mint);
       const holders: ApiHolders = {
         status: 'AVAILABLE',
         methodology: 'OBSERVED_BONDING_CURVE_TRADES',
@@ -466,13 +481,138 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         latestSnapshot: toHolderSnapshot(currentSnapshotRow),
         snapshots,
         positions: freeze(positionResult.rows.map((row) => toObservedWalletPosition(row.payload))),
-        clusters: freeze([] as []),
-        clusterAnalysisStatus: 'NOT_AVAILABLE',
+        ...graph,
       };
       return freeze(holders);
     } catch (error) {
       throw projectionError(error);
     }
+  }
+
+  private async loadWalletGraph(
+    mint: string,
+  ): Promise<ApiWalletGraphUnavailable | ApiWalletGraphAvailable> {
+    const unavailable: ApiWalletGraphUnavailable = freeze({
+      clusters: freeze([] as []),
+      clusterAnalysisStatus: 'NOT_AVAILABLE',
+    });
+    const profileResult = await this.database.query(
+      `SELECT input_fingerprint, methodology
+       FROM wallet_graph_profiles
+       WHERE mint = $1`,
+      [mint],
+    );
+    const profile = profileResult.rows[0];
+    if (profile === undefined) return unavailable;
+    const inputFingerprint = text(profile.input_fingerprint);
+    if (text(profile.methodology) !== 'OBSERVED_PUMPFUN_TRANSACTIONS') {
+      throw invalid();
+    }
+    const snapshotResult = await this.database.query(
+      `SELECT input_fingerprint, methodology, coverage, cluster_count
+       FROM wallet_graph_snapshots
+       WHERE mint = $1 AND input_fingerprint = $2
+       LIMIT 1`,
+      [mint, inputFingerprint],
+    );
+    const snapshot = snapshotResult.rows[0];
+    if (
+      snapshot === undefined
+      || text(snapshot.input_fingerprint) !== inputFingerprint
+      || text(snapshot.methodology) !== 'OBSERVED_PUMPFUN_TRANSACTIONS'
+    ) throw invalid();
+    const clusterCount = nonNegativeSafeNumber(snapshot.cluster_count);
+    const clusterResult = await this.database.query(
+      `SELECT cluster.cluster_id, cluster.participant_wallet_count,
+          cluster.auxiliary_wallet_count, cluster.positive_holder_count,
+          cluster.observed_positive_base_raw, cluster.concentration_bps,
+          cluster.contains_creator, cluster.shared_funder_count,
+          cluster.strong_relationship_count, cluster.strong_evidence_count,
+          (
+            SELECT COUNT(*)
+            FROM wallet_cluster_members AS member
+            WHERE member.mint = cluster.mint
+              AND member.cluster_id = cluster.cluster_id
+              AND member.input_fingerprint = cluster.input_fingerprint
+          ) AS member_count
+       FROM wallet_clusters AS cluster
+       WHERE cluster.mint = $1
+         AND cluster.input_fingerprint = $2
+       ORDER BY cluster.concentration_bps DESC, cluster.cluster_id ASC
+       LIMIT $3`,
+      [mint, inputFingerprint, this.holderLimits.clusters + 1],
+    );
+    const emittedRows = clusterResult.rows.slice(0, this.holderLimits.clusters);
+    if (clusterCount < emittedRows.length) throw invalid();
+    const clusterIds = emittedRows.map((row) => text(row.cluster_id));
+    const memberResult = clusterIds.length === 0
+      ? { rows: [] as readonly Record<string, unknown>[] }
+      : await this.database.query(
+        `WITH ranked_members AS (
+          SELECT member.cluster_id, member.wallet, member.member_role,
+            member.is_creator, member.observed_net_base_raw,
+            ROW_NUMBER() OVER (
+              PARTITION BY member.cluster_id
+              ORDER BY GREATEST(member.observed_net_base_raw, 0) DESC,
+                member.wallet ASC
+            ) AS member_rank
+          FROM wallet_cluster_members AS member
+          WHERE member.mint = $1
+            AND member.input_fingerprint = $2
+            AND member.cluster_id = ANY($3::text[])
+        )
+        SELECT cluster_id, wallet, member_role, is_creator,
+          observed_net_base_raw, member_rank
+        FROM ranked_members
+        WHERE member_rank <= $4
+        ORDER BY array_position($3::text[], cluster_id), member_rank
+        LIMIT $5`,
+        [
+          mint,
+          inputFingerprint,
+          clusterIds,
+          this.holderLimits.clusterMembers,
+          this.holderLimits.totalClusterMembers,
+        ],
+      );
+    const membersByCluster = new Map<string, ApiWalletClusterMember[]>();
+    for (const row of memberResult.rows) {
+      const clusterId = text(row.cluster_id);
+      if (!clusterIds.includes(clusterId)) throw invalid();
+      const members = membersByCluster.get(clusterId) ?? [];
+      members.push(toWalletClusterMember(row));
+      membersByCluster.set(clusterId, members);
+    }
+    const clusters = freeze(emittedRows.map((row): ApiWalletCluster => {
+      const clusterId = text(row.cluster_id);
+      const members = freeze(membersByCluster.get(clusterId) ?? []);
+      const memberCount = countDecimal(row.member_count);
+      if (memberCount < members.length) throw invalid();
+      return freeze({
+        id: clusterId,
+        participantWalletCount: nonNegativeSafeNumber(row.participant_wallet_count),
+        auxiliaryWalletCount: nonNegativeSafeNumber(row.auxiliary_wallet_count),
+        positiveHolderCount: nonNegativeSafeNumber(row.positive_holder_count),
+        observedPositiveBaseRaw: decimal(row.observed_positive_base_raw),
+        concentrationBps: boundedBps(row.concentration_bps),
+        containsCreator: boolean(row.contains_creator),
+        sharedFunderCount: nonNegativeSafeNumber(row.shared_funder_count),
+        strongRelationshipCount: nonNegativeSafeNumber(row.strong_relationship_count),
+        strongEvidenceCount: nonNegativeSafeNumber(row.strong_evidence_count),
+        memberCount,
+        membersTruncated: memberCount > members.length,
+        members,
+      });
+    }));
+    const available: ApiWalletGraphAvailable = {
+      clusterAnalysisStatus: 'AVAILABLE',
+      clusterMethodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+      clusterCoverage: toWalletGraphCoverage(snapshot.coverage),
+      clusterCount,
+      clustersTruncated: clusterCount > clusters.length,
+      clusters,
+    };
+    return freeze(available);
   }
 }
 
@@ -630,6 +770,45 @@ function toObservedWalletPosition(value: unknown): ApiObservedWalletPosition {
   });
 }
 
+function toWalletClusterMember(
+  row: Record<string, unknown>,
+): ApiWalletClusterMember {
+  const role = text(row.member_role);
+  if (role !== 'PARTICIPANT' && role !== 'AUXILIARY_FUNDER') throw invalid();
+  return freeze({
+    wallet: text(row.wallet),
+    role,
+    isCreator: boolean(row.is_creator),
+    observedNetBaseRaw: signedDecimal(row.observed_net_base_raw),
+  });
+}
+
+function toWalletGraphCoverage(value: unknown): ApiWalletGraphCoverage {
+  const coverage = record(json(value));
+  return freeze({
+    knownBuyCount: nonNegativeSafeNumber(coverage.knownBuyCount),
+    knownBuyerCount: nonNegativeSafeNumber(coverage.knownBuyerCount),
+    strongEvidenceBuyCount: nonNegativeSafeNumber(coverage.strongEvidenceBuyCount),
+    strongEvidenceBuyerCount: nonNegativeSafeNumber(
+      coverage.strongEvidenceBuyerCount,
+    ),
+    mediumOnlyBuyCount: nonNegativeSafeNumber(coverage.mediumOnlyBuyCount),
+    mediumOnlyBuyerCount: nonNegativeSafeNumber(coverage.mediumOnlyBuyerCount),
+    noEvidenceBuyCount: nonNegativeSafeNumber(coverage.noEvidenceBuyCount),
+    noEvidenceBuyerCount: nonNegativeSafeNumber(coverage.noEvidenceBuyerCount),
+    unavailableBuyCount: nonNegativeSafeNumber(coverage.unavailableBuyCount),
+    unavailableBuyerCount: nonNegativeSafeNumber(coverage.unavailableBuyerCount),
+    notProcessedBuyCount: nonNegativeSafeNumber(coverage.notProcessedBuyCount),
+    notProcessedBuyerCount: nonNegativeSafeNumber(
+      coverage.notProcessedBuyerCount,
+    ),
+    analyzedTransactionCount: nonNegativeSafeNumber(
+      coverage.analyzedTransactionCount,
+    ),
+    evidenceCount: nonNegativeSafeNumber(coverage.evidenceCount),
+  });
+}
+
 function toTimelineEntry(row: Record<string, unknown>): ApiTimelineEntry {
   try {
     return freeze({
@@ -775,6 +954,12 @@ function nullableSignedDecimal(value: unknown): string | null {
   return value;
 }
 
+function signedDecimal(value: unknown): string {
+  const result = nullableSignedDecimal(value);
+  if (result === null) throw invalid();
+  return result;
+}
+
 function text(value: unknown): string {
   if (typeof value !== 'string' || value.length === 0) throw invalid();
   return value;
@@ -796,9 +981,19 @@ function nonNegativeSafeNumber(value: unknown): number {
 }
 
 function holderLimit(value: number): number {
+  return boundedLimit(value, 500);
+}
+
+function boundedLimit(value: number, maximum: number): number {
   const result = positiveSafeNumber(value);
-  if (result > 500) throw invalid();
+  if (result > maximum) throw invalid();
   return result;
+}
+
+function countDecimal(value: unknown): number {
+  const result = BigInt(decimal(value));
+  if (result > BigInt(Number.MAX_SAFE_INTEGER)) throw invalid();
+  return Number(result);
 }
 
 function boolean(value: unknown): boolean {

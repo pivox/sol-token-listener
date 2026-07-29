@@ -60,6 +60,9 @@ export interface AppConfig {
   readonly apiPageLimitMaximum: number;
   readonly apiHolderPositionLimit: number;
   readonly apiHolderSnapshotLimit: number;
+  readonly apiWalletClusterLimit: number;
+  readonly apiWalletClusterMemberLimit: number;
+  readonly apiWalletClusterTotalMemberLimit: number;
   readonly apiSseHeartbeatMs: number;
   readonly apiSsePollMs: number;
   readonly logLevel: string;
@@ -147,6 +150,23 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     ),
     apiHolderSnapshotLimit: parseInteger(
       environment.API_HOLDER_SNAPSHOT_LIMIT, 100, 'API_HOLDER_SNAPSHOT_LIMIT', 1, 500,
+    ),
+    apiWalletClusterLimit: parseInteger(
+      environment.API_WALLET_CLUSTER_LIMIT, 50, 'API_WALLET_CLUSTER_LIMIT', 1, 100,
+    ),
+    apiWalletClusterMemberLimit: parseInteger(
+      environment.API_WALLET_CLUSTER_MEMBER_LIMIT,
+      50,
+      'API_WALLET_CLUSTER_MEMBER_LIMIT',
+      1,
+      100,
+    ),
+    apiWalletClusterTotalMemberLimit: parseInteger(
+      environment.API_WALLET_CLUSTER_TOTAL_MEMBER_LIMIT,
+      500,
+      'API_WALLET_CLUSTER_TOTAL_MEMBER_LIMIT',
+      1,
+      1_000,
     ),
     apiSseHeartbeatMs: parseInteger(
       environment.API_SSE_HEARTBEAT_MS, 15_000, 'API_SSE_HEARTBEAT_MS', 1_000, 60_000,

@@ -62,6 +62,9 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
         const projections = dependencies.createProjectionRepository(pool, PRODUCTION_API_PIPELINE_STATE, {
           positions: config.apiHolderPositionLimit,
           snapshots: config.apiHolderSnapshotLimit,
+          clusters: config.apiWalletClusterLimit,
+          clusterMembers: config.apiWalletClusterMemberLimit,
+          totalClusterMembers: config.apiWalletClusterTotalMemberLimit,
         });
         const stream = dependencies.createEventStreamRepository(pool);
         server = dependencies.createApiServer({

@@ -63,6 +63,9 @@ void test('le bootstrap API partage le pool puis ferme le serveur avant la base'
       assert.deepEqual(holderLimits, {
         positions: config.apiHolderPositionLimit,
         snapshots: config.apiHolderSnapshotLimit,
+        clusters: config.apiWalletClusterLimit,
+        clusterMembers: config.apiWalletClusterMemberLimit,
+        totalClusterMembers: config.apiWalletClusterTotalMemberLimit,
       });
       calls.push('projections');
       return {} as ApiProjectionRepository;
