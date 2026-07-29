@@ -48,6 +48,7 @@ export class ApiServer {
   private listenCalled = false;
   private listenPromise: Promise<ApiListeningAddress> | null = null;
   private closePromise: Promise<void> | null = null;
+  private closing = false;
 
   public constructor(options: ApiServerOptions) {
     assertOptions(options);
@@ -73,6 +74,10 @@ export class ApiServer {
         pollIntervalMs: options.ssePollMs ?? 1_000,
         heartbeatIntervalMs: options.sseHeartbeatMs ?? 15_000,
         createSession: (sessionOptions) => {
+          if (this.closing) {
+            endFailedResponse(sessionOptions.response);
+            return new SseSession({ ...sessionOptions, onClosed: (): void => undefined });
+          }
           const session = createSession({
             ...sessionOptions,
             onClosed: (closed) => { this.sessions.delete(closed); },
@@ -117,6 +122,7 @@ export class ApiServer {
 
   public close(): Promise<void> {
     if (this.closePromise !== null) return this.closePromise;
+    this.closing = true;
     this.closePromise = this.closeInternal();
     return this.closePromise;
   }
@@ -138,7 +144,13 @@ export class ApiServer {
   }
 
   private readonly handleRequest = (request: IncomingMessage, response: ServerResponse): void => {
-    void Promise.resolve().then(async () => this.router(request, response)).catch((error: unknown) => {
+    void Promise.resolve().then(() => {
+      if (this.closing) {
+        endFailedResponse(response);
+        return undefined;
+      }
+      return this.router(request, response);
+    }).catch((error: unknown) => {
       safeLog(this.logError, {
         event: 'api.request_failed', route: 'unknown', method: safeMethod(request.method),
         correlationId: 'unavailable', errorName: errorName(error),

@@ -108,6 +108,31 @@ void test('le bootstrap ferme la base même si la fermeture du serveur échoue',
   assert.deepEqual(calls, ['log', 'pool', 'server.listen', 'log', 'server.close', 'database.close']);
 });
 
+void test('le bootstrap conserve les erreurs primaire et de nettoyage dans leur ordre', async () => {
+  const serverFailure = new Error('server shutdown failure');
+  const databaseFailure = new Error('database cleanup failure');
+  const server = {
+    async listen() { return { host: '127.0.0.1', port: 32123 }; },
+    async close() { throw serverFailure; },
+  };
+  await assert.rejects(runApplication({
+    loadConfig: () => ({ ...config, apiEnabled: true }),
+    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
+    getDatabasePool: () => ({}),
+    migrateDatabase: async () => [],
+    createProjectionRepository: () => ({}) as ApiProjectionRepository,
+    createEventStreamRepository: () => ({}) as ApiEventStreamRepository,
+    createApiServer: () => server,
+    closeDatabase: async () => { throw databaseFailure; },
+    waitForShutdownSignal: async () => 'SIGTERM',
+    logInfo: () => undefined,
+  }), (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.deepEqual(error.errors, [serverFailure, databaseFailure]);
+    return true;
+  });
+});
+
 void test('le handler terminal redacted fixe le code d’échec sans quitter le processus', () => {
   const runtime: { exitCode: number | string | undefined } = { exitCode: undefined };
   const logs: object[] = [];

@@ -109,6 +109,41 @@ void test('ApiServer contient une promesse de handler rejetée sans exposer son 
   await server.close();
 });
 
+void test('ApiServer ne crée aucune session SSE lorsqu’une poignée de main se termine pendant sa fermeture', async () => {
+  let releaseHighWater: ((value: bigint) => void) | undefined;
+  let polls = 0;
+  let markHighWaterStarted: (() => void) | undefined;
+  const highWaterStarted = new Promise<void>((resolve) => { markHighWaterStarted = resolve; });
+  const delayedStream: ApiEventStreamRepository = {
+    async highWaterMark() {
+      markHighWaterStarted?.();
+      return new Promise<bigint>((release) => { releaseHighWater = release; });
+    },
+    async resolve(sequence) { return { status: 'CURRENT' as const, sequence }; },
+    async readAfter() {
+      polls += 1;
+      return new Promise<never>(() => undefined);
+    },
+  };
+  const server = new ApiServer({ host: '127.0.0.1', port: 0, projections, stream: delayedStream });
+  const address = await server.listen();
+  const outgoing = requestHttp({ host: address.host, port: address.port, path: '/api/v1/events', headers: { accept: 'text/event-stream' } });
+  outgoing.on('response', (incoming) => { incoming.resume(); });
+  outgoing.on('error', () => undefined);
+  outgoing.end();
+  await highWaterStarted;
+  const closing = server.close();
+  releaseHighWater?.(0n);
+  try {
+    await within(closing, 300, 'server close');
+    assert.equal(server.activeSessionCount, 0);
+    assert.equal(polls, 0);
+  } finally {
+    outgoing.destroy();
+    await closing.catch(() => undefined);
+  }
+});
+
 void test('les sources HTTP publiques ne chargent aucune capacité de signature ou de mutation', async () => {
   const files = ['../src/interfaces/http/api-server.ts', '../src/interfaces/http/api-router.ts', '../src/interfaces/http/sse-session.ts', '../src/app.ts'];
   for (const file of files) {
@@ -117,3 +152,15 @@ void test('les sources HTTP publiques ne chargent aucune capacité de signature 
     assert.doesNotMatch(source, /(?:POST|PUT|PATCH|DELETE)/u);
   }
 });
+
+async function within<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => { reject(new Error(`${label} timed out`)); }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}

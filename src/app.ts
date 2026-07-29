@@ -33,47 +33,55 @@ export interface ApplicationDependencies {
 export async function runApplication(overrides: Partial<ApplicationDependencies> = {}): Promise<void> {
   const dependencies: ApplicationDependencies = { ...productionDependencies, ...overrides };
   let server: ApplicationServer | null = null;
+  let primaryError: Readonly<{ value: unknown }> | null = null;
   try {
     const config = dependencies.loadConfig();
     const qualificationEngine = dependencies.createQualificationEngine(config);
     logFoundation(dependencies.logInfo, config, qualificationEngine.minimumTotalScore);
-    if (!config.apiEnabled) return;
-
-    const pool = dependencies.getDatabasePool(config.databaseUrl);
-    if (config.autoMigrate) {
-      const appliedMigrations = await dependencies.migrateDatabase(pool);
-      dependencies.logInfo({ event: 'database.migrations_applied', count: appliedMigrations.length }, 'Migrations PostgreSQL appliquées.');
+    if (config.apiEnabled) {
+      const pool = dependencies.getDatabasePool(config.databaseUrl);
+      if (config.autoMigrate) {
+        const appliedMigrations = await dependencies.migrateDatabase(pool);
+        dependencies.logInfo({ event: 'database.migrations_applied', count: appliedMigrations.length }, 'Migrations PostgreSQL appliquées.');
+      }
+      const projections = dependencies.createProjectionRepository(pool);
+      const stream = dependencies.createEventStreamRepository(pool);
+      server = dependencies.createApiServer({
+        host: config.apiHost,
+        port: config.apiPort,
+        projections,
+        stream,
+        defaultLimit: config.apiPageLimitDefault,
+        maximumLimit: config.apiPageLimitMaximum,
+        ssePollMs: config.apiSsePollMs,
+        sseHeartbeatMs: config.apiSseHeartbeatMs,
+        logError: (context) => { dependencies.logInfo(context, 'La requête API a échoué.'); },
+      });
+      const address = await server.listen();
+      dependencies.logInfo({
+        event: 'api.started', host: address.host, port: address.port,
+        apiEnabled: config.apiEnabled, executionMode: config.executionMode,
+        transactionSubmissionEnabled: false,
+      }, 'API publique d’observation disponible.');
+      await dependencies.waitForShutdownSignal();
+      const startedServer = server;
+      server = null;
+      await startedServer.close();
     }
-    const projections = dependencies.createProjectionRepository(pool);
-    const stream = dependencies.createEventStreamRepository(pool);
-    server = dependencies.createApiServer({
-      host: config.apiHost,
-      port: config.apiPort,
-      projections,
-      stream,
-      defaultLimit: config.apiPageLimitDefault,
-      maximumLimit: config.apiPageLimitMaximum,
-      ssePollMs: config.apiSsePollMs,
-      sseHeartbeatMs: config.apiSseHeartbeatMs,
-      logError: (context) => { dependencies.logInfo(context, 'La requête API a échoué.'); },
-    });
-    const address = await server.listen();
-    dependencies.logInfo({
-      event: 'api.started', host: address.host, port: address.port,
-      apiEnabled: config.apiEnabled, executionMode: config.executionMode,
-      transactionSubmissionEnabled: false,
-    }, 'API publique d’observation disponible.');
-    await dependencies.waitForShutdownSignal();
-    const startedServer = server;
-    server = null;
-    await startedServer.close();
-  } finally {
-    try {
-      if (server !== null) await server.close();
-    } finally {
-      await dependencies.closeDatabase();
-    }
+  } catch (error) {
+    primaryError = { value: error };
   }
+  const cleanupErrors: unknown[] = [];
+  if (server !== null) {
+    try { await server.close(); } catch (error) { cleanupErrors.push(error); }
+  }
+  try { await dependencies.closeDatabase(); } catch (error) { cleanupErrors.push(error); }
+  if (primaryError !== null) {
+    if (cleanupErrors.length === 0) throw primaryError.value;
+    throw new AggregateError([primaryError.value, ...cleanupErrors], 'Application shutdown failed.');
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) throw new AggregateError(cleanupErrors, 'Application shutdown failed.');
 }
 
 export function waitForShutdownSignal(signalSource: Pick<NodeJS.Process, 'once' | 'off'> = process): Promise<NodeJS.Signals> {
