@@ -7,6 +7,7 @@ import {
   type ApiHealth,
   type ApiJsonObject,
   type ApiLaunchSummary,
+  type ApiPayloadObject,
   type ApiPayloadValue,
   type ApiQualification,
   type ApiSocial,
@@ -185,12 +186,19 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(event.eventId, 'evt_1');
 });
 
-void test('public event payloads prohibit numeric amounts and fees', () => {
-  const accepted: ApiPayloadValue = { amountRaw: '42', feeBps: '42' };
+void test('public event payloads prohibit financial numbers but allow safe metadata numbers', () => {
+  const accepted: ApiPayloadObject = {
+    amountRaw: '42', feeBps: '42', slot: '123', payloadVersion: 1, decimals: 9, score: 15,
+  };
   // @ts-expect-error Public payloads must not expose numeric amounts.
   void ({ amountRaw: 42 } satisfies ApiPayloadValue);
   // @ts-expect-error Public payloads must not expose numeric fees.
   void ({ feeBps: 42 } satisfies ApiPayloadValue);
+  // @ts-expect-error Public payloads must not expose numeric slots.
+  void ({ slot: 42 } satisfies ApiPayloadValue);
 
   assert.equal(accepted.amountRaw, '42');
+  assert.equal(accepted.payloadVersion, 1);
+  assert.equal(accepted.decimals, 9);
+  assert.equal(accepted.score, 15);
 });

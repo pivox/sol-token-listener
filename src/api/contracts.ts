@@ -21,9 +21,17 @@ export type ApiJsonValue =
   | readonly ApiJsonValue[]
   | ApiJsonObject;
 
-export type ApiPayloadPrimitive = string | boolean | null;
+export type ApiPayloadPrimitive = string | number | boolean | null;
 export interface ApiPayloadObject {
   readonly [key: string]: ApiPayloadValue;
+  readonly [key: `${string}Raw`]: string | null;
+  readonly [key: `${string}Bps`]: string | null;
+  readonly [key: `${string}Lamports`]: string | null;
+  readonly slot?: string | null;
+  readonly reserves?: string | null;
+  readonly reserveBase?: string | null;
+  readonly reserveQuote?: string | null;
+  readonly fees?: string | null;
 }
 export type ApiPayloadValue =
   | ApiPayloadPrimitive
