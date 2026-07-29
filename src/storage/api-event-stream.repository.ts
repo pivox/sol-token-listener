@@ -85,12 +85,14 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
            WHERE id = 1
          ),
          retained_stream AS (
-           SELECT COALESCE(MAX(stream.sequence), 0)::text AS active_high_water
+           SELECT COALESCE(MIN(stream.sequence), 0)::text AS active_low_water,
+                  COALESCE(MAX(stream.sequence), 0)::text AS active_high_water
            FROM ${this.table} stream CROSS JOIN retained_clock
            WHERE stream.purge_after > retained_clock.retained_at
          )
          SELECT state_snapshot.state_count, state_snapshot.last_sequence,
-                state_snapshot.expired_through, retained_stream.active_high_water
+                state_snapshot.expired_through, retained_stream.active_low_water,
+                retained_stream.active_high_water
          FROM state_snapshot CROSS JOIN retained_stream`,
       );
       if (result.rows.length !== 1) throw invalid();
@@ -118,12 +120,14 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
            WHERE id = 1
          ),
          retained_stream AS (
-           SELECT COALESCE(MAX(stream.sequence), 0)::text AS active_high_water
+           SELECT COALESCE(MIN(stream.sequence), 0)::text AS active_low_water,
+                  COALESCE(MAX(stream.sequence), 0)::text AS active_high_water
            FROM ${this.table} stream CROSS JOIN retained_clock
            WHERE stream.purge_after > retained_clock.retained_at
          )
          SELECT state_snapshot.state_count, state_snapshot.last_sequence,
-                state_snapshot.expired_through, retained_stream.active_high_water,
+                state_snapshot.expired_through, retained_stream.active_low_water,
+                retained_stream.active_high_water,
                 EXISTS (
                   SELECT 1
                   FROM ${this.table} stream, retained_clock
@@ -162,12 +166,14 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
            WHERE id = 1
          ),
          retained_stream AS (
-           SELECT COALESCE(MAX(stream.sequence), 0)::text AS active_high_water
+           SELECT COALESCE(MIN(stream.sequence), 0)::text AS active_low_water,
+                  COALESCE(MAX(stream.sequence), 0)::text AS active_high_water
            FROM ${this.table} stream CROSS JOIN retained_clock
            WHERE stream.purge_after > retained_clock.retained_at
          ),
          cursor_snapshot AS (
-           SELECT state_snapshot.*, retained_stream.active_high_water,
+           SELECT state_snapshot.*, retained_stream.active_low_water,
+             retained_stream.active_high_water,
              retained_clock.retained_at,
              CASE
                WHEN state_count <> '1'
@@ -175,8 +181,11 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
                  OR expired_through IS NULL
                  OR expired_through::bigint > last_sequence::bigint
                  OR active_high_water::bigint > last_sequence::bigint
-                 OR (active_high_water::bigint <> 0
-                   AND active_high_water::bigint <= expired_through::bigint)
+                 OR active_low_water::bigint > active_high_water::bigint
+                 OR (active_low_water::bigint = 0)
+                   <> (active_high_water::bigint = 0)
+                 OR (active_low_water::bigint <> 0
+                   AND active_low_water::bigint <= expired_through::bigint)
                  THEN 'INVALID_STATE'
                WHEN $1::bigint = 0 THEN 'CURRENT'
                WHEN $1::bigint > last_sequence::bigint THEN 'FUTURE'
@@ -203,7 +212,8 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
            LIMIT $2
          )
          SELECT cursor_snapshot.state_count, cursor_snapshot.last_sequence,
-                cursor_snapshot.expired_through, cursor_snapshot.active_high_water,
+                cursor_snapshot.expired_through, cursor_snapshot.active_low_water,
+                cursor_snapshot.active_high_water,
                 cursor_snapshot.cursor_status,
                 batch.sequence, batch.stream_event_id, batch.domain_event_id,
                 batch.revision, batch.event_type, batch.mint,
@@ -241,6 +251,7 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
 interface StoredStreamState {
   readonly last: bigint;
   readonly expiredThrough: bigint;
+  readonly activeLowWater: bigint;
   readonly activeHighWater: bigint;
 }
 
@@ -262,11 +273,14 @@ function storedState(row: Record<string, unknown>): StoredStreamState {
   if (row.state_count !== '1') throw invalid();
   const last = sequence(row.last_sequence, true);
   const expiredThrough = sequence(row.expired_through, true);
+  const activeLowWater = sequence(row.active_low_water, true);
   const activeHighWater = sequence(row.active_high_water, true);
   if (expiredThrough > last
     || activeHighWater > last
-    || (activeHighWater !== 0n && activeHighWater <= expiredThrough)) throw invalid();
-  return { last, expiredThrough, activeHighWater };
+    || activeLowWater > activeHighWater
+    || (activeLowWater === 0n) !== (activeHighWater === 0n)
+    || (activeLowWater !== 0n && activeLowWater <= expiredThrough)) throw invalid();
+  return { last, expiredThrough, activeLowWater, activeHighWater };
 }
 
 function cursorStatus(value: unknown): CursorStatus {
@@ -304,6 +318,7 @@ function validateSnapshotMetadata(
     'state_count',
     'last_sequence',
     'expired_through',
+    'active_low_water',
     'active_high_water',
     'cursor_status',
   ]) {

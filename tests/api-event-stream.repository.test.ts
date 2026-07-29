@@ -45,6 +45,7 @@ const state = (overrides: Record<string, unknown> = {}): Record<string, unknown>
   state_count: '1',
   last_sequence: '8',
   expired_through: '0',
+  active_low_water: '1',
   active_high_water: '8',
   ...overrides,
 });
@@ -73,19 +74,26 @@ const batchResult = (
 
 void test('reads the currently retained non-expired high-water mark', async () => {
   const empty = new PostgresApiEventStreamRepository(new FakeQueryable(() => [{
-    ...state({ last_sequence: '8', expired_through: '8', active_high_water: '0' }),
+    ...state({
+      last_sequence: '8',
+      expired_through: '8',
+      active_low_water: '0',
+      active_high_water: '0',
+    }),
   }]));
   assert.equal(await empty.highWaterMark(), 0n);
 
   const database = new FakeQueryable(() => [{
     ...state({
       last_sequence: '9223372036854775807',
+      active_low_water: '1',
       active_high_water: '9223372036854775807',
     }),
   }]);
   const large = new PostgresApiEventStreamRepository(database, 'api_data');
   assert.equal(await large.highWaterMark(), 9223372036854775807n);
   assert.match(database.calls[0]?.text ?? '', /WITH retained_clock AS MATERIALIZED/u);
+  assert.match(database.calls[0]?.text ?? '', /COALESCE\(MIN\(stream\.sequence\), 0\)::text AS active_low_water/u);
   assert.match(database.calls[0]?.text ?? '', /COALESCE\(MAX\(stream\.sequence\), 0\)::text AS active_high_water/u);
   assert.match(database.calls[0]?.text ?? '', /purge_after > retained_clock\.retained_at/u);
   assert.match(database.calls[0]?.text ?? '', /"api_data"\."api_event_stream"/u);
@@ -134,6 +142,31 @@ void test('rejects retained rows beyond durable state in every atomic read', asy
   await assert.rejects(read.readAfter(0n, 20), ApiEventStreamDataError);
 });
 
+void test('rejects an active retained prefix at or below the durable expiry floor', async () => {
+  const disagreement = state({
+    last_sequence: '9',
+    expired_through: '5',
+    active_low_water: '5',
+    active_high_water: '9',
+  });
+  const highWater = new PostgresApiEventStreamRepository(new FakeQueryable(() => [disagreement]));
+  await assert.rejects(highWater.highWaterMark(), ApiEventStreamDataError);
+
+  const resolve = new PostgresApiEventStreamRepository(new FakeQueryable(() => [{
+    ...disagreement,
+    cursor_retained: true,
+  }]));
+  await assert.rejects(resolve.resolve(5n), ApiEventStreamDataError);
+
+  const read = new PostgresApiEventStreamRepository(new FakeQueryable(() => [
+    batchResult(row('5'), {
+      ...disagreement,
+      cursor_status: 'INVALID_STATE',
+    }),
+  ]));
+  await assert.rejects(read.readAfter(0n, 20), ApiEventStreamDataError);
+});
+
 void test('wraps database failures with the fixed public data error', async () => {
   const database: Queryable = {
     query: async () => { throw new Error('postgresql connection string leaked'); },
@@ -166,6 +199,7 @@ void test('resolves retained, future, floor-expired, and logically expired curso
   assert.doesNotMatch(currentDb.calls[0]?.text ?? '', /FROM\s+api_event_stream_state/u);
   assert.deepEqual(currentDb.calls[0]?.values, ['5']);
   assert.equal(currentDb.calls.length, 1);
+  assert.match(currentDb.calls[0]?.text ?? '', /MIN\(stream\.sequence\)/u);
   assert.match(currentDb.calls[0]?.text ?? '', /purge_after > retained_at/u);
 
   const future = new PostgresApiEventStreamRepository(new FakeQueryable(() => [{
@@ -175,7 +209,7 @@ void test('resolves retained, future, floor-expired, and logically expired curso
   assert.deepEqual(await future.resolve(9n), { status: 'FUTURE' });
 
   const floorExpired = new PostgresApiEventStreamRepository(new FakeQueryable(() => [{
-    ...state({ expired_through: '5' }),
+    ...state({ expired_through: '5', active_low_water: '6' }),
     cursor_retained: false,
   }]));
   assert.deepEqual(await floorExpired.resolve(5n), { status: 'EXPIRED' });
@@ -207,6 +241,7 @@ void test('reads non-contiguous revisions in ascending sequence without duplicat
   assert.equal(database.calls.length, 2);
   assert.match(database.calls[0]?.text ?? '', /^WITH retained_clock AS MATERIALIZED/u);
   assert.match(database.calls[0]?.text ?? '', /expired_through_sequence/u);
+  assert.match(database.calls[0]?.text ?? '', /MIN\(stream\.sequence\)/u);
   assert.match(database.calls[0]?.text ?? '', /cursor_status/u);
   assert.match(
     database.calls[0]?.text ?? '',
@@ -226,6 +261,7 @@ void test('readAfter rejects an expired cursor in its single statement instead o
   for (const expiredThrough of ['0', '5']) {
     const database = new FakeQueryable(() => [batchResult(null, {
       expired_through: expiredThrough,
+      active_low_water: expiredThrough === '5' ? '6' : '1',
       cursor_status: 'EXPIRED',
     })]);
     const repository = new PostgresApiEventStreamRepository(database);
@@ -258,6 +294,7 @@ void test('readAfter allows the internal zero cursor after a total purge', async
   const database = new FakeQueryable(() => [batchResult(null, {
     last_sequence: '8',
     expired_through: '8',
+    active_low_water: '0',
     active_high_water: '0',
     cursor_status: 'CURRENT',
   })]);
