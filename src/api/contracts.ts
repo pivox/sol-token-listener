@@ -22,17 +22,36 @@ export type ApiJsonValue =
   | ApiJsonObject;
 
 export type ApiPayloadPrimitive = string | number | boolean | null;
-export interface ApiPayloadObject {
+export type ApiFinancialPayloadKey =
+  | 'slot'
+  | `${string}Slot`
+  | 'amount'
+  | `${string}Amount${string}`
+  | 'fee'
+  | 'fees'
+  | `${string}Fee${string}`
+  | `${string}Raw`
+  | `${string}Bps`
+  | `${string}Lamports`
+  | `${string}Reserve${string}`
+  | `${string}Liquidity${string}`
+  | `${string}Supply${string}`
+  | `${string}Price${string}`
+  | `${string}MarketCap${string}`
+  | `${string}Pnl${string}`
+  | `${string}PnL${string}`
+  | `${string}reserve${string}`
+  | `${string}liquidity${string}`
+  | `${string}supply${string}`
+  | `${string}price${string}`
+  | `${string}marketCap${string}`
+  | `${string}pnl${string}`;
+
+export type ApiPayloadObject = {
   readonly [key: string]: ApiPayloadValue;
-  readonly [key: `${string}Raw`]: string | null;
-  readonly [key: `${string}Bps`]: string | null;
-  readonly [key: `${string}Lamports`]: string | null;
-  readonly slot?: string | null;
-  readonly reserves?: string | null;
-  readonly reserveBase?: string | null;
-  readonly reserveQuote?: string | null;
-  readonly fees?: string | null;
-}
+} & {
+  readonly [K in ApiFinancialPayloadKey]?: string | null;
+};
 export type ApiPayloadValue =
   | ApiPayloadPrimitive
   | readonly ApiPayloadValue[]

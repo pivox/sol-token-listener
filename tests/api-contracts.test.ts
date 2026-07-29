@@ -188,7 +188,8 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
 
 void test('public event payloads prohibit financial numbers but allow safe metadata numbers', () => {
   const accepted: ApiPayloadObject = {
-    amountRaw: '42', feeBps: '42', slot: '123', payloadVersion: 1, decimals: 9, score: 15,
+    amountRaw: '42', feeBps: '42', slot: '123', observedSlot: '123', createdSlot: '123',
+    amount: '42', fee: '42', marketCapQuote: '42', payloadVersion: 1, decimals: 9, score: 15,
   };
   // @ts-expect-error Public payloads must not expose numeric amounts.
   void ({ amountRaw: 42 } satisfies ApiPayloadValue);
@@ -196,6 +197,16 @@ void test('public event payloads prohibit financial numbers but allow safe metad
   void ({ feeBps: 42 } satisfies ApiPayloadValue);
   // @ts-expect-error Public payloads must not expose numeric slots.
   void ({ slot: 42 } satisfies ApiPayloadValue);
+  // @ts-expect-error Public payloads must not expose numeric observed slots.
+  void ({ observedSlot: 42 } satisfies ApiPayloadValue);
+  // @ts-expect-error Public payloads must not expose numeric created slots.
+  void ({ createdSlot: 42 } satisfies ApiPayloadValue);
+  // @ts-expect-error Public payloads must not expose numeric amounts without a suffix.
+  void ({ amount: 42 } satisfies ApiPayloadValue);
+  // @ts-expect-error Public payloads must not expose numeric fees without a suffix.
+  void ({ fee: 42 } satisfies ApiPayloadValue);
+  // @ts-expect-error Public payloads must not expose numeric market capitalization.
+  void ({ marketCapQuote: 42 } satisfies ApiPayloadValue);
 
   assert.equal(accepted.amountRaw, '42');
   assert.equal(accepted.payloadVersion, 1);
