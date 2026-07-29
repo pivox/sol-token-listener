@@ -64,11 +64,15 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
       transactionSubmissionEnabled: false,
     }, 'API publique d’observation disponible.');
     await dependencies.waitForShutdownSignal();
-    await server.close();
+    const startedServer = server;
     server = null;
+    await startedServer.close();
   } finally {
-    if (server !== null) await server.close();
-    await dependencies.closeDatabase();
+    try {
+      if (server !== null) await server.close();
+    } finally {
+      await dependencies.closeDatabase();
+    }
   }
 }
 
@@ -126,8 +130,17 @@ function logFoundation(
 const entrypoint = process.argv[1];
 if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {
   void main().catch((error: unknown) => {
-    logger.fatal({ event: 'listener.start_failed', errorName: safeErrorName(error) }, 'Initialisation du socle impossible.');
+    reportEntrypointFailure(error);
   });
+}
+
+export function reportEntrypointFailure(
+  error: unknown,
+  runtime: Pick<NodeJS.Process, 'exitCode'> = process,
+  logFatal: (context: object, message: string) => void = (context, message) => { logger.fatal(context, message); },
+): void {
+  runtime.exitCode = 1;
+  logFatal({ event: 'listener.start_failed', errorName: safeErrorName(error) }, 'Initialisation du socle impossible.');
 }
 
 function safeErrorName(error: unknown): string {

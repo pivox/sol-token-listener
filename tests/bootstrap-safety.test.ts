@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { parseConfig } from '../src/config/env.js';
-import { runApplication, waitForShutdownSignal } from '../src/app.js';
+import { reportEntrypointFailure, runApplication, waitForShutdownSignal } from '../src/app.js';
 import type { ApiEventStreamRepository } from '../src/ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
 
@@ -85,6 +85,35 @@ void test('le bootstrap nettoie le serveur puis la base après un échec de dém
     logInfo: () => { calls.push('log'); },
   }));
   assert.deepEqual(calls, ['log', 'pool', 'server.listen', 'server.close', 'database.close']);
+});
+
+void test('le bootstrap ferme la base même si la fermeture du serveur échoue', async () => {
+  const calls: string[] = [];
+  const server = {
+    async listen() { calls.push('server.listen'); return { host: '127.0.0.1', port: 32123 }; },
+    async close() { calls.push('server.close'); throw new Error('server close failure'); },
+  };
+  await assert.rejects(runApplication({
+    loadConfig: () => ({ ...config, apiEnabled: true }),
+    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
+    getDatabasePool: () => { calls.push('pool'); return {}; },
+    migrateDatabase: async () => [],
+    createProjectionRepository: () => ({}) as ApiProjectionRepository,
+    createEventStreamRepository: () => ({}) as ApiEventStreamRepository,
+    createApiServer: () => server,
+    closeDatabase: async () => { calls.push('database.close'); },
+    waitForShutdownSignal: async () => 'SIGTERM',
+    logInfo: () => { calls.push('log'); },
+  }), /server close failure/u);
+  assert.deepEqual(calls, ['log', 'pool', 'server.listen', 'log', 'server.close', 'database.close']);
+});
+
+void test('le handler terminal redacted fixe le code d’échec sans quitter le processus', () => {
+  const runtime: { exitCode: number | string | undefined } = { exitCode: undefined };
+  const logs: object[] = [];
+  reportEntrypointFailure(new Error('credential-like-detail'), runtime, (context) => { logs.push(context); });
+  assert.equal(runtime.exitCode, 1);
+  assert.deepEqual(logs, [{ event: 'listener.start_failed', errorName: 'Error' }]);
 });
 
 void test('le waiter de signal retire les deux écouteurs après le premier signal', async () => {
