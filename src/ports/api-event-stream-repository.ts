@@ -1,5 +1,12 @@
 import type { ApiSseEvent } from '../api/contracts.js';
 
+export class ApiEventStreamCursorExpiredError extends Error {
+  public constructor() {
+    super('API event stream cursor has expired.');
+    this.name = 'ApiEventStreamCursorExpiredError';
+  }
+}
+
 export interface ApiStreamRevision {
   readonly sequence: bigint;
   readonly streamEventId: string;

@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createRepositoryId } from '../src/storage/repositories.js';
-import { parseJson, stringifyJson } from '../src/utils/json.js';
+import {
+  MAX_SERIALIZED_BIGINT_DIGITS,
+  parseJson,
+  stringifyJson,
+  toJsonValue,
+} from '../src/utils/json.js';
 
 void test('sérialise et restaure exactement les bigint imbriqués', () => {
   const source = {
@@ -13,6 +18,64 @@ void test('sérialise et restaure exactement les bigint imbriqués', () => {
   const restored: unknown = parseJson(stringifyJson(source));
 
   assert.deepEqual(restored, source);
+});
+
+void test('borne les bigint sérialisés à 78 chiffres signés canoniques', () => {
+  assert.equal(MAX_SERIALIZED_BIGINT_DIGITS, 78);
+  const positive = BigInt('9'.repeat(78));
+  const negative = -positive;
+
+  assert.deepEqual(parseJson(stringifyJson({ positive, negative, zero: 0n })), {
+    positive,
+    negative,
+    zero: 0n,
+  });
+  assert.throws(
+    () => stringifyJson({ oversized: BigInt('1'.repeat(79)) }),
+    /Serialized bigint exceeds 78 decimal digits\./u,
+  );
+});
+
+void test('réserve le singleton exact du marqueur bigint avant sérialisation', () => {
+  const reserved = { $solTokenListenerBigInt: '42' };
+
+  assert.throws(
+    () => stringifyJson(reserved),
+    /The \$solTokenListenerBigInt singleton object is reserved for bigint serialization\./u,
+  );
+  assert.throws(
+    () => stringifyJson({ nested: [{ reserved }] }),
+    /The \$solTokenListenerBigInt singleton object is reserved for bigint serialization\./u,
+  );
+});
+
+void test('conserve comme donnée métier un marqueur accompagné d’une autre clé', () => {
+  const value = {
+    direct: { $solTokenListenerBigInt: '42', meaning: 'business-data' },
+    nested: [{ $solTokenListenerBigInt: '01', extra: true }],
+  };
+
+  assert.deepEqual(parseJson(stringifyJson(value)), value);
+});
+
+void test('autorise la recomposition de marqueurs créés par le même encodeur', () => {
+  const encoded = toJsonValue({ amount: 42n });
+
+  assert.deepEqual(toJsonValue({ nested: encoded }), {
+    nested: { amount: { $solTokenListenerBigInt: '42' } },
+  });
+});
+
+void test('invalide la confiance d’un marqueur encodé s’il est ensuite muté', () => {
+  const encoded = toJsonValue({ amount: 42n }) as {
+    amount: { $solTokenListenerBigInt: string };
+  };
+  encoded.amount.$solTokenListenerBigInt = '9'.repeat(79);
+
+  assert.throws(
+    () => stringifyJson(encoded),
+    /The \$solTokenListenerBigInt singleton object is reserved for bigint serialization\./u,
+  );
 });
 
 void test('les identifiants de repository sont déterministes et non ambigus', () => {

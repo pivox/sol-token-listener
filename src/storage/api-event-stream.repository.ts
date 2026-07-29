@@ -1,16 +1,22 @@
 import {
   toApiDomainPayload,
   toApiJson,
+  type ApiDomainPayload,
   type ApiSseEvent,
 } from '../api/contracts.js';
 import { DOMAIN_EVENT_TYPES, type DomainEventType } from '../domain/events.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
-import type {
-  ApiEventStreamRepository,
-  ApiStreamRevision,
-  StreamCursorResolution,
+import {
+  ApiEventStreamCursorExpiredError,
+  type ApiEventStreamRepository,
+  type ApiStreamRevision,
+  type StreamCursorResolution,
 } from '../ports/api-event-stream-repository.js';
-import { fromJsonValue } from '../utils/json.js';
+import {
+  BIGINT_JSON_MARKER,
+  MAX_SERIALIZED_BIGINT_DIGITS,
+  fromJsonValue,
+} from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 
 export interface Queryable {
@@ -30,12 +36,11 @@ export class ApiEventStreamDataError extends Error {
 
 const MAX_SEQUENCE = 9_223_372_036_854_775_807n;
 const MAX_INT4 = 2_147_483_647;
-const MAX_SLOT_DIGITS = 78;
+const MAX_SLOT_DIGITS = MAX_SERIALIZED_BIGINT_DIGITS;
 const MAX_TEXT_LENGTH = 512;
 const CONFIRMATION_STATUSES = ['processed', 'confirmed', 'finalized', 'orphaned'] as const;
 export const MAX_API_EVENT_JSON_BYTES = 1024 * 1024;
 export const MAX_API_PAYLOAD_JSON_BYTES = 1024 * 1024;
-const BIGINT_MARKER = '$solTokenListenerBigInt';
 const EVENT_KEYS = new Set([
   'eventId',
   'type',
@@ -69,12 +74,30 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
   public async highWaterMark(): Promise<bigint> {
     try {
       const result = await this.database.query(
-        `SELECT last_sequence::text AS high_water_mark
-         FROM ${this.stateTable}
-         WHERE id = 1`,
+        `WITH state_snapshot AS (
+           SELECT COUNT(*)::text AS state_count,
+                  MIN(last_sequence)::text AS last_sequence,
+                  MIN(expired_through_sequence)::text AS expired_through
+           FROM ${this.stateTable}
+           WHERE id = 1
+         ),
+         retained_stream AS (
+           SELECT COALESCE(MAX(sequence), 0)::text AS high_water_mark
+           FROM ${this.table}
+           WHERE purge_after > clock_timestamp()
+         )
+         SELECT state_snapshot.state_count, state_snapshot.last_sequence,
+                state_snapshot.expired_through, retained_stream.high_water_mark
+         FROM state_snapshot CROSS JOIN retained_stream`,
       );
       if (result.rows.length !== 1) throw invalid();
-      return sequence(result.rows[0]?.high_water_mark, true);
+      const row = result.rows[0];
+      if (row === undefined) throw invalid();
+      const snapshot = storedState(row);
+      const highWater = sequence(row.high_water_mark, true);
+      if (highWater > snapshot.last
+        || (highWater !== 0n && highWater <= snapshot.expiredThrough)) throw invalid();
+      return highWater;
     } catch (error) {
       throw dataError(error);
     }
@@ -82,19 +105,36 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
 
   public async resolve(sequenceValue: bigint): Promise<StreamCursorResolution> {
     const requested = requestedSequence(sequenceValue, false);
-    const highWater = await this.highWaterMark();
-    if (requested > highWater) return freeze({ status: 'FUTURE' as const });
     try {
       const result = await this.database.query(
-        `SELECT sequence::text AS sequence
-         FROM ${this.table}
-         WHERE sequence = $1`,
+        `WITH retained_clock AS MATERIALIZED (
+           SELECT clock_timestamp() AS retained_at
+         ),
+         state_snapshot AS (
+           SELECT COUNT(*)::text AS state_count,
+                  MIN(last_sequence)::text AS last_sequence,
+                  MIN(expired_through_sequence)::text AS expired_through
+           FROM ${this.stateTable}
+           WHERE id = 1
+         )
+         SELECT state_snapshot.state_count, state_snapshot.last_sequence,
+                state_snapshot.expired_through,
+                EXISTS (
+                  SELECT 1
+                  FROM ${this.table} stream, retained_clock
+                  WHERE stream.sequence = $1
+                    AND stream.purge_after > retained_at
+                ) AS cursor_retained
+         FROM state_snapshot`,
         [requested.toString()],
       );
-      if (result.rows.length > 1) throw invalid();
+      if (result.rows.length !== 1) throw invalid();
       const row = result.rows[0];
-      if (row === undefined) return freeze({ status: 'EXPIRED' as const });
-      if (sequence(row.sequence, false) !== requested) throw invalid();
+      if (row === undefined || typeof row.cursor_retained !== 'boolean') throw invalid();
+      const snapshot = storedState(row);
+      if (requested <= snapshot.expiredThrough) return freeze({ status: 'EXPIRED' as const });
+      if (requested > snapshot.last) return freeze({ status: 'FUTURE' as const });
+      if (!row.cursor_retained) return freeze({ status: 'EXPIRED' as const });
       return freeze({ status: 'CURRENT' as const, sequence: requested });
     } catch (error) {
       throw dataError(error);
@@ -106,20 +146,148 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
     const boundedLimit = pageLimit(limit);
     try {
       const result = await this.database.query(
-        `SELECT sequence::text AS sequence, stream_event_id, domain_event_id,
-            revision::text AS revision, event_type, mint, confirmation_status,
-            payload_version, event
-         FROM ${this.table}
-         WHERE sequence > $1
-         ORDER BY sequence ASC
-         LIMIT $2`,
+        `WITH retained_clock AS MATERIALIZED (
+           SELECT clock_timestamp() AS retained_at
+         ),
+         state_snapshot AS (
+           SELECT COUNT(*)::text AS state_count,
+                  MIN(last_sequence)::text AS last_sequence,
+                  MIN(expired_through_sequence)::text AS expired_through
+           FROM ${this.stateTable}
+           WHERE id = 1
+         ),
+         cursor_snapshot AS (
+           SELECT state_snapshot.*, retained_clock.retained_at,
+             CASE
+               WHEN state_count <> '1'
+                 OR last_sequence IS NULL
+                 OR expired_through IS NULL
+                 OR expired_through::bigint > last_sequence::bigint
+                 THEN 'INVALID_STATE'
+               WHEN $1::bigint = 0 THEN 'CURRENT'
+               WHEN $1::bigint > last_sequence::bigint THEN 'FUTURE'
+               WHEN $1::bigint <= expired_through::bigint THEN 'EXPIRED'
+               WHEN EXISTS (
+                 SELECT 1 FROM ${this.table} cursor_row
+                 WHERE cursor_row.sequence = $1
+                   AND cursor_row.purge_after > retained_clock.retained_at
+               ) THEN 'CURRENT'
+               ELSE 'EXPIRED'
+             END AS cursor_status
+           FROM state_snapshot CROSS JOIN retained_clock
+         ),
+         batch AS (
+           SELECT stream.sequence::text AS sequence, stream.stream_event_id,
+                  stream.domain_event_id, stream.revision::text AS revision,
+                  stream.event_type, stream.mint, stream.confirmation_status,
+                  stream.payload_version, stream.event
+           FROM ${this.table} stream CROSS JOIN cursor_snapshot
+           WHERE cursor_snapshot.cursor_status = 'CURRENT'
+             AND stream.sequence > $1
+             AND stream.purge_after > cursor_snapshot.retained_at
+           ORDER BY stream.sequence ASC
+           LIMIT $2
+         )
+         SELECT cursor_snapshot.state_count, cursor_snapshot.last_sequence,
+                cursor_snapshot.expired_through, cursor_snapshot.cursor_status,
+                batch.sequence, batch.stream_event_id, batch.domain_event_id,
+                batch.revision, batch.event_type, batch.mint,
+                batch.confirmation_status, batch.payload_version, batch.event
+         FROM cursor_snapshot
+         LEFT JOIN batch ON TRUE
+         ORDER BY batch.sequence ASC NULLS LAST`,
         [cursor.toString(), boundedLimit],
       );
+      if (result.rows.length === 0) throw invalid();
+      const first = result.rows[0];
+      if (first === undefined) throw invalid();
+      const snapshot = storedState(first);
+      const status = cursorStatus(first.cursor_status);
+      validateCursorStatus(cursor, snapshot, status);
+      for (const row of result.rows) validateSnapshotMetadata(row, first);
+      if (status !== 'CURRENT') {
+        if (result.rows.length !== 1 || !isEmptyBatchRow(first)) throw invalid();
+        if (status === 'EXPIRED') throw new ApiEventStreamCursorExpiredError();
+        throw invalid();
+      }
+      if (first.sequence === null) {
+        if (result.rows.length !== 1 || !isEmptyBatchRow(first)) throw invalid();
+        return freeze([] as ApiStreamRevision[]);
+      }
+      if (result.rows.some((row) => row.sequence === null)) throw invalid();
       return freeze(result.rows.map(toRevision));
     } catch (error) {
+      if (error instanceof ApiEventStreamCursorExpiredError) throw error;
       throw dataError(error);
     }
   }
+}
+
+interface StoredStreamState {
+  readonly last: bigint;
+  readonly expiredThrough: bigint;
+}
+
+type CursorStatus = 'CURRENT' | 'EXPIRED' | 'FUTURE' | 'INVALID_STATE';
+
+const BATCH_COLUMNS = [
+  'sequence',
+  'stream_event_id',
+  'domain_event_id',
+  'revision',
+  'event_type',
+  'mint',
+  'confirmation_status',
+  'payload_version',
+  'event',
+] as const;
+
+function storedState(row: Record<string, unknown>): StoredStreamState {
+  if (row.state_count !== '1') throw invalid();
+  const last = sequence(row.last_sequence, true);
+  const expiredThrough = sequence(row.expired_through, true);
+  if (expiredThrough > last) throw invalid();
+  return { last, expiredThrough };
+}
+
+function cursorStatus(value: unknown): CursorStatus {
+  if (
+    value !== 'CURRENT'
+    && value !== 'EXPIRED'
+    && value !== 'FUTURE'
+    && value !== 'INVALID_STATE'
+  ) throw invalid();
+  return value;
+}
+
+function validateCursorStatus(
+  cursor: bigint,
+  state: StoredStreamState,
+  status: CursorStatus,
+): void {
+  if (status === 'INVALID_STATE') throw invalid();
+  if (cursor === 0n) {
+    if (status !== 'CURRENT') throw invalid();
+    return;
+  }
+  if (cursor > state.last) {
+    if (status !== 'FUTURE') throw invalid();
+    return;
+  }
+  if (cursor <= state.expiredThrough && status !== 'EXPIRED') throw invalid();
+}
+
+function validateSnapshotMetadata(
+  row: Record<string, unknown>,
+  expected: Record<string, unknown>,
+): void {
+  for (const key of ['state_count', 'last_sequence', 'expired_through', 'cursor_status']) {
+    if (row[key] !== expected[key]) throw invalid();
+  }
+}
+
+function isEmptyBatchRow(row: Record<string, unknown>): boolean {
+  return BATCH_COLUMNS.every((column) => row[column] === null);
 }
 
 function toRevision(row: Record<string, unknown>): ApiStreamRevision {
@@ -179,7 +347,7 @@ function requireExactEventKeys(value: Record<string, unknown>): void {
   if (keys.length !== EVENT_KEYS.size || keys.some((key) => !EVENT_KEYS.has(key))) throw invalid();
 }
 
-function sanitizedPayload(value: unknown): ApiSseEvent['payload'] {
+function sanitizedPayload(value: unknown): ApiDomainPayload {
   const sanitized = toApiJson(value);
   assertJsonSize(JSON.stringify(sanitized), MAX_API_PAYLOAD_JSON_BYTES);
   validateReservedBigIntMarkers(sanitized);
@@ -198,13 +366,13 @@ function validateReservedBigIntMarkers(value: unknown): void {
   }
   const object = record(value);
   const keys = Object.keys(object);
-  if (keys.length === 1 && keys[0] === BIGINT_MARKER) {
+  if (keys.length === 1 && keys[0] === BIGINT_JSON_MARKER) {
     // This singleton is the existing persistence encoding and therefore cannot
     // be distinguished from business data with the same exact shape.
-    const decimal = object[BIGINT_MARKER];
+    const decimal = object[BIGINT_JSON_MARKER];
     if (typeof decimal !== 'string'
       || !/^(?:0|-?[1-9]\d*)$/u.test(decimal)
-      || decimal.replace(/^-/, '').length > MAX_SLOT_DIGITS) throw invalid();
+      || decimal.replace(/^-/, '').length > MAX_SERIALIZED_BIGINT_DIGITS) throw invalid();
     return;
   }
   for (const nested of Object.values(object)) validateReservedBigIntMarkers(nested);
