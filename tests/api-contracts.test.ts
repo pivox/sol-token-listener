@@ -7,6 +7,7 @@ import {
   type ApiHealth,
   type ApiJsonObject,
   type ApiLaunchSummary,
+  type ApiPayloadValue,
   type ApiQualification,
   type ApiSocial,
   type ApiHolders,
@@ -25,8 +26,11 @@ void test('toApiJson converts bigint values recursively and freezes its result',
   const nested = result.nested as readonly unknown[];
   const nestedObject = nested[1] as ApiJsonObject;
 
-  assert.equal(result.balance, '42');
-  assert.equal(result.count, 2);
+  assert.deepEqual(result, {
+    balance: '42',
+    nested: [null, { slot: '99', active: true, label: 'new' }],
+    count: 2,
+  });
   assert.deepEqual([...nested], [null, nested[1]]);
   assert.equal(nestedObject.slot, '99');
   assert.equal(nestedObject.active, true);
@@ -59,9 +63,8 @@ void test('toApiJson rejects cyclic structures', () => {
   assert.throws(() => toApiJson(cyclic), TypeError);
 });
 
-void test('toApiJson normalizes negative zero and rejects sparse arrays', () => {
-  assert.equal(toApiJson(-0), 0);
-  assert.equal(Object.is(toApiJson(-0), -0), false);
+void test('toApiJson preserves negative zero and rejects sparse arrays', () => {
+  assert.equal(Object.is(toApiJson(-0), -0), true);
   assert.throws(() => toApiJson(new Array<unknown>(1)), TypeError);
 
   Object.defineProperty(Array.prototype, '0', { value: 'inherited', configurable: true });
@@ -76,7 +79,7 @@ void test('toApiJson keeps __proto__ as a frozen own property without prototype 
   const source = JSON.parse('{"__proto__":{"polluted":true}}') as unknown;
   const result = toApiJson(source) as ApiJsonObject;
 
-  assert.equal(Object.getPrototypeOf(result), null);
+  assert.equal(Object.getPrototypeOf(result), Object.prototype);
   assert.equal(Object.hasOwn(result, '__proto__'), true);
   assert.equal((result.__proto__ as ApiJsonObject).polluted, true);
   assert.equal(({} as { polluted?: boolean }).polluted, undefined);
@@ -180,4 +183,14 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(qualification.verdict, 'WATCHLISTED');
   assert.equal(health.pipeline.pumpfun, 'RUNNING');
   assert.equal(event.eventId, 'evt_1');
+});
+
+void test('public event payloads prohibit numeric amounts and fees', () => {
+  const accepted: ApiPayloadValue = { amountRaw: '42', feeBps: '42' };
+  // @ts-expect-error Public payloads must not expose numeric amounts.
+  void ({ amountRaw: 42 } satisfies ApiPayloadValue);
+  // @ts-expect-error Public payloads must not expose numeric fees.
+  void ({ feeBps: 42 } satisfies ApiPayloadValue);
+
+  assert.equal(accepted.amountRaw, '42');
 });

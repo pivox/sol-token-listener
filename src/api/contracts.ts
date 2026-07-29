@@ -21,6 +21,15 @@ export type ApiJsonValue =
   | readonly ApiJsonValue[]
   | ApiJsonObject;
 
+export type ApiPayloadPrimitive = string | boolean | null;
+export interface ApiPayloadObject {
+  readonly [key: string]: ApiPayloadValue;
+}
+export type ApiPayloadValue =
+  | ApiPayloadPrimitive
+  | readonly ApiPayloadValue[]
+  | ApiPayloadObject;
+
 export interface ApiMeta {
   readonly generatedAt: string;
   readonly nextCursor: string | null;
@@ -81,7 +90,7 @@ export interface ApiTimelineEntry {
   readonly slot: string | null;
   readonly confirmationStatus: ChainConfirmationStatus;
   readonly payloadVersion: number;
-  readonly payload: ApiJsonValue;
+  readonly payload: ApiPayloadValue;
 }
 
 export interface ApiQualification {
@@ -197,7 +206,7 @@ export interface ApiSseEvent {
   readonly blockchainTime: string | null;
   readonly observedAt: string;
   readonly payloadVersion: number;
-  readonly payload: ApiJsonValue;
+  readonly payload: ApiPayloadValue;
 }
 
 export interface ApiSseCursor {
@@ -218,7 +227,7 @@ function convertToApiJson(value: unknown, ancestors: Set<object>): ApiJsonValue 
     if (!Number.isSafeInteger(value)) {
       throw new TypeError('API JSON numbers must be safe integers');
     }
-    return Object.is(value, -0) ? 0 : value;
+    return value;
   }
   if (typeof value !== 'object') {
     throw new TypeError(`Unsupported API JSON value: ${typeof value}`);
@@ -233,13 +242,13 @@ function convertToApiJson(value: unknown, ancestors: Set<object>): ApiJsonValue 
       return Object.freeze(value.map((item) => convertToApiJson(item, ancestors)));
     }
     if (!isPlainObject(value)) throw new TypeError('API JSON objects must be plain objects');
-    const result = Object.create(null) as Record<string, ApiJsonValue>;
+    const result: Record<string, ApiJsonValue> = {};
     for (const key of Object.keys(value)) {
       Object.defineProperty(result, key, {
         value: convertToApiJson(value[key], ancestors),
         enumerable: true,
-        configurable: false,
-        writable: false,
+        configurable: true,
+        writable: true,
       });
     }
     return Object.freeze(result);
