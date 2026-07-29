@@ -33,21 +33,45 @@ const MAX_INT4 = 2_147_483_647;
 const MAX_SLOT_DIGITS = 78;
 const MAX_TEXT_LENGTH = 512;
 const CONFIRMATION_STATUSES = ['processed', 'confirmed', 'finalized', 'orphaned'] as const;
+export const MAX_API_EVENT_JSON_BYTES = 1024 * 1024;
+export const MAX_API_PAYLOAD_JSON_BYTES = 1024 * 1024;
+const BIGINT_MARKER = '$solTokenListenerBigInt';
+const EVENT_KEYS = new Set([
+  'eventId',
+  'type',
+  'mint',
+  'source',
+  'program',
+  'signature',
+  'slot',
+  'transactionIndex',
+  'instructionIndex',
+  'innerInstructionIndex',
+  'confirmationStatus',
+  'blockchainTime',
+  'observedAt',
+  'payloadVersion',
+  'payload',
+]);
 
 export class PostgresApiEventStreamRepository implements ApiEventStreamRepository {
   private readonly table: string;
+  private readonly stateTable: string;
 
   public constructor(
     private readonly database: Queryable = getDatabasePool(),
     schema = 'public',
   ) {
     this.table = `${quoteIdentifier(schema)}.${quoteIdentifier('api_event_stream')}`;
+    this.stateTable = `${quoteIdentifier(schema)}.${quoteIdentifier('api_event_stream_state')}`;
   }
 
   public async highWaterMark(): Promise<bigint> {
     try {
       const result = await this.database.query(
-        `SELECT COALESCE(MAX(sequence), 0)::text AS high_water_mark FROM ${this.table}`,
+        `SELECT last_sequence::text AS high_water_mark
+         FROM ${this.stateTable}
+         WHERE id = 1`,
       );
       if (result.rows.length !== 1) throw invalid();
       return sequence(result.rows[0]?.high_water_mark, true);
@@ -82,7 +106,9 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
     const boundedLimit = pageLimit(limit);
     try {
       const result = await this.database.query(
-        `SELECT sequence::text AS sequence, stream_event_id, event_type, mint, confirmation_status, event
+        `SELECT sequence::text AS sequence, stream_event_id, domain_event_id,
+            revision::text AS revision, event_type, mint, confirmation_status,
+            payload_version, event
          FROM ${this.table}
          WHERE sequence > $1
          ORDER BY sequence ASC
@@ -99,17 +125,19 @@ export class PostgresApiEventStreamRepository implements ApiEventStreamRepositor
 function toRevision(row: Record<string, unknown>): ApiStreamRevision {
   const streamEventId = boundedText(row.stream_event_id);
   const event = toSseEvent(row.event);
-  if (boundedText(row.event_type) !== event.type
+  positiveSequence(row.revision);
+  if (boundedText(row.domain_event_id) !== event.eventId
+    || boundedText(row.event_type) !== event.type
     || boundedText(row.mint) !== event.mint
-    || confirmationStatus(row.confirmation_status) !== event.confirmationStatus) throw invalid();
+    || confirmationStatus(row.confirmation_status) !== event.confirmationStatus
+    || positiveInt(row.payload_version) !== event.payloadVersion) throw invalid();
   return freeze({ sequence: sequence(row.sequence, false), streamEventId, event });
 }
 
 function toSseEvent(value: unknown): ApiSseEvent {
-  const parsed = parseJson(value);
-  const json = toApiJson(parsed);
-  const object = record(json);
-  const payload = toApiDomainPayload(fromJsonValue(toApiDomainPayload(object.payload)));
+  const object = sanitizedEvent(value);
+  requireExactEventKeys(object);
+  const payload = sanitizedPayload(object.payload);
   return freeze({
     eventId: boundedText(object.eventId),
     type: domainEventType(object.type),
@@ -131,13 +159,55 @@ function toSseEvent(value: unknown): ApiSseEvent {
   });
 }
 
-function parseJson(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  try {
-    return JSON.parse(value) as unknown;
-  } catch {
-    throw invalid();
+function sanitizedEvent(value: unknown): Record<string, unknown> {
+  let parsed = value;
+  if (typeof value === 'string') {
+    assertJsonSize(value, MAX_API_EVENT_JSON_BYTES);
+    try {
+      parsed = JSON.parse(value) as unknown;
+    } catch {
+      throw invalid();
+    }
   }
+  const sanitized = toApiJson(parsed);
+  assertJsonSize(JSON.stringify(sanitized), MAX_API_EVENT_JSON_BYTES);
+  return record(sanitized);
+}
+
+function requireExactEventKeys(value: Record<string, unknown>): void {
+  const keys = Object.keys(value);
+  if (keys.length !== EVENT_KEYS.size || keys.some((key) => !EVENT_KEYS.has(key))) throw invalid();
+}
+
+function sanitizedPayload(value: unknown): ApiSseEvent['payload'] {
+  const sanitized = toApiJson(value);
+  assertJsonSize(JSON.stringify(sanitized), MAX_API_PAYLOAD_JSON_BYTES);
+  validateReservedBigIntMarkers(sanitized);
+  return toApiDomainPayload(fromJsonValue(sanitized));
+}
+
+function assertJsonSize(value: string | undefined, maximum: number): void {
+  if (value === undefined || Buffer.byteLength(value, 'utf8') > maximum) throw invalid();
+}
+
+function validateReservedBigIntMarkers(value: unknown): void {
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) validateReservedBigIntMarkers(item);
+    return;
+  }
+  const object = record(value);
+  const keys = Object.keys(object);
+  if (keys.length === 1 && keys[0] === BIGINT_MARKER) {
+    // This singleton is the existing persistence encoding and therefore cannot
+    // be distinguished from business data with the same exact shape.
+    const decimal = object[BIGINT_MARKER];
+    if (typeof decimal !== 'string'
+      || !/^(?:0|-?[1-9]\d*)$/u.test(decimal)
+      || decimal.replace(/^-/, '').length > MAX_SLOT_DIGITS) throw invalid();
+    return;
+  }
+  for (const nested of Object.values(object)) validateReservedBigIntMarkers(nested);
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -151,6 +221,10 @@ function sequence(value: unknown, zeroAllowed: boolean): bigint {
   const parsed = BigInt(value);
   if ((!zeroAllowed && parsed === 0n) || parsed > MAX_SEQUENCE) throw invalid();
   return parsed;
+}
+
+function positiveSequence(value: unknown): bigint {
+  return sequence(value, false);
 }
 
 function requestedSequence(value: unknown, zeroAllowed: boolean): bigint {
