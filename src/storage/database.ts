@@ -75,6 +75,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly migrations: number;
   readonly paperPositions: number;
   readonly stateTransitions: number;
+  readonly apiEventStream: number;
   readonly domainEvents: number;
   readonly rawChainEvents: number;
   readonly tokenLaunches: number;
@@ -112,6 +113,29 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const transitions = await client.query(
       'DELETE FROM state_transitions WHERE purge_after <= NOW()',
     );
+    const apiEventStream = await client.query<{ readonly deleted_count: string }>(
+      `WITH deleted AS (
+         DELETE FROM api_event_stream
+         WHERE purge_after <= clock_timestamp()
+         RETURNING sequence
+       ),
+       summary AS (
+         SELECT COUNT(*) AS deleted_count, MAX(sequence) AS max_deleted_sequence
+         FROM deleted
+       ),
+       updated_state AS (
+         UPDATE api_event_stream_state state
+         SET expired_through_sequence = GREATEST(
+           state.expired_through_sequence,
+           summary.max_deleted_sequence
+         )
+         FROM summary
+         WHERE state.id = 1
+           AND summary.max_deleted_sequence IS NOT NULL
+         RETURNING state.id
+       )
+       SELECT deleted_count FROM summary`,
+    );
     const domainEvents = await client.query(
       'DELETE FROM domain_events WHERE purge_after <= NOW()',
     );
@@ -136,6 +160,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       migrations: migrations.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
       stateTransitions: transitions.rowCount ?? 0,
+      apiEventStream: Number(apiEventStream.rows[0]?.deleted_count ?? 0),
       domainEvents: domainEvents.rowCount ?? 0,
       rawChainEvents: rawEvents.rowCount ?? 0,
       tokenLaunches: launches.rowCount ?? 0,

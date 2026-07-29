@@ -21,7 +21,7 @@ l’arrivée du token et conserve les événements nécessaires jusqu’à la fe
 du suivi. L’observation accepte plusieurs quote mints ; le paper trading est
 initialement limité à SOL/WSOL par `PAPER_QUOTE_MINT_ALLOWLIST`.
 
-## État après PR G
+## État après PR H
 
 La PR C épingle l’IDL officiel Pump.fun au commit
 `9c82f61cb711b044a17f770ab8ce9f9bdf78f333` et décode localement `create`,
@@ -47,8 +47,19 @@ Pump migration observed
 ```
 
 `src/app.ts` ne l’abonne encore à aucun flux réseau. Le bootstrap distingue
-`pumpSwapPipelineAvailable: true` de `pumpFunListenerActive: false`.
-L’activation opérationnelle et l’API de ces projections relèvent de la PR H.
+`pumpSwapPipelineAvailable: true` de `pumpFunListenerActive: false` : le
+listener RPC Pump.fun reste inactif, même lorsque l’API est démarrée.
+
+La PR H compose une interface `node:http` publique et non authentifiée, en
+lecture seule, avec huit routes JSON versionnées sous `/api/v1` et le flux SSE
+`/api/v1/events`. Elle ne compose ni souscription RPC, ni wallet, ni exécution
+live, ni envoi de transaction. `observe` et `paper` restent les seuls modes.
+Raydium CPMM reste un adaptateur secondaire non composé dans ce bootstrap.
+
+Les projections sociales et holders ne sont pas encore produites : leurs
+routes répondent explicitement `NOT_AVAILABLE`, et non une conclusion sur les
+réseaux sociaux ou la concentration. L’API ne formule aucune garantie de
+profit, de même slot ou de sellabilité.
 
 ## Dépendances autorisées
 
@@ -79,7 +90,7 @@ bootstrap -> composition observation-only
 | `WalletGraphAnalyzer` | funders communs, relations, clusters et concentration |
 | `QualificationEngine` | scores configurables, blockers, verdict et preuves |
 | `PaperTradingEngine` | entrée/sortie simulées, frais, slippage et PnL estimé |
-| API HTTP/SSE | projections publiques, versionnées et en lecture seule |
+| API HTTP/SSE | projections publiques V1, non authentifiées et en lecture seule |
 
 ## Contrats Solana
 
@@ -209,6 +220,21 @@ Quand un lancement est terminal et qu’aucune position paper n’est ouverte,
 supprime que les lignes arrivées à échéance, dans l’ordre des dépendances. Les
 preuves sociales V1 sont limitées aux contenus publics ; aucune API payante X
 ou Telegram n’est obligatoire.
+
+La PR H ajoute aussi un outbox SSE append-only. Chaque révision publique est
+persistée avant diffusion et reçoit un curseur de transport monotone, distinct
+de l’identité métier déterministe `eventId` incluse dans `data`. Le champ SSE
+`id` transporte ce curseur et doit seul être renvoyé dans `Last-Event-ID`; une
+montée de finalité peut donc publier plusieurs révisions du même `eventId`.
+Sans curseur, le serveur démarre au high-water mark courant. Le transport est
+retenu quatre heures. Un curseur invalide ou futur est rejeté, un curseur
+expiré produit `EVENT_CURSOR_EXPIRED` (409) et le client recharge alors les
+projections HTTP avant de se reconnecter.
+
+Par défaut, l’API écoute seulement sur `127.0.0.1`; `API_HOST` et `API_PORT`
+contrôlent le binding. Exposer une adresse publique requiert les protections de
+déploiement appropriées, car le contrat est non authentifié. La route health
+retourne 503 lorsque PostgreSQL est indisponible.
 
 ## Invariants de sécurité
 

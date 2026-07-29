@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { parseConfig } from '../src/config/env.js';
 
 const base = {
@@ -46,4 +47,41 @@ void test('le seuil de qualification est borné et vaut 60 par défaut', () => {
     () => parseConfig({ ...base, QUALIFICATION_MIN_SCORE: '101' }),
     /QUALIFICATION_MIN_SCORE/u,
   );
+});
+
+void test('l’API publique est activée localement avec des limites sûres par défaut', () => {
+  const config = parseConfig(base);
+  assert.equal(config.apiEnabled, true);
+  assert.equal(config.apiHost, '127.0.0.1');
+  assert.equal(config.apiPort, 3_000);
+  assert.equal(config.apiPageLimitDefault, 50);
+  assert.equal(config.apiPageLimitMaximum, 200);
+  assert.equal(config.apiSseHeartbeatMs, 15_000);
+  assert.equal(config.apiSsePollMs, 1_000);
+});
+
+void test('la configuration API refuse les valeurs ambiguës ou hors limites', () => {
+  const invalid: readonly Record<string, string>[] = [
+    { API_ENABLED: '1' },
+    { API_HOST: ' localhost' },
+    { API_HOST: 'http://localhost' },
+    { API_HOST: '127.0.0.1/path' },
+    { API_PORT: '0' },
+    { API_PORT: '65536' },
+    { API_PAGE_LIMIT_DEFAULT: '201' },
+    { API_PAGE_LIMIT_MAX: '201' },
+    { API_PAGE_LIMIT_DEFAULT: '51', API_PAGE_LIMIT_MAX: '50' },
+    { API_SSE_HEARTBEAT_MS: '999' },
+    { API_SSE_POLL_MS: '99' },
+  ];
+  for (const values of invalid) assert.throws(() => parseConfig({ ...base, ...values }));
+});
+
+void test('le modèle d’environnement publie les valeurs API sûres exactes', async () => {
+  const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
+  for (const line of [
+    'API_ENABLED=true', 'API_HOST=127.0.0.1', 'API_PORT=3000',
+    'API_PAGE_LIMIT_DEFAULT=50', 'API_PAGE_LIMIT_MAX=200',
+    'API_SSE_HEARTBEAT_MS=15000', 'API_SSE_POLL_MS=1000',
+  ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
 });

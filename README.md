@@ -1,32 +1,29 @@
 # sol-token-listener
 
-Backend TypeScript destiné à détecter, qualifier et simuler le suivi de nouveaux
-tokens Pump.fun, de leur création jusqu’à leur éventuelle activation sur
-PumpSwap.
+Backend TypeScript d'observation de tokens Pump.fun et de projections PumpSwap
+et paper trading. Il expose aussi une API publique V1 HTTP/SSE, strictement en
+lecture seule.
 
-Le projet compile et teste les contrats génériques, la normalisation Solana,
-la persistance PostgreSQL, le décodeur Pump.fun et Raydium CPMM historique.
-L’adaptateur Pump.fun reste volontairement non composé dans le bootstrap : le
-programme ne démarre donc pas encore de listener de production.
+Le listener RPC Pump.fun n'est pas encore composé dans le bootstrap : démarrer
+l'application ne souscrit à aucun flux réseau Pump.fun. L'API peut donc servir
+des projections PostgreSQL existantes sans prétendre détecter de nouveaux
+événements par elle-même. Raydium CPMM demeure un adaptateur secondaire isolé;
+son code n'est pas activé par ce bootstrap.
 
-## Limites de sécurité V1
+## Sécurité et limites
 
-- `EXECUTION_MODE=observe` par défaut ;
-- seuls `observe` et `paper` sont acceptés ;
-- le paper trading est initialement limité à SOL/WSOL par allowlist ;
-- aucune clé privée n’est lue ou acceptée ;
-- aucune transaction n’est signée ou envoyée ;
-- le dashboard historique est strictement en lecture seule ;
-- aucune promesse de première position, de même slot, de sellabilité ou de
-  profit.
-
-Le code Raydium CPMM est conservé comme adaptateur secondaire. Son décodage de
-fixtures reste testé, mais sa construction de transactions et ses cotations ne
-sont pas composées dans le bootstrap Pump.fun V1.
+- `EXECUTION_MODE=observe` est la valeur par défaut; seules les valeurs
+  `observe` et `paper` sont admises.
+- Aucun wallet ou secret de clé privée n'est accepté, et aucune transaction
+  live n'est signée ou envoyée.
+- Le paper trading est une projection simulée, initialement limitée à SOL/WSOL
+  par allowlist; il ne démontre ni profit ni sellabilité.
+- Aucune promesse de première position, même slot, sortie ou profit.
+- Le listener RPC est inactif et Raydium CPMM reste non composé.
 
 ## Installation
 
-Prérequis : Node.js 22+ et PostgreSQL pour les commandes de migration.
+Prérequis : Node.js 22+ et PostgreSQL.
 
 ```bash
 npm install
@@ -37,37 +34,45 @@ npm run lint
 npm test
 ```
 
-Renseigner `SOLANA_HTTP_RPC_URL`, `SOLANA_WS_RPC_URL` et `DATABASE_URL` sans
-ajouter de secret de wallet. Les migrations sont désactivées par défaut au
-démarrage :
+Renseigner `SOLANA_HTTP_RPC_URL`, `SOLANA_WS_RPC_URL` et `DATABASE_URL`, sans
+secret de wallet. Les migrations ne sont pas lancées automatiquement par
+défaut; les exécuter explicitement si nécessaire :
 
 ```bash
 npm run db:migrate
 ```
 
-`npm start` valide actuellement la configuration, applique éventuellement les
-migrations et publie un événement structuré `listener.foundation_ready`. Il ne
-compose pas encore l’adaptateur Pump.fun ni aucun listener réseau.
+## API V1
+
+L'API est activée par défaut (`API_ENABLED=true`) et écoute sur
+`127.0.0.1:3000` par défaut. Les variables `API_HOST` et `API_PORT` contrôlent
+l'écoute. Utiliser une adresse accessible publiquement est un choix de
+déploiement explicite : l'API n'est pas authentifiée et doit être placée
+derrière les contrôles réseau/TLS appropriés.
+
+Les huit routes JSON sont `launches`, détail/timeline/risk/social/holders d'un
+lancement, `paper-positions` et `health`; `/api/v1/events` est le flux SSE.
+Les montants et `bigint` sont des chaînes décimales. Les projections sociales
+et holders V1 retournent honnêtement `NOT_AVAILABLE`.
+
+```bash
+npm start
+curl -i http://127.0.0.1:3000/api/v1/health
+curl -N -H 'Accept: text/event-stream' http://127.0.0.1:3000/api/v1/events
+```
+
+Conserver le champ SSE `id` et le fournir dans `Last-Event-ID` pour reprendre
+le transport. Ce n'est pas `data.eventId`, qui reste l'identité métier
+déterministe. En cas de `EVENT_CURSOR_EXPIRED` (409), recharger les projections
+HTTP puis se reconnecter sans curseur; la rétention du flux est de quatre
+heures.
+
+Voir le contrat complet : [API V1](docs/api/v1.md).
 
 ## Architecture
 
 - [Architecture Pump.fun V1](docs/architecture/pumpfun-v1.md)
-- [Contrats API V1](docs/api/v1.md)
-- [Décisions de conception PR A](docs/superpowers/specs/2026-07-28-pr-a-foundation-design.md)
+- [Contrat API V1](docs/api/v1.md)
 
-Les montants bruts, réserves et lamports utilisent `bigint`. Dans PostgreSQL ils
-sont stockés en `NUMERIC(78,0)` ; dans les futurs contrats JSON ils seront
-exposés comme chaînes décimales.
-
-## Persistance et rétention
-
-Les migrations sont ordonnées, transactionnelles et idempotentes. Les événements
-bruts sont séparés des projections métier. Une ligne ne reçoit `purge_after`
-qu’une fois le suivi terminal et toute position paper fermée ; elle devient
-supprimable quatre heures plus tard. Le purgeur supprime dans l’ordre les
-transitions, événements métier, événements bruts non référencés, puis les
-lancements.
-
-Le jeu de règles de qualification initial est explicitement marqué
-`UNVALIDATED_RULE_SET`. Les seuils devront être calibrés sur des données réelles
-avant d’être présentés comme significatifs.
+Les montants bruts, réserves et lamports utilisent `bigint`; PostgreSQL les
+stocke en `NUMERIC(78,0)` et l'API les expose comme chaînes décimales.
