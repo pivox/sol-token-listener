@@ -35,9 +35,12 @@ void test('la migration crée une outbox append-only publique, indexée et sans 
   assert.match(sql, /INSERT INTO api_event_stream_state \(id\) VALUES \(1\) ON CONFLICT \(id\) DO NOTHING/u);
   assert.deepEqual(
     sqlStringListAfter(sql, 'event_type TEXT NOT NULL CHECK (event_type IN ('),
-    [...DOMAIN_EVENT_TYPES],
+    DOMAIN_EVENT_TYPES.filter((type) => type !== 'HolderDistributionUpdated'),
   );
-  assert.deepEqual(sqlStringListAfter(sql, 'AND type IN ('), [...DOMAIN_EVENT_TYPES]);
+  assert.deepEqual(
+    sqlStringListAfter(sql, 'AND type IN ('),
+    DOMAIN_EVENT_TYPES.filter((type) => type !== 'HolderDistributionUpdated'),
+  );
   const backfill = sql.indexOf('INSERT INTO %1$I.api_event_stream');
   assert.ok(backfill >= 0);
   assert.ok(sql.indexOf('CREATE INDEX IF NOT EXISTS api_event_stream_mint_sequence_idx') > backfill);
