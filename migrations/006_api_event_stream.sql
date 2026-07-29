@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS api_event_stream (
   sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   stream_event_id TEXT UNIQUE NOT NULL,
   domain_event_id TEXT NOT NULL,
+  revision BIGINT NOT NULL CHECK (revision > 0),
   event_type TEXT NOT NULL,
   mint TEXT NOT NULL,
   confirmation_status TEXT NOT NULL CHECK (
@@ -10,13 +11,9 @@ CREATE TABLE IF NOT EXISTS api_event_stream (
   payload_version INTEGER NOT NULL CHECK (payload_version > 0),
   event JSONB NOT NULL,
   emitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  purge_after TIMESTAMPTZ NOT NULL
+  purge_after TIMESTAMPTZ NOT NULL,
+  UNIQUE(domain_event_id, revision)
 );
-
-CREATE INDEX IF NOT EXISTS api_event_stream_mint_sequence_idx
-  ON api_event_stream(mint, sequence);
-CREATE INDEX IF NOT EXISTS api_event_stream_purge_after_idx
-  ON api_event_stream(purge_after);
 
 CREATE OR REPLACE FUNCTION enqueue_api_domain_event_revision()
 RETURNS TRIGGER
@@ -25,6 +22,7 @@ SECURITY INVOKER
 AS $$
 DECLARE
   public_event JSONB;
+  next_revision BIGINT;
 BEGIN
   IF TG_OP = 'UPDATE'
     AND NEW.event_id IS NOT DISTINCT FROM OLD.event_id
@@ -68,20 +66,30 @@ BEGIN
     'payload', NEW.payload
   );
 
-  INSERT INTO api_event_stream (
-    stream_event_id, domain_event_id, event_type, mint, confirmation_status,
-    payload_version, event, purge_after
-  ) VALUES (
-    NEW.event_id || ':' || NEW.confirmation_status || ':' || NEW.payload_version::text
-      || ':' || md5(public_event::text),
+  EXECUTE format(
+    'SELECT COALESCE(MAX(revision), 0) + 1 FROM %I.api_event_stream WHERE domain_event_id = $1',
+    TG_TABLE_SCHEMA
+  ) INTO next_revision USING NEW.event_id;
+
+  EXECUTE format(
+    $sql$
+      INSERT INTO %I.api_event_stream (
+        stream_event_id, domain_event_id, revision, event_type, mint, confirmation_status,
+        payload_version, event, purge_after
+      ) VALUES (
+        $1 || ':' || $2::text || ':' || $3 || ':' || $4::text || ':' || md5($5::text),
+        $1, $2, $6, $7, $3, $4, $5, NOW() + INTERVAL '4 hours'
+      ) ON CONFLICT (domain_event_id, revision) DO NOTHING
+    $sql$,
+    TG_TABLE_SCHEMA
+  ) USING
     NEW.event_id,
-    NEW.type,
-    NEW.mint,
+    next_revision,
     NEW.confirmation_status,
     NEW.payload_version,
     public_event,
-    NOW() + INTERVAL '4 hours'
-  ) ON CONFLICT (stream_event_id) DO NOTHING;
+    NEW.type,
+    NEW.mint;
 
   RETURN NEW;
 END;
@@ -93,13 +101,14 @@ AFTER INSERT OR UPDATE ON domain_events
 FOR EACH ROW EXECUTE FUNCTION enqueue_api_domain_event_revision();
 
 INSERT INTO api_event_stream (
-  stream_event_id, domain_event_id, event_type, mint, confirmation_status,
+  stream_event_id, domain_event_id, revision, event_type, mint, confirmation_status,
   payload_version, event, purge_after
 )
 SELECT
-  event_id || ':' || confirmation_status || ':' || payload_version::text
+  event_id || ':' || revision::text || ':' || confirmation_status || ':' || payload_version::text
     || ':' || md5(public_event::text),
   event_id,
+  revision,
   type,
   mint,
   confirmation_status,
@@ -109,6 +118,7 @@ SELECT
 FROM (
   SELECT
     event_id,
+    1::BIGINT AS revision,
     type,
     mint,
     confirmation_status,
@@ -138,4 +148,9 @@ FROM (
   WHERE purge_after IS NULL OR purge_after > NOW()
   ORDER BY created_at, event_id
 ) AS retained_domain_events
-ON CONFLICT (stream_event_id) DO NOTHING;
+ON CONFLICT (domain_event_id, revision) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS api_event_stream_mint_sequence_idx
+  ON api_event_stream(mint, sequence);
+CREATE INDEX IF NOT EXISTS api_event_stream_purge_after_idx
+  ON api_event_stream(purge_after);
