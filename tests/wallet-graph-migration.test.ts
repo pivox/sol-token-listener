@@ -1,0 +1,64 @@
+import { randomUUID } from 'node:crypto';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+import pg from 'pg';
+import { migrateDatabase } from '../src/storage/database.js';
+
+const migrationUrl = new URL('../migrations/008_wallet_graph.sql', import.meta.url);
+
+void test('creates replayable bigint wallet-funding evidence tables', async () => {
+  const sql = await readFile(migrationUrl, 'utf8');
+
+  for (const table of [
+    'wallet_funding_observations',
+    'wallet_funding_evidence',
+  ]) {
+    assert.match(sql, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`, 'u'));
+  }
+  assert.match(sql, /NUMERIC\(78,0\)/u);
+  assert.match(sql, /ON DELETE CASCADE/u);
+  assert.match(sql, /purge_after TIMESTAMPTZ/u);
+  assert.match(sql, /STRONG.*MEDIUM_ONLY.*NO_EVIDENCE.*UNAVAILABLE/su);
+  assert.match(sql, /DIRECT_QUOTE_TRANSFER.*FEE_PAYER_FOR_BUYER/su);
+  assert.match(sql, /processed.*confirmed.*finalized.*orphaned/su);
+  assert.match(sql, /amount_raw IS NULL.*transfer_slot IS NULL/su);
+  assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
+  assert.doesNotMatch(sql, /private[_ ]?key|keypair|send[_ ]?transaction/iu);
+  assert.doesNotMatch(sql, /DROP TABLE/iu);
+});
+
+void test('applies migrations 001-008 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
+    return;
+  }
+  const schema = `wallet_graph_${randomUUID().replaceAll('-', '')}`;
+  assert.match(schema, /^[a-z_][a-z0-9_]*$/u);
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    const applied = await migrateDatabase({ pool });
+    assert.equal(applied.at(-1), '008_wallet_graph.sql');
+    assert.deepEqual(await migrateDatabase({ pool }), []);
+    const sql = await readFile(migrationUrl, 'utf8');
+    await pool.query(sql);
+    await pool.query(sql);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
+function quoteIdentifier(identifier: string): string {
+  if (!/^[a-z_][a-z0-9_]*$/u.test(identifier)) {
+    throw new Error('Unsafe SQL identifier.');
+  }
+  return `"${identifier}"`;
+}
