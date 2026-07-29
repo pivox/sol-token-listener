@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
 import { LaunchParticipantAnalyticsService } from '../src/application/launch-participant-analytics.service.js';
-import { migrateDatabase } from '../src/storage/database.js';
+import { PostgresApiProjectionRepository } from '../src/storage/api-projection.repository.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { PostgresParticipantAnalyticsRepository } from '../src/storage/participant-analytics.repository.js';
 
 void test('verrouille le mint et charge une entrée canonique bigint dans une transaction', async () => {
@@ -56,6 +57,19 @@ void test('remplace profil, positions, snapshot et événements avant le commit'
   assert.equal(database.queries.some((query) => query.includes('INSERT INTO observed_wallet_positions')), true);
   assert.equal(database.queries.some((query) => query.includes('INSERT INTO token_holders_snapshots')), true);
   assert.deepEqual(database.queries.slice(-1), ['COMMIT']);
+});
+
+void test('borne chaque lot de positions sous la limite de paramètres PostgreSQL', async () => {
+  const database = new RecordingPool(3_641);
+  const repository = new PostgresParticipantAnalyticsRepository(database);
+
+  await new LaunchParticipantAnalyticsService(repository).rebuild('mint');
+
+  assert.equal(
+    database.queries.filter((query) =>
+      query.includes('INSERT INTO observed_wallet_positions')).length,
+    2,
+  );
 });
 
 void test('rejoue, réconcilie la finalité et rollback atomiquement sur PostgreSQL', async (context) => {
@@ -128,6 +142,15 @@ void test('rejoue, réconcilie la finalité et rollback atomiquement sur Postgre
     await service.rebuild('mint');
     assert.equal((await pool.query('SELECT 1 FROM observed_wallet_positions')).rowCount, 0);
     assert.equal((await pool.query('SELECT 1 FROM token_holders_snapshots')).rowCount, 3);
+    const holdersAfterOrphan = await new PostgresApiProjectionRepository(pool)
+      .getLaunchHolders('mint');
+    assert.equal(holdersAfterOrphan?.status, 'AVAILABLE');
+    if (holdersAfterOrphan?.status !== 'AVAILABLE') {
+      throw new Error('Expected available holder analytics.');
+    }
+    assert.equal(holdersAfterOrphan.latestSnapshot.cursor.instructionIndex, '1');
+    assert.equal(holdersAfterOrphan.latestSnapshot.totalPositiveNetBaseRaw, '0');
+    assert.equal(holdersAfterOrphan.snapshots[0]?.cursor.instructionIndex, '2');
 
     await insertTrade(pool, 'rollback-trade', 'rollback-event', 3, 'processed');
     const beforeRollback = await analyticsCounts(pool);
@@ -152,6 +175,18 @@ void test('rejoue, réconcilie la finalité et rollback atomiquement sur Postgre
     assert.equal((await pool.query(
       "SELECT 1 FROM token_holders_snapshots WHERE input_fingerprint = (SELECT input_fingerprint FROM creator_profiles)",
     )).rowCount, 1);
+
+    await pool.query(`UPDATE token_launches
+      SET terminal_at = NOW() - INTERVAL '5 hours',
+          purge_after = NOW() - INTERVAL '1 hour'
+      WHERE mint = 'mint'`);
+    const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.creatorProfiles, 1);
+    assert.equal(purged.observedWalletPositions, 1);
+    assert.ok(purged.holderSnapshots >= 1);
+    assert.equal((await pool.query(
+      "SELECT 1 FROM domain_events WHERE type IN ('CreatorProfileUpdated','HolderDistributionUpdated')",
+    )).rowCount, 0);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
@@ -162,6 +197,8 @@ void test('rejoue, réconcilie la finalité et rollback atomiquement sur Postgre
 class RecordingPool {
   public readonly queries: string[] = [];
   public released = false;
+
+  public constructor(private readonly tradeCount = 1) {}
 
   public async connect() {
     return {
@@ -188,26 +225,26 @@ class RecordingPool {
         }
         if (text.includes('FROM launch_trades AS trade')) {
           return {
-            rows: [{
-              event_id: 'trade-event',
-              trade_id: 'trade',
+            rows: Array.from({ length: this.tradeCount }, (_, index) => ({
+              event_id: `trade-event-${index}`,
+              trade_id: `trade-${index}`,
               mint: 'mint',
-              signature: 'trade-signature',
+              signature: `trade-signature-${index}`,
               slot: '10',
               transaction_index: 0,
-              instruction_index: 2,
+              instruction_index: index + 2,
               inner_instruction_index: null,
               confirmation_status: 'confirmed',
-              observed_at: new Date(1_720_000_000_001),
+              observed_at: new Date(1_720_000_000_001 + index),
               trade_kind: 'BUY',
-              trader: 'buyer',
+              trader: `buyer-${index}`,
               base_amount_raw: '10',
               quote_amount_raw: '2',
               quote_mint: 'sol',
               quote_decimals: 9,
               quote_token_program: 'SPL_TOKEN',
-            }],
-            rowCount: 1,
+            })),
+            rowCount: this.tradeCount,
           };
         }
         return { rows: [], rowCount: 1 };

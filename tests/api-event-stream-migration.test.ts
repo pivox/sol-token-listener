@@ -154,6 +154,9 @@ void test('la purge retire les projections participants expirées avant leurs é
       if (text.includes('DELETE FROM creator_profiles')) return { rows: [], rowCount: 1 };
       if (text.includes('DELETE FROM observed_wallet_positions')) return { rows: [], rowCount: 2 };
       if (text.includes('DELETE FROM token_holders_snapshots')) return { rows: [], rowCount: 1 };
+      if (
+        text.includes('DELETE FROM domain_events event USING token_launches launch')
+      ) return { rows: [], rowCount: 4 };
       return { rows: [], rowCount: 0 };
     },
     release: () => undefined,
@@ -167,6 +170,7 @@ void test('la purge retire les projections participants expirées avant leurs é
   assert.equal(result.creatorProfiles, 1);
   assert.equal(result.observedWalletPositions, 2);
   assert.equal(result.holderSnapshots, 1);
+  assert.equal(result.domainEvents, 4);
   const participantQueries = queries.filter((query) =>
     /DELETE FROM (?:creator_profiles|observed_wallet_positions|token_holders_snapshots)/u.test(query));
   assert.equal(participantQueries.length, 3);
@@ -177,6 +181,10 @@ void test('la purge retire les projections participants expirées avant leurs é
   const domainDeletion = queries.findIndex((query) =>
     query.includes('DELETE FROM domain_events WHERE purge_after <= NOW()'));
   assert.ok(domainDeletion > queries.findIndex((query) => query.includes('DELETE FROM creator_profiles')));
+  assert.ok(queries.some((query) =>
+    query.includes('DELETE FROM domain_events event USING token_launches launch')
+    && query.includes("'CreatorProfileUpdated', 'HolderDistributionUpdated'")
+    && query.includes('launch.purge_after <= NOW()')));
 });
 
 void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est configurée', async (context) => {

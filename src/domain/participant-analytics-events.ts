@@ -20,8 +20,10 @@ export interface CreatorProfileUpdatedPayloadV1 {
 export interface HolderDistributionUpdatedPayloadV1 {
   readonly inputFingerprint: string;
   readonly confirmationCounts: ParticipantConfirmationCounts;
-  readonly distribution: HolderDistribution;
+  readonly distribution: HolderDistributionSummary;
 }
+
+export type HolderDistributionSummary = Omit<HolderDistribution, 'positions'>;
 
 export type CreatorProfileUpdatedEventV1 = TypedDomainEvent<
   'CreatorProfileUpdated',
@@ -78,8 +80,28 @@ export function createHolderDistributionUpdatedEvent(
     payload: Object.freeze({
       inputFingerprint: projection.inputFingerprint,
       confirmationCounts: projection.confirmationCounts,
-      distribution: projection.distribution,
+      distribution: holderDistributionSummary(projection.distribution),
     }),
+  });
+}
+
+function holderDistributionSummary(
+  distribution: HolderDistribution,
+): HolderDistributionSummary {
+  return Object.freeze({
+    mint: distribution.mint,
+    creator: distribution.creator,
+    payloadVersion: distribution.payloadVersion,
+    inputFingerprint: distribution.inputFingerprint,
+    totalPositiveNetBaseRaw: distribution.totalPositiveNetBaseRaw,
+    top1Bps: distribution.top1Bps,
+    top5Bps: distribution.top5Bps,
+    top10Bps: distribution.top10Bps,
+    creatorBps: distribution.creatorBps,
+    uniqueKnownBuyers: distribution.uniqueKnownBuyers,
+    uniqueExternalBuyers: distribution.uniqueExternalBuyers,
+    positivePositionCount: distribution.positivePositionCount,
+    unknownTraderTradeCount: distribution.unknownTraderTradeCount,
   });
 }
 

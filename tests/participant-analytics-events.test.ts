@@ -28,6 +28,7 @@ void test('publie les deux événements dérivés avec des identités stables di
   assert.equal(profileEvent.confirmationStatus, projection.confirmationStatus);
   assert.equal(profileEvent.payload.inputFingerprint, projection.inputFingerprint);
   assert.equal(profileEvent.payload.confirmationCounts.confirmed, 2);
+  assert.equal('positions' in holderEvent.payload.distribution, false);
   assert.equal(Object.isFrozen(profileEvent.payload), true);
 });
 

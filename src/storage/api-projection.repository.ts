@@ -416,8 +416,24 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     );
     const profileRow = profileResult.rows[0];
     if (profileRow === undefined) return NOT_AVAILABLE_HOLDERS;
-    const snapshotResult = await this.database.query(
-      `SELECT snapshot_id, input_fingerprint, observed_at, confirmation_status,
+    try {
+      const storedProfile = restoredRecord(profileRow.payload);
+      const inputFingerprint = text(storedProfile.inputFingerprint);
+      const creatorProfile = toCreatorProfileRecord(storedProfile);
+      const currentSnapshotResult = await this.database.query(
+        `SELECT snapshot_id, input_fingerprint, observed_at, confirmation_status,
+          as_of_slot, as_of_transaction_index, as_of_instruction_index,
+          as_of_inner_instruction_index, total_positive_net_base_raw,
+          top1_bps, top5_bps, top10_bps, creator_bps, unique_known_buyers,
+          unique_external_buyers, positive_position_count,
+          unknown_trader_trade_count
+         FROM token_holders_snapshots
+         WHERE mint = $1 AND input_fingerprint = $2
+         LIMIT 1`,
+        [mint, inputFingerprint],
+      );
+      const snapshotResult = await this.database.query(
+        `SELECT snapshot_id, input_fingerprint, observed_at, confirmation_status,
           as_of_slot, as_of_transaction_index, as_of_instruction_index,
           as_of_inner_instruction_index, total_positive_net_base_raw,
           top1_bps, top5_bps, top10_bps, creator_bps, unique_known_buyers,
@@ -430,25 +446,24 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
           COALESCE(as_of_inner_instruction_index, -1) DESC,
           snapshot_id DESC
        LIMIT $2`,
-      [mint, this.holderLimits.snapshots],
-    );
-    const positionResult = await this.database.query(
-      `SELECT payload
-       FROM observed_wallet_positions
-       WHERE mint = $1
-       ORDER BY observed_net_base_raw DESC, wallet ASC
-       LIMIT $2`,
-      [mint, this.holderLimits.positions],
-    );
-    try {
+        [mint, this.holderLimits.snapshots],
+      );
+      const positionResult = await this.database.query(
+        `SELECT payload
+         FROM observed_wallet_positions
+         WHERE mint = $1
+         ORDER BY observed_net_base_raw DESC, wallet ASC
+         LIMIT $2`,
+        [mint, this.holderLimits.positions],
+      );
+      const currentSnapshotRow = currentSnapshotResult.rows[0];
+      if (currentSnapshotRow === undefined) throw invalid();
       const snapshots = freeze(snapshotResult.rows.map(toHolderSnapshot));
-      const latestSnapshot = snapshots[0];
-      if (latestSnapshot === undefined) throw invalid();
       const holders: ApiHolders = {
         status: 'AVAILABLE',
         methodology: 'OBSERVED_BONDING_CURVE_TRADES',
-        creatorProfile: toCreatorProfile(profileRow.payload),
-        latestSnapshot,
+        creatorProfile,
+        latestSnapshot: toHolderSnapshot(currentSnapshotRow),
         snapshots,
         positions: freeze(positionResult.rows.map((row) => toObservedWalletPosition(row.payload))),
         clusters: freeze([] as []),
@@ -502,9 +517,9 @@ function assembleLaunchDetail(
   });
 }
 
-function toCreatorProfile(value: unknown): ApiCreatorProfile {
-  const profile = restoredRecord(value);
+function toCreatorProfileRecord(profile: Record<string, unknown>): ApiCreatorProfile {
   if (safeNumber(profile.payloadVersion) !== 1) throw invalid();
+  text(profile.inputFingerprint);
   return freeze({
     mint: text(profile.mint),
     creator: text(profile.creator),

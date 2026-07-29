@@ -26,6 +26,8 @@ interface ParticipantAnalyticsClient {
   release(): void;
 }
 
+const POSITION_INSERT_BATCH_SIZE = 3_000;
+
 export interface ParticipantAnalyticsPool {
   connect(): Promise<ParticipantAnalyticsClient>;
 }
@@ -244,9 +246,24 @@ implements ParticipantAnalyticsTransaction {
   private async insertPositions(
     projection: ParticipantAnalyticsProjection,
   ): Promise<void> {
-    if (projection.distribution.positions.length === 0) return;
+    for (
+      let start = 0;
+      start < projection.distribution.positions.length;
+      start += POSITION_INSERT_BATCH_SIZE
+    ) {
+      await this.insertPositionBatch(
+        projection,
+        projection.distribution.positions.slice(start, start + POSITION_INSERT_BATCH_SIZE),
+      );
+    }
+  }
+
+  private async insertPositionBatch(
+    projection: ParticipantAnalyticsProjection,
+    positions: ParticipantAnalyticsProjection['distribution']['positions'],
+  ): Promise<void> {
     const values: unknown[] = [];
-    const rows = projection.distribution.positions.map((position, rowIndex) => {
+    const rows = positions.map((position, rowIndex) => {
       const offset = rowIndex * 18;
       values.push(
         projection.launch.mint, position.wallet, position.isCreator,

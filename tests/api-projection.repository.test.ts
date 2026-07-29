@@ -398,13 +398,73 @@ void test('expose les profils et positions observés avec des limites SQL borné
     clusterAnalysisStatus: 'NOT_AVAILABLE',
   });
   assert.deepEqual(
-    database.calls.find((call) => call.text.includes('FROM token_holders_snapshots'))?.values,
+    database.calls.find((call) =>
+      call.text.includes('FROM token_holders_snapshots')
+      && call.text.includes('ORDER BY as_of_slot DESC'))?.values,
     ['mint-a', 2],
   );
   assert.deepEqual(
     database.calls.find((call) => call.text.includes('FROM observed_wallet_positions'))?.values,
     ['mint-a', 1],
   );
+});
+
+void test('utilise le snapshot de l’empreinte courante après orphaning', async () => {
+  const current = {
+    snapshot_id: 'current',
+    input_fingerprint: 'current-fingerprint',
+    observed_at: detectedAt,
+    confirmation_status: 'confirmed',
+    as_of_slot: '10',
+    as_of_transaction_index: 0,
+    as_of_instruction_index: 1,
+    as_of_inner_instruction_index: null,
+    total_positive_net_base_raw: '0',
+    top1_bps: '0',
+    top5_bps: '0',
+    top10_bps: '0',
+    creator_bps: '0',
+    unique_known_buyers: 0,
+    unique_external_buyers: 0,
+    positive_position_count: 0,
+    unknown_trader_trade_count: 0,
+  };
+  const stale = {
+    ...current,
+    snapshot_id: 'stale',
+    input_fingerprint: 'stale-fingerprint',
+    as_of_instruction_index: 2,
+    total_positive_net_base_raw: '10',
+    top1_bps: '10000',
+    top5_bps: '10000',
+    top10_bps: '10000',
+    positive_position_count: 1,
+  };
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM creator_profiles')) return [{
+      payload: toJsonValue({
+        mint: 'mint-a', creator: 'creator', payloadVersion: 1,
+        inputFingerprint: 'current-fingerprint', buyCount: 0, sellCount: 0,
+        totalBoughtBaseRaw: 0n, totalSoldBaseRaw: 0n, observedNetBaseRaw: 0n,
+        hasSold: false, firstSell: null, initialBuys: [], quoteFlows: [],
+        uniqueExternalBuyers: 0, unknownTraderTradeCount: 0,
+      }),
+    }];
+    if (
+      call.text.includes('FROM token_holders_snapshots')
+      && call.text.includes('input_fingerprint = $2')
+    ) return [current];
+    if (call.text.includes('FROM token_holders_snapshots')) return [stale, current];
+    return [];
+  });
+
+  const holders = await new PostgresApiProjectionRepository(database).getLaunchHolders('mint-a');
+
+  assert.equal(holders?.status, 'AVAILABLE');
+  if (holders?.status !== 'AVAILABLE') return;
+  assert.equal(holders.latestSnapshot.id, 'current');
+  assert.deepEqual(holders.snapshots.map((snapshot) => snapshot.id), ['stale', 'current']);
 });
 
 void test('orders domain events and explicit transitions by the complete cursor', async () => {

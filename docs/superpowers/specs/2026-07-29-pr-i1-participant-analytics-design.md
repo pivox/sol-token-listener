@@ -228,8 +228,12 @@ processed < confirmed < finalized
 Les événements dérivés ne prennent pas le statut `orphaned`, car leur payload
 décrit précisément l'ensemble actif après exclusion. Si un événement
 antérieur devient orphaned, le même événement dérivé `asOf` peut recevoir un
-nouveau payload. L'upsert de `domain_events` déclenche alors une nouvelle
-révision dans l'outbox SSE existant.
+nouveau payload. `HolderDistributionUpdated` transporte uniquement l'agrégat
+borné (totaux, concentrations et compteurs) ; les positions complètes restent
+dans leur projection PostgreSQL et dans la route HTTP bornée afin qu'aucune
+révision SSE ne puisse dépasser les limites du transport.
+L'upsert de `domain_events` déclenche alors une nouvelle révision dans l'outbox
+SSE existant.
 
 Le payload contient l'empreinte d'entrée et les compteurs de finalité. Cela
 rend les montées de finalité observables même quand les agrégats financiers

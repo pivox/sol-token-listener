@@ -151,7 +151,13 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        )
        SELECT deleted_count FROM summary`,
     );
-    const domainEvents = await client.query(
+    const participantDomainEvents = await client.query(
+      `DELETE FROM domain_events event USING token_launches launch
+       WHERE event.mint = launch.mint
+         AND event.type IN ('CreatorProfileUpdated', 'HolderDistributionUpdated')
+         AND launch.purge_after <= NOW()`,
+    );
+    const expiredDomainEvents = await client.query(
       'DELETE FROM domain_events WHERE purge_after <= NOW()',
     );
     const rawEvents = await client.query(
@@ -179,7 +185,8 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       holderSnapshots: holderSnapshots.rowCount ?? 0,
       creatorProfiles: creatorProfiles.rowCount ?? 0,
       apiEventStream: Number(apiEventStream.rows[0]?.deleted_count ?? 0),
-      domainEvents: domainEvents.rowCount ?? 0,
+      domainEvents: (participantDomainEvents.rowCount ?? 0)
+        + (expiredDomainEvents.rowCount ?? 0),
       rawChainEvents: rawEvents.rowCount ?? 0,
       tokenLaunches: launches.rowCount ?? 0,
     };
