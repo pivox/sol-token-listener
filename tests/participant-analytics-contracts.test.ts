@@ -65,33 +65,33 @@ void test('publie les constantes stables de participant analytics', () => {
 });
 
 void test('valide une entrée canonique immuable', () => {
-  assert.doesNotThrow(() => assertValidParticipantAnalyticsInput(input));
+  assert.doesNotThrow(() => { assertValidParticipantAnalyticsInput(input); });
 });
 
 void test('refuse les montants, mints, curseurs et objets mutables incohérents', () => {
-  assert.throws(() => assertValidParticipantAnalyticsInput({
+  assert.throws(() => { assertValidParticipantAnalyticsInput({
     ...input,
     trades: Object.freeze([{ ...trade, baseAmountRaw: -1n }]),
-  }));
-  assert.throws(() => assertValidParticipantAnalyticsInput({
+  }); });
+  assert.throws(() => { assertValidParticipantAnalyticsInput({
     ...input,
     trades: Object.freeze([{ ...trade, launchMint: 'other' }]),
-  }));
-  assert.throws(() => assertValidParticipantAnalyticsInput({
+  }); });
+  assert.throws(() => { assertValidParticipantAnalyticsInput({
     ...input,
     trades: Object.freeze([trade, { ...trade }]),
-  }));
-  assert.throws(() => assertValidParticipantAnalyticsInput({
+  }); });
+  assert.throws(() => { assertValidParticipantAnalyticsInput({
     ...input,
     launch: { ...launch, cursor: { ...cursor } },
-  }));
-  assert.throws(() => assertValidParticipantAnalyticsInput({
+  }); });
+  assert.throws(() => { assertValidParticipantAnalyticsInput({
     ...input,
     trades: Object.freeze([{
       ...trade,
       quoteAsset: Object.freeze({ ...quoteAsset, decimals: 256 }),
     }]),
-  }));
+  }); });
 });
 
 void test('valide les projections et refuse les basis points hors échelle', () => {
@@ -129,10 +129,10 @@ void test('valide les projections et refuse les basis points hors échelle', () 
     unknownTraderTradeCount: 0,
   });
 
-  assert.doesNotThrow(() => assertValidCreatorProfile(profile));
-  assert.doesNotThrow(() => assertValidHolderDistribution(distribution));
-  assert.throws(() => assertValidHolderDistribution({
+  assert.doesNotThrow(() => { assertValidCreatorProfile(profile); });
+  assert.doesNotThrow(() => { assertValidHolderDistribution(distribution); });
+  assert.throws(() => { assertValidHolderDistribution({
     ...distribution,
     top1Bps: 10_001n,
-  }));
+  }); });
 });

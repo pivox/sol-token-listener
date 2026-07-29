@@ -169,9 +169,7 @@ export function assertValidParticipantAnalyticsInput(
     assertValidChainCursor(trade.cursor);
     assertAmount(trade.baseAmountRaw, 'trade.baseAmountRaw');
     assertAmount(trade.quoteAmountRaw, 'trade.quoteAmountRaw');
-    if (trade.kind !== 'BUY' && trade.kind !== 'SELL') {
-      throw new TypeError('Trade kind is invalid.');
-    }
+    assertTradeKind(trade.kind);
     if (trade.trader !== null) assertText(trade.trader, 'trade.trader');
     assertQuoteAsset(trade.quoteAsset);
     const cursorKey = [
@@ -194,9 +192,7 @@ export function assertValidCreatorProfile(profile: CreatorProfile): void {
   assertText(profile.mint, 'profile.mint');
   assertText(profile.creator, 'profile.creator');
   assertText(profile.inputFingerprint, 'profile.inputFingerprint');
-  if (profile.payloadVersion !== PARTICIPANT_ANALYTICS_PAYLOAD_VERSION) {
-    throw new TypeError('Creator profile payload version is invalid.');
-  }
+  assertPayloadVersion(profile.payloadVersion, 'Creator profile');
   assertCount(profile.buyCount, 'profile.buyCount');
   assertCount(profile.sellCount, 'profile.sellCount');
   assertAmount(profile.totalBoughtBaseRaw, 'profile.totalBoughtBaseRaw');
@@ -217,9 +213,7 @@ export function assertValidHolderDistribution(
   assertText(distribution.mint, 'distribution.mint');
   assertText(distribution.creator, 'distribution.creator');
   assertText(distribution.inputFingerprint, 'distribution.inputFingerprint');
-  if (distribution.payloadVersion !== PARTICIPANT_ANALYTICS_PAYLOAD_VERSION) {
-    throw new TypeError('Holder distribution payload version is invalid.');
-  }
+  assertPayloadVersion(distribution.payloadVersion, 'Holder distribution');
   assertFrozen(distribution.positions, 'distribution.positions');
   assertAmount(distribution.totalPositiveNetBaseRaw, 'distribution.totalPositiveNetBaseRaw');
   for (const [name, value] of [
@@ -261,14 +255,30 @@ function assertQuoteAsset(asset: QuoteAsset): void {
   if (!Number.isSafeInteger(asset.decimals) || asset.decimals < 0 || asset.decimals > 255) {
     throw new TypeError('Quote asset decimals are invalid.');
   }
-  if (asset.tokenProgram !== 'SPL_TOKEN' && asset.tokenProgram !== 'TOKEN_2022') {
-    throw new TypeError('Quote token program is invalid.');
-  }
+  assertTokenProgram(asset.tokenProgram);
 }
 
 function assertActiveConfirmation(value: string): void {
   if (!(PARTICIPANT_ANALYTICS_CONFIRMATION_ORDER as readonly string[]).includes(value)) {
     throw new TypeError('Participant analytics confirmation status is invalid.');
+  }
+}
+
+function assertTradeKind(value: unknown): void {
+  if (value !== 'BUY' && value !== 'SELL') {
+    throw new TypeError('Trade kind is invalid.');
+  }
+}
+
+function assertPayloadVersion(value: unknown, name: string): void {
+  if (value !== PARTICIPANT_ANALYTICS_PAYLOAD_VERSION) {
+    throw new TypeError(`${name} payload version is invalid.`);
+  }
+}
+
+function assertTokenProgram(value: unknown): void {
+  if (value !== 'SPL_TOKEN' && value !== 'TOKEN_2022') {
+    throw new TypeError('Quote token program is invalid.');
   }
 }
 
