@@ -4,13 +4,19 @@ import { loadConfig } from './config/env.js';
 import { ApiServer, type ApiListeningAddress, type ApiServerOptions } from './interfaces/http/api-server.js';
 import { createQualificationEngine } from './qualification/qualification-engine.js';
 import { PostgresApiEventStreamRepository } from './storage/api-event-stream.repository.js';
-import { PostgresApiProjectionRepository } from './storage/api-projection.repository.js';
+import { PostgresApiProjectionRepository, type ApiProjectionPipelineState } from './storage/api-projection.repository.js';
 import type { ApiEventStreamRepository } from './ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from './ports/api-projection-repository.js';
 import { closeDatabase, getDatabasePool, migrateDatabase } from './storage/database.js';
 import { logger } from './utils/logger.js';
 
 type ApplicationPool = unknown;
+
+export const PRODUCTION_API_PIPELINE_STATE: ApiProjectionPipelineState = Object.freeze({
+  httpAvailable: true,
+  pumpfun: 'STOPPED',
+  pumpswap: 'IDLE',
+});
 
 export interface ApplicationServer {
   listen(): Promise<ApiListeningAddress>;
@@ -22,7 +28,10 @@ export interface ApplicationDependencies {
   readonly createQualificationEngine: (config: AppConfig) => Readonly<{ minimumTotalScore: number }>;
   readonly getDatabasePool: (databaseUrl: string) => ApplicationPool;
   readonly migrateDatabase: (pool: ApplicationPool) => Promise<readonly string[]>;
-  readonly createProjectionRepository: (pool: ApplicationPool) => ApiProjectionRepository;
+  readonly createProjectionRepository: (
+    pool: ApplicationPool,
+    pipeline: ApiProjectionPipelineState,
+  ) => ApiProjectionRepository;
   readonly createEventStreamRepository: (pool: ApplicationPool) => ApiEventStreamRepository;
   readonly createApiServer: (options: ApiServerOptions) => ApplicationServer;
   readonly closeDatabase: () => Promise<void>;
@@ -38,35 +47,37 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
     const config = dependencies.loadConfig();
     const qualificationEngine = dependencies.createQualificationEngine(config);
     logFoundation(dependencies.logInfo, config, qualificationEngine.minimumTotalScore);
-    if (config.apiEnabled) {
+    if (config.apiEnabled || config.autoMigrate) {
       const pool = dependencies.getDatabasePool(config.databaseUrl);
       if (config.autoMigrate) {
         const appliedMigrations = await dependencies.migrateDatabase(pool);
         dependencies.logInfo({ event: 'database.migrations_applied', count: appliedMigrations.length }, 'Migrations PostgreSQL appliquées.');
       }
-      const projections = dependencies.createProjectionRepository(pool);
-      const stream = dependencies.createEventStreamRepository(pool);
-      server = dependencies.createApiServer({
-        host: config.apiHost,
-        port: config.apiPort,
-        projections,
-        stream,
-        defaultLimit: config.apiPageLimitDefault,
-        maximumLimit: config.apiPageLimitMaximum,
-        ssePollMs: config.apiSsePollMs,
-        sseHeartbeatMs: config.apiSseHeartbeatMs,
-        logError: (context) => { dependencies.logInfo(context, 'La requête API a échoué.'); },
-      });
-      const address = await server.listen();
-      dependencies.logInfo({
-        event: 'api.started', host: address.host, port: address.port,
-        apiEnabled: config.apiEnabled, executionMode: config.executionMode,
-        transactionSubmissionEnabled: false,
-      }, 'API publique d’observation disponible.');
-      await dependencies.waitForShutdownSignal();
-      const startedServer = server;
-      server = null;
-      await startedServer.close();
+      if (config.apiEnabled) {
+        const projections = dependencies.createProjectionRepository(pool, PRODUCTION_API_PIPELINE_STATE);
+        const stream = dependencies.createEventStreamRepository(pool);
+        server = dependencies.createApiServer({
+          host: config.apiHost,
+          port: config.apiPort,
+          projections,
+          stream,
+          defaultLimit: config.apiPageLimitDefault,
+          maximumLimit: config.apiPageLimitMaximum,
+          ssePollMs: config.apiSsePollMs,
+          sseHeartbeatMs: config.apiSseHeartbeatMs,
+          logError: (context) => { dependencies.logInfo(context, 'La requête API a échoué.'); },
+        });
+        const address = await server.listen();
+        dependencies.logInfo({
+          event: 'api.started', host: address.host, port: address.port,
+          apiEnabled: config.apiEnabled, executionMode: config.executionMode,
+          transactionSubmissionEnabled: false,
+        }, 'API publique d’observation disponible.');
+        await dependencies.waitForShutdownSignal();
+        const startedServer = server;
+        server = null;
+        await startedServer.close();
+      }
     }
   } catch (error) {
     primaryError = { value: error };
@@ -107,8 +118,10 @@ const productionDependencies: ApplicationDependencies = {
   createQualificationEngine,
   getDatabasePool,
   migrateDatabase: async (pool) => migrateDatabase({ pool: pool as ReturnType<typeof getDatabasePool> }),
-  createProjectionRepository: (pool) => new PostgresApiProjectionRepository(
+  createProjectionRepository: (pool, pipeline) => new PostgresApiProjectionRepository(
     pool as ConstructorParameters<typeof PostgresApiProjectionRepository>[0],
+    () => new Date(),
+    pipeline,
   ),
   createEventStreamRepository: (pool) => new PostgresApiEventStreamRepository(
     pool as ConstructorParameters<typeof PostgresApiEventStreamRepository>[0],

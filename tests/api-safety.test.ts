@@ -144,6 +144,38 @@ void test('ApiServer ne crée aucune session SSE lorsqu’une poignée de main s
   }
 });
 
+void test('ApiServer force la fermeture bornée d’une poignée de main SSE qui ne répond jamais', async () => {
+  let markHighWaterStarted: (() => void) | undefined;
+  const highWaterStarted = new Promise<void>((resolve) => { markHighWaterStarted = resolve; });
+  let polls = 0;
+  const stalledStream: ApiEventStreamRepository = {
+    async highWaterMark() {
+      markHighWaterStarted?.();
+      return new Promise<never>(() => undefined);
+    },
+    async resolve(sequence) { return { status: 'CURRENT' as const, sequence }; },
+    async readAfter() { polls += 1; return []; },
+  };
+  const server = new ApiServer({
+    host: '127.0.0.1', port: 0, projections, stream: stalledStream,
+    shutdownGraceMs: 25,
+  });
+  const address = await server.listen();
+  const outgoing = requestHttp({ host: address.host, port: address.port, path: '/api/v1/events', headers: { accept: 'text/event-stream' } });
+  const socketClosed = new Promise<void>((resolve) => { outgoing.once('close', resolve); });
+  outgoing.on('error', () => undefined);
+  outgoing.end();
+  await highWaterStarted;
+  try {
+    await within(server.close(), 250, 'bounded server close');
+    await within(socketClosed, 250, 'client socket close');
+    assert.equal(server.activeSessionCount, 0);
+    assert.equal(polls, 0);
+  } finally {
+    outgoing.destroy();
+  }
+});
+
 void test('les sources HTTP publiques ne chargent aucune capacité de signature ou de mutation', async () => {
   const files = ['../src/interfaces/http/api-server.ts', '../src/interfaces/http/api-router.ts', '../src/interfaces/http/sse-session.ts', '../src/app.ts'];
   for (const file of files) {

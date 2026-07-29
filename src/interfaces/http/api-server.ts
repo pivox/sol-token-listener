@@ -1,11 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
 import { createApiRouter, type ApiRouter } from './api-router.js';
 import { SseSession, type SseSessionOptions } from './sse-session.js';
 import type { ApiEventStreamRepository } from '../../ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from '../../ports/api-projection-repository.js';
 
 const DEFAULT_SSE_BATCH_SIZE = 100;
+export const DEFAULT_API_SHUTDOWN_GRACE_MS = 1_000;
+const MAX_API_SHUTDOWN_GRACE_MS = 60_000;
 
 export interface ApiServerLogContext {
   readonly event: 'api.request_failed';
@@ -26,6 +28,7 @@ export interface ApiServerOptions {
   readonly sseBatchSize?: number;
   readonly ssePollMs?: number;
   readonly sseHeartbeatMs?: number;
+  readonly shutdownGraceMs?: number;
   readonly correlationId?: () => string;
   readonly logError?: (context: ApiServerLogContext) => void;
   readonly createServer?: (handler: (request: IncomingMessage, response: ServerResponse) => void) => Server;
@@ -45,6 +48,8 @@ export class ApiServer {
   private readonly host: string;
   private readonly port: number;
   private readonly logError: ((context: ApiServerLogContext) => void) | undefined;
+  private readonly shutdownGraceMs: number;
+  private readonly sockets = new Set<Socket>();
   private listenCalled = false;
   private listenPromise: Promise<ApiListeningAddress> | null = null;
   private closePromise: Promise<void> | null = null;
@@ -55,6 +60,7 @@ export class ApiServer {
     this.host = options.host;
     this.port = options.port;
     this.logError = options.logError;
+    this.shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_API_SHUTDOWN_GRACE_MS;
     const createSession = options.createSseSession ?? ((sessionOptions: SseSessionOptions): SseSession => new SseSession(sessionOptions));
     const routerFactory = options.createRouter ?? createApiRouter;
     this.router = routerFactory({
@@ -89,6 +95,7 @@ export class ApiServer {
     });
     const createNodeServer = options.createServer ?? createServer;
     this.server = createNodeServer(this.handleRequest);
+    this.server.on('connection', this.onConnection);
   }
 
   public get activeSessionCount(): number { return this.sessions.size; }
@@ -140,8 +147,18 @@ export class ApiServer {
     await closeSessions;
     await new Promise<void>((resolve) => { setImmediate(resolve); });
     this.server.closeIdleConnections();
-    await stoppedAccepting;
+    const closedWithinGrace = await waitForClose(stoppedAccepting, this.shutdownGraceMs);
+    if (!closedWithinGrace) {
+      forceCloseConnections(this.server, this.sockets);
+      await stoppedAccepting;
+    }
+    this.server.off('connection', this.onConnection);
   }
+
+  private readonly onConnection = (socket: Socket): void => {
+    this.sockets.add(socket);
+    socket.once('close', () => { this.sockets.delete(socket); });
+  };
 
   private readonly handleRequest = (request: IncomingMessage, response: ServerResponse): void => {
     void Promise.resolve().then(() => {
@@ -161,8 +178,40 @@ export class ApiServer {
 }
 
 function assertOptions(options: ApiServerOptions): void {
-  if (options.host.length === 0 || !Number.isSafeInteger(options.port) || options.port < 0 || options.port > 65_535) {
+  const shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_API_SHUTDOWN_GRACE_MS;
+  if (
+    options.host.length === 0
+    || !Number.isSafeInteger(options.port)
+    || options.port < 0
+    || options.port > 65_535
+    || !Number.isSafeInteger(shutdownGraceMs)
+    || shutdownGraceMs <= 0
+    || shutdownGraceMs > MAX_API_SHUTDOWN_GRACE_MS
+  ) {
     throw new TypeError('API server host and port are invalid.');
+  }
+}
+
+async function waitForClose(closePromise: Promise<void>, graceMs: number): Promise<boolean> {
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      closePromise.then(() => true),
+      new Promise<boolean>((resolve) => { deadline = setTimeout(() => { resolve(false); }, graceMs); }),
+    ]);
+  } finally {
+    if (deadline !== undefined) clearTimeout(deadline);
+  }
+}
+
+function forceCloseConnections(server: Server, sockets: ReadonlySet<Socket>): void {
+  if (typeof server.closeAllConnections === 'function') {
+    try { server.closeAllConnections(); } catch { /* tracked sockets remain as a fallback */ }
+  }
+  for (const socket of sockets) {
+    if (!socket.destroyed) {
+      try { socket.destroy(); } catch { /* shutdown is already forced */ }
+    }
   }
 }
 
