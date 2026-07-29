@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import pg from 'pg';
 import { DOMAIN_EVENT_TYPES } from '../src/domain/events.js';
-import { migrateDatabase } from '../src/storage/database.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 
 const migrationUrl = new URL('../migrations/006_api_event_stream.sql', import.meta.url);
 
@@ -28,7 +28,10 @@ void test('la migration crée une outbox append-only publique, indexée et sans 
   assert.match(sql, /id SMALLINT PRIMARY KEY CHECK \(id = 1\)/u);
   assert.match(sql, /last_sequence BIGINT NOT NULL DEFAULT 0 CHECK \(last_sequence >= 0\)/u);
   assert.match(sql, /backfill_completed BOOLEAN NOT NULL DEFAULT FALSE/u);
+  assert.match(sql, /expired_through_sequence BIGINT NOT NULL DEFAULT 0/u);
+  assert.match(sql, /expired_through_sequence >= 0[\s\S]*expired_through_sequence <= last_sequence/u);
   assert.match(sql, /ALTER TABLE api_event_stream_state[\s\S]*ADD COLUMN IF NOT EXISTS backfill_completed/u);
+  assert.match(sql, /ALTER TABLE api_event_stream_state[\s\S]*ADD COLUMN IF NOT EXISTS expired_through_sequence/u);
   assert.match(sql, /INSERT INTO api_event_stream_state \(id\) VALUES \(1\) ON CONFLICT \(id\) DO NOTHING/u);
   assert.deepEqual(
     sqlStringListAfter(sql, 'event_type TEXT NOT NULL CHECK (event_type IN ('),
@@ -64,7 +67,12 @@ void test('la migration enfile les révisions publiques avec trigger rejouable e
   assert.match(sql, /NOT EXISTS \([\s\S]*existing\.domain_event_id = domain_events\.event_id/u);
   assert.match(sql, /%1\$I\.api_event_stream existing/u);
   assert.match(sql, /AND type IN \(/u);
-  assert.match(sql, /NOW\(\) \+ INTERVAL '4 hours'/u);
+  assert.match(sql, /clock_timestamp\(\) \+ INTERVAL '4 hours'/u);
+  assert.ok(
+    [...sql.matchAll(/clock_timestamp\(\) \+ INTERVAL '4 hours'/gu)].length >= 2,
+  );
+  assert.doesNotMatch(sql, /NOW\(\) \+ INTERVAL '4 hours'/u);
+  assert.doesNotMatch(sql, /\$5,\s*NOW\(\) \+ INTERVAL '4 hours'/u);
   assert.match(sql, /WHERE \(?purge_after IS NULL OR purge_after > NOW\(\)\)?/u);
   assert.match(sql, /ORDER BY created_at, event_id/u);
   assert.match(sql, /to_char\(\s*NEW\.blockchain_time AT TIME ZONE 'UTC'/u);
@@ -87,18 +95,49 @@ void test('la migration enfile les révisions publiques avec trigger rejouable e
   assert.match(sql, /SELECT backfill_completed[\s\S]*INTO backfill_done/u);
   assert.match(sql, /IF NOT backfill_done THEN/u);
   assert.match(sql, /backfill_completed = TRUE/u);
+  assert.doesNotMatch(
+    sql,
+    /SET[\s\S]*expired_through_sequence\s*=(?!\s*GREATEST)/u,
+  );
 });
 
 void test('la purge supprime l’outbox avant les événements de domaine et expose son compteur', async () => {
   const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
 
-  const outboxDeletion = source.indexOf("DELETE FROM api_event_stream WHERE purge_after <= NOW()");
+  const outboxDeletion = source.indexOf('DELETE FROM api_event_stream');
   const domainDeletion = source.indexOf("DELETE FROM domain_events WHERE purge_after <= NOW()");
   assert.ok(outboxDeletion >= 0);
   assert.ok(domainDeletion > outboxDeletion);
+  assert.match(source, /WITH deleted AS \([\s\S]*DELETE FROM api_event_stream[\s\S]*purge_after <= clock_timestamp\(\)[\s\S]*RETURNING sequence/u);
+  assert.match(source, /MAX\(sequence\) AS max_deleted_sequence/u);
+  assert.match(source, /expired_through_sequence = GREATEST\([\s\S]*max_deleted_sequence/u);
+  assert.match(source, /SELECT deleted_count FROM summary/u);
   assert.match(source, /readonly apiEventStream: number;/u);
-  assert.match(source, /apiEventStream: apiEventStream\.rowCount \?\? 0,/u);
+  assert.match(source, /apiEventStream: Number\(apiEventStream\.rows\[0\]\?\.deleted_count \?\? 0\),/u);
   assert.doesNotMatch(source, /DELETE FROM api_event_stream_state/u);
+});
+
+void test('la purge retourne le compteur agrégé de l’outbox, pas le rowCount du SELECT', async () => {
+  const queries: string[] = [];
+  const client = {
+    query: async (text: string) => {
+      queries.push(text);
+      if (text.includes('WITH deleted AS')) {
+        return { rows: [{ deleted_count: '7' }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  const pool = {
+    connect: async () => client,
+  } as unknown as InstanceType<typeof pg.Pool>;
+
+  const result = await purgeExpiredFoundationData(pool);
+
+  assert.equal(result.apiEventStream, 7);
+  assert.ok(queries.some((query) => query.includes('RETURNING sequence')));
+  assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
 
 void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est configurée', async (context) => {
@@ -254,41 +293,157 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
     )).rowCount, 0);
 
     await assertCommitOrderedSequences(pool, schema);
+    await assertSequenceOrderedExpirations(pool);
+
+    for (const [eventId, signature, slot] of [
+      ['purge-prefix-first', 'purge-prefix-first-signature', '50'],
+      ['purge-prefix-second', 'purge-prefix-second-signature', '51'],
+      ['purge-retained', 'purge-retained-signature', '52'],
+    ] as const) await pool.query(domainEventInsertSql, [eventId, signature, slot]);
+    const purgeCandidates = await pool.query<{
+      readonly domain_event_id: string;
+      readonly sequence: string;
+    }>(
+      `SELECT domain_event_id, sequence
+       FROM api_event_stream
+       WHERE domain_event_id LIKE 'purge-%'
+       ORDER BY sequence`,
+    );
+    assert.deepEqual(purgeCandidates.rows.map((row) => row.domain_event_id), [
+      'purge-prefix-first',
+      'purge-prefix-second',
+      'purge-retained',
+    ]);
+    const maxPrefixSequence = purgeCandidates.rows[1]?.sequence ?? '0';
+    await pool.query(
+      `UPDATE api_event_stream
+       SET purge_after = clock_timestamp() - INTERVAL '1 second'
+       WHERE domain_event_id IN ('purge-prefix-first', 'purge-prefix-second')`,
+    );
+    await pool.query(
+      `UPDATE domain_events
+       SET terminal_at = clock_timestamp(),
+           purge_after = clock_timestamp() - INTERVAL '1 second'
+       WHERE event_id IN ('purge-prefix-first', 'purge-prefix-second')`,
+    );
+    const stateBeforePurge = (await pool.query<{
+      readonly backfill_completed: boolean;
+      readonly expired_through_sequence: string;
+      readonly last_sequence: string;
+    }>(
+      `SELECT backfill_completed, expired_through_sequence, last_sequence
+       FROM api_event_stream_state WHERE id = 1`,
+    )).rows[0];
+    await pool.query(`CREATE FUNCTION reject_domain_event_purge()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'forced purge rollback';
+      END
+      $$`);
+    await pool.query(`CREATE TRIGGER reject_domain_event_purge_trigger
+      BEFORE DELETE ON domain_events
+      FOR EACH STATEMENT EXECUTE FUNCTION reject_domain_event_purge()`);
+    await assert.rejects(purgeExpiredFoundationData(pool), /forced purge rollback/u);
+    assert.equal((await pool.query(
+      `SELECT 1 FROM api_event_stream
+       WHERE domain_event_id IN ('purge-prefix-first', 'purge-prefix-second')`,
+    )).rowCount, 2);
+    assert.deepEqual((await pool.query(
+      `SELECT backfill_completed, expired_through_sequence, last_sequence
+       FROM api_event_stream_state WHERE id = 1`,
+    )).rows[0], stateBeforePurge);
+    await pool.query('DROP TRIGGER reject_domain_event_purge_trigger ON domain_events');
+    await pool.query('DROP FUNCTION reject_domain_event_purge()');
+
+    const partialPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(partialPurge.apiEventStream, 2);
+    assert.equal((await pool.query(
+      `SELECT 1 FROM api_event_stream
+       WHERE domain_event_id IN ('purge-prefix-first', 'purge-prefix-second')`,
+    )).rowCount, 0);
+    const stateAfterPartialPurge = (await pool.query<{
+      readonly backfill_completed: boolean;
+      readonly expired_through_sequence: string;
+      readonly last_sequence: string;
+    }>(
+      `SELECT backfill_completed, expired_through_sequence, last_sequence
+       FROM api_event_stream_state WHERE id = 1`,
+    )).rows[0];
+    assert.equal(stateAfterPartialPurge?.expired_through_sequence, maxPrefixSequence);
+    assert.equal(stateAfterPartialPurge?.last_sequence, stateBeforePurge?.last_sequence);
+    assert.equal(stateAfterPartialPurge?.backfill_completed, stateBeforePurge?.backfill_completed);
+    const emptyPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(emptyPurge.apiEventStream, 0);
+    assert.deepEqual((await pool.query(
+      `SELECT backfill_completed, expired_through_sequence, last_sequence
+       FROM api_event_stream_state WHERE id = 1`,
+    )).rows[0], stateAfterPartialPurge);
+
+    await pool.query(
+      domainEventInsertSql,
+      ['post-partial-purge', 'post-partial-purge-signature', '53'],
+    );
+    const stateAfterNewEvent = (await pool.query<{
+      readonly expired_through_sequence: string;
+      readonly last_sequence: string;
+    }>(
+      `SELECT expired_through_sequence, last_sequence
+       FROM api_event_stream_state WHERE id = 1`,
+    )).rows[0];
+    assert.ok(
+      BigInt(stateAfterNewEvent?.last_sequence ?? '0')
+        > BigInt(stateAfterPartialPurge?.last_sequence ?? '0'),
+    );
+    assert.equal(
+      stateAfterNewEvent?.expired_through_sequence,
+      stateAfterPartialPurge?.expired_through_sequence,
+    );
 
     const checkpointBeforePurge = await pool.query<{
+      readonly backfill_completed: boolean;
+      readonly expired_through_sequence: string;
       readonly last_sequence: string;
       readonly visible_max: string;
     }>(
-      `SELECT state.last_sequence, COALESCE(MAX(stream.sequence), 0) AS visible_max
+      `SELECT state.backfill_completed, state.expired_through_sequence, state.last_sequence,
+              COALESCE(MAX(stream.sequence), 0) AS visible_max
        FROM api_event_stream_state state
        LEFT JOIN api_event_stream stream ON TRUE
        WHERE state.id = 1
-       GROUP BY state.id, state.last_sequence`,
+       GROUP BY state.id, state.backfill_completed, state.expired_through_sequence,
+                state.last_sequence`,
     );
     assert.ok(BigInt(checkpointBeforePurge.rows[0]?.last_sequence ?? '-1') > 0n);
     assert.equal(
       checkpointBeforePurge.rows[0]?.last_sequence,
       checkpointBeforePurge.rows[0]?.visible_max,
     );
-    await pool.query('DELETE FROM api_event_stream');
-    assert.equal((await pool.query('SELECT 1 FROM api_event_stream')).rowCount, 0);
-    assert.equal(
-      (await pool.query<{ readonly last_sequence: string }>(
-        'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
-      )).rows[0]?.last_sequence,
-      checkpointBeforePurge.rows[0]?.last_sequence,
+    const visibleBeforeTotalPurge = (await pool.query<{ readonly count: string }>(
+      'SELECT COUNT(*) AS count FROM api_event_stream',
+    )).rows[0]?.count ?? '0';
+    await pool.query(
+      "UPDATE api_event_stream SET purge_after = clock_timestamp() - INTERVAL '1 second'",
     );
+    const totalPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(totalPurge.apiEventStream, Number(visibleBeforeTotalPurge));
+    assert.equal((await pool.query('SELECT 1 FROM api_event_stream')).rowCount, 0);
+    const stateAfterTotalPurge = (await pool.query<{
+      readonly backfill_completed: boolean;
+      readonly expired_through_sequence: string;
+      readonly last_sequence: string;
+    }>(
+      `SELECT backfill_completed, expired_through_sequence, last_sequence
+       FROM api_event_stream_state WHERE id = 1`,
+    )).rows[0];
+    assert.equal(stateAfterTotalPurge?.last_sequence, checkpointBeforePurge.rows[0]?.last_sequence);
+    assert.equal(stateAfterTotalPurge?.expired_through_sequence, stateAfterTotalPurge?.last_sequence);
+    assert.equal(stateAfterTotalPurge?.backfill_completed, checkpointBeforePurge.rows[0]?.backfill_completed);
     await pool.query(migrationSql);
     assert.equal((await pool.query('SELECT 1 FROM api_event_stream')).rowCount, 0);
-    assert.equal(
-      (await pool.query<{ readonly last_sequence: string }>(
-        'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
-      )).rows[0]?.last_sequence,
-      checkpointBeforePurge.rows[0]?.last_sequence,
-    );
-    assert.equal((await pool.query<{ readonly backfill_completed: boolean }>(
-      'SELECT backfill_completed FROM api_event_stream_state WHERE id = 1',
-    )).rows[0]?.backfill_completed, true);
+    assert.deepEqual((await pool.query(
+      `SELECT backfill_completed, expired_through_sequence, last_sequence
+       FROM api_event_stream_state WHERE id = 1`,
+    )).rows[0], stateAfterTotalPurge);
 
     const shadowClient = await pool.connect();
     try {
@@ -317,17 +472,23 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       );
       const persistentCheckpoint = await shadowClient.query<{
         readonly backfill_completed: boolean;
+        readonly expired_through_sequence: string;
         readonly last_sequence: string;
         readonly visible_max: string;
       }>(
-        `SELECT state.backfill_completed, state.last_sequence, MAX(stream.sequence) AS visible_max
+        `SELECT state.backfill_completed, state.expired_through_sequence, state.last_sequence,
+                MAX(stream.sequence) AS visible_max
          FROM ${quoteIdentifier(schema)}.api_event_stream_state state
          JOIN ${quoteIdentifier(schema)}.api_event_stream stream ON TRUE
          WHERE state.id = 1
-         GROUP BY state.id, state.backfill_completed, state.last_sequence`,
+         GROUP BY state.id, state.backfill_completed, state.expired_through_sequence,
+                  state.last_sequence`,
       );
-      const temporaryCheckpoint = await shadowClient.query<{ readonly last_sequence: string }>(
-        'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
+      const temporaryCheckpoint = await shadowClient.query<{
+        readonly expired_through_sequence: string;
+        readonly last_sequence: string;
+      }>(
+        'SELECT expired_through_sequence, last_sequence FROM api_event_stream_state WHERE id = 1',
       );
       assert.equal(persistentCount.rows[0]?.count, '2');
       assert.equal(temporaryCount.rows[0]?.count, '0');
@@ -340,7 +501,12 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
         persistentCheckpoint.rows[0]?.visible_max,
       );
       assert.equal(persistentCheckpoint.rows[0]?.backfill_completed, true);
+      assert.equal(
+        persistentCheckpoint.rows[0]?.expired_through_sequence,
+        stateAfterTotalPurge?.expired_through_sequence,
+      );
       assert.equal(temporaryCheckpoint.rows[0]?.last_sequence, '0');
+      assert.equal(temporaryCheckpoint.rows[0]?.expired_through_sequence, '0');
     } finally {
       shadowClient.release();
     }
@@ -381,6 +547,58 @@ async function applyMigration(
     throw error;
   } finally {
     client.release();
+  }
+}
+
+async function assertSequenceOrderedExpirations(
+  pool: InstanceType<typeof pg.Pool>,
+): Promise<void> {
+  const earlierTransaction = await pool.connect();
+  const laterTransaction = await pool.connect();
+  let earlierOpen = false;
+  let laterOpen = false;
+  try {
+    await earlierTransaction.query('BEGIN');
+    earlierOpen = true;
+    await delay(50);
+    await laterTransaction.query('BEGIN');
+    laterOpen = true;
+    await laterTransaction.query(
+      domainEventInsertSql,
+      ['expiration-sequence-first', 'expiration-sequence-first-signature', '54'],
+    );
+    await laterTransaction.query('COMMIT');
+    laterOpen = false;
+    await earlierTransaction.query(
+      domainEventInsertSql,
+      ['expiration-sequence-second', 'expiration-sequence-second-signature', '55'],
+    );
+    await earlierTransaction.query('COMMIT');
+    earlierOpen = false;
+
+    const expirations = await pool.query<{
+      readonly domain_event_id: string;
+      readonly purge_after: Date;
+      readonly sequence: string;
+    }>(
+      `SELECT domain_event_id, purge_after, sequence
+       FROM api_event_stream
+       WHERE domain_event_id IN ('expiration-sequence-first', 'expiration-sequence-second')
+       ORDER BY sequence`,
+    );
+    assert.deepEqual(expirations.rows.map((row) => row.domain_event_id), [
+      'expiration-sequence-first',
+      'expiration-sequence-second',
+    ]);
+    assert.ok(
+      (expirations.rows[1]?.purge_after.getTime() ?? 0)
+        >= (expirations.rows[0]?.purge_after.getTime() ?? 1),
+    );
+  } finally {
+    if (earlierOpen) await earlierTransaction.query('ROLLBACK');
+    if (laterOpen) await laterTransaction.query('ROLLBACK');
+    earlierTransaction.release();
+    laterTransaction.release();
   }
 }
 

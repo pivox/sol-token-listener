@@ -34,10 +34,38 @@ CREATE TABLE IF NOT EXISTS api_event_stream (
 CREATE TABLE IF NOT EXISTS api_event_stream_state (
   id SMALLINT PRIMARY KEY CHECK (id = 1),
   last_sequence BIGINT NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
-  backfill_completed BOOLEAN NOT NULL DEFAULT FALSE
+  backfill_completed BOOLEAN NOT NULL DEFAULT FALSE,
+  expired_through_sequence BIGINT NOT NULL DEFAULT 0,
+  CONSTRAINT api_event_stream_state_expired_sequence_check CHECK (
+    expired_through_sequence >= 0
+    AND expired_through_sequence <= last_sequence
+  )
 );
 ALTER TABLE api_event_stream_state
   ADD COLUMN IF NOT EXISTS backfill_completed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE api_event_stream_state
+  ADD COLUMN IF NOT EXISTS expired_through_sequence BIGINT NOT NULL DEFAULT 0;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint constraint_definition
+    JOIN pg_class constrained_table
+      ON constrained_table.oid = constraint_definition.conrelid
+    JOIN pg_namespace constrained_schema
+      ON constrained_schema.oid = constrained_table.relnamespace
+    WHERE constraint_definition.conname = 'api_event_stream_state_expired_sequence_check'
+      AND constrained_table.relname = 'api_event_stream_state'
+      AND constrained_schema.nspname = current_schema()
+  ) THEN
+    ALTER TABLE api_event_stream_state
+      ADD CONSTRAINT api_event_stream_state_expired_sequence_check CHECK (
+        expired_through_sequence >= 0
+        AND expired_through_sequence <= last_sequence
+      );
+  END IF;
+END;
+$$;
 INSERT INTO api_event_stream_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
 CREATE OR REPLACE FUNCTION enqueue_api_domain_event_revision()
@@ -108,7 +136,7 @@ BEGIN
         payload_version, event, purge_after
       ) VALUES (
         $1 || ':' || $2::text || ':' || $3 || ':' || $4::text || ':' || md5($5::text),
-        $1, $2, $6, $7, $3, $4, $5, NOW() + INTERVAL '4 hours'
+        $1, $2, $6, $7, $3, $4, $5, clock_timestamp() + INTERVAL '4 hours'
       ) ON CONFLICT (domain_event_id, revision) DO NOTHING
       RETURNING sequence
     $sql$,
@@ -144,6 +172,7 @@ DO $$
 DECLARE
   target_schema TEXT := current_schema();
   backfill_done BOOLEAN;
+  backfill_purge_after TIMESTAMPTZ;
 BEGIN
   IF target_schema IS NULL THEN
     RAISE EXCEPTION 'A current schema is required for the API event stream backfill.';
@@ -158,6 +187,7 @@ BEGIN
   ) INTO backfill_done;
 
   IF NOT backfill_done THEN
+    backfill_purge_after := clock_timestamp() + INTERVAL '4 hours';
     EXECUTE format(
       $sql$
         INSERT INTO %1$I.api_event_stream (
@@ -174,7 +204,7 @@ BEGIN
           confirmation_status,
           payload_version,
           public_event,
-          NOW() + INTERVAL '4 hours'
+          $1
         FROM (
           SELECT
             event_id,
@@ -233,7 +263,7 @@ BEGIN
         ON CONFLICT (domain_event_id, revision) DO NOTHING
       $sql$,
       target_schema
-    );
+    ) USING backfill_purge_after;
 
     EXECUTE format(
       $sql$
