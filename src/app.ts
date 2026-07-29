@@ -4,7 +4,11 @@ import { loadConfig } from './config/env.js';
 import { ApiServer, type ApiListeningAddress, type ApiServerOptions } from './interfaces/http/api-server.js';
 import { createQualificationEngine } from './qualification/qualification-engine.js';
 import { PostgresApiEventStreamRepository } from './storage/api-event-stream.repository.js';
-import { PostgresApiProjectionRepository, type ApiProjectionPipelineState } from './storage/api-projection.repository.js';
+import {
+  PostgresApiProjectionRepository,
+  type ApiHolderProjectionLimits,
+  type ApiProjectionPipelineState,
+} from './storage/api-projection.repository.js';
 import type { ApiEventStreamRepository } from './ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from './ports/api-projection-repository.js';
 import { closeDatabase, getDatabasePool, migrateDatabase } from './storage/database.js';
@@ -31,6 +35,7 @@ export interface ApplicationDependencies {
   readonly createProjectionRepository: (
     pool: ApplicationPool,
     pipeline: ApiProjectionPipelineState,
+    holderLimits: ApiHolderProjectionLimits,
   ) => ApiProjectionRepository;
   readonly createEventStreamRepository: (pool: ApplicationPool) => ApiEventStreamRepository;
   readonly createApiServer: (options: ApiServerOptions) => ApplicationServer;
@@ -54,7 +59,10 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
         dependencies.logInfo({ event: 'database.migrations_applied', count: appliedMigrations.length }, 'Migrations PostgreSQL appliquées.');
       }
       if (config.apiEnabled) {
-        const projections = dependencies.createProjectionRepository(pool, PRODUCTION_API_PIPELINE_STATE);
+        const projections = dependencies.createProjectionRepository(pool, PRODUCTION_API_PIPELINE_STATE, {
+          positions: config.apiHolderPositionLimit,
+          snapshots: config.apiHolderSnapshotLimit,
+        });
         const stream = dependencies.createEventStreamRepository(pool);
         server = dependencies.createApiServer({
           host: config.apiHost,
@@ -118,10 +126,11 @@ const productionDependencies: ApplicationDependencies = {
   createQualificationEngine,
   getDatabasePool,
   migrateDatabase: async (pool) => migrateDatabase({ pool: pool as ReturnType<typeof getDatabasePool> }),
-  createProjectionRepository: (pool, pipeline) => new PostgresApiProjectionRepository(
+  createProjectionRepository: (pool, pipeline, holderLimits) => new PostgresApiProjectionRepository(
     pool as ConstructorParameters<typeof PostgresApiProjectionRepository>[0],
     () => new Date(),
     pipeline,
+    holderLimits,
   ),
   createEventStreamRepository: (pool) => new PostgresApiEventStreamRepository(
     pool as ConstructorParameters<typeof PostgresApiEventStreamRepository>[0],

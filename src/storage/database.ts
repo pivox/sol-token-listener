@@ -75,6 +75,9 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly migrations: number;
   readonly paperPositions: number;
   readonly stateTransitions: number;
+  readonly observedWalletPositions: number;
+  readonly holderSnapshots: number;
+  readonly creatorProfiles: number;
   readonly apiEventStream: number;
   readonly domainEvents: number;
   readonly rawChainEvents: number;
@@ -113,6 +116,18 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const transitions = await client.query(
       'DELETE FROM state_transitions WHERE purge_after <= NOW()',
     );
+    const observedWalletPositions = await client.query(
+      `DELETE FROM observed_wallet_positions position USING token_launches launch
+       WHERE position.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const holderSnapshots = await client.query(
+      `DELETE FROM token_holders_snapshots snapshot USING token_launches launch
+       WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const creatorProfiles = await client.query(
+      `DELETE FROM creator_profiles profile USING token_launches launch
+       WHERE profile.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
     const apiEventStream = await client.query<{ readonly deleted_count: string }>(
       `WITH deleted AS (
          DELETE FROM api_event_stream
@@ -136,7 +151,13 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        )
        SELECT deleted_count FROM summary`,
     );
-    const domainEvents = await client.query(
+    const participantDomainEvents = await client.query(
+      `DELETE FROM domain_events event USING token_launches launch
+       WHERE event.mint = launch.mint
+         AND event.type IN ('CreatorProfileUpdated', 'HolderDistributionUpdated')
+         AND launch.purge_after <= NOW()`,
+    );
+    const expiredDomainEvents = await client.query(
       'DELETE FROM domain_events WHERE purge_after <= NOW()',
     );
     const rawEvents = await client.query(
@@ -160,8 +181,12 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       migrations: migrations.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
       stateTransitions: transitions.rowCount ?? 0,
+      observedWalletPositions: observedWalletPositions.rowCount ?? 0,
+      holderSnapshots: holderSnapshots.rowCount ?? 0,
+      creatorProfiles: creatorProfiles.rowCount ?? 0,
       apiEventStream: Number(apiEventStream.rows[0]?.deleted_count ?? 0),
-      domainEvents: domainEvents.rowCount ?? 0,
+      domainEvents: (participantDomainEvents.rowCount ?? 0)
+        + (expiredDomainEvents.rowCount ?? 0),
       rawChainEvents: rawEvents.rowCount ?? 0,
       tokenLaunches: launches.rowCount ?? 0,
     };

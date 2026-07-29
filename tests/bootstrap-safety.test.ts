@@ -57,9 +57,13 @@ void test('le bootstrap API partage le pool puis ferme le serveur avant la base'
     createQualificationEngine: () => ({ minimumTotalScore: 60 }),
     getDatabasePool: (url) => { calls.push(`pool:${url === config.databaseUrl}`); return pool; },
     migrateDatabase: async (receivedPool) => { assert.equal(receivedPool, pool); calls.push('migrate'); return []; },
-    createProjectionRepository: (receivedPool, pipeline) => {
+    createProjectionRepository: (receivedPool, pipeline, holderLimits) => {
       assert.equal(receivedPool, pool);
       assert.deepEqual(pipeline, PRODUCTION_API_PIPELINE_STATE);
+      assert.deepEqual(holderLimits, {
+        positions: config.apiHolderPositionLimit,
+        snapshots: config.apiHolderSnapshotLimit,
+      });
       calls.push('projections');
       return {} as ApiProjectionRepository;
     },

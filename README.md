@@ -52,8 +52,10 @@ derrière les contrôles réseau/TLS appropriés.
 
 Les huit routes JSON sont `launches`, détail/timeline/risk/social/holders d'un
 lancement, `paper-positions` et `health`; `/api/v1/events` est le flux SSE.
-Les montants et `bigint` sont des chaînes décimales. Les projections sociales
-et holders V1 retournent honnêtement `NOT_AVAILABLE`.
+Les montants et `bigint` sont des chaînes décimales. La projection sociale
+retourne honnêtement `NOT_AVAILABLE`. La projection holders devient
+`AVAILABLE` après une reconstruction explicite des trades Pump.fun persistés;
+sinon elle reste `NOT_AVAILABLE`.
 
 ```bash
 npm start
@@ -68,6 +70,21 @@ HTTP puis se reconnecter sans curseur; la rétention du flux est de quatre
 heures.
 
 Voir le contrat complet : [API V1](docs/api/v1.md).
+
+## Analytics participants I1
+
+Le service I1 reconstruit de façon déterministe le profil du créateur, ses
+achats initiaux, sa première vente, les positions nettes observées et les
+concentrations top 1/5/10. Il n'utilise que les trades de bonding curve
+persistés depuis la détection du token : il ne consulte ni historique antérieur
+ni RPC supplémentaire. Un flux net négatif est conservé comme preuve valide,
+pas ramené silencieusement à zéro.
+
+Ce service est passif et n'est pas encore composé dans le bootstrap réseau.
+Les clusters, funders communs et wallets liés restent explicitement
+`NOT_AVAILABLE` jusqu'à I2. `API_HOLDER_POSITION_LIMIT` et
+`API_HOLDER_SNAPSHOT_LIMIT` valent 100 par défaut et sont bornés à 500.
+Les projections suivent la rétention terminale de quatre heures.
 
 ## Architecture
 
