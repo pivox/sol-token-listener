@@ -187,13 +187,24 @@ void test('HEAD mirrors GET headers and status without a response body, and OPTI
   }
 });
 
-void test('maps missing launches and null risk consistently without unintended subroute reads', async () => {
-  const { router, repository } = makeRouter();
-  const missing = await invoke(router, 'GET', `/api/v1/launches/${OTHER_MINT}/risk`);
-  assert.equal(missing.status, 404);
-  assert.deepEqual(parseBody(missing), { apiVersion: 'v1', error: { code: 'LAUNCH_NOT_FOUND', message: 'The launch was not found' } });
-  assert.equal(repository.calls.includes(`risk:${OTHER_MINT}`), false);
+void test('maps missing launches across every detail and subroute without route-specific reads', async () => {
+  const cases: readonly [string, string | null][] = [
+    ['', null], ['/events', 'events'], ['/risk', 'risk'], ['/social', 'social'], ['/holders', 'holders'],
+  ];
+  for (const [suffix, routeMethod] of cases) {
+    const { router, repository } = makeRouter();
+    const missing = await invoke(router, 'GET', `/api/v1/launches/${OTHER_MINT}${suffix}`);
+    assert.equal(missing.status, 404, suffix);
+    assert.deepEqual(parseBody(missing), {
+      apiVersion: 'v1', error: { code: 'LAUNCH_NOT_FOUND', message: 'The launch was not found' },
+    }, suffix);
+    assert.deepEqual(repository.calls, [`launch:${OTHER_MINT}`], suffix);
+    if (routeMethod !== null) {
+      assert.equal(repository.calls.some((call) => call.startsWith(`${routeMethod}:`)), false, suffix);
+    }
+  }
 
+  const { router, repository } = makeRouter();
   const original = repository.getLaunchRisk;
   Object.assign(repository, { getLaunchRisk: async (_mint: string) => null });
   const risk = await invoke(router, 'GET', `/api/v1/launches/${MINT}/risk`);
