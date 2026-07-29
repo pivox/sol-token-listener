@@ -207,6 +207,8 @@ export interface ApiSseEvent {
   readonly payload: ApiDomainPayload;
 }
 
+export type ApiDomainEvent = ApiSseEvent;
+
 export interface ApiSseCursor {
   readonly slot: string;
   readonly transactionIndex: string;

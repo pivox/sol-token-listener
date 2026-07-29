@@ -13,6 +13,7 @@ import {
   type ApiQualification,
   type ApiSocial,
   type ApiHolders,
+  type ApiDomainEvent,
   type ApiSseEvent,
   type ApiSuccess,
   toApiDomainPayload,
@@ -175,6 +176,8 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
     confirmationStatus: 'confirmed', blockchainTime: null,
     observedAt: '2026-07-29T12:00:00.000Z', payloadVersion: 1, payload: toApiDomainPayload({}),
   };
+  const domainEvent: ApiDomainEvent = event;
+  const sseEvent: ApiSseEvent = domainEvent;
 
   assert.equal(success.apiVersion, 'v1');
   assert.equal(success.data.detectedAt, '2026-07-29T12:00:00.000Z');
@@ -185,7 +188,7 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(holders.snapshots.length, 0);
   assert.equal(qualification.verdict, 'WATCHLISTED');
   assert.equal(health.pipeline.pumpfun, 'RUNNING');
-  assert.equal(event.eventId, 'evt_1');
+  assert.equal(sseEvent.eventId, 'evt_1');
 });
 
 void test('toApiJson rejects adversarial descriptors without invoking input getters or methods', () => {

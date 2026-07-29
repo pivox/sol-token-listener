@@ -4,12 +4,12 @@ export const MAX_SERIALIZED_BIGINT_DIGITS = 78;
 const RESERVED_MARKER_MESSAGE =
   'The $solTokenListenerBigInt singleton object is reserved for bigint serialization.';
 const OVERSIZED_BIGINT_MESSAGE = 'Serialized bigint exceeds 78 decimal digits.';
-const trustedBigIntMarker = Symbol('trustedBigIntMarker');
+const trustedBigIntMarkers = new WeakMap<object, string>();
 
 export function stringifyJson(value: unknown): string {
   rejectReservedBigIntMarkers(value, new Set<object>());
   return JSON.stringify(value, (_key, nested: unknown) => {
-    if (isBigIntMarker(nested) && !isTrustedBigIntMarker(nested)) {
+    if (isReservedBigIntMarker(nested) && !isTrustedBigIntMarker(nested)) {
       throw new TypeError(RESERVED_MARKER_MESSAGE);
     }
     if (typeof nested === 'bigint') {
@@ -49,29 +49,29 @@ function rejectReservedBigIntMarkers(value: unknown, ancestors: Set<object>): vo
       for (const item of value) rejectReservedBigIntMarkers(item, ancestors);
       return;
     }
-    const entries = Object.entries(value);
-    if (
-      entries.length === 1
-      && entries[0]?.[0] === BIGINT_JSON_MARKER
-      && typeof entries[0][1] === 'string'
-      && !isTrustedBigIntMarker(value)
-    ) {
+    if (isReservedBigIntMarker(value) && !isTrustedBigIntMarker(value)) {
       throw new TypeError(RESERVED_MARKER_MESSAGE);
     }
-    for (const [, nested] of entries) rejectReservedBigIntMarkers(nested, ancestors);
+    for (const nested of Object.values(value)) rejectReservedBigIntMarkers(nested, ancestors);
   } finally {
     ancestors.delete(value);
   }
 }
 
-function isBigIntMarker(value: unknown): value is Record<typeof BIGINT_JSON_MARKER, string> {
+function isReservedBigIntMarker(
+  value: unknown,
+): value is Record<typeof BIGINT_JSON_MARKER, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const entries = Object.entries(value);
-  return entries.length === 1
-    && entries[0]?.[0] === BIGINT_JSON_MARKER
-    && typeof entries[0][1] === 'string'
-    && /^(?:0|-?[1-9]\d*)$/u.test(entries[0][1])
-    && entries[0][1].replace(/^-/, '').length <= MAX_SERIALIZED_BIGINT_DIGITS;
+  return entries.length === 1 && entries[0]?.[0] === BIGINT_JSON_MARKER;
+}
+
+function isBigIntMarker(value: unknown): value is Record<typeof BIGINT_JSON_MARKER, string> {
+  if (!isReservedBigIntMarker(value)) return false;
+  const encoded = value[BIGINT_JSON_MARKER];
+  return typeof encoded === 'string'
+    && /^(?:0|-?[1-9]\d*)$/u.test(encoded)
+    && encoded.replace(/^-/, '').length <= MAX_SERIALIZED_BIGINT_DIGITS;
 }
 
 function markEncodedBigIntMarkers(value: unknown): void {
@@ -86,15 +86,11 @@ function markEncodedBigIntMarkers(value: unknown): void {
 }
 
 function trustBigIntMarker<T extends Record<typeof BIGINT_JSON_MARKER, string>>(value: T): T {
-  Object.defineProperty(value, trustedBigIntMarker, {
-    value: value[BIGINT_JSON_MARKER],
-    enumerable: false,
-  });
+  trustedBigIntMarkers.set(value, value[BIGINT_JSON_MARKER]);
   return value;
 }
 
 function isTrustedBigIntMarker(value: object): boolean {
   if (!isBigIntMarker(value)) return false;
-  return Object.getOwnPropertyDescriptor(value, trustedBigIntMarker)?.value
-    === value[BIGINT_JSON_MARKER];
+  return trustedBigIntMarkers.get(value) === value[BIGINT_JSON_MARKER];
 }

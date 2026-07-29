@@ -1,4 +1,4 @@
-import type { ApiSseEvent } from '../api/contracts.js';
+import type { ApiDomainEvent } from '../api/contracts.js';
 
 export class ApiEventStreamCursorExpiredError extends Error {
   public constructor() {
@@ -10,7 +10,7 @@ export class ApiEventStreamCursorExpiredError extends Error {
 export interface ApiStreamRevision {
   readonly sequence: bigint;
   readonly streamEventId: string;
-  readonly event: ApiSseEvent;
+  readonly event: ApiDomainEvent;
 }
 
 export type StreamCursorResolution =

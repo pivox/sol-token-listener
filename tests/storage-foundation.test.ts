@@ -47,6 +47,10 @@ void test('réserve le singleton exact du marqueur bigint avant sérialisation',
     () => stringifyJson({ nested: [{ reserved }] }),
     /The \$solTokenListenerBigInt singleton object is reserved for bigint serialization\./u,
   );
+  assert.throws(
+    () => stringifyJson({ $solTokenListenerBigInt: 42 }),
+    /The \$solTokenListenerBigInt singleton object is reserved for bigint serialization\./u,
+  );
 });
 
 void test('conserve comme donnée métier un marqueur accompagné d’une autre clé', () => {
@@ -74,6 +78,23 @@ void test('invalide la confiance d’un marqueur encodé s’il est ensuite mut�
 
   assert.throws(
     () => stringifyJson(encoded),
+    /The \$solTokenListenerBigInt singleton object is reserved for bigint serialization\./u,
+  );
+});
+
+void test('ne permet pas de forger la confiance en copiant les symboles internes', () => {
+  const encoded = toJsonValue({ amount: 42n }) as {
+    amount: { $solTokenListenerBigInt: string };
+  };
+  const forged = { $solTokenListenerBigInt: '42' };
+  for (const symbol of Object.getOwnPropertySymbols(encoded.amount)) {
+    const descriptor = Object.getOwnPropertyDescriptor(encoded.amount, symbol);
+    assert.ok(descriptor);
+    Object.defineProperty(forged, symbol, descriptor);
+  }
+
+  assert.throws(
+    () => stringifyJson(forged),
     /The \$solTokenListenerBigInt singleton object is reserved for bigint serialization\./u,
   );
 });
