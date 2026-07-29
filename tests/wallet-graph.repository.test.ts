@@ -6,7 +6,10 @@ import pg from 'pg';
 import { LaunchParticipantAnalyticsService } from '../src/application/launch-participant-analytics.service.js';
 import { WalletGraphRebuildService } from '../src/application/wallet-graph-rebuild.service.js';
 import { PostgresParticipantAnalyticsRepository } from '../src/storage/participant-analytics.repository.js';
-import { migrateDatabase } from '../src/storage/database.js';
+import {
+  migrateDatabase,
+  purgeExpiredFoundationData,
+} from '../src/storage/database.js';
 import { PostgresWalletEvidenceRepository } from '../src/storage/wallet-evidence.repository.js';
 import {
   PostgresWalletGraphRepository,
@@ -149,6 +152,29 @@ void test('replays, revises and dissolves an orphaned cluster atomically', async
       FOR EACH ROW EXECUTE FUNCTION reject_wallet_graph_profile()`);
     await assert.rejects(service.rebuild('mint'), /forced wallet graph rollback/u);
     assert.deepEqual(await graphCounts(pool), beforeRollback);
+    await pool.query(
+      'DROP TRIGGER reject_wallet_graph_profile_trigger ON wallet_graph_profiles',
+    );
+    await pool.query('DROP FUNCTION reject_wallet_graph_profile()');
+
+    await pool.query(`UPDATE token_launches
+      SET terminal_at = NOW() - INTERVAL '5 hours',
+          purge_after = NOW() - INTERVAL '1 hour'
+      WHERE mint = 'mint'`);
+    const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.walletFundingObservations, 2);
+    assert.equal(purged.walletFundingEvidence, 2);
+    assert.equal(purged.walletRelationships, 0);
+    assert.equal(purged.walletGraphProfiles, 1);
+    assert.equal(purged.walletClusterMembers, 0);
+    assert.equal(purged.walletClusters, 0);
+    assert.equal(purged.walletGraphSnapshots, 2);
+    assert.equal(purged.tokenLaunches, 1);
+    assert.equal((await pool.query('SELECT 1 FROM wallet_graph_profiles')).rowCount, 0);
+    assert.equal((await pool.query('SELECT 1 FROM wallet_graph_snapshots')).rowCount, 0);
+    assert.equal((await pool.query(
+      "SELECT 1 FROM domain_events WHERE type = 'WalletClusterDetected'",
+    )).rowCount, 0);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);

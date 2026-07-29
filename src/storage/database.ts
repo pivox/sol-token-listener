@@ -78,6 +78,13 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly observedWalletPositions: number;
   readonly holderSnapshots: number;
   readonly creatorProfiles: number;
+  readonly walletFundingObservations: number;
+  readonly walletFundingEvidence: number;
+  readonly walletRelationships: number;
+  readonly walletGraphProfiles: number;
+  readonly walletClusterMembers: number;
+  readonly walletClusters: number;
+  readonly walletGraphSnapshots: number;
   readonly apiEventStream: number;
   readonly domainEvents: number;
   readonly rawChainEvents: number;
@@ -115,6 +122,34 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     );
     const transitions = await client.query(
       'DELETE FROM state_transitions WHERE purge_after <= NOW()',
+    );
+    const walletFundingEvidence = await client.query(
+      `DELETE FROM wallet_funding_evidence evidence USING token_launches launch
+       WHERE evidence.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const walletFundingObservations = await client.query(
+      `DELETE FROM wallet_funding_observations observation USING token_launches launch
+       WHERE observation.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const walletRelationships = await client.query(
+      `DELETE FROM wallet_relationships relationship USING token_launches launch
+       WHERE relationship.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const walletClusterMembers = await client.query(
+      `DELETE FROM wallet_cluster_members member USING token_launches launch
+       WHERE member.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const walletClusters = await client.query(
+      `DELETE FROM wallet_clusters cluster USING token_launches launch
+       WHERE cluster.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const walletGraphSnapshots = await client.query(
+      `DELETE FROM wallet_graph_snapshots snapshot USING token_launches launch
+       WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const walletGraphProfiles = await client.query(
+      `DELETE FROM wallet_graph_profiles profile USING token_launches launch
+       WHERE profile.mint = launch.mint AND launch.purge_after <= NOW()`,
     );
     const observedWalletPositions = await client.query(
       `DELETE FROM observed_wallet_positions position USING token_launches launch
@@ -154,7 +189,11 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const participantDomainEvents = await client.query(
       `DELETE FROM domain_events event USING token_launches launch
        WHERE event.mint = launch.mint
-         AND event.type IN ('CreatorProfileUpdated', 'HolderDistributionUpdated')
+         AND event.type IN (
+           'CreatorProfileUpdated',
+           'HolderDistributionUpdated',
+           'WalletClusterDetected'
+         )
          AND launch.purge_after <= NOW()`,
     );
     const expiredDomainEvents = await client.query(
@@ -184,6 +223,13 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       observedWalletPositions: observedWalletPositions.rowCount ?? 0,
       holderSnapshots: holderSnapshots.rowCount ?? 0,
       creatorProfiles: creatorProfiles.rowCount ?? 0,
+      walletFundingObservations: walletFundingObservations.rowCount ?? 0,
+      walletFundingEvidence: walletFundingEvidence.rowCount ?? 0,
+      walletRelationships: walletRelationships.rowCount ?? 0,
+      walletGraphProfiles: walletGraphProfiles.rowCount ?? 0,
+      walletClusterMembers: walletClusterMembers.rowCount ?? 0,
+      walletClusters: walletClusters.rowCount ?? 0,
+      walletGraphSnapshots: walletGraphSnapshots.rowCount ?? 0,
       apiEventStream: Number(apiEventStream.rows[0]?.deleted_count ?? 0),
       domainEvents: (participantDomainEvents.rowCount ?? 0)
         + (expiredDomainEvents.rowCount ?? 0),
