@@ -44,7 +44,7 @@ const buy: WalletFundingBuy = Object.freeze({
   observedAtMs: 1_720_000_000_100,
 });
 
-test('publishes stable wallet-funding constants and accepts a canonical frozen result', () => {
+void test('publishes stable wallet-funding constants and accepts a canonical frozen result', () => {
   assert.deepEqual(WALLET_FUNDING_ASSESSMENT_STATUSES, [
     'STRONG', 'MEDIUM_ONLY', 'NO_EVIDENCE', 'UNAVAILABLE',
   ]);
@@ -55,20 +55,20 @@ test('publishes stable wallet-funding constants and accepts a canonical frozen r
   assert.equal(WALLET_FUNDING_PAYLOAD_VERSION, 1);
 
   const result = directResult();
-  assert.doesNotThrow(() => assertValidWalletFundingExtractionResult(result));
+  assert.doesNotThrow(() => { assertValidWalletFundingExtractionResult(result); });
   assert.equal(
     result.assessments[0]?.id,
     createWalletFundingAssessmentId(buy),
   );
   assert.equal(
-    result.evidence[0]?.id,
-    createWalletFundingEvidenceId(result.evidence[0] as DirectQuoteTransferEvidence),
+    requiredDirectEvidence(result).id,
+    createWalletFundingEvidenceId(requiredDirectEvidence(result)),
   );
 });
 
-test('accepts medium-only and explicit no-evidence assessments without fake transfers', () => {
+void test('accepts medium-only and explicit no-evidence assessments without fake transfers', () => {
   const medium = feePayerResult();
-  assert.doesNotThrow(() => assertValidWalletFundingExtractionResult(medium));
+  assert.doesNotThrow(() => { assertValidWalletFundingExtractionResult(medium); });
   assert.equal(medium.evidence[0]?.amountRaw, null);
   assert.equal(medium.evidence[0]?.transferCursor, null);
 
@@ -80,86 +80,86 @@ test('accepts medium-only and explicit no-evidence assessments without fake tran
     }),
     [],
   );
-  assert.doesNotThrow(() => assertValidWalletFundingExtractionResult(noEvidence));
+  assert.doesNotThrow(() => { assertValidWalletFundingExtractionResult(noEvidence); });
 });
 
-test('rejects duplicates, foreign evidence and contradictory assessment statuses', () => {
+void test('rejects duplicates, foreign evidence and contradictory assessment statuses', () => {
   const canonical = directResult();
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(Object.freeze({
+    () => { assertValidWalletFundingExtractionResult(Object.freeze({
       assessments: Object.freeze([
-        canonical.assessments[0] as WalletFundingAssessment,
-        canonical.assessments[0] as WalletFundingAssessment,
+        requiredAssessment(canonical),
+        requiredAssessment(canonical),
       ]),
       evidence: canonical.evidence,
-    })),
+    })); },
     /unique/u,
   );
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
-      canonical.assessments[0] as WalletFundingAssessment,
+    () => { assertValidWalletFundingExtractionResult(resultWith(
+      requiredAssessment(canonical),
       Object.freeze([
-        canonical.evidence[0] as DirectQuoteTransferEvidence,
-        canonical.evidence[0] as DirectQuoteTransferEvidence,
+        requiredDirectEvidence(canonical),
+        requiredDirectEvidence(canonical),
       ]),
-    )),
+    )); },
     /unique/u,
   );
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
+    () => { assertValidWalletFundingExtractionResult(resultWith(
       assessmentWith({ status: 'NO_EVIDENCE', acceptedEvidenceCount: 1 }),
       canonical.evidence,
-    )),
+    )); },
     /status|evidence|accepted/u,
   );
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
-      canonical.assessments[0] as WalletFundingAssessment,
+    () => { assertValidWalletFundingExtractionResult(resultWith(
+      requiredAssessment(canonical),
       Object.freeze([directEvidence({ buyTradeId: 'foreign-trade' })]),
-    )),
+    )); },
     /assessed|trade/u,
   );
 });
 
-test('rejects self-funding, negative amounts and mismatched immutable context', () => {
+void test('rejects self-funding, negative amounts and mismatched immutable context', () => {
   const canonical = directResult();
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
-      canonical.assessments[0] as WalletFundingAssessment,
+    () => { assertValidWalletFundingExtractionResult(resultWith(
+      requiredAssessment(canonical),
       Object.freeze([directEvidence({ funder: buy.buyer })]),
-    )),
+    )); },
     /different|self/u,
   );
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
-      canonical.assessments[0] as WalletFundingAssessment,
+    () => { assertValidWalletFundingExtractionResult(resultWith(
+      requiredAssessment(canonical),
       Object.freeze([directEvidence({ amountRaw: -1n })]),
-    )),
+    )); },
     /amount/u,
   );
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
-      canonical.assessments[0] as WalletFundingAssessment,
+    () => { assertValidWalletFundingExtractionResult(resultWith(
+      requiredAssessment(canonical),
       Object.freeze([directEvidence({ mint: 'foreign-mint' })]),
-    )),
+    )); },
     /mint|context/u,
   );
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
-      canonical.assessments[0] as WalletFundingAssessment,
+    () => { assertValidWalletFundingExtractionResult(resultWith(
+      requiredAssessment(canonical),
       Object.freeze([directEvidence({ signature: 'foreign-signature' })]),
-    )),
+    )); },
     /signature|context/u,
   );
 });
 
-test('rejects mutable, non-canonical cursor, quote and timestamp inputs', () => {
+void test('rejects mutable, non-canonical cursor, quote and timestamp inputs', () => {
   const canonical = directResult();
   assert.throws(
-    () => assertValidWalletFundingExtractionResult({
+    () => { assertValidWalletFundingExtractionResult({
       assessments: canonical.assessments,
       evidence: canonical.evidence,
-    }),
+    }); },
     /frozen/u,
   );
   const badCursorBuy = Object.freeze({
@@ -167,10 +167,10 @@ test('rejects mutable, non-canonical cursor, quote and timestamp inputs', () => 
     cursor: Object.freeze({ ...cursor, transactionIndex: -1 }),
   });
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
+    () => { assertValidWalletFundingExtractionResult(resultWith(
       assessmentWith({}, badCursorBuy),
       [],
-    )),
+    )); },
     /cursor|transactionIndex/u,
   );
   const badQuoteBuy = Object.freeze({
@@ -178,18 +178,18 @@ test('rejects mutable, non-canonical cursor, quote and timestamp inputs', () => 
     quoteAsset: Object.freeze({ ...quoteAsset, decimals: 256 }),
   });
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
+    () => { assertValidWalletFundingExtractionResult(resultWith(
       assessmentWith({}, badQuoteBuy),
       [],
-    )),
+    )); },
     /decimals|quote/u,
   );
   const badTimeBuy = Object.freeze({ ...buy, observedAtMs: -1 });
   assert.throws(
-    () => assertValidWalletFundingExtractionResult(resultWith(
+    () => { assertValidWalletFundingExtractionResult(resultWith(
       assessmentWith({}, badTimeBuy),
       [],
-    )),
+    )); },
     /observedAtMs|timestamp/u,
   );
 });
@@ -297,4 +297,21 @@ function resultWith(
     assessments: Object.freeze([assessment]),
     evidence: Object.freeze([...evidence]),
   });
+}
+
+function requiredAssessment(
+  result: WalletFundingExtractionResult,
+): WalletFundingAssessment {
+  const assessment = result.assessments[0];
+  assert.ok(assessment);
+  return assessment;
+}
+
+function requiredDirectEvidence(
+  result: WalletFundingExtractionResult,
+): DirectQuoteTransferEvidence {
+  const evidence = result.evidence[0];
+  assert.ok(evidence);
+  assert.equal(evidence.type, 'DIRECT_QUOTE_TRANSFER');
+  return evidence as DirectQuoteTransferEvidence;
 }
