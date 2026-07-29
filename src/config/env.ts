@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { isIP } from 'node:net';
+import { MAX_API_PAGE_LIMIT } from '../ports/api-projection-repository.js';
 
 const DEFAULT_WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_RAYDIUM_CPMM_PROGRAM_ID = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
@@ -51,6 +53,13 @@ export interface AppConfig {
   readonly dashboardRefreshSeconds: number;
   readonly dashboardMaxRows: number;
   readonly dashboardActionsEnabled: false;
+  readonly apiEnabled: boolean;
+  readonly apiHost: string;
+  readonly apiPort: number;
+  readonly apiPageLimitDefault: number;
+  readonly apiPageLimitMaximum: number;
+  readonly apiSseHeartbeatMs: number;
+  readonly apiSsePollMs: number;
   readonly logLevel: string;
 }
 
@@ -68,6 +77,12 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   if (executionMode === 'paper' && !paperQuoteMintAllowlist.includes(wsolMint)) {
     throw new Error('Pump.fun V1 paper mode requires SOL/WSOL in PAPER_QUOTE_MINT_ALLOWLIST.');
   }
+  const apiPageLimitMaximum = parseInteger(
+    environment.API_PAGE_LIMIT_MAX, 200, 'API_PAGE_LIMIT_MAX', 1, MAX_API_PAGE_LIMIT,
+  );
+  const apiPageLimitDefault = parseInteger(
+    environment.API_PAGE_LIMIT_DEFAULT, 50, 'API_PAGE_LIMIT_DEFAULT', 1, apiPageLimitMaximum,
+  );
 
   return {
     cluster: optional(environment.SOLANA_CLUSTER, 'mainnet-beta'),
@@ -120,6 +135,15 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     dashboardRefreshSeconds: parseInteger(environment.DASHBOARD_REFRESH_SECONDS, 5, 'DASHBOARD_REFRESH_SECONDS', 1),
     dashboardMaxRows: parseInteger(environment.DASHBOARD_MAX_ROWS, 250, 'DASHBOARD_MAX_ROWS', 1),
     dashboardActionsEnabled: false,
+    apiEnabled: parseBoolean(environment.API_ENABLED, true, 'API_ENABLED'),
+    apiHost: parseApiHost(environment.API_HOST),
+    apiPort: parseInteger(environment.API_PORT, 3_000, 'API_PORT', 1, 65_535),
+    apiPageLimitDefault,
+    apiPageLimitMaximum,
+    apiSseHeartbeatMs: parseInteger(
+      environment.API_SSE_HEARTBEAT_MS, 15_000, 'API_SSE_HEARTBEAT_MS', 1_000, 60_000,
+    ),
+    apiSsePollMs: parseInteger(environment.API_SSE_POLL_MS, 1_000, 'API_SSE_POLL_MS', 100, 10_000),
     logLevel: optional(environment.LOG_LEVEL, 'info'),
   };
 }
@@ -193,6 +217,36 @@ function parseBoolean(raw: string | undefined, fallback: boolean, name: string):
   if (raw === 'true') return true;
   if (raw === 'false') return false;
   throw new Error(`${name} must be true or false.`);
+}
+
+function parseApiHost(raw: string | undefined): string {
+  if (raw === undefined) return '127.0.0.1';
+  if (
+    raw.length === 0
+    || raw !== raw.trim()
+    || /[\s\u007F]/u.test(raw)
+    || hasControlCharacter(raw)
+    || raw.includes('://')
+    || raw.includes('/')
+    || raw.includes('\\')
+    || (!isSafeHostname(raw) && isIP(raw) === 0)
+  ) {
+    throw new Error('API_HOST must be a safe hostname or IP address.');
+  }
+  return raw;
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && codePoint <= 31) return true;
+  }
+  return false;
+}
+
+function isSafeHostname(value: string): boolean {
+  if (value.length > 253 || value.endsWith('.')) return false;
+  return value.split('.').every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/u.test(label));
 }
 
 function requiredUrl(raw: string | undefined, name: string, protocols: readonly string[]): string {

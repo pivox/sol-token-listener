@@ -1,39 +1,135 @@
 import { pathToFileURL } from 'node:url';
+import type { AppConfig } from './config/env.js';
 import { loadConfig } from './config/env.js';
+import { ApiServer, type ApiListeningAddress, type ApiServerOptions } from './interfaces/http/api-server.js';
 import { createQualificationEngine } from './qualification/qualification-engine.js';
-import { closeDatabase, migrateDatabase } from './storage/database.js';
+import { PostgresApiEventStreamRepository } from './storage/api-event-stream.repository.js';
+import { PostgresApiProjectionRepository } from './storage/api-projection.repository.js';
+import type { ApiEventStreamRepository } from './ports/api-event-stream-repository.js';
+import type { ApiProjectionRepository } from './ports/api-projection-repository.js';
+import { closeDatabase, getDatabasePool, migrateDatabase } from './storage/database.js';
 import { logger } from './utils/logger.js';
 
-export async function main(): Promise<void> {
-  const config = loadConfig();
-  const qualificationEngine = createQualificationEngine(config);
-  if (config.autoMigrate) {
-    const appliedMigrations = await migrateDatabase();
-    logger.info({ appliedMigrations }, 'Migrations PostgreSQL appliquées.');
+type ApplicationPool = unknown;
+
+export interface ApplicationServer {
+  listen(): Promise<ApiListeningAddress>;
+  close(): Promise<void>;
+}
+
+export interface ApplicationDependencies {
+  readonly loadConfig: () => AppConfig;
+  readonly createQualificationEngine: (config: AppConfig) => Readonly<{ minimumTotalScore: number }>;
+  readonly getDatabasePool: (databaseUrl: string) => ApplicationPool;
+  readonly migrateDatabase: (pool: ApplicationPool) => Promise<readonly string[]>;
+  readonly createProjectionRepository: (pool: ApplicationPool) => ApiProjectionRepository;
+  readonly createEventStreamRepository: (pool: ApplicationPool) => ApiEventStreamRepository;
+  readonly createApiServer: (options: ApiServerOptions) => ApplicationServer;
+  readonly closeDatabase: () => Promise<void>;
+  readonly waitForShutdownSignal: () => Promise<NodeJS.Signals>;
+  readonly logInfo: (context: object, message: string) => void;
+}
+
+export async function runApplication(overrides: Partial<ApplicationDependencies> = {}): Promise<void> {
+  const dependencies: ApplicationDependencies = { ...productionDependencies, ...overrides };
+  let server: ApplicationServer | null = null;
+  try {
+    const config = dependencies.loadConfig();
+    const qualificationEngine = dependencies.createQualificationEngine(config);
+    logFoundation(dependencies.logInfo, config, qualificationEngine.minimumTotalScore);
+    if (!config.apiEnabled) return;
+
+    const pool = dependencies.getDatabasePool(config.databaseUrl);
+    if (config.autoMigrate) {
+      const appliedMigrations = await dependencies.migrateDatabase(pool);
+      dependencies.logInfo({ event: 'database.migrations_applied', count: appliedMigrations.length }, 'Migrations PostgreSQL appliquées.');
+    }
+    const projections = dependencies.createProjectionRepository(pool);
+    const stream = dependencies.createEventStreamRepository(pool);
+    server = dependencies.createApiServer({
+      host: config.apiHost,
+      port: config.apiPort,
+      projections,
+      stream,
+      defaultLimit: config.apiPageLimitDefault,
+      maximumLimit: config.apiPageLimitMaximum,
+      ssePollMs: config.apiSsePollMs,
+      sseHeartbeatMs: config.apiSseHeartbeatMs,
+      logError: (context) => { dependencies.logInfo(context, 'La requête API a échoué.'); },
+    });
+    const address = await server.listen();
+    dependencies.logInfo({
+      event: 'api.started', host: address.host, port: address.port,
+      apiEnabled: config.apiEnabled, executionMode: config.executionMode,
+      transactionSubmissionEnabled: false,
+    }, 'API publique d’observation disponible.');
+    await dependencies.waitForShutdownSignal();
+    await server.close();
+    server = null;
+  } finally {
+    if (server !== null) await server.close();
+    await dependencies.closeDatabase();
   }
-  logger.info({
+}
+
+export function waitForShutdownSignal(signalSource: Pick<NodeJS.Process, 'once' | 'off'> = process): Promise<NodeJS.Signals> {
+  return new Promise((resolve) => {
+    const complete = (signal: NodeJS.Signals): void => {
+      signalSource.off('SIGINT', onSigint);
+      signalSource.off('SIGTERM', onSigterm);
+      resolve(signal);
+    };
+    const onSigint = (): void => { complete('SIGINT'); };
+    const onSigterm = (): void => { complete('SIGTERM'); };
+    signalSource.once('SIGINT', onSigint);
+    signalSource.once('SIGTERM', onSigterm);
+  });
+}
+
+export async function main(): Promise<void> {
+  await runApplication();
+}
+
+const productionDependencies: ApplicationDependencies = {
+  loadConfig,
+  createQualificationEngine,
+  getDatabasePool,
+  migrateDatabase: async (pool) => migrateDatabase({ pool: pool as ReturnType<typeof getDatabasePool> }),
+  createProjectionRepository: (pool) => new PostgresApiProjectionRepository(
+    pool as ConstructorParameters<typeof PostgresApiProjectionRepository>[0],
+  ),
+  createEventStreamRepository: (pool) => new PostgresApiEventStreamRepository(
+    pool as ConstructorParameters<typeof PostgresApiEventStreamRepository>[0],
+  ),
+  createApiServer: (options) => new ApiServer(options),
+  closeDatabase,
+  waitForShutdownSignal,
+  logInfo: (context, message) => { logger.info(context, message); },
+};
+
+function logFoundation(
+  logInfo: ApplicationDependencies['logInfo'], config: AppConfig, minimumTotalScore: number,
+): void {
+  logInfo({
     event: 'listener.foundation_ready',
     executionMode: config.executionMode,
     cluster: config.cluster,
     paperQuoteMintAllowlist: config.paperQuoteMintAllowlist,
     qualificationRuleSetStatus: config.qualificationRuleSetStatus,
-    qualificationMinimumScore: qualificationEngine.minimumTotalScore,
+    qualificationMinimumScore: minimumTotalScore,
     pumpFunListenerActive: false,
     pumpSwapPipelineAvailable: true,
     transactionSubmissionEnabled: false,
   }, 'Pipeline PumpSwap disponible mais non abonné; listener réseau inactif.');
-  await closeDatabase();
 }
 
 const entrypoint = process.argv[1];
 if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {
   void main().catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.fatal({
-      event: 'listener.start_failed',
-      error: message,
-    }, 'Initialisation du socle impossible.');
-    process.exitCode = 1;
-    return closeDatabase();
+    logger.fatal({ event: 'listener.start_failed', errorName: safeErrorName(error) }, 'Initialisation du socle impossible.');
   });
+}
+
+function safeErrorName(error: unknown): string {
+  return error instanceof Error && /^[A-Za-z0-9_.-]{1,128}$/u.test(error.name) ? error.name : 'UnknownError';
 }
