@@ -141,6 +141,9 @@ exclut `orphaned`, remplace atomiquement les projections courantes et garde un
 snapshot immuable par fingerprint. Une analyse réussie à zéro cluster reste
 `AVAILABLE`. Les événements `WalletClusterDetected` ne contiennent que des
 agrégats bornés ; les relations et membres complets restent en base.
+Leur `asOf` et leur finalité minimale incluent explicitement la projection I1,
+y compris lorsqu'une vente plus récente que le dernier achat modifie les
+positions observées.
 
 L'API limite par défaut la réponse à 50 clusters, 50 membres par cluster et
 500 membres au total, avec des indicateurs de troncature explicites. Les reason

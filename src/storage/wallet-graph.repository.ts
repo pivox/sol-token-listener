@@ -102,6 +102,9 @@ export class PostgresWalletGraphRepository implements WalletGraphRepository {
 class PostgresWalletGraphTransaction implements WalletGraphTransaction {
   private loadedFingerprint: string | null = null;
   private participantInputFingerprint = NO_PARTICIPANT_PROJECTION;
+  private participantAsOf: WalletGraphInput['participantAsOf'] = null;
+  private participantConfirmationStatus:
+    WalletGraphInput['participantConfirmationStatus'] = null;
 
   public constructor(
     private readonly client: GraphClient,
@@ -134,15 +137,38 @@ class PostgresWalletGraphTransaction implements WalletGraphTransaction {
     const launch = launchFromRow(launchRow);
 
     const participantResult = await this.client.query(
-      `SELECT input_fingerprint
-       FROM creator_profiles
-       WHERE mint = $1`,
+      `SELECT profile.input_fingerprint, profile.confirmation_status,
+          event.confirmation_status AS event_confirmation_status,
+          event.event_id, event.signature, event.slot,
+          event.transaction_index, event.instruction_index,
+          event.inner_instruction_index, event.observed_at
+       FROM creator_profiles AS profile
+       JOIN domain_events AS event ON event.event_id = profile.profile_event_id
+       WHERE profile.mint = $1
+         AND event.confirmation_status <> 'orphaned'`,
       [mint],
     );
-    this.participantInputFingerprint = optionalText(
-      participantResult.rows[0]?.input_fingerprint,
-      NO_PARTICIPANT_PROJECTION,
-    );
+    const participantRow = participantResult.rows[0];
+    if (participantRow === undefined) {
+      this.participantInputFingerprint = NO_PARTICIPANT_PROJECTION;
+      this.participantAsOf = null;
+      this.participantConfirmationStatus = null;
+    } else {
+      this.participantInputFingerprint = text(participantRow.input_fingerprint);
+      this.participantConfirmationStatus = activeConfirmation(
+        participantRow.confirmation_status,
+      );
+      if (
+        activeConfirmation(participantRow.event_confirmation_status)
+        !== this.participantConfirmationStatus
+      ) throw invalid();
+      this.participantAsOf = Object.freeze({
+        eventId: text(participantRow.event_id),
+        signature: text(participantRow.signature),
+        cursor: cursorFromRow(participantRow),
+        observedAtMs: timestamp(participantRow.observed_at),
+      });
+    }
 
     const positionResult = await this.client.query(
       `SELECT wallet, is_creator, buy_count, sell_count, bought_base_raw,
@@ -229,6 +255,8 @@ class PostgresWalletGraphTransaction implements WalletGraphTransaction {
     const inputWithoutFingerprint = {
       launch,
       participantInputFingerprint: this.participantInputFingerprint,
+      participantAsOf: this.participantAsOf,
+      participantConfirmationStatus: this.participantConfirmationStatus,
       positions,
       buys,
       assessments,
@@ -800,10 +828,6 @@ function tokenProgram(value: unknown): TokenProgramKind {
 function text(value: unknown): string {
   if (typeof value !== 'string' || value.length === 0) throw invalid();
   return value;
-}
-
-function optionalText(value: unknown, fallback: string): string {
-  return value === undefined ? fallback : text(value);
 }
 
 function unsignedBigInt(value: unknown): bigint {

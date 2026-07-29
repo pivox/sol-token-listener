@@ -72,6 +72,35 @@ void test('persists a successful available projection with zero clusters', async
   assert.equal(repository.replacements.length, 1);
 });
 
+void test('uses a later I1 projection for as-of and minimum finality', async () => {
+  const input = graphInput({
+    participantAsOf: Object.freeze({
+      eventId: 'participant-event',
+      signature: 'sell-signature',
+      cursor: Object.freeze({
+        slot: 10n,
+        transactionIndex: 0,
+        instructionIndex: 8,
+        innerInstructionIndex: null,
+      }),
+      observedAtMs: 1_720_000_000_008,
+    }),
+    participantConfirmationStatus: 'processed',
+  });
+  const projection = await new WalletGraphRebuildService(
+    new FakeRepository(input),
+  ).rebuild('mint');
+
+  assert.equal(projection.asOf.eventId, 'participant-event');
+  assert.equal(projection.asOf.signature, 'sell-signature');
+  assert.equal(projection.confirmationStatus, 'processed');
+  assert.deepEqual(projection.confirmationCounts, {
+    processed: 1,
+    confirmed: 5,
+    finalized: 0,
+  });
+});
+
 void test('rejects absent or invalid canonical input before analysis and writing', async () => {
   const absent = new FakeRepository(null);
   await assert.rejects(

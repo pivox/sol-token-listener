@@ -622,6 +622,9 @@ Define:
 export interface WalletGraphInput {
   readonly launch: ParticipantAnalyticsLaunch;
   readonly participantInputFingerprint: string;
+  readonly participantAsOf: WalletGraphAsOf | null;
+  readonly participantConfirmationStatus:
+    ActiveParticipantConfirmationStatus | null;
   readonly positions: readonly ObservedWalletPosition[];
   readonly buys: readonly ParticipantAnalyticsTrade[];
   readonly assessments: readonly WalletFundingAssessment[];

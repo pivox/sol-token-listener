@@ -25,6 +25,9 @@ export const WALLET_GRAPH_METHODOLOGY =
 export interface WalletGraphInput {
   readonly launch: ParticipantAnalyticsLaunch;
   readonly participantInputFingerprint: string;
+  readonly participantAsOf: WalletGraphAsOf | null;
+  readonly participantConfirmationStatus:
+    ActiveParticipantConfirmationStatus | null;
   readonly positions: readonly ObservedWalletPosition[];
   readonly buys: readonly ParticipantAnalyticsTrade[];
   readonly assessments: readonly WalletFundingAssessment[];
@@ -136,6 +139,19 @@ export function assertValidWalletGraphInput(input: WalletGraphInput): void {
   assertFrozen(input, 'Wallet graph input');
   assertText(input.inputFingerprint, 'inputFingerprint');
   assertText(input.participantInputFingerprint, 'participantInputFingerprint');
+  if (
+    (input.participantAsOf === null)
+    !== (input.participantConfirmationStatus === null)
+  ) {
+    throw new TypeError('Wallet graph participant projection context is incomplete.');
+  }
+  if (input.participantAsOf !== null) {
+    validateAsOf(input.participantAsOf, 'participantAsOf');
+    assertActiveConfirmation(
+      input.participantConfirmationStatus,
+      'participantConfirmationStatus',
+    );
+  }
   assertFrozen(input.positions, 'Wallet graph positions');
   assertFrozen(input.buys, 'Wallet graph buys');
   assertFrozen(input.assessments, 'Wallet graph assessments');
@@ -220,12 +236,11 @@ export function assertValidWalletGraphProjection(
   if (methodology !== WALLET_GRAPH_METHODOLOGY) {
     throw new TypeError('Wallet graph methodology is invalid.');
   }
-  assertFrozen(projection.asOf, 'Wallet graph asOf');
-  assertText(projection.asOf.eventId, 'projection.asOf.eventId');
-  assertText(projection.asOf.signature, 'projection.asOf.signature');
-  assertFrozen(projection.asOf.cursor, 'projection.asOf.cursor');
-  assertValidChainCursor(projection.asOf.cursor);
-  assertValidTimestampMs('observedAtMs', projection.asOf.observedAtMs);
+  validateAsOf(projection.asOf, 'projection.asOf');
+  assertActiveConfirmation(
+    projection.confirmationStatus,
+    'projection.confirmationStatus',
+  );
   validateCounts(projection.confirmationCounts, 'confirmationCounts');
 }
 
@@ -320,6 +335,21 @@ function validateCluster(cluster: WalletCluster): void {
 function validateCoverage(coverage: WalletGraphCoverage): void {
   assertFrozen(coverage, 'Wallet graph coverage');
   validateCounts(coverage, 'coverage');
+}
+
+function validateAsOf(asOf: WalletGraphAsOf, name: string): void {
+  assertFrozen(asOf, `Wallet graph ${name}`);
+  assertText(asOf.eventId, `${name}.eventId`);
+  assertText(asOf.signature, `${name}.signature`);
+  assertFrozen(asOf.cursor, `${name}.cursor`);
+  assertValidChainCursor(asOf.cursor);
+  assertValidTimestampMs('observedAtMs', asOf.observedAtMs);
+}
+
+function assertActiveConfirmation(value: unknown, name: string): void {
+  if (value !== 'processed' && value !== 'confirmed' && value !== 'finalized') {
+    throw new TypeError(`Wallet graph ${name} must be an active confirmation.`);
+  }
 }
 
 function validateCounts(value: object, name: string): void {

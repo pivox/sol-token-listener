@@ -70,6 +70,7 @@ function createAsOf(input: WalletGraphInput): WalletGraphAsOf {
       cursor: input.launch.cursor,
       observedAtMs: input.launch.observedAtMs,
     }),
+    ...(input.participantAsOf === null ? [] : [input.participantAsOf]),
     ...input.buys.map((buy): WalletGraphAsOf => Object.freeze({
       eventId: buy.eventId,
       signature: buy.signature,
@@ -103,6 +104,9 @@ function minimumConfirmation(
 ): ActiveParticipantConfirmationStatus {
   const statuses = [
     input.launch.confirmationStatus,
+    ...(input.participantConfirmationStatus === null
+      ? []
+      : [input.participantConfirmationStatus]),
     ...input.buys.map((buy) => buy.confirmationStatus),
     ...input.evidence.map((evidence) =>
       activeConfirmation(evidence.confirmationStatus)),
@@ -118,6 +122,9 @@ function confirmationCounts(input: WalletGraphInput): WalletGraphConfirmationCou
     finalized: 0,
   };
   counts[input.launch.confirmationStatus] += 1;
+  if (input.participantConfirmationStatus !== null) {
+    counts[input.participantConfirmationStatus] += 1;
+  }
   for (const buy of input.buys) counts[buy.confirmationStatus] += 1;
   for (const evidence of input.evidence) {
     counts[activeConfirmation(evidence.confirmationStatus)] += 1;

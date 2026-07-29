@@ -41,6 +41,8 @@ export function graphInput(overrides: Partial<WalletGraphInput> = {}): WalletGra
   return Object.freeze({
     launch: launch(),
     participantInputFingerprint: 'participant-fingerprint',
+    participantAsOf: null,
+    participantConfirmationStatus: null,
     positions: Object.freeze([
       position(BUYER_A, 50n),
       position(BUYER_B, 25n),
