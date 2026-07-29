@@ -26,10 +26,18 @@ class FakeResponse extends EventEmitter {
 
 class BackpressureResponse extends FakeResponse {
   public blocked = true;
+  public destroyed = false;
+  public destroyCalls = 0;
 
   public override write(chunk: string): boolean {
     this.chunks.push(chunk);
     return !this.blocked;
+  }
+
+  public destroy(): this {
+    this.destroyCalls += 1;
+    this.destroyed = true;
+    return this;
   }
 }
 
@@ -589,6 +597,11 @@ void test('SseSession bounds SERVER close when an accepted event is blocked with
   timers.runOne();
   await new Promise<void>((resolve) => setImmediate(resolve));
   await within(session.close('SERVER'), 'bounded server close');
+  const sameClose = session.close('SERVER');
+  assert.equal(sameClose, session.close('SERVER'));
+  await sameClose;
   assert.equal(response.ended, true);
+  assert.equal(response.destroyed, true);
+  assert.equal(response.destroyCalls, 1);
   assert.equal(closed, 1);
 });

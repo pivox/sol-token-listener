@@ -256,8 +256,7 @@ export class SseSession {
 
   private destroyResponse(): void {
     if (this.response.destroyed) return;
-    const destroy = (this.response as unknown as { destroy?: () => void }).destroy;
-    try { destroy?.(); } catch { /* terminal cleanup is best effort */ }
+    try { this.response.destroy(); } catch { /* terminal cleanup is best effort */ }
   }
 
   private isClosed(): boolean { return this.closed; }
