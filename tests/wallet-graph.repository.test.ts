@@ -41,7 +41,7 @@ void test('locks, rolls back and releases the PostgreSQL client', async () => {
   );
 
   assert.deepEqual(queries.slice(0, 2), [
-    'BEGIN',
+    'BEGIN ISOLATION LEVEL REPEATABLE READ',
     queries[1],
   ]);
   assert.match(queries[1] ?? '', /pg_advisory_xact_lock/u);

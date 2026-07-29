@@ -82,7 +82,7 @@ export class PostgresWalletGraphRepository implements WalletGraphRepository {
     if (mint.length === 0) throw new TypeError('Wallet graph mint is required.');
     const client = await this.database.connect();
     try {
-      await client.query('BEGIN');
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended('wallet-graph:' || $1, 0))",
         [mint],
