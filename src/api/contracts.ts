@@ -182,14 +182,14 @@ export interface ApiCheckpoints {
 }
 
 export interface ApiHeartbeat {
-  readonly startedAt: string;
-  readonly updatedAt: string;
+  readonly startedAt: string | null;
+  readonly updatedAt: string | null;
   readonly lastHttpSlot: string | null;
   readonly lastWebsocketSlot: string | null;
   readonly lastFinalizedSlot: string | null;
   readonly lastSignature: string | null;
-  readonly pendingTransactions: number;
-  readonly activeSessions: number;
+  readonly pendingTransactions: number | null;
+  readonly activeSessions: number | null;
 }
 
 export interface ApiSseEvent {

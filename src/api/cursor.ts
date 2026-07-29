@@ -13,7 +13,15 @@ export interface PaperPositionPagePosition {
   readonly id: string;
 }
 
-type CursorTuple = readonly [string, number, number | string, string?];
+export interface TimelinePagePosition {
+  readonly slot: string;
+  readonly transactionIndex: number;
+  readonly instructionIndex: number;
+  readonly innerInstructionIndex: number | null;
+  readonly id: string;
+}
+
+type CursorTuple = readonly (string | number | null)[];
 
 export function encodeLaunchCursor(position: LaunchPagePosition): string {
   assertTimestamp(position.detectedAtMs, 'detectedAtMs');
@@ -60,6 +68,33 @@ export function decodePaperPositionCursor(cursor: string): PaperPositionPagePosi
   if (encodePaperPositionCursor(position) !== cursor) {
     throw new TypeError('Non-canonical paper positions cursor');
   }
+  return Object.freeze(position);
+}
+
+export function encodeTimelineCursor(position: TimelinePagePosition): string {
+  assertSequence(position.slot, 'slot', true);
+  assertIndex(position.transactionIndex, 'transactionIndex');
+  assertIndex(position.instructionIndex, 'instructionIndex');
+  if (position.innerInstructionIndex !== null) assertIndex(position.innerInstructionIndex, 'innerInstructionIndex');
+  assertText(position.id, 'id');
+  return encodeTuple(['timeline', 1, position.slot, position.transactionIndex,
+    position.instructionIndex, position.innerInstructionIndex, position.id]);
+}
+
+export function decodeTimelineCursor(cursor: string): TimelinePagePosition {
+  const tuple = decodeTuple(cursor);
+  if (tuple.length !== 7 || tuple[0] !== 'timeline' || tuple[1] !== 1) throw new TypeError('Invalid timeline cursor');
+  const position: TimelinePagePosition = {
+    slot: requireString(tuple[2]), transactionIndex: requireNumber(tuple[3]),
+    instructionIndex: requireNumber(tuple[4]),
+    innerInstructionIndex: tuple[5] === null ? null : requireNumber(tuple[5]), id: requireString(tuple[6]),
+  };
+  assertSequence(position.slot, 'slot', true);
+  assertIndex(position.transactionIndex, 'transactionIndex');
+  assertIndex(position.instructionIndex, 'instructionIndex');
+  if (position.innerInstructionIndex !== null) assertIndex(position.innerInstructionIndex, 'innerInstructionIndex');
+  assertText(position.id, 'id');
+  if (encodeTimelineCursor(position) !== cursor) throw new TypeError('Non-canonical timeline cursor');
   return Object.freeze(position);
 }
 
@@ -124,4 +159,24 @@ function assertText(value: string, field: string): void {
   if (value.length === 0 || value.length > MAX_CURSOR_TEXT_LENGTH) {
     throw new TypeError(`Invalid ${field}`);
   }
+}
+
+function assertSequence(value: string, field: string, allowZero = false): void {
+  if (!/^(?:0|[1-9]\d*)$/u.test(value)) throw new TypeError(`Invalid ${field}`);
+  const parsed = BigInt(value);
+  if ((!allowZero && parsed === 0n) || parsed > MAX_CURSOR_SEQUENCE) throw new TypeError(`Invalid ${field}`);
+}
+
+function assertIndex(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 0 || Object.is(value, -0)) throw new TypeError(`Invalid ${field}`);
+}
+
+function requireString(value: unknown): string {
+  if (typeof value !== 'string') throw new TypeError('Invalid timeline cursor');
+  return value;
+}
+
+function requireNumber(value: unknown): number {
+  if (typeof value !== 'number') throw new TypeError('Invalid timeline cursor');
+  return value;
 }

@@ -7,9 +7,11 @@ import {
   decodeLaunchCursor,
   decodePaperPositionCursor,
   decodeStreamCursor,
+  decodeTimelineCursor,
   encodeLaunchCursor,
   encodePaperPositionCursor,
   encodeStreamCursor,
+  encodeTimelineCursor,
 } from '../src/api/cursor.js';
 
 void test('encodes canonical opaque cursors for each public route', () => {
@@ -22,6 +24,10 @@ void test('encodes canonical opaque cursors for each public route', () => {
     'WyJwYXBlcl9wb3NpdGlvbnMiLDEsMTcyMDAwMDAwMDAwMSwicG9zXzEiXQ',
   );
   assert.equal(encodeStreamCursor(42n), 'WyJldmVudHMiLDEsIjQyIl0');
+  assert.deepEqual(decodeTimelineCursor(encodeTimelineCursor({ slot: '9007199254740993', transactionIndex: 1,
+    instructionIndex: 2, innerInstructionIndex: null, id: 'evt' })), {
+    slot: '9007199254740993', transactionIndex: 1, instructionIndex: 2, innerInstructionIndex: null, id: 'evt',
+  });
 });
 
 void test('decodes each cursor only for its matching route', () => {
@@ -35,6 +41,8 @@ void test('decodes each cursor only for its matching route', () => {
   assert.throws(() => decodeLaunchCursor(positions), TypeError);
   assert.throws(() => decodePaperPositionCursor(events), TypeError);
   assert.throws(() => decodeStreamCursor(launches), TypeError);
+  assert.throws(() => encodeTimelineCursor({ slot: '01', transactionIndex: 0, instructionIndex: 0,
+    innerInstructionIndex: null, id: 'evt' }), TypeError);
 });
 
 void test('each decoder rejects its own non-canonical cursor inputs', () => {

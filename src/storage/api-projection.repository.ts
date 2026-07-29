@@ -13,14 +13,17 @@ import {
 import {
   encodeLaunchCursor,
   encodePaperPositionCursor,
+  encodeTimelineCursor,
   type LaunchPagePosition,
   type PaperPositionPagePosition,
+  type TimelinePagePosition,
 } from '../api/cursor.js';
 import { DOMAIN_EVENT_TYPES } from '../domain/events.js';
 import { LAUNCH_STATUSES } from '../domain/launch-status.js';
 import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
 import { QUALIFICATION_SIGNAL_KEYS } from '../domain/qualification.js';
 import type { ApiProjectionRepository, PageRequest } from '../ports/api-projection-repository.js';
+import { fromJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 
 export interface Queryable {
@@ -28,6 +31,12 @@ export interface Queryable {
     text: string,
     values?: readonly unknown[],
   ): Promise<{ readonly rows: readonly Record<string, unknown>[] }>;
+  connect?(): Promise<QueryClient>;
+}
+
+interface QueryClient {
+  query(text: string, values?: readonly unknown[]): Promise<{ readonly rows: readonly Record<string, unknown>[] }>;
+  release(): void;
 }
 
 export interface ApiProjectionPipelineState {
@@ -83,6 +92,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
   public async listLaunches(
     request: PageRequest<LaunchPagePosition>,
   ): Promise<ApiPage<ApiLaunchSummary>> {
+    if (this.database.connect !== undefined) return this.withSnapshot((repository) => repository.listLaunches(request));
     const limit = pageLimit(request.limit);
     const values = request.after === null
       ? [limit + 1]
@@ -103,6 +113,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
   }
 
   public async getLaunch(mint: string): Promise<ApiLaunchDetail | null> {
+    if (this.database.connect !== undefined) return this.withSnapshot((repository) => repository.getLaunch(mint));
     const launches = await this.findLaunches(text(mint));
     const launch = launches[0];
     if (launch === undefined) return null;
@@ -110,7 +121,16 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     return assembleLaunchDetail(launch, projections);
   }
 
-  public async listLaunchEvents(mint: string): Promise<readonly ApiTimelineEntry[]> {
+  public async listLaunchEvents(mint: string, request: PageRequest<TimelinePagePosition>): Promise<ApiPage<ApiTimelineEntry>> {
+    const limit = pageLimit(request.limit);
+    const after = request.after;
+    const afterSql = after === null ? '' : ` WHERE (slot, transaction_index, instruction_index, inner_sort, id)
+        > ($2::numeric, $3::integer, $4::integer, $5::integer, $6::text)`;
+    const values = after === null ? [text(mint), limit + 1] : [text(mint), decimal(after.slot),
+      nonnegativeSafeNumber(after.transactionIndex), nonnegativeSafeNumber(after.instructionIndex),
+      after.innerInstructionIndex === null ? -1 : nonnegativeSafeNumber(after.innerInstructionIndex),
+      text(after.id), limit + 1];
+    const limitParameter = after === null ? '$2' : '$7';
     const result = await this.database.query(
       `WITH timeline AS (
        SELECT domain_event.event_id AS id, domain_event.type,
@@ -140,11 +160,20 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       )
       SELECT id, type, occurred_at, slot, transaction_index, instruction_index,
         inner_instruction_index, confirmation_status, payload_version, payload
-      FROM timeline
-      ORDER BY slot, transaction_index, instruction_index, inner_sort, id`,
-      [text(mint)],
+      FROM timeline${afterSql}
+      ORDER BY slot, transaction_index, instruction_index, inner_sort, id
+      LIMIT ${limitParameter}`,
+      values,
     );
-    return freeze(result.rows.map(toTimelineEntry));
+    const rows = result.rows.slice(0, limit);
+    const items = freeze(rows.map(toTimelineEntry));
+    const last = result.rows.length > limit ? rows.at(-1) : undefined;
+    return freeze({ items, nextCursor: last === undefined ? null : encodeTimelineCursor({
+      slot: decimal(last.slot), transactionIndex: safeNumber(last.transaction_index),
+      instructionIndex: safeNumber(last.instruction_index),
+      innerInstructionIndex: last.inner_instruction_index === null ? null : safeNumber(last.inner_instruction_index),
+      id: text(last.id),
+    }) });
   }
 
   public async getLaunchRisk(mint: string): Promise<ApiQualification | null> {
@@ -184,9 +213,11 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       `SELECT position.position_id, position.mint, position.status, position.opened_at,
           position.closed_at, position.quote_mint, position.remaining_base_raw,
           position.quote_cost_raw, position.quote_proceeds_raw, position.net_pnl_quote_raw,
-          entry_trade.fees_raw AS entry_fees_raw
+          entry_trade.fees_raw AS entry_fees_raw, exit_trade.fees_raw AS exit_fees_raw
        FROM paper_positions AS position
-       JOIN paper_trades AS entry_trade ON entry_trade.trade_id = position.entry_trade_id${after}
+       JOIN paper_trades AS entry_trade ON entry_trade.trade_id = position.entry_trade_id
+       LEFT JOIN paper_trades AS exit_trade ON exit_trade.trade_id = position.exit_trade_id
+       ${after}
        ORDER BY position.opened_at DESC, position.position_id ASC
        LIMIT ${limitParameter}`,
       values,
@@ -204,45 +235,32 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
 
   public async getHealth(): Promise<ApiHealth> {
     const observedAt = validDate(this.clock());
-    const [database, checkpoints, heartbeats] = await Promise.all([
-      this.database.query('SELECT 1 AS available'),
-      this.database.query(
+    try {
+      const database = await this.database.query('SELECT 1 AS available');
+      const checkpoints = await this.database.query(
         `SELECT checkpoint_key, slot FROM processing_checkpoints
          WHERE checkpoint_key = ANY($1)`,
         [['launchpad', 'market']],
-      ),
-      this.database.query(
+      );
+      const heartbeats = await this.database.query(
         `SELECT updated_at, last_http_slot, last_websocket_slot,
-            last_finalized_slot, last_signature, pending_transactions, active_sessions
+            last_finalized_slot, last_signature, pending_transactions, active_sessions, payload
          FROM listener_heartbeats ORDER BY updated_at DESC LIMIT 1`,
-      ),
-    ]);
-    const dbAvailable = database.rows.length > 0;
-    const checkpoint = new Map(checkpoints.rows.map((row) => [text(row.checkpoint_key), decimal(row.slot)]));
-    const row = heartbeats.rows[0];
-    const heartbeat = row === undefined ? freeze({
-      startedAt: observedAt.toISOString(), updatedAt: observedAt.toISOString(),
-      lastHttpSlot: null, lastWebsocketSlot: null, lastFinalizedSlot: null, lastSignature: null,
-      pendingTransactions: 0, activeSessions: 0,
-    }) : freeze({
-      startedAt: timestamp(row.updated_at).toISOString(), updatedAt: timestamp(row.updated_at).toISOString(),
-      lastHttpSlot: nullableDecimal(row.last_http_slot), lastWebsocketSlot: nullableDecimal(row.last_websocket_slot),
-      lastFinalizedSlot: nullableDecimal(row.last_finalized_slot), lastSignature: nullableText(row.last_signature),
-      pendingTransactions: safeNumber(row.pending_transactions), activeSessions: safeNumber(row.active_sessions),
-    });
-    const lagSlots = heartbeat.lastHttpSlot === null || heartbeat.lastFinalizedSlot === null
-      ? null : (BigInt(heartbeat.lastHttpSlot) - BigInt(heartbeat.lastFinalizedSlot)).toString();
-    const degraded = !dbAvailable || !this.pipeline.httpAvailable
+      );
+      const checkpoint = new Map(checkpoints.rows.map((item) => [text(item.checkpoint_key), decimal(item.slot)]));
+      const row = heartbeats.rows[0];
+      const heartbeat = row === undefined ? emptyHeartbeat() : heartbeatFromRow(row);
+      const lagSlots = heartbeat.lastHttpSlot === null || heartbeat.lastWebsocketSlot === null
+        ? null : (BigInt(heartbeat.lastHttpSlot) - BigInt(heartbeat.lastWebsocketSlot)).toString();
+      const stale = heartbeat.updatedAt === null
+        || observedAt.getTime() - Date.parse(heartbeat.updatedAt) > HEARTBEAT_STALE_AFTER_MS;
+      const degraded = database.rows.length === 0 || stale || !this.pipeline.httpAvailable
       || this.pipeline.pumpfun === 'DEGRADED' || this.pipeline.pumpfun === 'STOPPED'
       || this.pipeline.pumpswap === 'DEGRADED' || this.pipeline.pumpswap === 'STOPPED';
-    return freeze({
-      status: degraded ? 'DEGRADED' : 'OK', observedAt: observedAt.toISOString(),
-      postgresql: freeze({ status: dbAvailable ? 'AVAILABLE' : 'UNAVAILABLE' }),
-      http: freeze({ status: this.pipeline.httpAvailable ? 'AVAILABLE' : 'UNAVAILABLE' }),
-      pipeline: freeze({ pumpfun: this.pipeline.pumpfun, pumpswap: this.pipeline.pumpswap }),
-      checkpoints: freeze({ launchpad: checkpoint.get('launchpad') ?? null, market: checkpoint.get('market') ?? null }),
-      heartbeat, lagSlots,
-    });
+      return healthResult(observedAt, database.rows.length > 0, degraded, checkpoint, heartbeat, lagSlots, this.pipeline);
+    } catch {
+      return healthResult(observedAt, false, true, new Map(), emptyHeartbeat(), null, this.pipeline);
+    }
   }
 
   private async toLaunchPage(rows: readonly LaunchRow[], limit: number): Promise<ApiPage<ApiLaunchSummary>> {
@@ -256,6 +274,23 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         detectedAtMs: timestamp(next.detected_at).getTime(), mint: text(next.mint),
       }),
     });
+  }
+
+  private async withSnapshot<T>(operation: (repository: PostgresApiProjectionRepository) => Promise<T>): Promise<T> {
+    if (this.database.connect === undefined) return operation(this);
+    const client = await this.database.connect();
+    try {
+      await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const executor: Queryable = { query: (textValue, values) => client.query(textValue, values) };
+      const result = await operation(new PostgresApiProjectionRepository(executor, this.clock, this.pipeline));
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   private async findLaunches(mint: string): Promise<readonly LaunchRow[]> {
@@ -272,26 +307,27 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
 
   private async loadLaunchProjections(mints: readonly string[]): Promise<LaunchProjections> {
     if (mints.length === 0) return { metadata: new Map(), curves: new Map(), markets: new Map() };
-    const [metadata, curves, markets] = await Promise.all([
-      this.database.query(
-        `SELECT DISTINCT ON (snapshot.mint) snapshot.mint, snapshot.metadata
+    const metadata = await this.database.query(
+      `SELECT DISTINCT ON (snapshot.mint) snapshot.mint, snapshot.metadata
          FROM token_metadata_snapshots AS snapshot
          WHERE snapshot.mint = ANY($1) AND snapshot.resolution_status = 'resolved'
-         ORDER BY snapshot.mint, snapshot.fetched_at DESC, snapshot.snapshot_id DESC`, [mints],
-      ),
-      this.database.query(
-        `SELECT DISTINCT ON (curve.mint) curve.mint, curve.quote_mint, curve.quote_decimals,
+         ORDER BY snapshot.mint, snapshot.fetched_at DESC, snapshot.snapshot_id DESC`,
+      [mints],
+    );
+    const curves = await this.database.query(
+      `SELECT DISTINCT ON (curve.mint) curve.mint, curve.quote_mint, curve.quote_decimals,
             curve.real_base_reserves_raw, curve.real_quote_reserves_raw, curve.virtual_quote_reserves_raw
          FROM bonding_curve_snapshots AS curve
          WHERE curve.mint = ANY($1) AND curve.confirmation_status <> 'orphaned'
          ORDER BY curve.mint, curve.slot DESC, curve.transaction_index DESC,
             curve.instruction_index DESC, COALESCE(curve.inner_instruction_index, -1) DESC,
-            curve.snapshot_id DESC`, [mints],
-      ),
-      this.database.query(
-        `SELECT DISTINCT ON (migration.mint) migration.mint, migration.quote_mint,
+            curve.snapshot_id DESC`,
+      [mints],
+    );
+    const markets = await this.database.query(
+      `SELECT DISTINCT ON (migration.mint) migration.mint, migration.quote_mint,
             migration.quote_decimals, pool.payload AS pool_payload,
-            reserve.base_reserves_raw, reserve.effective_quote_reserves_raw
+            reserve.base_reserves_raw, reserve.quote_vault_amount_raw
          FROM migrations AS migration
          JOIN domain_events AS migration_event ON migration_event.event_id = migration.event_id
          LEFT JOIN LATERAL (
@@ -317,9 +353,9 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
            migration_event.instruction_index DESC,
            COALESCE(migration_event.inner_instruction_index, -1) DESC,
            migration.event_id DESC,
-           migration.migration_id DESC`, [mints],
-      ),
-    ]);
+           migration.migration_id DESC`,
+      [mints],
+    );
     return {
       metadata: rowsByMint(metadata.rows), curves: rowsByMint(curves.rows), markets: rowsByMint(markets.rows),
     };
@@ -344,9 +380,8 @@ function assembleLaunchSummary(row: LaunchRow, projections: LaunchProjections): 
     mint, detectedAt: timestamp(row.detected_at).toISOString(), detectedSlot: decimal(row.created_slot),
     status: launchStatus(row.current_state), name: metadataText(metadata, 'name'), symbol: metadataText(metadata, 'symbol'),
     quoteMint, quoteDecimals,
-    marketCapQuote: nullableDecimal(market?.effective_quote_reserves_raw)
-      ?? nullableDecimal(curve?.virtual_quote_reserves_raw),
-    liquidityQuote: nullableDecimal(market?.effective_quote_reserves_raw)
+    marketCapQuote: null,
+    liquidityQuote: nullableDecimal(market?.quote_vault_amount_raw)
       ?? nullableDecimal(curve?.real_quote_reserves_raw),
   });
 }
@@ -359,7 +394,7 @@ function assembleLaunchDetail(row: LaunchRow, projections: LaunchProjections): A
     ...summary, creator: text(row.creator), tokenProgram: text(row.token_program), launchpad: text(row.launchpad),
     initialTokenAmount: nullableDecimal(row.initial_token_amount), initialQuoteAmount: nullableDecimal(row.initial_quote_amount),
     reserveBase: nullableDecimal(market?.base_reserves_raw) ?? nullableDecimal(curve?.real_base_reserves_raw),
-    reserveQuote: nullableDecimal(market?.effective_quote_reserves_raw) ?? nullableDecimal(curve?.real_quote_reserves_raw),
+    reserveQuote: nullableDecimal(market?.quote_vault_amount_raw) ?? nullableDecimal(curve?.real_quote_reserves_raw),
     feeBps: null, social: NOT_AVAILABLE_SOCIAL, holders: NOT_AVAILABLE_HOLDERS,
   });
 }
@@ -369,7 +404,7 @@ function toTimelineEntry(row: Record<string, unknown>): ApiTimelineEntry {
     return freeze({
       id: text(row.id), type: validated(row.type, DOMAIN_EVENT_TYPES) as ApiTimelineEntry['type'], occurredAt: timestamp(row.occurred_at).toISOString(),
       slot: nullableDecimal(row.slot), confirmationStatus: validated(row.confirmation_status, CONFIRMATION_STATUSES) as ApiTimelineEntry['confirmationStatus'],
-      payloadVersion: positiveSafeNumber(row.payload_version), payload: toApiDomainPayload(json(row.payload)),
+      payloadVersion: positiveSafeNumber(row.payload_version), payload: toApiDomainPayload(fromJsonValue(json(row.payload))),
     });
   } catch (error) {
     throw projectionError(error);
@@ -411,7 +446,8 @@ function toPaperPosition(row: Record<string, unknown>): ApiPaperPosition {
     openedAt: timestamp(row.opened_at).toISOString(), closedAt: nullableTimestamp(row.closed_at), quoteMint: text(row.quote_mint),
     quantity: decimal(row.remaining_base_raw), entryQuoteAmount: decimal(row.quote_cost_raw),
     exitQuoteAmount: nullableDecimal(row.quote_proceeds_raw), realizedPnlQuote: nullableSignedDecimal(row.net_pnl_quote_raw),
-    estimatedFeesQuote: decimal(row.entry_fees_raw),
+    estimatedFeesQuote: (BigInt(decimal(row.entry_fees_raw))
+      + BigInt(nullableDecimal(row.exit_fees_raw) ?? '0')).toString(),
   });
 }
 
@@ -519,8 +555,57 @@ function positiveSafeNumber(value: unknown): number {
   return result;
 }
 
+function nonnegativeSafeNumber(value: unknown): number {
+  const result = safeNumber(value);
+  if (result < 0 || Object.is(result, -0)) throw invalid();
+  return result;
+}
+
 function pageLimit(value: number): number {
-  return positiveSafeNumber(value);
+  const limit = positiveSafeNumber(value);
+  if (limit > MAX_API_PAGE_LIMIT) throw invalid();
+  return limit;
+}
+
+export const MAX_API_PAGE_LIMIT = 200;
+export const HEARTBEAT_STALE_AFTER_MS = 30_000;
+
+function emptyHeartbeat(): ApiHealth['heartbeat'] {
+  return freeze({ startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
+    lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null });
+}
+
+function heartbeatFromRow(row: Record<string, unknown>): ApiHealth['heartbeat'] {
+  const payload = isRecord(row.payload) ? row.payload : {};
+  return freeze({
+    startedAt: canonicalTimestampOrNull(payload.startedAt),
+    updatedAt: timestamp(row.updated_at).toISOString(), lastHttpSlot: nullableDecimal(row.last_http_slot),
+    lastWebsocketSlot: nullableDecimal(row.last_websocket_slot), lastFinalizedSlot: nullableDecimal(row.last_finalized_slot),
+    lastSignature: nullableText(row.last_signature), pendingTransactions: nullableSafeNumber(row.pending_transactions),
+    activeSessions: nullableSafeNumber(row.active_sessions),
+  });
+}
+
+function canonicalTimestampOrNull(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  try {
+    return timestamp(value).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+function healthResult(
+  observedAt: Date, databaseAvailable: boolean, degraded: boolean,
+  checkpoints: ReadonlyMap<string, string>, heartbeat: ApiHealth['heartbeat'], lagSlots: string | null,
+  pipeline: ApiProjectionPipelineState,
+): ApiHealth {
+  return freeze({ status: degraded ? 'DEGRADED' : 'OK', observedAt: observedAt.toISOString(),
+    postgresql: freeze({ status: databaseAvailable ? 'AVAILABLE' : 'UNAVAILABLE' }),
+    http: freeze({ status: pipeline.httpAvailable ? 'AVAILABLE' : 'UNAVAILABLE' }),
+    pipeline: freeze({ pumpfun: pipeline.pumpfun, pumpswap: pipeline.pumpswap }),
+    checkpoints: freeze({ launchpad: checkpoints.get('launchpad') ?? null, market: checkpoints.get('market') ?? null }),
+    heartbeat, lagSlots });
 }
 
 function record(value: unknown): Record<string, unknown> {

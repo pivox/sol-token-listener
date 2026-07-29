@@ -9,7 +9,7 @@ import type {
   ApiSocial,
   ApiTimelineEntry,
 } from '../api/contracts.js';
-import type { LaunchPagePosition, PaperPositionPagePosition } from '../api/cursor.js';
+import type { LaunchPagePosition, PaperPositionPagePosition, TimelinePagePosition } from '../api/cursor.js';
 
 export interface PageRequest<T> {
   readonly limit: number;
@@ -19,7 +19,7 @@ export interface PageRequest<T> {
 export interface ApiProjectionRepository {
   listLaunches(request: PageRequest<LaunchPagePosition>): Promise<ApiPage<ApiLaunchSummary>>;
   getLaunch(mint: string): Promise<ApiLaunchDetail | null>;
-  listLaunchEvents(mint: string): Promise<readonly ApiTimelineEntry[]>;
+  listLaunchEvents(mint: string, request: PageRequest<TimelinePagePosition>): Promise<ApiPage<ApiTimelineEntry>>;
   getLaunchRisk(mint: string): Promise<ApiQualification | null>;
   getLaunchSocial(mint: string): Promise<ApiSocial | null>;
   getLaunchHolders(mint: string): Promise<ApiHolders | null>;
