@@ -71,7 +71,7 @@ heures.
 
 Voir le contrat complet : [API V1](docs/api/v1.md).
 
-## Analytics participants I1
+## Analytics participants et graphe observé
 
 Le service I1 reconstruit de façon déterministe le profil du créateur, ses
 achats initiaux, sa première vente, les positions nettes observées et les
@@ -80,11 +80,28 @@ persistés depuis la détection du token : il ne consulte ni historique antérie
 ni RPC supplémentaire. Un flux net négatif est conservé comme preuve valide,
 pas ramené silencieusement à zéro.
 
-Ce service est passif et n'est pas encore composé dans le bootstrap réseau.
-Les clusters, funders communs et wallets liés restent explicitement
-`NOT_AVAILABLE` jusqu'à I2. `API_HOLDER_POSITION_LIMIT` et
-`API_HOLDER_SNAPSHOT_LIMIT` valent 100 par défaut et sont bornés à 500.
-Les projections suivent la rétention terminale de quatre heures.
+I2 ajoute un ledger de preuves de financement et un graphe passif. Un transfert
+direct du quote asset vers l'acheteur, antérieur à son achat dans la même
+transaction, est une preuve forte. Un fee payer distinct est une preuve
+moyenne exposée, mais ne fusionne jamais deux wallets. Les auto-transferts sont
+ignorés. SOL, SPL Token et Token-2022 sont décodés ; les quote assets restent
+séparés et ne sont jamais additionnés entre eux.
+
+La couverture distingue `NOT_PROCESSED`, `UNAVAILABLE` et `NO_EVIDENCE`.
+Seules les arêtes fortes forment les composantes connexes. Leur concentration
+utilise les flux positifs observés par I1 depuis l'arrivée du token, pas un
+solde SPL certifié ou un historique antérieur. Une analyse réussie sans
+cluster est `AVAILABLE` avec `clusters: []`.
+
+Ces services restent non composés dans `src/app.ts` : démarrer l'API
+n'observe aucune transaction et ne reconstruit aucun graphe. Les reason codes
+`SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` existent comme
+contrats stables, mais restent désactivés jusqu'au calibrage dry run.
+
+`API_HOLDER_POSITION_LIMIT` et `API_HOLDER_SNAPSHOT_LIMIT` valent 100. Les
+limites clusters/membres valent respectivement 50/50, avec un budget total de
+500 membres ; les troncatures sont explicites. Toutes les projections et
+preuves I2 suivent la rétention terminale de quatre heures.
 
 ## Architecture
 

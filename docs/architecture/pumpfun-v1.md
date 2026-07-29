@@ -61,9 +61,10 @@ La projection sociale n'est pas encore produite et répond explicitement
 partir des seuls trades Pump.fun persistés depuis la création. La route holders
 reste `NOT_AVAILABLE` avant reconstruction, puis expose le profil créateur,
 les positions nettes observées et la concentration top 1/5/10. Elle ne prétend
-pas être un état exhaustif des comptes token. Les funders et clusters restent
-`NOT_AVAILABLE` jusqu'à I2. L’API ne formule aucune garantie de profit, de
-même slot ou de sellabilité.
+pas être un état exhaustif des comptes token. I2 peut ensuite exposer un graphe
+observé ; il reste `NOT_AVAILABLE` tant que sa reconstruction explicite n'a pas
+eu lieu. L’API ne formule aucune garantie de profit, de même slot ou de
+sellabilité.
 
 ## Dépendances autorisées
 
@@ -109,8 +110,43 @@ créateur, appel RPC additionnel ou lecture exhaustive des comptes token n'est
 effectué. Les quotes restent séparées et tous les calculs financiers utilisent
 `bigint`; une position nette négative est une observation valide. La
 reconstruction n'est pas composée dans `src/app.ts` : le bootstrap public ne
-lance aucun traitement ni abonnement. Les funders communs, liens de wallets et
-clusters sont réservés à I2 et restent explicitement indisponibles.
+lance aucun traitement ni abonnement.
+
+### Graphe de wallets observé I2
+
+I2 intervient uniquement à partir de l'arrivée du token. Il ne recherche
+aucun historique antérieur de wallet. Pour chaque achat Pump.fun connu, le
+ledger conserve une évaluation distincte :
+
+- `STRONG` pour un transfert direct du quote asset vers l'acheteur avant
+  l'achat dans la même transaction ;
+- `MEDIUM_ONLY` pour un fee payer externe sans transfert direct prouvé ;
+- `NO_EVIDENCE` lorsque l'extraction a réussi sans preuve externe ;
+- `UNAVAILABLE` lorsque les données normalisées sont ambiguës ou insuffisantes ;
+- l'absence de ligne est exposée séparément comme `NOT_PROCESSED`.
+
+Les auto-transferts n'apportent aucune preuve. L'extracteur traite SOL, SPL
+Token et Token-2022, instructions externes et internes. Les montants de quote
+assets différents ne sont jamais additionnés.
+
+`WalletGraphAnalyzer` agrège des arêtes non orientées déterministes. Seules les
+preuves directes fortes construisent les composantes connexes ; le fee payer
+moyen reste visible sans fusion. Un cluster exige au moins deux wallets
+participants. Sa concentration est calculée en entier sur les positions nettes
+positives observées par I1. Les funders auxiliaires ont une concentration
+nulle. Ces nombres décrivent les flux observés, pas des soldes SPL certifiés.
+
+Le rebuild relit les sources canoniques sous verrou PostgreSQL par mint,
+exclut `orphaned`, remplace atomiquement les projections courantes et garde un
+snapshot immuable par fingerprint. Une analyse réussie à zéro cluster reste
+`AVAILABLE`. Les événements `WalletClusterDetected` ne contiennent que des
+agrégats bornés ; les relations et membres complets restent en base.
+
+L'API limite par défaut la réponse à 50 clusters, 50 membres par cluster et
+500 membres au total, avec des indicateurs de troncature explicites. Les reason
+codes `SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` restent
+désactivés jusqu'au calibrage dry run : I2 ne change aucun verdict, score ou
+paper trade.
 
 ## Contrats Solana
 
@@ -238,8 +274,9 @@ rétracte le pool et ses projections.
 Quand un lancement est terminal et qu’aucune position paper n’est ouverte,
 `terminal_at` est fixé et `purge_after = terminal_at + 4 heures`. Le purgeur ne
 supprime que les lignes arrivées à échéance, dans l’ordre des dépendances. Les
-profils créateurs, positions observées et snapshots holders suivent la date du
-lancement parent et sont supprimés avant ses événements. Les preuves sociales
+profils créateurs, positions observées, preuves de financement, relations,
+clusters et snapshots suivent la date du lancement parent et sont supprimés
+avant leurs événements. Les preuves sociales
 V1 sont limitées aux contenus publics ; aucune API payante X ou Telegram n’est
 obligatoire.
 

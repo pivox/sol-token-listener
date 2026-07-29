@@ -13,6 +13,8 @@ const FORBIDDEN_IMPORTS = [
   'execution/transaction-confirmer',
   'execution/trade-executor',
   'dex/raydium-cpmm/transaction-builder',
+  'WalletEvidenceObservationService',
+  'WalletGraphRebuildService',
 ] as const;
 
 void test('le bootstrap V1 ne dépend d’aucun composant de signature ou envoi', async () => {
