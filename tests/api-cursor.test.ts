@@ -34,23 +34,32 @@ void test('decodes each cursor only for its matching route', () => {
   assert.throws(() => decodeStreamCursor(launches), TypeError);
 });
 
-void test('rejects non-canonical or invalid cursor inputs', () => {
-  const invalid = [
+void test('each decoder rejects its own non-canonical cursor inputs', () => {
+  const invalidLaunches = [
     'WyJsYXVuY2hlcyIsMSwxLCJNaW50MTExIl0=',
     ' WyJsYXVuY2hlcyIsMSwxLCJNaW50MTExIl0',
     'WyJsYXVuY2hlcyIsMSwtMCwiTWludDExMSJd',
     'WyJsYXVuY2hlcyIsMSwtMSwiTWludDExMSJd',
     'WyJsYXVuY2hlcyIsMSw5MDA3MTk5MjU0NzQwOTkyLCJNaW50MTExIl0',
+  ];
+  const invalidStreams = [
     'WyJldmVudHMiLDEsIjAiXQ',
     'WyJldmVudHMiLDEsIi0xIl0',
     'WyJldmVudHMiLDEsIjAxIl0',
   ];
+  const invalidPaperPositions = [
+    'WyJwYXBlcl9wb3NpdGlvbnMiLDEsLTAsInBvc18xIl0',
+    'WyJwYXBlcl9wb3NpdGlvbnMiLDEsLTEsInBvc18xIl0',
+    'WyJwYXBlcl9wb3NpdGlvbnMiLDEsOTAwNzE5OTI1NDc0MDk5MiwicG9zXzEiXQ',
+  ];
 
-  for (const cursor of invalid) {
-    assert.throws(() => {
-      decodeLaunchCursor(cursor);
-      decodePaperPositionCursor(cursor);
-      decodeStreamCursor(cursor);
-    }, TypeError);
+  for (const cursor of invalidLaunches) {
+    assert.throws(() => decodeLaunchCursor(cursor), TypeError);
+  }
+  for (const cursor of invalidPaperPositions) {
+    assert.throws(() => decodePaperPositionCursor(cursor), TypeError);
+  }
+  for (const cursor of invalidStreams) {
+    assert.throws(() => decodeStreamCursor(cursor), TypeError);
   }
 });

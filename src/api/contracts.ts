@@ -1,4 +1,14 @@
 import type { ApiErrorCode } from './errors.js';
+import type { DomainEventType } from '../domain/events.js';
+import type { LaunchStatus } from '../domain/launch-status.js';
+import type { PaperPositionStatus } from '../domain/paper-trading.js';
+import type {
+  QualificationEvidenceStatus,
+  QualificationSignalKey,
+  QualificationVerdict,
+} from '../domain/qualification.js';
+import type { QualificationReasonCode } from '../domain/qualification-reasons.js';
+import type { ChainConfirmationStatus } from '../domain/types.js';
 
 export const API_VERSION = 'v1' as const;
 
@@ -24,10 +34,10 @@ export interface ApiSuccess<T> {
 
 export interface ApiFailure {
   readonly apiVersion: typeof API_VERSION;
-  readonly meta: ApiMeta;
   readonly error: {
     readonly code: ApiErrorCode;
     readonly message: string;
+    readonly correlationId?: string;
   };
 }
 
@@ -36,15 +46,13 @@ export interface ApiPage<T> {
   readonly nextCursor: string | null;
 }
 
-export type ApiAvailability<T> =
-  | { readonly status: 'AVAILABLE'; readonly data: T }
-  | { readonly status: 'NOT_AVAILABLE' };
+export type ApiAvailability = 'AVAILABLE' | 'NOT_AVAILABLE';
 
 export interface ApiLaunchSummary {
   readonly mint: string;
   readonly detectedAt: string;
   readonly detectedSlot: string;
-  readonly status: string;
+  readonly status: LaunchStatus;
   readonly name: string | null;
   readonly symbol: string | null;
   readonly quoteMint: string | null;
@@ -68,61 +76,69 @@ export interface ApiLaunchDetail extends ApiLaunchSummary {
 
 export interface ApiTimelineEntry {
   readonly id: string;
-  readonly type: string;
+  readonly type: DomainEventType;
   readonly occurredAt: string;
   readonly slot: string | null;
-  readonly sequence: string | null;
-  readonly details: Readonly<Record<string, ApiJsonValue>>;
+  readonly confirmationStatus: ChainConfirmationStatus;
+  readonly payloadVersion: number;
+  readonly payload: ApiJsonValue;
 }
 
 export interface ApiQualification {
-  readonly status: string;
-  readonly score: number;
-  readonly threshold: number;
-  readonly reasons: readonly string[];
+  readonly ruleSet: ApiQualificationRuleset;
+  readonly scores: ApiQualificationScores;
+  readonly evidence: readonly ApiQualificationEvidence[];
+  readonly blockers: readonly ApiQualificationBlocker[];
+  readonly verdict: QualificationVerdict;
   readonly evaluatedAt: string;
 }
 
-export type ApiSocial =
-  | {
-      readonly status: 'AVAILABLE';
-      readonly links: Readonly<Record<string, string>>;
-      readonly evidence: readonly string[];
-    }
-  | {
-      readonly status: 'NOT_AVAILABLE';
-      readonly links: null;
-      readonly evidence: readonly string[];
-    };
-
-export type ApiHolders =
-  | {
-      readonly status: 'AVAILABLE';
-      readonly snapshots: readonly ApiHolderSnapshot[];
-      readonly clusters: readonly ApiHolderCluster[];
-    }
-  | {
-      readonly status: 'NOT_AVAILABLE';
-      readonly snapshots: readonly [];
-      readonly clusters: readonly [];
-    };
-
-export interface ApiHolderSnapshot {
-  readonly observedAt: string;
-  readonly holderCount: string;
-  readonly topHolderPercentageBps: string | null;
+export interface ApiQualificationRuleset {
+  readonly id: string;
+  readonly version: number;
+  readonly status: 'UNVALIDATED_RULE_SET';
+  readonly minimumTotalScore: number;
 }
 
-export interface ApiHolderCluster {
-  readonly label: string;
-  readonly holderCount: string;
-  readonly percentageBps: string;
+export interface ApiQualificationScores {
+  readonly preparation: ApiQualificationScore;
+  readonly socialAuthenticity: ApiQualificationScore;
+  readonly onchainHealth: ApiQualificationScore;
+  readonly total: ApiQualificationScore;
+}
+
+export interface ApiQualificationScore {
+  readonly score: number;
+  readonly maximum: number;
+}
+
+export interface ApiQualificationBlocker {
+  readonly code: QualificationReasonCode;
+  readonly message: string;
+}
+
+export interface ApiQualificationEvidence {
+  readonly signal: QualificationSignalKey;
+  readonly status: QualificationEvidenceStatus;
+  readonly message: string;
+}
+
+export interface ApiSocial {
+  readonly status: 'NOT_AVAILABLE';
+  readonly links: readonly [];
+  readonly evidence: readonly [];
+}
+
+export interface ApiHolders {
+  readonly status: 'NOT_AVAILABLE';
+  readonly snapshots: readonly [];
+  readonly clusters: readonly [];
 }
 
 export interface ApiPaperPosition {
   readonly id: string;
   readonly mint: string;
-  readonly status: string;
+  readonly status: PaperPositionStatus;
   readonly openedAt: string;
   readonly closedAt: string | null;
   readonly quoteMint: string;
@@ -136,15 +152,59 @@ export interface ApiPaperPosition {
 export interface ApiHealth {
   readonly status: 'OK' | 'DEGRADED';
   readonly observedAt: string;
-  readonly dependencies: Readonly<Record<string, 'AVAILABLE' | 'UNAVAILABLE'>>;
+  readonly postgresql: ApiHealthDependency;
+  readonly http: ApiHealthDependency;
+  readonly pipeline: ApiPipelineHealth;
+  readonly checkpoints: ApiCheckpoints;
+  readonly heartbeat: ApiHeartbeat;
+  readonly lagSlots: string | null;
+}
+
+export interface ApiHealthDependency {
+  readonly status: 'AVAILABLE' | 'UNAVAILABLE';
+}
+
+export interface ApiPipelineHealth {
+  readonly pumpfun: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+  readonly pumpswap: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+}
+
+export interface ApiCheckpoints {
+  readonly launchpad: string | null;
+  readonly market: string | null;
+}
+
+export interface ApiHeartbeat {
+  readonly startedAt: string;
+  readonly updatedAt: string;
+  readonly lastHttpSlot: string | null;
+  readonly lastWebsocketSlot: string | null;
+  readonly lastFinalizedSlot: string | null;
+  readonly lastSignature: string | null;
+  readonly pendingTransactions: number;
+  readonly activeSessions: number;
 }
 
 export interface ApiSseEvent {
-  readonly id: string;
-  readonly sequence: string;
-  readonly type: string;
-  readonly occurredAt: string;
-  readonly data: ApiJsonValue;
+  readonly eventId: string;
+  readonly type: DomainEventType;
+  readonly mint: string;
+  readonly source: string;
+  readonly program: string;
+  readonly signature: string;
+  readonly cursor: ApiSseCursor;
+  readonly confirmationStatus: ChainConfirmationStatus;
+  readonly blockchainTime: string | null;
+  readonly observedAt: string;
+  readonly payloadVersion: number;
+  readonly payload: ApiJsonValue;
+}
+
+export interface ApiSseCursor {
+  readonly slot: string;
+  readonly transactionIndex: string;
+  readonly instructionIndex: string;
+  readonly innerInstructionIndex: string | null;
 }
 
 export function toApiJson(value: unknown): ApiJsonValue {
@@ -155,10 +215,10 @@ function convertToApiJson(value: unknown, ancestors: Set<object>): ApiJsonValue 
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'number') {
-    if (!Number.isSafeInteger(value) || Object.is(value, -0)) {
+    if (!Number.isSafeInteger(value)) {
       throw new TypeError('API JSON numbers must be safe integers');
     }
-    return value;
+    return Object.is(value, -0) ? 0 : value;
   }
   if (typeof value !== 'object') {
     throw new TypeError(`Unsupported API JSON value: ${typeof value}`);
@@ -167,12 +227,20 @@ function convertToApiJson(value: unknown, ancestors: Set<object>): ApiJsonValue 
   ancestors.add(value);
   try {
     if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        if (!Object.hasOwn(value, index)) throw new TypeError('API JSON arrays must not be sparse');
+      }
       return Object.freeze(value.map((item) => convertToApiJson(item, ancestors)));
     }
     if (!isPlainObject(value)) throw new TypeError('API JSON objects must be plain objects');
-    const result: Record<string, ApiJsonValue> = {};
+    const result = Object.create(null) as Record<string, ApiJsonValue>;
     for (const key of Object.keys(value)) {
-      result[key] = convertToApiJson(value[key], ancestors);
+      Object.defineProperty(result, key, {
+        value: convertToApiJson(value[key], ancestors),
+        enumerable: true,
+        configurable: false,
+        writable: false,
+      });
     }
     return Object.freeze(result);
   } finally {
