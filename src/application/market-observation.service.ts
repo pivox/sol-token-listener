@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import type { MatchedMigration } from './pumpswap-migration-matcher.js';
 import type {
   CanonicalMarketPool,
-  MarketReserves,
   MarketTrade,
   RawMarketObservation,
 } from '../domain/market.js';
@@ -10,13 +9,14 @@ import { compareCursors } from '../domain/cursor.js';
 import type {
   MarketObservationRepository,
   MarketObservationResult,
+  MarketReserveObservation,
 } from '../ports/market-observation-repository.js';
 import type { SolanaObservedTransaction } from '../solana/rpc/observed-transaction.js';
 import { toJsonValue } from '../utils/json.js';
 
 export interface MarketObservation {
   readonly matches: readonly MatchedMigration[];
-  readonly reserveSnapshots: readonly MarketReserves[];
+  readonly reserveSnapshots: readonly MarketReserveObservation[];
   readonly trades: readonly MarketTrade[];
 }
 
@@ -67,7 +67,7 @@ export class MarketObservationService {
       if (
         reserves.cursor.slot !== transaction.cursor.slot
         || reserves.cursor.transactionIndex !== transaction.cursor.transactionIndex
-        || reserves.observedSlot !== reserves.cursor.slot
+        || reserves.reserves.observedSlot !== reserves.cursor.slot
       ) {
         throw new InvalidMarketObservationError(
           `Snapshot hors transaction: ${reserves.id}`,

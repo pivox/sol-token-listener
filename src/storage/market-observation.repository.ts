@@ -7,7 +7,6 @@ import {
 } from '../domain/state-transitions.js';
 import type {
   CanonicalMarketPool,
-  MarketReserves,
   MarketTrade,
   RawMarketObservation,
 } from '../domain/market.js';
@@ -19,6 +18,7 @@ import type {
   MarketObservationBatch,
   MarketObservationRepository,
   MarketObservationResult,
+  MarketReserveObservation,
 } from '../ports/market-observation-repository.js';
 import { fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
@@ -283,8 +283,9 @@ implements MarketObservationRepository {
 
   private async writeReserves(
     client: QueryClient,
-    reserves: MarketReserves,
+    observation: MarketReserveObservation,
   ): Promise<void> {
+    const { reserves } = observation;
     await client.query(
       `INSERT INTO market_reserve_snapshots (
         snapshot_id,pool_address,base_reserves_raw,quote_vault_amount_raw,
@@ -295,13 +296,13 @@ implements MarketObservationRepository {
       ON CONFLICT (snapshot_id) DO UPDATE SET
         confirmation_status = EXCLUDED.confirmation_status`,
       [
-        reserves.id, reserves.pool, reserves.baseReservesRaw.toString(),
+        observation.id, reserves.pool, reserves.baseReservesRaw.toString(),
         reserves.quoteVaultAmountRaw.toString(),
         reserves.virtualQuoteReservesRaw.toString(),
         reserves.effectiveQuoteReservesRaw.toString(),
-        reserves.cursor.slot.toString(), reserves.cursor.transactionIndex,
-        reserves.cursor.instructionIndex, reserves.cursor.innerInstructionIndex,
-        reserves.confirmationStatus, new Date(reserves.observedAtMs),
+        observation.cursor.slot.toString(), observation.cursor.transactionIndex,
+        observation.cursor.instructionIndex, observation.cursor.innerInstructionIndex,
+        observation.confirmationStatus, new Date(reserves.observedAtMs),
       ],
     );
   }
