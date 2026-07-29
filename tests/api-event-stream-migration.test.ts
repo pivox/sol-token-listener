@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import pg from 'pg';
+import { DOMAIN_EVENT_TYPES } from '../src/domain/events.js';
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationUrl = new URL('../migrations/006_api_event_stream.sql', import.meta.url);
@@ -22,6 +23,16 @@ void test('la migration crée une outbox append-only publique, indexée et sans 
   assert.match(sql, /event JSONB NOT NULL/u);
   assert.match(sql, /emitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW\(\)/u);
   assert.match(sql, /purge_after TIMESTAMPTZ NOT NULL/u);
+  assert.match(sql, /event_type TEXT NOT NULL CHECK \(event_type IN \(/u);
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS api_event_stream_state/u);
+  assert.match(sql, /id SMALLINT PRIMARY KEY CHECK \(id = 1\)/u);
+  assert.match(sql, /last_sequence BIGINT NOT NULL DEFAULT 0 CHECK \(last_sequence >= 0\)/u);
+  assert.match(sql, /INSERT INTO api_event_stream_state \(id\) VALUES \(1\) ON CONFLICT \(id\) DO NOTHING/u);
+  assert.deepEqual(
+    sqlStringListAfter(sql, 'event_type TEXT NOT NULL CHECK (event_type IN ('),
+    [...DOMAIN_EVENT_TYPES],
+  );
+  assert.deepEqual(sqlStringListAfter(sql, 'AND type IN ('), [...DOMAIN_EVENT_TYPES]);
   const backfill = sql.indexOf('INSERT INTO %1$I.api_event_stream');
   assert.ok(backfill >= 0);
   assert.ok(sql.indexOf('CREATE INDEX IF NOT EXISTS api_event_stream_mint_sequence_idx') > backfill);
@@ -50,6 +61,7 @@ void test('la migration enfile les révisions publiques avec trigger rejouable e
   assert.match(sql, /ON CONFLICT \(domain_event_id, revision\) DO NOTHING/u);
   assert.match(sql, /NOT EXISTS \([\s\S]*existing\.domain_event_id = domain_events\.event_id/u);
   assert.match(sql, /%1\$I\.api_event_stream existing/u);
+  assert.match(sql, /AND type IN \(/u);
   assert.match(sql, /NOW\(\) \+ INTERVAL '4 hours'/u);
   assert.match(sql, /WHERE \(?purge_after IS NULL OR purge_after > NOW\(\)\)?/u);
   assert.match(sql, /ORDER BY created_at, event_id/u);
@@ -57,6 +69,19 @@ void test('la migration enfile les révisions publiques avec trigger rejouable e
   assert.match(sql, /to_char\(\s*NEW\.observed_at AT TIME ZONE 'UTC'/u);
   assert.match(sql, /to_char\(\s*blockchain_time AT TIME ZONE 'UTC'/u);
   assert.match(sql, /to_char\(\s*observed_at AT TIME ZONE 'UTC'/u);
+
+  const locks = [...sql.matchAll(/PERFORM pg_advisory_xact_lock\(\d+, \d+\)/gu)];
+  assert.ok(locks.length >= 2);
+  const triggerLock = locks[0]?.index ?? -1;
+  const revisionAllocation = sql.indexOf('COALESCE(MAX(revision), 0) + 1');
+  const triggerInsert = sql.indexOf('INSERT INTO %I.api_event_stream');
+  assert.ok(triggerLock >= 0 && triggerLock < revisionAllocation && revisionAllocation < triggerInsert);
+  const backfillLock = locks[1]?.index ?? -1;
+  const backfillInsert = sql.indexOf('INSERT INTO %1$I.api_event_stream');
+  assert.ok(backfillLock >= 0 && backfillLock < backfillInsert);
+  assert.match(sql, /RETURNING sequence[\s\S]*INTO allocated_sequence/u);
+  assert.match(sql, /last_sequence = GREATEST\(last_sequence, \$1\)/u);
+  assert.match(sql, /last_sequence = GREATEST\([\s\S]*MAX\(sequence\)/u);
 });
 
 void test('la purge supprime l’outbox avant les événements de domaine et expose son compteur', async () => {
@@ -68,6 +93,7 @@ void test('la purge supprime l’outbox avant les événements de domaine et exp
   assert.ok(domainDeletion > outboxDeletion);
   assert.match(source, /readonly apiEventStream: number;/u);
   assert.match(source, /apiEventStream: apiEventStream\.rowCount \?\? 0,/u);
+  assert.doesNotMatch(source, /DELETE FROM api_event_stream_state/u);
 });
 
 void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est configurée', async (context) => {
@@ -80,7 +106,11 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
   const schema = `api_event_stream_${randomUUID().replaceAll('-', '')}`;
   assert.match(schema, /^[a-z_][a-z0-9_]*$/u);
   const admin = new pg.Pool({ connectionString: databaseUrl });
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    max: 3,
+    options: `-c search_path=${schema}`,
+  });
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const client = await pool.connect();
@@ -89,8 +119,23 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
     } finally {
       client.release();
     }
-    await migrateDatabase({ pool });
+    for (const migration of [
+      '001_initial.sql',
+      '002_pumpfun_foundation.sql',
+      '003_pumpfun_observations.sql',
+      '004_paper_trading.sql',
+      '005_pumpswap_market.sql',
+    ]) await applyMigration(pool, migration);
+    await pool.query(`INSERT INTO domain_events (
+      event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
+      confirmation_status, observed_at, payload_version, payload
+    ) VALUES ('legacy-live', 'LegacyUnknown', 'mint-live', 'legacy', 'legacy-program', 'legacy-signature',
+      40, 0, 0, 'processed', NOW(), 1, '{}'::jsonb)`);
+    assert.deepEqual(await migrateDatabase({ pool }), ['006_api_event_stream.sql']);
     assert.deepEqual(await migrateDatabase({ pool }), []);
+    assert.equal((await pool.query(
+      "SELECT 1 FROM api_event_stream WHERE domain_event_id = 'legacy-live'",
+    )).rowCount, 0);
     await pool.query("SET TIME ZONE 'Europe/Paris'");
 
     await pool.query(`
@@ -113,14 +158,14 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
           event_id, raw_event_id, type, mint, source, program, signature, slot,
           transaction_index, instruction_index, inner_instruction_index, confirmation_status,
           blockchain_time, observed_at, payload_version, payload
-        ) VALUES ('domain-live', 'raw-live', 'launch_detected', 'mint-live', 'listener', 'program-live',
+        ) VALUES ('domain-live', 'raw-live', 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live',
           'signature-live', 42, 1, 2, NULL, 'processed', '2025-01-02T03:04:04.000Z',
           '2025-01-02T03:04:05.000Z', 1, '{"amountRaw":"9007199254740993"}'::jsonb)
     `);
     await pool.query(`INSERT INTO domain_events (
         event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
         confirmation_status, observed_at, payload_version, payload, terminal_at, purge_after
-      ) VALUES ('backfill-live', 'launch_detected', 'mint-live', 'listener', 'program-live', 'backfill-signature',
+      ) VALUES ('backfill-live', 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live', 'backfill-signature',
         43, 1, 2, 'processed', NOW(), 1, '{}'::jsonb, NOW(), NOW() + INTERVAL '1 hour')`);
     await pool.query('DELETE FROM api_event_stream WHERE domain_event_id = $1', ['backfill-live']);
 
@@ -143,14 +188,23 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
     const migrationSql = await readFile(migrationUrl, 'utf8');
     await pool.query("SET TIME ZONE 'America/New_York'");
     await pool.query(migrationSql);
+    const checkpointAfterFirstReplay = (await pool.query<{ readonly last_sequence: string }>(
+      'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
+    )).rows[0]?.last_sequence;
     await pool.query(migrationSql);
+    assert.equal(
+      (await pool.query<{ readonly last_sequence: string }>(
+        'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
+      )).rows[0]?.last_sequence,
+      checkpointAfterFirstReplay,
+    );
     assert.equal((await pool.query('SELECT 1 FROM api_event_stream WHERE domain_event_id = $1', ['backfill-live'])).rowCount, 1);
     assert.equal((await pool.query('SELECT 1 FROM api_event_stream WHERE domain_event_id = $1', ['domain-live'])).rowCount, 4);
 
     await pool.query(`INSERT INTO domain_events (
       event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
       confirmation_status, observed_at, payload_version, payload
-    ) VALUES ('revision-live', 'launch_detected', 'mint-live', 'listener', 'program-live', 'revision-signature',
+    ) VALUES ('revision-live', 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live', 'revision-signature',
       44, 1, 2, 'processed', NOW(), 1, '{"state":"A"}'::jsonb)`);
     await pool.query("UPDATE domain_events SET payload = '{\"state\":\"B\"}'::jsonb WHERE event_id = 'revision-live'");
     await pool.query("UPDATE domain_events SET payload = '{\"state\":\"A\"}'::jsonb WHERE event_id = 'revision-live'");
@@ -167,7 +221,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
     await pool.query(`INSERT INTO domain_events (
       event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
       confirmation_status, observed_at, payload_version, payload
-    ) VALUES ('partial-replay-live', 'launch_detected', 'mint-live', 'listener', 'program-live', 'partial-signature',
+    ) VALUES ('partial-replay-live', 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live', 'partial-signature',
       46, 1, 2, 'processed', NOW(), 1, '{"state":"A"}'::jsonb)`);
     await pool.query("UPDATE domain_events SET payload = '{\"state\":\"B\"}'::jsonb WHERE event_id = 'partial-replay-live'");
     await pool.query('DELETE FROM api_event_stream WHERE domain_event_id = $1 AND revision = 1', ['partial-replay-live']);
@@ -177,22 +231,82 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
     );
     assert.deepEqual(retainedRevision.rows, [{ revision: '2', state: 'B' }]);
 
-    await pool.query(`CREATE TEMP TABLE api_event_stream (
-      LIKE ${quoteIdentifier(schema)}.api_event_stream INCLUDING ALL
-    )`);
-    await pool.query(`INSERT INTO domain_events (
-      event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
-      confirmation_status, observed_at, payload_version, payload
-    ) VALUES ('schema-target-live', 'launch_detected', 'mint-live', 'listener', 'program-live', 'schema-target-signature',
-      45, 1, 2, 'processed', NOW(), 1, '{}'::jsonb)`);
-    const persistentCount = await pool.query<{ readonly count: string }>(
-      `SELECT count(*) AS count FROM ${quoteIdentifier(schema)}.api_event_stream WHERE domain_event_id = 'schema-target-live'`,
+    await assert.rejects(
+      pool.query(`INSERT INTO domain_events (
+        event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
+        confirmation_status, observed_at, payload_version, payload
+      ) VALUES ('unsupported-live', 'UnsupportedNewType', 'mint-live', 'listener', 'program-live',
+        'unsupported-signature', 47, 1, 2, 'processed', NOW(), 1, '{}'::jsonb)`),
+      /api_event_stream_event_type_check/u,
     );
-    const temporaryCount = await pool.query<{ readonly count: string }>(
-      "SELECT count(*) AS count FROM api_event_stream WHERE domain_event_id = 'schema-target-live'",
+    assert.equal((await pool.query(
+      "SELECT 1 FROM api_event_stream WHERE domain_event_id = 'unsupported-live'",
+    )).rowCount, 0);
+
+    await assertCommitOrderedSequences(pool, schema);
+
+    const checkpointBeforePurge = await pool.query<{
+      readonly last_sequence: string;
+      readonly visible_max: string;
+    }>(
+      `SELECT state.last_sequence, COALESCE(MAX(stream.sequence), 0) AS visible_max
+       FROM api_event_stream_state state
+       LEFT JOIN api_event_stream stream ON TRUE
+       WHERE state.id = 1
+       GROUP BY state.id, state.last_sequence`,
     );
-    assert.equal(persistentCount.rows[0]?.count, '1');
-    assert.equal(temporaryCount.rows[0]?.count, '0');
+    assert.ok(BigInt(checkpointBeforePurge.rows[0]?.last_sequence ?? '-1') > 0n);
+    assert.equal(
+      checkpointBeforePurge.rows[0]?.last_sequence,
+      checkpointBeforePurge.rows[0]?.visible_max,
+    );
+    await pool.query('DELETE FROM api_event_stream');
+    assert.equal((await pool.query('SELECT 1 FROM api_event_stream')).rowCount, 0);
+    assert.equal(
+      (await pool.query<{ readonly last_sequence: string }>(
+        'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
+      )).rows[0]?.last_sequence,
+      checkpointBeforePurge.rows[0]?.last_sequence,
+    );
+
+    const shadowClient = await pool.connect();
+    try {
+      await shadowClient.query(`SET search_path TO ${quoteIdentifier(schema)}`);
+      await shadowClient.query(`CREATE TEMP TABLE api_event_stream (
+        LIKE ${quoteIdentifier(schema)}.api_event_stream INCLUDING ALL
+      )`);
+      await shadowClient.query(`CREATE TEMP TABLE api_event_stream_state (
+        LIKE ${quoteIdentifier(schema)}.api_event_stream_state INCLUDING ALL
+      )`);
+      await shadowClient.query('INSERT INTO api_event_stream_state(id) VALUES (1)');
+      await shadowClient.query(`INSERT INTO domain_events (
+        event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
+        confirmation_status, observed_at, payload_version, payload
+      ) VALUES ('schema-target-live', 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live',
+        'schema-target-signature', 45, 1, 2, 'processed', NOW(), 1, '{}'::jsonb)`);
+      const persistentCount = await shadowClient.query<{ readonly count: string }>(
+        `SELECT count(*) AS count FROM ${quoteIdentifier(schema)}.api_event_stream
+         WHERE domain_event_id = 'schema-target-live'`,
+      );
+      const temporaryCount = await shadowClient.query<{ readonly count: string }>(
+        "SELECT count(*) AS count FROM api_event_stream WHERE domain_event_id = 'schema-target-live'",
+      );
+      const persistentCheckpoint = await shadowClient.query<{ readonly last_sequence: string }>(
+        `SELECT last_sequence FROM ${quoteIdentifier(schema)}.api_event_stream_state WHERE id = 1`,
+      );
+      const temporaryCheckpoint = await shadowClient.query<{ readonly last_sequence: string }>(
+        'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
+      );
+      assert.equal(persistentCount.rows[0]?.count, '1');
+      assert.equal(temporaryCount.rows[0]?.count, '0');
+      assert.ok(
+        BigInt(persistentCheckpoint.rows[0]?.last_sequence ?? '0')
+          > BigInt(checkpointBeforePurge.rows[0]?.last_sequence ?? '0'),
+      );
+      assert.equal(temporaryCheckpoint.rows[0]?.last_sequence, '0');
+    } finally {
+      shadowClient.release();
+    }
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
@@ -203,4 +317,109 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
 function quoteIdentifier(identifier: string): string {
   if (!/^[a-z_][a-z0-9_]*$/u.test(identifier)) throw new Error('Unsafe SQL identifier.');
   return `"${identifier}"`;
+}
+
+function sqlStringListAfter(sql: string, marker: string): readonly string[] {
+  const start = sql.indexOf(marker);
+  assert.ok(start >= 0);
+  const end = sql.indexOf(')', start + marker.length);
+  assert.ok(end > start);
+  return [...sql.slice(start + marker.length, end).matchAll(/'([^']+)'/gu)]
+    .map((match) => match[1] ?? '');
+}
+
+async function applyMigration(
+  pool: InstanceType<typeof pg.Pool>,
+  migration: string,
+): Promise<void> {
+  const sql = await readFile(new URL(`../migrations/${migration}`, import.meta.url), 'utf8');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(sql);
+    await client.query('INSERT INTO migration_history(version) VALUES ($1)', [migration]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function assertCommitOrderedSequences(
+  pool: InstanceType<typeof pg.Pool>,
+  schema: string,
+): Promise<void> {
+  const first = await pool.connect();
+  const second = await pool.connect();
+  let firstOpen = false;
+  let secondOpen = false;
+  try {
+    for (const client of [first, second]) {
+      await client.query(`SET search_path TO ${quoteIdentifier(schema)}`);
+      await client.query("SET statement_timeout TO '5s'");
+    }
+    await first.query('BEGIN');
+    firstOpen = true;
+    await second.query('BEGIN');
+    secondOpen = true;
+    await first.query(domainEventInsertSql, ['concurrent-first', 'concurrent-first-signature', '48']);
+
+    let secondFinished = false;
+    const secondInsert = second.query(
+      domainEventInsertSql,
+      ['concurrent-second', 'concurrent-second-signature', '49'],
+    ).then(() => {
+      secondFinished = true;
+    });
+    await delay(150);
+    assert.equal(secondFinished, false);
+    await first.query('COMMIT');
+    firstOpen = false;
+    await withTimeout(secondInsert, 2_000);
+    await second.query('COMMIT');
+    secondOpen = false;
+
+    const sequences = await pool.query<{ readonly domain_event_id: string; readonly sequence: string }>(
+      `SELECT domain_event_id, sequence
+       FROM ${quoteIdentifier(schema)}.api_event_stream
+       WHERE domain_event_id IN ('concurrent-first', 'concurrent-second')
+       ORDER BY sequence`,
+    );
+    assert.deepEqual(sequences.rows.map((row) => row.domain_event_id), [
+      'concurrent-first',
+      'concurrent-second',
+    ]);
+    assert.ok(BigInt(sequences.rows[0]?.sequence ?? '0') < BigInt(sequences.rows[1]?.sequence ?? '0'));
+  } finally {
+    if (firstOpen) await first.query('ROLLBACK');
+    if (secondOpen) await second.query('ROLLBACK');
+    first.release();
+    second.release();
+  }
+}
+
+const domainEventInsertSql = `INSERT INTO domain_events (
+  event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
+  confirmation_status, observed_at, payload_version, payload
+) VALUES ($1, 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live', $2,
+  $3, 1, 2, 'processed', NOW(), 1, '{}'::jsonb)`;
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  const rejection = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error('PostgreSQL concurrency test timed out.'));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, rejection]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

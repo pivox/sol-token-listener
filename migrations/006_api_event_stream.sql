@@ -3,7 +3,23 @@ CREATE TABLE IF NOT EXISTS api_event_stream (
   stream_event_id TEXT UNIQUE NOT NULL,
   domain_event_id TEXT NOT NULL,
   revision BIGINT NOT NULL CHECK (revision > 0),
-  event_type TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN (
+    'TokenLaunchDetected',
+    'TokenMetadataResolved',
+    'TokenMetadataFailed',
+    'SocialEvidenceCollected',
+    'CreatorProfileUpdated',
+    'WalletClusterDetected',
+    'BondingCurveTradeObserved',
+    'BondingCurveStateUpdated',
+    'BondingCurveCompleted',
+    'QualificationUpdated',
+    'PaperPositionOpened',
+    'PaperPositionUpdated',
+    'PaperPositionClosed',
+    'MigrationObserved',
+    'PumpSwapPoolActivated'
+  )),
   mint TEXT NOT NULL,
   confirmation_status TEXT NOT NULL CHECK (
     confirmation_status IN ('processed', 'confirmed', 'finalized', 'orphaned')
@@ -15,6 +31,12 @@ CREATE TABLE IF NOT EXISTS api_event_stream (
   UNIQUE(domain_event_id, revision)
 );
 
+CREATE TABLE IF NOT EXISTS api_event_stream_state (
+  id SMALLINT PRIMARY KEY CHECK (id = 1),
+  last_sequence BIGINT NOT NULL DEFAULT 0 CHECK (last_sequence >= 0)
+);
+INSERT INTO api_event_stream_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
 CREATE OR REPLACE FUNCTION enqueue_api_domain_event_revision()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -23,6 +45,7 @@ AS $$
 DECLARE
   public_event JSONB;
   next_revision BIGINT;
+  allocated_sequence BIGINT;
 BEGIN
   IF TG_OP = 'UPDATE'
     AND NEW.event_id IS NOT DISTINCT FROM OLD.event_id
@@ -43,6 +66,10 @@ BEGIN
   THEN
     RETURN NEW;
   END IF;
+
+  -- Dedicated API outbox sequencing lock: two signed int32 application constants.
+  -- Holding this transaction-scoped lock makes identity allocation follow commit order.
+  PERFORM pg_advisory_xact_lock(1095782223, 1163281235);
 
   public_event := jsonb_build_object(
     'eventId', NEW.event_id,
@@ -80,9 +107,10 @@ BEGIN
         $1 || ':' || $2::text || ':' || $3 || ':' || $4::text || ':' || md5($5::text),
         $1, $2, $6, $7, $3, $4, $5, NOW() + INTERVAL '4 hours'
       ) ON CONFLICT (domain_event_id, revision) DO NOTHING
+      RETURNING sequence
     $sql$,
     TG_TABLE_SCHEMA
-  ) USING
+  ) INTO allocated_sequence USING
     NEW.event_id,
     next_revision,
     NEW.confirmation_status,
@@ -90,6 +118,15 @@ BEGIN
     public_event,
     NEW.type,
     NEW.mint;
+
+  IF allocated_sequence IS NOT NULL THEN
+    EXECUTE format(
+      'UPDATE %I.api_event_stream_state
+       SET last_sequence = GREATEST(last_sequence, $1)
+       WHERE id = 1',
+      TG_TABLE_SCHEMA
+    ) USING allocated_sequence;
+  END IF;
 
   RETURN NEW;
 END;
@@ -107,6 +144,9 @@ BEGIN
   IF target_schema IS NULL THEN
     RAISE EXCEPTION 'A current schema is required for the API event stream backfill.';
   END IF;
+
+  -- Same key pair as the trigger: backfill and live allocation cannot interleave.
+  PERFORM pg_advisory_xact_lock(1095782223, 1163281235);
 
   EXECUTE format(
     $sql$
@@ -156,6 +196,23 @@ BEGIN
           ) AS public_event
         FROM %1$I.domain_events
         WHERE (purge_after IS NULL OR purge_after > NOW())
+          AND type IN (
+            'TokenLaunchDetected',
+            'TokenMetadataResolved',
+            'TokenMetadataFailed',
+            'SocialEvidenceCollected',
+            'CreatorProfileUpdated',
+            'WalletClusterDetected',
+            'BondingCurveTradeObserved',
+            'BondingCurveStateUpdated',
+            'BondingCurveCompleted',
+            'QualificationUpdated',
+            'PaperPositionOpened',
+            'PaperPositionUpdated',
+            'PaperPositionClosed',
+            'MigrationObserved',
+            'PumpSwapPoolActivated'
+          )
           AND NOT EXISTS (
             SELECT 1
             FROM %1$I.api_event_stream existing
@@ -164,6 +221,18 @@ BEGIN
         ORDER BY created_at, event_id
       ) AS retained_domain_events
       ON CONFLICT (domain_event_id, revision) DO NOTHING
+    $sql$,
+    target_schema
+  );
+
+  EXECUTE format(
+    $sql$
+      UPDATE %1$I.api_event_stream_state
+      SET last_sequence = GREATEST(
+        last_sequence,
+        COALESCE((SELECT MAX(sequence) FROM %1$I.api_event_stream), 0)
+      )
+      WHERE id = 1
     $sql$,
     target_schema
   );
