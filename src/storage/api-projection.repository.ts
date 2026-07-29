@@ -1,5 +1,6 @@
 import {
   MAX_API_CLUSTER_QUOTE_ASSETS,
+  MAX_API_TOTAL_CLUSTER_QUOTE_ASSETS,
   toApiDomainPayload,
   type ApiHealth,
   type ApiHolders,
@@ -588,6 +589,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       members.push(toWalletClusterMember(row));
       membersByCluster.set(clusterId, members);
     }
+    let remainingQuoteAssetBudget = MAX_API_TOTAL_CLUSTER_QUOTE_ASSETS;
     const clusters = freeze(emittedRows.map((row): ApiWalletCluster => {
       const clusterId = text(row.cluster_id);
       const members = freeze(membersByCluster.get(clusterId) ?? []);
@@ -595,8 +597,12 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       if (memberCount < members.length) throw invalid();
       const storedQuoteAssets = array(json(row.quote_assets));
       const quoteAssets = freeze(storedQuoteAssets
-        .slice(0, MAX_API_CLUSTER_QUOTE_ASSETS)
+        .slice(0, Math.min(
+          MAX_API_CLUSTER_QUOTE_ASSETS,
+          remainingQuoteAssetBudget,
+        ))
         .map(toQuoteAsset));
+      remainingQuoteAssetBudget -= quoteAssets.length;
       return freeze({
         id: clusterId,
         quoteAssetCount: storedQuoteAssets.length,

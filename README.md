@@ -100,7 +100,8 @@ contrats stables, mais restent désactivés jusqu'au calibrage dry run.
 
 `API_HOLDER_POSITION_LIMIT` et `API_HOLDER_SNAPSHOT_LIMIT` valent 100. Les
 limites clusters/membres valent respectivement 50/50, avec un budget total de
-500 membres et 32 quote assets par cluster ; les troncatures sont explicites.
+500 membres, 8 quote assets par cluster et 64 au total ; les troncatures sont
+explicites.
 Toutes les projections et preuves I2 suivent la rétention terminale de quatre
 heures.
 

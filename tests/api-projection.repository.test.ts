@@ -527,7 +527,7 @@ void test('exposes current clusters with per-cluster truncation and one shared m
     'cluster-low',
   ]);
   assert.deepEqual(holders.clusters.map((cluster) => cluster.members.length), [2, 1]);
-  assert.equal(holders.clusters[0]?.quoteAssets.length, 32);
+  assert.equal(holders.clusters[0]?.quoteAssets.length, 8);
   assert.equal(holders.clusters[0]?.quoteAssetCount, 40);
   assert.equal(holders.clusters[0]?.quoteAssetsTruncated, true);
   assert.deepEqual(holders.clusters.map((cluster) => cluster.membersTruncated), [
@@ -579,6 +579,55 @@ void test('distinguishes a successful zero-cluster analysis from unavailable gra
   assert.deepEqual(holders.clusters, []);
   assert.equal(holders.clusterCount, 0);
   assert.equal(holders.clustersTruncated, false);
+});
+
+void test('shares one bounded quote-asset budget across emitted clusters', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
+    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
+    if (call.text.includes('FROM observed_wallet_positions')) return [];
+    if (call.text.includes('FROM wallet_graph_profiles')) return [{
+      input_fingerprint: 'graph-quotes',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+    }];
+    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
+      input_fingerprint: 'graph-quotes',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+      coverage: graphCoverage(),
+      cluster_count: 9,
+    }];
+    if (call.text.includes('FROM wallet_clusters AS cluster')) {
+      return Array.from({ length: 9 }, (_, index) =>
+        clusterRow(`cluster-${index}`, '1000', '0', 40));
+    }
+    if (call.text.includes('WITH ranked_members AS')) return [];
+    return [];
+  });
+  const repository = new PostgresApiProjectionRepository(
+    database,
+    () => detectedAt,
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE' },
+    {
+      positions: 1,
+      snapshots: 1,
+      clusters: 9,
+      clusterMembers: 1,
+      totalClusterMembers: 1,
+    },
+  );
+
+  const holders = await repository.getLaunchHolders('mint-a');
+
+  assert.equal(holders?.status, 'AVAILABLE');
+  if (holders?.status !== 'AVAILABLE'
+    || holders.clusterAnalysisStatus !== 'AVAILABLE') return;
+  assert.equal(holders.clusters.reduce(
+    (count, cluster) => count + cluster.quoteAssets.length,
+    0,
+  ), 64);
+  assert.equal(holders.clusters[8]?.quoteAssets.length, 0);
+  assert.equal(holders.clusters[8]?.quoteAssetsTruncated, true);
 });
 
 void test('rejects a graph snapshot whose current cluster rows are incomplete', async () => {

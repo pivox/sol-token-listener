@@ -13,7 +13,8 @@ import type { ChainConfirmationStatus } from '../domain/types.js';
 export const API_VERSION = 'v1' as const;
 export const MAX_API_JSON_DEPTH = 64;
 export const MAX_API_JSON_NODES = 10_000;
-export const MAX_API_CLUSTER_QUOTE_ASSETS = 32;
+export const MAX_API_CLUSTER_QUOTE_ASSETS = 8;
+export const MAX_API_TOTAL_CLUSTER_QUOTE_ASSETS = 64;
 
 export type ApiJsonPrimitive = string | number | boolean | null;
 export interface ApiJsonObject {
