@@ -99,18 +99,20 @@ Un transfert direct est fort seulement si :
 7. aucun compte technique connu n'est utilisé comme wallet métier.
 
 Plusieurs transferts valides restent plusieurs preuves. Ils ne sont pas
-additionnés entre quote assets. Une preuve conserve :
+additionnés entre quote assets. Toute preuve conserve :
 
 - mint du lancement ;
 - acheteur et funder ;
 - quote mint, décimales et Token Program ;
-- montant brut entier ;
 - type et confiance ;
-- signature et curseur complet du transfert ;
 - identifiant et curseur de l'achat associé ;
 - source, programme et finalité ;
 - dates blockchain et d'observation lorsqu'elles existent ;
 - version de payload.
+
+Une preuve `DIRECT_QUOTE_TRANSFER` conserve en plus son montant brut entier et
+le curseur complet du transfert. Une preuve `FEE_PAYER_FOR_BUYER` ne prétend
+pas être un transfert : son montant et son curseur de transfert sont `null`.
 
 L'identifiant déterministe inclut le type, la source, le programme, la
 signature, le curseur du transfert, le mint, l'acheteur, le funder et le quote
@@ -139,9 +141,10 @@ l'acheteur et le mint doit correspondre au quote asset de l'achat. Pour
 `Transfer`, dont l'instruction ne transporte pas le mint, une résolution
 absente ou contradictoire rend la preuve inconnue.
 
-L'autorité ou le propriétaire source devient le funder uniquement si son
-attribution est non ambiguë. Un multisig, un owner absent ou une contradiction
-de balances ne crée aucune arête.
+Le propriétaire canonique du compte token source devient le funder uniquement
+si son attribution est non ambiguë. L'autorité de transfert ne suffit pas,
+car elle peut être un delegate. Un multisig, un owner absent ou une
+contradiction de balances ne crée aucune arête.
 
 Un transfert entre deux comptes token appartenant au même acheteur est une
 consolidation interne. Il est compté comme transfert ignoré dans le ledger
@@ -391,8 +394,8 @@ Preuves explicites et réconciliables :
 - identifiant déterministe ;
 - mint et achat associé ;
 - funder, acheteur, type et confiance ;
-- quote asset et montant `NUMERIC(78,0)` ;
-- signature, curseurs transfert/achat et finalité ;
+- quote asset et montant direct nullable `NUMERIC(78,0)` ;
+- signature, curseur de transfert nullable, curseur d'achat et finalité ;
 - payload versionné ;
 - timestamps et `purge_after`.
 
@@ -408,6 +411,20 @@ Projection courante par relation :
 - premiers/derniers curseurs ;
 - empreinte de reconstruction ;
 - `purge_after`.
+
+### `wallet_graph_profiles`
+
+Projection courante unique par mint :
+
+- empreinte courante, méthodologie et couverture ;
+- compteurs agrégés de relations et clusters ;
+- événement et curseur `asOf` ;
+- statut de confirmation ;
+- `purge_after`.
+
+Cette ligne désigne explicitement l'empreinte courante, y compris lorsque
+l'analyse produit zéro cluster ou lorsqu'un orphaning fait reculer `asOf`.
+L'historique ne sert jamais implicitement à choisir la projection active.
 
 ### `wallet_clusters`
 
