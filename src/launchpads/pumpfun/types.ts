@@ -1,5 +1,6 @@
 import type {
   QuoteAsset,
+  TokenProgramKind,
 } from '../../domain/types.js';
 import type {
   NormalizedInstruction,
@@ -141,7 +142,7 @@ export interface DecodedPumpMigration {
   readonly mint: string;
   readonly bondingCurve: string;
   readonly announcedPool: string;
-  readonly baseTokenProgram: import('../../domain/types.js').TokenProgramKind;
+  readonly baseTokenProgram: TokenProgramKind;
   readonly quoteAsset: QuoteAsset;
 }
 

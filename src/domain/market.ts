@@ -36,12 +36,15 @@ export interface CanonicalMarketPool extends MarketPool {
 }
 
 export interface MarketReserves {
+  readonly id: string;
   readonly pool: string;
   readonly baseReservesRaw: bigint;
   readonly quoteVaultAmountRaw: bigint;
   readonly virtualQuoteReservesRaw: bigint;
   readonly effectiveQuoteReservesRaw: bigint;
   readonly observedSlot: bigint;
+  readonly cursor: ChainCursor;
+  readonly confirmationStatus: ChainConfirmationStatus;
   readonly observedAtMs: number;
 }
 
