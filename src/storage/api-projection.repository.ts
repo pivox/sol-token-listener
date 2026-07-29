@@ -542,8 +542,11 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
        LIMIT $3`,
       [mint, inputFingerprint, this.holderLimits.clusters + 1],
     );
+    const expectedClusterRowCount = clusterCount > this.holderLimits.clusters
+      ? this.holderLimits.clusters + 1
+      : clusterCount;
+    if (clusterResult.rows.length !== expectedClusterRowCount) throw invalid();
     const emittedRows = clusterResult.rows.slice(0, this.holderLimits.clusters);
-    if (clusterCount < emittedRows.length) throw invalid();
     const clusterIds = emittedRows.map((row) => text(row.cluster_id));
     const memberResult = clusterIds.length === 0
       ? { rows: [] as readonly Record<string, unknown>[] }

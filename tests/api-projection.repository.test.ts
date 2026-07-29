@@ -578,6 +578,30 @@ void test('distinguishes a successful zero-cluster analysis from unavailable gra
   assert.equal(holders.clustersTruncated, false);
 });
 
+void test('rejects a graph snapshot whose current cluster rows are incomplete', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
+    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
+    if (call.text.includes('FROM wallet_graph_profiles')) return [{
+      input_fingerprint: 'graph-incomplete',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+    }];
+    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
+      input_fingerprint: 'graph-incomplete',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+      coverage: graphCoverage(),
+      cluster_count: 1,
+    }];
+    return [];
+  });
+
+  await assert.rejects(
+    new PostgresApiProjectionRepository(database).getLaunchHolders('mint-a'),
+    ApiProjectionDataError,
+  );
+});
+
 void test('orders domain events and explicit transitions by the complete cursor', async () => {
   const database = new FakeQueryable((call) => {
     if (
