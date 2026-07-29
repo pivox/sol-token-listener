@@ -95,6 +95,9 @@ void test('lists launches with a stable keyset, exact decimals, and grouped proj
   assert.match(database.calls[2]?.text ?? '', /DISTINCT ON \(curve\.mint\)[\s\S]*confirmation_status <> 'orphaned'[\s\S]*ORDER BY curve\.mint, curve\.slot DESC/u);
   assert.match(database.calls[3]?.text ?? '', /JOIN domain_events AS migration_event ON migration_event\.event_id = migration\.event_id/u);
   assert.match(database.calls[3]?.text ?? '', /ORDER BY migration\.mint, migration_event\.slot DESC/u);
+  assert.match(database.calls[3]?.text ?? '', /market_pool\.pool_address DESC/u);
+  assert.match(database.calls[3]?.text ?? '', /snapshot\.snapshot_id DESC/u);
+  assert.match(database.calls[3]?.text ?? '', /migration\.event_id DESC,[\s\S]*migration\.migration_id DESC/u);
 });
 
 void test('keeps the database query count bounded as page size grows', async () => {
@@ -155,13 +158,18 @@ void test('returns NOT_AVAILABLE social and holders only for an existing launch'
   assert.equal(await new PostgresApiProjectionRepository(new FakeQueryable(() => [])).getLaunchHolders('none'), null);
 });
 
-void test('orders the complete timeline cursor and converts domain payloads safely', async () => {
+void test('orders domain events and explicit transitions by the complete cursor', async () => {
   const database = new FakeQueryable((call) => {
-    if (call.text.includes('UNION ALL')) return [{
+    if (call.text.includes('WITH timeline')) return [{
       id: 'domain-1', type: 'QualificationUpdated', occurred_at: detectedAt,
       slot: '900719925474099312345', transaction_index: 1, instruction_index: 2,
       inner_instruction_index: null, confirmation_status: 'confirmed', payload_version: 1,
       payload: { score: 90, amount: '42' },
+    }, {
+      id: 'transition-1', type: 'TokenLaunchDetected', occurred_at: openedAt,
+      slot: '900719925474099312346', transaction_index: 0, instruction_index: 0,
+      inner_instruction_index: 1, confirmation_status: 'finalized', payload_version: 1,
+      payload: { previousStatus: null, newStatus: 'DETECTED', reasonCode: null, message: 'Token launch detected', evidence: {} },
     }];
     return [];
   });
@@ -172,8 +180,14 @@ void test('orders the complete timeline cursor and converts domain payloads safe
     id: 'domain-1', type: 'QualificationUpdated', occurredAt: detectedAt.toISOString(),
     slot: '900719925474099312345', confirmationStatus: 'confirmed', payloadVersion: 1,
     payload: { score: 90, amount: '42' },
+  }, {
+    id: 'transition-1', type: 'TokenLaunchDetected', occurredAt: openedAt.toISOString(),
+    slot: '900719925474099312346', confirmationStatus: 'finalized', payloadVersion: 1,
+    payload: { previousStatus: null, newStatus: 'DETECTED', reasonCode: null, message: 'Token launch detected', evidence: {} },
   }]);
-  assert.match(database.calls[0]?.text ?? '', /slot, transaction_index, instruction_index, COALESCE\(inner_instruction_index, -1\), id/u);
+  assert.match(database.calls[0]?.text ?? '', /WITH timeline/u);
+  assert.match(database.calls[0]?.text ?? '', /COALESCE\(domain_event\.inner_instruction_index, -1\) AS inner_sort/u);
+  assert.match(database.calls[0]?.text ?? '', /ORDER BY slot, transaction_index, instruction_index, inner_sort, id/u);
   assert.equal(Object.isFrozen(entries), true);
   assert.equal(Object.isFrozen(entries[0]?.payload ?? {}), true);
 });
@@ -222,8 +236,28 @@ void test('lists paper positions by stable keyset without decimal coercion', asy
       realizedPnlQuote: null, estimatedFeesQuote: '7',
     }], nextCursor: encodePaperPositionCursor({ openedAtMs: openedAt.getTime(), id: 'position-a' }),
   });
-  assert.match(database.calls[0]?.text ?? '', /opened_at DESC, position_id ASC/u);
+  assert.match(database.calls[0]?.text ?? '', /position\.opened_at DESC, position\.position_id ASC/u);
   assert.deepEqual(database.calls[0]?.values, [2]);
+  assert.match(database.calls[0]?.text ?? '', /position\.position_id/u);
+  assert.match(database.calls[0]?.text ?? '', /position\.opened_at DESC, position\.position_id ASC/u);
+});
+
+void test('uses a strict paper keyset and encodes the final emitted position', async () => {
+  const database = new FakeQueryable(() => [{
+    position_id: 'position-c', mint: 'mint-c', status: 'PAPER_HOLDING', opened_at: openedAt,
+    closed_at: null, quote_mint: 'quote', remaining_base_raw: '1', quote_cost_raw: '2',
+    quote_proceeds_raw: null, net_pnl_quote_raw: null, entry_fees_raw: '3',
+  }, {
+    position_id: 'position-d', mint: 'mint-d', status: 'PAPER_HOLDING', opened_at: openedAt,
+    closed_at: null, quote_mint: 'quote', remaining_base_raw: '1', quote_cost_raw: '2',
+    quote_proceeds_raw: null, net_pnl_quote_raw: null, entry_fees_raw: '3',
+  }]);
+  const page = await new PostgresApiProjectionRepository(database).listPaperPositions({
+    limit: 1, after: { openedAtMs: openedAt.getTime(), id: 'position-b' },
+  });
+  assert.equal(page.nextCursor, encodePaperPositionCursor({ openedAtMs: openedAt.getTime(), id: 'position-c' }));
+  assert.match(database.calls[0]?.text ?? '', /position\.opened_at < \$1[\s\S]*position\.opened_at = \$1[\s\S]*position\.position_id > \$2/u);
+  assert.deepEqual(database.calls[0]?.values, [openedAt, 'position-b', 2]);
 });
 
 void test('returns health without exposing database URLs or secrets', async () => {
@@ -271,4 +305,14 @@ void test('rejects invalid dates and unsafe numeric rows with a safe typed error
     call.text.includes('FROM token_launches AS launch') ? [{ ...launch('mint-a'), current_state: 'UNKNOWN' }] : [],
   ));
   await assert.rejects(invalidEnum.getLaunch('mint-a'), ApiProjectionDataError);
+
+  const nonCanonicalIso = new PostgresApiProjectionRepository(new FakeQueryable((call) =>
+    call.text.includes('FROM token_launches AS launch') ? [launch('mint-a', '2026-07-01 12:00:00Z' as unknown as Date)] : [],
+  ));
+  await assert.rejects(nonCanonicalIso.getLaunch('mint-a'), ApiProjectionDataError);
+
+  const negativeZero = new PostgresApiProjectionRepository(new FakeQueryable((call) =>
+    call.text.includes('FROM token_launches AS launch') ? [{ ...launch('mint-a'), created_slot: '-0' }] : [],
+  ));
+  await assert.rejects(negativeZero.getLaunch('mint-a'), ApiProjectionDataError);
 });

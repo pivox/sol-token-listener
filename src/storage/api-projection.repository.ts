@@ -112,11 +112,13 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
 
   public async listLaunchEvents(mint: string): Promise<readonly ApiTimelineEntry[]> {
     const result = await this.database.query(
-      `SELECT domain_event.event_id AS id, domain_event.type,
+      `WITH timeline AS (
+       SELECT domain_event.event_id AS id, domain_event.type,
           COALESCE(domain_event.blockchain_time, domain_event.observed_at) AS occurred_at,
           domain_event.slot, domain_event.transaction_index, domain_event.instruction_index,
           domain_event.inner_instruction_index, domain_event.confirmation_status,
-          domain_event.payload_version, domain_event.payload
+          domain_event.payload_version, domain_event.payload,
+          COALESCE(domain_event.inner_instruction_index, -1) AS inner_sort
        FROM domain_events AS domain_event
        WHERE domain_event.mint = $1
        UNION ALL
@@ -130,11 +132,16 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
             'reasonCode', transition.reason_code,
             'message', transition.human_message,
             'evidence', transition.evidence
-          ) AS payload
+          ) AS payload,
+          COALESCE(domain_event.inner_instruction_index, -1) AS inner_sort
        FROM state_transitions AS transition
        JOIN domain_events AS domain_event ON domain_event.event_id = transition.event_id
        WHERE transition.mint = $1
-       ORDER BY slot, transaction_index, instruction_index, COALESCE(inner_instruction_index, -1), id`,
+      )
+      SELECT id, type, occurred_at, slot, transaction_index, instruction_index,
+        inner_instruction_index, confirmation_status, payload_version, payload
+      FROM timeline
+      ORDER BY slot, transaction_index, instruction_index, inner_sort, id`,
       [text(mint)],
     );
     return freeze(result.rows.map(toTimelineEntry));
@@ -171,15 +178,16 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       ? [limit + 1]
       : [dateFromMs(request.after.openedAtMs), text(request.after.id), limit + 1];
     const after = request.after === null ? '' : `
-      WHERE (opened_at < $1 OR (opened_at = $1 AND position_id > $2))`;
+      WHERE (position.opened_at < $1 OR (position.opened_at = $1 AND position.position_id > $2))`;
     const limitParameter = request.after === null ? '$1' : '$3';
     const result = await this.database.query(
-      `SELECT position_id, mint, status, opened_at, closed_at, quote_mint,
-          remaining_base_raw, quote_cost_raw, quote_proceeds_raw, net_pnl_quote_raw,
+      `SELECT position.position_id, position.mint, position.status, position.opened_at,
+          position.closed_at, position.quote_mint, position.remaining_base_raw,
+          position.quote_cost_raw, position.quote_proceeds_raw, position.net_pnl_quote_raw,
           entry_trade.fees_raw AS entry_fees_raw
-       FROM paper_positions
-       JOIN paper_trades AS entry_trade ON entry_trade.trade_id = paper_positions.entry_trade_id${after}
-       ORDER BY opened_at DESC, position_id ASC
+       FROM paper_positions AS position
+       JOIN paper_trades AS entry_trade ON entry_trade.trade_id = position.entry_trade_id${after}
+       ORDER BY position.opened_at DESC, position.position_id ASC
        LIMIT ${limitParameter}`,
       values,
     );
@@ -291,7 +299,8 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
            WHERE market_pool.migration_id = migration.migration_id
              AND market_pool.confirmation_status <> 'orphaned'
            ORDER BY market_pool.slot DESC, market_pool.transaction_index DESC,
-             market_pool.instruction_index DESC, COALESCE(market_pool.inner_instruction_index, -1) DESC
+             market_pool.instruction_index DESC, COALESCE(market_pool.inner_instruction_index, -1) DESC,
+             market_pool.pool_address DESC
            LIMIT 1
          ) AS pool ON true
          LEFT JOIN LATERAL (
@@ -300,13 +309,14 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
              AND snapshot.confirmation_status <> 'orphaned'
            ORDER BY snapshot.observed_slot DESC, snapshot.trigger_slot DESC,
              snapshot.transaction_index DESC, snapshot.instruction_index DESC,
-             COALESCE(snapshot.inner_instruction_index, -1) DESC
+             COALESCE(snapshot.inner_instruction_index, -1) DESC, snapshot.snapshot_id DESC
            LIMIT 1
          ) AS reserve ON true
          WHERE migration.mint = ANY($1) AND migration.confirmation_status <> 'orphaned'
          ORDER BY migration.mint, migration_event.slot DESC, migration_event.transaction_index DESC,
            migration_event.instruction_index DESC,
            COALESCE(migration_event.inner_instruction_index, -1) DESC,
+           migration.event_id DESC,
            migration.migration_id DESC`, [mints],
       ),
     ]);
@@ -355,11 +365,15 @@ function assembleLaunchDetail(row: LaunchRow, projections: LaunchProjections): A
 }
 
 function toTimelineEntry(row: Record<string, unknown>): ApiTimelineEntry {
-  return freeze({
-    id: text(row.id), type: validated(row.type, DOMAIN_EVENT_TYPES) as ApiTimelineEntry['type'], occurredAt: timestamp(row.occurred_at).toISOString(),
-    slot: nullableDecimal(row.slot), confirmationStatus: validated(row.confirmation_status, CONFIRMATION_STATUSES) as ApiTimelineEntry['confirmationStatus'],
-    payloadVersion: positiveSafeNumber(row.payload_version), payload: toApiDomainPayload(json(row.payload)),
-  });
+  try {
+    return freeze({
+      id: text(row.id), type: validated(row.type, DOMAIN_EVENT_TYPES) as ApiTimelineEntry['type'], occurredAt: timestamp(row.occurred_at).toISOString(),
+      slot: nullableDecimal(row.slot), confirmationStatus: validated(row.confirmation_status, CONFIRMATION_STATUSES) as ApiTimelineEntry['confirmationStatus'],
+      payloadVersion: positiveSafeNumber(row.payload_version), payload: toApiDomainPayload(json(row.payload)),
+    });
+  } catch (error) {
+    throw projectionError(error);
+  }
 }
 
 function qualification(value: unknown): ApiQualification {
@@ -396,7 +410,7 @@ function toPaperPosition(row: Record<string, unknown>): ApiPaperPosition {
     id: text(row.position_id), mint: text(row.mint), status: validated(row.status, PAPER_POSITION_STATUSES) as ApiPaperPosition['status'],
     openedAt: timestamp(row.opened_at).toISOString(), closedAt: nullableTimestamp(row.closed_at), quoteMint: text(row.quote_mint),
     quantity: decimal(row.remaining_base_raw), entryQuoteAmount: decimal(row.quote_cost_raw),
-    exitQuoteAmount: nullableDecimal(row.quote_proceeds_raw), realizedPnlQuote: nullableDecimal(row.net_pnl_quote_raw),
+    exitQuoteAmount: nullableDecimal(row.quote_proceeds_raw), realizedPnlQuote: nullableSignedDecimal(row.net_pnl_quote_raw),
     estimatedFeesQuote: decimal(row.entry_fees_raw),
   });
 }
@@ -447,7 +461,9 @@ function json(value: unknown): unknown {
 function timestamp(value: unknown): Date {
   if (value instanceof Date) return validDate(value);
   if (typeof value !== 'string') throw invalid();
-  return validDate(new Date(value));
+  const parsed = validDate(new Date(value));
+  if (parsed.toISOString() !== value) throw invalid();
+  return parsed;
 }
 
 function nullableTimestamp(value: unknown): string | null {
@@ -465,12 +481,18 @@ function dateFromMs(value: number): Date {
 }
 
 function decimal(value: unknown): string {
-  if (typeof value !== 'string' || !/^-?(?:0|[1-9]\d*)$/u.test(value)) throw invalid();
+  if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/u.test(value)) throw invalid();
   return value;
 }
 
 function nullableDecimal(value: unknown): string | null {
   return value === null || value === undefined ? null : decimal(value);
+}
+
+function nullableSignedDecimal(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string' || !/^(?:0|-?[1-9]\d*)$/u.test(value)) throw invalid();
+  return value;
 }
 
 function text(value: unknown): string {
@@ -522,4 +544,11 @@ function freeze<T extends object>(value: T): Readonly<T> {
 
 function invalid(): ApiProjectionDataError {
   return new ApiProjectionDataError();
+}
+
+function projectionError(error: unknown): ApiProjectionDataError {
+  if (error instanceof ApiProjectionDataError) return error;
+  const wrapped = new ApiProjectionDataError();
+  Object.defineProperty(wrapped, 'cause', { value: error, enumerable: false });
+  return wrapped;
 }
