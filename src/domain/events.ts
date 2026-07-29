@@ -8,6 +8,7 @@ export const DOMAIN_EVENT_TYPES = [
   'TokenMetadataFailed',
   'SocialEvidenceCollected',
   'CreatorProfileUpdated',
+  'HolderDistributionUpdated',
   'WalletClusterDetected',
   'BondingCurveTradeObserved',
   'BondingCurveStateUpdated',
