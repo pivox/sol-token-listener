@@ -237,7 +237,8 @@ function validateAssessment(assessment: WalletFundingAssessment): void {
     }
     diagnostics.add(code);
   }
-  if (assessment.payloadVersion !== WALLET_FUNDING_PAYLOAD_VERSION) {
+  const payloadVersion: unknown = assessment.payloadVersion;
+  if (payloadVersion !== WALLET_FUNDING_PAYLOAD_VERSION) {
     throw new TypeError('Wallet funding assessment payload version is invalid.');
   }
 }
@@ -283,28 +284,43 @@ function validateEvidence(evidence: WalletFundingEvidence): void {
   validateConfirmation(evidence.confirmationStatus);
   assertValidNullableTimestampMs('blockchainTimeMs', evidence.blockchainTimeMs);
   assertValidTimestampMs('observedAtMs', evidence.observedAtMs);
-  if (evidence.payloadVersion !== WALLET_FUNDING_PAYLOAD_VERSION) {
+  const payloadVersion: unknown = evidence.payloadVersion;
+  if (payloadVersion !== WALLET_FUNDING_PAYLOAD_VERSION) {
     throw new TypeError('Wallet funding evidence payload version is invalid.');
   }
-  if (evidence.type === 'DIRECT_QUOTE_TRANSFER') {
-    if (evidence.confidence !== 'STRONG') {
+  const evidenceType: unknown = evidence.type;
+  if (
+    evidenceType !== 'DIRECT_QUOTE_TRANSFER'
+    && evidenceType !== 'FEE_PAYER_FOR_BUYER'
+  ) {
+    throw new TypeError('Wallet funding evidence type is invalid.');
+  }
+  if (evidenceType === 'DIRECT_QUOTE_TRANSFER') {
+    const confidence: unknown = evidence.confidence;
+    const amountRaw: unknown = evidence.amountRaw;
+    if (confidence !== 'STRONG') {
       throw new TypeError('Direct wallet funding evidence must be strong.');
     }
-    if (typeof evidence.amountRaw !== 'bigint' || evidence.amountRaw <= 0n) {
+    if (typeof amountRaw !== 'bigint' || amountRaw <= 0n) {
       throw new TypeError('Direct wallet funding amount must be positive.');
     }
-    assertFrozen(evidence.transferCursor, 'evidence.transferCursor');
-    assertValidChainCursor(evidence.transferCursor);
-    if (compareCursors(evidence.transferCursor, evidence.buyCursor) >= 0) {
+    const direct = evidence as DirectQuoteTransferEvidence;
+    assertFrozen(direct.transferCursor, 'evidence.transferCursor');
+    assertValidChainCursor(direct.transferCursor);
+    if (compareCursors(direct.transferCursor, evidence.buyCursor) >= 0) {
       throw new TypeError('Direct wallet funding transfer must precede its buy.');
     }
-  } else if (
-    evidence.type !== 'FEE_PAYER_FOR_BUYER'
-    || evidence.confidence !== 'MEDIUM'
-    || evidence.amountRaw !== null
-    || evidence.transferCursor !== null
-  ) {
-    throw new TypeError('Fee-payer wallet funding evidence is invalid.');
+  } else {
+    const confidence: unknown = evidence.confidence;
+    const amountRaw: unknown = evidence.amountRaw;
+    const transferCursor: unknown = evidence.transferCursor;
+    if (
+      confidence !== 'MEDIUM'
+      || amountRaw !== null
+      || transferCursor !== null
+    ) {
+      throw new TypeError('Fee-payer wallet funding evidence is invalid.');
+    }
   }
   if (evidence.id !== createWalletFundingEvidenceId(evidence)) {
     throw new TypeError('Wallet funding evidence ID is not deterministic.');
@@ -343,20 +359,19 @@ function validateQuoteAsset(asset: QuoteAsset): void {
   ) {
     throw new TypeError('Wallet funding quote decimals are invalid.');
   }
-  if (
-    asset.tokenProgram !== 'SPL_TOKEN'
-    && asset.tokenProgram !== 'TOKEN_2022'
-  ) {
+  const tokenProgram: unknown = asset.tokenProgram;
+  if (tokenProgram !== 'SPL_TOKEN' && tokenProgram !== 'TOKEN_2022') {
     throw new TypeError('Wallet funding quote token program is invalid.');
   }
 }
 
 function validateConfirmation(status: ChainConfirmationStatus): void {
+  const runtimeStatus: unknown = status;
   if (
-    status !== 'processed'
-    && status !== 'confirmed'
-    && status !== 'finalized'
-    && status !== 'orphaned'
+    runtimeStatus !== 'processed'
+    && runtimeStatus !== 'confirmed'
+    && runtimeStatus !== 'finalized'
+    && runtimeStatus !== 'orphaned'
   ) {
     throw new TypeError('Wallet funding confirmation status is invalid.');
   }
