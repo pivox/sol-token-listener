@@ -100,55 +100,75 @@ CREATE TRIGGER enqueue_api_domain_event_revision_trigger
 AFTER INSERT OR UPDATE ON domain_events
 FOR EACH ROW EXECUTE FUNCTION enqueue_api_domain_event_revision();
 
-INSERT INTO api_event_stream (
-  stream_event_id, domain_event_id, revision, event_type, mint, confirmation_status,
-  payload_version, event, purge_after
-)
-SELECT
-  event_id || ':' || revision::text || ':' || confirmation_status || ':' || payload_version::text
-    || ':' || md5(public_event::text),
-  event_id,
-  revision,
-  type,
-  mint,
-  confirmation_status,
-  payload_version,
-  public_event,
-  NOW() + INTERVAL '4 hours'
-FROM (
-  SELECT
-    event_id,
-    1::BIGINT AS revision,
-    type,
-    mint,
-    confirmation_status,
-    payload_version,
-    jsonb_build_object(
-      'eventId', event_id,
-      'type', type,
-      'mint', mint,
-      'source', source,
-      'program', program,
-      'signature', signature,
-      'slot', slot::text,
-      'transactionIndex', transaction_index,
-      'instructionIndex', instruction_index,
-      'innerInstructionIndex', inner_instruction_index,
-      'confirmationStatus', confirmation_status,
-      'blockchainTime', to_jsonb(to_char(
-        blockchain_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-      )),
-      'observedAt', to_jsonb(to_char(
-        observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-      )),
-      'payloadVersion', payload_version,
-      'payload', payload
-    ) AS public_event
-  FROM domain_events
-  WHERE purge_after IS NULL OR purge_after > NOW()
-  ORDER BY created_at, event_id
-) AS retained_domain_events
-ON CONFLICT (domain_event_id, revision) DO NOTHING;
+DO $$
+DECLARE
+  target_schema TEXT := current_schema();
+BEGIN
+  IF target_schema IS NULL THEN
+    RAISE EXCEPTION 'A current schema is required for the API event stream backfill.';
+  END IF;
+
+  EXECUTE format(
+    $sql$
+      INSERT INTO %1$I.api_event_stream (
+        stream_event_id, domain_event_id, revision, event_type, mint, confirmation_status,
+        payload_version, event, purge_after
+      )
+      SELECT
+        event_id || ':' || revision::text || ':' || confirmation_status || ':' || payload_version::text
+          || ':' || md5(public_event::text),
+        event_id,
+        revision,
+        type,
+        mint,
+        confirmation_status,
+        payload_version,
+        public_event,
+        NOW() + INTERVAL '4 hours'
+      FROM (
+        SELECT
+          event_id,
+          1::BIGINT AS revision,
+          type,
+          mint,
+          confirmation_status,
+          payload_version,
+          jsonb_build_object(
+            'eventId', event_id,
+            'type', type,
+            'mint', mint,
+            'source', source,
+            'program', program,
+            'signature', signature,
+            'slot', slot::text,
+            'transactionIndex', transaction_index,
+            'instructionIndex', instruction_index,
+            'innerInstructionIndex', inner_instruction_index,
+            'confirmationStatus', confirmation_status,
+            'blockchainTime', to_jsonb(to_char(
+              blockchain_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+            )),
+            'observedAt', to_jsonb(to_char(
+              observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+            )),
+            'payloadVersion', payload_version,
+            'payload', payload
+          ) AS public_event
+        FROM %1$I.domain_events
+        WHERE (purge_after IS NULL OR purge_after > NOW())
+          AND NOT EXISTS (
+            SELECT 1
+            FROM %1$I.api_event_stream existing
+            WHERE existing.domain_event_id = domain_events.event_id
+          )
+        ORDER BY created_at, event_id
+      ) AS retained_domain_events
+      ON CONFLICT (domain_event_id, revision) DO NOTHING
+    $sql$,
+    target_schema
+  );
+END;
+$$;
 
 CREATE INDEX IF NOT EXISTS api_event_stream_mint_sequence_idx
   ON api_event_stream(mint, sequence);

@@ -47,8 +47,10 @@ void test('la migration enfile les révisions publiques avec trigger rejouable e
   assert.match(sql, /COALESCE\(MAX\(revision\), 0\) \+ 1/u);
   assert.match(sql, /event_id \|\| ':' \|\| revision::text \|\| ':'/u);
   assert.match(sql, /ON CONFLICT \(domain_event_id, revision\) DO NOTHING/u);
+  assert.match(sql, /NOT EXISTS \([\s\S]*existing\.domain_event_id = domain_events\.event_id/u);
+  assert.match(sql, /%1\$I\.api_event_stream existing/u);
   assert.match(sql, /NOW\(\) \+ INTERVAL '4 hours'/u);
-  assert.match(sql, /WHERE purge_after IS NULL OR purge_after > NOW\(\)/u);
+  assert.match(sql, /WHERE \(?purge_after IS NULL OR purge_after > NOW\(\)\)?/u);
   assert.match(sql, /ORDER BY created_at, event_id/u);
   assert.match(sql, /to_char\(\s*NEW\.blockchain_time AT TIME ZONE 'UTC'/u);
   assert.match(sql, /to_char\(\s*NEW\.observed_at AT TIME ZONE 'UTC'/u);
@@ -160,6 +162,19 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       { revision: '2', state: 'B' },
       { revision: '3', state: 'A' },
     ]);
+
+    await pool.query(`INSERT INTO domain_events (
+      event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
+      confirmation_status, observed_at, payload_version, payload
+    ) VALUES ('partial-replay-live', 'launch_detected', 'mint-live', 'listener', 'program-live', 'partial-signature',
+      46, 1, 2, 'processed', NOW(), 1, '{"state":"A"}'::jsonb)`);
+    await pool.query("UPDATE domain_events SET payload = '{\"state\":\"B\"}'::jsonb WHERE event_id = 'partial-replay-live'");
+    await pool.query('DELETE FROM api_event_stream WHERE domain_event_id = $1 AND revision = 1', ['partial-replay-live']);
+    await pool.query(migrationSql);
+    const retainedRevision = await pool.query<{ readonly revision: string; readonly state: string }>(
+      "SELECT revision, event->'payload'->>'state' AS state FROM api_event_stream WHERE domain_event_id = 'partial-replay-live' ORDER BY revision",
+    );
+    assert.deepEqual(retainedRevision.rows, [{ revision: '2', state: 'B' }]);
 
     await pool.query(`CREATE TEMP TABLE api_event_stream (
       LIKE ${quoteIdentifier(schema)}.api_event_stream INCLUDING ALL
