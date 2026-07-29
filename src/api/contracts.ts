@@ -11,6 +11,8 @@ import type { QualificationReasonCode } from '../domain/qualification-reasons.js
 import type { ChainConfirmationStatus } from '../domain/types.js';
 
 export const API_VERSION = 'v1' as const;
+export const MAX_API_JSON_DEPTH = 64;
+export const MAX_API_JSON_NODES = 10_000;
 
 export type ApiJsonPrimitive = string | number | boolean | null;
 export interface ApiJsonObject {
@@ -21,41 +23,10 @@ export type ApiJsonValue =
   | readonly ApiJsonValue[]
   | ApiJsonObject;
 
-export type ApiPayloadPrimitive = string | number | boolean | null;
-export type ApiFinancialPayloadKey =
-  | 'slot'
-  | `${string}Slot`
-  | 'amount'
-  | `${string}Amount${string}`
-  | 'fee'
-  | 'fees'
-  | `${string}Fee${string}`
-  | `${string}Raw`
-  | `${string}Bps`
-  | `${string}Lamports`
-  | `${string}Reserve${string}`
-  | `${string}Liquidity${string}`
-  | `${string}Supply${string}`
-  | `${string}Price${string}`
-  | `${string}MarketCap${string}`
-  | `${string}Pnl${string}`
-  | `${string}PnL${string}`
-  | `${string}reserve${string}`
-  | `${string}liquidity${string}`
-  | `${string}supply${string}`
-  | `${string}price${string}`
-  | `${string}marketCap${string}`
-  | `${string}pnl${string}`;
-
-export type ApiPayloadObject = {
-  readonly [key: string]: ApiPayloadValue;
-} & {
-  readonly [K in ApiFinancialPayloadKey]?: string | null;
+declare const apiDomainPayloadBrand: unique symbol;
+export type ApiDomainPayload = ApiJsonValue & {
+  readonly [apiDomainPayloadBrand]: 'ApiDomainPayload';
 };
-export type ApiPayloadValue =
-  | ApiPayloadPrimitive
-  | readonly ApiPayloadValue[]
-  | ApiPayloadObject;
 
 export interface ApiMeta {
   readonly generatedAt: string;
@@ -117,7 +88,7 @@ export interface ApiTimelineEntry {
   readonly slot: string | null;
   readonly confirmationStatus: ChainConfirmationStatus;
   readonly payloadVersion: number;
-  readonly payload: ApiPayloadValue;
+  readonly payload: ApiDomainPayload;
 }
 
 export interface ApiQualification {
@@ -233,7 +204,7 @@ export interface ApiSseEvent {
   readonly blockchainTime: string | null;
   readonly observedAt: string;
   readonly payloadVersion: number;
-  readonly payload: ApiPayloadValue;
+  readonly payload: ApiDomainPayload;
 }
 
 export interface ApiSseCursor {
@@ -244,10 +215,28 @@ export interface ApiSseCursor {
 }
 
 export function toApiJson(value: unknown): ApiJsonValue {
-  return convertToApiJson(value, new Set<object>());
+  return convertToApiJson(value, { ancestors: new Set<object>(), nodes: 0 }, 0);
 }
 
-function convertToApiJson(value: unknown, ancestors: Set<object>): ApiJsonValue {
+export function toApiDomainPayload(value: unknown): ApiDomainPayload {
+  const converted = toApiJson(value);
+  assertApiDomainPayload(converted, undefined);
+  return converted as ApiDomainPayload;
+}
+
+interface JsonConversionState {
+  readonly ancestors: Set<object>;
+  nodes: number;
+}
+
+function convertToApiJson(
+  value: unknown,
+  state: JsonConversionState,
+  depth: number,
+): ApiJsonValue {
+  if (depth > MAX_API_JSON_DEPTH) throw new RangeError('API JSON nesting exceeds the maximum depth');
+  state.nodes += 1;
+  if (state.nodes > MAX_API_JSON_NODES) throw new RangeError('API JSON exceeds the maximum node count');
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'number') {
@@ -259,32 +248,132 @@ function convertToApiJson(value: unknown, ancestors: Set<object>): ApiJsonValue 
   if (typeof value !== 'object') {
     throw new TypeError(`Unsupported API JSON value: ${typeof value}`);
   }
-  if (ancestors.has(value)) throw new TypeError('API JSON values must not contain cycles');
-  ancestors.add(value);
+  if (state.ancestors.has(value)) throw new TypeError('API JSON values must not contain cycles');
+  state.ancestors.add(value);
   try {
     if (Array.isArray(value)) {
-      for (let index = 0; index < value.length; index += 1) {
-        if (!Object.hasOwn(value, index)) throw new TypeError('API JSON arrays must not be sparse');
-      }
-      return Object.freeze(value.map((item) => convertToApiJson(item, ancestors)));
+      return convertArrayToApiJson(value, state, depth);
     }
     if (!isPlainObject(value)) throw new TypeError('API JSON objects must be plain objects');
-    const result: Record<string, ApiJsonValue> = {};
-    for (const key of Object.keys(value)) {
+    return convertObjectToApiJson(value, state, depth);
+  } finally {
+    state.ancestors.delete(value);
+  }
+}
+
+function convertArrayToApiJson(
+  value: unknown[],
+  state: JsonConversionState,
+  depth: number,
+): ApiJsonValue {
+  if (Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new TypeError('API JSON arrays must use Array.prototype');
+  }
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new TypeError('API JSON arrays must not have symbol properties');
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor)) {
+    throw new TypeError('API JSON arrays must have a data length property');
+  }
+  const length: unknown = lengthDescriptor.value;
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
+    throw new TypeError('API JSON arrays must have a valid length');
+  }
+  for (const key of Object.getOwnPropertyNames(value)) {
+    if (key !== 'length' && !isArrayIndex(key)) {
+      throw new TypeError('API JSON arrays must not have custom properties');
+    }
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !('value' in descriptor)) {
+      throw new TypeError('API JSON arrays must not have accessor properties');
+    }
+  }
+  const result: ApiJsonValue[] = new Array<ApiJsonValue>(length);
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (descriptor === undefined) throw new TypeError('API JSON arrays must not be sparse');
+    if (!('value' in descriptor)) throw new TypeError('API JSON arrays must not have accessor properties');
+    Object.defineProperty(result, index, {
+      value: convertToApiJson(descriptor.value, state, depth + 1),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return Object.freeze(result);
+}
+
+function convertObjectToApiJson(
+  value: Record<string, unknown>,
+  state: JsonConversionState,
+  depth: number,
+): ApiJsonValue {
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new TypeError('API JSON objects must not have symbol properties');
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const result: Record<string, ApiJsonValue> = {};
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !('value' in descriptor)) {
+      throw new TypeError('API JSON objects must not have accessor properties');
+    }
+    if (descriptor.enumerable) {
       Object.defineProperty(result, key, {
-        value: convertToApiJson(value[key], ancestors),
+        value: convertToApiJson(descriptor.value, state, depth + 1),
         enumerable: true,
         configurable: true,
         writable: true,
       });
     }
-    return Object.freeze(result);
-  } finally {
-    ancestors.delete(value);
   }
+  return Object.freeze(result);
 }
 
 function isPlainObject(value: object): value is Record<string, unknown> {
   const prototype = Object.getPrototypeOf(value) as object | null;
   return prototype === null || prototype === Object.prototype;
+}
+
+function isArrayIndex(key: string): boolean {
+  if (!/^(?:0|[1-9]\d*)$/u.test(key)) return false;
+  const index = Number(key);
+  return Number.isSafeInteger(index) && index >= 0 && index < 4_294_967_295;
+}
+
+// These are structural metadata, never token amounts, prices, fees, reserves, or slots.
+const API_DOMAIN_NUMBER_KEYS = new Set<string>([
+  'index',
+  'version',
+  'payloadVersion',
+  'decimals',
+  'score',
+  'maximum',
+  'poolIndex',
+  'transactionIndex',
+  'instructionIndex',
+  'innerInstructionIndex',
+]);
+
+function assertApiDomainPayload(value: ApiJsonValue, key: string | undefined): void {
+  if (typeof value === 'number') {
+    if (key === undefined || !API_DOMAIN_NUMBER_KEYS.has(key)) {
+      throw new TypeError('API domain payload numbers are not allowed for this key');
+    }
+    return;
+  }
+  if (value === null || typeof value !== 'object') return;
+  if (isApiJsonArray(value)) {
+    for (const item of value) assertApiDomainPayload(item, undefined);
+    return;
+  }
+  for (const [nestedKey, nestedValue] of Object.entries(value)) {
+    assertApiDomainPayload(nestedValue, nestedKey);
+  }
+}
+
+function isApiJsonArray(value: ApiJsonValue): value is readonly ApiJsonValue[] {
+  return Array.isArray(value);
 }

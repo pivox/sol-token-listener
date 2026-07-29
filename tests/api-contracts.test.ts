@@ -2,18 +2,20 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   API_VERSION,
+  MAX_API_JSON_DEPTH,
+  MAX_API_JSON_NODES,
   type ApiAvailability,
+  type ApiDomainPayload,
   type ApiFailure,
   type ApiHealth,
   type ApiJsonObject,
   type ApiLaunchSummary,
-  type ApiPayloadObject,
-  type ApiPayloadValue,
   type ApiQualification,
   type ApiSocial,
   type ApiHolders,
   type ApiSseEvent,
   type ApiSuccess,
+  toApiDomainPayload,
   toApiJson,
 } from '../src/api/contracts.js';
 import { API_ERROR_CODES, ApiError } from '../src/api/errors.js';
@@ -171,7 +173,7 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
     program: 'Pump111', signature: 'sig_1',
     cursor: { slot: '1', transactionIndex: '0', instructionIndex: '0', innerInstructionIndex: null },
     confirmationStatus: 'confirmed', blockchainTime: null,
-    observedAt: '2026-07-29T12:00:00.000Z', payloadVersion: 1, payload: null,
+    observedAt: '2026-07-29T12:00:00.000Z', payloadVersion: 1, payload: toApiDomainPayload({}),
   };
 
   assert.equal(success.apiVersion, 'v1');
@@ -186,30 +188,54 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(event.eventId, 'evt_1');
 });
 
-void test('public event payloads prohibit financial numbers but allow safe metadata numbers', () => {
-  const accepted: ApiPayloadObject = {
-    amountRaw: '42', feeBps: '42', slot: '123', observedSlot: '123', createdSlot: '123',
-    amount: '42', fee: '42', marketCapQuote: '42', payloadVersion: 1, decimals: 9, score: 15,
-  };
-  // @ts-expect-error Public payloads must not expose numeric amounts.
-  void ({ amountRaw: 42 } satisfies ApiPayloadValue);
-  // @ts-expect-error Public payloads must not expose numeric fees.
-  void ({ feeBps: 42 } satisfies ApiPayloadValue);
-  // @ts-expect-error Public payloads must not expose numeric slots.
-  void ({ slot: 42 } satisfies ApiPayloadValue);
-  // @ts-expect-error Public payloads must not expose numeric observed slots.
-  void ({ observedSlot: 42 } satisfies ApiPayloadValue);
-  // @ts-expect-error Public payloads must not expose numeric created slots.
-  void ({ createdSlot: 42 } satisfies ApiPayloadValue);
-  // @ts-expect-error Public payloads must not expose numeric amounts without a suffix.
-  void ({ amount: 42 } satisfies ApiPayloadValue);
-  // @ts-expect-error Public payloads must not expose numeric fees without a suffix.
-  void ({ fee: 42 } satisfies ApiPayloadValue);
-  // @ts-expect-error Public payloads must not expose numeric market capitalization.
-  void ({ marketCapQuote: 42 } satisfies ApiPayloadValue);
+void test('toApiJson rejects adversarial descriptors without invoking input getters or methods', () => {
+  let getterCalled = false;
+  const getterInput = {};
+  Object.defineProperty(getterInput, 'value', {
+    enumerable: true,
+    get: () => { getterCalled = true; return 'unsafe'; },
+  });
+  const maliciousArray = [1];
+  let mapCalled = false;
+  Object.defineProperty(maliciousArray, 'map', { value: () => { mapCalled = true; return []; } });
+  class ArraySubclass extends Array<unknown> {}
 
-  assert.equal(accepted.amountRaw, '42');
-  assert.equal(accepted.payloadVersion, 1);
-  assert.equal(accepted.decimals, 9);
-  assert.equal(accepted.score, 15);
+  assert.throws(() => toApiJson(getterInput), TypeError);
+  assert.throws(() => toApiJson(maliciousArray), TypeError);
+  assert.throws(() => toApiJson(new ArraySubclass()), TypeError);
+  assert.throws(() => toApiJson(Object.assign([1], { custom: true })), TypeError);
+  assert.throws(() => toApiJson(Object.assign([1], { [Symbol('custom')]: true })), TypeError);
+  assert.throws(() => toApiJson(new Date()), TypeError);
+  assert.equal(getterCalled, false);
+  assert.equal(mapCalled, false);
+});
+
+void test('toApiJson enforces depth and node limits before runtime overflow', () => {
+  let atLimit: unknown = null;
+  for (let index = 0; index < MAX_API_JSON_DEPTH; index += 1) atLimit = [atLimit];
+  assert.doesNotThrow(() => toApiJson(atLimit));
+  assert.throws(() => toApiJson([atLimit]), RangeError);
+  assert.doesNotThrow(() => toApiJson(new Array<unknown>(MAX_API_JSON_NODES - 1).fill(null)));
+  assert.throws(() => toApiJson(new Array<unknown>(MAX_API_JSON_NODES).fill(null)), RangeError);
+});
+
+void test('domain payload factory rejects numeric financial values and brands frozen payloads', () => {
+  const accepted = toApiDomainPayload({
+    version: 1, decimals: 9, score: 15, index: 0, amountQuote: '42', feeQuote: '1', feesQuote: '2',
+    slotNumber: '123', marketCapQuote: '99', nested: { amountRaw: 42n },
+  });
+  // @ts-expect-error API domain payloads are branded and cannot be supplied as plain objects.
+  const forged: ApiDomainPayload = { version: 1 };
+
+  assert.equal(Object.isFrozen(accepted), true);
+  assert.deepEqual(accepted, {
+    version: 1, decimals: 9, score: 15, index: 0, amountQuote: '42', feeQuote: '1', feesQuote: '2',
+    slotNumber: '123', marketCapQuote: '99', nested: { amountRaw: '42' },
+  });
+  assert.throws(() => toApiDomainPayload({ amountQuote: 42 }), TypeError);
+  assert.throws(() => toApiDomainPayload({ feeQuote: 42 }), TypeError);
+  assert.throws(() => toApiDomainPayload({ feesQuote: 42 }), TypeError);
+  assert.throws(() => toApiDomainPayload({ slotNumber: 42 }), TypeError);
+  assert.throws(() => toApiDomainPayload({ marketCapQuote: 42 }), TypeError);
+  void forged;
 });

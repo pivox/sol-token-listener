@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  MAX_CURSOR_ENCODED_LENGTH,
+  MAX_CURSOR_SEQUENCE,
+  MAX_CURSOR_TEXT_LENGTH,
   decodeLaunchCursor,
   decodePaperPositionCursor,
   decodeStreamCursor,
@@ -62,4 +65,18 @@ void test('each decoder rejects its own non-canonical cursor inputs', () => {
   for (const cursor of invalidStreams) {
     assert.throws(() => decodeStreamCursor(cursor), TypeError);
   }
+});
+
+void test('cursor limits accept exact bounds and reject oversized values before parsing', () => {
+  const textAtLimit = 'x'.repeat(MAX_CURSOR_TEXT_LENGTH);
+  const launch = encodeLaunchCursor({ detectedAtMs: 0, mint: textAtLimit });
+  const position = encodePaperPositionCursor({ openedAtMs: 0, id: textAtLimit });
+
+  assert.equal(decodeLaunchCursor(launch).mint, textAtLimit);
+  assert.equal(decodePaperPositionCursor(position).id, textAtLimit);
+  assert.equal(decodeStreamCursor(encodeStreamCursor(MAX_CURSOR_SEQUENCE)), MAX_CURSOR_SEQUENCE);
+  assert.throws(() => encodeLaunchCursor({ detectedAtMs: 0, mint: `${textAtLimit}x` }), TypeError);
+  assert.throws(() => encodePaperPositionCursor({ openedAtMs: 0, id: `${textAtLimit}x` }), TypeError);
+  assert.throws(() => encodeStreamCursor(MAX_CURSOR_SEQUENCE + 1n), TypeError);
+  assert.throws(() => decodeLaunchCursor('A'.repeat(MAX_CURSOR_ENCODED_LENGTH + 1)), TypeError);
 });

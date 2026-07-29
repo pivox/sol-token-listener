@@ -3,6 +3,11 @@ export interface LaunchPagePosition {
   readonly mint: string;
 }
 
+export const MAX_CURSOR_ENCODED_LENGTH = 2_048;
+export const MAX_CURSOR_DECODED_BYTES = 1_536;
+export const MAX_CURSOR_TEXT_LENGTH = 256;
+export const MAX_CURSOR_SEQUENCE = 9_223_372_036_854_775_807n;
+
 export interface PaperPositionPagePosition {
   readonly openedAtMs: number;
   readonly id: string;
@@ -59,7 +64,9 @@ export function decodePaperPositionCursor(cursor: string): PaperPositionPagePosi
 }
 
 export function encodeStreamCursor(sequence: bigint): string {
-  if (sequence <= 0n) throw new TypeError('Stream sequence must be positive');
+  if (sequence <= 0n || sequence > MAX_CURSOR_SEQUENCE) {
+    throw new TypeError('Stream sequence is outside the supported range');
+  }
   return encodeTuple(['events', 1, sequence.toString()]);
 }
 
@@ -74,19 +81,29 @@ export function decodeStreamCursor(cursor: string): bigint {
   } catch {
     throw new TypeError('Invalid events cursor');
   }
-  if (sequence <= 0n || sequence.toString() !== tuple[2] || encodeStreamCursor(sequence) !== cursor) {
+  if (
+    sequence <= 0n
+    || sequence > MAX_CURSOR_SEQUENCE
+    || sequence.toString() !== tuple[2]
+    || encodeStreamCursor(sequence) !== cursor
+  ) {
     throw new TypeError('Non-canonical events cursor');
   }
   return sequence;
 }
 
 function encodeTuple(tuple: CursorTuple): string {
-  return Buffer.from(JSON.stringify(tuple), 'utf8').toString('base64url');
+  const encoded = Buffer.from(JSON.stringify(tuple), 'utf8').toString('base64url');
+  if (encoded.length > MAX_CURSOR_ENCODED_LENGTH) throw new TypeError('Cursor encoding is too large');
+  return encoded;
 }
 
 function decodeTuple(cursor: string): readonly unknown[] {
+  if (cursor.length > MAX_CURSOR_ENCODED_LENGTH) throw new TypeError('Cursor encoding is too large');
   if (!/^[A-Za-z0-9_-]+$/u.test(cursor)) throw new TypeError('Invalid cursor encoding');
-  const decoded = Buffer.from(cursor, 'base64url').toString('utf8');
+  const bytes = Buffer.from(cursor, 'base64url');
+  if (bytes.length > MAX_CURSOR_DECODED_BYTES) throw new TypeError('Cursor payload is too large');
+  const decoded = bytes.toString('utf8');
   let value: unknown;
   try {
     value = JSON.parse(decoded) as unknown;
@@ -104,5 +121,7 @@ function assertTimestamp(value: number, field: string): void {
 }
 
 function assertText(value: string, field: string): void {
-  if (value.length === 0) throw new TypeError(`Invalid ${field}`);
+  if (value.length === 0 || value.length > MAX_CURSOR_TEXT_LENGTH) {
+    throw new TypeError(`Invalid ${field}`);
+  }
 }
