@@ -22,7 +22,8 @@ void test('la migration crée une outbox append-only publique, indexée et sans 
   assert.match(sql, /event JSONB NOT NULL/u);
   assert.match(sql, /emitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW\(\)/u);
   assert.match(sql, /purge_after TIMESTAMPTZ NOT NULL/u);
-  const backfill = sql.lastIndexOf('INSERT INTO api_event_stream');
+  const backfill = sql.indexOf('INSERT INTO %1$I.api_event_stream');
+  assert.ok(backfill >= 0);
   assert.ok(sql.indexOf('CREATE INDEX IF NOT EXISTS api_event_stream_mint_sequence_idx') > backfill);
   assert.ok(sql.indexOf('CREATE INDEX IF NOT EXISTS api_event_stream_purge_after_idx') > backfill);
   assert.doesNotMatch(sql, /\b(?:FLOAT|REAL)\b/iu);
