@@ -27,6 +27,8 @@ void test('la migration crée une outbox append-only publique, indexée et sans 
   assert.match(sql, /CREATE TABLE IF NOT EXISTS api_event_stream_state/u);
   assert.match(sql, /id SMALLINT PRIMARY KEY CHECK \(id = 1\)/u);
   assert.match(sql, /last_sequence BIGINT NOT NULL DEFAULT 0 CHECK \(last_sequence >= 0\)/u);
+  assert.match(sql, /backfill_completed BOOLEAN NOT NULL DEFAULT FALSE/u);
+  assert.match(sql, /ALTER TABLE api_event_stream_state[\s\S]*ADD COLUMN IF NOT EXISTS backfill_completed/u);
   assert.match(sql, /INSERT INTO api_event_stream_state \(id\) VALUES \(1\) ON CONFLICT \(id\) DO NOTHING/u);
   assert.deepEqual(
     sqlStringListAfter(sql, 'event_type TEXT NOT NULL CHECK (event_type IN ('),
@@ -82,6 +84,9 @@ void test('la migration enfile les révisions publiques avec trigger rejouable e
   assert.match(sql, /RETURNING sequence[\s\S]*INTO allocated_sequence/u);
   assert.match(sql, /last_sequence = GREATEST\(last_sequence, \$1\)/u);
   assert.match(sql, /last_sequence = GREATEST\([\s\S]*MAX\(sequence\)/u);
+  assert.match(sql, /SELECT backfill_completed[\s\S]*INTO backfill_done/u);
+  assert.match(sql, /IF NOT backfill_done THEN/u);
+  assert.match(sql, /backfill_completed = TRUE/u);
 });
 
 void test('la purge supprime l’outbox avant les événements de domaine et expose son compteur', async () => {
@@ -131,11 +136,23 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       confirmation_status, observed_at, payload_version, payload
     ) VALUES ('legacy-live', 'LegacyUnknown', 'mint-live', 'legacy', 'legacy-program', 'legacy-signature',
       40, 0, 0, 'processed', NOW(), 1, '{}'::jsonb)`);
+    await pool.query(`INSERT INTO domain_events (
+      event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
+      confirmation_status, observed_at, payload_version, payload, terminal_at, purge_after
+    ) VALUES ('backfill-live', 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live',
+      'backfill-signature', 41, 0, 0, 'processed', NOW(), 1, '{}'::jsonb,
+      NOW(), NOW() + INTERVAL '1 hour')`);
     assert.deepEqual(await migrateDatabase({ pool }), ['006_api_event_stream.sql']);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(
       "SELECT 1 FROM api_event_stream WHERE domain_event_id = 'legacy-live'",
     )).rowCount, 0);
+    assert.equal((await pool.query(
+      "SELECT 1 FROM api_event_stream WHERE domain_event_id = 'backfill-live'",
+    )).rowCount, 1);
+    assert.equal((await pool.query<{ readonly backfill_completed: boolean }>(
+      'SELECT backfill_completed FROM api_event_stream_state WHERE id = 1',
+    )).rows[0]?.backfill_completed, true);
     await pool.query("SET TIME ZONE 'Europe/Paris'");
 
     await pool.query(`
@@ -162,13 +179,6 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
           'signature-live', 42, 1, 2, NULL, 'processed', '2025-01-02T03:04:04.000Z',
           '2025-01-02T03:04:05.000Z', 1, '{"amountRaw":"9007199254740993"}'::jsonb)
     `);
-    await pool.query(`INSERT INTO domain_events (
-        event_id, type, mint, source, program, signature, slot, transaction_index, instruction_index,
-        confirmation_status, observed_at, payload_version, payload, terminal_at, purge_after
-      ) VALUES ('backfill-live', 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live', 'backfill-signature',
-        43, 1, 2, 'processed', NOW(), 1, '{}'::jsonb, NOW(), NOW() + INTERVAL '1 hour')`);
-    await pool.query('DELETE FROM api_event_stream WHERE domain_event_id = $1', ['backfill-live']);
-
     await pool.query("UPDATE domain_events SET confirmation_status = 'processed' WHERE event_id = 'domain-live'");
     await pool.query("UPDATE domain_events SET confirmation_status = 'confirmed' WHERE event_id = 'domain-live'");
     await pool.query("UPDATE domain_events SET confirmation_status = 'finalized' WHERE event_id = 'domain-live'");
@@ -268,9 +278,6 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       )).rows[0]?.last_sequence,
       checkpointBeforePurge.rows[0]?.last_sequence,
     );
-    await pool.query(`UPDATE domain_events
-      SET terminal_at = COALESCE(terminal_at, NOW()),
-          purge_after = NOW() - INTERVAL '1 second'`);
     await pool.query(migrationSql);
     assert.equal((await pool.query('SELECT 1 FROM api_event_stream')).rowCount, 0);
     assert.equal(
@@ -279,6 +286,9 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       )).rows[0]?.last_sequence,
       checkpointBeforePurge.rows[0]?.last_sequence,
     );
+    assert.equal((await pool.query<{ readonly backfill_completed: boolean }>(
+      'SELECT backfill_completed FROM api_event_stream_state WHERE id = 1',
+    )).rows[0]?.backfill_completed, true);
 
     const shadowClient = await pool.connect();
     try {
@@ -306,14 +316,15 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
         "SELECT count(*) AS count FROM api_event_stream WHERE domain_event_id = 'schema-target-live'",
       );
       const persistentCheckpoint = await shadowClient.query<{
+        readonly backfill_completed: boolean;
         readonly last_sequence: string;
         readonly visible_max: string;
       }>(
-        `SELECT state.last_sequence, MAX(stream.sequence) AS visible_max
+        `SELECT state.backfill_completed, state.last_sequence, MAX(stream.sequence) AS visible_max
          FROM ${quoteIdentifier(schema)}.api_event_stream_state state
          JOIN ${quoteIdentifier(schema)}.api_event_stream stream ON TRUE
          WHERE state.id = 1
-         GROUP BY state.id, state.last_sequence`,
+         GROUP BY state.id, state.backfill_completed, state.last_sequence`,
       );
       const temporaryCheckpoint = await shadowClient.query<{ readonly last_sequence: string }>(
         'SELECT last_sequence FROM api_event_stream_state WHERE id = 1',
@@ -328,6 +339,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
         persistentCheckpoint.rows[0]?.last_sequence,
         persistentCheckpoint.rows[0]?.visible_max,
       );
+      assert.equal(persistentCheckpoint.rows[0]?.backfill_completed, true);
       assert.equal(temporaryCheckpoint.rows[0]?.last_sequence, '0');
     } finally {
       shadowClient.release();
@@ -385,24 +397,49 @@ async function assertCommitOrderedSequences(
       await client.query(`SET search_path TO ${quoteIdentifier(schema)}`);
       await client.query("SET statement_timeout TO '5s'");
     }
+    const firstPid = (await first.query<{ readonly pid: number }>(
+      'SELECT pg_backend_pid() AS pid',
+    )).rows[0]?.pid;
+    const secondPid = (await second.query<{ readonly pid: number }>(
+      'SELECT pg_backend_pid() AS pid',
+    )).rows[0]?.pid;
+    assert.notEqual(firstPid, undefined);
+    assert.notEqual(secondPid, undefined);
     await first.query('BEGIN');
     firstOpen = true;
     await second.query('BEGIN');
     secondOpen = true;
     await first.query(domainEventInsertSql, ['concurrent-first', 'concurrent-first-signature', '48']);
 
-    let secondFinished = false;
     const secondInsert = second.query(
       domainEventInsertSql,
       ['concurrent-second', 'concurrent-second-signature', '49'],
-    ).then(() => {
-      secondFinished = true;
-    });
-    await delay(150);
-    assert.equal(secondFinished, false);
+    );
+    await waitForAdvisoryLockWait(pool, firstPid ?? -1, secondPid ?? -1);
+    assert.equal((await pool.query(
+      `SELECT 1 FROM ${quoteIdentifier(schema)}.api_event_stream
+       WHERE domain_event_id IN ('concurrent-first', 'concurrent-second')`,
+    )).rowCount, 0);
+
     await first.query('COMMIT');
     firstOpen = false;
     await withTimeout(secondInsert, 2_000);
+    const betweenCommits = await pool.query<{
+      readonly domain_event_id: string;
+      readonly sequence: string;
+    }>(
+      `SELECT domain_event_id, sequence
+       FROM ${quoteIdentifier(schema)}.api_event_stream
+       WHERE domain_event_id IN ('concurrent-first', 'concurrent-second')`,
+    );
+    assert.deepEqual(betweenCommits.rows.map((row) => row.domain_event_id), ['concurrent-first']);
+    assert.equal(
+      (await pool.query<{ readonly last_sequence: string }>(
+        `SELECT last_sequence FROM ${quoteIdentifier(schema)}.api_event_stream_state WHERE id = 1`,
+      )).rows[0]?.last_sequence,
+      betweenCommits.rows[0]?.sequence,
+    );
+
     await second.query('COMMIT');
     secondOpen = false;
 
@@ -417,6 +454,12 @@ async function assertCommitOrderedSequences(
       'concurrent-second',
     ]);
     assert.ok(BigInt(sequences.rows[0]?.sequence ?? '0') < BigInt(sequences.rows[1]?.sequence ?? '0'));
+    assert.equal(
+      (await pool.query<{ readonly last_sequence: string }>(
+        `SELECT last_sequence FROM ${quoteIdentifier(schema)}.api_event_stream_state WHERE id = 1`,
+      )).rows[0]?.last_sequence,
+      sequences.rows[1]?.sequence,
+    );
   } finally {
     if (firstOpen) await first.query('ROLLBACK');
     if (secondOpen) await second.query('ROLLBACK');
@@ -443,6 +486,47 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
   }
+}
+
+async function waitForAdvisoryLockWait(
+  pool: InstanceType<typeof pg.Pool>,
+  holderPid: number,
+  waiterPid: number,
+): Promise<void> {
+  await pollUntil(async () => {
+    const locks = await pool.query<{
+      readonly granted: boolean;
+      readonly pid: number;
+      readonly wait_event_type: string | null;
+    }>(
+      `SELECT lock.pid, lock.granted, activity.wait_event_type
+       FROM pg_locks lock
+       JOIN pg_stat_activity activity ON activity.pid = lock.pid
+       WHERE lock.locktype = 'advisory'
+         AND lock.classid = $1::oid
+         AND lock.objid = $2::oid
+         AND lock.objsubid = 2
+         AND lock.pid = ANY($3::int[])`,
+      [1095782223, 1163281235, [holderPid, waiterPid]],
+    );
+    const holder = locks.rows.find((row) => row.pid === holderPid);
+    const waiter = locks.rows.find((row) => row.pid === waiterPid);
+    return holder?.granted === true
+      && waiter?.granted === false
+      && waiter.wait_event_type === 'Lock';
+  }, 2_000);
+}
+
+async function pollUntil(
+  predicate: () => Promise<boolean>,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await delay(25);
+  }
+  throw new Error('PostgreSQL advisory lock wait was not observed before timeout.');
 }
 
 async function delay(milliseconds: number): Promise<void> {

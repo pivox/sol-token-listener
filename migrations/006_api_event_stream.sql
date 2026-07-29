@@ -33,8 +33,11 @@ CREATE TABLE IF NOT EXISTS api_event_stream (
 
 CREATE TABLE IF NOT EXISTS api_event_stream_state (
   id SMALLINT PRIMARY KEY CHECK (id = 1),
-  last_sequence BIGINT NOT NULL DEFAULT 0 CHECK (last_sequence >= 0)
+  last_sequence BIGINT NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
+  backfill_completed BOOLEAN NOT NULL DEFAULT FALSE
 );
+ALTER TABLE api_event_stream_state
+  ADD COLUMN IF NOT EXISTS backfill_completed BOOLEAN NOT NULL DEFAULT FALSE;
 INSERT INTO api_event_stream_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
 CREATE OR REPLACE FUNCTION enqueue_api_domain_event_revision()
@@ -140,6 +143,7 @@ FOR EACH ROW EXECUTE FUNCTION enqueue_api_domain_event_revision();
 DO $$
 DECLARE
   target_schema TEXT := current_schema();
+  backfill_done BOOLEAN;
 BEGIN
   IF target_schema IS NULL THEN
     RAISE EXCEPTION 'A current schema is required for the API event stream backfill.';
@@ -149,93 +153,101 @@ BEGIN
   PERFORM pg_advisory_xact_lock(1095782223, 1163281235);
 
   EXECUTE format(
-    $sql$
-      INSERT INTO %1$I.api_event_stream (
-        stream_event_id, domain_event_id, revision, event_type, mint, confirmation_status,
-        payload_version, event, purge_after
-      )
-      SELECT
-        event_id || ':' || revision::text || ':' || confirmation_status || ':' || payload_version::text
-          || ':' || md5(public_event::text),
-        event_id,
-        revision,
-        type,
-        mint,
-        confirmation_status,
-        payload_version,
-        public_event,
-        NOW() + INTERVAL '4 hours'
-      FROM (
+    'SELECT backfill_completed FROM %I.api_event_stream_state WHERE id = 1',
+    target_schema
+  ) INTO backfill_done;
+
+  IF NOT backfill_done THEN
+    EXECUTE format(
+      $sql$
+        INSERT INTO %1$I.api_event_stream (
+          stream_event_id, domain_event_id, revision, event_type, mint, confirmation_status,
+          payload_version, event, purge_after
+        )
         SELECT
+          event_id || ':' || revision::text || ':' || confirmation_status || ':' || payload_version::text
+            || ':' || md5(public_event::text),
           event_id,
-          1::BIGINT AS revision,
+          revision,
           type,
           mint,
           confirmation_status,
           payload_version,
-          jsonb_build_object(
-            'eventId', event_id,
-            'type', type,
-            'mint', mint,
-            'source', source,
-            'program', program,
-            'signature', signature,
-            'slot', slot::text,
-            'transactionIndex', transaction_index,
-            'instructionIndex', instruction_index,
-            'innerInstructionIndex', inner_instruction_index,
-            'confirmationStatus', confirmation_status,
-            'blockchainTime', to_jsonb(to_char(
-              blockchain_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-            )),
-            'observedAt', to_jsonb(to_char(
-              observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-            )),
-            'payloadVersion', payload_version,
-            'payload', payload
-          ) AS public_event
-        FROM %1$I.domain_events
-        WHERE (purge_after IS NULL OR purge_after > NOW())
-          AND type IN (
-            'TokenLaunchDetected',
-            'TokenMetadataResolved',
-            'TokenMetadataFailed',
-            'SocialEvidenceCollected',
-            'CreatorProfileUpdated',
-            'WalletClusterDetected',
-            'BondingCurveTradeObserved',
-            'BondingCurveStateUpdated',
-            'BondingCurveCompleted',
-            'QualificationUpdated',
-            'PaperPositionOpened',
-            'PaperPositionUpdated',
-            'PaperPositionClosed',
-            'MigrationObserved',
-            'PumpSwapPoolActivated'
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM %1$I.api_event_stream existing
-            WHERE existing.domain_event_id = domain_events.event_id
-          )
-        ORDER BY created_at, event_id
-      ) AS retained_domain_events
-      ON CONFLICT (domain_event_id, revision) DO NOTHING
-    $sql$,
-    target_schema
-  );
+          public_event,
+          NOW() + INTERVAL '4 hours'
+        FROM (
+          SELECT
+            event_id,
+            1::BIGINT AS revision,
+            type,
+            mint,
+            confirmation_status,
+            payload_version,
+            jsonb_build_object(
+              'eventId', event_id,
+              'type', type,
+              'mint', mint,
+              'source', source,
+              'program', program,
+              'signature', signature,
+              'slot', slot::text,
+              'transactionIndex', transaction_index,
+              'instructionIndex', instruction_index,
+              'innerInstructionIndex', inner_instruction_index,
+              'confirmationStatus', confirmation_status,
+              'blockchainTime', to_jsonb(to_char(
+                blockchain_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+              )),
+              'observedAt', to_jsonb(to_char(
+                observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+              )),
+              'payloadVersion', payload_version,
+              'payload', payload
+            ) AS public_event
+          FROM %1$I.domain_events
+          WHERE (purge_after IS NULL OR purge_after > NOW())
+            AND type IN (
+              'TokenLaunchDetected',
+              'TokenMetadataResolved',
+              'TokenMetadataFailed',
+              'SocialEvidenceCollected',
+              'CreatorProfileUpdated',
+              'WalletClusterDetected',
+              'BondingCurveTradeObserved',
+              'BondingCurveStateUpdated',
+              'BondingCurveCompleted',
+              'QualificationUpdated',
+              'PaperPositionOpened',
+              'PaperPositionUpdated',
+              'PaperPositionClosed',
+              'MigrationObserved',
+              'PumpSwapPoolActivated'
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM %1$I.api_event_stream existing
+              WHERE existing.domain_event_id = domain_events.event_id
+            )
+          ORDER BY created_at, event_id
+        ) AS retained_domain_events
+        ON CONFLICT (domain_event_id, revision) DO NOTHING
+      $sql$,
+      target_schema
+    );
 
-  EXECUTE format(
-    $sql$
-      UPDATE %1$I.api_event_stream_state
-      SET last_sequence = GREATEST(
-        last_sequence,
-        COALESCE((SELECT MAX(sequence) FROM %1$I.api_event_stream), 0)
-      )
-      WHERE id = 1
-    $sql$,
-    target_schema
-  );
+    EXECUTE format(
+      $sql$
+        UPDATE %1$I.api_event_stream_state
+        SET last_sequence = GREATEST(
+              last_sequence,
+              COALESCE((SELECT MAX(sequence) FROM %1$I.api_event_stream), 0)
+            ),
+            backfill_completed = TRUE
+        WHERE id = 1
+      $sql$,
+      target_schema
+    );
+  END IF;
 END;
 $$;
 
