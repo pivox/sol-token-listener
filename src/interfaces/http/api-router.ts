@@ -176,26 +176,52 @@ async function dispatchEventStream(
   if (stream === undefined || settings === undefined) {
     throw new ApiError({ code: 'DEPENDENCY_UNAVAILABLE', httpStatus: 503 });
   }
-  const startAfter = await resolveStreamStart(stream, request.headers['last-event-id']);
-  if (headOnly) {
-    response.writeHead(200, SSE_HEADERS);
-    response.end();
-    return null;
+  const peer = observeSsePeer(request, response);
+  try {
+    if (peer.isClosed()) return null;
+    const startAfter = await resolveStreamStart(stream, request.headers['last-event-id']);
+    if (peer.isClosed()) return null;
+    if (headOnly) {
+      response.writeHead(200, SSE_HEADERS);
+      response.end();
+      return null;
+    }
+    const sessionOptions = {
+      stream,
+      response,
+      startAfter,
+      batchSize: settings.batchSize,
+      pollIntervalMs: settings.pollIntervalMs,
+      heartbeatIntervalMs: settings.heartbeatIntervalMs,
+      schedule: settings.schedule ?? scheduleTimeout,
+      cancel: settings.cancel ?? cancelTimeout,
+      onClosed: () => undefined,
+    } as const;
+    const session = settings.createSession?.(sessionOptions) ?? new SseSession(sessionOptions);
+    return session.start() ? session : null;
+  } catch (error) {
+    if (peer.isClosed()) return null;
+    throw error;
+  } finally {
+    peer.detach();
   }
-  const sessionOptions = {
-    stream,
-    response,
-    startAfter,
-    batchSize: settings.batchSize,
-    pollIntervalMs: settings.pollIntervalMs,
-    heartbeatIntervalMs: settings.heartbeatIntervalMs,
-    schedule: settings.schedule ?? scheduleTimeout,
-    cancel: settings.cancel ?? cancelTimeout,
-    onClosed: () => undefined,
-  } as const;
-  const session = settings.createSession?.(sessionOptions) ?? new SseSession(sessionOptions);
-  session.start();
-  return session;
+}
+
+function observeSsePeer(request: IncomingMessage, response: ServerResponse): Readonly<{
+  isClosed: () => boolean;
+  detach: () => void;
+}> {
+  let closed = request.destroyed || response.destroyed || response.writableEnded;
+  const markClosed = (): void => { closed = true; };
+  request.once('aborted', markClosed);
+  response.once('close', markClosed);
+  return {
+    isClosed: (): boolean => closed || request.destroyed || response.destroyed || response.writableEnded,
+    detach: (): void => {
+      request.off('aborted', markClosed);
+      response.off('close', markClosed);
+    },
+  };
 }
 
 async function resolveStreamStart(

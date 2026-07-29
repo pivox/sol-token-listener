@@ -19,6 +19,7 @@ class FakeResponse extends EventEmitter {
     Object.assign(this.headers, headers);
     return this;
   }
+  public flushHeaders(): void {}
   public write(chunk: string): boolean { this.chunks.push(chunk); return true; }
   public end(): this { this.ended = true; return this; }
 }
@@ -495,4 +496,99 @@ void test('SseSession rejects a runtime event type containing CR/LF without fram
   assert.match(output, /"code":"DEPENDENCY_UNAVAILABLE"/u);
   assert.doesNotMatch(output, /\nevent: injected\n|\nid: injected\n/u);
   assert.equal(response.ended, true);
+});
+
+void test('events route abandons a deferred pre-header high-water read after client abort', async () => {
+  let releaseHighWater: (() => void) | undefined;
+  let highWaterStarted: (() => void) | undefined;
+  const highWaterStartedPromise = new Promise<void>((resolve) => { highWaterStarted = resolve; });
+  const highWater = new Promise<bigint>((resolve) => { releaseHighWater = () => { resolve(0n); }; });
+  let readAfterCalls = 0;
+  let scheduled = 0;
+  let returned: ((session: SseSession | null) => void) | undefined;
+  const returnedSession = new Promise<SseSession | null>((resolve) => { returned = resolve; });
+  const stream: ApiEventStreamRepository = {
+    async highWaterMark() { highWaterStarted?.(); return highWater; },
+    async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+    async readAfter() { readAfterCalls += 1; return []; },
+  };
+  const router = createApiRouter({
+    projections: {} as ApiProjectionRepository,
+    now: () => 0, defaultLimit: 1, maximumLimit: 1, correlationId: () => 'test', logError: () => {},
+    stream, sse: { batchSize: 1, pollIntervalMs: 50, heartbeatIntervalMs: 50,
+      schedule: () => { scheduled += 1; return 1; }, cancel: () => {} },
+  });
+  let peerClosed: (() => void) | undefined;
+  const peerClosedPromise = new Promise<void>((resolve) => { peerClosed = resolve; });
+  const server = createServer((incoming, outgoing) => {
+    outgoing.once('close', () => { peerClosed?.(); });
+    void router(incoming, outgoing).then((session) => { returned?.(session); });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('Expected a TCP server address');
+  try {
+    const outgoing = httpRequest({ host: '127.0.0.1', port: address.port, path: '/api/v1/events', method: 'GET',
+      headers: { accept: 'text/event-stream' } });
+    outgoing.once('error', () => {});
+    outgoing.end();
+    await within(highWaterStartedPromise, 'deferred high-water start');
+    outgoing.destroy();
+    await within(peerClosedPromise, 'aborted peer close');
+    releaseHighWater?.();
+    assert.equal(await within(returnedSession, 'aborted router completion'), null);
+    assert.equal(readAfterCalls, 0);
+    assert.equal(scheduled, 0);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+void test('SseSession flushes an empty-stream handshake before a long heartbeat interval', async () => {
+  const stream: ApiEventStreamRepository = {
+    async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+    async readAfter() { return []; },
+  };
+  const router = createApiRouter({
+    projections: {} as ApiProjectionRepository,
+    now: () => 0, defaultLimit: 1, maximumLimit: 1, correlationId: () => 'test', logError: () => {},
+    stream, sse: { batchSize: 1, pollIntervalMs: 60_000, heartbeatIntervalMs: 60_000 },
+  });
+  const { server, port } = await openServer(router);
+  try {
+    await within(new Promise<void>((resolve, reject) => {
+      const outgoing = httpRequest({ host: '127.0.0.1', port, path: '/api/v1/events', method: 'GET',
+        headers: { accept: 'text/event-stream' } }, (response) => {
+        assert.equal(response.headers['content-type'], 'text/event-stream; charset=utf-8');
+        response.destroy();
+        outgoing.destroy();
+        resolve();
+      });
+      outgoing.once('error', reject);
+      outgoing.end();
+    }), 'flushed SSE handshake');
+  } finally {
+    await closeServer(server);
+  }
+});
+
+void test('SseSession bounds SERVER close when an accepted event is blocked without drain', async () => {
+  const timers = new FakeTimers();
+  const response = new BackpressureResponse();
+  let closed = 0;
+  const session = new SseSession({
+    stream: {
+      async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+      async readAfter() { return [{ sequence: 1n, streamEventId: 'stream-1', event: event('blocked') }]; },
+    },
+    response: response as unknown as ServerResponse, startAfter: 0n, batchSize: 1,
+    pollIntervalMs: 10, heartbeatIntervalMs: 100, schedule: timers.schedule, cancel: timers.cancel,
+    onClosed: () => { closed += 1; },
+  });
+  session.start();
+  timers.runOne();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await within(session.close('SERVER'), 'bounded server close');
+  assert.equal(response.ended, true);
+  assert.equal(closed, 1);
 });

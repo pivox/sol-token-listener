@@ -6,6 +6,7 @@ import { stringifyJson } from '../../utils/json.js';
 
 export const MAX_SSE_BATCH_SIZE = 1_000;
 export const MAX_SSE_INTERVAL_MS = 86_400_000;
+export const MAX_SSE_TERMINAL_DRAIN_MS = 100;
 
 export type SseCloseReason = 'CLIENT' | 'SERVER' | 'ERROR';
 export type SseTimer = ReturnType<typeof setTimeout> | number;
@@ -41,6 +42,7 @@ export class SseSession {
   private started = false;
   private closedNotified = false;
   private closing: Promise<void> | null = null;
+  private pendingDrainAbort: (() => void) | null = null;
 
   public constructor(options: SseSessionOptions) {
     assertOptions(options);
@@ -55,14 +57,28 @@ export class SseSession {
     this.onClosed = options.onClosed;
   }
 
-  public start(): void {
-    if (this.started || this.closed) return;
+  public start(): boolean {
+    if (this.started || this.closed) return false;
+    if (!this.isWritable()) {
+      this.abandon();
+      return false;
+    }
     this.started = true;
-    this.response.writeHead(200, SSE_HEADERS);
     this.response.on('close', this.onClientClose);
     this.response.on('error', this.onClientClose);
+    if (!this.isWritable()) {
+      this.abandon();
+      return false;
+    }
+    this.response.writeHead(200, SSE_HEADERS);
+    this.response.flushHeaders();
+    if (!this.isWritable()) {
+      this.abandon();
+      return false;
+    }
     this.schedulePoll(0);
     this.scheduleHeartbeat();
+    return true;
   }
 
   public close(reason: SseCloseReason): Promise<void> {
@@ -78,14 +94,18 @@ export class SseSession {
     this.clearTimers();
     this.response.off('close', this.onClientClose);
     this.response.off('error', this.onClientClose);
+    this.interruptPendingDrain();
     this.closing = this.enqueue(async () => {
       if (reason === 'CLIENT') return;
-      if (reason === 'SERVER') {
-        await this.writeFrame('event: server_shutdown\ndata: {"apiVersion":"v1"}\n\n');
-      } else {
-        await this.writeFrame(errorFrame(errorCode));
+      let terminalDrained = false;
+      try {
+        terminalDrained = reason === 'SERVER'
+          ? await this.writeFrame('event: server_shutdown\ndata: {"apiVersion":"v1"}\n\n', true)
+          : await this.writeFrame(errorFrame(errorCode), true);
+      } finally {
+        this.endResponse();
+        if (!terminalDrained) this.destroyResponse();
       }
-      this.response.end();
     }).catch(() => {
       // A peer can disappear while a best-effort terminal frame is queued.
     }).then(() => {
@@ -125,8 +145,7 @@ export class SseSession {
       for (const revision of revisions) {
         await this.enqueue(async () => {
           if (this.closed) return;
-          await this.writeFrame(eventFrame(revision));
-          this.lastSequence = revision.sequence;
+          if (await this.writeFrame(eventFrame(revision))) this.lastSequence = revision.sequence;
         });
       }
       if (!this.isClosed()) this.schedulePoll(this.pollIntervalMs);
@@ -156,27 +175,47 @@ export class SseSession {
     return next;
   }
 
-  private async writeFrame(frame: string): Promise<void> {
-    if (this.closed && !frame.startsWith('event: server_shutdown') && !frame.startsWith('event: stream_error')) return;
-    if (this.response.writableEnded || this.response.destroyed) throw new Error('SSE response is not writable');
+  private async writeFrame(frame: string, terminal = false): Promise<boolean> {
+    if (this.closed && !terminal) return false;
+    if (!this.isWritable()) {
+      if (terminal) return false;
+      throw new Error('SSE response is not writable');
+    }
     const accepted = this.response.write(frame);
-    if (accepted) return;
-    await this.waitForDrain();
+    if (accepted) return true;
+    return this.waitForDrain(terminal);
   }
 
-  private waitForDrain(): Promise<void> {
+  private waitForDrain(terminal: boolean): Promise<boolean> {
     return new Promise((resolve, reject) => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
       const cleanup = (): void => {
         this.response.off('drain', onDrain);
         this.response.off('close', onClosed);
         this.response.off('error', onError);
+        if (timeout !== undefined) clearTimeout(timeout);
+        if (this.pendingDrainAbort === abort) this.pendingDrainAbort = null;
       };
-      const onDrain = (): void => { cleanup(); resolve(); };
-      const onClosed = (): void => { cleanup(); reject(new Error('SSE peer closed')); };
-      const onError = (): void => { cleanup(); reject(new Error('SSE response failed')); };
+      const settle = (drained: boolean, error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error === undefined) resolve(drained); else reject(error);
+      };
+      const abort = (): void => { settle(false, new Error('SSE drain interrupted')); };
+      const onDrain = (): void => { settle(true); };
+      const onClosed = (): void => {
+        if (terminal) settle(false); else settle(false, new Error('SSE peer closed'));
+      };
+      const onError = (): void => {
+        if (terminal) settle(false); else settle(false, new Error('SSE response failed'));
+      };
+      this.pendingDrainAbort = abort;
       this.response.once('drain', onDrain);
       this.response.once('close', onClosed);
       this.response.once('error', onError);
+      if (terminal) timeout = setTimeout(() => { settle(false); }, MAX_SSE_TERMINAL_DRAIN_MS);
     });
   }
 
@@ -191,6 +230,34 @@ export class SseSession {
     if (this.closedNotified) return;
     this.closedNotified = true;
     try { this.onClosed(this); } catch { /* observer errors cannot revive a session */ }
+  }
+
+  private interruptPendingDrain(): void {
+    this.pendingDrainAbort?.();
+  }
+
+  private abandon(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.clearTimers();
+    this.response.off('close', this.onClientClose);
+    this.response.off('error', this.onClientClose);
+    this.interruptPendingDrain();
+    this.notifyClosed();
+  }
+
+  private isWritable(): boolean { return !this.response.writableEnded && !this.response.destroyed; }
+
+  private endResponse(): void {
+    if (!this.response.writableEnded) {
+      try { this.response.end(); } catch { /* peer disappeared during terminal cleanup */ }
+    }
+  }
+
+  private destroyResponse(): void {
+    if (this.response.destroyed) return;
+    const destroy = (this.response as unknown as { destroy?: () => void }).destroy;
+    try { destroy?.(); } catch { /* terminal cleanup is best effort */ }
   }
 
   private isClosed(): boolean { return this.closed; }
