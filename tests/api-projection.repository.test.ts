@@ -5,7 +5,12 @@ import {
   PostgresApiProjectionRepository,
   type Queryable,
 } from '../src/storage/api-projection.repository.js';
-import { encodeLaunchCursor, encodePaperPositionCursor, encodeTimelineCursor } from '../src/api/cursor.js';
+import {
+  MAX_TIMELINE_INDEX,
+  encodeLaunchCursor,
+  encodePaperPositionCursor,
+  encodeTimelineCursor,
+} from '../src/api/cursor.js';
 
 interface Call {
   readonly text: string;
@@ -30,6 +35,7 @@ class FakeQueryable implements Queryable {
 class FakeConnectable implements Queryable {
   public readonly calls: Call[] = [];
   public released = false;
+  public connectCount = 0;
 
   public constructor(private readonly respond: (call: Call) => readonly Record<string, unknown>[]) {}
 
@@ -41,6 +47,7 @@ class FakeConnectable implements Queryable {
     query(text: string, values?: readonly unknown[]): Promise<{ readonly rows: readonly Record<string, unknown>[] }>;
     release(): void;
   }> {
+    this.connectCount += 1;
     return {
       query: async (text, values) => {
         const call = { text, values };
@@ -223,6 +230,18 @@ void test('rolls back and releases a snapshot when a grouped query fails', async
   assert.equal(database.released, true);
 });
 
+void test('rejects an invalid launch page before acquiring a snapshot client', async () => {
+  const database = new FakeConnectable(() => []);
+
+  await assert.rejects(
+    new PostgresApiProjectionRepository(database).listLaunches({ limit: 201, after: null }),
+    ApiProjectionDataError,
+  );
+
+  assert.equal(database.connectCount, 0);
+  assert.equal(database.calls.length, 0);
+});
+
 void test('returns NOT_AVAILABLE social and holders only for an existing launch', async () => {
   const database = new FakeQueryable((call) => {
     if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
@@ -336,6 +355,20 @@ void test('paginates a timeline with the complete ascending keyset', async () =>
   }));
 });
 
+void test('rejects timeline PostgreSQL integer overflow before querying', async () => {
+  const database = new FakeQueryable(() => []);
+  const repository = new PostgresApiProjectionRepository(database);
+
+  await assert.rejects(repository.listLaunchEvents('mint-a', {
+    limit: 1,
+    after: {
+      slot: '1', transactionIndex: MAX_TIMELINE_INDEX + 1, instructionIndex: 0,
+      innerInstructionIndex: null, id: 'event',
+    },
+  }), ApiProjectionDataError);
+  assert.equal(database.calls.length, 0);
+});
+
 void test('uses the latest non-orphaned qualification event and rejects malformed data safely', async () => {
   const report = {
     ruleSet: { id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60 },
@@ -367,12 +400,13 @@ void test('lists paper positions by stable keyset without decimal coercion', asy
     position_id: 'position-a', mint: 'mint-a', status: 'PAPER_HOLDING', opened_at: openedAt,
     closed_at: null, quote_mint: 'quote', remaining_base_raw: '100000000000000000001',
     quote_cost_raw: '200000000000000000002', quote_proceeds_raw: null,
-    net_pnl_quote_raw: null, round_trip_loss_bps: '17', entry_fees_raw: '7', exit_fees_raw: null,
+    net_pnl_quote_raw: null, round_trip_loss_bps: '17', entry_fees_raw: '7',
+    exit_trade_id: null, exit_fees_raw: null,
   }, {
     position_id: 'position-b', mint: 'mint-b', status: 'PAPER_CLOSED', opened_at: openedAt,
     closed_at: detectedAt, quote_mint: 'quote', remaining_base_raw: '0', quote_cost_raw: '2',
     quote_proceeds_raw: '3', net_pnl_quote_raw: '1', round_trip_loss_bps: '4',
-    entry_fees_raw: '8', exit_fees_raw: '13',
+    entry_fees_raw: '8', exit_trade_id: 'exit-b', exit_fees_raw: '13',
   }]);
   const page = await new PostgresApiProjectionRepository(database).listPaperPositions({ limit: 1, after: null });
 
@@ -395,7 +429,7 @@ void test('adds exact entry and exit fees for a closed paper position', async ()
     position_id: 'position-b', mint: 'mint-b', status: 'PAPER_CLOSED', opened_at: openedAt,
     closed_at: detectedAt, quote_mint: 'quote', remaining_base_raw: '0', quote_cost_raw: '2',
     quote_proceeds_raw: '3', net_pnl_quote_raw: '1',
-    entry_fees_raw: '900719925474099312345', exit_fees_raw: '11',
+    entry_fees_raw: '900719925474099312345', exit_trade_id: 'exit-b', exit_fees_raw: '11',
   }]);
 
   const page = await new PostgresApiProjectionRepository(database)
@@ -403,6 +437,20 @@ void test('adds exact entry and exit fees for a closed paper position', async ()
 
   assert.equal(page.items[0]?.estimatedFeesQuote, '900719925474099312356');
   assert.match(database.calls[0]?.text ?? '', /LEFT JOIN paper_trades AS exit_trade/u);
+});
+
+void test('rejects a closed paper position without a persisted exit trade', async () => {
+  const database = new FakeQueryable(() => [{
+    position_id: 'position-b', mint: 'mint-b', status: 'PAPER_CLOSED', opened_at: openedAt,
+    closed_at: detectedAt, quote_mint: 'quote', remaining_base_raw: '0', quote_cost_raw: '2',
+    quote_proceeds_raw: '3', net_pnl_quote_raw: '1',
+    entry_fees_raw: '5', exit_trade_id: null, exit_fees_raw: null,
+  }]);
+
+  await assert.rejects(
+    new PostgresApiProjectionRepository(database).listPaperPositions({ limit: 1, after: null }),
+    ApiProjectionDataError,
+  );
 });
 
 void test('uses a strict paper keyset and encodes the final emitted position', async () => {
@@ -486,6 +534,23 @@ void test('degrades stale heartbeats and reads startedAt only from canonical pay
   assert.equal(health.status, 'DEGRADED');
   assert.equal(health.heartbeat.startedAt, detectedAt.toISOString());
   assert.equal(health.lagSlots, '-3');
+});
+
+void test('degrades a heartbeat timestamped in the future', async () => {
+  const futureAt = new Date(openedAt.getTime() + 1);
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
+    if (call.text.includes('listener_heartbeats')) return [{
+      updated_at: futureAt, payload: {}, last_http_slot: '40', last_websocket_slot: '40',
+      last_finalized_slot: null, last_signature: null, pending_transactions: 0, active_sessions: 0,
+    }];
+    return [];
+  });
+  const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE',
+  }).getHealth();
+
+  assert.equal(health.status, 'DEGRADED');
 });
 
 void test('reports PostgreSQL unavailable without leaking a rejected health query', async () => {

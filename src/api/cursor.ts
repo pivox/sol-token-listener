@@ -7,6 +7,8 @@ export const MAX_CURSOR_ENCODED_LENGTH = 2_048;
 export const MAX_CURSOR_DECODED_BYTES = 1_536;
 export const MAX_CURSOR_TEXT_LENGTH = 256;
 export const MAX_CURSOR_SEQUENCE = 9_223_372_036_854_775_807n;
+export const MAX_TIMELINE_SLOT = '9'.repeat(78);
+export const MAX_TIMELINE_INDEX = 2_147_483_647;
 
 export interface PaperPositionPagePosition {
   readonly openedAtMs: number;
@@ -72,7 +74,7 @@ export function decodePaperPositionCursor(cursor: string): PaperPositionPagePosi
 }
 
 export function encodeTimelineCursor(position: TimelinePagePosition): string {
-  assertSequence(position.slot, 'slot', true);
+  assertTimelineSlot(position.slot);
   assertIndex(position.transactionIndex, 'transactionIndex');
   assertIndex(position.instructionIndex, 'instructionIndex');
   if (position.innerInstructionIndex !== null) assertIndex(position.innerInstructionIndex, 'innerInstructionIndex');
@@ -89,7 +91,7 @@ export function decodeTimelineCursor(cursor: string): TimelinePagePosition {
     instructionIndex: requireNumber(tuple[4]),
     innerInstructionIndex: tuple[5] === null ? null : requireNumber(tuple[5]), id: requireString(tuple[6]),
   };
-  assertSequence(position.slot, 'slot', true);
+  assertTimelineSlot(position.slot);
   assertIndex(position.transactionIndex, 'transactionIndex');
   assertIndex(position.instructionIndex, 'instructionIndex');
   if (position.innerInstructionIndex !== null) assertIndex(position.innerInstructionIndex, 'innerInstructionIndex');
@@ -161,14 +163,20 @@ function assertText(value: string, field: string): void {
   }
 }
 
-function assertSequence(value: string, field: string, allowZero = false): void {
-  if (!/^(?:0|[1-9]\d*)$/u.test(value)) throw new TypeError(`Invalid ${field}`);
-  const parsed = BigInt(value);
-  if ((!allowZero && parsed === 0n) || parsed > MAX_CURSOR_SEQUENCE) throw new TypeError(`Invalid ${field}`);
+function assertIndex(value: number, field: string): void {
+  if (
+    !Number.isSafeInteger(value)
+    || value < 0
+    || value > MAX_TIMELINE_INDEX
+    || Object.is(value, -0)
+  ) throw new TypeError(`Invalid ${field}`);
 }
 
-function assertIndex(value: number, field: string): void {
-  if (!Number.isSafeInteger(value) || value < 0 || Object.is(value, -0)) throw new TypeError(`Invalid ${field}`);
+function assertTimelineSlot(value: string): void {
+  if (
+    !/^(?:0|[1-9]\d*)$/u.test(value)
+    || value.length > MAX_TIMELINE_SLOT.length
+  ) throw new TypeError('Invalid slot');
 }
 
 function requireString(value: unknown): string {

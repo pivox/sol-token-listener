@@ -11,6 +11,8 @@ import {
   type ApiTimelineEntry,
 } from '../api/contracts.js';
 import {
+  MAX_TIMELINE_INDEX,
+  MAX_TIMELINE_SLOT,
   encodeLaunchCursor,
   encodePaperPositionCursor,
   encodeTimelineCursor,
@@ -92,14 +94,20 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
   public async listLaunches(
     request: PageRequest<LaunchPagePosition>,
   ): Promise<ApiPage<ApiLaunchSummary>> {
-    if (this.database.connect !== undefined) return this.withSnapshot((repository) => repository.listLaunches(request));
     const limit = pageLimit(request.limit);
-    const values = request.after === null
+    const position = request.after === null ? null : {
+      detectedAtMs: validatedTimestampMs(request.after.detectedAtMs),
+      mint: text(request.after.mint),
+    };
+    if (this.database.connect !== undefined) {
+      return this.withSnapshot((repository) => repository.listLaunches({ limit, after: position }));
+    }
+    const values = position === null
       ? [limit + 1]
-      : [dateFromMs(request.after.detectedAtMs), text(request.after.mint), limit + 1];
-    const after = request.after === null ? '' : `
+      : [dateFromMs(position.detectedAtMs), position.mint, limit + 1];
+    const after = position === null ? '' : `
       AND (launch.detected_at < $1 OR (launch.detected_at = $1 AND launch.mint > $2))`;
-    const limitParameter = request.after === null ? '$1' : '$3';
+    const limitParameter = position === null ? '$1' : '$3';
     const result = await this.database.query(`${launchSelect}
       WHERE NOT EXISTS (
         SELECT 1 FROM domain_events AS launch_event
@@ -126,9 +134,9 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     const after = request.after;
     const afterSql = after === null ? '' : ` WHERE (slot, transaction_index, instruction_index, inner_sort, id)
         > ($2::numeric, $3::integer, $4::integer, $5::integer, $6::text)`;
-    const values = after === null ? [text(mint), limit + 1] : [text(mint), decimal(after.slot),
-      nonnegativeSafeNumber(after.transactionIndex), nonnegativeSafeNumber(after.instructionIndex),
-      after.innerInstructionIndex === null ? -1 : nonnegativeSafeNumber(after.innerInstructionIndex),
+    const values = after === null ? [text(mint), limit + 1] : [text(mint), timelineSlot(after.slot),
+      timelineIndex(after.transactionIndex), timelineIndex(after.instructionIndex),
+      after.innerInstructionIndex === null ? -1 : timelineIndex(after.innerInstructionIndex),
       text(after.id), limit + 1];
     const limitParameter = after === null ? '$2' : '$7';
     const result = await this.database.query(
@@ -169,9 +177,9 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     const items = freeze(rows.map(toTimelineEntry));
     const last = result.rows.length > limit ? rows.at(-1) : undefined;
     return freeze({ items, nextCursor: last === undefined ? null : encodeTimelineCursor({
-      slot: decimal(last.slot), transactionIndex: safeNumber(last.transaction_index),
-      instructionIndex: safeNumber(last.instruction_index),
-      innerInstructionIndex: last.inner_instruction_index === null ? null : safeNumber(last.inner_instruction_index),
+      slot: timelineSlot(last.slot), transactionIndex: timelineIndex(last.transaction_index),
+      instructionIndex: timelineIndex(last.instruction_index),
+      innerInstructionIndex: last.inner_instruction_index === null ? null : timelineIndex(last.inner_instruction_index),
       id: text(last.id),
     }) });
   }
@@ -213,6 +221,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       `SELECT position.position_id, position.mint, position.status, position.opened_at,
           position.closed_at, position.quote_mint, position.remaining_base_raw,
           position.quote_cost_raw, position.quote_proceeds_raw, position.net_pnl_quote_raw,
+          position.exit_trade_id,
           entry_trade.fees_raw AS entry_fees_raw, exit_trade.fees_raw AS exit_fees_raw
        FROM paper_positions AS position
        JOIN paper_trades AS entry_trade ON entry_trade.trade_id = position.entry_trade_id
@@ -252,8 +261,11 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       const heartbeat = row === undefined ? emptyHeartbeat() : heartbeatFromRow(row);
       const lagSlots = heartbeat.lastHttpSlot === null || heartbeat.lastWebsocketSlot === null
         ? null : (BigInt(heartbeat.lastHttpSlot) - BigInt(heartbeat.lastWebsocketSlot)).toString();
-      const stale = heartbeat.updatedAt === null
-        || observedAt.getTime() - Date.parse(heartbeat.updatedAt) > HEARTBEAT_STALE_AFTER_MS;
+      const heartbeatAge = heartbeat.updatedAt === null
+        ? null : observedAt.getTime() - Date.parse(heartbeat.updatedAt);
+      const stale = heartbeatAge === null
+        || heartbeatAge < 0
+        || heartbeatAge > HEARTBEAT_STALE_AFTER_MS;
       const degraded = database.rows.length === 0 || stale || !this.pipeline.httpAvailable
       || this.pipeline.pumpfun === 'DEGRADED' || this.pipeline.pumpfun === 'STOPPED'
       || this.pipeline.pumpswap === 'DEGRADED' || this.pipeline.pumpswap === 'STOPPED';
@@ -441,13 +453,21 @@ function score(value: unknown): ApiQualification['scores']['total'] {
 }
 
 function toPaperPosition(row: Record<string, unknown>): ApiPaperPosition {
+  const status = validated(row.status, PAPER_POSITION_STATUSES) as ApiPaperPosition['status'];
+  const exitTradeId = nullableText(row.exit_trade_id);
+  const exitFees = nullableDecimal(row.exit_fees_raw);
+  if (
+    (status === 'PAPER_HOLDING' && (exitTradeId !== null || exitFees !== null))
+    || (status === 'PAPER_CLOSED' && (exitTradeId === null || exitFees === null))
+    || (status === 'PAPER_RETRACTED' && ((exitTradeId === null) !== (exitFees === null)))
+  ) throw invalid();
   return freeze({
-    id: text(row.position_id), mint: text(row.mint), status: validated(row.status, PAPER_POSITION_STATUSES) as ApiPaperPosition['status'],
+    id: text(row.position_id), mint: text(row.mint), status,
     openedAt: timestamp(row.opened_at).toISOString(), closedAt: nullableTimestamp(row.closed_at), quoteMint: text(row.quote_mint),
     quantity: decimal(row.remaining_base_raw), entryQuoteAmount: decimal(row.quote_cost_raw),
     exitQuoteAmount: nullableDecimal(row.quote_proceeds_raw), realizedPnlQuote: nullableSignedDecimal(row.net_pnl_quote_raw),
     estimatedFeesQuote: (BigInt(decimal(row.entry_fees_raw))
-      + BigInt(nullableDecimal(row.exit_fees_raw) ?? '0')).toString(),
+      + BigInt(exitFees ?? '0')).toString(),
   });
 }
 
@@ -512,8 +532,13 @@ function validDate(value: Date): Date {
 }
 
 function dateFromMs(value: number): Date {
-  if (!Number.isSafeInteger(value) || value < 0) throw invalid();
+  if (!Number.isSafeInteger(value) || value < 0 || Object.is(value, -0)) throw invalid();
   return validDate(new Date(value));
+}
+
+function validatedTimestampMs(value: number): number {
+  dateFromMs(value);
+  return value;
 }
 
 function decimal(value: unknown): string {
@@ -555,9 +580,15 @@ function positiveSafeNumber(value: unknown): number {
   return result;
 }
 
-function nonnegativeSafeNumber(value: unknown): number {
+function timelineIndex(value: unknown): number {
   const result = safeNumber(value);
-  if (result < 0 || Object.is(result, -0)) throw invalid();
+  if (result < 0 || result > MAX_TIMELINE_INDEX || Object.is(result, -0)) throw invalid();
+  return result;
+}
+
+function timelineSlot(value: unknown): string {
+  const result = decimal(value);
+  if (result.length > MAX_TIMELINE_SLOT.length) throw invalid();
   return result;
 }
 

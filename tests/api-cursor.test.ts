@@ -4,6 +4,8 @@ import {
   MAX_CURSOR_ENCODED_LENGTH,
   MAX_CURSOR_SEQUENCE,
   MAX_CURSOR_TEXT_LENGTH,
+  MAX_TIMELINE_INDEX,
+  MAX_TIMELINE_SLOT,
   decodeLaunchCursor,
   decodePaperPositionCursor,
   decodeStreamCursor,
@@ -87,4 +89,32 @@ void test('cursor limits accept exact bounds and reject oversized values before 
   assert.throws(() => encodePaperPositionCursor({ openedAtMs: 0, id: `${textAtLimit}x` }), TypeError);
   assert.throws(() => encodeStreamCursor(MAX_CURSOR_SEQUENCE + 1n), TypeError);
   assert.throws(() => decodeLaunchCursor('A'.repeat(MAX_CURSOR_ENCODED_LENGTH + 1)), TypeError);
+});
+
+void test('timeline cursors use PostgreSQL numeric and integer bounds independently from streams', () => {
+  const highUint64Slot = '18446744073709551615';
+  const maximum = {
+    slot: MAX_TIMELINE_SLOT,
+    transactionIndex: MAX_TIMELINE_INDEX,
+    instructionIndex: MAX_TIMELINE_INDEX,
+    innerInstructionIndex: MAX_TIMELINE_INDEX,
+    id: 'event-max',
+  };
+
+  assert.equal(decodeTimelineCursor(encodeTimelineCursor({
+    ...maximum, slot: highUint64Slot,
+  })).slot, highUint64Slot);
+  assert.deepEqual(decodeTimelineCursor(encodeTimelineCursor(maximum)), maximum);
+  assert.throws(() => encodeTimelineCursor({
+    ...maximum, slot: `1${'0'.repeat(MAX_TIMELINE_SLOT.length)}`,
+  }), TypeError);
+  assert.throws(() => encodeTimelineCursor({
+    ...maximum, transactionIndex: MAX_TIMELINE_INDEX + 1,
+  }), TypeError);
+  assert.throws(() => encodeTimelineCursor({
+    ...maximum, instructionIndex: MAX_TIMELINE_INDEX + 1,
+  }), TypeError);
+  assert.throws(() => encodeTimelineCursor({
+    ...maximum, innerInstructionIndex: MAX_TIMELINE_INDEX + 1,
+  }), TypeError);
 });
