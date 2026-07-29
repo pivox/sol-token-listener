@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS market_pools (
   confirmation_status TEXT NOT NULL CHECK (
     confirmation_status IN ('processed','confirmed','finalized','orphaned')
   ),
-  slot NUMERIC(78,0) NOT NULL,
+  observed_slot NUMERIC(78,0) NOT NULL,
+  trigger_slot NUMERIC(78,0) NOT NULL,
   transaction_index INTEGER NOT NULL,
   instruction_index INTEGER NOT NULL,
   inner_instruction_index INTEGER,
@@ -75,7 +76,7 @@ CREATE TABLE IF NOT EXISTS market_reserve_snapshots (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS market_reserve_snapshots_cursor_idx
   ON market_reserve_snapshots(
-    pool_address, slot, transaction_index, instruction_index,
+    pool_address, observed_slot, trigger_slot, transaction_index, instruction_index,
     COALESCE(inner_instruction_index, -1)
   );
 

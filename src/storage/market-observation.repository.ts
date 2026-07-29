@@ -289,10 +289,11 @@ implements MarketObservationRepository {
     await client.query(
       `INSERT INTO market_reserve_snapshots (
         snapshot_id,pool_address,base_reserves_raw,quote_vault_amount_raw,
-        virtual_quote_reserves_raw,effective_quote_reserves_raw,slot,
+        virtual_quote_reserves_raw,effective_quote_reserves_raw,observed_slot,
+        trigger_slot,
         transaction_index,instruction_index,inner_instruction_index,
         confirmation_status,observed_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       ON CONFLICT (snapshot_id) DO UPDATE SET
         confirmation_status = EXCLUDED.confirmation_status`,
       [
@@ -300,9 +301,13 @@ implements MarketObservationRepository {
         reserves.quoteVaultAmountRaw.toString(),
         reserves.virtualQuoteReservesRaw.toString(),
         reserves.effectiveQuoteReservesRaw.toString(),
-        observation.cursor.slot.toString(), observation.cursor.transactionIndex,
-        observation.cursor.instructionIndex, observation.cursor.innerInstructionIndex,
-        observation.confirmationStatus, new Date(reserves.observedAtMs),
+        reserves.observedSlot.toString(),
+        observation.triggerCursor.slot.toString(),
+        observation.triggerCursor.transactionIndex,
+        observation.triggerCursor.instructionIndex,
+        observation.triggerCursor.innerInstructionIndex,
+        observation.confirmationStatus,
+        new Date(reserves.observedAtMs),
       ],
     );
   }

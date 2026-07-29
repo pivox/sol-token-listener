@@ -14,7 +14,7 @@ import type { ChainConfirmationStatus, ChainCursor } from '../domain/types.js';
 export interface MarketReserveObservation {
   readonly id: string;
   readonly reserves: MarketReserves;
-  readonly cursor: ChainCursor;
+  readonly triggerCursor: ChainCursor;
   readonly confirmationStatus: ChainConfirmationStatus;
 }
 

@@ -19,8 +19,9 @@ export async function main(): Promise<void> {
     qualificationRuleSetStatus: config.qualificationRuleSetStatus,
     qualificationMinimumScore: qualificationEngine.minimumTotalScore,
     pumpFunListenerActive: false,
+    pumpSwapPipelineAvailable: true,
     transactionSubmissionEnabled: false,
-  }, 'Socle d’observation prêt; l’adaptateur Pump.fun sera activé dans une PR ultérieure.');
+  }, 'Pipeline PumpSwap disponible mais non abonné; listener réseau inactif.');
   await closeDatabase();
 }
 

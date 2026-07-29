@@ -65,9 +65,8 @@ export class MarketObservationService {
     }
     for (const reserves of observation.reserveSnapshots) {
       if (
-        reserves.cursor.slot !== transaction.cursor.slot
-        || reserves.cursor.transactionIndex !== transaction.cursor.transactionIndex
-        || reserves.reserves.observedSlot !== reserves.cursor.slot
+        reserves.triggerCursor.slot !== transaction.cursor.slot
+        || reserves.triggerCursor.transactionIndex !== transaction.cursor.transactionIndex
       ) {
         throw new InvalidMarketObservationError(
           `Snapshot hors transaction: ${reserves.id}`,
@@ -100,7 +99,7 @@ export class MarketObservationService {
       rawEvents,
       matches,
       reserveSnapshots: [...observation.reserveSnapshots].sort((left, right) =>
-        compareCursors(left.cursor, right.cursor)),
+        compareCursors(left.triggerCursor, right.triggerCursor)),
       trades,
     });
   }
