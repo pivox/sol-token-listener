@@ -56,6 +56,8 @@ void test('l’API publique est activée localement avec des limites sûres par 
   assert.equal(config.apiPort, 3_000);
   assert.equal(config.apiPageLimitDefault, 50);
   assert.equal(config.apiPageLimitMaximum, 200);
+  assert.equal(config.apiHolderPositionLimit, 100);
+  assert.equal(config.apiHolderSnapshotLimit, 100);
   assert.equal(config.apiSseHeartbeatMs, 15_000);
   assert.equal(config.apiSsePollMs, 1_000);
 });
@@ -73,6 +75,8 @@ void test('la configuration API refuse les valeurs ambiguës ou hors limites', (
     { API_PAGE_LIMIT_DEFAULT: '51', API_PAGE_LIMIT_MAX: '50' },
     { API_SSE_HEARTBEAT_MS: '999' },
     { API_SSE_POLL_MS: '99' },
+    { API_HOLDER_POSITION_LIMIT: '501' },
+    { API_HOLDER_SNAPSHOT_LIMIT: '501' },
   ];
   for (const values of invalid) assert.throws(() => parseConfig({ ...base, ...values }));
 });
@@ -83,5 +87,6 @@ void test('le modèle d’environnement publie les valeurs API sûres exactes', 
     'API_ENABLED=true', 'API_HOST=127.0.0.1', 'API_PORT=3000',
     'API_PAGE_LIMIT_DEFAULT=50', 'API_PAGE_LIMIT_MAX=200',
     'API_SSE_HEARTBEAT_MS=15000', 'API_SSE_POLL_MS=1000',
+    'API_HOLDER_POSITION_LIMIT=100', 'API_HOLDER_SNAPSHOT_LIMIT=100',
   ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
 });

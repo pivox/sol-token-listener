@@ -69,7 +69,10 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
     marketCapQuote: null, liquidityQuote: null,
   };
   const social: ApiSocial = { status: 'NOT_AVAILABLE', links: [], evidence: [] };
-  const holders: ApiHolders = { status: 'NOT_AVAILABLE', snapshots: [], clusters: [] };
+  const holders: ApiHolders = {
+    status: 'NOT_AVAILABLE', snapshots: [], positions: [], clusters: [],
+    clusterAnalysisStatus: 'NOT_AVAILABLE',
+  };
   const detail: ApiLaunchDetail = {
     ...summary, creator: MINT, tokenProgram: MINT, launchpad: 'pumpfun', initialTokenAmount: null,
     initialQuoteAmount: null, reserveBase: null, reserveQuote: null, feeBps: null, social, holders,

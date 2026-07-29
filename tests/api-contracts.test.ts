@@ -145,7 +145,57 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   };
   const availability: ApiAvailability = 'NOT_AVAILABLE';
   const social: ApiSocial = { status: 'NOT_AVAILABLE', links: [], evidence: [] };
-  const holders: ApiHolders = { status: 'NOT_AVAILABLE', snapshots: [], clusters: [] };
+  const holders: ApiHolders = {
+    status: 'NOT_AVAILABLE',
+    snapshots: [],
+    positions: [],
+    clusters: [],
+    clusterAnalysisStatus: 'NOT_AVAILABLE',
+  };
+  const availableHolders: ApiHolders = {
+    status: 'AVAILABLE',
+    methodology: 'OBSERVED_BONDING_CURVE_TRADES',
+    creatorProfile: {
+      mint: 'Mint111',
+      creator: 'Creator111',
+      buyCount: 1,
+      sellCount: 0,
+      totalBoughtBaseRaw: '10',
+      totalSoldBaseRaw: '0',
+      observedNetBaseRaw: '10',
+      hasSold: false,
+      firstSell: null,
+      initialBuys: [],
+      quoteFlows: [],
+      uniqueExternalBuyers: 1,
+      unknownTraderTradeCount: 0,
+    },
+    latestSnapshot: {
+      id: 'snapshot',
+      inputFingerprint: 'fingerprint',
+      observedAt: '2026-07-29T12:00:00.000Z',
+      confirmationStatus: 'confirmed',
+      cursor: {
+        slot: '1',
+        transactionIndex: '0',
+        instructionIndex: '0',
+        innerInstructionIndex: null,
+      },
+      totalPositiveNetBaseRaw: '10',
+      top1Bps: '10000',
+      top5Bps: '10000',
+      top10Bps: '10000',
+      creatorBps: '0',
+      uniqueKnownBuyers: 1,
+      uniqueExternalBuyers: 1,
+      positivePositionCount: 1,
+      unknownTraderTradeCount: 0,
+    },
+    snapshots: [],
+    positions: [],
+    clusters: [],
+    clusterAnalysisStatus: 'NOT_AVAILABLE',
+  };
   const qualification: ApiQualification = {
     ruleSet: {
       id: 'rules-v1', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60,
@@ -187,6 +237,7 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(availability, 'NOT_AVAILABLE');
   assert.equal(social.links.length, 0);
   assert.equal(holders.snapshots.length, 0);
+  assert.equal(availableHolders.status, 'AVAILABLE');
   assert.equal(qualification.verdict, 'WATCHLISTED');
   assert.equal(health.pipeline.pumpfun, 'RUNNING');
   assert.equal(sseEvent.eventId, 'evt_1');

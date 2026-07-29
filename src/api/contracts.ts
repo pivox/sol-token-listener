@@ -136,10 +136,100 @@ export interface ApiSocial {
   readonly evidence: readonly [];
 }
 
-export interface ApiHolders {
+export type ApiHolders = ApiHoldersUnavailable | ApiHoldersAvailable;
+
+export interface ApiHoldersUnavailable {
   readonly status: 'NOT_AVAILABLE';
   readonly snapshots: readonly [];
+  readonly positions: readonly [];
   readonly clusters: readonly [];
+  readonly clusterAnalysisStatus: 'NOT_AVAILABLE';
+}
+
+export interface ApiHoldersAvailable {
+  readonly status: 'AVAILABLE';
+  readonly methodology: 'OBSERVED_BONDING_CURVE_TRADES';
+  readonly creatorProfile: ApiCreatorProfile;
+  readonly latestSnapshot: ApiHolderSnapshot;
+  readonly snapshots: readonly ApiHolderSnapshot[];
+  readonly positions: readonly ApiObservedWalletPosition[];
+  readonly clusters: readonly [];
+  readonly clusterAnalysisStatus: 'NOT_AVAILABLE';
+}
+
+export interface ApiCreatorProfile {
+  readonly mint: string;
+  readonly creator: string;
+  readonly buyCount: number;
+  readonly sellCount: number;
+  readonly totalBoughtBaseRaw: string;
+  readonly totalSoldBaseRaw: string;
+  readonly observedNetBaseRaw: string;
+  readonly hasSold: boolean;
+  readonly firstSell: ApiCreatorTradeEvidence | null;
+  readonly initialBuys: readonly ApiCreatorTradeEvidence[];
+  readonly quoteFlows: readonly ApiParticipantQuoteFlow[];
+  readonly uniqueExternalBuyers: number;
+  readonly unknownTraderTradeCount: number;
+}
+
+export interface ApiCreatorTradeEvidence {
+  readonly eventId: string;
+  readonly tradeId: string;
+  readonly signature: string;
+  readonly cursor: ApiAnalyticsCursor;
+  readonly baseAmountRaw: string;
+  readonly quoteAmountRaw: string;
+  readonly quoteAsset: ApiQuoteAsset;
+}
+
+export interface ApiParticipantQuoteFlow {
+  readonly quoteAsset: ApiQuoteAsset;
+  readonly boughtQuoteRaw: string;
+  readonly soldQuoteRaw: string;
+}
+
+export interface ApiQuoteAsset {
+  readonly mint: string;
+  readonly decimals: number;
+  readonly tokenProgram: 'SPL_TOKEN' | 'TOKEN_2022';
+}
+
+export interface ApiAnalyticsCursor {
+  readonly slot: string;
+  readonly transactionIndex: string;
+  readonly instructionIndex: string;
+  readonly innerInstructionIndex: string | null;
+}
+
+export interface ApiHolderSnapshot {
+  readonly id: string;
+  readonly inputFingerprint: string;
+  readonly observedAt: string;
+  readonly confirmationStatus: Exclude<ChainConfirmationStatus, 'orphaned'>;
+  readonly cursor: ApiAnalyticsCursor;
+  readonly totalPositiveNetBaseRaw: string;
+  readonly top1Bps: string;
+  readonly top5Bps: string;
+  readonly top10Bps: string;
+  readonly creatorBps: string;
+  readonly uniqueKnownBuyers: number;
+  readonly uniqueExternalBuyers: number;
+  readonly positivePositionCount: number;
+  readonly unknownTraderTradeCount: number;
+}
+
+export interface ApiObservedWalletPosition {
+  readonly wallet: string;
+  readonly isCreator: boolean;
+  readonly buyCount: number;
+  readonly sellCount: number;
+  readonly boughtBaseRaw: string;
+  readonly soldBaseRaw: string;
+  readonly observedNetBaseRaw: string;
+  readonly quoteFlows: readonly ApiParticipantQuoteFlow[];
+  readonly firstObservedCursor: ApiAnalyticsCursor;
+  readonly lastObservedCursor: ApiAnalyticsCursor;
 }
 
 export interface ApiPaperPosition {
@@ -357,6 +447,12 @@ const API_DOMAIN_NUMBER_KEYS = new Set<string>([
   'transactionIndex',
   'instructionIndex',
   'innerInstructionIndex',
+  'buyCount',
+  'sellCount',
+  'uniqueKnownBuyers',
+  'uniqueExternalBuyers',
+  'positivePositionCount',
+  'unknownTraderTradeCount',
 ]);
 
 function assertApiDomainPayload(value: ApiJsonValue, key: string | undefined): void {

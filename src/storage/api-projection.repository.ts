@@ -2,11 +2,17 @@ import {
   toApiDomainPayload,
   type ApiHealth,
   type ApiHolders,
+  type ApiHolderSnapshot,
   type ApiLaunchDetail,
   type ApiLaunchSummary,
+  type ApiObservedWalletPosition,
   type ApiPage,
+  type ApiParticipantQuoteFlow,
   type ApiPaperPosition,
   type ApiQualification,
+  type ApiCreatorProfile,
+  type ApiCreatorTradeEvidence,
+  type ApiAnalyticsCursor,
   type ApiSocial,
   type ApiTimelineEntry,
 } from '../api/contracts.js';
@@ -47,6 +53,11 @@ export interface ApiProjectionPipelineState {
   readonly pumpswap: ApiHealth['pipeline']['pumpswap'];
 }
 
+export interface ApiHolderProjectionLimits {
+  readonly positions: number;
+  readonly snapshots: number;
+}
+
 export class ApiProjectionDataError extends Error {
   public constructor() {
     super('Stored API projection data is invalid.');
@@ -77,7 +88,11 @@ const NOT_AVAILABLE_SOCIAL: ApiSocial = Object.freeze({
   status: 'NOT_AVAILABLE', links: Object.freeze([] as []), evidence: Object.freeze([] as []),
 });
 const NOT_AVAILABLE_HOLDERS: ApiHolders = Object.freeze({
-  status: 'NOT_AVAILABLE', snapshots: Object.freeze([] as []), clusters: Object.freeze([] as []),
+  status: 'NOT_AVAILABLE',
+  snapshots: Object.freeze([] as []),
+  positions: Object.freeze([] as []),
+  clusters: Object.freeze([] as []),
+  clusterAnalysisStatus: 'NOT_AVAILABLE',
 });
 
 export class PostgresApiProjectionRepository implements ApiProjectionRepository {
@@ -89,7 +104,14 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       pumpfun: 'STOPPED',
       pumpswap: 'STOPPED',
     },
-  ) {}
+    private readonly holderLimits: ApiHolderProjectionLimits = {
+      positions: 100,
+      snapshots: 100,
+    },
+  ) {
+    holderLimit(holderLimits.positions);
+    holderLimit(holderLimits.snapshots);
+  }
 
   public async listLaunches(
     request: PageRequest<LaunchPagePosition>,
@@ -126,7 +148,8 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     const launch = launches[0];
     if (launch === undefined) return null;
     const projections = await this.loadLaunchProjections([text(mint)]);
-    return assembleLaunchDetail(launch, projections);
+    const holders = await this.loadHolders(text(mint));
+    return assembleLaunchDetail(launch, projections, holders);
   }
 
   public async listLaunchEvents(mint: string, request: PageRequest<TimelinePagePosition>): Promise<ApiPage<ApiTimelineEntry>> {
@@ -204,7 +227,13 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
   }
 
   public async getLaunchHolders(mint: string): Promise<ApiHolders | null> {
-    return (await this.findLaunches(text(mint))).length === 0 ? null : NOT_AVAILABLE_HOLDERS;
+    if (this.database.connect !== undefined) {
+      return this.withSnapshot((repository) => repository.getLaunchHolders(mint));
+    }
+    const validatedMint = text(mint);
+    return (await this.findLaunches(validatedMint)).length === 0
+      ? null
+      : this.loadHolders(validatedMint);
   }
 
   public async listPaperPositions(
@@ -294,7 +323,12 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     try {
       await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
       const executor: Queryable = { query: (textValue, values) => client.query(textValue, values) };
-      const result = await operation(new PostgresApiProjectionRepository(executor, this.clock, this.pipeline));
+      const result = await operation(new PostgresApiProjectionRepository(
+        executor,
+        this.clock,
+        this.pipeline,
+        this.holderLimits,
+      ));
       await client.query('COMMIT');
       return result;
     } catch (error) {
@@ -372,6 +406,59 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       metadata: rowsByMint(metadata.rows), curves: rowsByMint(curves.rows), markets: rowsByMint(markets.rows),
     };
   }
+
+  private async loadHolders(mint: string): Promise<ApiHolders> {
+    const profileResult = await this.database.query(
+      `SELECT payload
+       FROM creator_profiles
+       WHERE mint = $1`,
+      [mint],
+    );
+    const profileRow = profileResult.rows[0];
+    if (profileRow === undefined) return NOT_AVAILABLE_HOLDERS;
+    const snapshotResult = await this.database.query(
+      `SELECT snapshot_id, input_fingerprint, observed_at, confirmation_status,
+          as_of_slot, as_of_transaction_index, as_of_instruction_index,
+          as_of_inner_instruction_index, total_positive_net_base_raw,
+          top1_bps, top5_bps, top10_bps, creator_bps, unique_known_buyers,
+          unique_external_buyers, positive_position_count,
+          unknown_trader_trade_count
+       FROM token_holders_snapshots
+       WHERE mint = $1
+       ORDER BY as_of_slot DESC, as_of_transaction_index DESC,
+          as_of_instruction_index DESC,
+          COALESCE(as_of_inner_instruction_index, -1) DESC,
+          snapshot_id DESC
+       LIMIT $2`,
+      [mint, this.holderLimits.snapshots],
+    );
+    const positionResult = await this.database.query(
+      `SELECT payload
+       FROM observed_wallet_positions
+       WHERE mint = $1
+       ORDER BY observed_net_base_raw DESC, wallet ASC
+       LIMIT $2`,
+      [mint, this.holderLimits.positions],
+    );
+    try {
+      const snapshots = freeze(snapshotResult.rows.map(toHolderSnapshot));
+      const latestSnapshot = snapshots[0];
+      if (latestSnapshot === undefined) throw invalid();
+      const holders: ApiHolders = {
+        status: 'AVAILABLE',
+        methodology: 'OBSERVED_BONDING_CURVE_TRADES',
+        creatorProfile: toCreatorProfile(profileRow.payload),
+        latestSnapshot,
+        snapshots,
+        positions: freeze(positionResult.rows.map((row) => toObservedWalletPosition(row.payload))),
+        clusters: freeze([] as []),
+        clusterAnalysisStatus: 'NOT_AVAILABLE',
+      };
+      return freeze(holders);
+    } catch (error) {
+      throw projectionError(error);
+    }
+  }
 }
 
 const launchSelect = `SELECT launch.mint, launch.detected_at, launch.created_slot, launch.current_state,
@@ -398,7 +485,11 @@ function assembleLaunchSummary(row: LaunchRow, projections: LaunchProjections): 
   });
 }
 
-function assembleLaunchDetail(row: LaunchRow, projections: LaunchProjections): ApiLaunchDetail {
+function assembleLaunchDetail(
+  row: LaunchRow,
+  projections: LaunchProjections,
+  holders: ApiHolders = NOT_AVAILABLE_HOLDERS,
+): ApiLaunchDetail {
   const summary = assembleLaunchSummary(row, projections);
   const curve = projections.curves.get(summary.mint);
   const market = projections.markets.get(summary.mint);
@@ -407,7 +498,120 @@ function assembleLaunchDetail(row: LaunchRow, projections: LaunchProjections): A
     initialTokenAmount: nullableDecimal(row.initial_token_amount), initialQuoteAmount: nullableDecimal(row.initial_quote_amount),
     reserveBase: nullableDecimal(market?.base_reserves_raw) ?? nullableDecimal(curve?.real_base_reserves_raw),
     reserveQuote: nullableDecimal(market?.quote_vault_amount_raw) ?? nullableDecimal(curve?.real_quote_reserves_raw),
-    feeBps: null, social: NOT_AVAILABLE_SOCIAL, holders: NOT_AVAILABLE_HOLDERS,
+    feeBps: null, social: NOT_AVAILABLE_SOCIAL, holders,
+  });
+}
+
+function toCreatorProfile(value: unknown): ApiCreatorProfile {
+  const profile = restoredRecord(value);
+  if (safeNumber(profile.payloadVersion) !== 1) throw invalid();
+  return freeze({
+    mint: text(profile.mint),
+    creator: text(profile.creator),
+    buyCount: nonNegativeSafeNumber(profile.buyCount),
+    sellCount: nonNegativeSafeNumber(profile.sellCount),
+    totalBoughtBaseRaw: rawBigInt(profile.totalBoughtBaseRaw, false),
+    totalSoldBaseRaw: rawBigInt(profile.totalSoldBaseRaw, false),
+    observedNetBaseRaw: rawBigInt(profile.observedNetBaseRaw, true),
+    hasSold: boolean(profile.hasSold),
+    firstSell: profile.firstSell === null ? null : toCreatorTradeEvidence(profile.firstSell),
+    initialBuys: freeze(array(profile.initialBuys).map(toCreatorTradeEvidence)),
+    quoteFlows: freeze(array(profile.quoteFlows).map(toParticipantQuoteFlow)),
+    uniqueExternalBuyers: nonNegativeSafeNumber(profile.uniqueExternalBuyers),
+    unknownTraderTradeCount: nonNegativeSafeNumber(profile.unknownTraderTradeCount),
+  });
+}
+
+function toCreatorTradeEvidence(value: unknown): ApiCreatorTradeEvidence {
+  const evidence = record(value);
+  return freeze({
+    eventId: text(evidence.eventId),
+    tradeId: text(evidence.tradeId),
+    signature: text(evidence.signature),
+    cursor: toAnalyticsCursor(evidence.cursor),
+    baseAmountRaw: rawBigInt(evidence.baseAmountRaw, false),
+    quoteAmountRaw: rawBigInt(evidence.quoteAmountRaw, false),
+    quoteAsset: toQuoteAsset(evidence.quoteAsset),
+  });
+}
+
+function toParticipantQuoteFlow(value: unknown): ApiParticipantQuoteFlow {
+  const flow = record(value);
+  return freeze({
+    quoteAsset: toQuoteAsset(flow.quoteAsset),
+    boughtQuoteRaw: rawBigInt(flow.boughtQuoteRaw, false),
+    soldQuoteRaw: rawBigInt(flow.soldQuoteRaw, false),
+  });
+}
+
+function toQuoteAsset(value: unknown): ApiParticipantQuoteFlow['quoteAsset'] {
+  const asset = record(value);
+  const tokenProgram = text(asset.tokenProgram);
+  if (tokenProgram !== 'SPL_TOKEN' && tokenProgram !== 'TOKEN_2022') throw invalid();
+  const decimalsValue = nonNegativeSafeNumber(asset.decimals);
+  if (decimalsValue > 255) throw invalid();
+  return freeze({
+    mint: text(asset.mint),
+    decimals: decimalsValue,
+    tokenProgram,
+  });
+}
+
+function toAnalyticsCursor(value: unknown): ApiAnalyticsCursor {
+  const cursor = record(value);
+  return freeze({
+    slot: rawBigInt(cursor.slot, false),
+    transactionIndex: BigInt(nonNegativeSafeNumber(cursor.transactionIndex)).toString(),
+    instructionIndex: BigInt(nonNegativeSafeNumber(cursor.instructionIndex)).toString(),
+    innerInstructionIndex: cursor.innerInstructionIndex === null
+      ? null
+      : BigInt(nonNegativeSafeNumber(cursor.innerInstructionIndex)).toString(),
+  });
+}
+
+function toHolderSnapshot(row: Record<string, unknown>): ApiHolderSnapshot {
+  const top1Bps = boundedBps(row.top1_bps);
+  const top5Bps = boundedBps(row.top5_bps);
+  const top10Bps = boundedBps(row.top10_bps);
+  const creatorBps = boundedBps(row.creator_bps);
+  return freeze({
+    id: text(row.snapshot_id),
+    inputFingerprint: text(row.input_fingerprint),
+    observedAt: timestamp(row.observed_at).toISOString(),
+    confirmationStatus: activeConfirmation(row.confirmation_status),
+    cursor: freeze({
+      slot: decimal(row.as_of_slot),
+      transactionIndex: BigInt(timelineIndex(row.as_of_transaction_index)).toString(),
+      instructionIndex: BigInt(timelineIndex(row.as_of_instruction_index)).toString(),
+      innerInstructionIndex: row.as_of_inner_instruction_index === null
+        ? null
+        : BigInt(timelineIndex(row.as_of_inner_instruction_index)).toString(),
+    }),
+    totalPositiveNetBaseRaw: decimal(row.total_positive_net_base_raw),
+    top1Bps,
+    top5Bps,
+    top10Bps,
+    creatorBps,
+    uniqueKnownBuyers: nonNegativeSafeNumber(row.unique_known_buyers),
+    uniqueExternalBuyers: nonNegativeSafeNumber(row.unique_external_buyers),
+    positivePositionCount: nonNegativeSafeNumber(row.positive_position_count),
+    unknownTraderTradeCount: nonNegativeSafeNumber(row.unknown_trader_trade_count),
+  });
+}
+
+function toObservedWalletPosition(value: unknown): ApiObservedWalletPosition {
+  const position = restoredRecord(value);
+  return freeze({
+    wallet: text(position.wallet),
+    isCreator: boolean(position.isCreator),
+    buyCount: nonNegativeSafeNumber(position.buyCount),
+    sellCount: nonNegativeSafeNumber(position.sellCount),
+    boughtBaseRaw: rawBigInt(position.boughtBaseRaw, false),
+    soldBaseRaw: rawBigInt(position.soldBaseRaw, false),
+    observedNetBaseRaw: rawBigInt(position.observedNetBaseRaw, true),
+    quoteFlows: freeze(array(position.quoteFlows).map(toParticipantQuoteFlow)),
+    firstObservedCursor: toAnalyticsCursor(position.firstObservedCursor),
+    lastObservedCursor: toAnalyticsCursor(position.lastObservedCursor),
   });
 }
 
@@ -567,6 +771,43 @@ function nullableText(value: unknown): string | null {
 
 function safeNumber(value: unknown): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value)) throw invalid();
+  return value;
+}
+
+function nonNegativeSafeNumber(value: unknown): number {
+  const result = safeNumber(value);
+  if (result < 0 || Object.is(result, -0)) throw invalid();
+  return result;
+}
+
+function holderLimit(value: number): number {
+  const result = positiveSafeNumber(value);
+  if (result > 500) throw invalid();
+  return result;
+}
+
+function boolean(value: unknown): boolean {
+  if (typeof value !== 'boolean') throw invalid();
+  return value;
+}
+
+function rawBigInt(value: unknown, signed: boolean): string {
+  if (typeof value !== 'bigint' || (!signed && value < 0n)) throw invalid();
+  return value.toString();
+}
+
+function restoredRecord(value: unknown): Record<string, unknown> {
+  return record(fromJsonValue(json(value)));
+}
+
+function boundedBps(value: unknown): string {
+  const result = decimal(value);
+  if (BigInt(result) > 10_000n) throw invalid();
+  return result;
+}
+
+function activeConfirmation(value: unknown): ApiHolderSnapshot['confirmationStatus'] {
+  if (value !== 'processed' && value !== 'confirmed' && value !== 'finalized') throw invalid();
   return value;
 }
 

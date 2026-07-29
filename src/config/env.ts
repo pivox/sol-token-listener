@@ -58,6 +58,8 @@ export interface AppConfig {
   readonly apiPort: number;
   readonly apiPageLimitDefault: number;
   readonly apiPageLimitMaximum: number;
+  readonly apiHolderPositionLimit: number;
+  readonly apiHolderSnapshotLimit: number;
   readonly apiSseHeartbeatMs: number;
   readonly apiSsePollMs: number;
   readonly logLevel: string;
@@ -140,6 +142,12 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     apiPort: parseInteger(environment.API_PORT, 3_000, 'API_PORT', 1, 65_535),
     apiPageLimitDefault,
     apiPageLimitMaximum,
+    apiHolderPositionLimit: parseInteger(
+      environment.API_HOLDER_POSITION_LIMIT, 100, 'API_HOLDER_POSITION_LIMIT', 1, 500,
+    ),
+    apiHolderSnapshotLimit: parseInteger(
+      environment.API_HOLDER_SNAPSHOT_LIMIT, 100, 'API_HOLDER_SNAPSHOT_LIMIT', 1, 500,
+    ),
     apiSseHeartbeatMs: parseInteger(
       environment.API_SSE_HEARTBEAT_MS, 15_000, 'API_SSE_HEARTBEAT_MS', 1_000, 60_000,
     ),

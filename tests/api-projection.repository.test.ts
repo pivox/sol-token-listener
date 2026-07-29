@@ -11,6 +11,7 @@ import {
   encodePaperPositionCursor,
   encodeTimelineCursor,
 } from '../src/api/cursor.js';
+import { toJsonValue } from '../src/utils/json.js';
 
 interface Call {
   readonly text: string;
@@ -165,7 +166,10 @@ void test('reads an exact launch and returns null only when it is absent', async
     initialTokenAmount: null, initialQuoteAmount: null,
     reserveBase: '100', reserveQuote: '200', feeBps: null,
     social: { status: 'NOT_AVAILABLE', links: [], evidence: [] },
-    holders: { status: 'NOT_AVAILABLE', snapshots: [], clusters: [] },
+    holders: {
+      status: 'NOT_AVAILABLE', snapshots: [], positions: [], clusters: [],
+      clusterAnalysisStatus: 'NOT_AVAILABLE',
+    },
   });
   assert.equal(Object.isFrozen(detail), true);
   assert.equal(Object.isFrozen(detail?.social ?? {}), true);
@@ -253,10 +257,154 @@ void test('returns NOT_AVAILABLE social and holders only for an existing launch'
     status: 'NOT_AVAILABLE', links: [], evidence: [],
   });
   assert.deepEqual(await repository.getLaunchHolders('mint-a'), {
-    status: 'NOT_AVAILABLE', snapshots: [], clusters: [],
+    status: 'NOT_AVAILABLE', snapshots: [], positions: [], clusters: [],
+    clusterAnalysisStatus: 'NOT_AVAILABLE',
   });
   assert.equal(await new PostgresApiProjectionRepository(new FakeQueryable(() => [])).getLaunchSocial('none'), null);
   assert.equal(await new PostgresApiProjectionRepository(new FakeQueryable(() => [])).getLaunchHolders('none'), null);
+});
+
+void test('expose les profils et positions observés avec des limites SQL bornées', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM creator_profiles')) return [{
+      payload: toJsonValue({
+        mint: 'mint-a',
+        creator: 'creator',
+        payloadVersion: 1,
+        inputFingerprint: 'fingerprint',
+        buyCount: 1,
+        sellCount: 0,
+        totalBoughtBaseRaw: 10n,
+        totalSoldBaseRaw: 0n,
+        observedNetBaseRaw: 10n,
+        hasSold: false,
+        firstSell: null,
+        initialBuys: [],
+        quoteFlows: [{
+          quoteAsset: { mint: 'sol', decimals: 9, tokenProgram: 'SPL_TOKEN' },
+          boughtQuoteRaw: 2n,
+          soldQuoteRaw: 0n,
+        }],
+        uniqueExternalBuyers: 1,
+        unknownTraderTradeCount: 0,
+      }),
+    }];
+    if (call.text.includes('FROM token_holders_snapshots')) return [{
+      snapshot_id: 'snapshot',
+      input_fingerprint: 'fingerprint',
+      observed_at: detectedAt,
+      confirmation_status: 'confirmed',
+      as_of_slot: '10',
+      as_of_transaction_index: 0,
+      as_of_instruction_index: 2,
+      as_of_inner_instruction_index: null,
+      total_positive_net_base_raw: '10',
+      top1_bps: '10000',
+      top5_bps: '10000',
+      top10_bps: '10000',
+      creator_bps: '0',
+      unique_known_buyers: 1,
+      unique_external_buyers: 1,
+      positive_position_count: 1,
+      unknown_trader_trade_count: 0,
+    }];
+    if (call.text.includes('FROM observed_wallet_positions')) return [{
+      payload: toJsonValue({
+        wallet: 'buyer',
+        isCreator: false,
+        buyCount: 1,
+        sellCount: 0,
+        boughtBaseRaw: 10n,
+        soldBaseRaw: 0n,
+        observedNetBaseRaw: 10n,
+        quoteFlows: [],
+        firstObservedCursor: {
+          slot: 10n,
+          transactionIndex: 0,
+          instructionIndex: 2,
+          innerInstructionIndex: null,
+        },
+        lastObservedCursor: {
+          slot: 10n,
+          transactionIndex: 0,
+          instructionIndex: 2,
+          innerInstructionIndex: null,
+        },
+      }),
+    }];
+    return [];
+  });
+  const repository = new PostgresApiProjectionRepository(
+    database,
+    () => detectedAt,
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE' },
+    { positions: 1, snapshots: 2 },
+  );
+
+  const holders = await repository.getLaunchHolders('mint-a');
+
+  assert.deepEqual(holders, {
+    status: 'AVAILABLE',
+    methodology: 'OBSERVED_BONDING_CURVE_TRADES',
+    creatorProfile: {
+      mint: 'mint-a', creator: 'creator', buyCount: 1, sellCount: 0,
+      totalBoughtBaseRaw: '10', totalSoldBaseRaw: '0', observedNetBaseRaw: '10',
+      hasSold: false, firstSell: null, initialBuys: [],
+      quoteFlows: [{
+        quoteAsset: { mint: 'sol', decimals: 9, tokenProgram: 'SPL_TOKEN' },
+        boughtQuoteRaw: '2', soldQuoteRaw: '0',
+      }],
+      uniqueExternalBuyers: 1, unknownTraderTradeCount: 0,
+    },
+    latestSnapshot: {
+      id: 'snapshot', inputFingerprint: 'fingerprint',
+      observedAt: detectedAt.toISOString(), confirmationStatus: 'confirmed',
+      cursor: {
+        slot: '10', transactionIndex: '0', instructionIndex: '2',
+        innerInstructionIndex: null,
+      },
+      totalPositiveNetBaseRaw: '10', top1Bps: '10000', top5Bps: '10000',
+      top10Bps: '10000', creatorBps: '0', uniqueKnownBuyers: 1,
+      uniqueExternalBuyers: 1, positivePositionCount: 1,
+      unknownTraderTradeCount: 0,
+    },
+    snapshots: [{
+      id: 'snapshot', inputFingerprint: 'fingerprint',
+      observedAt: detectedAt.toISOString(), confirmationStatus: 'confirmed',
+      cursor: {
+        slot: '10', transactionIndex: '0', instructionIndex: '2',
+        innerInstructionIndex: null,
+      },
+      totalPositiveNetBaseRaw: '10', top1Bps: '10000', top5Bps: '10000',
+      top10Bps: '10000', creatorBps: '0', uniqueKnownBuyers: 1,
+      uniqueExternalBuyers: 1, positivePositionCount: 1,
+      unknownTraderTradeCount: 0,
+    }],
+    positions: [{
+      wallet: 'buyer', isCreator: false, buyCount: 1, sellCount: 0,
+      boughtBaseRaw: '10', soldBaseRaw: '0', observedNetBaseRaw: '10',
+      quoteFlows: [],
+      firstObservedCursor: {
+        slot: '10', transactionIndex: '0', instructionIndex: '2',
+        innerInstructionIndex: null,
+      },
+      lastObservedCursor: {
+        slot: '10', transactionIndex: '0', instructionIndex: '2',
+        innerInstructionIndex: null,
+      },
+    }],
+    clusters: [],
+    clusterAnalysisStatus: 'NOT_AVAILABLE',
+  });
+  assert.deepEqual(
+    database.calls.find((call) => call.text.includes('FROM token_holders_snapshots'))?.values,
+    ['mint-a', 2],
+  );
+  assert.deepEqual(
+    database.calls.find((call) => call.text.includes('FROM observed_wallet_positions'))?.values,
+    ['mint-a', 1],
+  );
 });
 
 void test('orders domain events and explicit transitions by the complete cursor', async () => {
