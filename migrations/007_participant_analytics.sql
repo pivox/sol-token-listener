@@ -91,17 +91,13 @@ CREATE INDEX IF NOT EXISTS token_holders_snapshots_purge_idx
 DO $$
 DECLARE
   target_schema TEXT := current_schema();
+  target_table REGCLASS := to_regclass(format('%I.api_event_stream', current_schema()));
   existing_constraint TEXT;
 BEGIN
   FOR existing_constraint IN
     SELECT constraint_definition.conname
     FROM pg_constraint AS constraint_definition
-    JOIN pg_class AS constrained_table
-      ON constrained_table.oid = constraint_definition.conrelid
-    JOIN pg_namespace AS constrained_schema
-      ON constrained_schema.oid = constrained_table.relnamespace
-    WHERE constrained_schema.nspname = target_schema
-      AND constrained_table.relname = 'api_event_stream'
+    WHERE constraint_definition.conrelid = target_table
       AND constraint_definition.contype = 'c'
       AND pg_get_constraintdef(constraint_definition.oid) LIKE '%event_type%'
   LOOP

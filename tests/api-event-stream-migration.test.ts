@@ -143,6 +143,42 @@ void test('la purge retourne le compteur agrégé de l’outbox, pas le rowCount
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
 
+void test('la purge retire les projections participants expirées avant leurs événements', async () => {
+  const queries: string[] = [];
+  const client = {
+    query: async (text: string) => {
+      queries.push(text);
+      if (text.includes('WITH deleted AS')) {
+        return { rows: [{ deleted_count: '0' }], rowCount: 1 };
+      }
+      if (text.includes('DELETE FROM creator_profiles')) return { rows: [], rowCount: 1 };
+      if (text.includes('DELETE FROM observed_wallet_positions')) return { rows: [], rowCount: 2 };
+      if (text.includes('DELETE FROM token_holders_snapshots')) return { rows: [], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => undefined,
+  };
+  const pool = {
+    connect: async () => client,
+  } as unknown as InstanceType<typeof pg.Pool>;
+
+  const result = await purgeExpiredFoundationData(pool);
+
+  assert.equal(result.creatorProfiles, 1);
+  assert.equal(result.observedWalletPositions, 2);
+  assert.equal(result.holderSnapshots, 1);
+  const participantQueries = queries.filter((query) =>
+    /DELETE FROM (?:creator_profiles|observed_wallet_positions|token_holders_snapshots)/u.test(query));
+  assert.equal(participantQueries.length, 3);
+  for (const query of participantQueries) {
+    assert.match(query, /USING token_launches launch/u);
+    assert.match(query, /launch\.purge_after <= NOW\(\)/u);
+  }
+  const domainDeletion = queries.findIndex((query) =>
+    query.includes('DELETE FROM domain_events WHERE purge_after <= NOW()'));
+  assert.ok(domainDeletion > queries.findIndex((query) => query.includes('DELETE FROM creator_profiles')));
+});
+
 void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est configurée', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -184,7 +220,10 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
     ) VALUES ('backfill-live', 'TokenLaunchDetected', 'mint-live', 'listener', 'program-live',
       'backfill-signature', 41, 0, 0, 'processed', NOW(), 1, '{}'::jsonb,
       NOW(), NOW() + INTERVAL '1 hour')`);
-    assert.deepEqual(await migrateDatabase({ pool }), ['006_api_event_stream.sql']);
+    assert.deepEqual(await migrateDatabase({ pool }), [
+      '006_api_event_stream.sql',
+      '007_participant_analytics.sql',
+    ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(
       "SELECT 1 FROM api_event_stream WHERE domain_event_id = 'legacy-live'",

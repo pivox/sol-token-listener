@@ -56,10 +56,14 @@ lecture seule, avec huit routes JSON versionnées sous `/api/v1` et le flux SSE
 live, ni envoi de transaction. `observe` et `paper` restent les seuls modes.
 Raydium CPMM reste un adaptateur secondaire non composé dans ce bootstrap.
 
-Les projections sociales et holders ne sont pas encore produites : leurs
-routes répondent explicitement `NOT_AVAILABLE`, et non une conclusion sur les
-réseaux sociaux ou la concentration. L’API ne formule aucune garantie de
-profit, de même slot ou de sellabilité.
+La projection sociale n'est pas encore produite et répond explicitement
+`NOT_AVAILABLE`. I1 introduit une reconstruction passive des participants à
+partir des seuls trades Pump.fun persistés depuis la création. La route holders
+reste `NOT_AVAILABLE` avant reconstruction, puis expose le profil créateur,
+les positions nettes observées et la concentration top 1/5/10. Elle ne prétend
+pas être un état exhaustif des comptes token. Les funders et clusters restent
+`NOT_AVAILABLE` jusqu'à I2. L’API ne formule aucune garantie de profit, de
+même slot ou de sellabilité.
 
 ## Dépendances autorisées
 
@@ -91,6 +95,22 @@ bootstrap -> composition observation-only
 | `QualificationEngine` | scores configurables, blockers, verdict et preuves |
 | `PaperTradingEngine` | entrée/sortie simulées, frais, slippage et PnL estimé |
 | API HTTP/SSE | projections publiques V1, non authentifiées et en lecture seule |
+
+### Analytics participants I1
+
+`LaunchParticipantAnalyticsService` charge, sous verrou PostgreSQL par mint,
+la création et les trades de bonding curve non orphaned déjà persistés. Les
+analyseurs purs reconstruisent ensuite un profil créateur et une distribution
+des positions observées. L'empreinte des entrées rend les snapshots et
+événements dérivés déterministes et idempotents; toute écriture est atomique.
+
+Le périmètre commence à la détection du token. Aucun historique antérieur de
+créateur, appel RPC additionnel ou lecture exhaustive des comptes token n'est
+effectué. Les quotes restent séparées et tous les calculs financiers utilisent
+`bigint`; une position nette négative est une observation valide. La
+reconstruction n'est pas composée dans `src/app.ts` : le bootstrap public ne
+lance aucun traitement ni abonnement. Les funders communs, liens de wallets et
+clusters sont réservés à I2 et restent explicitement indisponibles.
 
 ## Contrats Solana
 
@@ -218,8 +238,10 @@ rétracte le pool et ses projections.
 Quand un lancement est terminal et qu’aucune position paper n’est ouverte,
 `terminal_at` est fixé et `purge_after = terminal_at + 4 heures`. Le purgeur ne
 supprime que les lignes arrivées à échéance, dans l’ordre des dépendances. Les
-preuves sociales V1 sont limitées aux contenus publics ; aucune API payante X
-ou Telegram n’est obligatoire.
+profils créateurs, positions observées et snapshots holders suivent la date du
+lancement parent et sont supprimés avant ses événements. Les preuves sociales
+V1 sont limitées aux contenus publics ; aucune API payante X ou Telegram n’est
+obligatoire.
 
 La PR H ajoute aussi un outbox SSE append-only. Chaque révision publique est
 persistée avant diffusion et reçoit un curseur de transport monotone, distinct
