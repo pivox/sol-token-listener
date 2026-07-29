@@ -339,7 +339,13 @@ void test('expose les profils et positions observés avec des limites SQL borné
     database,
     () => detectedAt,
     { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE' },
-    { positions: 1, snapshots: 2 },
+    {
+      positions: 1,
+      snapshots: 2,
+      clusters: 50,
+      clusterMembers: 50,
+      totalClusterMembers: 500,
+    },
   );
 
   const holders = await repository.getLaunchHolders('mint-a');
@@ -467,6 +473,187 @@ void test('utilise le snapshot de l’empreinte courante après orphaning', asyn
   assert.deepEqual(holders.snapshots.map((snapshot) => snapshot.id), ['stale', 'current']);
 });
 
+void test('exposes current clusters with per-cluster truncation and one shared member budget', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
+    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
+    if (call.text.includes('FROM observed_wallet_positions')) return [];
+    if (call.text.includes('FROM wallet_graph_profiles')) return [{
+      input_fingerprint: 'graph-current',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+    }];
+    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
+      input_fingerprint: 'graph-current',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+      coverage: graphCoverage(),
+      cluster_count: 3,
+    }];
+    if (call.text.includes('FROM wallet_clusters AS cluster')) return [
+      clusterRow('cluster-high', '9000', '3', 40),
+      clusterRow('cluster-low', '5000', '2'),
+      clusterRow('cluster-truncated', '1000', '2'),
+    ];
+    if (call.text.includes('WITH ranked_members AS')) return [
+      memberRow('cluster-high', 'buyer-a', '50'),
+      memberRow('cluster-high', 'buyer-b', '25'),
+      memberRow('cluster-low', 'buyer-c', '10'),
+    ];
+    return [];
+  });
+  const repository = new PostgresApiProjectionRepository(
+    database,
+    () => detectedAt,
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE' },
+    {
+      positions: 1,
+      snapshots: 1,
+      clusters: 2,
+      clusterMembers: 2,
+      totalClusterMembers: 3,
+    },
+  );
+
+  const holders = await repository.getLaunchHolders('mint-a');
+
+  assert.equal(holders?.status, 'AVAILABLE');
+  if (holders?.status !== 'AVAILABLE') return;
+  assert.equal(holders.clusterAnalysisStatus, 'AVAILABLE');
+  if (holders.clusterAnalysisStatus !== 'AVAILABLE') return;
+  assert.equal(holders.clusterCount, 3);
+  assert.equal(holders.clustersTruncated, true);
+  assert.deepEqual(holders.clusters.map((cluster) => cluster.id), [
+    'cluster-high',
+    'cluster-low',
+  ]);
+  assert.deepEqual(holders.clusters.map((cluster) => cluster.members.length), [2, 1]);
+  assert.equal(holders.clusters[0]?.quoteAssets.length, 8);
+  assert.equal(holders.clusters[0]?.quoteAssetCount, 40);
+  assert.equal(holders.clusters[0]?.quoteAssetsTruncated, true);
+  assert.deepEqual(holders.clusters.map((cluster) => cluster.membersTruncated), [
+    true,
+    true,
+  ]);
+  assert.equal(
+    holders.clusters.reduce((count, cluster) => count + cluster.members.length, 0),
+    3,
+  );
+  assert.deepEqual(
+    database.calls.find((call) =>
+      call.text.includes('FROM wallet_clusters AS cluster'))?.values,
+    ['mint-a', 'graph-current', 3],
+  );
+  assert.deepEqual(
+    database.calls.find((call) =>
+      call.text.includes('WITH ranked_members AS'))?.values,
+    ['mint-a', 'graph-current', ['cluster-high', 'cluster-low'], 2, 3],
+  );
+  assert.equal(database.calls.some((call) =>
+    call.text.includes('FROM wallet_relationships')), false);
+});
+
+void test('distinguishes a successful zero-cluster analysis from unavailable graph data', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
+    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
+    if (call.text.includes('FROM observed_wallet_positions')) return [];
+    if (call.text.includes('FROM wallet_graph_profiles')) return [{
+      input_fingerprint: 'graph-empty',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+    }];
+    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
+      input_fingerprint: 'graph-empty',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+      coverage: graphCoverage(),
+      cluster_count: 0,
+    }];
+    return [];
+  });
+  const holders = await new PostgresApiProjectionRepository(database)
+    .getLaunchHolders('mint-a');
+  assert.equal(holders?.status, 'AVAILABLE');
+  if (holders?.status !== 'AVAILABLE') return;
+  assert.equal(holders.clusterAnalysisStatus, 'AVAILABLE');
+  if (holders.clusterAnalysisStatus !== 'AVAILABLE') return;
+  assert.deepEqual(holders.clusters, []);
+  assert.equal(holders.clusterCount, 0);
+  assert.equal(holders.clustersTruncated, false);
+});
+
+void test('shares one bounded quote-asset budget across emitted clusters', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
+    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
+    if (call.text.includes('FROM observed_wallet_positions')) return [];
+    if (call.text.includes('FROM wallet_graph_profiles')) return [{
+      input_fingerprint: 'graph-quotes',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+    }];
+    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
+      input_fingerprint: 'graph-quotes',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+      coverage: graphCoverage(),
+      cluster_count: 9,
+    }];
+    if (call.text.includes('FROM wallet_clusters AS cluster')) {
+      return Array.from({ length: 9 }, (_, index) =>
+        clusterRow(`cluster-${index}`, '1000', '0', 40));
+    }
+    if (call.text.includes('WITH ranked_members AS')) return [];
+    return [];
+  });
+  const repository = new PostgresApiProjectionRepository(
+    database,
+    () => detectedAt,
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE' },
+    {
+      positions: 1,
+      snapshots: 1,
+      clusters: 9,
+      clusterMembers: 1,
+      totalClusterMembers: 1,
+    },
+  );
+
+  const holders = await repository.getLaunchHolders('mint-a');
+
+  assert.equal(holders?.status, 'AVAILABLE');
+  if (holders?.status !== 'AVAILABLE'
+    || holders.clusterAnalysisStatus !== 'AVAILABLE') return;
+  assert.equal(holders.clusters.reduce(
+    (count, cluster) => count + cluster.quoteAssets.length,
+    0,
+  ), 64);
+  assert.equal(holders.clusters[8]?.quoteAssets.length, 0);
+  assert.equal(holders.clusters[8]?.quoteAssetsTruncated, true);
+});
+
+void test('rejects a graph snapshot whose current cluster rows are incomplete', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM creator_profiles')) return [creatorProfileRow()];
+    if (call.text.includes('FROM token_holders_snapshots')) return [holderSnapshotRow()];
+    if (call.text.includes('FROM wallet_graph_profiles')) return [{
+      input_fingerprint: 'graph-incomplete',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+    }];
+    if (call.text.includes('FROM wallet_graph_snapshots')) return [{
+      input_fingerprint: 'graph-incomplete',
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+      coverage: graphCoverage(),
+      cluster_count: 1,
+    }];
+    return [];
+  });
+
+  await assert.rejects(
+    new PostgresApiProjectionRepository(database).getLaunchHolders('mint-a'),
+    ApiProjectionDataError,
+  );
+});
+
 void test('orders domain events and explicit transitions by the complete cursor', async () => {
   const database = new FakeQueryable((call) => {
     if (
@@ -510,6 +697,110 @@ void test('orders domain events and explicit transitions by the complete cursor'
   assert.equal(Object.isFrozen(entries[0]?.payload ?? {}), true);
   assert.equal(page.nextCursor, null);
 });
+
+function creatorProfileRow(): Record<string, unknown> {
+  return {
+    payload: toJsonValue({
+      mint: 'mint-a',
+      creator: 'creator',
+      payloadVersion: 1,
+      inputFingerprint: 'holder-current',
+      buyCount: 0,
+      sellCount: 0,
+      totalBoughtBaseRaw: 0n,
+      totalSoldBaseRaw: 0n,
+      observedNetBaseRaw: 0n,
+      hasSold: false,
+      firstSell: null,
+      initialBuys: [],
+      quoteFlows: [],
+      uniqueExternalBuyers: 0,
+      unknownTraderTradeCount: 0,
+    }),
+  };
+}
+
+function holderSnapshotRow(): Record<string, unknown> {
+  return {
+    snapshot_id: 'holder-current',
+    input_fingerprint: 'holder-current',
+    observed_at: detectedAt,
+    confirmation_status: 'confirmed',
+    as_of_slot: '10',
+    as_of_transaction_index: 0,
+    as_of_instruction_index: 1,
+    as_of_inner_instruction_index: null,
+    total_positive_net_base_raw: '0',
+    top1_bps: '0',
+    top5_bps: '0',
+    top10_bps: '0',
+    creator_bps: '0',
+    unique_known_buyers: 0,
+    unique_external_buyers: 0,
+    positive_position_count: 0,
+    unknown_trader_trade_count: 0,
+  };
+}
+
+function graphCoverage(): Record<string, number> {
+  return {
+    knownBuyCount: 3,
+    knownBuyerCount: 3,
+    strongEvidenceBuyCount: 2,
+    strongEvidenceBuyerCount: 2,
+    mediumOnlyBuyCount: 0,
+    mediumOnlyBuyerCount: 0,
+    noEvidenceBuyCount: 0,
+    noEvidenceBuyerCount: 0,
+    unavailableBuyCount: 0,
+    unavailableBuyerCount: 0,
+    notProcessedBuyCount: 1,
+    notProcessedBuyerCount: 1,
+    analyzedTransactionCount: 2,
+    evidenceCount: 2,
+  };
+}
+
+function clusterRow(
+  clusterId: string,
+  concentrationBps: string,
+  memberCount: string,
+  quoteAssetCount = 1,
+): Record<string, unknown> {
+  return {
+    cluster_id: clusterId,
+    quote_assets: Array.from({ length: quoteAssetCount }, (_, index) => ({
+      mint: `quote-mint-${index.toString().padStart(3, '0')}`,
+      decimals: 9,
+      tokenProgram: 'SPL_TOKEN',
+    })),
+    participant_wallet_count: 2,
+    auxiliary_wallet_count: 1,
+    positive_holder_count: 2,
+    observed_positive_base_raw: '75',
+    concentration_bps: concentrationBps,
+    contains_creator: false,
+    shared_funder_count: 1,
+    strong_relationship_count: 2,
+    strong_evidence_count: 2,
+    member_count: memberCount,
+  };
+}
+
+function memberRow(
+  clusterId: string,
+  wallet: string,
+  observedNetBaseRaw: string,
+): Record<string, unknown> {
+  return {
+    cluster_id: clusterId,
+    wallet,
+    member_role: 'PARTICIPANT',
+    is_creator: false,
+    observed_net_base_raw: observedNetBaseRaw,
+    member_rank: '1',
+  };
+}
 
 void test('wraps invalid timeline payload conversion in a safe projection error', async () => {
   const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{

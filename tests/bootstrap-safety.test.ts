@@ -13,6 +13,8 @@ const FORBIDDEN_IMPORTS = [
   'execution/transaction-confirmer',
   'execution/trade-executor',
   'dex/raydium-cpmm/transaction-builder',
+  'WalletEvidenceObservationService',
+  'WalletGraphRebuildService',
 ] as const;
 
 void test('le bootstrap V1 ne dépend d’aucun composant de signature ou envoi', async () => {
@@ -63,6 +65,9 @@ void test('le bootstrap API partage le pool puis ferme le serveur avant la base'
       assert.deepEqual(holderLimits, {
         positions: config.apiHolderPositionLimit,
         snapshots: config.apiHolderSnapshotLimit,
+        clusters: config.apiWalletClusterLimit,
+        clusterMembers: config.apiWalletClusterMemberLimit,
+        totalClusterMembers: config.apiWalletClusterTotalMemberLimit,
       });
       calls.push('projections');
       return {} as ApiProjectionRepository;
