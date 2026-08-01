@@ -41,17 +41,16 @@ export abstract class TransactionLocatorError extends Error {
   ) {
     super('Solana transaction location failed.');
     this.name = 'TransactionLocatorError';
-    trustedTransactionLocatorErrors.set(this, fixedLocatorFailure(code));
   }
 }
 
 export function trustedTransactionLocatorFailure(
   value: unknown,
 ): IngestionFailure | null {
-  return typeof value === 'object'
-    && value !== null
-    ? trustedTransactionLocatorErrors.get(value) ?? null
-    : null;
+  if (typeof value !== 'object' || value === null) return null;
+  const failure = trustedTransactionLocatorErrors.get(value) ?? null;
+  if (failure !== null) trustedTransactionLocatorErrors.delete(value);
+  return failure;
 }
 
 export class RpcTransientError extends TransactionLocatorError {
@@ -94,25 +93,27 @@ export class SolanaTransactionLocator {
 
   public async locate(target: TransactionLocationTarget): Promise<NormalizedTransaction> {
     const response = await this.fetchTransaction(target);
-    if (response === null) throw new TransactionUnavailableError();
+    if (response === null) throw internalLocatorError(new TransactionUnavailableError());
 
     const rawSignatures = await this.fetchBlockSignatures(target);
-    if (rawSignatures === null) throw new BlockUnavailableError();
+    if (rawSignatures === null) throw internalLocatorError(new BlockUnavailableError());
     const signatures = snapshotBlockSignatures(rawSignatures, target.signature);
     const transactionIndex = uniqueSignatureIndex(signatures, target.signature);
-    if (transactionIndex === null) throw new TransactionIndexNotFoundError();
+    if (transactionIndex === null) throw internalLocatorError(new TransactionIndexNotFoundError());
     const rawSlot = readCanonicalRawSlot(response);
-    if (rawSlot === null) throw new TransactionNormalizationError();
+    if (rawSlot === null) throw internalLocatorError(new TransactionNormalizationError());
 
     let normalized: NormalizedTransaction;
     try {
       normalized = normalizeTransaction(response, target.confirmationStatus, transactionIndex);
     } catch {
-      throw new TransactionNormalizationError();
+      throw internalLocatorError(new TransactionNormalizationError());
     }
-    if (normalized.slot !== BigInt(rawSlot)) throw new TransactionNormalizationError();
+    if (normalized.slot !== BigInt(rawSlot)) {
+      throw internalLocatorError(new TransactionNormalizationError());
+    }
     if (normalized.signature !== target.signature || normalized.slot !== target.slot) {
-      throw new TransactionIndexNotFoundError();
+      throw internalLocatorError(new TransactionIndexNotFoundError());
     }
     return normalized;
   }
@@ -123,7 +124,7 @@ export class SolanaTransactionLocator {
     try {
       return await this.rpc.getTransaction(target.signature, target.confirmationStatus);
     } catch {
-      throw new RpcTransientError();
+      throw internalLocatorError(new RpcTransientError());
     }
   }
 
@@ -133,7 +134,7 @@ export class SolanaTransactionLocator {
     try {
       return await this.rpc.getBlockSignatures(target.slot, target.confirmationStatus);
     } catch {
-      throw new RpcTransientError();
+      throw internalLocatorError(new RpcTransientError());
     }
   }
 }
@@ -157,6 +158,11 @@ function fixedLocatorFailure(code: TransactionIngestionErrorCode): IngestionFail
         code: 'RPC_TRANSIENT', errorName: 'TransactionLocatorError', retryable: true,
       });
   }
+}
+
+function internalLocatorError<TError extends TransactionLocatorError>(error: TError): TError {
+  trustedTransactionLocatorErrors.set(error, fixedLocatorFailure(error.code));
+  return error;
 }
 
 function readCanonicalRawSlot(response: VersionedTransactionResponse): number | null {
@@ -190,10 +196,12 @@ function snapshotBlockSignatures(
   try {
     result = inspectBlockSignatures(value, target);
   } catch {
-    throw new BlockUnavailableError();
+    throw internalLocatorError(new BlockUnavailableError());
   }
-  if (result.kind === 'target-duplicate') throw new TransactionIndexNotFoundError();
-  if (result.kind === 'invalid') throw new BlockUnavailableError();
+  if (result.kind === 'target-duplicate') {
+    throw internalLocatorError(new TransactionIndexNotFoundError());
+  }
+  if (result.kind === 'invalid') throw internalLocatorError(new BlockUnavailableError());
   return result.signatures;
 }
 

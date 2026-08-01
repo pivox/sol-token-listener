@@ -14,6 +14,8 @@ import {
 import {
   RpcTransientError,
   TransactionIndexNotFoundError,
+  TransactionLocator,
+  TransactionLocatorError,
   type TransactionLocationTarget,
 } from '../src/solana/rpc/transaction-locator.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
@@ -102,23 +104,52 @@ void test('promotes a lagging fresh locator response to claim finality before pi
   assert.equal(markedStatus, 'confirmed');
 });
 
-void test('preserves trusted locator failure classification and redacts arbitrary failures', async () => {
-  const mutated = new RpcTransientError();
-  Object.assign(mutated, { code: 'SECRET_CODE', retryable: false, name: 'SecretName' });
+void test('trusts only consumed internal locator failures and redacts public constructions', async () => {
+  const internalLocator = new TransactionLocator({
+    async getTransaction() { return null; },
+    async getBlockSignatures() { return null; },
+  });
+  let consumedInternal: unknown;
+  const internal = {
+    async locate(target: TransactionLocationTarget) {
+      try {
+        return await internalLocator.locate(target);
+      } catch (error) {
+        consumedInternal = error;
+        Object.assign(error as object, {
+          code: 'SECRET_CODE', retryable: false, name: 'SecretName',
+        });
+        throw error;
+      }
+    },
+  };
+  class ExternalLocatorError extends TransactionLocatorError {
+    public constructor() { super('TRANSACTION_INDEX_NOT_FOUND', false); }
+  }
   for (const scenario of [
-    { error: new RpcTransientError(), failure: failure('RPC_TRANSIENT', 'RpcTransientError', true) },
-    { error: new TransactionIndexNotFoundError(), failure: failure('TRANSACTION_INDEX_NOT_FOUND', 'TransactionIndexNotFoundError', false) },
-    { error: mutated, failure: failure('RPC_TRANSIENT', 'RpcTransientError', true) },
+    { locator: internal, failure: failure('TRANSACTION_NOT_AVAILABLE', 'TransactionUnavailableError', true) },
+    { locator: { async locate() { throw new RpcTransientError(); } }, failure: failure('RPC_TRANSIENT', 'TransactionLocatorError', true) },
+    { locator: { async locate() { throw new TransactionIndexNotFoundError(); } }, failure: failure('RPC_TRANSIENT', 'TransactionLocatorError', true) },
+    { locator: { async locate() { throw new ExternalLocatorError(); } }, failure: failure('RPC_TRANSIENT', 'TransactionLocatorError', true) },
+    { locator: { async locate() { throw Object.create(TransactionIndexNotFoundError.prototype); } }, failure: failure('RPC_TRANSIENT', 'TransactionLocatorError', true) },
   ]) {
     let marked: IngestionFailure | null = null;
     const worker = new TransactionInboxWorker(repositoryWith({
       async claim() { return claim(); },
       async markFailed(_signature, _token, value) { marked = value; },
-    }), { async locate() { throw scenario.error; } }, pipeline(), options());
+    }), scenario.locator, pipeline(), options());
     assert.deepEqual(await worker.runOnce(), { kind: 'failed', signature: 'sig', failure: scenario.failure });
     assert.deepEqual(marked, scenario.failure);
     assert.ok(Object.isFrozen(marked));
   }
+  assert.ok(consumedInternal);
+  let replayed: IngestionFailure | null = null;
+  const replayWorker = new TransactionInboxWorker(repositoryWith({
+    async claim() { return claim(); },
+    async markFailed(_signature, _token, value) { replayed = value; },
+  }), { async locate() { throw consumedInternal; } }, pipeline(), options());
+  await replayWorker.runOnce();
+  assert.deepEqual(replayed, failure('RPC_TRANSIENT', 'TransactionLocatorError', true));
 
   let traps = 0;
   const hostile = new Proxy(new Error('hidden'), { get() { traps += 1; throw new Error('secret'); }, getPrototypeOf() { traps += 1; throw new Error('secret'); } });
@@ -272,6 +303,46 @@ void test('start idles without a busy loop and concurrent close cancels wait', a
   assert.deepEqual(await worker.runOnce(), { kind: 'closed' });
 });
 
+void test('settles a one-shot idle scheduler setup failure and restarts after recovery', async () => {
+  let scheduleAttempts = 0;
+  const scheduled = new Set<object>();
+  const scheduler: TransactionInboxWorkerScheduler = {
+    schedule() {
+      scheduleAttempts += 1;
+      if (scheduleAttempts === 1) throw new Error('one shot secret');
+      const handle = {};
+      scheduled.add(handle);
+      return handle;
+    },
+    cancel(handle) { scheduled.delete(handle as object); },
+  };
+  let claims = 0;
+  let processed = 0;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() {
+      claims += 1;
+      if (claims === 1 || claims >= 3) return null;
+      return claim('recovered');
+    },
+  }), { async locate(target) { return normalized(target.signature); } }, {
+    async process() { processed += 1; },
+  }, options({ scheduler }));
+
+  await worker.start();
+  await eventually(() => worker.state === 'DEGRADED' && claims === 1);
+  await Promise.resolve();
+  await worker.start();
+  await eventually(() => processed === 1 && scheduled.size === 1);
+  await Promise.race([
+    worker.close(),
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(() => { reject(new Error('close timed out')); }, 250).unref();
+    }),
+  ]);
+  assert.equal(worker.state, 'STOPPED');
+  assert.equal(scheduled.size, 0);
+});
+
 void test('close waits for in-flight pipeline and markProcessed failures degrade safely', async () => {
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
@@ -394,4 +465,12 @@ class ManualScheduler implements TransactionInboxWorkerScheduler {
     await Promise.resolve();
     await Promise.resolve();
   }
+}
+
+async function eventually(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return;
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+  }
+  assert.fail('condition was not reached');
 }

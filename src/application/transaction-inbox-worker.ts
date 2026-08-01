@@ -90,7 +90,7 @@ export class TransactionInboxWorker {
   private loopPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
   private idleHandle: unknown = null;
-  private idleResolve: (() => void) | null = null;
+  private idleResolve: ((scheduled: boolean) => void) | null = null;
   private permanentlyClosed = false;
   private degraded = false;
   private unresolvedResource = false;
@@ -163,10 +163,10 @@ export class TransactionInboxWorker {
       try {
         const result = await this.runOnce();
         if (this.isClosed()) break;
-        if (result.kind === 'idle') await this.waitForIdlePoll();
+        if (result.kind === 'idle' && !await this.waitForIdlePoll()) return;
       } catch {
         this.reportDegraded();
-        if (!this.isClosed()) await this.waitForIdlePoll();
+        if (!this.isClosed() && !await this.waitForIdlePoll()) return;
       }
     }
   }
@@ -331,19 +331,21 @@ export class TransactionInboxWorker {
     return value;
   }
 
-  private waitForIdlePoll(): Promise<void> {
-    if (this.permanentlyClosed) return Promise.resolve();
+  private waitForIdlePoll(): Promise<boolean> {
+    if (this.permanentlyClosed) return Promise.resolve(false);
     return new Promise((resolve) => {
       this.idleResolve = resolve;
       try {
         this.idleHandle = this.scheduler.schedule(() => {
           this.idleHandle = null;
           this.idleResolve = null;
-          resolve();
+          resolve(true);
         }, this.idlePollMs);
       } catch {
         this.idleHandle = null;
+        this.idleResolve = null;
         this.reportDegraded();
+        resolve(false);
       }
     });
   }
@@ -359,7 +361,7 @@ export class TransactionInboxWorker {
     this.idleHandle = null;
     const resolve = this.idleResolve;
     this.idleResolve = null;
-    resolve?.();
+    resolve?.(false);
   }
 
   private reportDegraded(): void {
