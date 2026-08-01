@@ -6,6 +6,11 @@ import {
 } from '@solana/web3.js';
 import {
   LISTENER_RUNTIME_STATES,
+  MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH,
+  MAX_TRANSACTION_SNAPSHOT_DEPTH,
+  MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES,
+  MAX_TRANSACTION_SNAPSHOT_NODES,
+  MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH,
   TRANSACTION_INBOX_STATUSES,
   assertValidClaimedTransaction,
   assertValidFinalityCandidate,
@@ -325,6 +330,81 @@ void test('rejects malformed and non-canonical durable instruction base64 direct
   }
 });
 
+void test('accepts exact durable depth and rejects boundary plus one', () => {
+  assert.doesNotThrow(() => createDurableTransactionSnapshot(normalizedTransaction({
+    error: nestedError(MAX_TRANSACTION_SNAPSHOT_DEPTH - 1),
+  })));
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({
+      error: nestedError(MAX_TRANSACTION_SNAPSHOT_DEPTH),
+    })),
+    /maximum depth/u,
+  );
+});
+
+void test('accepts exact durable node budget and rejects one additional entry', () => {
+  assert.doesNotThrow(() => createDurableTransactionSnapshot(normalizedTransaction({
+    error: nodeBudgetError(0),
+  })));
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({
+      error: nodeBudgetError(1),
+    })),
+    /maximum node/u,
+  );
+});
+
+void test('accepts exact durable array and string limits and rejects boundary plus one', () => {
+  assert.doesNotThrow(() => createDurableTransactionSnapshot(normalizedTransaction({
+    error: Object.freeze(new Array<null>(MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH).fill(null)),
+  })));
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({
+      error: Object.freeze(new Array<null>(MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH + 1).fill(null)),
+    })),
+    /maximum array length/u,
+  );
+  assert.doesNotThrow(() => createDurableTransactionSnapshot(normalizedTransaction({
+    error: 'x'.repeat(MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH),
+  })));
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({
+      error: 'x'.repeat(MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH + 1),
+    })),
+    /maximum string length/u,
+  );
+});
+
+void test('accepts exact decoded instruction byte limit and rejects boundary plus one', () => {
+  const exact = createDurableTransactionSnapshot(normalizedTransaction({
+    instructionData: new Uint8Array(MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES),
+  }));
+  assert.equal(
+    restoreNormalizedTransactionSnapshot(exact).instructions[0]?.data.byteLength,
+    MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES,
+  );
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({
+      instructionData: new Uint8Array(MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES + 1),
+    })),
+    /maximum instruction bytes/u,
+  );
+});
+
+void test('rejects very deep acyclic and cyclic error payloads with bounded TypeErrors', () => {
+  const deep = nestedError(10_000);
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({ error: deep })),
+    (error: unknown) => error instanceof TypeError && error.message.includes('maximum depth'),
+  );
+  const cycle: unknown[] = [];
+  cycle.push(cycle);
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({ error: cycle })),
+    (error: unknown) => error instanceof TypeError && error.message.includes('cycle'),
+  );
+});
+
 void test('rejects mutable contracts, number slots and non-integer millisecond times', () => {
   const notification = Object.freeze({
     signature: 'signature',
@@ -504,4 +584,27 @@ function rpcResponseWithoutTokenProgram(): VersionedTransactionResponse {
       rewards: [],
     },
   } as unknown as VersionedTransactionResponse;
+}
+
+function nestedError(depth: number): unknown {
+  let value: unknown = null;
+  for (let index = 0; index < depth; index += 1) value = Object.freeze([value]);
+  return value;
+}
+
+function nodeBudgetError(additionalEntries: number): unknown {
+  const canonicalNodesOutsideError = 47;
+  const containerNodes = 4;
+  const entryCount = MAX_TRANSACTION_SNAPSHOT_NODES
+    - canonicalNodesOutsideError
+    - containerNodes
+    + additionalEntries;
+  const firstLength = MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH;
+  const secondLength = MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH;
+  const thirdLength = entryCount - firstLength - secondLength;
+  return Object.freeze({
+    first: Object.freeze(new Array<null>(firstLength).fill(null)),
+    second: Object.freeze(new Array<null>(secondLength).fill(null)),
+    third: Object.freeze(new Array<null>(thirdLength).fill(null)),
+  });
 }

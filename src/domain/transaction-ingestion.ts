@@ -3,6 +3,12 @@ import { reconcileConfirmationStatus } from './confirmation-status.js';
 import { assertValidChainCursor, assertValidTransactionCursor } from './cursor.js';
 import type { ChainConfirmationStatus } from './types.js';
 
+export const MAX_TRANSACTION_SNAPSHOT_DEPTH = 64;
+export const MAX_TRANSACTION_SNAPSHOT_NODES = 10_000;
+export const MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH = 4_096;
+export const MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH = 16_384;
+export const MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES = 1_232;
+
 export const TRANSACTION_INBOX_STATUSES = Object.freeze([
   'PENDING',
   'PROCESSING',
@@ -163,6 +169,7 @@ export function createDurableTransactionSnapshot(
     if (!(instruction.data instanceof Uint8Array)) {
       throw new TypeError(`Normalized transaction instructions[${index}].data must be Uint8Array.`);
     }
+    assertInstructionByteLength(instruction.data.byteLength);
     return Object.freeze({
       programId: instruction.programId,
       accounts: Object.freeze([...instruction.accounts]),
@@ -644,8 +651,20 @@ function assertDeepFrozenData(value: unknown, name: string): void {
 
 function assertCanonicalBase64(value: unknown, name: string): asserts value is string {
   assertString(value, name);
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)) {
+    throw new TypeError(`${name} must be canonical base64.`);
+  }
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  const decodedLength = (value.length / 4 * 3) - padding;
+  assertInstructionByteLength(decodedLength);
   if (Buffer.from(value, 'base64').toString('base64') !== value) {
     throw new TypeError(`${name} must be canonical base64.`);
+  }
+}
+
+function assertInstructionByteLength(value: number): void {
+  if (value > MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES) {
+    throw new TypeError('Durable transaction snapshot exceeds maximum instruction bytes.');
   }
 }
 
@@ -657,42 +676,60 @@ function snapshotSafeDurableData(
   value: unknown,
   name: string,
   requireFrozen: boolean,
-  ancestors = new WeakSet(),
+  state: DurableSnapshotState = { ancestors: new WeakSet(), nodes: 0 },
+  depth = 0,
 ): DurableSnapshotValue {
+  if (depth > MAX_TRANSACTION_SNAPSHOT_DEPTH) {
+    throw new TypeError('Durable transaction snapshot exceeds maximum depth.');
+  }
+  state.nodes += 1;
+  if (state.nodes > MAX_TRANSACTION_SNAPSHOT_NODES) {
+    throw new TypeError('Durable transaction snapshot exceeds maximum node count.');
+  }
   if (
     value === null
-    || typeof value === 'string'
     || typeof value === 'boolean'
     || typeof value === 'bigint'
   ) return value;
+  if (typeof value === 'string') {
+    if (value.length > MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH) {
+      throw new TypeError(`${name} exceeds maximum string length.`);
+    }
+    return value;
+  }
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new TypeError(`${name} number must be finite.`);
     return value;
   }
   if (typeof value !== 'object') throw new TypeError(`${name} must be durable data.`);
   if (requireFrozen && !Object.isFrozen(value)) throw new TypeError(`${name} must be frozen.`);
-  if (ancestors.has(value)) throw new TypeError(`${name} must not contain cycles.`);
-  ancestors.add(value);
+  if (state.ancestors.has(value)) throw new TypeError(`${name} must not contain cycles.`);
+  state.ancestors.add(value);
   try {
     if (Array.isArray(value)) {
-      return snapshotSafeDurableArray(value, name, requireFrozen, ancestors);
+      return snapshotSafeDurableArray(value, name, requireFrozen, state, depth);
     }
-    return snapshotSafeDurableRecord(value, name, requireFrozen, ancestors);
+    return snapshotSafeDurableRecord(value, name, requireFrozen, state, depth);
   } finally {
-    ancestors.delete(value);
+    state.ancestors.delete(value);
   }
+}
+
+interface DurableSnapshotState {
+  readonly ancestors: WeakSet<object>;
+  nodes: number;
 }
 
 function snapshotSafeDurableArray(
   value: unknown[],
   name: string,
   requireFrozen: boolean,
-  ancestors: WeakSet<object>,
+  state: DurableSnapshotState,
+  depth: number,
 ): readonly DurableSnapshotValue[] {
   if (Reflect.getPrototypeOf(value) !== Array.prototype) {
     throw new TypeError(`${name} array prototype is invalid.`);
   }
-  const descriptors = Object.getOwnPropertyDescriptors(value);
   const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
   if (lengthDescriptor === undefined || !('value' in lengthDescriptor)) {
     throw new TypeError(`${name} array length must be a data property.`);
@@ -701,18 +738,25 @@ function snapshotSafeDurableArray(
   if (!Number.isSafeInteger(length) || (length as number) < 0) {
     throw new TypeError(`${name} array length is invalid.`);
   }
-  for (const key of Reflect.ownKeys(value)) {
+  if ((length as number) > MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH) {
+    throw new TypeError(`${name} exceeds maximum array length.`);
+  }
+  if (state.nodes + (length as number) > MAX_TRANSACTION_SNAPSHOT_NODES) {
+    throw new TypeError('Durable transaction snapshot exceeds maximum node count.');
+  }
+  const keys = Reflect.ownKeys(value);
+  for (const key of keys) {
     if (typeof key === 'symbol') throw new TypeError(`${name} array must not have symbol properties.`);
     if (key === 'length') continue;
     if (!isCanonicalArrayIndex(key)) throw new TypeError(`${name} array has a custom property.`);
-    const descriptor = descriptors[key];
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
       throw new TypeError(`${name}[${key}] must be an enumerable data property, not an accessor.`);
     }
   }
   const snapshot = new Array<DurableSnapshotValue>(length as number);
   for (let index = 0; index < snapshot.length; index += 1) {
-    const descriptor = descriptors[String(index)];
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
     if (descriptor === undefined) throw new TypeError(`${name} array must not be sparse.`);
     if (!descriptor.enumerable || !('value' in descriptor)) {
       throw new TypeError(`${name}[${index}] must be an enumerable data property, not an accessor.`);
@@ -722,7 +766,8 @@ function snapshotSafeDurableArray(
         descriptor.value,
         `${name}[${index}]`,
         requireFrozen,
-        ancestors,
+        state,
+        depth + 1,
       ),
       enumerable: true,
       configurable: true,
@@ -736,14 +781,19 @@ function snapshotSafeDurableRecord(
   value: object,
   name: string,
   requireFrozen: boolean,
-  ancestors: WeakSet<object>,
+  state: DurableSnapshotState,
+  depth: number,
 ): DurableSnapshotObject {
   const prototype = Reflect.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) {
     throw new TypeError(`${name} must use a plain or null prototype.`);
   }
+  const keys = Reflect.ownKeys(value);
+  if (state.nodes + keys.length > MAX_TRANSACTION_SNAPSHOT_NODES) {
+    throw new TypeError('Durable transaction snapshot exceeds maximum node count.');
+  }
   const snapshot = Object.create(prototype) as Record<string, DurableSnapshotValue>;
-  for (const key of Reflect.ownKeys(value)) {
+  for (const key of keys) {
     if (typeof key === 'symbol') throw new TypeError(`${name} must not have symbol properties.`);
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
@@ -754,7 +804,8 @@ function snapshotSafeDurableRecord(
         descriptor.value,
         `${name}.${key}`,
         requireFrozen,
-        ancestors,
+        state,
+        depth + 1,
       ),
       enumerable: true,
       configurable: false,
