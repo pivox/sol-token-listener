@@ -192,24 +192,23 @@ export function createDurableTransactionSnapshot(
     logs: Object.freeze([...transaction.logs]),
     error: freezeDurableSnapshotValue(transaction.error),
   });
-  assertValidDurableNormalizedTransaction(snapshot);
-  return snapshot;
+  return readValidDurableNormalizedTransaction(snapshot);
 }
 
 export function restoreNormalizedTransactionSnapshot(
   snapshot: DurableNormalizedTransaction,
 ): NormalizedTransaction {
-  assertValidDurableNormalizedTransaction(snapshot);
+  const validated = readValidDurableNormalizedTransaction(snapshot);
   return {
-    signature: snapshot.signature,
-    slot: snapshot.slot,
-    transactionIndex: snapshot.transactionIndex,
-    confirmationStatus: snapshot.confirmationStatus,
-    version: snapshot.version,
-    blockTimeMs: snapshot.blockTimeMs,
-    accountKeys: [...snapshot.accountKeys],
-    signerKeys: [...snapshot.signerKeys],
-    instructions: snapshot.instructions.map((instruction) => ({
+    signature: validated.signature,
+    slot: validated.slot,
+    transactionIndex: validated.transactionIndex,
+    confirmationStatus: validated.confirmationStatus,
+    version: validated.version,
+    blockTimeMs: validated.blockTimeMs,
+    accountKeys: [...validated.accountKeys],
+    signerKeys: [...validated.signerKeys],
+    instructions: validated.instructions.map((instruction) => ({
       programId: instruction.programId,
       accounts: [...instruction.accounts],
       data: Uint8Array.from(Buffer.from(instruction.dataBase64, 'base64')),
@@ -218,14 +217,14 @@ export function restoreNormalizedTransactionSnapshot(
       parentInstructionIndex: instruction.parentInstructionIndex,
       stackHeight: instruction.stackHeight,
     })),
-    preTokenBalances: snapshot.preTokenBalances.map((balance) => ({ ...balance })),
-    postTokenBalances: snapshot.postTokenBalances.map((balance) => ({ ...balance })),
-    preBalancesLamports: [...snapshot.preBalancesLamports],
-    postBalancesLamports: [...snapshot.postBalancesLamports],
-    feeLamports: snapshot.feeLamports,
-    computeUnits: snapshot.computeUnits,
-    logs: [...snapshot.logs],
-    error: restoreDurableSnapshotValue(snapshot.error),
+    preTokenBalances: validated.preTokenBalances.map((balance) => ({ ...balance })),
+    postTokenBalances: validated.postTokenBalances.map((balance) => ({ ...balance })),
+    preBalancesLamports: [...validated.preBalancesLamports],
+    postBalancesLamports: [...validated.postBalancesLamports],
+    feeLamports: validated.feeLamports,
+    computeUnits: validated.computeUnits,
+    logs: [...validated.logs],
+    error: restoreDurableSnapshotValue(validated.error),
   };
 }
 
@@ -257,15 +256,15 @@ export function assertValidClaimedTransaction(
   assertText(record.leaseToken, 'Claimed transaction leaseToken');
   assertMilliseconds(record.leaseExpiresAtMs, 'Claimed transaction leaseExpiresAtMs');
   if (record.normalizedTransaction !== null) {
-    assertValidDurableNormalizedTransaction(record.normalizedTransaction);
-    if (record.normalizedTransaction.signature !== record.signature) {
+    const snapshot = readValidDurableNormalizedTransaction(record.normalizedTransaction);
+    if (snapshot.signature !== record.signature) {
       throw new TypeError('Claimed normalized transaction signature does not match claim identity.');
     }
-    if (record.normalizedTransaction.slot !== record.slot) {
+    if (snapshot.slot !== record.slot) {
       throw new TypeError('Claimed normalized transaction slot does not match claim identity.');
     }
     assertCompatibleSnapshotFinality(
-      record.normalizedTransaction.confirmationStatus,
+      snapshot.confirmationStatus,
       record.confirmationStatus,
     );
   }
@@ -360,11 +359,11 @@ export function assertValidInboxCounts(value: unknown): asserts value is InboxCo
 }
 
 function frozenRecord(value: unknown, name: string): Readonly<Record<string, unknown>> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  const snapshot = snapshotSafeDurableData(value, name, true);
+  if (typeof snapshot !== 'object' || snapshot === null || Array.isArray(snapshot)) {
     throw new TypeError(`${name} must be an object.`);
   }
-  if (!Object.isFrozen(value)) throw new TypeError(`${name} must be frozen.`);
-  return value as Readonly<Record<string, unknown>>;
+  return snapshot as Readonly<Record<string, unknown>>;
 }
 
 function assertSlot(value: unknown, name: string): asserts value is bigint {
@@ -411,9 +410,9 @@ function isChainConfirmationStatus(value: unknown): value is ChainConfirmationSt
   return isObservedConfirmationStatus(value) || value === 'orphaned';
 }
 
-function assertValidDurableNormalizedTransaction(
+function readValidDurableNormalizedTransaction(
   value: unknown,
-): asserts value is DurableNormalizedTransaction {
+): DurableNormalizedTransaction {
   const snapshot = frozenRecord(value, 'Claimed normalized transaction snapshot');
   assertText(snapshot.signature, 'Normalized transaction signature');
   assertSlot(snapshot.slot, 'Normalized transaction slot');
@@ -501,6 +500,7 @@ function assertValidDurableNormalizedTransaction(
   assertNullableAmount(snapshot.computeUnits, 'Normalized transaction computeUnits');
   frozenStringArray(snapshot.logs, 'Normalized transaction logs');
   assertDeepFrozenData(snapshot.error, 'Normalized transaction error');
+  return snapshot as unknown as DurableNormalizedTransaction;
 }
 
 function assertCompatibleSnapshotFinality(
@@ -557,9 +557,9 @@ function assertLamportBalances(value: unknown, accountCount: number, field: stri
 }
 
 function frozenArray(value: unknown, name: string): readonly unknown[] {
-  if (!Array.isArray(value)) throw new TypeError(`${name} must be an array.`);
-  if (!Object.isFrozen(value)) throw new TypeError(`${name} must be frozen.`);
-  return value;
+  const snapshot = snapshotSafeDurableData(value, name, true);
+  if (!Array.isArray(snapshot)) throw new TypeError(`${name} must be an array.`);
+  return snapshot;
 }
 
 function frozenStringArray(value: unknown, name: string): readonly string[] {
@@ -575,27 +575,7 @@ function freezeTokenBalances(
 }
 
 function freezeDurableSnapshotValue(value: unknown): DurableSnapshotValue {
-  if (
-    value === null
-    || typeof value === 'string'
-    || typeof value === 'boolean'
-    || typeof value === 'bigint'
-  ) return value;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new TypeError('Normalized transaction error number must be finite.');
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return Object.freeze(value.map((item) => freezeDurableSnapshotValue(item)));
-  }
-  if (typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) {
-    throw new TypeError('Normalized transaction error must be durable data.');
-  }
-  const entries = Object.entries(value).map(([key, item]) => [
-    key,
-    freezeDurableSnapshotValue(item),
-  ] as const);
-  return Object.freeze(Object.fromEntries(entries));
+  return snapshotSafeDurableData(value, 'Normalized transaction error', false);
 }
 
 function restoreDurableSnapshotValue(value: DurableSnapshotValue): unknown {
@@ -652,8 +632,8 @@ function assertDeepFrozenData(value: unknown, name: string): void {
     return;
   }
   if (Array.isArray(value)) {
-    if (!Object.isFrozen(value)) throw new TypeError(`${name} must be deeply frozen.`);
-    value.forEach((item, index) => { assertDeepFrozenData(item, `${name}[${index}]`); });
+    const items = frozenArray(value, name);
+    items.forEach((item, index) => { assertDeepFrozenData(item, `${name}[${index}]`); });
     return;
   }
   const record = frozenRecord(value, name);
@@ -671,6 +651,123 @@ function assertCanonicalBase64(value: unknown, name: string): asserts value is s
 
 function assertString(value: unknown, name: string): asserts value is string {
   if (typeof value !== 'string') throw new TypeError(`${name} must be a string.`);
+}
+
+function snapshotSafeDurableData(
+  value: unknown,
+  name: string,
+  requireFrozen: boolean,
+  ancestors = new WeakSet(),
+): DurableSnapshotValue {
+  if (
+    value === null
+    || typeof value === 'string'
+    || typeof value === 'boolean'
+    || typeof value === 'bigint'
+  ) return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`${name} number must be finite.`);
+    return value;
+  }
+  if (typeof value !== 'object') throw new TypeError(`${name} must be durable data.`);
+  if (requireFrozen && !Object.isFrozen(value)) throw new TypeError(`${name} must be frozen.`);
+  if (ancestors.has(value)) throw new TypeError(`${name} must not contain cycles.`);
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return snapshotSafeDurableArray(value, name, requireFrozen, ancestors);
+    }
+    return snapshotSafeDurableRecord(value, name, requireFrozen, ancestors);
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function snapshotSafeDurableArray(
+  value: unknown[],
+  name: string,
+  requireFrozen: boolean,
+  ancestors: WeakSet<object>,
+): readonly DurableSnapshotValue[] {
+  if (Reflect.getPrototypeOf(value) !== Array.prototype) {
+    throw new TypeError(`${name} array prototype is invalid.`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor)) {
+    throw new TypeError(`${name} array length must be a data property.`);
+  }
+  const length: unknown = lengthDescriptor.value;
+  if (!Number.isSafeInteger(length) || (length as number) < 0) {
+    throw new TypeError(`${name} array length is invalid.`);
+  }
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key === 'symbol') throw new TypeError(`${name} array must not have symbol properties.`);
+    if (key === 'length') continue;
+    if (!isCanonicalArrayIndex(key)) throw new TypeError(`${name} array has a custom property.`);
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new TypeError(`${name}[${key}] must be an enumerable data property, not an accessor.`);
+    }
+  }
+  const snapshot = new Array<DurableSnapshotValue>(length as number);
+  for (let index = 0; index < snapshot.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (descriptor === undefined) throw new TypeError(`${name} array must not be sparse.`);
+    if (!descriptor.enumerable || !('value' in descriptor)) {
+      throw new TypeError(`${name}[${index}] must be an enumerable data property, not an accessor.`);
+    }
+    Object.defineProperty(snapshot, index, {
+      value: snapshotSafeDurableData(
+        descriptor.value,
+        `${name}[${index}]`,
+        requireFrozen,
+        ancestors,
+      ),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return Object.freeze(snapshot);
+}
+
+function snapshotSafeDurableRecord(
+  value: object,
+  name: string,
+  requireFrozen: boolean,
+  ancestors: WeakSet<object>,
+): DurableSnapshotObject {
+  const prototype = Reflect.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`${name} must use a plain or null prototype.`);
+  }
+  const snapshot = Object.create(prototype) as Record<string, DurableSnapshotValue>;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key === 'symbol') throw new TypeError(`${name} must not have symbol properties.`);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new TypeError(`${name}.${key} must be an enumerable data property, not an accessor.`);
+    }
+    Object.defineProperty(snapshot, key, {
+      value: snapshotSafeDurableData(
+        descriptor.value,
+        `${name}.${key}`,
+        requireFrozen,
+        ancestors,
+      ),
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return Object.freeze(snapshot);
+}
+
+function isCanonicalArrayIndex(key: string): boolean {
+  if (!/^(?:0|[1-9]\d*)$/u.test(key)) return false;
+  const index = Number(key);
+  return Number.isSafeInteger(index) && index >= 0 && index < 4_294_967_295;
 }
 
 function isLegacyConfirmationStatus(

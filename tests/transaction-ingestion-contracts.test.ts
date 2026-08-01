@@ -222,6 +222,109 @@ void test('accepts actual normalized RPC output when token balance programId is 
   assert.equal(snapshot.postTokenBalances[0]?.tokenProgram, '');
 });
 
+void test('rejects stateful top-level and nested accessors without invoking them', () => {
+  const canonical = durableSnapshot();
+  let signatureReads = 0;
+  const hostileTopLevel = { ...canonical };
+  Object.defineProperty(hostileTopLevel, 'signature', {
+    enumerable: true,
+    get: () => {
+      signatureReads += 1;
+      return signatureReads === 1 ? 'signature' : 'other';
+    },
+  });
+  Object.freeze(hostileTopLevel);
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(hostileTopLevel)); },
+    /accessor|data property|descriptor/u,
+  );
+  assert.equal(signatureReads, 0);
+
+  let programReads = 0;
+  const hostileInstruction = { ...canonical.instructions[0] };
+  Object.defineProperty(hostileInstruction, 'programId', {
+    enumerable: true,
+    get: () => { programReads += 1; return 'program'; },
+  });
+  Object.freeze(hostileInstruction);
+  const hostileNested = Object.freeze({
+    ...canonical,
+    instructions: Object.freeze([hostileInstruction]),
+  });
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(hostileNested)); },
+    /accessor|data property|descriptor/u,
+  );
+  assert.equal(programReads, 0);
+});
+
+void test('rejects sparse and accessor durable arrays without invoking inherited or own getters', () => {
+  const canonical = durableSnapshot();
+  const sparse = new Array<unknown>(1);
+  Object.freeze(sparse);
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(Object.freeze({
+      ...canonical,
+      instructions: sparse,
+    }))); },
+    /sparse|array|descriptor/u,
+  );
+
+  let instructionReads = 0;
+  const accessorArray: unknown[] = [];
+  Object.defineProperty(accessorArray, '0', {
+    enumerable: true,
+    configurable: false,
+    get: () => { instructionReads += 1; return canonical.instructions[0]; },
+  });
+  Object.defineProperty(accessorArray, 'length', { value: 1, writable: false });
+  Object.freeze(accessorArray);
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(Object.freeze({
+      ...canonical,
+      instructions: accessorArray,
+    }))); },
+    /accessor|data property|descriptor/u,
+  );
+  assert.equal(instructionReads, 0);
+});
+
+void test('rejects hostile durable prototypes and hidden symbol properties', () => {
+  const canonical = durableSnapshot();
+  const hostilePrototype = Object.assign(Object.create({ polluted: true }), canonical) as object;
+  Object.freeze(hostilePrototype);
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(hostilePrototype)); },
+    /prototype|plain/u,
+  );
+
+  const symbol = Symbol('hidden');
+  const hiddenSymbol = { ...canonical, [symbol]: true };
+  Object.freeze(hiddenSymbol);
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(hiddenSymbol)); },
+    /symbol|property/u,
+  );
+});
+
+void test('rejects malformed and non-canonical durable instruction base64 directly', () => {
+  const canonical = durableSnapshot();
+  for (const dataBase64 of ['***', 'AQI']) {
+    const instruction = Object.freeze({
+      ...canonical.instructions[0],
+      dataBase64,
+    });
+    const snapshot = Object.freeze({
+      ...canonical,
+      instructions: Object.freeze([instruction]),
+    });
+    assert.throws(
+      () => { assertValidClaimedTransaction(claimWithSnapshot(snapshot)); },
+      /base64|canonical/u,
+    );
+  }
+});
+
 void test('rejects mutable contracts, number slots and non-integer millisecond times', () => {
   const notification = Object.freeze({
     signature: 'signature',
