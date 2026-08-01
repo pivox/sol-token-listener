@@ -189,6 +189,45 @@ void test('rejects an unsafe rounded RPC slot even when its bigint conversion ma
   );
 });
 
+void test('rejects proxy slot values that differ from the validated descriptor without leaking', async () => {
+  for (const [runtimeSlot, observedSlot] of [
+    [Number.MAX_SAFE_INTEGER + 1, 9_007_199_254_740_992n],
+    [43, 43n],
+  ] as const) {
+    const raw = response('pump');
+    let descriptorReads = 0;
+    let slotReads = 0;
+    const hostile = new Proxy(raw, {
+      getOwnPropertyDescriptor: (value, property) => {
+        if (property === 'slot') {
+          descriptorReads += 1;
+          return { configurable: true, enumerable: true, writable: true, value: 42 };
+        }
+        return Reflect.getOwnPropertyDescriptor(value, property);
+      },
+      get: (value, property, receiver) => {
+        if (property === 'slot') {
+          slotReads += 1;
+          return runtimeSlot;
+        }
+        const result: unknown = Reflect.get(value, property, receiver);
+        return result;
+      },
+    });
+
+    await assert.rejects(
+      new TransactionLocator(rpc(hostile, ['pump'])).locate(target('pump', observedSlot)),
+      (error: unknown) => {
+        assert.ok(error instanceof TransactionNormalizationError);
+        assert.doesNotMatch(String(error), /unsafe|rounded|43/u);
+        return true;
+      },
+    );
+    assert.equal(descriptorReads, 1);
+    assert.equal(slotReads, 1);
+  }
+});
+
 void test('rejects negative, fractional, non-enumerable and inherited raw slots', async () => {
   const negative = response('pump', -1);
   const fractional = response('pump', 42.5);

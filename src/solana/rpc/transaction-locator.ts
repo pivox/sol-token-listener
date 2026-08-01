@@ -87,7 +87,8 @@ export class SolanaTransactionLocator {
     const signatures = snapshotBlockSignatures(rawSignatures, target.signature);
     const transactionIndex = uniqueSignatureIndex(signatures, target.signature);
     if (transactionIndex === null) throw new TransactionIndexNotFoundError();
-    if (!hasCanonicalRawSlot(response)) throw new TransactionNormalizationError();
+    const rawSlot = readCanonicalRawSlot(response);
+    if (rawSlot === null) throw new TransactionNormalizationError();
 
     let normalized: NormalizedTransaction;
     try {
@@ -95,6 +96,7 @@ export class SolanaTransactionLocator {
     } catch {
       throw new TransactionNormalizationError();
     }
+    if (normalized.slot !== BigInt(rawSlot)) throw new TransactionNormalizationError();
     if (normalized.signature !== target.signature || normalized.slot !== target.slot) {
       throw new TransactionIndexNotFoundError();
     }
@@ -124,19 +126,21 @@ export class SolanaTransactionLocator {
 
 export { SolanaTransactionLocator as TransactionLocator };
 
-function hasCanonicalRawSlot(response: VersionedTransactionResponse): boolean {
+function readCanonicalRawSlot(response: VersionedTransactionResponse): number | null {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(response, 'slot');
     if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
-      return false;
+      return null;
     }
     const slot: unknown = descriptor.value;
     return typeof slot === 'number'
       && Number.isSafeInteger(slot)
       && slot >= 0
-      && !Object.is(slot, -0);
+      && !Object.is(slot, -0)
+      ? slot
+      : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
