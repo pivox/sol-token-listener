@@ -71,6 +71,8 @@ void test('extends legacy listener heartbeats without seeding checkpoints', asyn
   assert.match(sql, /ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ/u);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS leased_transactions INTEGER NOT NULL DEFAULT 0/u);
   assert.match(sql, /STARTING.*RUNNING.*DEGRADED.*STOPPING.*STOPPED/su);
+  assert.match(sql, /pending_transactions >= 0/u);
+  assert.match(sql, /leased_transactions BETWEEN 0 AND pending_transactions/u);
   assert.doesNotMatch(sql, /INSERT INTO processing_checkpoints/iu);
 });
 
@@ -218,6 +220,365 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
     await admin.end();
   }
 });
+
+void test('backfills and constrains a heartbeat row created by migrations 001-008', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
+    return;
+  }
+  const schema = `transaction_heartbeat_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await applyMigrations(pool, 8);
+    await pool.query(`INSERT INTO listener_heartbeats (
+      service_key, last_http_slot, last_websocket_slot, last_finalized_slot,
+      last_signature, pending_transactions, retry_count, active_sessions, payload, updated_at
+    ) VALUES (
+      'legacy-listener', 100, 99, 98, 'legacy-signature', 3, 7, 2,
+      '{"legacy":true}'::jsonb, '2025-01-01T00:00:10.000Z'
+    )`);
+
+    const migrationSql = await readFile(migrationUrl, 'utf8');
+    await pool.query(migrationSql);
+    await pool.query(migrationSql);
+    const heartbeat = (await pool.query(`SELECT
+      service_key, last_http_slot, pending_transactions, retry_count, active_sessions, payload,
+      runtime_state, subscriber_state, scanner_state, worker_state, reconciler_state,
+      started_at, leased_transactions
+      FROM listener_heartbeats WHERE service_key = 'legacy-listener'`)).rows[0];
+    assert.deepEqual(heartbeat, {
+      service_key: 'legacy-listener',
+      last_http_slot: '100',
+      pending_transactions: 3,
+      retry_count: '7',
+      active_sessions: 2,
+      payload: { legacy: true },
+      runtime_state: 'STOPPED',
+      subscriber_state: 'STOPPED',
+      scanner_state: 'STOPPED',
+      worker_state: 'STOPPED',
+      reconciler_state: 'STOPPED',
+      started_at: null,
+      leased_transactions: 0,
+    });
+    await assert.rejects(
+      pool.query(`UPDATE listener_heartbeats
+        SET pending_transactions = 0, leased_transactions = 1
+        WHERE service_key = 'legacy-listener'`),
+      /listener_heartbeats_runtime_counts_check/u,
+    );
+    await assert.rejects(
+      pool.query(`UPDATE listener_heartbeats
+        SET pending_transactions = -1, leased_transactions = 0
+        WHERE service_key = 'legacy-listener'`),
+      /listener_heartbeats_runtime_counts_check/u,
+    );
+    await pool.query(`UPDATE listener_heartbeats
+      SET pending_transactions = 2, leased_transactions = 2
+      WHERE service_key = 'legacy-listener'`);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
+void test('enforces inbox lifecycle checks and terminal-only purge in PostgreSQL', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
+    return;
+  }
+  const schema = `transaction_matrix_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    const fingerprint = 'a'.repeat(64);
+    const snapshot = { signature: 'durable-snapshot' };
+    const processed = '2025-01-01T00:00:01.000Z';
+    const terminal = '2025-01-01T00:00:02.000Z';
+    const purgeAfter = '2025-01-01T04:00:02.000Z';
+    const insertCases: readonly InboxInsertCase[] = [
+      { name: 'websocket-source', accept: true, value: {} },
+      { name: 'catch-up-source', accept: true, value: { discoverySources: ['CATCH_UP'] } },
+      { name: 'both-sources', accept: true, value: { discoverySources: ['WEBSOCKET', 'CATCH_UP'] } },
+      { name: 'empty-sources', accept: false, value: { discoverySources: [] } },
+      { name: 'reversed-sources', accept: false, value: { discoverySources: ['CATCH_UP', 'WEBSOCKET'] } },
+      { name: 'duplicate-sources', accept: false, value: { discoverySources: ['WEBSOCKET', 'WEBSOCKET'] } },
+      { name: 'unknown-source', accept: false, value: { discoverySources: ['POLLING'] } },
+      { name: 'null-source-member', accept: false, value: { discoverySources: ['WEBSOCKET', null] } },
+      { name: 'processing-lease', accept: true, value: processingState() },
+      { name: 'processing-no-token', accept: false, value: { ...processingState(), leaseToken: null } },
+      { name: 'processing-no-expiry', accept: false, value: { ...processingState(), leaseExpiresAt: null } },
+      { name: 'pending-with-lease', accept: false, value: { leaseToken: 'lease', leaseExpiresAt: processed } },
+      { name: 'snapshot-pair', accept: true, value: { normalizedTransaction: snapshot, immutableFingerprint: fingerprint } },
+      { name: 'snapshot-no-fingerprint', accept: false, value: { normalizedTransaction: snapshot } },
+      { name: 'fingerprint-no-snapshot', accept: false, value: { immutableFingerprint: fingerprint } },
+      { name: 'snapshot-array', accept: false, value: { normalizedTransaction: [], immutableFingerprint: fingerprint } },
+      { name: 'uppercase-fingerprint', accept: false, value: { normalizedTransaction: snapshot, immutableFingerprint: 'A'.repeat(64) } },
+      { name: 'failed-no-retry', accept: true, value: failedState(false) },
+      { name: 'failed-retry', accept: true, value: { ...failedState(true), nextAttemptAt: processed } },
+      { name: 'failed-retry-no-time', accept: false, value: failedState(true) },
+      { name: 'failed-no-retry-with-time', accept: false, value: { ...failedState(false), nextAttemptAt: processed } },
+      { name: 'pending-next-attempt', accept: false, value: { nextAttemptAt: processed } },
+      { name: 'failed-no-code', accept: false, value: { ...failedState(false), errorCode: null } },
+      { name: 'failed-no-name', accept: false, value: { ...failedState(false), errorName: null } },
+      { name: 'failed-no-retryable', accept: false, value: { ...failedState(false), errorRetryable: null } },
+      { name: 'failed-unknown-code', accept: false, value: { ...failedState(false), errorCode: 'UNKNOWN' } },
+      { name: 'pending-with-failure', accept: false, value: failureFields(false) },
+      { name: 'processed-at-processed-finality', accept: true, value: processedState('processed', snapshot, fingerprint, processed) },
+      { name: 'processed-confirmed', accept: true, value: processedState('confirmed', snapshot, fingerprint, processed) },
+      { name: 'processed-finalized', accept: true, value: terminalState('finalized', snapshot, fingerprint, processed, terminal, purgeAfter) },
+      { name: 'processed-orphaned', accept: true, value: terminalState('orphaned', snapshot, fingerprint, processed, terminal, purgeAfter) },
+      { name: 'processed-no-snapshot', accept: false, value: { processingStatus: 'PROCESSED', processedAt: processed } },
+      { name: 'finalized-no-terminal', accept: false, value: processedState('finalized', snapshot, fingerprint, processed) },
+      { name: 'finalized-no-purge', accept: false, value: { ...terminalState('finalized', snapshot, fingerprint, processed, terminal, purgeAfter), purgeAfter: null } },
+      { name: 'terminal-pending', accept: false, value: { terminalAt: terminal, purgeAfter } },
+      { name: 'terminal-nonterminal-finality', accept: false, value: { ...processedState('confirmed', snapshot, fingerprint, processed), terminalAt: terminal, purgeAfter } },
+      { name: 'wrong-purge-deadline', accept: false, value: terminalState('finalized', snapshot, fingerprint, processed, terminal, '2025-01-01T04:00:03.000Z') },
+      { name: 'negative-attempts', accept: false, value: { attempts: -1 } },
+      { name: 'null-attempts', accept: false, value: { attempts: null } },
+      { name: 'negative-missing-polls', accept: false, value: { missingFinalityPolls: -1 } },
+      { name: 'null-missing-polls', accept: false, value: { missingFinalityPolls: null } },
+      { name: 'invalid-target-finality', accept: false, value: { targetConfirmationStatus: 'unknown' } },
+      { name: 'negative-slot', accept: false, value: { observedSlot: '-1' } },
+      { name: 'updated-before-created', accept: false, value: { createdAt: processed, updatedAt: '2025-01-01T00:00:00.000Z' } },
+      { name: 'processed-before-observed', accept: false, value: { ...processedState('confirmed', snapshot, fingerprint, '2024-12-31T23:59:59.000Z') } },
+      { name: 'terminal-before-processed', accept: false, value: terminalState('finalized', snapshot, fingerprint, processed, '2025-01-01T00:00:00.500Z', '2025-01-01T04:00:00.500Z') },
+    ];
+    for (const [index, item] of insertCases.entries()) {
+      const operation = insertInbox(pool, inboxValue(`matrix-${index}`, item.value));
+      if (item.accept) await operation;
+      else await assert.rejects(operation, /chain_transaction_inbox/u, item.name);
+    }
+
+    await insertInbox(pool, inboxValue('update-seed'));
+    const updateCases: readonly SqlCase[] = [
+      { name: 'status without lease', accept: false, text: "UPDATE chain_transaction_inbox SET processing_status = 'PROCESSING' WHERE signature = 'update-seed'" },
+      { name: 'claim with lease', accept: true, text: "UPDATE chain_transaction_inbox SET processing_status = 'PROCESSING', lease_token = 'lease', lease_expires_at = '2025-01-01T00:01:00Z' WHERE signature = 'update-seed'" },
+      { name: 'partial lease clear', accept: false, text: "UPDATE chain_transaction_inbox SET lease_token = NULL WHERE signature = 'update-seed'" },
+      { name: 'release lease', accept: true, text: "UPDATE chain_transaction_inbox SET processing_status = 'PENDING', lease_token = NULL, lease_expires_at = NULL WHERE signature = 'update-seed'" },
+      { name: 'mark processed', accept: true, text: `UPDATE chain_transaction_inbox SET processing_status = 'PROCESSED', normalized_transaction = '{"signature":"durable"}'::jsonb, immutable_fingerprint = '${fingerprint}', processed_at = '${processed}' WHERE signature = 'update-seed'` },
+      { name: 'terminal without retention', accept: false, text: "UPDATE chain_transaction_inbox SET target_confirmation_status = 'finalized' WHERE signature = 'update-seed'" },
+      { name: 'terminal with retention', accept: true, text: `UPDATE chain_transaction_inbox SET target_confirmation_status = 'finalized', terminal_at = '${terminal}', purge_after = '${purgeAfter}' WHERE signature = 'update-seed'` },
+    ];
+    for (const item of updateCases) {
+      const operation = pool.query(item.text);
+      if (item.accept) await operation;
+      else await assert.rejects(operation, /chain_transaction_inbox_.+_check/u, item.name);
+    }
+
+    await pool.query('TRUNCATE chain_transaction_inbox');
+    await insertInbox(pool, inboxValue('purge-finalized', terminalState(
+      'finalized', snapshot, fingerprint, '2020-01-01T00:00:01Z',
+      '2020-01-01T00:00:02Z', '2020-01-01T04:00:02Z',
+    ), { observedAt: '2020-01-01T00:00:00Z' }));
+    await insertInbox(pool, inboxValue('purge-orphaned', terminalState(
+      'orphaned', snapshot, fingerprint, '2020-01-01T00:00:01Z',
+      '2020-01-01T00:00:02Z', '2020-01-01T04:00:02Z',
+    ), { observedAt: '2020-01-01T00:00:00Z' }));
+    await insertInbox(pool, inboxValue('pending-retry', {
+      ...failedState(true), nextAttemptAt: '2099-01-01T00:00:00Z',
+    }));
+    await insertInbox(pool, inboxValue('leased', {
+      ...processingState(), leaseExpiresAt: '2099-01-01T00:00:00Z',
+    }));
+    await insertInbox(pool, inboxValue(
+      'processed-nonterminal', processedState('confirmed', snapshot, fingerprint, processed),
+    ));
+    await insertInbox(pool, inboxValue('unexpired-terminal', terminalState(
+      'finalized', snapshot, fingerprint, '2099-01-01T00:00:01Z',
+      '2099-01-01T00:00:02Z', '2099-01-01T04:00:02Z',
+    ), { observedAt: '2099-01-01T00:00:00Z', createdAt: '2099-01-01T00:00:00Z', updatedAt: '2099-01-01T00:00:00Z' }));
+
+    const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.transactionInbox, 2);
+    assert.deepEqual((await pool.query<{ readonly signature: string }>(
+      'SELECT signature FROM chain_transaction_inbox ORDER BY signature',
+    )).rows.map((row) => row.signature), [
+      'leased', 'pending-retry', 'processed-nonterminal', 'unexpired-terminal',
+    ]);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
+type PgPool = InstanceType<typeof pg.Pool>;
+
+interface InboxInsert {
+  readonly signature: string;
+  readonly observedSlot: string;
+  readonly discoverySources: readonly (string | null)[];
+  readonly targetConfirmationStatus: string;
+  readonly processingStatus: string;
+  readonly attempts: number | null;
+  readonly missingFinalityPolls: number | null;
+  readonly leaseToken: string | null;
+  readonly leaseExpiresAt: string | null;
+  readonly nextAttemptAt: string | null;
+  readonly normalizedTransaction: unknown;
+  readonly immutableFingerprint: string | null;
+  readonly errorCode: string | null;
+  readonly errorName: string | null;
+  readonly errorRetryable: boolean | null;
+  readonly blockchainTime: string | null;
+  readonly observedAt: string;
+  readonly processedAt: string | null;
+  readonly terminalAt: string | null;
+  readonly purgeAfter: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+interface InboxInsertCase {
+  readonly name: string;
+  readonly accept: boolean;
+  readonly value: Partial<InboxInsert>;
+}
+
+interface SqlCase {
+  readonly name: string;
+  readonly accept: boolean;
+  readonly text: string;
+}
+
+function inboxValue(
+  signature: string,
+  overrides: Partial<InboxInsert> = {},
+  timestamps: Partial<InboxInsert> = {},
+): InboxInsert {
+  return {
+    signature,
+    observedSlot: '42',
+    discoverySources: ['WEBSOCKET'],
+    targetConfirmationStatus: 'confirmed',
+    processingStatus: 'PENDING',
+    attempts: 0,
+    missingFinalityPolls: 0,
+    leaseToken: null,
+    leaseExpiresAt: null,
+    nextAttemptAt: null,
+    normalizedTransaction: null,
+    immutableFingerprint: null,
+    errorCode: null,
+    errorName: null,
+    errorRetryable: null,
+    blockchainTime: null,
+    observedAt: '2025-01-01T00:00:00.000Z',
+    processedAt: null,
+    terminalAt: null,
+    purgeAfter: null,
+    createdAt: '2025-01-01T00:00:00.000Z',
+    updatedAt: '2025-01-01T00:00:00.000Z',
+    ...overrides,
+    ...timestamps,
+  };
+}
+
+function processingState(): Partial<InboxInsert> {
+  return {
+    processingStatus: 'PROCESSING',
+    leaseToken: 'lease',
+    leaseExpiresAt: '2025-01-01T00:01:00.000Z',
+  };
+}
+
+function failureFields(retryable: boolean): Partial<InboxInsert> {
+  return {
+    errorCode: 'RPC_TRANSIENT',
+    errorName: 'RpcTransientError',
+    errorRetryable: retryable,
+  };
+}
+
+function failedState(retryable: boolean): Partial<InboxInsert> {
+  return { processingStatus: 'FAILED', ...failureFields(retryable) };
+}
+
+function processedState(
+  confirmationStatus: string,
+  snapshot: unknown,
+  fingerprint: string,
+  processedAt: string,
+): Partial<InboxInsert> {
+  return {
+    targetConfirmationStatus: confirmationStatus,
+    processingStatus: 'PROCESSED',
+    normalizedTransaction: snapshot,
+    immutableFingerprint: fingerprint,
+    processedAt,
+  };
+}
+
+function terminalState(
+  confirmationStatus: 'finalized' | 'orphaned',
+  snapshot: unknown,
+  fingerprint: string,
+  processedAt: string,
+  terminalAt: string,
+  purgeAfter: string,
+): Partial<InboxInsert> {
+  return {
+    ...processedState(confirmationStatus, snapshot, fingerprint, processedAt),
+    terminalAt,
+    purgeAfter,
+  };
+}
+
+async function insertInbox(pool: PgPool, value: InboxInsert): Promise<void> {
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature, observed_slot, discovery_sources, target_confirmation_status,
+    processing_status, attempts, missing_finality_polls, lease_token, lease_expires_at,
+    next_attempt_at, normalized_transaction, immutable_fingerprint, error_code, error_name,
+    error_retryable, blockchain_time, observed_at, processed_at, terminal_at, purge_after,
+    created_at, updated_at
+  ) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+    $17, $18, $19, $20, $21, $22
+  )`, [
+    value.signature, value.observedSlot, value.discoverySources,
+    value.targetConfirmationStatus, value.processingStatus, value.attempts,
+    value.missingFinalityPolls, value.leaseToken, value.leaseExpiresAt,
+    value.nextAttemptAt,
+    value.normalizedTransaction === null ? null : JSON.stringify(value.normalizedTransaction),
+    value.immutableFingerprint,
+    value.errorCode, value.errorName, value.errorRetryable, value.blockchainTime,
+    value.observedAt, value.processedAt, value.terminalAt, value.purgeAfter,
+    value.createdAt, value.updatedAt,
+  ]);
+}
+
+async function applyMigrations(pool: PgPool, last: number): Promise<void> {
+  for (let version = 1; version <= last; version += 1) {
+    const prefix = String(version).padStart(3, '0');
+    const migrationNames = [
+      '001_initial.sql',
+      '002_pumpfun_foundation.sql',
+      '003_pumpfun_observations.sql',
+      '004_paper_trading.sql',
+      '005_pumpswap_market.sql',
+      '006_api_event_stream.sql',
+      '007_participant_analytics.sql',
+      '008_wallet_graph.sql',
+    ];
+    const name = migrationNames[version - 1];
+    assert.ok(name?.startsWith(prefix));
+    await pool.query(await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
+  }
+}
 
 function quoteIdentifier(identifier: string): string {
   if (!/^[a-z_][a-z0-9_]*$/u.test(identifier)) throw new Error('Unsafe SQL identifier.');

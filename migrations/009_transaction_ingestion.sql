@@ -186,7 +186,8 @@ BEGIN
   ) THEN
     ALTER TABLE listener_heartbeats
       ADD CONSTRAINT listener_heartbeats_runtime_counts_check CHECK (
-        leased_transactions >= 0
+        pending_transactions >= 0
+        AND leased_transactions BETWEEN 0 AND pending_transactions
         AND (started_at IS NULL OR started_at <= updated_at)
       );
   END IF;
