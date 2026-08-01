@@ -198,3 +198,17 @@ BEGIN
   END IF;
 END;
 $$;
+
+-- A single Pump instruction can emit more than one distinct observation at
+-- the same canonical cursor (notably token creation plus its initial buy).
+-- Event IDs provide idempotence; the cursor remains an ordering index only.
+DROP INDEX IF EXISTS raw_chain_events_cursor_idx;
+CREATE INDEX raw_chain_events_cursor_idx
+  ON raw_chain_events (
+    source,
+    program,
+    signature,
+    transaction_index,
+    instruction_index,
+    COALESCE(inner_instruction_index, -1)
+  );
