@@ -84,6 +84,9 @@ export class SolanaProgramSubscriber {
     if (this.permanentlyClosed || this.currentState === 'STOPPING') {
       return Promise.reject(new ProgramSubscriberError('lifecycle'));
     }
+    if (!this.accepting && this.listenerIds.length > 0) {
+      return Promise.reject(new ProgramSubscriberError('lifecycle'));
+    }
     if (this.currentState === 'RUNNING' || this.currentState === 'DEGRADED') {
       return Promise.resolve();
     }
@@ -106,6 +109,10 @@ export class SolanaProgramSubscriber {
     this.currentState = 'STOPPING';
     const operation = this.performClose();
     this.closePromise = operation;
+    void operation.then(
+      () => { if (this.closePromise === operation) this.closePromise = null; },
+      () => { if (this.closePromise === operation) this.closePromise = null; },
+    );
     return operation;
   }
 
@@ -125,18 +132,20 @@ export class SolanaProgramSubscriber {
       }
     } catch {
       this.accepting = false;
-      const cleanupFailures = await removeListeners(this.connection, installed);
-      this.currentState = 'STOPPED';
-      const error = new ProgramSubscriberError('subscribe', cleanupFailures + 1);
+      const failedIds = await removeListeners(this.connection, installed);
+      this.listenerIds.push(...failedIds);
+      this.currentState = failedIds.length === 0 ? 'STOPPED' : 'DEGRADED';
+      const error = new ProgramSubscriberError('subscribe', failedIds.length + 1);
       this.currentError = error;
       throw error;
     }
 
     if (this.permanentlyClosed) {
-      const cleanupFailures = await removeListeners(this.connection, installed);
-      this.currentState = 'STOPPED';
-      if (cleanupFailures > 0) {
-        const error = new ProgramSubscriberError('unsubscribe', cleanupFailures);
+      const failedIds = await removeListeners(this.connection, installed);
+      this.listenerIds.push(...failedIds);
+      this.currentState = failedIds.length === 0 ? 'STOPPED' : 'DEGRADED';
+      if (failedIds.length > 0) {
+        const error = new ProgramSubscriberError('unsubscribe', failedIds.length);
         this.currentError = error;
         throw error;
       }
@@ -192,11 +201,12 @@ export class SolanaProgramSubscriber {
     }
 
     const ids = this.listenerIds.splice(0);
-    const cleanupFailures = await removeListeners(this.connection, ids);
+    const failedIds = await removeListeners(this.connection, ids);
+    this.listenerIds.push(...failedIds);
     await Promise.all([...this.inFlight]);
-    this.currentState = 'STOPPED';
-    if (cleanupFailures > 0) {
-      const error = new ProgramSubscriberError('unsubscribe', cleanupFailures);
+    this.currentState = failedIds.length === 0 ? 'STOPPED' : 'DEGRADED';
+    if (failedIds.length > 0) {
+      const error = new ProgramSubscriberError('unsubscribe', failedIds.length);
       this.currentError = error;
       throw error;
     }
@@ -272,11 +282,11 @@ function validListenerId(value: unknown): value is number {
 async function removeListeners(
   connection: ProgramLogsConnection,
   ids: readonly number[],
-): Promise<number> {
+): Promise<readonly number[]> {
   const results = await Promise.allSettled(ids.map(async (id) => {
     await connection.removeOnLogsListener(id);
   }));
-  return results.filter((result) => result.status === 'rejected').length;
+  return Object.freeze(ids.filter((_, index) => results[index]?.status === 'rejected'));
 }
 
 function clockOption(options: ProgramSubscriberOptions): (() => number) | undefined {

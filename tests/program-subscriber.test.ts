@@ -175,7 +175,14 @@ void test('aggregates all removal failures without leaking raw errors', async ()
   });
   assert.deepEqual(connection.removed, [1, 2]);
   assertStableError(subscriber.lastError, 'unsubscribe', 2);
-  await assert.rejects(subscriber.close(), ProgramSubscriberError);
+  assert.equal(subscriber.state, 'DEGRADED');
+  assert.deepEqual([...connection.active], [1, 2]);
+
+  connection.removeFailures.clear();
+  await subscriber.close();
+  assert.deepEqual(connection.removed, [1, 2, 1, 2]);
+  assert.deepEqual([...connection.active], []);
+  assert.equal(subscriber.state, 'STOPPED');
 });
 
 void test('cleans an installed listener after partial setup failure', async () => {
@@ -190,6 +197,34 @@ void test('cleans an installed listener after partial setup failure', async () =
     return true;
   });
   assert.deepEqual(connection.removed, [1]);
+  assert.equal(subscriber.state, 'STOPPED');
+});
+
+void test('retains failed partial-start cleanup and blocks restart until close retries it', async () => {
+  const connection = new FakeConnection([1, 2, 3, 4]);
+  connection.subscribeFailureAt = 2;
+  connection.removeFailures.add(1);
+  const subscriber = makeSubscriber(connection, new FakeInbox());
+
+  await assert.rejects(subscriber.start(), (error) => {
+    assertStableError(error, 'subscribe', 2);
+    return true;
+  });
+  assert.deepEqual([...connection.active], [1]);
+  assert.deepEqual(connection.removed, [1]);
+  assert.equal(subscriber.state, 'DEGRADED');
+
+  await assert.rejects(subscriber.start(), (error) => {
+    assertStableError(error, 'lifecycle');
+    return true;
+  });
+  assert.equal(connection.subscribeAttempts, 2);
+  assert.deepEqual([...connection.active], [1]);
+
+  connection.removeFailures.clear();
+  await subscriber.close();
+  assert.deepEqual(connection.removed, [1, 1]);
+  assert.deepEqual([...connection.active], []);
   assert.equal(subscriber.state, 'STOPPED');
 });
 
@@ -250,6 +285,8 @@ class FakeConnection implements ProgramLogsConnection {
   }[] = [];
   public readonly removed: number[] = [];
   public readonly removeFailures = new Set<number>();
+  public readonly active = new Set<number>();
+  public subscribeAttempts = 0;
   public subscribeFailureAt: number | null = null;
 
   public constructor(private readonly ids: readonly unknown[] = [1, 2]) {}
@@ -259,15 +296,19 @@ class FakeConnection implements ProgramLogsConnection {
     callback: ProgramLogsCallback,
     commitment: 'processed',
   ): number {
-    const call = this.subscriptions.length + 1;
+    this.subscribeAttempts += 1;
+    const call = this.subscribeAttempts;
     if (this.subscribeFailureAt === call) throw new Error('subscription secret');
     this.subscriptions.push({ programId: filter.toBase58(), callback, commitment });
-    return this.ids[call - 1] as number;
+    const id = this.ids[call - 1] as number;
+    this.active.add(id);
+    return id;
   }
 
   public async removeOnLogsListener(id: number): Promise<void> {
     this.removed.push(id);
     if (this.removeFailures.has(id)) throw new Error(`removal secret ${id}`);
+    this.active.delete(id);
   }
 
   public emit(programId: string, value: unknown, ctx: unknown): void {
