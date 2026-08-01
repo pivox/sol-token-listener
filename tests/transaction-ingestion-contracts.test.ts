@@ -10,6 +10,7 @@ import {
   MAX_TRANSACTION_SNAPSHOT_DEPTH,
   MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES,
   MAX_TRANSACTION_SNAPSHOT_NODES,
+  MAX_TRANSACTION_SNAPSHOT_TEXT_BYTES,
   MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH,
   TRANSACTION_INBOX_STATUSES,
   assertValidClaimedTransaction,
@@ -375,6 +376,35 @@ void test('accepts exact durable array and string limits and rejects boundary pl
   );
 });
 
+void test('bounds object keys by UTF-8 bytes before using them in validation paths', () => {
+  const exactKey = 'é'.repeat(MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH / 2);
+  assert.equal(Buffer.byteLength(exactKey, 'utf8'), MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH);
+  assert.doesNotThrow(() => createDurableTransactionSnapshot(normalizedTransaction({
+    error: Object.freeze({ [exactKey]: null }),
+  })));
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({
+      error: Object.freeze({ [`${exactKey}a`]: null }),
+    })),
+    /property key.*maximum string length/u,
+  );
+});
+
+void test('accepts exact aggregate UTF-8 text bytes and rejects one additional byte', () => {
+  const canonical = createDurableTransactionSnapshot(normalizedTransaction());
+  const remaining = MAX_TRANSACTION_SNAPSHOT_TEXT_BYTES - durableTextBytes(canonical);
+  assert.ok(remaining > MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH);
+  assert.doesNotThrow(() => createDurableTransactionSnapshot(normalizedTransaction({
+    error: textPayload(remaining),
+  })));
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({
+      error: textPayload(remaining + 1),
+    })),
+    /maximum text bytes/u,
+  );
+});
+
 void test('accepts exact decoded instruction byte limit and rejects boundary plus one', () => {
   const exact = createDurableTransactionSnapshot(normalizedTransaction({
     instructionData: new Uint8Array(MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES),
@@ -607,4 +637,28 @@ function nodeBudgetError(additionalEntries: number): unknown {
     second: Object.freeze(new Array<null>(secondLength).fill(null)),
     third: Object.freeze(new Array<null>(thirdLength).fill(null)),
   });
+}
+
+function textPayload(bytes: number): readonly string[] {
+  const values: string[] = [];
+  let remaining = bytes;
+  while (remaining > 0) {
+    const length = Math.min(remaining, MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH);
+    values.push('x'.repeat(length));
+    remaining -= length;
+  }
+  return Object.freeze(values);
+}
+
+function durableTextBytes(value: unknown): number {
+  if (typeof value === 'string') return Buffer.byteLength(value, 'utf8');
+  if (Array.isArray(value)) {
+    const items = value as readonly unknown[];
+    return items.reduce<number>((total, item) => total + durableTextBytes(item), 0);
+  }
+  if (typeof value !== 'object' || value === null) return 0;
+  return Object.entries(value).reduce(
+    (total, [key, item]) => total + Buffer.byteLength(key, 'utf8') + durableTextBytes(item),
+    0,
+  );
 }

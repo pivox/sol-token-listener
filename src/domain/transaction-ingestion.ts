@@ -7,6 +7,7 @@ export const MAX_TRANSACTION_SNAPSHOT_DEPTH = 64;
 export const MAX_TRANSACTION_SNAPSHOT_NODES = 10_000;
 export const MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH = 4_096;
 export const MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH = 16_384;
+export const MAX_TRANSACTION_SNAPSHOT_TEXT_BYTES = 1_048_576;
 export const MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES = 1_232;
 
 export const TRANSACTION_INBOX_STATUSES = Object.freeze([
@@ -676,7 +677,7 @@ function snapshotSafeDurableData(
   value: unknown,
   name: string,
   requireFrozen: boolean,
-  state: DurableSnapshotState = { ancestors: new WeakSet(), nodes: 0 },
+  state: DurableSnapshotState = { ancestors: new WeakSet(), nodes: 0, textBytes: 0 },
   depth = 0,
 ): DurableSnapshotValue {
   if (depth > MAX_TRANSACTION_SNAPSHOT_DEPTH) {
@@ -692,9 +693,7 @@ function snapshotSafeDurableData(
     || typeof value === 'bigint'
   ) return value;
   if (typeof value === 'string') {
-    if (value.length > MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH) {
-      throw new TypeError(`${name} exceeds maximum string length.`);
-    }
+    addSnapshotTextBytes(state, value, name);
     return value;
   }
   if (typeof value === 'number') {
@@ -718,6 +717,7 @@ function snapshotSafeDurableData(
 interface DurableSnapshotState {
   readonly ancestors: WeakSet<object>;
   nodes: number;
+  textBytes: number;
 }
 
 function snapshotSafeDurableArray(
@@ -795,6 +795,7 @@ function snapshotSafeDurableRecord(
   const snapshot = Object.create(prototype) as Record<string, DurableSnapshotValue>;
   for (const key of keys) {
     if (typeof key === 'symbol') throw new TypeError(`${name} must not have symbol properties.`);
+    addSnapshotTextBytes(state, key, `${name} property key`);
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
       throw new TypeError(`${name}.${key} must be an enumerable data property, not an accessor.`);
@@ -813,6 +814,17 @@ function snapshotSafeDurableRecord(
     });
   }
   return Object.freeze(snapshot);
+}
+
+function addSnapshotTextBytes(state: DurableSnapshotState, value: string, name: string): void {
+  const bytes = Buffer.byteLength(value, 'utf8');
+  if (bytes > MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH) {
+    throw new TypeError(`${name} exceeds maximum string length.`);
+  }
+  if (bytes > MAX_TRANSACTION_SNAPSHOT_TEXT_BYTES - state.textBytes) {
+    throw new TypeError('Durable transaction snapshot exceeds maximum text bytes.');
+  }
+  state.textBytes += bytes;
 }
 
 function isCanonicalArrayIndex(key: string): boolean {
