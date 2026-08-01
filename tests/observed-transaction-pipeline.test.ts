@@ -6,11 +6,16 @@ import {
   ObservedTransactionPipeline,
   type ObservedPipelineStage,
 } from '../src/application/observed-transaction-pipeline.js';
+import {
+  createBondingCurveTradeObservedEvent,
+  createTokenLaunchDetectedEvent,
+} from '../src/domain/launchpad-events.js';
 import type { LaunchpadObservationEventV1 } from '../src/domain/launchpad-events.js';
 import type { LaunchpadProjectionReader } from '../src/ports/launchpad-projection-reader.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 
 const SIGNATURE = 'pipeline-signature';
+const EVENT_INDEXES = new Map<string, number>();
 
 function transaction(
   confirmationStatus: NormalizedTransaction['confirmationStatus'] = 'CONFIRMED',
@@ -41,15 +46,67 @@ function event(
   mint: string,
   type: LaunchpadObservationEventV1['type'] = 'BondingCurveTradeObserved',
 ): LaunchpadObservationEventV1 {
-  return Object.freeze({ id, mint, type }) as LaunchpadObservationEventV1;
+  let instructionIndex = EVENT_INDEXES.get(id);
+  if (instructionIndex === undefined) {
+    instructionIndex = EVENT_INDEXES.size;
+    EVENT_INDEXES.set(id, instructionIndex);
+  }
+  const raw = transaction();
+  const observed = {
+    signature: raw.signature,
+    confirmationStatus: 'confirmed' as const,
+    blockTimeMs: raw.blockTimeMs,
+    observedAtMs: 1_700_000_000_500,
+    cursor: { slot: raw.slot, transactionIndex: 3 },
+    raw,
+  };
+  const cursor = {
+    slot: raw.slot,
+    transactionIndex: 3,
+    instructionIndex,
+    innerInstructionIndex: null,
+  };
+  if (type === 'TokenLaunchDetected') {
+    return createTokenLaunchDetectedEvent({
+      source: 'pumpfun',
+      program: 'PumpProgram',
+      transaction: observed,
+      launch: {
+        mint,
+        creator: `Creator_${mint}`,
+        tokenProgram: 'SPL_TOKEN',
+        quoteAssets: [{ mint: 'QuoteMint', decimals: 9, tokenProgram: 'SPL_TOKEN' }],
+        launchpad: 'pumpfun',
+        createdAt: cursor,
+        parameters: {},
+      },
+    });
+  }
+  return createBondingCurveTradeObservedEvent({
+    source: 'pumpfun',
+    program: 'PumpProgram',
+    transaction: observed,
+    trade: {
+      id,
+      launchMint: mint,
+      kind: 'BUY',
+      trader: `Trader_${id}`,
+      baseAmountRaw: 1n,
+      quoteAmountRaw: 2n,
+      quoteAsset: { mint: 'QuoteMint', decimals: 9, tokenProgram: 'SPL_TOKEN' },
+      cursor,
+    },
+  });
 }
 
 interface HarnessOptions {
   readonly tracked?: readonly string[];
   readonly activeEvents?: readonly LaunchpadObservationEventV1[];
   readonly fail?: ObservedPipelineStage;
+  readonly failMint?: string;
   readonly launchpadEventCount?: number;
   readonly launchpadAffectedMints?: readonly string[];
+  readonly launchpadAffectedValue?: unknown;
   readonly fundingAssessmentCount?: number;
   readonly fundingEvidenceCount?: number;
   readonly marketMigrationCount?: number;
@@ -60,8 +117,11 @@ function harness(options: HarnessOptions = {}) {
   const order: string[] = [];
   const observed: unknown[] = [];
   let clockCalls = 0;
-  const fail = (stage: ObservedPipelineStage): void => {
-    if (options.fail === stage) throw new Error(`secret at https://private/${stage}`);
+  const fail = (stage: ObservedPipelineStage, mint?: string): void => {
+    if (
+      options.fail === stage
+      && (options.failMint === undefined || options.failMint === mint)
+    ) throw new Error(`secret at https://private/${stage}`);
   };
   const reader: LaunchpadProjectionReader = {
     listTrackedMints: async () => {
@@ -72,7 +132,7 @@ function harness(options: HarnessOptions = {}) {
     listActiveEventsBySignature: async () => {
       order.push('reload');
       fail('reload_active_events');
-      return Object.freeze([...(options.activeEvents ?? [])]);
+      return options.activeEvents ?? Object.freeze([]);
     },
   };
   const launchpad = {
@@ -85,13 +145,17 @@ function harness(options: HarnessOptions = {}) {
           { length: options.launchpadEventCount ?? 0 },
           (_, index) => Object.freeze({ eventId: `event-${index}`, outcome: 'created' as const }),
         )),
-        affectedMints: Object.freeze([...(options.launchpadAffectedMints ?? [])]),
+        affectedMints: (options.launchpadAffectedValue
+          ?? Object.freeze([...(options.launchpadAffectedMints ?? [])])) as readonly string[],
       });
     },
   };
   const funding = {
     observe: async (input: unknown, events: readonly LaunchpadObservationEventV1[]) => {
-      order.push(`funding:${events.map((item) => item.id).join(',')}`);
+      order.push(`funding:${events.map((item) =>
+        item.type === 'BondingCurveTradeObserved'
+          ? item.payload.trade.id
+          : item.type).join(',')}`);
       observed.push(input);
       fail('funding_observation');
       return Object.freeze({
@@ -109,14 +173,14 @@ function harness(options: HarnessOptions = {}) {
   const participants = {
     rebuild: async (mint: string) => {
       order.push(`i1:${mint}`);
-      fail('participant_analytics');
+      fail('participant_analytics', mint);
       return Object.freeze({});
     },
   };
   const graph = {
     rebuild: async (mint: string) => {
       order.push(`i2:${mint}`);
-      fail('wallet_graph');
+      fail('wallet_graph', mint);
       return Object.freeze({});
     },
   };
@@ -187,8 +251,8 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
     'reload',
     'funding:trade-b,trade-a',
     'i1:MintA',
-    'i2:MintA',
     'i1:MintB',
+    'i2:MintA',
     'i2:MintB',
     'pumpswap',
   ]);
@@ -238,9 +302,27 @@ void test('uses persisted launchpad impact to dissolve orphaned projections afte
   const result = await h.pipeline.process(h.tx);
   assert.deepEqual(h.order, [
     'tracked', 'launchpad', 'reload', 'funding:',
-    'i1:MintA', 'i2:MintA', 'i1:MintZ', 'i2:MintZ', 'pumpswap',
+    'i1:MintA', 'i1:MintZ', 'i2:MintA', 'i2:MintZ', 'pumpswap',
   ]);
   assert.equal(result.affectedMintCount, 2);
+});
+
+void test('stops before every I2 rebuild when I1 fails on a later lexical mint', async () => {
+  const h = harness({
+    activeEvents: [event('event-b', 'MintB'), event('event-a', 'MintA')],
+    fail: 'participant_analytics',
+    failMint: 'MintB',
+  });
+  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'participant_analytics');
+    assert.equal(error.mint, 'MintB');
+    return true;
+  });
+  assert.deepEqual(h.order, [
+    'tracked', 'launchpad', 'reload', 'funding:event-b,event-a',
+    'i1:MintA', 'i1:MintB',
+  ]);
 });
 
 void test('keeps orphan impact on replay after tracked and active rows have already disappeared', async () => {
@@ -368,4 +450,191 @@ void test('rejects oversized dependency collections before iterating them unboun
     return true;
   });
   assert.deepEqual(h.order, ['tracked']);
+});
+
+void test('snapshots active events without invoking a stateful type getter', async () => {
+  const secret = 'https://private/type';
+  let getterCalls = 0;
+  const hostile = { ...event('getter-event', 'MintA') } as Record<string, unknown>;
+  Object.defineProperty(hostile, 'type', {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error(secret);
+    },
+  });
+  const h = harness({ activeEvents: [hostile as unknown as LaunchpadObservationEventV1] });
+  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
+    assert.equal(error.message.includes(secret), false);
+    return true;
+  });
+  assert.equal(getterCalls, 0);
+});
+
+void test('captures active event array length once from a stateful proxy', async () => {
+  let lengthReads = 0;
+  const repeated = event('proxy-event', 'MintA');
+  const target = new Array<LaunchpadObservationEventV1>(
+    MAX_OBSERVED_PIPELINE_ITEMS,
+  ).fill(repeated);
+  const events = new Proxy(target, {
+    getOwnPropertyDescriptor(value, property) {
+      if (property === 'length') {
+        lengthReads += 1;
+        if (lengthReads > 1) {
+          return {
+            ...Reflect.getOwnPropertyDescriptor(value, property),
+            value: MAX_OBSERVED_PIPELINE_ITEMS + 1,
+          };
+        }
+      }
+      return Reflect.getOwnPropertyDescriptor(value, property);
+    },
+  });
+  const h = harness({ activeEvents: events });
+  await assert.doesNotReject(h.pipeline.process(h.tx));
+  assert.equal(lengthReads, 1);
+});
+
+void test('rejects sparse, accessor, and prototype-tricked active arrays without getters', async () => {
+  let getterCalls = 0;
+  const sparse = new Array<LaunchpadObservationEventV1>(1);
+  const accessor: LaunchpadObservationEventV1[] = [];
+  Object.defineProperty(accessor, '0', {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return event('accessor-event', 'MintA');
+    },
+  });
+  Object.defineProperty(accessor, 'length', { value: 1 });
+  const wrongPrototype = [event('prototype-event', 'MintA')];
+  Object.setPrototypeOf(wrongPrototype, Object.create(Array.prototype));
+  for (const activeEvents of [sparse, accessor, wrongPrototype]) {
+    const h = harness({ activeEvents });
+    await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+      assert.ok(error instanceof ObservedPipelineError);
+      assert.equal(error.stage, 'reload_active_events');
+      return true;
+    });
+  }
+  assert.equal(getterCalls, 0);
+});
+
+void test('rejects one event ID carrying conflicting durable payloads', async () => {
+  const original = event('conflict-event', 'MintA');
+  const conflicting = Object.freeze({
+    ...original,
+    observedAtMs: original.observedAtMs + 1,
+  }) as LaunchpadObservationEventV1;
+  const h = harness({ activeEvents: [original, conflicting] });
+  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
+    return true;
+  });
+  assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload']);
+});
+
+void test('bounds tracked and launchpad affected iterators at max plus one and redacts failures', async () => {
+  const iterable = (count: number): Iterable<string> => ({
+    *[Symbol.iterator]() {
+      for (let index = 0; index < count; index += 1) yield `Mint_${index}`;
+    },
+  });
+  const h = harness();
+  const exactTracked = harness({
+    tracked: Array.from(
+      { length: MAX_OBSERVED_PIPELINE_ITEMS },
+      (_, index) => `Mint_${index}`,
+    ),
+  });
+  await assert.doesNotReject(exactTracked.pipeline.process(exactTracked.tx));
+  const trackedPipeline = new ObservedTransactionPipeline(
+    {
+      ...h.dependencies.reader,
+      listTrackedMints: async () => iterable(MAX_OBSERVED_PIPELINE_ITEMS + 1) as ReadonlySet<string>,
+    },
+    h.dependencies.launchpad,
+    h.dependencies.funding,
+    h.dependencies.participants,
+    h.dependencies.graph,
+    h.dependencies.market,
+    () => 1_700_000_000_500,
+  );
+  await assert.rejects(trackedPipeline.process(h.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'load_tracked_mints');
+    return true;
+  });
+
+  const exactAffected = harness({
+    launchpadAffectedValue: iterable(MAX_OBSERVED_PIPELINE_ITEMS),
+  });
+  const exactAffectedResult = await exactAffected.pipeline.process(exactAffected.tx);
+  assert.equal(exactAffectedResult.affectedMintCount, MAX_OBSERVED_PIPELINE_ITEMS);
+  const affected = harness({
+    launchpadAffectedValue: iterable(MAX_OBSERVED_PIPELINE_ITEMS + 1),
+  });
+  await assert.rejects(affected.pipeline.process(affected.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'launchpad_observation');
+    assert.equal('cause' in error, false);
+    return true;
+  });
+
+  const secret = 'postgres://private/iterator';
+  const throwing: Iterable<string> = {
+    [Symbol.iterator]() {
+      return {
+        next(): IteratorResult<string> {
+          throw new Error(secret);
+        },
+      };
+    },
+  };
+  for (const pipeline of [
+    new ObservedTransactionPipeline(
+      {
+        ...h.dependencies.reader,
+        listTrackedMints: async () => throwing as ReadonlySet<string>,
+      },
+      h.dependencies.launchpad,
+      h.dependencies.funding,
+      h.dependencies.participants,
+      h.dependencies.graph,
+      h.dependencies.market,
+      () => 1_700_000_000_500,
+    ),
+    harness({ launchpadAffectedValue: throwing }).pipeline,
+  ]) {
+    await assert.rejects(pipeline.process(h.tx), (error: unknown) => {
+      assert.ok(error instanceof ObservedPipelineError);
+      assert.equal(error.message.includes(secret), false);
+      assert.equal('cause' in error, false);
+      return true;
+    });
+  }
+});
+
+void test('accepts the exact active-event bound and rejects one additional item', async () => {
+  const repeated = event('bounded-event', 'MintA');
+  const exact = harness({
+    activeEvents: Object.freeze(
+      new Array<LaunchpadObservationEventV1>(MAX_OBSERVED_PIPELINE_ITEMS).fill(repeated),
+    ),
+  });
+  await assert.doesNotReject(exact.pipeline.process(exact.tx));
+  const oversized = harness({
+    activeEvents: Object.freeze(
+      new Array<LaunchpadObservationEventV1>(MAX_OBSERVED_PIPELINE_ITEMS + 1).fill(repeated),
+    ),
+  });
+  await assert.rejects(oversized.pipeline.process(oversized.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
+    return true;
+  });
 });
