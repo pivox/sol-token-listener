@@ -59,6 +59,7 @@ interface HarnessOptions {
 function harness(options: HarnessOptions = {}) {
   const order: string[] = [];
   const observed: unknown[] = [];
+  let clockCalls = 0;
   const fail = (stage: ObservedPipelineStage): void => {
     if (options.fail === stage) throw new Error(`secret at https://private/${stage}`);
   };
@@ -119,10 +120,9 @@ function harness(options: HarnessOptions = {}) {
       return Object.freeze({});
     },
   };
-  const market = {
-    observe: async (input: NormalizedTransaction) => {
+  const observeMarket = async (input: unknown) => {
       order.push('pumpswap');
-      assert.equal(input, tx);
+      observed.push(input);
       fail('pumpswap_observation');
       return Object.freeze({
         migrations: Object.freeze(Array.from(
@@ -134,7 +134,10 @@ function harness(options: HarnessOptions = {}) {
           () => Object.freeze({}),
         )),
       });
-    },
+  };
+  const market = {
+    observe: observeMarket,
+    processObserved: observeMarket,
   };
   const tx = transaction();
   const pipeline = new ObservedTransactionPipeline(
@@ -145,6 +148,7 @@ function harness(options: HarnessOptions = {}) {
     graph,
     market,
     () => {
+      clockCalls += 1;
       fail('create_observation');
       return 1_700_000_000_500;
     },
@@ -154,6 +158,7 @@ function harness(options: HarnessOptions = {}) {
     tx,
     order,
     observed,
+    clockCalls: () => clockCalls,
     dependencies: { reader, launchpad, funding, participants, graph, market },
   };
 }
@@ -187,9 +192,11 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
     'i2:MintB',
     'pumpswap',
   ]);
-  assert.equal(h.observed.length, 2);
+  assert.equal(h.observed.length, 3);
   assert.equal(h.observed[0], h.observed[1]);
+  assert.equal(h.observed[1], h.observed[2]);
   assert.ok(Object.isFrozen(h.observed[0]));
+  assert.equal(h.clockCalls(), 1);
   assert.deepEqual(result, {
     launchpadEventCount: 3,
     activeEventCount: 3,

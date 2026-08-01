@@ -14,6 +14,7 @@ import type { DecodedPumpTransaction } from '../src/launchpads/pumpfun/types.js'
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { PumpSwapMarketAdapter } from '../src/markets/pumpswap/pumpswap-market.adapter.js';
 import type { DecodedPumpSwapTransaction } from '../src/markets/pumpswap/types.js';
+import { createSolanaObservedTransaction } from '../src/solana/rpc/observed-transaction.js';
 import type { NormalizedInstruction, NormalizedTransaction } from '../src/solana/rpc/types.js';
 
 void test('PumpSwap observation pipeline persists migration and canonical activation', async () => {
@@ -55,6 +56,50 @@ void test('PumpSwap observation pipeline persists migration and canonical activa
     repository.recordedBatches[0]?.reserveSnapshots[0]?.reserves.observedSlot,
     12n,
   );
+});
+
+void test('processes a provided observed envelope without creating a second clock observation', async () => {
+  const repository = new MemoryRepository();
+  const pool = canonicalPool();
+  let clockCalls = 0;
+  const pipeline = new PumpSwapObservationPipeline(
+    new PumpFunLaunchpadAdapter(
+      { read: () => Promise.reject(new Error('unused')) },
+      (value) => pumpEvidence(value),
+    ),
+    new PumpSwapMarketAdapter(
+      () => marketEvidence(),
+      { validate: () => Promise.resolve(pool) },
+      {
+        read: () => Promise.resolve({
+          pool: pool.address,
+          baseReservesRaw: 10_000n,
+          quoteVaultAmountRaw: 20_000n,
+          virtualQuoteReservesRaw: 5_000n,
+          effectiveQuoteReservesRaw: 25_000n,
+          observedSlot: 12n,
+          observedAtMs: 2_100,
+        }),
+      },
+      { quote: () => Promise.reject(new Error('unused')) },
+      () => undefined,
+    ),
+    new MarketObservationService(repository),
+    () => {
+      clockCalls += 1;
+      return 2_000;
+    },
+  );
+  const observed = createSolanaObservedTransaction(transaction(), 2_000);
+
+  const result = await pipeline.processObserved(observed);
+
+  assert.equal(clockCalls, 0);
+  assert.equal(result.migrations.length, 1);
+  assert.equal(result.activations.length, 1);
+  const standaloneResult = await pipeline.observe(observed.raw);
+  assert.equal(clockCalls, 1);
+  assert.deepEqual(standaloneResult, result);
 });
 
 void test('PumpSwap observation pipeline ignores unrelated transactions without writes', async () => {

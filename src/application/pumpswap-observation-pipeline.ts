@@ -12,7 +12,10 @@ import type {
   MarketObservationResult,
   MarketReserveObservation,
 } from '../ports/market-observation-repository.js';
-import { createSolanaObservedTransaction } from '../solana/rpc/observed-transaction.js';
+import {
+  createSolanaObservedTransaction,
+  type SolanaObservedTransaction,
+} from '../solana/rpc/observed-transaction.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { stringifyJson } from '../utils/json.js';
 import type { MarketObservationService } from './market-observation.service.js';
@@ -48,10 +51,18 @@ export class PumpSwapObservationPipeline {
     if (!invokesPumpOrPumpSwap(transaction)) {
       return EMPTY_MARKET_OBSERVATION_RESULT;
     }
-    const observed = createSolanaObservedTransaction(
-      transaction,
-      this.clock(),
+    return this.processObserved(
+      createSolanaObservedTransaction(transaction, this.clock()),
     );
+  }
+
+  public async processObserved(
+    observed: SolanaObservedTransaction,
+  ): Promise<MarketObservationResult> {
+    const transaction = observed.raw;
+    if (!invokesPumpOrPumpSwap(transaction)) {
+      return EMPTY_MARKET_OBSERVATION_RESULT;
+    }
     const [activePools, migrations, evidence, detectedPools] =
       await Promise.all([
         this.service.loadActivePools(),

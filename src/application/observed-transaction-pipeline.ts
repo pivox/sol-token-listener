@@ -73,7 +73,9 @@ interface MarketObservationResult {
 }
 
 interface MarketObserver {
-  observe(transaction: NormalizedTransaction): Promise<MarketObservationResult>;
+  processObserved(
+    transaction: SolanaObservedTransaction,
+  ): Promise<MarketObservationResult>;
 }
 
 export class ObservedTransactionPipeline {
@@ -140,7 +142,7 @@ export class ObservedTransactionPipeline {
     }
 
     const market = await this.stage('pumpswap_observation', null, () =>
-      this.market.observe(transaction));
+      this.market.processObserved(observed));
     const [marketMigrationCount, marketActivationCount] = await this.stage(
       'pumpswap_observation',
       null,
