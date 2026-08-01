@@ -25,7 +25,8 @@ void test('creates a replayable bigint-safe transaction inbox with strict lifecy
   assert.match(sql, /immutable_fingerprint TEXT/u);
   assert.match(sql, /error_code TEXT/u);
   assert.match(sql, /error_name TEXT/u);
-  assert.match(sql, /error_message TEXT/u);
+  assert.match(sql, /error_retryable BOOLEAN/u);
+  assert.doesNotMatch(sql, /error_message/iu);
   assert.match(sql, /blockchain_time TIMESTAMPTZ/u);
   assert.match(sql, /observed_at TIMESTAMPTZ NOT NULL/u);
   assert.match(sql, /processed_at TIMESTAMPTZ/u);
@@ -37,6 +38,8 @@ void test('creates a replayable bigint-safe transaction inbox with strict lifecy
   assert.match(sql, /processing_status IN \('PENDING', 'PROCESSING', 'PROCESSED', 'FAILED'\)/u);
   assert.match(sql, /attempts >= 0/u);
   assert.match(sql, /missing_finality_polls >= 0/u);
+  assert.match(sql, /processing_status = 'FAILED'[\s\S]*error_code IS NOT NULL[\s\S]*error_code IN \([\s\S]*error_name IS NOT NULL[\s\S]*error_retryable IS NOT NULL/u);
+  assert.match(sql, /processing_status <> 'FAILED'[\s\S]*error_code IS NULL[\s\S]*error_name IS NULL[\s\S]*error_retryable IS NULL/u);
   assert.match(sql, /lease_token IS NULL AND lease_expires_at IS NULL/u);
   assert.match(sql, /normalized_transaction IS NULL AND immutable_fingerprint IS NULL/u);
   assert.match(sql, /normalized_transaction IS NOT NULL[\s\S]*immutable_fingerprint IS NOT NULL[\s\S]*immutable_fingerprint ~ '\^\[0-9a-f\]\{64\}\$'/u);
@@ -146,6 +149,42 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
     await pool.query(sql);
     await pool.query(sql);
     assert.equal((await pool.query('SELECT COUNT(*) FROM processing_checkpoints')).rows[0]?.count, '0');
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, target_confirmation_status,
+      processing_status, error_code, error_name, error_retryable, observed_at
+    ) VALUES (
+      'failed-structured', 42, ARRAY['WEBSOCKET'], 'confirmed',
+      'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', FALSE, NOW()
+    )`);
+    assert.equal((await pool.query(
+      "SELECT 1 FROM chain_transaction_inbox WHERE signature = 'failed-structured'",
+    )).rowCount, 1);
+    await assert.rejects(
+      pool.query(`INSERT INTO chain_transaction_inbox (
+        signature, observed_slot, discovery_sources, target_confirmation_status,
+        processing_status, error_code, error_name, observed_at
+      ) VALUES (
+        'failed-incomplete', 43, ARRAY['CATCH_UP'], 'confirmed',
+        'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', NOW()
+      )`),
+      /chain_transaction_inbox_error_check/u,
+    );
+    await assert.rejects(
+      pool.query(`INSERT INTO chain_transaction_inbox (
+        signature, observed_slot, discovery_sources, target_confirmation_status,
+        processing_status, error_name, error_retryable, observed_at
+      ) VALUES (
+        'failed-without-code', 44, ARRAY['CATCH_UP'], 'confirmed',
+        'FAILED', 'TransactionNormalizationError', FALSE, NOW()
+      )`),
+      /chain_transaction_inbox_error_check/u,
+    );
+    await assert.rejects(
+      pool.query(`UPDATE chain_transaction_inbox
+        SET processing_status = 'PENDING'
+        WHERE signature = 'failed-structured'`),
+      /chain_transaction_inbox_error_check/u,
+    );
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);

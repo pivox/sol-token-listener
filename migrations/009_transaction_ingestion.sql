@@ -13,7 +13,6 @@ CREATE TABLE IF NOT EXISTS chain_transaction_inbox (
   immutable_fingerprint TEXT,
   error_code TEXT,
   error_name TEXT,
-  error_message TEXT,
   error_retryable BOOLEAN,
   blockchain_time TIMESTAMPTZ,
   observed_at TIMESTAMPTZ NOT NULL,
@@ -68,6 +67,7 @@ CREATE TABLE IF NOT EXISTS chain_transaction_inbox (
   CONSTRAINT chain_transaction_inbox_error_check CHECK (
     (
       processing_status = 'FAILED'
+      AND error_code IS NOT NULL
       AND error_code IN (
         'RPC_TRANSIENT',
         'TRANSACTION_NOT_AVAILABLE',
@@ -80,14 +80,11 @@ CREATE TABLE IF NOT EXISTS chain_transaction_inbox (
       )
       AND error_name IS NOT NULL
       AND LENGTH(error_name) BETWEEN 1 AND 128
-      AND error_message IS NOT NULL
-      AND LENGTH(error_message) BETWEEN 1 AND 512
       AND error_retryable IS NOT NULL
     ) OR (
       processing_status <> 'FAILED'
       AND error_code IS NULL
       AND error_name IS NULL
-      AND error_message IS NULL
       AND error_retryable IS NULL
     )
   ),
