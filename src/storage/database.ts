@@ -164,6 +164,17 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       `DELETE FROM creator_profiles profile USING token_launches launch
        WHERE profile.mint = launch.mint AND launch.purge_after <= NOW()`,
     );
+    await client.query(
+      `UPDATE chain_transaction_inbox
+       SET terminal_at = processed_at,
+           purge_after = processed_at + INTERVAL '4 hours',
+           updated_at = GREATEST(updated_at, processed_at)
+       WHERE processing_status = 'PROCESSED'
+         AND target_confirmation_status IN ('finalized', 'orphaned')
+         AND processed_at IS NOT NULL
+         AND terminal_at IS NULL
+         AND purge_after IS NULL`,
+    );
     const transactionInbox = await client.query(
       `DELETE FROM chain_transaction_inbox
        WHERE processing_status = 'PROCESSED'

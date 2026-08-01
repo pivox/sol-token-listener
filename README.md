@@ -4,11 +4,10 @@ Backend TypeScript d'observation de tokens Pump.fun et de projections PumpSwap
 et paper trading. Il expose aussi une API publique V1 HTTP/SSE, strictement en
 lecture seule.
 
-Le listener RPC Pump.fun n'est pas encore composé dans le bootstrap : démarrer
-l'application ne souscrit à aucun flux réseau Pump.fun. L'API peut donc servir
-des projections PostgreSQL existantes sans prétendre détecter de nouveaux
-événements par elle-même. Raydium CPMM demeure un adaptateur secondaire isolé;
-son code n'est pas activé par ce bootstrap.
+Le listener durable Pump.fun/PumpSwap est composé et activé par défaut. Il
+combine souscriptions WebSocket, rattrapage HTTP borné, inbox PostgreSQL avec
+leases et réconciliation de finalité. Raydium CPMM demeure un adaptateur
+secondaire isolé; son code n'est pas activé par ce bootstrap.
 
 ## Sécurité et limites
 
@@ -19,7 +18,9 @@ son code n'est pas activé par ce bootstrap.
 - Le paper trading est une projection simulée, initialement limitée à SOL/WSOL
   par allowlist; il ne démontre ni profit ni sellabilité.
 - Aucune promesse de première position, même slot, sortie ou profit.
-- Le listener RPC est inactif et Raydium CPMM reste non composé.
+- L'observation accepte plusieurs quote assets, mais le paper trading refuse
+  tout mint hors de l'allowlist initiale SOL/WSOL.
+- Raydium CPMM reste non composé.
 
 ## Installation
 
@@ -41,6 +42,23 @@ défaut; les exécuter explicitement si nécessaire :
 ```bash
 npm run db:migrate
 ```
+
+Avec `LISTENER_ENABLED=true`, PostgreSQL et les endpoints Solana HTTP/WebSocket
+sont des dépendances de démarrage. L'ordre est : migrations optionnelles,
+health check RPC, rattrapage, souscriptions, worker, réconciliation de finalité,
+heartbeat, puis API. Un échec de dépendance ou de composant interrompt le
+démarrage et ferme les ressources déjà ouvertes. `LISTENER_ENABLED=false`
+désactive explicitement le listener et expose un pipeline `STOPPED` si l'API
+reste active.
+
+Le WebSocket est le chemin nominal. Au démarrage, le rattrapage HTTP est borné
+par `LISTENER_CATCH_UP_MAX_PAGES` pages de
+`LISTENER_CATCH_UP_PAGE_SIZE` signatures pour chacun des programmes Pump.fun
+et PumpSwap (20 × 100 par défaut). Les retries et la réconciliation sont eux
+aussi bornés; la consommation RPC dépend néanmoins du trafic et des reprises.
+L'arrêt ferme les producteurs, empêche de nouvelles prises de lease, draine le
+worker puis écrit le heartbeat final, dans la limite de
+`LISTENER_SHUTDOWN_TIMEOUT_MS`.
 
 ## API V1
 
@@ -93,8 +111,10 @@ utilise les flux positifs observés par I1 depuis l'arrivée du token, pas un
 solde SPL certifié ou un historique antérieur. Une analyse réussie sans
 cluster est `AVAILABLE` avec `clusters: []`.
 
-Ces services restent non composés dans `src/app.ts` : démarrer l'API
-n'observe aucune transaction et ne reconstruit aucun graphe. Les reason codes
+Le pipeline actif enchaîne détection launchpad, preuves de financement,
+reconstructions I1/I2 et PumpSwap. Une transaction échouée est rejouée depuis
+le début de ce pipeline; les écritures déterministes rendent ce replay complet
+idempotent, sans saut d'étape. Les reason codes
 `SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` existent comme
 contrats stables, mais restent désactivés jusqu'au calibrage dry run.
 
@@ -103,7 +123,17 @@ limites clusters/membres valent respectivement 50/50, avec un budget total de
 500 membres, 8 quote assets par cluster et 64 au total ; les troncatures sont
 explicites.
 Toutes les projections et preuves I2 suivent la rétention terminale de quatre
-heures.
+heures. Seules les données `finalized` ou `orphaned` devenues terminales sont
+purgeables; une transaction `processed` ou `confirmed` en attente de finalité
+ne l'est jamais. Cette fenêtre limite aussi la durée de conservation des
+données publiques de wallets observées; elle ne constitue pas un historique
+on-chain exhaustif.
+
+`GET /api/v1/health` publie l'état courant des composants, le backlog, les
+leases, checkpoints et slots observés, sans URL RPC/DB ni secret. `RUNNING`
+exige tous les composants actifs; une dépendance, un heartbeat périmé ou un
+nettoyage incomplet produit `DEGRADED`; `STOPPED` désigne l'arrêt ou la
+désactivation explicite.
 
 ## Architecture
 
