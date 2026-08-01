@@ -28,6 +28,8 @@ void test('atomically persists creation and initial buy and restores active even
   const batch = fixture('confirmed');
   const result = await repository.record(batch);
   assert.deepEqual(result.events.map((item) => item.outcome), ['created', 'created']);
+  assert.deepEqual(result.affectedMints, ['mint-a']);
+  assert.ok(Object.isFrozen(result.affectedMints));
   const counts = await pool.query(`SELECT
     (SELECT COUNT(*)::int FROM raw_chain_events) raw,
     (SELECT COUNT(*)::int FROM domain_events) domain,

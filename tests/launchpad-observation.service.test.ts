@@ -180,6 +180,7 @@ class RecordingSink implements LaunchpadEventSink {
           eventId: event.id,
           outcome: 'created' as const,
         })),
+        affectedMints: [...new Set(batch.events.map((event) => event.mint))].sort(),
       };
     };
 }
@@ -271,6 +272,7 @@ void test('records out-of-order launches once in full-cursor order with their in
     result.events,
     batch.events.map((event) => ({ eventId: event.id, outcome: 'created' })),
   );
+  assert.deepEqual(result.affectedMints, [first.mint, second.mint]);
 });
 
 void test('records a first-seen orphaned launch for audit without applying DETECTED state', async () => {
@@ -535,9 +537,10 @@ void test('returns a frozen empty result without recording while still running b
   assert.equal(adapter.decodeCalls.length, 1);
   assert.deepEqual(adapter.decodeCalls[0]?.trackedMints, new Set([EXISTING_MINT]));
   assert.equal(sink.batches.length, 0);
-  assert.deepEqual(result, { events: [] });
+  assert.deepEqual(result, { events: [], affectedMints: [] });
   assert.ok(Object.isFrozen(result));
   assert.ok(Object.isFrozen(result.events));
+  assert.ok(Object.isFrozen(result.affectedMints));
 });
 
 void test('records adapter and transaction metadata on the complete batch', async () => {

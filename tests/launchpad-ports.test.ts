@@ -79,7 +79,10 @@ void broadlyTypedAdapter;
 
 class Sink implements LaunchpadEventSink {
   public readonly record = async (batch: Parameters<LaunchpadEventSink['record']>[0]) => {
-    return { events: batch.events.map((event) => ({ eventId: event.id, outcome: 'created' as const })) };
+    return {
+      events: batch.events.map((event) => ({ eventId: event.id, outcome: 'created' as const })),
+      affectedMints: [...new Set(batch.events.map((event) => event.mint))].sort(),
+    };
   };
 }
 
@@ -87,7 +90,10 @@ type FinalizedBatch = LaunchpadEventBatch & { readonly confirmationStatus: 'fina
 
 const finalizedOnlySink = {
   async record(batch: FinalizedBatch) {
-    return { events: batch.events.map((event) => ({ eventId: event.id, outcome: 'created' as const })) };
+    return {
+      events: batch.events.map((event) => ({ eventId: event.id, outcome: 'created' as const })),
+      affectedMints: [...new Set(batch.events.map((event) => event.mint))].sort(),
+    };
   },
 };
 
@@ -162,7 +168,7 @@ void test('accepts an empty processed event-batch contract', async () => {
 
   const result = await new Sink().record(batch);
 
-  assert.deepEqual(result, { events: [] });
+  assert.deepEqual(result, { events: [], affectedMints: [] });
 });
 
 void test('preserves input event identity and order in the event-batch result shape', async () => {
@@ -193,6 +199,7 @@ void test('preserves input event identity and order in the event-batch result sh
 
   assert.equal(retractAction, 'retract');
   assert.deepEqual(result.events, [{ eventId: event.id, outcome: 'created' }]);
+  assert.deepEqual(result.affectedMints, [event.mint]);
 });
 
 void test('accepts only initial DETECTED transitions in apply batches at compile time', () => {

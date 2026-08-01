@@ -104,7 +104,10 @@ class RecordingSink implements LaunchpadEventSink {
 
   public readonly record: LaunchpadEventSink['record'] = async (batch) => {
     this.events = batch.events;
-    return { events: batch.events.map((event) => ({ eventId: event.id, outcome: 'created' })) };
+    return {
+      events: batch.events.map((event) => ({ eventId: event.id, outcome: 'created' })),
+      affectedMints: [...new Set(batch.events.map((event) => event.mint))].sort(),
+    };
   };
 }
 

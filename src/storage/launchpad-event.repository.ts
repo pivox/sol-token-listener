@@ -89,6 +89,9 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
             eventId: event.id,
             outcome: requiredOutcome(byId, event.id),
           }))),
+          affectedMints: Object.freeze(
+            [...new Set(batch.events.map((event) => event.mint))].sort(),
+          ),
         });
       } catch (error) {
         try { await client.query('ROLLBACK'); } catch { throw new LaunchpadEventRepositoryError('record'); }

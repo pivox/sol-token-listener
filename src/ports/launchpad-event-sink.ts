@@ -48,6 +48,8 @@ export type LaunchpadEventBatch =
 
 export interface LaunchpadEventBatchResult {
   readonly events: readonly EventRecordResult[];
+  /** Unique lexical mints in the reconciled batch, including retractions. */
+  readonly affectedMints: readonly string[];
 }
 
 export class InvalidLaunchpadEventBatchError extends Error {
