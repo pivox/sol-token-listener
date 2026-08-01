@@ -5,6 +5,7 @@ import pg from 'pg';
 import { createTokenLaunchDetectedEvent, createBondingCurveTradeObservedEvent } from '../src/domain/launchpad-events.js';
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
 import { ConfirmationStatusConflictError } from '../src/domain/confirmation-status.js';
+import type { LaunchpadEventBatch } from '../src/ports/launchpad-event-sink.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
 import { toJsonValue } from '../src/utils/json.js';
@@ -36,11 +37,74 @@ void test('atomically persists creation and initial buy and restores active even
   const tracked = await repository.listTrackedMints();
   assert.deepEqual([...tracked], ['mint-a']);
   assert.throws(() => (tracked as Set<string>).add('mutated'), TypeError);
+  const ownerValues: ReadonlySet<string>[] = [];
+  const thisArg = { marker: true };
+  tracked.forEach(function (this: typeof thisArg, _value, _key, owner) {
+    assert.equal(this, thisArg);
+    ownerValues.push(owner);
+    assert.throws(() => (owner as Set<string>).add('mutated'), TypeError);
+  }, thisArg);
+  assert.deepEqual(ownerValues, [tracked]);
   const restored = await repository.listActiveEventsBySignature('signature-a');
   assert.deepEqual(restored, batch.events);
   assert.equal(restored[1]?.type, 'BondingCurveTradeObserved');
   assert.equal(typeof (restored[1]?.type === 'BondingCurveTradeObserved' ? restored[1].payload.trade.baseAmountRaw : null), 'bigint');
   assert.equal(Object.isFrozen(restored), true);
+});
+
+void test('canonical payload fingerprints ignore reordered outer and nested keys', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(pool);
+    const batch = fixture('confirmed');
+    await repository.record(batch);
+    const launchEvent = batch.events[0];
+    assert.ok(launchEvent?.type === 'TokenLaunchDetected');
+    const launch = launchEvent.payload.launch;
+    const reorderedEvent = {
+      payload: { launch: {
+        parameters: { nested: { a: 1, b: 2 }, initialSupply: 1_000_000_000_000_000_000n },
+        createdAt: { innerInstructionIndex: null, instructionIndex: 2, transactionIndex: 4, slot: 9_007_199_254_740_993n },
+        launchpad: launch.launchpad, quoteAssets: launch.quoteAssets.map((quote) => ({ tokenProgram: quote.tokenProgram, decimals: quote.decimals, mint: quote.mint })),
+        tokenProgram: launch.tokenProgram, creator: launch.creator, mint: launch.mint,
+      } },
+      payloadVersion: launchEvent.payloadVersion, observedAtMs: launchEvent.observedAtMs,
+      blockchainTimeMs: launchEvent.blockchainTimeMs, confirmationStatus: launchEvent.confirmationStatus,
+      cursor: { innerInstructionIndex: null, instructionIndex: 2, transactionIndex: 4, slot: 9_007_199_254_740_993n },
+      signature: launchEvent.signature, program: launchEvent.program, source: launchEvent.source,
+      mint: launchEvent.mint, type: launchEvent.type, id: launchEvent.id,
+    } as typeof launchEvent;
+    const tradeEvent = batch.events[1];
+    assert.ok(tradeEvent);
+    const replay = await repository.record({ ...batch, events: [reorderedEvent, tradeEvent] });
+    assert.deepEqual(replay.events.map((event) => event.outcome), ['duplicate', 'duplicate']);
+    assert.equal((await pool.query('SELECT COUNT(*)::int count FROM raw_chain_events')).rows[0].count, 2);
+    assert.equal((await repository.listActiveEventsBySignature(batch.signature)).length, 2);
+  });
+});
+
+void test('redacts hostile batches before connecting without invoking getters', async () => {
+  let connections = 0;
+  let getterCalls = 0;
+  const repository = new PostgresLaunchpadEventRepository({ connect: () => { connections += 1; throw new Error('secret-connect'); } });
+  const getterBatch = Object.defineProperty({}, 'source', { enumerable: true, get() { getterCalls += 1; throw new Error('secret-getter'); } });
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  const hostile = [
+    getterBatch,
+    new Proxy({}, { getPrototypeOf() { throw new Error('secret-proxy'); } }),
+    cyclic,
+    { ...fixture('confirmed'), events: new Array(1_025).fill(fixture('confirmed').events[0]) },
+  ];
+  for (const value of hostile) {
+    await assert.rejects(repository.record(value as LaunchpadEventBatch), (error: unknown) => {
+      assert.equal((error as Error).message, 'Launchpad event repository operation failed.');
+      assert.equal(JSON.stringify(error).includes('secret'), false);
+      assert.equal(Object.hasOwn(error as object, 'cause'), false);
+      return true;
+    });
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(connections, 0);
 });
 
 void test('preserves multiple outer and inner events in one transaction and accepts different signatures concurrently', async (context) => {
@@ -167,6 +231,29 @@ void test('rejects stored transition identity, reason, and evidence contradictio
   });
 });
 
+void test('rejects immutable corruption in every persisted launchpad projection', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(pool);
+    const batch = fixture('confirmed');
+    await repository.record(batch);
+    const mutations = [
+      { mutate: "UPDATE raw_chain_events SET mint='corrupt' WHERE mint='mint-a'", restore: "UPDATE raw_chain_events SET mint='mint-a' WHERE mint='corrupt'" },
+      { mutate: "UPDATE domain_events SET program='corrupt' WHERE type='TokenLaunchDetected'", restore: "UPDATE domain_events SET program='pump' WHERE program='corrupt'" },
+      { mutate: "UPDATE domain_events SET raw_event_id=NULL WHERE type='TokenLaunchDetected'", restore: "UPDATE domain_events SET raw_event_id=(SELECT raw.event_id FROM raw_chain_events raw WHERE raw.payload->>'id'=domain_events.event_id) WHERE type='TokenLaunchDetected'" },
+      { mutate: "UPDATE token_launches SET creator='corrupt' WHERE mint='mint-a'", restore: "UPDATE token_launches SET creator='creator' WHERE mint='mint-a'" },
+      { mutate: "UPDATE launch_trades SET base_amount_raw=2 WHERE mint='mint-a'", restore: "UPDATE launch_trades SET base_amount_raw=9007199254740993 WHERE mint='mint-a'" },
+    ];
+    for (const mutation of mutations) {
+      await pool.query(mutation.mutate);
+      await assert.rejects(repository.record(batch), (error: unknown) => {
+        assert.equal((error as Error).name, 'LaunchpadEventConflictError');
+        return true;
+      });
+      await pool.query(mutation.restore);
+    }
+  });
+});
+
 void test('rejects finalized orphaning and immutable payload contradictions', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresLaunchpadEventRepository(pool);
@@ -221,6 +308,49 @@ void test('reader sorts full cursors, restores bigints, and rejects corrupt rows
   });
 });
 
+void test('active signature reader uses its full-cursor partial index without a sort', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(pool);
+    await repository.record(fixture('confirmed'));
+    await pool.query(`INSERT INTO raw_chain_events (
+      event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+      inner_instruction_index,confirmation_status,observed_at,payload_version,payload,
+      processing_status
+    ) SELECT 'plan-raw-' || value,'pumpfun','pump','plan-mint-' || value,
+      'plan-signature-' || value,value,0,0,NULL,'confirmed',clock_timestamp(),1,
+      '{}'::jsonb,'processed' FROM generate_series(1, 20000) AS value`);
+    await pool.query(`INSERT INTO domain_events (
+      event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+      instruction_index,inner_instruction_index,confirmation_status,observed_at,
+      payload_version,payload
+    ) SELECT 'plan-domain-' || value,'plan-raw-' || value,'TokenLaunchDetected',
+      'plan-mint-' || value,'pumpfun','pump','plan-signature-' || value,value,0,0,
+      NULL,'confirmed',clock_timestamp(),1,'{}'::jsonb
+      FROM generate_series(1, 20000) AS value`);
+    await pool.query('ANALYZE raw_chain_events');
+    await pool.query('ANALYZE domain_events');
+    const explained = await pool.query(`EXPLAIN (FORMAT JSON) SELECT
+      domain.event_id,domain.raw_event_id,domain.type,domain.mint,domain.source,
+      domain.program,domain.signature,domain.slot::text AS slot,
+      domain.transaction_index,domain.instruction_index,domain.inner_instruction_index,
+      domain.confirmation_status,domain.blockchain_time,domain.observed_at,
+      domain.payload_version,domain.payload,raw.payload AS raw_payload,
+      raw.confirmation_status AS raw_confirmation_status
+      FROM domain_events AS domain
+      JOIN raw_chain_events AS raw ON raw.event_id=domain.raw_event_id
+      WHERE domain.signature=$1 AND domain.confirmation_status <> 'orphaned'
+        AND domain.terminal_at IS NULL
+      ORDER BY domain.slot,domain.transaction_index,domain.instruction_index,
+        COALESCE(domain.inner_instruction_index,-1),domain.event_id`, ['signature-a']);
+    const nodes = planNodes(explained.rows[0]);
+    assert.equal(nodes.some((node) => node['Node Type'] === 'Sort'), false);
+    assert.equal(nodes.some((node) =>
+      node['Index Name'] === 'domain_events_active_signature_cursor_idx'), true);
+    assert.deepEqual((await repository.listActiveEventsBySignature('signature-a'))
+      .map((event) => event.type), ['TokenLaunchDetected', 'BondingCurveTradeObserved']);
+  });
+});
+
 void test('rolls back statement failures, releases clients, and redacts database secrets', async () => {
   let released = false;
   const secret = 'postgres://user:password@secret-host/private';
@@ -249,7 +379,7 @@ async function withDatabase(context: { skip(message?: string): void }, run: (poo
 function fixture(status: 'processed' | 'confirmed' | 'finalized' | 'orphaned', signature = 'signature-a', mint = 'mint-a', observedAtMs = 2_000, blockTimeMs: number | null = 1_000) {
   const transaction = { signature, confirmationStatus: status, blockTimeMs, observedAtMs, cursor: { slot: 9_007_199_254_740_993n, transactionIndex: 4 }, raw: null };
   const quoteAsset = { mint: 'quote', decimals: 9, tokenProgram: 'SPL_TOKEN' as const };
-  const launch = createTokenLaunchDetectedEvent({ source: 'pumpfun', program: 'pump', transaction, launch: { mint, creator: 'creator', tokenProgram: 'SPL_TOKEN', quoteAssets: [quoteAsset], launchpad: 'pumpfun', createdAt: { ...transaction.cursor, instructionIndex: 2, innerInstructionIndex: null }, parameters: { initialSupply: 1_000_000_000_000_000_000n } } });
+  const launch = createTokenLaunchDetectedEvent({ source: 'pumpfun', program: 'pump', transaction, launch: { mint, creator: 'creator', tokenProgram: 'SPL_TOKEN', quoteAssets: [quoteAsset], launchpad: 'pumpfun', createdAt: { ...transaction.cursor, instructionIndex: 2, innerInstructionIndex: null }, parameters: { initialSupply: 1_000_000_000_000_000_000n, nested: { b: 2, a: 1 } } } });
   const trade = createBondingCurveTradeObservedEvent({ source: 'pumpfun', program: 'pump', transaction, trade: { id: `trade-${mint}`, launchMint: mint, kind: 'BUY', trader: 'buyer', baseAmountRaw: 9007199254740993n, quoteAmountRaw: 1000000000n, quoteAsset, cursor: { ...transaction.cursor, instructionIndex: 2, innerInstructionIndex: 1 } } });
   return status === 'orphaned' ? { source: 'pumpfun', program: 'pump', signature: transaction.signature, confirmationStatus: status, events: [launch, trade], stateTransitionAction: 'retract' as const, transitions: [] as const } : { source: 'pumpfun', program: 'pump', signature: transaction.signature, confirmationStatus: status, events: [launch, trade], stateTransitionAction: 'apply' as const, transitions: [createInitialDetectedTransition(launch)] };
 }
@@ -266,4 +396,27 @@ async function storedOccurrence(pool: InstanceType<typeof pg.Pool>): Promise<{
   const row = result.rows[0];
   assert.ok(row);
   return row;
+}
+
+function planNodes(row: unknown): readonly Record<string, unknown>[] {
+  if (typeof row !== 'object' || row === null) throw new TypeError('Missing query plan.');
+  const value = Object.values(row as Record<string, unknown>)[0];
+  if (!Array.isArray(value) || typeof value[0] !== 'object' || value[0] === null) {
+    throw new TypeError('Invalid query plan.');
+  }
+  const root = (value[0] as Record<string, unknown>).Plan;
+  if (typeof root !== 'object' || root === null) throw new TypeError('Invalid query plan root.');
+  const nodes: Record<string, unknown>[] = [];
+  const visit = (node: Record<string, unknown>): void => {
+    nodes.push(node);
+    const children = node.Plans;
+    if (Array.isArray(children)) {
+      for (const child of children) {
+        if (typeof child !== 'object' || child === null) throw new TypeError('Invalid query plan node.');
+        visit(child as Record<string, unknown>);
+      }
+    }
+  };
+  visit(root as Record<string, unknown>);
+  return nodes;
 }

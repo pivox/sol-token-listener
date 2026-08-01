@@ -1,4 +1,3 @@
-import { isDeepStrictEqual } from 'node:util';
 import {
   createBondingCurveTradeObservedEvent,
   createTokenLaunchDetectedEvent,
@@ -17,7 +16,7 @@ import {
   type LaunchpadEventSink,
 } from '../ports/launchpad-event-sink.js';
 import type { LaunchpadProjectionReader } from '../ports/launchpad-projection-reader.js';
-import { fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
+import { canonicalStringifyJson, fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 import { createRepositoryId } from './repositories.js';
 
@@ -48,8 +47,8 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     private readonly now: () => number = Date.now,
   ) {}
 
-  public async record(batch: LaunchpadEventBatch): Promise<LaunchpadEventBatchResult> {
-    assertValidLaunchpadEventBatch(batch);
+  public async record(input: LaunchpadEventBatch): Promise<LaunchpadEventBatchResult> {
+    const batch = prepareLaunchpadBatch(input);
     const ids = new Set<string>();
     for (const event of batch.events) {
       if (ids.has(event.id)) throw conflict('identity');
@@ -135,7 +134,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     terminal: readonly [Date | null, Date | null],
   ): Promise<EventRecordOutcome> {
     const rawPayload = rawSnapshot(event);
-    const rawId = rawFingerprint(event.id, rawPayload);
+    const rawId = rawFingerprint(event.id);
     const found = await client.query(`SELECT event_id,source,program,mint,signature,
       slot::text AS slot,transaction_index,instruction_index,inner_instruction_index,
       payload_version,payload,confirmation_status FROM raw_chain_events
@@ -180,8 +179,8 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
   }
 
   private async writeDomain(client: Client, rawId: string, event: LaunchpadObservationEventV1, status: ChainConfirmationStatus): Promise<void> {
-    const existing = await client.query('SELECT payload,type,mint,source,program,signature,slot::text AS slot,transaction_index,instruction_index,inner_instruction_index,payload_version FROM domain_events WHERE event_id=$1 FOR UPDATE', [event.id]);
-    if (existing.rows[0] !== undefined) assertDomainMatches(existing.rows[0], event);
+    const existing = await client.query('SELECT raw_event_id,payload,type,mint,source,program,signature,slot::text AS slot,transaction_index,instruction_index,inner_instruction_index,payload_version FROM domain_events WHERE event_id=$1 FOR UPDATE', [event.id]);
+    if (existing.rows[0] !== undefined) assertDomainMatches(existing.rows[0], event, rawId);
     const result = await client.query(`INSERT INTO domain_events (
       event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
       instruction_index,inner_instruction_index,confirmation_status,blockchain_time,
@@ -201,8 +200,11 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     transition: InitialDetectedStateTransition,
   ): Promise<void> {
     const launch = event.payload.launch;
-    const existing = await client.query('SELECT * FROM token_launches WHERE mint=$1 FOR UPDATE', [event.mint]);
-    if (existing.rows[0] !== undefined && requiredText(existing.rows[0], 'created_signature') !== event.signature) throw conflict('identity');
+    const existing = await client.query(`SELECT mint,launchpad,program_id,creator,
+      token_program,quote_assets,created_signature,created_slot::text AS created_slot,
+      created_transaction_index,created_instruction_index,created_inner_instruction_index
+      FROM token_launches WHERE mint=$1 FOR UPDATE`, [event.mint]);
+    if (existing.rows[0] !== undefined) assertLaunchMatches(existing.rows[0], event);
     const result = await client.query(`INSERT INTO token_launches (
       mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
       created_signature,created_slot,created_transaction_index,created_instruction_index,
@@ -218,6 +220,12 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
 
   private async writeTrade(client: Client, event: Extract<LaunchpadObservationEventV1,{type:'BondingCurveTradeObserved'}>, status: ChainConfirmationStatus): Promise<void> {
     const trade = event.payload.trade;
+    const existing = await client.query(`SELECT trade_id,mint,trade_kind,trader,
+      base_amount_raw::text AS base_amount_raw,quote_amount_raw::text AS quote_amount_raw,
+      quote_mint,quote_decimals,quote_token_program,slot::text AS slot,
+      transaction_index,instruction_index,inner_instruction_index
+      FROM launch_trades WHERE trade_id=$1 FOR UPDATE`, [trade.id]);
+    if (existing.rows[0] !== undefined) assertTradeMatches(existing.rows[0], event);
     const result = await client.query(`INSERT INTO launch_trades (
       trade_id,mint,trade_kind,trader,base_amount_raw,quote_amount_raw,quote_mint,
       quote_decimals,quote_token_program,slot,transaction_index,instruction_index,
@@ -259,6 +267,110 @@ function rawSnapshot(event: LaunchpadObservationEventV1): object {
   return value;
 }
 
+function prepareLaunchpadBatch(value: unknown): LaunchpadEventBatch {
+  try {
+    const state = { nodes: 0, textBytes: 0, ancestors: new WeakSet() };
+    const snapshot = snapshotBoundaryValue(value, 0, state);
+    assertBatchShape(snapshot);
+    assertValidLaunchpadEventBatch(snapshot as LaunchpadEventBatch);
+    return snapshot as LaunchpadEventBatch;
+  } catch {
+    throw new LaunchpadEventRepositoryError('record');
+  }
+}
+
+function snapshotBoundaryValue(
+  value: unknown,
+  depth: number,
+  state: { nodes: number; textBytes: number; ancestors: WeakSet<object> },
+): unknown {
+  if (depth > 32 || ++state.nodes > 10_000) throw new RangeError('Batch bounds exceeded.');
+  if (typeof value === 'string') {
+    const bytes = Buffer.byteLength(value, 'utf8');
+    if (bytes > 16_384 || state.textBytes + bytes > 1_048_576) throw new RangeError('Batch text bounds exceeded.');
+    state.textBytes += bytes;
+    return value;
+  }
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') {
+    if (value.toString().replace(/^-/, '').length > 78) throw new RangeError('Batch bigint bounds exceeded.');
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) throw new TypeError('Batch number is invalid.');
+    return value;
+  }
+  if (typeof value !== 'object') throw new TypeError('Batch value is invalid.');
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (Array.isArray(value)) {
+    if (prototype !== Array.prototype) throw new TypeError('Batch array prototype is invalid.');
+  } else if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError('Batch object prototype is invalid.');
+  }
+  if (state.ancestors.has(value)) throw new TypeError('Batch must be acyclic.');
+  state.ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (value.length > 1_024) throw new RangeError('Batch array bounds exceeded.');
+      const keys = Reflect.ownKeys(value);
+      if (keys.length !== value.length + 1 || keys.some((key) => typeof key === 'symbol')) throw new TypeError('Batch array keys are invalid.');
+      const result: unknown[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError('Batch array property is invalid.');
+        result.push(snapshotBoundaryValue(descriptor.value, depth + 1, state));
+      }
+      return Object.freeze(result);
+    }
+    const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key === 'symbol') throw new TypeError('Batch symbols are invalid.');
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError('Batch property is invalid.');
+      Object.defineProperty(result, key, { value: snapshotBoundaryValue(descriptor.value, depth + 1, state), enumerable: true });
+    }
+    return Object.freeze(result);
+  } finally {
+    state.ancestors.delete(value);
+  }
+}
+
+function assertBatchShape(value: unknown): void {
+  const batch = shapeRecord(value, ['source', 'program', 'signature', 'confirmationStatus', 'stateTransitionAction', 'events', 'transitions']);
+  if (!Array.isArray(batch.events) || !Array.isArray(batch.transitions) || batch.events.length > 512 || batch.transitions.length > 512) throw new TypeError('Batch arrays are invalid.');
+  for (const eventValue of batch.events) {
+    const event = shapeRecord(eventValue, ['id', 'type', 'mint', 'source', 'program', 'signature', 'cursor', 'confirmationStatus', 'blockchainTimeMs', 'observedAtMs', 'payloadVersion', 'payload']);
+    shapeRecord(event.cursor, ['slot', 'transactionIndex', 'instructionIndex', 'innerInstructionIndex']);
+    const payload = shapeRecord(event.payload, event.type === 'TokenLaunchDetected' ? ['launch'] : ['trade']);
+    if (event.type === 'TokenLaunchDetected') {
+      const launch = shapeRecord(payload.launch, ['mint', 'creator', 'tokenProgram', 'quoteAssets', 'launchpad', 'createdAt', 'parameters']);
+      shapeRecord(launch.createdAt, ['slot', 'transactionIndex', 'instructionIndex', 'innerInstructionIndex']);
+      if (!Array.isArray(launch.quoteAssets) || launch.quoteAssets.length > 64) throw new TypeError('Quote assets are invalid.');
+      for (const quote of launch.quoteAssets) shapeRecord(quote, ['mint', 'decimals', 'tokenProgram']);
+      shapeRecord(launch.parameters, Object.keys(shapeRecord(launch.parameters)));
+    } else if (event.type === 'BondingCurveTradeObserved') {
+      const trade = shapeRecord(payload.trade, ['id', 'launchMint', 'kind', 'trader', 'baseAmountRaw', 'quoteAmountRaw', 'quoteAsset', 'cursor']);
+      shapeRecord(trade.quoteAsset, ['mint', 'decimals', 'tokenProgram']);
+      shapeRecord(trade.cursor, ['slot', 'transactionIndex', 'instructionIndex', 'innerInstructionIndex']);
+    } else throw new TypeError('Event type is invalid.');
+  }
+  for (const transitionValue of batch.transitions) {
+    const transition = shapeRecord(transitionValue, ['id', 'payloadVersion', 'mint', 'triggeringEventId', 'triggeringEventType', 'occurredAtMs', 'occurredAtSource', 'previousStatus', 'newStatus', 'reasonCode', 'message', 'evidence']);
+    shapeRecord(transition.evidence, ['source', 'program']);
+  }
+}
+
+function shapeRecord(value: unknown, allowed?: readonly string[]): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new TypeError('Batch object is invalid.');
+  const record = value as Record<string, unknown>;
+  if (allowed !== undefined) {
+    const keys = Object.keys(record).sort();
+    const expected = [...allowed].sort();
+    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) throw new TypeError('Batch object keys are invalid.');
+  }
+  return record;
+}
+
 function assertEventFingerprint(event: LaunchpadObservationEventV1): void {
   const transaction = {
     signature: event.signature,
@@ -271,7 +383,7 @@ function assertEventFingerprint(event: LaunchpadObservationEventV1): void {
   const expected = event.type === 'TokenLaunchDetected'
     ? createTokenLaunchDetectedEvent({ source: event.source, program: event.program, transaction, launch: event.payload.launch })
     : createBondingCurveTradeObservedEvent({ source: event.source, program: event.program, transaction, trade: event.payload.trade });
-  if (!isDeepStrictEqual(expected, event)) throw conflict('identity');
+  if (!canonicalEqual(expected, event)) throw conflict('identity');
 }
 
 function date(value: number | null): Date | null { return value === null ? null : new Date(value); }
@@ -280,9 +392,12 @@ function requiredField(row: unknown, field: string): unknown { const record = op
 function requiredText(row: unknown, field: string): string { const value = optionalRecord(row)?.[field]; if (typeof value !== 'string') throw new TypeError('Invalid repository row.'); return value; }
 function occurrenceSource(value: string): 'blockchain' | 'observation' { if (value !== 'blockchain' && value !== 'observation') throw new TypeError('Invalid transition occurrence source.'); return value; }
 function confirmation(value: string): ChainConfirmationStatus { if (!['processed', 'confirmed', 'finalized', 'orphaned'].includes(value)) throw new TypeError('Invalid repository row.'); return value as ChainConfirmationStatus; }
-function assertRawMatches(row: unknown, event: LaunchpadObservationEventV1, payload: unknown): void { const record = optionalRecord(row); if (record === null) throw conflict('identity'); assertFields(record, event); if (!isDeepStrictEqual(fromJsonValue(record.payload), payload)) throw conflict('payload'); }
-function assertDomainMatches(row: unknown, event: LaunchpadObservationEventV1): void { const record = optionalRecord(row); if (record === null) throw conflict('identity'); assertFields(record, event, event.type); if (!isDeepStrictEqual(fromJsonValue(record.payload), event.payload)) throw conflict('payload'); }
-function assertFields(record: Record<string, unknown>, event: LaunchpadObservationEventV1, type?: string): void { const expected = { ...(type === undefined ? {} : { type }), source: event.source, program: event.program, mint: event.mint, signature: event.signature, slot: event.cursor.slot.toString(), transaction_index: event.cursor.transactionIndex, instruction_index: event.cursor.instructionIndex, inner_instruction_index: event.cursor.innerInstructionIndex, payload_version: event.payloadVersion }; for (const [key, value] of Object.entries(expected)) if (String(record[key]) !== String(value)) throw conflict('identity'); }
+function assertRawMatches(row: unknown, event: LaunchpadObservationEventV1, payload: unknown): void { const record = optionalRecord(row); if (record === null) throw conflict('identity'); assertFields(record, event); if (!canonicalEqual(fromJsonValue(record.payload), payload)) throw conflict('payload'); }
+function assertDomainMatches(row: unknown, event: LaunchpadObservationEventV1, rawId: string): void { const record = optionalRecord(row); if (record === null) throw conflict('identity'); assertFields(record, event, event.type, rawId); if (!canonicalEqual(fromJsonValue(record.payload), event.payload)) throw conflict('payload'); }
+function assertFields(record: Record<string, unknown>, event: LaunchpadObservationEventV1, type?: string, rawId?: string): void { const expected = { ...(rawId === undefined ? {} : { raw_event_id: rawId }), ...(type === undefined ? {} : { type }), source: event.source, program: event.program, mint: event.mint, signature: event.signature, slot: event.cursor.slot.toString(), transaction_index: event.cursor.transactionIndex, instruction_index: event.cursor.instructionIndex, inner_instruction_index: event.cursor.innerInstructionIndex, payload_version: event.payloadVersion }; assertExactColumns(record, expected); }
+function assertExactColumns(record: Record<string, unknown>, expected: Readonly<Record<string, unknown>>): void { for (const [field, value] of Object.entries(expected)) if (record[field] !== value) throw conflict('identity'); }
+function assertLaunchMatches(row: unknown, event: Extract<LaunchpadObservationEventV1, {type: 'TokenLaunchDetected'}>): void { const record = optionalRecord(row); if (record === null) throw conflict('identity'); const launch = event.payload.launch; assertExactColumns(record, { mint: launch.mint, launchpad: launch.launchpad, program_id: event.program, creator: launch.creator, token_program: launch.tokenProgram, created_signature: event.signature, created_slot: launch.createdAt.slot.toString(), created_transaction_index: launch.createdAt.transactionIndex, created_instruction_index: launch.createdAt.instructionIndex, created_inner_instruction_index: launch.createdAt.innerInstructionIndex }); if (!canonicalEqual(fromJsonValue(record.quote_assets), launch.quoteAssets)) throw conflict('payload'); }
+function assertTradeMatches(row: unknown, event: Extract<LaunchpadObservationEventV1, {type: 'BondingCurveTradeObserved'}>): void { const record = optionalRecord(row); if (record === null) throw conflict('identity'); const trade = event.payload.trade; assertExactColumns(record, { trade_id: trade.id, mint: trade.launchMint, trade_kind: trade.kind, trader: trade.trader, base_amount_raw: trade.baseAmountRaw.toString(), quote_amount_raw: trade.quoteAmountRaw.toString(), quote_mint: trade.quoteAsset.mint, quote_decimals: trade.quoteAsset.decimals, quote_token_program: trade.quoteAsset.tokenProgram, slot: trade.cursor.slot.toString(), transaction_index: trade.cursor.transactionIndex, instruction_index: trade.cursor.instructionIndex, inner_instruction_index: trade.cursor.innerInstructionIndex }); }
 async function exact(client: Client, text: string, values: readonly unknown[]): Promise<void> { requireOne(await client.query(text, values)); }
 function requireOne(result: Result): void { if (result.rowCount !== 1) throw new TypeError('Unexpected repository row count.'); }
 async function writeTransition(
@@ -348,10 +463,8 @@ function assertTransitionMatches(
     reason_code: transition.reasonCode,
     human_message: transition.message,
   };
-  for (const [field, value] of Object.entries(expected)) {
-    if (String(record[field]) !== String(value)) throw conflict('identity');
-  }
-  if (!isDeepStrictEqual(fromJsonValue(record.evidence), transition.evidence)) {
+  assertExactColumns(record, expected);
+  if (!canonicalEqual(fromJsonValue(record.evidence), transition.evidence)) {
     throw conflict('payload');
   }
 }
@@ -370,9 +483,9 @@ function restoreEvent(row: unknown): LaunchpadObservationEventV1 {
   if (event.id !== requiredText(record, 'event_id') || event.payloadVersion !== integer(record.payload_version)) throw new TypeError('Invalid event fingerprint.');
   const rawPayload = fromJsonValue(record.raw_payload);
   if (
-    requiredText(record, 'raw_event_id') !== rawFingerprint(event.id, rawSnapshot(event))
+    requiredText(record, 'raw_event_id') !== rawFingerprint(event.id)
     || requiredText(record, 'raw_confirmation_status') !== event.confirmationStatus
-    || !isDeepStrictEqual(rawPayload, rawSnapshot(event))
+    || !canonicalEqual(rawPayload, rawSnapshot(event))
   ) throw new TypeError('Invalid raw event fingerprint.');
   return event;
 }
@@ -392,8 +505,8 @@ function immutableSet(values: readonly string[]): ReadonlySet<string> {
         return (): SetIterator<string> => set.values();
       }
       if (property === 'forEach') {
-        return (callback: (value: string, key: string, owner: Set<string>) => void): void => {
-          set.forEach(callback);
+        return (callback: (value: string, key: string, owner: ReadonlySet<string>) => void, thisArg?: unknown): void => {
+          set.forEach((value, key) => { callback.call(thisArg, value, key, result); });
         };
       }
       return Reflect.get(set, property, set) as unknown;
@@ -402,7 +515,8 @@ function immutableSet(values: readonly string[]): ReadonlySet<string> {
   return Object.freeze(result);
 }
 function requiredOutcome(values: ReadonlyMap<string, EventRecordOutcome>, id: string): EventRecordOutcome { const value = values.get(id); if (value === undefined) throw new TypeError('Missing event outcome.'); return value; }
-function rawFingerprint(eventId: string, payload: unknown): string { return createRepositoryId('launchpad_raw', [eventId, stringifyJson(payload)]); }
+function rawFingerprint(eventId: string): string { return createRepositoryId('launchpad_raw', [eventId]); }
 function conflict(kind: 'identity' | 'payload'): LaunchpadEventConflictError { const error = new LaunchpadEventConflictError(kind); trustedErrors.add(error); return error; }
 function reconcileStatus(current: ChainConfirmationStatus, incoming: ChainConfirmationStatus): ReturnType<typeof reconcileConfirmationStatus> { try { return reconcileConfirmationStatus(current, incoming); } catch (error) { if (typeof error === 'object' && error !== null) trustedErrors.add(error); throw error; } }
 function releaseClient(client: Client, operation: 'record' | 'read'): void { try { client.release(); } catch { throw new LaunchpadEventRepositoryError(operation); } }
+function canonicalEqual(left: unknown, right: unknown): boolean { return canonicalStringifyJson(left) === canonicalStringifyJson(right); }

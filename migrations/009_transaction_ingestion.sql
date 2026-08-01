@@ -227,6 +227,20 @@ FROM domain_events AS event
 WHERE event.event_id = transition.event_id
   AND transition.occurred_at_source IS NULL;
 
+ALTER TABLE state_transitions ALTER COLUMN occurred_at_source SET NOT NULL;
+ALTER TABLE state_transitions ALTER COLUMN payload_version DROP DEFAULT;
+
+CREATE INDEX IF NOT EXISTS domain_events_active_signature_cursor_idx
+  ON domain_events (
+    signature,
+    slot,
+    transaction_index,
+    instruction_index,
+    COALESCE(inner_instruction_index, -1),
+    event_id
+  )
+  WHERE confirmation_status <> 'orphaned' AND terminal_at IS NULL;
+
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -245,7 +259,7 @@ BEGIN
   ) THEN
     ALTER TABLE state_transitions
       ADD CONSTRAINT state_transitions_occurred_at_source_check
-      CHECK (occurred_at_source IS NULL OR occurred_at_source IN ('blockchain', 'observation'));
+      CHECK (occurred_at_source IN ('blockchain', 'observation'));
   END IF;
 END;
 $$;

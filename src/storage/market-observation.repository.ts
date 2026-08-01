@@ -674,13 +674,14 @@ async function writeTransition(
 ): Promise<void> {
   await client.query(
     `INSERT INTO state_transitions (
-      transition_id,mint,event_id,occurred_at,trigger_event,previous_state,
-      new_state,reason_code,human_message,evidence
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      transition_id,mint,event_id,occurred_at,occurred_at_source,payload_version,
+      trigger_event,previous_state,new_state,reason_code,human_message,evidence
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
     ON CONFLICT (transition_id) DO NOTHING`,
     [
       transition.id, transition.mint, transition.triggeringEventId,
-      new Date(transition.occurredAtMs), transition.triggeringEventType,
+      new Date(transition.occurredAtMs), transition.occurredAtSource,
+      transition.payloadVersion, transition.triggeringEventType,
       transition.previousStatus, transition.newStatus, transition.reasonCode,
       transition.message, toJsonValue(transition.evidence),
     ],

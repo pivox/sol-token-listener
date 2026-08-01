@@ -292,6 +292,67 @@ void test('backfills and constrains a heartbeat row created by migrations 001-00
   }
 });
 
+void test('backfills strict state transition provenance from pre-009 domain events', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
+    return;
+  }
+  const schema = `transition_provenance_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await applyMigrations(pool, 8);
+    await pool.query(`INSERT INTO domain_events (
+      event_id,type,mint,source,program,signature,slot,transaction_index,
+      instruction_index,inner_instruction_index,confirmation_status,
+      blockchain_time,observed_at,payload_version,payload
+    ) VALUES
+      ('event-chain','TokenLaunchDetected','mint-chain','pumpfun','pump',
+        'signature-chain',1,0,0,NULL,'confirmed','2025-01-01T00:00:00Z',
+        '2025-01-01T00:00:01Z',1,'{}'::jsonb),
+      ('event-observation','TokenLaunchDetected','mint-observation','pumpfun','pump',
+        'signature-observation',2,0,0,NULL,'confirmed',NULL,
+        '2025-01-01T00:00:02Z',1,'{}'::jsonb)`);
+    await pool.query(`INSERT INTO state_transitions (
+      transition_id,mint,event_id,occurred_at,trigger_event,new_state,human_message
+    ) VALUES
+      ('transition-chain','mint-chain','event-chain','2025-01-01T00:00:00Z',
+        'TokenLaunchDetected','DETECTED','chain'),
+      ('transition-observation','mint-observation','event-observation',
+        '2025-01-01T00:00:02Z','TokenLaunchDetected','DETECTED','observation')`);
+
+    const migrationSql = await readFile(migrationUrl, 'utf8');
+    await pool.query(migrationSql);
+    await pool.query(migrationSql);
+    assert.deepEqual((await pool.query(`SELECT transition_id,payload_version,
+      occurred_at_source FROM state_transitions ORDER BY transition_id`)).rows, [
+      { transition_id: 'transition-chain', payload_version: 1, occurred_at_source: 'blockchain' },
+      { transition_id: 'transition-observation', payload_version: 1, occurred_at_source: 'observation' },
+    ]);
+    assert.deepEqual((await pool.query(`SELECT column_name,is_nullable,column_default
+      FROM information_schema.columns
+      WHERE table_schema=current_schema() AND table_name='state_transitions'
+        AND column_name IN ('payload_version','occurred_at_source')
+      ORDER BY column_name`)).rows, [
+      { column_name: 'occurred_at_source', is_nullable: 'NO', column_default: null },
+      { column_name: 'payload_version', is_nullable: 'NO', column_default: null },
+    ]);
+    await assert.rejects(pool.query(`INSERT INTO state_transitions (
+      transition_id,mint,event_id,occurred_at,trigger_event,new_state,human_message
+    ) VALUES ('missing-provenance','mint-chain','event-chain',clock_timestamp(),
+      'TokenLaunchDetected','DETECTED','missing')`), /null value/u);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
 void test('enforces inbox lifecycle checks and terminal-only purge in PostgreSQL', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {

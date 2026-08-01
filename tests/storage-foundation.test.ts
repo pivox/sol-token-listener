@@ -2,11 +2,22 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createRepositoryId } from '../src/storage/repositories.js';
 import {
+  canonicalStringifyJson,
   MAX_SERIALIZED_BIGINT_DIGITS,
   parseJson,
   stringifyJson,
   toJsonValue,
 } from '../src/utils/json.js';
+
+void test('canonical JSON sorts nested keys without treating __proto__ as syntax', () => {
+  const nested = Object.create(null) as Record<string, unknown>;
+  Object.defineProperty(nested, '__proto__', { value: 'data', enumerable: true });
+  nested.b = { z: 2, a: 1 };
+  nested.a = 3n;
+
+  assert.equal(canonicalStringifyJson(nested),
+    '{"__proto__":"data","a":{"$solTokenListenerBigInt":"3"},"b":{"a":1,"z":2}}');
+});
 
 void test('sérialise et restaure exactement les bigint imbriqués', () => {
   const source = {

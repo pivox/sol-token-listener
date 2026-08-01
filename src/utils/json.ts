@@ -1,5 +1,8 @@
 export const BIGINT_JSON_MARKER = '$solTokenListenerBigInt';
 export const MAX_SERIALIZED_BIGINT_DIGITS = 78;
+export const MAX_CANONICAL_JSON_DEPTH = 64;
+export const MAX_CANONICAL_JSON_NODES = 10_000;
+export const MAX_CANONICAL_JSON_TEXT_BYTES = 1_048_576;
 
 const RESERVED_MARKER_MESSAGE =
   'The $solTokenListenerBigInt singleton object is reserved for bigint serialization.';
@@ -38,6 +41,61 @@ export function toJsonValue(value: unknown): unknown {
 
 export function fromJsonValue(value: unknown): unknown {
   return parseJson(JSON.stringify(value));
+}
+
+export function canonicalStringifyJson(value: unknown): string {
+  const state = { nodes: 0, textBytes: 0, ancestors: new WeakSet() };
+  return stringifyJson(canonicalJsonValue(value, 0, state));
+}
+
+function canonicalJsonValue(
+  value: unknown,
+  depth: number,
+  state: { nodes: number; textBytes: number; ancestors: WeakSet<object> },
+): unknown {
+  if (depth > MAX_CANONICAL_JSON_DEPTH || ++state.nodes > MAX_CANONICAL_JSON_NODES) {
+    throw new RangeError('Canonical JSON exceeds structural limits.');
+  }
+  if (typeof value === 'string') {
+    state.textBytes += Buffer.byteLength(value, 'utf8');
+    if (state.textBytes > MAX_CANONICAL_JSON_TEXT_BYTES) throw new RangeError('Canonical JSON exceeds text limits.');
+    return value;
+  }
+  if (value === null || typeof value === 'boolean' || typeof value === 'bigint') return value;
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) throw new TypeError('Canonical JSON number is invalid.');
+    return value;
+  }
+  if (typeof value !== 'object') throw new TypeError('Canonical JSON value is invalid.');
+  if (state.ancestors.has(value)) throw new TypeError('Canonical JSON must be acyclic.');
+  state.ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const keys = Reflect.ownKeys(value);
+      if (keys.some((key) => typeof key === 'symbol')) throw new TypeError('Canonical JSON symbols are forbidden.');
+      const result: unknown[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError('Canonical JSON array is invalid.');
+        result.push(canonicalJsonValue(descriptor.value, depth + 1, state));
+      }
+      if (keys.length !== value.length + 1) throw new TypeError('Canonical JSON array keys are invalid.');
+      return result;
+    }
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError('Canonical JSON object prototype is invalid.');
+    const keys = Reflect.ownKeys(value);
+    if (keys.some((key) => typeof key === 'symbol')) throw new TypeError('Canonical JSON symbols are forbidden.');
+    const result = Object.create(null) as Record<string, unknown>;
+    for (const key of (keys as string[]).sort()) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError('Canonical JSON property is invalid.');
+      result[key] = canonicalJsonValue(descriptor.value, depth + 1, state);
+    }
+    return result;
+  } finally {
+    state.ancestors.delete(value);
+  }
 }
 
 function rejectReservedBigIntMarkers(value: unknown, ancestors: Set<object>): void {
