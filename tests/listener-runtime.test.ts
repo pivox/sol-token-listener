@@ -193,6 +193,61 @@ void test('reports RUNNING only when every active component is explicitly RUNNIN
   assert.equal(runtime.state(), 'RUNNING');
 });
 
+void test('retries only unresolved startup rollback cleanup before becoming STOPPED', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  let subscriberCloseAttempts = 0;
+  deps.worker.start = async () => { calls.push('worker.start'); throw new Error('worker secret'); };
+  deps.subscriber.close = async () => {
+    calls.push('subscriber.close');
+    subscriberCloseAttempts += 1;
+    if (subscriberCloseAttempts === 1) throw new Error('rollback secret');
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+
+  await assert.rejects(runtime.start(), (error: unknown) => {
+    assert.ok(error instanceof ListenerRuntimeError);
+    assert.deepEqual(error.failures, [
+      Object.freeze({ stage: 'worker-start', errorName: 'ListenerDependencyError' }),
+      Object.freeze({ stage: 'subscriber-close', errorName: 'ListenerDependencyError' }),
+    ]);
+    return true;
+  });
+  calls.length = 0;
+
+  await runtime.close();
+  assert.deepEqual(calls, ['subscriber.close']);
+  assert.equal(runtime.state(), 'STOPPED');
+  await runtime.close();
+  assert.deepEqual(calls, ['subscriber.close']);
+});
+
+void test('keeps persistent rollback cleanup failure DEGRADED and retryable', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  deps.worker.start = async () => { calls.push('worker.start'); throw new Error('worker secret'); };
+  deps.subscriber.close = async () => {
+    calls.push('subscriber.close');
+    throw new Error('persistent cleanup secret');
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+  await assert.rejects(runtime.start(), ListenerRuntimeError);
+  calls.length = 0;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await assert.rejects(runtime.close(), (error: unknown) => {
+      assert.ok(error instanceof ListenerRuntimeError);
+      assert.deepEqual(error.failures, [
+        Object.freeze({ stage: 'subscriber-close', errorName: 'ListenerDependencyError' }),
+      ]);
+      assert.doesNotMatch(String(error), /secret/u);
+      return true;
+    });
+    assert.equal(runtime.state(), 'DEGRADED');
+  }
+  assert.deepEqual(calls, ['subscriber.close', 'subscriber.close']);
+});
+
 function dependencies(calls: string[]): ListenerRuntimeDependencies {
   return {
     rpc: { async checkHealth() { calls.push('rpc.health'); } },
