@@ -20,7 +20,7 @@ import type {
   MarketObservationResult,
   MarketReserveObservation,
 } from '../ports/market-observation-repository.js';
-import { fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
+import { canonicalStringifyJson, fromJsonValue, toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 
 interface QueryResultLike {
@@ -746,7 +746,7 @@ function findRaw(
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
-  return stringifyJson(fromJsonValue(left)) === stringifyJson(right);
+  return canonicalStringifyJson(fromJsonValue(left)) === canonicalStringifyJson(right);
 }
 
 function optionalRecord(value: unknown): Record<string, unknown> | null {

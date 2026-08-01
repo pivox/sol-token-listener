@@ -55,6 +55,34 @@ void test('atomically persists creation and initial buy and restores active even
   assert.equal(Object.isFrozen(restored), true);
 });
 
+void test('restores only launchpad events when market events share the signature', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(pool);
+    const batch = fixture('confirmed');
+    await repository.record(batch);
+    await pool.query(`INSERT INTO raw_chain_events (
+      event_id, source, program, mint, signature, slot, transaction_index,
+      instruction_index, confirmation_status, observed_at, payload_version,
+      payload, processing_status
+    ) VALUES (
+      'market-raw', 'pumpswap', 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+      'mint-a', 'signature-a', 10, 4, 3, 'confirmed', NOW(), 1, '{}'::jsonb,
+      'processed'
+    )`);
+    await pool.query(`INSERT INTO domain_events (
+      event_id, raw_event_id, type, mint, source, program, signature, slot,
+      transaction_index, instruction_index, confirmation_status, observed_at,
+      payload_version, payload
+    ) VALUES (
+      'market-event', 'market-raw', 'MigrationObserved', 'mint-a', 'pumpswap',
+      'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 'signature-a', 10, 4, 3,
+      'confirmed', NOW(), 1, '{}'::jsonb
+    )`);
+
+    assert.deepEqual(await repository.listActiveEventsBySignature(batch.signature), batch.events);
+  });
+});
+
 void test('canonical payload fingerprints ignore reordered outer and nested keys', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresLaunchpadEventRepository(pool);

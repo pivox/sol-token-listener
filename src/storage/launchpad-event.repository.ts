@@ -122,6 +122,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
         FROM domain_events AS domain
         JOIN raw_chain_events AS raw ON raw.event_id=domain.raw_event_id
         WHERE domain.signature=$1 AND domain.confirmation_status <> 'orphaned'
+          AND domain.type IN ('TokenLaunchDetected','BondingCurveTradeObserved')
           AND domain.terminal_at IS NULL
         ORDER BY domain.slot,domain.transaction_index,domain.instruction_index,
           COALESCE(domain.inner_instruction_index,-1),domain.event_id`, [signature]);
