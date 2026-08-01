@@ -64,6 +64,23 @@ void test('uses before pagination and stops at an exact checkpoint boundary mid-
   ]);
 });
 
+void test('rejects a repeated signature before accepting it as the checkpoint boundary', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('same', 6), sig('same', 5)]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  });
+  const inbox = new FakeInbox({ launchpad: checkpoint('launchpad', 'same', 5) });
+
+  await assert.rejects(scanner(source, inbox, { pageSize: 3 }).scan(), (error) => {
+    assert.ok(error instanceof CatchUpSourceError);
+    assert.equal(error.stage, 'pagination');
+    assert.equal(error.program, 'launchpad');
+    return true;
+  });
+  assert.deepEqual(inbox.enqueued, []);
+  assert.deepEqual(inbox.stored, []);
+});
+
 void test('treats empty and short pages as true exhaustion and never invents checkpoints', async () => {
   const source = new FakeSource({
     [PUMP_PROGRAM_ID]: [[]],

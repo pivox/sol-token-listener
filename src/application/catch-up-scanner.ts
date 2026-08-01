@@ -190,13 +190,13 @@ export class CatchUpScanner {
           throw new CatchUpSourceError('response', program.key);
         }
         previousSlot = row.slot;
+        if (signatures.has(row.signature)) throw new CatchUpSourceError('pagination', program.key);
         if (checkpoint !== null
           && row.signature === checkpoint.signature
           && row.slot === checkpoint.slot) {
           completed = true;
           break scanPages;
         }
-        if (signatures.has(row.signature)) throw new CatchUpSourceError('pagination', program.key);
         signatures.add(row.signature);
         rows.push(row);
       }
