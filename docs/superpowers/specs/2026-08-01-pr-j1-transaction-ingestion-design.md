@@ -452,4 +452,3 @@ PR J1 est acceptable lorsque :
 - `npm install`, build, check, lint et tous les tests réussissent ;
 - les migrations fonctionnent sur une base vide et en replay ;
 - tous les tests existants restent verts.
-
