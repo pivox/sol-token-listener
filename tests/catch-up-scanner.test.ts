@@ -124,18 +124,50 @@ void test('rejects pages that violate newest-to-oldest slot ordering', async () 
   });
 });
 
-void test('rejects duplicate contradictions within or across programs', async () => {
-  for (const conflicting of [sig('same', 8), sig('same', 7, 'finalized'), sig('same', 7, 'confirmed', 2_000)]) {
+void test('reconciles shared finality and nullable block time in either scan order', async () => {
+  const cases = [
+    [sig('same', 7, 'confirmed', null), sig('same', 7, 'finalized', 2_000)],
+    [sig('same', 7, 'finalized', 2_000), sig('same', 7, 'confirmed', null)],
+    [sig('same', 7, 'processed', 2_000), sig('same', 7, 'confirmed', 2_000)],
+    [sig('same', 7, 'confirmed', 2_000), sig('same', 7, 'processed', 2_000)],
+  ] as const;
+  for (const [launchpad, market] of cases) {
     const source = new FakeSource({
-      [PUMP_PROGRAM_ID]: [[sig('same', 7)]],
+      [PUMP_PROGRAM_ID]: [[launchpad]],
+      [PUMPSWAP_PROGRAM_ID]: [[market]],
+    });
+    const inbox = new FakeInbox();
+    await scanner(source, inbox, { pageSize: 2 }).scan();
+    assert.equal(inbox.enqueued[0]?.confirmationStatus,
+      launchpad.confirmationStatus === 'finalized' || market.confirmationStatus === 'finalized'
+        ? 'finalized' : 'confirmed');
+    assert.equal(inbox.enqueued[0]?.observedAtMs, 2_000);
+  }
+});
+
+void test('rejects immutable shared slot and conflicting known block times', async () => {
+  for (const conflicting of [sig('same', 8), sig('same', 7, 'confirmed', 2_000)]) {
+    const source = new FakeSource({
+      [PUMP_PROGRAM_ID]: [[sig('same', 7, 'confirmed', 1_000)]],
       [PUMPSWAP_PROGRAM_ID]: [[conflicting]],
     });
-    await assert.rejects(scanner(source, new FakeInbox(), { pageSize: 2 }).scan(), (error) => {
-      assert.ok(error instanceof CatchUpSourceError);
-      assert.equal(error.stage, 'response');
-      return true;
-    });
+    await assert.rejects(scanner(source, new FakeInbox(), { pageSize: 2 }).scan(), CatchUpSourceError);
   }
+});
+
+void test('rejects changed duplicate observations within one program pagination chain', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[
+      sig('same', 7, 'confirmed', null), sig('same', 7, 'finalized', 2_000),
+    ]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  });
+  await assert.rejects(scanner(source, new FakeInbox(), { pageSize: 3 }).scan(), (error) => {
+    assert.ok(error instanceof CatchUpSourceError);
+    assert.equal(error.stage, 'pagination');
+    assert.equal(error.program, 'launchpad');
+    return true;
+  });
 });
 
 void test('enqueues everything before checkpoints and writes none if enqueue fails', async () => {

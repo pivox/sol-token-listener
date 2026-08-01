@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
+import { PublicKey } from '@solana/web3.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 
 const migrationUrl = new URL('../migrations/009_transaction_ingestion.sql', import.meta.url);
@@ -37,7 +38,8 @@ void test('creates a replayable bigint-safe transaction inbox with strict lifecy
   assert.match(sql, /discovery_sources IN \([\s\S]*ARRAY\['WEBSOCKET'\]::TEXT\[\][\s\S]*ARRAY\['CATCH_UP'\]::TEXT\[\][\s\S]*ARRAY\['WEBSOCKET', 'CATCH_UP'\]::TEXT\[\]/u);
   assert.match(sql, /CARDINALITY\(program_ids\) BETWEEN 1 AND 16/u);
   assert.match(sql, /ARRAY_POSITION\(program_ids, NULL\) IS NULL/u);
-  assert.match(sql, /OCTET_LENGTH\(program_id\) NOT BETWEEN 1 AND 128/u);
+  assert.match(sql, /OCTET_LENGTH\(program_id\) NOT BETWEEN 32 AND 44/u);
+  assert.match(sql, /program_id !~ '\^\[1-9A-HJ-NP-Za-km-z\]\{32,44\}\$'/u);
   assert.match(sql, /SELECT DISTINCT program_id[\s\S]*ORDER BY program_id/u);
   assert.doesNotMatch(sql, /program_ids TEXT\[\][^\n]*DEFAULT/iu);
   assert.match(sql, /target_confirmation_status IN \('processed', 'confirmed', 'finalized', 'orphaned'\)/u);
@@ -166,7 +168,7 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, observed_at
     ) VALUES (
-      'failed-structured', 42, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'confirmed',
+      'failed-structured', 42, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
       'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', FALSE, NOW()
     )`);
     assert.equal((await pool.query(
@@ -178,12 +180,12 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, observed_at
-    ) VALUES ($1, 45, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'confirmed', 'FAILED',
+    ) VALUES ($1, 45, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'FAILED',
       'NORMALIZATION_FAILED', $2, FALSE, NOW())`, ['failed-multibyte', multibyteName]);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, observed_at
-    ) VALUES ($1, 46, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'confirmed', 'FAILED',
+    ) VALUES ($1, 46, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'FAILED',
       'NORMALIZATION_FAILED', $2, FALSE, NOW())`, ['failed-exact-name', exactMultibyteName]);
     assert.equal((await pool.query<{ readonly bytes: number }>(
       "SELECT OCTET_LENGTH(error_name) AS bytes FROM chain_transaction_inbox WHERE signature = 'failed-exact-name'",
@@ -192,7 +194,7 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
       pool.query(`INSERT INTO chain_transaction_inbox (
         signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
         processing_status, error_code, error_name, error_retryable, observed_at
-      ) VALUES ($1, 47, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'confirmed', 'FAILED',
+      ) VALUES ($1, 47, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'FAILED',
         'NORMALIZATION_FAILED', $2, FALSE, NOW())`,
       ['failed-oversized-name', oversizedMultibyteName]),
       /chain_transaction_inbox_error_check/u,
@@ -202,7 +204,7 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
         signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
         processing_status, error_code, error_name, observed_at
       ) VALUES (
-        'failed-incomplete', 43, ARRAY['CATCH_UP'], ARRAY['Program111'], 'confirmed',
+        'failed-incomplete', 43, ARRAY['CATCH_UP'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
         'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', NOW()
       )`),
       /chain_transaction_inbox_error_check/u,
@@ -212,7 +214,7 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
         signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
         processing_status, error_name, error_retryable, observed_at
       ) VALUES (
-        'failed-without-code', 44, ARRAY['CATCH_UP'], ARRAY['Program111'], 'confirmed',
+        'failed-without-code', 44, ARRAY['CATCH_UP'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
         'FAILED', 'TransactionNormalizationError', FALSE, NOW()
       )`),
       /chain_transaction_inbox_error_check/u,
@@ -393,9 +395,30 @@ void test('enforces inbox lifecycle checks and terminal-only purge in PostgreSQL
       { name: 'unknown-source', accept: false, value: { discoverySources: ['POLLING'] } },
       { name: 'null-source-member', accept: false, value: { discoverySources: ['WEBSOCKET', null] } },
       { name: 'empty-programs', accept: false, value: { programIds: [] } },
-      { name: 'null-program-member', accept: false, value: { programIds: ['Program111', null] } },
+      { name: 'two-programs', accept: true, value: { programIds: [
+        '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+        'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+      ] } },
+      { name: 'reversed-programs', accept: false, value: { programIds: [
+        'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+        '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+      ] } },
+      { name: 'duplicate-programs', accept: false, value: { programIds: [
+        '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+        '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+      ] } },
+      { name: 'null-program-member', accept: false, value: {
+        programIds: ['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', null],
+      } },
+      { name: 'invalid-base58-program', accept: false, value: {
+        programIds: ['0invalidBase58Address111111111111111111'],
+      } },
+      { name: 'base58-uppercase-o', accept: false, value: { programIds: ['O'.repeat(32)] } },
+      { name: 'base58-uppercase-i', accept: false, value: { programIds: ['I'.repeat(32)] } },
+      { name: 'base58-lowercase-l', accept: false, value: { programIds: ['l'.repeat(32)] } },
+      { name: 'short-program', accept: false, value: { programIds: ['111'] } },
       { name: 'too-many-programs', accept: false, value: {
-        programIds: Array.from({ length: 17 }, (_, index) => `Program${index}`),
+        programIds: validProgramIds(17),
       } },
       { name: 'processing-lease', accept: true, value: processingState() },
       { name: 'processing-no-token', accept: false, value: { ...processingState(), leaseToken: null } },
@@ -544,7 +567,7 @@ function inboxValue(
     signature,
     observedSlot: '42',
     discoverySources: ['WEBSOCKET'],
-    programIds: ['Program111'],
+    programIds: ['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],
     targetConfirmationStatus: 'confirmed',
     processingStatus: 'PENDING',
     attempts: 0,
@@ -567,6 +590,11 @@ function inboxValue(
     ...overrides,
     ...timestamps,
   };
+}
+
+function validProgramIds(count: number): string[] {
+  return Array.from({ length: count }, (_, index) =>
+    new PublicKey(Uint8Array.from({ length: 32 }, () => index + 1)).toBase58()).sort();
 }
 
 function processingState(): Partial<InboxInsert> {

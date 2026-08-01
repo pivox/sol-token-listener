@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   PublicKey,
+  SystemProgram,
   type VersionedTransactionResponse,
 } from '@solana/web3.js';
+import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import {
   LISTENER_RUNTIME_STATES,
   MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH,
@@ -51,7 +53,7 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
     signature: 'signature',
     slot: 42n,
     source: 'WEBSOCKET',
-    programIds: Object.freeze(['Program111', 'Program222']),
+    programIds: Object.freeze([PUMP_PROGRAM_ID]),
     confirmationStatus: 'confirmed',
     observedAtMs,
   });
@@ -465,7 +467,7 @@ void test('rejects mutable contracts, number slots and non-integer millisecond t
     signature: 'signature',
     slot: 42n,
     source: 'CATCH_UP' as const,
-    programIds: Object.freeze(['Program111']),
+    programIds: Object.freeze([PUMP_PROGRAM_ID]),
     confirmationStatus: 'finalized' as const,
     observedAtMs,
   });
@@ -523,7 +525,7 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
       signature: 'signature',
       slot: 42n,
       source: 'POLLING',
-      programIds: Object.freeze(['Program111']),
+      programIds: Object.freeze([PUMP_PROGRAM_ID]),
       confirmationStatus: 'confirmed',
       observedAtMs,
     })); },
@@ -535,11 +537,14 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
   });
   for (const programIds of [
     [],
-    ['Program222', 'Program111'],
-    ['Program111', 'Program111'],
-    [' Program111'],
+    [PUMP_PROGRAM_ID, SystemProgram.programId.toBase58()],
+    [PUMP_PROGRAM_ID, PUMP_PROGRAM_ID],
+    [` ${PUMP_PROGRAM_ID}`],
+    ['0invalidBase58Address111111111111111111'],
+    ['111'],
+    [`1${SystemProgram.programId.toBase58()}`],
     ['x'.repeat(129)],
-    Array.from({ length: 17 }, (_, index) => `Program${String(index).padStart(2, '0')}`),
+    validProgramIds(17),
   ]) {
     assert.throws(
       () => { assertValidTransactionNotification(Object.freeze({
@@ -557,6 +562,11 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
     /code/u,
   );
 });
+
+function validProgramIds(count: number): string[] {
+  return Array.from({ length: count }, (_, index) =>
+    new PublicKey(Uint8Array.from({ length: 32 }, () => index + 1)).toBase58()).sort();
+}
 
 function claimWithSnapshot(
   normalizedTransaction: unknown,

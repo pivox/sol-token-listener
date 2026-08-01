@@ -1,3 +1,4 @@
+import { PublicKey } from '@solana/web3.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { reconcileConfirmationStatus } from './confirmation-status.js';
 import { assertValidChainCursor, assertValidTransactionCursor } from './cursor.js';
@@ -10,7 +11,8 @@ export const MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH = 16_384;
 export const MAX_TRANSACTION_SNAPSHOT_TEXT_BYTES = 1_048_576;
 export const MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES = 1_232;
 export const MAX_TRANSACTION_NOTIFICATION_PROGRAM_IDS = 16;
-export const MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES = 128;
+export const MIN_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES = 32;
+export const MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES = 44;
 
 export const TRANSACTION_INBOX_STATUSES = Object.freeze([
   'PENDING',
@@ -269,12 +271,23 @@ function assertCanonicalProgramIds(value: unknown): void {
   }
   let previous: string | null = null;
   for (const programId of programIds) {
+    const byteLength = Buffer.byteLength(programId, 'utf8');
     if (programId !== programId.trim()
-      || Buffer.byteLength(programId, 'utf8') > MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
+      || byteLength < MIN_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
+      || byteLength > MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
+      || !isCanonicalSolanaProgramId(programId)
       || (previous !== null && programId <= previous)) {
       throw new TypeError('Transaction notification programIds are not canonical.');
     }
     previous = programId;
+  }
+}
+
+export function isCanonicalSolanaProgramId(value: string): boolean {
+  try {
+    return new PublicKey(value).toBase58() === value;
+  } catch {
+    return false;
   }
 }
 

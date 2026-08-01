@@ -11,12 +11,13 @@ AS $function$
     AND NOT EXISTS (
       SELECT 1 FROM UNNEST(program_ids) AS item(program_id)
       WHERE program_id <> BTRIM(program_id)
-         OR OCTET_LENGTH(program_id) NOT BETWEEN 1 AND 128
+         OR OCTET_LENGTH(program_id) NOT BETWEEN 32 AND 44
+         OR program_id !~ '^[1-9A-HJ-NP-Za-km-z]{32,44}$'
     )
     AND program_ids = ARRAY(
-      SELECT DISTINCT program_id
+      SELECT DISTINCT program_id COLLATE "C"
       FROM UNNEST(program_ids) AS item(program_id)
-      ORDER BY program_id
+      ORDER BY program_id COLLATE "C"
     )
 $function$;
 

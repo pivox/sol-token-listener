@@ -2,6 +2,7 @@ import type {
   ProcessingCheckpoint,
   TransactionNotification,
 } from '../domain/transaction-ingestion.js';
+import { reconcileConfirmationStatus } from '../domain/confirmation-status.js';
 import { PUMP_PROGRAM_ID } from '../launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../markets/pumpswap/constants.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
@@ -160,7 +161,7 @@ export class CatchUpScanner {
     checkpoint: ProcessingCheckpoint | null,
   ): Promise<ProgramScan> {
     const rows: CatchUpSignature[] = [];
-    const signatures = new Map<string, CatchUpSignature>();
+    const signatures = new Set<string>();
     const cursors = new Set<string>();
     let before: string | undefined;
     let completed = false;
@@ -195,12 +196,8 @@ export class CatchUpScanner {
           completed = true;
           break scanPages;
         }
-        const previous = signatures.get(row.signature);
-        if (previous !== undefined) {
-          if (!sameDiscovery(previous, row)) throw new CatchUpSourceError('response', program.key);
-          throw new CatchUpSourceError('pagination', program.key);
-        }
-        signatures.set(row.signature, row);
+        if (signatures.has(row.signature)) throw new CatchUpSourceError('pagination', program.key);
+        signatures.add(row.signature);
         rows.push(row);
       }
       if (page.length < this.pageSize) {
@@ -317,9 +314,9 @@ function merge(scans: readonly ProgramScan[]): readonly MergedDiscovery[] {
         }));
         continue;
       }
-      if (!sameDiscovery(previous, row)) throw new CatchUpSourceError('response', scan.program.key);
+      const reconciled = reconcileDiscovery(previous, row, scan.program.key);
       bySignature.set(row.signature, Object.freeze({
-        ...previous,
+        ...reconciled,
         programIds: Object.freeze([...previous.programIds, scan.program.id].sort(lexicalOrder)),
       }));
     }
@@ -327,10 +324,27 @@ function merge(scans: readonly ProgramScan[]): readonly MergedDiscovery[] {
   return Object.freeze([...bySignature.values()].sort(discoveryOrder));
 }
 
-function sameDiscovery(left: CatchUpSignature, right: CatchUpSignature): boolean {
-  return left.slot === right.slot
-    && left.confirmationStatus === right.confirmationStatus
-    && left.blockTimeMs === right.blockTimeMs;
+function reconcileDiscovery(
+  current: CatchUpSignature,
+  incoming: CatchUpSignature,
+  program: ProgramKey,
+): CatchUpSignature {
+  if (current.slot !== incoming.slot) throw new CatchUpSourceError('response', program);
+  if (current.blockTimeMs !== null
+    && incoming.blockTimeMs !== null
+    && current.blockTimeMs !== incoming.blockTimeMs) {
+    throw new CatchUpSourceError('response', program);
+  }
+  const confirmationStatus = reconcileConfirmationStatus(
+    current.confirmationStatus,
+    incoming.confirmationStatus,
+  ) === 'update' ? incoming.confirmationStatus : current.confirmationStatus;
+  return Object.freeze({
+    signature: current.signature,
+    slot: current.slot,
+    confirmationStatus,
+    blockTimeMs: current.blockTimeMs ?? incoming.blockTimeMs,
+  });
 }
 
 function discoveryOrder(left: MergedDiscovery, right: MergedDiscovery): number {

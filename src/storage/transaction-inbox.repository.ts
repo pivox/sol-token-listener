@@ -14,6 +14,7 @@ import {
   assertValidRuntimeHeartbeat,
   assertValidTransactionNotification,
   createDurableTransactionSnapshot,
+  isCanonicalSolanaProgramId,
   type ClaimedTransaction,
   type DurableNormalizedTransaction,
   type FinalityCandidate,
@@ -821,10 +822,11 @@ function storedProgramIds(value: unknown): string[] {
     }
     const programId: unknown = descriptor.value;
     if (typeof programId !== 'string'
-      || programId.length < 1
-      || programId.length > 128
+      || programId.length < 32
+      || programId.length > 44
       || programId !== programId.trim()
-      || Buffer.byteLength(programId, 'utf8') > 128
+      || Buffer.byteLength(programId, 'utf8') > 44
+      || !isCanonicalSolanaProgramId(programId)
       || (previous !== null && programId <= previous)) {
       throw new TypeError('Stored program IDs are invalid.');
     }

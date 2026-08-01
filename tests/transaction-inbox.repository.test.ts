@@ -27,7 +27,10 @@ void test('merges discoveries, rejects identity contradictions, and claims concu
     await repository.enqueue(notification('shared', 10n, 'CATCH_UP', 'confirmed', 1_100));
     const stored = await row(pool, 'shared');
     assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
-    assert.deepEqual(stored.program_ids, ['Program111', 'Program222']);
+    assert.deepEqual(stored.program_ids, [
+      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+      'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+    ]);
     assert.equal(stored.target_confirmation_status, 'confirmed');
     await assert.rejects(
       repository.enqueue(notification('shared', 11n, 'WEBSOCKET', 'confirmed', 1_200)),
@@ -381,7 +384,7 @@ void test('wraps malformed rows and database rollback failures in safe typed err
       'ALTER TABLE chain_transaction_inbox DROP CONSTRAINT chain_transaction_inbox_program_ids_check',
     );
     await pool.query(
-      "UPDATE chain_transaction_inbox SET program_ids = ARRAY['Program222', 'Program111'] WHERE signature = 'program-corrupt'",
+      "UPDATE chain_transaction_inbox SET program_ids = ARRAY['pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'] WHERE signature = 'program-corrupt'",
     );
     await assert.rejects(
       repository.enqueue(notification('program-corrupt', 61n)),
@@ -421,20 +424,20 @@ void test('uses an ordered partial index for a large mixed claim backlog', async
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, observed_at
-    ) SELECT 'pending-' || value, value + 20000, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'processed',
+    ) SELECT 'pending-' || value, value + 20000, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'processed',
       'PENDING', clock_timestamp()
       FROM generate_series(1, 10000) value`);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, next_attempt_at, observed_at
-    ) SELECT 'retry-' || value, value, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'processed',
+    ) SELECT 'retry-' || value, value, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'processed',
       'FAILED', 'RPC_TRANSIENT', 'RpcError', TRUE, clock_timestamp() + INTERVAL '1 day',
       clock_timestamp()
       FROM generate_series(1, 10000) value`);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, lease_token, lease_expires_at, observed_at
-    ) SELECT 'leased-' || value, value + 10000, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'processed',
+    ) SELECT 'leased-' || value, value + 10000, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'processed',
       'PROCESSING', 'lease-' || value, clock_timestamp() + INTERVAL '1 day',
       clock_timestamp()
       FROM generate_series(1, 10000) value`);
@@ -717,8 +720,11 @@ function notification(
   observedAtMs = 1_000,
 ): TransactionNotification {
   const programIds = source === 'CATCH_UP'
-    ? Object.freeze(['Program111', 'Program222'])
-    : Object.freeze(['Program111']);
+    ? Object.freeze([
+      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+      'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+    ])
+    : Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']);
   return Object.freeze({ signature, slot, source, programIds, confirmationStatus, observedAtMs });
 }
 
@@ -752,7 +758,7 @@ async function insertTerminal(
     signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
     processing_status, normalized_transaction, immutable_fingerprint, observed_at,
     processed_at, terminal_at, purge_after
-  ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'finalized', 'PROCESSED', $2, $3,
+  ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'finalized', 'PROCESSED', $2, $3,
     $4::TIMESTAMPTZ, $4::TIMESTAMPTZ, $4::TIMESTAMPTZ,
     $4::TIMESTAMPTZ + INTERVAL '4 hours')`, [signature, snapshot, 'a'.repeat(64), completedAt]);
 }
