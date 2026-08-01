@@ -91,6 +91,7 @@ void test('defines the transaction inbox port at the canonical snapshot conversi
     'markProcessed',
     'markFailed',
     'listForFinality',
+    'recordFinalityPoll',
     'enqueueRevision',
     'readCheckpoint',
     'storeCheckpoint',

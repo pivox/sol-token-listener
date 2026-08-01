@@ -134,6 +134,13 @@ export interface FinalityCandidate {
   readonly processedAtMs: number;
 }
 
+export interface FinalityPollObservation {
+  readonly signature: string;
+  readonly confirmationStatus: Extract<ChainConfirmationStatus, 'processed' | 'confirmed'> | null;
+  readonly expectedMissingFinalityPolls: number;
+  readonly observedAtMs: number;
+}
+
 export interface FinalityRevision {
   readonly signature: string;
   readonly confirmationStatus: Extract<ChainConfirmationStatus, 'finalized' | 'orphaned'>;
@@ -314,6 +321,23 @@ export function assertValidFinalityCandidate(
   }
   assertCount(record.missingFinalityPolls, 'Finality candidate missingFinalityPolls');
   assertMilliseconds(record.processedAtMs, 'Finality candidate processedAtMs');
+}
+
+export function assertValidFinalityPollObservation(
+  value: unknown,
+): asserts value is FinalityPollObservation {
+  const record = frozenRecord(value, 'Finality poll observation');
+  assertText(record.signature, 'Finality poll observation signature');
+  if (record.confirmationStatus !== null
+    && record.confirmationStatus !== 'processed'
+    && record.confirmationStatus !== 'confirmed') {
+    throw new TypeError('Finality poll observation confirmationStatus is invalid.');
+  }
+  assertCount(
+    record.expectedMissingFinalityPolls,
+    'Finality poll observation expectedMissingFinalityPolls',
+  );
+  assertMilliseconds(record.observedAtMs, 'Finality poll observation observedAtMs');
 }
 
 export function assertValidFinalityRevision(

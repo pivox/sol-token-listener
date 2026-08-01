@@ -1,6 +1,7 @@
 import type {
   ClaimedTransaction,
   FinalityCandidate,
+  FinalityPollObservation,
   FinalityRevision,
   InboxCounts,
   IngestionFailure,
@@ -34,6 +35,7 @@ export interface TransactionInboxRepository {
   ): Promise<void>;
   markFailed(signature: string, token: string, failure: IngestionFailure): Promise<void>;
   listForFinality(limit: number): Promise<readonly FinalityCandidate[]>;
+  recordFinalityPoll(value: FinalityPollObservation): Promise<FinalityCandidate>;
   enqueueRevision(value: FinalityRevision): Promise<void>;
   readCheckpoint(key: 'launchpad' | 'market'): Promise<ProcessingCheckpoint | null>;
   storeCheckpoint(value: ProcessingCheckpoint): Promise<void>;

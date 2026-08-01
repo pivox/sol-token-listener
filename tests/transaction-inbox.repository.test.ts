@@ -1,0 +1,393 @@
+import { randomUUID } from 'node:crypto';
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import pg from 'pg';
+import type {
+  IngestionFailure,
+  RuntimeHeartbeat,
+  TransactionNotification,
+} from '../src/domain/transaction-ingestion.js';
+import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
+import {
+  PostgresTransactionInboxRepository,
+  TransactionInboxConflictError,
+  TransactionInboxLeaseError,
+  TransactionInboxRepositoryError,
+} from '../src/storage/transaction-inbox.repository.js';
+
+const databaseUrl = process.env.TEST_DATABASE_URL;
+
+void test('merges discoveries, rejects identity contradictions, and claims concurrently without duplication', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('shared', 10n, 'WEBSOCKET', 'processed', 1_000));
+    await repository.enqueue(notification('shared', 10n, 'CATCH_UP', 'confirmed', 1_100));
+    const stored = await row(pool, 'shared');
+    assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+    assert.equal(stored.target_confirmation_status, 'confirmed');
+    await assert.rejects(
+      repository.enqueue(notification('shared', 11n, 'WEBSOCKET', 'confirmed', 1_200)),
+      TransactionInboxConflictError,
+    );
+
+    await repository.enqueue(notification('second', 11n, 'WEBSOCKET', 'processed', 1_100));
+    const [first, second] = await Promise.all([
+      repository.claim(2_000, 120),
+      repository.claim(2_000, 120),
+    ]);
+    assert.deepEqual(new Set([first?.signature, second?.signature]), new Set(['shared', 'second']));
+    assert.notEqual(first?.leaseToken, second?.leaseToken);
+    assert.equal(await repository.claim(2_001, 120), null);
+
+    await Promise.all([
+      repository.enqueue(notification('parallel-discovery', 12n, 'WEBSOCKET', 'processed', 2_100)),
+      repository.enqueue(notification('parallel-discovery', 12n, 'CATCH_UP', 'confirmed', 2_101)),
+    ]);
+    const parallel = await row(pool, 'parallel-discovery');
+    assert.deepEqual(parallel.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+    assert.equal(parallel.target_confirmation_status, 'confirmed');
+  });
+});
+
+void test('leases expire, renew, and reject stale tokens on every leased mutation', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('lease', 20n));
+    const first = await repository.claim(10_000, 2);
+    assert.ok(first);
+    await repository.renewLease('lease', first.leaseToken, 14_000);
+    assert.equal(await repository.claim(12_001, 2), null);
+    const reclaimed = await repository.claim(14_001, 2);
+    assert.ok(reclaimed);
+    assert.notEqual(reclaimed.leaseToken, first.leaseToken);
+    assert.equal(reclaimed.attempts, 2);
+
+    const stale = first.leaseToken;
+    const failure: IngestionFailure = Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    });
+    await assert.rejects(repository.renewLease('lease', stale, 20_000), TransactionInboxLeaseError);
+    await assert.rejects(repository.saveSnapshot('lease', stale, normalized('lease', 20n)), TransactionInboxLeaseError);
+    await assert.rejects(repository.markProcessed('lease', stale, 'confirmed'), TransactionInboxLeaseError);
+    await assert.rejects(repository.markFailed('lease', stale, failure), TransactionInboxLeaseError);
+  });
+});
+
+void test('stores canonical bigint/base64 snapshots idempotently and rejects conflicts', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('snapshot', 9_007_199_254_740_993n));
+    const claim = await repository.claim(50_000, 120);
+    assert.ok(claim);
+    const transaction = normalized('snapshot', 9_007_199_254_740_993n);
+    await repository.saveSnapshot('snapshot', claim.leaseToken, transaction);
+    await repository.saveSnapshot('snapshot', claim.leaseToken, transaction);
+    const stored = await row(pool, 'snapshot');
+    assert.equal(stored.normalized_transaction.slot.$solTokenListenerBigInt, '9007199254740993');
+    assert.equal(stored.normalized_transaction.feeLamports.$solTokenListenerBigInt, '9007199254740995');
+    assert.equal(stored.normalized_transaction.instructions[0].dataBase64, 'AAH/');
+    assert.match(stored.immutable_fingerprint, /^[0-9a-f]{64}$/u);
+
+    await assert.rejects(
+      repository.saveSnapshot('snapshot', claim.leaseToken, {
+        ...transaction, feeLamports: transaction.feeLamports + 1n,
+      }),
+      TransactionInboxConflictError,
+    );
+    const replay = await repository.claim(50_001, 120);
+    assert.equal(replay, null);
+  });
+});
+
+void test('reconciles processing finality, replays immutable revisions, and rejects terminal conflicts', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('finality', 30n));
+    const initial = await repository.claim(100_000, 120);
+    assert.ok(initial);
+    await repository.saveSnapshot('finality', initial.leaseToken, normalized('finality', 30n));
+    await repository.markProcessed('finality', initial.leaseToken, 'confirmed');
+    const firstMissing = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'finality', confirmationStatus: null,
+      expectedMissingFinalityPolls: 0, observedAtMs: 101_000,
+    }));
+    assert.equal(firstMissing.missingFinalityPolls, 1);
+    const concurrentMissing = await Promise.allSettled([
+      repository.recordFinalityPoll(Object.freeze({
+        signature: 'finality', confirmationStatus: null,
+        expectedMissingFinalityPolls: 1, observedAtMs: 102_000,
+      })),
+      repository.recordFinalityPoll(Object.freeze({
+        signature: 'finality', confirmationStatus: null,
+        expectedMissingFinalityPolls: 1, observedAtMs: 102_001,
+      })),
+    ]);
+    assert.equal(concurrentMissing.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(concurrentMissing.filter((result) =>
+      result.status === 'rejected' && result.reason instanceof TransactionInboxConflictError).length, 1);
+    const reset = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'finality', confirmationStatus: 'processed',
+      expectedMissingFinalityPolls: 2, observedAtMs: 103_000,
+    }));
+    assert.equal(reset.confirmationStatus, 'confirmed');
+    assert.equal(reset.missingFinalityPolls, 0);
+    const processedAtMs = new Date((await row(pool, 'finality')).processed_at).getTime();
+    assert.deepEqual(await repository.listForFinality(10), [{
+      signature: 'finality', slot: 30n, confirmationStatus: 'confirmed',
+      missingFinalityPolls: 0, processedAtMs,
+    }]);
+
+    await repository.enqueueRevision(Object.freeze({
+      signature: 'finality', confirmationStatus: 'finalized', observedAtMs: 110_000,
+    }));
+    const revision = await repository.claim(110_001, 120);
+    assert.ok(revision?.normalizedTransaction);
+    assert.equal(revision.confirmationStatus, 'finalized');
+    assert.equal(revision.normalizedTransaction.signature, 'finality');
+    await repository.markProcessed('finality', revision.leaseToken, 'finalized');
+    const terminal = await row(pool, 'finality');
+    assert.equal(terminal.processing_status, 'PROCESSED');
+    assert.equal(new Date(terminal.purge_after).getTime() - new Date(terminal.terminal_at).getTime(), 4 * 60 * 60 * 1_000);
+    await assert.rejects(repository.enqueueRevision(Object.freeze({
+      signature: 'finality', confirmationStatus: 'orphaned', observedAtMs: 120_000,
+    })), TransactionInboxConflictError);
+
+    await repository.enqueue(notification('orphan', 31n));
+    const orphan = await repository.claim(120_001, 120);
+    assert.ok(orphan);
+    await repository.saveSnapshot('orphan', orphan.leaseToken, normalized('orphan', 31n));
+    await repository.markProcessed('orphan', orphan.leaseToken, 'processed');
+    await repository.enqueueRevision(Object.freeze({
+      signature: 'orphan', confirmationStatus: 'orphaned', observedAtMs: 130_000,
+    }));
+    const orphanRevision = await repository.claim(130_001, 120);
+    assert.equal(orphanRevision?.confirmationStatus, 'orphaned');
+  });
+});
+
+void test('schedules retryable failures, keeps deterministic failures terminal, and counts states', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('retry', 40n));
+    await repository.enqueue(notification('fatal', 41n));
+    const retry = await repository.claim(200_000, 120);
+    assert.ok(retry);
+    await repository.markFailed('retry', retry.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    const failed = await row(pool, 'retry');
+    assert.equal(failed.error_code, 'RPC_TRANSIENT');
+    assert.equal(failed.error_name, 'RpcError');
+    assert.ok(failed.next_attempt_at);
+    assert.equal(await repository.claim(200_001, 120)?.then((value) => value?.signature), 'fatal');
+
+    const fatalClaim = await repository.claim(200_002, 120);
+    assert.equal(fatalClaim, null);
+    const fatalRow = await row(pool, 'fatal');
+    await repository.markFailed('fatal', fatalRow.lease_token, Object.freeze({
+      code: 'NORMALIZATION_FAILED', errorName: 'TypeError', retryable: false,
+    }));
+    assert.equal((await row(pool, 'fatal')).next_attempt_at, null);
+    assert.deepEqual(await repository.counts(), {
+      pending: 0, processing: 0, processed: 0, failed: 2,
+    });
+    const retryAt = new Date(failed.next_attempt_at).getTime();
+    assert.equal(await repository.claim(retryAt - 1, 120), null);
+    const retried = await repository.claim(retryAt + 1, 120);
+    assert.ok(retried);
+    assert.equal(retried.signature, 'retry');
+    assert.equal(retried.attempts, 2);
+    await repository.markFailed('retry', retried.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+
+    await repository.enqueue(notification('unsafe-error-name', 42n));
+    const unsafe = await repository.claim(retryAt + 2, 120);
+    assert.ok(unsafe);
+    assert.equal(unsafe.signature, 'unsafe-error-name');
+    await assert.rejects(repository.markFailed(
+      'unsafe-error-name', unsafe.leaseToken,
+      Object.freeze({
+        code: 'RPC_TRANSIENT',
+        errorName: 'https://rpc.invalid/key?token=secret',
+        retryable: true,
+      }),
+    ), TransactionInboxRepositoryError);
+    const unsafeRow = await row(pool, 'unsafe-error-name');
+    assert.equal(unsafeRow.processing_status, 'PROCESSING');
+    assert.equal(unsafeRow.error_name, null);
+  });
+});
+
+void test('stores monotonic checkpoints, runtime heartbeats, and purges only terminal work', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    assert.equal(await repository.readCheckpoint('launchpad'), null);
+    await repository.storeCheckpoint(Object.freeze({
+      key: 'launchpad', slot: 50n, signature: 'checkpoint', updatedAtMs: 300_000,
+    }));
+    await repository.storeCheckpoint(Object.freeze({
+      key: 'launchpad', slot: 50n, signature: 'checkpoint', updatedAtMs: 300_001,
+    }));
+    await repository.storeCheckpoint(Object.freeze({
+      key: 'launchpad', slot: 50n, signature: 'new-same-slot-head', updatedAtMs: 300_002,
+    }));
+    assert.deepEqual(await repository.readCheckpoint('launchpad'), {
+      key: 'launchpad', slot: 50n, signature: 'new-same-slot-head', updatedAtMs: 300_002,
+    });
+    await assert.rejects(repository.storeCheckpoint(Object.freeze({
+      key: 'launchpad', slot: 50n, signature: 'stale-same-slot-head', updatedAtMs: 300_001,
+    })), TransactionInboxConflictError);
+    await assert.rejects(repository.storeCheckpoint(Object.freeze({
+      key: 'launchpad', slot: 49n, signature: 'older', updatedAtMs: 300_003,
+    })), TransactionInboxConflictError);
+
+    const heartbeat: RuntimeHeartbeat = Object.freeze({
+      runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+      workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: 290_000,
+      updatedAtMs: 300_000, lastHttpSlot: 51n, lastWebsocketSlot: 50n,
+      lastFinalizedSlot: 49n, lastSignature: 'checkpoint', backlogCount: 3, leasedCount: 1,
+    });
+    await repository.writeHeartbeat(heartbeat);
+    const storedHeartbeat = (await pool.query(
+      "SELECT * FROM listener_heartbeats WHERE service_key = 'transaction-listener'",
+    )).rows[0];
+    assert.equal(storedHeartbeat.pending_transactions, 3);
+    assert.equal(storedHeartbeat.leased_transactions, 1);
+    assert.equal(storedHeartbeat.last_http_slot, '51');
+    assert.deepEqual(storedHeartbeat.payload, { startedAt: '1970-01-01T00:04:50.000Z' });
+
+    await insertTerminal(pool, 'purge-me', new Date(Date.now() - 1_000));
+    await insertTerminal(pool, 'keep-me', new Date(Date.now() + 60_000));
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 1);
+    assert.equal((await pool.query("SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature = 'keep-me'")).rows[0]?.count, '1');
+  });
+});
+
+void test('wraps malformed rows and database rollback failures in safe typed errors', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('fingerprint-corrupt', 59n));
+    const fingerprintClaim = await repository.claim(399_000, 120);
+    assert.ok(fingerprintClaim);
+    await repository.saveSnapshot(
+      'fingerprint-corrupt', fingerprintClaim.leaseToken,
+      normalized('fingerprint-corrupt', 59n),
+    );
+    await repository.markFailed('fingerprint-corrupt', fingerprintClaim.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    const retryAt = new Date((await row(pool, 'fingerprint-corrupt')).next_attempt_at).getTime();
+    await pool.query(
+      "UPDATE chain_transaction_inbox SET immutable_fingerprint = $2 WHERE signature = $1",
+      ['fingerprint-corrupt', '0'.repeat(64)],
+    );
+    await assert.rejects(repository.claim(retryAt + 1, 120), TransactionInboxRepositoryError);
+
+    await repository.enqueue(notification('corrupt', 60n));
+    await pool.query('ALTER TABLE chain_transaction_inbox DROP CONSTRAINT chain_transaction_inbox_observed_slot_check');
+    await pool.query("UPDATE chain_transaction_inbox SET observed_slot = -1 WHERE signature = 'corrupt'");
+    await assert.rejects(repository.claim(400_000, 120), (error) =>
+      error instanceof TransactionInboxRepositoryError
+      && error.message === 'Transaction inbox repository operation failed.'
+      && !error.message.includes('observed_slot'));
+  });
+});
+
+void test('rolls back and releases a checked-out client after a database failure', async () => {
+  const queries: string[] = [];
+  let released = false;
+  const client = {
+    query: async (text: string) => {
+      queries.push(text);
+      if (text.includes('pg_advisory_xact_lock')) throw new Error('postgresql://secret@host/db');
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => { released = true; },
+  };
+  const pool = {
+    connect: async () => client,
+    query: async () => ({ rows: [], rowCount: 0 }),
+  };
+  const repository = new PostgresTransactionInboxRepository(pool);
+  await assert.rejects(repository.enqueue(notification('rollback', 1n)), (error) =>
+    error instanceof TransactionInboxRepositoryError
+    && error.message === 'Transaction inbox repository operation failed.'
+    && !error.message.includes('secret'));
+  assert.deepEqual(queries, ['BEGIN',
+    "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
+    'ROLLBACK']);
+  assert.equal(released, true);
+});
+
+async function withDatabase(
+  context: { skip(message?: string): void },
+  run: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
+): Promise<void> {
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
+    return;
+  }
+  const schema = `transaction_inbox_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    await run(pool);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+}
+
+function notification(
+  signature: string,
+  slot: bigint,
+  source: TransactionNotification['source'] = 'WEBSOCKET',
+  confirmationStatus: TransactionNotification['confirmationStatus'] = 'processed',
+  observedAtMs = 1_000,
+): TransactionNotification {
+  return Object.freeze({ signature, slot, source, confirmationStatus, observedAtMs });
+}
+
+function normalized(signature: string, slot: bigint): NormalizedTransaction {
+  return {
+    signature, slot, transactionIndex: 0, confirmationStatus: 'PROCESSED', version: 'legacy',
+    blockTimeMs: 999, accountKeys: ['account'], signerKeys: ['account'],
+    instructions: [{
+      programId: 'program', accounts: ['account'], data: Uint8Array.from([0, 1, 255]),
+      instructionIndex: 0, innerInstructionIndex: null, parentInstructionIndex: null,
+      stackHeight: null,
+    }],
+    preTokenBalances: [], postTokenBalances: [],
+    preBalancesLamports: [9_007_199_254_740_994n], postBalancesLamports: [9_007_199_254_740_993n],
+    feeLamports: 9_007_199_254_740_995n, computeUnits: 123n, logs: ['ok'], error: null,
+  };
+}
+
+async function row(pool: InstanceType<typeof pg.Pool>, signature: string): Promise<any> {
+  return (await pool.query('SELECT * FROM chain_transaction_inbox WHERE signature = $1', [signature])).rows[0];
+}
+
+async function insertTerminal(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+  terminalAt: Date,
+): Promise<void> {
+  const snapshot = { signature };
+  const completedAt = new Date(terminalAt.getTime() - (4 * 60 * 60 * 1_000));
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature, observed_slot, discovery_sources, target_confirmation_status,
+    processing_status, normalized_transaction, immutable_fingerprint, observed_at,
+    processed_at, terminal_at, purge_after
+  ) VALUES ($1, 1, ARRAY['WEBSOCKET'], 'finalized', 'PROCESSED', $2, $3,
+    $4::TIMESTAMPTZ, $4::TIMESTAMPTZ, $4::TIMESTAMPTZ,
+    $4::TIMESTAMPTZ + INTERVAL '4 hours')`, [signature, snapshot, 'a'.repeat(64), completedAt]);
+}
+
+function quoteIdentifier(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
+}

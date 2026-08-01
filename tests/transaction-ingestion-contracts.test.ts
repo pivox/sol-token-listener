@@ -15,6 +15,7 @@ import {
   TRANSACTION_INBOX_STATUSES,
   assertValidClaimedTransaction,
   assertValidFinalityCandidate,
+  assertValidFinalityPollObservation,
   assertValidIngestionFailure,
   assertValidProcessingCheckpoint,
   assertValidRuntimeHeartbeat,
@@ -23,6 +24,7 @@ import {
   restoreNormalizedTransactionSnapshot,
   type ClaimedTransaction,
   type FinalityCandidate,
+  type FinalityPollObservation,
   type IngestionFailure,
   type ProcessingCheckpoint,
   type RuntimeHeartbeat,
@@ -79,6 +81,12 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
     missingFinalityPolls: 0,
     processedAtMs: observedAtMs,
   });
+  const finalityPoll: FinalityPollObservation = Object.freeze({
+    signature: 'signature',
+    confirmationStatus: null,
+    expectedMissingFinalityPolls: 0,
+    observedAtMs,
+  });
   const heartbeat: RuntimeHeartbeat = Object.freeze({
     runtimeState: 'RUNNING',
     subscriberState: 'RUNNING',
@@ -100,6 +108,7 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
   assert.doesNotThrow(() => { assertValidIngestionFailure(failure); });
   assert.doesNotThrow(() => { assertValidProcessingCheckpoint(checkpoint); });
   assert.doesNotThrow(() => { assertValidFinalityCandidate(candidate); });
+  assert.doesNotThrow(() => { assertValidFinalityPollObservation(finalityPoll); });
   assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
   assert.equal(typeof notification.slot, 'bigint');
   assert.ok(Number.isSafeInteger(heartbeat.updatedAtMs));
@@ -471,6 +480,24 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
       /missingFinalityPolls|safe integer/u,
     );
   }
+  const poll = Object.freeze({
+    signature: 'signature', confirmationStatus: null, expectedMissingFinalityPolls: 0,
+    observedAtMs,
+  });
+  for (const expectedMissingFinalityPolls of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => { assertValidFinalityPollObservation(Object.freeze({
+        ...poll, expectedMissingFinalityPolls,
+      })); },
+      /expectedMissingFinalityPolls|safe integer/u,
+    );
+  }
+  assert.throws(
+    () => { assertValidFinalityPollObservation(Object.freeze({
+      ...poll, confirmationStatus: 'finalized',
+    })); },
+    /confirmationStatus/u,
+  );
 });
 
 void test('rejects invalid discovery sources and ingestion error codes', () => {
