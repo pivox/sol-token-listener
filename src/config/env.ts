@@ -21,6 +21,12 @@ export interface AppConfig {
   readonly qualificationRuleSetStatus: QualificationRuleSetStatus;
   readonly qualificationMinimumScore: number;
   readonly dataRetentionHours: number;
+  readonly listenerEnabled: boolean;
+  readonly listenerWorkerLeaseSeconds: number;
+  readonly listenerCatchUpMaxPages: number;
+  readonly listenerCatchUpPageSize: number;
+  readonly listenerFinalityMissingPolls: number;
+  readonly listenerShutdownTimeoutMs: number;
   readonly raydiumCpmmProgramId: string;
   readonly wsolMint: string;
   readonly buyAmountLamports: bigint;
@@ -108,6 +114,22 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
       100,
     ),
     dataRetentionHours: parseInteger(environment.DATA_RETENTION_HOURS, 4, 'DATA_RETENTION_HOURS', 1, 168),
+    listenerEnabled: parseBoolean(environment.LISTENER_ENABLED, true, 'LISTENER_ENABLED'),
+    listenerWorkerLeaseSeconds: parseInteger(
+      environment.LISTENER_WORKER_LEASE_SECONDS, 120, 'LISTENER_WORKER_LEASE_SECONDS', 30, 900,
+    ),
+    listenerCatchUpMaxPages: parseInteger(
+      environment.LISTENER_CATCH_UP_MAX_PAGES, 20, 'LISTENER_CATCH_UP_MAX_PAGES', 1, 100,
+    ),
+    listenerCatchUpPageSize: parseInteger(
+      environment.LISTENER_CATCH_UP_PAGE_SIZE, 100, 'LISTENER_CATCH_UP_PAGE_SIZE', 1, 1_000,
+    ),
+    listenerFinalityMissingPolls: parseInteger(
+      environment.LISTENER_FINALITY_MISSING_POLLS, 3, 'LISTENER_FINALITY_MISSING_POLLS', 2, 20,
+    ),
+    listenerShutdownTimeoutMs: parseInteger(
+      environment.LISTENER_SHUTDOWN_TIMEOUT_MS, 30_000, 'LISTENER_SHUTDOWN_TIMEOUT_MS', 1_000, 120_000,
+    ),
     raydiumCpmmProgramId: optional(environment.RAYDIUM_CPMM_PROGRAM_ID, DEFAULT_RAYDIUM_CPMM_PROGRAM_ID),
     wsolMint,
     buyAmountLamports: parseSolToLamports(environment.BUY_AMOUNT_SOL, '0.01', 'BUY_AMOUNT_SOL'),
