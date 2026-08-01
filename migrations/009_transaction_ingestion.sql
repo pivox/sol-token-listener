@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS chain_transaction_inbox (
         'CATCH_UP_WINDOW_EXCEEDED'
       )
       AND error_name IS NOT NULL
-      AND LENGTH(error_name) BETWEEN 1 AND 128
+      AND OCTET_LENGTH(error_name) BETWEEN 1 AND 16384
       AND error_retryable IS NOT NULL
     ) OR (
       processing_status <> 'FAILED'

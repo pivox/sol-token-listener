@@ -40,6 +40,8 @@ void test('creates a replayable bigint-safe transaction inbox with strict lifecy
   assert.match(sql, /missing_finality_polls >= 0/u);
   assert.match(sql, /processing_status = 'FAILED'[\s\S]*error_code IS NOT NULL[\s\S]*error_code IN \([\s\S]*error_name IS NOT NULL[\s\S]*error_retryable IS NOT NULL/u);
   assert.match(sql, /processing_status <> 'FAILED'[\s\S]*error_code IS NULL[\s\S]*error_name IS NULL[\s\S]*error_retryable IS NULL/u);
+  assert.match(sql, /OCTET_LENGTH\(error_name\) BETWEEN 1 AND 16384/u);
+  assert.doesNotMatch(sql, /(?:^|[^_])LENGTH\(error_name\)|CHAR_LENGTH\(error_name\)/mu);
   assert.match(sql, /lease_token IS NULL AND lease_expires_at IS NULL/u);
   assert.match(sql, /normalized_transaction IS NULL AND immutable_fingerprint IS NULL/u);
   assert.match(sql, /normalized_transaction IS NOT NULL[\s\S]*immutable_fingerprint IS NOT NULL[\s\S]*immutable_fingerprint ~ '\^\[0-9a-f\]\{64\}\$'/u);
@@ -159,6 +161,31 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
     assert.equal((await pool.query(
       "SELECT 1 FROM chain_transaction_inbox WHERE signature = 'failed-structured'",
     )).rowCount, 1);
+    const multibyteName = 'é'.repeat(129);
+    const exactMultibyteName = 'é'.repeat(8_192);
+    const oversizedMultibyteName = `${exactMultibyteName}a`;
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, target_confirmation_status,
+      processing_status, error_code, error_name, error_retryable, observed_at
+    ) VALUES ($1, 45, ARRAY['WEBSOCKET'], 'confirmed', 'FAILED',
+      'NORMALIZATION_FAILED', $2, FALSE, NOW())`, ['failed-multibyte', multibyteName]);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, target_confirmation_status,
+      processing_status, error_code, error_name, error_retryable, observed_at
+    ) VALUES ($1, 46, ARRAY['WEBSOCKET'], 'confirmed', 'FAILED',
+      'NORMALIZATION_FAILED', $2, FALSE, NOW())`, ['failed-exact-name', exactMultibyteName]);
+    assert.equal((await pool.query<{ readonly bytes: number }>(
+      "SELECT OCTET_LENGTH(error_name) AS bytes FROM chain_transaction_inbox WHERE signature = 'failed-exact-name'",
+    )).rows[0]?.bytes, 16_384);
+    await assert.rejects(
+      pool.query(`INSERT INTO chain_transaction_inbox (
+        signature, observed_slot, discovery_sources, target_confirmation_status,
+        processing_status, error_code, error_name, error_retryable, observed_at
+      ) VALUES ($1, 47, ARRAY['WEBSOCKET'], 'confirmed', 'FAILED',
+        'NORMALIZATION_FAILED', $2, FALSE, NOW())`,
+      ['failed-oversized-name', oversizedMultibyteName]),
+      /chain_transaction_inbox_error_check/u,
+    );
     await assert.rejects(
       pool.query(`INSERT INTO chain_transaction_inbox (
         signature, observed_slot, discovery_sources, target_confirmation_status,
