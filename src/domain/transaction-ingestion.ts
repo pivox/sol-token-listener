@@ -173,6 +173,7 @@ export interface InboxCounts {
   readonly processing: number;
   readonly processed: number;
   readonly failed: number;
+  readonly retryableFailed: number;
 }
 
 export function createDurableTransactionSnapshot(
@@ -421,6 +422,10 @@ export function assertValidInboxCounts(value: unknown): asserts value is InboxCo
   assertCount(record.processing, 'Inbox counts processing');
   assertCount(record.processed, 'Inbox counts processed');
   assertCount(record.failed, 'Inbox counts failed');
+  assertCount(record.retryableFailed, 'Inbox counts retryableFailed');
+  if (record.retryableFailed > record.failed) {
+    throw new TypeError('Inbox counts retryableFailed exceeds failed.');
+  }
 }
 
 function frozenRecord(value: unknown, name: string): Readonly<Record<string, unknown>> {

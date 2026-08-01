@@ -153,6 +153,12 @@ implements ParticipantAnalyticsTransaction {
     await this.insertHolderSnapshot(projection, holderEvent.id);
   }
 
+  public async dissolveCurrent(mint: string): Promise<void> {
+    this.assertLockedMint(mint);
+    await this.client.query('DELETE FROM observed_wallet_positions WHERE mint = $1', [mint]);
+    await this.client.query('DELETE FROM creator_profiles WHERE mint = $1', [mint]);
+  }
+
   private async upsertDomainEvent(event: ParticipantAnalyticsDerivedEventV1): Promise<void> {
     await this.client.query(
       `INSERT INTO domain_events (

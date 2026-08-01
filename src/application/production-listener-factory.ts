@@ -406,7 +406,11 @@ export class PersistentListenerHeartbeat {
       ]);
       this.lastHttpSlot = slots[0];
       this.lastFinalizedSlot = slots[1];
-      this.backlogCount = counts.pending + counts.processing;
+      this.backlogCount = safeInboxBacklog(
+        counts.pending,
+        counts.processing,
+        counts.retryableFailed,
+      );
       this.leasedCount = counts.processing;
     }
     const value: RuntimeHeartbeat = Object.freeze({
@@ -426,6 +430,17 @@ export class PersistentListenerHeartbeat {
     });
     await this.inbox.writeHeartbeat(value);
   }
+}
+
+function safeInboxBacklog(...counts: readonly number[]): number {
+  let total = 0;
+  for (const count of counts) {
+    if (!Number.isSafeInteger(count) || count < 0 || !Number.isSafeInteger(total + count)) {
+      throw new TypeError('Transaction inbox backlog count is invalid.');
+    }
+    total += count;
+  }
+  return total;
 }
 
 async function settleController(

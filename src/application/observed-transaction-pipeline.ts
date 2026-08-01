@@ -10,6 +10,10 @@ import { createSolanaObservedTransaction } from '../solana/rpc/observed-transact
 import type { SolanaObservedTransaction } from '../solana/rpc/observed-transaction.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import {
+  missingCanonicalLaunchPolicy,
+  type MissingCanonicalLaunchPolicy,
+} from '../domain/projection-reconciliation.js';
+import {
   BIGINT_JSON_MARKER,
   MAX_CANONICAL_JSON_DEPTH,
   MAX_CANONICAL_JSON_STRING_BYTES,
@@ -79,7 +83,7 @@ interface FundingObserver {
 }
 
 interface MintProjectionRebuilder {
-  rebuild(mint: string): Promise<unknown>;
+  rebuild(mint: string, missingLaunchPolicy: MissingCanonicalLaunchPolicy): Promise<unknown>;
 }
 
 interface MarketObservationResult {
@@ -124,16 +128,20 @@ export class ObservedTransactionPipeline {
       ));
     const affectedMints = await this.stage('reload_active_events', null, () =>
       affectedMintList(active.mints, launchpad.affectedMints));
+    const missingLaunchPolicy = missingCanonicalLaunchPolicy(
+      transaction.confirmationStatus,
+    );
 
     let participantAnalyticsCount = 0;
     let walletGraphCount = 0;
     for (const mint of affectedMints) {
       await this.stage('participant_analytics', mint, () =>
-        this.participants.rebuild(mint));
+        this.participants.rebuild(mint, missingLaunchPolicy));
       participantAnalyticsCount += 1;
     }
     for (const mint of affectedMints) {
-      await this.stage('wallet_graph', mint, () => this.graph.rebuild(mint));
+      await this.stage('wallet_graph', mint, () =>
+        this.graph.rebuild(mint, missingLaunchPolicy));
       walletGraphCount += 1;
     }
 

@@ -210,6 +210,7 @@ interface HarnessOptions {
 
 function harness(options: HarnessOptions = {}) {
   const order: string[] = [];
+  const rebuildPolicies: string[] = [];
   const observed: unknown[] = [];
   let clockCalls = 0;
   const fail = (stage: ObservedPipelineStage, mint?: string): void => {
@@ -266,15 +267,17 @@ function harness(options: HarnessOptions = {}) {
     },
   };
   const participants = {
-    rebuild: async (mint: string) => {
+    rebuild: async (mint: string, policy: string) => {
       order.push(`i1:${mint}`);
+      rebuildPolicies.push(`i1:${mint}:${policy}`);
       fail('participant_analytics', mint);
       return Object.freeze({});
     },
   };
   const graph = {
-    rebuild: async (mint: string) => {
+    rebuild: async (mint: string, policy: string) => {
       order.push(`i2:${mint}`);
+      rebuildPolicies.push(`i2:${mint}:${policy}`);
       fail('wallet_graph', mint);
       return Object.freeze({});
     },
@@ -316,6 +319,7 @@ function harness(options: HarnessOptions = {}) {
     pipeline,
     tx,
     order,
+    rebuildPolicies,
     observed,
     clockCalls: () => clockCalls,
     dependencies: { reader, launchpad, funding, participants, graph, market },
@@ -400,6 +404,24 @@ void test('uses persisted launchpad impact to dissolve orphaned projections afte
     'i1:MintA', 'i1:MintZ', 'i2:MintA', 'i2:MintZ', 'pumpswap',
   ]);
   assert.equal(result.affectedMintCount, 2);
+  assert.deepEqual(h.rebuildPolicies, [
+    'i1:MintA:DISSOLVE_CURRENT',
+    'i1:MintZ:DISSOLVE_CURRENT',
+    'i2:MintA:DISSOLVE_CURRENT',
+    'i2:MintZ:DISSOLVE_CURRENT',
+  ]);
+});
+
+void test('uses error policy for every active confirmation status', async () => {
+  for (const status of ['PROCESSED', 'CONFIRMED', 'FINALIZED'] as const) {
+    const h = harness({ launchpadAffectedMints: ['MintA'] });
+    h.tx.confirmationStatus = status;
+    await h.pipeline.process(h.tx);
+    assert.deepEqual(h.rebuildPolicies, [
+      'i1:MintA:ERROR',
+      'i2:MintA:ERROR',
+    ]);
+  }
 });
 
 void test('stops before every I2 rebuild when I1 fails on a later lexical mint', async () => {

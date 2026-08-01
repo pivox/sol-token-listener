@@ -298,7 +298,7 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
     }));
     assert.equal((await row(pool, 'fatal')).next_attempt_at, null);
     assert.deepEqual(await repository.counts(), {
-      pending: 0, processing: 0, processed: 0, failed: 2,
+      pending: 0, processing: 0, processed: 0, failed: 2, retryableFailed: 1,
     });
     const retryAt = new Date(failed.next_attempt_at).getTime();
     assert.equal(await repository.claim(retryAt - 1, 120), null);

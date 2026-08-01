@@ -7,6 +7,7 @@ import { LaunchParticipantAnalyticsService } from '../src/application/launch-par
 import { LaunchpadObservationService } from '../src/application/launchpad-observation.service.js';
 import { MarketObservationService } from '../src/application/market-observation.service.js';
 import { ObservedTransactionPipeline } from '../src/application/observed-transaction-pipeline.js';
+import { PersistentListenerHeartbeat } from '../src/application/production-listener-factory.js';
 import { PumpSwapObservationPipeline } from '../src/application/pumpswap-observation-pipeline.js';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
 import { WalletEvidenceObservationService } from '../src/application/wallet-evidence-observation.service.js';
@@ -29,6 +30,7 @@ import { SolanaWalletFundingEvidenceExtractor } from '../src/solana/wallet-fundi
 import type { NormalizedInstruction, NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
+import { PostgresApiProjectionRepository } from '../src/storage/api-projection.repository.js';
 import { PostgresMarketObservationRepository } from '../src/storage/market-observation.repository.js';
 import { PostgresPaperTradingRepository } from '../src/storage/paper-trading.repository.js';
 import { PostgresParticipantAnalyticsRepository } from '../src/storage/participant-analytics.repository.js';
@@ -156,6 +158,112 @@ void test('terminalizes legacy finality rows for four hours without purging pend
   });
 });
 
+void test('processes a compound confirmed-to-orphaned replay and preserves audit', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const fixture = await loadPumpFixture('create-v2-initial-buy-mainnet.json');
+    const confirmed = migrationTransaction(fixture.transaction);
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(Object.freeze({
+      signature: confirmed.signature,
+      slot: confirmed.slot,
+      source: 'WEBSOCKET' as const,
+      programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
+      confirmationStatus: 'confirmed' as const,
+      observedAtMs: Date.now(),
+    }));
+    assert.deepEqual(
+      await worker(repository, confirmed, pipeline(pool, null, [])).runOnce(),
+      { kind: 'processed', signature: confirmed.signature },
+    );
+    const beforeAudit = await auditCounts(pool);
+    assert.deepEqual(await currentProjectionCounts(pool), {
+      participantProfiles: '1', participantPositions: '1', graphProfiles: '1',
+      graphRelationships: '0', graphClusters: '0', activeMarketPools: '1',
+    });
+
+    await repository.enqueueRevision(Object.freeze({
+      signature: confirmed.signature,
+      confirmationStatus: 'orphaned' as const,
+      observedAtMs: Date.now() + 1,
+    }));
+    const orphanOrder: Boundary[] = [];
+    const orphaned = Object.freeze({ ...confirmed, confirmationStatus: 'ORPHANED' as const });
+    const orphanResult = await worker(
+      repository, orphaned, pipeline(pool, null, orphanOrder), Date.now() + 2, false,
+    ).runOnce();
+    assert.deepEqual(
+      orphanResult,
+      { kind: 'processed', signature: confirmed.signature },
+      `orphan stages completed: ${orphanOrder.join(',')}`,
+    );
+    assert.deepEqual(orphanOrder, FULL_REPLAY);
+    assert.deepEqual(await currentProjectionCounts(pool), {
+      participantProfiles: '0', participantPositions: '0', graphProfiles: '0',
+      graphRelationships: '0', graphClusters: '0', activeMarketPools: '0',
+    });
+    assert.deepEqual(await auditCounts(pool), beforeAudit);
+    const states = (await pool.query(`SELECT
+      (SELECT current_state FROM token_launches LIMIT 1) AS launch_state,
+      (SELECT confirmation_status FROM wallet_funding_observations LIMIT 1) AS funding_status,
+      (SELECT pool_state FROM market_pools LIMIT 1) AS pool_state,
+      (SELECT confirmation_status FROM market_pools LIMIT 1) AS pool_confirmation,
+      (SELECT COUNT(*)::text FROM token_holders_snapshots) AS participant_snapshots,
+      (SELECT COUNT(*)::text FROM wallet_graph_snapshots) AS graph_snapshots`)).rows[0];
+    assert.deepEqual(states, {
+      launch_state: 'RETRACTED', funding_status: 'confirmed', pool_state: 'retracted',
+      pool_confirmation: 'orphaned', participant_snapshots: '1', graph_snapshots: '1',
+    });
+    assert.deepEqual(await repository.counts(), {
+      pending: 0, processing: 0, processed: 1, failed: 0, retryableFailed: 0,
+    });
+
+    const replayOrder: Boundary[] = [];
+    await pipeline(pool, null, replayOrder).process(orphaned);
+    assert.deepEqual(replayOrder, FULL_REPLAY);
+    assert.deepEqual(await auditCounts(pool), beforeAudit);
+    assert.deepEqual(await currentProjectionCounts(pool), {
+      participantProfiles: '0', participantPositions: '0', graphProfiles: '0',
+      graphRelationships: '0', graphClusters: '0', activeMarketPools: '0',
+    });
+  });
+});
+
+void test('exposes a real retryable failed inbox row through persisted API health', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(Object.freeze({
+      signature: 'retryable-health', slot: 1n, source: 'WEBSOCKET' as const,
+      programIds: Object.freeze([PUMP_PROGRAM_ID]), confirmationStatus: 'confirmed' as const,
+      observedAtMs: Date.now(),
+    }));
+    const claim = await repository.claim(Date.now() + 1, 120);
+    assert.ok(claim);
+    await repository.markFailed(claim.signature, claim.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    const heartbeat = new PersistentListenerHeartbeat(
+      repository,
+      { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+      () => 'RUNNING', () => 'RUNNING', () => 'RUNNING', () => 'RUNNING',
+      { intervalMs: 60_000, shutdownTimeoutMs: 1_000,
+        scheduler: { schedule: () => 1, cancel: () => undefined } },
+    );
+    await heartbeat.start();
+    const health = await new PostgresApiProjectionRepository(
+      pool,
+      () => new Date(),
+      { httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING' },
+    ).getHealth();
+    assert.equal(health.heartbeat.backlogCount, 1);
+    assert.equal(health.heartbeat.leasedCount, 0);
+    assert.equal(health.heartbeat.pendingTransactions, 1);
+    assert.notDeepEqual({ status: health.status, backlog: health.heartbeat.backlogCount }, {
+      status: 'OK', backlog: 0,
+    });
+    await heartbeat.stop();
+  });
+});
+
 function pipeline(
   pool: InstanceType<typeof pg.Pool>,
   failAt: Boundary | null,
@@ -188,8 +296,8 @@ function pipeline(
       return result;
     })) },
     { observe: (...args) => after('funding', realFunding.observe(...args)) },
-    { rebuild: (mint) => after('i1', realParticipants.rebuild(mint)) },
-    { rebuild: (mint) => after('i2', realGraph.rebuild(mint)) },
+    { rebuild: (mint, policy) => after('i1', realParticipants.rebuild(mint, policy)) },
+    { rebuild: (mint, policy) => after('i2', realGraph.rebuild(mint, policy)) },
     { processObserved: (observed) => after('pumpswap', realMarket.processObserved(observed)) },
     () => 1_800_000_000_000,
   );
@@ -254,7 +362,10 @@ function marketPipeline(
   const canonical = canonicalPool();
   const market = new PumpSwapMarketAdapter(
     () => marketEvidence(),
-    { validate: () => Promise.resolve(canonical) },
+    { validate: (_creation, transaction) => Promise.resolve(Object.freeze({
+      ...canonical,
+      confirmationStatus: transaction.confirmationStatus,
+    })) },
     { read: () => Promise.resolve({
       pool: canonical.address,
       baseReservesRaw: 10_000n,
@@ -384,6 +495,33 @@ async function productionCounts(pool: InstanceType<typeof pg.Pool>) {
     migrations: row.migrations, marketPools: row.market_pools,
     reserveSnapshots: row.reserve_snapshots, paperPositions: row.paper_positions,
   });
+}
+
+async function currentProjectionCounts(pool: InstanceType<typeof pg.Pool>) {
+  return (await pool.query<{
+    participantProfiles: string; participantPositions: string; graphProfiles: string;
+    graphRelationships: string; graphClusters: string; activeMarketPools: string;
+  }>(`SELECT
+    (SELECT COUNT(*)::text FROM creator_profiles) AS "participantProfiles",
+    (SELECT COUNT(*)::text FROM observed_wallet_positions) AS "participantPositions",
+    (SELECT COUNT(*)::text FROM wallet_graph_profiles) AS "graphProfiles",
+    (SELECT COUNT(*)::text FROM wallet_relationships) AS "graphRelationships",
+    (SELECT COUNT(*)::text FROM wallet_clusters) AS "graphClusters",
+    (SELECT COUNT(*)::text FROM market_pools
+      WHERE pool_state = 'active' AND confirmation_status <> 'orphaned') AS "activeMarketPools"`))
+    .rows[0];
+}
+
+async function auditCounts(pool: InstanceType<typeof pg.Pool>) {
+  return (await pool.query<{
+    rawChainEvents: string; domainEvents: string; participantSnapshots: string;
+    graphSnapshots: string; reserveSnapshots: string;
+  }>(`SELECT
+    (SELECT COUNT(*)::text FROM raw_chain_events) AS "rawChainEvents",
+    (SELECT COUNT(*)::text FROM domain_events) AS "domainEvents",
+    (SELECT COUNT(*)::text FROM token_holders_snapshots) AS "participantSnapshots",
+    (SELECT COUNT(*)::text FROM wallet_graph_snapshots) AS "graphSnapshots",
+    (SELECT COUNT(*)::text FROM market_reserve_snapshots) AS "reserveSnapshots"`)).rows[0];
 }
 
 function expectedCountsBefore(boundary: Boundary | null) {

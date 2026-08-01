@@ -58,7 +58,9 @@ void test('heartbeat stop fences an in-flight RUNNING write before durable STOPP
   let runningWrites = 0;
   const heartbeat = new PersistentListenerHeartbeat(
     {
-      async counts() { return { pending: 0, processing: 0, processed: 0, failed: 0 }; },
+      async counts() {
+        return { pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0 };
+      },
       async writeHeartbeat(value) {
         if (value.runtimeState === 'RUNNING' && ++runningWrites === 2) await periodic.promise;
         writes.push(value.runtimeState);
@@ -88,6 +90,31 @@ void test('heartbeat stop fences an in-flight RUNNING write before durable STOPP
   scheduler.fireLastCallbackAgain();
   await Promise.resolve();
   assert.deepEqual(writes, ['RUNNING', 'RUNNING', 'STOPPED']);
+});
+
+void test('heartbeat exposes retryable failed work in backlog without leasing it', async () => {
+  const writes: { readonly backlogCount: number; readonly leasedCount: number }[] = [];
+  const heartbeat = new PersistentListenerHeartbeat(
+    {
+      async counts() {
+        return { pending: 2, processing: 1, processed: 4, failed: 3, retryableFailed: 2 };
+      },
+      async writeHeartbeat(value) {
+        writes.push(value);
+      },
+    },
+    { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+    () => 'RUNNING',
+    () => 'RUNNING',
+    () => 'RUNNING',
+    () => 'RUNNING',
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler() },
+  );
+
+  await heartbeat.start();
+  assert.equal(writes[0]?.backlogCount, 5);
+  assert.equal(writes[0]?.leasedCount, 1);
+  await heartbeat.stop();
 });
 
 void test('finality close fences an in-flight pass and rejects stale timer activity', async () => {

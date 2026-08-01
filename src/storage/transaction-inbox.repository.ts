@@ -581,7 +581,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            COUNT(*) FILTER (WHERE processing_status = 'PENDING') AS pending,
            COUNT(*) FILTER (WHERE processing_status = 'PROCESSING') AS processing,
            COUNT(*) FILTER (WHERE processing_status = 'PROCESSED') AS processed,
-           COUNT(*) FILTER (WHERE processing_status = 'FAILED') AS failed
+           COUNT(*) FILTER (WHERE processing_status = 'FAILED') AS failed,
+           COUNT(*) FILTER (
+             WHERE processing_status = 'FAILED' AND error_retryable = TRUE
+           ) AS retryable_failed
          FROM chain_transaction_inbox`,
       );
       const row = requiredRow(result.rows[0]);
@@ -590,6 +593,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         processing: safeCount(row.processing, 'processing count'),
         processed: safeCount(row.processed, 'processed count'),
         failed: safeCount(row.failed, 'failed count'),
+        retryableFailed: safeCount(row.retryable_failed, 'retryable failed count'),
       });
       assertValidInboxCounts(counts);
       return counts;

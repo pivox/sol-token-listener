@@ -18,6 +18,7 @@ import {
   type WalletGraphProjection,
 } from '../domain/wallet-graph.js';
 import type { WalletGraphRepository } from '../ports/wallet-graph-repository.js';
+import type { MissingCanonicalLaunchPolicy } from '../domain/projection-reconciliation.js';
 
 interface WalletGraphAnalysisProvider {
   analyze(input: WalletGraphInput): WalletGraphAnalysis;
@@ -36,11 +37,18 @@ export class WalletGraphRebuildService {
     private readonly analyzer: WalletGraphAnalysisProvider = new WalletGraphAnalyzer(),
   ) {}
 
-  public async rebuild(mint: string): Promise<WalletGraphProjection> {
+  public async rebuild(
+    mint: string,
+    missingLaunchPolicy: MissingCanonicalLaunchPolicy = 'ERROR',
+  ): Promise<WalletGraphProjection | null> {
     if (mint.length === 0) throw new TypeError('Wallet graph mint is required.');
     return this.repository.transact(mint, async (transaction) => {
       const input = await transaction.loadCanonicalInput(mint);
-      if (input === null) throw new WalletGraphLaunchNotFoundError(mint);
+      if (input === null) {
+        if (missingLaunchPolicy === 'ERROR') throw new WalletGraphLaunchNotFoundError(mint);
+        await transaction.dissolveCurrent(mint);
+        return null;
+      }
       assertValidWalletGraphInput(input);
       const analysis = this.analyzer.analyze(input);
       const projection: WalletGraphProjection = Object.freeze({

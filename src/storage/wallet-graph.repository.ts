@@ -271,6 +271,13 @@ class PostgresWalletGraphTransaction implements WalletGraphTransaction {
     return input;
   }
 
+  public async dissolveCurrent(mint: string): Promise<void> {
+    this.assertLockedMint(mint);
+    await this.client.query('DELETE FROM wallet_relationships WHERE mint = $1', [mint]);
+    await this.client.query('DELETE FROM wallet_clusters WHERE mint = $1', [mint]);
+    await this.client.query('DELETE FROM wallet_graph_profiles WHERE mint = $1', [mint]);
+  }
+
   public async replaceProjection(
     projection: WalletGraphProjection,
     event: WalletClusterDetectedEventV1,
