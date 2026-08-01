@@ -103,6 +103,96 @@ void test('reflects active component degradation and validates shutdown bounds',
   assert.throws(() => new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 0 }), TypeError);
 });
 
+void test('uses one global deadline for startup and every shutdown dependency', async () => {
+  const calls: string[] = [];
+  const deps: ListenerRuntimeDependencies = {
+    ...dependencies(calls),
+    rpc: {
+      async checkHealth() {
+        calls.push('rpc.health');
+        await new Promise<void>(() => undefined);
+      },
+    },
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 5 });
+  void runtime.start().catch(() => undefined);
+  await Promise.resolve();
+  const startedAt = Date.now();
+
+  await assert.rejects(runtime.close(), (error: unknown) => {
+    assert.ok(error instanceof ListenerRuntimeError);
+    assert.deepEqual(error.failures, [
+      Object.freeze({ stage: 'startup-timeout', errorName: 'ListenerTimeoutError' }),
+    ]);
+    return true;
+  });
+  assert.ok(Date.now() - startedAt < 50);
+  assert.deepEqual(calls, [
+    'rpc.health', 'worker.close', 'subscriber.close', 'scanner.close',
+    'reconciler.close', 'heartbeat.stop:STOPPED',
+  ]);
+  assert.equal(runtime.state(), 'DEGRADED');
+});
+
+void test('attempts all hanging cleanup within one shared shutdown budget', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  const hanging = () => new Promise<void>(() => undefined);
+  deps.worker.close = () => { calls.push('worker.close'); return hanging(); };
+  deps.subscriber.close = () => { calls.push('subscriber.close'); return hanging(); };
+  deps.scanner.close = () => { calls.push('scanner.close'); return hanging(); };
+  deps.reconciler.close = () => { calls.push('reconciler.close'); return hanging(); };
+  deps.heartbeat.stop = (state) => { calls.push(`heartbeat.stop:${state}`); return hanging(); };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 10 });
+  await runtime.start();
+  calls.length = 0;
+  const startedAt = Date.now();
+
+  await assert.rejects(runtime.close(), (error: unknown) => {
+    assert.ok(error instanceof ListenerRuntimeError);
+    assert.deepEqual(error.failures, [
+      Object.freeze({ stage: 'subscriber-close', errorName: 'ListenerTimeoutError' }),
+      Object.freeze({ stage: 'scanner-close', errorName: 'ListenerTimeoutError' }),
+      Object.freeze({ stage: 'reconciler-close', errorName: 'ListenerTimeoutError' }),
+      Object.freeze({ stage: 'worker-timeout', errorName: 'ListenerTimeoutError' }),
+      Object.freeze({ stage: 'heartbeat-stop', errorName: 'ListenerTimeoutError' }),
+    ]);
+    return true;
+  });
+  assert.ok(Date.now() - startedAt < 60);
+  assert.deepEqual(calls, [
+    'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
+    'heartbeat.stop:STOPPED',
+  ]);
+  assert.equal(runtime.state(), 'DEGRADED');
+});
+
+void test('reports RUNNING only when every active component is explicitly RUNNING', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  const states = {
+    scanner: 'RUNNING', subscriber: 'RUNNING', worker: 'RUNNING',
+    reconciler: 'RUNNING', heartbeat: 'RUNNING',
+  } as Record<string, string>;
+  deps.scanner.state = () => states.scanner as 'RUNNING';
+  deps.subscriber.state = () => states.subscriber as 'RUNNING';
+  deps.worker.state = () => states.worker as 'RUNNING';
+  deps.reconciler.state = () => states.reconciler as 'RUNNING';
+  deps.heartbeat.state = () => states.heartbeat as 'RUNNING';
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+  await runtime.start();
+
+  for (const component of Object.keys(states)) {
+    for (const state of ['STOPPED', 'STARTING', 'STOPPING', 'DEGRADED', 'UNKNOWN']) {
+      states[component] = state;
+      assert.equal(runtime.state(), 'DEGRADED', `${component}:${state}`);
+      assert.equal(runtime.pipelineState().pumpfun, 'DEGRADED', `${component}:${state}`);
+      states[component] = 'RUNNING';
+    }
+  }
+  assert.equal(runtime.state(), 'RUNNING');
+});
+
 function dependencies(calls: string[]): ListenerRuntimeDependencies {
   return {
     rpc: { async checkHealth() { calls.push('rpc.health'); } },

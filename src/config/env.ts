@@ -4,6 +4,7 @@ import { MAX_API_PAGE_LIMIT } from '../ports/api-projection-repository.js';
 
 const DEFAULT_WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_RAYDIUM_CPMM_PROGRAM_ID = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
+const MAX_RECONCILE_SECONDS = 2_147_483;
 
 export type ExecutionMode = 'observe' | 'paper';
 export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
@@ -140,7 +141,13 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     maxConcurrentPositions: parseInteger(environment.MAX_CONCURRENT_POSITIONS, 1, 'MAX_CONCURRENT_POSITIONS', 1),
     maxActivePoolMonitors: parseInteger(environment.MAX_ACTIVE_POOL_MONITORS, 50, 'MAX_ACTIVE_POOL_MONITORS', 1),
     poolMonitorTtlMinutes: parseInteger(environment.POOL_MONITOR_TTL_MINUTES, 90, 'POOL_MONITOR_TTL_MINUTES', 1),
-    reconcileSeconds: parseInteger(environment.RECONCILE_SECONDS, 15, 'RECONCILE_SECONDS', 1),
+    reconcileSeconds: parseInteger(
+      environment.RECONCILE_SECONDS,
+      15,
+      'RECONCILE_SECONDS',
+      1,
+      MAX_RECONCILE_SECONDS,
+    ),
     rpcRetryMaxAttempts: parseInteger(environment.RPC_RETRY_MAX_ATTEMPTS, 5, 'RPC_RETRY_MAX_ATTEMPTS', 1),
     rpcRetryBaseDelayMs: parseInteger(environment.RPC_RETRY_BASE_DELAY_MS, 500, 'RPC_RETRY_BASE_DELAY_MS', 1),
     minWsolLiquidityLamports: parseSolToLamports(environment.MIN_WSOL_LIQUIDITY, '0.25', 'MIN_WSOL_LIQUIDITY'),

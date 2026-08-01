@@ -9,6 +9,7 @@ export type ListenerRuntimeFailureStage =
   | 'worker-start'
   | 'reconciler-start'
   | 'heartbeat-start'
+  | 'startup-timeout'
   | 'subscriber-close'
   | 'scanner-close'
   | 'reconciler-close'
@@ -108,9 +109,13 @@ export class SolanaListenerRuntime implements ListenerRuntime {
 
   public state(): ListenerRuntimeState {
     if (this.currentState !== 'RUNNING') return this.currentState;
-    return this.componentStates().some((state) => state === 'DEGRADED')
-      ? 'DEGRADED'
-      : 'RUNNING';
+    try {
+      return this.componentStates().every((state) => state === 'RUNNING')
+        ? 'RUNNING'
+        : 'DEGRADED';
+    } catch {
+      return 'DEGRADED';
+    }
   }
 
   public pipelineState(): ApiProjectionPipelineState {
@@ -128,20 +133,26 @@ export class SolanaListenerRuntime implements ListenerRuntime {
     let stage: ListenerRuntimeFailureStage = 'rpc-health';
     try {
       await this.dependencies.rpc.checkHealth();
+      this.assertStartOpen();
       stage = 'scanner-scan';
       await this.dependencies.scanner.scan();
+      this.assertStartOpen();
       stage = 'subscriber-start';
       await this.dependencies.subscriber.start();
       started.push('subscriber');
+      this.assertStartOpen();
       stage = 'worker-start';
       await this.dependencies.worker.start();
       started.push('worker');
+      this.assertStartOpen();
       stage = 'reconciler-start';
       await this.dependencies.reconciler.start();
       started.push('reconciler');
+      this.assertStartOpen();
       stage = 'heartbeat-start';
       await this.dependencies.heartbeat.start();
       started.push('heartbeat');
+      this.assertStartOpen();
       this.started = true;
       this.currentState = 'RUNNING';
     } catch {
@@ -170,27 +181,57 @@ export class SolanaListenerRuntime implements ListenerRuntime {
   }
 
   private async performClose(): Promise<void> {
+    const deadlineMs = Date.now() + this.options.shutdownTimeoutMs;
+    const failures: ListenerRuntimeFailure[] = [];
     const starting = this.startPromise;
+    let startupTimedOut = false;
     if (starting !== null) {
-      try { await starting; } catch { /* startup already rolled back */ }
+      const result = await settleUntil(starting, deadlineMs);
+      if (result === 'timeout') {
+        startupTimedOut = true;
+        failures.push(timeoutFailure('startup-timeout'));
+      }
     }
-    if (!this.started) {
+    if (!this.started && !startupTimedOut) {
       this.currentState = 'STOPPED';
       return;
     }
 
-    const failures: ListenerRuntimeFailure[] = [];
-    let workerClosing: Promise<void>;
-    try { workerClosing = this.dependencies.worker.close(); }
-    catch { workerClosing = Promise.reject(new Error('worker close')); }
-    const workerResultPromise = settleWithin(workerClosing, this.options.shutdownTimeoutMs);
-    await capture(() => this.dependencies.subscriber.close(), 'subscriber-close', failures);
-    await capture(() => this.dependencies.scanner.close(), 'scanner-close', failures);
-    await capture(() => this.dependencies.reconciler.close(), 'reconciler-close', failures);
-    const workerResult = await workerResultPromise;
-    if (workerResult === 'timeout') failures.push(timeoutFailure());
-    if (workerResult === 'failed') failures.push(failure('worker-close'));
-    await capture(() => this.dependencies.heartbeat.stop('STOPPED'), 'heartbeat-stop', failures);
+    const workerClosing = invoke(() => this.dependencies.worker.close());
+    const cleanup = [
+      Object.freeze({
+        stage: 'subscriber-close' as const,
+        operation: invoke(() => this.dependencies.subscriber.close()),
+      }),
+      Object.freeze({
+        stage: 'scanner-close' as const,
+        operation: invoke(() => this.dependencies.scanner.close()),
+      }),
+      Object.freeze({
+        stage: 'reconciler-close' as const,
+        operation: invoke(() => this.dependencies.reconciler.close()),
+      }),
+      Object.freeze({ stage: 'worker-close' as const, operation: workerClosing }),
+    ];
+    const results = await Promise.all(cleanup.map(async (item) => Object.freeze({
+      stage: item.stage,
+      result: await settleUntil(item.operation, deadlineMs),
+    })));
+    for (const result of results) {
+      if (result.result === 'failed') failures.push(failure(result.stage));
+      if (result.result === 'timeout') {
+        failures.push(timeoutFailure(
+          result.stage === 'worker-close' ? 'worker-timeout' : result.stage,
+        ));
+      }
+    }
+
+    const heartbeatResult = await settleUntil(
+      invoke(() => this.dependencies.heartbeat.stop('STOPPED')),
+      deadlineMs,
+    );
+    if (heartbeatResult === 'failed') failures.push(failure('heartbeat-stop'));
+    if (heartbeatResult === 'timeout') failures.push(timeoutFailure('heartbeat-stop'));
     this.started = false;
     this.currentState = failures.length === 0 ? 'STOPPED' : 'DEGRADED';
     if (failures.length > 0) throw new ListenerRuntimeError(failures);
@@ -205,23 +246,24 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       this.dependencies.heartbeat.state(),
     ];
   }
+
+  private assertStartOpen(): void {
+    if (this.permanentlyClosed) throw new Error('Listener startup was closed.');
+  }
 }
 
-async function capture(
-  operation: () => Promise<void>,
-  stage: ListenerRuntimeFailureStage,
-  failures: ListenerRuntimeFailure[],
-): Promise<void> {
-  try { await operation(); } catch { failures.push(failure(stage)); }
+function invoke(operation: () => Promise<void>): Promise<void> {
+  try { return operation(); } catch { return Promise.reject(new Error('Listener cleanup failed.')); }
 }
 
-async function settleWithin(
-  operation: Promise<void>,
-  timeoutMs: number,
+async function settleUntil(
+  operation: Promise<unknown>,
+  deadlineMs: number,
 ): Promise<'complete' | 'failed' | 'timeout'> {
+  const remainingMs = Math.max(0, deadlineMs - Date.now());
   const timer: { handle?: ReturnType<typeof setTimeout> } = {};
   const timeout = new Promise<'timeout'>((resolve) => {
-    timer.handle = setTimeout(() => { resolve('timeout'); }, timeoutMs);
+    timer.handle = setTimeout(() => { resolve('timeout'); }, remainingMs);
   });
   const settled: Promise<'complete' | 'failed'> = operation.then(
     () => 'complete',
@@ -236,6 +278,6 @@ function failure(stage: ListenerRuntimeFailureStage): ListenerRuntimeFailure {
   return Object.freeze({ stage, errorName: 'ListenerDependencyError' });
 }
 
-function timeoutFailure(): ListenerRuntimeFailure {
-  return Object.freeze({ stage: 'worker-timeout', errorName: 'ListenerTimeoutError' });
+function timeoutFailure(stage: ListenerRuntimeFailureStage): ListenerRuntimeFailure {
+  return Object.freeze({ stage, errorName: 'ListenerTimeoutError' });
 }

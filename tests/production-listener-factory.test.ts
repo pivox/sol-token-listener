@@ -6,6 +6,7 @@ import type { TokenLaunch } from '../src/domain/types.js';
 import type { getDatabasePool } from '../src/storage/database.js';
 import {
   BondingCurveReadUnavailableError,
+  MAX_LISTENER_TIMER_DELAY_MS,
   PersistentListenerHeartbeat,
   RecurringFinalityReconciler,
   createProductionListenerRuntime,
@@ -121,6 +122,25 @@ void test('finality close fences an in-flight pass and rejects stale timer activ
   assert.equal(reconciler.state(), 'STOPPED');
 });
 
+void test('accepts the exact Node timer bound and rejects overflow or fractions', () => {
+  const scheduler = new ManualScheduler();
+  assert.doesNotThrow(() => new RecurringFinalityReconciler(
+    { async runOnce() { return undefined; } },
+    { intervalMs: MAX_LISTENER_TIMER_DELAY_MS, shutdownTimeoutMs: 100, scheduler },
+  ));
+  assert.throws(() => new RecurringFinalityReconciler(
+    { async runOnce() { return undefined; } },
+    { intervalMs: MAX_LISTENER_TIMER_DELAY_MS + 1, shutdownTimeoutMs: 100, scheduler },
+  ), TypeError);
+  assert.throws(() => new RecurringFinalityReconciler(
+    { async runOnce() { return undefined; } },
+    { intervalMs: 1.5, shutdownTimeoutMs: 100, scheduler },
+  ), TypeError);
+
+  assert.equal(config({ RECONCILE_SECONDS: '2147483' }).reconcileSeconds, 2_147_483);
+  assert.throws(() => config({ RECONCILE_SECONDS: '2147484' }), /RECONCILE_SECONDS/u);
+});
+
 const inertPool = Object.freeze({
   async query(): Promise<never> {
     throw new Error('The composition test must not query PostgreSQL.');
@@ -129,6 +149,14 @@ const inertPool = Object.freeze({
     throw new Error('The composition test must not connect to PostgreSQL.');
   },
 });
+
+function config(overrides: Record<string, string> = {}): ReturnType<typeof parseConfig> {
+  return parseConfig({
+    SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
+    SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+    ...overrides,
+  });
+}
 
 class ManualScheduler implements ListenerRuntimeScheduler {
   private callback: (() => void) | null = null;

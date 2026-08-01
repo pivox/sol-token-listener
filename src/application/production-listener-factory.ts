@@ -41,6 +41,7 @@ import { WalletEvidenceObservationService } from './wallet-evidence-observation.
 import { WalletGraphRebuildService } from './wallet-graph-rebuild.service.js';
 
 type ProductionPool = ReturnType<typeof getDatabasePool>;
+export const MAX_LISTENER_TIMER_DELAY_MS = 2_147_483_647;
 
 export class BondingCurveReadUnavailableError extends Error {
   public constructor() {
@@ -447,6 +448,7 @@ async function settleController(
 function validateRecurringOptions(options: RecurringListenerOptions): void {
   if (!Number.isSafeInteger(options.intervalMs)
     || options.intervalMs <= 0
+    || options.intervalMs > MAX_LISTENER_TIMER_DELAY_MS
     || !Number.isSafeInteger(options.shutdownTimeoutMs)
     || options.shutdownTimeoutMs <= 0
     || options.shutdownTimeoutMs > 120_000
