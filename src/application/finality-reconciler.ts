@@ -124,8 +124,7 @@ export class FinalityReconciler {
         || Reflect.ownKeys(values).length !== values.length + 1) {
         throw new TypeError('Invalid finality candidate page.');
       }
-      for (const value of values) assertValidFinalityCandidate(value);
-      return Object.freeze(values.map((value) => value));
+      return Object.freeze(values.map((value) => snapshotCandidate(value)));
     } catch {
       throw new FinalityReconcilerError('list');
     }
@@ -153,16 +152,14 @@ export class FinalityReconciler {
     observedAtMs: number,
   ): Promise<FinalityCandidate> {
     try {
-      const updated = await this.repository.recordFinalityPoll(Object.freeze({
+      const rawUpdated = await this.repository.recordFinalityPoll(Object.freeze({
         signature: candidate.signature,
         confirmationStatus,
         expectedMissingFinalityPolls: candidate.missingFinalityPolls,
         observedAtMs,
       }));
-      assertValidFinalityCandidate(updated);
-      if (updated.signature !== candidate.signature || updated.slot !== candidate.slot) {
-        throw new TypeError('Finality poll identity changed.');
-      }
+      const updated = snapshotCandidate(rawUpdated);
+      assertPollTransition(candidate, confirmationStatus, updated);
       return updated;
     } catch {
       throw new FinalityReconcilerError('poll');
@@ -206,6 +203,49 @@ function snapshotStatuses(value: unknown, expectedLength: number): readonly (Fin
     return Object.freeze(value.map((entry) => snapshotStatus(entry)));
   } catch {
     throw new FinalityReconcilerError('history');
+  }
+}
+
+function snapshotCandidate(value: unknown): FinalityCandidate {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('Invalid finality candidate.');
+  }
+  const candidate = Object.freeze({
+    signature: dataProperty(value, 'signature'),
+    slot: dataProperty(value, 'slot'),
+    confirmationStatus: dataProperty(value, 'confirmationStatus'),
+    missingFinalityPolls: dataProperty(value, 'missingFinalityPolls'),
+    processedAtMs: dataProperty(value, 'processedAtMs'),
+  });
+  assertValidFinalityCandidate(candidate);
+  return candidate;
+}
+
+function assertPollTransition(
+  before: FinalityCandidate,
+  observed: 'processed' | 'confirmed' | null,
+  after: FinalityCandidate,
+): void {
+  if (after.signature !== before.signature
+    || after.slot !== before.slot
+    || after.processedAtMs !== before.processedAtMs) {
+    throw new TypeError('Finality poll identity changed.');
+  }
+  if (observed === null) {
+    const expectedMissing = before.missingFinalityPolls + 1;
+    if (!Number.isSafeInteger(expectedMissing)
+      || after.confirmationStatus !== before.confirmationStatus
+      || after.missingFinalityPolls !== expectedMissing) {
+      throw new TypeError('Finality missing poll transition is invalid.');
+    }
+    return;
+  }
+  const expectedStatus = before.confirmationStatus === 'confirmed'
+    || observed === 'confirmed'
+    ? 'confirmed'
+    : 'processed';
+  if (after.confirmationStatus !== expectedStatus || after.missingFinalityPolls !== 0) {
+    throw new TypeError('Finality observed poll transition is invalid.');
   }
 }
 

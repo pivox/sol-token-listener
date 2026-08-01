@@ -138,6 +138,131 @@ void test('does no RPC work for an empty page and rejects unsafe integer options
   }
 });
 
+void test('snapshots repository candidates without invoking stateful reads or getters', async () => {
+  let reads = 0;
+  const stable = candidate('stable', 50n);
+  const proxied = new Proxy(stable, {
+    get(target, key, receiver) {
+      reads += 1;
+      return Reflect.get(target, key, receiver) as unknown;
+    },
+  });
+  const repository = memoryRepository([]);
+  repository.listForFinality = async () => Object.freeze([proxied]);
+  const source: FinalityReconcilerSource = {
+    async getHistoryStatuses(signatures) {
+      assert.deepEqual(signatures, Object.freeze(['stable']));
+      return Object.freeze([history(50n, 'finalized')]);
+    },
+    async getFinalizedSlot() { return 51n; },
+  };
+  await new FinalityReconciler(source, repository, { limit: 1 }).runOnce();
+  assert.equal(reads, 0);
+  assert.equal(repository.revisions[0]?.signature, 'stable');
+
+  let getterReads = 0;
+  const getterCandidate = Object.freeze(Object.defineProperties({}, {
+    signature: { enumerable: true, get() { getterReads += 1; return 'https://secret.invalid/getter'; } },
+    slot: { enumerable: true, value: 51n },
+    confirmationStatus: { enumerable: true, value: 'processed' },
+    missingFinalityPolls: { enumerable: true, value: 0 },
+    processedAtMs: { enumerable: true, value: 100 },
+  })) as FinalityCandidate;
+  const rejected = new FinalityReconciler(source, {
+    ...memoryRepository([]), async listForFinality() { return Object.freeze([getterCandidate]); },
+  }, { limit: 1 });
+  await assert.rejects(rejected.runOnce(), (error: unknown) => {
+    assert.ok(error instanceof FinalityReconcilerError);
+    assert.equal(error.stage, 'list');
+    assert.doesNotMatch(String(error), /secret|getter|invalid/u);
+    return true;
+  });
+  assert.equal(getterReads, 0);
+});
+
+void test('snapshots poll results and rejects forged missing jumps before orphaning', async () => {
+  let reads = 0;
+  const original = candidate('poll-proxy', 60n);
+  const correct = freezeCandidate({ ...original, missingFinalityPolls: 1 });
+  const proxied = new Proxy(correct, {
+    get(target, key, receiver) {
+      if (key !== 'then') reads += 1;
+      return Reflect.get(target, key, receiver) as unknown;
+    },
+  });
+  const repository = memoryRepository([original]);
+  repository.recordFinalityPoll = async () => proxied;
+  const reconciler = new FinalityReconciler(
+    sequenceSource(() => null, () => 61n), repository,
+    { limit: 1, missingPollThreshold: 2 },
+  );
+  assert.deepEqual(await reconciler.runOnce(), {
+    candidateCount: 1, pollCount: 1, revisionCount: 0,
+  });
+  assert.equal(reads, 0);
+  assert.equal(repository.revisions.length, 0);
+
+  let getterReads = 0;
+  const getterPoll = Object.freeze(Object.defineProperties({}, {
+    signature: { enumerable: true, get() { getterReads += 1; return 'https://secret.invalid/poll'; } },
+    slot: { enumerable: true, value: 60n },
+    confirmationStatus: { enumerable: true, value: 'processed' },
+    missingFinalityPolls: { enumerable: true, value: 1 },
+    processedAtMs: { enumerable: true, value: 100 },
+  })) as FinalityCandidate;
+  const getterRepository = memoryRepository([original]);
+  getterRepository.recordFinalityPoll = async () => getterPoll;
+  const getterReconciler = new FinalityReconciler(
+    sequenceSource(() => null, () => 61n), getterRepository, { limit: 1 },
+  );
+  await assert.rejects(getterReconciler.runOnce(), (error: unknown) => {
+    assert.ok(error instanceof FinalityReconcilerError);
+    assert.equal(error.stage, 'poll');
+    assert.doesNotMatch(String(error), /secret|poll.invalid/u);
+    return true;
+  });
+  assert.equal(getterReads, 0);
+  assert.equal(getterRepository.revisions.length, 0);
+
+  const forgedRepository = memoryRepository([candidate('jump', 62n)]);
+  forgedRepository.recordFinalityPoll = async () => candidate('jump', 62n, 'processed', 3);
+  const forged = new FinalityReconciler(
+    sequenceSource(() => null, () => 63n), forgedRepository,
+    { limit: 1, missingPollThreshold: 2 },
+  );
+  await assert.rejects(forged.runOnce(), (error: unknown) => {
+    assert.ok(error instanceof FinalityReconcilerError);
+    assert.equal(error.stage, 'poll');
+    assert.equal(error.message, 'Transaction finality reconciliation failed.');
+    return true;
+  });
+  assert.equal(forgedRepository.revisions.length, 0);
+});
+
+void test('rejects forged non-null reset and downgrade poll results', async () => {
+  for (const scenario of [
+    {
+      current: candidate('bad-reset', 70n, 'processed', 1),
+      observed: history(70n, 'confirmed'),
+      returned: candidate('bad-reset', 70n, 'confirmed', 1),
+    },
+    {
+      current: candidate('bad-downgrade', 71n, 'confirmed', 1),
+      observed: history(71n, 'processed'),
+      returned: candidate('bad-downgrade', 71n, 'processed', 0),
+    },
+  ]) {
+    const repository = memoryRepository([scenario.current]);
+    repository.recordFinalityPoll = async () => scenario.returned;
+    const reconciler = new FinalityReconciler(
+      sequenceSource(() => scenario.observed, () => 80n), repository, { limit: 1 },
+    );
+    await assert.rejects(reconciler.runOnce(), (error: unknown) =>
+      error instanceof FinalityReconcilerError && error.stage === 'poll');
+    assert.equal(repository.revisions.length, 0);
+  }
+});
+
 interface MemoryRepository extends FinalityReconcilerRepository {
   readonly candidates: FinalityCandidate[];
   readonly polls: FinalityPollObservation[];
