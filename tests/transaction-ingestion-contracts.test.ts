@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  PublicKey,
+  type VersionedTransactionResponse,
+} from '@solana/web3.js';
+import {
   LISTENER_RUNTIME_STATES,
   TRANSACTION_INBOX_STATUSES,
   assertValidClaimedTransaction,
@@ -9,6 +13,8 @@ import {
   assertValidProcessingCheckpoint,
   assertValidRuntimeHeartbeat,
   assertValidTransactionNotification,
+  createDurableTransactionSnapshot,
+  restoreNormalizedTransactionSnapshot,
   type ClaimedTransaction,
   type FinalityCandidate,
   type IngestionFailure,
@@ -17,6 +23,7 @@ import {
   type TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
+import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
 const observedAtMs = 1_720_000_000_000;
 
@@ -93,7 +100,7 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
 });
 
 void test('accepts a deeply frozen snapshot whose earlier finality can advance on the claim', () => {
-  const snapshot = normalizedSnapshot({ confirmationStatus: 'CONFIRMED' });
+  const snapshot = durableSnapshot({ confirmationStatus: 'CONFIRMED' });
   const claim: ClaimedTransaction = Object.freeze({
     signature: snapshot.signature,
     slot: snapshot.slot,
@@ -114,24 +121,24 @@ void test('rejects empty and malformed normalized transaction snapshots', () => 
   );
   assert.throws(
     () => { assertValidClaimedTransaction(claimWithSnapshot(Object.freeze({
-      ...normalizedSnapshot(),
+      ...durableSnapshot(),
       feeLamports: 1,
     }))); },
     /feeLamports|bigint/u,
   );
   assert.throws(
-    () => { assertValidClaimedTransaction(claimWithSnapshot(normalizedSnapshot({ transactionIndex: -1 }))); },
+    () => { assertValidClaimedTransaction(claimWithSnapshot(durableSnapshot({ transactionIndex: -1 }))); },
     /transactionIndex|cursor/u,
   );
 });
 
 void test('rejects snapshots whose durable identity differs from the claim', () => {
   assert.throws(
-    () => { assertValidClaimedTransaction(claimWithSnapshot(normalizedSnapshot({ signature: 'other' }))); },
+    () => { assertValidClaimedTransaction(claimWithSnapshot(durableSnapshot({ signature: 'other' }))); },
     /signature|identity/u,
   );
   assert.throws(
-    () => { assertValidClaimedTransaction(claimWithSnapshot(normalizedSnapshot({ slot: 43n }))); },
+    () => { assertValidClaimedTransaction(claimWithSnapshot(durableSnapshot({ slot: 43n }))); },
     /slot|identity/u,
   );
 });
@@ -139,14 +146,14 @@ void test('rejects snapshots whose durable identity differs from the claim', () 
 void test('rejects snapshot finality regressions and terminal conflicts', () => {
   assert.throws(
     () => { assertValidClaimedTransaction(claimWithSnapshot(
-      normalizedSnapshot({ confirmationStatus: 'FINALIZED' }),
+      durableSnapshot({ confirmationStatus: 'FINALIZED' }),
       { confirmationStatus: 'confirmed' },
     )); },
     /confirmation|finality/u,
   );
   assert.throws(
     () => { assertValidClaimedTransaction(claimWithSnapshot(
-      normalizedSnapshot({ confirmationStatus: 'FINALIZED' }),
+      durableSnapshot({ confirmationStatus: 'FINALIZED' }),
       { confirmationStatus: 'orphaned' },
     )); },
     /confirmation|finality/u,
@@ -154,7 +161,7 @@ void test('rejects snapshot finality regressions and terminal conflicts', () => 
 });
 
 void test('rejects mutable nested normalized transaction collections', () => {
-  const canonical = normalizedSnapshot();
+  const canonical = durableSnapshot();
   const mutableAccountKeys = Object.freeze({
     ...canonical,
     accountKeys: [...canonical.accountKeys],
@@ -177,6 +184,42 @@ void test('rejects mutable nested normalized transaction collections', () => {
     () => { assertValidClaimedTransaction(claimWithSnapshot(mutableInstructionAccounts)); },
     /accounts|frozen/u,
   );
+});
+
+void test('encodes non-empty instruction bytes immutably and restores independent decoder bytes', () => {
+  const normalized = normalizedTransaction({ instructionData: new Uint8Array([1, 2, 3]) });
+  const snapshot = createDurableTransactionSnapshot(normalized);
+
+  assert.equal(snapshot.instructions[0]?.dataBase64, 'AQID');
+  normalized.instructions[0]?.data.fill(9);
+  assert.equal(snapshot.instructions[0]?.dataBase64, 'AQID');
+  assert.equal(
+    Reflect.set(snapshot.instructions[0] ?? {}, 'dataBase64', 'CQkJ'),
+    false,
+  );
+  assert.equal(snapshot.instructions[0]?.dataBase64, 'AQID');
+
+  const restored = restoreNormalizedTransactionSnapshot(snapshot);
+  const restoredInstruction = restored.instructions[0];
+  assert.ok(restoredInstruction);
+  assert.deepEqual([...restoredInstruction.data], [1, 2, 3]);
+  restoredInstruction.data.fill(7);
+  assert.equal(snapshot.instructions[0]?.dataBase64, 'AQID');
+});
+
+void test('accepts actual normalized RPC output when token balance programId is absent', () => {
+  const normalized = normalizeTransaction(
+    rpcResponseWithoutTokenProgram(),
+    'CONFIRMED',
+    0,
+  );
+  assert.equal(normalized.preTokenBalances[0]?.tokenProgram, '');
+  assert.equal(normalized.postTokenBalances[0]?.tokenProgram, '');
+
+  const snapshot = createDurableTransactionSnapshot(normalized);
+  assert.doesNotThrow(() => { assertValidClaimedTransaction(claimWithSnapshot(snapshot)); });
+  assert.equal(snapshot.preTokenBalances[0]?.tokenProgram, '');
+  assert.equal(snapshot.postTokenBalances[0]?.tokenProgram, '');
 });
 
 void test('rejects mutable contracts, number slots and non-integer millisecond times', () => {
@@ -254,19 +297,27 @@ function claimWithSnapshot(
   }) as ClaimedTransaction;
 }
 
-function normalizedSnapshot(
+function durableSnapshot(
   overrides: Readonly<Partial<NormalizedTransaction>> = {},
-): Readonly<NormalizedTransaction> {
-  const instruction = Object.freeze({
+): ReturnType<typeof createDurableTransactionSnapshot> {
+  return createDurableTransactionSnapshot(normalizedTransaction(overrides));
+}
+
+function normalizedTransaction(
+  overrides: Readonly<Partial<NormalizedTransaction>> & {
+    readonly instructionData?: Uint8Array;
+  } = {},
+): NormalizedTransaction {
+  const instruction = {
     programId: 'program',
-    accounts: Object.freeze(['account']),
-    data: Object.freeze(new Uint8Array()),
+    accounts: ['account'],
+    data: overrides.instructionData ?? new Uint8Array([1]),
     instructionIndex: 0,
     innerInstructionIndex: null,
     parentInstructionIndex: null,
     stackHeight: 1,
-  });
-  const balance = Object.freeze({
+  };
+  const balance = {
     accountIndex: 0,
     account: 'account',
     mint: 'mint',
@@ -274,25 +325,80 @@ function normalizedSnapshot(
     tokenProgram: 'token-program',
     amountRaw: 1n,
     decimals: 9,
-  });
-  return Object.freeze({
+  };
+  const { instructionData: _instructionData, ...transactionOverrides } = overrides;
+  return {
     signature: 'signature',
     slot: 42n,
     transactionIndex: 0,
     confirmationStatus: 'CONFIRMED',
     version: 0,
     blockTimeMs: observedAtMs,
-    accountKeys: Object.freeze(['account']),
-    signerKeys: Object.freeze(['account']),
-    instructions: Object.freeze([instruction]),
-    preTokenBalances: Object.freeze([balance]),
-    postTokenBalances: Object.freeze([balance]),
-    preBalancesLamports: Object.freeze([1n]),
-    postBalancesLamports: Object.freeze([1n]),
+    accountKeys: ['account'],
+    signerKeys: ['account'],
+    instructions: [instruction],
+    preTokenBalances: [balance],
+    postTokenBalances: [balance],
+    preBalancesLamports: [1n],
+    postBalancesLamports: [1n],
     feeLamports: 5_000n,
     computeUnits: 1_000n,
-    logs: Object.freeze(['log']),
+    logs: ['log'],
     error: null,
-    ...overrides,
-  });
+    ...transactionOverrides,
+  };
+}
+
+function rpcResponseWithoutTokenProgram(): VersionedTransactionResponse {
+  const payer = new PublicKey('11111111111111111111111111111111');
+  const program = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+  const tokenAccount = new PublicKey('So11111111111111111111111111111111111111112');
+  const accountKeys = [payer, program, tokenAccount];
+  const tokenBalance = {
+    accountIndex: 2,
+    mint: tokenAccount.toBase58(),
+    owner: payer.toBase58(),
+    uiTokenAmount: {
+      amount: '1',
+      decimals: 9,
+      uiAmount: 0.000000001,
+      uiAmountString: '0.000000001',
+    },
+  };
+  return {
+    slot: 42,
+    blockTime: 1_720_000_000,
+    version: 'legacy',
+    transaction: {
+      signatures: ['signature'],
+      message: {
+        header: {
+          numRequiredSignatures: 1,
+          numReadonlySignedAccounts: 0,
+          numReadonlyUnsignedAccounts: 1,
+        },
+        compiledInstructions: [{
+          programIdIndex: 1,
+          accountKeyIndexes: [2],
+          data: new Uint8Array([1, 2, 3]),
+        }],
+        getAccountKeys: () => ({
+          length: accountKeys.length,
+          get: (index: number) => accountKeys[index],
+        }),
+      },
+    },
+    meta: {
+      err: null,
+      fee: 5_000,
+      preBalances: [10_000, 0, 0],
+      postBalances: [5_000, 0, 0],
+      innerInstructions: [],
+      preTokenBalances: [tokenBalance],
+      postTokenBalances: [tokenBalance],
+      loadedAddresses: { writable: [], readonly: [] },
+      logMessages: ['log'],
+      rewards: [],
+    },
+  } as unknown as VersionedTransactionResponse;
 }

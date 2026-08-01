@@ -35,6 +35,58 @@ export type IngestionComponentState = ListenerRuntimeState;
 export type TransactionDiscoverySource = 'WEBSOCKET' | 'CATCH_UP';
 export type TransactionIngestionErrorCode = (typeof TRANSACTION_INGESTION_ERROR_CODES)[number];
 export type ProcessingCheckpointKey = 'launchpad' | 'market';
+export type DurableSnapshotValue =
+  | null
+  | string
+  | boolean
+  | number
+  | bigint
+  | readonly DurableSnapshotValue[]
+  | DurableSnapshotObject;
+
+export interface DurableSnapshotObject {
+  readonly [key: string]: DurableSnapshotValue;
+}
+
+export interface DurableNormalizedInstruction {
+  readonly programId: string;
+  readonly accounts: readonly string[];
+  readonly dataBase64: string;
+  readonly instructionIndex: number;
+  readonly innerInstructionIndex: number | null;
+  readonly parentInstructionIndex: number | null;
+  readonly stackHeight: number | null;
+}
+
+export interface DurableNormalizedTokenBalance {
+  readonly accountIndex: number;
+  readonly account: string;
+  readonly mint: string;
+  readonly owner: string | null;
+  readonly tokenProgram: string;
+  readonly amountRaw: bigint;
+  readonly decimals: number;
+}
+
+export interface DurableNormalizedTransaction {
+  readonly signature: string;
+  readonly slot: bigint;
+  readonly transactionIndex: number;
+  readonly confirmationStatus: NormalizedTransaction['confirmationStatus'];
+  readonly version: number | 'legacy';
+  readonly blockTimeMs: number | null;
+  readonly accountKeys: readonly string[];
+  readonly signerKeys: readonly string[];
+  readonly instructions: readonly DurableNormalizedInstruction[];
+  readonly preTokenBalances: readonly DurableNormalizedTokenBalance[];
+  readonly postTokenBalances: readonly DurableNormalizedTokenBalance[];
+  readonly preBalancesLamports: readonly bigint[];
+  readonly postBalancesLamports: readonly bigint[];
+  readonly feeLamports: bigint;
+  readonly computeUnits: bigint | null;
+  readonly logs: readonly string[];
+  readonly error: DurableSnapshotValue;
+}
 
 export interface TransactionNotification {
   readonly signature: string;
@@ -51,7 +103,7 @@ export interface ClaimedTransaction {
   readonly attempts: number;
   readonly leaseToken: string;
   readonly leaseExpiresAtMs: number;
-  readonly normalizedTransaction: Readonly<NormalizedTransaction> | null;
+  readonly normalizedTransaction: DurableNormalizedTransaction | null;
 }
 
 export interface IngestionFailure {
@@ -104,6 +156,79 @@ export interface InboxCounts {
   readonly failed: number;
 }
 
+export function createDurableTransactionSnapshot(
+  transaction: NormalizedTransaction,
+): DurableNormalizedTransaction {
+  const instructions = Object.freeze(transaction.instructions.map((instruction, index) => {
+    if (!(instruction.data instanceof Uint8Array)) {
+      throw new TypeError(`Normalized transaction instructions[${index}].data must be Uint8Array.`);
+    }
+    return Object.freeze({
+      programId: instruction.programId,
+      accounts: Object.freeze([...instruction.accounts]),
+      dataBase64: Buffer.from(instruction.data).toString('base64'),
+      instructionIndex: instruction.instructionIndex,
+      innerInstructionIndex: instruction.innerInstructionIndex,
+      parentInstructionIndex: instruction.parentInstructionIndex,
+      stackHeight: instruction.stackHeight,
+    });
+  }));
+  const snapshot = Object.freeze({
+    signature: transaction.signature,
+    slot: transaction.slot,
+    transactionIndex: transaction.transactionIndex,
+    confirmationStatus: transaction.confirmationStatus,
+    version: transaction.version,
+    blockTimeMs: transaction.blockTimeMs,
+    accountKeys: Object.freeze([...transaction.accountKeys]),
+    signerKeys: Object.freeze([...transaction.signerKeys]),
+    instructions,
+    preTokenBalances: freezeTokenBalances(transaction.preTokenBalances),
+    postTokenBalances: freezeTokenBalances(transaction.postTokenBalances),
+    preBalancesLamports: Object.freeze([...transaction.preBalancesLamports]),
+    postBalancesLamports: Object.freeze([...transaction.postBalancesLamports]),
+    feeLamports: transaction.feeLamports,
+    computeUnits: transaction.computeUnits,
+    logs: Object.freeze([...transaction.logs]),
+    error: freezeDurableSnapshotValue(transaction.error),
+  });
+  assertValidDurableNormalizedTransaction(snapshot);
+  return snapshot;
+}
+
+export function restoreNormalizedTransactionSnapshot(
+  snapshot: DurableNormalizedTransaction,
+): NormalizedTransaction {
+  assertValidDurableNormalizedTransaction(snapshot);
+  return {
+    signature: snapshot.signature,
+    slot: snapshot.slot,
+    transactionIndex: snapshot.transactionIndex,
+    confirmationStatus: snapshot.confirmationStatus,
+    version: snapshot.version,
+    blockTimeMs: snapshot.blockTimeMs,
+    accountKeys: [...snapshot.accountKeys],
+    signerKeys: [...snapshot.signerKeys],
+    instructions: snapshot.instructions.map((instruction) => ({
+      programId: instruction.programId,
+      accounts: [...instruction.accounts],
+      data: Uint8Array.from(Buffer.from(instruction.dataBase64, 'base64')),
+      instructionIndex: instruction.instructionIndex,
+      innerInstructionIndex: instruction.innerInstructionIndex,
+      parentInstructionIndex: instruction.parentInstructionIndex,
+      stackHeight: instruction.stackHeight,
+    })),
+    preTokenBalances: snapshot.preTokenBalances.map((balance) => ({ ...balance })),
+    postTokenBalances: snapshot.postTokenBalances.map((balance) => ({ ...balance })),
+    preBalancesLamports: [...snapshot.preBalancesLamports],
+    postBalancesLamports: [...snapshot.postBalancesLamports],
+    feeLamports: snapshot.feeLamports,
+    computeUnits: snapshot.computeUnits,
+    logs: [...snapshot.logs],
+    error: restoreDurableSnapshotValue(snapshot.error),
+  };
+}
+
 export function assertValidTransactionNotification(
   value: unknown,
 ): asserts value is TransactionNotification {
@@ -132,7 +257,7 @@ export function assertValidClaimedTransaction(
   assertText(record.leaseToken, 'Claimed transaction leaseToken');
   assertMilliseconds(record.leaseExpiresAtMs, 'Claimed transaction leaseExpiresAtMs');
   if (record.normalizedTransaction !== null) {
-    assertValidNormalizedTransaction(record.normalizedTransaction);
+    assertValidDurableNormalizedTransaction(record.normalizedTransaction);
     if (record.normalizedTransaction.signature !== record.signature) {
       throw new TypeError('Claimed normalized transaction signature does not match claim identity.');
     }
@@ -286,7 +411,9 @@ function isChainConfirmationStatus(value: unknown): value is ChainConfirmationSt
   return isObservedConfirmationStatus(value) || value === 'orphaned';
 }
 
-function assertValidNormalizedTransaction(value: unknown): asserts value is Readonly<NormalizedTransaction> {
+function assertValidDurableNormalizedTransaction(
+  value: unknown,
+): asserts value is DurableNormalizedTransaction {
   const snapshot = frozenRecord(value, 'Claimed normalized transaction snapshot');
   assertText(snapshot.signature, 'Normalized transaction signature');
   assertSlot(snapshot.slot, 'Normalized transaction slot');
@@ -328,9 +455,10 @@ function assertValidNormalizedTransaction(value: unknown): asserts value is Read
       instruction.accounts,
       `Normalized transaction instructions[${index}].accounts`,
     );
-    if (!(instruction.data instanceof Uint8Array)) {
-      throw new TypeError(`Normalized transaction instructions[${index}].data must be Uint8Array.`);
-    }
+    assertCanonicalBase64(
+      instruction.dataBase64,
+      `Normalized transaction instructions[${index}].dataBase64`,
+    );
     assertNullableIndex(
       instruction.innerInstructionIndex,
       `Normalized transaction instructions[${index}].innerInstructionIndex`,
@@ -409,7 +537,7 @@ function assertTokenBalances(
     }
     assertText(balance.mint, `Normalized transaction ${field}[${index}].mint`);
     assertNullableText(balance.owner, `Normalized transaction ${field}[${index}].owner`);
-    assertText(balance.tokenProgram, `Normalized transaction ${field}[${index}].tokenProgram`);
+    assertString(balance.tokenProgram, `Normalized transaction ${field}[${index}].tokenProgram`);
     assertAmount(balance.amountRaw, `Normalized transaction ${field}[${index}].amountRaw`);
     assertCount(balance.decimals, `Normalized transaction ${field}[${index}].decimals`);
     if (balance.decimals > 255) {
@@ -438,6 +566,50 @@ function frozenStringArray(value: unknown, name: string): readonly string[] {
   const values = frozenArray(value, name);
   values.forEach((item, index) => { assertText(item, `${name}[${index}]`); });
   return values as readonly string[];
+}
+
+function freezeTokenBalances(
+  balances: NormalizedTransaction['preTokenBalances'],
+): readonly DurableNormalizedTokenBalance[] {
+  return Object.freeze(balances.map((balance) => Object.freeze({ ...balance })));
+}
+
+function freezeDurableSnapshotValue(value: unknown): DurableSnapshotValue {
+  if (
+    value === null
+    || typeof value === 'string'
+    || typeof value === 'boolean'
+    || typeof value === 'bigint'
+  ) return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('Normalized transaction error number must be finite.');
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((item) => freezeDurableSnapshotValue(item)));
+  }
+  if (typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new TypeError('Normalized transaction error must be durable data.');
+  }
+  const entries = Object.entries(value).map(([key, item]) => [
+    key,
+    freezeDurableSnapshotValue(item),
+  ] as const);
+  return Object.freeze(Object.fromEntries(entries));
+}
+
+function restoreDurableSnapshotValue(value: DurableSnapshotValue): unknown {
+  if (Array.isArray(value)) {
+    const items = value as readonly DurableSnapshotValue[];
+    return items.map((item) => restoreDurableSnapshotValue(item));
+  }
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      key,
+      restoreDurableSnapshotValue(item),
+    ]));
+  }
+  return value;
 }
 
 function assertAmount(value: unknown, name: string): asserts value is bigint {
@@ -488,6 +660,17 @@ function assertDeepFrozenData(value: unknown, name: string): void {
   for (const key of Object.keys(record)) {
     assertDeepFrozenData(record[key], `${name}.${key}`);
   }
+}
+
+function assertCanonicalBase64(value: unknown, name: string): asserts value is string {
+  assertString(value, name);
+  if (Buffer.from(value, 'base64').toString('base64') !== value) {
+    throw new TypeError(`${name} must be canonical base64.`);
+  }
+}
+
+function assertString(value: unknown, name: string): asserts value is string {
+  if (typeof value !== 'string') throw new TypeError(`${name} must be a string.`);
 }
 
 function isLegacyConfirmationStatus(
