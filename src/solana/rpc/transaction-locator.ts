@@ -87,6 +87,7 @@ export class SolanaTransactionLocator {
     const signatures = snapshotBlockSignatures(rawSignatures, target.signature);
     const transactionIndex = uniqueSignatureIndex(signatures, target.signature);
     if (transactionIndex === null) throw new TransactionIndexNotFoundError();
+    if (!hasCanonicalRawSlot(response)) throw new TransactionNormalizationError();
 
     let normalized: NormalizedTransaction;
     try {
@@ -94,7 +95,6 @@ export class SolanaTransactionLocator {
     } catch {
       throw new TransactionNormalizationError();
     }
-    if (!hasStableRawSlot(response)) throw new TransactionNormalizationError();
     if (normalized.signature !== target.signature || normalized.slot !== target.slot) {
       throw new TransactionIndexNotFoundError();
     }
@@ -124,10 +124,17 @@ export class SolanaTransactionLocator {
 
 export { SolanaTransactionLocator as TransactionLocator };
 
-function hasStableRawSlot(response: VersionedTransactionResponse): boolean {
+function hasCanonicalRawSlot(response: VersionedTransactionResponse): boolean {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(response, 'slot');
-    return descriptor !== undefined && 'value' in descriptor;
+    if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+      return false;
+    }
+    const slot: unknown = descriptor.value;
+    return typeof slot === 'number'
+      && Number.isSafeInteger(slot)
+      && slot >= 0
+      && !Object.is(slot, -0);
   } catch {
     return false;
   }

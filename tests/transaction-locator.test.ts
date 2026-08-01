@@ -162,7 +162,7 @@ void test('rejects a fetched transaction whose normalized primary signature diff
   );
 });
 
-void test('normalizes once before checking a stateful raw slot against the observed slot', async () => {
+void test('rejects a stateful raw slot without invoking its accessor', async () => {
   const stateful = response('pump');
   let reads = 0;
   Object.defineProperty(stateful, 'slot', {
@@ -176,7 +176,40 @@ void test('normalizes once before checking a stateful raw slot against the obser
     new TransactionLocator(rpc(stateful, ['pump'])).locate(target('pump')),
     TransactionNormalizationError,
   );
-  assert.equal(reads, 1);
+  assert.equal(reads, 0);
+});
+
+void test('rejects an unsafe rounded RPC slot even when its bigint conversion matches the target', async () => {
+  const unsafeSlot = Number.MAX_SAFE_INTEGER + 1;
+  await assert.rejects(
+    new TransactionLocator(rpc(response('pump', unsafeSlot), ['pump'])).locate(
+      target('pump', 9_007_199_254_740_992n),
+    ),
+    TransactionNormalizationError,
+  );
+});
+
+void test('rejects negative, fractional, non-enumerable and inherited raw slots', async () => {
+  const negative = response('pump', -1);
+  const fractional = response('pump', 42.5);
+  const nonEnumerable = response('pump');
+  Object.defineProperty(nonEnumerable, 'slot', { value: 42, enumerable: false });
+  const inherited = response('pump');
+  Reflect.deleteProperty(inherited, 'slot');
+  Object.setPrototypeOf(inherited, { slot: 42 });
+
+  const cases: readonly [VersionedTransactionResponse, bigint][] = [
+    [negative, -1n],
+    [fractional, 42n],
+    [nonEnumerable, 42n],
+    [inherited, 42n],
+  ];
+  for (const [transaction, slot] of cases) {
+    await assert.rejects(
+      new TransactionLocator(rpc(transaction, ['pump'])).locate(target('pump', slot)),
+      TransactionNormalizationError,
+    );
+  }
 });
 
 void test('rejects missing and duplicate block signature membership without inventing an index', async () => {
