@@ -1,5 +1,6 @@
 import {
   assertValidClaimedTransaction,
+  createDurableTransactionSnapshot,
   restoreNormalizedTransactionSnapshot,
   type ClaimedTransaction,
   type IngestionFailure,
@@ -92,6 +93,7 @@ export class TransactionInboxWorker {
   private idleResolve: (() => void) | null = null;
   private permanentlyClosed = false;
   private degraded = false;
+  private unresolvedResource = false;
 
   public constructor(
     private readonly repository: TransactionInboxWorkerRepository,
@@ -173,7 +175,7 @@ export class TransactionInboxWorker {
     const loop = this.loopPromise;
     if (loop !== null) await loop;
     await this.runTail;
-    this.currentState = this.degraded ? 'DEGRADED' : 'STOPPED';
+    this.currentState = this.unresolvedResource ? 'DEGRADED' : 'STOPPED';
   }
 
   private async performRunOnce(): Promise<TransactionInboxRunResult> {
@@ -213,15 +215,37 @@ export class TransactionInboxWorker {
       } catch (error) {
         return this.failClaim(claim, locatorFailure(error));
       }
+      let view: NormalizedTransaction;
       try {
-        await this.repository.saveSnapshot(claim.signature, claim.leaseToken, transaction);
+        const snapshot = createDurableTransactionSnapshot(transaction);
+        assertValidClaimedTransaction(Object.freeze({
+          ...claim,
+          normalizedTransaction: snapshot,
+        }));
+        view = immutableClaimView(
+          restoreNormalizedTransactionSnapshot(snapshot),
+          claim.confirmationStatus,
+        );
+      } catch {
+        return this.failClaim(claim, normalizationFailure());
+      }
+      try {
+        await this.repository.saveSnapshot(
+          claim.signature,
+          claim.leaseToken,
+          transaction,
+        );
       } catch {
         this.reportDegraded();
         throw new TransactionInboxWorkerError('save-snapshot');
       }
+      transaction = view;
     } else {
       try {
-        transaction = restoreNormalizedTransactionSnapshot(claim.normalizedTransaction);
+        transaction = immutableClaimView(
+          restoreNormalizedTransactionSnapshot(claim.normalizedTransaction),
+          claim.confirmationStatus,
+        );
       } catch {
         return this.failClaim(claim, normalizationFailure());
       }
@@ -235,6 +259,7 @@ export class TransactionInboxWorker {
       this.leaseDurationMs,
       () => this.readNow(),
       () => { this.reportDegraded(); },
+      () => { this.reportCleanupFailure(); },
     );
     if (!await lease.start()) return frozenResult({ kind: 'lease-lost', signature: claim.signature });
 
@@ -328,7 +353,7 @@ export class TransactionInboxWorker {
       try {
         this.scheduler.cancel(this.idleHandle);
       } catch {
-        this.reportDegraded();
+        this.reportCleanupFailure();
       }
     }
     this.idleHandle = null;
@@ -340,6 +365,11 @@ export class TransactionInboxWorker {
   private reportDegraded(): void {
     this.degraded = true;
     if (this.currentState !== 'STOPPING') this.currentState = 'DEGRADED';
+  }
+
+  private reportCleanupFailure(): void {
+    this.unresolvedResource = true;
+    this.reportDegraded();
   }
 
   private isClosed(): boolean {
@@ -362,6 +392,7 @@ class LeaseGuard {
     private readonly leaseDurationMs: number,
     private readonly now: () => number,
     private readonly lost: () => void,
+    private readonly cleanupFailed: () => void,
   ) {
     this.untilMs = claim.leaseExpiresAtMs;
   }
@@ -379,7 +410,7 @@ class LeaseGuard {
         this.scheduler.cancel(this.handle);
       } catch {
         this.owned = false;
-        this.lost();
+        this.cleanupFailed();
       }
     }
     this.handle = null;
@@ -459,6 +490,47 @@ function legacyStatus(
     case 'confirmed': return 'CONFIRMED';
     case 'finalized': return 'FINALIZED';
   }
+}
+
+function immutableClaimView(
+  transaction: NormalizedTransaction,
+  status: ChainConfirmationStatus,
+): NormalizedTransaction {
+  return Object.freeze({
+    ...transaction,
+    confirmationStatus: legacyClaimStatus(status),
+    accountKeys: Object.freeze([...transaction.accountKeys]),
+    signerKeys: Object.freeze([...transaction.signerKeys]),
+    instructions: Object.freeze(transaction.instructions.map((instruction) => Object.freeze({
+      ...instruction,
+      accounts: Object.freeze([...instruction.accounts]),
+      data: Uint8Array.from(instruction.data),
+    }))),
+    preTokenBalances: Object.freeze(transaction.preTokenBalances.map((balance) =>
+      Object.freeze({ ...balance }))),
+    postTokenBalances: Object.freeze(transaction.postTokenBalances.map((balance) =>
+      Object.freeze({ ...balance }))),
+    preBalancesLamports: Object.freeze([...transaction.preBalancesLamports]),
+    postBalancesLamports: Object.freeze([...transaction.postBalancesLamports]),
+    logs: Object.freeze([...transaction.logs]),
+    error: freezeRestoredValue(transaction.error),
+  });
+}
+
+function legacyClaimStatus(status: ChainConfirmationStatus): LegacyConfirmationStatus {
+  return status === 'orphaned' ? 'ORPHANED' : legacyStatus(status);
+}
+
+function freezeRestoredValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    value.forEach((entry) => { freezeRestoredValue(entry); });
+    return Object.freeze(value);
+  }
+  if (typeof value === 'object' && value !== null) {
+    Object.values(value).forEach((entry) => { freezeRestoredValue(entry); });
+    return Object.freeze(value);
+  }
+  return value;
 }
 
 function frozenResult<TResult extends TransactionInboxRunResult>(value: TResult): TResult {

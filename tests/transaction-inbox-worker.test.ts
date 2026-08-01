@@ -43,7 +43,12 @@ void test('claims one row and processes it in durable order with claim finality'
       calls.push('locate');
       return tx;
     },
-  }, { async process(value) { assert.equal(value, tx); calls.push('pipeline'); } }, options());
+  }, { async process(value) {
+    assert.notEqual(value, tx);
+    assert.equal(value.confirmationStatus, 'CONFIRMED');
+    assert.ok(Object.isFrozen(value));
+    calls.push('pipeline');
+  } }, options());
 
   const result = await worker.runOnce();
 
@@ -56,24 +61,45 @@ void test('claims one row and processes it in durable order with claim finality'
   assert.equal(worker.state, 'STOPPED');
 });
 
-void test('restores a saved snapshot and skips locator and save for finalized replay', async () => {
-  const calls: string[] = [];
-  const tx = normalized('saved', 8n, 'CONFIRMED');
-  const repository = repositoryWith({
-    async claim() { return claim('saved', 8n, 'finalized', createDurableTransactionSnapshot(tx)); },
-    async renewLease() { calls.push('renew'); },
-    async markProcessed(_signature, _token, status) { calls.push(`processed:${status}`); },
-  });
-  const worker = new TransactionInboxWorker(repository, {
-    async locate() { calls.push('locate'); return tx; },
-  }, { async process(restored) {
-    calls.push('pipeline');
-    assert.equal(restored.transactionIndex, 3);
-    assert.equal(restored.confirmationStatus, 'CONFIRMED');
-  } }, options());
+void test('promotes saved snapshots to one immutable finalized or orphaned pipeline view', async () => {
+  for (const status of ['finalized', 'orphaned'] as const) {
+    const calls: string[] = [];
+    const tx = normalized(`saved-${status}`, 8n, 'CONFIRMED');
+    const repository = repositoryWith({
+      async claim() { return claim(tx.signature, 8n, status, createDurableTransactionSnapshot(tx)); },
+      async renewLease() { calls.push('renew'); },
+      async markProcessed(_signature, _token, markedStatus) { calls.push(`processed:${markedStatus}`); },
+    });
+    const worker = new TransactionInboxWorker(repository, {
+      async locate() { calls.push('locate'); return tx; },
+    }, { async process(restored) {
+      calls.push('pipeline');
+      assert.equal(restored.transactionIndex, 3);
+      assert.equal(restored.confirmationStatus, status.toUpperCase());
+      assert.ok(Object.isFrozen(restored));
+      assert.ok(Object.isFrozen(restored.accountKeys));
+      assert.ok(Object.isFrozen(restored.instructions));
+      assert.ok(Object.isFrozen(restored.preTokenBalances));
+    } }, options());
 
-  assert.deepEqual(await worker.runOnce(), { kind: 'processed', signature: 'saved' });
-  assert.deepEqual(calls, ['renew', 'pipeline', 'processed:finalized']);
+    assert.deepEqual(await worker.runOnce(), { kind: 'processed', signature: tx.signature });
+    assert.deepEqual(calls, ['renew', 'pipeline', `processed:${status}`]);
+  }
+});
+
+void test('promotes a lagging fresh locator response to claim finality before pipeline', async () => {
+  const tx = normalized('fresh-promoted', 9n, 'PROCESSED');
+  let pipelineStatus: string | null = null;
+  let markedStatus: string | null = null;
+  const worker = new TransactionInboxWorker(repositoryWith({
+    async claim() { return claim('fresh-promoted', 9n, 'confirmed'); },
+    async markProcessed(_signature, _token, status) { markedStatus = status; },
+  }), { async locate() { return tx; } }, {
+    async process(view) { pipelineStatus = view.confirmationStatus; assert.ok(Object.isFrozen(view)); },
+  }, options());
+  assert.deepEqual(await worker.runOnce(), { kind: 'processed', signature: 'fresh-promoted' });
+  assert.equal(pipelineStatus, 'CONFIRMED');
+  assert.equal(markedStatus, 'confirmed');
 });
 
 void test('preserves trusted locator failure classification and redacts arbitrary failures', async () => {
@@ -181,6 +207,8 @@ void test('does not complete or fail with a lost lease token', async () => {
   assert.equal(failed, 0);
   assert.equal(scheduler.activeCount, 0);
   assert.equal(worker.state, 'DEGRADED');
+  await worker.close();
+  assert.equal(worker.state, 'STOPPED');
 });
 
 void test('stops before pipeline when the initial ownership guard loses its lease', async () => {
@@ -198,17 +226,19 @@ void test('stops before pipeline when the initial ownership guard loses its leas
 });
 
 void test('contains scheduler setup and cleanup failures as degraded lease loss', async () => {
-  for (const scheduler of [
-    { schedule() { throw new Error('schedule secret'); }, cancel() {} },
-    { schedule() { return {}; }, cancel() { throw new Error('cancel secret'); } },
+  for (const scenario of [
+    { scheduler: { schedule() { throw new Error('schedule secret'); }, cancel() {} }, closedState: 'STOPPED' },
+    { scheduler: { schedule() { return {}; }, cancel() { throw new Error('cancel secret'); } }, closedState: 'DEGRADED' },
   ]) {
     let completed = 0;
     const worker = new TransactionInboxWorker(repositoryWith({
       async claim() { return claim(); }, async markProcessed() { completed += 1; },
-    }), locator(), pipeline(), options({ scheduler }));
+    }), locator(), pipeline(), options({ scheduler: scenario.scheduler }));
     assert.deepEqual(await worker.runOnce(), { kind: 'lease-lost', signature: 'sig' });
     assert.equal(completed, 0);
     assert.equal(worker.state, 'DEGRADED');
+    await worker.close();
+    assert.equal(worker.state, scenario.closedState);
   }
 });
 
