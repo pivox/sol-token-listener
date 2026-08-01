@@ -26,7 +26,6 @@ import type {
 import { PaperTradingEngine } from '../src/paper/paper-trading-engine.js';
 import { QualificationEngine, defaultQualificationRuleSet } from '../src/qualification/qualification-engine.js';
 import { SolanaWalletFundingEvidenceExtractor } from '../src/solana/wallet-funding-evidence-extractor.js';
-import { createSolanaObservedTransaction } from '../src/solana/rpc/observed-transaction.js';
 import type { NormalizedInstruction, NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
@@ -49,7 +48,7 @@ void test('restarts the production PostgreSQL path at every observation boundary
     const transaction = migrationTransaction(fixture.transaction);
     for (const boundary of BOUNDARIES) {
       await truncateRuntimeData(pool);
-      await seedObservedLaunch(pool, transaction);
+      assert.deepEqual(await productionCounts(pool), expectedCountsBefore(null), `${boundary}:before`);
       const repository = new PostgresTransactionInboxRepository(pool);
       await repository.enqueue(Object.freeze({
         signature: transaction.signature,
@@ -76,6 +75,16 @@ void test('restarts the production PostgreSQL path at every observation boundary
       }, boundary);
       assert.ok(failedInbox.normalized_transaction);
       assert.ok(failedInbox.next_attempt_at instanceof Date);
+      assert.deepEqual(
+        await productionCounts(pool),
+        expectedCountsBefore(boundary),
+        `${boundary}:first-attempt`,
+      );
+      assert.equal(
+        await launchState(pool),
+        boundary === 'pumpswap' ? 'PUMPSWAP_ACTIVE' : 'OBSERVING',
+        `${boundary}:launch-state`,
+      );
 
       const restartOrder: Boundary[] = [];
       const restartWorker = worker(
@@ -172,7 +181,12 @@ function pipeline(
   };
   return new ObservedTransactionPipeline(
     launchpadRepository,
-    { observe: (...args) => after('launchpad', realLaunchpad.observe(...args)) },
+    { observe: (...args) => after('launchpad', realLaunchpad.observe(...args).then(async (result) => {
+      await pool.query(
+        "UPDATE token_launches SET current_state = 'OBSERVING' WHERE current_state = 'DETECTED'",
+      );
+      return result;
+    })) },
     { observe: (...args) => after('funding', realFunding.observe(...args)) },
     { rebuild: (mint) => after('i1', realParticipants.rebuild(mint)) },
     { rebuild: (mint) => after('i2', realGraph.rebuild(mint)) },
@@ -372,6 +386,23 @@ async function productionCounts(pool: InstanceType<typeof pg.Pool>) {
   });
 }
 
+function expectedCountsBefore(boundary: Boundary | null) {
+  const completed = boundary === null ? -1 : BOUNDARIES.indexOf(boundary);
+  return Object.freeze({
+    launches: completed >= 0 ? '1' : '0',
+    trades: completed >= 0 ? '1' : '0',
+    fundingAssessments: completed >= 1 ? '1' : '0',
+    creatorProfiles: completed >= 2 ? '1' : '0',
+    participantSnapshots: completed >= 2 ? '1' : '0',
+    walletGraphProfiles: completed >= 3 ? '1' : '0',
+    walletGraphSnapshots: completed >= 3 ? '1' : '0',
+    migrations: completed >= 4 ? '1' : '0',
+    marketPools: completed >= 4 ? '1' : '0',
+    reserveSnapshots: completed >= 4 ? '1' : '0',
+    paperPositions: '0',
+  });
+}
+
 async function inboxRow(pool: InstanceType<typeof pg.Pool>, signature: string): Promise<{
   processing_status: string; attempts: number; error_code: string | null;
   error_retryable: boolean | null; normalized_transaction: unknown;
@@ -394,19 +425,11 @@ async function truncateRuntimeData(pool: InstanceType<typeof pg.Pool>): Promise<
     token_launches, api_event_stream RESTART IDENTITY CASCADE`);
 }
 
-async function seedObservedLaunch(
-  pool: InstanceType<typeof pg.Pool>,
-  transaction: NormalizedTransaction,
-): Promise<void> {
-  const repository = new PostgresLaunchpadEventRepository(pool, 4);
-  await new LaunchpadObservationService(pumpAdapter(), repository).observe(
-    createSolanaObservedTransaction(transaction, 1_800_000_000_000),
-    new Set<string>(),
+async function launchState(pool: InstanceType<typeof pg.Pool>): Promise<string | null> {
+  const result = await pool.query<{ current_state: string }>(
+    'SELECT current_state FROM token_launches',
   );
-  const result = await pool.query(
-    "UPDATE token_launches SET current_state = 'OBSERVING' WHERE current_state = 'DETECTED'",
-  );
-  assert.equal(result.rowCount, 1);
+  return result.rows[0]?.current_state ?? null;
 }
 
 async function assertPaperSafety(pool: InstanceType<typeof pg.Pool>): Promise<void> {

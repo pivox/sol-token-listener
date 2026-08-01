@@ -54,8 +54,13 @@ reste active.
 Le WebSocket est le chemin nominal. Au démarrage, le rattrapage HTTP est borné
 par `LISTENER_CATCH_UP_MAX_PAGES` pages de
 `LISTENER_CATCH_UP_PAGE_SIZE` signatures pour chacun des programmes Pump.fun
-et PumpSwap (20 × 100 par défaut). Les retries et la réconciliation sont eux
-aussi bornés; la consommation RPC dépend néanmoins du trafic et des reprises.
+et PumpSwap (20 × 100 par défaut). Une panne retryable est replanifiée avec un
+délai exponentiel de 500 ms, plafonné à 60 s entre deux tentatives, mais sans
+plafond du nombre de tentatives : elle peut donc être retentée indéfiniment.
+`RPC_RETRY_MAX_ATTEMPTS` et
+`RPC_RETRY_BASE_DELAY_MS` sont validés par la configuration pour compatibilité,
+mais ne pilotent pas encore ce scheduler durable. La consommation RPC dépend du
+trafic, des déconnexions et des reprises.
 L'arrêt ferme les producteurs, empêche de nouvelles prises de lease, draine le
 worker puis écrit le heartbeat final, dans la limite de
 `LISTENER_SHUTDOWN_TIMEOUT_MS`.

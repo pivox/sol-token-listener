@@ -271,8 +271,12 @@ une étape intermédiaire. Les leases expirés rendent le travail réclamable.
 Le WebSocket est le chemin nominal. Le catch-up initial est borné par
 `LISTENER_CATCH_UP_MAX_PAGES * LISTENER_CATCH_UP_PAGE_SIZE` pour chacun des
 programmes Pump.fun et PumpSwap, soit 20 × 100 signatures par programme par
-défaut. Les retries, polls de finalité et durées d'arrêt sont configurés et
-bornés; le quota RPC réel dépend du trafic, des déconnexions et des reprises.
+défaut. Une panne retryable est replanifiée avec un délai exponentiel de 500 ms
+plafonné à 60 s, sans plafond du nombre de tentatives. Les variables
+`RPC_RETRY_MAX_ATTEMPTS` et `RPC_RETRY_BASE_DELAY_MS` sont parsées et validées
+pour compatibilité, mais ne pilotent pas encore ce scheduler durable. Les lots
+de finalité et durées d'arrêt sont bornés; le quota RPC réel dépend du trafic,
+des déconnexions et des reprises.
 
 Le traitement réclame un événement avec un lease et reste idempotent.
 `raw_chain_events` est alimenté séparément : le batch du sink conserve les
