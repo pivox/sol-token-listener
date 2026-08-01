@@ -437,30 +437,79 @@ void test('uses an ordered partial index for a large mixed claim backlog', async
 });
 
 void test('does not retain raw external failures on any public error surface', async () => {
-  const secret = 'postgresql://reader:private-token@db.invalid/ledger';
+  const urlSecret = 'postgresql://reader:private-token@db.invalid/ledger';
+  const identifierSecret = 'StaticIdentifierLookingSecret';
+  let nameReads = 0;
+  const hostile = new Error(urlSecret);
+  Object.defineProperty(hostile, 'name', {
+    get: () => {
+      nameReads += 1;
+      return identifierSecret;
+    },
+  });
   const pool = {
     connect: async () => { throw new Error('not used'); },
-    query: async () => { throw new DatabaseUnavailableError(secret); },
+    query: async () => { throw hostile; },
   };
   const repository = new PostgresTransactionInboxRepository(pool);
   await assert.rejects(repository.counts(), (error) => {
     assert.ok(error instanceof TransactionInboxRepositoryError);
-    assertNoSecretSurface(error, secret);
-    assert.deepEqual(error.failures, [{ stage: 'operation', errorName: 'DatabaseUnavailableError' }]);
+    assertNoSecretSurface(error, urlSecret, identifierSecret);
+    assert.deepEqual(error.failures, [{
+      stage: 'operation',
+      failureKind: 'DATABASE_OPERATION',
+      errorName: 'TransactionInboxDatabaseOperationError',
+    }]);
+    assert.ok(Object.isFrozen(error.failures));
+    assert.ok(Object.isFrozen(error.failures[0]));
     return true;
   });
+  assert.equal(nameReads, 0);
+});
+
+void test('does not introspect a proxy thrown by the database boundary', async () => {
+  let trapCalls = 0;
+  const hostile = new Proxy(new Error('proxy-static-secret'), {
+    get: () => { trapCalls += 1; throw new Error('proxy get trap'); },
+    getOwnPropertyDescriptor: () => { trapCalls += 1; throw new Error('proxy descriptor trap'); },
+    getPrototypeOf: () => { trapCalls += 1; throw new Error('proxy prototype trap'); },
+    ownKeys: () => { trapCalls += 1; throw new Error('proxy ownKeys trap'); },
+  });
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => { throw new Error('not used'); },
+    query: async () => { throw hostile; },
+  });
+  await assert.rejects(repository.counts(), (error) =>
+    error instanceof TransactionInboxRepositoryError
+    && error.failures[0]?.failureKind === 'DATABASE_OPERATION');
+  assert.equal(trapCalls, 0);
 });
 
 void test('preserves primary and rollback failure categories without retaining their secrets', async () => {
   const primarySecret = 'https://rpc.invalid/key?token=primary-secret';
   const rollbackSecret = 'postgresql://admin:rollback-secret@db.invalid/ledger';
   let released = false;
+  let primaryNameReads = 0;
+  let rollbackTrapCalls = 0;
+  const primaryFailure = new Error(primarySecret);
+  Object.defineProperty(primaryFailure, 'name', {
+    get: () => {
+      primaryNameReads += 1;
+      return 'PrimaryIdentifierSecret';
+    },
+  });
+  const rollbackFailure = new Proxy(new Error(rollbackSecret), {
+    get: () => { rollbackTrapCalls += 1; throw new Error(rollbackSecret); },
+    getOwnPropertyDescriptor: () => { rollbackTrapCalls += 1; throw new Error(rollbackSecret); },
+    getPrototypeOf: () => { rollbackTrapCalls += 1; throw new Error(rollbackSecret); },
+    ownKeys: () => { rollbackTrapCalls += 1; throw new Error(rollbackSecret); },
+  });
   const client = {
     query: async (text: string) => {
       if (text.includes('pg_advisory_xact_lock')) {
-        throw new DatabaseUnavailableError(primarySecret);
+        throw primaryFailure;
       }
-      if (text === 'ROLLBACK') throw new RollbackFailureError(rollbackSecret);
+      if (text === 'ROLLBACK') throw rollbackFailure;
       return { rows: [], rowCount: 0 };
     },
     release: () => { released = true; },
@@ -472,13 +521,23 @@ void test('preserves primary and rollback failure categories without retaining t
   await assert.rejects(repository.enqueue(notification('rollback-redaction', 1n)), (error) => {
     assert.ok(error instanceof TransactionInboxRepositoryError);
     assert.deepEqual(error.failures, [
-      { stage: 'primary', errorName: 'DatabaseUnavailableError' },
-      { stage: 'rollback', errorName: 'RollbackFailureError' },
+      {
+        stage: 'primary',
+        failureKind: 'DATABASE_OPERATION',
+        errorName: 'TransactionInboxDatabaseOperationError',
+      },
+      {
+        stage: 'rollback',
+        failureKind: 'DATABASE_ROLLBACK',
+        errorName: 'TransactionInboxDatabaseRollbackError',
+      },
     ]);
-    assertNoSecretSurface(error, primarySecret, rollbackSecret);
+    assertNoSecretSurface(error, primarySecret, rollbackSecret, 'PrimaryIdentifierSecret');
     return true;
   });
   assert.equal(released, true);
+  assert.equal(primaryNameReads, 0);
+  assert.equal(rollbackTrapCalls, 0);
 });
 
 async function withDatabase(
@@ -550,14 +609,6 @@ async function insertTerminal(
 
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
-}
-
-class DatabaseUnavailableError extends Error {
-  public override readonly name = 'DatabaseUnavailableError';
-}
-
-class RollbackFailureError extends Error {
-  public override readonly name = 'RollbackFailureError';
 }
 
 function assertNoSecretSurface(value: unknown, ...secrets: readonly string[]): void {

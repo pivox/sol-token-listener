@@ -62,22 +62,30 @@ const MAX_DATE_MS = 8_640_000_000_000_000;
 
 export interface TransactionInboxFailureMetadata {
   readonly stage: 'operation' | 'primary' | 'rollback';
+  readonly failureKind: 'DATABASE_OPERATION' | 'DATABASE_ROLLBACK';
   readonly errorName: string;
 }
+
+const INTERNAL_REPOSITORY_ERROR = Symbol('internal-repository-error');
+const trustedRepositoryErrors = new WeakSet();
 
 export class TransactionInboxRepositoryError extends Error {
   public readonly failures: readonly TransactionInboxFailureMetadata[];
 
-  public constructor(failures: readonly TransactionInboxFailureMetadata[] = []) {
+  public constructor(
+    failures: readonly TransactionInboxFailureMetadata[] = [],
+    trustToken?: symbol,
+  ) {
     super('Transaction inbox repository operation failed.');
     this.name = 'TransactionInboxRepositoryError';
     this.failures = Object.freeze(failures.map((failure) => Object.freeze({ ...failure })));
+    if (trustToken === INTERNAL_REPOSITORY_ERROR) trustedRepositoryErrors.add(this);
   }
 }
 
 export class TransactionInboxConflictError extends TransactionInboxRepositoryError {
   public constructor(public readonly conflict: 'identity' | 'snapshot' | 'finality' | 'checkpoint') {
-    super();
+    super([], INTERNAL_REPOSITORY_ERROR);
     this.name = 'TransactionInboxConflictError';
     this.message = 'Transaction inbox immutable state conflicts.';
   }
@@ -85,7 +93,7 @@ export class TransactionInboxConflictError extends TransactionInboxRepositoryErr
 
 export class TransactionInboxLeaseError extends TransactionInboxRepositoryError {
   public constructor() {
-    super();
+    super([], INTERNAL_REPOSITORY_ERROR);
     this.name = 'TransactionInboxLeaseError';
     this.message = 'Transaction inbox lease is stale or missing.';
   }
@@ -588,11 +596,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       } catch (cause) {
         try {
           await client.query('ROLLBACK');
-        } catch (rollbackCause) {
+        } catch {
           throw new TransactionInboxRepositoryError([
-            safeFailureMetadata('primary', cause),
-            safeFailureMetadata('rollback', rollbackCause),
-          ]);
+            safeFailureMetadata('primary'),
+            safeFailureMetadata('rollback'),
+          ], INTERNAL_REPOSITORY_ERROR);
         }
         throw cause;
       }
@@ -605,10 +613,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     try {
       return await run();
     } catch (cause) {
-      if (cause instanceof TransactionInboxRepositoryError) throw cause;
+      if (isTrustedRepositoryError(cause)) throw cause;
       throw new TransactionInboxRepositoryError([
-        safeFailureMetadata('operation', cause),
-      ]);
+        safeFailureMetadata('operation'),
+      ], INTERNAL_REPOSITORY_ERROR);
     }
   }
 }
@@ -852,20 +860,24 @@ function requireSafeErrorName(value: string): void {
 
 function safeFailureMetadata(
   stage: TransactionInboxFailureMetadata['stage'],
-  value: unknown,
 ): TransactionInboxFailureMetadata {
-  let errorName = 'Error';
-  if (value instanceof Error) {
-    try {
-      if (/^[A-Za-z_$][A-Za-z0-9_$.-]*$/u.test(value.name)
-        && Buffer.byteLength(value.name, 'utf8') <= 256) {
-        errorName = value.name;
-      }
-    } catch {
-      errorName = 'Error';
-    }
-  }
-  return Object.freeze({ stage, errorName });
+  return stage === 'rollback'
+    ? Object.freeze({
+      stage,
+      failureKind: 'DATABASE_ROLLBACK',
+      errorName: 'TransactionInboxDatabaseRollbackError',
+    })
+    : Object.freeze({
+      stage,
+      failureKind: 'DATABASE_OPERATION',
+      errorName: 'TransactionInboxDatabaseOperationError',
+    });
+}
+
+function isTrustedRepositoryError(value: unknown): value is TransactionInboxRepositoryError {
+  return typeof value === 'object'
+    && value !== null
+    && trustedRepositoryErrors.has(value);
 }
 
 function requireCheckpointKey(value: unknown): asserts value is 'launchpad' | 'market' {
