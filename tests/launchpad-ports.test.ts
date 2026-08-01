@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { createTokenLaunchDetectedEvent } from '../src/domain/launchpad-events.js';
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
@@ -486,4 +487,49 @@ void test('runtime validation accepts valid apply and retract batches', () => {
   assert.doesNotThrow(() => {
     assertValidLaunchpadEventBatch(retractBatch);
   });
+});
+
+void test('validates reverse-ordered transitions with one prebuilt launch lookup', async () => {
+  const transaction: DecodedTransaction = {
+    signature: 'linear-validation-signature',
+    confirmationStatus: 'processed',
+    blockTimeMs: null,
+    observedAtMs: 8,
+    cursor: { slot: 8n, transactionIndex: 0 },
+    raw: null,
+    decodedProgram: 'pumpfun',
+  };
+  const events = Array.from({ length: 1_000 }, (_, index) =>
+    createTokenLaunchDetectedEvent({
+      source: adapter.source,
+      program: adapter.programId,
+      transaction,
+      launch: {
+        ...launch,
+        mint: `mint-${index}`,
+        createdAt: {
+          ...launch.createdAt,
+          slot: transaction.cursor.slot,
+          transactionIndex: transaction.cursor.transactionIndex,
+        },
+      },
+    }));
+  const transitions = events.map((event) => createInitialDetectedTransition(event)).reverse();
+  assert.doesNotThrow(() => {
+    assertValidLaunchpadEventBatch({
+      source: adapter.source,
+      program: adapter.programId,
+      signature: transaction.signature,
+      confirmationStatus: 'processed',
+      events,
+      stateTransitionAction: 'apply',
+      transitions,
+    });
+  });
+  const source = await readFile(
+    new URL('../src/ports/launchpad-event-sink.ts', import.meta.url),
+    'utf8',
+  );
+  assert.match(source, /const launchEventById = new Map/u);
+  assert.doesNotMatch(source, /launchEvents\.find\(/u);
 });

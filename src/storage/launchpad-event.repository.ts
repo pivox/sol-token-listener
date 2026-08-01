@@ -16,7 +16,14 @@ import {
   type LaunchpadEventSink,
 } from '../ports/launchpad-event-sink.js';
 import type { LaunchpadProjectionReader } from '../ports/launchpad-projection-reader.js';
-import { canonicalStringifyJson, fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
+import {
+  canonicalStringifyJson,
+  fromJsonValue,
+  MAX_CANONICAL_JSON_STRING_BYTES,
+  MAX_CANONICAL_JSON_TEXT_BYTES,
+  stringifyJson,
+  toJsonValue,
+} from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 import { createRepositoryId } from './repositories.js';
 
@@ -271,6 +278,10 @@ function prepareLaunchpadBatch(value: unknown): LaunchpadEventBatch {
   try {
     const state = { nodes: 0, textBytes: 0, ancestors: new WeakSet() };
     const snapshot = snapshotBoundaryValue(value, 0, state);
+    const serialized = stringifyJson(snapshot);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_CANONICAL_JSON_TEXT_BYTES) {
+      throw new RangeError('Batch serialized bounds exceeded.');
+    }
     assertBatchShape(snapshot);
     assertValidLaunchpadEventBatch(snapshot as LaunchpadEventBatch);
     return snapshot as LaunchpadEventBatch;
@@ -286,9 +297,7 @@ function snapshotBoundaryValue(
 ): unknown {
   if (depth > 32 || ++state.nodes > 10_000) throw new RangeError('Batch bounds exceeded.');
   if (typeof value === 'string') {
-    const bytes = Buffer.byteLength(value, 'utf8');
-    if (bytes > 16_384 || state.textBytes + bytes > 1_048_576) throw new RangeError('Batch text bounds exceeded.');
-    state.textBytes += bytes;
+    accountBatchText(value, state);
     return value;
   }
   if (value === null || typeof value === 'boolean') return value;
@@ -316,6 +325,7 @@ function snapshotBoundaryValue(
       if (keys.length !== value.length + 1 || keys.some((key) => typeof key === 'symbol')) throw new TypeError('Batch array keys are invalid.');
       const result: unknown[] = [];
       for (let index = 0; index < value.length; index += 1) {
+        accountBatchText(String(index), state);
         const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
         if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError('Batch array property is invalid.');
         result.push(snapshotBoundaryValue(descriptor.value, depth + 1, state));
@@ -325,6 +335,7 @@ function snapshotBoundaryValue(
     const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const key of Reflect.ownKeys(value)) {
       if (typeof key === 'symbol') throw new TypeError('Batch symbols are invalid.');
+      accountBatchText(key, state);
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError('Batch property is invalid.');
       Object.defineProperty(result, key, { value: snapshotBoundaryValue(descriptor.value, depth + 1, state), enumerable: true });
@@ -333,6 +344,15 @@ function snapshotBoundaryValue(
   } finally {
     state.ancestors.delete(value);
   }
+}
+
+function accountBatchText(value: string, state: { textBytes: number }): void {
+  const bytes = Buffer.byteLength(value, 'utf8');
+  if (
+    bytes > MAX_CANONICAL_JSON_STRING_BYTES
+    || state.textBytes + bytes > MAX_CANONICAL_JSON_TEXT_BYTES
+  ) throw new RangeError('Batch text bounds exceeded.');
+  state.textBytes += bytes;
 }
 
 function assertBatchShape(value: unknown): void {

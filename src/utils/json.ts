@@ -2,6 +2,7 @@ export const BIGINT_JSON_MARKER = '$solTokenListenerBigInt';
 export const MAX_SERIALIZED_BIGINT_DIGITS = 78;
 export const MAX_CANONICAL_JSON_DEPTH = 64;
 export const MAX_CANONICAL_JSON_NODES = 10_000;
+export const MAX_CANONICAL_JSON_STRING_BYTES = 16_384;
 export const MAX_CANONICAL_JSON_TEXT_BYTES = 1_048_576;
 
 const RESERVED_MARKER_MESSAGE =
@@ -45,7 +46,11 @@ export function fromJsonValue(value: unknown): unknown {
 
 export function canonicalStringifyJson(value: unknown): string {
   const state = { nodes: 0, textBytes: 0, ancestors: new WeakSet() };
-  return stringifyJson(canonicalJsonValue(value, 0, state));
+  const serialized = stringifyJson(canonicalJsonValue(value, 0, state));
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_CANONICAL_JSON_TEXT_BYTES) {
+    throw new RangeError('Canonical JSON exceeds serialized limit.');
+  }
+  return serialized;
 }
 
 function canonicalJsonValue(
@@ -57,8 +62,7 @@ function canonicalJsonValue(
     throw new RangeError('Canonical JSON exceeds structural limits.');
   }
   if (typeof value === 'string') {
-    state.textBytes += Buffer.byteLength(value, 'utf8');
-    if (state.textBytes > MAX_CANONICAL_JSON_TEXT_BYTES) throw new RangeError('Canonical JSON exceeds text limits.');
+    accountCanonicalText(value, state);
     return value;
   }
   if (value === null || typeof value === 'boolean' || typeof value === 'bigint') return value;
@@ -75,6 +79,7 @@ function canonicalJsonValue(
       if (keys.some((key) => typeof key === 'symbol')) throw new TypeError('Canonical JSON symbols are forbidden.');
       const result: unknown[] = [];
       for (let index = 0; index < value.length; index += 1) {
+        accountCanonicalText(String(index), state);
         const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
         if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError('Canonical JSON array is invalid.');
         result.push(canonicalJsonValue(descriptor.value, depth + 1, state));
@@ -86,6 +91,13 @@ function canonicalJsonValue(
     if (prototype !== Object.prototype && prototype !== null) throw new TypeError('Canonical JSON object prototype is invalid.');
     const keys = Reflect.ownKeys(value);
     if (keys.some((key) => typeof key === 'symbol')) throw new TypeError('Canonical JSON symbols are forbidden.');
+    for (const key of keys as string[]) accountCanonicalText(key, state);
+    if (isTrustedBigIntMarker(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, BIGINT_JSON_MARKER);
+      if (descriptor === undefined || !('value' in descriptor)) throw new TypeError('Canonical JSON property is invalid.');
+      canonicalJsonValue(descriptor.value, depth + 1, state);
+      return value;
+    }
     const result = Object.create(null) as Record<string, unknown>;
     for (const key of (keys as string[]).sort()) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -96,6 +108,18 @@ function canonicalJsonValue(
   } finally {
     state.ancestors.delete(value);
   }
+}
+
+function accountCanonicalText(
+  value: string,
+  state: { textBytes: number },
+): void {
+  const bytes = Buffer.byteLength(value, 'utf8');
+  if (
+    bytes > MAX_CANONICAL_JSON_STRING_BYTES
+    || state.textBytes + bytes > MAX_CANONICAL_JSON_TEXT_BYTES
+  ) throw new RangeError('Canonical JSON exceeds text limits.');
+  state.textBytes += bytes;
 }
 
 function rejectReservedBigIntMarkers(value: unknown, ancestors: Set<object>): void {

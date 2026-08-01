@@ -324,15 +324,19 @@ void test('backfills strict state transition provenance from pre-009 domain even
       ('transition-chain','mint-chain','event-chain','2025-01-01T00:00:00Z',
         'TokenLaunchDetected','DETECTED','chain'),
       ('transition-observation','mint-observation','event-observation',
-        '2025-01-01T00:00:02Z','TokenLaunchDetected','DETECTED','observation')`);
+        '2025-01-01T00:00:02Z','TokenLaunchDetected','DETECTED','observation'),
+      ('transition-unlinked','mint-unlinked',NULL,'2025-01-01T00:00:03Z',
+        'TokenLaunchDetected','DETECTED','unlinked')`);
 
     const migrationSql = await readFile(migrationUrl, 'utf8');
+    await pool.query(migrationSql);
     await pool.query(migrationSql);
     await pool.query(migrationSql);
     assert.deepEqual((await pool.query(`SELECT transition_id,payload_version,
       occurred_at_source FROM state_transitions ORDER BY transition_id`)).rows, [
       { transition_id: 'transition-chain', payload_version: 1, occurred_at_source: 'blockchain' },
       { transition_id: 'transition-observation', payload_version: 1, occurred_at_source: 'observation' },
+      { transition_id: 'transition-unlinked', payload_version: 1, occurred_at_source: 'observation' },
     ]);
     assert.deepEqual((await pool.query(`SELECT column_name,is_nullable,column_default
       FROM information_schema.columns

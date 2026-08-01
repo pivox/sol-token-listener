@@ -5,6 +5,7 @@ import pg from 'pg';
 import { createTokenLaunchDetectedEvent, createBondingCurveTradeObservedEvent } from '../src/domain/launchpad-events.js';
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
 import { ConfirmationStatusConflictError } from '../src/domain/confirmation-status.js';
+import type { LaunchParameterObject } from '../src/domain/types.js';
 import type { LaunchpadEventBatch } from '../src/ports/launchpad-event-sink.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
@@ -104,6 +105,27 @@ void test('redacts hostile batches before connecting without invoking getters', 
     });
   }
   assert.equal(getterCalls, 0);
+  assert.equal(connections, 0);
+});
+
+void test('bounds batch key bytes and escaped JSON before acquiring a client', async () => {
+  let connections = 0;
+  const repository = new PostgresLaunchpadEventRepository({
+    connect: () => { connections += 1; throw new Error('must not connect'); },
+  });
+  const oversizedKey = fixture('confirmed', 'signature-key', 'mint-key', 2_000, 1_000, {
+    ['é'.repeat(8_193)]: true,
+  });
+  const escapedOutput = fixture('confirmed', 'signature-nul', 'mint-nul', 2_000, 1_000, {
+    escaped: Array.from({ length: 12 }, () => '\0'.repeat(16_384)),
+  });
+  for (const batch of [oversizedKey, escapedOutput]) {
+    await assert.rejects(repository.record(batch), (error: unknown) => {
+      assert.equal((error as Error).name, 'LaunchpadEventRepositoryError');
+      assert.equal((error as Error).message, 'Launchpad event repository operation failed.');
+      return true;
+    });
+  }
   assert.equal(connections, 0);
 });
 
@@ -376,10 +398,10 @@ async function withDatabase(context: { skip(message?: string): void }, run: (poo
   finally { await pool.end(); await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); await admin.end(); }
 }
 
-function fixture(status: 'processed' | 'confirmed' | 'finalized' | 'orphaned', signature = 'signature-a', mint = 'mint-a', observedAtMs = 2_000, blockTimeMs: number | null = 1_000) {
+function fixture(status: 'processed' | 'confirmed' | 'finalized' | 'orphaned', signature = 'signature-a', mint = 'mint-a', observedAtMs = 2_000, blockTimeMs: number | null = 1_000, parameters: LaunchParameterObject = { initialSupply: 1_000_000_000_000_000_000n, nested: { b: 2, a: 1 } }) {
   const transaction = { signature, confirmationStatus: status, blockTimeMs, observedAtMs, cursor: { slot: 9_007_199_254_740_993n, transactionIndex: 4 }, raw: null };
   const quoteAsset = { mint: 'quote', decimals: 9, tokenProgram: 'SPL_TOKEN' as const };
-  const launch = createTokenLaunchDetectedEvent({ source: 'pumpfun', program: 'pump', transaction, launch: { mint, creator: 'creator', tokenProgram: 'SPL_TOKEN', quoteAssets: [quoteAsset], launchpad: 'pumpfun', createdAt: { ...transaction.cursor, instructionIndex: 2, innerInstructionIndex: null }, parameters: { initialSupply: 1_000_000_000_000_000_000n, nested: { b: 2, a: 1 } } } });
+  const launch = createTokenLaunchDetectedEvent({ source: 'pumpfun', program: 'pump', transaction, launch: { mint, creator: 'creator', tokenProgram: 'SPL_TOKEN', quoteAssets: [quoteAsset], launchpad: 'pumpfun', createdAt: { ...transaction.cursor, instructionIndex: 2, innerInstructionIndex: null }, parameters } });
   const trade = createBondingCurveTradeObservedEvent({ source: 'pumpfun', program: 'pump', transaction, trade: { id: `trade-${mint}`, launchMint: mint, kind: 'BUY', trader: 'buyer', baseAmountRaw: 9007199254740993n, quoteAmountRaw: 1000000000n, quoteAsset, cursor: { ...transaction.cursor, instructionIndex: 2, innerInstructionIndex: 1 } } });
   return status === 'orphaned' ? { source: 'pumpfun', program: 'pump', signature: transaction.signature, confirmationStatus: status, events: [launch, trade], stateTransitionAction: 'retract' as const, transitions: [] as const } : { source: 'pumpfun', program: 'pump', signature: transaction.signature, confirmationStatus: status, events: [launch, trade], stateTransitionAction: 'apply' as const, transitions: [createInitialDetectedTransition(launch)] };
 }

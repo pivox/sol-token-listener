@@ -227,6 +227,12 @@ FROM domain_events AS event
 WHERE event.event_id = transition.event_id
   AND transition.occurred_at_source IS NULL;
 
+-- A legacy transition without a linked domain event has no durable chain-time
+-- proof. Conservatively classify its occurrence as observation-derived.
+UPDATE state_transitions
+SET occurred_at_source = 'observation'
+WHERE occurred_at_source IS NULL;
+
 ALTER TABLE state_transitions ALTER COLUMN occurred_at_source SET NOT NULL;
 ALTER TABLE state_transitions ALTER COLUMN payload_version DROP DEFAULT;
 
