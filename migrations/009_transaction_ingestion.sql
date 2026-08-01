@@ -1,7 +1,30 @@
+CREATE OR REPLACE FUNCTION transaction_inbox_program_ids_valid(program_ids TEXT[])
+RETURNS BOOLEAN
+LANGUAGE SQL
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $function$
+  SELECT CARDINALITY(program_ids) BETWEEN 1 AND 16
+    AND ARRAY_POSITION(program_ids, NULL) IS NULL
+    AND ARRAY_NDIMS(program_ids) = 1
+    AND NOT EXISTS (
+      SELECT 1 FROM UNNEST(program_ids) AS item(program_id)
+      WHERE program_id <> BTRIM(program_id)
+         OR OCTET_LENGTH(program_id) NOT BETWEEN 1 AND 128
+    )
+    AND program_ids = ARRAY(
+      SELECT DISTINCT program_id
+      FROM UNNEST(program_ids) AS item(program_id)
+      ORDER BY program_id
+    )
+$function$;
+
 CREATE TABLE IF NOT EXISTS chain_transaction_inbox (
   signature TEXT PRIMARY KEY,
   observed_slot NUMERIC(78,0) NOT NULL,
   discovery_sources TEXT[] NOT NULL,
+  program_ids TEXT[] NOT NULL,
   target_confirmation_status TEXT NOT NULL,
   processing_status TEXT NOT NULL DEFAULT 'PENDING',
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -32,6 +55,9 @@ CREATE TABLE IF NOT EXISTS chain_transaction_inbox (
       ARRAY['CATCH_UP']::TEXT[],
       ARRAY['WEBSOCKET', 'CATCH_UP']::TEXT[]
     )
+  ),
+  CONSTRAINT chain_transaction_inbox_program_ids_check CHECK (
+    transaction_inbox_program_ids_valid(program_ids)
   ),
   CONSTRAINT chain_transaction_inbox_target_confirmation_check CHECK (
     target_confirmation_status IN ('processed', 'confirmed', 'finalized', 'orphaned')

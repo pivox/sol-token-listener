@@ -51,6 +51,7 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
     signature: 'signature',
     slot: 42n,
     source: 'WEBSOCKET',
+    programIds: Object.freeze(['Program111', 'Program222']),
     confirmationStatus: 'confirmed',
     observedAtMs,
   });
@@ -464,6 +465,7 @@ void test('rejects mutable contracts, number slots and non-integer millisecond t
     signature: 'signature',
     slot: 42n,
     source: 'CATCH_UP' as const,
+    programIds: Object.freeze(['Program111']),
     confirmationStatus: 'finalized' as const,
     observedAtMs,
   });
@@ -521,11 +523,31 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
       signature: 'signature',
       slot: 42n,
       source: 'POLLING',
+      programIds: Object.freeze(['Program111']),
       confirmationStatus: 'confirmed',
       observedAtMs,
     })); },
     /source/u,
   );
+  const notification = Object.freeze({
+    signature: 'signature', slot: 42n, source: 'CATCH_UP' as const,
+    confirmationStatus: 'confirmed' as const, observedAtMs,
+  });
+  for (const programIds of [
+    [],
+    ['Program222', 'Program111'],
+    ['Program111', 'Program111'],
+    [' Program111'],
+    ['x'.repeat(129)],
+    Array.from({ length: 17 }, (_, index) => `Program${String(index).padStart(2, '0')}`),
+  ]) {
+    assert.throws(
+      () => { assertValidTransactionNotification(Object.freeze({
+        ...notification, programIds: Object.freeze(programIds),
+      })); },
+      /programIds/u,
+    );
+  }
   assert.throws(
     () => { assertValidIngestionFailure(Object.freeze({
       code: 'UNKNOWN',

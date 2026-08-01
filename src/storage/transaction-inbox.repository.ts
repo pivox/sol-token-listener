@@ -52,6 +52,7 @@ interface InboxPool extends Queryable {
 interface InboxIdentityRow extends QueryResultRow {
   readonly observed_slot: unknown;
   readonly discovery_sources: unknown;
+  readonly program_ids: unknown;
   readonly target_confirmation_status: unknown;
   readonly processing_status: unknown;
   readonly normalized_transaction: unknown;
@@ -106,7 +107,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           [value.signature],
         );
         const existing = await client.query(
-          `SELECT observed_slot, discovery_sources, target_confirmation_status,
+          `SELECT observed_slot, discovery_sources, program_ids, target_confirmation_status,
              processing_status, normalized_transaction
            FROM chain_transaction_inbox WHERE signature = $1 FOR UPDATE`,
           [value.signature],
@@ -115,13 +116,14 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (row === undefined) {
           const inserted = await client.query(
             `INSERT INTO chain_transaction_inbox (
-              signature, observed_slot, discovery_sources, target_confirmation_status,
+              signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
               processing_status, observed_at
-            ) VALUES ($1,$2,ARRAY[$3]::TEXT[],$4,'PENDING',$5)`,
+            ) VALUES ($1,$2,ARRAY[$3]::TEXT[],$4,$5,'PENDING',$6)`,
             [
               value.signature,
               value.slot.toString(),
               value.source,
+              value.programIds,
               value.confirmationStatus,
               dateFromMs(value.observedAtMs),
             ],
@@ -137,6 +139,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const sources = discoverySources(row.discovery_sources);
         if (!sources.includes(value.source)) sources.push(value.source);
         sources.sort(sourceOrder);
+        const programs = storedProgramIds(row.program_ids);
+        for (const programId of value.programIds) {
+          if (!programs.includes(programId)) programs.push(programId);
+        }
+        programs.sort(lexicalOrder);
+        if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
         const processingStatus = inboxStatus(row.processing_status);
         const shouldReplay = processingStatus === 'PROCESSED' && next !== current;
         if (shouldReplay && row.normalized_transaction === null) {
@@ -145,15 +153,16 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const updated = await client.query(
           `UPDATE chain_transaction_inbox SET
              discovery_sources = $2,
-             target_confirmation_status = $3,
-             processing_status = CASE WHEN $4 THEN 'PENDING' ELSE processing_status END,
-             processed_at = CASE WHEN $4 THEN NULL ELSE processed_at END,
-             terminal_at = CASE WHEN $4 THEN NULL ELSE terminal_at END,
-             purge_after = CASE WHEN $4 THEN NULL ELSE purge_after END,
-             missing_finality_polls = CASE WHEN $4 THEN 0 ELSE missing_finality_polls END,
-             updated_at = GREATEST(updated_at, $5)
+             program_ids = $3,
+             target_confirmation_status = $4,
+             processing_status = CASE WHEN $5 THEN 'PENDING' ELSE processing_status END,
+             processed_at = CASE WHEN $5 THEN NULL ELSE processed_at END,
+             terminal_at = CASE WHEN $5 THEN NULL ELSE terminal_at END,
+             purge_after = CASE WHEN $5 THEN NULL ELSE purge_after END,
+             missing_finality_polls = CASE WHEN $5 THEN 0 ELSE missing_finality_polls END,
+             updated_at = GREATEST(updated_at, $6)
            WHERE signature = $1`,
-          [value.signature, sources, next, shouldReplay, dateFromMs(value.observedAtMs)],
+          [value.signature, sources, programs, next, shouldReplay, dateFromMs(value.observedAtMs)],
         );
         requireOne(updated.rowCount);
       });
@@ -791,6 +800,43 @@ function sourceOrder(
   right: TransactionNotification['source'],
 ): number {
   return (left === 'WEBSOCKET' ? 0 : 1) - (right === 'WEBSOCKET' ? 0 : 1);
+}
+
+function storedProgramIds(value: unknown): string[] {
+  if (!Array.isArray(value)) throw new TypeError('Stored program IDs are invalid.');
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor)
+    || typeof lengthDescriptor.value !== 'number'
+    || !Number.isSafeInteger(lengthDescriptor.value)
+    || lengthDescriptor.value < 1
+    || lengthDescriptor.value > 16) {
+    throw new TypeError('Stored program IDs are invalid.');
+  }
+  const result: string[] = [];
+  let previous: string | null = null;
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+      throw new TypeError('Stored program IDs are invalid.');
+    }
+    const programId: unknown = descriptor.value;
+    if (typeof programId !== 'string'
+      || programId.length < 1
+      || programId.length > 128
+      || programId !== programId.trim()
+      || Buffer.byteLength(programId, 'utf8') > 128
+      || (previous !== null && programId <= previous)) {
+      throw new TypeError('Stored program IDs are invalid.');
+    }
+    result.push(programId);
+    previous = programId;
+  }
+  return result;
+}
+
+function lexicalOrder(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
 }
 
 function numericBigInt(value: unknown, name: string): bigint {

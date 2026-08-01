@@ -27,6 +27,7 @@ void test('merges discoveries, rejects identity contradictions, and claims concu
     await repository.enqueue(notification('shared', 10n, 'CATCH_UP', 'confirmed', 1_100));
     const stored = await row(pool, 'shared');
     assert.deepEqual(stored.discovery_sources, ['WEBSOCKET', 'CATCH_UP']);
+    assert.deepEqual(stored.program_ids, ['Program111', 'Program222']);
     assert.equal(stored.target_confirmation_status, 'confirmed');
     await assert.rejects(
       repository.enqueue(notification('shared', 11n, 'WEBSOCKET', 'confirmed', 1_200)),
@@ -374,6 +375,18 @@ void test('wraps malformed rows and database rollback failures in safe typed err
       error instanceof TransactionInboxRepositoryError
       && error.message === 'Transaction inbox repository operation failed.'
       && !error.message.includes('observed_slot'));
+
+    await repository.enqueue(notification('program-corrupt', 61n));
+    await pool.query(
+      'ALTER TABLE chain_transaction_inbox DROP CONSTRAINT chain_transaction_inbox_program_ids_check',
+    );
+    await pool.query(
+      "UPDATE chain_transaction_inbox SET program_ids = ARRAY['Program222', 'Program111'] WHERE signature = 'program-corrupt'",
+    );
+    await assert.rejects(
+      repository.enqueue(notification('program-corrupt', 61n)),
+      TransactionInboxRepositoryError,
+    );
   });
 });
 
@@ -406,22 +419,22 @@ void test('rolls back and releases a checked-out client after a database failure
 void test('uses an ordered partial index for a large mixed claim backlog', async (context) => {
   await withDatabase(context, async (pool) => {
     await pool.query(`INSERT INTO chain_transaction_inbox (
-      signature, observed_slot, discovery_sources, target_confirmation_status,
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, observed_at
-    ) SELECT 'pending-' || value, value + 20000, ARRAY['WEBSOCKET'], 'processed',
+    ) SELECT 'pending-' || value, value + 20000, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'processed',
       'PENDING', clock_timestamp()
       FROM generate_series(1, 10000) value`);
     await pool.query(`INSERT INTO chain_transaction_inbox (
-      signature, observed_slot, discovery_sources, target_confirmation_status,
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, next_attempt_at, observed_at
-    ) SELECT 'retry-' || value, value, ARRAY['WEBSOCKET'], 'processed',
+    ) SELECT 'retry-' || value, value, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'processed',
       'FAILED', 'RPC_TRANSIENT', 'RpcError', TRUE, clock_timestamp() + INTERVAL '1 day',
       clock_timestamp()
       FROM generate_series(1, 10000) value`);
     await pool.query(`INSERT INTO chain_transaction_inbox (
-      signature, observed_slot, discovery_sources, target_confirmation_status,
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, lease_token, lease_expires_at, observed_at
-    ) SELECT 'leased-' || value, value + 10000, ARRAY['WEBSOCKET'], 'processed',
+    ) SELECT 'leased-' || value, value + 10000, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'processed',
       'PROCESSING', 'lease-' || value, clock_timestamp() + INTERVAL '1 day',
       clock_timestamp()
       FROM generate_series(1, 10000) value`);
@@ -703,7 +716,10 @@ function notification(
   confirmationStatus: TransactionNotification['confirmationStatus'] = 'processed',
   observedAtMs = 1_000,
 ): TransactionNotification {
-  return Object.freeze({ signature, slot, source, confirmationStatus, observedAtMs });
+  const programIds = source === 'CATCH_UP'
+    ? Object.freeze(['Program111', 'Program222'])
+    : Object.freeze(['Program111']);
+  return Object.freeze({ signature, slot, source, programIds, confirmationStatus, observedAtMs });
 }
 
 function normalized(signature: string, slot: bigint): NormalizedTransaction {
@@ -733,10 +749,10 @@ async function insertTerminal(
   const snapshot = { signature };
   const completedAt = new Date(terminalAt.getTime() - (4 * 60 * 60 * 1_000));
   await pool.query(`INSERT INTO chain_transaction_inbox (
-    signature, observed_slot, discovery_sources, target_confirmation_status,
+    signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
     processing_status, normalized_transaction, immutable_fingerprint, observed_at,
     processed_at, terminal_at, purge_after
-  ) VALUES ($1, 1, ARRAY['WEBSOCKET'], 'finalized', 'PROCESSED', $2, $3,
+  ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'finalized', 'PROCESSED', $2, $3,
     $4::TIMESTAMPTZ, $4::TIMESTAMPTZ, $4::TIMESTAMPTZ,
     $4::TIMESTAMPTZ + INTERVAL '4 hours')`, [signature, snapshot, 'a'.repeat(64), completedAt]);
 }

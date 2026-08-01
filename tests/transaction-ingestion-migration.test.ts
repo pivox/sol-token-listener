@@ -14,6 +14,7 @@ void test('creates a replayable bigint-safe transaction inbox with strict lifecy
   assert.match(sql, /signature TEXT PRIMARY KEY/u);
   assert.match(sql, /observed_slot NUMERIC\(78,0\) NOT NULL/u);
   assert.match(sql, /discovery_sources TEXT\[\] NOT NULL/u);
+  assert.match(sql, /program_ids TEXT\[\] NOT NULL/u);
   assert.match(sql, /target_confirmation_status TEXT NOT NULL/u);
   assert.match(sql, /processing_status TEXT NOT NULL/u);
   assert.match(sql, /attempts INTEGER NOT NULL DEFAULT 0/u);
@@ -34,6 +35,11 @@ void test('creates a replayable bigint-safe transaction inbox with strict lifecy
   assert.match(sql, /purge_after TIMESTAMPTZ/u);
 
   assert.match(sql, /discovery_sources IN \([\s\S]*ARRAY\['WEBSOCKET'\]::TEXT\[\][\s\S]*ARRAY\['CATCH_UP'\]::TEXT\[\][\s\S]*ARRAY\['WEBSOCKET', 'CATCH_UP'\]::TEXT\[\]/u);
+  assert.match(sql, /CARDINALITY\(program_ids\) BETWEEN 1 AND 16/u);
+  assert.match(sql, /ARRAY_POSITION\(program_ids, NULL\) IS NULL/u);
+  assert.match(sql, /OCTET_LENGTH\(program_id\) NOT BETWEEN 1 AND 128/u);
+  assert.match(sql, /SELECT DISTINCT program_id[\s\S]*ORDER BY program_id/u);
+  assert.doesNotMatch(sql, /program_ids TEXT\[\][^\n]*DEFAULT/iu);
   assert.match(sql, /target_confirmation_status IN \('processed', 'confirmed', 'finalized', 'orphaned'\)/u);
   assert.match(sql, /processing_status IN \('PENDING', 'PROCESSING', 'PROCESSED', 'FAILED'\)/u);
   assert.match(sql, /attempts >= 0/u);
@@ -157,10 +163,10 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
     await pool.query(sql);
     assert.equal((await pool.query('SELECT COUNT(*) FROM processing_checkpoints')).rows[0]?.count, '0');
     await pool.query(`INSERT INTO chain_transaction_inbox (
-      signature, observed_slot, discovery_sources, target_confirmation_status,
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, observed_at
     ) VALUES (
-      'failed-structured', 42, ARRAY['WEBSOCKET'], 'confirmed',
+      'failed-structured', 42, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'confirmed',
       'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', FALSE, NOW()
     )`);
     assert.equal((await pool.query(
@@ -170,43 +176,43 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
     const exactMultibyteName = 'é'.repeat(8_192);
     const oversizedMultibyteName = `${exactMultibyteName}a`;
     await pool.query(`INSERT INTO chain_transaction_inbox (
-      signature, observed_slot, discovery_sources, target_confirmation_status,
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, observed_at
-    ) VALUES ($1, 45, ARRAY['WEBSOCKET'], 'confirmed', 'FAILED',
+    ) VALUES ($1, 45, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'confirmed', 'FAILED',
       'NORMALIZATION_FAILED', $2, FALSE, NOW())`, ['failed-multibyte', multibyteName]);
     await pool.query(`INSERT INTO chain_transaction_inbox (
-      signature, observed_slot, discovery_sources, target_confirmation_status,
+      signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, error_code, error_name, error_retryable, observed_at
-    ) VALUES ($1, 46, ARRAY['WEBSOCKET'], 'confirmed', 'FAILED',
+    ) VALUES ($1, 46, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'confirmed', 'FAILED',
       'NORMALIZATION_FAILED', $2, FALSE, NOW())`, ['failed-exact-name', exactMultibyteName]);
     assert.equal((await pool.query<{ readonly bytes: number }>(
       "SELECT OCTET_LENGTH(error_name) AS bytes FROM chain_transaction_inbox WHERE signature = 'failed-exact-name'",
     )).rows[0]?.bytes, 16_384);
     await assert.rejects(
       pool.query(`INSERT INTO chain_transaction_inbox (
-        signature, observed_slot, discovery_sources, target_confirmation_status,
+        signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
         processing_status, error_code, error_name, error_retryable, observed_at
-      ) VALUES ($1, 47, ARRAY['WEBSOCKET'], 'confirmed', 'FAILED',
+      ) VALUES ($1, 47, ARRAY['WEBSOCKET'], ARRAY['Program111'], 'confirmed', 'FAILED',
         'NORMALIZATION_FAILED', $2, FALSE, NOW())`,
       ['failed-oversized-name', oversizedMultibyteName]),
       /chain_transaction_inbox_error_check/u,
     );
     await assert.rejects(
       pool.query(`INSERT INTO chain_transaction_inbox (
-        signature, observed_slot, discovery_sources, target_confirmation_status,
+        signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
         processing_status, error_code, error_name, observed_at
       ) VALUES (
-        'failed-incomplete', 43, ARRAY['CATCH_UP'], 'confirmed',
+        'failed-incomplete', 43, ARRAY['CATCH_UP'], ARRAY['Program111'], 'confirmed',
         'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', NOW()
       )`),
       /chain_transaction_inbox_error_check/u,
     );
     await assert.rejects(
       pool.query(`INSERT INTO chain_transaction_inbox (
-        signature, observed_slot, discovery_sources, target_confirmation_status,
+        signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
         processing_status, error_name, error_retryable, observed_at
       ) VALUES (
-        'failed-without-code', 44, ARRAY['CATCH_UP'], 'confirmed',
+        'failed-without-code', 44, ARRAY['CATCH_UP'], ARRAY['Program111'], 'confirmed',
         'FAILED', 'TransactionNormalizationError', FALSE, NOW()
       )`),
       /chain_transaction_inbox_error_check/u,
@@ -386,6 +392,11 @@ void test('enforces inbox lifecycle checks and terminal-only purge in PostgreSQL
       { name: 'duplicate-sources', accept: false, value: { discoverySources: ['WEBSOCKET', 'WEBSOCKET'] } },
       { name: 'unknown-source', accept: false, value: { discoverySources: ['POLLING'] } },
       { name: 'null-source-member', accept: false, value: { discoverySources: ['WEBSOCKET', null] } },
+      { name: 'empty-programs', accept: false, value: { programIds: [] } },
+      { name: 'null-program-member', accept: false, value: { programIds: ['Program111', null] } },
+      { name: 'too-many-programs', accept: false, value: {
+        programIds: Array.from({ length: 17 }, (_, index) => `Program${index}`),
+      } },
       { name: 'processing-lease', accept: true, value: processingState() },
       { name: 'processing-no-token', accept: false, value: { ...processingState(), leaseToken: null } },
       { name: 'processing-no-expiry', accept: false, value: { ...processingState(), leaseExpiresAt: null } },
@@ -490,6 +501,7 @@ interface InboxInsert {
   readonly signature: string;
   readonly observedSlot: string;
   readonly discoverySources: readonly (string | null)[];
+  readonly programIds: readonly (string | null)[];
   readonly targetConfirmationStatus: string;
   readonly processingStatus: string;
   readonly attempts: number | null;
@@ -532,6 +544,7 @@ function inboxValue(
     signature,
     observedSlot: '42',
     discoverySources: ['WEBSOCKET'],
+    programIds: ['Program111'],
     targetConfirmationStatus: 'confirmed',
     processingStatus: 'PENDING',
     attempts: 0,
@@ -608,16 +621,16 @@ function terminalState(
 
 async function insertInbox(pool: PgPool, value: InboxInsert): Promise<void> {
   await pool.query(`INSERT INTO chain_transaction_inbox (
-    signature, observed_slot, discovery_sources, target_confirmation_status,
+    signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
     processing_status, attempts, missing_finality_polls, lease_token, lease_expires_at,
     next_attempt_at, normalized_transaction, immutable_fingerprint, error_code, error_name,
     error_retryable, blockchain_time, observed_at, processed_at, terminal_at, purge_after,
     created_at, updated_at
   ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-    $17, $18, $19, $20, $21, $22
+    $17, $18, $19, $20, $21, $22, $23
   )`, [
-    value.signature, value.observedSlot, value.discoverySources,
+    value.signature, value.observedSlot, value.discoverySources, value.programIds,
     value.targetConfirmationStatus, value.processingStatus, value.attempts,
     value.missingFinalityPolls, value.leaseToken, value.leaseExpiresAt,
     value.nextAttemptAt,

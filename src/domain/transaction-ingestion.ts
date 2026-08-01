@@ -9,6 +9,8 @@ export const MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH = 4_096;
 export const MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH = 16_384;
 export const MAX_TRANSACTION_SNAPSHOT_TEXT_BYTES = 1_048_576;
 export const MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES = 1_232;
+export const MAX_TRANSACTION_NOTIFICATION_PROGRAM_IDS = 16;
+export const MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES = 128;
 
 export const TRANSACTION_INBOX_STATUSES = Object.freeze([
   'PENDING',
@@ -99,6 +101,7 @@ export interface TransactionNotification {
   readonly signature: string;
   readonly slot: bigint;
   readonly source: TransactionDiscoverySource;
+  readonly programIds: readonly string[];
   readonly confirmationStatus: Exclude<ChainConfirmationStatus, 'orphaned'>;
   readonly observedAtMs: number;
 }
@@ -252,10 +255,27 @@ export function assertValidTransactionNotification(
   if (record.source !== 'WEBSOCKET' && record.source !== 'CATCH_UP') {
     throw new TypeError('Transaction notification source is invalid.');
   }
+  assertCanonicalProgramIds(record.programIds);
   if (!isObservedConfirmationStatus(record.confirmationStatus)) {
     throw new TypeError('Transaction notification confirmation status is invalid.');
   }
   assertMilliseconds(record.observedAtMs, 'Transaction notification observedAtMs');
+}
+
+function assertCanonicalProgramIds(value: unknown): void {
+  const programIds = frozenStringArray(value, 'Transaction notification programIds');
+  if (programIds.length < 1 || programIds.length > MAX_TRANSACTION_NOTIFICATION_PROGRAM_IDS) {
+    throw new TypeError('Transaction notification programIds count is invalid.');
+  }
+  let previous: string | null = null;
+  for (const programId of programIds) {
+    if (programId !== programId.trim()
+      || Buffer.byteLength(programId, 'utf8') > MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES
+      || (previous !== null && programId <= previous)) {
+      throw new TypeError('Transaction notification programIds are not canonical.');
+    }
+    previous = programId;
+  }
 }
 
 export function assertValidClaimedTransaction(
