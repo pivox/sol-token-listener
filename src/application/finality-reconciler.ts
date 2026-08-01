@@ -119,12 +119,11 @@ export class FinalityReconciler {
   private async readCandidates(): Promise<readonly FinalityCandidate[]> {
     try {
       const values = await this.repository.listForFinality(this.limit);
-      if (Object.getPrototypeOf(values) !== Array.prototype
-        || values.length > this.limit
-        || Reflect.ownKeys(values).length !== values.length + 1) {
-        throw new TypeError('Invalid finality candidate page.');
-      }
-      return Object.freeze(values.map((value) => snapshotCandidate(value)));
+      return snapshotDenseArray(
+        values,
+        (length) => length <= this.limit,
+        snapshotCandidate,
+      );
     } catch {
       throw new FinalityReconcilerError('list');
     }
@@ -195,15 +194,45 @@ export class FinalityReconciler {
 
 function snapshotStatuses(value: unknown, expectedLength: number): readonly (FinalityHistoryStatus | null)[] {
   try {
-    if (!Array.isArray(value)
-      || value.length !== expectedLength
-      || Reflect.ownKeys(value).length !== expectedLength + 1) {
-      throw new TypeError('Invalid finality history batch.');
-    }
-    return Object.freeze(value.map((entry) => snapshotStatus(entry)));
+    return snapshotDenseArray(
+      value,
+      (length) => length === expectedLength,
+      snapshotStatus,
+    );
   } catch {
     throw new FinalityReconcilerError('history');
   }
+}
+
+function snapshotDenseArray<TResult>(
+  value: unknown,
+  acceptsLength: (length: number) => boolean,
+  snapshotItem: (item: unknown) => TResult,
+): readonly TResult[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new TypeError('Invalid dense array.');
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor)) {
+    throw new TypeError('Invalid dense array length.');
+  }
+  const length: unknown = lengthDescriptor.value;
+  if (typeof length !== 'number'
+    || !Number.isSafeInteger(length)
+    || length < 0
+    || !acceptsLength(length)
+    || Reflect.ownKeys(value).length !== length + 1) {
+    throw new TypeError('Invalid dense array length.');
+  }
+  const result: TResult[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+      throw new TypeError('Invalid dense array item.');
+    }
+    result.push(snapshotItem(descriptor.value));
+  }
+  return Object.freeze(result);
 }
 
 function snapshotCandidate(value: unknown): FinalityCandidate {

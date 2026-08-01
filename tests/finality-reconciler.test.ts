@@ -263,6 +263,47 @@ void test('rejects forged non-null reset and downgrade poll results', async () =
   }
 });
 
+void test('rejects hostile candidate arrays without calling dependency methods or leaking', async () => {
+  let methodReads = 0;
+  let descriptorReads = 0;
+  const target = Object.freeze([candidate('safe', 90n)]);
+  const hostile = new Proxy(target, {
+    get(array, key, receiver) {
+      if (key === 'map' || key === Symbol.iterator) {
+        methodReads += 1;
+        return () => [candidate('https://secret.invalid/forged', 90n)];
+      }
+      return Reflect.get(array, key, receiver) as unknown;
+    },
+    getOwnPropertyDescriptor(array, key) {
+      if (key === '0') {
+        descriptorReads += 1;
+        throw new Error('https://secret.invalid/descriptor');
+      }
+      return Reflect.getOwnPropertyDescriptor(array, key);
+    },
+  });
+  const repository = memoryRepository([]);
+  repository.listForFinality = async () => hostile;
+  let sourceReads = 0;
+  const reconciler = new FinalityReconciler({
+    async getHistoryStatuses() { sourceReads += 1; return Object.freeze([]); },
+    async getFinalizedSlot() { sourceReads += 1; return 100n; },
+  }, repository, { limit: 1 });
+
+  await assert.rejects(reconciler.runOnce(), (error: unknown) => {
+    assert.ok(error instanceof FinalityReconcilerError);
+    assert.equal(error.stage, 'list');
+    assert.equal(error.message, 'Transaction finality reconciliation failed.');
+    assert.doesNotMatch(String(error), /secret|descriptor|forged/u);
+    return true;
+  });
+  assert.equal(methodReads, 0);
+  assert.equal(descriptorReads, 1);
+  assert.equal(sourceReads, 0);
+  assert.equal(repository.revisions.length, 0);
+});
+
 interface MemoryRepository extends FinalityReconcilerRepository {
   readonly candidates: FinalityCandidate[];
   readonly polls: FinalityPollObservation[];
