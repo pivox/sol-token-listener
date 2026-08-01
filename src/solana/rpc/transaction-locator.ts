@@ -6,6 +6,11 @@ import type {
   NormalizedTransaction,
 } from './types.js';
 
+// Bounds hostile descriptor scans and the trusted copy while remaining far above practical blocks.
+export const MAX_BLOCK_SIGNATURE_COUNT = 100_000;
+// Solana signatures are base58 text; this byte cap admits canonical signatures with safety margin.
+export const MAX_TRANSACTION_SIGNATURE_LENGTH = 128;
+
 type LocatableConfirmationStatus = Exclude<LegacyConfirmationStatus, 'ORPHANED'>;
 
 export interface TransactionLocationTarget {
@@ -76,18 +81,24 @@ export class SolanaTransactionLocator {
   public async locate(target: TransactionLocationTarget): Promise<NormalizedTransaction> {
     const response = await this.fetchTransaction(target);
     if (response === null) throw new TransactionUnavailableError();
-    if (safeResponseSlot(response) !== target.slot) throw new TransactionIndexNotFoundError();
 
-    const signatures = await this.fetchBlockSignatures(target);
-    if (signatures === null) throw new BlockUnavailableError();
-    const transactionIndex = safeUniqueSignatureIndex(signatures, target.signature);
+    const rawSignatures = await this.fetchBlockSignatures(target);
+    if (rawSignatures === null) throw new BlockUnavailableError();
+    const signatures = snapshotBlockSignatures(rawSignatures, target.signature);
+    const transactionIndex = uniqueSignatureIndex(signatures, target.signature);
     if (transactionIndex === null) throw new TransactionIndexNotFoundError();
 
+    let normalized: NormalizedTransaction;
     try {
-      return normalizeTransaction(response, target.confirmationStatus, transactionIndex);
+      normalized = normalizeTransaction(response, target.confirmationStatus, transactionIndex);
     } catch {
       throw new TransactionNormalizationError();
     }
+    if (!hasStableRawSlot(response)) throw new TransactionNormalizationError();
+    if (normalized.signature !== target.signature || normalized.slot !== target.slot) {
+      throw new TransactionIndexNotFoundError();
+    }
+    return normalized;
   }
 
   private async fetchTransaction(
@@ -113,28 +124,78 @@ export class SolanaTransactionLocator {
 
 export { SolanaTransactionLocator as TransactionLocator };
 
-function safeResponseSlot(response: VersionedTransactionResponse): bigint {
+function hasStableRawSlot(response: VersionedTransactionResponse): boolean {
   try {
-    const slot = response.slot;
-    if (!Number.isSafeInteger(slot) || slot < 0) {
-      throw new TransactionNormalizationError();
-    }
-    return BigInt(slot);
-  } catch (error) {
-    if (error instanceof TransactionNormalizationError) throw error;
-    throw new TransactionNormalizationError();
+    const descriptor = Object.getOwnPropertyDescriptor(response, 'slot');
+    return descriptor !== undefined && 'value' in descriptor;
+  } catch {
+    return false;
   }
 }
 
-function safeUniqueSignatureIndex(
-  signatures: readonly string[],
+type SignatureSnapshotResult =
+  | { readonly kind: 'valid'; readonly signatures: readonly string[] }
+  | { readonly kind: 'invalid' }
+  | { readonly kind: 'target-duplicate' };
+
+function snapshotBlockSignatures(
+  value: readonly string[],
   target: string,
-): number | null {
+): readonly string[] {
+  let result: SignatureSnapshotResult;
   try {
-    return uniqueSignatureIndex(signatures, target);
+    result = inspectBlockSignatures(value, target);
   } catch {
-    throw new RpcTransientError();
+    throw new BlockUnavailableError();
   }
+  if (result.kind === 'target-duplicate') throw new TransactionIndexNotFoundError();
+  if (result.kind === 'invalid') throw new BlockUnavailableError();
+  return result.signatures;
+}
+
+function inspectBlockSignatures(
+  value: readonly string[],
+  target: string,
+): SignatureSnapshotResult {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    return { kind: 'invalid' };
+  }
+  const keys = Reflect.ownKeys(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor)) {
+    return { kind: 'invalid' };
+  }
+  const length: unknown = lengthDescriptor.value;
+  if (typeof length !== 'number'
+    || !Number.isSafeInteger(length)
+    || length < 0
+    || length > MAX_BLOCK_SIGNATURE_COUNT
+    || value.length !== length
+    || keys.length !== length + 1
+    || keys[length] !== 'length') {
+    return { kind: 'invalid' };
+  }
+
+  const copy: string[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < length; index += 1) {
+    const key = String(index);
+    if (keys[index] !== key) return { kind: 'invalid' };
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !('value' in descriptor)) return { kind: 'invalid' };
+    const signature: unknown = descriptor.value;
+    if (typeof signature !== 'string'
+      || signature.length === 0
+      || Buffer.byteLength(signature, 'utf8') > MAX_TRANSACTION_SIGNATURE_LENGTH) {
+      return { kind: 'invalid' };
+    }
+    if (seen.has(signature)) {
+      return { kind: signature === target ? 'target-duplicate' : 'invalid' };
+    }
+    seen.add(signature);
+    copy.push(signature);
+  }
+  return { kind: 'valid', signatures: Object.freeze(copy) };
 }
 
 function uniqueSignatureIndex(

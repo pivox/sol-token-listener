@@ -6,6 +6,8 @@ import {
 } from '@solana/web3.js';
 import {
   BlockUnavailableError,
+  MAX_BLOCK_SIGNATURE_COUNT,
+  MAX_TRANSACTION_SIGNATURE_LENGTH,
   RpcTransientError,
   TransactionIndexNotFoundError,
   TransactionLocator,
@@ -153,6 +155,30 @@ void test('rejects a transaction returned from a different slot', async () => {
   );
 });
 
+void test('rejects a fetched transaction whose normalized primary signature differs', async () => {
+  await assert.rejects(
+    new TransactionLocator(rpc(response('different'), ['pump'])).locate(target('pump')),
+    TransactionIndexNotFoundError,
+  );
+});
+
+void test('normalizes once before checking a stateful raw slot against the observed slot', async () => {
+  const stateful = response('pump');
+  let reads = 0;
+  Object.defineProperty(stateful, 'slot', {
+    get: () => {
+      reads += 1;
+      return reads === 1 ? 42 : 43;
+    },
+  });
+
+  await assert.rejects(
+    new TransactionLocator(rpc(stateful, ['pump'])).locate(target('pump')),
+    TransactionNormalizationError,
+  );
+  assert.equal(reads, 1);
+});
+
 void test('rejects missing and duplicate block signature membership without inventing an index', async () => {
   for (const signatures of [['other'], ['pump', 'other', 'pump']]) {
     await assert.rejects(
@@ -216,6 +242,97 @@ void test('contains hostile accessors returned by the RPC port', async () => {
     (error: unknown) => error instanceof RpcTransientError
       && !String(error).includes('block-secret'),
   );
+});
+
+void test('rejects sparse, non-array and globally duplicate block signatures', async () => {
+  const sparse = new Array<string>(2);
+  sparse[1] = 'pump';
+  for (const signatures of [
+    sparse,
+    { 0: 'pump', length: 1 } as unknown as readonly string[],
+    ['pump', 'other', 'other'],
+  ]) {
+    await assert.rejects(
+      new TransactionLocator(rpc(response('pump'), signatures)).locate(target('pump')),
+      BlockUnavailableError,
+    );
+  }
+});
+
+void test('rejects block signature accessors without invoking them', async () => {
+  let entryReads = 0;
+  const accessorEntry = ['other', 'pump'];
+  Object.defineProperty(accessorEntry, '0', {
+    enumerable: true,
+    configurable: true,
+    get: () => { entryReads += 1; return 'other'; },
+  });
+  let lengthReads = 0;
+  const accessorLength = Object.create(Array.prototype) as Record<string, unknown>;
+  Object.defineProperty(accessorLength, 'length', {
+    get: () => { lengthReads += 1; return 1; },
+  });
+
+  for (const signatures of [
+    accessorEntry,
+    accessorLength as unknown as readonly string[],
+  ]) {
+    await assert.rejects(
+      new TransactionLocator(rpc(response('pump'), signatures)).locate(target('pump')),
+      BlockUnavailableError,
+    );
+  }
+  assert.equal(entryReads, 0);
+  assert.equal(lengthReads, 0);
+});
+
+void test('contains a proxy Infinity length trap with bounded reads', async () => {
+  let valueReads = 0;
+  const proxy = new Proxy(['pump'], {
+    get: (value, property, receiver) => {
+      valueReads += 1;
+      if (property === 'length') return Infinity;
+      if (property === '2') throw new Error('https://rpc.invalid/infinity-secret');
+      const result: unknown = Reflect.get(value, property, receiver);
+      return result;
+    },
+  });
+
+  await assert.rejects(
+    new TransactionLocator(rpc(response('pump'), proxy)).locate(target('pump')),
+    BlockUnavailableError,
+  );
+  assert.ok(valueReads > 0 && valueReads <= 4);
+});
+
+void test('bounds block signature count, signature bytes and unexpected own keys', async () => {
+  const oversizedCount = new Array<string>(MAX_BLOCK_SIGNATURE_COUNT + 1).fill('other');
+  oversizedCount[0] = 'pump';
+  const oversizedSignature = 'x'.repeat(MAX_TRANSACTION_SIGNATURE_LENGTH + 1);
+  const extraKey = ['pump'];
+  Object.defineProperty(extraKey, Symbol('hostile'), { value: 'secret' });
+
+  for (const signatures of [oversizedCount, ['pump', oversizedSignature], extraKey]) {
+    await assert.rejects(
+      new TransactionLocator(rpc(response('pump'), signatures)).locate(target('pump')),
+      BlockUnavailableError,
+    );
+  }
+});
+
+void test('accepts exact bounded dense block signatures without losing the canonical index', async () => {
+  const signatures = Array.from(
+    { length: MAX_BLOCK_SIGNATURE_COUNT },
+    (_unused, index) => `signature-${index}`,
+  );
+  const exactLengthTarget = 'p'.repeat(MAX_TRANSACTION_SIGNATURE_LENGTH);
+  signatures[MAX_BLOCK_SIGNATURE_COUNT - 1] = exactLengthTarget;
+
+  const located = await new TransactionLocator(rpc(
+    response(exactLengthTarget),
+    signatures,
+  )).locate(target(exactLengthTarget));
+  assert.equal(located.transactionIndex, MAX_BLOCK_SIGNATURE_COUNT - 1);
 });
 
 void test('preserves v0 lookups, inner stack heights, Token-2022 balances, failure and finality', async () => {
