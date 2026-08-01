@@ -35,6 +35,10 @@ import {
 } from '../api/cursor.js';
 import { DOMAIN_EVENT_TYPES } from '../domain/events.js';
 import { LAUNCH_STATUSES } from '../domain/launch-status.js';
+import {
+  LISTENER_RUNTIME_STATES,
+  type ListenerRuntimeState,
+} from '../domain/transaction-ingestion.js';
 import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
 import { QUALIFICATION_SIGNAL_KEYS } from '../domain/qualification.js';
 import { MAX_API_PAGE_LIMIT, type ApiProjectionRepository, type PageRequest } from '../ports/api-projection-repository.js';
@@ -59,6 +63,8 @@ export interface ApiProjectionPipelineState {
   readonly pumpfun: ApiHealth['pipeline']['pumpfun'];
   readonly pumpswap: ApiHealth['pipeline']['pumpswap'];
 }
+
+export type ApiProjectionPipelineStateProvider = () => ApiProjectionPipelineState;
 
 export interface ApiHolderProjectionLimits {
   readonly positions: number;
@@ -106,10 +112,12 @@ const NOT_AVAILABLE_HOLDERS: ApiHolders = Object.freeze({
 });
 
 export class PostgresApiProjectionRepository implements ApiProjectionRepository {
+  private readonly pipeline: ApiProjectionPipelineStateProvider;
+
   public constructor(
     private readonly database: Queryable = getDatabasePool(),
     private readonly clock: () => Date = () => new Date(),
-    private readonly pipeline: ApiProjectionPipelineState = {
+    pipeline: ApiProjectionPipelineState | ApiProjectionPipelineStateProvider = {
       httpAvailable: false,
       pumpfun: 'STOPPED',
       pumpswap: 'STOPPED',
@@ -127,6 +135,9 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     boundedLimit(holderLimits.clusters, 100);
     boundedLimit(holderLimits.clusterMembers, 100);
     boundedLimit(holderLimits.totalClusterMembers, 1_000);
+    this.pipeline = typeof pipeline === 'function'
+      ? pipeline
+      : (): ApiProjectionPipelineState => pipeline;
   }
 
   public async listLaunches(
@@ -289,6 +300,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
 
   public async getHealth(): Promise<ApiHealth> {
     const observedAt = validDate(this.clock());
+    const pipeline = pipelineState(this.pipeline);
     try {
       const database = await this.database.query('SELECT 1 AS available');
       const checkpoints = await this.database.query(
@@ -297,8 +309,10 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         [['launchpad', 'market']],
       );
       const heartbeats = await this.database.query(
-        `SELECT updated_at, last_http_slot, last_websocket_slot,
-            last_finalized_slot, last_signature, pending_transactions, active_sessions, payload
+        `SELECT updated_at, started_at, last_http_slot, last_websocket_slot,
+            last_finalized_slot, last_signature, pending_transactions, active_sessions,
+            runtime_state, subscriber_state, scanner_state, worker_state,
+            reconciler_state, leased_transactions
          FROM listener_heartbeats ORDER BY updated_at DESC LIMIT 1`,
       );
       const checkpoint = new Map(checkpoints.rows.map((item) => [text(item.checkpoint_key), decimal(item.slot)]));
@@ -311,12 +325,17 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       const stale = heartbeatAge === null
         || heartbeatAge < 0
         || heartbeatAge > HEARTBEAT_STALE_AFTER_MS;
-      const degraded = database.rows.length === 0 || stale || !this.pipeline.httpAvailable
-      || this.pipeline.pumpfun === 'DEGRADED' || this.pipeline.pumpfun === 'STOPPED'
-      || this.pipeline.pumpswap === 'DEGRADED' || this.pipeline.pumpswap === 'STOPPED';
-      return healthResult(observedAt, database.rows.length > 0, degraded, checkpoint, heartbeat, lagSlots, this.pipeline);
+      const runtimeDegraded = heartbeat.runtimeState !== 'RUNNING'
+        || heartbeat.subscriberState !== 'RUNNING'
+        || heartbeat.scannerState !== 'RUNNING'
+        || heartbeat.workerState !== 'RUNNING'
+        || heartbeat.reconcilerState !== 'RUNNING';
+      const degraded = database.rows.length === 0 || stale || runtimeDegraded || !pipeline.httpAvailable
+      || pipeline.pumpfun === 'DEGRADED' || pipeline.pumpfun === 'STOPPED'
+      || pipeline.pumpswap === 'DEGRADED' || pipeline.pumpswap === 'STOPPED';
+      return healthResult(observedAt, database.rows.length > 0, degraded, checkpoint, heartbeat, lagSlots, pipeline);
     } catch {
-      return healthResult(observedAt, false, true, new Map(), emptyHeartbeat(), null, this.pipeline);
+      return healthResult(observedAt, false, true, new Map(), emptyHeartbeat(), null, pipeline);
     }
   }
 
@@ -1070,28 +1089,47 @@ function pageLimit(value: number): number {
 export const HEARTBEAT_STALE_AFTER_MS = 30_000;
 
 function emptyHeartbeat(): ApiHealth['heartbeat'] {
-  return freeze({ startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
+  return freeze({ runtimeState: null, subscriberState: null, scannerState: null,
+    workerState: null, reconcilerState: null, backlogCount: null, leasedCount: null,
+    startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null });
 }
 
 function heartbeatFromRow(row: Record<string, unknown>): ApiHealth['heartbeat'] {
-  const payload = isRecord(row.payload) ? row.payload : {};
+  const runtimeState = listenerRuntimeState(row.runtime_state);
+  const subscriberState = listenerRuntimeState(row.subscriber_state);
+  const scannerState = listenerRuntimeState(row.scanner_state);
+  const workerState = listenerRuntimeState(row.worker_state);
+  const reconcilerState = listenerRuntimeState(row.reconciler_state);
+  const backlogCount = nonNegativeSafeNumber(row.pending_transactions);
+  const leasedCount = nonNegativeSafeNumber(row.leased_transactions);
+  if (leasedCount > backlogCount) throw invalid();
+  const startedAt = nullableTimestamp(row.started_at);
+  const updatedAt = timestamp(row.updated_at).toISOString();
+  if (startedAt !== null && Date.parse(startedAt) > Date.parse(updatedAt)) throw invalid();
   return freeze({
-    startedAt: canonicalTimestampOrNull(payload.startedAt),
-    updatedAt: timestamp(row.updated_at).toISOString(), lastHttpSlot: nullableDecimal(row.last_http_slot),
+    runtimeState, subscriberState, scannerState, workerState, reconcilerState,
+    backlogCount, leasedCount, startedAt, updatedAt,
+    lastHttpSlot: nullableDecimal(row.last_http_slot),
     lastWebsocketSlot: nullableDecimal(row.last_websocket_slot), lastFinalizedSlot: nullableDecimal(row.last_finalized_slot),
-    lastSignature: nullableText(row.last_signature), pendingTransactions: nullableSafeNumber(row.pending_transactions),
+    lastSignature: nullableText(row.last_signature), pendingTransactions: backlogCount,
     activeSessions: nullableSafeNumber(row.active_sessions),
   });
 }
 
-function canonicalTimestampOrNull(value: unknown): string | null {
-  if (value === null || value === undefined) return null;
-  try {
-    return timestamp(value).toISOString();
-  } catch {
-    return null;
+function listenerRuntimeState(value: unknown): ListenerRuntimeState {
+  if (!LISTENER_RUNTIME_STATES.includes(value as ListenerRuntimeState)) throw invalid();
+  return value as ListenerRuntimeState;
+}
+
+function pipelineState(provider: ApiProjectionPipelineStateProvider): ApiProjectionPipelineState {
+  const value = provider();
+  if (typeof value.httpAvailable !== 'boolean'
+    || !['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED'].includes(value.pumpfun)
+    || !['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED'].includes(value.pumpswap)) {
+    throw invalid();
   }
+  return value;
 }
 
 function healthResult(

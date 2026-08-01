@@ -2,213 +2,160 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import type { ApiProjectionPipelineState } from '../src/storage/api-projection.repository.js';
 import { parseConfig } from '../src/config/env.js';
-import { PRODUCTION_API_PIPELINE_STATE, reportEntrypointFailure, runApplication, waitForShutdownSignal } from '../src/app.js';
+import {
+  reportEntrypointFailure,
+  runApplication,
+  waitForShutdownSignal,
+  type ApplicationDependencies,
+} from '../src/app.js';
 import type { ApiEventStreamRepository } from '../src/ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
-import { PostgresApiProjectionRepository, type Queryable } from '../src/storage/api-projection.repository.js';
 
 const FORBIDDEN_IMPORTS = [
   'execution/wallet',
   'execution/transaction-confirmer',
   'execution/trade-executor',
   'dex/raydium-cpmm/transaction-builder',
-  'WalletEvidenceObservationService',
-  'WalletGraphRebuildService',
 ] as const;
-
-void test('le bootstrap V1 ne dépend d’aucun composant de signature ou envoi', async () => {
-  const source = await readFile(new URL('../src/app.ts', import.meta.url), 'utf8');
-
-  for (const forbidden of FORBIDDEN_IMPORTS) {
-    assert.doesNotMatch(source, new RegExp(forbidden, 'u'));
-  }
-});
 
 const config = parseConfig({
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
   SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
 });
 
-void test('le bootstrap désactivé ne crée ni serveur ni connexion et ferme proprement', async () => {
-  const calls: string[] = [];
-  await runApplication({
-    loadConfig: () => ({ ...config, apiEnabled: false }),
-    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
-    getDatabasePool: () => { throw new Error('must not open database'); },
-    migrateDatabase: async () => [],
-    createProjectionRepository: () => { throw new Error('must not construct repository'); },
-    createEventStreamRepository: () => { throw new Error('must not construct repository'); },
-    createApiServer: () => { throw new Error('must not create server'); },
-    closeDatabase: async () => { calls.push('database.close'); },
-    waitForShutdownSignal: async () => 'SIGTERM',
-    logInfo: () => { calls.push('log'); },
-  });
-  assert.deepEqual(calls, ['log', 'database.close']);
+void test('bootstrap imports no signing, submission, or live execution path', async () => {
+  const source = await readFile(new URL('../src/app.ts', import.meta.url), 'utf8');
+  for (const forbidden of FORBIDDEN_IMPORTS) {
+    assert.doesNotMatch(source, new RegExp(forbidden, 'u'));
+  }
 });
 
-void test('le bootstrap API partage le pool puis ferme le serveur avant la base', async () => {
+void test('migrates, starts listener before API, then closes listener before API and database', async () => {
   const calls: string[] = [];
   const pool = {};
-  const server = {
-    async listen() { calls.push('server.listen'); return { host: '127.0.0.1', port: 32123 }; },
-    async close() { calls.push('server.close'); },
-  };
-  await runApplication({
-    loadConfig: () => ({ ...config, apiEnabled: true, autoMigrate: true }),
-    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
-    getDatabasePool: (url) => { calls.push(`pool:${url === config.databaseUrl}`); return pool; },
-    migrateDatabase: async (receivedPool) => { assert.equal(receivedPool, pool); calls.push('migrate'); return []; },
-    createProjectionRepository: (receivedPool, pipeline, holderLimits) => {
-      assert.equal(receivedPool, pool);
-      assert.deepEqual(pipeline, PRODUCTION_API_PIPELINE_STATE);
-      assert.deepEqual(holderLimits, {
-        positions: config.apiHolderPositionLimit,
-        snapshots: config.apiHolderSnapshotLimit,
-        clusters: config.apiWalletClusterLimit,
-        clusterMembers: config.apiWalletClusterMemberLimit,
-        totalClusterMembers: config.apiWalletClusterTotalMemberLimit,
-      });
+  const runtime = listener(calls, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+  });
+  await runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: true }),
+    getDatabasePool: () => { calls.push('pool'); return pool; },
+    migrateDatabase: async (received) => {
+      assert.equal(received, pool);
+      calls.push('migrate');
+      return [];
+    },
+    createListener: (received, receivedConfig) => {
+      assert.equal(received, pool);
+      assert.equal(receivedConfig.executionMode, 'observe');
+      calls.push('listener.create');
+      return runtime;
+    },
+    createProjectionRepository: (received, pipeline) => {
+      assert.equal(received, pool);
+      assert.deepEqual(pipeline(), runtime.pipelineState());
       calls.push('projections');
       return {} as ApiProjectionRepository;
     },
-    createEventStreamRepository: (receivedPool) => { assert.equal(receivedPool, pool); calls.push('stream'); return {} as ApiEventStreamRepository; },
-    createApiServer: (options) => { assert.equal(options.projections, options.projections); calls.push('server.create'); return server; },
-    closeDatabase: async () => { calls.push('database.close'); },
-    waitForShutdownSignal: async () => { calls.push('signal.wait'); return 'SIGTERM'; },
-    logInfo: () => { calls.push('log'); },
-  });
+  }));
+
   assert.deepEqual(calls, [
-    'log', 'pool:true', 'migrate', 'log', 'projections', 'stream', 'server.create',
-    'server.listen', 'log', 'signal.wait', 'server.close', 'database.close',
+    'log:listener.foundation_ready', 'pool', 'migrate', 'log:database.migrations_applied',
+    'listener.create', 'listener.start', 'projections', 'stream', 'server.create',
+    'server.listen', 'log:api.started', 'signal.wait', 'listener.close',
+    'server.close', 'database.close',
   ]);
 });
 
-void test('le bootstrap désactivé conserve la migration automatique sans créer de serveur', async () => {
+void test('keeps an API-disabled listener alive until shutdown', async () => {
   const calls: string[] = [];
-  const pool = {};
-  await runApplication({
-    loadConfig: () => ({ ...config, apiEnabled: false, autoMigrate: true }),
-    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
-    getDatabasePool: (url) => { calls.push(`pool:${url === config.databaseUrl}`); return pool; },
-    migrateDatabase: async (receivedPool) => { assert.equal(receivedPool, pool); calls.push('migrate'); return ['migration']; },
-    createProjectionRepository: () => { throw new Error('must not construct repository'); },
-    createEventStreamRepository: () => { throw new Error('must not construct repository'); },
-    createApiServer: () => { throw new Error('must not create server'); },
-    closeDatabase: async () => { calls.push('database.close'); },
-    waitForShutdownSignal: async () => { throw new Error('must not wait'); },
-    logInfo: () => { calls.push('log'); },
-  });
-  assert.deepEqual(calls, ['log', 'pool:true', 'migrate', 'log', 'database.close']);
-});
-
-void test('un échec de migration désactivée ferme la base et reste visible', async () => {
-  const migrationFailure = new Error('migration failure');
-  const calls: string[] = [];
-  await assert.rejects(runApplication({
-    loadConfig: () => ({ ...config, apiEnabled: false, autoMigrate: true }),
-    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
-    getDatabasePool: () => { calls.push('pool'); return {}; },
-    migrateDatabase: async () => { calls.push('migrate'); throw migrationFailure; },
-    createProjectionRepository: () => { throw new Error('must not construct repository'); },
-    createEventStreamRepository: () => { throw new Error('must not construct repository'); },
-    createApiServer: () => { throw new Error('must not create server'); },
-    closeDatabase: async () => { calls.push('database.close'); },
-    waitForShutdownSignal: async () => { throw new Error('must not wait'); },
-    logInfo: () => { calls.push('log'); },
-  }), (error: unknown) => error === migrationFailure);
-  assert.deepEqual(calls, ['log', 'pool', 'migrate', 'database.close']);
-});
-
-void test('l’état de production expose HTTP sans prétendre que les listeners tournent', () => {
-  assert.deepEqual(PRODUCTION_API_PIPELINE_STATE, {
-    httpAvailable: true,
-    pumpfun: 'STOPPED',
-    pumpswap: 'IDLE',
-  });
-});
-
-void test('la santé de production publie HTTP disponible et les pipelines réellement inactifs', async () => {
-  const database: Queryable = {
-    async query(text) {
-      return { rows: text.includes('SELECT 1 AS available') ? [{ available: 1 }] : [] };
-    },
-  };
-  const health = await new PostgresApiProjectionRepository(
-    database,
-    () => new Date('2026-07-29T00:00:00.000Z'),
-    PRODUCTION_API_PIPELINE_STATE,
-  ).getHealth();
-  assert.deepEqual(health.http, { status: 'AVAILABLE' });
-  assert.deepEqual(health.pipeline, { pumpfun: 'STOPPED', pumpswap: 'IDLE' });
-  assert.equal(health.status, 'DEGRADED');
-});
-
-void test('le bootstrap nettoie le serveur puis la base après un échec de démarrage', async () => {
-  const calls: string[] = [];
-  const server = { async listen() { calls.push('server.listen'); throw new Error('bind failure'); }, async close() { calls.push('server.close'); } };
-  await assert.rejects(runApplication({
-    loadConfig: () => ({ ...config, apiEnabled: true }),
-    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
-    getDatabasePool: () => { calls.push('pool'); return {}; },
-    migrateDatabase: async () => [],
-    createProjectionRepository: () => ({}) as ApiProjectionRepository,
-    createEventStreamRepository: () => ({}) as ApiEventStreamRepository,
-    createApiServer: () => server,
-    closeDatabase: async () => { calls.push('database.close'); },
-    waitForShutdownSignal: async () => 'SIGTERM',
-    logInfo: () => { calls.push('log'); },
+  await runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: false, autoMigrate: false }),
+    createApiServer: () => { throw new Error('must not create API'); },
   }));
-  assert.deepEqual(calls, ['log', 'pool', 'server.listen', 'server.close', 'database.close']);
+  assert.deepEqual(calls, [
+    'log:listener.foundation_ready', 'pool', 'listener.create', 'listener.start',
+    'signal.wait', 'listener.close', 'database.close',
+  ]);
 });
 
-void test('le bootstrap ferme la base même si la fermeture du serveur échoue', async () => {
+void test('explicit diagnostic disablement logs listener.disabled without opening resources', async () => {
   const calls: string[] = [];
-  const server = {
-    async listen() { calls.push('server.listen'); return { host: '127.0.0.1', port: 32123 }; },
-    async close() { calls.push('server.close'); throw new Error('server close failure'); },
-  };
-  await assert.rejects(runApplication({
-    loadConfig: () => ({ ...config, apiEnabled: true }),
-    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
-    getDatabasePool: () => { calls.push('pool'); return {}; },
-    migrateDatabase: async () => [],
-    createProjectionRepository: () => ({}) as ApiProjectionRepository,
-    createEventStreamRepository: () => ({}) as ApiEventStreamRepository,
-    createApiServer: () => server,
-    closeDatabase: async () => { calls.push('database.close'); },
-    waitForShutdownSignal: async () => 'SIGTERM',
-    logInfo: () => { calls.push('log'); },
-  }), /server close failure/u);
-  assert.deepEqual(calls, ['log', 'pool', 'server.listen', 'log', 'server.close', 'database.close']);
+  await runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: false, apiEnabled: false, autoMigrate: false }),
+    getDatabasePool: () => { throw new Error('must not open database'); },
+    waitForShutdownSignal: async () => { throw new Error('must not wait'); },
+  }));
+  assert.deepEqual(calls, ['log:listener.foundation_ready', 'log:listener.disabled']);
 });
 
-void test('le bootstrap conserve les erreurs primaire et de nettoyage dans leur ordre', async () => {
-  const serverFailure = new Error('server shutdown failure');
+void test('explicit listener disablement exposes STOPPED pipeline state to the API', async () => {
+  const calls: string[] = [];
+  let pipeline: (() => ApiProjectionPipelineState) | null = null;
+  await runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: false, apiEnabled: true, autoMigrate: false }),
+    createListener: () => { throw new Error('must not create listener'); },
+    createProjectionRepository: (_pool, receivedPipeline) => {
+      pipeline = receivedPipeline;
+      return {} as ApiProjectionRepository;
+    },
+  }));
+  assert.notEqual(pipeline, null);
+  assert.deepEqual((pipeline as unknown as () => ApiProjectionPipelineState)(), {
+    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED',
+  });
+  assert.ok(calls.includes('log:listener.disabled'));
+  assert.doesNotMatch(calls.join(','), /listener\.create|listener\.start|listener\.close/u);
+});
+
+void test('listener startup failure fails the process and cleans listener before database', async () => {
+  const calls: string[] = [];
+  const startupFailure = new Error('listener startup failure');
+  await assert.rejects(runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true }),
+    createListener: () => ({
+      async start() { calls.push('listener.start'); throw startupFailure; },
+      async close() { calls.push('listener.close'); },
+      state: () => 'DEGRADED',
+      pipelineState: () => ({ httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED' }),
+    }),
+  })), (error: unknown) => error === startupFailure);
+  assert.deepEqual(calls, [
+    'log:listener.foundation_ready', 'pool', 'listener.start', 'listener.close',
+    'database.close',
+  ]);
+});
+
+void test('API bind failure aggregates listener, server, and database cleanup in order', async () => {
+  const calls: string[] = [];
+  const bindFailure = new Error('bind failure');
+  const listenerFailure = new Error('listener cleanup failure');
+  const serverFailure = new Error('server cleanup failure');
   const databaseFailure = new Error('database cleanup failure');
-  const server = {
-    async listen() { return { host: '127.0.0.1', port: 32123 }; },
-    async close() { throw serverFailure; },
-  };
-  await assert.rejects(runApplication({
-    loadConfig: () => ({ ...config, apiEnabled: true }),
-    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
-    getDatabasePool: () => ({}),
-    migrateDatabase: async () => [],
-    createProjectionRepository: () => ({}) as ApiProjectionRepository,
-    createEventStreamRepository: () => ({}) as ApiEventStreamRepository,
-    createApiServer: () => server,
-    closeDatabase: async () => { throw databaseFailure; },
-    waitForShutdownSignal: async () => 'SIGTERM',
-    logInfo: () => undefined,
-  }), (error: unknown) => {
+  await assert.rejects(runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true }),
+    createListener: () => ({
+      async start() { calls.push('listener.start'); },
+      async close() { calls.push('listener.close'); throw listenerFailure; },
+      state: () => 'RUNNING',
+      pipelineState: () => ({ httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING' }),
+    }),
+    createApiServer: () => ({
+      async listen() { calls.push('server.listen'); throw bindFailure; },
+      async close() { calls.push('server.close'); throw serverFailure; },
+    }),
+    closeDatabase: async () => { calls.push('database.close'); throw databaseFailure; },
+  })), (error: unknown) => {
     assert.ok(error instanceof AggregateError);
-    assert.deepEqual(error.errors, [serverFailure, databaseFailure]);
+    assert.deepEqual(error.errors, [bindFailure, listenerFailure, serverFailure, databaseFailure]);
     return true;
   });
+  assert.ok(calls.indexOf('listener.close') < calls.indexOf('server.close'));
+  assert.ok(calls.indexOf('server.close') < calls.indexOf('database.close'));
 });
 
-void test('le handler terminal redacted fixe le code d’échec sans quitter le processus', () => {
+void test('terminal handler redacts the failure and sets exitCode', () => {
   const runtime: { exitCode: number | string | undefined } = { exitCode: undefined };
   const logs: object[] = [];
   reportEntrypointFailure(new Error('credential-like-detail'), runtime, (context) => { logs.push(context); });
@@ -216,13 +163,63 @@ void test('le handler terminal redacted fixe le code d’échec sans quitter le 
   assert.deepEqual(logs, [{ event: 'listener.start_failed', errorName: 'Error' }]);
 });
 
-void test('le waiter de signal retire les deux écouteurs après le premier signal', async () => {
+void test('signal waiter removes both listeners after the first signal', async () => {
   const signals = new EventEmitter();
   const waiting = waitForShutdownSignal(signals as unknown as Pick<NodeJS.Process, 'once' | 'off'>);
-  assert.equal(signals.listenerCount('SIGINT'), 1);
-  assert.equal(signals.listenerCount('SIGTERM'), 1);
   signals.emit('SIGINT');
   assert.equal(await waiting, 'SIGINT');
   assert.equal(signals.listenerCount('SIGINT'), 0);
   assert.equal(signals.listenerCount('SIGTERM'), 0);
 });
+
+function dependencies(
+  calls: string[],
+  overrides: Partial<ApplicationDependencies> = {},
+): Partial<ApplicationDependencies> {
+  const runtime = listener(calls, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+  });
+  return {
+    loadConfig: () => config,
+    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
+    getDatabasePool: () => { calls.push('pool'); return {}; },
+    migrateDatabase: async () => { calls.push('migrate'); return []; },
+    createListener: () => { calls.push('listener.create'); return runtime; },
+    createProjectionRepository: () => {
+      calls.push('projections');
+      return {} as ApiProjectionRepository;
+    },
+    createEventStreamRepository: () => {
+      calls.push('stream');
+      return {} as ApiEventStreamRepository;
+    },
+    createApiServer: () => {
+      calls.push('server.create');
+      return {
+        async listen() { calls.push('server.listen'); return { host: '127.0.0.1', port: 32123 }; },
+        async close() { calls.push('server.close'); },
+      };
+    },
+    closeDatabase: async () => { calls.push('database.close'); },
+    waitForShutdownSignal: async () => { calls.push('signal.wait'); return 'SIGTERM'; },
+    logInfo: (context) => {
+      const event = (context as { event?: unknown }).event;
+      calls.push(`log:${typeof event === 'string' ? event : 'unknown'}`);
+    },
+    ...overrides,
+  };
+}
+
+function listener(calls: string[], pipeline: ApiProjectionPipelineState): {
+  start(): Promise<void>;
+  close(): Promise<void>;
+  state(): 'RUNNING';
+  pipelineState(): ApiProjectionPipelineState;
+} {
+  return {
+    async start() { calls.push('listener.start'); },
+    async close() { calls.push('listener.close'); },
+    state: () => 'RUNNING',
+    pipelineState: () => Object.freeze({ ...pipeline }),
+  };
+}

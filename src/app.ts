@@ -1,5 +1,6 @@
 import { pathToFileURL } from 'node:url';
 import type { AppConfig } from './config/env.js';
+import { createProductionListenerRuntime } from './application/production-listener-factory.js';
 import { loadConfig } from './config/env.js';
 import { ApiServer, type ApiListeningAddress, type ApiServerOptions } from './interfaces/http/api-server.js';
 import { createQualificationEngine } from './qualification/qualification-engine.js';
@@ -8,19 +9,15 @@ import {
   PostgresApiProjectionRepository,
   type ApiHolderProjectionLimits,
   type ApiProjectionPipelineState,
+  type ApiProjectionPipelineStateProvider,
 } from './storage/api-projection.repository.js';
+import type { ListenerRuntime } from './ports/listener-runtime.js';
 import type { ApiEventStreamRepository } from './ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from './ports/api-projection-repository.js';
 import { closeDatabase, getDatabasePool, migrateDatabase } from './storage/database.js';
 import { logger } from './utils/logger.js';
 
 type ApplicationPool = unknown;
-
-export const PRODUCTION_API_PIPELINE_STATE: ApiProjectionPipelineState = Object.freeze({
-  httpAvailable: true,
-  pumpfun: 'STOPPED',
-  pumpswap: 'IDLE',
-});
 
 export interface ApplicationServer {
   listen(): Promise<ApiListeningAddress>;
@@ -32,9 +29,10 @@ export interface ApplicationDependencies {
   readonly createQualificationEngine: (config: AppConfig) => Readonly<{ minimumTotalScore: number }>;
   readonly getDatabasePool: (databaseUrl: string) => ApplicationPool;
   readonly migrateDatabase: (pool: ApplicationPool) => Promise<readonly string[]>;
+  readonly createListener: (pool: ApplicationPool, config: AppConfig) => ListenerRuntime;
   readonly createProjectionRepository: (
     pool: ApplicationPool,
-    pipeline: ApiProjectionPipelineState,
+    pipeline: ApiProjectionPipelineStateProvider,
     holderLimits: ApiHolderProjectionLimits,
   ) => ApiProjectionRepository;
   readonly createEventStreamRepository: (pool: ApplicationPool) => ApiEventStreamRepository;
@@ -47,19 +45,32 @@ export interface ApplicationDependencies {
 export async function runApplication(overrides: Partial<ApplicationDependencies> = {}): Promise<void> {
   const dependencies: ApplicationDependencies = { ...productionDependencies, ...overrides };
   let server: ApplicationServer | null = null;
+  let listener: ListenerRuntime | null = null;
+  let databaseOpened = false;
   let primaryError: Readonly<{ value: unknown }> | null = null;
   try {
     const config = dependencies.loadConfig();
     const qualificationEngine = dependencies.createQualificationEngine(config);
     logFoundation(dependencies.logInfo, config, qualificationEngine.minimumTotalScore);
-    if (config.apiEnabled || config.autoMigrate) {
+    if (!config.listenerEnabled) {
+      dependencies.logInfo({ event: 'listener.disabled' }, 'Listener réseau explicitement désactivé.');
+    }
+    if (config.listenerEnabled || config.apiEnabled || config.autoMigrate) {
       const pool = dependencies.getDatabasePool(config.databaseUrl);
+      databaseOpened = true;
       if (config.autoMigrate) {
         const appliedMigrations = await dependencies.migrateDatabase(pool);
         dependencies.logInfo({ event: 'database.migrations_applied', count: appliedMigrations.length }, 'Migrations PostgreSQL appliquées.');
       }
+      if (config.listenerEnabled) {
+        listener = dependencies.createListener(pool, config);
+        await listener.start();
+      }
       if (config.apiEnabled) {
-        const projections = dependencies.createProjectionRepository(pool, PRODUCTION_API_PIPELINE_STATE, {
+        const pipeline = listener === null
+          ? disabledPipelineState
+          : (): ApiProjectionPipelineState => listener?.pipelineState() ?? disabledPipelineState();
+        const projections = dependencies.createProjectionRepository(pool, pipeline, {
           positions: config.apiHolderPositionLimit,
           snapshots: config.apiHolderSnapshotLimit,
           clusters: config.apiWalletClusterLimit,
@@ -84,20 +95,22 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
           apiEnabled: config.apiEnabled, executionMode: config.executionMode,
           transactionSubmissionEnabled: false,
         }, 'API publique d’observation disponible.');
-        await dependencies.waitForShutdownSignal();
-        const startedServer = server;
-        server = null;
-        await startedServer.close();
       }
+      if (config.listenerEnabled || config.apiEnabled) await dependencies.waitForShutdownSignal();
     }
   } catch (error) {
     primaryError = { value: error };
   }
   const cleanupErrors: unknown[] = [];
+  if (listener !== null) {
+    try { await listener.close(); } catch (error) { cleanupErrors.push(error); }
+  }
   if (server !== null) {
     try { await server.close(); } catch (error) { cleanupErrors.push(error); }
   }
-  try { await dependencies.closeDatabase(); } catch (error) { cleanupErrors.push(error); }
+  if (databaseOpened) {
+    try { await dependencies.closeDatabase(); } catch (error) { cleanupErrors.push(error); }
+  }
   if (primaryError !== null) {
     if (cleanupErrors.length === 0) throw primaryError.value;
     throw new AggregateError([primaryError.value, ...cleanupErrors], 'Application shutdown failed.');
@@ -129,6 +142,10 @@ const productionDependencies: ApplicationDependencies = {
   createQualificationEngine,
   getDatabasePool,
   migrateDatabase: async (pool) => migrateDatabase({ pool: pool as ReturnType<typeof getDatabasePool> }),
+  createListener: (pool, config) => createProductionListenerRuntime(
+    config,
+    pool as ReturnType<typeof getDatabasePool>,
+  ),
   createProjectionRepository: (pool, pipeline, holderLimits) => new PostgresApiProjectionRepository(
     pool as ConstructorParameters<typeof PostgresApiProjectionRepository>[0],
     () => new Date(),
@@ -154,10 +171,18 @@ function logFoundation(
     paperQuoteMintAllowlist: config.paperQuoteMintAllowlist,
     qualificationRuleSetStatus: config.qualificationRuleSetStatus,
     qualificationMinimumScore: minimumTotalScore,
-    pumpFunListenerActive: false,
+    pumpFunListenerActive: config.listenerEnabled,
     pumpSwapPipelineAvailable: true,
     transactionSubmissionEnabled: false,
-  }, 'Pipeline PumpSwap disponible mais non abonné; listener réseau inactif.');
+  }, 'Socle d’observation Pump prêt selon la configuration du listener.');
+}
+
+function disabledPipelineState(): ApiProjectionPipelineState {
+  return Object.freeze({
+    httpAvailable: true,
+    pumpfun: 'STOPPED',
+    pumpswap: 'STOPPED',
+  });
 }
 
 const entrypoint = process.argv[1];
