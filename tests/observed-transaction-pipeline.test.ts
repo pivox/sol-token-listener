@@ -131,20 +131,22 @@ function launchWithNumericLeaves(
   });
 }
 
-function visitedSnapshotValues(value: unknown, memo = new WeakSet()): number {
+function visitedSnapshotValues(value: unknown, ancestors = new WeakSet()): number {
   if (typeof value !== 'object' || value === null) return 1;
-  if (memo.has(value)) return 1;
-  memo.add(value);
+  if (ancestors.has(value)) throw new TypeError('cyclic test fixture');
+  ancestors.add(value);
   let count = 1;
   if (Array.isArray(value)) {
     for (const nested of value as readonly unknown[]) {
-      count += visitedSnapshotValues(nested, memo);
+      count += visitedSnapshotValues(nested, ancestors);
     }
+    ancestors.delete(value);
     return count;
   }
   for (const nested of Object.values(value as Readonly<Record<string, unknown>>)) {
-    count += visitedSnapshotValues(nested, memo);
+    count += visitedSnapshotValues(nested, ancestors);
   }
+  ancestors.delete(value);
   return count;
 }
 
@@ -779,6 +781,59 @@ void test('enforces exact aggregate serialized bytes including numeric leaves an
     assert.equal(error.stage, 'reload_active_events');
     assert.equal(error.message.includes('serialized'), false);
     assert.equal('cause' in error, false);
+    return true;
+  });
+  assert.deepEqual(rejected.order, ['tracked', 'launchpad', 'reload']);
+});
+
+void test('charges a shared event subtree for every logical occurrence', async () => {
+  const shared = launchWithNumericLeaves('shared-node-bound', 50_000);
+  assert.ok(visitedSnapshotValues([shared]) < MAX_SNAPSHOT_NODES);
+  const h = harness({ activeEvents: [shared, shared] });
+  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
+    assert.equal('cause' in error, false);
+    return true;
+  });
+  assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload']);
+});
+
+void test('rejects 4096 shared padded events before funding without expanding them for final serialization', async () => {
+  const shared = launchWithNumericLeaves(
+    'shared-serialized-bound',
+    0,
+    0,
+    'x'.repeat(MAX_CANONICAL_JSON_STRING_BYTES),
+  );
+  const h = harness({
+    activeEvents: new Array<LaunchpadObservationEventV1>(
+      MAX_OBSERVED_PIPELINE_ITEMS,
+    ).fill(shared),
+  });
+  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
+    assert.equal('cause' in error, false);
+    return true;
+  });
+  assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload']);
+});
+
+void test('clones shared events below the limits, collapses their IDs, and still rejects cycles', async () => {
+  const shared = launchWithNumericLeaves('shared-small', 4, 7, 'padding');
+  const accepted = harness({ activeEvents: [shared, shared] });
+  const result = await accepted.pipeline.process(accepted.tx);
+  assert.equal(result.activeEventCount, 1);
+
+  const cyclic: unknown[] = [];
+  cyclic.push(cyclic);
+  const rejected = harness({
+    activeEvents: cyclic as readonly LaunchpadObservationEventV1[],
+  });
+  await assert.rejects(rejected.pipeline.process(rejected.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
     return true;
   });
   assert.deepEqual(rejected.order, ['tracked', 'launchpad', 'reload']);

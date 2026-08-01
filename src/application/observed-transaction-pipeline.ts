@@ -10,9 +10,11 @@ import { createSolanaObservedTransaction } from '../solana/rpc/observed-transact
 import type { SolanaObservedTransaction } from '../solana/rpc/observed-transaction.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import {
+  BIGINT_JSON_MARKER,
   MAX_CANONICAL_JSON_DEPTH,
   MAX_CANONICAL_JSON_STRING_BYTES,
   MAX_CANONICAL_JSON_TEXT_BYTES,
+  MAX_SERIALIZED_BIGINT_DIGITS,
   stringifyJson,
 } from '../utils/json.js';
 
@@ -180,8 +182,9 @@ interface ActiveContext {
 }
 
 function snapshotActiveContext(value: unknown): ActiveContext {
-  const snapshot = deepSnapshot(value, 0, snapshotState());
-  assertSerializedSnapshotBound(snapshot);
+  const state = snapshotState();
+  const snapshot = deepSnapshot(value, 0, state);
+  assertSerializedSnapshotBound(snapshot, state.serializedBytes);
   if (!Array.isArray(snapshot)) throw new TypeError('active events must be an array');
   const byId = new Map<string, LaunchpadObservationEventV1>();
   const events: LaunchpadObservationEventV1[] = [];
@@ -272,12 +275,12 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
 interface SnapshotState {
   nodes: number;
   textBytes: number;
+  serializedBytes: number;
   readonly ancestors: WeakSet<object>;
-  readonly memo: WeakMap<object, unknown>;
 }
 
 function snapshotState(): SnapshotState {
-  return { nodes: 0, textBytes: 0, ancestors: new WeakSet(), memo: new WeakMap() };
+  return { nodes: 0, textBytes: 0, serializedBytes: 0, ancestors: new WeakSet() };
 }
 
 function deepSnapshot(value: unknown, depth: number, state: SnapshotState): unknown {
@@ -290,29 +293,43 @@ function deepSnapshot(value: unknown, depth: number, state: SnapshotState): unkn
   if (depth > MAX_CANONICAL_JSON_DEPTH) throw new RangeError('snapshot too deep');
   if (typeof value === 'string') {
     accountText(value, state);
+    accountSerialized(jsonStringBytes(value), state);
     return value;
   }
-  if (value === null || typeof value === 'boolean') return value;
+  if (value === null) {
+    accountSerialized(4, state);
+    return value;
+  }
+  if (typeof value === 'boolean') {
+    accountSerialized(value ? 4 : 5, state);
+    return value;
+  }
   if (typeof value === 'bigint') {
-    if (value.toString().replace(/^-/, '').length > 78) throw new RangeError('bigint too large');
+    const decimal = value.toString();
+    if (decimal.replace(/^-/, '').length > MAX_SERIALIZED_BIGINT_DIGITS) {
+      throw new RangeError('bigint too large');
+    }
+    accountSerialized(
+      2 + jsonStringBytes(BIGINT_JSON_MARKER) + 1 + jsonStringBytes(decimal),
+      state,
+    );
     return value;
   }
   if (typeof value === 'number') {
     if (!Number.isSafeInteger(value) || Object.is(value, -0)) throw new TypeError('invalid number');
+    accountSerialized(String(value).length, state);
     return value;
   }
   if (typeof value !== 'object') throw new TypeError('invalid snapshot value');
   if (state.ancestors.has(value)) throw new TypeError('cyclic snapshot');
-  const memoized = state.memo.get(value);
-  if (memoized !== undefined) return memoized;
   const prototype: unknown = Reflect.getPrototypeOf(value);
   state.ancestors.add(value);
   try {
     if (Array.isArray(value)) {
       if (prototype !== Array.prototype) throw new TypeError('invalid array prototype');
       const { length, descriptors } = arrayDescriptors(value);
+      accountSerialized(2 + Math.max(0, length - 1), state);
       const result: unknown[] = [];
-      state.memo.set(value, result);
       for (let index = 0; index < length; index += 1) {
         const descriptor = descriptors[index];
         if (descriptor === undefined) throw new TypeError('sparse array');
@@ -320,7 +337,6 @@ function deepSnapshot(value: unknown, depth: number, state: SnapshotState): unkn
         result.push(deepSnapshot(descriptor.value, depth + 1, state));
       }
       Object.freeze(result);
-      state.memo.set(value, result);
       return result;
     }
     if (prototype !== Object.prototype && prototype !== null) {
@@ -328,11 +344,12 @@ function deepSnapshot(value: unknown, depth: number, state: SnapshotState): unkn
     }
     const keys = Reflect.ownKeys(value);
     if (keys.some((key) => typeof key === 'symbol')) throw new TypeError('symbols are invalid');
+    accountSerialized(2 + Math.max(0, keys.length - 1), state);
     const result: Record<string, unknown> = {};
-    state.memo.set(value, result);
     for (const key of keys) {
       if (typeof key !== 'string') throw new TypeError('invalid key');
       accountText(key, state);
+      accountSerialized(jsonStringBytes(key) + 1, state);
       const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
       if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
         throw new TypeError('invalid property');
@@ -343,18 +360,59 @@ function deepSnapshot(value: unknown, depth: number, state: SnapshotState): unkn
       });
     }
     Object.freeze(result);
-    state.memo.set(value, result);
     return result;
   } finally {
     state.ancestors.delete(value);
   }
 }
 
-function assertSerializedSnapshotBound(value: unknown): void {
+function assertSerializedSnapshotBound(value: unknown, expectedBytes: number): void {
   const serialized = stringifyJson(value);
-  if (Buffer.byteLength(serialized, 'utf8') > MAX_CANONICAL_JSON_TEXT_BYTES) {
+  if (Buffer.byteLength(serialized, 'utf8') !== expectedBytes) {
+    throw new TypeError('snapshot serialization size mismatch');
+  }
+}
+
+function accountSerialized(bytes: number, state: SnapshotState): void {
+  if (state.serializedBytes + bytes > MAX_CANONICAL_JSON_TEXT_BYTES) {
     throw new RangeError('snapshot serialization too large');
   }
+  state.serializedBytes += bytes;
+}
+
+function jsonStringBytes(value: string): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit === 0x22 || codeUnit === 0x5c) {
+      bytes += 2;
+    } else if (codeUnit <= 0x1f) {
+      bytes += codeUnit === 0x08
+        || codeUnit === 0x09
+        || codeUnit === 0x0a
+        || codeUnit === 0x0c
+        || codeUnit === 0x0d
+        ? 2
+        : 6;
+    } else if (codeUnit <= 0x7f) {
+      bytes += 1;
+    } else if (codeUnit <= 0x7ff) {
+      bytes += 2;
+    } else if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const following = value.charCodeAt(index + 1);
+      if (following >= 0xdc00 && following <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 6;
+      }
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      bytes += 6;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
 }
 
 function arrayDescriptors(value: object): {
