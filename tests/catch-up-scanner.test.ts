@@ -64,6 +64,19 @@ void test('uses before pagination and stops at an exact checkpoint boundary mid-
   ]);
 });
 
+void test('uses the scan clock for observations when RPC block time is in the future', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('future-block-time', 11, 'confirmed', 90_000)]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  });
+  const inbox = new FakeInbox();
+
+  await scanner(source, inbox).scan();
+
+  assert.equal(inbox.enqueued[0]?.observedAtMs, 9_000);
+  assert.deepEqual(inbox.stored, [checkpoint('launchpad', 'future-block-time', 11, 9_000)]);
+});
+
 void test('rejects a repeated signature before accepting it as the checkpoint boundary', async () => {
   const source = new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('same', 6), sig('same', 5)]],
@@ -158,7 +171,7 @@ void test('reconciles shared finality and nullable block time in either scan ord
     assert.equal(inbox.enqueued[0]?.confirmationStatus,
       launchpad.confirmationStatus === 'finalized' || market.confirmationStatus === 'finalized'
         ? 'finalized' : 'confirmed');
-    assert.equal(inbox.enqueued[0]?.observedAtMs, 2_000);
+    assert.equal(inbox.enqueued[0]?.observedAtMs, 9_000);
   }
 });
 
@@ -371,8 +384,13 @@ function rpcSig(signature: string, slot: number, confirmationStatus = 'confirmed
   return { signature, slot, err: null, memo: null, blockTime, confirmationStatus };
 }
 
-function checkpoint(key: 'launchpad' | 'market', signature: string, slot: number): ProcessingCheckpoint {
-  return Object.freeze({ key, signature, slot: BigInt(slot), updatedAtMs: 100 });
+function checkpoint(
+  key: 'launchpad' | 'market',
+  signature: string,
+  slot: number,
+  updatedAtMs = 100,
+): ProcessingCheckpoint {
+  return Object.freeze({ key, signature, slot: BigInt(slot), updatedAtMs });
 }
 
 class FakeSource implements CatchUpSource {

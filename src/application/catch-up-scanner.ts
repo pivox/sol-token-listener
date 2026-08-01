@@ -122,7 +122,7 @@ export class CatchUpScanner {
         source: 'CATCH_UP',
         programIds: discovery.programIds,
         confirmationStatus: discovery.confirmationStatus,
-        observedAtMs: discovery.blockTimeMs ?? observedAtMs,
+        observedAtMs,
       });
       try {
         await this.repository.enqueue(notification);

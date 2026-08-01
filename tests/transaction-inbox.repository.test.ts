@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
 import pg from 'pg';
+import { CatchUpScanner } from '../src/application/catch-up-scanner.js';
 import type {
   IngestionFailure,
   RuntimeHeartbeat,
@@ -10,6 +11,8 @@ import type {
 } from '../src/domain/transaction-ingestion.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { restoreNormalizedTransactionSnapshot } from '../src/domain/transaction-ingestion.js';
+import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
+import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import {
   PostgresTransactionInboxRepository,
@@ -19,6 +22,44 @@ import {
 } from '../src/storage/transaction-inbox.repository.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
+
+void test('processes a catch-up row at scan time when blockchain time is in the future', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const scanAtMs = Date.now();
+    const futureBlockTimeMs = scanAtMs + 86_400_000;
+    const scanner = new CatchUpScanner({
+      async list(programId: string) {
+        if (programId === PUMP_PROGRAM_ID) {
+          return [Object.freeze({
+            signature: 'future-block-time', slot: 9n, confirmationStatus: 'confirmed' as const,
+            blockTimeMs: futureBlockTimeMs,
+          })];
+        }
+        assert.equal(programId, PUMPSWAP_PROGRAM_ID);
+        return [];
+      },
+    }, repository, { pageSize: 2, maxPages: 2, now: () => scanAtMs });
+
+    await scanner.scan();
+
+    assert.equal(new Date((await row(pool, 'future-block-time')).observed_at).getTime(), scanAtMs);
+    assert.deepEqual(await repository.readCheckpoint('launchpad'), Object.freeze({
+      key: 'launchpad', signature: 'future-block-time', slot: 9n, updatedAtMs: scanAtMs,
+    }));
+    const claim = await repository.claim(scanAtMs, 120);
+    assert.ok(claim);
+    await repository.saveSnapshot('future-block-time', claim.leaseToken, {
+      ...normalized('future-block-time', 9n), blockTimeMs: futureBlockTimeMs,
+    });
+    assert.equal(
+      new Date((await row(pool, 'future-block-time')).blockchain_time).getTime(),
+      futureBlockTimeMs,
+    );
+    await repository.markProcessed('future-block-time', claim.leaseToken, 'confirmed');
+    assert.equal((await row(pool, 'future-block-time')).processing_status, 'PROCESSED');
+  });
+});
 
 void test('merges discoveries, rejects identity contradictions, and claims concurrently without duplication', async (context) => {
   await withDatabase(context, async (pool) => {
