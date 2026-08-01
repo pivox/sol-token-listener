@@ -16,6 +16,7 @@ import {
   type RuntimeHeartbeat,
   type TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
+import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 
 const observedAtMs = 1_720_000_000_000;
 
@@ -91,6 +92,93 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
   assert.ok(Number.isSafeInteger(heartbeat.updatedAtMs));
 });
 
+void test('accepts a deeply frozen snapshot whose earlier finality can advance on the claim', () => {
+  const snapshot = normalizedSnapshot({ confirmationStatus: 'CONFIRMED' });
+  const claim: ClaimedTransaction = Object.freeze({
+    signature: snapshot.signature,
+    slot: snapshot.slot,
+    confirmationStatus: 'finalized',
+    attempts: 1,
+    leaseToken: 'opaque-token',
+    leaseExpiresAtMs: observedAtMs + 120_000,
+    normalizedTransaction: snapshot,
+  });
+
+  assert.doesNotThrow(() => { assertValidClaimedTransaction(claim); });
+});
+
+void test('rejects empty and malformed normalized transaction snapshots', () => {
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(Object.freeze({}))); },
+    /snapshot|signature/u,
+  );
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(Object.freeze({
+      ...normalizedSnapshot(),
+      feeLamports: 1,
+    }))); },
+    /feeLamports|bigint/u,
+  );
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(normalizedSnapshot({ transactionIndex: -1 }))); },
+    /transactionIndex|cursor/u,
+  );
+});
+
+void test('rejects snapshots whose durable identity differs from the claim', () => {
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(normalizedSnapshot({ signature: 'other' }))); },
+    /signature|identity/u,
+  );
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(normalizedSnapshot({ slot: 43n }))); },
+    /slot|identity/u,
+  );
+});
+
+void test('rejects snapshot finality regressions and terminal conflicts', () => {
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(
+      normalizedSnapshot({ confirmationStatus: 'FINALIZED' }),
+      { confirmationStatus: 'confirmed' },
+    )); },
+    /confirmation|finality/u,
+  );
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(
+      normalizedSnapshot({ confirmationStatus: 'FINALIZED' }),
+      { confirmationStatus: 'orphaned' },
+    )); },
+    /confirmation|finality/u,
+  );
+});
+
+void test('rejects mutable nested normalized transaction collections', () => {
+  const canonical = normalizedSnapshot();
+  const mutableAccountKeys = Object.freeze({
+    ...canonical,
+    accountKeys: [...canonical.accountKeys],
+  });
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(mutableAccountKeys)); },
+    /accountKeys|frozen/u,
+  );
+
+  const mutableInstructionAccounts = Object.freeze({
+    ...canonical,
+    instructions: Object.freeze([
+      Object.freeze({
+        ...canonical.instructions[0],
+        accounts: ['account'],
+      }),
+    ]),
+  });
+  assert.throws(
+    () => { assertValidClaimedTransaction(claimWithSnapshot(mutableInstructionAccounts)); },
+    /accounts|frozen/u,
+  );
+});
+
 void test('rejects mutable contracts, number slots and non-integer millisecond times', () => {
   const notification = Object.freeze({
     signature: 'signature',
@@ -149,3 +237,62 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
     /code/u,
   );
 });
+
+function claimWithSnapshot(
+  normalizedTransaction: unknown,
+  overrides: Readonly<Partial<ClaimedTransaction>> = {},
+): ClaimedTransaction {
+  return Object.freeze({
+    signature: 'signature',
+    slot: 42n,
+    confirmationStatus: 'confirmed',
+    attempts: 0,
+    leaseToken: 'opaque-token',
+    leaseExpiresAtMs: observedAtMs + 120_000,
+    normalizedTransaction,
+    ...overrides,
+  }) as ClaimedTransaction;
+}
+
+function normalizedSnapshot(
+  overrides: Readonly<Partial<NormalizedTransaction>> = {},
+): Readonly<NormalizedTransaction> {
+  const instruction = Object.freeze({
+    programId: 'program',
+    accounts: Object.freeze(['account']),
+    data: Object.freeze(new Uint8Array()),
+    instructionIndex: 0,
+    innerInstructionIndex: null,
+    parentInstructionIndex: null,
+    stackHeight: 1,
+  });
+  const balance = Object.freeze({
+    accountIndex: 0,
+    account: 'account',
+    mint: 'mint',
+    owner: 'owner',
+    tokenProgram: 'token-program',
+    amountRaw: 1n,
+    decimals: 9,
+  });
+  return Object.freeze({
+    signature: 'signature',
+    slot: 42n,
+    transactionIndex: 0,
+    confirmationStatus: 'CONFIRMED',
+    version: 0,
+    blockTimeMs: observedAtMs,
+    accountKeys: Object.freeze(['account']),
+    signerKeys: Object.freeze(['account']),
+    instructions: Object.freeze([instruction]),
+    preTokenBalances: Object.freeze([balance]),
+    postTokenBalances: Object.freeze([balance]),
+    preBalancesLamports: Object.freeze([1n]),
+    postBalancesLamports: Object.freeze([1n]),
+    feeLamports: 5_000n,
+    computeUnits: 1_000n,
+    logs: Object.freeze(['log']),
+    error: null,
+    ...overrides,
+  });
+}

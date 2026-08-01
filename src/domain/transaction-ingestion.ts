@@ -1,4 +1,6 @@
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
+import { reconcileConfirmationStatus } from './confirmation-status.js';
+import { assertValidChainCursor, assertValidTransactionCursor } from './cursor.js';
 import type { ChainConfirmationStatus } from './types.js';
 
 export const TRANSACTION_INBOX_STATUSES = Object.freeze([
@@ -31,15 +33,7 @@ export type TransactionInboxStatus = (typeof TRANSACTION_INBOX_STATUSES)[number]
 export type ListenerRuntimeState = (typeof LISTENER_RUNTIME_STATES)[number];
 export type IngestionComponentState = ListenerRuntimeState;
 export type TransactionDiscoverySource = 'WEBSOCKET' | 'CATCH_UP';
-export type TransactionIngestionErrorCode =
-  | 'RPC_TRANSIENT'
-  | 'TRANSACTION_NOT_AVAILABLE'
-  | 'BLOCK_NOT_AVAILABLE'
-  | 'TRANSACTION_INDEX_NOT_FOUND'
-  | 'NORMALIZATION_FAILED'
-  | 'PIPELINE_STAGE_FAILED'
-  | 'FINALITY_INCONSISTENT'
-  | 'CATCH_UP_WINDOW_EXCEEDED';
+export type TransactionIngestionErrorCode = (typeof TRANSACTION_INGESTION_ERROR_CODES)[number];
 export type ProcessingCheckpointKey = 'launchpad' | 'market';
 
 export interface TransactionNotification {
@@ -138,7 +132,17 @@ export function assertValidClaimedTransaction(
   assertText(record.leaseToken, 'Claimed transaction leaseToken');
   assertMilliseconds(record.leaseExpiresAtMs, 'Claimed transaction leaseExpiresAtMs');
   if (record.normalizedTransaction !== null) {
-    frozenRecord(record.normalizedTransaction, 'Claimed normalized transaction');
+    assertValidNormalizedTransaction(record.normalizedTransaction);
+    if (record.normalizedTransaction.signature !== record.signature) {
+      throw new TypeError('Claimed normalized transaction signature does not match claim identity.');
+    }
+    if (record.normalizedTransaction.slot !== record.slot) {
+      throw new TypeError('Claimed normalized transaction slot does not match claim identity.');
+    }
+    assertCompatibleSnapshotFinality(
+      record.normalizedTransaction.confirmationStatus,
+      record.confirmationStatus,
+    );
   }
 }
 
@@ -280,4 +284,228 @@ function isObservedConfirmationStatus(
 
 function isChainConfirmationStatus(value: unknown): value is ChainConfirmationStatus {
   return isObservedConfirmationStatus(value) || value === 'orphaned';
+}
+
+function assertValidNormalizedTransaction(value: unknown): asserts value is Readonly<NormalizedTransaction> {
+  const snapshot = frozenRecord(value, 'Claimed normalized transaction snapshot');
+  assertText(snapshot.signature, 'Normalized transaction signature');
+  assertSlot(snapshot.slot, 'Normalized transaction slot');
+  assertNullableIndex(snapshot.transactionIndex, 'Normalized transaction transactionIndex');
+  if (snapshot.transactionIndex === null) {
+    throw new TypeError('Normalized transaction transactionIndex must be canonical.');
+  }
+  assertValidTransactionCursor({
+    slot: snapshot.slot,
+    transactionIndex: snapshot.transactionIndex,
+  });
+  if (!isLegacyConfirmationStatus(snapshot.confirmationStatus)) {
+    throw new TypeError('Normalized transaction confirmationStatus is invalid.');
+  }
+  if (snapshot.version !== 'legacy') {
+    assertCount(snapshot.version, 'Normalized transaction version');
+  }
+  assertNullableMilliseconds(snapshot.blockTimeMs, 'Normalized transaction blockTimeMs');
+
+  const accountKeys = frozenStringArray(snapshot.accountKeys, 'Normalized transaction accountKeys');
+  const signerKeys = frozenStringArray(snapshot.signerKeys, 'Normalized transaction signerKeys');
+  if (signerKeys.length > accountKeys.length) {
+    throw new TypeError('Normalized transaction signerKeys exceed accountKeys.');
+  }
+  signerKeys.forEach((key, index) => {
+    if (key !== accountKeys[index]) {
+      throw new TypeError('Normalized transaction signerKeys must be an accountKeys prefix.');
+    }
+  });
+
+  const instructions = frozenArray(snapshot.instructions, 'Normalized transaction instructions');
+  for (const [index, instructionValue] of instructions.entries()) {
+    const instruction = frozenRecord(
+      instructionValue,
+      `Normalized transaction instructions[${index}]`,
+    );
+    assertText(instruction.programId, `Normalized transaction instructions[${index}].programId`);
+    frozenStringArray(
+      instruction.accounts,
+      `Normalized transaction instructions[${index}].accounts`,
+    );
+    if (!(instruction.data instanceof Uint8Array)) {
+      throw new TypeError(`Normalized transaction instructions[${index}].data must be Uint8Array.`);
+    }
+    assertNullableIndex(
+      instruction.innerInstructionIndex,
+      `Normalized transaction instructions[${index}].innerInstructionIndex`,
+    );
+    assertNullableIndex(
+      instruction.parentInstructionIndex,
+      `Normalized transaction instructions[${index}].parentInstructionIndex`,
+    );
+    assertNullablePositiveInteger(
+      instruction.stackHeight,
+      `Normalized transaction instructions[${index}].stackHeight`,
+    );
+    assertCount(
+      instruction.instructionIndex,
+      `Normalized transaction instructions[${index}].instructionIndex`,
+    );
+    assertValidChainCursor({
+      slot: snapshot.slot,
+      transactionIndex: snapshot.transactionIndex,
+      instructionIndex: instruction.instructionIndex,
+      innerInstructionIndex: instruction.innerInstructionIndex,
+    });
+    const isInner = instruction.innerInstructionIndex !== null;
+    if (isInner !== (instruction.parentInstructionIndex !== null)) {
+      throw new TypeError(`Normalized transaction instructions[${index}] parent cursor is inconsistent.`);
+    }
+    if (
+      instruction.parentInstructionIndex !== null
+      && instruction.parentInstructionIndex !== instruction.instructionIndex
+    ) {
+      throw new TypeError(`Normalized transaction instructions[${index}] parent cursor is inconsistent.`);
+    }
+  }
+
+  assertTokenBalances(snapshot.preTokenBalances, accountKeys, 'preTokenBalances');
+  assertTokenBalances(snapshot.postTokenBalances, accountKeys, 'postTokenBalances');
+  assertLamportBalances(snapshot.preBalancesLamports, accountKeys.length, 'preBalancesLamports');
+  assertLamportBalances(snapshot.postBalancesLamports, accountKeys.length, 'postBalancesLamports');
+  assertAmount(snapshot.feeLamports, 'Normalized transaction feeLamports');
+  assertNullableAmount(snapshot.computeUnits, 'Normalized transaction computeUnits');
+  frozenStringArray(snapshot.logs, 'Normalized transaction logs');
+  assertDeepFrozenData(snapshot.error, 'Normalized transaction error');
+}
+
+function assertCompatibleSnapshotFinality(
+  snapshotStatus: NormalizedTransaction['confirmationStatus'],
+  claimStatus: ChainConfirmationStatus,
+): void {
+  const current = fromLegacyConfirmationStatus(snapshotStatus);
+  let reconciliation: ReturnType<typeof reconcileConfirmationStatus>;
+  try {
+    reconciliation = reconcileConfirmationStatus(current, claimStatus);
+  } catch {
+    throw new TypeError('Normalized transaction confirmation finality conflicts with claim.');
+  }
+  if (reconciliation === 'keep' && current !== claimStatus) {
+    throw new TypeError('Normalized transaction confirmation finality regresses from snapshot.');
+  }
+}
+
+function assertTokenBalances(
+  value: unknown,
+  accountKeys: readonly string[],
+  field: string,
+): void {
+  const balances = frozenArray(value, `Normalized transaction ${field}`);
+  for (const [index, balanceValue] of balances.entries()) {
+    const balance = frozenRecord(balanceValue, `Normalized transaction ${field}[${index}]`);
+    assertCount(balance.accountIndex, `Normalized transaction ${field}[${index}].accountIndex`);
+    if (balance.accountIndex >= accountKeys.length) {
+      throw new TypeError(`Normalized transaction ${field}[${index}].accountIndex is out of range.`);
+    }
+    assertText(balance.account, `Normalized transaction ${field}[${index}].account`);
+    if (balance.account !== accountKeys[balance.accountIndex]) {
+      throw new TypeError(`Normalized transaction ${field}[${index}].account is inconsistent.`);
+    }
+    assertText(balance.mint, `Normalized transaction ${field}[${index}].mint`);
+    assertNullableText(balance.owner, `Normalized transaction ${field}[${index}].owner`);
+    assertText(balance.tokenProgram, `Normalized transaction ${field}[${index}].tokenProgram`);
+    assertAmount(balance.amountRaw, `Normalized transaction ${field}[${index}].amountRaw`);
+    assertCount(balance.decimals, `Normalized transaction ${field}[${index}].decimals`);
+    if (balance.decimals > 255) {
+      throw new TypeError(`Normalized transaction ${field}[${index}].decimals exceeds u8.`);
+    }
+  }
+}
+
+function assertLamportBalances(value: unknown, accountCount: number, field: string): void {
+  const balances = frozenArray(value, `Normalized transaction ${field}`);
+  if (balances.length !== accountCount) {
+    throw new TypeError(`Normalized transaction ${field} must align with accountKeys.`);
+  }
+  balances.forEach((amount, index) => {
+    assertAmount(amount, `Normalized transaction ${field}[${index}]`);
+  });
+}
+
+function frozenArray(value: unknown, name: string): readonly unknown[] {
+  if (!Array.isArray(value)) throw new TypeError(`${name} must be an array.`);
+  if (!Object.isFrozen(value)) throw new TypeError(`${name} must be frozen.`);
+  return value;
+}
+
+function frozenStringArray(value: unknown, name: string): readonly string[] {
+  const values = frozenArray(value, name);
+  values.forEach((item, index) => { assertText(item, `${name}[${index}]`); });
+  return values as readonly string[];
+}
+
+function assertAmount(value: unknown, name: string): asserts value is bigint {
+  if (typeof value !== 'bigint' || value < 0n) {
+    throw new TypeError(`${name} must be a non-negative bigint.`);
+  }
+}
+
+function assertNullableAmount(value: unknown, name: string): asserts value is bigint | null {
+  if (value === null) return;
+  assertAmount(value, name);
+}
+
+function assertNullableIndex(value: unknown, name: string): asserts value is number | null {
+  if (value === null) return;
+  assertCount(value, name);
+}
+
+function assertNullablePositiveInteger(value: unknown, name: string): asserts value is number | null {
+  if (value === null) return;
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new TypeError(`${name} must be a positive safe integer or null.`);
+  }
+}
+
+function assertNullableMilliseconds(value: unknown, name: string): asserts value is number | null {
+  if (value === null) return;
+  assertMilliseconds(value, name);
+}
+
+function assertDeepFrozenData(value: unknown, name: string): void {
+  if (
+    value === null
+    || typeof value === 'string'
+    || typeof value === 'boolean'
+    || typeof value === 'bigint'
+  ) return;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`${name} number must be finite.`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    if (!Object.isFrozen(value)) throw new TypeError(`${name} must be deeply frozen.`);
+    value.forEach((item, index) => { assertDeepFrozenData(item, `${name}[${index}]`); });
+    return;
+  }
+  const record = frozenRecord(value, name);
+  for (const key of Object.keys(record)) {
+    assertDeepFrozenData(record[key], `${name}.${key}`);
+  }
+}
+
+function isLegacyConfirmationStatus(
+  value: unknown,
+): value is NormalizedTransaction['confirmationStatus'] {
+  return value === 'PROCESSED'
+    || value === 'CONFIRMED'
+    || value === 'FINALIZED'
+    || value === 'ORPHANED';
+}
+
+function fromLegacyConfirmationStatus(
+  value: NormalizedTransaction['confirmationStatus'],
+): ChainConfirmationStatus {
+  switch (value) {
+    case 'PROCESSED': return 'processed';
+    case 'CONFIRMED': return 'confirmed';
+    case 'FINALIZED': return 'finalized';
+    case 'ORPHANED': return 'orphaned';
+  }
 }
