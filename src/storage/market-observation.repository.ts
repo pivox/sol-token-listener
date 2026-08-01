@@ -20,7 +20,7 @@ import type {
   MarketObservationResult,
   MarketReserveObservation,
 } from '../ports/market-observation-repository.js';
-import { fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
+import { canonicalStringifyJson, fromJsonValue, toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 
 interface QueryResultLike {
@@ -674,13 +674,14 @@ async function writeTransition(
 ): Promise<void> {
   await client.query(
     `INSERT INTO state_transitions (
-      transition_id,mint,event_id,occurred_at,trigger_event,previous_state,
-      new_state,reason_code,human_message,evidence
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      transition_id,mint,event_id,occurred_at,occurred_at_source,payload_version,
+      trigger_event,previous_state,new_state,reason_code,human_message,evidence
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
     ON CONFLICT (transition_id) DO NOTHING`,
     [
       transition.id, transition.mint, transition.triggeringEventId,
-      new Date(transition.occurredAtMs), transition.triggeringEventType,
+      new Date(transition.occurredAtMs), transition.occurredAtSource,
+      transition.payloadVersion, transition.triggeringEventType,
       transition.previousStatus, transition.newStatus, transition.reasonCode,
       transition.message, toJsonValue(transition.evidence),
     ],
@@ -745,7 +746,7 @@ function findRaw(
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
-  return stringifyJson(fromJsonValue(left)) === stringifyJson(right);
+  return canonicalStringifyJson(fromJsonValue(left)) === canonicalStringifyJson(right);
 }
 
 function optionalRecord(value: unknown): Record<string, unknown> | null {

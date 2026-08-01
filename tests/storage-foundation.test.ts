@@ -2,11 +2,64 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createRepositoryId } from '../src/storage/repositories.js';
 import {
+  canonicalStringifyJson,
   MAX_SERIALIZED_BIGINT_DIGITS,
   parseJson,
   stringifyJson,
   toJsonValue,
 } from '../src/utils/json.js';
+
+void test('canonical JSON sorts nested keys without treating __proto__ as syntax', () => {
+  const nested = Object.create(null) as Record<string, unknown>;
+  Object.defineProperty(nested, '__proto__', { value: 'data', enumerable: true });
+  nested.b = { z: 2, a: 1 };
+  nested.a = 3n;
+
+  assert.equal(canonicalStringifyJson(nested),
+    '{"__proto__":"data","a":{"$solTokenListenerBigInt":"3"},"b":{"a":1,"z":2}}');
+});
+
+void test('canonical JSON accepts native and internally trusted bigint values only', () => {
+  const trusted = toJsonValue({ amount: 42n });
+  assert.equal(canonicalStringifyJson({ trusted, native: -7n }),
+    '{"native":{"$solTokenListenerBigInt":"-7"},"trusted":{"amount":{"$solTokenListenerBigInt":"42"}}}');
+  assert.throws(
+    () => canonicalStringifyJson({ amount: { $solTokenListenerBigInt: '42' } }),
+    /reserved for bigint serialization/u,
+  );
+  const marker = (trusted as { amount: { $solTokenListenerBigInt: string } }).amount;
+  assert.throws(
+    () => canonicalStringifyJson({ amount: { ...marker } }),
+    /reserved for bigint serialization/u,
+  );
+});
+
+void test('canonical JSON bounds every UTF-8 key and value at 16 KiB', () => {
+  assert.doesNotThrow(() => canonicalStringifyJson({ ['a'.repeat(16_384)]: true }));
+  assert.throws(() => canonicalStringifyJson({ ['a'.repeat(16_385)]: true }),
+    /text limits/u);
+  assert.doesNotThrow(() => canonicalStringifyJson({ value: 'é'.repeat(8_192) }));
+  assert.throws(() => canonicalStringifyJson({ value: 'é'.repeat(8_193) }),
+    /text limits/u);
+});
+
+void test('canonical JSON distinguishes aggregate input bytes from escaped output bytes', () => {
+  const exactAggregate = aggregateTextValue(1_048_576);
+  assert.throws(() => canonicalStringifyJson(exactAggregate), /serialized limit/u);
+  assert.throws(() => canonicalStringifyJson(aggregateTextValue(1_048_577)),
+    /text limits/u);
+  const escaped = Object.fromEntries(Array.from(
+    { length: 12 },
+    (_, index) => [String(index).padStart(3, '0'), '\0'.repeat(16_384)],
+  ));
+  assert.throws(() => canonicalStringifyJson(escaped), /serialized limit/u);
+});
+
+void test('canonical JSON includes dense array index keys in aggregate bytes', () => {
+  const values = Array.from({ length: 64 }, (_, index) =>
+    'a'.repeat(index === 63 ? 16_308 : 16_384));
+  assert.throws(() => canonicalStringifyJson(values), /text limits/u);
+});
 
 void test('sérialise et restaure exactement les bigint imbriqués', () => {
   const source = {
@@ -129,3 +182,15 @@ void test('les identifiants de repository sont déterministes et non ambigus', (
   assert.match(first, /^raw-chain-event_[a-f0-9]{64}$/u);
   assert.notEqual(first, ambiguousWithoutLengths);
 });
+
+function aggregateTextValue(totalBytes: number): Readonly<Record<string, string>> {
+  const value: Record<string, string> = {};
+  let remainingValues = totalBytes - (64 * 3);
+  for (let index = 0; index < 64; index += 1) {
+    const bytes = Math.min(16_384, remainingValues);
+    value[String(index).padStart(3, '0')] = 'a'.repeat(bytes);
+    remainingValues -= bytes;
+  }
+  assert.equal(remainingValues, 0);
+  return value;
+}

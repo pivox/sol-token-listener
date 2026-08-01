@@ -21,7 +21,7 @@ l’arrivée du token et conserve les événements nécessaires jusqu’à la fe
 du suivi. L’observation accepte plusieurs quote mints ; le paper trading est
 initialement limité à SOL/WSOL par `PAPER_QUOTE_MINT_ALLOWLIST`.
 
-## État après PR H
+## Runtime durable
 
 La PR C épingle l’IDL officiel Pump.fun au commit
 `9c82f61cb711b044a17f770ab8ce9f9bdf78f333` et décode localement `create`,
@@ -32,9 +32,9 @@ appairés ; aucun delta global de transaction n’est utilisé comme estimation.
 
 L’observation multi-quote est conservée (SPL Token et Token-2022), tandis que
 le paper trading reste limité à SOL/WSOL par configuration. Le décodeur ne fait
-aucun appel RPC à l’exécution. `PumpFunLaunchpadAdapter` est présent mais non
-composé dans `src/app.ts`; il ne déclenche donc aucun abonnement, lecture RPC ou
-ordre réel. Raydium CPMM demeure un adaptateur secondaire isolé et testé.
+aucun appel RPC à l’exécution. `PumpFunLaunchpadAdapter` est composé dans le
+listener d'observation; il ne construit, ne signe et ne soumet aucun ordre.
+Raydium CPMM demeure un adaptateur secondaire isolé et testé.
 
 La PR G ajoute un pipeline passif et invocable :
 
@@ -46,14 +46,17 @@ Pump migration observed
   -> réserves, trades et quotes paper passifs
 ```
 
-`src/app.ts` ne l’abonne encore à aucun flux réseau. Le bootstrap distingue
-`pumpSwapPipelineAvailable: true` de `pumpFunListenerActive: false` : le
-listener RPC Pump.fun reste inactif, même lorsque l’API est démarrée.
-
-La PR H compose une interface `node:http` publique et non authentifiée, en
+Le bootstrap compose une interface `node:http` publique et non authentifiée, en
 lecture seule, avec huit routes JSON versionnées sous `/api/v1` et le flux SSE
-`/api/v1/events`. Elle ne compose ni souscription RPC, ni wallet, ni exécution
-live, ni envoi de transaction. `observe` et `paper` restent les seuls modes.
+`/api/v1/events`. Il démarre d'abord le listener durable Pump.fun/PumpSwap :
+
+```text
+health RPC -> catch-up borné -> WebSocket -> worker inbox
+           -> réconciliation de finalité -> heartbeat -> API
+```
+
+Il ne compose ni wallet, ni exécution live, ni envoi de transaction. `observe`
+et `paper` restent les seuls modes.
 Raydium CPMM reste un adaptateur secondaire non composé dans ce bootstrap.
 
 La projection sociale n'est pas encore produite et répond explicitement
@@ -62,9 +65,9 @@ partir des seuls trades Pump.fun persistés depuis la création. La route holder
 reste `NOT_AVAILABLE` avant reconstruction, puis expose le profil créateur,
 les positions nettes observées et la concentration top 1/5/10. Elle ne prétend
 pas être un état exhaustif des comptes token. I2 peut ensuite exposer un graphe
-observé ; il reste `NOT_AVAILABLE` tant que sa reconstruction explicite n'a pas
-eu lieu. L’API ne formule aucune garantie de profit, de même slot ou de
-sellabilité.
+observé ; il reste `NOT_AVAILABLE` tant que sa reconstruction n'a pas eu lieu.
+Le pipeline actif enchaîne launchpad, financement, I1, I2 et PumpSwap. L’API ne
+formule aucune garantie de profit, de même slot ou de sellabilité.
 
 ## Dépendances autorisées
 
@@ -109,8 +112,8 @@ Le périmètre commence à la détection du token. Aucun historique antérieur d
 créateur, appel RPC additionnel ou lecture exhaustive des comptes token n'est
 effectué. Les quotes restent séparées et tous les calculs financiers utilisent
 `bigint`; une position nette négative est une observation valide. La
-reconstruction n'est pas composée dans `src/app.ts` : le bootstrap public ne
-lance aucun traitement ni abonnement.
+reconstruction est une étape idempotente du pipeline observé composé dans le
+bootstrap.
 
 ### Graphe de wallets observé I2
 
@@ -259,6 +262,22 @@ Les événements métier sont source-indépendants :
 `market_trades` et `state_transitions` sont des projections métier. Les
 checkpoints sont indépendants de la source.
 
+L'inbox durable déduplique les notifications WebSocket et le rattrapage HTTP.
+Une reprise après panne rejoue toujours l'intégralité des étapes launchpad,
+financement, I1, I2 et PumpSwap; les identités et écritures déterministes
+garantissent des effets persistés exactement une fois, sans reprendre après
+une étape intermédiaire. Les leases expirés rendent le travail réclamable.
+
+Le WebSocket est le chemin nominal. Le catch-up initial est borné par
+`LISTENER_CATCH_UP_MAX_PAGES * LISTENER_CATCH_UP_PAGE_SIZE` pour chacun des
+programmes Pump.fun et PumpSwap, soit 20 × 100 signatures par programme par
+défaut. Une panne retryable est replanifiée avec un délai exponentiel de 500 ms
+plafonné à 60 s, sans plafond du nombre de tentatives. Les variables
+`RPC_RETRY_MAX_ATTEMPTS` et `RPC_RETRY_BASE_DELAY_MS` sont parsées et validées
+pour compatibilité, mais ne pilotent pas encore ce scheduler durable. Les lots
+de finalité et durées d'arrêt sont bornés; le quota RPC réel dépend du trafic,
+des déconnexions et des reprises.
+
 Le traitement réclame un événement avec un lease et reste idempotent.
 `raw_chain_events` est alimenté séparément : le batch du sink conserve les
 événements métier et leur lien vers cette entrée d’audit, sans embarquer le
@@ -278,9 +297,12 @@ jamais. Le repository PumpSwap applique ces garanties dans une transaction
 PostgreSQL, avec verrou advisory par transaction. Un orphaning non finalisé
 rétracte le pool et ses projections.
 
-Quand un lancement est terminal et qu’aucune position paper n’est ouverte,
-`terminal_at` est fixé et `purge_after = terminal_at + 4 heures`. Le purgeur ne
-supprime que les lignes arrivées à échéance, dans l’ordre des dépendances. Les
+Quand un lancement ou une transaction inbox devient terminale en état
+`finalized` ou `orphaned`, `terminal_at` est fixé et
+`purge_after = terminal_at + 4 heures`. Le purgeur ne supprime que les lignes
+arrivées à échéance, dans l’ordre des dépendances. Une transaction `processed`
+ou `confirmed` en attente de finalité ne reçoit aucune échéance et n'est jamais
+purgée. Les
 profils créateurs, positions observées, preuves de financement, relations,
 clusters et snapshots suivent la date du lancement parent et sont supprimés
 avant leurs événements. Les preuves sociales
@@ -300,7 +322,11 @@ projections HTTP avant de se reconnecter.
 Par défaut, l’API écoute seulement sur `127.0.0.1`; `API_HOST` et `API_PORT`
 contrôlent le binding. Exposer une adresse publique requiert les protections de
 déploiement appropriées, car le contrat est non authentifié. La route health
-retourne 503 lorsque PostgreSQL est indisponible.
+retourne 503 lorsque PostgreSQL est indisponible. Son pipeline vaut `RUNNING`
+seulement lorsque tous ses composants tournent, `DEGRADED` lors d'une panne,
+d'un nettoyage incomplet ou d'un heartbeat périmé, et `STOPPED` après arrêt ou
+désactivation explicite. Le heartbeat rend visibles backlog, leases,
+checkpoints, derniers slots et fraîcheur sans divulguer les endpoints.
 
 ## Invariants de sécurité
 

@@ -108,6 +108,7 @@ void test('replays, revises and dissolves an orphaned cluster atomically', async
       new PostgresWalletGraphRepository(pool),
     );
     const first = await service.rebuild('mint');
+    assert.ok(first);
     assert.equal(first.relationships.length, 2);
     assert.equal(first.clusters.length, 1);
     assert.equal((await pool.query('SELECT 1 FROM wallet_graph_profiles')).rowCount, 1);
@@ -120,6 +121,7 @@ void test('replays, revises and dissolves an orphaned cluster atomically', async
     )).rowCount, 1);
 
     const replay = await service.rebuild('mint');
+    assert.ok(replay);
     assert.equal(replay.inputFingerprint, first.inputFingerprint);
     assert.equal((await pool.query('SELECT 1 FROM wallet_graph_snapshots')).rowCount, 1);
     assert.equal((await pool.query(
@@ -129,6 +131,7 @@ void test('replays, revises and dissolves an orphaned cluster atomically', async
     await evidenceRepository.record(orphanedBatch(assessmentA, evidenceA));
     await evidenceRepository.record(orphanedBatch(assessmentB, evidenceB));
     const dissolved = await service.rebuild('mint');
+    assert.ok(dissolved);
     assert.notEqual(dissolved.inputFingerprint, first.inputFingerprint);
     assert.equal(dissolved.clusters.length, 0);
     assert.equal(dissolved.coverage.notProcessedBuyCount, 2);

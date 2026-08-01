@@ -6,6 +6,7 @@ import type {
 
 export interface ParticipantAnalyticsTransaction {
   loadCanonicalInput(mint: string): Promise<ParticipantAnalyticsInput | null>;
+  dissolveCurrent(mint: string): Promise<void>;
   replaceProjection(
     projection: ParticipantAnalyticsProjection,
     events: readonly ParticipantAnalyticsDerivedEventV1[],

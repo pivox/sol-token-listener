@@ -48,6 +48,8 @@ export type LaunchpadEventBatch =
 
 export interface LaunchpadEventBatchResult {
   readonly events: readonly EventRecordResult[];
+  /** Unique lexical mints in the reconciled batch, including retractions. */
+  readonly affectedMints: readonly string[];
 }
 
 export class InvalidLaunchpadEventBatchError extends Error {
@@ -110,13 +112,15 @@ export function assertValidLaunchpadEventBatch(
     );
   }
 
-  const launchEvents: {
+  interface LaunchEventReference {
     readonly id: string;
     readonly mint: string;
     readonly type: 'TokenLaunchDetected';
     readonly blockchainTimeMs: number | null;
     readonly observedAtMs: number;
-  }[] = [];
+  }
+  const launchEvents: LaunchEventReference[] = [];
+  const launchEventById = new Map<string, LaunchEventReference>();
   for (const event of events) {
     if (
       !isRecord(event)
@@ -146,13 +150,15 @@ export function assertValidLaunchpadEventBatch(
           'launch event timestamps must be canonical',
         );
       }
-      launchEvents.push({
+      const launchEvent: LaunchEventReference = {
         id: event.id,
         mint: event.mint,
         type: event.type,
         blockchainTimeMs: event.blockchainTimeMs,
         observedAtMs: event.observedAtMs,
-      });
+      };
+      launchEvents.push(launchEvent);
+      launchEventById.set(launchEvent.id, launchEvent);
     }
   }
 
@@ -167,9 +173,9 @@ export function assertValidLaunchpadEventBatch(
     if (!isRecord(transition)) {
       throw new InvalidLaunchpadEventBatchError('transitions must be objects');
     }
-    const launchEvent = launchEvents.find(
-      (event) => event.id === transition.triggeringEventId,
-    );
+    const launchEvent = typeof transition.triggeringEventId === 'string'
+      ? launchEventById.get(transition.triggeringEventId)
+      : undefined;
     if (launchEvent === undefined) {
       throw new InvalidLaunchpadEventBatchError(
         'every transition must reference a launch event in the batch',

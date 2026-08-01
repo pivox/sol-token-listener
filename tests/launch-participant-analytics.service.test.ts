@@ -23,6 +23,7 @@ void test('reconstruit les deux projections avec le dernier curseur et la finali
   const service = new LaunchParticipantAnalyticsService(repository);
 
   const projection = await service.rebuild('mint');
+  assert.ok(projection);
 
   assert.equal(projection.asOf.eventId, 'later-event');
   assert.equal(projection.confirmationStatus, 'processed');
@@ -43,6 +44,7 @@ void test('utilise le lancement comme curseur lorsqu’aucun trade actif n’exi
   const repository = new FakeRepository(makeInput([], 'confirmed'));
 
   const projection = await new LaunchParticipantAnalyticsService(repository).rebuild('mint');
+  assert.ok(projection);
 
   assert.equal(projection.asOf.eventId, 'launch-event');
   assert.equal(projection.asOf.signature, 'create-signature');
@@ -61,6 +63,20 @@ void test('refuse un lancement absent sans écrire de projection', async () => {
     () => new LaunchParticipantAnalyticsService(repository).rebuild('mint'),
     ParticipantAnalyticsLaunchNotFoundError,
   );
+  assert.equal(repository.replacements.length, 0);
+  assert.deepEqual(repository.dissolutions, []);
+});
+
+void test('dissout uniquement la projection courante lorsqu’un replay orphelin n’a plus de lancement canonique', async () => {
+  const repository = new FakeRepository(null);
+
+  const projection = await new LaunchParticipantAnalyticsService(repository).rebuild(
+    'mint',
+    'DISSOLVE_CURRENT',
+  );
+
+  assert.equal(projection, null);
+  assert.deepEqual(repository.dissolutions, ['mint']);
   assert.equal(repository.replacements.length, 0);
 });
 
@@ -83,6 +99,7 @@ void test('ne remplace rien lorsqu’un analyseur échoue', async () => {
 });
 
 class FakeRepository implements ParticipantAnalyticsRepository {
+  public readonly dissolutions: string[] = [];
   public readonly replacements: {
     readonly projection: ParticipantAnalyticsProjection;
     readonly events: readonly ParticipantAnalyticsDerivedEventV1[];
@@ -96,6 +113,9 @@ class FakeRepository implements ParticipantAnalyticsRepository {
   ): Promise<TResult> {
     return operation({
       loadCanonicalInput: async () => this.input,
+      dissolveCurrent: async (mint) => {
+        this.dissolutions.push(mint);
+      },
       replaceProjection: async (projection, events) => {
         this.replacements.push({ projection, events });
       },

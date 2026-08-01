@@ -253,6 +253,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '006_api_event_stream.sql',
       '007_participant_analytics.sql',
       '008_wallet_graph.sql',
+      '009_transaction_ingestion.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

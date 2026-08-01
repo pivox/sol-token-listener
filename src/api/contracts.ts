@@ -9,6 +9,7 @@ import type {
 } from '../domain/qualification.js';
 import type { QualificationReasonCode } from '../domain/qualification-reasons.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
+import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
 
 export const API_VERSION = 'v1' as const;
 export const MAX_API_JSON_DEPTH = 64;
@@ -334,6 +335,13 @@ export interface ApiCheckpoints {
 }
 
 export interface ApiHeartbeat {
+  readonly runtimeState?: ListenerRuntimeState | null;
+  readonly subscriberState?: ListenerRuntimeState | null;
+  readonly scannerState?: ListenerRuntimeState | null;
+  readonly workerState?: ListenerRuntimeState | null;
+  readonly reconcilerState?: ListenerRuntimeState | null;
+  readonly backlogCount?: number | null;
+  readonly leasedCount?: number | null;
   readonly startedAt: string | null;
   readonly updatedAt: string | null;
   readonly lastHttpSlot: string | null;

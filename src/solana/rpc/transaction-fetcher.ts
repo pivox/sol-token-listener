@@ -1,12 +1,12 @@
 import bs58 from 'bs58';
 import type {
+  Connection,
   CompiledInstruction,
   MessageCompiledInstruction,
   TokenBalance,
   VersionedTransactionResponse,
 } from '@solana/web3.js';
 import { assertValidTransactionCursor } from '../../domain/cursor.js';
-import type { SolanaRpcClient } from './rpc-client.js';
 import type {
   LegacyConfirmationStatus,
   NormalizedInstruction,
@@ -18,8 +18,12 @@ interface RpcInnerInstruction extends CompiledInstruction {
   readonly stackHeight?: number | null;
 }
 
+export interface TransactionFetchClient {
+  readonly http: Pick<Connection, 'getTransaction'>;
+}
+
 export class TransactionFetcher {
-  constructor(private readonly rpc: SolanaRpcClient) {}
+  constructor(private readonly rpc: TransactionFetchClient) {}
 
   async fetch(
     signature: string,

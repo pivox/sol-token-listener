@@ -17,6 +17,7 @@ import {
   type ParticipantConfirmationCounts,
 } from '../domain/participant-analytics.js';
 import type { ParticipantAnalyticsRepository } from '../ports/participant-analytics-repository.js';
+import type { MissingCanonicalLaunchPolicy } from '../domain/projection-reconciliation.js';
 
 interface CreatorProfileProvider {
   profile(input: ParticipantAnalyticsInput): CreatorProfile;
@@ -40,11 +41,20 @@ export class LaunchParticipantAnalyticsService {
     private readonly holderAnalyzer: HolderDistributionProvider = new ObservedHolderAnalyzer(),
   ) {}
 
-  public async rebuild(mint: string): Promise<ParticipantAnalyticsProjection> {
+  public async rebuild(
+    mint: string,
+    missingLaunchPolicy: MissingCanonicalLaunchPolicy = 'ERROR',
+  ): Promise<ParticipantAnalyticsProjection | null> {
     if (mint.length === 0) throw new TypeError('Participant analytics mint is required.');
     return this.repository.transact(mint, async (transaction) => {
       const input = await transaction.loadCanonicalInput(mint);
-      if (input === null) throw new ParticipantAnalyticsLaunchNotFoundError(mint);
+      if (input === null) {
+        if (missingLaunchPolicy === 'ERROR') {
+          throw new ParticipantAnalyticsLaunchNotFoundError(mint);
+        }
+        await transaction.dissolveCurrent(mint);
+        return null;
+      }
       assertValidParticipantAnalyticsInput(input);
       const trades = [...input.trades].sort(compareParticipantTrades);
       const profile = this.creatorProfiler.profile(input);

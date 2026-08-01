@@ -82,6 +82,12 @@ void test('market observation repository writes migration and activation atomica
   ]);
   assert.equal(result.migrations.length, 1);
   assert.equal(result.activations.length, 1);
+  const transitions = client.calls.filter((call) =>
+    call.text.includes('INSERT INTO state_transitions'));
+  assert.equal(transitions.length, 2);
+  assert.equal(transitions.every((call) =>
+    (call.values[4] === 'blockchain' || call.values[4] === 'observation')
+    && call.values[5] === 1), true);
   assert.equal(client.released, true);
 });
 
@@ -388,7 +394,7 @@ function label(call: QueryCall): string | null {
   if (sql.includes('INSERT INTO migrations')) return 'INSERT migrations';
   if (sql.includes('INSERT INTO market_pools')) return 'INSERT market_pools';
   if (sql.includes('INSERT INTO state_transitions')) {
-    return `INSERT transition ${String(call.values[6])}`;
+    return `INSERT transition ${String(call.values[8])}`;
   }
   return null;
 }

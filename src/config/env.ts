@@ -4,6 +4,7 @@ import { MAX_API_PAGE_LIMIT } from '../ports/api-projection-repository.js';
 
 const DEFAULT_WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_RAYDIUM_CPMM_PROGRAM_ID = 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C';
+const MAX_RECONCILE_SECONDS = 2_147_483;
 
 export type ExecutionMode = 'observe' | 'paper';
 export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
@@ -21,6 +22,12 @@ export interface AppConfig {
   readonly qualificationRuleSetStatus: QualificationRuleSetStatus;
   readonly qualificationMinimumScore: number;
   readonly dataRetentionHours: number;
+  readonly listenerEnabled: boolean;
+  readonly listenerWorkerLeaseSeconds: number;
+  readonly listenerCatchUpMaxPages: number;
+  readonly listenerCatchUpPageSize: number;
+  readonly listenerFinalityMissingPolls: number;
+  readonly listenerShutdownTimeoutMs: number;
   readonly raydiumCpmmProgramId: string;
   readonly wsolMint: string;
   readonly buyAmountLamports: bigint;
@@ -108,6 +115,22 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
       100,
     ),
     dataRetentionHours: parseInteger(environment.DATA_RETENTION_HOURS, 4, 'DATA_RETENTION_HOURS', 1, 168),
+    listenerEnabled: parseBoolean(environment.LISTENER_ENABLED, true, 'LISTENER_ENABLED'),
+    listenerWorkerLeaseSeconds: parseInteger(
+      environment.LISTENER_WORKER_LEASE_SECONDS, 120, 'LISTENER_WORKER_LEASE_SECONDS', 30, 900,
+    ),
+    listenerCatchUpMaxPages: parseInteger(
+      environment.LISTENER_CATCH_UP_MAX_PAGES, 20, 'LISTENER_CATCH_UP_MAX_PAGES', 1, 100,
+    ),
+    listenerCatchUpPageSize: parseInteger(
+      environment.LISTENER_CATCH_UP_PAGE_SIZE, 100, 'LISTENER_CATCH_UP_PAGE_SIZE', 1, 1_000,
+    ),
+    listenerFinalityMissingPolls: parseInteger(
+      environment.LISTENER_FINALITY_MISSING_POLLS, 3, 'LISTENER_FINALITY_MISSING_POLLS', 2, 20,
+    ),
+    listenerShutdownTimeoutMs: parseInteger(
+      environment.LISTENER_SHUTDOWN_TIMEOUT_MS, 30_000, 'LISTENER_SHUTDOWN_TIMEOUT_MS', 1_000, 120_000,
+    ),
     raydiumCpmmProgramId: optional(environment.RAYDIUM_CPMM_PROGRAM_ID, DEFAULT_RAYDIUM_CPMM_PROGRAM_ID),
     wsolMint,
     buyAmountLamports: parseSolToLamports(environment.BUY_AMOUNT_SOL, '0.01', 'BUY_AMOUNT_SOL'),
@@ -118,7 +141,13 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     maxConcurrentPositions: parseInteger(environment.MAX_CONCURRENT_POSITIONS, 1, 'MAX_CONCURRENT_POSITIONS', 1),
     maxActivePoolMonitors: parseInteger(environment.MAX_ACTIVE_POOL_MONITORS, 50, 'MAX_ACTIVE_POOL_MONITORS', 1),
     poolMonitorTtlMinutes: parseInteger(environment.POOL_MONITOR_TTL_MINUTES, 90, 'POOL_MONITOR_TTL_MINUTES', 1),
-    reconcileSeconds: parseInteger(environment.RECONCILE_SECONDS, 15, 'RECONCILE_SECONDS', 1),
+    reconcileSeconds: parseInteger(
+      environment.RECONCILE_SECONDS,
+      15,
+      'RECONCILE_SECONDS',
+      1,
+      MAX_RECONCILE_SECONDS,
+    ),
     rpcRetryMaxAttempts: parseInteger(environment.RPC_RETRY_MAX_ATTEMPTS, 5, 'RPC_RETRY_MAX_ATTEMPTS', 1),
     rpcRetryBaseDelayMs: parseInteger(environment.RPC_RETRY_BASE_DELAY_MS, 500, 'RPC_RETRY_BASE_DELAY_MS', 1),
     minWsolLiquidityLamports: parseSolToLamports(environment.MIN_WSOL_LIQUIDITY, '0.25', 'MIN_WSOL_LIQUIDITY'),

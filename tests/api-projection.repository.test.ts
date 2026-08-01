@@ -977,6 +977,9 @@ void test('returns health without exposing database URLs or secrets', async () =
     if (call.text.includes('listener_heartbeats')) return [{
       updated_at: openedAt, last_http_slot: '60', last_websocket_slot: '59',
       last_finalized_slot: '58', last_signature: 'signature', pending_transactions: 0, active_sessions: 1,
+      runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
+      worker_state: 'RUNNING', reconciler_state: 'RUNNING', started_at: openedAt,
+      leased_transactions: 0,
     }];
     return [];
   });
@@ -991,12 +994,14 @@ void test('returns health without exposing database URLs or secrets', async () =
     pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE' },
     checkpoints: { launchpad: '55', market: '54' },
     heartbeat: {
-      startedAt: null, updatedAt: openedAt.toISOString(), lastHttpSlot: '60',
+      runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+      workerState: 'RUNNING', reconcilerState: 'RUNNING', backlogCount: 0, leasedCount: 0,
+      startedAt: openedAt.toISOString(), updatedAt: openedAt.toISOString(), lastHttpSlot: '60',
       lastWebsocketSlot: '59', lastFinalizedSlot: '58', lastSignature: 'signature',
       pendingTransactions: 0, activeSessions: 1,
     }, lagSlots: '1',
   });
-  assert.doesNotMatch(database.calls[2]?.text ?? '', /started_at/u);
+  assert.match(database.calls[2]?.text ?? '', /started_at/u);
   assert.doesNotMatch(JSON.stringify(health), /:\/\/|DATABASE_URL|password|secret|localhost/u);
 });
 
@@ -1009,20 +1014,24 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
 
   assert.equal(health.status, 'DEGRADED');
   assert.deepEqual(health.heartbeat, {
+    runtimeState: null, subscriberState: null, scannerState: null, workerState: null,
+    reconcilerState: null, backlogCount: null, leasedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
   });
   assert.equal(health.lagSlots, null);
 });
 
-void test('degrades stale heartbeats and reads startedAt only from canonical payload', async () => {
+void test('degrades stale heartbeats and reads the canonical runtime start column', async () => {
   const staleAt = new Date(openedAt.getTime() - 30_001);
   const database = new FakeQueryable((call) => {
     if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
     if (call.text.includes('listener_heartbeats')) return [{
       updated_at: staleAt, started_at: detectedAt, payload: { startedAt: detectedAt.toISOString() },
       last_http_slot: '40', last_websocket_slot: '43', last_finalized_slot: null,
-      last_signature: null, pending_transactions: null, active_sessions: null,
+      last_signature: null, pending_transactions: 0, active_sessions: null,
+      runtime_state: 'DEGRADED', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
+      worker_state: 'DEGRADED', reconciler_state: 'RUNNING', leased_transactions: 0,
     }];
     return [];
   });
@@ -1042,6 +1051,9 @@ void test('degrades a heartbeat timestamped in the future', async () => {
     if (call.text.includes('listener_heartbeats')) return [{
       updated_at: futureAt, payload: {}, last_http_slot: '40', last_websocket_slot: '40',
       last_finalized_slot: null, last_signature: null, pending_transactions: 0, active_sessions: 0,
+      runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
+      worker_state: 'RUNNING', reconciler_state: 'RUNNING', started_at: openedAt,
+      leased_transactions: 0,
     }];
     return [];
   });
@@ -1050,6 +1062,95 @@ void test('degrades a heartbeat timestamped in the future', async () => {
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
+});
+
+void test('rejects invalid heartbeat runtime states and impossible runtime counts', async () => {
+  for (const heartbeat of [{
+    runtime_state: 'UNKNOWN', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
+    worker_state: 'RUNNING', reconciler_state: 'RUNNING', pending_transactions: 0,
+    leased_transactions: 0,
+  }, {
+    runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
+    worker_state: 'RUNNING', reconciler_state: 'RUNNING', pending_transactions: 1,
+    leased_transactions: 2,
+  }]) {
+    const database = new FakeQueryable((call) => {
+      if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
+      if (call.text.includes('listener_heartbeats')) return [{
+        ...heartbeat, updated_at: openedAt, started_at: openedAt,
+        last_http_slot: null, last_websocket_slot: null, last_finalized_slot: null,
+        last_signature: null, active_sessions: 0,
+      }];
+      return [];
+    });
+    const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
+      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    }).getHealth();
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.postgresql.status, 'UNAVAILABLE');
+    assert.equal(health.heartbeat.runtimeState, null);
+  }
+});
+
+void test('redacts hostile dynamic pipeline providers into canonical DEGRADED health', async () => {
+  let getterReads = 0;
+  const getterState = Object.defineProperty({}, 'httpAvailable', {
+    enumerable: true,
+    get() { getterReads += 1; throw new Error('pipeline getter secret'); },
+  });
+  const hostileProxy = new Proxy({}, {
+    ownKeys() { throw new Error('pipeline proxy secret'); },
+    getOwnPropertyDescriptor() { throw new Error('pipeline descriptor secret'); },
+    get() { throw new Error('pipeline get secret'); },
+  });
+  const providers: (() => unknown)[] = [
+    () => { throw new Error('pipeline provider secret'); },
+    () => getterState,
+    () => hostileProxy,
+  ];
+
+  for (const provider of providers) {
+    const repository = new PostgresApiProjectionRepository(
+      new FakeQueryable(() => { throw new Error('must not query after invalid pipeline'); }),
+      () => openedAt,
+      provider as () => { httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING' },
+    );
+    const health = await repository.getHealth();
+    assert.equal(health.status, 'DEGRADED');
+    assert.deepEqual(health.http, { status: 'UNAVAILABLE' });
+    assert.deepEqual(health.pipeline, { pumpfun: 'DEGRADED', pumpswap: 'DEGRADED' });
+    assert.ok(Object.isFrozen(health.pipeline));
+    assert.doesNotMatch(JSON.stringify(health), /secret/u);
+  }
+  assert.equal(getterReads, 0);
+});
+
+void test('snapshots a dynamic pipeline provider exactly once without retaining its object', async () => {
+  let providerCalls = 0;
+  const original = { httpAvailable: true, pumpfun: 'RUNNING' as const, pumpswap: 'RUNNING' as const };
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
+    if (call.text.includes('listener_heartbeats')) return [{
+      updated_at: openedAt, started_at: openedAt, last_http_slot: '10',
+      last_websocket_slot: '10', last_finalized_slot: '9', last_signature: null,
+      pending_transactions: 0, active_sessions: 0, leased_transactions: 0,
+      runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
+      worker_state: 'RUNNING', reconciler_state: 'RUNNING',
+    }];
+    return [];
+  });
+  const health = await new PostgresApiProjectionRepository(database, () => openedAt, () => {
+    providerCalls += 1;
+    if (providerCalls > 1) throw new Error('stateful provider secret');
+    return original;
+  }).getHealth();
+
+  original.pumpfun = 'RUNNING';
+  assert.equal(providerCalls, 1);
+  assert.deepEqual(health.pipeline, { pumpfun: 'RUNNING', pumpswap: 'RUNNING' });
+  assert.ok(Object.isFrozen(health.pipeline));
+  assert.notEqual(health.pipeline, original);
+  assert.doesNotMatch(JSON.stringify(health), /secret/u);
 });
 
 void test('reports PostgreSQL unavailable without leaking a rejected health query', async () => {

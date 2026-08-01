@@ -38,6 +38,7 @@ import {
 const EMPTY_EVENT_RESULTS: readonly EventRecordResult[] = Object.freeze([]);
 const EMPTY_BATCH_RESULT: LaunchpadEventBatchResult = Object.freeze({
   events: EMPTY_EVENT_RESULTS,
+  affectedMints: Object.freeze([]),
 });
 
 export class LaunchpadObservationService<

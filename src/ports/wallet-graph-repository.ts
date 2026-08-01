@@ -8,6 +8,7 @@ import type {
 
 export interface WalletGraphTransaction {
   loadCanonicalInput(mint: string): Promise<WalletGraphInput | null>;
+  dissolveCurrent(mint: string): Promise<void>;
   replaceProjection(
     projection: WalletGraphProjection,
     event: WalletClusterDetectedEventV1,

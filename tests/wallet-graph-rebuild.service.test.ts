@@ -43,6 +43,7 @@ void test('rebuilds atomically with deterministic as-of and minimum finality', a
   });
   const repository = new FakeRepository(input);
   const projection = await new WalletGraphRebuildService(repository).rebuild('mint');
+  assert.ok(projection);
 
   assert.equal(projection.asOf.eventId, later.eventId);
   assert.equal(projection.asOf.signature, later.signature);
@@ -66,6 +67,7 @@ void test('persists a successful available projection with zero clusters', async
   });
   const repository = new FakeRepository(input);
   const projection = await new WalletGraphRebuildService(repository).rebuild('mint');
+  assert.ok(projection);
 
   assert.deepEqual(projection.clusters, []);
   assert.equal(projection.asOf.eventId, input.launch.eventId);
@@ -90,6 +92,7 @@ void test('uses a later I1 projection for as-of and minimum finality', async () 
   const projection = await new WalletGraphRebuildService(
     new FakeRepository(input),
   ).rebuild('mint');
+  assert.ok(projection);
 
   assert.equal(projection.asOf.eventId, 'participant-event');
   assert.equal(projection.asOf.signature, 'sell-signature');
@@ -129,6 +132,19 @@ void test('rejects absent or invalid canonical input before analysis and writing
   assert.equal(invalidRepository.replacements.length, 0);
 });
 
+void test('dissolves only current graph state when an orphan replay has no canonical launch', async () => {
+  const repository = new FakeRepository(null);
+
+  const projection = await new WalletGraphRebuildService(repository).rebuild(
+    'mint',
+    'DISSOLVE_CURRENT',
+  );
+
+  assert.equal(projection, null);
+  assert.deepEqual(repository.dissolutions, ['mint']);
+  assert.equal(repository.replacements.length, 0);
+});
+
 void test('propagates analyzer and repository failures without an extra write', async () => {
   const analysisFailure = new Error('analysis failed');
   const first = new FakeRepository(graphInput());
@@ -152,6 +168,7 @@ void test('propagates analyzer and repository failures without an extra write', 
 });
 
 class FakeRepository implements WalletGraphRepository {
+  public readonly dissolutions: string[] = [];
   public readonly replacements: {
     readonly projection: WalletGraphProjection;
     readonly event: WalletClusterDetectedEventV1;
@@ -168,6 +185,9 @@ class FakeRepository implements WalletGraphRepository {
   ): Promise<TResult> {
     return operation({
       loadCanonicalInput: async () => this.input,
+      dissolveCurrent: async (mint) => {
+        this.dissolutions.push(mint);
+      },
       replaceProjection: async (projection, event) => {
         if (this.replacementFailure !== undefined) throw this.replacementFailure;
         this.replacements.push({ projection, event });

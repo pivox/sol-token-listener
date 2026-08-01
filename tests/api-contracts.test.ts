@@ -264,6 +264,8 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
     pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE' },
     checkpoints: { launchpad: '1', market: null },
     heartbeat: {
+      runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+      workerState: 'RUNNING', reconcilerState: 'RUNNING', backlogCount: 0, leasedCount: 0,
       startedAt: '2026-07-29T12:00:00.000Z', updatedAt: '2026-07-29T12:00:00.000Z',
       lastHttpSlot: '1', lastWebsocketSlot: '1', lastFinalizedSlot: '1', lastSignature: null,
       pendingTransactions: 0, activeSessions: 0,
