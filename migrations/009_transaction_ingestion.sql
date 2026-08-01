@@ -125,6 +125,11 @@ CREATE INDEX IF NOT EXISTS chain_transaction_inbox_claim_idx
     processing_status, next_attempt_at, lease_expires_at, observed_slot, signature
   )
   WHERE processing_status IN ('PENDING', 'PROCESSING');
+CREATE INDEX IF NOT EXISTS chain_transaction_inbox_claim_order_idx
+  ON chain_transaction_inbox (observed_slot, signature)
+  WHERE processing_status = 'PENDING'
+     OR processing_status = 'PROCESSING'
+     OR (processing_status = 'FAILED' AND error_retryable = TRUE);
 CREATE INDEX IF NOT EXISTS chain_transaction_inbox_retry_idx
   ON chain_transaction_inbox (next_attempt_at, observed_slot, signature)
   WHERE processing_status = 'FAILED' AND error_retryable = TRUE;

@@ -444,6 +444,21 @@ void test('rejects very deep acyclic and cyclic error payloads with bounded Type
   );
 });
 
+void test('rejects negative zero anywhere in durable error data while keeping finite numbers', () => {
+  assert.throws(
+    () => createDurableTransactionSnapshot(normalizedTransaction({
+      error: Object.freeze({ nested: Object.freeze({ value: -0 }) }),
+    })),
+    (error: unknown) => error instanceof TypeError
+      && error.message === 'Normalized transaction error.nested.value must not be negative zero.',
+  );
+  const snapshot = createDurableTransactionSnapshot(normalizedTransaction({
+    error: Object.freeze({ negative: -1.25, positiveZero: 0, positive: 1.25 }),
+  }));
+  assert.deepEqual(snapshot.error, { negative: -1.25, positiveZero: 0, positive: 1.25 });
+  assert.equal(Object.is((snapshot.error as { readonly positiveZero: number }).positiveZero, -0), false);
+});
+
 void test('rejects mutable contracts, number slots and non-integer millisecond times', () => {
   const notification = Object.freeze({
     signature: 'signature',

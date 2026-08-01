@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
+import { inspect } from 'node:util';
 import test from 'node:test';
 import pg from 'pg';
 import type {
@@ -8,6 +9,7 @@ import type {
   TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
+import { restoreNormalizedTransactionSnapshot } from '../src/domain/transaction-ingestion.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import {
   PostgresTransactionInboxRepository,
@@ -56,9 +58,17 @@ void test('leases expire, renew, and reject stale tokens on every leased mutatio
     await repository.enqueue(notification('lease', 20n));
     const first = await repository.claim(10_000, 2);
     assert.ok(first);
-    await repository.renewLease('lease', first.leaseToken, 14_000);
+    await repository.renewLease('lease', first.leaseToken, 18_000);
+    await repository.renewLease('lease', first.leaseToken, 16_000);
+    assert.equal(new Date((await row(pool, 'lease')).lease_expires_at).getTime(), 18_000);
+    await Promise.all([
+      repository.renewLease('lease', first.leaseToken, 20_000),
+      repository.renewLease('lease', first.leaseToken, 19_000),
+    ]);
+    assert.equal(new Date((await row(pool, 'lease')).lease_expires_at).getTime(), 20_000);
     assert.equal(await repository.claim(12_001, 2), null);
-    const reclaimed = await repository.claim(14_001, 2);
+    assert.equal(await repository.claim(19_999, 2), null);
+    const reclaimed = await repository.claim(20_001, 2);
     assert.ok(reclaimed);
     assert.notEqual(reclaimed.leaseToken, first.leaseToken);
     assert.equal(reclaimed.attempts, 2);
@@ -97,6 +107,46 @@ void test('stores canonical bigint/base64 snapshots idempotently and rejects con
     );
     const replay = await repository.claim(50_001, 120);
     assert.equal(replay, null);
+  });
+});
+
+void test('rejects negative zero before JSONB and restores other finite snapshot numbers', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('negative-zero', 21n));
+    const negativeZeroClaim = await repository.claim(60_000, 120);
+    assert.ok(negativeZeroClaim);
+    await assert.rejects(repository.saveSnapshot(
+      'negative-zero',
+      negativeZeroClaim.leaseToken,
+      { ...normalized('negative-zero', 21n), error: { nested: { value: -0 } } },
+    ), TransactionInboxRepositoryError);
+    assert.equal((await row(pool, 'negative-zero')).normalized_transaction, null);
+    await repository.markFailed('negative-zero', negativeZeroClaim.leaseToken, Object.freeze({
+      code: 'NORMALIZATION_FAILED', errorName: 'TypeError', retryable: false,
+    }));
+
+    await repository.enqueue(notification('finite-numbers', 22n));
+    const finiteClaim = await repository.claim(60_001, 120);
+    assert.ok(finiteClaim);
+    await repository.saveSnapshot('finite-numbers', finiteClaim.leaseToken, {
+      ...normalized('finite-numbers', 22n),
+      error: { negative: -1.25, positiveZero: 0, positive: 1.25 },
+    });
+    const stored = await row(pool, 'finite-numbers');
+    assert.deepEqual(stored.normalized_transaction.error, {
+      negative: -1.25, positive: 1.25, positiveZero: 0,
+    });
+    assert.equal(Object.is(stored.normalized_transaction.error.positiveZero, -0), false);
+    await repository.markFailed('finite-numbers', finiteClaim.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    const retryAt = new Date((await row(pool, 'finite-numbers')).next_attempt_at).getTime();
+    const replay = await repository.claim(retryAt + 1, 120);
+    assert.ok(replay?.normalizedTransaction);
+    const restored = restoreNormalizedTransactionSnapshot(replay.normalizedTransaction);
+    assert.deepEqual(restored.error, { negative: -1.25, positive: 1.25, positiveZero: 0 });
+    assert.equal(Object.is((restored.error as { positiveZero: number }).positiveZero, -0), false);
   });
 });
 
@@ -250,12 +300,31 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
       lastFinalizedSlot: 49n, lastSignature: 'checkpoint', backlogCount: 3, leasedCount: 1,
     });
     await repository.writeHeartbeat(heartbeat);
+    await repository.writeHeartbeat(Object.freeze({
+      ...heartbeat,
+      runtimeState: 'DEGRADED',
+      subscriberState: 'STOPPED',
+      updatedAtMs: 299_999,
+      lastHttpSlot: 1n,
+      lastSignature: 'stale',
+      backlogCount: 0,
+      leasedCount: 0,
+    }));
+    await repository.writeHeartbeat(Object.freeze({
+      ...heartbeat,
+      runtimeState: 'STOPPED',
+      updatedAtMs: 300_000,
+      lastHttpSlot: 2n,
+      lastSignature: 'equal-conflict',
+    }));
     const storedHeartbeat = (await pool.query(
       "SELECT * FROM listener_heartbeats WHERE service_key = 'transaction-listener'",
     )).rows[0];
     assert.equal(storedHeartbeat.pending_transactions, 3);
     assert.equal(storedHeartbeat.leased_transactions, 1);
     assert.equal(storedHeartbeat.last_http_slot, '51');
+    assert.equal(storedHeartbeat.runtime_state, 'RUNNING');
+    assert.equal(storedHeartbeat.last_signature, 'checkpoint');
     assert.deepEqual(storedHeartbeat.payload, { startedAt: '1970-01-01T00:04:50.000Z' });
 
     await insertTerminal(pool, 'purge-me', new Date(Date.now() - 1_000));
@@ -318,6 +387,97 @@ void test('rolls back and releases a checked-out client after a database failure
   assert.deepEqual(queries, ['BEGIN',
     "SELECT pg_advisory_xact_lock(hashtextextended('transaction-inbox:' || $1, 0))",
     'ROLLBACK']);
+  assert.equal(released, true);
+});
+
+void test('uses an ordered partial index for a large mixed claim backlog', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, target_confirmation_status,
+      processing_status, observed_at
+    ) SELECT 'pending-' || value, value + 20000, ARRAY['WEBSOCKET'], 'processed',
+      'PENDING', clock_timestamp()
+      FROM generate_series(1, 10000) value`);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, target_confirmation_status,
+      processing_status, error_code, error_name, error_retryable, next_attempt_at, observed_at
+    ) SELECT 'retry-' || value, value, ARRAY['WEBSOCKET'], 'processed',
+      'FAILED', 'RPC_TRANSIENT', 'RpcError', TRUE, clock_timestamp() + INTERVAL '1 day',
+      clock_timestamp()
+      FROM generate_series(1, 10000) value`);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature, observed_slot, discovery_sources, target_confirmation_status,
+      processing_status, lease_token, lease_expires_at, observed_at
+    ) SELECT 'leased-' || value, value + 10000, ARRAY['WEBSOCKET'], 'processed',
+      'PROCESSING', 'lease-' || value, clock_timestamp() + INTERVAL '1 day',
+      clock_timestamp()
+      FROM generate_series(1, 10000) value`);
+    await pool.query('ANALYZE chain_transaction_inbox');
+    const explained = await pool.query(`EXPLAIN (FORMAT JSON)
+      SELECT signature FROM chain_transaction_inbox
+      WHERE processing_status = 'PENDING'
+         OR (processing_status = 'FAILED' AND error_retryable = TRUE
+             AND next_attempt_at <= clock_timestamp())
+         OR (processing_status = 'PROCESSING' AND lease_expires_at <= clock_timestamp())
+      ORDER BY observed_slot, signature
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1`);
+    const plan = explained.rows[0]?.['QUERY PLAN']?.[0]?.Plan;
+    assert.ok(plan);
+    const nodes = flattenPlan(plan);
+    assert.equal(plan['Node Type'], 'Limit');
+    assert.equal(plan['Plan Rows'], 1);
+    assert.equal(nodes.some((node) => node['Node Type'] === 'Seq Scan'), false);
+    assert.equal(nodes.some((node) => node['Node Type'] === 'Sort'), false);
+    assert.equal(nodes.some((node) =>
+      node['Index Name'] === 'chain_transaction_inbox_claim_order_idx'), true);
+    const claimed = await new PostgresTransactionInboxRepository(pool).claim(Date.now(), 120);
+    assert.equal(claimed?.signature, 'pending-1');
+  });
+});
+
+void test('does not retain raw external failures on any public error surface', async () => {
+  const secret = 'postgresql://reader:private-token@db.invalid/ledger';
+  const pool = {
+    connect: async () => { throw new Error('not used'); },
+    query: async () => { throw new DatabaseUnavailableError(secret); },
+  };
+  const repository = new PostgresTransactionInboxRepository(pool);
+  await assert.rejects(repository.counts(), (error) => {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    assertNoSecretSurface(error, secret);
+    assert.deepEqual(error.failures, [{ stage: 'operation', errorName: 'DatabaseUnavailableError' }]);
+    return true;
+  });
+});
+
+void test('preserves primary and rollback failure categories without retaining their secrets', async () => {
+  const primarySecret = 'https://rpc.invalid/key?token=primary-secret';
+  const rollbackSecret = 'postgresql://admin:rollback-secret@db.invalid/ledger';
+  let released = false;
+  const client = {
+    query: async (text: string) => {
+      if (text.includes('pg_advisory_xact_lock')) {
+        throw new DatabaseUnavailableError(primarySecret);
+      }
+      if (text === 'ROLLBACK') throw new RollbackFailureError(rollbackSecret);
+      return { rows: [], rowCount: 0 };
+    },
+    release: () => { released = true; },
+  };
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => client,
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+  await assert.rejects(repository.enqueue(notification('rollback-redaction', 1n)), (error) => {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    assert.deepEqual(error.failures, [
+      { stage: 'primary', errorName: 'DatabaseUnavailableError' },
+      { stage: 'rollback', errorName: 'RollbackFailureError' },
+    ]);
+    assertNoSecretSurface(error, primarySecret, rollbackSecret);
+    return true;
+  });
   assert.equal(released, true);
 });
 
@@ -390,4 +550,40 @@ async function insertTerminal(
 
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
+}
+
+class DatabaseUnavailableError extends Error {
+  public override readonly name = 'DatabaseUnavailableError';
+}
+
+class RollbackFailureError extends Error {
+  public override readonly name = 'RollbackFailureError';
+}
+
+function assertNoSecretSurface(value: unknown, ...secrets: readonly string[]): void {
+  const surfaces = [inspect(value, { depth: 20 }), JSON.stringify(value), ownPropertyText(value)];
+  for (const secret of secrets) {
+    for (const surface of surfaces) assert.doesNotMatch(surface, new RegExp(escapeRegex(secret), 'u'));
+  }
+}
+
+function ownPropertyText(value: unknown, seen = new Set<object>()): string {
+  if (typeof value !== 'object' || value === null) return String(value);
+  if (seen.has(value)) return '[cycle]';
+  seen.add(value);
+  return Reflect.ownKeys(value).map((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !('value' in descriptor)) return String(key);
+    return `${String(key)}:${ownPropertyText(descriptor.value, seen)}`;
+  }).join('|');
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+type ExplainPlan = Record<string, unknown> & { readonly Plans?: readonly ExplainPlan[] };
+
+function flattenPlan(plan: ExplainPlan): ExplainPlan[] {
+  return [plan, ...(plan.Plans ?? []).flatMap((nested) => flattenPlan(nested))];
 }

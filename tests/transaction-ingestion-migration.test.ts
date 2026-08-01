@@ -49,6 +49,8 @@ void test('creates a replayable bigint-safe transaction inbox with strict lifecy
   assert.match(sql, /terminal_at \+ INTERVAL '4 hours'/u);
   assert.match(sql, /target_confirmation_status IN \('finalized', 'orphaned'\)/u);
   assert.match(sql, /chain_transaction_inbox_claim_idx/u);
+  assert.match(sql, /chain_transaction_inbox_claim_order_idx/u);
+  assert.match(sql, /ON chain_transaction_inbox \(observed_slot, signature\)[\s\S]*processing_status = 'PENDING'[\s\S]*error_retryable = TRUE/u);
   assert.match(sql, /chain_transaction_inbox_finality_idx/u);
   assert.match(sql, /chain_transaction_inbox_purge_idx/u);
   assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);

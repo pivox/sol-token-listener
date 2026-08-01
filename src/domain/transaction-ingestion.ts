@@ -661,6 +661,7 @@ function assertDeepFrozenData(value: unknown, name: string): void {
   ) return;
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new TypeError(`${name} number must be finite.`);
+    if (Object.is(value, -0)) throw new TypeError(`${name} must not be negative zero.`);
     return;
   }
   if (Array.isArray(value)) {
@@ -722,6 +723,7 @@ function snapshotSafeDurableData(
   }
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new TypeError(`${name} number must be finite.`);
+    if (Object.is(value, -0)) throw new TypeError(`${name} must not be negative zero.`);
     return value;
   }
   if (typeof value !== 'object') throw new TypeError(`${name} must be durable data.`);

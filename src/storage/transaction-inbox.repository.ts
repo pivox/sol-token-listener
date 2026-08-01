@@ -60,16 +60,24 @@ interface InboxIdentityRow extends QueryResultRow {
 const SERVICE_KEY = 'transaction-listener';
 const MAX_DATE_MS = 8_640_000_000_000_000;
 
+export interface TransactionInboxFailureMetadata {
+  readonly stage: 'operation' | 'primary' | 'rollback';
+  readonly errorName: string;
+}
+
 export class TransactionInboxRepositoryError extends Error {
-  public constructor(cause: unknown) {
-    super('Transaction inbox repository operation failed.', { cause });
+  public readonly failures: readonly TransactionInboxFailureMetadata[];
+
+  public constructor(failures: readonly TransactionInboxFailureMetadata[] = []) {
+    super('Transaction inbox repository operation failed.');
     this.name = 'TransactionInboxRepositoryError';
+    this.failures = Object.freeze(failures.map((failure) => Object.freeze({ ...failure })));
   }
 }
 
 export class TransactionInboxConflictError extends TransactionInboxRepositoryError {
   public constructor(public readonly conflict: 'identity' | 'snapshot' | 'finality' | 'checkpoint') {
-    super(undefined);
+    super();
     this.name = 'TransactionInboxConflictError';
     this.message = 'Transaction inbox immutable state conflicts.';
   }
@@ -77,7 +85,7 @@ export class TransactionInboxConflictError extends TransactionInboxRepositoryErr
 
 export class TransactionInboxLeaseError extends TransactionInboxRepositoryError {
   public constructor() {
-    super(undefined);
+    super();
     this.name = 'TransactionInboxLeaseError';
     this.message = 'Transaction inbox lease is stale or missing.';
   }
@@ -196,7 +204,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       requireText(signature, 'signature');
       requireText(token, 'lease token');
       const result = await this.pool.query(
-        `UPDATE chain_transaction_inbox SET lease_expires_at = $3,
+        `UPDATE chain_transaction_inbox SET lease_expires_at = GREATEST(lease_expires_at, $3),
            updated_at = GREATEST(updated_at, clock_timestamp())
          WHERE signature = $1 AND lease_token = $2 AND processing_status = 'PROCESSING'`,
         [signature, token, dateFromMs(untilMs)],
@@ -523,7 +531,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            worker_state = EXCLUDED.worker_state,
            reconciler_state = EXCLUDED.reconciler_state,
            started_at = EXCLUDED.started_at,
-           leased_transactions = EXCLUDED.leased_transactions`,
+           leased_transactions = EXCLUDED.leased_transactions
+         WHERE EXCLUDED.updated_at > listener_heartbeats.updated_at`,
         [
           SERVICE_KEY,
           nullableBigInt(value.lastHttpSlot),
@@ -542,7 +551,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           toJsonValue({ startedAt: dateFromMs(value.startedAtMs).toISOString() }),
         ],
       );
-      requireOne(result.rowCount);
+      requireZeroOrOne(result.rowCount);
     });
   }
 
@@ -580,7 +589,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         try {
           await client.query('ROLLBACK');
         } catch (rollbackCause) {
-          throw new AggregateError([cause, rollbackCause], 'Transaction and rollback failed.');
+          throw new TransactionInboxRepositoryError([
+            safeFailureMetadata('primary', cause),
+            safeFailureMetadata('rollback', rollbackCause),
+          ]);
         }
         throw cause;
       }
@@ -594,7 +606,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       return await run();
     } catch (cause) {
       if (cause instanceof TransactionInboxRepositoryError) throw cause;
-      throw new TransactionInboxRepositoryError(cause);
+      throw new TransactionInboxRepositoryError([
+        safeFailureMetadata('operation', cause),
+      ]);
     }
   }
 }
@@ -836,6 +850,24 @@ function requireSafeErrorName(value: string): void {
   }
 }
 
+function safeFailureMetadata(
+  stage: TransactionInboxFailureMetadata['stage'],
+  value: unknown,
+): TransactionInboxFailureMetadata {
+  let errorName = 'Error';
+  if (value instanceof Error) {
+    try {
+      if (/^[A-Za-z_$][A-Za-z0-9_$.-]*$/u.test(value.name)
+        && Buffer.byteLength(value.name, 'utf8') <= 256) {
+        errorName = value.name;
+      }
+    } catch {
+      errorName = 'Error';
+    }
+  }
+  return Object.freeze({ stage, errorName });
+}
+
 function requireCheckpointKey(value: unknown): asserts value is 'launchpad' | 'market' {
   if (value !== 'launchpad' && value !== 'market') {
     throw new TypeError('Checkpoint key is invalid.');
@@ -849,6 +881,12 @@ function requiredRow(row: QueryResultRow | undefined): QueryResultRow {
 
 function requireOne(rowCount: number | null): void {
   if (rowCount !== 1) throw new TypeError('Repository mutation affected an unexpected row count.');
+}
+
+function requireZeroOrOne(rowCount: number | null): void {
+  if (rowCount !== 0 && rowCount !== 1) {
+    throw new TypeError('Repository mutation affected an unexpected row count.');
+  }
 }
 
 function requireLease(rowCount: number | null): void {
