@@ -309,6 +309,21 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
     await repository.markFailed('retry', retried.leaseToken, Object.freeze({
       code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
     }));
+    let capped = await row(pool, 'retry');
+    for (let expectedAttempt = 3; expectedAttempt <= 8; expectedAttempt += 1) {
+      const nextAttemptMs = new Date(capped.next_attempt_at).getTime();
+      const nextClaim = await repository.claim(nextAttemptMs + 1, 120);
+      assert.equal(nextClaim?.attempts, expectedAttempt);
+      assert.equal(nextClaim.signature, 'retry');
+      await repository.markFailed('retry', nextClaim.leaseToken, Object.freeze({
+        code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+      }));
+      capped = await row(pool, 'retry');
+    }
+    assert.equal(
+      new Date(capped.next_attempt_at).getTime() - new Date(capped.updated_at).getTime(),
+      60_000,
+    );
 
     await repository.enqueue(notification('unsafe-error-name', 42n));
     const unsafe = await repository.claim(retryAt + 2, 120);

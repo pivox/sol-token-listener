@@ -1,5 +1,8 @@
 import type { VersionedTransactionResponse } from '@solana/web3.js';
-import type { TransactionIngestionErrorCode } from '../../domain/transaction-ingestion.js';
+import type {
+  IngestionFailure,
+  TransactionIngestionErrorCode,
+} from '../../domain/transaction-ingestion.js';
 import { normalizeTransaction } from './transaction-fetcher.js';
 import type {
   LegacyConfirmationStatus,
@@ -12,6 +15,7 @@ export const MAX_BLOCK_SIGNATURE_COUNT = 100_000;
 export const MAX_TRANSACTION_SIGNATURE_LENGTH = 128;
 
 type LocatableConfirmationStatus = Exclude<LegacyConfirmationStatus, 'ORPHANED'>;
+const trustedTransactionLocatorErrors = new WeakMap<object, IngestionFailure>();
 
 export interface TransactionLocationTarget {
   readonly signature: string;
@@ -37,7 +41,17 @@ export abstract class TransactionLocatorError extends Error {
   ) {
     super('Solana transaction location failed.');
     this.name = 'TransactionLocatorError';
+    trustedTransactionLocatorErrors.set(this, fixedLocatorFailure(code));
   }
+}
+
+export function trustedTransactionLocatorFailure(
+  value: unknown,
+): IngestionFailure | null {
+  return typeof value === 'object'
+    && value !== null
+    ? trustedTransactionLocatorErrors.get(value) ?? null
+    : null;
 }
 
 export class RpcTransientError extends TransactionLocatorError {
@@ -125,6 +139,25 @@ export class SolanaTransactionLocator {
 }
 
 export { SolanaTransactionLocator as TransactionLocator };
+
+function fixedLocatorFailure(code: TransactionIngestionErrorCode): IngestionFailure {
+  switch (code) {
+    case 'RPC_TRANSIENT':
+      return Object.freeze({ code, errorName: 'RpcTransientError', retryable: true });
+    case 'TRANSACTION_NOT_AVAILABLE':
+      return Object.freeze({ code, errorName: 'TransactionUnavailableError', retryable: true });
+    case 'BLOCK_NOT_AVAILABLE':
+      return Object.freeze({ code, errorName: 'BlockUnavailableError', retryable: true });
+    case 'TRANSACTION_INDEX_NOT_FOUND':
+      return Object.freeze({ code, errorName: 'TransactionIndexNotFoundError', retryable: false });
+    case 'NORMALIZATION_FAILED':
+      return Object.freeze({ code, errorName: 'TransactionNormalizationError', retryable: false });
+    default:
+      return Object.freeze({
+        code: 'RPC_TRANSIENT', errorName: 'TransactionLocatorError', retryable: true,
+      });
+  }
+}
 
 function readCanonicalRawSlot(response: VersionedTransactionResponse): number | null {
   try {
