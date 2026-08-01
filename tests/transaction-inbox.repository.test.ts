@@ -30,7 +30,14 @@ void test('merges discoveries, rejects identity contradictions, and claims concu
     assert.equal(stored.target_confirmation_status, 'confirmed');
     await assert.rejects(
       repository.enqueue(notification('shared', 11n, 'WEBSOCKET', 'confirmed', 1_200)),
-      TransactionInboxConflictError,
+      (error) => {
+        assert.ok(error instanceof TransactionInboxConflictError);
+        assert.equal(error.conflict, 'identity');
+        assert.equal(error.message, 'Transaction inbox immutable state conflicts.');
+        assert.deepEqual(error.failures, []);
+        assert.equal(Object.hasOwn(error, 'cause'), false);
+        return true;
+      },
     );
 
     await repository.enqueue(notification('second', 11n, 'WEBSOCKET', 'processed', 1_100));
@@ -77,7 +84,13 @@ void test('leases expire, renew, and reject stale tokens on every leased mutatio
     const failure: IngestionFailure = Object.freeze({
       code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
     });
-    await assert.rejects(repository.renewLease('lease', stale, 20_000), TransactionInboxLeaseError);
+    await assert.rejects(repository.renewLease('lease', stale, 20_000), (error) => {
+      assert.ok(error instanceof TransactionInboxLeaseError);
+      assert.equal(error.message, 'Transaction inbox lease is stale or missing.');
+      assert.deepEqual(error.failures, []);
+      assert.equal(Object.hasOwn(error, 'cause'), false);
+      return true;
+    });
     await assert.rejects(repository.saveSnapshot('lease', stale, normalized('lease', 20n)), TransactionInboxLeaseError);
     await assert.rejects(repository.markProcessed('lease', stale, 'confirmed'), TransactionInboxLeaseError);
     await assert.rejects(repository.markFailed('lease', stale, failure), TransactionInboxLeaseError);
@@ -485,6 +498,127 @@ void test('does not introspect a proxy thrown by the database boundary', async (
   assert.equal(trapCalls, 0);
 });
 
+void test('sanitizes externally constructed repository error subclasses without retaining identity', async () => {
+  const secret = 'postgresql://subclass:external-secret@db.invalid/ledger';
+  class ExternalLeaseError extends TransactionInboxLeaseError {
+    public readonly externalSecret = secret;
+
+    public constructor() {
+      super();
+      Object.defineProperty(this, 'cause', {
+        configurable: true,
+        enumerable: true,
+        value: new Error(secret),
+      });
+    }
+  }
+  const hostile = new ExternalLeaseError();
+  const repository = repositoryThrowing(hostile);
+
+  await assert.rejects(repository.counts(), (error) => {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    assert.equal(error instanceof TransactionInboxLeaseError, false);
+    assert.notEqual(error, hostile);
+    assert.deepEqual(error.failures, [{
+      stage: 'operation',
+      failureKind: 'DATABASE_OPERATION',
+      errorName: 'TransactionInboxDatabaseOperationError',
+    }]);
+    assertNoSecretSurface(error, secret);
+    return true;
+  });
+});
+
+void test('sanitizes externally constructed conflict errors and prototype forgeries', async () => {
+  const constructorSecret = 'constructor-owned-conflict-secret';
+  const external = new TransactionInboxConflictError('identity');
+  Object.defineProperties(external, {
+    cause: { enumerable: true, value: new Error(constructorSecret) },
+    externalSecret: { enumerable: true, value: constructorSecret },
+  });
+  await assert.rejects(repositoryThrowing(external).counts(), (error) => {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    assert.equal(error instanceof TransactionInboxConflictError, false);
+    assert.notEqual(error, external);
+    assertNoSecretSurface(error, constructorSecret);
+    return true;
+  });
+
+  const forgedSecret = 'prototype-forged-conflict-secret';
+  const forged = Object.create(TransactionInboxConflictError.prototype) as object;
+  Object.defineProperty(forged, 'externalSecret', { enumerable: true, value: forgedSecret });
+  await assert.rejects(repositoryThrowing(forged).counts(), (error) => {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    assert.equal(error instanceof TransactionInboxConflictError, false);
+    assert.notEqual(error, forged);
+    assertNoSecretSurface(error, forgedSecret);
+    return true;
+  });
+});
+
+void test('sanitizes a previously emitted internal error when an external pool replays it', async () => {
+  const internalRepository = new PostgresTransactionInboxRepository({
+    connect: async () => { throw new Error('not used'); },
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+  let emitted: TransactionInboxLeaseError | undefined;
+  try {
+    await internalRepository.renewLease('lease', 'stale-token', 20_000);
+    assert.fail('Expected the stale lease operation to reject.');
+  } catch (error) {
+    assert.ok(error instanceof TransactionInboxLeaseError);
+    emitted = error;
+  }
+  assert.ok(emitted);
+
+  const secret = 'replayed-internal-error-secret';
+  Object.defineProperties(emitted, {
+    cause: { enumerable: true, value: new Error(secret) },
+    externalSecret: { enumerable: true, value: secret },
+  });
+  await assert.rejects(repositoryThrowing(emitted).counts(), (error) => {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    assert.equal(error instanceof TransactionInboxLeaseError, false);
+    assert.notEqual(error, emitted);
+    assert.deepEqual(error.failures, [{
+      stage: 'operation',
+      failureKind: 'DATABASE_OPERATION',
+      errorName: 'TransactionInboxDatabaseOperationError',
+    }]);
+    assertNoSecretSurface(error, secret);
+    return true;
+  });
+});
+
+void test('sanitizes a replayed terminal repository wrapper', async () => {
+  let emitted: TransactionInboxRepositoryError | undefined;
+  try {
+    await repositoryThrowing(new Error('initial external failure')).counts();
+    assert.fail('Expected the external database failure to reject.');
+  } catch (error) {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    emitted = error;
+  }
+  assert.ok(emitted);
+
+  const secret = 'replayed-terminal-wrapper-secret';
+  Object.defineProperties(emitted, {
+    cause: { enumerable: true, value: new Error(secret) },
+    externalSecret: { enumerable: true, value: secret },
+  });
+  await assert.rejects(repositoryThrowing(emitted).counts(), (error) => {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    assert.notEqual(error, emitted);
+    assert.deepEqual(error.failures, [{
+      stage: 'operation',
+      failureKind: 'DATABASE_OPERATION',
+      errorName: 'TransactionInboxDatabaseOperationError',
+    }]);
+    assertNoSecretSurface(error, secret);
+    return true;
+  });
+});
+
 void test('preserves primary and rollback failure categories without retaining their secrets', async () => {
   const primarySecret = 'https://rpc.invalid/key?token=primary-secret';
   const rollbackSecret = 'postgresql://admin:rollback-secret@db.invalid/ledger';
@@ -616,6 +750,13 @@ function assertNoSecretSurface(value: unknown, ...secrets: readonly string[]): v
   for (const secret of secrets) {
     for (const surface of surfaces) assert.doesNotMatch(surface, new RegExp(escapeRegex(secret), 'u'));
   }
+}
+
+function repositoryThrowing(value: unknown): PostgresTransactionInboxRepository {
+  return new PostgresTransactionInboxRepository({
+    connect: async () => { throw new Error('not used'); },
+    query: async () => { throw value; },
+  });
 }
 
 function ownPropertyText(value: unknown, seen = new Set<object>()): string {

@@ -66,26 +66,21 @@ export interface TransactionInboxFailureMetadata {
   readonly errorName: string;
 }
 
-const INTERNAL_REPOSITORY_ERROR = Symbol('internal-repository-error');
 const trustedRepositoryErrors = new WeakSet();
 
 export class TransactionInboxRepositoryError extends Error {
   public readonly failures: readonly TransactionInboxFailureMetadata[];
 
-  public constructor(
-    failures: readonly TransactionInboxFailureMetadata[] = [],
-    trustToken?: symbol,
-  ) {
+  public constructor(failures: readonly TransactionInboxFailureMetadata[] = []) {
     super('Transaction inbox repository operation failed.');
     this.name = 'TransactionInboxRepositoryError';
     this.failures = Object.freeze(failures.map((failure) => Object.freeze({ ...failure })));
-    if (trustToken === INTERNAL_REPOSITORY_ERROR) trustedRepositoryErrors.add(this);
   }
 }
 
 export class TransactionInboxConflictError extends TransactionInboxRepositoryError {
   public constructor(public readonly conflict: 'identity' | 'snapshot' | 'finality' | 'checkpoint') {
-    super([], INTERNAL_REPOSITORY_ERROR);
+    super();
     this.name = 'TransactionInboxConflictError';
     this.message = 'Transaction inbox immutable state conflicts.';
   }
@@ -93,7 +88,7 @@ export class TransactionInboxConflictError extends TransactionInboxRepositoryErr
 
 export class TransactionInboxLeaseError extends TransactionInboxRepositoryError {
   public constructor() {
-    super([], INTERNAL_REPOSITORY_ERROR);
+    super();
     this.name = 'TransactionInboxLeaseError';
     this.message = 'Transaction inbox lease is stale or missing.';
   }
@@ -135,7 +130,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           return;
         }
         if (numericBigInt(row.observed_slot, 'observed slot') !== value.slot) {
-          throw new TransactionInboxConflictError('identity');
+          throw internalRepositoryError(new TransactionInboxConflictError('identity'));
         }
         const current = confirmation(row.target_confirmation_status);
         const next = reconciledStatus(current, value.confirmationStatus);
@@ -145,7 +140,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const processingStatus = inboxStatus(row.processing_status);
         const shouldReplay = processingStatus === 'PROCESSED' && next !== current;
         if (shouldReplay && row.normalized_transaction === null) {
-          throw new TransactionInboxConflictError('snapshot');
+          throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
         }
         const updated = await client.query(
           `UPDATE chain_transaction_inbox SET
@@ -230,18 +225,20 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       requireText(signature, 'signature');
       requireText(token, 'lease token');
       const snapshot = createDurableTransactionSnapshot(tx);
-      if (snapshot.signature !== signature) throw new TransactionInboxConflictError('identity');
+      if (snapshot.signature !== signature) {
+        throw internalRepositoryError(new TransactionInboxConflictError('identity'));
+      }
       const fingerprint = snapshotFingerprint(snapshot);
       await this.transaction(async (client) => {
         const locked = await leasedRow(client, signature, token,
           'observed_slot, target_confirmation_status, normalized_transaction, immutable_fingerprint');
         if (numericBigInt(locked.observed_slot, 'observed slot') !== snapshot.slot) {
-          throw new TransactionInboxConflictError('identity');
+          throw internalRepositoryError(new TransactionInboxConflictError('identity'));
         }
         assertSnapshotCompatible(snapshot, confirmation(locked.target_confirmation_status));
         if (locked.normalized_transaction !== null) {
           if (requiredText(locked.immutable_fingerprint, 'immutable fingerprint') !== fingerprint) {
-            throw new TransactionInboxConflictError('snapshot');
+            throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
           }
           decodeSnapshot(
             locked.normalized_transaction,
@@ -286,7 +283,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           `observed_slot, target_confirmation_status, normalized_transaction,
            immutable_fingerprint`);
         if (locked.normalized_transaction === null) {
-          throw new TransactionInboxConflictError('snapshot');
+          throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
         }
         const next = reconciledStatus(confirmation(locked.target_confirmation_status), status);
         decodeSnapshot(
@@ -377,22 +374,22 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const row = selected.rows[0];
         if (row === undefined
           || inboxStatus(row.processing_status) !== 'PROCESSED') {
-          throw new TransactionInboxConflictError('finality');
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
         const current = confirmation(row.target_confirmation_status);
         if (current !== 'processed' && current !== 'confirmed') {
-          throw new TransactionInboxConflictError('finality');
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
         const missing = safeCount(row.missing_finality_polls, 'missing finality polls');
         if (missing !== value.expectedMissingFinalityPolls) {
-          throw new TransactionInboxConflictError('finality');
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
         const nextStatus = value.confirmationStatus === null
           ? current
           : reconciledStatus(current, value.confirmationStatus);
         const nextMissing = value.confirmationStatus === null ? missing + 1 : 0;
         if (!Number.isSafeInteger(nextMissing)) {
-          throw new TransactionInboxConflictError('finality');
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
         const updated = await client.query(
           `UPDATE chain_transaction_inbox SET
@@ -413,7 +410,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             dateFromMs(value.observedAtMs),
           ],
         );
-        if (updated.rowCount !== 1) throw new TransactionInboxConflictError('finality');
+        if (updated.rowCount !== 1) {
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+        }
         return finalityCandidateFromRow(requiredRow(updated.rows[0]));
       });
     });
@@ -431,7 +430,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         );
         const row = selected.rows[0];
         if (row === undefined || row.normalized_transaction === null) {
-          throw new TransactionInboxConflictError('snapshot');
+          throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
         }
         const current = confirmation(row.target_confirmation_status);
         const next = reconciledStatus(current, value.confirmationStatus);
@@ -446,9 +445,11 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (next === current) {
           if (status === 'PROCESSED' && (current === 'finalized' || current === 'orphaned')) return;
           if (status === 'PENDING') return;
-          throw new TransactionInboxConflictError('finality');
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
-        if (status !== 'PROCESSED') throw new TransactionInboxConflictError('finality');
+        if (status !== 'PROCESSED') {
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+        }
         const result = await client.query(
           `UPDATE chain_transaction_inbox SET
              target_confirmation_status = $2, processing_status = 'PENDING',
@@ -497,7 +498,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             || (value.slot === currentSlot
               && value.signature !== currentSignature
               && value.updatedAtMs <= dateMs(row.updated_at, 'checkpoint updated at'))) {
-            throw new TransactionInboxConflictError('checkpoint');
+            throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
           }
         }
         const result = await client.query(
@@ -597,10 +598,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         try {
           await client.query('ROLLBACK');
         } catch {
-          throw new TransactionInboxRepositoryError([
+          throw internalRepositoryError(new TransactionInboxRepositoryError([
             safeFailureMetadata('primary'),
             safeFailureMetadata('rollback'),
-          ], INTERNAL_REPOSITORY_ERROR);
+          ]));
         }
         throw cause;
       }
@@ -613,10 +614,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     try {
       return await run();
     } catch (cause) {
-      if (isTrustedRepositoryError(cause)) throw cause;
+      if (consumeTrustedRepositoryError(cause)) throw cause;
       throw new TransactionInboxRepositoryError([
         safeFailureMetadata('operation'),
-      ], INTERNAL_REPOSITORY_ERROR);
+      ]);
     }
   }
 }
@@ -634,7 +635,9 @@ async function leasedRow(
     [signature, token],
   );
   const row = result.rows[0];
-  if (row === undefined || result.rowCount !== 1) throw new TransactionInboxLeaseError();
+  if (row === undefined || result.rowCount !== 1) {
+    throw internalRepositoryError(new TransactionInboxLeaseError());
+  }
   return row;
 }
 
@@ -745,7 +748,7 @@ function reconciledStatus(
   try {
     return reconcileConfirmationStatus(current, incoming) === 'update' ? incoming : current;
   } catch {
-    throw new TransactionInboxConflictError('finality');
+    throw internalRepositoryError(new TransactionInboxConflictError('finality'));
   }
 }
 
@@ -874,10 +877,15 @@ function safeFailureMetadata(
     });
 }
 
-function isTrustedRepositoryError(value: unknown): value is TransactionInboxRepositoryError {
+function consumeTrustedRepositoryError(value: unknown): value is TransactionInboxRepositoryError {
   return typeof value === 'object'
     && value !== null
-    && trustedRepositoryErrors.has(value);
+    && trustedRepositoryErrors.delete(value);
+}
+
+function internalRepositoryError<T extends TransactionInboxRepositoryError>(error: T): T {
+  trustedRepositoryErrors.add(error);
+  return error;
 }
 
 function requireCheckpointKey(value: unknown): asserts value is 'launchpad' | 'market' {
@@ -902,7 +910,7 @@ function requireZeroOrOne(rowCount: number | null): void {
 }
 
 function requireLease(rowCount: number | null): void {
-  if (rowCount !== 1) throw new TransactionInboxLeaseError();
+  if (rowCount !== 1) throw internalRepositoryError(new TransactionInboxLeaseError());
 }
 
 function deepFreeze(value: unknown): unknown {
