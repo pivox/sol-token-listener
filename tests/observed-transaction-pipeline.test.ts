@@ -13,6 +13,12 @@ import {
 import type { LaunchpadObservationEventV1 } from '../src/domain/launchpad-events.js';
 import type { LaunchpadProjectionReader } from '../src/ports/launchpad-projection-reader.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
+import type { LaunchParameterObject } from '../src/domain/types.js';
+import {
+  MAX_CANONICAL_JSON_STRING_BYTES,
+  MAX_CANONICAL_JSON_TEXT_BYTES,
+  stringifyJson,
+} from '../src/utils/json.js';
 
 const SIGNATURE = 'pipeline-signature';
 const EVENT_INDEXES = new Map<string, number>();
@@ -45,6 +51,7 @@ function event(
   id: string,
   mint: string,
   type: LaunchpadObservationEventV1['type'] = 'BondingCurveTradeObserved',
+  parameters: LaunchParameterObject = {},
 ): LaunchpadObservationEventV1 {
   let instructionIndex = EVENT_INDEXES.get(id);
   if (instructionIndex === undefined) {
@@ -78,7 +85,7 @@ function event(
         quoteAssets: [{ mint: 'QuoteMint', decimals: 9, tokenProgram: 'SPL_TOKEN' }],
         launchpad: 'pumpfun',
         createdAt: cursor,
-        parameters: {},
+        parameters,
       },
     });
   }
@@ -97,6 +104,92 @@ function event(
       cursor,
     },
   });
+}
+
+const MAX_SNAPSHOT_NODES = MAX_OBSERVED_PIPELINE_ITEMS * 24;
+
+function numericChunks(length: number, value = 0): readonly (readonly number[])[] {
+  const chunks: number[][] = [];
+  for (let offset = 0; offset < length; offset += MAX_OBSERVED_PIPELINE_ITEMS) {
+    chunks.push(Array.from(
+      { length: Math.min(MAX_OBSERVED_PIPELINE_ITEMS, length - offset) },
+      () => value,
+    ));
+  }
+  return chunks;
+}
+
+function launchWithNumericLeaves(
+  id: string,
+  leaves: number,
+  value = 0,
+  padding = '',
+): LaunchpadObservationEventV1 {
+  return event(id, 'BoundedMint', 'TokenLaunchDetected', {
+    chunks: numericChunks(leaves, value),
+    padding,
+  });
+}
+
+function visitedSnapshotValues(value: unknown, memo = new WeakSet()): number {
+  if (typeof value !== 'object' || value === null) return 1;
+  if (memo.has(value)) return 1;
+  memo.add(value);
+  let count = 1;
+  if (Array.isArray(value)) {
+    for (const nested of value as readonly unknown[]) {
+      count += visitedSnapshotValues(nested, memo);
+    }
+    return count;
+  }
+  for (const nested of Object.values(value as Readonly<Record<string, unknown>>)) {
+    count += visitedSnapshotValues(nested, memo);
+  }
+  return count;
+}
+
+function launchAtSnapshotNodeLimit(): {
+  readonly exact: LaunchpadObservationEventV1;
+  readonly leaves: number;
+} {
+  let leaves = MAX_SNAPSHOT_NODES - 100;
+  for (;;) {
+    const exact = launchWithNumericLeaves('node-bound', leaves);
+    const count = visitedSnapshotValues([exact]);
+    if (count === MAX_SNAPSHOT_NODES) return { exact, leaves };
+    leaves += MAX_SNAPSHOT_NODES - count;
+  }
+}
+
+function launchAtSerializedByteLimit(): {
+  readonly exact: LaunchpadObservationEventV1;
+  readonly leaves: number;
+  readonly paddingBytes: number;
+} {
+  let leaves = 60_000;
+  for (;;) {
+    const unpadded = launchWithNumericLeaves(
+      'serialized-bound',
+      leaves,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const bytes = Buffer.byteLength(stringifyJson([unpadded]), 'utf8');
+    const paddingBytes = MAX_CANONICAL_JSON_TEXT_BYTES - bytes;
+    if (paddingBytes >= 0 && paddingBytes < MAX_CANONICAL_JSON_STRING_BYTES) {
+      const exact = launchWithNumericLeaves(
+        'serialized-bound',
+        leaves,
+        Number.MAX_SAFE_INTEGER,
+        'x'.repeat(paddingBytes),
+      );
+      assert.equal(
+        Buffer.byteLength(stringifyJson([exact]), 'utf8'),
+        MAX_CANONICAL_JSON_TEXT_BYTES,
+      );
+      return { exact, leaves, paddingBytes };
+    }
+    leaves += Math.max(1, Math.floor((paddingBytes - 8_192) / 17));
+  }
 }
 
 interface HarnessOptions {
@@ -494,7 +587,11 @@ void test('captures active event array length once from a stateful proxy', async
     },
   });
   const h = harness({ activeEvents: events });
-  await assert.doesNotReject(h.pipeline.process(h.tx));
+  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
+    return true;
+  });
   assert.equal(lengthReads, 1);
 });
 
@@ -619,14 +716,18 @@ void test('bounds tracked and launchpad affected iterators at max plus one and r
   }
 });
 
-void test('accepts the exact active-event bound and rejects one additional item', async () => {
+void test('applies the serialized bound within the active-event item bound and rejects one additional item', async () => {
   const repeated = event('bounded-event', 'MintA');
   const exact = harness({
     activeEvents: Object.freeze(
       new Array<LaunchpadObservationEventV1>(MAX_OBSERVED_PIPELINE_ITEMS).fill(repeated),
     ),
   });
-  await assert.doesNotReject(exact.pipeline.process(exact.tx));
+  await assert.rejects(exact.pipeline.process(exact.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
+    return true;
+  });
   const oversized = harness({
     activeEvents: Object.freeze(
       new Array<LaunchpadObservationEventV1>(MAX_OBSERVED_PIPELINE_ITEMS + 1).fill(repeated),
@@ -637,4 +738,48 @@ void test('accepts the exact active-event bound and rejects one additional item'
     assert.equal(error.stage, 'reload_active_events');
     return true;
   });
+});
+
+void test('counts every visited leaf at the snapshot node limit and rejects one more before funding', async () => {
+  const { exact, leaves } = launchAtSnapshotNodeLimit();
+  assert.equal(visitedSnapshotValues([exact]), MAX_SNAPSHOT_NODES);
+  const accepted = harness({ activeEvents: [exact] });
+  await assert.doesNotReject(accepted.pipeline.process(accepted.tx));
+
+  const oversized = launchWithNumericLeaves('node-bound', leaves + 1);
+  assert.equal(visitedSnapshotValues([oversized]), MAX_SNAPSHOT_NODES + 1);
+  const rejected = harness({ activeEvents: [oversized] });
+  await assert.rejects(rejected.pipeline.process(rejected.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
+    assert.equal('cause' in error, false);
+    return true;
+  });
+  assert.deepEqual(rejected.order, ['tracked', 'launchpad', 'reload']);
+});
+
+void test('enforces exact aggregate serialized bytes including numeric leaves and JSON syntax', async () => {
+  const { exact, leaves, paddingBytes } = launchAtSerializedByteLimit();
+  const accepted = harness({ activeEvents: [exact] });
+  await assert.doesNotReject(accepted.pipeline.process(accepted.tx));
+
+  const oversized = launchWithNumericLeaves(
+    'serialized-bound',
+    leaves,
+    Number.MAX_SAFE_INTEGER,
+    'x'.repeat(paddingBytes + 1),
+  );
+  assert.equal(
+    Buffer.byteLength(stringifyJson([oversized]), 'utf8'),
+    MAX_CANONICAL_JSON_TEXT_BYTES + 1,
+  );
+  const rejected = harness({ activeEvents: [oversized] });
+  await assert.rejects(rejected.pipeline.process(rejected.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'reload_active_events');
+    assert.equal(error.message.includes('serialized'), false);
+    assert.equal('cause' in error, false);
+    return true;
+  });
+  assert.deepEqual(rejected.order, ['tracked', 'launchpad', 'reload']);
 });

@@ -13,6 +13,7 @@ import {
   MAX_CANONICAL_JSON_DEPTH,
   MAX_CANONICAL_JSON_STRING_BYTES,
   MAX_CANONICAL_JSON_TEXT_BYTES,
+  stringifyJson,
 } from '../utils/json.js';
 
 export const MAX_OBSERVED_PIPELINE_ITEMS = 4_096;
@@ -180,6 +181,7 @@ interface ActiveContext {
 
 function snapshotActiveContext(value: unknown): ActiveContext {
   const snapshot = deepSnapshot(value, 0, snapshotState());
+  assertSerializedSnapshotBound(snapshot);
   if (!Array.isArray(snapshot)) throw new TypeError('active events must be an array');
   const byId = new Map<string, LaunchpadObservationEventV1>();
   const events: LaunchpadObservationEventV1[] = [];
@@ -279,6 +281,13 @@ function snapshotState(): SnapshotState {
 }
 
 function deepSnapshot(value: unknown, depth: number, state: SnapshotState): unknown {
+  // A node is every visited value (containers and leaves). Property names and
+  // array indexes are text-budget entries, not nodes.
+  state.nodes += 1;
+  if (state.nodes > MAX_OBSERVED_PIPELINE_SNAPSHOT_NODES) {
+    throw new RangeError('snapshot too large');
+  }
+  if (depth > MAX_CANONICAL_JSON_DEPTH) throw new RangeError('snapshot too deep');
   if (typeof value === 'string') {
     accountText(value, state);
     return value;
@@ -293,14 +302,9 @@ function deepSnapshot(value: unknown, depth: number, state: SnapshotState): unkn
     return value;
   }
   if (typeof value !== 'object') throw new TypeError('invalid snapshot value');
-  if (depth > MAX_CANONICAL_JSON_DEPTH) throw new RangeError('snapshot too deep');
   if (state.ancestors.has(value)) throw new TypeError('cyclic snapshot');
   const memoized = state.memo.get(value);
   if (memoized !== undefined) return memoized;
-  state.nodes += 1;
-  if (state.nodes > MAX_OBSERVED_PIPELINE_SNAPSHOT_NODES) {
-    throw new RangeError('snapshot too large');
-  }
   const prototype: unknown = Reflect.getPrototypeOf(value);
   state.ancestors.add(value);
   try {
@@ -343,6 +347,13 @@ function deepSnapshot(value: unknown, depth: number, state: SnapshotState): unkn
     return result;
   } finally {
     state.ancestors.delete(value);
+  }
+}
+
+function assertSerializedSnapshotBound(value: unknown): void {
+  const serialized = stringifyJson(value);
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_CANONICAL_JSON_TEXT_BYTES) {
+    throw new RangeError('snapshot serialization too large');
   }
 }
 
