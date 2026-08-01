@@ -160,7 +160,49 @@ void test('terminal handler redacts the failure and sets exitCode', () => {
   const logs: object[] = [];
   reportEntrypointFailure(new Error('credential-like-detail'), runtime, (context) => { logs.push(context); });
   assert.equal(runtime.exitCode, 1);
-  assert.deepEqual(logs, [{ event: 'listener.start_failed', errorName: 'Error' }]);
+  assert.deepEqual(logs, [{ event: 'listener.start_failed', errorName: 'UnknownError' }]);
+});
+
+void test('terminal handler reads only a bounded own enumerable name data descriptor', () => {
+  let getterReads = 0;
+  const getter = Object.defineProperty({}, 'name', {
+    enumerable: true,
+    get() { getterReads += 1; throw new Error('getter secret'); },
+  });
+  const prototype = Object.create(Object.defineProperty({}, 'name', {
+    get() { getterReads += 1; throw new Error('prototype secret'); },
+  })) as object;
+  const proxy = new Proxy({}, {
+    getOwnPropertyDescriptor() { throw new Error('proxy descriptor secret'); },
+    getPrototypeOf() { throw new Error('proxy prototype secret'); },
+    get() { throw new Error('proxy get secret'); },
+  });
+  const errors: unknown[] = [getter, prototype, proxy, 'primitive secret', {
+    name: 'x'.repeat(65), message: 'message secret',
+  }];
+
+  for (const error of errors) {
+    const logs: object[] = [];
+    assert.doesNotThrow(() => {
+      reportEntrypointFailure(
+        error,
+        { exitCode: undefined },
+        (context) => { logs.push(context); },
+      );
+    });
+    assert.deepEqual(logs, [{ event: 'listener.start_failed', errorName: 'UnknownError' }]);
+    assert.doesNotMatch(JSON.stringify(logs), /secret/u);
+  }
+  assert.equal(getterReads, 0);
+
+  const logs: object[] = [];
+  reportEntrypointFailure(
+    { name: 'ListenerStartupError', message: 'message secret' },
+    { exitCode: undefined },
+    (context) => { logs.push(context); },
+  );
+  assert.deepEqual(logs, [{ event: 'listener.start_failed', errorName: 'ListenerStartupError' }]);
+  assert.doesNotMatch(JSON.stringify(logs), /secret/u);
 });
 
 void test('signal waiter removes both listeners after the first signal', async () => {

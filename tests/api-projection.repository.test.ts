@@ -1092,6 +1092,67 @@ void test('rejects invalid heartbeat runtime states and impossible runtime count
   }
 });
 
+void test('redacts hostile dynamic pipeline providers into canonical DEGRADED health', async () => {
+  let getterReads = 0;
+  const getterState = Object.defineProperty({}, 'httpAvailable', {
+    enumerable: true,
+    get() { getterReads += 1; throw new Error('pipeline getter secret'); },
+  });
+  const hostileProxy = new Proxy({}, {
+    ownKeys() { throw new Error('pipeline proxy secret'); },
+    getOwnPropertyDescriptor() { throw new Error('pipeline descriptor secret'); },
+    get() { throw new Error('pipeline get secret'); },
+  });
+  const providers: (() => unknown)[] = [
+    () => { throw new Error('pipeline provider secret'); },
+    () => getterState,
+    () => hostileProxy,
+  ];
+
+  for (const provider of providers) {
+    const repository = new PostgresApiProjectionRepository(
+      new FakeQueryable(() => { throw new Error('must not query after invalid pipeline'); }),
+      () => openedAt,
+      provider as () => { httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING' },
+    );
+    const health = await repository.getHealth();
+    assert.equal(health.status, 'DEGRADED');
+    assert.deepEqual(health.http, { status: 'UNAVAILABLE' });
+    assert.deepEqual(health.pipeline, { pumpfun: 'DEGRADED', pumpswap: 'DEGRADED' });
+    assert.ok(Object.isFrozen(health.pipeline));
+    assert.doesNotMatch(JSON.stringify(health), /secret/u);
+  }
+  assert.equal(getterReads, 0);
+});
+
+void test('snapshots a dynamic pipeline provider exactly once without retaining its object', async () => {
+  let providerCalls = 0;
+  const original = { httpAvailable: true, pumpfun: 'RUNNING' as const, pumpswap: 'RUNNING' as const };
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
+    if (call.text.includes('listener_heartbeats')) return [{
+      updated_at: openedAt, started_at: openedAt, last_http_slot: '10',
+      last_websocket_slot: '10', last_finalized_slot: '9', last_signature: null,
+      pending_transactions: 0, active_sessions: 0, leased_transactions: 0,
+      runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
+      worker_state: 'RUNNING', reconciler_state: 'RUNNING',
+    }];
+    return [];
+  });
+  const health = await new PostgresApiProjectionRepository(database, () => openedAt, () => {
+    providerCalls += 1;
+    if (providerCalls > 1) throw new Error('stateful provider secret');
+    return original;
+  }).getHealth();
+
+  original.pumpfun = 'RUNNING';
+  assert.equal(providerCalls, 1);
+  assert.deepEqual(health.pipeline, { pumpfun: 'RUNNING', pumpswap: 'RUNNING' });
+  assert.ok(Object.isFrozen(health.pipeline));
+  assert.notEqual(health.pipeline, original);
+  assert.doesNotMatch(JSON.stringify(health), /secret/u);
+});
+
 void test('reports PostgreSQL unavailable without leaking a rejected health query', async () => {
   const database = new FakeQueryable(() => { throw new Error('connection secret'); });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt).getHealth();

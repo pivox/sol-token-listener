@@ -202,5 +202,19 @@ export function reportEntrypointFailure(
 }
 
 function safeErrorName(error: unknown): string {
-  return error instanceof Error && /^[A-Za-z0-9_.-]{1,128}$/u.test(error.name) ? error.name : 'UnknownError';
+  if ((typeof error !== 'object' && typeof error !== 'function') || error === null) {
+    return 'UnknownError';
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'name');
+    if (descriptor?.enumerable !== true) return 'UnknownError';
+    if (!('value' in descriptor)
+      || typeof descriptor.value !== 'string'
+      || !/^[A-Za-z0-9_.-]{1,64}$/u.test(descriptor.value)) {
+      return 'UnknownError';
+    }
+    return descriptor.value;
+  } catch {
+    return 'UnknownError';
+  }
 }

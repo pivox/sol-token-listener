@@ -300,8 +300,9 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
 
   public async getHealth(): Promise<ApiHealth> {
     const observedAt = validDate(this.clock());
-    const pipeline = pipelineState(this.pipeline);
+    let pipeline = DEGRADED_PIPELINE_STATE;
     try {
+      pipeline = pipelineState(this.pipeline);
       const database = await this.database.query('SELECT 1 AS available');
       const checkpoints = await this.database.query(
         `SELECT checkpoint_key, slot FROM processing_checkpoints
@@ -335,7 +336,15 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       || pipeline.pumpswap === 'DEGRADED' || pipeline.pumpswap === 'STOPPED';
       return healthResult(observedAt, database.rows.length > 0, degraded, checkpoint, heartbeat, lagSlots, pipeline);
     } catch {
-      return healthResult(observedAt, false, true, new Map(), emptyHeartbeat(), null, pipeline);
+      return healthResult(
+        observedAt,
+        false,
+        true,
+        new Map(),
+        emptyHeartbeat(),
+        null,
+        pipeline,
+      );
     }
   }
 
@@ -1087,6 +1096,11 @@ function pageLimit(value: number): number {
 }
 
 export const HEARTBEAT_STALE_AFTER_MS = 30_000;
+const DEGRADED_PIPELINE_STATE: ApiProjectionPipelineState = Object.freeze({
+  httpAvailable: false,
+  pumpfun: 'DEGRADED',
+  pumpswap: 'DEGRADED',
+});
 
 function emptyHeartbeat(): ApiHealth['heartbeat'] {
   return freeze({ runtimeState: null, subscriberState: null, scannerState: null,
@@ -1123,13 +1137,36 @@ function listenerRuntimeState(value: unknown): ListenerRuntimeState {
 }
 
 function pipelineState(provider: ApiProjectionPipelineStateProvider): ApiProjectionPipelineState {
-  const value = provider();
-  if (typeof value.httpAvailable !== 'boolean'
-    || !['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED'].includes(value.pumpfun)
-    || !['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED'].includes(value.pumpswap)) {
-    throw invalid();
-  }
-  return value;
+  const value: unknown = provider();
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 3
+    || !keys.includes('httpAvailable')
+    || !keys.includes('pumpfun')
+    || !keys.includes('pumpswap')) throw invalid();
+  const httpAvailable = pipelineValue(value, 'httpAvailable');
+  const pumpfun = pipelineValue(value, 'pumpfun');
+  const pumpswap = pipelineValue(value, 'pumpswap');
+  if (typeof httpAvailable !== 'boolean'
+    || !isPipelineRuntimeState(pumpfun)
+    || !isPipelineRuntimeState(pumpswap)) throw invalid();
+  return freeze({ httpAvailable, pumpfun, pumpswap });
+}
+
+function pipelineValue(value: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor?.enumerable !== true) throw invalid();
+  if (!('value' in descriptor)) throw invalid();
+  return descriptor.value;
+}
+
+function isPipelineRuntimeState(
+  value: unknown,
+): value is ApiProjectionPipelineState['pumpfun'] {
+  return value === 'IDLE'
+    || value === 'RUNNING'
+    || value === 'DEGRADED'
+    || value === 'STOPPED';
 }
 
 function healthResult(
