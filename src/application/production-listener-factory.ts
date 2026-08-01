@@ -123,7 +123,10 @@ export function createProductionListenerRuntime(
       limit: 100,
       missingPollThreshold: config.listenerFinalityMissingPolls,
     }),
-    config.reconcileSeconds * 1_000,
+    {
+      intervalMs: config.reconcileSeconds * 1_000,
+      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+    },
   );
   const subscriberComponent = lifecycleComponent(subscriber);
   const workerComponent = lifecycleComponent(worker);
@@ -134,6 +137,7 @@ export function createProductionListenerRuntime(
     () => scanner.state(),
     () => worker.state,
     () => reconciler.state(),
+    { intervalMs: 5_000, shutdownTimeoutMs: config.listenerShutdownTimeoutMs },
   );
 
   return new SolanaListenerRuntime({
@@ -172,15 +176,58 @@ class StartupScanner {
   }
 }
 
-class RecurringFinalityReconciler {
+export interface ListenerRuntimeScheduler {
+  schedule(callback: () => void, delayMs: number): unknown;
+  cancel(handle: unknown): void;
+}
+
+export interface RecurringListenerOptions {
+  readonly intervalMs: number;
+  readonly shutdownTimeoutMs: number;
+  readonly scheduler?: ListenerRuntimeScheduler;
+}
+
+export class ListenerControllerCloseError extends Error {
+  public constructor(
+    public readonly component: 'heartbeat' | 'reconciler',
+    public readonly reason: 'dependency' | 'timeout',
+  ) {
+    super('Passive listener controller cleanup failed.');
+    this.name = 'ListenerControllerCloseError';
+    Object.freeze(this);
+  }
+}
+
+const listenerScheduler: ListenerRuntimeScheduler = Object.freeze({
+  schedule(callback: () => void, delayMs: number): ReturnType<typeof setTimeout> {
+    const handle = setTimeout(callback, delayMs);
+    handle.unref();
+    return handle;
+  },
+  cancel(handle: unknown): void {
+    clearTimeout(handle as ReturnType<typeof setTimeout>);
+  },
+});
+
+export class RecurringFinalityReconciler {
   private currentState: ListenerRuntimeState = 'STOPPED';
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private readonly intervalMs: number;
+  private readonly shutdownTimeoutMs: number;
+  private readonly scheduler: ListenerRuntimeScheduler;
+  private timer: unknown = null;
+  private inFlight: Promise<unknown> | null = null;
+  private closePromise: Promise<void> | null = null;
   private closed = false;
 
   public constructor(
-    private readonly reconciler: FinalityReconciler,
-    private readonly intervalMs: number,
-  ) {}
+    private readonly reconciler: { readonly runOnce: () => Promise<unknown> },
+    options: RecurringListenerOptions,
+  ) {
+    validateRecurringOptions(options);
+    this.intervalMs = options.intervalMs;
+    this.shutdownTimeoutMs = options.shutdownTimeoutMs;
+    this.scheduler = options.scheduler ?? listenerScheduler;
+  }
 
   public async start(): Promise<void> {
     if (this.closed) return;
@@ -196,11 +243,13 @@ class RecurringFinalityReconciler {
   }
 
   public close(): Promise<void> {
+    if (this.closePromise !== null) return this.closePromise;
     this.closed = true;
-    if (this.timer !== null) clearTimeout(this.timer);
+    if (this.timer !== null) this.scheduler.cancel(this.timer);
     this.timer = null;
-    this.currentState = 'STOPPED';
-    return Promise.resolve();
+    const operation = this.performClose();
+    this.closePromise = operation;
+    return operation;
   }
 
   public state(): ListenerRuntimeState {
@@ -209,31 +258,55 @@ class RecurringFinalityReconciler {
 
   private schedule(): void {
     if (this.closed) return;
-    this.timer = setTimeout(() => {
+    this.timer = this.scheduler.schedule(() => {
       this.timer = null;
-      void this.reconciler.runOnce().then(
+      if (this.closed) return;
+      const operation = this.reconciler.runOnce();
+      this.inFlight = operation;
+      void operation.then(
         () => {
+          if (this.inFlight === operation) this.inFlight = null;
+          if (this.closed) return;
           this.currentState = 'RUNNING';
           this.schedule();
         },
         () => {
+          if (this.inFlight === operation) this.inFlight = null;
+          if (this.closed) return;
           this.currentState = 'DEGRADED';
           this.schedule();
         },
       );
     }, this.intervalMs);
-    this.timer.unref();
+  }
+
+  private async performClose(): Promise<void> {
+    const running = this.inFlight;
+    if (running !== null) {
+      const result = await settleController(running, this.shutdownTimeoutMs);
+      if (result === 'timeout') {
+        this.currentState = 'DEGRADED';
+        throw new ListenerControllerCloseError('reconciler', 'timeout');
+      }
+    }
+    this.currentState = 'STOPPED';
   }
 }
 
-class PersistentListenerHeartbeat {
+export class PersistentListenerHeartbeat {
   private currentState: ListenerRuntimeState = 'STOPPED';
   private startedAtMs = 0;
   private lastHttpSlot: bigint | null = null;
   private lastFinalizedSlot: bigint | null = null;
   private backlogCount = 0;
   private leasedCount = 0;
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private readonly intervalMs: number;
+  private readonly shutdownTimeoutMs: number;
+  private readonly scheduler: ListenerRuntimeScheduler;
+  private timer: unknown = null;
+  private inFlight: Promise<void> | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private closed = false;
 
   public constructor(
     private readonly inbox: Pick<TransactionInboxRepository, 'counts' | 'writeHeartbeat'>,
@@ -242,20 +315,30 @@ class PersistentListenerHeartbeat {
     private readonly scannerState: () => ListenerRuntimeState,
     private readonly workerState: () => ListenerRuntimeState,
     private readonly reconcilerState: () => ListenerRuntimeState,
-  ) {}
+    options: RecurringListenerOptions,
+  ) {
+    validateRecurringOptions(options);
+    this.intervalMs = options.intervalMs;
+    this.shutdownTimeoutMs = options.shutdownTimeoutMs;
+    this.scheduler = options.scheduler ?? listenerScheduler;
+  }
 
   public async start(): Promise<void> {
+    if (this.closed) return;
     this.currentState = 'RUNNING';
     this.startedAtMs = Date.now();
     await this.write('RUNNING');
     this.schedule();
   }
 
-  public async stop(): Promise<void> {
-    if (this.timer !== null) clearTimeout(this.timer);
+  public stop(): Promise<void> {
+    if (this.stopPromise !== null) return this.stopPromise;
+    this.closed = true;
+    if (this.timer !== null) this.scheduler.cancel(this.timer);
     this.timer = null;
-    await this.write('STOPPED');
-    this.currentState = 'STOPPED';
+    const operation = this.performStop();
+    this.stopPromise = operation;
+    return operation;
   }
 
   public state(): ListenerRuntimeState {
@@ -263,20 +346,55 @@ class PersistentListenerHeartbeat {
   }
 
   private schedule(): void {
-    this.timer = setTimeout(() => {
+    if (this.closed) return;
+    this.timer = this.scheduler.schedule(() => {
       this.timer = null;
-      void this.write('RUNNING').then(
+      if (this.closed) return;
+      const operation = this.write('RUNNING');
+      this.inFlight = operation;
+      void operation.then(
         () => {
+          if (this.inFlight === operation) this.inFlight = null;
+          if (this.closed) return;
           this.currentState = 'RUNNING';
           this.schedule();
         },
         () => {
+          if (this.inFlight === operation) this.inFlight = null;
+          if (this.closed) return;
           this.currentState = 'DEGRADED';
           this.schedule();
         },
       );
-    }, 5_000);
-    this.timer.unref();
+    }, this.intervalMs);
+  }
+
+  private async performStop(): Promise<void> {
+    let dependencyFailed = false;
+    const running = this.inFlight;
+    if (running !== null) {
+      const result = await settleController(running, this.shutdownTimeoutMs);
+      if (result === 'timeout') {
+        this.currentState = 'DEGRADED';
+        throw new ListenerControllerCloseError('heartbeat', 'timeout');
+      }
+      dependencyFailed = result === 'failed';
+    }
+    const stoppedResult = await settleController(
+      this.write('STOPPED'),
+      this.shutdownTimeoutMs,
+    );
+    if (stoppedResult !== 'complete') {
+      this.currentState = 'DEGRADED';
+      throw new ListenerControllerCloseError(
+        'heartbeat',
+        stoppedResult === 'timeout' ? 'timeout' : 'dependency',
+      );
+    }
+    this.currentState = dependencyFailed ? 'DEGRADED' : 'STOPPED';
+    if (dependencyFailed) {
+      throw new ListenerControllerCloseError('heartbeat', 'dependency');
+    }
   }
 
   private async write(runtimeState: 'RUNNING' | 'STOPPED'): Promise<void> {
@@ -306,6 +424,36 @@ class PersistentListenerHeartbeat {
       leasedCount: this.leasedCount,
     });
     await this.inbox.writeHeartbeat(value);
+  }
+}
+
+async function settleController(
+  operation: Promise<unknown>,
+  timeoutMs: number,
+): Promise<'complete' | 'failed' | 'timeout'> {
+  const timeoutHandle: { value?: ReturnType<typeof setTimeout> } = {};
+  const timeout = new Promise<'timeout'>((resolve) => {
+    timeoutHandle.value = setTimeout(() => { resolve('timeout'); }, timeoutMs);
+  });
+  const settled: Promise<'complete' | 'failed'> = operation.then(
+    () => 'complete',
+    () => 'failed',
+  );
+  const result = await Promise.race([settled, timeout]);
+  if (timeoutHandle.value !== undefined) clearTimeout(timeoutHandle.value);
+  return result;
+}
+
+function validateRecurringOptions(options: RecurringListenerOptions): void {
+  if (!Number.isSafeInteger(options.intervalMs)
+    || options.intervalMs <= 0
+    || !Number.isSafeInteger(options.shutdownTimeoutMs)
+    || options.shutdownTimeoutMs <= 0
+    || options.shutdownTimeoutMs > 120_000
+    || (options.scheduler !== undefined
+      && (typeof options.scheduler.schedule !== 'function'
+        || typeof options.scheduler.cancel !== 'function'))) {
+    throw new TypeError('Passive listener controller timing options are invalid.');
   }
 }
 
