@@ -5,7 +5,8 @@ import {
   type LaunchpadObservationEventV1,
 } from '../domain/launchpad-events.js';
 import { reconcileConfirmationStatus } from '../domain/confirmation-status.js';
-import { createInitialDetectedTransition } from '../domain/state-transitions.js';
+import { reconcileTransitionOccurrence } from '../domain/state-transitions.js';
+import type { InitialDetectedStateTransition } from '../domain/state-transitions.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { LaunchpadTrade, TokenLaunch } from '../domain/types.js';
 import {
@@ -56,6 +57,9 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
       assertEventFingerprint(event);
     }
     const terminal = this.terminal(batch.confirmationStatus);
+    const transitionsByEventId = new Map(
+      batch.transitions.map((transition) => [transition.triggeringEventId, transition]),
+    );
     for (let attempt = 0; attempt < 3; attempt += 1) {
       let client: Client;
       try { client = await this.pool.connect(); } catch { throw new LaunchpadEventRepositoryError('record'); }
@@ -66,7 +70,12 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
         const ordered = [...batch.events].sort((left, right) =>
           left.type === right.type ? 0 : left.type === 'TokenLaunchDetected' ? -1 : 1);
         for (const event of ordered) {
-          byId.set(event.id, await this.writeEvent(client, event, terminal));
+          byId.set(event.id, await this.writeEvent(
+            client,
+            event,
+            transitionsByEventId.get(event.id),
+            terminal,
+          ));
         }
         await client.query('COMMIT');
         return Object.freeze({
@@ -122,6 +131,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
   private async writeEvent(
     client: Client,
     event: LaunchpadObservationEventV1,
+    transition: InitialDetectedStateTransition | undefined,
     terminal: readonly [Date | null, Date | null],
   ): Promise<EventRecordOutcome> {
     const rawPayload = rawSnapshot(event);
@@ -133,12 +143,14 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     const current = found.rows[0];
     let status = event.confirmationStatus;
     let outcome: EventRecordOutcome = 'created';
+    let becameOrphaned = false;
     if (current !== undefined) {
       assertRawMatches(current, event, rawPayload);
       const oldStatus = confirmation(requiredText(current, 'confirmation_status'));
       const reconciliation = reconcileStatus(oldStatus, status);
       status = reconciliation === 'update' ? status : oldStatus;
       outcome = reconciliation === 'update' ? 'confirmation_updated' : 'duplicate';
+      becameOrphaned = reconciliation === 'update' && status === 'orphaned';
       if (reconciliation === 'update') await exact(client, `UPDATE raw_chain_events SET
         confirmation_status=$2,terminal_at=$3,purge_after=$4,updated_at=clock_timestamp()
         WHERE event_id=$1`, [rawId, status, ...terminal]);
@@ -155,11 +167,14 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
       ]);
     }
     if (status === 'orphaned') {
-      if (current !== undefined) await this.retract(client, event, terminal);
+      if (becameOrphaned) await this.retract(client, event, terminal);
       return outcome;
     }
     await this.writeDomain(client, rawId, event, status);
-    if (event.type === 'TokenLaunchDetected') await this.writeLaunch(client, event);
+    if (event.type === 'TokenLaunchDetected') {
+      if (transition === undefined) throw conflict('identity');
+      await this.writeLaunch(client, event, transition);
+    }
     else await this.writeTrade(client, event, status);
     return outcome;
   }
@@ -180,7 +195,11 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     requireOne(result);
   }
 
-  private async writeLaunch(client: Client, event: Extract<LaunchpadObservationEventV1,{type:'TokenLaunchDetected'}>): Promise<void> {
+  private async writeLaunch(
+    client: Client,
+    event: Extract<LaunchpadObservationEventV1, {type: 'TokenLaunchDetected'}>,
+    transition: InitialDetectedStateTransition,
+  ): Promise<void> {
     const launch = event.payload.launch;
     const existing = await client.query('SELECT * FROM token_launches WHERE mint=$1 FOR UPDATE', [event.mint]);
     if (existing.rows[0] !== undefined && requiredText(existing.rows[0], 'created_signature') !== event.signature) throw conflict('identity');
@@ -194,13 +213,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
       stringifyJson(launch.quoteAssets),event.signature,launch.createdAt.slot.toString(),launch.createdAt.transactionIndex,
       launch.createdAt.instructionIndex,launch.createdAt.innerInstructionIndex,new Date(event.blockchainTimeMs ?? event.observedAtMs)]);
     requireOne(result);
-    const transition = createTransition(event);
-    const transitionResult = await client.query(`INSERT INTO state_transitions (
-      transition_id,mint,event_id,occurred_at,trigger_event,previous_state,new_state,
-      reason_code,human_message,evidence,terminal_at,purge_after
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL)
-    ON CONFLICT (transition_id) DO UPDATE SET terminal_at=NULL,purge_after=NULL RETURNING transition_id`, transition);
-    requireOne(transitionResult);
+    await writeTransition(client, transition);
   }
 
   private async writeTrade(client: Client, event: Extract<LaunchpadObservationEventV1,{type:'BondingCurveTradeObserved'}>, status: ChainConfirmationStatus): Promise<void> {
@@ -263,14 +276,85 @@ function assertEventFingerprint(event: LaunchpadObservationEventV1): void {
 
 function date(value: number | null): Date | null { return value === null ? null : new Date(value); }
 function optionalRecord(value: unknown): Record<string, unknown> | null { return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null; }
+function requiredField(row: unknown, field: string): unknown { const record = optionalRecord(row); if (record === null || !Object.hasOwn(record, field)) throw new TypeError('Invalid repository row.'); return record[field]; }
 function requiredText(row: unknown, field: string): string { const value = optionalRecord(row)?.[field]; if (typeof value !== 'string') throw new TypeError('Invalid repository row.'); return value; }
+function occurrenceSource(value: string): 'blockchain' | 'observation' { if (value !== 'blockchain' && value !== 'observation') throw new TypeError('Invalid transition occurrence source.'); return value; }
 function confirmation(value: string): ChainConfirmationStatus { if (!['processed', 'confirmed', 'finalized', 'orphaned'].includes(value)) throw new TypeError('Invalid repository row.'); return value as ChainConfirmationStatus; }
 function assertRawMatches(row: unknown, event: LaunchpadObservationEventV1, payload: unknown): void { const record = optionalRecord(row); if (record === null) throw conflict('identity'); assertFields(record, event); if (!isDeepStrictEqual(fromJsonValue(record.payload), payload)) throw conflict('payload'); }
 function assertDomainMatches(row: unknown, event: LaunchpadObservationEventV1): void { const record = optionalRecord(row); if (record === null) throw conflict('identity'); assertFields(record, event, event.type); if (!isDeepStrictEqual(fromJsonValue(record.payload), event.payload)) throw conflict('payload'); }
 function assertFields(record: Record<string, unknown>, event: LaunchpadObservationEventV1, type?: string): void { const expected = { ...(type === undefined ? {} : { type }), source: event.source, program: event.program, mint: event.mint, signature: event.signature, slot: event.cursor.slot.toString(), transaction_index: event.cursor.transactionIndex, instruction_index: event.cursor.instructionIndex, inner_instruction_index: event.cursor.innerInstructionIndex, payload_version: event.payloadVersion }; for (const [key, value] of Object.entries(expected)) if (String(record[key]) !== String(value)) throw conflict('identity'); }
 async function exact(client: Client, text: string, values: readonly unknown[]): Promise<void> { requireOne(await client.query(text, values)); }
 function requireOne(result: Result): void { if (result.rowCount !== 1) throw new TypeError('Unexpected repository row count.'); }
-function createTransition(event: Extract<LaunchpadObservationEventV1, {type: 'TokenLaunchDetected'}>): readonly unknown[] { const transition = createInitialDetectedTransition(event); return [transition.id, transition.mint, transition.triggeringEventId, new Date(transition.occurredAtMs), transition.triggeringEventType, transition.previousStatus, transition.newStatus, transition.reasonCode, transition.message, toJsonValue(transition.evidence)]; }
+async function writeTransition(
+  client: Client,
+  transition: InitialDetectedStateTransition,
+): Promise<void> {
+  const existing = await client.query(`SELECT transition_id,mint,event_id,
+    occurred_at,occurred_at_source,payload_version,trigger_event,previous_state,
+    new_state,reason_code,human_message,evidence
+    FROM state_transitions WHERE transition_id=$1 OR event_id=$2 FOR UPDATE`, [
+    transition.id,
+    transition.triggeringEventId,
+  ]);
+  if (existing.rows.length > 1) throw conflict('identity');
+  const row = existing.rows[0];
+  let occurrence = transition;
+  if (row !== undefined) {
+    assertTransitionMatches(row, transition);
+    occurrence = {
+      ...transition,
+      ...reconcileTransitionOccurrence(
+        {
+          occurredAtMs: dateMs(requiredField(row, 'occurred_at')),
+          occurredAtSource: occurrenceSource(requiredText(row, 'occurred_at_source')),
+        },
+        transition,
+      ),
+    };
+  }
+  const result = await client.query(`INSERT INTO state_transitions (
+    transition_id,mint,event_id,occurred_at,occurred_at_source,payload_version,
+    trigger_event,previous_state,new_state,reason_code,human_message,evidence,
+    terminal_at,purge_after
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL,NULL)
+  ON CONFLICT (transition_id) DO UPDATE SET
+    occurred_at=EXCLUDED.occurred_at,
+    occurred_at_source=EXCLUDED.occurred_at_source,
+    terminal_at=NULL,purge_after=NULL
+  RETURNING transition_id`, [
+    transition.id, transition.mint, transition.triggeringEventId,
+    new Date(occurrence.occurredAtMs), occurrence.occurredAtSource,
+    transition.payloadVersion, transition.triggeringEventType,
+    transition.previousStatus, transition.newStatus, transition.reasonCode,
+    transition.message, toJsonValue(transition.evidence),
+  ]);
+  requireOne(result);
+}
+
+function assertTransitionMatches(
+  row: unknown,
+  transition: InitialDetectedStateTransition,
+): void {
+  const record = optionalRecord(row);
+  if (record === null) throw conflict('identity');
+  const expected = {
+    transition_id: transition.id,
+    mint: transition.mint,
+    event_id: transition.triggeringEventId,
+    payload_version: transition.payloadVersion,
+    trigger_event: transition.triggeringEventType,
+    previous_state: transition.previousStatus,
+    new_state: transition.newStatus,
+    reason_code: transition.reasonCode,
+    human_message: transition.message,
+  };
+  for (const [field, value] of Object.entries(expected)) {
+    if (String(record[field]) !== String(value)) throw conflict('identity');
+  }
+  if (!isDeepStrictEqual(fromJsonValue(record.evidence), transition.evidence)) {
+    throw conflict('payload');
+  }
+}
 
 function restoreEvent(row: unknown): LaunchpadObservationEventV1 {
   const record = optionalRecord(row);

@@ -102,6 +102,71 @@ void test('first orphan persists raw proof without active projections', async (c
   });
 });
 
+void test('replaying a first-seen orphan remains a duplicate raw proof without projections', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(pool);
+    await repository.record(fixture('orphaned'));
+    const replay = await repository.record(fixture('orphaned'));
+    assert.deepEqual(replay.events.map((event) => event.outcome), ['duplicate', 'duplicate']);
+    const counts = await pool.query(`SELECT
+      (SELECT COUNT(*)::int FROM raw_chain_events) raw,
+      (SELECT COUNT(*)::int FROM domain_events) domain,
+      (SELECT COUNT(*)::int FROM token_launches) launches,
+      (SELECT COUNT(*)::int FROM launch_trades) trades,
+      (SELECT COUNT(*)::int FROM state_transitions) transitions`);
+    assert.deepEqual(counts.rows[0], {
+      raw: 2, domain: 0, launches: 0, trades: 0, transitions: 0,
+    });
+  });
+});
+
+void test('reconciles supplied transition occurrences independently of event outcome', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(pool);
+    await repository.record(fixture('processed', 'signature-a', 'mint-a', 5_000, null));
+    await repository.record(fixture('processed', 'signature-a', 'mint-a', 4_000, null));
+    assert.deepEqual(await storedOccurrence(pool), { occurred_at_ms: '4000', occurred_at_source: 'observation' });
+
+    await repository.record(fixture('confirmed', 'signature-a', 'mint-a', 6_000, 4_500));
+    assert.deepEqual(await storedOccurrence(pool), { occurred_at_ms: '4500', occurred_at_source: 'blockchain' });
+
+    const worse = await repository.record(fixture('confirmed', 'signature-a', 'mint-a', 3_000, null));
+    assert.equal(worse.events[0]?.outcome, 'duplicate');
+    assert.deepEqual(await storedOccurrence(pool), { occurred_at_ms: '4500', occurred_at_source: 'blockchain' });
+
+    await repository.record(fixture('finalized', 'signature-a', 'mint-a', 7_000, 4_400));
+    await repository.record(fixture('finalized', 'signature-a', 'mint-a', 7_000, 4_600));
+    assert.deepEqual(await storedOccurrence(pool), { occurred_at_ms: '4400', occurred_at_source: 'blockchain' });
+    assert.equal((await pool.query('SELECT COUNT(*)::int count FROM state_transitions')).rows[0].count, 1);
+  });
+});
+
+void test('rejects stored transition identity, reason, and evidence contradictions', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(pool);
+    const batch = fixture('confirmed');
+    const transition = batch.transitions[0];
+    assert.ok(transition);
+    await repository.record(batch);
+    for (const mutation of [
+      "UPDATE state_transitions SET transition_id='corrupt'",
+      "UPDATE state_transitions SET human_message='corrupt'",
+      `UPDATE state_transitions SET evidence='{"source":"other","program":"pump"}'::jsonb`,
+      "UPDATE state_transitions SET trigger_event='BondingCurveTradeObserved'",
+    ]) {
+      await pool.query(mutation);
+      await assert.rejects(repository.record(batch), (error: unknown) => {
+        assert.equal((error as Error).name, 'LaunchpadEventConflictError');
+        return true;
+      });
+      await pool.query(`UPDATE state_transitions SET transition_id=$1,
+        human_message='Token launch detected',
+        evidence='{"source":"pumpfun","program":"pump"}'::jsonb,
+        trigger_event='TokenLaunchDetected'`, [transition.id]);
+    }
+  });
+});
+
 void test('rejects finalized orphaning and immutable payload contradictions', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresLaunchpadEventRepository(pool);
@@ -181,10 +246,24 @@ async function withDatabase(context: { skip(message?: string): void }, run: (poo
   finally { await pool.end(); await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); await admin.end(); }
 }
 
-function fixture(status: 'processed' | 'confirmed' | 'finalized' | 'orphaned', signature = 'signature-a', mint = 'mint-a', observedAtMs = 2_000) {
-  const transaction = { signature, confirmationStatus: status, blockTimeMs: 1_000, observedAtMs, cursor: { slot: 9_007_199_254_740_993n, transactionIndex: 4 }, raw: null };
+function fixture(status: 'processed' | 'confirmed' | 'finalized' | 'orphaned', signature = 'signature-a', mint = 'mint-a', observedAtMs = 2_000, blockTimeMs: number | null = 1_000) {
+  const transaction = { signature, confirmationStatus: status, blockTimeMs, observedAtMs, cursor: { slot: 9_007_199_254_740_993n, transactionIndex: 4 }, raw: null };
   const quoteAsset = { mint: 'quote', decimals: 9, tokenProgram: 'SPL_TOKEN' as const };
   const launch = createTokenLaunchDetectedEvent({ source: 'pumpfun', program: 'pump', transaction, launch: { mint, creator: 'creator', tokenProgram: 'SPL_TOKEN', quoteAssets: [quoteAsset], launchpad: 'pumpfun', createdAt: { ...transaction.cursor, instructionIndex: 2, innerInstructionIndex: null }, parameters: { initialSupply: 1_000_000_000_000_000_000n } } });
   const trade = createBondingCurveTradeObservedEvent({ source: 'pumpfun', program: 'pump', transaction, trade: { id: `trade-${mint}`, launchMint: mint, kind: 'BUY', trader: 'buyer', baseAmountRaw: 9007199254740993n, quoteAmountRaw: 1000000000n, quoteAsset, cursor: { ...transaction.cursor, instructionIndex: 2, innerInstructionIndex: 1 } } });
   return status === 'orphaned' ? { source: 'pumpfun', program: 'pump', signature: transaction.signature, confirmationStatus: status, events: [launch, trade], stateTransitionAction: 'retract' as const, transitions: [] as const } : { source: 'pumpfun', program: 'pump', signature: transaction.signature, confirmationStatus: status, events: [launch, trade], stateTransitionAction: 'apply' as const, transitions: [createInitialDetectedTransition(launch)] };
+}
+
+async function storedOccurrence(pool: InstanceType<typeof pg.Pool>): Promise<{
+  readonly occurred_at_ms: string;
+  readonly occurred_at_source: string;
+}> {
+  const result = await pool.query<{
+    readonly occurred_at_ms: string;
+    readonly occurred_at_source: string;
+  }>(`SELECT (EXTRACT(EPOCH FROM occurred_at) * 1000)::bigint::text AS occurred_at_ms,
+    occurred_at_source FROM state_transitions`);
+  const row = result.rows[0];
+  assert.ok(row);
+  return row;
 }

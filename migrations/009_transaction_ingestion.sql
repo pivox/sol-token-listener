@@ -212,3 +212,40 @@ CREATE INDEX raw_chain_events_cursor_idx
     instruction_index,
     COALESCE(inner_instruction_index, -1)
   );
+
+ALTER TABLE state_transitions
+  ADD COLUMN IF NOT EXISTS payload_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE state_transitions
+  ADD COLUMN IF NOT EXISTS occurred_at_source TEXT;
+
+UPDATE state_transitions AS transition
+SET occurred_at_source = CASE
+  WHEN event.blockchain_time IS NULL THEN 'observation'
+  ELSE 'blockchain'
+END
+FROM domain_events AS event
+WHERE event.event_id = transition.event_id
+  AND transition.occurred_at_source IS NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'state_transitions_payload_version_check'
+      AND conrelid = 'state_transitions'::regclass
+  ) THEN
+    ALTER TABLE state_transitions
+      ADD CONSTRAINT state_transitions_payload_version_check
+      CHECK (payload_version > 0);
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'state_transitions_occurred_at_source_check'
+      AND conrelid = 'state_transitions'::regclass
+  ) THEN
+    ALTER TABLE state_transitions
+      ADD CONSTRAINT state_transitions_occurred_at_source_check
+      CHECK (occurred_at_source IS NULL OR occurred_at_source IN ('blockchain', 'observation'));
+  END IF;
+END;
+$$;
