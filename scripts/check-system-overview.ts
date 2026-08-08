@@ -73,7 +73,7 @@ const requiredStatements = [
   'quatre heures',
   'SOL/WSOL',
   'Raydium CPMM',
-  '676 tests réussis',
+  '688 tests réussis',
   'Un blocker actif ne peut jamais être compensé',
 ];
 for (const statement of requiredStatements) {
