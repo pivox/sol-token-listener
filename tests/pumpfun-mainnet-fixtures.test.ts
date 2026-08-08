@@ -8,6 +8,10 @@ void test('décode hors ligne la création mainnet et son achat initial', async 
   const fixture = await loadPumpFixture('create-v2-initial-buy-mainnet.json');
   const decoded = decodePumpTransaction(fixture.transaction);
 
+  assert.equal(fixture.schemaVersion, 'solana-mainnet-fixture.v1');
+  assert.equal(fixture.family, 'pumpfun');
+  assert.equal(fixture.sanitization.anonymized, false);
+  assert.equal(fixture.transaction.confirmationStatus, 'FINALIZED');
   assert.equal(fixture.provenance.transactionIndex, 946);
   assert.equal(decoded.creations.length, 1);
   assert.equal(decoded.trades.length, 1);
@@ -45,4 +49,44 @@ void test('refuse une provenance qui ne correspond pas à la transaction', async
   value.provenance.signature = 'mismatch';
 
   assert.throws(() => parsePumpFixture(value), /provenance\.signature/);
+});
+
+void test('refuse les champs hors contrat et les preuves prétendument anonymisées', async () => {
+  const path = new URL(
+    './fixtures/pumpfun/sell-cpi-mainnet.json',
+    import.meta.url,
+  );
+  const value = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+
+  assert.throws(() => parsePumpFixture({ ...value, endpoint: 'https://private.invalid' }), /clés/u);
+  assert.throws(() => parsePumpFixture({ ...value, family: 'pumpswap' }), /family/u);
+  assert.throws(() => parsePumpFixture({
+    ...value,
+    sanitization: { contract: 'normalized-public-chain.v1', anonymized: true },
+  }), /anonymized/u);
+  assert.throws(() => parsePumpFixture({
+    ...value,
+    transaction: { ...(value.transaction as object), logs: [] },
+  }), /transaction.*clés/u);
+  assert.throws(() => parsePumpFixture({
+    ...value,
+    provenance: {
+      ...(value.provenance as object),
+      capturedAt: '2026-08-08 08:00:00Z',
+    },
+  }), /capturedAt.*ISO-8601/u);
+  assert.throws(() => parsePumpFixture({
+    ...value,
+    provenance: {
+      ...(value.provenance as object),
+      slot: '043',
+    },
+  }), /provenance\.slot.*entier décimal/u);
+  assert.throws(() => parsePumpFixture({
+    ...value,
+    transaction: {
+      ...(value.transaction as object),
+      confirmationStatus: 'CONFIRMED',
+    },
+  }), /confirmationStatus.*FINALIZED/u);
 });

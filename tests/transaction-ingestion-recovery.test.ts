@@ -443,6 +443,7 @@ function migrationTransaction(transaction: NormalizedTransaction): NormalizedTra
   for (const balance of balances) accountKeys[balance.accountIndex] = balance.account;
   return Object.freeze({
     ...transaction,
+    confirmationStatus: 'CONFIRMED' as const,
     accountKeys: Object.freeze(accountKeys),
     signerKeys: Object.freeze([accountKeys[0] as string]),
     instructions: Object.freeze([

@@ -116,6 +116,25 @@ heures.
 
 Voir le contrat complet : [API V1](docs/api/v1.md).
 
+## Preuves mainnet des décodeurs
+
+Les IDLs Pump.fun/PumpSwap sont épinglés au dépôt public officiel avec un
+manifeste SHA-256. Cinq fixtures mainnet minimisées valident hors ligne la
+création et les trades Pump.fun, puis la migration, l’activation de pool et un
+trade PumpSwap. Elles conservent signatures et comptes publics nécessaires au
+décodage exact, mais aucune URL RPC, aucun log brut et aucun secret.
+
+Une nouvelle preuve peut être capturée explicitement, jamais au démarrage :
+
+```bash
+npm run fixture:capture -- pumpswap <signature> <transactionIndex> <nom.json>
+```
+
+La commande exige `SOLANA_HTTP_RPC_URL`, une transaction `FINALIZED`, un index
+retrouvé et vérifié dans les signatures de son bloc, un nom inédit et un
+décodage sans erreur avant l’écriture. Elle n’écrase aucun fichier et sa sortie
+ne révèle ni endpoint ni contenu de transaction.
+
 ## Analytics participants et graphe observé
 
 Le service I1 reconstruit de façon déterministe le profil du créateur, ses
@@ -168,6 +187,7 @@ désactivation explicite.
 - [Architecture Pump.fun V1](docs/architecture/pumpfun-v1.md)
 - [Contrat API V1](docs/api/v1.md)
 - [Qualification RPC](docs/operations/rpc-qualification.md)
+- [Manifeste IDL officiel](vendor/pumpfun/idl/manifest.json)
 
 Les montants bruts, réserves et lamports utilisent `bigint`; PostgreSQL les
 stocke en `NUMERIC(78,0)` et l'API les expose comme chaînes décimales.

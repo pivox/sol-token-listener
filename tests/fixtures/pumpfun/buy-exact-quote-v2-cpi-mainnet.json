@@ -1,4 +1,10 @@
 {
+  "schemaVersion": "solana-mainnet-fixture.v1",
+  "family": "pumpfun",
+  "sanitization": {
+    "contract": "normalized-public-chain.v1",
+    "anonymized": false
+  },
   "provenance": {
     "source": "solana-mainnet",
     "signature": "57qfbsAcVGdenmgVq2sySpVcgyNDCx1aXLQvwz2kuX4fr8V5twxzdCdvWK2RjsZUuArCdneB4WzcSotaWVE8Forw",
@@ -10,7 +16,7 @@
     "signature": "57qfbsAcVGdenmgVq2sySpVcgyNDCx1aXLQvwz2kuX4fr8V5twxzdCdvWK2RjsZUuArCdneB4WzcSotaWVE8Forw",
     "slot": "435782997",
     "transactionIndex": 1188,
-    "confirmationStatus": "CONFIRMED",
+    "confirmationStatus": "FINALIZED",
     "version": 0,
     "blockTimeMs": 1785258585000,
     "instructions": [

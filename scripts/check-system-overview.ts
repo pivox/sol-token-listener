@@ -73,7 +73,7 @@ const requiredStatements = [
   'quatre heures',
   'SOL/WSOL',
   'Raydium CPMM',
-  '694 tests réussis',
+  '704 tests réussis, dont 39 scénarios PostgreSQL réels, aucun échec',
   'Un blocker actif ne peut jamais être compensé',
 ];
 for (const statement of requiredStatements) {

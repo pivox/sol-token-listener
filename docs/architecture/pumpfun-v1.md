@@ -192,7 +192,7 @@ issue d’un snapshot, pas une garantie de sellabilité.
 
 ## Source officielle et décodeur Pump.fun
 
-Vérification effectuée le 28 juillet 2026. La documentation publique officielle
+Vérification renouvelée le 8 août 2026. La documentation publique officielle
 indique une interface multi-quote avec `buy_v2`, `sell_v2` et
 `buy_exact_quote_in_v2`, tout en maintenant les anciennes instructions. Elle
 documente également `migrate` comme migration permissionless et idempotente
@@ -201,9 +201,18 @@ vers PumpSwap.
 La source épinglée est
 [pump-fun/pump-public-docs](https://github.com/pump-fun/pump-public-docs),
 commit `9c82f61cb711b044a17f770ab8ce9f9bdf78f333`. Les discriminators et schémas
-sont générés depuis cet IDL, jamais copiés depuis un projet tiers. Les fixtures
-normalisées publiques couvrent une création avec achat initial, une vente CPI
-et un achat V2 CPI ; elles se rejouent hors ligne.
+sont générés depuis cet IDL, jamais copiés depuis un projet tiers. Ce commit
+était toujours le HEAD de `main` lors de la vérification. Le manifeste
+`vendor/pumpfun/idl/manifest.json` lie hors ligne révision, chemins officiels,
+SHA-256 et sous-ensembles générés Pump.fun/PumpSwap.
+
+Les fixtures mainnet minimisées et versionnées couvrent une création avec
+achat initial, une vente CPI, un achat V2 CPI, une migration V2 avec son
+`create_pool` canonique et une vente PumpSwap dont le quote mint n’est pas
+WSOL. Elles conservent les identifiants publics nécessaires à la preuve exacte,
+mais excluent endpoints, en-têtes, logs, signers et tableaux globaux de
+lamports. « Assainie » ne signifie donc pas « anonymisée » ; tout se rejoue
+hors ligne sans RPC.
 
 ## Qualification
 
