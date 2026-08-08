@@ -554,11 +554,35 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
           purge_after = retained.terminal_at + INTERVAL '4 hours'
       FROM (SELECT clock_timestamp() - INTERVAL '5 hours' AS terminal_at) retained
       WHERE inbox.signature = 'failed-purge-me'`);
-    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 2);
+    await pool.query(`WITH recovery_clock AS MATERIALIZED (
+      SELECT clock_timestamp() AS recovered_at
+    )
+    INSERT INTO transaction_inbox_recoveries (
+      signature, exhausted_at, recovered_at, lifetime_attempts, cycle_attempts,
+      retry_max_attempts, retry_base_delay_ms, recovery_source, purge_after
+    )
+    SELECT 'failed-purge-me', recovered_at - INTERVAL '1 hour', recovered_at,
+           1, 1, 1, 500, 'LOCAL_CLI', recovered_at + INTERVAL '4 hours'
+    FROM recovery_clock`);
+    const firstPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(firstPurge.transactionInbox, 2);
+    assert.equal(firstPurge.transactionInboxRecoveries, 0);
     assert.equal((await pool.query("SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature = 'keep-me'")).rows[0]?.count, '1');
     assert.equal((await pool.query(
       "SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature = 'failed-purge-me'",
     )).rows[0]?.count, '0');
+    assert.equal((await pool.query(
+      "SELECT COUNT(*) FROM transaction_inbox_recoveries WHERE signature = 'failed-purge-me'",
+    )).rows[0]?.count, '1');
+
+    await pool.query(`UPDATE transaction_inbox_recoveries
+      SET exhausted_at = TIMESTAMPTZ '2020-01-01T00:00:00Z',
+          recovered_at = TIMESTAMPTZ '2020-01-01T01:00:00Z',
+          purge_after = TIMESTAMPTZ '2020-01-01T05:00:00Z'
+      WHERE signature = 'failed-purge-me'`);
+    const secondPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(secondPurge.transactionInbox, 0);
+    assert.equal(secondPurge.transactionInboxRecoveries, 1);
   });
 });
 

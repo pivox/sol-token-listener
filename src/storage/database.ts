@@ -85,6 +85,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly walletClusterMembers: number;
   readonly walletClusters: number;
   readonly walletGraphSnapshots: number;
+  readonly transactionInboxRecoveries: number;
   readonly transactionInbox: number;
   readonly apiEventStream: number;
   readonly domainEvents: number;
@@ -163,6 +164,9 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const creatorProfiles = await client.query(
       `DELETE FROM creator_profiles profile USING token_launches launch
        WHERE profile.mint = launch.mint AND launch.purge_after <= NOW()`,
+    );
+    const transactionInboxRecoveries = await client.query(
+      'DELETE FROM transaction_inbox_recoveries WHERE purge_after <= clock_timestamp()',
     );
     await client.query(
       `UPDATE chain_transaction_inbox
@@ -247,6 +251,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       walletClusterMembers: walletClusterMembers.rowCount ?? 0,
       walletClusters: walletClusters.rowCount ?? 0,
       walletGraphSnapshots: walletGraphSnapshots.rowCount ?? 0,
+      transactionInboxRecoveries: transactionInboxRecoveries.rowCount ?? 0,
       transactionInbox: transactionInbox.rowCount ?? 0,
       apiEventStream: Number(apiEventStream.rows[0]?.deleted_count ?? 0),
       domainEvents: (participantDomainEvents.rowCount ?? 0)

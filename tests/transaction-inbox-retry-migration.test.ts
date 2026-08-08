@@ -19,11 +19,17 @@ void test('adds durable bounded retry cycles, exhaustion, recovery audit and hea
     'last_manual_recovery_at TIMESTAMPTZ',
     'exhausted_transactions INTEGER',
     'CREATE TABLE IF NOT EXISTS transaction_inbox_recoveries',
+    'purge_after TIMESTAMPTZ',
     'PRIMARY KEY (signature, exhausted_at)',
     "CHECK (retry_max_attempts BETWEEN 1 AND 100)",
     "CHECK (retry_base_delay_ms BETWEEN 1 AND 60000)",
   ]) assert.ok(sql.includes(fragment), `missing migration fragment: ${fragment}`);
   assert.match(sql, /purge_after = terminal_at \+ INTERVAL '4 hours'/u);
+  assert.match(sql, /purge_after = recovered_at \+ INTERVAL '4 hours'/u);
+  assert.doesNotMatch(
+    sql,
+    /signature TEXT NOT NULL REFERENCES chain_transaction_inbox\(signature\) ON DELETE CASCADE/u,
+  );
   assert.match(sql, /processing_status = 'FAILED'[\s\S]*retry_exhausted_at IS NOT NULL/u);
   const claimOrderIndex = /DROP INDEX IF EXISTS chain_transaction_inbox_claim_order_idx;[\s\S]*?CREATE INDEX chain_transaction_inbox_claim_order_idx[\s\S]*?;/u
     .exec(sql)?.[0] ?? '';

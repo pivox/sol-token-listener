@@ -504,17 +504,23 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           throw new TypeError('Stored manual recovery count is invalid.');
         }
         const updated = await client.query(
-          `WITH recovery AS (
+          `WITH recovery_clock AS MATERIALIZED (
+             SELECT clock_timestamp() AS recovered_at
+           ),
+           recovery AS (
              INSERT INTO transaction_inbox_recoveries (
                signature, exhausted_at, recovered_at, lifetime_attempts, cycle_attempts,
-               retry_max_attempts, retry_base_delay_ms, recovery_source
+               retry_max_attempts, retry_base_delay_ms, recovery_source, purge_after
              )
-             SELECT signature, retry_exhausted_at, clock_timestamp(), $4, $5, $6, $7, 'LOCAL_CLI'
-             FROM chain_transaction_inbox
-             WHERE signature = $1
-               AND processing_status = 'FAILED'
-               AND error_retryable = TRUE
-               AND retry_exhausted_at IS NOT NULL
+             SELECT inbox.signature, inbox.retry_exhausted_at, recovery_clock.recovered_at,
+                    $4, $5, $6, $7, 'LOCAL_CLI',
+                    recovery_clock.recovered_at + INTERVAL '4 hours'
+             FROM chain_transaction_inbox inbox
+             CROSS JOIN recovery_clock
+             WHERE inbox.signature = $1
+               AND inbox.processing_status = 'FAILED'
+               AND inbox.error_retryable = TRUE
+               AND inbox.retry_exhausted_at IS NOT NULL
              RETURNING signature, recovered_at
            )
            UPDATE chain_transaction_inbox inbox SET

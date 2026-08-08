@@ -44,12 +44,12 @@ Inbox counts distinguish scheduled retryable failures from exhausted failures. T
 
 ## Data model
 
-Migration `011_transaction_inbox_retry_recovery.sql` adds row policy, cycle, exhaustion, and manual-recovery fields, widens lifecycle constraints for terminal failures, and creates the retained `transaction_inbox_recoveries` audit table. Migration replay is idempotent and compatible with migrations 001–010 on an empty database.
+Migration `011_transaction_inbox_retry_recovery.sql` adds row policy, cycle, exhaustion, and manual-recovery fields, widens lifecycle constraints for terminal failures, and creates the retained `transaction_inbox_recoveries` audit table. Each audit row has its own four-hour retention deadline and deliberately has no cascading foreign key to the mutable inbox row; purge therefore cannot erase recovery evidence implicitly. Migration replay is idempotent and compatible with migrations 001–010 on an empty database.
 
 ## Safety invariants
 
 - All counters and millisecond policies are integers.
 - No secret, endpoint, raw database error, signing capability, or transaction submission capability reaches CLI output or the public API.
 - Recovery cannot alter a processed row, a non-retryable failure, or a non-exhausted failure.
-- Purge remains ordered before raw chain-event deletion and removes only rows whose durable four-hour retention elapsed.
+- Purge remains ordered before raw chain-event deletion and removes inbox and recovery-audit rows only when each row's own durable four-hour retention elapsed.
 - Observe and paper execution modes remain the only accepted modes.

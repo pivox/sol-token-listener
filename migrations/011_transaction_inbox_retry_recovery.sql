@@ -159,9 +159,10 @@ ALTER TABLE listener_heartbeats
   );
 
 CREATE TABLE IF NOT EXISTS transaction_inbox_recoveries (
-  signature TEXT NOT NULL REFERENCES chain_transaction_inbox(signature) ON DELETE CASCADE,
+  signature TEXT NOT NULL,
   exhausted_at TIMESTAMPTZ NOT NULL,
   recovered_at TIMESTAMPTZ NOT NULL,
+  purge_after TIMESTAMPTZ NOT NULL,
   lifetime_attempts INTEGER NOT NULL CHECK (lifetime_attempts > 0),
   cycle_attempts INTEGER NOT NULL CHECK (cycle_attempts > 0),
   retry_max_attempts INTEGER NOT NULL CHECK (retry_max_attempts BETWEEN 1 AND 100),
@@ -170,6 +171,24 @@ CREATE TABLE IF NOT EXISTS transaction_inbox_recoveries (
   PRIMARY KEY (signature, exhausted_at),
   CHECK (recovered_at >= exhausted_at)
 );
+
+-- Recovery evidence has its own bounded retention. It must never disappear as
+-- an implicit side effect of purging the mutable inbox row.
+ALTER TABLE transaction_inbox_recoveries
+  DROP CONSTRAINT IF EXISTS transaction_inbox_recoveries_signature_fkey;
+ALTER TABLE transaction_inbox_recoveries
+  ADD COLUMN IF NOT EXISTS purge_after TIMESTAMPTZ;
+UPDATE transaction_inbox_recoveries
+SET purge_after = recovered_at + INTERVAL '4 hours'
+WHERE purge_after IS NULL;
+ALTER TABLE transaction_inbox_recoveries
+  ALTER COLUMN purge_after SET NOT NULL;
+ALTER TABLE transaction_inbox_recoveries
+  DROP CONSTRAINT IF EXISTS transaction_inbox_recoveries_retention_check;
+ALTER TABLE transaction_inbox_recoveries
+  ADD CONSTRAINT transaction_inbox_recoveries_retention_check CHECK (
+    purge_after = recovered_at + INTERVAL '4 hours'
+  );
 
 DROP INDEX IF EXISTS chain_transaction_inbox_claim_order_idx;
 CREATE INDEX chain_transaction_inbox_claim_order_idx
