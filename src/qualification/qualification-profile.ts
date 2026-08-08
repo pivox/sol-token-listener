@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { isProxy } from 'node:util/types';
 import type {
@@ -23,6 +23,11 @@ const MODES = new Set<QualificationConditionMode>(['DISABLED', 'REPORT_ONLY', 'E
 const DIMENSIONS = new Set<string>(QUALIFICATION_DIMENSIONS);
 const SIGNALS = new Set<string>(QUALIFICATION_SIGNAL_KEYS);
 const REASONS = new Set<string>(QUALIFICATION_REASON_CODES);
+
+type ProfileReadResult =
+  | { readonly kind: 'ok'; readonly contents: Buffer }
+  | { readonly kind: 'too_large' }
+  | { readonly kind: 'failed' };
 
 export type QualificationProfileErrorCode =
   | 'PROFILE_READ_FAILED'
@@ -62,23 +67,35 @@ export function loadQualificationProfile(options: LoadQualificationProfileOption
 }
 
 function readProfileBytes(path: string | URL, readFile: LoadQualificationProfileOptions['readFile']): Buffer {
+  const result = readFile === undefined ? readBoundedFile(path) : readInjectedFile(path, readFile);
+  if (result.kind === 'too_large') throw new QualificationProfileError('PROFILE_TOO_LARGE');
+  if (result.kind === 'failed') throw new QualificationProfileError('PROFILE_READ_FAILED');
+  return result.contents;
+}
+
+function readInjectedFile(path: string | URL, readFile: NonNullable<LoadQualificationProfileOptions['readFile']>): ProfileReadResult {
+  let raw: unknown;
   try {
-    const raw: unknown = readFile === undefined ? readBoundedFile(path) : readFile(path);
-    if (isProxy(raw) || !Buffer.isBuffer(raw)) throw new QualificationProfileError('PROFILE_READ_FAILED');
-    if (raw.byteLength > MAX_PROFILE_BYTES) throw new QualificationProfileError('PROFILE_TOO_LARGE');
-    return Buffer.from(raw);
-  } catch (error) {
-    if (error instanceof QualificationProfileError) throw error;
-    throw new QualificationProfileError('PROFILE_READ_FAILED');
+    raw = readFile(path);
+  } catch {
+    return { kind: 'failed' };
+  }
+  try {
+    if (isProxy(raw) || !Buffer.isBuffer(raw)) return { kind: 'failed' };
+    if (raw.byteLength > MAX_PROFILE_BYTES) return { kind: 'too_large' };
+    return { kind: 'ok', contents: Buffer.from(raw) };
+  } catch {
+    return { kind: 'failed' };
   }
 }
 
-function readBoundedFile(path: string | URL): Buffer {
-  const descriptor = openSync(path, 'r');
+function readBoundedFile(path: string | URL): ProfileReadResult {
+  let descriptor: number | null = null;
   try {
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
     const stats = fstatSync(descriptor);
-    if (!stats.isFile()) throw new QualificationProfileError('PROFILE_READ_FAILED');
-    if (stats.size > MAX_PROFILE_BYTES) throw new QualificationProfileError('PROFILE_TOO_LARGE');
+    if (!stats.isFile()) return { kind: 'failed' };
+    if (stats.size > MAX_PROFILE_BYTES) return { kind: 'too_large' };
     const contents = Buffer.allocUnsafe(MAX_PROFILE_BYTES + 1);
     let bytesRead = 0;
     while (bytesRead < contents.length) {
@@ -86,9 +103,15 @@ function readBoundedFile(path: string | URL): Buffer {
       if (read === 0) break;
       bytesRead += read;
     }
-    return contents.subarray(0, bytesRead);
+    return bytesRead > MAX_PROFILE_BYTES
+      ? { kind: 'too_large' }
+      : { kind: 'ok', contents: contents.subarray(0, bytesRead) };
+  } catch {
+    return { kind: 'failed' };
   } finally {
-    closeSync(descriptor);
+    if (descriptor !== null) {
+      try { closeSync(descriptor); } catch { /* A read result cannot safely recover from close failure. */ }
+    }
   }
 }
 

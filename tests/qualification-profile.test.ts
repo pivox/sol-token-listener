@@ -342,6 +342,34 @@ void test('rejects oversized and non-regular filesystem profile sources', () => 
   }
 });
 
+void test('rejects a FIFO without a writer without blocking the loader', (context) => {
+  const directory = mkdtempSync(join(tmpdir(), 'qualification-profile-fifo-'));
+  const fifo = join(directory, 'profile.fifo');
+  try {
+    const created = spawnSync('mkfifo', [fifo], { encoding: 'utf8' });
+    if (created.error !== undefined || created.status !== 0) {
+      context.skip('mkfifo is unavailable on this platform.');
+      return;
+    }
+    const script = `
+      import { loadQualificationProfile, QualificationProfileError } from './src/qualification/qualification-profile.js';
+      try {
+        loadQualificationProfile({ profilePath: ${JSON.stringify(fifo)}, minimumScoreOverride: null });
+        process.exitCode = 1;
+      } catch (error) {
+        process.exitCode = error instanceof QualificationProfileError && error.code === 'PROFILE_READ_FAILED' ? 0 : 1;
+      }
+    `;
+    const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 2_000,
+    });
+    assert.equal(result.signal, null, result.stderr);
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 void test('redacts hostile injected read results before inspecting them', () => {
   const secret = 'injected-buffer-secret';
   const customPath = './custom-secret-profile.json';
@@ -366,6 +394,20 @@ void test('redacts hostile injected read results before inspecting them', () => 
     [secret, customPath],
   );
   assert.equal(accessorRead, false);
+});
+
+void test('never trusts or inspects values thrown by an injected reader', () => {
+  const secret = 'thrown-reader-secret';
+  const customPath = './thrown-secret-profile.json';
+  const thrownProxy = new Proxy(new Error(secret), hostileProxyHandler(() => { throw new Error(secret); })) as Error;
+  assertProfileError(
+    () => loadQualificationProfile({ profilePath: customPath, minimumScoreOverride: null, readFile: () => { throw thrownProxy; } }),
+    'PROFILE_READ_FAILED', [secret, customPath],
+  );
+  assertProfileError(
+    () => loadQualificationProfile({ profilePath: customPath, minimumScoreOverride: null, readFile: () => { throw new QualificationProfileError('PROFILE_TOO_LARGE'); } }),
+    'PROFILE_READ_FAILED', [customPath],
+  );
 });
 
 function assertProfileError(action: () => unknown, code: 'PROFILE_READ_FAILED' | 'PROFILE_TOO_LARGE' | 'PROFILE_JSON_INVALID' | 'PROFILE_SCHEMA_INVALID', forbidden: readonly string[] = []): void {
