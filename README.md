@@ -45,13 +45,17 @@ npm run db:migrate
 
 Avec `LISTENER_ENABLED=true`, PostgreSQL et les endpoints Solana HTTP/WebSocket
 sont des dépendances de démarrage. L'ordre est : migrations optionnelles,
-health check RPC, rattrapage, souscriptions, worker, réconciliation de finalité,
-heartbeat, puis API. Un échec de dépendance ou de composant interrompt le
+health check RPC, baseline bornée, souscriptions, second rattrapage de fermeture
+de fenêtre, worker, réconciliation de finalité, heartbeat, puis API. Un échec
+de dépendance ou de composant interrompt le
 démarrage et ferme les ressources déjà ouvertes. `LISTENER_ENABLED=false`
 désactive explicitement le listener et expose un pipeline `STOPPED` si l'API
 reste active.
 
-Le WebSocket est le chemin nominal. Au démarrage, le rattrapage HTTP est borné
+Le WebSocket est le chemin nominal. Sans checkpoint, le premier rattrapage
+prend une seule page récente comme baseline au lieu de parcourir l'historique.
+Après l'ouverture des souscriptions, un second rattrapage ferme la fenêtre de
+course et converge par l'inbox idempotente. Chaque rattrapage HTTP est borné
 par `LISTENER_CATCH_UP_MAX_PAGES` pages de
 `LISTENER_CATCH_UP_PAGE_SIZE` signatures pour chacun des programmes Pump.fun
 et PumpSwap (20 × 100 par défaut). Une panne retryable est replanifiée avec un

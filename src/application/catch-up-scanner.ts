@@ -200,6 +200,10 @@ export class CatchUpScanner {
         signatures.add(row.signature);
         rows.push(row);
       }
+      if (checkpoint === null) {
+        completed = true;
+        break;
+      }
       if (page.length < this.pageSize) {
         completed = true;
         break;

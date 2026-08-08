@@ -149,6 +149,9 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       started.push('subscriber');
       this.activeResources.add('subscriber');
       this.assertStartOpen();
+      stage = 'scanner-scan';
+      await this.dependencies.scanner.scan();
+      this.assertStartOpen();
       stage = 'worker-start';
       await this.dependencies.worker.start();
       started.push('worker');

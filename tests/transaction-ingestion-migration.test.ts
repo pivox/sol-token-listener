@@ -142,7 +142,7 @@ void test('purges only terminal processed inbox rows and exposes their count', a
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
 
-void test('applies migrations 001-009 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-010 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -158,7 +158,7 @@ void test('applies migrations 001-009 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '009_transaction_ingestion.sql');
+    assert.equal(applied.at(-1), '010_transaction_inbox_timestamps.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);

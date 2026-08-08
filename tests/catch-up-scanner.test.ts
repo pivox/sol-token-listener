@@ -105,12 +105,39 @@ void test('treats empty and short pages as true exhaustion and never invents che
   assert.equal(result.checkpointWriteCount, 1);
 });
 
-void test('throws on a full max-page window and performs no durable writes', async () => {
+void test('uses one full newest page as the bounded baseline without a checkpoint', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch-new', 4), sig('launch-old', 3)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market-new', 6), sig('market-old', 5)]],
+  });
+  const inbox = new FakeInbox();
+
+  const result = await scanner(source, inbox, { pageSize: 2, maxPages: 1 }).scan();
+
+  assert.deepEqual(source.calls, [
+    [PUMP_PROGRAM_ID, undefined, 2],
+    [PUMPSWAP_PROGRAM_ID, undefined, 2],
+  ]);
+  assert.deepEqual(inbox.enqueued.map(({ signature }) => signature), [
+    'launch-old', 'launch-new', 'market-old', 'market-new',
+  ]);
+  assert.deepEqual(inbox.stored.map(({ key, signature }) => [key, signature]), [
+    ['launchpad', 'launch-new'], ['market', 'market-new'],
+  ]);
+  assert.deepEqual(result, {
+    discoveredCount: 4,
+    enqueuedCount: 4,
+    checkpointWriteCount: 2,
+    pageCount: 2,
+  });
+});
+
+void test('throws on a full max-page restart window and performs no durable writes', async () => {
   const source = new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('4', 4), sig('3', 3)], [sig('2', 2), sig('1', 1)]],
     [PUMPSWAP_PROGRAM_ID]: [[]],
   });
-  const inbox = new FakeInbox();
+  const inbox = new FakeInbox({ launchpad: checkpoint('launchpad', 'missing', 0) });
   await assert.rejects(scanner(source, inbox, { pageSize: 2, maxPages: 2 }).scan(), (error) => {
     assert.ok(error instanceof CatchUpWindowExceededError);
     assert.equal(error.program, 'launchpad');
@@ -128,7 +155,10 @@ void test('rejects pagination cursor cycles and repeated rows', async () => {
     [PUMP_PROGRAM_ID]: [[sig('b', 4), sig('a', 3)], [sig('c', 3), sig('a', 3)]],
     [PUMPSWAP_PROGRAM_ID]: [[]],
   });
-  await assert.rejects(scanner(cycling, new FakeInbox(), { pageSize: 2 }).scan(), (error) => {
+  const restartInbox = () => new FakeInbox({
+    launchpad: checkpoint('launchpad', 'missing', 0),
+  });
+  await assert.rejects(scanner(cycling, restartInbox(), { pageSize: 2 }).scan(), (error) => {
     assert.ok(error instanceof CatchUpSourceError);
     assert.equal(error.stage, 'pagination');
     return true;
@@ -138,7 +168,7 @@ void test('rejects pagination cursor cycles and repeated rows', async () => {
     [PUMP_PROGRAM_ID]: [[sig('b', 2), sig('a', 1)], [sig('b', 2), sig('a', 1)]],
     [PUMPSWAP_PROGRAM_ID]: [[]],
   });
-  await assert.rejects(scanner(repeated, new FakeInbox(), { pageSize: 2 }).scan(), CatchUpSourceError);
+  await assert.rejects(scanner(repeated, restartInbox(), { pageSize: 2 }).scan(), CatchUpSourceError);
 });
 
 void test('rejects pages that violate newest-to-oldest slot ordering', async () => {

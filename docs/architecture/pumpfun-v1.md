@@ -51,7 +51,8 @@ lecture seule, avec huit routes JSON versionnées sous `/api/v1` et le flux SSE
 `/api/v1/events`. Il démarre d'abord le listener durable Pump.fun/PumpSwap :
 
 ```text
-health RPC -> catch-up borné -> WebSocket -> worker inbox
+health RPC -> baseline bornée -> WebSocket -> catch-up de fermeture
+           -> worker inbox
            -> réconciliation de finalité -> heartbeat -> API
 ```
 
@@ -263,6 +264,9 @@ Les événements métier sont source-indépendants :
 checkpoints sont indépendants de la source.
 
 L'inbox durable déduplique les notifications WebSocket et le rattrapage HTTP.
+Sur une base vide, le scanner prend uniquement la page la plus récente de
+chaque programme comme baseline, conformément au périmètre sans historique.
+Une seconde passe après l'abonnement WebSocket ferme la fenêtre de démarrage.
 Une reprise après panne rejoue toujours l'intégralité des étapes launchpad,
 financement, I1, I2 et PumpSwap; les identités et écritures déterministes
 garantissent des effets persistés exactement une fois, sans reprendre après

@@ -68,7 +68,7 @@ Les diagrammes doivent rester compréhensibles sans couleur et sur un écran
 
 Les affirmations sont vérifiées contre les sources fusionnées : bootstrap,
 factory de production, pipeline observé, worker, repository inbox, reconciler,
-migrations `001` à `009`, contrats API et tests d’intégration.
+migrations `001` à `010`, contrats API et tests d’intégration.
 
 Le document précise notamment :
 
