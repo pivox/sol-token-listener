@@ -142,6 +142,7 @@ désactivation explicite.
 
 ## Architecture
 
+- [Vue complète du système (HTML Bootstrap hors ligne)](docs/system-overview.html)
 - [Architecture Pump.fun V1](docs/architecture/pumpfun-v1.md)
 - [Contrat API V1](docs/api/v1.md)
 

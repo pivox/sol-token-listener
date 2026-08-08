@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Architecture, sécurité et exploitation du listener durable Pump.fun et PumpSwap.">
+  <title>sol-token-listener — Vue complète du système</title>
+  <link rel="stylesheet" href="assets/vendor/bootstrap/bootstrap.min.css">
+  <style>
+    :root { --ink: #14213d; --pump: #14b8a6; --swap: #7c3aed; --warn: #f59e0b; --muted: #64748b; }
+    html { scroll-padding-top: 5rem; }
+    body { color: var(--ink); background: #f8fafc; }
+    .skip-link { position: absolute; left: -9999px; top: 0; z-index: 2000; }
+    .skip-link:focus { left: 1rem; top: 1rem; }
+    .hero { background: linear-gradient(135deg, #0f172a 0%, #172554 58%, #134e4a 100%); }
+    .eyebrow { letter-spacing: .12em; text-transform: uppercase; font-size: .76rem; }
+    .toc { top: 1rem; max-height: calc(100vh - 2rem); overflow-y: auto; }
+    .toc a { color: #334155; border-left: .2rem solid transparent; }
+    .toc a:hover, .toc a:focus { color: #0f766e; border-left-color: var(--pump); }
+    section { scroll-margin-top: 1rem; }
+    .section-kicker { color: #0f766e; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; font-size: .72rem; }
+    .status-active { background: #d1fae5; color: #065f46; }
+    .status-partial { background: #fef3c7; color: #92400e; }
+    .status-isolated { background: #e2e8f0; color: #334155; }
+    .status-future { background: #ede9fe; color: #5b21b6; }
+    .diagram { background: white; border: 1px solid #cbd5e1; border-radius: 1rem; overflow-x: auto; }
+    .diagram svg { display: block; min-width: 760px; width: 100%; height: auto; }
+    .diagram text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: #0f172a; }
+    .diagram .box { fill: #f8fafc; stroke: #64748b; stroke-width: 2; }
+    .diagram .active { fill: #ccfbf1; stroke: #0f766e; }
+    .diagram .market { fill: #ede9fe; stroke: #6d28d9; }
+    .diagram .audit { fill: #dbeafe; stroke: #1d4ed8; }
+    .diagram .warning { fill: #fef3c7; stroke: #d97706; }
+    .diagram .danger { fill: #fee2e2; stroke: #dc2626; }
+    .diagram .line { stroke: #475569; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    .diagram .dash { stroke-dasharray: 7 6; }
+    code { color: #6d28d9; }
+    .metric { border-left: .3rem solid var(--pump); }
+    .table thead th { white-space: nowrap; }
+    .callout { border-left: .35rem solid var(--warn); }
+    footer { background: #0f172a; }
+    @media (max-width: 991.98px) { .toc { position: static !important; max-height: none; } }
+    @media print {
+      .hero { background: white !important; color: black !important; }
+      .hero * { color: black !important; }
+      .toc { display: none; }
+      .diagram { break-inside: avoid; }
+      a { color: black !important; text-decoration: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link btn btn-light" href="#contenu">Aller au contenu</a>
+
+  <header class="hero text-white py-5">
+    <div class="container py-4">
+      <p class="eyebrow text-info mb-2">Documentation système hors ligne · 8 août 2026</p>
+      <div class="row align-items-end g-4">
+        <div class="col-lg-8">
+          <h1 class="display-4 fw-bold">sol-token-listener</h1>
+          <p class="lead mb-3">Détection durable des lancements Pump.fun, qualification explicable, paper trading et continuité PumpSwap.</p>
+          <p class="mb-0 text-white-50">Vue produit, technique, données, sécurité et exploitation du système fusionné sur <code class="text-info">main</code>.</p>
+        </div>
+        <div class="col-lg-4">
+          <div class="p-3 rounded-4 border border-info bg-dark bg-opacity-50">
+            <span class="badge text-bg-success me-1">ACTIF</span>
+            <span class="badge text-bg-info me-1">OBSERVE</span>
+            <span class="badge text-bg-primary">PAPER</span>
+            <hr class="border-secondary">
+            <strong>Aucun mode live.</strong><br>
+            <small class="text-white-50">Aucune clé privée, signature ou soumission de transaction dans le runtime V1.</small>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="container-fluid px-lg-5 py-4">
+    <div class="row g-4">
+      <aside class="col-lg-3 col-xl-2">
+        <nav class="toc position-sticky card shadow-sm" aria-label="Sommaire">
+          <div class="card-body">
+            <h2 class="h6 text-uppercase text-secondary">Sommaire</h2>
+            <ol class="nav flex-column small">
+              <li><a class="nav-link py-1" href="#resume">Résumé</a></li>
+              <li><a class="nav-link py-1" href="#perimetre">Périmètre</a></li>
+              <li><a class="nav-link py-1" href="#architecture">Architecture</a></li>
+              <li><a class="nav-link py-1" href="#flux-produit">Flux produit</a></li>
+              <li><a class="nav-link py-1" href="#acquisition">Acquisition Solana</a></li>
+              <li><a class="nav-link py-1" href="#inbox">Inbox et reprise</a></li>
+              <li><a class="nav-link py-1" href="#decodage">Décodage</a></li>
+              <li><a class="nav-link py-1" href="#finalite">Finalité</a></li>
+              <li><a class="nav-link py-1" href="#analyses">Analyses</a></li>
+              <li><a class="nav-link py-1" href="#qualification">Qualification</a></li>
+              <li><a class="nav-link py-1" href="#paper">Paper trading</a></li>
+              <li><a class="nav-link py-1" href="#persistance">Persistance</a></li>
+              <li><a class="nav-link py-1" href="#api">API et SSE</a></li>
+              <li><a class="nav-link py-1" href="#runtime">Exploitation</a></li>
+              <li><a class="nav-link py-1" href="#tests">Tests</a></li>
+              <li><a class="nav-link py-1" href="#limites">Limites</a></li>
+            </ol>
+          </div>
+        </nav>
+      </aside>
+
+      <main id="contenu" class="col-lg-9 col-xl-10">
+        <section id="resume" class="mb-5" aria-labelledby="resume-title">
+          <p class="section-kicker">01 · Résumé exécutif</p>
+          <h2 id="resume-title">Ce que le système fait réellement</h2>
+          <p class="lead">Le listener observe Pump.fun dès la création, rejoue durablement chaque transaction, produit des projections analytiques, suit la migration et poursuit l’observation sur le pool PumpSwap canonique.</p>
+          <div class="row row-cols-1 row-cols-md-2 row-cols-xl-4 g-3">
+            <div class="col"><div class="card h-100 shadow-sm metric"><div class="card-body"><span class="badge status-active">ACTIF</span><h3 class="h5 mt-2">Détection pré-DEX</h3><p class="small mb-0">Créations, achat initial, achats et ventes Pump.fun externes ou CPI.</p></div></div></div>
+            <div class="col"><div class="card h-100 shadow-sm metric"><div class="card-body"><span class="badge status-active">ACTIF</span><h3 class="h5 mt-2">Durabilité</h3><p class="small mb-0">Inbox PostgreSQL, leases, snapshots, replay intégral et idempotence.</p></div></div></div>
+            <div class="col"><div class="card h-100 shadow-sm metric"><div class="card-body"><span class="badge status-active">ACTIF</span><h3 class="h5 mt-2">PumpSwap</h3><p class="small mb-0">Migration, pool canonique, réserves effectives, trades et quotes passives.</p></div></div></div>
+            <div class="col"><div class="card h-100 shadow-sm metric"><div class="card-body"><span class="badge status-partial">PARTIEL</span><h3 class="h5 mt-2">Qualification</h3><p class="small mb-0">Contrats et moteur présents ; règles avancées à calibrer en dry run.</p></div></div></div>
+          </div>
+          <div class="alert alert-warning callout mt-3 mb-0"><strong>Operational ne signifie pas profitable.</strong> Le système ne promet ni première position, ni même slot, ni sellabilité, ni sortie, ni bénéfice.</div>
+        </section>
+
+        <section id="perimetre" class="mb-5" aria-labelledby="perimetre-title">
+          <p class="section-kicker">02 · Périmètre produit</p>
+          <h2 id="perimetre-title">Capacités, frontières et statut</h2>
+          <div class="table-responsive"><table class="table table-striped align-middle"><thead><tr><th>Capacité</th><th>Statut</th><th>Portée réelle</th></tr></thead><tbody>
+            <tr><td>Pump.fun launchpad</td><td><span class="badge status-active">ACTIF</span></td><td>Création, initial buy, trades de bonding curve et migration.</td></tr>
+            <tr><td>PumpSwap market</td><td><span class="badge status-active">ACTIF</span></td><td>Pool canonique, réserves, quotes et swaps observés.</td></tr>
+            <tr><td>Métadonnées HTTP</td><td><span class="badge status-partial">PARTIEL</span></td><td>Provider borné disponible ; orchestration sociale complète non composée.</td></tr>
+            <tr><td>Créateur et holders observés</td><td><span class="badge status-active">ACTIF</span></td><td>Depuis la détection seulement ; pas d’historique antérieur ni snapshot SPL exhaustif.</td></tr>
+            <tr><td>Clusters wallets</td><td><span class="badge status-active">ACTIF</span></td><td>Preuves fortes de financement ; reason codes encore désactivés avant calibrage.</td></tr>
+            <tr><td>Qualification</td><td><span class="badge status-partial">PARTIEL</span></td><td>Scores/blockers explicables ; jeu initial non validé.</td></tr>
+            <tr><td>Paper trading</td><td><span class="badge status-active">ACTIF</span></td><td>Ledger simulé, SOL/WSOL initialement autorisé, aucune transaction Solana.</td></tr>
+            <tr><td>Raydium CPMM</td><td><span class="badge status-isolated">ISOLÉ</span></td><td>Code conservé et testé, absent du bootstrap Pump.fun principal.</td></tr>
+            <tr><td>Exécution réelle</td><td><span class="badge status-isolated">ABSENTE</span></td><td>Aucun mode live activable et aucune clé privée acceptée.</td></tr>
+          </tbody></table></div>
+        </section>
+
+        <section id="architecture" class="mb-5" aria-labelledby="architecture-title">
+          <p class="section-kicker">03 · Architecture</p>
+          <h2 id="architecture-title">Couches et dépendances autorisées</h2>
+          <p>Le domaine reste indépendant de Pump.fun, PumpSwap et Raydium. Les programmes concrets sont derrière des ports ; le bootstrap ne compose que les chemins passifs.</p>
+          <figure class="diagram p-3">
+            <svg id="diagram-architecture" viewBox="0 0 1000 430" role="img" aria-labelledby="diagram-architecture-title diagram-architecture-desc">
+              <title id="diagram-architecture-title">Architecture en couches</title><desc id="diagram-architecture-desc">Le domaine alimente les ports, les services applicatifs, les adaptateurs Pump.fun et PumpSwap, PostgreSQL et les interfaces HTTP et SSE. Raydium reste isolé.</desc>
+              <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
+              <rect class="box active" x="350" y="25" width="300" height="60" rx="12"/><text x="500" y="52" text-anchor="middle" font-weight="700">Domaine source-indépendant</text><text x="500" y="72" text-anchor="middle" font-size="14">événements · états · bigint · reason codes</text>
+              <rect class="box audit" x="350" y="120" width="300" height="60" rx="12"/><text x="500" y="147" text-anchor="middle" font-weight="700">Ports</text><text x="500" y="167" text-anchor="middle" font-size="14">Launchpad · Market · Metadata · Repositories</text>
+              <rect class="box" x="350" y="215" width="300" height="65" rx="12"/><text x="500" y="243" text-anchor="middle" font-weight="700">Application</text><text x="500" y="263" text-anchor="middle" font-size="14">pipeline · worker · finality · analytics · paper</text>
+              <rect class="box active" x="35" y="325" width="210" height="65" rx="12"/><text x="140" y="352" text-anchor="middle" font-weight="700">Pump.fun</text><text x="140" y="373" text-anchor="middle" font-size="14">LaunchpadAdapter principal</text>
+              <rect class="box market" x="270" y="325" width="210" height="65" rx="12"/><text x="375" y="352" text-anchor="middle" font-weight="700">PumpSwap</text><text x="375" y="373" text-anchor="middle" font-size="14">MarketAdapter principal</text>
+              <rect class="box audit" x="505" y="325" width="210" height="65" rx="12"/><text x="610" y="352" text-anchor="middle" font-weight="700">PostgreSQL / Solana</text><text x="610" y="373" text-anchor="middle" font-size="14">infrastructure durable</text>
+              <rect class="box" x="740" y="325" width="225" height="65" rx="12"/><text x="852" y="352" text-anchor="middle" font-weight="700">HTTP / SSE</text><text x="852" y="373" text-anchor="middle" font-size="14">contrats publics V1</text>
+              <rect class="box warning" x="735" y="120" width="230" height="60" rx="12"/><text x="850" y="147" text-anchor="middle" font-weight="700">Raydium CPMM</text><text x="850" y="167" text-anchor="middle" font-size="14">secondaire, non composé</text>
+              <path class="line" d="M500 85V120"/><path class="line" d="M500 180V215"/><path class="line" d="M450 280L140 325"/><path class="line" d="M480 280L375 325"/><path class="line" d="M530 280L610 325"/><path class="line" d="M560 280L852 325"/><path class="line dash" d="M735 150H650"/>
+            </svg>
+            <figcaption class="small text-secondary mt-2">Les flèches représentent les dépendances de composition, jamais un accès à une clé ou à un exécuteur live.</figcaption>
+          </figure>
+          <div class="row g-3 mt-1"><div class="col-md-4"><div class="card h-100"><div class="card-body"><h3 class="h6">Règle 1</h3><p class="small mb-0">Le domaine n’importe aucun programme Solana concret.</p></div></div></div><div class="col-md-4"><div class="card h-100"><div class="card-body"><h3 class="h6">Règle 2</h3><p class="small mb-0">Pump.fun, PumpSwap et Raydium ne s’importent pas mutuellement.</p></div></div></div><div class="col-md-4"><div class="card h-100"><div class="card-body"><h3 class="h6">Règle 3</h3><p class="small mb-0">Le bootstrap actif ne charge ni wallet, ni signature, ni soumission.</p></div></div></div></div>
+        </section>
+
+        <section id="flux-produit" class="mb-5" aria-labelledby="flux-title">
+          <p class="section-kicker">04 · Flux fonctionnel</p><h2 id="flux-title">De la création Pump.fun au pool PumpSwap</h2>
+          <figure class="diagram p-3"><svg id="diagram-produit" viewBox="0 0 1200 320" role="img" aria-labelledby="diagram-produit-title diagram-produit-desc">
+            <title id="diagram-produit-title">Flux produit Pump.fun vers PumpSwap</title><desc id="diagram-produit-desc">Le token passe de la création et du suivi de courbe aux analyses, à la qualification, au paper trading puis à la graduation PumpSwap.</desc>
+            <defs><marker id="arrow-product" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#475569"/></marker></defs>
+            <g font-size="13" text-anchor="middle"><rect class="box active" x="20" y="90" width="130" height="65" rx="12"/><text x="85" y="117" font-weight="700">Création</text><text x="85" y="138">+ achat initial</text><rect class="box active" x="175" y="90" width="130" height="65" rx="12"/><text x="240" y="117" font-weight="700">Décodage</text><text x="240" y="138">courbe + trades</text><rect class="box" x="330" y="35" width="140" height="65" rx="12"/><text x="400" y="62" font-weight="700">Métadonnées</text><text x="400" y="83">signaux publics</text><rect class="box" x="330" y="145" width="140" height="65" rx="12"/><text x="400" y="172" font-weight="700">Participants</text><text x="400" y="193">créateur + wallets</text><rect class="box active" x="500" y="90" width="140" height="65" rx="12"/><text x="570" y="117" font-weight="700">Courbe</text><text x="570" y="138">progression + prix</text><rect class="box warning" x="670" y="90" width="140" height="65" rx="12"/><text x="740" y="117" font-weight="700">Qualification</text><text x="740" y="138">scores + blockers</text><rect class="box audit" x="840" y="90" width="140" height="65" rx="12"/><text x="910" y="117" font-weight="700">Paper</text><text x="910" y="138">entrée / sortie</text><rect class="box market" x="1010" y="90" width="165" height="65" rx="12"/><text x="1092" y="117" font-weight="700">PumpSwap</text><text x="1092" y="138">pool + réserves</text></g>
+            <g stroke="#475569" stroke-width="2" fill="none" marker-end="url(#arrow-product)"><path d="M150 122H175"/><path d="M305 122H330"/><path d="M470 68C485 68 485 110 500 110"/><path d="M470 178C485 178 485 135 500 135"/><path d="M640 122H670"/><path d="M810 122H840"/><path d="M980 122H1010"/></g>
+            <text x="740" y="190" text-anchor="middle" font-size="13" fill="#92400e">Un score élevé n’annule jamais un blocker.</text><text x="910" y="215" text-anchor="middle" font-size="13" fill="#1d4ed8">Simulation comptable uniquement.</text><path d="M1092 155C1092 260 570 270 570 155" stroke="#6d28d9" stroke-width="2" fill="none" stroke-dasharray="7 6" marker-end="url(#arrow-product)"/><text x="830" y="290" text-anchor="middle" font-size="13">Suivi continu des états et événements après graduation</text>
+          </svg><figcaption class="small text-secondary">Les analyses sociales et avancées enrichissent la décision ; elles ne constituent jamais une preuve de sérieux à elles seules.</figcaption></figure>
+        </section>
+
+        <section id="acquisition" class="mb-5" aria-labelledby="acquisition-title">
+          <p class="section-kicker">05 · Acquisition Solana</p><h2 id="acquisition-title">WebSocket nominal, rattrapage HTTP borné</h2>
+          <p>Deux souscriptions <code>onLogs</code> écoutent les programmes Pump.fun et PumpSwap. Le callback ne décode pas : il valide et enfile. Au démarrage, le scanner rattrape chaque programme par pages, jusqu’au checkpoint exact.</p>
+          <figure class="diagram p-3"><svg id="diagram-ingestion" viewBox="0 0 1100 370" role="img" aria-labelledby="diagram-ingestion-title diagram-ingestion-desc">
+            <title id="diagram-ingestion-title">Séquence d’ingestion durable</title><desc id="diagram-ingestion-desc">WebSocket et catch-up convergent dans l’inbox. Le worker localise la transaction, sauvegarde un snapshot et exécute le pipeline complet avant checkpoint et finalité.</desc>
+            <defs><marker id="arrow-ingest" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#475569"/></marker></defs>
+            <g text-anchor="middle" font-size="14"><rect class="box active" x="30" y="30" width="180" height="55" rx="10"/><text x="120" y="63" font-weight="700">WebSocket × 2</text><rect class="box audit" x="30" y="130" width="180" height="55" rx="10"/><text x="120" y="163" font-weight="700">Catch-up HTTP</text><rect class="box" x="270" y="80" width="180" height="70" rx="10"/><text x="360" y="110" font-weight="700">Inbox PostgreSQL</text><text x="360" y="132">déduplication signature</text><rect class="box" x="510" y="80" width="180" height="70" rx="10"/><text x="600" y="110" font-weight="700">Worker séquentiel</text><text x="600" y="132">lease + snapshot</text><rect class="box active" x="750" y="80" width="200" height="70" rx="10"/><text x="850" y="110" font-weight="700">Pipeline complet</text><text x="850" y="132">launchpad → I2 → market</text><rect class="box warning" x="510" y="245" width="180" height="65" rx="10"/><text x="600" y="272" font-weight="700">FAILED retryable</text><text x="600" y="293">backoff ≤ 60 s</text><rect class="box market" x="750" y="245" width="200" height="65" rx="10"/><text x="850" y="272" font-weight="700">Finality reconciler</text><text x="850" y="293">finalize / orphan</text></g>
+            <g stroke="#475569" stroke-width="2" fill="none" marker-end="url(#arrow-ingest)"><path d="M210 58C240 58 240 100 270 100"/><path d="M210 158C240 158 240 130 270 130"/><path d="M450 115H510"/><path d="M690 115H750"/><path d="M850 150V245"/><path d="M750 278H690"/><path d="M600 245V150"/></g><text x="120" y="215" text-anchor="middle" font-size="13">20 × 100 signatures/programme par défaut</text><text x="360" y="190" text-anchor="middle" font-size="13">sources fusionnées, ID idempotent</text><text x="600" y="340" text-anchor="middle" font-size="13">Nombre de tentatives non plafonné actuellement</text>
+          </svg><figcaption class="small text-secondary">Le checkpoint n’avance qu’après l’enqueue déterministe du lot. Une fenêtre ambiguë échoue explicitement.</figcaption></figure>
+        </section>
+
+        <section id="inbox" class="mb-5" aria-labelledby="inbox-title">
+          <p class="section-kicker">06 · Inbox, leases et reprise</p><h2 id="inbox-title">Une transaction, un travail durable, un replay intégral</h2>
+          <div class="row g-3"><div class="col-lg-6"><div class="card h-100"><div class="card-body"><h3 class="h5">Cycle du travail</h3><ol><li><code>PENDING</code> ou <code>FAILED retryable</code> devient réclamable.</li><li>Le claim crée un lease borné et incrémente <code>attempts</code>.</li><li>Le locator retrouve l’index canonique dans le block.</li><li>La transaction normalisée est fingerprintée puis persistée.</li><li>Le pipeline rejoue toutes les étapes depuis le début.</li><li>Le travail devient <code>PROCESSED</code> ou <code>FAILED</code>.</li></ol></div></div></div><div class="col-lg-6"><div class="card h-100"><div class="card-body"><h3 class="h5">Garanties</h3><ul><li>Un lease perdu ne peut pas marquer le travail comme traité.</li><li>Un worker arrêté est repris après expiration du lease.</li><li>Les écritures métier utilisent identités et fingerprints déterministes.</li><li>Aucun drapeau ne saute une étape déjà persistée.</li><li>Le backlog health inclut les échecs retryables.</li></ul></div></div></div></div>
+          <figure class="diagram p-3 mt-3"><svg id="diagram-recovery" viewBox="0 0 1100 330" role="img" aria-labelledby="diagram-recovery-title diagram-recovery-desc">
+            <title id="diagram-recovery-title">Reprise après panne aux cinq frontières</title><desc id="diagram-recovery-desc">Une première tentative persiste un préfixe et échoue. Une seconde tentative rejoue launchpad, funding, I1, I2 et PumpSwap. Les écritures déterministes restent uniques.</desc>
+            <defs><marker id="arrow-recovery" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#475569"/></marker></defs>
+            <g text-anchor="middle" font-size="13"><rect class="box active" x="25" y="75" width="155" height="55" rx="10"/><text x="102" y="108" font-weight="700">Launchpad</text><rect class="box" x="205" y="75" width="155" height="55" rx="10"/><text x="282" y="108" font-weight="700">Funding</text><rect class="box" x="385" y="75" width="155" height="55" rx="10"/><text x="462" y="108" font-weight="700">I1 participants</text><rect class="box" x="565" y="75" width="155" height="55" rx="10"/><text x="642" y="108" font-weight="700">I2 graphe</text><rect class="box market" x="745" y="75" width="155" height="55" rx="10"/><text x="822" y="108" font-weight="700">PumpSwap</text><rect class="box danger" x="445" y="180" width="180" height="60" rx="10"/><text x="535" y="205" font-weight="700">Panne injectée</text><text x="535" y="225">FAILED · attempt 1</text><rect class="box audit" x="745" y="180" width="210" height="60" rx="10"/><text x="850" y="205" font-weight="700">Nouveau worker</text><text x="850" y="225">replay · attempt 2</text></g>
+            <g stroke="#475569" stroke-width="2" fill="none" marker-end="url(#arrow-recovery)"><path d="M180 102H205"/><path d="M360 102H385"/><path d="M540 102H565"/><path d="M720 102H745"/><path d="M535 130V180"/><path d="M625 210H745"/><path d="M850 180C1040 140 1040 30 102 30C55 30 55 75 55 75"/></g><text x="550" y="285" text-anchor="middle" font-size="14">Résultat : 1 effet actif par table, audit immuable conservé, inbox PROCESSED</text>
+          </svg><figcaption class="small text-secondary">L’intégration PostgreSQL teste les cinq points de panne réels avec deux workers distincts.</figcaption></figure>
+        </section>
+
+        <section id="decodage" class="mb-5" aria-labelledby="decodage-title">
+          <p class="section-kicker">07 · Décodage Solana</p><h2 id="decodage-title">Multi-instruction, CPI, Token-2022 et multi-quote</h2>
+          <div class="table-responsive"><table class="table table-bordered"><thead><tr><th>Dimension</th><th>Comportement</th></tr></thead><tbody>
+            <tr><td>Instructions</td><td>Parcourt toutes les instructions externes et internes ; aucune hypothèse « une transaction = une instruction ».</td></tr>
+            <tr><td>Curseur</td><td><code>slot + transactionIndex + instructionIndex + innerInstructionIndex</code>, avec signature et programme.</td></tr>
+            <tr><td>Pump.fun</td><td><code>create</code>, <code>create_v2</code>, buys V1/V2/exact quote, sells V1/V2 et migration selon l’IDL officiel épinglé.</td></tr>
+            <tr><td>Montants</td><td>Événements CPI appairés, jamais une estimation à partir des deltas globaux répétés.</td></tr>
+            <tr><td>Token program</td><td>Détection SPL Token ou Token-2022 pour mint, vaults, transferts et quote asset.</td></tr>
+            <tr><td>Quotes</td><td>Observation multi-quote ; chaque quote garde mint, décimales et programme. Aucune somme entre assets différents.</td></tr>
+            <tr><td>Calculs</td><td><code>bigint</code> et entiers uniquement pour montants, réserves, frais et basis points.</td></tr>
+          </tbody></table></div>
+        </section>
+
+        <section id="finalite" class="mb-5" aria-labelledby="finalite-title">
+          <p class="section-kicker">08 · Finalité</p><h2 id="finalite-title">Réconciliation prudente et orphaning explicite</h2>
+          <figure class="diagram p-3"><svg id="diagram-finalite" viewBox="0 0 1050 360" role="img" aria-labelledby="diagram-finalite-title diagram-finalite-desc">
+            <title id="diagram-finalite-title">Machine de finalité</title><desc id="diagram-finalite-desc">Processed progresse vers confirmed puis finalized. Des sondages manquants consécutifs et une racine finalized strictement supérieure sont nécessaires avant orphaned. Finalized ne peut pas être rétracté.</desc>
+            <defs><marker id="arrow-finality" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#475569"/></marker></defs>
+            <g text-anchor="middle"><rect class="box" x="45" y="60" width="180" height="65" rx="12"/><text x="135" y="88" font-weight="700">processed</text><text x="135" y="109" font-size="13">observation provisoire</text><rect class="box active" x="300" y="60" width="180" height="65" rx="12"/><text x="390" y="88" font-weight="700">confirmed</text><text x="390" y="109" font-size="13">projection active</text><rect class="box audit" x="555" y="60" width="180" height="65" rx="12"/><text x="645" y="88" font-weight="700">finalized</text><text x="645" y="109" font-size="13">terminal · purgeable +4 h</text><rect class="box warning" x="300" y="225" width="180" height="65" rx="12"/><text x="390" y="253" font-weight="700">missing × 3</text><text x="390" y="274" font-size="13">compteur consécutif</text><rect class="box danger" x="555" y="225" width="180" height="65" rx="12"/><text x="645" y="253" font-weight="700">orphaned</text><text x="645" y="274" font-size="13">rétraction + audit</text><rect class="box" x="800" y="140" width="205" height="65" rx="12"/><text x="902" y="168" font-weight="700">Racine finalized</text><text x="902" y="189" font-size="13">strictement &gt; slot</text></g>
+            <g stroke="#475569" stroke-width="2" fill="none" marker-end="url(#arrow-finality)"><path d="M225 92H300"/><path d="M480 92H555"/><path d="M390 125V225"/><path d="M480 257H555"/><path d="M800 172C760 172 760 245 735 245"/><path d="M390 225C270 190 260 125 300 110"/></g><text x="258" y="180" font-size="13">confirmed remet le compteur à 0</text><path d="M735 92H930" stroke="#dc2626" stroke-width="2" stroke-dasharray="7 6"/><text x="835" y="82" text-anchor="middle" font-size="13" fill="#991b1b">contradiction : erreur, jamais rétraction</text>
+          </svg><figcaption class="small text-secondary">Un statut manquant seul ne suffit jamais. Les projections orphaned courantes sont dissoutes, les preuves brutes restent auditables.</figcaption></figure>
+        </section>
+
+        <section id="analyses" class="mb-5" aria-labelledby="analyses-title">
+          <p class="section-kicker">09 · Métadonnées et analyses</p><h2 id="analyses-title">Préparation, participants et relations observées</h2>
+          <div class="row g-3"><div class="col-lg-4"><div class="card h-100"><div class="card-body"><span class="badge status-partial">PARTIEL</span><h3 class="h5 mt-2">Métadonnées / social</h3><p>Le provider HTTP valide URI, taille, hôte public et JSON sans getters hostiles. La collecte sociale complète répond encore honnêtement <code>NOT_AVAILABLE</code>.</p></div></div></div><div class="col-lg-4"><div class="card h-100"><div class="card-body"><span class="badge status-active">ACTIF</span><h3 class="h5 mt-2">I1 · Participants</h3><p>Créateur, achat initial, première vente, positions nettes observées et concentrations top 1/5/10 depuis la création uniquement.</p></div></div></div><div class="col-lg-4"><div class="card h-100"><div class="card-body"><span class="badge status-active">ACTIF</span><h3 class="h5 mt-2">I2 · Graphe</h3><p>Transferts directs forts, fee payer moyen sans fusion, clusters connexes et concentration par quote asset.</p></div></div></div></div>
+          <div class="alert alert-info mt-3 mb-0">Ces positions décrivent les flux persistés depuis la détection. Elles ne certifient pas les soldes SPL actuels et ne constituent pas un historique antérieur du wallet.</div>
+        </section>
+
+        <section id="qualification" class="mb-5" aria-labelledby="qualification-title">
+          <p class="section-kicker">10 · Qualification</p><h2 id="qualification-title">Trois scores, blockers séparés, décision explicable</h2>
+          <div class="row g-3"><div class="col-md-4"><div class="card h-100 border-info"><div class="card-body"><div class="display-6">15</div><h3 class="h5">Préparation</h3><p class="small">Média, description, liens renseignés et cohérence visuelle.</p></div></div></div><div class="col-md-4"><div class="card h-100 border-primary"><div class="card-body"><div class="display-6">25</div><h3 class="h5">Authenticité sociale</h3><p class="small">Cross-links, mint publié, ancienneté, domaine et absence d’usurpation.</p></div></div></div><div class="col-md-4"><div class="card h-100 border-success"><div class="card-body"><div class="display-6">60</div><h3 class="h5">On-chain</h3><p class="small">Créateur, concentration, clusters, flux, courbe, liquidité et round trip.</p></div></div></div></div>
+          <div class="card mt-3 border-danger"><div class="card-body"><h3 class="h5 text-danger">Conditions éliminatoires</h3><p>Les reason codes stables — par exemple <code>CREATOR_EARLY_SELL</code>, <code>MINT_SOCIAL_MISMATCH</code>, <code>SHARED_FUNDER_CLUSTER</code>, <code>SELL_QUOTE_UNAVAILABLE</code> ou <code>ROUND_TRIP_LOSS_EXCEEDED</code> — décident indépendamment du score. Un blocker actif ne peut jamais être compensé.</p><p class="mb-0"><strong>État actuel :</strong> règles configurables présentes, <code>UNVALIDATED_RULE_SET</code> et calibrage dry run encore nécessaires.</p></div></div>
+        </section>
+
+        <section id="paper" class="mb-5" aria-labelledby="paper-title">
+          <p class="section-kicker">11 · Paper trading</p><h2 id="paper-title">Simulation comptable, jamais une transaction Solana</h2>
+          <div class="row g-3"><div class="col-lg-7"><div class="card h-100"><div class="card-body"><h3 class="h5">Conditions d’entrée</h3><ul><li><code>EXECUTION_MODE=paper</code> ;</li><li>qualification acceptée sans blocker ;</li><li>quote mint dans l’allowlist initiale SOL/WSOL ;</li><li>quote inverse disponible et perte aller-retour acceptable ;</li><li>frais, slippage, montants et PnL calculés en entiers.</li></ul><p class="mb-0">Positions, trades et événements sont persistés atomiquement et rétractés si leur déclencheur devient orphaned.</p></div></div></div><div class="col-lg-5"><div class="alert alert-danger h-100 mb-0"><h3 class="h5">Barrière de sécurité</h3><ul><li>Modes admis : <code>observe</code>, <code>paper</code>.</li><li>Aucune variable de clé privée.</li><li>Aucun signer dans le bootstrap.</li><li>Aucun <code>sendTransaction</code>.</li><li>Aucune garantie de sortie ou profit.</li></ul></div></div></div>
+          <figure class="diagram p-3 mt-3"><svg id="diagram-securite" viewBox="0 0 1050 310" role="img" aria-labelledby="diagram-securite-title diagram-securite-desc">
+            <title id="diagram-securite-title">Frontières de sécurité du runtime</title><desc id="diagram-securite-desc">Les données RPC alimentent l’observation et le ledger paper. Une barrière empêche tout accès au wallet, au signer et à la soumission. Le code Raydium historique reste isolé.</desc>
+            <defs><marker id="arrow-safety" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#475569"/></marker></defs>
+            <rect class="box active" x="40" y="60" width="190" height="65" rx="12"/><text x="135" y="88" text-anchor="middle" font-weight="700">RPC lecture seule</text><text x="135" y="109" text-anchor="middle" font-size="13">logs · tx · comptes</text><rect class="box" x="300" y="60" width="190" height="65" rx="12"/><text x="395" y="88" text-anchor="middle" font-weight="700">Observation</text><text x="395" y="109" text-anchor="middle" font-size="13">projections + API</text><rect class="box audit" x="560" y="60" width="190" height="65" rx="12"/><text x="655" y="88" text-anchor="middle" font-weight="700">Ledger paper</text><text x="655" y="109" text-anchor="middle" font-size="13">simulation interne</text><rect class="box danger" x="820" y="45" width="190" height="95" rx="12"/><text x="915" y="74" text-anchor="middle" font-weight="700">INTERDIT V1</text><text x="915" y="97" text-anchor="middle" font-size="13">wallet · signer</text><text x="915" y="118" text-anchor="middle" font-size="13">soumission · live</text><path d="M230 92H300" stroke="#475569" stroke-width="2" marker-end="url(#arrow-safety)"/><path d="M490 92H560" stroke="#475569" stroke-width="2" marker-end="url(#arrow-safety)"/><path d="M750 92H820" stroke="#dc2626" stroke-width="5" stroke-dasharray="10 8"/><text x="785" y="80" text-anchor="middle" font-size="12" fill="#991b1b">barrière</text><rect class="box warning" x="300" y="205" width="450" height="60" rx="12"/><text x="525" y="232" text-anchor="middle" font-weight="700">Raydium CPMM historique</text><text x="525" y="253" text-anchor="middle" font-size="13">compilé et testé, mais non importé par le bootstrap actif</text><path d="M395 125V205" stroke="#475569" stroke-width="2" stroke-dasharray="7 6"/>
+          </svg><figcaption class="small text-secondary">Le paper trading n’utilise pas le TradeExecutor Raydium historique et ne simule pas une soumission réseau.</figcaption></figure>
+        </section>
+
+        <section id="persistance" class="mb-5" aria-labelledby="persistance-title">
+          <p class="section-kicker">12 · PostgreSQL</p><h2 id="persistance-title">Audit brut, événements et projections séparés</h2>
+          <figure class="diagram p-3"><svg id="diagram-donnees" viewBox="0 0 1100 390" role="img" aria-labelledby="diagram-donnees-title diagram-donnees-desc">
+            <title id="diagram-donnees-title">Modèle de persistance et projections API</title><desc id="diagram-donnees-desc">L’inbox et les événements bruts alimentent des événements de domaine immuables, puis les projections launch, analytics, paper et market exposées par l’API et l’outbox SSE.</desc>
+            <defs><marker id="arrow-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#475569"/></marker></defs>
+            <g text-anchor="middle" font-size="13"><rect class="box audit" x="35" y="45" width="210" height="60" rx="10"/><text x="140" y="71" font-weight="700">chain_transaction_inbox</text><text x="140" y="92">snapshot + lease + retry</text><rect class="box audit" x="35" y="155" width="210" height="60" rx="10"/><text x="140" y="181" font-weight="700">raw_chain_events</text><text x="140" y="202">preuve technique</text><rect class="box active" x="330" y="100" width="210" height="70" rx="10"/><text x="435" y="128" font-weight="700">domain_events</text><text x="435" y="149">identité + payload versionné</text><rect class="box" x="625" y="25" width="210" height="55" rx="10"/><text x="730" y="58" font-weight="700">token_launches / trades</text><rect class="box" x="625" y="100" width="210" height="55" rx="10"/><text x="730" y="133" font-weight="700">I1 / I2 / social</text><rect class="box" x="625" y="175" width="210" height="55" rx="10"/><text x="730" y="208" font-weight="700">paper_positions</text><rect class="box market" x="625" y="250" width="210" height="55" rx="10"/><text x="730" y="283" font-weight="700">migrations / market</text><rect class="box warning" x="330" y="260" width="210" height="60" rx="10"/><text x="435" y="286" font-weight="700">state_transitions</text><text x="435" y="307">raison + preuve</text><rect class="box active" x="900" y="100" width="165" height="60" rx="10"/><text x="982" y="126" font-weight="700">API V1</text><text x="982" y="147">JSON readonly</text><rect class="box audit" x="900" y="215" width="165" height="60" rx="10"/><text x="982" y="241" font-weight="700">Outbox SSE</text><text x="982" y="262">curseur reprise</text></g>
+            <g stroke="#475569" stroke-width="2" fill="none" marker-end="url(#arrow-data)"><path d="M245 75L330 120"/><path d="M245 185L330 150"/><path d="M540 120L625 52"/><path d="M540 130H625"/><path d="M540 145L625 202"/><path d="M540 155L625 277"/><path d="M435 170V260"/><path d="M835 130H900"/><path d="M835 202L900 235"/></g><text x="550" y="365" text-anchor="middle" font-size="14">NUMERIC(78,0) en base · chaînes décimales dans l’API · aucun float financier</text>
+          </svg><figcaption class="small text-secondary">Les projections courantes peuvent être dissoutes après orphaning ; l’audit brut et les snapshots immuables restent séparés.</figcaption></figure>
+          <h3 class="h5 mt-3">Rétention et confidentialité</h3><p>La fenêtre applicative est de quatre heures pour les données terminales, l’outbox et les preuves publiques de wallets. Seules les transactions <code>finalized</code> ou <code>orphaned</code> devenues terminales sont purgeables. Les travaux <code>processed</code> ou <code>confirmed</code> encore en attente de finalité ne sont jamais purgés.</p>
+        </section>
+
+        <section id="api" class="mb-5" aria-labelledby="api-title">
+          <p class="section-kicker">13 · Frontend API</p><h2 id="api-title">Contrats JSON V1 et reprise SSE</h2>
+          <div class="table-responsive"><table class="table table-hover"><thead><tr><th>Route</th><th>Projection</th></tr></thead><tbody>
+            <tr><td><code>GET /api/v1/launches</code></td><td>Radar paginé des lancements.</td></tr><tr><td><code>GET /api/v1/launches/:mint</code></td><td>Fiche agrégée.</td></tr><tr><td><code>.../:mint/events</code></td><td>Timeline ordonnée.</td></tr><tr><td><code>.../:mint/risk</code></td><td>Qualification, score et raisons.</td></tr><tr><td><code>.../:mint/social</code></td><td>Preuves sociales ou <code>NOT_AVAILABLE</code>.</td></tr><tr><td><code>.../:mint/holders</code></td><td>I1/I2, positions et clusters observés.</td></tr><tr><td><code>GET /api/v1/paper-positions</code></td><td>Positions et PnL simulés.</td></tr><tr><td><code>GET /api/v1/health</code></td><td>Runtime, backlog, leases et checkpoints.</td></tr><tr><td><code>GET /api/v1/events</code></td><td>Flux SSE avec curseur opaque.</td></tr>
+          </tbody></table></div>
+          <div class="alert alert-secondary"><strong>Reconnexion :</strong> conserver le champ SSE <code>id</code>, puis l’envoyer dans <code>Last-Event-ID</code>. Sur <code>EVENT_CURSOR_EXPIRED</code>, recharger les projections HTTP et se reconnecter sans ancien curseur. <code>data.eventId</code> est une identité métier, pas un curseur.</div>
+          <p>L’API est publique, non authentifiée et liée à <code>127.0.0.1:3000</code> par défaut. Toute exposition réseau nécessite proxy, contrôle d’accès et TLS au niveau du déploiement.</p>
+        </section>
+
+        <section id="runtime" class="mb-5" aria-labelledby="runtime-title">
+          <p class="section-kicker">14 · Exploitation</p><h2 id="runtime-title">Démarrage, health et arrêt gracieux</h2>
+          <div class="row g-3"><div class="col-lg-6"><div class="card h-100"><div class="card-body"><h3 class="h5">Ordre de démarrage</h3><ol><li>PostgreSQL et migrations optionnelles.</li><li>Health RPC.</li><li>Catch-up borné.</li><li>Souscriptions WebSocket.</li><li>Worker inbox.</li><li>Réconciliateur de finalité.</li><li>Heartbeat persistant.</li><li>API HTTP/SSE.</li></ol></div></div></div><div class="col-lg-6"><div class="card h-100"><div class="card-body"><h3 class="h5">États honnêtes</h3><ul><li><code>RUNNING</code> exige tous les composants actifs.</li><li><code>DEGRADED</code> couvre panne, heartbeat périmé ou nettoyage incomplet.</li><li><code>STOPPED</code> couvre arrêt réussi ou désactivation explicite.</li><li>Le backlog inclut pending, processing et failed retryable.</li><li>Les URL RPC/DB et secrets ne sont jamais exposés.</li></ul></div></div></div></div>
+          <p class="mt-3">L’arrêt utilise une deadline globale : il bloque les nouveaux claims, ferme les producteurs, attend le travail en vol, clôt le réconciliateur et écrit <code>STOPPED</code> en dernier. Les ressources dont le nettoyage échoue restent suivies et retentables.</p>
+          <div class="alert alert-info mb-0"><strong>Configuration minimale :</strong> Node.js 22+, PostgreSQL, <code>SOLANA_HTTP_RPC_URL</code>, <code>SOLANA_WS_RPC_URL</code> et <code>DATABASE_URL</code>. Aucune variable de wallet.</div>
+        </section>
+
+        <section id="tests" class="mb-5" aria-labelledby="tests-title">
+          <p class="section-kicker">15 · Qualité et acceptation</p><h2 id="tests-title">Ce qui est vérifié automatiquement</h2>
+          <div class="row row-cols-1 row-cols-md-2 g-3"><div class="col"><div class="card h-100"><div class="card-body"><h3 class="h5">Décodage</h3><p class="small mb-0">Fixtures mainnet assainies, instructions externes/internes, initial buy, ventes CPI, V2, multi-quote et Token-2022.</p></div></div></div><div class="col"><div class="card h-100"><div class="card-body"><h3 class="h5">Durabilité</h3><p class="small mb-0">Migration vide/replay, claims concurrents, leases, snapshots hostiles, retries, finalité et orphaning.</p></div></div></div><div class="col"><div class="card h-100"><div class="card-body"><h3 class="h5">Recovery PostgreSQL</h3><p class="small mb-0">Panne réelle après launchpad, funding, I1, I2 ou PumpSwap ; replay intégral et exactement-un effet actif.</p></div></div></div><div class="col"><div class="card h-100"><div class="card-body"><h3 class="h5">Sécurité</h3><p class="small mb-0">Bootstrap sans signer/soumission, configuration observe/paper, erreurs redacted et frontières hostiles.</p></div></div></div></div>
+          <div class="mt-3 p-3 bg-dark text-white rounded"><code class="text-info">npm install · npm run build · npm run check · npm run lint · TEST_DATABASE_URL=... npm test</code><br><span class="small text-white-50">Dernière acceptation J1 avant fusion : 667 tests réussis, aucun échec.</span></div>
+        </section>
+
+        <section id="limites" class="mb-5" aria-labelledby="limites-title">
+          <p class="section-kicker">16 · Limites et prochaines étapes</p><h2 id="limites-title">Ce qui reste à prouver ou compléter</h2>
+          <div class="row g-3"><div class="col-lg-6"><div class="alert alert-warning h-100"><h3 class="h5">Limites connues</h3><ul><li>Validation live/dry run à effectuer avec les RPC et quotas réels.</li><li>Retry durable sans plafond de tentatives ; backoff seulement plafonné à 60 s.</li><li>APIs sociales X/Telegram payantes non requises et non intégrées.</li><li>Règles de qualification et clusters non calibrées.</li><li>Historique antérieur créateur/wallet volontairement absent.</li><li>Positions observées non équivalentes à des soldes on-chain exhaustifs.</li><li>13 vulnérabilités de dépendances signalées lors du dernier <code>npm install</code>, à traiter séparément sans mise à jour cassante automatique.</li></ul></div></div><div class="col-lg-6"><div class="alert alert-success h-100"><h3 class="h5">Étapes recommandées</h3><ol><li>Dry run mainnet avec métriques RPC et échantillons normalisés.</li><li>Comparer décodage aux transactions Pump.fun/PumpSwap actuelles.</li><li>Calibrer scores, blockers, concentration et round-trip.</li><li>Compléter les preuves sociales publiques.</li><li>Construire le front-end indépendant sur l’API V1/SSE.</li><li>Auditer puis mettre à jour les dépendances vulnérables.</li></ol></div></div></div>
+          <div class="card mt-3"><div class="card-body"><h3 class="h5">Documents et sources internes</h3><ul class="mb-0"><li><a href="../README.md">README opérateur</a></li><li><a href="architecture/pumpfun-v1.md">Architecture Pump.fun V1</a></li><li><a href="api/v1.md">Contrat API V1</a></li><li><a href="superpowers/specs/2026-08-01-pr-j1-transaction-ingestion-design.md">Conception de l’ingestion durable</a></li><li><a href="../migrations/009_transaction_ingestion.sql">Migration inbox/finalité</a></li><li><a href="../src/application/">Services applicatifs</a> et <a href="../src/storage/">repositories PostgreSQL</a></li></ul></div></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <footer class="text-white py-4"><div class="container"><div class="d-flex flex-column flex-md-row justify-content-between gap-2"><span><strong>sol-token-listener</strong> · Documentation système</span><span class="text-white-50">Bootstrap 5.3.8 local · HTML/SVG hors ligne · aucune télémétrie</span></div></div></footer>
+</body>
+</html>

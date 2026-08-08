@@ -19,7 +19,8 @@
     "pumpfun:generate": "tsx scripts/generate-pumpfun-idl.ts",
     "pumpfun:check-generated": "tsx scripts/generate-pumpfun-idl.ts --check",
     "pumpswap:generate": "tsx scripts/generate-pumpswap-idl.ts",
-    "pumpswap:check-generated": "tsx scripts/generate-pumpswap-idl.ts --check"
+    "pumpswap:check-generated": "tsx scripts/generate-pumpswap-idl.ts --check",
+    "docs:check": "tsx scripts/check-system-overview.ts"
   },
   "dependencies": {
     "@pump-fun/pump-swap-sdk": "1.19.0",
