@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import type { QualificationReasonCode } from './qualification-reasons.js';
 import { QUALIFICATION_REASON_CODES } from './qualification-reasons.js';
 
@@ -117,6 +118,7 @@ const QUALIFICATION_FACT_FIELDS = [
 
 const QUALIFICATION_UPSTREAM_CONDITION_FIELDS = ['code', 'triggered'] as const;
 const BASIS_POINTS_MAXIMUM = 10_000n;
+const QUALIFICATION_REASON_CODE_SET: ReadonlySet<string> = new Set(QUALIFICATION_REASON_CODES);
 
 export function assertValidQualificationFacts(
   facts: QualificationCalibrationFacts,
@@ -141,13 +143,19 @@ export function assertValidQualificationFacts(
 }
 
 function assertValidUpstreamConditions(value: unknown): void {
-  if (!Array.isArray(value) || !Object.isFrozen(value)) {
+  if (
+    typeof value !== 'object'
+    || value === null
+    || isProxy(value)
+    || !Array.isArray(value)
+    || !Object.isFrozen(value)
+  ) {
     throw new TypeError('Qualification upstream conditions must be a frozen array.');
   }
-  assertDenseDataArray(value, 'Qualification upstream conditions');
+  const conditions = assertDenseDataArray(value, 'Qualification upstream conditions');
   const codes = new Set<QualificationReasonCode>();
-  for (let index = 0; index < value.length; index += 1) {
-    const condition = value[index];
+  for (let index = 0; index < conditions.length; index += 1) {
+    const condition = conditions[index];
     assertFrozenPlainObject(condition, `Qualification upstream condition ${index}`);
     const fields = assertExactDataFields(
       condition,
@@ -196,6 +204,7 @@ function assertFrozenPlainObject(value: unknown, name: string): asserts value is
   if (
     typeof value !== 'object'
     || value === null
+    || isProxy(value)
     || Array.isArray(value)
     || !Object.isFrozen(value)
     || !isPlainObject(value)
@@ -203,7 +212,7 @@ function assertFrozenPlainObject(value: unknown, name: string): asserts value is
 }
 
 function isPlainObject(value: object): boolean {
-  const prototype = Object.getPrototypeOf(value);
+  const prototype: unknown = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 }
 
@@ -212,6 +221,7 @@ function assertExactDataFields(
   expectedFields: readonly string[],
   name: string,
 ): Record<string, unknown> {
+  if (isProxy(value)) throw new TypeError(`${name} must not be a proxy.`);
   if (Object.getOwnPropertySymbols(value).length !== 0) {
     throw new TypeError(`${name} must not contain symbol fields.`);
   }
@@ -229,12 +239,14 @@ function assertExactDataFields(
       || !('value' in descriptor)
       || !descriptor.enumerable
     ) throw new TypeError(`${name}.${field} must be an enumerable data field.`);
-    fields[field] = descriptor.value;
+    const fieldValue: unknown = descriptor.value;
+    fields[field] = fieldValue;
   }
   return fields;
 }
 
-function assertDenseDataArray(value: readonly unknown[], name: string): void {
+function assertDenseDataArray(value: readonly unknown[], name: string): readonly unknown[] {
+  if (isProxy(value)) throw new TypeError(`${name} must not be a proxy.`);
   if (Object.getOwnPropertySymbols(value).length !== 0) {
     throw new TypeError(`${name} must not contain symbol fields.`);
   }
@@ -245,17 +257,20 @@ function assertDenseDataArray(value: readonly unknown[], name: string): void {
   if (keys.length !== value.length + 1 || keys.some((key) => !expectedKeys.has(key))) {
     throw new TypeError(`${name} must be dense and contain no extra fields.`);
   }
+  const entries: unknown[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const descriptor = descriptors[String(index)];
     if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
       throw new TypeError(`${name} must contain only enumerable data entries.`);
     }
+    const entry: unknown = descriptor.value;
+    entries.push(entry);
   }
+  return entries;
 }
 
 function isQualificationReasonCode(value: unknown): value is QualificationReasonCode {
-  return typeof value === 'string'
-    && (QUALIFICATION_REASON_CODES as readonly string[]).includes(value);
+  return typeof value === 'string' && QUALIFICATION_REASON_CODE_SET.has(value);
 }
 
 export interface QualificationEvaluationInput {
