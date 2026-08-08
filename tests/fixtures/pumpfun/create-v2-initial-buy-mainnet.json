@@ -1,4 +1,10 @@
 {
+  "schemaVersion": "solana-mainnet-fixture.v1",
+  "family": "pumpfun",
+  "sanitization": {
+    "contract": "normalized-public-chain.v1",
+    "anonymized": false
+  },
   "provenance": {
     "source": "solana-mainnet",
     "signature": "5e5t9JwautKTqCNKqHmDiZhJx9K2x85kd7RbFfbtGZ4DtcLwPW4U18ZWoinYcCuUQzZ3WRmEiMe3BDsSewVwto8h",

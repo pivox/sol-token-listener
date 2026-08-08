@@ -57,8 +57,8 @@ It excludes:
 
 Every fixture is immutable: capture uses exclusive file creation and refuses
 an existing name. The loader rejects unknown/missing keys, non-canonical
-integers, provenance mismatch, mutable/oversized collections and an unexpected
-family before decoding.
+integers and timestamps, provenance mismatch, invalid collection shapes and an
+unexpected family before decoding.
 
 ## Evidence set
 
