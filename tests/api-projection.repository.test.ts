@@ -979,7 +979,7 @@ void test('returns health without exposing database URLs or secrets', async () =
       last_finalized_slot: '58', last_signature: 'signature', pending_transactions: 0, active_sessions: 1,
       runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
       worker_state: 'RUNNING', reconciler_state: 'RUNNING', started_at: openedAt,
-      leased_transactions: 0,
+      leased_transactions: 0, exhausted_transactions: 2,
     }];
     return [];
   });
@@ -996,6 +996,7 @@ void test('returns health without exposing database URLs or secrets', async () =
     heartbeat: {
       runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
       workerState: 'RUNNING', reconcilerState: 'RUNNING', backlogCount: 0, leasedCount: 0,
+      exhaustedCount: 2,
       startedAt: openedAt.toISOString(), updatedAt: openedAt.toISOString(), lastHttpSlot: '60',
       lastWebsocketSlot: '59', lastFinalizedSlot: '58', lastSignature: 'signature',
       pendingTransactions: 0, activeSessions: 1,
@@ -1015,7 +1016,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
   assert.equal(health.status, 'DEGRADED');
   assert.deepEqual(health.heartbeat, {
     runtimeState: null, subscriberState: null, scannerState: null, workerState: null,
-    reconcilerState: null, backlogCount: null, leasedCount: null,
+    reconcilerState: null, backlogCount: null, leasedCount: null, exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
   });
@@ -1032,6 +1033,7 @@ void test('degrades stale heartbeats and reads the canonical runtime start colum
       last_signature: null, pending_transactions: 0, active_sessions: null,
       runtime_state: 'DEGRADED', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
       worker_state: 'DEGRADED', reconciler_state: 'RUNNING', leased_transactions: 0,
+      exhausted_transactions: 0,
     }];
     return [];
   });
@@ -1053,7 +1055,7 @@ void test('degrades a heartbeat timestamped in the future', async () => {
       last_finalized_slot: null, last_signature: null, pending_transactions: 0, active_sessions: 0,
       runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
       worker_state: 'RUNNING', reconciler_state: 'RUNNING', started_at: openedAt,
-      leased_transactions: 0,
+      leased_transactions: 0, exhausted_transactions: 0,
     }];
     return [];
   });
@@ -1068,11 +1070,15 @@ void test('rejects invalid heartbeat runtime states and impossible runtime count
   for (const heartbeat of [{
     runtime_state: 'UNKNOWN', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
     worker_state: 'RUNNING', reconciler_state: 'RUNNING', pending_transactions: 0,
-    leased_transactions: 0,
+    leased_transactions: 0, exhausted_transactions: 0,
   }, {
     runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
     worker_state: 'RUNNING', reconciler_state: 'RUNNING', pending_transactions: 1,
-    leased_transactions: 2,
+    leased_transactions: 2, exhausted_transactions: 0,
+  }, {
+    runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
+    worker_state: 'RUNNING', reconciler_state: 'RUNNING', pending_transactions: 0,
+    leased_transactions: 0, exhausted_transactions: -1,
   }]) {
     const database = new FakeQueryable((call) => {
       if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
@@ -1134,6 +1140,7 @@ void test('snapshots a dynamic pipeline provider exactly once without retaining 
       updated_at: openedAt, started_at: openedAt, last_http_slot: '10',
       last_websocket_slot: '10', last_finalized_slot: '9', last_signature: null,
       pending_transactions: 0, active_sessions: 0, leased_transactions: 0,
+      exhausted_transactions: 0,
       runtime_state: 'RUNNING', subscriber_state: 'RUNNING', scanner_state: 'RUNNING',
       worker_state: 'RUNNING', reconciler_state: 'RUNNING',
     }];

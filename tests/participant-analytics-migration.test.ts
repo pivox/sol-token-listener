@@ -45,7 +45,7 @@ void test('applique 001–010 sur une base vide et accepte les événements SSE'
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '010_transaction_inbox_timestamps.sql');
+    assert.equal(applied.at(-1), '011_transaction_inbox_retry_recovery.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);

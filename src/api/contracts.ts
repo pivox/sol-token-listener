@@ -342,6 +342,7 @@ export interface ApiHeartbeat {
   readonly reconcilerState?: ListenerRuntimeState | null;
   readonly backlogCount?: number | null;
   readonly leasedCount?: number | null;
+  readonly exhaustedCount?: number | null;
   readonly startedAt: string | null;
   readonly updatedAt: string | null;
   readonly lastHttpSlot: string | null;

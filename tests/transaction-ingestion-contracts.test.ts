@@ -8,6 +8,7 @@ import {
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import {
   LISTENER_RUNTIME_STATES,
+  TRANSACTION_INBOX_RECOVERY_RESULT_CODES,
   MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH,
   MAX_TRANSACTION_SNAPSHOT_DEPTH,
   MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES,
@@ -19,6 +20,8 @@ import {
   assertValidFinalityCandidate,
   assertValidFinalityPollObservation,
   assertValidIngestionFailure,
+  assertValidInboxCounts,
+  assertValidInboxRecoveryResult,
   assertValidProcessingCheckpoint,
   assertValidRuntimeHeartbeat,
   assertValidTransactionNotification,
@@ -28,6 +31,7 @@ import {
   type FinalityCandidate,
   type FinalityPollObservation,
   type IngestionFailure,
+  type InboxRecoveryResult,
   type ProcessingCheckpoint,
   type RuntimeHeartbeat,
   type TransactionNotification,
@@ -46,6 +50,13 @@ void test('publishes exact frozen ingestion status constants', () => {
   ]);
   assert.ok(Object.isFrozen(TRANSACTION_INBOX_STATUSES));
   assert.ok(Object.isFrozen(LISTENER_RUNTIME_STATES));
+  assert.deepEqual(TRANSACTION_INBOX_RECOVERY_RESULT_CODES, [
+    'RECOVERY_SCHEDULED',
+    'RECOVERY_ALREADY_SCHEDULED',
+    'RECOVERY_NOT_ELIGIBLE',
+    'RECOVERY_NOT_FOUND',
+  ]);
+  assert.ok(Object.isFrozen(TRANSACTION_INBOX_RECOVERY_RESULT_CODES));
 });
 
 void test('accepts canonical frozen ingestion contracts with bigint slots and integer milliseconds', () => {
@@ -104,6 +115,11 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
     lastSignature: 'signature',
     backlogCount: 2,
     leasedCount: 1,
+    exhaustedCount: 3,
+  });
+  const recovery: InboxRecoveryResult = Object.freeze({
+    code: 'RECOVERY_SCHEDULED',
+    signature: 'signature',
   });
 
   assert.doesNotThrow(() => { assertValidTransactionNotification(notification); });
@@ -113,6 +129,7 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
   assert.doesNotThrow(() => { assertValidFinalityCandidate(candidate); });
   assert.doesNotThrow(() => { assertValidFinalityPollObservation(finalityPoll); });
   assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
+  assert.doesNotThrow(() => { assertValidInboxRecoveryResult(recovery); });
   assert.equal(typeof notification.slot, 'bigint');
   assert.ok(Number.isSafeInteger(heartbeat.updatedAtMs));
 });
@@ -517,6 +534,29 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
     })); },
     /confirmationStatus/u,
   );
+  const counts = Object.freeze({
+    pending: 0,
+    processing: 0,
+    processed: 0,
+    failed: 2,
+    retryableFailed: 1,
+    exhaustedFailed: 1,
+  });
+  assert.doesNotThrow(() => { assertValidInboxCounts(counts); });
+  assert.throws(
+    () => { assertValidInboxCounts(Object.freeze({ ...counts, exhaustedFailed: 2 })); },
+    /exhaustedFailed|failed/u,
+  );
+  assert.throws(
+    () => { assertValidRuntimeHeartbeat(Object.freeze({
+      runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
+      workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: observedAtMs,
+      updatedAtMs: observedAtMs, lastHttpSlot: null, lastWebsocketSlot: null,
+      lastFinalizedSlot: null, lastSignature: null, backlogCount: 0, leasedCount: 0,
+      exhaustedCount: -1,
+    })); },
+    /exhaustedCount/u,
+  );
 });
 
 void test('rejects invalid discovery sources and ingestion error codes', () => {
@@ -558,6 +598,17 @@ void test('rejects invalid discovery sources and ingestion error codes', () => {
       code: 'UNKNOWN',
       errorName: 'Error',
       retryable: false,
+    })); },
+    /code/u,
+  );
+  assert.doesNotThrow(() => { assertValidIngestionFailure(Object.freeze({
+    code: 'WORKER_LEASE_EXPIRED',
+    errorName: 'TransactionInboxLeaseExpired',
+    retryable: true,
+  })); });
+  assert.throws(
+    () => { assertValidInboxRecoveryResult(Object.freeze({
+      code: 'RECOVERY_UNKNOWN', signature: 'signature',
     })); },
     /code/u,
   );

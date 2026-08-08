@@ -29,6 +29,13 @@ export const LISTENER_RUNTIME_STATES = Object.freeze([
   'STOPPED',
 ] as const);
 
+export const TRANSACTION_INBOX_RECOVERY_RESULT_CODES = Object.freeze([
+  'RECOVERY_SCHEDULED',
+  'RECOVERY_ALREADY_SCHEDULED',
+  'RECOVERY_NOT_ELIGIBLE',
+  'RECOVERY_NOT_FOUND',
+] as const);
+
 export const TRANSACTION_INGESTION_ERROR_CODES = Object.freeze([
   'RPC_TRANSIENT',
   'TRANSACTION_NOT_AVAILABLE',
@@ -38,6 +45,7 @@ export const TRANSACTION_INGESTION_ERROR_CODES = Object.freeze([
   'PIPELINE_STAGE_FAILED',
   'FINALITY_INCONSISTENT',
   'CATCH_UP_WINDOW_EXCEEDED',
+  'WORKER_LEASE_EXPIRED',
 ] as const);
 
 export type TransactionInboxStatus = (typeof TRANSACTION_INBOX_STATUSES)[number];
@@ -45,6 +53,8 @@ export type ListenerRuntimeState = (typeof LISTENER_RUNTIME_STATES)[number];
 export type IngestionComponentState = ListenerRuntimeState;
 export type TransactionDiscoverySource = 'WEBSOCKET' | 'CATCH_UP';
 export type TransactionIngestionErrorCode = (typeof TRANSACTION_INGESTION_ERROR_CODES)[number];
+export type InboxRecoveryResultCode =
+  (typeof TRANSACTION_INBOX_RECOVERY_RESULT_CODES)[number];
 export type ProcessingCheckpointKey = 'launchpad' | 'market';
 export type DurableSnapshotValue =
   | null
@@ -166,6 +176,7 @@ export interface RuntimeHeartbeat {
   readonly lastSignature: string | null;
   readonly backlogCount: number;
   readonly leasedCount: number;
+  readonly exhaustedCount: number;
 }
 
 export interface InboxCounts {
@@ -174,6 +185,12 @@ export interface InboxCounts {
   readonly processed: number;
   readonly failed: number;
   readonly retryableFailed: number;
+  readonly exhaustedFailed: number;
+}
+
+export interface InboxRecoveryResult {
+  readonly code: InboxRecoveryResultCode;
+  readonly signature: string;
 }
 
 export function createDurableTransactionSnapshot(
@@ -411,6 +428,7 @@ export function assertValidRuntimeHeartbeat(
   assertNullableText(record.lastSignature, 'Runtime heartbeat lastSignature');
   assertCount(record.backlogCount, 'Runtime heartbeat backlogCount');
   assertCount(record.leasedCount, 'Runtime heartbeat leasedCount');
+  assertCount(record.exhaustedCount, 'Runtime heartbeat exhaustedCount');
   if (record.leasedCount > record.backlogCount) {
     throw new TypeError('Runtime heartbeat leasedCount exceeds backlogCount.');
   }
@@ -423,9 +441,20 @@ export function assertValidInboxCounts(value: unknown): asserts value is InboxCo
   assertCount(record.processed, 'Inbox counts processed');
   assertCount(record.failed, 'Inbox counts failed');
   assertCount(record.retryableFailed, 'Inbox counts retryableFailed');
-  if (record.retryableFailed > record.failed) {
-    throw new TypeError('Inbox counts retryableFailed exceeds failed.');
+  assertCount(record.exhaustedFailed, 'Inbox counts exhaustedFailed');
+  if (record.retryableFailed + record.exhaustedFailed > record.failed) {
+    throw new TypeError('Inbox counts retryableFailed and exhaustedFailed exceed failed.');
   }
+}
+
+export function assertValidInboxRecoveryResult(
+  value: unknown,
+): asserts value is InboxRecoveryResult {
+  const record = frozenRecord(value, 'Inbox recovery result');
+  if (!TRANSACTION_INBOX_RECOVERY_RESULT_CODES.includes(record.code as InboxRecoveryResultCode)) {
+    throw new TypeError('Inbox recovery result code is invalid.');
+  }
+  assertText(record.signature, 'Inbox recovery result signature');
 }
 
 function frozenRecord(value: unknown, name: string): Readonly<Record<string, unknown>> {

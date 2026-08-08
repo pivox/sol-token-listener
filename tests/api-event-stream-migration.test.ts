@@ -255,6 +255,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '008_wallet_graph.sql',
       '009_transaction_ingestion.sql',
       '010_transaction_inbox_timestamps.sql',
+      '011_transaction_inbox_retry_recovery.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(
