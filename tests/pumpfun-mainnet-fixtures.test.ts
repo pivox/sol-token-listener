@@ -11,6 +11,7 @@ void test('décode hors ligne la création mainnet et son achat initial', async 
   assert.equal(fixture.schemaVersion, 'solana-mainnet-fixture.v1');
   assert.equal(fixture.family, 'pumpfun');
   assert.equal(fixture.sanitization.anonymized, false);
+  assert.equal(fixture.transaction.confirmationStatus, 'FINALIZED');
   assert.equal(fixture.provenance.transactionIndex, 946);
   assert.equal(decoded.creations.length, 1);
   assert.equal(decoded.trades.length, 1);
@@ -81,4 +82,11 @@ void test('refuse les champs hors contrat et les preuves prétendument anonymis�
       slot: '043',
     },
   }), /provenance\.slot.*entier décimal/u);
+  assert.throws(() => parsePumpFixture({
+    ...value,
+    transaction: {
+      ...(value.transaction as object),
+      confirmationStatus: 'CONFIRMED',
+    },
+  }), /confirmationStatus.*FINALIZED/u);
 });

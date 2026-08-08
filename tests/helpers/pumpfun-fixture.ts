@@ -1,6 +1,5 @@
 import { readFile } from 'node:fs/promises';
 import type {
-  LegacyConfirmationStatus,
   NormalizedInstruction,
   NormalizedTokenBalance,
   NormalizedTransaction,
@@ -93,7 +92,10 @@ function parseTransaction(value: Record<string, unknown>): NormalizedTransaction
     'signature', 'slot', 'transactionIndex', 'confirmationStatus', 'version', 'blockTimeMs',
     'instructions', 'preTokenBalances', 'postTokenBalances', 'feeLamports', 'computeUnits', 'error',
   ], 'transaction');
-  const confirmationStatus = fixedStatus(value.confirmationStatus);
+  if (value.confirmationStatus !== 'FINALIZED') {
+    throw new Error('transaction.confirmationStatus doit être FINALIZED.');
+  }
+  const confirmationStatus = value.confirmationStatus;
   const version = value.version === 'legacy' ? 'legacy' : index(value.version, 'transaction.version');
   return Object.freeze({
     signature: string(value.signature, 'transaction.signature'),
@@ -216,13 +218,6 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[], 
   if (actual.length !== canonical.length || actual.some((key, indexValue) => key !== canonical[indexValue])) {
     throw new Error(`${path}: clés hors contrat.`);
   }
-}
-
-function fixedStatus(value: unknown): LegacyConfirmationStatus {
-  if (value === 'PROCESSED' || value === 'CONFIRMED' || value === 'FINALIZED' || value === 'ORPHANED') {
-    return value;
-  }
-  throw new Error('transaction.confirmationStatus invalide.');
 }
 
 function isoTimestamp(value: unknown, path: string): string {

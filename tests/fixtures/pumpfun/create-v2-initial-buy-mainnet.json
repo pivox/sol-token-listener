@@ -16,7 +16,7 @@
     "signature": "5e5t9JwautKTqCNKqHmDiZhJx9K2x85kd7RbFfbtGZ4DtcLwPW4U18ZWoinYcCuUQzZ3WRmEiMe3BDsSewVwto8h",
     "slot": "435798633",
     "transactionIndex": 946,
-    "confirmationStatus": "CONFIRMED",
+    "confirmationStatus": "FINALIZED",
     "version": 0,
     "blockTimeMs": 1785265230000,
     "instructions": [
