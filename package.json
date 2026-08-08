@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "tsx watch src/app.ts",
     "start": "node dist/src/app.js",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && tsx scripts/copy-migrations.ts",
     "check": "npm run pumpfun:check-generated && npm run pumpswap:check-generated && tsc -p tsconfig.json --noEmit",
     "lint": "eslint . --max-warnings=0",
     "test": "tsx --test tests/*.test.ts",

@@ -37,7 +37,9 @@ npm test
 
 Renseigner `SOLANA_HTTP_RPC_URL`, `SOLANA_WS_RPC_URL` et `DATABASE_URL`, sans
 secret de wallet. Les migrations ne sont pas lancées automatiquement par
-défaut; les exécuter explicitement si nécessaire :
+défaut. `npm run build` les embarque dans `dist/migrations`, de sorte que
+`POSTGRES_AUTO_MIGRATE=true npm start` fonctionne avec l'artefact compilé.
+Les exécuter explicitement si nécessaire :
 
 ```bash
 npm run db:migrate
