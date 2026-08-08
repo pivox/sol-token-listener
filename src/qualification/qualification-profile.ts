@@ -167,6 +167,8 @@ function validatePolicyThresholds(policy: QualificationConditionPolicy): void {
 
 function exactObject(value: unknown, expected: readonly string[]): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value) || !Object.isFrozen(value)) invalid();
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) invalid();
   if (Object.getOwnPropertySymbols(value).length !== 0) invalid();
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const keys = Object.keys(descriptors);
@@ -182,6 +184,7 @@ function exactObject(value: unknown, expected: readonly string[]): Record<string
 
 function exactArray(value: unknown): readonly unknown[] {
   if (!Array.isArray(value) || isProxy(value) || !Object.isFrozen(value) || Object.getOwnPropertySymbols(value).length !== 0) invalid();
+  if (Object.getPrototypeOf(value) !== Array.prototype) invalid();
   const descriptors = Object.getOwnPropertyDescriptors(value);
   if (Object.keys(descriptors).length !== value.length + 1) invalid();
   const result: unknown[] = [];

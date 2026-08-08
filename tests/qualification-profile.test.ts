@@ -268,6 +268,29 @@ void test('rejects malformed profile schemas and hostile direct-object shapes', 
   assert.throws(() => parseQualificationProfile(proxy, null), /PROFILE_SCHEMA_INVALID/u);
 });
 
+void test('rejects custom object and array prototypes at every profile boundary', () => {
+  const raw = validRawProfile();
+  const customObjectPrototype = Object.freeze({ custom: true });
+  const customArrayPrototype = Object.create(Array.prototype) as unknown[];
+  const [firstRule, ...remainingRules] = raw.rules;
+  const [firstPolicy, ...remainingPolicies] = raw.conditionPolicies;
+  if (firstRule === undefined || firstPolicy === undefined) throw new Error('Fixture must contain rules and policies.');
+  const invalid = [
+    withPrototype(raw, customObjectPrototype),
+    freeze({ ...raw, dimensionMaximums: withPrototype(raw.dimensionMaximums, customObjectPrototype) }),
+    freeze({ ...raw, rules: [withPrototype(firstRule, customObjectPrototype), ...remainingRules] }),
+    freeze({ ...raw, conditionPolicies: [withPrototype(firstPolicy, customObjectPrototype), ...remainingPolicies] }),
+    freeze({ ...raw, rules: withPrototype([...raw.rules], customArrayPrototype) }),
+    freeze({ ...raw, conditionPolicies: withPrototype([...raw.conditionPolicies], customArrayPrototype) }),
+  ];
+  for (const profile of invalid) assert.throws(() => parseQualificationProfile(freeze(profile), null), /PROFILE_SCHEMA_INVALID/u);
+
+  let arrayTraps = 0;
+  const rulesProxy = new Proxy([], hostileProxyHandler(() => { arrayTraps += 1; }));
+  assert.throws(() => parseQualificationProfile(Object.freeze({ ...raw, rules: rulesProxy }), null), /PROFILE_SCHEMA_INVALID/u);
+  assert.equal(arrayTraps, 0);
+});
+
 void test('loads default and custom profiles with bounded, redacted failures', () => {
   const defaultProfile = loadQualificationProfile({ profilePath: null, minimumScoreOverride: null });
   assert.equal(defaultProfile.id, 'pumpfun-v1-initial');
@@ -371,6 +394,10 @@ function freeze<T>(value: T): T {
     Object.freeze(value);
   }
   return value;
+}
+
+function withPrototype<T extends object>(value: T, prototype: object): T {
+  return Object.freeze(Object.assign(Object.create(prototype), value)) as T;
 }
 
 function hostileProxyHandler(onTrap: () => void): ProxyHandler<object> {
