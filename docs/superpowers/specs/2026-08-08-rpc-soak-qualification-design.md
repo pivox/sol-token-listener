@@ -44,7 +44,7 @@ deterministic nearest-rank rule.
 The frozen `rpc-soak.v1` report contains:
 
 - configured and observed duration;
-- HTTP attempted/succeeded/failed/rate-limited counts;
+- HTTP planned/attempted/missed/succeeded/failed/rate-limited counts;
 - a fixed failure histogram for deadline, rate-limited, request-failed and invalid-response samples;
 - min, p50, p95 and max latency;
 - first and last confirmed slots as decimal strings;
@@ -64,7 +64,8 @@ failures become `RPC_REQUEST_FAILED`; malformed successful responses become
 The WebSocket adapter uses the Node WebSocket client and the canonical
 Pump.fun/PumpSwap program IDs. It waits for both JSON-RPC subscription
 acknowledgements before reporting establishment, forwards only the program
-family and slot, and marks any later error or disconnect unhealthy. One socket
+family and slot, and marks any later error or disconnect unhealthy. Expired
+HTTP schedule slots are counted as missed and never replayed in a burst. One socket
 owns both server subscriptions, so closing it removes the complete session.
 Setup rollback and final cleanup are cancellable and their failures remain
 explicit.
@@ -77,7 +78,8 @@ signatures and provider error text never enter the report or logs.
 - `FAIL`: deadline exceeded, no successful HTTP sample, WebSocket subscription
   failure, later connection loss or cleanup failure;
 - `DEGRADED`: partial HTTP failure, any 429, no confirmed-slot progress, or no
-  WebSocket observation for one or both programs;
+  WebSocket observation for one or both programs, including a missed HTTP
+  schedule slot;
 - `PASS`: all HTTP samples succeed, the slot progresses, both subscriptions
   remain active and both programs produce at least one observation.
 

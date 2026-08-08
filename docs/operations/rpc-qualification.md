@@ -80,6 +80,10 @@ leur exactitude. L'absence d'événement Pump.fun ou PumpSwap pendant une fenêt
 courte peut refléter le trafic et produit donc `DEGRADED`, pas une preuve de
 panne HTTP.
 
+Le compteur HTTP `missed` augmente lorsqu'un établissement ou un appel lent a
+déjà dépassé un ou plusieurs créneaux. Ces créneaux ne sont jamais rejoués en
+rafale ; `HTTP_SCHEDULE_MISSED` rend le rapport `DEGRADED`.
+
 Une erreur de configuration ou une panne inattendue produit uniquement le code
 fixe `RPC_SOAK_COMMAND_FAILED` sur la sortie d'erreur et quitte avec le code 1.
 

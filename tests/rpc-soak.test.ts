@@ -51,7 +51,7 @@ void test('produces a frozen passing report with deterministic timing and percen
     plannedSampleCount: 2,
     sampleCount: 2,
     http: {
-      attempted: 2, succeeded: 2, failed: 0, rateLimited: 0,
+      attempted: 2, missed: 0, succeeded: 2, failed: 0, rateLimited: 0,
       failuresByCode: {
         RPC_DEADLINE_EXCEEDED: 0, RPC_RATE_LIMITED: 0,
         RPC_REQUEST_FAILED: 0, RPC_RESPONSE_INVALID: 0,
@@ -98,7 +98,7 @@ void test('reports rate limiting, partial failure, stalled slots and missing pro
     'WS_PUMPSWAP_UNOBSERVED',
   ]);
   assert.deepEqual(report.http, {
-    attempted: 3, succeeded: 2, failed: 1, rateLimited: 1,
+    attempted: 3, missed: 0, succeeded: 2, failed: 1, rateLimited: 1,
     failuresByCode: {
       RPC_DEADLINE_EXCEEDED: 0, RPC_RATE_LIMITED: 1,
       RPC_REQUEST_FAILED: 0, RPC_RESPONSE_INVALID: 0,
@@ -189,6 +189,29 @@ void test('aborts a hung RPC at the wall-clock deadline and still attempts clean
   assert.equal(transport.closeAttempts, 1);
 });
 
+void test('skips elapsed sample slots instead of replaying overdue requests in a burst', async () => {
+  const clock = runtime();
+  const transport = new FakeTransport([10n], [], clock);
+  transport.subscribeLatencyMs = 4_500;
+  transport.onHttpSample = (_sample, observe) => {
+    observe({ program: 'pumpfun', slot: 10n });
+    observe({ program: 'pumpswap', slot: 10n });
+  };
+
+  const report = await runRpcSoak(
+    transport,
+    { durationMs: 5_000, intervalMs: 1_000 },
+    clock,
+  );
+
+  assert.equal(report.plannedSampleCount, 5);
+  assert.equal(report.sampleCount, 1);
+  assert.equal(report.http.attempted, 1);
+  assert.equal(report.http.missed, 4);
+  assert.ok(report.reasonCodes.includes('HTTP_SCHEDULE_MISSED'));
+  assert.equal(transport.httpAttempts, 1);
+});
+
 class FakeTransport implements RpcSoakTransport {
   public subscriptionAttempts = 0;
   public httpAttempts = 0;
@@ -198,6 +221,7 @@ class FakeTransport implements RpcSoakTransport {
   public websocketHealthy = true;
   public hangHttp = false;
   public httpAborted = false;
+  public subscribeLatencyMs = 0;
   public onHttpSample: ((sample: number, observe: (value: RpcSoakObservation) => void) => void)
     | null = null;
   private observer: ((value: RpcSoakObservation) => void) | null = null;
@@ -213,6 +237,7 @@ class FakeTransport implements RpcSoakTransport {
     readonly health: () => 'HEALTHY' | 'FAILED';
   }> {
     this.subscriptionAttempts += 1;
+    this.clock.advance?.(this.subscribeLatencyMs);
     if (this.subscribeFailure !== null) throw this.subscribeFailure;
     this.observer = observe;
     return {

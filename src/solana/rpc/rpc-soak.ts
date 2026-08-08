@@ -16,6 +16,7 @@ export type RpcSoakReasonCode =
   | 'HTTP_UNAVAILABLE'
   | 'HTTP_PARTIAL_FAILURE'
   | 'HTTP_RATE_LIMITED'
+  | 'HTTP_SCHEDULE_MISSED'
   | 'HTTP_SLOT_STALLED'
   | 'WS_SUBSCRIBE_FAILED'
   | 'WS_CLEANUP_FAILED'
@@ -67,6 +68,7 @@ export interface RpcSoakReport {
   readonly sampleCount: number;
   readonly http: Readonly<{
     attempted: number;
+    missed: number;
     succeeded: number;
     failed: number;
     rateLimited: number;
@@ -190,19 +192,31 @@ export async function runRpcSoak(
   }
 
   let attemptedSamples = 0;
-  for (let sample = 0; sample < plannedSampleCount; sample += 1) {
-    const scheduledAtMs = startedAtMs + (sample * options.intervalMs);
-    const beforeWaitMs = readClock(runtime, startedAtMs);
-    if (scheduledAtMs >= deadlineAtMs || beforeWaitMs >= deadlineAtMs) {
-      deadlineExceeded = deadlineExceeded || beforeWaitMs >= deadlineAtMs;
-      break;
-    }
-    if (beforeWaitMs < scheduledAtMs) await runtime.wait(scheduledAtMs - beforeWaitMs);
-    if (readClock(runtime, startedAtMs) >= deadlineAtMs) {
+  let missedSamples = 0;
+  let sample = 0;
+  while (sample < plannedSampleCount) {
+    const currentMs = readClock(runtime, startedAtMs);
+    if (currentMs >= deadlineAtMs) {
+      missedSamples += plannedSampleCount - sample;
       deadlineExceeded = true;
       break;
     }
+    const currentScheduleIndex = Math.floor(
+      (currentMs - startedAtMs) / options.intervalMs,
+    );
+    if (currentScheduleIndex > sample) {
+      const nextSample = Math.min(currentScheduleIndex, plannedSampleCount);
+      missedSamples += nextSample - sample;
+      sample = nextSample;
+      continue;
+    }
+    const scheduledAtMs = startedAtMs + (sample * options.intervalMs);
+    if (currentMs < scheduledAtMs) {
+      await runtime.wait(scheduledAtMs - currentMs);
+      continue;
+    }
     attemptedSamples += 1;
+    sample += 1;
     const sampleStartedAtMs = readClock(runtime, startedAtMs);
     try {
       const slot = await runtime.runUntil(
@@ -247,6 +261,7 @@ export async function runRpcSoak(
   const completedAtMs = readClock(runtime, startedAtMs);
   const reasonCodes = reasons(
     attemptedSamples,
+    missedSamples,
     httpSlots,
     failuresByCode,
     subscriptionState,
@@ -275,6 +290,7 @@ export async function runRpcSoak(
     sampleCount: attemptedSamples,
     http: Object.freeze({
       attempted: attemptedSamples,
+      missed: missedSamples,
       succeeded: httpSlots.length,
       failed: failedSamples,
       rateLimited: failuresByCode.RPC_RATE_LIMITED,
@@ -351,6 +367,7 @@ function recordObservation(
 
 function reasons(
   sampleCount: number,
+  missedSamples: number,
   slots: readonly bigint[],
   failures: Readonly<Record<RpcSoakFailureCode, number>>,
   subscription: 'ESTABLISHED' | 'FAILED',
@@ -362,6 +379,7 @@ function reasons(
   if (failures.RPC_DEADLINE_EXCEEDED > 0) values.push('SOAK_DEADLINE_EXCEEDED');
   if (slots.length === 0) values.push('HTTP_UNAVAILABLE');
   else if (slots.length < sampleCount) values.push('HTTP_PARTIAL_FAILURE');
+  if (missedSamples > 0) values.push('HTTP_SCHEDULE_MISSED');
   if (failures.RPC_RATE_LIMITED > 0) values.push('HTTP_RATE_LIMITED');
   if (slots.length >= 2 && (slots.at(-1) ?? 0n) <= (slots[0] ?? 0n)) {
     values.push('HTTP_SLOT_STALLED');

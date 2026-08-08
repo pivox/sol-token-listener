@@ -83,6 +83,7 @@ function fakeReport(verdict: RpcSoakReport['verdict']): RpcSoakReport {
     sampleCount: 3,
     http: {
       attempted: 3,
+      missed: 0,
       succeeded: 3,
       failed: 0,
       rateLimited: 0,
