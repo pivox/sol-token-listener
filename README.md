@@ -71,6 +71,22 @@ L'arrêt ferme les producteurs, empêche de nouvelles prises de lease, draine le
 worker puis relit les compteurs de l'inbox et écrit le heartbeat final, dans la limite de
 `LISTENER_SHUTDOWN_TIMEOUT_MS`.
 
+## Qualification d'un endpoint RPC
+
+La commande bornée `npm run rpc:soak` vérifie un endpoint HTTP/WebSocket dédié
+avant son utilisation par le listener. Elle appelle uniquement `getSlot` et
+observe, après accusé de réception, les logs des programmes Pump.fun et PumpSwap; elle ne lit aucun corps
+de transaction et n'accède ni à PostgreSQL ni à un wallet. Sa sortie est un
+unique rapport JSON redacted. Un verdict `PASS`, `DEGRADED` ou `FAIL` produit
+respectivement le code de sortie 0, 2 ou 1.
+
+Les valeurs par défaut sont 60 secondes et un échantillon HTTP par seconde.
+`RPC_SOAK_DURATION_SECONDS` et `RPC_SOAK_INTERVAL_MS` permettent un test plus
+long tout en conservant des bornes strictes. Voir le
+[guide de qualification RPC](docs/operations/rpc-qualification.md) avant tout
+soak réel : les quotas et tableaux de bord du fournisseur restent la source de
+vérité pour la capacité et la facturation.
+
 ## API V1
 
 L'API est activée par défaut (`API_ENABLED=true`) et écoute sur
@@ -151,6 +167,7 @@ désactivation explicite.
 - [Vue complète du système (HTML Bootstrap hors ligne)](docs/system-overview.html)
 - [Architecture Pump.fun V1](docs/architecture/pumpfun-v1.md)
 - [Contrat API V1](docs/api/v1.md)
+- [Qualification RPC](docs/operations/rpc-qualification.md)
 
 Les montants bruts, réserves et lamports utilisent `bigint`; PostgreSQL les
 stocke en `NUMERIC(78,0)` et l'API les expose comme chaînes décimales.
