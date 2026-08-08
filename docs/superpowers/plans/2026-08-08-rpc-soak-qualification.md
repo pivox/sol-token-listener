@@ -56,4 +56,3 @@
 - [ ] Review the complete diff for secrets, production imports, floats, accidental writes and unrelated edits.
 - [ ] Commit with issue #29, push the branch and open the PR with test evidence.
 - [ ] Request `@codex` review, allow at most three review-correction cycles, and merge only with green checks and no blocking feedback.
-
