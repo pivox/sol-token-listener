@@ -239,6 +239,7 @@ export async function runRpcSoak(
       failuresByCode[code] += 1;
       if (timedOut) {
         deadlineExceeded = true;
+        missedSamples += plannedSampleCount - sample;
         break;
       }
     }
@@ -262,6 +263,7 @@ export async function runRpcSoak(
   const reasonCodes = reasons(
     attemptedSamples,
     missedSamples,
+    deadlineExceeded,
     httpSlots,
     failuresByCode,
     subscriptionState,
@@ -368,6 +370,7 @@ function recordObservation(
 function reasons(
   sampleCount: number,
   missedSamples: number,
+  deadlineExceeded: boolean,
   slots: readonly bigint[],
   failures: Readonly<Record<RpcSoakFailureCode, number>>,
   subscription: 'ESTABLISHED' | 'FAILED',
@@ -376,7 +379,7 @@ function reasons(
   observations: { readonly pumpfun: number; readonly pumpswap: number },
 ): RpcSoakReasonCode[] {
   const values: RpcSoakReasonCode[] = [];
-  if (failures.RPC_DEADLINE_EXCEEDED > 0) values.push('SOAK_DEADLINE_EXCEEDED');
+  if (deadlineExceeded) values.push('SOAK_DEADLINE_EXCEEDED');
   if (slots.length === 0) values.push('HTTP_UNAVAILABLE');
   else if (slots.length < sampleCount) values.push('HTTP_PARTIAL_FAILURE');
   if (missedSamples > 0) values.push('HTTP_SCHEDULE_MISSED');

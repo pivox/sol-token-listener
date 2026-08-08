@@ -185,8 +185,28 @@ void test('aborts a hung RPC at the wall-clock deadline and still attempts clean
   assert.equal(report.verdict, 'FAIL');
   assert.ok(report.reasonCodes.includes('SOAK_DEADLINE_EXCEEDED'));
   assert.equal(report.http.failuresByCode.RPC_DEADLINE_EXCEEDED, 1);
+  assert.equal(report.http.missed, 1);
+  assert.ok(report.reasonCodes.includes('HTTP_SCHEDULE_MISSED'));
   assert.equal(transport.httpAborted, true);
   assert.equal(transport.closeAttempts, 1);
+});
+
+void test('emits the deadline reason when WebSocket setup consumes the window', async () => {
+  const clock = deadlineRuntime(20_000, 1);
+  const transport = new FakeTransport([1n], [], clock);
+  transport.hangSubscribe = true;
+
+  const report = await runRpcSoak(
+    transport,
+    { durationMs: 5_000, intervalMs: 2_500 },
+    clock,
+  );
+
+  assert.equal(report.deadlineExceeded, true);
+  assert.equal(report.http.attempted, 0);
+  assert.equal(report.http.missed, 2);
+  assert.ok(report.reasonCodes.includes('SOAK_DEADLINE_EXCEEDED'));
+  assert.ok(report.reasonCodes.includes('WS_SUBSCRIBE_FAILED'));
 });
 
 void test('skips elapsed sample slots instead of replaying overdue requests in a burst', async () => {
@@ -222,6 +242,7 @@ class FakeTransport implements RpcSoakTransport {
   public hangHttp = false;
   public httpAborted = false;
   public subscribeLatencyMs = 0;
+  public hangSubscribe = false;
   public onHttpSample: ((sample: number, observe: (value: RpcSoakObservation) => void) => void)
     | null = null;
   private observer: ((value: RpcSoakObservation) => void) | null = null;
@@ -238,6 +259,11 @@ class FakeTransport implements RpcSoakTransport {
   }> {
     this.subscriptionAttempts += 1;
     this.clock.advance?.(this.subscribeLatencyMs);
+    if (this.hangSubscribe) {
+      return new Promise((_resolve, reject) => {
+        _signal.addEventListener('abort', () => { reject(new Error('private websocket')); }, { once: true });
+      });
+    }
     if (this.subscribeFailure !== null) throw this.subscribeFailure;
     this.observer = observe;
     return {
