@@ -68,7 +68,7 @@ plafond du nombre de tentatives : elle peut donc être retentée indéfiniment.
 mais ne pilotent pas encore ce scheduler durable. La consommation RPC dépend du
 trafic, des déconnexions et des reprises.
 L'arrêt ferme les producteurs, empêche de nouvelles prises de lease, draine le
-worker puis écrit le heartbeat final, dans la limite de
+worker puis relit les compteurs de l'inbox et écrit le heartbeat final, dans la limite de
 `LISTENER_SHUTDOWN_TIMEOUT_MS`.
 
 ## API V1

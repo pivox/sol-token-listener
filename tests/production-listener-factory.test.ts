@@ -6,6 +6,7 @@ import type { TokenLaunch } from '../src/domain/types.js';
 import type { getDatabasePool } from '../src/storage/database.js';
 import {
   BondingCurveReadUnavailableError,
+  ListenerControllerCloseError,
   MAX_LISTENER_TIMER_DELAY_MS,
   PersistentListenerHeartbeat,
   RecurringFinalityReconciler,
@@ -115,6 +116,84 @@ void test('heartbeat exposes retryable failed work in backlog without leasing it
   assert.equal(writes[0]?.backlogCount, 5);
   assert.equal(writes[0]?.leasedCount, 1);
   await heartbeat.stop();
+});
+
+void test('heartbeat refreshes post-drain counts without another shutdown RPC read', async () => {
+  const writes: {
+    readonly runtimeState: string;
+    readonly backlogCount: number;
+    readonly leasedCount: number;
+  }[] = [];
+  let countReads = 0;
+  let slotReads = 0;
+  let finalizedSlotReads = 0;
+  const heartbeat = new PersistentListenerHeartbeat(
+    {
+      async counts() {
+        countReads += 1;
+        return countReads === 1
+          ? { pending: 4, processing: 1, processed: 0, failed: 0, retryableFailed: 0 }
+          : { pending: 2, processing: 0, processed: 3, failed: 2, retryableFailed: 1 };
+      },
+      async writeHeartbeat(value) { writes.push(value); },
+    },
+    {
+      async getSlot() { slotReads += 1; return 10n; },
+      async getFinalizedSlot() { finalizedSlotReads += 1; return 9n; },
+    },
+    () => 'RUNNING',
+    () => 'RUNNING',
+    () => 'RUNNING',
+    () => 'RUNNING',
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler() },
+  );
+
+  await heartbeat.start();
+  await Promise.all([heartbeat.stop(), heartbeat.stop()]);
+
+  assert.equal(countReads, 2);
+  assert.equal(slotReads, 1);
+  assert.equal(finalizedSlotReads, 1);
+  assert.deepEqual(writes.map((value) => ({
+    runtimeState: value.runtimeState,
+    backlogCount: value.backlogCount,
+    leasedCount: value.leasedCount,
+  })), [
+    { runtimeState: 'RUNNING', backlogCount: 5, leasedCount: 1 },
+    { runtimeState: 'STOPPED', backlogCount: 3, leasedCount: 0 },
+  ]);
+});
+
+void test('heartbeat refuses a stale STOPPED snapshot when the final count read fails', async () => {
+  const writes: string[] = [];
+  let countReads = 0;
+  const heartbeat = new PersistentListenerHeartbeat(
+    {
+      async counts() {
+        countReads += 1;
+        if (countReads === 2) throw new Error('private final count failure');
+        return { pending: 1, processing: 1, processed: 0, failed: 0, retryableFailed: 0 };
+      },
+      async writeHeartbeat(value) { writes.push(value.runtimeState); },
+    },
+    { async getSlot() { return 10n; }, async getFinalizedSlot() { return 9n; } },
+    () => 'RUNNING',
+    () => 'RUNNING',
+    () => 'RUNNING',
+    () => 'RUNNING',
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler() },
+  );
+  await heartbeat.start();
+
+  await assert.rejects(heartbeat.stop(), (error: unknown) => {
+    assert.ok(error instanceof ListenerControllerCloseError);
+    assert.equal(error.component, 'heartbeat');
+    assert.equal(error.reason, 'dependency');
+    assert.doesNotMatch(String(error), /private|count|failure/u);
+    return true;
+  });
+  assert.deepEqual(writes, ['RUNNING']);
+  assert.equal(heartbeat.state(), 'DEGRADED');
 });
 
 void test('finality close fences an in-flight pass and rejects stale timer activity', async () => {

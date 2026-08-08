@@ -412,6 +412,14 @@ export class PersistentListenerHeartbeat {
         counts.retryableFailed,
       );
       this.leasedCount = counts.processing;
+    } else {
+      const counts = await this.inbox.counts();
+      this.backlogCount = safeInboxBacklog(
+        counts.pending,
+        counts.processing,
+        counts.retryableFailed,
+      );
+      this.leasedCount = counts.processing;
     }
     const value: RuntimeHeartbeat = Object.freeze({
       runtimeState,
