@@ -655,10 +655,13 @@ void test('uses an ordered partial index for a large mixed claim backlog', async
     await pool.query('ANALYZE chain_transaction_inbox');
     const explained = await pool.query(`EXPLAIN (FORMAT JSON)
       SELECT signature FROM chain_transaction_inbox
-      WHERE processing_status = 'PENDING'
+      WHERE (processing_status = 'PENDING' AND attempts_in_cycle < retry_max_attempts)
          OR (processing_status = 'FAILED' AND error_retryable = TRUE
-             AND next_attempt_at <= clock_timestamp())
-         OR (processing_status = 'PROCESSING' AND lease_expires_at <= clock_timestamp())
+             AND retry_exhausted_at IS NULL
+             AND next_attempt_at <= clock_timestamp()
+             AND attempts_in_cycle < retry_max_attempts)
+         OR (processing_status = 'PROCESSING' AND lease_expires_at <= clock_timestamp()
+             AND attempts_in_cycle < retry_max_attempts)
       ORDER BY observed_slot, signature
       FOR UPDATE SKIP LOCKED
       LIMIT 1`);
