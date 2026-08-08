@@ -44,6 +44,7 @@ The frozen `rpc-soak.v1` report contains:
 
 - configured and observed duration;
 - HTTP attempted/succeeded/failed/rate-limited counts;
+- a fixed failure histogram for rate-limited, request-failed and invalid-response samples;
 - min, p50, p95 and max latency;
 - first and last confirmed slots as decimal strings;
 - WebSocket subscription state;
@@ -99,4 +100,3 @@ dashboards remain authoritative for billing or compute-unit consumption.
 - safety tests prove no database, signing or transaction submission import;
 - build, generated-IDL check, lint, documentation check and the full
   PostgreSQL test suite pass before review.
-
