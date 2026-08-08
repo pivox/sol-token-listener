@@ -4,6 +4,7 @@ import type {
   FinalityPollObservation,
   FinalityRevision,
   InboxCounts,
+  InboxRecoveryResult,
   IngestionFailure,
   ProcessingCheckpoint,
   RuntimeHeartbeat,
@@ -34,6 +35,7 @@ export interface TransactionInboxRepository {
     status: ChainConfirmationStatus,
   ): Promise<void>;
   markFailed(signature: string, token: string, failure: IngestionFailure): Promise<void>;
+  recoverExhausted(signature: string): Promise<InboxRecoveryResult>;
   listForFinality(limit: number): Promise<readonly FinalityCandidate[]>;
   recordFinalityPoll(value: FinalityPollObservation): Promise<FinalityCandidate>;
   enqueueRevision(value: FinalityRevision): Promise<void>;

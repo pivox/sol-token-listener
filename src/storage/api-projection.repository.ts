@@ -313,7 +313,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         `SELECT updated_at, started_at, last_http_slot, last_websocket_slot,
             last_finalized_slot, last_signature, pending_transactions, active_sessions,
             runtime_state, subscriber_state, scanner_state, worker_state,
-            reconciler_state, leased_transactions
+            reconciler_state, leased_transactions, exhausted_transactions
          FROM listener_heartbeats ORDER BY updated_at DESC LIMIT 1`,
       );
       const checkpoint = new Map(checkpoints.rows.map((item) => [text(item.checkpoint_key), decimal(item.slot)]));
@@ -1105,6 +1105,7 @@ const DEGRADED_PIPELINE_STATE: ApiProjectionPipelineState = Object.freeze({
 function emptyHeartbeat(): ApiHealth['heartbeat'] {
   return freeze({ runtimeState: null, subscriberState: null, scannerState: null,
     workerState: null, reconcilerState: null, backlogCount: null, leasedCount: null,
+    exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null });
 }
@@ -1117,13 +1118,14 @@ function heartbeatFromRow(row: Record<string, unknown>): ApiHealth['heartbeat'] 
   const reconcilerState = listenerRuntimeState(row.reconciler_state);
   const backlogCount = nonNegativeSafeNumber(row.pending_transactions);
   const leasedCount = nonNegativeSafeNumber(row.leased_transactions);
+  const exhaustedCount = nonNegativeSafeNumber(row.exhausted_transactions);
   if (leasedCount > backlogCount) throw invalid();
   const startedAt = nullableTimestamp(row.started_at);
   const updatedAt = timestamp(row.updated_at).toISOString();
   if (startedAt !== null && Date.parse(startedAt) > Date.parse(updatedAt)) throw invalid();
   return freeze({
     runtimeState, subscriberState, scannerState, workerState, reconcilerState,
-    backlogCount, leasedCount, startedAt, updatedAt,
+    backlogCount, leasedCount, exhaustedCount, startedAt, updatedAt,
     lastHttpSlot: nullableDecimal(row.last_http_slot),
     lastWebsocketSlot: nullableDecimal(row.last_websocket_slot), lastFinalizedSlot: nullableDecimal(row.last_finalized_slot),
     lastSignature: nullableText(row.last_signature), pendingTransactions: backlogCount,

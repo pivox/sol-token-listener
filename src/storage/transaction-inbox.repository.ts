@@ -9,6 +9,7 @@ import {
   assertValidFinalityPollObservation,
   assertValidFinalityRevision,
   assertValidInboxCounts,
+  assertValidInboxRecoveryResult,
   assertValidIngestionFailure,
   assertValidProcessingCheckpoint,
   assertValidRuntimeHeartbeat,
@@ -21,6 +22,7 @@ import {
   type FinalityPollObservation,
   type FinalityRevision,
   type InboxCounts,
+  type InboxRecoveryResult,
   type IngestionFailure,
   type ProcessingCheckpoint,
   type RuntimeHeartbeat,
@@ -61,6 +63,13 @@ interface InboxIdentityRow extends QueryResultRow {
 
 const SERVICE_KEY = 'transaction-listener';
 const MAX_DATE_MS = 8_640_000_000_000_000;
+const MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM = 100;
+const DEFAULT_RETRY_POLICY = Object.freeze({ maxAttempts: 5, baseDelayMs: 500 });
+
+export interface TransactionInboxRetryPolicy {
+  readonly maxAttempts: number;
+  readonly baseDelayMs: number;
+}
 
 export interface TransactionInboxFailureMetadata {
   readonly stage: 'operation' | 'primary' | 'rollback';
@@ -97,7 +106,14 @@ export class TransactionInboxLeaseError extends TransactionInboxRepositoryError 
 }
 
 export class PostgresTransactionInboxRepository implements TransactionInboxRepository {
-  public constructor(private readonly pool: InboxPool = getDatabasePool()) {}
+  private readonly retryPolicy: TransactionInboxRetryPolicy;
+
+  public constructor(
+    private readonly pool: InboxPool = getDatabasePool(),
+    retryPolicy: TransactionInboxRetryPolicy = DEFAULT_RETRY_POLICY,
+  ) {
+    this.retryPolicy = snapshotRetryPolicy(retryPolicy);
+  }
 
   public async enqueue(value: TransactionNotification): Promise<void> {
     return this.safely(async () => {
@@ -118,8 +134,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           const inserted = await client.query(
             `INSERT INTO chain_transaction_inbox (
               signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-              processing_status, observed_at
-            ) VALUES ($1,$2,ARRAY[$3]::TEXT[],$4,$5,'PENDING',$6)`,
+              processing_status, observed_at, retry_max_attempts, retry_base_delay_ms
+            ) VALUES ($1,$2,ARRAY[$3]::TEXT[],$4,$5,'PENDING',$6,$7,$8)`,
             [
               value.signature,
               value.slot.toString(),
@@ -127,6 +143,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
               value.programIds,
               value.confirmationStatus,
               dateFromMs(value.observedAtMs),
+              this.retryPolicy.maxAttempts,
+              this.retryPolicy.baseDelayMs,
             ],
           );
           requireOne(inserted.rowCount);
@@ -160,6 +178,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              processed_at = CASE WHEN $5 THEN NULL ELSE processed_at END,
              terminal_at = CASE WHEN $5 THEN NULL ELSE terminal_at END,
              purge_after = CASE WHEN $5 THEN NULL ELSE purge_after END,
+             attempts_in_cycle = CASE WHEN $5 THEN 0 ELSE attempts_in_cycle END,
+             retry_exhausted_at = CASE WHEN $5 THEN NULL ELSE retry_exhausted_at END,
              missing_finality_polls = CASE WHEN $5 THEN 0 ELSE missing_finality_polls END,
              updated_at = GREATEST(updated_at, $6)
            WHERE signature = $1`,
@@ -180,13 +200,53 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       if (!Number.isSafeInteger(leaseMs)) throw new TypeError('Lease duration is unsafe.');
       const expires = dateFromMs(nowMs + leaseMs);
       return this.transaction(async (client) => {
+        await client.query(
+          `WITH exhausted AS (
+             SELECT signature
+             FROM chain_transaction_inbox
+             WHERE attempts_in_cycle >= retry_max_attempts
+               AND retry_exhausted_at IS NULL
+               AND (
+                 (processing_status = 'FAILED' AND error_retryable = TRUE)
+                 OR (processing_status = 'PROCESSING' AND lease_expires_at <= $1)
+               )
+             ORDER BY observed_slot, signature
+             FOR UPDATE SKIP LOCKED
+             LIMIT $2
+           ), completed AS (
+             SELECT clock_timestamp() AS completed_at
+           )
+           UPDATE chain_transaction_inbox inbox SET
+             processing_status = 'FAILED',
+             lease_token = NULL,
+             lease_expires_at = NULL,
+             next_attempt_at = NULL,
+             error_code = CASE
+               WHEN inbox.processing_status = 'PROCESSING' THEN 'WORKER_LEASE_EXPIRED'
+               ELSE inbox.error_code
+             END,
+             error_name = CASE
+               WHEN inbox.processing_status = 'PROCESSING' THEN 'TransactionInboxLeaseExpired'
+               ELSE inbox.error_name
+             END,
+             error_retryable = TRUE,
+             retry_exhausted_at = completed.completed_at,
+             terminal_at = completed.completed_at,
+             purge_after = completed.completed_at + INTERVAL '4 hours',
+             updated_at = GREATEST(inbox.updated_at, completed.completed_at)
+           FROM exhausted, completed
+           WHERE inbox.signature = exhausted.signature`,
+          [now, MAX_EXHAUSTION_RECONCILIATIONS_PER_CLAIM],
+        );
         const selected = await client.query(
           `SELECT signature
            FROM chain_transaction_inbox
-           WHERE processing_status = 'PENDING'
+           WHERE (processing_status = 'PENDING' AND attempts_in_cycle < retry_max_attempts)
               OR (processing_status = 'FAILED' AND error_retryable = TRUE
-                  AND next_attempt_at <= $1)
-              OR (processing_status = 'PROCESSING' AND lease_expires_at <= $1)
+                  AND retry_exhausted_at IS NULL AND next_attempt_at <= $1
+                  AND attempts_in_cycle < retry_max_attempts)
+              OR (processing_status = 'PROCESSING' AND lease_expires_at <= $1
+                  AND attempts_in_cycle < retry_max_attempts)
            ORDER BY observed_slot, signature
            FOR UPDATE SKIP LOCKED
            LIMIT 1`,
@@ -198,6 +258,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         const updated = await client.query(
           `UPDATE chain_transaction_inbox SET
              processing_status = 'PROCESSING', attempts = attempts + 1,
+             attempts_in_cycle = attempts_in_cycle + 1,
              lease_token = $2, lease_expires_at = $3, next_attempt_at = NULL,
              error_code = NULL, error_name = NULL, error_retryable = NULL,
              updated_at = GREATEST(updated_at, $1)
@@ -334,20 +395,163 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       assertValidIngestionFailure(failure);
       requireSafeErrorName(failure.errorName);
       await this.transaction(async (client) => {
-        await leasedRow(client, signature, token, 'attempts');
+        const row = await leasedRow(
+          client,
+          signature,
+          token,
+          'attempts_in_cycle, retry_max_attempts, retry_base_delay_ms',
+        );
+        const attemptsInCycle = safeCount(row.attempts_in_cycle, 'attempts in cycle');
+        const maxAttempts = positiveBoundedInteger(
+          row.retry_max_attempts,
+          'retry max attempts',
+          100,
+        );
+        const baseDelayMs = positiveBoundedInteger(
+          row.retry_base_delay_ms,
+          'retry base delay milliseconds',
+          60_000,
+        );
+        const exhausted = failure.retryable && attemptsInCycle >= maxAttempts;
+        const terminal = !failure.retryable || exhausted;
+        const delayMs = retryDelayMs(baseDelayMs, attemptsInCycle);
         const result = await client.query(
           `UPDATE chain_transaction_inbox SET
              processing_status = 'FAILED', lease_token = NULL, lease_expires_at = NULL,
              error_code = $3, error_name = $4, error_retryable = $5,
-             next_attempt_at = CASE WHEN $5 THEN
-               clock_timestamp() + LEAST(INTERVAL '60 seconds',
-                 INTERVAL '500 milliseconds' * power(2, LEAST(attempts - 1, 16)))
+             next_attempt_at = CASE WHEN $5 AND NOT $6 THEN
+               completed.completed_at + ($7::INTEGER * INTERVAL '1 millisecond')
                ELSE NULL END,
-             updated_at = clock_timestamp()
+             retry_exhausted_at = CASE WHEN $6 THEN completed.completed_at ELSE NULL END,
+             terminal_at = CASE WHEN $8 THEN completed.completed_at ELSE NULL END,
+             purge_after = CASE WHEN $8 THEN
+               completed.completed_at + INTERVAL '4 hours' ELSE NULL END,
+             updated_at = completed.completed_at
+           FROM (SELECT clock_timestamp() AS completed_at) completed
            WHERE signature = $1 AND lease_token = $2 AND processing_status = 'PROCESSING'`,
-          [signature, token, failure.code, failure.errorName, failure.retryable],
+          [
+            signature,
+            token,
+            failure.code,
+            failure.errorName,
+            failure.retryable,
+            exhausted,
+            delayMs,
+            terminal,
+          ],
         );
         requireLease(result.rowCount);
+      });
+    });
+  }
+
+  public async recoverExhausted(signature: string): Promise<InboxRecoveryResult> {
+    return this.safely(async () => {
+      requireText(signature, 'signature');
+      return this.transaction(async (client) => {
+        const selected = await client.query(
+          `SELECT processing_status, attempts, attempts_in_cycle, retry_max_attempts,
+             retry_base_delay_ms, error_retryable, retry_exhausted_at, terminal_at,
+             purge_after, manual_recovery_count, last_manual_recovery_at,
+             purge_after > clock_timestamp() AS recovery_retained
+           FROM chain_transaction_inbox
+           WHERE signature = $1
+           FOR UPDATE`,
+          [signature],
+        );
+        const row = selected.rows[0];
+        if (row === undefined) return inboxRecoveryResult('RECOVERY_NOT_FOUND', signature);
+        const status = inboxStatus(row.processing_status);
+        const recoveryCount = safeCount(row.manual_recovery_count, 'manual recovery count');
+        if ((status === 'PENDING' || status === 'PROCESSING')
+          && recoveryCount > 0
+          && row.last_manual_recovery_at !== null) {
+          dateMs(row.last_manual_recovery_at, 'last manual recovery at');
+          return inboxRecoveryResult('RECOVERY_ALREADY_SCHEDULED', signature);
+        }
+        const exhaustedAtMs = nullableDateMs(row.retry_exhausted_at, 'retry exhausted at');
+        const terminalAtMs = nullableDateMs(row.terminal_at, 'terminal at');
+        const purgeAfterMs = nullableDateMs(row.purge_after, 'purge after');
+        if (status !== 'FAILED'
+          || row.error_retryable !== true
+          || exhaustedAtMs === null
+          || terminalAtMs === null
+          || purgeAfterMs === null
+          || row.recovery_retained !== true) {
+          return inboxRecoveryResult('RECOVERY_NOT_ELIGIBLE', signature);
+        }
+        const lifetimeAttempts = positiveBoundedInteger(
+          row.attempts,
+          'lifetime attempts',
+          2_147_483_647,
+        );
+        const cycleAttempts = positiveBoundedInteger(
+          row.attempts_in_cycle,
+          'cycle attempts',
+          100,
+        );
+        const priorMaxAttempts = positiveBoundedInteger(
+          row.retry_max_attempts,
+          'retry max attempts',
+          100,
+        );
+        const priorBaseDelayMs = positiveBoundedInteger(
+          row.retry_base_delay_ms,
+          'retry base delay milliseconds',
+          60_000,
+        );
+        if (recoveryCount >= 2_147_483_647) {
+          throw new TypeError('Stored manual recovery count is invalid.');
+        }
+        const updated = await client.query(
+          `WITH recovery AS (
+             INSERT INTO transaction_inbox_recoveries (
+               signature, exhausted_at, recovered_at, lifetime_attempts, cycle_attempts,
+               retry_max_attempts, retry_base_delay_ms, recovery_source
+             )
+             SELECT signature, retry_exhausted_at, clock_timestamp(), $4, $5, $6, $7, 'LOCAL_CLI'
+             FROM chain_transaction_inbox
+             WHERE signature = $1
+               AND processing_status = 'FAILED'
+               AND error_retryable = TRUE
+               AND retry_exhausted_at IS NOT NULL
+             RETURNING signature, recovered_at
+           )
+           UPDATE chain_transaction_inbox inbox SET
+             processing_status = 'PENDING',
+             attempts_in_cycle = 0,
+             retry_max_attempts = $2,
+             retry_base_delay_ms = $3,
+             lease_token = NULL,
+             lease_expires_at = NULL,
+             next_attempt_at = NULL,
+             error_code = NULL,
+             error_name = NULL,
+             error_retryable = NULL,
+             retry_exhausted_at = NULL,
+             processed_at = NULL,
+             terminal_at = NULL,
+             purge_after = NULL,
+             manual_recovery_count = inbox.manual_recovery_count + 1,
+             last_manual_recovery_at = recovery.recovered_at,
+             updated_at = GREATEST(inbox.updated_at, recovery.recovered_at)
+           FROM recovery
+           WHERE inbox.signature = recovery.signature
+             AND inbox.processing_status = 'FAILED'
+             AND inbox.error_retryable = TRUE
+             AND inbox.retry_exhausted_at IS NOT NULL`,
+          [
+            signature,
+            this.retryPolicy.maxAttempts,
+            this.retryPolicy.baseDelayMs,
+            lifetimeAttempts,
+            cycleAttempts,
+            priorMaxAttempts,
+            priorBaseDelayMs,
+          ],
+        );
+        requireOne(updated.rowCount);
+        return inboxRecoveryResult('RECOVERY_SCHEDULED', signature);
       });
     });
   }
@@ -464,6 +668,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           `UPDATE chain_transaction_inbox SET
              target_confirmation_status = $2, processing_status = 'PENDING',
              processed_at = NULL, terminal_at = NULL, purge_after = NULL,
+             attempts_in_cycle = 0, retry_exhausted_at = NULL,
              missing_finality_polls = 0, updated_at = GREATEST(updated_at, $3)
            WHERE signature = $1 AND processing_status = 'PROCESSED'
              AND normalized_transaction IS NOT NULL`,
@@ -534,8 +739,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            service_key, last_http_slot, last_websocket_slot, last_finalized_slot,
            last_signature, pending_transactions, retry_count, active_sessions, payload,
            updated_at, runtime_state, subscriber_state, scanner_state, worker_state,
-           reconciler_state, started_at, leased_transactions
-         ) VALUES ($1,$2,$3,$4,$5,$6,0,0,$15,$7,$8,$9,$10,$11,$12,$13,$14)
+           reconciler_state, started_at, leased_transactions, exhausted_transactions
+         ) VALUES ($1,$2,$3,$4,$5,$6,0,0,$15,$7,$8,$9,$10,$11,$12,$13,$14,$16)
          ON CONFLICT (service_key) DO UPDATE SET
            last_http_slot = EXCLUDED.last_http_slot,
            last_websocket_slot = EXCLUDED.last_websocket_slot,
@@ -550,7 +755,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            worker_state = EXCLUDED.worker_state,
            reconciler_state = EXCLUDED.reconciler_state,
            started_at = EXCLUDED.started_at,
-           leased_transactions = EXCLUDED.leased_transactions
+           leased_transactions = EXCLUDED.leased_transactions,
+           exhausted_transactions = EXCLUDED.exhausted_transactions
          WHERE EXCLUDED.updated_at > listener_heartbeats.updated_at`,
         [
           SERVICE_KEY,
@@ -568,6 +774,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           dateFromMs(value.startedAtMs),
           value.leasedCount,
           toJsonValue({ startedAt: dateFromMs(value.startedAtMs).toISOString() }),
+          value.exhaustedCount,
         ],
       );
       requireZeroOrOne(result.rowCount);
@@ -584,7 +791,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            COUNT(*) FILTER (WHERE processing_status = 'FAILED') AS failed,
            COUNT(*) FILTER (
              WHERE processing_status = 'FAILED' AND error_retryable = TRUE
-           ) AS retryable_failed
+               AND retry_exhausted_at IS NULL AND next_attempt_at IS NOT NULL
+           ) AS retryable_failed,
+           COUNT(*) FILTER (
+             WHERE processing_status = 'FAILED' AND error_retryable = TRUE
+               AND retry_exhausted_at IS NOT NULL
+           ) AS exhausted_failed
          FROM chain_transaction_inbox`,
       );
       const row = requiredRow(result.rows[0]);
@@ -594,6 +806,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         processed: safeCount(row.processed, 'processed count'),
         failed: safeCount(row.failed, 'failed count'),
         retryableFailed: safeCount(row.retryable_failed, 'retryable failed count'),
+        exhaustedFailed: safeCount(row.exhausted_failed, 'exhausted failed count'),
       });
       assertValidInboxCounts(counts);
       return counts;
@@ -876,6 +1089,10 @@ function dateMs(value: unknown, name: string): number {
   return milliseconds;
 }
 
+function nullableDateMs(value: unknown, name: string): number | null {
+  return value === null ? null : dateMs(value, name);
+}
+
 function nullableBigInt(value: bigint | null): string | null {
   return value === null ? null : value.toString();
 }
@@ -911,6 +1128,59 @@ function requireSafeErrorName(value: string): void {
     || Buffer.byteLength(value, 'utf8') > 16_384) {
     throw new TypeError('Ingestion failure errorName must be a safe structured name.');
   }
+}
+
+function snapshotRetryPolicy(value: unknown): TransactionInboxRetryPolicy {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('Transaction inbox retry policy must be an object.');
+  }
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError('Transaction inbox retry policy prototype is invalid.');
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Object.keys(descriptors).sort();
+  if (keys.length !== 2 || keys[0] !== 'baseDelayMs' || keys[1] !== 'maxAttempts') {
+    throw new TypeError('Transaction inbox retry policy fields are invalid.');
+  }
+  const maxAttempts = descriptorInteger(descriptors.maxAttempts, 'maxAttempts', 100);
+  const baseDelayMs = descriptorInteger(descriptors.baseDelayMs, 'baseDelayMs', 60_000);
+  return Object.freeze({ maxAttempts, baseDelayMs });
+}
+
+function descriptorInteger(
+  descriptor: PropertyDescriptor | undefined,
+  name: string,
+  maximum: number,
+): number {
+  if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+    throw new TypeError(`Transaction inbox retry policy ${name} is invalid.`);
+  }
+  return positiveBoundedInteger(descriptor.value, name, maximum);
+}
+
+function positiveBoundedInteger(value: unknown, name: string, maximum: number): number {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > maximum) {
+    throw new TypeError(`Stored ${name} is invalid.`);
+  }
+  return value as number;
+}
+
+function retryDelayMs(baseDelayMs: number, attemptsInCycle: number): number {
+  if (!Number.isSafeInteger(attemptsInCycle) || attemptsInCycle <= 0) {
+    throw new TypeError('Stored attempts in cycle is invalid.');
+  }
+  const multiplier = 2 ** Math.min(attemptsInCycle - 1, 16);
+  return Math.min(60_000, baseDelayMs * multiplier);
+}
+
+function inboxRecoveryResult(
+  code: InboxRecoveryResult['code'],
+  signature: string,
+): InboxRecoveryResult {
+  const result = Object.freeze({ code, signature });
+  assertValidInboxRecoveryResult(result);
+  return result;
 }
 
 function safeFailureMetadata(

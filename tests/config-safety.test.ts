@@ -136,12 +136,16 @@ void test('la configuration listener accepte ses bornes exactes', () => {
     LISTENER_CATCH_UP_PAGE_SIZE: '1000',
     LISTENER_FINALITY_MISSING_POLLS: '20',
     LISTENER_SHUTDOWN_TIMEOUT_MS: '120000',
+    RPC_RETRY_MAX_ATTEMPTS: '100',
+    RPC_RETRY_BASE_DELAY_MS: '60000',
   });
   assert.equal(maximums.listenerWorkerLeaseSeconds, 900);
   assert.equal(maximums.listenerCatchUpMaxPages, 100);
   assert.equal(maximums.listenerCatchUpPageSize, 1_000);
   assert.equal(maximums.listenerFinalityMissingPolls, 20);
   assert.equal(maximums.listenerShutdownTimeoutMs, 120_000);
+  assert.equal(maximums.rpcRetryMaxAttempts, 100);
+  assert.equal(maximums.rpcRetryBaseDelayMs, 60_000);
 });
 
 void test('la configuration listener refuse les valeurs ambiguës ou hors limites', () => {
@@ -160,6 +164,10 @@ void test('la configuration listener refuse les valeurs ambiguës ou hors limite
     { LISTENER_SHUTDOWN_TIMEOUT_MS: '999' },
     { LISTENER_SHUTDOWN_TIMEOUT_MS: '120001' },
     { LISTENER_SHUTDOWN_TIMEOUT_MS: '9007199254740992' },
+    { RPC_RETRY_MAX_ATTEMPTS: '0' },
+    { RPC_RETRY_MAX_ATTEMPTS: '101' },
+    { RPC_RETRY_BASE_DELAY_MS: '0' },
+    { RPC_RETRY_BASE_DELAY_MS: '60001' },
   ];
   for (const values of invalid) assert.throws(() => parseConfig({ ...base, ...values }));
 });

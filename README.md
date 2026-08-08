@@ -61,15 +61,31 @@ course et converge par l'inbox idempotente. Chaque rattrapage HTTP est borné
 par `LISTENER_CATCH_UP_MAX_PAGES` pages de
 `LISTENER_CATCH_UP_PAGE_SIZE` signatures pour chacun des programmes Pump.fun
 et PumpSwap (20 × 100 par défaut). Une panne retryable est replanifiée avec un
-délai exponentiel de 500 ms, plafonné à 60 s entre deux tentatives, mais sans
-plafond du nombre de tentatives : elle peut donc être retentée indéfiniment.
-`RPC_RETRY_MAX_ATTEMPTS` et
-`RPC_RETRY_BASE_DELAY_MS` sont validés par la configuration pour compatibilité,
-mais ne pilotent pas encore ce scheduler durable. La consommation RPC dépend du
-trafic, des déconnexions et des reprises.
+délai exponentiel piloté par `RPC_RETRY_BASE_DELAY_MS` et plafonné à 60 s.
+`RPC_RETRY_MAX_ATTEMPTS` compte les prises de lease d'un cycle, première
+tentative comprise (5 par défaut, maximum 100). La policy est persistée avec la
+transaction : un redémarrage ne modifie pas silencieusement un cycle actif.
+Après épuisement, l'échec devient terminal et sort du backlog automatique. La
+consommation RPC dépend du trafic, des déconnexions et des reprises.
 L'arrêt ferme les producteurs, empêche de nouvelles prises de lease, draine le
 worker puis relit les compteurs de l'inbox et écrit le heartbeat final, dans la limite de
 `LISTENER_SHUTDOWN_TIMEOUT_MS`.
+
+### Reprise manuelle d'une transaction épuisée
+
+La reprise est une commande opérateur locale, jamais une route HTTP publique.
+Elle exige deux fois la signature exacte :
+
+```bash
+npm run inbox:recover -- --signature=<SIGNATURE> --confirm=<SIGNATURE>
+```
+
+Seul un échec retryable épuisé et encore retenu peut être replanifié. La
+commande conserve le compteur total, remet à zéro uniquement le cycle courant,
+applique la policy configurée au nouveau cycle et écrit une preuve d'audit
+atomique. Une répétition pendant que ce cycle est déjà `PENDING` ou
+`PROCESSING` est idempotente. La sortie JSON utilise des codes stables et ne
+contient ni URL de base, ni endpoint RPC, ni erreur brute.
 
 ## Qualification d'un endpoint RPC
 
@@ -169,14 +185,15 @@ limites clusters/membres valent respectivement 50/50, avec un budget total de
 500 membres, 8 quote assets par cluster et 64 au total ; les troncatures sont
 explicites.
 Toutes les projections et preuves I2 suivent la rétention terminale de quatre
-heures. Seules les données `finalized` ou `orphaned` devenues terminales sont
-purgeables; une transaction `processed` ou `confirmed` en attente de finalité
-ne l'est jamais. Cette fenêtre limite aussi la durée de conservation des
+heures. Les transactions `finalized`, `orphaned`, non retryables ou épuisées
+devenues terminales sont purgeables; une transaction `processed` ou `confirmed`
+en attente de finalité ne l'est jamais. Cette fenêtre limite aussi la durée de conservation des
 données publiques de wallets observées; elle ne constitue pas un historique
 on-chain exhaustif.
 
 `GET /api/v1/health` publie l'état courant des composants, le backlog, les
-leases, checkpoints et slots observés, sans URL RPC/DB ni secret. `RUNNING`
+leases, le compteur `exhaustedCount`, checkpoints et slots observés, sans URL
+RPC/DB ni secret. `RUNNING`
 exige tous les composants actifs; une dépendance, un heartbeat périmé ou un
 nettoyage incomplet produit `DEGRADED`; `STOPPED` désigne l'arrêt ou la
 désactivation explicite.

@@ -274,9 +274,63 @@ void test('reconciles processing finality, replays immutable revisions, and reje
   });
 });
 
+void test('starts a fresh retry cycle for a durable finality replay', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 1,
+      baseDelayMs: 500,
+    }));
+    await repository.enqueue(notification('cycle-replay', 39n));
+    const first = await repository.claim(190_000, 120);
+    assert.ok(first);
+    await repository.saveSnapshot(
+      'cycle-replay', first.leaseToken, normalized('cycle-replay', 39n),
+    );
+    await repository.markProcessed('cycle-replay', first.leaseToken, 'processed');
+    await repository.enqueueRevision(Object.freeze({
+      signature: 'cycle-replay', confirmationStatus: 'finalized', observedAtMs: 191_000,
+    }));
+
+    const replay = await repository.claim(191_001, 120);
+    assert.ok(replay);
+    assert.equal(replay.attempts, 2);
+    assert.equal((await row(pool, 'cycle-replay')).attempts_in_cycle, 1);
+  });
+});
+
+void test('terminalizes a capped expired lease and claims the next row atomically', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 2,
+      baseDelayMs: 500,
+    }));
+    await repository.enqueue(notification('expired-capped', 39n));
+    const first = await repository.claim(195_000, 1);
+    assert.ok(first);
+    const second = await repository.claim(first.leaseExpiresAtMs + 1, 1);
+    assert.ok(second);
+    assert.equal(second.signature, 'expired-capped');
+    await repository.enqueue(notification('after-expired', 40n));
+
+    const next = await repository.claim(second.leaseExpiresAtMs + 1, 1);
+    assert.equal(next?.signature, 'after-expired');
+    const expired = await row(pool, 'expired-capped');
+    assert.equal(expired.processing_status, 'FAILED');
+    assert.equal(expired.error_code, 'WORKER_LEASE_EXPIRED');
+    assert.equal(expired.error_name, 'TransactionInboxLeaseExpired');
+    assert.equal(expired.error_retryable, true);
+    assert.ok(expired.retry_exhausted_at);
+    assert.ok(expired.terminal_at);
+    assert.equal(expired.next_attempt_at, null);
+  });
+});
+
 void test('schedules retryable failures, keeps deterministic failures terminal, and counts states', async (context) => {
   await withDatabase(context, async (pool) => {
-    const repository = new PostgresTransactionInboxRepository(pool);
+    const repository = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 3,
+      baseDelayMs: 1_000,
+    }));
     await repository.enqueue(notification('retry', 40n));
     await repository.enqueue(notification('fatal', 41n));
     const retry = await repository.claim(200_000, 120);
@@ -288,6 +342,13 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
     assert.equal(failed.error_code, 'RPC_TRANSIENT');
     assert.equal(failed.error_name, 'RpcError');
     assert.ok(failed.next_attempt_at);
+    assert.equal(
+      new Date(failed.next_attempt_at).getTime() - new Date(failed.updated_at).getTime(),
+      1_000,
+    );
+    assert.equal(failed.retry_max_attempts, 3);
+    assert.equal(failed.retry_base_delay_ms, 1_000);
+    assert.equal(failed.attempts_in_cycle, 1);
     assert.equal(await repository.claim(200_001, 120)?.then((value) => value?.signature), 'fatal');
 
     const fatalClaim = await repository.claim(200_002, 120);
@@ -296,9 +357,17 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
     await repository.markFailed('fatal', fatalRow.lease_token, Object.freeze({
       code: 'NORMALIZATION_FAILED', errorName: 'TypeError', retryable: false,
     }));
-    assert.equal((await row(pool, 'fatal')).next_attempt_at, null);
+    const terminalFailure = await row(pool, 'fatal');
+    assert.equal(terminalFailure.next_attempt_at, null);
+    assert.ok(terminalFailure.terminal_at);
+    assert.equal(
+      new Date(terminalFailure.purge_after).getTime()
+        - new Date(terminalFailure.terminal_at).getTime(),
+      4 * 60 * 60 * 1_000,
+    );
     assert.deepEqual(await repository.counts(), {
-      pending: 0, processing: 0, processed: 0, failed: 2, retryableFailed: 1,
+      pending: 0, processing: 0, processed: 0, failed: 2,
+      retryableFailed: 1, exhaustedFailed: 0,
     });
     const retryAt = new Date(failed.next_attempt_at).getTime();
     assert.equal(await repository.claim(retryAt - 1, 120), null);
@@ -310,23 +379,34 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
       code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
     }));
     let capped = await row(pool, 'retry');
-    for (let expectedAttempt = 3; expectedAttempt <= 8; expectedAttempt += 1) {
-      const nextAttemptMs = new Date(capped.next_attempt_at).getTime();
-      const nextClaim = await repository.claim(nextAttemptMs + 1, 120);
-      assert.equal(nextClaim?.attempts, expectedAttempt);
-      assert.equal(nextClaim.signature, 'retry');
-      await repository.markFailed('retry', nextClaim.leaseToken, Object.freeze({
-        code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
-      }));
-      capped = await row(pool, 'retry');
-    }
     assert.equal(
       new Date(capped.next_attempt_at).getTime() - new Date(capped.updated_at).getTime(),
-      60_000,
+      2_000,
     );
+    const nextAttemptMs = new Date(capped.next_attempt_at).getTime();
+    const finalClaim = await repository.claim(nextAttemptMs + 1, 120);
+    assert.equal(finalClaim?.attempts, 3);
+    assert.equal(finalClaim.signature, 'retry');
+    await repository.markFailed('retry', finalClaim.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    capped = await row(pool, 'retry');
+    assert.equal(capped.attempts_in_cycle, 3);
+    assert.equal(capped.next_attempt_at, null);
+    assert.ok(capped.retry_exhausted_at);
+    assert.ok(capped.terminal_at);
+    assert.equal(
+      new Date(capped.purge_after).getTime() - new Date(capped.terminal_at).getTime(),
+      4 * 60 * 60 * 1_000,
+    );
+    assert.equal(await repository.claim(Date.now() + 86_400_000, 120), null);
+    assert.deepEqual(await repository.counts(), {
+      pending: 0, processing: 0, processed: 0, failed: 2,
+      retryableFailed: 0, exhaustedFailed: 1,
+    });
 
     await repository.enqueue(notification('unsafe-error-name', 42n));
-    const unsafe = await repository.claim(retryAt + 2, 120);
+    const unsafe = await repository.claim(Date.now() + 86_400_001, 120);
     assert.ok(unsafe);
     assert.equal(unsafe.signature, 'unsafe-error-name');
     await assert.rejects(repository.markFailed(
@@ -340,6 +420,65 @@ void test('schedules retryable failures, keeps deterministic failures terminal, 
     const unsafeRow = await row(pool, 'unsafe-error-name');
     assert.equal(unsafeRow.processing_status, 'PROCESSING');
     assert.equal(unsafeRow.error_name, null);
+  });
+});
+
+void test('recovers one exhausted cycle idempotently without erasing lifetime attempts', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const firstPolicy = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 1,
+      baseDelayMs: 500,
+    }));
+    await firstPolicy.enqueue(notification('manual-recovery', 43n));
+    const first = await firstPolicy.claim(210_000, 120);
+    assert.ok(first);
+    await firstPolicy.markFailed('manual-recovery', first.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+
+    const currentPolicy = new PostgresTransactionInboxRepository(pool, Object.freeze({
+      maxAttempts: 2,
+      baseDelayMs: 1_000,
+    }));
+    assert.deepEqual(await currentPolicy.recoverExhausted('manual-recovery'), {
+      code: 'RECOVERY_SCHEDULED', signature: 'manual-recovery',
+    });
+    const recovered = await row(pool, 'manual-recovery');
+    assert.equal(recovered.processing_status, 'PENDING');
+    assert.equal(recovered.attempts, 1);
+    assert.equal(recovered.attempts_in_cycle, 0);
+    assert.equal(recovered.retry_max_attempts, 2);
+    assert.equal(recovered.retry_base_delay_ms, 1_000);
+    assert.equal(recovered.error_code, null);
+    assert.equal(recovered.retry_exhausted_at, null);
+    assert.equal(recovered.terminal_at, null);
+    assert.equal(recovered.purge_after, null);
+    assert.equal(recovered.manual_recovery_count, 1);
+    assert.ok(recovered.last_manual_recovery_at);
+
+    assert.deepEqual(await currentPolicy.recoverExhausted('manual-recovery'), {
+      code: 'RECOVERY_ALREADY_SCHEDULED', signature: 'manual-recovery',
+    });
+    assert.equal((await row(pool, 'manual-recovery')).manual_recovery_count, 1);
+    assert.equal((await pool.query(
+      "SELECT COUNT(*) FROM transaction_inbox_recoveries WHERE signature = 'manual-recovery'",
+    )).rows[0]?.count, '1');
+
+    const second = await currentPolicy.claim(Date.now() + 1_000, 120);
+    assert.ok(second);
+    assert.equal(second.attempts, 2);
+    assert.equal((await row(pool, 'manual-recovery')).attempts_in_cycle, 1);
+    await currentPolicy.markFailed('manual-recovery', second.leaseToken, Object.freeze({
+      code: 'RPC_TRANSIENT', errorName: 'RpcError', retryable: true,
+    }));
+    assert.ok((await row(pool, 'manual-recovery')).next_attempt_at);
+
+    assert.deepEqual(await currentPolicy.recoverExhausted('missing'), {
+      code: 'RECOVERY_NOT_FOUND', signature: 'missing',
+    });
+    assert.deepEqual(await currentPolicy.recoverExhausted('manual-recovery'), {
+      code: 'RECOVERY_NOT_ELIGIBLE', signature: 'manual-recovery',
+    });
   });
 });
 
@@ -371,6 +510,7 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
       workerState: 'RUNNING', reconcilerState: 'RUNNING', startedAtMs: 290_000,
       updatedAtMs: 300_000, lastHttpSlot: 51n, lastWebsocketSlot: 50n,
       lastFinalizedSlot: 49n, lastSignature: 'checkpoint', backlogCount: 3, leasedCount: 1,
+      exhaustedCount: 0,
     });
     await repository.writeHeartbeat(heartbeat);
     await repository.writeHeartbeat(Object.freeze({
@@ -395,6 +535,7 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
     )).rows[0];
     assert.equal(storedHeartbeat.pending_transactions, 3);
     assert.equal(storedHeartbeat.leased_transactions, 1);
+    assert.equal(storedHeartbeat.exhausted_transactions, 0);
     assert.equal(storedHeartbeat.last_http_slot, '51');
     assert.equal(storedHeartbeat.runtime_state, 'RUNNING');
     assert.equal(storedHeartbeat.last_signature, 'checkpoint');
@@ -402,8 +543,22 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
 
     await insertTerminal(pool, 'purge-me', new Date(Date.now() - 1_000));
     await insertTerminal(pool, 'keep-me', new Date(Date.now() + 60_000));
-    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 1);
+    await repository.enqueue(notification('failed-purge-me', 51n));
+    const failedClaim = await repository.claim(Date.now(), 120);
+    assert.equal(failedClaim?.signature, 'failed-purge-me');
+    await repository.markFailed('failed-purge-me', failedClaim.leaseToken, Object.freeze({
+      code: 'NORMALIZATION_FAILED', errorName: 'TypeError', retryable: false,
+    }));
+    await pool.query(`UPDATE chain_transaction_inbox inbox
+      SET terminal_at = retained.terminal_at,
+          purge_after = retained.terminal_at + INTERVAL '4 hours'
+      FROM (SELECT clock_timestamp() - INTERVAL '5 hours' AS terminal_at) retained
+      WHERE inbox.signature = 'failed-purge-me'`);
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox, 2);
     assert.equal((await pool.query("SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature = 'keep-me'")).rows[0]?.count, '1');
+    assert.equal((await pool.query(
+      "SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature = 'failed-purge-me'",
+    )).rows[0]?.count, '0');
   });
 });
 

@@ -64,7 +64,10 @@ export function createProductionListenerRuntime(
   pool: ProductionPool = getDatabasePool(),
 ): ListenerRuntime {
   const rpc = new SolanaRpcClient(config);
-  const inbox = new PostgresTransactionInboxRepository(pool);
+  const inbox = new PostgresTransactionInboxRepository(pool, Object.freeze({
+    maxAttempts: config.rpcRetryMaxAttempts,
+    baseDelayMs: config.rpcRetryBaseDelayMs,
+  }));
   const locator = new SolanaTransactionLocator(rpc);
   const catchUp = new CatchUpScanner(
     new SolanaCatchUpSource(catchUpRpc(rpc), config.commitment),
@@ -301,6 +304,7 @@ export class PersistentListenerHeartbeat {
   private lastFinalizedSlot: bigint | null = null;
   private backlogCount = 0;
   private leasedCount = 0;
+  private exhaustedCount = 0;
   private readonly intervalMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly scheduler: ListenerRuntimeScheduler;
@@ -412,6 +416,7 @@ export class PersistentListenerHeartbeat {
         counts.retryableFailed,
       );
       this.leasedCount = counts.processing;
+      this.exhaustedCount = counts.exhaustedFailed;
     } else {
       const counts = await this.inbox.counts();
       this.backlogCount = safeInboxBacklog(
@@ -420,6 +425,7 @@ export class PersistentListenerHeartbeat {
         counts.retryableFailed,
       );
       this.leasedCount = counts.processing;
+      this.exhaustedCount = counts.exhaustedFailed;
     }
     const value: RuntimeHeartbeat = Object.freeze({
       runtimeState,
@@ -435,6 +441,7 @@ export class PersistentListenerHeartbeat {
       lastSignature: null,
       backlogCount: this.backlogCount,
       leasedCount: this.leasedCount,
+      exhaustedCount: this.exhaustedCount,
     });
     await this.inbox.writeHeartbeat(value);
   }

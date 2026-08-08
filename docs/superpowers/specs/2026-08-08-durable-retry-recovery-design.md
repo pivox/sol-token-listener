@@ -44,7 +44,7 @@ Inbox counts distinguish scheduled retryable failures from exhausted failures. T
 
 ## Data model
 
-Migration `011_transaction_inbox_retry_recovery.sql` adds row policy, cycle, exhaustion, and manual-recovery fields, widens lifecycle constraints for terminal failures, and creates the append-only `transaction_inbox_recoveries` audit table. Migration replay is idempotent and compatible with migrations 001–010 on an empty database.
+Migration `011_transaction_inbox_retry_recovery.sql` adds row policy, cycle, exhaustion, and manual-recovery fields, widens lifecycle constraints for terminal failures, and creates the retained `transaction_inbox_recoveries` audit table. Migration replay is idempotent and compatible with migrations 001–010 on an empty database.
 
 ## Safety invariants
 

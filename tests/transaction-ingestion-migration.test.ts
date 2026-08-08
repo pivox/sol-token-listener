@@ -100,6 +100,7 @@ void test('defines the transaction inbox port at the canonical snapshot conversi
     'saveSnapshot',
     'markProcessed',
     'markFailed',
+    'recoverExhausted',
     'listForFinality',
     'recordFinalityPoll',
     'enqueueRevision',
@@ -113,11 +114,14 @@ void test('defines the transaction inbox port at the canonical snapshot conversi
   assert.doesNotMatch(source, /purge/u);
 });
 
-void test('purges only terminal processed inbox rows and exposes their count', async () => {
+void test('purges every retained terminal inbox row and exposes their count', async () => {
   const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
 
   assert.match(source, /readonly transactionInbox: number;/u);
-  assert.match(source, /DELETE FROM chain_transaction_inbox[\s\S]*processing_status = 'PROCESSED'[\s\S]*target_confirmation_status IN \('finalized', 'orphaned'\)[\s\S]*terminal_at IS NOT NULL[\s\S]*purge_after <= clock_timestamp\(\)/u);
+  assert.match(source, /DELETE FROM chain_transaction_inbox[\s\S]*terminal_at IS NOT NULL[\s\S]*purge_after <= clock_timestamp\(\)/u);
+  const deletion = /DELETE FROM chain_transaction_inbox[\s\S]*?purge_after <= clock_timestamp\(\)/u
+    .exec(source)?.[0] ?? '';
+  assert.doesNotMatch(deletion, /processing_status = 'PROCESSED'/u);
   assert.match(source, /transactionInbox: transactionInbox\.rowCount \?\? 0,/u);
   const inboxDeletion = source.indexOf('DELETE FROM chain_transaction_inbox');
   const rawDeletion = source.indexOf('DELETE FROM raw_chain_events raw');
@@ -142,7 +146,7 @@ void test('purges only terminal processed inbox rows and exposes their count', a
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
 
-void test('applies migrations 001-010 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-011 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -158,7 +162,7 @@ void test('applies migrations 001-010 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '010_transaction_inbox_timestamps.sql');
+    assert.equal(applied.at(-1), '011_transaction_inbox_retry_recovery.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
@@ -166,10 +170,12 @@ void test('applies migrations 001-010 on an empty PostgreSQL schema and replays 
     assert.equal((await pool.query('SELECT COUNT(*) FROM processing_checkpoints')).rows[0]?.count, '0');
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, error_code, error_name, error_retryable, observed_at
+      processing_status, error_code, error_name, error_retryable, observed_at,
+      terminal_at, purge_after
     ) VALUES (
       'failed-structured', 42, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
-      'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', FALSE, NOW()
+      'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', FALSE, NOW(),
+      NOW(), NOW() + INTERVAL '4 hours'
     )`);
     assert.equal((await pool.query(
       "SELECT 1 FROM chain_transaction_inbox WHERE signature = 'failed-structured'",
@@ -179,43 +185,50 @@ void test('applies migrations 001-010 on an empty PostgreSQL schema and replays 
     const oversizedMultibyteName = `${exactMultibyteName}a`;
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, error_code, error_name, error_retryable, observed_at
+      processing_status, error_code, error_name, error_retryable, observed_at,
+      terminal_at, purge_after
     ) VALUES ($1, 45, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'FAILED',
-      'NORMALIZATION_FAILED', $2, FALSE, NOW())`, ['failed-multibyte', multibyteName]);
+      'NORMALIZATION_FAILED', $2, FALSE, NOW(), NOW(), NOW() + INTERVAL '4 hours')`,
+    ['failed-multibyte', multibyteName]);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-      processing_status, error_code, error_name, error_retryable, observed_at
+      processing_status, error_code, error_name, error_retryable, observed_at,
+      terminal_at, purge_after
     ) VALUES ($1, 46, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'FAILED',
-      'NORMALIZATION_FAILED', $2, FALSE, NOW())`, ['failed-exact-name', exactMultibyteName]);
+      'NORMALIZATION_FAILED', $2, FALSE, NOW(), NOW(), NOW() + INTERVAL '4 hours')`,
+    ['failed-exact-name', exactMultibyteName]);
     assert.equal((await pool.query<{ readonly bytes: number }>(
       "SELECT OCTET_LENGTH(error_name) AS bytes FROM chain_transaction_inbox WHERE signature = 'failed-exact-name'",
     )).rows[0]?.bytes, 16_384);
     await assert.rejects(
       pool.query(`INSERT INTO chain_transaction_inbox (
         signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-        processing_status, error_code, error_name, error_retryable, observed_at
+        processing_status, error_code, error_name, error_retryable, observed_at,
+        terminal_at, purge_after
       ) VALUES ($1, 47, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed', 'FAILED',
-        'NORMALIZATION_FAILED', $2, FALSE, NOW())`,
+        'NORMALIZATION_FAILED', $2, FALSE, NOW(), NOW(), NOW() + INTERVAL '4 hours')`,
       ['failed-oversized-name', oversizedMultibyteName]),
       /chain_transaction_inbox_error_check/u,
     );
     await assert.rejects(
       pool.query(`INSERT INTO chain_transaction_inbox (
         signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-        processing_status, error_code, error_name, observed_at
+        processing_status, error_code, error_name, observed_at, terminal_at, purge_after
       ) VALUES (
         'failed-incomplete', 43, ARRAY['CATCH_UP'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
-        'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', NOW()
+        'FAILED', 'NORMALIZATION_FAILED', 'TransactionNormalizationError', NOW(),
+        NOW(), NOW() + INTERVAL '4 hours'
       )`),
       /chain_transaction_inbox_error_check/u,
     );
     await assert.rejects(
       pool.query(`INSERT INTO chain_transaction_inbox (
         signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
-        processing_status, error_name, error_retryable, observed_at
+        processing_status, error_name, error_retryable, observed_at, terminal_at, purge_after
       ) VALUES (
         'failed-without-code', 44, ARRAY['CATCH_UP'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'confirmed',
-        'FAILED', 'TransactionNormalizationError', FALSE, NOW()
+        'FAILED', 'TransactionNormalizationError', FALSE, NOW(),
+        NOW(), NOW() + INTERVAL '4 hours'
       )`),
       /chain_transaction_inbox_error_check/u,
     );
@@ -481,7 +494,7 @@ void test('enforces inbox lifecycle checks and terminal-only purge in PostgreSQL
       else await assert.rejects(operation, /chain_transaction_inbox_.+_check/u, item.name);
     }
 
-    await pool.query('TRUNCATE chain_transaction_inbox');
+    await pool.query('TRUNCATE transaction_inbox_recoveries, chain_transaction_inbox');
     await insertInbox(pool, inboxValue('purge-finalized', terminalState(
       'finalized', snapshot, fingerprint, '2020-01-01T00:00:01Z',
       '2020-01-01T00:00:02Z', '2020-01-01T04:00:02Z',
@@ -614,7 +627,14 @@ function failureFields(retryable: boolean): Partial<InboxInsert> {
 }
 
 function failedState(retryable: boolean): Partial<InboxInsert> {
-  return { processingStatus: 'FAILED', ...failureFields(retryable) };
+  return retryable
+    ? { processingStatus: 'FAILED', ...failureFields(true) }
+    : {
+      processingStatus: 'FAILED',
+      ...failureFields(false),
+      terminalAt: '2025-01-01T00:00:02.000Z',
+      purgeAfter: '2025-01-01T04:00:02.000Z',
+    };
 }
 
 function processedState(

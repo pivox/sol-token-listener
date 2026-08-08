@@ -338,8 +338,8 @@ déploiement appropriées, car le contrat est non authentifié. La route health
 retourne 503 lorsque PostgreSQL est indisponible. Son pipeline vaut `RUNNING`
 seulement lorsque tous ses composants tournent, `DEGRADED` lors d'une panne,
 d'un nettoyage incomplet ou d'un heartbeat périmé, et `STOPPED` après arrêt ou
-désactivation explicite. Le heartbeat rend visibles backlog, leases,
-checkpoints, derniers slots et fraîcheur sans divulguer les endpoints.
+désactivation explicite. Le heartbeat rend visibles backlog, leases, échecs
+épuisés, checkpoints, derniers slots et fraîcheur sans divulguer les endpoints.
 
 ## Invariants de sécurité
 

@@ -177,9 +177,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     );
     const transactionInbox = await client.query(
       `DELETE FROM chain_transaction_inbox
-       WHERE processing_status = 'PROCESSED'
-         AND target_confirmation_status IN ('finalized', 'orphaned')
-         AND terminal_at IS NOT NULL
+       WHERE terminal_at IS NOT NULL
          AND purge_after <= clock_timestamp()`,
     );
     const apiEventStream = await client.query<{ readonly deleted_count: string }>(

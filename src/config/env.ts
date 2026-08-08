@@ -75,6 +75,24 @@ export interface AppConfig {
   readonly logLevel: string;
 }
 
+export interface TransactionInboxRetryPolicyConfig {
+  readonly maxAttempts: number;
+  readonly baseDelayMs: number;
+}
+
+export function parseTransactionInboxRetryPolicy(
+  environment: NodeJS.ProcessEnv | Record<string, string | undefined>,
+): TransactionInboxRetryPolicyConfig {
+  return Object.freeze({
+    maxAttempts: parseInteger(
+      environment.RPC_RETRY_MAX_ATTEMPTS, 5, 'RPC_RETRY_MAX_ATTEMPTS', 1, 100,
+    ),
+    baseDelayMs: parseInteger(
+      environment.RPC_RETRY_BASE_DELAY_MS, 500, 'RPC_RETRY_BASE_DELAY_MS', 1, 60_000,
+    ),
+  });
+}
+
 export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, string | undefined>): AppConfig {
   rejectPrivateKeyConfiguration(environment);
 
@@ -95,6 +113,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   const apiPageLimitDefault = parseInteger(
     environment.API_PAGE_LIMIT_DEFAULT, 50, 'API_PAGE_LIMIT_DEFAULT', 1, apiPageLimitMaximum,
   );
+  const transactionInboxRetryPolicy = parseTransactionInboxRetryPolicy(environment);
 
   return {
     cluster: optional(environment.SOLANA_CLUSTER, 'mainnet-beta'),
@@ -148,8 +167,8 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
       1,
       MAX_RECONCILE_SECONDS,
     ),
-    rpcRetryMaxAttempts: parseInteger(environment.RPC_RETRY_MAX_ATTEMPTS, 5, 'RPC_RETRY_MAX_ATTEMPTS', 1),
-    rpcRetryBaseDelayMs: parseInteger(environment.RPC_RETRY_BASE_DELAY_MS, 500, 'RPC_RETRY_BASE_DELAY_MS', 1),
+    rpcRetryMaxAttempts: transactionInboxRetryPolicy.maxAttempts,
+    rpcRetryBaseDelayMs: transactionInboxRetryPolicy.baseDelayMs,
     minWsolLiquidityLamports: parseSolToLamports(environment.MIN_WSOL_LIQUIDITY, '0.25', 'MIN_WSOL_LIQUIDITY'),
     riskMinScore: parseInteger(environment.RISK_MIN_SCORE, 80, 'RISK_MIN_SCORE', 0, 100),
     riskAllowUnknownReviews: parseBoolean(environment.RISK_ALLOW_UNKNOWN_REVIEWS, false, 'RISK_ALLOW_UNKNOWN_REVIEWS'),

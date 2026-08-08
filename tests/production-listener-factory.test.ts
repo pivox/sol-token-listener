@@ -60,7 +60,10 @@ void test('heartbeat stop fences an in-flight RUNNING write before durable STOPP
   const heartbeat = new PersistentListenerHeartbeat(
     {
       async counts() {
-        return { pending: 0, processing: 0, processed: 0, failed: 0, retryableFailed: 0 };
+        return {
+          pending: 0, processing: 0, processed: 0, failed: 0,
+          retryableFailed: 0, exhaustedFailed: 0,
+        };
       },
       async writeHeartbeat(value) {
         if (value.runtimeState === 'RUNNING' && ++runningWrites === 2) await periodic.promise;
@@ -94,11 +97,18 @@ void test('heartbeat stop fences an in-flight RUNNING write before durable STOPP
 });
 
 void test('heartbeat exposes retryable failed work in backlog without leasing it', async () => {
-  const writes: { readonly backlogCount: number; readonly leasedCount: number }[] = [];
+  const writes: {
+    readonly backlogCount: number;
+    readonly leasedCount: number;
+    readonly exhaustedCount: number;
+  }[] = [];
   const heartbeat = new PersistentListenerHeartbeat(
     {
       async counts() {
-        return { pending: 2, processing: 1, processed: 4, failed: 3, retryableFailed: 2 };
+        return {
+          pending: 2, processing: 1, processed: 4, failed: 3,
+          retryableFailed: 2, exhaustedFailed: 1,
+        };
       },
       async writeHeartbeat(value) {
         writes.push(value);
@@ -115,6 +125,7 @@ void test('heartbeat exposes retryable failed work in backlog without leasing it
   await heartbeat.start();
   assert.equal(writes[0]?.backlogCount, 5);
   assert.equal(writes[0]?.leasedCount, 1);
+  assert.equal(writes[0]?.exhaustedCount, 1);
   await heartbeat.stop();
 });
 
@@ -123,6 +134,7 @@ void test('heartbeat refreshes post-drain counts without another shutdown RPC re
     readonly runtimeState: string;
     readonly backlogCount: number;
     readonly leasedCount: number;
+    readonly exhaustedCount: number;
   }[] = [];
   let countReads = 0;
   let slotReads = 0;
@@ -132,8 +144,14 @@ void test('heartbeat refreshes post-drain counts without another shutdown RPC re
       async counts() {
         countReads += 1;
         return countReads === 1
-          ? { pending: 4, processing: 1, processed: 0, failed: 0, retryableFailed: 0 }
-          : { pending: 2, processing: 0, processed: 3, failed: 2, retryableFailed: 1 };
+          ? {
+            pending: 4, processing: 1, processed: 0, failed: 0,
+            retryableFailed: 0, exhaustedFailed: 0,
+          }
+          : {
+            pending: 2, processing: 0, processed: 3, failed: 2,
+            retryableFailed: 1, exhaustedFailed: 1,
+          };
       },
       async writeHeartbeat(value) { writes.push(value); },
     },
@@ -158,9 +176,10 @@ void test('heartbeat refreshes post-drain counts without another shutdown RPC re
     runtimeState: value.runtimeState,
     backlogCount: value.backlogCount,
     leasedCount: value.leasedCount,
+    exhaustedCount: value.exhaustedCount,
   })), [
-    { runtimeState: 'RUNNING', backlogCount: 5, leasedCount: 1 },
-    { runtimeState: 'STOPPED', backlogCount: 3, leasedCount: 0 },
+    { runtimeState: 'RUNNING', backlogCount: 5, leasedCount: 1, exhaustedCount: 0 },
+    { runtimeState: 'STOPPED', backlogCount: 3, leasedCount: 0, exhaustedCount: 1 },
   ]);
 });
 
@@ -172,7 +191,10 @@ void test('heartbeat refuses a stale STOPPED snapshot when the final count read 
       async counts() {
         countReads += 1;
         if (countReads === 2) throw new Error('private final count failure');
-        return { pending: 1, processing: 1, processed: 0, failed: 0, retryableFailed: 0 };
+        return {
+          pending: 1, processing: 1, processed: 0, failed: 0,
+          retryableFailed: 0, exhaustedFailed: 0,
+        };
       },
       async writeHeartbeat(value) { writes.push(value.runtimeState); },
     },

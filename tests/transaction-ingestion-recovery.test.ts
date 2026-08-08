@@ -214,7 +214,8 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
       pool_confirmation: 'orphaned', participant_snapshots: '1', graph_snapshots: '1',
     });
     assert.deepEqual(await repository.counts(), {
-      pending: 0, processing: 0, processed: 1, failed: 0, retryableFailed: 0,
+      pending: 0, processing: 0, processed: 1, failed: 0,
+      retryableFailed: 0, exhaustedFailed: 0,
     });
 
     const replayOrder: Boundary[] = [];
