@@ -1,4 +1,4 @@
-export const QUALIFICATION_REASON_CODES = [
+export const QUALIFICATION_REASON_CODES = Object.freeze([
   'CREATOR_EARLY_SELL',
   'CREATOR_REPEAT_DUMPER',
   'MINT_SOCIAL_MISMATCH',
@@ -13,6 +13,6 @@ export const QUALIFICATION_REASON_CODES = [
   'UNSUPPORTED_TOKEN_EXTENSION',
   'METADATA_FETCH_FAILED',
   'UNSUPPORTED_QUOTE_MINT',
-] as const;
+] as const);
 
 export type QualificationReasonCode = (typeof QUALIFICATION_REASON_CODES)[number];

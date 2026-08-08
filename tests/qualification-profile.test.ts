@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
 import {
@@ -170,20 +171,51 @@ void test('rejects proxies before invoking any root, array, or entry trap', () =
   assert.equal(entryTraps, 0);
 });
 
-void test('uses an immutable private reason-code registry snapshot', () => {
+void test('rejects mutations of the canonical reason-code registry', () => {
   const exportedCodes = QUALIFICATION_REASON_CODES as unknown as string[];
-  exportedCodes.push('NOT_A_REASON');
-  try {
-    assertInvalidFacts(Object.freeze({
-      ...canonicalFacts(),
+  assert.throws(() => { exportedCodes.push('NOT_A_REASON'); });
+  assertInvalidFacts(Object.freeze({
+    ...canonicalFacts(),
+    upstreamConditions: Object.freeze([Object.freeze({
+      code: 'NOT_A_REASON',
+      triggered: false,
+    })]),
+  }));
+});
+
+void test('rejects pre-initialization mutations of the canonical reason-code registry', () => {
+  const script = `
+    import { QUALIFICATION_REASON_CODES } from './src/domain/qualification-reasons.js';
+    try { QUALIFICATION_REASON_CODES.push('PREIMPORT_FOREIGN'); } catch {}
+    const { assertValidQualificationFacts } = await import('./src/domain/qualification.js');
+    const facts = Object.freeze({
+      top1HolderBps: 2_000n,
+      top5HoldersBps: 5_000n,
+      top10HoldersBps: 7_000n,
+      maximumRelatedClusterBps: 3_000n,
+      maximumSharedFunderCount: 1,
+      buySimulationSucceeded: true,
+      sellQuoteAvailable: true,
+      roundTripLossBps: 3_000n,
       upstreamConditions: Object.freeze([Object.freeze({
-        code: 'NOT_A_REASON',
+        code: 'PREIMPORT_FOREIGN',
         triggered: false,
       })]),
-    }));
-  } finally {
-    exportedCodes.pop();
-  }
+    });
+    try {
+      assertValidQualificationFacts(facts);
+      process.exitCode = 1;
+    } catch {}
+  `;
+  const result = spawnSync(process.execPath, [
+    '--import',
+    'tsx',
+    '--input-type=module',
+    '--eval',
+    script,
+  ], { cwd: process.cwd(), encoding: 'utf8' });
+
+  assert.equal(result.status, 0, result.stderr);
 });
 
 function hostileProxyHandler(onTrap: () => void): ProxyHandler<object> {
