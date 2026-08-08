@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
 import {
@@ -11,6 +14,7 @@ import {
 import {
   loadQualificationProfile,
   parseQualificationProfile,
+  QualificationProfileError,
 } from '../src/qualification/qualification-profile.js';
 
 const canonicalFacts = (): QualificationCalibrationFacts => Object.freeze({
@@ -245,12 +249,18 @@ void test('rejects malformed profile schemas and hostile direct-object shapes', 
     { ...validRawProfile(), schemaVersion: 2 },
     { ...validRawProfile(), status: 'VALIDATED' },
     { ...validRawProfile(), minimumTotalScore: Number.MAX_SAFE_INTEGER + 1 },
+    { ...validRawProfile(), version: 1.5 },
+    { ...validRawProfile(), version: -0 },
     { ...validRawProfile(), rules: [...validRawProfile().rules, validRawProfile().rules[0]] },
+    { ...validRawProfile(), rules: validRawProfile().rules.map((rule, index) => index === 0 ? { ...rule, weight: 14.5 } : rule) },
     { ...validRawProfile(), dimensionMaximums: { preparation: 14, socialAuthenticity: 25, onchainHealth: 60 } },
     { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.slice(1) },
     { ...validRawProfile(), conditionPolicies: [...validRawProfile().conditionPolicies, validRawProfile().conditionPolicies[0]] },
+    { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.map((policy, index) => index === 1 ? { ...policy, code: 'CREATOR_EARLY_SELL' } : policy) },
+    { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.map((policy, index) => index === 0 ? { ...policy, code: 'NOT_A_REASON' } : policy) },
     { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.map((policy) => policy.code === 'STALE_DATA' ? { ...policy, mode: 'BAD' } : policy) },
     { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.map((policy) => policy.code === 'ROUND_TRIP_LOSS_EXCEEDED' ? { ...policy, maximumRoundTripLossBps: 10_001 } : policy) },
+    { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.map((policy) => policy.code === 'ROUND_TRIP_LOSS_EXCEEDED' ? { ...policy, maximumRoundTripLossBps: 3000.5 } : policy) },
     { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.map((policy) => policy.code === 'STALE_DATA' ? { ...policy, maximumTop1Bps: 1 } : policy) },
     { ...validRawProfile(), rules: validRawProfile().rules.map((rule, index) => index === 0 ? { ...rule, message: '' } : rule) },
   ];
@@ -312,6 +322,59 @@ void test('loads default and custom profiles with bounded, redacted failures', (
     );
   }
 });
+
+void test('rejects oversized and non-regular filesystem profile sources', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'qualification-profile-'));
+  try {
+    const oversized = join(directory, 'oversized.json');
+    writeFileSync(oversized, Buffer.alloc(65_537));
+    assertProfileError(
+      () => loadQualificationProfile({ profilePath: './oversized.json', minimumScoreOverride: null, workingDirectory: directory }),
+      'PROFILE_TOO_LARGE',
+    );
+    mkdirSync(join(directory, 'not-a-file'));
+    assertProfileError(
+      () => loadQualificationProfile({ profilePath: './not-a-file', minimumScoreOverride: null, workingDirectory: directory }),
+      'PROFILE_READ_FAILED',
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+void test('redacts hostile injected read results before inspecting them', () => {
+  const secret = 'injected-buffer-secret';
+  const customPath = './custom-secret-profile.json';
+  const hostile = new Proxy(Buffer.from('{}'), hostileProxyHandler(() => { throw new Error(secret); })) as unknown as Buffer;
+  assertProfileError(
+    () => loadQualificationProfile({
+      profilePath: customPath,
+      minimumScoreOverride: null,
+      readFile: () => hostile,
+    }),
+    'PROFILE_READ_FAILED',
+    [secret, customPath],
+  );
+  let accessorRead = false;
+  const accessorLike = Object.defineProperty({}, 'byteLength', {
+    enumerable: true,
+    get(): number { accessorRead = true; throw new Error(secret); },
+  }) as unknown as Buffer;
+  assertProfileError(
+    () => loadQualificationProfile({ profilePath: customPath, minimumScoreOverride: null, readFile: () => accessorLike }),
+    'PROFILE_READ_FAILED',
+    [secret, customPath],
+  );
+  assert.equal(accessorRead, false);
+});
+
+function assertProfileError(action: () => unknown, code: 'PROFILE_READ_FAILED' | 'PROFILE_TOO_LARGE' | 'PROFILE_JSON_INVALID' | 'PROFILE_SCHEMA_INVALID', forbidden: readonly string[] = []): void {
+  assert.throws(action, (error: unknown) => {
+    if (!(error instanceof QualificationProfileError)) return false;
+    if (error.code !== code || error.message !== code) return false;
+    return forbidden.every((value) => !error.stack?.includes(value));
+  });
+}
 
 interface RawRule {
   readonly signal: string;

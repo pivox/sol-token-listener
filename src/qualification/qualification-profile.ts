@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { closeSync, openSync, readSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { isProxy } from 'node:util/types';
 import type {
@@ -51,14 +51,7 @@ export function loadQualificationProfile(options: LoadQualificationProfileOption
   const path = options.profilePath === null
     ? new URL('../../config/qualification/pumpfun-v1-unvalidated.json', import.meta.url)
     : resolveProfilePath(options.profilePath, options.workingDirectory ?? process.cwd());
-  let contents: Buffer;
-  try {
-    contents = options.readFile === undefined ? readBoundedFile(path) : options.readFile(path);
-  } catch {
-    throw new QualificationProfileError('PROFILE_READ_FAILED');
-  }
-  if (!Buffer.isBuffer(contents)) throw new QualificationProfileError('PROFILE_READ_FAILED');
-  if (contents.byteLength > MAX_PROFILE_BYTES) throw new QualificationProfileError('PROFILE_TOO_LARGE');
+  const contents = readProfileBytes(path, options.readFile);
   let parsed: unknown;
   try {
     parsed = JSON.parse(contents.toString('utf8'));
@@ -68,11 +61,31 @@ export function loadQualificationProfile(options: LoadQualificationProfileOption
   return parseQualificationProfile(deepFreeze(parsed), options.minimumScoreOverride);
 }
 
+function readProfileBytes(path: string | URL, readFile: LoadQualificationProfileOptions['readFile']): Buffer {
+  try {
+    const raw: unknown = readFile === undefined ? readBoundedFile(path) : readFile(path);
+    if (isProxy(raw) || !Buffer.isBuffer(raw)) throw new QualificationProfileError('PROFILE_READ_FAILED');
+    if (raw.byteLength > MAX_PROFILE_BYTES) throw new QualificationProfileError('PROFILE_TOO_LARGE');
+    return Buffer.from(raw);
+  } catch (error) {
+    if (error instanceof QualificationProfileError) throw error;
+    throw new QualificationProfileError('PROFILE_READ_FAILED');
+  }
+}
+
 function readBoundedFile(path: string | URL): Buffer {
   const descriptor = openSync(path, 'r');
   try {
+    const stats = fstatSync(descriptor);
+    if (!stats.isFile()) throw new QualificationProfileError('PROFILE_READ_FAILED');
+    if (stats.size > MAX_PROFILE_BYTES) throw new QualificationProfileError('PROFILE_TOO_LARGE');
     const contents = Buffer.allocUnsafe(MAX_PROFILE_BYTES + 1);
-    const bytesRead = readSync(descriptor, contents, 0, contents.length, null);
+    let bytesRead = 0;
+    while (bytesRead < contents.length) {
+      const read = readSync(descriptor, contents, bytesRead, contents.length - bytesRead, null);
+      if (read === 0) break;
+      bytesRead += read;
+    }
     return contents.subarray(0, bytesRead);
   } finally {
     closeSync(descriptor);
