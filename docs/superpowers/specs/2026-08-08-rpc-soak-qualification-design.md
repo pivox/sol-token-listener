@@ -17,7 +17,7 @@ PumpSwap log notifications over WebSocket.
 
 ```text
 SOLANA_HTTP_RPC_URL -> bounded getSlot samples -> HTTP evidence
-SOLANA_WS_RPC_URL   -> two read-only onLogs subscriptions -> WS evidence
+SOLANA_WS_RPC_URL   -> two acknowledged logsSubscribe calls -> WS evidence
                                                       \-> rpc-soak.v1 report
 ```
 
@@ -35,8 +35,9 @@ Configuration is integer-only:
 - interval: 250 to 60,000 ms;
 - computed sample count: 2 to 10,000.
 
-The runner subscribes first, samples immediately, waits between samples, then
-closes both subscriptions. It records no signatures or endpoint identifiers.
+The runner subscribes first, samples on a monotonic schedule, then closes the
+WebSocket session. One absolute wall-clock deadline covers setup, every HTTP
+request and cleanup; cancellation is propagated with `AbortSignal`. It records no signatures or endpoint identifiers.
 HTTP latencies are non-negative integer milliseconds and percentiles use the
 deterministic nearest-rank rule.
 
@@ -44,10 +45,10 @@ The frozen `rpc-soak.v1` report contains:
 
 - configured and observed duration;
 - HTTP attempted/succeeded/failed/rate-limited counts;
-- a fixed failure histogram for rate-limited, request-failed and invalid-response samples;
+- a fixed failure histogram for deadline, rate-limited, request-failed and invalid-response samples;
 - min, p50, p95 and max latency;
 - first and last confirmed slots as decimal strings;
-- WebSocket subscription state;
+- WebSocket acknowledgement, ongoing health and cleanup states;
 - total, Pump.fun and PumpSwap observation counts;
 - first and last observed slots as decimal strings;
 - verdict and stable reason codes.
@@ -60,18 +61,21 @@ response body. HTTP 429 becomes `RPC_RATE_LIMITED`; other transport/status
 failures become `RPC_REQUEST_FAILED`; malformed successful responses become
 `RPC_RESPONSE_INVALID`.
 
-The WebSocket adapter uses the existing Solana `Connection` and the canonical
-Pump.fun/PumpSwap program IDs. Its callback forwards only the program family
-and slot. Cleanup removes both listener IDs and fails explicitly if either
-unsubscribe fails.
+The WebSocket adapter uses the Node WebSocket client and the canonical
+Pump.fun/PumpSwap program IDs. It waits for both JSON-RPC subscription
+acknowledgements before reporting establishment, forwards only the program
+family and slot, and marks any later error or disconnect unhealthy. One socket
+owns both server subscriptions, so closing it removes the complete session.
+Setup rollback and final cleanup are cancellable and their failures remain
+explicit.
 
 Errors expose only fixed codes and messages. URLs, headers, response bodies,
 signatures and provider error text never enter the report or logs.
 
 ## Verdict
 
-- `FAIL`: no successful HTTP sample, WebSocket subscription failure or cleanup
-  failure;
+- `FAIL`: deadline exceeded, no successful HTTP sample, WebSocket subscription
+  failure, later connection loss or cleanup failure;
 - `DEGRADED`: partial HTTP failure, any 429, no confirmed-slot progress, or no
   WebSocket observation for one or both programs;
 - `PASS`: all HTTP samples succeed, the slot progresses, both subscriptions

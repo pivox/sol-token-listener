@@ -1,5 +1,4 @@
 import { pathToFileURL } from 'node:url';
-import { Connection } from '@solana/web3.js';
 import { parseConfig } from '../src/config/env.js';
 import {
   RPC_SOAK_MAX_DURATION_MS,
@@ -38,7 +37,7 @@ export function parseRpcSoakOptions(
     RPC_SOAK_MAX_INTERVAL_MS,
   );
   const durationMs = durationSeconds * 1_000;
-  const sampleCount = Math.floor(durationMs / intervalMs) + 1;
+  const sampleCount = Math.ceil(durationMs / intervalMs);
   if (sampleCount < 2 || sampleCount > RPC_SOAK_MAX_SAMPLES) {
     throw new TypeError('RPC soak sample count is invalid.');
   }
@@ -70,14 +69,10 @@ function parseCanonicalInteger(
 async function main(): Promise<void> {
   try {
     const config = parseConfig(process.env);
-    const connection = new Connection(config.httpRpcUrl, {
-      commitment: config.commitment,
-      wsEndpoint: config.wsRpcUrl,
-    });
     const transport = new SolanaRpcSoakTransport({
       httpRpcUrl: config.httpRpcUrl,
+      websocketUrl: config.wsRpcUrl,
       commitment: config.commitment,
-      connection,
     });
     process.exitCode = await runRpcSoakCli({
       environment: process.env,

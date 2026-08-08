@@ -7,16 +7,19 @@ export const RPC_SOAK_MAX_SAMPLES = 10_000;
 
 export type RpcSoakProgram = 'pumpfun' | 'pumpswap';
 export type RpcSoakFailureCode =
+  | 'RPC_DEADLINE_EXCEEDED'
   | 'RPC_RATE_LIMITED'
   | 'RPC_REQUEST_FAILED'
   | 'RPC_RESPONSE_INVALID';
 export type RpcSoakReasonCode =
+  | 'SOAK_DEADLINE_EXCEEDED'
   | 'HTTP_UNAVAILABLE'
   | 'HTTP_PARTIAL_FAILURE'
   | 'HTTP_RATE_LIMITED'
   | 'HTTP_SLOT_STALLED'
   | 'WS_SUBSCRIBE_FAILED'
   | 'WS_CLEANUP_FAILED'
+  | 'WS_CONNECTION_LOST'
   | 'WS_PUMPFUN_UNOBSERVED'
   | 'WS_PUMPSWAP_UNOBSERVED';
 
@@ -26,17 +29,25 @@ export interface RpcSoakObservation {
 }
 
 export interface RpcSoakSubscription {
-  close(): Promise<void>;
+  close(signal: AbortSignal): Promise<void>;
+  health(): 'HEALTHY' | 'FAILED';
 }
 
 export interface RpcSoakTransport {
-  subscribe(observe: (value: RpcSoakObservation) => void): Promise<RpcSoakSubscription>;
-  sampleHttpSlot(): Promise<bigint>;
+  subscribe(
+    observe: (value: RpcSoakObservation) => void,
+    signal: AbortSignal,
+  ): Promise<RpcSoakSubscription>;
+  sampleHttpSlot(signal: AbortSignal): Promise<bigint>;
 }
 
 export interface RpcSoakRuntime {
   now(): number;
   wait(milliseconds: number): Promise<void>;
+  runUntil<T>(
+    deadlineMs: number,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T>;
 }
 
 export interface RpcSoakOptions {
@@ -48,8 +59,11 @@ export interface RpcSoakReport {
   readonly schemaVersion: typeof RPC_SOAK_SCHEMA_VERSION;
   readonly startedAtMs: number;
   readonly completedAtMs: number;
+  readonly deadlineAtMs: number;
+  readonly deadlineExceeded: boolean;
   readonly configuredDurationMs: number;
   readonly intervalMs: number;
+  readonly plannedSampleCount: number;
   readonly sampleCount: number;
   readonly http: Readonly<{
     attempted: number;
@@ -63,6 +77,7 @@ export interface RpcSoakReport {
   }>;
   readonly websocket: Readonly<{
     subscriptionState: 'ESTABLISHED' | 'FAILED';
+    healthState: 'HEALTHY' | 'FAILED' | 'NOT_ESTABLISHED';
     cleanupState: 'COMPLETED' | 'FAILED' | 'NOT_REQUIRED';
     observations: number;
     pumpfunObservations: number;
@@ -82,10 +97,50 @@ export class RpcSoakTransportError extends Error {
   }
 }
 
+export class RpcSoakSubscriptionError extends Error {
+  public constructor(public readonly cleanupFailed: boolean) {
+    super('RPC soak subscription setup failed.');
+    this.name = 'RpcSoakSubscriptionError';
+  }
+}
+
+class RpcSoakDeadlineError extends Error {
+  public constructor() {
+    super('RPC soak operation deadline exceeded.');
+    this.name = 'RpcSoakDeadlineError';
+  }
+}
+
 const defaultRuntime: RpcSoakRuntime = Object.freeze({
   now: Date.now,
   wait(milliseconds: number): Promise<void> {
     return new Promise((resolve) => { setTimeout(resolve, milliseconds); });
+  },
+  async runUntil<T>(
+    deadlineMs: number,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const remainingMs = deadlineMs - Date.now();
+    const operationPromise = Promise.resolve().then(async () => operation(controller.signal));
+    if (remainingMs <= 0) {
+      controller.abort();
+      void operationPromise.catch(() => undefined);
+      throw new RpcSoakDeadlineError();
+    }
+    let rejectDeadline: (reason: Error) => void = () => undefined;
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      rejectDeadline = reject;
+    });
+    const timer = setTimeout(() => {
+      controller.abort();
+      queueMicrotask(() => { rejectDeadline(new RpcSoakDeadlineError()); });
+    }, remainingMs);
+    try {
+      return await Promise.race([operationPromise, timeoutPromise]);
+    } finally {
+      clearTimeout(timer);
+    }
   },
 });
 
@@ -94,11 +149,14 @@ export async function runRpcSoak(
   options: RpcSoakOptions,
   runtime: RpcSoakRuntime = defaultRuntime,
 ): Promise<RpcSoakReport> {
-  const sampleCount = validateOptions(options);
+  const plannedSampleCount = validateOptions(options);
   const startedAtMs = readClock(runtime, null);
+  const deadlineAtMs = startedAtMs + options.durationMs;
+  if (!Number.isSafeInteger(deadlineAtMs)) throw new TypeError('RPC soak deadline is invalid.');
   const httpSlots: bigint[] = [];
   const latencies: number[] = [];
   const failuresByCode: Record<RpcSoakFailureCode, number> = {
+    RPC_DEADLINE_EXCEEDED: 0,
     RPC_RATE_LIMITED: 0,
     RPC_REQUEST_FAILED: 0,
     RPC_RESPONSE_INVALID: 0,
@@ -112,18 +170,45 @@ export async function runRpcSoak(
 
   let subscription: RpcSoakSubscription | null = null;
   let subscriptionState: 'ESTABLISHED' | 'FAILED' = 'FAILED';
+  let healthState: 'HEALTHY' | 'FAILED' | 'NOT_ESTABLISHED' = 'NOT_ESTABLISHED';
+  let cleanupState: 'COMPLETED' | 'FAILED' | 'NOT_REQUIRED' = 'NOT_REQUIRED';
+  let deadlineExceeded = false;
   try {
-    subscription = await transport.subscribe((value) => { recordObservation(observations, value); });
-    if (typeof subscription.close !== 'function') throw new TypeError('RPC soak subscription is invalid.');
+    subscription = await runtime.runUntil(
+      deadlineAtMs,
+      async (signal) => transport.subscribe((value) => { recordObservation(observations, value); }, signal),
+    );
+    if (typeof subscription.close !== 'function' || typeof subscription.health !== 'function') {
+      throw new TypeError('RPC soak subscription is invalid.');
+    }
     subscriptionState = 'ESTABLISHED';
-  } catch {
+    healthState = 'HEALTHY';
+  } catch (error) {
+    if (error instanceof RpcSoakSubscriptionError && error.cleanupFailed) cleanupState = 'FAILED';
+    deadlineExceeded = deadlineReached(runtime, deadlineAtMs, error);
     subscription = null;
   }
 
-  for (let sample = 0; sample < sampleCount; sample += 1) {
+  let attemptedSamples = 0;
+  for (let sample = 0; sample < plannedSampleCount; sample += 1) {
+    const scheduledAtMs = startedAtMs + (sample * options.intervalMs);
+    const beforeWaitMs = readClock(runtime, startedAtMs);
+    if (scheduledAtMs >= deadlineAtMs || beforeWaitMs >= deadlineAtMs) {
+      deadlineExceeded = deadlineExceeded || beforeWaitMs >= deadlineAtMs;
+      break;
+    }
+    if (beforeWaitMs < scheduledAtMs) await runtime.wait(scheduledAtMs - beforeWaitMs);
+    if (readClock(runtime, startedAtMs) >= deadlineAtMs) {
+      deadlineExceeded = true;
+      break;
+    }
+    attemptedSamples += 1;
     const sampleStartedAtMs = readClock(runtime, startedAtMs);
     try {
-      const slot = await transport.sampleHttpSlot();
+      const slot = await runtime.runUntil(
+        deadlineAtMs,
+        async (signal) => transport.sampleHttpSlot(signal),
+      );
       if (typeof slot !== 'bigint' || slot < 0n) {
         throw new RpcSoakTransportError('RPC_RESPONSE_INVALID');
       }
@@ -131,35 +216,49 @@ export async function runRpcSoak(
       latencies.push(sampleCompletedAtMs - sampleStartedAtMs);
       httpSlots.push(slot);
     } catch (error) {
-      const code = error instanceof RpcSoakTransportError
+      const timedOut = deadlineReached(runtime, deadlineAtMs, error);
+      const code: RpcSoakFailureCode = timedOut
+        ? 'RPC_DEADLINE_EXCEEDED'
+        : error instanceof RpcSoakTransportError
         ? error.code
         : 'RPC_REQUEST_FAILED';
       failuresByCode[code] += 1;
+      if (timedOut) {
+        deadlineExceeded = true;
+        break;
+      }
     }
-    if (sample + 1 < sampleCount) await runtime.wait(options.intervalMs);
   }
 
-  let cleanupState: 'COMPLETED' | 'FAILED' | 'NOT_REQUIRED' = 'NOT_REQUIRED';
   if (subscription !== null) {
     try {
-      await subscription.close();
-      cleanupState = 'COMPLETED';
+      healthState = subscription.health();
     } catch {
+      healthState = 'FAILED';
+    }
+    try {
+      await runtime.runUntil(deadlineAtMs, async (signal) => subscription.close(signal));
+      cleanupState = 'COMPLETED';
+    } catch (error) {
       cleanupState = 'FAILED';
+      deadlineExceeded = deadlineExceeded || deadlineReached(runtime, deadlineAtMs, error);
     }
   }
   const completedAtMs = readClock(runtime, startedAtMs);
   const reasonCodes = reasons(
-    sampleCount,
+    attemptedSamples,
     httpSlots,
     failuresByCode,
     subscriptionState,
+    healthState,
     cleanupState,
     observations,
   );
   const failed = reasonCodes.includes('HTTP_UNAVAILABLE')
+    || reasonCodes.includes('SOAK_DEADLINE_EXCEEDED')
     || reasonCodes.includes('WS_SUBSCRIBE_FAILED')
-    || reasonCodes.includes('WS_CLEANUP_FAILED');
+    || reasonCodes.includes('WS_CLEANUP_FAILED')
+    || reasonCodes.includes('WS_CONNECTION_LOST');
   const verdict = failed ? 'FAIL' : reasonCodes.length > 0 ? 'DEGRADED' : 'PASS';
   const failedSamples = Object.values(failuresByCode)
     .reduce((total, value) => total + value, 0);
@@ -168,11 +267,14 @@ export async function runRpcSoak(
     schemaVersion: RPC_SOAK_SCHEMA_VERSION,
     startedAtMs,
     completedAtMs,
+    deadlineAtMs,
+    deadlineExceeded,
     configuredDurationMs: options.durationMs,
     intervalMs: options.intervalMs,
-    sampleCount,
+    plannedSampleCount,
+    sampleCount: attemptedSamples,
     http: Object.freeze({
-      attempted: sampleCount,
+      attempted: attemptedSamples,
       succeeded: httpSlots.length,
       failed: failedSamples,
       rateLimited: failuresByCode.RPC_RATE_LIMITED,
@@ -183,6 +285,7 @@ export async function runRpcSoak(
     }),
     websocket: Object.freeze({
       subscriptionState,
+      healthState,
       cleanupState,
       observations: observations.pumpfun + observations.pumpswap,
       pumpfunObservations: observations.pumpfun,
@@ -208,7 +311,7 @@ function validateOptions(options: RpcSoakOptions): number {
     RPC_SOAK_MAX_INTERVAL_MS,
     'RPC soak interval',
   );
-  const sampleCount = Math.floor(options.durationMs / options.intervalMs) + 1;
+  const sampleCount = Math.ceil(options.durationMs / options.intervalMs);
   if (sampleCount < 2 || sampleCount > RPC_SOAK_MAX_SAMPLES) {
     throw new TypeError('RPC soak sample count is invalid.');
   }
@@ -236,11 +339,14 @@ function recordObservation(
   target: { pumpfun: number; pumpswap: number; firstSlot: bigint | null; lastSlot: bigint | null },
   value: RpcSoakObservation,
 ): void {
-  if (typeof value.slot !== 'bigint'
-    || value.slot < 0n) return;
-  target[value.program] += 1;
-  target.firstSlot ??= value.slot;
-  target.lastSlot = value.slot;
+  const program: unknown = value.program;
+  const slot: unknown = value.slot;
+  if ((program !== 'pumpfun' && program !== 'pumpswap')
+    || typeof slot !== 'bigint'
+    || slot < 0n) return;
+  target[program] += 1;
+  target.firstSlot ??= slot;
+  target.lastSlot = slot;
 }
 
 function reasons(
@@ -248,10 +354,12 @@ function reasons(
   slots: readonly bigint[],
   failures: Readonly<Record<RpcSoakFailureCode, number>>,
   subscription: 'ESTABLISHED' | 'FAILED',
+  health: 'HEALTHY' | 'FAILED' | 'NOT_ESTABLISHED',
   cleanup: 'COMPLETED' | 'FAILED' | 'NOT_REQUIRED',
   observations: { readonly pumpfun: number; readonly pumpswap: number },
 ): RpcSoakReasonCode[] {
   const values: RpcSoakReasonCode[] = [];
+  if (failures.RPC_DEADLINE_EXCEEDED > 0) values.push('SOAK_DEADLINE_EXCEEDED');
   if (slots.length === 0) values.push('HTTP_UNAVAILABLE');
   else if (slots.length < sampleCount) values.push('HTTP_PARTIAL_FAILURE');
   if (failures.RPC_RATE_LIMITED > 0) values.push('HTTP_RATE_LIMITED');
@@ -260,11 +368,16 @@ function reasons(
   }
   if (subscription === 'FAILED') values.push('WS_SUBSCRIBE_FAILED');
   if (cleanup === 'FAILED') values.push('WS_CLEANUP_FAILED');
+  if (health === 'FAILED') values.push('WS_CONNECTION_LOST');
   if (subscription === 'ESTABLISHED') {
     if (observations.pumpfun === 0) values.push('WS_PUMPFUN_UNOBSERVED');
     if (observations.pumpswap === 0) values.push('WS_PUMPSWAP_UNOBSERVED');
   }
   return values;
+}
+
+function deadlineReached(runtime: RpcSoakRuntime, deadlineAtMs: number, error: unknown): boolean {
+  return error instanceof RpcSoakDeadlineError || readClock(runtime, null) >= deadlineAtMs;
 }
 
 function latencySummary(values: readonly number[]): Readonly<{

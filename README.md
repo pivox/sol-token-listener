@@ -75,7 +75,7 @@ worker puis relit les compteurs de l'inbox et écrit le heartbeat final, dans la
 
 La commande bornée `npm run rpc:soak` vérifie un endpoint HTTP/WebSocket dédié
 avant son utilisation par le listener. Elle appelle uniquement `getSlot` et
-observe les logs des programmes Pump.fun et PumpSwap; elle ne lit aucun corps
+observe, après accusé de réception, les logs des programmes Pump.fun et PumpSwap; elle ne lit aucun corps
 de transaction et n'accède ni à PostgreSQL ni à un wallet. Sa sortie est un
 unique rapport JSON redacted. Un verdict `PASS`, `DEGRADED` ou `FAIL` produit
 respectivement le code de sortie 0, 2 ou 1.

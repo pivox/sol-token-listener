@@ -7,30 +7,26 @@ import {
   RpcSoakWebsocketError,
   SolanaRpcSoakTransport,
   type RpcSoakFetch,
-  type RpcSoakLogsConnection,
+  type RpcSoakWebSocket,
 } from '../src/solana/rpc/rpc-soak-transport.js';
 
-void test('samples one canonical confirmed slot without exposing the endpoint', async () => {
+void test('samples one canonical confirmed slot with cancellation and no endpoint exposure', async () => {
   const calls: { readonly input: string; readonly init: RequestInit }[] = [];
-  const transport = new SolanaRpcSoakTransport({
-    httpRpcUrl: 'https://user:secret@rpc.example.invalid/key',
-    commitment: 'confirmed',
-    fetch: async (input, init) => {
-      calls.push({ input, init });
-      return response(200, { jsonrpc: '2.0', id: 1, result: 123 });
-    },
-    connection: new FakeLogsConnection(),
+  const transport = createTransport(new FakeWebSocket(), async (input, init) => {
+    calls.push({ input, init });
+    return response(200, { jsonrpc: '2.0', id: 1, result: 123 });
   });
+  const signal = new AbortController().signal;
 
-  assert.equal(await transport.sampleHttpSlot(), 123n);
+  assert.equal(await transport.sampleHttpSlot(signal), 123n);
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.input, 'https://user:secret@rpc.example.invalid/key');
+  assert.equal(calls[0]?.init.signal, signal);
   const body = calls[0]?.init.body;
   if (typeof body !== 'string') throw new TypeError('Expected string request body.');
   assert.deepEqual(JSON.parse(body), {
     jsonrpc: '2.0', id: 1, method: 'getSlot', params: [{ commitment: 'confirmed' }],
   });
-  assert.equal((calls[0]?.init.headers as Record<string, string>)['content-type'], 'application/json');
 });
 
 void test('classifies HTTP 429, other failures and invalid JSON-RPC with fixed redacted codes', async () => {
@@ -48,11 +44,8 @@ void test('classifies HTTP 429, other failures and invalid JSON-RPC with fixed r
   ];
 
   for (const entry of cases) {
-    const transport = new SolanaRpcSoakTransport({
-      httpRpcUrl: 'https://secret.invalid/key', commitment: 'confirmed',
-      fetch: entry.fetch, connection: new FakeLogsConnection(),
-    });
-    await assert.rejects(transport.sampleHttpSlot(), (error: unknown) => {
+    const transport = createTransport(new FakeWebSocket(), entry.fetch);
+    await assert.rejects(transport.sampleHttpSlot(new AbortController().signal), (error: unknown) => {
       assert.ok(error instanceof RpcSoakTransportError, entry.name);
       assert.equal(error.code, entry.code, entry.name);
       assert.doesNotMatch(String(error), /secret|private|provider|quota|invalid\/key/u);
@@ -61,58 +54,131 @@ void test('classifies HTTP 429, other failures and invalid JSON-RPC with fixed r
   }
 });
 
-void test('subscribes to both canonical programs and forwards only program family and slot', async () => {
-  const connection = new FakeLogsConnection();
-  const transport = new SolanaRpcSoakTransport({
-    httpRpcUrl: 'https://rpc.example.invalid', commitment: 'confirmed',
-    fetch: async () => response(200, { jsonrpc: '2.0', id: 1, result: 1 }),
-    connection,
-  });
+void test('requires two server acknowledgements and forwards only typed program slots', async () => {
+  const socket = new FakeWebSocket();
+  const transport = createTransport(socket);
   const observations: unknown[] = [];
+  const pending = transport.subscribe(
+    (value) => { observations.push(value); },
+    new AbortController().signal,
+  );
 
-  const subscription = await transport.subscribe((value) => { observations.push(value); });
+  socket.open();
+  assert.deepEqual(socket.sent.map(parseJson), [
+    {
+      jsonrpc: '2.0', id: 1, method: 'logsSubscribe',
+      params: [{ mentions: [PUMP_PROGRAM_ID] }, { commitment: 'processed' }],
+    },
+    {
+      jsonrpc: '2.0', id: 2, method: 'logsSubscribe',
+      params: [{ mentions: [PUMPSWAP_PROGRAM_ID] }, { commitment: 'processed' }],
+    },
+  ]);
+  socket.message({ jsonrpc: '2.0', id: 1, result: 100 });
+  socket.message({ jsonrpc: '2.0', id: 2, result: 101 });
+  const subscription = await pending;
+  assert.equal(subscription.health(), 'HEALTHY');
 
-  assert.deepEqual(connection.programs, [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID]);
-  assert.deepEqual(connection.commitments, ['processed', 'processed']);
-  connection.emit(0, 10);
-  connection.emit(1, 11);
-  connection.emit(0, -1);
+  socket.message(notification(100, 10));
+  socket.message(notification(101, 11));
+  socket.message(notification(999, 12));
+  socket.message(notification(100, -1));
   assert.deepEqual(observations, [
     { program: 'pumpfun', slot: 10n },
     { program: 'pumpswap', slot: 11n },
   ]);
-  await Promise.all([subscription.close(), subscription.close()]);
-  assert.deepEqual(connection.removed.sort((left, right) => left - right), [100, 101]);
+  await Promise.all([
+    subscription.close(new AbortController().signal),
+    subscription.close(new AbortController().signal),
+  ]);
+  assert.equal(socket.closeCalls, 1);
 });
 
-void test('rolls back partial subscription and attempts every removal on cleanup failure', async () => {
-  const partial = new FakeLogsConnection();
-  partial.listenerIds = [100, -1];
-  const partialTransport = transport(partial);
-  await assert.rejects(partialTransport.subscribe(() => undefined), (error: unknown) => {
+void test('marks an acknowledged session unhealthy after error or disconnect', async () => {
+  for (const event of ['error', 'close'] as const) {
+    const socket = new FakeWebSocket();
+    const pending = createTransport(socket).subscribe(() => undefined, new AbortController().signal);
+    socket.open();
+    socket.message({ jsonrpc: '2.0', id: 1, result: 100 });
+    socket.message({ jsonrpc: '2.0', id: 2, result: 101 });
+    const subscription = await pending;
+
+    if (event === 'error') socket.error();
+    else socket.disconnect();
+
+    assert.equal(subscription.health(), 'FAILED', event);
+  }
+});
+
+void test('reports cleanup failure instead of swallowing a partial subscribe rollback', async () => {
+  const clean = new FakeWebSocket();
+  const cleanPending = createTransport(clean).subscribe(() => undefined, new AbortController().signal);
+  clean.open();
+  clean.message({ jsonrpc: '2.0', id: 1, result: 100 });
+  clean.message({ jsonrpc: '2.0', id: 2, error: { message: 'private rejection' } });
+  await assert.rejects(cleanPending, (error: unknown) => {
     assert.ok(error instanceof RpcSoakWebsocketError);
     assert.equal(error.stage, 'subscribe');
+    assert.equal(error.cleanupFailed, false);
     return true;
   });
-  assert.deepEqual(partial.removed, [100]);
 
-  const cleanup = new FakeLogsConnection();
-  cleanup.removeFailures.add(100);
-  const active = await transport(cleanup).subscribe(() => undefined);
-  await assert.rejects(active.close(), (error: unknown) => {
+  const failed = new FakeWebSocket();
+  failed.closeThrows = true;
+  const failedPending = createTransport(failed).subscribe(() => undefined, new AbortController().signal);
+  failed.open();
+  failed.message({ jsonrpc: '2.0', id: 1, result: 100 });
+  failed.message({ jsonrpc: '2.0', id: 2, error: { message: 'private rejection' } });
+  await assert.rejects(failedPending, (error: unknown) => {
     assert.ok(error instanceof RpcSoakWebsocketError);
     assert.equal(error.stage, 'cleanup');
-    assert.doesNotMatch(String(error), /private/u);
+    assert.equal(error.cleanupFailed, true);
+    assert.doesNotMatch(String(error), /private|rejection/u);
     return true;
   });
-  assert.deepEqual(cleanup.removed.sort((left, right) => left - right), [100, 101]);
 });
 
-function transport(connection: FakeLogsConnection): SolanaRpcSoakTransport {
-  return new SolanaRpcSoakTransport({
-    httpRpcUrl: 'https://rpc.example.invalid', commitment: 'confirmed', connection,
-    fetch: async () => response(200, { jsonrpc: '2.0', id: 1, result: 1 }),
+void test('cancellation forces an active socket close and returns a fixed cleanup error', async () => {
+  const socket = new FakeWebSocket();
+  socket.autoClose = false;
+  const pending = createTransport(socket).subscribe(() => undefined, new AbortController().signal);
+  socket.open();
+  socket.message({ jsonrpc: '2.0', id: 1, result: 100 });
+  socket.message({ jsonrpc: '2.0', id: 2, result: 101 });
+  const subscription = await pending;
+  const controller = new AbortController();
+  const closing = subscription.close(controller.signal);
+  controller.abort();
+  await assert.rejects(closing, (error: unknown) => {
+    assert.ok(error instanceof RpcSoakWebsocketError);
+    assert.equal(error.stage, 'cleanup');
+    return true;
   });
+  assert.equal(socket.closeCalls, 2);
+});
+
+function createTransport(
+  socket: FakeWebSocket,
+  fetch: RpcSoakFetch = async () => response(200, { jsonrpc: '2.0', id: 1, result: 1 }),
+): SolanaRpcSoakTransport {
+  return new SolanaRpcSoakTransport({
+    httpRpcUrl: 'https://user:secret@rpc.example.invalid/key',
+    websocketUrl: 'wss://user:secret@rpc.example.invalid/key',
+    commitment: 'confirmed',
+    fetch,
+    createWebSocket: () => socket,
+  });
+}
+
+function notification(subscription: number, slot: number): unknown {
+  return {
+    jsonrpc: '2.0', method: 'logsNotification',
+    params: { subscription, result: { context: { slot }, value: { signature: 'not-forwarded' } } },
+  };
+}
+
+function parseJson(value: string): unknown {
+  return JSON.parse(value) as unknown;
 }
 
 function response(status: number, body: unknown): Awaited<ReturnType<RpcSoakFetch>> {
@@ -126,31 +192,55 @@ function response(status: number, body: unknown): Awaited<ReturnType<RpcSoakFetc
   };
 }
 
-class FakeLogsConnection implements RpcSoakLogsConnection {
-  public programs: string[] = [];
-  public commitments: string[] = [];
-  public removed: number[] = [];
-  public listenerIds: number[] = [100, 101];
-  public removeFailures = new Set<number>();
-  private readonly callbacks: ((logs: unknown, context: { readonly slot: number }) => void)[] = [];
+class FakeWebSocket implements RpcSoakWebSocket {
+  public readyState = 0;
+  public sent: string[] = [];
+  public closeCalls = 0;
+  public closeThrows = false;
+  public autoClose = true;
+  private readonly listeners = new Map<string, Set<(event: unknown) => void>>();
 
-  public onLogs(
-    program: { toBase58(): string },
-    callback: (logs: unknown, context: { readonly slot: number }) => void,
-    commitment: 'processed',
-  ): number {
-    this.programs.push(program.toBase58());
-    this.commitments.push(commitment);
-    this.callbacks.push(callback);
-    return this.listenerIds[this.callbacks.length - 1] ?? -1;
+  public addEventListener(type: string, listener: (event: unknown) => void): void {
+    const values = this.listeners.get(type) ?? new Set();
+    values.add(listener);
+    this.listeners.set(type, values);
   }
 
-  public async removeOnLogsListener(id: number): Promise<void> {
-    this.removed.push(id);
-    if (this.removeFailures.has(id)) throw new Error('private cleanup');
+  public removeEventListener(type: string, listener: (event: unknown) => void): void {
+    this.listeners.get(type)?.delete(listener);
   }
 
-  public emit(index: number, slot: number): void {
-    this.callbacks[index]?.({ signature: 'must-not-be-forwarded' }, { slot });
+  public send(data: string): void {
+    if (this.readyState !== 1) throw new Error('private socket state');
+    this.sent.push(data);
+  }
+
+  public close(): void {
+    this.closeCalls += 1;
+    if (this.closeThrows) throw new Error('private close failure');
+    if (this.autoClose) this.disconnect();
+    else this.readyState = 2;
+  }
+
+  public open(): void {
+    this.readyState = 1;
+    this.emit('open', {});
+  }
+
+  public message(value: unknown): void {
+    this.emit('message', { data: JSON.stringify(value) });
+  }
+
+  public error(): void {
+    this.emit('error', {});
+  }
+
+  public disconnect(): void {
+    this.readyState = 3;
+    this.emit('close', {});
+  }
+
+  private emit(type: string, event: unknown): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
   }
 }

@@ -12,10 +12,14 @@ La commande :
 - ne signe, ne simule et n'envoie aucune transaction ;
 - appelle uniquement la méthode JSON-RPC `getSlot` ;
 - ouvre exactement deux souscriptions `logsSubscribe`, une pour Pump.fun et
-  une pour PumpSwap ;
+  une pour PumpSwap, et exige leurs accusés de réception JSON-RPC ;
 - ne conserve ni signature, ni logs, ni contenu de transaction ;
 - n'affiche jamais les URL RPC, en-têtes ou messages d'erreur du transport ;
 - n'accède pas à la base de données et ne modifie pas le listener actif.
+
+Un deadline mural annule les appels HTTP, l'établissement WebSocket et son
+nettoyage. Une déconnexion ou erreur après les accusés de réception invalide
+également la santé WebSocket, même si les deux programmes ont déjà été vus.
 
 Le test reste borné entre 5 secondes et 1 heure, avec un intervalle compris
 entre 250 ms et 60 secondes et au maximum 10 000 échantillons HTTP.
@@ -68,7 +72,9 @@ tableau de bord du fournisseur afin de mesurer la consommation réelle.
 | `DEGRADED` | 2 | Le transport reste partiellement disponible, mais une perte HTTP, un 429, un slot immobile ou une absence d'observation programme est détecté. |
 | `FAIL` | 1 | HTTP est indisponible, la souscription échoue ou le nettoyage WebSocket échoue. |
 
-Les `reasonCodes` sont stables et expliquent le verdict. Les latences sont des
+Les `reasonCodes` sont stables et expliquent le verdict. Le code
+`SOAK_DEADLINE_EXCEEDED` signale une opération annulée au deadline et
+`WS_CONNECTION_LOST` une session acquittée puis devenue défaillante. Les latences sont des
 entiers en millisecondes ; les slots sont des chaînes décimales pour préserver
 leur exactitude. L'absence d'événement Pump.fun ou PumpSwap pendant une fenêtre
 courte peut refléter le trafic et produit donc `DEGRADED`, pas une preuve de

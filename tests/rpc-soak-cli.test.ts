@@ -29,6 +29,7 @@ void test('rejects malformed, out-of-range and excessive sample settings', () =>
     { RPC_SOAK_DURATION_SECONDS: '3601' },
     { RPC_SOAK_INTERVAL_MS: '249' },
     { RPC_SOAK_INTERVAL_MS: '60001' },
+    { RPC_SOAK_DURATION_SECONDS: '5', RPC_SOAK_INTERVAL_MS: '5000' },
     { RPC_SOAK_DURATION_SECONDS: '3600', RPC_SOAK_INTERVAL_MS: '250' },
   ]) {
     assert.throws(() => parseRpcSoakOptions(environment), TypeError);
@@ -74,8 +75,11 @@ function fakeReport(verdict: RpcSoakReport['verdict']): RpcSoakReport {
     schemaVersion: 'rpc-soak.v1',
     startedAtMs: 1,
     completedAtMs: 2,
+    deadlineAtMs: 5_001,
+    deadlineExceeded: false,
     configuredDurationMs: 5_000,
     intervalMs: 2_500,
+    plannedSampleCount: 2,
     sampleCount: 3,
     http: {
       attempted: 3,
@@ -83,6 +87,7 @@ function fakeReport(verdict: RpcSoakReport['verdict']): RpcSoakReport {
       failed: 0,
       rateLimited: 0,
       failuresByCode: {
+        RPC_DEADLINE_EXCEEDED: 0,
         RPC_RATE_LIMITED: 0,
         RPC_REQUEST_FAILED: 0,
         RPC_RESPONSE_INVALID: 0,
@@ -93,6 +98,7 @@ function fakeReport(verdict: RpcSoakReport['verdict']): RpcSoakReport {
     },
     websocket: {
       subscriptionState: 'ESTABLISHED',
+      healthState: 'HEALTHY',
       cleanupState: 'COMPLETED',
       observations: 2,
       pumpfunObservations: 1,

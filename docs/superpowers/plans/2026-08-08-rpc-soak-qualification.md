@@ -6,7 +6,7 @@
 
 **Architecture:** A pure soak runner aggregates injected observations into a frozen `rpc-soak.v1` report. Separate HTTP and WebSocket adapters touch the network, while a thin CLI parses bounded environment values and renders one JSON line.
 
-**Tech Stack:** TypeScript strict ESM, Node fetch/test runner, `@solana/web3.js`, canonical Pump program constants.
+**Tech Stack:** TypeScript strict ESM, Node fetch/WebSocket/test runner, canonical Pump program constants.
 
 ---
 
@@ -28,8 +28,8 @@
 - Create: `tests/rpc-soak-transport.test.ts`
 
 - [ ] Write failing HTTP adapter tests for canonical slots, 429, other HTTP failure, invalid JSON-RPC and hostile thrown values.
-- [ ] Write failing WebSocket tests for exactly two canonical program subscriptions, normalized callbacks and complete cleanup.
-- [ ] Implement one-request `getSlot` sampling and the two read-only `onLogs` subscriptions.
+- [ ] Write failing WebSocket tests for exactly two acknowledged canonical program subscriptions, normalized callbacks, disconnect health and complete cleanup.
+- [ ] Implement cancellable `getSlot` sampling and two read-only `logsSubscribe` calls behind one bounded WebSocket session.
 - [ ] Run both focused test files to green.
 
 ### Task 3: CLI and operator contract
