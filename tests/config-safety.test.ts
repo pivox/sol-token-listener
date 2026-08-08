@@ -49,6 +49,25 @@ void test('le seuil de qualification est borné et vaut 60 par défaut', () => {
   );
 });
 
+void test('selects one local qualification profile and validates its fixed status', () => {
+  assert.equal(parseConfig(base).qualificationProfilePath, null);
+  assert.equal(
+    parseConfig({ ...base, QUALIFICATION_PROFILE_PATH: './profile.json' }).qualificationProfilePath,
+    './profile.json',
+  );
+  for (const profilePath of [' ', 'x'.repeat(4_097), 'profile\u0000.json']) {
+    assert.throws(() => parseConfig({ ...base, QUALIFICATION_PROFILE_PATH: profilePath }), /QUALIFICATION_PROFILE_PATH/u);
+  }
+  assert.throws(() => parseConfig({ ...base, QUALIFICATION_RULE_SET_STATUS: 'VALIDATED' }), /QUALIFICATION_RULE_SET_STATUS/u);
+});
+
+void test('the environment example publishes explicit qualification selection defaults', async () => {
+  const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
+  for (const line of ['QUALIFICATION_PROFILE_PATH=', 'QUALIFICATION_MIN_SCORE=60', 'QUALIFICATION_RULE_SET_STATUS=UNVALIDATED_RULE_SET']) {
+    assert.match(source, new RegExp(`^${line}$`, 'mu'));
+  }
+});
+
 void test('l’API publique est activée localement avec des limites sûres par défaut', () => {
   const config = parseConfig(base);
   assert.equal(config.apiEnabled, true);

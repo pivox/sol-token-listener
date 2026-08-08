@@ -8,6 +8,10 @@ import {
   assertValidQualificationFacts,
   type QualificationCalibrationFacts,
 } from '../src/domain/qualification.js';
+import {
+  loadQualificationProfile,
+  parseQualificationProfile,
+} from '../src/qualification/qualification-profile.js';
 
 const canonicalFacts = (): QualificationCalibrationFacts => Object.freeze({
   top1HolderBps: 2_000n,
@@ -217,6 +221,157 @@ void test('rejects pre-initialization mutations of the canonical reason-code reg
 
   assert.equal(result.status, 0, result.stderr);
 });
+
+void test('normalizes, freezes, and canonically fingerprints a complete profile', () => {
+  const first = parseQualificationProfile(freeze(validRawProfile()), null);
+  const reordered = parseQualificationProfile(freeze(reorderedRawProfile()), null);
+  const overridden = parseQualificationProfile(freeze(validRawProfile()), 61);
+
+  assert.match(first.fingerprint, /^[0-9a-f]{64}$/u);
+  assert.equal(reordered.fingerprint, first.fingerprint);
+  assert.notEqual(overridden.fingerprint, first.fingerprint);
+  assert.equal(overridden.minimumTotalScore, 61);
+  assert.equal(Object.isFrozen(first), true);
+  assert.equal(Object.isFrozen(first.rules), true);
+  assert.equal(Object.isFrozen(first.conditionPolicies), true);
+  assert.equal(Object.isFrozen(first.dimensionMaximums), true);
+  assert.equal(Object.isFrozen(first.rules[0]), true);
+  assert.equal(Object.isFrozen(first.conditionPolicies[0]), true);
+});
+
+void test('rejects malformed profile schemas and hostile direct-object shapes', () => {
+  const invalid = [
+    { ...validRawProfile(), extra: true },
+    { ...validRawProfile(), schemaVersion: 2 },
+    { ...validRawProfile(), status: 'VALIDATED' },
+    { ...validRawProfile(), minimumTotalScore: Number.MAX_SAFE_INTEGER + 1 },
+    { ...validRawProfile(), rules: [...validRawProfile().rules, validRawProfile().rules[0]] },
+    { ...validRawProfile(), dimensionMaximums: { preparation: 14, socialAuthenticity: 25, onchainHealth: 60 } },
+    { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.slice(1) },
+    { ...validRawProfile(), conditionPolicies: [...validRawProfile().conditionPolicies, validRawProfile().conditionPolicies[0]] },
+    { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.map((policy) => policy.code === 'STALE_DATA' ? { ...policy, mode: 'BAD' } : policy) },
+    { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.map((policy) => policy.code === 'ROUND_TRIP_LOSS_EXCEEDED' ? { ...policy, maximumRoundTripLossBps: 10_001 } : policy) },
+    { ...validRawProfile(), conditionPolicies: validRawProfile().conditionPolicies.map((policy) => policy.code === 'STALE_DATA' ? { ...policy, maximumTop1Bps: 1 } : policy) },
+    { ...validRawProfile(), rules: validRawProfile().rules.map((rule, index) => index === 0 ? { ...rule, message: '' } : rule) },
+  ];
+  for (const profile of invalid) assert.throws(() => parseQualificationProfile(freeze(profile), null), /PROFILE_SCHEMA_INVALID/u);
+
+  let accessorRead = false;
+  const accessor = Object.freeze(Object.defineProperty(validRawProfile(), 'id', {
+    enumerable: true,
+    get(): string { accessorRead = true; return 'pumpfun-v1-initial'; },
+  }));
+  assert.throws(() => parseQualificationProfile(accessor, null), /PROFILE_SCHEMA_INVALID/u);
+  assert.equal(accessorRead, false);
+  assert.throws(() => parseQualificationProfile(validRawProfile(), null), /PROFILE_SCHEMA_INVALID/u);
+  const proxy = new Proxy(freeze(validRawProfile()), hostileProxyHandler(() => { throw new Error('trap'); }));
+  assert.throws(() => parseQualificationProfile(proxy, null), /PROFILE_SCHEMA_INVALID/u);
+});
+
+void test('loads default and custom profiles with bounded, redacted failures', () => {
+  const defaultProfile = loadQualificationProfile({ profilePath: null, minimumScoreOverride: null });
+  assert.equal(defaultProfile.id, 'pumpfun-v1-initial');
+  const customProfile = loadQualificationProfile({
+    profilePath: './profile.json',
+    minimumScoreOverride: null,
+    workingDirectory: '/safe',
+    readFile: () => Buffer.from(JSON.stringify(validRawProfile())),
+  });
+  assert.equal(customProfile.id, 'pumpfun-v1-initial');
+  for (const readFile of [
+    () => Buffer.alloc(65_537),
+    () => Buffer.from('{'),
+    () => { throw new Error('secret /custom/path'); },
+  ]) {
+    assert.throws(
+      () => loadQualificationProfile({ profilePath: './profile.json', minimumScoreOverride: null, readFile }),
+      (error: unknown) => error instanceof Error && /^(PROFILE_TOO_LARGE|PROFILE_JSON_INVALID|PROFILE_READ_FAILED)$/u.test(error.message) && !error.message.includes('secret'),
+    );
+  }
+});
+
+interface RawRule {
+  readonly signal: string;
+  readonly dimension: string;
+  readonly weight: number;
+  readonly required: boolean;
+  readonly message: string;
+}
+
+interface RawPolicy {
+  readonly code: string;
+  readonly mode: string;
+  readonly maximumTop1Bps: number | null;
+  readonly maximumTop5Bps: number | null;
+  readonly maximumTop10Bps: number | null;
+  readonly maximumClusterBps: number | null;
+  readonly minimumSharedFunders: number | null;
+  readonly maximumRoundTripLossBps: number | null;
+}
+
+interface RawProfile {
+  readonly schemaVersion: number;
+  readonly id: string;
+  readonly version: number;
+  readonly status: string;
+  readonly minimumTotalScore: number;
+  readonly dimensionMaximums: { readonly preparation: number; readonly socialAuthenticity: number; readonly onchainHealth: number };
+  readonly rules: readonly RawRule[];
+  readonly conditionPolicies: readonly RawPolicy[];
+}
+
+function validRawProfile(): RawProfile {
+  return {
+    schemaVersion: 1,
+    id: 'pumpfun-v1-initial',
+    version: 1,
+    status: 'UNVALIDATED_RULE_SET',
+    minimumTotalScore: 60,
+    dimensionMaximums: { preparation: 15, socialAuthenticity: 25, onchainHealth: 60 },
+    rules: [
+      { signal: 'imageValid', dimension: 'preparation', weight: 15, required: true, message: 'Image is valid.' },
+      { signal: 'socialCrossLinkConfirmed', dimension: 'socialAuthenticity', weight: 25, required: true, message: 'Social cross-link is confirmed.' },
+      { signal: 'creatorHasNotSold', dimension: 'onchainHealth', weight: 20, required: true, message: 'Creator has not sold.' },
+      { signal: 'reverseQuoteAvailable', dimension: 'onchainHealth', weight: 20, required: false, message: 'Reverse quote is available.' },
+      { signal: 'externalBuyersObserved', dimension: 'onchainHealth', weight: 20, required: false, message: 'External buyers are observed.' },
+    ],
+    conditionPolicies: QUALIFICATION_REASON_CODES.map((code) => ({
+      code,
+      mode: code === 'CREATOR_REPEAT_DUMPER' ? 'DISABLED' : [
+        'MINT_SOCIAL_MISMATCH', 'IMPERSONATION_SUSPECTED', 'HOLDER_CONCENTRATION_EXCEEDED',
+        'RELATED_WALLET_CLUSTER_EXCEEDED', 'SHARED_FUNDER_CLUSTER', 'METADATA_FETCH_FAILED',
+      ].includes(code) ? 'REPORT_ONLY' : 'ENFORCED',
+      maximumTop1Bps: null,
+      maximumTop5Bps: null,
+      maximumTop10Bps: null,
+      maximumClusterBps: null,
+      minimumSharedFunders: code === 'SHARED_FUNDER_CLUSTER' ? 1 : null,
+      maximumRoundTripLossBps: code === 'ROUND_TRIP_LOSS_EXCEEDED' ? 3000 : null,
+    })),
+  };
+}
+
+function reorderedRawProfile(): RawProfile {
+  const source = validRawProfile();
+  return {
+    conditionPolicies: [...source.conditionPolicies].reverse().map((policy) => ({ ...policy })),
+    rules: [...source.rules].reverse().map((rule) => ({ ...rule })),
+    dimensionMaximums: { onchainHealth: 60, preparation: 15, socialAuthenticity: 25 },
+    minimumTotalScore: 60,
+    status: 'UNVALIDATED_RULE_SET',
+    version: 1,
+    id: 'pumpfun-v1-initial',
+    schemaVersion: 1,
+  };
+}
+
+function freeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object') {
+    for (const child of Object.values(value)) freeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
 
 function hostileProxyHandler(onTrap: () => void): ProxyHandler<object> {
   const trap = (): never => {

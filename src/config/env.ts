@@ -19,6 +19,7 @@ export interface AppConfig {
   readonly autoMigrate: boolean;
   readonly executionMode: ExecutionMode;
   readonly paperQuoteMintAllowlist: readonly string[];
+  readonly qualificationProfilePath: string | null;
   readonly qualificationRuleSetStatus: QualificationRuleSetStatus;
   readonly qualificationMinimumScore: number;
   readonly dataRetentionHours: number;
@@ -125,7 +126,8 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     autoMigrate: parseBoolean(environment.POSTGRES_AUTO_MIGRATE, false, 'POSTGRES_AUTO_MIGRATE'),
     executionMode,
     paperQuoteMintAllowlist,
-    qualificationRuleSetStatus: 'UNVALIDATED_RULE_SET',
+    qualificationProfilePath: parseQualificationProfilePath(environment.QUALIFICATION_PROFILE_PATH),
+    qualificationRuleSetStatus: parseQualificationRuleSetStatus(environment.QUALIFICATION_RULE_SET_STATUS),
     qualificationMinimumScore: parseInteger(
       environment.QUALIFICATION_MIN_SCORE,
       60,
@@ -234,6 +236,24 @@ function parseExecutionMode(raw: string | undefined): ExecutionMode {
     throw new Error('EXECUTION_MODE must be observe or paper in Pump.fun V1.');
   }
   return value;
+}
+
+function parseQualificationProfilePath(raw: string | undefined): string | null {
+  if (raw === undefined || raw.length === 0) return null;
+  if (
+    raw !== raw.trim()
+    || Buffer.byteLength(raw, 'utf8') > 4_096
+    || raw.includes('\0')
+  ) throw new Error('QUALIFICATION_PROFILE_PATH must be a non-empty safe local path of at most 4096 bytes.');
+  return raw;
+}
+
+function parseQualificationRuleSetStatus(raw: string | undefined): QualificationRuleSetStatus {
+  if (raw === undefined || raw.length === 0) return 'UNVALIDATED_RULE_SET';
+  if (raw !== 'UNVALIDATED_RULE_SET') {
+    throw new Error('QUALIFICATION_RULE_SET_STATUS must be UNVALIDATED_RULE_SET.');
+  }
+  return raw;
 }
 
 function rejectPrivateKeyConfiguration(environment: NodeJS.ProcessEnv | Record<string, string | undefined>): void {
