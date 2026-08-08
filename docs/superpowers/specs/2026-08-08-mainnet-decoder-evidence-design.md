@@ -83,7 +83,9 @@ program identity, quote asset resolution and migration-to-pool matching.
 an explicit operator command. It is never imported by the listener or API.
 It uses the standard `SOLANA_HTTP_RPC_URL`, derives a WebSocket URL only for
 the existing RPC configuration shape, fetches one finalized transaction,
-normalizes it and writes one new file under the selected family directory.
+locates its signature exactly once in the finalized block, rejects a supplied
+index that differs from that position, then normalizes and writes one new file
+under the selected family directory.
 
 The command prints only the family and output filename. It never prints the
 endpoint, signature, raw transaction or provider error. Capturing data does

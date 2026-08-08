@@ -130,9 +130,10 @@ Une nouvelle preuve peut être capturée explicitement, jamais au démarrage :
 npm run fixture:capture -- pumpswap <signature> <transactionIndex> <nom.json>
 ```
 
-La commande exige `SOLANA_HTTP_RPC_URL`, une transaction `FINALIZED`, un nom
-inédit et un décodage sans erreur avant l’écriture. Elle n’écrase aucun fichier
-et sa sortie ne révèle ni endpoint ni contenu de transaction.
+La commande exige `SOLANA_HTTP_RPC_URL`, une transaction `FINALIZED`, un index
+retrouvé et vérifié dans les signatures de son bloc, un nom inédit et un
+décodage sans erreur avant l’écriture. Elle n’écrase aucun fichier et sa sortie
+ne révèle ni endpoint ni contenu de transaction.
 
 ## Analytics participants et graphe observé
 

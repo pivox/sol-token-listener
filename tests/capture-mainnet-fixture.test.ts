@@ -76,4 +76,9 @@ void test('capture source remains opt-in and contains no signing or submission c
   const source = await readFile(new URL('../scripts/capture-fixture.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /private.?key|sendTransaction|signTransaction|simulateTransaction/iu);
   assert.match(source, /FINALIZED/u);
+  assert.match(source, /new SolanaTransactionLocator\(client\)/u);
+  assert.doesNotMatch(
+    source,
+    /fetch\(\s*args\.signature,\s*'FINALIZED',\s*args\.transactionIndex\s*,?\s*\)/su,
+  );
 });

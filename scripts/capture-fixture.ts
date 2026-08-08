@@ -6,6 +6,7 @@ import { decodePumpTransaction } from '../src/launchpads/pumpfun/transaction-dec
 import { decodePumpSwapTransaction } from '../src/markets/pumpswap/transaction-decoder.js';
 import { SolanaRpcClient } from '../src/solana/rpc/rpc-client.js';
 import { TransactionFetcher } from '../src/solana/rpc/transaction-fetcher.js';
+import { SolanaTransactionLocator } from '../src/solana/rpc/transaction-locator.js';
 import type {
   NormalizedInstruction,
   NormalizedTokenBalance,
@@ -184,12 +185,21 @@ async function main(): Promise<void> {
     commitment: 'finalized',
     finality: 'finalized',
   });
-  const transaction = await new TransactionFetcher(client).fetch(
+  const candidate = await new TransactionFetcher(client).fetch(
     args.signature,
     'FINALIZED',
-    args.transactionIndex,
+    null,
   );
-  if (transaction?.signature !== args.signature
+  if (candidate?.signature !== args.signature
+    || candidate.confirmationStatus !== 'FINALIZED') {
+    throw new TypeError('Fixture transaction could not be finalized.');
+  }
+  const transaction = await new SolanaTransactionLocator(client).locate(Object.freeze({
+    signature: args.signature,
+    slot: candidate.slot,
+    confirmationStatus: 'FINALIZED',
+  }));
+  if (transaction.signature !== args.signature
     || transaction.transactionIndex !== args.transactionIndex
     || transaction.confirmationStatus !== 'FINALIZED') {
     throw new TypeError('Fixture transaction could not be finalized.');
