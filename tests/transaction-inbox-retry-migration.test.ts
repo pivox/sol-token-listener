@@ -25,6 +25,11 @@ void test('adds durable bounded retry cycles, exhaustion, recovery audit and hea
   ]) assert.ok(sql.includes(fragment), `missing migration fragment: ${fragment}`);
   assert.match(sql, /purge_after = terminal_at \+ INTERVAL '4 hours'/u);
   assert.match(sql, /processing_status = 'FAILED'[\s\S]*retry_exhausted_at IS NOT NULL/u);
+  const claimOrderIndex = /DROP INDEX IF EXISTS chain_transaction_inbox_claim_order_idx;[\s\S]*?CREATE INDEX chain_transaction_inbox_claim_order_idx[\s\S]*?;/u
+    .exec(sql)?.[0] ?? '';
+  assert.match(claimOrderIndex, /processing_status = 'PENDING'/u);
+  assert.match(claimOrderIndex, /processing_status = 'PROCESSING'/u);
+  assert.match(claimOrderIndex, /processing_status = 'FAILED'[\s\S]*error_retryable = TRUE[\s\S]*retry_exhausted_at IS NULL/u);
   assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
   assert.doesNotMatch(sql, /private[_ ]?key|keypair|send[_ ]?transaction/iu);
   assert.doesNotMatch(sql, /DROP TABLE/iu);

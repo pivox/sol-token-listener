@@ -171,6 +171,17 @@ CREATE TABLE IF NOT EXISTS transaction_inbox_recoveries (
   CHECK (recovered_at >= exhausted_at)
 );
 
+DROP INDEX IF EXISTS chain_transaction_inbox_claim_order_idx;
+CREATE INDEX chain_transaction_inbox_claim_order_idx
+  ON chain_transaction_inbox (observed_slot, signature)
+  WHERE processing_status = 'PENDING'
+     OR processing_status = 'PROCESSING'
+     OR (
+       processing_status = 'FAILED'
+       AND error_retryable = TRUE
+       AND retry_exhausted_at IS NULL
+     );
+
 DROP INDEX IF EXISTS chain_transaction_inbox_retry_idx;
 CREATE INDEX chain_transaction_inbox_retry_idx
   ON chain_transaction_inbox (next_attempt_at, observed_slot, signature)
