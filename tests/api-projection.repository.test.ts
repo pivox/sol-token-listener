@@ -14,7 +14,7 @@ import {
 import { toJsonValue } from '../src/utils/json.js';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
 import {
-  defaultQualificationRuleSet,
+  createDefaultQualificationRuleSet,
   QualificationEngine,
 } from '../src/qualification/qualification-engine.js';
 
@@ -1066,7 +1066,7 @@ void test('rejects hostile qualification payload descriptors and proxies without
 });
 
 void test('projects complete engine evidence from calibrated and legacy persisted reports', async () => {
-  const report = new QualificationEngine(defaultQualificationRuleSet).evaluate({
+  const report = new QualificationEngine(createDefaultQualificationRuleSet(60)).evaluate({
     evaluatedAtMs: detectedAt.getTime(), signals: {}, blockers: [], calibrationFacts: null,
   });
   const calibrated = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;

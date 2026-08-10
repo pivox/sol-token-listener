@@ -23,8 +23,6 @@ import {
 } from './qualification-profile.js';
 import { evaluateQualificationConditions } from './qualification-policy-evaluator.js';
 
-export const defaultQualificationRuleSet = createDefaultQualificationRuleSet(60);
-
 export function createDefaultQualificationRuleSet(minimumTotalScore: number): EffectiveQualificationProfile {
   return loadQualificationProfile({ profilePath: null, minimumScoreOverride: minimumTotalScore });
 }

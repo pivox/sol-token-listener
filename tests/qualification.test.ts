@@ -1,16 +1,20 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import {
   createQualificationEngine,
   QualificationEngine,
   createDefaultQualificationRuleSet,
-  defaultQualificationRuleSet,
 } from '../src/qualification/qualification-engine.js';
 import { parseConfig } from '../src/config/env.js';
 import type { QualificationCalibrationFacts } from '../src/domain/qualification.js';
 import type { QualificationReasonCode } from '../src/domain/qualification-reasons.js';
 import { parseQualificationProfile } from '../src/qualification/qualification-profile.js';
+
+const defaultQualificationRuleSet = createDefaultQualificationRuleSet(60);
 
 function noCalibrationFacts(): QualificationCalibrationFacts {
   return Object.freeze({
@@ -65,6 +69,83 @@ function completeInput() {
     calibrationFacts: null,
   };
 }
+
+void test('imports the qualification engine without reading the bundled profile', () => {
+  const script = `
+    import { createRequire, syncBuiltinESMExports } from 'node:module';
+    const require = createRequire(import.meta.url);
+    const fileSystem = require('node:fs');
+    const originalOpenSync = fileSystem.openSync;
+    let bundledOpenCount = 0;
+    fileSystem.openSync = (...arguments_) => {
+      if (String(arguments_[0]).includes('/config/qualification/pumpfun-v1-unvalidated.json')) bundledOpenCount += 1;
+      return originalOpenSync(...arguments_);
+    };
+    syncBuiltinESMExports();
+    await import('./src/qualification/qualification-engine.ts');
+    if (bundledOpenCount !== 0) process.exitCode = 1;
+  `;
+  const result = spawnSync(process.execPath, [
+    '--import',
+    'tsx',
+    '--input-type=module',
+    '--eval',
+    script,
+  ], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+void test('creates an engine from the selected custom profile without reading the bundled default', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'qualification-engine-selected-profile-'));
+  const customPath = join(directory, 'custom.json');
+  try {
+    const raw = JSON.parse(readFileSync(
+      new URL('../config/qualification/pumpfun-v1-unvalidated.json', import.meta.url),
+      'utf8',
+    )) as { id: string };
+    raw.id = 'selected-custom-profile';
+    writeFileSync(customPath, JSON.stringify(raw));
+    const script = `
+      import { createRequire, syncBuiltinESMExports } from 'node:module';
+      const require = createRequire(import.meta.url);
+      const fileSystem = require('node:fs');
+      const originalOpenSync = fileSystem.openSync;
+      let bundledOpenCount = 0;
+      let customOpenCount = 0;
+      fileSystem.openSync = (...arguments_) => {
+        const openedPath = String(arguments_[0]);
+        if (openedPath.includes('/config/qualification/pumpfun-v1-unvalidated.json')) bundledOpenCount += 1;
+        if (openedPath === ${JSON.stringify(customPath)}) customOpenCount += 1;
+        return originalOpenSync(...arguments_);
+      };
+      syncBuiltinESMExports();
+      const { createQualificationEngine } = await import('./src/qualification/qualification-engine.ts');
+      const engine = createQualificationEngine({
+        qualificationProfilePath: ${JSON.stringify(customPath)},
+        qualificationMinimumScore: null,
+      });
+      if (engine.profileSummary.id !== 'selected-custom-profile' || bundledOpenCount !== 0 || customOpenCount !== 1) process.exitCode = 1;
+    `;
+    const result = spawnSync(process.execPath, [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      script,
+    ], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 void test('rejects hostile qualification input shapes without invoking getters or proxy traps', () => {
   const engine = new QualificationEngine(defaultQualificationRuleSet);

@@ -25,7 +25,7 @@ import type {
   DecodedPumpSwapTransaction,
 } from '../src/markets/pumpswap/types.js';
 import { PaperTradingEngine } from '../src/paper/paper-trading-engine.js';
-import { QualificationEngine, defaultQualificationRuleSet } from '../src/qualification/qualification-engine.js';
+import { createDefaultQualificationRuleSet, QualificationEngine } from '../src/qualification/qualification-engine.js';
 import { SolanaWalletFundingEvidenceExtractor } from '../src/solana/wallet-funding-evidence-extractor.js';
 import type { NormalizedInstruction, NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
@@ -611,7 +611,7 @@ async function insertProcessed(
 }
 
 function openCommand(): OpenPaperPositionCommand {
-  const qualification = new QualificationEngine(defaultQualificationRuleSet).evaluate({
+  const qualification = new QualificationEngine(createDefaultQualificationRuleSet(60)).evaluate({
     evaluatedAtMs: 1,
     signals: { imageValid: true, socialCrossLinkConfirmed: true, creatorHasNotSold: true },
     blockers: [],

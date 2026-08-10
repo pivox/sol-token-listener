@@ -181,9 +181,10 @@ foundation log includes only profile id, version, status, and fingerprint; it
 never logs the selected path or raw JSON.
 
 `createQualificationEngine` receives the effective profile rather than building
-hard-coded rules internally. The default exported rule set remains available to
-existing unit fixtures and is produced from the same validated bundled profile,
-preventing two divergent defaults.
+hard-coded rules internally. Importing the engine module performs no profile or
+filesystem load. Unit fixtures can explicitly call the lazy default-profile
+factory, which uses the same validated bundled profile and prevents two
+divergent defaults.
 
 The production observation pipeline remains unchanged in this PR. Runtime
 assembly and persistence of live `QualificationUpdated` events belong to the

@@ -15,8 +15,8 @@ import type {
 } from '../src/ports/paper-trading-repository.js';
 import { PaperTradingEngine } from '../src/paper/paper-trading-engine.js';
 import {
+  createDefaultQualificationRuleSet,
   QualificationEngine,
-  defaultQualificationRuleSet,
 } from '../src/qualification/qualification-engine.js';
 import { reconcileConfirmationStatus } from '../src/domain/confirmation-status.js';
 import type { ChainConfirmationStatus } from '../src/domain/types.js';
@@ -427,7 +427,7 @@ function makeEngine(
 }
 
 function openCommand(): OpenPaperPositionCommand {
-  const qualification = new QualificationEngine(defaultQualificationRuleSet).evaluate({
+  const qualification = new QualificationEngine(createDefaultQualificationRuleSet(60)).evaluate({
     evaluatedAtMs: 1,
     signals: {
       imageValid: true,
