@@ -307,7 +307,11 @@ function forbiddenModuleSpecifiers(sourceText: string): readonly string[] {
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
-  return specifiers.filter((specifier) => /(?:^|\/)(?:wallet|keypair|signing|submission|transaction-builder|transaction-confirmer|trade-executor)(?:\/|$)/iu.test(specifier));
+  return specifiers.filter((specifier) => /(?:^|\/)(?:wallet|keypair|signing|submission|transaction-builder|transaction-confirmer|trade-executor)(?:\/|$)/iu.test(normalizeModuleSpecifier(specifier)));
+}
+
+function normalizeModuleSpecifier(specifier: string): string {
+  return specifier.replace(/[?#].*$/u, '').replace(/\.(?:js|ts|mjs|cjs|mts|cts)$/iu, '');
 }
 
 function forbiddenExecutableCalls(sourceText: string): readonly string[] {

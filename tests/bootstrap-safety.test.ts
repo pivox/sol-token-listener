@@ -17,6 +17,7 @@ import { QualificationProfileError } from '../src/qualification/qualification-pr
 import { createQualificationEngine as buildQualificationEngine } from '../src/qualification/qualification-engine.js';
 
 const FORBIDDEN_IMPORT_PATHS = /(?:^|\/)(?:wallet|keypair|signing|submission|transaction-builder|transaction-confirmer|trade-executor)(?:\/|$)/iu;
+const MODULE_EXTENSION = /\.(?:js|ts|mjs|cjs|mts|cts)$/iu;
 
 const config = parseConfig({
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
@@ -31,18 +32,19 @@ void test('bootstrap imports no signing, submission, or live execution path', as
 
 void test('bootstrap boundary guard detects dynamic import and export-from execution dependencies', () => {
   const source = [
-    'import type { Wallet } from "execution/wallet";',
-    'export {} from "dex/raydium-cpmm/transaction-builder";',
-    'await import("execution/trade-executor");',
-    'type WalletModule = import("execution/wallet").Wallet;',
-    'import Wallet = require("execution/wallet");',
+    'import type { Wallet } from "../execution/wallet.js";',
+    'export {} from "../dex/raydium-cpmm/transaction-builder.js";',
+    'await import("../execution/keypair.js");',
+    'type SubmissionModule = import("../execution/submission.js").Submission;',
+    'import Wallet = require("../execution/wallet.js");',
+    'import "../execution/wallet-utils.js";',
   ].join('\n');
   assert.deepEqual(forbiddenModuleSpecifiers(source), [
-    'execution/wallet',
-    'dex/raydium-cpmm/transaction-builder',
-    'execution/trade-executor',
-    'execution/wallet',
-    'execution/wallet',
+    '../execution/wallet.js',
+    '../dex/raydium-cpmm/transaction-builder.js',
+    '../execution/keypair.js',
+    '../execution/submission.js',
+    '../execution/wallet.js',
   ]);
   assert.deepEqual(forbiddenExecutableCalls('client.sendTransaction(); signer.signTransaction(); gateway.submit();'), ['sendTransaction', 'signTransaction', 'submit']);
 });
@@ -61,7 +63,11 @@ function forbiddenModuleSpecifiers(sourceText: string): readonly string[] {
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
-  return specifiers.filter((specifier) => FORBIDDEN_IMPORT_PATHS.test(specifier));
+  return specifiers.filter((specifier) => FORBIDDEN_IMPORT_PATHS.test(normalizeModuleSpecifier(specifier)));
+}
+
+function normalizeModuleSpecifier(specifier: string): string {
+  return specifier.replace(/[?#].*$/u, '').replace(MODULE_EXTENSION, '');
 }
 
 function forbiddenExecutableCalls(sourceText: string): readonly string[] {
