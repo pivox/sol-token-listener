@@ -51,6 +51,76 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
+function completeInput() {
+  return {
+    evaluatedAtMs: 1,
+    signals: {
+      imageValid: true,
+      socialCrossLinkConfirmed: true,
+      creatorHasNotSold: true,
+      reverseQuoteAvailable: true,
+      externalBuyersObserved: true,
+    },
+    blockers: [] as QualificationReasonCode[],
+    calibrationFacts: null,
+  };
+}
+
+void test('rejects hostile qualification input shapes without invoking getters or proxy traps', () => {
+  const engine = new QualificationEngine(defaultQualificationRuleSet);
+  let rootGetterReads = 0;
+  const rootAccessor = Object.freeze(Object.defineProperty(completeInput(), 'evaluatedAtMs', {
+    enumerable: true,
+    get(): number { rootGetterReads += 1; return 1; },
+  }));
+  let signalGetterReads = 0;
+  const signalAccessor = Object.freeze(Object.defineProperty({ ...completeInput().signals }, 'imageValid', {
+    enumerable: true,
+    get(): boolean { signalGetterReads += 1; return true; },
+  }));
+  let proxyTraps = 0;
+  const signalsProxy = new Proxy({}, {
+    get() { proxyTraps += 1; throw new Error('must not read proxy'); },
+    getOwnPropertyDescriptor() { proxyTraps += 1; throw new Error('must not inspect proxy'); },
+    ownKeys() { proxyTraps += 1; throw new Error('must not enumerate proxy'); },
+  });
+
+  assert.throws(() => engine.evaluate(rootAccessor as unknown as ReturnType<typeof completeInput>));
+  assert.throws(() => engine.evaluate({ ...completeInput(), signals: signalAccessor }));
+  assert.throws(() => engine.evaluate({ ...completeInput(), signals: signalsProxy }));
+  assert.equal(rootGetterReads, 0);
+  assert.equal(signalGetterReads, 0);
+  assert.equal(proxyTraps, 0);
+});
+
+void test('rejects inherited, unknown, and non-boolean qualification signals before scoring', () => {
+  const engine = new QualificationEngine(defaultQualificationRuleSet);
+  const inherited = Object.create({ imageValid: true }) as Record<string, boolean>;
+  inherited.socialCrossLinkConfirmed = true;
+  inherited.creatorHasNotSold = true;
+  assert.throws(() => engine.evaluate({ ...completeInput(), signals: inherited }));
+  assert.throws(() => engine.evaluate({
+    ...completeInput(),
+    signals: { ...completeInput().signals, unexpected: true } as Record<string, boolean>,
+  }));
+  assert.throws(() => engine.evaluate({
+    ...completeInput(),
+    signals: { ...completeInput().signals, imageValid: 'true' as unknown as boolean },
+  }));
+});
+
+void test('uses an immutable qualification input snapshot', () => {
+  const engine = new QualificationEngine(defaultQualificationRuleSet);
+  const input = completeInput();
+  const report = engine.evaluate(input);
+  input.signals.imageValid = false;
+  input.blockers.push('STALE_DATA');
+
+  assert.equal(report.verdict, 'QUALIFIED');
+  assert.equal(report.scores.total.score, 100);
+  assert.equal(report.blockers.length, 0);
+});
+
 void test('qualifie un lancement dont les trois dimensions atteignent le seuil', () => {
   const report = new QualificationEngine(defaultQualificationRuleSet).evaluate({
     evaluatedAtMs: 1,

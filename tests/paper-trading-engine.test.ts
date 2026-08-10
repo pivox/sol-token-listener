@@ -261,6 +261,29 @@ void test('binds the profile fingerprint and calibrated condition evidence into 
   assert.equal(conditionRepository.writeCount, 1);
 });
 
+void test('replays calibrated condition maps with a different key order', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = openCommand();
+  const first = await engine.open(command);
+  const replay = await engine.open({
+    ...command,
+    qualification: {
+      ...command.qualification,
+      conditions: command.qualification.conditions.map((item) => item.code === 'HOLDER_CONCENTRATION_EXCEEDED'
+        ? {
+          ...item,
+          observed: reverseRecord(item.observed),
+          thresholds: reverseRecord(item.thresholds),
+        }
+        : item),
+    },
+  });
+
+  assert.equal(replay.id, first.id);
+  assert.equal(repository.writeCount, 1);
+});
+
 void test('ferme entièrement et calcule le PnL conservateur', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
@@ -414,6 +437,12 @@ function hasCode(code: string): (error: unknown) => boolean {
     && 'code' in error
     && error.code === code
   );
+}
+
+function reverseRecord<T extends bigint | number | boolean | null>(
+  record: Readonly<Record<string, T>>,
+): Record<string, T> {
+  return Object.fromEntries(Object.entries(record).reverse()) as Record<string, T>;
 }
 
 class MemoryPaperRepository implements PaperTradingRepository {

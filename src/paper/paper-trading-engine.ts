@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import type { AppConfig } from '../config/env.js';
 import type { DomainEvent } from '../domain/events.js';
 import { assertValidChainCursor } from '../domain/cursor.js';
@@ -389,8 +390,8 @@ function snapshotQualification(report: QualificationReport): QualificationReport
       code: item.code,
       mode: item.mode,
       status: item.status,
-      observed: freeze({ ...item.observed }),
-      thresholds: freeze({ ...item.thresholds }),
+      observed: snapshotConditionRecord(item.observed, isObservedConditionValue),
+      thresholds: snapshotConditionRecord(item.thresholds, isThresholdConditionValue),
       message: item.message,
     }))),
     blockers: freeze(report.blockers.map((item) => freeze({
@@ -400,6 +401,41 @@ function snapshotQualification(report: QualificationReport): QualificationReport
     verdict: report.verdict,
     evaluatedAtMs: report.evaluatedAtMs,
   });
+}
+
+function snapshotConditionRecord<T>(
+  value: unknown,
+  validValue: (candidate: unknown) => candidate is T,
+): Readonly<Record<string, T>> {
+  if (
+    typeof value !== 'object'
+    || value === null
+    || Array.isArray(value)
+    || isProxy(value)
+  ) throw new TypeError('Qualification condition records must be plain objects.');
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null || Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new TypeError('Qualification condition records must be plain objects.');
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Object.getOwnPropertyNames(value).sort();
+  const result = Object.create(null) as Record<string, T>;
+  for (const key of keys) {
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable || !validValue(descriptor.value)) {
+      throw new TypeError('Qualification condition records must contain enumerable data values.');
+    }
+    result[key] = descriptor.value;
+  }
+  return freeze(result);
+}
+
+function isObservedConditionValue(value: unknown): value is bigint | number | boolean | null {
+  return value === null || typeof value === 'bigint' || typeof value === 'number' || typeof value === 'boolean';
+}
+
+function isThresholdConditionValue(value: unknown): value is bigint | number | null {
+  return value === null || typeof value === 'bigint' || typeof value === 'number';
 }
 
 function snapshotTrigger(trigger: DomainEvent): DomainEvent {

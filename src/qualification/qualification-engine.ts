@@ -1,4 +1,6 @@
 import {
+  QUALIFICATION_SIGNAL_KEYS,
+  assertValidQualificationFacts,
   type EffectiveQualificationProfile,
   type QualificationBlocker,
   type QualificationCalibrationFacts,
@@ -13,6 +15,7 @@ import {
 } from '../domain/qualification.js';
 import { QUALIFICATION_REASON_CODES, type QualificationReasonCode } from '../domain/qualification-reasons.js';
 import { assertValidTimestampMs } from '../domain/timestamp.js';
+import { isProxy } from 'node:util/types';
 import type { AppConfig } from '../config/env.js';
 import {
   assertValidEffectiveQualificationProfile,
@@ -75,13 +78,14 @@ export class QualificationEngine {
   }
 
   public evaluate(input: QualificationEvaluationInput): QualificationReport {
-    assertValidTimestampMs('evaluatedAtMs', input.evaluatedAtMs);
-    const evidence = this.profile.rules.map((ruleDefinition) => evidenceFor(ruleDefinition, input));
+    const snapshot = snapshotEvaluationInput(input);
+    assertValidTimestampMs('evaluatedAtMs', snapshot.evaluatedAtMs);
+    const evidence = this.profile.rules.map((ruleDefinition) => evidenceFor(ruleDefinition, snapshot.signals));
     const scores = calculateScores(evidence, this.profile.dimensionMaximums);
     const evaluatedConditions = evaluateQualificationConditions(
       this.profile,
-      input.calibrationFacts ?? noCalibrationFacts(),
-      legacyBlockers(input.blockers),
+      snapshot.calibrationFacts ?? noCalibrationFacts(),
+      snapshot.blockers,
     );
     const blockers = createBlockers(evaluatedConditions.blockers);
     const missingRequiredEvidence = evidence.some((item) => item.required && item.status !== 'SATISFIED');
@@ -103,7 +107,7 @@ export class QualificationEngine {
       conditions: evaluatedConditions.conditions,
       blockers: freeze(blockers),
       verdict,
-      evaluatedAtMs: input.evaluatedAtMs,
+      evaluatedAtMs: snapshot.evaluatedAtMs,
     });
   }
 }
@@ -122,8 +126,11 @@ function snapshotProfile(profile: EffectiveQualificationProfile): EffectiveQuali
   });
 }
 
-function evidenceFor(ruleDefinition: QualificationRule, input: QualificationEvaluationInput): QualificationEvidence {
-  const value = input.signals[ruleDefinition.signal];
+function evidenceFor(
+  ruleDefinition: QualificationRule,
+  signals: Readonly<Partial<Record<QualificationRule['signal'], boolean>>>,
+): QualificationEvidence {
+  const value = signals[ruleDefinition.signal];
   const status: QualificationEvidenceStatus = value === true
     ? 'SATISFIED'
     : value === false
@@ -164,10 +171,6 @@ function score(value: number, maximum: number): QualificationScore {
   return freeze({ score: value, maximum });
 }
 
-function legacyBlockers(codes: readonly QualificationReasonCode[]): readonly QualificationReasonCode[] {
-  return freeze([...codes]);
-}
-
 function createBlockers(codes: readonly QualificationReasonCode[]): readonly QualificationBlocker[] {
   const uniqueCodes = [...new Set(codes)];
   for (const code of uniqueCodes) {
@@ -193,6 +196,100 @@ const EMPTY_CALIBRATION_FACTS: QualificationCalibrationFacts = freeze({
   roundTripLossBps: null,
   upstreamConditions: freeze([]),
 });
+
+type QualificationInputSnapshot = Readonly<{
+  evaluatedAtMs: number;
+  signals: Readonly<Partial<Record<QualificationRule['signal'], boolean>>>;
+  blockers: readonly QualificationReasonCode[];
+  calibrationFacts: QualificationCalibrationFacts | null;
+}>;
+
+const INPUT_FIELDS = ['evaluatedAtMs', 'signals', 'blockers', 'calibrationFacts'] as const;
+const SIGNAL_KEY_SET: ReadonlySet<string> = new Set(QUALIFICATION_SIGNAL_KEYS);
+const REASON_CODE_SET: ReadonlySet<string> = new Set(QUALIFICATION_REASON_CODES);
+
+function snapshotEvaluationInput(input: QualificationEvaluationInput): QualificationInputSnapshot {
+  const fields = exactDataObject(input, INPUT_FIELDS, 'Qualification evaluation input');
+  const evaluatedAtMs = fields.evaluatedAtMs;
+  if (typeof evaluatedAtMs !== 'number') throw new TypeError('Qualification evaluatedAtMs must be a number.');
+  const signals = snapshotSignals(fields.signals);
+  const blockers = snapshotBlockers(fields.blockers);
+  const calibrationFacts = snapshotCalibrationFacts(fields.calibrationFacts);
+  return freeze({ evaluatedAtMs, signals, blockers, calibrationFacts });
+}
+
+function snapshotSignals(value: unknown): Readonly<Partial<Record<QualificationRule['signal'], boolean>>> {
+  const fields = dataObjectFields(value, 'Qualification signals');
+  const result = Object.create(null) as Partial<Record<QualificationRule['signal'], boolean>>;
+  for (const [key, signal] of Object.entries(fields)) {
+    if (!SIGNAL_KEY_SET.has(key) || typeof signal !== 'boolean') {
+      throw new TypeError('Qualification signals must contain known boolean values.');
+    }
+    result[key as QualificationRule['signal']] = signal;
+  }
+  return freeze(result);
+}
+
+function snapshotBlockers(value: unknown): readonly QualificationReasonCode[] {
+  if (!Array.isArray(value) || isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new TypeError('Qualification blockers must be a standard array.');
+  }
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new TypeError('Qualification blockers must not contain symbols.');
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor) || typeof lengthDescriptor.value !== 'number' || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0 || lengthDescriptor.value > QUALIFICATION_REASON_CODES.length) {
+    throw new TypeError('Qualification blockers must be bounded.');
+  }
+  const length = lengthDescriptor.value;
+  const names = Object.getOwnPropertyNames(value);
+  if (names.length !== length + 1) throw new TypeError('Qualification blockers must be dense.');
+  const blockers: QualificationReasonCode[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable || typeof descriptor.value !== 'string' || !REASON_CODE_SET.has(descriptor.value)) {
+      throw new TypeError('Qualification blocker is invalid.');
+    }
+    blockers.push(descriptor.value as QualificationReasonCode);
+  }
+  return freeze(blockers);
+}
+
+function snapshotCalibrationFacts(value: unknown): QualificationCalibrationFacts | null {
+  if (value === null) return null;
+  assertValidQualificationFacts(value as QualificationCalibrationFacts);
+  return value as QualificationCalibrationFacts;
+}
+
+function exactDataObject(value: unknown, fields: readonly string[], name: string): Record<string, unknown> {
+  const entries = dataObjectFields(value, name);
+  const keys = Object.keys(entries);
+  if (keys.length !== fields.length || fields.some((field) => !Object.hasOwn(entries, field))) {
+    throw new TypeError(`${name} must contain exactly the required fields.`);
+  }
+  return entries;
+}
+
+function dataObjectFields(value: unknown, name: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value)) {
+    throw new TypeError(`${name} must be a plain object.`);
+  }
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`${name} must be a plain object.`);
+  if (Object.getOwnPropertySymbols(value).length !== 0) throw new TypeError(`${name} must not contain symbols.`);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const names = Object.getOwnPropertyNames(value);
+  const fields = Object.create(null) as Record<string, unknown>;
+  for (const key of names) {
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) {
+      throw new TypeError(`${name} must contain enumerable data fields.`);
+    }
+    fields[key] = descriptor.value;
+  }
+  return fields;
+}
 
 function freeze<T>(value: T): T {
   if (typeof value === 'object' && value !== null) Object.freeze(value);
