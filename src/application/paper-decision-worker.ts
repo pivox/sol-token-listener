@@ -73,7 +73,9 @@ interface CandidateBuilder {
 interface StrategyActions {
   prepare: ValidatedExternalBuysStrategy['prepare'];
   open: ValidatedExternalBuysStrategy['open'];
+  recoverOpen: ValidatedExternalBuysStrategy['recoverOpen'];
   reconcile: ValidatedExternalBuysStrategy['reconcile'];
+  reconcileSource: ValidatedExternalBuysStrategy['reconcileSource'];
 }
 
 const systemScheduler: PaperDecisionWorkerScheduler = Object.freeze({
@@ -166,7 +168,11 @@ export class PaperDecisionWorker {
     if (
       paperEnabled
       && snapshot.currentSession !== null
-      && snapshot.currentSession.state !== 'BUY_PENDING'
+      && (
+        snapshot.asOfEvent.confirmationStatus === 'orphaned'
+        || snapshot.currentSession.state !== 'BUY_PENDING'
+        || snapshot.activePosition !== null
+      )
     ) return this.reconcileExisting(job,lease,snapshot);
 
     const quoteAsset=snapshot.launch.quoteAssets.find((asset) => (
@@ -276,7 +282,13 @@ export class PaperDecisionWorker {
     const candidateResult:TradingCandidateResult=Object.freeze({
       candidate,event:persisted.candidateEvent,
     });
-    if (['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state)) {
+    if (
+      ['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state)
+      && (
+        snapshot.asOfEvent.confirmationStatus !== 'orphaned'
+        || session.state === 'PAPER_RETRACTED'
+      )
+    ) {
       return this.complete(job,lease,decision(
         context,candidateResult,session,sessionEvent(session,persisted.candidateEvent),[],'NONE',
       ));
@@ -301,11 +313,26 @@ export class PaperDecisionWorker {
       );
       if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
       await this.repository.stageDecision(job,staged);
-      reconciled=await this.strategy.reconcile({
-        candidate,session,position:snapshot.activePosition,creator:snapshot.launch.creator,
-        launchTrades:snapshot.activeLaunchTrades,marketTrades:snapshot.activeMarketTrades,
-        nowMs:this.readNow(),
-      });
+      if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
+      if (snapshot.asOfEvent.confirmationStatus === 'orphaned') {
+        reconciled=await this.strategy.reconcileSource({
+          candidate,session,qualification:persisted.report,
+          qualificationEvent:persisted.qualificationEvent,
+          maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
+        });
+      } else if (session.state === 'BUY_PENDING') {
+        reconciled=await this.strategy.recoverOpen({
+          candidate,session,qualification:persisted.report,
+          qualificationEvent:persisted.qualificationEvent,
+          maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
+        });
+      } else {
+        reconciled=await this.strategy.reconcile({
+          candidate,session,position:snapshot.activePosition,creator:snapshot.launch.creator,
+          launchTrades:snapshot.activeLaunchTrades,marketTrades:snapshot.activeMarketTrades,
+          nowMs:this.readNow(),
+        });
+      }
     } catch (error:unknown) {
       const retryable=error instanceof PaperQuoteError&&error.retryable;
       return this.fail(

@@ -101,12 +101,82 @@ void test('keeps an explicit exit-pending state when the sell quote is unavailab
   assert.equal(result.requestedAction, 'NONE');
 });
 
+void test('recovers a committed close without quoting or closing again', async () => {
+  const ledger = new FakeLedger();
+  const router = new FakeRouter();
+  const strategy = new ValidatedExternalBuysStrategy(
+    ledger, router, { retentionMs:14_400_000 },
+  );
+  const candidate = eligibleCandidate();
+  const pending = strategy.prepare(candidate, {
+    externalBuyTarget:1,minimumConfirmation:'confirmed',nowMs:1_000,
+  });
+  assert.ok(pending);
+  const position = Object.freeze({
+    ...POSITION,status:'PAPER_CLOSED' as const,remainingBaseRaw:0n,
+    quoteProceedsRaw:1_100n,grossPnlQuoteRaw:100n,netPnlQuoteRaw:100n,
+    exitTradeId:'exit',closeCommandHash:'close',closedAtMs:2_000,purgeAfterMs:14_402_000,
+  });
+
+  const result = await strategy.reconcile({
+    candidate,session:Object.freeze({
+      ...pending,state:'WAITING_EXTERNAL_BUYS' as const,positionId:POSITION.id,
+    }),position,creator:'creator',launchTrades:[launchBuy('target',2,'wallet')],
+    marketTrades:[],nowMs:3_000,
+  });
+
+  assert.equal(result.session.state, 'PAPER_CLOSED');
+  assert.equal(result.requestedAction, 'NONE');
+  assert.equal(router.requests.length, 0);
+  assert.equal(ledger.closeCalls.length, 0);
+});
+
+void test('reconciles an orphaned entry into a retracted session without another fill', async () => {
+  const ledger = new FakeLedger();
+  ledger.reconcileOpenResult = Object.freeze({
+    ...POSITION,status:'PAPER_RETRACTED' as const,closedAtMs:2_000,purgeAfterMs:14_402_000,
+  });
+  const strategy = new ValidatedExternalBuysStrategy(
+    ledger, new FakeRouter(), { retentionMs:14_400_000 },
+  );
+  const candidate = eligibleCandidate();
+  const pending = strategy.prepare(candidate, {
+    externalBuyTarget:10,minimumConfirmation:'confirmed',nowMs:1_000,
+  });
+  assert.ok(pending);
+  const holding = Object.freeze({
+    ...pending,state:'WAITING_EXTERNAL_BUYS' as const,positionId:POSITION.id,
+  });
+
+  const result = await strategy.reconcileSource({
+    candidate,session:holding,qualification:report(),
+    qualificationEvent:Object.freeze({
+      ...candidateEvent(),confirmationStatus:'orphaned' as const,
+    }),
+    maximumRoundTripLossBps:3_000n,
+  });
+
+  assert.equal(ledger.openCalls.length, 0);
+  assert.equal(ledger.reconcileOpenCalls.length, 1);
+  assert.equal(result.position?.status, 'PAPER_RETRACTED');
+  assert.equal(result.session.state, 'PAPER_RETRACTED');
+  assert.equal(result.session.reasonCode, 'SOURCE_ORPHANED');
+  assert.equal(result.requestedAction, 'NONE');
+});
+
 class FakeLedger {
   public readonly openCalls: OpenPaperPositionCommand[] = [];
+  public readonly reconcileOpenCalls: OpenPaperPositionCommand[] = [];
   public readonly closeCalls: ClosePaperPositionCommand[] = [];
+  public openResult: PaperPosition = POSITION;
+  public reconcileOpenResult: PaperPosition = POSITION;
   public async open(command: OpenPaperPositionCommand): Promise<PaperPosition> {
     this.openCalls.push(command);
-    return POSITION;
+    return this.openResult;
+  }
+  public async reconcileOpen(command: OpenPaperPositionCommand): Promise<PaperPosition> {
+    this.reconcileOpenCalls.push(command);
+    return this.reconcileOpenResult;
   }
   public async close(command: ClosePaperPositionCommand): Promise<PaperPosition> {
     this.closeCalls.push(command);

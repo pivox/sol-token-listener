@@ -176,6 +176,43 @@ export class PaperTradingEngine {
     });
   }
 
+  public async reconcileOpen(command: OpenPaperPositionCommand): Promise<PaperPosition> {
+    this.requirePaperMode();
+    const snapshot = snapshotOpenCommand(
+      command,command.qualification,command.mint,snapshotTrigger(command.trigger),
+    );
+    validateOpenCommand(
+      snapshot,
+      this.config.paperQuoteMintAllowlist,
+      this.qualificationProfile,
+    );
+    const roundTrip = calculateRoundTrip(snapshot.buyQuote, snapshot.reverseSellQuote);
+    validateQualificationExecutionFacts(
+      snapshot.qualification,
+      roundTrip.lossBps,
+      this.qualificationProfile,
+    );
+    if (roundTrip.lossBps > snapshot.maximumRoundTripLossBps) {
+      roundTripLossExceeded(roundTrip.lossBps);
+    }
+    const positionId = hashId('paper_position', [
+      snapshot.mint,
+      snapshot.strategy.id,
+      snapshot.strategy.version,
+      snapshot.trigger.id,
+    ]);
+    const openCommandHashes = hashOpenCommand(snapshot);
+    return this.repository.transact(async (transaction) => {
+      const existing = await transaction.findPosition(positionId);
+      if (existing === null) {
+        throw new PaperTradingError('POSITION_NOT_FOUND', 'Position paper introuvable.');
+      }
+      return this.reconcileOpenReplay(
+        transaction,existing,openCommandHashes,snapshot.trigger,
+      );
+    });
+  }
+
   public async close(command: ClosePaperPositionCommand): Promise<PaperPosition> {
     this.requirePaperMode();
     const snapshot = snapshotCloseCommand(command);

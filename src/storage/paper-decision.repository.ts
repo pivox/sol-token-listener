@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { compareCursors } from '../domain/cursor.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { BondingCurveTradeObservedEventV1 } from '../domain/launchpad-events.js';
 import type { MarketTrade } from '../domain/market.js';
@@ -119,15 +120,18 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       const result = await client.query(`SELECT event.event_id,event.raw_event_id,
         event.confirmation_status FROM domain_events event
         WHERE event.mint=$1 AND event.raw_event_id IS NOT NULL
-          AND event.confirmation_status<>'orphaned'
           AND event.type IN (
             'TokenLaunchDetected','BondingCurveTradeObserved',
             'BondingCurveStateUpdated','BondingCurveCompleted',
             'MigrationObserved','PumpSwapPoolActivated'
           )
+          AND (
+            ($3='orphaned' AND event.signature=$2 AND event.confirmation_status='orphaned')
+            OR ($3<>'orphaned' AND event.confirmation_status<>'orphaned')
+          )
         ORDER BY event.slot DESC,event.transaction_index DESC,
           event.instruction_index DESC,COALESCE(event.inner_instruction_index,-1) DESC,
-          event.event_id DESC LIMIT 1`, [mint]);
+          event.event_id DESC LIMIT 1`, [mint,triggerSignature,triggerConfirmationStatus]);
       const row=result.rows[0];
       if (row !== undefined) {
         const sourceEventId=textField(row,'event_id');
@@ -169,7 +173,8 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         SELECT job.job_id
         FROM paper_decision_jobs job
         JOIN domain_events source ON source.event_id=job.source_event_id
-        WHERE source.confirmation_status <> 'orphaned'
+        WHERE (source.confirmation_status <> 'orphaned'
+            OR job.source_confirmation_status = 'orphaned')
           AND job.attempts_in_cycle < job.max_attempts
           AND (
             job.status='PENDING'
@@ -229,8 +234,8 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         [job.sourceEventId,job.mint],
       );
       const asOfEvent = decodeDomainEvent(requiredRow(sourceResult, 'Source event is missing.'));
-      if (asOfEvent.confirmationStatus === 'orphaned') throw new PaperDecisionLeaseLostError();
-      const launch = await loadLaunch(client, job.mint);
+      const includeOrphaned = asOfEvent.confirmationStatus === 'orphaned';
+      const launch = await loadLaunch(client, job.mint, includeOrphaned);
       const metadata = await latestMetadata(client, job.mint);
       const social = await latestPayload<SocialEvidenceCollectionV1>(client,
         `SELECT payload #> '{collection}' AS payload FROM domain_events
@@ -242,28 +247,14 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       const holderSnapshot = await latestPayload<HolderDistribution>(client,
         'SELECT payload FROM token_holders_snapshots WHERE mint=$1 ORDER BY observed_at DESC,snapshot_id DESC LIMIT 1',job.mint);
       const walletGraph = await latestWalletGraph(client, job.mint);
-      const candidate = await latestPayload<TradingCandidateV1>(client,
-        `SELECT candidate.payload FROM trading_candidates candidate
-          JOIN domain_events source ON source.event_id=candidate.source_event_id
-          WHERE candidate.mint=$1 AND candidate.superseded_at IS NULL
-            AND source.confirmation_status<>'orphaned'
-          ORDER BY candidate.created_at DESC,candidate.candidate_id DESC LIMIT 1`,job.mint);
+      const candidate = await loadCandidate(client, job, includeOrphaned);
       const currentDecision = candidate === null
         ? null
-        : await loadCurrentDecision(client, candidate.id);
-      const session = await latestPayload<PaperStrategySessionV1>(client,
-        `SELECT session.payload FROM paper_strategy_sessions session
-          JOIN domain_events source ON source.event_id=session.source_event_id
-          WHERE session.mint=$1 AND source.confirmation_status<>'orphaned'
-          ORDER BY session.updated_at DESC,session.session_id DESC LIMIT 1`,job.mint);
+        : await loadCurrentDecision(client, candidate.id, includeOrphaned);
+      const session = await loadSession(client, job.mint, candidate, includeOrphaned);
       const launchTrades = await activeLaunchTrades(client, job.mint, session);
       const marketTrades = await activeMarketTrades(client, job.mint, session);
-      const position = await latestPayload<PaperPosition>(client,
-        `SELECT position.payload FROM paper_positions position
-          JOIN domain_events trigger ON trigger.event_id=position.trigger_event_id
-          WHERE position.mint=$1 AND position.status='PAPER_HOLDING'
-            AND trigger.confirmation_status<>'orphaned'
-          ORDER BY position.opened_at DESC,position.position_id DESC LIMIT 1`,job.mint);
+      const position = await loadPosition(client, job.mint, session);
       await client.query('COMMIT');
       return deepFreeze({
         mint: job.mint,asOfEvent,launch,metadata,social,creatorProfile,holderSnapshot,
@@ -430,20 +421,25 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
   if (result.sessionEvent !== null) await insertDomainEvent(client, job, result.sessionEvent);
   const report = result.report;
   const candidate = result.candidate;
-  await client.query(`UPDATE qualification_reports SET superseded_at=$4
-    WHERE mint=$1 AND profile_id=$2 AND profile_version=$3
-      AND report_id<>$5 AND superseded_at IS NULL`, [
-    job.mint,candidate.qualificationProfile.id,candidate.qualificationProfile.version,
-    new Date(report.evaluatedAtMs),candidate.qualificationReportId,
-  ]);
+  const incomingIsCurrent = !await currentProjectionIsNewer(client, candidate);
+  if (incomingIsCurrent) {
+    await client.query(`UPDATE qualification_reports
+      SET superseded_at=GREATEST($4,evaluated_at)
+      WHERE mint=$1 AND profile_id=$2 AND profile_version=$3
+        AND report_id<>$5 AND superseded_at IS NULL`, [
+      job.mint,candidate.qualificationProfile.id,candidate.qualificationProfile.version,
+      new Date(report.evaluatedAtMs),candidate.qualificationReportId,
+    ]);
+  }
+  const reportSupersededAt = incomingIsCurrent ? null : new Date(report.evaluatedAtMs);
   await client.query(`INSERT INTO qualification_reports (
     report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
     profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
     preparation_score,social_score,onchain_score,total_score,as_of_slot,
     as_of_transaction_index,as_of_instruction_index,as_of_inner_instruction_index,
-    confirmation_status,evaluated_at,purge_after,payload_version,payload
+    confirmation_status,evaluated_at,superseded_at,purge_after,payload_version,payload
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-    $19,$20,$21,1,$22) ON CONFLICT (report_id) DO NOTHING`, [
+    $19,$20,$21,$22,1,$23) ON CONFLICT (report_id) DO NOTHING`, [
     candidate.qualificationReportId,job.mint,job.sourceEventId,job.sourceRawEventId,
     result.qualificationEvent.id,candidate.qualificationProfile.id,
     candidate.qualificationProfile.version,candidate.qualificationProfile.fingerprint,
@@ -452,28 +448,33 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
     report.scores.total.score,candidate.asOf.cursor.slot.toString(),
     candidate.asOf.cursor.transactionIndex,candidate.asOf.cursor.instructionIndex,
     candidate.asOf.cursor.innerInstructionIndex,candidate.asOf.confirmationStatus,
-    new Date(report.evaluatedAtMs),new Date(report.evaluatedAtMs + 14_400_000),
-    toJsonValue(report),
+    new Date(report.evaluatedAtMs),reportSupersededAt,
+    new Date(report.evaluatedAtMs + 14_400_000),toJsonValue(report),
   ]);
-  await client.query(`UPDATE trading_candidates SET superseded_at=$4
-    WHERE mint=$1 AND strategy_id=$2 AND strategy_version=$3
-      AND candidate_id<>$5 AND superseded_at IS NULL`, [
-    job.mint,candidate.strategy.id,candidate.strategy.version,
-    new Date(candidate.createdAtMs),candidate.id,
-  ]);
+  if (incomingIsCurrent) {
+    await client.query(`UPDATE trading_candidates
+      SET superseded_at=GREATEST($4,created_at)
+      WHERE mint=$1 AND strategy_id=$2 AND strategy_version=$3
+        AND candidate_id<>$5 AND superseded_at IS NULL`, [
+      job.mint,candidate.strategy.id,candidate.strategy.version,
+      new Date(candidate.createdAtMs),candidate.id,
+    ]);
+  }
+  const candidateSupersededAt = incomingIsCurrent ? null : new Date(candidate.createdAtMs);
   await client.query(`INSERT INTO trading_candidates (
     candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
     strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,quote_decimals,
-    quote_token_program,reason_codes,eligible_until,created_at,purge_after,
+    quote_token_program,reason_codes,eligible_until,created_at,superseded_at,purge_after,
     payload_version,payload
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,1,$18)
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,1,$19)
   ON CONFLICT (candidate_id) DO NOTHING`, [
     candidate.id,job.mint,candidate.qualificationReportId,job.sourceEventId,
     result.candidateEvent.id,candidate.strategy.id,candidate.strategy.version,
     candidate.evidenceFingerprint,candidate.asOf.confirmationStatus,candidate.state,candidate.quoteAsset.mint,
     candidate.quoteAsset.decimals,candidate.quoteAsset.tokenProgram,
     stringifyJson(candidate.reasonCodes),date(candidate.eligibleUntilMs),
-    new Date(candidate.createdAtMs),new Date(candidate.purgeAfterMs),toJsonValue(candidate),
+    new Date(candidate.createdAtMs),candidateSupersededAt,
+    new Date(candidate.purgeAfterMs),toJsonValue(candidate),
   ]);
   if (result.session !== null && result.sessionEvent !== null) {
     await upsertSession(client, job, result.session, result.sessionEvent.id);
@@ -517,6 +518,48 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
       evidence.confirmationStatus,new Date(evidence.observedAtMs),countedBuyPurgeAfter,
       toJsonValue(evidence),
     ]);
+  }
+}
+
+async function currentProjectionIsNewer(
+  client: Client,
+  candidate: TradingCandidateV1,
+): Promise<boolean> {
+  const result = await client.query(`SELECT report_id,as_of_slot,
+    as_of_transaction_index,as_of_instruction_index,as_of_inner_instruction_index,
+    confirmation_status,evaluated_at
+    FROM qualification_reports
+    WHERE mint=$1 AND profile_id=$2 AND profile_version=$3
+      AND superseded_at IS NULL
+    FOR UPDATE`, [
+    candidate.mint,candidate.qualificationProfile.id,candidate.qualificationProfile.version,
+  ]);
+  const row = result.rows[0];
+  if (row === undefined || textField(row,'report_id') === candidate.qualificationReportId) {
+    return false;
+  }
+  const inner = field(row,'as_of_inner_instruction_index');
+  const currentCursor = Object.freeze({
+    slot:BigInt(textField(row,'as_of_slot')),
+    transactionIndex:integerField(row,'as_of_transaction_index'),
+    instructionIndex:integerField(row,'as_of_instruction_index'),
+    innerInstructionIndex:inner === null ? null : integer(inner,'as_of_inner_instruction_index'),
+  });
+  const cursorOrder = compareCursors(currentCursor,candidate.asOf.cursor);
+  if (cursorOrder !== 0) return cursorOrder > 0;
+  const currentStatus = textField(row,'confirmation_status') as ChainConfirmationStatus;
+  const confirmationOrder = confirmationRank(currentStatus)
+    - confirmationRank(candidate.asOf.confirmationStatus);
+  if (confirmationOrder !== 0) return confirmationOrder > 0;
+  return dateField(row,'evaluated_at').getTime() > candidate.createdAtMs;
+}
+
+function confirmationRank(status: ChainConfirmationStatus): number {
+  switch (status) {
+    case 'orphaned': return -1;
+    case 'processed': return 0;
+    case 'confirmed': return 1;
+    case 'finalized': return 2;
   }
 }
 
@@ -643,13 +686,78 @@ async function latestMetadata(client: Client, mint: string): Promise<TokenMetada
   });
 }
 
-async function loadLaunch(client: Client, mint: string): Promise<TokenLaunch> {
+async function loadLaunch(
+  client: Client,
+  mint: string,
+  includeOrphaned: boolean,
+): Promise<TokenLaunch> {
   const result = await client.query(`SELECT * FROM domain_events
-    WHERE mint=$1 AND type='TokenLaunchDetected' AND confirmation_status<>'orphaned'
+    WHERE mint=$1 AND type='TokenLaunchDetected'
+      AND ($2::boolean OR confirmation_status<>'orphaned')
     ORDER BY slot,transaction_index,instruction_index,
-      COALESCE(inner_instruction_index,-1),event_id LIMIT 1`, [mint]);
+      COALESCE(inner_instruction_index,-1),event_id LIMIT 1`, [mint,includeOrphaned]);
   const event = decodeDomainEvent(requiredRow(result, 'Token launch event is missing.'));
   return payloadProperty(event.payload, 'launch') as TokenLaunch;
+}
+
+async function loadCandidate(
+  client: Client,
+  job: ClaimedPaperDecisionJob,
+  includeOrphaned: boolean,
+): Promise<TradingCandidateV1 | null> {
+  const result = includeOrphaned
+    ? await client.query(`SELECT payload FROM trading_candidates
+        WHERE mint=$1 AND source_event_id=$2
+        ORDER BY created_at DESC,candidate_id DESC LIMIT 1`, [job.mint,job.sourceEventId])
+    : await client.query(`SELECT candidate.payload FROM trading_candidates candidate
+        JOIN domain_events source ON source.event_id=candidate.source_event_id
+        WHERE candidate.mint=$1 AND candidate.superseded_at IS NULL
+          AND source.confirmation_status<>'orphaned'
+        ORDER BY candidate.created_at DESC,candidate.candidate_id DESC LIMIT 1`, [job.mint]);
+  const row=result.rows[0];
+  return row === undefined
+    ? null
+    : decoded(field(row,'payload'),'Trading candidate payload is invalid.') as TradingCandidateV1;
+}
+
+async function loadSession(
+  client: Client,
+  mint: string,
+  candidate: TradingCandidateV1 | null,
+  includeOrphaned: boolean,
+): Promise<PaperStrategySessionV1 | null> {
+  const result = includeOrphaned && candidate !== null
+    ? await client.query(`SELECT payload FROM paper_strategy_sessions
+        WHERE mint=$1 AND candidate_id=$2
+        ORDER BY updated_at DESC,session_id DESC LIMIT 1`, [mint,candidate.id])
+    : await client.query(`SELECT session.payload FROM paper_strategy_sessions session
+        JOIN domain_events source ON source.event_id=session.source_event_id
+        WHERE session.mint=$1 AND source.confirmation_status<>'orphaned'
+        ORDER BY session.updated_at DESC,session.session_id DESC LIMIT 1`, [mint]);
+  const row=result.rows[0];
+  return row === undefined
+    ? null
+    : decoded(field(row,'payload'),'Paper strategy session payload is invalid.') as PaperStrategySessionV1;
+}
+
+async function loadPosition(
+  client: Client,
+  mint: string,
+  session: PaperStrategySessionV1 | null,
+): Promise<PaperPosition | null> {
+  const result = session === null
+    ? await client.query(`SELECT position.payload FROM paper_positions position
+        JOIN domain_events trigger ON trigger.event_id=position.trigger_event_id
+        WHERE position.mint=$1 AND position.status='PAPER_HOLDING'
+          AND trigger.confirmation_status<>'orphaned'
+        ORDER BY position.opened_at DESC,position.position_id DESC LIMIT 1`, [mint])
+    : await client.query(`SELECT payload FROM paper_positions
+        WHERE mint=$1 AND strategy_session_id=$2
+        ORDER BY opened_at DESC,position_id DESC LIMIT 1`, [mint,session.id]);
+  const row=result.rows[0];
+  return row === undefined
+    ? null
+    : decoded(field(row,'payload'),'Paper position payload is invalid.') as PaperPosition;
 }
 
 async function latestPayload<T>(client: Client, sql: string, mint: string): Promise<T | null> {
@@ -661,6 +769,7 @@ async function latestPayload<T>(client: Client, sql: string, mint: string): Prom
 async function loadCurrentDecision(
   client: Client,
   candidateId: string,
+  includeOrphaned: boolean,
 ): Promise<PaperDecisionSnapshot['currentDecision']> {
   const result = await client.query(`SELECT report.report_id,report.evidence_fingerprint,
     report.payload AS report_payload,qualification_event.*,
@@ -684,8 +793,10 @@ async function loadCurrentDecision(
     JOIN domain_events qualification_event ON qualification_event.event_id=report.qualification_event_id
     JOIN domain_events candidate_event ON candidate_event.event_id=candidate.candidate_event_id
     WHERE candidate.candidate_id=$1
-      AND qualification_event.confirmation_status<>'orphaned'
-      AND candidate_event.confirmation_status<>'orphaned'`, [candidateId]);
+      AND ($2::boolean OR qualification_event.confirmation_status<>'orphaned')
+      AND ($2::boolean OR candidate_event.confirmation_status<>'orphaned')`, [
+    candidateId,includeOrphaned,
+  ]);
   const row = result.rows[0];
   if (row === undefined) return null;
   return deepFreeze({

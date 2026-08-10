@@ -23,6 +23,7 @@ import { canonicalStringifyJson } from '../utils/json.js';
 
 export interface PaperTradingActions {
   open(command: OpenPaperPositionCommand): Promise<PaperPosition>;
+  reconcileOpen(command: OpenPaperPositionCommand): Promise<PaperPosition>;
   close(command: ClosePaperPositionCommand): Promise<PaperPosition>;
 }
 
@@ -98,6 +99,80 @@ export class ValidatedExternalBuysStrategy {
     return result(updated, [], 'OPEN', position, input.qualificationEvent);
   }
 
+  public async recoverOpen(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV1;
+    qualification: QualificationReport;
+    qualificationEvent: DomainEvent;
+    maximumRoundTripLossBps: bigint;
+  }>): Promise<ExternalBuysStrategyResult> {
+    const { candidate,session } = input;
+    if (
+      session.state !== 'BUY_PENDING'
+      || session.candidateId !== candidate.id
+      || candidate.buyQuote === null
+      || candidate.reverseSellQuote === null
+    ) throw new TypeError('Paper strategy entry recovery is inconsistent.');
+    const position = await this.ledger.reconcileOpen({
+      mint:candidate.mint,quoteAsset:candidate.quoteAsset,strategy:candidate.strategy,
+      trigger:input.qualificationEvent,qualification:input.qualification,
+      buyQuote:candidate.buyQuote,reverseSellQuote:candidate.reverseSellQuote,
+      maximumRoundTripLossBps:input.maximumRoundTripLossBps,
+      strategySessionId:session.id,qualificationReportId:candidate.qualificationReportId,
+      candidateId:candidate.id,
+    });
+    if (position.status !== 'PAPER_HOLDING') {
+      throw new TypeError('Paper strategy entry recovery did not find a holding position.');
+    }
+    const updated = createPaperStrategySession({
+      candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'QUALIFIED_ENTRY',
+      positionId:position.id,entryCursor:session.entryCursor,
+      externalBuyTarget:session.externalBuyTarget,externalBuyCount:0,
+      countedTradeIds:[],lastCountedCursor:null,
+      minimumConfirmation:session.minimumConfirmation,lastQuote:candidate.buyQuote,
+      lastError:null,createdAtMs:session.createdAtMs,updatedAtMs:position.openedAtMs,
+      purgeAfterMs:position.openedAtMs + this.options.retentionMs,
+    });
+    return result(updated, [], 'NONE', position, input.qualificationEvent);
+  }
+
+  public async reconcileSource(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV1;
+    qualification: QualificationReport;
+    qualificationEvent: DomainEvent;
+    maximumRoundTripLossBps: bigint;
+  }>): Promise<ExternalBuysStrategyResult> {
+    const { candidate,session } = input;
+    if (
+      session.candidateId !== candidate.id
+      || candidate.buyQuote === null
+      || candidate.reverseSellQuote === null
+      || input.qualificationEvent.confirmationStatus !== 'orphaned'
+    ) throw new TypeError('Paper strategy source reconciliation is inconsistent.');
+    const position = await this.ledger.reconcileOpen({
+      mint:candidate.mint,quoteAsset:candidate.quoteAsset,strategy:candidate.strategy,
+      trigger:input.qualificationEvent,qualification:input.qualification,
+      buyQuote:candidate.buyQuote,reverseSellQuote:candidate.reverseSellQuote,
+      maximumRoundTripLossBps:input.maximumRoundTripLossBps,
+      strategySessionId:session.id,qualificationReportId:candidate.qualificationReportId,
+      candidateId:candidate.id,
+    });
+    if (
+      position.status !== 'PAPER_RETRACTED'
+      || position.closedAtMs === null
+      || position.purgeAfterMs === null
+    ) throw new TypeError('Paper position source reconciliation did not retract the position.');
+    const retractedAtMs = position.purgeAfterMs - this.options.retentionMs;
+    const updated = Object.freeze({
+      ...session,state:'PAPER_RETRACTED' as const,reasonCode:'SOURCE_ORPHANED' as const,
+      positionId:position.id,lastError:null,
+      updatedAtMs:Math.max(session.updatedAtMs,position.closedAtMs,retractedAtMs),
+      purgeAfterMs:position.purgeAfterMs,
+    });
+    return result(updated, [], 'NONE', position, input.qualificationEvent);
+  }
+
   public async reconcile(input: Readonly<{
     candidate: TradingCandidateV1;
     session: PaperStrategySessionV1;
@@ -125,10 +200,28 @@ export class ValidatedExternalBuysStrategy {
       if (countedResult.targetReached) break;
     }
     if (session.externalBuyCount < session.externalBuyTarget) {
+      if (input.position.status !== 'PAPER_HOLDING') {
+        throw new TypeError('Terminal paper position has incomplete external-buy evidence.');
+      }
       return result(session, counted, 'NONE', input.position, closeTrigger ?? candidateTrigger(input.candidate));
     }
 
     const trigger = closeTrigger ?? candidateTrigger(input.candidate);
+    if (input.position.status === 'PAPER_CLOSED') {
+      if (input.position.closedAtMs === null || input.position.purgeAfterMs === null) {
+        throw new TypeError('Closed paper position is missing its terminal timestamps.');
+      }
+      const closed = Object.freeze({
+        ...session,state:'PAPER_CLOSED' as const,
+        reasonCode:'EXTERNAL_BUY_TARGET_REACHED' as const,
+        lastError:null,updatedAtMs:input.position.closedAtMs,
+        purgeAfterMs:input.position.purgeAfterMs,
+      });
+      return result(closed, counted, 'NONE', input.position, trigger);
+    }
+    if (input.position.status !== 'PAPER_HOLDING') {
+      throw new TypeError('Paper position is unavailable for closing.');
+    }
     let sellQuote;
     try {
       sellQuote = await this.quotes.quote({

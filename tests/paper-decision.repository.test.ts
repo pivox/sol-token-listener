@@ -4,9 +4,10 @@ import test from 'node:test';
 import pg from 'pg';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../src/domain/events.js';
 import { createPaperStrategySession } from '../src/domain/paper-strategy.js';
+import type { PaperPosition } from '../src/domain/paper-trading.js';
 import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
-import type { TokenLaunch } from '../src/domain/types.js';
+import type { ChainCursor, TokenLaunch } from '../src/domain/types.js';
 import type {
   PaperDecisionJobInput,
   PaperDecisionResult,
@@ -88,6 +89,40 @@ void test('keeps a claimed job usable after its lease is renewed', async (contex
     assert.equal(await repository.renew(claim, 1_500, 1_000), true);
     const snapshot = await repository.loadSnapshot(claim);
     assert.equal(snapshot.launch.mint, MINT);
+  });
+});
+
+void test('claims an orphaned source revision and reloads its paper lineage', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const confirmed = await repository.claim({ nowMs: 1_000, leaseMs: 1_000 });
+    assert.ok(confirmed);
+    await repository.complete(confirmed, decisionResult());
+
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await repository.enqueueLatest(MINT, 'signature', 'orphaned');
+    const orphaned = await repository.claim({ nowMs: 2_000, leaseMs: 1_000 });
+    assert.ok(orphaned);
+    assert.equal(orphaned.sourceConfirmationStatus, 'orphaned');
+
+    const snapshot = await repository.loadSnapshot(orphaned);
+    assert.equal(snapshot.asOfEvent.confirmationStatus, 'orphaned');
+    assert.ok(snapshot.currentCandidate);
+    assert.ok(snapshot.currentSession);
+    assert.ok(snapshot.currentDecision);
   });
 });
 
@@ -207,6 +242,65 @@ void test('persists a finalized candidate revision after a confirmed decision', 
   });
 });
 
+void test('loads the closed position linked to a staged paper session', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const entry = await repository.claim({ nowMs: 1_000, leaseMs: 1_000 });
+    assert.ok(entry);
+    const decision = decisionResult();
+    await repository.complete(entry, decision);
+    assert.ok(decision.session);
+    await insertPosition(pool, closedPosition(decision));
+
+    await repository.enqueue(jobInput({
+      sourceEventId:TRADE_EVENT_ID,sourceRawEventId:TRADE_RAW_EVENT_ID,
+      inputFingerprint:'9'.repeat(64),
+    }));
+    const replay = await repository.claim({ nowMs: 2_000, leaseMs: 1_000 });
+    assert.ok(replay);
+    const snapshot = await repository.loadSnapshot(replay);
+    assert.equal(snapshot.activePosition?.status, 'PAPER_CLOSED');
+    assert.equal(snapshot.activePosition?.strategySessionId, decision.session.id);
+  });
+});
+
+void test('does not let a delayed older job supersede a newer decision', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput({
+      sourceEventId:TRADE_EVENT_ID,sourceRawEventId:TRADE_RAW_EVENT_ID,
+      inputFingerprint:'8'.repeat(64),
+    }));
+    const newerJob = await repository.claim({ nowMs: 2_000, leaseMs: 1_000 });
+    assert.ok(newerJob);
+    const newer = decisionResultAt(11n, 2_000, '8');
+    await repository.complete(newerJob, newer);
+
+    await repository.enqueue(jobInput({ inputFingerprint:'7'.repeat(64) }));
+    const olderJob = await repository.claim({ nowMs: 3_000, leaseMs: 1_000 });
+    assert.ok(olderJob);
+    await repository.complete(olderJob, decisionResultAt(10n, 1_000, '7'));
+
+    const current = await pool.query<{ readonly candidate_id: string }>(
+      'SELECT candidate_id FROM trading_candidates WHERE superseded_at IS NULL',
+    );
+    assert.deepEqual(current.rows, [{ candidate_id:newer.candidate.id }]);
+  });
+});
+
 void test('purges counted external buys before their terminal paper session', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
@@ -246,13 +340,17 @@ function jobInput(overrides: Partial<PaperDecisionJobInput> = {}): PaperDecision
 
 function decisionResult(
   confirmationStatus: 'confirmed' | 'finalized' = 'confirmed',
+  cursor: ChainCursor = Object.freeze({
+    slot:10n,transactionIndex:0,instructionIndex:1,innerInstructionIndex:null,
+  }),
+  evaluatedAtMs = 1_000,
+  reportIdentity = confirmationStatus === 'confirmed' ? 'b' : 'e',
 ): PaperDecisionResult {
-  const report = qualificationReport();
-  const qualificationReportId = confirmationStatus === 'confirmed'
-    ? `qreport_${'b'.repeat(64)}`
-    : `qreport_${'e'.repeat(64)}`;
+  const report = qualificationReport(evaluatedAtMs);
+  const qualificationReportId = `qreport_${reportIdentity.repeat(64)}`;
   const qualificationEvent = derivedEvent(
     'QualificationUpdated', qualificationReportId, { report }, confirmationStatus,
+    cursor, evaluatedAtMs,
   );
   const candidate = createTradingCandidate({
     mint: MINT,
@@ -275,27 +373,39 @@ function decisionResult(
       amountOutRaw: 800n, minimumAmountOutRaw: 800n, feesRaw: 1n,
       slippageBps: 0n, priceImpactBps: 1n, observedAtMs: 1_000, observedSlot: 10n,
     }),
-    eligibleUntilMs: 46_000,
+    eligibleUntilMs: evaluatedAtMs + 45_000,
     reasonCodes: ['QUALIFIED_ENTRY'],
-    createdAtMs: 1_000,
-    purgeAfterMs: 14_401_000,
+    createdAtMs: evaluatedAtMs,
+    purgeAfterMs: evaluatedAtMs + 14_400_000,
   });
   const candidateEvent = derivedEvent(
     'TradingCandidateUpdated', candidate.id, { candidate }, confirmationStatus,
+    cursor, evaluatedAtMs,
   );
   const session = createPaperStrategySession({
     candidate, state: 'BUY_PENDING', reasonCode: 'QUALIFIED_ENTRY', positionId: null,
     entryCursor: candidate.asOf.cursor, externalBuyTarget: 10, externalBuyCount: 0,
     countedTradeIds: [], lastCountedCursor: null, minimumConfirmation: 'confirmed',
-    lastQuote: candidate.buyQuote, lastError: null, createdAtMs: 1_000,
-    updatedAtMs: 1_000, purgeAfterMs: 14_401_000,
+    lastQuote: candidate.buyQuote, lastError: null, createdAtMs: evaluatedAtMs,
+    updatedAtMs: evaluatedAtMs, purgeAfterMs: evaluatedAtMs + 14_400_000,
   });
   const sessionEvent = derivedEvent(
     'PaperStrategySessionUpdated', session.id, { session }, confirmationStatus,
+    cursor, evaluatedAtMs,
   );
   return Object.freeze({
     report, qualificationEvent, candidate, candidateEvent, session, sessionEvent,
     countedExternalBuys: Object.freeze([]), requestedAction: 'OPEN',
+  });
+}
+
+function decisionResultAt(slot: bigint, evaluatedAtMs: number, reportIdentity: string): PaperDecisionResult {
+  const cursor = Object.freeze({
+    slot,transactionIndex:0,instructionIndex:slot === 10n ? 1 : 2,innerInstructionIndex:null,
+  });
+  const result = decisionResult('confirmed', cursor, evaluatedAtMs, reportIdentity);
+  return Object.freeze({
+    ...result,session:null,sessionEvent:null,requestedAction:'NONE' as const,
   });
 }
 
@@ -335,7 +445,7 @@ function terminalDecisionResult(): PaperDecisionResult {
   });
 }
 
-function qualificationReport(): QualificationReport {
+function qualificationReport(evaluatedAtMs = 1_000): QualificationReport {
   const score = Object.freeze({ score: 0, maximum: 0 });
   return Object.freeze({
     ruleSet: Object.freeze({
@@ -347,7 +457,7 @@ function qualificationReport(): QualificationReport {
       total: Object.freeze({ score: 0, maximum: 100 }),
     }),
     evidence: Object.freeze([]), conditions: Object.freeze([]), blockers: Object.freeze([]),
-    verdict: 'QUALIFIED', evaluatedAtMs: 1_000,
+    verdict: 'QUALIFIED', evaluatedAtMs,
   });
 }
 
@@ -356,18 +466,67 @@ function derivedEvent(
   qualifier: string,
   payload: Readonly<Record<string, unknown>>,
   confirmationStatus: 'confirmed' | 'finalized' = 'confirmed',
+  cursor: ChainCursor = Object.freeze({
+    slot:10n,transactionIndex:0,instructionIndex:1,innerInstructionIndex:null,
+  }),
+  observedAtMs = 1_000,
 ): DomainEvent {
   const identity = {
     type, mint: MINT, source: 'paper-decision', program: 'pump', signature: 'signature',
-    cursor: Object.freeze({ slot: 10n, transactionIndex: 0, instructionIndex: 1, innerInstructionIndex: null }),
+    cursor,
     qualifier,
   } as const;
   return Object.freeze({
     id: createDeterministicDerivedEventId(identity), type, mint: MINT,
     source: identity.source, program: identity.program, signature: identity.signature,
     cursor: identity.cursor, confirmationStatus, blockchainTimeMs: 900,
-    observedAtMs: 1_000, payloadVersion: 1, payload: Object.freeze(payload),
+    observedAtMs, payloadVersion: 1, payload: Object.freeze(payload),
   });
+}
+
+function closedPosition(result: PaperDecisionResult): PaperPosition & {
+  readonly strategySessionId: string;
+  readonly qualificationReportId: string;
+  readonly candidateId: string;
+} {
+  assert.ok(result.session);
+  return Object.freeze({
+    id:'closed-position',mint:MINT,quoteAsset:result.candidate.quoteAsset,
+    strategy:result.candidate.strategy,status:'PAPER_CLOSED',baseFilledRaw:900n,
+    remainingBaseRaw:0n,quoteCostRaw:1_000n,quoteProceedsRaw:1_100n,
+    grossPnlQuoteRaw:100n,netPnlQuoteRaw:100n,roundTripLossBps:2_000n,
+    entryTradeId:'entry-trade',exitTradeId:'exit-trade',openCommandHash:'open-hash',
+    closeCommandHash:'close-hash',triggerEventId:result.qualificationEvent.id,
+    strategySessionId:result.session.id,qualificationReportId:result.candidate.qualificationReportId,
+    candidateId:result.candidate.id,openedAtMs:1_000,closedAtMs:2_000,
+    purgeAfterMs:14_402_000,payloadVersion:1,
+  });
+}
+
+async function insertPosition(
+  pool: InstanceType<typeof pg.Pool>,
+  position: ReturnType<typeof closedPosition>,
+): Promise<void> {
+  await pool.query(`INSERT INTO paper_positions (
+    position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+    strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+    quote_proceeds_raw,gross_pnl_quote_raw,net_pnl_quote_raw,round_trip_loss_bps,
+    entry_trade_id,exit_trade_id,open_command_hash,close_command_hash,trigger_event_id,
+    payload_version,payload,opened_at,closed_at,purge_after,strategy_session_id,
+    qualification_report_id,candidate_id
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+    $19,$20,1,$21,$22,$23,$24,$25,$26,$27)`, [
+    position.id,position.mint,position.quoteAsset.mint,position.quoteAsset.decimals,
+    position.quoteAsset.tokenProgram,position.strategy.id,position.strategy.version,
+    position.status,position.baseFilledRaw.toString(),position.remainingBaseRaw.toString(),
+    position.quoteCostRaw.toString(),position.quoteProceedsRaw?.toString(),
+    position.grossPnlQuoteRaw?.toString(),position.netPnlQuoteRaw?.toString(),
+    position.roundTripLossBps.toString(),position.entryTradeId,position.exitTradeId,
+    position.openCommandHash,position.closeCommandHash,position.triggerEventId,
+    toJsonValue(position),new Date(position.openedAtMs),new Date(position.closedAtMs ?? 0),
+    new Date(position.purgeAfterMs ?? 0),position.strategySessionId,
+    position.qualificationReportId,position.candidateId,
+  ]);
 }
 
 async function seed(pool: InstanceType<typeof pg.Pool>): Promise<void> {
