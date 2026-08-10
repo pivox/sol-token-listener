@@ -118,8 +118,10 @@ export class SseParser {
   }
 
   #dispatch(): ParsedSseFrame | null {
-    const frame = this.#id !== null && this.#id !== '' && this.#event !== null && this.#event !== '' && this.#hasData
-      ? Object.freeze({ id: this.#id, event: this.#event, data: this.#data.join('\n') })
+    const hasTransportIdentity = this.#id !== null && this.#id !== '';
+    const isTerminalStreamFrame = this.#event === 'stream_error';
+    const frame = (hasTransportIdentity || isTerminalStreamFrame) && this.#event !== null && this.#event !== '' && this.#hasData
+      ? Object.freeze({ id: this.#id ?? '', event: this.#event, data: this.#data.join('\n') })
       : null;
     this.#resetEvent();
     return frame;

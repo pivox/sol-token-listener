@@ -36,6 +36,15 @@ describe('bounded incremental SSE parser', () => {
     expect(parser.finish()).toEqual([]);
   });
 
+  it('surfaces the backend terminal stream_error frame without treating it as a cursor', () => {
+    const parser = new SseParser();
+    expect(parser.push(bytes('event: stream_error\ndata: {"apiVersion":"v1","error":{"code":"EVENT_CURSOR_EXPIRED"}}\n\n'))).toEqual([{
+      id: '',
+      event: 'stream_error',
+      data: '{"apiVersion":"v1","error":{"code":"EVENT_CURSOR_EXPIRED"}}',
+    }]);
+  });
+
   it('rejects malformed UTF-8 and bounded line, event, and pending buffers', () => {
     expect(() => new SseParser().push(Uint8Array.of(0xc3, 0x28, 0x0a))).toThrow(SseParseError);
     expect(() => new SseParser({ maximumLineBytes: 4 }).push(bytes('id: abc\n'))).toThrow(expect.objectContaining({ code: 'LINE_TOO_LARGE' }));
