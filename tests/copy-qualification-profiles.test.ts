@@ -56,6 +56,31 @@ void test('rejects missing, invalid, and oversized profile sources before cleani
   }
 });
 
+void test('rejects duplicate keys and invalid UTF-8 without altering the target', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sol-listener-ambiguous-qualification-profile-'));
+  const sourceDirectory = join(root, 'source');
+  const targetDirectory = join(root, 'target');
+  const sourcePath = join(sourceDirectory, profileName);
+  const sentinel = join(targetDirectory, 'preserve-me');
+  try {
+    await mkdir(sourceDirectory);
+    await mkdir(targetDirectory);
+    await writeFile(sentinel, 'stale');
+    const canonical = await readFile(bundledProfile, 'utf8');
+    for (const contents of [
+      Buffer.from(canonical.replace('"schemaVersion": 1', '"schemaVersion": 1, "schemaVersion": 1')),
+      Buffer.from([0xc3, 0x28]),
+    ]) {
+      await writeFile(sourcePath, contents);
+      await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
+      assert.equal(await readFile(sentinel, 'utf8'), 'stale');
+      assert.deepEqual(await readdir(targetDirectory), ['preserve-me']);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 void test('rejects symlinked sources and source-target aliases without altering the source', async () => {
   const root = await mkdtemp(join(tmpdir(), 'sol-listener-unsafe-qualification-profile-'));
   const sourceDirectory = join(root, 'source');

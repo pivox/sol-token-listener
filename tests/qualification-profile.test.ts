@@ -345,6 +345,45 @@ void test('loads default and custom profiles with bounded, redacted failures', (
   }
 });
 
+void test('rejects duplicate decoded JSON keys before profile materialization', () => {
+  const canonical = JSON.stringify(validRawProfile());
+  const duplicateProfiles = [
+    canonical.replace('"schemaVersion":1', '"schemaVersion":1,"schemaVersion":1'),
+    canonical.replace('"id":"pumpfun-v1-initial"', '"id":"pumpfun-v1-initial","\\u0069d":"pumpfun-v1-shadow"'),
+    canonical.replace('"preparation":15', '"preparation":15,"preparation":15'),
+    canonical.replace('"signal":"imageValid"', '"signal":"imageValid","signal":"descriptionAvailable"'),
+    canonical.replace('"code":"CREATOR_EARLY_SELL"', '"code":"CREATOR_EARLY_SELL","code":"STALE_DATA"'),
+  ];
+
+  for (const contents of duplicateProfiles) {
+    assertProfileError(
+      () => loadQualificationProfile({
+        profilePath: './duplicate.json',
+        minimumScoreOverride: null,
+        readFile: () => Buffer.from(contents),
+      }),
+      'PROFILE_JSON_INVALID',
+    );
+  }
+});
+
+void test('rejects invalid UTF-8 and bounds raw JSON depth and nodes before JSON.parse', () => {
+  const loadRaw = (contents: Buffer): void => {
+    loadQualificationProfile({
+      profilePath: './bounded.json',
+      minimumScoreOverride: null,
+      readFile: () => contents,
+    });
+  };
+
+  assertProfileError(() => { loadRaw(Buffer.from([0xc3, 0x28])); }, 'PROFILE_JSON_INVALID');
+  assertProfileError(() => { loadRaw(Buffer.from(`${'['.repeat(64)}0${']'.repeat(64)}`)); }, 'PROFILE_SCHEMA_INVALID');
+  assertProfileError(() => { loadRaw(Buffer.from(`${'['.repeat(65)}0${']'.repeat(65)}`)); }, 'PROFILE_JSON_INVALID');
+  assertProfileError(() => { loadRaw(Buffer.from(`[${new Array(9_999).fill('0').join(',')}]`)); }, 'PROFILE_SCHEMA_INVALID');
+  assertProfileError(() => { loadRaw(Buffer.from(`[${new Array(10_000).fill('0').join(',')}]`)); }, 'PROFILE_JSON_INVALID');
+  assertProfileError(() => { loadRaw(Buffer.from(`${'['.repeat(20_000)}0${']'.repeat(20_000)}`)); }, 'PROFILE_JSON_INVALID');
+});
+
 void test('rejects oversized and non-regular filesystem profile sources', () => {
   const directory = mkdtempSync(join(tmpdir(), 'qualification-profile-'));
   try {

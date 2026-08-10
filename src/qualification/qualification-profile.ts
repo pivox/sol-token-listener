@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { TextDecoder } from 'node:util';
 import { isProxy } from 'node:util/types';
 import type {
   EffectiveQualificationProfile,
@@ -16,6 +17,8 @@ import { canonicalStringifyJson } from '../utils/json.js';
 
 const MAX_PROFILE_BYTES = 65_536;
 const MAX_PROFILE_PATH_BYTES = 4_096;
+const MAX_PROFILE_JSON_DEPTH = 64;
+const MAX_PROFILE_JSON_NODES = 10_000;
 const TOP_LEVEL_FIELDS = ['schemaVersion', 'id', 'version', 'status', 'minimumTotalScore', 'dimensionMaximums', 'rules', 'conditionPolicies'] as const;
 const EFFECTIVE_PROFILE_FIELDS = ['schemaVersion', 'fingerprint', 'id', 'version', 'status', 'minimumTotalScore', 'dimensionMaximums', 'rules', 'conditionPolicies'] as const;
 const RULE_FIELDS = ['signal', 'dimension', 'weight', 'required', 'message'] as const;
@@ -58,13 +61,22 @@ export function loadQualificationProfile(options: LoadQualificationProfileOption
     ? new URL('../../config/qualification/pumpfun-v1-unvalidated.json', import.meta.url)
     : resolveProfilePath(options.profilePath, options.workingDirectory ?? process.cwd());
   const contents = readProfileBytes(path, options.readFile);
+  return parseQualificationProfileJson(contents, options.minimumScoreOverride);
+}
+
+export function parseQualificationProfileJson(contents: Buffer, minimumScoreOverride: number | null): EffectiveQualificationProfile {
+  if (isProxy(contents) || !Buffer.isBuffer(contents)) throw new QualificationProfileError('PROFILE_JSON_INVALID');
+  if (contents.byteLength > MAX_PROFILE_BYTES) throw new QualificationProfileError('PROFILE_TOO_LARGE');
   let parsed: unknown;
   try {
-    parsed = JSON.parse(contents.toString('utf8'));
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(contents);
+    validateJsonText(text);
+    parsed = JSON.parse(text);
+    freezeJsonSnapshot(parsed);
   } catch {
     throw new QualificationProfileError('PROFILE_JSON_INVALID');
   }
-  return parseQualificationProfile(deepFreeze(parsed), options.minimumScoreOverride);
+  return parseQualificationProfile(parsed, minimumScoreOverride);
 }
 
 function readProfileBytes(path: string | URL, readFile: LoadQualificationProfileOptions['readFile']): Buffer {
@@ -130,7 +142,7 @@ export function parseQualificationProfile(rawProfile: unknown, minimumScoreOverr
     const conditionPolicies = parsePolicies(raw.conditionPolicies);
     const withoutFingerprint = { schemaVersion: 1 as const, id, version, status: 'UNVALIDATED_RULE_SET' as const, minimumTotalScore, dimensionMaximums, rules, conditionPolicies };
     const fingerprint = createHash('sha256').update(canonicalStringifyJson(withoutFingerprint)).digest('hex');
-    return deepFreeze({ ...withoutFingerprint, fingerprint });
+    return freeze({ ...withoutFingerprint, fingerprint });
   } catch (error) {
     if (error instanceof QualificationProfileError) throw error;
     throw new QualificationProfileError('PROFILE_SCHEMA_INVALID');
@@ -173,7 +185,7 @@ function parseMaximums(value: unknown): Readonly<Record<QualificationDimension, 
     socialAuthenticity: safeInteger(fields.socialAuthenticity, 25, 25),
     onchainHealth: safeInteger(fields.onchainHealth, 60, 60),
   };
-  return deepFreeze(result);
+  return freeze(result);
 }
 
 function parseRules(value: unknown, maxima: Readonly<Record<QualificationDimension, number>>): readonly QualificationRule[] {
@@ -189,10 +201,10 @@ function parseRules(value: unknown, maxima: Readonly<Record<QualificationDimensi
     if (typeof fields.required !== 'boolean') invalid();
     const rule: QualificationRule = { signal: fields.signal as QualificationSignalKey, dimension, weight, required: fields.required, message: boundedString(fields.message, 1, 280) };
     signals.add(rule.signal); totals[dimension] += weight;
-    return deepFreeze(rule);
+    return freeze(rule);
   });
   for (const dimension of QUALIFICATION_DIMENSIONS) if (totals[dimension] !== maxima[dimension]) invalid();
-  return deepFreeze([...rules].sort((left, right) => left.signal.localeCompare(right.signal)));
+  return freeze([...rules].sort((left, right) => left.signal.localeCompare(right.signal)));
 }
 
 function parsePolicies(value: unknown): readonly QualificationConditionPolicy[] {
@@ -209,10 +221,10 @@ function parsePolicies(value: unknown): readonly QualificationConditionPolicy[] 
       maximumTop1Bps: nullableBps(fields.maximumTop1Bps), maximumTop5Bps: nullableBps(fields.maximumTop5Bps), maximumTop10Bps: nullableBps(fields.maximumTop10Bps),
       maximumClusterBps: nullableBps(fields.maximumClusterBps), minimumSharedFunders: nullablePositive(fields.minimumSharedFunders), maximumRoundTripLossBps: nullableBps(fields.maximumRoundTripLossBps),
     };
-    validatePolicyThresholds(policy); seen.add(code); return deepFreeze(policy);
+    validatePolicyThresholds(policy); seen.add(code); return freeze(policy);
   });
   if (seen.size !== QUALIFICATION_REASON_CODES.length) invalid();
-  return deepFreeze([...policies].sort((left, right) => QUALIFICATION_REASON_CODES.indexOf(left.code) - QUALIFICATION_REASON_CODES.indexOf(right.code)));
+  return freeze([...policies].sort((left, right) => QUALIFICATION_REASON_CODES.indexOf(left.code) - QUALIFICATION_REASON_CODES.indexOf(right.code)));
 }
 
 function validatePolicyThresholds(policy: QualificationConditionPolicy): void {
@@ -273,10 +285,230 @@ function hasControlCharacter(value: string): boolean {
 }
 function invalid(): never { throw new QualificationProfileError('PROFILE_SCHEMA_INVALID'); }
 
-function deepFreeze<T>(value: T): T {
-  if (value !== null && typeof value === 'object') {
-    for (const child of Object.values(value)) deepFreeze(child);
-    Object.freeze(value);
-  }
+function freeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object') Object.freeze(value);
   return value;
+}
+
+type JsonFrame =
+  | { readonly kind: 'array'; state: 'valueOrEnd' | 'value' | 'commaOrEnd' }
+  | { readonly kind: 'object'; state: 'keyOrEnd' | 'key' | 'colon' | 'value' | 'commaOrEnd'; readonly keys: Set<string> };
+
+function validateJsonText(text: string): void {
+  const frames: JsonFrame[] = [];
+  let rootState: 'value' | 'end' = 'value';
+  let index = 0;
+  let nodes = 0;
+
+  const consumeValue = (): void => {
+    nodes += 1;
+    if (nodes > MAX_PROFILE_JSON_NODES) throw new Error('too many JSON nodes');
+    const character = text[index];
+    if (character === '"') {
+      index = scanJsonString(text, index).end;
+    } else if (character === '{' || character === '[') {
+      if (frames.length >= MAX_PROFILE_JSON_DEPTH) throw new Error('JSON nesting is too deep');
+      frames.push(character === '{'
+        ? { kind: 'object', state: 'keyOrEnd', keys: new Set<string>() }
+        : { kind: 'array', state: 'valueOrEnd' });
+      index += 1;
+    } else if (character === 't') {
+      index = scanLiteral(text, index, 'true');
+    } else if (character === 'f') {
+      index = scanLiteral(text, index, 'false');
+    } else if (character === 'n') {
+      index = scanLiteral(text, index, 'null');
+    } else {
+      index = scanJsonNumber(text, index);
+    }
+  };
+
+  for (;;) {
+    index = skipJsonWhitespace(text, index);
+    const frame = frames.at(-1);
+    if (frame === undefined) {
+      if (rootState === 'end') {
+        if (index !== text.length) throw new Error('unexpected trailing JSON');
+        return;
+      }
+      if (index >= text.length) throw new Error('missing JSON value');
+      rootState = 'end';
+      consumeValue();
+      continue;
+    }
+
+    if (frame.kind === 'object') {
+      if (frame.state === 'keyOrEnd' || frame.state === 'key') {
+        if (frame.state === 'keyOrEnd' && text[index] === '}') {
+          frames.pop();
+          index += 1;
+          continue;
+        }
+        if (text[index] !== '"') throw new Error('missing JSON object key');
+        const key = scanJsonString(text, index);
+        if (frame.keys.has(key.value)) throw new Error('duplicate JSON object key');
+        frame.keys.add(key.value);
+        frame.state = 'colon';
+        index = key.end;
+        continue;
+      }
+      if (frame.state === 'colon') {
+        if (text[index] !== ':') throw new Error('missing JSON object colon');
+        frame.state = 'value';
+        index += 1;
+        continue;
+      }
+      if (frame.state === 'value') {
+        frame.state = 'commaOrEnd';
+        consumeValue();
+        continue;
+      }
+      if (text[index] === ',') {
+        frame.state = 'key';
+        index += 1;
+        continue;
+      }
+      if (text[index] === '}') {
+        frames.pop();
+        index += 1;
+        continue;
+      }
+      throw new Error('invalid JSON object separator');
+    }
+
+    if (frame.state === 'valueOrEnd' && text[index] === ']') {
+      frames.pop();
+      index += 1;
+      continue;
+    }
+    if (frame.state === 'valueOrEnd' || frame.state === 'value') {
+      frame.state = 'commaOrEnd';
+      consumeValue();
+      continue;
+    }
+    if (text[index] === ',') {
+      frame.state = 'value';
+      index += 1;
+      continue;
+    }
+    if (text[index] === ']') {
+      frames.pop();
+      index += 1;
+      continue;
+    }
+    throw new Error('invalid JSON array separator');
+  }
+}
+
+function scanJsonString(text: string, start: number): { readonly value: string; readonly end: number } {
+  let value = '';
+  let index = start + 1;
+  let segmentStart = index;
+  while (index < text.length) {
+    const code = text.charCodeAt(index);
+    if (code === 0x22) {
+      value += text.slice(segmentStart, index);
+      return { value, end: index + 1 };
+    }
+    if (code < 0x20) throw new Error('invalid JSON string control character');
+    if (code !== 0x5c) {
+      index += 1;
+      continue;
+    }
+    value += text.slice(segmentStart, index);
+    index += 1;
+    const escape = text[index];
+    if (escape === undefined) throw new Error('unterminated JSON escape');
+    const simpleEscape = JSON_SIMPLE_ESCAPES[escape];
+    if (simpleEscape !== undefined) {
+      value += simpleEscape;
+      index += 1;
+    } else if (escape === 'u') {
+      const hexadecimal = text.slice(index + 1, index + 5);
+      if (!/^[0-9a-fA-F]{4}$/u.test(hexadecimal)) throw new Error('invalid JSON unicode escape');
+      value += String.fromCharCode(Number.parseInt(hexadecimal, 16));
+      index += 5;
+    } else {
+      throw new Error('invalid JSON escape');
+    }
+    segmentStart = index;
+  }
+  throw new Error('unterminated JSON string');
+}
+
+const JSON_SIMPLE_ESCAPES: Readonly<Record<string, string>> = Object.freeze({
+  '"': '"',
+  '\\': '\\',
+  '/': '/',
+  b: '\b',
+  f: '\f',
+  n: '\n',
+  r: '\r',
+  t: '\t',
+});
+
+function scanLiteral(text: string, start: number, literal: 'true' | 'false' | 'null'): number {
+  if (!text.startsWith(literal, start)) throw new Error('invalid JSON literal');
+  return start + literal.length;
+}
+
+function scanJsonNumber(text: string, start: number): number {
+  let index = start;
+  if (text[index] === '-') index += 1;
+  if (text[index] === '0') {
+    index += 1;
+    if (isDigit(text[index])) throw new Error('invalid JSON leading zero');
+  } else {
+    if (!isNonZeroDigit(text[index])) throw new Error('invalid JSON value');
+    while (isDigit(text[index])) index += 1;
+  }
+  if (text[index] === '.') {
+    index += 1;
+    if (!isDigit(text[index])) throw new Error('invalid JSON fraction');
+    while (isDigit(text[index])) index += 1;
+  }
+  if (text[index] === 'e' || text[index] === 'E') {
+    index += 1;
+    if (text[index] === '+' || text[index] === '-') index += 1;
+    if (!isDigit(text[index])) throw new Error('invalid JSON exponent');
+    while (isDigit(text[index])) index += 1;
+  }
+  return index;
+}
+
+function isDigit(value: string | undefined): boolean {
+  return value !== undefined && value >= '0' && value <= '9';
+}
+
+function isNonZeroDigit(value: string | undefined): boolean {
+  return value !== undefined && value >= '1' && value <= '9';
+}
+
+function skipJsonWhitespace(text: string, start: number): number {
+  let index = start;
+  while (text[index] === ' ' || text[index] === '\n' || text[index] === '\r' || text[index] === '\t') index += 1;
+  return index;
+}
+
+function freezeJsonSnapshot(value: unknown): void {
+  if (value === null || typeof value !== 'object') return;
+  const pending: { readonly value: object; readonly depth: number; readonly visited: boolean }[] = [
+    { value, depth: 1, visited: false },
+  ];
+  let nodes = 0;
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined) break;
+    if (current.visited) {
+      Object.freeze(current.value);
+      continue;
+    }
+    nodes += 1;
+    if (nodes > MAX_PROFILE_JSON_NODES || current.depth > MAX_PROFILE_JSON_DEPTH) throw new Error('JSON snapshot is too complex');
+    pending.push({ ...current, visited: true });
+    for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(current.value))) {
+      const child: unknown = 'value' in descriptor ? descriptor.value : null;
+      if (child !== null && typeof child === 'object') pending.push({ value: child, depth: current.depth + 1, visited: false });
+    }
+  }
 }

@@ -2,12 +2,11 @@ import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, ope
 import { writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { parseQualificationProfile } from '../src/qualification/qualification-profile.js';
+import { parseQualificationProfileJson } from '../src/qualification/qualification-profile.js';
 
 const canonicalProfileName = 'pumpfun-v1-unvalidated.json' as const;
 const MAX_PROFILE_BYTES = 65_536;
 const MAX_PATH_BYTES = 4_096;
-const MAX_PROFILE_JSON_NODES = 4_096;
 const repositoryRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
 
 export interface CopyQualificationProfilesOptions {
@@ -63,13 +62,11 @@ function readCanonicalProfile(sourceDirectory: string): Buffer {
 }
 
 function validateProfile(bytes: Buffer): void {
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(bytes.toString('utf8'));
+    parseQualificationProfileJson(bytes, null);
   } catch {
     throw new Error('Qualification profile source is invalid.');
   }
-  parseQualificationProfile(deepFreeze(parsed), null);
 }
 
 async function replaceTargetDirectory(sourceDirectory: string, targetDirectory: string, sourceBytes: Buffer): Promise<void> {
@@ -248,35 +245,6 @@ function pathsOverlap(left: string, right: string): boolean {
 function isSameOrAncestor(ancestor: string, descendant: string): boolean {
   const path = relative(ancestor, descendant);
   return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !isAbsolute(path));
-}
-
-function deepFreeze<T>(value: T): T {
-  try {
-    const pending: { readonly value: object; readonly freeze: boolean }[] = [];
-    const seen = new Set<object>();
-    if (value !== null && typeof value === 'object') pending.push({ value, freeze: false });
-    while (pending.length > 0) {
-      const current = pending.pop();
-      if (current === undefined) break;
-      if (current.freeze) {
-        Object.freeze(current.value);
-        continue;
-      }
-      if (seen.has(current.value)) continue;
-      if (seen.size >= MAX_PROFILE_JSON_NODES) throw new Error('Qualification profile source is invalid.');
-      seen.add(current.value);
-      pending.push({ value: current.value, freeze: true });
-      for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(current.value))) {
-        const child: unknown = 'value' in descriptor ? descriptor.value : undefined;
-        if (child !== null && typeof child === 'object') {
-          pending.push({ value: child, freeze: false });
-        }
-      }
-    }
-  } catch {
-    throw new Error('Qualification profile source is invalid.');
-  }
-  return value;
 }
 
 async function main(): Promise<void> {
