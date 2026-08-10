@@ -30,6 +30,25 @@ void test('persiste position, trade et événement dans une transaction', async 
   assert.equal(client.values.flat().some((value) => typeof value === 'bigint'), false);
 });
 
+void test('persiste et relit la lignée de stratégie sans casser les anciennes positions', async () => {
+  const lineagePosition: PaperPosition = {
+    ...position(),strategySessionId:'paper-session',qualificationReportId:'report',candidateId:'candidate',
+  };
+  const writer = new RecordingClient();
+  const repository = new PostgresPaperTradingRepository({ connect:async () => writer });
+  await repository.transact(async (transaction) => {
+    await transaction.insertOpened(lineagePosition, trade(), event());
+  });
+  assert.deepEqual(writer.values[1]?.slice(-3), ['paper-session','report','candidate']);
+
+  const reader = new RecordingClient(false, [{ payload:toJsonValue(lineagePosition) }]);
+  const readRepository = new PostgresPaperTradingRepository({ connect:async () => reader });
+  const decoded = await readRepository.transact(async (transaction) => transaction.findPosition('position'));
+  assert.equal(decoded?.strategySessionId, 'paper-session');
+  assert.equal(decoded?.qualificationReportId, 'report');
+  assert.equal(decoded?.candidateId, 'candidate');
+});
+
 void test('rollback si l’événement ne peut pas être persisté', async () => {
   const client = new RecordingClient(true);
   const repository = new PostgresPaperTradingRepository({

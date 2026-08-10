@@ -56,6 +56,9 @@ export interface PaperPosition {
   readonly openCommandHash: string;
   readonly closeCommandHash: string | null;
   readonly triggerEventId: string;
+  readonly strategySessionId?: string;
+  readonly qualificationReportId?: string;
+  readonly candidateId?: string;
   readonly openedAtMs: number;
   readonly closedAtMs: number | null;
   readonly purgeAfterMs: number | null;
@@ -82,6 +85,9 @@ export interface OpenPaperPositionCommand {
   readonly buyQuote: PaperExecutionQuote;
   readonly reverseSellQuote: PaperExecutionQuote;
   readonly maximumRoundTripLossBps: bigint;
+  readonly strategySessionId?: string;
+  readonly qualificationReportId?: string;
+  readonly candidateId?: string;
 }
 
 export interface ClosePaperPositionCommand {

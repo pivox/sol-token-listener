@@ -157,6 +157,11 @@ export class PaperTradingEngine {
         openCommandHash: openCommandHashes.current,
         closeCommandHash: null,
         triggerEventId: snapshot.trigger.id,
+        ...(snapshot.strategySessionId === undefined ? {} : {
+          strategySessionId:snapshot.strategySessionId,
+          qualificationReportId:snapshot.qualificationReportId,
+          candidateId:snapshot.candidateId,
+        }),
         openedAtMs,
         closedAtMs: null,
         purgeAfterMs: null,
@@ -363,6 +368,12 @@ function validateOpenCommand(
   if (command.strategy.id.trim() === '' || !Number.isSafeInteger(command.strategy.version) || command.strategy.version <= 0) {
     invalidQuote('strategy');
   }
+  const lineage = [command.strategySessionId,command.qualificationReportId,command.candidateId];
+  if (
+    lineage.some((value) => value !== undefined)
+    && (lineage.some((value) => value === undefined)
+      || lineage.some((value) => value?.trim() === ''))
+  ) invalidQuote('paper lineage');
   validateQualificationReport(command.qualification, qualificationProfile);
   if (command.qualification.blockers.length > 0) {
     throw new PaperTradingError('QUALIFICATION_BLOCKED', 'La qualification contient un blocker.');
@@ -544,6 +555,11 @@ function snapshotOpenCommand(
     buyQuote: snapshotQuote(command.buyQuote),
     reverseSellQuote: snapshotQuote(command.reverseSellQuote),
     maximumRoundTripLossBps: command.maximumRoundTripLossBps,
+    ...(command.strategySessionId === undefined ? {} : {
+      strategySessionId:command.strategySessionId,
+      qualificationReportId:command.qualificationReportId,
+      candidateId:command.candidateId,
+    }),
   });
 }
 

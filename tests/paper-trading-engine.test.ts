@@ -70,6 +70,21 @@ void test('ouvre avec le rapport exact produit par l’autorité et rejoue sans 
   assert.deepEqual([...repository.eventStatuses.values()], ['confirmed']);
 });
 
+void test('attache la lignée décisionnelle complète à la position paper', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const position = await engine.open({
+    ...openCommand(),
+    strategySessionId:`paper_session_${'a'.repeat(64)}`,
+    qualificationReportId:`qreport_${'b'.repeat(64)}`,
+    candidateId:`candidate_${'c'.repeat(64)}`,
+  });
+
+  assert.equal(position.strategySessionId, `paper_session_${'a'.repeat(64)}`);
+  assert.equal(position.qualificationReportId, `qreport_${'b'.repeat(64)}`);
+  assert.equal(position.candidateId, `candidate_${'c'.repeat(64)}`);
+});
+
 void test('rejoue la même commande après montée de finalité sans conflit', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
