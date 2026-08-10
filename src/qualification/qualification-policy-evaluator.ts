@@ -42,14 +42,14 @@ export function evaluateQualificationConditions(
 function evaluate(code: QualificationReasonCode, policy: QualificationConditionPolicy, facts: QualificationCalibrationFacts, upstream: ReadonlyMap<QualificationReasonCode, boolean>, legacy: ReadonlySet<QualificationReasonCode>): QualificationConditionEvidence {
   if (policy.mode === 'DISABLED') return evidence(code, policy.mode, 'DISABLED', {}, {}, 'Condition disabled.');
   switch (code) {
-    case 'HOLDER_CONCENTRATION_EXCEEDED': return holder(policy, facts);
-    case 'RELATED_WALLET_CLUSTER_EXCEEDED': return maximum(code, policy.mode, facts.maximumRelatedClusterBps, policy.maximumClusterBps, 'Related wallet cluster exceeds the configured threshold.');
-    case 'SHARED_FUNDER_CLUSTER': return minimum(policy, facts.maximumSharedFunderCount);
-    case 'BUY_SIMULATION_FAILED': return booleanCondition(code, policy.mode, facts.buySimulationSucceeded, 'Buy simulation failed.');
-    case 'SELL_QUOTE_UNAVAILABLE': return booleanCondition(code, policy.mode, facts.sellQuoteAvailable, 'Sell quote is unavailable.');
-    case 'ROUND_TRIP_LOSS_EXCEEDED': return maximum(code, policy.mode, facts.roundTripLossBps, policy.maximumRoundTripLossBps, 'Perte aller-retour supérieure au seuil configuré.');
+    case 'HOLDER_CONCENTRATION_EXCEEDED': return triggeredByLegacy(holder(policy, facts), legacy.has(code));
+    case 'RELATED_WALLET_CLUSTER_EXCEEDED': return triggeredByLegacy(maximum(code, policy.mode, facts.maximumRelatedClusterBps, policy.maximumClusterBps, 'maximumRelatedClusterBps', 'maximumClusterBps', 'Related wallet cluster exceeds the configured threshold.'), legacy.has(code));
+    case 'SHARED_FUNDER_CLUSTER': return triggeredByLegacy(minimum(policy, facts.maximumSharedFunderCount), legacy.has(code));
+    case 'BUY_SIMULATION_FAILED': return triggeredByLegacy(booleanCondition(code, policy.mode, facts.buySimulationSucceeded, 'buySimulationSucceeded', 'Buy simulation failed.'), legacy.has(code));
+    case 'SELL_QUOTE_UNAVAILABLE': return triggeredByLegacy(booleanCondition(code, policy.mode, facts.sellQuoteAvailable, 'sellQuoteAvailable', 'Sell quote is unavailable.'), legacy.has(code));
+    case 'ROUND_TRIP_LOSS_EXCEEDED': return triggeredByLegacy(maximum(code, policy.mode, facts.roundTripLossBps, policy.maximumRoundTripLossBps, 'roundTripLossBps', 'maximumRoundTripLossBps', 'Perte aller-retour supérieure au seuil configuré.'), legacy.has(code));
     default: {
-      const triggered = upstream.get(code) ?? (legacy.has(code) ? true : undefined);
+      const triggered = legacy.has(code) ? true : upstream.get(code);
       return evidence(code, policy.mode, triggered === true ? 'TRIGGERED' : triggered === false ? 'PASSED' : 'UNKNOWN', {}, {}, triggered === true ? 'Upstream condition triggered.' : triggered === false ? 'Upstream condition passed.' : 'Upstream condition is unavailable.');
     }
   }
@@ -62,17 +62,17 @@ function holder(policy: QualificationConditionPolicy, facts: QualificationCalibr
     ['top10HoldersBps', facts.top10HoldersBps, policy.maximumTop10Bps],
   ] as const;
   const configured = pairs.filter(([, , threshold]) => threshold !== null);
-  const observed = Object.fromEntries(pairs.map(([key, value]) => [key, value]));
-  const thresholds = Object.fromEntries(pairs.map(([key, , value]) => [key, value === null ? null : BigInt(value)]));
+  const observed = { top1HolderBps: facts.top1HolderBps, top5HoldersBps: facts.top5HoldersBps, top10HoldersBps: facts.top10HoldersBps };
+  const thresholds = { maximumTop1Bps: policy.maximumTop1Bps === null ? null : BigInt(policy.maximumTop1Bps), maximumTop5Bps: policy.maximumTop5Bps === null ? null : BigInt(policy.maximumTop5Bps), maximumTop10Bps: policy.maximumTop10Bps === null ? null : BigInt(policy.maximumTop10Bps) };
   if (configured.some(([, value, threshold]) => value !== null && threshold !== null && value > BigInt(threshold))) return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'TRIGGERED', observed, thresholds, 'Holder concentration exceeds the configured threshold.');
   if (configured.some(([, value]) => value === null)) return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'UNKNOWN', observed, thresholds, 'Holder concentration is unavailable.');
   if (pairs.some(([, , threshold]) => threshold === null)) return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'NOT_CONFIGURED', observed, thresholds, 'Holder concentration is not fully configured.');
   return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'PASSED', observed, thresholds, 'Holder concentration passed.');
 }
 
-function maximum(code: QualificationReasonCode, mode: QualificationConditionMode, observedValue: bigint | null, thresholdValue: number | null, triggeredMessage: string): QualificationConditionEvidence {
-  const observed = { value: observedValue };
-  const thresholds = { maximum: thresholdValue === null ? null : BigInt(thresholdValue) };
+function maximum(code: QualificationReasonCode, mode: QualificationConditionMode, observedValue: bigint | null, thresholdValue: number | null, observedKey: string, thresholdKey: string, triggeredMessage: string): QualificationConditionEvidence {
+  const observed = { [observedKey]: observedValue };
+  const thresholds = { [thresholdKey]: thresholdValue === null ? null : BigInt(thresholdValue) };
   if (thresholdValue === null) return evidence(code, mode, 'NOT_CONFIGURED', observed, thresholds, 'Condition is not configured.');
   if (observedValue === null) return evidence(code, mode, 'UNKNOWN', observed, thresholds, 'Condition observation is unavailable.');
   return evidence(code, mode, observedValue > BigInt(thresholdValue) ? 'TRIGGERED' : 'PASSED', observed, thresholds, observedValue > BigInt(thresholdValue) ? triggeredMessage : 'Condition passed.');
@@ -80,14 +80,14 @@ function maximum(code: QualificationReasonCode, mode: QualificationConditionMode
 
 function minimum(policy: QualificationConditionPolicy, observedValue: number | null): QualificationConditionEvidence {
   const threshold = policy.minimumSharedFunders;
-  if (threshold === null) return evidence('SHARED_FUNDER_CLUSTER', policy.mode, 'NOT_CONFIGURED', { count: observedValue }, { minimum: null }, 'Shared funder cluster is not configured.');
-  const observed = { count: observedValue }; const thresholds = { minimum: threshold };
+  if (threshold === null) return evidence('SHARED_FUNDER_CLUSTER', policy.mode, 'NOT_CONFIGURED', { maximumSharedFunderCount: observedValue }, { minimumSharedFunders: null }, 'Shared funder cluster is not configured.');
+  const observed = { maximumSharedFunderCount: observedValue }; const thresholds = { minimumSharedFunders: threshold };
   if (observedValue === null) return evidence('SHARED_FUNDER_CLUSTER', policy.mode, 'UNKNOWN', observed, thresholds, 'Shared funder observation is unavailable.');
   return evidence('SHARED_FUNDER_CLUSTER', policy.mode, observedValue >= threshold ? 'TRIGGERED' : 'PASSED', observed, thresholds, observedValue >= threshold ? 'Shared funder cluster meets the configured minimum.' : 'Shared funder cluster passed.');
 }
 
-function booleanCondition(code: QualificationReasonCode, mode: QualificationConditionMode, observedValue: boolean | null, triggeredMessage: string): QualificationConditionEvidence {
-  const observed = { available: observedValue }; const thresholds = {};
+function booleanCondition(code: QualificationReasonCode, mode: QualificationConditionMode, observedValue: boolean | null, observedKey: string, triggeredMessage: string): QualificationConditionEvidence {
+  const observed = { [observedKey]: observedValue }; const thresholds = {};
   if (observedValue === null) return evidence(code, mode, 'UNKNOWN', observed, thresholds, 'Condition observation is unavailable.');
   return evidence(code, mode, observedValue ? 'PASSED' : 'TRIGGERED', observed, thresholds, observedValue ? 'Condition passed.' : triggeredMessage);
 }
@@ -97,10 +97,15 @@ function evidence(code: QualificationReasonCode, mode: QualificationConditionMod
 }
 
 function validatedLegacyCodes(value: readonly QualificationReasonCode[]): ReadonlySet<QualificationReasonCode> {
+  if (!Array.isArray(value) || isProxy(value) || value.length > REASON_CODES.length) throw new TypeError('Legacy triggered codes must be a bounded array.');
   const entries = denseFrozenArray(value, 'Legacy triggered codes');
   const result = new Set<QualificationReasonCode>();
   for (const entry of entries) { if (typeof entry !== 'string' || !REASON_SET.has(entry)) throw new TypeError('Legacy triggered code is invalid.'); result.add(entry as QualificationReasonCode); }
   return result;
+}
+
+function triggeredByLegacy(condition: QualificationConditionEvidence, triggered: boolean): QualificationConditionEvidence {
+  return triggered ? evidence(condition.code, condition.mode, 'TRIGGERED', condition.observed, condition.thresholds, 'Legacy condition triggered.') : condition;
 }
 
 function denseFrozenArray(value: unknown, name: string): readonly unknown[] {

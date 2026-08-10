@@ -125,6 +125,18 @@ void test('keeps the default creator-repeat-dumper policy disabled despite upstr
   assert.ok(!result.blockers.includes('CREATOR_REPEAT_DUMPER'));
 });
 
+void test('uses contract evidence keys and lets legacy triggers override passing or unavailable calibrated facts', () => {
+  const calibrated = profile({ HOLDER_CONCENTRATION_EXCEEDED: { mode: 'ENFORCED', maximumTop1Bps: 100, maximumTop5Bps: 200, maximumTop10Bps: 300 }, RELATED_WALLET_CLUSTER_EXCEEDED: { mode: 'ENFORCED', maximumClusterBps: 400 }, ROUND_TRIP_LOSS_EXCEEDED: { mode: 'ENFORCED', maximumRoundTripLossBps: 3000 } });
+  const result = evaluateQualificationConditions(calibrated, facts({ top1HolderBps: 100n, top5HoldersBps: 200n, top10HoldersBps: 300n, maximumRelatedClusterBps: 400n, roundTripLossBps: null }), Object.freeze(['HOLDER_CONCENTRATION_EXCEEDED', 'RELATED_WALLET_CLUSTER_EXCEEDED', 'ROUND_TRIP_LOSS_EXCEEDED']));
+  assert.deepEqual(condition(result, 'HOLDER_CONCENTRATION_EXCEEDED').observed, { top1HolderBps: 100n, top5HoldersBps: 200n, top10HoldersBps: 300n });
+  assert.deepEqual(condition(result, 'HOLDER_CONCENTRATION_EXCEEDED').thresholds, { maximumTop1Bps: 100n, maximumTop5Bps: 200n, maximumTop10Bps: 300n });
+  assert.deepEqual(condition(result, 'RELATED_WALLET_CLUSTER_EXCEEDED').observed, { maximumRelatedClusterBps: 400n });
+  assert.deepEqual(condition(result, 'RELATED_WALLET_CLUSTER_EXCEEDED').thresholds, { maximumClusterBps: 400n });
+  assert.deepEqual(condition(result, 'ROUND_TRIP_LOSS_EXCEEDED').observed, { roundTripLossBps: null });
+  assert.deepEqual(condition(result, 'ROUND_TRIP_LOSS_EXCEEDED').thresholds, { maximumRoundTripLossBps: 3000n });
+  assert.deepEqual(result.blockers, ['HOLDER_CONCENTRATION_EXCEEDED', 'RELATED_WALLET_CLUSTER_EXCEEDED', 'ROUND_TRIP_LOSS_EXCEEDED']);
+});
+
 void test('uses stable legacy reason ordering and returns deeply frozen safe results', () => {
   const legacy = Object.freeze(['METADATA_FETCH_FAILED', 'CREATOR_EARLY_SELL', 'METADATA_FETCH_FAILED'] as QualificationReasonCode[]);
   const result = evaluateQualificationConditions(profile({ METADATA_FETCH_FAILED: { mode: 'ENFORCED' } }), facts(), legacy);
