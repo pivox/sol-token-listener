@@ -1,4 +1,4 @@
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, rmSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, renameSync, rmSync, rmdirSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -7,6 +7,7 @@ import { parseQualificationProfile } from '../src/qualification/qualification-pr
 const canonicalProfileName = 'pumpfun-v1-unvalidated.json' as const;
 const MAX_PROFILE_BYTES = 65_536;
 const MAX_PATH_BYTES = 4_096;
+const MAX_PROFILE_JSON_NODES = 4_096;
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 export interface CopyQualificationProfilesOptions {
@@ -21,8 +22,7 @@ export async function copyQualificationProfiles(
   const targetDirectory = safeDirectoryPath(options.targetDirectory, 'target');
   const sourceBytes = readCanonicalProfile(sourceDirectory);
   validateProfile(sourceBytes);
-  prepareTargetDirectory(sourceDirectory, targetDirectory);
-  await writeFile(join(targetDirectory, canonicalProfileName), sourceBytes, { flag: 'wx' });
+  await replaceTargetDirectory(sourceDirectory, targetDirectory, sourceBytes);
   return Object.freeze([canonicalProfileName]);
 }
 
@@ -72,28 +72,108 @@ function validateProfile(bytes: Buffer): void {
   parseQualificationProfile(deepFreeze(parsed), null);
 }
 
-function prepareTargetDirectory(sourceDirectory: string, targetDirectory: string): void {
+async function replaceTargetDirectory(sourceDirectory: string, targetDirectory: string, sourceBytes: Buffer): Promise<void> {
   const sourceRealPath = realpathSync(sourceDirectory);
-  if (pathsOverlap(sourceRealPath, targetDirectory)) throw new Error('Source and target directories must not overlap.');
-
+  assertSafeTargetDirectory(sourceRealPath, targetDirectory);
+  const sourceIdentity = directoryIdentity(sourceDirectory, 'source');
+  const targetParent = dirname(targetDirectory);
+  mkdirSync(targetParent, { recursive: true });
+  assertSafeExistingDirectory(targetParent, 'target');
+  const stagingDirectory = mkdtempSync(join(targetParent, '.qualification-profile-stage-'));
+  let quarantineDirectory: string | null = null;
+  let stagingMoved = false;
   try {
-    const targetStats = lstatSync(targetDirectory);
-    if (!targetStats.isDirectory() || targetStats.isSymbolicLink()) throw new Error('Unsafe target directory.');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    mkdirSync(targetDirectory, { recursive: true });
-  }
-  const targetRealPath = realpathSync(targetDirectory);
-  if (pathsOverlap(sourceRealPath, targetRealPath)) throw new Error('Source and target directories must not overlap.');
+    await writeFile(join(stagingDirectory, canonicalProfileName), sourceBytes, { flag: 'wx', mode: 0o600 });
+    const targetIdentity = existingDirectoryIdentity(targetDirectory);
+    if (targetIdentity === null) {
+      renameSync(stagingDirectory, targetDirectory);
+      stagingMoved = true;
+      return;
+    }
+    if (pathsOverlap(sourceRealPath, realpathSync(targetDirectory))) throw new Error('Source and target directories must not overlap.');
 
-  rmSync(targetDirectory, { recursive: true, force: true });
-  mkdirSync(targetDirectory, { recursive: true });
-  assertSafeExistingDirectory(targetDirectory, 'target');
+    quarantineDirectory = mkdtempSync(join(targetParent, '.qualification-profile-quarantine-'));
+    rmdirSync(quarantineDirectory);
+    if (!sameIdentity(directoryIdentity(targetDirectory, 'target'), targetIdentity)) throw new Error('Target directory changed before replacement.');
+    renameSync(targetDirectory, quarantineDirectory);
+    const quarantinedIdentity = directoryIdentity(quarantineDirectory, 'target');
+    if (!sameIdentity(quarantinedIdentity, targetIdentity)) {
+      restoreDirectory(quarantineDirectory, targetDirectory);
+      throw new Error('Target directory changed during replacement.');
+    }
+    if (!sameIdentity(directoryIdentity(sourceDirectory, 'source'), sourceIdentity)) {
+      restoreSourceDirectory(quarantineDirectory, sourceDirectory, sourceIdentity);
+      throw new Error('Source directory changed during replacement.');
+    }
+    renameSync(stagingDirectory, targetDirectory);
+    stagingMoved = true;
+    removeQuarantine(quarantineDirectory, quarantinedIdentity, sourceRealPath);
+    quarantineDirectory = null;
+  } finally {
+    if (!stagingMoved) removeEmptyDirectory(stagingDirectory);
+    if (quarantineDirectory !== null) {
+      // A failed identity check leaves the quarantine intact rather than deleting a mutable pathname.
+    }
+  }
+}
+
+function assertSafeTargetDirectory(sourceRealPath: string, targetDirectory: string): void {
+  const currentWorkingDirectory = resolve(process.cwd());
+  if (isSameOrAncestor(targetDirectory, currentWorkingDirectory)
+    || isSameOrAncestor(targetDirectory, repositoryRoot)
+    || pathsOverlap(sourceRealPath, targetDirectory)) {
+    throw new Error('Unsafe target directory.');
+  }
+}
+
+function existingDirectoryIdentity(directory: string): DirectoryIdentity | null {
+  try {
+    return directoryIdentity(directory, 'target');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 function assertSafeExistingDirectory(directory: string, label: 'source' | 'target'): void {
   const stats = lstatSync(directory);
   if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error(`Unsafe ${label} directory.`);
+}
+
+interface DirectoryIdentity {
+  readonly device: number;
+  readonly inode: number;
+}
+
+function directoryIdentity(directory: string, label: 'source' | 'target'): DirectoryIdentity {
+  const stats = lstatSync(directory);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error(`Unsafe ${label} directory.`);
+  return Object.freeze({ device: stats.dev, inode: stats.ino });
+}
+
+function sameIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function restoreDirectory(from: string, to: string): void {
+  try { renameSync(from, to); } catch { /* Preserve the unique quarantine if rollback is no longer safe. */ }
+}
+
+function restoreSourceDirectory(quarantineDirectory: string, sourceDirectory: string, sourceIdentity: DirectoryIdentity): void {
+  try {
+    if (sameIdentity(directoryIdentity(quarantineDirectory, 'target'), sourceIdentity)) renameSync(quarantineDirectory, sourceDirectory);
+  } catch { /* Preserve the unique quarantine if the source cannot be restored safely. */ }
+}
+
+function removeQuarantine(quarantineDirectory: string, expected: DirectoryIdentity, sourceRealPath: string): void {
+  if (!sameIdentity(directoryIdentity(quarantineDirectory, 'target'), expected) || pathsOverlap(sourceRealPath, realpathSync(quarantineDirectory))) {
+    throw new Error('Quarantine directory changed before cleanup.');
+  }
+  rmSync(quarantineDirectory, { recursive: true, force: false });
+}
+
+function removeEmptyDirectory(directory: string): void {
+  try { rmdirSync(directory); } catch { /* An unsuccessful staging cleanup is non-destructive. */ }
 }
 
 function pathsOverlap(left: string, right: string): boolean {
@@ -104,10 +184,36 @@ function pathsOverlap(left: string, right: string): boolean {
     || (!rightRelative.startsWith(`..${sep}`) && rightRelative !== '..' && !isAbsolute(rightRelative));
 }
 
+function isSameOrAncestor(ancestor: string, descendant: string): boolean {
+  const path = relative(ancestor, descendant);
+  return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !isAbsolute(path));
+}
+
 function deepFreeze<T>(value: T): T {
-  if (value !== null && typeof value === 'object') {
-    for (const child of Object.values(value)) deepFreeze(child);
-    Object.freeze(value);
+  try {
+    const pending: { readonly value: object; readonly freeze: boolean }[] = [];
+    const seen = new Set<object>();
+    if (value !== null && typeof value === 'object') pending.push({ value, freeze: false });
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (current === undefined) break;
+      if (current.freeze) {
+        Object.freeze(current.value);
+        continue;
+      }
+      if (seen.has(current.value)) continue;
+      if (seen.size >= MAX_PROFILE_JSON_NODES) throw new Error('Qualification profile source is invalid.');
+      seen.add(current.value);
+      pending.push({ value: current.value, freeze: true });
+      for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(current.value))) {
+        const child: unknown = 'value' in descriptor ? descriptor.value : undefined;
+        if (child !== null && typeof child === 'object') {
+          pending.push({ value: child, freeze: false });
+        }
+      }
+    }
+  } catch {
+    throw new Error('Qualification profile source is invalid.');
   }
   return value;
 }
