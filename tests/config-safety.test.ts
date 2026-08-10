@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config/env.js';
+import { loadQualificationProfile } from '../src/qualification/qualification-profile.js';
+import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
 const base = {
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
@@ -41,12 +44,32 @@ void test('les actions dashboard exigent leur confirmation indépendante', () =>
   assert.throws(() => parseConfig({ ...base, DASHBOARD_ACTIONS_ENABLED: 'true' }), /read-only/u);
 });
 
-void test('le seuil de qualification est borné et vaut 60 par défaut', () => {
-  assert.equal(parseConfig(base).qualificationMinimumScore, 60);
+void test('le seuil de qualification absent reste sans override et un seuil explicite est borné', () => {
+  assert.equal(parseConfig(base).qualificationMinimumScore, null);
+  assert.equal(parseConfig({ ...base, QUALIFICATION_MIN_SCORE: '61' }).qualificationMinimumScore, 61);
   assert.throws(
     () => parseConfig({ ...base, QUALIFICATION_MIN_SCORE: '101' }),
     /QUALIFICATION_MIN_SCORE/u,
   );
+});
+
+void test('selects one local qualification profile and validates its fixed status', () => {
+  assert.equal(parseConfig(base).qualificationProfilePath, null);
+  assert.equal(
+    parseConfig({ ...base, QUALIFICATION_PROFILE_PATH: './profile.json' }).qualificationProfilePath,
+    './profile.json',
+  );
+  for (const profilePath of [' ', 'x'.repeat(4_097), 'profile\u0000.json']) {
+    assert.throws(() => parseConfig({ ...base, QUALIFICATION_PROFILE_PATH: profilePath }), /QUALIFICATION_PROFILE_PATH/u);
+  }
+  assert.throws(() => parseConfig({ ...base, QUALIFICATION_RULE_SET_STATUS: 'VALIDATED' }), /QUALIFICATION_RULE_SET_STATUS/u);
+});
+
+void test('the environment example publishes explicit qualification selection defaults', async () => {
+  const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
+  for (const line of ['QUALIFICATION_PROFILE_PATH=', 'QUALIFICATION_MIN_SCORE=', 'QUALIFICATION_RULE_SET_STATUS=UNVALIDATED_RULE_SET']) {
+    assert.match(source, new RegExp(`^${line}$`, 'mu'));
+  }
 });
 
 void test('l’API publique est activée localement avec des limites sûres par défaut', () => {
@@ -196,4 +219,106 @@ void test('les réglages listener ne régressent pas la sécurité observe/paper
     LISTENER_ENABLED: 'true',
     SOLANA_PRIVATE_KEY_BASE58: 'secret',
   }), /private key/u);
+});
+
+void test('Pump.fun calibration documentation states the initial profile, semantics, and safety limits', async () => {
+  const documentPaths = [
+    '../README.md',
+    '../docs/architecture/pumpfun-v1.md',
+    '../docs/api/v1.md',
+    '../docs/system-overview.html',
+  ] as const;
+  const documents = await Promise.all(documentPaths.map((path) => readFile(new URL(path, import.meta.url), 'utf8')));
+  const [readme, architecture, api, systemOverview] = documents as [string, string, string, string];
+  const documentation = documents.join('\n');
+  for (const statement of [
+    'config/qualification/pumpfun-v1-unvalidated.json',
+    'QUALIFICATION_PROFILE_PATH',
+    'QUALIFICATION_MIN_SCORE',
+    'UNVALIDATED_RULE_SET',
+    'SHA-256',
+    'DISABLED',
+    'REPORT_ONLY',
+    'ENFORCED',
+    '15',
+    '25',
+    '60',
+    '3000 bps',
+    'NONVALIDATED',
+    'calibration initiale',
+    'SHARED_FUNDER_CLUSTER',
+    'RELATED_WALLET_CLUSTER_EXCEEDED',
+    'UNKNOWN',
+    'dépassement strict',
+    'métadonnées',
+    'social',
+    'Raydium',
+    '"fingerprint": null',
+    '"conditions": []',
+    'chaînes décimales',
+    'clé privée',
+    'sendTransaction',
+    'signTransaction',
+    'profit',
+    'sellabilité',
+    'première position',
+    'même slot',
+  ]) assert.ok(documentation.includes(statement), `missing documentation statement: ${statement}`);
+
+  assert.match(readme, /par défaut.*config\/qualification\/pumpfun-v1-unvalidated\.json/isu);
+  assert.match(readme, /fail.closed|fails closed/iu);
+  assert.match(readme, /redact|ne journalise ni le\s+chemin/iu);
+  assert.match(architecture, /Un blocker actif.*compensé/isu);
+  assert.match(architecture, /null.*REPORT_ONLY.*dry-run/isu);
+  for (const document of [readme, architecture, systemOverview]) {
+    assert.doesNotMatch(document, /(?:SHARED_FUNDER_CLUSTER|RELATED_WALLET_CLUSTER_EXCEEDED)[\s\S]{0,180}désactivés/iu);
+    assert.match(document, /REPORT_ONLY[\s\S]{0,220}(?:blocker|verdict|paper)/iu);
+  }
+  assert.match(architecture, /égalité passe.*dépassement strict/isu);
+  assert.match(api, /legacy.*"fingerprint": null.*"conditions": \[\]/isu);
+  assert.match(api, /fingerprint.*lowercase/iu);
+  assert.match(systemOverview, /diagnostic/iu);
+  assert.match(systemOverview, /imageValid.*15.*socialCrossLinkConfirmed.*25.*creatorHasNotSold.*reverseQuoteAvailable.*externalBuyersObserved/isu);
+  assert.match(systemOverview, /TRIGGERED.*ENFORCED.*blocker.*décide le rejet/isu);
+  assert.match(systemOverview, /MINT_SOCIAL_MISMATCH.*SHARED_FUNDER_CLUSTER.*REPORT_ONLY.*sans décider/isu);
+  assert.match(systemOverview, /HOLDER_CONCENTRATION_EXCEEDED.*RELATED_WALLET_CLUSTER_EXCEEDED.*REPORT_ONLY.*null/isu);
+  assert.match(systemOverview, /SHARED_FUNDER_CLUSTER.*REPORT_ONLY.*minimumSharedFunders=1/isu);
+  assert.match(systemOverview, /BUY_SIMULATION_FAILED.*SELL_QUOTE_UNAVAILABLE.*ENFORCED/isu);
+  assert.match(systemOverview, /ROUND_TRIP_LOSS_EXCEEDED.*ENFORCED.*maximumRoundTripLossBps=3000/isu);
+  assert.match(systemOverview, /Liquidité.*future non scorée/iu);
+  assert.match(api, /projection legacy.*projection calibrée.*Perte aller-retour supérieure au seuil configuré/isu);
+  assert.doesNotMatch(systemOverview, /704 tests réussis/iu);
+});
+
+void test('qualification loader, evaluator, profile, and public API boundaries exclude execution primitives', async () => {
+  const modulePaths = [
+    '../src/qualification/qualification-engine.ts',
+    '../src/qualification/qualification-policy-evaluator.ts',
+    '../src/qualification/qualification-profile.ts',
+    '../src/api/contracts.ts',
+    '../src/storage/api-projection.repository.ts',
+  ] as const;
+  const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+  for (const path of modulePaths) {
+    const sourceUrl = new URL(path, import.meta.url);
+    const source = await readFile(sourceUrl, 'utf8');
+    assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(sourceUrl), repositoryRoot), []);
+  }
+  const profile = loadQualificationProfile({ profilePath: null, minimumScoreOverride: null });
+  assert.equal(profile.id, 'pumpfun-v1-initial');
+  const policy = (code: string) => profile.conditionPolicies.find((item) => item.code === code);
+  assert.deepEqual(policy('HOLDER_CONCENTRATION_EXCEEDED'), {
+    code: 'HOLDER_CONCENTRATION_EXCEEDED', mode: 'REPORT_ONLY', maximumTop1Bps: null, maximumTop5Bps: null,
+    maximumTop10Bps: null, maximumClusterBps: null, minimumSharedFunders: null, maximumRoundTripLossBps: null,
+  });
+  assert.deepEqual(policy('RELATED_WALLET_CLUSTER_EXCEEDED'), {
+    code: 'RELATED_WALLET_CLUSTER_EXCEEDED', mode: 'REPORT_ONLY', maximumTop1Bps: null, maximumTop5Bps: null,
+    maximumTop10Bps: null, maximumClusterBps: null, minimumSharedFunders: null, maximumRoundTripLossBps: null,
+  });
+  assert.equal(policy('SHARED_FUNDER_CLUSTER')?.mode, 'REPORT_ONLY');
+  assert.equal(policy('SHARED_FUNDER_CLUSTER')?.minimumSharedFunders, 1);
+  assert.equal(policy('BUY_SIMULATION_FAILED')?.mode, 'ENFORCED');
+  assert.equal(policy('SELL_QUOTE_UNAVAILABLE')?.mode, 'ENFORCED');
+  assert.equal(policy('ROUND_TRIP_LOSS_EXCEEDED')?.mode, 'ENFORCED');
+  assert.equal(policy('ROUND_TRIP_LOSS_EXCEEDED')?.maximumRoundTripLossBps, 3_000);
 });

@@ -25,7 +25,7 @@ import type {
   DecodedPumpSwapTransaction,
 } from '../src/markets/pumpswap/types.js';
 import { PaperTradingEngine } from '../src/paper/paper-trading-engine.js';
-import { QualificationEngine, defaultQualificationRuleSet } from '../src/qualification/qualification-engine.js';
+import { createDefaultQualificationRuleSet, QualificationEngine } from '../src/qualification/qualification-engine.js';
 import { SolanaWalletFundingEvidenceExtractor } from '../src/solana/wallet-funding-evidence-extractor.js';
 import type { NormalizedInstruction, NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
@@ -574,20 +574,19 @@ async function launchState(pool: InstanceType<typeof pg.Pool>): Promise<string |
 
 async function assertPaperSafety(pool: InstanceType<typeof pg.Pool>): Promise<void> {
   const repository = new PostgresPaperTradingRepository(pool);
+  const profile = createDefaultQualificationRuleSet(60);
+  const authority = new QualificationEngine(profile);
   await assert.rejects(
     new PaperTradingEngine({
       executionMode: 'observe', paperQuoteMintAllowlist: ['SOL'], dataRetentionHours: 4,
-    }, repository).open({} as OpenPaperPositionCommand),
+    }, repository, profile, authority).open({} as OpenPaperPositionCommand),
     hasCode('PAPER_MODE_DISABLED'),
   );
-  const watchlisted = openCommand();
+  const watchlisted = openCommand(authority, false);
   await assert.rejects(
     new PaperTradingEngine({
       executionMode: 'paper', paperQuoteMintAllowlist: ['SOL'], dataRetentionHours: 4,
-    }, repository).open({
-      ...watchlisted,
-      qualification: { ...watchlisted.qualification, verdict: 'WATCHLISTED' },
-    }),
+    }, repository, profile, authority).open(watchlisted),
     hasCode('QUALIFICATION_NOT_ACCEPTED'),
   );
 }
@@ -610,22 +609,40 @@ async function insertProcessed(
   );
 }
 
-function openCommand(): OpenPaperPositionCommand {
-  const qualification = new QualificationEngine(defaultQualificationRuleSet).evaluate({
+function openCommand(
+  authority: QualificationEngine,
+  imageValid = true,
+): OpenPaperPositionCommand {
+  const triggerEvent = {
+    id: 'trigger', type: 'QualificationUpdated' as const, mint: 'MINT', source: 'pumpfun',
+    program: 'pump-program', signature: 'signature',
+    cursor: { slot: 1n, transactionIndex: 0, instructionIndex: 0, innerInstructionIndex: null },
+    confirmationStatus: 'confirmed' as const, blockchainTimeMs: 1, observedAtMs: 1,
+    payloadVersion: 1, payload: {},
+  };
+  const qualification = authority.evaluateAuthorized({
+    mint: 'MINT',
+    triggerEventId: triggerEvent.id,
+  }, {
     evaluatedAtMs: 1,
-    signals: { imageValid: true, socialCrossLinkConfirmed: true, creatorHasNotSold: true },
+    signals: { imageValid, socialCrossLinkConfirmed: true, creatorHasNotSold: true },
     blockers: [],
+    calibrationFacts: Object.freeze({
+      top1HolderBps: null,
+      top5HoldersBps: null,
+      top10HoldersBps: null,
+      maximumRelatedClusterBps: null,
+      maximumSharedFunderCount: null,
+      buySimulationSucceeded: true,
+      sellQuoteAvailable: true,
+      roundTripLossBps: 2_000n,
+      upstreamConditions: Object.freeze([]),
+    }),
   });
   return {
     mint: 'MINT', quoteAsset: { mint: 'SOL', decimals: 9, tokenProgram: 'SPL_TOKEN' },
     strategy: { id: 'recovery', version: 1 },
-    trigger: {
-      id: 'trigger', type: 'QualificationUpdated', mint: 'MINT', source: 'pumpfun',
-      program: 'pump-program', signature: 'signature',
-      cursor: { slot: 1n, transactionIndex: 0, instructionIndex: 0, innerInstructionIndex: null },
-      confirmationStatus: 'confirmed', blockchainTimeMs: 1, observedAtMs: 1,
-      payloadVersion: 1, payload: {},
-    },
+    trigger: triggerEvent,
     qualification,
     buyQuote: quote('buy', 'SOL', 'MINT'),
     reverseSellQuote: quote('sell', 'MINT', 'SOL'),

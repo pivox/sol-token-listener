@@ -101,6 +101,21 @@ bootstrap -> composition observation-only
 | `PaperTradingEngine` | entrée/sortie simulées, frais, slippage et PnL estimé |
 | API HTTP/SSE | projections publiques V1, non authentifiées et en lecture seule |
 
+Le `PaperTradingEngine` reçoit l’`EffectiveQualificationProfile` déjà chargé
+comme autorité de politique et une `QualificationReportAuthority` process-local
+portée par le `QualificationEngine` qui produit les rapports. Il ne relit aucun
+fichier : avant toute transaction paper, il exige la référence exacte d’un
+rapport autorisé pour le même mint et le même événement déclencheur, puis
+compare l’identité du ruleset ainsi que les modes et seuils des conditions aux
+policies du profil. Pour les policies `ENFORCED`, il exige également une
+simulation BUY réussie, une quote SELL disponible, un loss observé égal au loss
+recalculé et le respect du plafond round-trip du profil ; `REPORT_ONLY` reste
+non bloquant et `DISABLED` n’exige pas d’observation. Une copie,
+désérialisation ou réutilisation pour un autre
+sujet est donc refusée. Après redémarrage, les inputs de confiance doivent être
+réévalués pour le nouveau sujet ; le paper trading n’est pas encore composé dans
+le bootstrap de production.
+
 ### Analytics participants I1
 
 `LaunchParticipantAnalyticsService` charge, sous verrou PostgreSQL par mint,
@@ -155,9 +170,10 @@ positions observées.
 L'API limite par défaut la réponse à 50 clusters, 50 membres par cluster,
 500 membres au total, 8 quote assets par cluster et 64 quote assets au total,
 avec des indicateurs de troncature explicites. Les reason
-codes `SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` restent
-désactivés jusqu'au calibrage dry run : I2 ne change aucun verdict, score ou
-paper trade.
+codes `SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` sont
+`REPORT_ONLY` pendant le calibrage dry run : I2 rapporte les preuves et les
+déclenchements, sans ajouter de blocker ni changer le verdict, le score ou la
+décision paper.
 
 ## Contrats Solana
 
@@ -223,14 +239,55 @@ Les trois scores sont indépendants :
 - santé et comportement on-chain : 60.
 
 Le jeu initial est `UNVALIDATED_RULE_SET` et tous les poids/seuils seront
-configurables. `QUALIFICATION_MIN_SCORE` vaut 60 par défaut ; il est non
-calibré et ne déclenche jamais à lui seul le paper trading. Les métadonnées ne
-prouvent jamais le sérieux du projet.
+configurables. Son minimum vaut 60. `QUALIFICATION_MIN_SCORE` est un override
+optionnel ; en son absence, le minimum du profil sélectionné est conservé. Ce
+minimum est non calibré et ne déclenche jamais à lui seul le paper trading. Les
+métadonnées ne prouvent jamais le sérieux du projet.
 
 Les conditions éliminatoires utilisent les codes stables de
 `src/domain/qualification-reasons.ts`. Un blocker actif décide du rejet sans
 pouvoir être compensé par le score. Chaque rapport conserve les preuves, les
 valeurs de règles et leur version.
+
+### Profil effectif, calibration et décision
+
+Le profil par défaut est
+`config/qualification/pumpfun-v1-unvalidated.json`; `QUALIFICATION_PROFILE_PATH`
+sélectionne un fichier local et `QUALIFICATION_MIN_SCORE` surcharge le minimum
+effectif. Le chargeur échoue fail-closed avant toute ressource de runtime si le
+profil ne se lit pas ou ne valide pas. Les diagnostics de démarrage sont
+redacted: ni path ni contenu du profil ne sont logged.
+
+Le fingerprint est le SHA-256 du JSON canonique du profil effectif, avec le
+minimum remplacé par `QUALIFICATION_MIN_SCORE` lorsqu'il est défini. Il est un
+hex lowercase de 64 caractères, versionne la règle réellement évaluée et non
+le seul fichier brut. Le statut reste `UNVALIDATED_RULE_SET`: les valeurs sont
+une calibration initiale NONVALIDATED, non une calibration officiellement ou
+empiriquement validée.
+
+Les maxima fixes sont préparation 15, authenticité sociale 25 et santé
+on-chain 60, soit 100. Le minimum par défaut est 60 et est configurable. Les
+signaux metadata/social ne contribuent qu'à préparation ou authenticité; ils
+ne constituent jamais une preuve de sérieux. Un score ne peut jamais compenser
+un blocker enforced: seuls les blockers `ENFORCED` déclenchés refusent le verdict.
+
+| Mode | Condition | Effet sur le verdict |
+| --- | --- | --- |
+| `DISABLED` | Non évaluée, statut `DISABLED` | Aucun blocker |
+| `REPORT_ONLY` | Évaluée et exposée, y compris `UNKNOWN` | Aucun blocker |
+| `ENFORCED` | Évaluée | `TRIGGERED` crée un blocker, indépendamment du score |
+
+Une observation inconnue donne `UNKNOWN`; un seuil absent donne
+`NOT_CONFIGURED`. Pour un maximum, l'égalité passe et seul un dépassement strict
+du seuil déclenche; pour le minimum shared funder,
+l'égalité déclenche (`>=`). Les seuils holder et related cluster sont `null` et
+`REPORT_ONLY` pendant le dry-run; `SHARED_FUNDER_CLUSTER` est `REPORT_ONLY`
+avec minimumSharedFunders=1. Le seuil roundtrip par défaut est 3000 bps,
+NONVALIDATED et calibration initiale: il n'est pas une garantie de profit, de
+sellabilité, de première position ou de résultat dans le même slot.
+
+Raydium legacy `RISK_*` reste isolé du calibrage Pump.fun; il ne modifie ni le
+profil, ni les conditions, ni le verdict Pump.fun.
 
 ## Machine d’état et événements
 

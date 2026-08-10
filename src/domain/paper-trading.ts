@@ -112,6 +112,7 @@ export type PaperPositionClosedEventV1 = TypedDomainEvent<
 
 export type PaperTradingErrorCode =
   | 'PAPER_MODE_DISABLED'
+  | 'QUALIFICATION_INVALID'
   | 'QUALIFICATION_NOT_ACCEPTED'
   | 'QUALIFICATION_BLOCKED'
   | 'QUOTE_MINT_NOT_ALLOWED'

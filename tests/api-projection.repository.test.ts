@@ -12,6 +12,11 @@ import {
   encodeTimelineCursor,
 } from '../src/api/cursor.js';
 import { toJsonValue } from '../src/utils/json.js';
+import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
+import {
+  createDefaultQualificationRuleSet,
+  QualificationEngine,
+} from '../src/qualification/qualification-engine.js';
 
 interface Call {
   readonly text: string;
@@ -62,6 +67,38 @@ class FakeConnectable implements Queryable {
 
 const detectedAt = new Date('2026-07-01T12:00:00.000Z');
 const openedAt = new Date('2026-07-02T12:00:00.000Z');
+
+function calibratedConditions(): Record<string, unknown>[] {
+  return QUALIFICATION_REASON_CODES.map((code) => {
+    if (code === 'HOLDER_CONCENTRATION_EXCEEDED') return {
+      code, mode: 'ENFORCED', status: 'PASSED',
+      observed: { top1HolderBps: '1', top5HoldersBps: '2', top10HoldersBps: '3' },
+      thresholds: { maximumTop1Bps: '100', maximumTop5Bps: '200', maximumTop10Bps: '300' }, message: 'Passed.',
+    };
+    if (code === 'RELATED_WALLET_CLUSTER_EXCEEDED') return {
+      code, mode: 'ENFORCED', status: 'PASSED', observed: { maximumRelatedClusterBps: '1' },
+      thresholds: { maximumClusterBps: '100' }, message: 'Passed.',
+    };
+    if (code === 'SHARED_FUNDER_CLUSTER') return {
+      code, mode: 'ENFORCED', status: 'PASSED', observed: { maximumSharedFunderCount: 0 },
+      thresholds: { minimumSharedFunders: 1 }, message: 'Passed.',
+    };
+    if (code === 'BUY_SIMULATION_FAILED') return {
+      code, mode: 'ENFORCED', status: 'PASSED', observed: { buySimulationSucceeded: true },
+      thresholds: {}, message: 'Passed.',
+    };
+    if (code === 'SELL_QUOTE_UNAVAILABLE') return {
+      code, mode: 'ENFORCED', status: 'PASSED', observed: { sellQuoteAvailable: true },
+      thresholds: {}, message: 'Passed.',
+    };
+    if (code === 'ROUND_TRIP_LOSS_EXCEEDED') return {
+      code, mode: 'ENFORCED', status: 'TRIGGERED', observed: { roundTripLossBps: 3001n },
+      thresholds: { maximumRoundTripLossBps: 3000n },
+      message: 'Perte aller-retour supérieure au seuil configuré.',
+    };
+    return { code, mode: 'ENFORCED', status: 'UNKNOWN', observed: {}, thresholds: {}, message: 'Unavailable.' };
+  });
+}
 
 function launch(mint: string, at = detectedAt): Record<string, unknown> {
   return {
@@ -880,8 +917,8 @@ void test('uses the latest non-orphaned qualification event and rejects malforme
     ? [{ payload: report }] : []);
   const value = await new PostgresApiProjectionRepository(database).getLaunchRisk('mint-a');
   assert.deepEqual(value, {
-    ruleSet: report.ruleSet, scores: report.scores, evidence: report.evidence,
-    blockers: report.blockers, verdict: report.verdict,
+    ruleSet: { ...report.ruleSet, fingerprint: null }, scores: report.scores, evidence: report.evidence,
+    conditions: [], blockers: report.blockers, verdict: report.verdict,
     evaluatedAt: detectedAt.toISOString(),
   });
   assert.match(database.calls[0]?.text ?? '', /confirmation_status <> 'orphaned'/u);
@@ -892,6 +929,169 @@ void test('uses the latest non-orphaned qualification event and rejects malforme
 
   const malformed = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: '{bad json' }]));
   await assert.rejects(malformed.getLaunchRisk('mint-a'), ApiProjectionDataError);
+});
+
+void test('projects calibrated qualification evidence as canonical V1 condition fields', async () => {
+  const report = {
+    ruleSet: {
+      id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60,
+      fingerprint: 'a'.repeat(64),
+    },
+    scores: {
+      preparation: { score: 1, maximum: 2 }, socialAuthenticity: { score: 3, maximum: 4 },
+      onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 },
+    },
+    evidence: [], conditions: calibratedConditions(),
+    blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
+  };
+  const databasePayload = JSON.parse(JSON.stringify(toJsonValue(report))) as unknown;
+  const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: databasePayload }]));
+
+  const value = await repository.getLaunchRisk('mint-a');
+
+  assert.deepEqual(value?.ruleSet.fingerprint, 'a'.repeat(64));
+  assert.deepEqual(value?.conditions.find((item) => item.code === 'ROUND_TRIP_LOSS_EXCEEDED'), {
+    code: 'ROUND_TRIP_LOSS_EXCEEDED', mode: 'ENFORCED', status: 'TRIGGERED',
+    observed: { roundTripLossBps: '3001' }, thresholds: { maximumRoundTripLossBps: '3000' },
+    message: 'Perte aller-retour supérieure au seuil configuré.',
+  });
+  assert.equal(Object.isFrozen(value?.conditions), true);
+  assert.equal(Object.isFrozen(value?.conditions[0]?.observed), true);
+});
+
+void test('rejects incomplete or malformed calibrated qualification evidence fail closed', async () => {
+  const valid = {
+    ruleSet: {
+      id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60,
+      fingerprint: 'a'.repeat(64),
+    },
+    scores: {
+      preparation: { score: 1, maximum: 2 }, socialAuthenticity: { score: 3, maximum: 4 },
+      onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 },
+    }, evidence: [], blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
+    conditions: calibratedConditions(),
+  };
+  const roundTripIndex = QUALIFICATION_REASON_CODES.indexOf('ROUND_TRIP_LOSS_EXCEEDED');
+  const malformed: readonly unknown[] = [
+    { ...valid, ruleSet: { ...valid.ruleSet, fingerprint: undefined } },
+    { ...valid, conditions: undefined },
+    { ...valid, ruleSet: { ...valid.ruleSet, fingerprint: 'A'.repeat(64) } },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, observed: { roundTripLossBps: '03' } } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, observed: { roundTripLossBps: ['3001'] } } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, observed: { roundTripLossBps: { $solTokenListenerBigInt: '03' } } } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, observed: { roundTripLossBps: { $solTokenListenerBigInt: '-0' } } } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, observed: { roundTripLossBps: { $solTokenListenerBigInt: '10001' } } } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, observed: { roundTripLossBps: { $solTokenListenerBigInt: '3001', extra: true } } } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, mode: 'UNKNOWN' } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, status: 'INVALID' } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, code: 'INVALID' } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, unexpected: true } : item) },
+    { ...valid, conditions: valid.conditions.map((item, index) => index === roundTripIndex ? { ...item, observed: { roundTripLossBps: 9_007_199_254_740_992 } } : item) },
+    { ...valid, conditions: valid.conditions.slice(0, -1) },
+  ];
+
+  for (const payload of malformed) {
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
+  }
+});
+
+void test('requires new calibrated qualifications to use the complete canonical condition registry', async () => {
+  const valid = {
+    ruleSet: { id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60, fingerprint: 'a'.repeat(64) },
+    scores: { preparation: { score: 1, maximum: 2 }, socialAuthenticity: { score: 3, maximum: 4 }, onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 } },
+    evidence: [], blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(), conditions: calibratedConditions(),
+  };
+  const reordered = [...valid.conditions];
+  const first = reordered[0];
+  const second = reordered[1];
+  if (first === undefined || second === undefined) throw new Error('Missing canonical conditions.');
+  reordered[0] = second;
+  reordered[1] = first;
+  const disabled = valid.conditions.map((item) => item.code === 'CREATOR_EARLY_SELL'
+    ? { ...item, mode: 'DISABLED', status: 'PASSED' } : item);
+  const statusDisabled = valid.conditions.map((item) => item.code === 'CREATOR_EARLY_SELL'
+    ? { ...item, status: 'DISABLED' } : item);
+
+  for (const conditions of [[], valid.conditions.slice(0, -1), reordered, disabled, statusDisabled]) {
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: { ...valid, conditions } }]));
+    await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
+  }
+});
+
+void test('enforces shared-funder observation and threshold bounds exactly', async () => {
+  const conditions = calibratedConditions();
+  const index = QUALIFICATION_REASON_CODES.indexOf('SHARED_FUNDER_CLUSTER');
+  const shared = conditions[index];
+  if (shared === undefined) throw new Error('Missing shared-funder condition.');
+  const valid = {
+    ruleSet: { id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60, fingerprint: 'a'.repeat(64) },
+    scores: { preparation: { score: 1, maximum: 2 }, socialAuthenticity: { score: 3, maximum: 4 }, onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 } },
+    evidence: [], blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(), conditions,
+  };
+  for (const replacement of [
+    { ...shared, observed: { maximumSharedFunderCount: -0 } },
+    { ...shared, observed: { maximumSharedFunderCount: 0.5 } },
+    { ...shared, thresholds: { minimumSharedFunders: 0 } },
+    { ...shared, thresholds: { minimumSharedFunders: 10_001 } },
+  ]) {
+    const invalidConditions = [...conditions];
+    invalidConditions[index] = replacement;
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: { ...valid, conditions: invalidConditions } }]));
+    await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
+  }
+});
+
+void test('rejects hostile qualification payload descriptors and proxies without leaking trap secrets', async () => {
+  const secret = 'qualification-trap-secret';
+  let proxyTrapCalled = false;
+  const proxy = new Proxy({}, {
+    getPrototypeOf: () => { proxyTrapCalled = true; throw new Error(secret); },
+    get: () => { proxyTrapCalled = true; throw new Error(secret); },
+  });
+  const accessor = {};
+  Object.defineProperty(accessor, 'ruleSet', {
+    enumerable: true,
+    get: () => { throw new Error(secret); },
+  });
+  for (const payload of [proxy, accessor]) {
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    await assert.rejects(repository.getLaunchRisk('mint-a'), (error: unknown) => {
+      assert.ok(error instanceof ApiProjectionDataError);
+      assert.equal(error.message.includes(secret), false);
+      return true;
+    });
+  }
+  assert.equal(proxyTrapCalled, false);
+});
+
+void test('projects complete engine evidence from calibrated and legacy persisted reports', async () => {
+  const report = new QualificationEngine(createDefaultQualificationRuleSet(60)).evaluate({
+    evaluatedAtMs: detectedAt.getTime(), signals: {}, blockers: [], calibrationFacts: null,
+  });
+  const calibrated = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;
+  const legacy = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;
+  const legacyRuleSet = legacy.ruleSet as Record<string, unknown>;
+  Reflect.deleteProperty(legacyRuleSet, 'fingerprint');
+  Reflect.deleteProperty(legacy, 'conditions');
+
+  for (const payload of [calibrated, legacy]) {
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    const value = await repository.getLaunchRisk('mint-a');
+    assert.deepEqual(value?.evidence, report.evidence.map(({ signal, status, message }) => ({ signal, status, message })));
+  }
+
+  for (const change of [
+    { dimension: 'invalid' },
+    { required: 'true' },
+    { weight: 101 },
+  ]) {
+    const corrupt = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;
+    const evidence = corrupt.evidence as Record<string, unknown>[];
+    evidence[0] = { ...evidence[0], ...change };
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: corrupt }]));
+    await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
+  }
 });
 
 void test('lists paper positions by stable keyset without decimal coercion', async () => {

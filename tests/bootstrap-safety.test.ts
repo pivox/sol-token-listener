@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import type { ApiProjectionPipelineState } from '../src/storage/api-projection.repository.js';
 import { parseConfig } from '../src/config/env.js';
 import {
@@ -12,13 +13,11 @@ import {
 } from '../src/app.js';
 import type { ApiEventStreamRepository } from '../src/ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
+import { QualificationProfileError } from '../src/qualification/qualification-profile.js';
+import { createQualificationEngine as buildQualificationEngine } from '../src/qualification/qualification-engine.js';
+import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
-const FORBIDDEN_IMPORTS = [
-  'execution/wallet',
-  'execution/transaction-confirmer',
-  'execution/trade-executor',
-  'dex/raydium-cpmm/transaction-builder',
-] as const;
+const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 
 const config = parseConfig({
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
@@ -27,9 +26,25 @@ const config = parseConfig({
 
 void test('bootstrap imports no signing, submission, or live execution path', async () => {
   const source = await readFile(new URL('../src/app.ts', import.meta.url), 'utf8');
-  for (const forbidden of FORBIDDEN_IMPORTS) {
-    assert.doesNotMatch(source, new RegExp(forbidden, 'u'));
-  }
+  assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(new URL('../src/app.ts', import.meta.url)), repositoryRoot), []);
+});
+
+void test('bootstrap boundary guard detects dynamic import and export-from execution dependencies', () => {
+  const source = [
+    'import type { Wallet } from "../execution/wallet.js";',
+    'export {} from "../dex/raydium-cpmm/transaction-builder.js";',
+    'await import("../execution/keypair.js");',
+    'type SubmissionModule = import("../execution/submission.js").Submission;',
+    'import Wallet = require("../execution/wallet.js");',
+    'import "../execution/order-sender.js";',
+    'import "../wallet-utils.js";',
+  ].join('\n');
+  assert.equal(executionBoundaryViolations(source, '/repo/src/qualification/engine.ts', '/repo').length, 7);
+  assert.equal(executionBoundaryViolations('const module = "../execution/order-sender.js"; await import(module);', '/repo/src/qualification/engine.ts', '/repo').length, 1);
+  assert.equal(executionBoundaryViolations('require("../execution/wallet.js");', '/repo/src/qualification/engine.ts', '/repo').length, 2);
+  assert.equal(executionBoundaryViolations('require(module);', '/repo/src/qualification/engine.ts', '/repo').length, 2);
+  assert.equal(executionBoundaryViolations("client['sendTransaction']();", '/repo/src/qualification/engine.ts', '/repo').length, 1);
+  assert.deepEqual(executionBoundaryViolations('form.submit(); import "../wallet-utils.js";', '/repo/src/qualification/engine.ts', '/repo'), []);
 });
 
 void test('migrates, starts listener before API, then closes listener before API and database', async () => {
@@ -88,6 +103,65 @@ void test('explicit diagnostic disablement logs listener.disabled without openin
     waitForShutdownSignal: async () => { throw new Error('must not wait'); },
   }));
   assert.deepEqual(calls, ['log:listener.foundation_ready', 'log:listener.disabled']);
+});
+
+void test('logs only the effective qualification profile identity at foundation startup', async () => {
+  const logs: object[] = [];
+  await runApplication(dependencies([], {
+    loadConfig: () => ({ ...config, listenerEnabled: false, apiEnabled: false, autoMigrate: false }),
+    createQualificationEngine: () => ({
+      minimumTotalScore: 60,
+      profileSummary: Object.freeze({
+        id: 'pumpfun-v1-initial',
+        version: 1,
+        status: 'UNVALIDATED_RULE_SET' as const,
+        fingerprint: 'a'.repeat(64),
+        minimumTotalScore: 60,
+      }),
+    }),
+    logInfo: (context) => { logs.push(context); },
+  }));
+
+  assert.deepEqual(logs[0], {
+    event: 'listener.foundation_ready',
+    executionMode: 'observe',
+    cluster: 'mainnet-beta',
+    paperQuoteMintAllowlist: [config.wsolMint],
+    qualificationProfileId: 'pumpfun-v1-initial',
+    qualificationProfileVersion: 1,
+    qualificationRuleSetStatus: 'UNVALIDATED_RULE_SET',
+    qualificationProfileFingerprint: 'a'.repeat(64),
+    qualificationMinimumScore: 60,
+    pumpFunListenerActive: false,
+    pumpSwapPipelineAvailable: true,
+    transactionSubmissionEnabled: false,
+  });
+});
+
+void test('selected invalid profile prevents every database, listener, and API resource', async () => {
+  const calls: string[] = [];
+  await assert.rejects(runApplication(dependencies(calls, {
+    loadConfig: () => ({
+      ...config,
+      qualificationProfilePath: './tests/fixtures/not-a-qualification-profile.json',
+    }),
+    createQualificationEngine: (received) => {
+      calls.push('profile.load');
+      return buildQualificationEngine(received);
+    },
+    getDatabasePool: () => { calls.push('pool'); throw new Error('must not open pool'); },
+    createListener: () => { calls.push('listener.create'); throw new Error('must not create listener'); },
+    createApiServer: () => { calls.push('server.create'); throw new Error('must not create API'); },
+  })), (error: unknown) => error instanceof QualificationProfileError && error.code === 'PROFILE_READ_FAILED');
+  assert.deepEqual(calls, ['profile.load']);
+
+  const logs: object[] = [];
+  reportEntrypointFailure(new QualificationProfileError('PROFILE_SCHEMA_INVALID'), { exitCode: undefined }, (context) => { logs.push(context); });
+  assert.deepEqual(logs, [{
+    event: 'listener.start_failed',
+    errorName: 'QualificationProfileError',
+  }]);
+  assert.doesNotMatch(JSON.stringify(logs), /path|content|cause/u);
 });
 
 void test('explicit listener disablement exposes STOPPED pipeline state to the API', async () => {
@@ -223,7 +297,16 @@ function dependencies(
   });
   return {
     loadConfig: () => config,
-    createQualificationEngine: () => ({ minimumTotalScore: 60 }),
+    createQualificationEngine: () => ({
+      minimumTotalScore: 60,
+      profileSummary: Object.freeze({
+        id: 'pumpfun-v1-initial',
+        version: 1,
+        status: 'UNVALIDATED_RULE_SET' as const,
+        fingerprint: 'a'.repeat(64),
+        minimumTotalScore: 60,
+      }),
+    }),
     getDatabasePool: () => { calls.push('pool'); return {}; },
     migrateDatabase: async () => { calls.push('migrate'); return []; },
     createListener: () => { calls.push('listener.create'); return runtime; },

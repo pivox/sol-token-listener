@@ -3,7 +3,10 @@ import type { AppConfig } from './config/env.js';
 import { createProductionListenerRuntime } from './application/production-listener-factory.js';
 import { loadConfig } from './config/env.js';
 import { ApiServer, type ApiListeningAddress, type ApiServerOptions } from './interfaces/http/api-server.js';
-import { createQualificationEngine } from './qualification/qualification-engine.js';
+import {
+  createQualificationEngine,
+  type QualificationProfileSummary,
+} from './qualification/qualification-engine.js';
 import { PostgresApiEventStreamRepository } from './storage/api-event-stream.repository.js';
 import {
   PostgresApiProjectionRepository,
@@ -26,7 +29,10 @@ export interface ApplicationServer {
 
 export interface ApplicationDependencies {
   readonly loadConfig: () => AppConfig;
-  readonly createQualificationEngine: (config: AppConfig) => Readonly<{ minimumTotalScore: number }>;
+  readonly createQualificationEngine: (config: AppConfig) => Readonly<{
+    minimumTotalScore: number;
+    profileSummary: QualificationProfileSummary;
+  }>;
   readonly getDatabasePool: (databaseUrl: string) => ApplicationPool;
   readonly migrateDatabase: (pool: ApplicationPool) => Promise<readonly string[]>;
   readonly createListener: (pool: ApplicationPool, config: AppConfig) => ListenerRuntime;
@@ -51,7 +57,7 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
   try {
     const config = dependencies.loadConfig();
     const qualificationEngine = dependencies.createQualificationEngine(config);
-    logFoundation(dependencies.logInfo, config, qualificationEngine.minimumTotalScore);
+    logFoundation(dependencies.logInfo, config, qualificationEngine.profileSummary);
     if (!config.listenerEnabled) {
       dependencies.logInfo({ event: 'listener.disabled' }, 'Listener réseau explicitement désactivé.');
     }
@@ -162,15 +168,18 @@ const productionDependencies: ApplicationDependencies = {
 };
 
 function logFoundation(
-  logInfo: ApplicationDependencies['logInfo'], config: AppConfig, minimumTotalScore: number,
+  logInfo: ApplicationDependencies['logInfo'], config: AppConfig, profile: QualificationProfileSummary,
 ): void {
   logInfo({
     event: 'listener.foundation_ready',
     executionMode: config.executionMode,
     cluster: config.cluster,
     paperQuoteMintAllowlist: config.paperQuoteMintAllowlist,
-    qualificationRuleSetStatus: config.qualificationRuleSetStatus,
-    qualificationMinimumScore: minimumTotalScore,
+    qualificationProfileId: profile.id,
+    qualificationProfileVersion: profile.version,
+    qualificationRuleSetStatus: profile.status,
+    qualificationProfileFingerprint: profile.fingerprint,
+    qualificationMinimumScore: profile.minimumTotalScore,
     pumpFunListenerActive: config.listenerEnabled,
     pumpSwapPipelineAvailable: true,
     transactionSubmissionEnabled: false,
@@ -198,7 +207,8 @@ export function reportEntrypointFailure(
   logFatal: (context: object, message: string) => void = (context, message) => { logger.fatal(context, message); },
 ): void {
   runtime.exitCode = 1;
-  logFatal({ event: 'listener.start_failed', errorName: safeErrorName(error) }, 'Initialisation du socle impossible.');
+  const errorName = safeErrorName(error);
+  logFatal({ event: 'listener.start_failed', errorName }, 'Initialisation du socle impossible.');
 }
 
 function safeErrorName(error: unknown): string {

@@ -49,19 +49,42 @@ des millisecondes entières canoniques. Les objets produits sont gelés.
 
 - d’une configuration `observe|paper`, allowlist et rétention ;
 - d’un `PaperTradingRepository` ;
+- de l’`EffectiveQualificationProfile` déjà chargé, injecté comme autorité de
+  politique sans rechargement ni I/O implicite ;
+- d’une `QualificationReportAuthority` process-local, fournie par le même
+  `QualificationEngine` qui évalue les rapports ;
 - d’une horloge injectée pour des tests déterministes.
 
 L’ouverture exige :
 
 - `EXECUTION_MODE=paper` ;
+- la référence exacte d’un rapport émis par l’autorité injectée pour le même
+  mint et le même identifiant d’événement déclencheur : une copie, une
+  reconstruction, une désérialisation ou une réutilisation pour un autre sujet
+  est refusée avant transaction ;
 - un rapport `QUALIFIED` sans blocker ;
+- une identité de ruleset (id, version, statut, fingerprint et score minimum),
+  des modes de conditions et des seuils identiques au profil effectif injecté ;
+- pour les policies d’exécution `ENFORCED`, des faits cohérents : simulation BUY
+  réussie, quote SELL inverse disponible et perte aller-retour observée égale
+  au calcul des quotes ; `REPORT_ONLY` reste non bloquant et `DISABLED` n’exige
+  pas d’observation ;
 - un quote mint autorisé ;
 - une quote BUY et une quote SELL inverse compatibles ;
 - une quantité et un résultat conservateur strictement positifs ;
-- une perte aller-retour inférieure au plafond fourni dans la commande.
+- une perte aller-retour inférieure au plafond de la commande et, lorsque sa
+  policy est `ENFORCED`, au plafond du profil effectif injecté.
 
 Le moteur remplit au `minimumAmountOutRaw`. Il ne promet donc ni prix réel, ni
 sellabilité, ni profit.
+
+L’autorisation de rapport est volontairement non sérialisable et ne survit pas
+au redémarrage du processus. Après restart, l’appelant doit reconstruire les
+inputs depuis des sources de confiance et les réévaluer avec le
+`QualificationEngine` injecté pour le mint et le nouvel événement déclencheur.
+Le paper trading n’étant pas encore composé dans
+le bootstrap de production, cette contrainte devra être respectée par sa future
+composition, sans relecture implicite de profil dans le moteur paper.
 
 La fermeture vend exactement la quantité paper encore détenue et utilise
 également `minimumAmountOutRaw`. La V1 ferme la position entièrement.

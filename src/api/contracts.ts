@@ -4,6 +4,8 @@ import type { LaunchStatus } from '../domain/launch-status.js';
 import type { PaperPositionStatus } from '../domain/paper-trading.js';
 import type {
   QualificationEvidenceStatus,
+  QualificationConditionMode,
+  QualificationConditionStatus,
   QualificationSignalKey,
   QualificationVerdict,
 } from '../domain/qualification.js';
@@ -98,6 +100,7 @@ export interface ApiQualification {
   readonly ruleSet: ApiQualificationRuleset;
   readonly scores: ApiQualificationScores;
   readonly evidence: readonly ApiQualificationEvidence[];
+  readonly conditions: readonly ApiQualificationCondition[];
   readonly blockers: readonly ApiQualificationBlocker[];
   readonly verdict: QualificationVerdict;
   readonly evaluatedAt: string;
@@ -108,6 +111,16 @@ export interface ApiQualificationRuleset {
   readonly version: number;
   readonly status: 'UNVALIDATED_RULE_SET';
   readonly minimumTotalScore: number;
+  readonly fingerprint: string | null;
+}
+
+export interface ApiQualificationCondition {
+  readonly code: QualificationReasonCode;
+  readonly mode: QualificationConditionMode;
+  readonly status: QualificationConditionStatus;
+  readonly observed: Readonly<Record<string, string | number | boolean | null>>;
+  readonly thresholds: Readonly<Record<string, string | number | null>>;
+  readonly message: string;
 }
 
 export interface ApiQualificationScores {

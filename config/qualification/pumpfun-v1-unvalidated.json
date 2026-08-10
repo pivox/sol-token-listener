@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "pumpfun-v1-initial",
+  "version": 1,
+  "status": "UNVALIDATED_RULE_SET",
+  "minimumTotalScore": 60,
+  "dimensionMaximums": { "preparation": 15, "socialAuthenticity": 25, "onchainHealth": 60 },
+  "rules": [
+    { "signal": "imageValid", "dimension": "preparation", "weight": 15, "required": true, "message": "Image is valid." },
+    { "signal": "socialCrossLinkConfirmed", "dimension": "socialAuthenticity", "weight": 25, "required": true, "message": "Social cross-link is confirmed." },
+    { "signal": "creatorHasNotSold", "dimension": "onchainHealth", "weight": 20, "required": true, "message": "Creator has not sold." },
+    { "signal": "reverseQuoteAvailable", "dimension": "onchainHealth", "weight": 20, "required": false, "message": "Reverse quote is available." },
+    { "signal": "externalBuyersObserved", "dimension": "onchainHealth", "weight": 20, "required": false, "message": "External buyers are observed." }
+  ],
+  "conditionPolicies": [
+    { "code": "CREATOR_EARLY_SELL", "mode": "ENFORCED", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "CREATOR_REPEAT_DUMPER", "mode": "DISABLED", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "MINT_SOCIAL_MISMATCH", "mode": "REPORT_ONLY", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "IMPERSONATION_SUSPECTED", "mode": "REPORT_ONLY", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "HOLDER_CONCENTRATION_EXCEEDED", "mode": "REPORT_ONLY", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "RELATED_WALLET_CLUSTER_EXCEEDED", "mode": "REPORT_ONLY", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "SHARED_FUNDER_CLUSTER", "mode": "REPORT_ONLY", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": 1, "maximumRoundTripLossBps": null },
+    { "code": "BUY_SIMULATION_FAILED", "mode": "ENFORCED", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "SELL_QUOTE_UNAVAILABLE", "mode": "ENFORCED", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "ROUND_TRIP_LOSS_EXCEEDED", "mode": "ENFORCED", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": 3000 },
+    { "code": "STALE_DATA", "mode": "ENFORCED", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "UNSUPPORTED_TOKEN_EXTENSION", "mode": "ENFORCED", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "METADATA_FETCH_FAILED", "mode": "REPORT_ONLY", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null },
+    { "code": "UNSUPPORTED_QUOTE_MINT", "mode": "ENFORCED", "maximumTop1Bps": null, "maximumTop5Bps": null, "maximumTop10Bps": null, "maximumClusterBps": null, "minimumSharedFunders": null, "maximumRoundTripLossBps": null }
+  ]
+}
