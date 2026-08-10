@@ -175,11 +175,21 @@ in scope even though Telegram supports many other deep-link forms.
 - deterministic `id` derived from mint, metadata snapshot and kind;
 - mint and metadata snapshot ID;
 - kind;
-- original declared URL;
+- SHA-256 of the declared value;
 - canonical URL when syntax is valid;
 - syntax status `VALID | INVALID`;
 - optional typed invalid reason;
 - observation timestamp.
+
+The untrusted declared string is never persisted or returned by the API. For a
+valid link, the canonical URL is the only retained URL. For an invalid link,
+only its SHA-256 and typed reason remain, so an embedded credential or query
+token cannot leak through storage, logs or API responses.
+
+The metadata object persisted in `token_metadata_snapshots` is rebuilt after
+link normalization: `websiteUrl`, `twitterUrl` and `telegramUrl` contain only
+their canonical valid value or `null`. The provider's raw declared strings
+exist only in memory until that rebuild and are then discarded.
 
 Only one link per kind comes from the current normalized metadata schema. The
 model remains a list so later providers can add verified alternatives without
