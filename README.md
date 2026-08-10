@@ -9,6 +9,13 @@ combine souscriptions WebSocket, rattrapage HTTP borné, inbox PostgreSQL avec
 leases et réconciliation de finalité. Raydium CPMM demeure un adaptateur
 secondaire isolé; son code n'est pas activé par ce bootstrap.
 
+Le parcours paper E2E est opt-in. Après une qualification sans blocker, un
+worker durable produit un candidat, ouvre une position simulée, compte les
+achats externes confirmés après l'entrée puis cote et simule la sortie. La
+venue de cotation est Pump.fun tant que la bonding curve est active, puis le
+pool PumpSwap canonique après graduation. Aucun de ces chemins ne construit,
+ne signe ou n'envoie une transaction Solana.
+
 ## Profil de qualification Pump.fun
 
 Le profil chargé par défaut est
@@ -139,6 +146,39 @@ long tout en conservant des bornes strictes. Voir le
 soak réel : les quotas et tableaux de bord du fournisseur restent la source de
 vérité pour la capacité et la facturation.
 
+## Dry run paper borné
+
+Le dry run démarre le bootstrap réel avec `EXECUTION_MODE=paper` et
+`PAPER_STRATEGY_ENABLED=true`, observe une fenêtre de 5 à 3 600 secondes, lit
+au plus 1 000 sessions mises à jour pendant cette fenêtre, puis ferme le
+listener avec le même chemin logique qu'un `SIGTERM`. Il écrit une seule fois
+un fichier JSON en mode création exclusive (`0600`) : un fichier existant
+n'est jamais écrasé.
+
+La configuration paper reste volontairement explicite : profil de
+qualification, perte aller-retour maximale, montant d'entrée, slippage et
+allowlist quote mint. Exemple à adapter avant un essai :
+
+```bash
+EXECUTION_MODE=paper \
+PAPER_STRATEGY_ENABLED=true \
+QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-v1-unvalidated.json \
+RISK_MAX_ROUNDTRIP_LOSS_BPS=3000 \
+PAPER_ENTRY_QUOTE_AMOUNT_RAW=1000000 \
+PAPER_SLIPPAGE_BPS=100 \
+npm run paper:dry-run -- \
+  --duration-seconds=60 \
+  --max-sessions=100 \
+  --report-file=paper-dry-run.json
+```
+
+Le rapport `paper-dry-run.v1` ne contient que les timestamps, les compteurs
+de sessions et positions, les états, les indisponibilités de quote et le PnL
+agrégé par quote mint sous forme de chaînes décimales. Il ne contient ni URL
+RPC/DB, ni transaction, signature, contenu social brut ou message d'erreur.
+`NO_CLOSED_POSITION` est un résultat de couverture valide, pas une panne
+technique. Un rapport dry run ne prouve ni profit, ni sellabilité.
+
 ## API V1
 
 L'API est activée par défaut (`API_ENABLED=true`) et écoute sur
@@ -167,6 +207,15 @@ le transport. Ce n'est pas `data.eventId`, qui reste l'identité métier
 déterministe. En cas de `EVENT_CURSOR_EXPIRED` (409), recharger les projections
 HTTP puis se reconnecter sans curseur; la rétention du flux est de quatre
 heures.
+
+Le détail d'un lancement expose de façon additive le candidat paper courant et
+la progression de la stratégie. Les positions exposent leur lignée de
+qualification, le nombre d'acheteurs externes, leur venue d'entrée
+`PUMP_FUN_BONDING_CURVE`, `PUMPSWAP` ou `UNKNOWN`, et des reason codes stables.
+La santé sépare `pipeline.paperDecision` et `paperDecisionJobs`. Les événements
+SSE `TradingCandidateUpdated`, `PaperStrategySessionUpdated` et
+`PaperExternalBuyCounted` sont des résumés bornés : aucune quote complète ni
+liste exhaustive de trades n'est publiée.
 
 Voir le contrat complet : [API V1](docs/api/v1.md).
 

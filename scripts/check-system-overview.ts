@@ -85,6 +85,16 @@ const requiredStatements = [
   'evidenceTruncated',
   'sans API payante',
   'contenu brut',
+  'paper:dry-run',
+  'TradingCandidateUpdated',
+  'PaperStrategySessionUpdated',
+  'PaperExternalBuyCounted',
+  'paperDecisionJobs',
+  'NO_CLOSED_POSITION',
+  'PUMP_FUN_BONDING_CURVE',
+  'PUMPSWAP',
+  'EXECUTION_MODE=paper',
+  'PAPER_STRATEGY_ENABLED=true',
 ];
 for (const statement of requiredStatements) {
   if (!html.includes(statement)) failures.push(`affirmation requise absente: ${statement}`);

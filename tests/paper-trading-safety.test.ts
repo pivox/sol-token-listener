@@ -8,6 +8,7 @@ const PAPER_FILES = [
   '../src/paper/paper-trading-engine.ts',
   '../src/paper/paper-quote-router.ts',
   '../src/paper/pumpfun-paper-quote.provider.ts',
+  '../src/cli/paper-dry-run.ts',
   '../src/ports/paper-quote-router.ts',
   '../src/ports/paper-trading-repository.ts',
   '../src/storage/paper-trading.repository.ts',

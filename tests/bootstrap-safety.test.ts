@@ -29,6 +29,13 @@ void test('bootstrap imports no signing, submission, or live execution path', as
   assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(new URL('../src/app.ts', import.meta.url)), repositoryRoot), []);
 });
 
+void test('paper dry-run bootstrap imports no signing, submission, or live execution path', async () => {
+  const path = fileURLToPath(new URL('../src/cli/paper-dry-run.ts', import.meta.url));
+  const source = await readFile(path, 'utf8');
+  assert.deepEqual(executionBoundaryViolations(source, path, repositoryRoot), []);
+  assert.doesNotMatch(source, /sendTransaction|simulateTransaction|signTransaction|Keypair|WalletSigner/iu);
+});
+
 void test('bootstrap boundary guard detects dynamic import and export-from execution dependencies', () => {
   const source = [
     'import type { Wallet } from "../execution/wallet.js";',
