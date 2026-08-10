@@ -25,6 +25,7 @@ export interface PaperTradingActions {
   open(command: OpenPaperPositionCommand): Promise<PaperPosition>;
   reconcileOpen(command: OpenPaperPositionCommand): Promise<PaperPosition>;
   close(command: ClosePaperPositionCommand): Promise<PaperPosition>;
+  retract(positionId: string, trigger: DomainEvent): Promise<PaperPosition>;
 }
 
 export interface ExternalBuysStrategyResult {
@@ -171,6 +172,62 @@ export class ValidatedExternalBuysStrategy {
       purgeAfterMs:position.purgeAfterMs,
     });
     return result(updated, [], 'NONE', position, input.qualificationEvent);
+  }
+
+  public async reconcileEvidence(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV1;
+    position: PaperPosition;
+    creator: string;
+    launchTrades: readonly BondingCurveTradeObservedEventV1[];
+    marketTrades: readonly MarketTrade[];
+    orphanedEvent: DomainEvent;
+    nowMs: number;
+  }>): Promise<ExternalBuysStrategyResult> {
+    if (input.orphanedEvent.confirmationStatus !== 'orphaned') {
+      throw new TypeError('Paper evidence reconciliation requires an orphaned event.');
+    }
+    assertReconcileInput(input);
+    const baseline = createPaperStrategySession({
+      candidate:input.candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'QUALIFIED_ENTRY',
+      positionId:input.position.id,entryCursor:input.session.entryCursor,
+      externalBuyTarget:input.session.externalBuyTarget,externalBuyCount:0,
+      countedTradeIds:[],lastCountedCursor:null,
+      minimumConfirmation:input.session.minimumConfirmation,lastQuote:input.candidate.buyQuote,
+      lastError:null,createdAtMs:input.session.createdAtMs,
+      updatedAtMs:Math.max(input.session.createdAtMs,input.position.openedAtMs),
+      purgeAfterMs:input.session.purgeAfterMs,
+    });
+    if (input.position.status === 'PAPER_HOLDING') {
+      return this.reconcile({ ...input,session:baseline });
+    }
+    let rebuilt = baseline;
+    const counted: PaperExternalBuyEvidence[] = [];
+    for (const trade of canonicalBuys({ ...input,session:baseline })) {
+      const countedResult = countExternalBuy(rebuilt, {
+        tradeId:trade.id,mint:input.candidate.mint,
+        quoteMint:input.candidate.quoteAsset.mint,trader:trade.trader,
+        cursor:trade.cursor,confirmationStatus:trade.confirmationStatus,
+        observedAtMs:trade.observedAtMs,
+      });
+      rebuilt=countedResult.session;
+      if (countedResult.evidence !== null) counted.push(countedResult.evidence);
+      if (countedResult.targetReached) break;
+    }
+    if (rebuilt.externalBuyCount === rebuilt.externalBuyTarget) {
+      return this.reconcile({ ...input,session:baseline });
+    }
+    const position = await this.ledger.retract(input.position.id,input.orphanedEvent);
+    if (position.status !== 'PAPER_RETRACTED' || position.purgeAfterMs === null) {
+      throw new TypeError('Paper evidence reconciliation did not retract the position.');
+    }
+    const retracted = Object.freeze({
+      ...rebuilt,state:'PAPER_RETRACTED' as const,reasonCode:'SOURCE_ORPHANED' as const,
+      updatedAtMs:Math.max(
+        rebuilt.updatedAtMs,input.session.updatedAtMs,input.orphanedEvent.observedAtMs,
+      ),purgeAfterMs:position.purgeAfterMs,
+    });
+    return result(retracted,counted,'NONE',position,input.orphanedEvent);
   }
 
   public async reconcile(input: Readonly<{

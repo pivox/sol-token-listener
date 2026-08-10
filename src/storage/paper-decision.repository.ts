@@ -247,11 +247,14 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       const holderSnapshot = await latestPayload<HolderDistribution>(client,
         'SELECT payload FROM token_holders_snapshots WHERE mint=$1 ORDER BY observed_at DESC,snapshot_id DESC LIMIT 1',job.mint);
       const walletGraph = await latestWalletGraph(client, job.mint);
-      const candidate = await loadCandidate(client, job, includeOrphaned);
+      let candidate = await loadCandidate(client, job, includeOrphaned);
+      const session = await loadSession(client, job, candidate, includeOrphaned);
+      if (includeOrphaned && candidate === null && session !== null) {
+        candidate = await loadCandidateById(client, session.candidateId);
+      }
       const currentDecision = candidate === null
         ? null
         : await loadCurrentDecision(client, candidate.id, includeOrphaned);
-      const session = await loadSession(client, job.mint, candidate, includeOrphaned);
       const launchTrades = await activeLaunchTrades(client, job.mint, session);
       const marketTrades = await activeMarketTrades(client, job.mint, session);
       const position = await loadPosition(client, job.mint, session);
@@ -588,7 +591,21 @@ async function upsertSession(
     reason_code=EXCLUDED.reason_code,position_id=EXCLUDED.position_id,
     close_command_id=EXCLUDED.close_command_id,external_buy_count=EXCLUDED.external_buy_count,
     updated_at=EXCLUDED.updated_at,terminal_at=EXCLUDED.terminal_at,
-    purge_after=EXCLUDED.purge_after,payload=EXCLUDED.payload`, [
+    purge_after=EXCLUDED.purge_after,payload=EXCLUDED.payload
+  WHERE (
+      paper_strategy_sessions.updated_at < EXCLUDED.updated_at
+      OR (
+        paper_strategy_sessions.updated_at = EXCLUDED.updated_at
+        AND (
+          EXCLUDED.external_buy_count >= paper_strategy_sessions.external_buy_count
+          OR $30::boolean
+        )
+      )
+    )
+    AND (
+      paper_strategy_sessions.state NOT IN ('PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW')
+      OR EXCLUDED.state IN ('PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW')
+    )`, [
     session.id,job.mint,session.candidateId,session.qualificationReportId,
     job.sourceEventId,sessionEventId,session.strategy.id,session.strategy.version,
     session.actorKind,session.state,session.reasonCode,session.quoteAsset.mint,
@@ -598,7 +615,7 @@ async function upsertSession(
     session.entryCursor.innerInstructionIndex,session.externalBuyTarget,
     session.externalBuyCount,session.minimumConfirmation,new Date(session.createdAtMs),
     new Date(session.updatedAtMs),terminal ? new Date(session.updatedAtMs) : null,
-    purgeAfter,toJsonValue(session),
+    purgeAfter,toJsonValue(session),job.sourceConfirmationStatus === 'orphaned',
   ]);
   if (purgeAfter !== null) {
     await client.query(`UPDATE paper_external_buy_events
@@ -723,24 +740,64 @@ async function loadCandidate(
     : decoded(field(row,'payload'),'Trading candidate payload is invalid.') as TradingCandidateV1;
 }
 
+async function loadCandidateById(
+  client: Client,
+  candidateId: string,
+): Promise<TradingCandidateV1 | null> {
+  const result = await client.query(
+    'SELECT payload FROM trading_candidates WHERE candidate_id=$1',
+    [candidateId],
+  );
+  const row = result.rows[0];
+  return row === undefined
+    ? null
+    : decoded(field(row,'payload'),'Trading candidate payload is invalid.') as TradingCandidateV1;
+}
+
 async function loadSession(
   client: Client,
-  mint: string,
+  job: ClaimedPaperDecisionJob,
   candidate: TradingCandidateV1 | null,
   includeOrphaned: boolean,
 ): Promise<PaperStrategySessionV1 | null> {
-  const result = includeOrphaned && candidate !== null
-    ? await client.query(`SELECT payload FROM paper_strategy_sessions
-        WHERE mint=$1 AND candidate_id=$2
-        ORDER BY updated_at DESC,session_id DESC LIMIT 1`, [mint,candidate.id])
-    : await client.query(`SELECT session.payload FROM paper_strategy_sessions session
-        JOIN domain_events source ON source.event_id=session.source_event_id
-        WHERE session.mint=$1 AND source.confirmation_status<>'orphaned'
-        ORDER BY session.updated_at DESC,session.session_id DESC LIMIT 1`, [mint]);
+  let result: Result;
+  if (includeOrphaned && candidate !== null) {
+    result=await client.query(`SELECT payload FROM paper_strategy_sessions
+      WHERE mint=$1 AND candidate_id=$2
+      ORDER BY updated_at DESC,session_id DESC LIMIT 1`, [job.mint,candidate.id]);
+  } else if (includeOrphaned) {
+    result=await client.query(`SELECT session.payload FROM paper_strategy_sessions session
+      WHERE session.mint=$1 AND (
+        session.session_id IN (
+          SELECT event.payload #>> '{session,id}' FROM domain_events event
+          WHERE event.raw_event_id=$2 AND event.type='PaperStrategySessionUpdated'
+        )
+        OR session.session_id IN (
+          SELECT evidence.session_id FROM paper_external_buy_events evidence
+          JOIN domain_events source ON source.event_id=evidence.source_event_id
+          WHERE source.raw_event_id=$2
+        )
+      )
+      ORDER BY session.updated_at DESC,session.session_id DESC LIMIT 1`, [
+      job.mint,job.sourceRawEventId,
+    ]);
+    if (result.rows[0] === undefined) {
+      result=await activeSession(client,job.mint);
+    }
+  } else {
+    result=await activeSession(client,job.mint);
+  }
   const row=result.rows[0];
   return row === undefined
     ? null
     : decoded(field(row,'payload'),'Paper strategy session payload is invalid.') as PaperStrategySessionV1;
+}
+
+function activeSession(client: Client, mint: string): Promise<Result> {
+  return client.query(`SELECT session.payload FROM paper_strategy_sessions session
+        JOIN domain_events source ON source.event_id=session.source_event_id
+        WHERE session.mint=$1 AND source.confirmation_status<>'orphaned'
+        ORDER BY session.updated_at DESC,session.session_id DESC LIMIT 1`, [mint]);
 }
 
 async function loadPosition(

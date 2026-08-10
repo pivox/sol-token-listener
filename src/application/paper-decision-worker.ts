@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { compareCursors } from '../domain/cursor.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { PaperStrategySessionV1 } from '../domain/paper-strategy.js';
 import type { PaperExecutionQuote } from '../domain/paper-trading.js';
@@ -76,6 +77,7 @@ interface StrategyActions {
   recoverOpen: ValidatedExternalBuysStrategy['recoverOpen'];
   reconcile: ValidatedExternalBuysStrategy['reconcile'];
   reconcileSource: ValidatedExternalBuysStrategy['reconcileSource'];
+  reconcileEvidence: ValidatedExternalBuysStrategy['reconcileEvidence'];
 }
 
 const systemScheduler: PaperDecisionWorkerScheduler = Object.freeze({
@@ -315,11 +317,18 @@ export class PaperDecisionWorker {
       await this.repository.stageDecision(job,staged);
       if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
       if (snapshot.asOfEvent.confirmationStatus === 'orphaned') {
-        reconciled=await this.strategy.reconcileSource({
-          candidate,session,qualification:persisted.report,
-          qualificationEvent:persisted.qualificationEvent,
-          maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
-        });
+        reconciled=compareCursors(candidate.asOf.cursor,snapshot.asOfEvent.cursor) === 0
+          ? await this.strategy.reconcileSource({
+            candidate,session,qualification:persisted.report,
+            qualificationEvent:persisted.qualificationEvent,
+            maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
+          })
+          : await this.strategy.reconcileEvidence({
+            candidate,session,position:snapshot.activePosition,
+            creator:snapshot.launch.creator,launchTrades:snapshot.activeLaunchTrades,
+            marketTrades:snapshot.activeMarketTrades,orphanedEvent:snapshot.asOfEvent,
+            nowMs:this.readNow(),
+          });
       } else if (session.state === 'BUY_PENDING') {
         reconciled=await this.strategy.recoverOpen({
           candidate,session,qualification:persisted.report,

@@ -164,10 +164,87 @@ void test('reconciles an orphaned entry into a retracted session without another
   assert.equal(result.requestedAction, 'NONE');
 });
 
+void test('rebuilds counted buys after a later trade is orphaned', async () => {
+  const ledger = new FakeLedger();
+  const strategy = new ValidatedExternalBuysStrategy(
+    ledger,new FakeRouter(),{ retentionMs:14_400_000 },
+  );
+  const candidate = eligibleCandidate();
+  const pending = strategy.prepare(candidate, {
+    externalBuyTarget:2,minimumConfirmation:'confirmed',nowMs:1_000,
+  });
+  assert.ok(pending);
+  const stale = Object.freeze({
+    ...pending,state:'WAITING_EXTERNAL_BUYS' as const,positionId:POSITION.id,
+    externalBuyCount:2,countedTradeIds:Object.freeze(['active','orphaned']),
+    lastCountedCursor:Object.freeze({
+      slot:10n,transactionIndex:0,instructionIndex:3,innerInstructionIndex:null,
+    }),updatedAtMs:2_000,purgeAfterMs:14_402_000,
+  });
+  const orphanedEvent = Object.freeze({
+    ...candidateEvent(),type:'BondingCurveTradeObserved' as const,
+    cursor:Object.freeze({
+      slot:10n,transactionIndex:0,instructionIndex:3,innerInstructionIndex:null,
+    }),confirmationStatus:'orphaned' as const,observedAtMs:2_000,
+  });
+
+  const result = await strategy.reconcileEvidence({
+    candidate,session:stale,position:POSITION,creator:'creator',
+    launchTrades:[launchBuy('active',2,'wallet')],marketTrades:[],
+    orphanedEvent,nowMs:2_000,
+  });
+
+  assert.equal(result.session.state,'WAITING_EXTERNAL_BUYS');
+  assert.equal(result.session.externalBuyCount,1);
+  assert.deepEqual(result.session.countedTradeIds,['active']);
+  assert.equal(ledger.retractCalls.length,0);
+});
+
+void test('retracts a committed close when active buys fall below the target', async () => {
+  const ledger = new FakeLedger();
+  const strategy = new ValidatedExternalBuysStrategy(
+    ledger,new FakeRouter(),{ retentionMs:14_400_000 },
+  );
+  const candidate = eligibleCandidate();
+  const pending = strategy.prepare(candidate, {
+    externalBuyTarget:1,minimumConfirmation:'confirmed',nowMs:1_000,
+  });
+  assert.ok(pending);
+  const closedPosition = Object.freeze({
+    ...POSITION,status:'PAPER_CLOSED' as const,remainingBaseRaw:0n,
+    quoteProceedsRaw:1_100n,grossPnlQuoteRaw:100n,netPnlQuoteRaw:100n,
+    exitTradeId:'exit',closeCommandHash:'close',closedAtMs:2_000,purgeAfterMs:14_402_000,
+  });
+  const closedSession = Object.freeze({
+    ...pending,state:'PAPER_CLOSED' as const,reasonCode:'EXTERNAL_BUY_TARGET_REACHED' as const,
+    positionId:POSITION.id,externalBuyCount:1,countedTradeIds:Object.freeze(['orphaned']),
+    lastCountedCursor:Object.freeze({
+      slot:10n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+    }),updatedAtMs:2_000,purgeAfterMs:14_402_000,
+  });
+  const orphanedEvent = Object.freeze({
+    ...candidateEvent(),type:'BondingCurveTradeObserved' as const,
+    cursor:Object.freeze({
+      slot:10n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+    }),confirmationStatus:'orphaned' as const,observedAtMs:2_000,
+  });
+
+  const result = await strategy.reconcileEvidence({
+    candidate,session:closedSession,position:closedPosition,creator:'creator',
+    launchTrades:[],marketTrades:[],orphanedEvent,nowMs:2_000,
+  });
+
+  assert.equal(result.session.state,'PAPER_RETRACTED');
+  assert.equal(result.position?.status,'PAPER_RETRACTED');
+  assert.equal(ledger.retractCalls.length,1);
+  assert.equal(ledger.closeCalls.length,0);
+});
+
 class FakeLedger {
   public readonly openCalls: OpenPaperPositionCommand[] = [];
   public readonly reconcileOpenCalls: OpenPaperPositionCommand[] = [];
   public readonly closeCalls: ClosePaperPositionCommand[] = [];
+  public readonly retractCalls: { readonly positionId:string; readonly trigger:DomainEvent }[] = [];
   public openResult: PaperPosition = POSITION;
   public reconcileOpenResult: PaperPosition = POSITION;
   public async open(command: OpenPaperPositionCommand): Promise<PaperPosition> {
@@ -184,6 +261,12 @@ class FakeLedger {
       ...POSITION,status:'PAPER_CLOSED',remainingBaseRaw:0n,quoteProceedsRaw:1_100n,
       grossPnlQuoteRaw:100n,netPnlQuoteRaw:100n,exitTradeId:'exit',closeCommandHash:'close',
       closedAtMs:3_000,purgeAfterMs:14_403_000,
+    });
+  }
+  public async retract(positionId: string, trigger: DomainEvent): Promise<PaperPosition> {
+    this.retractCalls.push({ positionId,trigger });
+    return Object.freeze({
+      ...POSITION,status:'PAPER_RETRACTED' as const,closedAtMs:2_000,purgeAfterMs:14_402_000,
     });
   }
 }

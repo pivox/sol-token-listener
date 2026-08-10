@@ -213,6 +213,23 @@ export class PaperTradingEngine {
     });
   }
 
+  public async retract(positionId: string, triggerEvent: DomainEvent): Promise<PaperPosition> {
+    this.requirePaperMode();
+    const trigger = snapshotTrigger(triggerEvent);
+    if (trigger.confirmationStatus !== 'orphaned') {
+      throw new PaperTradingError(
+        'TRIGGER_ORPHANED','La rétraction paper exige un événement orphaned.',
+      );
+    }
+    return this.repository.transact(async (transaction) => {
+      const current = await transaction.findPosition(positionId);
+      if (current === null) {
+        throw new PaperTradingError('POSITION_NOT_FOUND','Position paper introuvable.');
+      }
+      return this.retractPosition(transaction,current);
+    });
+  }
+
   public async close(command: ClosePaperPositionCommand): Promise<PaperPosition> {
     this.requirePaperMode();
     const snapshot = snapshotCloseCommand(command);
@@ -242,7 +259,7 @@ export class PaperTradingEngine {
           snapshot.trigger,
         );
         if (snapshot.trigger.confirmationStatus === 'orphaned') {
-          return this.retract(transaction, current);
+          return this.retractPosition(transaction, current);
         }
         return current;
       }
@@ -297,12 +314,12 @@ export class PaperTradingEngine {
       trigger,
     );
     if (trigger.confirmationStatus === 'orphaned') {
-      return this.retract(transaction, position);
+      return this.retractPosition(transaction, position);
     }
     return position;
   }
 
-  private async retract(
+  private async retractPosition(
     transaction: PaperTradingTransaction,
     current: PaperPosition,
   ): Promise<PaperPosition> {

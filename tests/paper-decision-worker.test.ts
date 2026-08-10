@@ -153,6 +153,38 @@ void test('retracts a paper session when its source revision becomes orphaned', 
   assert.equal(repository.completions[0]?.result.session?.state, 'PAPER_RETRACTED');
 });
 
+void test('recounts session evidence when a later trade becomes orphaned', async () => {
+  const operations: string[] = [];
+  const repository = new FakeRepository([claim()], operations);
+  const candidate = tradingCandidate('ELIGIBLE');
+  const session = createPaperStrategySession({
+    candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'EXTERNAL_BUY_OBSERVED',
+    positionId:POSITION.id,entryCursor:candidate.asOf.cursor,externalBuyTarget:10,
+    externalBuyCount:1,countedTradeIds:['orphaned-trade'],lastCountedCursor:Object.freeze({
+      slot:11n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+    }),minimumConfirmation:'confirmed',lastQuote:candidate.buyQuote,lastError:null,
+    createdAtMs:1_000,updatedAtMs:2_000,purgeAfterMs:14_402_000,
+  });
+  repository.snapshotValue=snapshot({
+    asOfEvent:Object.freeze({
+      ...event('BondingCurveTradeObserved','evt_trade','orphaned'),
+      cursor:Object.freeze({
+        slot:11n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+      }),
+    }),currentCandidate:candidate,currentSession:session,activePosition:POSITION,
+    currentDecision:persistedDecision(candidate,'orphaned'),
+  });
+  const services = fakeServices('ELIGIBLE', operations);
+  const worker = new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.ok(operations.includes('reconcile-evidence'));
+  assert.equal(operations.includes('reconcile-source'),false);
+});
+
 void test('retracts a closed paper session when its entry source becomes orphaned', async () => {
   const operations: string[] = [];
   const repository = new FakeRepository([claim()], operations);
@@ -327,6 +359,16 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
         position:Object.freeze({
           ...POSITION,status:'PAPER_RETRACTED' as const,closedAtMs:2_000,purgeAfterMs:14_402_000,
         }),
+      });
+    },
+    async reconcileEvidence(input: { readonly session:ReturnType<typeof createPaperStrategySession> }) {
+      operations.push('reconcile-evidence');
+      return Object.freeze({
+        session:Object.freeze({
+          ...input.session,externalBuyCount:0,countedTradeIds:Object.freeze([]),
+          lastCountedCursor:null,updatedAtMs:2_000,
+        }),sessionEvent:event('PaperStrategySessionUpdated','evt_session_recounted','orphaned'),
+        countedExternalBuys:Object.freeze([]),requestedAction:'NONE' as const,position:POSITION,
       });
     },
   };

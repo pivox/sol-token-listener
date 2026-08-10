@@ -845,6 +845,18 @@ void test('rétracte une clôture si son déclencheur devient orphaned', async (
   );
 });
 
+void test('rétracte explicitement une position existante sans nouveau trade', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository,'paper');
+  const opened = await engine.open(openCommand());
+  const retracted = await engine.retract(opened.id,Object.freeze({
+    ...trigger('BondingCurveTradeObserved'),confirmationStatus:'orphaned' as const,
+  }));
+
+  assert.equal(retracted.status,'PAPER_RETRACTED');
+  assert.equal(repository.writeCount,2);
+});
+
 function makeEngine(
   repository: PaperTradingRepository,
   executionMode: 'observe' | 'paper',

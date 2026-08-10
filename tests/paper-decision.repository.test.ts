@@ -134,6 +134,41 @@ void test('claims an orphaned source revision and reloads its paper lineage', as
   });
 });
 
+void test('reloads the entry candidate when a later trade becomes orphaned', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const entryJob = await repository.claim({ nowMs:1_000,leaseMs:1_000 });
+    assert.ok(entryJob);
+    const entry = decisionResult();
+    await repository.complete(entryJob,entry);
+    await seedTrade(pool);
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [TRADE_RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
+      [TRADE_RAW_EVENT_ID],
+    );
+
+    await repository.enqueueLatest(MINT,'trade-signature','orphaned');
+    const orphaned = await repository.claim({ nowMs:2_000,leaseMs:1_000 });
+    assert.ok(orphaned);
+    const snapshot = await repository.loadSnapshot(orphaned);
+
+    assert.equal(snapshot.asOfEvent.id,TRADE_EVENT_ID);
+    assert.equal(snapshot.currentCandidate?.id,entry.candidate.id);
+    assert.equal(snapshot.currentSession?.candidateId,entry.candidate.id);
+    assert.equal(snapshot.currentDecision?.reportId,entry.candidate.qualificationReportId);
+  });
+});
+
 void test('retries with a bounded lease and cancels only after exhaustion', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
@@ -309,6 +344,45 @@ void test('does not let a delayed older job supersede a newer decision', async (
   });
 });
 
+void test('does not let a delayed session update regress a closed session', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const entryJob = await repository.claim({ nowMs:1_000,leaseMs:10_000 });
+    assert.ok(entryJob);
+    const entry = decisionResult();
+    await repository.complete(entryJob,entry);
+
+    await repository.enqueue(jobInput({
+      sourceEventId:TRADE_EVENT_ID,sourceRawEventId:TRADE_RAW_EVENT_ID,
+      inputFingerprint:'6'.repeat(64),
+    }));
+    const older = await repository.claim({ nowMs:2_000,leaseMs:10_000 });
+    assert.ok(older);
+    await repository.enqueue(jobInput({
+      sourceEventId:TRADE_EVENT_ID,sourceRawEventId:TRADE_RAW_EVENT_ID,
+      inputFingerprint:'5'.repeat(64),
+    }));
+    const newer = await repository.claim({ nowMs:2_100,leaseMs:10_000 });
+    assert.ok(newer);
+
+    await repository.complete(newer,decisionWithSession(entry,'PAPER_CLOSED',10,3_000));
+    await repository.complete(older,decisionWithSession(entry,'WAITING_EXTERNAL_BUYS',9,2_000));
+
+    const current = await pool.query<{
+      readonly state:string;
+      readonly external_buy_count:number;
+    }>('SELECT state,external_buy_count FROM paper_strategy_sessions');
+    assert.deepEqual(current.rows, [{ state:'PAPER_CLOSED',external_buy_count:10 }]);
+  });
+});
+
 void test('purges counted external buys before their terminal paper session', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
@@ -414,6 +488,33 @@ function decisionResultAt(slot: bigint, evaluatedAtMs: number, reportIdentity: s
   const result = decisionResult('confirmed', cursor, evaluatedAtMs, reportIdentity);
   return Object.freeze({
     ...result,session:null,sessionEvent:null,requestedAction:'NONE' as const,
+  });
+}
+
+function decisionWithSession(
+  base: PaperDecisionResult,
+  state: 'WAITING_EXTERNAL_BUYS' | 'PAPER_CLOSED',
+  externalBuyCount: number,
+  updatedAtMs: number,
+): PaperDecisionResult {
+  const session = createPaperStrategySession({
+    candidate:base.candidate,state,reasonCode:state === 'PAPER_CLOSED'
+      ? 'EXTERNAL_BUY_TARGET_REACHED'
+      : 'EXTERNAL_BUY_OBSERVED',positionId:'paper-position',
+    entryCursor:base.candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount,
+    countedTradeIds:Array.from({ length:externalBuyCount }, (_, index) => `trade-${index}`),
+    lastCountedCursor:Object.freeze({
+      slot:11n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+    }),minimumConfirmation:'confirmed',lastQuote:base.candidate.buyQuote,lastError:null,
+    createdAtMs:1_000,updatedAtMs,purgeAfterMs:updatedAtMs+14_400_000,
+  });
+  const sessionEvent = derivedEvent(
+    'PaperStrategySessionUpdated',`${session.id}:${state}:${externalBuyCount}`,
+    { session },'confirmed',base.candidate.asOf.cursor,updatedAtMs,
+  );
+  return Object.freeze({
+    ...base,session,sessionEvent,countedExternalBuys:Object.freeze([]),
+    requestedAction:'NONE' as const,
   });
 }
 
