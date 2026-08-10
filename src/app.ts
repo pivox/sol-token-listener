@@ -191,6 +191,7 @@ function disabledPipelineState(): ApiProjectionPipelineState {
     httpAvailable: true,
     pumpfun: 'STOPPED',
     pumpswap: 'STOPPED',
+    paperDecision: 'STOPPED',
     social: 'STOPPED',
   });
 }

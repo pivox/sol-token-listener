@@ -29,6 +29,7 @@ void test('composes the passive production listener without opening resources', 
     httpAvailable: true,
     pumpfun: 'STOPPED',
     pumpswap: 'STOPPED',
+    paperDecision: 'STOPPED',
     social: 'STOPPED',
   });
 });

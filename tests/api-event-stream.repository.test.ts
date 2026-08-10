@@ -257,6 +257,97 @@ void test('reads non-contiguous revisions in ascending sequence without duplicat
   assert.equal(Object.isFrozen(first[0]?.event.payload ?? {}), true);
 });
 
+void test('projects bounded paper event summaries before exposing SSE payloads', async () => {
+  const candidatePayload = {
+    candidate: {
+      id: `candidate_${'a'.repeat(64)}`, state: 'ELIGIBLE',
+      strategy: { id: 'validated-external-buys', version: 1 },
+      qualificationReportId: `qreport_${'b'.repeat(64)}`,
+      quoteAsset: { mint: 'quote', decimals: 9, tokenProgram: 'SPL_TOKEN' },
+      reasonCodes: ['QUALIFIED_ENTRY'], eligibleUntilMs: 1_800_000_000_000,
+      buyQuote: { private: 'must-not-stream' }, reverseSellQuote: { private: 'hidden' },
+    },
+  };
+  const sessionPayload = {
+    session: {
+      id: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
+      reasonCode: 'EXTERNAL_BUY_OBSERVED',
+      strategy: { id: 'validated-external-buys', version: 1 }, positionId: 'position-a',
+      quoteAsset: { mint: 'quote', decimals: 9, tokenProgram: 'SPL_TOKEN' },
+      externalBuyCount: 3, externalBuyTarget: 10, minimumConfirmation: 'confirmed',
+      updatedAtMs: 1_800_000_000_000,
+      countedTradeIds: new Array(1000).fill('must-not-stream'),
+      lastQuote: { private: 'must-not-stream' },
+      lastError: { code: 'QUOTE_UNAVAILABLE', message: 'secret', retryable: true },
+    },
+  };
+  const cases = [
+    ['TradingCandidateUpdated', candidatePayload],
+    ['PaperStrategySessionUpdated', sessionPayload],
+    ['PaperExternalBuyCounted', { tradeId: 'trade-a', rawTrade: 'must-not-stream' }],
+  ] as const;
+
+  const payloads: unknown[] = [];
+  for (const [type, payload] of cases) {
+    const repository = new PostgresApiEventStreamRepository(new FakeQueryable(() => [
+      batchResult(row('5', {
+        event_type: type,
+        event: event({ type, payload }),
+      })),
+    ]));
+    const revisions = await repository.readAfter(0n, 1);
+    payloads.push(revisions[0]?.event.payload);
+  }
+
+  assert.deepEqual(payloads[0], {
+    candidateId: `candidate_${'a'.repeat(64)}`, state: 'ELIGIBLE',
+    strategy: { id: 'validated-external-buys', version: 1 },
+    qualificationReportId: `qreport_${'b'.repeat(64)}`, quoteMint: 'quote',
+    reasonCodes: ['QUALIFIED_ENTRY'], eligibleUntil: '2027-01-15T08:00:00.000Z',
+  });
+  assert.deepEqual(payloads[1], {
+    sessionId: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
+    reasonCode: 'EXTERNAL_BUY_OBSERVED',
+    strategy: { id: 'validated-external-buys', version: 1 }, positionId: 'position-a',
+    quoteMint: 'quote', externalBuyCount: 3, externalBuyTarget: 10,
+    minimumConfirmation: 'confirmed', updatedAt: '2027-01-15T08:00:00.000Z',
+    lastError: { code: 'QUOTE_UNAVAILABLE', retryable: true },
+  });
+  assert.deepEqual(payloads[2], { tradeId: 'trade-a' });
+  assert.doesNotMatch(JSON.stringify(payloads), /must-not-stream|secret|countedTradeIds/u);
+  assert.ok(Buffer.byteLength(JSON.stringify(payloads)) < 4_096);
+
+  const invalidCases = [
+    ['TradingCandidateUpdated', {
+      candidate: { ...candidatePayload.candidate, state: 'UNKNOWN' },
+    }],
+    ['TradingCandidateUpdated', {
+      candidate: {
+        ...candidatePayload.candidate,
+        reasonCodes: ['QUALIFIED_ENTRY', 'QUALIFIED_ENTRY'],
+      },
+    }],
+    ['PaperStrategySessionUpdated', {
+      session: { ...sessionPayload.session, externalBuyCount: 11 },
+    }],
+    ['PaperStrategySessionUpdated', {
+      session: {
+        ...sessionPayload.session,
+        lastError: { code: 'unsafe-code', message: 'hidden', retryable: true },
+      },
+    }],
+  ] as const;
+  for (const [type, payload] of invalidCases) {
+    const repository = new PostgresApiEventStreamRepository(new FakeQueryable(() => [
+      batchResult(row('5', {
+        event_type: type,
+        event: event({ type, payload }),
+      })),
+    ]));
+    await assert.rejects(repository.readAfter(0n, 1), ApiEventStreamDataError);
+  }
+});
+
 void test('readAfter rejects an expired cursor in its single statement instead of returning an empty batch', async () => {
   for (const expiredThrough of ['0', '5']) {
     const database = new FakeQueryable(() => [batchResult(null, {

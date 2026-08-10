@@ -3,9 +3,15 @@ import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
+import {
+  PUMP_FEE_PROGRAM_ID as OFFICIAL_PUMP_FEE_PROGRAM_ID,
+  PUMP_PROGRAM_ID as OFFICIAL_PUMP_PROGRAM_ID,
+} from '@pump-fun/pump-sdk';
 
 export const PUMP_PROGRAM_ID =
-  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+  OFFICIAL_PUMP_PROGRAM_ID.toBase58();
+export const PUMP_FEE_PROGRAM_ADDRESS =
+  OFFICIAL_PUMP_FEE_PROGRAM_ID.toBase58();
 export const DEFAULT_PUBLIC_KEY =
   '11111111111111111111111111111111';
 export const WSOL_MINT = NATIVE_MINT.toBase58();

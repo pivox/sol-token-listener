@@ -7,6 +7,9 @@ import { DOMAIN_EVENT_TYPES } from '../src/domain/events.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 
 const migrationUrl = new URL('../migrations/006_api_event_stream.sql', import.meta.url);
+const PAPER_EVENT_TYPES = new Set([
+  'TradingCandidateUpdated', 'PaperStrategySessionUpdated', 'PaperExternalBuyCounted',
+]);
 
 void test('la migration crée une outbox append-only publique, indexée et sans FK parent', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
@@ -35,11 +38,11 @@ void test('la migration crée une outbox append-only publique, indexée et sans 
   assert.match(sql, /INSERT INTO api_event_stream_state \(id\) VALUES \(1\) ON CONFLICT \(id\) DO NOTHING/u);
   assert.deepEqual(
     sqlStringListAfter(sql, 'event_type TEXT NOT NULL CHECK (event_type IN ('),
-    DOMAIN_EVENT_TYPES.filter((type) => type !== 'HolderDistributionUpdated'),
+    DOMAIN_EVENT_TYPES.filter((type) => type !== 'HolderDistributionUpdated' && !PAPER_EVENT_TYPES.has(type)),
   );
   assert.deepEqual(
     sqlStringListAfter(sql, 'AND type IN ('),
-    DOMAIN_EVENT_TYPES.filter((type) => type !== 'HolderDistributionUpdated'),
+    DOMAIN_EVENT_TYPES.filter((type) => type !== 'HolderDistributionUpdated' && !PAPER_EVENT_TYPES.has(type)),
   );
   const backfill = sql.indexOf('INSERT INTO %1$I.api_event_stream');
   assert.ok(backfill >= 0);
@@ -257,6 +260,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '010_transaction_inbox_timestamps.sql',
       '011_transaction_inbox_retry_recovery.sql',
       '012_public_social_evidence.sql',
+      '013_paper_e2e.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

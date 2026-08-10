@@ -157,6 +157,11 @@ export class PaperTradingEngine {
         openCommandHash: openCommandHashes.current,
         closeCommandHash: null,
         triggerEventId: snapshot.trigger.id,
+        ...(snapshot.strategySessionId === undefined ? {} : {
+          strategySessionId:snapshot.strategySessionId,
+          qualificationReportId:snapshot.qualificationReportId,
+          candidateId:snapshot.candidateId,
+        }),
         openedAtMs,
         closedAtMs: null,
         purgeAfterMs: null,
@@ -168,6 +173,60 @@ export class PaperTradingEngine {
         createPaperEvent('PaperPositionOpened', position, trade, snapshot.trigger),
       );
       return position;
+    });
+  }
+
+  public async reconcileOpen(command: OpenPaperPositionCommand): Promise<PaperPosition> {
+    this.requirePaperMode();
+    const snapshot = snapshotOpenCommand(
+      command,command.qualification,command.mint,snapshotTrigger(command.trigger),
+    );
+    validateOpenCommand(
+      snapshot,
+      this.config.paperQuoteMintAllowlist,
+      this.qualificationProfile,
+    );
+    const roundTrip = calculateRoundTrip(snapshot.buyQuote, snapshot.reverseSellQuote);
+    validateQualificationExecutionFacts(
+      snapshot.qualification,
+      roundTrip.lossBps,
+      this.qualificationProfile,
+    );
+    if (roundTrip.lossBps > snapshot.maximumRoundTripLossBps) {
+      roundTripLossExceeded(roundTrip.lossBps);
+    }
+    const positionId = hashId('paper_position', [
+      snapshot.mint,
+      snapshot.strategy.id,
+      snapshot.strategy.version,
+      snapshot.trigger.id,
+    ]);
+    const openCommandHashes = hashOpenCommand(snapshot);
+    return this.repository.transact(async (transaction) => {
+      const existing = await transaction.findPosition(positionId);
+      if (existing === null) {
+        throw new PaperTradingError('POSITION_NOT_FOUND', 'Position paper introuvable.');
+      }
+      return this.reconcileOpenReplay(
+        transaction,existing,openCommandHashes,snapshot.trigger,
+      );
+    });
+  }
+
+  public async retract(positionId: string, triggerEvent: DomainEvent): Promise<PaperPosition> {
+    this.requirePaperMode();
+    const trigger = snapshotTrigger(triggerEvent);
+    if (trigger.confirmationStatus !== 'orphaned') {
+      throw new PaperTradingError(
+        'TRIGGER_ORPHANED','La rétraction paper exige un événement orphaned.',
+      );
+    }
+    return this.repository.transact(async (transaction) => {
+      const current = await transaction.findPosition(positionId);
+      if (current === null) {
+        throw new PaperTradingError('POSITION_NOT_FOUND','Position paper introuvable.');
+      }
+      return this.retractPosition(transaction,current);
     });
   }
 
@@ -200,7 +259,7 @@ export class PaperTradingEngine {
           snapshot.trigger,
         );
         if (snapshot.trigger.confirmationStatus === 'orphaned') {
-          return this.retract(transaction, current);
+          return this.retractPosition(transaction, current);
         }
         return current;
       }
@@ -255,12 +314,12 @@ export class PaperTradingEngine {
       trigger,
     );
     if (trigger.confirmationStatus === 'orphaned') {
-      return this.retract(transaction, position);
+      return this.retractPosition(transaction, position);
     }
     return position;
   }
 
-  private async retract(
+  private async retractPosition(
     transaction: PaperTradingTransaction,
     current: PaperPosition,
   ): Promise<PaperPosition> {
@@ -363,6 +422,12 @@ function validateOpenCommand(
   if (command.strategy.id.trim() === '' || !Number.isSafeInteger(command.strategy.version) || command.strategy.version <= 0) {
     invalidQuote('strategy');
   }
+  const lineage = [command.strategySessionId,command.qualificationReportId,command.candidateId];
+  if (
+    lineage.some((value) => value !== undefined)
+    && (lineage.some((value) => value === undefined)
+      || lineage.some((value) => value?.trim() === ''))
+  ) invalidQuote('paper lineage');
   validateQualificationReport(command.qualification, qualificationProfile);
   if (command.qualification.blockers.length > 0) {
     throw new PaperTradingError('QUALIFICATION_BLOCKED', 'La qualification contient un blocker.');
@@ -544,6 +609,11 @@ function snapshotOpenCommand(
     buyQuote: snapshotQuote(command.buyQuote),
     reverseSellQuote: snapshotQuote(command.reverseSellQuote),
     maximumRoundTripLossBps: command.maximumRoundTripLossBps,
+    ...(command.strategySessionId === undefined ? {} : {
+      strategySessionId:command.strategySessionId,
+      qualificationReportId:command.qualificationReportId,
+      candidateId:command.candidateId,
+    }),
   });
 }
 

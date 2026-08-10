@@ -87,7 +87,7 @@ void test('market observation service validates, sorts and derives raw events', 
   const repository: MarketObservationRepository = {
     record(batch) {
       received = batch;
-      return Promise.resolve({ migrations: [], activations: [] });
+      return Promise.resolve({ migrations: [], activations: [], affectedMints: [] });
     },
     loadActivePools: () => Promise.resolve([]),
   };
@@ -107,7 +107,7 @@ void test('market observation service validates, sorts and derives raw events', 
 });
 
 void test('market observation service rejects duplicate identities and foreign cursors', async () => {
-  const result: MarketObservationResult = { migrations: [], activations: [] };
+  const result: MarketObservationResult = { migrations: [], activations: [], affectedMints: [] };
   const repository: MarketObservationRepository = {
     record: () => Promise.resolve(result),
     loadActivePools: () => Promise.resolve([]),
@@ -143,7 +143,7 @@ void test('raw market payload stays stable across confirmation replay', async ()
   const repository: MarketObservationRepository = {
     record(batch) {
       batches.push(batch);
-      return Promise.resolve({ migrations: [], activations: [] });
+      return Promise.resolve({ migrations: [], activations: [], affectedMints: [] });
     },
     loadActivePools: () => Promise.resolve([]),
   };

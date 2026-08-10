@@ -174,10 +174,11 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
         quote_cost_raw, quote_proceeds_raw, gross_pnl_quote_raw, net_pnl_quote_raw,
         round_trip_loss_bps, entry_trade_id, exit_trade_id, open_command_hash,
         close_command_hash, trigger_event_id, payload_version, payload, opened_at,
-        closed_at, purge_after
+        closed_at, purge_after, strategy_session_id, qualification_report_id,
+        candidate_id
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-        $20,$21,$22,$23,$24,$25
+        $20,$21,$22,$23,$24,$25,$26,$27,$28
       )`,
       [
         position.id, position.mint, position.quoteAsset.mint,
@@ -191,6 +192,8 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
         position.triggerEventId, position.payloadVersion, toJsonValue(position),
         new Date(position.openedAtMs), date(position.closedAtMs),
         date(position.purgeAfterMs),
+        position.strategySessionId ?? null,position.qualificationReportId ?? null,
+        position.candidateId ?? null,
       ],
     );
   }
@@ -270,6 +273,13 @@ function decodePosition(row: unknown): PaperPosition | null {
   ) {
     invalidPayload('status');
   }
+  const lineage = Object.hasOwn(value, 'strategySessionId')
+    ? {
+      strategySessionId:text(value.strategySessionId, 'strategySessionId'),
+      qualificationReportId:text(value.qualificationReportId, 'qualificationReportId'),
+      candidateId:text(value.candidateId, 'candidateId'),
+    }
+    : {};
   const position: PaperPosition = {
     id: text(value.id, 'id'),
     mint: text(value.mint, 'mint'),
@@ -295,6 +305,7 @@ function decodePosition(row: unknown): PaperPosition | null {
     openCommandHash: text(value.openCommandHash, 'openCommandHash'),
     closeCommandHash: nullableText(value.closeCommandHash, 'closeCommandHash'),
     triggerEventId: text(value.triggerEventId, 'triggerEventId'),
+    ...lineage,
     openedAtMs: integer(value.openedAtMs, 'openedAtMs'),
     closedAtMs: nullableInteger(value.closedAtMs, 'closedAtMs'),
     purgeAfterMs: nullableInteger(value.purgeAfterMs, 'purgeAfterMs'),

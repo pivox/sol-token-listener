@@ -78,6 +78,12 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly marketReserveSnapshots: number;
   readonly marketPools: number;
   readonly migrations: number;
+  readonly paperExternalBuys: number;
+  readonly paperSessions: number;
+  readonly tradingCandidates: number;
+  readonly qualificationReports: number;
+  readonly paperDecisionJobs: number;
+  readonly paperTrades: number;
   readonly paperPositions: number;
   readonly stateTransitions: number;
   readonly observedWalletPositions: number;
@@ -131,7 +137,15 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        WHERE snapshot.mint = launch.mint
          AND (
            snapshot.purge_after <= statement_timestamp()
-           OR launch.purge_after <= statement_timestamp()
+           OR (
+             launch.purge_after <= statement_timestamp()
+             AND NOT EXISTS (
+               SELECT 1 FROM social_evidence_collections collection
+               WHERE collection.metadata_snapshot_id = snapshot.snapshot_id
+                 AND (collection.purge_after IS NULL
+                   OR collection.purge_after > statement_timestamp())
+             )
+           )
          )`,
     );
     const bondingCurveSnapshots = await client.query(
@@ -153,6 +167,40 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     );
     const migrations = await client.query(
       'DELETE FROM migrations WHERE purge_after <= NOW()',
+    );
+    const paperExternalBuys = await client.query(
+      'DELETE FROM paper_external_buy_events WHERE purge_after <= statement_timestamp()',
+    );
+    const paperSessions = await client.query(
+      'DELETE FROM paper_strategy_sessions WHERE purge_after <= statement_timestamp()',
+    );
+    const tradingCandidates = await client.query(
+      `DELETE FROM trading_candidates candidate
+       WHERE candidate.purge_after <= statement_timestamp()
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_strategy_sessions session
+           WHERE session.candidate_id = candidate.candidate_id
+         )`,
+    );
+    const qualificationReports = await client.query(
+      `DELETE FROM qualification_reports report
+       WHERE report.purge_after <= statement_timestamp()
+         AND NOT EXISTS (
+           SELECT 1 FROM trading_candidates candidate
+           WHERE candidate.report_id = report.report_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_strategy_sessions session
+           WHERE session.report_id = report.report_id
+         )`,
+    );
+    const paperDecisionJobs = await client.query(
+      'DELETE FROM paper_decision_jobs WHERE purge_after <= statement_timestamp()',
+    );
+    const paperTrades = await client.query(
+      `DELETE FROM paper_trades trade USING paper_positions position
+       WHERE trade.position_id = position.position_id
+         AND position.purge_after <= NOW()`,
     );
     const paperPositions = await client.query(
       'DELETE FROM paper_positions WHERE purge_after <= NOW()',
@@ -250,20 +298,123 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            'HolderDistributionUpdated',
            'WalletClusterDetected'
          )
-         AND launch.purge_after <= NOW()`,
+         AND launch.purge_after <= NOW()
+         AND NOT EXISTS (
+           SELECT 1 FROM qualification_reports report
+           WHERE report.source_event_id = event.event_id
+              OR report.qualification_event_id = event.event_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM trading_candidates candidate
+           WHERE candidate.source_event_id = event.event_id
+              OR candidate.candidate_event_id = event.event_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_strategy_sessions session
+           WHERE session.source_event_id = event.event_id
+              OR session.session_event_id = event.event_id
+         )`,
     );
     const expiredDomainEvents = await client.query(
-      'DELETE FROM domain_events WHERE purge_after <= NOW()',
+      `DELETE FROM domain_events WHERE purge_after <= NOW()
+         AND NOT EXISTS (
+           SELECT 1 FROM social_enrichment_jobs job
+           WHERE job.source_launch_event_id = domain_events.event_id
+             AND (job.purge_after IS NULL OR job.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM social_evidence_collections collection
+           WHERE collection.source_launch_event_id = domain_events.event_id
+             AND (collection.purge_after IS NULL OR collection.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_decision_jobs job
+           WHERE job.source_event_id = domain_events.event_id
+             AND (job.purge_after IS NULL OR job.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM qualification_reports report
+           WHERE report.source_event_id = domain_events.event_id
+              OR report.qualification_event_id = domain_events.event_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM trading_candidates candidate
+           WHERE candidate.source_event_id = domain_events.event_id
+              OR candidate.candidate_event_id = domain_events.event_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_strategy_sessions session
+           WHERE session.source_event_id = domain_events.event_id
+              OR session.session_event_id = domain_events.event_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_external_buy_events counted
+           WHERE counted.source_event_id = domain_events.event_id
+         )`,
     );
     const rawEvents = await client.query(
       `DELETE FROM raw_chain_events raw
        WHERE raw.purge_after <= NOW()
          AND NOT EXISTS (
            SELECT 1 FROM domain_events domain_event WHERE domain_event.raw_event_id = raw.event_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM social_enrichment_jobs job
+           WHERE job.source_raw_event_id = raw.event_id
+             AND (job.purge_after IS NULL OR job.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_decision_jobs job
+           WHERE job.source_raw_event_id = raw.event_id
+             AND (job.purge_after IS NULL OR job.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM qualification_reports report
+           WHERE report.source_raw_event_id = raw.event_id
          )`,
     );
     const launches = await client.query(
-      'DELETE FROM token_launches WHERE purge_after <= NOW()',
+      `DELETE FROM token_launches launch WHERE purge_after <= NOW()
+         AND NOT EXISTS (
+           SELECT 1 FROM social_enrichment_jobs social_job
+           WHERE social_job.mint = launch.mint
+             AND (social_job.purge_after IS NULL
+               OR social_job.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM social_evidence_collections social_collection
+           WHERE social_collection.mint = launch.mint
+             AND (social_collection.purge_after IS NULL
+               OR social_collection.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_decision_jobs paper_job
+           WHERE paper_job.mint = launch.mint
+             AND (paper_job.purge_after IS NULL
+               OR paper_job.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM qualification_reports report
+           WHERE report.mint = launch.mint
+             AND report.purge_after > statement_timestamp()
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM trading_candidates candidate
+           WHERE candidate.mint = launch.mint
+             AND candidate.purge_after > statement_timestamp()
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_strategy_sessions session
+           WHERE session.mint = launch.mint
+             AND (session.purge_after IS NULL
+               OR session.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_positions position
+           WHERE position.mint = launch.mint
+             AND (position.purge_after IS NULL
+               OR position.purge_after > statement_timestamp())
+         )`,
     );
     await client.query('COMMIT');
     return {
@@ -279,6 +430,12 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       marketReserveSnapshots: marketReserveSnapshots.rowCount ?? 0,
       marketPools: marketPools.rowCount ?? 0,
       migrations: migrations.rowCount ?? 0,
+      paperExternalBuys: paperExternalBuys.rowCount ?? 0,
+      paperSessions: paperSessions.rowCount ?? 0,
+      tradingCandidates: tradingCandidates.rowCount ?? 0,
+      qualificationReports: qualificationReports.rowCount ?? 0,
+      paperDecisionJobs: paperDecisionJobs.rowCount ?? 0,
+      paperTrades: paperTrades.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
       stateTransitions: transitions.rowCount ?? 0,
       observedWalletPositions: observedWalletPositions.rowCount ?? 0,

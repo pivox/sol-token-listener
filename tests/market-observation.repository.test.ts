@@ -183,7 +183,7 @@ void test('confirmed orphaning retracts dependent market projections', async () 
     reserveSnapshots: [],
     trades: [],
   });
-  assert.deepEqual(result, { migrations: [], activations: [] });
+  assert.deepEqual(result, { migrations: [], activations: [], affectedMints: ['mint'] });
   assert.equal(
     client.calls.some((call) =>
       call.text.includes("pool_state='retracted'")),

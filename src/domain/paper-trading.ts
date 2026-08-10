@@ -2,6 +2,9 @@ import type { QualificationReport } from './qualification.js';
 import type { DomainEvent, TypedDomainEvent } from './events.js';
 import type { QuoteAsset } from './types.js';
 
+export const PAPER_SIMULATION_ACTOR_KIND = 'PAPER_SIMULATION' as const;
+export type PaperSimulationActorKind = typeof PAPER_SIMULATION_ACTOR_KIND;
+
 export interface PaperExecutionQuote {
   readonly id: string;
   readonly inputMint: string;
@@ -53,6 +56,9 @@ export interface PaperPosition {
   readonly openCommandHash: string;
   readonly closeCommandHash: string | null;
   readonly triggerEventId: string;
+  readonly strategySessionId?: string;
+  readonly qualificationReportId?: string;
+  readonly candidateId?: string;
   readonly openedAtMs: number;
   readonly closedAtMs: number | null;
   readonly purgeAfterMs: number | null;
@@ -79,6 +85,9 @@ export interface OpenPaperPositionCommand {
   readonly buyQuote: PaperExecutionQuote;
   readonly reverseSellQuote: PaperExecutionQuote;
   readonly maximumRoundTripLossBps: bigint;
+  readonly strategySessionId?: string;
+  readonly qualificationReportId?: string;
+  readonly candidateId?: string;
 }
 
 export interface ClosePaperPositionCommand {

@@ -5,7 +5,12 @@ import {
   type ApiDomainPayload,
 } from '../api/contracts.js';
 import { DOMAIN_EVENT_TYPES, type DomainEventType } from '../domain/events.js';
+import {
+  PAPER_DECISION_REASON_CODES,
+  PAPER_STRATEGY_SESSION_STATES,
+} from '../domain/paper-strategy.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
+import { TRADING_CANDIDATE_STATES } from '../domain/trading-candidate.js';
 import {
   ApiEventStreamCursorExpiredError,
   type ApiEventStreamRepository,
@@ -345,10 +350,11 @@ function toRevision(row: Record<string, unknown>): ApiStreamRevision {
 function toSseEvent(value: unknown): ApiDomainEvent {
   const object = sanitizedEvent(value);
   requireExactEventKeys(object);
-  const payload = sanitizedPayload(object.payload);
+  const type = domainEventType(object.type);
+  const payload = sanitizedPayload(object.payload, type);
   return freeze({
     eventId: boundedText(object.eventId),
-    type: domainEventType(object.type),
+    type,
     mint: boundedText(object.mint),
     source: boundedText(object.source),
     program: boundedText(object.program),
@@ -387,11 +393,153 @@ function requireExactEventKeys(value: Record<string, unknown>): void {
   if (keys.length !== EVENT_KEYS.size || keys.some((key) => !EVENT_KEYS.has(key))) throw invalid();
 }
 
-function sanitizedPayload(value: unknown): ApiDomainPayload {
+function sanitizedPayload(value: unknown, type: DomainEventType): ApiDomainPayload {
   const sanitized = toApiJson(value);
   assertJsonSize(JSON.stringify(sanitized), MAX_API_PAYLOAD_JSON_BYTES);
   validateReservedBigIntMarkers(sanitized);
-  return toApiDomainPayload(fromJsonValue(sanitized));
+  return toApiDomainPayload(summarizePaperPayload(fromJsonValue(sanitized), type));
+}
+
+function summarizePaperPayload(value: unknown, type: DomainEventType): unknown {
+  switch (type) {
+    case 'TradingCandidateUpdated': {
+      const candidate = nestedRecord(value, 'candidate');
+      const strategy = nestedRecord(candidate, 'strategy');
+      const state = enumStringValue(candidate, 'state', TRADING_CANDIDATE_STATES);
+      const eligibleUntil = nullableTimestampValue(candidate, 'eligibleUntilMs');
+      if ((state === 'ELIGIBLE') !== (eligibleUntil !== null)) throw invalid();
+      return {
+        candidateId: stringValue(candidate, 'id'),
+        state,
+        strategy: {
+          id: stringValue(strategy, 'id'),
+          version: positiveIntegerValue(strategy, 'version'),
+        },
+        qualificationReportId: stringValue(candidate, 'qualificationReportId'),
+        quoteMint: stringValue(nestedRecord(candidate, 'quoteAsset'), 'mint'),
+        reasonCodes: enumStringArray(
+          candidate,
+          'reasonCodes',
+          PAPER_DECISION_REASON_CODES,
+        ),
+        eligibleUntil,
+      };
+    }
+    case 'PaperStrategySessionUpdated': {
+      const session = nestedRecord(value, 'session');
+      const strategy = nestedRecord(session, 'strategy');
+      const externalBuyCount = integerValue(session, 'externalBuyCount');
+      const externalBuyTarget = positiveIntegerValue(session, 'externalBuyTarget');
+      if (externalBuyCount > externalBuyTarget) throw invalid();
+      return {
+        sessionId: stringValue(session, 'id'),
+        state: enumStringValue(session, 'state', PAPER_STRATEGY_SESSION_STATES),
+        reasonCode: enumStringValue(session, 'reasonCode', PAPER_DECISION_REASON_CODES),
+        strategy: {
+          id: stringValue(strategy, 'id'),
+          version: positiveIntegerValue(strategy, 'version'),
+        },
+        positionId: nullableStringValue(session, 'positionId'),
+        quoteMint: stringValue(nestedRecord(session, 'quoteAsset'), 'mint'),
+        externalBuyCount,
+        externalBuyTarget,
+        minimumConfirmation: enumStringValue(
+          session,
+          'minimumConfirmation',
+          ['confirmed', 'finalized'] as const,
+        ),
+        updatedAt: timestampValue(session, 'updatedAtMs'),
+        lastError: summarizedLastError(session),
+      };
+    }
+    case 'PaperExternalBuyCounted':
+      return { tradeId: stringValue(record(value), 'tradeId') };
+    default:
+      return value;
+  }
+}
+
+function summarizedLastError(value: Record<string, unknown>): unknown {
+  const error = value.lastError;
+  if (error === null) return null;
+  const item = record(error);
+  const code = stringValue(item, 'code');
+  if (!/^[A-Z][A-Z0-9_]{0,127}$/u.test(code)) throw invalid();
+  return {
+    code,
+    retryable: booleanValue(item, 'retryable'),
+  };
+}
+
+function nestedRecord(value: unknown, key: string): Record<string, unknown> {
+  return record(record(value)[key]);
+}
+
+function stringValue(value: Record<string, unknown>, key: string): string {
+  const result = value[key];
+  if (typeof result !== 'string' || result.length === 0 || result.length > MAX_TEXT_LENGTH) {
+    throw invalid();
+  }
+  return result;
+}
+
+function nullableStringValue(value: Record<string, unknown>, key: string): string | null {
+  return value[key] === null ? null : stringValue(value, key);
+}
+
+function integerValue(value: Record<string, unknown>, key: string): number {
+  const result = value[key];
+  if (typeof result !== 'number' || !Number.isSafeInteger(result) || result < 0) throw invalid();
+  return result;
+}
+
+function positiveIntegerValue(value: Record<string, unknown>, key: string): number {
+  const result = integerValue(value, key);
+  if (result === 0) throw invalid();
+  return result;
+}
+
+function enumStringValue<const Value extends string>(
+  value: Record<string, unknown>,
+  key: string,
+  allowed: readonly Value[],
+): Value {
+  const result = stringValue(value, key);
+  if (!allowed.includes(result as Value)) throw invalid();
+  return result as Value;
+}
+
+function timestampValue(value: Record<string, unknown>, key: string): string {
+  const result = integerValue(value, key);
+  return new Date(result).toISOString();
+}
+
+function nullableTimestampValue(value: Record<string, unknown>, key: string): string | null {
+  return value[key] === null ? null : timestampValue(value, key);
+}
+
+function booleanValue(value: Record<string, unknown>, key: string): boolean {
+  const result = value[key];
+  if (typeof result !== 'boolean') throw invalid();
+  return result;
+}
+
+function enumStringArray<const Value extends string>(
+  value: Record<string, unknown>,
+  key: string,
+  allowed: readonly Value[],
+): readonly Value[] {
+  const result = value[key];
+  if (!Array.isArray(result) || result.length > allowed.length) throw invalid();
+  const strings = result.map((item): Value => {
+    if (typeof item !== 'string' || item.length === 0 || item.length > MAX_TEXT_LENGTH) {
+      throw invalid();
+    }
+    if (!allowed.includes(item as Value)) throw invalid();
+    return item as Value;
+  });
+  if (new Set(strings).size !== strings.length) throw invalid();
+  return freeze(strings);
 }
 
 function assertJsonSize(value: string | undefined, maximum: number): void {

@@ -70,6 +70,21 @@ void test('ouvre avec le rapport exact produit par l’autorité et rejoue sans 
   assert.deepEqual([...repository.eventStatuses.values()], ['confirmed']);
 });
 
+void test('attache la lignée décisionnelle complète à la position paper', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const position = await engine.open({
+    ...openCommand(),
+    strategySessionId:`paper_session_${'a'.repeat(64)}`,
+    qualificationReportId:`qreport_${'b'.repeat(64)}`,
+    candidateId:`candidate_${'c'.repeat(64)}`,
+  });
+
+  assert.equal(position.strategySessionId, `paper_session_${'a'.repeat(64)}`);
+  assert.equal(position.qualificationReportId, `qreport_${'b'.repeat(64)}`);
+  assert.equal(position.candidateId, `candidate_${'c'.repeat(64)}`);
+});
+
 void test('rejoue la même commande après montée de finalité sans conflit', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
@@ -551,6 +566,34 @@ void test('rétracte une position si son déclencheur devient orphaned', async (
   assert.deepEqual([...repository.eventStatuses.values()], ['orphaned']);
 });
 
+void test('réconcilie un replay durable désérialisé sans autoriser une nouvelle ouverture', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = openCommand();
+  await engine.open(command);
+
+  const retracted = await engine.reconcileOpen({
+    ...command,
+    qualification:structuredClone(command.qualification),
+    trigger:{ ...command.trigger,confirmationStatus:'orphaned' },
+  });
+
+  assert.equal(retracted.status, 'PAPER_RETRACTED');
+  assert.equal(repository.writeCount, 2);
+  assert.deepEqual([...repository.eventStatuses.values()], ['orphaned']);
+});
+
+void test('refuse une reprise durable lorsque la position paper est absente', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = openCommand();
+
+  await assert.rejects(engine.reconcileOpen({
+    ...command,qualification:structuredClone(command.qualification),
+  }), hasCode('POSITION_NOT_FOUND'));
+  assert.equal(repository.writeCount, 0);
+});
+
 void test('refuse un replay d’ouverture contradictoire sans second trade', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
@@ -800,6 +843,18 @@ void test('rétracte une clôture si son déclencheur devient orphaned', async (
     [...repository.eventStatuses.values()],
     ['confirmed', 'orphaned'],
   );
+});
+
+void test('rétracte explicitement une position existante sans nouveau trade', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository,'paper');
+  const opened = await engine.open(openCommand());
+  const retracted = await engine.retract(opened.id,Object.freeze({
+    ...trigger('BondingCurveTradeObserved'),confirmationStatus:'orphaned' as const,
+  }));
+
+  assert.equal(retracted.status,'PAPER_RETRACTED');
+  assert.equal(repository.writeCount,2);
 });
 
 function makeEngine(

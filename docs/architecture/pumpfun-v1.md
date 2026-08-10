@@ -125,8 +125,10 @@ recalculé et le respect du plafond round-trip du profil ; `REPORT_ONLY` reste
 non bloquant et `DISABLED` n’exige pas d’observation. Une copie,
 désérialisation ou réutilisation pour un autre
 sujet est donc refusée. Après redémarrage, les inputs de confiance doivent être
-réévalués pour le nouveau sujet ; le paper trading n’est pas encore composé dans
-le bootstrap de production.
+réévalués pour le nouveau sujet. Le bootstrap de production compose désormais
+ce parcours derrière un worker durable séparé de l'ingestion Solana ; le mode
+`observe` conserve les projections de qualification/candidat mais n'ouvre
+aucune session ou position paper.
 
 ### Analytics participants I1
 
@@ -314,6 +316,26 @@ Le moteur Pump.fun V1 est un ledger comptable indépendant du
 transaction Solana et ne dépend d’aucun wallet. Il ouvre uniquement en mode
 `paper`, après qualification sans blocker et pour un quote mint autorisé.
 
+Le parcours durable est : job déterministe → reconstruction des preuves →
+deux quotes passives cohérentes → `TradingCandidateUpdated` → BUY paper →
+`PaperStrategySessionUpdated` → comptage idempotent de chaque
+`PaperExternalBuyCounted` → quote SELL → fermeture paper. Les achats du
+créateur, ventes, traders inconnus, événements orphaned, mauvais quote mints et
+trades antérieurs à l'entrée ne sont jamais comptés. La cible initiale est
+configurable et vaut dix, sans hypothèse qu'elle soit optimale.
+
+Le routeur de quotes choisit exclusivement une venue canonique :
+
+- `PUMP_FUN_BONDING_CURVE` lorsque la courbe est active ;
+- `PUMPSWAP` lorsque la courbe est complète et le pool canonique actif ;
+- attente explicite pendant la migration, jamais fallback silencieux vers un
+  autre pool ou vers Raydium.
+
+Le worker utilise claims, leases, renouvellement, retries bornés par cycle et
+codes d'erreur stables. Les rapports, candidats, sessions, achats comptés et
+positions conservent leur lignée et sont purgés après quatre heures lorsqu'ils
+deviennent terminaux.
+
 Les entrées et sorties utilisent `minimumAmountOutRaw`. Frais, slippage,
 perte aller-retour et PnL restent en `bigint`. Position, trade et événement
 métier sont persistés atomiquement ; les replays sont idempotents. Une
@@ -331,6 +353,8 @@ Les événements métier sont source-indépendants :
 - `BondingCurveTradeObserved`, `BondingCurveStateUpdated`,
   `BondingCurveCompleted` ;
 - `QualificationUpdated` ;
+- `TradingCandidateUpdated`, `PaperStrategySessionUpdated`,
+  `PaperExternalBuyCounted` ;
 - `PaperPositionOpened`, `PaperPositionUpdated`, `PaperPositionClosed` ;
 - `MigrationObserved`, `PumpSwapPoolActivated`.
 
@@ -412,8 +436,18 @@ d'un nettoyage incomplet ou d'un heartbeat périmé, et `STOPPED` après arrêt 
 désactivation explicite. Le heartbeat rend visibles backlog, leases, échecs
 épuisés, checkpoints, derniers slots et fraîcheur sans divulguer les endpoints.
 `pipeline.social` et les compteurs `socialJobs` isolent l'état de cet
-enrichissement : une panne sociale dégrade sa propre composante sans renommer
-les pipelines chain Pump.fun/PumpSwap.
+enrichissement. `pipeline.paperDecision` et `paperDecisionJobs` exposent
+séparément pending, leased, retryable, exhausted, dernier succès et dernier
+code d'erreur stable : une panne d'un worker ne renomme pas les pipelines chain
+Pump.fun/PumpSwap.
+
+Le CLI `npm run paper:dry-run` exécute le bootstrap réel pendant une durée
+bornée, limite la lecture aux sessions mises à jour dans la fenêtre, ferme les
+ressources par le chemin `SIGTERM` et écrit un rapport `paper-dry-run.v1`
+assaini. `NO_CLOSED_POSITION` indique une couverture sans sortie observée et
+n'est pas transformé en échec technique. Les PnL sont agrégés en entiers par
+quote mint ; aucune URL, transaction, signature, preuve sociale brute ou
+erreur interne n'est incluse.
 
 ## Invariants de sécurité
 

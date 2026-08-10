@@ -7,6 +7,7 @@ export type ListenerRuntimeFailureStage =
   | 'scanner-scan'
   | 'subscriber-start'
   | 'worker-start'
+  | 'paper-worker-start'
   | 'social-worker-start'
   | 'reconciler-start'
   | 'heartbeat-start'
@@ -16,6 +17,8 @@ export type ListenerRuntimeFailureStage =
   | 'reconciler-close'
   | 'worker-close'
   | 'worker-timeout'
+  | 'paper-worker-close'
+  | 'paper-worker-timeout'
   | 'social-worker-close'
   | 'social-worker-timeout'
   | 'heartbeat-stop';
@@ -59,6 +62,7 @@ export interface ListenerRuntimeDependencies {
   readonly scanner: RuntimeScanner;
   readonly subscriber: RuntimeComponent;
   readonly worker: RuntimeComponent;
+  readonly paperWorker: RuntimeComponent;
   readonly socialWorker: RuntimeComponent;
   readonly reconciler: RuntimeComponent;
   readonly heartbeat: RuntimeHeartbeat;
@@ -68,7 +72,8 @@ export interface ListenerRuntimeOptions {
   readonly shutdownTimeoutMs: number;
 }
 
-type ActiveRuntimeResource = 'subscriber' | 'worker' | 'socialWorker' | 'reconciler' | 'heartbeat';
+type ActiveRuntimeResource =
+  | 'subscriber' | 'worker' | 'paperWorker' | 'socialWorker' | 'reconciler' | 'heartbeat';
 
 export class SolanaListenerRuntime implements ListenerRuntime {
   private currentState: ListenerRuntimeState = 'STOPPED';
@@ -132,16 +137,19 @@ export class SolanaListenerRuntime implements ListenerRuntime {
   public pipelineState(): ApiProjectionPipelineState {
     if (this.currentState === 'STOPPED') {
       return Object.freeze({
-        httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', social: 'STOPPED',
+        httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED',
+        paperDecision: 'STOPPED', social: 'STOPPED',
       });
     }
     if (this.currentState !== 'RUNNING') {
       return Object.freeze({
-        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', social: 'DEGRADED',
+        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED',
+        paperDecision: 'DEGRADED', social: 'DEGRADED',
       });
     }
     let chain: 'RUNNING' | 'DEGRADED' = 'DEGRADED';
     let social: ApiProjectionPipelineState['social'] = 'DEGRADED';
+    let paperDecision: ApiProjectionPipelineState['paperDecision'] = 'DEGRADED';
     try {
       chain = this.chainComponentStates().every((state) => state === 'RUNNING')
         ? 'RUNNING' : 'DEGRADED';
@@ -149,10 +157,16 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       social = socialState === 'RUNNING'
         ? 'RUNNING'
         : socialState === 'STOPPED' ? 'STOPPED' : 'DEGRADED';
+      const paperState = this.dependencies.paperWorker.state();
+      paperDecision = paperState === 'RUNNING'
+        ? 'RUNNING'
+        : paperState === 'STOPPED' ? 'STOPPED' : 'DEGRADED';
     } catch {
       // The failing projection stays DEGRADED without leaking the component error.
     }
-    return Object.freeze({ httpAvailable: true, pumpfun: chain, pumpswap: chain, social });
+    return Object.freeze({
+      httpAvailable: true, pumpfun: chain, pumpswap: chain, paperDecision, social,
+    });
   }
 
   private async performStart(): Promise<void> {
@@ -176,6 +190,11 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       await this.dependencies.worker.start();
       started.push('worker');
       this.activeResources.add('worker');
+      this.assertStartOpen();
+      stage = 'paper-worker-start';
+      await this.dependencies.paperWorker.start();
+      started.push('paperWorker');
+      this.activeResources.add('paperWorker');
       this.assertStartOpen();
       stage = 'social-worker-start';
       await this.dependencies.socialWorker.start();
@@ -212,7 +231,11 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       if (component === undefined) continue;
       const closeStage = component === 'heartbeat'
         ? 'heartbeat-stop'
-        : component === 'socialWorker' ? 'social-worker-close' : `${component}-close` as ListenerRuntimeFailureStage;
+        : component === 'socialWorker'
+          ? 'social-worker-close'
+          : component === 'paperWorker'
+            ? 'paper-worker-close'
+            : `${component}-close` as ListenerRuntimeFailureStage;
       try {
         if (component === 'heartbeat') await this.dependencies.heartbeat.stop('STOPPED');
         else await this.dependencies[component].close();
@@ -246,9 +269,13 @@ export class SolanaListenerRuntime implements ListenerRuntime {
     const cleanup: {
       readonly resource: ActiveRuntimeResource | 'scanner';
       readonly stage: Extract<ListenerRuntimeFailureStage,
-      'subscriber-close' | 'scanner-close' | 'reconciler-close' | 'worker-close' | 'social-worker-close'>;
+      'subscriber-close' | 'scanner-close' | 'reconciler-close' | 'worker-close'
+      | 'paper-worker-close' | 'social-worker-close'>;
       readonly operation: Promise<void>;
     }[] = [];
+    const paperWorkerClosing = startupTimedOut || this.activeResources.has('paperWorker')
+      ? invoke(() => this.dependencies.paperWorker.close())
+      : null;
     const socialWorkerClosing = startupTimedOut || this.activeResources.has('socialWorker')
       ? invoke(() => this.dependencies.socialWorker.close())
       : null;
@@ -290,6 +317,13 @@ export class SolanaListenerRuntime implements ListenerRuntime {
         operation: socialWorkerClosing,
       });
     }
+    if (paperWorkerClosing !== null) {
+      cleanup.unshift({
+        resource: 'paperWorker',
+        stage: 'paper-worker-close',
+        operation: paperWorkerClosing,
+      });
+    }
     const results = await Promise.all(cleanup.map(async (item) => Object.freeze({
       resource: item.resource,
       stage: item.stage,
@@ -310,7 +344,9 @@ export class SolanaListenerRuntime implements ListenerRuntime {
         failures.push(timeoutFailure(
           result.stage === 'worker-close'
             ? 'worker-timeout'
-            : result.stage === 'social-worker-close' ? 'social-worker-timeout' : result.stage,
+            : result.stage === 'paper-worker-close'
+              ? 'paper-worker-timeout'
+              : result.stage === 'social-worker-close' ? 'social-worker-timeout' : result.stage,
         ));
       }
     }
@@ -340,6 +376,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       this.dependencies.scanner.state(),
       this.dependencies.subscriber.state(),
       this.dependencies.worker.state(),
+      this.dependencies.paperWorker.state(),
       this.dependencies.socialWorker.state(),
       this.dependencies.reconciler.state(),
       this.dependencies.heartbeat.state(),

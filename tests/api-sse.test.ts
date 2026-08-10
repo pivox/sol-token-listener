@@ -517,6 +517,44 @@ void test('SseSession emits a bounded SocialEvidenceCollected summary without ra
   await session.close('CLIENT');
 });
 
+void test('SseSession emits bounded paper progress without quotes or error messages', async () => {
+  const timers = new FakeTimers();
+  const response = new FakeResponse();
+  const paperEvent: ApiDomainEvent = {
+    ...event('paper-session-event'),
+    type: 'PaperStrategySessionUpdated',
+    source: 'paper-decision',
+    payload: toApiDomainPayload({
+      sessionId: `paper_session_${'a'.repeat(64)}`,
+      state: 'WAITING_EXTERNAL_BUYS', reasonCode: 'EXTERNAL_BUY_OBSERVED',
+      strategy: { id: 'validated-external-buys', version: 1 },
+      positionId: 'position-a', quoteMint: 'quote',
+      externalBuyCount: 3, externalBuyTarget: 10, minimumConfirmation: 'confirmed',
+      updatedAt: '2026-07-29T00:00:00.000Z',
+      lastError: { code: 'QUOTE_UNAVAILABLE', retryable: true },
+    }),
+  };
+  const session = new SseSession({
+    stream: {
+      async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+      async readAfter() { return [{ sequence: 1n, streamEventId: 'stream-1', event: paperEvent }]; },
+    },
+    response: response as unknown as ServerResponse, startAfter: 0n, batchSize: 1,
+    pollIntervalMs: 10, heartbeatIntervalMs: 100, schedule: timers.schedule, cancel: timers.cancel,
+    onClosed: () => undefined,
+  });
+
+  session.start();
+  timers.runOne();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const output = response.chunks.join('');
+  assert.match(output, /event: PaperStrategySessionUpdated/u);
+  assert.match(output, /"externalBuyCount":3/u);
+  assert.doesNotMatch(output, /countedTradeIds|lastQuote|buyQuote|reverseSellQuote|message/u);
+  assert.ok(Buffer.byteLength(output) < 4_096);
+  await session.close('CLIENT');
+});
+
 void test('SseSession rejects a runtime event type containing CR/LF without frame injection', async () => {
   const timers = new FakeTimers();
   const response = new FakeResponse();

@@ -58,3 +58,15 @@ void test('pins the bounded public-content dependencies exactly', async () => {
   assert.equal(lock.packages?.['node_modules/parse5']?.version, '8.0.1');
   assert.equal(lock.packages?.['node_modules/tldts']?.version, '7.4.10');
 });
+
+void test('pins the official Pump.fun SDK exactly', async () => {
+  const manifest = JSON.parse(
+    await readFile(new URL('package.json', root), 'utf8'),
+  ) as PackageManifest;
+  const lock = JSON.parse(
+    await readFile(new URL('package-lock.json', root), 'utf8'),
+  ) as PackageLock;
+
+  assert.equal(manifest.dependencies?.['@pump-fun/pump-sdk'], '1.36.0');
+  assert.equal(lock.packages?.['node_modules/@pump-fun/pump-sdk']?.version, '1.36.0');
+});

@@ -13,6 +13,12 @@ import type { QualificationReasonCode } from '../domain/qualification-reasons.js
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
 import type {
+  PaperDecisionReasonCode,
+  PaperMinimumConfirmation,
+  PaperStrategySessionState,
+} from '../domain/paper-strategy.js';
+import type { TradingCandidateState } from '../domain/trading-candidate.js';
+import type {
   SocialCollectionStatus,
   SocialEvidenceOutcome,
   SocialEvidenceType,
@@ -92,6 +98,37 @@ export interface ApiLaunchDetail extends ApiLaunchSummary {
   readonly feeBps: string | null;
   readonly social: ApiSocial;
   readonly holders: ApiHolders;
+  readonly candidate: ApiTradingCandidate | null;
+  readonly paperStrategy: ApiPaperStrategyProgress | null;
+}
+
+export interface ApiTradingCandidate {
+  readonly id: string;
+  readonly state: TradingCandidateState;
+  readonly strategyId: string;
+  readonly strategyVersion: number;
+  readonly qualificationReportId: string;
+  readonly quoteMint: string;
+  readonly quoteDecimals: number;
+  readonly reasonCodes: readonly PaperDecisionReasonCode[];
+  readonly eligibleUntil: string | null;
+  readonly createdAt: string;
+}
+
+export interface ApiPaperStrategyProgress {
+  readonly id: string;
+  readonly state: PaperStrategySessionState;
+  readonly reasonCode: PaperDecisionReasonCode;
+  readonly strategyId: string;
+  readonly strategyVersion: number;
+  readonly positionId: string | null;
+  readonly quoteMint: string;
+  readonly externalBuyTarget: number;
+  readonly externalBuyCount: number;
+  readonly minimumConfirmation: PaperMinimumConfirmation;
+  readonly updatedAt: string;
+  readonly lastErrorCode: string | null;
+  readonly lastErrorRetryable: boolean | null;
 }
 
 export interface ApiTimelineEntry {
@@ -378,6 +415,15 @@ export interface ApiPaperPosition {
   readonly exitQuoteAmount: string | null;
   readonly realizedPnlQuote: string | null;
   readonly estimatedFeesQuote: string;
+  readonly strategyId: string;
+  readonly strategyVersion: number;
+  readonly strategySessionId: string | null;
+  readonly qualificationReportId: string | null;
+  readonly candidateId: string | null;
+  readonly externalBuyCount: number | null;
+  readonly externalBuyTarget: number | null;
+  readonly entryVenue: 'PUMP_FUN_BONDING_CURVE' | 'PUMPSWAP' | 'UNKNOWN';
+  readonly reasonCodes: readonly PaperDecisionReasonCode[];
 }
 
 export interface ApiHealth {
@@ -387,6 +433,7 @@ export interface ApiHealth {
   readonly http: ApiHealthDependency;
   readonly pipeline: ApiPipelineHealth;
   readonly socialJobs: ApiSocialJobHealth;
+  readonly paperDecisionJobs: ApiPaperDecisionJobHealth;
   readonly checkpoints: ApiCheckpoints;
   readonly heartbeat: ApiHeartbeat;
   readonly lagSlots: string | null;
@@ -399,6 +446,7 @@ export interface ApiHealthDependency {
 export interface ApiPipelineHealth {
   readonly pumpfun: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly pumpswap: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+  readonly paperDecision: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly social: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
 }
 
@@ -407,6 +455,15 @@ export interface ApiSocialJobHealth {
   readonly leasedCount: number;
   readonly retryableFailedCount: number;
   readonly exhaustedCount: number;
+}
+
+export interface ApiPaperDecisionJobHealth {
+  readonly pendingCount: number;
+  readonly leasedCount: number;
+  readonly retryableFailedCount: number;
+  readonly exhaustedCount: number;
+  readonly lastSuccessAt: string | null;
+  readonly lastErrorCode: 'RPC_TRANSIENT' | 'QUOTE_UNAVAILABLE' | 'LEASE_EXPIRED' | 'DECISION_INVALID' | null;
 }
 
 export interface ApiCheckpoints {
@@ -606,6 +663,8 @@ const API_DOMAIN_NUMBER_KEYS = new Set<string>([
   'unknownTraderTradeCount',
   'linkCount',
   'evidenceCount',
+  'externalBuyCount',
+  'externalBuyTarget',
 ]);
 
 function assertApiDomainPayload(value: ApiJsonValue, key: string | undefined): void {

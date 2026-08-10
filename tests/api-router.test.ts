@@ -76,6 +76,7 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
   const detail: ApiLaunchDetail = {
     ...summary, creator: MINT, tokenProgram: MINT, launchpad: 'pumpfun', initialTokenAmount: null,
     initialQuoteAmount: null, reserveBase: null, reserveQuote: null, feeBps: null, social, holders,
+    candidate: null, paperStrategy: null,
   };
   const timeline: ApiTimelineEntry = {
     id: 'event-1', type: 'TokenLaunchDetected', occurredAt: summary.detectedAt, slot: '1',
@@ -95,11 +96,18 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
     id: 'position-1', mint: MINT, status: 'PAPER_HOLDING', openedAt: summary.detectedAt, closedAt: null,
     quoteMint: MINT, quantity: '1', entryQuoteAmount: '1', exitQuoteAmount: null,
     realizedPnlQuote: null, estimatedFeesQuote: '0',
+    strategyId: 'validated-external-buys', strategyVersion: 1,
+    strategySessionId: null, qualificationReportId: null, candidateId: null,
+    externalBuyCount: null, externalBuyTarget: null, entryVenue: 'UNKNOWN', reasonCodes: [],
   };
   const health: ApiHealth = {
     status: 'OK', observedAt: summary.detectedAt, postgresql: { status: 'AVAILABLE' },
-    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', social: 'IDLE' },
+    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
     socialJobs: { pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0 },
+    paperDecisionJobs: {
+      pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
+      lastSuccessAt: null, lastErrorCode: null,
+    },
     checkpoints: { launchpad: null, market: null },
     heartbeat: { startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
       lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null }, lagSlots: null,

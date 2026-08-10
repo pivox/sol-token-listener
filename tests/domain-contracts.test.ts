@@ -7,11 +7,14 @@ import {
   InvalidChainCursorError,
 } from '../src/domain/cursor.js';
 import {
+  DOMAIN_EVENT_TYPES,
   createDeterministicChainEventId,
   createDeterministicDerivedEventId,
 } from '../src/domain/events.js';
 import { isTerminalLaunchStatus, LAUNCH_STATUSES } from '../src/domain/launch-status.js';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
+import { PAPER_DECISION_REASON_CODES, PAPER_STRATEGY_SESSION_STATES } from '../src/domain/paper-strategy.js';
+import { TRADING_CANDIDATE_STATES } from '../src/domain/trading-candidate.js';
 import type { ChainCursor, QuoteAsset, TokenLaunch } from '../src/domain/types.js';
 
 const SOL: QuoteAsset = {
@@ -298,4 +301,10 @@ void test('les états métier et reason codes V1 sont stables et explicites', ()
   assert.equal(isTerminalLaunchStatus('EXPIRED'), true);
   assert.ok(QUALIFICATION_REASON_CODES.includes('CREATOR_EARLY_SELL'));
   assert.ok(QUALIFICATION_REASON_CODES.includes('UNSUPPORTED_QUOTE_MINT'));
+  assert.deepEqual(TRADING_CANDIDATE_STATES, ['NOT_ELIGIBLE', 'ELIGIBLE', 'EXPIRED', 'REVOKED']);
+  assert.ok(PAPER_STRATEGY_SESSION_STATES.includes('WAITING_EXTERNAL_BUYS'));
+  assert.ok(PAPER_DECISION_REASON_CODES.includes('EXTERNAL_BUY_TARGET_REACHED'));
+  for (const eventType of [
+    'TradingCandidateUpdated', 'PaperStrategySessionUpdated', 'PaperExternalBuyCounted',
+  ] as const) assert.ok(DOMAIN_EVENT_TYPES.includes(eventType));
 });

@@ -127,7 +127,7 @@ void test('PumpSwap observation pipeline ignores unrelated transactions without 
     instructions: [instruction('11111111111111111111111111111111', 0, null, 1)],
   };
   const result = await pipeline.observe(unrelated);
-  assert.deepEqual(result, { migrations: [], activations: [] });
+  assert.deepEqual(result, { migrations: [], activations: [], affectedMints: [] });
   assert.equal(repository.recordedBatches.length, 0);
 });
 
@@ -220,6 +220,10 @@ class MemoryRepository implements MarketObservationRepository {
       migrations: batch.matches.map((match) => match.migrationEvent),
       activations: batch.matches.flatMap((match) =>
         match.activationEvent === null ? [] : [match.activationEvent]),
+      affectedMints: [...new Set([
+        ...batch.matches.map((match) => match.migrationEvent.mint),
+        ...batch.trades.map((trade) => trade.mint),
+      ])].sort(),
     });
   }
   public loadActivePools(): Promise<readonly CanonicalMarketPool[]> {
