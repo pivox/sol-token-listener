@@ -2,6 +2,9 @@ import type { QualificationReport } from './qualification.js';
 import type { DomainEvent, TypedDomainEvent } from './events.js';
 import type { QuoteAsset } from './types.js';
 
+export const PAPER_SIMULATION_ACTOR_KIND = 'PAPER_SIMULATION' as const;
+export type PaperSimulationActorKind = typeof PAPER_SIMULATION_ACTOR_KIND;
+
 export interface PaperExecutionQuote {
   readonly id: string;
   readonly inputMint: string;
