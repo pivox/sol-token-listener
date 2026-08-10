@@ -307,13 +307,11 @@ export interface QualificationBlocker {
 }
 
 export interface QualificationReport {
-  /** Legacy persisted reports may not contain the calibration fingerprint. */
   readonly ruleSet: Pick<QualificationRuleSet, 'id' | 'version' | 'status' | 'minimumTotalScore'> &
-    Readonly<{ fingerprint?: string }>;
+    Readonly<{ fingerprint: string }>;
   readonly scores: QualificationScores;
   readonly evidence: readonly QualificationEvidence[];
-  /** Legacy persisted reports may predate calibrated condition evidence. */
-  readonly conditions?: readonly QualificationConditionEvidence[];
+  readonly conditions: readonly QualificationConditionEvidence[];
   readonly blockers: readonly QualificationBlocker[];
   readonly verdict: QualificationVerdict;
   readonly evaluatedAtMs: number;

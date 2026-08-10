@@ -147,7 +147,6 @@ void test('selected invalid profile prevents every database, listener, and API r
   assert.deepEqual(logs, [{
     event: 'listener.start_failed',
     errorName: 'QualificationProfileError',
-    errorCode: 'PROFILE_SCHEMA_INVALID',
   }]);
   assert.doesNotMatch(JSON.stringify(logs), /path|content|cause/u);
 });

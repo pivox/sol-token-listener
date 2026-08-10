@@ -28,7 +28,7 @@ function noCalibrationFacts(): QualificationCalibrationFacts {
 
 function profileWithPolicy(
   code: QualificationReasonCode,
-  mode: 'DISABLED' | 'REPORT_ONLY' | 'ENFORCED',
+  change: Record<string, unknown>,
 ) {
   const raw = JSON.parse(readFileSync(
     new URL('../config/qualification/pumpfun-v1-unvalidated.json', import.meta.url),
@@ -38,7 +38,7 @@ function profileWithPolicy(
   };
   raw.conditionPolicies = raw.conditionPolicies.map((policy) => ({
       ...policy,
-      ...(policy.code === code ? { mode } : {}),
+      ...(policy.code === code ? change : {}),
     }));
   return parseQualificationProfile(deepFreeze(raw), null);
 }
@@ -161,13 +161,15 @@ void test('propagates the effective profile fingerprint and all calibrated condi
   });
 
   assert.equal(report.ruleSet.fingerprint, defaultQualificationRuleSet.fingerprint);
-  assert.equal(report.conditions?.length, 14);
+  assert.equal(report.conditions.length, 14);
   assert.equal(engine.profileSummary.fingerprint, defaultQualificationRuleSet.fingerprint);
   assert.ok(Object.isFrozen(engine.profileSummary));
 });
 
 void test('lets report-only calibration conditions remain visible without rejecting', () => {
-  const report = new QualificationEngine(profileWithPolicy('MINT_SOCIAL_MISMATCH', 'REPORT_ONLY')).evaluate({
+  const report = new QualificationEngine(profileWithPolicy('MINT_SOCIAL_MISMATCH', {
+    mode: 'REPORT_ONLY',
+  })).evaluate({
     evaluatedAtMs: 1,
     signals: {
       imageValid: true,
@@ -180,7 +182,32 @@ void test('lets report-only calibration conditions remain visible without reject
     calibrationFacts: noCalibrationFacts(),
   });
 
-  assert.equal(report.conditions?.find((item) => item.code === 'MINT_SOCIAL_MISMATCH')?.status, 'TRIGGERED');
+  assert.equal(report.conditions.find((item) => item.code === 'MINT_SOCIAL_MISMATCH')?.status, 'TRIGGERED');
+  assert.equal(report.blockers.length, 0);
+  assert.equal(report.verdict, 'QUALIFIED');
+});
+
+void test('reports a triggered report-only wallet cluster without rejecting', () => {
+  const report = new QualificationEngine(profileWithPolicy('RELATED_WALLET_CLUSTER_EXCEEDED', {
+    mode: 'REPORT_ONLY',
+    maximumClusterBps: 400,
+  })).evaluate({
+    evaluatedAtMs: 1,
+    signals: {
+      imageValid: true,
+      socialCrossLinkConfirmed: true,
+      creatorHasNotSold: true,
+      reverseQuoteAvailable: true,
+      externalBuyersObserved: true,
+    },
+    blockers: [],
+    calibrationFacts: Object.freeze({
+      ...noCalibrationFacts(),
+      maximumRelatedClusterBps: 401n,
+    }),
+  });
+
+  assert.equal(report.conditions.find((item) => item.code === 'RELATED_WALLET_CLUSTER_EXCEEDED')?.status, 'TRIGGERED');
   assert.equal(report.blockers.length, 0);
   assert.equal(report.verdict, 'QUALIFIED');
 });

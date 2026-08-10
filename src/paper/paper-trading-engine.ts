@@ -368,6 +368,7 @@ function snapshotQualification(report: QualificationReport): QualificationReport
       id: report.ruleSet.id,
       version: report.ruleSet.version,
       status: report.ruleSet.status,
+      fingerprint: report.ruleSet.fingerprint,
       minimumTotalScore: report.ruleSet.minimumTotalScore,
     }),
     scores: freeze({
@@ -382,6 +383,14 @@ function snapshotQualification(report: QualificationReport): QualificationReport
       status: item.status,
       required: item.required,
       weight: item.weight,
+      message: item.message,
+    }))),
+    conditions: freeze(report.conditions.map((item) => freeze({
+      code: item.code,
+      mode: item.mode,
+      status: item.status,
+      observed: freeze({ ...item.observed }),
+      thresholds: freeze({ ...item.thresholds }),
       message: item.message,
     }))),
     blockers: freeze(report.blockers.map((item) => freeze({

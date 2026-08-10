@@ -208,12 +208,7 @@ export function reportEntrypointFailure(
 ): void {
   runtime.exitCode = 1;
   const errorName = safeErrorName(error);
-  const errorCode = safeQualificationProfileErrorCode(error, errorName);
-  logFatal({
-    event: 'listener.start_failed',
-    errorName,
-    ...(errorCode === null ? {} : { errorCode }),
-  }, 'Initialisation du socle impossible.');
+  logFatal({ event: 'listener.start_failed', errorName }, 'Initialisation du socle impossible.');
 }
 
 function safeErrorName(error: unknown): string {
@@ -231,23 +226,5 @@ function safeErrorName(error: unknown): string {
     return descriptor.value;
   } catch {
     return 'UnknownError';
-  }
-}
-
-function safeQualificationProfileErrorCode(error: unknown, errorName: string): string | null {
-  if (errorName !== 'QualificationProfileError' || (typeof error !== 'object' && typeof error !== 'function') || error === null) {
-    return null;
-  }
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
-    if (descriptor?.enumerable !== true || !('value' in descriptor) || typeof descriptor.value !== 'string') return null;
-    return [
-      'PROFILE_READ_FAILED',
-      'PROFILE_TOO_LARGE',
-      'PROFILE_JSON_INVALID',
-      'PROFILE_SCHEMA_INVALID',
-    ].includes(descriptor.value) ? descriptor.value : null;
-  } catch {
-    return null;
   }
 }

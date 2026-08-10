@@ -230,6 +230,37 @@ void test('refuse un replay d’ouverture contradictoire sans second trade', asy
   assert.equal(repository.writeCount, 1);
 });
 
+void test('binds the profile fingerprint and calibrated condition evidence into open idempotency', async () => {
+  const fingerprintRepository = new MemoryPaperRepository();
+  const fingerprintEngine = makeEngine(fingerprintRepository, 'paper');
+  const fingerprintCommand = openCommand();
+  await fingerprintEngine.open(fingerprintCommand);
+  await assert.rejects(fingerprintEngine.open({
+    ...fingerprintCommand,
+    qualification: {
+      ...fingerprintCommand.qualification,
+      ruleSet: { ...fingerprintCommand.qualification.ruleSet, fingerprint: 'b'.repeat(64) },
+    },
+  }), hasCode('POSITION_CONFLICT'));
+
+  const conditionRepository = new MemoryPaperRepository();
+  const conditionEngine = makeEngine(conditionRepository, 'paper');
+  const conditionCommand = openCommand();
+  await conditionEngine.open(conditionCommand);
+  const conditions = conditionCommand.qualification.conditions;
+  await assert.rejects(conditionEngine.open({
+    ...conditionCommand,
+    qualification: {
+      ...conditionCommand.qualification,
+      conditions: conditions.map((item) => item.code === 'ROUND_TRIP_LOSS_EXCEEDED'
+        ? { ...item, observed: { ...item.observed, roundTripLossBps: 3_001n } }
+        : item),
+    },
+  }), hasCode('POSITION_CONFLICT'));
+  assert.equal(fingerprintRepository.writeCount, 1);
+  assert.equal(conditionRepository.writeCount, 1);
+});
+
 void test('ferme entièrement et calcule le PnL conservateur', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
