@@ -175,7 +175,7 @@ Use exact versions captured during planning:
     "eslint-plugin-react-hooks": "7.1.1",
     "eslint-plugin-react-refresh": "0.5.4",
     "globals": "17.9.0",
-    "jsdom": "30.0.1",
+    "jsdom": "28.1.0",
     "msw": "2.15.0",
     "typescript": "5.8.3",
     "typescript-eslint": "8.65.0",

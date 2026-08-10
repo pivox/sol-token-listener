@@ -4,13 +4,22 @@
   "private": true,
   "description": "Observation et paper trading de nouveaux tokens Pump.fun, avec Raydium CPMM conservé comme adaptateur secondaire.",
   "type": "module",
+  "workspaces": [
+    "frontend"
+  ],
   "scripts": {
     "dev": "tsx watch src/app.ts",
     "start": "node dist/src/app.js",
-    "build": "tsc -p tsconfig.json && tsx scripts/copy-migrations.ts && tsx scripts/copy-qualification-profiles.ts",
-    "check": "npm run pumpfun:check-generated && npm run pumpswap:check-generated && tsc -p tsconfig.json --noEmit",
-    "lint": "eslint . --max-warnings=0",
-    "test": "tsx --test tests/*.test.ts",
+    "build": "npm run build:backend && npm run build --workspace frontend",
+    "build:backend": "tsc -p tsconfig.json && tsx scripts/copy-migrations.ts && tsx scripts/copy-qualification-profiles.ts",
+    "check": "npm run check:backend && npm run check --workspace frontend",
+    "check:backend": "npm run pumpfun:check-generated && npm run pumpswap:check-generated && tsc -p tsconfig.json --noEmit",
+    "lint": "npm run lint:backend && npm run lint --workspace frontend",
+    "lint:backend": "eslint src tests scripts --max-warnings=0",
+    "test": "npm run test:backend && npm test --workspace frontend",
+    "test:backend": "tsx --test tests/*.test.ts",
+    "frontend:dev": "npm run dev --workspace frontend",
+    "frontend:e2e": "npm run e2e --workspace frontend",
     "db:migrate": "tsx scripts/migrate.ts",
     "rpc:check": "tsx scripts/check-rpc.ts",
     "rpc:soak": "tsx scripts/rpc-soak.ts",
@@ -51,6 +60,6 @@
     "typescript-eslint": "^8.65.0"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   }
 }
