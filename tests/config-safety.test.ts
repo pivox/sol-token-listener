@@ -280,6 +280,12 @@ void test('Pump.fun calibration documentation states the initial profile, semant
   assert.match(systemOverview, /imageValid.*15.*socialCrossLinkConfirmed.*25.*creatorHasNotSold.*reverseQuoteAvailable.*externalBuyersObserved/isu);
   assert.match(systemOverview, /TRIGGERED.*ENFORCED.*blocker.*décide le rejet/isu);
   assert.match(systemOverview, /MINT_SOCIAL_MISMATCH.*SHARED_FUNDER_CLUSTER.*REPORT_ONLY.*sans décider/isu);
+  assert.match(systemOverview, /HOLDER_CONCENTRATION_EXCEEDED.*RELATED_WALLET_CLUSTER_EXCEEDED.*REPORT_ONLY.*null/isu);
+  assert.match(systemOverview, /SHARED_FUNDER_CLUSTER.*REPORT_ONLY.*minimumSharedFunders=1/isu);
+  assert.match(systemOverview, /BUY_SIMULATION_FAILED.*SELL_QUOTE_UNAVAILABLE.*ENFORCED/isu);
+  assert.match(systemOverview, /ROUND_TRIP_LOSS_EXCEEDED.*ENFORCED.*maximumRoundTripLossBps=3000/isu);
+  assert.match(systemOverview, /Liquidité.*future non scorée/iu);
+  assert.match(api, /projection legacy.*projection calibrée.*Perte aller-retour supérieure au seuil configuré/isu);
   assert.doesNotMatch(systemOverview, /704 tests réussis/iu);
 });
 
@@ -297,5 +303,21 @@ void test('qualification loader, evaluator, profile, and public API boundaries e
     const source = await readFile(sourceUrl, 'utf8');
     assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(sourceUrl), repositoryRoot), []);
   }
-  assert.equal(loadQualificationProfile({ profilePath: null, minimumScoreOverride: null }).id, 'pumpfun-v1-initial');
+  const profile = loadQualificationProfile({ profilePath: null, minimumScoreOverride: null });
+  assert.equal(profile.id, 'pumpfun-v1-initial');
+  const policy = (code: string) => profile.conditionPolicies.find((item) => item.code === code);
+  assert.deepEqual(policy('HOLDER_CONCENTRATION_EXCEEDED'), {
+    code: 'HOLDER_CONCENTRATION_EXCEEDED', mode: 'REPORT_ONLY', maximumTop1Bps: null, maximumTop5Bps: null,
+    maximumTop10Bps: null, maximumClusterBps: null, minimumSharedFunders: null, maximumRoundTripLossBps: null,
+  });
+  assert.deepEqual(policy('RELATED_WALLET_CLUSTER_EXCEEDED'), {
+    code: 'RELATED_WALLET_CLUSTER_EXCEEDED', mode: 'REPORT_ONLY', maximumTop1Bps: null, maximumTop5Bps: null,
+    maximumTop10Bps: null, maximumClusterBps: null, minimumSharedFunders: null, maximumRoundTripLossBps: null,
+  });
+  assert.equal(policy('SHARED_FUNDER_CLUSTER')?.mode, 'REPORT_ONLY');
+  assert.equal(policy('SHARED_FUNDER_CLUSTER')?.minimumSharedFunders, 1);
+  assert.equal(policy('BUY_SIMULATION_FAILED')?.mode, 'ENFORCED');
+  assert.equal(policy('SELL_QUOTE_UNAVAILABLE')?.mode, 'ENFORCED');
+  assert.equal(policy('ROUND_TRIP_LOSS_EXCEEDED')?.mode, 'ENFORCED');
+  assert.equal(policy('ROUND_TRIP_LOSS_EXCEEDED')?.maximumRoundTripLossBps, 3_000);
 });
