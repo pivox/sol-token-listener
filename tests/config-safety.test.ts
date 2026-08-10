@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import ts from 'typescript';
+import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config/env.js';
+import { loadQualificationProfile } from '../src/qualification/qualification-profile.js';
+import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
 const base = {
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
@@ -250,8 +252,8 @@ void test('Pump.fun calibration documentation states the initial profile, semant
     'métadonnées',
     'social',
     'Raydium',
-    'fingerprint: null',
-    'conditions: []',
+    '"fingerprint": null',
+    '"conditions": []',
     'chaînes décimales',
     'clé privée',
     'sendTransaction',
@@ -272,9 +274,13 @@ void test('Pump.fun calibration documentation states the initial profile, semant
     assert.match(document, /REPORT_ONLY[\s\S]{0,220}(?:blocker|verdict|paper)/iu);
   }
   assert.match(architecture, /égalité passe.*dépassement strict/isu);
-  assert.match(api, /legacy.*fingerprint: null.*conditions: \[\]/isu);
+  assert.match(api, /legacy.*"fingerprint": null.*"conditions": \[\]/isu);
   assert.match(api, /fingerprint.*lowercase/iu);
   assert.match(systemOverview, /diagnostic/iu);
+  assert.match(systemOverview, /imageValid.*15.*socialCrossLinkConfirmed.*25.*creatorHasNotSold.*reverseQuoteAvailable.*externalBuyersObserved/isu);
+  assert.match(systemOverview, /TRIGGERED.*ENFORCED.*blocker.*décide le rejet/isu);
+  assert.match(systemOverview, /MINT_SOCIAL_MISMATCH.*SHARED_FUNDER_CLUSTER.*REPORT_ONLY.*sans décider/isu);
+  assert.doesNotMatch(systemOverview, /704 tests réussis/iu);
 });
 
 void test('qualification loader, evaluator, profile, and public API boundaries exclude execution primitives', async () => {
@@ -282,48 +288,14 @@ void test('qualification loader, evaluator, profile, and public API boundaries e
     '../src/qualification/qualification-engine.ts',
     '../src/qualification/qualification-policy-evaluator.ts',
     '../src/qualification/qualification-profile.ts',
-    '../config/qualification/pumpfun-v1-unvalidated.json',
     '../src/api/contracts.ts',
     '../src/storage/api-projection.repository.ts',
   ] as const;
-  const sources = await Promise.all(modulePaths.map((path) => readFile(new URL(path, import.meta.url), 'utf8')));
-  for (const source of sources) assert.deepEqual(forbiddenModuleSpecifiers(source), []);
-  for (const source of sources) {
-    assert.deepEqual(forbiddenExecutableCalls(source), []);
+  const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+  for (const path of modulePaths) {
+    const sourceUrl = new URL(path, import.meta.url);
+    const source = await readFile(sourceUrl, 'utf8');
+    assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(sourceUrl), repositoryRoot), []);
   }
+  assert.equal(loadQualificationProfile({ profilePath: null, minimumScoreOverride: null }).id, 'pumpfun-v1-initial');
 });
-
-function forbiddenModuleSpecifiers(sourceText: string): readonly string[] {
-  const sourceFile = ts.createSourceFile('boundary.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const specifiers: string[] = [];
-  const append = (node: ts.Expression | undefined): void => {
-    if (node !== undefined && ts.isStringLiteralLike(node)) specifiers.push(node.text);
-  };
-  const visit = (node: ts.Node): void => {
-    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) append(node.moduleSpecifier);
-    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) append(node.arguments[0]);
-    if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) append(node.moduleReference.expression);
-    if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) append(node.argument.literal);
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return specifiers.filter((specifier) => /(?:^|\/)(?:wallet|keypair|signing|submission|transaction-builder|transaction-confirmer|trade-executor)(?:\/|$)/iu.test(normalizeModuleSpecifier(specifier)));
-}
-
-function normalizeModuleSpecifier(specifier: string): string {
-  return specifier.replace(/[?#].*$/u, '').replace(/\.(?:js|ts|mjs|cjs|mts|cts)$/iu, '');
-}
-
-function forbiddenExecutableCalls(sourceText: string): readonly string[] {
-  const sourceFile = ts.createSourceFile('boundary.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const calls: string[] = [];
-  const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node)) {
-      const name = ts.isIdentifier(node.expression) ? node.expression.text : ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : null;
-      if (name !== null && ['sendTransaction', 'signTransaction', 'submit'].includes(name)) calls.push(name);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return calls;
-}

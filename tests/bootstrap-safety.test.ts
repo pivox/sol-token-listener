@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import ts from 'typescript';
+import { fileURLToPath } from 'node:url';
 import type { ApiProjectionPipelineState } from '../src/storage/api-projection.repository.js';
 import { parseConfig } from '../src/config/env.js';
 import {
@@ -15,9 +15,9 @@ import type { ApiEventStreamRepository } from '../src/ports/api-event-stream-rep
 import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
 import { QualificationProfileError } from '../src/qualification/qualification-profile.js';
 import { createQualificationEngine as buildQualificationEngine } from '../src/qualification/qualification-engine.js';
+import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
-const FORBIDDEN_IMPORT_PATHS = /(?:^|\/)(?:wallet|keypair|signing|submission|transaction-builder|transaction-confirmer|trade-executor)(?:\/|$)/iu;
-const MODULE_EXTENSION = /\.(?:js|ts|mjs|cjs|mts|cts)$/iu;
+const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 
 const config = parseConfig({
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
@@ -26,8 +26,7 @@ const config = parseConfig({
 
 void test('bootstrap imports no signing, submission, or live execution path', async () => {
   const source = await readFile(new URL('../src/app.ts', import.meta.url), 'utf8');
-  assert.deepEqual(forbiddenModuleSpecifiers(source), []);
-  assert.deepEqual(forbiddenExecutableCalls(source), []);
+  assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(new URL('../src/app.ts', import.meta.url)), repositoryRoot), []);
 });
 
 void test('bootstrap boundary guard detects dynamic import and export-from execution dependencies', () => {
@@ -37,52 +36,16 @@ void test('bootstrap boundary guard detects dynamic import and export-from execu
     'await import("../execution/keypair.js");',
     'type SubmissionModule = import("../execution/submission.js").Submission;',
     'import Wallet = require("../execution/wallet.js");',
-    'import "../execution/wallet-utils.js";',
+    'import "../execution/order-sender.js";',
+    'import "../wallet-utils.js";',
   ].join('\n');
-  assert.deepEqual(forbiddenModuleSpecifiers(source), [
-    '../execution/wallet.js',
-    '../dex/raydium-cpmm/transaction-builder.js',
-    '../execution/keypair.js',
-    '../execution/submission.js',
-    '../execution/wallet.js',
-  ]);
-  assert.deepEqual(forbiddenExecutableCalls('client.sendTransaction(); signer.signTransaction(); gateway.submit();'), ['sendTransaction', 'signTransaction', 'submit']);
+  assert.equal(executionBoundaryViolations(source, '/repo/src/qualification/engine.ts', '/repo').length, 7);
+  assert.equal(executionBoundaryViolations('const module = "../execution/order-sender.js"; await import(module);', '/repo/src/qualification/engine.ts', '/repo').length, 1);
+  assert.equal(executionBoundaryViolations('require("../execution/wallet.js");', '/repo/src/qualification/engine.ts', '/repo').length, 2);
+  assert.equal(executionBoundaryViolations('require(module);', '/repo/src/qualification/engine.ts', '/repo').length, 2);
+  assert.equal(executionBoundaryViolations("client['sendTransaction']();", '/repo/src/qualification/engine.ts', '/repo').length, 1);
+  assert.deepEqual(executionBoundaryViolations('form.submit(); import "../wallet-utils.js";', '/repo/src/qualification/engine.ts', '/repo'), []);
 });
-
-function forbiddenModuleSpecifiers(sourceText: string): readonly string[] {
-  const sourceFile = ts.createSourceFile('boundary.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const specifiers: string[] = [];
-  const append = (node: ts.Expression | undefined): void => {
-    if (node !== undefined && ts.isStringLiteralLike(node)) specifiers.push(node.text);
-  };
-  const visit = (node: ts.Node): void => {
-    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) append(node.moduleSpecifier);
-    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) append(node.arguments[0]);
-    if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) append(node.moduleReference.expression);
-    if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) append(node.argument.literal);
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return specifiers.filter((specifier) => FORBIDDEN_IMPORT_PATHS.test(normalizeModuleSpecifier(specifier)));
-}
-
-function normalizeModuleSpecifier(specifier: string): string {
-  return specifier.replace(/[?#].*$/u, '').replace(MODULE_EXTENSION, '');
-}
-
-function forbiddenExecutableCalls(sourceText: string): readonly string[] {
-  const sourceFile = ts.createSourceFile('boundary.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const calls: string[] = [];
-  const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node)) {
-      const name = ts.isIdentifier(node.expression) ? node.expression.text : ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : null;
-      if (name !== null && ['sendTransaction', 'signTransaction', 'submit'].includes(name)) calls.push(name);
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return calls;
-}
 
 void test('migrates, starts listener before API, then closes listener before API and database', async () => {
   const calls: string[] = [];

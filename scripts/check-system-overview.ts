@@ -73,8 +73,8 @@ const requiredStatements = [
   'quatre heures',
   'SOL/WSOL',
   'Raydium CPMM',
-  '704 tests réussis, dont 39 scénarios PostgreSQL réels, aucun échec',
-  'Un blocker actif ne peut jamais être compensé',
+  "La suite complète ne peut être annoncée sans échec ni skip qu'après exécution avec PostgreSQL disponible.",
+  'un score ne peut jamais le compenser',
 ];
 for (const statement of requiredStatements) {
   if (!html.includes(statement)) failures.push(`affirmation requise absente: ${statement}`);
