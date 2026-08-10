@@ -49,12 +49,16 @@ des millisecondes entières canoniques. Les objets produits sont gelés.
 
 - d’une configuration `observe|paper`, allowlist et rétention ;
 - d’un `PaperTradingRepository` ;
+- de l’`EffectiveQualificationProfile` déjà chargé, injecté comme autorité de
+  politique sans rechargement ni I/O implicite ;
 - d’une horloge injectée pour des tests déterministes.
 
 L’ouverture exige :
 
 - `EXECUTION_MODE=paper` ;
 - un rapport `QUALIFIED` sans blocker ;
+- une identité de ruleset (id, version, statut, fingerprint et score minimum),
+  des modes de conditions et des seuils identiques au profil effectif injecté ;
 - un quote mint autorisé ;
 - une quote BUY et une quote SELL inverse compatibles ;
 - une quantité et un résultat conservateur strictement positifs ;

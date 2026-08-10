@@ -101,6 +101,11 @@ bootstrap -> composition observation-only
 | `PaperTradingEngine` | entrée/sortie simulées, frais, slippage et PnL estimé |
 | API HTTP/SSE | projections publiques V1, non authentifiées et en lecture seule |
 
+Le `PaperTradingEngine` reçoit l’`EffectiveQualificationProfile` déjà chargé
+comme autorité. Il ne relit aucun fichier : avant toute transaction paper, il
+compare l’identité du ruleset ainsi que les modes et seuils des conditions du
+rapport aux policies de ce profil.
+
 ### Analytics participants I1
 
 `LaunchParticipantAnalyticsService` charge, sous verrou PostgreSQL par mint,

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import type { EffectiveQualificationProfile } from '../src/domain/qualification.js';
 import type {
   ClosePaperPositionCommand,
   OpenPaperPositionCommand,
@@ -200,6 +201,49 @@ void test('accepts a coherent triggered report-only condition without inventing 
   assert.equal(repository.writeCount, 1);
 });
 
+void test('rejects an enforced condition downgraded to report-only before writing', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand();
+
+  await assert.rejects(makeEngine(repository, 'paper').open({
+    ...command,
+    qualification: {
+      ...command.qualification,
+      conditions: command.qualification.conditions.map((item) => item.code === 'CREATOR_EARLY_SELL'
+        ? { ...item, mode: 'REPORT_ONLY' as const, status: 'TRIGGERED' as const }
+        : item),
+    },
+  }), hasCode('QUALIFICATION_INVALID'));
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('rejects a report from a different effective profile before writing', async () => {
+  const repository = new MemoryPaperRepository();
+  const foreignProfile = createDefaultQualificationRuleSet(59);
+
+  await assert.rejects(
+    makeEngine(repository, 'paper').open(openCommand(foreignProfile)),
+    hasCode('QUALIFICATION_INVALID'),
+  );
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('rejects condition thresholds that differ from the trusted profile before writing', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand();
+
+  await assert.rejects(makeEngine(repository, 'paper').open({
+    ...command,
+    qualification: {
+      ...command.qualification,
+      conditions: command.qualification.conditions.map((item) => item.code === 'ROUND_TRIP_LOSS_EXCEEDED'
+        ? { ...item, thresholds: { maximumRoundTripLossBps: 2_999n } }
+        : item),
+    },
+  }), hasCode('QUALIFICATION_INVALID'));
+  assert.equal(repository.writeCount, 0);
+});
+
 void test('refuse un quote mint hors allowlist SOL initiale', async () => {
   const repository = new MemoryPaperRepository();
   const command = openCommand();
@@ -327,7 +371,7 @@ void test('replays only the exact origin-main open-command hash for a pre-calibr
         minimumTotalScore: command.qualification.ruleSet.minimumTotalScore + 1,
       },
     },
-  }), hasCode('POSITION_CONFLICT'));
+  }), hasCode('QUALIFICATION_INVALID'));
   assert.equal(repository.writeCount, 1);
 });
 
@@ -342,7 +386,7 @@ void test('binds the profile fingerprint and calibrated condition evidence into 
       ...fingerprintCommand.qualification,
       ruleSet: { ...fingerprintCommand.qualification.ruleSet, fingerprint: 'b'.repeat(64) },
     },
-  }), hasCode('POSITION_CONFLICT'));
+  }), hasCode('QUALIFICATION_INVALID'));
 
   const conditionRepository = new MemoryPaperRepository();
   const conditionEngine = makeEngine(conditionRepository, 'paper');
@@ -524,12 +568,15 @@ function makeEngine(
       dataRetentionHours: 4,
     },
     repository,
+    createDefaultQualificationRuleSet(60),
     { now: () => 1_000 },
   );
 }
 
-function openCommand(): OpenPaperPositionCommand {
-  const qualification = new QualificationEngine(createDefaultQualificationRuleSet(60)).evaluate({
+function openCommand(
+  profile: EffectiveQualificationProfile = createDefaultQualificationRuleSet(60),
+): OpenPaperPositionCommand {
+  const qualification = new QualificationEngine(profile).evaluate({
     evaluatedAtMs: 1,
     signals: {
       imageValid: true,

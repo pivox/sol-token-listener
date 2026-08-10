@@ -5,6 +5,8 @@ import type { DomainEvent } from '../domain/events.js';
 import { assertValidChainCursor } from '../domain/cursor.js';
 import type {
   QualificationConditionEvidence,
+  QualificationConditionPolicy,
+  EffectiveQualificationProfile,
   QualificationReport,
   QualificationScore,
   QualificationSignalKey,
@@ -14,6 +16,7 @@ import {
   QUALIFICATION_CONDITION_STATUSES,
 } from '../domain/qualification.js';
 import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
+import { assertValidEffectiveQualificationProfile } from '../qualification/qualification-profile.js';
 import {
   PaperTradingError,
   type ClosePaperPositionCommand,
@@ -48,17 +51,23 @@ export class PaperTradingEngine {
   public constructor(
     private readonly config: PaperTradingConfig,
     private readonly repository: PaperTradingRepository,
+    private readonly qualificationProfile: EffectiveQualificationProfile,
     private readonly clock: Clock = { now: Date.now },
   ) {
     if (!Number.isSafeInteger(config.dataRetentionHours) || config.dataRetentionHours <= 0) {
       throw new RangeError('dataRetentionHours doit être un entier positif sûr.');
     }
+    assertValidEffectiveQualificationProfile(qualificationProfile);
   }
 
   public async open(command: OpenPaperPositionCommand): Promise<PaperPosition> {
     this.requirePaperMode();
     const snapshot = snapshotOpenCommand(command);
-    validateOpenCommand(snapshot, this.config.paperQuoteMintAllowlist);
+    validateOpenCommand(
+      snapshot,
+      this.config.paperQuoteMintAllowlist,
+      this.qualificationProfile,
+    );
     const roundTrip = calculateRoundTrip(snapshot.buyQuote, snapshot.reverseSellQuote);
     if (roundTrip.lossBps > snapshot.maximumRoundTripLossBps) {
       throw new PaperTradingError(
@@ -337,12 +346,13 @@ function matchesOpenCommandHash(position: PaperPosition, hashes: OpenCommandHash
 function validateOpenCommand(
   command: OpenPaperPositionCommand,
   allowlist: readonly string[],
+  qualificationProfile: EffectiveQualificationProfile,
 ): void {
   if (command.mint.trim() === '' || command.trigger.mint !== command.mint) invalidQuote('mint');
   if (command.strategy.id.trim() === '' || !Number.isSafeInteger(command.strategy.version) || command.strategy.version <= 0) {
     invalidQuote('strategy');
   }
-  validateQualificationReport(command.qualification);
+  validateQualificationReport(command.qualification, qualificationProfile);
   if (command.qualification.blockers.length > 0) {
     throw new PaperTradingError('QUALIFICATION_BLOCKED', 'La qualification contient un blocker.');
   }
@@ -360,17 +370,33 @@ function validateOpenCommand(
   }
 }
 
-function validateQualificationReport(report: QualificationReport): void {
+function validateQualificationReport(
+  report: QualificationReport,
+  profile: EffectiveQualificationProfile,
+): void {
+  const reportStatus: unknown = report.ruleSet.status;
+  if (
+    report.ruleSet.id !== profile.id
+    || report.ruleSet.version !== profile.version
+    || reportStatus !== profile.status
+    || report.ruleSet.fingerprint !== profile.fingerprint
+    || report.ruleSet.minimumTotalScore !== profile.minimumTotalScore
+  ) invalidQualification();
   if (report.conditions.length !== QUALIFICATION_REASON_CODES.length) invalidQualification();
+  const policies = new Map(profile.conditionPolicies.map((policy) => [policy.code, policy]));
   const enforcedTriggers: string[] = [];
   for (let index = 0; index < QUALIFICATION_REASON_CODES.length; index += 1) {
     const condition = report.conditions[index];
+    const policy = condition === undefined ? undefined : policies.get(condition.code);
     if (
       condition === undefined
       || condition.code !== QUALIFICATION_REASON_CODES[index]
+      || policy === undefined
       || !QUALIFICATION_CONDITION_MODES.includes(condition.mode)
       || !QUALIFICATION_CONDITION_STATUSES.includes(condition.status)
       || (condition.mode === 'DISABLED') !== (condition.status === 'DISABLED')
+      || condition.mode !== policy.mode
+      || !matchesPolicyThresholds(condition, policy)
     ) invalidQualification();
     if (condition.mode === 'ENFORCED' && condition.status === 'TRIGGERED') {
       enforcedTriggers.push(condition.code);
@@ -386,6 +412,45 @@ function validateQualificationReport(report: QualificationReport): void {
     || (verdict === 'REJECTED') !== (enforcedTriggers.length > 0)
   ) invalidQualification();
 }
+
+function matchesPolicyThresholds(
+  condition: QualificationConditionEvidence,
+  policy: QualificationConditionPolicy,
+): boolean {
+  const expected = expectedPolicyThresholds(policy);
+  const actualKeys = Object.keys(condition.thresholds);
+  const expectedKeys = Object.keys(expected);
+  return actualKeys.length === expectedKeys.length
+    && expectedKeys.every((key) => Object.is(condition.thresholds[key], expected[key]));
+}
+
+function expectedPolicyThresholds(
+  policy: QualificationConditionPolicy,
+): Readonly<Record<string, bigint | number | null>> {
+  if (policy.mode === 'DISABLED') return EMPTY_CONDITION_THRESHOLDS;
+  switch (policy.code) {
+    case 'HOLDER_CONCENTRATION_EXCEEDED':
+      return {
+        maximumTop1Bps: nullableBigInt(policy.maximumTop1Bps),
+        maximumTop5Bps: nullableBigInt(policy.maximumTop5Bps),
+        maximumTop10Bps: nullableBigInt(policy.maximumTop10Bps),
+      };
+    case 'RELATED_WALLET_CLUSTER_EXCEEDED':
+      return { maximumClusterBps: nullableBigInt(policy.maximumClusterBps) };
+    case 'SHARED_FUNDER_CLUSTER':
+      return { minimumSharedFunders: policy.minimumSharedFunders };
+    case 'ROUND_TRIP_LOSS_EXCEEDED':
+      return { maximumRoundTripLossBps: nullableBigInt(policy.maximumRoundTripLossBps) };
+    default:
+      return EMPTY_CONDITION_THRESHOLDS;
+  }
+}
+
+function nullableBigInt(value: number | null): bigint | null {
+  return value === null ? null : BigInt(value);
+}
+
+const EMPTY_CONDITION_THRESHOLDS: Readonly<Record<string, never>> = Object.freeze({});
 
 function validateCloseCommand(
   command: ClosePaperPositionCommand,

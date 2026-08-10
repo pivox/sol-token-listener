@@ -577,14 +577,14 @@ async function assertPaperSafety(pool: InstanceType<typeof pg.Pool>): Promise<vo
   await assert.rejects(
     new PaperTradingEngine({
       executionMode: 'observe', paperQuoteMintAllowlist: ['SOL'], dataRetentionHours: 4,
-    }, repository).open({} as OpenPaperPositionCommand),
+    }, repository, createDefaultQualificationRuleSet(60)).open({} as OpenPaperPositionCommand),
     hasCode('PAPER_MODE_DISABLED'),
   );
   const watchlisted = openCommand();
   await assert.rejects(
     new PaperTradingEngine({
       executionMode: 'paper', paperQuoteMintAllowlist: ['SOL'], dataRetentionHours: 4,
-    }, repository).open({
+    }, repository, createDefaultQualificationRuleSet(60)).open({
       ...watchlisted,
       qualification: { ...watchlisted.qualification, verdict: 'WATCHLISTED' },
     }),
