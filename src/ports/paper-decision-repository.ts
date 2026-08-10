@@ -1,0 +1,82 @@
+import type { DomainEvent } from '../domain/events.js';
+import type { LaunchpadObservationEventV1 } from '../domain/launchpad-events.js';
+import type { MarketTrade } from '../domain/market.js';
+import type { PaperStrategySessionV1, PaperExternalBuyEvidence } from '../domain/paper-strategy.js';
+import type { PaperPosition } from '../domain/paper-trading.js';
+import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
+import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
+import type { QualificationReport } from '../domain/qualification.js';
+import type { SocialEvidenceCollectionV1 } from '../domain/social-evidence.js';
+import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
+import type { ChainConfirmationStatus, TokenLaunch } from '../domain/types.js';
+import type { WalletGraphAnalysis } from '../domain/wallet-graph.js';
+
+export interface PaperDecisionJobInput {
+  readonly mint: string;
+  readonly sourceEventId: string;
+  readonly sourceRawEventId: string;
+  readonly sourceConfirmationStatus: ChainConfirmationStatus;
+  readonly inputFingerprint: string;
+}
+
+export interface ClaimedPaperDecisionJob extends PaperDecisionJobInput {
+  readonly jobId: string;
+  readonly attempts: number;
+  readonly maxAttempts: number;
+  readonly leaseToken: string;
+  readonly leaseExpiresAtMs: number;
+}
+
+export interface PaperDecisionQueueCounts {
+  readonly pending: number;
+  readonly processing: number;
+  readonly retryableFailed: number;
+  readonly exhausted: number;
+}
+
+export interface PaperDecisionSnapshot {
+  readonly mint: string;
+  readonly asOfEvent: DomainEvent;
+  readonly launch: TokenLaunch;
+  readonly metadata: TokenMetadataSnapshot | null;
+  readonly social: SocialEvidenceCollectionV1 | null;
+  readonly creatorProfile: CreatorProfile | null;
+  readonly holderSnapshot: HolderDistribution | null;
+  readonly walletGraph: WalletGraphAnalysis | null;
+  readonly activeLaunchTrades: readonly Extract<
+    LaunchpadObservationEventV1,
+    { readonly type: 'BondingCurveTradeObserved' }
+  >[];
+  readonly activeMarketTrades: readonly MarketTrade[];
+  readonly currentCandidate: TradingCandidateV1 | null;
+  readonly currentSession: PaperStrategySessionV1 | null;
+  readonly activePosition: PaperPosition | null;
+}
+
+export interface PaperDecisionResult {
+  readonly report: QualificationReport;
+  readonly qualificationEvent: DomainEvent;
+  readonly candidate: TradingCandidateV1;
+  readonly candidateEvent: DomainEvent;
+  readonly session: PaperStrategySessionV1 | null;
+  readonly sessionEvent: DomainEvent | null;
+  readonly countedExternalBuys: readonly PaperExternalBuyEvidence[];
+  readonly requestedAction: 'NONE' | 'OPEN' | 'CLOSE';
+}
+
+export interface PaperDecisionFailure {
+  readonly code: 'RPC_TRANSIENT' | 'QUOTE_UNAVAILABLE' | 'LEASE_EXPIRED' | 'DECISION_INVALID';
+  readonly retryable: boolean;
+  readonly terminalResult: PaperDecisionResult | null;
+}
+
+export interface PaperDecisionRepository {
+  enqueue(input: PaperDecisionJobInput): Promise<void>;
+  claim(options: Readonly<{ leaseMs: number; nowMs: number }>): Promise<ClaimedPaperDecisionJob | null>;
+  renew(job: ClaimedPaperDecisionJob, nowMs: number, leaseMs: number): Promise<boolean>;
+  loadSnapshot(job: ClaimedPaperDecisionJob): Promise<PaperDecisionSnapshot>;
+  stageDecision(job: ClaimedPaperDecisionJob, result: PaperDecisionResult): Promise<void>;
+  complete(job: ClaimedPaperDecisionJob, result: PaperDecisionResult): Promise<void>;
+  fail(job: ClaimedPaperDecisionJob, failure: PaperDecisionFailure): Promise<void>;
+  counts(): Promise<PaperDecisionQueueCounts>;
+}
