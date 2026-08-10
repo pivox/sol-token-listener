@@ -85,8 +85,10 @@ imports `../../src`, generated backend files, PostgreSQL repositories, Solana
 SDKs, or listener configuration.
 
 The static deployment artifact is `frontend/dist/`. It can be hosted on a
-different origin from the backend. The existing backend CORS contract remains
-public and read-only.
+different origin from the backend. The backend CORS contract remains public and
+read-only. Its `OPTIONS` response is extended to allow the `Last-Event-ID`
+request header: a cross-origin `fetch` that restores this non-safelisted header
+otherwise fails browser preflight before reaching the SSE route.
 
 ## 4. Package and command integration
 
@@ -399,9 +401,10 @@ verifies:
 6. reconnect with `Last-Event-ID`;
 7. expired cursor resynchronization.
 
-Backend API contract tests remain unchanged and continue to protect the server
-side. Frontend schema fixtures are cross-checked against representative backend
-responses so accidental drift fails in CI.
+Backend API contract tests continue to protect the server side. A focused router
+test proves that CORS preflight advertises `Last-Event-ID` while still allowing
+only `GET`, `HEAD`, and `OPTIONS`. Frontend schema fixtures are cross-checked
+against representative backend responses so accidental drift fails in CI.
 
 ## 14. CI and delivery
 
@@ -442,9 +445,9 @@ Included in issue #41:
 
 Explicitly excluded:
 
-- backend route or database schema changes unless a demonstrable contract defect
-  blocks the approved UI, in which case the defect is documented before a
-  minimal additive fix;
+- backend data-route or database schema changes; the only backend contract change
+  is the additive `Access-Control-Allow-Headers: Last-Event-ID` preflight response
+  required for cross-origin resumable SSE;
 - authentication, user accounts, alerts, watchlist persistence, or notification
   delivery;
 - wallet connection, real trading, transaction submission, or live mode;
@@ -484,10 +487,9 @@ The PR is complete when:
 | --- | --- |
 | Backend additive contracts drift | frontend-owned runtime schemas accept safe additions and reject breaking changes |
 | SSE parser loses or duplicates revisions | incremental parser tests, deterministic cursor commit point, HTTP projections remain canonical |
-| Different-origin deployment fails | explicit absolute runtime URL and existing public CORS behavior tested in browser smoke fixtures |
+| Different-origin deployment fails | explicit absolute runtime URL, `Last-Event-ID` preflight allowance, and cross-origin browser smoke fixtures |
 | Dense UI hides uncertainty | dedicated unknown/partial/stale states and blocker-first hierarchy |
 | Financial display introduces float error | decimal-string validators and bigint-only integer formatting |
 | Frontend dependencies expand audit surface | pinned workspace lockfile, dependency audit kept separate as chantier 8/9 |
 | E2E suite becomes slow | one deterministic Chromium smoke journey; detailed cases remain in Vitest/MSW |
 | Browser cache outlives backend retention | no local launch archive; expired cursor forces canonical HTTP resynchronization |
-
