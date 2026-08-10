@@ -1,5 +1,7 @@
 import {
   MAX_API_CLUSTER_QUOTE_ASSETS,
+  MAX_API_SOCIAL_EVIDENCE,
+  MAX_API_SOCIAL_LINKS,
   MAX_API_TOTAL_CLUSTER_QUOTE_ASSETS,
   toApiDomainPayload,
   type ApiHealth,
@@ -22,6 +24,8 @@ import {
   type ApiCreatorTradeEvidence,
   type ApiAnalyticsCursor,
   type ApiSocial,
+  type ApiSocialEvidence,
+  type ApiSocialLink,
   type ApiTimelineEntry,
 } from '../api/contracts.js';
 import { isProxy } from 'node:util/types';
@@ -36,6 +40,12 @@ import {
   type TimelinePagePosition,
 } from '../api/cursor.js';
 import { DOMAIN_EVENT_TYPES } from '../domain/events.js';
+import {
+  SOCIAL_COLLECTION_STATUSES,
+  SOCIAL_EVIDENCE_OUTCOMES,
+  SOCIAL_EVIDENCE_TYPES,
+  SOCIAL_LINK_KINDS,
+} from '../domain/social-evidence.js';
 import { LAUNCH_STATUSES } from '../domain/launch-status.js';
 import {
   LISTENER_RUNTIME_STATES,
@@ -55,6 +65,7 @@ import {
   fromJsonValue,
 } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
+import { SOCIAL_URL_INVALID_REASONS } from '../social/social-url-normalizer.js';
 
 export interface Queryable {
   query(
@@ -187,7 +198,8 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     if (launch === undefined) return null;
     const projections = await this.loadLaunchProjections([text(mint)]);
     const holders = await this.loadHolders(text(mint));
-    return assembleLaunchDetail(launch, projections, holders);
+    const social = await this.loadSocial(text(mint));
+    return assembleLaunchDetail(launch, projections, holders, social);
   }
 
   public async listLaunchEvents(mint: string, request: PageRequest<TimelinePagePosition>): Promise<ApiPage<ApiTimelineEntry>> {
@@ -261,7 +273,13 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
   }
 
   public async getLaunchSocial(mint: string): Promise<ApiSocial | null> {
-    return (await this.findLaunches(text(mint))).length === 0 ? null : NOT_AVAILABLE_SOCIAL;
+    if (this.database.connect !== undefined) {
+      return this.withSnapshot((repository) => repository.getLaunchSocial(mint));
+    }
+    const validatedMint = text(mint);
+    return (await this.findLaunches(validatedMint)).length === 0
+      ? null
+      : this.loadSocial(validatedMint);
   }
 
   public async getLaunchHolders(mint: string): Promise<ApiHolders | null> {
@@ -460,6 +478,131 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     return {
       metadata: rowsByMint(metadata.rows), curves: rowsByMint(curves.rows), markets: rowsByMint(markets.rows),
     };
+  }
+
+  private async loadSocial(mint: string): Promise<ApiSocial> {
+    const collectionResult = await this.database.query(
+      `SELECT collection.collection_id, collection.metadata_snapshot_id,
+          collection.collection_status, collection.observed_at,
+          (SELECT COUNT(*) FROM social_links AS counted_link
+            WHERE counted_link.collection_id = collection.collection_id) AS declared_link_count,
+          (SELECT COUNT(*) FROM social_http_observations AS counted_observation
+            WHERE counted_observation.collection_id = collection.collection_id) AS inspected_link_count,
+          (SELECT COUNT(*) FROM social_verification_evidence AS counted_evidence
+            WHERE counted_evidence.collection_id = collection.collection_id) AS evidence_count,
+          (SELECT COUNT(*) FROM social_verification_evidence AS confirmed_evidence
+            WHERE confirmed_evidence.collection_id = collection.collection_id
+              AND confirmed_evidence.outcome = 'CONFIRMED') AS confirmed_evidence_count,
+          (SELECT COUNT(*) FROM social_verification_evidence AS rejected_evidence
+            WHERE rejected_evidence.collection_id = collection.collection_id
+              AND rejected_evidence.outcome = 'REJECTED') AS rejected_evidence_count,
+          (SELECT COUNT(*) FROM social_verification_evidence AS unknown_evidence
+            WHERE unknown_evidence.collection_id = collection.collection_id
+              AND unknown_evidence.outcome = 'UNKNOWN') AS unknown_evidence_count
+       FROM social_evidence_collections AS collection
+       JOIN domain_events AS social_event
+         ON social_event.type = 'SocialEvidenceCollected'
+        AND social_event.mint = collection.mint
+        AND social_event.payload ->> 'collectionId' = collection.collection_id
+       JOIN domain_events AS launch_event
+         ON launch_event.event_id = collection.source_launch_event_id
+        AND launch_event.type = 'TokenLaunchDetected'
+       WHERE collection.mint = $1
+         AND collection.confirmation_status <> 'orphaned'
+         AND social_event.confirmation_status <> 'orphaned'
+         AND launch_event.confirmation_status <> 'orphaned'
+         AND collection.terminal_at IS NULL
+         AND social_event.terminal_at IS NULL
+       ORDER BY social_event.slot DESC, social_event.transaction_index DESC,
+         social_event.instruction_index DESC,
+         COALESCE(social_event.inner_instruction_index, -1) DESC,
+         collection.collection_id DESC
+       LIMIT 1`,
+      [mint],
+    );
+    const collection = collectionResult.rows[0];
+    if (collection === undefined) return NOT_AVAILABLE_SOCIAL;
+    try {
+      const collectionId = text(collection.collection_id);
+      const linkCount = countDecimal(collection.declared_link_count);
+      const inspectedLinkCount = countDecimal(collection.inspected_link_count);
+      const evidenceCount = countDecimal(collection.evidence_count);
+      const confirmedEvidenceCount = countDecimal(collection.confirmed_evidence_count);
+      const rejectedEvidenceCount = countDecimal(collection.rejected_evidence_count);
+      const unknownEvidenceCount = countDecimal(collection.unknown_evidence_count);
+      if (
+        inspectedLinkCount > linkCount
+        || confirmedEvidenceCount + rejectedEvidenceCount + unknownEvidenceCount !== evidenceCount
+      ) throw invalid();
+      const linksResult = await this.database.query(
+        `SELECT link.link_id, link.link_kind, link.declared_value_sha256,
+            link.syntax_status, link.canonical_url, link.invalid_reason, link.observed_at
+         FROM social_links AS link
+         WHERE link.collection_id = $1
+         ORDER BY CASE link.link_kind
+           WHEN 'WEBSITE' THEN 0 WHEN 'X' THEN 1 WHEN 'TELEGRAM' THEN 2 ELSE 3 END,
+           link.link_id
+         LIMIT $2`,
+        [collectionId, MAX_API_SOCIAL_LINKS],
+      );
+      const evidenceResult = await this.database.query(
+        `SELECT evidence.evidence_id, evidence.evidence_type, evidence.outcome,
+            evidence.subject_kind, evidence.related_kind,
+            subject_link.canonical_url AS subject_url,
+            observation.final_canonical_url AS final_url,
+            observation.http_status,
+            COALESCE(observation.redirect_count, 0) AS redirect_count,
+            observation.content_sha256, evidence.reason_code, evidence.observed_at
+         FROM social_verification_evidence AS evidence
+         LEFT JOIN social_links AS subject_link
+           ON subject_link.link_id = evidence.link_id
+          AND subject_link.collection_id = evidence.collection_id
+         LEFT JOIN social_http_observations AS observation
+           ON observation.observation_id = evidence.observation_id
+          AND observation.collection_id = evidence.collection_id
+         WHERE evidence.collection_id = $1
+         ORDER BY CASE evidence.evidence_type
+           WHEN 'URL_SYNTAX_VALID' THEN 0 WHEN 'URL_SYNTAX_INVALID' THEN 1
+           WHEN 'URL_REACHABLE' THEN 2 WHEN 'CROSS_LINK_CONFIRMED' THEN 3
+           WHEN 'MINT_PUBLISHED' THEN 4 WHEN 'ACCOUNT_TOO_RECENT' THEN 5
+           WHEN 'DOMAIN_MISMATCH' THEN 6 WHEN 'CONTENT_UNAVAILABLE' THEN 7
+           WHEN 'VERIFICATION_UNKNOWN' THEN 8 ELSE 9 END,
+           evidence.evidence_id
+         LIMIT $2`,
+        [collectionId, MAX_API_SOCIAL_EVIDENCE],
+      );
+      if (
+        linksResult.rows.length !== Math.min(linkCount, MAX_API_SOCIAL_LINKS)
+        || evidenceResult.rows.length !== Math.min(evidenceCount, MAX_API_SOCIAL_EVIDENCE)
+      ) throw invalid();
+      const links = freeze(linksResult.rows.map(toSocialLink));
+      const evidence = freeze(evidenceResult.rows.map(toSocialEvidence));
+      return freeze({
+        status: 'AVAILABLE' as const,
+        collectionStatus: validated(
+          collection.collection_status,
+          SOCIAL_COLLECTION_STATUSES,
+        ) as (typeof SOCIAL_COLLECTION_STATUSES)[number],
+        collectionId,
+        metadataSnapshotId: text(collection.metadata_snapshot_id),
+        observedAt: timestamp(collection.observed_at).toISOString(),
+        linkCount,
+        linksTruncated: linkCount > links.length,
+        links,
+        evidenceCount,
+        evidenceTruncated: evidenceCount > evidence.length,
+        evidence,
+        coverage: freeze({
+          declaredLinkCount: linkCount,
+          inspectedLinkCount,
+          confirmedEvidenceCount,
+          rejectedEvidenceCount,
+          unknownEvidenceCount,
+        }),
+      });
+    } catch (error) {
+      throw projectionError(error);
+    }
   }
 
   private async loadHolders(mint: string): Promise<ApiHolders> {
@@ -701,6 +844,7 @@ function assembleLaunchDetail(
   row: LaunchRow,
   projections: LaunchProjections,
   holders: ApiHolders = NOT_AVAILABLE_HOLDERS,
+  social: ApiSocial = NOT_AVAILABLE_SOCIAL,
 ): ApiLaunchDetail {
   const summary = assembleLaunchSummary(row, projections);
   const curve = projections.curves.get(summary.mint);
@@ -710,7 +854,52 @@ function assembleLaunchDetail(
     initialTokenAmount: nullableDecimal(row.initial_token_amount), initialQuoteAmount: nullableDecimal(row.initial_quote_amount),
     reserveBase: nullableDecimal(market?.base_reserves_raw) ?? nullableDecimal(curve?.real_base_reserves_raw),
     reserveQuote: nullableDecimal(market?.quote_vault_amount_raw) ?? nullableDecimal(curve?.real_quote_reserves_raw),
-    feeBps: null, social: NOT_AVAILABLE_SOCIAL, holders,
+    feeBps: null, social, holders,
+  });
+}
+
+function toSocialLink(row: Record<string, unknown>): ApiSocialLink {
+  const syntaxStatus = validated(row.syntax_status, ['VALID', 'INVALID'] as const) as ApiSocialLink['syntaxStatus'];
+  const canonicalUrl = nullableText(row.canonical_url);
+  const invalidReason = nullableText(row.invalid_reason);
+  if (
+    (syntaxStatus === 'VALID' && (canonicalUrl === null || invalidReason !== null))
+    || (syntaxStatus === 'INVALID' && (canonicalUrl !== null || invalidReason === null))
+    || (invalidReason !== null && !SOCIAL_URL_INVALID_REASONS.includes(
+      invalidReason as (typeof SOCIAL_URL_INVALID_REASONS)[number],
+    ))
+  ) throw invalid();
+  return freeze({
+    id: text(row.link_id),
+    kind: validated(row.link_kind, SOCIAL_LINK_KINDS) as ApiSocialLink['kind'],
+    declaredValueSha256: sha256(row.declared_value_sha256),
+    syntaxStatus,
+    canonicalUrl,
+    invalidReason,
+    observedAt: timestamp(row.observed_at).toISOString(),
+  });
+}
+
+function toSocialEvidence(row: Record<string, unknown>): ApiSocialEvidence {
+  const httpStatus = nullableSafeNumber(row.http_status);
+  if (httpStatus !== null && (httpStatus < 100 || httpStatus > 599)) throw invalid();
+  const redirectCount = nonNegativeSafeNumber(row.redirect_count);
+  if (redirectCount > 10) throw invalid();
+  const reasonCode = text(row.reason_code);
+  if (!/^[A-Z][A-Z0-9_]{0,127}$/u.test(reasonCode)) throw invalid();
+  return freeze({
+    id: text(row.evidence_id),
+    type: validated(row.evidence_type, SOCIAL_EVIDENCE_TYPES) as ApiSocialEvidence['type'],
+    outcome: validated(row.outcome, SOCIAL_EVIDENCE_OUTCOMES) as ApiSocialEvidence['outcome'],
+    subjectKind: nullableValidated(row.subject_kind, SOCIAL_LINK_KINDS) as ApiSocialEvidence['subjectKind'],
+    relatedKind: nullableValidated(row.related_kind, SOCIAL_LINK_KINDS) as ApiSocialEvidence['relatedKind'],
+    subjectUrl: nullableText(row.subject_url),
+    finalUrl: nullableText(row.final_url),
+    httpStatus,
+    redirectCount,
+    contentSha256: nullableSha256(row.content_sha256),
+    reasonCode,
+    observedAt: timestamp(row.observed_at).toISOString(),
   });
 }
 
@@ -1237,6 +1426,20 @@ function text(value: unknown): string {
 
 function nullableText(value: unknown): string | null {
   return value === null || value === undefined ? null : text(value);
+}
+
+function nullableValidated(value: unknown, values: readonly string[]): string | null {
+  return value === null || value === undefined ? null : validated(value, values);
+}
+
+function sha256(value: unknown): string {
+  const candidate = text(value);
+  if (!/^[0-9a-f]{64}$/u.test(candidate)) throw invalid();
+  return candidate;
+}
+
+function nullableSha256(value: unknown): string | null {
+  return value === null || value === undefined ? null : sha256(value);
 }
 
 function safeNumber(value: unknown): number {

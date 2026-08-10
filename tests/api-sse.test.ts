@@ -483,6 +483,40 @@ void test('SseSession escapes CR/LF payload data without creating injected frame
   await session.close('CLIENT');
 });
 
+void test('SseSession emits a bounded SocialEvidenceCollected summary without raw evidence arrays', async () => {
+  const timers = new FakeTimers();
+  const response = new FakeResponse();
+  const socialEvent: ApiDomainEvent = {
+    ...event('social-event'),
+    type: 'SocialEvidenceCollected',
+    source: 'public_social',
+    payload: toApiDomainPayload({
+      sourceLaunchEventId: 'launch-event', collectionId: 'social_collection_a',
+      metadataSnapshotId: 'pumpfun_metadata_a', collectionStatus: 'COMPLETE',
+      inputFingerprint: 'a'.repeat(64), linkCount: 3, evidenceCount: 9,
+    }),
+  };
+  const session = new SseSession({
+    stream: {
+      async highWaterMark() { return 0n; }, async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+      async readAfter() { return [{ sequence: 1n, streamEventId: 'stream-1', event: socialEvent }]; },
+    },
+    response: response as unknown as ServerResponse, startAfter: 0n, batchSize: 1,
+    pollIntervalMs: 10, heartbeatIntervalMs: 100, schedule: timers.schedule, cancel: timers.cancel,
+    onClosed: () => undefined,
+  });
+
+  session.start();
+  timers.runOne();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const output = response.chunks.join('');
+  assert.match(output, /event: SocialEvidenceCollected/u);
+  assert.match(output, /"collectionId":"social_collection_a"/u);
+  assert.doesNotMatch(output, /"links"|"evidence"|rawBody|responseHeaders|dnsAnswers/u);
+  assert.ok(Buffer.byteLength(output) < 4_096);
+  await session.close('CLIENT');
+});
+
 void test('SseSession rejects a runtime event type containing CR/LF without frame injection', async () => {
   const timers = new FakeTimers();
   const response = new FakeResponse();

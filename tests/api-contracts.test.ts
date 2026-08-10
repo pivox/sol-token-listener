@@ -146,6 +146,28 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   };
   const availability: ApiAvailability = 'NOT_AVAILABLE';
   const social: ApiSocial = { status: 'NOT_AVAILABLE', links: [], evidence: [] };
+  const availableSocial: ApiSocial = {
+    status: 'AVAILABLE', collectionStatus: 'PARTIAL', collectionId: 'social_collection_a',
+    metadataSnapshotId: 'pumpfun_metadata_a', observedAt: '2026-08-10T12:00:00.000Z',
+    linkCount: 1, linksTruncated: false,
+    links: [{
+      id: 'social_link_a', kind: 'WEBSITE', declaredValueSha256: 'a'.repeat(64),
+      syntaxStatus: 'VALID', canonicalUrl: 'https://project.example/', invalidReason: null,
+      observedAt: '2026-08-10T12:00:00.000Z',
+    }],
+    evidenceCount: 1, evidenceTruncated: false,
+    evidence: [{
+      id: 'social_evidence_a', type: 'URL_REACHABLE', outcome: 'CONFIRMED',
+      subjectKind: 'WEBSITE', relatedKind: null, subjectUrl: 'https://project.example/',
+      finalUrl: 'https://project.example/', httpStatus: 200, redirectCount: 0,
+      contentSha256: 'b'.repeat(64), reasonCode: 'HTTP_2XX',
+      observedAt: '2026-08-10T12:00:00.000Z',
+    }],
+    coverage: {
+      declaredLinkCount: 1, inspectedLinkCount: 1, confirmedEvidenceCount: 1,
+      rejectedEvidenceCount: 0, unknownEvidenceCount: 0,
+    },
+  };
   const holders: ApiHolders = {
     status: 'NOT_AVAILABLE',
     snapshots: [],
@@ -297,6 +319,7 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(failure.error.correlationId, 'req_123');
   assert.equal(availability, 'NOT_AVAILABLE');
   assert.equal(social.links.length, 0);
+  assert.equal(availableSocial.status, 'AVAILABLE');
   assert.equal(holders.snapshots.length, 0);
   assert.equal(availableHolders.status, 'AVAILABLE');
   assert.equal(clusteredHolders.clusterAnalysisStatus, 'AVAILABLE');
