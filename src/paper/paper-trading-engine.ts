@@ -9,6 +9,11 @@ import type {
   QualificationScore,
 } from '../domain/qualification.js';
 import {
+  QUALIFICATION_CONDITION_MODES,
+  QUALIFICATION_CONDITION_STATUSES,
+} from '../domain/qualification.js';
+import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
+import {
   PaperTradingError,
   type ClosePaperPositionCommand,
   type OpenPaperPositionCommand,
@@ -309,6 +314,7 @@ function validateOpenCommand(
   if (command.strategy.id.trim() === '' || !Number.isSafeInteger(command.strategy.version) || command.strategy.version <= 0) {
     invalidQuote('strategy');
   }
+  validateQualificationReport(command.qualification);
   if (command.qualification.blockers.length > 0) {
     throw new PaperTradingError('QUALIFICATION_BLOCKED', 'La qualification contient un blocker.');
   }
@@ -324,6 +330,33 @@ function validateOpenCommand(
   if (command.maximumRoundTripLossBps < 0n || command.maximumRoundTripLossBps > 10_000n) {
     invalidQuote('maximumRoundTripLossBps');
   }
+}
+
+function validateQualificationReport(report: QualificationReport): void {
+  if (report.conditions.length !== QUALIFICATION_REASON_CODES.length) invalidQualification();
+  const enforcedTriggers: string[] = [];
+  for (let index = 0; index < QUALIFICATION_REASON_CODES.length; index += 1) {
+    const condition = report.conditions[index];
+    if (
+      condition === undefined
+      || condition.code !== QUALIFICATION_REASON_CODES[index]
+      || !QUALIFICATION_CONDITION_MODES.includes(condition.mode)
+      || !QUALIFICATION_CONDITION_STATUSES.includes(condition.status)
+      || (condition.mode === 'DISABLED') !== (condition.status === 'DISABLED')
+    ) invalidQualification();
+    if (condition.mode === 'ENFORCED' && condition.status === 'TRIGGERED') {
+      enforcedTriggers.push(condition.code);
+    }
+  }
+  if (
+    report.blockers.length !== enforcedTriggers.length
+    || report.blockers.some((blocker, index) => blocker.code !== enforcedTriggers[index])
+  ) invalidQualification();
+  const verdict: unknown = report.verdict;
+  if (
+    (verdict !== 'QUALIFIED' && verdict !== 'WATCHLISTED' && verdict !== 'REJECTED')
+    || (verdict === 'REJECTED') !== (enforcedTriggers.length > 0)
+  ) invalidQualification();
 }
 
 function validateCloseCommand(
@@ -636,6 +669,13 @@ function hashValue(namespace: string, value: unknown): string {
 
 function invalidQuote(field: string): never {
   throw new PaperTradingError('QUOTE_INVALID', `Commande paper invalide: ${field}.`);
+}
+
+function invalidQualification(): never {
+  throw new PaperTradingError(
+    'QUALIFICATION_INVALID',
+    'Rapport de qualification incohérent pour la commande paper.',
+  );
 }
 
 function conflict(): never {

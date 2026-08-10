@@ -110,7 +110,7 @@ void test('refuse une qualification non acceptée', async () => {
   assert.equal(repository.writeCount, 0);
 });
 
-void test('refuse une qualification bloquée même marquée QUALIFIED', async () => {
+void test('refuse une qualification cohérente mais bloquée', async () => {
   const repository = new MemoryPaperRepository();
   const command = openCommand();
 
@@ -119,15 +119,84 @@ void test('refuse une qualification bloquée même marquée QUALIFIED', async ()
       ...command,
       qualification: {
         ...command.qualification,
+        conditions: command.qualification.conditions.map((item) => item.code === 'CREATOR_EARLY_SELL'
+          ? { ...item, status: 'TRIGGERED' }
+          : item),
         blockers: [{
           code: 'CREATOR_EARLY_SELL',
           message: 'Condition éliminatoire active.',
         }],
+        verdict: 'REJECTED',
       },
     }),
     hasCode('QUALIFICATION_BLOCKED'),
   );
   assert.equal(repository.writeCount, 0);
+});
+
+void test('rejects incomplete, duplicate, reordered, and invalid qualification conditions', async () => {
+  const command = openCommand();
+  const conditions = command.qualification.conditions;
+  const [firstCondition, secondCondition] = conditions;
+  if (firstCondition === undefined || secondCondition === undefined) throw new Error('Qualification fixture is incomplete.');
+  const candidates: readonly (typeof conditions)[] = [
+    conditions.slice(1),
+    [...conditions.slice(0, -1), firstCondition],
+    [secondCondition, firstCondition, ...conditions.slice(2)],
+    conditions.map((item, index) => index === 0 ? { ...item, code: 'NOT_A_REASON' } : item) as unknown as typeof conditions,
+    conditions.map((item, index) => index === 0 ? { ...item, mode: 'INVALID' } : item) as unknown as typeof conditions,
+    conditions.map((item, index) => index === 0 ? { ...item, status: 'INVALID' } : item) as unknown as typeof conditions,
+    conditions.map((item, index) => index === 0 ? { ...item, status: 'DISABLED' } : item),
+  ];
+
+  for (const invalidConditions of candidates) {
+    const repository = new MemoryPaperRepository();
+    await assert.rejects(makeEngine(repository, 'paper').open({
+      ...command,
+      qualification: { ...command.qualification, conditions: invalidConditions },
+    }), hasCode('QUALIFICATION_INVALID'));
+    assert.equal(repository.writeCount, 0);
+  }
+});
+
+void test('rejects qualification condition, blocker, and verdict inconsistencies before writing', async () => {
+  const command = openCommand();
+  const triggeredConditions = command.qualification.conditions.map((item) => item.code === 'CREATOR_EARLY_SELL'
+    ? { ...item, status: 'TRIGGERED' as const }
+    : item);
+  const blocker = { code: 'CREATOR_EARLY_SELL' as const, message: 'Condition éliminatoire active.' };
+  const candidates = [
+    { ...command.qualification, conditions: triggeredConditions },
+    { ...command.qualification, blockers: [blocker], verdict: 'REJECTED' as const },
+    { ...command.qualification, conditions: triggeredConditions, verdict: 'REJECTED' as const },
+    { ...command.qualification, conditions: triggeredConditions, blockers: [blocker] },
+  ];
+
+  for (const qualification of candidates) {
+    const repository = new MemoryPaperRepository();
+    await assert.rejects(makeEngine(repository, 'paper').open({
+      ...command,
+      qualification,
+    }), hasCode('QUALIFICATION_INVALID'));
+    assert.equal(repository.writeCount, 0);
+  }
+});
+
+void test('accepts a coherent triggered report-only condition without inventing a blocker', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand();
+  const position = await makeEngine(repository, 'paper').open({
+    ...command,
+    qualification: {
+      ...command.qualification,
+      conditions: command.qualification.conditions.map((item) => item.code === 'MINT_SOCIAL_MISMATCH'
+        ? { ...item, status: 'TRIGGERED' }
+        : item),
+    },
+  });
+
+  assert.equal(position.status, 'PAPER_HOLDING');
+  assert.equal(repository.writeCount, 1);
 });
 
 void test('refuse un quote mint hors allowlist SOL initiale', async () => {
