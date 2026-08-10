@@ -64,20 +64,27 @@ export class PaperTradingEngine {
 
   public async open(command: OpenPaperPositionCommand): Promise<PaperPosition> {
     this.requirePaperMode();
-    const qualification: unknown = command.qualification;
-    if (!this.qualificationReportAuthority.isAuthorized(qualification)) invalidQualification();
-    const snapshot = snapshotOpenCommand(command, qualification);
+    const qualification = command.qualification;
+    const mint = command.mint;
+    const trigger = snapshotTrigger(command.trigger);
+    if (!this.qualificationReportAuthority.isAuthorized(qualification, {
+      mint,
+      triggerEventId: trigger.id,
+    })) invalidQualification();
+    const snapshot = snapshotOpenCommand(command, qualification, mint, trigger);
     validateOpenCommand(
       snapshot,
       this.config.paperQuoteMintAllowlist,
       this.qualificationProfile,
     );
     const roundTrip = calculateRoundTrip(snapshot.buyQuote, snapshot.reverseSellQuote);
+    validateQualificationExecutionFacts(
+      snapshot.qualification,
+      roundTrip.lossBps,
+      this.qualificationProfile,
+    );
     if (roundTrip.lossBps > snapshot.maximumRoundTripLossBps) {
-      throw new PaperTradingError(
-        'ROUND_TRIP_LOSS_EXCEEDED',
-        `Perte aller-retour ${roundTrip.lossBps} bps supérieure au plafond.`,
-      );
+      roundTripLossExceeded(roundTrip.lossBps);
     }
     const positionId = hashId('paper_position', [
       snapshot.mint,
@@ -417,6 +424,40 @@ function validateQualificationReport(
   ) invalidQualification();
 }
 
+function validateQualificationExecutionFacts(
+  report: QualificationReport,
+  roundTripLossBps: bigint,
+  profile: EffectiveQualificationProfile,
+): void {
+  const conditions = new Map(report.conditions.map((condition) => [condition.code, condition]));
+  const policies = new Map(profile.conditionPolicies.map((policy) => [policy.code, policy]));
+  const buySimulation = conditions.get('BUY_SIMULATION_FAILED');
+  const sellQuote = conditions.get('SELL_QUOTE_UNAVAILABLE');
+  const roundTrip = conditions.get('ROUND_TRIP_LOSS_EXCEEDED');
+  const buyPolicy = policies.get('BUY_SIMULATION_FAILED');
+  const sellPolicy = policies.get('SELL_QUOTE_UNAVAILABLE');
+  const roundTripPolicy = policies.get('ROUND_TRIP_LOSS_EXCEEDED');
+  if (
+    buyPolicy === undefined
+    || sellPolicy === undefined
+    || roundTripPolicy === undefined
+  ) invalidQualification();
+  if (buyPolicy.mode === 'ENFORCED' && buySimulation?.observed.buySimulationSucceeded !== true) {
+    invalidQualification();
+  }
+  if (sellPolicy.mode === 'ENFORCED' && sellQuote?.observed.sellQuoteAvailable !== true) {
+    invalidQualification();
+  }
+  if (roundTripPolicy.mode === 'ENFORCED') {
+    if (roundTrip?.observed.roundTripLossBps !== roundTripLossBps) invalidQualification();
+    const maximumRoundTripLossBps = roundTripPolicy.maximumRoundTripLossBps;
+    if (maximumRoundTripLossBps === null) invalidQualification();
+    if (roundTripLossBps > BigInt(maximumRoundTripLossBps)) {
+      roundTripLossExceeded(roundTripLossBps);
+    }
+  }
+}
+
 function matchesPolicyThresholds(
   condition: QualificationConditionEvidence,
   policy: QualificationConditionPolicy,
@@ -484,9 +525,11 @@ function rejectOrphanedTrigger(trigger: DomainEvent): void {
 function snapshotOpenCommand(
   command: OpenPaperPositionCommand,
   qualification: QualificationReport,
+  mint: string,
+  trigger: DomainEvent,
 ): OpenPaperPositionCommand {
   return freeze({
-    mint: command.mint,
+    mint,
     quoteAsset: freeze({
       mint: command.quoteAsset.mint,
       decimals: command.quoteAsset.decimals,
@@ -496,7 +539,7 @@ function snapshotOpenCommand(
       id: command.strategy.id,
       version: command.strategy.version,
     }),
-    trigger: snapshotTrigger(command.trigger),
+    trigger,
     qualification: snapshotQualification(qualification),
     buyQuote: snapshotQuote(command.buyQuote),
     reverseSellQuote: snapshotQuote(command.reverseSellQuote),
@@ -775,6 +818,13 @@ function invalidQualification(): never {
   throw new PaperTradingError(
     'QUALIFICATION_INVALID',
     'Rapport de qualification incohérent pour la commande paper.',
+  );
+}
+
+function roundTripLossExceeded(lossBps: bigint): never {
+  throw new PaperTradingError(
+    'ROUND_TRIP_LOSS_EXCEEDED',
+    `Perte aller-retour ${lossBps} bps supérieure au plafond.`,
   );
 }
 

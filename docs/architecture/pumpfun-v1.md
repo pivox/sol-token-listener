@@ -105,10 +105,16 @@ Le `PaperTradingEngine` reçoit l’`EffectiveQualificationProfile` déjà charg
 comme autorité de politique et une `QualificationReportAuthority` process-local
 portée par le `QualificationEngine` qui produit les rapports. Il ne relit aucun
 fichier : avant toute transaction paper, il exige la référence exacte d’un
-rapport autorisé, puis compare l’identité du ruleset ainsi que les modes et
-seuils des conditions aux policies du profil. Une copie ou désérialisation est
-donc refusée. Après redémarrage, les inputs de confiance doivent être réévalués ;
-le paper trading n’est pas encore composé dans le bootstrap de production.
+rapport autorisé pour le même mint et le même événement déclencheur, puis
+compare l’identité du ruleset ainsi que les modes et seuils des conditions aux
+policies du profil. Pour les policies `ENFORCED`, il exige également une
+simulation BUY réussie, une quote SELL disponible, un loss observé égal au loss
+recalculé et le respect du plafond round-trip du profil ; `REPORT_ONLY` reste
+non bloquant et `DISABLED` n’exige pas d’observation. Une copie,
+désérialisation ou réutilisation pour un autre
+sujet est donc refusée. Après redémarrage, les inputs de confiance doivent être
+réévalués pour le nouveau sujet ; le paper trading n’est pas encore composé dans
+le bootstrap de production.
 
 ### Analytics participants I1
 

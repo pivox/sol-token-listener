@@ -17,7 +17,10 @@ import { QUALIFICATION_REASON_CODES, type QualificationReasonCode } from '../dom
 import { assertValidTimestampMs } from '../domain/timestamp.js';
 import { isProxy } from 'node:util/types';
 import type { AppConfig } from '../config/env.js';
-import type { QualificationReportAuthority } from '../ports/qualification-report-authority.js';
+import type {
+  QualificationReportAuthority,
+  QualificationReportSubject,
+} from '../ports/qualification-report-authority.js';
 import {
   assertValidEffectiveQualificationProfile,
   loadQualificationProfile,
@@ -55,7 +58,7 @@ export type QualificationProfileSummary = Readonly<{
 export class QualificationEngine implements QualificationReportAuthority {
   private readonly profile: EffectiveQualificationProfile;
   private readonly summary: QualificationProfileSummary;
-  readonly #authorizedReports = new WeakSet<QualificationReport>();
+  readonly #authorizedReports = new WeakMap<QualificationReport, QualificationReportSubject>();
 
   public constructor(profile: EffectiveQualificationProfile) {
     assertValidEffectiveQualificationProfile(profile);
@@ -77,13 +80,33 @@ export class QualificationEngine implements QualificationReportAuthority {
     return this.summary;
   }
 
-  public readonly isAuthorized = (report: unknown): report is QualificationReport => (
-    typeof report === 'object'
-    && report !== null
-    && this.#authorizedReports.has(report as QualificationReport)
-  );
+  public readonly isAuthorized = (
+    report: unknown,
+    subject: QualificationReportSubject,
+  ): report is QualificationReport => {
+    if (typeof report !== 'object' || report === null) return false;
+    const mint = subject.mint;
+    const triggerEventId = subject.triggerEventId;
+    const authorizedSubject = this.#authorizedReports.get(report as QualificationReport);
+    return authorizedSubject?.mint === mint
+      && authorizedSubject.triggerEventId === triggerEventId;
+  };
 
   public evaluate(input: QualificationEvaluationInput): QualificationReport {
+    return this.evaluateReport(input);
+  }
+
+  public evaluateAuthorized(
+    subject: QualificationReportSubject,
+    input: QualificationEvaluationInput,
+  ): QualificationReport {
+    const authorizedSubject = snapshotReportSubject(subject);
+    const report = this.evaluateReport(input);
+    this.#authorizedReports.set(report, authorizedSubject);
+    return report;
+  }
+
+  private evaluateReport(input: QualificationEvaluationInput): QualificationReport {
     const snapshot = snapshotEvaluationInput(input);
     assertValidTimestampMs('evaluatedAtMs', snapshot.evaluatedAtMs);
     const evidence = this.profile.rules.map((ruleDefinition) => evidenceFor(ruleDefinition, snapshot.signals));
@@ -115,9 +138,22 @@ export class QualificationEngine implements QualificationReportAuthority {
       verdict,
       evaluatedAtMs: snapshot.evaluatedAtMs,
     } satisfies QualificationReport);
-    this.#authorizedReports.add(report);
     return report;
   }
+}
+
+function snapshotReportSubject(
+  subject: QualificationReportSubject,
+): QualificationReportSubject {
+  const mint = subject.mint;
+  const triggerEventId = subject.triggerEventId;
+  if (
+    typeof mint !== 'string'
+    || mint.trim() === ''
+    || typeof triggerEventId !== 'string'
+    || triggerEventId.trim() === ''
+  ) throw new TypeError('Qualification report subject is invalid.');
+  return freeze({ mint, triggerEventId });
 }
 
 function snapshotProfile(profile: EffectiveQualificationProfile): EffectiveQualificationProfile {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import type {
   EffectiveQualificationProfile,
@@ -24,6 +25,7 @@ import {
   createDefaultQualificationRuleSet,
   QualificationEngine,
 } from '../src/qualification/qualification-engine.js';
+import { parseQualificationProfile } from '../src/qualification/qualification-profile.js';
 import { reconcileConfirmationStatus } from '../src/domain/confirmation-status.js';
 import type { ChainConfirmationStatus } from '../src/domain/types.js';
 
@@ -31,6 +33,17 @@ import type { ChainConfirmationStatus } from '../src/domain/types.js';
 const LEGACY_OPEN_COMMAND_HASH = 'paper_open_command_553d5ff67f95f9b3779d79d66fabc2f19a019d43b33e45933ed69522d2568ab5';
 const TEST_QUALIFICATION_PROFILE = createDefaultQualificationRuleSet(60);
 const TEST_QUALIFICATION_AUTHORITY = new QualificationEngine(TEST_QUALIFICATION_PROFILE);
+const OPEN_CALIBRATION_FACTS = Object.freeze({
+  top1HolderBps: null,
+  top5HoldersBps: null,
+  top10HoldersBps: null,
+  maximumRelatedClusterBps: null,
+  maximumSharedFunderCount: null,
+  buySimulationSucceeded: true,
+  sellQuoteAvailable: true,
+  roundTripLossBps: 1_100n,
+  upstreamConditions: Object.freeze([]),
+});
 
 void test('refuse le mode observe sans écriture', async () => {
   const repository = new MemoryPaperRepository();
@@ -214,6 +227,129 @@ void test('rejects an identical cloned qualification report before writing', asy
     qualification: structuredClone(command.qualification),
   }), hasCode('QUALIFICATION_INVALID'));
   assert.equal(repository.writeCount, 0);
+});
+
+void test('rejects an authorized report reused for another mint or trigger before writing', async () => {
+  const command = openCommand();
+  const candidates: readonly OpenPaperPositionCommand[] = [
+    {
+      ...command,
+      mint: 'OTHER_MINT',
+      trigger: { ...command.trigger, mint: 'OTHER_MINT' },
+      buyQuote: { ...command.buyQuote, outputMint: 'OTHER_MINT' },
+      reverseSellQuote: { ...command.reverseSellQuote, inputMint: 'OTHER_MINT' },
+    },
+    {
+      ...command,
+      trigger: { ...command.trigger, id: 'trigger:other' },
+    },
+  ];
+
+  for (const candidate of candidates) {
+    const repository = new MemoryPaperRepository();
+    await assert.rejects(
+      makeEngine(repository, 'paper').open(candidate),
+      hasCode('QUALIFICATION_INVALID'),
+    );
+    assert.equal(repository.writeCount, 0);
+  }
+});
+
+void test('rejects quotes whose recomputed loss differs from the authorized report', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand();
+
+  await assert.rejects(makeEngine(repository, 'paper').open({
+    ...command,
+    reverseSellQuote: { ...command.reverseSellQuote, minimumAmountOutRaw: 88n },
+    maximumRoundTripLossBps: 2_000n,
+  }), hasCode('QUALIFICATION_INVALID'));
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('requires successful buy simulation and an available reverse quote', async () => {
+  const command = openCommand();
+  const cases = [
+    ['BUY_SIMULATION_FAILED', 'buySimulationSucceeded'],
+    ['SELL_QUOTE_UNAVAILABLE', 'sellQuoteAvailable'],
+  ] as const;
+
+  for (const [code, observedKey] of cases) {
+    const repository = new MemoryPaperRepository();
+    const qualification = {
+      ...command.qualification,
+      conditions: command.qualification.conditions.map((item) => item.code === code
+        ? { ...item, observed: { [observedKey]: false } }
+        : item),
+    };
+    const engine = makeEngine(
+      repository,
+      'paper',
+      TEST_QUALIFICATION_PROFILE,
+      exactReportsAuthority(qualification),
+    );
+
+    await assert.rejects(engine.open({ ...command, qualification }), hasCode('QUALIFICATION_INVALID'));
+    assert.equal(repository.writeCount, 0);
+  }
+});
+
+void test('enforces the trusted profile round-trip ceiling independently of the command', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand();
+  const qualification = {
+    ...command.qualification,
+    conditions: command.qualification.conditions.map((item) => {
+      switch (item.code) {
+        case 'BUY_SIMULATION_FAILED':
+          return { ...item, status: 'PASSED' as const, observed: { buySimulationSucceeded: true } };
+        case 'SELL_QUOTE_UNAVAILABLE':
+          return { ...item, status: 'PASSED' as const, observed: { sellQuoteAvailable: true } };
+        case 'ROUND_TRIP_LOSS_EXCEEDED':
+          return { ...item, status: 'PASSED' as const, observed: { roundTripLossBps: 3_100n } };
+        default:
+          return item;
+      }
+    }),
+  };
+  const engine = makeEngine(
+    repository,
+    'paper',
+    TEST_QUALIFICATION_PROFILE,
+    exactReportsAuthority(qualification),
+  );
+
+  await assert.rejects(engine.open({
+    ...command,
+    qualification,
+    reverseSellQuote: { ...command.reverseSellQuote, minimumAmountOutRaw: 69n },
+    maximumRoundTripLossBps: 4_000n,
+  }), hasCode('ROUND_TRIP_LOSS_EXCEEDED'));
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('does not turn report-only execution policies into paper blockers', async () => {
+  const repository = new MemoryPaperRepository();
+  const profile = reportOnlyExecutionProfile();
+  const authority = new QualificationEngine(profile);
+  const command = openCommand(authority, {
+    calibrationFacts: Object.freeze({
+      ...OPEN_CALIBRATION_FACTS,
+      buySimulationSucceeded: false,
+      sellQuoteAvailable: false,
+      roundTripLossBps: 3_100n,
+    }),
+  });
+  const engine = makeEngine(repository, 'paper', profile, authority);
+
+  const position = await engine.open({
+    ...command,
+    reverseSellQuote: { ...command.reverseSellQuote, minimumAmountOutRaw: 69n },
+    maximumRoundTripLossBps: 4_000n,
+  });
+
+  assert.equal(position.status, 'PAPER_HOLDING');
+  assert.equal(repository.writeCount, 1);
 });
 
 void test('rejects a cloned coherent rejected report before writing', async () => {
@@ -484,8 +620,8 @@ void test('binds the profile fingerprint and calibrated condition evidence into 
   const conditions = conditionCommand.qualification.conditions;
   const conflictingQualification = {
     ...conditionCommand.qualification,
-    conditions: conditions.map((item) => item.code === 'ROUND_TRIP_LOSS_EXCEEDED'
-      ? { ...item, observed: { ...item.observed, roundTripLossBps: 3_001n } }
+    conditions: conditions.map((item) => item.code === 'HOLDER_CONCENTRATION_EXCEEDED'
+      ? { ...item, observed: { ...item.observed, top1HolderBps: 1n } }
       : item),
   };
   const conditionEngine = makeEngine(
@@ -534,7 +670,7 @@ void test('preserves the historical calibrated qualification command hash', asyn
 
   assert.equal(
     first.openCommandHash,
-    'paper_open_command_04adf7b1775782bd2c2a8978237cb1b653158fbf0dd4d9ca4f5e7484445971d0',
+    'paper_open_command_5fc05d1b9538825fdb6173fc08330eabc2d71800d666236e87e64ea678504d77',
   );
   assert.notEqual(first.openCommandHash, LEGACY_OPEN_COMMAND_HASH);
   const replay = await engine.open(command);
@@ -689,7 +825,11 @@ function openCommand(
   authority: QualificationEngine = TEST_QUALIFICATION_AUTHORITY,
   input: Partial<QualificationEvaluationInput> = {},
 ): OpenPaperPositionCommand {
-  const qualification = authority.evaluate({
+  const triggerEvent = trigger('QualificationUpdated');
+  const qualification = authority.evaluateAuthorized({
+    mint: 'MINT',
+    triggerEventId: triggerEvent.id,
+  }, {
     evaluatedAtMs: input.evaluatedAtMs ?? 1,
     signals: input.signals ?? {
       imageValid: true,
@@ -697,13 +837,13 @@ function openCommand(
       creatorHasNotSold: true,
     },
     blockers: input.blockers ?? [],
-    calibrationFacts: input.calibrationFacts ?? null,
+    calibrationFacts: input.calibrationFacts ?? OPEN_CALIBRATION_FACTS,
   });
   return {
     mint: 'MINT',
     quoteAsset: { mint: 'SOL', decimals: 9, tokenProgram: 'SPL_TOKEN' },
     strategy: { id: 'momentum-controlled', version: 1 },
-    trigger: trigger('QualificationUpdated'),
+    trigger: triggerEvent,
     qualification,
     buyQuote: quote('buy', 'SOL', 'MINT', 100n, 95n, 90n),
     reverseSellQuote: quote('reverse', 'MINT', 'SOL', 90n, 91n, 89n),
@@ -722,6 +862,31 @@ function exactReportsAuthority(
       && authorized.has(candidate as QualificationReport)
     ),
   });
+}
+
+function reportOnlyExecutionProfile(): EffectiveQualificationProfile {
+  const raw = JSON.parse(readFileSync(
+    new URL('../config/qualification/pumpfun-v1-unvalidated.json', import.meta.url),
+    'utf8',
+  )) as { conditionPolicies: Record<string, unknown>[] };
+  const executionCodes = new Set([
+    'BUY_SIMULATION_FAILED',
+    'SELL_QUOTE_UNAVAILABLE',
+    'ROUND_TRIP_LOSS_EXCEEDED',
+  ]);
+  raw.conditionPolicies = raw.conditionPolicies.map((policy) => ({
+    ...policy,
+    ...(executionCodes.has(String(policy.code)) ? { mode: 'REPORT_ONLY' } : {}),
+  }));
+  return parseQualificationProfile(deepFreeze(raw), null);
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object') {
+    for (const item of Object.values(value)) deepFreeze(item);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 function closeCommand(positionId: string): ClosePaperPositionCommand {

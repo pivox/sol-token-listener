@@ -222,11 +222,16 @@ void test('qualifie un lancement dont les trois dimensions atteignent le seuil',
 void test('authorizes only the exact reports emitted by the same qualification engine', () => {
   const engine = new QualificationEngine(defaultQualificationRuleSet);
   const otherEngine = new QualificationEngine(defaultQualificationRuleSet);
-  const report = engine.evaluate(completeInput());
+  const subject = { mint: 'MINT', triggerEventId: 'trigger' };
+  const plainReport = engine.evaluate(completeInput());
+  const report = engine.evaluateAuthorized(subject, completeInput());
 
-  assert.equal(engine.isAuthorized(report), true);
-  assert.equal(engine.isAuthorized(structuredClone(report)), false);
-  assert.equal(otherEngine.isAuthorized(report), false);
+  assert.equal(engine.isAuthorized(plainReport, subject), false);
+  assert.equal(engine.isAuthorized(report, subject), true);
+  assert.equal(engine.isAuthorized(report, { ...subject, mint: 'OTHER' }), false);
+  assert.equal(engine.isAuthorized(report, { ...subject, triggerEventId: 'other' }), false);
+  assert.equal(engine.isAuthorized(structuredClone(report), subject), false);
+  assert.equal(otherEngine.isAuthorized(report, subject), false);
 });
 
 void test('rejette un lancement bloqué indépendamment du score', () => {

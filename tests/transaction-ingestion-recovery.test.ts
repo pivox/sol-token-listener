@@ -613,22 +613,36 @@ function openCommand(
   authority: QualificationEngine,
   imageValid = true,
 ): OpenPaperPositionCommand {
-  const qualification = authority.evaluate({
+  const triggerEvent = {
+    id: 'trigger', type: 'QualificationUpdated' as const, mint: 'MINT', source: 'pumpfun',
+    program: 'pump-program', signature: 'signature',
+    cursor: { slot: 1n, transactionIndex: 0, instructionIndex: 0, innerInstructionIndex: null },
+    confirmationStatus: 'confirmed' as const, blockchainTimeMs: 1, observedAtMs: 1,
+    payloadVersion: 1, payload: {},
+  };
+  const qualification = authority.evaluateAuthorized({
+    mint: 'MINT',
+    triggerEventId: triggerEvent.id,
+  }, {
     evaluatedAtMs: 1,
     signals: { imageValid, socialCrossLinkConfirmed: true, creatorHasNotSold: true },
     blockers: [],
-    calibrationFacts: null,
+    calibrationFacts: Object.freeze({
+      top1HolderBps: null,
+      top5HoldersBps: null,
+      top10HoldersBps: null,
+      maximumRelatedClusterBps: null,
+      maximumSharedFunderCount: null,
+      buySimulationSucceeded: true,
+      sellQuoteAvailable: true,
+      roundTripLossBps: 2_000n,
+      upstreamConditions: Object.freeze([]),
+    }),
   });
   return {
     mint: 'MINT', quoteAsset: { mint: 'SOL', decimals: 9, tokenProgram: 'SPL_TOKEN' },
     strategy: { id: 'recovery', version: 1 },
-    trigger: {
-      id: 'trigger', type: 'QualificationUpdated', mint: 'MINT', source: 'pumpfun',
-      program: 'pump-program', signature: 'signature',
-      cursor: { slot: 1n, transactionIndex: 0, instructionIndex: 0, innerInstructionIndex: null },
-      confirmationStatus: 'confirmed', blockchainTimeMs: 1, observedAtMs: 1,
-      payloadVersion: 1, payload: {},
-    },
+    trigger: triggerEvent,
     qualification,
     buyQuote: quote('buy', 'SOL', 'MINT'),
     reverseSellQuote: quote('sell', 'MINT', 'SOL'),
