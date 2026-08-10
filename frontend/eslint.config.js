@@ -55,6 +55,10 @@ export default tseslint.config(
     files: ['src/**/*.test.{ts,tsx}', 'src/test/**/*.ts', 'tests/**/*.{ts,tsx}'],
     languageOptions: {
       globals: { ...globals.browser, ...globals.node },
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
     },
     rules: {
       '@typescript-eslint/explicit-function-return-type': 'off',
