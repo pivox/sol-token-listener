@@ -27,7 +27,7 @@ void test('copies the only canonical profile byte-for-byte and removes stale tar
     assert.deepEqual(copied, [profileName]);
     assert.deepEqual(await readFile(join(targetDirectory, profileName)), expected);
     assert.deepEqual((await readdir(targetDirectory)).sort(), [profileName]);
-    assert.equal((await readdir(root)).filter((name) => name.startsWith('.qualification-profile-quarantine-')).length, 1);
+    assert.deepEqual((await readdir(root)).filter((name) => name.startsWith('.qualification-profile-')), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -180,6 +180,52 @@ void test('rejects filesystem root and repository working-directory ancestors as
     for (const targetDirectory of [parse(process.cwd()).root, process.cwd(), dirname(process.cwd())]) {
       await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test('replaces direct stale entries deterministically without leaving sibling artifacts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sol-listener-repeatable-qualification-profile-'));
+  const sourceDirectory = join(root, 'source');
+  const targetDirectory = join(root, 'target');
+  const expected = await readFile(bundledProfile);
+  try {
+    await mkdir(sourceDirectory);
+    await mkdir(targetDirectory);
+    await writeFile(join(sourceDirectory, profileName), expected);
+    await writeFile(join(targetDirectory, 'stale'), 'stale');
+
+    await copyQualificationProfiles({ sourceDirectory, targetDirectory });
+    const first = await readFile(join(targetDirectory, profileName));
+    await copyQualificationProfiles({ sourceDirectory, targetDirectory });
+
+    assert.deepEqual(first, expected);
+    assert.deepEqual(await readFile(join(targetDirectory, profileName)), expected);
+    assert.deepEqual(await readdir(targetDirectory), [profileName]);
+    assert.deepEqual((await readdir(root)).filter((name) => name.startsWith('.qualification-profile-')), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test('rejects nested stale target directories without touching either directory', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sol-listener-nested-stale-qualification-profile-'));
+  const sourceDirectory = join(root, 'source');
+  const targetDirectory = join(root, 'target');
+  const nestedDirectory = join(targetDirectory, 'nested');
+  try {
+    await mkdir(sourceDirectory);
+    await mkdir(nestedDirectory, { recursive: true });
+    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    await writeFile(join(sourceDirectory, 'source-sentinel'), 'source');
+    await writeFile(join(nestedDirectory, 'target-sentinel'), 'target');
+
+    await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
+
+    assert.equal(await readFile(join(sourceDirectory, 'source-sentinel'), 'utf8'), 'source');
+    assert.equal(await readFile(join(nestedDirectory, 'target-sentinel'), 'utf8'), 'target');
+    assert.deepEqual((await readdir(root)).filter((name) => name.startsWith('.qualification-profile-stage-')), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -1,4 +1,4 @@
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -83,35 +83,22 @@ async function replaceTargetDirectory(sourceDirectory: string, targetDirectory: 
   assertSafeTargetDirectory(sourceRealPath, stableTargetDirectory);
   const stagingDirectory = mkdtempSync(join(stableTargetParent, '.qualification-profile-stage-'));
   const stagingIdentity = directoryIdentity(stagingDirectory, 'target');
-  let stagingMoved = false;
   try {
     await writeFile(join(stagingDirectory, canonicalProfileName), sourceBytes, { flag: 'wx', mode: 0o600 });
-    const targetIdentity = existingDirectoryIdentity(stableTargetDirectory);
-    if (targetIdentity === null) {
-      if (!sameIdentity(directoryIdentity(stagingDirectory, 'target'), stagingIdentity)) throw new Error('Staging directory changed before replacement.');
-      renameSync(stagingDirectory, stableTargetDirectory);
-      stagingMoved = true;
-      return;
+    const targetIdentity = ensureTargetDirectory(stableTargetDirectory, sourceDirectory, sourceIdentity);
+    const entries = directTargetEntries(stableTargetDirectory);
+    for (const entry of entries) {
+      assertStableDirectories(stableTargetDirectory, targetIdentity, sourceDirectory, sourceIdentity);
+      const entryPath = join(stableTargetDirectory, entry.name);
+      if (!sameIdentity(entryIdentity(entryPath), entry.identity)) throw new Error('Target entry changed before replacement.');
+      unlinkSync(entryPath);
     }
-
-    const quarantineDirectory = mkdtempSync(join(targetParent, '.qualification-profile-quarantine-'));
-    rmdirSync(quarantineDirectory);
-    if (!sameIdentity(directoryIdentity(stableTargetDirectory, 'target'), targetIdentity)) throw new Error('Target directory changed before replacement.');
-    renameSync(stableTargetDirectory, quarantineDirectory);
-    const quarantinedIdentity = directoryIdentity(quarantineDirectory, 'target');
-    if (!sameIdentity(quarantinedIdentity, targetIdentity)) {
-      restoreDirectory(quarantineDirectory, stableTargetDirectory);
-      throw new Error('Target directory changed during replacement.');
-    }
-    if (!sameIdentity(directoryIdentity(sourceDirectory, 'source'), sourceIdentity)) {
-      restoreSourceDirectory(quarantineDirectory, sourceDirectory, sourceIdentity);
-      throw new Error('Source directory changed during replacement.');
-    }
+    assertStableDirectories(stableTargetDirectory, targetIdentity, sourceDirectory, sourceIdentity);
+    if (readdirSync(stableTargetDirectory).length !== 0) throw new Error('Target directory changed before replacement.');
     if (!sameIdentity(directoryIdentity(stagingDirectory, 'target'), stagingIdentity)) throw new Error('Staging directory changed before replacement.');
-    renameSync(stagingDirectory, stableTargetDirectory);
-    stagingMoved = true;
+    renameSync(join(stagingDirectory, canonicalProfileName), join(stableTargetDirectory, canonicalProfileName));
   } finally {
-    if (!stagingMoved) removePrivateStagingDirectory(stagingDirectory, stagingIdentity);
+    removePrivateStagingDirectory(stagingDirectory, stagingIdentity);
   }
 }
 
@@ -160,6 +147,61 @@ function existingDirectoryIdentity(directory: string): DirectoryIdentity | null 
   }
 }
 
+function ensureTargetDirectory(
+  directory: string,
+  sourceDirectory: string,
+  sourceIdentity: DirectoryIdentity,
+): DirectoryIdentity {
+  const existing = existingDirectoryIdentity(directory);
+  if (existing !== null) return existing;
+  if (!sameIdentity(directoryIdentity(sourceDirectory, 'source'), sourceIdentity)) {
+    throw new Error('Source directory changed before replacement.');
+  }
+  try {
+    mkdirSync(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  return directoryIdentity(directory, 'target');
+}
+
+interface TargetEntry {
+  readonly name: string;
+  readonly identity: EntryIdentity;
+}
+
+interface EntryIdentity {
+  readonly device: number;
+  readonly inode: number;
+}
+
+function directTargetEntries(directory: string): readonly TargetEntry[] {
+  return Object.freeze(readdirSync(directory).sort((left, right) => left.localeCompare(right)).map((name) => {
+    const path = join(directory, name);
+    const stats = lstatSync(path);
+    if (!stats.isFile() && !stats.isSymbolicLink()) throw new Error('Target directory contains unsafe entries.');
+    return Object.freeze({ name, identity: Object.freeze({ device: stats.dev, inode: stats.ino }) });
+  }));
+}
+
+function entryIdentity(path: string): EntryIdentity {
+  const stats = lstatSync(path);
+  if (!stats.isFile() && !stats.isSymbolicLink()) throw new Error('Target directory contains unsafe entries.');
+  return Object.freeze({ device: stats.dev, inode: stats.ino });
+}
+
+function assertStableDirectories(
+  targetDirectory: string,
+  targetIdentity: DirectoryIdentity,
+  sourceDirectory: string,
+  sourceIdentity: DirectoryIdentity,
+): void {
+  if (!sameIdentity(directoryIdentity(targetDirectory, 'target'), targetIdentity)
+    || !sameIdentity(directoryIdentity(sourceDirectory, 'source'), sourceIdentity)) {
+    throw new Error('Source or target directory changed during replacement.');
+  }
+}
+
 function assertSafeExistingDirectory(directory: string, label: 'source' | 'target'): void {
   const stats = lstatSync(directory);
   if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error(`Unsafe ${label} directory.`);
@@ -178,16 +220,6 @@ function directoryIdentity(directory: string, label: 'source' | 'target'): Direc
 
 function sameIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
   return left.device === right.device && left.inode === right.inode;
-}
-
-function restoreDirectory(from: string, to: string): void {
-  try { renameSync(from, to); } catch { /* Preserve the unique quarantine if rollback is no longer safe. */ }
-}
-
-function restoreSourceDirectory(quarantineDirectory: string, sourceDirectory: string, sourceIdentity: DirectoryIdentity): void {
-  try {
-    if (sameIdentity(directoryIdentity(quarantineDirectory, 'target'), sourceIdentity)) renameSync(quarantineDirectory, sourceDirectory);
-  } catch { /* Preserve the unique quarantine if the source cannot be restored safely. */ }
 }
 
 function removePrivateStagingDirectory(directory: string, expected: DirectoryIdentity): void {
