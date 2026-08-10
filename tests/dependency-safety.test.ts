@@ -44,3 +44,17 @@ void test('every locked bn.js v5 release contains the infinite-loop fix', async 
     );
   }
 });
+
+void test('pins the bounded public-content dependencies exactly', async () => {
+  const manifest = JSON.parse(
+    await readFile(new URL('package.json', root), 'utf8'),
+  ) as PackageManifest;
+  const lock = JSON.parse(
+    await readFile(new URL('package-lock.json', root), 'utf8'),
+  ) as PackageLock;
+
+  assert.equal(manifest.dependencies?.parse5, '8.0.1');
+  assert.equal(manifest.dependencies?.tldts, '7.4.10');
+  assert.equal(lock.packages?.['node_modules/parse5']?.version, '8.0.1');
+  assert.equal(lock.packages?.['node_modules/tldts']?.version, '7.4.10');
+});
