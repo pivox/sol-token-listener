@@ -4,6 +4,8 @@ import type { TokenMetadataSnapshot } from './pumpfun-observation.js';
 import { assertValidTimestampMs } from './timestamp.js';
 import { canonicalStringifyJson } from '../utils/json.js';
 
+export const PUBLIC_SOCIAL_RETENTION_HOURS = 4;
+
 export const SOCIAL_LINK_KINDS = Object.freeze([
   'WEBSITE',
   'X',

@@ -80,7 +80,7 @@ export class BoundedPublicHttpClient implements PublicHttpClient {
       try {
         const statusCode = response.value.statusCode;
         if (statusCode >= 300 && statusCode < 400) {
-          response.value.discard?.();
+          discard(response.value);
           if (redirectCount === this.options.maxRedirects) {
             return failure('REDIRECT_LIMIT_EXCEEDED', false);
           }
@@ -97,17 +97,17 @@ export class BoundedPublicHttpClient implements PublicHttpClient {
         }
 
         if (statusCode < 200 || statusCode >= 300) {
-          response.value.discard?.();
+          discard(response.value);
           return failure('HTTP_STATUS_INVALID', isRetryableStatus(statusCode));
         }
         const contentType = mediaType(header(response.value.headers, 'content-type'));
         if (contentType === null || !accepted.has(contentType)) {
-          response.value.discard?.();
+          discard(response.value);
           return failure('CONTENT_TYPE_UNSUPPORTED', false);
         }
         const declaredLength = contentLength(header(response.value.headers, 'content-length'));
         if (declaredLength !== null && declaredLength > this.options.maxBytes) {
-          response.value.discard?.();
+          discard(response.value);
           return failure('CONTENT_TOO_LARGE', false);
         }
         let body: Uint8Array | null;
@@ -118,7 +118,10 @@ export class BoundedPublicHttpClient implements PublicHttpClient {
             ? failure('TIMEOUT', true)
             : failure('NETWORK_FAILED', true);
         }
-        if (body === null) return failure('CONTENT_TOO_LARGE', false);
+        if (body === null) {
+          discard(response.value);
+          return failure('CONTENT_TOO_LARGE', false);
+        }
         try {
           new TextDecoder('utf-8', { fatal: true }).decode(body);
         } catch {
@@ -271,7 +274,7 @@ export const nodePublicHttpTransport: PublicHttpTransport = async (input) => {
         statusCode: response.statusCode ?? 500,
         headers: Object.freeze(headers),
         body: response,
-        discard: () => response.resume(),
+        discard: () => response.destroy(),
       }));
     });
     outbound.once('error', reject);
@@ -477,6 +480,10 @@ function once(action: () => void): () => void {
 
 function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function discard(response: PublicHttpTransportResponse): void {
+  try { response.discard?.(); } catch { /* bounded failure wins */ }
 }
 
 function isTimeoutError(error: unknown): boolean {

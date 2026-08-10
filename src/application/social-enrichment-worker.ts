@@ -191,6 +191,13 @@ export class SocialEnrichmentWorker {
     } catch {
       return this.failClaim(job, lease, 'PROVIDER_UNAVAILABLE');
     }
+    if (collected.retryable) {
+      return this.failClaim(job, lease, 'HTTP_TRANSIENT', Object.freeze({
+        status: 'RESOLVED' as const,
+        metadataSnapshot: collected.metadataSnapshot,
+        collection: collected.collection,
+      }));
+    }
     return this.completeClaim(job, lease, Object.freeze({
       status: 'RESOLVED' as const,
       metadataSnapshot: collected.metadataSnapshot,
@@ -219,13 +226,14 @@ export class SocialEnrichmentWorker {
     job: ClaimedSocialJob,
     lease: SocialLeaseGuard,
     code: SocialJobFailure['code'],
+    terminalResult?: SocialJobResult,
   ): Promise<SocialEnrichmentRunResult> {
     const owned = await lease.finish();
     if (this.activeLease === lease) this.activeLease = null;
     if (!owned) return frozen({ kind: 'lease-lost' as const, jobId: job.id });
     const failure = Object.freeze({ code, retryable: true, observedAtMs: this.readNow() });
     try {
-      await this.repository.fail(job, failure);
+      await this.repository.fail(job, failure, terminalResult);
     } catch {
       this.currentState = 'DEGRADED';
       throw new SocialEnrichmentWorkerError('fail');
@@ -409,7 +417,10 @@ function snapshotSafeProviderResult(
   result: Awaited<ReturnType<SocialVerificationProvider['collect']>>,
 ): Awaited<ReturnType<SocialVerificationProvider['collect']>> {
   const fields = dataFields(result, 'Social provider result');
-  exactKeys(fields, ['metadataSnapshot', 'collection'], 'Social provider result');
+  exactKeys(fields, ['metadataSnapshot', 'collection', 'retryable'], 'Social provider result');
+  if (typeof fields.retryable !== 'boolean') {
+    throw new TypeError('Social provider retryability is invalid.');
+  }
   const metadataSnapshot = snapshotTokenMetadata(fields.metadataSnapshot);
   const collection = snapshotCollection(fields.collection);
   if (
@@ -433,7 +444,7 @@ function snapshotSafeProviderResult(
     !== canonicalStringifyJson(metadataSnapshot.resolution.metadata)) {
     throw new TypeError('Social provider returned unsafe metadata links.');
   }
-  return Object.freeze({ metadataSnapshot, collection });
+  return Object.freeze({ metadataSnapshot, collection, retryable: fields.retryable });
 }
 
 function snapshotTokenMetadata(value: unknown): TokenMetadataSnapshot {

@@ -5,7 +5,6 @@ import {
   type SocialEnrichmentWorkerScheduler,
 } from '../src/application/social-enrichment-worker.js';
 import type { MetadataResolution, TokenMetadataSnapshot } from '../src/domain/pumpfun-observation.js';
-import type { SocialEvidenceCollectionV1 } from '../src/domain/social-evidence.js';
 import type { MetadataProvider } from '../src/ports/metadata-provider.js';
 import type {
   ClaimedSocialJob,
@@ -80,6 +79,35 @@ void test('retries typed transient metadata failure without partial completion',
   })]);
 });
 
+void test('retries transient social fetches and carries explicit terminal evidence', async () => {
+  const repository = new ScriptedRepository([claimedJob()]);
+  const social = new PublicSocialVerificationProvider({
+    get: async () => Object.freeze({
+      status: 'FAILED' as const, reason: 'TIMEOUT' as const, retryable: true,
+    }),
+  });
+  const worker = new SocialEnrichmentWorker(
+    repository,
+    metadataProvider(Object.freeze({
+      status: 'RESOLVED' as const,
+      metadata: Object.freeze({
+        name: 'Project', symbol: 'P', description: null, imageUrl: null,
+        videoUrl: null, websiteUrl: 'https://project.example/',
+        twitterUrl: null, telegramUrl: null,
+      }),
+    })),
+    social,
+    options(),
+    new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind: 'failed', jobId: 'social-job-1' });
+  assert.equal(repository.completions.length, 0);
+  assert.equal(repository.failures[0]?.failure.code, 'HTTP_TRANSIENT');
+  assert.equal(repository.failures[0]?.terminalResult?.status, 'RESOLVED');
+  assert.equal(repository.failures[0]?.terminalResult?.collection.status, 'FAILED');
+});
+
 void test('redacts thrown provider details into a stable retryable failure', async () => {
   const repository = new ScriptedRepository([claimedJob()]);
   const secret = 'https://user:secret@example.test/private';
@@ -99,10 +127,7 @@ void test('renews an in-flight lease and suppresses completion after lease loss'
   const scheduler = new ManualScheduler();
   const repository = new ScriptedRepository([claimedJob()]);
   repository.renewResult = false;
-  const pending = deferred<Readonly<{
-    metadataSnapshot: TokenMetadataSnapshot;
-    collection: SocialEvidenceCollectionV1;
-  }>>();
+  const pending = deferred<Awaited<ReturnType<SocialVerificationProvider['collect']>>>();
   const worker = new SocialEnrichmentWorker(
     repository,
     metadataProvider(resolved()),
@@ -195,10 +220,7 @@ void test('rejects hostile job and provider accessors without invoking getters',
 void test('degrades bounded shutdown and abandons the unresolved lease without timers', async () => {
   const scheduler = new ManualScheduler();
   const repository = new ScriptedRepository([claimedJob()]);
-  const pending = deferred<Readonly<{
-    metadataSnapshot: TokenMetadataSnapshot;
-    collection: SocialEvidenceCollectionV1;
-  }>>();
+  const pending = deferred<Awaited<ReturnType<SocialVerificationProvider['collect']>>>();
   const worker = new SocialEnrichmentWorker(
     repository,
     metadataProvider(resolved()),
@@ -219,7 +241,11 @@ void test('degrades bounded shutdown and abandons the unresolved lease without t
 
 class ScriptedRepository implements SocialEvidenceRepository {
   readonly completions: { readonly job: ClaimedSocialJob; readonly result: SocialJobResult }[] = [];
-  readonly failures: { readonly job: ClaimedSocialJob; readonly failure: SocialJobFailure }[] = [];
+  readonly failures: {
+    readonly job: ClaimedSocialJob;
+    readonly failure: SocialJobFailure;
+    readonly terminalResult?: SocialJobResult;
+  }[] = [];
   readonly renewals: readonly unknown[] = [];
   public renewResult = true;
 
@@ -235,8 +261,14 @@ class ScriptedRepository implements SocialEvidenceRepository {
   public async complete(job: ClaimedSocialJob, result: SocialJobResult): Promise<void> {
     this.completions.push(Object.freeze({ job, result }));
   }
-  public async fail(job: ClaimedSocialJob, failure: SocialJobFailure): Promise<void> {
-    this.failures.push(Object.freeze({ job, failure }));
+  public async fail(
+    job: ClaimedSocialJob,
+    failure: SocialJobFailure,
+    terminalResult?: SocialJobResult,
+  ): Promise<void> {
+    this.failures.push(Object.freeze(
+      terminalResult === undefined ? { job, failure } : { job, failure, terminalResult },
+    ));
   }
   public async counts(): Promise<SocialJobCounts> {
     return Object.freeze({ pending: 0, processing: 0, retryableFailed: 0, exhausted: 0 });

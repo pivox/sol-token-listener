@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createDeterministicDerivedEventId } from '../domain/events.js';
 import {
   createSocialCollection,
+  PUBLIC_SOCIAL_RETENTION_HOURS,
   socialMetadataSnapshotId,
 } from '../domain/social-evidence.js';
 import type {
@@ -37,9 +38,12 @@ export class SocialJobLeaseLostError extends Error {
 export class PostgresSocialEvidenceRepository implements SocialEvidenceRepository {
   public constructor(
     private readonly pool: Pool = getDatabasePool(),
-    private readonly retentionHours = 4,
+    private readonly retentionHours = PUBLIC_SOCIAL_RETENTION_HOURS,
   ) {
-    if (!Number.isSafeInteger(retentionHours) || retentionHours !== 4) {
+    if (
+      !Number.isSafeInteger(retentionHours)
+      || retentionHours !== PUBLIC_SOCIAL_RETENTION_HOURS
+    ) {
       throw new RangeError('Social evidence retention must be four hours.');
     }
   }
@@ -53,6 +57,15 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
     const client = await this.connect('claim');
     try {
       await client.query('BEGIN');
+      await client.query(`UPDATE social_enrichment_jobs SET
+        status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+        error_code='LEASE_EXPIRED',retry_exhausted_at=$1,terminal_at=$1,
+        purge_after=$2,updated_at=$1
+        WHERE status='PROCESSING' AND lease_expires_at <= $1
+          AND attempts_in_cycle >= max_attempts`, [
+        new Date(options.nowMs),
+        new Date(options.nowMs + this.retentionHours * 3_600_000),
+      ]);
       const leaseToken = `social_lease_${randomUUID()}`;
       const result = await client.query(`WITH candidate AS (
         SELECT job.job_id
@@ -176,9 +189,14 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
     }
   }
 
-  public async fail(job: ClaimedSocialJob, failure: SocialJobFailure): Promise<void> {
+  public async fail(
+    job: ClaimedSocialJob,
+    failure: SocialJobFailure,
+    terminalResult?: SocialJobResult,
+  ): Promise<void> {
     assertClaimedJob(job);
     assertFailure(failure);
+    if (terminalResult !== undefined) assertJobResult(job, terminalResult);
     const client = await this.connect('fail');
     try {
       await client.query('BEGIN');
@@ -201,18 +219,43 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
           job.id,job.leaseToken,new Date(failure.observedAtMs + delayMs),failure.code,observedAt,
         ]);
       } else {
-        await exact(client, `UPDATE social_enrichment_jobs SET
-          status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,
-          next_attempt_at=NULL,error_code=$3,retry_exhausted_at=$4,
-          terminal_at=$5,purge_after=$6,updated_at=$5
-          WHERE job_id=$1 AND lease_token=$2`, [
-          job.id,
-          job.leaseToken,
-          failure.code,
-          failure.retryable ? observedAt : null,
-          observedAt,
-          new Date(failure.observedAtMs + this.retentionHours * 3_600_000),
-        ]);
+        const purgeAfter = new Date(
+          failure.observedAtMs + this.retentionHours * 3_600_000,
+        );
+        if (terminalResult !== undefined) {
+          const sourceResult = await client.query(`SELECT source.event_id,source.raw_event_id,
+            source.program,source.signature,source.slot::text AS slot,
+            source.transaction_index,source.instruction_index,source.inner_instruction_index,
+            source.confirmation_status,source.blockchain_time,raw.event_id AS checked_raw_event_id
+            FROM domain_events source
+            JOIN raw_chain_events raw ON raw.event_id=source.raw_event_id
+            WHERE source.event_id=$1 AND source.mint=$2
+            FOR UPDATE OF source,raw`, [job.sourceLaunchEventId,job.mint]);
+          const source = sourceResult.rows[0];
+          if (source === undefined || textField(source, 'confirmation_status') === 'orphaned') {
+            throw new SocialJobLeaseLostError();
+          }
+          await writeMetadataSnapshot(client, job, terminalResult);
+          await writeSocialCollection(client, source, terminalResult);
+          await writeSocialDerivedEvent(client, source, terminalResult);
+          await exact(client, `UPDATE social_enrichment_jobs SET
+            status='COMPLETED',lease_token=NULL,lease_expires_at=NULL,
+            next_attempt_at=NULL,error_code=$3,retry_exhausted_at=$4,
+            terminal_at=$5,purge_after=$6,updated_at=$5
+            WHERE job_id=$1 AND lease_token=$2`, [
+            job.id,job.leaseToken,failure.code,failure.retryable ? observedAt : null,
+            observedAt,purgeAfter,
+          ]);
+        } else {
+          await exact(client, `UPDATE social_enrichment_jobs SET
+            status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,
+            next_attempt_at=NULL,error_code=$3,retry_exhausted_at=$4,
+            terminal_at=$5,purge_after=$6,updated_at=$5
+            WHERE job_id=$1 AND lease_token=$2`, [
+            job.id,job.leaseToken,failure.code,failure.retryable ? observedAt : null,
+            observedAt,purgeAfter,
+          ]);
+        }
       }
       await client.query('COMMIT');
     } catch {
@@ -479,10 +522,11 @@ function assertFailure(failure: SocialJobFailure): void {
 }
 
 function assertLeaseRow(row: unknown, job: ClaimedSocialJob): void {
+  const storedExpiryMs = dateField(row, 'lease_expires_at').getTime();
   if (
     integerField(row, 'attempts') !== job.attempts
     || integerField(row, 'attempts_in_cycle') !== job.attemptsInCycle
-    || dateField(row, 'lease_expires_at').getTime() !== job.leaseExpiresAtMs
+    || storedExpiryMs < job.leaseExpiresAtMs
   ) throw new TypeError('Social lease identity conflicts.');
 }
 

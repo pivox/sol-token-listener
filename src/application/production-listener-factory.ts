@@ -102,7 +102,7 @@ export function createProductionListenerRuntime(
     maxPerHostConcurrency: 1,
   });
   const socialWorker = new SocialEnrichmentWorker(
-    new PostgresSocialEvidenceRepository(pool, config.dataRetentionHours),
+    new PostgresSocialEvidenceRepository(pool),
     new HttpMetadataProvider(publicHttp),
     new PublicSocialVerificationProvider(publicHttp),
     {

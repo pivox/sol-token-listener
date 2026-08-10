@@ -78,19 +78,26 @@ void test('confirms exact mint, detects website domain redirects and fetches eac
 
 void test('keeps unavailable and transient content unknown with stable collection coverage', async () => {
   const cases = [
-    [failure('HTTP_STATUS_INVALID', false), 'PARTIAL', 'REJECTED'],
-    [failure('HTTP_STATUS_INVALID', true), 'PARTIAL', 'UNKNOWN'],
-    [failure('TIMEOUT', true), 'PARTIAL', 'UNKNOWN'],
+    [failure('HTTP_STATUS_INVALID', false), 'PARTIAL', 'REJECTED', false],
+    [failure('HTTP_STATUS_INVALID', true), 'FAILED', 'UNKNOWN', true],
+    [failure('TIMEOUT', true), 'FAILED', 'UNKNOWN', true],
   ] as const;
-  for (const [reply, status, reachability] of cases) {
+  for (const [reply, status, reachability, retryable] of cases) {
     const pages = new Map<string, PublicHttpResult>([['https://project.example/', reply]]);
     const result = await new PublicSocialVerificationProvider(recordingClient([], pages)).collect(
       providerInput(metadata({ websiteUrl: 'https://project.example/' })),
     );
     assert.equal(result.collection.status, status);
-    assertEvidence(result.collection, 'URL_REACHABLE', 'WEBSITE', null, reachability);
-    assertEvidence(result.collection, 'CONTENT_UNAVAILABLE', 'WEBSITE', null, 'UNKNOWN');
-    assertEvidence(result.collection, 'MINT_PUBLISHED', 'WEBSITE', null, 'UNKNOWN');
+    assert.equal(result.retryable, retryable);
+    if (retryable) {
+      assertEvidence(result.collection, 'VERIFICATION_UNKNOWN', null, null, 'UNKNOWN');
+      assert.equal(result.collection.links.length, 0);
+      assert.equal(result.collection.observations.length, 0);
+    } else {
+      assertEvidence(result.collection, 'URL_REACHABLE', 'WEBSITE', null, reachability);
+      assertEvidence(result.collection, 'CONTENT_UNAVAILABLE', 'WEBSITE', null, 'UNKNOWN');
+      assertEvidence(result.collection, 'MINT_PUBLISHED', 'WEBSITE', null, 'UNKNOWN');
+    }
   }
 });
 
@@ -140,7 +147,7 @@ void test('orders links and evidence deterministically regardless of declaration
 function assertEvidence(
   collection: SocialEvidenceCollectionV1,
   type: SocialEvidenceType,
-  subjectKind: SocialLinkKind,
+  subjectKind: SocialLinkKind | null,
   relatedKind: SocialLinkKind | null,
   outcome: SocialEvidenceOutcome,
 ): void {

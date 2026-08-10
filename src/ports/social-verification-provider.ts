@@ -6,8 +6,11 @@ export interface SocialVerificationProvider {
     mint: string;
     sourceLaunchEventId: string;
     metadataSnapshot: TokenMetadataSnapshot;
-  }>): Promise<Readonly<{
-    metadataSnapshot: TokenMetadataSnapshot;
-    collection: SocialEvidenceCollectionV1;
-  }>>;
+  }>): Promise<SocialVerificationResult>;
+}
+
+export interface SocialVerificationResult {
+  readonly metadataSnapshot: TokenMetadataSnapshot;
+  readonly collection: SocialEvidenceCollectionV1;
+  readonly retryable: boolean;
 }

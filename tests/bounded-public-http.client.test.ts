@@ -101,6 +101,21 @@ void test('enforces redirect, status, type, length, stream and UTF-8 bounds', as
   });
 });
 
+void test('destroys an oversized streamed response before releasing bounded capacity', async () => {
+  let discarded = 0;
+  const client = new BoundedPublicHttpClient(async () => Object.freeze({
+    statusCode: 200,
+    headers: Object.freeze({ 'content-type': 'text/plain' }),
+    body: chunks(new TextEncoder().encode('x'.repeat(65))),
+    discard: () => { discarded += 1; },
+  }), publicResolver, OPTIONS);
+
+  assert.deepEqual(await client.get('https://example.test/oversized', ['text/plain']), {
+    status: 'FAILED', reason: 'CONTENT_TOO_LARGE', retryable: false,
+  });
+  assert.equal(discarded, 1);
+});
+
 void test('returns only bounded success data and requests identity encoding', async () => {
   const transport = scriptedTransport([
     response(200, 'hello', { 'content-type': 'text/plain; charset=utf-8' }),

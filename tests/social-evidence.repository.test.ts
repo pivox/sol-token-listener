@@ -22,11 +22,11 @@ const MINT = 'So11111111111111111111111111111111111111112';
 
 void test('claims one durable job exclusively and renews only its active lease', async (context) => {
   await withDatabase(context, async (pool) => {
-    await enqueue(pool, 'mint-social-a', 'signature-social-a');
+    await enqueue(pool, MINT, 'signature-social-a');
     const repository = new PostgresSocialEvidenceRepository(pool);
     const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
     assert.ok(claimed);
-    assert.equal(claimed.mint, 'mint-social-a');
+    assert.equal(claimed.mint, MINT);
     assert.equal(claimed.metadataUri, 'https://metadata.example/token.json');
     assert.equal(claimed.attempts, 1);
     assert.equal(claimed.attemptsInCycle, 1);
@@ -40,6 +40,28 @@ void test('claims one durable job exclusively and renews only its active lease',
     assert.deepEqual(stored.rows[0], {
       status: 'PROCESSING', attempts: 1, attempts_in_cycle: 1,
       lease_ms: String(NOW + 1 + 6_000),
+    });
+    await repository.complete(claimed, await successfulResult(claimed.sourceLaunchEventId));
+    assert.equal((await pool.query('SELECT status FROM social_enrichment_jobs')).rows[0].status, 'COMPLETED');
+  });
+});
+
+void test('terminalizes an expired final-attempt lease instead of stranding it processing', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await new PostgresLaunchpadEventRepository(pool, 4, Date.now, {
+      maxAttempts: 1, baseDelayMs: 500,
+    }).record(launchBatch('mint-social-expired', 'signature-social-expired', 'confirmed'));
+    const repository = new PostgresSocialEvidenceRepository(pool);
+    const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
+    assert.ok(claimed);
+
+    assert.equal(await repository.claim({ leaseMs: 5_000, nowMs: NOW + 5_001 }), null);
+    const row = await pool.query(`SELECT status,error_code,retry_exhausted_at,
+      EXTRACT(EPOCH FROM (purge_after-terminal_at))::int retention_seconds
+      FROM social_enrichment_jobs`);
+    assert.deepEqual(row.rows[0], {
+      status: 'CANCELLED', error_code: 'LEASE_EXPIRED',
+      retry_exhausted_at: new Date(NOW + 5_001), retention_seconds: 14_400,
     });
   });
 });
@@ -81,6 +103,35 @@ void test('terminalizes permanent failures with exact four-hour retention', asyn
       FROM social_enrichment_jobs`);
     assert.deepEqual(row.rows[0], {
       status: 'CANCELLED', error_code: 'PROVIDER_UNAVAILABLE', retention_seconds: 14_400,
+    });
+  });
+});
+
+void test('persists explicit failed evidence when a transient social retry is exhausted', async (context) => {
+  await withDatabase(context, async (pool) => {
+    await new PostgresLaunchpadEventRepository(pool, 4, Date.now, {
+      maxAttempts: 1, baseDelayMs: 500,
+    }).record(launchBatch(MINT, 'signature-social-exhausted', 'confirmed'));
+    const repository = new PostgresSocialEvidenceRepository(pool);
+    const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
+    assert.ok(claimed);
+    const terminalResult = await transientSocialResult(claimed.sourceLaunchEventId);
+
+    await repository.fail(claimed, Object.freeze({
+      code: 'HTTP_TRANSIENT', retryable: true, observedAtMs: NOW + 20,
+    }), terminalResult);
+
+    const stored = await pool.query(`SELECT job.status,job.error_code,
+      job.retry_exhausted_at,collection.collection_status,
+      (SELECT COUNT(*)::int FROM social_verification_evidence) evidence_count,
+      (SELECT COUNT(*)::int FROM api_event_stream
+        WHERE event_type='SocialEvidenceCollected') revision_count
+      FROM social_enrichment_jobs job
+      LEFT JOIN social_evidence_collections collection ON collection.mint=job.mint`);
+    assert.deepEqual(stored.rows[0], {
+      status: 'COMPLETED', error_code: 'HTTP_TRANSIENT',
+      retry_exhausted_at: new Date(NOW + 20), collection_status: 'FAILED',
+      evidence_count: 1, revision_count: 1,
     });
   });
 });
@@ -313,6 +364,35 @@ async function successfulResult(sourceLaunchEventId: string): Promise<SocialJobR
     get: async () => page,
   }).collect(Object.freeze({ mint: MINT, sourceLaunchEventId, metadataSnapshot: snapshot }));
   return Object.freeze({ status: 'RESOLVED' as const, ...collected });
+}
+
+async function transientSocialResult(sourceLaunchEventId: string): Promise<SocialJobResult> {
+  const snapshot: TokenMetadataSnapshot = Object.freeze({
+    mint: MINT,
+    uri: 'https://metadata.example/token.json',
+    resolution: Object.freeze({
+      status: 'RESOLVED' as const,
+      metadata: Object.freeze({
+        name: 'Project', symbol: 'P', description: null, imageUrl: null,
+        videoUrl: null, websiteUrl: 'https://project.example/',
+        twitterUrl: null, telegramUrl: null,
+      }),
+    }),
+    fetchedAtMs: NOW,
+    payloadVersion: 1,
+  });
+  const collected = await new PublicSocialVerificationProvider({
+    get: async () => Object.freeze({
+      status: 'FAILED' as const, reason: 'TIMEOUT' as const, retryable: true,
+    }),
+  }).collect(Object.freeze({ mint: MINT, sourceLaunchEventId, metadataSnapshot: snapshot }));
+  assert.equal(collected.retryable, true);
+  assert.equal(collected.collection.status, 'FAILED');
+  return Object.freeze({
+    status: 'RESOLVED' as const,
+    metadataSnapshot: collected.metadataSnapshot,
+    collection: collected.collection,
+  });
 }
 
 async function failedResult(mint: string, sourceLaunchEventId: string): Promise<SocialJobResult> {

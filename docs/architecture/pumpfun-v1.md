@@ -69,6 +69,9 @@ empreintes et preuves structurées. Il n'utilise ni API payante X/Telegram, ni
 token, cookie ou proxy. `NOT_AVAILABLE` signifie qu'aucune collection canonique
 n'existe encore; `AVAILABLE` expose une couverture `COMPLETE`, `PARTIAL` ou
 `FAILED`. Un fait inconnu reste `UNKNOWN` et ne devient jamais faux.
+Un échec HTTP transitoire ne publie pas de projection intermédiaire : le job
+est rejoué avec sa policy bornée, puis son épuisement persiste atomiquement une
+collection `FAILED` et une preuve `VERIFICATION_UNKNOWN`.
 
 I1 introduit une reconstruction passive des participants à
 partir des seuls trades Pump.fun persistés depuis la création. La route holders

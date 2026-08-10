@@ -33,6 +33,19 @@ void test('composes the passive production listener without opening resources', 
   });
 });
 
+void test('keeps fixed social retention compatible with a different foundation retention', () => {
+  const runtime = createProductionListenerRuntime(
+    parseConfig({
+      SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
+      SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+      DATA_RETENTION_HOURS: '24',
+    }),
+    inertPool as unknown as ReturnType<typeof getDatabasePool>,
+  );
+
+  assert.equal(runtime.state(), 'STOPPED');
+});
+
 void test('generic Pump bonding-curve reads fail with a stable redacted error', async () => {
   const reader = createUnavailableBondingCurveReader();
 

@@ -7,6 +7,7 @@ import { reconcileConfirmationStatus } from '../domain/confirmation-status.js';
 import { reconcileTransitionOccurrence } from '../domain/state-transitions.js';
 import type { InitialDetectedStateTransition } from '../domain/state-transitions.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
+import { PUBLIC_SOCIAL_RETENTION_HOURS } from '../domain/social-evidence.js';
 import type { LaunchParameterObject, LaunchpadTrade, TokenLaunch } from '../domain/types.js';
 import {
   assertValidLaunchpadEventBatch,
@@ -275,24 +276,27 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     terminal: readonly [Date | null, Date | null],
   ): Promise<void> {
     const [terminalAt, purgeAfter] = terminal;
+    const socialPurgeAfter = terminalAt === null ? null : new Date(
+      terminalAt.getTime() + PUBLIC_SOCIAL_RETENTION_HOURS * 3_600_000,
+    );
       await exact(client, `UPDATE domain_events SET confirmation_status='orphaned',terminal_at=$2,purge_after=$3 WHERE event_id=$1`, [event.id,terminalAt,purgeAfter]);
     if (event.type === 'TokenLaunchDetected') {
       await client.query(`UPDATE social_enrichment_jobs SET
         status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
         error_code=NULL,terminal_at=$2,purge_after=$3,updated_at=$2
         WHERE source_launch_event_id=$1
-          AND status IN ('PENDING','PROCESSING','RETRYABLE_FAILED')`, [event.id,terminalAt,purgeAfter]);
+          AND status IN ('PENDING','PROCESSING','RETRYABLE_FAILED')`, [event.id,terminalAt,socialPurgeAfter]);
       await client.query(`UPDATE token_metadata_snapshots metadata SET purge_after=$2
         FROM social_evidence_collections collection
         WHERE collection.source_launch_event_id=$1
-          AND metadata.snapshot_id=collection.metadata_snapshot_id`, [event.id,purgeAfter]);
+          AND metadata.snapshot_id=collection.metadata_snapshot_id`, [event.id,socialPurgeAfter]);
       await client.query(`UPDATE social_evidence_collections SET
         confirmation_status='orphaned',terminal_at=$2,purge_after=$3
-        WHERE source_launch_event_id=$1`, [event.id,terminalAt,purgeAfter]);
+        WHERE source_launch_event_id=$1`, [event.id,terminalAt,socialPurgeAfter]);
       await client.query(`UPDATE domain_events SET confirmation_status='orphaned',
         terminal_at=$2,purge_after=$3
         WHERE type='SocialEvidenceCollected'
-          AND payload->>'sourceLaunchEventId'=$1`, [event.id,terminalAt,purgeAfter]);
+          AND payload->>'sourceLaunchEventId'=$1`, [event.id,terminalAt,socialPurgeAfter]);
       await exact(client, 'UPDATE state_transitions SET terminal_at=$2,purge_after=$3 WHERE event_id=$1', [event.id,terminalAt,purgeAfter]);
       await exact(client, 'UPDATE token_launches SET current_state=\'RETRACTED\',terminal_at=$2,purge_after=$3,updated_at=$2 WHERE mint=$1', [event.mint,terminalAt,purgeAfter]);
     } else await exact(client, `UPDATE launch_trades SET confirmation_status='orphaned',purge_after=$2 WHERE trade_id=$1`, [event.payload.trade.id,purgeAfter]);

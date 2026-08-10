@@ -58,6 +58,7 @@ export class PublicSocialVerificationProvider implements SocialVerificationProvi
       return Object.freeze({
         metadataSnapshot: input.metadataSnapshot,
         collection: createFailedSocialCollection(input),
+        retryable: false,
       });
     }
 
@@ -109,19 +110,72 @@ export class PublicSocialVerificationProvider implements SocialVerificationProvi
     }
 
     const observations = Object.freeze([...inspectedByLink.values()].map((item) => item.observation));
-    const status = collectionStatus(links, inspectedByLink);
+    const retryable = [...inspectedByLink.values()].some((item) => item.retryable);
+    if (retryable) {
+      const unavailableMetadataSnapshot = safeMetadataSnapshot(
+        metadataSnapshot,
+        sanitizeMetadataForPersistence(metadata, Object.freeze([])),
+      );
+      const unavailableMetadataSnapshotId = socialMetadataSnapshotId({
+        sourceLaunchEventId: input.sourceLaunchEventId,
+        snapshot: unavailableMetadataSnapshot,
+      });
+      return Object.freeze({
+        metadataSnapshot: unavailableMetadataSnapshot,
+        collection: retryableFailureCollection(
+          input.mint,
+          input.sourceLaunchEventId,
+          unavailableMetadataSnapshotId,
+          unavailableMetadataSnapshot.fetchedAtMs,
+        ),
+        retryable: true,
+      });
+    }
     const collection = createSocialCollection(Object.freeze({
       mint: input.mint,
       sourceLaunchEventId: input.sourceLaunchEventId,
       metadataSnapshotId,
-      status,
+      status: collectionStatus(links, inspectedByLink),
       links: Object.freeze(links),
       observations,
       evidence: Object.freeze(evidence),
       observedAtMs: metadataSnapshot.fetchedAtMs,
     }));
-    return Object.freeze({ metadataSnapshot, collection });
+    return Object.freeze({ metadataSnapshot, collection, retryable });
   };
+}
+
+function retryableFailureCollection(
+  mint: string,
+  sourceLaunchEventId: string,
+  metadataSnapshotId: string,
+  observedAtMs: number,
+): ReturnType<typeof createSocialCollection> {
+  const evidenceBase = Object.freeze({
+    mint,
+    linkId: null,
+    observationId: null,
+    type: 'VERIFICATION_UNKNOWN' as const,
+    outcome: 'UNKNOWN' as const,
+    subjectKind: null,
+    relatedKind: null,
+    reasonCode: 'TRANSIENT_PUBLIC_SOURCE_UNAVAILABLE',
+    observedAtMs,
+  });
+  const evidence = Object.freeze({
+    id: socialVerificationEvidenceId(evidenceBase),
+    ...evidenceBase,
+  });
+  return createSocialCollection(Object.freeze({
+    mint,
+    sourceLaunchEventId,
+    metadataSnapshotId,
+    status: 'FAILED' as const,
+    links: Object.freeze([]),
+    observations: Object.freeze([]),
+    evidence: Object.freeze([evidence]),
+    observedAtMs,
+  }));
 }
 
 function normalizeDeclarations(metadata: PublicTokenMetadata): readonly NormalizedDeclaration[] {

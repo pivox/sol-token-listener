@@ -59,7 +59,7 @@ void test('atomically enqueues one durable social job and cancels it on orphanin
   await withDatabase(context, async (pool) => {
     const repository = new PostgresLaunchpadEventRepository(
       pool,
-      4,
+      24,
       () => 10_000,
       { maxAttempts: 3, baseDelayMs: 1_000 },
     );

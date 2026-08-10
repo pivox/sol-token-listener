@@ -41,7 +41,10 @@ export interface SocialEvidenceRepository {
   claim(options: Readonly<{ leaseMs: number; nowMs: number }>): Promise<ClaimedSocialJob | null>;
   renew(jobId: string, leaseToken: string, leaseMs: number, nowMs: number): Promise<boolean>;
   complete(job: ClaimedSocialJob, result: SocialJobResult): Promise<void>;
-  fail(job: ClaimedSocialJob, failure: SocialJobFailure): Promise<void>;
+  fail(
+    job: ClaimedSocialJob,
+    failure: SocialJobFailure,
+    terminalResult?: SocialJobResult,
+  ): Promise<void>;
   counts(): Promise<SocialJobCounts>;
 }
-
