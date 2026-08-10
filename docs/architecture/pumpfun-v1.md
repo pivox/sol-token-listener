@@ -224,9 +224,10 @@ Les trois scores sont indépendants :
 - santé et comportement on-chain : 60.
 
 Le jeu initial est `UNVALIDATED_RULE_SET` et tous les poids/seuils seront
-configurables. `QUALIFICATION_MIN_SCORE` vaut 60 par défaut ; il est non
-calibré et ne déclenche jamais à lui seul le paper trading. Les métadonnées ne
-prouvent jamais le sérieux du projet.
+configurables. Son minimum vaut 60. `QUALIFICATION_MIN_SCORE` est un override
+optionnel ; en son absence, le minimum du profil sélectionné est conservé. Ce
+minimum est non calibré et ne déclenche jamais à lui seul le paper trading. Les
+métadonnées ne prouvent jamais le sérieux du projet.
 
 Les conditions éliminatoires utilisent les codes stables de
 `src/domain/qualification-reasons.ts`. Un blocker actif décide du rejet sans

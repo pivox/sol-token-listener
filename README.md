@@ -14,7 +14,8 @@ secondaire isolé; son code n'est pas activé par ce bootstrap.
 Le profil chargé par défaut est
 `config/qualification/pumpfun-v1-unvalidated.json`. On peut sélectionner un
 fichier local différent avec `QUALIFICATION_PROFILE_PATH`; `QUALIFICATION_MIN_SCORE`
-remplace le minimum effectif (60 par défaut, configurable de 0 à 100). Le
+remplace le minimum effectif lorsqu'il est défini (de 0 à 100). En son absence,
+le minimum du profil sélectionné est conservé; celui du profil initial vaut 60. Le
 profil initial porte le statut `UNVALIDATED_RULE_SET`: c'est une calibration
 initiale NONVALIDATED, pas une calibration officiellement ou
 empiriquement validée.
@@ -31,7 +32,7 @@ Exemple de configuration local, sans secret :
 
 ```dotenv
 QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-v1-unvalidated.json
-QUALIFICATION_MIN_SCORE=60
+QUALIFICATION_MIN_SCORE=
 ```
 
 Pour dépanner, corriger le JSON local ou retirer l'override puis redémarrer;

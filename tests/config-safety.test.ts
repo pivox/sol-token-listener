@@ -67,7 +67,7 @@ void test('selects one local qualification profile and validates its fixed statu
 
 void test('the environment example publishes explicit qualification selection defaults', async () => {
   const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
-  for (const line of ['QUALIFICATION_PROFILE_PATH=', 'QUALIFICATION_MIN_SCORE=60', 'QUALIFICATION_RULE_SET_STATUS=UNVALIDATED_RULE_SET']) {
+  for (const line of ['QUALIFICATION_PROFILE_PATH=', 'QUALIFICATION_MIN_SCORE=', 'QUALIFICATION_RULE_SET_STATUS=UNVALIDATED_RULE_SET']) {
     assert.match(source, new RegExp(`^${line}$`, 'mu'));
   }
 });
