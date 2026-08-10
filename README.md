@@ -9,6 +9,37 @@ combine souscriptions WebSocket, rattrapage HTTP borné, inbox PostgreSQL avec
 leases et réconciliation de finalité. Raydium CPMM demeure un adaptateur
 secondaire isolé; son code n'est pas activé par ce bootstrap.
 
+## Profil de qualification Pump.fun
+
+Le profil chargé par défaut est
+`config/qualification/pumpfun-v1-unvalidated.json`. On peut sélectionner un
+fichier local différent avec `QUALIFICATION_PROFILE_PATH`; `QUALIFICATION_MIN_SCORE`
+remplace le minimum effectif (60 par défaut, configurable de 0 à 100). Le
+profil initial porte le statut `UNVALIDATED_RULE_SET`: c'est une calibration
+initiale NONVALIDATED, pas une calibration officiellement ou
+empiriquement validée.
+
+Le chargeur construit un fingerprint SHA-256 du profil canonique effectif,
+donc y compris le remplacement `QUALIFICATION_MIN_SCORE`; le fingerprint est
+hexadécimal lowercase. Un profil illisible ou invalide fait échouer le
+démarrage fail-closed avant l'ouverture de PostgreSQL, du listener ou de
+l'API. Le journal ne publie que l'identité, la version, le statut, le
+fingerprint et le minimum effectif: il redacte l'erreur et ne journalise ni le
+chemin ni le contenu du profil.
+
+Exemple de configuration local, sans secret :
+
+```dotenv
+QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-v1-unvalidated.json
+QUALIFICATION_MIN_SCORE=60
+```
+
+Pour dépanner, corriger le JSON local ou retirer l'override puis redémarrer;
+ne copiez jamais son chemin ou son contenu dans les logs. Une valeur de score
+n'est pas une instruction de trading: l'application reste observe/paper only,
+sans clé privée, signature, soumission ni live; elle n'appelle ni
+`sendTransaction` ni `signTransaction`.
+
 ## Sécurité et limites
 
 - `EXECUTION_MODE=observe` est la valeur par défaut; seules les valeurs

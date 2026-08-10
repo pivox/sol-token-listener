@@ -232,6 +232,46 @@ Les conditions éliminatoires utilisent les codes stables de
 pouvoir être compensé par le score. Chaque rapport conserve les preuves, les
 valeurs de règles et leur version.
 
+### Profil effectif, calibration et décision
+
+Le profil par défaut est
+`config/qualification/pumpfun-v1-unvalidated.json`; `QUALIFICATION_PROFILE_PATH`
+sélectionne un fichier local et `QUALIFICATION_MIN_SCORE` surcharge le minimum
+effectif. Le chargeur échoue fail-closed avant toute ressource de runtime si le
+profil ne se lit pas ou ne valide pas. Les diagnostics de démarrage sont
+redacted: ni path ni contenu du profil ne sont logged.
+
+Le fingerprint est le SHA-256 du JSON canonique du profil effectif, avec le
+minimum remplacé par `QUALIFICATION_MIN_SCORE` lorsqu'il est défini. Il est un
+hex lowercase de 64 caractères, versionne la règle réellement évaluée et non
+le seul fichier brut. Le statut reste `UNVALIDATED_RULE_SET`: les valeurs sont
+une calibration initiale NONVALIDATED, non une calibration officiellement ou
+empiriquement validée.
+
+Les maxima fixes sont préparation 15, authenticité sociale 25 et santé
+on-chain 60, soit 100. Le minimum par défaut est 60 et est configurable. Les
+signaux metadata/social ne contribuent qu'à préparation ou authenticité; ils
+ne constituent jamais une preuve de sérieux. Un score ne peut jamais compenser
+un blocker enforced: seuls les blockers `ENFORCED` déclenchés refusent le verdict.
+
+| Mode | Condition | Effet sur le verdict |
+| --- | --- | --- |
+| `DISABLED` | Non évaluée, statut `DISABLED` | Aucun blocker |
+| `REPORT_ONLY` | Évaluée et exposée, y compris `UNKNOWN` | Aucun blocker |
+| `ENFORCED` | Évaluée | `TRIGGERED` crée un blocker, indépendamment du score |
+
+Une observation inconnue donne `UNKNOWN`; un seuil absent donne
+`NOT_CONFIGURED`. Pour un maximum, l'égalité passe et seul un dépassement strict
+du seuil déclenche; pour le minimum shared funder,
+l'égalité déclenche (`>=`). Les seuils holder et related cluster sont `null` et
+`REPORT_ONLY` pendant le dry-run; `SHARED_FUNDER_CLUSTER` est `REPORT_ONLY`
+avec minimumSharedFunders=1. Le seuil roundtrip par défaut est 3000 bps,
+NONVALIDATED et calibration initiale: il n'est pas une garantie de profit, de
+sellabilité, de première position ou de résultat dans le même slot.
+
+Raydium legacy `RISK_*` reste isolé du calibrage Pump.fun; il ne modifie ni le
+profil, ni les conditions, ni le verdict Pump.fun.
+
 ## Machine d’état et événements
 
 Les états publics sont définis dans `src/domain/launch-status.ts`. Chaque

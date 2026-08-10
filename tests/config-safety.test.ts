@@ -216,3 +216,80 @@ void test('les réglages listener ne régressent pas la sécurité observe/paper
     SOLANA_PRIVATE_KEY_BASE58: 'secret',
   }), /private key/u);
 });
+
+void test('Pump.fun calibration documentation states the initial profile, semantics, and safety limits', async () => {
+  const documentPaths = [
+    '../README.md',
+    '../docs/architecture/pumpfun-v1.md',
+    '../docs/api/v1.md',
+    '../docs/system-overview.html',
+  ] as const;
+  const documents = await Promise.all(documentPaths.map((path) => readFile(new URL(path, import.meta.url), 'utf8')));
+  const [readme, architecture, api, systemOverview] = documents as [string, string, string, string];
+  const documentation = documents.join('\n');
+  for (const statement of [
+    'config/qualification/pumpfun-v1-unvalidated.json',
+    'QUALIFICATION_PROFILE_PATH',
+    'QUALIFICATION_MIN_SCORE',
+    'UNVALIDATED_RULE_SET',
+    'SHA-256',
+    'DISABLED',
+    'REPORT_ONLY',
+    'ENFORCED',
+    '15',
+    '25',
+    '60',
+    '3000 bps',
+    'NONVALIDATED',
+    'calibration initiale',
+    'SHARED_FUNDER_CLUSTER',
+    'RELATED_WALLET_CLUSTER_EXCEEDED',
+    'UNKNOWN',
+    'dépassement strict',
+    'métadonnées',
+    'social',
+    'Raydium',
+    'fingerprint: null',
+    'conditions: []',
+    'chaînes décimales',
+    'clé privée',
+    'sendTransaction',
+    'signTransaction',
+    'profit',
+    'sellabilité',
+    'première position',
+    'même slot',
+  ]) assert.ok(documentation.includes(statement), `missing documentation statement: ${statement}`);
+
+  assert.match(readme, /par défaut.*config\/qualification\/pumpfun-v1-unvalidated\.json/isu);
+  assert.match(readme, /fail.closed|fails closed/iu);
+  assert.match(readme, /redact|ne journalise ni le\s+chemin/iu);
+  assert.match(architecture, /Un blocker actif.*compensé/isu);
+  assert.match(architecture, /null.*REPORT_ONLY.*dry-run/isu);
+  assert.match(architecture, /égalité passe.*dépassement strict/isu);
+  assert.match(api, /legacy.*fingerprint: null.*conditions: \[\]/isu);
+  assert.match(api, /fingerprint.*lowercase/iu);
+  assert.match(systemOverview, /diagnostic/iu);
+});
+
+void test('qualification loader, evaluator, profile, and public API boundaries exclude execution primitives', async () => {
+  const modulePaths = [
+    '../src/qualification/qualification-engine.ts',
+    '../src/qualification/qualification-policy-evaluator.ts',
+    '../src/qualification/qualification-profile.ts',
+    '../config/qualification/pumpfun-v1-unvalidated.json',
+    '../src/api/contracts.ts',
+    '../src/storage/api-projection.repository.ts',
+  ] as const;
+  const sources = await Promise.all(modulePaths.map((path) => readFile(new URL(path, import.meta.url), 'utf8')));
+  const importSpecifiers = sources.flatMap((source) => [...source.matchAll(/^\s*import(?:\s+type)?[\s\S]*?\sfrom\s+['"]([^'"]+)['"];?|^\s*import\s+['"]([^'"]+)['"];?/gmu)])
+    .map((match) => match[1] ?? match[2])
+    .filter((specifier): specifier is string => specifier !== undefined);
+  for (const specifier of importSpecifiers) {
+    assert.doesNotMatch(specifier, /(?:wallet|keypair|sign|transaction.builder|trade.executor|submission)/iu);
+  }
+  for (const source of sources) {
+    const executableSource = source.replace(/(['"`])(?:\\.|(?!\1)[\s\S])*?\1/gu, '');
+    assert.doesNotMatch(executableSource, /\b(?:sendTransaction|signTransaction)\s*\(/u);
+  }
+});

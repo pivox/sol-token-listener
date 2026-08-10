@@ -15,12 +15,7 @@ import type { ApiProjectionRepository } from '../src/ports/api-projection-reposi
 import { QualificationProfileError } from '../src/qualification/qualification-profile.js';
 import { createQualificationEngine as buildQualificationEngine } from '../src/qualification/qualification-engine.js';
 
-const FORBIDDEN_IMPORTS = [
-  'execution/wallet',
-  'execution/transaction-confirmer',
-  'execution/trade-executor',
-  'dex/raydium-cpmm/transaction-builder',
-] as const;
+const FORBIDDEN_IMPORT_PATHS = /(?:execution\/(?:wallet|transaction-confirmer|trade-executor)|dex\/raydium-cpmm\/transaction-builder|(?:signing|submission|keypair))/iu;
 
 const config = parseConfig({
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
@@ -29,9 +24,12 @@ const config = parseConfig({
 
 void test('bootstrap imports no signing, submission, or live execution path', async () => {
   const source = await readFile(new URL('../src/app.ts', import.meta.url), 'utf8');
-  for (const forbidden of FORBIDDEN_IMPORTS) {
-    assert.doesNotMatch(source, new RegExp(forbidden, 'u'));
-  }
+  const imports = [...source.matchAll(/^\s*import(?:\s+type)?[\s\S]*?\sfrom\s+['"]([^'"]+)['"];?|^\s*import\s+['"]([^'"]+)['"];?/gmu)]
+    .map((match) => match[1] ?? match[2])
+    .filter((specifier): specifier is string => specifier !== undefined);
+  for (const specifier of imports) assert.doesNotMatch(specifier, FORBIDDEN_IMPORT_PATHS);
+  const executableSource = source.replace(/(['"`])(?:\\.|(?!\1)[\s\S])*?\1/gu, '');
+  assert.doesNotMatch(executableSource, /\b(?:sendTransaction|signTransaction)\s*\(/u);
 });
 
 void test('migrates, starts listener before API, then closes listener before API and database', async () => {
