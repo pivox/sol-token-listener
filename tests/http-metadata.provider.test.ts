@@ -1,16 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { HttpMetadataProvider } from '../src/metadata/http-metadata.provider.js';
+import type { MetadataFailureReason } from '../src/domain/pumpfun-observation.js';
+import type { PublicHttpClient, PublicHttpResult } from '../src/ports/public-http-client.js';
 
-const publicResolver = async (): Promise<readonly string[]> => ['93.184.216.34'];
-
-void test('récupère et normalise un JSON public borné', async () => {
-  const provider = new HttpMetadataProvider(async () => new Response(JSON.stringify({
+void test('préserve la normalisation publique existante sur le transport partagé', async () => {
+  const provider = new HttpMetadataProvider(client(success(JSON.stringify({
     name: ' Éclair ', symbol: 'ecl', image: 'https://cdn.test/image.png',
-  }), { status: 200 }), { timeoutMs: 100, maxBytes: 1_024, maxRedirects: 1 }, publicResolver);
+  }))));
 
-  const result = await provider.resolve('https://example.com/meta.json');
-  assert.deepEqual(result, {
+  assert.deepEqual(await provider.resolve('https://example.com/meta.json'), {
     status: 'RESOLVED', metadata: {
       name: 'Éclair', symbol: 'ECL', description: null,
       imageUrl: 'https://cdn.test/image.png', videoUrl: null, websiteUrl: null,
@@ -19,55 +18,77 @@ void test('récupère et normalise un JSON public borné', async () => {
   });
 });
 
-void test('échoue de façon typée pour URI invalide, HTTP et JSON invalides', async () => {
-  const invalid = new HttpMetadataProvider(async () => new Response('', { status: 500 }), {
-    timeoutMs: 100, maxBytes: 1_024, maxRedirects: 1,
-  }, publicResolver);
-  assertFailure(await invalid.resolve('ftp://example.com'), 'UNSUPPORTED_URI_SCHEME');
-  assertFailure(await invalid.resolve('https://example.com'), 'HTTP_STATUS_INVALID');
-
-  const json = new HttpMetadataProvider(async () => new Response('{', { status: 200 }), {
-    timeoutMs: 100, maxBytes: 1_024, maxRedirects: 1,
-  }, publicResolver);
-  assertFailure(await json.resolve('https://example.com'), 'JSON_INVALID');
+void test('classe les échecs de transport sans fuite et conserve leur retryabilité', async () => {
+  const cases = [
+    ['URL_INVALID', 'URI_INVALID', false],
+    ['SCHEME_UNSUPPORTED', 'UNSUPPORTED_URI_SCHEME', false],
+    ['UNSAFE_DESTINATION', 'URI_INVALID', false],
+    ['DNS_FAILED', 'FETCH_FAILED', true],
+    ['TIMEOUT', 'FETCH_FAILED', true],
+    ['NETWORK_FAILED', 'FETCH_FAILED', true],
+    ['REDIRECT_INVALID', 'REDIRECT_LIMIT_EXCEEDED', false],
+    ['REDIRECT_LIMIT_EXCEEDED', 'REDIRECT_LIMIT_EXCEEDED', false],
+    ['HTTP_STATUS_INVALID', 'HTTP_STATUS_INVALID', true],
+    ['CONTENT_TYPE_UNSUPPORTED', 'FETCH_FAILED', false],
+    ['CONTENT_TOO_LARGE', 'CONTENT_TOO_LARGE', false],
+    ['UTF8_INVALID', 'JSON_INVALID', false],
+  ] as const;
+  for (const [transportReason, metadataReason, retryable] of cases) {
+    const provider = new HttpMetadataProvider(client(Object.freeze({
+      status: 'FAILED' as const,
+      reason: transportReason,
+      retryable,
+    })));
+    assertFailure(await provider.resolve('https://secret.example/path'), metadataReason, retryable);
+  }
 });
 
-void test('refuse un contenu qui dépasse la limite', async () => {
-  const provider = new HttpMetadataProvider(async () => new Response('{"name":"long"}', { status: 200 }), {
-    timeoutMs: 100, maxBytes: 5, maxRedirects: 1,
-  }, publicResolver);
-  assertFailure(await provider.resolve('https://example.com'), 'CONTENT_TOO_LARGE');
+void test('rejette le JSON invalide et la forme invalide sans les rendre retryables', async () => {
+  const invalidJson = new HttpMetadataProvider(client(success('{')));
+  assertFailure(await invalidJson.resolve('https://example.test'), 'JSON_INVALID', false);
+
+  const invalidShape = new HttpMetadataProvider(client(success('[]')));
+  assertFailure(await invalidShape.resolve('https://example.test'), 'JSON_SHAPE_INVALID', false);
 });
 
-void test('refuse les hôtes non publics avant toute requête', async () => {
-  let requests = 0;
-  const provider = new HttpMetadataProvider(async () => {
-    requests += 1;
-    return new Response('{}', { status: 200 });
-  }, { timeoutMs: 100, maxBytes: 1_024, maxRedirects: 1 }, async () => ['127.0.0.1']);
-
-  assertFailure(await provider.resolve('https://metadata.example'), 'URI_INVALID');
-  assert.equal(requests, 0);
+void test('demande uniquement les types JSON au transport', async () => {
+  const calls: (readonly [string, readonly string[]])[] = [];
+  const http: PublicHttpClient = {
+    get: async (url, accepted) => {
+      calls.push([url, accepted]);
+      return success('{}');
+    },
+  };
+  await new HttpMetadataProvider(http).resolve('https://example.test/meta');
+  assert.deepEqual(calls, [[
+    'https://example.test/meta',
+    ['application/json', 'text/json'],
+  ]]);
 });
 
-void test('refuse une IPv4 locale mappée dans IPv6', async () => {
-  const provider = new HttpMetadataProvider(async () => new Response('{}', { status: 200 }), {
-    timeoutMs: 100, maxBytes: 1_024, maxRedirects: 1,
-  }, async () => ['::ffff:127.0.0.1']);
+function client(result: PublicHttpResult): PublicHttpClient {
+  return { get: async () => result };
+}
 
-  assertFailure(await provider.resolve('https://metadata.example'), 'URI_INVALID');
-});
-
-void test('valide les bornes du récupérateur HTTP', () => {
-  assert.throws(() => new HttpMetadataProvider(fetch, {
-    timeoutMs: 0, maxBytes: 1_024, maxRedirects: 1,
-  }, publicResolver), /timeoutMs/);
-});
+function success(body: string): PublicHttpResult {
+  return Object.freeze({
+    status: 'SUCCEEDED' as const,
+    finalUrl: 'https://example.test/meta',
+    httpStatus: 200,
+    contentType: 'application/json',
+    redirectCount: 0,
+    body: new TextEncoder().encode(body),
+  });
+}
 
 function assertFailure(
   result: Awaited<ReturnType<HttpMetadataProvider['resolve']>>,
-  reason: string,
+  reason: MetadataFailureReason,
+  retryable: boolean,
 ): void {
   assert.equal(result.status, 'FAILED');
-  if (result.status === 'FAILED') assert.equal(result.reason, reason);
+  if (result.status !== 'FAILED') return;
+  assert.equal(result.reason, reason);
+  assert.equal(result.retryable, retryable);
+  assert.doesNotMatch(result.message, /secret|example|path|93\.184/iu);
 }

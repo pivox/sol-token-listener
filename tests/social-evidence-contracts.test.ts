@@ -71,11 +71,15 @@ void test('changes deterministic identities only when immutable evidence changes
       evidence({ outcome: 'REJECTED', reasonCode: 'URL_NOT_REACHABLE' }),
     ]),
   });
+  const originalEvidence = original.evidence[0];
+  const changedEvidence = changed.evidence[0];
+  assert.ok(originalEvidence);
+  assert.ok(changedEvidence);
 
   assert.notEqual(socialCollectionId(original), socialCollectionId(changed));
   assert.notEqual(
-    socialVerificationEvidenceId(original.evidence[0] as SocialVerificationEvidenceV1),
-    socialVerificationEvidenceId(changed.evidence[0] as SocialVerificationEvidenceV1),
+    socialVerificationEvidenceId(originalEvidence),
+    socialVerificationEvidenceId(changedEvidence),
   );
 });
 
@@ -140,9 +144,11 @@ void test('rejects mutable, accessor, duplicate, foreign and inconsistent inputs
     /data|field|input/iu,
   );
 
+  const canonicalLink = canonical.links[0];
+  assert.ok(canonicalLink);
   assert.throws(() => createSocialCollection(collectionInput({
     ...canonical,
-    links: Object.freeze([canonical.links[0] as SocialLinkV1, canonical.links[0] as SocialLinkV1]),
+    links: Object.freeze([canonicalLink, canonicalLink]),
   })), /duplicate|unique/iu);
 
   assert.throws(() => createSocialCollection(collectionInput({

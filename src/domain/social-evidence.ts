@@ -478,7 +478,7 @@ function collectionFingerprint(input: SocialEvidenceCollectionInputV1): string {
   return createHash('sha256').update(canonical).digest('hex');
 }
 
-function withoutObservedAt<T extends { readonly observedAtMs: number }>(value: T): object {
+function withoutObservedAt(value: { readonly observedAtMs: number }): object {
   const result: Record<string, unknown> = {};
   for (const [key, nested] of Object.entries(value)) {
     if (key !== 'observedAtMs') result[key] = nested;
@@ -546,7 +546,7 @@ function exactFields<const TFields extends readonly string[]>(
   if (keys.length !== fields.length || fields.some((field) => !Object.hasOwn(values, field))) {
     throw new TypeError(`${name} must contain exactly the required fields.`);
   }
-  return values as Record<TFields[number], unknown>;
+  return values;
 }
 
 function dataField(value: unknown, field: string): unknown {
