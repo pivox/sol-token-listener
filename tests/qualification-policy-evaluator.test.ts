@@ -45,9 +45,16 @@ void test('handles unavailable calibrated observations without cross-condition i
     HOLDER_CONCENTRATION_EXCEEDED: { mode: 'ENFORCED', maximumTop1Bps: null, maximumTop5Bps: 500, maximumTop10Bps: null },
     ROUND_TRIP_LOSS_EXCEEDED: { maximumRoundTripLossBps: 3000 },
   }), facts({ top5HoldersBps: null, roundTripLossBps: 3001n }), Object.freeze([]));
-  assert.equal(condition(result, 'HOLDER_CONCENTRATION_EXCEEDED').status, 'NOT_CONFIGURED');
+  assert.equal(condition(result, 'HOLDER_CONCENTRATION_EXCEEDED').status, 'UNKNOWN');
   assert.equal(condition(result, 'ROUND_TRIP_LOSS_EXCEEDED').status, 'TRIGGERED');
   assert.deepEqual(result.blockers, ['ROUND_TRIP_LOSS_EXCEEDED']);
+});
+
+void test('reports partial holder configuration only after all configured observations pass', () => {
+  const result = evaluateQualificationConditions(profile({
+    HOLDER_CONCENTRATION_EXCEEDED: { mode: 'ENFORCED', maximumTop1Bps: 500, maximumTop5Bps: null, maximumTop10Bps: null },
+  }), facts({ top1HolderBps: 500n, top5HoldersBps: 900n, top10HoldersBps: 900n }), Object.freeze([]));
+  assert.equal(condition(result, 'HOLDER_CONCENTRATION_EXCEEDED').status, 'NOT_CONFIGURED');
 });
 
 void test('rejects incomplete effective profiles before evaluating their policies', () => {
@@ -108,6 +115,14 @@ void test('evaluates boolean calibrated checks and disabled/upstream policies', 
   assert.equal(condition(result, 'BUY_SIMULATION_FAILED').status, 'TRIGGERED');
   assert.equal(condition(result, 'SELL_QUOTE_UNAVAILABLE').status, 'TRIGGERED');
   assert.deepEqual(result.blockers, ['BUY_SIMULATION_FAILED', 'SELL_QUOTE_UNAVAILABLE']);
+});
+
+void test('keeps the default creator-repeat-dumper policy disabled despite upstream evidence', () => {
+  const result = evaluateQualificationConditions(profile(), facts({
+    upstreamConditions: Object.freeze([Object.freeze({ code: 'CREATOR_REPEAT_DUMPER', triggered: true })]),
+  }), Object.freeze([]));
+  assert.equal(condition(result, 'CREATOR_REPEAT_DUMPER').status, 'DISABLED');
+  assert.ok(!result.blockers.includes('CREATOR_REPEAT_DUMPER'));
 });
 
 void test('uses stable legacy reason ordering and returns deeply frozen safe results', () => {

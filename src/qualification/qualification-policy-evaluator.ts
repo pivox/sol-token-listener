@@ -65,9 +65,9 @@ function holder(policy: QualificationConditionPolicy, facts: QualificationCalibr
   const observed = Object.fromEntries(pairs.map(([key, value]) => [key, value]));
   const thresholds = Object.fromEntries(pairs.map(([key, , value]) => [key, value === null ? null : BigInt(value)]));
   if (configured.some(([, value, threshold]) => value !== null && threshold !== null && value > BigInt(threshold))) return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'TRIGGERED', observed, thresholds, 'Holder concentration exceeds the configured threshold.');
+  if (configured.some(([, value]) => value === null)) return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'UNKNOWN', observed, thresholds, 'Holder concentration is unavailable.');
   if (pairs.some(([, , threshold]) => threshold === null)) return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'NOT_CONFIGURED', observed, thresholds, 'Holder concentration is not fully configured.');
-  const status: QualificationConditionStatus = configured.some(([, value]) => value === null) ? 'UNKNOWN' : 'PASSED';
-  return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, status, observed, thresholds, status === 'UNKNOWN' ? 'Holder concentration is unavailable.' : 'Holder concentration passed.');
+  return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'PASSED', observed, thresholds, 'Holder concentration passed.');
 }
 
 function maximum(code: QualificationReasonCode, mode: QualificationConditionMode, observedValue: bigint | null, thresholdValue: number | null, triggeredMessage: string): QualificationConditionEvidence {
