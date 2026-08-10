@@ -8,6 +8,7 @@ import type { ApiClient } from '../data/api-client.js';
 import { ApiClientProvider } from '../data/api-provider.js';
 import type { SseClient } from '../data/sse-client.js';
 import { RadarPage } from '../features/radar/radar-page.js';
+import { LaunchPage } from '../features/launch/launch-page.js';
 import { AppShell } from './app-shell.js';
 import { ErrorBoundary } from './error-boundary.js';
 
@@ -30,7 +31,7 @@ export function App({ apiBaseUrl, realtimeClient, apiClient: providedApiClient }
             <Routes>
               <Route element={<AppShell />}>
                 <Route index element={<RadarPage />} />
-                <Route path="launches/:mint" element={<PlaceholderPage title="Fiche du lancement" />} />
+                <Route path="launches/:mint" element={<LaunchPage />} />
                 <Route path="paper-positions" element={<PlaceholderPage title="Positions paper" />} />
                 <Route path="health" element={<PlaceholderPage title="Santé technique" />} />
                 <Route path="*" element={<NotFoundPage />} />
