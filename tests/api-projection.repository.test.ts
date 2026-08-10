@@ -13,6 +13,10 @@ import {
 } from '../src/api/cursor.js';
 import { toJsonValue } from '../src/utils/json.js';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
+import {
+  defaultQualificationRuleSet,
+  QualificationEngine,
+} from '../src/qualification/qualification-engine.js';
 
 interface Call {
   readonly text: string;
@@ -1059,6 +1063,35 @@ void test('rejects hostile qualification payload descriptors and proxies without
     });
   }
   assert.equal(proxyTrapCalled, false);
+});
+
+void test('projects complete engine evidence from calibrated and legacy persisted reports', async () => {
+  const report = new QualificationEngine(defaultQualificationRuleSet).evaluate({
+    evaluatedAtMs: detectedAt.getTime(), signals: {}, blockers: [], calibrationFacts: null,
+  });
+  const calibrated = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;
+  const legacy = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;
+  const legacyRuleSet = legacy.ruleSet as Record<string, unknown>;
+  Reflect.deleteProperty(legacyRuleSet, 'fingerprint');
+  Reflect.deleteProperty(legacy, 'conditions');
+
+  for (const payload of [calibrated, legacy]) {
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    const value = await repository.getLaunchRisk('mint-a');
+    assert.deepEqual(value?.evidence, report.evidence.map(({ signal, status, message }) => ({ signal, status, message })));
+  }
+
+  for (const change of [
+    { dimension: 'invalid' },
+    { required: 'true' },
+    { weight: 101 },
+  ]) {
+    const corrupt = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;
+    const evidence = corrupt.evidence as Record<string, unknown>[];
+    evidence[0] = { ...evidence[0], ...change };
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: corrupt }]));
+    await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
+  }
 });
 
 void test('lists paper positions by stable keyset without decimal coercion', async () => {

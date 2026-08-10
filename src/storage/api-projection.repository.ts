@@ -45,6 +45,7 @@ import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
 import {
   QUALIFICATION_CONDITION_MODES,
   QUALIFICATION_CONDITION_STATUSES,
+  QUALIFICATION_DIMENSIONS,
   QUALIFICATION_SIGNAL_KEYS,
 } from '../domain/qualification.js';
 import { MAX_API_PAGE_LIMIT, type ApiProjectionRepository, type PageRequest } from '../ports/api-projection-repository.js';
@@ -913,7 +914,7 @@ const QUALIFICATION_PAYLOAD_FIELDS_WITH_CALIBRATION = [...QUALIFICATION_PAYLOAD_
 const QUALIFICATION_RULE_SET_FIELDS_LEGACY = ['id', 'version', 'status', 'minimumTotalScore'] as const;
 const QUALIFICATION_RULE_SET_FIELDS_WITH_FINGERPRINT = [...QUALIFICATION_RULE_SET_FIELDS_LEGACY, 'fingerprint'] as const;
 const QUALIFICATION_SCORE_FIELDS = ['preparation', 'socialAuthenticity', 'onchainHealth', 'total'] as const;
-const QUALIFICATION_EVIDENCE_FIELDS = ['signal', 'status', 'message'] as const;
+const QUALIFICATION_EVIDENCE_FIELDS = ['signal', 'dimension', 'status', 'required', 'weight', 'message'] as const;
 const QUALIFICATION_BLOCKER_FIELDS = ['code', 'message'] as const;
 const QUALIFICATION_CONDITION_FIELDS = [
   'code', 'mode', 'status', 'observed', 'thresholds', 'message',
@@ -1052,10 +1053,13 @@ function qualificationMessage(value: unknown): string {
 function qualificationEvidence(value: unknown): readonly ApiQualification['evidence'][number][] {
   return freeze(exactDenseArray(value, QUALIFICATION_SIGNAL_KEYS.length, 'Qualification evidence').map((item) => {
     const fields = exactDataRecord(item, QUALIFICATION_EVIDENCE_FIELDS, 'Qualification evidence item');
+    validated(fields.dimension, QUALIFICATION_DIMENSIONS);
+    boolean(fields.required);
+    if (nonNegativeSafeNumber(fields.weight) > 100) throw invalid();
     return freeze({
       signal: validated(fields.signal, QUALIFICATION_SIGNAL_KEYS) as ApiQualification['evidence'][number]['signal'],
       status: validated(fields.status, QUALIFICATION_EVIDENCE_STATUSES) as ApiQualification['evidence'][number]['status'],
-      message: text(fields.message),
+      message: qualificationMessage(fields.message),
     });
   }));
 }
