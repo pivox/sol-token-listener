@@ -21,11 +21,16 @@ export type PaperQuoteFailureCode =
   | 'UNSUPPORTED_QUOTE_MINT';
 
 export class PaperQuoteError extends Error {
+  public readonly retryable: boolean;
+
   public constructor(
     public readonly code: PaperQuoteFailureCode,
     message: string,
   ) {
     super(message);
     this.name = 'PaperQuoteError';
+    this.retryable = code === 'QUOTE_STATE_UNAVAILABLE'
+      || code === 'QUOTE_STALE'
+      || code === 'VENUE_MIGRATION_PENDING';
   }
 }
