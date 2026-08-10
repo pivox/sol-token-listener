@@ -1,7 +1,7 @@
 # Paper trading end-to-end V1 — conception
 
-Date : 2026-08-10  
-Issue : [#39](https://github.com/pivox/sol-token-listener/issues/39)  
+Date : 2026-08-10
+Issue : [#39](https://github.com/pivox/sol-token-listener/issues/39)
 Stratégie : `validated-external-buys-v1`, version `1`
 
 ## 1. Décision
