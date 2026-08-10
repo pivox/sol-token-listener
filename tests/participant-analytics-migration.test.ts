@@ -29,7 +29,7 @@ void test('crée les projections participant analytics bigint et rejouables', as
   assert.doesNotMatch(sql, /DROP TABLE/iu);
 });
 
-void test('applique 001–010 sur une base vide et accepte les événements SSE', async (context) => {
+void test('applique 001–012 sur une base vide et accepte les événements SSE', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -45,7 +45,7 @@ void test('applique 001–010 sur une base vide et accepte les événements SSE'
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '011_transaction_inbox_retry_recovery.sql');
+    assert.equal(applied.at(-1), '012_public_social_evidence.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
