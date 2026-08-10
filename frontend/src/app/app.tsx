@@ -1,36 +1,42 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';
 import { RealtimeProvider } from '../data/realtime-provider.js';
+import { createApiClient } from '../data/api-client.js';
+import type { ApiClient } from '../data/api-client.js';
+import { ApiClientProvider } from '../data/api-provider.js';
 import type { SseClient } from '../data/sse-client.js';
+import { RadarPage } from '../features/radar/radar-page.js';
 import { AppShell } from './app-shell.js';
 import { ErrorBoundary } from './error-boundary.js';
 
 export interface AppProps {
   readonly apiBaseUrl: string;
   readonly realtimeClient?: SseClient;
+  readonly apiClient?: ApiClient;
 }
 
-export function App({ apiBaseUrl, realtimeClient }: AppProps): ReactNode {
+export function App({ apiBaseUrl, realtimeClient, apiClient: providedApiClient }: AppProps): ReactNode {
   const [queryClient] = useState(() => new QueryClient({
     defaultOptions: { queries: { staleTime: 5_000, gcTime: 5 * 60_000 } },
   }));
+  const apiClient = useMemo(() => providedApiClient ?? createApiClient({ apiBaseUrl }), [apiBaseUrl, providedApiClient]);
   return (
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>
         <RealtimeProvider apiBaseUrl={apiBaseUrl} {...(realtimeClient === undefined ? {} : { client: realtimeClient })}>
-          <BrowserRouter>
+          <ApiClientProvider client={apiClient}><BrowserRouter>
             <Routes>
               <Route element={<AppShell />}>
-                <Route index element={<PlaceholderPage title="Radar des lancements" />} />
+                <Route index element={<RadarPage />} />
                 <Route path="launches/:mint" element={<PlaceholderPage title="Fiche du lancement" />} />
                 <Route path="paper-positions" element={<PlaceholderPage title="Positions paper" />} />
                 <Route path="health" element={<PlaceholderPage title="Santé technique" />} />
                 <Route path="*" element={<NotFoundPage />} />
               </Route>
             </Routes>
-          </BrowserRouter>
+          </BrowserRouter></ApiClientProvider>
         </RealtimeProvider>
       </QueryClientProvider>
     </ErrorBoundary>
