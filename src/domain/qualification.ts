@@ -277,6 +277,7 @@ export interface QualificationEvaluationInput {
   readonly evaluatedAtMs: number;
   readonly signals: Readonly<Partial<Record<QualificationSignalKey, boolean>>>;
   readonly blockers: readonly QualificationReasonCode[];
+  readonly calibrationFacts: QualificationCalibrationFacts | null;
 }
 
 export interface QualificationEvidence {
@@ -306,9 +307,13 @@ export interface QualificationBlocker {
 }
 
 export interface QualificationReport {
-  readonly ruleSet: Pick<QualificationRuleSet, 'id' | 'version' | 'status' | 'minimumTotalScore'>;
+  /** Legacy persisted reports may not contain the calibration fingerprint. */
+  readonly ruleSet: Pick<QualificationRuleSet, 'id' | 'version' | 'status' | 'minimumTotalScore'> &
+    Readonly<{ fingerprint?: string }>;
   readonly scores: QualificationScores;
   readonly evidence: readonly QualificationEvidence[];
+  /** Legacy persisted reports may predate calibrated condition evidence. */
+  readonly conditions?: readonly QualificationConditionEvidence[];
   readonly blockers: readonly QualificationBlocker[];
   readonly verdict: QualificationVerdict;
   readonly evaluatedAtMs: number;

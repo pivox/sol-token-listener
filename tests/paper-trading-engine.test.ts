@@ -308,6 +308,7 @@ function openCommand(): OpenPaperPositionCommand {
       creatorHasNotSold: true,
     },
     blockers: [],
+    calibrationFacts: null,
   });
   return {
     mint: 'MINT',

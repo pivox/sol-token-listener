@@ -615,6 +615,7 @@ function openCommand(): OpenPaperPositionCommand {
     evaluatedAtMs: 1,
     signals: { imageValid: true, socialCrossLinkConfirmed: true, creatorHasNotSold: true },
     blockers: [],
+    calibrationFacts: null,
   });
   return {
     mint: 'MINT', quoteAsset: { mint: 'SOL', decimals: 9, tokenProgram: 'SPL_TOKEN' },

@@ -1,52 +1,38 @@
 import {
-  QUALIFICATION_DIMENSIONS,
-  QUALIFICATION_SIGNAL_KEYS,
+  type EffectiveQualificationProfile,
   type QualificationBlocker,
+  type QualificationCalibrationFacts,
   type QualificationDimension,
   type QualificationEvaluationInput,
   type QualificationEvidence,
   type QualificationEvidenceStatus,
   type QualificationReport,
   type QualificationRule,
-  type QualificationRuleSet,
   type QualificationScore,
   type QualificationScores,
 } from '../domain/qualification.js';
-import {
-  QUALIFICATION_REASON_CODES,
-  type QualificationReasonCode,
-} from '../domain/qualification-reasons.js';
+import { QUALIFICATION_REASON_CODES, type QualificationReasonCode } from '../domain/qualification-reasons.js';
 import { assertValidTimestampMs } from '../domain/timestamp.js';
 import type { AppConfig } from '../config/env.js';
-
-const DIMENSION_MAXIMUMS: Readonly<Record<QualificationDimension, number>> = Object.freeze({
-  preparation: 15,
-  socialAuthenticity: 25,
-  onchainHealth: 60,
-});
+import {
+  assertValidEffectiveQualificationProfile,
+  loadQualificationProfile,
+} from './qualification-profile.js';
+import { evaluateQualificationConditions } from './qualification-policy-evaluator.js';
 
 export const defaultQualificationRuleSet = createDefaultQualificationRuleSet(60);
 
-export function createDefaultQualificationRuleSet(minimumTotalScore: number): QualificationRuleSet {
-  return freeze({
-    id: 'pumpfun-v1-initial',
-    version: 1,
-    status: 'UNVALIDATED_RULE_SET',
-    minimumTotalScore,
-    rules: freeze([
-    rule('imageValid', 'preparation', 15, true, 'Préparation visuelle du lancement valide.'),
-    rule('socialCrossLinkConfirmed', 'socialAuthenticity', 25, true, 'Liens sociaux cohérents.'),
-    rule('creatorHasNotSold', 'onchainHealth', 20, true, 'Aucune vente précoce du créateur.'),
-    rule('reverseQuoteAvailable', 'onchainHealth', 20, false, 'Cotation inverse disponible.'),
-    rule('externalBuyersObserved', 'onchainHealth', 20, false, 'Acheteurs externes observés.'),
-    ]),
-  });
+export function createDefaultQualificationRuleSet(minimumTotalScore: number): EffectiveQualificationProfile {
+  return loadQualificationProfile({ profilePath: null, minimumScoreOverride: minimumTotalScore });
 }
 
 export function createQualificationEngine(
-  config: Pick<AppConfig, 'qualificationMinimumScore'>,
+  config: Pick<AppConfig, 'qualificationProfilePath' | 'qualificationMinimumScore'>,
 ): QualificationEngine {
-  return new QualificationEngine(createDefaultQualificationRuleSet(config.qualificationMinimumScore));
+  return new QualificationEngine(loadQualificationProfile({
+    profilePath: config.qualificationProfilePath,
+    minimumScoreOverride: config.qualificationMinimumScore,
+  }));
 }
 
 export class QualificationConfigurationError extends Error {
@@ -56,38 +42,65 @@ export class QualificationConfigurationError extends Error {
   }
 }
 
-export class QualificationEngine {
-  private readonly ruleSet: QualificationRuleSet;
+export type QualificationProfileSummary = Readonly<{
+  id: string;
+  version: number;
+  status: 'UNVALIDATED_RULE_SET';
+  fingerprint: string;
+  minimumTotalScore: number;
+}>;
 
-  public constructor(ruleSet: QualificationRuleSet) {
-    validateRuleSet(ruleSet);
-    this.ruleSet = snapshotRuleSet(ruleSet);
+export class QualificationEngine {
+  private readonly profile: EffectiveQualificationProfile;
+  private readonly summary: QualificationProfileSummary;
+
+  public constructor(profile: EffectiveQualificationProfile) {
+    assertValidEffectiveQualificationProfile(profile);
+    this.profile = snapshotProfile(profile);
+    this.summary = freeze({
+      id: this.profile.id,
+      version: this.profile.version,
+      status: this.profile.status,
+      fingerprint: this.profile.fingerprint,
+      minimumTotalScore: this.profile.minimumTotalScore,
+    });
   }
 
   public get minimumTotalScore(): number {
-    return this.ruleSet.minimumTotalScore;
+    return this.profile.minimumTotalScore;
+  }
+
+  public get profileSummary(): QualificationProfileSummary {
+    return this.summary;
   }
 
   public evaluate(input: QualificationEvaluationInput): QualificationReport {
     assertValidTimestampMs('evaluatedAtMs', input.evaluatedAtMs);
-    const evidence = this.ruleSet.rules.map((ruleDefinition) => evidenceFor(ruleDefinition, input));
-    const scores = calculateScores(evidence);
-    const blockers = createBlockers(input.blockers);
+    const evidence = this.profile.rules.map((ruleDefinition) => evidenceFor(ruleDefinition, input));
+    const scores = calculateScores(evidence, this.profile.dimensionMaximums);
+    const evaluatedConditions = evaluateQualificationConditions(
+      this.profile,
+      input.calibrationFacts ?? noCalibrationFacts(),
+      legacyBlockers(input.blockers),
+    );
+    const blockers = createBlockers(evaluatedConditions.blockers);
     const missingRequiredEvidence = evidence.some((item) => item.required && item.status !== 'SATISFIED');
     const verdict = blockers.length > 0
       ? 'REJECTED'
-      : (missingRequiredEvidence || scores.total.score < this.ruleSet.minimumTotalScore)
+      : (missingRequiredEvidence || scores.total.score < this.profile.minimumTotalScore)
         ? 'WATCHLISTED'
         : 'QUALIFIED';
     return freeze({
       ruleSet: freeze({
-        id: this.ruleSet.id,
-        version: this.ruleSet.version,
-        status: this.ruleSet.status,
-        minimumTotalScore: this.ruleSet.minimumTotalScore,
+        id: this.profile.id,
+        version: this.profile.version,
+        status: this.profile.status,
+        fingerprint: this.profile.fingerprint,
+        minimumTotalScore: this.profile.minimumTotalScore,
       }),
       scores,
       evidence: freeze(evidence),
+      conditions: evaluatedConditions.conditions,
       blockers: freeze(blockers),
       verdict,
       evaluatedAtMs: input.evaluatedAtMs,
@@ -95,63 +108,17 @@ export class QualificationEngine {
   }
 }
 
-function rule(
-  signal: QualificationRule['signal'],
-  dimension: QualificationDimension,
-  weight: number,
-  required: boolean,
-  message: string,
-): QualificationRule {
-  return freeze({ signal, dimension, weight, required, message });
-}
-
-function validateRuleSet(ruleSet: QualificationRuleSet): void {
-  if (!Number.isSafeInteger(ruleSet.version) || ruleSet.version <= 0) {
-    throw new QualificationConfigurationError('ruleSet.version doit être un entier positif sûr.');
-  }
-  if (!Number.isSafeInteger(ruleSet.minimumTotalScore) || ruleSet.minimumTotalScore < 0 || ruleSet.minimumTotalScore > 100) {
-    throw new QualificationConfigurationError('ruleSet.minimumTotalScore doit être entre 0 et 100.');
-  }
-  const seenSignals = new Set<string>();
-  const dimensionWeights: Record<QualificationDimension, number> = {
-    preparation: 0, socialAuthenticity: 0, onchainHealth: 0,
-  };
-  for (const item of ruleSet.rules) {
-    if (!QUALIFICATION_SIGNAL_KEYS.includes(item.signal)) {
-      throw new QualificationConfigurationError(`Signal de qualification inconnu: ${item.signal}.`);
-    }
-    if (!QUALIFICATION_DIMENSIONS.includes(item.dimension)) {
-      throw new QualificationConfigurationError(`Dimension de qualification inconnue: ${item.dimension}.`);
-    }
-    if (seenSignals.has(item.signal)) {
-      throw new QualificationConfigurationError(`Signal de qualification dupliqué: ${item.signal}.`);
-    }
-    if (!Number.isSafeInteger(item.weight) || item.weight < 0) {
-      throw new QualificationConfigurationError(`Poids invalide pour ${item.signal}.`);
-    }
-    seenSignals.add(item.signal);
-    dimensionWeights[item.dimension] += item.weight;
-  }
-  for (const dimension of QUALIFICATION_DIMENSIONS) {
-    if (dimensionWeights[dimension] !== DIMENSION_MAXIMUMS[dimension]) {
-      throw new QualificationConfigurationError(`Poids total invalide pour ${dimension}.`);
-    }
-  }
-}
-
-function snapshotRuleSet(ruleSet: QualificationRuleSet): QualificationRuleSet {
+function snapshotProfile(profile: EffectiveQualificationProfile): EffectiveQualificationProfile {
   return freeze({
-    id: ruleSet.id,
-    version: ruleSet.version,
-    status: ruleSet.status,
-    minimumTotalScore: ruleSet.minimumTotalScore,
-    rules: freeze(ruleSet.rules.map((item) => freeze({
-      signal: item.signal,
-      dimension: item.dimension,
-      weight: item.weight,
-      required: item.required,
-      message: item.message,
-    }))),
+    schemaVersion: profile.schemaVersion,
+    fingerprint: profile.fingerprint,
+    id: profile.id,
+    version: profile.version,
+    status: profile.status,
+    minimumTotalScore: profile.minimumTotalScore,
+    dimensionMaximums: freeze({ ...profile.dimensionMaximums }),
+    rules: freeze(profile.rules.map((item) => freeze({ ...item }))),
+    conditionPolicies: freeze(profile.conditionPolicies.map((item) => freeze({ ...item }))),
   });
 }
 
@@ -172,16 +139,19 @@ function evidenceFor(ruleDefinition: QualificationRule, input: QualificationEval
   });
 }
 
-function calculateScores(evidence: readonly QualificationEvidence[]): QualificationScores {
+function calculateScores(
+  evidence: readonly QualificationEvidence[],
+  maximums: Readonly<Record<QualificationDimension, number>>,
+): QualificationScores {
   const scores: Record<QualificationDimension, number> = {
     preparation: 0, socialAuthenticity: 0, onchainHealth: 0,
   };
   for (const item of evidence) {
     if (item.status === 'SATISFIED') scores[item.dimension] += item.weight;
   }
-  const preparation = score(scores.preparation, DIMENSION_MAXIMUMS.preparation);
-  const socialAuthenticity = score(scores.socialAuthenticity, DIMENSION_MAXIMUMS.socialAuthenticity);
-  const onchainHealth = score(scores.onchainHealth, DIMENSION_MAXIMUMS.onchainHealth);
+  const preparation = score(scores.preparation, maximums.preparation);
+  const socialAuthenticity = score(scores.socialAuthenticity, maximums.socialAuthenticity);
+  const onchainHealth = score(scores.onchainHealth, maximums.onchainHealth);
   return freeze({
     preparation,
     socialAuthenticity,
@@ -194,6 +164,10 @@ function score(value: number, maximum: number): QualificationScore {
   return freeze({ score: value, maximum });
 }
 
+function legacyBlockers(codes: readonly QualificationReasonCode[]): readonly QualificationReasonCode[] {
+  return freeze([...codes]);
+}
+
 function createBlockers(codes: readonly QualificationReasonCode[]): readonly QualificationBlocker[] {
   const uniqueCodes = [...new Set(codes)];
   for (const code of uniqueCodes) {
@@ -201,12 +175,24 @@ function createBlockers(codes: readonly QualificationReasonCode[]): readonly Qua
       throw new QualificationConfigurationError(`Reason code de qualification inconnu: ${code}.`);
     }
   }
-  return uniqueCodes.map((code) => freeze({ code, message: blockerMessage(code) }));
+  return uniqueCodes.map((code) => freeze({ code, message: `Condition éliminatoire active: ${code}.` }));
 }
 
-function blockerMessage(code: QualificationReasonCode): string {
-  return `Condition éliminatoire active: ${code}.`;
+function noCalibrationFacts(): QualificationCalibrationFacts {
+  return EMPTY_CALIBRATION_FACTS;
 }
+
+const EMPTY_CALIBRATION_FACTS: QualificationCalibrationFacts = freeze({
+  top1HolderBps: null,
+  top5HoldersBps: null,
+  top10HoldersBps: null,
+  maximumRelatedClusterBps: null,
+  maximumSharedFunderCount: null,
+  buySimulationSucceeded: null,
+  sellQuoteAvailable: null,
+  roundTripLossBps: null,
+  upstreamConditions: freeze([]),
+});
 
 function freeze<T>(value: T): T {
   if (typeof value === 'object' && value !== null) Object.freeze(value);
