@@ -42,12 +42,12 @@ export function evaluateQualificationConditions(
 function evaluate(code: QualificationReasonCode, policy: QualificationConditionPolicy, facts: QualificationCalibrationFacts, upstream: ReadonlyMap<QualificationReasonCode, boolean>, legacy: ReadonlySet<QualificationReasonCode>): QualificationConditionEvidence {
   if (policy.mode === 'DISABLED') return evidence(code, policy.mode, 'DISABLED', {}, {}, 'Condition disabled.');
   switch (code) {
-    case 'HOLDER_CONCENTRATION_EXCEEDED': return triggeredByLegacy(holder(policy, facts), legacy.has(code));
-    case 'RELATED_WALLET_CLUSTER_EXCEEDED': return triggeredByLegacy(maximum(code, policy.mode, facts.maximumRelatedClusterBps, policy.maximumClusterBps, 'maximumRelatedClusterBps', 'maximumClusterBps', 'Related wallet cluster exceeds the configured threshold.'), legacy.has(code));
-    case 'SHARED_FUNDER_CLUSTER': return triggeredByLegacy(minimum(policy, facts.maximumSharedFunderCount), legacy.has(code));
-    case 'BUY_SIMULATION_FAILED': return triggeredByLegacy(booleanCondition(code, policy.mode, facts.buySimulationSucceeded, 'buySimulationSucceeded', 'Buy simulation failed.'), legacy.has(code));
-    case 'SELL_QUOTE_UNAVAILABLE': return triggeredByLegacy(booleanCondition(code, policy.mode, facts.sellQuoteAvailable, 'sellQuoteAvailable', 'Sell quote is unavailable.'), legacy.has(code));
-    case 'ROUND_TRIP_LOSS_EXCEEDED': return triggeredByLegacy(maximum(code, policy.mode, facts.roundTripLossBps, policy.maximumRoundTripLossBps, 'roundTripLossBps', 'maximumRoundTripLossBps', 'Perte aller-retour supérieure au seuil configuré.'), legacy.has(code));
+    case 'HOLDER_CONCENTRATION_EXCEEDED': return triggeredByTrustedSource(holder(policy, facts), upstream.get(code), legacy.has(code));
+    case 'RELATED_WALLET_CLUSTER_EXCEEDED': return triggeredByTrustedSource(maximum(code, policy.mode, facts.maximumRelatedClusterBps, policy.maximumClusterBps, 'maximumRelatedClusterBps', 'maximumClusterBps', 'Related wallet cluster exceeds the configured threshold.'), upstream.get(code), legacy.has(code));
+    case 'SHARED_FUNDER_CLUSTER': return triggeredByTrustedSource(minimum(policy, facts.maximumSharedFunderCount), upstream.get(code), legacy.has(code));
+    case 'BUY_SIMULATION_FAILED': return triggeredByTrustedSource(booleanCondition(code, policy.mode, facts.buySimulationSucceeded, 'buySimulationSucceeded', 'Buy simulation failed.'), upstream.get(code), legacy.has(code));
+    case 'SELL_QUOTE_UNAVAILABLE': return triggeredByTrustedSource(booleanCondition(code, policy.mode, facts.sellQuoteAvailable, 'sellQuoteAvailable', 'Sell quote is unavailable.'), upstream.get(code), legacy.has(code));
+    case 'ROUND_TRIP_LOSS_EXCEEDED': return triggeredByTrustedSource(maximum(code, policy.mode, facts.roundTripLossBps, policy.maximumRoundTripLossBps, 'roundTripLossBps', 'maximumRoundTripLossBps', 'Perte aller-retour supérieure au seuil configuré.'), upstream.get(code), legacy.has(code));
     default: {
       const triggered = legacy.has(code) ? true : upstream.get(code);
       return evidence(code, policy.mode, triggered === true ? 'TRIGGERED' : triggered === false ? 'PASSED' : 'UNKNOWN', {}, {}, triggered === true ? 'Upstream condition triggered.' : triggered === false ? 'Upstream condition passed.' : 'Upstream condition is unavailable.');
@@ -104,8 +104,9 @@ function validatedLegacyCodes(value: readonly QualificationReasonCode[]): Readon
   return result;
 }
 
-function triggeredByLegacy(condition: QualificationConditionEvidence, triggered: boolean): QualificationConditionEvidence {
-  return triggered ? evidence(condition.code, condition.mode, 'TRIGGERED', condition.observed, condition.thresholds, 'Legacy condition triggered.') : condition;
+function triggeredByTrustedSource(condition: QualificationConditionEvidence, upstream: boolean | undefined, legacy: boolean): QualificationConditionEvidence {
+  if (upstream === true) return evidence(condition.code, condition.mode, 'TRIGGERED', condition.observed, condition.thresholds, 'Upstream condition triggered.');
+  return legacy ? evidence(condition.code, condition.mode, 'TRIGGERED', condition.observed, condition.thresholds, 'Legacy condition triggered.') : condition;
 }
 
 function denseFrozenArray(value: unknown, name: string): readonly unknown[] {

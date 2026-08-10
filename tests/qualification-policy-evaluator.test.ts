@@ -137,6 +137,62 @@ void test('uses contract evidence keys and lets legacy triggers override passing
   assert.deepEqual(result.blockers, ['HOLDER_CONCENTRATION_EXCEEDED', 'RELATED_WALLET_CLUSTER_EXCEEDED', 'ROUND_TRIP_LOSS_EXCEEDED']);
 });
 
+void test('lets authoritative upstream triggers override local results for all calibrated conditions', () => {
+  const calibrated = profile({
+    HOLDER_CONCENTRATION_EXCEEDED: { mode: 'ENFORCED', maximumTop1Bps: 100, maximumTop5Bps: 200, maximumTop10Bps: 300 },
+    RELATED_WALLET_CLUSTER_EXCEEDED: { mode: 'ENFORCED', maximumClusterBps: 400 },
+    SHARED_FUNDER_CLUSTER: { mode: 'ENFORCED', minimumSharedFunders: 2 },
+    BUY_SIMULATION_FAILED: { mode: 'ENFORCED' },
+    SELL_QUOTE_UNAVAILABLE: { mode: 'ENFORCED' },
+    ROUND_TRIP_LOSS_EXCEEDED: { mode: 'ENFORCED', maximumRoundTripLossBps: 3000 },
+  });
+  const calibratedCodes = [
+    'HOLDER_CONCENTRATION_EXCEEDED',
+    'RELATED_WALLET_CLUSTER_EXCEEDED',
+    'SHARED_FUNDER_CLUSTER',
+    'BUY_SIMULATION_FAILED',
+    'SELL_QUOTE_UNAVAILABLE',
+    'ROUND_TRIP_LOSS_EXCEEDED',
+  ] as const;
+  const result = evaluateQualificationConditions(calibrated, facts({
+    top1HolderBps: 100n,
+    top5HoldersBps: 200n,
+    top10HoldersBps: 300n,
+    maximumRelatedClusterBps: 400n,
+    maximumSharedFunderCount: 1,
+    buySimulationSucceeded: null,
+    sellQuoteAvailable: true,
+    roundTripLossBps: 3000n,
+    upstreamConditions: Object.freeze(calibratedCodes.map((code) => Object.freeze({ code, triggered: true }))),
+  }), Object.freeze([]));
+
+  for (const code of calibratedCodes) assert.equal(condition(result, code).status, 'TRIGGERED');
+  assert.deepEqual(result.blockers, calibratedCodes);
+});
+
+void test('does not let upstream false mask calibrated or legacy triggers and still honors disabled mode', () => {
+  const calibrated = profile({
+    BUY_SIMULATION_FAILED: { mode: 'DISABLED' },
+    SELL_QUOTE_UNAVAILABLE: { mode: 'ENFORCED' },
+    ROUND_TRIP_LOSS_EXCEEDED: { mode: 'ENFORCED', maximumRoundTripLossBps: 3000 },
+  });
+  const result = evaluateQualificationConditions(calibrated, facts({
+    buySimulationSucceeded: false,
+    sellQuoteAvailable: false,
+    roundTripLossBps: 3000n,
+    upstreamConditions: Object.freeze([
+      Object.freeze({ code: 'BUY_SIMULATION_FAILED', triggered: true }),
+      Object.freeze({ code: 'SELL_QUOTE_UNAVAILABLE', triggered: false }),
+      Object.freeze({ code: 'ROUND_TRIP_LOSS_EXCEEDED', triggered: false }),
+    ]),
+  }), Object.freeze(['ROUND_TRIP_LOSS_EXCEEDED']));
+
+  assert.equal(condition(result, 'BUY_SIMULATION_FAILED').status, 'DISABLED');
+  assert.equal(condition(result, 'SELL_QUOTE_UNAVAILABLE').status, 'TRIGGERED');
+  assert.equal(condition(result, 'ROUND_TRIP_LOSS_EXCEEDED').status, 'TRIGGERED');
+  assert.deepEqual(result.blockers, ['SELL_QUOTE_UNAVAILABLE', 'ROUND_TRIP_LOSS_EXCEEDED']);
+});
+
 void test('uses stable legacy reason ordering and returns deeply frozen safe results', () => {
   const legacy = Object.freeze(['METADATA_FETCH_FAILED', 'CREATOR_EARLY_SELL', 'METADATA_FETCH_FAILED'] as QualificationReasonCode[]);
   const result = evaluateQualificationConditions(profile({ METADATA_FETCH_FAILED: { mode: 'ENFORCED' } }), facts(), legacy);
