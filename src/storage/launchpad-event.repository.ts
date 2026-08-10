@@ -184,6 +184,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     if (event.type === 'TokenLaunchDetected') {
       if (transition === undefined) throw conflict('identity');
       await this.writeLaunch(client, rawId, event, transition);
+      await reconcileSocialFinality(client, event.id, status);
     }
     else await this.writeTrade(client, event, status);
     return outcome;
@@ -265,6 +266,17 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
         error_code=NULL,terminal_at=$2,purge_after=$3,updated_at=$2
         WHERE source_launch_event_id=$1
           AND status IN ('PENDING','PROCESSING','RETRYABLE_FAILED')`, [event.id,terminalAt,purgeAfter]);
+      await client.query(`UPDATE token_metadata_snapshots metadata SET purge_after=$2
+        FROM social_evidence_collections collection
+        WHERE collection.source_launch_event_id=$1
+          AND metadata.snapshot_id=collection.metadata_snapshot_id`, [event.id,purgeAfter]);
+      await client.query(`UPDATE social_evidence_collections SET
+        confirmation_status='orphaned',terminal_at=$2,purge_after=$3
+        WHERE source_launch_event_id=$1`, [event.id,terminalAt,purgeAfter]);
+      await client.query(`UPDATE domain_events SET confirmation_status='orphaned',
+        terminal_at=$2,purge_after=$3
+        WHERE type='SocialEvidenceCollected'
+          AND payload->>'sourceLaunchEventId'=$1`, [event.id,terminalAt,purgeAfter]);
       await exact(client, 'UPDATE state_transitions SET terminal_at=$2,purge_after=$3 WHERE event_id=$1', [event.id,terminalAt,purgeAfter]);
       await exact(client, 'UPDATE token_launches SET current_state=\'RETRACTED\',terminal_at=$2,purge_after=$3,updated_at=$2 WHERE mint=$1', [event.mint,terminalAt,purgeAfter]);
     } else await exact(client, `UPDATE launch_trades SET confirmation_status='orphaned',purge_after=$2 WHERE trade_id=$1`, [event.payload.trade.id,purgeAfter]);
@@ -275,6 +287,19 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     const terminal = this.now();
     return [new Date(terminal),new Date(terminal + this.retentionHours*3_600_000)];
   }
+}
+
+async function reconcileSocialFinality(
+  client: Client,
+  sourceLaunchEventId: string,
+  status: Exclude<ChainConfirmationStatus, 'orphaned'>,
+): Promise<void> {
+  await client.query(`UPDATE social_evidence_collections SET confirmation_status=$2
+    WHERE source_launch_event_id=$1 AND confirmation_status <> $2`, [sourceLaunchEventId,status]);
+  await client.query(`UPDATE domain_events SET confirmation_status=$2
+    WHERE type='SocialEvidenceCollected'
+      AND payload->>'sourceLaunchEventId'=$1
+      AND confirmation_status <> $2`, [sourceLaunchEventId,status]);
 }
 
 async function enqueueSocialJob(
