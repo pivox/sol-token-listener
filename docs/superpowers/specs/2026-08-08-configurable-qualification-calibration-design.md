@@ -55,6 +55,12 @@ objects and dense arrays, rejects unknown or duplicate semantic fields, and
 uses typed redacted errors. Error output never includes file content, an
 absolute path, an RPC endpoint, or environment values.
 
+The shared runtime and packaging parser decodes UTF-8 strictly and validates
+raw JSON iteratively before materialization. It rejects malformed syntax,
+duplicate decoded object keys at every depth, depth above 64, and more than
+10,000 value nodes as `PROFILE_JSON_INVALID`; escaped and literal spellings of
+the same key are duplicates.
+
 ## Score model
 
 Score rules retain the existing fields:
