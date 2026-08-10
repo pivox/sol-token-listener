@@ -7,7 +7,7 @@ import { reconcileConfirmationStatus } from '../domain/confirmation-status.js';
 import { reconcileTransitionOccurrence } from '../domain/state-transitions.js';
 import type { InitialDetectedStateTransition } from '../domain/state-transitions.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
-import type { LaunchpadTrade, TokenLaunch } from '../domain/types.js';
+import type { LaunchParameterObject, LaunchpadTrade, TokenLaunch } from '../domain/types.js';
 import {
   assertValidLaunchpadEventBatch,
   type EventRecordOutcome,
@@ -183,7 +183,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     await this.writeDomain(client, rawId, event, status);
     if (event.type === 'TokenLaunchDetected') {
       if (transition === undefined) throw conflict('identity');
-      await this.writeLaunch(client, event, transition);
+      await this.writeLaunch(client, rawId, event, transition);
     }
     else await this.writeTrade(client, event, status);
     return outcome;
@@ -207,6 +207,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
 
   private async writeLaunch(
     client: Client,
+    rawId: string,
     event: Extract<LaunchpadObservationEventV1, {type: 'TokenLaunchDetected'}>,
     transition: InitialDetectedStateTransition,
   ): Promise<void> {
@@ -227,6 +228,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
       launch.createdAt.instructionIndex,launch.createdAt.innerInstructionIndex,new Date(event.blockchainTimeMs ?? event.observedAtMs)]);
     requireOne(result);
     await writeTransition(client, transition);
+    await enqueueSocialJob(client, rawId, event);
   }
 
   private async writeTrade(client: Client, event: Extract<LaunchpadObservationEventV1,{type:'BondingCurveTradeObserved'}>, status: ChainConfirmationStatus): Promise<void> {
@@ -258,6 +260,11 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     const [terminalAt, purgeAfter] = terminal;
       await exact(client, `UPDATE domain_events SET confirmation_status='orphaned',terminal_at=$2,purge_after=$3 WHERE event_id=$1`, [event.id,terminalAt,purgeAfter]);
     if (event.type === 'TokenLaunchDetected') {
+      await client.query(`UPDATE social_enrichment_jobs SET
+        status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+        error_code=NULL,terminal_at=$2,purge_after=$3,updated_at=$2
+        WHERE source_launch_event_id=$1
+          AND status IN ('PENDING','PROCESSING','RETRYABLE_FAILED')`, [event.id,terminalAt,purgeAfter]);
       await exact(client, 'UPDATE state_transitions SET terminal_at=$2,purge_after=$3 WHERE event_id=$1', [event.id,terminalAt,purgeAfter]);
       await exact(client, 'UPDATE token_launches SET current_state=\'RETRACTED\',terminal_at=$2,purge_after=$3,updated_at=$2 WHERE mint=$1', [event.mint,terminalAt,purgeAfter]);
     } else await exact(client, `UPDATE launch_trades SET confirmation_status='orphaned',purge_after=$2 WHERE trade_id=$1`, [event.payload.trade.id,purgeAfter]);
@@ -268,6 +275,71 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     const terminal = this.now();
     return [new Date(terminal),new Date(terminal + this.retentionHours*3_600_000)];
   }
+}
+
+async function enqueueSocialJob(
+  client: Client,
+  rawId: string,
+  event: Extract<LaunchpadObservationEventV1, { type: 'TokenLaunchDetected' }>,
+): Promise<void> {
+  const metadataUri = ownMetadataUri(event.payload.launch.parameters);
+  const jobId = createRepositoryId('social_job', [event.mint, event.id]);
+  const inputFingerprint = repositoryDigest('social_job_input', [
+    event.mint,
+    event.id,
+    rawId,
+    metadataUri,
+  ]);
+  const existing = await client.query(`SELECT job_id,mint,source_launch_event_id,
+    source_raw_event_id,metadata_uri,input_fingerprint,max_attempts,base_delay_ms
+    FROM social_enrichment_jobs
+    WHERE job_id=$1 OR (mint=$2 AND source_launch_event_id=$3)
+    FOR UPDATE`, [jobId, event.mint, event.id]);
+  if (existing.rows.length > 1) throw conflict('identity');
+  if (existing.rows[0] !== undefined) assertSocialJobMatches(existing.rows[0], {
+    job_id: jobId,
+    mint: event.mint,
+    source_launch_event_id: event.id,
+    source_raw_event_id: rawId,
+    metadata_uri: metadataUri,
+    input_fingerprint: inputFingerprint,
+    max_attempts: 5,
+    base_delay_ms: 500,
+  });
+  const createdAt = new Date(event.observedAtMs);
+  const inserted = await client.query(`INSERT INTO social_enrichment_jobs (
+    job_id,mint,source_launch_event_id,source_raw_event_id,metadata_uri,
+    input_fingerprint,status,attempts,attempts_in_cycle,max_attempts,
+    base_delay_ms,created_at,updated_at
+  ) VALUES ($1,$2,$3,$4,$5,$6,'PENDING',0,0,5,500,$7,$7)
+  ON CONFLICT (job_id) DO UPDATE SET job_id=EXCLUDED.job_id
+  RETURNING job_id`, [
+    jobId,event.mint,event.id,rawId,metadataUri,inputFingerprint,createdAt,
+  ]);
+  requireOne(inserted);
+}
+
+function ownMetadataUri(parameters: LaunchParameterObject): string | null {
+  const descriptor = Object.getOwnPropertyDescriptor(parameters, 'uri');
+  if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return null;
+  return typeof descriptor.value === 'string' && descriptor.value !== '' ? descriptor.value : null;
+}
+
+function repositoryDigest(
+  namespace: string,
+  values: readonly (string | number | bigint | null)[],
+): string {
+  const value = createRepositoryId(namespace, values);
+  return value.slice(namespace.length + 1);
+}
+
+function assertSocialJobMatches(
+  row: unknown,
+  expected: Readonly<Record<string, unknown>>,
+): void {
+  const record = optionalRecord(row);
+  if (record === null) throw conflict('identity');
+  assertExactColumns(record, expected);
 }
 
 function rawSnapshot(event: LaunchpadObservationEventV1): object {
