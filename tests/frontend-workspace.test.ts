@@ -35,6 +35,11 @@ void test('declares an isolated read-only frontend workspace', async () => {
     '28.1.0',
     'jsdom must support the declared Node >=22.12 runtime and current Node releases',
   );
+  assert.equal(
+    root.devDependencies?.jsdom,
+    '28.1.0',
+    'hoisted Vitest must be able to resolve the workspace jsdom environment',
+  );
 
   for (const dependency of Object.keys(frontend.dependencies ?? {})) {
     assert.equal(dependency.includes('solana'), false);
