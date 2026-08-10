@@ -51,11 +51,15 @@ des millisecondes entières canoniques. Les objets produits sont gelés.
 - d’un `PaperTradingRepository` ;
 - de l’`EffectiveQualificationProfile` déjà chargé, injecté comme autorité de
   politique sans rechargement ni I/O implicite ;
+- d’une `QualificationReportAuthority` process-local, fournie par le même
+  `QualificationEngine` qui évalue les rapports ;
 - d’une horloge injectée pour des tests déterministes.
 
 L’ouverture exige :
 
 - `EXECUTION_MODE=paper` ;
+- la référence exacte d’un rapport émis par l’autorité injectée : une copie,
+  une reconstruction ou un rapport désérialisé est refusé avant transaction ;
 - un rapport `QUALIFIED` sans blocker ;
 - une identité de ruleset (id, version, statut, fingerprint et score minimum),
   des modes de conditions et des seuils identiques au profil effectif injecté ;
@@ -66,6 +70,13 @@ L’ouverture exige :
 
 Le moteur remplit au `minimumAmountOutRaw`. Il ne promet donc ni prix réel, ni
 sellabilité, ni profit.
+
+L’autorisation de rapport est volontairement non sérialisable et ne survit pas
+au redémarrage du processus. Après restart, l’appelant doit reconstruire les
+inputs depuis des sources de confiance et les réévaluer avec le
+`QualificationEngine` injecté. Le paper trading n’étant pas encore composé dans
+le bootstrap de production, cette contrainte devra être respectée par sa future
+composition, sans relecture implicite de profil dans le moteur paper.
 
 La fermeture vend exactement la quantité paper encore détenue et utilise
 également `minimumAmountOutRaw`. La V1 ferme la position entièrement.

@@ -35,6 +35,7 @@ import type {
   PaperTradingRepository,
   PaperTradingTransaction,
 } from '../ports/paper-trading-repository.js';
+import type { QualificationReportAuthority } from '../ports/qualification-report-authority.js';
 import { stringifyJson } from '../utils/json.js';
 import { calculateRoundTrip, validatePaperQuote } from './paper-math.js';
 
@@ -52,6 +53,7 @@ export class PaperTradingEngine {
     private readonly config: PaperTradingConfig,
     private readonly repository: PaperTradingRepository,
     private readonly qualificationProfile: EffectiveQualificationProfile,
+    private readonly qualificationReportAuthority: QualificationReportAuthority,
     private readonly clock: Clock = { now: Date.now },
   ) {
     if (!Number.isSafeInteger(config.dataRetentionHours) || config.dataRetentionHours <= 0) {
@@ -62,7 +64,9 @@ export class PaperTradingEngine {
 
   public async open(command: OpenPaperPositionCommand): Promise<PaperPosition> {
     this.requirePaperMode();
-    const snapshot = snapshotOpenCommand(command);
+    const qualification: unknown = command.qualification;
+    if (!this.qualificationReportAuthority.isAuthorized(qualification)) invalidQualification();
+    const snapshot = snapshotOpenCommand(command, qualification);
     validateOpenCommand(
       snapshot,
       this.config.paperQuoteMintAllowlist,
@@ -477,7 +481,10 @@ function rejectOrphanedTrigger(trigger: DomainEvent): void {
   }
 }
 
-function snapshotOpenCommand(command: OpenPaperPositionCommand): OpenPaperPositionCommand {
+function snapshotOpenCommand(
+  command: OpenPaperPositionCommand,
+  qualification: QualificationReport,
+): OpenPaperPositionCommand {
   return freeze({
     mint: command.mint,
     quoteAsset: freeze({
@@ -490,7 +497,7 @@ function snapshotOpenCommand(command: OpenPaperPositionCommand): OpenPaperPositi
       version: command.strategy.version,
     }),
     trigger: snapshotTrigger(command.trigger),
-    qualification: snapshotQualification(command.qualification),
+    qualification: snapshotQualification(qualification),
     buyQuote: snapshotQuote(command.buyQuote),
     reverseSellQuote: snapshotQuote(command.reverseSellQuote),
     maximumRoundTripLossBps: command.maximumRoundTripLossBps,

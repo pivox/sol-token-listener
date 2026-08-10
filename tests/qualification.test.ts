@@ -219,6 +219,16 @@ void test('qualifie un lancement dont les trois dimensions atteignent le seuil',
   assert.equal(report.scores.total.maximum, 100);
 });
 
+void test('authorizes only the exact reports emitted by the same qualification engine', () => {
+  const engine = new QualificationEngine(defaultQualificationRuleSet);
+  const otherEngine = new QualificationEngine(defaultQualificationRuleSet);
+  const report = engine.evaluate(completeInput());
+
+  assert.equal(engine.isAuthorized(report), true);
+  assert.equal(engine.isAuthorized(structuredClone(report)), false);
+  assert.equal(otherEngine.isAuthorized(report), false);
+});
+
 void test('rejette un lancement bloqué indépendamment du score', () => {
   const report = new QualificationEngine(defaultQualificationRuleSet).evaluate({
     evaluatedAtMs: 1,

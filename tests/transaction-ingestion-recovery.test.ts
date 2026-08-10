@@ -574,20 +574,19 @@ async function launchState(pool: InstanceType<typeof pg.Pool>): Promise<string |
 
 async function assertPaperSafety(pool: InstanceType<typeof pg.Pool>): Promise<void> {
   const repository = new PostgresPaperTradingRepository(pool);
+  const profile = createDefaultQualificationRuleSet(60);
+  const authority = new QualificationEngine(profile);
   await assert.rejects(
     new PaperTradingEngine({
       executionMode: 'observe', paperQuoteMintAllowlist: ['SOL'], dataRetentionHours: 4,
-    }, repository, createDefaultQualificationRuleSet(60)).open({} as OpenPaperPositionCommand),
+    }, repository, profile, authority).open({} as OpenPaperPositionCommand),
     hasCode('PAPER_MODE_DISABLED'),
   );
-  const watchlisted = openCommand();
+  const watchlisted = openCommand(authority, false);
   await assert.rejects(
     new PaperTradingEngine({
       executionMode: 'paper', paperQuoteMintAllowlist: ['SOL'], dataRetentionHours: 4,
-    }, repository, createDefaultQualificationRuleSet(60)).open({
-      ...watchlisted,
-      qualification: { ...watchlisted.qualification, verdict: 'WATCHLISTED' },
-    }),
+    }, repository, profile, authority).open(watchlisted),
     hasCode('QUALIFICATION_NOT_ACCEPTED'),
   );
 }
@@ -610,10 +609,13 @@ async function insertProcessed(
   );
 }
 
-function openCommand(): OpenPaperPositionCommand {
-  const qualification = new QualificationEngine(createDefaultQualificationRuleSet(60)).evaluate({
+function openCommand(
+  authority: QualificationEngine,
+  imageValid = true,
+): OpenPaperPositionCommand {
+  const qualification = authority.evaluate({
     evaluatedAtMs: 1,
-    signals: { imageValid: true, socialCrossLinkConfirmed: true, creatorHasNotSold: true },
+    signals: { imageValid, socialCrossLinkConfirmed: true, creatorHasNotSold: true },
     blockers: [],
     calibrationFacts: null,
   });

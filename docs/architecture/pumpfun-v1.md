@@ -102,9 +102,13 @@ bootstrap -> composition observation-only
 | API HTTP/SSE | projections publiques V1, non authentifiées et en lecture seule |
 
 Le `PaperTradingEngine` reçoit l’`EffectiveQualificationProfile` déjà chargé
-comme autorité. Il ne relit aucun fichier : avant toute transaction paper, il
-compare l’identité du ruleset ainsi que les modes et seuils des conditions du
-rapport aux policies de ce profil.
+comme autorité de politique et une `QualificationReportAuthority` process-local
+portée par le `QualificationEngine` qui produit les rapports. Il ne relit aucun
+fichier : avant toute transaction paper, il exige la référence exacte d’un
+rapport autorisé, puis compare l’identité du ruleset ainsi que les modes et
+seuils des conditions aux policies du profil. Une copie ou désérialisation est
+donc refusée. Après redémarrage, les inputs de confiance doivent être réévalués ;
+le paper trading n’est pas encore composé dans le bootstrap de production.
 
 ### Analytics participants I1
 

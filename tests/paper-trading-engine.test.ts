@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { EffectiveQualificationProfile } from '../src/domain/qualification.js';
+import type {
+  EffectiveQualificationProfile,
+  QualificationEvaluationInput,
+  QualificationReport,
+} from '../src/domain/qualification.js';
 import type {
   ClosePaperPositionCommand,
   OpenPaperPositionCommand,
@@ -14,6 +18,7 @@ import type {
   PaperTradingRepository,
   PaperTradingTransaction,
 } from '../src/ports/paper-trading-repository.js';
+import type { QualificationReportAuthority } from '../src/ports/qualification-report-authority.js';
 import { PaperTradingEngine } from '../src/paper/paper-trading-engine.js';
 import {
   createDefaultQualificationRuleSet,
@@ -24,6 +29,8 @@ import type { ChainConfirmationStatus } from '../src/domain/types.js';
 
 // Golden captured by executing this file's exact open-command fixture with origin/main.
 const LEGACY_OPEN_COMMAND_HASH = 'paper_open_command_553d5ff67f95f9b3779d79d66fabc2f19a019d43b33e45933ed69522d2568ab5';
+const TEST_QUALIFICATION_PROFILE = createDefaultQualificationRuleSet(60);
+const TEST_QUALIFICATION_AUTHORITY = new QualificationEngine(TEST_QUALIFICATION_PROFILE);
 
 void test('refuse le mode observe sans écriture', async () => {
   const repository = new MemoryPaperRepository();
@@ -33,7 +40,7 @@ void test('refuse le mode observe sans écriture', async () => {
   assert.equal(repository.writeCount, 0);
 });
 
-void test('ouvre une position au fill conservateur et rejoue sans doublon', async () => {
+void test('ouvre avec le rapport exact produit par l’autorité et rejoue sans doublon', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
   const command = openCommand();
@@ -100,13 +107,16 @@ void test('rejoue une position déjà terminale devenue visible après le verrou
 
 void test('refuse une qualification non acceptée', async () => {
   const repository = new MemoryPaperRepository();
-  const command = openCommand();
+  const command = openCommand(TEST_QUALIFICATION_AUTHORITY, {
+    signals: {
+      imageValid: false,
+      socialCrossLinkConfirmed: true,
+      creatorHasNotSold: true,
+    },
+  });
 
   await assert.rejects(
-    makeEngine(repository, 'paper').open({
-      ...command,
-      qualification: { ...command.qualification, verdict: 'WATCHLISTED' },
-    }),
+    makeEngine(repository, 'paper').open(command),
     hasCode('QUALIFICATION_NOT_ACCEPTED'),
   );
   assert.equal(repository.writeCount, 0);
@@ -114,23 +124,12 @@ void test('refuse une qualification non acceptée', async () => {
 
 void test('refuse une qualification cohérente mais bloquée', async () => {
   const repository = new MemoryPaperRepository();
-  const command = openCommand();
+  const command = openCommand(TEST_QUALIFICATION_AUTHORITY, {
+    blockers: ['CREATOR_EARLY_SELL'],
+  });
 
   await assert.rejects(
-    makeEngine(repository, 'paper').open({
-      ...command,
-      qualification: {
-        ...command.qualification,
-        conditions: command.qualification.conditions.map((item) => item.code === 'CREATOR_EARLY_SELL'
-          ? { ...item, status: 'TRIGGERED' }
-          : item),
-        blockers: [{
-          code: 'CREATOR_EARLY_SELL',
-          message: 'Condition éliminatoire active.',
-        }],
-        verdict: 'REJECTED',
-      },
-    }),
+    makeEngine(repository, 'paper').open(command),
     hasCode('QUALIFICATION_BLOCKED'),
   );
   assert.equal(repository.writeCount, 0);
@@ -153,9 +152,15 @@ void test('rejects incomplete, duplicate, reordered, and invalid qualification c
 
   for (const invalidConditions of candidates) {
     const repository = new MemoryPaperRepository();
-    await assert.rejects(makeEngine(repository, 'paper').open({
+    const qualification = { ...command.qualification, conditions: invalidConditions };
+    await assert.rejects(makeEngine(
+      repository,
+      'paper',
+      TEST_QUALIFICATION_PROFILE,
+      exactReportsAuthority(qualification),
+    ).open({
       ...command,
-      qualification: { ...command.qualification, conditions: invalidConditions },
+      qualification,
     }), hasCode('QUALIFICATION_INVALID'));
     assert.equal(repository.writeCount, 0);
   }
@@ -176,7 +181,12 @@ void test('rejects qualification condition, blocker, and verdict inconsistencies
 
   for (const qualification of candidates) {
     const repository = new MemoryPaperRepository();
-    await assert.rejects(makeEngine(repository, 'paper').open({
+    await assert.rejects(makeEngine(
+      repository,
+      'paper',
+      TEST_QUALIFICATION_PROFILE,
+      exactReportsAuthority(qualification),
+    ).open({
       ...command,
       qualification,
     }), hasCode('QUALIFICATION_INVALID'));
@@ -186,33 +196,96 @@ void test('rejects qualification condition, blocker, and verdict inconsistencies
 
 void test('accepts a coherent triggered report-only condition without inventing a blocker', async () => {
   const repository = new MemoryPaperRepository();
-  const command = openCommand();
-  const position = await makeEngine(repository, 'paper').open({
-    ...command,
-    qualification: {
-      ...command.qualification,
-      conditions: command.qualification.conditions.map((item) => item.code === 'MINT_SOCIAL_MISMATCH'
-        ? { ...item, status: 'TRIGGERED' }
-        : item),
-    },
+  const command = openCommand(TEST_QUALIFICATION_AUTHORITY, {
+    blockers: ['MINT_SOCIAL_MISMATCH'],
   });
+  const position = await makeEngine(repository, 'paper').open(command);
 
   assert.equal(position.status, 'PAPER_HOLDING');
   assert.equal(repository.writeCount, 1);
 });
 
-void test('rejects an enforced condition downgraded to report-only before writing', async () => {
+void test('rejects an identical cloned qualification report before writing', async () => {
   const repository = new MemoryPaperRepository();
   const command = openCommand();
 
   await assert.rejects(makeEngine(repository, 'paper').open({
     ...command,
-    qualification: {
+    qualification: structuredClone(command.qualification),
+  }), hasCode('QUALIFICATION_INVALID'));
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('rejects a cloned coherent rejected report before writing', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand(TEST_QUALIFICATION_AUTHORITY, {
+    blockers: ['CREATOR_EARLY_SELL'],
+  });
+
+  await assert.rejects(makeEngine(repository, 'paper').open({
+    ...command,
+    qualification: structuredClone(command.qualification),
+  }), hasCode('QUALIFICATION_INVALID'));
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('rejects a verdict-only watchlisted clone before writing', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand();
+
+  await assert.rejects(makeEngine(repository, 'paper').open({
+    ...command,
+    qualification: { ...command.qualification, verdict: 'WATCHLISTED' },
+  }), hasCode('QUALIFICATION_INVALID'));
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('rejects evidence and score clones before writing', async () => {
+  const command = openCommand();
+  const candidates = [
+    {
       ...command.qualification,
-      conditions: command.qualification.conditions.map((item) => item.code === 'CREATOR_EARLY_SELL'
-        ? { ...item, mode: 'REPORT_ONLY' as const, status: 'TRIGGERED' as const }
+      evidence: command.qualification.evidence.map((item, index) => index === 0
+        ? { ...item, message: 'Forged evidence.' }
         : item),
     },
+    {
+      ...command.qualification,
+      scores: {
+        ...command.qualification.scores,
+        total: { ...command.qualification.scores.total, score: 100 },
+      },
+    },
+  ];
+
+  for (const qualification of candidates) {
+    const repository = new MemoryPaperRepository();
+    await assert.rejects(makeEngine(repository, 'paper').open({
+      ...command,
+      qualification,
+    }), hasCode('QUALIFICATION_INVALID'));
+    assert.equal(repository.writeCount, 0);
+  }
+});
+
+void test('rejects an enforced condition downgraded to report-only before writing', async () => {
+  const repository = new MemoryPaperRepository();
+  const command = openCommand();
+  const qualification = {
+    ...command.qualification,
+    conditions: command.qualification.conditions.map((item) => item.code === 'CREATOR_EARLY_SELL'
+      ? { ...item, mode: 'REPORT_ONLY' as const, status: 'TRIGGERED' as const }
+      : item),
+  };
+
+  await assert.rejects(makeEngine(
+    repository,
+    'paper',
+    TEST_QUALIFICATION_PROFILE,
+    exactReportsAuthority(qualification),
+  ).open({
+    ...command,
+    qualification,
   }), hasCode('QUALIFICATION_INVALID'));
   assert.equal(repository.writeCount, 0);
 });
@@ -220,9 +293,15 @@ void test('rejects an enforced condition downgraded to report-only before writin
 void test('rejects a report from a different effective profile before writing', async () => {
   const repository = new MemoryPaperRepository();
   const foreignProfile = createDefaultQualificationRuleSet(59);
+  const foreignAuthority = new QualificationEngine(foreignProfile);
 
   await assert.rejects(
-    makeEngine(repository, 'paper').open(openCommand(foreignProfile)),
+    makeEngine(
+      repository,
+      'paper',
+      TEST_QUALIFICATION_PROFILE,
+      foreignAuthority,
+    ).open(openCommand(foreignAuthority)),
     hasCode('QUALIFICATION_INVALID'),
   );
   assert.equal(repository.writeCount, 0);
@@ -231,15 +310,21 @@ void test('rejects a report from a different effective profile before writing', 
 void test('rejects condition thresholds that differ from the trusted profile before writing', async () => {
   const repository = new MemoryPaperRepository();
   const command = openCommand();
+  const qualification = {
+    ...command.qualification,
+    conditions: command.qualification.conditions.map((item) => item.code === 'ROUND_TRIP_LOSS_EXCEEDED'
+      ? { ...item, thresholds: { maximumRoundTripLossBps: 2_999n } }
+      : item),
+  };
 
-  await assert.rejects(makeEngine(repository, 'paper').open({
+  await assert.rejects(makeEngine(
+    repository,
+    'paper',
+    TEST_QUALIFICATION_PROFILE,
+    exactReportsAuthority(qualification),
+  ).open({
     ...command,
-    qualification: {
-      ...command.qualification,
-      conditions: command.qualification.conditions.map((item) => item.code === 'ROUND_TRIP_LOSS_EXCEEDED'
-        ? { ...item, thresholds: { maximumRoundTripLossBps: 2_999n } }
-        : item),
-    },
+    qualification,
   }), hasCode('QUALIFICATION_INVALID'));
   assert.equal(repository.writeCount, 0);
 });
@@ -377,41 +462,53 @@ void test('replays only the exact origin-main open-command hash for a pre-calibr
 
 void test('binds the profile fingerprint and calibrated condition evidence into open idempotency', async () => {
   const fingerprintRepository = new MemoryPaperRepository();
-  const fingerprintEngine = makeEngine(fingerprintRepository, 'paper');
   const fingerprintCommand = openCommand();
+  const fingerprintQualification = {
+    ...fingerprintCommand.qualification,
+    ruleSet: { ...fingerprintCommand.qualification.ruleSet, fingerprint: 'b'.repeat(64) },
+  };
+  const fingerprintEngine = makeEngine(
+    fingerprintRepository,
+    'paper',
+    TEST_QUALIFICATION_PROFILE,
+    exactReportsAuthority(fingerprintCommand.qualification, fingerprintQualification),
+  );
   await fingerprintEngine.open(fingerprintCommand);
   await assert.rejects(fingerprintEngine.open({
     ...fingerprintCommand,
-    qualification: {
-      ...fingerprintCommand.qualification,
-      ruleSet: { ...fingerprintCommand.qualification.ruleSet, fingerprint: 'b'.repeat(64) },
-    },
+    qualification: fingerprintQualification,
   }), hasCode('QUALIFICATION_INVALID'));
 
   const conditionRepository = new MemoryPaperRepository();
-  const conditionEngine = makeEngine(conditionRepository, 'paper');
   const conditionCommand = openCommand();
-  await conditionEngine.open(conditionCommand);
   const conditions = conditionCommand.qualification.conditions;
+  const conflictingQualification = {
+    ...conditionCommand.qualification,
+    conditions: conditions.map((item) => item.code === 'ROUND_TRIP_LOSS_EXCEEDED'
+      ? { ...item, observed: { ...item.observed, roundTripLossBps: 3_001n } }
+      : item),
+  };
+  const conditionEngine = makeEngine(
+    conditionRepository,
+    'paper',
+    TEST_QUALIFICATION_PROFILE,
+    exactReportsAuthority(conditionCommand.qualification, conflictingQualification),
+  );
+  await conditionEngine.open(conditionCommand);
   await assert.rejects(conditionEngine.open({
     ...conditionCommand,
-    qualification: {
-      ...conditionCommand.qualification,
-      conditions: conditions.map((item) => item.code === 'ROUND_TRIP_LOSS_EXCEEDED'
-        ? { ...item, observed: { ...item.observed, roundTripLossBps: 3_001n } }
-        : item),
-    },
+    qualification: conflictingQualification,
   }), hasCode('POSITION_CONFLICT'));
   assert.equal(fingerprintRepository.writeCount, 1);
   assert.equal(conditionRepository.writeCount, 1);
 });
 
-void test('replays calibrated condition maps with a different key order', async () => {
+void test('rejects reconstructed calibrated condition maps with a different key order', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
   const command = openCommand();
   const first = await engine.open(command);
-  const replay = await engine.open({
+  await assert.rejects(engine.open({
     ...command,
     qualification: {
       ...command.qualification,
@@ -423,9 +520,9 @@ void test('replays calibrated condition maps with a different key order', async 
         }
         : item),
     },
-  });
+  }), hasCode('QUALIFICATION_INVALID'));
 
-  assert.equal(replay.id, first.id);
+  assert.equal(first.status, 'PAPER_HOLDING');
   assert.equal(repository.writeCount, 1);
 });
 
@@ -440,40 +537,46 @@ void test('preserves the historical calibrated qualification command hash', asyn
     'paper_open_command_04adf7b1775782bd2c2a8978237cb1b653158fbf0dd4d9ca4f5e7484445971d0',
   );
   assert.notEqual(first.openCommandHash, LEGACY_OPEN_COMMAND_HASH);
-  const replay = await engine.open({
-    ...command,
-    qualification: {
-      ...command.qualification,
-      conditions: command.qualification.conditions.map((item) => item.code === 'HOLDER_CONCENTRATION_EXCEEDED'
-        ? {
-          ...item,
-          observed: reverseRecord(item.observed),
-          thresholds: reverseRecord(item.thresholds),
-        }
-        : item),
-    },
-  });
+  const replay = await engine.open(command);
   assert.equal(replay.id, first.id);
 });
 
 void test('rejects invalid numeric calibrated condition values instead of replaying null', async () => {
   for (const value of [NaN, Infinity, -Infinity, 1.5, -0]) {
     const observedRepository = new MemoryPaperRepository();
-    const observedEngine = makeEngine(observedRepository, 'paper');
     const observedCommand = openCommand();
+    const invalidObservedCommand = withHolderConditionValue(observedCommand, 'observed', value);
+    const observedEngine = makeEngine(
+      observedRepository,
+      'paper',
+      TEST_QUALIFICATION_PROFILE,
+      exactReportsAuthority(
+        observedCommand.qualification,
+        invalidObservedCommand.qualification,
+      ),
+    );
     await observedEngine.open(observedCommand);
     await assert.rejects(
-      observedEngine.open(withHolderConditionValue(observedCommand, 'observed', value)),
+      observedEngine.open(invalidObservedCommand),
       /Qualification condition records must contain enumerable data values/u,
     );
     assert.equal(observedRepository.writeCount, 1);
 
     const thresholdRepository = new MemoryPaperRepository();
-    const thresholdEngine = makeEngine(thresholdRepository, 'paper');
     const thresholdCommand = openCommand();
+    const invalidThresholdCommand = withHolderConditionValue(thresholdCommand, 'thresholds', value);
+    const thresholdEngine = makeEngine(
+      thresholdRepository,
+      'paper',
+      TEST_QUALIFICATION_PROFILE,
+      exactReportsAuthority(
+        thresholdCommand.qualification,
+        invalidThresholdCommand.qualification,
+      ),
+    );
     await thresholdEngine.open(thresholdCommand);
     await assert.rejects(
-      thresholdEngine.open(withHolderConditionValue(thresholdCommand, 'thresholds', value)),
+      thresholdEngine.open(invalidThresholdCommand),
       /Qualification condition records must contain enumerable data values/u,
     );
     assert.equal(thresholdRepository.writeCount, 1);
@@ -492,11 +595,17 @@ void test('rejects cross-type and out-of-range calibrated condition fields', asy
   ] as const;
   for (const [code, record, key, value] of cases) {
     const repository = new MemoryPaperRepository();
-    const engine = makeEngine(repository, 'paper');
     const command = openCommand();
+    const invalidCommand = withConditionValue(command, code, record, key, value);
+    const engine = makeEngine(
+      repository,
+      'paper',
+      TEST_QUALIFICATION_PROFILE,
+      exactReportsAuthority(command.qualification, invalidCommand.qualification),
+    );
     await engine.open(command);
     await assert.rejects(
-      engine.open(withConditionValue(command, code, record, key, value)),
+      engine.open(invalidCommand),
       /Qualification condition records must contain enumerable data values/u,
     );
     assert.equal(repository.writeCount, 1);
@@ -560,6 +669,8 @@ void test('rétracte une clôture si son déclencheur devient orphaned', async (
 function makeEngine(
   repository: PaperTradingRepository,
   executionMode: 'observe' | 'paper',
+  profile: EffectiveQualificationProfile = TEST_QUALIFICATION_PROFILE,
+  authority: QualificationReportAuthority = TEST_QUALIFICATION_AUTHORITY,
 ): PaperTradingEngine {
   return new PaperTradingEngine(
     {
@@ -568,23 +679,25 @@ function makeEngine(
       dataRetentionHours: 4,
     },
     repository,
-    createDefaultQualificationRuleSet(60),
+    profile,
+    authority,
     { now: () => 1_000 },
   );
 }
 
 function openCommand(
-  profile: EffectiveQualificationProfile = createDefaultQualificationRuleSet(60),
+  authority: QualificationEngine = TEST_QUALIFICATION_AUTHORITY,
+  input: Partial<QualificationEvaluationInput> = {},
 ): OpenPaperPositionCommand {
-  const qualification = new QualificationEngine(profile).evaluate({
-    evaluatedAtMs: 1,
-    signals: {
+  const qualification = authority.evaluate({
+    evaluatedAtMs: input.evaluatedAtMs ?? 1,
+    signals: input.signals ?? {
       imageValid: true,
       socialCrossLinkConfirmed: true,
       creatorHasNotSold: true,
     },
-    blockers: [],
-    calibrationFacts: null,
+    blockers: input.blockers ?? [],
+    calibrationFacts: input.calibrationFacts ?? null,
   });
   return {
     mint: 'MINT',
@@ -596,6 +709,19 @@ function openCommand(
     reverseSellQuote: quote('reverse', 'MINT', 'SOL', 90n, 91n, 89n),
     maximumRoundTripLossBps: 1_100n,
   };
+}
+
+function exactReportsAuthority(
+  ...reports: readonly QualificationReport[]
+): QualificationReportAuthority {
+  const authorized = new WeakSet<QualificationReport>(reports);
+  return Object.freeze({
+    isAuthorized: (candidate: unknown): candidate is QualificationReport => (
+      typeof candidate === 'object'
+      && candidate !== null
+      && authorized.has(candidate as QualificationReport)
+    ),
+  });
 }
 
 function closeCommand(positionId: string): ClosePaperPositionCommand {

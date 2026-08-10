@@ -17,6 +17,7 @@ import { QUALIFICATION_REASON_CODES, type QualificationReasonCode } from '../dom
 import { assertValidTimestampMs } from '../domain/timestamp.js';
 import { isProxy } from 'node:util/types';
 import type { AppConfig } from '../config/env.js';
+import type { QualificationReportAuthority } from '../ports/qualification-report-authority.js';
 import {
   assertValidEffectiveQualificationProfile,
   loadQualificationProfile,
@@ -51,9 +52,10 @@ export type QualificationProfileSummary = Readonly<{
   minimumTotalScore: number;
 }>;
 
-export class QualificationEngine {
+export class QualificationEngine implements QualificationReportAuthority {
   private readonly profile: EffectiveQualificationProfile;
   private readonly summary: QualificationProfileSummary;
+  readonly #authorizedReports = new WeakSet<QualificationReport>();
 
   public constructor(profile: EffectiveQualificationProfile) {
     assertValidEffectiveQualificationProfile(profile);
@@ -75,6 +77,12 @@ export class QualificationEngine {
     return this.summary;
   }
 
+  public readonly isAuthorized = (report: unknown): report is QualificationReport => (
+    typeof report === 'object'
+    && report !== null
+    && this.#authorizedReports.has(report as QualificationReport)
+  );
+
   public evaluate(input: QualificationEvaluationInput): QualificationReport {
     const snapshot = snapshotEvaluationInput(input);
     assertValidTimestampMs('evaluatedAtMs', snapshot.evaluatedAtMs);
@@ -92,7 +100,7 @@ export class QualificationEngine {
       : (missingRequiredEvidence || scores.total.score < this.profile.minimumTotalScore)
         ? 'WATCHLISTED'
         : 'QUALIFIED';
-    return freeze({
+    const report = freeze({
       ruleSet: freeze({
         id: this.profile.id,
         version: this.profile.version,
@@ -106,7 +114,9 @@ export class QualificationEngine {
       blockers: freeze(blockers),
       verdict,
       evaluatedAtMs: snapshot.evaluatedAtMs,
-    });
+    } satisfies QualificationReport);
+    this.#authorizedReports.add(report);
+    return report;
   }
 }
 
