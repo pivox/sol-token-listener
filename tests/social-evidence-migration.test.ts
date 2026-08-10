@@ -127,6 +127,39 @@ void test('keeps every terminal social row before its own purge deadline', async
   });
 });
 
+void test('keeps social parent lineage until the fixed social deadline', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await migrateDatabase({ pool });
+    const terminalAtMs = Date.now() - 2 * 3_600_000;
+    await insertTerminalSocialGraph(
+      pool,
+      'So11111111111111111111111111111111111111112',
+      'signature-social-short-parent-retention',
+      terminalAtMs,
+      1,
+    );
+
+    await purgeExpiredFoundationData(pool);
+
+    assert.deepEqual(await socialCounts(pool), {
+      jobs: 1, collections: 1, links: 1, observations: 1, evidence: 3,
+    });
+    const parents = await pool.query(`SELECT
+      (SELECT COUNT(*)::int FROM token_launches) launches,
+      (SELECT COUNT(*)::int FROM raw_chain_events) raw_events,
+      (SELECT COUNT(*)::int FROM domain_events
+        WHERE type='TokenLaunchDetected') launch_events,
+      (SELECT COUNT(*)::int FROM token_metadata_snapshots) metadata_snapshots`);
+    assert.deepEqual(parents.rows[0], {
+      launches: 1, raw_events: 1, launch_events: 1, metadata_snapshots: 1,
+    });
+  });
+});
+
 async function relationExists(pool: InstanceType<typeof pg.Pool>, name: string): Promise<boolean> {
   const result = await pool.query<{ readonly exists: boolean }>(
     'SELECT to_regclass($1) IS NOT NULL AS exists',
@@ -140,8 +173,13 @@ async function insertTerminalSocialGraph(
   mint: string,
   signature: string,
   terminalAtMs: number,
+  parentRetentionHours = 4,
 ): Promise<void> {
-  const launchRepository = new PostgresLaunchpadEventRepository(pool, 4, () => terminalAtMs);
+  const launchRepository = new PostgresLaunchpadEventRepository(
+    pool,
+    parentRetentionHours,
+    () => terminalAtMs,
+  );
   const processed = launchBatch(mint, signature, 'processed', terminalAtMs);
   await launchRepository.record(processed);
   const socialRepository = new PostgresSocialEvidenceRepository(pool);

@@ -279,8 +279,17 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     const socialPurgeAfter = terminalAt === null ? null : new Date(
       terminalAt.getTime() + PUBLIC_SOCIAL_RETENTION_HOURS * 3_600_000,
     );
-      await exact(client, `UPDATE domain_events SET confirmation_status='orphaned',terminal_at=$2,purge_after=$3 WHERE event_id=$1`, [event.id,terminalAt,purgeAfter]);
+    const lineagePurgeAfter = event.type === 'TokenLaunchDetected'
+      ? socialPurgeAfter
+      : purgeAfter;
+    await exact(client, `UPDATE domain_events SET
+      confirmation_status='orphaned',terminal_at=$2,purge_after=$3
+      WHERE event_id=$1`, [event.id,terminalAt,lineagePurgeAfter]);
     if (event.type === 'TokenLaunchDetected') {
+      await exact(client, `UPDATE raw_chain_events raw SET purge_after=$2
+        FROM domain_events domain_event
+        WHERE domain_event.event_id=$1
+          AND raw.event_id=domain_event.raw_event_id`, [event.id,socialPurgeAfter]);
       await client.query(`UPDATE social_enrichment_jobs SET
         status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
         error_code=NULL,terminal_at=$2,purge_after=$3,updated_at=$2
@@ -298,7 +307,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
         WHERE type='SocialEvidenceCollected'
           AND payload->>'sourceLaunchEventId'=$1`, [event.id,terminalAt,socialPurgeAfter]);
       await exact(client, 'UPDATE state_transitions SET terminal_at=$2,purge_after=$3 WHERE event_id=$1', [event.id,terminalAt,purgeAfter]);
-      await exact(client, 'UPDATE token_launches SET current_state=\'RETRACTED\',terminal_at=$2,purge_after=$3,updated_at=$2 WHERE mint=$1', [event.mint,terminalAt,purgeAfter]);
+      await exact(client, 'UPDATE token_launches SET current_state=\'RETRACTED\',terminal_at=$2,purge_after=$3,updated_at=$2 WHERE mint=$1', [event.mint,terminalAt,socialPurgeAfter]);
     } else await exact(client, `UPDATE launch_trades SET confirmation_status='orphaned',purge_after=$2 WHERE trade_id=$1`, [event.payload.trade.id,purgeAfter]);
   }
 
