@@ -21,6 +21,7 @@ import {
   type ApiPaperStrategyProgress,
   type ApiQualification,
   type ApiQualificationCondition,
+  type ApiQualificationSummary,
   type ApiCreatorProfile,
   type ApiCreatorTradeEvidence,
   type ApiAnalyticsCursor,
@@ -129,11 +130,16 @@ interface LaunchProjections {
   readonly metadata: ReadonlyMap<string, Record<string, unknown>>;
   readonly curves: ReadonlyMap<string, Record<string, unknown>>;
   readonly markets: ReadonlyMap<string, Record<string, unknown>>;
+  readonly radar: ReadonlyMap<string, LaunchRadarProjection>;
 }
 
 interface PaperDecisionProjection {
   readonly candidate: ApiTradingCandidate | null;
   readonly paperStrategy: ApiPaperStrategyProgress | null;
+}
+
+interface LaunchRadarProjection extends PaperDecisionProjection {
+  readonly qualificationSummary: ApiQualificationSummary | null;
 }
 
 const NOT_AVAILABLE_SOCIAL: ApiSocial = Object.freeze({
@@ -149,6 +155,10 @@ const NOT_AVAILABLE_HOLDERS: ApiHolders = Object.freeze({
 const NOT_AVAILABLE_PAPER: PaperDecisionProjection = Object.freeze({
   candidate: null,
   paperStrategy: null,
+});
+const NOT_AVAILABLE_RADAR: LaunchRadarProjection = Object.freeze({
+  qualificationSummary: null,
+  ...NOT_AVAILABLE_PAPER,
 });
 
 export class PostgresApiProjectionRepository implements ApiProjectionRepository {
@@ -219,8 +229,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     const projections = await this.loadLaunchProjections([text(mint)]);
     const holders = await this.loadHolders(text(mint));
     const social = await this.loadSocial(text(mint));
-    const paper = await this.loadPaperDecision(text(mint));
-    return assembleLaunchDetail(launch, projections, holders, social, paper);
+    return assembleLaunchDetail(launch, projections, holders, social);
   }
 
   public async listLaunchEvents(mint: string, request: PageRequest<TimelinePagePosition>): Promise<ApiPage<ApiTimelineEntry>> {
@@ -369,32 +378,6 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     });
   }
 
-  private async loadPaperDecision(mint: string): Promise<PaperDecisionProjection> {
-    const candidates = await this.database.query(
-      `SELECT candidate_id,state,strategy_id,strategy_version,report_id,quote_mint,
-          quote_decimals,reason_codes,eligible_until,created_at
-       FROM trading_candidates
-       WHERE mint=$1 AND superseded_at IS NULL AND purge_after>clock_timestamp()
-       ORDER BY created_at DESC,candidate_id DESC LIMIT 1`,
-      [mint],
-    );
-    const sessions = await this.database.query(
-      `SELECT session_id,state,reason_code,strategy_id,strategy_version,position_id,
-          quote_mint,external_buy_target,external_buy_count,minimum_confirmation,
-          updated_at,payload
-       FROM paper_strategy_sessions
-       WHERE mint=$1 AND (purge_after IS NULL OR purge_after>clock_timestamp())
-       ORDER BY updated_at DESC,session_id DESC LIMIT 1`,
-      [mint],
-    );
-    return freeze({
-      candidate: candidates.rows[0] === undefined
-        ? null : toTradingCandidate(candidates.rows[0]),
-      paperStrategy: sessions.rows[0] === undefined
-        ? null : toPaperStrategy(sessions.rows[0]),
-    });
-  }
-
   public async getHealth(): Promise<ApiHealth> {
     const observedAt = validDate(this.clock());
     let pipeline = DEGRADED_PIPELINE_STATE;
@@ -539,7 +522,9 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
   }
 
   private async loadLaunchProjections(mints: readonly string[]): Promise<LaunchProjections> {
-    if (mints.length === 0) return { metadata: new Map(), curves: new Map(), markets: new Map() };
+    if (mints.length === 0) {
+      return { metadata: new Map(), curves: new Map(), markets: new Map(), radar: new Map() };
+    }
     const metadata = await this.database.query(
       `SELECT DISTINCT ON (snapshot.mint) snapshot.mint, snapshot.metadata
          FROM token_metadata_snapshots AS snapshot
@@ -589,8 +574,69 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
            migration.migration_id DESC`,
       [mints],
     );
+    const qualifications = await this.database.query(
+      `SELECT DISTINCT ON (report.mint) report.mint, report.payload
+         FROM qualification_reports AS report
+         JOIN domain_events AS qualification_event
+           ON qualification_event.event_id = report.qualification_event_id
+         WHERE report.mint = ANY($1)
+           AND report.confirmation_status <> 'orphaned'
+           AND report.superseded_at IS NULL
+           AND report.purge_after > clock_timestamp()
+           AND qualification_event.confirmation_status <> 'orphaned'
+         ORDER BY report.mint, report.evaluated_at DESC, report.report_id DESC`,
+      [mints],
+    );
+    const candidates = await this.database.query(
+      `SELECT DISTINCT ON (candidate.mint) candidate.mint, candidate.candidate_id,
+          candidate.state, candidate.strategy_id, candidate.strategy_version,
+          candidate.report_id, candidate.quote_mint, candidate.quote_decimals,
+          candidate.reason_codes, candidate.eligible_until, candidate.created_at
+         FROM trading_candidates AS candidate
+         WHERE candidate.mint = ANY($1)
+           AND candidate.confirmation_status <> 'orphaned'
+           AND candidate.superseded_at IS NULL
+           AND candidate.purge_after > clock_timestamp()
+         ORDER BY candidate.mint, candidate.created_at DESC, candidate.candidate_id DESC`,
+      [mints],
+    );
+    const sessions = await this.database.query(
+      `SELECT DISTINCT ON (session.mint) session.mint, session.session_id,
+          session.state, session.reason_code, session.strategy_id,
+          session.strategy_version, session.position_id, session.quote_mint,
+          session.external_buy_target, session.external_buy_count,
+          session.minimum_confirmation, session.updated_at, session.payload
+         FROM paper_strategy_sessions AS session
+         WHERE session.mint = ANY($1)
+           AND (session.purge_after IS NULL OR session.purge_after > clock_timestamp())
+         ORDER BY session.mint, session.updated_at DESC, session.session_id DESC`,
+      [mints],
+    );
+    const radar = new Map<string, LaunchRadarProjection>();
+    for (const mint of mints) radar.set(mint, NOT_AVAILABLE_RADAR);
+    for (const row of qualifications.rows) {
+      const mint = text(row.mint);
+      const current = radar.get(mint) ?? NOT_AVAILABLE_RADAR;
+      radar.set(mint, freeze({
+        ...current,
+        qualificationSummary: toQualificationSummary(row.payload),
+      }));
+    }
+    for (const row of candidates.rows) {
+      const mint = text(row.mint);
+      const current = radar.get(mint) ?? NOT_AVAILABLE_RADAR;
+      radar.set(mint, freeze({ ...current, candidate: toTradingCandidate(row) }));
+    }
+    for (const row of sessions.rows) {
+      const mint = text(row.mint);
+      const current = radar.get(mint) ?? NOT_AVAILABLE_RADAR;
+      radar.set(mint, freeze({ ...current, paperStrategy: toPaperStrategy(row) }));
+    }
     return {
-      metadata: rowsByMint(metadata.rows), curves: rowsByMint(curves.rows), markets: rowsByMint(markets.rows),
+      metadata: rowsByMint(metadata.rows),
+      curves: rowsByMint(curves.rows),
+      markets: rowsByMint(markets.rows),
+      radar,
     };
   }
 
@@ -940,6 +986,7 @@ function assembleLaunchSummary(row: LaunchRow, projections: LaunchProjections): 
   const curve = projections.curves.get(mint);
   const market = projections.markets.get(mint);
   const metadata = projections.metadata.get(mint);
+  const radar = projections.radar.get(mint) ?? NOT_AVAILABLE_RADAR;
   const quote = quoteAsset(row.quote_assets);
   const quoteMint = nullableText(curve?.quote_mint) ?? nullableText(market?.quote_mint) ?? quote.mint;
   const quoteDecimals = nullableSafeNumber(curve?.quote_decimals)
@@ -951,6 +998,9 @@ function assembleLaunchSummary(row: LaunchRow, projections: LaunchProjections): 
     marketCapQuote: null,
     liquidityQuote: nullableDecimal(market?.quote_vault_amount_raw)
       ?? nullableDecimal(curve?.real_quote_reserves_raw),
+    qualificationSummary: radar.qualificationSummary,
+    candidate: radar.candidate,
+    paperStrategy: radar.paperStrategy,
   });
 }
 
@@ -959,7 +1009,6 @@ function assembleLaunchDetail(
   projections: LaunchProjections,
   holders: ApiHolders = NOT_AVAILABLE_HOLDERS,
   social: ApiSocial = NOT_AVAILABLE_SOCIAL,
-  paper: PaperDecisionProjection = NOT_AVAILABLE_PAPER,
 ): ApiLaunchDetail {
   const summary = assembleLaunchSummary(row, projections);
   const curve = projections.curves.get(summary.mint);
@@ -970,8 +1019,16 @@ function assembleLaunchDetail(
     reserveBase: nullableDecimal(market?.base_reserves_raw) ?? nullableDecimal(curve?.real_base_reserves_raw),
     reserveQuote: nullableDecimal(market?.quote_vault_amount_raw) ?? nullableDecimal(curve?.real_quote_reserves_raw),
     feeBps: null, social, holders,
-    candidate: paper.candidate,
-    paperStrategy: paper.paperStrategy,
+  });
+}
+
+function toQualificationSummary(value: unknown): ApiQualificationSummary {
+  const report = qualification(value);
+  return freeze({
+    verdict: report.verdict,
+    scores: report.scores,
+    blockerCodes: freeze(report.blockers.map((blocker) => blocker.code)),
+    evaluatedAt: report.evaluatedAt,
   });
 }
 

@@ -146,13 +146,14 @@ void test('lists launches with a stable keyset, exact decimals, and grouped proj
       detectedSlot: '900719925474099312345', status: 'DETECTED',
       name: 'Alpha', symbol: 'ALP', quoteMint: 'quote', quoteDecimals: 6,
       marketCapQuote: null, liquidityQuote: '200',
+      qualificationSummary: null, candidate: null, paperStrategy: null,
     }],
     nextCursor: encodeLaunchCursor({ detectedAtMs: detectedAt.getTime(), mint: 'mint-a' }),
   });
   assert.equal(Object.isFrozen(page), true);
   assert.equal(Object.isFrozen(page.items), true);
   assert.equal(Object.isFrozen(page.items[0]), true);
-  assert.equal(database.calls.length, 4);
+  assert.equal(database.calls.length, 7);
   assert.match(database.calls[0]?.text ?? '', /detected_at DESC, launch\.mint ASC/u);
   assert.match(database.calls[0]?.text ?? '', /detected_at < \$1[\s\S]*detected_at = \$1[\s\S]*mint > \$2/u);
   assert.deepEqual(database.calls[0]?.values, [detectedAt, 'previous-mint', 2]);
@@ -180,8 +181,8 @@ void test('keeps the database query count bounded as page size grows', async () 
 
   await repository.listLaunches({ limit: 2, after: null });
 
-  assert.equal(database.calls.length, 4);
-  assert.equal(database.calls.filter((call) => call.text.includes('= ANY($1)')).length, 3);
+  assert.equal(database.calls.length, 7);
+  assert.equal(database.calls.filter((call) => call.text.includes('= ANY($1)')).length, 6);
   assert.ok(database.calls.every((call) => !call.text.includes("'mint-a'")));
 });
 
@@ -199,6 +200,7 @@ void test('reads an exact launch and returns null only when it is absent', async
     detectedSlot: '900719925474099312345', status: 'DETECTED',
     name: 'Alpha', symbol: 'ALP', quoteMint: 'quote', quoteDecimals: 6,
     marketCapQuote: null, liquidityQuote: '200', creator: 'creator',
+    qualificationSummary: null,
     tokenProgram: 'token-program', launchpad: 'pumpfun',
     initialTokenAmount: null, initialQuoteAmount: null,
     reserveBase: '100', reserveQuote: '200', feeBps: null,
@@ -214,6 +216,66 @@ void test('reads an exact launch and returns null only when it is absent', async
 
   const absent = new PostgresApiProjectionRepository(new FakeQueryable(() => []));
   assert.equal(await absent.getLaunch('absent'), null);
+});
+
+void test('loads qualification, candidate, and paper progress set-wise for a launch page', async () => {
+  const report = new QualificationEngine(createDefaultQualificationRuleSet(60)).evaluate({
+    evaluatedAtMs: detectedAt.getTime(),
+    signals: { imageValid: true, descriptionAvailable: true },
+    blockers: ['SHARED_FUNDER_CLUSTER'],
+    calibrationFacts: null,
+  });
+  const reportPayload = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;
+  reportPayload.blockers = [{
+    code: 'SHARED_FUNDER_CLUSTER',
+    message: 'Condition éliminatoire active: SHARED_FUNDER_CLUSTER.',
+  }];
+  reportPayload.verdict = 'REJECTED';
+  const candidateId = `candidate_${'a'.repeat(64)}`;
+  const reportId = `qreport_${'b'.repeat(64)}`;
+  const sessionId = `paper_session_${'c'.repeat(64)}`;
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a'), launch('mint-b')];
+    if (call.text.includes('FROM qualification_reports')) {
+      return [{ mint: 'mint-a', payload: reportPayload }];
+    }
+    if (call.text.includes('FROM trading_candidates')) return [{
+      mint: 'mint-a', candidate_id: candidateId, state: 'ELIGIBLE',
+      strategy_id: 'validated-external-buys', strategy_version: 1,
+      report_id: reportId, quote_mint: 'quote', quote_decimals: 6,
+      reason_codes: ['QUALIFIED_ENTRY'], eligible_until: detectedAt, created_at: openedAt,
+    }];
+    if (call.text.includes('FROM paper_strategy_sessions')) return [{
+      mint: 'mint-a', session_id: sessionId, state: 'WAITING_EXTERNAL_BUYS',
+      reason_code: 'EXTERNAL_BUY_OBSERVED', strategy_id: 'validated-external-buys',
+      strategy_version: 1, position_id: 'position-a', quote_mint: 'quote',
+      external_buy_target: 10, external_buy_count: 3, minimum_confirmation: 'confirmed',
+      updated_at: detectedAt, payload: toJsonValue({ lastError: null }),
+    }];
+    return projectionRows(call);
+  });
+
+  const page = await new PostgresApiProjectionRepository(database).listLaunches({ limit: 2, after: null });
+
+  assert.deepEqual(page.items[0]?.qualificationSummary, {
+    verdict: 'REJECTED',
+    scores: report.scores,
+    blockerCodes: ['SHARED_FUNDER_CLUSTER'],
+    evaluatedAt: detectedAt.toISOString(),
+  });
+  assert.equal(page.items[0]?.candidate?.id, candidateId);
+  assert.equal(page.items[0]?.paperStrategy?.id, sessionId);
+  assert.equal(page.items[1]?.qualificationSummary, null);
+  assert.equal(page.items[1]?.candidate, null);
+  assert.equal(page.items[1]?.paperStrategy, null);
+  assert.equal(database.calls.length, 7);
+  for (const call of database.calls.slice(1)) {
+    assert.deepEqual(call.values, [['mint-a', 'mint-b']]);
+  }
+  assert.match(
+    database.calls.find((call) => call.text.includes('FROM qualification_reports'))?.text ?? '',
+    /DISTINCT ON \(report\.mint\)[\s\S]*confirmation_status <> 'orphaned'[\s\S]*superseded_at IS NULL/u,
+  );
 });
 
 void test('uses the real quote vault for PumpSwap liquidity and reserves', async () => {
@@ -241,13 +303,13 @@ void test('exposes current candidate and bounded paper strategy progress on laun
   const database = new FakeQueryable((call) => {
     if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
     if (call.text.includes('FROM trading_candidates')) return [{
-      candidate_id: `candidate_${'a'.repeat(64)}`, state: 'ELIGIBLE',
+      mint: 'mint-a', candidate_id: `candidate_${'a'.repeat(64)}`, state: 'ELIGIBLE',
       strategy_id: 'validated-external-buys', strategy_version: 1,
       report_id: `qreport_${'b'.repeat(64)}`, quote_mint: 'quote', quote_decimals: 6,
       reason_codes: ['QUALIFIED_ENTRY'], eligible_until: detectedAt, created_at: openedAt,
     }];
     if (call.text.includes('FROM paper_strategy_sessions')) return [{
-      session_id: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
+      mint: 'mint-a', session_id: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
       reason_code: 'EXTERNAL_BUY_OBSERVED', strategy_id: 'validated-external-buys',
       strategy_version: 1, position_id: 'position-a', quote_mint: 'quote',
       external_buy_target: 10, external_buy_count: 3, minimum_confirmation: 'confirmed',
@@ -279,13 +341,13 @@ void test('exposes current candidate and bounded paper strategy progress on laun
 
 void test('fails closed on incoherent candidate windows and paper progress', async () => {
   const candidate = {
-    candidate_id: `candidate_${'a'.repeat(64)}`, state: 'ELIGIBLE',
+    mint: 'mint-a', candidate_id: `candidate_${'a'.repeat(64)}`, state: 'ELIGIBLE',
     strategy_id: 'validated-external-buys', strategy_version: 1,
     report_id: `qreport_${'b'.repeat(64)}`, quote_mint: 'quote', quote_decimals: 6,
     reason_codes: ['QUALIFIED_ENTRY'], eligible_until: detectedAt, created_at: openedAt,
   };
   const session = {
-    session_id: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
+    mint: 'mint-a', session_id: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
     reason_code: 'EXTERNAL_BUY_OBSERVED', strategy_id: 'validated-external-buys',
     strategy_version: 1, position_id: 'position-a', quote_mint: 'quote',
     external_buy_target: 10, external_buy_count: 3, minimum_confirmation: 'confirmed',
@@ -321,8 +383,14 @@ void test('uses one sequential repeatable-read snapshot and releases it', async 
     if (call.text.includes('token_metadata_snapshots')) return 'metadata';
     if (call.text.includes('bonding_curve_snapshots')) return 'curves';
     if (call.text.includes('FROM migrations AS migration')) return 'markets';
+    if (call.text.includes('FROM qualification_reports')) return 'qualification';
+    if (call.text.includes('FROM trading_candidates')) return 'candidates';
+    if (call.text.includes('FROM paper_strategy_sessions')) return 'sessions';
     return call.text;
-  }), ['BEGIN', 'launches', 'metadata', 'curves', 'markets', 'COMMIT']);
+  }), [
+    'BEGIN', 'launches', 'metadata', 'curves', 'markets',
+    'qualification', 'candidates', 'sessions', 'COMMIT',
+  ]);
   assert.match(database.calls[0]?.text ?? '', /REPEATABLE READ READ ONLY/u);
   assert.equal(database.released, true);
 });

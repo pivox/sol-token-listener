@@ -67,6 +67,7 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
     mint: MINT, detectedAt: '2024-07-03T09:46:40.000Z', detectedSlot: '1', status: 'DETECTED',
     name: 'Token', symbol: 'TOK', quoteMint: null, quoteDecimals: null,
     marketCapQuote: null, liquidityQuote: null,
+    qualificationSummary: null, candidate: null, paperStrategy: null,
   };
   const social: ApiSocial = { status: 'NOT_AVAILABLE', links: [], evidence: [] };
   const holders: ApiHolders = {
@@ -76,7 +77,6 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
   const detail: ApiLaunchDetail = {
     ...summary, creator: MINT, tokenProgram: MINT, launchpad: 'pumpfun', initialTokenAmount: null,
     initialQuoteAmount: null, reserveBase: null, reserveQuote: null, feeBps: null, social, holders,
-    candidate: null, paperStrategy: null,
   };
   const timeline: ApiTimelineEntry = {
     id: 'event-1', type: 'TokenLaunchDetected', occurredAt: summary.detectedAt, slot: '1',
