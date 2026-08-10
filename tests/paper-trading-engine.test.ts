@@ -334,6 +334,29 @@ void test('rejects invalid numeric calibrated condition values instead of replay
   }
 });
 
+void test('rejects cross-type and out-of-range calibrated condition fields', async () => {
+  const cases = [
+    ['HOLDER_CONCENTRATION_EXCEEDED', 'observed', 'top1HolderBps', 1],
+    ['HOLDER_CONCENTRATION_EXCEEDED', 'observed', 'top1HolderBps', true],
+    ['SHARED_FUNDER_CLUSTER', 'observed', 'maximumSharedFunderCount', 1n],
+    ['SHARED_FUNDER_CLUSTER', 'observed', 'maximumSharedFunderCount', -1],
+    ['SHARED_FUNDER_CLUSTER', 'thresholds', 'minimumSharedFunders', 10_001],
+    ['BUY_SIMULATION_FAILED', 'observed', 'buySimulationSucceeded', 1],
+    ['ROUND_TRIP_LOSS_EXCEEDED', 'observed', 'roundTripLossBps', 1],
+  ] as const;
+  for (const [code, record, key, value] of cases) {
+    const repository = new MemoryPaperRepository();
+    const engine = makeEngine(repository, 'paper');
+    const command = openCommand();
+    await engine.open(command);
+    await assert.rejects(
+      engine.open(withConditionValue(command, code, record, key, value)),
+      /Qualification condition records must contain enumerable data values/u,
+    );
+    assert.equal(repository.writeCount, 1);
+  }
+});
+
 void test('ferme entièrement et calcule le PnL conservateur', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
@@ -509,6 +532,27 @@ function withHolderConditionValue(
         return record === 'observed'
           ? { ...item, observed: { ...item.observed, top1HolderBps: value } }
           : { ...item, thresholds: { ...item.thresholds, maximumTop1Bps: value } };
+      }),
+    },
+  };
+}
+
+function withConditionValue(
+  command: OpenPaperPositionCommand,
+  code: OpenPaperPositionCommand['qualification']['conditions'][number]['code'],
+  record: 'observed' | 'thresholds',
+  key: string,
+  value: unknown,
+): OpenPaperPositionCommand {
+  return {
+    ...command,
+    qualification: {
+      ...command.qualification,
+      conditions: command.qualification.conditions.map((item) => {
+        if (item.code !== code) return item;
+        return record === 'observed'
+          ? { ...item, observed: { ...item.observed, [key]: value } as typeof item.observed }
+          : { ...item, thresholds: { ...item.thresholds, [key]: value } as typeof item.thresholds };
       }),
     },
   };

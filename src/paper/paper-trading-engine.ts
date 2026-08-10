@@ -394,12 +394,12 @@ function snapshotQualification(report: QualificationReport): QualificationReport
       observed: snapshotConditionRecord(
         item.observed,
         conditionRecordKeys(item, 'observed'),
-        isObservedConditionValue,
+        observedConditionValueIsValid,
       ),
       thresholds: snapshotConditionRecord(
         item.thresholds,
         conditionRecordKeys(item, 'thresholds'),
-        isThresholdConditionValue,
+        thresholdConditionValueIsValid,
       ),
       message: item.message,
     }))),
@@ -415,7 +415,7 @@ function snapshotQualification(report: QualificationReport): QualificationReport
 function snapshotConditionRecord<T>(
   value: unknown,
   expectedKeys: readonly string[],
-  validValue: (candidate: unknown) => candidate is T,
+  validValue: (key: string, candidate: unknown) => boolean,
 ): Readonly<Record<string, T>> {
   if (
     typeof value !== 'object'
@@ -435,24 +435,66 @@ function snapshotConditionRecord<T>(
   const result: Record<string, T> = {};
   for (const key of expectedKeys) {
     const descriptor = descriptors[key];
-    if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable || !validValue(descriptor.value)) {
+    if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable || !validValue(key, descriptor.value)) {
       throw new TypeError('Qualification condition records must contain enumerable data values.');
     }
-    result[key] = descriptor.value;
+    result[key] = descriptor.value as T;
   }
   return freeze(result);
 }
 
-function isObservedConditionValue(value: unknown): value is bigint | number | boolean | null {
-  return value === null || typeof value === 'bigint' || typeof value === 'boolean' || isSafeConditionInteger(value);
+type ConditionValueValidator = (value: unknown) => boolean;
+
+const OBSERVED_CONDITION_VALUE_VALIDATORS: Readonly<Record<string, ConditionValueValidator>> = Object.freeze({
+  top1HolderBps: isNullableBasisPoints,
+  top5HoldersBps: isNullableBasisPoints,
+  top10HoldersBps: isNullableBasisPoints,
+  maximumRelatedClusterBps: isNullableBasisPoints,
+  maximumSharedFunderCount: isNullableSharedFunderCount,
+  buySimulationSucceeded: isNullableBoolean,
+  sellQuoteAvailable: isNullableBoolean,
+  roundTripLossBps: isNullableBasisPoints,
+});
+
+const THRESHOLD_CONDITION_VALUE_VALIDATORS: Readonly<Record<string, ConditionValueValidator>> = Object.freeze({
+  maximumTop1Bps: isNullableBasisPoints,
+  maximumTop5Bps: isNullableBasisPoints,
+  maximumTop10Bps: isNullableBasisPoints,
+  maximumClusterBps: isNullableBasisPoints,
+  minimumSharedFunders: isNullableMinimumSharedFunders,
+  maximumRoundTripLossBps: isNullableBasisPoints,
+});
+
+function observedConditionValueIsValid(key: string, value: unknown): boolean {
+  return OBSERVED_CONDITION_VALUE_VALIDATORS[key]?.(value) ?? false;
 }
 
-function isThresholdConditionValue(value: unknown): value is bigint | number | null {
-  return value === null || typeof value === 'bigint' || isSafeConditionInteger(value);
+function thresholdConditionValueIsValid(key: string, value: unknown): boolean {
+  return THRESHOLD_CONDITION_VALUE_VALIDATORS[key]?.(value) ?? false;
 }
 
-function isSafeConditionInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && !Object.is(value, -0);
+function isNullableBasisPoints(value: unknown): boolean {
+  return value === null || (typeof value === 'bigint' && value >= 0n && value <= 10_000n);
+}
+
+function isNullableSharedFunderCount(value: unknown): boolean {
+  return value === null || isSafeInteger(value, 0, Number.MAX_SAFE_INTEGER);
+}
+
+function isNullableMinimumSharedFunders(value: unknown): boolean {
+  return value === null || isSafeInteger(value, 1, 10_000);
+}
+
+function isNullableBoolean(value: unknown): boolean {
+  return value === null || typeof value === 'boolean';
+}
+
+function isSafeInteger(value: unknown, minimum: number, maximum: number): boolean {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && !Object.is(value, -0)
+    && value >= minimum
+    && value <= maximum;
 }
 
 function conditionRecordKeys(
