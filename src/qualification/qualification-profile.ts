@@ -17,6 +17,7 @@ import { canonicalStringifyJson } from '../utils/json.js';
 const MAX_PROFILE_BYTES = 65_536;
 const MAX_PROFILE_PATH_BYTES = 4_096;
 const TOP_LEVEL_FIELDS = ['schemaVersion', 'id', 'version', 'status', 'minimumTotalScore', 'dimensionMaximums', 'rules', 'conditionPolicies'] as const;
+const EFFECTIVE_PROFILE_FIELDS = ['schemaVersion', 'fingerprint', 'id', 'version', 'status', 'minimumTotalScore', 'dimensionMaximums', 'rules', 'conditionPolicies'] as const;
 const RULE_FIELDS = ['signal', 'dimension', 'weight', 'required', 'message'] as const;
 const POLICY_FIELDS = ['code', 'mode', 'maximumTop1Bps', 'maximumTop5Bps', 'maximumTop10Bps', 'maximumClusterBps', 'minimumSharedFunders', 'maximumRoundTripLossBps'] as const;
 const MODES = new Set<QualificationConditionMode>(['DISABLED', 'REPORT_ONLY', 'ENFORCED']);
@@ -130,6 +131,27 @@ export function parseQualificationProfile(rawProfile: unknown, minimumScoreOverr
     const withoutFingerprint = { schemaVersion: 1 as const, id, version, status: 'UNVALIDATED_RULE_SET' as const, minimumTotalScore, dimensionMaximums, rules, conditionPolicies };
     const fingerprint = createHash('sha256').update(canonicalStringifyJson(withoutFingerprint)).digest('hex');
     return deepFreeze({ ...withoutFingerprint, fingerprint });
+  } catch (error) {
+    if (error instanceof QualificationProfileError) throw error;
+    throw new QualificationProfileError('PROFILE_SCHEMA_INVALID');
+  }
+}
+
+/** Validates a loaded profile before it is consumed outside the profile loader. */
+export function assertValidEffectiveQualificationProfile(profile: unknown): asserts profile is EffectiveQualificationProfile {
+  try {
+    const raw = exactObject(profile, EFFECTIVE_PROFILE_FIELDS);
+    if (raw.schemaVersion !== 1 || raw.status !== 'UNVALIDATED_RULE_SET') invalid();
+    const id = boundedString(raw.id, 1, 160);
+    const version = safeInteger(raw.version, 1, Number.MAX_SAFE_INTEGER);
+    const minimumTotalScore = safeInteger(raw.minimumTotalScore, 0, 100);
+    if (typeof raw.fingerprint !== 'string' || !/^[a-f0-9]{64}$/u.test(raw.fingerprint)) invalid();
+    const dimensionMaximums = parseMaximums(raw.dimensionMaximums);
+    const rules = parseRules(raw.rules, dimensionMaximums);
+    const conditionPolicies = parsePolicies(raw.conditionPolicies);
+    const canonical = { schemaVersion: 1 as const, id, version, status: 'UNVALIDATED_RULE_SET' as const, minimumTotalScore, dimensionMaximums, rules, conditionPolicies };
+    const fingerprint = createHash('sha256').update(canonicalStringifyJson(canonical)).digest('hex');
+    if (raw.fingerprint !== fingerprint) invalid();
   } catch (error) {
     if (error instanceof QualificationProfileError) throw error;
     throw new QualificationProfileError('PROFILE_SCHEMA_INVALID');

@@ -8,18 +8,11 @@ import {
   type QualificationConditionPolicy,
   type QualificationConditionStatus,
 } from '../domain/qualification.js';
-import type { QualificationReasonCode } from '../domain/qualification-reasons.js';
+import { QUALIFICATION_REASON_CODES, type QualificationReasonCode } from '../domain/qualification-reasons.js';
+import { assertValidEffectiveQualificationProfile } from './qualification-profile.js';
 
-const REASON_CODES = Object.freeze([
-  'CREATOR_EARLY_SELL', 'CREATOR_REPEAT_DUMPER', 'MINT_SOCIAL_MISMATCH', 'IMPERSONATION_SUSPECTED',
-  'HOLDER_CONCENTRATION_EXCEEDED', 'RELATED_WALLET_CLUSTER_EXCEEDED', 'SHARED_FUNDER_CLUSTER',
-  'BUY_SIMULATION_FAILED', 'SELL_QUOTE_UNAVAILABLE', 'ROUND_TRIP_LOSS_EXCEEDED', 'STALE_DATA',
-  'UNSUPPORTED_TOKEN_EXTENSION', 'METADATA_FETCH_FAILED', 'UNSUPPORTED_QUOTE_MINT',
-] as const);
+const REASON_CODES = QUALIFICATION_REASON_CODES;
 const REASON_SET: ReadonlySet<string> = new Set(REASON_CODES);
-const MODES: ReadonlySet<string> = new Set(['DISABLED', 'REPORT_ONLY', 'ENFORCED']);
-const PROFILE_FIELDS = ['schemaVersion', 'fingerprint', 'id', 'version', 'status', 'minimumTotalScore', 'dimensionMaximums', 'rules', 'conditionPolicies'] as const;
-const POLICY_FIELDS = ['code', 'mode', 'maximumTop1Bps', 'maximumTop5Bps', 'maximumTop10Bps', 'maximumClusterBps', 'minimumSharedFunders', 'maximumRoundTripLossBps'] as const;
 
 export interface QualificationConditionResult {
   readonly conditions: readonly QualificationConditionEvidence[];
@@ -31,7 +24,8 @@ export function evaluateQualificationConditions(
   facts: QualificationCalibrationFacts,
   legacyTriggeredCodes: readonly QualificationReasonCode[],
 ): QualificationConditionResult {
-  const policies = validatedPolicies(profile);
+  assertValidEffectiveQualificationProfile(profile);
+  const policies = new Map(profile.conditionPolicies.map((policy) => [policy.code, policy]));
   assertValidQualificationFacts(facts);
   const legacy = validatedLegacyCodes(legacyTriggeredCodes);
   const upstream = new Map<QualificationReasonCode, boolean>();
@@ -70,8 +64,8 @@ function holder(policy: QualificationConditionPolicy, facts: QualificationCalibr
   const configured = pairs.filter(([, , threshold]) => threshold !== null);
   const observed = Object.fromEntries(pairs.map(([key, value]) => [key, value]));
   const thresholds = Object.fromEntries(pairs.map(([key, , value]) => [key, value === null ? null : BigInt(value)]));
-  if (configured.length === 0) return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'NOT_CONFIGURED', observed, thresholds, 'Holder concentration is not configured.');
   if (configured.some(([, value, threshold]) => value !== null && threshold !== null && value > BigInt(threshold))) return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'TRIGGERED', observed, thresholds, 'Holder concentration exceeds the configured threshold.');
+  if (pairs.some(([, , threshold]) => threshold === null)) return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, 'NOT_CONFIGURED', observed, thresholds, 'Holder concentration is not fully configured.');
   const status: QualificationConditionStatus = configured.some(([, value]) => value === null) ? 'UNKNOWN' : 'PASSED';
   return evidence('HOLDER_CONCENTRATION_EXCEEDED', policy.mode, status, observed, thresholds, status === 'UNKNOWN' ? 'Holder concentration is unavailable.' : 'Holder concentration passed.');
 }
@@ -109,37 +103,6 @@ function validatedLegacyCodes(value: readonly QualificationReasonCode[]): Readon
   return result;
 }
 
-function validatedPolicies(profile: EffectiveQualificationProfile): ReadonlyMap<QualificationReasonCode, QualificationConditionPolicy> {
-  exactFrozenObject(profile, PROFILE_FIELDS, 'Qualification profile');
-  const profileValues = descriptors(profile, PROFILE_FIELDS, 'Qualification profile');
-  if (profileValues.schemaVersion !== 1 || profileValues.status !== 'UNVALIDATED_RULE_SET') throw new TypeError('Qualification profile is invalid.');
-  const entries = denseFrozenArray(profileValues.conditionPolicies, 'Qualification condition policies');
-  if (entries.length !== REASON_CODES.length) throw new TypeError('Qualification condition policies are invalid.');
-  const result = new Map<QualificationReasonCode, QualificationConditionPolicy>();
-  for (let index = 0; index < entries.length; index += 1) {
-    const entry = entries[index]; exactFrozenObject(entry, POLICY_FIELDS, 'Qualification condition policy');
-    const values = descriptors(entry, POLICY_FIELDS, 'Qualification condition policy');
-    if (values.code !== REASON_CODES[index] || typeof values.mode !== 'string' || !MODES.has(values.mode)) throw new TypeError('Qualification condition policy is invalid.');
-    for (const key of ['maximumTop1Bps', 'maximumTop5Bps', 'maximumTop10Bps', 'maximumClusterBps', 'maximumRoundTripLossBps']) {
-      const value = values[key];
-      if (value !== null && (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > 10_000)) throw new TypeError('Qualification condition policy is invalid.');
-    }
-    if (values.minimumSharedFunders !== null && (!Number.isSafeInteger(values.minimumSharedFunders) || (values.minimumSharedFunders as number) < 1)) throw new TypeError('Qualification condition policy is invalid.');
-    result.set(values.code as QualificationReasonCode, entry as QualificationConditionPolicy);
-  }
-  return result;
-}
-
-function exactFrozenObject(value: unknown, fields: readonly string[], name: string): asserts value is object {
-  if (typeof value !== 'object' || value === null || isProxy(value) || Array.isArray(value) || !Object.isFrozen(value) || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) || Object.getOwnPropertySymbols(value).length !== 0) throw new TypeError(`${name} must be a frozen plain object.`);
-  const own = Object.getOwnPropertyNames(value);
-  if (own.length !== fields.length || fields.some((field) => !Object.hasOwn(value, field))) throw new TypeError(`${name} must contain exact fields.`);
-}
-function descriptors(value: object, fields: readonly string[], name: string): Record<string, unknown> {
-  const source = Object.getOwnPropertyDescriptors(value); const result = Object.create(null) as Record<string, unknown>;
-  for (const field of fields) { const descriptor = source[field]; if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable) throw new TypeError(`${name} must contain data fields.`); result[field] = descriptor.value; }
-  return result;
-}
 function denseFrozenArray(value: unknown, name: string): readonly unknown[] {
   if (!Array.isArray(value) || isProxy(value) || !Object.isFrozen(value) || Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length !== 0) throw new TypeError(`${name} must be a frozen array.`);
   const source = Object.getOwnPropertyDescriptors(value); if (Object.getOwnPropertyNames(value).length !== value.length + 1) throw new TypeError(`${name} must be dense.`);
