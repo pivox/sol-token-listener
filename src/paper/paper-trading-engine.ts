@@ -66,10 +66,7 @@ export class PaperTradingEngine {
       snapshot.strategy.version,
       snapshot.trigger.id,
     ]);
-    const openCommandHash = hashValue('paper_open_command', {
-      ...snapshot,
-      trigger: snapshot.trigger.id,
-    });
+    const openCommandHashes = hashOpenCommand(snapshot);
     const openedAtMs = this.clock.now();
     assertValidTimestampMs('occurredAtMs', openedAtMs);
 
@@ -79,17 +76,17 @@ export class PaperTradingEngine {
         return this.reconcileOpenReplay(
           transaction,
           existing,
-          openCommandHash,
+          openCommandHashes,
           snapshot.trigger,
         );
       }
       const active = await transaction.findActivePosition(snapshot.mint, snapshot.strategy);
       if (active !== null) {
-        if (active.id === positionId && active.openCommandHash === openCommandHash) {
+        if (active.id === positionId && matchesOpenCommandHash(active, openCommandHashes)) {
           return this.reconcileOpenReplay(
             transaction,
             active,
-            openCommandHash,
+            openCommandHashes,
             snapshot.trigger,
           );
         }
@@ -100,7 +97,7 @@ export class PaperTradingEngine {
         return this.reconcileOpenReplay(
           transaction,
           terminalReplay,
-          openCommandHash,
+          openCommandHashes,
           snapshot.trigger,
         );
       }
@@ -131,7 +128,7 @@ export class PaperTradingEngine {
         roundTripLossBps: roundTrip.lossBps,
         entryTradeId: tradeId,
         exitTradeId: null,
-        openCommandHash,
+        openCommandHash: openCommandHashes.current,
         closeCommandHash: null,
         triggerEventId: snapshot.trigger.id,
         openedAtMs,
@@ -218,10 +215,10 @@ export class PaperTradingEngine {
   private async reconcileOpenReplay(
     transaction: PaperTradingTransaction,
     position: PaperPosition,
-    openCommandHash: string,
+    openCommandHashes: OpenCommandHashes,
     trigger: DomainEvent,
   ): Promise<PaperPosition> {
-    if (position.openCommandHash !== openCommandHash) conflict();
+    if (!matchesOpenCommandHash(position, openCommandHashes)) conflict();
     await transaction.reconcileEventConfirmation(
       paperEventId(
         'PaperPositionOpened',
@@ -263,6 +260,45 @@ export class PaperTradingEngine {
       );
     }
   }
+}
+
+interface OpenCommandHashes {
+  readonly current: string;
+  readonly legacy: string;
+}
+
+function hashOpenCommand(command: OpenPaperPositionCommand): OpenCommandHashes {
+  const current = {
+    ...command,
+    trigger: command.trigger.id,
+  };
+  return freeze({
+    current: hashValue('paper_open_command', current),
+    legacy: hashValue('paper_open_command', {
+      ...current,
+      qualification: legacyQualificationSnapshot(command.qualification),
+    }),
+  });
+}
+
+function legacyQualificationSnapshot(report: QualificationReport): unknown {
+  return {
+    ruleSet: {
+      id: report.ruleSet.id,
+      version: report.ruleSet.version,
+      status: report.ruleSet.status,
+      minimumTotalScore: report.ruleSet.minimumTotalScore,
+    },
+    scores: report.scores,
+    evidence: report.evidence,
+    blockers: report.blockers,
+    verdict: report.verdict,
+    evaluatedAtMs: report.evaluatedAtMs,
+  };
+}
+
+function matchesOpenCommandHash(position: PaperPosition, hashes: OpenCommandHashes): boolean {
+  return position.openCommandHash === hashes.current || position.openCommandHash === hashes.legacy;
 }
 
 function validateOpenCommand(

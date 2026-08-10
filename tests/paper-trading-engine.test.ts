@@ -21,6 +21,8 @@ import {
 import { reconcileConfirmationStatus } from '../src/domain/confirmation-status.js';
 import type { ChainConfirmationStatus } from '../src/domain/types.js';
 
+const LEGACY_OPEN_COMMAND_HASH = 'paper_open_command_c15ca7d645261fdaff95f67e813854952c2e3540fc36830318cc25bbb2685e0b';
+
 void test('refuse le mode observe sans écriture', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'observe');
@@ -230,6 +232,25 @@ void test('refuse un replay d’ouverture contradictoire sans second trade', asy
   assert.equal(repository.writeCount, 1);
 });
 
+void test('replays only the exact origin-main open-command hash for a pre-calibration position', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = openCommand();
+  const current = await engine.open(command);
+  const legacy = Object.freeze({ ...current, openCommandHash: LEGACY_OPEN_COMMAND_HASH });
+  repository.positions.set(current.id, legacy);
+
+  const replay = await engine.open(command);
+
+  assert.equal(replay.openCommandHash, LEGACY_OPEN_COMMAND_HASH);
+  assert.equal(repository.writeCount, 1);
+  await assert.rejects(engine.open({
+    ...command,
+    buyQuote: { ...command.buyQuote, feesRaw: 2n },
+  }), hasCode('POSITION_CONFLICT'));
+  assert.equal(repository.writeCount, 1);
+});
+
 void test('binds the profile fingerprint and calibrated condition evidence into open idempotency', async () => {
   const fingerprintRepository = new MemoryPaperRepository();
   const fingerprintEngine = makeEngine(fingerprintRepository, 'paper');
@@ -294,6 +315,7 @@ void test('preserves the historical calibrated qualification command hash', asyn
     first.openCommandHash,
     'paper_open_command_04adf7b1775782bd2c2a8978237cb1b653158fbf0dd4d9ca4f5e7484445971d0',
   );
+  assert.notEqual(first.openCommandHash, LEGACY_OPEN_COMMAND_HASH);
   const replay = await engine.open({
     ...command,
     qualification: {
