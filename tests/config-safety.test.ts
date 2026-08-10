@@ -22,6 +22,144 @@ void test('le mode paper est accepté avec SOL dans son allowlist initiale', () 
   assert.deepEqual(config.paperQuoteMintAllowlist, [config.wsolMint]);
 });
 
+void test('la stratégie paper end-to-end est strictement désactivée par défaut', () => {
+  const config = parseConfig(base);
+  assert.deepEqual({
+    enabled: config.paperStrategyEnabled,
+    id: config.paperStrategyId,
+    version: config.paperStrategyVersion,
+    entryQuoteAmountRaw: config.paperEntryQuoteAmountRaw,
+    externalBuyTarget: config.paperExternalBuyTarget,
+    minimumConfirmation: config.paperMinimumConfirmation,
+    entryWindowSeconds: config.paperEntryWindowSeconds,
+    quoteMaxAgeMs: config.paperQuoteMaxAgeMs,
+    quoteMaxSlotLag: config.paperQuoteMaxSlotLag,
+    slippageBps: config.paperSlippageBps,
+    workerPollMs: config.paperDecisionWorkerPollMs,
+    workerLeaseSeconds: config.paperDecisionWorkerLeaseSeconds,
+    retryMaxAttempts: config.paperDecisionRetryMaxAttempts,
+    retryBaseDelayMs: config.paperDecisionRetryBaseDelayMs,
+  }, {
+    enabled: false,
+    id: 'validated-external-buys',
+    version: 1,
+    entryQuoteAmountRaw: null,
+    externalBuyTarget: 10,
+    minimumConfirmation: 'confirmed',
+    entryWindowSeconds: 45,
+    quoteMaxAgeMs: 5_000,
+    quoteMaxSlotLag: 32,
+    slippageBps: null,
+    workerPollMs: 1_000,
+    workerLeaseSeconds: 30,
+    retryMaxAttempts: 5,
+    retryBaseDelayMs: 500,
+  });
+});
+
+void test('la stratégie paper exige un mode et des seuils explicitement sûrs', () => {
+  const enabled = {
+    ...base,
+    EXECUTION_MODE: 'paper',
+    PAPER_STRATEGY_ENABLED: 'true',
+    PAPER_ENTRY_QUOTE_AMOUNT_RAW: '10000000',
+    PAPER_SLIPPAGE_BPS: '1500',
+    QUALIFICATION_PROFILE_PATH: './config/qualification/pumpfun-v1-unvalidated.json',
+    RISK_MAX_ROUNDTRIP_LOSS_BPS: '3000',
+  } as const;
+  const config = parseConfig(enabled);
+  assert.equal(config.paperStrategyEnabled, true);
+  assert.equal(config.paperEntryQuoteAmountRaw, 10_000_000n);
+  assert.equal(config.paperSlippageBps, 1_500n);
+
+  assert.throws(() => parseConfig({ ...enabled, EXECUTION_MODE: 'observe' }), /PAPER_STRATEGY_ENABLED.*paper/u);
+  assert.throws(() => parseConfig({ ...enabled, PAPER_ENTRY_QUOTE_AMOUNT_RAW: '' }), /PAPER_ENTRY_QUOTE_AMOUNT_RAW/u);
+  assert.throws(() => parseConfig({ ...enabled, PAPER_ENTRY_QUOTE_AMOUNT_RAW: '0' }), /PAPER_ENTRY_QUOTE_AMOUNT_RAW/u);
+  assert.throws(() => parseConfig({ ...enabled, PAPER_SLIPPAGE_BPS: '' }), /PAPER_SLIPPAGE_BPS/u);
+  assert.throws(() => parseConfig({ ...enabled, QUALIFICATION_PROFILE_PATH: '' }), /QUALIFICATION_PROFILE_PATH/u);
+  assert.throws(() => parseConfig({ ...enabled, RISK_MAX_ROUNDTRIP_LOSS_BPS: undefined }), /RISK_MAX_ROUNDTRIP_LOSS_BPS/u);
+});
+
+void test('la configuration paper accepte ses bornes inclusives exactes', () => {
+  const minimums = parseConfig({
+    ...base,
+    PAPER_EXTERNAL_BUY_TARGET: '1', PAPER_ENTRY_WINDOW_SECONDS: '1',
+    PAPER_QUOTE_MAX_AGE_MS: '100', PAPER_QUOTE_MAX_SLOT_LAG: '0',
+    PAPER_DECISION_WORKER_POLL_MS: '100', PAPER_DECISION_WORKER_LEASE_SECONDS: '5',
+    PAPER_DECISION_RETRY_MAX_ATTEMPTS: '1', PAPER_DECISION_RETRY_BASE_DELAY_MS: '100',
+  });
+  assert.deepEqual([
+    minimums.paperExternalBuyTarget, minimums.paperEntryWindowSeconds,
+    minimums.paperQuoteMaxAgeMs, minimums.paperQuoteMaxSlotLag,
+    minimums.paperDecisionWorkerPollMs, minimums.paperDecisionWorkerLeaseSeconds,
+    minimums.paperDecisionRetryMaxAttempts, minimums.paperDecisionRetryBaseDelayMs,
+  ], [1, 1, 100, 0, 100, 5, 1, 100]);
+
+  const maximums = parseConfig({
+    ...base,
+    PAPER_EXTERNAL_BUY_TARGET: '1000', PAPER_ENTRY_WINDOW_SECONDS: '3600',
+    PAPER_QUOTE_MAX_AGE_MS: '60000', PAPER_QUOTE_MAX_SLOT_LAG: '10000',
+    PAPER_DECISION_WORKER_POLL_MS: '60000', PAPER_DECISION_WORKER_LEASE_SECONDS: '900',
+    PAPER_DECISION_RETRY_MAX_ATTEMPTS: '100', PAPER_DECISION_RETRY_BASE_DELAY_MS: '60000',
+    PAPER_MINIMUM_CONFIRMATION: 'finalized',
+  });
+  assert.deepEqual([
+    maximums.paperExternalBuyTarget, maximums.paperEntryWindowSeconds,
+    maximums.paperQuoteMaxAgeMs, maximums.paperQuoteMaxSlotLag,
+    maximums.paperDecisionWorkerPollMs, maximums.paperDecisionWorkerLeaseSeconds,
+    maximums.paperDecisionRetryMaxAttempts, maximums.paperDecisionRetryBaseDelayMs,
+    maximums.paperMinimumConfirmation,
+  ], [1_000, 3_600, 60_000, 10_000, 60_000, 900, 100, 60_000, 'finalized']);
+});
+
+void test('la configuration paper rejette les identifiants, enums, nombres ambigus et dépassements', () => {
+  const invalid: readonly Record<string, string>[] = [
+    { PAPER_STRATEGY_ENABLED: '1' },
+    { PAPER_STRATEGY_ID: 'other' },
+    { PAPER_STRATEGY_VERSION: '2' },
+    { PAPER_MINIMUM_CONFIRMATION: 'processed' },
+    { PAPER_EXTERNAL_BUY_TARGET: '01' },
+    { PAPER_EXTERNAL_BUY_TARGET: '1001' },
+    { PAPER_ENTRY_WINDOW_SECONDS: '3601' },
+    { PAPER_QUOTE_MAX_AGE_MS: '60001' },
+    { PAPER_QUOTE_MAX_SLOT_LAG: '10001' },
+    { PAPER_DECISION_WORKER_POLL_MS: '60001' },
+    { PAPER_DECISION_WORKER_LEASE_SECONDS: '901' },
+    { PAPER_DECISION_RETRY_MAX_ATTEMPTS: '101' },
+    { PAPER_DECISION_RETRY_BASE_DELAY_MS: '60001' },
+  ];
+  for (const values of invalid) assert.throws(() => parseConfig({ ...base, ...values }));
+
+  const enabled = {
+    ...base,
+    EXECUTION_MODE: 'paper',
+    PAPER_STRATEGY_ENABLED: 'true',
+    PAPER_ENTRY_QUOTE_AMOUNT_RAW: '1',
+    PAPER_SLIPPAGE_BPS: '0',
+    QUALIFICATION_PROFILE_PATH: './config/qualification/pumpfun-v1-unvalidated.json',
+    RISK_MAX_ROUNDTRIP_LOSS_BPS: '3000',
+  } as const;
+  for (const value of ['01', '+1', '-1', ' 1', '1 ', '1e3', '1.0', '18446744073709551616']) {
+    assert.throws(() => parseConfig({ ...enabled, PAPER_ENTRY_QUOTE_AMOUNT_RAW: value }));
+  }
+  for (const value of ['01', '+1', '-1', ' 1', '1 ', '1e3', '1.0', '10001']) {
+    assert.throws(() => parseConfig({ ...enabled, PAPER_SLIPPAGE_BPS: value }));
+  }
+});
+
+void test('le modèle d’environnement publie la stratégie paper inactive et sans montant implicite', async () => {
+  const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
+  for (const line of [
+    'PAPER_STRATEGY_ENABLED=false', 'PAPER_STRATEGY_ID=validated-external-buys',
+    'PAPER_STRATEGY_VERSION=1', 'PAPER_ENTRY_QUOTE_AMOUNT_RAW=',
+    'PAPER_EXTERNAL_BUY_TARGET=10', 'PAPER_MINIMUM_CONFIRMATION=confirmed',
+    'PAPER_ENTRY_WINDOW_SECONDS=45', 'PAPER_QUOTE_MAX_AGE_MS=5000',
+    'PAPER_QUOTE_MAX_SLOT_LAG=32', 'PAPER_SLIPPAGE_BPS=',
+    'PAPER_DECISION_WORKER_POLL_MS=1000', 'PAPER_DECISION_WORKER_LEASE_SECONDS=30',
+    'PAPER_DECISION_RETRY_MAX_ATTEMPTS=5', 'PAPER_DECISION_RETRY_BASE_DELAY_MS=500',
+  ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
+});
+
 void test('le live est toujours refusé dans la V1', () => {
   assert.throws(() => parseConfig({
     ...base,

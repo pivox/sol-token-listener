@@ -25,6 +25,7 @@
     "docs:check": "tsx scripts/check-system-overview.ts"
   },
   "dependencies": {
+    "@pump-fun/pump-sdk": "1.36.0",
     "@pump-fun/pump-swap-sdk": "1.19.0",
     "@raydium-io/raydium-sdk-v2": "0.2.59-alpha",
     "@solana/spl-token": "0.4.15",

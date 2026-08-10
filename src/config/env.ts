@@ -8,6 +8,8 @@ const MAX_RECONCILE_SECONDS = 2_147_483;
 
 export type ExecutionMode = 'observe' | 'paper';
 export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
+export type PaperStrategyId = 'validated-external-buys';
+export type PaperMinimumConfirmation = 'confirmed' | 'finalized';
 
 export interface AppConfig {
   readonly cluster: string;
@@ -19,6 +21,20 @@ export interface AppConfig {
   readonly autoMigrate: boolean;
   readonly executionMode: ExecutionMode;
   readonly paperQuoteMintAllowlist: readonly string[];
+  readonly paperStrategyEnabled: boolean;
+  readonly paperStrategyId: PaperStrategyId;
+  readonly paperStrategyVersion: 1;
+  readonly paperEntryQuoteAmountRaw: bigint | null;
+  readonly paperExternalBuyTarget: number;
+  readonly paperMinimumConfirmation: PaperMinimumConfirmation;
+  readonly paperEntryWindowSeconds: number;
+  readonly paperQuoteMaxAgeMs: number;
+  readonly paperQuoteMaxSlotLag: number;
+  readonly paperSlippageBps: bigint | null;
+  readonly paperDecisionWorkerPollMs: number;
+  readonly paperDecisionWorkerLeaseSeconds: number;
+  readonly paperDecisionRetryMaxAttempts: number;
+  readonly paperDecisionRetryBaseDelayMs: number;
   readonly qualificationProfilePath: string | null;
   readonly qualificationRuleSetStatus: QualificationRuleSetStatus;
   readonly qualificationMinimumScore: number | null;
@@ -89,6 +105,23 @@ export interface TransactionInboxRetryPolicyConfig {
   readonly baseDelayMs: number;
 }
 
+interface PaperStrategyConfig {
+  readonly paperStrategyEnabled: boolean;
+  readonly paperStrategyId: PaperStrategyId;
+  readonly paperStrategyVersion: 1;
+  readonly paperEntryQuoteAmountRaw: bigint | null;
+  readonly paperExternalBuyTarget: number;
+  readonly paperMinimumConfirmation: PaperMinimumConfirmation;
+  readonly paperEntryWindowSeconds: number;
+  readonly paperQuoteMaxAgeMs: number;
+  readonly paperQuoteMaxSlotLag: number;
+  readonly paperSlippageBps: bigint | null;
+  readonly paperDecisionWorkerPollMs: number;
+  readonly paperDecisionWorkerLeaseSeconds: number;
+  readonly paperDecisionRetryMaxAttempts: number;
+  readonly paperDecisionRetryBaseDelayMs: number;
+}
+
 export function parseTransactionInboxRetryPolicy(
   environment: NodeJS.ProcessEnv | Record<string, string | undefined>,
 ): TransactionInboxRetryPolicyConfig {
@@ -123,6 +156,19 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     environment.API_PAGE_LIMIT_DEFAULT, 50, 'API_PAGE_LIMIT_DEFAULT', 1, apiPageLimitMaximum,
   );
   const transactionInboxRetryPolicy = parseTransactionInboxRetryPolicy(environment);
+  const qualificationProfilePath = parseQualificationProfilePath(environment.QUALIFICATION_PROFILE_PATH);
+  const riskMaxRoundTripLossBps = parseInteger(
+    environment.RISK_MAX_ROUNDTRIP_LOSS_BPS,
+    3_000,
+    'RISK_MAX_ROUNDTRIP_LOSS_BPS',
+    0,
+    10_000,
+  );
+  const paperStrategyConfig = parsePaperStrategyConfig(
+    environment,
+    executionMode,
+    qualificationProfilePath,
+  );
 
   return {
     cluster: optional(environment.SOLANA_CLUSTER, 'mainnet-beta'),
@@ -134,7 +180,8 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     autoMigrate: parseBoolean(environment.POSTGRES_AUTO_MIGRATE, false, 'POSTGRES_AUTO_MIGRATE'),
     executionMode,
     paperQuoteMintAllowlist,
-    qualificationProfilePath: parseQualificationProfilePath(environment.QUALIFICATION_PROFILE_PATH),
+    ...paperStrategyConfig,
+    qualificationProfilePath,
     qualificationRuleSetStatus: parseQualificationRuleSetStatus(environment.QUALIFICATION_RULE_SET_STATUS),
     qualificationMinimumScore: parseOptionalInteger(
       environment.QUALIFICATION_MIN_SCORE,
@@ -210,7 +257,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     riskMaxTransferFeeBps: parseInteger(environment.RISK_MAX_TRANSFER_FEE_BPS, 1_500, 'RISK_MAX_TRANSFER_FEE_BPS', 0, 10_000),
     riskMaxBuyPriceImpactBps: parseOptionalInteger(environment.RISK_MAX_BUY_PRICE_IMPACT_BPS, null, 'RISK_MAX_BUY_PRICE_IMPACT_BPS', 0, 10_000),
     riskMaxSellPriceImpactBps: parseOptionalInteger(environment.RISK_MAX_SELL_PRICE_IMPACT_BPS, null, 'RISK_MAX_SELL_PRICE_IMPACT_BPS', 0, 10_000),
-    riskMaxRoundTripLossBps: parseInteger(environment.RISK_MAX_ROUNDTRIP_LOSS_BPS, 3_000, 'RISK_MAX_ROUNDTRIP_LOSS_BPS', 0, 10_000),
+    riskMaxRoundTripLossBps,
     riskBuySimulationRequired: parseBoolean(environment.RISK_BUY_SIMULATION_REQUIRED, true, 'RISK_BUY_SIMULATION_REQUIRED'),
     riskReverseQuoteRequired: parseBoolean(environment.RISK_REVERSE_QUOTE_REQUIRED, true, 'RISK_REVERSE_QUOTE_REQUIRED'),
     riskMaxTop1HolderBps: parseOptionalInteger(environment.RISK_MAX_TOP1_HOLDER_BPS, null, 'RISK_MAX_TOP1_HOLDER_BPS', 0, 10_000),
@@ -258,6 +305,123 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   };
 }
 
+function parsePaperStrategyConfig(
+  environment: NodeJS.ProcessEnv | Record<string, string | undefined>,
+  executionMode: ExecutionMode,
+  qualificationProfilePath: string | null,
+): PaperStrategyConfig {
+  const paperStrategyEnabled = parseBoolean(
+    environment.PAPER_STRATEGY_ENABLED,
+    false,
+    'PAPER_STRATEGY_ENABLED',
+  );
+  const paperStrategyId = parseClosedLiteral(
+    environment.PAPER_STRATEGY_ID,
+    'validated-external-buys',
+    'PAPER_STRATEGY_ID',
+    ['validated-external-buys'],
+  );
+  const paperStrategyVersion = parseClosedIntegerLiteral(
+    environment.PAPER_STRATEGY_VERSION,
+    1,
+    'PAPER_STRATEGY_VERSION',
+  );
+  const paperExternalBuyTarget = parseCanonicalBoundedInteger(
+    environment.PAPER_EXTERNAL_BUY_TARGET, 10, 'PAPER_EXTERNAL_BUY_TARGET', 1, 1_000,
+  );
+  const paperMinimumConfirmation = parseClosedLiteral(
+    environment.PAPER_MINIMUM_CONFIRMATION,
+    'confirmed',
+    'PAPER_MINIMUM_CONFIRMATION',
+    ['confirmed', 'finalized'],
+  );
+  const paperEntryWindowSeconds = parseCanonicalBoundedInteger(
+    environment.PAPER_ENTRY_WINDOW_SECONDS, 45, 'PAPER_ENTRY_WINDOW_SECONDS', 1, 3_600,
+  );
+  const paperQuoteMaxAgeMs = parseCanonicalBoundedInteger(
+    environment.PAPER_QUOTE_MAX_AGE_MS, 5_000, 'PAPER_QUOTE_MAX_AGE_MS', 100, 60_000,
+  );
+  const paperQuoteMaxSlotLag = parseCanonicalBoundedInteger(
+    environment.PAPER_QUOTE_MAX_SLOT_LAG, 32, 'PAPER_QUOTE_MAX_SLOT_LAG', 0, 10_000,
+  );
+  const paperDecisionWorkerPollMs = parseCanonicalBoundedInteger(
+    environment.PAPER_DECISION_WORKER_POLL_MS, 1_000, 'PAPER_DECISION_WORKER_POLL_MS', 100, 60_000,
+  );
+  const paperDecisionWorkerLeaseSeconds = parseCanonicalBoundedInteger(
+    environment.PAPER_DECISION_WORKER_LEASE_SECONDS, 30, 'PAPER_DECISION_WORKER_LEASE_SECONDS', 5, 900,
+  );
+  const paperDecisionRetryMaxAttempts = parseCanonicalBoundedInteger(
+    environment.PAPER_DECISION_RETRY_MAX_ATTEMPTS, 5, 'PAPER_DECISION_RETRY_MAX_ATTEMPTS', 1, 100,
+  );
+  const paperDecisionRetryBaseDelayMs = parseCanonicalBoundedInteger(
+    environment.PAPER_DECISION_RETRY_BASE_DELAY_MS, 500, 'PAPER_DECISION_RETRY_BASE_DELAY_MS', 100, 60_000,
+  );
+
+  if (!paperStrategyEnabled) {
+    return {
+      paperStrategyEnabled,
+      paperStrategyId,
+      paperStrategyVersion,
+      paperEntryQuoteAmountRaw: null,
+      paperExternalBuyTarget,
+      paperMinimumConfirmation,
+      paperEntryWindowSeconds,
+      paperQuoteMaxAgeMs,
+      paperQuoteMaxSlotLag,
+      paperSlippageBps: null,
+      paperDecisionWorkerPollMs,
+      paperDecisionWorkerLeaseSeconds,
+      paperDecisionRetryMaxAttempts,
+      paperDecisionRetryBaseDelayMs,
+    };
+  }
+
+  if (executionMode !== 'paper') {
+    throw new Error('PAPER_STRATEGY_ENABLED requires EXECUTION_MODE=paper.');
+  }
+  if (qualificationProfilePath === null) {
+    throw new Error('PAPER_STRATEGY_ENABLED requires an explicit QUALIFICATION_PROFILE_PATH.');
+  }
+  if (!hasValue(environment.RISK_MAX_ROUNDTRIP_LOSS_BPS)) {
+    throw new Error('PAPER_STRATEGY_ENABLED requires an explicit RISK_MAX_ROUNDTRIP_LOSS_BPS.');
+  }
+
+  const paperEntryQuoteAmountRaw = parseCanonicalBigInt(
+    environment.PAPER_ENTRY_QUOTE_AMOUNT_RAW,
+    'PAPER_ENTRY_QUOTE_AMOUNT_RAW',
+  );
+  if (paperEntryQuoteAmountRaw === null || paperEntryQuoteAmountRaw === 0n) {
+    throw new Error('PAPER_ENTRY_QUOTE_AMOUNT_RAW must be explicitly configured above zero.');
+  }
+  const slippage = parseCanonicalBoundedInteger(
+    environment.PAPER_SLIPPAGE_BPS,
+    -1,
+    'PAPER_SLIPPAGE_BPS',
+    0,
+    10_000,
+  );
+  if (slippage < 0) {
+    throw new Error('PAPER_SLIPPAGE_BPS must be explicitly configured.');
+  }
+
+  return {
+    paperStrategyEnabled,
+    paperStrategyId,
+    paperStrategyVersion,
+    paperEntryQuoteAmountRaw,
+    paperExternalBuyTarget,
+    paperMinimumConfirmation,
+    paperEntryWindowSeconds,
+    paperQuoteMaxAgeMs,
+    paperQuoteMaxSlotLag,
+    paperSlippageBps: BigInt(slippage),
+    paperDecisionWorkerPollMs,
+    paperDecisionWorkerLeaseSeconds,
+    paperDecisionRetryMaxAttempts,
+    paperDecisionRetryBaseDelayMs,
+  };
+}
+
 export function loadConfig(): AppConfig {
   return parseConfig(process.env);
 }
@@ -267,6 +431,27 @@ function parseExecutionMode(raw: string | undefined): ExecutionMode {
   if (value !== 'observe' && value !== 'paper') {
     throw new Error('EXECUTION_MODE must be observe or paper in Pump.fun V1.');
   }
+  return value;
+}
+
+function parseClosedLiteral<const T extends string>(
+  raw: string | undefined,
+  fallback: T,
+  name: string,
+  values: readonly T[],
+): T {
+  if (raw === undefined || raw === '') return fallback;
+  if (!values.includes(raw as T)) throw new Error(`${name} has an unsupported value.`);
+  return raw as T;
+}
+
+function parseClosedIntegerLiteral<const T extends number>(
+  raw: string | undefined,
+  value: T,
+  name: string,
+): T {
+  if (raw === undefined || raw === '') return value;
+  if (raw !== String(value)) throw new Error(`${name} must be ${String(value)}.`);
   return value;
 }
 
@@ -312,6 +497,18 @@ function parseOptionalBigInt(raw: string | undefined, name: string): bigint | nu
   if (!hasValue(raw)) return null;
   if (!/^\d+$/u.test(raw.trim())) throw new Error(`${name} must be a non-negative integer.`);
   return BigInt(raw.trim());
+}
+
+function parseCanonicalBigInt(raw: string | undefined, name: string): bigint | null {
+  if (raw === undefined || raw === '') return null;
+  if (!/^(?:0|[1-9]\d*)$/u.test(raw)) {
+    throw new Error(`${name} must be a canonical non-negative integer.`);
+  }
+  const value = BigInt(raw);
+  if (value > 18_446_744_073_709_551_615n) {
+    throw new Error(`${name} is outside its allowed range.`);
+  }
+  return value;
 }
 
 function parseInteger(
