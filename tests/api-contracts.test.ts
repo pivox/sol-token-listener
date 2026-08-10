@@ -291,7 +291,7 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   const health: ApiHealth = {
     status: 'OK', observedAt: '2026-07-29T12:00:00.000Z',
     postgresql: { status: 'AVAILABLE' }, http: { status: 'AVAILABLE' },
-    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', social: 'RUNNING' },
+    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING' },
     socialJobs: { pendingCount: 1, leasedCount: 1, retryableFailedCount: 0, exhaustedCount: 0 },
     checkpoints: { launchpad: '1', market: null },
     heartbeat: {

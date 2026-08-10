@@ -126,6 +126,10 @@ implements MarketObservationRepository {
       return Object.freeze({
         migrations: Object.freeze(migrations),
         activations: Object.freeze(activations),
+        affectedMints: Object.freeze([...new Set([
+          ...batch.matches.map((match) => match.migrationEvent.mint),
+          ...batch.trades.map((trade) => trade.mint),
+        ])].sort()),
       });
     } catch (error) {
       await client.query('ROLLBACK');

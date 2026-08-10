@@ -84,6 +84,7 @@ export interface ApiProjectionPipelineState {
   readonly httpAvailable: boolean;
   readonly pumpfun: ApiHealth['pipeline']['pumpfun'];
   readonly pumpswap: ApiHealth['pipeline']['pumpswap'];
+  readonly paperDecision: ApiHealth['pipeline']['paperDecision'];
   readonly social: ApiHealth['pipeline']['social'];
 }
 
@@ -144,6 +145,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       httpAvailable: false,
       pumpfun: 'STOPPED',
       pumpswap: 'STOPPED',
+      paperDecision: 'STOPPED',
       social: 'STOPPED',
     },
     private readonly holderLimits: ApiHolderProjectionLimits = {
@@ -1552,6 +1554,7 @@ const DEGRADED_PIPELINE_STATE: ApiProjectionPipelineState = Object.freeze({
   httpAvailable: false,
   pumpfun: 'DEGRADED',
   pumpswap: 'DEGRADED',
+  paperDecision: 'DEGRADED',
   social: 'DEGRADED',
 });
 
@@ -1613,20 +1616,23 @@ function pipelineState(provider: ApiProjectionPipelineStateProvider): ApiProject
   const value: unknown = provider();
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== 4
+  if (keys.length !== 5
     || !keys.includes('httpAvailable')
     || !keys.includes('pumpfun')
     || !keys.includes('pumpswap')
+    || !keys.includes('paperDecision')
     || !keys.includes('social')) throw invalid();
   const httpAvailable = pipelineValue(value, 'httpAvailable');
   const pumpfun = pipelineValue(value, 'pumpfun');
   const pumpswap = pipelineValue(value, 'pumpswap');
+  const paperDecision = pipelineValue(value, 'paperDecision');
   const social = pipelineValue(value, 'social');
   if (typeof httpAvailable !== 'boolean'
     || !isPipelineRuntimeState(pumpfun)
     || !isPipelineRuntimeState(pumpswap)
+    || !isPipelineRuntimeState(paperDecision)
     || !isPipelineRuntimeState(social)) throw invalid();
-  return freeze({ httpAvailable, pumpfun, pumpswap, social });
+  return freeze({ httpAvailable, pumpfun, pumpswap, paperDecision, social });
 }
 
 function pipelineValue(value: object, key: string): unknown {
@@ -1654,7 +1660,12 @@ function healthResult(
   return freeze({ status: degraded ? 'DEGRADED' : 'OK', observedAt: observedAt.toISOString(),
     postgresql: freeze({ status: databaseAvailable ? 'AVAILABLE' : 'UNAVAILABLE' }),
     http: freeze({ status: pipeline.httpAvailable ? 'AVAILABLE' : 'UNAVAILABLE' }),
-    pipeline: freeze({ pumpfun: pipeline.pumpfun, pumpswap: pipeline.pumpswap, social: pipeline.social }),
+    pipeline: freeze({
+      pumpfun: pipeline.pumpfun,
+      pumpswap: pipeline.pumpswap,
+      paperDecision: pipeline.paperDecision,
+      social: pipeline.social,
+    }),
     socialJobs,
     checkpoints: freeze({ launchpad: checkpoints.get('launchpad') ?? null, market: checkpoints.get('market') ?? null }),
     heartbeat, lagSlots });

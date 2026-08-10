@@ -399,6 +399,7 @@ export interface ApiHealthDependency {
 export interface ApiPipelineHealth {
   readonly pumpfun: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly pumpswap: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+  readonly paperDecision: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly social: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
 }
 

@@ -51,7 +51,7 @@ void test('migrates, starts listener before API, then closes listener before API
   const calls: string[] = [];
   const pool = {};
   const runtime = listener(calls, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   await runApplication(dependencies(calls, {
     loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: true }),
@@ -177,7 +177,7 @@ void test('explicit listener disablement exposes STOPPED pipeline state to the A
   }));
   assert.notEqual(pipeline, null);
   assert.deepEqual((pipeline as unknown as () => ApiProjectionPipelineState)(), {
-    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', social: 'STOPPED',
+    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', paperDecision: 'STOPPED', social: 'STOPPED',
   });
   assert.ok(calls.includes('log:listener.disabled'));
   assert.doesNotMatch(calls.join(','), /listener\.create|listener\.start|listener\.close/u);
@@ -193,7 +193,7 @@ void test('listener startup failure fails the process and cleans listener before
       async close() { calls.push('listener.close'); },
       state: () => 'DEGRADED',
       pipelineState: () => ({
-        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', social: 'DEGRADED',
+        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
       }),
     }),
   })), (error: unknown) => error === startupFailure);
@@ -216,7 +216,7 @@ void test('API bind failure aggregates listener, server, and database cleanup in
       async close() { calls.push('listener.close'); throw listenerFailure; },
       state: () => 'RUNNING',
       pipelineState: () => ({
-        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'RUNNING',
+        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
       }),
     }),
     createApiServer: () => ({
@@ -297,7 +297,7 @@ function dependencies(
   overrides: Partial<ApplicationDependencies> = {},
 ): Partial<ApplicationDependencies> {
   const runtime = listener(calls, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   return {
     loadConfig: () => config,

@@ -206,6 +206,8 @@ interface HarnessOptions {
   readonly fundingEvidenceCount?: number;
   readonly marketMigrationCount?: number;
   readonly marketActivationCount?: number;
+  readonly marketAffectedMints?: readonly string[];
+  readonly paperDecisions?: boolean;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -295,6 +297,7 @@ function harness(options: HarnessOptions = {}) {
           { length: options.marketActivationCount ?? 0 },
           () => Object.freeze({}),
         )),
+        affectedMints: Object.freeze([...(options.marketAffectedMints ?? [])]),
       });
   };
   const market = {
@@ -302,6 +305,16 @@ function harness(options: HarnessOptions = {}) {
     processObserved: observeMarket,
   };
   const tx = transaction();
+  const paperDecisions = options.paperDecisions === true ? {
+    enqueueLatest: async (
+      mint: string,
+      signature: string,
+      confirmationStatus: string,
+    ) => {
+      order.push(`paper:${mint}:${signature}:${confirmationStatus}`);
+      fail('paper_decision_enqueue', mint);
+    },
+  } : null;
   const pipeline = new ObservedTransactionPipeline(
     reader,
     launchpad,
@@ -314,6 +327,7 @@ function harness(options: HarnessOptions = {}) {
       fail('create_observation');
       return 1_700_000_000_500;
     },
+    paperDecisions,
   );
   return {
     pipeline,
@@ -370,6 +384,7 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
     walletGraphCount: 2,
     marketMigrationCount: 0,
     marketActivationCount: 0,
+    paperDecisionEnqueueCount: 0,
   });
   assert.ok(Object.isFrozen(result));
   assert.ok(Object.values(result).every(Number.isSafeInteger));
@@ -380,6 +395,42 @@ void test('keeps an irrelevant active transaction write-minimal while PumpSwap s
   const result = await h.pipeline.process(h.tx);
   assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload', 'funding:', 'pumpswap']);
   assert.equal(result.affectedMintCount, 0);
+});
+
+void test('enqueues one durable paper decision per affected mint after every projection', async () => {
+  const h = harness({
+    activeEvents: [event('trade-b', 'MintB')],
+    launchpadAffectedMints: ['MintA'],
+    marketAffectedMints: ['MintC', 'MintA'],
+    paperDecisions: true,
+  });
+
+  const result = await h.pipeline.process(h.tx);
+
+  assert.deepEqual(h.order.slice(-4), [
+    'pumpswap',
+    `paper:MintA:${SIGNATURE}:confirmed`,
+    `paper:MintB:${SIGNATURE}:confirmed`,
+    `paper:MintC:${SIGNATURE}:confirmed`,
+  ]);
+  assert.equal(result.paperDecisionEnqueueCount, 3);
+});
+
+void test('attributes a paper enqueue failure to its mint and stops deterministically', async () => {
+  const h = harness({
+    launchpadAffectedMints: ['MintA', 'MintB'],
+    paperDecisions: true,
+    fail: 'paper_decision_enqueue',
+    failMint: 'MintA',
+  });
+
+  await assert.rejects(h.pipeline.process(transaction('ORPHANED')), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'paper_decision_enqueue');
+    assert.equal(error.mint, 'MintA');
+    return true;
+  });
+  assert.equal(h.order.at(-1), `paper:MintA:${SIGNATURE}:orphaned`);
 });
 
 void test('pairs creation and initial buy for one mint only once', async () => {

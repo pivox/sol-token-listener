@@ -4,6 +4,7 @@ import {
   createTokenLaunchDetectedEvent,
 } from '../domain/launchpad-events.js';
 import type { LaunchpadObservationEventV1 } from '../domain/launchpad-events.js';
+import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { LaunchpadEventBatchResult } from '../ports/launchpad-event-sink.js';
 import type { LaunchpadProjectionReader } from '../ports/launchpad-projection-reader.js';
 import { createSolanaObservedTransaction } from '../solana/rpc/observed-transaction.js';
@@ -34,7 +35,8 @@ export type ObservedPipelineStage =
   | 'funding_observation'
   | 'participant_analytics'
   | 'wallet_graph'
-  | 'pumpswap_observation';
+  | 'pumpswap_observation'
+  | 'paper_decision_enqueue';
 
 export interface ObservedPipelineResult {
   readonly launchpadEventCount: number;
@@ -46,6 +48,7 @@ export interface ObservedPipelineResult {
   readonly walletGraphCount: number;
   readonly marketMigrationCount: number;
   readonly marketActivationCount: number;
+  readonly paperDecisionEnqueueCount: number;
 }
 
 export class ObservedPipelineError extends Error {
@@ -89,12 +92,21 @@ interface MintProjectionRebuilder {
 interface MarketObservationResult {
   readonly migrations: readonly unknown[];
   readonly activations: readonly unknown[];
+  readonly affectedMints: readonly string[];
 }
 
 interface MarketObserver {
   processObserved(
     transaction: SolanaObservedTransaction,
   ): Promise<MarketObservationResult>;
+}
+
+interface PaperDecisionScheduler {
+  enqueueLatest(
+    mint: string,
+    triggerSignature: string,
+    triggerConfirmationStatus: ChainConfirmationStatus,
+  ): Promise<void>;
 }
 
 export class ObservedTransactionPipeline {
@@ -106,6 +118,7 @@ export class ObservedTransactionPipeline {
     private readonly graph: MintProjectionRebuilder,
     private readonly market: MarketObserver,
     private readonly clock: () => number = Date.now,
+    private readonly paperDecisions: PaperDecisionScheduler | null = null,
   ) {}
 
   public async process(
@@ -146,10 +159,21 @@ export class ObservedTransactionPipeline {
     }
 
     const market = await this.stage('pumpswap_observation', null, async () =>
-      snapshotNamedCounts(
-        await this.market.processObserved(observed),
-        ['migrations', 'activations'],
-      ));
+      snapshotMarketResult(await this.market.processObserved(observed)));
+    const paperMints = affectedMintList(affectedMints, market.affectedMints);
+    let paperDecisionEnqueueCount = 0;
+    const paperDecisions = this.paperDecisions;
+    if (paperDecisions !== null) {
+      for (const mint of paperMints) {
+        await this.stage('paper_decision_enqueue', mint, () =>
+          paperDecisions.enqueueLatest(
+            mint,
+            observed.signature,
+            observed.confirmationStatus,
+          ));
+        paperDecisionEnqueueCount += 1;
+      }
+    }
     return Object.freeze({
       launchpadEventCount: launchpad.eventCount,
       activeEventCount: active.events.length,
@@ -158,8 +182,9 @@ export class ObservedTransactionPipeline {
       affectedMintCount: affectedMints.length,
       participantAnalyticsCount,
       walletGraphCount,
-      marketMigrationCount: market[0],
-      marketActivationCount: market[1],
+      marketMigrationCount: market.migrationCount,
+      marketActivationCount: market.activationCount,
+      paperDecisionEnqueueCount,
     });
   }
 
@@ -174,6 +199,19 @@ export class ObservedTransactionPipeline {
       throw new ObservedPipelineError(stage, mint);
     }
   }
+}
+
+function snapshotMarketResult(value: unknown): Readonly<{
+  migrationCount: number;
+  activationCount: number;
+  affectedMints: readonly string[];
+}> {
+  const result=dataRecord(value,['migrations','activations','affectedMints']);
+  return Object.freeze({
+    migrationCount:denseArrayLength(result.migrations),
+    activationCount:denseArrayLength(result.activations),
+    affectedMints:snapshotMintIterable(result.affectedMints),
+  });
 }
 
 function boundedMintSet(values: ReadonlySet<string>): ReadonlySet<string> {

@@ -28,6 +28,7 @@ export const EMPTY_MARKET_OBSERVATION_RESULT: MarketObservationResult =
   Object.freeze({
     migrations: Object.freeze([]),
     activations: Object.freeze([]),
+    affectedMints: Object.freeze([]),
   });
 
 export class ConflictingMarketPoolError extends Error {

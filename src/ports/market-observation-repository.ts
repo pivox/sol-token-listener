@@ -28,6 +28,7 @@ export interface MarketObservationBatch {
 export interface MarketObservationResult {
   readonly migrations: readonly MigrationObservedEventV1[];
   readonly activations: readonly PumpSwapPoolActivatedEventV1[];
+  readonly affectedMints: readonly string[];
 }
 
 export interface MarketObservationRepository {

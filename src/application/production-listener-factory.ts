@@ -12,6 +12,9 @@ import { PumpSwapFeeStateReader } from '../markets/pumpswap/pumpswap-fee-state.j
 import { PumpSwapMarketAdapter } from '../markets/pumpswap/pumpswap-market.adapter.js';
 import { PumpSwapQuoteProvider } from '../markets/pumpswap/pumpswap-quote.provider.js';
 import { PumpSwapReserveReader } from '../markets/pumpswap/pumpswap-reserve-reader.js';
+import { CanonicalPaperQuoteRouter } from '../paper/paper-quote-router.js';
+import { PaperTradingEngine } from '../paper/paper-trading-engine.js';
+import { PumpFunPaperQuoteProvider } from '../paper/pumpfun-paper-quote.provider.js';
 import { BoundedPublicHttpClient } from '../metadata/bounded-public-http.client.js';
 import { HttpMetadataProvider } from '../metadata/http-metadata.provider.js';
 import { RpcPumpSwapPoolValidator } from '../markets/pumpswap/pool-validator.js';
@@ -27,6 +30,9 @@ import { getDatabasePool } from '../storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../storage/launchpad-event.repository.js';
 import { PostgresMarketObservationRepository } from '../storage/market-observation.repository.js';
 import { PostgresParticipantAnalyticsRepository } from '../storage/participant-analytics.repository.js';
+import { PostgresPaperDecisionRepository } from '../storage/paper-decision.repository.js';
+import { PostgresPaperTradingRepository } from '../storage/paper-trading.repository.js';
+import { PostgresPaperVenueReader } from '../storage/paper-venue.reader.js';
 import { PostgresSocialEvidenceRepository } from '../storage/social-evidence.repository.js';
 import { PostgresTransactionInboxRepository } from '../storage/transaction-inbox.repository.js';
 import { PostgresWalletEvidenceRepository } from '../storage/wallet-evidence.repository.js';
@@ -44,6 +50,12 @@ import { WalletEvidenceObservationService } from './wallet-evidence-observation.
 import { WalletGraphRebuildService } from './wallet-graph-rebuild.service.js';
 import { PublicSocialVerificationProvider } from '../social/public-social-verification.provider.js';
 import { SocialEnrichmentWorker } from './social-enrichment-worker.js';
+import { PaperDecisionWorker } from './paper-decision-worker.js';
+import { QualificationRebuildService } from './qualification-rebuild.service.js';
+import { TradingCandidateService } from './trading-candidate.service.js';
+import { ValidatedExternalBuysStrategy } from './validated-external-buys.strategy.js';
+import { QualificationEngine } from '../qualification/qualification-engine.js';
+import { loadQualificationProfile } from '../qualification/qualification-profile.js';
 
 type ProductionPool = ReturnType<typeof getDatabasePool>;
 export const MAX_LISTENER_TIMER_DELAY_MS = 2_147_483_647;
@@ -136,6 +148,68 @@ export function createProductionListenerRuntime(
     new PostgresMarketObservationRepository(pool, config.dataRetentionHours),
   );
   const marketPipeline = new PumpSwapObservationPipeline(pump, market, marketService);
+  const paperRepository = new PostgresPaperDecisionRepository(pool, {
+    maxAttempts: config.paperDecisionRetryMaxAttempts,
+    baseDelayMs: config.paperDecisionRetryBaseDelayMs,
+    retentionHours: 4,
+  });
+  const qualificationProfile = loadQualificationProfile({
+    profilePath: config.qualificationProfilePath,
+    minimumScoreOverride: config.qualificationMinimumScore,
+  });
+  const qualificationEngine = new QualificationEngine(qualificationProfile);
+  const quoteRouter = new CanonicalPaperQuoteRouter(
+    new PostgresPaperVenueReader(() => rpc.getSlot(), pool),
+    new PumpFunPaperQuoteProvider(marketRpc),
+    market,
+    {
+      maxAgeMs: config.paperQuoteMaxAgeMs,
+      maxSlotLag: BigInt(config.paperQuoteMaxSlotLag),
+    },
+  );
+  const paperTrading = new PaperTradingEngine(
+    config,
+    new PostgresPaperTradingRepository(pool),
+    qualificationProfile,
+    qualificationEngine,
+  );
+  const paperStrategy = new ValidatedExternalBuysStrategy(
+    paperTrading,
+    quoteRouter,
+    { retentionMs: 14_400_000 },
+  );
+  const paperWorker = new PaperDecisionWorker(
+    paperRepository,
+    quoteRouter,
+    new QualificationRebuildService(qualificationEngine),
+    new TradingCandidateService({
+      strategy: { id: config.paperStrategyId, version: config.paperStrategyVersion },
+      quoteMintAllowlist: config.paperQuoteMintAllowlist,
+      minimumConfirmation: config.paperMinimumConfirmation,
+      entryWindowMs: config.paperEntryWindowSeconds * 1_000,
+      maximumQuoteAgeMs: config.paperQuoteMaxAgeMs,
+      maximumQuoteSlotLag: BigInt(config.paperQuoteMaxSlotLag),
+      retentionMs: 14_400_000,
+    }),
+    paperStrategy,
+    {
+      executionMode: config.executionMode,
+      paperStrategyEnabled: config.paperStrategyEnabled,
+      quoteMintAllowlist: config.paperQuoteMintAllowlist,
+      entryQuoteAmountRaw: config.paperEntryQuoteAmountRaw ?? 1n,
+      slippageBps: config.paperSlippageBps ?? 0n,
+      externalBuyTarget: config.paperExternalBuyTarget,
+      minimumConfirmation: config.paperMinimumConfirmation,
+      maximumRoundTripLossBps: BigInt(config.riskMaxRoundTripLossBps),
+      pollIntervalMs: config.paperDecisionWorkerPollMs,
+      leaseMs: config.paperDecisionWorkerLeaseSeconds * 1_000,
+      renewalIntervalMs: Math.max(
+        1_000,
+        Math.floor(config.paperDecisionWorkerLeaseSeconds * 1_000 / 3),
+      ),
+      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+    },
+  );
   const pipeline = new ObservedTransactionPipeline(
     launchpadRepository,
     launchpad,
@@ -143,6 +217,8 @@ export function createProductionListenerRuntime(
     participants,
     graph,
     marketPipeline,
+    Date.now,
+    paperRepository,
   );
 
   const worker = new TransactionInboxWorker(inbox, locator, pipeline, {
@@ -163,6 +239,7 @@ export function createProductionListenerRuntime(
   const subscriberComponent = lifecycleComponent(subscriber);
   const workerComponent = lifecycleComponent(worker);
   const socialWorkerComponent = lifecycleComponent(socialWorker);
+  const paperWorkerComponent = lifecycleComponent(paperWorker);
   const heartbeat = new PersistentListenerHeartbeat(
     inbox,
     rpc,
@@ -178,6 +255,7 @@ export function createProductionListenerRuntime(
     scanner,
     subscriber: subscriberComponent,
     worker: workerComponent,
+    paperWorker: paperWorkerComponent,
     socialWorker: socialWorkerComponent,
     reconciler,
     heartbeat,

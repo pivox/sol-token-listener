@@ -8,7 +8,7 @@ import type { CreatorProfile, HolderDistribution } from '../domain/participant-a
 import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
 import type { SocialEvidenceCollectionV1 } from '../domain/social-evidence.js';
 import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
-import type { TokenLaunch } from '../domain/types.js';
+import type { ChainConfirmationStatus, TokenLaunch } from '../domain/types.js';
 import type {
   WalletCluster,
   WalletClusterMember,
@@ -101,6 +101,52 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     } finally {
       release(client);
     }
+  }
+
+  public async enqueueLatest(
+    mint: string,
+    triggerSignature: string,
+    triggerConfirmationStatus: ChainConfirmationStatus,
+  ): Promise<void> {
+    boundedText(mint, 'mint');
+    boundedText(triggerSignature, 'triggerSignature');
+    if (!['processed','confirmed','finalized','orphaned'].includes(triggerConfirmationStatus)) {
+      throw new TypeError('triggerConfirmationStatus is invalid.');
+    }
+    const client = await this.connect('enqueue');
+    let input: PaperDecisionJobInput | null = null;
+    try {
+      const result = await client.query(`SELECT event.event_id,event.raw_event_id,
+        event.confirmation_status FROM domain_events event
+        WHERE event.mint=$1 AND event.raw_event_id IS NOT NULL
+          AND event.confirmation_status<>'orphaned'
+          AND event.type IN (
+            'TokenLaunchDetected','BondingCurveTradeObserved',
+            'BondingCurveStateUpdated','BondingCurveCompleted',
+            'MigrationObserved','PumpSwapPoolActivated'
+          )
+        ORDER BY event.slot DESC,event.transaction_index DESC,
+          event.instruction_index DESC,COALESCE(event.inner_instruction_index,-1) DESC,
+          event.event_id DESC LIMIT 1`, [mint]);
+      const row=result.rows[0];
+      if (row !== undefined) {
+        const sourceEventId=textField(row,'event_id');
+        const sourceRawEventId=textField(row,'raw_event_id');
+        const sourceConfirmationStatus=textField(row,'confirmation_status') as PaperDecisionJobInput['sourceConfirmationStatus'];
+        input=Object.freeze({
+          mint,sourceEventId,sourceRawEventId,sourceConfirmationStatus,
+          inputFingerprint:hash([
+            mint,sourceEventId,sourceRawEventId,sourceConfirmationStatus,
+            triggerSignature,triggerConfirmationStatus,
+          ]),
+        });
+      }
+    } catch (error:unknown) {
+      throw repositoryError('enqueue',error);
+    } finally {
+      release(client);
+    }
+    if (input !== null) await this.enqueue(input);
   }
 
   public async claim(options: Readonly<{ leaseMs: number; nowMs: number }>): Promise<ClaimedPaperDecisionJob | null> {

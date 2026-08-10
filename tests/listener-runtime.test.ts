@@ -14,11 +14,12 @@ void test('starts dependencies in exact order and exposes honest frozen pipeline
 
   assert.deepEqual(calls, [
     'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
-    'socialWorker.start', 'reconciler.start', 'heartbeat.start',
+    'paperWorker.start', 'socialWorker.start', 'reconciler.start', 'heartbeat.start',
   ]);
   assert.equal(runtime.state(), 'RUNNING');
   assert.deepEqual(runtime.pipelineState(), {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    paperDecision: 'RUNNING', social: 'RUNNING',
   });
   assert.ok(Object.isFrozen(runtime.pipelineState()));
 });
@@ -34,8 +35,47 @@ void test('social degradation is visible without relabeling healthy chain pipeli
 
   assert.equal(runtime.state(), 'DEGRADED');
   assert.deepEqual(runtime.pipelineState(), {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'DEGRADED',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    paperDecision: 'RUNNING', social: 'DEGRADED',
   });
+});
+
+void test('paper degradation is visible without relabeling healthy chain or social pipelines', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  let paperState: 'RUNNING' | 'DEGRADED' = 'RUNNING';
+  deps.paperWorker.state = () => paperState;
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+  await runtime.start();
+  paperState = 'DEGRADED';
+
+  assert.equal(runtime.state(), 'DEGRADED');
+  assert.deepEqual(runtime.pipelineState(), {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    paperDecision: 'DEGRADED', social: 'RUNNING',
+  });
+});
+
+void test('rolls back the inbox worker when paper startup fails', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  deps.paperWorker.start = async () => {
+    calls.push('paperWorker.start');
+    throw new Error('private paper startup');
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+
+  await assert.rejects(runtime.start(), (error: unknown) => {
+    assert.ok(error instanceof ListenerRuntimeError);
+    assert.deepEqual(error.failures, [
+      Object.freeze({ stage: 'paper-worker-start', errorName: 'ListenerDependencyError' }),
+    ]);
+    return true;
+  });
+  assert.deepEqual(calls, [
+    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
+    'paperWorker.start', 'worker.close', 'subscriber.close',
+  ]);
 });
 
 void test('rolls back the transaction worker and producers when social startup fails', async () => {
@@ -57,7 +97,8 @@ void test('rolls back the transaction worker and producers when social startup f
   });
   assert.deepEqual(calls, [
     'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
-    'socialWorker.start', 'worker.close', 'subscriber.close',
+    'paperWorker.start', 'socialWorker.start', 'paperWorker.close', 'worker.close',
+    'subscriber.close',
   ]);
 });
 
@@ -117,12 +158,14 @@ void test('stops claims, closes producers, drains worker, and writes STOPPED hea
   await Promise.all([runtime.close(), runtime.close()]);
 
   assert.deepEqual(calls, [
-    'socialWorker.close', 'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
+    'paperWorker.close', 'socialWorker.close', 'worker.close', 'subscriber.close',
+    'scanner.close', 'reconciler.close',
     'heartbeat.stop:STOPPED',
   ]);
   assert.equal(runtime.state(), 'STOPPED');
   assert.deepEqual(runtime.pipelineState(), {
-    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', social: 'STOPPED',
+    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED',
+    paperDecision: 'STOPPED', social: 'STOPPED',
   });
 });
 
@@ -147,7 +190,8 @@ void test('bounds worker drain and aggregates cleanup failures without raw error
     return true;
   });
   assert.deepEqual(calls, [
-    'socialWorker.close', 'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
+    'paperWorker.close', 'socialWorker.close', 'worker.close', 'subscriber.close',
+    'scanner.close', 'reconciler.close',
     'heartbeat.stop:STOPPED',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
@@ -163,7 +207,8 @@ void test('reflects active component degradation and validates shutdown bounds',
   workerState = 'DEGRADED';
   assert.equal(runtime.state(), 'DEGRADED');
   assert.deepEqual(runtime.pipelineState(), {
-    httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED',
+    paperDecision: 'RUNNING', social: 'RUNNING',
   });
   assert.throws(() => new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 0 }), TypeError);
 });
@@ -193,7 +238,8 @@ void test('uses one global deadline for startup and every shutdown dependency', 
   });
   assert.ok(Date.now() - startedAt < 50);
   assert.deepEqual(calls, [
-    'rpc.health', 'socialWorker.close', 'worker.close', 'subscriber.close', 'scanner.close',
+    'rpc.health', 'paperWorker.close', 'socialWorker.close', 'worker.close',
+    'subscriber.close', 'scanner.close',
     'reconciler.close', 'heartbeat.stop:STOPPED',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
@@ -204,6 +250,7 @@ void test('attempts all hanging cleanup within one shared shutdown budget', asyn
   const deps = dependencies(calls);
   const hanging = () => new Promise<void>(() => undefined);
   deps.worker.close = () => { calls.push('worker.close'); return hanging(); };
+  deps.paperWorker.close = () => { calls.push('paperWorker.close'); return hanging(); };
   deps.socialWorker.close = () => { calls.push('socialWorker.close'); return hanging(); };
   deps.subscriber.close = () => { calls.push('subscriber.close'); return hanging(); };
   deps.scanner.close = () => { calls.push('scanner.close'); return hanging(); };
@@ -217,6 +264,7 @@ void test('attempts all hanging cleanup within one shared shutdown budget', asyn
   await assert.rejects(runtime.close(), (error: unknown) => {
     assert.ok(error instanceof ListenerRuntimeError);
     assert.deepEqual(error.failures, [
+      Object.freeze({ stage: 'paper-worker-timeout', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'social-worker-timeout', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'subscriber-close', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'scanner-close', errorName: 'ListenerTimeoutError' }),
@@ -228,7 +276,8 @@ void test('attempts all hanging cleanup within one shared shutdown budget', asyn
   });
   assert.ok(Date.now() - startedAt < 60);
   assert.deepEqual(calls, [
-    'socialWorker.close', 'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
+    'paperWorker.close', 'socialWorker.close', 'worker.close', 'subscriber.close',
+    'scanner.close', 'reconciler.close',
     'heartbeat.stop:STOPPED',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
@@ -238,12 +287,13 @@ void test('reports RUNNING only when every active component is explicitly RUNNIN
   const calls: string[] = [];
   const deps = dependencies(calls);
   const states = {
-    scanner: 'RUNNING', subscriber: 'RUNNING', worker: 'RUNNING',
+    scanner: 'RUNNING', subscriber: 'RUNNING', worker: 'RUNNING', paperWorker: 'RUNNING',
     reconciler: 'RUNNING', heartbeat: 'RUNNING',
   } as Record<string, string>;
   deps.scanner.state = () => states.scanner as 'RUNNING';
   deps.subscriber.state = () => states.subscriber as 'RUNNING';
   deps.worker.state = () => states.worker as 'RUNNING';
+  deps.paperWorker.state = () => states.paperWorker as 'RUNNING';
   deps.reconciler.state = () => states.reconciler as 'RUNNING';
   deps.heartbeat.state = () => states.heartbeat as 'RUNNING';
   const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
@@ -253,7 +303,18 @@ void test('reports RUNNING only when every active component is explicitly RUNNIN
     for (const state of ['STOPPED', 'STARTING', 'STOPPING', 'DEGRADED', 'UNKNOWN']) {
       states[component] = state;
       assert.equal(runtime.state(), 'DEGRADED', `${component}:${state}`);
-      assert.equal(runtime.pipelineState().pumpfun, 'DEGRADED', `${component}:${state}`);
+      assert.equal(
+        runtime.pipelineState().pumpfun,
+        component === 'paperWorker' ? 'RUNNING' : 'DEGRADED',
+        `${component}:${state}`,
+      );
+      assert.equal(
+        runtime.pipelineState().paperDecision,
+        component === 'paperWorker'
+          ? state === 'STOPPED' ? 'STOPPED' : 'DEGRADED'
+          : 'RUNNING',
+        `${component}:${state}`,
+      );
       states[component] = 'RUNNING';
     }
   }
@@ -331,6 +392,11 @@ function dependencies(calls: string[]): ListenerRuntimeDependencies {
     worker: {
       async start() { calls.push('worker.start'); },
       async close() { calls.push('worker.close'); },
+      state: () => 'RUNNING',
+    },
+    paperWorker: {
+      async start() { calls.push('paperWorker.start'); },
+      async close() { calls.push('paperWorker.close'); },
       state: () => 'RUNNING',
     },
     socialWorker: {
