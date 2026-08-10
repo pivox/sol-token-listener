@@ -21,7 +21,8 @@ import {
 import { reconcileConfirmationStatus } from '../src/domain/confirmation-status.js';
 import type { ChainConfirmationStatus } from '../src/domain/types.js';
 
-const LEGACY_OPEN_COMMAND_HASH = 'paper_open_command_c15ca7d645261fdaff95f67e813854952c2e3540fc36830318cc25bbb2685e0b';
+// Golden captured by executing this file's exact open-command fixture with origin/main.
+const LEGACY_OPEN_COMMAND_HASH = 'paper_open_command_553d5ff67f95f9b3779d79d66fabc2f19a019d43b33e45933ed69522d2568ab5';
 
 void test('refuse le mode observe sans écriture', async () => {
   const repository = new MemoryPaperRepository();
@@ -316,6 +317,16 @@ void test('replays only the exact origin-main open-command hash for a pre-calibr
   await assert.rejects(engine.open({
     ...command,
     buyQuote: { ...command.buyQuote, feesRaw: 2n },
+  }), hasCode('POSITION_CONFLICT'));
+  await assert.rejects(engine.open({
+    ...command,
+    qualification: {
+      ...command.qualification,
+      ruleSet: {
+        ...command.qualification.ruleSet,
+        minimumTotalScore: command.qualification.ruleSet.minimumTotalScore + 1,
+      },
+    },
   }), hasCode('POSITION_CONFLICT'));
   assert.equal(repository.writeCount, 1);
 });

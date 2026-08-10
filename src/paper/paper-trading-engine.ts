@@ -7,6 +7,7 @@ import type {
   QualificationConditionEvidence,
   QualificationReport,
   QualificationScore,
+  QualificationSignalKey,
 } from '../domain/qualification.js';
 import {
   QUALIFICATION_CONDITION_MODES,
@@ -287,6 +288,7 @@ function hashOpenCommand(command: OpenPaperPositionCommand): OpenCommandHashes {
 }
 
 function legacyQualificationSnapshot(report: QualificationReport): unknown {
+  // origin/main hashed the French evidence copy in rule declaration order.
   return {
     ruleSet: {
       id: report.ruleSet.id,
@@ -295,12 +297,38 @@ function legacyQualificationSnapshot(report: QualificationReport): unknown {
       minimumTotalScore: report.ruleSet.minimumTotalScore,
     },
     scores: report.scores,
-    evidence: report.evidence,
+    evidence: [...report.evidence].sort((left, right) => (
+      legacyEvidenceIndex(left.signal) - legacyEvidenceIndex(right.signal)
+    )).map((item) => ({
+      ...item,
+      message: LEGACY_QUALIFICATION_EVIDENCE_MESSAGES[item.signal] ?? item.message,
+    })),
     blockers: report.blockers,
     verdict: report.verdict,
     evaluatedAtMs: report.evaluatedAtMs,
   };
 }
+
+function legacyEvidenceIndex(signal: QualificationSignalKey): number {
+  const index = LEGACY_QUALIFICATION_EVIDENCE_ORDER.indexOf(signal);
+  return index === -1 ? LEGACY_QUALIFICATION_EVIDENCE_ORDER.length : index;
+}
+
+const LEGACY_QUALIFICATION_EVIDENCE_MESSAGES: Readonly<Partial<Record<QualificationSignalKey, string>>> = Object.freeze({
+  imageValid: 'Préparation visuelle du lancement valide.',
+  socialCrossLinkConfirmed: 'Liens sociaux cohérents.',
+  creatorHasNotSold: 'Aucune vente précoce du créateur.',
+  reverseQuoteAvailable: 'Cotation inverse disponible.',
+  externalBuyersObserved: 'Acheteurs externes observés.',
+});
+
+const LEGACY_QUALIFICATION_EVIDENCE_ORDER: readonly QualificationSignalKey[] = Object.freeze([
+  'imageValid',
+  'socialCrossLinkConfirmed',
+  'creatorHasNotSold',
+  'reverseQuoteAvailable',
+  'externalBuyersObserved',
+]);
 
 function matchesOpenCommandHash(position: PaperPosition, hashes: OpenCommandHashes): boolean {
   return position.openCommandHash === hashes.current || position.openCommandHash === hashes.legacy;
