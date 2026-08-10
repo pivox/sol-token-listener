@@ -148,9 +148,13 @@ function assertValidUpstreamConditions(value: unknown): void {
     || value === null
     || isProxy(value)
     || !Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Array.prototype
     || !Object.isFrozen(value)
   ) {
     throw new TypeError('Qualification upstream conditions must be a frozen array.');
+  }
+  if (value.length > QUALIFICATION_REASON_CODES.length) {
+    throw new TypeError('Qualification upstream conditions must be bounded.');
   }
   const conditions = assertDenseDataArray(value, 'Qualification upstream conditions');
   const codes = new Set<QualificationReasonCode>();

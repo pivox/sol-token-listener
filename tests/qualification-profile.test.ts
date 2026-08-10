@@ -134,6 +134,28 @@ void test('rejects duplicate, foreign, and malformed upstream conditions', () =>
   }));
 });
 
+void test('bounds upstream conditions before dense-array work and accepts the exact registry boundary', () => {
+  const facts = canonicalFacts();
+  const hugeSparse = Object.freeze(new Array(1_000_000));
+  assertInvalidFacts(Object.freeze({ ...facts, upstreamConditions: hugeSparse }));
+
+  const exactBoundary = Object.freeze(QUALIFICATION_REASON_CODES.map((code) => Object.freeze({
+    code,
+    triggered: false,
+  })));
+  assert.doesNotThrow(() => {
+    assertValidQualificationFacts(Object.freeze({ ...facts, upstreamConditions: exactBoundary }));
+  });
+
+  const duplicateAtBoundary = Object.freeze(exactBoundary.map((entry, index) => index === exactBoundary.length - 1
+    ? Object.freeze({ code: exactBoundary[0]?.code ?? 'STALE_DATA', triggered: false })
+    : entry));
+  assertInvalidFacts(Object.freeze({ ...facts, upstreamConditions: duplicateAtBoundary }));
+
+  const customPrototype = Object.freeze(Object.setPrototypeOf([...exactBoundary], Object.create(Array.prototype)));
+  assertInvalidFacts(Object.freeze({ ...facts, upstreamConditions: customPrototype }));
+});
+
 void test('rejects hostile object and array shapes without invoking accessors', () => {
   const facts = canonicalFacts();
   let accessorRead = false;
