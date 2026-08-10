@@ -31,6 +31,12 @@ interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number
 interface Client { query(text: string, values?: readonly unknown[]): Promise<Result>; release(): void }
 interface Pool { connect(): Promise<Client>; query?(text: string, values?: readonly unknown[]): Promise<Result> }
 const trustedErrors = new WeakSet();
+const DEFAULT_SOCIAL_JOB_POLICY = Object.freeze({ maxAttempts: 5, baseDelayMs: 500 });
+
+export interface SocialJobPolicy {
+  readonly maxAttempts: number;
+  readonly baseDelayMs: number;
+}
 
 export class LaunchpadEventConflictError extends Error {
   public constructor(public readonly conflict: 'identity' | 'payload') {
@@ -52,7 +58,17 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
     private readonly pool: Pool = getDatabasePool(),
     private readonly retentionHours = 4,
     private readonly now: () => number = Date.now,
-  ) {}
+    private readonly socialJobPolicy: SocialJobPolicy = DEFAULT_SOCIAL_JOB_POLICY,
+  ) {
+    if (
+      !Number.isSafeInteger(socialJobPolicy.maxAttempts)
+      || socialJobPolicy.maxAttempts < 1
+      || socialJobPolicy.maxAttempts > 100
+      || !Number.isSafeInteger(socialJobPolicy.baseDelayMs)
+      || socialJobPolicy.baseDelayMs < 1
+      || socialJobPolicy.baseDelayMs > 60_000
+    ) throw new RangeError('Social job policy is invalid.');
+  }
 
   public async record(input: LaunchpadEventBatch): Promise<LaunchpadEventBatchResult> {
     const batch = prepareLaunchpadBatch(input);
@@ -229,7 +245,7 @@ implements LaunchpadEventSink, LaunchpadProjectionReader {
       launch.createdAt.instructionIndex,launch.createdAt.innerInstructionIndex,new Date(event.blockchainTimeMs ?? event.observedAtMs)]);
     requireOne(result);
     await writeTransition(client, transition);
-    await enqueueSocialJob(client, rawId, event);
+    await enqueueSocialJob(client, rawId, event, this.socialJobPolicy);
   }
 
   private async writeTrade(client: Client, event: Extract<LaunchpadObservationEventV1,{type:'BondingCurveTradeObserved'}>, status: ChainConfirmationStatus): Promise<void> {
@@ -306,6 +322,7 @@ async function enqueueSocialJob(
   client: Client,
   rawId: string,
   event: Extract<LaunchpadObservationEventV1, { type: 'TokenLaunchDetected' }>,
+  policy: SocialJobPolicy,
 ): Promise<void> {
   const metadataUri = ownMetadataUri(event.payload.launch.parameters);
   const jobId = createRepositoryId('social_job', [event.mint, event.id]);
@@ -328,18 +345,19 @@ async function enqueueSocialJob(
     source_raw_event_id: rawId,
     metadata_uri: metadataUri,
     input_fingerprint: inputFingerprint,
-    max_attempts: 5,
-    base_delay_ms: 500,
+    max_attempts: policy.maxAttempts,
+    base_delay_ms: policy.baseDelayMs,
   });
   const createdAt = new Date(event.observedAtMs);
   const inserted = await client.query(`INSERT INTO social_enrichment_jobs (
     job_id,mint,source_launch_event_id,source_raw_event_id,metadata_uri,
     input_fingerprint,status,attempts,attempts_in_cycle,max_attempts,
     base_delay_ms,created_at,updated_at
-  ) VALUES ($1,$2,$3,$4,$5,$6,'PENDING',0,0,5,500,$7,$7)
+  ) VALUES ($1,$2,$3,$4,$5,$6,'PENDING',0,0,$7,$8,$9,$9)
   ON CONFLICT (job_id) DO UPDATE SET job_id=EXCLUDED.job_id
   RETURNING job_id`, [
-    jobId,event.mint,event.id,rawId,metadataUri,inputFingerprint,createdAt,
+    jobId,event.mint,event.id,rawId,metadataUri,inputFingerprint,
+    policy.maxAttempts,policy.baseDelayMs,createdAt,
   ]);
   requireOne(inserted);
 }

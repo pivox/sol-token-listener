@@ -386,6 +386,7 @@ export interface ApiHealth {
   readonly postgresql: ApiHealthDependency;
   readonly http: ApiHealthDependency;
   readonly pipeline: ApiPipelineHealth;
+  readonly socialJobs: ApiSocialJobHealth;
   readonly checkpoints: ApiCheckpoints;
   readonly heartbeat: ApiHeartbeat;
   readonly lagSlots: string | null;
@@ -398,6 +399,14 @@ export interface ApiHealthDependency {
 export interface ApiPipelineHealth {
   readonly pumpfun: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly pumpswap: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+  readonly social: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+}
+
+export interface ApiSocialJobHealth {
+  readonly pendingCount: number;
+  readonly leasedCount: number;
+  readonly retryableFailedCount: number;
+  readonly exhaustedCount: number;
 }
 
 export interface ApiCheckpoints {

@@ -98,7 +98,8 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
   };
   const health: ApiHealth = {
     status: 'OK', observedAt: summary.detectedAt, postgresql: { status: 'AVAILABLE' },
-    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE' },
+    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', social: 'IDLE' },
+    socialJobs: { pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0 },
     checkpoints: { launchpad: null, market: null },
     heartbeat: { startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
       lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null }, lagSlots: null,

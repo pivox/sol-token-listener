@@ -14,13 +14,51 @@ void test('starts dependencies in exact order and exposes honest frozen pipeline
 
   assert.deepEqual(calls, [
     'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
-    'reconciler.start', 'heartbeat.start',
+    'socialWorker.start', 'reconciler.start', 'heartbeat.start',
   ]);
   assert.equal(runtime.state(), 'RUNNING');
   assert.deepEqual(runtime.pipelineState(), {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'RUNNING',
   });
   assert.ok(Object.isFrozen(runtime.pipelineState()));
+});
+
+void test('social degradation is visible without relabeling healthy chain pipelines', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  let socialState: 'RUNNING' | 'DEGRADED' = 'RUNNING';
+  deps.socialWorker.state = () => socialState;
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+  await runtime.start();
+  socialState = 'DEGRADED';
+
+  assert.equal(runtime.state(), 'DEGRADED');
+  assert.deepEqual(runtime.pipelineState(), {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'DEGRADED',
+  });
+});
+
+void test('rolls back the transaction worker and producers when social startup fails', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  deps.socialWorker.start = async () => {
+    calls.push('socialWorker.start');
+    throw new Error('private social startup');
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+
+  await assert.rejects(runtime.start(), (error: unknown) => {
+    assert.ok(error instanceof ListenerRuntimeError);
+    assert.deepEqual(error.failures, [
+      Object.freeze({ stage: 'social-worker-start', errorName: 'ListenerDependencyError' }),
+    ]);
+    assert.doesNotMatch(String(error), /private/u);
+    return true;
+  });
+  assert.deepEqual(calls, [
+    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
+    'socialWorker.start', 'worker.close', 'subscriber.close',
+  ]);
 });
 
 void test('rolls back only started resources in reverse after startup failure', async () => {
@@ -79,12 +117,12 @@ void test('stops claims, closes producers, drains worker, and writes STOPPED hea
   await Promise.all([runtime.close(), runtime.close()]);
 
   assert.deepEqual(calls, [
-    'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
+    'socialWorker.close', 'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
     'heartbeat.stop:STOPPED',
   ]);
   assert.equal(runtime.state(), 'STOPPED');
   assert.deepEqual(runtime.pipelineState(), {
-    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED',
+    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', social: 'STOPPED',
   });
 });
 
@@ -109,7 +147,7 @@ void test('bounds worker drain and aggregates cleanup failures without raw error
     return true;
   });
   assert.deepEqual(calls, [
-    'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
+    'socialWorker.close', 'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
     'heartbeat.stop:STOPPED',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
@@ -125,7 +163,7 @@ void test('reflects active component degradation and validates shutdown bounds',
   workerState = 'DEGRADED';
   assert.equal(runtime.state(), 'DEGRADED');
   assert.deepEqual(runtime.pipelineState(), {
-    httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED',
+    httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', social: 'RUNNING',
   });
   assert.throws(() => new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 0 }), TypeError);
 });
@@ -155,7 +193,7 @@ void test('uses one global deadline for startup and every shutdown dependency', 
   });
   assert.ok(Date.now() - startedAt < 50);
   assert.deepEqual(calls, [
-    'rpc.health', 'worker.close', 'subscriber.close', 'scanner.close',
+    'rpc.health', 'socialWorker.close', 'worker.close', 'subscriber.close', 'scanner.close',
     'reconciler.close', 'heartbeat.stop:STOPPED',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
@@ -166,6 +204,7 @@ void test('attempts all hanging cleanup within one shared shutdown budget', asyn
   const deps = dependencies(calls);
   const hanging = () => new Promise<void>(() => undefined);
   deps.worker.close = () => { calls.push('worker.close'); return hanging(); };
+  deps.socialWorker.close = () => { calls.push('socialWorker.close'); return hanging(); };
   deps.subscriber.close = () => { calls.push('subscriber.close'); return hanging(); };
   deps.scanner.close = () => { calls.push('scanner.close'); return hanging(); };
   deps.reconciler.close = () => { calls.push('reconciler.close'); return hanging(); };
@@ -178,6 +217,7 @@ void test('attempts all hanging cleanup within one shared shutdown budget', asyn
   await assert.rejects(runtime.close(), (error: unknown) => {
     assert.ok(error instanceof ListenerRuntimeError);
     assert.deepEqual(error.failures, [
+      Object.freeze({ stage: 'social-worker-timeout', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'subscriber-close', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'scanner-close', errorName: 'ListenerTimeoutError' }),
       Object.freeze({ stage: 'reconciler-close', errorName: 'ListenerTimeoutError' }),
@@ -188,7 +228,7 @@ void test('attempts all hanging cleanup within one shared shutdown budget', asyn
   });
   assert.ok(Date.now() - startedAt < 60);
   assert.deepEqual(calls, [
-    'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
+    'socialWorker.close', 'worker.close', 'subscriber.close', 'scanner.close', 'reconciler.close',
     'heartbeat.stop:STOPPED',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
@@ -291,6 +331,11 @@ function dependencies(calls: string[]): ListenerRuntimeDependencies {
     worker: {
       async start() { calls.push('worker.start'); },
       async close() { calls.push('worker.close'); },
+      state: () => 'RUNNING',
+    },
+    socialWorker: {
+      async start() { calls.push('socialWorker.start'); },
+      async close() { calls.push('socialWorker.close'); },
       state: () => 'RUNNING',
     },
     reconciler: {

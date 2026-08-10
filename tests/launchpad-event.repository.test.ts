@@ -57,7 +57,12 @@ void test('atomically persists creation and initial buy and restores active even
 
 void test('atomically enqueues one durable social job and cancels it on orphaning', async (context) => {
   await withDatabase(context, async (pool) => {
-    const repository = new PostgresLaunchpadEventRepository(pool, 4, () => 10_000);
+    const repository = new PostgresLaunchpadEventRepository(
+      pool,
+      4,
+      () => 10_000,
+      { maxAttempts: 3, baseDelayMs: 1_000 },
+    );
     const parameters = Object.freeze({
       initialSupply: 1_000_000_000_000_000_000n,
       uri: 'https://metadata.example/token.json',
@@ -73,6 +78,8 @@ void test('atomically enqueues one durable social job and cancels it on orphanin
     assert.equal(first.rows[0].metadata_uri, 'https://metadata.example/token.json');
     assert.equal(first.rows[0].status, 'PENDING');
     assert.equal(first.rows[0].attempts, 0);
+    assert.equal(first.rows[0].max_attempts, 3);
+    assert.equal(first.rows[0].base_delay_ms, 1_000);
     assert.match(first.rows[0].job_id, /^social_job_[0-9a-f]{64}$/u);
     assert.match(first.rows[0].input_fingerprint, /^[0-9a-f]{64}$/u);
 

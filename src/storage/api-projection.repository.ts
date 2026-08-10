@@ -84,6 +84,7 @@ export interface ApiProjectionPipelineState {
   readonly httpAvailable: boolean;
   readonly pumpfun: ApiHealth['pipeline']['pumpfun'];
   readonly pumpswap: ApiHealth['pipeline']['pumpswap'];
+  readonly social: ApiHealth['pipeline']['social'];
 }
 
 export type ApiProjectionPipelineStateProvider = () => ApiProjectionPipelineState;
@@ -143,6 +144,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       httpAvailable: false,
       pumpfun: 'STOPPED',
       pumpswap: 'STOPPED',
+      social: 'STOPPED',
     },
     private readonly holderLimits: ApiHolderProjectionLimits = {
       positions: 100,
@@ -345,6 +347,23 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
             reconciler_state, leased_transactions, exhausted_transactions
          FROM listener_heartbeats ORDER BY updated_at DESC LIMIT 1`,
       );
+      let socialJobs = emptySocialJobs();
+      let socialCountsAvailable = true;
+      try {
+        const socialCounts = await this.database.query(
+          `SELECT
+            COUNT(*) FILTER (WHERE status = 'PENDING')::int AS pending_count,
+            COUNT(*) FILTER (WHERE status = 'PROCESSING')::int AS leased_count,
+            COUNT(*) FILTER (WHERE status = 'RETRYABLE_FAILED')::int AS retryable_failed_count,
+            COUNT(*) FILTER (WHERE retry_exhausted_at IS NOT NULL)::int AS exhausted_count
+           FROM social_enrichment_jobs`,
+        );
+        const socialRow = socialCounts.rows[0];
+        if (socialRow !== undefined) socialJobs = socialJobsFromRow(socialRow);
+      } catch {
+        socialCountsAvailable = false;
+        pipeline = freeze({ ...pipeline, social: 'DEGRADED' });
+      }
       const checkpoint = new Map(checkpoints.rows.map((item) => [text(item.checkpoint_key), decimal(item.slot)]));
       const row = heartbeats.rows[0];
       const heartbeat = row === undefined ? emptyHeartbeat() : heartbeatFromRow(row);
@@ -362,8 +381,13 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         || heartbeat.reconcilerState !== 'RUNNING';
       const degraded = database.rows.length === 0 || stale || runtimeDegraded || !pipeline.httpAvailable
       || pipeline.pumpfun === 'DEGRADED' || pipeline.pumpfun === 'STOPPED'
-      || pipeline.pumpswap === 'DEGRADED' || pipeline.pumpswap === 'STOPPED';
-      return healthResult(observedAt, database.rows.length > 0, degraded, checkpoint, heartbeat, lagSlots, pipeline);
+      || pipeline.pumpswap === 'DEGRADED' || pipeline.pumpswap === 'STOPPED'
+      || pipeline.social === 'DEGRADED' || pipeline.social === 'STOPPED'
+      || !socialCountsAvailable;
+      return healthResult(
+        observedAt, database.rows.length > 0, degraded, checkpoint, heartbeat,
+        lagSlots, pipeline, socialJobs,
+      );
     } catch {
       return healthResult(
         observedAt,
@@ -373,6 +397,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         emptyHeartbeat(),
         null,
         pipeline,
+        emptySocialJobs(),
       );
     }
   }
@@ -1527,6 +1552,7 @@ const DEGRADED_PIPELINE_STATE: ApiProjectionPipelineState = Object.freeze({
   httpAvailable: false,
   pumpfun: 'DEGRADED',
   pumpswap: 'DEGRADED',
+  social: 'DEGRADED',
 });
 
 function emptyHeartbeat(): ApiHealth['heartbeat'] {
@@ -1535,6 +1561,24 @@ function emptyHeartbeat(): ApiHealth['heartbeat'] {
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null });
+}
+
+function emptySocialJobs(): ApiHealth['socialJobs'] {
+  return freeze({
+    pendingCount: 0,
+    leasedCount: 0,
+    retryableFailedCount: 0,
+    exhaustedCount: 0,
+  });
+}
+
+function socialJobsFromRow(row: Record<string, unknown>): ApiHealth['socialJobs'] {
+  return freeze({
+    pendingCount: nonNegativeSafeNumber(row.pending_count),
+    leasedCount: nonNegativeSafeNumber(row.leased_count),
+    retryableFailedCount: nonNegativeSafeNumber(row.retryable_failed_count),
+    exhaustedCount: nonNegativeSafeNumber(row.exhausted_count),
+  });
 }
 
 function heartbeatFromRow(row: Record<string, unknown>): ApiHealth['heartbeat'] {
@@ -1569,17 +1613,20 @@ function pipelineState(provider: ApiProjectionPipelineStateProvider): ApiProject
   const value: unknown = provider();
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== 3
+  if (keys.length !== 4
     || !keys.includes('httpAvailable')
     || !keys.includes('pumpfun')
-    || !keys.includes('pumpswap')) throw invalid();
+    || !keys.includes('pumpswap')
+    || !keys.includes('social')) throw invalid();
   const httpAvailable = pipelineValue(value, 'httpAvailable');
   const pumpfun = pipelineValue(value, 'pumpfun');
   const pumpswap = pipelineValue(value, 'pumpswap');
+  const social = pipelineValue(value, 'social');
   if (typeof httpAvailable !== 'boolean'
     || !isPipelineRuntimeState(pumpfun)
-    || !isPipelineRuntimeState(pumpswap)) throw invalid();
-  return freeze({ httpAvailable, pumpfun, pumpswap });
+    || !isPipelineRuntimeState(pumpswap)
+    || !isPipelineRuntimeState(social)) throw invalid();
+  return freeze({ httpAvailable, pumpfun, pumpswap, social });
 }
 
 function pipelineValue(value: object, key: string): unknown {
@@ -1602,11 +1649,13 @@ function healthResult(
   observedAt: Date, databaseAvailable: boolean, degraded: boolean,
   checkpoints: ReadonlyMap<string, string>, heartbeat: ApiHealth['heartbeat'], lagSlots: string | null,
   pipeline: ApiProjectionPipelineState,
+  socialJobs: ApiHealth['socialJobs'],
 ): ApiHealth {
   return freeze({ status: degraded ? 'DEGRADED' : 'OK', observedAt: observedAt.toISOString(),
     postgresql: freeze({ status: databaseAvailable ? 'AVAILABLE' : 'UNAVAILABLE' }),
     http: freeze({ status: pipeline.httpAvailable ? 'AVAILABLE' : 'UNAVAILABLE' }),
-    pipeline: freeze({ pumpfun: pipeline.pumpfun, pumpswap: pipeline.pumpswap }),
+    pipeline: freeze({ pumpfun: pipeline.pumpfun, pumpswap: pipeline.pumpswap, social: pipeline.social }),
+    socialJobs,
     checkpoints: freeze({ launchpad: checkpoints.get('launchpad') ?? null, market: checkpoints.get('market') ?? null }),
     heartbeat, lagSlots });
 }

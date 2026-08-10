@@ -29,6 +29,7 @@ void test('composes the passive production listener without opening resources', 
     httpAvailable: true,
     pumpfun: 'STOPPED',
     pumpswap: 'STOPPED',
+    social: 'STOPPED',
   });
 });
 
@@ -50,6 +51,21 @@ void test('production factory has no transaction execution or Raydium builder pa
   );
 
   assert.doesNotMatch(source, /(?:sendRawTransaction|sendTransaction|transaction-builder|execution\/wallet|\.\.\/execution\/|raydium)/iu);
+});
+
+void test('public social runtime components have no signer or submission path', async () => {
+  for (const path of [
+    '../src/application/social-enrichment-worker.ts',
+    '../src/storage/social-evidence.repository.ts',
+    '../src/social/public-social-verification.provider.ts',
+  ]) {
+    const source = await readFile(new URL(path, import.meta.url), 'utf8');
+    assert.doesNotMatch(
+      source,
+      /(?:sendRawTransaction|sendTransaction|signTransaction|execution\/wallet|\.\.\/execution\/|privateKey|keypair)/iu,
+      path,
+    );
+  }
 });
 
 void test('heartbeat stop fences an in-flight RUNNING write before durable STOPPED', async () => {

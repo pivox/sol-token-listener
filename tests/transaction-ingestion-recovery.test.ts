@@ -253,7 +253,7 @@ void test('exposes a real retryable failed inbox row through persisted API healt
     const health = await new PostgresApiProjectionRepository(
       pool,
       () => new Date(),
-      { httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING' },
+      { httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'RUNNING' },
     ).getHealth();
     assert.equal(health.heartbeat.backlogCount, 1);
     assert.equal(health.heartbeat.leasedCount, 0);

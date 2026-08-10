@@ -291,7 +291,8 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   const health: ApiHealth = {
     status: 'OK', observedAt: '2026-07-29T12:00:00.000Z',
     postgresql: { status: 'AVAILABLE' }, http: { status: 'AVAILABLE' },
-    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE' },
+    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', social: 'RUNNING' },
+    socialJobs: { pendingCount: 1, leasedCount: 1, retryableFailedCount: 0, exhaustedCount: 0 },
     checkpoints: { launchpad: '1', market: null },
     heartbeat: {
       runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
@@ -326,6 +327,8 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(qualification.verdict, 'WATCHLISTED');
   assert.equal(condition.observed.roundTripLossBps, '3001');
   assert.equal(health.pipeline.pumpfun, 'RUNNING');
+  assert.equal(health.pipeline.social, 'RUNNING');
+  assert.equal(health.socialJobs.pendingCount, 1);
   assert.equal(sseEvent.eventId, 'evt_1');
 });
 

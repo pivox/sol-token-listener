@@ -29,6 +29,14 @@ export interface AppConfig {
   readonly listenerCatchUpPageSize: number;
   readonly listenerFinalityMissingPolls: number;
   readonly listenerShutdownTimeoutMs: number;
+  readonly socialHttpTimeoutMs: number;
+  readonly socialHttpMaxBytes: number;
+  readonly socialHttpMaxRedirects: number;
+  readonly socialHttpConcurrency: number;
+  readonly socialWorkerPollMs: number;
+  readonly socialWorkerLeaseSeconds: number;
+  readonly socialRetryMaxAttempts: number;
+  readonly socialRetryBaseDelayMs: number;
   readonly raydiumCpmmProgramId: string;
   readonly wsolMint: string;
   readonly buyAmountLamports: bigint;
@@ -151,6 +159,30 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     ),
     listenerShutdownTimeoutMs: parseInteger(
       environment.LISTENER_SHUTDOWN_TIMEOUT_MS, 30_000, 'LISTENER_SHUTDOWN_TIMEOUT_MS', 1_000, 120_000,
+    ),
+    socialHttpTimeoutMs: parseCanonicalBoundedInteger(
+      environment.SOCIAL_HTTP_TIMEOUT_MS, 5_000, 'SOCIAL_HTTP_TIMEOUT_MS', 100, 30_000,
+    ),
+    socialHttpMaxBytes: parseCanonicalBoundedInteger(
+      environment.SOCIAL_HTTP_MAX_BYTES, 262_144, 'SOCIAL_HTTP_MAX_BYTES', 1_024, 1_048_576,
+    ),
+    socialHttpMaxRedirects: parseCanonicalBoundedInteger(
+      environment.SOCIAL_HTTP_MAX_REDIRECTS, 3, 'SOCIAL_HTTP_MAX_REDIRECTS', 0, 10,
+    ),
+    socialHttpConcurrency: parseCanonicalBoundedInteger(
+      environment.SOCIAL_HTTP_CONCURRENCY, 2, 'SOCIAL_HTTP_CONCURRENCY', 1, 8,
+    ),
+    socialWorkerPollMs: parseCanonicalBoundedInteger(
+      environment.SOCIAL_WORKER_POLL_MS, 1_000, 'SOCIAL_WORKER_POLL_MS', 100, 60_000,
+    ),
+    socialWorkerLeaseSeconds: parseCanonicalBoundedInteger(
+      environment.SOCIAL_WORKER_LEASE_SECONDS, 30, 'SOCIAL_WORKER_LEASE_SECONDS', 5, 300,
+    ),
+    socialRetryMaxAttempts: parseCanonicalBoundedInteger(
+      environment.SOCIAL_RETRY_MAX_ATTEMPTS, 3, 'SOCIAL_RETRY_MAX_ATTEMPTS', 1, 10,
+    ),
+    socialRetryBaseDelayMs: parseCanonicalBoundedInteger(
+      environment.SOCIAL_RETRY_BASE_DELAY_MS, 1_000, 'SOCIAL_RETRY_BASE_DELAY_MS', 100, 60_000,
     ),
     raydiumCpmmProgramId: optional(environment.RAYDIUM_CPMM_PROGRAM_ID, DEFAULT_RAYDIUM_CPMM_PROGRAM_ID),
     wsolMint,
@@ -290,6 +322,24 @@ function parseInteger(
   maximum = Number.MAX_SAFE_INTEGER,
 ): number {
   return parseOptionalInteger(raw, fallback, name, minimum, maximum) ?? fallback;
+}
+
+export function parseCanonicalBoundedInteger(
+  raw: string | undefined,
+  fallback: number,
+  name: string,
+  minimum: number,
+  maximum: number,
+): number {
+  if (raw === undefined || raw === '') return fallback;
+  if (!/^(?:0|[1-9]\d*)$/u.test(raw)) {
+    throw new Error(`${name} must be a canonical decimal integer.`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} is outside its allowed range.`);
+  }
+  return value;
 }
 
 function parseOptionalInteger(
