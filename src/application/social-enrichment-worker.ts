@@ -167,12 +167,18 @@ export class SocialEnrichmentWorker {
     });
 
     if (resolution.status === 'FAILED') {
-      if (resolution.retryable) return this.failClaim(job, lease, 'HTTP_TRANSIENT');
       const collection = createFailedSocialCollection(Object.freeze({
         mint: job.mint,
         sourceLaunchEventId: job.sourceLaunchEventId,
         metadataSnapshot,
       }));
+      if (resolution.retryable) {
+        return this.failClaim(job, lease, 'HTTP_TRANSIENT', Object.freeze({
+          status: 'METADATA_FAILED' as const,
+          metadataSnapshot,
+          collection,
+        }));
+      }
       return this.completeClaim(job, lease, Object.freeze({
         status: 'METADATA_FAILED' as const,
         metadataSnapshot,

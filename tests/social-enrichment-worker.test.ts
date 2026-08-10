@@ -71,12 +71,16 @@ void test('retries typed transient metadata failure without partial completion',
   );
   assert.deepEqual(await worker.runOnce(), { kind: 'failed', jobId: 'social-job-1' });
   assert.equal(repository.completions.length, 0);
-  assert.deepEqual(repository.failures, [Object.freeze({
-    job: claimedJob(),
-    failure: Object.freeze({
-      code: 'HTTP_TRANSIENT', retryable: true, observedAtMs: NOW,
-    }),
-  })]);
+  assert.deepEqual(repository.failures[0]?.job, claimedJob());
+  assert.deepEqual(repository.failures[0]?.failure, {
+    code: 'HTTP_TRANSIENT', retryable: true, observedAtMs: NOW,
+  });
+  assert.equal(repository.failures[0]?.terminalResult?.status, 'METADATA_FAILED');
+  assert.equal(repository.failures[0]?.terminalResult?.collection.status, 'FAILED');
+  assert.equal(
+    repository.failures[0]?.terminalResult?.collection.evidence[0]?.type,
+    'VERIFICATION_UNKNOWN',
+  );
 });
 
 void test('retries transient social fetches and carries explicit terminal evidence', async () => {

@@ -58,6 +58,10 @@ export class BoundedPublicHttpClient implements PublicHttpClient {
     this.#global = new Semaphore(options.maxConcurrency);
   }
 
+  public get retainedHostCount(): number {
+    return this.#byHost.size;
+  }
+
   public async get(
     input: string,
     acceptedContentTypes: readonly string[],
@@ -171,7 +175,13 @@ export class BoundedPublicHttpClient implements PublicHttpClient {
   async #request(url: URL, address: string, family: 4 | 6): Promise<RequestResult> {
     const hostname = normalizedHostname(url.hostname).toLowerCase();
     const hostSemaphore = this.#hostSemaphore(hostname);
-    const releaseHost = await hostSemaphore.acquire();
+    const releaseHostLease = await hostSemaphore.acquire();
+    const releaseHost = (): void => {
+      releaseHostLease();
+      if (hostSemaphore.idle && this.#byHost.get(hostname) === hostSemaphore) {
+        this.#byHost.delete(hostname);
+      }
+    };
     const releaseGlobal = await this.#global.acquire();
     const controller = new AbortController();
     const timer = setTimeout(() => { controller.abort(); }, this.options.timeoutMs);
@@ -228,8 +238,12 @@ class Semaphore {
   #available: number;
   readonly #waiters: ((release: () => void) => void)[] = [];
 
-  public constructor(capacity: number) {
+  public constructor(private readonly capacity: number) {
     this.#available = capacity;
+  }
+
+  public get idle(): boolean {
+    return this.#available === this.capacity && this.#waiters.length === 0;
   }
 
   public acquire(): Promise<() => void> {

@@ -175,12 +175,28 @@ void test('bounds global concurrency and serializes requests to one host', async
   await tick();
   assert.equal(active, 2);
   assert.equal(peak, 2);
+  assert.equal(client.retainedHostCount, 2);
   releases.splice(0).forEach((release) => { release(); });
   await tick();
   assert.equal(active, 1);
   releases.splice(0).forEach((release) => { release(); });
   await Promise.all(requests);
   assert.equal(peak, 2);
+  assert.equal(client.retainedHostCount, 0);
+});
+
+void test('evicts idle semaphores for attacker-controlled unique hostnames', async () => {
+  const client = new BoundedPublicHttpClient(
+    async () => response(200, 'ok', { 'content-type': 'text/plain' }),
+    publicResolver,
+    OPTIONS,
+  );
+  await Promise.all(Array.from(
+    { length: 100 },
+    (_, index) => client.get(`https://host-${index}.test/value`, ['text/plain']),
+  ));
+
+  assert.equal(client.retainedHostCount, 0);
 });
 
 void test('keeps timeout and per-host serialization active while streaming the body', async () => {
