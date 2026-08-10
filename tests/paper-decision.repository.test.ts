@@ -103,7 +103,8 @@ void test('claims an orphaned source revision and reloads its paper lineage', as
     await repository.enqueue(jobInput());
     const confirmed = await repository.claim({ nowMs: 1_000, leaseMs: 1_000 });
     assert.ok(confirmed);
-    await repository.complete(confirmed, decisionResult());
+    const decision = decisionResult();
+    await repository.complete(confirmed, decision);
 
     await pool.query(
       `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
@@ -123,6 +124,13 @@ void test('claims an orphaned source revision and reloads its paper lineage', as
     assert.ok(snapshot.currentCandidate);
     assert.ok(snapshot.currentSession);
     assert.ok(snapshot.currentDecision);
+
+    await repository.complete(orphaned, decision);
+    const completed = await pool.query<{ readonly status: string }>(
+      'SELECT status FROM paper_decision_jobs WHERE job_id=$1',
+      [orphaned.jobId],
+    );
+    assert.deepEqual(completed.rows, [{ status:'COMPLETED' }]);
   });
 });
 

@@ -376,7 +376,10 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         'SELECT confirmation_status FROM domain_events WHERE event_id=$1 AND mint=$2 FOR UPDATE',
         [job.sourceEventId,job.mint],
       );
-      if (textField(requiredRow(source, 'Source event is missing.'), 'confirmation_status') === 'orphaned') {
+      if (
+        textField(requiredRow(source, 'Source event is missing.'), 'confirmation_status') === 'orphaned'
+        && job.sourceConfirmationStatus !== 'orphaned'
+      ) {
         throw new PaperDecisionLeaseLostError();
       }
       await writeDecision(client, job, result);
