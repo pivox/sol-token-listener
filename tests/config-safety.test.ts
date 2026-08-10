@@ -44,8 +44,9 @@ void test('les actions dashboard exigent leur confirmation indépendante', () =>
   assert.throws(() => parseConfig({ ...base, DASHBOARD_ACTIONS_ENABLED: 'true' }), /read-only/u);
 });
 
-void test('le seuil de qualification est borné et vaut 60 par défaut', () => {
-  assert.equal(parseConfig(base).qualificationMinimumScore, 60);
+void test('le seuil de qualification absent reste sans override et un seuil explicite est borné', () => {
+  assert.equal(parseConfig(base).qualificationMinimumScore, null);
+  assert.equal(parseConfig({ ...base, QUALIFICATION_MIN_SCORE: '61' }).qualificationMinimumScore, 61);
   assert.throws(
     () => parseConfig({ ...base, QUALIFICATION_MIN_SCORE: '101' }),
     /QUALIFICATION_MIN_SCORE/u,

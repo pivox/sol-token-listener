@@ -21,7 +21,7 @@ export interface AppConfig {
   readonly paperQuoteMintAllowlist: readonly string[];
   readonly qualificationProfilePath: string | null;
   readonly qualificationRuleSetStatus: QualificationRuleSetStatus;
-  readonly qualificationMinimumScore: number;
+  readonly qualificationMinimumScore: number | null;
   readonly dataRetentionHours: number;
   readonly listenerEnabled: boolean;
   readonly listenerWorkerLeaseSeconds: number;
@@ -128,9 +128,9 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     paperQuoteMintAllowlist,
     qualificationProfilePath: parseQualificationProfilePath(environment.QUALIFICATION_PROFILE_PATH),
     qualificationRuleSetStatus: parseQualificationRuleSetStatus(environment.QUALIFICATION_RULE_SET_STATUS),
-    qualificationMinimumScore: parseInteger(
+    qualificationMinimumScore: parseOptionalInteger(
       environment.QUALIFICATION_MIN_SCORE,
-      60,
+      null,
       'QUALIFICATION_MIN_SCORE',
       0,
       100,

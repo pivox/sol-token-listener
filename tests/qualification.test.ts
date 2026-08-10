@@ -288,6 +288,32 @@ void test('injecte le seuil d’environnement dans le moteur construit pour l’
   assert.equal(report.verdict, 'WATCHLISTED');
 });
 
+void test('preserves the selected profile minimum unless the environment overrides it', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'qualification-profile-minimum-'));
+  const profilePath = join(directory, 'profile.json');
+  try {
+    const raw = JSON.parse(readFileSync(
+      new URL('../config/qualification/pumpfun-v1-unvalidated.json', import.meta.url),
+      'utf8',
+    )) as { minimumTotalScore: number };
+    raw.minimumTotalScore = 73;
+    writeFileSync(profilePath, JSON.stringify(raw));
+    const baseEnvironment = {
+      SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
+      SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+      QUALIFICATION_PROFILE_PATH: profilePath,
+    };
+
+    assert.equal(createQualificationEngine(parseConfig(baseEnvironment)).minimumTotalScore, 73);
+    assert.equal(createQualificationEngine(parseConfig({
+      ...baseEnvironment,
+      QUALIFICATION_MIN_SCORE: '61',
+    })).minimumTotalScore, 61);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 void test('refuse un profil effectif mutable avant de le consommer', () => {
   const mutableRuleSet = {
     ...defaultQualificationRuleSet,
