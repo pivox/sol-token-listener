@@ -54,6 +54,6 @@ void test('the build script packages migrations after TypeScript compilation', a
 
   assert.equal(
     packageJson.scripts?.build,
-    'tsc -p tsconfig.json && tsx scripts/copy-migrations.ts',
+    'tsc -p tsconfig.json && tsx scripts/copy-migrations.ts && tsx scripts/copy-qualification-profiles.ts',
   );
 });
