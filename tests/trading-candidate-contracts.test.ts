@@ -45,6 +45,10 @@ void test('candidate identity changes only with its specified evidence identity 
     ...candidateInput(),
     asOfEvent: event({ id: 'evt_other' }),
   }).id, id);
+  assert.notEqual(createTradingCandidate({
+    ...candidateInput(),
+    asOfEvent: event({ confirmationStatus: 'finalized' }),
+  }).id, id);
 });
 
 void test('rejects non-canonical cursors, incoherent quotes, windows, states and reason codes', () => {

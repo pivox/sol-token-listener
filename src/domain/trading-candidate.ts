@@ -93,6 +93,7 @@ export function createTradingCandidate(input: CreateTradingCandidateInput): Trad
     qualificationProfile.fingerprint,
     input.evidenceFingerprint,
     input.asOfEvent.id,
+    input.asOfEvent.confirmationStatus,
   ]);
   return Object.freeze({
     id: `candidate_${createHash('sha256').update(identity).digest('hex')}`,

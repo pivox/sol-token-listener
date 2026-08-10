@@ -11,7 +11,7 @@ import type {
   PaperDecisionJobInput,
   PaperDecisionResult,
 } from '../src/ports/paper-decision-repository.js';
-import { migrateDatabase } from '../src/storage/database.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { PostgresPaperDecisionRepository } from '../src/storage/paper-decision.repository.js';
 import { toJsonValue } from '../src/utils/json.js';
 
@@ -19,6 +19,8 @@ const databaseUrl = process.env.TEST_DATABASE_URL;
 const MINT = 'So11111111111111111111111111111111111111112';
 const RAW_EVENT_ID = 'raw_paper_source';
 const SOURCE_EVENT_ID = 'evt_paper_source';
+const TRADE_RAW_EVENT_ID = 'raw_paper_trade';
+const TRADE_EVENT_ID = 'evt_paper_trade';
 const FINGERPRINT = 'a'.repeat(64);
 
 void test('claims one idempotent job concurrently, renews it, and reports queue counts', async (context) => {
@@ -47,6 +49,45 @@ void test('claims one idempotent job concurrently, renews it, and reports queue 
     assert.deepEqual(await repository.counts(), {
       pending: 0, processing: 1, retryableFailed: 0, exhausted: 0,
     });
+  });
+});
+
+void test('loads the immutable launch when a later trade triggers the decision', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueueLatest(MINT, 'trade-signature', 'confirmed');
+
+    const claim = await repository.claim({ nowMs: 2_000, leaseMs: 1_000 });
+    assert.ok(claim);
+    const snapshot = await repository.loadSnapshot(claim);
+
+    assert.equal(snapshot.asOfEvent.id, TRADE_EVENT_ID);
+    assert.equal(snapshot.launch.mint, MINT);
+    assert.equal(snapshot.launch.creator, 'creator');
+  });
+});
+
+void test('keeps a claimed job usable after its lease is renewed', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const claim = await repository.claim({ nowMs: 1_000, leaseMs: 1_000 });
+    assert.ok(claim);
+
+    assert.equal(await repository.renew(claim, 1_500, 1_000), true);
+    const snapshot = await repository.loadSnapshot(claim);
+    assert.equal(snapshot.launch.mint, MINT);
   });
 });
 
@@ -121,23 +162,102 @@ void test('stages, survives lease expiry, replays and completes one immutable de
   });
 });
 
-function jobInput(): PaperDecisionJobInput {
+void test('persists a finalized candidate revision after a confirmed decision', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const confirmedClaim = await repository.claim({ nowMs: 1_000, leaseMs: 1_000 });
+    assert.ok(confirmedClaim);
+    const confirmed = decisionResult('confirmed');
+    await repository.complete(confirmedClaim, Object.freeze({
+      ...confirmed, session: null, sessionEvent: null, requestedAction: 'NONE' as const,
+    }));
+
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='finalized' WHERE event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='finalized' WHERE event_id=$1`,
+      [SOURCE_EVENT_ID],
+    );
+    await repository.enqueue(jobInput({
+      sourceConfirmationStatus: 'finalized', inputFingerprint: 'f'.repeat(64),
+    }));
+    const finalizedClaim = await repository.claim({ nowMs: 2_000, leaseMs: 1_000 });
+    assert.ok(finalizedClaim);
+    const finalized = decisionResult('finalized');
+    await repository.complete(finalizedClaim, finalized);
+
+    const revisions = await pool.query<{
+      readonly candidate_id: string;
+      readonly confirmation_status: 'confirmed' | 'finalized';
+      readonly superseded_at: Date | null;
+    }>(`SELECT candidate_id,confirmation_status,superseded_at
+      FROM trading_candidates ORDER BY confirmation_status`);
+    assert.equal(revisions.rowCount, 2);
+    assert.notEqual(finalized.candidate.id, confirmed.candidate.id);
+    assert.deepEqual(revisions.rows.map((row) => row.confirmation_status), ['confirmed', 'finalized']);
+    assert.equal(revisions.rows.filter((row) => row.superseded_at === null).length, 1);
+  });
+});
+
+void test('purges counted external buys before their terminal paper session', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const claim = await repository.claim({ nowMs: 1_000, leaseMs: 1_000 });
+    assert.ok(claim);
+
+    await repository.complete(claim, terminalDecisionResult());
+    const before = await pool.query(
+      'SELECT purge_after FROM paper_external_buy_events WHERE session_id=$1',
+      [terminalDecisionResult().session?.id],
+    );
+    assert.ok(before.rows[0]?.purge_after instanceof Date);
+
+    const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.paperExternalBuys, 1);
+    assert.equal(purged.paperSessions, 1);
+  });
+});
+
+function jobInput(overrides: Partial<PaperDecisionJobInput> = {}): PaperDecisionJobInput {
   return Object.freeze({
     mint: MINT,
     sourceEventId: SOURCE_EVENT_ID,
     sourceRawEventId: RAW_EVENT_ID,
     sourceConfirmationStatus: 'confirmed',
     inputFingerprint: FINGERPRINT,
+    ...overrides,
   });
 }
 
-function decisionResult(): PaperDecisionResult {
+function decisionResult(
+  confirmationStatus: 'confirmed' | 'finalized' = 'confirmed',
+): PaperDecisionResult {
   const report = qualificationReport();
-  const qualificationEvent = derivedEvent('QualificationUpdated', 'qualification', { report });
+  const qualificationReportId = confirmationStatus === 'confirmed'
+    ? `qreport_${'b'.repeat(64)}`
+    : `qreport_${'e'.repeat(64)}`;
+  const qualificationEvent = derivedEvent(
+    'QualificationUpdated', qualificationReportId, { report }, confirmationStatus,
+  );
   const candidate = createTradingCandidate({
     mint: MINT,
     strategy: Object.freeze({ id: 'validated-external-buys', version: 1 }),
-    qualificationReportId: `qreport_${'b'.repeat(64)}`,
+    qualificationReportId,
     qualificationProfile: Object.freeze({
       id: 'pumpfun-v1-initial', version: 1, fingerprint: 'c'.repeat(64),
     }),
@@ -160,7 +280,9 @@ function decisionResult(): PaperDecisionResult {
     createdAtMs: 1_000,
     purgeAfterMs: 14_401_000,
   });
-  const candidateEvent = derivedEvent('TradingCandidateUpdated', candidate.id, { candidate });
+  const candidateEvent = derivedEvent(
+    'TradingCandidateUpdated', candidate.id, { candidate }, confirmationStatus,
+  );
   const session = createPaperStrategySession({
     candidate, state: 'BUY_PENDING', reasonCode: 'QUALIFIED_ENTRY', positionId: null,
     entryCursor: candidate.asOf.cursor, externalBuyTarget: 10, externalBuyCount: 0,
@@ -168,10 +290,48 @@ function decisionResult(): PaperDecisionResult {
     lastQuote: candidate.buyQuote, lastError: null, createdAtMs: 1_000,
     updatedAtMs: 1_000, purgeAfterMs: 14_401_000,
   });
-  const sessionEvent = derivedEvent('PaperStrategySessionUpdated', session.id, { session });
+  const sessionEvent = derivedEvent(
+    'PaperStrategySessionUpdated', session.id, { session }, confirmationStatus,
+  );
   return Object.freeze({
     report, qualificationEvent, candidate, candidateEvent, session, sessionEvent,
     countedExternalBuys: Object.freeze([]), requestedAction: 'OPEN',
+  });
+}
+
+function terminalDecisionResult(): PaperDecisionResult {
+  const base = decisionResult();
+  assert.ok(base.session);
+  const cursor = Object.freeze({
+    slot: 11n, transactionIndex: 0, instructionIndex: 2, innerInstructionIndex: null,
+  });
+  const session = Object.freeze({
+    ...base.session,
+    state: 'PAPER_CLOSED' as const,
+    reasonCode: 'EXTERNAL_BUY_TARGET_REACHED' as const,
+    externalBuyTarget: 1,
+    externalBuyCount: 1,
+    countedTradeIds: Object.freeze(['external-buy-1']),
+    lastCountedCursor: cursor,
+    updatedAtMs: 2_000,
+    purgeAfterMs: 14_402_000,
+  });
+  return Object.freeze({
+    ...base,
+    session,
+    sessionEvent: derivedEvent('PaperStrategySessionUpdated', session.id, { session }),
+    countedExternalBuys: Object.freeze([Object.freeze({
+      sessionId: session.id,
+      tradeId: 'external-buy-1',
+      mint: MINT,
+      quoteMint: 'SOL',
+      trader: 'external-wallet',
+      cursor,
+      confirmationStatus: 'confirmed' as const,
+      observedAtMs: 2_000,
+      payloadVersion: 1 as const,
+    })]),
+    requestedAction: 'CLOSE' as const,
   });
 }
 
@@ -195,6 +355,7 @@ function derivedEvent(
   type: DomainEvent['type'],
   qualifier: string,
   payload: Readonly<Record<string, unknown>>,
+  confirmationStatus: 'confirmed' | 'finalized' = 'confirmed',
 ): DomainEvent {
   const identity = {
     type, mint: MINT, source: 'paper-decision', program: 'pump', signature: 'signature',
@@ -204,7 +365,7 @@ function derivedEvent(
   return Object.freeze({
     id: createDeterministicDerivedEventId(identity), type, mint: MINT,
     source: identity.source, program: identity.program, signature: identity.signature,
-    cursor: identity.cursor, confirmationStatus: 'confirmed', blockchainTimeMs: 900,
+    cursor: identity.cursor, confirmationStatus, blockchainTimeMs: 900,
     observedAtMs: 1_000, payloadVersion: 1, payload: Object.freeze(payload),
   });
 }
@@ -236,6 +397,22 @@ async function seed(pool: InstanceType<typeof pg.Pool>): Promise<void> {
   ) VALUES ($1,$2,'TokenLaunchDetected',$3,'pumpfun','pump','signature',10,0,1,
     'confirmed',$4,1,$5)`, [
     SOURCE_EVENT_ID, RAW_EVENT_ID, MINT, new Date(1_000), toJsonValue({ launch }),
+  ]);
+}
+
+async function seedTrade(pool: InstanceType<typeof pg.Pool>): Promise<void> {
+  await pool.query(`INSERT INTO raw_chain_events (
+    event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+    confirmation_status,observed_at,payload_version,payload
+  ) VALUES ($1,'pumpfun','pump',$2,'trade-signature',11,0,2,'confirmed',$3,1,'{}')`, [
+    TRADE_RAW_EVENT_ID, MINT, new Date(2_000),
+  ]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+    instruction_index,confirmation_status,observed_at,payload_version,payload
+  ) VALUES ($1,$2,'BondingCurveTradeObserved',$3,'pumpfun','pump','trade-signature',11,0,2,
+    'confirmed',$4,1,$5)`, [
+    TRADE_EVENT_ID, TRADE_RAW_EVENT_ID, MINT, new Date(2_000), toJsonValue({ trade: {} }),
   ]);
 }
 

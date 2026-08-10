@@ -230,7 +230,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       );
       const asOfEvent = decodeDomainEvent(requiredRow(sourceResult, 'Source event is missing.'));
       if (asOfEvent.confirmationStatus === 'orphaned') throw new PaperDecisionLeaseLostError();
-      const launch = payloadProperty(asOfEvent.payload, 'launch') as TokenLaunch;
+      const launch = await loadLaunch(client, job.mint);
       const metadata = await latestMetadata(client, job.mint);
       const social = await latestPayload<SocialEvidenceCollectionV1>(client,
         `SELECT payload #> '{collection}' AS payload FROM domain_events
@@ -463,14 +463,14 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
   ]);
   await client.query(`INSERT INTO trading_candidates (
     candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
-    strategy_version,evidence_fingerprint,state,quote_mint,quote_decimals,
+    strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,quote_decimals,
     quote_token_program,reason_codes,eligible_until,created_at,purge_after,
     payload_version,payload
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,1,$17)
+  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,1,$18)
   ON CONFLICT (candidate_id) DO NOTHING`, [
     candidate.id,job.mint,candidate.qualificationReportId,job.sourceEventId,
     result.candidateEvent.id,candidate.strategy.id,candidate.strategy.version,
-    candidate.evidenceFingerprint,candidate.state,candidate.quoteAsset.mint,
+    candidate.evidenceFingerprint,candidate.asOf.confirmationStatus,candidate.state,candidate.quoteAsset.mint,
     candidate.quoteAsset.decimals,candidate.quoteAsset.tokenProgram,
     stringifyJson(candidate.reasonCodes),date(candidate.eligibleUntilMs),
     new Date(candidate.createdAtMs),new Date(candidate.purgeAfterMs),toJsonValue(candidate),
@@ -478,6 +478,7 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
   if (result.session !== null && result.sessionEvent !== null) {
     await upsertSession(client, job, result.session, result.sessionEvent.id);
   }
+  const countedBuyPurgeAfter = result.session === null ? null : sessionPurgeAfter(result.session);
   for (const evidence of result.countedExternalBuys) {
     const source = await client.query(`SELECT event_id,program,signature,blockchain_time
       FROM raw_chain_events
@@ -508,12 +509,13 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
       session_id,trade_id,source_event_id,mint,quote_mint,trader,slot,
       transaction_index,instruction_index,inner_instruction_index,
       confirmation_status,observed_at,purge_after,payload_version,payload
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL,1,$13)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,$14)
     ON CONFLICT (session_id,trade_id) DO NOTHING`, [
       evidence.sessionId,evidence.tradeId,countedEvent.id,evidence.mint,evidence.quoteMint,
       evidence.trader,evidence.cursor.slot.toString(),evidence.cursor.transactionIndex,
       evidence.cursor.instructionIndex,evidence.cursor.innerInstructionIndex,
-      evidence.confirmationStatus,new Date(evidence.observedAtMs),toJsonValue(evidence),
+      evidence.confirmationStatus,new Date(evidence.observedAtMs),countedBuyPurgeAfter,
+      toJsonValue(evidence),
     ]);
   }
 }
@@ -525,6 +527,7 @@ async function upsertSession(
   sessionEventId: string,
 ): Promise<void> {
   const terminal = ['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state);
+  const purgeAfter = sessionPurgeAfter(session);
   await client.query(`INSERT INTO paper_strategy_sessions (
     session_id,mint,candidate_id,report_id,source_event_id,session_event_id,
     strategy_id,strategy_version,actor_kind,state,reason_code,quote_mint,
@@ -549,8 +552,19 @@ async function upsertSession(
     session.entryCursor.innerInstructionIndex,session.externalBuyTarget,
     session.externalBuyCount,session.minimumConfirmation,new Date(session.createdAtMs),
     new Date(session.updatedAtMs),terminal ? new Date(session.updatedAtMs) : null,
-    terminal ? new Date(session.updatedAtMs + 14_400_000) : null,toJsonValue(session),
+    purgeAfter,toJsonValue(session),
   ]);
+  if (purgeAfter !== null) {
+    await client.query(`UPDATE paper_external_buy_events
+      SET purge_after=COALESCE(purge_after,$2)
+      WHERE session_id=$1`, [session.id,purgeAfter]);
+  }
+}
+
+function sessionPurgeAfter(session: PaperStrategySessionV1): Date | null {
+  return ['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state)
+    ? new Date(session.updatedAtMs + 14_400_000)
+    : null;
 }
 
 async function insertDomainEvent(client: Client, job: ClaimedPaperDecisionJob, event: DomainEvent): Promise<void> {
@@ -602,7 +616,7 @@ function assertLeaseRow(row: unknown, job: ClaimedPaperDecisionJob): void {
   if (
     textField(row, 'status') !== 'PROCESSING'
     || nullableTextField(row, 'lease_token') !== job.leaseToken
-    || dateField(row, 'lease_expires_at').getTime() !== job.leaseExpiresAtMs
+    || dateField(row, 'lease_expires_at').getTime() < job.leaseExpiresAtMs
   ) throw new PaperDecisionLeaseLostError();
 }
 
@@ -627,6 +641,15 @@ async function latestMetadata(client: Client, mint: string): Promise<TokenMetada
     mint,uri:textField(row, 'uri'),resolution,
     fetchedAtMs:dateField(row, 'fetched_at').getTime(),payloadVersion:integerField(row, 'payload_version'),
   });
+}
+
+async function loadLaunch(client: Client, mint: string): Promise<TokenLaunch> {
+  const result = await client.query(`SELECT * FROM domain_events
+    WHERE mint=$1 AND type='TokenLaunchDetected' AND confirmation_status<>'orphaned'
+    ORDER BY slot,transaction_index,instruction_index,
+      COALESCE(inner_instruction_index,-1),event_id LIMIT 1`, [mint]);
+  const event = decodeDomainEvent(requiredRow(result, 'Token launch event is missing.'));
+  return payloadProperty(event.payload, 'launch') as TokenLaunch;
 }
 
 async function latestPayload<T>(client: Client, sql: string, mint: string): Promise<T | null> {

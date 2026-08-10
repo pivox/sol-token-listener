@@ -21,6 +21,8 @@ void test('defines the complete additive paper decision schema with closed enums
   assert.match(sql, /reason_codes <@/u);
   assert.match(sql, /paper_decision_jobs_claim_idx/u);
   assert.match(sql, /trading_candidates_current_idx/u);
+  assert.match(sql, /trading_candidates[\s\S]*confirmation_status TEXT NOT NULL[\s\S]*UNIQUE \(mint, strategy_id, strategy_version, evidence_fingerprint, source_event_id, confirmation_status\)/u);
+  assert.match(sql, /qualification_reports[\s\S]*UNIQUE \(mint, profile_id, profile_version, evidence_fingerprint, source_event_id, confirmation_status\)/u);
   assert.match(sql, /paper_strategy_sessions_active_idx/u);
   assert.match(sql, /UNIQUE \(session_id, trade_id\)/u);
   assert.match(sql, /NUMERIC\(78,0\)/u);

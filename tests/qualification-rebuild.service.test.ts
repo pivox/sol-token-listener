@@ -67,6 +67,27 @@ void test('keeps an enforced creator sell separate from the score', () => {
   assert.equal(rebuilt.report.verdict, 'REJECTED');
 });
 
+void test('revises qualification identity when source confirmation advances', () => {
+  const service = new QualificationRebuildService(engine());
+  const confirmedSnapshot = snapshot();
+  const finalizedSnapshot = snapshot({
+    asOfEvent: Object.freeze({
+      ...confirmedSnapshot.asOfEvent,
+      confirmationStatus: 'finalized' as const,
+    }),
+  });
+
+  const confirmed = service.rebuild({
+    snapshot: confirmedSnapshot, buyQuote: undefined, reverseSellQuote: undefined,
+  });
+  const finalized = service.rebuild({
+    snapshot: finalizedSnapshot, buyQuote: undefined, reverseSellQuote: undefined,
+  });
+
+  assert.notEqual(finalized.reportId, confirmed.reportId);
+  assert.notEqual(finalized.reportEventId, confirmed.reportEventId);
+});
+
 function engine(): QualificationEngine {
   return new QualificationEngine(createDefaultQualificationRuleSet(60));
 }

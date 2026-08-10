@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS qualification_reports (
   purge_after TIMESTAMPTZ NOT NULL,
   payload_version INTEGER NOT NULL CHECK (payload_version = 1),
   payload JSONB NOT NULL,
-  UNIQUE (mint, profile_id, profile_version, evidence_fingerprint, source_event_id),
+  UNIQUE (mint, profile_id, profile_version, evidence_fingerprint, source_event_id, confirmation_status),
   CHECK (purge_after = evaluated_at + INTERVAL '4 hours'),
   CHECK (superseded_at IS NULL OR superseded_at >= evaluated_at)
 );
@@ -102,6 +102,9 @@ CREATE TABLE IF NOT EXISTS trading_candidates (
   strategy_id TEXT NOT NULL CHECK (OCTET_LENGTH(strategy_id) BETWEEN 1 AND 256),
   strategy_version INTEGER NOT NULL CHECK (strategy_version > 0),
   evidence_fingerprint TEXT NOT NULL CHECK (evidence_fingerprint ~ '^[0-9a-f]{64}$'),
+  confirmation_status TEXT NOT NULL CHECK (
+    confirmation_status IN ('processed','confirmed','finalized','orphaned')
+  ),
   state TEXT NOT NULL CHECK (state IN ('NOT_ELIGIBLE','ELIGIBLE','EXPIRED','REVOKED')),
   quote_mint TEXT NOT NULL,
   quote_decimals INTEGER NOT NULL CHECK (quote_decimals BETWEEN 0 AND 255),
@@ -121,7 +124,7 @@ CREATE TABLE IF NOT EXISTS trading_candidates (
   purge_after TIMESTAMPTZ NOT NULL,
   payload_version INTEGER NOT NULL CHECK (payload_version = 1),
   payload JSONB NOT NULL,
-  UNIQUE (mint, strategy_id, strategy_version, evidence_fingerprint, source_event_id),
+  UNIQUE (mint, strategy_id, strategy_version, evidence_fingerprint, source_event_id, confirmation_status),
   CHECK (purge_after = created_at + INTERVAL '4 hours'),
   CHECK ((state = 'ELIGIBLE' AND eligible_until IS NOT NULL) OR state <> 'ELIGIBLE'),
   CHECK (superseded_at IS NULL OR superseded_at >= created_at)

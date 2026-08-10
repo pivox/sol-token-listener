@@ -44,7 +44,7 @@ export class QualificationRebuildService {
     const profile = this.engine.profileSummary;
     const reportId = `qreport_${hash(JSON.stringify([
       input.snapshot.mint,profile.id,String(profile.version),profile.fingerprint,
-      evidenceFingerprint,input.snapshot.asOfEvent.id,
+      evidenceFingerprint,input.snapshot.asOfEvent.id,input.snapshot.asOfEvent.confirmationStatus,
     ]))}`;
     const eventId = createDeterministicDerivedEventId({
       type:'QualificationUpdated',mint:input.snapshot.mint,source:'paper-decision',
