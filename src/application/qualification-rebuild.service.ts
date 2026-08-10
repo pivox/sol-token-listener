@@ -18,6 +18,7 @@ export interface QualificationRebuildInput {
   readonly snapshot: PaperDecisionSnapshot;
   readonly buyQuote: PaperExecutionQuote | null | undefined;
   readonly reverseSellQuote: PaperExecutionQuote | null | undefined;
+  readonly upstreamConditions?: readonly QualificationUpstreamCondition[];
 }
 
 export interface RebuiltQualification {
@@ -91,6 +92,7 @@ function evaluationFrom(input: QualificationRebuildInput): QualificationEvaluati
     signals.creatorHasNotSold = !snapshot.creatorProfile.hasSold;
     upstream.set('CREATOR_EARLY_SELL', snapshot.creatorProfile.hasSold);
   }
+  for (const condition of input.upstreamConditions ?? []) mergeCondition(upstream, condition);
   if (snapshot.holderSnapshot !== null) {
     signals.externalBuyersObserved = snapshot.holderSnapshot.uniqueExternalBuyers > 0;
   }

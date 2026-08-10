@@ -74,7 +74,7 @@ function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecision
       quoteAssets:Object.freeze([Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const })]),
       launchpad:'pumpfun',createdAt:Object.freeze({ ...asOfEvent.cursor }),parameters:Object.freeze({}),
     }),metadata:null,social:null,creatorProfile:null,holderSnapshot:null,walletGraph:null,
-    activeLaunchTrades:Object.freeze([]),activeMarketTrades:Object.freeze([]),currentCandidate:null,
+    activeLaunchTrades:Object.freeze([]),activeMarketTrades:Object.freeze([]),currentCandidate:null,currentDecision:null,
     currentSession:null,activePosition:null,...overrides,
   });
 }

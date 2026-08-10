@@ -49,6 +49,13 @@ export interface PaperDecisionSnapshot {
   >[];
   readonly activeMarketTrades: readonly MarketTrade[];
   readonly currentCandidate: TradingCandidateV1 | null;
+  readonly currentDecision: Readonly<{
+    readonly reportId: string;
+    readonly evidenceFingerprint: string;
+    readonly report: QualificationReport;
+    readonly qualificationEvent: DomainEvent;
+    readonly candidateEvent: DomainEvent;
+  }> | null;
   readonly currentSession: PaperStrategySessionV1 | null;
   readonly activePosition: PaperPosition | null;
 }

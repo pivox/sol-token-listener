@@ -103,6 +103,9 @@ void test('stages, survives lease expiry, replays and completes one immutable de
     assert.equal(snapshot.launch.mint, MINT);
     assert.equal(snapshot.asOfEvent.id, SOURCE_EVENT_ID);
     assert.equal(snapshot.currentCandidate?.id, result.candidate.id);
+    assert.equal(snapshot.currentDecision?.reportId, result.candidate.qualificationReportId);
+    assert.equal(snapshot.currentDecision?.qualificationEvent.id, result.qualificationEvent.id);
+    assert.equal(snapshot.currentDecision?.candidateEvent.id, result.candidateEvent.id);
     assert.equal(snapshot.currentSession?.id, result.session?.id);
 
     await repository.complete(replay, result);

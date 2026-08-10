@@ -88,7 +88,7 @@ function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecision
     }),
     metadata: null, social: null, creatorProfile: null, holderSnapshot: null,
     walletGraph: null, activeLaunchTrades: Object.freeze([]), activeMarketTrades: Object.freeze([]),
-    currentCandidate: null, currentSession: null, activePosition: null,
+    currentCandidate: null, currentDecision: null, currentSession: null, activePosition: null,
     ...overrides,
   });
 }

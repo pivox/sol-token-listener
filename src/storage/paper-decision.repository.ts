@@ -202,6 +202,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
           WHERE candidate.mint=$1 AND candidate.superseded_at IS NULL
             AND source.confirmation_status<>'orphaned'
           ORDER BY candidate.created_at DESC,candidate.candidate_id DESC LIMIT 1`,job.mint);
+      const currentDecision = candidate === null
+        ? null
+        : await loadCurrentDecision(client, candidate.id);
       const session = await latestPayload<PaperStrategySessionV1>(client,
         `SELECT session.payload FROM paper_strategy_sessions session
           JOIN domain_events source ON source.event_id=session.source_event_id
@@ -219,7 +222,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       return deepFreeze({
         mint: job.mint,asOfEvent,launch,metadata,social,creatorProfile,holderSnapshot,
         walletGraph,activeLaunchTrades: launchTrades,activeMarketTrades: marketTrades,
-        currentCandidate: candidate,currentSession: session,activePosition: position,
+        currentCandidate: candidate,currentDecision,currentSession: session,activePosition: position,
       });
     } catch (error: unknown) {
       await rollback(client);
@@ -557,6 +560,48 @@ async function latestPayload<T>(client: Client, sql: string, mint: string): Prom
   return row === undefined ? null : decoded(field(row, 'payload'), 'Projection payload is invalid.') as T;
 }
 
+async function loadCurrentDecision(
+  client: Client,
+  candidateId: string,
+): Promise<PaperDecisionSnapshot['currentDecision']> {
+  const result = await client.query(`SELECT report.report_id,report.evidence_fingerprint,
+    report.payload AS report_payload,qualification_event.*,
+    candidate_event.event_id AS candidate_event_id,
+    candidate_event.type AS candidate_event_type,
+    candidate_event.mint AS candidate_event_mint,
+    candidate_event.source AS candidate_event_source,
+    candidate_event.program AS candidate_event_program,
+    candidate_event.signature AS candidate_event_signature,
+    candidate_event.slot AS candidate_event_slot,
+    candidate_event.transaction_index AS candidate_event_transaction_index,
+    candidate_event.instruction_index AS candidate_event_instruction_index,
+    candidate_event.inner_instruction_index AS candidate_event_inner_instruction_index,
+    candidate_event.confirmation_status AS candidate_event_confirmation_status,
+    candidate_event.blockchain_time AS candidate_event_blockchain_time,
+    candidate_event.observed_at AS candidate_event_observed_at,
+    candidate_event.payload_version AS candidate_event_payload_version,
+    candidate_event.payload AS candidate_event_payload
+    FROM trading_candidates candidate
+    JOIN qualification_reports report ON report.report_id=candidate.report_id
+    JOIN domain_events qualification_event ON qualification_event.event_id=report.qualification_event_id
+    JOIN domain_events candidate_event ON candidate_event.event_id=candidate.candidate_event_id
+    WHERE candidate.candidate_id=$1
+      AND qualification_event.confirmation_status<>'orphaned'
+      AND candidate_event.confirmation_status<>'orphaned'`, [candidateId]);
+  const row = result.rows[0];
+  if (row === undefined) return null;
+  return deepFreeze({
+    reportId:textField(row,'report_id'),
+    evidenceFingerprint:textField(row,'evidence_fingerprint'),
+    report:decoded(
+      field(row,'report_payload'),
+      'Qualification report payload is invalid.',
+    ) as NonNullable<PaperDecisionSnapshot['currentDecision']>['report'],
+    qualificationEvent:decodeDomainEvent(row),
+    candidateEvent:decodePrefixedDomainEvent(row,'candidate_event_'),
+  });
+}
+
 async function activeLaunchTrades(
   client: Client,
   mint: string,
@@ -673,6 +718,22 @@ function decodeDomainEvent(row: unknown): DomainEvent {
     observedAtMs:dateField(row,'observed_at').getTime(),payloadVersion:integerField(row,'payload_version'),
     payload:decoded(field(row,'payload'),'Domain event payload is invalid.') as Readonly<Record<string, unknown>>,
   });
+}
+
+function decodePrefixedDomainEvent(row: unknown, prefix: string): DomainEvent {
+  const projected = {
+    event_id:field(row,`${prefix}id`),type:field(row,`${prefix}type`),
+    mint:field(row,`${prefix}mint`),source:field(row,`${prefix}source`),
+    program:field(row,`${prefix}program`),signature:field(row,`${prefix}signature`),
+    slot:field(row,`${prefix}slot`),transaction_index:field(row,`${prefix}transaction_index`),
+    instruction_index:field(row,`${prefix}instruction_index`),
+    inner_instruction_index:field(row,`${prefix}inner_instruction_index`),
+    confirmation_status:field(row,`${prefix}confirmation_status`),
+    blockchain_time:field(row,`${prefix}blockchain_time`),
+    observed_at:field(row,`${prefix}observed_at`),
+    payload_version:field(row,`${prefix}payload_version`),payload:field(row,`${prefix}payload`),
+  };
+  return decodeDomainEvent(projected);
 }
 
 function cursorFromRow(row: unknown): DomainEvent['cursor'] {
