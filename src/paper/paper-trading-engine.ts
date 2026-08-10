@@ -4,6 +4,7 @@ import type { AppConfig } from '../config/env.js';
 import type { DomainEvent } from '../domain/events.js';
 import { assertValidChainCursor } from '../domain/cursor.js';
 import type {
+  QualificationConditionEvidence,
   QualificationReport,
   QualificationScore,
 } from '../domain/qualification.js';
@@ -390,8 +391,16 @@ function snapshotQualification(report: QualificationReport): QualificationReport
       code: item.code,
       mode: item.mode,
       status: item.status,
-      observed: snapshotConditionRecord(item.observed, isObservedConditionValue),
-      thresholds: snapshotConditionRecord(item.thresholds, isThresholdConditionValue),
+      observed: snapshotConditionRecord(
+        item.observed,
+        conditionRecordKeys(item, 'observed'),
+        isObservedConditionValue,
+      ),
+      thresholds: snapshotConditionRecord(
+        item.thresholds,
+        conditionRecordKeys(item, 'thresholds'),
+        isThresholdConditionValue,
+      ),
       message: item.message,
     }))),
     blockers: freeze(report.blockers.map((item) => freeze({
@@ -405,6 +414,7 @@ function snapshotQualification(report: QualificationReport): QualificationReport
 
 function snapshotConditionRecord<T>(
   value: unknown,
+  expectedKeys: readonly string[],
   validValue: (candidate: unknown) => candidate is T,
 ): Readonly<Record<string, T>> {
   if (
@@ -418,9 +428,12 @@ function snapshotConditionRecord<T>(
     throw new TypeError('Qualification condition records must be plain objects.');
   }
   const descriptors = Object.getOwnPropertyDescriptors(value);
-  const keys = Object.getOwnPropertyNames(value).sort();
-  const result = Object.create(null) as Record<string, T>;
-  for (const key of keys) {
+  const keys = Object.getOwnPropertyNames(value);
+  if (keys.length !== expectedKeys.length || expectedKeys.some((key) => !Object.hasOwn(descriptors, key))) {
+    throw new TypeError('Qualification condition record keys are invalid.');
+  }
+  const result: Record<string, T> = {};
+  for (const key of expectedKeys) {
     const descriptor = descriptors[key];
     if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable || !validValue(descriptor.value)) {
       throw new TypeError('Qualification condition records must contain enumerable data values.');
@@ -431,12 +444,51 @@ function snapshotConditionRecord<T>(
 }
 
 function isObservedConditionValue(value: unknown): value is bigint | number | boolean | null {
-  return value === null || typeof value === 'bigint' || typeof value === 'number' || typeof value === 'boolean';
+  return value === null || typeof value === 'bigint' || typeof value === 'boolean' || isSafeConditionInteger(value);
 }
 
 function isThresholdConditionValue(value: unknown): value is bigint | number | null {
-  return value === null || typeof value === 'bigint' || typeof value === 'number';
+  return value === null || typeof value === 'bigint' || isSafeConditionInteger(value);
 }
+
+function isSafeConditionInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && !Object.is(value, -0);
+}
+
+function conditionRecordKeys(
+  condition: QualificationConditionEvidence,
+  kind: 'observed' | 'thresholds',
+): readonly string[] {
+  if (condition.status === 'DISABLED') return EMPTY_CONDITION_RECORD_KEYS;
+  switch (condition.code) {
+    case 'HOLDER_CONCENTRATION_EXCEEDED':
+      return kind === 'observed' ? HOLDER_OBSERVED_KEYS : HOLDER_THRESHOLD_KEYS;
+    case 'RELATED_WALLET_CLUSTER_EXCEEDED':
+      return kind === 'observed' ? RELATED_OBSERVED_KEYS : RELATED_THRESHOLD_KEYS;
+    case 'SHARED_FUNDER_CLUSTER':
+      return kind === 'observed' ? SHARED_FUNDER_OBSERVED_KEYS : SHARED_FUNDER_THRESHOLD_KEYS;
+    case 'BUY_SIMULATION_FAILED':
+      return kind === 'observed' ? BUY_SIMULATION_OBSERVED_KEYS : EMPTY_CONDITION_RECORD_KEYS;
+    case 'SELL_QUOTE_UNAVAILABLE':
+      return kind === 'observed' ? SELL_QUOTE_OBSERVED_KEYS : EMPTY_CONDITION_RECORD_KEYS;
+    case 'ROUND_TRIP_LOSS_EXCEEDED':
+      return kind === 'observed' ? ROUND_TRIP_OBSERVED_KEYS : ROUND_TRIP_THRESHOLD_KEYS;
+    default:
+      return EMPTY_CONDITION_RECORD_KEYS;
+  }
+}
+
+const EMPTY_CONDITION_RECORD_KEYS = Object.freeze([] as string[]);
+const HOLDER_OBSERVED_KEYS = Object.freeze(['top1HolderBps', 'top5HoldersBps', 'top10HoldersBps']);
+const HOLDER_THRESHOLD_KEYS = Object.freeze(['maximumTop1Bps', 'maximumTop5Bps', 'maximumTop10Bps']);
+const RELATED_OBSERVED_KEYS = Object.freeze(['maximumRelatedClusterBps']);
+const RELATED_THRESHOLD_KEYS = Object.freeze(['maximumClusterBps']);
+const SHARED_FUNDER_OBSERVED_KEYS = Object.freeze(['maximumSharedFunderCount']);
+const SHARED_FUNDER_THRESHOLD_KEYS = Object.freeze(['minimumSharedFunders']);
+const BUY_SIMULATION_OBSERVED_KEYS = Object.freeze(['buySimulationSucceeded']);
+const SELL_QUOTE_OBSERVED_KEYS = Object.freeze(['sellQuoteAvailable']);
+const ROUND_TRIP_OBSERVED_KEYS = Object.freeze(['roundTripLossBps']);
+const ROUND_TRIP_THRESHOLD_KEYS = Object.freeze(['maximumRoundTripLossBps']);
 
 function snapshotTrigger(trigger: DomainEvent): DomainEvent {
   assertValidChainCursor(trigger.cursor);

@@ -284,6 +284,56 @@ void test('replays calibrated condition maps with a different key order', async 
   assert.equal(repository.writeCount, 1);
 });
 
+void test('preserves the historical calibrated qualification command hash', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = openCommand();
+  const first = await engine.open(command);
+
+  assert.equal(
+    first.openCommandHash,
+    'paper_open_command_04adf7b1775782bd2c2a8978237cb1b653158fbf0dd4d9ca4f5e7484445971d0',
+  );
+  const replay = await engine.open({
+    ...command,
+    qualification: {
+      ...command.qualification,
+      conditions: command.qualification.conditions.map((item) => item.code === 'HOLDER_CONCENTRATION_EXCEEDED'
+        ? {
+          ...item,
+          observed: reverseRecord(item.observed),
+          thresholds: reverseRecord(item.thresholds),
+        }
+        : item),
+    },
+  });
+  assert.equal(replay.id, first.id);
+});
+
+void test('rejects invalid numeric calibrated condition values instead of replaying null', async () => {
+  for (const value of [NaN, Infinity, -Infinity, 1.5, -0]) {
+    const observedRepository = new MemoryPaperRepository();
+    const observedEngine = makeEngine(observedRepository, 'paper');
+    const observedCommand = openCommand();
+    await observedEngine.open(observedCommand);
+    await assert.rejects(
+      observedEngine.open(withHolderConditionValue(observedCommand, 'observed', value)),
+      /Qualification condition records must contain enumerable data values/u,
+    );
+    assert.equal(observedRepository.writeCount, 1);
+
+    const thresholdRepository = new MemoryPaperRepository();
+    const thresholdEngine = makeEngine(thresholdRepository, 'paper');
+    const thresholdCommand = openCommand();
+    await thresholdEngine.open(thresholdCommand);
+    await assert.rejects(
+      thresholdEngine.open(withHolderConditionValue(thresholdCommand, 'thresholds', value)),
+      /Qualification condition records must contain enumerable data values/u,
+    );
+    assert.equal(thresholdRepository.writeCount, 1);
+  }
+});
+
 void test('ferme entièrement et calcule le PnL conservateur', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
@@ -443,6 +493,25 @@ function reverseRecord<T extends bigint | number | boolean | null>(
   record: Readonly<Record<string, T>>,
 ): Record<string, T> {
   return Object.fromEntries(Object.entries(record).reverse()) as Record<string, T>;
+}
+
+function withHolderConditionValue(
+  command: OpenPaperPositionCommand,
+  record: 'observed' | 'thresholds',
+  value: number,
+): OpenPaperPositionCommand {
+  return {
+    ...command,
+    qualification: {
+      ...command.qualification,
+      conditions: command.qualification.conditions.map((item) => {
+        if (item.code !== 'HOLDER_CONCENTRATION_EXCEEDED') return item;
+        return record === 'observed'
+          ? { ...item, observed: { ...item.observed, top1HolderBps: value } }
+          : { ...item, thresholds: { ...item.thresholds, maximumTop1Bps: value } };
+      }),
+    },
+  };
 }
 
 class MemoryPaperRepository implements PaperTradingRepository {
