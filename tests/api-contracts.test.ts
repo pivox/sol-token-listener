@@ -11,6 +11,7 @@ import {
   type ApiJsonObject,
   type ApiLaunchSummary,
   type ApiQualification,
+  type ApiQualificationCondition,
   type ApiSocial,
   type ApiHolders,
   type ApiDomainEvent,
@@ -249,14 +250,21 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   const qualification: ApiQualification = {
     ruleSet: {
       id: 'rules-v1', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60,
+      fingerprint: null,
     },
     scores: {
       preparation: { score: 20, maximum: 30 }, socialAuthenticity: { score: 20, maximum: 30 },
       onchainHealth: { score: 20, maximum: 40 }, total: { score: 60, maximum: 100 },
     },
     evidence: [{ signal: 'imageValid', status: 'UNKNOWN', message: 'Not fetched' }],
+    conditions: [],
     blockers: [{ code: 'STALE_DATA', message: 'Data is stale' }],
     verdict: 'WATCHLISTED', evaluatedAt: '2026-07-29T12:00:00.000Z',
+  };
+  const condition: ApiQualificationCondition = {
+    code: 'ROUND_TRIP_LOSS_EXCEEDED', mode: 'ENFORCED', status: 'TRIGGERED',
+    observed: { roundTripLossBps: '3001' }, thresholds: { maximumRoundTripLossBps: '3000' },
+    message: 'Perte aller-retour supérieure au seuil configuré.',
   };
   const health: ApiHealth = {
     status: 'OK', observedAt: '2026-07-29T12:00:00.000Z',
@@ -293,6 +301,7 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(availableHolders.status, 'AVAILABLE');
   assert.equal(clusteredHolders.clusterAnalysisStatus, 'AVAILABLE');
   assert.equal(qualification.verdict, 'WATCHLISTED');
+  assert.equal(condition.observed.roundTripLossBps, '3001');
   assert.equal(health.pipeline.pumpfun, 'RUNNING');
   assert.equal(sseEvent.eventId, 'evt_1');
 });

@@ -17,12 +17,14 @@ import {
   type ApiParticipantQuoteFlow,
   type ApiPaperPosition,
   type ApiQualification,
+  type ApiQualificationCondition,
   type ApiCreatorProfile,
   type ApiCreatorTradeEvidence,
   type ApiAnalyticsCursor,
   type ApiSocial,
   type ApiTimelineEntry,
 } from '../api/contracts.js';
+import { isProxy } from 'node:util/types';
 import {
   MAX_TIMELINE_INDEX,
   MAX_TIMELINE_SLOT,
@@ -40,9 +42,17 @@ import {
   type ListenerRuntimeState,
 } from '../domain/transaction-ingestion.js';
 import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
-import { QUALIFICATION_SIGNAL_KEYS } from '../domain/qualification.js';
+import {
+  QUALIFICATION_CONDITION_MODES,
+  QUALIFICATION_CONDITION_STATUSES,
+  QUALIFICATION_SIGNAL_KEYS,
+} from '../domain/qualification.js';
 import { MAX_API_PAGE_LIMIT, type ApiProjectionRepository, type PageRequest } from '../ports/api-projection-repository.js';
-import { fromJsonValue } from '../utils/json.js';
+import {
+  BIGINT_JSON_MARKER,
+  MAX_SERIALIZED_BIGINT_DIGITS,
+  fromJsonValue,
+} from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 
 export interface Queryable {
@@ -873,9 +883,15 @@ function qualification(value: unknown): ApiQualification {
   const ruleSet = record(payload.ruleSet);
   const scores = record(payload.scores);
   const evaluatedAtMs = safeNumber(payload.evaluatedAtMs);
+  const hasFingerprint = Object.hasOwn(ruleSet, 'fingerprint');
+  const hasConditions = Object.hasOwn(payload, 'conditions');
+  if (hasFingerprint !== hasConditions) throw invalid();
+  const fingerprint = hasFingerprint ? ownDataProperty(ruleSet, 'fingerprint') : undefined;
+  const conditions = hasConditions ? ownDataProperty(payload, 'conditions') : undefined;
   return freeze({
     ruleSet: freeze({ id: text(ruleSet.id), version: positiveSafeNumber(ruleSet.version),
-      status: qualificationRuleSetStatus(ruleSet.status), minimumTotalScore: safeNumber(ruleSet.minimumTotalScore) }),
+      status: qualificationRuleSetStatus(ruleSet.status), minimumTotalScore: safeNumber(ruleSet.minimumTotalScore),
+      fingerprint: hasFingerprint ? qualificationFingerprint(fingerprint) : null }),
     scores: freeze({ preparation: score(scores.preparation), socialAuthenticity: score(scores.socialAuthenticity),
       onchainHealth: score(scores.onchainHealth), total: score(scores.total) }),
     evidence: freeze(array(payload.evidence).map((item) => {
@@ -883,12 +899,181 @@ function qualification(value: unknown): ApiQualification {
       return freeze({ signal: validated(itemRecord.signal, QUALIFICATION_SIGNAL_KEYS) as ApiQualification['evidence'][number]['signal'],
         status: validated(itemRecord.status, QUALIFICATION_EVIDENCE_STATUSES) as ApiQualification['evidence'][number]['status'], message: text(itemRecord.message) });
     })),
+    conditions: hasConditions ? qualificationConditions(conditions) : freeze([]),
     blockers: freeze(array(payload.blockers).map((item) => {
       const itemRecord = record(item);
       return freeze({ code: validated(itemRecord.code, QUALIFICATION_REASON_CODES) as ApiQualification['blockers'][number]['code'], message: text(itemRecord.message) });
     })),
     verdict: validated(payload.verdict, QUALIFICATION_VERDICTS) as ApiQualification['verdict'], evaluatedAt: dateFromMs(evaluatedAtMs).toISOString(),
   });
+}
+
+const MAX_QUALIFICATION_CONDITIONS = QUALIFICATION_REASON_CODES.length;
+const MAX_QUALIFICATION_CONDITION_MESSAGE_LENGTH = 4_096;
+const MAX_QUALIFICATION_CONDITION_MAP_KEYS = 3;
+const QUALIFICATION_CONDITION_FIELDS = [
+  'code', 'mode', 'status', 'observed', 'thresholds', 'message',
+] as const;
+
+function qualificationFingerprint(value: unknown): string {
+  if (typeof value !== 'string' || !/^[0-9a-f]{64}$/u.test(value)) throw invalid();
+  return value;
+}
+
+function qualificationConditions(value: unknown): readonly ApiQualificationCondition[] {
+  const source = exactDenseArray(value, MAX_QUALIFICATION_CONDITIONS, 'Qualification conditions');
+  const seen = new Set<string>();
+  return freeze(source.map((item) => {
+    const fields = exactDataRecord(item, QUALIFICATION_CONDITION_FIELDS, 'Qualification condition');
+    const code = validated(fields.code, QUALIFICATION_REASON_CODES) as ApiQualificationCondition['code'];
+    if (seen.has(code)) throw invalid();
+    seen.add(code);
+    const mode = validated(fields.mode, QUALIFICATION_CONDITION_MODES) as ApiQualificationCondition['mode'];
+    const status = validated(fields.status, QUALIFICATION_CONDITION_STATUSES) as ApiQualificationCondition['status'];
+    const observed = qualificationObserved(code, mode, fields.observed);
+    const thresholds = qualificationThresholds(code, mode, fields.thresholds);
+    const message = qualificationMessage(fields.message);
+    return freeze({ code, mode, status, observed, thresholds, message });
+  }));
+}
+
+function qualificationObserved(
+  code: ApiQualificationCondition['code'],
+  mode: ApiQualificationCondition['mode'],
+  value: unknown,
+): ApiQualificationCondition['observed'] {
+  if (mode === 'DISABLED') return qualificationMap(value, [], []);
+  switch (code) {
+    case 'HOLDER_CONCENTRATION_EXCEEDED':
+      return qualificationMap(value, ['top1HolderBps', 'top5HoldersBps', 'top10HoldersBps'], ['decimal', 'decimal', 'decimal']);
+    case 'RELATED_WALLET_CLUSTER_EXCEEDED':
+      return qualificationMap(value, ['maximumRelatedClusterBps'], ['decimal']);
+    case 'SHARED_FUNDER_CLUSTER':
+      return qualificationMap(value, ['maximumSharedFunderCount'], ['count']);
+    case 'BUY_SIMULATION_FAILED':
+      return qualificationMap(value, ['buySimulationSucceeded'], ['boolean']);
+    case 'SELL_QUOTE_UNAVAILABLE':
+      return qualificationMap(value, ['sellQuoteAvailable'], ['boolean']);
+    case 'ROUND_TRIP_LOSS_EXCEEDED':
+      return qualificationMap(value, ['roundTripLossBps'], ['decimal']);
+    default:
+      return qualificationMap(value, [], []);
+  }
+}
+
+function qualificationThresholds(
+  code: ApiQualificationCondition['code'],
+  mode: ApiQualificationCondition['mode'],
+  value: unknown,
+): ApiQualificationCondition['thresholds'] {
+  if (mode === 'DISABLED') return qualificationMap(value, [], []) as ApiQualificationCondition['thresholds'];
+  switch (code) {
+    case 'HOLDER_CONCENTRATION_EXCEEDED':
+      return qualificationMap(value, ['maximumTop1Bps', 'maximumTop5Bps', 'maximumTop10Bps'], ['decimal', 'decimal', 'decimal']) as ApiQualificationCondition['thresholds'];
+    case 'RELATED_WALLET_CLUSTER_EXCEEDED':
+      return qualificationMap(value, ['maximumClusterBps'], ['decimal']) as ApiQualificationCondition['thresholds'];
+    case 'SHARED_FUNDER_CLUSTER':
+      return qualificationMap(value, ['minimumSharedFunders'], ['count']) as ApiQualificationCondition['thresholds'];
+    case 'ROUND_TRIP_LOSS_EXCEEDED':
+      return qualificationMap(value, ['maximumRoundTripLossBps'], ['decimal']) as ApiQualificationCondition['thresholds'];
+    default:
+      return qualificationMap(value, [], []) as ApiQualificationCondition['thresholds'];
+  }
+}
+
+type QualificationMapValue = 'decimal' | 'count' | 'boolean';
+
+function qualificationMap(
+  value: unknown,
+  keys: readonly string[],
+  valueTypes: readonly QualificationMapValue[],
+): Readonly<Record<string, string | number | boolean | null>> {
+  if (keys.length > MAX_QUALIFICATION_CONDITION_MAP_KEYS || keys.length !== valueTypes.length) throw invalid();
+  const fields = exactDataRecord(value, keys, 'Qualification condition map');
+  const result: Record<string, string | number | boolean | null> = {};
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    const valueType = valueTypes[index];
+    if (key === undefined || valueType === undefined) throw invalid();
+    result[key] = qualificationMapValue(fields[key], valueType);
+  }
+  return freeze(result);
+}
+
+function qualificationMapValue(value: unknown, type: QualificationMapValue): string | number | boolean | null {
+  if (value === null) return null;
+  if (type === 'decimal') return qualificationDecimal(value);
+  if (type === 'count') return nonNegativeSafeNumber(value);
+  if (typeof value !== 'boolean') throw invalid();
+  return value;
+}
+
+function qualificationDecimal(value: unknown): string {
+  if (typeof value === 'bigint') return boundedBps(value.toString());
+  if (typeof value === 'string') return boundedBps(value);
+  return boundedBps(canonicalBigIntMarker(value));
+}
+
+function canonicalBigIntMarker(value: unknown): string {
+  if (!isBigIntMarkerShape(value)) throw invalid();
+  const encoded = ownDataProperty(value, BIGINT_JSON_MARKER);
+  if (
+    typeof encoded !== 'string'
+    || !/^(?:0|-?[1-9]\d*)$/u.test(encoded)
+    || encoded.replace(/^-/, '').length > MAX_SERIALIZED_BIGINT_DIGITS
+  ) throw invalid();
+  return encoded;
+}
+
+function isBigIntMarkerShape(value: unknown): value is Record<typeof BIGINT_JSON_MARKER, unknown> {
+  if (typeof value !== 'object' || value === null || isProxy(value) || !isRecord(value)
+    || Object.getOwnPropertySymbols(value).length !== 0) return false;
+  const keys = Object.getOwnPropertyNames(value);
+  const descriptor = Object.getOwnPropertyDescriptor(value, BIGINT_JSON_MARKER);
+  return keys.length === 1 && keys[0] === BIGINT_JSON_MARKER && descriptor?.enumerable === true
+    && 'value' in descriptor;
+}
+
+function qualificationMessage(value: unknown): string {
+  const result = text(value);
+  if (result.length > MAX_QUALIFICATION_CONDITION_MESSAGE_LENGTH) throw invalid();
+  return result;
+}
+
+function exactDenseArray(value: unknown, maximum: number, name: string): readonly unknown[] {
+  if (!Array.isArray(value) || isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype
+    || Object.getOwnPropertySymbols(value).length !== 0 || value.length > maximum) throw invalid();
+  const names = Object.getOwnPropertyNames(value);
+  if (names.length !== value.length + 1 || !Object.hasOwn(value, 'length')) throw invalid();
+  const entries: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw invalid();
+    entries.push(descriptor.value);
+  }
+  void name;
+  return entries;
+}
+
+function exactDataRecord(value: unknown, expected: readonly string[], name: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || isProxy(value) || !isRecord(value)
+    || Object.getOwnPropertySymbols(value).length !== 0) throw invalid();
+  const keys = Object.getOwnPropertyNames(value);
+  if (keys.length !== expected.length || expected.some((key) => !Object.hasOwn(value, key))) throw invalid();
+  const result: Record<string, unknown> = {};
+  for (const key of expected) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw invalid();
+    result[key] = descriptor.value;
+  }
+  void name;
+  return result;
+}
+
+function ownDataProperty(value: Record<string, unknown>, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw invalid();
+  return descriptor.value;
 }
 
 function score(value: unknown): ApiQualification['scores']['total'] {

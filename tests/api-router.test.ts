@@ -82,11 +82,14 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
     confirmationStatus: 'confirmed', payloadVersion: 1, payload: {} as ApiTimelineEntry['payload'],
   };
   const risk: ApiQualification = {
-    ruleSet: { id: 'v1', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60 },
+    ruleSet: {
+      id: 'v1', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60,
+      fingerprint: null,
+    },
     scores: {
       preparation: { score: 0, maximum: 30 }, socialAuthenticity: { score: 0, maximum: 30 },
       onchainHealth: { score: 0, maximum: 40 }, total: { score: 0, maximum: 100 },
-    }, evidence: [], blockers: [], verdict: 'WATCHLISTED', evaluatedAt: summary.detectedAt,
+    }, evidence: [], conditions: [], blockers: [], verdict: 'WATCHLISTED', evaluatedAt: summary.detectedAt,
   };
   const position: ApiPaperPosition = {
     id: 'position-1', mint: MINT, status: 'PAPER_HOLDING', openedAt: summary.detectedAt, closedAt: null,

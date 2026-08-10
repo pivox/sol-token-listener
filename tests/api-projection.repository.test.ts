@@ -880,8 +880,8 @@ void test('uses the latest non-orphaned qualification event and rejects malforme
     ? [{ payload: report }] : []);
   const value = await new PostgresApiProjectionRepository(database).getLaunchRisk('mint-a');
   assert.deepEqual(value, {
-    ruleSet: report.ruleSet, scores: report.scores, evidence: report.evidence,
-    blockers: report.blockers, verdict: report.verdict,
+    ruleSet: { ...report.ruleSet, fingerprint: null }, scores: report.scores, evidence: report.evidence,
+    conditions: [], blockers: report.blockers, verdict: report.verdict,
     evaluatedAt: detectedAt.toISOString(),
   });
   assert.match(database.calls[0]?.text ?? '', /confirmation_status <> 'orphaned'/u);
@@ -892,6 +892,80 @@ void test('uses the latest non-orphaned qualification event and rejects malforme
 
   const malformed = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: '{bad json' }]));
   await assert.rejects(malformed.getLaunchRisk('mint-a'), ApiProjectionDataError);
+});
+
+void test('projects calibrated qualification evidence as canonical V1 condition fields', async () => {
+  const report = {
+    ruleSet: {
+      id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60,
+      fingerprint: 'a'.repeat(64),
+    },
+    scores: {
+      preparation: { score: 1, maximum: 2 }, socialAuthenticity: { score: 3, maximum: 4 },
+      onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 },
+    },
+    evidence: [],
+    conditions: [{
+      code: 'ROUND_TRIP_LOSS_EXCEEDED', mode: 'ENFORCED', status: 'TRIGGERED',
+      observed: { roundTripLossBps: 3001n }, thresholds: { maximumRoundTripLossBps: toJsonValue(3000n) },
+      message: 'Perte aller-retour supérieure au seuil configuré.',
+    }],
+    blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
+  };
+  const databasePayload = JSON.parse(JSON.stringify(toJsonValue(report))) as unknown;
+  const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: databasePayload }]));
+
+  const value = await repository.getLaunchRisk('mint-a');
+
+  assert.deepEqual(value?.ruleSet.fingerprint, 'a'.repeat(64));
+  assert.deepEqual(value?.conditions, [{
+    code: 'ROUND_TRIP_LOSS_EXCEEDED', mode: 'ENFORCED', status: 'TRIGGERED',
+    observed: { roundTripLossBps: '3001' }, thresholds: { maximumRoundTripLossBps: '3000' },
+    message: 'Perte aller-retour supérieure au seuil configuré.',
+  }]);
+  assert.equal(Object.isFrozen(value?.conditions), true);
+  assert.equal(Object.isFrozen(value?.conditions[0]?.observed), true);
+});
+
+void test('rejects incomplete or malformed calibrated qualification evidence fail closed', async () => {
+  const valid = {
+    ruleSet: {
+      id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60,
+      fingerprint: 'a'.repeat(64),
+    },
+    scores: {
+      preparation: { score: 1, maximum: 2 }, socialAuthenticity: { score: 3, maximum: 4 },
+      onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 },
+    }, evidence: [], blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
+    conditions: [{
+      code: 'ROUND_TRIP_LOSS_EXCEEDED', mode: 'ENFORCED', status: 'TRIGGERED',
+      observed: { roundTripLossBps: '3001' }, thresholds: { maximumRoundTripLossBps: '3000' },
+      message: 'Perte aller-retour supérieure au seuil configuré.',
+    }],
+  };
+  const malformed: readonly unknown[] = [
+    { ...valid, ruleSet: { ...valid.ruleSet, fingerprint: undefined } },
+    { ...valid, conditions: undefined },
+    { ...valid, ruleSet: { ...valid.ruleSet, fingerprint: 'A'.repeat(64) } },
+    { ...valid, conditions: [{ ...valid.conditions[0], observed: { roundTripLossBps: '03' } }] },
+    { ...valid, conditions: [{ ...valid.conditions[0], observed: { roundTripLossBps: ['3001'] } }] },
+    { ...valid, conditions: [{ ...valid.conditions[0], observed: { roundTripLossBps: { $solTokenListenerBigInt: '03' } } }] },
+    { ...valid, conditions: [{ ...valid.conditions[0], observed: { roundTripLossBps: { $solTokenListenerBigInt: '-0' } } }] },
+    { ...valid, conditions: [{ ...valid.conditions[0], observed: { roundTripLossBps: { $solTokenListenerBigInt: '10001' } } }] },
+    { ...valid, conditions: [{ ...valid.conditions[0], observed: { roundTripLossBps: { $solTokenListenerBigInt: '3001', extra: true } } }] },
+    { ...valid, conditions: [{ ...valid.conditions[0], mode: 'UNKNOWN' }] },
+    { ...valid, conditions: [{ ...valid.conditions[0], status: 'INVALID' }] },
+    { ...valid, conditions: [{ ...valid.conditions[0], code: 'INVALID' }] },
+    { ...valid, conditions: [valid.conditions[0], valid.conditions[0]] },
+    { ...valid, conditions: [{ ...valid.conditions[0], unexpected: true }] },
+    { ...valid, conditions: [{ ...valid.conditions[0], observed: { roundTripLossBps: 9_007_199_254_740_992 } }] },
+    { ...valid, conditions: Array.from({ length: 15 }, () => valid.conditions[0]) },
+  ];
+
+  for (const payload of malformed) {
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
+  }
 });
 
 void test('lists paper positions by stable keyset without decimal coercion', async () => {
