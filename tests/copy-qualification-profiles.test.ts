@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { lstat, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, parse } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -27,6 +27,7 @@ void test('copies the only canonical profile byte-for-byte and removes stale tar
     assert.deepEqual(copied, [profileName]);
     assert.deepEqual(await readFile(join(targetDirectory, profileName)), expected);
     assert.deepEqual((await readdir(targetDirectory)).sort(), [profileName]);
+    assert.equal((await readdir(root)).filter((name) => name.startsWith('.qualification-profile-quarantine-')).length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -129,6 +130,56 @@ void test('rejects deeply nested JSON before cleaning the target', async () => {
     );
 
     assert.equal(await readFile(sentinel, 'utf8'), 'stale');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test('rejects canonical target aliases that would create a child beneath the source', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sol-listener-target-alias-'));
+  const sourceDirectory = join(root, 'source');
+  const targetAlias = join(root, 'source-alias');
+  try {
+    await mkdir(sourceDirectory);
+    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    await symlink(sourceDirectory, targetAlias);
+
+    await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory: join(targetAlias, 'child', 'target') }));
+
+    await assert.rejects(lstat(join(sourceDirectory, 'child')));
+    assert.deepEqual(await readFile(join(sourceDirectory, profileName)), await readFile(bundledProfile));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test('cleans its private staging directory when an existing target is invalid', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sol-listener-stage-cleanup-'));
+  const sourceDirectory = join(root, 'source');
+  const targetDirectory = join(root, 'target');
+  try {
+    await mkdir(sourceDirectory);
+    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    await writeFile(targetDirectory, 'not a directory');
+
+    await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
+
+    assert.deepEqual((await readdir(root)).filter((name) => name.startsWith('.qualification-profile-stage-')), []);
+    assert.equal(await readFile(targetDirectory, 'utf8'), 'not a directory');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test('rejects filesystem root and repository working-directory ancestors as targets', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sol-listener-broad-target-'));
+  const sourceDirectory = join(root, 'source');
+  try {
+    await mkdir(sourceDirectory);
+    await writeFile(join(sourceDirectory, profileName), await readFile(bundledProfile));
+    for (const targetDirectory of [parse(process.cwd()).root, process.cwd(), dirname(process.cwd())]) {
+      await assert.rejects(copyQualificationProfiles({ sourceDirectory, targetDirectory }));
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

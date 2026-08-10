@@ -1,6 +1,6 @@
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, renameSync, rmSync, rmdirSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseQualificationProfile } from '../src/qualification/qualification-profile.js';
 
@@ -8,7 +8,7 @@ const canonicalProfileName = 'pumpfun-v1-unvalidated.json' as const;
 const MAX_PROFILE_BYTES = 65_536;
 const MAX_PATH_BYTES = 4_096;
 const MAX_PROFILE_JSON_NODES = 4_096;
-const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const repositoryRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
 
 export interface CopyQualificationProfilesOptions {
   readonly sourceDirectory: string;
@@ -74,45 +74,70 @@ function validateProfile(bytes: Buffer): void {
 
 async function replaceTargetDirectory(sourceDirectory: string, targetDirectory: string, sourceBytes: Buffer): Promise<void> {
   const sourceRealPath = realpathSync(sourceDirectory);
-  assertSafeTargetDirectory(sourceRealPath, targetDirectory);
+  const canonicalTarget = canonicalTargetDirectory(sourceRealPath, targetDirectory);
   const sourceIdentity = directoryIdentity(sourceDirectory, 'source');
-  const targetParent = dirname(targetDirectory);
+  const targetParent = dirname(canonicalTarget);
   mkdirSync(targetParent, { recursive: true });
-  assertSafeExistingDirectory(targetParent, 'target');
-  const stagingDirectory = mkdtempSync(join(targetParent, '.qualification-profile-stage-'));
-  let quarantineDirectory: string | null = null;
+  const stableTargetParent = realpathSync(targetParent);
+  const stableTargetDirectory = join(stableTargetParent, basename(canonicalTarget));
+  assertSafeTargetDirectory(sourceRealPath, stableTargetDirectory);
+  const stagingDirectory = mkdtempSync(join(stableTargetParent, '.qualification-profile-stage-'));
+  const stagingIdentity = directoryIdentity(stagingDirectory, 'target');
   let stagingMoved = false;
   try {
     await writeFile(join(stagingDirectory, canonicalProfileName), sourceBytes, { flag: 'wx', mode: 0o600 });
-    const targetIdentity = existingDirectoryIdentity(targetDirectory);
+    const targetIdentity = existingDirectoryIdentity(stableTargetDirectory);
     if (targetIdentity === null) {
-      renameSync(stagingDirectory, targetDirectory);
+      if (!sameIdentity(directoryIdentity(stagingDirectory, 'target'), stagingIdentity)) throw new Error('Staging directory changed before replacement.');
+      renameSync(stagingDirectory, stableTargetDirectory);
       stagingMoved = true;
       return;
     }
-    if (pathsOverlap(sourceRealPath, realpathSync(targetDirectory))) throw new Error('Source and target directories must not overlap.');
 
-    quarantineDirectory = mkdtempSync(join(targetParent, '.qualification-profile-quarantine-'));
+    const quarantineDirectory = mkdtempSync(join(targetParent, '.qualification-profile-quarantine-'));
     rmdirSync(quarantineDirectory);
-    if (!sameIdentity(directoryIdentity(targetDirectory, 'target'), targetIdentity)) throw new Error('Target directory changed before replacement.');
-    renameSync(targetDirectory, quarantineDirectory);
+    if (!sameIdentity(directoryIdentity(stableTargetDirectory, 'target'), targetIdentity)) throw new Error('Target directory changed before replacement.');
+    renameSync(stableTargetDirectory, quarantineDirectory);
     const quarantinedIdentity = directoryIdentity(quarantineDirectory, 'target');
     if (!sameIdentity(quarantinedIdentity, targetIdentity)) {
-      restoreDirectory(quarantineDirectory, targetDirectory);
+      restoreDirectory(quarantineDirectory, stableTargetDirectory);
       throw new Error('Target directory changed during replacement.');
     }
     if (!sameIdentity(directoryIdentity(sourceDirectory, 'source'), sourceIdentity)) {
       restoreSourceDirectory(quarantineDirectory, sourceDirectory, sourceIdentity);
       throw new Error('Source directory changed during replacement.');
     }
-    renameSync(stagingDirectory, targetDirectory);
+    if (!sameIdentity(directoryIdentity(stagingDirectory, 'target'), stagingIdentity)) throw new Error('Staging directory changed before replacement.');
+    renameSync(stagingDirectory, stableTargetDirectory);
     stagingMoved = true;
-    removeQuarantine(quarantineDirectory, quarantinedIdentity, sourceRealPath);
-    quarantineDirectory = null;
   } finally {
-    if (!stagingMoved) removeEmptyDirectory(stagingDirectory);
-    if (quarantineDirectory !== null) {
-      // A failed identity check leaves the quarantine intact rather than deleting a mutable pathname.
+    if (!stagingMoved) removePrivateStagingDirectory(stagingDirectory, stagingIdentity);
+  }
+}
+
+function canonicalTargetDirectory(sourceRealPath: string, targetDirectory: string): string {
+  const requestedParent = dirname(targetDirectory);
+  const targetName = basename(targetDirectory);
+  const existingAncestor = nearestExistingAncestor(requestedParent);
+  const canonicalParent = join(realpathSync(existingAncestor.directory), ...existingAncestor.descendants);
+  const canonicalTarget = join(canonicalParent, targetName);
+  assertSafeTargetDirectory(sourceRealPath, canonicalTarget);
+  return canonicalTarget;
+}
+
+function nearestExistingAncestor(directory: string): { readonly directory: string; readonly descendants: readonly string[] } {
+  const descendants: string[] = [];
+  let current = directory;
+  for (;;) {
+    try {
+      if (!statSync(current).isDirectory()) throw new Error('Unsafe target directory.');
+      return Object.freeze({ directory: current, descendants: Object.freeze(descendants) });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = dirname(current);
+      if (parent === current) throw new Error('Unsafe target directory.');
+      descendants.unshift(basename(current));
+      current = parent;
     }
   }
 }
@@ -165,15 +190,19 @@ function restoreSourceDirectory(quarantineDirectory: string, sourceDirectory: st
   } catch { /* Preserve the unique quarantine if the source cannot be restored safely. */ }
 }
 
-function removeQuarantine(quarantineDirectory: string, expected: DirectoryIdentity, sourceRealPath: string): void {
-  if (!sameIdentity(directoryIdentity(quarantineDirectory, 'target'), expected) || pathsOverlap(sourceRealPath, realpathSync(quarantineDirectory))) {
-    throw new Error('Quarantine directory changed before cleanup.');
-  }
-  rmSync(quarantineDirectory, { recursive: true, force: false });
-}
-
-function removeEmptyDirectory(directory: string): void {
-  try { rmdirSync(directory); } catch { /* An unsuccessful staging cleanup is non-destructive. */ }
+function removePrivateStagingDirectory(directory: string, expected: DirectoryIdentity): void {
+  try {
+    if (!sameIdentity(directoryIdentity(directory, 'target'), expected)) return;
+    const profilePath = join(directory, canonicalProfileName);
+    try {
+      const profile = lstatSync(profilePath);
+      if (profile.isSymbolicLink() || !profile.isFile()) return;
+      unlinkSync(profilePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return;
+    }
+    if (sameIdentity(directoryIdentity(directory, 'target'), expected)) rmdirSync(directory);
+  } catch { /* A failed private staging cleanup is retained rather than broadened. */ }
 }
 
 function pathsOverlap(left: string, right: string): boolean {
