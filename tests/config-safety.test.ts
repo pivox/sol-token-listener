@@ -347,6 +347,16 @@ void test('Pump.fun calibration documentation states the initial profile, semant
     'sellabilité',
     'première position',
     'même slot',
+    'SocialEvidenceCollected',
+    'URL_REACHABLE',
+    'CROSS_LINK_CONFIRMED',
+    'MINT_PUBLISHED',
+    'VERIFICATION_UNKNOWN',
+    'collectionStatus',
+    'linksTruncated',
+    'evidenceTruncated',
+    'sans API payante',
+    'contenu brut',
   ]) assert.ok(documentation.includes(statement), `missing documentation statement: ${statement}`);
 
   assert.match(readme, /par défaut.*config\/qualification\/pumpfun-v1-unvalidated\.json/isu);
@@ -371,6 +381,9 @@ void test('Pump.fun calibration documentation states the initial profile, semant
   assert.match(systemOverview, /ROUND_TRIP_LOSS_EXCEEDED.*ENFORCED.*maximumRoundTripLossBps=3000/isu);
   assert.match(systemOverview, /Liquidité.*future non scorée/iu);
   assert.match(api, /projection legacy.*projection calibrée.*Perte aller-retour supérieure au seuil configuré/isu);
+  assert.match(api, /NOT_AVAILABLE.*AVAILABLE.*COMPLETE.*PARTIAL.*FAILED/isu);
+  assert.match(architecture, /inconnu.*UNKNOWN.*ne.*faux/isu);
+  assert.match(readme, /métadonnées.*liens sociaux.*ne prouvent.*sérieux/isu);
   assert.doesNotMatch(systemOverview, /704 tests réussis/iu);
 });
 

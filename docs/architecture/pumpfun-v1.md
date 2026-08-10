@@ -53,6 +53,7 @@ lecture seule, avec huit routes JSON versionnées sous `/api/v1` et le flux SSE
 ```text
 health RPC -> baseline bornée -> WebSocket -> catch-up de fermeture
            -> worker inbox
+           -> worker social public
            -> réconciliation de finalité -> heartbeat -> API
 ```
 
@@ -60,8 +61,16 @@ Il ne compose ni wallet, ni exécution live, ni envoi de transaction. `observe`
 et `paper` restent les seuls modes.
 Raydium CPMM reste un adaptateur secondaire non composé dans ce bootstrap.
 
-La projection sociale n'est pas encore produite et répond explicitement
-`NOT_AVAILABLE`. I1 introduit une reconstruction passive des participants à
+Le worker social durable prend ses propres leases et enrichit passivement les
+snapshots de métadonnées. Un transport HTTP partagé et borné valide chaque
+résolution DNS et redirection contre les réseaux privés, limite temps, taille,
+redirections et concurrence, puis ne persiste que des URLs normalisées,
+empreintes et preuves structurées. Il n'utilise ni API payante X/Telegram, ni
+token, cookie ou proxy. `NOT_AVAILABLE` signifie qu'aucune collection canonique
+n'existe encore; `AVAILABLE` expose une couverture `COMPLETE`, `PARTIAL` ou
+`FAILED`. Un fait inconnu reste `UNKNOWN` et ne devient jamais faux.
+
+I1 introduit une reconstruction passive des participants à
 partir des seuls trades Pump.fun persistés depuis la création. La route holders
 reste `NOT_AVAILABLE` avant reconstruction, puis expose le profil créateur,
 les positions nettes observées et la concentration top 1/5/10. Elle ne prétend
@@ -377,7 +386,9 @@ profils créateurs, positions observées, preuves de financement, relations,
 clusters et snapshots suivent la date du lancement parent et sont supprimés
 avant leurs événements. Les preuves sociales
 V1 sont limitées aux contenus publics ; aucune API payante X ou Telegram n’est
-obligatoire.
+obligatoire. Collections, observations, liens, preuves et jobs sociaux suivent
+une rétention terminale de quatre heures et sont supprimés enfant d'abord.
+Aucun corps HTTP brut, header, résultat DNS ou adresse IP n'est conservé.
 
 La PR H ajoute aussi un outbox SSE append-only. Chaque révision publique est
 persistée avant diffusion et reçoit un curseur de transport monotone, distinct
@@ -397,6 +408,9 @@ seulement lorsque tous ses composants tournent, `DEGRADED` lors d'une panne,
 d'un nettoyage incomplet ou d'un heartbeat périmé, et `STOPPED` après arrêt ou
 désactivation explicite. Le heartbeat rend visibles backlog, leases, échecs
 épuisés, checkpoints, derniers slots et fraîcheur sans divulguer les endpoints.
+`pipeline.social` et les compteurs `socialJobs` isolent l'état de cet
+enrichissement : une panne sociale dégrade sa propre composante sans renommer
+les pipelines chain Pump.fun/PumpSwap.
 
 ## Invariants de sécurité
 

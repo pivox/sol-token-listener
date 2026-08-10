@@ -2,7 +2,18 @@ import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
-import { migrateDatabase } from '../src/storage/database.js';
+import {
+  migrateDatabase,
+  purgeExpiredFoundationData,
+} from '../src/storage/database.js';
+import { createTokenLaunchDetectedEvent } from '../src/domain/launchpad-events.js';
+import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
+import type { LaunchpadEventBatch } from '../src/ports/launchpad-event-sink.js';
+import type { TokenMetadataSnapshot } from '../src/domain/pumpfun-observation.js';
+import type { PublicHttpResult } from '../src/ports/public-http-client.js';
+import { PublicSocialVerificationProvider } from '../src/social/public-social-verification.provider.js';
+import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
+import { PostgresSocialEvidenceRepository } from '../src/storage/social-evidence.repository.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -65,12 +76,174 @@ void test('enforces four-hour terminal retention and checked social enums', asyn
   });
 });
 
+void test('purges a complete terminal social graph child-first at its own four-hour deadline', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await migrateDatabase({ pool });
+    const terminalAtMs = Date.now() - 4 * 3_600_000;
+    await insertTerminalSocialGraph(
+      pool,
+      'So11111111111111111111111111111111111111112',
+      'signature-social-expired',
+      terminalAtMs,
+    );
+
+    const purged = await purgeExpiredFoundationData(pool);
+
+    assert.deepEqual(await socialCounts(pool), {
+      jobs: 0, collections: 0, links: 0, observations: 0, evidence: 0,
+    });
+    assert.equal(purged.socialJobs, 1);
+    assert.equal(purged.socialCollections, 1);
+    assert.equal(purged.socialLinks, 1);
+    assert.equal(purged.socialObservations, 1);
+    assert.equal(purged.socialEvidence, 3);
+  });
+});
+
+void test('keeps every terminal social row before its own purge deadline', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await migrateDatabase({ pool });
+    const terminalAtMs = Date.now() - 4 * 3_600_000 + 60_000;
+    await insertTerminalSocialGraph(
+      pool,
+      '11111111111111111111111111111111',
+      'signature-social-retained',
+      terminalAtMs,
+    );
+
+    await purgeExpiredFoundationData(pool);
+
+    assert.deepEqual(await socialCounts(pool), {
+      jobs: 1, collections: 1, links: 1, observations: 1, evidence: 3,
+    });
+  });
+});
+
 async function relationExists(pool: InstanceType<typeof pg.Pool>, name: string): Promise<boolean> {
   const result = await pool.query<{ readonly exists: boolean }>(
     'SELECT to_regclass($1) IS NOT NULL AS exists',
     [name],
   );
   return result.rows[0]?.exists === true;
+}
+
+async function insertTerminalSocialGraph(
+  pool: InstanceType<typeof pg.Pool>,
+  mint: string,
+  signature: string,
+  terminalAtMs: number,
+): Promise<void> {
+  const launchRepository = new PostgresLaunchpadEventRepository(pool, 4, () => terminalAtMs);
+  const processed = launchBatch(mint, signature, 'processed', terminalAtMs);
+  await launchRepository.record(processed);
+  const socialRepository = new PostgresSocialEvidenceRepository(pool);
+  const claimed = await socialRepository.claim({ leaseMs: 5_000, nowMs: terminalAtMs });
+  assert.ok(claimed);
+  const metadataSnapshot: TokenMetadataSnapshot = Object.freeze({
+    mint,
+    uri: 'https://metadata.example/token.json',
+    resolution: Object.freeze({
+      status: 'RESOLVED' as const,
+      metadata: Object.freeze({
+        name: 'Project', symbol: 'P', description: 'Public project',
+        imageUrl: null, videoUrl: null, websiteUrl: 'https://project.example/',
+        twitterUrl: null, telegramUrl: null,
+      }),
+    }),
+    fetchedAtMs: terminalAtMs,
+    payloadVersion: 1,
+  });
+  const page: PublicHttpResult = Object.freeze({
+    status: 'SUCCEEDED' as const,
+    finalUrl: 'https://project.example/',
+    httpStatus: 200,
+    contentType: 'text/html',
+    redirectCount: 0,
+    body: new TextEncoder().encode(`<p>${mint}</p>`),
+  });
+  const collected = await new PublicSocialVerificationProvider({
+    get: async () => page,
+  }).collect(Object.freeze({
+    mint,
+    sourceLaunchEventId: claimed.sourceLaunchEventId,
+    metadataSnapshot,
+  }));
+  await socialRepository.complete(claimed, Object.freeze({
+    status: 'RESOLVED' as const,
+    ...collected,
+  }));
+  await launchRepository.record(launchBatch(mint, signature, 'orphaned', terminalAtMs));
+}
+
+function launchBatch(
+  mint: string,
+  signature: string,
+  confirmationStatus: 'processed' | 'orphaned',
+  observedAtMs: number,
+): LaunchpadEventBatch {
+  const transaction = Object.freeze({
+    signature,
+    confirmationStatus,
+    blockTimeMs: observedAtMs,
+    observedAtMs,
+    cursor: Object.freeze({ slot: 10n, transactionIndex: 0 }),
+    raw: null,
+  });
+  const launch = createTokenLaunchDetectedEvent({
+    source: 'pumpfun',
+    program: 'pump',
+    transaction,
+    launch: Object.freeze({
+      mint,
+      creator: 'creator',
+      tokenProgram: 'SPL_TOKEN' as const,
+      quoteAssets: Object.freeze([Object.freeze({
+        mint: 'quote', decimals: 9, tokenProgram: 'SPL_TOKEN' as const,
+      })]),
+      launchpad: 'pumpfun',
+      createdAt: Object.freeze({
+        slot: 10n, transactionIndex: 0, instructionIndex: 1,
+        innerInstructionIndex: null,
+      }),
+      parameters: Object.freeze({ uri: 'https://metadata.example/token.json' }),
+    }),
+  });
+  const common = Object.freeze({
+    source: 'pumpfun', program: 'pump', signature, events: Object.freeze([launch]),
+  });
+  return confirmationStatus === 'orphaned'
+    ? Object.freeze({
+      ...common, confirmationStatus, stateTransitionAction: 'retract' as const,
+      transitions: Object.freeze([] as const),
+    })
+    : Object.freeze({
+      ...common, confirmationStatus, stateTransitionAction: 'apply' as const,
+      transitions: Object.freeze([createInitialDetectedTransition(launch)]),
+    });
+}
+
+async function socialCounts(pool: InstanceType<typeof pg.Pool>): Promise<Readonly<{
+  jobs: number;
+  collections: number;
+  links: number;
+  observations: number;
+  evidence: number;
+}>> {
+  const result = await pool.query(`SELECT
+    (SELECT COUNT(*)::int FROM social_enrichment_jobs) jobs,
+    (SELECT COUNT(*)::int FROM social_evidence_collections) collections,
+    (SELECT COUNT(*)::int FROM social_links) links,
+    (SELECT COUNT(*)::int FROM social_http_observations) observations,
+    (SELECT COUNT(*)::int FROM social_verification_evidence) evidence`);
+  return result.rows[0] as Awaited<ReturnType<typeof socialCounts>>;
 }
 
 async function withSchema(run: (pool: InstanceType<typeof pg.Pool>) => Promise<void>): Promise<void> {
