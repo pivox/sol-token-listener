@@ -161,6 +161,28 @@ Contract failures produce a typed `ApiContractError` containing the route and a
 bounded issue summary. Raw response bodies are never placed in user-visible
 errors or persistent browser storage.
 
+### 6.1 Additive launch-radar summary
+
+The current launch list does not expose qualification or paper progress. Loading
+those projections once per row from the browser would create an unbounded N+1
+request pattern. `GET /api/v1/launches` is therefore extended additively so each
+`ApiLaunchSummary` contains:
+
+- `qualificationSummary`: nullable verdict, three dimension scores, total score,
+  blocker codes, and evaluation time;
+- `candidate`: the existing nullable public candidate summary;
+- `paperStrategy`: the existing nullable public strategy progress summary.
+
+`ApiLaunchDetail` inherits these fields instead of redeclaring candidate and
+paper strategy. The PostgreSQL projection repository loads the latest canonical
+qualification, candidate, and strategy rows for every mint in a page through
+bounded set-based queries inside the existing repeatable-read snapshot. It does
+not execute one query per launch. Orphaned/retracted projections are excluded by
+the same canonical authority rules used by detail endpoints.
+
+This is an additive V1 contract change. Existing clients may ignore the fields;
+the frontend uses them to render radar rows without speculative inference.
+
 ## 7. HTTP client and cache policy
 
 `frontend/src/data/api-client.ts` owns all requests. It:
@@ -440,14 +462,17 @@ Included in issue #41:
 - all four V1 routes and shared navigation;
 - frontend-owned V1 schemas and typed client;
 - resumable fetch-based SSE transport;
+- additive, set-based launch-list summaries for qualification and paper progress;
+- additive CORS preflight support for `Last-Event-ID`;
 - unit, component, contract, and browser smoke tests;
 - CI and operator documentation.
 
 Explicitly excluded:
 
-- backend data-route or database schema changes; the only backend contract change
-  is the additive `Access-Control-Allow-Headers: Last-Event-ID` preflight response
-  required for cross-origin resumable SSE;
+- new backend routes, database tables, or listener behavior; the only backend
+  contract changes are the additive launch-list summaries and
+  `Access-Control-Allow-Headers: Last-Event-ID` preflight response required by
+  the approved independent console;
 - authentication, user accounts, alerts, watchlist persistence, or notification
   delivery;
 - wallet connection, real trading, transaction submission, or live mode;
@@ -479,13 +504,16 @@ The PR is complete when:
     is introduced;
 13. README and frontend documentation explain what the console does and does not
     prove;
-14. the backend listener behavior is unchanged.
+14. the backend listener behavior is unchanged;
+15. launch radar summaries are loaded with bounded set-based queries and never
+    one request or database query per row.
 
 ## 17. Known risks and mitigations
 
 | Risk | Mitigation |
 | --- | --- |
 | Backend additive contracts drift | frontend-owned runtime schemas accept safe additions and reject breaking changes |
+| Radar enrichment creates N+1 load | qualification, candidate, and strategy summaries are fetched set-wise for the bounded launch page |
 | SSE parser loses or duplicates revisions | incremental parser tests, deterministic cursor commit point, HTTP projections remain canonical |
 | Different-origin deployment fails | explicit absolute runtime URL, `Last-Event-ID` preflight allowance, and cross-origin browser smoke fixtures |
 | Dense UI hides uncertainty | dedicated unknown/partial/stale states and blocker-first hierarchy |
