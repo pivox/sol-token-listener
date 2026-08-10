@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import ts from 'typescript';
 import type { ApiProjectionPipelineState } from '../src/storage/api-projection.repository.js';
 import { parseConfig } from '../src/config/env.js';
 import {
@@ -15,7 +16,7 @@ import type { ApiProjectionRepository } from '../src/ports/api-projection-reposi
 import { QualificationProfileError } from '../src/qualification/qualification-profile.js';
 import { createQualificationEngine as buildQualificationEngine } from '../src/qualification/qualification-engine.js';
 
-const FORBIDDEN_IMPORT_PATHS = /(?:execution\/(?:wallet|transaction-confirmer|trade-executor)|dex\/raydium-cpmm\/transaction-builder|(?:signing|submission|keypair))/iu;
+const FORBIDDEN_IMPORT_PATHS = /(?:^|\/)(?:wallet|keypair|signing|submission|transaction-builder|transaction-confirmer|trade-executor)(?:\/|$)/iu;
 
 const config = parseConfig({
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
@@ -24,13 +25,58 @@ const config = parseConfig({
 
 void test('bootstrap imports no signing, submission, or live execution path', async () => {
   const source = await readFile(new URL('../src/app.ts', import.meta.url), 'utf8');
-  const imports = [...source.matchAll(/^\s*import(?:\s+type)?[\s\S]*?\sfrom\s+['"]([^'"]+)['"];?|^\s*import\s+['"]([^'"]+)['"];?/gmu)]
-    .map((match) => match[1] ?? match[2])
-    .filter((specifier): specifier is string => specifier !== undefined);
-  for (const specifier of imports) assert.doesNotMatch(specifier, FORBIDDEN_IMPORT_PATHS);
-  const executableSource = source.replace(/(['"`])(?:\\.|(?!\1)[\s\S])*?\1/gu, '');
-  assert.doesNotMatch(executableSource, /\b(?:sendTransaction|signTransaction)\s*\(/u);
+  assert.deepEqual(forbiddenModuleSpecifiers(source), []);
+  assert.deepEqual(forbiddenExecutableCalls(source), []);
 });
+
+void test('bootstrap boundary guard detects dynamic import and export-from execution dependencies', () => {
+  const source = [
+    'import type { Wallet } from "execution/wallet";',
+    'export {} from "dex/raydium-cpmm/transaction-builder";',
+    'await import("execution/trade-executor");',
+    'type WalletModule = import("execution/wallet").Wallet;',
+    'import Wallet = require("execution/wallet");',
+  ].join('\n');
+  assert.deepEqual(forbiddenModuleSpecifiers(source), [
+    'execution/wallet',
+    'dex/raydium-cpmm/transaction-builder',
+    'execution/trade-executor',
+    'execution/wallet',
+    'execution/wallet',
+  ]);
+  assert.deepEqual(forbiddenExecutableCalls('client.sendTransaction(); signer.signTransaction(); gateway.submit();'), ['sendTransaction', 'signTransaction', 'submit']);
+});
+
+function forbiddenModuleSpecifiers(sourceText: string): readonly string[] {
+  const sourceFile = ts.createSourceFile('boundary.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const specifiers: string[] = [];
+  const append = (node: ts.Expression | undefined): void => {
+    if (node !== undefined && ts.isStringLiteralLike(node)) specifiers.push(node.text);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) append(node.moduleSpecifier);
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) append(node.arguments[0]);
+    if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) append(node.moduleReference.expression);
+    if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) append(node.argument.literal);
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return specifiers.filter((specifier) => FORBIDDEN_IMPORT_PATHS.test(specifier));
+}
+
+function forbiddenExecutableCalls(sourceText: string): readonly string[] {
+  const sourceFile = ts.createSourceFile('boundary.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const calls: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const name = ts.isIdentifier(node.expression) ? node.expression.text : ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : null;
+      if (name !== null && ['sendTransaction', 'signTransaction', 'submit'].includes(name)) calls.push(name);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return calls;
+}
 
 void test('migrates, starts listener before API, then closes listener before API and database', async () => {
   const calls: string[] = [];

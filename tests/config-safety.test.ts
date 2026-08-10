@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import ts from 'typescript';
 import { parseConfig } from '../src/config/env.js';
 
 const base = {
@@ -266,6 +267,10 @@ void test('Pump.fun calibration documentation states the initial profile, semant
   assert.match(readme, /redact|ne journalise ni le\s+chemin/iu);
   assert.match(architecture, /Un blocker actif.*compensé/isu);
   assert.match(architecture, /null.*REPORT_ONLY.*dry-run/isu);
+  for (const document of [readme, architecture, systemOverview]) {
+    assert.doesNotMatch(document, /(?:SHARED_FUNDER_CLUSTER|RELATED_WALLET_CLUSTER_EXCEEDED)[\s\S]{0,180}désactivés/iu);
+    assert.match(document, /REPORT_ONLY[\s\S]{0,220}(?:blocker|verdict|paper)/iu);
+  }
   assert.match(architecture, /égalité passe.*dépassement strict/isu);
   assert.match(api, /legacy.*fingerprint: null.*conditions: \[\]/isu);
   assert.match(api, /fingerprint.*lowercase/iu);
@@ -282,14 +287,39 @@ void test('qualification loader, evaluator, profile, and public API boundaries e
     '../src/storage/api-projection.repository.ts',
   ] as const;
   const sources = await Promise.all(modulePaths.map((path) => readFile(new URL(path, import.meta.url), 'utf8')));
-  const importSpecifiers = sources.flatMap((source) => [...source.matchAll(/^\s*import(?:\s+type)?[\s\S]*?\sfrom\s+['"]([^'"]+)['"];?|^\s*import\s+['"]([^'"]+)['"];?/gmu)])
-    .map((match) => match[1] ?? match[2])
-    .filter((specifier): specifier is string => specifier !== undefined);
-  for (const specifier of importSpecifiers) {
-    assert.doesNotMatch(specifier, /(?:wallet|keypair|sign|transaction.builder|trade.executor|submission)/iu);
-  }
+  for (const source of sources) assert.deepEqual(forbiddenModuleSpecifiers(source), []);
   for (const source of sources) {
-    const executableSource = source.replace(/(['"`])(?:\\.|(?!\1)[\s\S])*?\1/gu, '');
-    assert.doesNotMatch(executableSource, /\b(?:sendTransaction|signTransaction)\s*\(/u);
+    assert.deepEqual(forbiddenExecutableCalls(source), []);
   }
 });
+
+function forbiddenModuleSpecifiers(sourceText: string): readonly string[] {
+  const sourceFile = ts.createSourceFile('boundary.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const specifiers: string[] = [];
+  const append = (node: ts.Expression | undefined): void => {
+    if (node !== undefined && ts.isStringLiteralLike(node)) specifiers.push(node.text);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) append(node.moduleSpecifier);
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) append(node.arguments[0]);
+    if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) append(node.moduleReference.expression);
+    if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) append(node.argument.literal);
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return specifiers.filter((specifier) => /(?:^|\/)(?:wallet|keypair|signing|submission|transaction-builder|transaction-confirmer|trade-executor)(?:\/|$)/iu.test(specifier));
+}
+
+function forbiddenExecutableCalls(sourceText: string): readonly string[] {
+  const sourceFile = ts.createSourceFile('boundary.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const calls: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const name = ts.isIdentifier(node.expression) ? node.expression.text : ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : null;
+      if (name !== null && ['sendTransaction', 'signTransaction', 'submit'].includes(name)) calls.push(name);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return calls;
+}

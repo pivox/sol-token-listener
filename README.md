@@ -209,7 +209,9 @@ reconstructions I1/I2 et PumpSwap. Une transaction échouée est rejouée depuis
 le début de ce pipeline; les écritures déterministes rendent ce replay complet
 idempotent, sans saut d'étape. Les reason codes
 `SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` existent comme
-contrats stables, mais restent désactivés jusqu'au calibrage dry run.
+contrats stables et sont `REPORT_ONLY` pendant le calibrage dry run : leurs
+preuves et déclenchements sont rapportés, mais ils ne peuvent ajouter aucun
+blocker ni modifier le verdict ou la décision paper.
 
 `API_HOLDER_POSITION_LIMIT` et `API_HOLDER_SNAPSHOT_LIMIT` valent 100. Les
 limites clusters/membres valent respectivement 50/50, avec un budget total de

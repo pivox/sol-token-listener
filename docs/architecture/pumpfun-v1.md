@@ -155,9 +155,10 @@ positions observées.
 L'API limite par défaut la réponse à 50 clusters, 50 membres par cluster,
 500 membres au total, 8 quote assets par cluster et 64 quote assets au total,
 avec des indicateurs de troncature explicites. Les reason
-codes `SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` restent
-désactivés jusqu'au calibrage dry run : I2 ne change aucun verdict, score ou
-paper trade.
+codes `SHARED_FUNDER_CLUSTER` et `RELATED_WALLET_CLUSTER_EXCEEDED` sont
+`REPORT_ONLY` pendant le calibrage dry run : I2 rapporte les preuves et les
+déclenchements, sans ajouter de blocker ni changer le verdict, le score ou la
+décision paper.
 
 ## Contrats Solana
 
