@@ -202,6 +202,7 @@ void test('reads an exact launch and returns null only when it is absent', async
     tokenProgram: 'token-program', launchpad: 'pumpfun',
     initialTokenAmount: null, initialQuoteAmount: null,
     reserveBase: '100', reserveQuote: '200', feeBps: null,
+    candidate: null, paperStrategy: null,
     social: { status: 'NOT_AVAILABLE', links: [], evidence: [] },
     holders: {
       status: 'NOT_AVAILABLE', snapshots: [], positions: [], clusters: [],
@@ -233,6 +234,78 @@ void test('uses the real quote vault for PumpSwap liquidity and reserves', async
   assert.match(
     database.calls.find((call) => call.text.includes('FROM migrations AS migration'))?.text ?? '',
     /reserve\.quote_vault_amount_raw/u,
+  );
+});
+
+void test('exposes current candidate and bounded paper strategy progress on launch detail', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM trading_candidates')) return [{
+      candidate_id: `candidate_${'a'.repeat(64)}`, state: 'ELIGIBLE',
+      strategy_id: 'validated-external-buys', strategy_version: 1,
+      report_id: `qreport_${'b'.repeat(64)}`, quote_mint: 'quote', quote_decimals: 6,
+      reason_codes: ['QUALIFIED_ENTRY'], eligible_until: detectedAt, created_at: openedAt,
+    }];
+    if (call.text.includes('FROM paper_strategy_sessions')) return [{
+      session_id: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
+      reason_code: 'EXTERNAL_BUY_OBSERVED', strategy_id: 'validated-external-buys',
+      strategy_version: 1, position_id: 'position-a', quote_mint: 'quote',
+      external_buy_target: 10, external_buy_count: 3, minimum_confirmation: 'confirmed',
+      updated_at: detectedAt,
+      payload: toJsonValue({ lastError: { code: 'QUOTE_UNAVAILABLE', message: 'hidden', retryable: true } }),
+    }];
+    return projectionRows(call);
+  });
+
+  const detail = await new PostgresApiProjectionRepository(database).getLaunch('mint-a');
+
+  assert.deepEqual(detail?.candidate, {
+    id: `candidate_${'a'.repeat(64)}`, state: 'ELIGIBLE',
+    strategyId: 'validated-external-buys', strategyVersion: 1,
+    qualificationReportId: `qreport_${'b'.repeat(64)}`, quoteMint: 'quote',
+    quoteDecimals: 6, reasonCodes: ['QUALIFIED_ENTRY'],
+    eligibleUntil: detectedAt.toISOString(), createdAt: openedAt.toISOString(),
+  });
+  assert.deepEqual(detail?.paperStrategy, {
+    id: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
+    reasonCode: 'EXTERNAL_BUY_OBSERVED', strategyId: 'validated-external-buys',
+    strategyVersion: 1, positionId: 'position-a', quoteMint: 'quote',
+    externalBuyTarget: 10, externalBuyCount: 3, minimumConfirmation: 'confirmed',
+    updatedAt: detectedAt.toISOString(), lastErrorCode: 'QUOTE_UNAVAILABLE',
+    lastErrorRetryable: true,
+  });
+  assert.doesNotMatch(JSON.stringify(detail), /hidden/u);
+});
+
+void test('fails closed on incoherent candidate windows and paper progress', async () => {
+  const candidate = {
+    candidate_id: `candidate_${'a'.repeat(64)}`, state: 'ELIGIBLE',
+    strategy_id: 'validated-external-buys', strategy_version: 1,
+    report_id: `qreport_${'b'.repeat(64)}`, quote_mint: 'quote', quote_decimals: 6,
+    reason_codes: ['QUALIFIED_ENTRY'], eligible_until: detectedAt, created_at: openedAt,
+  };
+  const session = {
+    session_id: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
+    reason_code: 'EXTERNAL_BUY_OBSERVED', strategy_id: 'validated-external-buys',
+    strategy_version: 1, position_id: 'position-a', quote_mint: 'quote',
+    external_buy_target: 10, external_buy_count: 3, minimum_confirmation: 'confirmed',
+    updated_at: detectedAt, payload: toJsonValue({ lastError: null }),
+  };
+  const repository = (candidateRow: Record<string, unknown>, sessionRow: Record<string, unknown>) =>
+    new PostgresApiProjectionRepository(new FakeQueryable((call) => {
+      if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+      if (call.text.includes('FROM trading_candidates')) return [candidateRow];
+      if (call.text.includes('FROM paper_strategy_sessions')) return [sessionRow];
+      return projectionRows(call);
+    }));
+
+  await assert.rejects(
+    repository({ ...candidate, eligible_until: null }, session).getLaunch('mint-a'),
+    ApiProjectionDataError,
+  );
+  await assert.rejects(
+    repository(candidate, { ...session, external_buy_count: 11 }).getLaunch('mint-a'),
+    ApiProjectionDataError,
   );
 });
 
@@ -1248,12 +1321,18 @@ void test('lists paper positions by stable keyset without decimal coercion', asy
   const database = new FakeQueryable(() => [{
     position_id: 'position-a', mint: 'mint-a', status: 'PAPER_HOLDING', opened_at: openedAt,
     closed_at: null, quote_mint: 'quote', remaining_base_raw: '100000000000000000001',
+    strategy_id: 'strategy', strategy_version: 1, strategy_session_id: null,
+    qualification_report_id: null, candidate_id: null, external_buy_count: null,
+    external_buy_target: null, reason_codes: null, entry_venue: 'UNKNOWN',
     quote_cost_raw: '200000000000000000002', quote_proceeds_raw: null,
     net_pnl_quote_raw: null, round_trip_loss_bps: '17', entry_fees_raw: '7',
     exit_trade_id: null, exit_fees_raw: null,
   }, {
     position_id: 'position-b', mint: 'mint-b', status: 'PAPER_CLOSED', opened_at: openedAt,
     closed_at: detectedAt, quote_mint: 'quote', remaining_base_raw: '0', quote_cost_raw: '2',
+    strategy_id: 'strategy', strategy_version: 1, strategy_session_id: null,
+    qualification_report_id: null, candidate_id: null, external_buy_count: null,
+    external_buy_target: null, reason_codes: null, entry_venue: 'UNKNOWN',
     quote_proceeds_raw: '3', net_pnl_quote_raw: '1', round_trip_loss_bps: '4',
     entry_fees_raw: '8', exit_trade_id: 'exit-b', exit_fees_raw: '13',
   }]);
@@ -1265,6 +1344,9 @@ void test('lists paper positions by stable keyset without decimal coercion', asy
       closedAt: null, quoteMint: 'quote', quantity: '100000000000000000001',
       entryQuoteAmount: '200000000000000000002', exitQuoteAmount: null,
       realizedPnlQuote: null, estimatedFeesQuote: '7',
+      strategyId: 'strategy', strategyVersion: 1, strategySessionId: null,
+      qualificationReportId: null, candidateId: null, externalBuyCount: null,
+      externalBuyTarget: null, entryVenue: 'UNKNOWN', reasonCodes: [],
     }], nextCursor: encodePaperPositionCursor({ openedAtMs: openedAt.getTime(), id: 'position-a' }),
   });
   assert.match(database.calls[0]?.text ?? '', /position\.opened_at DESC, position\.position_id ASC/u);
@@ -1277,6 +1359,9 @@ void test('adds exact entry and exit fees for a closed paper position', async ()
   const database = new FakeQueryable(() => [{
     position_id: 'position-b', mint: 'mint-b', status: 'PAPER_CLOSED', opened_at: openedAt,
     closed_at: detectedAt, quote_mint: 'quote', remaining_base_raw: '0', quote_cost_raw: '2',
+    strategy_id: 'strategy', strategy_version: 1, strategy_session_id: null,
+    qualification_report_id: null, candidate_id: null, external_buy_count: null,
+    external_buy_target: null, reason_codes: null, entry_venue: 'UNKNOWN',
     quote_proceeds_raw: '3', net_pnl_quote_raw: '1',
     entry_fees_raw: '900719925474099312345', exit_trade_id: 'exit-b', exit_fees_raw: '11',
   }]);
@@ -1288,10 +1373,45 @@ void test('adds exact entry and exit fees for a closed paper position', async ()
   assert.match(database.calls[0]?.text ?? '', /LEFT JOIN paper_trades AS exit_trade/u);
 });
 
+void test('exposes paper position lineage, progress, venue and stable reasons', async () => {
+  const database = new FakeQueryable(() => [{
+    position_id: 'position-progress', mint: 'mint-a', status: 'PAPER_HOLDING',
+    opened_at: openedAt, closed_at: null, quote_mint: 'quote', remaining_base_raw: '50',
+    quote_cost_raw: '100', quote_proceeds_raw: null, net_pnl_quote_raw: null,
+    entry_fees_raw: '2', exit_trade_id: null, exit_fees_raw: null,
+    strategy_id: 'validated-external-buys', strategy_version: 1,
+    strategy_session_id: `paper_session_${'a'.repeat(64)}`,
+    qualification_report_id: `qreport_${'b'.repeat(64)}`,
+    candidate_id: `candidate_${'c'.repeat(64)}`,
+    external_buy_count: 7, external_buy_target: 10,
+    reason_codes: ['QUALIFIED_ENTRY', 'EXTERNAL_BUY_OBSERVED'],
+    entry_venue: 'PUMPSWAP',
+  }]);
+
+  const page = await new PostgresApiProjectionRepository(database)
+    .listPaperPositions({ limit: 1, after: null });
+
+  assert.deepEqual(page.items[0], {
+    id: 'position-progress', mint: 'mint-a', status: 'PAPER_HOLDING',
+    openedAt: openedAt.toISOString(), closedAt: null, quoteMint: 'quote', quantity: '50',
+    entryQuoteAmount: '100', exitQuoteAmount: null, realizedPnlQuote: null,
+    estimatedFeesQuote: '2', strategyId: 'validated-external-buys', strategyVersion: 1,
+    strategySessionId: `paper_session_${'a'.repeat(64)}`,
+    qualificationReportId: `qreport_${'b'.repeat(64)}`,
+    candidateId: `candidate_${'c'.repeat(64)}`,
+    externalBuyCount: 7, externalBuyTarget: 10, entryVenue: 'PUMPSWAP',
+    reasonCodes: ['QUALIFIED_ENTRY', 'EXTERNAL_BUY_OBSERVED'],
+  });
+  assert.match(database.calls[0]?.text ?? '', /FROM market_pools AS entry_pool/u);
+});
+
 void test('rejects a closed paper position without a persisted exit trade', async () => {
   const database = new FakeQueryable(() => [{
     position_id: 'position-b', mint: 'mint-b', status: 'PAPER_CLOSED', opened_at: openedAt,
     closed_at: detectedAt, quote_mint: 'quote', remaining_base_raw: '0', quote_cost_raw: '2',
+    strategy_id: 'strategy', strategy_version: 1, strategy_session_id: null,
+    qualification_report_id: null, candidate_id: null, external_buy_count: null,
+    external_buy_target: null, reason_codes: null, entry_venue: 'UNKNOWN',
     quote_proceeds_raw: '3', net_pnl_quote_raw: '1',
     entry_fees_raw: '5', exit_trade_id: null, exit_fees_raw: null,
   }]);
@@ -1306,10 +1426,16 @@ void test('uses a strict paper keyset and encodes the final emitted position', a
   const database = new FakeQueryable(() => [{
     position_id: 'position-c', mint: 'mint-c', status: 'PAPER_HOLDING', opened_at: openedAt,
     closed_at: null, quote_mint: 'quote', remaining_base_raw: '1', quote_cost_raw: '2',
+    strategy_id: 'strategy', strategy_version: 1, strategy_session_id: null,
+    qualification_report_id: null, candidate_id: null, external_buy_count: null,
+    external_buy_target: null, reason_codes: null, entry_venue: 'UNKNOWN',
     quote_proceeds_raw: null, net_pnl_quote_raw: null, entry_fees_raw: '3',
   }, {
     position_id: 'position-d', mint: 'mint-d', status: 'PAPER_HOLDING', opened_at: openedAt,
     closed_at: null, quote_mint: 'quote', remaining_base_raw: '1', quote_cost_raw: '2',
+    strategy_id: 'strategy', strategy_version: 1, strategy_session_id: null,
+    qualification_report_id: null, candidate_id: null, external_buy_count: null,
+    external_buy_target: null, reason_codes: null, entry_venue: 'UNKNOWN',
     quote_proceeds_raw: null, net_pnl_quote_raw: null, entry_fees_raw: '3',
   }]);
   const page = await new PostgresApiProjectionRepository(database).listPaperPositions({
@@ -1334,6 +1460,10 @@ void test('returns health without exposing database URLs or secrets', async () =
     if (call.text.includes('FROM social_enrichment_jobs')) return [{
       pending_count: 2, leased_count: 1, retryable_failed_count: 3, exhausted_count: 4,
     }];
+    if (call.text.includes('FROM paper_decision_jobs')) return [{
+      pending_count: 5, leased_count: 2, retryable_failed_count: 1, exhausted_count: 3,
+      last_success_at: openedAt, last_error_code: 'QUOTE_UNAVAILABLE',
+    }];
     return [];
   });
   const repository = new PostgresApiProjectionRepository(database, () => openedAt, {
@@ -1346,6 +1476,10 @@ void test('returns health without exposing database URLs or secrets', async () =
     postgresql: { status: 'AVAILABLE' }, http: { status: 'UNAVAILABLE' },
     pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING' },
     socialJobs: { pendingCount: 2, leasedCount: 1, retryableFailedCount: 3, exhaustedCount: 4 },
+    paperDecisionJobs: {
+      pendingCount: 5, leasedCount: 2, retryableFailedCount: 1, exhaustedCount: 3,
+      lastSuccessAt: openedAt.toISOString(), lastErrorCode: 'QUOTE_UNAVAILABLE',
+    },
     checkpoints: { launchpad: '55', market: '54' },
     heartbeat: {
       runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
@@ -1388,6 +1522,40 @@ void test('degrades only social health when its bounded count projection fails',
     pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
   });
   assert.doesNotMatch(JSON.stringify(health), /metadata|private|failure|:\/\//u);
+});
+
+void test('degrades only paper health when its bounded queue projection fails', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
+    if (call.text.includes('listener_heartbeats')) return [{
+      updated_at: openedAt, started_at: openedAt, last_http_slot: '60',
+      last_websocket_slot: '60', last_finalized_slot: '59', last_signature: null,
+      pending_transactions: 0, active_sessions: 0, leased_transactions: 0,
+      exhausted_transactions: 0, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
+      scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
+    }];
+    if (call.text.includes('FROM social_enrichment_jobs')) return [{
+      pending_count: 0, leased_count: 0, retryable_failed_count: 0, exhausted_count: 0,
+    }];
+    if (call.text.includes('FROM paper_decision_jobs')) {
+      throw new Error('postgres://private/paper-count-failure');
+    }
+    return [];
+  });
+  const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    paperDecision: 'RUNNING', social: 'RUNNING',
+  }).getHealth();
+
+  assert.equal(health.status, 'DEGRADED');
+  assert.deepEqual(health.pipeline, {
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'DEGRADED', social: 'RUNNING',
+  });
+  assert.deepEqual(health.paperDecisionJobs, {
+    pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
+    lastSuccessAt: null, lastErrorCode: null,
+  });
+  assert.doesNotMatch(JSON.stringify(health), /postgres:\/\/|private|failure/u);
 });
 
 void test('returns nullable unknown heartbeat fields when no heartbeat exists', async () => {

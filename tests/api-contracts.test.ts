@@ -293,6 +293,10 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
     postgresql: { status: 'AVAILABLE' }, http: { status: 'AVAILABLE' },
     pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING' },
     socialJobs: { pendingCount: 1, leasedCount: 1, retryableFailedCount: 0, exhaustedCount: 0 },
+    paperDecisionJobs: {
+      pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
+      lastSuccessAt: null, lastErrorCode: null,
+    },
     checkpoints: { launchpad: '1', market: null },
     heartbeat: {
       runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',

@@ -18,6 +18,7 @@ import {
   type ApiPage,
   type ApiParticipantQuoteFlow,
   type ApiPaperPosition,
+  type ApiPaperStrategyProgress,
   type ApiQualification,
   type ApiQualificationCondition,
   type ApiCreatorProfile,
@@ -27,6 +28,7 @@ import {
   type ApiSocialEvidence,
   type ApiSocialLink,
   type ApiTimelineEntry,
+  type ApiTradingCandidate,
 } from '../api/contracts.js';
 import { isProxy } from 'node:util/types';
 import {
@@ -52,6 +54,11 @@ import {
   type ListenerRuntimeState,
 } from '../domain/transaction-ingestion.js';
 import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
+import {
+  PAPER_DECISION_REASON_CODES,
+  PAPER_STRATEGY_SESSION_STATES,
+} from '../domain/paper-strategy.js';
+import { TRADING_CANDIDATE_STATES } from '../domain/trading-candidate.js';
 import {
   QUALIFICATION_CONDITION_MODES,
   QUALIFICATION_CONDITION_STATUSES,
@@ -124,6 +131,11 @@ interface LaunchProjections {
   readonly markets: ReadonlyMap<string, Record<string, unknown>>;
 }
 
+interface PaperDecisionProjection {
+  readonly candidate: ApiTradingCandidate | null;
+  readonly paperStrategy: ApiPaperStrategyProgress | null;
+}
+
 const NOT_AVAILABLE_SOCIAL: ApiSocial = Object.freeze({
   status: 'NOT_AVAILABLE', links: Object.freeze([] as []), evidence: Object.freeze([] as []),
 });
@@ -133,6 +145,10 @@ const NOT_AVAILABLE_HOLDERS: ApiHolders = Object.freeze({
   positions: Object.freeze([] as []),
   clusters: Object.freeze([] as []),
   clusterAnalysisStatus: 'NOT_AVAILABLE',
+});
+const NOT_AVAILABLE_PAPER: PaperDecisionProjection = Object.freeze({
+  candidate: null,
+  paperStrategy: null,
 });
 
 export class PostgresApiProjectionRepository implements ApiProjectionRepository {
@@ -203,7 +219,8 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     const projections = await this.loadLaunchProjections([text(mint)]);
     const holders = await this.loadHolders(text(mint));
     const social = await this.loadSocial(text(mint));
-    return assembleLaunchDetail(launch, projections, holders, social);
+    const paper = await this.loadPaperDecision(text(mint));
+    return assembleLaunchDetail(launch, projections, holders, social, paper);
   }
 
   public async listLaunchEvents(mint: string, request: PageRequest<TimelinePagePosition>): Promise<ApiPage<ApiTimelineEntry>> {
@@ -310,11 +327,32 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       `SELECT position.position_id, position.mint, position.status, position.opened_at,
           position.closed_at, position.quote_mint, position.remaining_base_raw,
           position.quote_cost_raw, position.quote_proceeds_raw, position.net_pnl_quote_raw,
-          position.exit_trade_id,
+          position.exit_trade_id, position.strategy_id, position.strategy_version,
+          position.strategy_session_id, position.qualification_report_id,
+          position.candidate_id, session.external_buy_count, session.external_buy_target,
+          candidate.reason_codes,
+          CASE WHEN trigger.event_id IS NULL THEN 'UNKNOWN'
+            WHEN EXISTS (
+              SELECT 1 FROM market_pools AS entry_pool
+              WHERE entry_pool.base_mint = position.mint
+                AND entry_pool.pool_state = 'active'
+                AND entry_pool.confirmation_status <> 'orphaned'
+                AND (entry_pool.slot, entry_pool.transaction_index,
+                  entry_pool.instruction_index,
+                  COALESCE(entry_pool.inner_instruction_index, -1))
+                  <= (trigger.slot, trigger.transaction_index,
+                    trigger.instruction_index,
+                    COALESCE(trigger.inner_instruction_index, -1))
+            ) THEN 'PUMPSWAP' ELSE 'PUMP_FUN_BONDING_CURVE' END AS entry_venue,
           entry_trade.fees_raw AS entry_fees_raw, exit_trade.fees_raw AS exit_fees_raw
        FROM paper_positions AS position
        JOIN paper_trades AS entry_trade ON entry_trade.trade_id = position.entry_trade_id
        LEFT JOIN paper_trades AS exit_trade ON exit_trade.trade_id = position.exit_trade_id
+       LEFT JOIN paper_strategy_sessions AS session
+         ON session.session_id = position.strategy_session_id
+       LEFT JOIN trading_candidates AS candidate
+         ON candidate.candidate_id = position.candidate_id
+       LEFT JOIN domain_events AS trigger ON trigger.event_id = position.trigger_event_id
        ${after}
        ORDER BY position.opened_at DESC, position.position_id ASC
        LIMIT ${limitParameter}`,
@@ -328,6 +366,32 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       nextCursor: next === undefined ? null : encodePaperPositionCursor({
         openedAtMs: Date.parse(next.openedAt), id: next.id,
       }),
+    });
+  }
+
+  private async loadPaperDecision(mint: string): Promise<PaperDecisionProjection> {
+    const candidates = await this.database.query(
+      `SELECT candidate_id,state,strategy_id,strategy_version,report_id,quote_mint,
+          quote_decimals,reason_codes,eligible_until,created_at
+       FROM trading_candidates
+       WHERE mint=$1 AND superseded_at IS NULL AND purge_after>clock_timestamp()
+       ORDER BY created_at DESC,candidate_id DESC LIMIT 1`,
+      [mint],
+    );
+    const sessions = await this.database.query(
+      `SELECT session_id,state,reason_code,strategy_id,strategy_version,position_id,
+          quote_mint,external_buy_target,external_buy_count,minimum_confirmation,
+          updated_at,payload
+       FROM paper_strategy_sessions
+       WHERE mint=$1 AND (purge_after IS NULL OR purge_after>clock_timestamp())
+       ORDER BY updated_at DESC,session_id DESC LIMIT 1`,
+      [mint],
+    );
+    return freeze({
+      candidate: candidates.rows[0] === undefined
+        ? null : toTradingCandidate(candidates.rows[0]),
+      paperStrategy: sessions.rows[0] === undefined
+        ? null : toPaperStrategy(sessions.rows[0]),
     });
   }
 
@@ -350,7 +414,9 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
          FROM listener_heartbeats ORDER BY updated_at DESC LIMIT 1`,
       );
       let socialJobs = emptySocialJobs();
+      let paperDecisionJobs = emptyPaperDecisionJobs();
       let socialCountsAvailable = true;
+      let paperCountsAvailable = true;
       try {
         const socialCounts = await this.database.query(
           `SELECT
@@ -365,6 +431,25 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       } catch {
         socialCountsAvailable = false;
         pipeline = freeze({ ...pipeline, social: 'DEGRADED' });
+      }
+      try {
+        const paperCounts = await this.database.query(
+          `SELECT
+            COUNT(*) FILTER (WHERE status = 'PENDING')::int AS pending_count,
+            COUNT(*) FILTER (WHERE status = 'PROCESSING')::int AS leased_count,
+            COUNT(*) FILTER (WHERE status = 'RETRYABLE_FAILED')::int AS retryable_failed_count,
+            COUNT(*) FILTER (WHERE retry_exhausted_at IS NOT NULL)::int AS exhausted_count,
+            MAX(terminal_at) FILTER (WHERE status = 'COMPLETED') AS last_success_at,
+            (SELECT latest.error_code FROM paper_decision_jobs AS latest
+              WHERE latest.error_code IS NOT NULL
+              ORDER BY latest.updated_at DESC,latest.job_id DESC LIMIT 1) AS last_error_code
+           FROM paper_decision_jobs`,
+        );
+        const paperRow = paperCounts.rows[0];
+        if (paperRow !== undefined) paperDecisionJobs = paperDecisionJobsFromRow(paperRow);
+      } catch {
+        paperCountsAvailable = false;
+        pipeline = freeze({ ...pipeline, paperDecision: 'DEGRADED' });
       }
       const checkpoint = new Map(checkpoints.rows.map((item) => [text(item.checkpoint_key), decimal(item.slot)]));
       const row = heartbeats.rows[0];
@@ -384,11 +469,12 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       const degraded = database.rows.length === 0 || stale || runtimeDegraded || !pipeline.httpAvailable
       || pipeline.pumpfun === 'DEGRADED' || pipeline.pumpfun === 'STOPPED'
       || pipeline.pumpswap === 'DEGRADED' || pipeline.pumpswap === 'STOPPED'
+      || pipeline.paperDecision === 'DEGRADED' || pipeline.paperDecision === 'STOPPED'
       || pipeline.social === 'DEGRADED' || pipeline.social === 'STOPPED'
-      || !socialCountsAvailable;
+      || !socialCountsAvailable || !paperCountsAvailable;
       return healthResult(
         observedAt, database.rows.length > 0, degraded, checkpoint, heartbeat,
-        lagSlots, pipeline, socialJobs,
+        lagSlots, pipeline, socialJobs, paperDecisionJobs,
       );
     } catch {
       return healthResult(
@@ -400,6 +486,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         null,
         pipeline,
         emptySocialJobs(),
+        emptyPaperDecisionJobs(),
       );
     }
   }
@@ -872,6 +959,7 @@ function assembleLaunchDetail(
   projections: LaunchProjections,
   holders: ApiHolders = NOT_AVAILABLE_HOLDERS,
   social: ApiSocial = NOT_AVAILABLE_SOCIAL,
+  paper: PaperDecisionProjection = NOT_AVAILABLE_PAPER,
 ): ApiLaunchDetail {
   const summary = assembleLaunchSummary(row, projections);
   const curve = projections.curves.get(summary.mint);
@@ -882,6 +970,61 @@ function assembleLaunchDetail(
     reserveBase: nullableDecimal(market?.base_reserves_raw) ?? nullableDecimal(curve?.real_base_reserves_raw),
     reserveQuote: nullableDecimal(market?.quote_vault_amount_raw) ?? nullableDecimal(curve?.real_quote_reserves_raw),
     feeBps: null, social, holders,
+    candidate: paper.candidate,
+    paperStrategy: paper.paperStrategy,
+  });
+}
+
+function toTradingCandidate(row: Record<string, unknown>): ApiTradingCandidate {
+  const state = validated(row.state, TRADING_CANDIDATE_STATES) as ApiTradingCandidate['state'];
+  const eligibleUntil = nullableTimestamp(row.eligible_until);
+  if ((state === 'ELIGIBLE') !== (eligibleUntil !== null)) throw invalid();
+  return freeze({
+    id: text(row.candidate_id),
+    state,
+    strategyId: text(row.strategy_id),
+    strategyVersion: positiveSafeNumber(row.strategy_version),
+    qualificationReportId: text(row.report_id),
+    quoteMint: text(row.quote_mint),
+    quoteDecimals: tokenDecimals(row.quote_decimals),
+    reasonCodes: paperReasonCodes(row.reason_codes),
+    eligibleUntil,
+    createdAt: timestamp(row.created_at).toISOString(),
+  });
+}
+
+function toPaperStrategy(row: Record<string, unknown>): ApiPaperStrategyProgress {
+  const payload = restoredRecord(row.payload);
+  const lastErrorValue = payload.lastError;
+  const lastError = lastErrorValue === null ? null : record(lastErrorValue);
+  const lastErrorCode = lastError === null ? null : text(lastError.code);
+  if (lastErrorCode !== null && !/^[A-Z][A-Z0-9_]{0,127}$/u.test(lastErrorCode)) throw invalid();
+  const externalBuyTarget = positiveSafeNumber(row.external_buy_target);
+  const externalBuyCount = nonNegativeSafeNumber(row.external_buy_count);
+  if (externalBuyCount > externalBuyTarget) throw invalid();
+  return freeze({
+    id: text(row.session_id),
+    state: validated(
+      row.state,
+      PAPER_STRATEGY_SESSION_STATES,
+    ) as ApiPaperStrategyProgress['state'],
+    reasonCode: validated(
+      row.reason_code,
+      PAPER_DECISION_REASON_CODES,
+    ) as ApiPaperStrategyProgress['reasonCode'],
+    strategyId: text(row.strategy_id),
+    strategyVersion: positiveSafeNumber(row.strategy_version),
+    positionId: nullableText(row.position_id),
+    quoteMint: text(row.quote_mint),
+    externalBuyTarget,
+    externalBuyCount,
+    minimumConfirmation: validated(
+      row.minimum_confirmation,
+      ['confirmed', 'finalized'],
+    ) as ApiPaperStrategyProgress['minimumConfirmation'],
+    updatedAt: timestamp(row.updated_at).toISOString(),
+    lastErrorCode,
+    lastErrorRetryable: lastError === null ? null : boolean(lastError.retryable),
   });
 }
 
@@ -1345,6 +1488,18 @@ function toPaperPosition(row: Record<string, unknown>): ApiPaperPosition {
     || (status === 'PAPER_CLOSED' && (exitTradeId === null || exitFees === null))
     || (status === 'PAPER_RETRACTED' && ((exitTradeId === null) !== (exitFees === null)))
   ) throw invalid();
+  const externalBuyCount = nullableSafeNumber(row.external_buy_count);
+  const externalBuyTarget = nullableSafeNumber(row.external_buy_target);
+  const strategySessionId = nullableText(row.strategy_session_id);
+  const qualificationReportId = nullableText(row.qualification_report_id);
+  const candidateId = nullableText(row.candidate_id);
+  const lineagePresence = [strategySessionId, qualificationReportId, candidateId]
+    .filter((value) => value !== null).length;
+  if ((externalBuyCount === null) !== (externalBuyTarget === null)
+    || (externalBuyCount !== null && externalBuyTarget !== null
+      && (externalBuyCount > externalBuyTarget || externalBuyTarget <= 0))
+    || (lineagePresence !== 0 && lineagePresence !== 3)
+    || ((lineagePresence === 0) !== (externalBuyCount === null))) throw invalid();
   return freeze({
     id: text(row.position_id), mint: text(row.mint), status,
     openedAt: timestamp(row.opened_at).toISOString(), closedAt: nullableTimestamp(row.closed_at), quoteMint: text(row.quote_mint),
@@ -1352,7 +1507,28 @@ function toPaperPosition(row: Record<string, unknown>): ApiPaperPosition {
     exitQuoteAmount: nullableDecimal(row.quote_proceeds_raw), realizedPnlQuote: nullableSignedDecimal(row.net_pnl_quote_raw),
     estimatedFeesQuote: (BigInt(decimal(row.entry_fees_raw))
       + BigInt(exitFees ?? '0')).toString(),
+    strategyId: text(row.strategy_id),
+    strategyVersion: positiveSafeNumber(row.strategy_version),
+    strategySessionId,
+    qualificationReportId,
+    candidateId,
+    externalBuyCount,
+    externalBuyTarget,
+    entryVenue: validated(
+      row.entry_venue,
+      ['PUMP_FUN_BONDING_CURVE', 'PUMPSWAP', 'UNKNOWN'],
+    ) as ApiPaperPosition['entryVenue'],
+    reasonCodes: row.reason_codes === null || row.reason_codes === undefined
+      ? freeze([] as const) : paperReasonCodes(row.reason_codes),
   });
+}
+
+function paperReasonCodes(value: unknown): readonly ApiPaperPosition['reasonCodes'][number][] {
+  const values = array(json(value));
+  if (values.length > PAPER_DECISION_REASON_CODES.length) throw invalid();
+  const reasons = values.map((item) => validated(item, PAPER_DECISION_REASON_CODES));
+  if (new Set(reasons).size !== reasons.length) throw invalid();
+  return freeze(reasons as ApiPaperPosition['reasonCodes'][number][]);
 }
 
 function rowsByMint(rows: readonly Record<string, unknown>[]): ReadonlyMap<string, Record<string, unknown>> {
@@ -1575,12 +1751,39 @@ function emptySocialJobs(): ApiHealth['socialJobs'] {
   });
 }
 
+function emptyPaperDecisionJobs(): ApiHealth['paperDecisionJobs'] {
+  return freeze({
+    pendingCount: 0,
+    leasedCount: 0,
+    retryableFailedCount: 0,
+    exhaustedCount: 0,
+    lastSuccessAt: null,
+    lastErrorCode: null,
+  });
+}
+
 function socialJobsFromRow(row: Record<string, unknown>): ApiHealth['socialJobs'] {
   return freeze({
     pendingCount: nonNegativeSafeNumber(row.pending_count),
     leasedCount: nonNegativeSafeNumber(row.leased_count),
     retryableFailedCount: nonNegativeSafeNumber(row.retryable_failed_count),
     exhaustedCount: nonNegativeSafeNumber(row.exhausted_count),
+  });
+}
+
+function paperDecisionJobsFromRow(
+  row: Record<string, unknown>,
+): ApiHealth['paperDecisionJobs'] {
+  return freeze({
+    pendingCount: nonNegativeSafeNumber(row.pending_count),
+    leasedCount: nonNegativeSafeNumber(row.leased_count),
+    retryableFailedCount: nonNegativeSafeNumber(row.retryable_failed_count),
+    exhaustedCount: nonNegativeSafeNumber(row.exhausted_count),
+    lastSuccessAt: nullableTimestamp(row.last_success_at),
+    lastErrorCode: nullableValidated(
+      row.last_error_code,
+      ['RPC_TRANSIENT', 'QUOTE_UNAVAILABLE', 'LEASE_EXPIRED', 'DECISION_INVALID'],
+    ) as ApiHealth['paperDecisionJobs']['lastErrorCode'],
   });
 }
 
@@ -1656,6 +1859,7 @@ function healthResult(
   checkpoints: ReadonlyMap<string, string>, heartbeat: ApiHealth['heartbeat'], lagSlots: string | null,
   pipeline: ApiProjectionPipelineState,
   socialJobs: ApiHealth['socialJobs'],
+  paperDecisionJobs: ApiHealth['paperDecisionJobs'],
 ): ApiHealth {
   return freeze({ status: degraded ? 'DEGRADED' : 'OK', observedAt: observedAt.toISOString(),
     postgresql: freeze({ status: databaseAvailable ? 'AVAILABLE' : 'UNAVAILABLE' }),
@@ -1667,8 +1871,15 @@ function healthResult(
       social: pipeline.social,
     }),
     socialJobs,
+    paperDecisionJobs,
     checkpoints: freeze({ launchpad: checkpoints.get('launchpad') ?? null, market: checkpoints.get('market') ?? null }),
     heartbeat, lagSlots });
+}
+
+function tokenDecimals(value: unknown): number {
+  const result = safeNumber(value);
+  if (result < 0 || result > 255) throw invalid();
+  return result;
 }
 
 function record(value: unknown): Record<string, unknown> {

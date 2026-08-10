@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { DomainEvent } from '../domain/events.js';
+import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { BondingCurveTradeObservedEventV1 } from '../domain/launchpad-events.js';
 import type { MarketTrade } from '../domain/market.js';
 import type { PaperStrategySessionV1 } from '../domain/paper-strategy.js';
@@ -479,17 +479,38 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
     await upsertSession(client, job, result.session, result.sessionEvent.id);
   }
   for (const evidence of result.countedExternalBuys) {
-    const source = await client.query(`SELECT event_id FROM domain_events
-      WHERE mint=$1 AND confirmation_status<>'orphaned'
-        AND payload #>> '{trade,id}'=$2 ORDER BY observed_at DESC LIMIT 1`, [job.mint,evidence.tradeId]);
-    const sourceEventId = textField(requiredRow(source, 'External buy source event is missing.'), 'event_id');
+    const source = await client.query(`SELECT event_id,program,signature,blockchain_time
+      FROM raw_chain_events
+      WHERE mint=$1 AND slot=$2 AND transaction_index=$3 AND instruction_index=$4
+        AND COALESCE(inner_instruction_index,-1)=COALESCE($5::integer,-1)
+        AND confirmation_status<>'orphaned'
+      ORDER BY observed_at DESC,event_id DESC LIMIT 1`, [
+      job.mint,evidence.cursor.slot.toString(),evidence.cursor.transactionIndex,
+      evidence.cursor.instructionIndex,evidence.cursor.innerInstructionIndex,
+    ]);
+    const sourceRow = requiredRow(source, 'External buy raw source is missing.');
+    const rawEventId = textField(sourceRow, 'event_id');
+    const countedEvent: DomainEvent = Object.freeze({
+      id:createDeterministicDerivedEventId({
+        type:'PaperExternalBuyCounted',mint:evidence.mint,source:'paper-decision',
+        program:textField(sourceRow,'program'),signature:textField(sourceRow,'signature'),
+        cursor:evidence.cursor,qualifier:`${evidence.sessionId}:${evidence.tradeId}`,
+      }),
+      type:'PaperExternalBuyCounted',mint:evidence.mint,source:'paper-decision',
+      program:textField(sourceRow,'program'),signature:textField(sourceRow,'signature'),
+      cursor:evidence.cursor,confirmationStatus:evidence.confirmationStatus,
+      blockchainTimeMs:nullableDateField(sourceRow,'blockchain_time')?.getTime() ?? null,
+      observedAtMs:evidence.observedAtMs,payloadVersion:1,
+      payload:Object.freeze({ sessionId:evidence.sessionId,tradeId:evidence.tradeId }),
+    });
+    await insertDomainEventWithRaw(client, rawEventId, countedEvent);
     await client.query(`INSERT INTO paper_external_buy_events (
       session_id,trade_id,source_event_id,mint,quote_mint,trader,slot,
       transaction_index,instruction_index,inner_instruction_index,
       confirmation_status,observed_at,purge_after,payload_version,payload
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL,1,$13)
     ON CONFLICT (session_id,trade_id) DO NOTHING`, [
-      evidence.sessionId,evidence.tradeId,sourceEventId,evidence.mint,evidence.quoteMint,
+      evidence.sessionId,evidence.tradeId,countedEvent.id,evidence.mint,evidence.quoteMint,
       evidence.trader,evidence.cursor.slot.toString(),evidence.cursor.transactionIndex,
       evidence.cursor.instructionIndex,evidence.cursor.innerInstructionIndex,
       evidence.confirmationStatus,new Date(evidence.observedAtMs),toJsonValue(evidence),
@@ -533,13 +554,21 @@ async function upsertSession(
 }
 
 async function insertDomainEvent(client: Client, job: ClaimedPaperDecisionJob, event: DomainEvent): Promise<void> {
+  await insertDomainEventWithRaw(client, job.sourceRawEventId, event);
+}
+
+async function insertDomainEventWithRaw(
+  client: Client,
+  rawEventId: string,
+  event: DomainEvent,
+): Promise<void> {
   await client.query(`INSERT INTO domain_events (
     event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
     instruction_index,inner_instruction_index,confirmation_status,blockchain_time,
     observed_at,payload_version,payload
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
   ON CONFLICT (event_id) DO NOTHING`, [
-    event.id,job.sourceRawEventId,event.type,event.mint,event.source,event.program,
+    event.id,rawEventId,event.type,event.mint,event.source,event.program,
     event.signature,event.cursor.slot.toString(),event.cursor.transactionIndex,
     event.cursor.instructionIndex,event.cursor.innerInstructionIndex,
     event.confirmationStatus,date(event.blockchainTimeMs),new Date(event.observedAtMs),
