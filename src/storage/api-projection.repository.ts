@@ -878,39 +878,43 @@ function toTimelineEntry(row: Record<string, unknown>): ApiTimelineEntry {
 }
 
 function qualification(value: unknown): ApiQualification {
-  const payload = json(value);
-  if (!isRecord(payload)) throw invalid();
-  const ruleSet = record(payload.ruleSet);
-  const scores = record(payload.scores);
-  const evaluatedAtMs = safeNumber(payload.evaluatedAtMs);
-  const hasFingerprint = Object.hasOwn(ruleSet, 'fingerprint');
-  const hasConditions = Object.hasOwn(payload, 'conditions');
-  if (hasFingerprint !== hasConditions) throw invalid();
-  const fingerprint = hasFingerprint ? ownDataProperty(ruleSet, 'fingerprint') : undefined;
-  const conditions = hasConditions ? ownDataProperty(payload, 'conditions') : undefined;
-  return freeze({
-    ruleSet: freeze({ id: text(ruleSet.id), version: positiveSafeNumber(ruleSet.version),
-      status: qualificationRuleSetStatus(ruleSet.status), minimumTotalScore: safeNumber(ruleSet.minimumTotalScore),
-      fingerprint: hasFingerprint ? qualificationFingerprint(fingerprint) : null }),
-    scores: freeze({ preparation: score(scores.preparation), socialAuthenticity: score(scores.socialAuthenticity),
-      onchainHealth: score(scores.onchainHealth), total: score(scores.total) }),
-    evidence: freeze(array(payload.evidence).map((item) => {
-      const itemRecord = record(item);
-      return freeze({ signal: validated(itemRecord.signal, QUALIFICATION_SIGNAL_KEYS) as ApiQualification['evidence'][number]['signal'],
-        status: validated(itemRecord.status, QUALIFICATION_EVIDENCE_STATUSES) as ApiQualification['evidence'][number]['status'], message: text(itemRecord.message) });
-    })),
-    conditions: hasConditions ? qualificationConditions(conditions) : freeze([]),
-    blockers: freeze(array(payload.blockers).map((item) => {
-      const itemRecord = record(item);
-      return freeze({ code: validated(itemRecord.code, QUALIFICATION_REASON_CODES) as ApiQualification['blockers'][number]['code'], message: text(itemRecord.message) });
-    })),
-    verdict: validated(payload.verdict, QUALIFICATION_VERDICTS) as ApiQualification['verdict'], evaluatedAt: dateFromMs(evaluatedAtMs).toISOString(),
-  });
+  try {
+    const payload = qualificationRecord(json(value));
+    const hasConditions = Object.hasOwn(payload, 'conditions');
+    const payloadFields = exactDataRecord(payload, hasConditions
+      ? QUALIFICATION_PAYLOAD_FIELDS_WITH_CALIBRATION
+      : QUALIFICATION_PAYLOAD_FIELDS_LEGACY, 'Qualification payload');
+    const ruleSet = exactDataRecord(payloadFields.ruleSet, hasConditions
+      ? QUALIFICATION_RULE_SET_FIELDS_WITH_FINGERPRINT
+      : QUALIFICATION_RULE_SET_FIELDS_LEGACY, 'Qualification rule set');
+    const scores = exactDataRecord(payloadFields.scores, QUALIFICATION_SCORE_FIELDS, 'Qualification scores');
+    return freeze({
+      ruleSet: freeze({ id: text(ruleSet.id), version: positiveSafeNumber(ruleSet.version),
+        status: qualificationRuleSetStatus(ruleSet.status), minimumTotalScore: safeNumber(ruleSet.minimumTotalScore),
+        fingerprint: hasConditions ? qualificationFingerprint(ruleSet.fingerprint) : null }),
+      scores: freeze({ preparation: score(scores.preparation), socialAuthenticity: score(scores.socialAuthenticity),
+        onchainHealth: score(scores.onchainHealth), total: score(scores.total) }),
+      evidence: qualificationEvidence(payloadFields.evidence),
+      conditions: hasConditions ? qualificationConditions(payloadFields.conditions) : freeze([]),
+      blockers: qualificationBlockers(payloadFields.blockers),
+      verdict: validated(payloadFields.verdict, QUALIFICATION_VERDICTS) as ApiQualification['verdict'],
+      evaluatedAt: dateFromMs(safeNumber(payloadFields.evaluatedAtMs)).toISOString(),
+    });
+  } catch (error) {
+    throw projectionError(error);
+  }
 }
 
 const MAX_QUALIFICATION_CONDITIONS = QUALIFICATION_REASON_CODES.length;
 const MAX_QUALIFICATION_CONDITION_MESSAGE_LENGTH = 4_096;
 const MAX_QUALIFICATION_CONDITION_MAP_KEYS = 3;
+const QUALIFICATION_PAYLOAD_FIELDS_LEGACY = ['ruleSet', 'scores', 'evidence', 'blockers', 'verdict', 'evaluatedAtMs'] as const;
+const QUALIFICATION_PAYLOAD_FIELDS_WITH_CALIBRATION = [...QUALIFICATION_PAYLOAD_FIELDS_LEGACY, 'conditions'] as const;
+const QUALIFICATION_RULE_SET_FIELDS_LEGACY = ['id', 'version', 'status', 'minimumTotalScore'] as const;
+const QUALIFICATION_RULE_SET_FIELDS_WITH_FINGERPRINT = [...QUALIFICATION_RULE_SET_FIELDS_LEGACY, 'fingerprint'] as const;
+const QUALIFICATION_SCORE_FIELDS = ['preparation', 'socialAuthenticity', 'onchainHealth', 'total'] as const;
+const QUALIFICATION_EVIDENCE_FIELDS = ['signal', 'status', 'message'] as const;
+const QUALIFICATION_BLOCKER_FIELDS = ['code', 'message'] as const;
 const QUALIFICATION_CONDITION_FIELDS = [
   'code', 'mode', 'status', 'observed', 'thresholds', 'message',
 ] as const;
@@ -922,14 +926,14 @@ function qualificationFingerprint(value: unknown): string {
 
 function qualificationConditions(value: unknown): readonly ApiQualificationCondition[] {
   const source = exactDenseArray(value, MAX_QUALIFICATION_CONDITIONS, 'Qualification conditions');
-  const seen = new Set<string>();
-  return freeze(source.map((item) => {
+  if (source.length !== QUALIFICATION_REASON_CODES.length) throw invalid();
+  return freeze(source.map((item, index) => {
     const fields = exactDataRecord(item, QUALIFICATION_CONDITION_FIELDS, 'Qualification condition');
     const code = validated(fields.code, QUALIFICATION_REASON_CODES) as ApiQualificationCondition['code'];
-    if (seen.has(code)) throw invalid();
-    seen.add(code);
+    if (code !== QUALIFICATION_REASON_CODES[index]) throw invalid();
     const mode = validated(fields.mode, QUALIFICATION_CONDITION_MODES) as ApiQualificationCondition['mode'];
     const status = validated(fields.status, QUALIFICATION_CONDITION_STATUSES) as ApiQualificationCondition['status'];
+    if ((mode === 'DISABLED') !== (status === 'DISABLED')) throw invalid();
     const observed = qualificationObserved(code, mode, fields.observed);
     const thresholds = qualificationThresholds(code, mode, fields.thresholds);
     const message = qualificationMessage(fields.message);
@@ -949,7 +953,7 @@ function qualificationObserved(
     case 'RELATED_WALLET_CLUSTER_EXCEEDED':
       return qualificationMap(value, ['maximumRelatedClusterBps'], ['decimal']);
     case 'SHARED_FUNDER_CLUSTER':
-      return qualificationMap(value, ['maximumSharedFunderCount'], ['count']);
+      return qualificationMap(value, ['maximumSharedFunderCount'], ['observedCount']);
     case 'BUY_SIMULATION_FAILED':
       return qualificationMap(value, ['buySimulationSucceeded'], ['boolean']);
     case 'SELL_QUOTE_UNAVAILABLE':
@@ -973,7 +977,7 @@ function qualificationThresholds(
     case 'RELATED_WALLET_CLUSTER_EXCEEDED':
       return qualificationMap(value, ['maximumClusterBps'], ['decimal']) as ApiQualificationCondition['thresholds'];
     case 'SHARED_FUNDER_CLUSTER':
-      return qualificationMap(value, ['minimumSharedFunders'], ['count']) as ApiQualificationCondition['thresholds'];
+      return qualificationMap(value, ['minimumSharedFunders'], ['thresholdCount']) as ApiQualificationCondition['thresholds'];
     case 'ROUND_TRIP_LOSS_EXCEEDED':
       return qualificationMap(value, ['maximumRoundTripLossBps'], ['decimal']) as ApiQualificationCondition['thresholds'];
     default:
@@ -981,7 +985,7 @@ function qualificationThresholds(
   }
 }
 
-type QualificationMapValue = 'decimal' | 'count' | 'boolean';
+type QualificationMapValue = 'decimal' | 'observedCount' | 'thresholdCount' | 'boolean';
 
 function qualificationMap(
   value: unknown,
@@ -1003,7 +1007,12 @@ function qualificationMap(
 function qualificationMapValue(value: unknown, type: QualificationMapValue): string | number | boolean | null {
   if (value === null) return null;
   if (type === 'decimal') return qualificationDecimal(value);
-  if (type === 'count') return nonNegativeSafeNumber(value);
+  if (type === 'observedCount') return nonNegativeSafeNumber(value);
+  if (type === 'thresholdCount') {
+    const count = positiveSafeNumber(value);
+    if (count > 10_000) throw invalid();
+    return count;
+  }
   if (typeof value !== 'boolean') throw invalid();
   return value;
 }
@@ -1040,8 +1049,34 @@ function qualificationMessage(value: unknown): string {
   return result;
 }
 
+function qualificationEvidence(value: unknown): readonly ApiQualification['evidence'][number][] {
+  return freeze(exactDenseArray(value, QUALIFICATION_SIGNAL_KEYS.length, 'Qualification evidence').map((item) => {
+    const fields = exactDataRecord(item, QUALIFICATION_EVIDENCE_FIELDS, 'Qualification evidence item');
+    return freeze({
+      signal: validated(fields.signal, QUALIFICATION_SIGNAL_KEYS) as ApiQualification['evidence'][number]['signal'],
+      status: validated(fields.status, QUALIFICATION_EVIDENCE_STATUSES) as ApiQualification['evidence'][number]['status'],
+      message: text(fields.message),
+    });
+  }));
+}
+
+function qualificationBlockers(value: unknown): readonly ApiQualification['blockers'][number][] {
+  return freeze(exactDenseArray(value, QUALIFICATION_REASON_CODES.length, 'Qualification blockers').map((item) => {
+    const fields = exactDataRecord(item, QUALIFICATION_BLOCKER_FIELDS, 'Qualification blocker');
+    return freeze({
+      code: validated(fields.code, QUALIFICATION_REASON_CODES) as ApiQualification['blockers'][number]['code'],
+      message: text(fields.message),
+    });
+  }));
+}
+
+function qualificationRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || isProxy(value) || !isRecord(value)) throw invalid();
+  return value;
+}
+
 function exactDenseArray(value: unknown, maximum: number, name: string): readonly unknown[] {
-  if (!Array.isArray(value) || isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype
+  if (isProxy(value) || !Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype
     || Object.getOwnPropertySymbols(value).length !== 0 || value.length > maximum) throw invalid();
   const names = Object.getOwnPropertyNames(value);
   if (names.length !== value.length + 1 || !Object.hasOwn(value, 'length')) throw invalid();
@@ -1077,7 +1112,7 @@ function ownDataProperty(value: Record<string, unknown>, key: string): unknown {
 }
 
 function score(value: unknown): ApiQualification['scores']['total'] {
-  const item = record(value);
+  const item = exactDataRecord(value, ['score', 'maximum'], 'Qualification score');
   return freeze({ score: safeNumber(item.score), maximum: safeNumber(item.maximum) });
 }
 
