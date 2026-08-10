@@ -29,7 +29,21 @@ void test('composes the passive production listener without opening resources', 
     httpAvailable: true,
     pumpfun: 'STOPPED',
     pumpswap: 'STOPPED',
+    social: 'STOPPED',
   });
+});
+
+void test('keeps fixed social retention compatible with a different foundation retention', () => {
+  const runtime = createProductionListenerRuntime(
+    parseConfig({
+      SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
+      SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+      DATA_RETENTION_HOURS: '24',
+    }),
+    inertPool as unknown as ReturnType<typeof getDatabasePool>,
+  );
+
+  assert.equal(runtime.state(), 'STOPPED');
 });
 
 void test('generic Pump bonding-curve reads fail with a stable redacted error', async () => {
@@ -50,6 +64,21 @@ void test('production factory has no transaction execution or Raydium builder pa
   );
 
   assert.doesNotMatch(source, /(?:sendRawTransaction|sendTransaction|transaction-builder|execution\/wallet|\.\.\/execution\/|raydium)/iu);
+});
+
+void test('public social runtime components have no signer or submission path', async () => {
+  for (const path of [
+    '../src/application/social-enrichment-worker.ts',
+    '../src/storage/social-evidence.repository.ts',
+    '../src/social/public-social-verification.provider.ts',
+  ]) {
+    const source = await readFile(new URL(path, import.meta.url), 'utf8');
+    assert.doesNotMatch(
+      source,
+      /(?:sendRawTransaction|sendTransaction|signTransaction|execution\/wallet|\.\.\/execution\/|privateKey|keypair)/iu,
+      path,
+    );
+  }
 });
 
 void test('heartbeat stop fences an in-flight RUNNING write before durable STOPPED', async () => {

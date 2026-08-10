@@ -30,6 +30,7 @@ export type MetadataResolution =
     readonly status: 'FAILED';
     readonly reason: MetadataFailureReason;
     readonly message: string;
+    readonly retryable: boolean;
   };
 
 export interface TokenMetadataSnapshot {

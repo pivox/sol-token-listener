@@ -75,6 +75,16 @@ const requiredStatements = [
   'Raydium CPMM',
   "La suite complète ne peut être annoncée sans échec ni skip qu'après exécution avec PostgreSQL disponible.",
   'un score ne peut jamais le compenser',
+  'SocialEvidenceCollected',
+  'URL_REACHABLE',
+  'CROSS_LINK_CONFIRMED',
+  'MINT_PUBLISHED',
+  'VERIFICATION_UNKNOWN',
+  'collectionStatus',
+  'linksTruncated',
+  'evidenceTruncated',
+  'sans API payante',
+  'contenu brut',
 ];
 for (const statement of requiredStatements) {
   if (!html.includes(statement)) failures.push(`affirmation requise absente: ${statement}`);

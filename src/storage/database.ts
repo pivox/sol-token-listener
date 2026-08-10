@@ -67,6 +67,11 @@ export async function migrateDatabase(options: {
 
 export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool()): Promise<{
   readonly metadataSnapshots: number;
+  readonly socialEvidence: number;
+  readonly socialObservations: number;
+  readonly socialLinks: number;
+  readonly socialCollections: number;
+  readonly socialJobs: number;
   readonly bondingCurveSnapshots: number;
   readonly launchTrades: number;
   readonly marketTrades: number;
@@ -95,9 +100,39 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const socialEvidence = await client.query(
+      `DELETE FROM social_verification_evidence evidence
+       USING social_evidence_collections collection
+       WHERE evidence.collection_id = collection.collection_id
+         AND collection.purge_after <= statement_timestamp()`,
+    );
+    const socialObservations = await client.query(
+      `DELETE FROM social_http_observations observation
+       USING social_evidence_collections collection
+       WHERE observation.collection_id = collection.collection_id
+         AND collection.purge_after <= statement_timestamp()`,
+    );
+    const socialLinks = await client.query(
+      `DELETE FROM social_links link
+       USING social_evidence_collections collection
+       WHERE link.collection_id = collection.collection_id
+         AND collection.purge_after <= statement_timestamp()`,
+    );
+    const socialCollections = await client.query(
+      `DELETE FROM social_evidence_collections
+       WHERE purge_after <= statement_timestamp()`,
+    );
+    const socialJobs = await client.query(
+      `DELETE FROM social_enrichment_jobs
+       WHERE purge_after <= statement_timestamp()`,
+    );
     const metadataSnapshots = await client.query(
       `DELETE FROM token_metadata_snapshots snapshot USING token_launches launch
-       WHERE snapshot.mint = launch.mint AND launch.purge_after <= NOW()`,
+       WHERE snapshot.mint = launch.mint
+         AND (
+           snapshot.purge_after <= statement_timestamp()
+           OR launch.purge_after <= statement_timestamp()
+         )`,
     );
     const bondingCurveSnapshots = await client.query(
       `DELETE FROM bonding_curve_snapshots snapshot USING token_launches launch
@@ -233,6 +268,11 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     await client.query('COMMIT');
     return {
       metadataSnapshots: metadataSnapshots.rowCount ?? 0,
+      socialEvidence: socialEvidence.rowCount ?? 0,
+      socialObservations: socialObservations.rowCount ?? 0,
+      socialLinks: socialLinks.rowCount ?? 0,
+      socialCollections: socialCollections.rowCount ?? 0,
+      socialJobs: socialJobs.rowCount ?? 0,
       bondingCurveSnapshots: bondingCurveSnapshots.rowCount ?? 0,
       launchTrades: launchTrades.rowCount ?? 0,
       marketTrades: marketTrades.rowCount ?? 0,

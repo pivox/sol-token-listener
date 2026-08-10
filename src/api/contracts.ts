@@ -12,12 +12,20 @@ import type {
 import type { QualificationReasonCode } from '../domain/qualification-reasons.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
+import type {
+  SocialCollectionStatus,
+  SocialEvidenceOutcome,
+  SocialEvidenceType,
+  SocialLinkKind,
+} from '../domain/social-evidence.js';
 
 export const API_VERSION = 'v1' as const;
 export const MAX_API_JSON_DEPTH = 64;
 export const MAX_API_JSON_NODES = 10_000;
 export const MAX_API_CLUSTER_QUOTE_ASSETS = 8;
 export const MAX_API_TOTAL_CLUSTER_QUOTE_ASSETS = 64;
+export const MAX_API_SOCIAL_LINKS = 64;
+export const MAX_API_SOCIAL_EVIDENCE = 64;
 
 export type ApiJsonPrimitive = string | number | boolean | null;
 export interface ApiJsonObject {
@@ -146,10 +154,60 @@ export interface ApiQualificationEvidence {
   readonly message: string;
 }
 
-export interface ApiSocial {
+export type ApiSocial = ApiSocialUnavailable | ApiSocialAvailable;
+
+export interface ApiSocialUnavailable {
   readonly status: 'NOT_AVAILABLE';
   readonly links: readonly [];
   readonly evidence: readonly [];
+}
+
+export interface ApiSocialAvailable {
+  readonly status: 'AVAILABLE';
+  readonly collectionStatus: SocialCollectionStatus;
+  readonly collectionId: string;
+  readonly metadataSnapshotId: string;
+  readonly observedAt: string;
+  readonly linkCount: number;
+  readonly linksTruncated: boolean;
+  readonly links: readonly ApiSocialLink[];
+  readonly evidenceCount: number;
+  readonly evidenceTruncated: boolean;
+  readonly evidence: readonly ApiSocialEvidence[];
+  readonly coverage: ApiSocialCoverage;
+}
+
+export interface ApiSocialLink {
+  readonly id: string;
+  readonly kind: SocialLinkKind;
+  readonly declaredValueSha256: string;
+  readonly syntaxStatus: 'VALID' | 'INVALID';
+  readonly canonicalUrl: string | null;
+  readonly invalidReason: string | null;
+  readonly observedAt: string;
+}
+
+export interface ApiSocialEvidence {
+  readonly id: string;
+  readonly type: SocialEvidenceType;
+  readonly outcome: SocialEvidenceOutcome;
+  readonly subjectKind: SocialLinkKind | null;
+  readonly relatedKind: SocialLinkKind | null;
+  readonly subjectUrl: string | null;
+  readonly finalUrl: string | null;
+  readonly httpStatus: number | null;
+  readonly redirectCount: number;
+  readonly contentSha256: string | null;
+  readonly reasonCode: string;
+  readonly observedAt: string;
+}
+
+export interface ApiSocialCoverage {
+  readonly declaredLinkCount: number;
+  readonly inspectedLinkCount: number;
+  readonly confirmedEvidenceCount: number;
+  readonly rejectedEvidenceCount: number;
+  readonly unknownEvidenceCount: number;
 }
 
 export type ApiHolders = ApiHoldersUnavailable | ApiHoldersAvailable;
@@ -328,6 +386,7 @@ export interface ApiHealth {
   readonly postgresql: ApiHealthDependency;
   readonly http: ApiHealthDependency;
   readonly pipeline: ApiPipelineHealth;
+  readonly socialJobs: ApiSocialJobHealth;
   readonly checkpoints: ApiCheckpoints;
   readonly heartbeat: ApiHeartbeat;
   readonly lagSlots: string | null;
@@ -340,6 +399,14 @@ export interface ApiHealthDependency {
 export interface ApiPipelineHealth {
   readonly pumpfun: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly pumpswap: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+  readonly social: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+}
+
+export interface ApiSocialJobHealth {
+  readonly pendingCount: number;
+  readonly leasedCount: number;
+  readonly retryableFailedCount: number;
+  readonly exhaustedCount: number;
 }
 
 export interface ApiCheckpoints {
@@ -537,6 +604,8 @@ const API_DOMAIN_NUMBER_KEYS = new Set<string>([
   'uniqueExternalBuyers',
   'positivePositionCount',
   'unknownTraderTradeCount',
+  'linkCount',
+  'evidenceCount',
 ]);
 
 function assertApiDomainPayload(value: ApiJsonValue, key: string | undefined): void {

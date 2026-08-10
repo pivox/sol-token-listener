@@ -72,3 +72,22 @@ export function createDeterministicChainEventId(identity: ChainEventIdentity): s
   ]);
   return `evt_${createHash('sha256').update(canonical).digest('hex')}`;
 }
+
+export function createDeterministicDerivedEventId(input: Readonly<{
+  type: DomainEventType;
+  mint: string;
+  source: string;
+  program: string;
+  signature: string;
+  cursor: ChainCursor;
+  qualifier: string;
+}>): string {
+  if (
+    typeof input.qualifier !== 'string'
+    || input.qualifier === ''
+    || Buffer.byteLength(input.qualifier, 'utf8') > 16_384
+  ) throw new TypeError('Derived event qualifier is invalid.');
+  const chainId = createDeterministicChainEventId(input);
+  const canonical = JSON.stringify([chainId, input.qualifier]);
+  return `evt_${createHash('sha256').update(canonical).digest('hex')}`;
+}

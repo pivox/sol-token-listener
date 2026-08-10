@@ -301,6 +301,156 @@ void test('returns NOT_AVAILABLE social and holders only for an existing launch'
   assert.equal(await new PostgresApiProjectionRepository(new FakeQueryable(() => [])).getLaunchHolders('none'), null);
 });
 
+void test('exposes the latest completed non-orphaned social collection with stable bounded evidence', async () => {
+  const observedAt = new Date('2026-08-10T12:00:00.000Z');
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM social_evidence_collections AS collection')) return [{
+      collection_id: 'social_collection_a', metadata_snapshot_id: 'pumpfun_metadata_a',
+      collection_status: 'PARTIAL', observed_at: observedAt,
+      declared_link_count: '2', inspected_link_count: '1', evidence_count: '2',
+      confirmed_evidence_count: '1', rejected_evidence_count: '0', unknown_evidence_count: '1',
+    }];
+    if (call.text.includes('FROM social_links AS link')) return [{
+      link_id: 'social_link_website', link_kind: 'WEBSITE', declared_value_sha256: 'a'.repeat(64),
+      syntax_status: 'VALID', canonical_url: 'https://project.example/', invalid_reason: null,
+      observed_at: observedAt,
+    }, {
+      link_id: 'social_link_x', link_kind: 'X', declared_value_sha256: 'b'.repeat(64),
+      syntax_status: 'INVALID', canonical_url: null, invalid_reason: 'URL_INVALID',
+      observed_at: observedAt,
+    }];
+    if (call.text.includes('FROM social_verification_evidence AS evidence')) return [{
+      evidence_id: 'social_evidence_reachable', evidence_type: 'URL_REACHABLE',
+      outcome: 'CONFIRMED', subject_kind: 'WEBSITE', related_kind: null,
+      subject_url: 'https://project.example/', final_url: 'https://project.example/',
+      http_status: 200, redirect_count: 0, content_sha256: 'c'.repeat(64),
+      reason_code: 'HTTP_2XX', observed_at: observedAt,
+    }, {
+      evidence_id: 'social_evidence_unknown', evidence_type: 'VERIFICATION_UNKNOWN',
+      outcome: 'UNKNOWN', subject_kind: 'X', related_kind: null,
+      subject_url: null, final_url: null, http_status: null, redirect_count: 0,
+      content_sha256: null, reason_code: 'URL_INVALID', observed_at: observedAt,
+    }];
+    return [];
+  });
+  const repository = new PostgresApiProjectionRepository(database);
+
+  const social = await repository.getLaunchSocial('mint-a');
+
+  assert.deepEqual(social, {
+    status: 'AVAILABLE', collectionStatus: 'PARTIAL', collectionId: 'social_collection_a',
+    metadataSnapshotId: 'pumpfun_metadata_a', observedAt: observedAt.toISOString(),
+    linkCount: 2, linksTruncated: false,
+    links: [{
+      id: 'social_link_website', kind: 'WEBSITE', declaredValueSha256: 'a'.repeat(64),
+      syntaxStatus: 'VALID', canonicalUrl: 'https://project.example/', invalidReason: null,
+      observedAt: observedAt.toISOString(),
+    }, {
+      id: 'social_link_x', kind: 'X', declaredValueSha256: 'b'.repeat(64),
+      syntaxStatus: 'INVALID', canonicalUrl: null, invalidReason: 'URL_INVALID',
+      observedAt: observedAt.toISOString(),
+    }],
+    evidenceCount: 2, evidenceTruncated: false,
+    evidence: [{
+      id: 'social_evidence_reachable', type: 'URL_REACHABLE', outcome: 'CONFIRMED',
+      subjectKind: 'WEBSITE', relatedKind: null, subjectUrl: 'https://project.example/',
+      finalUrl: 'https://project.example/', httpStatus: 200, redirectCount: 0,
+      contentSha256: 'c'.repeat(64), reasonCode: 'HTTP_2XX', observedAt: observedAt.toISOString(),
+    }, {
+      id: 'social_evidence_unknown', type: 'VERIFICATION_UNKNOWN', outcome: 'UNKNOWN',
+      subjectKind: 'X', relatedKind: null, subjectUrl: null, finalUrl: null,
+      httpStatus: null, redirectCount: 0, contentSha256: null, reasonCode: 'URL_INVALID',
+      observedAt: observedAt.toISOString(),
+    }],
+    coverage: {
+      declaredLinkCount: 2, inspectedLinkCount: 1, confirmedEvidenceCount: 1,
+      rejectedEvidenceCount: 0, unknownEvidenceCount: 1,
+    },
+  });
+  assert.equal(Object.isFrozen(social ?? {}), true);
+  assert.equal(Object.isFrozen(social?.links ?? []), true);
+  assert.match(database.calls[1]?.text ?? '', /SocialEvidenceCollected/u);
+  assert.match(database.calls[1]?.text ?? '', /confirmation_status <> 'orphaned'/u);
+  assert.match(database.calls[2]?.text ?? '', /ORDER BY CASE link\.link_kind/u);
+  assert.match(database.calls[3]?.text ?? '', /ORDER BY CASE evidence\.evidence_type/u);
+});
+
+void test('fails closed on malformed social projection data', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM social_evidence_collections AS collection')) return [{
+      collection_id: 'social_collection_a', metadata_snapshot_id: 'pumpfun_metadata_a',
+      collection_status: 'COMPLETE', observed_at: detectedAt,
+      declared_link_count: '-1', inspected_link_count: '0', evidence_count: '0',
+      confirmed_evidence_count: '0', rejected_evidence_count: '0', unknown_evidence_count: '0',
+    }];
+    return [];
+  });
+
+  await assert.rejects(
+    new PostgresApiProjectionRepository(database).getLaunchSocial('mint-a'),
+    ApiProjectionDataError,
+  );
+});
+
+void test('returns failed metadata evidence as AVAILABLE and truncates oversized evidence explicitly', async () => {
+  const evidenceRows = Array.from({ length: 64 }, (_, index) => ({
+    evidence_id: `social_evidence_${String(index).padStart(2, '0')}`,
+    evidence_type: 'VERIFICATION_UNKNOWN', outcome: 'UNKNOWN', subject_kind: null,
+    related_kind: null, subject_url: null, final_url: null, http_status: null,
+    redirect_count: 0, content_sha256: null, reason_code: 'METADATA_UNAVAILABLE',
+    observed_at: detectedAt,
+  }));
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('FROM social_evidence_collections AS collection')) return [{
+      collection_id: 'social_collection_failed', metadata_snapshot_id: 'pumpfun_metadata_failed',
+      collection_status: 'FAILED', observed_at: detectedAt,
+      declared_link_count: '0', inspected_link_count: '0', evidence_count: '65',
+      confirmed_evidence_count: '0', rejected_evidence_count: '0', unknown_evidence_count: '65',
+    }];
+    if (call.text.includes('FROM social_verification_evidence AS evidence')) return evidenceRows;
+    return [];
+  });
+
+  const social = await new PostgresApiProjectionRepository(database).getLaunchSocial('mint-a');
+
+  assert.equal(social?.status, 'AVAILABLE');
+  if (social?.status !== 'AVAILABLE') return;
+  assert.equal(social.collectionStatus, 'FAILED');
+  assert.equal(social.linkCount, 0);
+  assert.equal(social.evidenceCount, 65);
+  assert.equal(social.evidence.length, 64);
+  assert.equal(social.evidenceTruncated, true);
+  assert.deepEqual(database.calls.at(-1)?.values, ['social_collection_failed', 64]);
+});
+
+void test('embeds the same immutable social projection in launch detail as the dedicated route', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+    if (call.text.includes('token_metadata_snapshots')) return [];
+    if (call.text.includes('bonding_curve_snapshots')) return [];
+    if (call.text.includes('FROM migrations AS migration')) return [];
+    if (call.text.includes('FROM creator_profiles')) return [];
+    if (call.text.includes('FROM social_evidence_collections AS collection')) return [{
+      collection_id: 'social_collection_empty', metadata_snapshot_id: 'pumpfun_metadata_empty',
+      collection_status: 'COMPLETE', observed_at: detectedAt,
+      declared_link_count: '0', inspected_link_count: '0', evidence_count: '0',
+      confirmed_evidence_count: '0', rejected_evidence_count: '0', unknown_evidence_count: '0',
+    }];
+    return [];
+  });
+  const repository = new PostgresApiProjectionRepository(database);
+
+  const detail = await repository.getLaunch('mint-a');
+  const dedicated = await repository.getLaunchSocial('mint-a');
+
+  assert.deepEqual(detail?.social, dedicated);
+  assert.equal(detail?.social.status, 'AVAILABLE');
+  assert.equal(Object.isFrozen(detail?.social ?? {}), true);
+});
+
 void test('expose les profils et positions observés avec des limites SQL bornées', async () => {
   const database = new FakeQueryable((call) => {
     if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
@@ -375,7 +525,7 @@ void test('expose les profils et positions observés avec des limites SQL borné
   const repository = new PostgresApiProjectionRepository(
     database,
     () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE' },
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', social: 'IDLE' },
     {
       positions: 1,
       snapshots: 2,
@@ -541,7 +691,7 @@ void test('exposes current clusters with per-cluster truncation and one shared m
   const repository = new PostgresApiProjectionRepository(
     database,
     () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE' },
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', social: 'IDLE' },
     {
       positions: 1,
       snapshots: 1,
@@ -644,7 +794,7 @@ void test('shares one bounded quote-asset budget across emitted clusters', async
   const repository = new PostgresApiProjectionRepository(
     database,
     () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE' },
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', social: 'IDLE' },
     {
       positions: 1,
       snapshots: 1,
@@ -1181,17 +1331,21 @@ void test('returns health without exposing database URLs or secrets', async () =
       worker_state: 'RUNNING', reconciler_state: 'RUNNING', started_at: openedAt,
       leased_transactions: 0, exhausted_transactions: 2,
     }];
+    if (call.text.includes('FROM social_enrichment_jobs')) return [{
+      pending_count: 2, leased_count: 1, retryable_failed_count: 3, exhausted_count: 4,
+    }];
     return [];
   });
   const repository = new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: false, pumpfun: 'RUNNING', pumpswap: 'IDLE',
+    httpAvailable: false, pumpfun: 'RUNNING', pumpswap: 'IDLE', social: 'RUNNING',
   });
   const health = await repository.getHealth();
 
   assert.deepEqual(health, {
     status: 'DEGRADED', observedAt: openedAt.toISOString(),
     postgresql: { status: 'AVAILABLE' }, http: { status: 'UNAVAILABLE' },
-    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE' },
+    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', social: 'RUNNING' },
+    socialJobs: { pendingCount: 2, leasedCount: 1, retryableFailedCount: 3, exhaustedCount: 4 },
     checkpoints: { launchpad: '55', market: '54' },
     heartbeat: {
       runtimeState: 'RUNNING', subscriberState: 'RUNNING', scannerState: 'RUNNING',
@@ -1206,11 +1360,41 @@ void test('returns health without exposing database URLs or secrets', async () =
   assert.doesNotMatch(JSON.stringify(health), /:\/\/|DATABASE_URL|password|secret|localhost/u);
 });
 
+void test('degrades only social health when its bounded count projection fails', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
+    if (call.text.includes('listener_heartbeats')) return [{
+      updated_at: openedAt, started_at: openedAt, last_http_slot: '60',
+      last_websocket_slot: '60', last_finalized_slot: '59', last_signature: null,
+      pending_transactions: 0, active_sessions: 0, leased_transactions: 0,
+      exhausted_transactions: 0, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
+      scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
+    }];
+    if (call.text.includes('FROM social_enrichment_jobs')) {
+      throw new Error('https://metadata.example/private social count failure');
+    }
+    return [];
+  });
+  const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'RUNNING',
+  }).getHealth();
+
+  assert.equal(health.status, 'DEGRADED');
+  assert.equal(health.postgresql.status, 'AVAILABLE');
+  assert.deepEqual(health.pipeline, {
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'DEGRADED',
+  });
+  assert.deepEqual(health.socialJobs, {
+    pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
+  });
+  assert.doesNotMatch(JSON.stringify(health), /metadata|private|failure|:\/\//u);
+});
+
 void test('returns nullable unknown heartbeat fields when no heartbeat exists', async () => {
   const database = new FakeQueryable((call) =>
     call.text.includes('SELECT 1 AS available') ? [{ available: 1 }] : []);
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -1238,7 +1422,7 @@ void test('degrades stale heartbeats and reads the canonical runtime start colum
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -1260,7 +1444,7 @@ void test('degrades a heartbeat timestamped in the future', async () => {
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -1290,7 +1474,7 @@ void test('rejects invalid heartbeat runtime states and impossible runtime count
       return [];
     });
     const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'RUNNING',
     }).getHealth();
     assert.equal(health.status, 'DEGRADED');
     assert.equal(health.postgresql.status, 'UNAVAILABLE');
@@ -1319,12 +1503,16 @@ void test('redacts hostile dynamic pipeline providers into canonical DEGRADED he
     const repository = new PostgresApiProjectionRepository(
       new FakeQueryable(() => { throw new Error('must not query after invalid pipeline'); }),
       () => openedAt,
-      provider as () => { httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING' },
+      provider as () => {
+        httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING'; social: 'RUNNING';
+      },
     );
     const health = await repository.getHealth();
     assert.equal(health.status, 'DEGRADED');
     assert.deepEqual(health.http, { status: 'UNAVAILABLE' });
-    assert.deepEqual(health.pipeline, { pumpfun: 'DEGRADED', pumpswap: 'DEGRADED' });
+    assert.deepEqual(health.pipeline, {
+      pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', social: 'DEGRADED',
+    });
     assert.ok(Object.isFrozen(health.pipeline));
     assert.doesNotMatch(JSON.stringify(health), /secret/u);
   }
@@ -1333,7 +1521,10 @@ void test('redacts hostile dynamic pipeline providers into canonical DEGRADED he
 
 void test('snapshots a dynamic pipeline provider exactly once without retaining its object', async () => {
   let providerCalls = 0;
-  const original = { httpAvailable: true, pumpfun: 'RUNNING' as const, pumpswap: 'RUNNING' as const };
+  const original = {
+    httpAvailable: true, pumpfun: 'RUNNING' as const, pumpswap: 'RUNNING' as const,
+    social: 'RUNNING' as const,
+  };
   const database = new FakeQueryable((call) => {
     if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
     if (call.text.includes('listener_heartbeats')) return [{
@@ -1354,7 +1545,9 @@ void test('snapshots a dynamic pipeline provider exactly once without retaining 
 
   original.pumpfun = 'RUNNING';
   assert.equal(providerCalls, 1);
-  assert.deepEqual(health.pipeline, { pumpfun: 'RUNNING', pumpswap: 'RUNNING' });
+  assert.deepEqual(health.pipeline, {
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', social: 'RUNNING',
+  });
   assert.ok(Object.isFrozen(health.pipeline));
   assert.notEqual(health.pipeline, original);
   assert.doesNotMatch(JSON.stringify(health), /secret/u);

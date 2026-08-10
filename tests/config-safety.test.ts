@@ -207,6 +207,90 @@ void test('le modèle d’environnement publie les valeurs listener sûres exact
   ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
 });
 
+void test('public social enrichment uses strict bounded non-secret defaults', () => {
+  const config = parseConfig(base);
+  assert.deepEqual({
+    timeoutMs: config.socialHttpTimeoutMs,
+    maxBytes: config.socialHttpMaxBytes,
+    maxRedirects: config.socialHttpMaxRedirects,
+    concurrency: config.socialHttpConcurrency,
+    pollMs: config.socialWorkerPollMs,
+    leaseSeconds: config.socialWorkerLeaseSeconds,
+    maxAttempts: config.socialRetryMaxAttempts,
+    baseDelayMs: config.socialRetryBaseDelayMs,
+  }, {
+    timeoutMs: 5_000, maxBytes: 262_144, maxRedirects: 3, concurrency: 2,
+    pollMs: 1_000, leaseSeconds: 30, maxAttempts: 3, baseDelayMs: 1_000,
+  });
+});
+
+void test('public social enrichment accepts only its exact inclusive bounds', () => {
+  const minimums = parseConfig({
+    ...base, SOCIAL_HTTP_TIMEOUT_MS: '100', SOCIAL_HTTP_MAX_BYTES: '1024',
+    SOCIAL_HTTP_MAX_REDIRECTS: '0', SOCIAL_HTTP_CONCURRENCY: '1',
+    SOCIAL_WORKER_POLL_MS: '100', SOCIAL_WORKER_LEASE_SECONDS: '5',
+    SOCIAL_RETRY_MAX_ATTEMPTS: '1', SOCIAL_RETRY_BASE_DELAY_MS: '100',
+  });
+  assert.deepEqual([
+    minimums.socialHttpTimeoutMs, minimums.socialHttpMaxBytes,
+    minimums.socialHttpMaxRedirects, minimums.socialHttpConcurrency,
+    minimums.socialWorkerPollMs, minimums.socialWorkerLeaseSeconds,
+    minimums.socialRetryMaxAttempts, minimums.socialRetryBaseDelayMs,
+  ], [100, 1_024, 0, 1, 100, 5, 1, 100]);
+
+  const maximums = parseConfig({
+    ...base, SOCIAL_HTTP_TIMEOUT_MS: '30000', SOCIAL_HTTP_MAX_BYTES: '1048576',
+    SOCIAL_HTTP_MAX_REDIRECTS: '10', SOCIAL_HTTP_CONCURRENCY: '8',
+    SOCIAL_WORKER_POLL_MS: '60000', SOCIAL_WORKER_LEASE_SECONDS: '300',
+    SOCIAL_RETRY_MAX_ATTEMPTS: '10', SOCIAL_RETRY_BASE_DELAY_MS: '60000',
+  });
+  assert.deepEqual([
+    maximums.socialHttpTimeoutMs, maximums.socialHttpMaxBytes,
+    maximums.socialHttpMaxRedirects, maximums.socialHttpConcurrency,
+    maximums.socialWorkerPollMs, maximums.socialWorkerLeaseSeconds,
+    maximums.socialRetryMaxAttempts, maximums.socialRetryBaseDelayMs,
+  ], [30_000, 1_048_576, 10, 8, 60_000, 300, 10, 60_000]);
+});
+
+void test('public social enrichment rejects ambiguous integers without reflecting configured values', () => {
+  const fields = [
+    'SOCIAL_HTTP_TIMEOUT_MS', 'SOCIAL_HTTP_MAX_BYTES', 'SOCIAL_HTTP_MAX_REDIRECTS',
+    'SOCIAL_HTTP_CONCURRENCY', 'SOCIAL_WORKER_POLL_MS', 'SOCIAL_WORKER_LEASE_SECONDS',
+    'SOCIAL_RETRY_MAX_ATTEMPTS', 'SOCIAL_RETRY_BASE_DELAY_MS',
+  ] as const;
+  for (const field of fields) {
+    for (const value of ['01', '+1', '-1', ' 1', '1 ', '1e3', '1.0']) {
+      assert.throws(() => parseConfig({ ...base, [field]: value }), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, new RegExp(field, 'u'));
+        assert.equal(error.message.includes(value), false);
+        assert.equal(error.message.includes(base.SOLANA_HTTP_RPC_URL), false);
+        return true;
+      });
+    }
+  }
+  const aboveMaximum = {
+    SOCIAL_HTTP_TIMEOUT_MS: '30001', SOCIAL_HTTP_MAX_BYTES: '1048577',
+    SOCIAL_HTTP_MAX_REDIRECTS: '11', SOCIAL_HTTP_CONCURRENCY: '9',
+    SOCIAL_WORKER_POLL_MS: '60001', SOCIAL_WORKER_LEASE_SECONDS: '301',
+    SOCIAL_RETRY_MAX_ATTEMPTS: '11', SOCIAL_RETRY_BASE_DELAY_MS: '60001',
+  } as const;
+  for (const [field, value] of Object.entries(aboveMaximum)) {
+    assert.throws(() => parseConfig({ ...base, [field]: value }));
+  }
+});
+
+void test('the environment example contains only safe public-social settings', async () => {
+  const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
+  for (const line of [
+    'SOCIAL_HTTP_TIMEOUT_MS=5000', 'SOCIAL_HTTP_MAX_BYTES=262144',
+    'SOCIAL_HTTP_MAX_REDIRECTS=3', 'SOCIAL_HTTP_CONCURRENCY=2',
+    'SOCIAL_WORKER_POLL_MS=1000', 'SOCIAL_WORKER_LEASE_SECONDS=30',
+    'SOCIAL_RETRY_MAX_ATTEMPTS=3', 'SOCIAL_RETRY_BASE_DELAY_MS=1000',
+  ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
+  assert.doesNotMatch(source, /(?:X|TWITTER|TELEGRAM).*(?:TOKEN|COOKIE|SECRET|PROXY)|PRIVATE_KEY|KEYPAIR_PATH/iu);
+});
+
 void test('les réglages listener ne régressent pas la sécurité observe/paper', () => {
   assert.equal(parseConfig({ ...base, LISTENER_ENABLED: 'false' }).executionMode, 'observe');
   assert.throws(() => parseConfig({
@@ -263,6 +347,16 @@ void test('Pump.fun calibration documentation states the initial profile, semant
     'sellabilité',
     'première position',
     'même slot',
+    'SocialEvidenceCollected',
+    'URL_REACHABLE',
+    'CROSS_LINK_CONFIRMED',
+    'MINT_PUBLISHED',
+    'VERIFICATION_UNKNOWN',
+    'collectionStatus',
+    'linksTruncated',
+    'evidenceTruncated',
+    'sans API payante',
+    'contenu brut',
   ]) assert.ok(documentation.includes(statement), `missing documentation statement: ${statement}`);
 
   assert.match(readme, /par défaut.*config\/qualification\/pumpfun-v1-unvalidated\.json/isu);
@@ -287,6 +381,9 @@ void test('Pump.fun calibration documentation states the initial profile, semant
   assert.match(systemOverview, /ROUND_TRIP_LOSS_EXCEEDED.*ENFORCED.*maximumRoundTripLossBps=3000/isu);
   assert.match(systemOverview, /Liquidité.*future non scorée/iu);
   assert.match(api, /projection legacy.*projection calibrée.*Perte aller-retour supérieure au seuil configuré/isu);
+  assert.match(api, /NOT_AVAILABLE.*AVAILABLE.*COMPLETE.*PARTIAL.*FAILED/isu);
+  assert.match(architecture, /inconnu.*UNKNOWN.*ne.*faux/isu);
+  assert.match(readme, /métadonnées.*liens sociaux.*ne prouvent.*sérieux/isu);
   assert.doesNotMatch(systemOverview, /704 tests réussis/iu);
 });
 

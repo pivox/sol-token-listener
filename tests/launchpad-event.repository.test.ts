@@ -55,6 +55,79 @@ void test('atomically persists creation and initial buy and restores active even
   assert.equal(Object.isFrozen(restored), true);
 });
 
+void test('atomically enqueues one durable social job and cancels it on orphaning', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(
+      pool,
+      24,
+      () => 10_000,
+      { maxAttempts: 3, baseDelayMs: 1_000 },
+    );
+    const parameters = Object.freeze({
+      initialSupply: 1_000_000_000_000_000_000n,
+      uri: 'https://metadata.example/token.json',
+    });
+    const processed = fixture('processed', 'signature-social', 'mint-social', 2_000, 1_000, parameters);
+    await repository.record(processed);
+    const first = await pool.query(`SELECT job_id,mint,source_launch_event_id,
+      metadata_uri,status,attempts,max_attempts,base_delay_ms,input_fingerprint
+      FROM social_enrichment_jobs`);
+    assert.equal(first.rowCount, 1);
+    assert.equal(first.rows[0].mint, 'mint-social');
+    assert.equal(first.rows[0].source_launch_event_id, processed.events[0]?.id);
+    assert.equal(first.rows[0].metadata_uri, 'https://metadata.example/token.json');
+    assert.equal(first.rows[0].status, 'PENDING');
+    assert.equal(first.rows[0].attempts, 0);
+    assert.equal(first.rows[0].max_attempts, 3);
+    assert.equal(first.rows[0].base_delay_ms, 1_000);
+    assert.match(first.rows[0].job_id, /^social_job_[0-9a-f]{64}$/u);
+    assert.match(first.rows[0].input_fingerprint, /^[0-9a-f]{64}$/u);
+
+    await repository.record(processed);
+    assert.equal((await pool.query('SELECT COUNT(*)::int count FROM social_enrichment_jobs')).rows[0].count, 1);
+    await repository.record(fixture(
+      'confirmed', 'signature-social', 'mint-social', 3_000, 1_000, parameters,
+    ));
+    assert.equal((await pool.query('SELECT job_id FROM social_enrichment_jobs')).rows[0].job_id, first.rows[0].job_id);
+
+    await repository.record(fixture(
+      'orphaned', 'signature-social', 'mint-social', 4_000, 1_000, parameters,
+    ));
+    const cancelled = await pool.query(`SELECT status,terminal_at,purge_after,
+      EXTRACT(EPOCH FROM (purge_after-terminal_at))::int retention_seconds
+      FROM social_enrichment_jobs`);
+    assert.deepEqual(cancelled.rows[0], {
+      status: 'CANCELLED',
+      terminal_at: new Date(10_000),
+      purge_after: new Date(10_000 + 4 * 3_600_000),
+      retention_seconds: 14_400,
+    });
+  });
+});
+
+void test('preserves social job identity when the source launch finalizes', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(pool);
+    const processed = fixture('processed', 'signature-final-social', 'mint-final-social');
+    await repository.record(processed);
+    const jobId = (await pool.query('SELECT job_id FROM social_enrichment_jobs')).rows[0].job_id;
+    await repository.record(fixture('finalized', 'signature-final-social', 'mint-final-social'));
+    const final = await pool.query(`SELECT job.job_id,event.confirmation_status
+      FROM social_enrichment_jobs job
+      JOIN domain_events event ON event.event_id=job.source_launch_event_id`);
+    assert.deepEqual(final.rows[0], { job_id: jobId, confirmation_status: 'finalized' });
+  });
+});
+
+void test('enqueues a nullable metadata URI without reading inherited parameters', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresLaunchpadEventRepository(pool);
+    await repository.record(fixture('confirmed', 'signature-no-uri', 'mint-no-uri'));
+    const job = await pool.query('SELECT metadata_uri FROM social_enrichment_jobs');
+    assert.equal(job.rows[0].metadata_uri, null);
+  });
+});
+
 void test('restores only launchpad events when market events share the signature', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresLaunchpadEventRepository(pool);

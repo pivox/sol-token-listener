@@ -26,7 +26,7 @@ void test('persiste séparément la résolution ou l’échec de metadata', asyn
   await repository.upsertMetadataSnapshot({
     mint: 'mint', uri: 'https://example.test/meta.json', fetchedAtMs: 1,
     payloadVersion: 1,
-    resolution: { status: 'FAILED', reason: 'JSON_INVALID', message: 'invalid' },
+    resolution: { status: 'FAILED', reason: 'JSON_INVALID', message: 'invalid', retryable: false },
   });
 
   assert.match(database.calls[0]?.text ?? '', /token_metadata_snapshots/u);

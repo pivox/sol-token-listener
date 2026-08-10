@@ -12,6 +12,8 @@ import { PumpSwapFeeStateReader } from '../markets/pumpswap/pumpswap-fee-state.j
 import { PumpSwapMarketAdapter } from '../markets/pumpswap/pumpswap-market.adapter.js';
 import { PumpSwapQuoteProvider } from '../markets/pumpswap/pumpswap-quote.provider.js';
 import { PumpSwapReserveReader } from '../markets/pumpswap/pumpswap-reserve-reader.js';
+import { BoundedPublicHttpClient } from '../metadata/bounded-public-http.client.js';
+import { HttpMetadataProvider } from '../metadata/http-metadata.provider.js';
 import { RpcPumpSwapPoolValidator } from '../markets/pumpswap/pool-validator.js';
 import type { ListenerRuntime } from '../ports/listener-runtime.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
@@ -25,6 +27,7 @@ import { getDatabasePool } from '../storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../storage/launchpad-event.repository.js';
 import { PostgresMarketObservationRepository } from '../storage/market-observation.repository.js';
 import { PostgresParticipantAnalyticsRepository } from '../storage/participant-analytics.repository.js';
+import { PostgresSocialEvidenceRepository } from '../storage/social-evidence.repository.js';
 import { PostgresTransactionInboxRepository } from '../storage/transaction-inbox.repository.js';
 import { PostgresWalletEvidenceRepository } from '../storage/wallet-evidence.repository.js';
 import { PostgresWalletGraphRepository } from '../storage/wallet-graph.repository.js';
@@ -39,6 +42,8 @@ import { SolanaListenerRuntime } from './listener-runtime.js';
 import { TransactionInboxWorker } from './transaction-inbox-worker.js';
 import { WalletEvidenceObservationService } from './wallet-evidence-observation.service.js';
 import { WalletGraphRebuildService } from './wallet-graph-rebuild.service.js';
+import { PublicSocialVerificationProvider } from '../social/public-social-verification.provider.js';
+import { SocialEnrichmentWorker } from './social-enrichment-worker.js';
 
 type ProductionPool = ReturnType<typeof getDatabasePool>;
 export const MAX_LISTENER_TIMER_DELAY_MS = 2_147_483_647;
@@ -83,6 +88,29 @@ export function createProductionListenerRuntime(
   const launchpadRepository = new PostgresLaunchpadEventRepository(
     pool,
     config.dataRetentionHours,
+    Date.now,
+    {
+      maxAttempts: config.socialRetryMaxAttempts,
+      baseDelayMs: config.socialRetryBaseDelayMs,
+    },
+  );
+  const publicHttp = new BoundedPublicHttpClient(undefined, undefined, {
+    timeoutMs: config.socialHttpTimeoutMs,
+    maxBytes: config.socialHttpMaxBytes,
+    maxRedirects: config.socialHttpMaxRedirects,
+    maxConcurrency: config.socialHttpConcurrency,
+    maxPerHostConcurrency: 1,
+  });
+  const socialWorker = new SocialEnrichmentWorker(
+    new PostgresSocialEvidenceRepository(pool),
+    new HttpMetadataProvider(publicHttp),
+    new PublicSocialVerificationProvider(publicHttp),
+    {
+      pollIntervalMs: config.socialWorkerPollMs,
+      leaseMs: config.socialWorkerLeaseSeconds * 1_000,
+      renewalIntervalMs: Math.floor(config.socialWorkerLeaseSeconds * 1_000 / 3),
+      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+    },
   );
   const pump = new PumpFunLaunchpadAdapter(createUnavailableBondingCurveReader());
   const launchpad = new LaunchpadObservationService(pump, launchpadRepository);
@@ -134,6 +162,7 @@ export function createProductionListenerRuntime(
   );
   const subscriberComponent = lifecycleComponent(subscriber);
   const workerComponent = lifecycleComponent(worker);
+  const socialWorkerComponent = lifecycleComponent(socialWorker);
   const heartbeat = new PersistentListenerHeartbeat(
     inbox,
     rpc,
@@ -149,6 +178,7 @@ export function createProductionListenerRuntime(
     scanner,
     subscriber: subscriberComponent,
     worker: workerComponent,
+    socialWorker: socialWorkerComponent,
     reconciler,
     heartbeat,
   }, { shutdownTimeoutMs: config.listenerShutdownTimeoutMs });

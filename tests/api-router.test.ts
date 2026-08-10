@@ -98,7 +98,8 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
   };
   const health: ApiHealth = {
     status: 'OK', observedAt: summary.detectedAt, postgresql: { status: 'AVAILABLE' },
-    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE' },
+    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', social: 'IDLE' },
+    socialJobs: { pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0 },
     checkpoints: { launchpad: null, market: null },
     heartbeat: { startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
       lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null }, lagSlots: null,
@@ -169,6 +170,37 @@ void test('serves every public GET route with its projection and validates route
     assert.equal(repository.calls.includes(expectedCall), true, expectedCall);
   }
   assert.equal(repository.calls.filter((call) => call.startsWith('launch:')).length, 5);
+});
+
+void test('serves the additive AVAILABLE social contract without exposing raw content', async () => {
+  const repository = makeRepository();
+  const available: ApiSocial = {
+    status: 'AVAILABLE', collectionStatus: 'COMPLETE', collectionId: 'social_collection_a',
+    metadataSnapshotId: 'pumpfun_metadata_a', observedAt: '2026-08-10T12:00:00.000Z',
+    linkCount: 0, linksTruncated: false, links: [], evidenceCount: 1,
+    evidenceTruncated: false,
+    evidence: [{
+      id: 'social_evidence_a', type: 'VERIFICATION_UNKNOWN', outcome: 'UNKNOWN',
+      subjectKind: null, relatedKind: null, subjectUrl: null, finalUrl: null,
+      httpStatus: null, redirectCount: 0, contentSha256: null,
+      reasonCode: 'METADATA_UNAVAILABLE', observedAt: '2026-08-10T12:00:00.000Z',
+    }],
+    coverage: {
+      declaredLinkCount: 0, inspectedLinkCount: 0, confirmedEvidenceCount: 0,
+      rejectedEvidenceCount: 0, unknownEvidenceCount: 1,
+    },
+  };
+  Object.assign(repository, { async getLaunchSocial() { return available; } });
+  const { router } = makeRouter(repository);
+
+  const response = await invoke(router, 'GET', `/api/v1/launches/${MINT}/social`);
+  const body = parseBody(response) as { readonly data: Record<string, unknown> };
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.data, available);
+  assert.equal('rawBody' in body.data, false);
+  assert.equal('responseHeaders' in body.data, false);
+  assert.equal('dnsAnswers' in body.data, false);
 });
 
 void test('HEAD mirrors GET headers and status without a response body, and OPTIONS is public', async () => {

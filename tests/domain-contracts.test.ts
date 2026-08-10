@@ -6,7 +6,10 @@ import {
   compareCursors,
   InvalidChainCursorError,
 } from '../src/domain/cursor.js';
-import { createDeterministicChainEventId } from '../src/domain/events.js';
+import {
+  createDeterministicChainEventId,
+  createDeterministicDerivedEventId,
+} from '../src/domain/events.js';
 import { isTerminalLaunchStatus, LAUNCH_STATUSES } from '../src/domain/launch-status.js';
 import { QUALIFICATION_REASON_CODES } from '../src/domain/qualification-reasons.js';
 import type { ChainCursor, QuoteAsset, TokenLaunch } from '../src/domain/types.js';
@@ -115,6 +118,27 @@ void test('l’identité métier encode sans ambiguïté les champs contenant le
   });
 
   assert.notEqual(separatorInSource, separatorInProgram);
+});
+
+void test('l’identité dérivée conserve l’enveloppe chaîne et ajoute un qualifiant', () => {
+  const base = {
+    type: 'SocialEvidenceCollected' as const,
+    mint: SOL.mint,
+    source: 'public_social',
+    program: 'pump',
+    signature: 'signature',
+    cursor: Object.freeze({
+      slot: 10n, transactionIndex: 1, instructionIndex: 2, innerInstructionIndex: null,
+    }),
+    qualifier: 'a'.repeat(64),
+  };
+  const first = createDeterministicDerivedEventId(base);
+  assert.equal(createDeterministicDerivedEventId(base), first);
+  assert.match(first, /^evt_[0-9a-f]{64}$/u);
+  assert.notEqual(createDeterministicDerivedEventId({ ...base, qualifier: 'b'.repeat(64) }), first);
+  assert.notEqual(createDeterministicDerivedEventId({
+    ...base, cursor: Object.freeze({ ...base.cursor, instructionIndex: 3 }),
+  }), first);
 });
 
 void test('valide les bornes canoniques des curseurs de transaction et de chaîne', () => {

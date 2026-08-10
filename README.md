@@ -52,6 +52,9 @@ sans clé privée, signature, soumission ni live; elle n'appelle ni
 - Aucune promesse de première position, même slot, sortie ou profit.
 - L'observation accepte plusieurs quote assets, mais le paper trading refuse
   tout mint hors de l'allowlist initiale SOL/WSOL.
+- Les métadonnées et liens sociaux ne sont que des signaux de préparation et
+  d'authenticité : ils ne prouvent jamais le sérieux, la sellabilité ou le
+  potentiel de profit d'un token.
 - Raydium CPMM reste non composé.
 
 ## Installation
@@ -80,7 +83,8 @@ npm run db:migrate
 Avec `LISTENER_ENABLED=true`, PostgreSQL et les endpoints Solana HTTP/WebSocket
 sont des dépendances de démarrage. L'ordre est : migrations optionnelles,
 health check RPC, baseline bornée, souscriptions, second rattrapage de fermeture
-de fenêtre, worker, réconciliation de finalité, heartbeat, puis API. Un échec
+de fenêtre, worker inbox, worker social public, réconciliation de finalité,
+heartbeat, puis API. Un échec
 de dépendance ou de composant interrompt le
 démarrage et ferme les ressources déjà ouvertes. `LISTENER_ENABLED=false`
 désactive explicitement le listener et expose un pipeline `STOPPED` si l'API
@@ -145,8 +149,10 @@ derrière les contrôles réseau/TLS appropriés.
 
 Les huit routes JSON sont `launches`, détail/timeline/risk/social/holders d'un
 lancement, `paper-positions` et `health`; `/api/v1/events` est le flux SSE.
-Les montants et `bigint` sont des chaînes décimales. La projection sociale
-retourne honnêtement `NOT_AVAILABLE`. La projection holders devient
+Les montants et `bigint` sont des chaînes décimales. La projection sociale vaut
+`NOT_AVAILABLE` avant la première collection canonique, puis `AVAILABLE` avec
+un `collectionStatus` `COMPLETE`, `PARTIAL` ou `FAILED`, des preuves typées et
+des limites/troncatures explicites. La projection holders devient
 `AVAILABLE` après une reconstruction explicite des trades Pump.fun persistés;
 sinon elle reste `NOT_AVAILABLE`.
 
@@ -225,8 +231,17 @@ en attente de finalité ne l'est jamais. Cette fenêtre limite aussi la durée d
 données publiques de wallets observées; elle ne constitue pas un historique
 on-chain exhaustif.
 
+Les métadonnées et preuves sociales publiques utilisent un transport HTTP
+borné qui revalide DNS et redirections afin d'écarter les destinations privées.
+Le worker ne dépend d'aucune API payante X ou Telegram, ni token, cookie ou
+proxy. Il persiste uniquement des URL normalisées, empreintes et preuves
+structurées : aucun corps HTTP brut, header, résultat DNS ou adresse IP. Les
+collections et jobs sociaux terminaux sont conservés quatre heures puis purgés
+dans l'ordre des dépendances.
+
 `GET /api/v1/health` publie l'état courant des composants, le backlog, les
-leases, le compteur `exhaustedCount`, checkpoints et slots observés, sans URL
+leases, le compteur `exhaustedCount`, `pipeline.social`, les compteurs
+`socialJobs`, checkpoints et slots observés, sans URL
 RPC/DB ni secret. `RUNNING`
 exige tous les composants actifs; une dépendance, un heartbeat périmé ou un
 nettoyage incomplet produit `DEGRADED`; `STOPPED` désigne l'arrêt ou la
