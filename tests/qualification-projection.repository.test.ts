@@ -12,6 +12,10 @@ import {
   createDefaultQualificationRuleSet,
 } from '../src/qualification/qualification-engine.js';
 import {
+  createWalletClusterId,
+  createWalletRelationshipId,
+} from '../src/domain/wallet-graph.js';
+import {
   createSocialCollection,
   socialHttpObservationId,
   socialLinkId,
@@ -25,6 +29,14 @@ import {
   QualificationProjectionDataError,
   QualificationProjectionRepositoryError,
 } from '../src/storage/qualification-projection.repository.js';
+
+const SOCIAL_LINK_ROW_MAXIMUM = 3;
+const SOCIAL_OBSERVATION_ROW_MAXIMUM = 3;
+const SOCIAL_EVIDENCE_ROW_MAXIMUM = 64;
+const WALLET_RELATIONSHIP_ROW_MAXIMUM = 1_000;
+const WALLET_CLUSTER_ROW_MAXIMUM = 256;
+const WALLET_MEMBER_ROW_MAXIMUM = 1_024;
+const WALLET_MEMBERS_PER_CLUSTER_MAXIMUM = 256;
 
 void test('uses a repeatable-read mint lock and commits and releases', async () => {
   const database = new ScriptedPool();
@@ -198,6 +210,8 @@ void test('loads participant and complete current wallet graph only through acti
   assert.match(graphSql, /JOIN raw_chain_events AS raw/u);
   assert.match(graphSql, /raw\.confirmation_status=event\.confirmation_status/u);
   assert.match(graphSql, /event\.confirmation_status=graph\.confirmation_status/u);
+  assert.match(graphSql, /event\.payload_version AS graph_event_payload_version/u);
+  assert.match(graphSql, /event\.payload AS graph_event_payload/u);
   assert.match(graphSql, /snapshot\.input_fingerprint=graph\.input_fingerprint/u);
   assert.match(graphSql, /snapshot\.graph_event_id=graph\.graph_event_id/u);
 });
@@ -300,6 +314,237 @@ void test('fails closed when participant and graph revisions do not align', asyn
     repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
     QualificationProjectionDataError,
   );
+});
+
+for (const mutation of [
+  {
+    name: 'missing aggregate',
+    mutate: (payload: Record<string, unknown>) => {
+      const remaining = { ...payload };
+      Reflect.deleteProperty(remaining, 'maximumClusterBps');
+      return remaining;
+    },
+  },
+  {
+    name: 'wrong aggregate',
+    mutate: (payload: Record<string, unknown>) => ({
+      ...payload,
+      strongRelationshipCount: 1,
+    }),
+  },
+  {
+    name: 'extra field',
+    mutate: (payload: Record<string, unknown>) => ({ ...payload, extra: true }),
+  },
+  {
+    name: 'malformed bigint',
+    mutate: (payload: Record<string, unknown>) => ({
+      ...payload,
+      maximumClusterBps: '0',
+    }),
+  },
+] as const) {
+  void test(`rejects graph event payload with ${mutation.name}`, async () => {
+    const evidence = analyticsFixture();
+    const original = evidence.graphRow.graph_event_payload;
+    assert.ok(typeof original === 'object' && original !== null && !Array.isArray(original));
+    const graphRow = {
+      ...evidence.graphRow,
+      graph_event_payload: mutation.mutate(original as Record<string, unknown>),
+    };
+    const database = analyticsPool(evidence, graphRow);
+    const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+    await assert.rejects(
+      repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+      QualificationProjectionDataError,
+    );
+  });
+}
+
+void test('rejects a graph event payload version other than one', async () => {
+  const evidence = analyticsFixture();
+  const database = analyticsPool(evidence, {
+    ...evidence.graphRow,
+    graph_event_payload_version: 2,
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+    QualificationProjectionDataError,
+  );
+});
+
+void test('rejects every social child overflow before decoding hostile rows', async () => {
+  const evidence = socialFixture();
+  const cases = [
+    ['qualification_social_links', SOCIAL_LINK_ROW_MAXIMUM],
+    ['qualification_social_observations', SOCIAL_OBSERVATION_ROW_MAXIMUM],
+    ['qualification_social_verification', SOCIAL_EVIDENCE_ROW_MAXIMUM],
+  ] as const;
+  for (const [target, maximum] of cases) {
+    let touched = false;
+    const hostile = hostileRows(maximum + 1, () => { touched = true; });
+    const database = new ScriptedPool((text) => {
+      if (text.includes('qualification_launch')) return rows([launchRow(evidence.mint)]);
+      if (text.includes('qualification_as_of')) return rows([asOfRow(evidence.mint)]);
+      if (text.includes('qualification_social */')) return rows([evidence.collectionRow]);
+      if (text.includes(target)) return rows(hostile);
+      if (text.includes('qualification_social_links')) return rows([evidence.linkRow]);
+      if (text.includes('qualification_social_observations')) {
+        return rows([evidence.observationRow]);
+      }
+      if (text.includes('qualification_social_verification')) return rows([evidence.evidenceRow]);
+      if (text.includes('qualification_metadata_collection')) return rows([evidence.metadataRow]);
+      return rows([]);
+    });
+    const repository = new PostgresQualificationProjectionRepository(database, validator());
+    await assert.rejects(
+      repository.transact(evidence.mint, (transaction) => (
+        transaction.loadCanonicalInput(evidence.mint)
+      )),
+      QualificationProjectionDataError,
+    );
+    assert.equal(touched, false, `${target} decoded an overflow row`);
+  }
+});
+
+void test('rejects every wallet child overflow before decoding hostile rows', async () => {
+  const evidence = analyticsFixture();
+  const cases = [
+    ['qualification_graph_relationships', WALLET_RELATIONSHIP_ROW_MAXIMUM],
+    ['qualification_graph_clusters', WALLET_CLUSTER_ROW_MAXIMUM],
+    ['qualification_graph_members', WALLET_MEMBER_ROW_MAXIMUM],
+  ] as const;
+  for (const [target, maximum] of cases) {
+    let touched = false;
+    const hostile = hostileRows(maximum + 1, () => { touched = true; });
+    const database = new ScriptedPool((text) => {
+      if (text.includes('qualification_launch')) return rows([launchRow()]);
+      if (text.includes('qualification_as_of')) return rows([asOfRow()]);
+      if (text.includes('qualification_creator')) return rows([evidence.profileRow]);
+      if (text.includes('qualification_holders')) return rows([evidence.holderRow]);
+      if (text.includes('qualification_graph */')) return rows([evidence.graphRow]);
+      if (text.includes(target)) return rows(hostile);
+      return rows([]);
+    });
+    const repository = new PostgresQualificationProjectionRepository(database, validator());
+    await assert.rejects(
+      repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+      QualificationProjectionDataError,
+    );
+    assert.equal(touched, false, `${target} decoded an overflow row`);
+  }
+});
+
+void test('accepts exact social child boundaries and queries only maximum plus one', async () => {
+  const evidence = socialBoundaryFixture();
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_launch')) return rows([launchRow(evidence.mint)]);
+    if (text.includes('qualification_as_of')) return rows([asOfRow(evidence.mint)]);
+    if (text.includes('qualification_social */')) return rows([evidence.collectionRow]);
+    if (text.includes('qualification_social_links')) return rows(evidence.linkRows);
+    if (text.includes('qualification_social_observations')) return rows(evidence.observationRows);
+    if (text.includes('qualification_social_verification')) return rows(evidence.evidenceRows);
+    if (text.includes('qualification_metadata_collection')) return rows([evidence.metadataRow]);
+    return rows([]);
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  const snapshot = await repository.transact(evidence.mint, (transaction) => (
+    transaction.loadCanonicalInput(evidence.mint)
+  ));
+
+  assert.deepEqual(snapshot?.social, evidence.collection);
+  for (const [marker, maximum] of [
+    ['qualification_social_links', SOCIAL_LINK_ROW_MAXIMUM],
+    ['qualification_social_observations', SOCIAL_OBSERVATION_ROW_MAXIMUM],
+    ['qualification_social_verification', SOCIAL_EVIDENCE_ROW_MAXIMUM],
+  ] as const) {
+    const call = database.queries.find((query) => query.text.includes(marker));
+    assert.match(call?.text ?? '', /LIMIT \$2/u);
+    assert.equal(call?.values?.[1], maximum + 1);
+  }
+});
+
+for (const family of ['relationships', 'clusters', 'members'] as const) {
+  void test(`accepts the exact wallet ${family} boundary and queries only maximum plus one`, async () => {
+    const evidence = walletBoundaryFixture(family);
+    const database = new ScriptedPool((text) => {
+      if (text.includes('qualification_launch')) return rows([launchRow()]);
+      if (text.includes('qualification_as_of')) return rows([asOfRow()]);
+      if (text.includes('qualification_creator')) return rows([evidence.profileRow]);
+      if (text.includes('qualification_holders')) return rows([evidence.holderRow]);
+      if (text.includes('qualification_graph */')) return rows([evidence.graphRow]);
+      if (text.includes('qualification_graph_relationships')) {
+        return rows(evidence.relationshipRows);
+      }
+      if (text.includes('qualification_graph_clusters')) return rows(evidence.clusterRows);
+      if (text.includes('qualification_graph_members')) return rows(evidence.memberRows);
+      return rows([]);
+    });
+    const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+    const snapshot = await repository.transact('mint', (transaction) => (
+      transaction.loadCanonicalInput('mint')
+    ));
+
+    assert.equal(snapshot?.walletGraph?.relationships.length, evidence.relationshipRows.length);
+    assert.equal(snapshot?.walletGraph?.clusters.length, evidence.clusterRows.length);
+    assert.equal(
+      snapshot?.walletGraph?.clusters.reduce((count, cluster) => count + cluster.members.length, 0),
+      evidence.memberRows.length,
+    );
+    const relationshipCall = database.queries.find((query) => (
+      query.text.includes('qualification_graph_relationships')
+    ));
+    assert.match(relationshipCall?.text ?? '', /LIMIT \$3/u);
+    assert.equal(relationshipCall?.values?.[2], WALLET_RELATIONSHIP_ROW_MAXIMUM + 1);
+    const clusterCall = database.queries.find((query) => (
+      query.text.includes('qualification_graph_clusters')
+    ));
+    assert.match(clusterCall?.text ?? '', /LIMIT \$3/u);
+    assert.equal(clusterCall?.values?.[2], WALLET_CLUSTER_ROW_MAXIMUM + 1);
+    const memberCall = database.queries.find((query) => (
+      query.text.includes('qualification_graph_members')
+    ));
+    assert.match(memberCall?.text ?? '', /ROW_NUMBER\(\) OVER/u);
+    assert.match(memberCall?.text ?? '', /LIMIT \$3/u);
+    assert.equal(memberCall?.values?.[2], WALLET_MEMBER_ROW_MAXIMUM + 1);
+    assert.equal(memberCall?.values?.[3], WALLET_MEMBERS_PER_CLUSTER_MAXIMUM + 1);
+  });
+}
+
+void test('rejects a wallet cluster member per-cluster overflow before decoding', async () => {
+  const evidence = analyticsFixture();
+  let touched = false;
+  const overflowRow = new Proxy(
+    { cluster_member_ordinal: WALLET_MEMBERS_PER_CLUSTER_MAXIMUM + 1 },
+    {
+      get(target, property) {
+        if (property === 'cluster_member_ordinal') return target.cluster_member_ordinal;
+        touched = true;
+        return undefined;
+      },
+    },
+  );
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_launch')) return rows([launchRow()]);
+    if (text.includes('qualification_as_of')) return rows([asOfRow()]);
+    if (text.includes('qualification_creator')) return rows([evidence.profileRow]);
+    if (text.includes('qualification_holders')) return rows([evidence.holderRow]);
+    if (text.includes('qualification_graph */')) return rows([evidence.graphRow]);
+    if (text.includes('qualification_graph_members')) return rows([overflowRow]);
+    return rows([]);
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+    QualificationProjectionDataError,
+  );
+  assert.equal(touched, false);
 });
 
 void test('dissolves the current report without deleting or inventing an event', async () => {
@@ -507,6 +752,18 @@ function rows(values: readonly Record<string, unknown>[]) {
   return { rows: values, rowCount: values.length };
 }
 
+function hostileRows(
+  count: number,
+  touch: () => void,
+): readonly Record<string, unknown>[] {
+  return Array.from({ length: count }, () => new Proxy<Record<string, unknown>>({}, {
+    get: () => {
+      touch();
+      throw new Error('hostile row decoded');
+    },
+  }));
+}
+
 function launchRow(mint = 'mint'): Record<string, unknown> {
   return {
     event_id: 'launch-event', raw_event_id: 'raw-launch', type: 'TokenLaunchDetected',
@@ -624,6 +881,127 @@ function socialFixture() {
   };
 }
 
+function socialBoundaryFixture() {
+  const mint = '11111111111111111111111111111111';
+  const metadata = Object.freeze({
+    mint,
+    uri: 'https://example.test/boundary.json',
+    resolution: Object.freeze({
+      status: 'RESOLVED' as const,
+      metadata: Object.freeze({
+        name: 'Boundary', symbol: 'BND', description: null,
+        imageUrl: null, videoUrl: null, websiteUrl: null,
+        twitterUrl: null, telegramUrl: null,
+      }),
+    }),
+    fetchedAtMs: 1_020,
+    payloadVersion: 1,
+  });
+  const metadataSnapshotId = socialMetadataSnapshotId({
+    sourceLaunchEventId: 'launch-event',
+    snapshot: metadata,
+  });
+  const kinds = ['WEBSITE', 'X', 'TELEGRAM'] as const;
+  const links = Object.freeze(kinds.map((kind, index) => {
+    const base = Object.freeze({
+      mint, metadataSnapshotId, kind,
+      declaredValueSha256: String(index + 1).repeat(64),
+      syntaxStatus: 'VALID' as const,
+      canonicalUrl: `https://example.test/${kind.toLowerCase()}`,
+      invalidReason: null,
+      observedAtMs: 1_021 + index,
+    });
+    return Object.freeze({ id: socialLinkId(base), ...base });
+  }));
+  const observations = Object.freeze(links.map((link, index) => {
+    const base = Object.freeze({
+      linkId: link.id,
+      outcome: 'SUCCEEDED' as const,
+      finalCanonicalUrl: link.canonicalUrl,
+      httpStatus: 200,
+      redirectCount: 0,
+      contentSha256: ['a', 'b', 'c'][index]?.repeat(64) ?? 'd'.repeat(64),
+      failureReason: null,
+      observedAtMs: 1_030 + index,
+    });
+    return Object.freeze({ id: socialHttpObservationId(base), ...base });
+  }));
+  const evidenceTypes = [
+    'URL_SYNTAX_VALID', 'URL_REACHABLE', 'CROSS_LINK_CONFIRMED',
+    'MINT_PUBLISHED', 'ACCOUNT_TOO_RECENT', 'DOMAIN_MISMATCH',
+    'CONTENT_UNAVAILABLE', 'VERIFICATION_UNKNOWN',
+  ] as const;
+  const evidence = Object.freeze(Array.from(
+    { length: SOCIAL_EVIDENCE_ROW_MAXIMUM },
+    (_, index) => {
+      const base = Object.freeze({
+        mint,
+        linkId: links[0]?.id ?? null,
+        observationId: observations[0]?.id ?? null,
+        type: evidenceTypes[index % evidenceTypes.length] ?? 'VERIFICATION_UNKNOWN',
+        outcome: 'CONFIRMED' as const,
+        subjectKind: 'WEBSITE' as const,
+        relatedKind: null,
+        reasonCode: `BOUNDARY_${index}`,
+        observedAtMs: 1_040 + index,
+      });
+      return Object.freeze({ id: socialVerificationEvidenceId(base), ...base });
+    },
+  ));
+  const collection = createSocialCollection(Object.freeze({
+    mint,
+    sourceLaunchEventId: 'launch-event',
+    metadataSnapshotId,
+    status: 'COMPLETE' as const,
+    links,
+    observations,
+    evidence,
+    observedAtMs: 1_200,
+  }));
+  return {
+    mint,
+    collection,
+    collectionRow: {
+      collection_id: collection.id,
+      input_fingerprint: collection.inputFingerprint,
+      mint,
+      source_launch_event_id: 'launch-event',
+      source_raw_event_id: 'raw-launch',
+      metadata_snapshot_id: metadataSnapshotId,
+      collection_status: 'COMPLETE',
+      observed_at: new Date(collection.observedAtMs),
+      payload_version: 1,
+    },
+    linkRows: collection.links.map((link) => ({
+      link_id: link.id, mint, metadata_snapshot_id: metadataSnapshotId,
+      link_kind: link.kind, declared_value_sha256: link.declaredValueSha256,
+      syntax_status: link.syntaxStatus, canonical_url: link.canonicalUrl,
+      invalid_reason: link.invalidReason, observed_at: new Date(link.observedAtMs),
+    })),
+    observationRows: collection.observations.map((observation) => ({
+      observation_id: observation.id, link_id: observation.linkId,
+      outcome: observation.outcome, final_canonical_url: observation.finalCanonicalUrl,
+      http_status: observation.httpStatus, redirect_count: observation.redirectCount,
+      content_sha256: observation.contentSha256, failure_reason: observation.failureReason,
+      observed_at: new Date(observation.observedAtMs),
+    })),
+    evidenceRows: collection.evidence.map((item) => ({
+      evidence_id: item.id, mint, link_id: item.linkId,
+      observation_id: item.observationId, evidence_type: item.type,
+      outcome: item.outcome, subject_kind: item.subjectKind,
+      related_kind: item.relatedKind, reason_code: item.reasonCode,
+      observed_at: new Date(item.observedAtMs),
+    })),
+    metadataRow: {
+      snapshot_id: metadataSnapshotId, mint, uri: metadata.uri,
+      resolution_status: 'resolved', failure_reason: null, failure_message: null,
+      failure_retryable: null, metadata: metadata.resolution.metadata,
+      fetched_at: new Date(metadata.fetchedAtMs), payload_version: 1,
+      source_launch_event_id: 'launch-event',
+    },
+  };
+}
+
 function analyticsFixture(
   holderFingerprint = 'c'.repeat(64),
   graphParticipantFingerprint = 'c'.repeat(64),
@@ -698,8 +1076,116 @@ function analyticsFixture(
       confirmation_counts: confirmationCounts,
       medium_relationship_count: 0, cluster_count: 0, maximum_cluster_bps: '0',
       creator_cluster_count: 0,
+      graph_event_payload_version: 1,
+      graph_event_payload: toJsonValue({
+        inputFingerprint,
+        methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+        coverage,
+        strongRelationshipCount: 0,
+        mediumRelationshipCount: 0,
+        clusterCount: 0,
+        maximumClusterBps: 0n,
+        creatorClusterCount: 0,
+        confirmationCounts,
+      }),
     },
   };
+}
+
+function walletBoundaryFixture(
+  family: 'relationships' | 'clusters' | 'members',
+) {
+  const evidence = analyticsFixture();
+  const inputFingerprint = 'c'.repeat(64);
+  const relationshipCount = family === 'relationships'
+    ? WALLET_RELATIONSHIP_ROW_MAXIMUM
+    : 0;
+  const relationshipRows = Array.from({ length: relationshipCount }, (_, index) => {
+    const leftWallet = `left-${String(index).padStart(4, '0')}`;
+    const rightWallet = `right-${String(index).padStart(4, '0')}`;
+    return {
+      relationship_id: createWalletRelationshipId(
+        'mint', leftWallet, rightWallet, 'DIRECT_QUOTE_TRANSFER',
+      ),
+      mint: 'mint', left_wallet: leftWallet, right_wallet: rightWallet,
+      relationship_type: 'DIRECT_QUOTE_TRANSFER', confidence: 'STRONG',
+      evidence_count: 1, quote_totals: [],
+      first_observed_cursor: toJsonValue({
+        slot: 10n, transactionIndex: 0, instructionIndex: 1,
+        innerInstructionIndex: null,
+      }),
+      last_observed_cursor: toJsonValue({
+        slot: 10n, transactionIndex: 0, instructionIndex: 1,
+        innerInstructionIndex: null,
+      }),
+      input_fingerprint: inputFingerprint,
+    };
+  });
+  const clusterCount = family === 'clusters'
+    ? WALLET_CLUSTER_ROW_MAXIMUM
+    : family === 'members' ? WALLET_MEMBER_ROW_MAXIMUM
+      / WALLET_MEMBERS_PER_CLUSTER_MAXIMUM : 0;
+  const membersPerCluster = family === 'members'
+    ? WALLET_MEMBERS_PER_CLUSTER_MAXIMUM
+    : 2;
+  const clusterRows: Record<string, unknown>[] = [];
+  const memberRows: Record<string, unknown>[] = [];
+  for (let clusterIndex = 0; clusterIndex < clusterCount; clusterIndex += 1) {
+    const wallets = Array.from({ length: membersPerCluster }, (_, memberIndex) => (
+      `wallet-${String(clusterIndex).padStart(3, '0')}-${String(memberIndex).padStart(3, '0')}`
+    ));
+    const clusterId = createWalletClusterId('mint', wallets);
+    clusterRows.push({
+      cluster_id: clusterId, mint: 'mint', input_fingerprint: inputFingerprint,
+      participant_wallet_count: wallets.length, auxiliary_wallet_count: 0,
+      positive_holder_count: 0, observed_positive_base_raw: '0', concentration_bps: '0',
+      contains_creator: false, shared_funder_count: 0, strong_relationship_count: 0,
+      strong_evidence_count: 0, quote_assets: [],
+    });
+    memberRows.push(...wallets.map((wallet, memberIndex) => ({
+      cluster_id: clusterId, wallet, member_role: 'PARTICIPANT', is_creator: false,
+      observed_net_base_raw: '0', input_fingerprint: inputFingerprint,
+      cluster_member_ordinal: memberIndex + 1,
+    })));
+  }
+  const confirmationCounts = { processed: 0, confirmed: 1, finalized: 0 };
+  const graphRow = {
+    ...evidence.graphRow,
+    strong_relationship_count: relationshipRows.length,
+    cluster_count: clusterRows.length,
+    graph_event_payload: toJsonValue({
+      inputFingerprint,
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+      coverage: evidence.graphRow.coverage,
+      strongRelationshipCount: relationshipRows.length,
+      mediumRelationshipCount: 0,
+      clusterCount: clusterRows.length,
+      maximumClusterBps: 0n,
+      creatorClusterCount: 0,
+      confirmationCounts,
+    }),
+  };
+  return {
+    ...evidence,
+    graphRow,
+    relationshipRows,
+    clusterRows,
+    memberRows,
+  };
+}
+
+function analyticsPool(
+  evidence: ReturnType<typeof analyticsFixture>,
+  graphRow: Record<string, unknown> = evidence.graphRow,
+): ScriptedPool {
+  return new ScriptedPool((text) => {
+    if (text.includes('qualification_launch')) return rows([launchRow()]);
+    if (text.includes('qualification_as_of')) return rows([asOfRow()]);
+    if (text.includes('qualification_creator')) return rows([evidence.profileRow]);
+    if (text.includes('qualification_holders')) return rows([evidence.holderRow]);
+    if (text.includes('qualification_graph */')) return rows([graphRow]);
+    return rows([]);
+  });
 }
 
 function qualificationService(): QualificationRebuildService {

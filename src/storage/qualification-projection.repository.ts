@@ -31,6 +31,7 @@ import {
   assertValidWalletGraphAnalysis,
   type WalletCluster,
   type WalletGraphAnalysis,
+  type WalletGraphConfirmationCounts,
   type WalletGraphCoverage,
   type WalletRelationship,
 } from '../domain/wallet-graph.js';
@@ -59,6 +60,14 @@ export interface QualificationProjectionPool {
 export interface QualificationProjectionAuthority {
   reauthorize(projection: CanonicalQualificationProjection): unknown;
 }
+
+const SOCIAL_LINK_ROW_MAXIMUM = 3;
+const SOCIAL_OBSERVATION_ROW_MAXIMUM = 3;
+const SOCIAL_EVIDENCE_ROW_MAXIMUM = 64;
+const WALLET_RELATIONSHIP_ROW_MAXIMUM = 1_000;
+const WALLET_CLUSTER_ROW_MAXIMUM = 256;
+const WALLET_MEMBER_ROW_MAXIMUM = 1_024;
+const WALLET_MEMBERS_PER_CLUSTER_MAXIMUM = 256;
 
 export class QualificationProjectionDataError extends Error {
   public constructor(message = 'Stored qualification projection data is invalid.') {
@@ -342,7 +351,8 @@ implements QualificationProjectionTransaction {
       `SELECT /* qualification_graph */ graph.input_fingerprint,
           graph.participant_input_fingerprint,graph.methodology,
           graph.graph_event_id,graph.confirmation_status,graph.coverage,
-          graph.confirmation_counts,
+          graph.confirmation_counts,event.payload_version AS graph_event_payload_version,
+          event.payload AS graph_event_payload,
           graph.strong_relationship_count,graph.medium_relationship_count,
           graph.cluster_count,graph.maximum_cluster_bps::text,
           graph.creator_cluster_count
@@ -387,11 +397,7 @@ implements QualificationProjectionTransaction {
          AND event.instruction_index=graph.as_of_instruction_index
          AND event.inner_instruction_index
            IS NOT DISTINCT FROM graph.as_of_inner_instruction_index
-         AND event.observed_at=graph.observed_at
-         AND event.payload->>'inputFingerprint'=graph.input_fingerprint
-         AND event.payload->>'methodology'=graph.methodology
-         AND event.payload->'coverage'=graph.coverage
-         AND event.payload->'confirmationCounts'=graph.confirmation_counts`,
+         AND event.observed_at=graph.observed_at`,
       [mint, participantInputFingerprint],
     );
     const walletGraph = graphResult.rows[0] === undefined
@@ -425,25 +431,28 @@ implements QualificationProjectionTransaction {
       `SELECT /* qualification_social_links */ link_id,mint,metadata_snapshot_id,
           link_kind,declared_value_sha256,syntax_status,canonical_url,
           invalid_reason,observed_at
-       FROM social_links WHERE collection_id=$1 ORDER BY link_kind,link_id`,
-      [collectionId],
+       FROM social_links WHERE collection_id=$1 ORDER BY link_kind,link_id LIMIT $2`,
+      [collectionId, SOCIAL_LINK_ROW_MAXIMUM + 1],
     );
     const observationResult = await this.client.query(
       `SELECT /* qualification_social_observations */ observation_id,link_id,outcome,
           final_canonical_url,http_status,redirect_count,content_sha256,
           failure_reason,observed_at
        FROM social_http_observations
-       WHERE collection_id=$1 ORDER BY observation_id`,
-      [collectionId],
+       WHERE collection_id=$1 ORDER BY observation_id LIMIT $2`,
+      [collectionId, SOCIAL_OBSERVATION_ROW_MAXIMUM + 1],
     );
     const evidenceResult = await this.client.query(
       `SELECT /* qualification_social_verification */ evidence_id,mint,link_id,
           observation_id,evidence_type,outcome,subject_kind,related_kind,
           reason_code,observed_at
        FROM social_verification_evidence
-       WHERE collection_id=$1 ORDER BY evidence_type,evidence_id`,
-      [collectionId],
+       WHERE collection_id=$1 ORDER BY evidence_type,evidence_id LIMIT $2`,
+      [collectionId, SOCIAL_EVIDENCE_ROW_MAXIMUM + 1],
     );
+    assertBoundedRows(linkResult.rows, SOCIAL_LINK_ROW_MAXIMUM);
+    assertBoundedRows(observationResult.rows, SOCIAL_OBSERVATION_ROW_MAXIMUM);
+    assertBoundedRows(evidenceResult.rows, SOCIAL_EVIDENCE_ROW_MAXIMUM);
     const collection = createSocialCollection(Object.freeze({
       mint: text(collectionRow.mint),
       sourceLaunchEventId: text(collectionRow.source_launch_event_id),
@@ -479,8 +488,8 @@ implements QualificationProjectionTransaction {
           left_wallet,right_wallet,relationship_type,confidence,evidence_count,
           quote_totals,first_observed_cursor,last_observed_cursor,input_fingerprint
        FROM wallet_relationships
-       WHERE mint=$1 AND input_fingerprint=$2 ORDER BY relationship_id`,
-      [mint, inputFingerprint],
+       WHERE mint=$1 AND input_fingerprint=$2 ORDER BY relationship_id LIMIT $3`,
+      [mint, inputFingerprint, WALLET_RELATIONSHIP_ROW_MAXIMUM + 1],
     );
     const clusterResult = await this.client.query(
       `SELECT /* qualification_graph_clusters */ cluster_id,mint,input_fingerprint,
@@ -488,16 +497,34 @@ implements QualificationProjectionTransaction {
           observed_positive_base_raw::text,concentration_bps::text,contains_creator,
           shared_funder_count,strong_relationship_count,strong_evidence_count,quote_assets
        FROM wallet_clusters
-       WHERE mint=$1 AND input_fingerprint=$2 ORDER BY cluster_id`,
-      [mint, inputFingerprint],
+       WHERE mint=$1 AND input_fingerprint=$2 ORDER BY cluster_id LIMIT $3`,
+      [mint, inputFingerprint, WALLET_CLUSTER_ROW_MAXIMUM + 1],
     );
     const memberResult = await this.client.query(
       `SELECT /* qualification_graph_members */ cluster_id,wallet,member_role,
-          is_creator,observed_net_base_raw::text,input_fingerprint
-       FROM wallet_cluster_members
-       WHERE mint=$1 AND input_fingerprint=$2 ORDER BY cluster_id,wallet`,
-      [mint, inputFingerprint],
+          is_creator,observed_net_base_raw::text,input_fingerprint,
+          cluster_member_ordinal
+       FROM (
+         SELECT cluster_id,wallet,member_role,is_creator,observed_net_base_raw,
+           input_fingerprint,
+           ROW_NUMBER() OVER (PARTITION BY cluster_id ORDER BY wallet)
+             AS cluster_member_ordinal
+         FROM wallet_cluster_members
+         WHERE mint=$1 AND input_fingerprint=$2
+       ) AS ranked_members
+       WHERE cluster_member_ordinal <= $4
+       ORDER BY cluster_id,wallet LIMIT $3`,
+      [
+        mint,
+        inputFingerprint,
+        WALLET_MEMBER_ROW_MAXIMUM + 1,
+        WALLET_MEMBERS_PER_CLUSTER_MAXIMUM + 1,
+      ],
     );
+    assertBoundedRows(relationshipResult.rows, WALLET_RELATIONSHIP_ROW_MAXIMUM);
+    assertBoundedRows(clusterResult.rows, WALLET_CLUSTER_ROW_MAXIMUM);
+    assertBoundedRows(memberResult.rows, WALLET_MEMBER_ROW_MAXIMUM);
+    assertBoundedClusterMembers(memberResult.rows);
     const members = membersByCluster(memberResult.rows, inputFingerprint);
     const relationships = Object.freeze(relationshipResult.rows.map((row) => (
       relationshipFromRow(row, mint, inputFingerprint)
@@ -508,7 +535,7 @@ implements QualificationProjectionTransaction {
     if ([...members.keys()].some((clusterId) =>
       !clusters.some((cluster) => cluster.id === clusterId))) throw invalid();
     const coverage = coverageFromJson(graphRow.coverage);
-    confirmationCountsFromJson(graphRow.confirmation_counts);
+    const confirmationCounts = confirmationCountsFromJson(graphRow.confirmation_counts);
     const graph = Object.freeze({ relationships, clusters, coverage });
     assertValidWalletGraphAnalysis(graph);
     const strongCount = relationships.filter((item) => item.confidence === 'STRONG').length;
@@ -519,6 +546,7 @@ implements QualificationProjectionTransaction {
         : maximum,
       0n,
     );
+    const creatorClusterCount = clusters.filter((cluster) => cluster.containsCreator).length;
     if (
       graphRow.methodology !== 'OBSERVED_PUMPFUN_TRANSACTIONS'
       || confirmation(graphRow.confirmation_status) === 'orphaned'
@@ -526,9 +554,19 @@ implements QualificationProjectionTransaction {
       || index(graphRow.medium_relationship_count) !== mediumCount
       || index(graphRow.cluster_count) !== clusters.length
       || unsignedBigInt(graphRow.maximum_cluster_bps) !== maximumClusterBps
-      || index(graphRow.creator_cluster_count)
-        !== clusters.filter((cluster) => cluster.containsCreator).length
+      || index(graphRow.creator_cluster_count) !== creatorClusterCount
     ) throw invalid();
+    assertGraphEventPayload(graphRow, Object.freeze({
+      inputFingerprint,
+      methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS',
+      coverage,
+      strongRelationshipCount: strongCount,
+      mediumRelationshipCount: mediumCount,
+      clusterCount: clusters.length,
+      maximumClusterBps,
+      creatorClusterCount,
+      confirmationCounts,
+    }));
     return graph;
   }
 
@@ -1086,6 +1124,21 @@ function clusterFromRow(
   });
 }
 
+function assertBoundedRows(
+  rows: readonly Record<string, unknown>[],
+  maximum: number,
+): void {
+  if (rows.length > maximum) throw invalid();
+}
+
+function assertBoundedClusterMembers(rows: readonly Record<string, unknown>[]): void {
+  for (const row of rows) {
+    if (positiveIndex(row.cluster_member_ordinal) > WALLET_MEMBERS_PER_CLUSTER_MAXIMUM) {
+      throw invalid();
+    }
+  }
+}
+
 function membersByCluster(
   rows: readonly Record<string, unknown>[],
   inputFingerprint: string,
@@ -1122,12 +1175,46 @@ function coverageFromJson(value: unknown): WalletGraphCoverage {
   return Object.freeze(result) as unknown as WalletGraphCoverage;
 }
 
-function confirmationCountsFromJson(value: unknown): void {
+function confirmationCountsFromJson(value: unknown): WalletGraphConfirmationCounts {
   const decoded = record(decodeJson(value));
   exactKeys(decoded, ['processed', 'confirmed', 'finalized']);
-  index(decoded.processed);
-  index(decoded.confirmed);
-  index(decoded.finalized);
+  return Object.freeze({
+    processed: index(decoded.processed),
+    confirmed: index(decoded.confirmed),
+    finalized: index(decoded.finalized),
+  });
+}
+
+const GRAPH_EVENT_PAYLOAD_FIELDS = [
+  'inputFingerprint',
+  'methodology',
+  'coverage',
+  'strongRelationshipCount',
+  'mediumRelationshipCount',
+  'clusterCount',
+  'maximumClusterBps',
+  'creatorClusterCount',
+  'confirmationCounts',
+] as const;
+
+function assertGraphEventPayload(
+  row: Readonly<Record<string, unknown>>,
+  expected: Readonly<{
+    inputFingerprint: string;
+    methodology: 'OBSERVED_PUMPFUN_TRANSACTIONS';
+    coverage: WalletGraphCoverage;
+    strongRelationshipCount: number;
+    mediumRelationshipCount: number;
+    clusterCount: number;
+    maximumClusterBps: bigint;
+    creatorClusterCount: number;
+    confirmationCounts: WalletGraphConfirmationCounts;
+  }>,
+): void {
+  if (positiveIndex(row.graph_event_payload_version) !== 1) throw invalid();
+  const payload = record(decodeJson(row.graph_event_payload));
+  exactKeys(payload, GRAPH_EVENT_PAYLOAD_FIELDS);
+  if (canonicalStringifyJson(payload) !== canonicalStringifyJson(expected)) throw invalid();
 }
 
 function quoteAssetFromJson(value: unknown): QuoteAsset {
