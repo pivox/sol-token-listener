@@ -5,6 +5,7 @@ import {
   checkDeploymentHealth,
 } from '../src/operations/deployment-healthcheck.js';
 import {
+  DEPLOYMENT_HEALTHCHECK_EXIT_CODES,
   deploymentHealthcheckUrl,
   runDeploymentHealthcheckCli,
 } from '../scripts/deployment-healthcheck.js';
@@ -144,6 +145,19 @@ void test('constructs the exact loopback URL from a canonical API_PORT and retur
     check: async () => undefined,
   }), 2);
   assert.deepEqual(writes, ['{"event":"deployment.healthcheck","code":"HEALTHCHECK_PORT_INVALID"}\n']);
+});
+
+void test('returns the documented healthy exit code without writing stdout, stderr, or logs', async () => {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const logs: string[] = [];
+  const exitCode = await runDeploymentHealthcheckCli({
+    environment: { API_PORT: '3000' },
+    write: (line) => { logs.push(line); },
+    check: async (url) => checkDeploymentHealth(url, { fetch: async () => healthResponse('OK') }),
+  });
+  assert.equal(exitCode, DEPLOYMENT_HEALTHCHECK_EXIT_CODES.HEALTHY);
+  assert.deepEqual({ stdout, stderr, logs }, { stdout: [], stderr: [], logs: [] });
 });
 
 function healthResponse(status: 'OK' | 'DEGRADED', postgresql = 'AVAILABLE'): Response {

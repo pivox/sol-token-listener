@@ -6,6 +6,18 @@ import {
   type DeploymentHealthcheckCode,
 } from '../src/operations/deployment-healthcheck.js';
 
+/**
+ * Process exit contract for the deployment health probe:
+ * - 0: the health envelope is accepted; the command stays silent.
+ * - 1: a runtime probe failure; one stable, redacted JSON line is emitted.
+ * - 2: an invalid API_PORT; one stable, redacted JSON line is emitted.
+ */
+export const DEPLOYMENT_HEALTHCHECK_EXIT_CODES = Object.freeze({
+  HEALTHY: 0,
+  PROBE_FAILED: 1,
+  API_PORT_INVALID: 2,
+} as const);
+
 export interface DeploymentHealthcheckCliOptions {
   readonly environment: NodeJS.ProcessEnv;
   readonly write: (line: string) => void;
@@ -31,14 +43,14 @@ export async function runDeploymentHealthcheckCli(options: DeploymentHealthcheck
     url = deploymentHealthcheckUrl(options.environment);
   } catch (error: unknown) {
     writeResult(options.write, codeOf(error, 'HEALTHCHECK_PORT_INVALID'));
-    return 2;
+    return DEPLOYMENT_HEALTHCHECK_EXIT_CODES.API_PORT_INVALID;
   }
   try {
     await options.check(url);
-    return 0;
+    return DEPLOYMENT_HEALTHCHECK_EXIT_CODES.HEALTHY;
   } catch (error: unknown) {
     writeResult(options.write, codeOf(error, 'HEALTHCHECK_REQUEST_FAILED'));
-    return 1;
+    return DEPLOYMENT_HEALTHCHECK_EXIT_CODES.PROBE_FAILED;
   }
 }
 
