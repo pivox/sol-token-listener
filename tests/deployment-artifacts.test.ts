@@ -7,6 +7,8 @@ const nodeImage =
   'node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94';
 const nginxImage =
   'nginxinc/nginx-unprivileged:1.30.4-alpine@sha256:44e36330f74d4f3a1d4e222acca9e23b401fb87811a7597024502bb759c4dd49';
+const postgresImage =
+  'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3';
 
 async function readArtifact(path: string): Promise<string> {
   return (await readFile(new URL(path, root), 'utf8')).replaceAll('\r\n', '\n');
@@ -21,6 +23,15 @@ function stage(source: string, name: string): string {
   assert.ok(current?.index !== undefined);
   const next = stages[index + 1];
   return source.slice(current.index, next?.index ?? source.length);
+}
+
+function composeService(source: string, name: string): string {
+  const marker = `  ${name}:\n`;
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `missing Compose service ${name}`);
+  const rest = source.slice(start + marker.length);
+  const next = rest.search(/^ {2}[a-z][a-z-]*:\s*$/m);
+  return source.slice(start, next === -1 ? source.length : start + marker.length + next);
 }
 
 void test('Dockerfile pins reviewed images and builds exact workspace artifacts', async () => {
@@ -161,4 +172,63 @@ void test('Nginx serves the SPA with bounded caching and proxies only the read-o
 
   assert.doesNotMatch(nginx, /Access-Control-Allow-Credentials/i);
   assert.doesNotMatch(nginx, /websocket|proxy_set_header\s+Upgrade|\/live(?:\W|$)/i);
+});
+
+void test('Compose defines an observe-only, five-service deployment without exposed database or backend', async () => {
+  const compose = await readArtifact('deploy/compose.yaml');
+
+  assert.match(compose, /^services:\s*$/m);
+  const networksOffset = compose.indexOf('\nnetworks:');
+  assert.notEqual(networksOffset, -1, 'missing networks section');
+  const services = compose.slice(0, networksOffset);
+  const serviceNames = [...services.matchAll(/^ {2}([a-z][a-z-]*):\s*$/gm)]
+    .map((match) => match[1])
+    .filter((name): name is string => name !== undefined);
+  assert.deepEqual(serviceNames, ['postgres', 'migrate', 'app', 'retention', 'frontend']);
+  assert.match(compose, new RegExp(`^    image: ${postgresImage.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+  assert.match(compose, /^ {4}ports:\s*\["127\.0\.0\.1:\$\{FRONTEND_PORT:-8080\}:8080"\]\s*$/m);
+  assert.equal((compose.match(/^ {4}ports:/gm) ?? []).length, 1);
+  assert.match(compose, /^ {2}EXECUTION_MODE: observe$/m);
+  assert.match(compose, /^ {2}POSTGRES_AUTO_MIGRATE: "false"$/m);
+  assert.match(compose, /^ {6}API_HOST: 0\.0\.0\.0$/m);
+  assert.match(compose, /^ {6}API_PORT: "3000"$/m);
+  assert.match(compose, /^ {4}init: true$/m);
+  assert.match(compose, /^ {4}stop_grace_period: 40s$/m);
+  assert.match(compose, /^ {6}test: \["CMD", "node", "dist\/scripts\/deployment-healthcheck\.js"\]$/m);
+  assert.match(compose, /^ {4}command: \["node", "dist\/scripts\/migrate\.js"\]$/m);
+  assert.match(compose, /^ {4}command: \["node", "dist\/scripts\/purge-retained-data\.js"\]$/m);
+  assert.equal((compose.match(/depends_on:\s*\n {6}migrate:\s*\n {8}condition: service_completed_successfully/g) ?? []).length, 2);
+  assert.match(compose, /depends_on:\s*\n {6}postgres:\s*\n {8}condition: service_healthy/);
+  assert.match(compose, /depends_on:\s*\n {6}app:\s*\n {8}condition: service_healthy/);
+  assert.match(composeService(compose, 'postgres'), /^ {4}networks: \[internal\]$/m);
+  assert.match(composeService(compose, 'migrate'), /^ {4}networks: \[internal\]$/m);
+  assert.match(composeService(compose, 'app'), /^ {4}networks: \[internal, application\]$/m);
+  assert.match(composeService(compose, 'retention'), /^ {4}networks: \[internal, application\]$/m);
+  assert.match(composeService(compose, 'frontend'), /^ {4}networks: \[application\]$/m);
+  assert.match(compose, /^ {4}volumes: \["postgres-data:\/var\/lib\/postgresql\/data"\]$/m);
+  assert.match(compose, /^networks:\s*\n {2}internal:\s*\n {4}internal: true\s*\n {2}application:$/m);
+  assert.match(compose, /^volumes:\s*\n {2}postgres-data:$/m);
+  assert.doesNotMatch(compose, /privileged:|network_mode: host|docker\.sock|PRIVATE_KEY|SECRET_KEY|WALLET/i);
+  assert.doesNotMatch(compose, /EXECUTION_MODE:\s*\$\{|POSTGRES_AUTO_MIGRATE:\s*\$\{/);
+  assert.doesNotMatch(compose, /^ {4}image: [^\n@]+:[^\n@]+$/m);
+});
+
+void test('Compose environment template contains documentation-only required inputs', async () => {
+  const environment = await readArtifact('deploy/env.example');
+
+  for (const value of [
+    'POSTGRES_DB=sol_token_listener',
+    'POSTGRES_USER=sol_token_listener',
+    'POSTGRES_PASSWORD=replace-with-a-secret',
+    'SOLANA_HTTP_RPC_URL=https://rpc-provider.invalid',
+    'SOLANA_WS_RPC_URL=wss://rpc-provider.invalid',
+    'FRONTEND_PORT=8080',
+    'LISTENER_ENABLED=true',
+    'RETENTION_PURGE_INTERVAL_MS=900000',
+  ]) {
+    assert.ok(environment.includes(value), `missing deploy environment value: ${value}`);
+  }
+  assert.match(environment, /outside version control/i);
+  assert.match(environment, /must be replaced/i);
+  assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/i);
 });

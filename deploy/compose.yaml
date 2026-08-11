@@ -1,0 +1,97 @@
+x-runtime-environment: &runtime-environment
+  DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+  SOLANA_HTTP_RPC_URL: ${SOLANA_HTTP_RPC_URL:?SOLANA_HTTP_RPC_URL is required}
+  SOLANA_WS_RPC_URL: ${SOLANA_WS_RPC_URL:?SOLANA_WS_RPC_URL is required}
+  EXECUTION_MODE: observe
+  POSTGRES_AUTO_MIGRATE: "false"
+
+services:
+  postgres:
+    image: postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    networks: [internal]
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: backend
+    command: ["node", "dist/scripts/migrate.js"]
+    environment: *runtime-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+    restart: "no"
+
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: backend
+    environment:
+      <<: *runtime-environment
+      API_HOST: 0.0.0.0
+      API_PORT: "3000"
+      LISTENER_ENABLED: ${LISTENER_ENABLED:-true}
+    init: true
+    stop_grace_period: 40s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "dist/scripts/deployment-healthcheck.js"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks: [internal, application]
+    restart: unless-stopped
+
+  retention:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: backend
+    command: ["node", "dist/scripts/purge-retained-data.js"]
+    environment:
+      <<: *runtime-environment
+      RETENTION_PURGE_INTERVAL_MS: ${RETENTION_PURGE_INTERVAL_MS:-900000}
+    init: true
+    stop_grace_period: 40s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [internal, application]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: frontend
+    depends_on:
+      app:
+        condition: service_healthy
+    ports: ["127.0.0.1:${FRONTEND_PORT:-8080}:8080"]
+    networks: [application]
+    restart: unless-stopped
+
+networks:
+  internal:
+    internal: true
+  application:
+
+volumes:
+  postgres-data:
