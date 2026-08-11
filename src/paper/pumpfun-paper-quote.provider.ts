@@ -11,7 +11,7 @@ import {
   type BondingCurve,
   type FeeConfig,
   type Global,
-} from '@pump-fun/pump-sdk';
+} from '../launchpads/pumpfun/official-sdk.js';
 import { PublicKey, type AccountInfo } from '@solana/web3.js';
 import BN from 'bn.js';
 import type { PaperExecutionQuote } from '../domain/paper-trading.js';

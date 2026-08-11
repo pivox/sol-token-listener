@@ -6,7 +6,7 @@ import {
 import {
   PUMP_FEE_PROGRAM_ID as OFFICIAL_PUMP_FEE_PROGRAM_ID,
   PUMP_PROGRAM_ID as OFFICIAL_PUMP_PROGRAM_ID,
-} from '@pump-fun/pump-sdk';
+} from './official-sdk.js';
 
 export const PUMP_PROGRAM_ID =
   OFFICIAL_PUMP_PROGRAM_ID.toBase58();

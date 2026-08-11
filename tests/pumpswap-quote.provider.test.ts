@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import BN from 'bn.js';
-import { buyQuoteInput, sellBaseInput } from '@pump-fun/pump-swap-sdk';
-import type { GlobalConfig } from '@pump-fun/pump-swap-sdk';
+import {
+  buyQuoteInput,
+  sellBaseInput,
+  type GlobalConfig,
+} from '../src/markets/pumpswap/official-sdk.js';
 import type { RawMint } from '@solana/spl-token';
 import { PublicKey } from '@solana/web3.js';
 import type {
