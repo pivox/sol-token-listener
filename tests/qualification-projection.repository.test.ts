@@ -56,6 +56,7 @@ void test('acquires a session mint lock before repeatable read and always unlock
   assert.equal(database.queries.at(-2)?.text, 'COMMIT');
   assert.match(database.queries.at(-1)?.text ?? '', /pg_advisory_unlock/u);
   assert.equal(database.released, true);
+  assert.deepEqual(database.releaseArguments, [undefined]);
 });
 
 void test('rolls back and releases without leaking database causes', async () => {
@@ -99,6 +100,10 @@ void test('redacts rollback and unlock failures while releasing the connection',
     },
   );
   assert.equal(database.released, true);
+  const eviction = database.releaseArguments[0];
+  assert.ok(eviction instanceof Error);
+  assert.equal(eviction.message, 'Qualification projection session lock eviction required.');
+  assert.doesNotMatch(eviction.message, /password/u);
 });
 
 void test('does not unlock when session lock acquisition fails', async () => {
@@ -130,6 +135,35 @@ void test('treats a false session unlock result as a cleanup failure', async () 
     QualificationProjectionRepositoryError,
   );
   assert.equal(database.released, true);
+  const eviction = database.releaseArguments[0];
+  assert.ok(eviction instanceof Error);
+  assert.equal(eviction.message, 'Qualification projection session lock eviction required.');
+});
+
+void test('aggregates and redacts an eviction release failure', async () => {
+  const database = new ScriptedPool(
+    (text) => {
+      if (text.includes('pg_advisory_unlock')) throw new Error('unlock-password');
+      return undefined;
+    },
+    () => { throw new Error('release-password'); },
+  );
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', async () => { throw new Error('primary-password'); }),
+    (error: unknown) => {
+      assert.ok(error instanceof QualificationProjectionRepositoryError);
+      assert.ok(error.cause instanceof AggregateError);
+      assert.equal(error.cause.errors.length, 3);
+      assert.doesNotMatch(error.message, /password/u);
+      assert.doesNotMatch(JSON.stringify(error.cause), /password/u);
+      return true;
+    },
+  );
+  const eviction = database.releaseArguments[0];
+  assert.ok(eviction instanceof Error);
+  assert.doesNotMatch(eviction.message, /password/u);
 });
 
 void test('rejects empty and mismatched mints', async () => {
@@ -1048,6 +1082,7 @@ interface QueryCall {
 
 class ScriptedPool {
   public readonly queries: QueryCall[] = [];
+  public readonly releaseArguments: (Error | boolean | undefined)[] = [];
   public released = false;
 
   public constructor(
@@ -1055,6 +1090,7 @@ class ScriptedPool {
       readonly rows: readonly Record<string, unknown>[];
       readonly rowCount: number | null;
     } | undefined = () => undefined,
+    private readonly releaseClient: (error?: Error | boolean) => void = () => undefined,
   ) {}
 
   public async connect() {
@@ -1071,7 +1107,11 @@ class ScriptedPool {
           ? { rows: [], rowCount: 1 }
           : rows([]);
       },
-      release: () => { this.released = true; },
+      release: (error?: Error | boolean) => {
+        this.released = true;
+        this.releaseArguments.push(error);
+        this.releaseClient(error);
+      },
     };
   }
 }

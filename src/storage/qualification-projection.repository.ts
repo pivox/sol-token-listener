@@ -50,7 +50,7 @@ interface QueryResult {
 
 interface QualificationProjectionClient {
   query(text: string, values?: readonly unknown[]): Promise<QueryResult>;
-  release(): void;
+  release(error?: Error | boolean): void;
 }
 
 export interface QualificationProjectionPool {
@@ -70,6 +70,8 @@ const WALLET_MEMBER_ROW_MAXIMUM = 1_024;
 const WALLET_MEMBERS_PER_CLUSTER_MAXIMUM = 256;
 const WALLET_FUNDING_EVIDENCE_ROW_MAXIMUM = 4_096;
 const DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM = 1_048_576;
+const QUALIFICATION_LOCK_EVICTION_MESSAGE =
+  'Qualification projection session lock eviction required.';
 
 export class QualificationProjectionDataError extends Error {
   public constructor(message = 'Stored qualification projection data is invalid.') {
@@ -112,6 +114,7 @@ implements QualificationProjectionRepository {
     let completed = false;
     let result: TResult | undefined;
     let primaryFailure: unknown;
+    let evictClient = false;
     const failures: unknown[] = [];
     try {
       await client.query(
@@ -149,12 +152,18 @@ implements QualificationProjectionRepository {
           );
           if (unlocked.rows[0]?.pg_advisory_unlock !== true) {
             failures.push(new Error('Qualification projection session lock was not released.'));
+            evictClient = true;
           }
         } catch (unlockFailure: unknown) {
           failures.push(unlockFailure);
+          evictClient = true;
         }
       }
-      try { client.release(); } catch { /* connection is already unusable */ }
+      try {
+        client.release(evictClient ? new Error(QUALIFICATION_LOCK_EVICTION_MESSAGE) : undefined);
+      } catch (releaseFailure: unknown) {
+        failures.push(releaseFailure);
+      }
     }
     if (failures.length !== 0) {
       if (failures.length === 1 && primaryFailure instanceof QualificationProjectionDataError) {
