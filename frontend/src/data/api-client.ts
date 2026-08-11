@@ -21,10 +21,10 @@ import type {
   ApiTimelineEntry,
 } from './api-schemas.js';
 import { ApiContractError, ApiHttpError, ApiNetworkError } from './api-errors.js';
+import { isSolanaPublicKey } from './solana-address.js';
 
 const DEFAULT_TIMEOUT_MS = 8_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
-const mintPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/u;
 
 export { ApiContractError, ApiHttpError, ApiNetworkError } from './api-errors.js';
 
@@ -77,39 +77,48 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
       requestController.abort(signal?.reason);
     };
     signal?.addEventListener('abort', propagateAbort, { once: true });
-    let response: Response;
     try {
-      response = await fetchFn(new URL(route.replace(/^\/+/, ''), baseUrl), {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-        signal: requestController.signal,
-      });
-    } catch (error) {
-      if (didAbort(signal)) throw signal?.reason;
-      throw new ApiNetworkError(error);
+      let response: Response;
+      try {
+        response = await fetchFn(new URL(route.replace(/^\/+/, ''), baseUrl), {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          signal: requestController.signal,
+        });
+      } catch (error) {
+        if (didAbort(signal)) throw signal?.reason;
+        throw new ApiNetworkError(error);
+      }
+
+      let decoded: unknown;
+      try {
+        decoded = await readJson(response, route, maxResponseBytes);
+      } catch (error) {
+        if (didAbort(signal)) throw signal?.reason;
+        if (requestController.signal.aborted) throw new ApiNetworkError(error);
+        throw error;
+      }
+      if (!response.ok) {
+        const failure = apiFailureSchema.safeParse(decoded);
+        if (!failure.success) {
+          throw new ApiHttpError(response.status, 'INTERNAL_ERROR', 'La requête API a échoué.');
+        }
+        throw new ApiHttpError(
+          response.status,
+          failure.data.error.code,
+          failure.data.error.message,
+          failure.data.error.correlationId,
+        );
+      }
+      const parsed = schema.safeParse(decoded);
+      if (!parsed.success) {
+        throw new ApiContractError(route, parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`));
+      }
+      return parsed.data;
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener('abort', propagateAbort);
     }
-
-    const decoded = await readJson(response, route, maxResponseBytes);
-    if (!response.ok) {
-      const failure = apiFailureSchema.safeParse(decoded);
-      if (!failure.success) {
-        throw new ApiHttpError(response.status, 'INTERNAL_ERROR', 'La requête API a échoué.');
-      }
-      throw new ApiHttpError(
-        response.status,
-        failure.data.error.code,
-        failure.data.error.message,
-        failure.data.error.correlationId,
-      );
-    }
-    const parsed = schema.safeParse(decoded);
-    if (!parsed.success) {
-      throw new ApiContractError(route, parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`));
-    }
-    return parsed.data;
   }
 
   function pageRoute(route: string, input: PageInput = {}): string {
@@ -121,7 +130,7 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
   }
 
   function mintRoute(mint: string, suffix = ''): string {
-    if (!mintPattern.test(mint)) throw new ApiContractError(suffix || '/api/v1/launches/:mint', ['mint: invalid']);
+    if (!isSolanaPublicKey(mint)) throw new ApiContractError(suffix || '/api/v1/launches/:mint', ['mint: invalid']);
     return `/api/v1/launches/${encodeURIComponent(mint)}${suffix}`;
   }
 
@@ -171,15 +180,20 @@ async function readJson(response: Response, route: string, maximumBytes: number)
   if (reader === undefined) throw new ApiContractError(route, ['response: empty']);
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let consumed = false;
   try {
     for (;;) {
       const chunk = await reader.read();
-      if (chunk.done) break;
+      if (chunk.done) {
+        consumed = true;
+        break;
+      }
       total += chunk.value.byteLength;
       if (total > maximumBytes) throw new ApiContractError(route, ['response: too large']);
       chunks.push(chunk.value);
     }
   } finally {
+    if (!consumed) void reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
   const bytes = new Uint8Array(total);

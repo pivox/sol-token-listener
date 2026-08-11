@@ -17,6 +17,7 @@ const HOLDER_EVENTS = new Set<ApiSseEvent['type']>([
   'CreatorProfileUpdated', 'HolderDistributionUpdated', 'WalletClusterDetected',
 ]);
 const PAPER_EVENTS = new Set<ApiSseEvent['type']>([
+  'PaperStrategySessionUpdated', 'PaperExternalBuyCounted',
   'PaperPositionOpened', 'PaperPositionUpdated', 'PaperPositionClosed',
 ]);
 

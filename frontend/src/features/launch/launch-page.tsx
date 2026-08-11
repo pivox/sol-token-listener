@@ -5,13 +5,13 @@ import { ErrorState, LoadingState } from '../../components/async-state.js';
 import { ApiHttpError } from '../../data/api-errors.js';
 import { launchQuery } from '../../data/queries.js';
 import { useApiClient } from '../../data/use-api-client.js';
+import { isSolanaPublicKey } from '../../data/solana-address.js';
 import { HoldersPanel } from './holders-panel.js';
 import { OverviewPanel } from './overview-panel.js';
 import { RiskPanel } from './risk-panel.js';
 import { SocialPanel } from './social-panel.js';
 import { TimelinePanel } from './timeline-panel.js';
 
-const mintPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/u;
 const tabs = ['overview', 'timeline', 'risk', 'social', 'holders'] as const;
 type Tab = (typeof tabs)[number];
 const labels: Readonly<Record<Tab, string>> = {
@@ -20,7 +20,7 @@ const labels: Readonly<Record<Tab, string>> = {
 
 export function LaunchPage(): ReactNode {
   const mint = useParams().mint ?? '';
-  const validMint = mintPattern.test(mint);
+  const validMint = isSolanaPublicKey(mint);
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get('tab');
   const activeTab: Tab = tabs.includes(requestedTab as Tab) ? requestedTab as Tab : 'overview';
@@ -32,6 +32,21 @@ export function LaunchPage(): ReactNode {
     return <ErrorState>Fiche du lancement indisponible.</ErrorState>;
   }
   const launch = query.data;
+  const selectTab = (tab: Tab): void => {
+    setSearchParams(tab === 'overview' ? {} : { tab });
+  };
+  const moveTab = (event: React.KeyboardEvent<HTMLButtonElement>, tab: Tab): void => {
+    const current = tabs.indexOf(tab);
+    const target = event.key === 'ArrowRight' ? tabs[(current + 1) % tabs.length]
+      : event.key === 'ArrowLeft' ? tabs[(current - 1 + tabs.length) % tabs.length]
+        : event.key === 'Home' ? tabs[0]
+          : event.key === 'End' ? tabs[tabs.length - 1]
+            : undefined;
+    if (target === undefined) return;
+    event.preventDefault();
+    selectTab(target);
+    document.getElementById(`launch-tab-${target}`)?.focus();
+  };
   return (
     <article>
       <header className="mb-3">
@@ -39,13 +54,15 @@ export function LaunchPage(): ReactNode {
         <span className="badge text-bg-secondary">{launch.status}</span>
       </header>
       <nav className="nav nav-tabs mb-3" role="tablist" aria-label="Sections du lancement">
-        {tabs.map((tab) => <button key={tab} type="button" role="tab" aria-selected={tab === activeTab} className={`nav-link${tab === activeTab ? ' active' : ''}`} onClick={() => { setSearchParams(tab === 'overview' ? {} : { tab }); }}>{labels[tab]}</button>)}
+        {tabs.map((tab) => <button key={tab} id={`launch-tab-${tab}`} type="button" role="tab" aria-selected={tab === activeTab} aria-controls={`launch-panel-${tab}`} tabIndex={tab === activeTab ? 0 : -1} className={`nav-link${tab === activeTab ? ' active' : ''}`} onClick={() => { selectTab(tab); }} onKeyDown={(event) => { moveTab(event, tab); }}>{labels[tab]}</button>)}
       </nav>
-      {activeTab === 'overview' && <OverviewPanel launch={launch} />}
-      {activeTab === 'timeline' && <TimelinePanel mint={mint} />}
-      {activeTab === 'risk' && <RiskPanel mint={mint} />}
-      {activeTab === 'social' && <SocialPanel mint={mint} />}
-      {activeTab === 'holders' && <HoldersPanel mint={mint} />}
+      <section id={`launch-panel-${activeTab}`} role="tabpanel" aria-labelledby={`launch-tab-${activeTab}`} tabIndex={0}>
+        {activeTab === 'overview' && <OverviewPanel launch={launch} />}
+        {activeTab === 'timeline' && <TimelinePanel mint={mint} />}
+        {activeTab === 'risk' && <RiskPanel mint={mint} />}
+        {activeTab === 'social' && <SocialPanel mint={mint} />}
+        {activeTab === 'holders' && <HoldersPanel mint={mint} />}
+      </section>
     </article>
   );
 }

@@ -39,7 +39,10 @@ describe('event-driven query invalidation', () => {
       expect(invalidationKeysForEvent(event(type))).toContainEqual(queryKeys.holders(MINT));
     }
     expect(invalidationKeysForEvent(event('QualificationUpdated'))).toContainEqual(queryKeys.risk(MINT));
-    for (const type of ['PaperPositionOpened', 'PaperPositionUpdated', 'PaperPositionClosed'] as const) {
+    for (const type of [
+      'PaperStrategySessionUpdated', 'PaperExternalBuyCounted',
+      'PaperPositionOpened', 'PaperPositionUpdated', 'PaperPositionClosed',
+    ] as const) {
       expect(invalidationKeysForEvent(event(type))).toContainEqual(queryKeys.paperPositions.all);
     }
     expect(invalidationKeysForEvent(event('TokenMetadataResolved'))).not.toContainEqual(queryKeys.social(MINT));

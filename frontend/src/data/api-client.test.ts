@@ -38,6 +38,7 @@ describe('bounded GET-only API client', () => {
     const client = createApiClient({ apiBaseUrl: 'https://api.example', fetchFn });
 
     await expect(client.getLaunch('not/a/mint')).rejects.toBeInstanceOf(ApiContractError);
+    await expect(client.getLaunch('z'.repeat(32))).rejects.toBeInstanceOf(ApiContractError);
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
@@ -92,5 +93,26 @@ describe('bounded GET-only API client', () => {
     controller.abort(new DOMException('caller stopped', 'AbortError'));
     await expect(client.getHealth({ signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
     expect(ApiNetworkError).toBeDefined();
+  });
+
+  it('keeps timeout and caller cancellation active while reading the response body', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller): void {
+          init?.signal?.addEventListener('abort', () => {
+            controller.error(init.signal?.reason);
+          }, { once: true });
+        },
+      });
+      return new Response(body, { headers: { 'content-type': 'application/json' } });
+    });
+    const timed = createApiClient({ apiBaseUrl: 'https://api.example', fetchFn, timeoutMs: 5 });
+    await expect(timed.getHealth()).rejects.toMatchObject({ name: 'ApiNetworkError', retryable: true });
+
+    const controller = new AbortController();
+    const cancelled = createApiClient({ apiBaseUrl: 'https://api.example', fetchFn, timeoutMs: 1_000 });
+    const request = cancelled.getHealth({ signal: controller.signal });
+    controller.abort(new DOMException('caller stopped', 'AbortError'));
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' });
   });
 });

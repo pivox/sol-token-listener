@@ -81,6 +81,18 @@ describe('launch detail route', () => {
     expect(screen.getByText('17 / 25')).toBeVisible();
   });
 
+  it('links tabs to their panel and supports arrow-key navigation', async () => {
+    const user = userEvent.setup();
+    renderPage(client(), `/launches/${detail.mint}`);
+    const overview = await screen.findByRole('tab', { name: 'Aperçu' });
+    overview.focus();
+    await user.keyboard('{ArrowRight}');
+    const timeline = screen.getByRole('tab', { name: 'Timeline' });
+    expect(timeline).toHaveAttribute('aria-selected', 'true');
+    expect(timeline).toHaveFocus();
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', timeline.id);
+  });
+
   it('renders unavailable social evidence, observed holder methodology, and escaped orphan diagnostics', async () => {
     const user = userEvent.setup();
     renderPage(client(), `/launches/${detail.mint}?tab=social`);

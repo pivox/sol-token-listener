@@ -62,6 +62,7 @@ export function createSseClient(options: SseClientOptions): SseClient {
   const now: NonNullable<SseClientOptions['now']> = options.now ?? ((): Date => new Date());
   const isOnline: NonNullable<SseClientOptions['isOnline']> = options.isOnline ?? ((): boolean => true);
   const minimumResyncMs = options.minimumResyncMs ?? DEFAULT_MINIMUM_RESYNC_MS;
+  const streamUrl = new URL('api/v1/events', `${options.apiBaseUrl.replace(/\/+$/u, '')}/`);
   const listeners = new Set<() => void>();
   let snapshot: RealtimeSnapshot = Object.freeze({
     state: 'STOPPED', lastEventAt: null, retryAttempt: 0, errorCode: null,
@@ -69,6 +70,7 @@ export function createSseClient(options: SseClientOptions): SseClient {
   let stopped = true;
   let activeController: AbortController | null = null;
   let retryTimer: unknown;
+  let resyncPromise: Promise<void> | null = null;
   let onlineOverride: boolean | null = null;
 
   const online = (): boolean => onlineOverride ?? isOnline();
@@ -87,65 +89,78 @@ export function createSseClient(options: SseClientOptions): SseClient {
       return;
     }
     const controller = new AbortController();
+    activeController?.abort();
     activeController = controller;
     const cursor = options.cursorStore.read();
     const headers: Record<string, string> = { Accept: 'text/event-stream' };
     if (cursor !== null) headers['Last-Event-ID'] = cursor;
-    let response: Response;
     try {
-      response = await fetchFn(new URL('/api/v1/events', options.apiBaseUrl), {
-        method: 'GET', headers, signal: controller.signal,
-      });
-    } catch {
-      if (isStopped() || isAborted(controller)) return;
-      scheduleReconnect('NETWORK_ERROR');
-      return;
-    }
-    if (isStopped()) return;
-    if (response.status === 409) {
-      await resynchronize();
-      return;
-    }
-    if (response.status === 400 || response.status === 406) {
-      publish({ state: 'DISCONNECTED', errorCode: `HTTP_${String(response.status)}` });
-      return;
-    }
-    if (!response.ok) {
-      scheduleReconnect(`HTTP_${String(response.status)}`);
-      return;
-    }
-    if (!response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream')) {
-      publish({ state: 'DISCONNECTED', errorCode: 'INVALID_CONTENT_TYPE' });
-      return;
-    }
-    const reader = response.body?.getReader();
-    if (reader === undefined) {
-      scheduleReconnect('EMPTY_STREAM');
-      return;
-    }
-    publish({ state: 'LIVE', retryAttempt: 0, errorCode: null });
-    const parser = new SseParser();
-    try {
-      for (;;) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        for (const frame of parser.push(chunk.value)) {
-          const shouldContinue = await acceptFrame(frame.id, frame.event, frame.data);
-          if (!shouldContinue) return;
-        }
+      let response: Response;
+      try {
+        response = await fetchFn(streamUrl, {
+          method: 'GET', headers, signal: controller.signal,
+        });
+      } catch {
+        if (isStopped() || isAborted(controller)) return;
+        scheduleReconnect('NETWORK_ERROR');
+        return;
       }
-      parser.finish();
-    } catch {
-      if (isStopped() || isAborted(controller)) return;
-      scheduleReconnect('STREAM_INVALID');
-      return;
+      if (isStopped() || activeController !== controller) return;
+      if (response.status === 409) {
+        await resynchronize();
+        return;
+      }
+      if (response.status === 400 || response.status === 406) {
+        publish({ state: 'DISCONNECTED', errorCode: `HTTP_${String(response.status)}` });
+        return;
+      }
+      if (!response.ok) {
+        scheduleReconnect(`HTTP_${String(response.status)}`);
+        return;
+      }
+      if (!response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream')) {
+        publish({ state: 'DISCONNECTED', errorCode: 'INVALID_CONTENT_TYPE' });
+        return;
+      }
+      const reader = response.body?.getReader();
+      if (reader === undefined) {
+        scheduleReconnect('EMPTY_STREAM');
+        return;
+      }
+      publish({ state: 'LIVE', retryAttempt: 0, errorCode: null });
+      const parser = new SseParser();
+      try {
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          for (const frame of parser.push(chunk.value)) {
+            const shouldContinue = await acceptFrame(frame.id, frame.event, frame.data, controller);
+            if (!shouldContinue) return;
+          }
+        }
+        parser.finish();
+      } catch {
+        if (isStopped() || isAborted(controller)) return;
+        scheduleReconnect('STREAM_INVALID');
+        return;
+      } finally {
+        if (!isAborted(controller)) controller.abort();
+        void reader.cancel().catch(() => undefined);
+        reader.releaseLock();
+      }
+      if (!isStopped()) scheduleReconnect('STREAM_ENDED');
     } finally {
-      reader.releaseLock();
+      if (!isAborted(controller)) controller.abort();
+      if (activeController === controller) activeController = null;
     }
-    if (!isStopped()) scheduleReconnect('STREAM_ENDED');
   }
 
-  async function acceptFrame(id: string, eventName: string, data: string): Promise<boolean> {
+  async function acceptFrame(
+    id: string,
+    eventName: string,
+    data: string,
+    controller: AbortController,
+  ): Promise<boolean> {
     if (eventName === 'stream_error') {
       let decoded: unknown;
       try {
@@ -181,7 +196,7 @@ export function createSseClient(options: SseClientOptions): SseClient {
       scheduleReconnect('INVALIDATION_FAILED');
       return false;
     }
-    if (isStopped()) return false;
+    if (isStopped() || isAborted(controller) || activeController !== controller) return false;
     options.cursorStore.save(id);
     publish({ lastEventAt: now().toISOString(), errorCode: null });
     return true;
@@ -189,6 +204,26 @@ export function createSseClient(options: SseClientOptions): SseClient {
 
   async function resynchronize(): Promise<void> {
     if (isStopped()) return;
+    if (resyncPromise !== null) {
+      await resyncPromise;
+      return;
+    }
+    const task = runResynchronization();
+    resyncPromise = task;
+    await task;
+    if (resyncPromise !== task) return;
+    resyncPromise = null;
+    if (isStopped()) return;
+    if (!online()) {
+      publish({ state: 'DISCONNECTED', errorCode: 'OFFLINE' });
+      return;
+    }
+    if (retryTimer !== undefined) return;
+    publish({ state: 'CONNECTING', retryAttempt: 0, errorCode: null });
+    void connect();
+  }
+
+  async function runResynchronization(): Promise<void> {
     const startedAt = Date.now();
     publish({ state: 'RESYNCING', errorCode: 'EVENT_CURSOR_EXPIRED' });
     options.cursorStore.clear();
@@ -200,9 +235,6 @@ export function createSseClient(options: SseClientOptions): SseClient {
     }
     const remaining = minimumResyncMs - (Date.now() - startedAt);
     if (remaining > 0) await wait(remaining);
-    if (isStopped()) return;
-    publish({ state: 'CONNECTING', retryAttempt: 0, errorCode: null });
-    await connect();
   }
 
   function scheduleReconnect(errorCode: string): void {
@@ -245,6 +277,7 @@ export function createSseClient(options: SseClientOptions): SseClient {
     },
     reconnectNow(): void {
       if (stopped || !online()) return;
+      if (resyncPromise !== null) return;
       if (retryTimer !== undefined) cancel(retryTimer);
       retryTimer = undefined;
       activeController?.abort();

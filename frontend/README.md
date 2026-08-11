@@ -74,3 +74,10 @@ npm run frontend:e2e
 Le test Playwright démarre un mock API/SSE sur une autre origine et vérifie la
 reprise, l’expiration de curseur, la resynchronisation et l’absence de requêtes
 d’écriture issues du navigateur.
+
+## Déploiement statique
+
+Le build utilise `BrowserRouter`. L’hébergeur ou le proxy doit donc réécrire
+toute route inconnue (`/launches/*`, `/paper-positions`, `/health`) vers
+`index.html`, tout en servant normalement les assets existants. Sans ce fallback
+SPA, un accès direct ou un rafraîchissement d’une route produit retourne 404.

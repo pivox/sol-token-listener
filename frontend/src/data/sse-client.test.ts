@@ -30,7 +30,7 @@ describe('resumable SSE lifecycle', () => {
     const accepted: string[] = [];
     const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(streamResponse(eventFrame()));
     const client = createSseClient({
-      apiBaseUrl: 'https://api.example', fetchFn, cursorStore: store,
+      apiBaseUrl: 'https://api.example/gateway', fetchFn, cursorStore: store,
       acceptEvent: async (event) => { accepted.push(event.eventId); },
       resync: async () => undefined,
       schedule: () => 1,
@@ -38,7 +38,7 @@ describe('resumable SSE lifecycle', () => {
     });
     await client.start();
 
-    expect(fetchFn).toHaveBeenCalledWith(new URL('https://api.example/api/v1/events'), expect.objectContaining({
+    expect(fetchFn).toHaveBeenCalledWith(new URL('https://api.example/gateway/api/v1/events'), expect.objectContaining({
       method: 'GET', headers: { Accept: 'text/event-stream', 'Last-Event-ID': 'transport-old' },
     }));
     expect(accepted).toEqual([sseEvent.eventId]);
@@ -68,6 +68,27 @@ describe('resumable SSE lifecycle', () => {
     await rejected.start();
     expect(rejectedStore.saved).toEqual([]);
     invalid.stop(); rejected.stop();
+  });
+
+  it('cancels an open response body after a terminal frame error', async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(new TextEncoder().encode('id:x\nevent:QualificationUpdated\ndata:{}\n\n'));
+      },
+      cancel,
+    });
+    const client = createSseClient({
+      apiBaseUrl: 'https://api.example', cursorStore: cursorStore(),
+      fetchFn: vi.fn<typeof fetch>().mockResolvedValue(new Response(body, {
+        headers: { 'content-type': 'text/event-stream' },
+      })),
+      acceptEvent: async () => undefined, resync: async () => undefined,
+      schedule: () => 1, cancel: () => undefined,
+    });
+    await client.start();
+    expect(cancel).toHaveBeenCalledOnce();
+    client.stop();
   });
 
   it('accepts finality revisions sharing a domain id when transport ids differ', async () => {
@@ -121,6 +142,54 @@ describe('resumable SSE lifecycle', () => {
     expect(store.cleared).toBe(1);
     expect(resync).toHaveBeenCalledOnce();
     expect(fetchFn.mock.calls[1]?.[1]?.headers).toEqual({ Accept: 'text/event-stream' });
+    client.stop();
+  });
+
+  it('keeps resynchronization single-flight when connectivity changes', async () => {
+    let finishResync: (() => void) | undefined;
+    const resync = vi.fn(async () => {
+      await new Promise<void>((resolve) => { finishResync = resolve; });
+    });
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(streamResponse('{}', 409))
+      .mockResolvedValueOnce(streamResponse(''));
+    const client = createSseClient({
+      apiBaseUrl: 'https://api.example', cursorStore: cursorStore('expired'), fetchFn, resync,
+      acceptEvent: async () => undefined, schedule: () => 1, cancel: () => undefined,
+      minimumResyncMs: 0,
+    });
+    const started = client.start();
+    await vi.waitFor(() => { expect(resync).toHaveBeenCalledOnce(); });
+    client.setOnline(true);
+    expect(fetchFn).toHaveBeenCalledOnce();
+    finishResync?.();
+    await started;
+    await vi.waitFor(() => { expect(fetchFn).toHaveBeenCalledTimes(2); });
+    client.stop();
+  });
+
+  it('does not let an aborted connection regress the saved cursor', async () => {
+    let releaseFirst: (() => void) | undefined;
+    const acceptEvent = vi.fn()
+      .mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => { releaseFirst = resolve; });
+      })
+      .mockResolvedValueOnce(undefined);
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(streamResponse(eventFrame('transport-old')))
+      .mockResolvedValueOnce(streamResponse(eventFrame('transport-new')));
+    const store = cursorStore();
+    const client = createSseClient({
+      apiBaseUrl: 'https://api.example', cursorStore: store, fetchFn, acceptEvent,
+      resync: async () => undefined, schedule: () => 1, cancel: () => undefined,
+    });
+    const first = client.start();
+    await vi.waitFor(() => { expect(acceptEvent).toHaveBeenCalledOnce(); });
+    client.reconnectNow();
+    await vi.waitFor(() => { expect(store.saved).toEqual(['transport-new']); });
+    releaseFirst?.();
+    await first;
+    expect(store.saved).toEqual(['transport-new']);
     client.stop();
   });
 
