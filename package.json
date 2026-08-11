@@ -25,6 +25,7 @@
     "db:purge": "tsx scripts/purge-retained-data.ts --once",
     "db:purge:compiled": "node dist/scripts/purge-retained-data.js --once",
     "retention:start:compiled": "node dist/scripts/purge-retained-data.js",
+    "deployment:healthcheck:compiled": "node dist/scripts/deployment-healthcheck.js",
     "rpc:check": "tsx scripts/check-rpc.ts",
     "rpc:soak": "tsx scripts/rpc-soak.ts",
     "paper:dry-run": "tsx src/cli/paper-dry-run.ts",

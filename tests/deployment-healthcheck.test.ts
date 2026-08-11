@@ -1,0 +1,159 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+  DeploymentHealthcheckError,
+  checkDeploymentHealth,
+} from '../src/operations/deployment-healthcheck.js';
+import {
+  deploymentHealthcheckUrl,
+  runDeploymentHealthcheckCli,
+} from '../scripts/deployment-healthcheck.js';
+
+const HEALTH_URL = 'http://127.0.0.1:3000/api/v1/health';
+
+void test('accepts the public V1 health envelope when PostgreSQL is available and status is OK or DEGRADED', async () => {
+  for (const status of ['OK', 'DEGRADED'] as const) {
+    let request: RequestInit | undefined;
+    await checkDeploymentHealth(HEALTH_URL, {
+      fetch: async (_url, init) => {
+        request = init;
+        return healthResponse(status);
+      },
+    });
+    assert.deepEqual(request, {
+      method: 'GET', headers: { accept: 'application/json' }, redirect: 'error', signal: request?.signal,
+    });
+    assert.ok(request?.signal instanceof AbortSignal);
+  }
+  await checkDeploymentHealth('http://127.0.0.1:80/api/v1/health', { fetch: async () => healthResponse('OK') });
+});
+
+void test('rejects PostgreSQL unavailability, HTTP failures, redirects, and invalid public health envelopes with stable codes', async () => {
+  const cases: readonly [Response, string][] = [
+    [healthResponse('DEGRADED', 'UNAVAILABLE'), 'HEALTHCHECK_UNHEALTHY'],
+    [new Response('no', { status: 503 }), 'HEALTHCHECK_HTTP_STATUS_INVALID'],
+    [new Response('', { status: 302, headers: { location: HEALTH_URL } }), 'HEALTHCHECK_HTTP_STATUS_INVALID'],
+    [new Response(JSON.stringify({ apiVersion: 'v2', data: { status: 'OK', postgresql: { status: 'AVAILABLE' } } })), 'HEALTHCHECK_ENVELOPE_INVALID'],
+  ];
+  for (const [response, code] of cases) {
+    await assert.rejects(checkDeploymentHealth(HEALTH_URL, { fetch: async () => response }), errorCode(code));
+  }
+});
+
+void test('rejects non-canonical, non-loopback, credentialed, and non-health probe URLs before fetching', async () => {
+  const invalid = [
+    'https://127.0.0.1:3000/api/v1/health',
+    'http://localhost:3000/api/v1/health',
+    'http://127.0.0.1:0/api/v1/health',
+    'http://127.0.0.1:3000/api/v1/health?x=1',
+    'http://127.0.0.1:3000/api/v1/health#hash',
+    'http://user:pass@127.0.0.1:3000/api/v1/health',
+    'http://127.0.0.1:3000/api/v1/health/',
+    'http://127.0.0.1:3000/api/v1/other',
+    'http://127.0.0.1:3000/api/v1/health%2fother',
+    'http://127.0.0.1:03000/api/v1/health',
+    'http://127.0.0.1/api/v1/health',
+  ];
+  for (const url of invalid) {
+    let calls = 0;
+    await assert.rejects(checkDeploymentHealth(url, { fetch: async () => { calls += 1; return healthResponse('OK'); } }), errorCode('HEALTHCHECK_URL_INVALID'));
+    assert.equal(calls, 0);
+  }
+});
+
+void test('rejects malformed and hostile response data without retaining attacker failures', async () => {
+  const hostile = new Proxy({}, { get: () => { throw new Error('healthcheck proxy secret'); } }) as Response;
+  for (const [response, code] of [
+    [new Response(JSON.stringify({ apiVersion: 'v1', data: { status: 'OK', postgresql: {} } })), 'HEALTHCHECK_ENVELOPE_INVALID'],
+    [hostile, 'HEALTHCHECK_REQUEST_FAILED'],
+  ] as const) {
+    await assert.rejects(checkDeploymentHealth(HEALTH_URL, { fetch: async () => response }), (error: unknown) => {
+      assert.ok(error instanceof DeploymentHealthcheckError);
+      assert.equal(error.code, code);
+      assert.doesNotMatch(error.message, /healthcheck proxy secret/u);
+      return true;
+    });
+  }
+});
+
+void test('bounds both declared and streamed response bodies at 65536 bytes', async () => {
+  const tooLarge = new Uint8Array(65_537);
+  await assert.rejects(checkDeploymentHealth(HEALTH_URL, {
+    fetch: async () => new Response('x', { headers: { 'content-length': '65537' } }),
+  }), errorCode('HEALTHCHECK_BODY_TOO_LARGE'));
+  await assert.rejects(checkDeploymentHealth(HEALTH_URL, {
+    fetch: async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(tooLarge); controller.close(); },
+    })),
+  }), errorCode('HEALTHCHECK_BODY_TOO_LARGE'));
+});
+
+void test('strictly rejects invalid UTF-8 and invalid JSON without exposing response content', async () => {
+  for (const response of [
+    new Response(new Uint8Array([0xc3, 0x28])),
+    new Response('{"apiVersion":"v1"'),
+  ]) await assert.rejects(checkDeploymentHealth(HEALTH_URL, { fetch: async () => response }), errorCode('HEALTHCHECK_ENVELOPE_INVALID'));
+});
+
+void test('aborts at three seconds and cleans up timeout resources after success and failure', async () => {
+  const callbacks: (() => void)[] = [];
+  const cleared: unknown[] = [];
+  const handle = Object.freeze({ timer: 1 });
+  const timers = {
+    setTimeout: (next: () => void, delayMs: number): unknown => { assert.equal(delayMs, 3_000); callbacks.push(next); return handle; },
+    clearTimeout: (value: unknown): void => { cleared.push(value); },
+  };
+  await checkDeploymentHealth(HEALTH_URL, { fetch: async () => healthResponse('OK'), timers });
+  assert.deepEqual(cleared, [handle]);
+
+  callbacks.length = 0;
+  cleared.length = 0;
+  let signal: AbortSignal | undefined;
+  const pending = checkDeploymentHealth(HEALTH_URL, {
+    fetch: async (_url, init) => {
+      signal = init?.signal ?? undefined;
+      return await new Promise<Response>(() => undefined);
+    },
+    timers,
+  });
+  assert.equal(callbacks.length, 1);
+  callbacks[0]?.();
+  await assert.rejects(pending, errorCode('HEALTHCHECK_TIMEOUT'));
+  assert.equal(signal?.aborted, true);
+  assert.deepEqual(cleared, [handle]);
+});
+
+void test('constructs the exact loopback URL from a canonical API_PORT and returns only a redacted CLI log on failure', async () => {
+  assert.equal(deploymentHealthcheckUrl({ API_PORT: '65535' }), 'http://127.0.0.1:65535/api/v1/health');
+  assert.equal(deploymentHealthcheckUrl({}), 'http://127.0.0.1:3000/api/v1/health');
+  for (const value of ['0', '65536', '03000', ' 3000', '3000x']) {
+    assert.throws(() => deploymentHealthcheckUrl({ API_PORT: value }), errorCode('HEALTHCHECK_PORT_INVALID'));
+  }
+
+  const writes: string[] = [];
+  assert.equal(await runDeploymentHealthcheckCli({
+    environment: { API_PORT: '3000' },
+    write: (line) => { writes.push(line); },
+    check: async () => { throw new Error('http://credentials.example/internal secret'); },
+  }), 1);
+  assert.deepEqual(writes, ['{"event":"deployment.healthcheck","code":"HEALTHCHECK_REQUEST_FAILED"}\n']);
+
+  writes.length = 0;
+  assert.equal(await runDeploymentHealthcheckCli({
+    environment: { API_PORT: '0' }, write: (line) => { writes.push(line); },
+    check: async () => undefined,
+  }), 2);
+  assert.deepEqual(writes, ['{"event":"deployment.healthcheck","code":"HEALTHCHECK_PORT_INVALID"}\n']);
+});
+
+function healthResponse(status: 'OK' | 'DEGRADED', postgresql = 'AVAILABLE'): Response {
+  return new Response(JSON.stringify({
+    apiVersion: 'v1',
+    meta: { generatedAt: '2026-08-11T00:00:00.000Z', nextCursor: null },
+    data: { status, postgresql: { status: postgresql } },
+  }));
+}
+
+function errorCode(code: string): (error: unknown) => boolean {
+  return (error: unknown): boolean => error instanceof DeploymentHealthcheckError && error.code === code;
+}
