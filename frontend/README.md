@@ -16,18 +16,20 @@ npm run build
 npm run frontend:dev
 ```
 
-Le backend écoute par défaut sur `http://127.0.0.1:3000` et Vite sur son port
-de développement. Le fichier public `public/config.json` est lu et validé avant
-la création de l’application :
+Le fichier public `public/config.json` est lu et validé avant la création de
+l’application :
 
 ```json
-{ "apiBaseUrl": "http://127.0.0.1:3000" }
+{ "apiBaseUrl": "/" }
 ```
 
-Seules les URL absolues HTTP(S), sans credentials, query ni fragment sont
-acceptées. Ce fichier est une configuration publique : aucun secret ne doit y
-être placé. Une configuration invalide arrête le bootstrap avant toute requête
-métier ou connexion SSE.
+La valeur exacte `/` utilise l’origine HTTP(S) courante, ce qui permet au même
+build d’être servi derrière un proxy qui expose le frontend et l’API sur la
+même origine. Pour un frontend sur une origine différente du backend, utilisez
+une URL HTTP(S) absolue, sans credentials, query ni fragment. Les autres URL
+relatives ne sont pas acceptées. Ce fichier est une configuration publique :
+aucun secret ne doit y être placé. Une configuration invalide arrête le
+bootstrap avant toute requête métier ou connexion SSE.
 
 ## Routes produit
 

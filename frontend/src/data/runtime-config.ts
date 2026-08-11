@@ -27,6 +27,9 @@ export class RuntimeConfigError extends Error {
 export async function loadRuntimeConfig(
   fetchFn: typeof fetch,
   signal?: AbortSignal,
+  // Node-based callers do not necessarily expose the browser-only Location global.
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  currentOrigin = globalThis.location?.origin,
 ): Promise<RuntimeConfig> {
   const timeoutSignal = AbortSignal.timeout(CONFIG_TIMEOUT_MS);
   const requestSignal = signal === undefined
@@ -54,7 +57,7 @@ export async function loadRuntimeConfig(
   }
   const parsed = runtimeConfigSchema.safeParse(decoded);
   if (!parsed.success) throw new RuntimeConfigError('CONFIG_INVALID');
-  return Object.freeze({ apiBaseUrl: normalizeApiBaseUrl(parsed.data.apiBaseUrl) });
+  return Object.freeze({ apiBaseUrl: normalizeApiBaseUrl(parsed.data.apiBaseUrl, currentOrigin) });
 }
 
 function assertContentLength(value: string | null): void {
@@ -89,7 +92,8 @@ async function readBoundedText(response: Response): Promise<string> {
   }
 }
 
-function normalizeApiBaseUrl(value: string): string {
+function normalizeApiBaseUrl(value: string, currentOrigin: string | undefined): string {
+  if (value === '/') return normalizeOrigin(currentOrigin);
   if (value.trim() !== value) throw new RuntimeConfigError('CONFIG_INVALID');
   let url: URL;
   try {
@@ -106,4 +110,23 @@ function normalizeApiBaseUrl(value: string): string {
   ) throw new RuntimeConfigError('CONFIG_INVALID');
   const pathname = url.pathname === '/' ? '' : url.pathname.replace(/\/+$/u, '');
   return `${url.origin}${pathname}`;
+}
+
+function normalizeOrigin(value: string | undefined): string {
+  if (typeof value !== 'string' || value.trim() !== value) throw new RuntimeConfigError('CONFIG_INVALID');
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new RuntimeConfigError('CONFIG_INVALID');
+  }
+  if (
+    (url.protocol !== 'http:' && url.protocol !== 'https:')
+    || url.username !== ''
+    || url.password !== ''
+    || url.pathname !== '/'
+    || url.search !== ''
+    || url.hash !== ''
+  ) throw new RuntimeConfigError('CONFIG_INVALID');
+  return url.origin;
 }
