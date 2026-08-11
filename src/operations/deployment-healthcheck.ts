@@ -1,5 +1,7 @@
 import { isProxy } from 'node:util/types';
 
+type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>;
+
 export const DEPLOYMENT_HEALTHCHECK_TIMEOUT_MS = 3_000;
 export const DEPLOYMENT_HEALTHCHECK_MAX_BYTES = 65_536;
 
@@ -42,13 +44,17 @@ export async function checkDeploymentHealth(
   const url = canonicalProbeUrl(input);
   const controller = new AbortController();
   const timers = dependencies.timers ?? productionTimers;
+  let rejectDeadline: (error: DeploymentHealthcheckError) => void = () => undefined;
+  const deadline = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
   const timer = timers.setTimeout(() => {
     controller.abort();
+    rejectDeadline(failure('HEALTHCHECK_TIMEOUT'));
   }, DEPLOYMENT_HEALTHCHECK_TIMEOUT_MS);
+  let response: Response | undefined;
   try {
-    const response = await awaitWithAbort(dependencies.fetch(url, Object.freeze({
+    response = await raceDeadline(dependencies.fetch(url, Object.freeze({
       method: 'GET', headers: Object.freeze({ accept: 'application/json' }), redirect: 'error', signal: controller.signal,
-    })), controller.signal);
+    })), deadline);
     if (controller.signal.aborted) throw failure('HEALTHCHECK_TIMEOUT');
     const status = responseStatus(response);
     if (status !== 200) throw failure('HEALTHCHECK_HTTP_STATUS_INVALID');
@@ -56,13 +62,16 @@ export async function checkDeploymentHealth(
     if (declaredLength !== null && declaredLength > DEPLOYMENT_HEALTHCHECK_MAX_BYTES) {
       throw failure('HEALTHCHECK_BODY_TOO_LARGE');
     }
-    const body = await readBoundedResponseBody(response, controller.signal);
+    const body = await readBoundedResponseBody(response, deadline);
     const envelope = parseEnvelope(body);
     if (envelope.status !== 'OK' && envelope.status !== 'DEGRADED') throw failure('HEALTHCHECK_UNHEALTHY');
     if (envelope.postgresql !== 'AVAILABLE') throw failure('HEALTHCHECK_UNHEALTHY');
   } catch (error: unknown) {
+    const deadlineExpired = controller.signal.aborted;
+    controller.abort();
+    if (response !== undefined) cancelResponseBody(response);
     if (error instanceof DeploymentHealthcheckError) throw error;
-    if (controller.signal.aborted) throw failure('HEALTHCHECK_TIMEOUT');
+    if (deadlineExpired) throw failure('HEALTHCHECK_TIMEOUT');
     throw failure('HEALTHCHECK_REQUEST_FAILED');
   } finally {
     try { timers.clearTimeout(timer); } catch { /* A timer implementation cannot affect the probe result. */ }
@@ -116,7 +125,7 @@ function responseContentLength(response: Response): number | null {
   }
 }
 
-async function readBoundedResponseBody(response: Response, signal: AbortSignal): Promise<Uint8Array> {
+async function readBoundedResponseBody(response: Response, deadline: Promise<never>): Promise<Uint8Array> {
   let reader: ReadableStreamDefaultReader<Uint8Array>;
   try {
     const body = response.body;
@@ -127,20 +136,37 @@ async function readBoundedResponseBody(response: Response, signal: AbortSignal):
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let completed = false;
+  let pendingRead: Promise<StreamReadResult> | undefined;
+  let readPending = false;
   try {
     for (;;) {
-      const item = await awaitWithAbort(reader.read(), signal);
-      if (item.done) break;
+      const read = Promise.resolve(reader.read());
+      pendingRead = read;
+      readPending = true;
+      void read.then(
+        () => { readPending = false; },
+        () => { readPending = false; },
+      );
+      const item = await raceDeadline(read, deadline);
+      pendingRead = undefined;
+      readPending = false;
+      if (item.done) { completed = true; break; }
       if (!(item.value instanceof Uint8Array)) throw failure('HEALTHCHECK_ENVELOPE_INVALID');
       total += item.value.byteLength;
       if (total > DEPLOYMENT_HEALTHCHECK_MAX_BYTES) throw failure('HEALTHCHECK_BODY_TOO_LARGE');
       chunks.push(item.value);
     }
-  } catch (error: unknown) {
-    try { await reader.cancel(); } catch { /* bounded failure wins */ }
-    throw error;
   } finally {
-    try { reader.releaseLock(); } catch { /* native stream cleanup is best effort */ }
+    if (!completed) cancelReader(reader);
+    if (pendingRead !== undefined && readPending) {
+      void pendingRead.then(
+        () => { releaseReader(reader); },
+        () => { releaseReader(reader); },
+      );
+    } else {
+      releaseReader(reader);
+    }
   }
   const result = new Uint8Array(total);
   let offset = 0;
@@ -184,16 +210,36 @@ function requiredField(value: object, key: string): unknown {
   return descriptor.value;
 }
 
-async function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) throw failure('HEALTHCHECK_TIMEOUT');
-  return await new Promise<T>((resolve, reject) => {
-    const abort = (): void => { reject(failure('HEALTHCHECK_TIMEOUT')); };
-    signal.addEventListener('abort', abort, { once: true });
-    void operation.then(
-      (value) => { signal.removeEventListener('abort', abort); resolve(value); },
-      () => { signal.removeEventListener('abort', abort); reject(failure('HEALTHCHECK_REQUEST_FAILED')); },
-    );
-  });
+async function raceDeadline<T>(operation: Promise<T>, deadline: Promise<never>): Promise<T> {
+  const contained = Promise.resolve(operation).then(
+    (value) => value,
+    () => { throw failure('HEALTHCHECK_REQUEST_FAILED'); },
+  );
+  return await Promise.race([contained, deadline]);
+}
+
+function cancelResponseBody(response: Response): void {
+  try {
+    const body = response.body;
+    if (body !== null) contain(body.cancel());
+  } catch {
+    // Cancellation is best effort and must never replace or delay the bounded failure.
+  }
+}
+
+function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try { contain(reader.cancel()); } catch { /* bounded failure wins */ }
+}
+
+function contain(operation: Promise<unknown>): void {
+  void Promise.resolve(operation).then(
+    () => undefined,
+    () => undefined,
+  );
+}
+
+function releaseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try { reader.releaseLock(); } catch { /* native stream cleanup is best effort */ }
 }
 
 function failure(code: DeploymentHealthcheckCode): DeploymentHealthcheckError {

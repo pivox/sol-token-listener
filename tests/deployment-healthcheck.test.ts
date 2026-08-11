@@ -10,6 +10,8 @@ import {
   runDeploymentHealthcheckCli,
 } from '../scripts/deployment-healthcheck.js';
 
+type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>;
+
 const HEALTH_URL = 'http://127.0.0.1:3000/api/v1/health';
 
 void test('accepts the public V1 health envelope when PostgreSQL is available and status is OK or DEGRADED', async () => {
@@ -124,6 +126,126 @@ void test('aborts at three seconds and cleans up timeout resources after success
   assert.deepEqual(cleared, [handle]);
 });
 
+void test('bounds a fetch that never settles by the global deadline', async () => {
+  const deadline = manualDeadline();
+  let signal: AbortSignal | undefined;
+  const probe = checkDeploymentHealth(HEALTH_URL, {
+    fetch: async (_url, init) => {
+      signal = init?.signal ?? undefined;
+      return await new Promise<Response>(() => undefined);
+    },
+    timers: deadline.timers,
+  });
+  deadline.fire();
+  await assert.rejects(settlesPromptly(probe), errorCode('HEALTHCHECK_TIMEOUT'));
+  assert.equal(signal?.aborted, true);
+});
+
+void test('reports the deadline when abort makes the pending fetch reject', async () => {
+  const deadline = manualDeadline();
+  const probe = checkDeploymentHealth(HEALTH_URL, {
+    fetch: async (_url, init) => await new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => { reject(new Error('abort detail')); }, { once: true });
+    }),
+    timers: deadline.timers,
+  });
+  deadline.fire();
+  await assert.rejects(settlesPromptly(probe), errorCode('HEALTHCHECK_TIMEOUT'));
+});
+
+void test('bounds a response read and does not await cancellation that never settles', async () => {
+  const deadline = manualDeadline();
+  let cancelCalls = 0;
+  let signal: AbortSignal | undefined;
+  const probe = checkDeploymentHealth(HEALTH_URL, {
+    fetch: async (_url, init) => {
+      signal = init?.signal ?? undefined;
+      return fakeResponse({
+        read: async () => await new Promise<StreamReadResult>(() => undefined),
+        cancel: () => { cancelCalls += 1; return new Promise<void>(() => undefined); },
+      });
+    },
+    timers: deadline.timers,
+  });
+  await nextTurn();
+  deadline.fire();
+  await assert.rejects(settlesPromptly(probe), errorCode('HEALTHCHECK_TIMEOUT'));
+  assert.equal(signal?.aborted, true);
+  assert.equal(cancelCalls, 1);
+});
+
+void test('defers hostile read-lock cleanup until the pending read settles and contains its rejection', async () => {
+  const deadline = manualDeadline();
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+  let rejectRead: ((error: Error) => void) | undefined;
+  let releaseCalls = 0;
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const probe = checkDeploymentHealth(HEALTH_URL, {
+      fetch: async () => fakeResponse({
+        read: async () => await new Promise<StreamReadResult>((_resolve, reject) => { rejectRead = reject; }),
+        cancel: () => new Promise<void>(() => undefined),
+        releaseLock: () => { releaseCalls += 1; throw new Error('release lock secret'); },
+      }),
+      timers: deadline.timers,
+    });
+    await nextTurn();
+    deadline.fire();
+    await assert.rejects(settlesPromptly(probe), errorCode('HEALTHCHECK_TIMEOUT'));
+    assert.equal(releaseCalls, 0);
+    assert.ok(rejectRead);
+    rejectRead(new Error('pending read secret'));
+    await nextTurn();
+    await nextTurn();
+    assert.equal(releaseCalls, 1);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled);
+  }
+});
+
+void test('aborts and asynchronously cancels bodies for non-200 and declared oversized responses', async () => {
+  for (const responseOptions of [
+    { status: 503 },
+    { status: 200, contentLength: '65537' },
+  ]) {
+    let signal: AbortSignal | undefined;
+    let cancelCalls = 0;
+    const response = fakeResponse({
+      ...responseOptions,
+      cancelBody: async () => { cancelCalls += 1; },
+    });
+    await assert.rejects(checkDeploymentHealth(HEALTH_URL, {
+      fetch: async (_url, init) => { signal = init?.signal ?? undefined; return response; },
+    }), errorCode(responseOptions.status === 503
+      ? 'HEALTHCHECK_HTTP_STATUS_INVALID'
+      : 'HEALTHCHECK_BODY_TOO_LARGE'));
+    await nextTurn();
+    assert.equal(signal?.aborted, true);
+    assert.equal(cancelCalls, 1);
+  }
+});
+
+void test('contains an asynchronous body cancellation rejection without an unhandled rejection', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    await assert.rejects(checkDeploymentHealth(HEALTH_URL, {
+      fetch: async () => fakeResponse({
+        status: 503,
+        cancelBody: async () => { throw new Error('cancel rejection secret'); },
+      }),
+    }), errorCode('HEALTHCHECK_HTTP_STATUS_INVALID'));
+    await nextTurn();
+    await nextTurn();
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled);
+  }
+});
+
 void test('constructs the exact loopback URL from a canonical API_PORT and returns only a redacted CLI log on failure', async () => {
   assert.equal(deploymentHealthcheckUrl({ API_PORT: '65535' }), 'http://127.0.0.1:65535/api/v1/health');
   assert.equal(deploymentHealthcheckUrl({}), 'http://127.0.0.1:3000/api/v1/health');
@@ -170,4 +292,60 @@ function healthResponse(status: 'OK' | 'DEGRADED', postgresql = 'AVAILABLE'): Re
 
 function errorCode(code: string): (error: unknown) => boolean {
   return (error: unknown): boolean => error instanceof DeploymentHealthcheckError && error.code === code;
+}
+
+function manualDeadline(): Readonly<{
+  timers: { setTimeout: (callback: () => void, delayMs: number) => unknown; clearTimeout: () => void };
+  fire: () => void;
+}> {
+  let callback: (() => void) | undefined;
+  return {
+    timers: {
+      setTimeout: (next, delayMs) => { assert.equal(delayMs, 3_000); callback = next; return 1; },
+      clearTimeout: () => undefined,
+    },
+    fire: () => { assert.ok(callback); callback(); },
+  };
+}
+
+function fakeResponse(options: Readonly<{
+  status?: number;
+  contentLength?: string;
+  read?: () => Promise<StreamReadResult>;
+  cancel?: () => Promise<void>;
+  cancelBody?: () => Promise<void>;
+  releaseLock?: () => void;
+}>): Response {
+  const reader = {
+    read: options.read ?? (async () => ({ done: true, value: undefined })),
+    cancel: options.cancel ?? (async () => undefined),
+    releaseLock: options.releaseLock ?? (() => undefined),
+  } as ReadableStreamDefaultReader<Uint8Array>;
+  const body = {
+    getReader: () => reader,
+    cancel: options.cancelBody ?? (async () => undefined),
+  } as ReadableStream<Uint8Array>;
+  return {
+    status: options.status ?? 200,
+    headers: new Headers(options.contentLength === undefined ? {} : { 'content-length': options.contentLength }),
+    body,
+  } as Response;
+}
+
+async function settlesPromptly(promise: Promise<void>): Promise<void> {
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<void>((_resolve, reject) => {
+        watchdog = setTimeout(() => { reject(new Error('Healthcheck remained pending after its deadline.')); }, 100);
+      }),
+    ]);
+  } finally {
+    if (watchdog !== undefined) clearTimeout(watchdog);
+  }
+}
+
+async function nextTurn(): Promise<void> {
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
 }
