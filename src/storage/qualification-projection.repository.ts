@@ -796,6 +796,16 @@ implements QualificationProjectionTransaction {
     }
     const evaluatedAt = retentionDate(projection.report.evaluatedAtMs, 0);
     const purgeAfter = retentionDate(projection.report.evaluatedAtMs, 14_400_000);
+    const freshnessResult = await this.client.query(
+      `SELECT /* qualification_write_freshness */
+          $1::timestamptz > transaction_timestamp() AS qualification_write_is_fresh`,
+      [purgeAfter],
+    );
+    if (!booleanValue(freshnessResult.rows[0]?.qualification_write_is_fresh)) {
+      throw new QualificationProjectionDataError(
+        'Qualification projection report is already stale.',
+      );
+    }
     const existingEvent = await this.client.query(
       `SELECT /* qualification_existing_event */ event_id,raw_event_id,type,mint,source,
           program,signature,slot::text AS slot,transaction_index,instruction_index,

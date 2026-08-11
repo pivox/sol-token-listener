@@ -969,7 +969,7 @@ void test('returns UNCHANGED for an exact current replay without event or outbox
 });
 
 void test('recreates a purged report by reusing an exact retained qualification event', async () => {
-  const projection = projectionFixture();
+  const projection = projectionFixture({ observedAtMs: Date.now() });
   const database = new ScriptedPool((text) => {
     if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
     if (text.includes('qualification_existing_event')) {
@@ -998,6 +998,40 @@ void test('recreates a purged report by reusing an exact retained qualification 
     (reportInsert.values?.[20] as Date | undefined)?.getTime(),
     projection.report.evaluatedAtMs + 14_400_000,
   );
+});
+
+void test('rejects a never-stored stale projection before writing its event or report', async () => {
+  const projection = projectionFixture();
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
+    if (text.includes('qualification_write_freshness')) {
+      return rows([{ qualification_write_is_fresh: false }]);
+    }
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(
+    database,
+    qualificationService(),
+  );
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.replaceProjection(projection)),
+    (error: unknown) => {
+      assert.ok(error instanceof QualificationProjectionDataError);
+      assert.equal(error.message, 'Qualification projection report is already stale.');
+      return true;
+    },
+  );
+
+  const statements = database.queries.map((call) => call.text);
+  const freshness = database.queries.find((call) => (
+    call.text.includes('qualification_write_freshness')
+  ));
+  assert.match(freshness?.text ?? '', /transaction_timestamp\(\)/u);
+  assert.ok(freshness?.values?.[0] instanceof Date);
+  assert.equal(statements.some((sql) => sql.includes('qualification_existing_event')), false);
+  assert.equal(statements.some((sql) => sql.includes('INSERT INTO domain_events')), false);
+  assert.equal(statements.some((sql) => sql.includes('INSERT INTO qualification_reports')), false);
 });
 
 void test('rejects a conflicting retained qualification event before report insert', async () => {
@@ -1293,9 +1327,13 @@ void test('live PostgreSQL excludes expired reports and never extends determinis
     const repository = new PostgresQualificationProjectionRepository(pool, service);
     const original = projectionFixture({ observedAtMs });
     await repository.transact('mint', (transaction) => transaction.replaceProjection(original));
-    await pool.query(`UPDATE qualification_reports
-      SET evaluated_at=clock_timestamp()-INTERVAL '5 hours',
-          purge_after=clock_timestamp()-INTERVAL '1 hour'
+    await pool.query(`WITH retained_clock AS (
+      SELECT clock_timestamp()-INTERVAL '5 hours' AS evaluated_at
+    )
+    UPDATE qualification_reports
+      SET evaluated_at=retained_clock.evaluated_at,
+          purge_after=retained_clock.evaluated_at+INTERVAL '4 hours'
+      FROM retained_clock
       WHERE report_id=$1`, [original.reportId]);
     const before = await pool.query<{ readonly purge_after: Date }>(
       'SELECT purge_after FROM qualification_reports WHERE report_id=$1',
@@ -1335,6 +1373,55 @@ void test('live PostgreSQL excludes expired reports and never extends determinis
   }
 });
 
+void test('live PostgreSQL rejects a never-stored stale projection before any derived write', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live stale qualification write test skipped');
+    return;
+  }
+  const schema = `qualification_stale_write_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    const observedAtMs = Date.now() - 5 * 60 * 60 * 1_000;
+    await insertLiveLaunch(pool, observedAtMs);
+    const projection = projectionFixture({ observedAtMs });
+    const repository = new PostgresQualificationProjectionRepository(
+      pool,
+      qualificationService(),
+    );
+
+    await assert.rejects(
+      repository.transact('mint', (transaction) => transaction.replaceProjection(projection)),
+      (error: unknown) => {
+        assert.ok(error instanceof QualificationProjectionDataError);
+        assert.equal(error.message, 'Qualification projection report is already stale.');
+        return true;
+      },
+    );
+
+    const counts = await pool.query<{
+      readonly reports: string;
+      readonly events: string;
+      readonly outbox: string;
+    }>(`SELECT
+      (SELECT COUNT(*) FROM qualification_reports)::text AS reports,
+      (SELECT COUNT(*) FROM domain_events WHERE type='QualificationUpdated')::text AS events,
+      (SELECT COUNT(*) FROM api_event_stream
+        WHERE event_type='QualificationUpdated')::text AS outbox`);
+    assert.deepEqual(counts.rows[0], { reports: '0', events: '0', outbox: '0' });
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
 interface QueryCall {
   readonly text: string;
   readonly values: readonly unknown[] | undefined;
@@ -1363,6 +1450,9 @@ class ScriptedPool {
           && resolved?.rows[0] === undefined
         ) return rows([{ pg_advisory_unlock: true }]);
         if (resolved !== undefined) return resolved;
+        if (text.includes('qualification_write_freshness')) {
+          return rows([{ qualification_write_is_fresh: true }]);
+        }
         return /^(?:INSERT|UPDATE)\b/u.test(text.trim())
           ? { rows: [], rowCount: 1 }
           : rows([]);
