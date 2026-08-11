@@ -1,5 +1,7 @@
+name: sol-token-listener
+
 x-runtime-environment: &runtime-environment
-  DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+  DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD_URI_ENCODED:?POSTGRES_PASSWORD_URI_ENCODED is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
   SOLANA_HTTP_RPC_URL: ${SOLANA_HTTP_RPC_URL:?SOLANA_HTTP_RPC_URL is required}
   SOLANA_WS_RPC_URL: ${SOLANA_WS_RPC_URL:?SOLANA_WS_RPC_URL is required}
   EXECUTION_MODE: observe

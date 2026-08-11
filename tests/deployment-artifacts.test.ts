@@ -177,6 +177,7 @@ void test('Nginx serves the SPA with bounded caching and proxies only the read-o
 void test('Compose defines an observe-only, five-service deployment without exposed database or backend', async () => {
   const compose = await readArtifact('deploy/compose.yaml');
 
+  assert.match(compose, /^name: sol-token-listener$/m);
   assert.match(compose, /^services:\s*$/m);
   const networksOffset = compose.indexOf('\nnetworks:');
   assert.notEqual(networksOffset, -1, 'missing networks section');
@@ -213,6 +214,28 @@ void test('Compose defines an observe-only, five-service deployment without expo
   assert.doesNotMatch(compose, /^ {4}image: [^\n@]+:[^\n@]+$/m);
 });
 
+void test('Compose keeps the raw PostgreSQL password separate from its URI-encoded form', async () => {
+  const compose = await readArtifact('deploy/compose.yaml');
+  const rawPassword = 'example:@/?#[]';
+  const encodedPassword = 'example%3A%40%2F%3F%23%5B%5D';
+
+  assert.match(
+    compose,
+    /DATABASE_URL: postgresql:\/\/\$\{POSTGRES_USER:\?POSTGRES_USER is required\}:\$\{POSTGRES_PASSWORD_URI_ENCODED:\?POSTGRES_PASSWORD_URI_ENCODED is required\}@postgres:5432\/\$\{POSTGRES_DB:\?POSTGRES_DB is required\}/,
+  );
+  assert.match(
+    composeService(compose, 'postgres'),
+    /POSTGRES_PASSWORD: \$\{POSTGRES_PASSWORD:\?POSTGRES_PASSWORD is required\}/,
+  );
+  assert.doesNotMatch(compose, /DATABASE_URL:[^\n]*\$\{POSTGRES_PASSWORD:\?/);
+
+  const databaseUrl = `postgresql://listener:${encodedPassword}@postgres:5432/listener`;
+  const postgresEnvironment = { POSTGRES_PASSWORD: rawPassword };
+  assert.equal(new URL(databaseUrl).password, encodedPassword);
+  assert.equal(postgresEnvironment.POSTGRES_PASSWORD, rawPassword);
+  assert.notEqual(postgresEnvironment.POSTGRES_PASSWORD, new URL(databaseUrl).password);
+});
+
 void test('Compose environment template contains documentation-only required inputs', async () => {
   const environment = await readArtifact('deploy/env.example');
 
@@ -220,6 +243,7 @@ void test('Compose environment template contains documentation-only required inp
     'POSTGRES_DB=sol_token_listener',
     'POSTGRES_USER=sol_token_listener',
     'POSTGRES_PASSWORD=replace-with-a-secret',
+    'POSTGRES_PASSWORD_URI_ENCODED=replace-with-a-secret',
     'SOLANA_HTTP_RPC_URL=https://rpc-provider.invalid',
     'SOLANA_WS_RPC_URL=wss://rpc-provider.invalid',
     'FRONTEND_PORT=8080',
@@ -230,5 +254,7 @@ void test('Compose environment template contains documentation-only required inp
   }
   assert.match(environment, /outside version control/i);
   assert.match(environment, /must be replaced/i);
+  assert.match(environment, /POSTGRES_PASSWORD_URI_ENCODED must be the percent-encoding of POSTGRES_PASSWORD/i);
+  assert.match(environment, /unreserved example values can be identical/i);
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/i);
 });
