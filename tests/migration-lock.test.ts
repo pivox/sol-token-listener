@@ -25,6 +25,8 @@ void test('holds the fixed session advisory lock across history reads and migrat
     ]);
     assert.deepEqual(database.lockValues, [[migrationLockId]]);
     assert.deepEqual(database.unlockValues, [[migrationLockId]]);
+    assert.deepEqual(database.lockQueries, ['SELECT pg_advisory_lock($1)']);
+    assert.deepEqual(database.unlockQueries, ['SELECT pg_advisory_unlock($1) AS unlocked']);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -71,6 +73,28 @@ void test('rejects a malformed advisory unlock result and still releases the ses
       /Migration advisory lock was not released/u,
     );
     assert.deepEqual(database.events, ['lock', 'history-table', 'unlock', 'release']);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('rejects a standalone advisory unlock failure after migrations succeed and releases the session', async () => {
+  const directory = await migrationDirectory();
+  const unlockFailure = new Error('unlock failed');
+  const database = new RecordingPool({ unlockFailure });
+  try {
+    await assert.rejects(
+      migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
+      (error: unknown) => {
+        assert.equal(error, unlockFailure);
+        assert.ok(!(error instanceof AggregateError));
+        return true;
+      },
+    );
+    assert.deepEqual(database.events, [
+      'lock', 'history-table', 'history-read', 'begin', 'application',
+      'history-write', 'commit', 'unlock', 'release',
+    ]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -140,6 +164,8 @@ class RecordingPool {
   public readonly events: string[] = [];
   public readonly lockValues: unknown[][] = [];
   public readonly unlockValues: unknown[][] = [];
+  public readonly lockQueries: string[] = [];
+  public readonly unlockQueries: string[] = [];
   public readonly pool: InstanceType<typeof pg.Pool>;
 
   public constructor(private readonly options: {
@@ -158,11 +184,13 @@ class RecordingPool {
   private async query(text: string, values: unknown[] | undefined): Promise<{ rows: readonly unknown[] }> {
     if (text.includes('pg_advisory_lock')) {
       this.events.push('lock');
+      this.lockQueries.push(text);
       this.lockValues.push(values ?? []);
       return { rows: [] };
     }
     if (text.includes('pg_advisory_unlock')) {
       this.events.push('unlock');
+      this.unlockQueries.push(text);
       this.unlockValues.push(values ?? []);
       if (this.options.unlockFailure !== undefined) throw this.options.unlockFailure;
       return this.options.unlockResult ?? { rows: [{ unlocked: true }] };

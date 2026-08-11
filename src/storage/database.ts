@@ -39,7 +39,7 @@ export async function migrateDatabase(options: {
   let primaryFailure: unknown;
   let primaryFailed = false;
   try {
-    await client.query('SELECT pg_advisory_lock($1::bigint)', [migrationAdvisoryLockId]);
+    await client.query('SELECT pg_advisory_lock($1)', [migrationAdvisoryLockId]);
     await client.query(`
       CREATE TABLE IF NOT EXISTS migration_history (
         version TEXT PRIMARY KEY,
@@ -72,7 +72,7 @@ export async function migrateDatabase(options: {
   let unlockFailed = false;
   try {
     const unlock = await client.query<{ readonly unlocked: boolean }>(
-      'SELECT pg_advisory_unlock($1::bigint) AS unlocked',
+      'SELECT pg_advisory_unlock($1) AS unlocked',
       [migrationAdvisoryLockId],
     );
     if (unlock.rows.length !== 1 || unlock.rows[0]?.unlocked !== true) {
