@@ -6,6 +6,7 @@ import type { PoolClient } from 'pg';
 
 type PgPool = InstanceType<typeof pg.Pool>;
 let sharedPool: PgPool | null = null;
+const migrationAdvisoryLockId = 7_347_662_125;
 
 export function getDatabasePool(databaseUrl = process.env.DATABASE_URL): PgPool {
   if (sharedPool !== null) return sharedPool;
@@ -35,7 +36,10 @@ export async function migrateDatabase(options: {
 
   const client = await pool.connect();
   const applied: string[] = [];
+  let primaryFailure: unknown;
+  let primaryFailed = false;
   try {
+    await client.query('SELECT pg_advisory_lock($1::bigint)', [migrationAdvisoryLockId]);
     await client.query(`
       CREATE TABLE IF NOT EXISTS migration_history (
         version TEXT PRIMARY KEY,
@@ -59,8 +63,43 @@ export async function migrateDatabase(options: {
         throw error;
       }
     }
-  } finally {
+  } catch (error) {
+    primaryFailed = true;
+    primaryFailure = error;
+  }
+
+  let unlockFailure: unknown;
+  let unlockFailed = false;
+  try {
+    const unlock = await client.query<{ readonly unlocked: boolean }>(
+      'SELECT pg_advisory_unlock($1::bigint) AS unlocked',
+      [migrationAdvisoryLockId],
+    );
+    if (unlock.rows.length !== 1 || unlock.rows[0]?.unlocked !== true) {
+      throw new Error('Migration advisory lock was not released.');
+    }
+  } catch (error) {
+    unlockFailed = true;
+    unlockFailure = error;
+  }
+
+  let releaseFailure: unknown;
+  let releaseFailed = false;
+  try {
     client.release();
+  } catch (error) {
+    releaseFailed = true;
+    releaseFailure = error;
+  }
+
+  const failures = [
+    ...(primaryFailed ? [primaryFailure] : []),
+    ...(unlockFailed ? [unlockFailure] : []),
+    ...(releaseFailed ? [releaseFailure] : []),
+  ];
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, 'Database migration and cleanup failed.');
   }
   return applied;
 }

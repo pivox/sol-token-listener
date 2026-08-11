@@ -21,6 +21,7 @@
     "frontend:dev": "npm run dev --workspace frontend",
     "frontend:e2e": "npm run e2e --workspace frontend",
     "db:migrate": "tsx scripts/migrate.ts",
+    "db:migrate:compiled": "node dist/scripts/migrate.js",
     "rpc:check": "tsx scripts/check-rpc.ts",
     "rpc:soak": "tsx scripts/rpc-soak.ts",
     "paper:dry-run": "tsx src/cli/paper-dry-run.ts",
