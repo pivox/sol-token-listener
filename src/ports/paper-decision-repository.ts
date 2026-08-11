@@ -10,6 +10,7 @@ import type { SocialEvidenceCollectionV1 } from '../domain/social-evidence.js';
 import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
 import type { ChainConfirmationStatus, TokenLaunch } from '../domain/types.js';
 import type { WalletGraphAnalysis } from '../domain/wallet-graph.js';
+import type { CanonicalQualificationProjection } from './qualification-projection-repository.js';
 
 export interface PaperDecisionJobInput {
   readonly mint: string;
@@ -48,12 +49,10 @@ export interface PaperDecisionSnapshot {
     { readonly type: 'BondingCurveTradeObserved' }
   >[];
   readonly activeMarketTrades: readonly MarketTrade[];
+  readonly currentQualification: CanonicalQualificationProjection | null;
   readonly currentCandidate: TradingCandidateV1 | null;
   readonly currentDecision: Readonly<{
-    readonly reportId: string;
-    readonly evidenceFingerprint: string;
-    readonly report: QualificationReport;
-    readonly qualificationEvent: DomainEvent;
+    readonly qualification: CanonicalQualificationProjection;
     readonly candidateEvent: DomainEvent;
   }> | null;
   readonly currentSession: PaperStrategySessionV1 | null;

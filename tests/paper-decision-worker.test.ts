@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
 import type { DomainEvent } from '../src/domain/events.js';
 import { createPaperStrategySession } from '../src/domain/paper-strategy.js';
 import type { PaperExecutionQuote, PaperPosition } from '../src/domain/paper-trading.js';
 import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
+import type { CanonicalQualificationProjection } from '../src/ports/qualification-projection-repository.js';
+import {
+  createDefaultQualificationRuleSet,
+  QualificationEngine,
+} from '../src/qualification/qualification-engine.js';
+import { fromJsonValue,toJsonValue } from '../src/utils/json.js';
 import type {
   ClaimedPaperDecisionJob,
   PaperDecisionFailure,
@@ -35,6 +42,89 @@ void test('persists explainable observe decisions without requesting quotes or p
   assert.equal(repository.completions.length, 1);
   assert.equal(repository.completions[0]?.result.session, null);
 });
+
+void test('retries before quotes when no canonical qualification is persisted', async () => {
+  const repository = new FakeRepository([claim()]);
+  repository.snapshotValue = snapshot({ currentQualification:null });
+  const quotes = new FakeQuotes();
+  const services = fakeServices('NOT_ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind:'failed',jobId:'paper-job' });
+  assert.equal(repository.failures[0]?.failure.code, 'RPC_TRANSIENT');
+  assert.equal(repository.failures[0]?.failure.retryable, true);
+  assert.equal(quotes.calls, 0);
+  assert.equal(services.candidates.calls.length, 0);
+  assert.equal(repository.stages.length, 0);
+  assert.equal(repository.completions.length, 0);
+});
+
+void test('reauthorizes the persisted canonical qualification and preserves its candidate identity', async () => {
+  const repository = new FakeRepository([claim()]);
+  const persisted = canonicalQualification();
+  repository.snapshotValue = snapshot({ currentQualification:persisted });
+  const services = fakeServices('NOT_ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options({ executionMode:'observe',paperStrategyEnabled:false }),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind, 'completed');
+  assert.deepEqual(services.qualification.calls, [persisted]);
+  const input = services.candidates.calls[0];
+  assert.ok(input);
+  assert.equal(input.report, services.qualification.authorizedReport);
+  assert.equal(input.reportId, persisted.reportId);
+  assert.equal(input.qualificationEvent, persisted.qualificationEvent);
+  assert.equal(input.evidenceFingerprint, persisted.evidenceFingerprint);
+});
+
+void test('reauthorizes a JSON-deserialized qualification before creating a candidate', async () => {
+  const repository=new FakeRepository([claim()]);
+  const qualification=new QualificationRebuildService(
+    new QualificationEngine(createDefaultQualificationRuleSet(60)),
+  );
+  const persisted=fromJsonValue(toJsonValue(
+    realCanonicalQualification(qualification),
+  )) as CanonicalQualificationProjection;
+  repository.snapshotValue=snapshot({ currentQualification:persisted });
+  const services=fakeServices('NOT_ELIGIBLE');
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),qualification,services.candidates,services.strategy,
+    options({ executionMode:'observe',paperStrategyEnabled:false }),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.equal(services.candidates.calls.length,1);
+});
+
+for(const mutation of canonicalTamperingCases()){
+  void test(`rejects tampered persisted qualification ${mutation.name} before paper writes`,async()=>{
+    const repository=new FakeRepository([claim()]);
+    const qualification=new QualificationRebuildService(
+      new QualificationEngine(createDefaultQualificationRuleSet(60)),
+    );
+    const persisted=fromJsonValue(toJsonValue(
+      realCanonicalQualification(qualification),
+    )) as CanonicalQualificationProjection;
+    repository.snapshotValue=snapshot({ currentQualification:mutation.mutate(persisted) });
+    const services=fakeServices('NOT_ELIGIBLE');
+    const worker=new PaperDecisionWorker(
+      repository,new FakeQuotes(),qualification,services.candidates,services.strategy,
+      options({ executionMode:'observe',paperStrategyEnabled:false }),new ManualScheduler(),
+    );
+
+    assert.equal((await worker.runOnce()).kind,'failed');
+    assert.equal(repository.failures[0]?.failure.code,'DECISION_INVALID');
+    assert.equal(repository.failures[0]?.failure.retryable,false);
+    assert.equal(services.candidates.calls.length,0);
+    assert.equal(repository.stages.length,0);
+    assert.equal(repository.completions.length,0);
+  });
+}
 
 void test('quotes both directions, stages BUY_PENDING before the ledger and completes the opened session', async () => {
   const operations: string[] = [];
@@ -81,8 +171,7 @@ void test('reuses the persisted decision for an active session without entry quo
   repository.snapshotValue=snapshot({
     currentCandidate:candidate,currentSession:session,activePosition:POSITION,
     currentDecision:Object.freeze({
-      reportId:candidate.qualificationReportId,evidenceFingerprint:candidate.evidenceFingerprint,
-      report:report(),qualificationEvent:event('QualificationUpdated','evt_qualification'),
+      qualification:canonicalQualification(),
       candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
     }),
   });
@@ -96,6 +185,39 @@ void test('reuses the persisted decision for an active session without entry quo
   assert.equal((await worker.runOnce()).kind, 'completed');
   assert.equal(quotes.calls, 0);
   assert.equal(repository.stages.length, 1);
+});
+
+void test('reconciles the exact historical qualification without opening a new position', async () => {
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const historical=canonicalQualification();
+  const active=Object.freeze({
+    ...canonicalQualification(),reportId:`qreport_${'f'.repeat(64)}`,
+  });
+  const session=createPaperStrategySession({
+    candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'QUALIFIED_ENTRY',positionId:'position',
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:active,currentCandidate:candidate,currentSession:session,
+    activePosition:POSITION,currentDecision:Object.freeze({
+      qualification:historical,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.equal(services.qualification.calls[0],historical);
+  assert.equal(services.candidates.calls.length,0);
+  assert.deepEqual(operations,['stage','complete']);
 });
 
 void test('recovers a staged BUY_PENDING session after its paper position opened', async () => {
@@ -124,6 +246,40 @@ void test('recovers a staged BUY_PENDING session after its paper position opened
   assert.equal(quotes.calls, 0);
   assert.deepEqual(operations, ['stage','recover-open','complete']);
   assert.equal(repository.completions[0]?.result.session?.state, 'WAITING_EXTERNAL_BUYS');
+});
+
+void test('resumes a staged BUY_PENDING session with its historical qualification',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const historical=canonicalQualification();
+  const session=createPaperStrategySession({
+    candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:Object.freeze({
+      ...canonicalQualification(),reportId:`qreport_${'f'.repeat(64)}`,
+    }),currentCandidate:candidate,currentSession:session,activePosition:null,
+    currentDecision:Object.freeze({
+      qualification:historical,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const quotes=new FakeQuotes();
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.equal(services.qualification.calls[0],historical);
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(quotes.calls,0);
+  assert.deepEqual(operations,['stage','open','complete']);
 });
 
 void test('retracts a paper session when its source revision becomes orphaned', async () => {
@@ -312,8 +468,11 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
     candidate,event:event('TradingCandidateUpdated','evt_candidate'),
   });
   const candidates = {
+    calls:[] as Parameters<ConstructorParameters<typeof PaperDecisionWorker>[3]['create']>[0][],
     gate:Promise.resolve(),
-    async create() { await this.gate; return candidateResult; },
+    async create(input: Parameters<ConstructorParameters<typeof PaperDecisionWorker>[3]['create']>[0]) {
+      this.calls.push(input); await this.gate; return candidateResult;
+    },
   };
   const strategy = {
     prepare() {
@@ -372,7 +531,18 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
       });
     },
   };
-  return { qualification:{ rebuild:() => rebuilt },candidates,strategy };
+  const qualification = {
+    calls:[] as CanonicalQualificationProjection[],
+    authorizedReport:rebuilt.report,
+    reauthorize(projection:CanonicalQualificationProjection) {
+      this.calls.push(projection);
+      return Object.freeze({
+        ...rebuilt,reportId:'qreport_authorized',reportEventId:'evt_authorized',
+        evidenceFingerprint:'e'.repeat(64),event:event('QualificationUpdated','evt_authorized'),
+      });
+    },
+  };
+  return { qualification,candidates,strategy };
 }
 
 function options(overrides: Partial<ConstructorParameters<typeof PaperDecisionWorker>[5]> = {}) {
@@ -402,7 +572,8 @@ function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecision
       launchpad:'pumpfun',createdAt:asOfEvent.cursor,parameters:Object.freeze({}),
     }),metadata:null,social:null,creatorProfile:null,holderSnapshot:null,walletGraph:null,
     activeLaunchTrades:Object.freeze([]),activeMarketTrades:Object.freeze([]),
-    currentCandidate:null,currentDecision:null,currentSession:null,activePosition:null,...overrides,
+    currentQualification:canonicalQualification(),currentCandidate:null,currentDecision:null,
+    currentSession:null,activePosition:null,...overrides,
   });
 }
 
@@ -432,14 +603,77 @@ function report(): QualificationReport {
 }
 
 function persistedDecision(
-  candidate: ReturnType<typeof tradingCandidate>,
+  _candidate: ReturnType<typeof tradingCandidate>,
   confirmationStatus: 'confirmed' | 'orphaned' = 'confirmed',
 ) {
   return Object.freeze({
-    reportId:candidate.qualificationReportId,evidenceFingerprint:candidate.evidenceFingerprint,
-    report:report(),qualificationEvent:event('QualificationUpdated','evt_qualification',confirmationStatus),
+    qualification:canonicalQualification(confirmationStatus),
     candidateEvent:event('TradingCandidateUpdated','evt_candidate',confirmationStatus),
   });
+}
+
+function canonicalQualification(
+  confirmationStatus: 'confirmed' | 'orphaned' = 'confirmed',
+): CanonicalQualificationProjection {
+  const qualificationEvent=event('QualificationUpdated','evt_qualification',confirmationStatus);
+  const evaluation=Object.freeze({
+    evaluatedAtMs:1_000,signals:Object.freeze({}),blockers:Object.freeze([]),
+    calibrationFacts:null,
+  });
+  const qualificationReport=report();
+  return Object.freeze({
+    reportId:`qreport_${'b'.repeat(64)}`,sourceEventId:'evt_source',
+    sourceRawEventId:'raw_source',evidenceFingerprint:'d'.repeat(64),
+    evaluation,report:qualificationReport,
+    qualificationEvent:Object.freeze({
+      ...qualificationEvent,source:'qualification',payload:Object.freeze({
+        reportId:`qreport_${'b'.repeat(64)}`,evidenceFingerprint:'d'.repeat(64),
+        evaluation,report:qualificationReport,
+      }),
+    }),
+  });
+}
+
+function realCanonicalQualification(
+  service:QualificationRebuildService,
+):CanonicalQualificationProjection{
+  const paper=snapshot();
+  const rebuilt=service.rebuild({
+    snapshot:Object.freeze({
+      mint:paper.mint,asOfEvent:paper.asOfEvent,launch:paper.launch,
+      metadata:paper.metadata,social:paper.social,creatorProfile:paper.creatorProfile,
+      holderSnapshot:null,walletGraph:paper.walletGraph,
+    }),buyQuote:undefined,reverseSellQuote:undefined,
+  });
+  return Object.freeze({
+    reportId:rebuilt.reportId,sourceEventId:paper.asOfEvent.id,
+    sourceRawEventId:'raw_source',evidenceFingerprint:rebuilt.evidenceFingerprint,
+    evaluation:rebuilt.evaluation,report:rebuilt.report,qualificationEvent:rebuilt.event,
+  });
+}
+
+function canonicalTamperingCases():readonly Readonly<{
+  name:string;
+  mutate:(value:CanonicalQualificationProjection)=>CanonicalQualificationProjection;
+}>[]{
+  return [
+    { name:'evaluation',mutate:(value)=>({
+      ...value,evaluation:{ ...value.evaluation,evaluatedAtMs:value.evaluation.evaluatedAtMs+1 },
+    }) },
+    { name:'report',mutate:(value)=>({
+      ...value,report:{ ...value.report,verdict:'REJECTED' },
+    }) },
+    { name:'profile',mutate:(value)=>({
+      ...value,report:{
+        ...value.report,ruleSet:{ ...value.report.ruleSet,fingerprint:'f'.repeat(64) },
+      },
+    }) },
+    { name:'report id',mutate:(value)=>({ ...value,reportId:`qreport_${'f'.repeat(64)}` }) },
+    { name:'event id',mutate:(value)=>({
+      ...value,qualificationEvent:{ ...value.qualificationEvent,id:'evt_tampered' },
+    }) },
+    { name:'fingerprint',mutate:(value)=>({ ...value,evidenceFingerprint:'f'.repeat(64) }) },
+  ];
 }
 
 function event(
