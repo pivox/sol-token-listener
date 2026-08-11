@@ -427,6 +427,9 @@ void test('deployment error summaries categorize aggregate causes without raw me
 
 void test('deployment runbook documents the safe production lifecycle and safety boundary', async () => {
   const runbook = await readArtifact('docs/operations/deployment.md');
+  const packageJson = JSON.parse(await readArtifact('package.json')) as {
+    readonly scripts?: Readonly<Record<string, string>>;
+  };
 
   for (const heading of [
     '## Prérequis',
@@ -458,6 +461,16 @@ void test('deployment runbook documents the safe production lifecycle and safety
   );
   assert.match(runbook, /exec -T app node dist\/scripts\/deployment-healthcheck\.js/);
   assert.match(runbook, /pull postgres migrate app retention frontend/);
+  const escapedPostgresImage = postgresImage.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const validationPipeline = new RegExp(
+    `docker compose --env-file "\\$DEPLOY_ENV" -f deploy/compose\\.yaml --project-name sol-token-listener config --images migrate app retention frontend \\| grep -Fvx '${escapedPostgresImage}' \\| npm run --silent deployment:validate-images`,
+    'g',
+  );
+  assert.equal((runbook.match(validationPipeline) ?? []).length, 2);
+  assert.equal(
+    packageJson.scripts?.['deployment:validate-images'],
+    'node scripts/validate-deployment-images.mjs',
+  );
   assert.match(runbook, /up --detach --wait --wait-timeout 60 --no-build postgres/);
   assert.match(runbook, /deployment-healthcheck\.js --require-ok/);
   assert.match(runbook, /up -d --no-build --no-deps frontend/);
@@ -467,11 +480,31 @@ void test('deployment runbook documents the safe production lifecycle and safety
   assert.match(runbook, /production[^\n]*OK/i);
   assert.match(runbook, /down --volumes[\s\S]{0,120}destructif[\s\S]{0,120}jamais[\s\S]{0,120}arrêt normal/i);
   assert.match(runbook, /sans inverser[^\n]*migration/i);
-  assert.match(runbook, /BACKEND_IMAGE[\s\S]{0,240}FRONTEND_IMAGE[\s\S]{0,320}pull[\s\S]{0,320}up[^\n]*--no-build/i);
+  const rollback = runbook.slice(runbook.indexOf('## Rollback'), runbook.indexOf('## Proxy SSE'));
+  assert.match(rollback, /BACKEND_IMAGE[\s\S]*FRONTEND_IMAGE/);
+  assert.match(rollback, /pull app retention frontend/);
+  assert.match(rollback, /up -d --no-build --no-deps app retention/);
   assert.match(runbook, /restauration[^\n]*répétée/i);
   assert.match(runbook, /EXÉCUTION_MODE=observe|EXECUTION_MODE=observe/);
   assert.match(runbook, /observe|paper/i);
   assert.match(runbook, /aucun[^\n]*(?:wallet|clé privée|ordre réel|transaction live)/i);
+  assert.equal((runbook.match(/^health_attempt=0$/gm) ?? []).length, 2);
+  assert.equal((runbook.match(/^until docker compose .*deployment-healthcheck\.js --require-ok; do$/gm) ?? []).length, 2);
+  assert.equal((runbook.match(/^ {2}\[ "\$health_attempt" -lt 30 \] \|\| exit 1$/gm) ?? []).length, 2);
+  assert.equal((runbook.match(/^ {2}sleep 2$/gm) ?? []).length, 2);
+  assert.equal((runbook.match(/^set -euo pipefail$/gm) ?? []).length, 2);
+});
+
+void test('every deployment runbook shell block is syntactically valid Bash', async () => {
+  const runbook = await readArtifact('docs/operations/deployment.md');
+  const blocks = [...runbook.matchAll(/```bash\n([\s\S]*?)```/g)].map((match) => match[1] ?? '');
+  assert.ok(blocks.length >= 6);
+  for (const block of blocks) {
+    const syntax = spawnSync('bash', ['-n'], { encoding: 'utf8', input: block, timeout: 10_000 });
+    assert.equal(syntax.status, 0, syntax.stderr);
+    assert.equal(syntax.stdout, '');
+    assert.equal(syntax.stderr, '');
+  }
 });
 
 void test('deployment runbook verifies a real SSE heartbeat with a bounded, cleanup-safe curl probe', async () => {
