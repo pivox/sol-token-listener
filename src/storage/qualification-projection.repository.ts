@@ -68,6 +68,8 @@ const WALLET_RELATIONSHIP_ROW_MAXIMUM = 1_000;
 const WALLET_CLUSTER_ROW_MAXIMUM = 256;
 const WALLET_MEMBER_ROW_MAXIMUM = 1_024;
 const WALLET_MEMBERS_PER_CLUSTER_MAXIMUM = 256;
+const WALLET_FUNDING_EVIDENCE_ROW_MAXIMUM = 4_096;
+const DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM = 1_048_576;
 
 export class QualificationProjectionDataError extends Error {
   public constructor(message = 'Stored qualification projection data is invalid.') {
@@ -77,8 +79,8 @@ export class QualificationProjectionDataError extends Error {
 }
 
 export class QualificationProjectionRepositoryError extends Error {
-  public constructor() {
-    super('Qualification projection transaction failed.');
+  public constructor(options?: ErrorOptions) {
+    super('Qualification projection transaction failed.', options);
     this.name = 'QualificationProjectionRepositoryError';
   }
 }
@@ -105,33 +107,71 @@ implements QualificationProjectionRepository {
     } catch {
       throw new QualificationProjectionRepositoryError();
     }
+    let lockAcquired = false;
+    let transactionStarted = false;
+    let completed = false;
+    let result: TResult | undefined;
+    let primaryFailure: unknown;
+    const failures: unknown[] = [];
     try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       await client.query(
-        "SELECT pg_advisory_xact_lock(hashtextextended('qualification-projection:' || $1, 0))",
+        "SELECT pg_advisory_lock(hashtextextended('qualification-projection:' || $1, 0))",
         [mint],
       );
-      const result = await operation(new PostgresQualificationProjectionTransaction(
+      lockAcquired = true;
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      transactionStarted = true;
+      result = await operation(new PostgresQualificationProjectionTransaction(
         client,
         mint,
         this.authority,
       ));
       await client.query('COMMIT');
-      return result;
+      transactionStarted = false;
+      completed = true;
     } catch (error: unknown) {
-      try {
-        await client.query('ROLLBACK');
-      } catch {
-        // The original typed error remains authoritative.
+      primaryFailure = error;
+      failures.push(error);
+      if (transactionStarted) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackFailure: unknown) {
+          failures.push(rollbackFailure);
+        }
+        transactionStarted = false;
       }
-      if (error instanceof QualificationProjectionDataError) {
-        throw error;
-      }
-      if (error instanceof TypeError || error instanceof RangeError) throw invalid();
-      throw new QualificationProjectionRepositoryError();
     } finally {
+      if (lockAcquired) {
+        try {
+          const unlocked = await client.query(
+            "SELECT pg_advisory_unlock(hashtextextended('qualification-projection:' || $1, 0))",
+            [mint],
+          );
+          if (unlocked.rows[0]?.pg_advisory_unlock !== true) {
+            failures.push(new Error('Qualification projection session lock was not released.'));
+          }
+        } catch (unlockFailure: unknown) {
+          failures.push(unlockFailure);
+        }
+      }
       try { client.release(); } catch { /* connection is already unusable */ }
     }
+    if (failures.length !== 0) {
+      if (failures.length === 1 && primaryFailure instanceof QualificationProjectionDataError) {
+        throw primaryFailure;
+      }
+      if (
+        failures.length === 1
+        && (primaryFailure instanceof TypeError || primaryFailure instanceof RangeError)
+      ) throw invalid();
+      const redactedAggregate = new AggregateError(
+        failures.map(() => new Error('Qualification projection operation or cleanup failed.')),
+        'Qualification projection operation or cleanup failures were aggregated.',
+      );
+      throw new QualificationProjectionRepositoryError({ cause: redactedAggregate });
+    }
+    if (!completed) throw new QualificationProjectionRepositoryError();
+    return result as TResult;
   }
 }
 
@@ -226,7 +266,9 @@ implements QualificationProjectionTransaction {
           collection.input_fingerprint,collection.mint,
           collection.source_launch_event_id,collection.source_raw_event_id,
           collection.metadata_snapshot_id,collection.collection_status,
-          collection.observed_at,collection.payload_version
+          collection.observed_at,collection.payload_version,
+          social_event.payload_version AS social_event_payload_version,
+          social_event.payload AS social_event_payload
        FROM social_evidence_collections AS collection
        JOIN domain_events AS launch_event
          ON launch_event.event_id=collection.source_launch_event_id
@@ -236,18 +278,18 @@ implements QualificationProjectionTransaction {
        JOIN domain_events AS social_event
          ON social_event.mint=collection.mint
         AND social_event.type='SocialEvidenceCollected'
-        AND social_event.payload->>'collectionId'=collection.collection_id
-        AND social_event.payload->>'sourceLaunchEventId'=collection.source_launch_event_id
         AND social_event.raw_event_id=collection.source_raw_event_id
         AND social_event.confirmation_status=collection.confirmation_status
         AND social_event.confirmation_status <> 'orphaned'
+        AND social_event.observed_at=collection.observed_at
        WHERE collection.mint=$1
          AND collection.confirmation_status=launch_event.confirmation_status
          AND collection.confirmation_status <> 'orphaned'
          AND collection.terminal_at IS NULL
+         AND octet_length(social_event.payload::text) <= $3
        ORDER BY collection.observed_at DESC,collection.collection_id DESC
        LIMIT 1`,
-      [mint, launchEvent.id],
+      [mint, launchEvent.id, DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM],
     );
     const collectionRow = socialResult.rows[0];
     const social = collectionRow === undefined
@@ -299,8 +341,10 @@ implements QualificationProjectionTransaction {
          AND event.confirmation_status=profile.confirmation_status
          AND raw.confirmation_status=event.confirmation_status
          AND raw.confirmation_status <> 'orphaned'
-         AND event.payload->>'inputFingerprint'=profile.input_fingerprint`,
-      [mint],
+         AND event.payload->>'inputFingerprint'=profile.input_fingerprint
+         AND octet_length(profile.payload::text) <= $2
+         AND octet_length(event.payload::text) <= $2`,
+      [mint, DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM],
     );
     const creatorProfile = creatorResult.rows[0] === undefined
       ? null
@@ -312,7 +356,8 @@ implements QualificationProjectionTransaction {
           holder.top1_bps::text,holder.top5_bps::text,holder.top10_bps::text,
           holder.creator_bps::text,holder.unique_known_buyers,
           holder.unique_external_buyers,holder.positive_position_count,
-          holder.unknown_trader_trade_count,holder.payload,event.payload AS event_payload
+          holder.unknown_trader_trade_count,event.payload_version AS event_payload_version,
+          event.payload AS event_payload
        FROM token_holders_snapshots AS holder
        JOIN domain_events AS event ON event.event_id=holder.holder_event_id
        JOIN raw_chain_events AS raw
@@ -328,15 +373,20 @@ implements QualificationProjectionTransaction {
          AND raw.confirmation_status=event.confirmation_status
          AND raw.confirmation_status <> 'orphaned'
          AND event.payload->>'inputFingerprint'=holder.input_fingerprint
+         AND octet_length(event.payload::text) <= $3
        ORDER BY holder.as_of_slot DESC,holder.as_of_transaction_index DESC,
          holder.as_of_instruction_index DESC,
          COALESCE(holder.as_of_inner_instruction_index,-1) DESC,holder.snapshot_id DESC
        LIMIT 1`,
-      [mint, creatorProfile?.inputFingerprint ?? null],
+      [
+        mint,
+        creatorProfile?.inputFingerprint ?? null,
+        DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM,
+      ],
     );
     const holderSnapshot = holderResult.rows[0] === undefined
       ? null
-      : holderDistributionFromRow(holderResult.rows[0], mint);
+      : holderDistributionFromRow(holderResult.rows[0], mint, creatorProfile?.creator ?? null);
     if (
       (creatorProfile === null) !== (holderSnapshot === null)
       || (
@@ -355,7 +405,9 @@ implements QualificationProjectionTransaction {
           event.payload AS graph_event_payload,
           graph.strong_relationship_count,graph.medium_relationship_count,
           graph.cluster_count,graph.maximum_cluster_bps::text,
-          graph.creator_cluster_count
+          graph.creator_cluster_count,graph.as_of_slot::text AS as_of_slot,
+          graph.as_of_transaction_index,graph.as_of_instruction_index,
+          graph.as_of_inner_instruction_index
        FROM wallet_graph_profiles AS graph
        JOIN domain_events AS event ON event.event_id=graph.graph_event_id
        JOIN raw_chain_events AS raw
@@ -406,6 +458,8 @@ implements QualificationProjectionTransaction {
         graphResult.rows[0],
         mint,
         participantInputFingerprint,
+        launch.creator,
+        holderSnapshot?.totalPositiveNetBaseRaw ?? 0n,
       );
     return Object.freeze({
       mint,
@@ -471,6 +525,7 @@ implements QualificationProjectionTransaction {
       || collection.sourceLaunchEventId !== launchEventId
       || text(collectionRow.source_raw_event_id) !== launchRawEventId
     ) throw invalid();
+    assertSocialEventPayload(collectionRow, collection);
     return collection;
   }
 
@@ -478,6 +533,8 @@ implements QualificationProjectionTransaction {
     graphRow: Record<string, unknown>,
     mint: string,
     participantInputFingerprint: string,
+    creator: string,
+    holderTotalPositiveBaseRaw: bigint,
   ): Promise<WalletGraphAnalysis> {
     const inputFingerprint = hash(graphRow.input_fingerprint);
     if (text(graphRow.participant_input_fingerprint) !== participantInputFingerprint) {
@@ -521,9 +578,34 @@ implements QualificationProjectionTransaction {
         WALLET_MEMBERS_PER_CLUSTER_MAXIMUM + 1,
       ],
     );
+    const fundingResult = await this.client.query(
+      `SELECT /* qualification_graph_funding */ evidence.buyer,evidence.funder
+       FROM wallet_funding_evidence AS evidence
+       JOIN wallet_funding_observations AS observation
+         ON observation.assessment_id=evidence.assessment_id
+        AND observation.confirmation_status <> 'orphaned'
+       WHERE evidence.mint=$1
+         AND evidence.evidence_type='DIRECT_QUOTE_TRANSFER'
+         AND evidence.confidence='STRONG'
+         AND evidence.confirmation_status <> 'orphaned'
+         AND (
+           evidence.buy_slot,evidence.buy_transaction_index,
+           evidence.buy_instruction_index,COALESCE(evidence.buy_inner_instruction_index,-1)
+         ) <= ($3::numeric,$4::integer,$5::integer,COALESCE($6::integer,-1))
+       ORDER BY evidence.evidence_id LIMIT $2`,
+      [
+        mint,
+        WALLET_FUNDING_EVIDENCE_ROW_MAXIMUM + 1,
+        unsignedBigInt(graphRow.as_of_slot).toString(),
+        index(graphRow.as_of_transaction_index),
+        index(graphRow.as_of_instruction_index),
+        nullableIndex(graphRow.as_of_inner_instruction_index),
+      ],
+    );
     assertBoundedRows(relationshipResult.rows, WALLET_RELATIONSHIP_ROW_MAXIMUM);
     assertBoundedRows(clusterResult.rows, WALLET_CLUSTER_ROW_MAXIMUM);
     assertBoundedRows(memberResult.rows, WALLET_MEMBER_ROW_MAXIMUM);
+    assertBoundedRows(fundingResult.rows, WALLET_FUNDING_EVIDENCE_ROW_MAXIMUM);
     assertBoundedClusterMembers(memberResult.rows);
     const members = membersByCluster(memberResult.rows, inputFingerprint);
     const relationships = Object.freeze(relationshipResult.rows.map((row) => (
@@ -532,6 +614,17 @@ implements QualificationProjectionTransaction {
     const clusters = Object.freeze(clusterResult.rows.map((row) => (
       clusterFromRow(row, mint, inputFingerprint, members.get(text(row.cluster_id)) ?? [])
     )));
+    const funding = Object.freeze(fundingResult.rows.map((row) => Object.freeze({
+      buyer: text(row.buyer),
+      funder: text(row.funder),
+    })));
+    assertWalletClusterDerivations(
+      clusters,
+      relationships,
+      funding,
+      creator,
+      holderTotalPositiveBaseRaw,
+    );
     if ([...members.keys()].some((clusterId) =>
       !clusters.some((cluster) => cluster.id === clusterId))) throw invalid();
     const coverage = coverageFromJson(graphRow.coverage);
@@ -651,24 +744,50 @@ implements QualificationProjectionTransaction {
       if (reactivated.rowCount !== 1) throw invalid();
       return 'UPDATED';
     }
-    const insertedEvent = await this.client.query(
-      `INSERT INTO domain_events (
-        event_id,raw_event_id,type,mint,source,program,signature,slot,
-        transaction_index,instruction_index,inner_instruction_index,
-        confirmation_status,blockchain_time,observed_at,payload_version,payload
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-      [
-        event.id, projection.sourceRawEventId, event.type, event.mint, event.source,
-        event.program, event.signature, event.cursor.slot.toString(),
-        event.cursor.transactionIndex, event.cursor.instructionIndex,
-        event.cursor.innerInstructionIndex, event.confirmationStatus,
-        date(event.blockchainTimeMs), new Date(event.observedAtMs),
-        event.payloadVersion, toJsonValue(event.payload),
-      ],
-    );
-    if (insertedEvent.rowCount !== 1) throw invalid();
     const evaluatedAt = retentionDate(projection.report.evaluatedAtMs, 0);
     const purgeAfter = retentionDate(projection.report.evaluatedAtMs, 14_400_000);
+    const existingEvent = await this.client.query(
+      `SELECT /* qualification_existing_event */ event_id,raw_event_id,type,mint,source,
+          program,signature,slot::text AS slot,transaction_index,instruction_index,
+          inner_instruction_index,confirmation_status,blockchain_time,observed_at,
+          payload_version,payload
+       FROM domain_events WHERE event_id=$1 FOR UPDATE`,
+      [event.id],
+    );
+    if (existingEvent.rows[0] === undefined) {
+      const insertedEvent = await this.client.query(
+        `INSERT INTO domain_events (
+          event_id,raw_event_id,type,mint,source,program,signature,slot,
+          transaction_index,instruction_index,inner_instruction_index,
+          confirmation_status,blockchain_time,observed_at,payload_version,payload,
+          terminal_at,purge_after
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+        ON CONFLICT (event_id) DO NOTHING`,
+        [
+          event.id, projection.sourceRawEventId, event.type, event.mint, event.source,
+          event.program, event.signature, event.cursor.slot.toString(),
+          event.cursor.transactionIndex, event.cursor.instructionIndex,
+          event.cursor.innerInstructionIndex, event.confirmationStatus,
+          date(event.blockchainTimeMs), new Date(event.observedAtMs),
+          event.payloadVersion, toJsonValue(event.payload), evaluatedAt, purgeAfter,
+        ],
+      );
+      if (insertedEvent.rowCount !== 1) {
+        const racedEvent = await this.client.query(
+          `SELECT /* qualification_existing_event */ event_id,raw_event_id,type,mint,source,
+              program,signature,slot::text AS slot,transaction_index,instruction_index,
+              inner_instruction_index,confirmation_status,blockchain_time,observed_at,
+              payload_version,payload
+           FROM domain_events WHERE event_id=$1 FOR UPDATE`,
+          [event.id],
+        );
+        const racedRow = racedEvent.rows[0];
+        if (racedRow === undefined) throw invalid();
+        assertQualificationEventRow(racedRow, projection);
+      }
+    } else {
+      assertQualificationEventRow(existingEvent.rows[0], projection);
+    }
     const insertedReport = await this.client.query(
       `INSERT INTO qualification_reports (
         report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
@@ -881,6 +1000,28 @@ function socialEvidenceFromRow(row: Record<string, unknown>): SocialVerification
   });
 }
 
+function assertSocialEventPayload(
+  row: Record<string, unknown>,
+  collection: SocialEvidenceCollectionV1,
+): void {
+  if (positiveIndex(row.social_event_payload_version) !== 1) throw invalid();
+  const payload = record(decodeJson(row.social_event_payload));
+  exactKeys(payload, [
+    'sourceLaunchEventId', 'collectionId', 'metadataSnapshotId', 'collectionStatus',
+    'inputFingerprint', 'linkCount', 'evidenceCount',
+  ]);
+  const expected = Object.freeze({
+    sourceLaunchEventId: collection.sourceLaunchEventId,
+    collectionId: collection.id,
+    metadataSnapshotId: collection.metadataSnapshotId,
+    collectionStatus: collection.status,
+    inputFingerprint: collection.inputFingerprint,
+    linkCount: collection.links.length,
+    evidenceCount: collection.evidence.length,
+  });
+  if (canonicalStringifyJson(payload) !== canonicalStringifyJson(expected)) throw invalid();
+}
+
 const CREATOR_PROFILE_FIELDS = [
   'mint', 'creator', 'payloadVersion', 'inputFingerprint', 'buyCount', 'sellCount',
   'totalBoughtBaseRaw', 'totalSoldBaseRaw', 'observedNetBaseRaw', 'hasSold',
@@ -919,22 +1060,31 @@ function creatorProfileFromRow(
   return profile;
 }
 
-const HOLDER_FIELDS = [
-  'mint', 'creator', 'payloadVersion', 'inputFingerprint', 'positions',
-  'totalPositiveNetBaseRaw', 'top1Bps', 'top5Bps', 'top10Bps', 'creatorBps',
-  'uniqueKnownBuyers', 'uniqueExternalBuyers', 'positivePositionCount',
-  'unknownTraderTradeCount',
-] as const;
-
 function holderDistributionFromRow(
   row: Record<string, unknown>,
   mint: string,
+  creator: string | null,
 ): HolderDistribution {
-  const decoded = record(decodeJson(row.payload));
-  exactKeys(decoded, HOLDER_FIELDS);
-  const distribution = decoded as unknown as HolderDistribution;
+  if (creator === null) throw invalid();
+  if (positiveIndex(row.payload_version) !== 1) throw invalid();
+  const distribution = Object.freeze({
+    mint: text(row.mint),
+    creator,
+    payloadVersion: 1 as const,
+    inputFingerprint: hash(row.input_fingerprint),
+    positions: Object.freeze([]),
+    totalPositiveNetBaseRaw: unsignedBigInt(row.total_positive_net_base_raw),
+    top1Bps: unsignedBigInt(row.top1_bps),
+    top5Bps: unsignedBigInt(row.top5_bps),
+    top10Bps: unsignedBigInt(row.top10_bps),
+    creatorBps: unsignedBigInt(row.creator_bps),
+    uniqueKnownBuyers: index(row.unique_known_buyers),
+    uniqueExternalBuyers: index(row.unique_external_buyers),
+    positivePositionCount: index(row.positive_position_count),
+    unknownTraderTradeCount: index(row.unknown_trader_trade_count),
+  });
   assertValidHolderDistribution(distribution);
-  assertHolderDistributionDetails(distribution);
+  if (positiveIndex(row.event_payload_version) !== 1) throw invalid();
   assertParticipantEventPayload(
     row.event_payload,
     distribution.inputFingerprint,
@@ -943,19 +1093,6 @@ function holderDistributionFromRow(
   );
   if (
     distribution.mint !== mint
-    || distribution.mint !== text(row.mint)
-    || distribution.payloadVersion !== positiveIndex(row.payload_version)
-    || distribution.inputFingerprint !== hash(row.input_fingerprint)
-    || distribution.totalPositiveNetBaseRaw
-      !== unsignedBigInt(row.total_positive_net_base_raw)
-    || distribution.top1Bps !== unsignedBigInt(row.top1_bps)
-    || distribution.top5Bps !== unsignedBigInt(row.top5_bps)
-    || distribution.top10Bps !== unsignedBigInt(row.top10_bps)
-    || distribution.creatorBps !== unsignedBigInt(row.creator_bps)
-    || distribution.uniqueKnownBuyers !== index(row.unique_known_buyers)
-    || distribution.uniqueExternalBuyers !== index(row.unique_external_buyers)
-    || distribution.positivePositionCount !== index(row.positive_position_count)
-    || distribution.unknownTraderTradeCount !== index(row.unknown_trader_trade_count)
     || text(row.holder_event_id).length === 0
     || confirmation(row.confirmation_status) === 'orphaned'
   ) throw invalid();
@@ -1018,31 +1155,6 @@ function assertCreatorTradeEvidence(value: unknown): void {
   unsignedBigIntValue(fields.baseAmountRaw);
   unsignedBigIntValue(fields.quoteAmountRaw);
   quoteAssetFromJson(fields.quoteAsset);
-}
-
-function assertHolderDistributionDetails(distribution: HolderDistribution): void {
-  assertDataArray(distribution.positions);
-  const wallets = new Set<string>();
-  for (const position of distribution.positions) {
-    const fields = record(position);
-    exactKeys(fields, [
-      'wallet', 'isCreator', 'buyCount', 'sellCount', 'boughtBaseRaw',
-      'soldBaseRaw', 'observedNetBaseRaw', 'quoteFlows',
-      'firstObservedCursor', 'lastObservedCursor',
-    ]);
-    const wallet = text(fields.wallet);
-    if (wallets.has(wallet)) throw invalid();
-    wallets.add(wallet);
-    booleanValue(fields.isCreator);
-    index(fields.buyCount);
-    index(fields.sellCount);
-    unsignedBigIntValue(fields.boughtBaseRaw);
-    unsignedBigIntValue(fields.soldBaseRaw);
-    signedBigInt(fields.observedNetBaseRaw);
-    assertQuoteFlows(fields.quoteFlows);
-    cursorFromDecodedJson(fields.firstObservedCursor);
-    cursorFromDecodedJson(fields.lastObservedCursor);
-  }
 }
 
 function assertQuoteFlows(value: unknown): void {
@@ -1122,6 +1234,124 @@ function clusterFromRow(
     strongEvidenceCount: index(row.strong_evidence_count),
     quoteAssets: Object.freeze(quoteAssetsValue.map(quoteAssetFromJson)),
   });
+}
+
+function assertWalletClusterDerivations(
+  clusters: readonly WalletCluster[],
+  relationships: readonly WalletRelationship[],
+  funding: readonly Readonly<{ buyer: string; funder: string }>[],
+  creator: string,
+  holderTotalPositiveBaseRaw: bigint,
+): void {
+  const clusterByWallet = new Map<string, string>();
+  for (const cluster of clusters) {
+    for (const member of cluster.members) {
+      if (clusterByWallet.has(member.wallet)) throw invalid();
+      clusterByWallet.set(member.wallet, cluster.id);
+      if (member.isCreator !== (member.wallet === creator)) throw invalid();
+    }
+  }
+  for (const relationship of relationships) {
+    if (relationship.confidence !== 'STRONG') continue;
+    const leftCluster = clusterByWallet.get(relationship.leftWallet);
+    const rightCluster = clusterByWallet.get(relationship.rightWallet);
+    if (
+      (leftCluster === undefined) !== (rightCluster === undefined)
+      || (
+        leftCluster !== undefined
+        && rightCluster !== undefined
+        && leftCluster !== rightCluster
+      )
+    ) throw invalid();
+  }
+  for (const cluster of clusters) {
+    const wallets = new Set(cluster.members.map((member) => member.wallet));
+    const strongRelationships = relationships.filter((relationship) => (
+      relationship.confidence === 'STRONG'
+      && wallets.has(relationship.leftWallet)
+      && wallets.has(relationship.rightWallet)
+    ));
+    assertStrongClusterConnected(wallets, strongRelationships);
+    const participantWalletCount = cluster.members.filter((member) => (
+      member.role === 'PARTICIPANT'
+    )).length;
+    const auxiliaryWalletCount = cluster.members.length - participantWalletCount;
+    const positiveHolderCount = cluster.members.filter((member) => (
+      member.observedNetBaseRaw > 0n
+    )).length;
+    const observedPositiveBaseRaw = cluster.members.reduce(
+      (sum, member) => sum + (member.observedNetBaseRaw > 0n ? member.observedNetBaseRaw : 0n),
+      0n,
+    );
+    const concentrationBps = holderTotalPositiveBaseRaw === 0n
+      ? 0n
+      : observedPositiveBaseRaw * 10_000n / holderTotalPositiveBaseRaw;
+    const quoteAssets = new Map<string, QuoteAsset>();
+    for (const relationship of strongRelationships) {
+      for (const total of relationship.quoteTotals) {
+        quoteAssets.set(qualificationQuoteAssetKey(total.quoteAsset), total.quoteAsset);
+      }
+    }
+    const expectedQuoteAssets = Object.freeze([...quoteAssets.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([, asset]) => asset));
+    const buyersByFunder = new Map<string, Set<string>>();
+    for (const item of funding) {
+      if (!wallets.has(item.funder) || !wallets.has(item.buyer)) continue;
+      const buyers = buyersByFunder.get(item.funder) ?? new Set<string>();
+      buyers.add(item.buyer);
+      buyersByFunder.set(item.funder, buyers);
+    }
+    const sharedFunderCount = [...buyersByFunder.values()].filter((buyers) => (
+      buyers.size >= 2
+    )).length;
+    if (
+      cluster.participantWalletCount !== participantWalletCount
+      || cluster.auxiliaryWalletCount !== auxiliaryWalletCount
+      || cluster.positiveHolderCount !== positiveHolderCount
+      || cluster.observedPositiveBaseRaw !== observedPositiveBaseRaw
+      || cluster.concentrationBps !== concentrationBps
+      || cluster.containsCreator !== wallets.has(creator)
+      || cluster.sharedFunderCount !== sharedFunderCount
+      || cluster.strongRelationshipCount !== strongRelationships.length
+      || cluster.strongEvidenceCount !== strongRelationships.reduce(
+        (sum, relationship) => sum + relationship.evidenceCount,
+        0,
+      )
+      || canonicalStringifyJson(cluster.quoteAssets)
+        !== canonicalStringifyJson(expectedQuoteAssets)
+    ) throw invalid();
+  }
+}
+
+function assertStrongClusterConnected(
+  wallets: ReadonlySet<string>,
+  relationships: readonly WalletRelationship[],
+): void {
+  const first = wallets.values().next().value;
+  if (first === undefined) throw invalid();
+  const adjacency = new Map<string, Set<string>>();
+  for (const relationship of relationships) {
+    const left = adjacency.get(relationship.leftWallet) ?? new Set<string>();
+    left.add(relationship.rightWallet);
+    adjacency.set(relationship.leftWallet, left);
+    const right = adjacency.get(relationship.rightWallet) ?? new Set<string>();
+    right.add(relationship.leftWallet);
+    adjacency.set(relationship.rightWallet, right);
+  }
+  const visited = new Set<string>();
+  const pending = [first];
+  while (pending.length !== 0) {
+    const wallet = pending.pop();
+    if (wallet === undefined || visited.has(wallet)) continue;
+    visited.add(wallet);
+    pending.push(...(adjacency.get(wallet) ?? []));
+  }
+  if (visited.size !== wallets.size) throw invalid();
+}
+
+function qualificationQuoteAssetKey(asset: QuoteAsset): string {
+  return `${asset.mint}\0${asset.decimals}\0${asset.tokenProgram}`;
 }
 
 function assertBoundedRows(
@@ -1263,6 +1493,32 @@ function assertSourceMapping(
     || confirmation(row.confirmation_status) !== event.confirmationStatus
     || nullableTimestamp(row.blockchain_time) !== event.blockchainTimeMs
     || timestamp(row.observed_at) !== event.observedAtMs
+  ) throw invalid();
+}
+
+function assertQualificationEventRow(
+  row: Record<string, unknown>,
+  projection: CanonicalQualificationProjection,
+): void {
+  const event = projection.qualificationEvent;
+  if (
+    text(row.event_id) !== event.id
+    || text(row.raw_event_id) !== projection.sourceRawEventId
+    || row.type !== event.type
+    || text(row.mint) !== event.mint
+    || text(row.source) !== event.source
+    || text(row.program) !== event.program
+    || text(row.signature) !== event.signature
+    || unsignedBigInt(row.slot) !== event.cursor.slot
+    || index(row.transaction_index) !== event.cursor.transactionIndex
+    || index(row.instruction_index) !== event.cursor.instructionIndex
+    || nullableIndex(row.inner_instruction_index) !== event.cursor.innerInstructionIndex
+    || confirmation(row.confirmation_status) !== event.confirmationStatus
+    || nullableTimestamp(row.blockchain_time) !== event.blockchainTimeMs
+    || timestamp(row.observed_at) !== event.observedAtMs
+    || positiveIndex(row.payload_version) !== event.payloadVersion
+    || canonicalStringifyJson(decodeJson(row.payload))
+      !== canonicalStringifyJson(event.payload)
   ) throw invalid();
 }
 

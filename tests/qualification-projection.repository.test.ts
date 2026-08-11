@@ -37,23 +37,24 @@ const WALLET_RELATIONSHIP_ROW_MAXIMUM = 1_000;
 const WALLET_CLUSTER_ROW_MAXIMUM = 256;
 const WALLET_MEMBER_ROW_MAXIMUM = 1_024;
 const WALLET_MEMBERS_PER_CLUSTER_MAXIMUM = 256;
+const WALLET_FUNDING_EVIDENCE_ROW_MAXIMUM = 4_096;
 
-void test('uses a repeatable-read mint lock and commits and releases', async () => {
+void test('acquires a session mint lock before repeatable read and always unlocks', async () => {
   const database = new ScriptedPool();
   const repository = new PostgresQualificationProjectionRepository(database, validator());
 
   const result = await repository.transact('mint', async () => 'result');
 
   assert.equal(result, 'result');
-  assert.deepEqual(database.queries.slice(0, 2).map((call) => call.text), [
-    'BEGIN ISOLATION LEVEL REPEATABLE READ',
-    database.queries[1]?.text,
-  ]);
+  assert.match(database.queries[0]?.text ?? '', /pg_advisory_lock/u);
+  assert.equal(database.queries[1]?.text, 'BEGIN ISOLATION LEVEL REPEATABLE READ');
   assert.match(
-    database.queries[1]?.text ?? '',
+    database.queries[0]?.text ?? '',
     /hashtextextended\('qualification-projection:' \|\| \$1, 0\)/u,
   );
-  assert.deepEqual(database.queries.at(-1)?.text, 'COMMIT');
+  assert.equal(database.queries.some((call) => call.text.includes('pg_advisory_xact_lock')), false);
+  assert.equal(database.queries.at(-2)?.text, 'COMMIT');
+  assert.match(database.queries.at(-1)?.text ?? '', /pg_advisory_unlock/u);
   assert.equal(database.released, true);
 });
 
@@ -72,7 +73,62 @@ void test('rolls back and releases without leaking database causes', async () =>
       return true;
     },
   );
-  assert.equal(database.queries.at(-1)?.text, 'ROLLBACK');
+  assert.equal(database.queries.at(-2)?.text, 'ROLLBACK');
+  assert.match(database.queries.at(-1)?.text ?? '', /pg_advisory_unlock/u);
+  assert.equal(database.released, true);
+});
+
+void test('redacts rollback and unlock failures while releasing the connection', async () => {
+  const database = new ScriptedPool((text) => {
+    if (text === 'ROLLBACK') throw new Error('rollback-password');
+    if (text.includes('pg_advisory_unlock')) throw new Error('unlock-password');
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', async () => { throw new Error('primary-password'); }),
+    (error: unknown) => {
+      assert.ok(error instanceof QualificationProjectionRepositoryError);
+      assert.equal(error.message, 'Qualification projection transaction failed.');
+      assert.doesNotMatch(error.message, /password/u);
+      assert.ok(error.cause instanceof AggregateError);
+      assert.equal(error.cause.errors.length, 3);
+      assert.doesNotMatch(JSON.stringify(error.cause), /password/u);
+      return true;
+    },
+  );
+  assert.equal(database.released, true);
+});
+
+void test('does not unlock when session lock acquisition fails', async () => {
+  const database = new ScriptedPool((text) => {
+    if (text.includes('pg_advisory_lock')) throw new Error('lock-password');
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', async () => undefined),
+    QualificationProjectionRepositoryError,
+  );
+  assert.equal(database.queries.some((call) => call.text.includes('pg_advisory_unlock')), false);
+  assert.equal(database.released, true);
+});
+
+void test('treats a false session unlock result as a cleanup failure', async () => {
+  const database = new ScriptedPool((text) => {
+    if (text.includes('pg_advisory_unlock')) {
+      return rows([{ pg_advisory_unlock: false }]);
+    }
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', async () => undefined),
+    QualificationProjectionRepositoryError,
+  );
   assert.equal(database.released, true);
 });
 
@@ -149,7 +205,7 @@ void test('fails closed when a canonical row has no exact raw lineage', async ()
       return true;
     },
   );
-  assert.equal(database.queries.at(-1)?.text, 'ROLLBACK');
+  assert.equal(database.queries.at(-2)?.text, 'ROLLBACK');
 });
 
 void test('reconstructs metadata and social evidence only through the active launch collection', async () => {
@@ -179,10 +235,42 @@ void test('reconstructs metadata and social evidence only through the active lau
   assert.match(socialSql, /social_event\.type='SocialEvidenceCollected'/u);
   assert.match(socialSql, /social_event\.confirmation_status=collection\.confirmation_status/u);
   assert.match(socialSql, /collection\.confirmation_status=launch_event\.confirmation_status/u);
+  assert.match(socialSql, /social_event\.payload_version AS social_event_payload_version/u);
+  assert.match(socialSql, /social_event\.payload AS social_event_payload/u);
   const metadataSql = database.queries.find((call) =>
     call.text.includes('qualification_metadata_collection'))?.text ?? '';
   assert.match(metadataSql, /snapshot_id=\$1/u);
   assert.doesNotMatch(metadataSql, /ORDER BY fetched_at/u);
+});
+
+void test('rejects a social event summary that differs from the reconstructed collection', async () => {
+  const evidence = socialFixture();
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_launch')) return rows([launchRow(evidence.mint)]);
+    if (text.includes('qualification_as_of')) return rows([asOfRow(evidence.mint)]);
+    if (text.includes('qualification_social */')) {
+      return rows([{
+        ...evidence.collectionRow,
+        social_event_payload: toJsonValue({
+          ...(evidence.collectionRow.social_event_payload as Record<string, unknown>),
+          evidenceCount: 2,
+        }),
+      }]);
+    }
+    if (text.includes('qualification_social_links')) return rows([evidence.linkRow]);
+    if (text.includes('qualification_social_observations')) return rows([evidence.observationRow]);
+    if (text.includes('qualification_social_verification')) return rows([evidence.evidenceRow]);
+    if (text.includes('qualification_metadata_collection')) return rows([evidence.metadataRow]);
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact(evidence.mint, (transaction) => (
+      transaction.loadCanonicalInput(evidence.mint)
+    )),
+    QualificationProjectionDataError,
+  );
 });
 
 void test('loads participant and complete current wallet graph only through active derived events', async () => {
@@ -214,6 +302,64 @@ void test('loads participant and complete current wallet graph only through acti
   assert.match(graphSql, /event\.payload AS graph_event_payload/u);
   assert.match(graphSql, /snapshot\.input_fingerprint=graph\.input_fingerprint/u);
   assert.match(graphSql, /snapshot\.graph_event_id=graph\.graph_event_id/u);
+  const holderSql = database.queries.find((call) => (
+    call.text.includes('qualification_holders')
+  ))?.text ?? '';
+  assert.doesNotMatch(holderSql, /holder\.payload(?:,|\s)/u);
+  assert.match(holderSql, /octet_length\(event\.payload::text\) <= \$3/u);
+});
+
+void test('reconstructs holder aggregates without touching the snapshot payload', async () => {
+  const evidence = analyticsFixture();
+  let touched = false;
+  const holderRow = { ...evidence.holderRow };
+  Object.defineProperty(holderRow, 'payload', {
+    enumerable: true,
+    get: () => {
+      touched = true;
+      throw new Error('oversized holder payload materialized');
+    },
+  });
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_launch')) return rows([launchRow()]);
+    if (text.includes('qualification_as_of')) return rows([asOfRow()]);
+    if (text.includes('qualification_creator')) return rows([evidence.profileRow]);
+    if (text.includes('qualification_holders')) return rows([holderRow]);
+    if (text.includes('qualification_graph */')) return rows([evidence.graphRow]);
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  const snapshot = await repository.transact('mint', (transaction) => (
+    transaction.loadCanonicalInput('mint')
+  ));
+
+  assert.equal(touched, false);
+  assert.deepEqual(snapshot?.holderSnapshot?.positions, []);
+  assert.equal(snapshot?.holderSnapshot?.totalPositiveNetBaseRaw, 2n);
+});
+
+void test('rejects a holder event summary that differs from reconstructed scalars', async () => {
+  const evidence = analyticsFixture();
+  const originalEvent = evidence.holderRow.event_payload as Record<string, unknown>;
+  const holderRow = {
+    ...evidence.holderRow,
+    event_payload: toJsonValue({
+      inputFingerprint: 'c'.repeat(64),
+      confirmationCounts: { processed: 0, confirmed: 1, finalized: 0 },
+      distribution: {
+        ...(originalEvent.distribution as Record<string, unknown>),
+        totalPositiveNetBaseRaw: 3n,
+      },
+    }),
+  };
+  const database = analyticsPool(evidence, evidence.graphRow, holderRow);
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+    QualificationProjectionDataError,
+  );
 });
 
 void test('validates source lineage, supersedes current first and inserts one four-hour report', async () => {
@@ -221,7 +367,7 @@ void test('validates source lineage, supersedes current first and inserts one fo
   let authorized = false;
   const database = new ScriptedPool((text) => {
     if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
-    return rows([]);
+    return undefined;
   });
   const repository = new PostgresQualificationProjectionRepository(database, {
     reauthorize: (received) => {
@@ -255,6 +401,9 @@ void test('validates source lineage, supersedes current first and inserts one fo
   assert.ok(evaluatedAt);
   assert.ok(purgeAfter);
   assert.equal(purgeAfter.getTime() - evaluatedAt.getTime(), 14_400_000);
+  const eventInsert = statements[eventIndex] ?? '';
+  assert.match(eventInsert, /ON CONFLICT \(event_id\) DO NOTHING/u);
+  assert.match(eventInsert, /terminal_at,purge_after/u);
 });
 
 void test('rejects sourceRawEventId substitution before writing', async () => {
@@ -519,6 +668,21 @@ for (const family of ['relationships', 'clusters', 'members'] as const) {
   });
 }
 
+void test('accepts the exact per-cluster wallet member boundary', async () => {
+  const evidence = walletBoundaryFixture('per_cluster');
+  const database = graphPool(evidence);
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  const snapshot = await repository.transact('mint', (transaction) => (
+    transaction.loadCanonicalInput('mint')
+  ));
+
+  assert.equal(
+    snapshot?.walletGraph?.clusters[0]?.members.length,
+    WALLET_MEMBERS_PER_CLUSTER_MAXIMUM,
+  );
+});
+
 void test('rejects a wallet cluster member per-cluster overflow before decoding', async () => {
   const evidence = analyticsFixture();
   let touched = false;
@@ -548,6 +712,85 @@ void test('rejects a wallet cluster member per-cluster overflow before decoding'
     QualificationProjectionDataError,
   );
   assert.equal(touched, false);
+});
+
+for (const mutation of [
+  ['participant_wallet_count', 3],
+  ['auxiliary_wallet_count', 1],
+  ['positive_holder_count', 1],
+  ['observed_positive_base_raw', '1'],
+  ['concentration_bps', '1'],
+  ['contains_creator', true],
+  ['shared_funder_count', 1],
+  ['strong_relationship_count', 0],
+  ['strong_evidence_count', 0],
+  ['quote_assets', [{ mint: 'quote', decimals: 6, tokenProgram: 'SPL_TOKEN' }]],
+] as const) {
+  void test(`rejects wallet cluster ${mutation[0]} mismatch`, async () => {
+    const evidence = walletBoundaryFixture('clusters');
+    const first = evidence.clusterRows[0];
+    assert.ok(first);
+    const clusterRows = [
+      { ...first, [mutation[0]]: mutation[1] },
+      ...evidence.clusterRows.slice(1),
+    ];
+    const database = graphPool(evidence, { clusterRows });
+    const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+    await assert.rejects(
+      repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+      QualificationProjectionDataError,
+    );
+  });
+}
+
+void test('bounds active direct funding evidence before decoding hostile rows', async () => {
+  const evidence = walletBoundaryFixture('clusters');
+  let touched = false;
+  const database = graphPool(evidence, {
+    fundingRows: hostileRows(WALLET_FUNDING_EVIDENCE_ROW_MAXIMUM + 1, () => { touched = true; }),
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+    QualificationProjectionDataError,
+  );
+  assert.equal(touched, false);
+});
+
+void test('recomputes shared funders from bounded active direct evidence', async () => {
+  const evidence = walletBoundaryFixture('members');
+  const firstCluster = evidence.clusterRows[0];
+  const firstClusterId = firstCluster?.cluster_id;
+  assert.equal(typeof firstClusterId, 'string');
+  const members = evidence.memberRows.filter((row) => row.cluster_id === firstClusterId);
+  const funder = members[1]?.wallet;
+  const buyer1 = members[0]?.wallet;
+  const buyer2 = members[2]?.wallet;
+  assert.equal(typeof funder, 'string');
+  assert.equal(typeof buyer1, 'string');
+  assert.equal(typeof buyer2, 'string');
+  const clusterRows = evidence.clusterRows.map((row, index) => (
+    index === 0 ? { ...row, shared_funder_count: 1 } : row
+  ));
+  const fundingRows = [
+    { buyer: buyer1, funder },
+    { buyer: buyer2, funder },
+  ];
+  const database = graphPool(evidence, { clusterRows, fundingRows });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  const snapshot = await repository.transact('mint', (transaction) => (
+    transaction.loadCanonicalInput('mint')
+  ));
+
+  assert.equal(snapshot?.walletGraph?.clusters[0]?.sharedFunderCount, 1);
+  const fundingCall = database.queries.find((query) => (
+    query.text.includes('qualification_graph_funding')
+  ));
+  assert.match(fundingCall?.text ?? '', /LIMIT \$2/u);
+  assert.equal(fundingCall?.values?.[1], WALLET_FUNDING_EVIDENCE_ROW_MAXIMUM + 1);
 });
 
 void test('dissolves the current report without deleting or inventing an event', async () => {
@@ -590,6 +833,88 @@ void test('returns UNCHANGED for an exact current replay without event or outbox
   assert.equal(statements.some((sql) => sql.includes('INSERT INTO domain_events')), false);
   assert.equal(statements.some((sql) => sql.includes('INSERT INTO qualification_reports')), false);
   assert.equal(statements.some((sql) => sql.includes('UPDATE qualification_reports')), false);
+});
+
+void test('recreates a purged report by reusing an exact retained qualification event', async () => {
+  const projection = projectionFixture();
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
+    if (text.includes('qualification_existing_event')) {
+      return rows([qualificationEventRow(projection)]);
+    }
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(
+    database,
+    qualificationService(),
+  );
+
+  const outcome = await repository.transact('mint', (transaction) => (
+    transaction.replaceProjection(projection)
+  ));
+
+  assert.equal(outcome, 'UPDATED');
+  assert.equal(database.queries.some((call) => (
+    call.text.includes('INSERT INTO domain_events')
+  )), false);
+  const reportInsert = database.queries.find((call) => (
+    call.text.includes('INSERT INTO qualification_reports')
+  ));
+  assert.ok(reportInsert);
+  assert.equal(
+    (reportInsert.values?.[20] as Date | undefined)?.getTime(),
+    projection.report.evaluatedAtMs + 14_400_000,
+  );
+});
+
+void test('rejects a conflicting retained qualification event before report insert', async () => {
+  const projection = projectionFixture();
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
+    if (text.includes('qualification_existing_event')) {
+      return rows([{
+        ...qualificationEventRow(projection),
+        payload: toJsonValue({ conflict: true }),
+      }]);
+    }
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(
+    database,
+    qualificationService(),
+  );
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.replaceProjection(projection)),
+    QualificationProjectionDataError,
+  );
+  assert.equal(database.queries.some((call) => (
+    call.text.includes('INSERT INTO qualification_reports')
+  )), false);
+});
+
+void test('fails closed when an expired historical report cannot be deterministically reactivated', async () => {
+  const projection = projectionFixture();
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
+    if (text.includes('qualification_historical_report')) {
+      return rows([{ report_id: projection.reportId }]);
+    }
+    if (text.includes('qualification_stored_report')) {
+      return rows([storedProjectionRow(projection)]);
+    }
+    if (text.includes('SET superseded_at=NULL')) return { rows: [], rowCount: 0 };
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(
+    database,
+    qualificationService(),
+  );
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.replaceProjection(projection)),
+    QualificationProjectionDataError,
+  );
 });
 
 void test('reactivates an exact historical report after superseding current without cursor veto', async () => {
@@ -729,7 +1054,7 @@ class ScriptedPool {
     private readonly resolve: (text: string, values: readonly unknown[] | undefined) => {
       readonly rows: readonly Record<string, unknown>[];
       readonly rowCount: number | null;
-    } = () => rows([]),
+    } | undefined = () => undefined,
   ) {}
 
   public async connect() {
@@ -737,10 +1062,14 @@ class ScriptedPool {
       query: async (text: string, values?: readonly unknown[]) => {
         this.queries.push({ text, values });
         const resolved = this.resolve(text, values);
-        if (resolved.rowCount === 0 && /^(?:INSERT|UPDATE)\b/u.test(text.trim())) {
-          return { ...resolved, rowCount: 1 };
-        }
-        return resolved;
+        if (
+          text.includes('pg_advisory_unlock')
+          && resolved?.rows[0] === undefined
+        ) return rows([{ pg_advisory_unlock: true }]);
+        if (resolved !== undefined) return resolved;
+        return /^(?:INSERT|UPDATE)\b/u.test(text.trim())
+          ? { rows: [], rowCount: 1 }
+          : rows([]);
       },
       release: () => { this.released = true; },
     };
@@ -854,6 +1183,13 @@ function socialFixture() {
       source_raw_event_id: 'raw-launch',
       metadata_snapshot_id: metadataSnapshotId, collection_status: 'COMPLETE',
       observed_at: new Date(1_014), payload_version: 1,
+      social_event_payload_version: 1,
+      social_event_payload: toJsonValue({
+        sourceLaunchEventId: 'launch-event', collectionId: collection.id,
+        metadataSnapshotId, collectionStatus: 'COMPLETE',
+        inputFingerprint: collection.inputFingerprint,
+        linkCount: collection.links.length, evidenceCount: collection.evidence.length,
+      }),
     },
     linkRow: {
       link_id: link.id, mint, metadata_snapshot_id: metadataSnapshotId,
@@ -974,6 +1310,13 @@ function socialBoundaryFixture() {
       collection_status: 'COMPLETE',
       observed_at: new Date(collection.observedAtMs),
       payload_version: 1,
+      social_event_payload_version: 1,
+      social_event_payload: toJsonValue({
+        sourceLaunchEventId: 'launch-event', collectionId: collection.id,
+        metadataSnapshotId, collectionStatus: 'COMPLETE',
+        inputFingerprint: collection.inputFingerprint,
+        linkCount: collection.links.length, evidenceCount: collection.evidence.length,
+      }),
     },
     linkRows: collection.links.map((link) => ({
       link_id: link.id, mint, metadata_snapshot_id: metadataSnapshotId,
@@ -1065,6 +1408,7 @@ function analyticsFixture(
       top10_bps: '5000', creator_bps: '0', unique_known_buyers: 1,
       unique_external_buyers: 1, positive_position_count: 1,
       unknown_trader_trade_count: 0, payload: toJsonValue(holder),
+      event_payload_version: 1,
       event_payload: toJsonValue({
         inputFingerprint: holderFingerprint,
         confirmationCounts,
@@ -1079,6 +1423,8 @@ function analyticsFixture(
       confirmation_counts: confirmationCounts,
       medium_relationship_count: 0, cluster_count: 0, maximum_cluster_bps: '0',
       creator_cluster_count: 0,
+      as_of_slot: '10', as_of_transaction_index: 0, as_of_instruction_index: 1,
+      as_of_inner_instruction_index: null,
       graph_event_payload_version: 1,
       graph_event_payload: toJsonValue({
         inputFingerprint,
@@ -1096,21 +1442,21 @@ function analyticsFixture(
 }
 
 function walletBoundaryFixture(
-  family: 'relationships' | 'clusters' | 'members',
+  family: 'relationships' | 'clusters' | 'members' | 'per_cluster',
 ) {
   const evidence = analyticsFixture();
   const inputFingerprint = 'c'.repeat(64);
   const relationshipCount = family === 'relationships'
     ? WALLET_RELATIONSHIP_ROW_MAXIMUM
     : 0;
-  const relationshipRows = Array.from({ length: relationshipCount }, (_, index) => {
-    const leftWallet = `left-${String(index).padStart(4, '0')}`;
-    const rightWallet = `right-${String(index).padStart(4, '0')}`;
+  const relationshipRow = (leftWallet: string, rightWallet: string) => {
+    const left = leftWallet < rightWallet ? leftWallet : rightWallet;
+    const right = leftWallet < rightWallet ? rightWallet : leftWallet;
     return {
       relationship_id: createWalletRelationshipId(
-        'mint', leftWallet, rightWallet, 'DIRECT_QUOTE_TRANSFER',
+        'mint', left, right, 'DIRECT_QUOTE_TRANSFER',
       ),
-      mint: 'mint', left_wallet: leftWallet, right_wallet: rightWallet,
+      mint: 'mint', left_wallet: left, right_wallet: right,
       relationship_type: 'DIRECT_QUOTE_TRANSFER', confidence: 'STRONG',
       evidence_count: 1, quote_totals: [],
       first_observed_cursor: toJsonValue({
@@ -1123,14 +1469,19 @@ function walletBoundaryFixture(
       }),
       input_fingerprint: inputFingerprint,
     };
+  };
+  const relationshipRows = Array.from({ length: relationshipCount }, (_, index) => {
+    const leftWallet = `left-${String(index).padStart(4, '0')}`;
+    const rightWallet = `right-${String(index).padStart(4, '0')}`;
+    return relationshipRow(leftWallet, rightWallet);
   });
   const clusterCount = family === 'clusters'
     ? WALLET_CLUSTER_ROW_MAXIMUM
-    : family === 'members' ? WALLET_MEMBER_ROW_MAXIMUM
-      / WALLET_MEMBERS_PER_CLUSTER_MAXIMUM : 0;
+    : family === 'members' ? WALLET_CLUSTER_ROW_MAXIMUM
+      : family === 'per_cluster' ? 1 : 0;
   const membersPerCluster = family === 'members'
-    ? WALLET_MEMBERS_PER_CLUSTER_MAXIMUM
-    : 2;
+    ? 4
+    : family === 'per_cluster' ? WALLET_MEMBERS_PER_CLUSTER_MAXIMUM : 2;
   const clusterRows: Record<string, unknown>[] = [];
   const memberRows: Record<string, unknown>[] = [];
   for (let clusterIndex = 0; clusterIndex < clusterCount; clusterIndex += 1) {
@@ -1138,12 +1489,21 @@ function walletBoundaryFixture(
       `wallet-${String(clusterIndex).padStart(3, '0')}-${String(memberIndex).padStart(3, '0')}`
     ));
     const clusterId = createWalletClusterId('mint', wallets);
+    const strongRelationshipCount = wallets.length - 1;
+    for (let index = 1; index < wallets.length; index += 1) {
+      const left = wallets[index - 1];
+      const right = wallets[index];
+      assert.ok(left);
+      assert.ok(right);
+      relationshipRows.push(relationshipRow(left, right));
+    }
     clusterRows.push({
       cluster_id: clusterId, mint: 'mint', input_fingerprint: inputFingerprint,
       participant_wallet_count: wallets.length, auxiliary_wallet_count: 0,
       positive_holder_count: 0, observed_positive_base_raw: '0', concentration_bps: '0',
-      contains_creator: false, shared_funder_count: 0, strong_relationship_count: 0,
-      strong_evidence_count: 0, quote_assets: [],
+      contains_creator: false, shared_funder_count: 0,
+      strong_relationship_count: strongRelationshipCount,
+      strong_evidence_count: strongRelationshipCount, quote_assets: [],
     });
     memberRows.push(...wallets.map((wallet, memberIndex) => ({
       cluster_id: clusterId, wallet, member_role: 'PARTICIPANT', is_creator: false,
@@ -1180,14 +1540,40 @@ function walletBoundaryFixture(
 function analyticsPool(
   evidence: ReturnType<typeof analyticsFixture>,
   graphRow: Record<string, unknown> = evidence.graphRow,
+  holderRow: Record<string, unknown> = evidence.holderRow,
+): ScriptedPool {
+  return new ScriptedPool((text) => {
+    if (text.includes('qualification_launch')) return rows([launchRow()]);
+    if (text.includes('qualification_as_of')) return rows([asOfRow()]);
+    if (text.includes('qualification_creator')) return rows([evidence.profileRow]);
+    if (text.includes('qualification_holders')) return rows([holderRow]);
+    if (text.includes('qualification_graph */')) return rows([graphRow]);
+    return rows([]);
+  });
+}
+
+function graphPool(
+  evidence: ReturnType<typeof walletBoundaryFixture>,
+  options: Readonly<{
+    clusterRows?: readonly Record<string, unknown>[];
+    fundingRows?: readonly Record<string, unknown>[];
+  }> = {},
 ): ScriptedPool {
   return new ScriptedPool((text) => {
     if (text.includes('qualification_launch')) return rows([launchRow()]);
     if (text.includes('qualification_as_of')) return rows([asOfRow()]);
     if (text.includes('qualification_creator')) return rows([evidence.profileRow]);
     if (text.includes('qualification_holders')) return rows([evidence.holderRow]);
-    if (text.includes('qualification_graph */')) return rows([graphRow]);
-    return rows([]);
+    if (text.includes('qualification_graph */')) return rows([evidence.graphRow]);
+    if (text.includes('qualification_graph_relationships')) {
+      return rows(evidence.relationshipRows);
+    }
+    if (text.includes('qualification_graph_clusters')) {
+      return rows(options.clusterRows ?? evidence.clusterRows);
+    }
+    if (text.includes('qualification_graph_members')) return rows(evidence.memberRows);
+    if (text.includes('qualification_graph_funding')) return rows(options.fundingRows ?? []);
+    return undefined;
   });
 }
 
@@ -1292,6 +1678,30 @@ function sourceMappingRow(projection: CanonicalQualificationProjection): Record<
     observed_at: new Date(event.observedAtMs),
     payload_version: 1,
     payload: {},
+  };
+}
+
+function qualificationEventRow(
+  projection: CanonicalQualificationProjection,
+): Record<string, unknown> {
+  const event = projection.qualificationEvent;
+  return {
+    event_id: event.id,
+    raw_event_id: projection.sourceRawEventId,
+    type: event.type,
+    mint: event.mint,
+    source: event.source,
+    program: event.program,
+    signature: event.signature,
+    slot: event.cursor.slot.toString(),
+    transaction_index: event.cursor.transactionIndex,
+    instruction_index: event.cursor.instructionIndex,
+    inner_instruction_index: event.cursor.innerInstructionIndex,
+    confirmation_status: event.confirmationStatus,
+    blockchain_time: event.blockchainTimeMs === null ? null : new Date(event.blockchainTimeMs),
+    observed_at: new Date(event.observedAtMs),
+    payload_version: event.payloadVersion,
+    payload: toJsonValue(event.payload),
   };
 }
 
