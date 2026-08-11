@@ -74,7 +74,13 @@ docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name so
 health_attempt=0
 until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js --require-ok; do
   health_attempt=$((health_attempt + 1))
-  [ "$health_attempt" -lt 30 ] || exit 1
+  if [ "$health_attempt" -ge 30 ]; then
+    if ! docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 app retention; then
+      echo 'Le healthcheck strict a échoué et l’arrêt de sécurité app/retention a aussi échoué.' >&2
+    fi
+    echo 'Le healthcheck strict n’a pas convergé ; le déploiement est interrompu.' >&2
+    exit 1
+  fi
   sleep 2
 done
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps frontend
@@ -205,7 +211,13 @@ docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name so
 health_attempt=0
 until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js --require-ok; do
   health_attempt=$((health_attempt + 1))
-  [ "$health_attempt" -lt 30 ] || exit 1
+  if [ "$health_attempt" -ge 30 ]; then
+    if ! docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 app retention; then
+      echo 'Le healthcheck strict a échoué et l’arrêt de sécurité app/retention a aussi échoué.' >&2
+    fi
+    echo 'Le healthcheck strict n’a pas convergé ; le déploiement est interrompu.' >&2
+    exit 1
+  fi
   sleep 2
 done
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps frontend

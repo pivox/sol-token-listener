@@ -15,6 +15,7 @@ const MAX_RETENTION_OUTPUT_BYTES = 16 * 1024;
 const MAX_FAILURE_SUMMARY_BYTES = 1_024;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const composeFile = resolve(root, 'deploy/compose.yaml');
+const smokeComposeFile = resolve(root, 'deploy/compose.smoke.yaml');
 const scriptPath = fileURLToPath(import.meta.url);
 let invocationMode;
 let invocationFailure;
@@ -194,7 +195,7 @@ async function runDeployment(selfSignal) {
     try {
       try {
         await runDocker(
-          ['compose', '-f', composeFile, 'down', '--volumes', '--remove-orphans', '--rmi', 'local'],
+          composeCommand(['down', '--volumes', '--remove-orphans', '--rmi', 'local']),
           { cleanup: true, reflectFailureOutput: false },
         );
       } catch (error) {
@@ -352,7 +353,7 @@ async function cleanupFaultProject(faultName, cleanupFailures) {
   const faultEnvironment = faultCleanupEnvironment(faultName);
   try {
     await runDocker(
-      ['compose', '--project-name', faultName, '-f', composeFile, 'down', '--volumes', '--remove-orphans', '--rmi', 'local'],
+      composeCommand(['down', '--volumes', '--remove-orphans', '--rmi', 'local'], faultName),
       { cleanup: true, reflectFailureOutput: false, commandEnvironment: faultEnvironment },
     );
   } catch (error) {
@@ -486,7 +487,14 @@ async function runFaultProbeChild(faultName, signal) {
 }
 
 async function compose(args, options = {}) {
-  return runDocker(['compose', '-f', composeFile, ...args], options);
+  return runDocker(composeCommand(args), options);
+}
+
+function composeCommand(args, projectNameOverride) {
+  const projectArgs = projectNameOverride === undefined
+    ? []
+    : ['--project-name', projectNameOverride];
+  return ['compose', ...projectArgs, '-f', composeFile, '-f', smokeComposeFile, ...args];
 }
 
 async function runDocker(args, options = {}) {
@@ -581,7 +589,11 @@ function remainingCleanupMs() {
 }
 
 function commandLabel(args) {
-  const action = args.find((value) => value !== 'compose' && value !== '-f' && value !== composeFile);
+  const action = args.find((value) =>
+    value !== 'compose'
+    && value !== '-f'
+    && value !== composeFile
+    && value !== smokeComposeFile);
   return `Docker ${action ?? 'command'}`;
 }
 
@@ -685,10 +697,10 @@ async function assertCorsContract() {
 
 async function readMigrationHistory() {
   const sql = "SELECT version, applied_at::text FROM migration_history ORDER BY version";
-  const { stdout } = await runDocker([
-    'compose', '-f', composeFile, 'exec', '-T', 'postgres', 'psql',
+  const { stdout } = await runDocker(composeCommand([
+    'exec', '-T', 'postgres', 'psql',
     '-X', '-A', '-t', '-F', '|', '-v', 'ON_ERROR_STOP=1', '-U', 'smoke', '-d', 'smoke', '-c', sql,
-  ]);
+  ]));
   return stdout.trim().split('\n').filter(Boolean).map((line) => {
     const separator = line.indexOf('|');
     if (separator <= 0 || separator === line.length - 1) throw new Error('Migration history row is malformed.');

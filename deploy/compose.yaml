@@ -54,7 +54,7 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "node", "dist/scripts/deployment-healthcheck.js"]
+      test: ["CMD", "node", "dist/scripts/deployment-healthcheck.js", "--require-ok"]
       interval: 10s
       timeout: 5s
       retries: 3

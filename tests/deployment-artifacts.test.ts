@@ -182,6 +182,7 @@ void test('Nginx serves the SPA with bounded caching and proxies only the read-o
 
 void test('Compose defines an observe-only, five-service deployment without exposed database or backend', async () => {
   const compose = await readArtifact('deploy/compose.yaml');
+  const smokeOverride = await readArtifact('deploy/compose.smoke.yaml');
 
   assert.match(compose, /^name: sol-token-listener$/m);
   assert.match(compose, /^services:\s*$/m);
@@ -230,7 +231,18 @@ void test('Compose defines an observe-only, five-service deployment without expo
   assert.match(app, /^ {6}LISTENER_ENABLED: \$\{LISTENER_ENABLED:-true\}$/m);
   assert.match(compose, /^ {4}init: true$/m);
   assert.match(compose, /^ {4}stop_grace_period: 40s$/m);
-  assert.match(compose, /^ {6}test: \["CMD", "node", "dist\/scripts\/deployment-healthcheck\.js"\]$/m);
+  assert.match(
+    composeService(compose, 'app'),
+    /^ {6}test: \["CMD", "node", "dist\/scripts\/deployment-healthcheck\.js", "--require-ok"\]$/m,
+  );
+  assert.doesNotMatch(composeService(compose, 'app'), /deployment-healthcheck\.js"\s*\]/);
+  assert.equal(smokeOverride, [
+    'services:',
+    '  app:',
+    '    healthcheck:',
+    '      test: ["CMD", "node", "dist/scripts/deployment-healthcheck.js"]',
+    '',
+  ].join('\n'));
   assert.match(compose, /^ {4}command: \["node", "dist\/scripts\/migrate\.js"\]$/m);
   assert.match(compose, /^ {4}command: \["node", "dist\/scripts\/purge-retained-data\.js"\]$/m);
   assert.equal((compose.match(/depends_on:\s*\n {6}migrate:\s*\n {8}condition: service_completed_successfully/g) ?? []).length, 2);
@@ -347,9 +359,15 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /LISTENER_ENABLED:\s*'false'/);
   assert.match(smoke, /BACKEND_IMAGE:\s*deploymentImages\.backend/);
   assert.match(smoke, /FRONTEND_IMAGE:\s*deploymentImages\.frontend/);
+  assert.match(smoke, /const smokeComposeFile = resolve\(root, 'deploy\/compose\.smoke\.yaml'\)/);
+  assert.match(
+    smoke,
+    /return \['compose', \.\.\.projectArgs, '-f', composeFile, '-f', smokeComposeFile, \.\.\.args\];/,
+  );
   assert.match(smoke, /await compose\(\['build', 'app', 'frontend'\]\)/);
-  assert.match(smoke, /\[\s*'compose', '-f', composeFile, 'exec', '-T', 'postgres', 'psql'/);
-  assert.match(smoke, /\['compose', '-f', composeFile, 'down', '--volumes', '--remove-orphans', '--rmi', 'local'/);
+  assert.match(smoke, /composeCommand\(\[\s*'exec', '-T', 'postgres', 'psql'/);
+  assert.match(smoke, /composeCommand\(\['down', '--volumes', '--remove-orphans', '--rmi', 'local'\]\)/);
+  assert.equal((smoke.match(/\['compose'/g) ?? []).length, 1);
   assert.match(smoke, /com\.docker\.compose\.project=/);
   assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key|\bwallet\b/iu);
   assert.doesNotMatch(smoke, /sol-token-listener-(?:backend|frontend):(?:smoke|latest)/u);
@@ -446,7 +464,7 @@ void test('failed signal fault probes always clean only their explicit child pro
   assert.match(smoke, /await cleanupFaultProject\(faultName, cleanupFailures\)/);
   assert.match(
     smoke,
-    /\['compose', '--project-name', faultName, '-f', composeFile, 'down', '--volumes', '--remove-orphans', '--rmi', 'local'\]/,
+    /composeCommand\(\['down', '--volumes', '--remove-orphans', '--rmi', 'local'\], faultName\)/,
   );
   assert.match(smoke, /COMPOSE_PROJECT_NAME:\s*faultName/);
   assert.match(smoke, /--signal-fault-probe-kill/);
@@ -563,7 +581,12 @@ void test('deployment runbook documents the safe production lifecycle and safety
   assert.match(runbook, /aucun[^\n]*(?:wallet|clé privée|ordre réel|transaction live)/i);
   assert.equal((runbook.match(/^health_attempt=0$/gm) ?? []).length, 2);
   assert.equal((runbook.match(/^until docker compose .*deployment-healthcheck\.js --require-ok; do$/gm) ?? []).length, 2);
-  assert.equal((runbook.match(/^ {2}\[ "\$health_attempt" -lt 30 \] \|\| exit 1$/gm) ?? []).length, 2);
+  assert.equal((runbook.match(/^ {2}if \[ "\$health_attempt" -ge 30 \]; then$/gm) ?? []).length, 2);
+  assert.equal((runbook.match(/^ {4}if ! docker compose .* stop --timeout 40 app retention; then$/gm) ?? []).length, 2);
+  assert.equal((runbook.match(/^ {6}echo 'Le healthcheck strict a échoué et l’arrêt de sécurité app\/retention a aussi échoué\.' >&2$/gm) ?? []).length, 2);
+  assert.equal((runbook.match(
+    /^ {4}echo 'Le healthcheck strict n’a pas convergé ; le déploiement est interrompu\.' >&2\n {4}exit 1\n {2}fi$/gm,
+  ) ?? []).length, 2);
   assert.equal((runbook.match(/^ {2}sleep 2$/gm) ?? []).length, 2);
   assert.equal((runbook.match(/^set -euo pipefail$/gm) ?? []).length, 2);
 });
