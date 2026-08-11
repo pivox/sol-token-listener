@@ -9,6 +9,8 @@ import { ApiClientProvider } from '../data/api-provider.js';
 import type { SseClient } from '../data/sse-client.js';
 import { RadarPage } from '../features/radar/radar-page.js';
 import { LaunchPage } from '../features/launch/launch-page.js';
+import { PaperPage } from '../features/paper/paper-page.js';
+import { HealthPage } from '../features/health/health-page.js';
 import { AppShell } from './app-shell.js';
 import { ErrorBoundary } from './error-boundary.js';
 
@@ -32,8 +34,8 @@ export function App({ apiBaseUrl, realtimeClient, apiClient: providedApiClient }
               <Route element={<AppShell />}>
                 <Route index element={<RadarPage />} />
                 <Route path="launches/:mint" element={<LaunchPage />} />
-                <Route path="paper-positions" element={<PlaceholderPage title="Positions paper" />} />
-                <Route path="health" element={<PlaceholderPage title="Santé technique" />} />
+                <Route path="paper-positions" element={<PaperPage />} />
+                <Route path="health" element={<HealthPage />} />
                 <Route path="*" element={<NotFoundPage />} />
               </Route>
             </Routes>
@@ -41,17 +43,6 @@ export function App({ apiBaseUrl, realtimeClient, apiClient: providedApiClient }
         </RealtimeProvider>
       </QueryClientProvider>
     </ErrorBoundary>
-  );
-}
-
-function PlaceholderPage({ title }: { readonly title: string }): ReactNode {
-  return (
-    <section className="card shadow-sm">
-      <div className="card-body">
-        <h1 className="h3">{title}</h1>
-        <p className="text-secondary mb-0">Cette vue publique en lecture seule sera alimentée par l’API v1.</p>
-      </div>
-    </section>
   );
 }
 

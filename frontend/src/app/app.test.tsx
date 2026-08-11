@@ -2,7 +2,9 @@ import { screen, render } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ApiClient } from '../data/api-client.js';
+import { apiHealthEnvelopeSchema } from '../data/api-schemas.js';
 import type { RealtimeSnapshot, SseClient } from '../data/sse-client.js';
+import { health, success } from '../../tests/fixtures/api.js';
 import { App } from './app.js';
 
 function fakeRealtimeClient(state: RealtimeSnapshot['state'] = 'LIVE'): SseClient {
@@ -15,6 +17,7 @@ function fakeRealtimeClient(state: RealtimeSnapshot['state'] = 'LIVE'): SseClien
 
 function fakeApiClient(): ApiClient {
   const unavailable = async (): Promise<never> => { throw new Error('not used'); };
+  const healthProjection = apiHealthEnvelopeSchema.parse(success(health)).data;
   return {
     listLaunches: async () => ({ items: [], nextCursor: null }),
     getLaunch: unavailable,
@@ -22,8 +25,8 @@ function fakeApiClient(): ApiClient {
     getLaunchRisk: unavailable,
     getLaunchSocial: unavailable,
     getLaunchHolders: unavailable,
-    listPaperPositions: unavailable,
-    getHealth: unavailable,
+    listPaperPositions: async () => ({ items: [], nextCursor: null }),
+    getHealth: async () => healthProjection,
   };
 }
 
@@ -40,9 +43,9 @@ describe('read-only operator shell', () => {
     expect(await screen.findByRole('heading', { name: 'Radar des lancements' })).toBeVisible();
 
     await user.click(screen.getByRole('link', { name: 'Positions paper' }));
-    expect(screen.getByRole('heading', { name: 'Positions paper' })).toBeVisible();
+    expect(await screen.findByRole('heading', { name: 'Positions paper' })).toBeVisible();
     await user.click(screen.getByRole('link', { name: 'Santé' }));
-    expect(screen.getByRole('heading', { name: 'Santé technique' })).toBeVisible();
+    expect(await screen.findByRole('heading', { name: 'Santé technique' })).toBeVisible();
     await user.click(screen.getByRole('link', { name: 'Radar' }));
     expect(screen.getByRole('heading', { name: 'Radar des lancements' })).toBeVisible();
   });
