@@ -120,7 +120,7 @@ describe('resumable SSE lifecycle', () => {
     await Promise.resolve();
 
     expect(store.cleared).toBe(1);
-    expect(resync).toHaveBeenCalledOnce();
+    expect(resync).toHaveBeenCalledTimes(2);
     expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(fetchFn.mock.calls[1]?.[1]?.headers).toEqual({ Accept: 'text/event-stream' });
     client.stop();
@@ -140,6 +140,7 @@ describe('resumable SSE lifecycle', () => {
     await client.start();
     await vi.waitFor(() => { expect(fetchFn).toHaveBeenCalledTimes(2); });
     expect(store.cleared).toBe(1);
+    expect(resync).toHaveBeenCalledTimes(2);
     expect(fetchFn.mock.calls[1]?.[1]?.headers).toEqual({ Accept: 'text/event-stream' });
     client.stop();
 
@@ -168,16 +169,18 @@ describe('resumable SSE lifecycle', () => {
     });
     await client.start();
     expect(store.cleared).toBe(1);
-    expect(resync).toHaveBeenCalledOnce();
+    expect(resync).toHaveBeenCalledTimes(2);
     expect(fetchFn.mock.calls[1]?.[1]?.headers).toEqual({ Accept: 'text/event-stream' });
     client.stop();
   });
 
   it('keeps resynchronization single-flight when connectivity changes', async () => {
     let finishResync: (() => void) | undefined;
-    const resync = vi.fn(async () => {
-      await new Promise<void>((resolve) => { finishResync = resolve; });
-    });
+    const resync = vi.fn()
+      .mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => { finishResync = resolve; });
+      })
+      .mockResolvedValueOnce(undefined);
     const fetchFn = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(streamResponse('{}', 409))
       .mockResolvedValueOnce(streamResponse(''));
@@ -193,6 +196,67 @@ describe('resumable SSE lifecycle', () => {
     finishResync?.();
     await started;
     await vi.waitFor(() => { expect(fetchFn).toHaveBeenCalledTimes(2); });
+    await vi.waitFor(() => { expect(resync).toHaveBeenCalledTimes(2); });
+    client.stop();
+  });
+
+  it('retries a failed HTTP resync before opening a cursorless stream', async () => {
+    const scheduled: (() => void)[] = [];
+    const resync = vi.fn()
+      .mockRejectedValueOnce(new Error('refetch failed'))
+      .mockResolvedValue(undefined);
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(streamResponse('{}', 409))
+      .mockResolvedValueOnce(streamResponse(''));
+    const client = createSseClient({
+      apiBaseUrl: 'https://api.example', cursorStore: cursorStore('expired'), fetchFn, resync,
+      acceptEvent: async () => undefined,
+      schedule: (callback) => { scheduled.push(callback); return scheduled.length; },
+      cancel: () => undefined, minimumResyncMs: 0,
+    });
+    await client.start();
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(client.getSnapshot()).toMatchObject({ state: 'RESYNCING', errorCode: 'RESYNC_FAILED' });
+    scheduled[0]?.();
+    await vi.waitFor(() => { expect(fetchFn).toHaveBeenCalledTimes(2); });
+    await vi.waitFor(() => { expect(resync).toHaveBeenCalledTimes(3); });
+    client.stop();
+  });
+
+  it('retries the initial resync after an offline interval instead of skipping to high-water', async () => {
+    const resync = vi.fn()
+      .mockRejectedValueOnce(new Error('refetch failed'))
+      .mockResolvedValue(undefined);
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(streamResponse('{}', 409))
+      .mockResolvedValueOnce(streamResponse(''));
+    const client = createSseClient({
+      apiBaseUrl: 'https://api.example', cursorStore: cursorStore('expired'), fetchFn, resync,
+      acceptEvent: async () => undefined, schedule: () => 1, cancel: () => undefined,
+      minimumResyncMs: 0,
+    });
+    await client.start();
+    client.setOnline(false);
+    client.setOnline(true);
+    await vi.waitFor(() => { expect(resync).toHaveBeenCalledTimes(3); });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    client.stop();
+  });
+
+  it('performs the closing HTTP refresh after the cursorless stream baseline', async () => {
+    const order: string[] = [];
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockImplementationOnce(async () => { order.push('fetch-expired'); return streamResponse('{}', 409); })
+      .mockImplementationOnce(async () => { order.push('fetch-baseline'); return streamResponse(eventFrame()); });
+    const resync = vi.fn(async () => { order.push('resync'); });
+    const client = createSseClient({
+      apiBaseUrl: 'https://api.example', cursorStore: cursorStore('expired'), fetchFn, resync,
+      acceptEvent: async () => { order.push('accept-event'); },
+      schedule: () => 1, cancel: () => undefined, minimumResyncMs: 0,
+    });
+    await client.start();
+    await vi.waitFor(() => { expect(order).toContain('accept-event'); });
+    expect(order).toEqual(['fetch-expired', 'resync', 'fetch-baseline', 'resync', 'accept-event']);
     client.stop();
   });
 

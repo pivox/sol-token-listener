@@ -30,11 +30,17 @@ export function RealtimeProvider({
       cursorStore: createSseCursorStore(apiBaseUrl, storage ?? window.localStorage),
       acceptEvent: async (event) => {
         await Promise.all(invalidationKeysForEvent(event).map(async (queryKey) => {
-          await queryClient.invalidateQueries({ queryKey, exact: true });
+          await queryClient.invalidateQueries(
+            { queryKey, exact: true },
+            { throwOnError: true },
+          );
         }));
       },
       resync: async () => {
-        await queryClient.invalidateQueries({ type: 'active', refetchType: 'active' });
+        await queryClient.invalidateQueries(
+          { type: 'active', refetchType: 'active' },
+          { throwOnError: true },
+        );
       },
       ...(fetchFn === undefined ? {} : { fetchFn }),
       isOnline: () => window.navigator.onLine,

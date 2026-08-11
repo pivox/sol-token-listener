@@ -27,6 +27,7 @@ test('public operator journey is resumable and read-only across origins', async 
   const resumeCountBefore = await resumeCount(request);
   await request.post(`${API}/__test/reconnect`);
   await expect.poll(async (): Promise<number> => await resumeCount(request)).toBeGreaterThan(resumeCountBefore);
+  await expect.poll(async (): Promise<number> => await activeStreamCount(request)).toBe(1);
   await request.post(`${API}/__test/expire`);
   await expect(page.getByText(/Temps réel : resynchronisation/i)).toBeVisible({ timeout: 10_000 });
   await expect(page.getByText(/Temps réel : connecté/i)).toBeVisible({ timeout: 10_000 });
@@ -44,4 +45,10 @@ async function resumeCount(request: { get(url: string): Promise<{ json(): Promis
   const decoded = await (await request.get(`${API}/__test/requests`)).json();
   if (!isRequestLog(decoded)) return 0;
   return decoded.requests.filter((item) => item.lastEventId !== null).length;
+}
+
+async function activeStreamCount(request: { get(url: string): Promise<{ json(): Promise<unknown> }> }): Promise<number> {
+  const decoded = await (await request.get(`${API}/__test/state`)).json();
+  if (typeof decoded !== 'object' || decoded === null || !('activeStreams' in decoded)) return 0;
+  return typeof decoded.activeStreams === 'number' ? decoded.activeStreams : 0;
 }

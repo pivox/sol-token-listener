@@ -70,7 +70,9 @@ export function createSseClient(options: SseClientOptions): SseClient {
   let stopped = true;
   let activeController: AbortController | null = null;
   let retryTimer: unknown;
-  let resyncPromise: Promise<void> | null = null;
+  let resyncPromise: Promise<boolean> | null = null;
+  let initialResynchronizationRequired = false;
+  let finalRefreshRequired = false;
   let onlineOverride: boolean | null = null;
 
   const online = (): boolean => onlineOverride ?? isOnline();
@@ -130,6 +132,18 @@ export function createSseClient(options: SseClientOptions): SseClient {
       if (reader === undefined) {
         scheduleReconnect('EMPTY_STREAM');
         return;
+      }
+      if (finalRefreshRequired) {
+        try {
+          await options.resync();
+        } catch {
+          if (!isStopped() && !isAborted(controller) && activeController === controller) {
+            scheduleResynchronization('RESYNC_FINAL_REFRESH_FAILED');
+          }
+          return;
+        }
+        if (isStopped() || isAborted(controller) || activeController !== controller) return;
+        finalRefreshRequired = false;
       }
       publish({ state: 'LIVE', retryAttempt: 0, errorCode: null });
       const parser = new SseParser();
@@ -212,33 +226,53 @@ export function createSseClient(options: SseClientOptions): SseClient {
       await resyncPromise;
       return;
     }
+    initialResynchronizationRequired = true;
     const task = runResynchronization();
     resyncPromise = task;
-    await task;
+    const succeeded = await task;
     if (resyncPromise !== task) return;
     resyncPromise = null;
     if (isStopped()) return;
+    if (!succeeded) {
+      scheduleResynchronization('RESYNC_FAILED');
+      return;
+    }
+    initialResynchronizationRequired = false;
     if (!online()) {
       publish({ state: 'DISCONNECTED', errorCode: 'OFFLINE' });
       return;
     }
     if (retryTimer !== undefined) return;
-    publish({ state: 'CONNECTING', retryAttempt: 0, errorCode: null });
+    finalRefreshRequired = true;
     void connect();
   }
 
-  async function runResynchronization(): Promise<void> {
-    const startedAt = Date.now();
+  async function runResynchronization(): Promise<boolean> {
     publish({ state: 'RESYNCING', errorCode: 'EVENT_CURSOR_EXPIRED' });
     options.cursorStore.clear();
     try {
       await options.resync();
     } catch {
-      scheduleReconnect('RESYNC_FAILED');
+      return false;
+    }
+    if (minimumResyncMs > 0) await wait(minimumResyncMs);
+    return true;
+  }
+
+  function scheduleResynchronization(errorCode: string): void {
+    if (stopped || retryTimer !== undefined) return;
+    if (!online()) {
+      publish({ state: 'DISCONNECTED', errorCode: 'OFFLINE' });
       return;
     }
-    const remaining = minimumResyncMs - (Date.now() - startedAt);
-    if (remaining > 0) await wait(remaining);
+    const attempt = snapshot.retryAttempt + 1;
+    const delay = retryDelay(attempt);
+    publish({ state: 'RESYNCING', retryAttempt: attempt, errorCode });
+    retryTimer = schedule(() => {
+      retryTimer = undefined;
+      if (stopped) return;
+      void resynchronize();
+    }, delay);
   }
 
   function scheduleReconnect(errorCode: string): void {
@@ -248,8 +282,7 @@ export function createSseClient(options: SseClientOptions): SseClient {
       return;
     }
     const attempt = snapshot.retryAttempt + 1;
-    const baseDelay = Math.min(500 * 2 ** (attempt - 1), MAXIMUM_RETRY_DELAY_MS);
-    const delay = Math.round(baseDelay * (0.5 + random()));
+    const delay = retryDelay(attempt);
     publish({ state: 'RECONNECTING', retryAttempt: attempt, errorCode });
     retryTimer = schedule(() => {
       retryTimer = undefined;
@@ -258,10 +291,19 @@ export function createSseClient(options: SseClientOptions): SseClient {
     }, delay);
   }
 
+  function retryDelay(attempt: number): number {
+    const baseDelay = Math.min(500 * 2 ** (attempt - 1), MAXIMUM_RETRY_DELAY_MS);
+    return Math.round(baseDelay * (0.5 + random()));
+  }
+
   const client: SseClient = {
     async start(): Promise<void> {
       if (!stopped) return;
       stopped = false;
+      if (initialResynchronizationRequired) {
+        await resynchronize();
+        return;
+      }
       publish({ state: 'CONNECTING', retryAttempt: 0, errorCode: null });
       await connect();
     },
@@ -285,6 +327,10 @@ export function createSseClient(options: SseClientOptions): SseClient {
       if (retryTimer !== undefined) cancel(retryTimer);
       retryTimer = undefined;
       activeController?.abort();
+      if (initialResynchronizationRequired) {
+        void resynchronize();
+        return;
+      }
       publish({ state: 'CONNECTING', retryAttempt: 0, errorCode: null });
       void connect();
     },

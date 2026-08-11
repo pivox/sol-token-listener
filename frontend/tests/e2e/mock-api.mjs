@@ -52,6 +52,7 @@ const server = createServer(async (request, response) => {
     json(response, 200, { ok: true }); return;
   }
   if (url.pathname === '/__test/requests') { json(response, 200, { requests }); return; }
+  if (url.pathname === '/__test/state') { json(response, 200, { activeStreams: streams.size }); return; }
   if (url.pathname === '/api/v1/events') {
     cors(response);
     if (expireNextCursor && request.headers['last-event-id']) { expireNextCursor = false; json(response, 409, { apiVersion: 'v1', error: { code: 'EVENT_CURSOR_EXPIRED', message: 'expired' } }); return; }
