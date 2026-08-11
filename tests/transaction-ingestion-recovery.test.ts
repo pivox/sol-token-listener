@@ -86,7 +86,9 @@ void test('restarts the production PostgreSQL path at every observation boundary
       );
       assert.equal(
         await launchState(pool),
-        boundary === 'pumpswap' ? 'PUMPSWAP_ACTIVE' : 'OBSERVING',
+        boundary === 'pumpswap' || boundary === 'qualification'
+          ? 'PUMPSWAP_ACTIVE'
+          : 'OBSERVING',
         `${boundary}:launch-state`,
       );
 
