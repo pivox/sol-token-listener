@@ -23,7 +23,7 @@ void test('declares an isolated read-only frontend workspace', async () => {
   const frontend = await readManifest('frontend/package.json');
 
   assert.deepEqual(root.workspaces, ['frontend']);
-  assert.equal(root.engines?.node, '>=22.12.0');
+  assert.equal(root.engines?.node, '>=22.13.0');
   assert.equal(root.scripts?.build, 'npm run build:backend && npm run build --workspace frontend');
   assert.equal(root.scripts?.check, 'npm run check:backend && npm run check --workspace frontend');
   assert.equal(root.scripts?.lint, 'npm run lint:backend && npm run lint --workspace frontend');
@@ -33,7 +33,7 @@ void test('declares an isolated read-only frontend workspace', async () => {
   assert.equal(
     frontend.devDependencies?.jsdom,
     '28.1.0',
-    'jsdom must support the declared Node >=22.12 runtime and current Node releases',
+    'jsdom must support the declared Node >=22.13 runtime and current Node releases',
   );
   assert.equal(
     root.devDependencies?.jsdom,
