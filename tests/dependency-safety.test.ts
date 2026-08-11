@@ -5,6 +5,7 @@ import test from 'node:test';
 interface PackageManifest {
   readonly dependencies?: Readonly<Record<string, string>>;
   readonly devDependencies?: Readonly<Record<string, string>>;
+  readonly engines?: Readonly<Record<string, string>>;
   readonly overrides?: unknown;
 }
 
@@ -12,6 +13,7 @@ interface LockedPackage {
   readonly version?: string;
   readonly dependencies?: Readonly<Record<string, string>>;
   readonly devDependencies?: Readonly<Record<string, string>>;
+  readonly engines?: Readonly<Record<string, string>>;
 }
 
 interface PackageLock {
@@ -146,4 +148,73 @@ void test('locks the reviewed maintenance toolchain in both workspaces', async (
     '8.67.0',
     'resolved typescript-eslint must match the frontend workspace lock',
   );
+});
+
+void test('requires the supported Node floor and patched compatible transitive releases', async () => {
+  const manifest = JSON.parse(
+    await readFile(new URL('package.json', root), 'utf8'),
+  ) as PackageManifest;
+  const frontendManifest = JSON.parse(
+    await readFile(new URL('frontend/package.json', root), 'utf8'),
+  ) as PackageManifest;
+  const lock = JSON.parse(
+    await readFile(new URL('package-lock.json', root), 'utf8'),
+  ) as PackageLock;
+
+  const violations: string[] = [];
+  const nodeEngines = Object.freeze({
+    'package.json': manifest.engines?.node,
+    'frontend/package.json': frontendManifest.engines?.node,
+    'package-lock.json root workspace': lock.packages?.['']?.engines?.node,
+    'package-lock.json frontend workspace': lock.packages?.frontend?.engines?.node,
+  });
+  for (const [location, engine] of Object.entries(nodeEngines)) {
+    if (engine !== '>=22.13.0') {
+      violations.push(`${location} declares Node ${engine ?? 'missing'}, expected >=22.13.0`);
+    }
+  }
+
+  let braceExpansionCount = 0;
+  let jsYamlCount = 0;
+  for (const [path, entry] of Object.entries(lock.packages ?? {})) {
+    if (/(?:^|\/)node_modules\/brace-expansion$/u.test(path)) {
+      braceExpansionCount += 1;
+      const [majorText, , patchText] = entry.version?.split('.') ?? [];
+      const major = Number(majorText);
+      const patch = Number(patchText);
+      if (!(major > 1 || (major === 1 && patch >= 18))) {
+        violations.push(`${path} ${entry.version ?? 'missing'} is vulnerable`);
+      }
+    }
+
+    if (/(?:^|\/)node_modules\/js-yaml$/u.test(path)) {
+      jsYamlCount += 1;
+      const [majorText, minorText, patchText] = entry.version?.split('.') ?? [];
+      const major = Number(majorText);
+      const minor = Number(minorText);
+      const patch = Number(patchText);
+      if (!(major > 4 || (major === 4 && (minor > 3 || (minor === 3 && patch >= 1))))) {
+        violations.push(`${path} ${entry.version ?? 'missing'} is vulnerable`);
+      }
+    }
+  }
+
+  assert.ok(braceExpansionCount > 0, 'package-lock.json must contain brace-expansion');
+  assert.ok(jsYamlCount > 0, 'package-lock.json must contain js-yaml');
+  assert.deepEqual(violations, []);
+});
+
+void test('loads the required official Pump SDK exports through Node-compatible bridges', async () => {
+  const pump = await import('../src/launchpads/pumpfun/official-sdk.js');
+  const swap = await import('../src/markets/pumpswap/official-sdk.js');
+
+  assert.equal(typeof pump.bondingCurvePda, 'function');
+  assert.equal(typeof pump.getBuySolAmountFromTokenAmount, 'function');
+  assert.equal(typeof pump.getBuyTokenAmountFromSolAmount, 'function');
+  assert.equal(typeof pump.getSellSolAmountFromTokenAmount, 'function');
+  assert.equal(typeof pump.PUMP_PROGRAM_ID, 'object');
+  assert.equal(typeof swap.buyQuoteInput, 'function');
+  assert.equal(typeof swap.poolPda, 'function');
+  assert.equal(typeof swap.sellBaseInput, 'function');
+  assert.equal(typeof swap.PUMP_FEE_PROGRAM_ID, 'object');
 });
