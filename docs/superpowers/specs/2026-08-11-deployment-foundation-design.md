@@ -1,7 +1,7 @@
 # Deployment Foundation Design
 
-**Issue:** #45  
-**Date:** 2026-08-11  
+**Issue:** #45
+**Date:** 2026-08-11
 **Status:** approved through the standing recommendation-first instruction
 
 ## 1. Purpose

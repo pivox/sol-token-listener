@@ -6,6 +6,9 @@ x-runtime-environment: &runtime-environment
   SOLANA_WS_RPC_URL: ${SOLANA_WS_RPC_URL:?SOLANA_WS_RPC_URL is required}
   EXECUTION_MODE: observe
   POSTGRES_AUTO_MIGRATE: "false"
+  PAPER_STRATEGY_ENABLED: "false"
+  API_ENABLED: "true"
+  DATA_RETENTION_HOURS: "4"
 
 services:
   postgres:

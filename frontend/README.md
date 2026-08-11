@@ -16,6 +16,12 @@ npm run build
 npm run frontend:dev
 ```
 
+Le serveur Vite de développement conserve l'origine `127.0.0.1:4173` et
+proxy uniquement les requêtes de lecture `/api/v1` vers le backend loopback
+`127.0.0.1:3000`. Il ne change pas l'en-tête `Host` et ne proxifie pas de
+WebSocket. Démarrez donc le backend local sur ce port avant d'utiliser la
+console de développement.
+
 Le fichier public `public/config.json` est lu et validé avant la création de
 l’application :
 
@@ -75,7 +81,9 @@ npm run frontend:e2e
 
 Le test Playwright démarre un mock API/SSE sur une autre origine et vérifie la
 reprise, l’expiration de curseur, la resynchronisation et l’absence de requêtes
-d’écriture issues du navigateur.
+d’écriture issues du navigateur. Après chaque build de test, il écrit
+uniquement `dist/config.json` avec l'URL absolue du mock : le
+`public/config.json` de production reste configuré sur `/`.
 
 ## Déploiement statique
 

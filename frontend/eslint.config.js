@@ -14,6 +14,7 @@ export default tseslint.config(
       'playwright-report/**',
       'test-results/**',
       'tests/e2e/mock-api.mjs',
+      'tests/e2e/write-cross-origin-config.mjs',
     ],
   },
   eslint.configs.recommended,

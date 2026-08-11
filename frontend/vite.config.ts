@@ -8,6 +8,13 @@ export default defineConfig({
   server: {
     host: '127.0.0.1',
     port: 4173,
+    proxy: {
+      '/api/v1': {
+        target: 'http://127.0.0.1:3000',
+        changeOrigin: false,
+        ws: false,
+      },
+    },
   },
   preview: {
     host: '127.0.0.1',

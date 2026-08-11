@@ -201,6 +201,9 @@ void test('Compose defines an observe-only, five-service deployment without expo
   assert.equal((compose.match(/^ {4}ports:/gm) ?? []).length, 1);
   assert.match(compose, /^ {2}EXECUTION_MODE: observe$/m);
   assert.match(compose, /^ {2}POSTGRES_AUTO_MIGRATE: "false"$/m);
+  assert.match(compose, /^ {2}PAPER_STRATEGY_ENABLED: "false"$/m);
+  assert.match(compose, /^ {2}API_ENABLED: "true"$/m);
+  assert.match(compose, /^ {2}DATA_RETENTION_HOURS: "4"$/m);
   assert.match(compose, /^ {6}API_HOST: 0\.0\.0\.0$/m);
   assert.match(compose, /^ {6}API_PORT: "3000"$/m);
   assert.match(compose, /^ {4}init: true$/m);
@@ -224,6 +227,32 @@ void test('Compose defines an observe-only, five-service deployment without expo
   for (const imageLine of compose.match(/^ {4}image: .+$/gm) ?? []) {
     assert.match(imageLine, /(?:@sha256:[0-9a-f]{64}|\$\{(?:BACKEND|FRONTEND)_IMAGE:\?)/u);
   }
+});
+
+void test('local frontend development proxies the read-only V1 API to the loopback backend', async () => {
+  const vite = await readArtifact('frontend/vite.config.ts');
+  const readme = await readArtifact('frontend/README.md');
+
+  assert.match(
+    vite,
+    /server:\s*\{[\s\S]*?proxy:\s*\{[\s\S]*?'\/api\/v1':\s*\{[\s\S]*?target:\s*'http:\/\/127\.0\.0\.1:3000',[\s\S]*?changeOrigin:\s*false,[\s\S]*?ws:\s*false,/,
+  );
+  assert.match(readme, /proxy[\s\S]{0,160}\/api\/v1[\s\S]{0,160}127\.0\.0\.1:3000/i);
+});
+
+void test('cross-origin Playwright uses a generated dist-only runtime config without changing production config', async () => {
+  const playwright = await readArtifact('frontend/playwright.config.ts');
+  const setup = await readArtifact('frontend/tests/e2e/write-cross-origin-config.mjs');
+  const productionConfig = await readArtifact('frontend/public/config.json');
+
+  assert.equal(productionConfig, '{\n  "apiBaseUrl": "/"\n}\n');
+  assert.match(setup, /new URL\('\.\.\/\.\.\/dist\/config\.json', import\.meta\.url\)/);
+  assert.match(setup, /http:\/\/127\.0\.0\.1:3000/);
+  assert.match(setup, /writeFile\([^,]+, serialized, 'utf8'\)/);
+  assert.match(
+    playwright,
+    /command:\s*'npm run build && node tests\/e2e\/write-cross-origin-config\.mjs && npm run preview -- --host 127\.0\.0\.1 --port 4173'/,
+  );
 });
 
 void test('Compose keeps the raw PostgreSQL password separate from its URI-encoded form', async () => {
