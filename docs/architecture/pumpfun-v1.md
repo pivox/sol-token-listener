@@ -459,3 +459,21 @@ erreur interne n'est incluse.
 - aucune promesse de même slot entre création, graduation et snapshot RPC ;
 - simulation inverse indisponible = preuve inconnue ou blocker configuré, jamais
   affirmation de sellabilité.
+
+## Console opérateur indépendante
+
+Le frontend React est un consommateur externe des ports HTTP/SSE : il n’importe
+aucun module du domaine ou des adaptateurs Pump.fun/PumpSwap/Raydium. Ses
+contrats Zod sont volontairement possédés par le workspace frontend afin de
+détecter une dérive de sérialisation à la frontière réseau.
+
+Les projections HTTP restent canoniques. Une révision SSE ne transporte qu’un
+signal borné et invalide des clés TanStack Query spécifiques au mint. Une seule
+connexion `fetch` streaming existe par application. Son curseur est cloisonné
+par version d’API et origine ; il n’est committé qu’après acceptation de la
+trame. Une expiration rend la discontinuité visible, recharge les projections
+actives et reprend au high-water mark courant.
+
+Le build produit un artefact statique configurable au runtime, déployable
+séparément du backend. Cette séparation ne modifie pas les invariants : aucune
+clé privée, aucun wallet, aucun endpoint d’écriture et aucune exécution live.
