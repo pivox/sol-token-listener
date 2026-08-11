@@ -21,6 +21,7 @@ import {
   MAX_CANONICAL_JSON_NODES,
   MAX_CANONICAL_JSON_STRING_BYTES,
   MAX_CANONICAL_JSON_TEXT_BYTES,
+  MAX_SERIALIZED_BIGINT_DIGITS,
 } from '../utils/json.js';
 import type { QualificationEngine } from '../qualification/qualification-engine.js';
 import { toSocialQualificationObservations } from '../social/social-qualification-observations.js';
@@ -149,6 +150,8 @@ const QUALIFICATION_PROJECTION_FIELDS = [
   'report',
   'qualificationEvent',
 ] as const;
+const MAX_PERSISTED_BIGINT_MAGNITUDE =
+  10n ** BigInt(MAX_SERIALIZED_BIGINT_DIGITS) - 1n;
 
 interface PersistedSnapshotState {
   nodes: number;
@@ -184,7 +187,14 @@ function snapshotPersistedValue<T>(
     accountPersistedText(value, state);
     return value;
   }
-  if (value === null || typeof value === 'boolean' || typeof value === 'bigint') return value;
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') {
+    if (
+      value > MAX_PERSISTED_BIGINT_MAGNITUDE
+      || value < -MAX_PERSISTED_BIGINT_MAGNITUDE
+    ) throw invalidPersistedProjection();
+    return value;
+  }
   if (typeof value === 'number') {
     if (!Number.isSafeInteger(value) || Object.is(value, -0)) throw invalidPersistedProjection();
     return value;

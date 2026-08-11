@@ -11,7 +11,11 @@ import {
   createDefaultQualificationRuleSet,
   QualificationEngine,
 } from '../src/qualification/qualification-engine.js';
-import { fromJsonValue, toJsonValue } from '../src/utils/json.js';
+import {
+  fromJsonValue,
+  MAX_SERIALIZED_BIGINT_DIGITS,
+  toJsonValue,
+} from '../src/utils/json.js';
 
 void test('rebuilds from qualification evidence independently of paper state', () => {
   const service = new QualificationRebuildService(engine());
@@ -290,6 +294,42 @@ void test('requires source raw event ids to be exact bounded text', () => {
   }), TypeError);
 });
 
+void test('bounds persisted bigint magnitudes before canonical serialization', () => {
+  const service = new QualificationRebuildService(engine());
+  const projection = deserializeProjection(canonicalProjection(service));
+  const maximumMagnitude = 10n ** BigInt(MAX_SERIALIZED_BIGINT_DIGITS) - 1n;
+  const overMaximum = maximumMagnitude + 1n;
+  const ordinarySource = snapshot();
+  const maximumSlotProjection = deserializeProjection(canonicalProjection(
+    service,
+    snapshot({
+      asOfEvent: {
+        ...ordinarySource.asOfEvent,
+        cursor: { ...ordinarySource.asOfEvent.cursor,slot:maximumMagnitude },
+      },
+    }),
+  ));
+
+  assert.doesNotThrow(() => service.reauthorize(maximumSlotProjection));
+  assert.throws(
+    () => service.reauthorize(withPayloadValue(projection, -maximumMagnitude)),
+    /Persisted qualification projection is not canonical\./u,
+  );
+  for (const hostileMagnitude of [overMaximum, -overMaximum]) {
+    assert.throws(
+      () => service.reauthorize(withPayloadValue(projection, hostileMagnitude)),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(
+          error.message,
+          'Persisted qualification projection contains unsafe data.',
+        );
+        return true;
+      },
+    );
+  }
+});
+
 const engines = new WeakMap<QualificationRebuildService, QualificationEngine>();
 
 function engine(): QualificationEngine {
@@ -309,8 +349,10 @@ function engineFor(service: QualificationRebuildService): QualificationEngine {
   return qualificationEngine;
 }
 
-function canonicalProjection(service = serviceWithEngine()): CanonicalQualificationProjection {
-  const source = snapshot();
+function canonicalProjection(
+  service = serviceWithEngine(),
+  source = snapshot(),
+): CanonicalQualificationProjection {
   const rebuilt = service.rebuild({
     snapshot: source,
     buyQuote: undefined,
