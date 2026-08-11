@@ -119,6 +119,10 @@ void test('does not unlock when session lock acquisition fails', async () => {
   );
   assert.equal(database.queries.some((call) => call.text.includes('pg_advisory_unlock')), false);
   assert.equal(database.released, true);
+  const eviction = database.releaseArguments[0];
+  assert.ok(eviction instanceof Error);
+  assert.equal(eviction.message, 'Qualification projection session lock eviction required.');
+  assert.doesNotMatch(eviction.message, /password/u);
 });
 
 void test('treats a false session unlock result as a cleanup failure', async () => {
@@ -270,7 +274,7 @@ void test('reconstructs metadata and social evidence only through the active lau
   assert.match(socialSql, /social_event\.confirmation_status=collection\.confirmation_status/u);
   assert.match(socialSql, /collection\.confirmation_status=launch_event\.confirmation_status/u);
   assert.match(socialSql, /social_event\.payload_version AS social_event_payload_version/u);
-  assert.match(socialSql, /social_event\.payload AS social_event_payload/u);
+  assert.match(socialSql, /END AS social_event_payload/u);
   const metadataSql = database.queries.find((call) =>
     call.text.includes('qualification_metadata_collection'))?.text ?? '';
   assert.match(metadataSql, /snapshot_id=\$1/u);
@@ -305,6 +309,38 @@ void test('rejects a social event summary that differs from the reconstructed co
     )),
     QualificationProjectionDataError,
   );
+});
+
+void test('surfaces an oversized active social event and fails before loading child evidence', async () => {
+  const evidence = socialFixture();
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_launch')) return rows([launchRow(evidence.mint)]);
+    if (text.includes('qualification_as_of')) return rows([asOfRow(evidence.mint)]);
+    if (text.includes('qualification_social')) {
+      return rows([{
+        ...evidence.collectionRow,
+        social_event_payload_bytes: 1_048_577,
+        social_event_payload: null,
+      }]);
+    }
+    return rows([]);
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact(evidence.mint, (transaction) => (
+      transaction.loadCanonicalInput(evidence.mint)
+    )),
+    QualificationProjectionDataError,
+  );
+
+  const socialSql = database.queries.find((call) => (
+    call.text.includes('qualification_social')
+  ))?.text ?? '';
+  assert.match(socialSql, /octet_length\(social_event\.payload::text\).*social_event_payload_bytes/u);
+  assert.match(socialSql, /CASE[\s\S]*octet_length\(social_event\.payload::text\)[\s\S]*social_event\.payload/u);
+  assert.doesNotMatch(socialSql, /WHERE[\s\S]*octet_length\(social_event\.payload::text\)\s*<=/u);
+  assert.equal(database.queries.some((call) => call.text.includes('qualification_social_links')), false);
 });
 
 void test('loads participant and complete current wallet graph only through active derived events', async () => {
@@ -343,6 +379,40 @@ void test('loads participant and complete current wallet graph only through acti
   assert.match(holderSql, /octet_length\(event\.payload::text\) <= \$3/u);
 });
 
+void test('surfaces an oversized active creator profile before holder matching', async () => {
+  const evidence = analyticsFixture();
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_launch')) return rows([launchRow()]);
+    if (text.includes('qualification_as_of')) return rows([asOfRow()]);
+    if (text.includes('qualification_creator')) {
+      return rows([{
+        ...evidence.profileRow,
+        profile_payload_bytes: 1_048_577,
+        profile_event_payload_bytes: 1_048_577,
+        profile_payload: null,
+        profile_event_payload: null,
+      }]);
+    }
+    return rows([]);
+  });
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+    QualificationProjectionDataError,
+  );
+
+  const creatorSql = database.queries.find((call) => (
+    call.text.includes('qualification_creator')
+  ))?.text ?? '';
+  assert.match(creatorSql, /profile_payload_bytes/u);
+  assert.match(creatorSql, /profile_event_payload_bytes/u);
+  assert.match(creatorSql, /CASE[\s\S]*profile\.payload/u);
+  assert.match(creatorSql, /CASE[\s\S]*event\.payload/u);
+  assert.doesNotMatch(creatorSql, /WHERE[\s\S]*octet_length\((?:profile|event)\.payload::text\)\s*<=/u);
+  assert.equal(database.queries.some((call) => call.text.includes('qualification_holders')), false);
+});
+
 void test('reconstructs holder aggregates without touching the snapshot payload', async () => {
   const evidence = analyticsFixture();
   let touched = false;
@@ -369,7 +439,12 @@ void test('reconstructs holder aggregates without touching the snapshot payload'
   ));
 
   assert.equal(touched, false);
-  assert.deepEqual(snapshot?.holderSnapshot?.positions, []);
+  assert.equal(
+    snapshot?.holderSnapshot === null
+      ? true
+      : Object.hasOwn(snapshot?.holderSnapshot ?? {}, 'positions'),
+    false,
+  );
   assert.equal(snapshot?.holderSnapshot?.totalPositiveNetBaseRaw, 2n);
 });
 
@@ -385,6 +460,28 @@ void test('rejects a holder event summary that differs from reconstructed scalar
         ...(originalEvent.distribution as Record<string, unknown>),
         totalPositiveNetBaseRaw: 3n,
       },
+    }),
+  };
+  const database = analyticsPool(evidence, evidence.graphRow, holderRow);
+  const repository = new PostgresQualificationProjectionRepository(database, validator());
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+    QualificationProjectionDataError,
+  );
+});
+
+void test('rejects a holder summary concentration outside the basis-point scale', async () => {
+  const evidence = analyticsFixture();
+  const originalEvent = evidence.holderRow.event_payload as Record<string, unknown>;
+  const originalSummary = originalEvent.distribution as Record<string, unknown>;
+  const holderRow = {
+    ...evidence.holderRow,
+    top1_bps: '10001',
+    event_payload: toJsonValue({
+      inputFingerprint: 'c'.repeat(64),
+      confirmationCounts: { processed: 0, confirmed: 1, finalized: 0 },
+      distribution: { ...originalSummary, top1Bps: 10_001n },
     }),
   };
   const database = analyticsPool(evidence, evidence.graphRow, holderRow);
@@ -867,6 +964,8 @@ void test('returns UNCHANGED for an exact current replay without event or outbox
   assert.equal(statements.some((sql) => sql.includes('INSERT INTO domain_events')), false);
   assert.equal(statements.some((sql) => sql.includes('INSERT INTO qualification_reports')), false);
   assert.equal(statements.some((sql) => sql.includes('UPDATE qualification_reports')), false);
+  const currentSql = statements.find((sql) => sql.includes('qualification_current_report')) ?? '';
+  assert.match(currentSql, /purge_after > clock_timestamp\(\)/u);
 });
 
 void test('recreates a purged report by reusing an exact retained qualification event', async () => {
@@ -927,17 +1026,13 @@ void test('rejects a conflicting retained qualification event before report inse
   )), false);
 });
 
-void test('fails closed when an expired historical report cannot be deterministically reactivated', async () => {
+void test('fails closed on an exact expired report without extending its freshness', async () => {
   const projection = projectionFixture();
   const database = new ScriptedPool((text) => {
     if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
-    if (text.includes('qualification_historical_report')) {
+    if (text.includes('qualification_expired_report')) {
       return rows([{ report_id: projection.reportId }]);
     }
-    if (text.includes('qualification_stored_report')) {
-      return rows([storedProjectionRow(projection)]);
-    }
-    if (text.includes('SET superseded_at=NULL')) return { rows: [], rowCount: 0 };
     return undefined;
   });
   const repository = new PostgresQualificationProjectionRepository(
@@ -947,8 +1042,21 @@ void test('fails closed when an expired historical report cannot be deterministi
 
   await assert.rejects(
     repository.transact('mint', (transaction) => transaction.replaceProjection(projection)),
-    QualificationProjectionDataError,
+    (error: unknown) => {
+      assert.ok(error instanceof QualificationProjectionDataError);
+      assert.equal(error.message, 'Stored qualification projection report has expired.');
+      return true;
+    },
   );
+  const statements = database.queries.map((call) => call.text);
+  const historicalSql = statements.find((sql) => (
+    sql.includes('qualification_historical_report')
+  )) ?? '';
+  const expiredSql = statements.find((sql) => sql.includes('qualification_expired_report')) ?? '';
+  assert.match(historicalSql, /purge_after > clock_timestamp\(\)/u);
+  assert.match(expiredSql, /purge_after <= clock_timestamp\(\)/u);
+  assert.equal(statements.some((sql) => sql.includes('SET superseded_at=NULL')), false);
+  assert.equal(statements.some((sql) => sql.includes('INSERT INTO qualification_reports')), false);
 });
 
 void test('reactivates an exact historical report after superseding current without cursor veto', async () => {
@@ -980,6 +1088,7 @@ void test('reactivates an exact historical report after superseding current with
   const reactivate = statements.findIndex((sql) => sql.includes('SET superseded_at=NULL'));
   assert.ok(supersede > 0);
   assert.ok(reactivate > supersede);
+  assert.match(statements[reactivate] ?? '', /purge_after > clock_timestamp\(\)/u);
   assert.equal(statements.some((sql) => sql.includes('INSERT INTO domain_events')), false);
   assert.equal(statements.some((sql) => /as_of_slot.*>/u.test(sql)), false);
 });
@@ -1001,10 +1110,11 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     await migrateDatabase({ pool });
-    await insertLiveLaunch(pool);
+    const observedAtMs = Date.now();
+    await insertLiveLaunch(pool, observedAtMs);
     const service = qualificationService();
     const repository = new PostgresQualificationProjectionRepository(pool, service);
-    const confirmed = projectionFixture();
+    const confirmed = projectionFixture({ observedAtMs });
 
     await Promise.all([
       repository.transact('mint', (transaction) => transaction.replaceProjection(confirmed)),
@@ -1021,18 +1131,19 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
       WHERE event_id='raw-source'`);
     await pool.query(`UPDATE domain_events SET confirmation_status='finalized'
       WHERE event_id='source-event'`);
-    const finalized = projectionFixture({ confirmationStatus: 'finalized' });
+    const finalized = projectionFixture({ confirmationStatus: 'finalized', observedAtMs });
     await repository.transact('mint', (transaction) => transaction.replaceProjection(finalized));
     const evidenceRevision = projectionFixture({
       confirmationStatus: 'finalized',
       descriptionAvailable: true,
+      observedAtMs,
     });
     await repository.transact(
       'mint',
       (transaction) => transaction.replaceProjection(evidenceRevision),
     );
 
-    await insertLiveTrade(pool);
+    await insertLiveTrade(pool, observedAtMs + 1_000);
     const recentSnapshot = await repository.transact(
       'mint',
       (transaction) => transaction.loadCanonicalInput('mint'),
@@ -1068,6 +1179,155 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
     assert.equal(missing, null);
     await repository.transact('mint', (transaction) => transaction.dissolveCurrent('mint'));
     assert.deepEqual(await liveCounts(pool), ['4', '0', '4', '4']);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
+void test('live PostgreSQL rejects present oversized social and creator JSON evidence', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live qualification payload bound test skipped');
+    return;
+  }
+  const schema = `qualification_payload_bounds_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    const observedAtMs = Date.now();
+    await insertLiveLaunch(pool, observedAtMs);
+    const repository = new PostgresQualificationProjectionRepository(pool, validator());
+    const oversized = 'x'.repeat(1_048_577);
+    const metadataSnapshotId = 'metadata-oversized';
+    const collectionId = `social_collection_${'a'.repeat(64)}`;
+    const fingerprint = 'b'.repeat(64);
+    await pool.query(`INSERT INTO token_metadata_snapshots (
+      snapshot_id,mint,uri,resolution_status,failure_reason,failure_message,
+      payload_version,payload_hash,metadata,fetched_at,purge_after,source_launch_event_id
+    ) VALUES ($1,'mint','https://example.test/metadata.json','resolved',NULL,NULL,
+      1,$2,'{}'::jsonb,$3,NULL,'source-event')`, [
+      metadataSnapshotId, 'c'.repeat(64), new Date(observedAtMs),
+    ]);
+    await pool.query(`INSERT INTO domain_events (
+      event_id,raw_event_id,type,mint,source,program,signature,slot,
+      transaction_index,instruction_index,inner_instruction_index,
+      confirmation_status,blockchain_time,observed_at,payload_version,payload
+    ) VALUES (
+      'social-oversized-event','raw-source','SocialEvidenceCollected','mint','pumpfun',
+      'pump-program','signature',10,0,1,NULL,'confirmed',$1,$2,1,$3
+    )`, [new Date(observedAtMs - 100), new Date(observedAtMs), {
+      inputFingerprint: fingerprint, padding: oversized,
+    }]);
+    await pool.query(`INSERT INTO social_evidence_collections (
+      collection_id,input_fingerprint,mint,source_launch_event_id,source_raw_event_id,
+      metadata_snapshot_id,collection_status,confirmation_status,observed_at,
+      payload_version,terminal_at,purge_after
+    ) VALUES ($1,$2,'mint','source-event','raw-source',$3,'COMPLETE','confirmed',$4,
+      1,NULL,NULL)`, [collectionId, fingerprint, metadataSnapshotId, new Date(observedAtMs)]);
+
+    await assert.rejects(
+      repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+      QualificationProjectionDataError,
+    );
+
+    await pool.query('DELETE FROM social_evidence_collections');
+    await pool.query("DELETE FROM domain_events WHERE event_id='social-oversized-event'");
+    await pool.query('DELETE FROM token_metadata_snapshots');
+    const participantFingerprint = 'd'.repeat(64);
+    await pool.query(`INSERT INTO domain_events (
+      event_id,raw_event_id,type,mint,source,program,signature,slot,
+      transaction_index,instruction_index,inner_instruction_index,
+      confirmation_status,blockchain_time,observed_at,payload_version,payload
+    ) VALUES (
+      'creator-oversized-event','raw-source','CreatorProfileUpdated','mint','pumpfun',
+      'pump-program','signature',10,0,1,NULL,'confirmed',$1,$2,1,$3
+    )`, [new Date(observedAtMs - 100), new Date(observedAtMs), {
+      inputFingerprint: participantFingerprint, padding: oversized,
+    }]);
+    await pool.query(`INSERT INTO creator_profiles (
+      mint,creator,payload_version,input_fingerprint,profile_event_id,
+      as_of_slot,as_of_transaction_index,as_of_instruction_index,
+      as_of_inner_instruction_index,confirmation_status,total_bought_base_raw,
+      total_sold_base_raw,observed_net_base_raw,has_sold,payload,observed_at,purge_after
+    ) VALUES ('mint','different-creator',1,$1,'creator-oversized-event',10,0,1,NULL,
+      'confirmed',0,0,0,FALSE,$2,$3,NULL)`, [
+      participantFingerprint, { padding: oversized }, new Date(observedAtMs),
+    ]);
+
+    await assert.rejects(
+      repository.transact('mint', (transaction) => transaction.loadCanonicalInput('mint')),
+      QualificationProjectionDataError,
+    );
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
+void test('live PostgreSQL excludes expired reports and never extends deterministic freshness', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live qualification expiry test skipped');
+    return;
+  }
+  const schema = `qualification_expiry_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    const observedAtMs = Date.now();
+    await insertLiveLaunch(pool, observedAtMs);
+    const service = qualificationService();
+    const repository = new PostgresQualificationProjectionRepository(pool, service);
+    const original = projectionFixture({ observedAtMs });
+    await repository.transact('mint', (transaction) => transaction.replaceProjection(original));
+    await pool.query(`UPDATE qualification_reports
+      SET evaluated_at=clock_timestamp()-INTERVAL '5 hours',
+          purge_after=clock_timestamp()-INTERVAL '1 hour'
+      WHERE report_id=$1`, [original.reportId]);
+    const before = await pool.query<{ readonly purge_after: Date }>(
+      'SELECT purge_after FROM qualification_reports WHERE report_id=$1',
+      [original.reportId],
+    );
+
+    await assert.rejects(
+      repository.transact('mint', (transaction) => transaction.replaceProjection(original)),
+      (error: unknown) => {
+        assert.ok(error instanceof QualificationProjectionDataError);
+        assert.equal(error.message, 'Stored qualification projection report has expired.');
+        return true;
+      },
+    );
+    const after = await pool.query<{ readonly purge_after: Date; readonly superseded_at: Date | null }>(
+      'SELECT purge_after,superseded_at FROM qualification_reports WHERE report_id=$1',
+      [original.reportId],
+    );
+    assert.equal(after.rows[0]?.purge_after.getTime(), before.rows[0]?.purge_after.getTime());
+    assert.equal(after.rows[0]?.superseded_at, null);
+
+    const fresh = projectionFixture({ observedAtMs, descriptionAvailable: true });
+    assert.notEqual(fresh.reportId, original.reportId);
+    const outcomes = await Promise.all([
+      repository.transact('mint', (transaction) => transaction.replaceProjection(fresh)),
+      repository.transact('mint', (transaction) => transaction.replaceProjection(fresh)),
+    ]);
+    assert.deepEqual([...outcomes].sort(), ['UNCHANGED', 'UPDATED']);
+    const current = await pool.query<{ readonly report_id: string }>(`SELECT report_id
+      FROM qualification_reports
+      WHERE superseded_at IS NULL AND purge_after > clock_timestamp()`);
+    assert.deepEqual(current.rows.map((row) => row.report_id), [fresh.reportId]);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
@@ -1215,6 +1475,12 @@ function socialFixture() {
     observations: Object.freeze([observation]), evidence: Object.freeze([socialEvidence]),
     observedAtMs: 1_014,
   }));
+  const socialEventPayload = toJsonValue({
+    sourceLaunchEventId: 'launch-event', collectionId: collection.id,
+    metadataSnapshotId, collectionStatus: 'COMPLETE',
+    inputFingerprint: collection.inputFingerprint,
+    linkCount: collection.links.length, evidenceCount: collection.evidence.length,
+  });
   return {
     mint, metadata, collection,
     collectionRow: {
@@ -1224,12 +1490,8 @@ function socialFixture() {
       metadata_snapshot_id: metadataSnapshotId, collection_status: 'COMPLETE',
       observed_at: new Date(1_014), payload_version: 1,
       social_event_payload_version: 1,
-      social_event_payload: toJsonValue({
-        sourceLaunchEventId: 'launch-event', collectionId: collection.id,
-        metadataSnapshotId, collectionStatus: 'COMPLETE',
-        inputFingerprint: collection.inputFingerprint,
-        linkCount: collection.links.length, evidenceCount: collection.evidence.length,
-      }),
+      social_event_payload_bytes: Buffer.byteLength(JSON.stringify(socialEventPayload), 'utf8'),
+      social_event_payload: socialEventPayload,
     },
     linkRow: {
       link_id: link.id, mint, metadata_snapshot_id: metadataSnapshotId,
@@ -1337,6 +1599,12 @@ function socialBoundaryFixture() {
     evidence,
     observedAtMs: 1_200,
   }));
+  const socialEventPayload = toJsonValue({
+    sourceLaunchEventId: 'launch-event', collectionId: collection.id,
+    metadataSnapshotId, collectionStatus: 'COMPLETE',
+    inputFingerprint: collection.inputFingerprint,
+    linkCount: collection.links.length, evidenceCount: collection.evidence.length,
+  });
   return {
     mint,
     collection,
@@ -1351,12 +1619,8 @@ function socialBoundaryFixture() {
       observed_at: new Date(collection.observedAtMs),
       payload_version: 1,
       social_event_payload_version: 1,
-      social_event_payload: toJsonValue({
-        sourceLaunchEventId: 'launch-event', collectionId: collection.id,
-        metadataSnapshotId, collectionStatus: 'COMPLETE',
-        inputFingerprint: collection.inputFingerprint,
-        linkCount: collection.links.length, evidenceCount: collection.evidence.length,
-      }),
+      social_event_payload_bytes: Buffer.byteLength(JSON.stringify(socialEventPayload), 'utf8'),
+      social_event_payload: socialEventPayload,
     },
     linkRows: collection.links.map((link) => ({
       link_id: link.id, mint, metadata_snapshot_id: metadataSnapshotId,
@@ -1430,16 +1694,21 @@ function analyticsFixture(
     positivePositionCount: holder.positivePositionCount,
     unknownTraderTradeCount: holder.unknownTraderTradeCount,
   };
+  const profilePayload = toJsonValue(profile);
+  const profileEventPayload = toJsonValue({
+    inputFingerprint, confirmationCounts, profile,
+  });
   return {
     graph,
     profileRow: {
       mint: 'mint', creator: 'creator', payload_version: 1, input_fingerprint: inputFingerprint,
       profile_event_id: 'profile-event', confirmation_status: 'confirmed',
       total_bought_base_raw: '2', total_sold_base_raw: '0',
-      observed_net_base_raw: '2', has_sold: false, payload: toJsonValue(profile),
-      event_payload: toJsonValue({
-        inputFingerprint, confirmationCounts, profile,
-      }),
+      observed_net_base_raw: '2', has_sold: false,
+      profile_payload_bytes: Buffer.byteLength(JSON.stringify(profilePayload), 'utf8'),
+      profile_payload: profilePayload,
+      profile_event_payload_bytes: Buffer.byteLength(JSON.stringify(profileEventPayload), 'utf8'),
+      profile_event_payload: profileEventPayload,
     },
     holderRow: {
       snapshot_id: 'holder-snapshot', mint: 'mint', input_fingerprint: holderFingerprint,
@@ -1626,9 +1895,11 @@ function qualificationService(): QualificationRebuildService {
 function projectionFixture(options: Readonly<{
   confirmationStatus?: 'confirmed' | 'finalized';
   descriptionAvailable?: boolean;
+  observedAtMs?: number;
 }> = {}): CanonicalQualificationProjection {
   const service = qualificationService();
   const confirmationStatus = options.confirmationStatus ?? 'confirmed';
+  const observedAtMs = options.observedAtMs ?? 1_000;
   const asOfEvent = Object.freeze({
     id: 'source-event', type: 'TokenLaunchDetected' as const, mint: 'mint',
     source: 'pumpfun', program: 'pump-program', signature: 'signature',
@@ -1637,7 +1908,7 @@ function projectionFixture(options: Readonly<{
       innerInstructionIndex: null,
     }),
     confirmationStatus,
-    blockchainTimeMs: 900, observedAtMs: 1_000, payloadVersion: 1,
+    blockchainTimeMs: observedAtMs - 100, observedAtMs, payloadVersion: 1,
     payload: Object.freeze({}),
   });
   const rebuilt = service.rebuild({
@@ -1661,7 +1932,7 @@ function projectionFixture(options: Readonly<{
               twitterUrl: null, telegramUrl: null,
             }),
           }),
-          fetchedAtMs: 1_000, payloadVersion: 1,
+          fetchedAtMs: observedAtMs, payloadVersion: 1,
         }),
       social: null, creatorProfile: null,
       holderSnapshot: null, walletGraph: null,
@@ -1794,7 +2065,10 @@ function storedProjectionRow(
   };
 }
 
-async function insertLiveLaunch(pool: InstanceType<typeof pg.Pool>): Promise<void> {
+async function insertLiveLaunch(
+  pool: InstanceType<typeof pg.Pool>,
+  observedAtMs = 1_000,
+): Promise<void> {
   const launch = {
     mint: 'mint', creator: 'creator', tokenProgram: 'SPL_TOKEN', quoteAssets: [],
     launchpad: 'pumpfun',
@@ -1811,7 +2085,7 @@ async function insertLiveLaunch(pool: InstanceType<typeof pg.Pool>): Promise<voi
   ) VALUES (
     'raw-source','pumpfun','pump-program','mint','signature',10,0,1,NULL,
     'confirmed',$1,$2,1,'{}'::jsonb,'processed'
-  )`, [new Date(900), new Date(1_000)]);
+  )`, [new Date(observedAtMs - 100), new Date(observedAtMs)]);
   await pool.query(`INSERT INTO domain_events (
     event_id,raw_event_id,type,mint,source,program,signature,slot,
     transaction_index,instruction_index,inner_instruction_index,
@@ -1819,7 +2093,7 @@ async function insertLiveLaunch(pool: InstanceType<typeof pg.Pool>): Promise<voi
   ) VALUES (
     'source-event','raw-source','TokenLaunchDetected','mint','pumpfun',
     'pump-program','signature',10,0,1,NULL,'confirmed',$1,$2,1,$3
-  )`, [new Date(900), new Date(1_000), toJsonValue({ launch })]);
+  )`, [new Date(observedAtMs - 100), new Date(observedAtMs), toJsonValue({ launch })]);
   await pool.query(`INSERT INTO token_launches (
     mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
     created_signature,created_slot,created_transaction_index,
@@ -1827,10 +2101,13 @@ async function insertLiveLaunch(pool: InstanceType<typeof pg.Pool>): Promise<voi
   ) VALUES (
     'mint','pumpfun','pump-program','creator','SPL_TOKEN','[]'::jsonb,'DETECTED',
     'signature',10,0,1,NULL,$1,$1
-  )`, [new Date(1_000)]);
+  )`, [new Date(observedAtMs)]);
 }
 
-async function insertLiveTrade(pool: InstanceType<typeof pg.Pool>): Promise<void> {
+async function insertLiveTrade(
+  pool: InstanceType<typeof pg.Pool>,
+  observedAtMs = 2_000,
+): Promise<void> {
   await pool.query(`INSERT INTO raw_chain_events (
     event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
     inner_instruction_index,confirmation_status,blockchain_time,observed_at,
@@ -1838,7 +2115,7 @@ async function insertLiveTrade(pool: InstanceType<typeof pg.Pool>): Promise<void
   ) VALUES (
     'raw-trade','pumpfun','pump-program','mint','trade-signature',11,0,2,NULL,
     'finalized',$1,$2,1,'{}'::jsonb,'processed'
-  )`, [new Date(1_900), new Date(2_000)]);
+  )`, [new Date(observedAtMs - 100), new Date(observedAtMs)]);
   await pool.query(`INSERT INTO domain_events (
     event_id,raw_event_id,type,mint,source,program,signature,slot,
     transaction_index,instruction_index,inner_instruction_index,
@@ -1846,7 +2123,7 @@ async function insertLiveTrade(pool: InstanceType<typeof pg.Pool>): Promise<void
   ) VALUES (
     'trade-event','raw-trade','BondingCurveTradeObserved','mint','pumpfun',
     'pump-program','trade-signature',11,0,2,NULL,'finalized',$1,$2,1,'{}'::jsonb
-  )`, [new Date(1_900), new Date(2_000)]);
+  )`, [new Date(observedAtMs - 100), new Date(observedAtMs)]);
 }
 
 async function liveCounts(

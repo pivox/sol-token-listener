@@ -6,9 +6,7 @@ import type {
 } from '../domain/pumpfun-observation.js';
 import {
   assertValidCreatorProfile,
-  assertValidHolderDistribution,
   type CreatorProfile,
-  type HolderDistribution,
 } from '../domain/participant-analytics.js';
 import {
   createSocialCollection,
@@ -37,6 +35,7 @@ import {
 } from '../domain/wallet-graph.js';
 import type {
   CanonicalQualificationProjection,
+  QualificationHolderSummary,
   QualificationCanonicalSnapshot,
   QualificationProjectionRepository,
   QualificationProjectionTransaction,
@@ -117,11 +116,13 @@ implements QualificationProjectionRepository {
     let evictClient = false;
     const failures: unknown[] = [];
     try {
+      evictClient = true;
       await client.query(
         "SELECT pg_advisory_lock(hashtextextended('qualification-projection:' || $1, 0))",
         [mint],
       );
       lockAcquired = true;
+      evictClient = false;
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       transactionStarted = true;
       result = await operation(new PostgresQualificationProjectionTransaction(
@@ -277,7 +278,9 @@ implements QualificationProjectionTransaction {
           collection.metadata_snapshot_id,collection.collection_status,
           collection.observed_at,collection.payload_version,
           social_event.payload_version AS social_event_payload_version,
-          social_event.payload AS social_event_payload
+          octet_length(social_event.payload::text) AS social_event_payload_bytes,
+          CASE WHEN octet_length(social_event.payload::text) <= $3
+            THEN social_event.payload ELSE NULL END AS social_event_payload
        FROM social_evidence_collections AS collection
        JOIN domain_events AS launch_event
          ON launch_event.event_id=collection.source_launch_event_id
@@ -295,12 +298,19 @@ implements QualificationProjectionTransaction {
          AND collection.confirmation_status=launch_event.confirmation_status
          AND collection.confirmation_status <> 'orphaned'
          AND collection.terminal_at IS NULL
-         AND octet_length(social_event.payload::text) <= $3
        ORDER BY collection.observed_at DESC,collection.collection_id DESC
        LIMIT 1`,
       [mint, launchEvent.id, DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM],
     );
     const collectionRow = socialResult.rows[0];
+    if (
+      collectionRow !== undefined
+      && (
+        index(collectionRow.social_event_payload_bytes)
+          > DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM
+        || collectionRow.social_event_payload === null
+      )
+    ) throw invalid();
     const social = collectionRow === undefined
       ? null
       : await this.loadSocial(
@@ -336,7 +346,13 @@ implements QualificationProjectionTransaction {
           profile.payload_version,profile.input_fingerprint,profile.profile_event_id,
           profile.confirmation_status,profile.total_bought_base_raw::text,
           profile.total_sold_base_raw::text,profile.observed_net_base_raw::text,
-          profile.has_sold,profile.payload,event.payload AS event_payload
+          profile.has_sold,
+          octet_length(profile.payload::text) AS profile_payload_bytes,
+          CASE WHEN octet_length(profile.payload::text) <= $2
+            THEN profile.payload ELSE NULL END AS profile_payload,
+          octet_length(event.payload::text) AS profile_event_payload_bytes,
+          CASE WHEN octet_length(event.payload::text) <= $2
+            THEN event.payload ELSE NULL END AS profile_event_payload
        FROM creator_profiles AS profile
        JOIN domain_events AS event ON event.event_id=profile.profile_event_id
        JOIN raw_chain_events AS raw
@@ -351,13 +367,22 @@ implements QualificationProjectionTransaction {
          AND raw.confirmation_status=event.confirmation_status
          AND raw.confirmation_status <> 'orphaned'
          AND event.payload->>'inputFingerprint'=profile.input_fingerprint
-         AND octet_length(profile.payload::text) <= $2
-         AND octet_length(event.payload::text) <= $2`,
+      `,
       [mint, DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM],
     );
-    const creatorProfile = creatorResult.rows[0] === undefined
+    const creatorRow = creatorResult.rows[0];
+    if (
+      creatorRow !== undefined
+      && (
+        index(creatorRow.profile_payload_bytes) > DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM
+        || index(creatorRow.profile_event_payload_bytes) > DERIVED_EVENT_PAYLOAD_BYTE_MAXIMUM
+        || creatorRow.profile_payload === null
+        || creatorRow.profile_event_payload === null
+      )
+    ) throw invalid();
+    const creatorProfile = creatorRow === undefined
       ? null
-      : creatorProfileFromRow(creatorResult.rows[0], mint);
+      : creatorProfileFromRow(creatorRow, mint);
     const holderResult = await this.client.query(
       `SELECT /* qualification_holders */ holder.snapshot_id,holder.mint,
           holder.input_fingerprint,holder.holder_event_id,holder.payload_version,
@@ -395,7 +420,7 @@ implements QualificationProjectionTransaction {
     );
     const holderSnapshot = holderResult.rows[0] === undefined
       ? null
-      : holderDistributionFromRow(holderResult.rows[0], mint, creatorProfile?.creator ?? null);
+      : holderSummaryFromRow(holderResult.rows[0], mint, creatorProfile?.creator ?? null);
     if (
       (creatorProfile === null) !== (holderSnapshot === null)
       || (
@@ -718,6 +743,7 @@ implements QualificationProjectionTransaction {
        FROM qualification_reports
        WHERE mint=$1 AND profile_id=$2 AND profile_version=$3
          AND superseded_at IS NULL
+         AND purge_after > clock_timestamp()
        FOR UPDATE`,
       [event.mint, profile.id, profile.version],
     );
@@ -740,18 +766,33 @@ implements QualificationProjectionTransaction {
     );
     const historicalResult = await this.client.query(
       `SELECT /* qualification_historical_report */ report_id
-       FROM qualification_reports WHERE report_id=$1 FOR UPDATE`,
+       FROM qualification_reports WHERE report_id=$1
+         AND purge_after > clock_timestamp()
+       FOR UPDATE`,
       [projection.reportId],
     );
     if (historicalResult.rows[0] !== undefined) {
       await this.assertStoredProjection(projection);
       const reactivated = await this.client.query(
         `UPDATE qualification_reports SET superseded_at=NULL
-         WHERE report_id=$1 AND mint=$2 AND superseded_at IS NOT NULL`,
+         WHERE report_id=$1 AND mint=$2 AND superseded_at IS NOT NULL
+           AND purge_after > clock_timestamp()`,
         [projection.reportId, event.mint],
       );
       if (reactivated.rowCount !== 1) throw invalid();
       return 'UPDATED';
+    }
+    const expiredResult = await this.client.query(
+      `SELECT /* qualification_expired_report */ report_id
+       FROM qualification_reports WHERE report_id=$1
+         AND purge_after <= clock_timestamp()
+       FOR UPDATE`,
+      [projection.reportId],
+    );
+    if (expiredResult.rows[0] !== undefined) {
+      throw new QualificationProjectionDataError(
+        'Stored qualification projection report has expired.',
+      );
     }
     const evaluatedAt = retentionDate(projection.report.evaluatedAtMs, 0);
     const purgeAfter = retentionDate(projection.report.evaluatedAtMs, 14_400_000);
@@ -1042,13 +1083,13 @@ function creatorProfileFromRow(
   row: Record<string, unknown>,
   mint: string,
 ): CreatorProfile {
-  const decoded = record(decodeJson(row.payload));
+  const decoded = record(decodeJson(row.profile_payload));
   exactKeys(decoded, CREATOR_PROFILE_FIELDS);
   const profile = decoded as unknown as CreatorProfile;
   assertValidCreatorProfile(profile);
   assertCreatorProfileDetails(profile);
   assertParticipantEventPayload(
-    row.event_payload,
+    row.profile_event_payload,
     profile.inputFingerprint,
     'profile',
     profile,
@@ -1069,19 +1110,18 @@ function creatorProfileFromRow(
   return profile;
 }
 
-function holderDistributionFromRow(
+function holderSummaryFromRow(
   row: Record<string, unknown>,
   mint: string,
   creator: string | null,
-): HolderDistribution {
+): QualificationHolderSummary {
   if (creator === null) throw invalid();
   if (positiveIndex(row.payload_version) !== 1) throw invalid();
-  const distribution = Object.freeze({
+  const summary = Object.freeze({
     mint: text(row.mint),
     creator,
     payloadVersion: 1 as const,
     inputFingerprint: hash(row.input_fingerprint),
-    positions: Object.freeze([]),
     totalPositiveNetBaseRaw: unsignedBigInt(row.total_positive_net_base_raw),
     top1Bps: unsignedBigInt(row.top1_bps),
     top5Bps: unsignedBigInt(row.top5_bps),
@@ -1092,20 +1132,21 @@ function holderDistributionFromRow(
     positivePositionCount: index(row.positive_position_count),
     unknownTraderTradeCount: index(row.unknown_trader_trade_count),
   });
-  assertValidHolderDistribution(distribution);
+  if ([summary.top1Bps, summary.top5Bps, summary.top10Bps, summary.creatorBps]
+    .some((value) => value > 10_000n)) throw invalid();
   if (positiveIndex(row.event_payload_version) !== 1) throw invalid();
   assertParticipantEventPayload(
     row.event_payload,
-    distribution.inputFingerprint,
+    summary.inputFingerprint,
     'distribution',
-    holderDistributionSummary(distribution),
+    holderDistributionSummary(summary),
   );
   if (
-    distribution.mint !== mint
+    summary.mint !== mint
     || text(row.holder_event_id).length === 0
     || confirmation(row.confirmation_status) === 'orphaned'
   ) throw invalid();
-  return distribution;
+  return summary;
 }
 
 function assertParticipantEventPayload(
@@ -1125,7 +1166,7 @@ function assertParticipantEventPayload(
 }
 
 function holderDistributionSummary(
-  distribution: HolderDistribution,
+  distribution: QualificationHolderSummary,
 ): Readonly<Record<string, unknown>> {
   return Object.freeze({
     mint: distribution.mint,

@@ -1,5 +1,5 @@
 import type { DomainEvent } from '../domain/events.js';
-import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
+import type { CreatorProfile } from '../domain/participant-analytics.js';
 import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
 import type {
   QualificationEvaluationInput,
@@ -16,8 +16,24 @@ export interface QualificationEvidenceSnapshot {
   readonly metadata: TokenMetadataSnapshot | null;
   readonly social: SocialEvidenceCollectionV1 | null;
   readonly creatorProfile: CreatorProfile | null;
-  readonly holderSnapshot: HolderDistribution | null;
+  readonly holderSnapshot: QualificationHolderSummary | null;
   readonly walletGraph: WalletGraphAnalysis | null;
+}
+
+export interface QualificationHolderSummary {
+  readonly mint: string;
+  readonly creator: string;
+  readonly payloadVersion: 1;
+  readonly inputFingerprint: string;
+  readonly totalPositiveNetBaseRaw: bigint;
+  readonly top1Bps: bigint;
+  readonly top5Bps: bigint;
+  readonly top10Bps: bigint;
+  readonly creatorBps: bigint;
+  readonly uniqueKnownBuyers: number;
+  readonly uniqueExternalBuyers: number;
+  readonly positivePositionCount: number;
+  readonly unknownTraderTradeCount: number;
 }
 
 export interface QualificationCanonicalSnapshot extends QualificationEvidenceSnapshot {
