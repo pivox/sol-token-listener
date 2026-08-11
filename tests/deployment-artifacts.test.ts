@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 const root = new URL('../', import.meta.url);
@@ -313,10 +315,10 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
 void test('deployment smoke proves all project resources are absent after cleanup', async () => {
   const smoke = await readArtifact('scripts/deployment-smoke.mjs');
 
-  assert.match(smoke, /\['ps', '-a', '--filter', projectLabel, '--format', '\{\{\.ID\}\}'\]/);
-  assert.match(smoke, /\['network', 'ls', '--filter', projectLabel, '--format', '\{\{\.ID\}\}'\]/);
-  assert.match(smoke, /\['volume', 'ls', '--filter', projectLabel, '--format', '\{\{\.Name\}\}'\]/);
-  assert.match(smoke, /\['image', 'ls', '--filter', projectLabel, '--format', '\{\{\.ID\}\}'\]/);
+  assert.match(smoke, /\['ps', '-a', '--filter', label, '--format', '\{\{\.ID\}\}'\]/);
+  assert.match(smoke, /\['network', 'ls', '--filter', label, '--format', '\{\{\.ID\}\}'\]/);
+  assert.match(smoke, /\['volume', 'ls', '--filter', label, '--format', '\{\{\.Name\}\}'\]/);
+  assert.match(smoke, /\['image', 'ls', '--filter', label, '--format', '\{\{\.ID\}\}'\]/);
   assert.match(smoke, /cleanupFailures\.push\(error\)/);
   assert.match(
     smoke,
@@ -345,8 +347,8 @@ void test('deployment smoke handles signals through one bounded cleanup path bef
   assert.match(smoke, /SIGTERM:\s*143/);
   assert.match(smoke, /--self-sigterm/);
   assert.match(smoke, /--signal-fault-probe/);
-  assert.match(smoke, /await runSignalFaultProbe\(\)/);
-  assert.match(smoke, /await runActiveChildSignalProbe\(\)/);
+  assert.match(smoke, /await runSignalFaultProbe\(invocationMode === 'signal-fault-probe-kill' \? 'SIGKILL' : 'SIGTERM'\)/);
+  assert.match(smoke, /await runActiveChildSignalProbe\(selfSignal\)/);
   assert.match(smoke, /'exec', '-T', 'app', 'node', '-e', 'setInterval\(\(\) => undefined, 1_000\)'/);
   assert.match(smoke, /if \(exitCode === 0\) process\.stdout\.write\('Deployment smoke passed\.\\n'\)/);
   assert.equal(packageJson.scripts?.['deployment:smoke:signal'], 'node scripts/deployment-smoke.mjs --signal-fault-probe');
@@ -360,4 +362,43 @@ void test('deployment smoke discovers Docker allocated loopback port after start
   assert.match(smoke, /\['port', 'frontend', '8080'\]/);
   assert.match(smoke, /\^127\\\.0\\\.0\\\.1:\(\[1-9\]\[0-9\]\{0,4\}\)\\n\$/);
   assert.doesNotMatch(smoke, /reserveLoopbackPort|createServer/);
+});
+
+void test('failed signal fault probes always clean only their explicit child project', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+
+  assert.match(smoke, /finally\s*{\s*cleanupDeadlineAt = Date\.now\(\) \+ CLEANUP_TIMEOUT_MS;/);
+  assert.match(smoke, /await cleanupFaultProject\(faultName, cleanupFailures\)/);
+  assert.match(
+    smoke,
+    /\['compose', '--project-name', faultName, '-f', composeFile, 'down', '--volumes', '--remove-orphans', '--rmi', 'local'\]/,
+  );
+  assert.match(smoke, /COMPOSE_PROJECT_NAME:\s*faultName/);
+  assert.match(smoke, /--signal-fault-probe-kill/);
+  assert.match(smoke, /--self-sigkill/);
+  assert.match(smoke, /new AggregateError\(\[primaryFailure, \.\.\.cleanupFailures\]/);
+});
+
+void test('top-level deployment errors are categorized, bounded, and never reflect input', () => {
+  const secret = `review-secret-${'x'.repeat(4_096)}`;
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL('../scripts/deployment-smoke.mjs', import.meta.url)), secret],
+    { encoding: 'utf8', timeout: 10_000 },
+  );
+
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'Deployment smoke failed: Error(arguments).\n');
+  assert.ok(Buffer.byteLength(result.stderr, 'utf8') <= 1_024);
+  assert.doesNotMatch(result.stderr, /review-secret|deployment-smoke\.mjs:\d+|\bat\s/u);
+});
+
+void test('deployment error summaries categorize aggregate causes without raw messages', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+
+  assert.match(smoke, /error instanceof AggregateError/);
+  assert.match(smoke, /MAX_FAILURE_SUMMARY_BYTES\s*=\s*1_024/);
+  assert.match(smoke, /redact\(summary\)/);
+  assert.doesNotMatch(smoke, /process\.stderr\.write\([^)]*error\.(?:message|stack)/s);
 });

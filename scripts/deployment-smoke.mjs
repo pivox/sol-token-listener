@@ -12,11 +12,18 @@ const FAULT_PROBE_TIMEOUT_MS = 260_000;
 const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_RETENTION_OUTPUT_BYTES = 16 * 1024;
+const MAX_FAILURE_SUMMARY_BYTES = 1_024;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const composeFile = resolve(root, 'deploy/compose.yaml');
 const scriptPath = fileURLToPath(import.meta.url);
-const invocationMode = parseInvocationMode(process.argv.slice(2));
-const projectName = invocationMode === 'self-sigterm'
+let invocationMode;
+let invocationFailure;
+try {
+  invocationMode = parseInvocationMode(process.argv.slice(2));
+} catch (error) {
+  invocationFailure = error;
+}
+const projectName = invocationMode === 'self-sigterm' || invocationMode === 'self-sigkill'
   ? faultProjectName(process.env.DEPLOYMENT_SMOKE_FAULT_PROJECT_NAME)
   : `sol-listener-smoke-${process.pid}-${randomBytes(4).toString('hex')}`;
 const projectLabel = `label=com.docker.compose.project=${projectName}`;
@@ -78,24 +85,28 @@ const canonicalRetentionCounters = Object.freeze([
   'walletGraphSnapshots',
   'walletRelationships',
 ]);
-const projectResourceChecks = Object.freeze([
-  Object.freeze({
-    kind: 'container',
-    args: Object.freeze(['ps', '-a', '--filter', projectLabel, '--format', '{{.ID}}']),
-  }),
-  Object.freeze({
-    kind: 'network',
-    args: Object.freeze(['network', 'ls', '--filter', projectLabel, '--format', '{{.ID}}']),
-  }),
-  Object.freeze({
-    kind: 'volume',
-    args: Object.freeze(['volume', 'ls', '--filter', projectLabel, '--format', '{{.Name}}']),
-  }),
-  Object.freeze({
-    kind: 'image',
-    args: Object.freeze(['image', 'ls', '--filter', projectLabel, '--format', '{{.ID}}']),
-  }),
-]);
+const projectResourceChecks = projectResourceChecksFor(projectLabel);
+
+function projectResourceChecksFor(label) {
+  return Object.freeze([
+    Object.freeze({
+      kind: 'container',
+      args: Object.freeze(['ps', '-a', '--filter', label, '--format', '{{.ID}}']),
+    }),
+    Object.freeze({
+      kind: 'network',
+      args: Object.freeze(['network', 'ls', '--filter', label, '--format', '{{.ID}}']),
+    }),
+    Object.freeze({
+      kind: 'volume',
+      args: Object.freeze(['volume', 'ls', '--filter', label, '--format', '{{.Name}}']),
+    }),
+    Object.freeze({
+      kind: 'image',
+      args: Object.freeze(['image', 'ls', '--filter', label, '--format', '{{.ID}}']),
+    }),
+  ]);
+}
 
 const environment = Object.freeze({
   ...process.env,
@@ -113,21 +124,25 @@ let baseUrl = null;
 
 let exitCode = 1;
 try {
-  if (invocationMode === 'signal-fault-probe') {
-    await runSignalFaultProbe();
+  if (invocationFailure !== undefined) throw invocationFailure;
+  if (invocationMode === 'signal-fault-probe' || invocationMode === 'signal-fault-probe-kill') {
+    await runSignalFaultProbe(invocationMode === 'signal-fault-probe-kill' ? 'SIGKILL' : 'SIGTERM');
     process.stdout.write('Deployment signal fault probe passed.\n');
     exitCode = 0;
   } else {
-    exitCode = await runDeployment(invocationMode === 'self-sigterm');
+    const selfSignal = invocationMode === 'self-sigterm'
+      ? 'SIGTERM'
+      : invocationMode === 'self-sigkill' ? 'SIGKILL' : null;
+    exitCode = await runDeployment(selfSignal);
     if (exitCode === 0) process.stdout.write('Deployment smoke passed.\n');
   }
-} catch {
-  process.stderr.write('Deployment smoke failed.\n');
+} catch (error) {
+  process.stderr.write(deploymentFailureLine(error));
   exitCode = 1;
 }
 process.exitCode = exitCode;
 
-async function runDeployment(selfSigterm) {
+async function runDeployment(selfSignal) {
   const signals = installSmokeSignalHandlers();
   activeSignalRuntime = signals;
   let primaryFailure;
@@ -137,8 +152,8 @@ async function runDeployment(selfSigterm) {
       await compose(['build']);
       await compose(['up', '--detach', '--wait', '--wait-timeout', '120']);
       baseUrl = await discoverFrontendBaseUrl();
-      if (selfSigterm) {
-        await runActiveChildSignalProbe();
+      if (selfSignal !== null) {
+        await runActiveChildSignalProbe(selfSignal);
       }
       await assertNonRoot('app');
       await assertNonRoot('frontend');
@@ -208,9 +223,9 @@ async function runDeployment(selfSigterm) {
   return 0;
 }
 
-async function runActiveChildSignalProbe() {
+async function runActiveChildSignalProbe(signal) {
   const timer = setTimeout(() => {
-    process.kill(process.pid, 'SIGTERM');
+    process.kill(process.pid, signal);
   }, SELF_SIGNAL_TIMEOUT_MS);
   try {
     await compose([
@@ -225,7 +240,9 @@ async function runActiveChildSignalProbe() {
 function parseInvocationMode(args) {
   if (args.length === 0) return 'nominal';
   if (args.length === 1 && args[0] === '--signal-fault-probe') return 'signal-fault-probe';
+  if (args.length === 1 && args[0] === '--signal-fault-probe-kill') return 'signal-fault-probe-kill';
   if (args.length === 1 && args[0] === '--self-sigterm') return 'self-sigterm';
+  if (args.length === 1 && args[0] === '--self-sigkill') return 'self-sigkill';
   throw new Error('Deployment smoke arguments are invalid.');
 }
 
@@ -284,39 +301,100 @@ function installSmokeSignalHandlers() {
   });
 }
 
-async function runSignalFaultProbe() {
+async function runSignalFaultProbe(signal) {
   const faultName = `sol-listener-smoke-${process.pid}-${randomBytes(4).toString('hex')}`;
-  const result = await runFaultProbeChild(faultName);
-  if (result.code !== 143 || result.signal !== null || result.stdout !== '' || result.stderr !== '') {
-    throw new Error('Deployment signal fault probe did not exit cleanly after SIGTERM.');
+  let primaryFailure;
+  const cleanupFailures = [];
+  try {
+    const result = await runFaultProbeChild(faultName, signal);
+    const expected = signal === 'SIGTERM'
+      ? result.code === 143 && result.signal === null
+      : result.code === null && result.signal === 'SIGKILL';
+    if (!expected || result.stdout !== '' || result.stderr !== '') {
+      throw new Error('Deployment signal fault probe child returned an invalid result.');
+    }
+    if (signal === 'SIGKILL') {
+      throw new Error('Deployment signal fault probe controlled child failure.');
+    }
+  } catch (error) {
+    primaryFailure = error;
+  } finally {
+    cleanupDeadlineAt = Date.now() + CLEANUP_TIMEOUT_MS;
+    try {
+      await cleanupFaultProject(faultName, cleanupFailures);
+    } finally {
+      cleanupDeadlineAt = null;
+    }
   }
 
-  cleanupDeadlineAt = Date.now() + CLEANUP_TIMEOUT_MS;
+  if (primaryFailure !== undefined && cleanupFailures.length > 0) {
+    throw new AggregateError([primaryFailure, ...cleanupFailures], 'Deployment fault probe and cleanup failed.');
+  }
+  if (cleanupFailures.length === 1) throw cleanupFailures[0];
+  if (cleanupFailures.length > 1) {
+    throw new AggregateError(cleanupFailures, 'Deployment fault probe cleanup failed.');
+  }
+  if (primaryFailure !== undefined) throw primaryFailure;
+}
+
+async function cleanupFaultProject(faultName, cleanupFailures) {
+  const faultEnvironment = faultCleanupEnvironment(faultName);
   try {
-    const faultLabel = `label=com.docker.compose.project=${faultName}`;
-    for (const check of projectResourceChecks) {
-      const args = check.args.map((value) => value === projectLabel ? faultLabel : value);
-      const probe = await runDocker(args, { cleanup: true, reflectFailureOutput: false });
+    await runDocker(
+      ['compose', '--project-name', faultName, '-f', composeFile, 'down', '--volumes', '--remove-orphans', '--rmi', 'local'],
+      { cleanup: true, reflectFailureOutput: false, commandEnvironment: faultEnvironment },
+    );
+  } catch (error) {
+    cleanupFailures.push(error);
+  }
+  const faultLabel = `label=com.docker.compose.project=${faultName}`;
+  for (const check of projectResourceChecksFor(faultLabel)) {
+    try {
+      const probe = await runDocker(check.args, {
+        cleanup: true,
+        reflectFailureOutput: false,
+        commandEnvironment: faultEnvironment,
+      });
       if (probe.stderr !== '' || probe.stdout.trim() !== '') {
         throw new Error(`Deployment signal fault probe left ${check.kind} resources behind.`);
       }
+    } catch (error) {
+      cleanupFailures.push(error);
     }
-  } finally {
-    cleanupDeadlineAt = null;
   }
 }
 
-async function runFaultProbeChild(faultName) {
+function faultCleanupEnvironment(faultName) {
+  return Object.freeze({
+    ...process.env,
+    COMPOSE_PROJECT_NAME: faultName,
+    POSTGRES_DB: 'smoke',
+    POSTGRES_USER: 'smoke',
+    POSTGRES_PASSWORD: 'cleanup-only',
+    POSTGRES_PASSWORD_URI_ENCODED: 'cleanup-only',
+    SOLANA_HTTP_RPC_URL: 'https://rpc.invalid',
+    SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
+    LISTENER_ENABLED: 'false',
+    FRONTEND_PORT: '0',
+  });
+}
+
+async function runFaultProbeChild(faultName, signal) {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(process.execPath, [scriptPath, '--self-sigterm'], {
-      cwd: root,
-      env: Object.freeze({
-        ...process.env,
-        DEPLOYMENT_SMOKE_FAULT_PROJECT_NAME: faultName,
-      }),
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const child = spawn(
+      process.execPath,
+      [scriptPath, signal === 'SIGKILL' ? '--self-sigkill' : '--self-sigterm'],
+      {
+        cwd: root,
+        env: Object.freeze({
+          ...process.env,
+          COMPOSE_PROJECT_NAME: faultName,
+          DEPLOYMENT_SMOKE_FAULT_PROJECT_NAME: faultName,
+        }),
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
     const stdout = [];
     const stderr = [];
     let outputBytes = 0;
@@ -372,7 +450,11 @@ async function runDocker(args, options = {}) {
   return runCommand('docker', args, options);
 }
 
-async function runCommand(command, args, { cleanup = false, reflectFailureOutput = true } = {}) {
+async function runCommand(
+  command,
+  args,
+  { cleanup = false, reflectFailureOutput = true, commandEnvironment = environment } = {},
+) {
   const timeoutMs = cleanup
     ? remainingCleanupMs()
     : Math.max(1, deadlineAt - Date.now());
@@ -384,7 +466,7 @@ async function runCommand(command, args, { cleanup = false, reflectFailureOutput
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(command, args, {
       cwd: root,
-      env: environment,
+      env: commandEnvironment,
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -463,6 +545,42 @@ function commandLabel(args) {
 function redact(value) {
   return value.replaceAll(postgresPassword, '[REDACTED]')
     .replaceAll(encodeURIComponent(postgresPassword), '[REDACTED]');
+}
+
+function deploymentFailureLine(error) {
+  const prefix = 'Deployment smoke failed: ';
+  const suffix = '.\n';
+  const availableBytes = MAX_FAILURE_SUMMARY_BYTES
+    - Buffer.byteLength(prefix, 'utf8')
+    - Buffer.byteLength(suffix, 'utf8');
+  const summary = summarizeFailure(error);
+  return `${prefix}${summary.slice(0, availableBytes)}${suffix}`;
+}
+
+function summarizeFailure(error, depth = 0) {
+  if (depth >= 4) return 'Error(depth_limit)';
+  let summary;
+  if (error instanceof AggregateError) {
+    const causes = [...error.errors].slice(0, 8).map((cause) => summarizeFailure(cause, depth + 1));
+    summary = `AggregateError(${error.errors.length})[${causes.join(',')}]`;
+  } else if (error instanceof Error) {
+    summary = `${safeName(error)}(${failureCategory(error.message)})`;
+  } else {
+    summary = 'UnknownError(non_error)';
+  }
+  return redact(summary).replaceAll(/[\r\n\t]/gu, ' ');
+}
+
+function failureCategory(message) {
+  if (/arguments are invalid/iu.test(message)) return 'arguments';
+  if (/cleanup|left .* resources behind|\bdown\b/iu.test(message)) return 'cleanup';
+  if (/deadline|timeout/iu.test(message)) return 'timeout';
+  if (/signal|interrupt/iu.test(message)) return 'signal';
+  if (/could not start/iu.test(message)) return 'spawn';
+  if (/output limit|response/iu.test(message)) return 'bounded_io';
+  if (/failed \((?:exit|SIG)/u.test(message)) return 'command';
+  if (/fault probe/iu.test(message)) return 'fault_probe';
+  return 'validation';
 }
 
 async function discoverFrontendBaseUrl() {
