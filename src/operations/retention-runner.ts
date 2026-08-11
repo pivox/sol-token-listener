@@ -2,7 +2,9 @@ import { isProxy } from 'node:util/types';
 
 export const MIN_RETENTION_PURGE_INTERVAL_MS = 60_000;
 export const MAX_RETENTION_PURGE_INTERVAL_MS = 86_400_000;
-export const DEFAULT_RETENTION_PURGE_INTERVAL_MS = 900_000;
+// The native accessor is intentionally retained for its internal-slot brand check.
+// eslint-disable-next-line @typescript-eslint/unbound-method
+const abortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')?.get;
 
 export type RetentionCounters = Readonly<Record<string, number>>;
 
@@ -20,8 +22,8 @@ export interface RetentionRunnerDependencies {
 
 export interface RetentionRunnerOptions {
   readonly once: boolean;
-  readonly intervalMs?: number | undefined;
-  readonly signal?: AbortSignal | undefined;
+  readonly intervalMs: number;
+  readonly signal: AbortSignal;
 }
 
 export async function runRetention(
@@ -71,34 +73,35 @@ function validateOptions(options: RetentionRunnerOptions): Readonly<{
   if (typeof options !== 'object' || isProxy(options)) {
     throw new TypeError('Retention options are invalid.');
   }
-  const descriptors = Object.getOwnPropertyDescriptors(options);
-  const once = dataField(descriptors, 'once');
-  const interval = dataField(descriptors, 'intervalMs');
-  const suppliedSignal = dataField(descriptors, 'signal');
+  const descriptors = readDescriptors(options, invalidOptions);
+  const once = requiredDataField(descriptors, 'once');
+  const intervalMs = requiredDataField(descriptors, 'intervalMs');
+  const signal = requiredDataField(descriptors, 'signal');
   if (typeof once !== 'boolean') throw new TypeError('Retention mode is invalid.');
-  const intervalMs = interval === undefined ? DEFAULT_RETENTION_PURGE_INTERVAL_MS : interval;
   if (
     typeof intervalMs !== 'number'
     || !Number.isSafeInteger(intervalMs)
     || intervalMs < MIN_RETENTION_PURGE_INTERVAL_MS
     || intervalMs > MAX_RETENTION_PURGE_INTERVAL_MS
   ) throw new RangeError('Retention interval is invalid.');
-  if (suppliedSignal !== undefined && !(suppliedSignal instanceof AbortSignal)) {
+  if (!isNativeAbortSignal(signal)) {
     throw new TypeError('Retention abort signal is invalid.');
   }
   return Object.freeze({
     once,
     intervalMs,
-    signal: suppliedSignal ?? new AbortController().signal,
+    signal,
   });
 }
 
-function dataField(
+function requiredDataField(
   descriptors: Readonly<Record<string, PropertyDescriptor>>,
   key: string,
 ): unknown {
   const descriptor = descriptors[key];
-  if (descriptor === undefined) return undefined;
+  if (descriptor === undefined) {
+    throw new TypeError(`Retention option ${key} is required.`);
+  }
   if (!descriptor.enumerable || !('value' in descriptor)) {
     throw new TypeError(`Retention option ${key} is invalid.`);
   }
@@ -111,28 +114,69 @@ function safeCounters(value: unknown): RetentionCounters {
     || value === null
     || Array.isArray(value)
     || isProxy(value)
-    || Object.getPrototypeOf(value) !== Object.prototype
   ) throw new TypeError('Retention counters are invalid.');
-  if (Object.getOwnPropertySymbols(value).length !== 0) {
-    throw new TypeError('Retention counters are invalid.');
-  }
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const keys = Object.keys(descriptors).sort((left, right) => left.localeCompare(right));
-  if (keys.length > 64) throw new RangeError('Retention counters are invalid.');
-  const counters: Record<string, number> = {};
-  for (const key of keys) {
-    const descriptor = descriptors[key];
+  const descriptors = readDescriptors(value, invalidCounters);
+  const entries: [string, number][] = [];
+  for (const key of Reflect.ownKeys(descriptors)) {
+    const descriptor = ownDescriptor(descriptors, key);
+    if (descriptor === undefined || !('value' in descriptor)) invalidCounters();
+    const source: unknown = descriptor.value;
+    if (typeof source !== 'object' || source === null) invalidCounters();
+    const property = source as PropertyDescriptor;
+    if (!property.enumerable) continue;
+    if (typeof key !== 'string') invalidCounters();
     if (
-      descriptor === undefined
-      || !descriptor.enumerable
-      || !('value' in descriptor)
-      || !/^[a-z][A-Za-z0-9]{0,63}$/u.test(key)
-      || typeof descriptor.value !== 'number'
-      || !Number.isSafeInteger(descriptor.value)
-      || descriptor.value < 0
-      || Object.is(descriptor.value, -0)
-    ) throw new RangeError('Retention counters are invalid.');
-    counters[key] = descriptor.value;
+      !/^[a-z][A-Za-z0-9]{0,63}$/u.test(key)
+      || !('value' in property)
+      || typeof property.value !== 'number'
+      || !Number.isSafeInteger(property.value)
+      || property.value < 0
+      || Object.is(property.value, -0)
+    ) invalidCounters();
+    entries.push([key, property.value]);
+    if (entries.length > 64) invalidCounters();
   }
+  entries.sort(([left], [right]) => left.localeCompare(right));
+  const counters = Object.create(null) as Record<string, number>;
+  for (const [key, counter] of entries) counters[key] = counter;
   return Object.freeze(counters);
+}
+
+function isNativeAbortSignal(value: unknown): value is AbortSignal {
+  if (typeof value !== 'object' || value === null || isProxy(value) || abortSignalAborted === undefined) {
+    return false;
+  }
+  try {
+    void abortSignalAborted.call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readDescriptors(
+  value: object,
+  invalid: () => never,
+): Readonly<Record<string, PropertyDescriptor>> {
+  try {
+    return Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return invalid();
+  }
+}
+
+function ownDescriptor(value: object, key: PropertyKey): PropertyDescriptor | undefined {
+  try {
+    return Object.getOwnPropertyDescriptor(value, key);
+  } catch {
+    return undefined;
+  }
+}
+
+function invalidOptions(): never {
+  throw new TypeError('Retention options are invalid.');
+}
+
+function invalidCounters(): never {
+  throw new RangeError('Retention counters are invalid.');
 }

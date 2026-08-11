@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import { pathToFileURL } from 'node:url';
 import {
-  DEFAULT_RETENTION_PURGE_INTERVAL_MS,
   MAX_RETENTION_PURGE_INTERVAL_MS,
   MIN_RETENTION_PURGE_INTERVAL_MS,
   runRetention,
@@ -9,6 +8,8 @@ import {
 } from '../src/operations/retention-runner.js';
 import { closeDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { logger } from '../src/utils/logger.js';
+
+export const DEFAULT_RETENTION_PURGE_INTERVAL_MS = 900_000;
 
 export interface RetentionCliOptions {
   readonly argv: readonly string[];
