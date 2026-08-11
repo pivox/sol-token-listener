@@ -509,7 +509,10 @@ for (const family of ['relationships', 'clusters', 'members'] as const) {
     const memberCall = database.queries.find((query) => (
       query.text.includes('qualification_graph_members')
     ));
-    assert.match(memberCall?.text ?? '', /ROW_NUMBER\(\) OVER/u);
+    assert.match(
+      memberCall?.text ?? '',
+      /\(ROW_NUMBER\(\) OVER \(PARTITION BY cluster_id ORDER BY wallet\)\)::integer/u,
+    );
     assert.match(memberCall?.text ?? '', /LIMIT \$3/u);
     assert.equal(memberCall?.values?.[2], WALLET_MEMBER_ROW_MAXIMUM + 1);
     assert.equal(memberCall?.values?.[3], WALLET_MEMBERS_PER_CLUSTER_MAXIMUM + 1);

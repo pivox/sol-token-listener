@@ -507,7 +507,7 @@ implements QualificationProjectionTransaction {
        FROM (
          SELECT cluster_id,wallet,member_role,is_creator,observed_net_base_raw,
            input_fingerprint,
-           ROW_NUMBER() OVER (PARTITION BY cluster_id ORDER BY wallet)
+           (ROW_NUMBER() OVER (PARTITION BY cluster_id ORDER BY wallet))::integer
              AS cluster_member_ordinal
          FROM wallet_cluster_members
          WHERE mint=$1 AND input_fingerprint=$2
