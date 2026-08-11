@@ -15,7 +15,13 @@ import type {
   CanonicalQualificationProjection,
   QualificationEvidenceSnapshot,
 } from '../ports/qualification-projection-repository.js';
-import { canonicalStringifyJson } from '../utils/json.js';
+import {
+  canonicalStringifyJson,
+  MAX_CANONICAL_JSON_DEPTH,
+  MAX_CANONICAL_JSON_NODES,
+  MAX_CANONICAL_JSON_STRING_BYTES,
+  MAX_CANONICAL_JSON_TEXT_BYTES,
+} from '../utils/json.js';
 import type { QualificationEngine } from '../qualification/qualification-engine.js';
 import { toSocialQualificationObservations } from '../social/social-qualification-observations.js';
 
@@ -50,27 +56,23 @@ export class QualificationRebuildService {
   }
 
   public reauthorize(projection: CanonicalQualificationProjection): RebuiltQualification {
-    rejectProxy(projection, 'projection');
-    rejectProxy(projection.report, 'report');
-    rejectProxy(projection.qualificationEvent, 'qualification event');
-    rejectProxy(projection.qualificationEvent.payload, 'qualification event payload');
-    assertCanonicalValue(projection, 'projection');
-    assertPersistedIdentifier(projection.sourceEventId, 'source event id');
-    assertPersistedIdentifier(projection.sourceRawEventId, 'source raw event id');
-    const evaluation = snapshotPersistedEvaluation(projection.evaluation);
+    const persisted = snapshotPersistedProjection(projection);
+    assertCanonicalValue(persisted, 'projection');
+    assertPersistedIdentifier(persisted.sourceEventId, 'source event id');
+    assertPersistedIdentifier(persisted.sourceRawEventId, 'source raw event id');
     const rebuilt = this.build({
-      sourceEventId:projection.sourceEventId,
-      mint:projection.qualificationEvent.mint,
-      sourceEvent:projection.qualificationEvent,
-      evaluation,
-      authorizationEventId:projection.qualificationEvent.id,
+      sourceEventId:persisted.sourceEventId,
+      mint:persisted.qualificationEvent.mint,
+      sourceEvent:persisted.qualificationEvent,
+      evaluation:persisted.evaluation,
+      authorizationEventId:persisted.qualificationEvent.id,
     });
     if (
-      projection.reportId !== rebuilt.reportId
-      || projection.evidenceFingerprint !== rebuilt.evidenceFingerprint
-      || !isDeepStrictEqual(projection.evaluation, rebuilt.evaluation)
-      || !isDeepStrictEqual(projection.report, rebuilt.report)
-      || !isDeepStrictEqual(projection.qualificationEvent, rebuilt.event)
+      persisted.reportId !== rebuilt.reportId
+      || persisted.evidenceFingerprint !== rebuilt.evidenceFingerprint
+      || !isDeepStrictEqual(persisted.evaluation, rebuilt.evaluation)
+      || !isDeepStrictEqual(persisted.report, rebuilt.report)
+      || !isDeepStrictEqual(persisted.qualificationEvent, rebuilt.event)
     ) throw new TypeError('Persisted qualification projection is not canonical.');
     return rebuilt;
   }
@@ -125,7 +127,8 @@ function assertPersistedIdentifier(value: string, name: string): void {
   if (
     typeof value !== 'string'
     || value.trim() === ''
-    || Buffer.byteLength(value, 'utf8') > 16_384
+    || value.trim() !== value
+    || Buffer.byteLength(value, 'utf8') > MAX_CANONICAL_JSON_STRING_BYTES
   ) throw new TypeError(`Persisted qualification ${name} is invalid.`);
 }
 
@@ -137,48 +140,141 @@ function assertCanonicalValue(value: unknown, name: string): void {
   }
 }
 
-function snapshotPersistedEvaluation(
-  evaluation: QualificationEvaluationInput,
-): QualificationEvaluationInput {
-  assertCanonicalValue(evaluation, 'evaluation');
-  rejectProxy(evaluation, 'evaluation');
-  rejectProxy(evaluation.signals, 'evaluation signals');
-  rejectProxy(evaluation.blockers, 'evaluation blockers');
-  const calibrationFacts = evaluation.calibrationFacts === null
-    ? null
-    : snapshotPersistedCalibrationFacts(evaluation.calibrationFacts);
-  return Object.freeze({
-    evaluatedAtMs:evaluation.evaluatedAtMs,
-    signals:Object.freeze({ ...evaluation.signals }),
-    blockers:Object.freeze([...evaluation.blockers]),
-    calibrationFacts,
-  });
+const QUALIFICATION_PROJECTION_FIELDS = [
+  'reportId',
+  'sourceEventId',
+  'sourceRawEventId',
+  'evidenceFingerprint',
+  'evaluation',
+  'report',
+  'qualificationEvent',
+] as const;
+
+interface PersistedSnapshotState {
+  nodes: number;
+  textBytes: number;
+  readonly ancestors: WeakSet<object>;
 }
 
-function snapshotPersistedCalibrationFacts(
-  facts: NonNullable<QualificationEvaluationInput['calibrationFacts']>,
-): NonNullable<QualificationEvaluationInput['calibrationFacts']> {
-  rejectProxy(facts, 'evaluation calibration facts');
-  rejectProxy(facts.upstreamConditions, 'evaluation upstream conditions');
-  const upstreamConditions = Object.freeze(facts.upstreamConditions.map((condition) => {
-    rejectProxy(condition, 'evaluation upstream condition');
-    return Object.freeze({ code:condition.code,triggered:condition.triggered });
-  }));
-  return Object.freeze({
-    top1HolderBps:facts.top1HolderBps,
-    top5HoldersBps:facts.top5HoldersBps,
-    top10HoldersBps:facts.top10HoldersBps,
-    maximumRelatedClusterBps:facts.maximumRelatedClusterBps,
-    maximumSharedFunderCount:facts.maximumSharedFunderCount,
-    buySimulationSucceeded:facts.buySimulationSucceeded,
-    sellQuoteAvailable:facts.sellQuoteAvailable,
-    roundTripLossBps:facts.roundTripLossBps,
-    upstreamConditions,
+function snapshotPersistedProjection(
+  projection: CanonicalQualificationProjection,
+): CanonicalQualificationProjection {
+  const snapshot = snapshotPersistedValue(projection, 0, {
+    nodes:0,
+    textBytes:0,
+    ancestors:new WeakSet(),
   });
+  if (
+    Array.isArray(snapshot)
+    || QUALIFICATION_PROJECTION_FIELDS.some((field) => !Object.hasOwn(snapshot, field))
+    || Object.keys(snapshot).length !== QUALIFICATION_PROJECTION_FIELDS.length
+  ) throw invalidPersistedProjection();
+  return snapshot;
 }
 
-function rejectProxy(value: object, name: string): void {
-  if (isProxy(value)) throw new TypeError(`Persisted qualification ${name} is invalid.`);
+function snapshotPersistedValue<T>(
+  value: T,
+  depth: number,
+  state: PersistedSnapshotState,
+): T {
+  if (depth > MAX_CANONICAL_JSON_DEPTH || ++state.nodes > MAX_CANONICAL_JSON_NODES) {
+    throw invalidPersistedProjection();
+  }
+  if (typeof value === 'string') {
+    accountPersistedText(value, state);
+    return value;
+  }
+  if (value === null || typeof value === 'boolean' || typeof value === 'bigint') return value;
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) throw invalidPersistedProjection();
+    return value;
+  }
+  if (typeof value !== 'object' || isProxy(value)) throw invalidPersistedProjection();
+  if (state.ancestors.has(value)) throw invalidPersistedProjection();
+  state.ancestors.add(value);
+  try {
+    if (Array.isArray(value)) return snapshotPersistedArray(value, depth, state) as T;
+    return snapshotPersistedObject(value, depth, state) as T;
+  } finally {
+    state.ancestors.delete(value);
+  }
+}
+
+function snapshotPersistedArray(
+  value: readonly unknown[],
+  depth: number,
+  state: PersistedSnapshotState,
+): readonly unknown[] {
+  if (Object.getPrototypeOf(value) !== Array.prototype) throw invalidPersistedProjection();
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => typeof key === 'symbol')) throw invalidPersistedProjection();
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    lengthDescriptor === undefined
+    || !('value' in lengthDescriptor)
+    || typeof lengthDescriptor.value !== 'number'
+    || !Number.isSafeInteger(lengthDescriptor.value)
+    || lengthDescriptor.value < 0
+    || keys.length !== lengthDescriptor.value + 1
+    || lengthDescriptor.value > MAX_CANONICAL_JSON_NODES - state.nodes
+  ) throw invalidPersistedProjection();
+  const result: unknown[] = [];
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+    const key = String(index);
+    accountPersistedText(key, state);
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw invalidPersistedProjection();
+    }
+    result.push(snapshotPersistedValue(descriptor.value, depth + 1, state));
+  }
+  return Object.freeze(result);
+}
+
+function snapshotPersistedObject(
+  value: object,
+  depth: number,
+  state: PersistedSnapshotState,
+): Readonly<Record<string, unknown>> {
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw invalidPersistedProjection();
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.some((key) => typeof key === 'symbol')
+    || keys.length > MAX_CANONICAL_JSON_NODES - state.nodes
+  ) throw invalidPersistedProjection();
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const result: Record<string, unknown> = prototype === null
+    ? Object.create(null) as Record<string, unknown>
+    : {};
+  for (const key of keys as string[]) {
+    accountPersistedText(key, state);
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw invalidPersistedProjection();
+    }
+    Object.defineProperty(result, key, {
+      value:snapshotPersistedValue(descriptor.value, depth + 1, state),
+      enumerable:true,
+      configurable:true,
+      writable:true,
+    });
+  }
+  return Object.freeze(result);
+}
+
+function accountPersistedText(value: string, state: PersistedSnapshotState): void {
+  const bytes = Buffer.byteLength(value, 'utf8');
+  if (
+    bytes > MAX_CANONICAL_JSON_STRING_BYTES
+    || state.textBytes + bytes > MAX_CANONICAL_JSON_TEXT_BYTES
+  ) throw invalidPersistedProjection();
+  state.textBytes += bytes;
+}
+
+function invalidPersistedProjection(): TypeError {
+  return new TypeError('Persisted qualification projection contains unsafe data.');
 }
 
 function evaluationFrom(input: QualificationRebuildInput): QualificationEvaluationInput {

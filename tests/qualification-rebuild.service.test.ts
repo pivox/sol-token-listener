@@ -186,6 +186,110 @@ for (const mutation of projectionMutations) {
   });
 }
 
+void test('rejects nested proxies without invoking their traps', () => {
+  const service = new QualificationRebuildService(engine());
+  const projection = deserializeProjection(canonicalProjection(service));
+  let trapCalls = 0;
+  const hostileRuleSet = new Proxy({ ...projection.report.ruleSet }, {
+    ownKeys: () => {
+      trapCalls += 1;
+      throw new Error('secret from proxy trap');
+    },
+  });
+
+  assert.throws(() => service.reauthorize({
+    ...projection,
+    report: { ...projection.report, ruleSet: hostileRuleSet },
+  }), TypeError);
+  assert.equal(trapCalls, 0);
+});
+
+void test('rejects nested accessors without reading them', () => {
+  const service = new QualificationRebuildService(engine());
+  const projection = deserializeProjection(canonicalProjection(service));
+  let accessorReads = 0;
+  const hostileRuleSet = { ...projection.report.ruleSet };
+  Object.defineProperty(hostileRuleSet, 'fingerprint', {
+    enumerable: true,
+    get: () => {
+      accessorReads += 1;
+      throw new Error('secret from accessor');
+    },
+  });
+
+  assert.throws(() => service.reauthorize({
+    ...projection,
+    report: { ...projection.report, ruleSet: hostileRuleSet },
+  }), TypeError);
+  assert.equal(accessorReads, 0);
+});
+
+void test('rejects custom prototypes, symbols and sparse arrays in nested data', () => {
+  const service = new QualificationRebuildService(engine());
+  const projection = deserializeProjection(canonicalProjection(service));
+  const customRuleSet = Object.assign(
+    Object.create({ inherited: true }) as Record<string, unknown>,
+    projection.report.ruleSet,
+  ) as CanonicalQualificationProjection['report']['ruleSet'];
+  const symbolSignals = { ...projection.evaluation.signals };
+  Object.defineProperty(symbolSignals, Symbol('secret'), { value:true,enumerable:true });
+  const sparseEvidence = new Array(projection.report.evidence.length + 1);
+  for (let index = 0; index < projection.report.evidence.length; index += 1) {
+    sparseEvidence[index] = projection.report.evidence[index];
+  }
+
+  assert.throws(() => service.reauthorize({
+    ...projection,
+    report: { ...projection.report, ruleSet: customRuleSet },
+  }), TypeError);
+  assert.throws(() => service.reauthorize({
+    ...projection,
+    evaluation: { ...projection.evaluation, signals: symbolSignals },
+  }), TypeError);
+  assert.throws(() => service.reauthorize({
+    ...projection,
+    report: { ...projection.report, evidence: sparseEvidence },
+  }), TypeError);
+});
+
+void test('enforces structural depth, node and nested string byte limits', () => {
+  const service = new QualificationRebuildService(engine());
+  const projection = deserializeProjection(canonicalProjection(service));
+
+  for (const hostileValue of [
+    deeplyNestedValue(65),
+    Array.from({ length:10_001 }, () => null),
+    'é'.repeat(8_193),
+  ]) {
+    assert.throws(() => service.reauthorize(withPayloadValue(projection, hostileValue)), TypeError);
+  }
+});
+
+void test('requires source raw event ids to be exact bounded text', () => {
+  const service = new QualificationRebuildService(engine());
+  const projection = deserializeProjection(canonicalProjection(service));
+
+  for (const sourceRawEventId of [' raw_source', 'raw_source ', '\traw_source', 'raw_source\n']) {
+    assert.throws(() => service.reauthorize({ ...projection,sourceRawEventId }), TypeError);
+  }
+  assert.doesNotThrow(() => service.reauthorize({
+    ...projection,
+    sourceRawEventId:'r'.repeat(16_384),
+  }));
+  assert.throws(() => service.reauthorize({
+    ...projection,
+    sourceRawEventId:'r'.repeat(16_385),
+  }), TypeError);
+  assert.doesNotThrow(() => service.reauthorize({
+    ...projection,
+    sourceRawEventId:'é'.repeat(8_192),
+  }));
+  assert.throws(() => service.reauthorize({
+    ...projection,
+    sourceRawEventId:'é'.repeat(8_193),
+  }), TypeError);
+});
+
 const engines = new WeakMap<QualificationRebuildService, QualificationEngine>();
 
 function engine(): QualificationEngine {
@@ -227,6 +331,25 @@ function deserializeProjection(
   projection: CanonicalQualificationProjection,
 ): CanonicalQualificationProjection {
   return fromJsonValue(toJsonValue(projection)) as CanonicalQualificationProjection;
+}
+
+function withPayloadValue(
+  projection: CanonicalQualificationProjection,
+  hostileValue: unknown,
+): CanonicalQualificationProjection {
+  return {
+    ...projection,
+    qualificationEvent: {
+      ...projection.qualificationEvent,
+      payload: { ...projection.qualificationEvent.payload,hostileValue },
+    },
+  };
+}
+
+function deeplyNestedValue(depth: number): unknown {
+  let value: unknown = null;
+  for (let index = 0; index < depth; index += 1) value = { nested:value };
+  return value;
 }
 
 function snapshot(
