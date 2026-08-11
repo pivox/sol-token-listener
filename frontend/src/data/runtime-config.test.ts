@@ -23,6 +23,55 @@ describe('loadRuntimeConfig', () => {
     }));
   });
 
+  it('uses an injected canonical origin when the public API URL is exactly root', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(response(JSON.stringify({ apiBaseUrl: '/' })));
+
+    await expect(loadRuntimeConfig(fetchFn, undefined, 'https://tokens.example')).resolves.toEqual({
+      apiBaseUrl: 'https://tokens.example',
+    });
+  });
+
+  it.each([
+    ['./', 'relative path'],
+    ['/api', 'API path'],
+    ['//evil.example', 'scheme-relative URL'],
+    [' / ', 'whitespace-wrapped root'],
+  ])('rejects %s instead of treating it as same-origin', async (apiBaseUrl) => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(response(JSON.stringify({ apiBaseUrl })));
+
+    await expect(loadRuntimeConfig(fetchFn, undefined, 'https://tokens.example')).rejects.toMatchObject({
+      code: 'CONFIG_INVALID',
+    });
+  });
+
+  it.each<[label: string, currentOrigin: string | undefined]>([
+    ['missing', undefined],
+    ['credentials', 'https://user:password@tokens.example'],
+    ['non-HTTP scheme', 'ftp://tokens.example'],
+    ['query', 'https://tokens.example?debug=true'],
+    ['path', 'https://tokens.example/path'],
+    ['whitespace', ' https://tokens.example'],
+  ])('rejects a %s injected origin for same-origin configuration', async (_label, currentOrigin) => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(response(JSON.stringify({ apiBaseUrl: '/' })));
+
+    await expect(loadRuntimeConfig(fetchFn, undefined, currentOrigin)).rejects.toMatchObject({
+      code: 'CONFIG_INVALID',
+    });
+  });
+
+  it('rejects a hostile injected origin without reading its properties', async () => {
+    const hostileOrigin = new Proxy({}, {
+      get(): never {
+        throw new Error('origin properties must not be read');
+      },
+    }) as unknown as string;
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(response(JSON.stringify({ apiBaseUrl: '/' })));
+
+    await expect(loadRuntimeConfig(fetchFn, undefined, hostileOrigin)).rejects.toMatchObject({
+      code: 'CONFIG_INVALID',
+    });
+  });
+
   it.each([
     ['relative URL', '/api'],
     ['credentials', 'https://user:password@api.example.test'],

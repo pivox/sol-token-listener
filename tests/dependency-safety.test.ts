@@ -207,9 +207,9 @@ void test('requires the supported Node floor and patched compatible transitive r
   const ciNodeVersions = [
     ...ciWorkflow.matchAll(/^\s+node-version:\s*([^\s#]+)(?:\s+#.*)?$/gmu),
   ].map((match) => match[1]);
-  assert.deepEqual(ciNodeVersions, ['22.13.0', '22.13.0']);
+  assert.deepEqual(ciNodeVersions, ['22.13.0', '22.13.0', '22.13.0']);
 
-  for (const job of ['quality', 'frontend-e2e'] as const) {
+  for (const job of ['quality', 'frontend-e2e', 'deployment-contract'] as const) {
     const heading = `  ${job}:\n`;
     const jobStart = ciWorkflow.indexOf(heading);
     assert.notEqual(jobStart, -1, `CI must contain the ${job} job`);

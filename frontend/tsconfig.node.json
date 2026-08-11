@@ -20,5 +20,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["vite.config.ts", "playwright.config.ts"]
+  "include": ["vite.config.ts", "vite-read-only-api-proxy.ts", "vite-read-only-api-proxy.test.ts", "playwright.config.ts"]
 }

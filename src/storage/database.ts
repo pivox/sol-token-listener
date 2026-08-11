@@ -6,6 +6,7 @@ import type { PoolClient } from 'pg';
 
 type PgPool = InstanceType<typeof pg.Pool>;
 let sharedPool: PgPool | null = null;
+const migrationAdvisoryLockId = 7_347_662_125;
 
 export function getDatabasePool(databaseUrl = process.env.DATABASE_URL): PgPool {
   if (sharedPool !== null) return sharedPool;
@@ -35,7 +36,13 @@ export async function migrateDatabase(options: {
 
   const client = await pool.connect();
   const applied: string[] = [];
+  let lockAcquired = false;
+  const sessionState = { mustBeEvicted: false };
+  const primaryFailures: unknown[] = [];
+  const migrationAborted = new Error('Migration transaction aborted.');
   try {
+    await client.query('SELECT pg_advisory_lock($1)', [migrationAdvisoryLockId]);
+    lockAcquired = true;
     await client.query(`
       CREATE TABLE IF NOT EXISTS migration_history (
         version TEXT PRIMARY KEY,
@@ -55,14 +62,65 @@ export async function migrateDatabase(options: {
         await client.query('COMMIT');
         applied.push(name);
       } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
+        primaryFailures.push(error);
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackFailure) {
+          primaryFailures.push(rollbackFailure);
+          sessionState.mustBeEvicted = true;
+        }
+        throw migrationAborted;
       }
     }
-  } finally {
-    client.release();
+  } catch (error) {
+    if (error !== migrationAborted) primaryFailures.push(error);
+  }
+
+  let unlockFailure: unknown;
+  let unlockFailed = false;
+  if (lockAcquired) {
+    try {
+      const unlock = await client.query<Record<string, unknown>>(
+        'SELECT pg_advisory_unlock($1)',
+        [migrationAdvisoryLockId],
+      );
+      if (!releasedMigrationAdvisoryLock(unlock.rows)) {
+        throw new Error('Migration advisory lock was not released.');
+      }
+    } catch (error) {
+      unlockFailed = true;
+      unlockFailure = error;
+    }
+  }
+
+  let releaseFailure: unknown;
+  let releaseFailed = false;
+  try {
+    if (!lockAcquired || unlockFailed || sessionState.mustBeEvicted) client.release(true);
+    else client.release();
+  } catch (error) {
+    releaseFailed = true;
+    releaseFailure = error;
+  }
+
+  const failures = [
+    ...primaryFailures,
+    ...(unlockFailed ? [unlockFailure] : []),
+    ...(releaseFailed ? [releaseFailure] : []),
+  ];
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, 'Database migration and cleanup failed.');
   }
   return applied;
+}
+
+function releasedMigrationAdvisoryLock(rows: unknown): boolean {
+  if (!Array.isArray(rows) || rows.length !== 1) return false;
+  const row: unknown = (rows as readonly unknown[])[0];
+  if (typeof row !== 'object' || row === null) return false;
+  const result = Object.getOwnPropertyDescriptor(row, 'pg_advisory_unlock');
+  return result !== undefined && 'value' in result && result.value === true;
 }
 
 export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool()): Promise<{

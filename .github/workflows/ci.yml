@@ -51,3 +51,16 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run frontend:e2e
+
+  deployment-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: npm
+      - run: npm ci
+      - run: npm run deployment:smoke
+      - run: npm run deployment:smoke:signal

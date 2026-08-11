@@ -14,6 +14,7 @@ export default tseslint.config(
       'playwright-report/**',
       'test-results/**',
       'tests/e2e/mock-api.mjs',
+      'tests/e2e/write-cross-origin-config.mjs',
     ],
   },
   eslint.configs.recommended,
@@ -43,7 +44,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['vite.config.ts', 'playwright.config.ts'],
+    files: ['vite.config.ts', 'vite-read-only-api-proxy.ts', 'vite-read-only-api-proxy.test.ts', 'playwright.config.ts'],
     languageOptions: {
       globals: globals.node,
       parserOptions: {

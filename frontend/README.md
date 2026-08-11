@@ -16,18 +16,26 @@ npm run build
 npm run frontend:dev
 ```
 
-Le backend écoute par défaut sur `http://127.0.0.1:3000` et Vite sur son port
-de développement. Le fichier public `public/config.json` est lu et validé avant
-la création de l’application :
+Le serveur Vite de développement conserve l'origine `127.0.0.1:4173` et
+proxy uniquement les requêtes de lecture `/api/v1` vers le backend loopback
+`127.0.0.1:3000`. Il ne change pas l'en-tête `Host` et ne proxifie pas de
+WebSocket. Démarrez donc le backend local sur ce port avant d'utiliser la
+console de développement.
+
+Le fichier public `public/config.json` est lu et validé avant la création de
+l’application :
 
 ```json
-{ "apiBaseUrl": "http://127.0.0.1:3000" }
+{ "apiBaseUrl": "/" }
 ```
 
-Seules les URL absolues HTTP(S), sans credentials, query ni fragment sont
-acceptées. Ce fichier est une configuration publique : aucun secret ne doit y
-être placé. Une configuration invalide arrête le bootstrap avant toute requête
-métier ou connexion SSE.
+La valeur exacte `/` utilise l’origine HTTP(S) courante, ce qui permet au même
+build d’être servi derrière un proxy qui expose le frontend et l’API sur la
+même origine. Pour un frontend sur une origine différente du backend, utilisez
+une URL HTTP(S) absolue, sans credentials, query ni fragment. Les autres URL
+relatives ne sont pas acceptées. Ce fichier est une configuration publique :
+aucun secret ne doit y être placé. Une configuration invalide arrête le
+bootstrap avant toute requête métier ou connexion SSE.
 
 ## Routes produit
 
@@ -73,7 +81,9 @@ npm run frontend:e2e
 
 Le test Playwright démarre un mock API/SSE sur une autre origine et vérifie la
 reprise, l’expiration de curseur, la resynchronisation et l’absence de requêtes
-d’écriture issues du navigateur.
+d’écriture issues du navigateur. Après chaque build de test, il écrit
+uniquement `dist/config.json` avec l'URL absolue du mock : le
+`public/config.json` de production reste configuré sur `/`.
 
 ## Déploiement statique
 

@@ -66,7 +66,8 @@ sans clé privée, signature, soumission ni live; elle n'appelle ni
 
 ## Installation
 
-Prérequis : Node.js 22+ et PostgreSQL.
+Prérequis : Node.js 22.13+ et PostgreSQL. Le déploiement conteneurisé de
+référence épingle Node.js 22.22.0 par digest.
 
 ```bash
 npm install
@@ -321,7 +322,29 @@ désactivation explicite.
 - [Architecture Pump.fun V1](docs/architecture/pumpfun-v1.md)
 - [Contrat API V1](docs/api/v1.md)
 - [Qualification RPC](docs/operations/rpc-qualification.md)
+- [Guide de déploiement](docs/operations/deployment.md)
 - [Manifeste IDL officiel](vendor/pumpfun/idl/manifest.json)
+
+## Déploiement de référence
+
+Le compose de référence démarre une seule application listener, un worker de
+rétention et un frontend same-origin ; PostgreSQL et l’API backend restent
+privés. Il est strictement observe/paper : il ne charge aucun wallet, ne signe
+et n’envoie aucune transaction. Le worker conserve les données terminales 4
+heures et les purge à cadence bornée. TLS externe et sauvegarde externe restent
+sous la responsabilité de l’opérateur.
+
+Avant une livraison, exécuter le smoke isolé puis suivre le
+[guide de déploiement](docs/operations/deployment.md) pour les secrets, la
+migration, le rollback et l’arrêt :
+
+```bash
+npm run deployment:smoke
+```
+
+Le déploiement est limité à un réplica unique. Il n’offre aucune promesse de
+première position, de sellabilité ou de profit ; le smoke ne contacte aucun RPC
+mainnet et ne constitue pas une validation de performance.
 
 Les montants bruts, réserves et lamports utilisent `bigint`; PostgreSQL les
 stocke en `NUMERIC(78,0)` et l'API les expose comme chaînes décimales.
