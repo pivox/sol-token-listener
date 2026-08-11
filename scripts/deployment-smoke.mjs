@@ -27,6 +27,7 @@ const projectName = invocationMode === 'self-sigterm' || invocationMode === 'sel
   ? faultProjectName(process.env.DEPLOYMENT_SMOKE_FAULT_PROJECT_NAME)
   : `sol-listener-smoke-${process.pid}-${randomBytes(4).toString('hex')}`;
 const projectLabel = `label=com.docker.compose.project=${projectName}`;
+const deploymentImages = deploymentImagesFor(projectName);
 const postgresPassword = randomBytes(24).toString('hex');
 const deadlineAt = Date.now() + GLOBAL_TIMEOUT_MS;
 const signalExitCodes = Object.freeze({ SIGINT: 130, SIGTERM: 143 });
@@ -108,6 +109,13 @@ function projectResourceChecksFor(label) {
   ]);
 }
 
+function deploymentImagesFor(name) {
+  return Object.freeze({
+    backend: `sol-token-listener-smoke-backend:${name}`,
+    frontend: `sol-token-listener-smoke-frontend:${name}`,
+  });
+}
+
 const environment = Object.freeze({
   ...process.env,
   COMPOSE_PROJECT_NAME: projectName,
@@ -115,6 +123,8 @@ const environment = Object.freeze({
   POSTGRES_USER: 'smoke',
   POSTGRES_PASSWORD: postgresPassword,
   POSTGRES_PASSWORD_URI_ENCODED: encodeURIComponent(postgresPassword),
+  BACKEND_IMAGE: deploymentImages.backend,
+  FRONTEND_IMAGE: deploymentImages.frontend,
   SOLANA_HTTP_RPC_URL: 'https://rpc.invalid',
   SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
   LISTENER_ENABLED: 'false',
@@ -149,7 +159,7 @@ async function runDeployment(selfSignal) {
   const cleanupFailures = [];
   try {
     try {
-      await compose(['build']);
+      await compose(['build', 'app', 'frontend']);
       await compose(['up', '--detach', '--wait', '--wait-timeout', '120']);
       baseUrl = await discoverFrontendBaseUrl();
       if (selfSignal !== null) {
@@ -190,6 +200,7 @@ async function runDeployment(selfSignal) {
       } catch (error) {
         cleanupFailures.push(error);
       }
+      await cleanupExplicitImages(deploymentImages, environment, cleanupFailures);
       for (const check of projectResourceChecks) {
         try {
           const { stdout, stderr } = await runDocker(check.args, {
@@ -347,6 +358,7 @@ async function cleanupFaultProject(faultName, cleanupFailures) {
   } catch (error) {
     cleanupFailures.push(error);
   }
+  await cleanupExplicitImages(deploymentImagesFor(faultName), faultEnvironment, cleanupFailures);
   const faultLabel = `label=com.docker.compose.project=${faultName}`;
   for (const check of projectResourceChecksFor(faultLabel)) {
     try {
@@ -364,6 +376,35 @@ async function cleanupFaultProject(faultName, cleanupFailures) {
   }
 }
 
+async function cleanupExplicitImages(images, commandEnvironment, cleanupFailures) {
+  for (const imageReference of Object.values(images)) {
+    try {
+      let probe = await findExplicitImage(imageReference, commandEnvironment);
+      if (probe.stderr !== '') throw new Error('Deployment smoke image lookup emitted unexpected stderr.');
+      if (probe.stdout.trim() !== '') {
+        await runDocker(['image', 'rm', imageReference], {
+          cleanup: true,
+          reflectFailureOutput: false,
+          commandEnvironment,
+        });
+      }
+      probe = await findExplicitImage(imageReference, commandEnvironment);
+      if (probe.stderr !== '' || probe.stdout.trim() !== '') {
+        throw new Error('Deployment smoke left an explicit image reference behind.');
+      }
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+  }
+}
+
+async function findExplicitImage(imageReference, commandEnvironment) {
+  return runDocker(
+    ['image', 'ls', '--filter', `reference=${imageReference}`, '--format', '{{.ID}}'],
+    { cleanup: true, reflectFailureOutput: false, commandEnvironment },
+  );
+}
+
 function faultCleanupEnvironment(faultName) {
   return Object.freeze({
     ...process.env,
@@ -372,6 +413,8 @@ function faultCleanupEnvironment(faultName) {
     POSTGRES_USER: 'smoke',
     POSTGRES_PASSWORD: 'cleanup-only',
     POSTGRES_PASSWORD_URI_ENCODED: 'cleanup-only',
+    BACKEND_IMAGE: deploymentImagesFor(faultName).backend,
+    FRONTEND_IMAGE: deploymentImagesFor(faultName).frontend,
     SOLANA_HTTP_RPC_URL: 'https://rpc.invalid',
     SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
     LISTENER_ENABLED: 'false',

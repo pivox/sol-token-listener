@@ -25,10 +25,7 @@ services:
     restart: unless-stopped
 
   migrate:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-      target: backend
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
     command: ["node", "dist/scripts/migrate.js"]
     environment: *runtime-environment
     depends_on:
@@ -38,6 +35,7 @@ services:
     restart: "no"
 
   app:
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -62,10 +60,7 @@ services:
     restart: unless-stopped
 
   retention:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-      target: backend
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
     command: ["node", "dist/scripts/purge-retained-data.js"]
     environment:
       <<: *runtime-environment
@@ -79,6 +74,7 @@ services:
     restart: unless-stopped
 
   frontend:
+    image: ${FRONTEND_IMAGE:?FRONTEND_IMAGE is required}
     build:
       context: ..
       dockerfile: Dockerfile

@@ -31,6 +31,20 @@ void test('accepts the public V1 health envelope when PostgreSQL is available an
   await checkDeploymentHealth('http://127.0.0.1:80/api/v1/health', { fetch: async () => healthResponse('OK') });
 });
 
+void test('requires an OK runtime status only when strict production health is requested', async () => {
+  await assert.rejects(checkDeploymentHealth(HEALTH_URL, {
+    fetch: async () => healthResponse('DEGRADED'),
+    requireOk: true,
+  }), errorCode('HEALTHCHECK_UNHEALTHY'));
+  await checkDeploymentHealth(HEALTH_URL, {
+    fetch: async () => healthResponse('OK'),
+    requireOk: true,
+  });
+  await checkDeploymentHealth(HEALTH_URL, {
+    fetch: async () => healthResponse('DEGRADED'),
+  });
+});
+
 void test('rejects PostgreSQL unavailability, HTTP failures, redirects, and invalid public health envelopes with stable codes', async () => {
   const cases: readonly [Response, string][] = [
     [healthResponse('DEGRADED', 'UNAVAILABLE'), 'HEALTHCHECK_UNHEALTHY'],
@@ -280,6 +294,36 @@ void test('returns the documented healthy exit code without writing stdout, stde
   });
   assert.equal(exitCode, DEPLOYMENT_HEALTHCHECK_EXIT_CODES.HEALTHY);
   assert.deepEqual({ stdout, stderr, logs }, { stdout: [], stderr: [], logs: [] });
+});
+
+void test('passes an explicit strict mode from the CLI and rejects every other argument safely', async () => {
+  const requested: boolean[] = [];
+  for (const [args, expected] of [[[], false], [['--require-ok'], true]] as const) {
+    const logs: string[] = [];
+    assert.equal(await runDeploymentHealthcheckCli({
+      arguments: args,
+      environment: { API_PORT: '3000' },
+      write: (line) => { logs.push(line); },
+      check: async (_url, options) => { requested.push(options.requireOk); },
+    }), DEPLOYMENT_HEALTHCHECK_EXIT_CODES.HEALTHY);
+    assert.deepEqual(logs, []);
+    assert.equal(requested.at(-1), expected);
+  }
+
+  for (const args of [['--unknown'], ['--require-ok', '--require-ok']] as const) {
+    const logs: string[] = [];
+    let calls = 0;
+    assert.equal(await runDeploymentHealthcheckCli({
+      arguments: args,
+      environment: { API_PORT: '3000' },
+      write: (line) => { logs.push(line); },
+      check: async () => { calls += 1; },
+    }), DEPLOYMENT_HEALTHCHECK_EXIT_CODES.CONFIGURATION_INVALID);
+    assert.equal(calls, 0);
+    assert.deepEqual(logs, [
+      '{"event":"deployment.healthcheck","code":"HEALTHCHECK_ARGUMENTS_INVALID"}\n',
+    ]);
+  }
 });
 
 function healthResponse(status: 'OK' | 'DEGRADED', postgresql = 'AVAILABLE'): Response {

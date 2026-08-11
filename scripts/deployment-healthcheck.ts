@@ -10,18 +10,23 @@ import {
  * Process exit contract for the deployment health probe:
  * - 0: the health envelope is accepted; the command stays silent.
  * - 1: a runtime probe failure; one stable, redacted JSON line is emitted.
- * - 2: an invalid API_PORT; one stable, redacted JSON line is emitted.
+ * - 2: invalid arguments or API_PORT; one stable, redacted JSON line is emitted.
  */
 export const DEPLOYMENT_HEALTHCHECK_EXIT_CODES = Object.freeze({
   HEALTHY: 0,
   PROBE_FAILED: 1,
   API_PORT_INVALID: 2,
+  CONFIGURATION_INVALID: 2,
 } as const);
 
 export interface DeploymentHealthcheckCliOptions {
+  readonly arguments?: readonly string[];
   readonly environment: NodeJS.ProcessEnv;
   readonly write: (line: string) => void;
-  readonly check: (url: string) => Promise<void>;
+  readonly check: (
+    url: string,
+    options: Readonly<{ requireOk: boolean }>,
+  ) => Promise<void>;
 }
 
 export function deploymentHealthcheckUrl(environment: NodeJS.ProcessEnv): string {
@@ -38,6 +43,13 @@ export function deploymentHealthcheckUrl(environment: NodeJS.ProcessEnv): string
 }
 
 export async function runDeploymentHealthcheckCli(options: DeploymentHealthcheckCliOptions): Promise<number> {
+  let requireOk: boolean;
+  try {
+    requireOk = requireOkFromArguments(options.arguments ?? []);
+  } catch (error: unknown) {
+    writeResult(options.write, codeOf(error, 'HEALTHCHECK_ARGUMENTS_INVALID'));
+    return DEPLOYMENT_HEALTHCHECK_EXIT_CODES.CONFIGURATION_INVALID;
+  }
   let url: string;
   try {
     url = deploymentHealthcheckUrl(options.environment);
@@ -46,12 +58,22 @@ export async function runDeploymentHealthcheckCli(options: DeploymentHealthcheck
     return DEPLOYMENT_HEALTHCHECK_EXIT_CODES.API_PORT_INVALID;
   }
   try {
-    await options.check(url);
+    await options.check(url, Object.freeze({ requireOk }));
     return DEPLOYMENT_HEALTHCHECK_EXIT_CODES.HEALTHY;
   } catch (error: unknown) {
     writeResult(options.write, codeOf(error, 'HEALTHCHECK_REQUEST_FAILED'));
     return DEPLOYMENT_HEALTHCHECK_EXIT_CODES.PROBE_FAILED;
   }
+}
+
+function requireOkFromArguments(args: readonly string[]): boolean {
+  try {
+    if (args.length === 0) return false;
+    if (args.length === 1 && args[0] === '--require-ok') return true;
+  } catch {
+    // Hostile argv-like values map to the same stable public error.
+  }
+  throw new DeploymentHealthcheckError('HEALTHCHECK_ARGUMENTS_INVALID');
 }
 
 function parsePort(value: unknown): number {
@@ -75,9 +97,13 @@ function writeResult(write: (line: string) => void, code: DeploymentHealthcheckC
 
 async function main(): Promise<void> {
   process.exitCode = await runDeploymentHealthcheckCli({
+    arguments: process.argv.slice(2),
     environment: process.env,
     write: (line) => { process.stderr.write(line); },
-    check: async (url) => checkDeploymentHealth(url, { fetch: globalThis.fetch }),
+    check: async (url, options) => checkDeploymentHealth(url, {
+      fetch: globalThis.fetch,
+      requireOk: options.requireOk,
+    }),
   });
 }
 

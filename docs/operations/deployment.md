@@ -17,10 +17,13 @@ conteneurisé plutôt qu’un tag mutable.
 
 ## Images immuables
 
-`Dockerfile` et `deploy/compose.yaml` épinglent les images de base par digest.
-Avant un rollout, construisez ou tirez les images immuables validées et notez
-le digest réellement déployé. Le backend Node et le frontend Nginx s’exécutent
-sans root ; PostgreSQL, l’API backend et les secrets ne sont pas publics.
+`Dockerfile` épingle les images de base par digest. Le fichier opérateur doit
+aussi définir `BACKEND_IMAGE` et `FRONTEND_IMAGE` comme références publiées par
+digest (`registre/dépôt@sha256:…`) ; les valeurs `registry.invalid` du template
+ne fonctionnent volontairement pas. Avant un rollout, tirez ces artefacts
+immuables validés et notez les digests réellement déployés. Le backend Node et
+le frontend Nginx s’exécutent sans root ; PostgreSQL, l’API backend et les
+secrets ne sont pas publics.
 
 ## Secrets externes
 
@@ -58,11 +61,17 @@ Avant toute migration, effectuez et vérifiez une sauvegarde de la base. Puis
 construisez ou tirez les images immuables validées. Depuis la racine du dépôt :
 
 ```bash
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 postgres
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull postgres migrate app retention frontend
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 --no-build postgres
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener run --rm --no-deps migrate
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-deps app retention
-until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js; do sleep 2; done
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-deps frontend
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps app retention
+health_attempt=0
+until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js --require-ok; do
+  health_attempt=$((health_attempt + 1))
+  [ "$health_attempt" -lt 30 ] || exit 1
+  sleep 2
+done
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps frontend
 ```
 
 La commande PostgreSQL attend explicitement un état sain, avec une borne de 60
@@ -70,12 +79,35 @@ secondes ; une migration `--no-deps` ne part donc pas sur une base seulement
 démarrée. Lancez ensuite la migration one-shot, puis exactement une application
 et un worker de rétention. La boucle attend le healthcheck compilé
 avant de publier le frontend derrière le proxy TLS externe. Vérifiez health, SSE
-et les logs de rétention :
+et les logs de rétention. La sonde SSE attend 20 secondes, donc au-delà du
+heartbeat par défaut de 15 secondes. Un `curl` encore connecté doit terminer
+uniquement sur son timeout attendu (code 28), puis les deux preuves sont
+vérifiées avant de supprimer les fichiers temporaires :
 
 ```bash
 curl --fail --silent --show-error http://127.0.0.1:8080/api/v1/health
-curl --no-buffer --max-time 10 -H 'Accept: text/event-stream' http://127.0.0.1:8080/api/v1/events
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener logs --since=15m retention
+
+(
+  set -eu
+  sse_headers="$(mktemp)"
+  sse_body="$(mktemp)"
+  trap 'rm -f "$sse_headers" "$sse_body"' EXIT
+  set +e
+  curl --fail-with-body --silent --show-error --no-buffer --max-time 20 \
+    --dump-header "$sse_headers" \
+    --output "$sse_body" \
+    --header 'Accept: text/event-stream' \
+    http://127.0.0.1:8080/api/v1/events
+  sse_status=$?
+  set -e
+  if [ "$sse_status" -ne 28 ]; then
+    echo 'La sonde SSE ne s’est pas terminée sur le timeout attendu.' >&2
+    exit 1
+  fi
+  grep -Eiq '^content-type:[[:space:]]*text/event-stream([;[:space:]]|$)' "$sse_headers"
+  grep -Fq ': heartbeat' "$sse_body"
+)
 ```
 
 ## Arrêt normal
@@ -136,12 +168,23 @@ de production.
 
 ## Rollback
 
-Quand l’ancienne application est compatible avec le schéma, replacez les images
-par leurs digests précédents et redémarrez les services. Le rollback se fait
-sans inverser les migrations : le schéma est forward-only. Si la compatibilité
-est impossible, préservez le volume et restaurez uniquement depuis une
-sauvegarde dont la restauration a été répétée. Ne modifiez pas
-`migration_history` pour contourner ce cas.
+Quand l’ancienne application est compatible avec le schéma, remplacez dans
+`$DEPLOY_ENV` les valeurs `BACKEND_IMAGE` et `FRONTEND_IMAGE` par leurs digests
+précédents, puis appliquez exactement le même gate strict :
+
+```bash
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --quiet
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull app retention frontend
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps app retention
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js --require-ok
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps frontend
+```
+
+Le rollback se fait sans inverser les migrations : le schéma est forward-only.
+Ne relancez pas une ancienne image avant d’avoir vérifié sa compatibilité avec
+le schéma déjà appliqué. Si la compatibilité est impossible, préservez le volume
+et restaurez uniquement depuis une sauvegarde dont la restauration a été
+répétée. Ne modifiez pas `migration_history` pour contourner ce cas.
 
 ## Proxy SSE et TLS externe
 

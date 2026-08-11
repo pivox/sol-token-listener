@@ -189,6 +189,14 @@ void test('Compose defines an observe-only, five-service deployment without expo
     .filter((name): name is string => name !== undefined);
   assert.deepEqual(serviceNames, ['postgres', 'migrate', 'app', 'retention', 'frontend']);
   assert.match(compose, new RegExp(`^    image: ${postgresImage.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+  assert.match(composeService(compose, 'app'), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m);
+  assert.match(composeService(compose, 'migrate'), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m);
+  assert.match(composeService(compose, 'retention'), /^ {4}image: \$\{BACKEND_IMAGE:\?BACKEND_IMAGE is required\}$/m);
+  assert.match(composeService(compose, 'frontend'), /^ {4}image: \$\{FRONTEND_IMAGE:\?FRONTEND_IMAGE is required\}$/m);
+  assert.match(composeService(compose, 'app'), /^ {4}build:\s*$/m);
+  assert.match(composeService(compose, 'frontend'), /^ {4}build:\s*$/m);
+  assert.doesNotMatch(composeService(compose, 'migrate'), /^ {4}build:\s*$/m);
+  assert.doesNotMatch(composeService(compose, 'retention'), /^ {4}build:\s*$/m);
   assert.match(compose, /^ {4}ports:\s*\["127\.0\.0\.1:\$\{FRONTEND_PORT:-8080\}:8080"\]\s*$/m);
   assert.equal((compose.match(/^ {4}ports:/gm) ?? []).length, 1);
   assert.match(compose, /^ {2}EXECUTION_MODE: observe$/m);
@@ -213,7 +221,9 @@ void test('Compose defines an observe-only, five-service deployment without expo
   assert.match(compose, /^volumes:\s*\n {2}postgres-data:$/m);
   assert.doesNotMatch(compose, /privileged:|network_mode: host|docker\.sock|PRIVATE_KEY|SECRET_KEY|WALLET/i);
   assert.doesNotMatch(compose, /EXECUTION_MODE:\s*\$\{|POSTGRES_AUTO_MIGRATE:\s*\$\{/);
-  assert.doesNotMatch(compose, /^ {4}image: [^\n@]+:[^\n@]+$/m);
+  for (const imageLine of compose.match(/^ {4}image: .+$/gm) ?? []) {
+    assert.match(imageLine, /(?:@sha256:[0-9a-f]{64}|\$\{(?:BACKEND|FRONTEND)_IMAGE:\?)/u);
+  }
 });
 
 void test('Compose keeps the raw PostgreSQL password separate from its URI-encoded form', async () => {
@@ -246,6 +256,8 @@ void test('Compose environment template contains documentation-only required inp
     'POSTGRES_USER=sol_token_listener',
     'POSTGRES_PASSWORD=replace-with-a-secret',
     'POSTGRES_PASSWORD_URI_ENCODED=replace-with-a-secret',
+    `BACKEND_IMAGE=registry.invalid/sol-token-listener/backend@sha256:${'0'.repeat(64)}`,
+    `FRONTEND_IMAGE=registry.invalid/sol-token-listener/frontend@sha256:${'1'.repeat(64)}`,
     'SOLANA_HTTP_RPC_URL=https://rpc-provider.invalid',
     'SOLANA_WS_RPC_URL=wss://rpc-provider.invalid',
     'FRONTEND_PORT=8080',
@@ -259,6 +271,9 @@ void test('Compose environment template contains documentation-only required inp
   assert.match(environment, /POSTGRES_PASSWORD_URI_ENCODED must be the percent-encoding of POSTGRES_PASSWORD/i);
   assert.match(environment, /unreserved example values can be identical/i);
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/i);
+  for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE']) {
+    assert.match(environment, new RegExp(`^${name}=registry\\.invalid/[^\\s@]+@sha256:[0-9a-f]{64}$`, 'm'));
+  }
 });
 
 void test('deployment smoke is bounded, isolated, secret-free, and always cleans its project', async () => {
@@ -277,10 +292,14 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /SOLANA_HTTP_RPC_URL:\s*'https:\/\/rpc\.invalid'/);
   assert.match(smoke, /SOLANA_WS_RPC_URL:\s*'wss:\/\/rpc\.invalid'/);
   assert.match(smoke, /LISTENER_ENABLED:\s*'false'/);
+  assert.match(smoke, /BACKEND_IMAGE:\s*deploymentImages\.backend/);
+  assert.match(smoke, /FRONTEND_IMAGE:\s*deploymentImages\.frontend/);
+  assert.match(smoke, /await compose\(\['build', 'app', 'frontend'\]\)/);
   assert.match(smoke, /\[\s*'compose', '-f', composeFile, 'exec', '-T', 'postgres', 'psql'/);
   assert.match(smoke, /\['compose', '-f', composeFile, 'down', '--volumes', '--remove-orphans', '--rmi', 'local'/);
   assert.match(smoke, /com\.docker\.compose\.project=/);
   assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key|\bwallet\b/iu);
+  assert.doesNotMatch(smoke, /sol-token-listener-(?:backend|frontend):(?:smoke|latest)/u);
 
   assert.equal(packageJson.scripts?.['deployment:smoke'], 'node scripts/deployment-smoke.mjs');
   assert.match(ci, /^ {2}deployment-contract:\s*$/m);
@@ -319,6 +338,9 @@ void test('deployment smoke proves all project resources are absent after cleanu
   assert.match(smoke, /\['network', 'ls', '--filter', label, '--format', '\{\{\.ID\}\}'\]/);
   assert.match(smoke, /\['volume', 'ls', '--filter', label, '--format', '\{\{\.Name\}\}'\]/);
   assert.match(smoke, /\['image', 'ls', '--filter', label, '--format', '\{\{\.ID\}\}'\]/);
+  assert.match(smoke, /\['image', 'rm', imageReference\]/);
+  assert.match(smoke, /reference=\$\{imageReference\}/);
+  assert.match(smoke, /Deployment smoke left an explicit image reference behind\./);
   assert.match(smoke, /cleanupFailures\.push\(error\)/);
   assert.match(
     smoke,
@@ -432,19 +454,39 @@ void test('deployment runbook documents the safe production lifecycle and safety
   assert.match(runbook, /pg_advisory_lock/);
   assert.match(
     runbook,
-    /docker compose --env-file "\$DEPLOY_ENV" -f deploy\/compose\.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 postgres/,
+    /docker compose --env-file "\$DEPLOY_ENV" -f deploy\/compose\.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 --no-build postgres/,
   );
   assert.match(runbook, /exec -T app node dist\/scripts\/deployment-healthcheck\.js/);
+  assert.match(runbook, /pull postgres migrate app retention frontend/);
+  assert.match(runbook, /up --detach --wait --wait-timeout 60 --no-build postgres/);
+  assert.match(runbook, /deployment-healthcheck\.js --require-ok/);
+  assert.match(runbook, /up -d --no-build --no-deps frontend/);
   assert.match(runbook, /4 heures/);
   assert.match(runbook, /15 minutes/);
   assert.match(runbook, /DEGRADED[\s\S]{0,120}smoke[\s\S]{0,120}listener[\s\S]{0,120}désactivé/i);
   assert.match(runbook, /production[^\n]*OK/i);
   assert.match(runbook, /down --volumes[\s\S]{0,120}destructif[\s\S]{0,120}jamais[\s\S]{0,120}arrêt normal/i);
   assert.match(runbook, /sans inverser[^\n]*migration/i);
+  assert.match(runbook, /BACKEND_IMAGE[\s\S]{0,240}FRONTEND_IMAGE[\s\S]{0,320}pull[\s\S]{0,320}up[^\n]*--no-build/i);
   assert.match(runbook, /restauration[^\n]*répétée/i);
   assert.match(runbook, /EXÉCUTION_MODE=observe|EXECUTION_MODE=observe/);
   assert.match(runbook, /observe|paper/i);
   assert.match(runbook, /aucun[^\n]*(?:wallet|clé privée|ordre réel|transaction live)/i);
+});
+
+void test('deployment runbook verifies a real SSE heartbeat with a bounded, cleanup-safe curl probe', async () => {
+  const runbook = await readArtifact('docs/operations/deployment.md');
+
+  assert.match(runbook, /sse_headers="\$\(mktemp\)"/);
+  assert.match(runbook, /sse_body="\$\(mktemp\)"/);
+  assert.match(runbook, /trap 'rm -f "\$sse_headers" "\$sse_body"' EXIT/);
+  assert.match(runbook, /curl --fail-with-body --silent --show-error --no-buffer --max-time 20/);
+  assert.match(runbook, /--dump-header "\$sse_headers"/);
+  assert.match(runbook, /--output "\$sse_body"/);
+  assert.match(runbook, /if \[ "\$sse_status" -ne 28 \]/);
+  assert.match(runbook, /content-type:\[\[:space:\]\]\*text\/event-stream/);
+  assert.match(runbook, /grep -Fq ': heartbeat' "\$sse_body"/);
+  assert.doesNotMatch(runbook, /curl --no-buffer --max-time 10/);
 });
 
 void test('operator documentation links the deployment runbook and smoke command', async () => {

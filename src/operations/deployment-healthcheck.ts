@@ -8,6 +8,7 @@ export const DEPLOYMENT_HEALTHCHECK_MAX_BYTES = 65_536;
 export type DeploymentHealthcheckCode =
   | 'HEALTHCHECK_URL_INVALID'
   | 'HEALTHCHECK_PORT_INVALID'
+  | 'HEALTHCHECK_ARGUMENTS_INVALID'
   | 'HEALTHCHECK_REQUEST_FAILED'
   | 'HEALTHCHECK_TIMEOUT'
   | 'HEALTHCHECK_HTTP_STATUS_INVALID'
@@ -30,6 +31,7 @@ export interface DeploymentHealthcheckTimers {
 export interface DeploymentHealthcheckDependencies {
   readonly fetch: typeof fetch;
   readonly timers?: DeploymentHealthcheckTimers;
+  readonly requireOk?: boolean;
 }
 
 const productionTimers: DeploymentHealthcheckTimers = Object.freeze({
@@ -64,7 +66,10 @@ export async function checkDeploymentHealth(
     }
     const body = await readBoundedResponseBody(response, deadline);
     const envelope = parseEnvelope(body);
-    if (envelope.status !== 'OK' && envelope.status !== 'DEGRADED') throw failure('HEALTHCHECK_UNHEALTHY');
+    if (
+      envelope.status !== 'OK'
+      && (dependencies.requireOk === true || envelope.status !== 'DEGRADED')
+    ) throw failure('HEALTHCHECK_UNHEALTHY');
     if (envelope.postgresql !== 'AVAILABLE') throw failure('HEALTHCHECK_UNHEALTHY');
   } catch (error: unknown) {
     const deadlineExpired = controller.signal.aborted;
