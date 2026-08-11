@@ -1027,7 +1027,8 @@ void test('rejects a never-stored stale projection before writing its event or r
   const freshness = database.queries.find((call) => (
     call.text.includes('qualification_write_freshness')
   ));
-  assert.match(freshness?.text ?? '', /transaction_timestamp\(\)/u);
+  assert.match(freshness?.text ?? '', /clock_timestamp\(\)/u);
+  assert.doesNotMatch(freshness?.text ?? '', /transaction_timestamp\(\)/u);
   assert.ok(freshness?.values?.[0] instanceof Date);
   const freshnessIndex = statements.findIndex((sql) => (
     sql.includes('qualification_write_freshness')
@@ -1041,6 +1042,112 @@ void test('rejects a never-stored stale projection before writing its event or r
     statements.slice(0, freshnessIndex).some((sql) => /^\s*(?:INSERT|UPDATE)\b/u.test(sql)),
     false,
   );
+});
+
+void test('rolls back with the stable stale error when expiry crosses at event insertion', async () => {
+  const projection = projectionFixture({ observedAtMs: Date.now() });
+  let freshnessChecks = 0;
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
+    if (text.includes('qualification_write_freshness')) {
+      freshnessChecks += 1;
+      return rows([{ qualification_write_is_fresh: freshnessChecks === 1 }]);
+    }
+    if (text.includes('INSERT INTO domain_events')) return { rows: [], rowCount: 0 };
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(
+    database,
+    qualificationService(),
+  );
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.replaceProjection(projection)),
+    (error: unknown) => {
+      assert.ok(error instanceof QualificationProjectionDataError);
+      assert.equal(error.message, 'Qualification projection report is already stale.');
+      return true;
+    },
+  );
+
+  assert.equal(freshnessChecks, 2);
+  const eventInsert = database.queries.find((call) => (
+    call.text.includes('INSERT INTO domain_events')
+  ))?.text ?? '';
+  assert.match(eventInsert, /SELECT[\s\S]*WHERE \$18::timestamptz > clock_timestamp\(\)/u);
+  assert.equal(database.queries.some((call) => (
+    call.text.includes('INSERT INTO qualification_reports')
+  )), false);
+});
+
+void test('rolls back with the stable stale error when expiry crosses at report insertion', async () => {
+  const projection = projectionFixture({ observedAtMs: Date.now() });
+  let freshnessChecks = 0;
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
+    if (text.includes('qualification_write_freshness')) {
+      freshnessChecks += 1;
+      return rows([{ qualification_write_is_fresh: freshnessChecks === 1 }]);
+    }
+    if (text.includes('qualification_existing_event')) {
+      return rows([qualificationEventRow(projection)]);
+    }
+    if (text.includes('INSERT INTO qualification_reports')) return { rows: [], rowCount: 0 };
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(
+    database,
+    qualificationService(),
+  );
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.replaceProjection(projection)),
+    (error: unknown) => {
+      assert.ok(error instanceof QualificationProjectionDataError);
+      assert.equal(error.message, 'Qualification projection report is already stale.');
+      return true;
+    },
+  );
+
+  assert.equal(freshnessChecks, 2);
+  const reportInsert = database.queries.find((call) => (
+    call.text.includes('INSERT INTO qualification_reports')
+  ))?.text ?? '';
+  assert.match(reportInsert, /SELECT[\s\S]*WHERE \$21::timestamptz > clock_timestamp\(\)/u);
+});
+
+void test('rolls back when expiry crosses during a successful report insertion', async () => {
+  const projection = projectionFixture({ observedAtMs: Date.now() });
+  let freshnessChecks = 0;
+  const database = new ScriptedPool((text) => {
+    if (text.includes('qualification_source_mapping')) return rows([sourceMappingRow(projection)]);
+    if (text.includes('qualification_write_freshness')) {
+      freshnessChecks += 1;
+      return rows([{ qualification_write_is_fresh: freshnessChecks === 1 }]);
+    }
+    if (text.includes('qualification_existing_event')) {
+      return rows([qualificationEventRow(projection)]);
+    }
+    return undefined;
+  });
+  const repository = new PostgresQualificationProjectionRepository(
+    database,
+    qualificationService(),
+  );
+
+  await assert.rejects(
+    repository.transact('mint', (transaction) => transaction.replaceProjection(projection)),
+    (error: unknown) => {
+      assert.ok(error instanceof QualificationProjectionDataError);
+      assert.equal(error.message, 'Qualification projection report is already stale.');
+      return true;
+    },
+  );
+
+  assert.equal(freshnessChecks, 2);
+  assert.equal(database.queries.some((call) => (
+    call.text.includes('INSERT INTO qualification_reports')
+  )), true);
 });
 
 void test('rejects a conflicting retained qualification event before report insert', async () => {
@@ -1425,6 +1532,105 @@ void test('live PostgreSQL rejects a never-stored stale projection before any de
         WHERE event_type='QualificationUpdated')::text AS outbox`);
     assert.deepEqual(counts.rows[0], { reports: '0', events: '0', outbox: '0' });
   } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
+void test('live PostgreSQL rolls back when report insertion crosses its expiry', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live qualification boundary test skipped');
+    return;
+  }
+  const schema = `qualification_expiry_boundary_${randomUUID().replaceAll('-', '')}`;
+  const applicationName = `qualification_boundary_${randomUUID().replaceAll('-', '')}`;
+  const advisoryKey = Number.parseInt(randomUUID().slice(0, 8), 16) & 0x7fffffff;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    application_name: applicationName,
+    max: 4,
+    options: `-c search_path=${schema}`,
+  });
+  let blocker: pg.PoolClient | undefined;
+  let blockerLocked = false;
+  let operation: Promise<unknown> | undefined;
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    await pool.query(`CREATE FUNCTION qualification_block_report_insert()
+      RETURNS trigger LANGUAGE plpgsql AS $function$
+      BEGIN
+        PERFORM pg_advisory_lock(${advisoryKey});
+        PERFORM pg_advisory_unlock(${advisoryKey});
+        RETURN NEW;
+      END
+      $function$`);
+    await pool.query(`CREATE TRIGGER qualification_block_report_insert
+      BEFORE INSERT ON qualification_reports
+      FOR EACH ROW EXECUTE FUNCTION qualification_block_report_insert()`);
+    blocker = await pool.connect();
+    await blocker.query('SELECT pg_advisory_lock($1)', [advisoryKey]);
+    blockerLocked = true;
+
+    const databaseClock = await pool.query<{ readonly now: Date }>(
+      'SELECT clock_timestamp() AS now',
+    );
+    const deadlineMs = (databaseClock.rows[0]?.now.getTime() ?? 0) + 2_500;
+    const observedAtMs = deadlineMs - 14_400_000;
+    await insertLiveLaunch(pool, observedAtMs);
+    const projection = projectionFixture({ observedAtMs });
+    const repository = new PostgresQualificationProjectionRepository(
+      pool,
+      qualificationService(),
+    );
+
+    operation = repository.transact(
+      'mint',
+      (transaction) => transaction.replaceProjection(projection),
+    );
+    await waitForCondition(async () => {
+      const waiting = await admin.query<{ readonly waiting: boolean }>(`SELECT EXISTS (
+        SELECT 1 FROM pg_stat_activity
+        WHERE application_name=$1 AND wait_event='advisory'
+          AND query ILIKE '%INSERT INTO qualification_reports%'
+      ) AS waiting`, [applicationName]);
+      return waiting.rows[0]?.waiting === true;
+    }, 'qualification report insert did not reach the advisory trigger');
+    await waitForCondition(async () => {
+      const crossed = await pool.query<{ readonly crossed: boolean }>(
+        'SELECT clock_timestamp() >= $1::timestamptz AS crossed',
+        [new Date(deadlineMs)],
+      );
+      return crossed.rows[0]?.crossed === true;
+    }, 'database clock did not cross the qualification expiry');
+
+    await blocker.query('SELECT pg_advisory_unlock($1)', [advisoryKey]);
+    blockerLocked = false;
+    await assert.rejects(operation, (error: unknown) => {
+      assert.ok(error instanceof QualificationProjectionDataError);
+      assert.equal(error.message, 'Qualification projection report is already stale.');
+      return true;
+    });
+
+    const counts = await pool.query<{
+      readonly reports: string;
+      readonly events: string;
+      readonly outbox: string;
+    }>(`SELECT
+      (SELECT COUNT(*) FROM qualification_reports)::text AS reports,
+      (SELECT COUNT(*) FROM domain_events WHERE type='QualificationUpdated')::text AS events,
+      (SELECT COUNT(*) FROM api_event_stream
+        WHERE event_type='QualificationUpdated')::text AS outbox`);
+    assert.deepEqual(counts.rows[0], { reports: '0', events: '0', outbox: '0' });
+  } finally {
+    if (blockerLocked && blocker !== undefined) {
+      await blocker.query('SELECT pg_advisory_unlock($1)', [advisoryKey]);
+    }
+    await operation?.catch(() => undefined);
+    blocker?.release();
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
     await admin.end();
@@ -2252,4 +2458,15 @@ async function liveCounts(
 function quoteIdentifier(identifier: string): string {
   if (!/^[a-z_][a-z0-9_]*$/u.test(identifier)) throw new Error('Unsafe SQL identifier.');
   return `"${identifier}"`;
+}
+
+async function waitForCondition(
+  condition: () => Promise<boolean>,
+  failureMessage: string,
+): Promise<void> {
+  const timeoutAt = Date.now() + 15_000;
+  while (!(await condition())) {
+    if (Date.now() >= timeoutAt) throw new Error(failureMessage);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }

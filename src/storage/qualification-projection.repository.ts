@@ -785,16 +785,7 @@ implements QualificationProjectionTransaction {
     }
     const evaluatedAt = retentionDate(projection.report.evaluatedAtMs, 0);
     const purgeAfter = retentionDate(projection.report.evaluatedAtMs, 14_400_000);
-    const freshnessResult = await this.client.query(
-      `SELECT /* qualification_write_freshness */
-          $1::timestamptz > transaction_timestamp() AS qualification_write_is_fresh`,
-      [purgeAfter],
-    );
-    if (!booleanValue(freshnessResult.rows[0]?.qualification_write_is_fresh)) {
-      throw new QualificationProjectionDataError(
-        'Qualification projection report is already stale.',
-      );
-    }
+    if (!(await this.isFreshAtDatabase(purgeAfter))) throw staleProjection();
     await this.supersedeCurrentReport(projection);
     const existingEvent = await this.client.query(
       `SELECT /* qualification_existing_event */ event_id,raw_event_id,type,mint,source,
@@ -811,7 +802,8 @@ implements QualificationProjectionTransaction {
           transaction_index,instruction_index,inner_instruction_index,
           confirmation_status,blockchain_time,observed_at,payload_version,payload,
           terminal_at,purge_after
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+        ) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
+        WHERE $18::timestamptz > clock_timestamp()
         ON CONFLICT (event_id) DO NOTHING`,
         [
           event.id, projection.sourceRawEventId, event.type, event.mint, event.source,
@@ -823,6 +815,7 @@ implements QualificationProjectionTransaction {
         ],
       );
       if (insertedEvent.rowCount !== 1) {
+        if (!(await this.isFreshAtDatabase(purgeAfter))) throw staleProjection();
         const racedEvent = await this.client.query(
           `SELECT /* qualification_existing_event */ event_id,raw_event_id,type,mint,source,
               program,signature,slot::text AS slot,transaction_index,instruction_index,
@@ -845,8 +838,9 @@ implements QualificationProjectionTransaction {
         preparation_score,social_score,onchain_score,total_score,as_of_slot,
         as_of_transaction_index,as_of_instruction_index,as_of_inner_instruction_index,
         confirmation_status,evaluated_at,superseded_at,purge_after,payload_version,payload
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-        $19,$20,NULL,$21,1,$22)`,
+      ) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+        $19,$20,NULL,$21,1,$22
+      WHERE $21::timestamptz > clock_timestamp()`,
       [
         projection.reportId, event.mint, projection.sourceEventId,
         projection.sourceRawEventId, event.id, profile.id, profile.version,
@@ -860,7 +854,11 @@ implements QualificationProjectionTransaction {
         evaluatedAt, purgeAfter, toJsonValue(projection.report),
       ],
     );
-    if (insertedReport.rowCount !== 1) throw invalid();
+    if (insertedReport.rowCount !== 1) {
+      if (!(await this.isFreshAtDatabase(purgeAfter))) throw staleProjection();
+      throw invalid();
+    }
+    if (!(await this.isFreshAtDatabase(purgeAfter))) throw staleProjection();
     return 'UPDATED';
   }
 
@@ -916,6 +914,15 @@ implements QualificationProjectionTransaction {
         retentionDate(projection.evaluation.evaluatedAtMs, 0),
       ],
     );
+  }
+
+  private async isFreshAtDatabase(purgeAfter: Date): Promise<boolean> {
+    const freshnessResult = await this.client.query(
+      `SELECT /* qualification_write_freshness */
+          $1::timestamptz > clock_timestamp() AS qualification_write_is_fresh`,
+      [purgeAfter],
+    );
+    return booleanValue(freshnessResult.rows[0]?.qualification_write_is_fresh);
   }
 
   private assertLockedMint(mint: string): void {
@@ -1900,4 +1907,10 @@ function memberRole(value: unknown): WalletCluster['members'][number]['role'] {
 
 function invalid(): QualificationProjectionDataError {
   return new QualificationProjectionDataError();
+}
+
+function staleProjection(): QualificationProjectionDataError {
+  return new QualificationProjectionDataError(
+    'Qualification projection report is already stale.',
+  );
 }
