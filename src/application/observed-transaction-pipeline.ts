@@ -36,6 +36,7 @@ export type ObservedPipelineStage =
   | 'participant_analytics'
   | 'wallet_graph'
   | 'pumpswap_observation'
+  | 'qualification'
   | 'paper_decision_enqueue';
 
 export interface ObservedPipelineResult {
@@ -48,6 +49,7 @@ export interface ObservedPipelineResult {
   readonly walletGraphCount: number;
   readonly marketMigrationCount: number;
   readonly marketActivationCount: number;
+  readonly qualificationRebuildCount: number;
   readonly paperDecisionEnqueueCount: number;
 }
 
@@ -119,6 +121,7 @@ export class ObservedTransactionPipeline {
     private readonly market: MarketObserver,
     private readonly clock: () => number = Date.now,
     private readonly paperDecisions: PaperDecisionScheduler | null = null,
+    private readonly qualification: MintProjectionRebuilder | null = null,
   ) {}
 
   public async process(
@@ -160,11 +163,20 @@ export class ObservedTransactionPipeline {
 
     const market = await this.stage('pumpswap_observation', null, async () =>
       snapshotMarketResult(await this.market.processObserved(observed)));
-    const paperMints = affectedMintList(affectedMints, market.affectedMints);
+    const qualificationMints = affectedMintList(affectedMints, market.affectedMints);
+    let qualificationRebuildCount = 0;
+    const qualification = this.qualification;
+    if (qualification !== null) {
+      for (const mint of qualificationMints) {
+        await this.stage('qualification', mint, () =>
+          qualification.rebuild(mint, missingLaunchPolicy));
+        qualificationRebuildCount += 1;
+      }
+    }
     let paperDecisionEnqueueCount = 0;
     const paperDecisions = this.paperDecisions;
     if (paperDecisions !== null) {
-      for (const mint of paperMints) {
+      for (const mint of qualificationMints) {
         await this.stage('paper_decision_enqueue', mint, () =>
           paperDecisions.enqueueLatest(
             mint,
@@ -184,6 +196,7 @@ export class ObservedTransactionPipeline {
       walletGraphCount,
       marketMigrationCount: market.migrationCount,
       marketActivationCount: market.activationCount,
+      qualificationRebuildCount,
       paperDecisionEnqueueCount,
     });
   }

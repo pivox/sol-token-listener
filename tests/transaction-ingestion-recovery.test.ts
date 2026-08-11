@@ -40,7 +40,9 @@ import { PostgresWalletGraphRepository } from '../src/storage/wallet-graph.repos
 import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
-const BOUNDARIES = Object.freeze(['launchpad', 'funding', 'i1', 'i2', 'pumpswap'] as const);
+const BOUNDARIES = Object.freeze([
+  'launchpad', 'funding', 'i1', 'i2', 'pumpswap', 'qualification',
+] as const);
 type Boundary = (typeof BOUNDARIES)[number];
 const FULL_REPLAY: readonly Boundary[] = BOUNDARIES;
 
@@ -301,6 +303,8 @@ function pipeline(
     { rebuild: (mint, policy) => after('i2', realGraph.rebuild(mint, policy)) },
     { processObserved: (observed) => after('pumpswap', realMarket.processObserved(observed)) },
     () => 1_800_000_000_000,
+    null,
+    { rebuild: () => after('qualification', Promise.resolve(Object.freeze({}))) },
   );
 }
 
