@@ -387,7 +387,7 @@ Create an isolated PostgreSQL database using the locally available PostgreSQL to
 npm test
 ```
 
-Expected: 983 backend tests and 116 frontend tests pass with zero PostgreSQL skips. Drop only the explicitly created temporary database after the run.
+Expected: 984 backend tests and 116 frontend tests pass with zero PostgreSQL skips. Drop only the explicitly created temporary database after the run.
 
 - [ ] **Step 4: Run the cross-origin browser test**
 
