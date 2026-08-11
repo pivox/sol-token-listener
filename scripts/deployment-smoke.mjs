@@ -9,9 +9,11 @@ const REQUEST_TIMEOUT_MS = 10_000;
 const CLEANUP_TIMEOUT_MS = 30_000;
 const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
+const MAX_RETENTION_OUTPUT_BYTES = 16 * 1024;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const composeFile = resolve(root, 'deploy/compose.yaml');
 const projectName = `sol-listener-smoke-${process.pid}-${randomBytes(4).toString('hex')}`;
+const projectLabel = `label=com.docker.compose.project=${projectName}`;
 const postgresPassword = randomBytes(24).toString('hex');
 const deadlineAt = Date.now() + GLOBAL_TIMEOUT_MS;
 const canonicalMigrations = Object.freeze([
@@ -28,6 +30,58 @@ const canonicalMigrations = Object.freeze([
   '011_transaction_inbox_retry_recovery.sql',
   '012_public_social_evidence.sql',
   '013_paper_e2e.sql',
+]);
+const canonicalRetentionCounters = Object.freeze([
+  'apiEventStream',
+  'bondingCurveSnapshots',
+  'creatorProfiles',
+  'domainEvents',
+  'holderSnapshots',
+  'launchTrades',
+  'marketPools',
+  'marketReserveSnapshots',
+  'marketTrades',
+  'metadataSnapshots',
+  'migrations',
+  'observedWalletPositions',
+  'paperDecisionJobs',
+  'paperExternalBuys',
+  'paperPositions',
+  'paperSessions',
+  'paperTrades',
+  'qualificationReports',
+  'rawChainEvents',
+  'socialCollections',
+  'socialEvidence',
+  'socialJobs',
+  'socialLinks',
+  'socialObservations',
+  'stateTransitions',
+  'tokenLaunches',
+  'tradingCandidates',
+  'transactionInbox',
+  'transactionInboxRecoveries',
+  'walletClusterMembers',
+  'walletClusters',
+  'walletFundingEvidence',
+  'walletFundingObservations',
+  'walletGraphProfiles',
+  'walletGraphSnapshots',
+  'walletRelationships',
+]);
+const projectResourceChecks = Object.freeze([
+  Object.freeze({
+    kind: 'container',
+    args: Object.freeze(['ps', '-a', '--filter', projectLabel, '--format', '{{.ID}}']),
+  }),
+  Object.freeze({
+    kind: 'network',
+    args: Object.freeze(['network', 'ls', '--filter', projectLabel, '--format', '{{.ID}}']),
+  }),
+  Object.freeze({
+    kind: 'volume',
+    args: Object.freeze(['volume', 'ls', '--filter', projectLabel, '--format', '{{.Name}}']),
+  }),
 ]);
 
 const frontendPort = await reserveLoopbackPort();
@@ -74,26 +128,32 @@ try {
 } catch (error) {
   primaryFailure = error;
 } finally {
-  let cleanupFailure;
+  const cleanupFailures = [];
   try {
     await runDocker(
       ['compose', '-f', composeFile, 'down', '--volumes', '--remove-orphans'],
       { cleanup: true },
     );
   } catch (error) {
-    cleanupFailure = error;
+    cleanupFailures.push(error);
   }
-  try {
-    await assertNoProjectContainers();
-  } catch (error) {
-    cleanupFailure = cleanupFailure === undefined
-      ? error
-      : new AggregateError([cleanupFailure, error], 'Deployment smoke cleanup failed.');
+  for (const check of projectResourceChecks) {
+    try {
+      const { stdout, stderr } = await runDocker(check.args, { cleanup: true });
+      if (stderr !== '' || stdout.trim() !== '') {
+        throw new Error(`Deployment smoke left project ${check.kind} resources behind.`);
+      }
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
   }
-  if (primaryFailure !== undefined && cleanupFailure !== undefined) {
-    throw new AggregateError([primaryFailure, cleanupFailure], 'Deployment smoke and cleanup failed.');
+  if (primaryFailure !== undefined && cleanupFailures.length > 0) {
+    throw new AggregateError([primaryFailure, ...cleanupFailures], 'Deployment smoke and cleanup failed.');
   }
-  if (cleanupFailure !== undefined) throw cleanupFailure;
+  if (cleanupFailures.length === 1) throw cleanupFailures[0];
+  if (cleanupFailures.length > 1) {
+    throw new AggregateError(cleanupFailures, 'Deployment smoke cleanup failed.');
+  }
 }
 if (primaryFailure !== undefined) throw primaryFailure;
 
@@ -105,7 +165,7 @@ async function runDocker(args, options = {}) {
   return runCommand('docker', args, options);
 }
 
-async function runCommand(command, args, { cleanup = false } = {}) {
+async function runCommand(command, args, { cleanup = false, reflectFailureOutput = true } = {}) {
   const timeoutMs = cleanup
     ? CLEANUP_TIMEOUT_MS
     : Math.max(1, deadlineAt - Date.now());
@@ -143,7 +203,9 @@ async function runCommand(command, args, { cleanup = false } = {}) {
         });
         return;
       }
-      const detail = redact(Buffer.concat([...stderr, ...stdout]).toString('utf8')).slice(-8_192).trim();
+      const detail = reflectFailureOutput
+        ? redact(Buffer.concat([...stderr, ...stdout]).toString('utf8')).slice(-8_192).trim()
+        : '';
       finish(new Error(
         `${commandLabel(args)} failed (${code === null ? signal ?? 'unknown' : `exit ${code}`})${detail === '' ? '.' : `: ${detail}`}`,
       ));
@@ -334,30 +396,49 @@ async function waitForPublicHealth() {
 }
 
 async function assertRetentionOneShot() {
-  const { stdout } = await compose([
-    'run', '--rm', 'retention', 'node', 'dist/scripts/purge-retained-data.js', '--once',
-  ]);
-  const events = stdout.split('\n').filter(Boolean).flatMap((line) => {
-    try {
-      const value = JSON.parse(line);
-      return value?.event === 'retention.purged' ? [value] : [];
-    } catch {
-      return [];
-    }
-  });
-  assertEqual(events.length, 1, 'Retention did not emit one stable success event.');
-  const counters = events[0]?.counters;
+  const { stdout, stderr } = await compose([
+    'exec', '-T', 'retention', 'node', 'dist/scripts/purge-retained-data.js', '--once',
+  ], { reflectFailureOutput: false });
+  if (stderr !== '') throw new Error('Retention emitted unexpected stderr.');
+  if (
+    Buffer.byteLength(stdout, 'utf8') > MAX_RETENTION_OUTPUT_BYTES
+    || !stdout.endsWith('\n')
+    || stdout.includes('\r')
+    || stdout.slice(0, -1).includes('\n')
+  ) throw new Error('Retention output contract is invalid.');
+  const serialized = stdout.slice(0, -1);
+  let event;
+  try {
+    event = JSON.parse(serialized);
+  } catch {
+    throw new Error('Retention output contract is invalid.');
+  }
+  if (
+    typeof event !== 'object'
+    || event === null
+    || Array.isArray(event)
+    || JSON.stringify(event) !== serialized
+  ) throw new Error('Retention output contract is invalid.');
+  const eventKeys = Object.keys(event);
+  if (
+    JSON.stringify(eventKeys) !== JSON.stringify(['level', 'time', 'service', 'event', 'counters'])
+    || event.level !== 30
+    || !Number.isSafeInteger(event.time)
+    || event.time <= 0
+    || event.service !== 'sol-token-listener'
+    || event.event !== 'retention.purged'
+  ) throw new Error('Retention event contract is invalid.');
+  const counters = event.counters;
   if (typeof counters !== 'object' || counters === null || Array.isArray(counters)) {
     throw new Error('Retention counters are invalid.');
   }
   const keys = Object.keys(counters);
-  assertEqual(JSON.stringify(keys), JSON.stringify([...keys].sort()), 'Retention counters are not stable.');
-  if (keys.length < 30 || Object.values(counters).some((value) => value !== 0)) {
+  if (
+    JSON.stringify(keys) !== JSON.stringify(canonicalRetentionCounters)
+    || keys.length > 64
+    || Object.values(counters).some((value) => !Number.isSafeInteger(value) || value !== 0)
+  ) {
     throw new Error('Retention counters are not the expected empty-database aggregate.');
-  }
-  const safeEventKeys = new Set(['level', 'time', 'service', 'event', 'counters']);
-  if (Object.keys(events[0]).some((key) => !safeEventKeys.has(key))) {
-    throw new Error('Retention event exposed row data.');
   }
 }
 
@@ -416,13 +497,6 @@ async function readBoundedBody(response, label) {
     try { reader.releaseLock(); } catch { /* a pending cancellation owns the reader */ }
   }
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8');
-}
-
-async function assertNoProjectContainers() {
-  const { stdout } = await runDocker([
-    'ps', '-a', '--filter', `label=com.docker.compose.project=${projectName}`, '--format', '{{.ID}}',
-  ], { cleanup: true });
-  if (stdout.trim() !== '') throw new Error('Deployment smoke left project containers behind.');
 }
 
 async function reserveLoopbackPort() {

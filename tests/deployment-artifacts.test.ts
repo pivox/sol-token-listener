@@ -288,3 +288,38 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(ci, /deployment-contract:[\s\S]*?- run: npm run deployment:smoke/);
   assert.doesNotMatch(ci, /deployment-contract:[\s\S]*?secrets\./);
 });
+
+void test('deployment smoke accepts only one bounded retention aggregate with silent stderr', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+  const retention = smoke.slice(
+    smoke.indexOf('async function assertRetentionOneShot'),
+    smoke.indexOf('async function fetchBounded'),
+  );
+
+  assert.match(
+    retention,
+    /const \{ stdout, stderr \} = await compose\(\[\s*'exec', '-T', 'retention'/,
+  );
+  assert.match(retention, /if \(stderr !== ''\) throw new Error\('Retention emitted unexpected stderr\.'\)/);
+  assert.match(retention, /reflectFailureOutput: false/);
+  assert.match(retention, /MAX_RETENTION_OUTPUT_BYTES/);
+  assert.match(retention, /JSON\.parse\(serialized\)/);
+  assert.match(retention, /canonicalRetentionCounters/);
+  assert.doesNotMatch(retention, /\.split\('\n'\).*\.filter/s);
+  assert.doesNotMatch(retention, /new Error\(`[^`]*\$\{(?:stdout|stderr)\}/);
+  assert.doesNotMatch(retention, /new Error\([^)]*\+\s*(?:stdout|stderr)/s);
+});
+
+void test('deployment smoke proves containers, networks, and volumes are absent after cleanup', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+
+  assert.match(smoke, /\['ps', '-a', '--filter', projectLabel, '--format', '\{\{\.ID\}\}'\]/);
+  assert.match(smoke, /\['network', 'ls', '--filter', projectLabel, '--format', '\{\{\.ID\}\}'\]/);
+  assert.match(smoke, /\['volume', 'ls', '--filter', projectLabel, '--format', '\{\{\.Name\}\}'\]/);
+  assert.match(smoke, /cleanupFailures\.push\(error\)/);
+  assert.match(
+    smoke,
+    /new AggregateError\(\[primaryFailure, \.\.\.cleanupFailures\], 'Deployment smoke and cleanup failed\.'\)/,
+  );
+  assert.match(smoke, /new AggregateError\(cleanupFailures, 'Deployment smoke cleanup failed\.'\)/);
+});
