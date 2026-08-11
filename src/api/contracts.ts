@@ -85,6 +85,9 @@ export interface ApiLaunchSummary {
   readonly quoteDecimals: number | null;
   readonly marketCapQuote: string | null;
   readonly liquidityQuote: string | null;
+  readonly qualificationSummary: ApiQualificationSummary | null;
+  readonly candidate: ApiTradingCandidate | null;
+  readonly paperStrategy: ApiPaperStrategyProgress | null;
 }
 
 export interface ApiLaunchDetail extends ApiLaunchSummary {
@@ -98,8 +101,13 @@ export interface ApiLaunchDetail extends ApiLaunchSummary {
   readonly feeBps: string | null;
   readonly social: ApiSocial;
   readonly holders: ApiHolders;
-  readonly candidate: ApiTradingCandidate | null;
-  readonly paperStrategy: ApiPaperStrategyProgress | null;
+}
+
+export interface ApiQualificationSummary {
+  readonly verdict: QualificationVerdict;
+  readonly scores: ApiQualificationScores;
+  readonly blockerCodes: readonly QualificationReasonCode[];
+  readonly evaluatedAt: string;
 }
 
 export interface ApiTradingCandidate {

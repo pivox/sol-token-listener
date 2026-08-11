@@ -10,6 +10,7 @@ import {
   type ApiHealth,
   type ApiJsonObject,
   type ApiLaunchSummary,
+  type ApiQualificationSummary,
   type ApiQualification,
   type ApiQualificationCondition,
   type ApiSocial,
@@ -123,6 +124,17 @@ void test('exports the V1 API version and stable public error codes', () => {
 });
 
 void test('exposes V1 envelopes at the root and ISO dates in public projections', () => {
+  const qualificationSummary: ApiQualificationSummary = {
+    verdict: 'WATCHLISTED',
+    scores: {
+      preparation: { score: 12, maximum: 15 },
+      socialAuthenticity: { score: 17, maximum: 25 },
+      onchainHealth: { score: 43, maximum: 60 },
+      total: { score: 72, maximum: 100 },
+    },
+    blockerCodes: ['SHARED_FUNDER_CLUSTER'],
+    evaluatedAt: '2026-07-29T12:00:00.000Z',
+  };
   const launch: ApiLaunchSummary = {
     mint: 'Mint111',
     detectedAt: '2026-07-29T12:00:00.000Z',
@@ -134,6 +146,9 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
     quoteDecimals: null,
     marketCapQuote: null,
     liquidityQuote: null,
+    qualificationSummary,
+    candidate: null,
+    paperStrategy: null,
   };
   const success: ApiSuccess<ApiLaunchSummary> = {
     apiVersion: API_VERSION,
@@ -323,6 +338,7 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(failure.apiVersion, 'v1');
   assert.equal(failure.error.correlationId, 'req_123');
   assert.equal(availability, 'NOT_AVAILABLE');
+  assert.deepEqual(success.data.qualificationSummary, qualificationSummary);
   assert.equal(social.links.length, 0);
   assert.equal(availableSocial.status, 'AVAILABLE');
   assert.equal(holders.snapshots.length, 0);

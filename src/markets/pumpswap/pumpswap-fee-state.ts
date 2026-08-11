@@ -8,7 +8,7 @@ import {
   PUMP_AMM_FEE_CONFIG_PDA,
   PUMP_AMM_SDK,
   PUMP_FEE_PROGRAM_ID,
-} from '@pump-fun/pump-swap-sdk';
+} from './official-sdk.js';
 import { PublicKey, type AccountInfo } from '@solana/web3.js';
 import type { CanonicalMarketPool } from '../../domain/market.js';
 import type {

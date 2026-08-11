@@ -77,6 +77,25 @@ npm run lint
 npm test
 ```
 
+## Console frontend indépendante
+
+Le workspace `frontend/` fournit maintenant la console opérateur React/Vite
+publique en lecture seule. Elle se déploie comme un artefact statique séparé,
+lit son `apiBaseUrl` dans `frontend/public/config.json`, puis consomme les huit
+projections JSON et le flux SSE reprenable. Ses routes produit sont le radar
+`/`, la fiche `/launches/:mint`, les simulations `/paper-positions` et la santé
+`/health`.
+
+```bash
+npm run frontend:dev
+npm run frontend:e2e
+```
+
+La console ne charge aucun wallet et ne propose aucune action de trading. Elle
+affiche les blockers avant les scores, les absences de preuve explicitement et
+un statut visible lors d’une resynchronisation SSE. Voir le
+[guide frontend](frontend/README.md).
+
 Renseigner `SOLANA_HTTP_RPC_URL`, `SOLANA_WS_RPC_URL` et `DATABASE_URL`, sans
 secret de wallet. Les migrations ne sont pas lancées automatiquement par
 défaut. `npm run build` les embarque dans `dist/migrations`, de sorte que

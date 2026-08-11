@@ -345,6 +345,30 @@ void test('events route validates cursor, negotiation, body, CORS, HEAD, and OPT
   }
 });
 
+void test('events preflight allows the Last-Event-ID header without allowing writes', async () => {
+  const stream: ApiEventStreamRepository = {
+    async highWaterMark() { return 0n; },
+    async resolve() { return { status: 'CURRENT' as const, sequence: 0n }; },
+    async readAfter() { return []; },
+  };
+  const { server, port } = await openServer(makeSseRouter(stream));
+  try {
+    const response = await requestResult(port, 'OPTIONS', {
+      origin: 'https://radar.example',
+      'access-control-request-method': 'GET',
+      'access-control-request-headers': 'Last-Event-ID',
+    });
+
+    assert.equal(response.status, 204);
+    assert.equal(response.headers['access-control-allow-origin'], '*');
+    assert.equal(response.headers['access-control-allow-methods'], 'GET, HEAD, OPTIONS');
+    assert.equal(response.headers['access-control-allow-headers'], 'Last-Event-ID');
+    assert.doesNotMatch(response.headers['access-control-allow-methods'] ?? '', /POST|PUT|PATCH|DELETE/u);
+  } finally {
+    await closeServer(server);
+  }
+});
+
 void test('events GET frames high-water events over node:http and cleans up an aborted client', async () => {
   let highWaterCalls = 0;
   let closeSession: (() => void) | undefined;

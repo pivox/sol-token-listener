@@ -5,6 +5,13 @@ import { fileURLToPath } from 'node:url';
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const documentPath = resolve(repositoryRoot, 'docs/system-overview.html');
 const html = await readFile(documentPath, 'utf8');
+const frontendReadmePath = resolve(repositoryRoot, 'frontend/README.md');
+let frontendReadme = '';
+try {
+  frontendReadme = await readFile(frontendReadmePath, 'utf8');
+} catch {
+  // Reported with the other documentation contract failures below.
+}
 const failures: string[] = [];
 
 function requireMatch(pattern: RegExp, message: string): void {
@@ -98,6 +105,25 @@ const requiredStatements = [
 ];
 for (const statement of requiredStatements) {
   if (!html.includes(statement)) failures.push(`affirmation requise absente: ${statement}`);
+}
+
+const requiredFrontendStatements = [
+  'npm run frontend:dev',
+  'public/config.json',
+  'Simulation uniquement',
+  'aucun wallet',
+  'aucune garantie de profit',
+  '/paper-positions',
+  '/health',
+  '/launches/:mint',
+  'Last-Event-ID',
+  'EVENT_CURSOR_EXPIRED',
+  'déploiement statique',
+  'Access-Control-Allow-Headers',
+];
+if (frontendReadme === '') failures.push('frontend/README.md absent ou illisible');
+for (const statement of requiredFrontendStatements) {
+  if (!frontendReadme.includes(statement)) failures.push(`frontend/README.md: affirmation requise absente: ${statement}`);
 }
 
 if (failures.length > 0) {

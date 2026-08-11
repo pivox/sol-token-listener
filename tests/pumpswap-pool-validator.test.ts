@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { PublicKey } from '@solana/web3.js';
-import { poolPda } from '@pump-fun/pump-swap-sdk';
+import { poolPda } from '../src/markets/pumpswap/official-sdk.js';
 import {
   AccountType,
   ExtensionType,

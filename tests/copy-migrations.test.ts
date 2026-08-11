@@ -47,13 +47,17 @@ void test('rejects a source without canonical migration SQL', async () => {
   }
 });
 
-void test('the build script packages migrations after TypeScript compilation', async () => {
+void test('the build scripts package backend artifacts before building the frontend workspace', async () => {
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as {
     readonly scripts?: Readonly<Record<string, unknown>>;
   };
 
   assert.equal(
-    packageJson.scripts?.build,
+    packageJson.scripts?.['build:backend'],
     'tsc -p tsconfig.json && tsx scripts/copy-migrations.ts && tsx scripts/copy-qualification-profiles.ts',
+  );
+  assert.equal(
+    packageJson.scripts?.build,
+    'npm run build:backend && npm run build --workspace frontend',
   );
 });

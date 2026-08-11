@@ -13,6 +13,7 @@ import { failure, success, writeJson } from './api-response.js';
 import { SSE_HEADERS, SseSession, type SseCancel, type SseSchedule, type SseTimer } from './sse-session.js';
 
 const ALLOW = 'GET, HEAD, OPTIONS';
+const CORS_ALLOWED_HEADERS = 'Last-Event-ID';
 const MIN_MINT_BASE58_LENGTH = 32;
 const MAX_MINT_BASE58_LENGTH = 44;
 const MAX_ACCEPT_HEADER_LENGTH = 4_096;
@@ -459,6 +460,7 @@ function writeOptions(response: ServerResponse): void {
     'cache-control': 'no-store',
     'access-control-allow-origin': '*',
     'access-control-allow-methods': ALLOW,
+    'access-control-allow-headers': CORS_ALLOWED_HEADERS,
   });
   response.end();
 }

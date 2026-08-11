@@ -1,5 +1,5 @@
 import { PublicKey } from '@solana/web3.js';
-import { poolPda } from '@pump-fun/pump-swap-sdk';
+import { poolPda } from './official-sdk.js';
 import {
   ExtensionType,
   getExtensionTypes,
