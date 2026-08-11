@@ -1029,9 +1029,18 @@ void test('rejects a never-stored stale projection before writing its event or r
   ));
   assert.match(freshness?.text ?? '', /transaction_timestamp\(\)/u);
   assert.ok(freshness?.values?.[0] instanceof Date);
+  const freshnessIndex = statements.findIndex((sql) => (
+    sql.includes('qualification_write_freshness')
+  ));
+  assert.ok(freshnessIndex > 0);
+  assert.equal(statements.some((sql) => sql.includes('UPDATE qualification_reports')), false);
   assert.equal(statements.some((sql) => sql.includes('qualification_existing_event')), false);
   assert.equal(statements.some((sql) => sql.includes('INSERT INTO domain_events')), false);
   assert.equal(statements.some((sql) => sql.includes('INSERT INTO qualification_reports')), false);
+  assert.equal(
+    statements.slice(0, freshnessIndex).some((sql) => /^\s*(?:INSERT|UPDATE)\b/u.test(sql)),
+    false,
+  );
 });
 
 void test('rejects a conflicting retained qualification event before report insert', async () => {

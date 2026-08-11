@@ -752,18 +752,6 @@ implements QualificationProjectionTransaction {
       await this.assertStoredProjection(projection);
       return 'UNCHANGED';
     }
-    await this.client.query(
-      `UPDATE qualification_reports
-       SET superseded_at=GREATEST(evaluated_at,$4)
-       WHERE mint=$1 AND profile_id=$2 AND profile_version=$3
-         AND superseded_at IS NULL`,
-      [
-        event.mint,
-        profile.id,
-        profile.version,
-        retentionDate(projection.evaluation.evaluatedAtMs, 0),
-      ],
-    );
     const historicalResult = await this.client.query(
       `SELECT /* qualification_historical_report */ report_id
        FROM qualification_reports WHERE report_id=$1
@@ -773,6 +761,7 @@ implements QualificationProjectionTransaction {
     );
     if (historicalResult.rows[0] !== undefined) {
       await this.assertStoredProjection(projection);
+      await this.supersedeCurrentReport(projection);
       const reactivated = await this.client.query(
         `UPDATE qualification_reports SET superseded_at=NULL
          WHERE report_id=$1 AND mint=$2 AND superseded_at IS NOT NULL
@@ -806,6 +795,7 @@ implements QualificationProjectionTransaction {
         'Qualification projection report is already stale.',
       );
     }
+    await this.supersedeCurrentReport(projection);
     const existingEvent = await this.client.query(
       `SELECT /* qualification_existing_event */ event_id,raw_event_id,type,mint,source,
           program,signature,slot::text AS slot,transaction_index,instruction_index,
@@ -908,6 +898,24 @@ implements QualificationProjectionTransaction {
     const row = stored.rows[0];
     if (row === undefined) throw invalid();
     assertStoredProjectionRow(row, projection);
+  }
+
+  private async supersedeCurrentReport(
+    projection: CanonicalQualificationProjection,
+  ): Promise<void> {
+    const profile = projection.report.ruleSet;
+    await this.client.query(
+      `UPDATE qualification_reports
+       SET superseded_at=GREATEST(evaluated_at,$4)
+       WHERE mint=$1 AND profile_id=$2 AND profile_version=$3
+         AND superseded_at IS NULL`,
+      [
+        projection.qualificationEvent.mint,
+        profile.id,
+        profile.version,
+        retentionDate(projection.evaluation.evaluatedAtMs, 0),
+      ],
+    );
   }
 
   private assertLockedMint(mint: string): void {
