@@ -276,7 +276,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /SOLANA_WS_RPC_URL:\s*'wss:\/\/rpc\.invalid'/);
   assert.match(smoke, /LISTENER_ENABLED:\s*'false'/);
   assert.match(smoke, /\[\s*'compose', '-f', composeFile, 'exec', '-T', 'postgres', 'psql'/);
-  assert.match(smoke, /\['compose', '-f', composeFile, 'down', '--volumes', '--remove-orphans'/);
+  assert.match(smoke, /\['compose', '-f', composeFile, 'down', '--volumes', '--remove-orphans', '--rmi', 'local'/);
   assert.match(smoke, /com\.docker\.compose\.project=/);
   assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key|\bwallet\b/iu);
 
@@ -310,16 +310,54 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
   assert.doesNotMatch(retention, /new Error\([^)]*\+\s*(?:stdout|stderr)/s);
 });
 
-void test('deployment smoke proves containers, networks, and volumes are absent after cleanup', async () => {
+void test('deployment smoke proves all project resources are absent after cleanup', async () => {
   const smoke = await readArtifact('scripts/deployment-smoke.mjs');
 
   assert.match(smoke, /\['ps', '-a', '--filter', projectLabel, '--format', '\{\{\.ID\}\}'\]/);
   assert.match(smoke, /\['network', 'ls', '--filter', projectLabel, '--format', '\{\{\.ID\}\}'\]/);
   assert.match(smoke, /\['volume', 'ls', '--filter', projectLabel, '--format', '\{\{\.Name\}\}'\]/);
+  assert.match(smoke, /\['image', 'ls', '--filter', projectLabel, '--format', '\{\{\.ID\}\}'\]/);
   assert.match(smoke, /cleanupFailures\.push\(error\)/);
   assert.match(
     smoke,
     /new AggregateError\(\[primaryFailure, \.\.\.cleanupFailures\], 'Deployment smoke and cleanup failed\.'\)/,
   );
   assert.match(smoke, /new AggregateError\(cleanupFailures, 'Deployment smoke cleanup failed\.'\)/);
+});
+
+void test('deployment smoke handles signals through one bounded cleanup path before reporting status', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+  const packageJson = JSON.parse(await readArtifact('package.json')) as {
+    readonly scripts?: Readonly<Record<string, string>>;
+  };
+  const ci = await readArtifact('.github/workflows/ci.yml');
+
+  assert.match(smoke, /CLEANUP_TIMEOUT_MS\s*=\s*65_000/);
+  assert.match(smoke, /SIGNAL_CHILD_TIMEOUT_MS\s*=\s*5_000/);
+  assert.match(smoke, /SELF_SIGNAL_TIMEOUT_MS\s*=\s*1_000/);
+  assert.match(smoke, /process\.on\('SIGINT'/);
+  assert.match(smoke, /process\.on\('SIGTERM'/);
+  assert.match(smoke, /process\.off\('SIGINT'/);
+  assert.match(smoke, /process\.off\('SIGTERM'/);
+  assert.match(smoke, /child\.kill\('SIGTERM'\)/);
+  assert.match(smoke, /child\.kill\('SIGKILL'\)/);
+  assert.match(smoke, /SIGINT:\s*130/);
+  assert.match(smoke, /SIGTERM:\s*143/);
+  assert.match(smoke, /--self-sigterm/);
+  assert.match(smoke, /--signal-fault-probe/);
+  assert.match(smoke, /await runSignalFaultProbe\(\)/);
+  assert.match(smoke, /await runActiveChildSignalProbe\(\)/);
+  assert.match(smoke, /'exec', '-T', 'app', 'node', '-e', 'setInterval\(\(\) => undefined, 1_000\)'/);
+  assert.match(smoke, /if \(exitCode === 0\) process\.stdout\.write\('Deployment smoke passed\.\\n'\)/);
+  assert.equal(packageJson.scripts?.['deployment:smoke:signal'], 'node scripts/deployment-smoke.mjs --signal-fault-probe');
+  assert.match(ci, /deployment-contract:[\s\S]*?- run: npm run deployment:smoke:signal/);
+});
+
+void test('deployment smoke discovers Docker allocated loopback port after startup', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+
+  assert.match(smoke, /FRONTEND_PORT:\s*'0'/);
+  assert.match(smoke, /\['port', 'frontend', '8080'\]/);
+  assert.match(smoke, /\^127\\\.0\\\.0\\\.1:\(\[1-9\]\[0-9\]\{0,4\}\)\\n\$/);
+  assert.doesNotMatch(smoke, /reserveLoopbackPort|createServer/);
 });

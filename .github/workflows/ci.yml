@@ -63,3 +63,4 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run deployment:smoke
+      - run: npm run deployment:smoke:signal

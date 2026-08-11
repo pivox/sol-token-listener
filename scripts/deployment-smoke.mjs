@@ -1,21 +1,30 @@
 import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { createServer } from 'node:net';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const GLOBAL_TIMEOUT_MS = 180_000;
 const REQUEST_TIMEOUT_MS = 10_000;
-const CLEANUP_TIMEOUT_MS = 30_000;
+const CLEANUP_TIMEOUT_MS = 65_000;
+const SIGNAL_CHILD_TIMEOUT_MS = 5_000;
+const SELF_SIGNAL_TIMEOUT_MS = 1_000;
+const FAULT_PROBE_TIMEOUT_MS = 260_000;
 const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_RETENTION_OUTPUT_BYTES = 16 * 1024;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const composeFile = resolve(root, 'deploy/compose.yaml');
-const projectName = `sol-listener-smoke-${process.pid}-${randomBytes(4).toString('hex')}`;
+const scriptPath = fileURLToPath(import.meta.url);
+const invocationMode = parseInvocationMode(process.argv.slice(2));
+const projectName = invocationMode === 'self-sigterm'
+  ? faultProjectName(process.env.DEPLOYMENT_SMOKE_FAULT_PROJECT_NAME)
+  : `sol-listener-smoke-${process.pid}-${randomBytes(4).toString('hex')}`;
 const projectLabel = `label=com.docker.compose.project=${projectName}`;
 const postgresPassword = randomBytes(24).toString('hex');
 const deadlineAt = Date.now() + GLOBAL_TIMEOUT_MS;
+const signalExitCodes = Object.freeze({ SIGINT: 130, SIGTERM: 143 });
+let cleanupDeadlineAt = null;
+let activeSignalRuntime = null;
 const canonicalMigrations = Object.freeze([
   '001_initial.sql',
   '002_pumpfun_foundation.sql',
@@ -82,9 +91,12 @@ const projectResourceChecks = Object.freeze([
     kind: 'volume',
     args: Object.freeze(['volume', 'ls', '--filter', projectLabel, '--format', '{{.Name}}']),
   }),
+  Object.freeze({
+    kind: 'image',
+    args: Object.freeze(['image', 'ls', '--filter', projectLabel, '--format', '{{.ID}}']),
+  }),
 ]);
 
-const frontendPort = await reserveLoopbackPort();
 const environment = Object.freeze({
   ...process.env,
   COMPOSE_PROJECT_NAME: projectName,
@@ -95,58 +107,94 @@ const environment = Object.freeze({
   SOLANA_HTTP_RPC_URL: 'https://rpc.invalid',
   SOLANA_WS_RPC_URL: 'wss://rpc.invalid',
   LISTENER_ENABLED: 'false',
-  FRONTEND_PORT: String(frontendPort),
+  FRONTEND_PORT: '0',
 });
-const baseUrl = `http://127.0.0.1:${frontendPort}`;
+let baseUrl = null;
 
-let primaryFailure;
+let exitCode = 1;
 try {
-  await compose(['build']);
-  await compose(['up', '--detach', '--wait', '--wait-timeout', '120']);
-  await assertNonRoot('app');
-  await assertNonRoot('frontend');
-  await assertPublicHealth();
-  await assertCorsContract();
+  if (invocationMode === 'signal-fault-probe') {
+    await runSignalFaultProbe();
+    process.stdout.write('Deployment signal fault probe passed.\n');
+    exitCode = 0;
+  } else {
+    exitCode = await runDeployment(invocationMode === 'self-sigterm');
+    if (exitCode === 0) process.stdout.write('Deployment smoke passed.\n');
+  }
+} catch {
+  process.stderr.write('Deployment smoke failed.\n');
+  exitCode = 1;
+}
+process.exitCode = exitCode;
 
-  const initialMigrations = await readMigrationHistory();
-  assertMigrationHistory(initialMigrations);
-  await compose(['run', '--rm', 'migrate']);
-  const replayedMigrations = await readMigrationHistory();
-  assertMigrationHistory(replayedMigrations);
-  assertEqual(
-    JSON.stringify(replayedMigrations),
-    JSON.stringify(initialMigrations),
-    'Migration replay changed migration_history.',
-  );
-
-  await assertFrontendContract();
-  await assertGracefulSseShutdown();
-  await compose(['start', 'app']);
-  await waitForPublicHealth();
-  await assertRetentionOneShot();
-  process.stdout.write('Deployment smoke passed.\n');
-} catch (error) {
-  primaryFailure = error;
-} finally {
+async function runDeployment(selfSigterm) {
+  const signals = installSmokeSignalHandlers();
+  activeSignalRuntime = signals;
+  let primaryFailure;
   const cleanupFailures = [];
   try {
-    await runDocker(
-      ['compose', '-f', composeFile, 'down', '--volumes', '--remove-orphans'],
-      { cleanup: true },
-    );
-  } catch (error) {
-    cleanupFailures.push(error);
-  }
-  for (const check of projectResourceChecks) {
     try {
-      const { stdout, stderr } = await runDocker(check.args, { cleanup: true });
-      if (stderr !== '' || stdout.trim() !== '') {
-        throw new Error(`Deployment smoke left project ${check.kind} resources behind.`);
+      await compose(['build']);
+      await compose(['up', '--detach', '--wait', '--wait-timeout', '120']);
+      baseUrl = await discoverFrontendBaseUrl();
+      if (selfSigterm) {
+        await runActiveChildSignalProbe();
       }
+      await assertNonRoot('app');
+      await assertNonRoot('frontend');
+      await assertPublicHealth();
+      await assertCorsContract();
+
+      const initialMigrations = await readMigrationHistory();
+      assertMigrationHistory(initialMigrations);
+      await compose(['run', '--rm', 'migrate']);
+      const replayedMigrations = await readMigrationHistory();
+      assertMigrationHistory(replayedMigrations);
+      assertEqual(
+        JSON.stringify(replayedMigrations),
+        JSON.stringify(initialMigrations),
+        'Migration replay changed migration_history.',
+      );
+
+      await assertFrontendContract();
+      await assertGracefulSseShutdown();
+      await compose(['start', 'app']);
+      await waitForPublicHealth();
+      await assertRetentionOneShot();
     } catch (error) {
-      cleanupFailures.push(error);
+      primaryFailure = error;
+    }
+  } finally {
+    cleanupDeadlineAt = Date.now() + CLEANUP_TIMEOUT_MS;
+    try {
+      try {
+        await runDocker(
+          ['compose', '-f', composeFile, 'down', '--volumes', '--remove-orphans', '--rmi', 'local'],
+          { cleanup: true, reflectFailureOutput: false },
+        );
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+      for (const check of projectResourceChecks) {
+        try {
+          const { stdout, stderr } = await runDocker(check.args, {
+            cleanup: true,
+            reflectFailureOutput: false,
+          });
+          if (stderr !== '' || stdout.trim() !== '') {
+            throw new Error(`Deployment smoke left project ${check.kind} resources behind.`);
+          }
+        } catch (error) {
+          cleanupFailures.push(error);
+        }
+      }
+    } finally {
+      signals.restore();
+      activeSignalRuntime = null;
+      cleanupDeadlineAt = null;
     }
   }
+
   if (primaryFailure !== undefined && cleanupFailures.length > 0) {
     throw new AggregateError([primaryFailure, ...cleanupFailures], 'Deployment smoke and cleanup failed.');
   }
@@ -154,8 +202,167 @@ try {
   if (cleanupFailures.length > 1) {
     throw new AggregateError(cleanupFailures, 'Deployment smoke cleanup failed.');
   }
+  const receivedSignal = signals.received();
+  if (receivedSignal !== null) return signalExitCodes[receivedSignal];
+  if (primaryFailure !== undefined) throw primaryFailure;
+  return 0;
 }
-if (primaryFailure !== undefined) throw primaryFailure;
+
+async function runActiveChildSignalProbe() {
+  const timer = setTimeout(() => {
+    process.kill(process.pid, 'SIGTERM');
+  }, SELF_SIGNAL_TIMEOUT_MS);
+  try {
+    await compose([
+      'exec', '-T', 'app', 'node', '-e', 'setInterval(() => undefined, 1_000)',
+    ], { reflectFailureOutput: false });
+    throw new Error('Deployment signal fault child exited without interruption.');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseInvocationMode(args) {
+  if (args.length === 0) return 'nominal';
+  if (args.length === 1 && args[0] === '--signal-fault-probe') return 'signal-fault-probe';
+  if (args.length === 1 && args[0] === '--self-sigterm') return 'self-sigterm';
+  throw new Error('Deployment smoke arguments are invalid.');
+}
+
+function faultProjectName(value) {
+  if (typeof value !== 'string' || !/^sol-listener-smoke-[0-9]+-[0-9a-f]{8}$/u.test(value)) {
+    throw new Error('Deployment signal fault project is invalid.');
+  }
+  return value;
+}
+
+function installSmokeSignalHandlers() {
+  let receivedSignal = null;
+  let activeChild = null;
+  let childDeadline = null;
+
+  const onSigint = () => receive('SIGINT');
+  const onSigterm = () => receive('SIGTERM');
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
+
+  function receive(signal) {
+    if (receivedSignal !== null) return;
+    receivedSignal = signal;
+    interruptActiveChild();
+  }
+
+  function interruptActiveChild() {
+    const child = activeChild;
+    if (child === null) return;
+    child.kill('SIGTERM');
+    childDeadline = setTimeout(() => {
+      if (activeChild === child) child.kill('SIGKILL');
+    }, SIGNAL_CHILD_TIMEOUT_MS);
+  }
+
+  return Object.freeze({
+    received: () => receivedSignal,
+    track: (child, interruptible) => {
+      if (!interruptible) return;
+      activeChild = child;
+      if (receivedSignal !== null) interruptActiveChild();
+    },
+    untrack: (child) => {
+      if (activeChild !== child) return;
+      activeChild = null;
+      if (childDeadline !== null) clearTimeout(childDeadline);
+      childDeadline = null;
+    },
+    restore: () => {
+      process.off('SIGINT', onSigint);
+      process.off('SIGTERM', onSigterm);
+      if (childDeadline !== null) clearTimeout(childDeadline);
+      childDeadline = null;
+      activeChild = null;
+    },
+  });
+}
+
+async function runSignalFaultProbe() {
+  const faultName = `sol-listener-smoke-${process.pid}-${randomBytes(4).toString('hex')}`;
+  const result = await runFaultProbeChild(faultName);
+  if (result.code !== 143 || result.signal !== null || result.stdout !== '' || result.stderr !== '') {
+    throw new Error('Deployment signal fault probe did not exit cleanly after SIGTERM.');
+  }
+
+  cleanupDeadlineAt = Date.now() + CLEANUP_TIMEOUT_MS;
+  try {
+    const faultLabel = `label=com.docker.compose.project=${faultName}`;
+    for (const check of projectResourceChecks) {
+      const args = check.args.map((value) => value === projectLabel ? faultLabel : value);
+      const probe = await runDocker(args, { cleanup: true, reflectFailureOutput: false });
+      if (probe.stderr !== '' || probe.stdout.trim() !== '') {
+        throw new Error(`Deployment signal fault probe left ${check.kind} resources behind.`);
+      }
+    }
+  } finally {
+    cleanupDeadlineAt = null;
+  }
+}
+
+async function runFaultProbeChild(faultName) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(process.execPath, [scriptPath, '--self-sigterm'], {
+      cwd: root,
+      env: Object.freeze({
+        ...process.env,
+        DEPLOYMENT_SMOKE_FAULT_PROJECT_NAME: faultName,
+      }),
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const stdout = [];
+    const stderr = [];
+    let outputBytes = 0;
+    let settled = false;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, FAULT_PROBE_TIMEOUT_MS);
+
+    child.stdout.on('data', (chunk) => collect(chunk, stdout));
+    child.stderr.on('data', (chunk) => collect(chunk, stderr));
+    child.once('error', () => finish(new Error('Deployment signal fault probe could not start.')));
+    child.once('close', (code, signal) => {
+      if (timedOut) {
+        finish(new Error('Deployment signal fault probe exceeded its deadline.'));
+        return;
+      }
+      finish(undefined, Object.freeze({
+        code,
+        signal,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+      }));
+    });
+
+    function collect(chunk, target) {
+      if (!Buffer.isBuffer(chunk)) return;
+      outputBytes += chunk.byteLength;
+      if (outputBytes > MAX_RETENTION_OUTPUT_BYTES) {
+        timedOut = true;
+        child.kill('SIGKILL');
+        return;
+      }
+      target.push(chunk);
+    }
+
+    function finish(error, result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error === undefined) resolvePromise(result);
+      else rejectPromise(error);
+    }
+  });
+}
 
 async function compose(args, options = {}) {
   return runDocker(['compose', '-f', composeFile, ...args], options);
@@ -167,9 +374,12 @@ async function runDocker(args, options = {}) {
 
 async function runCommand(command, args, { cleanup = false, reflectFailureOutput = true } = {}) {
   const timeoutMs = cleanup
-    ? CLEANUP_TIMEOUT_MS
+    ? remainingCleanupMs()
     : Math.max(1, deadlineAt - Date.now());
   if (!cleanup && Date.now() >= deadlineAt) throw new Error('Deployment smoke global deadline exceeded.');
+  if (!cleanup && activeSignalRuntime?.received() !== null) {
+    throw new Error('Deployment smoke interrupted.');
+  }
 
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(command, args, {
@@ -178,6 +388,7 @@ async function runCommand(command, args, { cleanup = false, reflectFailureOutput
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    activeSignalRuntime?.track(child, !cleanup);
     const stdout = [];
     const stderr = [];
     let outputBytes = 0;
@@ -192,6 +403,10 @@ async function runCommand(command, args, { cleanup = false, reflectFailureOutput
     child.stderr.on('data', (chunk) => collect(chunk, stderr));
     child.once('error', (error) => finish(new Error(`${commandLabel(args)} could not start: ${safeName(error)}.`)));
     child.once('close', (code, signal) => {
+      if (!cleanup && activeSignalRuntime?.received() !== null) {
+        finish(new Error('Deployment smoke interrupted.'));
+        return;
+      }
       if (terminationFailure !== undefined) {
         finish(terminationFailure);
         return;
@@ -226,10 +441,18 @@ async function runCommand(command, args, { cleanup = false, reflectFailureOutput
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      activeSignalRuntime?.untrack(child);
       if (error === undefined) resolvePromise(result);
       else rejectPromise(error);
     }
   });
+}
+
+function remainingCleanupMs() {
+  if (cleanupDeadlineAt === null) throw new Error('Deployment cleanup deadline is unavailable.');
+  const remaining = cleanupDeadlineAt - Date.now();
+  if (remaining <= 0) throw new Error('Deployment cleanup deadline exceeded.');
+  return remaining;
 }
 
 function commandLabel(args) {
@@ -240,6 +463,25 @@ function commandLabel(args) {
 function redact(value) {
   return value.replaceAll(postgresPassword, '[REDACTED]')
     .replaceAll(encodeURIComponent(postgresPassword), '[REDACTED]');
+}
+
+async function discoverFrontendBaseUrl() {
+  const { stdout, stderr } = await compose(
+    ['port', 'frontend', '8080'],
+    { reflectFailureOutput: false },
+  );
+  if (stderr !== '') throw new Error('Frontend port discovery emitted unexpected stderr.');
+  const match = /^127\.0\.0\.1:([1-9][0-9]{0,4})\n$/u.exec(stdout);
+  const port = Number(match?.[1]);
+  if (match === null || !Number.isSafeInteger(port) || port > 65_535) {
+    throw new Error('Frontend loopback port discovery failed.');
+  }
+  return `http://127.0.0.1:${port}`;
+}
+
+function publicBaseUrl() {
+  if (baseUrl === null) throw new Error('Frontend loopback port is unavailable.');
+  return baseUrl;
 }
 
 async function assertNonRoot(service) {
@@ -331,7 +573,7 @@ async function assertFrontendContract() {
 
 async function assertGracefulSseShutdown() {
   const controller = new AbortController();
-  const response = await requestWithDeadline(`${baseUrl}/api/v1/events`, {
+  const response = await requestWithDeadline(`${publicBaseUrl()}/api/v1/events`, {
     headers: { accept: 'text/event-stream' },
     signal: controller.signal,
   });
@@ -443,7 +685,7 @@ async function assertRetentionOneShot() {
 }
 
 async function fetchBounded(path, options = {}) {
-  const response = await requestWithDeadline(`${baseUrl}${path}`, options);
+  const response = await requestWithDeadline(`${publicBaseUrl()}${path}`, options);
   const declaredLength = response.headers.get('content-length');
   if (declaredLength !== null && Number(declaredLength) > MAX_RESPONSE_BYTES) {
     void response.body?.cancel().catch(() => undefined);
@@ -497,24 +739,6 @@ async function readBoundedBody(response, label) {
     try { reader.releaseLock(); } catch { /* a pending cancellation owns the reader */ }
   }
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8');
-}
-
-async function reserveLoopbackPort() {
-  const server = createServer();
-  await new Promise((resolvePromise, rejectPromise) => {
-    server.once('error', rejectPromise);
-    server.listen(0, '127.0.0.1', resolvePromise);
-  });
-  const address = server.address();
-  if (address === null || typeof address === 'string' || address.address !== '127.0.0.1') {
-    server.close();
-    throw new Error('Could not reserve a loopback port.');
-  }
-  await new Promise((resolvePromise, rejectPromise) => server.close((error) => {
-    if (error === undefined) resolvePromise();
-    else rejectPromise(error);
-  }));
-  return address.port;
 }
 
 function remainingGlobalMs() {

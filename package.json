@@ -27,6 +27,7 @@
     "retention:start:compiled": "node dist/scripts/purge-retained-data.js",
     "deployment:healthcheck:compiled": "node dist/scripts/deployment-healthcheck.js",
     "deployment:smoke": "node scripts/deployment-smoke.mjs",
+    "deployment:smoke:signal": "node scripts/deployment-smoke.mjs --signal-fault-probe",
     "rpc:check": "tsx scripts/check-rpc.ts",
     "rpc:soak": "tsx scripts/rpc-soak.ts",
     "paper:dry-run": "tsx src/cli/paper-dry-run.ts",
