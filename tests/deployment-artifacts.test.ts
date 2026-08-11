@@ -426,9 +426,14 @@ void test('deployment runbook documents the safe production lifecycle and safety
     assert.ok(runbook.includes(heading), `missing runbook section: ${heading}`);
   }
 
-  assert.match(runbook, /docker compose --env-file \/etc\/sol-token-listener\/deploy\.env -f deploy\/compose\.yaml/);
+  assert.match(runbook, /export DEPLOY_ENV=\/etc\/sol-token-listener\/deploy\.env/);
+  assert.match(runbook, /docker compose --env-file "\$DEPLOY_ENV" -f deploy\/compose\.yaml/);
   assert.match(runbook, /deploy\/env\.example[^\n]*jamais[^\n]*secret[^\n]*production/i);
   assert.match(runbook, /pg_advisory_lock/);
+  assert.match(
+    runbook,
+    /docker compose --env-file "\$DEPLOY_ENV" -f deploy\/compose\.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 postgres/,
+  );
   assert.match(runbook, /exec -T app node dist\/scripts\/deployment-healthcheck\.js/);
   assert.match(runbook, /4 heures/);
   assert.match(runbook, /15 minutes/);

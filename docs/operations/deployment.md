@@ -6,7 +6,7 @@ et n’envoie aucune transaction. Le déploiement reste à réplica unique.
 
 ## Prérequis
 
-- Docker Engine, Docker Compose v2 et BuildKit ;
+- Docker Engine, Docker Compose v2 avec `up --wait --wait-timeout`, et BuildKit ;
 - accès au fichier d’environnement externe et à la sauvegarde PostgreSQL ;
 - endpoints Solana HTTP/WebSocket dédiés ;
 - un proxy TLS externe pour publier uniquement le frontend.
@@ -35,10 +35,11 @@ Fournissez séparément `POSTGRES_PASSWORD` et
 dans `DATABASE_URL`. N’ajoutez aucune variable de wallet, clé privée, keypair
 ou signature : elles sont interdites par la configuration V1.
 
-Validez le rendu sans imprimer le fichier :
+Définissez le chemin une fois puis validez le rendu sans imprimer le fichier :
 
 ```bash
-docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.yaml --project-name sol-token-listener config --quiet
+export DEPLOY_ENV=/etc/sol-token-listener/deploy.env
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --quiet
 ```
 
 N’envoyez jamais ce fichier vers Git, les logs CI ou une image Docker.
@@ -57,22 +58,24 @@ Avant toute migration, effectuez et vérifiez une sauvegarde de la base. Puis
 construisez ou tirez les images immuables validées. Depuis la racine du dépôt :
 
 ```bash
-docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.yaml --project-name sol-token-listener up -d postgres
-docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.yaml --project-name sol-token-listener run --rm --no-deps migrate
-docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.yaml --project-name sol-token-listener up -d --no-deps app retention
-until docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js; do sleep 2; done
-docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.yaml --project-name sol-token-listener up -d --no-deps frontend
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 postgres
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener run --rm --no-deps migrate
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-deps app retention
+until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js; do sleep 2; done
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-deps frontend
 ```
 
-Attendez PostgreSQL sain, lancez la migration one-shot, puis exactement une
-application et un worker de rétention. La boucle attend le healthcheck compilé
+La commande PostgreSQL attend explicitement un état sain, avec une borne de 60
+secondes ; une migration `--no-deps` ne part donc pas sur une base seulement
+démarrée. Lancez ensuite la migration one-shot, puis exactement une application
+et un worker de rétention. La boucle attend le healthcheck compilé
 avant de publier le frontend derrière le proxy TLS externe. Vérifiez health, SSE
 et les logs de rétention :
 
 ```bash
 curl --fail --silent --show-error http://127.0.0.1:8080/api/v1/health
 curl --no-buffer --max-time 10 -H 'Accept: text/event-stream' http://127.0.0.1:8080/api/v1/events
-docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.yaml --project-name sol-token-listener logs --since=15m retention
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener logs --since=15m retention
 ```
 
 ## Arrêt normal
@@ -80,8 +83,8 @@ docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.y
 Respectez les 40 secondes de grâce pour fermer SSE et PostgreSQL proprement :
 
 ```bash
-docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.yaml --project-name sol-token-listener stop frontend app retention
-docker compose --env-file /etc/sol-token-listener/deploy.env -f deploy/compose.yaml --project-name sol-token-listener stop postgres
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop frontend app retention
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop postgres
 ```
 
 `docker compose down --volumes` est destructif et ne doit jamais être utilisé
