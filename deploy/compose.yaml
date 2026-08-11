@@ -1,14 +1,8 @@
 name: sol-token-listener
 
-x-runtime-environment: &runtime-environment
+x-database-environment: &database-environment
   DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD_URI_ENCODED:?POSTGRES_PASSWORD_URI_ENCODED is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
-  SOLANA_HTTP_RPC_URL: ${SOLANA_HTTP_RPC_URL:?SOLANA_HTTP_RPC_URL is required}
-  SOLANA_WS_RPC_URL: ${SOLANA_WS_RPC_URL:?SOLANA_WS_RPC_URL is required}
-  EXECUTION_MODE: observe
   POSTGRES_AUTO_MIGRATE: "false"
-  PAPER_STRATEGY_ENABLED: "false"
-  API_ENABLED: "true"
-  DATA_RETENTION_HOURS: "4"
 
 services:
   postgres:
@@ -30,7 +24,7 @@ services:
   migrate:
     image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
     command: ["node", "dist/scripts/migrate.js"]
-    environment: *runtime-environment
+    environment: *database-environment
     depends_on:
       postgres:
         condition: service_healthy
@@ -44,7 +38,13 @@ services:
       dockerfile: Dockerfile
       target: backend
     environment:
-      <<: *runtime-environment
+      <<: *database-environment
+      SOLANA_HTTP_RPC_URL: ${SOLANA_HTTP_RPC_URL:?SOLANA_HTTP_RPC_URL is required}
+      SOLANA_WS_RPC_URL: ${SOLANA_WS_RPC_URL:?SOLANA_WS_RPC_URL is required}
+      EXECUTION_MODE: observe
+      PAPER_STRATEGY_ENABLED: "false"
+      API_ENABLED: "true"
+      DATA_RETENTION_HOURS: "4"
       API_HOST: 0.0.0.0
       API_PORT: "3000"
       LISTENER_ENABLED: ${LISTENER_ENABLED:-true}
@@ -66,14 +66,15 @@ services:
     image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
     command: ["node", "dist/scripts/purge-retained-data.js"]
     environment:
-      <<: *runtime-environment
+      <<: *database-environment
+      DATA_RETENTION_HOURS: "4"
       RETENTION_PURGE_INTERVAL_MS: ${RETENTION_PURGE_INTERVAL_MS:-900000}
     init: true
     stop_grace_period: 40s
     depends_on:
       migrate:
         condition: service_completed_successfully
-    networks: [internal, application]
+    networks: [internal]
     restart: unless-stopped
 
   frontend:

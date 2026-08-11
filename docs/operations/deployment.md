@@ -51,9 +51,12 @@ N’envoyez jamais ce fichier vers Git, les logs CI ou une image Docker.
 
 La topologie fixe `POSTGRES_AUTO_MIGRATE=false`. Le service `migrate` exécute
 l’artefact compilé et prend `pg_advisory_lock(7347662125)` avant de consulter
-l’historique. Ce verrou de session sérialise les rollouts concurrents ; une
-connexion perdue le libère. Les migrations transactionnelles sont rejouables :
-ne modifiez, ne supprimez et n’inversez jamais à la main une migration appliquée.
+l’historique. Ce verrou de session sérialise uniquement les migrateurs
+concurrents. Il n’arrête ni l’application ni le worker de rétention : les
+services applicatifs doivent donc être arrêtés explicitement avant la migration.
+Une connexion perdue libère le verrou. Les migrations transactionnelles sont
+rejouables : ne modifiez, ne supprimez et n’inversez jamais à la main une
+migration appliquée.
 
 ## Démarrage
 
@@ -64,6 +67,7 @@ construisez ou tirez les images immuables validées. Depuis la racine du dépôt
 set -euo pipefail
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --images migrate app retention frontend | grep -Fvx 'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3' | npm run --silent deployment:validate-images
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull postgres migrate app retention frontend
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 frontend app retention
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 --no-build postgres
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener run --rm --no-deps migrate
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps app retention
@@ -81,6 +85,11 @@ Compose, puis valide les quatre images applicatives effectivement rendues après
 application du fichier et des éventuelles variables d’environnement du shell.
 Elle refuse tout tag mutable, digest non canonique, cinquième image inattendue ou
 partage incorrect avant le premier `pull`.
+
+La commande `stop` attend la fin des trois services et ouvre une période
+d’indisponibilité planifiée. Elle commence avant la migration et se termine
+seulement lorsque le nouveau frontend est publié après le healthcheck. N’exécutez
+pas la migration tant que cette commande n’est pas terminée.
 
 La commande PostgreSQL attend explicitement un état sain, avec une borne de 60
 secondes ; une migration `--no-deps` ne part donc pas sur une base seulement
@@ -176,9 +185,16 @@ de production.
 
 ## Rollback
 
-Quand l’ancienne application est compatible avec le schéma, remplacez dans
-`$DEPLOY_ENV` les valeurs `BACKEND_IMAGE` et `FRONTEND_IMAGE` par leurs digests
-précédents, puis appliquez exactement le même gate strict :
+Quand l’ancienne application est compatible avec le schéma, arrêtez d’abord les
+trois services applicatifs avec les digests encore déployés :
+
+```bash
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 frontend app retention
+```
+
+La commande attend leur fin avant toute modification de version. Remplacez
+ensuite dans `$DEPLOY_ENV` les valeurs `BACKEND_IMAGE` et `FRONTEND_IMAGE` par
+leurs digests précédents, puis appliquez exactement le même gate strict :
 
 ```bash
 set -euo pipefail

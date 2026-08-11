@@ -52,6 +52,66 @@ void test('unlocks and releases the session after a migration application fails'
   }
 });
 
+void test('preserves migration and rollback failures before unlocking and evicting the session', async () => {
+  const directory = await migrationDirectory();
+  const migrationFailure = new Error('migration failed');
+  const rollbackFailure = new Error('rollback failed');
+  const database = new RecordingPool({ applicationFailure: migrationFailure, rollbackFailure });
+  try {
+    await assert.rejects(
+      migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors, [migrationFailure, rollbackFailure]);
+        return true;
+      },
+    );
+    assert.deepEqual(database.events, [
+      'lock', 'history-table', 'history-read', 'begin', 'application',
+      'rollback', 'unlock', 'release',
+    ]);
+    assert.deepEqual(database.releaseArguments, [true]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('orders migration, rollback, unlock and eviction failures deterministically', async () => {
+  const directory = await migrationDirectory();
+  const migrationFailure = new Error('migration failed');
+  const rollbackFailure = new Error('rollback failed');
+  const unlockFailure = new Error('unlock failed');
+  const releaseFailure = new Error('eviction failed');
+  const database = new RecordingPool({
+    applicationFailure: migrationFailure,
+    rollbackFailure,
+    unlockFailure,
+    releaseFailure,
+  });
+  try {
+    await assert.rejects(
+      migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors, [
+          migrationFailure,
+          rollbackFailure,
+          unlockFailure,
+          releaseFailure,
+        ]);
+        return true;
+      },
+    );
+    assert.deepEqual(database.events, [
+      'lock', 'history-table', 'history-read', 'begin', 'application',
+      'rollback', 'unlock', 'release',
+    ]);
+    assert.deepEqual(database.releaseArguments, [true]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 void test('rejects a false advisory unlock result and still releases the session', async () => {
   const directory = await emptyMigrationDirectory();
   const database = new RecordingPool({
@@ -308,6 +368,7 @@ class RecordingPool {
     readonly applicationFailure?: Error;
     readonly lockFailure?: Error;
     readonly releaseFailure?: Error;
+    readonly rollbackFailure?: Error;
     readonly unlockFailure?: Error;
     readonly unlockResult?: { readonly rows: readonly unknown[] };
   } = {}) {
@@ -348,6 +409,7 @@ class RecordingPool {
       this.events.push('commit');
     } else if (text === 'ROLLBACK') {
       this.events.push('rollback');
+      if (this.options.rollbackFailure !== undefined) throw this.options.rollbackFailure;
     } else if (text.includes('INSERT INTO migration_history')) {
       this.events.push('history-write');
     } else {

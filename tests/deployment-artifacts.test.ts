@@ -66,6 +66,10 @@ void test('Dockerfile pins reviewed images and builds exact workspace artifacts'
   assert.match(build, /^COPY\s+scripts\s+\.\/scripts$/m);
   assert.match(build, /^COPY\s+migrations\s+\.\/migrations$/m);
   assert.match(build, /^COPY\s+config\s+\.\/config$/m);
+  assert.match(
+    build,
+    /^COPY\s+frontend\/vite-read-only-api-proxy\.ts\s+frontend\/vite-read-only-api-proxy\.ts$/m,
+  );
 
   const productionDependencies = stage(dockerfile, 'production-dependencies');
   assert.match(
@@ -199,13 +203,31 @@ void test('Compose defines an observe-only, five-service deployment without expo
   assert.doesNotMatch(composeService(compose, 'retention'), /^ {4}build:\s*$/m);
   assert.match(compose, /^ {4}ports:\s*\["127\.0\.0\.1:\$\{FRONTEND_PORT:-8080\}:8080"\]\s*$/m);
   assert.equal((compose.match(/^ {4}ports:/gm) ?? []).length, 1);
-  assert.match(compose, /^ {2}EXECUTION_MODE: observe$/m);
+  assert.match(compose, /^x-database-environment: &database-environment$/m);
+  assert.match(compose, /^ {2}DATABASE_URL: postgresql:/m);
   assert.match(compose, /^ {2}POSTGRES_AUTO_MIGRATE: "false"$/m);
-  assert.match(compose, /^ {2}PAPER_STRATEGY_ENABLED: "false"$/m);
-  assert.match(compose, /^ {2}API_ENABLED: "true"$/m);
-  assert.match(compose, /^ {2}DATA_RETENTION_HOURS: "4"$/m);
-  assert.match(compose, /^ {6}API_HOST: 0\.0\.0\.0$/m);
-  assert.match(compose, /^ {6}API_PORT: "3000"$/m);
+
+  const migrate = composeService(compose, 'migrate');
+  assert.match(migrate, /^ {4}environment: \*database-environment$/m);
+  assert.doesNotMatch(migrate, /SOLANA_|EXECUTION_MODE|PAPER_STRATEGY|API_|DATA_RETENTION|RETENTION_PURGE/);
+
+  const retention = composeService(compose, 'retention');
+  assert.match(retention, /^ {4}environment:\s*\n {6}<<: \*database-environment$/m);
+  assert.match(retention, /^ {6}DATA_RETENTION_HOURS: "4"$/m);
+  assert.match(retention, /^ {6}RETENTION_PURGE_INTERVAL_MS: \$\{RETENTION_PURGE_INTERVAL_MS:-900000\}$/m);
+  assert.doesNotMatch(retention, /SOLANA_|EXECUTION_MODE|PAPER_STRATEGY|API_/);
+
+  const app = composeService(compose, 'app');
+  assert.match(app, /^ {4}environment:\s*\n {6}<<: \*database-environment$/m);
+  assert.match(app, /^ {6}SOLANA_HTTP_RPC_URL: \$\{SOLANA_HTTP_RPC_URL:\?SOLANA_HTTP_RPC_URL is required\}$/m);
+  assert.match(app, /^ {6}SOLANA_WS_RPC_URL: \$\{SOLANA_WS_RPC_URL:\?SOLANA_WS_RPC_URL is required\}$/m);
+  assert.match(app, /^ {6}EXECUTION_MODE: observe$/m);
+  assert.match(app, /^ {6}PAPER_STRATEGY_ENABLED: "false"$/m);
+  assert.match(app, /^ {6}API_ENABLED: "true"$/m);
+  assert.match(app, /^ {6}DATA_RETENTION_HOURS: "4"$/m);
+  assert.match(app, /^ {6}API_HOST: 0\.0\.0\.0$/m);
+  assert.match(app, /^ {6}API_PORT: "3000"$/m);
+  assert.match(app, /^ {6}LISTENER_ENABLED: \$\{LISTENER_ENABLED:-true\}$/m);
   assert.match(compose, /^ {4}init: true$/m);
   assert.match(compose, /^ {4}stop_grace_period: 40s$/m);
   assert.match(compose, /^ {6}test: \["CMD", "node", "dist\/scripts\/deployment-healthcheck\.js"\]$/m);
@@ -217,7 +239,7 @@ void test('Compose defines an observe-only, five-service deployment without expo
   assert.match(composeService(compose, 'postgres'), /^ {4}networks: \[internal\]$/m);
   assert.match(composeService(compose, 'migrate'), /^ {4}networks: \[internal\]$/m);
   assert.match(composeService(compose, 'app'), /^ {4}networks: \[internal, application\]$/m);
-  assert.match(composeService(compose, 'retention'), /^ {4}networks: \[internal, application\]$/m);
+  assert.match(composeService(compose, 'retention'), /^ {4}networks: \[internal\]$/m);
   assert.match(composeService(compose, 'frontend'), /^ {4}networks: \[application\]$/m);
   assert.match(compose, /^ {4}volumes: \["postgres-data:\/var\/lib\/postgresql\/data"\]$/m);
   assert.match(compose, /^networks:\s*\n {2}internal:\s*\n {4}internal: true\s*\n {2}application:$/m);
@@ -237,6 +259,8 @@ void test('local frontend development proxies the read-only V1 API to the loopba
     vite,
     /server:\s*\{[\s\S]*?proxy:\s*\{[\s\S]*?'\/api\/v1':\s*\{[\s\S]*?target:\s*'http:\/\/127\.0\.0\.1:3000',[\s\S]*?changeOrigin:\s*false,[\s\S]*?ws:\s*false,/,
   );
+  assert.match(vite, /rejectNonReadOnlyApiMethod/);
+  assert.match(vite, /server\.middlewares\.use\('\/api\/v1'/);
   assert.match(readme, /proxy[\s\S]{0,160}\/api\/v1[\s\S]{0,160}127\.0\.0\.1:3000/i);
 });
 
@@ -486,6 +510,10 @@ void test('deployment runbook documents the safe production lifecycle and safety
   assert.match(runbook, /pg_advisory_lock/);
   assert.match(
     runbook,
+    /verrou[\s\S]{0,240}(?:sérialise|coordonne)[^\n]*migrateurs[\s\S]{0,240}(?:n’arrête|ne stoppe|ne coordonne)[^\n]*(?:app|application|worker)/i,
+  );
+  assert.match(
+    runbook,
     /docker compose --env-file "\$DEPLOY_ENV" -f deploy\/compose\.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 --no-build postgres/,
   );
   assert.match(runbook, /exec -T app node dist\/scripts\/deployment-healthcheck\.js/);
@@ -509,7 +537,23 @@ void test('deployment runbook documents the safe production lifecycle and safety
   assert.match(runbook, /production[^\n]*OK/i);
   assert.match(runbook, /down --volumes[\s\S]{0,120}destructif[\s\S]{0,120}jamais[\s\S]{0,120}arrêt normal/i);
   assert.match(runbook, /sans inverser[^\n]*migration/i);
+  const startup = runbook.slice(runbook.indexOf('## Démarrage'), runbook.indexOf('## Arrêt normal'));
+  const startupStop = 'stop --timeout 40 frontend app retention';
+  const startupStopIndex = startup.indexOf(startupStop);
+  assert.notEqual(startupStopIndex, -1, 'rollout must stop every application service');
+  assert.ok(startupStopIndex > startup.indexOf('sauvegarde'), 'backup must precede downtime');
+  assert.ok(startupStopIndex > startup.indexOf('pull postgres migrate app retention frontend'));
+  assert.ok(startupStopIndex > startup.indexOf('deployment:validate-images'));
+  assert.ok(startupStopIndex < startup.indexOf('run --rm --no-deps migrate'));
+  assert.match(startup, /indisponib|downtime/i);
+  assert.match(startup, /commande[^\n]*(?:attend|bloque)|(?:attend|bloque)[^\n]*commande/i);
+
   const rollback = runbook.slice(runbook.indexOf('## Rollback'), runbook.indexOf('## Proxy SSE'));
+  const rollbackStopIndex = rollback.indexOf(startupStop);
+  assert.notEqual(rollbackStopIndex, -1, 'rollback must stop every application service');
+  assert.ok(rollbackStopIndex < rollback.indexOf('BACKEND_IMAGE'));
+  assert.ok(rollbackStopIndex < rollback.indexOf('pull app retention frontend'));
+  assert.ok(rollbackStopIndex < rollback.indexOf('up -d --no-build --no-deps app retention'));
   assert.match(rollback, /BACKEND_IMAGE[\s\S]*FRONTEND_IMAGE/);
   assert.match(rollback, /pull app retention frontend/);
   assert.match(rollback, /up -d --no-build --no-deps app retention/);

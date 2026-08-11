@@ -37,8 +37,9 @@ export async function migrateDatabase(options: {
   const client = await pool.connect();
   const applied: string[] = [];
   let lockAcquired = false;
-  let primaryFailure: unknown;
-  let primaryFailed = false;
+  const sessionState = { mustBeEvicted: false };
+  const primaryFailures: unknown[] = [];
+  const migrationAborted = new Error('Migration transaction aborted.');
   try {
     await client.query('SELECT pg_advisory_lock($1)', [migrationAdvisoryLockId]);
     lockAcquired = true;
@@ -61,13 +62,18 @@ export async function migrateDatabase(options: {
         await client.query('COMMIT');
         applied.push(name);
       } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
+        primaryFailures.push(error);
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackFailure) {
+          primaryFailures.push(rollbackFailure);
+          sessionState.mustBeEvicted = true;
+        }
+        throw migrationAborted;
       }
     }
   } catch (error) {
-    primaryFailed = true;
-    primaryFailure = error;
+    if (error !== migrationAborted) primaryFailures.push(error);
   }
 
   let unlockFailure: unknown;
@@ -90,7 +96,7 @@ export async function migrateDatabase(options: {
   let releaseFailure: unknown;
   let releaseFailed = false;
   try {
-    if (!lockAcquired || unlockFailed) client.release(true);
+    if (!lockAcquired || unlockFailed || sessionState.mustBeEvicted) client.release(true);
     else client.release();
   } catch (error) {
     releaseFailed = true;
@@ -98,7 +104,7 @@ export async function migrateDatabase(options: {
   }
 
   const failures = [
-    ...(primaryFailed ? [primaryFailure] : []),
+    ...primaryFailures,
     ...(unlockFailed ? [unlockFailure] : []),
     ...(releaseFailed ? [releaseFailure] : []),
   ];

@@ -19,6 +19,7 @@ COPY frontend/tsconfig.json frontend/tsconfig.json
 COPY frontend/tsconfig.app.json frontend/tsconfig.app.json
 COPY frontend/tsconfig.node.json frontend/tsconfig.node.json
 COPY frontend/vite.config.ts frontend/vite.config.ts
+COPY frontend/vite-read-only-api-proxy.ts frontend/vite-read-only-api-proxy.ts
 COPY frontend/public ./frontend/public
 COPY frontend/src ./frontend/src
 
