@@ -1,21 +1,28 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
 import type { PaperExecutionQuote } from '../src/domain/paper-trading.js';
 import type { CreatorProfile, HolderDistribution } from '../src/domain/participant-analytics.js';
-import type { PaperDecisionSnapshot } from '../src/ports/paper-decision-repository.js';
-import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
+import type {
+  CanonicalQualificationProjection,
+  QualificationEvidenceSnapshot,
+} from '../src/ports/qualification-projection-repository.js';
 import {
   createDefaultQualificationRuleSet,
   QualificationEngine,
 } from '../src/qualification/qualification-engine.js';
+import { fromJsonValue, toJsonValue } from '../src/utils/json.js';
 
-void test('keeps unavailable evidence UNKNOWN instead of manufacturing negative facts', () => {
+void test('rebuilds from qualification evidence independently of paper state', () => {
   const service = new QualificationRebuildService(engine());
   const rebuilt = service.rebuild({ snapshot: snapshot(), buyQuote: undefined, reverseSellQuote: undefined });
 
   assert.match(rebuilt.reportId, /^qreport_[a-f0-9]{64}$/u);
   assert.equal(rebuilt.event.type, 'QualificationUpdated');
+  assert.equal(rebuilt.event.source, 'qualification');
   assert.equal(rebuilt.event.id, rebuilt.reportEventId);
+  assert.equal(rebuilt.event.payload.reportId, rebuilt.reportId);
+  assert.deepEqual(rebuilt.event.payload.evaluation, rebuilt.evaluation);
   assert.equal(rebuilt.report.evidence.every((item) => item.status === 'UNKNOWN'), true);
   assert.equal(condition(rebuilt, 'BUY_SIMULATION_FAILED').status, 'UNKNOWN');
   assert.equal(condition(rebuilt, 'SELL_QUOTE_UNAVAILABLE').status, 'UNKNOWN');
@@ -88,11 +95,143 @@ void test('revises qualification identity when source confirmation advances', ()
   assert.notEqual(finalized.reportEventId, confirmed.reportEventId);
 });
 
+void test('reauthorizes a JSON-style deserialized canonical projection', () => {
+  const service = serviceWithEngine();
+  const projection = deserializeProjection(canonicalProjection(service));
+
+  const rebuilt = service.reauthorize(projection);
+
+  assert.deepEqual(rebuilt.evaluation, projection.evaluation);
+  assert.deepEqual(rebuilt.report, projection.report);
+  assert.deepEqual(rebuilt.event, projection.qualificationEvent);
+  assert.notEqual(rebuilt.report, projection.report);
+  assert.equal(engineFor(service).isAuthorized(rebuilt.report, {
+    mint: rebuilt.event.mint,
+    triggerEventId: rebuilt.event.id,
+  }), true);
+});
+
+const projectionMutations: readonly Readonly<{
+  name: string;
+  mutate: (projection: CanonicalQualificationProjection) => CanonicalQualificationProjection;
+}>[] = [
+  {
+    name: 'evaluation',
+    mutate: (projection) => ({
+      ...projection,
+      evaluation: { ...projection.evaluation, evaluatedAtMs: projection.evaluation.evaluatedAtMs + 1 },
+    }),
+  },
+  {
+    name: 'report',
+    mutate: (projection) => ({
+      ...projection,
+      report: {
+        ...projection.report,
+        verdict: projection.report.verdict === 'REJECTED' ? 'WATCHLISTED' : 'REJECTED',
+      },
+    }),
+  },
+  {
+    name: 'profile/report identity',
+    mutate: (projection) => ({
+      ...projection,
+      report: {
+        ...projection.report,
+        ruleSet: { ...projection.report.ruleSet, fingerprint: 'f'.repeat(64) },
+      },
+    }),
+  },
+  {
+    name: 'report id',
+    mutate: (projection) => ({ ...projection, reportId: `qreport_${'f'.repeat(64)}` }),
+  },
+  {
+    name: 'source event id',
+    mutate: (projection) => ({ ...projection, sourceEventId: 'evt_changed' }),
+  },
+  {
+    name: 'source raw event id',
+    mutate: (projection) => ({ ...projection, sourceRawEventId: '' }),
+  },
+  {
+    name: 'evidence fingerprint',
+    mutate: (projection) => ({ ...projection, evidenceFingerprint: 'f'.repeat(64) }),
+  },
+  {
+    name: 'qualification event identity',
+    mutate: (projection) => ({
+      ...projection,
+      qualificationEvent: { ...projection.qualificationEvent, source: 'paper-decision' },
+    }),
+  },
+  {
+    name: 'qualification event payload',
+    mutate: (projection) => ({
+      ...projection,
+      qualificationEvent: {
+        ...projection.qualificationEvent,
+        payload: { ...projection.qualificationEvent.payload, reportId: `qreport_${'e'.repeat(64)}` },
+      },
+    }),
+  },
+];
+
+for (const mutation of projectionMutations) {
+  void test(`rejects altered persisted ${mutation.name}`, () => {
+    const service = new QualificationRebuildService(engine());
+    const projection = deserializeProjection(canonicalProjection(service));
+
+    assert.throws(() => service.reauthorize(mutation.mutate(projection)), TypeError);
+  });
+}
+
+const engines = new WeakMap<QualificationRebuildService, QualificationEngine>();
+
 function engine(): QualificationEngine {
   return new QualificationEngine(createDefaultQualificationRuleSet(60));
 }
 
-function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecisionSnapshot {
+function serviceWithEngine(): QualificationRebuildService {
+  const qualificationEngine = engine();
+  const service = new QualificationRebuildService(qualificationEngine);
+  engines.set(service, qualificationEngine);
+  return service;
+}
+
+function engineFor(service: QualificationRebuildService): QualificationEngine {
+  const qualificationEngine = engines.get(service);
+  assert.ok(qualificationEngine);
+  return qualificationEngine;
+}
+
+function canonicalProjection(service = serviceWithEngine()): CanonicalQualificationProjection {
+  const source = snapshot();
+  const rebuilt = service.rebuild({
+    snapshot: source,
+    buyQuote: undefined,
+    reverseSellQuote: undefined,
+  });
+  return Object.freeze({
+    reportId: rebuilt.reportId,
+    sourceEventId: source.asOfEvent.id,
+    sourceRawEventId: 'raw_source',
+    evidenceFingerprint: rebuilt.evidenceFingerprint,
+    evaluation: rebuilt.evaluation,
+    report: rebuilt.report,
+    qualificationEvent: rebuilt.event,
+  });
+}
+
+function deserializeProjection(
+  projection: CanonicalQualificationProjection,
+): CanonicalQualificationProjection {
+  return fromJsonValue(toJsonValue(projection)) as CanonicalQualificationProjection;
+}
+
+function snapshot(
+  overrides: Partial<QualificationEvidenceSnapshot> = {},
+): QualificationEvidenceSnapshot {
   const asOfEvent = {
     id: 'evt_source', type: 'TokenLaunchDetected' as const, mint: 'MINT', source: 'pumpfun',
     program: 'pump', signature: 'signature',
@@ -108,8 +247,7 @@ function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecision
       launchpad: 'pumpfun', createdAt: Object.freeze({ ...asOfEvent.cursor }), parameters: Object.freeze({}),
     }),
     metadata: null, social: null, creatorProfile: null, holderSnapshot: null,
-    walletGraph: null, activeLaunchTrades: Object.freeze([]), activeMarketTrades: Object.freeze([]),
-    currentCandidate: null, currentDecision: null, currentSession: null, activePosition: null,
+    walletGraph: null,
     ...overrides,
   });
 }
