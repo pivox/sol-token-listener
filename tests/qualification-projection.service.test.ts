@@ -64,6 +64,19 @@ void test('rejects a missing active launch with a typed error without changing c
   assert.deepEqual(repository.replacements, []);
 });
 
+void test('raises the typed missing-launch error after a wrapping transaction completes', async () => {
+  const delegate = new FakeRepository(null, []);
+  const repository = new CallbackErrorWrappingRepository(delegate);
+
+  await assert.rejects(
+    () => service(repository, ['SOL']).rebuild('MINT'),
+    QualificationProjectionLaunchNotFoundError,
+  );
+  assert.equal(repository.callbackErrorsWrapped, 0);
+  assert.deepEqual(delegate.dissolutions, []);
+  assert.deepEqual(delegate.replacements, []);
+});
+
 void test('dissolves only the current projection when an orphan replay has no canonical launch', async () => {
   const repository = new FakeRepository(null, []);
 
@@ -185,6 +198,26 @@ class FakeRepository implements QualificationProjectionRepository {
         if (result === undefined) throw new Error('Unexpected projection replacement.');
         return result;
       },
+    });
+  }
+}
+
+class CallbackErrorWrappingRepository implements QualificationProjectionRepository {
+  public callbackErrorsWrapped = 0;
+
+  public constructor(private readonly delegate: QualificationProjectionRepository) {}
+
+  public async transact<TResult>(
+    mint: string,
+    operation: (transaction: QualificationProjectionTransaction) => Promise<TResult>,
+  ): Promise<TResult> {
+    return this.delegate.transact(mint, async (transaction) => {
+      try {
+        return await operation(transaction);
+      } catch (cause: unknown) {
+        this.callbackErrorsWrapped += 1;
+        throw new Error('Transaction callback failed.', { cause });
+      }
     });
   }
 }

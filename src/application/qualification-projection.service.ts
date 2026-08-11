@@ -18,6 +18,8 @@ export type QualificationProjectionRebuildResult =
     projection: null;
   }>;
 
+const MISSING_CANONICAL_LAUNCH = Symbol('missing canonical qualification launch');
+
 export class QualificationProjectionLaunchNotFoundError extends Error {
   public constructor(public readonly mint: string) {
     super(`Qualification projection launch not found for mint ${mint}.`);
@@ -44,11 +46,13 @@ export class QualificationProjectionService {
     if (!isMissingCanonicalLaunchPolicy(missingLaunchPolicy)) {
       throw new TypeError('Qualification projection missing launch policy is invalid.');
     }
-    return this.repository.transact(mint, async (transaction) => {
+    const result = await this.repository.transact<
+      QualificationProjectionRebuildResult | typeof MISSING_CANONICAL_LAUNCH
+    >(mint, async (transaction) => {
       const snapshot = await transaction.loadCanonicalInput(mint);
       if (snapshot === null) {
         if (missingLaunchPolicy === 'ERROR') {
-          throw new QualificationProjectionLaunchNotFoundError(mint);
+          return MISSING_CANONICAL_LAUNCH;
         }
         await transaction.dissolveCurrent(mint);
         return Object.freeze({ kind:'DISSOLVED' as const, projection:null });
@@ -76,6 +80,10 @@ export class QualificationProjectionService {
       const kind = await transaction.replaceProjection(projection);
       return Object.freeze({ kind,projection });
     });
+    if (result === MISSING_CANONICAL_LAUNCH) {
+      throw new QualificationProjectionLaunchNotFoundError(mint);
+    }
+    return result;
   }
 }
 
