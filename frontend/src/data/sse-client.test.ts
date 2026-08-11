@@ -243,6 +243,36 @@ describe('resumable SSE lifecycle', () => {
     client.stop();
   });
 
+  it('preserves the closing refresh when connectivity drops after the initial resync', async () => {
+    let finishInitialResync: (() => void) | undefined;
+    const resync = vi.fn()
+      .mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => { finishInitialResync = resolve; });
+      })
+      .mockResolvedValueOnce(undefined);
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(streamResponse('{}', 409))
+      .mockResolvedValueOnce(streamResponse(''));
+    const client = createSseClient({
+      apiBaseUrl: 'https://api.example', cursorStore: cursorStore('expired'), fetchFn, resync,
+      acceptEvent: async () => undefined, schedule: () => 1, cancel: () => undefined,
+      minimumResyncMs: 0,
+    });
+
+    const started = client.start();
+    await vi.waitFor(() => { expect(resync).toHaveBeenCalledOnce(); });
+    client.setOnline(false);
+    finishInitialResync?.();
+    await started;
+    expect(client.getSnapshot()).toMatchObject({ state: 'DISCONNECTED', errorCode: 'OFFLINE' });
+    expect(resync).toHaveBeenCalledOnce();
+
+    client.setOnline(true);
+    await vi.waitFor(() => { expect(resync).toHaveBeenCalledTimes(2); });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    client.stop();
+  });
+
   it('performs the closing HTTP refresh after the cursorless stream baseline', async () => {
     const order: string[] = [];
     const fetchFn = vi.fn<typeof fetch>()

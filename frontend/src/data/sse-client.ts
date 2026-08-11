@@ -237,13 +237,13 @@ export function createSseClient(options: SseClientOptions): SseClient {
       scheduleResynchronization('RESYNC_FAILED');
       return;
     }
+    finalRefreshRequired = true;
     initialResynchronizationRequired = false;
     if (!online()) {
       publish({ state: 'DISCONNECTED', errorCode: 'OFFLINE' });
       return;
     }
     if (retryTimer !== undefined) return;
-    finalRefreshRequired = true;
     void connect();
   }
 
