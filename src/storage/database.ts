@@ -36,10 +36,12 @@ export async function migrateDatabase(options: {
 
   const client = await pool.connect();
   const applied: string[] = [];
+  let lockAcquired = false;
   let primaryFailure: unknown;
   let primaryFailed = false;
   try {
     await client.query('SELECT pg_advisory_lock($1)', [migrationAdvisoryLockId]);
+    lockAcquired = true;
     await client.query(`
       CREATE TABLE IF NOT EXISTS migration_history (
         version TEXT PRIMARY KEY,
@@ -70,23 +72,26 @@ export async function migrateDatabase(options: {
 
   let unlockFailure: unknown;
   let unlockFailed = false;
-  try {
-    const unlock = await client.query<Record<string, unknown>>(
-      'SELECT pg_advisory_unlock($1)',
-      [migrationAdvisoryLockId],
-    );
-    if (!releasedMigrationAdvisoryLock(unlock.rows)) {
-      throw new Error('Migration advisory lock was not released.');
+  if (lockAcquired) {
+    try {
+      const unlock = await client.query<Record<string, unknown>>(
+        'SELECT pg_advisory_unlock($1)',
+        [migrationAdvisoryLockId],
+      );
+      if (!releasedMigrationAdvisoryLock(unlock.rows)) {
+        throw new Error('Migration advisory lock was not released.');
+      }
+    } catch (error) {
+      unlockFailed = true;
+      unlockFailure = error;
     }
-  } catch (error) {
-    unlockFailed = true;
-    unlockFailure = error;
   }
 
   let releaseFailure: unknown;
   let releaseFailed = false;
   try {
-    client.release();
+    if (!lockAcquired || unlockFailed) client.release(true);
+    else client.release();
   } catch (error) {
     releaseFailed = true;
     releaseFailure = error;

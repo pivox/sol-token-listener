@@ -27,6 +27,7 @@ void test('holds the fixed session advisory lock across history reads and migrat
     assert.deepEqual(database.unlockValues, [[migrationLockId]]);
     assert.deepEqual(database.lockQueries, ['SELECT pg_advisory_lock($1)']);
     assert.deepEqual(database.unlockQueries, ['SELECT pg_advisory_unlock($1)']);
+    assert.deepEqual(database.releaseArguments, [undefined]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -45,6 +46,7 @@ void test('unlocks and releases the session after a migration application fails'
       'lock', 'history-table', 'history-read', 'begin', 'application',
       'rollback', 'unlock', 'release',
     ]);
+    assert.deepEqual(database.releaseArguments, [undefined]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -61,6 +63,7 @@ void test('rejects a false advisory unlock result and still releases the session
       /Migration advisory lock was not released/u,
     );
     assert.deepEqual(database.events, ['lock', 'history-table', 'unlock', 'release']);
+    assert.deepEqual(database.releaseArguments, [true]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -75,6 +78,7 @@ void test('rejects a malformed advisory unlock result and still releases the ses
       /Migration advisory lock was not released/u,
     );
     assert.deepEqual(database.events, ['lock', 'history-table', 'unlock', 'release']);
+    assert.deepEqual(database.releaseArguments, [true]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -98,6 +102,7 @@ void test('rejects an advisory unlock getter without invoking it and still relea
     );
     assert.equal(getterInvoked, false);
     assert.deepEqual(database.events, ['lock', 'history-table', 'unlock', 'release']);
+    assert.deepEqual(database.releaseArguments, [true]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -120,6 +125,7 @@ void test('rejects a standalone advisory unlock failure after migrations succeed
       'lock', 'history-table', 'history-read', 'begin', 'application',
       'history-write', 'commit', 'unlock', 'release',
     ]);
+    assert.deepEqual(database.releaseArguments, [true]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -141,6 +147,110 @@ void test('aggregates migration and advisory unlock failures with the migration 
     );
     assert.deepEqual(database.events.at(-2), 'unlock');
     assert.deepEqual(database.events.at(-1), 'release');
+    assert.deepEqual(database.releaseArguments, [true]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('evicts without unlocking when advisory lock acquisition fails', async () => {
+  const directory = await emptyMigrationDirectory();
+  const lockFailure = new Error('lock failed');
+  const database = new RecordingPool({ lockFailure });
+  try {
+    await assert.rejects(
+      migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
+      (error: unknown) => {
+        assert.equal(error, lockFailure);
+        assert.ok(!(error instanceof AggregateError));
+        return true;
+      },
+    );
+    assert.deepEqual(database.events, ['lock', 'release']);
+    assert.deepEqual(database.releaseArguments, [true]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('propagates a normal release failure after a successful unlock', async () => {
+  const directory = await emptyMigrationDirectory();
+  const releaseFailure = new Error('release failed');
+  const database = new RecordingPool({ releaseFailure });
+  try {
+    await assert.rejects(
+      migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
+      releaseFailure,
+    );
+    assert.deepEqual(database.events, ['lock', 'history-table', 'unlock', 'release']);
+    assert.deepEqual(database.releaseArguments, [undefined]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('aggregates acquisition and eviction failures without inventing an unlock failure', async () => {
+  const directory = await emptyMigrationDirectory();
+  const lockFailure = new Error('lock failed');
+  const releaseFailure = new Error('eviction failed');
+  const database = new RecordingPool({ lockFailure, releaseFailure });
+  try {
+    await assert.rejects(
+      migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors, [lockFailure, releaseFailure]);
+        return true;
+      },
+    );
+    assert.deepEqual(database.events, ['lock', 'release']);
+    assert.deepEqual(database.releaseArguments, [true]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('aggregates unlock and eviction failures', async () => {
+  const directory = await emptyMigrationDirectory();
+  const unlockFailure = new Error('unlock failed');
+  const releaseFailure = new Error('eviction failed');
+  const database = new RecordingPool({ unlockFailure, releaseFailure });
+  try {
+    await assert.rejects(
+      migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors, [unlockFailure, releaseFailure]);
+        return true;
+      },
+    );
+    assert.deepEqual(database.events, ['lock', 'history-table', 'unlock', 'release']);
+    assert.deepEqual(database.releaseArguments, [true]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('orders primary, unlock and eviction failures', async () => {
+  const directory = await migrationDirectory();
+  const migrationFailure = new Error('migration failed');
+  const unlockFailure = new Error('unlock failed');
+  const releaseFailure = new Error('eviction failed');
+  const database = new RecordingPool({ applicationFailure: migrationFailure, unlockFailure, releaseFailure });
+  try {
+    await assert.rejects(
+      migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.deepEqual(error.errors, [migrationFailure, unlockFailure, releaseFailure]);
+        return true;
+      },
+    );
+    assert.deepEqual(database.events, [
+      'lock', 'history-table', 'history-read', 'begin', 'application',
+      'rollback', 'unlock', 'release',
+    ]);
+    assert.deepEqual(database.releaseArguments, [true]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -191,17 +301,24 @@ class RecordingPool {
   public readonly unlockValues: unknown[][] = [];
   public readonly lockQueries: string[] = [];
   public readonly unlockQueries: string[] = [];
+  public readonly releaseArguments: (boolean | undefined)[] = [];
   public readonly pool: InstanceType<typeof pg.Pool>;
 
   public constructor(private readonly options: {
     readonly applicationFailure?: Error;
+    readonly lockFailure?: Error;
+    readonly releaseFailure?: Error;
     readonly unlockFailure?: Error;
     readonly unlockResult?: { readonly rows: readonly unknown[] };
   } = {}) {
     this.pool = {
       connect: async () => ({
         query: async (text: string, values?: unknown[]) => this.query(text, values),
-        release: () => { this.events.push('release'); },
+        release: (destroy?: boolean) => {
+          this.events.push('release');
+          this.releaseArguments.push(destroy);
+          if (this.options.releaseFailure !== undefined) throw this.options.releaseFailure;
+        },
       }),
     } as unknown as InstanceType<typeof pg.Pool>;
   }
@@ -211,6 +328,7 @@ class RecordingPool {
       this.events.push('lock');
       this.lockQueries.push(text);
       this.lockValues.push(values ?? []);
+      if (this.options.lockFailure !== undefined) throw this.options.lockFailure;
       return { rows: [] };
     }
     if (text.includes('pg_advisory_unlock')) {
