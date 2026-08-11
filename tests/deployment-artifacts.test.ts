@@ -258,3 +258,33 @@ void test('Compose environment template contains documentation-only required inp
   assert.match(environment, /unreserved example values can be identical/i);
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/i);
 });
+
+void test('deployment smoke is bounded, isolated, secret-free, and always cleans its project', async () => {
+  const smoke = await readArtifact('scripts/deployment-smoke.mjs');
+  const packageJson = JSON.parse(await readArtifact('package.json')) as {
+    readonly scripts?: Readonly<Record<string, string>>;
+  };
+  const ci = await readArtifact('.github/workflows/ci.yml');
+
+  assert.match(smoke, /sol-listener-smoke-\$\{process\.pid\}-\$\{randomBytes\(4\)\.toString\('hex'\)\}/);
+  assert.match(smoke, /GLOBAL_TIMEOUT_MS\s*=\s*180_000/);
+  assert.match(smoke, /REQUEST_TIMEOUT_MS\s*=\s*10_000/);
+  assert.match(smoke, /postgresPassword\s*=\s*randomBytes\(24\)\.toString\('hex'\)/);
+  assert.match(smoke, /POSTGRES_PASSWORD:\s*postgresPassword/);
+  assert.match(smoke, /POSTGRES_PASSWORD_URI_ENCODED:\s*encodeURIComponent\(postgresPassword\)/);
+  assert.match(smoke, /SOLANA_HTTP_RPC_URL:\s*'https:\/\/rpc\.invalid'/);
+  assert.match(smoke, /SOLANA_WS_RPC_URL:\s*'wss:\/\/rpc\.invalid'/);
+  assert.match(smoke, /LISTENER_ENABLED:\s*'false'/);
+  assert.match(smoke, /\[\s*'compose', '-f', composeFile, 'exec', '-T', 'postgres', 'psql'/);
+  assert.match(smoke, /\['compose', '-f', composeFile, 'down', '--volumes', '--remove-orphans'/);
+  assert.match(smoke, /com\.docker\.compose\.project=/);
+  assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key|\bwallet\b/iu);
+
+  assert.equal(packageJson.scripts?.['deployment:smoke'], 'node scripts/deployment-smoke.mjs');
+  assert.match(ci, /^ {2}deployment-contract:\s*$/m);
+  assert.match(ci, /deployment-contract:[\s\S]*?timeout-minutes: 15/);
+  assert.match(ci, /deployment-contract:[\s\S]*?node-version: 22\.13\.0/);
+  assert.match(ci, /deployment-contract:[\s\S]*?- run: npm ci/);
+  assert.match(ci, /deployment-contract:[\s\S]*?- run: npm run deployment:smoke/);
+  assert.doesNotMatch(ci, /deployment-contract:[\s\S]*?secrets\./);
+});
