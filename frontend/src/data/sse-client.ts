@@ -5,6 +5,7 @@ import type { SseCursorStore } from './sse-cursor-store.js';
 import { SseParser } from './sse-parser.js';
 
 const MAXIMUM_RETRY_DELAY_MS = 30_000;
+const DEFAULT_MINIMUM_RESYNC_MS = 250;
 
 const streamErrorSchema = z.object({
   apiVersion: z.literal('v1'),
@@ -48,6 +49,7 @@ export interface SseClientOptions {
   readonly random?: () => number;
   readonly now?: () => Date;
   readonly isOnline?: () => boolean;
+  readonly minimumResyncMs?: number;
 }
 
 export function createSseClient(options: SseClientOptions): SseClient {
@@ -59,6 +61,7 @@ export function createSseClient(options: SseClientOptions): SseClient {
   const random: NonNullable<SseClientOptions['random']> = options.random ?? Math.random;
   const now: NonNullable<SseClientOptions['now']> = options.now ?? ((): Date => new Date());
   const isOnline: NonNullable<SseClientOptions['isOnline']> = options.isOnline ?? ((): boolean => true);
+  const minimumResyncMs = options.minimumResyncMs ?? DEFAULT_MINIMUM_RESYNC_MS;
   const listeners = new Set<() => void>();
   let snapshot: RealtimeSnapshot = Object.freeze({
     state: 'STOPPED', lastEventAt: null, retryAttempt: 0, errorCode: null,
@@ -186,6 +189,7 @@ export function createSseClient(options: SseClientOptions): SseClient {
 
   async function resynchronize(): Promise<void> {
     if (isStopped()) return;
+    const startedAt = Date.now();
     publish({ state: 'RESYNCING', errorCode: 'EVENT_CURSOR_EXPIRED' });
     options.cursorStore.clear();
     try {
@@ -194,6 +198,8 @@ export function createSseClient(options: SseClientOptions): SseClient {
       scheduleReconnect('RESYNC_FAILED');
       return;
     }
+    const remaining = minimumResyncMs - (Date.now() - startedAt);
+    if (remaining > 0) await wait(remaining);
     if (isStopped()) return;
     publish({ state: 'CONNECTING', retryAttempt: 0, errorCode: null });
     await connect();
@@ -263,4 +269,8 @@ export function createSseClient(options: SseClientOptions): SseClient {
 
 function isAborted(controller: AbortController): boolean {
   return controller.signal.aborted;
+}
+
+async function wait(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolve) => { setTimeout(resolve, milliseconds); });
 }

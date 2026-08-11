@@ -93,6 +93,7 @@ describe('resumable SSE lifecycle', () => {
     const client = createSseClient({
       apiBaseUrl: 'https://api.example', fetchFn, cursorStore: store, resync,
       acceptEvent: async () => undefined, schedule: () => 1, cancel: () => undefined,
+      minimumResyncMs: 0,
     });
     await client.start();
     await Promise.resolve();
@@ -114,6 +115,7 @@ describe('resumable SSE lifecycle', () => {
     const client = createSseClient({
       apiBaseUrl: 'https://api.example', fetchFn, cursorStore: store, resync,
       acceptEvent: async () => undefined, schedule: () => 1, cancel: () => undefined,
+      minimumResyncMs: 0,
     });
     await client.start();
     expect(store.cleared).toBe(1);

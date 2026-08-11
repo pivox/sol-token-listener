@@ -13,6 +13,7 @@ export default tseslint.config(
       'node_modules/**',
       'playwright-report/**',
       'test-results/**',
+      'tests/e2e/mock-api.mjs',
     ],
   },
   eslint.configs.recommended,
