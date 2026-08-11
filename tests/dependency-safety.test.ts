@@ -23,6 +23,35 @@ interface PackageLock {
 
 const root = new URL('../', import.meta.url);
 
+function isCanonicalSemverAtLeast(
+  version: string | undefined,
+  [minimumMajor, minimumMinor, minimumPatch]: readonly [number, number, number],
+): boolean {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.exec(version ?? '');
+  if (match === null) return false;
+
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (major !== minimumMajor) return major > minimumMajor;
+  if (minor !== minimumMinor) return minor > minimumMinor;
+  return patch >= minimumPatch;
+}
+
+void test('compares canonical dependency versions as semantic version tuples', () => {
+  const braceExpansionFloor = [1, 1, 18] as const;
+
+  assert.equal(isCanonicalSemverAtLeast('1.2.0', braceExpansionFloor), true);
+  assert.equal(isCanonicalSemverAtLeast('1.1.18', braceExpansionFloor), true);
+  assert.equal(isCanonicalSemverAtLeast('2.0.0', braceExpansionFloor), true);
+  assert.equal(isCanonicalSemverAtLeast('1.1.17', braceExpansionFloor), false);
+  assert.equal(isCanonicalSemverAtLeast('1.0.99', braceExpansionFloor), false);
+  assert.equal(isCanonicalSemverAtLeast(undefined, braceExpansionFloor), false);
+  assert.equal(isCanonicalSemverAtLeast('1.1', braceExpansionFloor), false);
+  assert.equal(isCanonicalSemverAtLeast('1.01.18', braceExpansionFloor), false);
+  assert.equal(isCanonicalSemverAtLeast('1.1.18-beta', braceExpansionFloor), false);
+});
+
 void test('every locked bn.js v5 release contains the infinite-loop fix', async () => {
   const manifest = JSON.parse(
     await readFile(new URL('package.json', root), 'utf8'),
@@ -205,10 +234,7 @@ void test('requires the supported Node floor and patched compatible transitive r
   for (const [path, entry] of Object.entries(lock.packages ?? {})) {
     if (/(?:^|\/)node_modules\/brace-expansion$/u.test(path)) {
       braceExpansionCount += 1;
-      const [majorText, , patchText] = entry.version?.split('.') ?? [];
-      const major = Number(majorText);
-      const patch = Number(patchText);
-      if (!(major > 1 || (major === 1 && patch >= 18))) {
+      if (!isCanonicalSemverAtLeast(entry.version, [1, 1, 18])) {
         violations.push(`${path} ${entry.version ?? 'missing'} is vulnerable`);
       }
     }
