@@ -197,11 +197,85 @@ git commit -m "chore: reduce and refresh dependency graph (#43)"
 ### Task 3: Lock official SDK loading and document residual advisories
 
 **Files:**
+- Modify: `package.json`
+- Modify: `frontend/package.json`
+- Modify: `package-lock.json`
+- Modify: `.github/workflows/ci.yml`
+- Modify: `tests/frontend-workspace.test.ts`
 - Modify: `tests/dependency-safety.test.ts`
 - Modify: `SECURITY.md`
 - Test: `tests/dependency-safety.test.ts`
 
-- [ ] **Step 1: Add bridge characterization coverage**
+- [ ] **Step 1: Add failing Node-floor and patched-transitive contracts**
+
+Add `engines?: Readonly<Record<string, string>>` to `PackageManifest` and
+`LockedPackage`. Add a dependency test that reads the root manifest, frontend
+manifest, and lockfile, then asserts:
+
+```ts
+assert.equal(manifest.engines?.node, '>=22.13.0');
+assert.equal(frontend.engines?.node, '>=22.13.0');
+assert.equal(lock.packages?.['']?.engines?.node, '>=22.13.0');
+assert.equal(lock.packages?.frontend?.engines?.node, '>=22.13.0');
+
+for (const [path, entry] of Object.entries(lock.packages ?? {})) {
+  if (/(?:^|\/)node_modules\/brace-expansion$/u.test(path)) {
+    const [majorText, , patchText] = entry.version?.split('.') ?? [];
+    const major = Number(majorText);
+    const patch = Number(patchText);
+    assert.ok(major > 1 || (major === 1 && patch >= 18), `${path} is vulnerable`);
+  }
+  if (/(?:^|\/)node_modules\/js-yaml$/u.test(path)) {
+    const [majorText, minorText, patchText] = entry.version?.split('.') ?? [];
+    const major = Number(majorText);
+    const minor = Number(minorText);
+    const patch = Number(patchText);
+    assert.ok(
+      major > 4 || (major === 4 && (minor > 3 || (minor === 3 && patch >= 1))),
+      `${path} is vulnerable`,
+    );
+  }
+}
+```
+
+Change `tests/frontend-workspace.test.ts` to expect `>=22.13.0` and update its
+jsdom explanation to name the declared Node 22.13 runtime.
+
+- [ ] **Step 2: Run the new contracts red**
+
+```bash
+npx tsx --test tests/dependency-safety.test.ts tests/frontend-workspace.test.ts
+```
+
+Expected: failure on Node `>=22.12.0`, `brace-expansion@1.1.16`, and
+`js-yaml@4.3.0`.
+
+- [ ] **Step 3: Align Node and update only compatible transitive locks**
+
+Set both manifest engines to `>=22.13.0`, change both CI `node-version` entries
+to `22.13.0`, then run:
+
+```bash
+npm install --package-lock-only
+npm update brace-expansion js-yaml --package-lock-only
+npm ci
+```
+
+Expected: root/frontend lock engines match, `brace-expansion` v1 resolves to at
+least `1.1.18`, `js-yaml` v4 resolves to at least `4.3.1`, and no override or
+new direct dependency appears.
+
+- [ ] **Step 4: Verify the compatibility contracts green**
+
+```bash
+npx tsx --test tests/dependency-safety.test.ts tests/frontend-workspace.test.ts
+npm ls brace-expansion js-yaml --all
+```
+
+Expected: both test files pass and every listed version satisfies the tested
+patched boundary.
+
+- [ ] **Step 5: Add bridge characterization coverage**
 
 Append this test without changing either production bridge:
 
@@ -222,7 +296,7 @@ void test('loads the required official Pump SDK exports through Node-compatible 
 });
 ```
 
-- [ ] **Step 2: Run the bridge characterization test**
+- [ ] **Step 6: Run the bridge characterization test**
 
 Run:
 
@@ -232,7 +306,7 @@ npx tsx --test tests/dependency-safety.test.ts
 
 Expected: all tests pass on the supported Node runtime; no direct ESM import replaces either `createRequire` bridge.
 
-- [ ] **Step 3: Measure both audit views**
+- [ ] **Step 7: Measure both audit views**
 
 Run:
 
@@ -242,9 +316,11 @@ npm audit --omit=dev --json
 npm ls bigint-buffer uuid jayson @solana/buffer-layout-utils @solana/web3.js --all
 ```
 
-Expected: non-zero audit exits remain because the two documented upstream leaf advisories are unresolved; no `bn.js` vulnerable release appears.
+Expected: both audit views report the same 13 propagated records (six high,
+seven moderate) from the two documented production leaf advisories; no
+`brace-expansion`, `js-yaml`, or vulnerable `bn.js` release appears.
 
-- [ ] **Step 4: Replace `SECURITY.md` audit evidence with the current decision**
+- [ ] **Step 8: Replace `SECURITY.md` audit evidence with the current decision**
 
 Keep the reporting and observe/paper boundary sections, set `Last reviewed` to `2026-08-11`, and add:
 
@@ -254,21 +330,25 @@ Keep the reporting and observe/paper boundary sections, set `Last reviewed` to `
 The npm audit report propagates each leaf advisory through every affected
 parent package. The count of affected package records is therefore not the
 count of independent vulnerabilities. On 2026-08-11, both the full workspace
-and `--omit=dev` reports traced back to the two leaf advisories below.
+and `--omit=dev` reports contained 13 affected records (six high and seven
+moderate) traced back to the two leaf advisories below.
 
 The unused `@raydium-io/raydium-sdk-v2` direct dependency was removed without
 removing the repository's Raydium CPMM adapter. Compatible maintenance releases
 for PostgreSQL and TypeScript tooling were applied independently. Neither
 change provides a compatible remediation for the Solana Web3.js v1 advisories.
+Compatible development-only fixes for `brace-expansion` and `js-yaml` were
+applied without an override.
 ```
 
-Record the exact fresh full and production-only affected-record counts in the same section. Retain the advisory table, explain that npm proposes incompatible historical downgrades, and explicitly forbid `npm audit fix --force` and overrides.
+Retain the advisory table, explain that npm proposes incompatible historical
+downgrades, and explicitly forbid `npm audit fix --force` and overrides.
 
-- [ ] **Step 5: Commit contracts and evidence**
+- [ ] **Step 9: Commit contracts and evidence**
 
 ```bash
-git add tests/dependency-safety.test.ts SECURITY.md
-git commit -m "docs: record dependency audit decisions (#43)"
+git add package.json frontend/package.json package-lock.json .github/workflows/ci.yml tests/frontend-workspace.test.ts tests/dependency-safety.test.ts SECURITY.md
+git commit -m "fix: align supported dependency runtime (#43)"
 ```
 
 ### Task 4: Verify the entire repository and real PostgreSQL path

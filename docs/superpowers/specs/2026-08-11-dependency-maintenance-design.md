@@ -37,12 +37,16 @@ The pull request will:
    - `@types/pg` from `8.15.0` to `8.21.0`;
    - `@types/bn.js` from `5.1.6` to `5.2.0`;
    - root and frontend `typescript-eslint` from `8.65.0` to `8.67.0`;
-3. leave Pump.fun, PumpSwap, SPL Token, Web3.js, TypeScript, ESLint, Node types,
+   - compatible locked `brace-expansion` and `js-yaml` releases that close the
+     development-only advisories without an override;
+3. raise the declared and CI-tested Node floor from `22.12.0` to `22.13.0`,
+   matching the engines required by the retained development graph;
+4. leave Pump.fun, PumpSwap, SPL Token, Web3.js, TypeScript, ESLint, Node types,
    IDLs, and runtime application behavior unchanged;
-4. strengthen dependency contract tests for manifest/lock agreement, forbidden
+5. strengthen dependency contract tests for manifest/lock agreement, forbidden
    overrides, exact high-impact SDK pins, the absent unused Raydium SDK, and the
    official SDK bridge export shapes;
-5. update `SECURITY.md` with the current audit date, distinction between leaf
+6. update `SECURITY.md` with the current audit date, distinction between leaf
    causes and propagated package records, and explicit deferred decisions.
 
 No `npm audit fix`, `--force`, override, fork, downgrade, or broad update command
@@ -77,10 +81,13 @@ dependencies. The backend remains observe/paper only.
 ## 4. Security evidence and residual risk
 
 `SECURITY.md` must report both audit views without claiming that the repository
-is vulnerability-free:
+is vulnerability-free. Before the compatible development-only refresh, the
+full workspace has two additional leaf advisories in `brace-expansion@1.1.16`
+and `js-yaml@4.3.0`; both must be updated within their parents' accepted ranges.
+After that refresh, the expected residual views are:
 
-- full workspace: 16 propagated records at the start of the change;
-- production-only: 14 propagated records at the start of the change;
+- full workspace: 13 propagated records, six high and seven moderate;
+- production-only: 13 propagated records, six high and seven moderate;
 - two underlying unresolved leaf advisories.
 
 After removing the unused Raydium SDK and regenerating the lockfile, the exact
@@ -104,7 +111,9 @@ It will verify:
 - exact Pump, PumpSwap, SPL Token, Web3.js, `bn.js`, `parse5`, and `tldts`
   versions;
 - every locked `bn.js` v5 copy contains the infinite-loop fix;
-- required Pump and PumpSwap bridge exports load as the expected runtime types.
+- required Pump and PumpSwap bridge exports load as the expected runtime types;
+- root, frontend, lockfile, and CI agree on Node `>=22.13.0`/`22.13.0`;
+- no locked vulnerable `brace-expansion` v1 or `js-yaml` v4 release remains.
 
 Existing Raydium CPMM tests remain mandatory. Generated Pump.fun and PumpSwap
 IDL checks must remain byte-for-byte clean.
