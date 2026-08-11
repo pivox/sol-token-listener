@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url';
 import {
   MAX_RETENTION_PURGE_INTERVAL_MS,
   MIN_RETENTION_PURGE_INTERVAL_MS,
+  retentionSignalAborted,
   runRetention,
   type RetentionRunnerDependencies,
 } from '../src/operations/retention-runner.js';
@@ -10,6 +11,12 @@ import { closeDatabase, purgeExpiredFoundationData } from '../src/storage/databa
 import { logger } from '../src/utils/logger.js';
 
 export const DEFAULT_RETENTION_PURGE_INTERVAL_MS = 900_000;
+
+// Native EventTarget methods bypass attacker-controlled own shadow properties.
+// eslint-disable-next-line @typescript-eslint/unbound-method
+const nativeAddEventListener = EventTarget.prototype.addEventListener;
+// eslint-disable-next-line @typescript-eslint/unbound-method
+const nativeRemoveEventListener = EventTarget.prototype.removeEventListener;
 
 export interface RetentionCliOptions {
   readonly argv: readonly string[];
@@ -73,19 +80,36 @@ function writeResult(write: (line: string) => void, code: string): void {
   write(`${JSON.stringify({ event: 'retention.command', code })}\n`);
 }
 
-function wait(intervalMs: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
+interface RetentionTimerDependencies {
+  readonly setTimeout: (callback: () => void, intervalMs: number) => unknown;
+  readonly clearTimeout: (timer: unknown) => void;
+}
+
+const productionTimers: RetentionTimerDependencies = {
+  setTimeout: (callback, intervalMs) => setTimeout(callback, intervalMs),
+  clearTimeout: (timer) => { clearTimeout(timer as ReturnType<typeof setTimeout>); },
+};
+
+export function waitForRetentionInterval(
+  intervalMs: number,
+  signal: AbortSignal,
+  timers: RetentionTimerDependencies = productionTimers,
+): Promise<void> {
+  if (retentionSignalAborted(signal)) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(finish, intervalMs);
-    const abort = (): void => {
-      clearTimeout(timer);
-      finish();
-    };
+    let settled = false;
+    let listenerRegistered = false;
     function finish(): void {
-      signal.removeEventListener('abort', abort);
+      if (settled) return;
+      settled = true;
+      timers.clearTimeout(timer);
+      if (listenerRegistered) nativeRemoveEventListener.call(signal, 'abort', finish);
       resolve();
     }
-    signal.addEventListener('abort', abort, { once: true });
+    const timer = timers.setTimeout(finish, intervalMs);
+    nativeAddEventListener.call(signal, 'abort', finish, { once: true });
+    listenerRegistered = true;
+    if (retentionSignalAborted(signal)) finish();
   });
 }
 
@@ -93,14 +117,14 @@ function productionDependencies(): RetentionRunnerDependencies {
   return {
     purge: async () => purgeExpiredFoundationData(),
     closeDatabase,
-    wait,
+    wait: waitForRetentionInterval,
     log: (entry): void => { logger.info(entry); },
   };
 }
 
 async function main(): Promise<void> {
   const controller = new AbortController();
-  const removeSignals = installSignalHandlers(controller);
+  const removeSignals = installRetentionSignalHandlers(controller);
   try {
     process.exitCode = await runRetentionCli({
       argv: process.argv.slice(2),
@@ -114,13 +138,21 @@ async function main(): Promise<void> {
   }
 }
 
-function installSignalHandlers(controller: AbortController): () => void {
+interface RetentionSignalTarget {
+  once(event: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  removeListener(event: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+}
+
+export function installRetentionSignalHandlers(
+  controller: AbortController,
+  target: RetentionSignalTarget = process,
+): () => void {
   const abort = (): void => { controller.abort(); };
-  process.once('SIGINT', abort);
-  process.once('SIGTERM', abort);
+  target.once('SIGINT', abort);
+  target.once('SIGTERM', abort);
   return () => {
-    process.removeListener('SIGINT', abort);
-    process.removeListener('SIGTERM', abort);
+    target.removeListener('SIGINT', abort);
+    target.removeListener('SIGTERM', abort);
   };
 }
 

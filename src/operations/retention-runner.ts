@@ -38,12 +38,8 @@ export async function runRetention(
       const counters = safeCounters(await dependencies.purge());
       dependencies.log(Object.freeze({ event: 'retention.purged', counters }));
       if (settings.once) break;
-      try {
-        await dependencies.wait(settings.intervalMs, settings.signal);
-      } catch (error) {
-        if (!settings.signal.aborted) throw error;
-      }
-    } while (!settings.signal.aborted);
+      await dependencies.wait(settings.intervalMs, settings.signal);
+    } while (!retentionSignalAborted(settings.signal));
   } catch (error) {
     primaryFailure = error;
     primaryFailed = true;
@@ -143,15 +139,27 @@ function safeCounters(value: unknown): RetentionCounters {
 }
 
 function isNativeAbortSignal(value: unknown): value is AbortSignal {
-  if (typeof value !== 'object' || value === null || isProxy(value) || abortSignalAborted === undefined) {
-    return false;
-  }
   try {
-    void abortSignalAborted.call(value);
+    retentionSignalAborted(value as AbortSignal);
     return true;
   } catch {
     return false;
   }
+}
+
+export function retentionSignalAborted(signal: AbortSignal): boolean {
+  if (
+    typeof signal !== 'object'
+    || isProxy(signal)
+    || abortSignalAborted === undefined
+  ) throw new TypeError('Retention abort signal is invalid.');
+  try {
+    const aborted: unknown = abortSignalAborted.call(signal);
+    if (typeof aborted === 'boolean') return aborted;
+  } catch {
+    // The fixed error below does not retain an attacker-controlled failure.
+  }
+  throw new TypeError('Retention abort signal is invalid.');
 }
 
 function readDescriptors(

@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import {
   runRetention,
 } from '../src/operations/retention-runner.js';
-import { runRetentionCli } from '../scripts/purge-retained-data.js';
+import {
+  installRetentionSignalHandlers,
+  runRetentionCli,
+  waitForRetentionInterval,
+} from '../scripts/purge-retained-data.js';
 
 void test('purges immediately once, logs safe counters, then closes the database once', async () => {
   const events: unknown[] = [];
@@ -47,6 +52,106 @@ void test('runs sequentially and stops cleanly when the real abort signal interr
   });
 
   assert.deepEqual(calls, ['purge', 'log', 'wait:60000', 'close']);
+});
+
+void test('uses branded cancellation state when a genuine signal shadows aborted', async () => {
+  for (const shadow of [
+    { get: () => { throw new Error('shadowed aborted getter'); } },
+    { value: false },
+  ]) {
+    const controller = new AbortController();
+    Object.defineProperty(controller.signal, 'aborted', { configurable: true, ...shadow });
+    let purges = 0;
+    let closes = 0;
+    await runRetention(options({ once: false, signal: controller.signal }), {
+      purge: async () => {
+        purges += 1;
+        if (purges > 1) throw new Error('purged after abort');
+        return { tokenLaunches: 1 };
+      },
+      closeDatabase: async () => { closes += 1; },
+      wait: async () => { controller.abort(); },
+      log: () => undefined,
+    });
+    assert.equal(purges, 1);
+    assert.equal(closes, 1);
+  }
+});
+
+void test('keeps repeated purges gated behind each completed wait without overlap', async () => {
+  const controller = new AbortController();
+  const waitGates: (() => void)[] = [];
+  let purges = 0;
+  let closes = 0;
+  const running = runRetention(options({ once: false, signal: controller.signal }), {
+    purge: async () => { purges += 1; return { tokenLaunches: purges }; },
+    closeDatabase: async () => { closes += 1; },
+    wait: async () => new Promise<void>((resolve) => { waitGates.push(resolve); }),
+    log: () => undefined,
+  });
+
+  await nextTurn();
+  assert.equal(purges, 1);
+  assert.equal(waitGates.length, 1);
+  waitGates[0]?.();
+  await nextTurn();
+  assert.equal(purges, 2);
+  assert.equal(waitGates.length, 2);
+  controller.abort();
+  waitGates[1]?.();
+  await running;
+  assert.equal(purges, 2);
+  assert.equal(closes, 1);
+});
+
+void test('preserves a purge failure when that purge concurrently aborts the signal', async () => {
+  const controller = new AbortController();
+  const primary = new Error('purge failed');
+  let closes = 0;
+  await assert.rejects(runRetention(options({ once: false, signal: controller.signal }), {
+    purge: async () => { controller.abort(); throw primary; },
+    closeDatabase: async () => { closes += 1; },
+    wait: async () => undefined,
+    log: () => undefined,
+  }), primary);
+  assert.equal(closes, 1);
+});
+
+void test('production wait bypasses shadow methods and cleans its timer and native listener', async () => {
+  const controller = new AbortController();
+  Object.defineProperties(controller.signal, {
+    aborted: { configurable: true, get: () => { throw new Error('shadow getter'); } },
+    addEventListener: { configurable: true, value: () => { throw new Error('shadow add'); } },
+    removeEventListener: { configurable: true, value: () => { throw new Error('shadow remove'); } },
+  });
+  const handle = Object.freeze({ timer: 1 });
+  const cleared: unknown[] = [];
+  let duration: number | undefined;
+  let callback: (() => void) | undefined;
+  const waiting = waitForRetentionInterval(60_000, controller.signal, {
+    setTimeout: (next, intervalMs) => { callback = next; duration = intervalMs; return handle; },
+    clearTimeout: (timer) => { cleared.push(timer); },
+  });
+  assert.equal(duration, 60_000);
+  assert.equal(typeof callback, 'function');
+  controller.abort();
+  await waiting;
+  assert.deepEqual(cleared, [handle]);
+  EventTarget.prototype.dispatchEvent.call(controller.signal, new Event('abort'));
+  assert.deepEqual(cleared, [handle]);
+});
+
+void test('production signal handlers abort once and remove both process listeners', () => {
+  const signals = new EventEmitter();
+  const controller = new AbortController();
+  const remove = installRetentionSignalHandlers(controller, signals);
+  assert.equal(signals.listenerCount('SIGINT'), 1);
+  assert.equal(signals.listenerCount('SIGTERM'), 1);
+  signals.emit('SIGTERM');
+  assert.equal(controller.signal.aborted, true);
+  remove();
+  assert.equal(signals.listenerCount('SIGINT'), 0);
+  assert.equal(signals.listenerCount('SIGTERM'), 0);
 });
 
 void test('rejects unsafe aggregate data without invoking a getter or logging raw values', async () => {
@@ -269,4 +374,8 @@ function dependenciesFor(result: unknown): {
     wait: async () => undefined,
     log: () => undefined,
   };
+}
+
+async function nextTurn(): Promise<void> {
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
 }
