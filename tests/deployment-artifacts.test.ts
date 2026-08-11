@@ -130,6 +130,9 @@ void test('Nginx serves the SPA with bounded caching and proxies only the read-o
 
   assert.match(nginx, /listen\s+8080;/);
   assert.match(nginx, /autoindex\s+off;/);
+  assert.match(nginx, /resolver\s+127\.0\.0\.11\s+ipv6=off\s+valid=1s;/);
+  assert.match(nginx, /resolver_timeout\s+5s;/);
+  assert.match(nginx, /set\s+\$app_upstream\s+app:3000;/);
   assert.match(
     nginx,
     /location\s+=\s+\/config\.json\s*\{[^}]*Cache-Control\s+"no-store"[^}]*try_files\s+\$uri\s+=404;/s,
@@ -147,7 +150,9 @@ void test('Nginx serves the SPA with bounded caching and proxies only the read-o
   assert.match(nginx, /location\s+=\s+\/api\/v1\/events\s*\{/);
   assert.match(nginx, /location\s+\^~\s+\/api\/v1\/\s*\{/);
   assert.match(nginx, /location\s+=\s+\/api\/v1\s*\{/);
-  assert.equal((nginx.match(/proxy_pass\s+http:\/\/app:3000;/g) ?? []).length, 3);
+  assert.equal((nginx.match(/proxy_pass\s+http:\/\/\$app_upstream\$request_uri;/g) ?? []).length, 3);
+  assert.doesNotMatch(nginx, /proxy_pass\s+http:\/\/app:3000/);
+  assert.equal((nginx.match(/proxy_set_header\s+Host\s+\$host;/g) ?? []).length, 3);
   assert.equal((nginx.match(/limit_except\s+GET\s+OPTIONS/g) ?? []).length, 3);
   assert.match(
     nginx,
