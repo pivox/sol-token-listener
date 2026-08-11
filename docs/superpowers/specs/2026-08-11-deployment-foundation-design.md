@@ -92,7 +92,7 @@ TLS terminates at an external ingress or reverse proxy in production.
 
 ### 5.1 Backend target
 
-The backend uses a multi-stage Node 22.13 build:
+The backend uses a multi-stage Node 22.22.0 build:
 
 1. install the exact lockfile with `npm ci`;
 2. compile backend and frontend artifacts;

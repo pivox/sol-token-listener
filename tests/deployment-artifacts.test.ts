@@ -402,3 +402,63 @@ void test('deployment error summaries categorize aggregate causes without raw me
   assert.match(smoke, /redact\(summary\)/);
   assert.doesNotMatch(smoke, /process\.stderr\.write\([^)]*error\.(?:message|stack)/s);
 });
+
+void test('deployment runbook documents the safe production lifecycle and safety boundary', async () => {
+  const runbook = await readArtifact('docs/operations/deployment.md');
+
+  for (const heading of [
+    '## Prérequis',
+    '## Images immuables',
+    '## Secrets externes',
+    '## Migration et verrou consultatif',
+    '## Démarrage',
+    '## Arrêt normal',
+    '## Santé et supervision',
+    '## Rétention et confidentialité',
+    '## Sauvegarde',
+    '## Répétition de restauration',
+    '## Rollback',
+    '## Proxy SSE et TLS externe',
+    '## Limite de réplica unique',
+    '## Arrêt incident',
+    '## Frontière no-live',
+  ]) {
+    assert.ok(runbook.includes(heading), `missing runbook section: ${heading}`);
+  }
+
+  assert.match(runbook, /docker compose --env-file \/etc\/sol-token-listener\/deploy\.env -f deploy\/compose\.yaml/);
+  assert.match(runbook, /deploy\/env\.example[^\n]*jamais[^\n]*secret[^\n]*production/i);
+  assert.match(runbook, /pg_advisory_lock/);
+  assert.match(runbook, /exec -T app node dist\/scripts\/deployment-healthcheck\.js/);
+  assert.match(runbook, /4 heures/);
+  assert.match(runbook, /15 minutes/);
+  assert.match(runbook, /DEGRADED[\s\S]{0,120}smoke[\s\S]{0,120}listener[\s\S]{0,120}désactivé/i);
+  assert.match(runbook, /production[^\n]*OK/i);
+  assert.match(runbook, /down --volumes[\s\S]{0,120}destructif[\s\S]{0,120}jamais[\s\S]{0,120}arrêt normal/i);
+  assert.match(runbook, /sans inverser[^\n]*migration/i);
+  assert.match(runbook, /restauration[^\n]*répétée/i);
+  assert.match(runbook, /EXÉCUTION_MODE=observe|EXECUTION_MODE=observe/);
+  assert.match(runbook, /observe|paper/i);
+  assert.match(runbook, /aucun[^\n]*(?:wallet|clé privée|ordre réel|transaction live)/i);
+});
+
+void test('operator documentation links the deployment runbook and smoke command', async () => {
+  const readme = await readArtifact('README.md');
+  const overview = await readArtifact('docs/system-overview.html');
+
+  assert.match(readme, /\[Guide de déploiement\]\(docs\/operations\/deployment\.md\)/);
+  assert.match(readme, /npm run deployment:smoke/);
+  assert.match(readme, /réplica unique|single replica/i);
+  assert.match(readme, /observe\/paper|observe et paper/i);
+  assert.match(readme, /4\s+heures/);
+  assert.match(readme, /TLS externe/i);
+  assert.match(readme, /sauvegarde externe/i);
+  assert.match(readme, /aucune promesse[^\n]*(?:première position|sellabilité|profit)/i);
+
+  assert.match(overview, /href="operations\/deployment\.md"/);
+  assert.match(overview, /npm run deployment:smoke/);
+  assert.match(overview, /réplica unique|single replica/i);
+  assert.match(overview, /TLS externe/i);
+  assert.match(overview, /sauvegarde externe/i);
+  assert.match(overview, /aucune promesse[^<]*(?:première position|sellabilité|profit)/i);
+});
