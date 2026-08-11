@@ -26,7 +26,7 @@ void test('holds the fixed session advisory lock across history reads and migrat
     assert.deepEqual(database.lockValues, [[migrationLockId]]);
     assert.deepEqual(database.unlockValues, [[migrationLockId]]);
     assert.deepEqual(database.lockQueries, ['SELECT pg_advisory_lock($1)']);
-    assert.deepEqual(database.unlockQueries, ['SELECT pg_advisory_unlock($1) AS unlocked']);
+    assert.deepEqual(database.unlockQueries, ['SELECT pg_advisory_unlock($1)']);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -52,7 +52,9 @@ void test('unlocks and releases the session after a migration application fails'
 
 void test('rejects a false advisory unlock result and still releases the session', async () => {
   const directory = await emptyMigrationDirectory();
-  const database = new RecordingPool({ unlockResult: { rows: [{ unlocked: false }] } });
+  const database = new RecordingPool({
+    unlockResult: { rows: [{ pg_advisory_unlock: false }] },
+  });
   try {
     await assert.rejects(
       migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
@@ -72,6 +74,29 @@ void test('rejects a malformed advisory unlock result and still releases the ses
       migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
       /Migration advisory lock was not released/u,
     );
+    assert.deepEqual(database.events, ['lock', 'history-table', 'unlock', 'release']);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('rejects an advisory unlock getter without invoking it and still releases the session', async () => {
+  const directory = await emptyMigrationDirectory();
+  let getterInvoked = false;
+  const unlockRow = Object.defineProperty({}, 'pg_advisory_unlock', {
+    enumerable: true,
+    get: () => {
+      getterInvoked = true;
+      return true;
+    },
+  });
+  const database = new RecordingPool({ unlockResult: { rows: [unlockRow] } });
+  try {
+    await assert.rejects(
+      migrateDatabase({ pool: database.pool, migrationsDirectory: directory }),
+      /Migration advisory lock was not released/u,
+    );
+    assert.equal(getterInvoked, false);
     assert.deepEqual(database.events, ['lock', 'history-table', 'unlock', 'release']);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -193,7 +218,7 @@ class RecordingPool {
       this.unlockQueries.push(text);
       this.unlockValues.push(values ?? []);
       if (this.options.unlockFailure !== undefined) throw this.options.unlockFailure;
-      return this.options.unlockResult ?? { rows: [{ unlocked: true }] };
+      return this.options.unlockResult ?? { rows: [{ pg_advisory_unlock: true }] };
     }
     if (text.includes('CREATE TABLE IF NOT EXISTS migration_history')) {
       this.events.push('history-table');

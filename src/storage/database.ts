@@ -71,11 +71,11 @@ export async function migrateDatabase(options: {
   let unlockFailure: unknown;
   let unlockFailed = false;
   try {
-    const unlock = await client.query<{ readonly unlocked: boolean }>(
-      'SELECT pg_advisory_unlock($1) AS unlocked',
+    const unlock = await client.query<Record<string, unknown>>(
+      'SELECT pg_advisory_unlock($1)',
       [migrationAdvisoryLockId],
     );
-    if (unlock.rows.length !== 1 || unlock.rows[0]?.unlocked !== true) {
+    if (!releasedMigrationAdvisoryLock(unlock.rows)) {
       throw new Error('Migration advisory lock was not released.');
     }
   } catch (error) {
@@ -102,6 +102,14 @@ export async function migrateDatabase(options: {
     throw new AggregateError(failures, 'Database migration and cleanup failed.');
   }
   return applied;
+}
+
+function releasedMigrationAdvisoryLock(rows: unknown): boolean {
+  if (!Array.isArray(rows) || rows.length !== 1) return false;
+  const row: unknown = (rows as readonly unknown[])[0];
+  if (typeof row !== 'object' || row === null) return false;
+  const result = Object.getOwnPropertyDescriptor(row, 'pg_advisory_unlock');
+  return result !== undefined && 'value' in result && result.value === true;
 }
 
 export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool()): Promise<{
