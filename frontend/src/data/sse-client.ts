@@ -110,6 +110,10 @@ export function createSseClient(options: SseClientOptions): SseClient {
         await resynchronize();
         return;
       }
+      if (response.status === 400 && cursor !== null) {
+        await resynchronize();
+        return;
+      }
       if (response.status === 400 || response.status === 406) {
         publish({ state: 'DISCONNECTED', errorCode: `HTTP_${String(response.status)}` });
         return;

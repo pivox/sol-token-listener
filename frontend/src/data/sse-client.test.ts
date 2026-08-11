@@ -126,6 +126,34 @@ describe('resumable SSE lifecycle', () => {
     client.stop();
   });
 
+  it('recovers from a rejected persisted cursor but keeps cursor-free 400 terminal', async () => {
+    const store = cursorStore('corrupt');
+    const resync = vi.fn(async () => undefined);
+    const fetchFn = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(streamResponse('{}', 400))
+      .mockResolvedValueOnce(streamResponse(''));
+    const client = createSseClient({
+      apiBaseUrl: 'https://api.example', cursorStore: store, fetchFn, resync,
+      acceptEvent: async () => undefined, schedule: () => 1, cancel: () => undefined,
+      minimumResyncMs: 0,
+    });
+    await client.start();
+    await vi.waitFor(() => { expect(fetchFn).toHaveBeenCalledTimes(2); });
+    expect(store.cleared).toBe(1);
+    expect(fetchFn.mock.calls[1]?.[1]?.headers).toEqual({ Accept: 'text/event-stream' });
+    client.stop();
+
+    const terminal = createSseClient({
+      apiBaseUrl: 'https://api.example', cursorStore: cursorStore(),
+      fetchFn: vi.fn<typeof fetch>().mockResolvedValue(streamResponse('{}', 400)),
+      acceptEvent: async () => undefined, resync: async () => undefined,
+      schedule: () => 1, cancel: () => undefined,
+    });
+    await terminal.start();
+    expect(terminal.getSnapshot()).toMatchObject({ state: 'DISCONNECTED', errorCode: 'HTTP_400' });
+    terminal.stop();
+  });
+
   it('handles a post-header cursor-expiry terminal frame', async () => {
     const store = cursorStore('expired');
     const resync = vi.fn(async () => undefined);
