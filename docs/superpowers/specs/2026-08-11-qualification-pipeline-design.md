@@ -149,6 +149,13 @@ Le repository charge exclusivement des lignes persistées dont la preuve source
 n'est pas `orphaned`. Il ne réalise aucun appel RPC ou HTTP et ne lit aucun état
 en mémoire. Les faits absents restent `UNKNOWN`.
 
+Les preuves sociales sont reconstruites depuis la collection active et ses
+tables normalisées (`social_evidence_collections`, `social_links`, observations
+HTTP et preuves de vérification), toutes reliées à des événements actifs. Les
+métadonnées proviennent du `metadata_snapshot_id` de cette collection lorsqu'il
+existe ; une lecture « dernier snapshot par date » indépendante est interdite,
+car elle pourrait réintroduire un snapshot issu d'un lancement orphaned.
+
 Dans cette étape synchrone, `buyQuote` et `reverseSellQuote` valent
 `undefined`. Les conditions liées aux quotes restent donc inconnues ; elles ne
 sont ni transformées en échec ni présentées comme une preuve de sellabilité.
@@ -177,7 +184,10 @@ Le rapport conserve l'identité existante fondée sur :
 
 `QualificationUpdated` utilise la source métier stable `qualification`, la
 provenance Solana de l'événement `asOf`, le `reportId` comme qualifier et le
-payload version `1` existant.
+payload version `1` existant. Son payload ajoute l'entrée d'évaluation canonique
+(`signals`, blockers amont et faits calibrés) utilisée pour produire le rapport.
+Cette entrée bigint-safe est validée, bornée et immuable ; elle ne contient ni
+contenu social brut ni donnée RPC.
 
 Une répétition exacte retrouve les mêmes `reportId` et `eventId`. Les clauses
 uniques et `ON CONFLICT DO NOTHING` empêchent une deuxième ligne, un deuxième
@@ -191,6 +201,16 @@ le `reportId` canonique fourni existe, reste courant, actif et cohérent avec le
 mint, le profil et l'événement transmis, puis persiste candidat et décision
 paper. Cette autorité unique interdit deux `eventId` ou deux révisions SSE pour
 un même rapport.
+
+Le moteur conserve sa protection d'autorité par identité d'objet. Après une
+reprise, le worker ne fait donc pas confiance à un objet JSON désérialisé : il
+rejoue l'entrée d'évaluation persistée avec le même profil effectif et le même
+sujet `(mint, qualificationEventId)`, compare strictement le rapport recalculé,
+le `reportId`, l'empreinte des preuves et l'identité de l'événement aux valeurs
+stockées, puis utilise seulement le nouvel objet autorisé en mémoire. Une
+discordance échoue fermée avant toute écriture candidat ou paper. Cette
+réautorisation ne reconstruit pas les projections, ne modifie pas le rapport et
+ne publie aucun événement.
 
 ### 5.3 Concurrence et reorg
 
@@ -242,6 +262,11 @@ validées par `TradingCandidateService` et `PaperTradingEngine` avant toute
 
 Pour cette PR, le chemin `reconcileExisting` n'est pas transformé en moteur de
 révocation de candidat : ce comportement appartient à l'issue #16.
+Une nouvelle création de candidat exige le rapport canonique courant. La reprise
+ou réconciliation d'un candidat déjà persisté peut relire son rapport historique
+supersédé, mais uniquement par lignée exacte candidat/rapport/événement et après
+la même réautorisation déterministe et structurelle ; elle ne peut jamais
+utiliser ce rapport historique pour ouvrir une nouvelle position.
 
 En revanche, l'existence d'une session paper n'empêche jamais la nouvelle étape
 du pipeline de publier la qualification canonique courante. L'API risque et la
@@ -313,6 +338,8 @@ les adresses RPC ou les erreurs brutes.
 - ordre lexical, union/déduplication des mints et nouveau compteur pipeline ;
 - attribution exacte d'un échec à `qualification` et arrêt avant enqueue ;
 - sécurité des objets hostiles, tableaux bornés et absence de `any`.
+- réautorisation après désérialisation exacte et rejet de toute altération du
+  rapport, de l'évaluation, du profil, du sujet ou des empreintes ;
 
 ### 10.2 Intégration repository
 
@@ -338,6 +365,8 @@ les adresses RPC ou les erreurs brutes.
 - santé nominale et dégradation isolée des métriques qualification ;
 - API risque, timeline et SSE lisent la nouvelle projection autonome ;
 - garde d'import confirmant l'absence de wallet, signature ou soumission.
+- frontend opérateur aligné sur les nouveaux champs de santé, avec schéma,
+  fixtures et tests E2E mis à jour.
 
 Commandes d'acceptation :
 
