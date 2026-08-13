@@ -119,7 +119,7 @@ void test('restarts the production PostgreSQL path at every observation boundary
         launches: '1', trades: '3', fundingAssessments: '2', creatorProfiles: '1',
         participantSnapshots: '1', walletGraphProfiles: '1', walletGraphSnapshots: '1',
         migrations: '1', marketPools: '1', reserveSnapshots: '1', qualificationReports: '1',
-        paperDecisionJobs: '1', paperPositions: '0',
+        paperDecisionJobs: '1', paperPositions: '0', paperTrades: '0',
       }, boundary);
       const processedInbox = await inboxRow(pool, transaction.signature);
       assert.deepEqual({
@@ -143,6 +143,7 @@ void test('restarts the production PostgreSQL path at every observation boundary
 
       await assertPaperSafety(pool);
       assert.equal((await productionCounts(pool)).paperPositions, '0', boundary);
+      assert.equal((await productionCounts(pool)).paperTrades, '0', boundary);
     }
   });
 });
@@ -658,6 +659,7 @@ async function productionCounts(pool: InstanceType<typeof pg.Pool>) {
     participant_snapshots: string; wallet_graph_profiles: string; wallet_graph_snapshots: string;
     migrations: string; market_pools: string; reserve_snapshots: string;
     qualification_reports: string; paper_decision_jobs: string; paper_positions: string;
+    paper_trades: string;
   }>(`SELECT
     (SELECT COUNT(*) FROM token_launches)::text AS launches,
     (SELECT COUNT(*) FROM launch_trades)::text AS trades,
@@ -671,7 +673,8 @@ async function productionCounts(pool: InstanceType<typeof pg.Pool>) {
     (SELECT COUNT(*) FROM market_reserve_snapshots)::text AS reserve_snapshots,
     (SELECT COUNT(*) FROM qualification_reports)::text AS qualification_reports,
     (SELECT COUNT(*) FROM paper_decision_jobs)::text AS paper_decision_jobs,
-    (SELECT COUNT(*) FROM paper_positions)::text AS paper_positions`);
+    (SELECT COUNT(*) FROM paper_positions)::text AS paper_positions,
+    (SELECT COUNT(*) FROM paper_trades)::text AS paper_trades`);
   const row = result.rows[0];
   if (row === undefined) throw new Error('Production counts missing');
   return Object.freeze({
@@ -681,6 +684,7 @@ async function productionCounts(pool: InstanceType<typeof pg.Pool>) {
     migrations: row.migrations, marketPools: row.market_pools,
     reserveSnapshots: row.reserve_snapshots, qualificationReports: row.qualification_reports,
     paperDecisionJobs: row.paper_decision_jobs, paperPositions: row.paper_positions,
+    paperTrades: row.paper_trades,
   });
 }
 
@@ -728,8 +732,7 @@ function expectedCountsBefore(boundary: Boundary | null) {
     marketPools: completed >= 4 ? '1' : '0',
     reserveSnapshots: completed >= 4 ? '1' : '0',
     qualificationReports: completed >= 5 ? '1' : '0',
-    paperDecisionJobs: '0',
-    paperPositions: '0',
+    paperDecisionJobs: '0', paperPositions: '0', paperTrades: '0',
   });
 }
 

@@ -34,7 +34,8 @@ import {
 void test('persists explainable observe decisions without requesting quotes or paper actions', async () => {
   const repository = new FakeRepository([claim()]);
   const quotes = new FakeQuotes();
-  const services = fakeServices('NOT_ELIGIBLE');
+  const paperActions: string[] = [];
+  const services = fakeServices('NOT_ELIGIBLE', paperActions);
   const worker = new PaperDecisionWorker(
     repository,quotes,services.qualification,services.candidates,services.strategy,
     options({ executionMode:'observe',paperStrategyEnabled:false }),new ManualScheduler(),
@@ -42,6 +43,8 @@ void test('persists explainable observe decisions without requesting quotes or p
 
   assert.deepEqual(await worker.runOnce(), { kind:'completed',jobId:'paper-job' });
   assert.equal(quotes.calls, 0);
+  assert.equal(services.candidates.calls.length, 1);
+  assert.deepEqual(paperActions, []);
   assert.equal(repository.stages.length, 0);
   assert.equal(repository.completions.length, 1);
   assert.equal(repository.completions[0]?.result.session, null);

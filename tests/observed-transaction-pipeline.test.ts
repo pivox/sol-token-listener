@@ -569,12 +569,23 @@ void test('keeps orphan impact on replay after tracked and active rows have alre
   assert.equal(h.order.at(-1), 'qualification:RetractedMint');
 });
 
-void test('reports migration and pool activation while running PumpSwap last', async () => {
-  const h = harness({ marketMigrationCount: 1, marketActivationCount: 1 });
+void test('runs migration activation through PumpSwap then qualification and paper enqueue', async () => {
+  const h = harness({
+    marketMigrationCount: 1,
+    marketActivationCount: 1,
+    marketAffectedMints: ['MigratedMint'],
+    paperDecisions: true,
+  });
   const result = await h.pipeline.process(h.tx);
-  assert.equal(h.order.at(-1), 'pumpswap');
+  assert.deepEqual(h.order.slice(-3), [
+    'pumpswap',
+    'qualification:MigratedMint',
+    `paper:MigratedMint:${SIGNATURE}:confirmed`,
+  ]);
   assert.equal(result.marketMigrationCount, 1);
   assert.equal(result.marketActivationCount, 1);
+  assert.equal(result.qualificationRebuildCount, 1);
+  assert.equal(result.paperDecisionEnqueueCount, 1);
 });
 
 void test('cuts off after each failed stage and identifies the exact stable stage and mint', async () => {
