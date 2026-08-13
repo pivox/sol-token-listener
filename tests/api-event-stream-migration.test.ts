@@ -262,6 +262,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '012_public_social_evidence.sql',
       '013_paper_e2e.sql',
       '014_social_persistence_retry.sql',
+      '015_paper_active_session_per_mint.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(
