@@ -244,8 +244,9 @@ export const health = {
   postgresql: { status: 'AVAILABLE' },
   http: { status: 'AVAILABLE' },
   pipeline: {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'DEGRADED', social: 'RUNNING',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'DEGRADED', qualification: 'RUNNING', social: 'RUNNING',
   },
+  qualification: { currentCount: 2, lastSuccessAt: null },
   socialJobs: { pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0 },
   paperDecisionJobs: {
     pendingCount: 1, leasedCount: 0, retryableFailedCount: 1, exhaustedCount: 0,

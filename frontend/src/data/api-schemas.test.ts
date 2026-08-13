@@ -80,6 +80,38 @@ describe('frontend-owned API V1 schemas', () => {
     expect(() => apiSseEventSchema.parse({ ...sseEvent, confirmationStatus: 'trusted' })).toThrow();
   });
 
+  it('requires bounded qualification health details', () => {
+    const qualification = { currentCount: 3, lastSuccessAt: '2026-08-11T00:00:00.000Z' };
+    const pipelineWithoutQualification: Record<string, unknown> = { ...health.pipeline };
+    const healthWithoutQualification: Record<string, unknown> = { ...health };
+    delete pipelineWithoutQualification.qualification;
+    delete healthWithoutQualification.qualification;
+    expect(apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      pipeline: { ...health.pipeline, qualification: 'RUNNING' },
+      qualification,
+    })).data.qualification.currentCount).toBe(3);
+    expect(() => apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      pipeline: pipelineWithoutQualification,
+      qualification,
+    }))).toThrow();
+    expect(() => apiHealthEnvelopeSchema.parse(success({
+      ...healthWithoutQualification,
+      pipeline: { ...health.pipeline, qualification: 'RUNNING' },
+    }))).toThrow();
+    expect(() => apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      pipeline: { ...health.pipeline, qualification: 'RUNNING' },
+      qualification: { currentCount: -1, lastSuccessAt: '2026-08-11T00:00:00.000Z' },
+    }))).toThrow();
+    expect(() => apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      pipeline: { ...health.pipeline, qualification: 'RUNNING' },
+      qualification: { currentCount: 3, lastSuccessAt: 'not-a-timestamp' },
+    }))).toThrow();
+  });
+
   it('accepts stable public failures and rejects leaked fields', () => {
     expect(apiFailureSchema.parse({
       apiVersion: 'v1', error: { code: 'INVALID_CURSOR', message: 'The cursor is invalid' },
