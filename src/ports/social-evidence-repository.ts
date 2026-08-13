@@ -49,6 +49,10 @@ export interface SocialEvidenceRepository {
   ): Promise<void>;
   complete(job: ClaimedSocialJob): Promise<void>;
   release(job: ClaimedSocialJob, failure: SocialJobFailure): Promise<boolean>;
+  releaseAfterPersistFailure(
+    job: ClaimedSocialJob,
+    failure: SocialJobFailure,
+  ): Promise<boolean>;
   fail(
     job: ClaimedSocialJob,
     failure: SocialJobFailure,

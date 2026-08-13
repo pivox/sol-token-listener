@@ -52,7 +52,7 @@ void test('claims one durable job exclusively and renews only its active lease',
   });
 });
 
-void test('terminalizes an expired final-attempt lease instead of stranding it processing', async (context) => {
+void test('bounds fresh provider cycles after expired final-attempt leases', async (context) => {
   await withDatabase(context, async (pool) => {
     await new PostgresLaunchpadEventRepository(pool, 4, Date.now, {
       maxAttempts: 1, baseDelayMs: 500,
@@ -61,13 +61,23 @@ void test('terminalizes an expired final-attempt lease instead of stranding it p
     const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
     assert.ok(claimed);
 
-    assert.equal(await repository.claim({ leaseMs: 5_000, nowMs: NOW + 5_001 }), null);
+    const second=await repository.claim({ leaseMs:5_000,nowMs:NOW+5_001 });
+    assert.ok(second);
+    assert.equal(second.attempts,2);
+    assert.equal(second.attemptsInCycle,1);
+    const third=await repository.claim({ leaseMs:5_000,nowMs:NOW+10_002 });
+    assert.ok(third);
+    assert.equal(third.attempts,3);
+    assert.equal(third.attemptsInCycle,1);
+    assert.equal(await repository.claim({ leaseMs:5_000,nowMs:NOW+15_003 }),null);
     const row = await pool.query(`SELECT status,error_code,retry_exhausted_at,
+      persistence_retry_cycles,attempts,
       EXTRACT(EPOCH FROM (purge_after-terminal_at))::int retention_seconds
       FROM social_enrichment_jobs`);
     assert.deepEqual(row.rows[0], {
       status: 'CANCELLED', error_code: 'LEASE_EXPIRED',
-      retry_exhausted_at: new Date(NOW + 5_001), retention_seconds: 14_400,
+      retry_exhausted_at: new Date(NOW+15_003),persistence_retry_cycles:2,
+      attempts:3,retention_seconds:14_400,
     });
   });
 });
@@ -229,7 +239,7 @@ void test('releases an ambiguous committed persist and reclaims its durable evid
     assert.ok(providerJob);
     await repository.persist(providerJob,await successfulResult(providerJob.sourceLaunchEventId));
 
-    assert.equal(await repository.release(providerJob,Object.freeze({
+    assert.equal(await repository.releaseAfterPersistFailure(providerJob,Object.freeze({
       code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+10,
     })),true);
     assert.equal(await repository.claim({ leaseMs:5_000,nowMs:NOW+509 }),null);
@@ -238,7 +248,7 @@ void test('releases an ambiguous committed persist and reclaims its durable evid
     assert.equal(projectionJob.evidencePersisted,true);
     assert.equal(projectionJob.attemptsInCycle,1);
 
-    assert.equal(await repository.release(providerJob,Object.freeze({
+    assert.equal(await repository.releaseAfterPersistFailure(providerJob,Object.freeze({
       code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+511,
     })),false);
     const stored=await pool.query(`SELECT status,lease_token,
@@ -258,13 +268,62 @@ void test('releases a rolled-back persist outcome for a provider retry without e
     const first=await repository.claim({ leaseMs:5_000,nowMs:NOW });
     assert.ok(first);
 
-    assert.equal(await repository.release(first,Object.freeze({
+    assert.equal(await repository.releaseAfterPersistFailure(first,Object.freeze({
       code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+10,
     })),true);
     const retry=await repository.claim({ leaseMs:5_000,nowMs:NOW+510 });
     assert.ok(retry);
     assert.equal(retry.evidencePersisted,false);
-    assert.equal(retry.attemptsInCycle,2);
+    assert.equal(retry.attempts,2);
+    assert.equal(retry.attemptsInCycle,1);
+  });
+});
+
+void test('opens only two fresh provider cycles after last-attempt persistence rollbacks',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    await new PostgresLaunchpadEventRepository(pool,4,Date.now,{
+      maxAttempts:1,baseDelayMs:500,
+    }).record(launchBatch(MINT,'signature-social-persist-cycle','confirmed'));
+    const repository=new PostgresSocialEvidenceRepository(pool);
+    const releaser=repository as unknown as {
+      releaseAfterPersistFailure(
+        job:Parameters<PostgresSocialEvidenceRepository['persist']>[0],
+        failure:Parameters<PostgresSocialEvidenceRepository['fail']>[1],
+      ):Promise<boolean>;
+    };
+
+    const first=await repository.claim({ leaseMs:5_000,nowMs:NOW });
+    assert.ok(first);
+    assert.equal(await releaser.releaseAfterPersistFailure(first,Object.freeze({
+      code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+1,
+    })),true);
+    const second=await repository.claim({ leaseMs:5_000,nowMs:NOW+1 });
+    assert.ok(second);
+    assert.equal(second.evidencePersisted,false);
+    assert.equal(second.attempts,2);
+    assert.equal(second.attemptsInCycle,1);
+    assert.equal(await releaser.releaseAfterPersistFailure(second,Object.freeze({
+      code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+2,
+    })),true);
+
+    const third=await repository.claim({ leaseMs:5_000,nowMs:NOW+2 });
+    assert.ok(third);
+    assert.equal(third.evidencePersisted,false);
+    assert.equal(third.attempts,3);
+    assert.equal(third.attemptsInCycle,1);
+    assert.equal(await releaser.releaseAfterPersistFailure(third,Object.freeze({
+      code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+3,
+    })),true);
+    assert.equal(await repository.claim({ leaseMs:5_000,nowMs:NOW+3 }),null);
+
+    const stored=await pool.query(`SELECT status,attempts,attempts_in_cycle,
+      persistence_retry_cycles,error_code,retry_exhausted_at
+      FROM social_enrichment_jobs`);
+    assert.deepEqual(stored.rows,[{
+      status:'CANCELLED',attempts:3,attempts_in_cycle:1,
+      persistence_retry_cycles:2,error_code:'PROVIDER_UNAVAILABLE',
+      retry_exhausted_at:new Date(NOW+3),
+    }]);
   });
 });
 

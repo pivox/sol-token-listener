@@ -35,6 +35,8 @@ export class SocialJobLeaseLostError extends Error {
   }
 }
 
+const MAX_PERSISTENCE_RETRY_CYCLES=2;
+
 export class PostgresSocialEvidenceRepository implements SocialEvidenceRepository {
   public constructor(
     private readonly pool: Pool = getDatabasePool(),
@@ -57,6 +59,18 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
     const client = await this.connect('claim');
     try {
       await client.query('BEGIN');
+      await client.query(`UPDATE social_enrichment_jobs job SET
+        status='PENDING',attempts_in_cycle=0,persistence_retry_cycles=persistence_retry_cycles+1,
+        lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+        error_code='LEASE_EXPIRED',retry_exhausted_at=NULL,updated_at=$1
+        WHERE status='PROCESSING' AND lease_expires_at <= $1
+          AND attempts_in_cycle >= max_attempts
+          AND persistence_retry_cycles < ${MAX_PERSISTENCE_RETRY_CYCLES}
+          AND NOT EXISTS(SELECT 1 FROM social_evidence_collections collection
+            WHERE collection.mint=job.mint
+              AND collection.source_launch_event_id=job.source_launch_event_id)`,[
+        new Date(options.nowMs),
+      ]);
       await client.query(`UPDATE social_enrichment_jobs SET
         status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
         error_code='LEASE_EXPIRED',retry_exhausted_at=$1,terminal_at=$1,
@@ -245,6 +259,9 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
             AND collection.source_launch_event_id=job.source_launch_event_id) evidence_persisted
         FROM social_enrichment_jobs job
         WHERE job.job_id=$1 AND job.status='PROCESSING' AND job.lease_token=$2
+          AND EXISTS(SELECT 1 FROM social_evidence_collections collection
+            WHERE collection.mint=job.mint
+              AND collection.source_launch_event_id=job.source_launch_event_id)
         FOR UPDATE`,[job.id,job.leaseToken]);
       const row=selected.rows[0];
       if(row===undefined){
@@ -278,6 +295,68 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
     }catch(error:unknown){
       await rollback(client);
       if(error instanceof SocialJobLeaseLostError)throw error;
+      throw new SocialEvidenceRepositoryError('release');
+    }finally{release(client,'release');}
+  }
+
+  public async releaseAfterPersistFailure(
+    job:ClaimedSocialJob,
+    failure:SocialJobFailure,
+  ):Promise<boolean>{
+    assertClaimedJob(job);assertFailure(failure);
+    const client=await this.connect('release');
+    try{
+      await client.query('BEGIN');
+      const selected=await client.query(`SELECT attempts_in_cycle,max_attempts,base_delay_ms,
+        persistence_retry_cycles,
+        EXISTS(SELECT 1 FROM social_evidence_collections collection
+          WHERE collection.mint=job.mint
+            AND collection.source_launch_event_id=job.source_launch_event_id) evidence_persisted
+        FROM social_enrichment_jobs job
+        WHERE job.job_id=$1 AND job.status='PROCESSING' AND job.lease_token=$2
+        FOR UPDATE`,[job.id,job.leaseToken]);
+      const row=selected.rows[0];
+      if(row===undefined){
+        await client.query('COMMIT');
+        return false;
+      }
+      const evidencePersisted=booleanField(row,'evidence_persisted');
+      const attempts=integerField(row,'attempts_in_cycle');
+      const maximum=integerField(row,'max_attempts');
+      const persistenceCycles=integerField(row,'persistence_retry_cycles');
+      const now=new Date(failure.observedAtMs);
+      if(evidencePersisted&&failure.retryable&&attempts<maximum){
+        await exact(client,`UPDATE social_enrichment_jobs SET
+          status='RETRYABLE_FAILED',lease_token=NULL,lease_expires_at=NULL,
+          next_attempt_at=$3,error_code=$4,updated_at=$5
+          WHERE job_id=$1 AND lease_token=$2`,[
+          job.id,job.leaseToken,new Date(failure.observedAtMs+retryDelay(
+            integerField(row,'base_delay_ms'),Math.max(1,attempts),
+          )),failure.code,now,
+        ]);
+      }else if(!evidencePersisted&&failure.retryable
+        &&persistenceCycles<MAX_PERSISTENCE_RETRY_CYCLES){
+        await exact(client,`UPDATE social_enrichment_jobs SET
+          status='PENDING',attempts_in_cycle=0,
+          persistence_retry_cycles=persistence_retry_cycles+1,
+          lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+          error_code=$3,retry_exhausted_at=NULL,updated_at=$4
+          WHERE job_id=$1 AND lease_token=$2`,[
+          job.id,job.leaseToken,failure.code,now,
+        ]);
+      }else{
+        await exact(client,`UPDATE social_enrichment_jobs SET
+          status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+          error_code=$3,retry_exhausted_at=$4,terminal_at=$4,purge_after=$5,updated_at=$4
+          WHERE job_id=$1 AND lease_token=$2`,[
+          job.id,job.leaseToken,failure.code,now,
+          new Date(failure.observedAtMs+this.retentionHours*3_600_000),
+        ]);
+      }
+      await client.query('COMMIT');
+      return true;
+    }catch{
+      await rollback(client);
       throw new SocialEvidenceRepositoryError('release');
     }finally{release(client,'release');}
   }

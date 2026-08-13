@@ -298,7 +298,7 @@ export class SocialEnrichmentWorker {
     if(this.activeLease===lease)this.activeLease=null;
     if(!owned)return frozen({ kind:'lease-lost' as const,jobId:job.id });
     try{
-      const released=await this.repository.release(job,Object.freeze({
+      const released=await this.repository.releaseAfterPersistFailure(job,Object.freeze({
         code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:this.readNow(),
       }));
       if(!released)return frozen({ kind:'lease-lost' as const,jobId:job.id });

@@ -191,7 +191,7 @@ void test('stops renewal and reclaims durable resolved evidence after persist re
   persistResponse.reject(new Error('response lost after commit'));
 
   assert.deepEqual(await first,{ kind:'failed',jobId:'social-job-1' });
-  assert.equal(repository.releases,1);
+  assert.equal(repository.persistFailureReleases,1);
   assert.equal(scheduler.activeCount,0);
   assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
   assert.equal(metadataCalls,1);
@@ -227,12 +227,60 @@ void test('stops renewal and reclaims durable terminal evidence after persist re
   assert.deepEqual(await first,{ kind:'failed',jobId:'social-job-1' });
   assert.equal(repository.persisted[0]?.terminalFailure?.code,'HTTP_TRANSIENT');
   assert.equal(repository.persisted[0]?.result.collection.status,'FAILED');
-  assert.equal(repository.releases,1);
+  assert.equal(repository.persistFailureReleases,1);
   assert.equal(scheduler.activeCount,0);
   assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
   assert.equal(metadataCalls,1);
   assert.equal(repository.persisted.length,1);
   assert.equal(repository.renewals.length,1);
+  assert.equal(scheduler.activeCount,0);
+});
+
+void test('opens a bounded provider cycle after the last successful result persist rolls back',async()=>{
+  const scheduler=new ManualScheduler();
+  const repository=new ScriptedRepository([
+    claimedJob({ maxAttempts:1 }),
+    claimedJob({ attempts:2,attemptsInCycle:1,maxAttempts:1,leaseToken:'lease-2' }),
+  ]);
+  repository.persistResponse=Promise.reject(new Error('persist rolled back'));
+  let metadataCalls=0;
+  let socialCalls=0;
+  const worker=new SocialEnrichmentWorker(
+    repository,
+    { resolve:async()=>{metadataCalls+=1;return resolved();} },
+    { collect:async(input)=>{socialCalls+=1;return providerResult(input.metadataSnapshot);} },
+    new FakeProjection(repository.operations),options(),scheduler,
+  );
+
+  assert.deepEqual(await worker.runOnce(),{ kind:'failed',jobId:'social-job-1' });
+  assert.equal(repository.persistFailureReleases,1);
+  assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
+  assert.equal(metadataCalls,2);
+  assert.equal(socialCalls,2);
+  assert.equal(repository.persisted.length,2);
+  assert.equal(scheduler.activeCount,0);
+});
+
+void test('opens a bounded provider cycle after last terminal evidence persist rolls back',async()=>{
+  const scheduler=new ManualScheduler();
+  const repository=new ScriptedRepository([
+    claimedJob({ maxAttempts:1 }),
+    claimedJob({ attempts:2,attemptsInCycle:1,maxAttempts:1,leaseToken:'lease-2' }),
+  ]);
+  repository.persistResponse=Promise.reject(new Error('terminal evidence rolled back'));
+  let metadataCalls=0;
+  const worker=new SocialEnrichmentWorker(
+    repository,
+    { resolve:async()=>{metadataCalls+=1;return failed(true);} },
+    passthroughSocialProvider(),new FakeProjection(repository.operations),options(),scheduler,
+  );
+
+  assert.deepEqual(await worker.runOnce(),{ kind:'failed',jobId:'social-job-1' });
+  assert.equal(repository.persistFailureReleases,1);
+  assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
+  assert.equal(metadataCalls,2);
+  assert.equal(repository.persisted.length,2);
+  assert.equal(repository.persisted[1]?.result.collection.status,'FAILED');
   assert.equal(scheduler.activeCount,0);
 });
 
@@ -387,6 +435,7 @@ class ScriptedRepository implements SocialEvidenceRepository {
   readonly renewals: readonly unknown[] = [];
   public renewResult = true;
   public persistResponse:Promise<void>|null=null;
+  public persistFailureReleases=0;
   public releases = 0;
 
   public constructor(
@@ -424,6 +473,11 @@ class ScriptedRepository implements SocialEvidenceRepository {
   }
   public async release(): Promise<boolean> {
     this.operations.push('release');this.releases+=1;
+    return true;
+  }
+  public async releaseAfterPersistFailure():Promise<boolean>{
+    this.operations.push('release-persist');
+    this.persistFailureReleases+=1;
     return true;
   }
   public async fail(
