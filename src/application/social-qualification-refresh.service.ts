@@ -25,7 +25,7 @@ export class SocialQualificationRefreshService {
 
   public async refresh(mint:string):Promise<void>{
     const rebuilt=await this.qualification.rebuild(mint,'ERROR');
-    if(rebuilt.kind==='DISSOLVED'||rebuilt.projection===null){
+    if(rebuilt.kind==='DISSOLVED'){
       throw new TypeError('Social qualification refresh lost its canonical launch.');
     }
     const projection=rebuilt.projection;

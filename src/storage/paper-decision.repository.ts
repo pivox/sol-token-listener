@@ -1127,24 +1127,28 @@ async function loadQualificationByCandidate(
 }
 
 function snapshotQualificationProfile(
-  value: QualificationProfileIdentity,
+  value: unknown,
 ): QualificationProfileIdentity {
   if (
     typeof value !== 'object'
     || value === null
     || Array.isArray(value)
-    || typeof value.id !== 'string'
-    || value.id.length === 0
-    || Buffer.byteLength(value.id, 'utf8') > 256
-    || !Number.isSafeInteger(value.version)
-    || value.version <= 0
-    || typeof value.fingerprint !== 'string'
-    || !/^[0-9a-f]{64}$/u.test(value.fingerprint)
+  ) throw new TypeError('Effective qualification profile identity is invalid.');
+  const profile=value as Partial<QualificationProfileIdentity>;
+  if (
+    typeof profile.id !== 'string'
+    || profile.id.length === 0
+    || Buffer.byteLength(profile.id, 'utf8') > 256
+    || typeof profile.version !== 'number'
+    || !Number.isSafeInteger(profile.version)
+    || profile.version <= 0
+    || typeof profile.fingerprint !== 'string'
+    || !/^[0-9a-f]{64}$/u.test(profile.fingerprint)
   ) throw new TypeError('Effective qualification profile identity is invalid.');
   return Object.freeze({
-    id:value.id,
-    version:value.version,
-    fingerprint:value.fingerprint,
+    id:profile.id,
+    version:profile.version,
+    fingerprint:profile.fingerprint,
   });
 }
 
