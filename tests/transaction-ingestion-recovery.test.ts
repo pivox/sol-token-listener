@@ -7,6 +7,8 @@ import { LaunchParticipantAnalyticsService } from '../src/application/launch-par
 import { LaunchpadObservationService } from '../src/application/launchpad-observation.service.js';
 import { MarketObservationService } from '../src/application/market-observation.service.js';
 import { ObservedTransactionPipeline } from '../src/application/observed-transaction-pipeline.js';
+import { QualificationProjectionService } from '../src/application/qualification-projection.service.js';
+import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
 import { PersistentListenerHeartbeat } from '../src/application/production-listener-factory.js';
 import { PumpSwapObservationPipeline } from '../src/application/pumpswap-observation-pipeline.js';
 import { TransactionInboxWorker } from '../src/application/transaction-inbox-worker.js';
@@ -17,7 +19,11 @@ import type { OpenPaperPositionCommand, PaperExecutionQuote } from '../src/domai
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PumpFunLaunchpadAdapter } from '../src/launchpads/pumpfun/pumpfun-launchpad.adapter.js';
 import { decodePumpTransaction } from '../src/launchpads/pumpfun/transaction-decoder.js';
-import type { DecodedPumpMigration, DecodedPumpTransaction } from '../src/launchpads/pumpfun/types.js';
+import type {
+  DecodedPumpMigration,
+  DecodedPumpTrade,
+  DecodedPumpTransaction,
+} from '../src/launchpads/pumpfun/types.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { PumpSwapMarketAdapter } from '../src/markets/pumpswap/pumpswap-market.adapter.js';
 import type {
@@ -32,19 +38,23 @@ import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/data
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
 import { PostgresApiProjectionRepository } from '../src/storage/api-projection.repository.js';
 import { PostgresMarketObservationRepository } from '../src/storage/market-observation.repository.js';
+import { PostgresPaperDecisionRepository } from '../src/storage/paper-decision.repository.js';
 import { PostgresPaperTradingRepository } from '../src/storage/paper-trading.repository.js';
 import { PostgresParticipantAnalyticsRepository } from '../src/storage/participant-analytics.repository.js';
+import { PostgresQualificationProjectionRepository } from '../src/storage/qualification-projection.repository.js';
 import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
 import { PostgresWalletEvidenceRepository } from '../src/storage/wallet-evidence.repository.js';
 import { PostgresWalletGraphRepository } from '../src/storage/wallet-graph.repository.js';
 import { loadPumpFixture } from './helpers/pumpfun-fixture.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
+const EXTERNAL_BUYER = '8SBKzEQU4nLSzcwF4a74F2iaUDQyTfjGndn6qUWBnrpR';
 const BOUNDARIES = Object.freeze([
   'launchpad', 'funding', 'i1', 'i2', 'pumpswap', 'qualification',
 ] as const);
 type Boundary = (typeof BOUNDARIES)[number];
-const FULL_REPLAY: readonly Boundary[] = BOUNDARIES;
+type ReplayStage = Boundary | 'paper';
+const FULL_REPLAY: readonly ReplayStage[] = Object.freeze([...BOUNDARIES, 'paper']);
 
 void test('restarts the production PostgreSQL path at every observation boundary', async (context) => {
   await withDatabase(context, async (pool) => {
@@ -63,7 +73,7 @@ void test('restarts the production PostgreSQL path at every observation boundary
         observedAtMs: Date.now(),
       }));
 
-      const firstOrder: Boundary[] = [];
+      const firstOrder: ReplayStage[] = [];
       const firstWorker = worker(repository, transaction, pipeline(pool, boundary, firstOrder));
       const failed = await firstWorker.runOnce();
       assert.equal(failed.kind, 'failed', boundary);
@@ -92,7 +102,7 @@ void test('restarts the production PostgreSQL path at every observation boundary
         `${boundary}:launch-state`,
       );
 
-      const restartOrder: Boundary[] = [];
+      const restartOrder: ReplayStage[] = [];
       const restartWorker = worker(
         repository,
         transaction,
@@ -106,9 +116,10 @@ void test('restarts the production PostgreSQL path at every observation boundary
         kind: 'processed', signature: transaction.signature,
       }, boundary);
       assert.deepEqual(await productionCounts(pool), {
-        launches: '1', trades: '1', fundingAssessments: '1', creatorProfiles: '1',
+        launches: '1', trades: '3', fundingAssessments: '2', creatorProfiles: '1',
         participantSnapshots: '1', walletGraphProfiles: '1', walletGraphSnapshots: '1',
-        migrations: '1', marketPools: '1', reserveSnapshots: '1', paperPositions: '0',
+        migrations: '1', marketPools: '1', reserveSnapshots: '1', qualificationReports: '1',
+        paperDecisionJobs: '1', paperPositions: '0',
       }, boundary);
       const processedInbox = await inboxRow(pool, transaction.signature);
       assert.deepEqual({
@@ -120,6 +131,11 @@ void test('restarts the production PostgreSQL path at every observation boundary
         status: 'PROCESSED', attempts: 2, errorCode: null, nextAttemptAt: null,
       }, boundary);
       assert.ok(processedInbox.processed_at instanceof Date);
+      assert.deepEqual(await verticalEvidence(pool), {
+        creatorHasSold: true,
+        relationships: '2',
+        clusters: '1',
+      });
 
       await assertPaperSafety(pool);
       assert.equal((await productionCounts(pool)).paperPositions, '0', boundary);
@@ -181,8 +197,9 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
     );
     const beforeAudit = await auditCounts(pool);
     assert.deepEqual(await currentProjectionCounts(pool), {
-      participantProfiles: '1', participantPositions: '1', graphProfiles: '1',
-      graphRelationships: '0', graphClusters: '0', activeMarketPools: '1',
+      participantProfiles: '1', participantPositions: '2', graphProfiles: '1',
+      graphRelationships: '2', graphClusters: '1', activeMarketPools: '1',
+      currentQualifications: '1',
     });
 
     await repository.enqueueRevision(Object.freeze({
@@ -190,7 +207,7 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
       confirmationStatus: 'orphaned' as const,
       observedAtMs: Date.now() + 1,
     }));
-    const orphanOrder: Boundary[] = [];
+    const orphanOrder: ReplayStage[] = [];
     const orphaned = Object.freeze({ ...confirmed, confirmationStatus: 'ORPHANED' as const });
     const orphanResult = await worker(
       repository, orphaned, pipeline(pool, null, orphanOrder), Date.now() + 2, false,
@@ -204,6 +221,7 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
     assert.deepEqual(await currentProjectionCounts(pool), {
       participantProfiles: '0', participantPositions: '0', graphProfiles: '0',
       graphRelationships: '0', graphClusters: '0', activeMarketPools: '0',
+      currentQualifications: '0',
     });
     assert.deepEqual(await auditCounts(pool), beforeAudit);
     const states = (await pool.query(`SELECT
@@ -222,13 +240,14 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
       retryableFailed: 0, exhaustedFailed: 0,
     });
 
-    const replayOrder: Boundary[] = [];
+    const replayOrder: ReplayStage[] = [];
     await pipeline(pool, null, replayOrder).process(orphaned);
     assert.deepEqual(replayOrder, FULL_REPLAY);
     assert.deepEqual(await auditCounts(pool), beforeAudit);
     assert.deepEqual(await currentProjectionCounts(pool), {
       participantProfiles: '0', participantPositions: '0', graphProfiles: '0',
       graphRelationships: '0', graphClusters: '0', activeMarketPools: '0',
+      currentQualifications: '0',
     });
   });
 });
@@ -272,7 +291,7 @@ void test('exposes a real retryable failed inbox row through persisted API healt
 function pipeline(
   pool: InstanceType<typeof pg.Pool>,
   failAt: Boundary | null,
-  order: Boundary[],
+  order: ReplayStage[],
 ): ObservedTransactionPipeline {
   const launchpadRepository = new PostgresLaunchpadEventRepository(pool, 4);
   const pump = pumpAdapter();
@@ -286,7 +305,20 @@ function pipeline(
   );
   const realGraph = new WalletGraphRebuildService(new PostgresWalletGraphRepository(pool));
   const realMarket = marketPipeline(pool, pump);
-  const after = async <T>(boundary: Boundary, operation: Promise<T>): Promise<T> => {
+  const qualificationEngine = new QualificationEngine(createDefaultQualificationRuleSet(60));
+  const qualificationRebuilder = new QualificationRebuildService(qualificationEngine);
+  const realQualification = new QualificationProjectionService(
+    new PostgresQualificationProjectionRepository(pool, qualificationRebuilder),
+    qualificationRebuilder,
+    ['So11111111111111111111111111111111111111112'],
+  );
+  const paperDecisions = new PostgresPaperDecisionRepository(pool, {
+    maxAttempts: 5,
+    baseDelayMs: 500,
+    retentionHours: 4,
+    clock: () => 1_800_000_000_000,
+  });
+  const after = async <T>(boundary: ReplayStage, operation: Promise<T>): Promise<T> => {
     const result = await operation;
     order.push(boundary);
     if (failAt === boundary) throw new Error(`restart after ${boundary}`);
@@ -305,8 +337,10 @@ function pipeline(
     { rebuild: (mint, policy) => after('i2', realGraph.rebuild(mint, policy)) },
     { processObserved: (observed) => after('pumpswap', realMarket.processObserved(observed)) },
     () => 1_800_000_000_000,
-    null,
-    { rebuild: () => after('qualification', Promise.resolve(Object.freeze({}))) },
+    {
+      enqueueLatest: (...args) => after('paper', paperDecisions.enqueueLatest(...args)),
+    },
+    { rebuild: (mint, policy) => after('qualification', realQualification.rebuild(mint, policy)) },
   );
 }
 
@@ -334,7 +368,12 @@ function pumpAdapter(): PumpFunLaunchpadAdapter {
   return new PumpFunLaunchpadAdapter(
     { read: () => Promise.reject(new Error('unused bonding curve read')) },
     (transaction) => {
-      const decoded = decodePumpTransaction(transaction);
+      const decoded = decodePumpTransaction(Object.freeze({
+        ...transaction,
+        instructions: Object.freeze(transaction.instructions.filter((item) => (
+          item.instructionIndex !== 6 && item.instructionIndex !== 7
+        ))),
+      }));
       const creation = decoded.creations[0];
       if (creation === undefined) throw new Error('Pump fixture creation missing');
       const migrationInstruction = transaction.instructions.find((instruction) =>
@@ -357,6 +396,10 @@ function pumpAdapter(): PumpFunLaunchpadAdapter {
       return Object.freeze({
         ...decoded,
         migrations: Object.freeze([migration]),
+        trades: Object.freeze([
+          ...decoded.trades,
+          ...verticalSliceTrades(decoded),
+        ]),
       }) satisfies DecodedPumpTransaction;
     },
   );
@@ -391,6 +434,63 @@ function marketPipeline(
     new MarketObservationService(new PostgresMarketObservationRepository(pool, 4)),
     () => 1_800_000_000_000,
   );
+}
+
+function verticalSliceTrades(decoded: DecodedPumpTransaction): readonly DecodedPumpTrade[] {
+  const creation = decoded.creations[0];
+  const initialBuy = decoded.trades[0];
+  if (creation === undefined || initialBuy === undefined) {
+    throw new Error('Pump fixture vertical slice evidence missing');
+  }
+  const creatorSellInstruction = cloneInstruction(initialBuy.action.instruction, 6);
+  const creatorSellEvent = Object.freeze({
+    ...initialBuy.event,
+    isBuy: false,
+    user: creation.event.creator,
+    ixName: 'sell_v2',
+  });
+  const creatorSell: DecodedPumpTrade = Object.freeze({
+    ...initialBuy,
+    action: Object.freeze({
+      ...initialBuy.action,
+      name: 'sell_v2',
+      family: 'SELL',
+      instruction: creatorSellInstruction,
+    }),
+    event: creatorSellEvent,
+    eventCpi: Object.freeze({
+      ...initialBuy.eventCpi,
+      event: creatorSellEvent,
+      instruction: cloneInstruction(initialBuy.eventCpi.instruction, 6),
+    }),
+  });
+  const externalBuyInstruction = cloneInstruction(
+    initialBuy.action.instruction,
+    7,
+    EXTERNAL_BUYER,
+  );
+  const externalBuyEvent = Object.freeze({
+    ...initialBuy.event,
+    user: EXTERNAL_BUYER,
+  });
+  const externalBuy: DecodedPumpTrade = Object.freeze({
+    ...initialBuy,
+    action: Object.freeze({
+      ...initialBuy.action,
+      instruction: externalBuyInstruction,
+      accounts: Object.freeze({
+        ...initialBuy.action.accounts,
+        user: EXTERNAL_BUYER,
+      }),
+    }),
+    event: externalBuyEvent,
+    eventCpi: Object.freeze({
+      ...initialBuy.eventCpi,
+      event: externalBuyEvent,
+      instruction: cloneInstruction(initialBuy.eventCpi.instruction, 7),
+    }),
+  });
+  return Object.freeze([creatorSell, externalBuy]);
 }
 
 function marketEvidence(): DecodedPumpSwapTransaction {
@@ -443,6 +543,9 @@ function canonicalPool(): CanonicalMarketPool {
 }
 
 function migrationTransaction(transaction: NormalizedTransaction): NormalizedTransaction {
+  const decoded = decodePumpTransaction(transaction);
+  const initialBuy = decoded.trades[0];
+  if (initialBuy === undefined) throw new Error('Pump fixture initial buy missing');
   const balances = [...transaction.preTokenBalances, ...transaction.postTokenBalances];
   const accountCount = Math.max(...balances.map((balance) => balance.accountIndex)) + 1;
   const accountKeys = Array.from({ length: accountCount }, () => '11111111111111111111111111111111');
@@ -457,6 +560,8 @@ function migrationTransaction(transaction: NormalizedTransaction): NormalizedTra
       ...transaction.instructions,
       instruction(PUMP_PROGRAM_ID, 5, null, 1),
       instruction(PUMPSWAP_PROGRAM_ID, 5, 0, 2),
+      cloneInstruction(initialBuy.action.instruction, 6),
+      cloneInstruction(initialBuy.action.instruction, 7, EXTERNAL_BUYER),
     ]),
     preBalancesLamports: Object.freeze(accountKeys.map(() => 0n)),
     postBalancesLamports: Object.freeze(accountKeys.map(() => 0n)),
@@ -477,11 +582,32 @@ function instruction(
   });
 }
 
+function cloneInstruction(
+  source: NormalizedInstruction,
+  instructionIndex: number,
+  replacementUser?: string,
+): NormalizedInstruction {
+  const accounts = [...source.accounts];
+  if (replacementUser !== undefined) {
+    const userIndex = 13;
+    if (accounts[userIndex] === undefined) throw new Error('Pump buy user account missing');
+    accounts[userIndex] = replacementUser;
+  }
+  return Object.freeze({
+    ...source,
+    accounts: Object.freeze(accounts),
+    instructionIndex,
+    innerInstructionIndex: null,
+    parentInstructionIndex: null,
+  });
+}
+
 async function productionCounts(pool: InstanceType<typeof pg.Pool>) {
   const result = await pool.query<{
     launches: string; trades: string; funding_assessments: string; creator_profiles: string;
     participant_snapshots: string; wallet_graph_profiles: string; wallet_graph_snapshots: string;
-    migrations: string; market_pools: string; reserve_snapshots: string; paper_positions: string;
+    migrations: string; market_pools: string; reserve_snapshots: string;
+    qualification_reports: string; paper_decision_jobs: string; paper_positions: string;
   }>(`SELECT
     (SELECT COUNT(*) FROM token_launches)::text AS launches,
     (SELECT COUNT(*) FROM launch_trades)::text AS trades,
@@ -493,6 +619,8 @@ async function productionCounts(pool: InstanceType<typeof pg.Pool>) {
     (SELECT COUNT(*) FROM migrations)::text AS migrations,
     (SELECT COUNT(*) FROM market_pools)::text AS market_pools,
     (SELECT COUNT(*) FROM market_reserve_snapshots)::text AS reserve_snapshots,
+    (SELECT COUNT(*) FROM qualification_reports)::text AS qualification_reports,
+    (SELECT COUNT(*) FROM paper_decision_jobs)::text AS paper_decision_jobs,
     (SELECT COUNT(*) FROM paper_positions)::text AS paper_positions`);
   const row = result.rows[0];
   if (row === undefined) throw new Error('Production counts missing');
@@ -501,7 +629,8 @@ async function productionCounts(pool: InstanceType<typeof pg.Pool>) {
     creatorProfiles: row.creator_profiles, participantSnapshots: row.participant_snapshots,
     walletGraphProfiles: row.wallet_graph_profiles, walletGraphSnapshots: row.wallet_graph_snapshots,
     migrations: row.migrations, marketPools: row.market_pools,
-    reserveSnapshots: row.reserve_snapshots, paperPositions: row.paper_positions,
+    reserveSnapshots: row.reserve_snapshots, qualificationReports: row.qualification_reports,
+    paperDecisionJobs: row.paper_decision_jobs, paperPositions: row.paper_positions,
   });
 }
 
@@ -509,6 +638,7 @@ async function currentProjectionCounts(pool: InstanceType<typeof pg.Pool>) {
   return (await pool.query<{
     participantProfiles: string; participantPositions: string; graphProfiles: string;
     graphRelationships: string; graphClusters: string; activeMarketPools: string;
+    currentQualifications: string;
   }>(`SELECT
     (SELECT COUNT(*)::text FROM creator_profiles) AS "participantProfiles",
     (SELECT COUNT(*)::text FROM observed_wallet_positions) AS "participantPositions",
@@ -516,7 +646,9 @@ async function currentProjectionCounts(pool: InstanceType<typeof pg.Pool>) {
     (SELECT COUNT(*)::text FROM wallet_relationships) AS "graphRelationships",
     (SELECT COUNT(*)::text FROM wallet_clusters) AS "graphClusters",
     (SELECT COUNT(*)::text FROM market_pools
-      WHERE pool_state = 'active' AND confirmation_status <> 'orphaned') AS "activeMarketPools"`))
+      WHERE pool_state = 'active' AND confirmation_status <> 'orphaned') AS "activeMarketPools",
+    (SELECT COUNT(*)::text FROM qualification_reports
+      WHERE superseded_at IS NULL) AS "currentQualifications"`))
     .rows[0];
 }
 
@@ -536,8 +668,8 @@ function expectedCountsBefore(boundary: Boundary | null) {
   const completed = boundary === null ? -1 : BOUNDARIES.indexOf(boundary);
   return Object.freeze({
     launches: completed >= 0 ? '1' : '0',
-    trades: completed >= 0 ? '1' : '0',
-    fundingAssessments: completed >= 1 ? '1' : '0',
+    trades: completed >= 0 ? '3' : '0',
+    fundingAssessments: completed >= 1 ? '2' : '0',
     creatorProfiles: completed >= 2 ? '1' : '0',
     participantSnapshots: completed >= 2 ? '1' : '0',
     walletGraphProfiles: completed >= 3 ? '1' : '0',
@@ -545,7 +677,30 @@ function expectedCountsBefore(boundary: Boundary | null) {
     migrations: completed >= 4 ? '1' : '0',
     marketPools: completed >= 4 ? '1' : '0',
     reserveSnapshots: completed >= 4 ? '1' : '0',
+    qualificationReports: completed >= 5 ? '1' : '0',
+    paperDecisionJobs: '0',
     paperPositions: '0',
+  });
+}
+
+async function verticalEvidence(pool: InstanceType<typeof pg.Pool>): Promise<{
+  readonly creatorHasSold: boolean;
+  readonly relationships: string;
+  readonly clusters: string;
+}> {
+  const row = (await pool.query<{
+    creator_has_sold: boolean;
+    relationships: string;
+    clusters: string;
+  }>(`SELECT
+    (SELECT has_sold FROM creator_profiles LIMIT 1) AS creator_has_sold,
+    (SELECT COUNT(*)::text FROM wallet_relationships) AS relationships,
+    (SELECT COUNT(*)::text FROM wallet_clusters) AS clusters`)).rows[0];
+  if (row === undefined) throw new Error('Vertical evidence missing');
+  return Object.freeze({
+    creatorHasSold: row.creator_has_sold,
+    relationships: row.relationships,
+    clusters: row.clusters,
   });
 }
 

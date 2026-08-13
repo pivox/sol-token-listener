@@ -33,6 +33,7 @@ import { PostgresParticipantAnalyticsRepository } from '../storage/participant-a
 import { PostgresPaperDecisionRepository } from '../storage/paper-decision.repository.js';
 import { PostgresPaperTradingRepository } from '../storage/paper-trading.repository.js';
 import { PostgresPaperVenueReader } from '../storage/paper-venue.reader.js';
+import { PostgresQualificationProjectionRepository } from '../storage/qualification-projection.repository.js';
 import { PostgresSocialEvidenceRepository } from '../storage/social-evidence.repository.js';
 import { PostgresTransactionInboxRepository } from '../storage/transaction-inbox.repository.js';
 import { PostgresWalletEvidenceRepository } from '../storage/wallet-evidence.repository.js';
@@ -51,6 +52,7 @@ import { WalletGraphRebuildService } from './wallet-graph-rebuild.service.js';
 import { PublicSocialVerificationProvider } from '../social/public-social-verification.provider.js';
 import { SocialEnrichmentWorker } from './social-enrichment-worker.js';
 import { PaperDecisionWorker } from './paper-decision-worker.js';
+import { QualificationProjectionService } from './qualification-projection.service.js';
 import { QualificationRebuildService } from './qualification-rebuild.service.js';
 import { TradingCandidateService } from './trading-candidate.service.js';
 import { ValidatedExternalBuysStrategy } from './validated-external-buys.strategy.js';
@@ -158,6 +160,12 @@ export function createProductionListenerRuntime(
     minimumScoreOverride: config.qualificationMinimumScore,
   });
   const qualificationEngine = new QualificationEngine(qualificationProfile);
+  const qualificationRebuilder = new QualificationRebuildService(qualificationEngine);
+  const qualification = new QualificationProjectionService(
+    new PostgresQualificationProjectionRepository(pool, qualificationRebuilder),
+    qualificationRebuilder,
+    config.paperQuoteMintAllowlist,
+  );
   const quoteRouter = new CanonicalPaperQuoteRouter(
     new PostgresPaperVenueReader(() => rpc.getSlot(), pool),
     new PumpFunPaperQuoteProvider(marketRpc),
@@ -181,7 +189,7 @@ export function createProductionListenerRuntime(
   const paperWorker = new PaperDecisionWorker(
     paperRepository,
     quoteRouter,
-    new QualificationRebuildService(qualificationEngine),
+    qualificationRebuilder,
     new TradingCandidateService({
       strategy: { id: config.paperStrategyId, version: config.paperStrategyVersion },
       quoteMintAllowlist: config.paperQuoteMintAllowlist,
@@ -219,6 +227,7 @@ export function createProductionListenerRuntime(
     marketPipeline,
     Date.now,
     paperRepository,
+    qualification,
   );
 
   const worker = new TransactionInboxWorker(inbox, locator, pipeline, {

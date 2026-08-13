@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { ApiProjectionPipelineState } from '../src/storage/api-projection.repository.js';
@@ -27,6 +28,20 @@ const config = parseConfig({
 void test('bootstrap imports no signing, submission, or live execution path', async () => {
   const source = await readFile(new URL('../src/app.ts', import.meta.url), 'utf8');
   assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(new URL('../src/app.ts', import.meta.url)), repositoryRoot), []);
+});
+
+void test('production qualification import graph has no signing, simulation, or submission path', async () => {
+  const graph = await readLocalImportGraph(
+    fileURLToPath(new URL('../src/application/production-listener-factory.ts', import.meta.url)),
+  );
+  const violations: string[] = [];
+  for (const [path, source] of graph) {
+    violations.push(...executionBoundaryViolations(source, path, repositoryRoot));
+    if (/\b(?:Keypair|sendTransaction|signTransaction|simulateTransaction)\b/u.test(source)) {
+      violations.push(`Forbidden execution symbol in ${path}`);
+    }
+  }
+  assert.deepEqual(violations, []);
 });
 
 void test('paper dry-run bootstrap imports no signing, submission, or live execution path', async () => {
@@ -358,4 +373,24 @@ function listener(calls: string[], pipeline: ApiProjectionPipelineState): {
     state: () => 'RUNNING',
     pipelineState: () => Object.freeze({ ...pipeline }),
   };
+}
+
+async function readLocalImportGraph(entrypoint: string): Promise<ReadonlyMap<string, string>> {
+  const graph = new Map<string, string>();
+  const pending = [entrypoint];
+  while (pending.length > 0) {
+    const path = pending.pop();
+    if (path === undefined || graph.has(path)) continue;
+    const source = await readFile(path, 'utf8');
+    graph.set(path, source);
+    for (const match of source.matchAll(
+      /(?:from\s+|import\s*\(\s*|import\s+)["'](\.{1,2}\/[^"']+)["']/gu,
+    )) {
+      const specifier = match[1];
+      if (specifier === undefined) continue;
+      const resolved = resolve(dirname(path), specifier.replace(/\.js$/u, '.ts'));
+      if (!graph.has(resolved)) pending.push(resolved);
+    }
+  }
+  return graph;
 }
