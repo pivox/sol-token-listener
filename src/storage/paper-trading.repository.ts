@@ -62,7 +62,8 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
       [identity.mint],
     );
     const current=await this.client.query(
-      `SELECT report.report_id FROM qualification_reports report
+      `SELECT report.report_id,report.source_event_id,report.source_raw_event_id
+       FROM qualification_reports report
        JOIN domain_events event ON event.event_id=report.qualification_event_id
        WHERE report.mint=$1 AND report.report_id=$2
          AND report.qualification_event_id=$3
@@ -71,13 +72,59 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
          AND report.purge_after > clock_timestamp()
          AND report.confirmation_status <> 'orphaned'
          AND event.confirmation_status <> 'orphaned'
+         AND report.confirmation_status=event.confirmation_status
        FOR SHARE OF report,event`,
       [identity.mint,identity.reportId,identity.qualificationEventId],
     );
     if(current.rows.length!==1){
-      throw new PaperTradingError(
-        'QUALIFICATION_NOT_CURRENT','Paper qualification is not current.',
-      );
+      qualificationNotCurrent();
+    }
+    const currentRow=current.rows[0];
+    if(!isRecord(currentRow))qualificationNotCurrent();
+    const sourceEventId=currentRow.source_event_id;
+    const sourceRawEventId=currentRow.source_raw_event_id;
+    if(typeof sourceEventId!=='string'||typeof sourceRawEventId!=='string'){
+      qualificationNotCurrent();
+    }
+    const raw=await this.client.query(
+      `SELECT raw.event_id FROM raw_chain_events raw
+       WHERE raw.event_id=$1 AND raw.mint=$2
+         AND raw.confirmation_status <> 'orphaned'
+       FOR SHARE OF raw`,
+      [sourceRawEventId,identity.mint],
+    );
+    if(raw.rows.length!==1)qualificationNotCurrent();
+    const source=await this.client.query(
+      `SELECT source.event_id FROM domain_events source
+       JOIN raw_chain_events raw ON raw.event_id=source.raw_event_id
+       JOIN qualification_reports report ON report.report_id=$4
+       JOIN domain_events qualification
+         ON qualification.event_id=report.qualification_event_id
+       WHERE source.event_id=$1 AND source.raw_event_id=$2 AND source.mint=$3
+         AND source.type IN (
+           'TokenLaunchDetected','BondingCurveTradeObserved','BondingCurveStateUpdated',
+           'BondingCurveCompleted','MigrationObserved','PumpSwapPoolActivated'
+         )
+         AND report.mint=$3 AND report.source_event_id=source.event_id
+         AND report.source_raw_event_id=raw.event_id
+         AND qualification.event_id=$5
+         AND source.confirmation_status <> 'orphaned'
+         AND raw.confirmation_status <> 'orphaned'
+         AND source.confirmation_status=raw.confirmation_status
+         AND source.confirmation_status=report.confirmation_status
+         AND source.confirmation_status=qualification.confirmation_status
+         AND raw.source=source.source AND raw.program=source.program
+         AND raw.mint=source.mint AND raw.signature=source.signature
+         AND raw.slot=source.slot
+         AND raw.transaction_index=source.transaction_index
+         AND raw.instruction_index=source.instruction_index
+         AND raw.inner_instruction_index IS NOT DISTINCT FROM source.inner_instruction_index
+       FOR SHARE OF source,raw`,
+      [sourceEventId,sourceRawEventId,identity.mint,identity.reportId,
+        identity.qualificationEventId],
+    );
+    if(source.rows.length!==1){
+      qualificationNotCurrent();
     }
   }
 
@@ -357,6 +404,11 @@ function text(value: unknown, field: string): string {
 }
 function nullableText(value: unknown, field: string): string | null {
   return value === null ? null : text(value, field);
+}
+function qualificationNotCurrent():never{
+  throw new PaperTradingError(
+    'QUALIFICATION_NOT_CURRENT','Paper qualification is not current.',
+  );
 }
 function integer(value: unknown, field: string): number {
   if (

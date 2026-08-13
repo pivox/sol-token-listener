@@ -513,6 +513,89 @@ void test('holds the qualification advisory lock from validation through paper c
   });
 });
 
+void test('rejects a current report whose exact raw-backed source is orphaned',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [SOURCE_EVENT_ID],
+    );
+    const ledger=new PostgresPaperTradingRepository(pool);
+    const projection=canonicalProjection(decisionResult());
+    const before=await paperOpenRows(pool);
+
+    await assert.rejects(ledger.transact(async transaction=>{
+      await transaction.requireCurrentQualification({
+        mint:MINT,reportId:projection.reportId,
+        qualificationEventId:projection.qualificationEvent.id,
+      });
+    }),hasCode('QUALIFICATION_NOT_CURRENT'));
+
+    assert.deepEqual(await paperOpenRows(pool),before);
+    assert.deepEqual(before,{ positions:0,trades:0,opened_events:0,sessions:0,candidates:0 });
+  });
+});
+
+void test('serializes a concurrent source orphan behind the paper source locks',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    const ledger=new PostgresPaperTradingRepository(pool);
+    const projection=canonicalProjection(decisionResult());
+    let guardedResolve!:()=>void;
+    const guarded=new Promise<void>((resolve)=>{guardedResolve=resolve;});
+    let releaseResolve!:()=>void;
+    const releaseGuard=new Promise<void>((resolve)=>{releaseResolve=resolve;});
+    const holding=ledger.transact(async transaction=>{
+      await transaction.requireCurrentQualification({
+        mint:MINT,reportId:projection.reportId,
+        qualificationEventId:projection.qualificationEvent.id,
+      });
+      guardedResolve();
+      await releaseGuard;
+    });
+    await guarded;
+    const orphan=await pool.connect();
+    try{
+      await orphan.query('BEGIN');
+      await orphan.query(`SET LOCAL lock_timeout='100ms'`);
+      await assert.rejects(orphan.query(
+        `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+        [RAW_EVENT_ID],
+      ),/lock timeout/u);
+      await orphan.query('ROLLBACK');
+      releaseResolve();
+      await holding;
+      await orphan.query('BEGIN');
+      await orphan.query(
+        `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+        [RAW_EVENT_ID],
+      );
+      await orphan.query(
+        `UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+        [SOURCE_EVENT_ID],
+      );
+      await orphan.query('COMMIT');
+    }finally{
+      releaseResolve();
+      await holding;
+      await orphan.query('ROLLBACK').catch(()=>undefined);
+      orphan.release();
+    }
+    await assert.rejects(ledger.transact(async transaction=>{
+      await transaction.requireCurrentQualification({
+        mint:MINT,reportId:projection.reportId,
+        qualificationEventId:projection.qualificationEvent.id,
+      });
+    }),hasCode('QUALIFICATION_NOT_CURRENT'));
+  });
+});
+
 void test('stages, survives lease expiry, replays and completes one immutable decision', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
