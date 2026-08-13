@@ -39,6 +39,7 @@ export interface PaperDecisionSnapshot {
   readonly mint: string;
   readonly asOfEvent: DomainEvent;
   readonly canonicalLaunchActive: boolean;
+  readonly hasPaperLineage: boolean;
   readonly launch: TokenLaunch;
   readonly metadata: TokenMetadataSnapshot | null;
   readonly social: SocialEvidenceCollectionV1 | null;
@@ -85,6 +86,7 @@ export interface PaperDecisionRepository {
   stageDecision(job: ClaimedPaperDecisionJob, result: PaperDecisionResult): Promise<void>;
   complete(job: ClaimedPaperDecisionJob, result: PaperDecisionResult): Promise<void>;
   completeNoop(job: ClaimedPaperDecisionJob): Promise<void>;
+  completeObsolete(job: ClaimedPaperDecisionJob): Promise<void>;
   fail(job: ClaimedPaperDecisionJob, failure: PaperDecisionFailure): Promise<void>;
   counts(): Promise<PaperDecisionQueueCounts>;
 }

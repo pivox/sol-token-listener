@@ -419,6 +419,119 @@ void test('terminalizes an orphan-only launch no-op without exhausting the backl
   });
 });
 
+void test('terminalizes an obsolete orphan job without changing later paper lineage', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput({
+      sourceEventId:TRADE_EVENT_ID,sourceRawEventId:TRADE_RAW_EVENT_ID,
+      inputFingerprint:'8'.repeat(64),
+    }));
+    const laterJob=await repository.claim({ nowMs:2_000,leaseMs:1_000 });
+    assert.ok(laterJob);
+    const later=decisionResultAt(11n,2_000,'8');
+    await replaceCurrentQualification(pool,canonicalProjection(later));
+    await repository.complete(laterJob,later);
+    await pool.query(`UPDATE qualification_reports SET superseded_at=evaluated_at
+      WHERE mint=$1 AND superseded_at IS NULL`,[MINT]);
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await repository.enqueueLatest(MINT,'signature','orphaned');
+    const obsolete=await repository.claim({ nowMs:3_000,leaseMs:1_000 });
+    assert.ok(obsolete);
+
+    const before=await paperDomainRows(pool);
+    const snapshot=await repository.loadSnapshot(obsolete);
+    assert.equal(snapshot.currentQualification,null);
+    assert.equal(snapshot.currentCandidate,null);
+    assert.equal(snapshot.currentDecision,null);
+    assert.equal(snapshot.currentSession,null);
+    assert.equal(snapshot.activePosition,null);
+    assert.equal(snapshot.hasPaperLineage,true);
+    await repository.completeObsolete(obsolete);
+
+    assert.deepEqual(await paperDomainRows(pool),before);
+    const stored=await pool.query(`SELECT status,error_code,retry_exhausted_at
+      FROM paper_decision_jobs WHERE job_id=$1`,[obsolete.jobId]);
+    assert.deepEqual(stored.rows,[{
+      status:'COMPLETED',error_code:null,retry_exhausted_at:null,
+    }]);
+  });
+});
+
+void test('obsolete completion rejects exact lineage committed after its snapshot', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await repository.enqueueLatest(MINT,'signature','orphaned');
+    const obsolete=await repository.claim({ nowMs:2_000,leaseMs:10_000 });
+    assert.ok(obsolete);
+    const snapshot=await repository.loadSnapshot(obsolete);
+    assert.equal(snapshot.currentCandidate,null);
+
+    const exact=decisionResult();
+    await pool.query(`INSERT INTO domain_events (
+      event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+      instruction_index,inner_instruction_index,confirmation_status,blockchain_time,
+      observed_at,payload_version,payload
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1,$15)`,[
+      exact.candidateEvent.id,RAW_EVENT_ID,exact.candidateEvent.type,MINT,
+      exact.candidateEvent.source,exact.candidateEvent.program,exact.candidateEvent.signature,
+      exact.candidateEvent.cursor.slot.toString(),exact.candidateEvent.cursor.transactionIndex,
+      exact.candidateEvent.cursor.instructionIndex,exact.candidateEvent.cursor.innerInstructionIndex,
+      'orphaned',new Date(exact.candidateEvent.blockchainTimeMs ?? 0),
+      new Date(exact.candidateEvent.observedAtMs),toJsonValue(exact.candidateEvent.payload),
+    ]);
+    await pool.query(`INSERT INTO trading_candidates (
+      candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
+      strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,
+      quote_decimals,quote_token_program,reason_codes,eligible_until,created_at,
+      superseded_at,purge_after,payload_version,payload
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NULL,$17,1,$18)`,[
+      exact.candidate.id,MINT,exact.candidate.qualificationReportId,SOURCE_EVENT_ID,
+      exact.candidateEvent.id,exact.candidate.strategy.id,exact.candidate.strategy.version,
+      exact.candidate.evidenceFingerprint,exact.candidate.asOf.confirmationStatus,
+      exact.candidate.state,exact.candidate.quoteAsset.mint,exact.candidate.quoteAsset.decimals,
+      exact.candidate.quoteAsset.tokenProgram,JSON.stringify(toJsonValue(exact.candidate.reasonCodes)),
+      new Date(exact.candidate.eligibleUntilMs ?? 0),new Date(exact.candidate.createdAtMs),
+      new Date(exact.candidate.purgeAfterMs),toJsonValue(exact.candidate),
+    ]);
+
+    await assert.rejects(repository.completeObsolete(obsolete));
+    const stored=await pool.query('SELECT status FROM paper_decision_jobs WHERE job_id=$1',[
+      obsolete.jobId,
+    ]);
+    assert.deepEqual(stored.rows,[{ status:'PROCESSING' }]);
+    const retained=await pool.query(
+      'SELECT candidate_id FROM trading_candidates WHERE candidate_id=$1',[exact.candidate.id],
+    );
+    assert.deepEqual(retained.rows,[{ candidate_id:exact.candidate.id }]);
+  });
+});
+
 void test('reloads the entry candidate when a later trade becomes orphaned', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');

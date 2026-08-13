@@ -178,7 +178,9 @@ export class PaperDecisionWorker {
         && snapshot.currentDecision === null
         && snapshot.currentSession === null
         && snapshot.activePosition === null
-      ) return this.completeNoop(job,lease);
+      ) return snapshot.hasPaperLineage
+        ? this.completeObsolete(job,lease)
+        : this.completeNoop(job,lease);
       return this.fail(job,lease,'RPC_TRANSIENT',true,null);
     }
 
@@ -417,6 +419,18 @@ export class PaperDecisionWorker {
       return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
     }
     try { await this.repository.completeNoop(job); }
+    catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
+    return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
+  }
+
+  private async completeObsolete(
+    job: ClaimedPaperDecisionJob,
+    lease: PaperLeaseGuard,
+  ): Promise<PaperDecisionRunResult> {
+    if (!await this.finishLease(lease)) {
+      return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
+    }
+    try { await this.repository.completeObsolete(job); }
     catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
     return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
   }

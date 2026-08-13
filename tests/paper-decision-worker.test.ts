@@ -94,6 +94,33 @@ void test('completes an orphan-only launch without paper lineage as a no-op', as
   assert.equal(services.candidates.calls.length,0);
 });
 
+void test('completes a superseded orphan job without reconciling unrelated paper lineage', async () => {
+  const repository = new FakeRepository([claim()]);
+  repository.snapshotValue = snapshot({
+    canonicalLaunchActive:false,
+    currentQualification:null,
+    currentCandidate:null,
+    currentDecision:null,
+    currentSession:null,
+    activePosition:null,
+    hasPaperLineage:true,
+  } as Partial<PaperDecisionSnapshot> & { readonly hasPaperLineage:boolean });
+  const quotes = new FakeQuotes();
+  const services = fakeServices('NOT_ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind:'completed',jobId:'paper-job' });
+  assert.equal(repository.obsoleteCompletions,1);
+  assert.equal(repository.noopCompletions,0);
+  assert.equal(repository.failures.length,0);
+  assert.equal(repository.completions.length,0);
+  assert.equal(quotes.calls,0);
+  assert.equal(services.candidates.calls.length,0);
+});
+
 void test('reauthorizes the persisted canonical qualification and preserves its candidate identity', async () => {
   const repository = new FakeRepository([claim()]);
   const persisted = canonicalQualification();
@@ -630,6 +657,7 @@ class FakeRepository implements PaperDecisionRepository {
   public readonly failures: { readonly failure:PaperDecisionFailure }[] = [];
   public renewResult = true;
   public noopCompletions = 0;
+  public obsoleteCompletions = 0;
   public snapshotValue: PaperDecisionSnapshot = snapshot();
   public constructor(
     private readonly claims: (ClaimedPaperDecisionJob|null)[],
@@ -647,6 +675,9 @@ class FakeRepository implements PaperDecisionRepository {
   }
   public async completeNoop(): Promise<void> {
     this.operations.push('complete-noop'); this.noopCompletions += 1;
+  }
+  public async completeObsolete(): Promise<void> {
+    this.operations.push('complete-obsolete'); this.obsoleteCompletions += 1;
   }
   public async fail(_job:ClaimedPaperDecisionJob,failure:PaperDecisionFailure): Promise<void> {
     this.operations.push('fail'); this.failures.push({ failure });
@@ -789,7 +820,7 @@ function claim(): ClaimedPaperDecisionJob {
 function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecisionSnapshot {
   const asOfEvent=event('TokenLaunchDetected','evt_source');
   return Object.freeze({
-    mint:'MINT',asOfEvent,canonicalLaunchActive:true,launch:Object.freeze({
+    mint:'MINT',asOfEvent,canonicalLaunchActive:true,hasPaperLineage:false,launch:Object.freeze({
       mint:'MINT',creator:'creator',tokenProgram:'SPL_TOKEN' as const,
       quoteAssets:Object.freeze([Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const })]),
       launchpad:'pumpfun',createdAt:asOfEvent.cursor,parameters:Object.freeze({}),

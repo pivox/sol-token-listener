@@ -277,11 +277,12 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         : await loadCurrentDecision(client, candidate.id, includeOrphaned);
       const launchTrades = await activeLaunchTrades(client, job.mint, session);
       const marketTrades = await activeMarketTrades(client, job.mint, session);
-      const position = await loadPosition(client, job.mint, session);
+      const position = await loadPosition(client, job, session, includeOrphaned);
+      const hasPaperLineage = await paperLineageExists(client,job.mint);
       await client.query('COMMIT');
       return deepFreeze({
         mint: job.mint,asOfEvent,canonicalLaunchActive:launchSnapshot.canonicalLaunchActive,
-        launch:launchSnapshot.launch,metadata,social,creatorProfile,holderSnapshot,
+        hasPaperLineage,launch:launchSnapshot.launch,metadata,social,creatorProfile,holderSnapshot,
         walletGraph,activeLaunchTrades: launchTrades,activeMarketTrades: marketTrades,
         currentQualification,currentCandidate: candidate,currentDecision,
         currentSession: session,activePosition: position,
@@ -304,27 +305,66 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
   }
 
   public async completeNoop(job: ClaimedPaperDecisionJob): Promise<void> {
+    await this.completeWithoutDecision(job,false);
+  }
+
+  public async completeObsolete(job: ClaimedPaperDecisionJob): Promise<void> {
+    await this.completeWithoutDecision(job,true);
+  }
+
+  private async completeWithoutDecision(
+    job: ClaimedPaperDecisionJob,
+    allowUnrelatedLineage: boolean,
+  ): Promise<void> {
     assertClaim(job);
     const client = await this.connect('complete');
     try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      await client.query('BEGIN');
       await lockMint(client,job.mint);
       await lockQualificationMint(client,job.mint);
       const nowMs=this.clock();
       timestamp(nowMs,'clock');
+      const lineagePredicate=allowUnrelatedLineage
+        ? exactPaperLineagePredicate('job')
+        : `NOT EXISTS (SELECT 1 FROM trading_candidates WHERE mint=job.mint)
+          AND NOT EXISTS (SELECT 1 FROM paper_strategy_sessions WHERE mint=job.mint)
+          AND NOT EXISTS (SELECT 1 FROM paper_positions WHERE mint=job.mint)`;
       const completed=await client.query(`UPDATE paper_decision_jobs job SET
         status='COMPLETED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
         error_code=NULL,retry_exhausted_at=NULL,terminal_at=$3,purge_after=$4,updated_at=$3
         WHERE job.job_id=$1 AND job.lease_token=$2 AND job.status='PROCESSING'
+          AND job.source_confirmation_status='orphaned'
+          AND EXISTS (
+            SELECT 1 FROM domain_events source
+            JOIN raw_chain_events raw ON raw.event_id=job.source_raw_event_id
+            WHERE source.event_id=job.source_event_id AND source.mint=job.mint
+              AND source.raw_event_id=raw.event_id AND raw.mint=job.mint
+              AND source.confirmation_status='orphaned'
+              AND raw.confirmation_status='orphaned'
+          )
           AND NOT EXISTS (
             SELECT 1 FROM domain_events launch
             WHERE launch.mint=job.mint AND launch.type='TokenLaunchDetected'
               AND launch.confirmation_status<>'orphaned'
           )
-          AND NOT EXISTS (SELECT 1 FROM trading_candidates WHERE mint=job.mint)
-          AND NOT EXISTS (SELECT 1 FROM paper_strategy_sessions WHERE mint=job.mint)
-          AND NOT EXISTS (SELECT 1 FROM paper_positions WHERE mint=job.mint)`,[
+          AND NOT EXISTS (
+            SELECT 1 FROM qualification_reports report
+            JOIN domain_events qualification
+              ON qualification.event_id=report.qualification_event_id
+            JOIN domain_events source ON source.event_id=report.source_event_id
+              AND source.raw_event_id=report.source_raw_event_id
+            JOIN raw_chain_events raw ON raw.event_id=report.source_raw_event_id
+            WHERE report.mint=job.mint AND report.superseded_at IS NULL
+              AND report.profile_id=$5 AND report.profile_version=$6
+              AND report.profile_fingerprint=$7
+              AND qualification.confirmation_status<>'orphaned'
+              AND source.confirmation_status<>'orphaned'
+              AND raw.confirmation_status<>'orphaned'
+          )
+          AND ${lineagePredicate}`,[
         job.jobId,job.leaseToken,new Date(nowMs),new Date(nowMs+this.retentionMs),
+        this.qualificationProfile.id,this.qualificationProfile.version,
+        this.qualificationProfile.fingerprint,
       ]);
       if(completed.rowCount!==1)throw new PaperDecisionLeaseLostError();
       await client.query('COMMIT');
@@ -856,7 +896,8 @@ async function loadSession(
   } else if (includeOrphaned) {
     result=await client.query(`SELECT session.payload FROM paper_strategy_sessions session
       WHERE session.mint=$1 AND (
-        session.session_id IN (
+        session.source_event_id=$3
+        OR session.session_id IN (
           SELECT event.payload #>> '{session,id}' FROM domain_events event
           WHERE event.raw_event_id=$2 AND event.type='PaperStrategySessionUpdated'
         )
@@ -865,13 +906,33 @@ async function loadSession(
           JOIN domain_events source ON source.event_id=evidence.source_event_id
           WHERE source.raw_event_id=$2
         )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          JOIN trading_candidates candidate ON candidate.candidate_id=session.candidate_id
+          JOIN domain_events entry_source ON entry_source.event_id=session.source_event_id
+          WHERE trigger.event_id=$3
+            AND trigger.type IN (
+              'BondingCurveTradeObserved','BondingCurveStateUpdated',
+              'BondingCurveCompleted','MigrationObserved','PumpSwapPoolActivated'
+            )
+            AND session.state IN (
+              'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+              'EXIT_PENDING_QUOTE','SELL_PENDING'
+            )
+            AND candidate.superseded_at IS NULL
+            AND entry_source.confirmation_status<>'orphaned'
+            AND ROW(
+              session.entry_slot,session.entry_transaction_index,
+              session.entry_instruction_index,COALESCE(session.entry_inner_instruction_index,-1)
+            ) < ROW(
+              trigger.slot,trigger.transaction_index,
+              trigger.instruction_index,COALESCE(trigger.inner_instruction_index,-1)
+            )
+        )
       )
       ORDER BY session.updated_at DESC,session.session_id DESC LIMIT 1`, [
-      job.mint,job.sourceRawEventId,
+      job.mint,job.sourceRawEventId,job.sourceEventId,
     ]);
-    if (result.rows[0] === undefined) {
-      result=await activeSession(client,job.mint);
-    }
   } else {
     result=await activeSession(client,job.mint);
   }
@@ -890,22 +951,165 @@ function activeSession(client: Client, mint: string): Promise<Result> {
 
 async function loadPosition(
   client: Client,
-  mint: string,
+  job: ClaimedPaperDecisionJob,
   session: PaperStrategySessionV1 | null,
+  includeOrphaned: boolean,
 ): Promise<PaperPosition | null> {
-  const result = session === null
-    ? await client.query(`SELECT position.payload FROM paper_positions position
+  const result = session !== null
+    ? await client.query(`SELECT payload FROM paper_positions
+        WHERE mint=$1 AND strategy_session_id=$2
+        ORDER BY opened_at DESC,position_id DESC LIMIT 1`, [job.mint,session.id])
+    : includeOrphaned
+      ? await client.query(`SELECT position.payload FROM paper_positions position
+        WHERE position.mint=$1 AND (
+          position.candidate_id IN (
+            SELECT candidate_id FROM trading_candidates
+            WHERE mint=$1 AND source_event_id=$2
+          )
+          OR position.strategy_session_id IN (
+            SELECT session.session_id FROM paper_strategy_sessions session
+            WHERE session.mint=$1 AND (
+              session.source_event_id=$2
+              OR EXISTS (
+                SELECT 1 FROM domain_events session_event
+                WHERE session_event.event_id=session.session_event_id
+                  AND session_event.raw_event_id=$3
+              )
+            )
+          )
+          OR EXISTS (
+            SELECT 1 FROM domain_events trigger
+            WHERE trigger.event_id=position.trigger_event_id
+              AND trigger.raw_event_id=$3
+          )
+        )
+        ORDER BY position.opened_at DESC,position.position_id DESC LIMIT 1`, [
+        job.mint,job.sourceEventId,job.sourceRawEventId,
+      ])
+      : await client.query(`SELECT position.payload FROM paper_positions position
         JOIN domain_events trigger ON trigger.event_id=position.trigger_event_id
         WHERE position.mint=$1 AND position.status='PAPER_HOLDING'
           AND trigger.confirmation_status<>'orphaned'
-        ORDER BY position.opened_at DESC,position.position_id DESC LIMIT 1`, [mint])
-    : await client.query(`SELECT payload FROM paper_positions
-        WHERE mint=$1 AND strategy_session_id=$2
-        ORDER BY opened_at DESC,position_id DESC LIMIT 1`, [mint,session.id]);
+        ORDER BY position.opened_at DESC,position.position_id DESC LIMIT 1`, [job.mint]);
   const row=result.rows[0];
   return row === undefined
     ? null
     : decoded(field(row,'payload'),'Paper position payload is invalid.') as PaperPosition;
+}
+
+async function paperLineageExists(client:Client,mint:string):Promise<boolean>{
+  const result=await client.query(`SELECT (
+    EXISTS(SELECT 1 FROM trading_candidates WHERE mint=$1)
+    OR EXISTS(SELECT 1 FROM paper_strategy_sessions WHERE mint=$1)
+    OR EXISTS(SELECT 1 FROM paper_positions WHERE mint=$1)
+  ) AS present`,[mint]);
+  return booleanField(requiredRow(result,'Paper lineage result is missing.'),'present');
+}
+
+function exactPaperLineagePredicate(jobAlias:string):string{
+  if(jobAlias!=='job')throw new TypeError('Paper job alias is invalid.');
+  return `NOT EXISTS (
+      SELECT 1 FROM trading_candidates candidate
+      WHERE candidate.mint=${jobAlias}.mint
+        AND candidate.source_event_id=${jobAlias}.source_event_id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM paper_strategy_sessions session
+      WHERE session.mint=${jobAlias}.mint AND (
+        session.source_event_id=${jobAlias}.source_event_id
+        OR session.candidate_id IN (
+          SELECT candidate.candidate_id FROM trading_candidates candidate
+          WHERE candidate.mint=${jobAlias}.mint
+            AND candidate.source_event_id=${jobAlias}.source_event_id
+        )
+        OR EXISTS (
+          SELECT 1 FROM domain_events session_event
+          WHERE session_event.event_id=session.session_event_id
+            AND session_event.raw_event_id=${jobAlias}.source_raw_event_id
+        )
+        OR EXISTS (
+          SELECT 1 FROM paper_external_buy_events evidence
+          JOIN domain_events evidence_source
+            ON evidence_source.event_id=evidence.source_event_id
+          WHERE evidence.session_id=session.session_id
+            AND evidence_source.raw_event_id=${jobAlias}.source_raw_event_id
+        )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          JOIN trading_candidates active_candidate
+            ON active_candidate.candidate_id=session.candidate_id
+          JOIN domain_events entry_source ON entry_source.event_id=session.source_event_id
+          WHERE trigger.event_id=${jobAlias}.source_event_id
+            AND trigger.type IN (
+              'BondingCurveTradeObserved','BondingCurveStateUpdated',
+              'BondingCurveCompleted','MigrationObserved','PumpSwapPoolActivated'
+            )
+            AND session.state IN (
+              'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+              'EXIT_PENDING_QUOTE','SELL_PENDING'
+            )
+            AND active_candidate.superseded_at IS NULL
+            AND entry_source.confirmation_status<>'orphaned'
+            AND ROW(
+              session.entry_slot,session.entry_transaction_index,
+              session.entry_instruction_index,COALESCE(session.entry_inner_instruction_index,-1)
+            ) < ROW(
+              trigger.slot,trigger.transaction_index,
+              trigger.instruction_index,COALESCE(trigger.inner_instruction_index,-1)
+            )
+        )
+      )
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM paper_positions position
+      WHERE position.mint=${jobAlias}.mint AND (
+        position.candidate_id IN (
+          SELECT candidate.candidate_id FROM trading_candidates candidate
+          WHERE candidate.mint=${jobAlias}.mint
+            AND candidate.source_event_id=${jobAlias}.source_event_id
+        )
+        OR position.strategy_session_id IN (
+          SELECT session.session_id FROM paper_strategy_sessions session
+          WHERE session.mint=${jobAlias}.mint AND (
+            session.source_event_id=${jobAlias}.source_event_id
+            OR EXISTS (
+              SELECT 1 FROM domain_events session_event
+              WHERE session_event.event_id=session.session_event_id
+                AND session_event.raw_event_id=${jobAlias}.source_raw_event_id
+            )
+            OR EXISTS (
+              SELECT 1 FROM domain_events trigger
+              JOIN trading_candidates active_candidate
+                ON active_candidate.candidate_id=session.candidate_id
+              JOIN domain_events entry_source ON entry_source.event_id=session.source_event_id
+              WHERE trigger.event_id=${jobAlias}.source_event_id
+                AND trigger.type IN (
+                  'BondingCurveTradeObserved','BondingCurveStateUpdated',
+                  'BondingCurveCompleted','MigrationObserved','PumpSwapPoolActivated'
+                )
+                AND session.state IN (
+                  'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+                  'EXIT_PENDING_QUOTE','SELL_PENDING'
+                )
+                AND active_candidate.superseded_at IS NULL
+                AND entry_source.confirmation_status<>'orphaned'
+                AND ROW(
+                  session.entry_slot,session.entry_transaction_index,
+                  session.entry_instruction_index,COALESCE(session.entry_inner_instruction_index,-1)
+                ) < ROW(
+                  trigger.slot,trigger.transaction_index,
+                  trigger.instruction_index,COALESCE(trigger.inner_instruction_index,-1)
+                )
+            )
+          )
+        )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          WHERE trigger.event_id=position.trigger_event_id
+            AND trigger.raw_event_id=${jobAlias}.source_raw_event_id
+        )
+      )
+    )`;
 }
 
 async function latestPayload<T>(client: Client, sql: string, mint: string): Promise<T | null> {
