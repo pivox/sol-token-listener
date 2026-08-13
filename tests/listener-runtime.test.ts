@@ -19,7 +19,7 @@ void test('starts dependencies in exact order and exposes honest frozen pipeline
   assert.equal(runtime.state(), 'RUNNING');
   assert.deepEqual(runtime.pipelineState(), {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   assert.ok(Object.isFrozen(runtime.pipelineState()));
 });
@@ -36,7 +36,7 @@ void test('social degradation is visible without relabeling healthy chain pipeli
   assert.equal(runtime.state(), 'DEGRADED');
   assert.deepEqual(runtime.pipelineState(), {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    paperDecision: 'RUNNING', social: 'DEGRADED',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'DEGRADED',
   });
 });
 
@@ -52,7 +52,7 @@ void test('paper degradation is visible without relabeling healthy chain or soci
   assert.equal(runtime.state(), 'DEGRADED');
   assert.deepEqual(runtime.pipelineState(), {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    paperDecision: 'DEGRADED', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'DEGRADED', social: 'RUNNING',
   });
 });
 
@@ -165,7 +165,7 @@ void test('stops claims, closes producers, drains worker, and writes STOPPED hea
   assert.equal(runtime.state(), 'STOPPED');
   assert.deepEqual(runtime.pipelineState(), {
     httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED',
-    paperDecision: 'STOPPED', social: 'STOPPED',
+    qualification: 'STOPPED', paperDecision: 'STOPPED', social: 'STOPPED',
   });
 });
 
@@ -208,7 +208,7 @@ void test('reflects active component degradation and validates shutdown bounds',
   assert.equal(runtime.state(), 'DEGRADED');
   assert.deepEqual(runtime.pipelineState(), {
     httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED',
-    paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'DEGRADED', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   assert.throws(() => new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 0 }), TypeError);
 });

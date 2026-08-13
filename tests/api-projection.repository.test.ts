@@ -666,7 +666,7 @@ void test('expose les profils et positions observés avec des limites SQL borné
   const repository = new PostgresApiProjectionRepository(
     database,
     () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
     {
       positions: 1,
       snapshots: 2,
@@ -832,7 +832,7 @@ void test('exposes current clusters with per-cluster truncation and one shared m
   const repository = new PostgresApiProjectionRepository(
     database,
     () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
     {
       positions: 1,
       snapshots: 1,
@@ -935,7 +935,7 @@ void test('shares one bounded quote-asset budget across emitted clusters', async
   const repository = new PostgresApiProjectionRepository(
     database,
     () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
     {
       positions: 1,
       snapshots: 1,
@@ -1532,17 +1532,21 @@ void test('returns health without exposing database URLs or secrets', async () =
       pending_count: 5, leased_count: 2, retryable_failed_count: 1, exhausted_count: 3,
       last_success_at: openedAt, last_error_code: 'QUOTE_UNAVAILABLE',
     }];
+    if (call.text.includes('FROM qualification_reports AS report')) return [{
+      current_count: 2, last_success_at: openedAt,
+    }];
     return [];
   });
   const repository = new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: false, pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: false, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
   });
   const health = await repository.getHealth();
 
   assert.deepEqual(health, {
     status: 'DEGRADED', observedAt: openedAt.toISOString(),
     postgresql: { status: 'AVAILABLE' }, http: { status: 'UNAVAILABLE' },
-    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING' },
+    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING' },
+    qualification: { currentCount: 2, lastSuccessAt: openedAt.toISOString() },
     socialJobs: { pendingCount: 2, leasedCount: 1, retryableFailedCount: 3, exhaustedCount: 4 },
     paperDecisionJobs: {
       pendingCount: 5, leasedCount: 2, retryableFailedCount: 1, exhaustedCount: 3,
@@ -1559,6 +1563,12 @@ void test('returns health without exposing database URLs or secrets', async () =
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
+  const qualificationQuery = database.calls.find((call) => call.text.includes('FROM qualification_reports AS report'))?.text ?? '';
+  assert.match(qualificationQuery, /superseded_at IS NULL/u);
+  assert.match(qualificationQuery, /report\.purge_after > clock_timestamp\(\)/u);
+  assert.match(qualificationQuery, /qualification_event\.confirmation_status <> 'orphaned'/u);
+  assert.match(qualificationQuery, /source\.confirmation_status <> 'orphaned'/u);
+  assert.match(qualificationQuery, /raw\.confirmation_status <> 'orphaned'/u);
   assert.doesNotMatch(JSON.stringify(health), /:\/\/|DATABASE_URL|password|secret|localhost/u);
 });
 
@@ -1578,18 +1588,55 @@ void test('degrades only social health when its bounded count projection fails',
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
   assert.equal(health.postgresql.status, 'AVAILABLE');
   assert.deepEqual(health.pipeline, {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'DEGRADED',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'DEGRADED',
   });
   assert.deepEqual(health.socialJobs, {
     pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
   });
   assert.doesNotMatch(JSON.stringify(health), /metadata|private|failure|:\/\//u);
+});
+
+void test('degrades only qualification health when its bounded current aggregate fails', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
+    if (call.text.includes('listener_heartbeats')) return [{
+      updated_at: openedAt, started_at: openedAt, last_http_slot: '60',
+      last_websocket_slot: '60', last_finalized_slot: '59', last_signature: null,
+      pending_transactions: 0, active_sessions: 0, leased_transactions: 0,
+      exhausted_transactions: 0, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
+      scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
+    }];
+    if (call.text.includes('FROM social_enrichment_jobs')) return [{
+      pending_count: 0, leased_count: 0, retryable_failed_count: 0, exhausted_count: 0,
+    }];
+    if (call.text.includes('FROM paper_decision_jobs')) return [{
+      pending_count: 0, leased_count: 0, retryable_failed_count: 0, exhausted_count: 0,
+      last_success_at: null, last_error_code: null,
+    }];
+    if (call.text.includes('FROM qualification_reports AS report')) {
+      throw new Error('postgres://private/qualification-current-failure');
+    }
+    return [];
+  });
+  const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+  }).getHealth();
+
+  assert.equal(health.status, 'DEGRADED');
+  assert.equal(health.postgresql.status, 'AVAILABLE');
+  assert.deepEqual(health.pipeline, {
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'DEGRADED',
+    paperDecision: 'RUNNING', social: 'RUNNING',
+  });
+  assert.deepEqual(health.qualification, { currentCount: 0, lastSuccessAt: null });
+  assert.doesNotMatch(JSON.stringify(health), /postgres:\/\/|private|failure/u);
 });
 
 void test('degrades only paper health when its bounded queue projection fails', async () => {
@@ -1612,12 +1659,12 @@ void test('degrades only paper health when its bounded queue projection fails', 
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
   assert.deepEqual(health.pipeline, {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'DEGRADED', social: 'RUNNING',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'DEGRADED', social: 'RUNNING',
   });
   assert.deepEqual(health.paperDecisionJobs, {
     pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
@@ -1630,7 +1677,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
   const database = new FakeQueryable((call) =>
     call.text.includes('SELECT 1 AS available') ? [{ available: 1 }] : []);
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -1658,7 +1705,7 @@ void test('degrades stale heartbeats and reads the canonical runtime start colum
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -1680,7 +1727,7 @@ void test('degrades a heartbeat timestamped in the future', async () => {
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -1710,7 +1757,7 @@ void test('rejects invalid heartbeat runtime states and impossible runtime count
       return [];
     });
     const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
     }).getHealth();
     assert.equal(health.status, 'DEGRADED');
     assert.equal(health.postgresql.status, 'UNAVAILABLE');
@@ -1731,6 +1778,10 @@ void test('redacts hostile dynamic pipeline providers into canonical DEGRADED he
   });
   const providers: (() => unknown)[] = [
     () => { throw new Error('pipeline provider secret'); },
+    () => ({
+      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+      paperDecision: 'RUNNING', social: 'RUNNING',
+    }),
     () => getterState,
     () => hostileProxy,
   ];
@@ -1740,14 +1791,14 @@ void test('redacts hostile dynamic pipeline providers into canonical DEGRADED he
       new FakeQueryable(() => { throw new Error('must not query after invalid pipeline'); }),
       () => openedAt,
       provider as () => {
-        httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING'; paperDecision: 'RUNNING'; social: 'RUNNING';
+        httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING'; qualification: 'RUNNING'; paperDecision: 'RUNNING'; social: 'RUNNING';
       },
     );
     const health = await repository.getHealth();
     assert.equal(health.status, 'DEGRADED');
     assert.deepEqual(health.http, { status: 'UNAVAILABLE' });
     assert.deepEqual(health.pipeline, {
-      pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
+      pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', qualification: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
     });
     assert.ok(Object.isFrozen(health.pipeline));
     assert.doesNotMatch(JSON.stringify(health), /secret/u);
@@ -1759,6 +1810,7 @@ void test('snapshots a dynamic pipeline provider exactly once without retaining 
   let providerCalls = 0;
   const original = {
     httpAvailable: true, pumpfun: 'RUNNING' as const, pumpswap: 'RUNNING' as const,
+    qualification: 'RUNNING' as const,
     paperDecision: 'RUNNING' as const,
     social: 'RUNNING' as const,
   };
@@ -1783,7 +1835,7 @@ void test('snapshots a dynamic pipeline provider exactly once without retaining 
   original.pumpfun = 'RUNNING';
   assert.equal(providerCalls, 1);
   assert.deepEqual(health.pipeline, {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   assert.ok(Object.isFrozen(health.pipeline));
   assert.notEqual(health.pipeline, original);
