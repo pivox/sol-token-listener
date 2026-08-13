@@ -929,6 +929,14 @@ async function loadSession(
               trigger.instruction_index,COALESCE(trigger.inner_instruction_index,-1)
             )
         )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          WHERE trigger.event_id=$3 AND trigger.type='TokenLaunchDetected'
+            AND session.state IN (
+              'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+              'EXIT_PENDING_QUOTE','SELL_PENDING'
+            )
+        )
       )
       ORDER BY session.updated_at DESC,session.session_id DESC LIMIT 1`, [
       job.mint,job.sourceRawEventId,job.sourceEventId,
@@ -1058,6 +1066,15 @@ function exactPaperLineagePredicate(jobAlias:string):string{
               trigger.instruction_index,COALESCE(trigger.inner_instruction_index,-1)
             )
         )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          WHERE trigger.event_id=${jobAlias}.source_event_id
+            AND trigger.type='TokenLaunchDetected'
+            AND session.state IN (
+              'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+              'EXIT_PENDING_QUOTE','SELL_PENDING'
+            )
+        )
       )
     )
     AND NOT EXISTS (
@@ -1099,6 +1116,15 @@ function exactPaperLineagePredicate(jobAlias:string):string{
                 ) < ROW(
                   trigger.slot,trigger.transaction_index,
                   trigger.instruction_index,COALESCE(trigger.inner_instruction_index,-1)
+                )
+            )
+            OR EXISTS (
+              SELECT 1 FROM domain_events trigger
+              WHERE trigger.event_id=${jobAlias}.source_event_id
+                AND trigger.type='TokenLaunchDetected'
+                AND session.state IN (
+                  'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+                  'EXIT_PENDING_QUOTE','SELL_PENDING'
                 )
             )
           )

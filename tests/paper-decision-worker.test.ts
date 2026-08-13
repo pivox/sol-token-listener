@@ -10,6 +10,7 @@ import {
 } from '../src/domain/paper-trading.js';
 import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
+import type { ChainCursor } from '../src/domain/types.js';
 import type { CanonicalQualificationProjection } from '../src/ports/qualification-projection-repository.js';
 import {
   createDefaultQualificationRuleSet,
@@ -545,6 +546,37 @@ void test('retracts a paper session when its source revision becomes orphaned', 
   assert.equal(repository.completions[0]?.result.session?.state, 'PAPER_RETRACTED');
 });
 
+void test('retracts a later paper session when its launch becomes orphaned', async () => {
+  const operations: string[] = [];
+  const repository = new FakeRepository([claim()],operations);
+  const candidate = tradingCandidate('ELIGIBLE',Object.freeze({
+    slot:11n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+  }));
+  const session = createPaperStrategySession({
+    candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'QUALIFIED_ENTRY',positionId:POSITION.id,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:2_000,updatedAtMs:2_000,
+    purgeAfterMs:14_402_000,
+  });
+  repository.snapshotValue=snapshot({
+    asOfEvent:event('TokenLaunchDetected','evt_source','orphaned'),
+    canonicalLaunchActive:false,currentQualification:null,currentCandidate:candidate,
+    currentSession:session,activePosition:POSITION,
+    currentDecision:persistedDecision(candidate,'orphaned'),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.ok(operations.includes('reconcile-source'));
+  assert.equal(operations.includes('reconcile-evidence'),false);
+  assert.equal(repository.completions[0]?.result.session?.state,'PAPER_RETRACTED');
+});
+
 void test('recounts session evidence when a later trade becomes orphaned', async () => {
   const operations: string[] = [];
   const repository = new FakeRepository([claim()], operations);
@@ -831,12 +863,19 @@ function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecision
   });
 }
 
-function tradingCandidate(state:'ELIGIBLE'|'NOT_ELIGIBLE') {
+function tradingCandidate(
+  state:'ELIGIBLE'|'NOT_ELIGIBLE',
+  cursor:ChainCursor=Object.freeze({
+    slot:10n,transactionIndex:0,instructionIndex:1,innerInstructionIndex:null,
+  }),
+) {
   return createTradingCandidate({
     mint:'MINT',strategy:Object.freeze({ id:'validated-external-buys',version:1 }),
     qualificationReportId:`qreport_${'b'.repeat(64)}`,qualificationProfile:Object.freeze({
       id:'profile',version:1,fingerprint:'c'.repeat(64),
-    }),evidenceFingerprint:'d'.repeat(64),asOfEvent:event('QualificationUpdated','evt_qualification'),
+    }),evidenceFingerprint:'d'.repeat(64),asOfEvent:Object.freeze({
+      ...event('QualificationUpdated','evt_qualification'),cursor,
+    }),
     state,quoteAsset:Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' }),
     buyQuote:state === 'ELIGIBLE' ? quote('buy','SOL','MINT',1_000n,900n,900n) : null,
     reverseSellQuote:state === 'ELIGIBLE' ? quote('reverse','MINT','SOL',900n,800n,800n) : null,

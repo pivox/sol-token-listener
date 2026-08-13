@@ -363,7 +363,8 @@ export class PaperDecisionWorker {
       await this.repository.stageDecision(job,staged);
       if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
       if (snapshot.asOfEvent.confirmationStatus === 'orphaned') {
-        reconciled=compareCursors(candidate.asOf.cursor,snapshot.asOfEvent.cursor) === 0
+        reconciled=snapshot.asOfEvent.type === 'TokenLaunchDetected'
+          || compareCursors(candidate.asOf.cursor,snapshot.asOfEvent.cursor) === 0
           ? await this.strategy.reconcileSource({
             candidate,session,qualification:context.report,
             qualificationEvent:context.event,

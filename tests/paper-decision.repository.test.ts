@@ -570,6 +570,54 @@ void test('reloads the entry candidate when a later trade becomes orphaned', asy
   });
 });
 
+void test('reloads an active later session when its launch becomes orphaned', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await repository.enqueue(jobInput({
+      sourceEventId:TRADE_EVENT_ID,sourceRawEventId:TRADE_RAW_EVENT_ID,
+      inputFingerprint:'8'.repeat(64),
+    }));
+    const entryJob=await repository.claim({ nowMs:2_000,leaseMs:1_000 });
+    assert.ok(entryJob);
+    const entry=decisionResult('confirmed',Object.freeze({
+      slot:11n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+    }),2_000,'8');
+    await replaceCurrentQualification(pool,canonicalProjection(entry));
+    await repository.complete(entryJob,entry);
+    await pool.query(`UPDATE qualification_reports SET superseded_at=evaluated_at
+      WHERE mint=$1 AND superseded_at IS NULL`,[MINT]);
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+
+    await repository.enqueueLatest(MINT,'signature','orphaned');
+    const orphaned=await repository.claim({ nowMs:3_000,leaseMs:1_000 });
+    assert.ok(orphaned);
+    const snapshot=await repository.loadSnapshot(orphaned);
+
+    assert.equal(snapshot.asOfEvent.type,'TokenLaunchDetected');
+    assert.equal(snapshot.currentCandidate?.id,entry.candidate.id);
+    assert.equal(snapshot.currentSession?.candidateId,entry.candidate.id);
+    assert.equal(snapshot.activePosition,null);
+    await assert.rejects(repository.completeObsolete(orphaned));
+    const stored=await pool.query('SELECT status FROM paper_decision_jobs WHERE job_id=$1',[
+      orphaned.jobId,
+    ]);
+    assert.deepEqual(stored.rows,[{ status:'PROCESSING' }]);
+  });
+});
+
 void test('retries with a bounded lease and cancels only after exhaustion', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
