@@ -97,6 +97,9 @@ export class PaperTradingEngine {
     assertValidTimestampMs('occurredAtMs', openedAtMs);
 
     return this.repository.transact(async (transaction) => {
+      if(snapshot.expectedCurrentQualification!==undefined){
+        await transaction.requireCurrentQualification(snapshot.expectedCurrentQualification);
+      }
       const existing = await transaction.findPosition(positionId);
       if (existing !== null) {
         return this.reconcileOpenReplay(
@@ -353,8 +356,10 @@ interface OpenCommandHashes {
 }
 
 function hashOpenCommand(command: OpenPaperPositionCommand): OpenCommandHashes {
+  const { expectedCurrentQualification:_expectedCurrentQualification,...stableCommand }=command;
+  void _expectedCurrentQualification;
   const current = {
-    ...command,
+    ...stableCommand,
     trigger: command.trigger.id,
   };
   return freeze({
@@ -428,6 +433,14 @@ function validateOpenCommand(
     && (lineage.some((value) => value === undefined)
       || lineage.some((value) => value?.trim() === ''))
   ) invalidQuote('paper lineage');
+  if(
+    command.strategySessionId!==undefined
+    &&(
+      command.expectedCurrentQualification?.mint!==command.mint
+      ||command.expectedCurrentQualification.reportId!==command.qualificationReportId
+      ||command.expectedCurrentQualification.qualificationEventId!==command.trigger.id
+    )
+  )invalidQuote('current qualification');
   validateQualificationReport(command.qualification, qualificationProfile);
   if (command.qualification.blockers.length > 0) {
     throw new PaperTradingError('QUALIFICATION_BLOCKED', 'La qualification contient un blocker.');
@@ -613,6 +626,11 @@ function snapshotOpenCommand(
       strategySessionId:command.strategySessionId,
       qualificationReportId:command.qualificationReportId,
       candidateId:command.candidateId,
+      expectedCurrentQualification:freeze({
+        mint:command.expectedCurrentQualification?.mint ?? '',
+        reportId:command.expectedCurrentQualification?.reportId ?? '',
+        qualificationEventId:command.expectedCurrentQualification?.qualificationEventId ?? '',
+      }),
     }),
   });
 }

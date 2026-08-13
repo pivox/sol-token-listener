@@ -3,7 +3,11 @@ import test from 'node:test';
 import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
 import type { DomainEvent } from '../src/domain/events.js';
 import { createPaperStrategySession } from '../src/domain/paper-strategy.js';
-import type { PaperExecutionQuote, PaperPosition } from '../src/domain/paper-trading.js';
+import {
+  PaperTradingError,
+  type PaperExecutionQuote,
+  type PaperPosition,
+} from '../src/domain/paper-trading.js';
 import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
 import type { CanonicalQualificationProjection } from '../src/ports/qualification-projection-repository.js';
@@ -108,8 +112,8 @@ void test('rejects invalid qualification before paper quotes and candidate creat
   repository.snapshotValue=snapshot({ currentQualification:persisted });
   const services=fakeServices('ELIGIBLE');
   services.qualification.rejected=persisted;
-  services.qualification.beforeReauthorize=()=>operations.push('authorize');
-  services.candidates.beforeCreate=()=>operations.push('candidate');
+  services.qualification.beforeReauthorize=()=>{operations.push('authorize');};
+  services.candidates.beforeCreate=()=>{operations.push('candidate');};
   const quotes=new FakeQuotes(operations);
   const worker=new PaperDecisionWorker(
     repository,quotes,services.qualification,services.candidates,services.strategy,
@@ -182,6 +186,41 @@ void test('turns a typed transient quote error into a bounded repository retry',
   assert.equal(repository.failures[0]?.failure.code, 'QUOTE_UNAVAILABLE');
   assert.equal(repository.failures[0]?.failure.retryable, true);
   assert.ok(repository.failures[0]?.failure.terminalResult);
+});
+
+void test('retries only a typed stale qualification rejected at paper open',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const services=fakeServices('ELIGIBLE',operations);
+  services.strategy.openError=new PaperTradingError(
+    'QUALIFICATION_NOT_CURRENT','stale qualification',
+  );
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(operations,['stage','open','fail']);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'RPC_TRANSIENT',retryable:true,terminalResult:null,
+  });
+});
+
+void test('keeps non-stale paper open failures terminal',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const services=fakeServices('ELIGIBLE',operations);
+  services.strategy.openError=new PaperTradingError('POSITION_CONFLICT','conflict');
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.equal(repository.failures[0]?.failure.code,'DECISION_INVALID');
+  assert.equal(repository.failures[0]?.failure.retryable,false);
+  assert.equal(repository.failures[0]?.failure.terminalResult,repository.stages[0]);
 });
 
 void test('reuses the persisted decision for an active session without entry quote RPCs', async () => {
@@ -621,6 +660,7 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
     },
   };
   const strategy = {
+    openError:null as Error|null,
     prepare() {
       return state === 'ELIGIBLE' ? createPaperStrategySession({
         candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
@@ -632,6 +672,7 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
     },
     async open(input: { readonly session: ReturnType<typeof createPaperStrategySession> }) {
       operations.push('open');
+      if(this.openError!==null)throw this.openError;
       return Object.freeze({
         session:Object.freeze({ ...input.session,state:'WAITING_EXTERNAL_BUYS' as const,positionId:'position' }),
         sessionEvent:event('PaperStrategySessionUpdated','evt_session_open'),

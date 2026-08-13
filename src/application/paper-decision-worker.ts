@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { compareCursors } from '../domain/cursor.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { PaperStrategySessionV1 } from '../domain/paper-strategy.js';
-import type { PaperExecutionQuote } from '../domain/paper-trading.js';
+import { PaperTradingError,type PaperExecutionQuote } from '../domain/paper-trading.js';
 import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
 import type { QuoteAsset } from '../domain/types.js';
 import type { CanonicalQualificationProjection } from '../ports/qualification-projection-repository.js';
@@ -249,7 +249,10 @@ export class PaperDecisionWorker {
           qualification:rebuilt.report,qualificationEvent:rebuilt.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
         });
-      } catch {
+      } catch (error:unknown) {
+        if(isQualificationNotCurrent(error)){
+          return this.fail(job,lease,'RPC_TRANSIENT',true,null);
+        }
         return this.fail(job,lease,'DECISION_INVALID',false,staged);
       }
       return this.complete(job,lease,decision(
@@ -325,7 +328,12 @@ export class PaperDecisionWorker {
           candidate,session,qualification:context.report,qualificationEvent:context.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
         });
-      }catch{return this.fail(job,lease,'DECISION_INVALID',false,staged);}
+      }catch(error:unknown){
+        if(isQualificationNotCurrent(error)){
+          return this.fail(job,lease,'RPC_TRANSIENT',true,null);
+        }
+        return this.fail(job,lease,'DECISION_INVALID',false,staged);
+      }
       return this.complete(job,lease,decision(
         context,candidateResult,opened.session,opened.sessionEvent,
         opened.countedExternalBuys,opened.requestedAction,
@@ -523,6 +531,10 @@ function authorizedQualification(
     report:authorized.report,
     event:persisted.qualificationEvent,
   });
+}
+
+function isQualificationNotCurrent(error:unknown):boolean{
+  return error instanceof PaperTradingError&&error.code==='QUALIFICATION_NOT_CURRENT';
 }
 
 function manualReviewDecision(

@@ -1,10 +1,12 @@
 import type {
+  PaperCurrentQualificationIdentity,
   PaperPosition,
   PaperPositionClosedEventV1,
   PaperPositionOpenedEventV1,
   PaperStrategyIdentity,
   PaperTrade,
 } from '../domain/paper-trading.js';
+import { PaperTradingError } from '../domain/paper-trading.js';
 import { reconcileConfirmationStatus } from '../domain/confirmation-status.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type {
@@ -51,6 +53,33 @@ export class PostgresPaperTradingRepository implements PaperTradingRepository {
 
 class PostgresPaperTradingTransaction implements PaperTradingTransaction {
   public constructor(private readonly client: QueryClient) {}
+
+  public async requireCurrentQualification(
+    identity:PaperCurrentQualificationIdentity,
+  ):Promise<void>{
+    await this.client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended('qualification-projection:' || $1, 0))",
+      [identity.mint],
+    );
+    const current=await this.client.query(
+      `SELECT report.report_id FROM qualification_reports report
+       JOIN domain_events event ON event.event_id=report.qualification_event_id
+       WHERE report.mint=$1 AND report.report_id=$2
+         AND report.qualification_event_id=$3
+         AND event.event_id=$3 AND event.mint=$1 AND event.type='QualificationUpdated'
+         AND report.superseded_at IS NULL
+         AND report.purge_after > clock_timestamp()
+         AND report.confirmation_status <> 'orphaned'
+         AND event.confirmation_status <> 'orphaned'
+       FOR SHARE OF report,event`,
+      [identity.mint,identity.reportId,identity.qualificationEventId],
+    );
+    if(current.rows.length!==1){
+      throw new PaperTradingError(
+        'QUALIFICATION_NOT_CURRENT','Paper qualification is not current.',
+      );
+    }
+  }
 
   public async findPosition(id: string): Promise<PaperPosition | null> {
     const result = await this.client.query(

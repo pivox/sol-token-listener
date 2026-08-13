@@ -15,6 +15,7 @@ import type {
 import type { CanonicalQualificationProjection } from '../src/ports/qualification-projection-repository.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { PostgresPaperDecisionRepository } from '../src/storage/paper-decision.repository.js';
+import { PostgresPaperTradingRepository } from '../src/storage/paper-trading.repository.js';
 import { toJsonValue } from '../src/utils/json.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -435,6 +436,83 @@ void test('retry-only reconciliation failure preserves every paper domain row',a
   });
 });
 
+void test('rejects a staged paper open superseded before the atomic ledger guard',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    const decisions=new PostgresPaperDecisionRepository(pool);
+    await decisions.enqueue(jobInput());
+    const job=await decisions.claim({ nowMs:1_000,leaseMs:10_000 });
+    assert.ok(job);
+    const staged=decisionResult();
+    await decisions.stageDecision(job,staged);
+    await seedTrade(pool);
+    await replaceCurrentQualification(pool,canonicalProjection(
+      decisionResultAt(11n,2_000,'8'),
+    ));
+    const before=await paperOpenRows(pool);
+    const ledger=new PostgresPaperTradingRepository(pool);
+
+    await assert.rejects(ledger.transact(async transaction=>{
+      await transaction.requireCurrentQualification({
+        mint:MINT,reportId:staged.candidate.qualificationReportId,
+        qualificationEventId:staged.qualificationEvent.id,
+      });
+    }),hasCode('QUALIFICATION_NOT_CURRENT'));
+
+    assert.deepEqual(await paperOpenRows(pool),before);
+    assert.deepEqual(before,{ positions:0,trades:0,opened_events:0,sessions:1,candidates:1 });
+  });
+});
+
+void test('holds the qualification advisory lock from validation through paper commit',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    const ledger=new PostgresPaperTradingRepository(pool);
+    const projection=canonicalProjection(decisionResult());
+    let guardedResolve!:()=>void;
+    const guarded=new Promise<void>((resolve)=>{guardedResolve=resolve;});
+    let releaseResolve!:()=>void;
+    const releaseGuard=new Promise<void>((resolve)=>{releaseResolve=resolve;});
+    const holding=ledger.transact(async transaction=>{
+      await transaction.requireCurrentQualification({
+        mint:MINT,reportId:projection.reportId,
+        qualificationEventId:projection.qualificationEvent.id,
+      });
+      guardedResolve();
+      await releaseGuard;
+    });
+    await guarded;
+    const contender=await pool.connect();
+    try{
+      const blocked=await contender.query<{readonly acquired:boolean}>(
+        `SELECT pg_try_advisory_lock(
+          hashtextextended('qualification-projection:' || $1,0)
+        ) AS acquired`,[MINT],
+      );
+      assert.equal(blocked.rows[0]?.acquired,false);
+      releaseResolve();
+      await holding;
+      const acquired=await contender.query<{readonly acquired:boolean}>(
+        `SELECT pg_try_advisory_lock(
+          hashtextextended('qualification-projection:' || $1,0)
+        ) AS acquired`,[MINT],
+      );
+      assert.equal(acquired.rows[0]?.acquired,true);
+      await contender.query(
+        `SELECT pg_advisory_unlock(
+          hashtextextended('qualification-projection:' || $1,0)
+        )`,[MINT],
+      );
+    }finally{
+      releaseResolve();
+      await holding;
+      contender.release();
+    }
+  });
+});
+
 void test('stages, survives lease expiry, replays and completes one immutable decision', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
@@ -679,6 +757,22 @@ async function paperDomainRows(pool:pg.Pool):Promise<unknown>{
     (SELECT COALESCE(jsonb_agg(to_jsonb(buy_row) ORDER BY session_id,trade_id),'[]'::jsonb)
       FROM paper_external_buy_events buy_row) external_buys`);
   return result.rows[0];
+}
+
+async function paperOpenRows(pool:pg.Pool):Promise<unknown>{
+  const result=await pool.query(`SELECT
+    (SELECT COUNT(*)::int FROM paper_positions) positions,
+    (SELECT COUNT(*)::int FROM paper_trades) trades,
+    (SELECT COUNT(*)::int FROM domain_events WHERE type='PaperPositionOpened') opened_events,
+    (SELECT COUNT(*)::int FROM paper_strategy_sessions) sessions,
+    (SELECT COUNT(*)::int FROM trading_candidates) candidates`);
+  return result.rows[0];
+}
+
+function hasCode(code:string):(error:unknown)=>boolean{
+  return (error)=>(
+    typeof error==='object'&&error!==null&&'code' in error&&error.code===code
+  );
 }
 
 function decisionResult(

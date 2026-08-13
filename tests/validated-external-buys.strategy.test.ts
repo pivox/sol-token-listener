@@ -34,6 +34,15 @@ void test('stages an entry, opens once and closes only on the target external BU
   assert.equal(ledger.openCalls.length, 1);
   assert.equal(ledger.openCalls[0]?.strategySessionId, pending.id);
   assert.equal(ledger.openCalls[0]?.qualificationReportId, candidate.qualificationReportId);
+  assert.deepEqual(
+    (ledger.openCalls[0] as OpenPaperPositionCommand & {
+      readonly expectedCurrentQualification?:unknown;
+    }|undefined)?.expectedCurrentQualification,
+    Object.freeze({
+      mint:candidate.mint,reportId:candidate.qualificationReportId,
+      qualificationEventId:candidateEvent().id,
+    }),
+  );
 
   const first = await strategy.reconcile({
     candidate,session:opened.session,position:POSITION,creator:'creator',

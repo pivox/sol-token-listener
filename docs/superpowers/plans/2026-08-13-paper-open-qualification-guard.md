@@ -16,15 +16,15 @@
 - Modify: `tests/paper-decision-worker.test.ts`
 - Modify: `src/application/paper-decision-worker.ts`
 
-- [ ] **Step 1: Write failing order and tamper tests**
+- [x] **Step 1: Write failing order and tamper tests**
 
 Add a paper-mode test whose qualification rebuilder records `authorize` and throws, while the quote router records `quote` and candidate builder records `candidate`. Assert the run fails with `DECISION_INVALID`, the trace is exactly `['authorize','fail']`, and quote/candidate/stage/complete counts are zero.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run `npx tsx --test --test-name-pattern='before paper quotes' tests/paper-decision-worker.test.ts` and expect a quote call before the authorization failure.
 
-- [ ] **Step 3: Move authorization before quotes**
+- [x] **Step 3: Move authorization before quotes**
 
 Immediately after `currentQualification` is required, call:
 
@@ -39,11 +39,11 @@ try {
 
 Then perform quotes and candidate creation using `rebuilt`, with candidate creation retaining its own invalid-decision catch.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run the focused worker test and the complete worker test file; expect zero failures.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Commit the worker and test changes as `fix: authorize paper qualification before quotes (#15)`.
 
@@ -57,15 +57,15 @@ Commit the worker and test changes as `fix: authorize paper qualification before
 - Modify: `tests/paper-trading-engine.test.ts`
 - Modify: `tests/validated-external-buys.strategy.test.ts`
 
-- [ ] **Step 1: Write failing engine contract tests**
+- [x] **Step 1: Write failing engine contract tests**
 
 Extend the fake transaction trace and assert a strategy-linked `open` calls `requireCurrentQualification({mint,reportId,qualificationEventId})` before `findPosition`, while `reconcileOpen` never calls the guard. Add a typed stale failure test asserting no find/insert call follows the guard failure.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run `npx tsx --test --test-name-pattern='current qualification' tests/paper-trading-engine.test.ts`; expect the missing transaction method/order assertion to fail.
 
-- [ ] **Step 3: Add command and transaction types**
+- [x] **Step 3: Add command and transaction types**
 
 Add `PaperCurrentQualificationIdentity`, an optional `expectedCurrentQualification` on `OpenPaperPositionCommand`, and:
 
@@ -75,11 +75,11 @@ requireCurrentQualification(identity:PaperCurrentQualificationIdentity):Promise<
 
 Add a distinct `QUALIFICATION_NOT_CURRENT` `PaperTradingError` code.
 
-- [ ] **Step 4: Guard new opens first**
+- [x] **Step 4: Guard new opens first**
 
 Have `ValidatedExternalBuysStrategy.open` populate the expected identity from candidate mint/report and qualification event id. In `PaperTradingEngine.open`, require this identity for strategy-linked commands and call `requireCurrentQualification` as the first callback operation. Leave `reconcileOpen` unchanged.
 
-- [ ] **Step 5: Verify GREEN**
+- [x] **Step 5: Verify GREEN**
 
 Run the engine and strategy test files and expect zero failures.
 
@@ -90,7 +90,7 @@ Run the engine and strategy test files and expect zero failures.
 - Modify: `tests/paper-trading.repository.test.ts`
 - Modify: `tests/paper-decision.repository.test.ts` or add the live orchestration case to `tests/paper-trading.repository.test.ts`
 
-- [ ] **Step 1: Write failing repository SQL and live race tests**
+- [x] **Step 1: Write failing repository SQL and live race tests**
 
 Assert `requireCurrentQualification` first executes:
 
@@ -102,15 +102,15 @@ SELECT pg_advisory_xact_lock(
 
 Then assert its validation query requires exact `report_id`, `mint`, `qualification_event_id`, `superseded_at IS NULL`, `purge_after > clock_timestamp()`, and non-orphaned report/event confirmation. In live PostgreSQL, stage an entry, pause before open, replace the current qualification, release open, and assert typed rejection with no new paper position, trade, or opened event. Add a lock-serialization case showing qualification replacement waits while open holds this advisory lock.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run the focused repository tests with `TEST_DATABASE_URL=postgresql:///postgres`; expect the missing method/query failure.
 
-- [ ] **Step 3: Implement the PostgreSQL guard**
+- [x] **Step 3: Implement the PostgreSQL guard**
 
 Acquire the shared advisory lock, then execute a `SELECT ... FOR SHARE` joining the qualification event and accept exactly one row. Otherwise throw `PaperTradingError('QUALIFICATION_NOT_CURRENT', ...)`. Because this is the first paper transaction operation and qualification projection acquires only the same qualification lock before its own rows, no paper-held lock can participate in a cycle.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run focused unit and live PostgreSQL tests and expect zero position/trade/open-event changes on stale rejection.
 
@@ -120,22 +120,22 @@ Run focused unit and live PostgreSQL tests and expect zero position/trade/open-e
 - Modify: `src/application/paper-decision-worker.ts`
 - Modify: `tests/paper-decision-worker.test.ts`
 
-- [ ] **Step 1: Write failing mapping tests**
+- [x] **Step 1: Write failing mapping tests**
 
 Make the fake strategy throw `PaperTradingError('QUALIFICATION_NOT_CURRENT', ...)` and assert `RPC_TRANSIENT`, retryable, null terminal result. Make it throw another paper error and assert the existing `DECISION_INVALID`, nonretryable, staged result behavior.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run the two focused worker tests and expect stale to be incorrectly mapped to `DECISION_INVALID`.
 
-- [ ] **Step 3: Add narrow mapping**
+- [x] **Step 3: Add narrow mapping**
 
 In the new-position open catch, branch only when `error instanceof PaperTradingError && error.code === 'QUALIFICATION_NOT_CURRENT'`; use `fail(...,'RPC_TRANSIENT',true,null)`. Preserve the existing catch behavior for every other error.
 
-- [ ] **Step 4: Verify GREEN and regression matrix**
+- [x] **Step 4: Verify GREEN and regression matrix**
 
 Run focused worker, engine, strategy, and repository tests; then live PostgreSQL paper tests, `npm test`, `npm run check`, `npm run lint`, and `git diff --check`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Commit the atomic boundary, mapping, and tests as `fix: guard paper opens with current qualification (#15)`.

@@ -86,7 +86,10 @@ export class ValidatedExternalBuysStrategy {
       buyQuote:candidate.buyQuote,reverseSellQuote:candidate.reverseSellQuote,
       maximumRoundTripLossBps:input.maximumRoundTripLossBps,
       strategySessionId:session.id,qualificationReportId:candidate.qualificationReportId,
-      candidateId:candidate.id,
+      candidateId:candidate.id,expectedCurrentQualification:Object.freeze({
+        mint:candidate.mint,reportId:candidate.qualificationReportId,
+        qualificationEventId:input.qualificationEvent.id,
+      }),
     });
     const updated = createPaperStrategySession({
       candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'QUALIFIED_ENTRY',
@@ -120,7 +123,10 @@ export class ValidatedExternalBuysStrategy {
       buyQuote:candidate.buyQuote,reverseSellQuote:candidate.reverseSellQuote,
       maximumRoundTripLossBps:input.maximumRoundTripLossBps,
       strategySessionId:session.id,qualificationReportId:candidate.qualificationReportId,
-      candidateId:candidate.id,
+      candidateId:candidate.id,expectedCurrentQualification:Object.freeze({
+        mint:candidate.mint,reportId:candidate.qualificationReportId,
+        qualificationEventId:input.qualificationEvent.id,
+      }),
     });
     if (position.status !== 'PAPER_HOLDING') {
       throw new TypeError('Paper strategy entry recovery did not find a holding position.');
