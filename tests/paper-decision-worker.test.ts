@@ -101,6 +101,32 @@ void test('reauthorizes a JSON-deserialized qualification before creating a cand
   assert.equal(services.candidates.calls.length,1);
 });
 
+void test('rejects invalid qualification before paper quotes and candidate creation',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const persisted=canonicalQualification();
+  repository.snapshotValue=snapshot({ currentQualification:persisted });
+  const services=fakeServices('ELIGIBLE');
+  services.qualification.rejected=persisted;
+  services.qualification.beforeReauthorize=()=>operations.push('authorize');
+  services.candidates.beforeCreate=()=>operations.push('candidate');
+  const quotes=new FakeQuotes(operations);
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(operations,['authorize','fail']);
+  assert.equal(quotes.calls,0);
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(repository.stages.length,0);
+  assert.equal(repository.completions.length,0);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'DECISION_INVALID',retryable:false,terminalResult:null,
+  });
+});
+
 for(const mutation of canonicalTamperingCases()){
   void test(`rejects tampered persisted qualification ${mutation.name} before paper writes`,async()=>{
     const repository=new FakeRepository([claim()]);
@@ -562,7 +588,9 @@ class FakeRepository implements PaperDecisionRepository {
 class FakeQuotes {
   public calls = 0;
   public error: PaperQuoteError|null = null;
+  public constructor(private readonly operations:string[]=[]){ }
   public async quote(request: { readonly side:'BUY'|'SELL'; readonly amountInRaw:bigint }): Promise<PaperExecutionQuote> {
+    this.operations.push('quote');
     this.calls += 1;
     if (this.error !== null) throw this.error;
     return request.side === 'BUY'
@@ -586,7 +614,9 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
   const candidates = {
     calls:[] as Parameters<ConstructorParameters<typeof PaperDecisionWorker>[3]['create']>[0][],
     gate:Promise.resolve(),
+    beforeCreate:()=>undefined,
     async create(input: Parameters<ConstructorParameters<typeof PaperDecisionWorker>[3]['create']>[0]) {
+      this.beforeCreate();
       this.calls.push(input); await this.gate; return candidateResult;
     },
   };
@@ -650,8 +680,10 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
   const qualification = {
     calls:[] as CanonicalQualificationProjection[],
     rejected:null as CanonicalQualificationProjection|null,
+    beforeReauthorize:()=>undefined,
     authorizedReport:rebuilt.report,
     reauthorize(projection:CanonicalQualificationProjection) {
+      this.beforeReauthorize();
       this.calls.push(projection);
       if(projection===this.rejected)throw new TypeError('invalid qualification');
       return Object.freeze({

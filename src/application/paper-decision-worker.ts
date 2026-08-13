@@ -175,6 +175,13 @@ export class PaperDecisionWorker {
       return this.fail(job,lease,'RPC_TRANSIENT',true,null);
     }
 
+    let rebuilt:RebuiltQualification;
+    try {
+      rebuilt=authorizedQualification(this.qualification.reauthorize(persisted),persisted);
+    } catch {
+      return this.fail(job,lease,'DECISION_INVALID',false,null);
+    }
+
     const quoteAsset=snapshot.launch.quoteAssets.find((asset) => (
       this.options.quoteMintAllowlist.includes(asset.mint)
     )) ?? null;
@@ -199,10 +206,8 @@ export class PaperDecisionWorker {
         else reverseSellQuote=null;
       }
     }
-    let rebuilt: RebuiltQualification;
     let candidateResult: TradingCandidateResult;
     try {
-      rebuilt=authorizedQualification(this.qualification.reauthorize(persisted),persisted);
       candidateResult=await this.candidates.create({
         snapshot,report:rebuilt.report,reportId:rebuilt.reportId,
         qualificationEvent:rebuilt.event,evidenceFingerprint:rebuilt.evidenceFingerprint,
