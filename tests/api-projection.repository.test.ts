@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   ApiProjectionDataError,
   PostgresApiProjectionRepository,
+  type ApiProjectionPipelineState,
   type Queryable,
 } from '../src/storage/api-projection.repository.js';
 import {
@@ -22,6 +23,13 @@ interface Call {
   readonly text: string;
   readonly values: readonly unknown[] | undefined;
 }
+
+// @ts-expect-error qualification is mandatory for every pipeline provider.
+const missingQualificationPipeline: ApiProjectionPipelineState = {
+  httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+  paperDecision: 'RUNNING', social: 'RUNNING',
+};
+void missingQualificationPipeline;
 
 class FakeQueryable implements Queryable {
   public readonly calls: Call[] = [];
@@ -1567,6 +1575,18 @@ void test('returns health without exposing database URLs or secrets', async () =
   assert.match(qualificationQuery, /superseded_at IS NULL/u);
   assert.match(qualificationQuery, /report\.purge_after > clock_timestamp\(\)/u);
   assert.match(qualificationQuery, /qualification_event\.confirmation_status <> 'orphaned'/u);
+  assert.match(qualificationQuery, /qualification_event\.source = 'qualification'/u);
+  assert.match(qualificationQuery, /qualification_event\.program = source\.program/u);
+  assert.match(qualificationQuery, /qualification_event\.signature = source\.signature/u);
+  assert.match(qualificationQuery, /qualification_event\.slot = report\.as_of_slot/u);
+  assert.match(qualificationQuery, /qualification_event\.transaction_index = report\.as_of_transaction_index/u);
+  assert.match(qualificationQuery, /qualification_event\.instruction_index = report\.as_of_instruction_index/u);
+  assert.match(qualificationQuery, /qualification_event\.inner_instruction_index[\s\S]*report\.as_of_inner_instruction_index/u);
+  assert.match(qualificationQuery, /qualification_event\.observed_at = report\.evaluated_at/u);
+  assert.match(qualificationQuery, /source\.slot = report\.as_of_slot/u);
+  assert.match(qualificationQuery, /source\.transaction_index = report\.as_of_transaction_index/u);
+  assert.match(qualificationQuery, /source\.instruction_index = report\.as_of_instruction_index/u);
+  assert.match(qualificationQuery, /source\.inner_instruction_index[\s\S]*report\.as_of_inner_instruction_index/u);
   assert.match(qualificationQuery, /source\.confirmation_status <> 'orphaned'/u);
   assert.match(qualificationQuery, /raw\.confirmation_status <> 'orphaned'/u);
   assert.doesNotMatch(JSON.stringify(health), /:\/\/|DATABASE_URL|password|secret|localhost/u);

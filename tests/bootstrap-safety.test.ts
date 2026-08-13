@@ -73,7 +73,7 @@ void test('migrates, starts listener before API, then closes listener before API
   const calls: string[] = [];
   const pool = {};
   const runtime = listener(calls, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   await runApplication(dependencies(calls, {
     loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: true }),
@@ -215,7 +215,7 @@ void test('listener startup failure fails the process and cleans listener before
       async close() { calls.push('listener.close'); },
       state: () => 'DEGRADED',
       pipelineState: () => ({
-        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
+        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', qualification: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
       }),
     }),
   })), (error: unknown) => error === startupFailure);
@@ -238,7 +238,7 @@ void test('API bind failure aggregates listener, server, and database cleanup in
       async close() { calls.push('listener.close'); throw listenerFailure; },
       state: () => 'RUNNING',
       pipelineState: () => ({
-        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
       }),
     }),
     createApiServer: () => ({
@@ -319,7 +319,7 @@ function dependencies(
   overrides: Partial<ApplicationDependencies> = {},
 ): Partial<ApplicationDependencies> {
   const runtime = listener(calls, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   return {
     loadConfig: () => config,

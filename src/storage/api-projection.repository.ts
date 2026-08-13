@@ -92,16 +92,12 @@ export interface ApiProjectionPipelineState {
   readonly httpAvailable: boolean;
   readonly pumpfun: ApiHealth['pipeline']['pumpfun'];
   readonly pumpswap: ApiHealth['pipeline']['pumpswap'];
-  readonly qualification?: ApiHealth['pipeline']['qualification'];
+  readonly qualification: ApiHealth['pipeline']['qualification'];
   readonly paperDecision: ApiHealth['pipeline']['paperDecision'];
   readonly social: ApiHealth['pipeline']['social'];
 }
 
 export type ApiProjectionPipelineStateProvider = () => ApiProjectionPipelineState;
-
-type ValidatedPipelineState = ApiProjectionPipelineState & Readonly<{
-  qualification: ApiHealth['pipeline']['qualification'];
-}>;
 
 export interface ApiHolderProjectionLimits {
   readonly positions: number;
@@ -386,7 +382,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
 
   public async getHealth(): Promise<ApiHealth> {
     const observedAt = validDate(this.clock());
-    let pipeline: ValidatedPipelineState = DEGRADED_PIPELINE_STATE;
+    let pipeline = DEGRADED_PIPELINE_STATE;
     try {
       pipeline = pipelineState(this.pipeline);
       const database = await this.database.query('SELECT 1 AS available');
@@ -446,15 +442,15 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         const qualificationCounts = await this.database.query(
           `SELECT COUNT(*)::int AS current_count, MAX(report.evaluated_at) AS last_success_at
            FROM qualification_reports AS report
-           JOIN domain_events AS qualification_event
-             ON qualification_event.event_id = report.qualification_event_id
-            AND qualification_event.raw_event_id = report.source_raw_event_id
-            AND qualification_event.mint = report.mint
-            AND qualification_event.type = 'QualificationUpdated'
            JOIN domain_events AS source
              ON source.event_id = report.source_event_id
             AND source.raw_event_id = report.source_raw_event_id
             AND source.mint = report.mint
+            AND source.slot = report.as_of_slot
+            AND source.transaction_index = report.as_of_transaction_index
+            AND source.instruction_index = report.as_of_instruction_index
+            AND source.inner_instruction_index
+              IS NOT DISTINCT FROM report.as_of_inner_instruction_index
             AND source.type IN (
               'TokenLaunchDetected', 'BondingCurveTradeObserved',
               'BondingCurveStateUpdated', 'BondingCurveCompleted',
@@ -470,15 +466,32 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
             AND raw.transaction_index = source.transaction_index
             AND raw.instruction_index = source.instruction_index
             AND raw.inner_instruction_index IS NOT DISTINCT FROM source.inner_instruction_index
+           JOIN domain_events AS qualification_event
+             ON qualification_event.event_id = report.qualification_event_id
+            AND qualification_event.raw_event_id = report.source_raw_event_id
+            AND qualification_event.mint = report.mint
+            AND qualification_event.type = 'QualificationUpdated'
+            AND qualification_event.source = 'qualification'
+            AND qualification_event.program = source.program
+            AND qualification_event.signature = source.signature
+            AND qualification_event.slot = report.as_of_slot
+            AND qualification_event.transaction_index = report.as_of_transaction_index
+            AND qualification_event.instruction_index = report.as_of_instruction_index
+            AND qualification_event.inner_instruction_index
+              IS NOT DISTINCT FROM report.as_of_inner_instruction_index
+            AND qualification_event.blockchain_time
+              IS NOT DISTINCT FROM source.blockchain_time
+            AND qualification_event.observed_at = report.evaluated_at
+            AND qualification_event.payload_version = 1
            WHERE report.superseded_at IS NULL
              AND report.purge_after > clock_timestamp()
              AND report.confirmation_status <> 'orphaned'
              AND qualification_event.confirmation_status <> 'orphaned'
              AND source.confirmation_status <> 'orphaned'
              AND raw.confirmation_status <> 'orphaned'
-             AND report.confirmation_status = qualification_event.confirmation_status
              AND report.confirmation_status = source.confirmation_status
-             AND report.confirmation_status = raw.confirmation_status`,
+             AND report.confirmation_status = raw.confirmation_status
+             AND report.confirmation_status = qualification_event.confirmation_status`,
         );
         const qualificationRow = qualificationCounts.rows[0];
         if (qualificationRow !== undefined) qualification = qualificationHealthFromRow(qualificationRow);
@@ -1837,7 +1850,7 @@ function pageLimit(value: number): number {
 }
 
 export const HEARTBEAT_STALE_AFTER_MS = 30_000;
-const DEGRADED_PIPELINE_STATE: ValidatedPipelineState = Object.freeze({
+const DEGRADED_PIPELINE_STATE: ApiProjectionPipelineState = Object.freeze({
   httpAvailable: false,
   pumpfun: 'DEGRADED',
   pumpswap: 'DEGRADED',
@@ -1940,7 +1953,7 @@ function listenerRuntimeState(value: unknown): ListenerRuntimeState {
   return value as ListenerRuntimeState;
 }
 
-function pipelineState(provider: ApiProjectionPipelineStateProvider): ValidatedPipelineState {
+function pipelineState(provider: ApiProjectionPipelineStateProvider): ApiProjectionPipelineState {
   const value: unknown = provider();
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
   const keys = Reflect.ownKeys(value);
@@ -1985,7 +1998,7 @@ function isPipelineRuntimeState(
 function healthResult(
   observedAt: Date, databaseAvailable: boolean, degraded: boolean,
   checkpoints: ReadonlyMap<string, string>, heartbeat: ApiHealth['heartbeat'], lagSlots: string | null,
-  pipeline: ValidatedPipelineState,
+  pipeline: ApiProjectionPipelineState,
   qualification: ApiHealth['qualification'],
   socialJobs: ApiHealth['socialJobs'],
   paperDecisionJobs: ApiHealth['paperDecisionJobs'],

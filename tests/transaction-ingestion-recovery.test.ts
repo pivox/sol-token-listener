@@ -276,7 +276,7 @@ void test('exposes a real retryable failed inbox row through persisted API healt
     const health = await new PostgresApiProjectionRepository(
       pool,
       () => new Date(),
-      { httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING' },
+      { httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING' },
     ).getHealth();
     assert.equal(health.heartbeat.backlogCount, 1);
     assert.equal(health.heartbeat.leasedCount, 0);
@@ -285,6 +285,52 @@ void test('exposes a real retryable failed inbox row through persisted API healt
       status: 'OK', backlog: 0,
     });
     await heartbeat.stop();
+  });
+});
+
+void test('counts only qualification reports with canonical active lineage in PostgreSQL health', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const fixture = await loadPumpFixture('create-v2-initial-buy-mainnet.json');
+    const transaction = migrationTransaction(fixture.transaction);
+    const inbox = new PostgresTransactionInboxRepository(pool);
+    await inbox.enqueue(Object.freeze({
+      signature: transaction.signature,
+      slot: transaction.slot,
+      source: 'WEBSOCKET' as const,
+      programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
+      confirmationStatus: 'confirmed' as const,
+      observedAtMs: Date.now(),
+    }));
+    assert.deepEqual(await worker(inbox, transaction, pipeline(pool, null, [])).runOnce(), {
+      kind: 'processed', signature: transaction.signature,
+    });
+    const health = async () => new PostgresApiProjectionRepository(pool, () => new Date(), {
+      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING',
+      paperDecision: 'RUNNING', social: 'RUNNING',
+    }).getHealth();
+    assert.equal((await health()).qualification.currentCount, 1);
+    const lineage = (await pool.query(`SELECT qualification.event_id, qualification.source,
+      qualification.program, qualification.signature, qualification.slot,
+      qualification.transaction_index, qualification.instruction_index,
+      qualification.inner_instruction_index
+      FROM qualification_reports AS report
+      JOIN domain_events AS qualification ON qualification.event_id = report.qualification_event_id`)).rows[0];
+    assert.ok(lineage);
+    for (const [column, invalidValue] of [
+      ['source', 'invalid-source'],
+      ['program', 'invalid-program'],
+      ['signature', 'invalid-signature'],
+      ['slot', '999999999999999999999999999999'],
+    ] as const) {
+      await pool.query(`UPDATE domain_events SET ${column} = $1 WHERE event_id = $2`, [
+        invalidValue, lineage.event_id,
+      ]);
+      assert.equal((await health()).qualification.currentCount, 0, column);
+      await pool.query(`UPDATE domain_events SET ${column} = $1 WHERE event_id = $2`, [
+        lineage[column], lineage.event_id,
+      ]);
+      assert.equal((await health()).qualification.currentCount, 1, `${column}:restored`);
+    }
   });
 });
 
