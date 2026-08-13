@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
 import { createTokenLaunchDetectedEvent } from '../src/domain/launchpad-events.js';
+import { QualificationProjectionService } from '../src/application/qualification-projection.service.js';
+import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
+import { SocialQualificationRefreshService } from '../src/application/social-qualification-refresh.service.js';
 import { createInitialDetectedTransition } from '../src/domain/state-transitions.js';
 import type { TokenMetadataSnapshot } from '../src/domain/pumpfun-observation.js';
 import type { SocialJobResult } from '../src/ports/social-evidence-repository.js';
@@ -10,6 +13,9 @@ import type { LaunchpadEventBatch } from '../src/ports/launchpad-event-sink.js';
 import type { PublicHttpResult } from '../src/ports/public-http-client.js';
 import { PublicSocialVerificationProvider } from '../src/social/public-social-verification.provider.js';
 import { migrateDatabase } from '../src/storage/database.js';
+import { createDefaultQualificationRuleSet,QualificationEngine } from '../src/qualification/qualification-engine.js';
+import { PostgresPaperDecisionRepository } from '../src/storage/paper-decision.repository.js';
+import { PostgresQualificationProjectionRepository } from '../src/storage/qualification-projection.repository.js';
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
 import {
   PostgresSocialEvidenceRepository,
@@ -41,7 +47,7 @@ void test('claims one durable job exclusively and renews only its active lease',
       status: 'PROCESSING', attempts: 1, attempts_in_cycle: 1,
       lease_ms: String(NOW + 1 + 6_000),
     });
-    await repository.complete(claimed, await successfulResult(claimed.sourceLaunchEventId));
+    await completeJob(repository,claimed,await successfulResult(claimed.sourceLaunchEventId));
     assert.equal((await pool.query('SELECT status FROM social_enrichment_jobs')).rows[0].status, 'COMPLETED');
   });
 });
@@ -117,9 +123,11 @@ void test('persists explicit failed evidence when a transient social retry is ex
     assert.ok(claimed);
     const terminalResult = await transientSocialResult(claimed.sourceLaunchEventId);
 
-    await repository.fail(claimed, Object.freeze({
+    const failure=Object.freeze({
       code: 'HTTP_TRANSIENT', retryable: true, observedAtMs: NOW + 20,
-    }), terminalResult);
+    });
+    await repository.persist(claimed,terminalResult,failure);
+    await repository.complete(claimed);
 
     const stored = await pool.query(`SELECT job.status,job.error_code,
       job.retry_exhausted_at,collection.collection_status,
@@ -143,7 +151,7 @@ void test('atomically completes a leased job with safe projections and one SSE r
     const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
     assert.ok(claimed);
     const result = await successfulResult(claimed.sourceLaunchEventId);
-    await repository.complete(claimed, result);
+    await completeJob(repository,claimed,result);
 
     const counts = await pool.query(`SELECT
       (SELECT COUNT(*)::int FROM token_metadata_snapshots) metadata,
@@ -165,9 +173,98 @@ void test('atomically completes a leased job with safe projections and one SSE r
       retention_seconds: 14_400,
     });
 
-    await repository.complete(claimed, result);
+    await repository.complete(claimed);
     assert.equal((await pool.query(`SELECT COUNT(*)::int count FROM api_event_stream
       WHERE event_type='SocialEvidenceCollected'`)).rows[0].count, 1);
+  });
+});
+
+void test('reclaims persisted evidence in a separate bounded projection retry cycle',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    await new PostgresLaunchpadEventRepository(pool,4,Date.now,{
+      maxAttempts:2,baseDelayMs:500,
+    }).record(launchBatch(MINT,'signature-social-projection-retry','confirmed'));
+    const repository=new PostgresSocialEvidenceRepository(pool);
+    const providerJob=await repository.claim({ leaseMs:5_000,nowMs:NOW });
+    assert.ok(providerJob);
+    const result=await successfulResult(providerJob.sourceLaunchEventId);
+    await repository.persist(providerJob,result);
+    const pending=await pool.query(`SELECT status,attempts_in_cycle,terminal_at,purge_after
+      FROM social_enrichment_jobs`);
+    assert.deepEqual(pending.rows,[{
+      status:'PROCESSING',attempts_in_cycle:0,terminal_at:null,purge_after:null,
+    }]);
+
+    const firstRetry=await repository.claim({ leaseMs:5_000,nowMs:NOW+5_001 });
+    assert.ok(firstRetry);
+    assert.equal(firstRetry.evidencePersisted,true);
+    assert.equal(firstRetry.attemptsInCycle,1);
+    await repository.release(firstRetry,Object.freeze({
+      code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+5_010,
+    }));
+    const secondRetry=await repository.claim({ leaseMs:5_000,nowMs:NOW+5_510 });
+    assert.ok(secondRetry);
+    assert.equal(secondRetry.evidencePersisted,true);
+    assert.equal(secondRetry.attemptsInCycle,2);
+    await repository.release(secondRetry,Object.freeze({
+      code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+5_520,
+    }));
+
+    assert.deepEqual(await repository.counts(),{
+      pending:0,processing:0,retryableFailed:0,exhausted:1,
+    });
+    const stored=await pool.query(`SELECT status,
+      (SELECT COUNT(*)::int FROM social_evidence_collections) collections,
+      (SELECT COUNT(*)::int FROM domain_events WHERE type='SocialEvidenceCollected') events
+      FROM social_enrichment_jobs`);
+    assert.deepEqual(stored.rows,[{ status:'CANCELLED',collections:1,events:1 }]);
+  });
+});
+
+void test('rebuilds qualification from persisted social evidence before enqueuing exact paper work',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    await enqueue(pool,MINT,'signature-social-live-refresh');
+    const liveNow=Date.now();
+    await pool.query(`UPDATE raw_chain_events SET observed_at=$1 WHERE mint=$2`,[
+      new Date(liveNow),MINT,
+    ]);
+    await pool.query(`UPDATE domain_events SET observed_at=$1 WHERE mint=$2`,[
+      new Date(liveNow),MINT,
+    ]);
+    const rebuilder=new QualificationRebuildService(new QualificationEngine(
+      createDefaultQualificationRuleSet(60),
+    ));
+    const qualification=new QualificationProjectionService(
+      new PostgresQualificationProjectionRepository(pool,rebuilder),rebuilder,['quote'],
+    );
+    const before=await qualification.rebuild(MINT,'ERROR');
+    assert.ok(before.projection);
+    const paper=new PostgresPaperDecisionRepository(pool,{},
+      createDefaultQualificationRuleSet(60));
+    const refresh=new SocialQualificationRefreshService(qualification,paper);
+    const social=new PostgresSocialEvidenceRepository(pool);
+    const job=await social.claim({ leaseMs:5_000,nowMs:liveNow });
+    assert.ok(job);
+    await social.persist(job,await successfulResult(job.sourceLaunchEventId));
+
+    await refresh.refresh(MINT);
+    await social.complete(job);
+
+    const current=await pool.query(`SELECT report_id,source_event_id,source_raw_event_id,
+      evidence_fingerprint FROM qualification_reports
+      WHERE mint=$1 AND profile_id='pumpfun-v1-initial'
+        AND profile_version=1 AND superseded_at IS NULL`,[MINT]);
+    assert.equal(current.rowCount,1);
+    assert.notEqual(current.rows[0]?.report_id,before.projection.reportId);
+    const queued=await pool.query(`SELECT source_event_id,source_raw_event_id,
+      source_confirmation_status,input_fingerprint,status FROM paper_decision_jobs`);
+    assert.deepEqual(queued.rows,[{
+      source_event_id:current.rows[0]?.source_event_id,
+      source_raw_event_id:current.rows[0]?.source_raw_event_id,
+      source_confirmation_status:'confirmed',
+      input_fingerprint:current.rows[0]?.evidence_fingerprint,
+      status:'PENDING',
+    }]);
   });
 });
 
@@ -180,7 +277,7 @@ void test('rolls back every projection when the derived event cannot be inserted
     const result = await successfulResult(claimed.sourceLaunchEventId);
     await pool.query(`ALTER TABLE domain_events ADD CONSTRAINT reject_social_completion
       CHECK (type <> 'SocialEvidenceCollected')`);
-    await assert.rejects(repository.complete(claimed, result));
+    await assert.rejects(repository.persist(claimed,result));
     const counts = await pool.query(`SELECT
       (SELECT COUNT(*)::int FROM token_metadata_snapshots) metadata,
       (SELECT COUNT(*)::int FROM social_evidence_collections) collections,
@@ -201,7 +298,7 @@ void test('completes permanent metadata failure as explicit available evidence',
     const repository = new PostgresSocialEvidenceRepository(pool);
     const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
     assert.ok(claimed);
-    await repository.complete(claimed, await failedResult(mint, claimed.sourceLaunchEventId));
+    await completeJob(repository,claimed,await failedResult(mint,claimed.sourceLaunchEventId));
     const row = await pool.query(`SELECT collection.collection_status,
       metadata.resolution_status,metadata.failure_reason,metadata.failure_retryable,
       (SELECT COUNT(*)::int FROM social_verification_evidence) evidence_count
@@ -222,7 +319,7 @@ void test('advances one derived event through source finality without duplicate 
     const repository = new PostgresSocialEvidenceRepository(pool);
     const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
     assert.ok(claimed);
-    await repository.complete(claimed, await successfulResult(claimed.sourceLaunchEventId));
+    await completeJob(repository,claimed,await successfulResult(claimed.sourceLaunchEventId));
     await launchRepository.record(launchBatch(MINT, 'signature-social-finality', 'confirmed'));
     await launchRepository.record(launchBatch(MINT, 'signature-social-finality', 'finalized'));
     await launchRepository.record(launchBatch(MINT, 'signature-social-finality', 'finalized'));
@@ -248,7 +345,7 @@ void test('orphans completed projections and rejects an in-flight stale completi
     const repository = new PostgresSocialEvidenceRepository(pool);
     const claimed = await repository.claim({ leaseMs: 5_000, nowMs: NOW });
     assert.ok(claimed);
-    await repository.complete(claimed, await successfulResult(claimed.sourceLaunchEventId));
+    await completeJob(repository,claimed,await successfulResult(claimed.sourceLaunchEventId));
     await launchRepository.record(launchBatch(MINT, 'signature-social-orphan', 'orphaned'));
     const projections = await pool.query(`SELECT collection.confirmation_status,
       collection.terminal_at,event.confirmation_status event_status,event.terminal_at event_terminal,
@@ -271,7 +368,7 @@ void test('orphans completed projections and rejects an in-flight stale completi
     await launchRepository.record(launchBatch(
       inFlight.mint, 'signature-social-inflight', 'orphaned',
     ));
-    await assert.rejects(repository.complete(inFlight, inFlightResult), SocialJobLeaseLostError);
+    await assert.rejects(repository.persist(inFlight,inFlightResult),SocialJobLeaseLostError);
   });
 });
 
@@ -284,6 +381,15 @@ async function enqueue(
   await new PostgresLaunchpadEventRepository(pool).record(
     launchBatch(mint, signature, confirmationStatus),
   );
+}
+
+async function completeJob(
+  repository:PostgresSocialEvidenceRepository,
+  job:NonNullable<Awaited<ReturnType<PostgresSocialEvidenceRepository['claim']>>>,
+  result:SocialJobResult,
+):Promise<void>{
+  await repository.persist(job,result);
+  await repository.complete(job);
 }
 
 function launchBatch(

@@ -54,6 +54,7 @@ import { SocialEnrichmentWorker } from './social-enrichment-worker.js';
 import { PaperDecisionWorker } from './paper-decision-worker.js';
 import { QualificationProjectionService } from './qualification-projection.service.js';
 import { QualificationRebuildService } from './qualification-rebuild.service.js';
+import { SocialQualificationRefreshService } from './social-qualification-refresh.service.js';
 import { TradingCandidateService } from './trading-candidate.service.js';
 import { ValidatedExternalBuysStrategy } from './validated-external-buys.strategy.js';
 import { QualificationEngine } from '../qualification/qualification-engine.js';
@@ -115,17 +116,6 @@ export function createProductionListenerRuntime(
     maxConcurrency: config.socialHttpConcurrency,
     maxPerHostConcurrency: 1,
   });
-  const socialWorker = new SocialEnrichmentWorker(
-    new PostgresSocialEvidenceRepository(pool),
-    new HttpMetadataProvider(publicHttp),
-    new PublicSocialVerificationProvider(publicHttp),
-    {
-      pollIntervalMs: config.socialWorkerPollMs,
-      leaseMs: config.socialWorkerLeaseSeconds * 1_000,
-      renewalIntervalMs: Math.floor(config.socialWorkerLeaseSeconds * 1_000 / 3),
-      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
-    },
-  );
   const pump = new PumpFunLaunchpadAdapter(createUnavailableBondingCurveReader());
   const launchpad = new LaunchpadObservationService(pump, launchpadRepository);
   const funding = new WalletEvidenceObservationService(
@@ -165,6 +155,18 @@ export function createProductionListenerRuntime(
     new PostgresQualificationProjectionRepository(pool, qualificationRebuilder),
     qualificationRebuilder,
     config.paperQuoteMintAllowlist,
+  );
+  const socialWorker = new SocialEnrichmentWorker(
+    new PostgresSocialEvidenceRepository(pool),
+    new HttpMetadataProvider(publicHttp),
+    new PublicSocialVerificationProvider(publicHttp),
+    new SocialQualificationRefreshService(qualification,paperRepository),
+    {
+      pollIntervalMs: config.socialWorkerPollMs,
+      leaseMs: config.socialWorkerLeaseSeconds * 1_000,
+      renewalIntervalMs: Math.floor(config.socialWorkerLeaseSeconds * 1_000 / 3),
+      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+    },
   );
   const quoteRouter = new CanonicalPaperQuoteRouter(
     new PostgresPaperVenueReader(() => rpc.getSlot(), pool),

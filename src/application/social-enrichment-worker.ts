@@ -41,6 +41,10 @@ export interface SocialEnrichmentWorkerScheduler {
   now(): number;
 }
 
+export interface SocialProjectionRefresher {
+  refresh(mint: string): Promise<void>;
+}
+
 export type SocialEnrichmentRunResult =
   | Readonly<{ kind: 'idle' | 'closed' }>
   | Readonly<{ kind: 'completed' | 'failed' | 'lease-lost'; jobId: string }>;
@@ -78,6 +82,7 @@ export class SocialEnrichmentWorker {
     private readonly repository: SocialEvidenceRepository,
     private readonly metadataProvider: MetadataProvider,
     private readonly socialProvider: SocialVerificationProvider,
+    private readonly projection: SocialProjectionRefresher,
     options: SocialEnrichmentWorkerOptions,
     scheduler: SocialEnrichmentWorkerScheduler = systemScheduler,
   ) {
@@ -148,6 +153,8 @@ export class SocialEnrichmentWorker {
     this.activeLease = lease;
     lease.start();
 
+    if (job.evidencePersisted) return this.refreshPersisted(job,lease);
+
     let resolution: MetadataResolution;
     if (job.metadataUri === null) {
       resolution = metadataFailure('URI_INVALID');
@@ -216,16 +223,13 @@ export class SocialEnrichmentWorker {
     lease: SocialLeaseGuard,
     result: SocialJobResult,
   ): Promise<SocialEnrichmentRunResult> {
-    const owned = await lease.finish();
-    if (this.activeLease === lease) this.activeLease = null;
-    if (!owned) return frozen({ kind: 'lease-lost' as const, jobId: job.id });
     try {
-      await this.repository.complete(job, result);
+      await this.repository.persist(job,result);
     } catch {
       this.currentState = 'DEGRADED';
       throw new SocialEnrichmentWorkerError('complete');
     }
-    return frozen({ kind: 'completed' as const, jobId: job.id });
+    return this.refreshPersisted(job,lease);
   }
 
   private async failClaim(
@@ -234,10 +238,18 @@ export class SocialEnrichmentWorker {
     code: SocialJobFailure['code'],
     terminalResult?: SocialJobResult,
   ): Promise<SocialEnrichmentRunResult> {
+    const failure = Object.freeze({ code, retryable: true, observedAtMs: this.readNow() });
+    if (terminalResult !== undefined && job.attemptsInCycle >= job.maxAttempts) {
+      try { await this.repository.persist(job,terminalResult,failure); }
+      catch {
+        this.currentState='DEGRADED';
+        throw new SocialEnrichmentWorkerError('fail');
+      }
+      return this.refreshPersisted(job,lease);
+    }
     const owned = await lease.finish();
     if (this.activeLease === lease) this.activeLease = null;
     if (!owned) return frozen({ kind: 'lease-lost' as const, jobId: job.id });
-    const failure = Object.freeze({ code, retryable: true, observedAtMs: this.readNow() });
     try {
       await this.repository.fail(job, failure, terminalResult);
     } catch {
@@ -245,6 +257,37 @@ export class SocialEnrichmentWorker {
       throw new SocialEnrichmentWorkerError('fail');
     }
     return frozen({ kind: 'failed' as const, jobId: job.id });
+  }
+
+  private async refreshPersisted(
+    job: ClaimedSocialJob,
+    lease: SocialLeaseGuard,
+  ): Promise<SocialEnrichmentRunResult> {
+    try {
+      await this.projection.refresh(job.mint);
+    } catch {
+      const owned=await lease.finish();
+      if(this.activeLease===lease)this.activeLease=null;
+      if(!owned)return frozen({ kind:'lease-lost' as const,jobId:job.id });
+      try {
+        await this.repository.release(job,Object.freeze({
+          code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:this.readNow(),
+        }));
+      } catch {
+        this.currentState='DEGRADED';
+        throw new SocialEnrichmentWorkerError('fail');
+      }
+      return frozen({ kind:'failed' as const,jobId:job.id });
+    }
+    const owned=await lease.finish();
+    if(this.activeLease===lease)this.activeLease=null;
+    if(!owned)return frozen({ kind:'lease-lost' as const,jobId:job.id });
+    try { await this.repository.complete(job); }
+    catch {
+      this.currentState='DEGRADED';
+      throw new SocialEnrichmentWorkerError('complete');
+    }
+    return frozen({ kind:'completed' as const,jobId:job.id });
   }
 
   private scheduleNext(delayMs: number): void {
@@ -518,7 +561,8 @@ function snapshotClaimedJob(value: ClaimedSocialJob): ClaimedSocialJob {
   const fields = dataFields(value, 'Claimed social job');
   exactKeys(fields, [
     'id', 'mint', 'sourceLaunchEventId', 'metadataUri', 'attempts',
-    'attemptsInCycle', 'leaseToken', 'leaseExpiresAtMs',
+    'attemptsInCycle', 'maxAttempts', 'evidencePersisted',
+    'leaseToken', 'leaseExpiresAtMs',
   ], 'Claimed social job');
   const metadataUri = fields.metadataUri === null ? null : boundedString(fields.metadataUri);
   return Object.freeze({
@@ -528,9 +572,16 @@ function snapshotClaimedJob(value: ClaimedSocialJob): ClaimedSocialJob {
     metadataUri,
     attempts: positiveInteger(fields.attempts),
     attemptsInCycle: positiveInteger(fields.attemptsInCycle),
+    maxAttempts: positiveInteger(fields.maxAttempts),
+    evidencePersisted: booleanValue(fields.evidencePersisted),
     leaseToken: boundedString(fields.leaseToken),
     leaseExpiresAtMs: safeTimestamp(fields.leaseExpiresAtMs),
   });
+}
+
+function booleanValue(value:unknown):boolean {
+  if(typeof value!=='boolean')throw new TypeError('Social worker boolean is invalid.');
+  return value;
 }
 
 function dataFields(value: unknown, name: string): Record<string, unknown> {

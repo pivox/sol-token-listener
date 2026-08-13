@@ -81,6 +81,7 @@ void test('production composes one canonical qualification writer before paper d
   assert.equal(count(source, /new QualificationProjectionService\(/gu), 1);
   assert.match(source, /new PostgresQualificationProjectionRepository\(pool,\s*qualificationRebuilder\)/u);
   assert.match(source, /new QualificationProjectionService\([\s\S]*?qualificationRebuilder,[\s\S]*?config\.paperQuoteMintAllowlist[\s\S]*?\)/u);
+  assert.match(source,/new SocialQualificationRefreshService\(qualification,paperRepository\)/u);
   assert.match(source, /new PaperDecisionWorker\([\s\S]*?quoteRouter,\s*qualificationRebuilder,/u);
   assert.match(source, /new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*\)/u);
 });
@@ -88,6 +89,7 @@ void test('production composes one canonical qualification writer before paper d
 void test('public social runtime components have no signer or submission path', async () => {
   for (const path of [
     '../src/application/social-enrichment-worker.ts',
+    '../src/application/social-qualification-refresh.service.ts',
     '../src/storage/social-evidence.repository.ts',
     '../src/social/public-social-verification.provider.ts',
   ]) {

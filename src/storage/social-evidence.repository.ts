@@ -21,7 +21,7 @@ interface Pool { connect(): Promise<Client> }
 
 export class SocialEvidenceRepositoryError extends Error {
   public constructor(
-    public readonly operation: 'claim' | 'renew' | 'complete' | 'fail' | 'counts',
+    public readonly operation: 'claim' | 'renew' | 'persist' | 'complete' | 'release' | 'fail' | 'counts',
   ) {
     super('Social evidence repository operation failed.');
     this.name = 'SocialEvidenceRepositoryError';
@@ -89,7 +89,11 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
         error_code=NULL,updated_at=$1
       FROM candidate WHERE job.job_id=candidate.job_id
       RETURNING job.job_id,job.mint,job.source_launch_event_id,job.metadata_uri,
-        job.attempts,job.attempts_in_cycle,job.lease_token,job.lease_expires_at`, [
+        job.attempts,job.attempts_in_cycle,job.max_attempts,
+        EXISTS(SELECT 1 FROM social_evidence_collections collection
+          WHERE collection.mint=job.mint
+            AND collection.source_launch_event_id=job.source_launch_event_id) AS evidence_persisted,
+        job.lease_token,job.lease_expires_at`, [
         new Date(options.nowMs),
         leaseToken,
         new Date(options.nowMs + options.leaseMs),
@@ -130,10 +134,15 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
     }
   }
 
-  public async complete(job: ClaimedSocialJob, result: SocialJobResult): Promise<void> {
+  public async persist(
+    job: ClaimedSocialJob,
+    result: SocialJobResult,
+    terminalFailure?: SocialJobFailure,
+  ): Promise<void> {
     assertClaimedJob(job);
     assertJobResult(job, result);
-    const client = await this.connect('complete');
+    if(terminalFailure!==undefined)assertFailure(terminalFailure);
+    const client = await this.connect('persist');
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [job.mint]);
@@ -143,11 +152,6 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
       const jobRow = selected.rows[0];
       if (jobRow === undefined) throw new SocialJobLeaseLostError();
       const status = textField(jobRow, 'status');
-      if (status === 'COMPLETED') {
-        await assertCompletionReplay(client, job, result);
-        await client.query('COMMIT');
-        return;
-      }
       if (status !== 'PROCESSING' || nullableTextField(jobRow, 'lease_token') !== job.leaseToken) {
         throw new SocialJobLeaseLostError();
       }
@@ -166,27 +170,111 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
         throw new SocialJobLeaseLostError();
       }
 
-      await writeMetadataSnapshot(client, job, result);
-      await writeSocialCollection(client, source, result);
-      await writeSocialDerivedEvent(client, source, result);
-      const terminalAt = new Date(result.collection.observedAtMs);
+      if(job.evidencePersisted){
+        await assertCompletionReplay(client,job,result);
+      }else{
+        await writeMetadataSnapshot(client, job, result);
+        await writeSocialCollection(client, source, result);
+        await writeSocialDerivedEvent(client, source, result);
+      }
       await exact(client, `UPDATE social_enrichment_jobs SET
-        status='COMPLETED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
-        error_code=NULL,terminal_at=$3,purge_after=$4,updated_at=$3
+        attempts_in_cycle=0,error_code=COALESCE($3,error_code),
+        retry_exhausted_at=COALESCE($4,retry_exhausted_at),updated_at=$5
         WHERE job_id=$1 AND lease_token=$2`, [
-        job.id,
-        job.leaseToken,
-        terminalAt,
-        new Date(result.collection.observedAtMs + this.retentionHours * 3_600_000),
+        job.id,job.leaseToken,terminalFailure?.code??null,
+        terminalFailure?.retryable===true?new Date(terminalFailure.observedAtMs):null,
+        new Date(terminalFailure?.observedAtMs??result.collection.observedAtMs),
       ]);
       await client.query('COMMIT');
     } catch (error: unknown) {
       await rollback(client);
       if (error instanceof SocialJobLeaseLostError) throw error;
-      throw new SocialEvidenceRepositoryError('complete');
+      throw new SocialEvidenceRepositoryError('persist');
     } finally {
-      release(client, 'complete');
+      release(client, 'persist');
     }
+  }
+
+  public async complete(job: ClaimedSocialJob): Promise<void> {
+    assertClaimedJob(job);
+    const client=await this.connect('complete');
+    try{
+      await client.query('BEGIN');
+      const selected=await client.query(`SELECT job.status,
+        EXISTS(SELECT 1 FROM social_evidence_collections collection
+          WHERE collection.mint=job.mint
+            AND collection.source_launch_event_id=job.source_launch_event_id) AS evidence_persisted
+        FROM social_enrichment_jobs job WHERE job.job_id=$1 FOR UPDATE`,[job.id]);
+      const row=selected.rows[0];
+      if(
+        row!==undefined
+        &&textField(row,'status')==='COMPLETED'
+        &&booleanField(row,'evidence_persisted')
+      ){
+        await client.query('COMMIT');
+        return;
+      }
+      const result=await client.query(`UPDATE social_enrichment_jobs job SET
+        status='COMPLETED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+        terminal_at=collection.observed_at,
+        purge_after=collection.observed_at + INTERVAL '4 hours',
+        updated_at=GREATEST(job.updated_at,collection.observed_at)
+        FROM social_evidence_collections collection
+        JOIN domain_events source ON source.event_id=collection.source_launch_event_id
+        WHERE job.job_id=$1 AND job.lease_token=$2 AND job.status='PROCESSING'
+          AND collection.mint=job.mint
+          AND collection.source_launch_event_id=job.source_launch_event_id
+          AND source.confirmation_status<>'orphaned'`,[job.id,job.leaseToken]);
+      if(result.rowCount!==1)throw new SocialJobLeaseLostError();
+      await client.query('COMMIT');
+    }catch(error:unknown){
+      await rollback(client);
+      if(error instanceof SocialJobLeaseLostError)throw error;
+      throw new SocialEvidenceRepositoryError('complete');
+    }finally{release(client,'complete');}
+  }
+
+  public async release(job:ClaimedSocialJob,failure:SocialJobFailure):Promise<void>{
+    assertClaimedJob(job);assertFailure(failure);
+    const client=await this.connect('release');
+    try{
+      await client.query('BEGIN');
+      const selected=await client.query(`SELECT attempts_in_cycle,max_attempts,base_delay_ms
+        FROM social_enrichment_jobs job
+        WHERE job.job_id=$1 AND job.status='PROCESSING' AND job.lease_token=$2
+          AND EXISTS(SELECT 1 FROM social_evidence_collections collection
+            WHERE collection.mint=job.mint
+              AND collection.source_launch_event_id=job.source_launch_event_id)
+        FOR UPDATE`,[job.id,job.leaseToken]);
+      const row=selected.rows[0];
+      if(row===undefined)throw new SocialJobLeaseLostError();
+      const attempts=integerField(row,'attempts_in_cycle');
+      const maximum=integerField(row,'max_attempts');
+      const now=new Date(failure.observedAtMs);
+      if(failure.retryable&&attempts<maximum){
+        await exact(client,`UPDATE social_enrichment_jobs SET
+          status='RETRYABLE_FAILED',lease_token=NULL,lease_expires_at=NULL,
+          next_attempt_at=$3,error_code=$4,updated_at=$5
+          WHERE job_id=$1 AND lease_token=$2`,[
+          job.id,job.leaseToken,new Date(failure.observedAtMs+retryDelay(
+            integerField(row,'base_delay_ms'),Math.max(1,attempts),
+          )),failure.code,now,
+        ]);
+      }else{
+        await exact(client,`UPDATE social_enrichment_jobs SET
+          status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+          error_code=$3,retry_exhausted_at=$4,terminal_at=$4,purge_after=$5,updated_at=$4
+          WHERE job_id=$1 AND lease_token=$2`,[
+          job.id,job.leaseToken,failure.code,now,
+          new Date(failure.observedAtMs+this.retentionHours*3_600_000),
+        ]);
+      }
+      await client.query('COMMIT');
+    }catch(error:unknown){
+      await rollback(client);
+      if(error instanceof SocialJobLeaseLostError)throw error;
+      throw new SocialEvidenceRepositoryError('release');
+    }finally{release(client,'release');}
   }
 
   public async fail(
@@ -478,16 +566,68 @@ async function assertCompletionReplay(
   job: ClaimedSocialJob,
   result: SocialJobResult,
 ): Promise<void> {
-  const stored = await client.query(`SELECT collection_id,input_fingerprint,
-    metadata_snapshot_id FROM social_evidence_collections
-    WHERE source_launch_event_id=$1 AND mint=$2`, [job.sourceLaunchEventId,job.mint]);
+  const stored = await client.query(`SELECT collection.collection_id,
+    collection.input_fingerprint,collection.metadata_snapshot_id,
+    collection.collection_status,collection.confirmation_status,
+    collection.observed_at,collection.payload_version,
+    metadata.uri,metadata.resolution_status,metadata.failure_reason,
+    metadata.failure_message,metadata.failure_retryable,metadata.metadata,
+    metadata.fetched_at,metadata.payload_version AS metadata_payload_version
+    FROM social_evidence_collections collection
+    JOIN token_metadata_snapshots metadata
+      ON metadata.snapshot_id=collection.metadata_snapshot_id
+    WHERE collection.source_launch_event_id=$1 AND collection.mint=$2`, [
+    job.sourceLaunchEventId,job.mint,
+  ]);
   const row = stored.rows[0];
+  const snapshot=result.metadataSnapshot;
+  const resolution=snapshot.resolution;
   if (
     row === undefined
     || textField(row, 'collection_id') !== result.collection.id
     || textField(row, 'input_fingerprint') !== result.collection.inputFingerprint
     || textField(row, 'metadata_snapshot_id') !== result.collection.metadataSnapshotId
+    ||textField(row,'collection_status')!==result.collection.status
+    ||textField(row,'confirmation_status')==='orphaned'
+    ||dateField(row,'observed_at').getTime()!==result.collection.observedAtMs
+    ||integerField(row,'payload_version')!==result.collection.payloadVersion
+    ||textField(row,'uri')!==snapshot.uri
+    ||textField(row,'resolution_status')!==resolution.status.toLowerCase()
+    ||nullableTextField(row,'failure_reason')!==(resolution.status==='FAILED'?resolution.reason:null)
+    ||nullableTextField(row,'failure_message')!==(resolution.status==='FAILED'?resolution.message:null)
+    ||record(row).failure_retryable!==(resolution.status==='FAILED'?resolution.retryable:null)
+    ||canonicalStringifyJson(record(row).metadata)
+      !==canonicalStringifyJson(resolution.status==='RESOLVED'?resolution.metadata:null)
+    ||dateField(row,'fetched_at').getTime()!==snapshot.fetchedAtMs
+    ||integerField(row,'metadata_payload_version')!==snapshot.payloadVersion
   ) throw new TypeError('Social completion replay conflicts.');
+  await assertReplayRows(client,'social_links','collection_id',result.collection.id,
+    result.collection.links.map((item)=>item.id));
+  await assertReplayRows(client,'social_http_observations','collection_id',result.collection.id,
+    result.collection.observations.map((item)=>item.id));
+  await assertReplayRows(client,'social_verification_evidence','collection_id',result.collection.id,
+    result.collection.evidence.map((item)=>item.id));
+}
+
+async function assertReplayRows(
+  client:Client,
+  table:'social_links'|'social_http_observations'|'social_verification_evidence',
+  foreignKey:'collection_id',
+  collectionId:string,
+  expectedIds:readonly string[],
+):Promise<void>{
+  const idColumn=table==='social_links'
+    ?'link_id'
+    :table==='social_http_observations'?'observation_id':'evidence_id';
+  const stored=await client.query(
+    `SELECT ${idColumn} AS item_id FROM ${table} WHERE ${foreignKey}=$1 ORDER BY ${idColumn}`,
+    [collectionId],
+  );
+  const ids=stored.rows.map((row)=>textField(row,'item_id'));
+  const expected=[...expectedIds].sort();
+  if(canonicalStringifyJson(ids)!==canonicalStringifyJson(expected)){
+    throw new TypeError('Social completion replay conflicts.');
+  }
 }
 
 function claimedJob(row: unknown): ClaimedSocialJob {
@@ -498,6 +638,8 @@ function claimedJob(row: unknown): ClaimedSocialJob {
     metadataUri: nullableTextField(row, 'metadata_uri'),
     attempts: integerField(row, 'attempts'),
     attemptsInCycle: integerField(row, 'attempts_in_cycle'),
+    maxAttempts:integerField(row,'max_attempts'),
+    evidencePersisted:booleanField(row,'evidence_persisted'),
     leaseToken: textField(row, 'lease_token'),
     leaseExpiresAtMs: dateField(row, 'lease_expires_at').getTime(),
   });
@@ -510,6 +652,9 @@ function assertClaimedJob(job: ClaimedSocialJob): void {
   boundedText(job.leaseToken, 'job.leaseToken');
   positiveInteger(job.attempts, 'job.attempts');
   positiveInteger(job.attemptsInCycle, 'job.attemptsInCycle');
+  positiveInteger(job.maxAttempts,'job.maxAttempts');
+  if(job.attemptsInCycle>job.maxAttempts)throw new TypeError('job.attemptsInCycle is invalid.');
+  if(typeof job.evidencePersisted!=='boolean')throw new TypeError('job.evidencePersisted is invalid.');
   timestamp(job.leaseExpiresAtMs, 'job.leaseExpiresAtMs');
 }
 
@@ -559,6 +704,12 @@ function integerField(row: unknown, field: string): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
     throw new TypeError('Social repository integer is invalid.');
   }
+  return value;
+}
+
+function booleanField(row:unknown,field:string):boolean{
+  const value=record(row)[field];
+  if(typeof value!=='boolean')throw new TypeError('Social repository boolean is invalid.');
   return value;
 }
 

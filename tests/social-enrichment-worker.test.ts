@@ -21,17 +21,54 @@ const NOW = 1_786_300_000_000;
 
 void test('resolves and completes one enrichment outside the Solana path', async () => {
   const repository = new ScriptedRepository([claimedJob(), null]);
+  const projection = new FakeProjection(repository.operations);
   const worker = new SocialEnrichmentWorker(
     repository,
     metadataProvider(resolved()),
     passthroughSocialProvider(),
+    projection,
     options(),
     new ManualScheduler(),
   );
   assert.deepEqual(await worker.runOnce(), { kind: 'completed', jobId: 'social-job-1' });
+  assert.deepEqual(repository.operations, ['persist','project','complete']);
+  assert.deepEqual(projection.calls, [MINT]);
   assert.equal(repository.completions.length, 1);
   assert.equal(repository.failures.length, 0);
   assert.equal(repository.completions[0]?.result.status, 'RESOLVED');
+});
+
+void test('replays persisted evidence after projection failure without calling providers twice', async () => {
+  const operations:string[]=[];
+  const repository = new ScriptedRepository([
+    claimedJob(),
+    claimedJob({ evidencePersisted:true,attempts:1,attemptsInCycle:1 }),
+  ],operations);
+  let metadataCalls=0;
+  let socialCalls=0;
+  const projection=new FakeProjection(operations);
+  projection.fail=true;
+  const worker = new SocialEnrichmentWorker(
+    repository,
+    { resolve:async()=>{metadataCalls+=1;return resolved();} },
+    { collect:async(input)=>{socialCalls+=1;return providerResult(input.metadataSnapshot);} },
+    projection,
+    options(),
+    new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind:'failed',jobId:'social-job-1' });
+  projection.fail=false;
+  assert.deepEqual(await worker.runOnce(), { kind:'completed',jobId:'social-job-1' });
+
+  assert.equal(metadataCalls,1);
+  assert.equal(socialCalls,1);
+  assert.equal(repository.persisted.length,1);
+  assert.equal(repository.releases,1);
+  assert.equal(repository.completions.length,1);
+  assert.deepEqual(operations,[
+    'persist','project','release','project','complete',
+  ]);
 });
 
 void test('completes missing URI and permanent metadata failures without social fetch', async () => {
@@ -52,7 +89,7 @@ void test('completes missing URI and permanent metadata failures without social 
         socialCalls += 1;
         throw new Error('social provider must not run');
       },
-    }, options(), new ManualScheduler());
+    }, new FakeProjection(), options(), new ManualScheduler());
     assert.equal((await worker.runOnce()).kind, 'completed');
     assert.equal(metadataCalls, scenario.job.metadataUri === null ? 0 : 1);
     assert.equal(socialCalls, 0);
@@ -66,6 +103,7 @@ void test('retries typed transient metadata failure without partial completion',
     repository,
     metadataProvider(failed(true)),
     passthroughSocialProvider(),
+    new FakeProjection(),
     options(),
     new ManualScheduler(),
   );
@@ -101,6 +139,7 @@ void test('retries transient social fetches and carries explicit terminal eviden
       }),
     })),
     social,
+    new FakeProjection(),
     options(),
     new ManualScheduler(),
   );
@@ -112,6 +151,20 @@ void test('retries transient social fetches and carries explicit terminal eviden
   assert.equal(repository.failures[0]?.terminalResult?.collection.status, 'FAILED');
 });
 
+void test('refreshes qualification before acknowledging exhausted failed evidence',async()=>{
+  const repository=new ScriptedRepository([claimedJob({ maxAttempts:1 })]);
+  const projection=new FakeProjection(repository.operations);
+  const worker=new SocialEnrichmentWorker(
+    repository,metadataProvider(failed(true)),passthroughSocialProvider(),projection,
+    options(),new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
+  assert.deepEqual(repository.operations,['persist','project','complete']);
+  assert.equal(repository.failures.length,0);
+  assert.equal(repository.persisted[0]?.result.collection.status,'FAILED');
+});
+
 void test('redacts thrown provider details into a stable retryable failure', async () => {
   const repository = new ScriptedRepository([claimedJob()]);
   const secret = 'https://user:secret@example.test/private';
@@ -119,6 +172,7 @@ void test('redacts thrown provider details into a stable retryable failure', asy
     repository,
     metadataProvider(resolved()),
     { collect: async () => { throw new Error(secret); } },
+    new FakeProjection(),
     options(),
     new ManualScheduler(),
   );
@@ -136,6 +190,7 @@ void test('renews an in-flight lease and suppresses completion after lease loss'
     repository,
     metadataProvider(resolved()),
     { collect: async () => pending.promise },
+    new FakeProjection(),
     options(),
     scheduler,
   );
@@ -155,6 +210,7 @@ void test('starts idempotently, polls serially and closes without timers', async
     repository,
     metadataProvider(resolved()),
     passthroughSocialProvider(),
+    new FakeProjection(),
     options(),
     scheduler,
   );
@@ -181,7 +237,7 @@ void test('rejects hostile job and provider accessors without invoking getters',
   const jobRepository = new ScriptedRepository([hostileJob]);
   const jobWorker = new SocialEnrichmentWorker(
     jobRepository, metadataProvider(resolved()), passthroughSocialProvider(),
-    options(), new ManualScheduler(),
+    new FakeProjection(), options(), new ManualScheduler(),
   );
   await assert.rejects(jobWorker.runOnce());
   assert.equal(getterCalls, 0);
@@ -193,7 +249,7 @@ void test('rejects hostile job and provider accessors without invoking getters',
   })) as MetadataResolution;
   const providerWorker = new SocialEnrichmentWorker(
     providerRepository, metadataProvider(hostileResolution), passthroughSocialProvider(),
-    options(), new ManualScheduler(),
+    new FakeProjection(), options(), new ManualScheduler(),
   );
   assert.equal((await providerWorker.runOnce()).kind, 'failed');
   assert.equal(getterCalls, 0);
@@ -214,6 +270,7 @@ void test('rejects hostile job and provider accessors without invoking getters',
     nestedRepository,
     metadataProvider(resolved()),
     { collect: async () => Object.freeze({ ...good, metadataSnapshot: hostileSnapshot }) },
+    new FakeProjection(),
     options(),
     new ManualScheduler(),
   );
@@ -229,6 +286,7 @@ void test('degrades bounded shutdown and abandons the unresolved lease without t
     repository,
     metadataProvider(resolved()),
     { collect: async () => pending.promise },
+    new FakeProjection(),
     Object.freeze({ ...options(), shutdownTimeoutMs: 5 }),
     scheduler,
   );
@@ -244,6 +302,7 @@ void test('degrades bounded shutdown and abandons the unresolved lease without t
 });
 
 class ScriptedRepository implements SocialEvidenceRepository {
+  readonly persisted: { readonly job: ClaimedSocialJob; readonly result: SocialJobResult }[] = [];
   readonly completions: { readonly job: ClaimedSocialJob; readonly result: SocialJobResult }[] = [];
   readonly failures: {
     readonly job: ClaimedSocialJob;
@@ -252,8 +311,12 @@ class ScriptedRepository implements SocialEvidenceRepository {
   }[] = [];
   readonly renewals: readonly unknown[] = [];
   public renewResult = true;
+  public releases = 0;
 
-  public constructor(private readonly claims: (ClaimedSocialJob | null)[]) {}
+  public constructor(
+    private readonly claims: (ClaimedSocialJob | null)[],
+    readonly operations:string[] = [],
+  ) {}
 
   public async claim(): Promise<ClaimedSocialJob | null> {
     return this.claims.shift() ?? null;
@@ -262,8 +325,18 @@ class ScriptedRepository implements SocialEvidenceRepository {
     (this.renewals as unknown[]).push(Object.freeze(args));
     return this.renewResult;
   }
-  public async complete(job: ClaimedSocialJob, result: SocialJobResult): Promise<void> {
-    this.completions.push(Object.freeze({ job, result }));
+  public async persist(job: ClaimedSocialJob, result: SocialJobResult): Promise<void> {
+    this.operations.push('persist');
+    this.persisted.push(Object.freeze({ job,result }));
+  }
+  public async complete(job: ClaimedSocialJob): Promise<void> {
+    this.operations.push('complete');
+    const persisted=this.persisted.at(-1);
+    assert.ok(persisted);
+    this.completions.push(Object.freeze({ job,result:persisted.result }));
+  }
+  public async release(): Promise<void> {
+    this.operations.push('release');this.releases+=1;
   }
   public async fail(
     job: ClaimedSocialJob,
@@ -276,6 +349,16 @@ class ScriptedRepository implements SocialEvidenceRepository {
   }
   public async counts(): Promise<SocialJobCounts> {
     return Object.freeze({ pending: 0, processing: 0, retryableFailed: 0, exhausted: 0 });
+  }
+}
+
+class FakeProjection {
+  readonly calls:string[]=[];
+  public fail=false;
+  public constructor(private readonly operations:string[]=[]){ }
+  public async refresh(mint:string):Promise<void>{
+    this.operations.push('project');this.calls.push(mint);
+    if(this.fail)throw new Error('projection unavailable');
   }
 }
 
@@ -318,7 +401,8 @@ function claimedJob(overrides: Partial<ClaimedSocialJob> = {}): ClaimedSocialJob
   return Object.freeze({
     id: 'social-job-1', mint: MINT, sourceLaunchEventId: 'launch-event-1',
     metadataUri: 'https://metadata.example/token.json', attempts: 1,
-    attemptsInCycle: 1, leaseToken: 'lease-1', leaseExpiresAtMs: NOW + 10_000,
+    attemptsInCycle: 1, maxAttempts:3, evidencePersisted:false,
+    leaseToken: 'lease-1', leaseExpiresAtMs: NOW + 10_000,
     ...overrides,
   });
 }
