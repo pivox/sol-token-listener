@@ -249,7 +249,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       );
       const asOfEvent = decodeDomainEvent(requiredRow(sourceResult, 'Source event is missing.'));
       const includeOrphaned = asOfEvent.confirmationStatus === 'orphaned';
-      const launch = await loadLaunch(client, job.mint, includeOrphaned);
+      const launchSnapshot = await loadLaunch(client, job.mint, includeOrphaned);
       const metadata = await latestMetadata(client, job.mint);
       const social = await latestPayload<SocialEvidenceCollectionV1>(client,
         `SELECT payload #> '{collection}' AS payload FROM domain_events
@@ -280,7 +280,8 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       const position = await loadPosition(client, job.mint, session);
       await client.query('COMMIT');
       return deepFreeze({
-        mint: job.mint,asOfEvent,launch,metadata,social,creatorProfile,holderSnapshot,
+        mint: job.mint,asOfEvent,canonicalLaunchActive:launchSnapshot.canonicalLaunchActive,
+        launch:launchSnapshot.launch,metadata,social,creatorProfile,holderSnapshot,
         walletGraph,activeLaunchTrades: launchTrades,activeMarketTrades: marketTrades,
         currentQualification,currentCandidate: candidate,currentDecision,
         currentSession: session,activePosition: position,
@@ -300,6 +301,38 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
 
   public async complete(job: ClaimedPaperDecisionJob, result: PaperDecisionResult): Promise<void> {
     await this.persist(job, result, true, 'complete');
+  }
+
+  public async completeNoop(job: ClaimedPaperDecisionJob): Promise<void> {
+    assertClaim(job);
+    const client = await this.connect('complete');
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      await lockMint(client,job.mint);
+      await lockQualificationMint(client,job.mint);
+      const nowMs=this.clock();
+      timestamp(nowMs,'clock');
+      const completed=await client.query(`UPDATE paper_decision_jobs job SET
+        status='COMPLETED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+        error_code=NULL,retry_exhausted_at=NULL,terminal_at=$3,purge_after=$4,updated_at=$3
+        WHERE job.job_id=$1 AND job.lease_token=$2 AND job.status='PROCESSING'
+          AND NOT EXISTS (
+            SELECT 1 FROM domain_events launch
+            WHERE launch.mint=job.mint AND launch.type='TokenLaunchDetected'
+              AND launch.confirmation_status<>'orphaned'
+          )
+          AND NOT EXISTS (SELECT 1 FROM trading_candidates WHERE mint=job.mint)
+          AND NOT EXISTS (SELECT 1 FROM paper_strategy_sessions WHERE mint=job.mint)
+          AND NOT EXISTS (SELECT 1 FROM paper_positions WHERE mint=job.mint)`,[
+        job.jobId,job.leaseToken,new Date(nowMs),new Date(nowMs+this.retentionMs),
+      ]);
+      if(completed.rowCount!==1)throw new PaperDecisionLeaseLostError();
+      await client.query('COMMIT');
+    } catch(error:unknown) {
+      await rollback(client);
+      if(error instanceof PaperDecisionLeaseLostError)throw error;
+      throw repositoryError('complete',error);
+    } finally { release(client); }
   }
 
   public async fail(job: ClaimedPaperDecisionJob, failure: PaperDecisionFailure): Promise<void> {
@@ -758,14 +791,21 @@ async function loadLaunch(
   client: Client,
   mint: string,
   includeOrphaned: boolean,
-): Promise<TokenLaunch> {
-  const result = await client.query(`SELECT * FROM domain_events
-    WHERE mint=$1 AND type='TokenLaunchDetected'
-      AND ($2::boolean OR confirmation_status<>'orphaned')
-    ORDER BY slot,transaction_index,instruction_index,
-      COALESCE(inner_instruction_index,-1),event_id LIMIT 1`, [mint,includeOrphaned]);
+): Promise<Readonly<{ launch:TokenLaunch; canonicalLaunchActive:boolean }>> {
+  const result = await client.query(`SELECT launch.*,
+    EXISTS(SELECT 1 FROM domain_events active
+      WHERE active.mint=$1 AND active.type='TokenLaunchDetected'
+        AND active.confirmation_status<>'orphaned') AS canonical_launch_active
+    FROM domain_events launch
+    WHERE launch.mint=$1 AND launch.type='TokenLaunchDetected'
+      AND ($2::boolean OR launch.confirmation_status<>'orphaned')
+    ORDER BY launch.slot,launch.transaction_index,launch.instruction_index,
+      COALESCE(launch.inner_instruction_index,-1),launch.event_id LIMIT 1`, [mint,includeOrphaned]);
   const event = decodeDomainEvent(requiredRow(result, 'Token launch event is missing.'));
-  return payloadProperty(event.payload, 'launch') as TokenLaunch;
+  return Object.freeze({
+    launch:payloadProperty(event.payload,'launch') as TokenLaunch,
+    canonicalLaunchActive:booleanField(result.rows[0],'canonical_launch_active'),
+  });
 }
 
 async function loadCandidate(

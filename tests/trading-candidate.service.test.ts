@@ -69,7 +69,7 @@ function candidateInput(overrides: Partial<Parameters<TradingCandidateService['c
 function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecisionSnapshot {
   const asOfEvent = event();
   return Object.freeze({
-    mint:'MINT',asOfEvent,launch:Object.freeze({
+    mint:'MINT',asOfEvent,canonicalLaunchActive:true,launch:Object.freeze({
       mint:'MINT',creator:'creator',tokenProgram:'SPL_TOKEN' as const,
       quoteAssets:Object.freeze([Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const })]),
       launchpad:'pumpfun',createdAt:Object.freeze({ ...asOfEvent.cursor }),parameters:Object.freeze({}),

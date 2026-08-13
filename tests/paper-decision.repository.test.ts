@@ -379,6 +379,46 @@ void test('claims an orphaned source revision and reloads its paper lineage', as
   });
 });
 
+void test('terminalizes an orphan-only launch no-op without exhausting the backlog', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    const repository = new PostgresPaperDecisionRepository(pool);
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
+      [RAW_EVENT_ID],
+    );
+    await repository.enqueueLatest(MINT,'signature','orphaned');
+    const job = await repository.claim({ nowMs:2_000,leaseMs:1_000 });
+    assert.ok(job);
+
+    const snapshot = await repository.loadSnapshot(job);
+    assert.equal(snapshot.canonicalLaunchActive,false);
+    assert.equal(snapshot.currentQualification,null);
+    assert.equal(snapshot.currentCandidate,null);
+    assert.equal(snapshot.currentSession,null);
+    assert.equal(snapshot.activePosition,null);
+    await repository.completeNoop(job);
+
+    assert.deepEqual(await repository.counts(), {
+      pending:0,processing:0,retryableFailed:0,exhausted:0,
+    });
+    const stored=await pool.query(`SELECT status,error_code,retry_exhausted_at
+      FROM paper_decision_jobs WHERE job_id=$1`,[job.jobId]);
+    assert.deepEqual(stored.rows,[{
+      status:'COMPLETED',error_code:null,retry_exhausted_at:null,
+    }]);
+    assert.equal((await pool.query('SELECT COUNT(*)::int count FROM trading_candidates')).rows[0].count,0);
+  });
+});
+
 void test('reloads the entry candidate when a later trade becomes orphaned', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');

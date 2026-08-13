@@ -172,6 +172,13 @@ export class PaperDecisionWorker {
 
     const persisted=snapshot.currentQualification;
     if (persisted === null) {
+      if (
+        !snapshot.canonicalLaunchActive
+        && snapshot.currentCandidate === null
+        && snapshot.currentDecision === null
+        && snapshot.currentSession === null
+        && snapshot.activePosition === null
+      ) return this.completeNoop(job,lease);
       return this.fail(job,lease,'RPC_TRANSIENT',true,null);
     }
 
@@ -398,6 +405,18 @@ export class PaperDecisionWorker {
   ): Promise<PaperDecisionRunResult> {
     if (!await this.finishLease(lease)) return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
     try { await this.repository.complete(job,value); }
+    catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
+    return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
+  }
+
+  private async completeNoop(
+    job: ClaimedPaperDecisionJob,
+    lease: PaperLeaseGuard,
+  ): Promise<PaperDecisionRunResult> {
+    if (!await this.finishLease(lease)) {
+      return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
+    }
+    try { await this.repository.completeNoop(job); }
     catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
     return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
   }
