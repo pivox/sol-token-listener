@@ -27,7 +27,9 @@ void test('expires the opportunity, rejects unsupported quote mints and revokes 
     quoteAsset: Object.freeze({ mint: 'USDC', decimals: 6, tokenProgram: 'SPL_TOKEN' }),
   })).candidate.state, 'NOT_ELIGIBLE');
   assert.deepEqual(service.create(candidateInput({
-    snapshot: snapshot({ asOfEvent: event({ confirmationStatus: 'orphaned' }) }),
+    qualificationEvent: event({
+      id:'evt_qualification_orphaned',type:'QualificationUpdated',confirmationStatus:'orphaned',
+    }),
   })).candidate.reasonCodes, ['SOURCE_ORPHANED']);
 });
 
@@ -35,13 +37,43 @@ void test('requires a qualified report, minimum finality and two fresh coherent 
   const service = candidateService();
   assert.equal(service.create(candidateInput({ report: report('WATCHLISTED') })).candidate.state, 'NOT_ELIGIBLE');
   assert.equal(service.create(candidateInput({
-    snapshot: snapshot({ asOfEvent: event({ confirmationStatus: 'processed' }) }),
+    qualificationEvent:event({
+      id:'evt_qualification_processed',type:'QualificationUpdated',confirmationStatus:'processed',
+    }),
   })).candidate.state, 'NOT_ELIGIBLE');
   assert.equal(service.create(candidateInput({ reverseSellQuote: null })).candidate.state, 'NOT_ELIGIBLE');
   assert.equal(service.create(candidateInput({
     buyQuote: quote('buy', 'SOL', 'MINT', 1_000n, 900n, 900n, 1),
     nowMs: 6_000,
   })).candidate.state, 'NOT_ELIGIBLE');
+});
+
+void test('rejects a processed canonical qualification selected by an older confirmed job', () => {
+  const result = candidateService().create(candidateInput({
+    snapshot:snapshot({ asOfEvent:event({ confirmationStatus:'confirmed' }) }),
+    qualificationEvent:event({
+      id:'evt_qualification_processed',type:'QualificationUpdated',
+      confirmationStatus:'processed',
+    }),
+  }));
+
+  assert.equal(result.candidate.state,'NOT_ELIGIBLE');
+  assert.equal(result.candidate.asOf.eventId,'evt_qualification_processed');
+  assert.equal(result.candidate.asOf.confirmationStatus,'processed');
+});
+
+void test('accepts a confirmed canonical qualification selected by an older processed job', () => {
+  const result = candidateService().create(candidateInput({
+    snapshot:snapshot({ asOfEvent:event({ confirmationStatus:'processed' }) }),
+    qualificationEvent:event({
+      id:'evt_qualification_confirmed',type:'QualificationUpdated',
+      confirmationStatus:'confirmed',
+    }),
+  }));
+
+  assert.equal(result.candidate.state,'ELIGIBLE');
+  assert.equal(result.candidate.asOf.eventId,'evt_qualification_confirmed');
+  assert.equal(result.candidate.asOf.confirmationStatus,'confirmed');
 });
 
 function candidateService(): TradingCandidateService {
