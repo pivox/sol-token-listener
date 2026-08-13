@@ -14,7 +14,10 @@ import type {
 } from '../src/ports/paper-decision-repository.js';
 import type { CanonicalQualificationProjection } from '../src/ports/qualification-projection-repository.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
-import { PostgresPaperDecisionRepository } from '../src/storage/paper-decision.repository.js';
+import {
+  PostgresPaperDecisionRepository as ProductionPaperDecisionRepository,
+  type PaperDecisionRepositoryOptions,
+} from '../src/storage/paper-decision.repository.js';
 import { PostgresPaperTradingRepository } from '../src/storage/paper-trading.repository.js';
 import { toJsonValue } from '../src/utils/json.js';
 
@@ -26,6 +29,26 @@ const TRADE_RAW_EVENT_ID = 'raw_paper_trade';
 const TRADE_EVENT_ID = 'evt_paper_trade';
 const FINGERPRINT = 'a'.repeat(64);
 const QUALIFICATION_EVALUATED_AT_MS = Date.now();
+const EFFECTIVE_QUALIFICATION_PROFILE = Object.freeze({
+  id: 'pumpfun-v1-initial', version: 1, fingerprint: 'c'.repeat(64),
+});
+
+class PostgresPaperDecisionRepository extends ProductionPaperDecisionRepository {
+  public constructor(
+    pool: InstanceType<typeof pg.Pool>,
+    options: PaperDecisionRepositoryOptions = {},
+    qualificationProfile = EFFECTIVE_QUALIFICATION_PROFILE,
+  ) {
+    super(pool, options, qualificationProfile);
+  }
+}
+
+function paperDecisionRepository(
+  pool: InstanceType<typeof pg.Pool>,
+  options: PaperDecisionRepositoryOptions = {},
+): PostgresPaperDecisionRepository {
+  return new PostgresPaperDecisionRepository(pool, options);
+}
 
 void test('claims one idempotent job concurrently, renews it, and reports queue counts', async (context) => {
   if (databaseUrl === undefined) {
@@ -34,7 +57,7 @@ void test('claims one idempotent job concurrently, renews it, and reports queue 
   }
   await withSchema(async (pool) => {
     await seed(pool);
-    const repository = new PostgresPaperDecisionRepository(pool, { maxAttempts: 3, baseDelayMs: 100 });
+    const repository = paperDecisionRepository(pool, { maxAttempts: 3, baseDelayMs: 100 });
     await repository.enqueue(jobInput());
     await repository.enqueue(jobInput());
     const [left, right] = await Promise.all([
@@ -95,6 +118,34 @@ void test('loads the current canonical qualification without a paper candidate',
     assert.deepEqual(snapshot.currentQualification,persisted);
     assert.equal(snapshot.currentCandidate,null);
     assert.equal(snapshot.currentDecision,null);
+  });
+});
+
+void test('loads current qualification only for the effective profile identity', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    const effective = canonicalProjection(decisionResult());
+    const legacy = qualificationProjectionForProfile({
+      id: 'pumpfun-v0-retired', version: 9, fingerprint: '9'.repeat(64),
+    }, effective.report.evaluatedAtMs + 1_000, '9');
+    await seedQualification(pool, legacy);
+    const repository = new PostgresPaperDecisionRepository(
+      pool,
+      {},
+      EFFECTIVE_QUALIFICATION_PROFILE,
+    );
+    await repository.enqueue(jobInput());
+    const claimed = await repository.claim({ nowMs:1_000,leaseMs:1_000 });
+    assert.ok(claimed);
+
+    const snapshot = await repository.loadSnapshot(claimed);
+
+    assert.equal(snapshot.currentQualification?.reportId, effective.reportId);
+    assert.deepEqual(snapshot.currentQualification?.report.ruleSet, effective.report.ruleSet);
   });
 });
 
@@ -603,7 +654,7 @@ void test('stages, survives lease expiry, replays and completes one immutable de
   }
   await withSchema(async (pool) => {
     await seed(pool);
-    const repository = new PostgresPaperDecisionRepository(pool, { maxAttempts: 3, baseDelayMs: 100 });
+    const repository = paperDecisionRepository(pool, { maxAttempts: 3, baseDelayMs: 100 });
     await repository.enqueue(jobInput());
     const first = await repository.claim({ nowMs: 1_000, leaseMs: 100 });
     assert.ok(first);
@@ -1050,6 +1101,40 @@ function canonicalProjection(result:PaperDecisionResult):CanonicalQualificationP
     evaluation:payload.evaluation as CanonicalQualificationProjection['evaluation'],
     report:result.report,
     qualificationEvent:result.qualificationEvent,
+  });
+}
+
+function qualificationProjectionForProfile(
+  profile: Readonly<{ id: string; version: number; fingerprint: string }>,
+  evaluatedAtMs: number,
+  identity: string,
+): CanonicalQualificationProjection {
+  const base = canonicalProjection(decisionResult());
+  const report = Object.freeze({
+    ...base.report,
+    ruleSet: Object.freeze({ ...base.report.ruleSet, ...profile }),
+    evaluatedAtMs,
+  });
+  const reportId = `qreport_${identity.repeat(64)}`;
+  const evaluation = Object.freeze({ ...base.evaluation, evaluatedAtMs });
+  const evidenceFingerprint = identity.repeat(64);
+  const qualificationEvent = derivedEvent(
+    'QualificationUpdated',
+    reportId,
+    Object.freeze({ reportId, evidenceFingerprint, evaluation, report }),
+    'confirmed',
+    base.qualificationEvent.cursor,
+    evaluatedAtMs,
+    'qualification',
+  );
+  return Object.freeze({
+    reportId,
+    sourceEventId: SOURCE_EVENT_ID,
+    sourceRawEventId: RAW_EVENT_ID,
+    evidenceFingerprint,
+    evaluation,
+    report,
+    qualificationEvent,
   });
 }
 

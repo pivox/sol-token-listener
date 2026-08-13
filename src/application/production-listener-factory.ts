@@ -150,15 +150,15 @@ export function createProductionListenerRuntime(
     new PostgresMarketObservationRepository(pool, config.dataRetentionHours),
   );
   const marketPipeline = new PumpSwapObservationPipeline(pump, market, marketService);
-  const paperRepository = new PostgresPaperDecisionRepository(pool, {
-    maxAttempts: config.paperDecisionRetryMaxAttempts,
-    baseDelayMs: config.paperDecisionRetryBaseDelayMs,
-    retentionHours: 4,
-  });
   const qualificationProfile = loadQualificationProfile({
     profilePath: config.qualificationProfilePath,
     minimumScoreOverride: config.qualificationMinimumScore,
   });
+  const paperRepository = new PostgresPaperDecisionRepository(pool, {
+    maxAttempts: config.paperDecisionRetryMaxAttempts,
+    baseDelayMs: config.paperDecisionRetryBaseDelayMs,
+    retentionHours: 4,
+  }, qualificationProfile);
   const qualificationEngine = new QualificationEngine(qualificationProfile);
   const qualificationRebuilder = new QualificationRebuildService(qualificationEngine);
   const qualification = new QualificationProjectionService(

@@ -8,7 +8,10 @@ import type { PaperPosition } from '../domain/paper-trading.js';
 import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
 import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
 import type { SocialEvidenceCollectionV1 } from '../domain/social-evidence.js';
-import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
+import type {
+  QualificationProfileIdentity,
+  TradingCandidateV1,
+} from '../domain/trading-candidate.js';
 import type { ChainConfirmationStatus, TokenLaunch } from '../domain/types.js';
 import type {
   WalletCluster,
@@ -67,10 +70,12 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
   private readonly baseDelayMs: number;
   private readonly retentionMs: number;
   private readonly clock: () => number;
+  private readonly qualificationProfile: QualificationProfileIdentity;
 
   public constructor(
     private readonly pool: Pool = getDatabasePool(),
     options: PaperDecisionRepositoryOptions = {},
+    qualificationProfile: QualificationProfileIdentity,
   ) {
     this.maxAttempts = options.maxAttempts ?? 5;
     this.baseDelayMs = options.baseDelayMs ?? 500;
@@ -80,6 +85,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     if (retentionHours !== 4) throw new RangeError('Paper decision retention must be four hours.');
     this.retentionMs = retentionHours * 3_600_000;
     this.clock = options.clock ?? Date.now;
+    this.qualificationProfile = snapshotQualificationProfile(qualificationProfile);
   }
 
   public async enqueue(input: PaperDecisionJobInput): Promise<void> {
@@ -255,7 +261,12 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       const holderSnapshot = await latestPayload<HolderDistribution>(client,
         'SELECT payload FROM token_holders_snapshots WHERE mint=$1 ORDER BY observed_at DESC,snapshot_id DESC LIMIT 1',job.mint);
       const walletGraph = await latestWalletGraph(client, job.mint);
-      const currentQualification = await loadQualification(client, job.mint, true);
+      const currentQualification = await loadQualification(
+        client,
+        job.mint,
+        true,
+        this.qualificationProfile,
+      );
       let candidate = await loadCandidate(client, job, includeOrphaned);
       const session = await loadSession(client, job, candidate, includeOrphaned);
       if (includeOrphaned && candidate === null && session !== null) {
@@ -318,7 +329,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
           job.jobId,job.leaseToken,new Date(nowMs + delay),failure.code,new Date(nowMs),
         ]);
       } else {
-        if (failure.terminalResult !== null) await writeDecision(client, job, failure.terminalResult);
+        if (failure.terminalResult !== null) {
+          await writeDecision(client, job, failure.terminalResult, this.qualificationProfile);
+        }
         const terminalStatus = failure.terminalResult === null ? 'CANCELLED' : 'COMPLETED';
         await exact(client, `UPDATE paper_decision_jobs SET
           status=$3,lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
@@ -382,7 +395,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       );
       const row = requiredRow(selected, 'Paper decision job is missing.');
       if (textField(row, 'status') === 'COMPLETED') {
-        await assertDecisionReplay(client, result);
+        await assertDecisionReplay(client, result, this.qualificationProfile);
         await client.query('COMMIT');
         return;
       }
@@ -397,7 +410,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       ) {
         throw new PaperDecisionLeaseLostError();
       }
-      await writeDecision(client, job, result);
+      await writeDecision(client, job, result, this.qualificationProfile);
       const nowMs = Math.max(result.candidate.createdAtMs, result.session?.updatedAtMs ?? 0);
       if (terminal) {
         await exact(client, `UPDATE paper_decision_jobs SET
@@ -433,8 +446,13 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
   }
 }
 
-async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, result: PaperDecisionResult): Promise<void> {
-  const qualification=await assertPersistedQualification(client,result);
+async function writeDecision(
+  client: Client,
+  job: ClaimedPaperDecisionJob,
+  result: PaperDecisionResult,
+  qualificationProfile: QualificationProfileIdentity,
+): Promise<void> {
+  const qualification=await assertPersistedQualification(client,result,qualificationProfile);
   const candidate = result.candidate;
   if(!qualification.existingCandidate){
     await insertDomainEventWithRaw(
@@ -512,6 +530,7 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
 async function assertPersistedQualification(
   client:Client,
   result:PaperDecisionResult,
+  qualificationProfile:QualificationProfileIdentity,
 ):Promise<Readonly<{
   existingCandidate:boolean;
   projection:CanonicalQualificationProjection;
@@ -537,7 +556,7 @@ async function assertPersistedQualification(
   const existingRow=existing.rows[0];
   let projection:CanonicalQualificationProjection|null;
   if(existingRow===undefined){
-    projection=await loadQualification(client,candidate.mint,true);
+    projection=await loadQualification(client,candidate.mint,true,qualificationProfile);
   }else{
     if(
       textField(existingRow,'report_id')!==candidate.qualificationReportId
@@ -547,7 +566,7 @@ async function assertPersistedQualification(
       ||canonicalStringifyJson(decodePrefixedDomainEvent(existingRow,'candidate_event_'))
         !==canonicalStringifyJson(result.candidateEvent)
     )throw new TypeError('Persisted paper candidate is invalid.');
-    projection=await loadQualification(client,candidate.qualificationReportId,false,true);
+    projection=await loadQualification(client,candidate.qualificationReportId,false,undefined,true);
   }
   if(projection===null)throw new TypeError('Persisted qualification projection is missing.');
   assertQualificationMatches(projection,result);
@@ -677,8 +696,12 @@ async function insertDomainEventWithRaw(
   ]);
 }
 
-async function assertDecisionReplay(client: Client, result: PaperDecisionResult): Promise<void> {
-  await assertPersistedQualification(client,result);
+async function assertDecisionReplay(
+  client: Client,
+  result: PaperDecisionResult,
+  qualificationProfile: QualificationProfileIdentity,
+): Promise<void> {
+  await assertPersistedQualification(client,result,qualificationProfile);
   const persisted = await client.query(`SELECT
     EXISTS(SELECT 1 FROM qualification_reports WHERE report_id=$1) AS report,
     EXISTS(SELECT 1 FROM trading_candidates WHERE candidate_id=$2) AS candidate,
@@ -897,11 +920,18 @@ async function loadQualification(
   client:Client,
   identity:string,
   current:boolean,
+  qualificationProfile:QualificationProfileIdentity|undefined,
   includeOrphaned=false,
 ):Promise<CanonicalQualificationProjection|null> {
+  if (current && qualificationProfile === undefined) {
+    throw new TypeError('Effective qualification profile is required.');
+  }
   const result=current
     ? await client.query(`${QUALIFICATION_SELECT}
         WHERE report.mint=$1 AND report.superseded_at IS NULL
+          AND report.profile_id=$2
+          AND report.profile_version=$3
+          AND report.profile_fingerprint=$4
           AND report.purge_after > clock_timestamp()
           AND octet_length(report.payload::text)<=${MAX_CANONICAL_JSON_TEXT_BYTES}
           AND octet_length(qualification.payload::text)<=${MAX_CANONICAL_JSON_TEXT_BYTES}
@@ -910,7 +940,12 @@ async function loadQualification(
           AND raw.confirmation_status<>'orphaned'
           AND qualification.confirmation_status=source.confirmation_status
           AND source.confirmation_status=raw.confirmation_status
-        ORDER BY report.evaluated_at DESC,report.report_id DESC LIMIT 1`,[identity])
+        ORDER BY report.evaluated_at DESC,report.report_id DESC LIMIT 1`,[
+          identity,
+          qualificationProfile?.id,
+          qualificationProfile?.version,
+          qualificationProfile?.fingerprint,
+        ])
     : await client.query(`${QUALIFICATION_SELECT}
         WHERE report.report_id=$1
           AND octet_length(report.payload::text)<=${MAX_CANONICAL_JSON_TEXT_BYTES}
@@ -1048,7 +1083,29 @@ async function loadQualificationByCandidate(
   const row=linked.rows[0];
   return row===undefined
     ?null
-    :loadQualification(client,textField(row,'report_id'),false,includeOrphaned);
+    :loadQualification(client,textField(row,'report_id'),false,undefined,includeOrphaned);
+}
+
+function snapshotQualificationProfile(
+  value: QualificationProfileIdentity,
+): QualificationProfileIdentity {
+  if (
+    typeof value !== 'object'
+    || value === null
+    || Array.isArray(value)
+    || typeof value.id !== 'string'
+    || value.id.length === 0
+    || Buffer.byteLength(value.id, 'utf8') > 256
+    || !Number.isSafeInteger(value.version)
+    || value.version <= 0
+    || typeof value.fingerprint !== 'string'
+    || !/^[0-9a-f]{64}$/u.test(value.fingerprint)
+  ) throw new TypeError('Effective qualification profile identity is invalid.');
+  return Object.freeze({
+    id:value.id,
+    version:value.version,
+    fingerprint:value.fingerprint,
+  });
 }
 
 async function activeLaunchTrades(

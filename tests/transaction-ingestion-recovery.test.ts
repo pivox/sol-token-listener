@@ -368,7 +368,7 @@ function pipeline(
     baseDelayMs: 500,
     retentionHours: 4,
     clock: () => 1_800_000_000_000,
-  });
+  }, qualificationEngine.profileSummary);
   const after = async <T>(boundary: ReplayStage, operation: Promise<T>): Promise<T> => {
     const result = await operation;
     order.push(boundary);
