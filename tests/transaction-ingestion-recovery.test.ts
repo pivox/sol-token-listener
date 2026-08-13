@@ -136,6 +136,10 @@ void test('restarts the production PostgreSQL path at every observation boundary
         relationships: '2',
         clusters: '1',
       });
+      assert.deepEqual(await currentQualificationEvidence(pool), {
+        verdict: 'REJECTED',
+        creatorEarlySellTriggered: true,
+      });
 
       await assertPaperSafety(pool);
       assert.equal((await productionCounts(pool)).paperPositions, '0', boundary);
@@ -747,6 +751,28 @@ async function verticalEvidence(pool: InstanceType<typeof pg.Pool>): Promise<{
     creatorHasSold: row.creator_has_sold,
     relationships: row.relationships,
     clusters: row.clusters,
+  });
+}
+
+async function currentQualificationEvidence(pool: InstanceType<typeof pg.Pool>): Promise<{
+  readonly verdict: string;
+  readonly creatorEarlySellTriggered: boolean;
+}> {
+  const row = (await pool.query<{
+    verdict: string;
+    creator_early_sell_triggered: boolean;
+  }>(`SELECT report.verdict,
+      EXISTS (
+        SELECT 1 FROM jsonb_array_elements(report.payload->'conditions') AS condition
+        WHERE condition->>'code' = 'CREATOR_EARLY_SELL'
+          AND condition->>'status' = 'TRIGGERED'
+      ) AS creator_early_sell_triggered
+    FROM qualification_reports AS report
+    WHERE report.superseded_at IS NULL`)).rows[0];
+  if (row === undefined) throw new Error('Current qualification evidence missing');
+  return Object.freeze({
+    verdict: row.verdict,
+    creatorEarlySellTriggered: row.creator_early_sell_triggered,
   });
 }
 

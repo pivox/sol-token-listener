@@ -14,6 +14,7 @@ import {
 import {
   createWalletClusterId,
   createWalletRelationshipId,
+  type WalletGraphAnalysis,
 } from '../src/domain/wallet-graph.js';
 import {
   createSocialCollection,
@@ -1243,6 +1244,14 @@ void test('reactivates an exact historical report after superseding current with
   assert.equal(statements.some((sql) => /as_of_slot.*>/u.test(sql)), false);
 });
 
+void test('changes the evidence fingerprint when wallet cluster evidence changes', () => {
+  const withoutCluster = projectionFixture();
+  const withCluster = projectionFixture({ walletGraph: walletGraphEvidence(2_500n) });
+
+  assert.notEqual(withCluster.evidenceFingerprint, withoutCluster.evidenceFingerprint);
+  assert.notEqual(withCluster.reportId, withoutCluster.reportId);
+});
+
 void test('live PostgreSQL keeps one current report across replay, revisions, fallback and concurrency', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -1266,10 +1275,11 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
     const repository = new PostgresQualificationProjectionRepository(pool, service);
     const confirmed = projectionFixture({ observedAtMs });
 
-    await Promise.all([
+    const creationOutcomes = await Promise.all([
       repository.transact('mint', (transaction) => transaction.replaceProjection(confirmed)),
       repository.transact('mint', (transaction) => transaction.replaceProjection(confirmed)),
     ]);
+    assert.deepEqual([...creationOutcomes].sort(), ['UNCHANGED', 'UPDATED']);
     assert.deepEqual(await liveCounts(pool), ['1', '1', '1', '1']);
     assert.equal(
       await repository.transact('mint', (transaction) => transaction.replaceProjection(confirmed)),
@@ -1282,15 +1292,23 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
     await pool.query(`UPDATE domain_events SET confirmation_status='finalized'
       WHERE event_id='source-event'`);
     const finalized = projectionFixture({ confirmationStatus: 'finalized', observedAtMs });
-    await repository.transact('mint', (transaction) => transaction.replaceProjection(finalized));
+    assert.notEqual(finalized.reportId, confirmed.reportId);
+    assert.equal(
+      await repository.transact('mint', (transaction) => transaction.replaceProjection(finalized)),
+      'UPDATED',
+    );
     const evidenceRevision = projectionFixture({
       confirmationStatus: 'finalized',
-      descriptionAvailable: true,
       observedAtMs,
+      walletGraph: walletGraphEvidence(2_500n),
     });
-    await repository.transact(
-      'mint',
-      (transaction) => transaction.replaceProjection(evidenceRevision),
+    assert.notEqual(evidenceRevision.evidenceFingerprint, finalized.evidenceFingerprint);
+    assert.equal(
+      await repository.transact(
+        'mint',
+        (transaction) => transaction.replaceProjection(evidenceRevision),
+      ),
+      'UPDATED',
     );
 
     await insertLiveTrade(pool, observedAtMs + 1_000);
@@ -1301,7 +1319,10 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
     assert.ok(recentSnapshot);
     assert.equal(recentSnapshot.asOfEvent.id, 'trade-event');
     const recent = canonicalProjectionFromSnapshot(service, recentSnapshot);
-    await repository.transact('mint', (transaction) => transaction.replaceProjection(recent));
+    assert.equal(
+      await repository.transact('mint', (transaction) => transaction.replaceProjection(recent)),
+      'UPDATED',
+    );
 
     await pool.query(`UPDATE raw_chain_events SET confirmation_status='orphaned'
       WHERE event_id='raw-trade'`);
@@ -1315,8 +1336,12 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
     assert.equal(fallbackSnapshot.asOfEvent.id, 'source-event');
     const fallback = canonicalProjectionFromSnapshot(service, fallbackSnapshot);
     assert.equal(fallback.reportId, finalized.reportId);
-    await repository.transact('mint', (transaction) => transaction.replaceProjection(fallback));
+    assert.equal(
+      await repository.transact('mint', (transaction) => transaction.replaceProjection(fallback)),
+      'UPDATED',
+    );
     assert.deepEqual(await liveCounts(pool), ['4', '1', '4', '4']);
+    assert.equal(await liveCurrentReportId(pool), finalized.reportId);
 
     await pool.query(`UPDATE raw_chain_events SET confirmation_status='orphaned'
       WHERE event_id='raw-source'`);
@@ -2201,6 +2226,7 @@ function projectionFixture(options: Readonly<{
   confirmationStatus?: 'confirmed' | 'finalized';
   descriptionAvailable?: boolean;
   observedAtMs?: number;
+  walletGraph?: WalletGraphAnalysis;
 }> = {}): CanonicalQualificationProjection {
   const service = qualificationService();
   const confirmationStatus = options.confirmationStatus ?? 'confirmed';
@@ -2240,7 +2266,7 @@ function projectionFixture(options: Readonly<{
           fetchedAtMs: observedAtMs, payloadVersion: 1,
         }),
       social: null, creatorProfile: null,
-      holderSnapshot: null, walletGraph: null,
+      holderSnapshot: null, walletGraph: options.walletGraph ?? null,
     }),
     buyQuote: undefined,
     reverseSellQuote: undefined,
@@ -2253,6 +2279,39 @@ function projectionFixture(options: Readonly<{
     evaluation: rebuilt.evaluation,
     report: rebuilt.report,
     qualificationEvent: rebuilt.event,
+  });
+}
+
+function walletGraphEvidence(concentrationBps: bigint): WalletGraphAnalysis {
+  return Object.freeze({
+    relationships: Object.freeze([]),
+    clusters: Object.freeze([Object.freeze({
+      id: createWalletClusterId('mint', ['buyer-a', 'buyer-b']),
+      mint: 'mint',
+      members: Object.freeze([
+        Object.freeze({
+          wallet: 'buyer-a', role: 'PARTICIPANT' as const, isCreator: false,
+          observedNetBaseRaw: 3n,
+        }),
+        Object.freeze({
+          wallet: 'buyer-b', role: 'PARTICIPANT' as const, isCreator: false,
+          observedNetBaseRaw: 1n,
+        }),
+      ]),
+      participantWalletCount: 2, auxiliaryWalletCount: 0, positiveHolderCount: 2,
+      observedPositiveBaseRaw: 4n, concentrationBps, containsCreator: false,
+      sharedFunderCount: 1, strongRelationshipCount: 1, strongEvidenceCount: 1,
+      quoteAssets: Object.freeze([]),
+    })]),
+    coverage: Object.freeze({
+      knownBuyCount: 2, knownBuyerCount: 2,
+      strongEvidenceBuyCount: 2, strongEvidenceBuyerCount: 2,
+      mediumOnlyBuyCount: 0, mediumOnlyBuyerCount: 0,
+      noEvidenceBuyCount: 0, noEvidenceBuyerCount: 0,
+      unavailableBuyCount: 0, unavailableBuyerCount: 0,
+      notProcessedBuyCount: 0, notProcessedBuyerCount: 0,
+      analyzedTransactionCount: 1, evidenceCount: 1,
+    }),
   });
 }
 
@@ -2453,6 +2512,14 @@ async function liveCounts(
     row?.events ?? '-1',
     row?.outbox ?? '-1',
   ];
+}
+
+async function liveCurrentReportId(pool: InstanceType<typeof pg.Pool>): Promise<string> {
+  const row = (await pool.query<{ report_id: string }>(
+    'SELECT report_id FROM qualification_reports WHERE superseded_at IS NULL',
+  )).rows[0];
+  assert.ok(row);
+  return row.report_id;
 }
 
 function quoteIdentifier(identifier: string): string {

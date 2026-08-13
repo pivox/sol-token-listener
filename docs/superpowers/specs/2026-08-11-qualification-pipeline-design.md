@@ -1,7 +1,7 @@
 # Qualification canonique dans le pipeline d'observation — conception
 
-Date : 2026-08-11  
-Issue : [#15](https://github.com/pivox/sol-token-listener/issues/15)  
+Date : 2026-08-11
+Issue : [#15](https://github.com/pivox/sol-token-listener/issues/15)
 Statut : conception validée, spécification soumise à relecture
 
 ## 1. Objectif et périmètre

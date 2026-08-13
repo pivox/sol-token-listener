@@ -43,7 +43,7 @@ No migration is planned: `migrations/013_paper_e2e.sql` already permits a report
 - Modify: `src/application/qualification-rebuild.service.ts`
 - Test: `tests/qualification-rebuild.service.test.ts`
 
-- [ ] **Step 1: Write failing tests for the generic snapshot and stable event source**
+- [x] **Step 1: Write failing tests for the generic snapshot and stable event source**
 
 Update the fixture in `tests/qualification-rebuild.service.test.ts` to import
 `QualificationCanonicalSnapshot` instead of `PaperDecisionSnapshot`, then add:
@@ -62,14 +62,14 @@ void test('builds canonical qualification independently from paper state', () =>
 });
 ```
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 Run: `npx tsx --test tests/qualification-rebuild.service.test.ts`
 
 Expected: compilation fails because `QualificationCanonicalSnapshot` does not
 exist or the event source is still `paper-decision`.
 
-- [ ] **Step 3: Add the canonical port types**
+- [x] **Step 3: Add the canonical port types**
 
 Create `src/ports/qualification-projection-repository.ts` with the exact public
 shape:
@@ -138,7 +138,7 @@ confirms the stored projection exactly.
 Do not modify `PaperDecisionSnapshot` yet and do not add candidate/session
 fields to the canonical snapshot.
 
-- [ ] **Step 4: Run contract tests and type checking**
+- [x] **Step 4: Run contract tests and type checking**
 
 Run:
 
@@ -150,7 +150,7 @@ npm run check
 Expected: qualification rebuild tests and the full type check pass because the
 existing paper snapshot structurally satisfies `QualificationEvidenceSnapshot`.
 
-- [ ] **Step 5: Commit the contract**
+- [x] **Step 5: Commit the contract**
 
 ```bash
 git add src/ports/qualification-projection-repository.ts \
@@ -167,7 +167,7 @@ git commit -m "refactor: extract canonical qualification contract (#15)"
 - Create: `tests/qualification-projection.repository.test.ts`
 - Test: `tests/paper-e2e-migration.test.ts`
 
-- [ ] **Step 1: Write failing repository tests**
+- [x] **Step 1: Write failing repository tests**
 
 Use the scripted-client pattern from
 `tests/participant-analytics.repository.test.ts`. Cover BEGIN, advisory lock,
@@ -192,13 +192,13 @@ assert.equal(qualificationEventsForOriginalReport, 1);
 assert.equal(activeOrphanEvidence, 0);
 ```
 
-- [ ] **Step 2: Run the test and confirm RED**
+- [x] **Step 2: Run the test and confirm RED**
 
 Run: `npx tsx --test tests/qualification-projection.repository.test.ts`
 
 Expected: module-not-found failure for the new repository.
 
-- [ ] **Step 3: Implement transaction and canonical reads**
+- [x] **Step 3: Implement transaction and canonical reads**
 
 Implement `PostgresQualificationProjectionRepository` with:
 
@@ -229,7 +229,7 @@ await client.query(
 
 No query may join on a derived event's null `raw_event_id` as report source.
 
-- [ ] **Step 4: Implement deterministic replacement and reactivation**
+- [x] **Step 4: Implement deterministic replacement and reactivation**
 
 Within the same transaction, implement this order:
 
@@ -260,7 +260,7 @@ domain event's non-null `raw_event_id` for `source_raw_event_id`.
 `dissolveCurrent` sets a bounded `superseded_at` on the current row; it does not
 delete report or event history.
 
-- [ ] **Step 5: Run repository and migration contracts**
+- [x] **Step 5: Run repository and migration contracts**
 
 Run:
 
@@ -272,7 +272,7 @@ npx tsx --test tests/paper-e2e-migration.test.ts tests/migration-contract.test.t
 Expected: all non-live tests pass; the live test reports skipped only when
 `TEST_DATABASE_URL` is absent.
 
-- [ ] **Step 6: Commit the repository**
+- [x] **Step 6: Commit the repository**
 
 ```bash
 git add src/storage/qualification-projection.repository.ts \
@@ -288,7 +288,7 @@ git commit -m "feat: persist canonical qualification projections (#15)"
 - Create: `src/application/qualification-projection.service.ts`
 - Create: `tests/qualification-projection.service.test.ts`
 
-- [ ] **Step 1: Write failing service tests**
+- [x] **Step 1: Write failing service tests**
 
 Cover `UPDATED`, `UNCHANGED`, active missing launch and orphan dissolution:
 
@@ -311,13 +311,13 @@ an exact replay returning `UNCHANGED`, and `UNSUPPORTED_QUOTE_MINT` triggered
 only when none of the launch quote assets belongs to the configured V1
 allowlist.
 
-- [ ] **Step 2: Run the test and confirm RED**
+- [x] **Step 2: Run the test and confirm RED**
 
 Run: `npx tsx --test tests/qualification-projection.service.test.ts`
 
 Expected: module-not-found failure.
 
-- [ ] **Step 3: Implement the minimal orchestration**
+- [x] **Step 3: Implement the minimal orchestration**
 
 Create a typed `QualificationProjectionLaunchNotFoundError` and implement:
 
@@ -366,7 +366,7 @@ The constructor receives a validated, non-empty, duplicate-free frozen
 assumption. Remove the equivalent upstream-condition construction from the
 paper worker in Task 5 so there remains one canonical reason-code producer.
 
-- [ ] **Step 4: Run focused tests and check**
+- [x] **Step 4: Run focused tests and check**
 
 Run:
 
@@ -378,7 +378,7 @@ npm run check
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit the service**
+- [x] **Step 5: Commit the service**
 
 ```bash
 git add src/application/qualification-projection.service.ts \
@@ -394,7 +394,7 @@ git commit -m "feat: rebuild canonical qualification by mint (#15)"
 - Modify: `tests/observed-transaction-pipeline.test.ts`
 - Modify: `tests/transaction-ingestion-recovery.test.ts`
 
-- [ ] **Step 1: Write failing ordering, union and error tests**
+- [x] **Step 1: Write failing ordering, union and error tests**
 
 Extend the pipeline harness with a qualification rebuilder. Assert the exact
 order for lexically sorted mints:
@@ -425,7 +425,7 @@ assert.equal(calls.includes('paper:B'), false);
 Add recovery coverage showing the inbox replays a failed qualification stage
 and reaches `markProcessed` once the dependency succeeds.
 
-- [ ] **Step 2: Run the tests and confirm RED**
+- [x] **Step 2: Run the tests and confirm RED**
 
 Run:
 
@@ -436,7 +436,7 @@ npx tsx --test tests/observed-transaction-pipeline.test.ts \
 
 Expected: missing constructor dependency/stage/result field failures.
 
-- [ ] **Step 3: Implement the lexical qualification stage**
+- [x] **Step 3: Implement the lexical qualification stage**
 
 Add to `ObservedPipelineStage` and result:
 
@@ -462,7 +462,7 @@ for (const mint of qualificationMints) {
 Use `qualificationMints` for paper enqueue. Do not make any RPC or quote call in
 this stage.
 
-- [ ] **Step 4: Run pipeline/recovery tests and static checks**
+- [x] **Step 4: Run pipeline/recovery tests and static checks**
 
 Run:
 
@@ -474,7 +474,7 @@ npm run check
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit the pipeline stage**
+- [x] **Step 5: Commit the pipeline stage**
 
 ```bash
 git add src/application/observed-transaction-pipeline.ts \
@@ -493,7 +493,7 @@ git commit -m "feat: qualify affected mints in observation pipeline (#15)"
 - Modify: `tests/paper-decision-worker.test.ts`
 - Modify: `tests/paper-decision.repository.test.ts`
 
-- [ ] **Step 1: Write failing single-writer tests**
+- [x] **Step 1: Write failing single-writer tests**
 
 Add this field to `PaperDecisionSnapshot` before updating worker fixtures:
 
@@ -529,7 +529,7 @@ report, profile, report ID, event ID or evidence fingerprint before paper
 writes. Add one separate case proving an existing candidate can reconcile its
 exact historical report after supersession, without opening a new position.
 
-- [ ] **Step 2: Run focused tests and confirm RED**
+- [x] **Step 2: Run focused tests and confirm RED**
 
 Run:
 
@@ -541,7 +541,7 @@ npx tsx --test tests/paper-decision-worker.test.ts \
 Expected: worker still calls the rebuild dependency and repository still writes
 the report.
 
-- [ ] **Step 3: Refactor the worker**
+- [x] **Step 3: Refactor the worker**
 
 Keep `QualificationRebuildService` in the worker only as a persisted projection
 verifier. Before quotes and candidate creation, require
@@ -571,7 +571,7 @@ reauthorized qualification for new candidate work. In `reconcileExisting`,
 reauthorize only the exact report already linked to candidate/session; never use
 a superseded historical report to create a new candidate or paper position.
 
-- [ ] **Step 4: Refactor PostgreSQL paper persistence**
+- [x] **Step 4: Refactor PostgreSQL paper persistence**
 
 `loadSnapshot` loads the current active qualification independently of a
 candidate. Before candidate/session writes, verify it under the mint lock:
@@ -591,7 +591,7 @@ reconciliation, require the exact existing candidate/report/event lineage
 instead. Remove qualification event insertion, report supersession and report
 insert from `writeDecision`; begin writes with the candidate event/row.
 
-- [ ] **Step 5: Run paper and end-to-end tests**
+- [x] **Step 5: Run paper and end-to-end tests**
 
 Run:
 
@@ -606,7 +606,7 @@ npm run check
 Expected: all pass; live PostgreSQL tests skip only without
 `TEST_DATABASE_URL`.
 
-- [ ] **Step 6: Commit the single-writer refactor**
+- [x] **Step 6: Commit the single-writer refactor**
 
 ```bash
 git add src/ports/paper-decision-repository.ts \
@@ -626,7 +626,7 @@ git commit -m "refactor: consume canonical qualification in paper worker (#15)"
 - Modify: `tests/bootstrap-safety.test.ts`
 - Modify: `tests/transaction-ingestion-recovery.test.ts`
 
-- [ ] **Step 1: Write failing composition and observe-mode tests**
+- [x] **Step 1: Write failing composition and observe-mode tests**
 
 Assert the factory imports and composes
 `PostgresQualificationProjectionRepository` and
@@ -641,7 +641,7 @@ assert.doesNotMatch(importGraph, /Keypair|sendTransaction|signTransaction|simula
 assert.equal(paperWritesInObserveMode, 0);
 ```
 
-- [ ] **Step 2: Run tests and confirm RED**
+- [x] **Step 2: Run tests and confirm RED**
 
 Run:
 
@@ -652,7 +652,7 @@ npx tsx --test tests/production-listener-factory.test.ts \
 
 Expected: factory lacks the qualification projection composition.
 
-- [ ] **Step 3: Compose one engine and one canonical service**
+- [x] **Step 3: Compose one engine and one canonical service**
 
 In `createProductionListenerRuntime`, reuse the already loaded effective
 profile and engine:
@@ -671,7 +671,7 @@ rebuilder in `PaperDecisionWorker` only for deterministic persisted-report
 reauthorization; it must never write a qualification projection there. Do not
 change execution mode, RPC clients, quote providers or Raydium paths.
 
-- [ ] **Step 4: Run runtime tests and static checks**
+- [x] **Step 4: Run runtime tests and static checks**
 
 Run:
 
@@ -684,7 +684,7 @@ npm run lint
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit runtime composition**
+- [x] **Step 5: Commit runtime composition**
 
 ```bash
 git add src/application/production-listener-factory.ts \
@@ -707,7 +707,7 @@ git commit -m "feat: compose qualification projection in production (#15)"
 - Modify: `tests/api-safety.test.ts`
 - Modify: `tests/listener-runtime.test.ts`
 
-- [ ] **Step 1: Write failing API and isolation tests**
+- [x] **Step 1: Write failing API and isolation tests**
 
 Extend expected health with:
 
@@ -729,7 +729,7 @@ Add a query-failure test asserting PostgreSQL remains available, only
 `pipeline.qualification` becomes `DEGRADED`, qualification metrics return safe
 zero/null values and global health becomes `DEGRADED`.
 
-- [ ] **Step 2: Run focused tests and confirm RED**
+- [x] **Step 2: Run focused tests and confirm RED**
 
 Run:
 
@@ -740,7 +740,7 @@ npx tsx --test tests/api-contracts.test.ts \
 
 Expected: missing contract fields.
 
-- [ ] **Step 3: Add the bounded health contract**
+- [x] **Step 3: Add the bounded health contract**
 
 Add:
 
@@ -758,7 +758,7 @@ Update the disabled provider in `src/app.ts`, the degraded fallback and the
 exact-key validator in `api-projection.repository.ts` to require the sixth
 pipeline field.
 
-- [ ] **Step 4: Add isolated metrics projection**
+- [x] **Step 4: Add isolated metrics projection**
 
 Query only bounded aggregates:
 
@@ -775,7 +775,7 @@ Catch this query separately. On failure, set qualification metrics to
 `{ currentCount:0, lastSuccessAt:null }`, mark only qualification pipeline
 state degraded, and preserve safe redaction.
 
-- [ ] **Step 5: Run health tests and public API checks**
+- [x] **Step 5: Run health tests and public API checks**
 
 Run:
 
@@ -788,7 +788,7 @@ npm run check
 
 Expected: all pass.
 
-- [ ] **Step 6: Commit health support**
+- [x] **Step 6: Commit health support**
 
 ```bash
 git add src/api/contracts.ts src/application/listener-runtime.ts src/app.ts \
@@ -810,7 +810,7 @@ git commit -m "feat: expose canonical qualification health (#15)"
 - Modify: `frontend/tests/e2e/mock-api.mjs`
 - Modify: `frontend/tests/e2e/operator-console.spec.ts`
 
-- [ ] **Step 1: Write failing schema and rendering tests**
+- [x] **Step 1: Write failing schema and rendering tests**
 
 Extend the health fixture with `pipeline.qualification` and
 `qualification:{currentCount,lastSuccessAt}`. Assert schema rejection when
@@ -822,7 +822,7 @@ expect(screen.getByText(/rapports courants : 2/iu)).toBeVisible();
 expect(screen.getByText(/dernier succès/iu)).toBeVisible();
 ```
 
-- [ ] **Step 2: Run frontend tests and confirm RED**
+- [x] **Step 2: Run frontend tests and confirm RED**
 
 Run:
 
@@ -833,7 +833,7 @@ npm test --workspace frontend -- --run api-schemas health-page
 Expected: schema/fixture or rendering assertions fail because qualification
 health is not yet modeled.
 
-- [ ] **Step 3: Extend the schema and diagnostic page**
+- [x] **Step 3: Extend the schema and diagnostic page**
 
 Add to the loose internal health schema:
 
@@ -854,7 +854,7 @@ Add one qualification row to `PipelineRows` and one Bootstrap diagnostic card
 showing current report count and last success. Update mock API and E2E fixture
 with bounded public values; do not expose mint or report payload.
 
-- [ ] **Step 4: Run frontend unit and E2E tests**
+- [x] **Step 4: Run frontend unit and E2E tests**
 
 Run:
 
@@ -867,7 +867,7 @@ npm run e2e --workspace frontend
 
 Expected: all frontend tests and operator-console E2E pass.
 
-- [ ] **Step 5: Commit frontend alignment**
+- [x] **Step 5: Commit frontend alignment**
 
 ```bash
 git add frontend/src/data/api-schemas.ts frontend/src/data/api-schemas.test.ts \
@@ -887,7 +887,7 @@ git commit -m "feat: show qualification health in operator console (#15)"
 - Modify: `docs/superpowers/plans/2026-08-11-qualification-pipeline.md`
 - Test: all suites
 
-- [ ] **Step 1: Add the final regression matrix**
+- [x] **Step 1: Add the final regression matrix**
 
 Ensure named tests prove all issue cases:
 
@@ -909,7 +909,7 @@ Place creation/buy/sell/cluster/reorg cases in
 `tests/transaction-ingestion-recovery.test.ts`. Do not create a second broad
 end-to-end fixture.
 
-- [ ] **Step 2: Run all acceptance commands**
+- [x] **Step 2: Run all acceptance commands**
 
 Run:
 
@@ -925,7 +925,7 @@ Expected: exit code 0 for every command. Record the exact pass/skip totals in
 the PR description. PostgreSQL skips are acceptable locally only when
 `TEST_DATABASE_URL` is absent.
 
-- [ ] **Step 3: Run live PostgreSQL acceptance**
+- [x] **Step 3: Run live PostgreSQL acceptance**
 
 When `TEST_DATABASE_URL` is available, run:
 
@@ -936,7 +936,7 @@ TEST_DATABASE_URL="$TEST_DATABASE_URL" npm test
 Expected: repository concurrency, replay, reactivation, empty-schema migration
 and purge tests pass with no PostgreSQL skips. Do not print the URL.
 
-- [ ] **Step 4: Verify safety and diff scope**
+- [x] **Step 4: Verify safety and diff scope**
 
 Run:
 
@@ -952,7 +952,7 @@ git status --short
 Expected: no whitespace errors, no forbidden execution capability in the new
 path, and only issue #15 files changed.
 
-- [ ] **Step 5: Mark this plan complete and commit documentation if changed**
+- [x] **Step 5: Mark this plan complete and commit documentation if changed**
 
 Document the stage order, single-writer authority, persisted reauthorization,
 health fields and four-hour retention in the architecture/API documents. Check
