@@ -309,6 +309,12 @@ orpheline, une projection historique encore active peut redevenir courante
 sans dupliquer son événement ; si le lancement lui-même n’est plus canonique,
 la projection courante est dissoute.
 
+La route risk ne déduit pas l'état courant du dernier événement chronologique.
+Elle joint le rapport `superseded_at IS NULL` encore retenu du profil effectif
+à son wrapper `QualificationUpdated`, son événement source et son raw event,
+puis vérifie leurs identités et finalités avant de projeter le rapport. Une
+lignée absente, expirée, dissoute ou orphaned reste indisponible.
+
 La détection reste multi-quote : les quote assets Pump.fun/PumpSwap conservent
 mint, décimales et Token Program séparément. La qualification accepte un
 lancement lorsqu’au moins un quote mint appartient à

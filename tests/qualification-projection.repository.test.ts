@@ -30,6 +30,7 @@ import {
   QualificationProjectionDataError,
   QualificationProjectionRepositoryError,
 } from '../src/storage/qualification-projection.repository.js';
+import { PostgresApiProjectionRepository } from '../src/storage/api-projection.repository.js';
 
 const SOCIAL_LINK_ROW_MAXIMUM = 3;
 const SOCIAL_OBSERVATION_ROW_MAXIMUM = 3;
@@ -1274,6 +1275,9 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
     const service = qualificationService();
     const repository = new PostgresQualificationProjectionRepository(pool, service);
     const confirmed = projectionFixture({ observedAtMs });
+    const api = new PostgresApiProjectionRepository(
+      pool, () => new Date(), undefined, undefined, confirmed.report.ruleSet,
+    );
 
     const creationOutcomes = await Promise.all([
       repository.transact('mint', (transaction) => transaction.replaceProjection(confirmed)),
@@ -1281,6 +1285,7 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
     ]);
     assert.deepEqual([...creationOutcomes].sort(), ['UNCHANGED', 'UPDATED']);
     assert.deepEqual(await liveCounts(pool), ['1', '1', '1', '1']);
+    assert.equal((await api.getLaunchRisk('mint'))?.ruleSet.fingerprint, confirmed.report.ruleSet.fingerprint);
     assert.equal(
       await repository.transact('mint', (transaction) => transaction.replaceProjection(confirmed)),
       'UNCHANGED',
@@ -1309,6 +1314,12 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
         (transaction) => transaction.replaceProjection(evidenceRevision),
       ),
       'UPDATED',
+    );
+    assert.equal(
+      (await api.getLaunchRisk('mint'))?.conditions.find((condition) => (
+        condition.code === 'RELATED_WALLET_CLUSTER_EXCEEDED'
+      ))?.observed.maximumRelatedClusterBps,
+      '2500',
     );
 
     await insertLiveTrade(pool, observedAtMs + 1_000);
@@ -1354,6 +1365,7 @@ void test('live PostgreSQL keeps one current report across replay, revisions, fa
     assert.equal(missing, null);
     await repository.transact('mint', (transaction) => transaction.dissolveCurrent('mint'));
     assert.deepEqual(await liveCounts(pool), ['4', '0', '4', '4']);
+    assert.equal(await api.getLaunchRisk('mint'), null);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);

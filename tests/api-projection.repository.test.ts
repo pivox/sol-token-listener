@@ -76,6 +76,54 @@ class FakeConnectable implements Queryable {
 const detectedAt = new Date('2026-07-01T12:00:00.000Z');
 const openedAt = new Date('2026-07-02T12:00:00.000Z');
 
+function legacyRiskReport(): Record<string, unknown> {
+  return {
+    ruleSet: { id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60 },
+    scores: {
+      preparation: { score: 1, maximum: 2 }, socialAuthenticity: { score: 3, maximum: 4 },
+      onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 },
+    }, evidence: [], blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
+  };
+}
+
+function canonicalRiskWrapper(report: Record<string, unknown>): Record<string, unknown> {
+  return {
+    reportId: `qreport_${'c'.repeat(64)}`,
+    evidenceFingerprint: 'b'.repeat(64),
+    evaluation: { evaluatedAtMs: detectedAt.getTime(), signals: {}, blockers: [], calibrationFacts: null },
+    report,
+  };
+}
+
+function canonicalRiskRow(
+  report: Record<string, unknown>,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const ruleSet = report.ruleSet as Record<string, unknown>;
+  const scores = report.scores as Record<string, Record<string, unknown>>;
+  return {
+    report_id: `qreport_${'c'.repeat(64)}`,
+    evidence_fingerprint: 'b'.repeat(64),
+    profile_id: ruleSet.id,
+    profile_version: ruleSet.version,
+    profile_fingerprint: ruleSet.fingerprint ?? 'a'.repeat(64),
+    verdict: report.verdict,
+    preparation_score: scores.preparation?.score,
+    social_score: scores.socialAuthenticity?.score,
+    onchain_score: scores.onchainHealth?.score,
+    total_score: scores.total?.score,
+    evaluated_at: new Date(report.evaluatedAtMs as number),
+    report_payload_version: 1,
+    report_payload_size: 1,
+    report_payload: report,
+    qualification_event_id: `evt_${'d'.repeat(64)}`,
+    event_payload_version: 1,
+    event_payload_size: 1,
+    event_payload: canonicalRiskWrapper(report),
+    ...overrides,
+  };
+}
+
 function calibratedConditions(): Record<string, unknown>[] {
   return QUALIFICATION_REASON_CODES.map((code) => {
     if (code === 'HOLDER_CONCENTRATION_EXCEEDED') return {
@@ -1204,7 +1252,7 @@ void test('rejects timeline PostgreSQL integer overflow before querying', async 
   assert.equal(database.calls.length, 0);
 });
 
-void test('uses the latest non-orphaned qualification event and rejects malformed data safely', async () => {
+void test('loads the current canonical qualification wrapper for the effective profile', async () => {
   const report = {
     ruleSet: { id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60 },
     scores: {
@@ -1212,22 +1260,51 @@ void test('uses the latest non-orphaned qualification event and rejects malforme
       onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 },
     }, evidence: [], blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
   };
-  const database = new FakeQueryable((call) => call.text.includes('QualificationUpdated')
-    ? [{ payload: report }] : []);
-  const value = await new PostgresApiProjectionRepository(database).getLaunchRisk('mint-a');
+  const database = new FakeQueryable(() => [canonicalRiskRow(report)]);
+  const value = await new PostgresApiProjectionRepository(
+    database, () => new Date(), undefined, undefined,
+    { id: 'rules', version: 1, fingerprint: 'a'.repeat(64) },
+  ).getLaunchRisk('mint-a');
   assert.deepEqual(value, {
     ruleSet: { ...report.ruleSet, fingerprint: null }, scores: report.scores, evidence: report.evidence,
     conditions: [], blockers: report.blockers, verdict: report.verdict,
     evaluatedAt: detectedAt.toISOString(),
   });
-  assert.match(database.calls[0]?.text ?? '', /confirmation_status <> 'orphaned'/u);
-  assert.match(
-    database.calls[0]?.text ?? '',
-    /ORDER BY\s+slot DESC,\s*transaction_index DESC,\s*instruction_index DESC,\s*COALESCE\(inner_instruction_index, -1\) DESC,\s*event_id DESC/u,
-  );
+  const query = database.calls[0]?.text ?? '';
+  assert.match(query, /FROM qualification_reports AS report/u);
+  assert.match(query, /report\.superseded_at IS NULL/u);
+  assert.match(query, /report\.purge_after > clock_timestamp\(\)/u);
+  assert.match(query, /JOIN domain_events AS source/u);
+  assert.match(query, /JOIN raw_chain_events AS raw/u);
+  assert.match(query, /JOIN domain_events AS qualification_event/u);
+  assert.match(query, /qualification_event\.source = 'qualification'/u);
+  assert.match(query, /report\.confirmation_status <> 'orphaned'/u);
+  assert.match(query, /source\.confirmation_status <> 'orphaned'/u);
+  assert.match(query, /raw\.confirmation_status <> 'orphaned'/u);
+  assert.match(query, /qualification_event\.confirmation_status <> 'orphaned'/u);
+  assert.match(query, /source\.raw_event_id = report\.source_raw_event_id/u);
+  assert.match(query, /qualification_event\.raw_event_id = report\.source_raw_event_id/u);
+  assert.match(query, /octet_length\(report\.payload::text\) <= 1048576/u);
+  assert.match(query, /octet_length\(qualification_event\.payload::text\) <= 1048576/u);
+  assert.match(query, /report\.profile_id = \$2/u);
+  assert.deepEqual(database.calls[0]?.values, ['mint-a', 'rules', 1, 'a'.repeat(64)]);
+});
 
-  const malformed = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: '{bad json' }]));
-  await assert.rejects(malformed.getLaunchRisk('mint-a'), ApiProjectionDataError);
+void test('rejects a direct legacy event report and malformed canonical identity', async () => {
+  const report = legacyRiskReport();
+  const direct = canonicalRiskRow(report, { event_payload: report });
+  const mismatched = canonicalRiskRow(report, {
+    event_payload: { ...canonicalRiskWrapper(report), reportId: `qreport_${'f'.repeat(64)}` },
+  });
+  for (const row of [direct, mismatched]) {
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [row]));
+    await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
+  }
+});
+
+void test('returns unavailable when no current fresh coherent qualification lineage exists', async () => {
+  const database = new FakeQueryable(() => []);
+  assert.equal(await new PostgresApiProjectionRepository(database).getLaunchRisk('mint-a'), null);
 });
 
 void test('projects calibrated qualification evidence as canonical V1 condition fields', async () => {
@@ -1244,7 +1321,9 @@ void test('projects calibrated qualification evidence as canonical V1 condition 
     blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
   };
   const databasePayload = JSON.parse(JSON.stringify(toJsonValue(report))) as unknown;
-  const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: databasePayload }]));
+  const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [
+    canonicalRiskRow(databasePayload as Record<string, unknown>),
+  ]));
 
   const value = await repository.getLaunchRisk('mint-a');
 
@@ -1290,7 +1369,9 @@ void test('rejects incomplete or malformed calibrated qualification evidence fai
   ];
 
   for (const payload of malformed) {
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [
+      canonicalRiskRow(payload as Record<string, unknown>),
+    ]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
   }
 });
@@ -1313,7 +1394,9 @@ void test('requires new calibrated qualifications to use the complete canonical 
     ? { ...item, status: 'DISABLED' } : item);
 
   for (const conditions of [[], valid.conditions.slice(0, -1), reordered, disabled, statusDisabled]) {
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: { ...valid, conditions } }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [
+      canonicalRiskRow({ ...valid, conditions }),
+    ]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
   }
 });
@@ -1336,7 +1419,9 @@ void test('enforces shared-funder observation and threshold bounds exactly', asy
   ]) {
     const invalidConditions = [...conditions];
     invalidConditions[index] = replacement;
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: { ...valid, conditions: invalidConditions } }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [
+      canonicalRiskRow({ ...valid, conditions: invalidConditions }),
+    ]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
   }
 });
@@ -1354,7 +1439,10 @@ void test('rejects hostile qualification payload descriptors and proxies without
     get: () => { throw new Error(secret); },
   });
   for (const payload of [proxy, accessor]) {
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [canonicalRiskRow(
+      legacyRiskReport(),
+      { event_payload: { ...canonicalRiskWrapper(legacyRiskReport()), report: payload } },
+    )]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), (error: unknown) => {
       assert.ok(error instanceof ApiProjectionDataError);
       assert.equal(error.message.includes(secret), false);
@@ -1375,7 +1463,7 @@ void test('projects complete engine evidence from calibrated and legacy persiste
   Reflect.deleteProperty(legacy, 'conditions');
 
   for (const payload of [calibrated, legacy]) {
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [canonicalRiskRow(payload)]));
     const value = await repository.getLaunchRisk('mint-a');
     assert.deepEqual(value?.evidence, report.evidence.map(({ signal, status, message }) => ({ signal, status, message })));
   }
@@ -1388,7 +1476,7 @@ void test('projects complete engine evidence from calibrated and legacy persiste
     const corrupt = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;
     const evidence = corrupt.evidence as Record<string, unknown>[];
     evidence[0] = { ...evidence[0], ...change };
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: corrupt }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [canonicalRiskRow(corrupt)]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
   }
 });

@@ -89,9 +89,13 @@ void test('migrates, starts listener before API, then closes listener before API
       calls.push('listener.create');
       return runtime;
     },
-    createProjectionRepository: (received, pipeline) => {
+    createProjectionRepository: (received, pipeline, _holderLimits, qualificationProfile) => {
       assert.equal(received, pool);
       assert.deepEqual(pipeline(), runtime.pipelineState());
+      assert.deepEqual(qualificationProfile, {
+        id: 'pumpfun-v1-initial', version: 1, status: 'UNVALIDATED_RULE_SET',
+        fingerprint: 'a'.repeat(64), minimumTotalScore: 60,
+      });
       calls.push('projections');
       return {} as ApiProjectionRepository;
     },
