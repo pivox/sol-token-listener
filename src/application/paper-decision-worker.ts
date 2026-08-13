@@ -305,10 +305,7 @@ export class PaperDecisionWorker {
         }
       }
       if(!qualificationIsCurrent){
-        const terminal=manualReviewDecision(
-          context,candidateResult,session,decisionSnapshot.candidateEvent,this.readNow(),
-        );
-        return this.fail(job,lease,'DECISION_INVALID',false,terminal);
+        return this.fail(job,lease,'RPC_TRANSIENT',true,null);
       }
       const staged=decision(
         context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'OPEN',

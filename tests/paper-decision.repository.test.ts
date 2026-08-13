@@ -397,6 +397,44 @@ void test('retries with a bounded lease and cancels only after exhaustion', asyn
   });
 });
 
+void test('retry-only reconciliation failure preserves every paper domain row',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    const repository=new PostgresPaperDecisionRepository(pool,{
+      maxAttempts:3,baseDelayMs:100,clock:()=>2_000,
+    });
+    await repository.enqueue(jobInput());
+    const entryJob=await repository.claim({ nowMs:1_000,leaseMs:1_000 });
+    assert.ok(entryJob);
+    await repository.complete(entryJob,decisionResult());
+    await seedTrade(pool);
+    await repository.enqueue(jobInput({
+      sourceEventId:TRADE_EVENT_ID,sourceRawEventId:TRADE_RAW_EVENT_ID,
+      inputFingerprint:'8'.repeat(64),
+    }));
+    const retryJob=await repository.claim({ nowMs:2_000,leaseMs:1_000 });
+    assert.ok(retryJob);
+    const before=await paperDomainRows(pool);
+
+    await repository.fail(retryJob,{
+      code:'RPC_TRANSIENT',retryable:true,terminalResult:null,
+    });
+
+    assert.deepEqual(await paperDomainRows(pool),before);
+    const persisted=await pool.query<{
+      readonly status:string;readonly error_code:string;readonly next_attempt_at:Date|null;
+    }>(`SELECT status,error_code,next_attempt_at FROM paper_decision_jobs
+      WHERE job_id=$1`,[retryJob.jobId]);
+    assert.equal(persisted.rows[0]?.status,'RETRYABLE_FAILED');
+    assert.equal(persisted.rows[0]?.error_code,'RPC_TRANSIENT');
+    assert.equal(persisted.rows[0]?.next_attempt_at?.getTime(),2_100);
+    assert.deepEqual(await repository.counts(),{
+      pending:0,processing:0,retryableFailed:1,exhausted:0,
+    });
+  });
+});
+
 void test('stages, survives lease expiry, replays and completes one immutable decision', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
@@ -624,6 +662,23 @@ function jobInput(overrides: Partial<PaperDecisionJobInput> = {}): PaperDecision
     inputFingerprint: FINGERPRINT,
     ...overrides,
   });
+}
+
+async function paperDomainRows(pool:pg.Pool):Promise<unknown>{
+  const result=await pool.query(`SELECT
+    (SELECT COALESCE(jsonb_agg(to_jsonb(event_row) ORDER BY event_id),'[]'::jsonb)
+      FROM domain_events event_row) events,
+    (SELECT COALESCE(jsonb_agg(to_jsonb(candidate_row) ORDER BY candidate_id),'[]'::jsonb)
+      FROM trading_candidates candidate_row) candidates,
+    (SELECT COALESCE(jsonb_agg(to_jsonb(session_row) ORDER BY session_id),'[]'::jsonb)
+      FROM paper_strategy_sessions session_row) sessions,
+    (SELECT COALESCE(jsonb_agg(to_jsonb(position_row) ORDER BY position_id),'[]'::jsonb)
+      FROM paper_positions position_row) positions,
+    (SELECT COALESCE(jsonb_agg(to_jsonb(trade_row) ORDER BY trade_id),'[]'::jsonb)
+      FROM paper_trades trade_row) trades,
+    (SELECT COALESCE(jsonb_agg(to_jsonb(buy_row) ORDER BY session_id,trade_id),'[]'::jsonb)
+      FROM paper_external_buy_events buy_row) external_buys`);
+  return result.rows[0];
 }
 
 function decisionResult(

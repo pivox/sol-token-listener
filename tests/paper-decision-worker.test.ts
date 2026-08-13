@@ -209,8 +209,9 @@ void test('reconciles the exact historical qualification without opening a new p
     }),
   });
   const services=fakeServices('ELIGIBLE',operations);
+  const quotes=new FakeQuotes();
   const worker=new PaperDecisionWorker(
-    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    repository,quotes,services.qualification,services.candidates,services.strategy,
     options(),new ManualScheduler(),
   );
 
@@ -248,7 +249,7 @@ void test('recovers a staged BUY_PENDING session after its paper position opened
   assert.equal(repository.completions[0]?.result.session?.state, 'WAITING_EXTERNAL_BUYS');
 });
 
-void test('blocks a staged BUY_PENDING open when its qualification was superseded',async()=>{
+void test('defers a staged BUY_PENDING open when its qualification was superseded',async()=>{
   const operations:string[]=[];
   const repository=new FakeRepository([claim()],operations);
   const candidate=tradingCandidate('ELIGIBLE');
@@ -281,17 +282,15 @@ void test('blocks a staged BUY_PENDING open when its qualification was supersede
   assert.deepEqual(services.qualification.calls,[historical,superseded]);
   assert.equal(services.candidates.calls.length,0);
   assert.equal(quotes.calls,0);
-  assert.deepEqual(operations,[]);
-  assert.equal(repository.failures[0]?.failure.code,'DECISION_INVALID');
-  assert.equal(repository.failures[0]?.failure.retryable,false);
-  assert.equal(repository.failures[0]?.failure.terminalResult?.session?.state,'MANUAL_REVIEW');
-  assert.equal(
-    repository.failures[0]?.failure.terminalResult?.session?.reasonCode,
-    'RECONCILIATION_REQUIRED',
-  );
+  assert.deepEqual(operations,['fail']);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'RPC_TRANSIENT',retryable:true,terminalResult:null,
+  });
+  assert.equal(repository.stages.length,0);
+  assert.equal(repository.completions.length,0);
 });
 
-void test('blocks a staged BUY_PENDING open when current qualification is missing',async()=>{
+void test('defers a staged BUY_PENDING open when current qualification is missing',async()=>{
   const operations:string[]=[];
   const repository=new FakeRepository([claim()],operations);
   const candidate=tradingCandidate('ELIGIBLE');
@@ -310,16 +309,61 @@ void test('blocks a staged BUY_PENDING open when current qualification is missin
     }),
   });
   const services=fakeServices('ELIGIBLE',operations);
+  const quotes=new FakeQuotes();
   const worker=new PaperDecisionWorker(
-    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    repository,quotes,services.qualification,services.candidates,services.strategy,
     options(),new ManualScheduler(),
   );
 
   assert.equal((await worker.runOnce()).kind,'failed');
   assert.deepEqual(services.qualification.calls,[historical]);
-  assert.deepEqual(operations,[]);
-  assert.equal(repository.failures[0]?.failure.code,'DECISION_INVALID');
-  assert.equal(repository.failures[0]?.failure.terminalResult?.session?.state,'MANUAL_REVIEW');
+  assert.deepEqual(operations,['fail']);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'RPC_TRANSIENT',retryable:true,terminalResult:null,
+  });
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(quotes.calls,0);
+  assert.equal(repository.stages.length,0);
+  assert.equal(repository.completions.length,0);
+});
+
+void test('defers a staged BUY_PENDING open when current qualification is invalid',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const historical=canonicalQualification();
+  const invalid=canonicalQualification();
+  const session=createPaperStrategySession({
+    candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:invalid,currentCandidate:candidate,currentSession:session,
+    activePosition:null,currentDecision:Object.freeze({
+      qualification:historical,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  services.qualification.rejected=invalid;
+  const quotes=new FakeQuotes();
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(services.qualification.calls,[historical,invalid]);
+  assert.deepEqual(operations,['fail']);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'RPC_TRANSIENT',retryable:true,terminalResult:null,
+  });
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(quotes.calls,0);
+  assert.equal(repository.stages.length,0);
+  assert.equal(repository.completions.length,0);
 });
 
 void test('resumes a staged BUY_PENDING open when its qualification is still current',async()=>{
@@ -508,7 +552,7 @@ class FakeRepository implements PaperDecisionRepository {
     this.operations.push('complete'); this.completions.push({ result });
   }
   public async fail(_job:ClaimedPaperDecisionJob,failure:PaperDecisionFailure): Promise<void> {
-    this.failures.push({ failure });
+    this.operations.push('fail'); this.failures.push({ failure });
   }
   public async counts(): Promise<PaperDecisionQueueCounts> {
     return Object.freeze({ pending:0,processing:0,retryableFailed:0,exhausted:0 });
@@ -605,9 +649,11 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
   };
   const qualification = {
     calls:[] as CanonicalQualificationProjection[],
+    rejected:null as CanonicalQualificationProjection|null,
     authorizedReport:rebuilt.report,
     reauthorize(projection:CanonicalQualificationProjection) {
       this.calls.push(projection);
+      if(projection===this.rejected)throw new TypeError('invalid qualification');
       return Object.freeze({
         ...rebuilt,reportId:'qreport_authorized',reportEventId:'evt_authorized',
         evidenceFingerprint:'e'.repeat(64),event:event('QualificationUpdated','evt_authorized'),
