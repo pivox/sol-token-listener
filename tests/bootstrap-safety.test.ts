@@ -199,7 +199,7 @@ void test('explicit listener disablement exposes STOPPED pipeline state to the A
   }));
   assert.notEqual(pipeline, null);
   assert.deepEqual((pipeline as unknown as () => ApiProjectionPipelineState)(), {
-    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', paperDecision: 'STOPPED', social: 'STOPPED',
+    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', qualification: 'STOPPED', paperDecision: 'STOPPED', social: 'STOPPED',
   });
   assert.ok(calls.includes('log:listener.disabled'));
   assert.doesNotMatch(calls.join(','), /listener\.create|listener\.start|listener\.close/u);
