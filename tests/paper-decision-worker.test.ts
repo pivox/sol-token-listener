@@ -248,7 +248,50 @@ void test('recovers a staged BUY_PENDING session after its paper position opened
   assert.equal(repository.completions[0]?.result.session?.state, 'WAITING_EXTERNAL_BUYS');
 });
 
-void test('resumes a staged BUY_PENDING session with its historical qualification',async()=>{
+void test('blocks a staged BUY_PENDING open when its qualification was superseded',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const historical=canonicalQualification();
+  const superseded=Object.freeze({
+    ...canonicalQualification(),reportId:`qreport_${'f'.repeat(64)}`,
+  });
+  const session=createPaperStrategySession({
+    candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:superseded,currentCandidate:candidate,currentSession:session,
+    activePosition:null,
+    currentDecision:Object.freeze({
+      qualification:historical,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const quotes=new FakeQuotes();
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(services.qualification.calls,[historical,superseded]);
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(quotes.calls,0);
+  assert.deepEqual(operations,[]);
+  assert.equal(repository.failures[0]?.failure.code,'DECISION_INVALID');
+  assert.equal(repository.failures[0]?.failure.retryable,false);
+  assert.equal(repository.failures[0]?.failure.terminalResult?.session?.state,'MANUAL_REVIEW');
+  assert.equal(
+    repository.failures[0]?.failure.terminalResult?.session?.reasonCode,
+    'RECONCILIATION_REQUIRED',
+  );
+});
+
+void test('blocks a staged BUY_PENDING open when current qualification is missing',async()=>{
   const operations:string[]=[];
   const repository=new FakeRepository([claim()],operations);
   const candidate=tradingCandidate('ELIGIBLE');
@@ -261,11 +304,40 @@ void test('resumes a staged BUY_PENDING session with its historical qualificatio
     purgeAfterMs:14_401_000,
   });
   repository.snapshotValue=snapshot({
-    currentQualification:Object.freeze({
-      ...canonicalQualification(),reportId:`qreport_${'f'.repeat(64)}`,
-    }),currentCandidate:candidate,currentSession:session,activePosition:null,
-    currentDecision:Object.freeze({
+    currentQualification:null,currentCandidate:candidate,currentSession:session,
+    activePosition:null,currentDecision:Object.freeze({
       qualification:historical,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(services.qualification.calls,[historical]);
+  assert.deepEqual(operations,[]);
+  assert.equal(repository.failures[0]?.failure.code,'DECISION_INVALID');
+  assert.equal(repository.failures[0]?.failure.terminalResult?.session?.state,'MANUAL_REVIEW');
+});
+
+void test('resumes a staged BUY_PENDING open when its qualification is still current',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const current=canonicalQualification();
+  const session=createPaperStrategySession({
+    candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:current,currentCandidate:candidate,currentSession:session,
+    activePosition:null,currentDecision:Object.freeze({
+      qualification:current,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
     }),
   });
   const services=fakeServices('ELIGIBLE',operations);
@@ -276,7 +348,7 @@ void test('resumes a staged BUY_PENDING session with its historical qualificatio
   );
 
   assert.equal((await worker.runOnce()).kind,'completed');
-  assert.equal(services.qualification.calls[0],historical);
+  assert.deepEqual(services.qualification.calls,[current,current]);
   assert.equal(services.candidates.calls.length,0);
   assert.equal(quotes.calls,0);
   assert.deepEqual(operations,['stage','open','complete']);

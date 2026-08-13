@@ -294,6 +294,22 @@ export class PaperDecisionWorker {
       &&snapshot.activePosition===null
       &&snapshot.asOfEvent.confirmationStatus!=='orphaned'
     ){
+      let qualificationIsCurrent=false;
+      if(snapshot.currentQualification!==null){
+        try{
+          this.qualification.reauthorize(snapshot.currentQualification);
+          qualificationIsCurrent=canonicalStringifyJson(snapshot.currentQualification)
+            ===canonicalStringifyJson(decisionSnapshot.qualification);
+        }catch{
+          qualificationIsCurrent=false;
+        }
+      }
+      if(!qualificationIsCurrent){
+        const terminal=manualReviewDecision(
+          context,candidateResult,session,decisionSnapshot.candidateEvent,this.readNow(),
+        );
+        return this.fail(job,lease,'DECISION_INVALID',false,terminal);
+      }
       const staged=decision(
         context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'OPEN',
       );
@@ -314,15 +330,8 @@ export class PaperDecisionWorker {
       ));
     }
     if (snapshot.activePosition === null || session.candidateId !== candidate.id) {
-      const now=this.readNow();
-      const manual=Object.freeze({
-        ...session,state:'MANUAL_REVIEW' as const,reasonCode:'RECONCILIATION_REQUIRED' as const,
-        lastError:Object.freeze({
-          code:'POSITION_NOT_FOUND',message:'Active paper position or candidate is unavailable.',retryable:false,
-        }),updatedAtMs:now,purgeAfterMs:now+14_400_000,
-      });
-      const terminal=decision(
-        context,candidateResult,manual,sessionEvent(manual,decisionSnapshot.candidateEvent),[],'NONE',
+      const terminal=manualReviewDecision(
+        context,candidateResult,session,decisionSnapshot.candidateEvent,this.readNow(),
       );
       return this.fail(job,lease,'DECISION_INVALID',false,terminal);
     }
@@ -512,6 +521,24 @@ function authorizedQualification(
     report:authorized.report,
     event:persisted.qualificationEvent,
   });
+}
+
+function manualReviewDecision(
+  qualification:RebuiltQualification,
+  candidate:TradingCandidateResult,
+  session:PaperStrategySessionV1,
+  candidateEvent:DomainEvent,
+  nowMs:number,
+):PaperDecisionResult{
+  const manual=Object.freeze({
+    ...session,state:'MANUAL_REVIEW' as const,reasonCode:'RECONCILIATION_REQUIRED' as const,
+    lastError:Object.freeze({
+      code:'POSITION_NOT_FOUND',message:'Active paper position or candidate is unavailable.',retryable:false,
+    }),updatedAtMs:nowMs,purgeAfterMs:nowMs+14_400_000,
+  });
+  return decision(
+    qualification,candidate,manual,sessionEvent(manual,candidateEvent),[],'NONE',
+  );
 }
 
 function sessionEvent(session:PaperStrategySessionV1,trigger:DomainEvent):DomainEvent {
