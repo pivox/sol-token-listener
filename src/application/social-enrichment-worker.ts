@@ -226,8 +226,7 @@ export class SocialEnrichmentWorker {
     try {
       await this.repository.persist(job,result);
     } catch {
-      this.currentState = 'DEGRADED';
-      throw new SocialEnrichmentWorkerError('complete');
+      return this.releasePersistFailure(job,lease,'complete');
     }
     return this.refreshPersisted(job,lease);
   }
@@ -242,8 +241,7 @@ export class SocialEnrichmentWorker {
     if (terminalResult !== undefined && job.attemptsInCycle >= job.maxAttempts) {
       try { await this.repository.persist(job,terminalResult,failure); }
       catch {
-        this.currentState='DEGRADED';
-        throw new SocialEnrichmentWorkerError('fail');
+        return this.releasePersistFailure(job,lease,'fail');
       }
       return this.refreshPersisted(job,lease);
     }
@@ -270,9 +268,10 @@ export class SocialEnrichmentWorker {
       if(this.activeLease===lease)this.activeLease=null;
       if(!owned)return frozen({ kind:'lease-lost' as const,jobId:job.id });
       try {
-        await this.repository.release(job,Object.freeze({
+        const released=await this.repository.release(job,Object.freeze({
           code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:this.readNow(),
         }));
+        if(!released)return frozen({ kind:'lease-lost' as const,jobId:job.id });
       } catch {
         this.currentState='DEGRADED';
         throw new SocialEnrichmentWorkerError('fail');
@@ -288,6 +287,26 @@ export class SocialEnrichmentWorker {
       throw new SocialEnrichmentWorkerError('complete');
     }
     return frozen({ kind:'completed' as const,jobId:job.id });
+  }
+
+  private async releasePersistFailure(
+    job:ClaimedSocialJob,
+    lease:SocialLeaseGuard,
+    stage:SocialEnrichmentWorkerError['stage'],
+  ):Promise<SocialEnrichmentRunResult>{
+    const owned=await lease.finish();
+    if(this.activeLease===lease)this.activeLease=null;
+    if(!owned)return frozen({ kind:'lease-lost' as const,jobId:job.id });
+    try{
+      const released=await this.repository.release(job,Object.freeze({
+        code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:this.readNow(),
+      }));
+      if(!released)return frozen({ kind:'lease-lost' as const,jobId:job.id });
+    }catch{
+      this.currentState='DEGRADED';
+      throw new SocialEnrichmentWorkerError(stage);
+    }
+    return frozen({ kind:'failed' as const,jobId:job.id });
   }
 
   private scheduleNext(delayMs: number): void {

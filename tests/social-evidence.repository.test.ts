@@ -221,6 +221,53 @@ void test('reclaims persisted evidence in a separate bounded projection retry cy
   });
 });
 
+void test('releases an ambiguous committed persist and reclaims its durable evidence',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    await enqueue(pool,MINT,'signature-social-ambiguous-commit');
+    const repository=new PostgresSocialEvidenceRepository(pool);
+    const providerJob=await repository.claim({ leaseMs:5_000,nowMs:NOW });
+    assert.ok(providerJob);
+    await repository.persist(providerJob,await successfulResult(providerJob.sourceLaunchEventId));
+
+    assert.equal(await repository.release(providerJob,Object.freeze({
+      code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+10,
+    })),true);
+    assert.equal(await repository.claim({ leaseMs:5_000,nowMs:NOW+509 }),null);
+    const projectionJob=await repository.claim({ leaseMs:5_000,nowMs:NOW+510 });
+    assert.ok(projectionJob);
+    assert.equal(projectionJob.evidencePersisted,true);
+    assert.equal(projectionJob.attemptsInCycle,1);
+
+    assert.equal(await repository.release(providerJob,Object.freeze({
+      code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+511,
+    })),false);
+    const stored=await pool.query(`SELECT status,lease_token,
+      (SELECT COUNT(*)::int FROM social_evidence_collections) collections,
+      (SELECT COUNT(*)::int FROM domain_events WHERE type='SocialEvidenceCollected') events
+      FROM social_enrichment_jobs`);
+    assert.deepEqual(stored.rows,[{
+      status:'PROCESSING',lease_token:projectionJob.leaseToken,collections:1,events:1,
+    }]);
+  });
+});
+
+void test('releases a rolled-back persist outcome for a provider retry without evidence',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    await enqueue(pool,MINT,'signature-social-ambiguous-rollback');
+    const repository=new PostgresSocialEvidenceRepository(pool);
+    const first=await repository.claim({ leaseMs:5_000,nowMs:NOW });
+    assert.ok(first);
+
+    assert.equal(await repository.release(first,Object.freeze({
+      code:'PROVIDER_UNAVAILABLE',retryable:true,observedAtMs:NOW+10,
+    })),true);
+    const retry=await repository.claim({ leaseMs:5_000,nowMs:NOW+510 });
+    assert.ok(retry);
+    assert.equal(retry.evidencePersisted,false);
+    assert.equal(retry.attemptsInCycle,2);
+  });
+});
+
 void test('rebuilds qualification from persisted social evidence before enqueuing exact paper work',async(context)=>{
   await withDatabase(context,async(pool)=>{
     await enqueue(pool,MINT,'signature-social-live-refresh');

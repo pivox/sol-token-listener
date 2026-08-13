@@ -48,7 +48,7 @@ export interface SocialEvidenceRepository {
     terminalFailure?: SocialJobFailure,
   ): Promise<void>;
   complete(job: ClaimedSocialJob): Promise<void>;
-  release(job: ClaimedSocialJob, failure: SocialJobFailure): Promise<void>;
+  release(job: ClaimedSocialJob, failure: SocialJobFailure): Promise<boolean>;
   fail(
     job: ClaimedSocialJob,
     failure: SocialJobFailure,

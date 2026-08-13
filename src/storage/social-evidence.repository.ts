@@ -234,20 +234,24 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
     }finally{release(client,'complete');}
   }
 
-  public async release(job:ClaimedSocialJob,failure:SocialJobFailure):Promise<void>{
+  public async release(job:ClaimedSocialJob,failure:SocialJobFailure):Promise<boolean>{
     assertClaimedJob(job);assertFailure(failure);
     const client=await this.connect('release');
     try{
       await client.query('BEGIN');
-      const selected=await client.query(`SELECT attempts_in_cycle,max_attempts,base_delay_ms
+      const selected=await client.query(`SELECT attempts_in_cycle,max_attempts,base_delay_ms,
+        EXISTS(SELECT 1 FROM social_evidence_collections collection
+          WHERE collection.mint=job.mint
+            AND collection.source_launch_event_id=job.source_launch_event_id) evidence_persisted
         FROM social_enrichment_jobs job
         WHERE job.job_id=$1 AND job.status='PROCESSING' AND job.lease_token=$2
-          AND EXISTS(SELECT 1 FROM social_evidence_collections collection
-            WHERE collection.mint=job.mint
-              AND collection.source_launch_event_id=job.source_launch_event_id)
         FOR UPDATE`,[job.id,job.leaseToken]);
       const row=selected.rows[0];
-      if(row===undefined)throw new SocialJobLeaseLostError();
+      if(row===undefined){
+        await client.query('COMMIT');
+        return false;
+      }
+      booleanField(row,'evidence_persisted');
       const attempts=integerField(row,'attempts_in_cycle');
       const maximum=integerField(row,'max_attempts');
       const now=new Date(failure.observedAtMs);
@@ -270,6 +274,7 @@ export class PostgresSocialEvidenceRepository implements SocialEvidenceRepositor
         ]);
       }
       await client.query('COMMIT');
+      return true;
     }catch(error:unknown){
       await rollback(client);
       if(error instanceof SocialJobLeaseLostError)throw error;
