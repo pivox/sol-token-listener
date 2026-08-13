@@ -78,11 +78,42 @@ void test('attache la lignée décisionnelle complète à la position paper', as
     strategySessionId:`paper_session_${'a'.repeat(64)}`,
     qualificationReportId:`qreport_${'b'.repeat(64)}`,
     candidateId:`candidate_${'c'.repeat(64)}`,
+    expectedCurrentQualification:Object.freeze({
+      mint:'MINT',reportId:`qreport_${'b'.repeat(64)}`,
+      qualificationEventId:'trigger:QualificationUpdated',
+    }),
   });
 
   assert.equal(position.strategySessionId, `paper_session_${'a'.repeat(64)}`);
   assert.equal(position.qualificationReportId, `qreport_${'b'.repeat(64)}`);
   assert.equal(position.candidateId, `candidate_${'c'.repeat(64)}`);
+});
+
+void test('guards the current qualification before every strategy-linked position read',async()=>{
+  const operations:string[]=[];
+  const repository:PaperTradingRepository={
+    async transact<T>(operation:(transaction:PaperTradingTransaction)=>Promise<T>):Promise<T>{
+      const transaction={
+        requireCurrentQualification:async()=>{operations.push('qualification');},
+        findPosition:async()=>{operations.push('position');return null;},
+        findActivePosition:async()=>{operations.push('active');return null;},
+        insertOpened:async()=>{operations.push('insert');},
+        updateClosed:async()=>undefined,reconcileEventConfirmation:async()=>undefined,
+        retractPosition:async()=>undefined,
+      } as unknown as PaperTradingTransaction;
+      return operation(transaction);
+    },
+  };
+  const command=Object.freeze({
+    ...openCommand(),strategySessionId:'paper-session',candidateId:'candidate',
+    qualificationReportId:'qreport',expectedCurrentQualification:Object.freeze({
+      mint:'MINT',reportId:'qreport',qualificationEventId:'trigger:QualificationUpdated',
+    }),
+  });
+
+  await makeEngine(repository,'paper').open(command);
+
+  assert.deepEqual(operations,['qualification','position','active','position','insert']);
 });
 
 void test('rejoue la même commande après montée de finalité sans conflit', async () => {
@@ -1062,6 +1093,7 @@ class MemoryPaperRepository implements PaperTradingRepository {
     operation: (transaction: PaperTradingTransaction) => Promise<T>,
   ): Promise<T> {
     return operation({
+      requireCurrentQualification:async()=>undefined,
       findPosition: async (id) => this.positions.get(id) ?? null,
       findActivePosition: async (mint, strategy) => (
         [...this.positions.values()].find((position) => (
@@ -1113,6 +1145,7 @@ class ConcurrentReplayRepository implements PaperTradingRepository {
     operation: (transaction: PaperTradingTransaction) => Promise<T>,
   ): Promise<T> {
     return operation({
+      requireCurrentQualification:async()=>undefined,
       findPosition: async () => null,
       findActivePosition: async () => this.active,
       insertOpened: async () => {
@@ -1139,6 +1172,7 @@ class TerminalReplayRepository implements PaperTradingRepository {
     operation: (transaction: PaperTradingTransaction) => Promise<T>,
   ): Promise<T> {
     return operation({
+      requireCurrentQualification:async()=>undefined,
       findPosition: async () => {
         this.positionReadCount += 1;
         return this.positionReadCount === 1 ? null : this.terminal;

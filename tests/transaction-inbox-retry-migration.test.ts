@@ -41,7 +41,7 @@ void test('adds durable bounded retry cycles, exhaustion, recovery audit and hea
   assert.doesNotMatch(sql, /DROP TABLE/iu);
 });
 
-void test('applies migrations through 013, replays and backfills legacy retries', async (context) => {
+void test('applies migrations through 014, replays and backfills legacy retries', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: PostgreSQL retry migration test skipped');
@@ -53,7 +53,7 @@ void test('applies migrations through 013, replays and backfills legacy retries'
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '013_paper_e2e.sql');
+    assert.equal(applied.at(-1), '015_paper_active_session_per_mint.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,

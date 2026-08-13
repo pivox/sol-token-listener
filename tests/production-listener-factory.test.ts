@@ -29,6 +29,7 @@ void test('composes the passive production listener without opening resources', 
     httpAvailable: true,
     pumpfun: 'STOPPED',
     pumpswap: 'STOPPED',
+    qualification: 'STOPPED',
     paperDecision: 'STOPPED',
     social: 'STOPPED',
   });
@@ -67,9 +68,28 @@ void test('production factory has no transaction execution or Raydium builder pa
   assert.doesNotMatch(source, /(?:sendRawTransaction|sendTransaction|transaction-builder|execution\/wallet|\.\.\/execution\/|raydium)/iu);
 });
 
+void test('production composes one canonical qualification writer before paper decisions', async () => {
+  const source = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+
+  assert.equal(count(source, /new QualificationEngine\(/gu), 1);
+  assert.equal(count(source, /loadQualificationProfile\(/gu), 1);
+  assert.equal(count(source, /new QualificationRebuildService\(/gu), 1);
+  assert.equal(count(source, /new PostgresQualificationProjectionRepository\(/gu), 1);
+  assert.equal(count(source, /new QualificationProjectionService\(/gu), 1);
+  assert.match(source, /new PostgresQualificationProjectionRepository\(pool,\s*qualificationRebuilder\)/u);
+  assert.match(source, /new QualificationProjectionService\([\s\S]*?qualificationRebuilder,[\s\S]*?config\.paperQuoteMintAllowlist[\s\S]*?\)/u);
+  assert.match(source,/new SocialQualificationRefreshService\(qualification,paperRepository\)/u);
+  assert.match(source, /new PaperDecisionWorker\([\s\S]*?quoteRouter,\s*qualificationRebuilder,/u);
+  assert.match(source, /new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*\)/u);
+});
+
 void test('public social runtime components have no signer or submission path', async () => {
   for (const path of [
     '../src/application/social-enrichment-worker.ts',
+    '../src/application/social-qualification-refresh.service.ts',
     '../src/storage/social-evidence.repository.ts',
     '../src/social/public-social-verification.provider.ts',
   ]) {
@@ -314,6 +334,10 @@ function config(overrides: Record<string, string> = {}): ReturnType<typeof parse
     SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
     ...overrides,
   });
+}
+
+function count(source: string, pattern: RegExp): number {
+  return [...source.matchAll(pattern)].length;
 }
 
 class ManualScheduler implements ListenerRuntimeScheduler {

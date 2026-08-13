@@ -1,10 +1,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
 import type { DomainEvent } from '../src/domain/events.js';
 import { createPaperStrategySession } from '../src/domain/paper-strategy.js';
-import type { PaperExecutionQuote, PaperPosition } from '../src/domain/paper-trading.js';
+import {
+  PaperTradingError,
+  type PaperExecutionQuote,
+  type PaperPosition,
+} from '../src/domain/paper-trading.js';
 import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
+import type { ChainCursor } from '../src/domain/types.js';
+import type { CanonicalQualificationProjection } from '../src/ports/qualification-projection-repository.js';
+import {
+  createDefaultQualificationRuleSet,
+  QualificationEngine,
+} from '../src/qualification/qualification-engine.js';
+import { fromJsonValue,toJsonValue } from '../src/utils/json.js';
 import type {
   ClaimedPaperDecisionJob,
   PaperDecisionFailure,
@@ -23,7 +35,8 @@ import {
 void test('persists explainable observe decisions without requesting quotes or paper actions', async () => {
   const repository = new FakeRepository([claim()]);
   const quotes = new FakeQuotes();
-  const services = fakeServices('NOT_ELIGIBLE');
+  const paperActions: string[] = [];
+  const services = fakeServices('NOT_ELIGIBLE', paperActions);
   const worker = new PaperDecisionWorker(
     repository,quotes,services.qualification,services.candidates,services.strategy,
     options({ executionMode:'observe',paperStrategyEnabled:false }),new ManualScheduler(),
@@ -31,10 +44,173 @@ void test('persists explainable observe decisions without requesting quotes or p
 
   assert.deepEqual(await worker.runOnce(), { kind:'completed',jobId:'paper-job' });
   assert.equal(quotes.calls, 0);
+  assert.equal(services.candidates.calls.length, 1);
+  assert.deepEqual(paperActions, []);
   assert.equal(repository.stages.length, 0);
   assert.equal(repository.completions.length, 1);
   assert.equal(repository.completions[0]?.result.session, null);
 });
+
+void test('retries before quotes when no canonical qualification is persisted', async () => {
+  const repository = new FakeRepository([claim()]);
+  repository.snapshotValue = snapshot({ currentQualification:null });
+  const quotes = new FakeQuotes();
+  const services = fakeServices('NOT_ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind:'failed',jobId:'paper-job' });
+  assert.equal(repository.failures[0]?.failure.code, 'RPC_TRANSIENT');
+  assert.equal(repository.failures[0]?.failure.retryable, true);
+  assert.equal(quotes.calls, 0);
+  assert.equal(services.candidates.calls.length, 0);
+  assert.equal(repository.stages.length, 0);
+  assert.equal(repository.completions.length, 0);
+});
+
+void test('completes an orphan-only launch without paper lineage as a no-op', async () => {
+  const repository = new FakeRepository([claim()]);
+  repository.snapshotValue = snapshot({
+    canonicalLaunchActive:false,
+    currentQualification:null,
+    currentCandidate:null,
+    currentDecision:null,
+    currentSession:null,
+    activePosition:null,
+  });
+  const quotes = new FakeQuotes();
+  const services = fakeServices('NOT_ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind:'completed',jobId:'paper-job' });
+  assert.equal(repository.noopCompletions,1);
+  assert.equal(repository.failures.length,0);
+  assert.equal(repository.completions.length,0);
+  assert.equal(quotes.calls,0);
+  assert.equal(services.candidates.calls.length,0);
+});
+
+void test('completes a superseded orphan job without reconciling unrelated paper lineage', async () => {
+  const repository = new FakeRepository([claim()]);
+  repository.snapshotValue = snapshot({
+    canonicalLaunchActive:false,
+    currentQualification:null,
+    currentCandidate:null,
+    currentDecision:null,
+    currentSession:null,
+    activePosition:null,
+    hasPaperLineage:true,
+  } as Partial<PaperDecisionSnapshot> & { readonly hasPaperLineage:boolean });
+  const quotes = new FakeQuotes();
+  const services = fakeServices('NOT_ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind:'completed',jobId:'paper-job' });
+  assert.equal(repository.obsoleteCompletions,1);
+  assert.equal(repository.noopCompletions,0);
+  assert.equal(repository.failures.length,0);
+  assert.equal(repository.completions.length,0);
+  assert.equal(quotes.calls,0);
+  assert.equal(services.candidates.calls.length,0);
+});
+
+void test('reauthorizes the persisted canonical qualification and preserves its candidate identity', async () => {
+  const repository = new FakeRepository([claim()]);
+  const persisted = canonicalQualification();
+  repository.snapshotValue = snapshot({ currentQualification:persisted });
+  const services = fakeServices('NOT_ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options({ executionMode:'observe',paperStrategyEnabled:false }),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind, 'completed');
+  assert.deepEqual(services.qualification.calls, [persisted]);
+  const input = services.candidates.calls[0];
+  assert.ok(input);
+  assert.equal(input.report, services.qualification.authorizedReport);
+  assert.equal(input.reportId, persisted.reportId);
+  assert.equal(input.qualificationEvent, persisted.qualificationEvent);
+  assert.equal(input.evidenceFingerprint, persisted.evidenceFingerprint);
+});
+
+void test('reauthorizes a JSON-deserialized qualification before creating a candidate', async () => {
+  const repository=new FakeRepository([claim()]);
+  const qualification=new QualificationRebuildService(
+    new QualificationEngine(createDefaultQualificationRuleSet(60)),
+  );
+  const persisted=fromJsonValue(toJsonValue(
+    realCanonicalQualification(qualification),
+  )) as CanonicalQualificationProjection;
+  repository.snapshotValue=snapshot({ currentQualification:persisted });
+  const services=fakeServices('NOT_ELIGIBLE');
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),qualification,services.candidates,services.strategy,
+    options({ executionMode:'observe',paperStrategyEnabled:false }),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.equal(services.candidates.calls.length,1);
+});
+
+void test('rejects invalid qualification before paper quotes and candidate creation',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const persisted=canonicalQualification();
+  repository.snapshotValue=snapshot({ currentQualification:persisted });
+  const services=fakeServices('ELIGIBLE');
+  services.qualification.rejected=persisted;
+  services.qualification.beforeReauthorize=()=>{operations.push('authorize');};
+  services.candidates.beforeCreate=()=>{operations.push('candidate');};
+  const quotes=new FakeQuotes(operations);
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(operations,['authorize','fail']);
+  assert.equal(quotes.calls,0);
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(repository.stages.length,0);
+  assert.equal(repository.completions.length,0);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'DECISION_INVALID',retryable:false,terminalResult:null,
+  });
+});
+
+for(const mutation of canonicalTamperingCases()){
+  void test(`rejects tampered persisted qualification ${mutation.name} before paper writes`,async()=>{
+    const repository=new FakeRepository([claim()]);
+    const qualification=new QualificationRebuildService(
+      new QualificationEngine(createDefaultQualificationRuleSet(60)),
+    );
+    const persisted=fromJsonValue(toJsonValue(
+      realCanonicalQualification(qualification),
+    )) as CanonicalQualificationProjection;
+    repository.snapshotValue=snapshot({ currentQualification:mutation.mutate(persisted) });
+    const services=fakeServices('NOT_ELIGIBLE');
+    const worker=new PaperDecisionWorker(
+      repository,new FakeQuotes(),qualification,services.candidates,services.strategy,
+      options({ executionMode:'observe',paperStrategyEnabled:false }),new ManualScheduler(),
+    );
+
+    assert.equal((await worker.runOnce()).kind,'failed');
+    assert.equal(repository.failures[0]?.failure.code,'DECISION_INVALID');
+    assert.equal(repository.failures[0]?.failure.retryable,false);
+    assert.equal(services.candidates.calls.length,0);
+    assert.equal(repository.stages.length,0);
+    assert.equal(repository.completions.length,0);
+  });
+}
 
 void test('quotes both directions, stages BUY_PENDING before the ledger and completes the opened session', async () => {
   const operations: string[] = [];
@@ -68,6 +244,41 @@ void test('turns a typed transient quote error into a bounded repository retry',
   assert.ok(repository.failures[0]?.failure.terminalResult);
 });
 
+void test('retries only a typed stale qualification rejected at paper open',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const services=fakeServices('ELIGIBLE',operations);
+  services.strategy.openError=new PaperTradingError(
+    'QUALIFICATION_NOT_CURRENT','stale qualification',
+  );
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(operations,['stage','open','fail']);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'RPC_TRANSIENT',retryable:true,terminalResult:null,
+  });
+});
+
+void test('keeps non-stale paper open failures terminal',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const services=fakeServices('ELIGIBLE',operations);
+  services.strategy.openError=new PaperTradingError('POSITION_CONFLICT','conflict');
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.equal(repository.failures[0]?.failure.code,'DECISION_INVALID');
+  assert.equal(repository.failures[0]?.failure.retryable,false);
+  assert.equal(repository.failures[0]?.failure.terminalResult,repository.stages[0]);
+});
+
 void test('reuses the persisted decision for an active session without entry quote RPCs', async () => {
   const repository = new FakeRepository([claim()]);
   const candidate = tradingCandidate('ELIGIBLE');
@@ -81,8 +292,7 @@ void test('reuses the persisted decision for an active session without entry quo
   repository.snapshotValue=snapshot({
     currentCandidate:candidate,currentSession:session,activePosition:POSITION,
     currentDecision:Object.freeze({
-      reportId:candidate.qualificationReportId,evidenceFingerprint:candidate.evidenceFingerprint,
-      report:report(),qualificationEvent:event('QualificationUpdated','evt_qualification'),
+      qualification:canonicalQualification(),
       candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
     }),
   });
@@ -96,6 +306,40 @@ void test('reuses the persisted decision for an active session without entry quo
   assert.equal((await worker.runOnce()).kind, 'completed');
   assert.equal(quotes.calls, 0);
   assert.equal(repository.stages.length, 1);
+});
+
+void test('reconciles the exact historical qualification without opening a new position', async () => {
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const historical=canonicalQualification();
+  const active=Object.freeze({
+    ...canonicalQualification(),reportId:`qreport_${'f'.repeat(64)}`,
+  });
+  const session=createPaperStrategySession({
+    candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'QUALIFIED_ENTRY',positionId:'position',
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:active,currentCandidate:candidate,currentSession:session,
+    activePosition:POSITION,currentDecision:Object.freeze({
+      qualification:historical,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const quotes=new FakeQuotes();
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.equal(services.qualification.calls[0],historical);
+  assert.equal(services.candidates.calls.length,0);
+  assert.deepEqual(operations,['stage','complete']);
 });
 
 void test('recovers a staged BUY_PENDING session after its paper position opened', async () => {
@@ -126,6 +370,155 @@ void test('recovers a staged BUY_PENDING session after its paper position opened
   assert.equal(repository.completions[0]?.result.session?.state, 'WAITING_EXTERNAL_BUYS');
 });
 
+void test('defers a staged BUY_PENDING open when its qualification was superseded',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const historical=canonicalQualification();
+  const superseded=Object.freeze({
+    ...canonicalQualification(),reportId:`qreport_${'f'.repeat(64)}`,
+  });
+  const session=createPaperStrategySession({
+    candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:superseded,currentCandidate:candidate,currentSession:session,
+    activePosition:null,
+    currentDecision:Object.freeze({
+      qualification:historical,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const quotes=new FakeQuotes();
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(services.qualification.calls,[historical,superseded]);
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(quotes.calls,0);
+  assert.deepEqual(operations,['fail']);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'RPC_TRANSIENT',retryable:true,terminalResult:null,
+  });
+  assert.equal(repository.stages.length,0);
+  assert.equal(repository.completions.length,0);
+});
+
+void test('defers a staged BUY_PENDING open when current qualification is missing',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const historical=canonicalQualification();
+  const session=createPaperStrategySession({
+    candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:null,currentCandidate:candidate,currentSession:session,
+    activePosition:null,currentDecision:Object.freeze({
+      qualification:historical,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const quotes=new FakeQuotes();
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(services.qualification.calls,[historical]);
+  assert.deepEqual(operations,['fail']);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'RPC_TRANSIENT',retryable:true,terminalResult:null,
+  });
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(quotes.calls,0);
+  assert.equal(repository.stages.length,0);
+  assert.equal(repository.completions.length,0);
+});
+
+void test('defers a staged BUY_PENDING open when current qualification is invalid',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const historical=canonicalQualification();
+  const invalid=canonicalQualification();
+  const session=createPaperStrategySession({
+    candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:invalid,currentCandidate:candidate,currentSession:session,
+    activePosition:null,currentDecision:Object.freeze({
+      qualification:historical,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  services.qualification.rejected=invalid;
+  const quotes=new FakeQuotes();
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'failed');
+  assert.deepEqual(services.qualification.calls,[historical,invalid]);
+  assert.deepEqual(operations,['fail']);
+  assert.deepEqual(repository.failures[0]?.failure,{
+    code:'RPC_TRANSIENT',retryable:true,terminalResult:null,
+  });
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(quotes.calls,0);
+  assert.equal(repository.stages.length,0);
+  assert.equal(repository.completions.length,0);
+});
+
+void test('resumes a staged BUY_PENDING open when its qualification is still current',async()=>{
+  const operations:string[]=[];
+  const repository=new FakeRepository([claim()],operations);
+  const candidate=tradingCandidate('ELIGIBLE');
+  const current=canonicalQualification();
+  const session=createPaperStrategySession({
+    candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentQualification:current,currentCandidate:candidate,currentSession:session,
+    activePosition:null,currentDecision:Object.freeze({
+      qualification:current,candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const quotes=new FakeQuotes();
+  const worker=new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.deepEqual(services.qualification.calls,[current,current]);
+  assert.equal(services.candidates.calls.length,0);
+  assert.equal(quotes.calls,0);
+  assert.deepEqual(operations,['stage','open','complete']);
+});
+
 void test('retracts a paper session when its source revision becomes orphaned', async () => {
   const operations: string[] = [];
   const repository = new FakeRepository([claim()], operations);
@@ -151,6 +544,37 @@ void test('retracts a paper session when its source revision becomes orphaned', 
   assert.equal((await worker.runOnce()).kind, 'completed');
   assert.ok(operations.includes('reconcile-source'));
   assert.equal(repository.completions[0]?.result.session?.state, 'PAPER_RETRACTED');
+});
+
+void test('retracts a later paper session when its launch becomes orphaned', async () => {
+  const operations: string[] = [];
+  const repository = new FakeRepository([claim()],operations);
+  const candidate = tradingCandidate('ELIGIBLE',Object.freeze({
+    slot:11n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+  }));
+  const session = createPaperStrategySession({
+    candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'QUALIFIED_ENTRY',positionId:POSITION.id,
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:2_000,updatedAtMs:2_000,
+    purgeAfterMs:14_402_000,
+  });
+  repository.snapshotValue=snapshot({
+    asOfEvent:event('TokenLaunchDetected','evt_source','orphaned'),
+    canonicalLaunchActive:false,currentQualification:null,currentCandidate:candidate,
+    currentSession:session,activePosition:POSITION,
+    currentDecision:persistedDecision(candidate,'orphaned'),
+  });
+  const services=fakeServices('ELIGIBLE',operations);
+  const worker=new PaperDecisionWorker(
+    repository,new FakeQuotes(),services.qualification,services.candidates,services.strategy,
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.ok(operations.includes('reconcile-source'));
+  assert.equal(operations.includes('reconcile-evidence'),false);
+  assert.equal(repository.completions[0]?.result.session?.state,'PAPER_RETRACTED');
 });
 
 void test('recounts session evidence when a later trade becomes orphaned', async () => {
@@ -264,6 +688,8 @@ class FakeRepository implements PaperDecisionRepository {
   public readonly completions: { readonly result:PaperDecisionResult }[] = [];
   public readonly failures: { readonly failure:PaperDecisionFailure }[] = [];
   public renewResult = true;
+  public noopCompletions = 0;
+  public obsoleteCompletions = 0;
   public snapshotValue: PaperDecisionSnapshot = snapshot();
   public constructor(
     private readonly claims: (ClaimedPaperDecisionJob|null)[],
@@ -279,8 +705,14 @@ class FakeRepository implements PaperDecisionRepository {
   public async complete(_job:ClaimedPaperDecisionJob,result:PaperDecisionResult): Promise<void> {
     this.operations.push('complete'); this.completions.push({ result });
   }
+  public async completeNoop(): Promise<void> {
+    this.operations.push('complete-noop'); this.noopCompletions += 1;
+  }
+  public async completeObsolete(): Promise<void> {
+    this.operations.push('complete-obsolete'); this.obsoleteCompletions += 1;
+  }
   public async fail(_job:ClaimedPaperDecisionJob,failure:PaperDecisionFailure): Promise<void> {
-    this.failures.push({ failure });
+    this.operations.push('fail'); this.failures.push({ failure });
   }
   public async counts(): Promise<PaperDecisionQueueCounts> {
     return Object.freeze({ pending:0,processing:0,retryableFailed:0,exhausted:0 });
@@ -290,7 +722,9 @@ class FakeRepository implements PaperDecisionRepository {
 class FakeQuotes {
   public calls = 0;
   public error: PaperQuoteError|null = null;
+  public constructor(private readonly operations:string[]=[]){ }
   public async quote(request: { readonly side:'BUY'|'SELL'; readonly amountInRaw:bigint }): Promise<PaperExecutionQuote> {
+    this.operations.push('quote');
     this.calls += 1;
     if (this.error !== null) throw this.error;
     return request.side === 'BUY'
@@ -312,10 +746,16 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
     candidate,event:event('TradingCandidateUpdated','evt_candidate'),
   });
   const candidates = {
+    calls:[] as Parameters<ConstructorParameters<typeof PaperDecisionWorker>[3]['create']>[0][],
     gate:Promise.resolve(),
-    async create() { await this.gate; return candidateResult; },
+    beforeCreate:()=>undefined,
+    async create(input: Parameters<ConstructorParameters<typeof PaperDecisionWorker>[3]['create']>[0]) {
+      this.beforeCreate();
+      this.calls.push(input); await this.gate; return candidateResult;
+    },
   };
   const strategy = {
+    openError:null as Error|null,
     prepare() {
       return state === 'ELIGIBLE' ? createPaperStrategySession({
         candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
@@ -327,6 +767,7 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
     },
     async open(input: { readonly session: ReturnType<typeof createPaperStrategySession> }) {
       operations.push('open');
+      if(this.openError!==null)throw this.openError;
       return Object.freeze({
         session:Object.freeze({ ...input.session,state:'WAITING_EXTERNAL_BUYS' as const,positionId:'position' }),
         sessionEvent:event('PaperStrategySessionUpdated','evt_session_open'),
@@ -372,7 +813,22 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
       });
     },
   };
-  return { qualification:{ rebuild:() => rebuilt },candidates,strategy };
+  const qualification = {
+    calls:[] as CanonicalQualificationProjection[],
+    rejected:null as CanonicalQualificationProjection|null,
+    beforeReauthorize:()=>undefined,
+    authorizedReport:rebuilt.report,
+    reauthorize(projection:CanonicalQualificationProjection) {
+      this.beforeReauthorize();
+      this.calls.push(projection);
+      if(projection===this.rejected)throw new TypeError('invalid qualification');
+      return Object.freeze({
+        ...rebuilt,reportId:'qreport_authorized',reportEventId:'evt_authorized',
+        evidenceFingerprint:'e'.repeat(64),event:event('QualificationUpdated','evt_authorized'),
+      });
+    },
+  };
+  return { qualification,candidates,strategy };
 }
 
 function options(overrides: Partial<ConstructorParameters<typeof PaperDecisionWorker>[5]> = {}) {
@@ -396,22 +852,30 @@ function claim(): ClaimedPaperDecisionJob {
 function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecisionSnapshot {
   const asOfEvent=event('TokenLaunchDetected','evt_source');
   return Object.freeze({
-    mint:'MINT',asOfEvent,launch:Object.freeze({
+    mint:'MINT',asOfEvent,canonicalLaunchActive:true,hasPaperLineage:false,launch:Object.freeze({
       mint:'MINT',creator:'creator',tokenProgram:'SPL_TOKEN' as const,
       quoteAssets:Object.freeze([Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const })]),
       launchpad:'pumpfun',createdAt:asOfEvent.cursor,parameters:Object.freeze({}),
     }),metadata:null,social:null,creatorProfile:null,holderSnapshot:null,walletGraph:null,
     activeLaunchTrades:Object.freeze([]),activeMarketTrades:Object.freeze([]),
-    currentCandidate:null,currentDecision:null,currentSession:null,activePosition:null,...overrides,
+    currentQualification:canonicalQualification(),currentCandidate:null,currentDecision:null,
+    currentSession:null,activePosition:null,...overrides,
   });
 }
 
-function tradingCandidate(state:'ELIGIBLE'|'NOT_ELIGIBLE') {
+function tradingCandidate(
+  state:'ELIGIBLE'|'NOT_ELIGIBLE',
+  cursor:ChainCursor=Object.freeze({
+    slot:10n,transactionIndex:0,instructionIndex:1,innerInstructionIndex:null,
+  }),
+) {
   return createTradingCandidate({
     mint:'MINT',strategy:Object.freeze({ id:'validated-external-buys',version:1 }),
     qualificationReportId:`qreport_${'b'.repeat(64)}`,qualificationProfile:Object.freeze({
       id:'profile',version:1,fingerprint:'c'.repeat(64),
-    }),evidenceFingerprint:'d'.repeat(64),asOfEvent:event('QualificationUpdated','evt_qualification'),
+    }),evidenceFingerprint:'d'.repeat(64),asOfEvent:Object.freeze({
+      ...event('QualificationUpdated','evt_qualification'),cursor,
+    }),
     state,quoteAsset:Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' }),
     buyQuote:state === 'ELIGIBLE' ? quote('buy','SOL','MINT',1_000n,900n,900n) : null,
     reverseSellQuote:state === 'ELIGIBLE' ? quote('reverse','MINT','SOL',900n,800n,800n) : null,
@@ -432,14 +896,77 @@ function report(): QualificationReport {
 }
 
 function persistedDecision(
-  candidate: ReturnType<typeof tradingCandidate>,
+  _candidate: ReturnType<typeof tradingCandidate>,
   confirmationStatus: 'confirmed' | 'orphaned' = 'confirmed',
 ) {
   return Object.freeze({
-    reportId:candidate.qualificationReportId,evidenceFingerprint:candidate.evidenceFingerprint,
-    report:report(),qualificationEvent:event('QualificationUpdated','evt_qualification',confirmationStatus),
+    qualification:canonicalQualification(confirmationStatus),
     candidateEvent:event('TradingCandidateUpdated','evt_candidate',confirmationStatus),
   });
+}
+
+function canonicalQualification(
+  confirmationStatus: 'confirmed' | 'orphaned' = 'confirmed',
+): CanonicalQualificationProjection {
+  const qualificationEvent=event('QualificationUpdated','evt_qualification',confirmationStatus);
+  const evaluation=Object.freeze({
+    evaluatedAtMs:1_000,signals:Object.freeze({}),blockers:Object.freeze([]),
+    calibrationFacts:null,
+  });
+  const qualificationReport=report();
+  return Object.freeze({
+    reportId:`qreport_${'b'.repeat(64)}`,sourceEventId:'evt_source',
+    sourceRawEventId:'raw_source',evidenceFingerprint:'d'.repeat(64),
+    evaluation,report:qualificationReport,
+    qualificationEvent:Object.freeze({
+      ...qualificationEvent,source:'qualification',payload:Object.freeze({
+        reportId:`qreport_${'b'.repeat(64)}`,evidenceFingerprint:'d'.repeat(64),
+        evaluation,report:qualificationReport,
+      }),
+    }),
+  });
+}
+
+function realCanonicalQualification(
+  service:QualificationRebuildService,
+):CanonicalQualificationProjection{
+  const paper=snapshot();
+  const rebuilt=service.rebuild({
+    snapshot:Object.freeze({
+      mint:paper.mint,asOfEvent:paper.asOfEvent,launch:paper.launch,
+      metadata:paper.metadata,social:paper.social,creatorProfile:paper.creatorProfile,
+      holderSnapshot:null,walletGraph:paper.walletGraph,
+    }),buyQuote:undefined,reverseSellQuote:undefined,
+  });
+  return Object.freeze({
+    reportId:rebuilt.reportId,sourceEventId:paper.asOfEvent.id,
+    sourceRawEventId:'raw_source',evidenceFingerprint:rebuilt.evidenceFingerprint,
+    evaluation:rebuilt.evaluation,report:rebuilt.report,qualificationEvent:rebuilt.event,
+  });
+}
+
+function canonicalTamperingCases():readonly Readonly<{
+  name:string;
+  mutate:(value:CanonicalQualificationProjection)=>CanonicalQualificationProjection;
+}>[]{
+  return [
+    { name:'evaluation',mutate:(value)=>({
+      ...value,evaluation:{ ...value.evaluation,evaluatedAtMs:value.evaluation.evaluatedAtMs+1 },
+    }) },
+    { name:'report',mutate:(value)=>({
+      ...value,report:{ ...value.report,verdict:'REJECTED' },
+    }) },
+    { name:'profile',mutate:(value)=>({
+      ...value,report:{
+        ...value.report,ruleSet:{ ...value.report.ruleSet,fingerprint:'f'.repeat(64) },
+      },
+    }) },
+    { name:'report id',mutate:(value)=>({ ...value,reportId:`qreport_${'f'.repeat(64)}` }) },
+    { name:'event id',mutate:(value)=>({
+      ...value,qualificationEvent:{ ...value.qualificationEvent,id:'evt_tampered' },
+    }) },
+    { name:'fingerprint',mutate:(value)=>({ ...value,evidenceFingerprint:'f'.repeat(64) }) },
+  ];
 }
 
 function event(

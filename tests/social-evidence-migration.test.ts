@@ -214,10 +214,11 @@ async function insertTerminalSocialGraph(
     sourceLaunchEventId: claimed.sourceLaunchEventId,
     metadataSnapshot,
   }));
-  await socialRepository.complete(claimed, Object.freeze({
+  await socialRepository.persist(claimed, Object.freeze({
     status: 'RESOLVED' as const,
     ...collected,
   }));
+  await socialRepository.complete(claimed);
   await launchRepository.record(launchBatch(mint, signature, 'orphaned', terminalAtMs));
 }
 

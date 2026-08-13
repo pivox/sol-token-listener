@@ -11,7 +11,8 @@ const FORBIDDEN = /(?:execution\/(?:wallet|transaction-confirmer|trade-executor)
 
 const health: ApiHealth = {
   status: 'OK', observedAt: '2026-07-29T00:00:00.000Z', postgresql: { status: 'AVAILABLE' },
-  http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+  http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+  qualification: { currentCount: 0, lastSuccessAt: null },
   socialJobs: { pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0 },
   paperDecisionJobs: {
     pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,

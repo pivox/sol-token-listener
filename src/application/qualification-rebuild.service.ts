@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+import { isProxy } from 'node:util/types';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { PaperExecutionQuote } from '../domain/paper-trading.js';
 import type {
@@ -9,13 +11,23 @@ import type {
   QualificationUpstreamCondition,
 } from '../domain/qualification.js';
 import type { QualificationReasonCode } from '../domain/qualification-reasons.js';
-import type { PaperDecisionSnapshot } from '../ports/paper-decision-repository.js';
-import { canonicalStringifyJson } from '../utils/json.js';
+import type {
+  CanonicalQualificationProjection,
+  QualificationEvidenceSnapshot,
+} from '../ports/qualification-projection-repository.js';
+import {
+  canonicalStringifyJson,
+  MAX_CANONICAL_JSON_DEPTH,
+  MAX_CANONICAL_JSON_NODES,
+  MAX_CANONICAL_JSON_STRING_BYTES,
+  MAX_CANONICAL_JSON_TEXT_BYTES,
+  MAX_SERIALIZED_BIGINT_DIGITS,
+} from '../utils/json.js';
 import type { QualificationEngine } from '../qualification/qualification-engine.js';
 import { toSocialQualificationObservations } from '../social/social-qualification-observations.js';
 
 export interface QualificationRebuildInput {
-  readonly snapshot: PaperDecisionSnapshot;
+  readonly snapshot: QualificationEvidenceSnapshot;
   readonly buyQuote: PaperExecutionQuote | null | undefined;
   readonly reverseSellQuote: PaperExecutionQuote | null | undefined;
   readonly upstreamConditions?: readonly QualificationUpstreamCondition[];
@@ -36,36 +48,243 @@ export class QualificationRebuildService {
   public rebuild(input: QualificationRebuildInput): RebuiltQualification {
     assertInput(input);
     const evaluation = evaluationFrom(input);
-    const evidenceFingerprint = hash(canonicalStringifyJson({
-      signals:evaluation.signals,
-      blockers:evaluation.blockers,
-      calibrationFacts:evaluation.calibrationFacts,
-    }));
+    return this.build({
+      sourceEventId:input.snapshot.asOfEvent.id,
+      mint:input.snapshot.mint,
+      sourceEvent:input.snapshot.asOfEvent,
+      evaluation,
+    });
+  }
+
+  public reauthorize(projection: CanonicalQualificationProjection): RebuiltQualification {
+    const persisted = snapshotPersistedProjection(projection);
+    assertCanonicalValue(persisted, 'projection');
+    assertPersistedIdentifier(persisted.sourceEventId, 'source event id');
+    assertPersistedIdentifier(persisted.sourceRawEventId, 'source raw event id');
+    const rebuilt = this.build({
+      sourceEventId:persisted.sourceEventId,
+      mint:persisted.qualificationEvent.mint,
+      sourceEvent:persisted.qualificationEvent,
+      evaluation:persisted.evaluation,
+      authorizationEventId:persisted.qualificationEvent.id,
+    });
+    if (
+      persisted.reportId !== rebuilt.reportId
+      || persisted.evidenceFingerprint !== rebuilt.evidenceFingerprint
+      || !isDeepStrictEqual(persisted.evaluation, rebuilt.evaluation)
+      || !isDeepStrictEqual(persisted.report, rebuilt.report)
+      || !isDeepStrictEqual(persisted.qualificationEvent, rebuilt.event)
+    ) throw new TypeError('Persisted qualification projection is not canonical.');
+    return rebuilt;
+  }
+
+  private build(input: Readonly<{
+    sourceEventId: string;
+    mint: string;
+    sourceEvent: DomainEvent;
+    evaluation: QualificationEvaluationInput;
+    authorizationEventId?: string;
+  }>): RebuiltQualification {
+    const evidenceFingerprint = fingerprintEvaluation(input.evaluation);
     const profile = this.engine.profileSummary;
     const reportId = `qreport_${hash(JSON.stringify([
-      input.snapshot.mint,profile.id,String(profile.version),profile.fingerprint,
-      evidenceFingerprint,input.snapshot.asOfEvent.id,input.snapshot.asOfEvent.confirmationStatus,
+      input.mint,profile.id,String(profile.version),profile.fingerprint,
+      evidenceFingerprint,input.sourceEventId,input.sourceEvent.confirmationStatus,
     ]))}`;
     const eventId = createDeterministicDerivedEventId({
-      type:'QualificationUpdated',mint:input.snapshot.mint,source:'paper-decision',
-      program:input.snapshot.asOfEvent.program,signature:input.snapshot.asOfEvent.signature,
-      cursor:input.snapshot.asOfEvent.cursor,qualifier:reportId,
+      type:'QualificationUpdated',mint:input.mint,source:'qualification',
+      program:input.sourceEvent.program,signature:input.sourceEvent.signature,
+      cursor:input.sourceEvent.cursor,qualifier:reportId,
     });
     const report = this.engine.evaluateAuthorized(
-      { mint:input.snapshot.mint,triggerEventId:eventId },
-      evaluation,
+      { mint:input.mint,triggerEventId:input.authorizationEventId ?? eventId },
+      input.evaluation,
     );
     const event: DomainEvent = Object.freeze({
-      id:eventId,type:'QualificationUpdated',mint:input.snapshot.mint,
-      source:'paper-decision',program:input.snapshot.asOfEvent.program,
-      signature:input.snapshot.asOfEvent.signature,cursor:input.snapshot.asOfEvent.cursor,
-      confirmationStatus:input.snapshot.asOfEvent.confirmationStatus,
-      blockchainTimeMs:input.snapshot.asOfEvent.blockchainTimeMs,
-      observedAtMs:evaluation.evaluatedAtMs,payloadVersion:1,
-      payload:Object.freeze({ reportId,evidenceFingerprint,report }),
+      id:eventId,type:'QualificationUpdated',mint:input.mint,
+      source:'qualification',program:input.sourceEvent.program,
+      signature:input.sourceEvent.signature,cursor:input.sourceEvent.cursor,
+      confirmationStatus:input.sourceEvent.confirmationStatus,
+      blockchainTimeMs:input.sourceEvent.blockchainTimeMs,
+      observedAtMs:input.evaluation.evaluatedAtMs,payloadVersion:1,
+      payload:Object.freeze({ reportId,evidenceFingerprint,evaluation:input.evaluation,report }),
     });
-    return Object.freeze({ reportId,reportEventId:eventId,evidenceFingerprint,evaluation,report,event });
+    return Object.freeze({
+      reportId,reportEventId:eventId,evidenceFingerprint,
+      evaluation:input.evaluation,report,event,
+    });
   }
+}
+
+function fingerprintEvaluation(evaluation: QualificationEvaluationInput): string {
+  return hash(canonicalStringifyJson({
+    signals:evaluation.signals,
+    blockers:evaluation.blockers,
+    calibrationFacts:evaluation.calibrationFacts,
+  }));
+}
+
+function assertPersistedIdentifier(value: string, name: string): void {
+  if (
+    typeof value !== 'string'
+    || value.trim() === ''
+    || value.trim() !== value
+    || Buffer.byteLength(value, 'utf8') > MAX_CANONICAL_JSON_STRING_BYTES
+  ) throw new TypeError(`Persisted qualification ${name} is invalid.`);
+}
+
+function assertCanonicalValue(value: unknown, name: string): void {
+  try {
+    canonicalStringifyJson(value);
+  } catch (cause: unknown) {
+    throw new TypeError(`Persisted qualification ${name} is invalid.`, { cause });
+  }
+}
+
+const QUALIFICATION_PROJECTION_FIELDS = [
+  'reportId',
+  'sourceEventId',
+  'sourceRawEventId',
+  'evidenceFingerprint',
+  'evaluation',
+  'report',
+  'qualificationEvent',
+] as const;
+const MAX_PERSISTED_BIGINT_MAGNITUDE =
+  10n ** BigInt(MAX_SERIALIZED_BIGINT_DIGITS) - 1n;
+
+interface PersistedSnapshotState {
+  nodes: number;
+  textBytes: number;
+  readonly ancestors: WeakSet<object>;
+}
+
+function snapshotPersistedProjection(
+  projection: CanonicalQualificationProjection,
+): CanonicalQualificationProjection {
+  const snapshot = snapshotPersistedValue(projection, 0, {
+    nodes:0,
+    textBytes:0,
+    ancestors:new WeakSet(),
+  });
+  if (
+    Array.isArray(snapshot)
+    || QUALIFICATION_PROJECTION_FIELDS.some((field) => !Object.hasOwn(snapshot, field))
+    || Object.keys(snapshot).length !== QUALIFICATION_PROJECTION_FIELDS.length
+  ) throw invalidPersistedProjection();
+  return snapshot;
+}
+
+function snapshotPersistedValue<T>(
+  value: T,
+  depth: number,
+  state: PersistedSnapshotState,
+): T {
+  if (depth > MAX_CANONICAL_JSON_DEPTH || ++state.nodes > MAX_CANONICAL_JSON_NODES) {
+    throw invalidPersistedProjection();
+  }
+  if (typeof value === 'string') {
+    accountPersistedText(value, state);
+    return value;
+  }
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') {
+    if (
+      value > MAX_PERSISTED_BIGINT_MAGNITUDE
+      || value < -MAX_PERSISTED_BIGINT_MAGNITUDE
+    ) throw invalidPersistedProjection();
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) throw invalidPersistedProjection();
+    return value;
+  }
+  if (typeof value !== 'object' || isProxy(value)) throw invalidPersistedProjection();
+  if (state.ancestors.has(value)) throw invalidPersistedProjection();
+  state.ancestors.add(value);
+  try {
+    if (Array.isArray(value)) return snapshotPersistedArray(value, depth, state) as T;
+    return snapshotPersistedObject(value, depth, state) as T;
+  } finally {
+    state.ancestors.delete(value);
+  }
+}
+
+function snapshotPersistedArray(
+  value: readonly unknown[],
+  depth: number,
+  state: PersistedSnapshotState,
+): readonly unknown[] {
+  if (Object.getPrototypeOf(value) !== Array.prototype) throw invalidPersistedProjection();
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => typeof key === 'symbol')) throw invalidPersistedProjection();
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+  if (
+    lengthDescriptor === undefined
+    || !('value' in lengthDescriptor)
+    || typeof lengthDescriptor.value !== 'number'
+    || !Number.isSafeInteger(lengthDescriptor.value)
+    || lengthDescriptor.value < 0
+    || keys.length !== lengthDescriptor.value + 1
+    || lengthDescriptor.value > MAX_CANONICAL_JSON_NODES - state.nodes
+  ) throw invalidPersistedProjection();
+  const result: unknown[] = [];
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+    const key = String(index);
+    accountPersistedText(key, state);
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw invalidPersistedProjection();
+    }
+    result.push(snapshotPersistedValue(descriptor.value, depth + 1, state));
+  }
+  return Object.freeze(result);
+}
+
+function snapshotPersistedObject(
+  value: object,
+  depth: number,
+  state: PersistedSnapshotState,
+): Readonly<Record<string, unknown>> {
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw invalidPersistedProjection();
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.some((key) => typeof key === 'symbol')
+    || keys.length > MAX_CANONICAL_JSON_NODES - state.nodes
+  ) throw invalidPersistedProjection();
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const result: Record<string, unknown> = prototype === null
+    ? Object.create(null) as Record<string, unknown>
+    : {};
+  for (const key of keys as string[]) {
+    accountPersistedText(key, state);
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw invalidPersistedProjection();
+    }
+    Object.defineProperty(result, key, {
+      value:snapshotPersistedValue(descriptor.value, depth + 1, state),
+      enumerable:true,
+      configurable:true,
+      writable:true,
+    });
+  }
+  return Object.freeze(result);
+}
+
+function accountPersistedText(value: string, state: PersistedSnapshotState): void {
+  const bytes = Buffer.byteLength(value, 'utf8');
+  if (
+    bytes > MAX_CANONICAL_JSON_STRING_BYTES
+    || state.textBytes + bytes > MAX_CANONICAL_JSON_TEXT_BYTES
+  ) throw invalidPersistedProjection();
+  state.textBytes += bytes;
+}
+
+function invalidPersistedProjection(): TypeError {
+  return new TypeError('Persisted qualification projection contains unsafe data.');
 }
 
 function evaluationFrom(input: QualificationRebuildInput): QualificationEvaluationInput {

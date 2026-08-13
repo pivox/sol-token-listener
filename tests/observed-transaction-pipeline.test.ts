@@ -284,6 +284,14 @@ function harness(options: HarnessOptions = {}) {
       return Object.freeze({});
     },
   };
+  const qualification = {
+    rebuild: async (mint: string, policy: string) => {
+      order.push(`qualification:${mint}`);
+      rebuildPolicies.push(`qualification:${mint}:${policy}`);
+      fail('qualification', mint);
+      return Object.freeze({});
+    },
+  };
   const observeMarket = async (input: unknown) => {
       order.push('pumpswap');
       observed.push(input);
@@ -328,6 +336,7 @@ function harness(options: HarnessOptions = {}) {
       return 1_700_000_000_500;
     },
     paperDecisions,
+    qualification,
   );
   return {
     pipeline,
@@ -336,7 +345,7 @@ function harness(options: HarnessOptions = {}) {
     rebuildPolicies,
     observed,
     clockCalls: () => clockCalls,
-    dependencies: { reader, launchpad, funding, participants, graph, market },
+    dependencies: { reader, launchpad, funding, participants, graph, market, qualification },
   };
 }
 
@@ -368,6 +377,8 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
     'i2:MintA',
     'i2:MintB',
     'pumpswap',
+    'qualification:MintA',
+    'qualification:MintB',
   ]);
   assert.equal(h.observed.length, 3);
   assert.equal(h.observed[0], h.observed[1]);
@@ -384,6 +395,7 @@ void test('runs strict stages once, collapses duplicates, and rebuilds mints lex
     walletGraphCount: 2,
     marketMigrationCount: 0,
     marketActivationCount: 0,
+    qualificationRebuildCount: 2,
     paperDecisionEnqueueCount: 0,
   });
   assert.ok(Object.isFrozen(result));
@@ -395,6 +407,7 @@ void test('keeps an irrelevant active transaction write-minimal while PumpSwap s
   const result = await h.pipeline.process(h.tx);
   assert.deepEqual(h.order, ['tracked', 'launchpad', 'reload', 'funding:', 'pumpswap']);
   assert.equal(result.affectedMintCount, 0);
+  assert.equal(result.qualificationRebuildCount, 0);
 });
 
 void test('enqueues one durable paper decision per affected mint after every projection', async () => {
@@ -407,13 +420,58 @@ void test('enqueues one durable paper decision per affected mint after every pro
 
   const result = await h.pipeline.process(h.tx);
 
-  assert.deepEqual(h.order.slice(-4), [
+  assert.deepEqual(h.order.slice(-7), [
     'pumpswap',
+    'qualification:MintA',
+    'qualification:MintB',
+    'qualification:MintC',
     `paper:MintA:${SIGNATURE}:confirmed`,
     `paper:MintB:${SIGNATURE}:confirmed`,
     `paper:MintC:${SIGNATURE}:confirmed`,
   ]);
+  assert.equal(result.qualificationRebuildCount, 3);
   assert.equal(result.paperDecisionEnqueueCount, 3);
+});
+
+void test('rebuilds the sorted affected and market union before paper decisions', async () => {
+  const h = harness({
+    activeEvents: [event('trade-b', 'MintB')],
+    launchpadAffectedMints: ['MintA'],
+    marketAffectedMints: ['MintC', 'MintA'],
+    paperDecisions: true,
+  });
+
+  const result = await h.pipeline.process(h.tx);
+
+  assert.deepEqual(h.order.slice(4), [
+    'i1:MintA', 'i1:MintB',
+    'i2:MintA', 'i2:MintB',
+    'pumpswap',
+    'qualification:MintA', 'qualification:MintB', 'qualification:MintC',
+    `paper:MintA:${SIGNATURE}:confirmed`,
+    `paper:MintB:${SIGNATURE}:confirmed`,
+    `paper:MintC:${SIGNATURE}:confirmed`,
+  ]);
+  assert.equal(result.qualificationRebuildCount, 3);
+});
+
+void test('attributes a qualification failure to its mint and stops before paper decisions', async () => {
+  const h = harness({
+    launchpadAffectedMints: ['MintA', 'MintB'],
+    marketAffectedMints: ['MintC'],
+    paperDecisions: true,
+    fail: 'qualification',
+    failMint: 'MintB',
+  });
+
+  await assert.rejects(h.pipeline.process(h.tx), (error: unknown) => {
+    assert.ok(error instanceof ObservedPipelineError);
+    assert.equal(error.stage, 'qualification');
+    assert.equal(error.mint, 'MintB');
+    return true;
+  });
+  assert.deepEqual(h.order.slice(-2), ['qualification:MintA', 'qualification:MintB']);
+  assert.equal(h.order.some((call) => call.startsWith('paper:')), false);
 });
 
 void test('attributes a paper enqueue failure to its mint and stops deterministically', async () => {
@@ -453,6 +511,7 @@ void test('uses persisted launchpad impact to dissolve orphaned projections afte
   assert.deepEqual(h.order, [
     'tracked', 'launchpad', 'reload', 'funding:',
     'i1:MintA', 'i1:MintZ', 'i2:MintA', 'i2:MintZ', 'pumpswap',
+    'qualification:MintA', 'qualification:MintZ',
   ]);
   assert.equal(result.affectedMintCount, 2);
   assert.deepEqual(h.rebuildPolicies, [
@@ -460,6 +519,8 @@ void test('uses persisted launchpad impact to dissolve orphaned projections afte
     'i1:MintZ:DISSOLVE_CURRENT',
     'i2:MintA:DISSOLVE_CURRENT',
     'i2:MintZ:DISSOLVE_CURRENT',
+    'qualification:MintA:DISSOLVE_CURRENT',
+    'qualification:MintZ:DISSOLVE_CURRENT',
   ]);
 });
 
@@ -471,6 +532,7 @@ void test('uses error policy for every active confirmation status', async () => 
     assert.deepEqual(h.rebuildPolicies, [
       'i1:MintA:ERROR',
       'i2:MintA:ERROR',
+      'qualification:MintA:ERROR',
     ]);
   }
 });
@@ -501,15 +563,29 @@ void test('keeps orphan impact on replay after tracked and active rows have alre
   });
   h.tx.confirmationStatus = 'ORPHANED';
   await h.pipeline.process(h.tx);
-  assert.deepEqual(h.order.slice(4, 6), ['i1:RetractedMint', 'i2:RetractedMint']);
+  assert.deepEqual(h.order.slice(4, 7), [
+    'i1:RetractedMint', 'i2:RetractedMint', 'pumpswap',
+  ]);
+  assert.equal(h.order.at(-1), 'qualification:RetractedMint');
 });
 
-void test('reports migration and pool activation while running PumpSwap last', async () => {
-  const h = harness({ marketMigrationCount: 1, marketActivationCount: 1 });
+void test('runs migration activation through PumpSwap then qualification and paper enqueue', async () => {
+  const h = harness({
+    marketMigrationCount: 1,
+    marketActivationCount: 1,
+    marketAffectedMints: ['MigratedMint'],
+    paperDecisions: true,
+  });
   const result = await h.pipeline.process(h.tx);
-  assert.equal(h.order.at(-1), 'pumpswap');
+  assert.deepEqual(h.order.slice(-3), [
+    'pumpswap',
+    'qualification:MigratedMint',
+    `paper:MigratedMint:${SIGNATURE}:confirmed`,
+  ]);
   assert.equal(result.marketMigrationCount, 1);
   assert.equal(result.marketActivationCount, 1);
+  assert.equal(result.qualificationRebuildCount, 1);
+  assert.equal(result.paperDecisionEnqueueCount, 1);
 });
 
 void test('cuts off after each failed stage and identifies the exact stable stage and mint', async () => {
@@ -522,6 +598,7 @@ void test('cuts off after each failed stage and identifies the exact stable stag
     ['participant_analytics', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA'], 'MintA'],
     ['wallet_graph', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA', 'i2:MintA'], 'MintA'],
     ['pumpswap_observation', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA', 'i2:MintA', 'pumpswap'], null],
+    ['qualification', ['tracked', 'launchpad', 'reload', 'funding:event-a', 'i1:MintA', 'i2:MintA', 'pumpswap', 'qualification:MintA'], 'MintA'],
   ];
   for (const [stage, expectedOrder, mint] of cases) {
     const h = harness({ activeEvents: [event('event-a', 'MintA')], fail: stage });
@@ -562,7 +639,8 @@ void test('redacts hostile transaction accessors at the observation boundary', a
 void test('full replay safely reruns the same idempotent stage sequence', async () => {
   const h = harness({ activeEvents: [event('event-a', 'MintA')] });
   assert.deepEqual(await h.pipeline.process(h.tx), await h.pipeline.process(h.tx));
-  assert.deepEqual(h.order.slice(0, 7), h.order.slice(7));
+  const replayLength = h.order.length / 2;
+  assert.deepEqual(h.order.slice(0, replayLength), h.order.slice(replayLength));
 });
 
 void test('redacts hostile dependency errors without consulting their properties', async () => {

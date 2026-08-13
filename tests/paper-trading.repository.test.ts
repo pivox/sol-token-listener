@@ -81,6 +81,59 @@ void test('sérialise les ouvertures concurrentes pour une stratégie et un mint
   assert.deepEqual(client.values[1], ['MINT\u001fstrategy\u001f1']);
 });
 
+void test('locks and verifies the exact current qualification before paper writes',async()=>{
+  const client=new RecordingClient(false,[
+    { report_id:'report',source_event_id:'source',source_raw_event_id:'raw' },
+  ]);
+  const repository=new PostgresPaperTradingRepository({ connect:async()=>client });
+
+  await repository.transact(async(transaction)=>{
+    await transaction.requireCurrentQualification({
+      mint:'MINT',reportId:'report',qualificationEventId:'qualification-event',
+    });
+  });
+
+  assert.match(client.texts[1] ?? '',/qualification-projection:/u);
+  assert.match(client.texts[1] ?? '',/pg_advisory_xact_lock/u);
+  assert.match(client.texts[2] ?? '',/superseded_at IS NULL/u);
+  assert.match(client.texts[2] ?? '',/purge_after > clock_timestamp\(\)/u);
+  assert.match(client.texts[2] ?? '',/qualification_event_id/u);
+  assert.match(client.texts[2] ?? '',/report\.confirmation_status <> 'orphaned'/u);
+  assert.match(client.texts[2] ?? '',/event\.confirmation_status <> 'orphaned'/u);
+  assert.match(client.texts[3] ?? '',/FROM raw_chain_events raw/u);
+  assert.match(client.texts[3] ?? '',/raw\.event_id=\$1/u);
+  assert.match(client.texts[3] ?? '',/raw\.confirmation_status <> 'orphaned'/u);
+  assert.match(client.texts[3] ?? '',/FOR SHARE OF raw/u);
+  assert.match(client.texts[4] ?? '',/FROM domain_events source/u);
+  assert.match(client.texts[4] ?? '',/source\.event_id=\$1/u);
+  assert.match(client.texts[4] ?? '',/source\.raw_event_id=\$2/u);
+  assert.match(client.texts[4] ?? '',/source\.confirmation_status <> 'orphaned'/u);
+  assert.match(client.texts[4] ?? '',/source\.type IN/u);
+  assert.match(client.texts[4] ?? '',/raw\.source=source\.source/u);
+  assert.match(client.texts[4] ?? '',/FOR SHARE OF source,raw/u);
+  assert.deepEqual(client.values[1],['MINT']);
+  assert.deepEqual(client.values[2],['MINT','report','qualification-event']);
+  assert.deepEqual(client.values[3],['raw','MINT']);
+  assert.deepEqual(client.values[4],[
+    'source','raw','MINT','report','qualification-event',
+  ]);
+});
+
+void test('rolls back a stale current qualification before paper writes',async()=>{
+  const client=new RecordingClient();
+  const repository=new PostgresPaperTradingRepository({ connect:async()=>client });
+
+  await assert.rejects(repository.transact(async(transaction)=>{
+    await transaction.requireCurrentQualification({
+      mint:'MINT',reportId:'report',qualificationEventId:'qualification-event',
+    });
+    await transaction.insertOpened(position(),trade(),event());
+  }),hasCode('QUALIFICATION_NOT_CURRENT'));
+
+  assert.equal(client.commands.includes('INSERT paper_positions'),false);
+  assert.equal(client.commands.at(-1),'ROLLBACK');
+});
+
 void test('rend les événements paper purgeables à la fermeture', async () => {
   const client = new RecordingClient();
   const repository = new PostgresPaperTradingRepository({
@@ -326,4 +379,10 @@ function classify(sql: string): string {
     ? 'SELECT'
     : normalized.startsWith('UPDATE') ? 'UPDATE' : 'INSERT';
   return `${operation} ${match?.[1] ?? 'unknown'}`;
+}
+
+function hasCode(code:string):(error:unknown)=>boolean{
+  return (error)=>(
+    typeof error==='object'&&error!==null&&'code' in error&&error.code===code
+  );
 }

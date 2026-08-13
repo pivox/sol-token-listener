@@ -10,6 +10,7 @@ import type { SocialEvidenceCollectionV1 } from '../domain/social-evidence.js';
 import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
 import type { ChainConfirmationStatus, TokenLaunch } from '../domain/types.js';
 import type { WalletGraphAnalysis } from '../domain/wallet-graph.js';
+import type { CanonicalQualificationProjection } from './qualification-projection-repository.js';
 
 export interface PaperDecisionJobInput {
   readonly mint: string;
@@ -37,6 +38,8 @@ export interface PaperDecisionQueueCounts {
 export interface PaperDecisionSnapshot {
   readonly mint: string;
   readonly asOfEvent: DomainEvent;
+  readonly canonicalLaunchActive: boolean;
+  readonly hasPaperLineage: boolean;
   readonly launch: TokenLaunch;
   readonly metadata: TokenMetadataSnapshot | null;
   readonly social: SocialEvidenceCollectionV1 | null;
@@ -48,12 +51,10 @@ export interface PaperDecisionSnapshot {
     { readonly type: 'BondingCurveTradeObserved' }
   >[];
   readonly activeMarketTrades: readonly MarketTrade[];
+  readonly currentQualification: CanonicalQualificationProjection | null;
   readonly currentCandidate: TradingCandidateV1 | null;
   readonly currentDecision: Readonly<{
-    readonly reportId: string;
-    readonly evidenceFingerprint: string;
-    readonly report: QualificationReport;
-    readonly qualificationEvent: DomainEvent;
+    readonly qualification: CanonicalQualificationProjection;
     readonly candidateEvent: DomainEvent;
   }> | null;
   readonly currentSession: PaperStrategySessionV1 | null;
@@ -84,6 +85,8 @@ export interface PaperDecisionRepository {
   loadSnapshot(job: ClaimedPaperDecisionJob): Promise<PaperDecisionSnapshot>;
   stageDecision(job: ClaimedPaperDecisionJob, result: PaperDecisionResult): Promise<void>;
   complete(job: ClaimedPaperDecisionJob, result: PaperDecisionResult): Promise<void>;
+  completeNoop(job: ClaimedPaperDecisionJob): Promise<void>;
+  completeObsolete(job: ClaimedPaperDecisionJob): Promise<void>;
   fail(job: ClaimedPaperDecisionJob, failure: PaperDecisionFailure): Promise<void>;
   counts(): Promise<PaperDecisionQueueCounts>;
 }

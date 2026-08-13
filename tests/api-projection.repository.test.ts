@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   ApiProjectionDataError,
   PostgresApiProjectionRepository,
+  type ApiProjectionPipelineState,
   type Queryable,
 } from '../src/storage/api-projection.repository.js';
 import {
@@ -22,6 +23,13 @@ interface Call {
   readonly text: string;
   readonly values: readonly unknown[] | undefined;
 }
+
+// @ts-expect-error qualification is mandatory for every pipeline provider.
+const missingQualificationPipeline: ApiProjectionPipelineState = {
+  httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+  paperDecision: 'RUNNING', social: 'RUNNING',
+};
+void missingQualificationPipeline;
 
 class FakeQueryable implements Queryable {
   public readonly calls: Call[] = [];
@@ -67,6 +75,54 @@ class FakeConnectable implements Queryable {
 
 const detectedAt = new Date('2026-07-01T12:00:00.000Z');
 const openedAt = new Date('2026-07-02T12:00:00.000Z');
+
+function legacyRiskReport(): Record<string, unknown> {
+  return {
+    ruleSet: { id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60 },
+    scores: {
+      preparation: { score: 1, maximum: 2 }, socialAuthenticity: { score: 3, maximum: 4 },
+      onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 },
+    }, evidence: [], blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
+  };
+}
+
+function canonicalRiskWrapper(report: Record<string, unknown>): Record<string, unknown> {
+  return {
+    reportId: `qreport_${'c'.repeat(64)}`,
+    evidenceFingerprint: 'b'.repeat(64),
+    evaluation: { evaluatedAtMs: detectedAt.getTime(), signals: {}, blockers: [], calibrationFacts: null },
+    report,
+  };
+}
+
+function canonicalRiskRow(
+  report: Record<string, unknown>,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const ruleSet = report.ruleSet as Record<string, unknown>;
+  const scores = report.scores as Record<string, Record<string, unknown>>;
+  return {
+    report_id: `qreport_${'c'.repeat(64)}`,
+    evidence_fingerprint: 'b'.repeat(64),
+    profile_id: ruleSet.id,
+    profile_version: ruleSet.version,
+    profile_fingerprint: ruleSet.fingerprint ?? 'a'.repeat(64),
+    verdict: report.verdict,
+    preparation_score: scores.preparation?.score,
+    social_score: scores.socialAuthenticity?.score,
+    onchain_score: scores.onchainHealth?.score,
+    total_score: scores.total?.score,
+    evaluated_at: new Date(report.evaluatedAtMs as number),
+    report_payload_version: 1,
+    report_payload_size: 1,
+    report_payload: report,
+    qualification_event_id: `evt_${'d'.repeat(64)}`,
+    event_payload_version: 1,
+    event_payload_size: 1,
+    event_payload: canonicalRiskWrapper(report),
+    ...overrides,
+  };
+}
 
 function calibratedConditions(): Record<string, unknown>[] {
   return QUALIFICATION_REASON_CODES.map((code) => {
@@ -666,7 +722,7 @@ void test('expose les profils et positions observés avec des limites SQL borné
   const repository = new PostgresApiProjectionRepository(
     database,
     () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
     {
       positions: 1,
       snapshots: 2,
@@ -832,7 +888,7 @@ void test('exposes current clusters with per-cluster truncation and one shared m
   const repository = new PostgresApiProjectionRepository(
     database,
     () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
     {
       positions: 1,
       snapshots: 1,
@@ -935,7 +991,7 @@ void test('shares one bounded quote-asset budget across emitted clusters', async
   const repository = new PostgresApiProjectionRepository(
     database,
     () => detectedAt,
-    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+    { httpAvailable: true, pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
     {
       positions: 1,
       snapshots: 1,
@@ -1196,7 +1252,7 @@ void test('rejects timeline PostgreSQL integer overflow before querying', async 
   assert.equal(database.calls.length, 0);
 });
 
-void test('uses the latest non-orphaned qualification event and rejects malformed data safely', async () => {
+void test('loads the current canonical qualification wrapper for the effective profile', async () => {
   const report = {
     ruleSet: { id: 'rules', version: 1, status: 'UNVALIDATED_RULE_SET', minimumTotalScore: 60 },
     scores: {
@@ -1204,22 +1260,51 @@ void test('uses the latest non-orphaned qualification event and rejects malforme
       onchainHealth: { score: 5, maximum: 6 }, total: { score: 9, maximum: 12 },
     }, evidence: [], blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
   };
-  const database = new FakeQueryable((call) => call.text.includes('QualificationUpdated')
-    ? [{ payload: report }] : []);
-  const value = await new PostgresApiProjectionRepository(database).getLaunchRisk('mint-a');
+  const database = new FakeQueryable(() => [canonicalRiskRow(report)]);
+  const value = await new PostgresApiProjectionRepository(
+    database, () => new Date(), undefined, undefined,
+    { id: 'rules', version: 1, fingerprint: 'a'.repeat(64) },
+  ).getLaunchRisk('mint-a');
   assert.deepEqual(value, {
     ruleSet: { ...report.ruleSet, fingerprint: null }, scores: report.scores, evidence: report.evidence,
     conditions: [], blockers: report.blockers, verdict: report.verdict,
     evaluatedAt: detectedAt.toISOString(),
   });
-  assert.match(database.calls[0]?.text ?? '', /confirmation_status <> 'orphaned'/u);
-  assert.match(
-    database.calls[0]?.text ?? '',
-    /ORDER BY\s+slot DESC,\s*transaction_index DESC,\s*instruction_index DESC,\s*COALESCE\(inner_instruction_index, -1\) DESC,\s*event_id DESC/u,
-  );
+  const query = database.calls[0]?.text ?? '';
+  assert.match(query, /FROM qualification_reports AS report/u);
+  assert.match(query, /report\.superseded_at IS NULL/u);
+  assert.match(query, /report\.purge_after > clock_timestamp\(\)/u);
+  assert.match(query, /JOIN domain_events AS source/u);
+  assert.match(query, /JOIN raw_chain_events AS raw/u);
+  assert.match(query, /JOIN domain_events AS qualification_event/u);
+  assert.match(query, /qualification_event\.source = 'qualification'/u);
+  assert.match(query, /report\.confirmation_status <> 'orphaned'/u);
+  assert.match(query, /source\.confirmation_status <> 'orphaned'/u);
+  assert.match(query, /raw\.confirmation_status <> 'orphaned'/u);
+  assert.match(query, /qualification_event\.confirmation_status <> 'orphaned'/u);
+  assert.match(query, /source\.raw_event_id = report\.source_raw_event_id/u);
+  assert.match(query, /qualification_event\.raw_event_id = report\.source_raw_event_id/u);
+  assert.match(query, /octet_length\(report\.payload::text\) <= 1048576/u);
+  assert.match(query, /octet_length\(qualification_event\.payload::text\) <= 1048576/u);
+  assert.match(query, /report\.profile_id = \$2/u);
+  assert.deepEqual(database.calls[0]?.values, ['mint-a', 'rules', 1, 'a'.repeat(64)]);
+});
 
-  const malformed = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: '{bad json' }]));
-  await assert.rejects(malformed.getLaunchRisk('mint-a'), ApiProjectionDataError);
+void test('rejects a direct legacy event report and malformed canonical identity', async () => {
+  const report = legacyRiskReport();
+  const direct = canonicalRiskRow(report, { event_payload: report });
+  const mismatched = canonicalRiskRow(report, {
+    event_payload: { ...canonicalRiskWrapper(report), reportId: `qreport_${'f'.repeat(64)}` },
+  });
+  for (const row of [direct, mismatched]) {
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [row]));
+    await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
+  }
+});
+
+void test('returns unavailable when no current fresh coherent qualification lineage exists', async () => {
+  const database = new FakeQueryable(() => []);
+  assert.equal(await new PostgresApiProjectionRepository(database).getLaunchRisk('mint-a'), null);
 });
 
 void test('projects calibrated qualification evidence as canonical V1 condition fields', async () => {
@@ -1236,7 +1321,9 @@ void test('projects calibrated qualification evidence as canonical V1 condition 
     blockers: [], verdict: 'QUALIFIED', evaluatedAtMs: detectedAt.getTime(),
   };
   const databasePayload = JSON.parse(JSON.stringify(toJsonValue(report))) as unknown;
-  const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: databasePayload }]));
+  const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [
+    canonicalRiskRow(databasePayload as Record<string, unknown>),
+  ]));
 
   const value = await repository.getLaunchRisk('mint-a');
 
@@ -1282,7 +1369,9 @@ void test('rejects incomplete or malformed calibrated qualification evidence fai
   ];
 
   for (const payload of malformed) {
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [
+      canonicalRiskRow(payload as Record<string, unknown>),
+    ]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
   }
 });
@@ -1305,7 +1394,9 @@ void test('requires new calibrated qualifications to use the complete canonical 
     ? { ...item, status: 'DISABLED' } : item);
 
   for (const conditions of [[], valid.conditions.slice(0, -1), reordered, disabled, statusDisabled]) {
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: { ...valid, conditions } }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [
+      canonicalRiskRow({ ...valid, conditions }),
+    ]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
   }
 });
@@ -1328,7 +1419,9 @@ void test('enforces shared-funder observation and threshold bounds exactly', asy
   ]) {
     const invalidConditions = [...conditions];
     invalidConditions[index] = replacement;
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: { ...valid, conditions: invalidConditions } }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [
+      canonicalRiskRow({ ...valid, conditions: invalidConditions }),
+    ]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
   }
 });
@@ -1346,7 +1439,10 @@ void test('rejects hostile qualification payload descriptors and proxies without
     get: () => { throw new Error(secret); },
   });
   for (const payload of [proxy, accessor]) {
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [canonicalRiskRow(
+      legacyRiskReport(),
+      { event_payload: { ...canonicalRiskWrapper(legacyRiskReport()), report: payload } },
+    )]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), (error: unknown) => {
       assert.ok(error instanceof ApiProjectionDataError);
       assert.equal(error.message.includes(secret), false);
@@ -1367,7 +1463,7 @@ void test('projects complete engine evidence from calibrated and legacy persiste
   Reflect.deleteProperty(legacy, 'conditions');
 
   for (const payload of [calibrated, legacy]) {
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [canonicalRiskRow(payload)]));
     const value = await repository.getLaunchRisk('mint-a');
     assert.deepEqual(value?.evidence, report.evidence.map(({ signal, status, message }) => ({ signal, status, message })));
   }
@@ -1380,7 +1476,7 @@ void test('projects complete engine evidence from calibrated and legacy persiste
     const corrupt = JSON.parse(JSON.stringify(toJsonValue(report))) as Record<string, unknown>;
     const evidence = corrupt.evidence as Record<string, unknown>[];
     evidence[0] = { ...evidence[0], ...change };
-    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [{ payload: corrupt }]));
+    const repository = new PostgresApiProjectionRepository(new FakeQueryable(() => [canonicalRiskRow(corrupt)]));
     await assert.rejects(repository.getLaunchRisk('mint-a'), ApiProjectionDataError);
   }
 });
@@ -1532,17 +1628,21 @@ void test('returns health without exposing database URLs or secrets', async () =
       pending_count: 5, leased_count: 2, retryable_failed_count: 1, exhausted_count: 3,
       last_success_at: openedAt, last_error_code: 'QUOTE_UNAVAILABLE',
     }];
+    if (call.text.includes('FROM qualification_reports AS report')) return [{
+      current_count: 2, last_success_at: openedAt,
+    }];
     return [];
   });
   const repository = new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: false, pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: false, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
   });
   const health = await repository.getHealth();
 
   assert.deepEqual(health, {
     status: 'DEGRADED', observedAt: openedAt.toISOString(),
     postgresql: { status: 'AVAILABLE' }, http: { status: 'UNAVAILABLE' },
-    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING' },
+    pipeline: { pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING' },
+    qualification: { currentCount: 2, lastSuccessAt: openedAt.toISOString() },
     socialJobs: { pendingCount: 2, leasedCount: 1, retryableFailedCount: 3, exhaustedCount: 4 },
     paperDecisionJobs: {
       pendingCount: 5, leasedCount: 2, retryableFailedCount: 1, exhaustedCount: 3,
@@ -1559,6 +1659,24 @@ void test('returns health without exposing database URLs or secrets', async () =
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
+  const qualificationQuery = database.calls.find((call) => call.text.includes('FROM qualification_reports AS report'))?.text ?? '';
+  assert.match(qualificationQuery, /superseded_at IS NULL/u);
+  assert.match(qualificationQuery, /report\.purge_after > clock_timestamp\(\)/u);
+  assert.match(qualificationQuery, /qualification_event\.confirmation_status <> 'orphaned'/u);
+  assert.match(qualificationQuery, /qualification_event\.source = 'qualification'/u);
+  assert.match(qualificationQuery, /qualification_event\.program = source\.program/u);
+  assert.match(qualificationQuery, /qualification_event\.signature = source\.signature/u);
+  assert.match(qualificationQuery, /qualification_event\.slot = report\.as_of_slot/u);
+  assert.match(qualificationQuery, /qualification_event\.transaction_index = report\.as_of_transaction_index/u);
+  assert.match(qualificationQuery, /qualification_event\.instruction_index = report\.as_of_instruction_index/u);
+  assert.match(qualificationQuery, /qualification_event\.inner_instruction_index[\s\S]*report\.as_of_inner_instruction_index/u);
+  assert.match(qualificationQuery, /qualification_event\.observed_at = report\.evaluated_at/u);
+  assert.match(qualificationQuery, /source\.slot = report\.as_of_slot/u);
+  assert.match(qualificationQuery, /source\.transaction_index = report\.as_of_transaction_index/u);
+  assert.match(qualificationQuery, /source\.instruction_index = report\.as_of_instruction_index/u);
+  assert.match(qualificationQuery, /source\.inner_instruction_index[\s\S]*report\.as_of_inner_instruction_index/u);
+  assert.match(qualificationQuery, /source\.confirmation_status <> 'orphaned'/u);
+  assert.match(qualificationQuery, /raw\.confirmation_status <> 'orphaned'/u);
   assert.doesNotMatch(JSON.stringify(health), /:\/\/|DATABASE_URL|password|secret|localhost/u);
 });
 
@@ -1578,18 +1696,55 @@ void test('degrades only social health when its bounded count projection fails',
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
   assert.equal(health.postgresql.status, 'AVAILABLE');
   assert.deepEqual(health.pipeline, {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'DEGRADED',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'DEGRADED',
   });
   assert.deepEqual(health.socialJobs, {
     pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
   });
   assert.doesNotMatch(JSON.stringify(health), /metadata|private|failure|:\/\//u);
+});
+
+void test('degrades only qualification health when its bounded current aggregate fails', async () => {
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
+    if (call.text.includes('listener_heartbeats')) return [{
+      updated_at: openedAt, started_at: openedAt, last_http_slot: '60',
+      last_websocket_slot: '60', last_finalized_slot: '59', last_signature: null,
+      pending_transactions: 0, active_sessions: 0, leased_transactions: 0,
+      exhausted_transactions: 0, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
+      scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
+    }];
+    if (call.text.includes('FROM social_enrichment_jobs')) return [{
+      pending_count: 0, leased_count: 0, retryable_failed_count: 0, exhausted_count: 0,
+    }];
+    if (call.text.includes('FROM paper_decision_jobs')) return [{
+      pending_count: 0, leased_count: 0, retryable_failed_count: 0, exhausted_count: 0,
+      last_success_at: null, last_error_code: null,
+    }];
+    if (call.text.includes('FROM qualification_reports AS report')) {
+      throw new Error('postgres://private/qualification-current-failure');
+    }
+    return [];
+  });
+  const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+  }).getHealth();
+
+  assert.equal(health.status, 'DEGRADED');
+  assert.equal(health.postgresql.status, 'AVAILABLE');
+  assert.deepEqual(health.pipeline, {
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'DEGRADED',
+    paperDecision: 'RUNNING', social: 'RUNNING',
+  });
+  assert.deepEqual(health.qualification, { currentCount: 0, lastSuccessAt: null });
+  assert.doesNotMatch(JSON.stringify(health), /postgres:\/\/|private|failure/u);
 });
 
 void test('degrades only paper health when its bounded queue projection fails', async () => {
@@ -1612,12 +1767,12 @@ void test('degrades only paper health when its bounded queue projection fails', 
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
-    paperDecision: 'RUNNING', social: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
   assert.deepEqual(health.pipeline, {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'DEGRADED', social: 'RUNNING',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'DEGRADED', social: 'RUNNING',
   });
   assert.deepEqual(health.paperDecisionJobs, {
     pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
@@ -1630,7 +1785,7 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
   const database = new FakeQueryable((call) =>
     call.text.includes('SELECT 1 AS available') ? [{ available: 1 }] : []);
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -1658,7 +1813,7 @@ void test('degrades stale heartbeats and reads the canonical runtime start colum
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -1680,7 +1835,7 @@ void test('degrades a heartbeat timestamped in the future', async () => {
     return [];
   });
   const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'RUNNING',
   }).getHealth();
 
   assert.equal(health.status, 'DEGRADED');
@@ -1710,7 +1865,7 @@ void test('rejects invalid heartbeat runtime states and impossible runtime count
       return [];
     });
     const health = await new PostgresApiProjectionRepository(database, () => openedAt, {
-      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
     }).getHealth();
     assert.equal(health.status, 'DEGRADED');
     assert.equal(health.postgresql.status, 'UNAVAILABLE');
@@ -1731,6 +1886,10 @@ void test('redacts hostile dynamic pipeline providers into canonical DEGRADED he
   });
   const providers: (() => unknown)[] = [
     () => { throw new Error('pipeline provider secret'); },
+    () => ({
+      httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+      paperDecision: 'RUNNING', social: 'RUNNING',
+    }),
     () => getterState,
     () => hostileProxy,
   ];
@@ -1740,14 +1899,14 @@ void test('redacts hostile dynamic pipeline providers into canonical DEGRADED he
       new FakeQueryable(() => { throw new Error('must not query after invalid pipeline'); }),
       () => openedAt,
       provider as () => {
-        httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING'; paperDecision: 'RUNNING'; social: 'RUNNING';
+        httpAvailable: boolean; pumpfun: 'RUNNING'; pumpswap: 'RUNNING'; qualification: 'RUNNING'; paperDecision: 'RUNNING'; social: 'RUNNING';
       },
     );
     const health = await repository.getHealth();
     assert.equal(health.status, 'DEGRADED');
     assert.deepEqual(health.http, { status: 'UNAVAILABLE' });
     assert.deepEqual(health.pipeline, {
-      pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
+      pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', qualification: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
     });
     assert.ok(Object.isFrozen(health.pipeline));
     assert.doesNotMatch(JSON.stringify(health), /secret/u);
@@ -1759,6 +1918,7 @@ void test('snapshots a dynamic pipeline provider exactly once without retaining 
   let providerCalls = 0;
   const original = {
     httpAvailable: true, pumpfun: 'RUNNING' as const, pumpswap: 'RUNNING' as const,
+    qualification: 'RUNNING' as const,
     paperDecision: 'RUNNING' as const,
     social: 'RUNNING' as const,
   };
@@ -1783,7 +1943,7 @@ void test('snapshots a dynamic pipeline provider exactly once without retaining 
   original.pumpfun = 'RUNNING';
   assert.equal(providerCalls, 1);
   assert.deepEqual(health.pipeline, {
-    pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   assert.ok(Object.isFrozen(health.pipeline));
   assert.notEqual(health.pipeline, original);

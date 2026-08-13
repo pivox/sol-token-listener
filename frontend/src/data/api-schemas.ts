@@ -417,7 +417,12 @@ const healthSchema = z.object({
     pumpfun: z.enum(['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED']),
     pumpswap: z.enum(['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED']),
     paperDecision: z.enum(['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED']),
+    qualification: z.enum(['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED']),
     social: z.enum(['IDLE', 'RUNNING', 'DEGRADED', 'STOPPED']),
+  }).loose(),
+  qualification: z.object({
+    currentCount: countSchema,
+    lastSuccessAt: timestampSchema.nullable(),
   }).loose(),
   socialJobs: jobCountsSchema,
   paperDecisionJobs: jobCountsSchema.extend({

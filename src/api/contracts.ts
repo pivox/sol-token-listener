@@ -440,6 +440,7 @@ export interface ApiHealth {
   readonly postgresql: ApiHealthDependency;
   readonly http: ApiHealthDependency;
   readonly pipeline: ApiPipelineHealth;
+  readonly qualification: ApiQualificationHealth;
   readonly socialJobs: ApiSocialJobHealth;
   readonly paperDecisionJobs: ApiPaperDecisionJobHealth;
   readonly checkpoints: ApiCheckpoints;
@@ -454,8 +455,14 @@ export interface ApiHealthDependency {
 export interface ApiPipelineHealth {
   readonly pumpfun: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly pumpswap: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+  readonly qualification: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly paperDecision: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
   readonly social: 'IDLE' | 'RUNNING' | 'DEGRADED' | 'STOPPED';
+}
+
+export interface ApiQualificationHealth {
+  readonly currentCount: number;
+  readonly lastSuccessAt: string | null;
 }
 
 export interface ApiSocialJobHealth {

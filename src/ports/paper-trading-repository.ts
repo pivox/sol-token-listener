@@ -2,6 +2,7 @@ import type {
   PaperPosition,
   PaperPositionClosedEventV1,
   PaperPositionOpenedEventV1,
+  PaperCurrentQualificationIdentity,
   PaperStrategyIdentity,
   PaperTrade,
 } from '../domain/paper-trading.js';
@@ -13,6 +14,7 @@ export type PaperConfirmationObservation = Pick<
 >;
 
 export interface PaperTradingTransaction {
+  requireCurrentQualification(identity:PaperCurrentQualificationIdentity):Promise<void>;
   findPosition(id: string): Promise<PaperPosition | null>;
   findActivePosition(
     mint: string,

@@ -38,6 +38,12 @@ export interface PaperStrategyIdentity {
   readonly version: number;
 }
 
+export interface PaperCurrentQualificationIdentity {
+  readonly mint:string;
+  readonly reportId:string;
+  readonly qualificationEventId:string;
+}
+
 export interface PaperPosition {
   readonly id: string;
   readonly mint: string;
@@ -88,6 +94,7 @@ export interface OpenPaperPositionCommand {
   readonly strategySessionId?: string;
   readonly qualificationReportId?: string;
   readonly candidateId?: string;
+  readonly expectedCurrentQualification?:PaperCurrentQualificationIdentity;
 }
 
 export interface ClosePaperPositionCommand {
@@ -124,6 +131,7 @@ export type PaperTradingErrorCode =
   | 'QUALIFICATION_INVALID'
   | 'QUALIFICATION_NOT_ACCEPTED'
   | 'QUALIFICATION_BLOCKED'
+  | 'QUALIFICATION_NOT_CURRENT'
   | 'QUOTE_MINT_NOT_ALLOWED'
   | 'QUOTE_INVALID'
   | 'ROUND_TRIP_LOSS_EXCEEDED'

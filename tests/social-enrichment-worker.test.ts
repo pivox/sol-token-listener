@@ -21,17 +21,54 @@ const NOW = 1_786_300_000_000;
 
 void test('resolves and completes one enrichment outside the Solana path', async () => {
   const repository = new ScriptedRepository([claimedJob(), null]);
+  const projection = new FakeProjection(repository.operations);
   const worker = new SocialEnrichmentWorker(
     repository,
     metadataProvider(resolved()),
     passthroughSocialProvider(),
+    projection,
     options(),
     new ManualScheduler(),
   );
   assert.deepEqual(await worker.runOnce(), { kind: 'completed', jobId: 'social-job-1' });
+  assert.deepEqual(repository.operations, ['persist','project','complete']);
+  assert.deepEqual(projection.calls, [MINT]);
   assert.equal(repository.completions.length, 1);
   assert.equal(repository.failures.length, 0);
   assert.equal(repository.completions[0]?.result.status, 'RESOLVED');
+});
+
+void test('replays persisted evidence after projection failure without calling providers twice', async () => {
+  const operations:string[]=[];
+  const repository = new ScriptedRepository([
+    claimedJob(),
+    claimedJob({ evidencePersisted:true,attempts:1,attemptsInCycle:1 }),
+  ],operations);
+  let metadataCalls=0;
+  let socialCalls=0;
+  const projection=new FakeProjection(operations);
+  projection.fail=true;
+  const worker = new SocialEnrichmentWorker(
+    repository,
+    { resolve:async()=>{metadataCalls+=1;return resolved();} },
+    { collect:async(input)=>{socialCalls+=1;return providerResult(input.metadataSnapshot);} },
+    projection,
+    options(),
+    new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind:'failed',jobId:'social-job-1' });
+  projection.fail=false;
+  assert.deepEqual(await worker.runOnce(), { kind:'completed',jobId:'social-job-1' });
+
+  assert.equal(metadataCalls,1);
+  assert.equal(socialCalls,1);
+  assert.equal(repository.persisted.length,1);
+  assert.equal(repository.releases,1);
+  assert.equal(repository.completions.length,1);
+  assert.deepEqual(operations,[
+    'persist','project','release','project','complete',
+  ]);
 });
 
 void test('completes missing URI and permanent metadata failures without social fetch', async () => {
@@ -52,7 +89,7 @@ void test('completes missing URI and permanent metadata failures without social 
         socialCalls += 1;
         throw new Error('social provider must not run');
       },
-    }, options(), new ManualScheduler());
+    }, new FakeProjection(), options(), new ManualScheduler());
     assert.equal((await worker.runOnce()).kind, 'completed');
     assert.equal(metadataCalls, scenario.job.metadataUri === null ? 0 : 1);
     assert.equal(socialCalls, 0);
@@ -66,6 +103,7 @@ void test('retries typed transient metadata failure without partial completion',
     repository,
     metadataProvider(failed(true)),
     passthroughSocialProvider(),
+    new FakeProjection(),
     options(),
     new ManualScheduler(),
   );
@@ -101,6 +139,7 @@ void test('retries transient social fetches and carries explicit terminal eviden
       }),
     })),
     social,
+    new FakeProjection(),
     options(),
     new ManualScheduler(),
   );
@@ -112,6 +151,139 @@ void test('retries transient social fetches and carries explicit terminal eviden
   assert.equal(repository.failures[0]?.terminalResult?.collection.status, 'FAILED');
 });
 
+void test('refreshes qualification before acknowledging exhausted failed evidence',async()=>{
+  const repository=new ScriptedRepository([claimedJob({ maxAttempts:1 })]);
+  const projection=new FakeProjection(repository.operations);
+  const worker=new SocialEnrichmentWorker(
+    repository,metadataProvider(failed(true)),passthroughSocialProvider(),projection,
+    options(),new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
+  assert.deepEqual(repository.operations,['persist','project','complete']);
+  assert.equal(repository.failures.length,0);
+  assert.equal(repository.persisted[0]?.result.collection.status,'FAILED');
+});
+
+void test('stops renewal and reclaims durable resolved evidence after persist response loss',async()=>{
+  const scheduler=new ManualScheduler();
+  const repository=new ScriptedRepository([
+    claimedJob(),
+    claimedJob({ evidencePersisted:true,attempts:2,attemptsInCycle:1,leaseToken:'lease-2' }),
+  ]);
+  const persistResponse=deferred<undefined>();
+  repository.persistResponse=persistResponse.promise;
+  let metadataCalls=0;
+  let socialCalls=0;
+  const worker=new SocialEnrichmentWorker(
+    repository,
+    { resolve:async()=>{metadataCalls+=1;return resolved();} },
+    { collect:async(input)=>{socialCalls+=1;return providerResult(input.metadataSnapshot);} },
+    new FakeProjection(repository.operations),options(),scheduler,
+  );
+
+  const first=worker.runOnce();
+  await scheduler.waitForScheduled();
+  await waitUntil(()=>repository.persisted.length===1);
+  await scheduler.fireNext();
+  assert.equal(repository.renewals.length,1);
+  assert.equal(scheduler.activeCount,1);
+  persistResponse.reject(new Error('response lost after commit'));
+
+  assert.deepEqual(await first,{ kind:'failed',jobId:'social-job-1' });
+  assert.equal(repository.persistFailureReleases,1);
+  assert.equal(scheduler.activeCount,0);
+  assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
+  assert.equal(metadataCalls,1);
+  assert.equal(socialCalls,1);
+  assert.equal(repository.persisted.length,1);
+  assert.equal(repository.renewals.length,1);
+  assert.equal(scheduler.activeCount,0);
+});
+
+void test('stops renewal and reclaims durable terminal evidence after persist response loss',async()=>{
+  const scheduler=new ManualScheduler();
+  const repository=new ScriptedRepository([
+    claimedJob({ maxAttempts:1 }),
+    claimedJob({
+      maxAttempts:1,evidencePersisted:true,attempts:2,attemptsInCycle:1,leaseToken:'lease-2',
+    }),
+  ]);
+  const persistResponse=deferred<undefined>();
+  repository.persistResponse=persistResponse.promise;
+  let metadataCalls=0;
+  const worker=new SocialEnrichmentWorker(
+    repository,
+    { resolve:async()=>{metadataCalls+=1;return failed(true);} },
+    passthroughSocialProvider(),new FakeProjection(repository.operations),options(),scheduler,
+  );
+
+  const first=worker.runOnce();
+  await scheduler.waitForScheduled();
+  await waitUntil(()=>repository.persisted.length===1);
+  await scheduler.fireNext();
+  persistResponse.reject(new Error('terminal persist response lost'));
+
+  assert.deepEqual(await first,{ kind:'failed',jobId:'social-job-1' });
+  assert.equal(repository.persisted[0]?.terminalFailure?.code,'HTTP_TRANSIENT');
+  assert.equal(repository.persisted[0]?.result.collection.status,'FAILED');
+  assert.equal(repository.persistFailureReleases,1);
+  assert.equal(scheduler.activeCount,0);
+  assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
+  assert.equal(metadataCalls,1);
+  assert.equal(repository.persisted.length,1);
+  assert.equal(repository.renewals.length,1);
+  assert.equal(scheduler.activeCount,0);
+});
+
+void test('opens a bounded provider cycle after the last successful result persist rolls back',async()=>{
+  const scheduler=new ManualScheduler();
+  const repository=new ScriptedRepository([
+    claimedJob({ maxAttempts:1 }),
+    claimedJob({ attempts:2,attemptsInCycle:1,maxAttempts:1,leaseToken:'lease-2' }),
+  ]);
+  repository.persistResponse=Promise.reject(new Error('persist rolled back'));
+  let metadataCalls=0;
+  let socialCalls=0;
+  const worker=new SocialEnrichmentWorker(
+    repository,
+    { resolve:async()=>{metadataCalls+=1;return resolved();} },
+    { collect:async(input)=>{socialCalls+=1;return providerResult(input.metadataSnapshot);} },
+    new FakeProjection(repository.operations),options(),scheduler,
+  );
+
+  assert.deepEqual(await worker.runOnce(),{ kind:'failed',jobId:'social-job-1' });
+  assert.equal(repository.persistFailureReleases,1);
+  assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
+  assert.equal(metadataCalls,2);
+  assert.equal(socialCalls,2);
+  assert.equal(repository.persisted.length,2);
+  assert.equal(scheduler.activeCount,0);
+});
+
+void test('opens a bounded provider cycle after last terminal evidence persist rolls back',async()=>{
+  const scheduler=new ManualScheduler();
+  const repository=new ScriptedRepository([
+    claimedJob({ maxAttempts:1 }),
+    claimedJob({ attempts:2,attemptsInCycle:1,maxAttempts:1,leaseToken:'lease-2' }),
+  ]);
+  repository.persistResponse=Promise.reject(new Error('terminal evidence rolled back'));
+  let metadataCalls=0;
+  const worker=new SocialEnrichmentWorker(
+    repository,
+    { resolve:async()=>{metadataCalls+=1;return failed(true);} },
+    passthroughSocialProvider(),new FakeProjection(repository.operations),options(),scheduler,
+  );
+
+  assert.deepEqual(await worker.runOnce(),{ kind:'failed',jobId:'social-job-1' });
+  assert.equal(repository.persistFailureReleases,1);
+  assert.deepEqual(await worker.runOnce(),{ kind:'completed',jobId:'social-job-1' });
+  assert.equal(metadataCalls,2);
+  assert.equal(repository.persisted.length,2);
+  assert.equal(repository.persisted[1]?.result.collection.status,'FAILED');
+  assert.equal(scheduler.activeCount,0);
+});
+
 void test('redacts thrown provider details into a stable retryable failure', async () => {
   const repository = new ScriptedRepository([claimedJob()]);
   const secret = 'https://user:secret@example.test/private';
@@ -119,6 +291,7 @@ void test('redacts thrown provider details into a stable retryable failure', asy
     repository,
     metadataProvider(resolved()),
     { collect: async () => { throw new Error(secret); } },
+    new FakeProjection(),
     options(),
     new ManualScheduler(),
   );
@@ -136,6 +309,7 @@ void test('renews an in-flight lease and suppresses completion after lease loss'
     repository,
     metadataProvider(resolved()),
     { collect: async () => pending.promise },
+    new FakeProjection(),
     options(),
     scheduler,
   );
@@ -155,6 +329,7 @@ void test('starts idempotently, polls serially and closes without timers', async
     repository,
     metadataProvider(resolved()),
     passthroughSocialProvider(),
+    new FakeProjection(),
     options(),
     scheduler,
   );
@@ -181,7 +356,7 @@ void test('rejects hostile job and provider accessors without invoking getters',
   const jobRepository = new ScriptedRepository([hostileJob]);
   const jobWorker = new SocialEnrichmentWorker(
     jobRepository, metadataProvider(resolved()), passthroughSocialProvider(),
-    options(), new ManualScheduler(),
+    new FakeProjection(), options(), new ManualScheduler(),
   );
   await assert.rejects(jobWorker.runOnce());
   assert.equal(getterCalls, 0);
@@ -193,7 +368,7 @@ void test('rejects hostile job and provider accessors without invoking getters',
   })) as MetadataResolution;
   const providerWorker = new SocialEnrichmentWorker(
     providerRepository, metadataProvider(hostileResolution), passthroughSocialProvider(),
-    options(), new ManualScheduler(),
+    new FakeProjection(), options(), new ManualScheduler(),
   );
   assert.equal((await providerWorker.runOnce()).kind, 'failed');
   assert.equal(getterCalls, 0);
@@ -214,6 +389,7 @@ void test('rejects hostile job and provider accessors without invoking getters',
     nestedRepository,
     metadataProvider(resolved()),
     { collect: async () => Object.freeze({ ...good, metadataSnapshot: hostileSnapshot }) },
+    new FakeProjection(),
     options(),
     new ManualScheduler(),
   );
@@ -229,6 +405,7 @@ void test('degrades bounded shutdown and abandons the unresolved lease without t
     repository,
     metadataProvider(resolved()),
     { collect: async () => pending.promise },
+    new FakeProjection(),
     Object.freeze({ ...options(), shutdownTimeoutMs: 5 }),
     scheduler,
   );
@@ -244,6 +421,11 @@ void test('degrades bounded shutdown and abandons the unresolved lease without t
 });
 
 class ScriptedRepository implements SocialEvidenceRepository {
+  readonly persisted: {
+    readonly job: ClaimedSocialJob;
+    readonly result: SocialJobResult;
+    readonly terminalFailure?: SocialJobFailure;
+  }[] = [];
   readonly completions: { readonly job: ClaimedSocialJob; readonly result: SocialJobResult }[] = [];
   readonly failures: {
     readonly job: ClaimedSocialJob;
@@ -252,8 +434,14 @@ class ScriptedRepository implements SocialEvidenceRepository {
   }[] = [];
   readonly renewals: readonly unknown[] = [];
   public renewResult = true;
+  public persistResponse:Promise<void>|null=null;
+  public persistFailureReleases=0;
+  public releases = 0;
 
-  public constructor(private readonly claims: (ClaimedSocialJob | null)[]) {}
+  public constructor(
+    private readonly claims: (ClaimedSocialJob | null)[],
+    readonly operations:string[] = [],
+  ) {}
 
   public async claim(): Promise<ClaimedSocialJob | null> {
     return this.claims.shift() ?? null;
@@ -262,8 +450,35 @@ class ScriptedRepository implements SocialEvidenceRepository {
     (this.renewals as unknown[]).push(Object.freeze(args));
     return this.renewResult;
   }
-  public async complete(job: ClaimedSocialJob, result: SocialJobResult): Promise<void> {
-    this.completions.push(Object.freeze({ job, result }));
+  public async persist(
+    job: ClaimedSocialJob,
+    result: SocialJobResult,
+    terminalFailure?:SocialJobFailure,
+  ): Promise<void> {
+    this.operations.push('persist');
+    this.persisted.push(Object.freeze(
+      terminalFailure===undefined?{ job,result }:{ job,result,terminalFailure },
+    ));
+    if(this.persistResponse!==null){
+      const response=this.persistResponse;
+      this.persistResponse=null;
+      await response;
+    }
+  }
+  public async complete(job: ClaimedSocialJob): Promise<void> {
+    this.operations.push('complete');
+    const persisted=this.persisted.at(-1);
+    assert.ok(persisted);
+    this.completions.push(Object.freeze({ job,result:persisted.result }));
+  }
+  public async release(): Promise<boolean> {
+    this.operations.push('release');this.releases+=1;
+    return true;
+  }
+  public async releaseAfterPersistFailure():Promise<boolean>{
+    this.operations.push('release-persist');
+    this.persistFailureReleases+=1;
+    return true;
   }
   public async fail(
     job: ClaimedSocialJob,
@@ -276,6 +491,16 @@ class ScriptedRepository implements SocialEvidenceRepository {
   }
   public async counts(): Promise<SocialJobCounts> {
     return Object.freeze({ pending: 0, processing: 0, retryableFailed: 0, exhausted: 0 });
+  }
+}
+
+class FakeProjection {
+  readonly calls:string[]=[];
+  public fail=false;
+  public constructor(private readonly operations:string[]=[]){ }
+  public async refresh(mint:string):Promise<void>{
+    this.operations.push('project');this.calls.push(mint);
+    if(this.fail)throw new Error('projection unavailable');
   }
 }
 
@@ -318,7 +543,8 @@ function claimedJob(overrides: Partial<ClaimedSocialJob> = {}): ClaimedSocialJob
   return Object.freeze({
     id: 'social-job-1', mint: MINT, sourceLaunchEventId: 'launch-event-1',
     metadataUri: 'https://metadata.example/token.json', attempts: 1,
-    attemptsInCycle: 1, leaseToken: 'lease-1', leaseExpiresAtMs: NOW + 10_000,
+    attemptsInCycle: 1, maxAttempts:3, evidencePersisted:false,
+    leaseToken: 'lease-1', leaseExpiresAtMs: NOW + 10_000,
     ...overrides,
   });
 }
@@ -370,9 +596,17 @@ async function providerResult(metadataSnapshot: TokenMetadataSnapshot) {
   }));
 }
 
-function deferred<T>(): Readonly<{ promise: Promise<T>; resolve(value: T): void }> {
+function deferred<T>(): Readonly<{
+  promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error:unknown):void;
+}> {
   let resolvePromise: ((value: T) => void) | null = null;
-  const promise = new Promise<T>((resolve) => { resolvePromise = resolve; });
+  let rejectPromise:((error:unknown)=>void)|null=null;
+  const promise = new Promise<T>((resolve,reject) => {
+    resolvePromise = resolve;
+    rejectPromise=reject;
+  });
   return Object.freeze({
     promise,
     resolve(value: T): void {
@@ -380,5 +614,18 @@ function deferred<T>(): Readonly<{ promise: Promise<T>; resolve(value: T): void 
       assert.ok(action);
       action(value);
     },
+    reject(error:unknown):void{
+      const action=rejectPromise;
+      assert.ok(action);
+      action(error);
+    },
   });
+}
+
+async function waitUntil(predicate:()=>boolean):Promise<void>{
+  for(let attempt=0;attempt<20;attempt+=1){
+    if(predicate())return;
+    await new Promise<void>((resolve)=>setImmediate(resolve));
+  }
+  assert.fail('Condition was not reached.');
 }

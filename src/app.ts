@@ -40,6 +40,7 @@ export interface ApplicationDependencies {
     pool: ApplicationPool,
     pipeline: ApiProjectionPipelineStateProvider,
     holderLimits: ApiHolderProjectionLimits,
+    qualificationProfile: QualificationProfileSummary,
   ) => ApiProjectionRepository;
   readonly createEventStreamRepository: (pool: ApplicationPool) => ApiEventStreamRepository;
   readonly createApiServer: (options: ApiServerOptions) => ApplicationServer;
@@ -82,7 +83,7 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
           clusters: config.apiWalletClusterLimit,
           clusterMembers: config.apiWalletClusterMemberLimit,
           totalClusterMembers: config.apiWalletClusterTotalMemberLimit,
-        });
+        }, qualificationEngine.profileSummary);
         const stream = dependencies.createEventStreamRepository(pool);
         server = dependencies.createApiServer({
           host: config.apiHost,
@@ -152,11 +153,12 @@ const productionDependencies: ApplicationDependencies = {
     config,
     pool as ReturnType<typeof getDatabasePool>,
   ),
-  createProjectionRepository: (pool, pipeline, holderLimits) => new PostgresApiProjectionRepository(
+  createProjectionRepository: (pool, pipeline, holderLimits, qualificationProfile) => new PostgresApiProjectionRepository(
     pool as ConstructorParameters<typeof PostgresApiProjectionRepository>[0],
     () => new Date(),
     pipeline,
     holderLimits,
+    qualificationProfile,
   ),
   createEventStreamRepository: (pool) => new PostgresApiEventStreamRepository(
     pool as ConstructorParameters<typeof PostgresApiEventStreamRepository>[0],
@@ -191,6 +193,7 @@ function disabledPipelineState(): ApiProjectionPipelineState {
     httpAvailable: true,
     pumpfun: 'STOPPED',
     pumpswap: 'STOPPED',
+    qualification: 'STOPPED',
     paperDecision: 'STOPPED',
     social: 'STOPPED',
   });

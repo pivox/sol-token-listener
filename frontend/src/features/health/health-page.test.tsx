@@ -36,6 +36,10 @@ describe('technical health page', () => {
     expect(screen.getByText('QUOTE_UNAVAILABLE')).toBeVisible();
     expect(screen.getByLabelText('Pump.fun : RUNNING')).toBeVisible();
     expect(screen.getByLabelText('Paper decision : DEGRADED')).toBeVisible();
+    expect(screen.getByLabelText('Qualification : RUNNING')).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Qualification' })).toBeVisible();
+    expect(screen.getByText('Rapports courants : 2')).toBeVisible();
+    expect(screen.getByText('Indisponible')).toBeVisible();
     expect(screen.getByText(/Backlog : 1/)).toBeVisible();
     expect(document.body).not.toHaveTextContent('secret-rpc');
     expect(document.body).not.toHaveTextContent('database password');

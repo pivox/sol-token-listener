@@ -48,6 +48,8 @@ const canonicalMigrations = Object.freeze([
   '011_transaction_inbox_retry_recovery.sql',
   '012_public_social_evidence.sql',
   '013_paper_e2e.sql',
+  '014_social_persistence_retry.sql',
+  '015_paper_active_session_per_mint.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
@@ -709,7 +711,7 @@ async function readMigrationHistory() {
 }
 
 function assertMigrationHistory(rows) {
-  assertEqual(rows.length, canonicalMigrations.length, 'Migration history does not contain exactly 13 rows.');
+  assertEqual(rows.length, canonicalMigrations.length, 'Migration history does not contain exactly 14 rows.');
   assertEqual(
     JSON.stringify(rows.map(({ version }) => version)),
     JSON.stringify(canonicalMigrations),

@@ -2,9 +2,10 @@ import { createHash } from 'node:crypto';
 import { compareCursors } from '../domain/cursor.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { PaperStrategySessionV1 } from '../domain/paper-strategy.js';
-import type { PaperExecutionQuote } from '../domain/paper-trading.js';
+import { PaperTradingError,type PaperExecutionQuote } from '../domain/paper-trading.js';
 import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
 import type { QuoteAsset } from '../domain/types.js';
+import type { CanonicalQualificationProjection } from '../ports/qualification-projection-repository.js';
 import type {
   ClaimedPaperDecisionJob,
   PaperDecisionFailure,
@@ -14,10 +15,7 @@ import type {
 } from '../ports/paper-decision-repository.js';
 import { PaperQuoteError, type PaperQuoteRouter } from '../ports/paper-quote-router.js';
 import { canonicalStringifyJson } from '../utils/json.js';
-import type {
-  QualificationRebuildInput,
-  RebuiltQualification,
-} from './qualification-rebuild.service.js';
+import type { RebuiltQualification } from './qualification-rebuild.service.js';
 import type {
   TradingCandidateResult,
   TradingCandidateService,
@@ -62,7 +60,7 @@ export class PaperDecisionWorkerError extends Error {
 }
 
 interface QualificationRebuilder {
-  rebuild(input: QualificationRebuildInput): RebuiltQualification;
+  reauthorize(projection: CanonicalQualificationProjection): RebuiltQualification;
 }
 
 interface CandidateBuilder {
@@ -170,12 +168,28 @@ export class PaperDecisionWorker {
     if (
       paperEnabled
       && snapshot.currentSession !== null
-      && (
-        snapshot.asOfEvent.confirmationStatus === 'orphaned'
-        || snapshot.currentSession.state !== 'BUY_PENDING'
-        || snapshot.activePosition !== null
-      )
     ) return this.reconcileExisting(job,lease,snapshot);
+
+    const persisted=snapshot.currentQualification;
+    if (persisted === null) {
+      if (
+        !snapshot.canonicalLaunchActive
+        && snapshot.currentCandidate === null
+        && snapshot.currentDecision === null
+        && snapshot.currentSession === null
+        && snapshot.activePosition === null
+      ) return snapshot.hasPaperLineage
+        ? this.completeObsolete(job,lease)
+        : this.completeNoop(job,lease);
+      return this.fail(job,lease,'RPC_TRANSIENT',true,null);
+    }
+
+    let rebuilt:RebuiltQualification;
+    try {
+      rebuilt=authorizedQualification(this.qualification.reauthorize(persisted),persisted);
+    } catch {
+      return this.fail(job,lease,'DECISION_INVALID',false,null);
+    }
 
     const quoteAsset=snapshot.launch.quoteAssets.find((asset) => (
       this.options.quoteMintAllowlist.includes(asset.mint)
@@ -201,15 +215,8 @@ export class PaperDecisionWorker {
         else reverseSellQuote=null;
       }
     }
-    const upstreamConditions = quoteAsset === null
-      ? Object.freeze([Object.freeze({ code:'UNSUPPORTED_QUOTE_MINT' as const,triggered:true })])
-      : Object.freeze([Object.freeze({ code:'UNSUPPORTED_QUOTE_MINT' as const,triggered:false })]);
-    let rebuilt: RebuiltQualification;
     let candidateResult: TradingCandidateResult;
     try {
-      rebuilt=this.qualification.rebuild({
-        snapshot,buyQuote,reverseSellQuote,upstreamConditions,
-      });
       candidateResult=await this.candidates.create({
         snapshot,report:rebuilt.report,reportId:rebuilt.reportId,
         qualificationEvent:rebuilt.event,evidenceFingerprint:rebuilt.evidenceFingerprint,
@@ -251,7 +258,10 @@ export class PaperDecisionWorker {
           qualification:rebuilt.report,qualificationEvent:rebuilt.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
         });
-      } catch {
+      } catch (error:unknown) {
+        if(isQualificationNotCurrent(error)){
+          return this.fail(job,lease,'RPC_TRANSIENT',true,null);
+        }
         return this.fail(job,lease,'DECISION_INVALID',false,staged);
       }
       return this.complete(job,lease,decision(
@@ -269,20 +279,21 @@ export class PaperDecisionWorker {
   ): Promise<PaperDecisionRunResult> {
     const session=snapshot.currentSession;
     const candidate=snapshot.currentCandidate;
-    const persisted=snapshot.currentDecision;
-    if (session === null || candidate === null || persisted === null) {
+    const decisionSnapshot=snapshot.currentDecision;
+    if (session === null || candidate === null || decisionSnapshot === null) {
       return this.fail(job,lease,'DECISION_INVALID',false,null);
     }
-    const context: RebuiltQualification=Object.freeze({
-      reportId:persisted.reportId,reportEventId:persisted.qualificationEvent.id,
-      evidenceFingerprint:persisted.evidenceFingerprint,
-      evaluation:Object.freeze({
-        evaluatedAtMs:persisted.report.evaluatedAtMs,signals:Object.freeze({}),
-        blockers:Object.freeze([]),calibrationFacts:null,
-      }),report:persisted.report,event:persisted.qualificationEvent,
-    });
+    let context:RebuiltQualification;
+    try {
+      context=authorizedQualification(
+        this.qualification.reauthorize(decisionSnapshot.qualification),
+        decisionSnapshot.qualification,
+      );
+    } catch {
+      return this.fail(job,lease,'DECISION_INVALID',false,null);
+    }
     const candidateResult:TradingCandidateResult=Object.freeze({
-      candidate,event:persisted.candidateEvent,
+      candidate,event:decisionSnapshot.candidateEvent,
     });
     if (
       ['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state)
@@ -292,35 +303,71 @@ export class PaperDecisionWorker {
       )
     ) {
       return this.complete(job,lease,decision(
-        context,candidateResult,session,sessionEvent(session,persisted.candidateEvent),[],'NONE',
+        context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'NONE',
+      ));
+    }
+    if(
+      session.state==='BUY_PENDING'
+      &&snapshot.activePosition===null
+      &&snapshot.asOfEvent.confirmationStatus!=='orphaned'
+    ){
+      let qualificationIsCurrent=false;
+      if(snapshot.currentQualification!==null){
+        try{
+          this.qualification.reauthorize(snapshot.currentQualification);
+          qualificationIsCurrent=canonicalStringifyJson(snapshot.currentQualification)
+            ===canonicalStringifyJson(decisionSnapshot.qualification);
+        }catch{
+          qualificationIsCurrent=false;
+        }
+      }
+      if(!qualificationIsCurrent){
+        return this.fail(job,lease,'RPC_TRANSIENT',true,null);
+      }
+      const staged=decision(
+        context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'OPEN',
+      );
+      if(!await lease.checkpoint())return this.leaseLost(job,lease);
+      try{await this.repository.stageDecision(job,staged);}
+      catch{return this.fail(job,lease,'RPC_TRANSIENT',true,staged);}
+      if(!await lease.checkpoint())return this.leaseLost(job,lease);
+      let opened:ExternalBuysStrategyResult;
+      try{
+        opened=await this.strategy.open({
+          candidate,session,qualification:context.report,qualificationEvent:context.event,
+          maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
+        });
+      }catch(error:unknown){
+        if(isQualificationNotCurrent(error)){
+          return this.fail(job,lease,'RPC_TRANSIENT',true,null);
+        }
+        return this.fail(job,lease,'DECISION_INVALID',false,staged);
+      }
+      return this.complete(job,lease,decision(
+        context,candidateResult,opened.session,opened.sessionEvent,
+        opened.countedExternalBuys,opened.requestedAction,
       ));
     }
     if (snapshot.activePosition === null || session.candidateId !== candidate.id) {
-      const now=this.readNow();
-      const manual=Object.freeze({
-        ...session,state:'MANUAL_REVIEW' as const,reasonCode:'RECONCILIATION_REQUIRED' as const,
-        lastError:Object.freeze({
-          code:'POSITION_NOT_FOUND',message:'Active paper position or candidate is unavailable.',retryable:false,
-        }),updatedAtMs:now,purgeAfterMs:now+14_400_000,
-      });
-      const terminal=decision(
-        context,candidateResult,manual,sessionEvent(manual,persisted.candidateEvent),[],'NONE',
+      const terminal=manualReviewDecision(
+        context,candidateResult,session,decisionSnapshot.candidateEvent,this.readNow(),
       );
       return this.fail(job,lease,'DECISION_INVALID',false,terminal);
     }
     let reconciled:ExternalBuysStrategyResult;
     try {
       const staged=decision(
-        context,candidateResult,session,sessionEvent(session,persisted.candidateEvent),[],'NONE',
+        context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'NONE',
       );
       if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
       await this.repository.stageDecision(job,staged);
       if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
       if (snapshot.asOfEvent.confirmationStatus === 'orphaned') {
-        reconciled=compareCursors(candidate.asOf.cursor,snapshot.asOfEvent.cursor) === 0
+        reconciled=snapshot.asOfEvent.type === 'TokenLaunchDetected'
+          || compareCursors(candidate.asOf.cursor,snapshot.asOfEvent.cursor) === 0
           ? await this.strategy.reconcileSource({
-            candidate,session,qualification:persisted.report,
-            qualificationEvent:persisted.qualificationEvent,
+            candidate,session,qualification:context.report,
+            qualificationEvent:context.event,
             maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
           })
           : await this.strategy.reconcileEvidence({
@@ -331,8 +378,8 @@ export class PaperDecisionWorker {
           });
       } else if (session.state === 'BUY_PENDING') {
         reconciled=await this.strategy.recoverOpen({
-          candidate,session,qualification:persisted.report,
-          qualificationEvent:persisted.qualificationEvent,
+          candidate,session,qualification:context.report,
+          qualificationEvent:context.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
         });
       } else {
@@ -361,6 +408,30 @@ export class PaperDecisionWorker {
   ): Promise<PaperDecisionRunResult> {
     if (!await this.finishLease(lease)) return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
     try { await this.repository.complete(job,value); }
+    catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
+    return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
+  }
+
+  private async completeNoop(
+    job: ClaimedPaperDecisionJob,
+    lease: PaperLeaseGuard,
+  ): Promise<PaperDecisionRunResult> {
+    if (!await this.finishLease(lease)) {
+      return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
+    }
+    try { await this.repository.completeNoop(job); }
+    catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
+    return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
+  }
+
+  private async completeObsolete(
+    job: ClaimedPaperDecisionJob,
+    lease: PaperLeaseGuard,
+  ): Promise<PaperDecisionRunResult> {
+    if (!await this.finishLease(lease)) {
+      return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
+    }
+    try { await this.repository.completeObsolete(job); }
     catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
     return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
   }
@@ -480,6 +551,42 @@ function decision(
     candidateEvent:candidate.event,session,sessionEvent,
     countedExternalBuys:Object.freeze([...countedExternalBuys]),requestedAction,
   });
+}
+
+function authorizedQualification(
+  authorized:RebuiltQualification,
+  persisted:CanonicalQualificationProjection,
+):RebuiltQualification {
+  return Object.freeze({
+    reportId:persisted.reportId,
+    reportEventId:persisted.qualificationEvent.id,
+    evidenceFingerprint:persisted.evidenceFingerprint,
+    evaluation:authorized.evaluation,
+    report:authorized.report,
+    event:persisted.qualificationEvent,
+  });
+}
+
+function isQualificationNotCurrent(error:unknown):boolean{
+  return error instanceof PaperTradingError&&error.code==='QUALIFICATION_NOT_CURRENT';
+}
+
+function manualReviewDecision(
+  qualification:RebuiltQualification,
+  candidate:TradingCandidateResult,
+  session:PaperStrategySessionV1,
+  candidateEvent:DomainEvent,
+  nowMs:number,
+):PaperDecisionResult{
+  const manual=Object.freeze({
+    ...session,state:'MANUAL_REVIEW' as const,reasonCode:'RECONCILIATION_REQUIRED' as const,
+    lastError:Object.freeze({
+      code:'POSITION_NOT_FOUND',message:'Active paper position or candidate is unavailable.',retryable:false,
+    }),updatedAtMs:nowMs,purgeAfterMs:nowMs+14_400_000,
+  });
+  return decision(
+    qualification,candidate,manual,sessionEvent(manual,candidateEvent),[],'NONE',
+  );
 }
 
 function sessionEvent(session:PaperStrategySessionV1,trigger:DomainEvent):DomainEvent {

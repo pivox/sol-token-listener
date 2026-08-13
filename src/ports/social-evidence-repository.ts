@@ -8,6 +8,8 @@ export interface ClaimedSocialJob {
   readonly metadataUri: string | null;
   readonly attempts: number;
   readonly attemptsInCycle: number;
+  readonly maxAttempts: number;
+  readonly evidencePersisted: boolean;
   readonly leaseToken: string;
   readonly leaseExpiresAtMs: number;
 }
@@ -40,7 +42,17 @@ export interface SocialJobCounts {
 export interface SocialEvidenceRepository {
   claim(options: Readonly<{ leaseMs: number; nowMs: number }>): Promise<ClaimedSocialJob | null>;
   renew(jobId: string, leaseToken: string, leaseMs: number, nowMs: number): Promise<boolean>;
-  complete(job: ClaimedSocialJob, result: SocialJobResult): Promise<void>;
+  persist(
+    job: ClaimedSocialJob,
+    result: SocialJobResult,
+    terminalFailure?: SocialJobFailure,
+  ): Promise<void>;
+  complete(job: ClaimedSocialJob): Promise<void>;
+  release(job: ClaimedSocialJob, failure: SocialJobFailure): Promise<boolean>;
+  releaseAfterPersistFailure(
+    job: ClaimedSocialJob,
+    failure: SocialJobFailure,
+  ): Promise<boolean>;
   fail(
     job: ClaimedSocialJob,
     failure: SocialJobFailure,

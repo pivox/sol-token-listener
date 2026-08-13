@@ -8,7 +8,10 @@ import type { PaperPosition } from '../domain/paper-trading.js';
 import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
 import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
 import type { SocialEvidenceCollectionV1 } from '../domain/social-evidence.js';
-import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
+import type {
+  QualificationProfileIdentity,
+  TradingCandidateV1,
+} from '../domain/trading-candidate.js';
 import type { ChainConfirmationStatus, TokenLaunch } from '../domain/types.js';
 import type {
   WalletCluster,
@@ -25,7 +28,14 @@ import type {
   PaperDecisionResult,
   PaperDecisionSnapshot,
 } from '../ports/paper-decision-repository.js';
-import { canonicalStringifyJson, fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
+import type { CanonicalQualificationProjection } from '../ports/qualification-projection-repository.js';
+import {
+  canonicalStringifyJson,
+  fromJsonValue,
+  MAX_CANONICAL_JSON_TEXT_BYTES,
+  stringifyJson,
+  toJsonValue,
+} from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 
 interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number | null }
@@ -60,10 +70,12 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
   private readonly baseDelayMs: number;
   private readonly retentionMs: number;
   private readonly clock: () => number;
+  private readonly qualificationProfile: QualificationProfileIdentity;
 
   public constructor(
     private readonly pool: Pool = getDatabasePool(),
     options: PaperDecisionRepositoryOptions = {},
+    qualificationProfile: QualificationProfileIdentity,
   ) {
     this.maxAttempts = options.maxAttempts ?? 5;
     this.baseDelayMs = options.baseDelayMs ?? 500;
@@ -73,6 +85,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     if (retentionHours !== 4) throw new RangeError('Paper decision retention must be four hours.');
     this.retentionMs = retentionHours * 3_600_000;
     this.clock = options.clock ?? Date.now;
+    this.qualificationProfile = snapshotQualificationProfile(qualificationProfile);
   }
 
   public async enqueue(input: PaperDecisionJobInput): Promise<void> {
@@ -228,6 +241,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       await lockMint(client, job.mint);
+      await lockQualificationMint(client,job.mint);
       await assertActiveLease(client, job);
       const sourceResult = await client.query(
         'SELECT * FROM domain_events WHERE event_id=$1 AND mint=$2',
@@ -235,7 +249,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       );
       const asOfEvent = decodeDomainEvent(requiredRow(sourceResult, 'Source event is missing.'));
       const includeOrphaned = asOfEvent.confirmationStatus === 'orphaned';
-      const launch = await loadLaunch(client, job.mint, includeOrphaned);
+      const launchSnapshot = await loadLaunch(client, job.mint, includeOrphaned);
       const metadata = await latestMetadata(client, job.mint);
       const social = await latestPayload<SocialEvidenceCollectionV1>(client,
         `SELECT payload #> '{collection}' AS payload FROM domain_events
@@ -247,6 +261,12 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       const holderSnapshot = await latestPayload<HolderDistribution>(client,
         'SELECT payload FROM token_holders_snapshots WHERE mint=$1 ORDER BY observed_at DESC,snapshot_id DESC LIMIT 1',job.mint);
       const walletGraph = await latestWalletGraph(client, job.mint);
+      const currentQualification = await loadQualification(
+        client,
+        job.mint,
+        true,
+        this.qualificationProfile,
+      );
       let candidate = await loadCandidate(client, job, includeOrphaned);
       const session = await loadSession(client, job, candidate, includeOrphaned);
       if (includeOrphaned && candidate === null && session !== null) {
@@ -257,12 +277,15 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         : await loadCurrentDecision(client, candidate.id, includeOrphaned);
       const launchTrades = await activeLaunchTrades(client, job.mint, session);
       const marketTrades = await activeMarketTrades(client, job.mint, session);
-      const position = await loadPosition(client, job.mint, session);
+      const position = await loadPosition(client, job, session, includeOrphaned);
+      const hasPaperLineage = await paperLineageExists(client,job.mint);
       await client.query('COMMIT');
       return deepFreeze({
-        mint: job.mint,asOfEvent,launch,metadata,social,creatorProfile,holderSnapshot,
+        mint: job.mint,asOfEvent,canonicalLaunchActive:launchSnapshot.canonicalLaunchActive,
+        hasPaperLineage,launch:launchSnapshot.launch,metadata,social,creatorProfile,holderSnapshot,
         walletGraph,activeLaunchTrades: launchTrades,activeMarketTrades: marketTrades,
-        currentCandidate: candidate,currentDecision,currentSession: session,activePosition: position,
+        currentQualification,currentCandidate: candidate,currentDecision,
+        currentSession: session,activePosition: position,
       });
     } catch (error: unknown) {
       await rollback(client);
@@ -281,6 +304,77 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     await this.persist(job, result, true, 'complete');
   }
 
+  public async completeNoop(job: ClaimedPaperDecisionJob): Promise<void> {
+    await this.completeWithoutDecision(job,false);
+  }
+
+  public async completeObsolete(job: ClaimedPaperDecisionJob): Promise<void> {
+    await this.completeWithoutDecision(job,true);
+  }
+
+  private async completeWithoutDecision(
+    job: ClaimedPaperDecisionJob,
+    allowUnrelatedLineage: boolean,
+  ): Promise<void> {
+    assertClaim(job);
+    const client = await this.connect('complete');
+    try {
+      await client.query('BEGIN');
+      await lockMint(client,job.mint);
+      await lockQualificationMint(client,job.mint);
+      const nowMs=this.clock();
+      timestamp(nowMs,'clock');
+      const lineagePredicate=allowUnrelatedLineage
+        ? exactPaperLineagePredicate('job')
+        : `NOT EXISTS (SELECT 1 FROM trading_candidates WHERE mint=job.mint)
+          AND NOT EXISTS (SELECT 1 FROM paper_strategy_sessions WHERE mint=job.mint)
+          AND NOT EXISTS (SELECT 1 FROM paper_positions WHERE mint=job.mint)`;
+      const completed=await client.query(`UPDATE paper_decision_jobs job SET
+        status='COMPLETED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+        error_code=NULL,retry_exhausted_at=NULL,terminal_at=$3,purge_after=$4,updated_at=$3
+        WHERE job.job_id=$1 AND job.lease_token=$2 AND job.status='PROCESSING'
+          AND job.source_confirmation_status='orphaned'
+          AND EXISTS (
+            SELECT 1 FROM domain_events source
+            JOIN raw_chain_events raw ON raw.event_id=job.source_raw_event_id
+            WHERE source.event_id=job.source_event_id AND source.mint=job.mint
+              AND source.raw_event_id=raw.event_id AND raw.mint=job.mint
+              AND source.confirmation_status='orphaned'
+              AND raw.confirmation_status='orphaned'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM domain_events launch
+            WHERE launch.mint=job.mint AND launch.type='TokenLaunchDetected'
+              AND launch.confirmation_status<>'orphaned'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM qualification_reports report
+            JOIN domain_events qualification
+              ON qualification.event_id=report.qualification_event_id
+            JOIN domain_events source ON source.event_id=report.source_event_id
+              AND source.raw_event_id=report.source_raw_event_id
+            JOIN raw_chain_events raw ON raw.event_id=report.source_raw_event_id
+            WHERE report.mint=job.mint AND report.superseded_at IS NULL
+              AND report.profile_id=$5 AND report.profile_version=$6
+              AND report.profile_fingerprint=$7
+              AND qualification.confirmation_status<>'orphaned'
+              AND source.confirmation_status<>'orphaned'
+              AND raw.confirmation_status<>'orphaned'
+          )
+          AND ${lineagePredicate}`,[
+        job.jobId,job.leaseToken,new Date(nowMs),new Date(nowMs+this.retentionMs),
+        this.qualificationProfile.id,this.qualificationProfile.version,
+        this.qualificationProfile.fingerprint,
+      ]);
+      if(completed.rowCount!==1)throw new PaperDecisionLeaseLostError();
+      await client.query('COMMIT');
+    } catch(error:unknown) {
+      await rollback(client);
+      if(error instanceof PaperDecisionLeaseLostError)throw error;
+      throw repositoryError('complete',error);
+    } finally { release(client); }
+  }
+
   public async fail(job: ClaimedPaperDecisionJob, failure: PaperDecisionFailure): Promise<void> {
     assertClaim(job);
     assertFailure(failure);
@@ -289,6 +383,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       await lockMint(client, job.mint);
+      await lockQualificationMint(client,job.mint);
       const selected = await client.query(`SELECT status,lease_token,lease_expires_at,
         attempts_in_cycle,max_attempts,base_delay_ms FROM paper_decision_jobs
         WHERE job_id=$1 FOR UPDATE`, [job.jobId]);
@@ -307,7 +402,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
           job.jobId,job.leaseToken,new Date(nowMs + delay),failure.code,new Date(nowMs),
         ]);
       } else {
-        if (failure.terminalResult !== null) await writeDecision(client, job, failure.terminalResult);
+        if (failure.terminalResult !== null) {
+          await writeDecision(client, job, failure.terminalResult, this.qualificationProfile);
+        }
         const terminalStatus = failure.terminalResult === null ? 'CANCELLED' : 'COMPLETED';
         await exact(client, `UPDATE paper_decision_jobs SET
           status=$3,lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
@@ -364,13 +461,14 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       await lockMint(client, job.mint);
+      await lockQualificationMint(client,job.mint);
       const selected = await client.query(
         'SELECT status,lease_token,lease_expires_at FROM paper_decision_jobs WHERE job_id=$1 FOR UPDATE',
         [job.jobId],
       );
       const row = requiredRow(selected, 'Paper decision job is missing.');
       if (textField(row, 'status') === 'COMPLETED') {
-        await assertDecisionReplay(client, result);
+        await assertDecisionReplay(client, result, this.qualificationProfile);
         await client.query('COMMIT');
         return;
       }
@@ -385,7 +483,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       ) {
         throw new PaperDecisionLeaseLostError();
       }
-      await writeDecision(client, job, result);
+      await writeDecision(client, job, result, this.qualificationProfile);
       const nowMs = Math.max(result.candidate.createdAtMs, result.session?.updatedAtMs ?? 0);
       if (terminal) {
         await exact(client, `UPDATE paper_decision_jobs SET
@@ -421,43 +519,18 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
   }
 }
 
-async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, result: PaperDecisionResult): Promise<void> {
-  await insertDomainEvent(client, job, result.qualificationEvent);
-  await insertDomainEvent(client, job, result.candidateEvent);
-  if (result.sessionEvent !== null) await insertDomainEvent(client, job, result.sessionEvent);
-  const report = result.report;
+async function writeDecision(
+  client: Client,
+  job: ClaimedPaperDecisionJob,
+  result: PaperDecisionResult,
+  qualificationProfile: QualificationProfileIdentity,
+): Promise<void> {
+  const qualification=await assertPersistedQualification(client,result,qualificationProfile);
   const candidate = result.candidate;
-  const incomingIsCurrent = !await currentProjectionIsNewer(client, candidate);
-  if (incomingIsCurrent) {
-    await client.query(`UPDATE qualification_reports
-      SET superseded_at=GREATEST($4,evaluated_at)
-      WHERE mint=$1 AND profile_id=$2 AND profile_version=$3
-        AND report_id<>$5 AND superseded_at IS NULL`, [
-      job.mint,candidate.qualificationProfile.id,candidate.qualificationProfile.version,
-      new Date(report.evaluatedAtMs),candidate.qualificationReportId,
-    ]);
-  }
-  const reportSupersededAt = incomingIsCurrent ? null : new Date(report.evaluatedAtMs);
-  await client.query(`INSERT INTO qualification_reports (
-    report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
-    profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
-    preparation_score,social_score,onchain_score,total_score,as_of_slot,
-    as_of_transaction_index,as_of_instruction_index,as_of_inner_instruction_index,
-    confirmation_status,evaluated_at,superseded_at,purge_after,payload_version,payload
-  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-    $19,$20,$21,$22,1,$23) ON CONFLICT (report_id) DO NOTHING`, [
-    candidate.qualificationReportId,job.mint,job.sourceEventId,job.sourceRawEventId,
-    result.qualificationEvent.id,candidate.qualificationProfile.id,
-    candidate.qualificationProfile.version,candidate.qualificationProfile.fingerprint,
-    candidate.evidenceFingerprint,report.verdict,report.scores.preparation.score,
-    report.scores.socialAuthenticity.score,report.scores.onchainHealth.score,
-    report.scores.total.score,candidate.asOf.cursor.slot.toString(),
-    candidate.asOf.cursor.transactionIndex,candidate.asOf.cursor.instructionIndex,
-    candidate.asOf.cursor.innerInstructionIndex,candidate.asOf.confirmationStatus,
-    new Date(report.evaluatedAtMs),reportSupersededAt,
-    new Date(report.evaluatedAtMs + 14_400_000),toJsonValue(report),
-  ]);
-  if (incomingIsCurrent) {
+  if(!qualification.existingCandidate){
+    await insertDomainEventWithRaw(
+      client,qualification.projection.sourceRawEventId,result.candidateEvent,
+    );
     await client.query(`UPDATE trading_candidates
       SET superseded_at=GREATEST($4,created_at)
       WHERE mint=$1 AND strategy_id=$2 AND strategy_version=$3
@@ -465,9 +538,7 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
       job.mint,candidate.strategy.id,candidate.strategy.version,
       new Date(candidate.createdAtMs),candidate.id,
     ]);
-  }
-  const candidateSupersededAt = incomingIsCurrent ? null : new Date(candidate.createdAtMs);
-  await client.query(`INSERT INTO trading_candidates (
+    await client.query(`INSERT INTO trading_candidates (
     candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
     strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,quote_decimals,
     quote_token_program,reason_codes,eligible_until,created_at,superseded_at,purge_after,
@@ -479,9 +550,11 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
     candidate.evidenceFingerprint,candidate.asOf.confirmationStatus,candidate.state,candidate.quoteAsset.mint,
     candidate.quoteAsset.decimals,candidate.quoteAsset.tokenProgram,
     stringifyJson(candidate.reasonCodes),date(candidate.eligibleUntilMs),
-    new Date(candidate.createdAtMs),candidateSupersededAt,
+    new Date(candidate.createdAtMs),null,
     new Date(candidate.purgeAfterMs),toJsonValue(candidate),
   ]);
+  }
+  if (result.sessionEvent !== null) await insertDomainEvent(client, job, result.sessionEvent);
   if (result.session !== null && result.sessionEvent !== null) {
     await upsertSession(client, job, result.session, result.sessionEvent.id);
   }
@@ -527,46 +600,89 @@ async function writeDecision(client: Client, job: ClaimedPaperDecisionJob, resul
   }
 }
 
-async function currentProjectionIsNewer(
-  client: Client,
-  candidate: TradingCandidateV1,
-): Promise<boolean> {
-  const result = await client.query(`SELECT report_id,as_of_slot,
-    as_of_transaction_index,as_of_instruction_index,as_of_inner_instruction_index,
-    confirmation_status,evaluated_at
-    FROM qualification_reports
-    WHERE mint=$1 AND profile_id=$2 AND profile_version=$3
-      AND superseded_at IS NULL
-    FOR UPDATE`, [
-    candidate.mint,candidate.qualificationProfile.id,candidate.qualificationProfile.version,
-  ]);
-  const row = result.rows[0];
-  if (row === undefined || textField(row,'report_id') === candidate.qualificationReportId) {
-    return false;
+async function assertPersistedQualification(
+  client:Client,
+  result:PaperDecisionResult,
+  qualificationProfile:QualificationProfileIdentity,
+):Promise<Readonly<{
+  existingCandidate:boolean;
+  projection:CanonicalQualificationProjection;
+}>>{
+  const candidate=result.candidate;
+  const existing=await client.query(`SELECT candidate.report_id,candidate.evidence_fingerprint,
+    candidate.payload,
+    event.event_id AS candidate_event_id,event.type AS candidate_event_type,
+    event.mint AS candidate_event_mint,event.source AS candidate_event_source,
+    event.program AS candidate_event_program,event.signature AS candidate_event_signature,
+    event.slot::text AS candidate_event_slot,
+    event.transaction_index AS candidate_event_transaction_index,
+    event.instruction_index AS candidate_event_instruction_index,
+    event.inner_instruction_index AS candidate_event_inner_instruction_index,
+    event.confirmation_status AS candidate_event_confirmation_status,
+    event.blockchain_time AS candidate_event_blockchain_time,
+    event.observed_at AS candidate_event_observed_at,
+    event.payload_version AS candidate_event_payload_version,
+    event.payload AS candidate_event_payload
+    FROM trading_candidates candidate
+    JOIN domain_events event ON event.event_id=candidate.candidate_event_id
+    WHERE candidate.candidate_id=$1 FOR UPDATE OF candidate,event`,[candidate.id]);
+  const existingRow=existing.rows[0];
+  let projection:CanonicalQualificationProjection|null;
+  if(existingRow===undefined){
+    projection=await loadQualification(client,candidate.mint,true,qualificationProfile);
+  }else{
+    if(
+      textField(existingRow,'report_id')!==candidate.qualificationReportId
+      ||textField(existingRow,'evidence_fingerprint')!==candidate.evidenceFingerprint
+      ||canonicalStringifyJson(decoded(field(existingRow,'payload'),'Candidate payload is invalid.'))
+        !==canonicalStringifyJson(candidate)
+      ||canonicalStringifyJson(decodePrefixedDomainEvent(existingRow,'candidate_event_'))
+        !==canonicalStringifyJson(result.candidateEvent)
+    )throw new TypeError('Persisted paper candidate is invalid.');
+    projection=await loadQualification(client,candidate.qualificationReportId,false,undefined,true);
   }
-  const inner = field(row,'as_of_inner_instruction_index');
-  const currentCursor = Object.freeze({
-    slot:BigInt(textField(row,'as_of_slot')),
-    transactionIndex:integerField(row,'as_of_transaction_index'),
-    instructionIndex:integerField(row,'as_of_instruction_index'),
-    innerInstructionIndex:inner === null ? null : integer(inner,'as_of_inner_instruction_index'),
+  if(projection===null)throw new TypeError('Persisted qualification projection is missing.');
+  assertQualificationMatches(projection,result);
+  if(existingRow===undefined)assertCandidateEvent(result);
+  return Object.freeze({
+    existingCandidate:existingRow!==undefined,
+    projection,
   });
-  const cursorOrder = compareCursors(currentCursor,candidate.asOf.cursor);
-  if (cursorOrder !== 0) return cursorOrder > 0;
-  const currentStatus = textField(row,'confirmation_status') as ChainConfirmationStatus;
-  const confirmationOrder = confirmationRank(currentStatus)
-    - confirmationRank(candidate.asOf.confirmationStatus);
-  if (confirmationOrder !== 0) return confirmationOrder > 0;
-  return dateField(row,'evaluated_at').getTime() > candidate.createdAtMs;
 }
 
-function confirmationRank(status: ChainConfirmationStatus): number {
-  switch (status) {
-    case 'orphaned': return -1;
-    case 'processed': return 0;
-    case 'confirmed': return 1;
-    case 'finalized': return 2;
-  }
+function assertQualificationMatches(
+  projection:CanonicalQualificationProjection,
+  result:PaperDecisionResult,
+):void{
+  const candidate=result.candidate;
+  const profile=projection.report.ruleSet;
+  if(
+    candidate.qualificationReportId!==projection.reportId
+    ||candidate.mint!==projection.qualificationEvent.mint
+    ||candidate.qualificationProfile.id!==profile.id
+    ||candidate.qualificationProfile.version!==profile.version
+    ||candidate.qualificationProfile.fingerprint!==profile.fingerprint
+    ||candidate.evidenceFingerprint!==projection.evidenceFingerprint
+    ||candidate.asOf.eventId!==projection.qualificationEvent.id
+    ||compareCursors(candidate.asOf.cursor,projection.qualificationEvent.cursor)!==0
+    ||candidate.asOf.confirmationStatus!==projection.qualificationEvent.confirmationStatus
+    ||candidate.asOf.observedAtMs!==projection.qualificationEvent.observedAtMs
+    ||canonicalStringifyJson(result.report)!==canonicalStringifyJson(projection.report)
+    ||canonicalStringifyJson(result.qualificationEvent)
+      !==canonicalStringifyJson(projection.qualificationEvent)
+  )throw new TypeError('Paper candidate qualification is not the persisted projection.');
+}
+
+function assertCandidateEvent(result:PaperDecisionResult):void{
+  const event=result.candidateEvent;
+  if(
+    event.type!=='TradingCandidateUpdated'||event.source!=='paper-decision'
+    ||event.mint!==result.candidate.mint||event.payloadVersion!==1
+    ||compareCursors(event.cursor,result.candidate.asOf.cursor)!==0
+    ||event.confirmationStatus!==result.candidate.asOf.confirmationStatus
+    ||canonicalStringifyJson(event.payload)
+      !==canonicalStringifyJson(Object.freeze({ candidate:result.candidate }))
+  )throw new TypeError('Paper candidate event is invalid.');
 }
 
 async function upsertSession(
@@ -653,7 +769,12 @@ async function insertDomainEventWithRaw(
   ]);
 }
 
-async function assertDecisionReplay(client: Client, result: PaperDecisionResult): Promise<void> {
+async function assertDecisionReplay(
+  client: Client,
+  result: PaperDecisionResult,
+  qualificationProfile: QualificationProfileIdentity,
+): Promise<void> {
+  await assertPersistedQualification(client,result,qualificationProfile);
   const persisted = await client.query(`SELECT
     EXISTS(SELECT 1 FROM qualification_reports WHERE report_id=$1) AS report,
     EXISTS(SELECT 1 FROM trading_candidates WHERE candidate_id=$2) AS candidate,
@@ -710,14 +831,21 @@ async function loadLaunch(
   client: Client,
   mint: string,
   includeOrphaned: boolean,
-): Promise<TokenLaunch> {
-  const result = await client.query(`SELECT * FROM domain_events
-    WHERE mint=$1 AND type='TokenLaunchDetected'
-      AND ($2::boolean OR confirmation_status<>'orphaned')
-    ORDER BY slot,transaction_index,instruction_index,
-      COALESCE(inner_instruction_index,-1),event_id LIMIT 1`, [mint,includeOrphaned]);
+): Promise<Readonly<{ launch:TokenLaunch; canonicalLaunchActive:boolean }>> {
+  const result = await client.query(`SELECT launch.*,
+    EXISTS(SELECT 1 FROM domain_events active
+      WHERE active.mint=$1 AND active.type='TokenLaunchDetected'
+        AND active.confirmation_status<>'orphaned') AS canonical_launch_active
+    FROM domain_events launch
+    WHERE launch.mint=$1 AND launch.type='TokenLaunchDetected'
+      AND ($2::boolean OR launch.confirmation_status<>'orphaned')
+    ORDER BY launch.slot,launch.transaction_index,launch.instruction_index,
+      COALESCE(launch.inner_instruction_index,-1),launch.event_id LIMIT 1`, [mint,includeOrphaned]);
   const event = decodeDomainEvent(requiredRow(result, 'Token launch event is missing.'));
-  return payloadProperty(event.payload, 'launch') as TokenLaunch;
+  return Object.freeze({
+    launch:payloadProperty(event.payload,'launch') as TokenLaunch,
+    canonicalLaunchActive:booleanField(result.rows[0],'canonical_launch_active'),
+  });
 }
 
 async function loadCandidate(
@@ -768,7 +896,8 @@ async function loadSession(
   } else if (includeOrphaned) {
     result=await client.query(`SELECT session.payload FROM paper_strategy_sessions session
       WHERE session.mint=$1 AND (
-        session.session_id IN (
+        session.source_event_id=$3
+        OR session.session_id IN (
           SELECT event.payload #>> '{session,id}' FROM domain_events event
           WHERE event.raw_event_id=$2 AND event.type='PaperStrategySessionUpdated'
         )
@@ -777,13 +906,41 @@ async function loadSession(
           JOIN domain_events source ON source.event_id=evidence.source_event_id
           WHERE source.raw_event_id=$2
         )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          JOIN trading_candidates candidate ON candidate.candidate_id=session.candidate_id
+          JOIN domain_events entry_source ON entry_source.event_id=session.source_event_id
+          WHERE trigger.event_id=$3
+            AND trigger.type IN (
+              'BondingCurveTradeObserved','BondingCurveStateUpdated',
+              'BondingCurveCompleted','MigrationObserved','PumpSwapPoolActivated'
+            )
+            AND session.state IN (
+              'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+              'EXIT_PENDING_QUOTE','SELL_PENDING'
+            )
+            AND candidate.superseded_at IS NULL
+            AND entry_source.confirmation_status<>'orphaned'
+            AND ROW(
+              session.entry_slot,session.entry_transaction_index,
+              session.entry_instruction_index,COALESCE(session.entry_inner_instruction_index,-1)
+            ) < ROW(
+              trigger.slot,trigger.transaction_index,
+              trigger.instruction_index,COALESCE(trigger.inner_instruction_index,-1)
+            )
+        )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          WHERE trigger.event_id=$3 AND trigger.type='TokenLaunchDetected'
+            AND session.state IN (
+              'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+              'EXIT_PENDING_QUOTE','SELL_PENDING'
+            )
+        )
       )
       ORDER BY session.updated_at DESC,session.session_id DESC LIMIT 1`, [
-      job.mint,job.sourceRawEventId,
+      job.mint,job.sourceRawEventId,job.sourceEventId,
     ]);
-    if (result.rows[0] === undefined) {
-      result=await activeSession(client,job.mint);
-    }
   } else {
     result=await activeSession(client,job.mint);
   }
@@ -802,22 +959,183 @@ function activeSession(client: Client, mint: string): Promise<Result> {
 
 async function loadPosition(
   client: Client,
-  mint: string,
+  job: ClaimedPaperDecisionJob,
   session: PaperStrategySessionV1 | null,
+  includeOrphaned: boolean,
 ): Promise<PaperPosition | null> {
-  const result = session === null
-    ? await client.query(`SELECT position.payload FROM paper_positions position
+  const result = session !== null
+    ? await client.query(`SELECT payload FROM paper_positions
+        WHERE mint=$1 AND strategy_session_id=$2
+        ORDER BY opened_at DESC,position_id DESC LIMIT 1`, [job.mint,session.id])
+    : includeOrphaned
+      ? await client.query(`SELECT position.payload FROM paper_positions position
+        WHERE position.mint=$1 AND (
+          position.candidate_id IN (
+            SELECT candidate_id FROM trading_candidates
+            WHERE mint=$1 AND source_event_id=$2
+          )
+          OR position.strategy_session_id IN (
+            SELECT session.session_id FROM paper_strategy_sessions session
+            WHERE session.mint=$1 AND (
+              session.source_event_id=$2
+              OR EXISTS (
+                SELECT 1 FROM domain_events session_event
+                WHERE session_event.event_id=session.session_event_id
+                  AND session_event.raw_event_id=$3
+              )
+            )
+          )
+          OR EXISTS (
+            SELECT 1 FROM domain_events trigger
+            WHERE trigger.event_id=position.trigger_event_id
+              AND trigger.raw_event_id=$3
+          )
+        )
+        ORDER BY position.opened_at DESC,position.position_id DESC LIMIT 1`, [
+        job.mint,job.sourceEventId,job.sourceRawEventId,
+      ])
+      : await client.query(`SELECT position.payload FROM paper_positions position
         JOIN domain_events trigger ON trigger.event_id=position.trigger_event_id
         WHERE position.mint=$1 AND position.status='PAPER_HOLDING'
           AND trigger.confirmation_status<>'orphaned'
-        ORDER BY position.opened_at DESC,position.position_id DESC LIMIT 1`, [mint])
-    : await client.query(`SELECT payload FROM paper_positions
-        WHERE mint=$1 AND strategy_session_id=$2
-        ORDER BY opened_at DESC,position_id DESC LIMIT 1`, [mint,session.id]);
+        ORDER BY position.opened_at DESC,position.position_id DESC LIMIT 1`, [job.mint]);
   const row=result.rows[0];
   return row === undefined
     ? null
     : decoded(field(row,'payload'),'Paper position payload is invalid.') as PaperPosition;
+}
+
+async function paperLineageExists(client:Client,mint:string):Promise<boolean>{
+  const result=await client.query(`SELECT (
+    EXISTS(SELECT 1 FROM trading_candidates WHERE mint=$1)
+    OR EXISTS(SELECT 1 FROM paper_strategy_sessions WHERE mint=$1)
+    OR EXISTS(SELECT 1 FROM paper_positions WHERE mint=$1)
+  ) AS present`,[mint]);
+  return booleanField(requiredRow(result,'Paper lineage result is missing.'),'present');
+}
+
+function exactPaperLineagePredicate(jobAlias:string):string{
+  if(jobAlias!=='job')throw new TypeError('Paper job alias is invalid.');
+  return `NOT EXISTS (
+      SELECT 1 FROM trading_candidates candidate
+      WHERE candidate.mint=${jobAlias}.mint
+        AND candidate.source_event_id=${jobAlias}.source_event_id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM paper_strategy_sessions session
+      WHERE session.mint=${jobAlias}.mint AND (
+        session.source_event_id=${jobAlias}.source_event_id
+        OR session.candidate_id IN (
+          SELECT candidate.candidate_id FROM trading_candidates candidate
+          WHERE candidate.mint=${jobAlias}.mint
+            AND candidate.source_event_id=${jobAlias}.source_event_id
+        )
+        OR EXISTS (
+          SELECT 1 FROM domain_events session_event
+          WHERE session_event.event_id=session.session_event_id
+            AND session_event.raw_event_id=${jobAlias}.source_raw_event_id
+        )
+        OR EXISTS (
+          SELECT 1 FROM paper_external_buy_events evidence
+          JOIN domain_events evidence_source
+            ON evidence_source.event_id=evidence.source_event_id
+          WHERE evidence.session_id=session.session_id
+            AND evidence_source.raw_event_id=${jobAlias}.source_raw_event_id
+        )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          JOIN trading_candidates active_candidate
+            ON active_candidate.candidate_id=session.candidate_id
+          JOIN domain_events entry_source ON entry_source.event_id=session.source_event_id
+          WHERE trigger.event_id=${jobAlias}.source_event_id
+            AND trigger.type IN (
+              'BondingCurveTradeObserved','BondingCurveStateUpdated',
+              'BondingCurveCompleted','MigrationObserved','PumpSwapPoolActivated'
+            )
+            AND session.state IN (
+              'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+              'EXIT_PENDING_QUOTE','SELL_PENDING'
+            )
+            AND active_candidate.superseded_at IS NULL
+            AND entry_source.confirmation_status<>'orphaned'
+            AND ROW(
+              session.entry_slot,session.entry_transaction_index,
+              session.entry_instruction_index,COALESCE(session.entry_inner_instruction_index,-1)
+            ) < ROW(
+              trigger.slot,trigger.transaction_index,
+              trigger.instruction_index,COALESCE(trigger.inner_instruction_index,-1)
+            )
+        )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          WHERE trigger.event_id=${jobAlias}.source_event_id
+            AND trigger.type='TokenLaunchDetected'
+            AND session.state IN (
+              'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+              'EXIT_PENDING_QUOTE','SELL_PENDING'
+            )
+        )
+      )
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM paper_positions position
+      WHERE position.mint=${jobAlias}.mint AND (
+        position.candidate_id IN (
+          SELECT candidate.candidate_id FROM trading_candidates candidate
+          WHERE candidate.mint=${jobAlias}.mint
+            AND candidate.source_event_id=${jobAlias}.source_event_id
+        )
+        OR position.strategy_session_id IN (
+          SELECT session.session_id FROM paper_strategy_sessions session
+          WHERE session.mint=${jobAlias}.mint AND (
+            session.source_event_id=${jobAlias}.source_event_id
+            OR EXISTS (
+              SELECT 1 FROM domain_events session_event
+              WHERE session_event.event_id=session.session_event_id
+                AND session_event.raw_event_id=${jobAlias}.source_raw_event_id
+            )
+            OR EXISTS (
+              SELECT 1 FROM domain_events trigger
+              JOIN trading_candidates active_candidate
+                ON active_candidate.candidate_id=session.candidate_id
+              JOIN domain_events entry_source ON entry_source.event_id=session.source_event_id
+              WHERE trigger.event_id=${jobAlias}.source_event_id
+                AND trigger.type IN (
+                  'BondingCurveTradeObserved','BondingCurveStateUpdated',
+                  'BondingCurveCompleted','MigrationObserved','PumpSwapPoolActivated'
+                )
+                AND session.state IN (
+                  'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+                  'EXIT_PENDING_QUOTE','SELL_PENDING'
+                )
+                AND active_candidate.superseded_at IS NULL
+                AND entry_source.confirmation_status<>'orphaned'
+                AND ROW(
+                  session.entry_slot,session.entry_transaction_index,
+                  session.entry_instruction_index,COALESCE(session.entry_inner_instruction_index,-1)
+                ) < ROW(
+                  trigger.slot,trigger.transaction_index,
+                  trigger.instruction_index,COALESCE(trigger.inner_instruction_index,-1)
+                )
+            )
+            OR EXISTS (
+              SELECT 1 FROM domain_events trigger
+              WHERE trigger.event_id=${jobAlias}.source_event_id
+                AND trigger.type='TokenLaunchDetected'
+                AND session.state IN (
+                  'BUY_PENDING','PAPER_HOLDING','WAITING_EXTERNAL_BUYS',
+                  'EXIT_PENDING_QUOTE','SELL_PENDING'
+                )
+            )
+          )
+        )
+        OR EXISTS (
+          SELECT 1 FROM domain_events trigger
+          WHERE trigger.event_id=position.trigger_event_id
+            AND trigger.raw_event_id=${jobAlias}.source_raw_event_id
+        )
+      )
+    )`;
 }
 
 async function latestPayload<T>(client: Client, sql: string, mint: string): Promise<T | null> {
@@ -826,13 +1144,177 @@ async function latestPayload<T>(client: Client, sql: string, mint: string): Prom
   return row === undefined ? null : decoded(field(row, 'payload'), 'Projection payload is invalid.') as T;
 }
 
+const QUALIFICATION_SELECT = `SELECT report.report_id,report.mint AS report_mint,
+  report.source_event_id,report.source_raw_event_id,report.qualification_event_id,
+  report.profile_id,report.profile_version,report.profile_fingerprint,
+  report.evidence_fingerprint,report.verdict,report.preparation_score,
+  report.social_score,report.onchain_score,report.total_score,
+  report.as_of_slot::text AS as_of_slot,
+  report.as_of_transaction_index,report.as_of_instruction_index,
+  report.as_of_inner_instruction_index,report.confirmation_status AS report_confirmation_status,
+  report.evaluated_at,report.superseded_at,report.purge_after,
+  report.payload_version AS report_payload_version,report.payload AS report_payload,
+  qualification.event_id AS qualification_id,qualification.raw_event_id AS qualification_raw_event_id,
+  qualification.type AS qualification_type,qualification.mint AS qualification_mint,
+  qualification.source AS qualification_source,qualification.program AS qualification_program,
+  qualification.signature AS qualification_signature,qualification.slot::text AS qualification_slot,
+  qualification.transaction_index AS qualification_transaction_index,
+  qualification.instruction_index AS qualification_instruction_index,
+  qualification.inner_instruction_index AS qualification_inner_instruction_index,
+  qualification.confirmation_status AS qualification_confirmation_status,
+  qualification.blockchain_time AS qualification_blockchain_time,
+  qualification.observed_at AS qualification_observed_at,
+  qualification.payload_version AS qualification_payload_version,
+  qualification.payload AS qualification_payload,
+  source.event_id AS source_id,source.raw_event_id AS source_raw_event_id_value,
+  source.type AS source_type,source.mint AS source_mint,source.source AS source_source,
+  source.program AS source_program,source.signature AS source_signature,
+  source.slot::text AS source_slot,source.transaction_index AS source_transaction_index,
+  source.instruction_index AS source_instruction_index,
+  source.inner_instruction_index AS source_inner_instruction_index,
+  source.confirmation_status AS source_confirmation_status,
+  source.blockchain_time AS source_blockchain_time,
+  raw.confirmation_status AS raw_confirmation_status
+  FROM qualification_reports report
+  JOIN domain_events qualification ON qualification.event_id=report.qualification_event_id
+  JOIN domain_events source ON source.event_id=report.source_event_id
+    AND source.raw_event_id=report.source_raw_event_id
+  JOIN raw_chain_events raw ON raw.event_id=report.source_raw_event_id
+    AND raw.source=source.source AND raw.program=source.program AND raw.mint=source.mint
+    AND raw.signature=source.signature AND raw.slot=source.slot
+    AND raw.transaction_index=source.transaction_index
+    AND raw.instruction_index=source.instruction_index
+    AND raw.inner_instruction_index IS NOT DISTINCT FROM source.inner_instruction_index`;
+
+async function loadQualification(
+  client:Client,
+  identity:string,
+  current:boolean,
+  qualificationProfile:QualificationProfileIdentity|undefined,
+  includeOrphaned=false,
+):Promise<CanonicalQualificationProjection|null> {
+  if (current && qualificationProfile === undefined) {
+    throw new TypeError('Effective qualification profile is required.');
+  }
+  const result=current
+    ? await client.query(`${QUALIFICATION_SELECT}
+        WHERE report.mint=$1 AND report.superseded_at IS NULL
+          AND report.profile_id=$2
+          AND report.profile_version=$3
+          AND report.profile_fingerprint=$4
+          AND report.purge_after > clock_timestamp()
+          AND octet_length(report.payload::text)<=${MAX_CANONICAL_JSON_TEXT_BYTES}
+          AND octet_length(qualification.payload::text)<=${MAX_CANONICAL_JSON_TEXT_BYTES}
+          AND qualification.confirmation_status<>'orphaned'
+          AND source.confirmation_status<>'orphaned'
+          AND raw.confirmation_status<>'orphaned'
+          AND qualification.confirmation_status=source.confirmation_status
+          AND source.confirmation_status=raw.confirmation_status
+        ORDER BY report.evaluated_at DESC,report.report_id DESC LIMIT 1`,[
+          identity,
+          qualificationProfile?.id,
+          qualificationProfile?.version,
+          qualificationProfile?.fingerprint,
+        ])
+    : await client.query(`${QUALIFICATION_SELECT}
+        WHERE report.report_id=$1
+          AND octet_length(report.payload::text)<=${MAX_CANONICAL_JSON_TEXT_BYTES}
+          AND octet_length(qualification.payload::text)<=${MAX_CANONICAL_JSON_TEXT_BYTES}
+          AND ($2::boolean OR qualification.confirmation_status<>'orphaned')
+          AND ($2::boolean OR source.confirmation_status<>'orphaned')
+          AND ($2::boolean OR raw.confirmation_status<>'orphaned')`,[identity,includeOrphaned]);
+  const row=result.rows[0];
+  return row===undefined?null:qualificationFromRow(row,!current&&includeOrphaned);
+}
+
+function qualificationFromRow(
+  row:unknown,
+  allowHistoricalOrphan=false,
+):CanonicalQualificationProjection {
+  const report=decoded(
+    field(row,'report_payload'),'Qualification report payload is invalid.',
+  ) as CanonicalQualificationProjection['report'];
+  const storedEvent=decodePrefixedDomainEvent(row,'qualification_');
+  const reportConfirmationValue=textField(row,'report_confirmation_status');
+  if(!['processed','confirmed','finalized','orphaned'].includes(reportConfirmationValue)){
+    throw new TypeError('Stored qualification confirmation is invalid.');
+  }
+  const reportConfirmation=reportConfirmationValue as DomainEvent['confirmationStatus'];
+  const historicalOrphan=allowHistoricalOrphan
+    &&storedEvent.confirmationStatus==='orphaned'
+    &&textField(row,'source_confirmation_status')==='orphaned'
+    &&textField(row,'raw_confirmation_status')==='orphaned';
+  const event=historicalOrphan
+    ?deepFreeze({ ...storedEvent,confirmationStatus:reportConfirmation })
+    :storedEvent;
+  const payload=event.payload;
+  const evaluation=payload.evaluation as CanonicalQualificationProjection['evaluation'];
+  const projection=deepFreeze({
+    reportId:textField(row,'report_id'),sourceEventId:textField(row,'source_event_id'),
+    sourceRawEventId:textField(row,'source_raw_event_id'),
+    evidenceFingerprint:textField(row,'evidence_fingerprint'),evaluation,report,
+    qualificationEvent:event,
+  });
+  const sourceCursor=Object.freeze({
+    slot:BigInt(textField(row,'source_slot')),
+    transactionIndex:integerField(row,'source_transaction_index'),
+    instructionIndex:integerField(row,'source_instruction_index'),
+    innerInstructionIndex:field(row,'source_inner_instruction_index')===null
+      ? null:integerField(row,'source_inner_instruction_index'),
+  });
+  const expectedPayload=Object.freeze({
+    reportId:projection.reportId,evidenceFingerprint:projection.evidenceFingerprint,
+    evaluation:projection.evaluation,report:projection.report,
+  });
+  if (
+    event.type!=='QualificationUpdated'||event.source!=='qualification'
+    ||event.payloadVersion!==1||event.id!==textField(row,'qualification_event_id')
+    ||event.mint!==textField(row,'report_mint')
+    ||event.mint!==textField(row,'source_mint')
+    ||textField(row,'qualification_raw_event_id')!==projection.sourceRawEventId
+    ||projection.sourceEventId!==textField(row,'source_id')
+    ||projection.sourceRawEventId!==textField(row,'source_raw_event_id_value')
+    ||!['TokenLaunchDetected','BondingCurveTradeObserved','BondingCurveStateUpdated',
+      'BondingCurveCompleted','MigrationObserved','PumpSwapPoolActivated']
+      .includes(textField(row,'source_type'))
+    ||event.program!==textField(row,'source_program')
+    ||event.signature!==textField(row,'source_signature')
+    ||compareCursors(event.cursor,sourceCursor)!==0
+    ||event.confirmationStatus!==reportConfirmation
+    ||(!historicalOrphan&&event.confirmationStatus!==textField(row,'source_confirmation_status'))
+    ||(!historicalOrphan&&event.confirmationStatus!==textField(row,'raw_confirmation_status'))
+    ||event.blockchainTimeMs!==(nullableDateField(row,'source_blockchain_time')?.getTime()??null)
+    ||report.ruleSet.id!==textField(row,'profile_id')
+    ||report.ruleSet.version!==integerField(row,'profile_version')
+    ||report.ruleSet.fingerprint!==textField(row,'profile_fingerprint')
+    ||report.verdict!==textField(row,'verdict')
+    ||report.scores.preparation.score!==integerField(row,'preparation_score')
+    ||report.scores.socialAuthenticity.score!==integerField(row,'social_score')
+    ||report.scores.onchainHealth.score!==integerField(row,'onchain_score')
+    ||report.scores.total.score!==integerField(row,'total_score')
+    ||event.cursor.slot!==BigInt(textField(row,'as_of_slot'))
+    ||event.cursor.transactionIndex!==integerField(row,'as_of_transaction_index')
+    ||event.cursor.instructionIndex!==integerField(row,'as_of_instruction_index')
+    ||event.cursor.innerInstructionIndex!==(field(row,'as_of_inner_instruction_index')===null
+      ?null:integerField(row,'as_of_inner_instruction_index'))
+    ||report.evaluatedAtMs!==dateField(row,'evaluated_at').getTime()
+    ||dateField(row,'purge_after').getTime()!==report.evaluatedAtMs+14_400_000
+    ||integerField(row,'report_payload_version')!==1
+    ||canonicalStringifyJson(payload)!==canonicalStringifyJson(expectedPayload)
+  ) throw new TypeError('Stored qualification projection is invalid.');
+  fingerprint(projection.evidenceFingerprint);
+  canonicalStringifyJson(projection);
+  return projection;
+}
+
 async function loadCurrentDecision(
   client: Client,
   candidateId: string,
   includeOrphaned: boolean,
 ): Promise<PaperDecisionSnapshot['currentDecision']> {
-  const result = await client.query(`SELECT report.report_id,report.evidence_fingerprint,
-    report.payload AS report_payload,qualification_event.*,
+  const qualification=await loadQualificationByCandidate(client,candidateId,includeOrphaned);
+  if(qualification===null)return null;
+  const result = await client.query(`SELECT
     candidate_event.event_id AS candidate_event_id,
     candidate_event.type AS candidate_event_type,
     candidate_event.mint AS candidate_event_mint,
@@ -849,25 +1331,54 @@ async function loadCurrentDecision(
     candidate_event.payload_version AS candidate_event_payload_version,
     candidate_event.payload AS candidate_event_payload
     FROM trading_candidates candidate
-    JOIN qualification_reports report ON report.report_id=candidate.report_id
-    JOIN domain_events qualification_event ON qualification_event.event_id=report.qualification_event_id
     JOIN domain_events candidate_event ON candidate_event.event_id=candidate.candidate_event_id
     WHERE candidate.candidate_id=$1
-      AND ($2::boolean OR qualification_event.confirmation_status<>'orphaned')
       AND ($2::boolean OR candidate_event.confirmation_status<>'orphaned')`, [
     candidateId,includeOrphaned,
   ]);
   const row = result.rows[0];
   if (row === undefined) return null;
   return deepFreeze({
-    reportId:textField(row,'report_id'),
-    evidenceFingerprint:textField(row,'evidence_fingerprint'),
-    report:decoded(
-      field(row,'report_payload'),
-      'Qualification report payload is invalid.',
-    ) as NonNullable<PaperDecisionSnapshot['currentDecision']>['report'],
-    qualificationEvent:decodeDomainEvent(row),
+    qualification,
     candidateEvent:decodePrefixedDomainEvent(row,'candidate_event_'),
+  });
+}
+
+async function loadQualificationByCandidate(
+  client:Client,candidateId:string,includeOrphaned:boolean,
+):Promise<CanonicalQualificationProjection|null>{
+  const linked=await client.query(
+    'SELECT report_id FROM trading_candidates WHERE candidate_id=$1',[candidateId],
+  );
+  const row=linked.rows[0];
+  return row===undefined
+    ?null
+    :loadQualification(client,textField(row,'report_id'),false,undefined,includeOrphaned);
+}
+
+function snapshotQualificationProfile(
+  value: unknown,
+): QualificationProfileIdentity {
+  if (
+    typeof value !== 'object'
+    || value === null
+    || Array.isArray(value)
+  ) throw new TypeError('Effective qualification profile identity is invalid.');
+  const profile=value as Partial<QualificationProfileIdentity>;
+  if (
+    typeof profile.id !== 'string'
+    || profile.id.length === 0
+    || Buffer.byteLength(profile.id, 'utf8') > 256
+    || typeof profile.version !== 'number'
+    || !Number.isSafeInteger(profile.version)
+    || profile.version <= 0
+    || typeof profile.fingerprint !== 'string'
+    || !/^[0-9a-f]{64}$/u.test(profile.fingerprint)
+  ) throw new TypeError('Effective qualification profile identity is invalid.');
+  return Object.freeze({
+    id:profile.id,
+    version:profile.version,
+    fingerprint:profile.fingerprint,
   });
 }
 
@@ -1092,6 +1603,7 @@ function payloadProperty(payload: object, key: string): object {
 function decoded(value: unknown, message: string): object {
   const decodedValue = fromJsonValue(value);
   if (typeof decodedValue !== 'object' || decodedValue === null) throw new TypeError(message);
+  canonicalStringifyJson(decodedValue);
   return deepFreeze(decodedValue);
 }
 
@@ -1119,6 +1631,13 @@ function retryDelay(base: number, attempt: number): number {
 
 async function lockMint(client: Client, mint: string): Promise<void> {
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended('paper-decision:' || $1, 0))", [mint]);
+}
+
+async function lockQualificationMint(client:Client,mint:string):Promise<void>{
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended('qualification-projection:' || $1, 0))",
+    [mint],
+  );
 }
 
 async function exact(client: Client, sql: string, values: readonly unknown[]): Promise<void> {

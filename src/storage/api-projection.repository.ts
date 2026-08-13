@@ -69,6 +69,7 @@ import {
 import { MAX_API_PAGE_LIMIT, type ApiProjectionRepository, type PageRequest } from '../ports/api-projection-repository.js';
 import {
   BIGINT_JSON_MARKER,
+  canonicalStringifyJson,
   MAX_SERIALIZED_BIGINT_DIGITS,
   fromJsonValue,
 } from '../utils/json.js';
@@ -92,6 +93,7 @@ export interface ApiProjectionPipelineState {
   readonly httpAvailable: boolean;
   readonly pumpfun: ApiHealth['pipeline']['pumpfun'];
   readonly pumpswap: ApiHealth['pipeline']['pumpswap'];
+  readonly qualification: ApiHealth['pipeline']['qualification'];
   readonly paperDecision: ApiHealth['pipeline']['paperDecision'];
   readonly social: ApiHealth['pipeline']['social'];
 }
@@ -104,6 +106,12 @@ export interface ApiHolderProjectionLimits {
   readonly clusters: number;
   readonly clusterMembers: number;
   readonly totalClusterMembers: number;
+}
+
+export interface ApiQualificationProfileIdentity {
+  readonly id: string;
+  readonly version: number;
+  readonly fingerprint: string;
 }
 
 export class ApiProjectionDataError extends Error {
@@ -163,6 +171,7 @@ const NOT_AVAILABLE_RADAR: LaunchRadarProjection = Object.freeze({
 
 export class PostgresApiProjectionRepository implements ApiProjectionRepository {
   private readonly pipeline: ApiProjectionPipelineStateProvider;
+  private readonly qualificationProfile: ApiQualificationProfileIdentity | null;
 
   public constructor(
     private readonly database: Queryable = getDatabasePool(),
@@ -171,6 +180,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       httpAvailable: false,
       pumpfun: 'STOPPED',
       pumpswap: 'STOPPED',
+      qualification: 'STOPPED',
       paperDecision: 'STOPPED',
       social: 'STOPPED',
     },
@@ -181,6 +191,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       clusterMembers: 50,
       totalClusterMembers: 500,
     },
+    qualificationProfile: ApiQualificationProfileIdentity | null = null,
   ) {
     holderLimit(holderLimits.positions);
     holderLimit(holderLimits.snapshots);
@@ -190,6 +201,9 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
     this.pipeline = typeof pipeline === 'function'
       ? pipeline
       : (): ApiProjectionPipelineState => pipeline;
+    this.qualificationProfile = qualificationProfile === null
+      ? null
+      : qualificationProfileIdentity(qualificationProfile);
   }
 
   public async listLaunches(
@@ -288,18 +302,78 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
   }
 
   public async getLaunchRisk(mint: string): Promise<ApiQualification | null> {
+    const profileClause = this.qualificationProfile === null ? '' : `
+         AND report.profile_id = $2 AND report.profile_version = $3
+         AND report.profile_fingerprint = $4`;
+    const values = this.qualificationProfile === null
+      ? [text(mint)]
+      : [text(mint), this.qualificationProfile.id, this.qualificationProfile.version,
+        this.qualificationProfile.fingerprint];
     const result = await this.database.query(
-      `SELECT payload
-       FROM domain_events
-       WHERE mint = $1 AND type = 'QualificationUpdated'
-         AND confirmation_status <> 'orphaned'
-       ORDER BY slot DESC, transaction_index DESC, instruction_index DESC,
-         COALESCE(inner_instruction_index, -1) DESC, event_id DESC
+      `SELECT report.report_id, report.evidence_fingerprint, report.profile_id,
+         report.profile_version, report.profile_fingerprint, report.verdict,
+         report.preparation_score, report.social_score, report.onchain_score,
+         report.total_score, report.evaluated_at,
+         report.payload_version AS report_payload_version,
+         octet_length(report.payload::text) AS report_payload_size,
+         CASE WHEN octet_length(report.payload::text) <= 1048576 THEN report.payload END AS report_payload,
+         qualification_event.event_id AS qualification_event_id,
+         qualification_event.payload_version AS event_payload_version,
+         octet_length(qualification_event.payload::text) AS event_payload_size,
+         CASE WHEN octet_length(qualification_event.payload::text) <= 1048576
+           THEN qualification_event.payload END AS event_payload
+       FROM qualification_reports AS report
+       JOIN domain_events AS source
+         ON source.event_id = report.source_event_id
+        AND source.raw_event_id = report.source_raw_event_id
+        AND source.mint = report.mint
+        AND source.slot = report.as_of_slot
+        AND source.transaction_index = report.as_of_transaction_index
+        AND source.instruction_index = report.as_of_instruction_index
+        AND source.inner_instruction_index IS NOT DISTINCT FROM report.as_of_inner_instruction_index
+        AND source.type IN (
+          'TokenLaunchDetected', 'BondingCurveTradeObserved',
+          'BondingCurveStateUpdated', 'BondingCurveCompleted',
+          'MigrationObserved', 'PumpSwapPoolActivated'
+        )
+       JOIN raw_chain_events AS raw
+         ON raw.event_id = report.source_raw_event_id
+        AND raw.source = source.source AND raw.program = source.program
+        AND raw.mint = source.mint AND raw.signature = source.signature
+        AND raw.slot = source.slot AND raw.transaction_index = source.transaction_index
+        AND raw.instruction_index = source.instruction_index
+        AND raw.inner_instruction_index IS NOT DISTINCT FROM source.inner_instruction_index
+       JOIN domain_events AS qualification_event
+         ON qualification_event.event_id = report.qualification_event_id
+        AND qualification_event.raw_event_id = report.source_raw_event_id
+        AND qualification_event.mint = report.mint
+        AND qualification_event.type = 'QualificationUpdated'
+        AND qualification_event.source = 'qualification'
+        AND qualification_event.program = source.program
+        AND qualification_event.signature = source.signature
+        AND qualification_event.slot = report.as_of_slot
+        AND qualification_event.transaction_index = report.as_of_transaction_index
+        AND qualification_event.instruction_index = report.as_of_instruction_index
+        AND qualification_event.inner_instruction_index IS NOT DISTINCT FROM report.as_of_inner_instruction_index
+        AND qualification_event.blockchain_time IS NOT DISTINCT FROM source.blockchain_time
+        AND qualification_event.observed_at = report.evaluated_at
+        AND qualification_event.payload_version = 1
+       WHERE report.mint = $1
+         AND report.superseded_at IS NULL
+         AND report.purge_after > clock_timestamp()
+         AND report.confirmation_status <> 'orphaned'
+         AND source.confirmation_status <> 'orphaned'
+         AND raw.confirmation_status <> 'orphaned'
+         AND qualification_event.confirmation_status <> 'orphaned'
+         AND report.confirmation_status = source.confirmation_status
+         AND report.confirmation_status = raw.confirmation_status
+         AND report.confirmation_status = qualification_event.confirmation_status${profileClause}
+       ORDER BY report.evaluated_at DESC, report.report_id DESC
        LIMIT 1`,
-      [text(mint)],
+      values,
     );
     const row = result.rows[0];
-    return row === undefined ? null : qualification(row.payload);
+    return row === undefined ? null : canonicalQualificationRisk(row);
   }
 
   public async getLaunchSocial(mint: string): Promise<ApiSocial | null> {
@@ -398,8 +472,10 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       );
       let socialJobs = emptySocialJobs();
       let paperDecisionJobs = emptyPaperDecisionJobs();
+      let qualification = emptyQualificationHealth();
       let socialCountsAvailable = true;
       let paperCountsAvailable = true;
+      let qualificationCountsAvailable = true;
       try {
         const socialCounts = await this.database.query(
           `SELECT
@@ -434,6 +510,67 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         paperCountsAvailable = false;
         pipeline = freeze({ ...pipeline, paperDecision: 'DEGRADED' });
       }
+      try {
+        const qualificationCounts = await this.database.query(
+          `SELECT COUNT(*)::int AS current_count, MAX(report.evaluated_at) AS last_success_at
+           FROM qualification_reports AS report
+           JOIN domain_events AS source
+             ON source.event_id = report.source_event_id
+            AND source.raw_event_id = report.source_raw_event_id
+            AND source.mint = report.mint
+            AND source.slot = report.as_of_slot
+            AND source.transaction_index = report.as_of_transaction_index
+            AND source.instruction_index = report.as_of_instruction_index
+            AND source.inner_instruction_index
+              IS NOT DISTINCT FROM report.as_of_inner_instruction_index
+            AND source.type IN (
+              'TokenLaunchDetected', 'BondingCurveTradeObserved',
+              'BondingCurveStateUpdated', 'BondingCurveCompleted',
+              'MigrationObserved', 'PumpSwapPoolActivated'
+            )
+           JOIN raw_chain_events AS raw
+             ON raw.event_id = report.source_raw_event_id
+            AND raw.source = source.source
+            AND raw.program = source.program
+            AND raw.mint = source.mint
+            AND raw.signature = source.signature
+            AND raw.slot = source.slot
+            AND raw.transaction_index = source.transaction_index
+            AND raw.instruction_index = source.instruction_index
+            AND raw.inner_instruction_index IS NOT DISTINCT FROM source.inner_instruction_index
+           JOIN domain_events AS qualification_event
+             ON qualification_event.event_id = report.qualification_event_id
+            AND qualification_event.raw_event_id = report.source_raw_event_id
+            AND qualification_event.mint = report.mint
+            AND qualification_event.type = 'QualificationUpdated'
+            AND qualification_event.source = 'qualification'
+            AND qualification_event.program = source.program
+            AND qualification_event.signature = source.signature
+            AND qualification_event.slot = report.as_of_slot
+            AND qualification_event.transaction_index = report.as_of_transaction_index
+            AND qualification_event.instruction_index = report.as_of_instruction_index
+            AND qualification_event.inner_instruction_index
+              IS NOT DISTINCT FROM report.as_of_inner_instruction_index
+            AND qualification_event.blockchain_time
+              IS NOT DISTINCT FROM source.blockchain_time
+            AND qualification_event.observed_at = report.evaluated_at
+            AND qualification_event.payload_version = 1
+           WHERE report.superseded_at IS NULL
+             AND report.purge_after > clock_timestamp()
+             AND report.confirmation_status <> 'orphaned'
+             AND qualification_event.confirmation_status <> 'orphaned'
+             AND source.confirmation_status <> 'orphaned'
+             AND raw.confirmation_status <> 'orphaned'
+             AND report.confirmation_status = source.confirmation_status
+             AND report.confirmation_status = raw.confirmation_status
+             AND report.confirmation_status = qualification_event.confirmation_status`,
+        );
+        const qualificationRow = qualificationCounts.rows[0];
+        if (qualificationRow !== undefined) qualification = qualificationHealthFromRow(qualificationRow);
+      } catch {
+        qualificationCountsAvailable = false;
+        pipeline = freeze({ ...pipeline, qualification: 'DEGRADED' });
+      }
       const checkpoint = new Map(checkpoints.rows.map((item) => [text(item.checkpoint_key), decimal(item.slot)]));
       const row = heartbeats.rows[0];
       const heartbeat = row === undefined ? emptyHeartbeat() : heartbeatFromRow(row);
@@ -452,12 +589,13 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       const degraded = database.rows.length === 0 || stale || runtimeDegraded || !pipeline.httpAvailable
       || pipeline.pumpfun === 'DEGRADED' || pipeline.pumpfun === 'STOPPED'
       || pipeline.pumpswap === 'DEGRADED' || pipeline.pumpswap === 'STOPPED'
+      || pipeline.qualification === 'DEGRADED' || pipeline.qualification === 'STOPPED'
       || pipeline.paperDecision === 'DEGRADED' || pipeline.paperDecision === 'STOPPED'
       || pipeline.social === 'DEGRADED' || pipeline.social === 'STOPPED'
-      || !socialCountsAvailable || !paperCountsAvailable;
+      || !socialCountsAvailable || !paperCountsAvailable || !qualificationCountsAvailable;
       return healthResult(
         observedAt, database.rows.length > 0, degraded, checkpoint, heartbeat,
-        lagSlots, pipeline, socialJobs, paperDecisionJobs,
+        lagSlots, pipeline, qualification, socialJobs, paperDecisionJobs,
       );
     } catch {
       return healthResult(
@@ -468,6 +606,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         emptyHeartbeat(),
         null,
         pipeline,
+        emptyQualificationHealth(),
         emptySocialJobs(),
         emptyPaperDecisionJobs(),
       );
@@ -498,6 +637,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         this.clock,
         this.pipeline,
         this.holderLimits,
+        this.qualificationProfile,
       ));
       await client.query('COMMIT');
       return result;
@@ -1322,6 +1462,71 @@ function qualification(value: unknown): ApiQualification {
   }
 }
 
+const CANONICAL_QUALIFICATION_EVENT_FIELDS = [
+  'reportId', 'evidenceFingerprint', 'evaluation', 'report',
+] as const;
+const QUALIFICATION_EVALUATION_FIELDS = [
+  'evaluatedAtMs', 'signals', 'blockers', 'calibrationFacts',
+] as const;
+const MAX_QUALIFICATION_PAYLOAD_BYTES = 1_048_576;
+
+function canonicalQualificationRisk(row: Record<string, unknown>): ApiQualification {
+  try {
+    const reportPayloadSize = positiveSafeNumber(row.report_payload_size);
+    const eventPayloadSize = positiveSafeNumber(row.event_payload_size);
+    if (
+      reportPayloadSize > MAX_QUALIFICATION_PAYLOAD_BYTES
+      || eventPayloadSize > MAX_QUALIFICATION_PAYLOAD_BYTES
+      || positiveSafeNumber(row.report_payload_version) !== 1
+      || positiveSafeNumber(row.event_payload_version) !== 1
+    ) throw invalid();
+    const reportPayload = json(row.report_payload);
+    const eventPayload = exactDataRecord(
+      json(row.event_payload),
+      CANONICAL_QUALIFICATION_EVENT_FIELDS,
+      'Canonical qualification event payload',
+    );
+    const reportId = qualificationReportId(eventPayload.reportId);
+    const evidenceFingerprint = qualificationFingerprint(eventPayload.evidenceFingerprint);
+    const evaluation = exactDataRecord(
+      eventPayload.evaluation,
+      QUALIFICATION_EVALUATION_FIELDS,
+      'Canonical qualification evaluation',
+    );
+    const projected = qualification(eventPayload.report);
+    canonicalStringifyJson(fromJsonValue(eventPayload));
+    if (
+      canonicalStringifyJson(fromJsonValue(eventPayload.report))
+      !== canonicalStringifyJson(fromJsonValue(reportPayload))
+    ) throw invalid();
+    const evaluatedAt = timestamp(row.evaluated_at);
+    if (
+      reportId !== text(row.report_id)
+      || evidenceFingerprint !== qualificationFingerprint(row.evidence_fingerprint)
+      || text(row.qualification_event_id).length === 0
+      || text(row.profile_id) !== projected.ruleSet.id
+      || positiveSafeNumber(row.profile_version) !== projected.ruleSet.version
+      || qualificationFingerprint(row.profile_fingerprint)
+        !== (projected.ruleSet.fingerprint ?? qualificationFingerprint(row.profile_fingerprint))
+      || row.verdict !== projected.verdict
+      || safeNumber(row.preparation_score) !== projected.scores.preparation.score
+      || safeNumber(row.social_score) !== projected.scores.socialAuthenticity.score
+      || safeNumber(row.onchain_score) !== projected.scores.onchainHealth.score
+      || safeNumber(row.total_score) !== projected.scores.total.score
+      || evaluatedAt.toISOString() !== projected.evaluatedAt
+      || safeNumber(evaluation.evaluatedAtMs) !== evaluatedAt.getTime()
+    ) throw invalid();
+    return projected;
+  } catch (error) {
+    throw projectionError(error);
+  }
+}
+
+function qualificationReportId(value: unknown): string {
+  if (typeof value !== 'string' || !/^qreport_[0-9a-f]{64}$/u.test(value)) throw invalid();
+  return value;
+}
+
 const MAX_QUALIFICATION_CONDITIONS = QUALIFICATION_REASON_CODES.length;
 const MAX_QUALIFICATION_CONDITION_MESSAGE_LENGTH = 4_096;
 const MAX_QUALIFICATION_CONDITION_MAP_KEYS = 3;
@@ -1339,6 +1544,17 @@ const QUALIFICATION_CONDITION_FIELDS = [
 function qualificationFingerprint(value: unknown): string {
   if (typeof value !== 'string' || !/^[0-9a-f]{64}$/u.test(value)) throw invalid();
   return value;
+}
+
+function qualificationProfileIdentity(
+  value: ApiQualificationProfileIdentity,
+): ApiQualificationProfileIdentity {
+  const fields = qualificationRecord(value);
+  return freeze({
+    id: text(ownDataProperty(fields, 'id')),
+    version: positiveSafeNumber(ownDataProperty(fields, 'version')),
+    fingerprint: qualificationFingerprint(ownDataProperty(fields, 'fingerprint')),
+  });
 }
 
 function qualificationConditions(value: unknown): readonly ApiQualificationCondition[] {
@@ -1787,6 +2003,7 @@ const DEGRADED_PIPELINE_STATE: ApiProjectionPipelineState = Object.freeze({
   httpAvailable: false,
   pumpfun: 'DEGRADED',
   pumpswap: 'DEGRADED',
+  qualification: 'DEGRADED',
   paperDecision: 'DEGRADED',
   social: 'DEGRADED',
 });
@@ -1808,6 +2025,10 @@ function emptySocialJobs(): ApiHealth['socialJobs'] {
   });
 }
 
+function emptyQualificationHealth(): ApiHealth['qualification'] {
+  return freeze({ currentCount: 0, lastSuccessAt: null });
+}
+
 function emptyPaperDecisionJobs(): ApiHealth['paperDecisionJobs'] {
   return freeze({
     pendingCount: 0,
@@ -1825,6 +2046,15 @@ function socialJobsFromRow(row: Record<string, unknown>): ApiHealth['socialJobs'
     leasedCount: nonNegativeSafeNumber(row.leased_count),
     retryableFailedCount: nonNegativeSafeNumber(row.retryable_failed_count),
     exhaustedCount: nonNegativeSafeNumber(row.exhausted_count),
+  });
+}
+
+function qualificationHealthFromRow(
+  row: Record<string, unknown>,
+): ApiHealth['qualification'] {
+  return freeze({
+    currentCount: nonNegativeSafeNumber(row.current_count),
+    lastSuccessAt: nullableTimestamp(row.last_success_at),
   });
 }
 
@@ -1876,23 +2106,26 @@ function pipelineState(provider: ApiProjectionPipelineStateProvider): ApiProject
   const value: unknown = provider();
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== 5
+  if (keys.length !== 6
     || !keys.includes('httpAvailable')
     || !keys.includes('pumpfun')
     || !keys.includes('pumpswap')
+    || !keys.includes('qualification')
     || !keys.includes('paperDecision')
     || !keys.includes('social')) throw invalid();
   const httpAvailable = pipelineValue(value, 'httpAvailable');
   const pumpfun = pipelineValue(value, 'pumpfun');
   const pumpswap = pipelineValue(value, 'pumpswap');
+  const qualification = pipelineValue(value, 'qualification');
   const paperDecision = pipelineValue(value, 'paperDecision');
   const social = pipelineValue(value, 'social');
   if (typeof httpAvailable !== 'boolean'
     || !isPipelineRuntimeState(pumpfun)
     || !isPipelineRuntimeState(pumpswap)
+    || !isPipelineRuntimeState(qualification)
     || !isPipelineRuntimeState(paperDecision)
     || !isPipelineRuntimeState(social)) throw invalid();
-  return freeze({ httpAvailable, pumpfun, pumpswap, paperDecision, social });
+  return freeze({ httpAvailable, pumpfun, pumpswap, qualification, paperDecision, social });
 }
 
 function pipelineValue(value: object, key: string): unknown {
@@ -1915,6 +2148,7 @@ function healthResult(
   observedAt: Date, databaseAvailable: boolean, degraded: boolean,
   checkpoints: ReadonlyMap<string, string>, heartbeat: ApiHealth['heartbeat'], lagSlots: string | null,
   pipeline: ApiProjectionPipelineState,
+  qualification: ApiHealth['qualification'],
   socialJobs: ApiHealth['socialJobs'],
   paperDecisionJobs: ApiHealth['paperDecisionJobs'],
 ): ApiHealth {
@@ -1924,10 +2158,11 @@ function healthResult(
     pipeline: freeze({
       pumpfun: pipeline.pumpfun,
       pumpswap: pipeline.pumpswap,
+      qualification: pipeline.qualification,
       paperDecision: pipeline.paperDecision,
       social: pipeline.social,
     }),
-    socialJobs,
+    qualification, socialJobs,
     paperDecisionJobs,
     checkpoints: freeze({ launchpad: checkpoints.get('launchpad') ?? null, market: checkpoints.get('market') ?? null }),
     heartbeat, lagSlots });

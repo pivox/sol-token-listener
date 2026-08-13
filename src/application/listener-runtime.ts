@@ -138,13 +138,13 @@ export class SolanaListenerRuntime implements ListenerRuntime {
     if (this.currentState === 'STOPPED') {
       return Object.freeze({
         httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED',
-        paperDecision: 'STOPPED', social: 'STOPPED',
+        qualification: 'STOPPED', paperDecision: 'STOPPED', social: 'STOPPED',
       });
     }
     if (this.currentState !== 'RUNNING') {
       return Object.freeze({
         httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED',
-        paperDecision: 'DEGRADED', social: 'DEGRADED',
+        qualification: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
       });
     }
     let chain: 'RUNNING' | 'DEGRADED' = 'DEGRADED';
@@ -165,7 +165,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       // The failing projection stays DEGRADED without leaking the component error.
     }
     return Object.freeze({
-      httpAvailable: true, pumpfun: chain, pumpswap: chain, paperDecision, social,
+      httpAvailable: true, pumpfun: chain, pumpswap: chain, qualification: chain, paperDecision, social,
     });
   }
 

@@ -23,6 +23,8 @@ test('public operator journey is resumable and read-only across origins', async 
   await expect(page.getByText('PAPER_CLOSED')).toBeVisible();
   await page.getByRole('link', { name: 'Santé' }).click();
   await expect(page.getByRole('heading', { name: 'Santé technique' })).toBeVisible();
+  await expect(page.getByLabel('Qualification : RUNNING')).toBeVisible();
+  await expect(page.getByText('Rapports courants : 2')).toBeVisible();
 
   const resumeCountBefore = await resumeCount(request);
   await request.post(`${API}/__test/reconnect`);

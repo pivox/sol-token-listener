@@ -104,13 +104,13 @@ export class TradingCandidateService {
     eligibleUntilMs: number,
     quotesCoherent: boolean,
   ): TradingCandidateState {
-    if (input.snapshot.asOfEvent.confirmationStatus === 'orphaned') return 'REVOKED';
+    if (input.qualificationEvent.confirmationStatus === 'orphaned') return 'REVOKED';
     if (input.nowMs > eligibleUntilMs) return 'EXPIRED';
     if (
       input.report.verdict !== 'QUALIFIED'
       || input.report.blockers.length > 0
       || !confirmationReached(
-        input.snapshot.asOfEvent.confirmationStatus,
+        input.qualificationEvent.confirmationStatus,
         this.options.minimumConfirmation,
       )
       || !this.options.quoteMintAllowlist.includes(input.quoteAsset.mint)

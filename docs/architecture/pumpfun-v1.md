@@ -79,8 +79,26 @@ reste `NOT_AVAILABLE` avant reconstruction, puis expose le profil créateur,
 les positions nettes observées et la concentration top 1/5/10. Elle ne prétend
 pas être un état exhaustif des comptes token. I2 peut ensuite exposer un graphe
 observé ; il reste `NOT_AVAILABLE` tant que sa reconstruction n'a pas eu lieu.
-Le pipeline actif enchaîne launchpad, financement, I1, I2 et PumpSwap. L’API ne
-formule aucune garantie de profit, de même slot ou de sellabilité.
+Le pipeline actif exécute, dans cet ordre strict :
+
+```text
+create_observation
+  -> load_tracked_mints
+  -> launchpad_observation
+  -> reload_active_events
+  -> funding_observation
+  -> participant_analytics (mints en ordre lexical)
+  -> wallet_graph (mints en ordre lexical)
+  -> pumpswap_observation
+  -> qualification (union des mints affectés, dédupliquée et triée)
+  -> paper_decision_enqueue (même ordre lexical)
+```
+
+La migration et l’activation PumpSwap sont donc persistées avant la
+qualification du même traitement. La qualification est elle-même persistée
+avant l’enqueue paper ; son échec arrête ce mint à l’étape `qualification` et
+laisse l’inbox durable appliquer sa politique de reprise. L’API ne formule
+aucune garantie de profit, de même slot ou de sellabilité.
 
 ## Dépendances autorisées
 
@@ -125,10 +143,20 @@ recalculé et le respect du plafond round-trip du profil ; `REPORT_ONLY` reste
 non bloquant et `DISABLED` n’exige pas d’observation. Une copie,
 désérialisation ou réutilisation pour un autre
 sujet est donc refusée. Après redémarrage, les inputs de confiance doivent être
-réévalués pour le nouveau sujet. Le bootstrap de production compose désormais
-ce parcours derrière un worker durable séparé de l'ingestion Solana ; le mode
-`observe` conserve les projections de qualification/candidat mais n'ouvre
-aucune session ou position paper.
+réévalués pour le nouveau sujet. Le worker paper réautorise pour cela l’entrée
+d’évaluation persistée, recalcule déterministement rapport, `reportId`,
+empreinte et événement pour le sujet exact, puis compare toute la structure
+stockée avant de demander une quote. Cette opération ne reconstruit aucune
+projection et ne publie aucun événement.
+
+Le bootstrap de production compose ce parcours derrière un worker durable
+séparé de l'ingestion Solana. Le mode `observe` exécute la même qualification
+canonique, enfile les jobs de décision et peut persister un candidat explicable
+comme orchestration diagnostique. Le worker réautorise donc le rapport et
+construit la décision observable, mais `paperEnabled=false` coupe le routeur de
+quotes et toute action de stratégie avant préparation ou ouverture. Le mode
+`observe` crée ainsi zéro session d’exécution, position, trade ou fill paper et
+n’ajoute aucune capacité de wallet, signature, simulation RPC ou soumission.
 
 ### Analytics participants I1
 
@@ -263,6 +291,36 @@ Les conditions éliminatoires utilisent les codes stables de
 pouvoir être compensé par le score. Chaque rapport conserve les preuves, les
 valeurs de règles et leur version.
 
+### Projection canonique et autorité d’écriture
+
+`PostgresQualificationProjectionRepository`, appelé uniquement par
+`QualificationProjectionService`, est l’unique écrivain de
+`qualification_reports` et `QualificationUpdated`. Sous un verrou advisory par
+mint, il relit le lancement et les preuves persistées actives, exclut toute
+lignée `orphaned`, choisit une source domaine possédant un `raw_event_id`, puis
+remplace, réactive ou dissout la projection courante. Le repository paper est
+un consommateur : il peut vérifier et réautoriser une lignée exacte, mais ne
+crée ni ne supersède jamais un rapport de qualification.
+
+Une répétition exacte retourne `UNCHANGED` et n’ajoute ni événement domaine ni
+révision outbox. Une preuve, un profil ou une finalité réellement différent
+produit un nouvel identifiant déterministe. Si une preuve récente devient
+orpheline, une projection historique encore active peut redevenir courante
+sans dupliquer son événement ; si le lancement lui-même n’est plus canonique,
+la projection courante est dissoute.
+
+La route risk ne déduit pas l'état courant du dernier événement chronologique.
+Elle joint le rapport `superseded_at IS NULL` encore retenu du profil effectif
+à son wrapper `QualificationUpdated`, son événement source et son raw event,
+puis vérifie leurs identités et finalités avant de projeter le rapport. Une
+lignée absente, expirée, dissoute ou orphaned reste indisponible.
+
+La détection reste multi-quote : les quote assets Pump.fun/PumpSwap conservent
+mint, décimales et Token Program séparément. La qualification accepte un
+lancement lorsqu’au moins un quote mint appartient à
+`PAPER_QUOTE_MINT_ALLOWLIST`; les quotes BUY/SELL restent des préconditions du
+candidat paper et ne créent pas un second rapport canonique.
+
 ### Profil effectif, calibration et décision
 
 Le profil par défaut est
@@ -316,8 +374,9 @@ Le moteur Pump.fun V1 est un ledger comptable indépendant du
 transaction Solana et ne dépend d’aucun wallet. Il ouvre uniquement en mode
 `paper`, après qualification sans blocker et pour un quote mint autorisé.
 
-Le parcours durable est : job déterministe → reconstruction des preuves →
-deux quotes passives cohérentes → `TradingCandidateUpdated` → BUY paper →
+Le parcours durable est : qualification canonique persistée → job déterministe
+→ réautorisation exacte du rapport → deux quotes passives cohérentes →
+`TradingCandidateUpdated` → BUY paper →
 `PaperStrategySessionUpdated` → comptage idempotent de chaque
 `PaperExternalBuyCounted` → quote SELL → fermeture paper. Les achats du
 créateur, ventes, traders inconnus, événements orphaned, mauvais quote mints et
@@ -335,6 +394,17 @@ Le worker utilise claims, leases, renouvellement, retries bornés par cycle et
 codes d'erreur stables. Les rapports, candidats, sessions, achats comptés et
 positions conservent leur lignée et sont purgés après quatre heures lorsqu'ils
 deviennent terminaux.
+
+Une nouvelle ouverture porte l’identité attendue
+`(mint, reportId, qualificationEventId)`. Sa transaction acquiert d’abord le
+même verrou advisory par mint que la projection de qualification, puis exige
+atomiquement que le rapport soit courant, non expiré et relié à des événements
+qualification, source et raw concordants et non `orphaned`, avant toute
+recherche ou insertion de position. Le verrou est gardé jusqu’au commit. Un
+remplacement concurrent rend l’ouverture retryable et ne laisse ni position,
+ni trade, ni événement d’ouverture ; la
+réconciliation d’une position déjà créée conserve en revanche sa lignée
+historique exacte.
 
 Les entrées et sorties utilisent `minimumAmountOutRaw`. Frais, slippage,
 perte aller-retour et PnL restent en `bigint`. Position, trade et événement
@@ -370,9 +440,10 @@ Sur une base vide, le scanner prend uniquement la page la plus récente de
 chaque programme comme baseline, conformément au périmètre sans historique.
 Une seconde passe après l'abonnement WebSocket ferme la fenêtre de démarrage.
 Une reprise après panne rejoue toujours l'intégralité des étapes launchpad,
-financement, I1, I2 et PumpSwap; les identités et écritures déterministes
-garantissent des effets persistés exactement une fois, sans reprendre après
-une étape intermédiaire. Les leases expirés rendent le travail réclamable.
+financement, I1, I2, PumpSwap, qualification puis enqueue paper ; les identités
+et écritures déterministes garantissent des effets persistés exactement une
+fois, sans reprendre après une étape intermédiaire. Les leases expirés rendent
+le travail réclamable.
 
 Le WebSocket est le chemin nominal. Le catch-up initial est borné par
 `LISTENER_CATCH_UP_MAX_PAGES * LISTENER_CATCH_UP_PAGE_SIZE` pour chacun des
@@ -417,6 +488,12 @@ obligatoire. Collections, observations, liens, preuves et jobs sociaux suivent
 une rétention terminale de quatre heures et sont supprimés enfant d'abord.
 Aucun corps HTTP brut, header, résultat DNS ou adresse IP n'est conservé.
 
+Les rapports de qualification, leurs événements sources et révisions outbox
+restent eux aussi auditables pendant quatre heures. La purge supprime les
+enfants (paper, rapports et projections dépendantes) avant leurs sources raw ;
+elle ne supprime jamais une ligne `processed` ou `confirmed` encore en attente
+de finalité.
+
 La PR H ajoute aussi un outbox SSE append-only. Chaque révision publique est
 persistée avant diffusion et reçoit un curseur de transport monotone, distinct
 de l’identité métier déterministe `eventId` incluse dans `data`. Le champ SSE
@@ -440,6 +517,15 @@ enrichissement. `pipeline.paperDecision` et `paperDecisionJobs` exposent
 séparément pending, leased, retryable, exhausted, dernier succès et dernier
 code d'erreur stable : une panne d'un worker ne renomme pas les pipelines chain
 Pump.fun/PumpSwap.
+
+`pipeline.qualification` reflète l’état du worker inbox qui exécute l’étape
+synchrone (`IDLE | RUNNING | DEGRADED | STOPPED`). `qualification.currentCount`
+compte uniquement les rapports courants à lignée active et
+`qualification.lastSuccessAt` expose leur dernier `evaluated_at`, ou `null`.
+Une panne isolée de cette requête conserve PostgreSQL disponible mais met ces
+valeurs à `0`/`null`, dégrade seulement la composante qualification et fait
+passer la santé globale à `DEGRADED`; aucun mint, payload, endpoint RPC ou
+message interne n’est exposé.
 
 Le CLI `npm run paper:dry-run` exécute le bootstrap réel pendant une durée
 bornée, limite la lecture aux sessions mises à jour dans la fenêtre, ferme les
@@ -477,3 +563,9 @@ actives et reprend au high-water mark courant.
 Le build produit un artefact statique configurable au runtime, déployable
 séparément du backend. Cette séparation ne modifie pas les invariants : aucune
 clé privée, aucun wallet, aucun endpoint d’écriture et aucune exécution live.
+
+Le schéma frontend exige `pipeline.qualification` ainsi que
+`qualification.currentCount` et `qualification.lastSuccessAt`. La page santé
+affiche cet état et ces métriques bornées ; l’absence d’un champ requis est une
+dérive de contrat, tandis que les champs métier additifs restent acceptés selon
+les règles Zod V1.

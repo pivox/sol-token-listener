@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { ApiProjectionPipelineState } from '../src/storage/api-projection.repository.js';
@@ -27,6 +28,20 @@ const config = parseConfig({
 void test('bootstrap imports no signing, submission, or live execution path', async () => {
   const source = await readFile(new URL('../src/app.ts', import.meta.url), 'utf8');
   assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(new URL('../src/app.ts', import.meta.url)), repositoryRoot), []);
+});
+
+void test('production qualification import graph has no signing, simulation, or submission path', async () => {
+  const graph = await readLocalImportGraph(
+    fileURLToPath(new URL('../src/application/production-listener-factory.ts', import.meta.url)),
+  );
+  const violations: string[] = [];
+  for (const [path, source] of graph) {
+    violations.push(...executionBoundaryViolations(source, path, repositoryRoot));
+    if (/\b(?:Keypair|sendTransaction|signTransaction|simulateTransaction)\b/u.test(source)) {
+      violations.push(`Forbidden execution symbol in ${path}`);
+    }
+  }
+  assert.deepEqual(violations, []);
 });
 
 void test('paper dry-run bootstrap imports no signing, submission, or live execution path', async () => {
@@ -58,7 +73,7 @@ void test('migrates, starts listener before API, then closes listener before API
   const calls: string[] = [];
   const pool = {};
   const runtime = listener(calls, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   await runApplication(dependencies(calls, {
     loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: true }),
@@ -74,9 +89,13 @@ void test('migrates, starts listener before API, then closes listener before API
       calls.push('listener.create');
       return runtime;
     },
-    createProjectionRepository: (received, pipeline) => {
+    createProjectionRepository: (received, pipeline, _holderLimits, qualificationProfile) => {
       assert.equal(received, pool);
       assert.deepEqual(pipeline(), runtime.pipelineState());
+      assert.deepEqual(qualificationProfile, {
+        id: 'pumpfun-v1-initial', version: 1, status: 'UNVALIDATED_RULE_SET',
+        fingerprint: 'a'.repeat(64), minimumTotalScore: 60,
+      });
       calls.push('projections');
       return {} as ApiProjectionRepository;
     },
@@ -184,7 +203,7 @@ void test('explicit listener disablement exposes STOPPED pipeline state to the A
   }));
   assert.notEqual(pipeline, null);
   assert.deepEqual((pipeline as unknown as () => ApiProjectionPipelineState)(), {
-    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', paperDecision: 'STOPPED', social: 'STOPPED',
+    httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED', qualification: 'STOPPED', paperDecision: 'STOPPED', social: 'STOPPED',
   });
   assert.ok(calls.includes('log:listener.disabled'));
   assert.doesNotMatch(calls.join(','), /listener\.create|listener\.start|listener\.close/u);
@@ -200,7 +219,7 @@ void test('listener startup failure fails the process and cleans listener before
       async close() { calls.push('listener.close'); },
       state: () => 'DEGRADED',
       pipelineState: () => ({
-        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
+        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', qualification: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
       }),
     }),
   })), (error: unknown) => error === startupFailure);
@@ -223,7 +242,7 @@ void test('API bind failure aggregates listener, server, and database cleanup in
       async close() { calls.push('listener.close'); throw listenerFailure; },
       state: () => 'RUNNING',
       pipelineState: () => ({
-        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
       }),
     }),
     createApiServer: () => ({
@@ -304,7 +323,7 @@ function dependencies(
   overrides: Partial<ApplicationDependencies> = {},
 ): Partial<ApplicationDependencies> {
   const runtime = listener(calls, {
-    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
   return {
     loadConfig: () => config,
@@ -358,4 +377,24 @@ function listener(calls: string[], pipeline: ApiProjectionPipelineState): {
     state: () => 'RUNNING',
     pipelineState: () => Object.freeze({ ...pipeline }),
   };
+}
+
+async function readLocalImportGraph(entrypoint: string): Promise<ReadonlyMap<string, string>> {
+  const graph = new Map<string, string>();
+  const pending = [entrypoint];
+  while (pending.length > 0) {
+    const path = pending.pop();
+    if (path === undefined || graph.has(path)) continue;
+    const source = await readFile(path, 'utf8');
+    graph.set(path, source);
+    for (const match of source.matchAll(
+      /(?:from\s+|import\s*\(\s*|import\s+)["'](\.{1,2}\/[^"']+)["']/gu,
+    )) {
+      const specifier = match[1];
+      if (specifier === undefined) continue;
+      const resolved = resolve(dirname(path), specifier.replace(/\.js$/u, '.ts'));
+      if (!graph.has(resolved)) pending.push(resolved);
+    }
+  }
+  return graph;
 }

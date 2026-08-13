@@ -33,6 +33,7 @@ import { PostgresParticipantAnalyticsRepository } from '../storage/participant-a
 import { PostgresPaperDecisionRepository } from '../storage/paper-decision.repository.js';
 import { PostgresPaperTradingRepository } from '../storage/paper-trading.repository.js';
 import { PostgresPaperVenueReader } from '../storage/paper-venue.reader.js';
+import { PostgresQualificationProjectionRepository } from '../storage/qualification-projection.repository.js';
 import { PostgresSocialEvidenceRepository } from '../storage/social-evidence.repository.js';
 import { PostgresTransactionInboxRepository } from '../storage/transaction-inbox.repository.js';
 import { PostgresWalletEvidenceRepository } from '../storage/wallet-evidence.repository.js';
@@ -51,7 +52,9 @@ import { WalletGraphRebuildService } from './wallet-graph-rebuild.service.js';
 import { PublicSocialVerificationProvider } from '../social/public-social-verification.provider.js';
 import { SocialEnrichmentWorker } from './social-enrichment-worker.js';
 import { PaperDecisionWorker } from './paper-decision-worker.js';
+import { QualificationProjectionService } from './qualification-projection.service.js';
 import { QualificationRebuildService } from './qualification-rebuild.service.js';
+import { SocialQualificationRefreshService } from './social-qualification-refresh.service.js';
 import { TradingCandidateService } from './trading-candidate.service.js';
 import { ValidatedExternalBuysStrategy } from './validated-external-buys.strategy.js';
 import { QualificationEngine } from '../qualification/qualification-engine.js';
@@ -113,17 +116,6 @@ export function createProductionListenerRuntime(
     maxConcurrency: config.socialHttpConcurrency,
     maxPerHostConcurrency: 1,
   });
-  const socialWorker = new SocialEnrichmentWorker(
-    new PostgresSocialEvidenceRepository(pool),
-    new HttpMetadataProvider(publicHttp),
-    new PublicSocialVerificationProvider(publicHttp),
-    {
-      pollIntervalMs: config.socialWorkerPollMs,
-      leaseMs: config.socialWorkerLeaseSeconds * 1_000,
-      renewalIntervalMs: Math.floor(config.socialWorkerLeaseSeconds * 1_000 / 3),
-      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
-    },
-  );
   const pump = new PumpFunLaunchpadAdapter(createUnavailableBondingCurveReader());
   const launchpad = new LaunchpadObservationService(pump, launchpadRepository);
   const funding = new WalletEvidenceObservationService(
@@ -148,16 +140,34 @@ export function createProductionListenerRuntime(
     new PostgresMarketObservationRepository(pool, config.dataRetentionHours),
   );
   const marketPipeline = new PumpSwapObservationPipeline(pump, market, marketService);
-  const paperRepository = new PostgresPaperDecisionRepository(pool, {
-    maxAttempts: config.paperDecisionRetryMaxAttempts,
-    baseDelayMs: config.paperDecisionRetryBaseDelayMs,
-    retentionHours: 4,
-  });
   const qualificationProfile = loadQualificationProfile({
     profilePath: config.qualificationProfilePath,
     minimumScoreOverride: config.qualificationMinimumScore,
   });
+  const paperRepository = new PostgresPaperDecisionRepository(pool, {
+    maxAttempts: config.paperDecisionRetryMaxAttempts,
+    baseDelayMs: config.paperDecisionRetryBaseDelayMs,
+    retentionHours: 4,
+  }, qualificationProfile);
   const qualificationEngine = new QualificationEngine(qualificationProfile);
+  const qualificationRebuilder = new QualificationRebuildService(qualificationEngine);
+  const qualification = new QualificationProjectionService(
+    new PostgresQualificationProjectionRepository(pool, qualificationRebuilder),
+    qualificationRebuilder,
+    config.paperQuoteMintAllowlist,
+  );
+  const socialWorker = new SocialEnrichmentWorker(
+    new PostgresSocialEvidenceRepository(pool),
+    new HttpMetadataProvider(publicHttp),
+    new PublicSocialVerificationProvider(publicHttp),
+    new SocialQualificationRefreshService(qualification,paperRepository),
+    {
+      pollIntervalMs: config.socialWorkerPollMs,
+      leaseMs: config.socialWorkerLeaseSeconds * 1_000,
+      renewalIntervalMs: Math.floor(config.socialWorkerLeaseSeconds * 1_000 / 3),
+      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+    },
+  );
   const quoteRouter = new CanonicalPaperQuoteRouter(
     new PostgresPaperVenueReader(() => rpc.getSlot(), pool),
     new PumpFunPaperQuoteProvider(marketRpc),
@@ -181,7 +191,7 @@ export function createProductionListenerRuntime(
   const paperWorker = new PaperDecisionWorker(
     paperRepository,
     quoteRouter,
-    new QualificationRebuildService(qualificationEngine),
+    qualificationRebuilder,
     new TradingCandidateService({
       strategy: { id: config.paperStrategyId, version: config.paperStrategyVersion },
       quoteMintAllowlist: config.paperQuoteMintAllowlist,
@@ -219,6 +229,7 @@ export function createProductionListenerRuntime(
     marketPipeline,
     Date.now,
     paperRepository,
+    qualification,
   );
 
   const worker = new TransactionInboxWorker(inbox, locator, pipeline, {

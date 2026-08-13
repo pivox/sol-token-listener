@@ -102,7 +102,8 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
   };
   const health: ApiHealth = {
     status: 'OK', observedAt: summary.detectedAt, postgresql: { status: 'AVAILABLE' },
-    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+    http: { status: 'AVAILABLE' }, pipeline: { pumpfun: 'IDLE', pumpswap: 'IDLE', qualification: 'IDLE', paperDecision: 'IDLE', social: 'IDLE' },
+    qualification: { currentCount: 0, lastSuccessAt: null },
     socialJobs: { pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0 },
     paperDecisionJobs: {
       pendingCount: 0, leasedCount: 0, retryableFailedCount: 0, exhaustedCount: 0,
