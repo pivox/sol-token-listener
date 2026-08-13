@@ -624,6 +624,7 @@ git commit -m "refactor: consume canonical qualification in paper worker (#15)"
 - Modify: `src/application/production-listener-factory.ts`
 - Modify: `tests/production-listener-factory.test.ts`
 - Modify: `tests/bootstrap-safety.test.ts`
+- Modify: `tests/paper-decision-worker.test.ts`
 - Modify: `tests/transaction-ingestion-recovery.test.ts`
 
 - [x] **Step 1: Write failing composition and observe-mode tests**
@@ -634,11 +635,21 @@ Assert the factory imports and composes
 buy, creator sell, cluster revision and PumpSwap activation each produce a
 qualification call before paper enqueue.
 
+Le mode `observe` conserve volontairement les jobs de décision et peut
+persister des candidats explicables comme projections diagnostiques. Il doit en
+revanche couper toute quote et action de stratégie et conserver zéro session
+d’exécution, position, trade ou fill paper.
+
 The security assertion remains:
 
 ```ts
 assert.doesNotMatch(importGraph, /Keypair|sendTransaction|signTransaction|simulateTransaction/u);
-assert.equal(paperWritesInObserveMode, 0);
+assert.equal(paperDecisionJobsInObserveMode, 1);
+assert.equal(explainableCandidateWritesInObserveMode, 1);
+assert.equal(paperPositionWritesInObserveMode, 0);
+assert.equal(paperTradeOrFillWritesInObserveMode, 0);
+assert.equal(quoteCallsInObserveMode, 0);
+assert.equal(strategyOpenCallsInObserveMode, 0);
 ```
 
 - [x] **Step 2: Run tests and confirm RED**
@@ -903,9 +914,11 @@ orphaned launch -> DISSOLVED
 orphaned recent proof -> older active report reactivated
 ```
 
-Place creation/buy/sell/cluster/reorg cases in
-`tests/qualification-projection.repository.test.ts`, ordering/migration in
-`tests/observed-transaction-pipeline.test.ts`, and retry in
+Place creation/replay/finality/reorg cases in
+`tests/qualification-projection.repository.test.ts`, targeted buy progression
+and creator-sell evidence in `tests/qualification-projection.service.test.ts`,
+ordering/migration in `tests/observed-transaction-pipeline.test.ts`, observe
+safety in `tests/paper-decision-worker.test.ts` and durable retry in
 `tests/transaction-ingestion-recovery.test.ts`. Do not create a second broad
 end-to-end fixture.
 

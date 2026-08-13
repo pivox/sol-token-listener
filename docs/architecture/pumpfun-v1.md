@@ -151,9 +151,12 @@ projection et ne publie aucun événement.
 
 Le bootstrap de production compose ce parcours derrière un worker durable
 séparé de l'ingestion Solana. Le mode `observe` exécute la même qualification
-canonique et alimente les routes risque/timeline, mais n’enfile aucun job paper,
-n’ouvre aucune session ou position et n’ajoute aucune capacité de wallet,
-signature, simulation RPC ou soumission.
+canonique, enfile les jobs de décision et peut persister un candidat explicable
+comme orchestration diagnostique. Le worker réautorise donc le rapport et
+construit la décision observable, mais `paperEnabled=false` coupe le routeur de
+quotes et toute action de stratégie avant préparation ou ouverture. Le mode
+`observe` crée ainsi zéro session d’exécution, position, trade ou fill paper et
+n’ajoute aucune capacité de wallet, signature, simulation RPC ou soumission.
 
 ### Analytics participants I1
 
