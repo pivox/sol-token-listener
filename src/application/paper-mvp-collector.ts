@@ -36,6 +36,7 @@ export class PaperMvpCollector {
     const batch = await this.source.collectBatch({
       runId: before.run.runId,
       startedAtMs: before.run.startedAtMs,
+      deadlineAtMs: before.run.deadlineAtMs,
       strategyId: before.run.configuration.strategyId,
       strategyVersion: before.run.configuration.strategyVersion,
       limit: input.limit,
@@ -54,14 +55,10 @@ export class PaperMvpCollector {
       counters: Object.freeze({
         creationsObserved: before.run.counters.creationsObserved,
         entriesRejected: before.run.counters.entriesRejected,
-        duplicateLogicalBuys: Math.max(
-          before.run.counters.duplicateLogicalBuys,
-          batch.duplicateLogicalBuys,
-        ),
-        duplicateLogicalSells: Math.max(
-          before.run.counters.duplicateLogicalSells,
-          batch.duplicateLogicalSells,
-        ),
+        duplicateLogicalBuys: before.run.counters.duplicateLogicalBuys
+          + batch.duplicateLogicalBuys,
+        duplicateLogicalSells: before.run.counters.duplicateLogicalSells
+          + batch.duplicateLogicalSells,
       }),
       providerUsage: before.run.providerUsage,
       samples: Object.freeze(samples),

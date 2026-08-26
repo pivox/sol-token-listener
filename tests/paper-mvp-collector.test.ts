@@ -6,7 +6,7 @@ import type { PaperMvpRepository, PaperMvpRunSnapshot } from '../src/ports/paper
 import type { PaperMvpSource } from '../src/ports/paper-mvp-source.js';
 import { PaperMvpCollector } from '../src/application/paper-mvp-collector.js';
 import { PostgresPaperMvpSource } from '../src/storage/paper-mvp-source.js';
-import { migrateDatabase } from '../src/storage/database.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { PostgresPaperMvpRepository } from '../src/storage/paper-mvp.repository.js';
 
 const runSnapshot: PaperMvpRunSnapshot = Object.freeze({
@@ -91,6 +91,50 @@ void test('collects exact authoritative position facts and preserves bigint valu
   });
 });
 
+void test('accumulates bounded duplicate counts across distinct collection polls', async () => {
+  let snapshot = runSnapshot;
+  let poll = 0;
+  const repository: PaperMvpRepository = Object.freeze({
+    startOrResume: async () => snapshot.run,
+    load: async () => snapshot,
+    recordProgress: async (progress: Parameters<PaperMvpRepository['recordProgress']>[0]) => {
+      snapshot = Object.freeze({
+        ...snapshot,
+        run: Object.freeze({
+          ...snapshot.run,
+          counters: Object.freeze({
+            ...snapshot.run.counters,
+            ...progress.counters,
+          }),
+          closedPositions: snapshot.run.closedPositions + progress.samples.length,
+          updatedAtMs: progress.observedAtMs,
+        }),
+      });
+      return snapshot.run;
+    },
+    terminalize: async () => snapshot.run,
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => {
+      poll += 1;
+      return Object.freeze({
+        positions: Object.freeze([
+          Object.freeze({ ...validFacts(), positionId: `position-${poll}` }),
+        ]),
+        duplicateLogicalBuys: poll === 1 ? 2 : 3,
+        duplicateLogicalSells: poll === 1 ? 1 : 4,
+      });
+    },
+  });
+  const collector = new PaperMvpCollector(repository, source, () => 8_000 + poll);
+
+  assert.equal((await collector.collect({ runId:'run-1',limit:1 })).duplicateLogicalBuys, 2);
+  assert.deepEqual(await collector.collect({ runId:'run-1',limit:1 }), {
+    scanned:1,inserted:1,valid:1,unknown:0,
+    duplicateLogicalBuys:5,duplicateLogicalSells:5,
+  });
+});
+
 void test('classifies terminal source gaps and contradictions as durable unknown positions', async () => {
   const facts = validFacts();
   const positions = Object.freeze([
@@ -147,7 +191,7 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
 
   const result = await source.collectBatch({
     runId: 'run-1', startedAtMs: 1_000, strategyId: 'creation-entry-v1',
-    strategyVersion: 1, limit: 100,
+    strategyVersion: 1, deadlineAtMs: 61_000, limit: 100,
   });
 
   assert.deepEqual(result, {
@@ -155,16 +199,18 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
   });
   assert.equal(queries.length, 1);
   assert.deepEqual(queries[0]?.values, [
-    'run-1', new Date(1_000), 'creation-entry-v1', 1, 100,
+    'run-1', new Date(1_000), new Date(61_000), 'creation-entry-v1', 1, 100,
   ]);
   assert.match(queries[0]?.text ?? '', /NOT EXISTS[\s\S]*paper_mvp_position_samples/u);
   assert.match(queries[0]?.text ?? '', /entry_trade_id/u);
   assert.match(queries[0]?.text ?? '', /exit_trade_id/u);
   assert.match(queries[0]?.text ?? '', /GREATEST\(COUNT\(\*\) FILTER[\s\S]*- 1, 0\)/u);
-  assert.match(queries[0]?.text ?? '', /ORDER BY[\s\S]*LIMIT \$5/u);
+  assert.match(queries[0]?.text ?? '', /opened_at <= \$3[\s\S]*closed_at <= \$3/u);
+  assert.match(queries[0]?.text ?? '', /WITH candidates AS MATERIALIZED[\s\S]*LIMIT \$6/u);
+  assert.doesNotMatch(queries[0]?.text ?? '', /FROM paper_trades trade JOIN eligible/u);
   await assert.rejects(source.collectBatch({
     runId: 'run-1', startedAtMs: 1_000, strategyId: 'creation-entry-v1',
-    strategyVersion: 1, limit: 1_001,
+    strategyVersion: 1, deadlineAtMs: 61_000, limit: 1_001,
   }), /limit/u);
   assert.equal(queries.length, 1);
 });
@@ -179,6 +225,11 @@ void test('collects and replays exact PostgreSQL facts before source retention',
     await seedPostgresFacts(pool);
     const repository = new PostgresPaperMvpRepository(pool);
     const run = await repository.startOrResume(runSnapshot.run.configuration, 1_000);
+    const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.paperTrades, 0);
+    assert.equal(purged.paperPositions, 0);
+    assert.equal((await pool.query('SELECT 1 FROM paper_positions')).rowCount, 2);
+    assert.equal((await pool.query('SELECT 1 FROM paper_trades')).rowCount, 4);
     const collector = new PaperMvpCollector(
       repository, new PostgresPaperMvpSource(pool), () => 2_000,
     );

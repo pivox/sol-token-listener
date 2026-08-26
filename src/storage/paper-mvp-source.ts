@@ -17,6 +17,7 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
   public async collectBatch(input: Readonly<{
     runId: string;
     startedAtMs: number;
+    deadlineAtMs: number;
     strategyId: string;
     strategyVersion: number;
     limit: number;
@@ -25,8 +26,8 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
       throw new RangeError('Paper MVP source limit must be between 1 and 1000.');
     }
     const result = await this.pool.query(COLLECT_SQL, [
-      input.runId, new Date(input.startedAtMs), input.strategyId,
-      input.strategyVersion, input.limit,
+      input.runId, new Date(input.startedAtMs), new Date(input.deadlineAtMs),
+      input.strategyId, input.strategyVersion, input.limit,
     ]);
     const first = result.rows[0];
     const duplicateLogicalBuys = first === undefined ? 0 : count(first.duplicate_logical_buys);
@@ -41,24 +42,32 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
   }
 }
 
-const COLLECT_SQL = `WITH eligible AS MATERIALIZED (
+const COLLECT_SQL = `WITH candidates AS MATERIALIZED (
   SELECT position.*
   FROM paper_positions position
-  WHERE position.strategy_id=$3 AND position.strategy_version=$4
+  WHERE position.strategy_id=$4 AND position.strategy_version=$5
     AND position.opened_at >= $2
+    AND position.opened_at <= $3
+    AND position.closed_at <= $3
     AND position.status IN ('PAPER_CLOSED','PAPER_RETRACTED')
+    AND NOT EXISTS (
+      SELECT 1 FROM paper_mvp_position_samples observation
+      WHERE observation.run_id=$1 AND observation.position_id=position.position_id
+    )
+  ORDER BY position.closed_at,position.position_id
+  LIMIT $6
 ), trade_counts AS (
   SELECT trade.position_id,
     GREATEST(COUNT(*) FILTER (WHERE trade.side='BUY') - 1, 0)::integer AS duplicate_buys,
     GREATEST(COUNT(*) FILTER (WHERE trade.side='SELL') - 1, 0)::integer AS duplicate_sells
-  FROM paper_trades trade JOIN eligible ON eligible.position_id=trade.position_id
+  FROM paper_trades trade JOIN candidates ON candidates.position_id=trade.position_id
   GROUP BY trade.position_id
 ), duplicate_totals AS (
   SELECT COALESCE(SUM(duplicate_buys),0)::integer AS duplicate_logical_buys,
     COALESCE(SUM(duplicate_sells),0)::integer AS duplicate_logical_sells
   FROM trade_counts
-), candidates AS (
-  SELECT eligible.*, launch.detected_at AS creation_detected_at,
+), facts AS (
+  SELECT candidates.*, launch.detected_at AS creation_detected_at,
     CASE WHEN entry_job.job_id IS NULL THEN 0 ELSE 1 END AS entry_decision_job_count,
     entry_job.created_at AS entry_decision_job_at,
     buy.trade_id AS buy_trade_id,buy.side AS buy_side,
@@ -81,24 +90,19 @@ const COLLECT_SQL = `WITH eligible AS MATERIALIZED (
     sell.quote_observed_at AS exit_quote_at,sell.created_at AS paper_sell_at,
     close_event.type AS close_event_type,close_event.source AS close_event_source,
     close_event.observed_at AS close_event_observed_at
-  FROM eligible
-  LEFT JOIN token_launches launch ON launch.mint=eligible.mint
+  FROM candidates
+  LEFT JOIN token_launches launch ON launch.mint=candidates.mint
   LEFT JOIN paper_decision_jobs entry_job
-    ON entry_job.job_id=eligible.entry_decision_job_id
-  LEFT JOIN paper_trades buy ON buy.trade_id=eligible.entry_trade_id
-    AND buy.position_id=eligible.position_id
-  LEFT JOIN paper_trades sell ON sell.trade_id=eligible.exit_trade_id
-    AND sell.position_id=eligible.position_id
-  LEFT JOIN domain_events close_event ON close_event.event_id=eligible.close_event_id
-  WHERE NOT EXISTS (
-    SELECT 1 FROM paper_mvp_position_samples observation
-    WHERE observation.run_id=$1 AND observation.position_id=eligible.position_id
-  )
-  ORDER BY eligible.closed_at,eligible.position_id
-  LIMIT $5
+    ON entry_job.job_id=candidates.entry_decision_job_id
+  LEFT JOIN paper_trades buy ON buy.trade_id=candidates.entry_trade_id
+    AND buy.position_id=candidates.position_id
+  LEFT JOIN paper_trades sell ON sell.trade_id=candidates.exit_trade_id
+    AND sell.position_id=candidates.position_id
+  LEFT JOIN domain_events close_event ON close_event.event_id=candidates.close_event_id
 )
-SELECT candidates.*,duplicate_totals.*
-FROM duplicate_totals LEFT JOIN candidates ON TRUE`;
+SELECT facts.*,duplicate_totals.*
+FROM duplicate_totals LEFT JOIN facts ON TRUE
+ORDER BY facts.closed_at,facts.position_id`;
 
 function positionFromRow(row: Row): PaperMvpSourcePosition {
   return Object.freeze({

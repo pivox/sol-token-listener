@@ -53,6 +53,7 @@ export interface PaperMvpSource {
   collectBatch(input: Readonly<{
     runId: string;
     startedAtMs: number;
+    deadlineAtMs: number;
     strategyId: string;
     strategyVersion: number;
     limit: number;

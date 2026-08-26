@@ -269,10 +269,37 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const paperTrades = await client.query(
       `DELETE FROM paper_trades trade USING paper_positions position
        WHERE trade.position_id = position.position_id
-         AND position.purge_after <= NOW()`,
+         AND position.purge_after <= NOW()
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_mvp_runs run
+           WHERE run.state = 'RUNNING'
+             AND run.strategy_id = position.strategy_id
+             AND run.strategy_version = position.strategy_version
+             AND position.opened_at BETWEEN run.started_at AND run.deadline_at
+             AND position.closed_at <= run.deadline_at
+             AND NOT EXISTS (
+               SELECT 1 FROM paper_mvp_position_samples sample
+               WHERE sample.run_id = run.run_id
+                 AND sample.position_id = position.position_id
+             )
+         )`,
     );
     const paperPositions = await client.query(
-      'DELETE FROM paper_positions WHERE purge_after <= NOW()',
+      `DELETE FROM paper_positions position
+       WHERE position.purge_after <= NOW()
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_mvp_runs run
+           WHERE run.state = 'RUNNING'
+             AND run.strategy_id = position.strategy_id
+             AND run.strategy_version = position.strategy_version
+             AND position.opened_at BETWEEN run.started_at AND run.deadline_at
+             AND position.closed_at <= run.deadline_at
+             AND NOT EXISTS (
+               SELECT 1 FROM paper_mvp_position_samples sample
+               WHERE sample.run_id = run.run_id
+                 AND sample.position_id = position.position_id
+             )
+         )`,
     );
     const transitions = await client.query(
       'DELETE FROM state_transitions WHERE purge_after <= NOW()',
@@ -489,7 +516,20 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            SELECT 1 FROM paper_positions position
            WHERE position.mint = launch.mint
              AND (position.purge_after IS NULL
-               OR position.purge_after > statement_timestamp())
+               OR position.purge_after > statement_timestamp()
+               OR EXISTS (
+                 SELECT 1 FROM paper_mvp_runs run
+                 WHERE run.state = 'RUNNING'
+                   AND run.strategy_id = position.strategy_id
+                   AND run.strategy_version = position.strategy_version
+                   AND position.opened_at BETWEEN run.started_at AND run.deadline_at
+                   AND position.closed_at <= run.deadline_at
+                   AND NOT EXISTS (
+                     SELECT 1 FROM paper_mvp_position_samples sample
+                     WHERE sample.run_id = run.run_id
+                       AND sample.position_id = position.position_id
+                   )
+               ))
          )`,
     );
     await client.query('COMMIT');
