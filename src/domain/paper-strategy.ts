@@ -32,10 +32,27 @@ export const PAPER_DECISION_REASON_CODES = Object.freeze([
   'EXIT_QUOTE_UNAVAILABLE',
   'SOURCE_ORPHANED',
   'RECONCILIATION_REQUIRED',
+  'CREATION_ENTRY_EXPIRED',
+  'CREATION_ENTRY_REJECTED',
+  'EXTERNAL_UNIQUE_BUY_OBSERVED',
+  'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+  'TAKE_PROFIT_2X_EXECUTABLE',
+  'CREATOR_EARLY_SELL',
+  'MANUAL_KILL_SWITCH',
+  'SELL_QUOTE_UNAVAILABLE_OR_STALE',
 ] as const);
 
 export type PaperDecisionReasonCode = (typeof PAPER_DECISION_REASON_CODES)[number];
 export type PaperMinimumConfirmation = 'confirmed' | 'finalized';
+
+export const CREATION_EXIT_REASONS = Object.freeze([
+  'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+  'TAKE_PROFIT_2X_EXECUTABLE',
+  'CREATOR_EARLY_SELL',
+  'MANUAL_KILL_SWITCH',
+] as const);
+
+export type CreationExitReason = (typeof CREATION_EXIT_REASONS)[number];
 
 export interface PaperStrategyErrorEvidence {
   readonly code: string;
@@ -70,6 +87,18 @@ export interface PaperStrategySessionV1 {
   readonly payloadVersion: 1;
 }
 
+export interface PaperStrategySessionV2 extends Omit<
+PaperStrategySessionV1,
+'strategy' | 'payloadVersion'
+> {
+  readonly strategy: Readonly<{ readonly id: 'creation-entry-v1'; readonly version: 1 }>;
+  readonly countedBuyerWallets: readonly string[];
+  readonly pendingExitReason: CreationExitReason | null;
+  readonly payloadVersion: 2;
+}
+
+export type PaperStrategySession = PaperStrategySessionV1 | PaperStrategySessionV2;
+
 export interface CreatePaperStrategySessionInput {
   readonly candidate: TradingCandidateV1;
   readonly state: PaperStrategySessionState;
@@ -86,6 +115,11 @@ export interface CreatePaperStrategySessionInput {
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
   readonly purgeAfterMs: number;
+}
+
+export interface CreateCreationEntrySessionInput extends CreatePaperStrategySessionInput {
+  readonly countedBuyerWallets: readonly string[];
+  readonly pendingExitReason: CreationExitReason | null;
 }
 
 export interface PaperExternalBuyEvidence {
@@ -155,6 +189,76 @@ export function createPaperStrategySession(
     updatedAtMs: input.updatedAtMs,
     purgeAfterMs: input.purgeAfterMs,
     payloadVersion: 1,
+  });
+}
+
+export function createCreationEntrySession(
+  input: CreateCreationEntrySessionInput,
+): PaperStrategySessionV2 {
+  validateSessionInput(input);
+  if (
+    input.candidate.strategy.id !== 'creation-entry-v1'
+    || input.candidate.strategy.version !== 1
+  ) throw new TypeError('Creation session strategy is invalid.');
+  if (
+    input.countedBuyerWallets.length !== input.externalBuyCount
+    || new Set(input.countedBuyerWallets).size !== input.countedBuyerWallets.length
+  ) throw new TypeError('Creation session buyer wallet count is invalid.');
+  for (const wallet of input.countedBuyerWallets) text(wallet, 'buyer wallet');
+  if (
+    input.pendingExitReason !== null
+    && !CREATION_EXIT_REASONS.includes(input.pendingExitReason)
+  ) throw new TypeError('Creation session pending exit reason is invalid.');
+
+  const strategy = Object.freeze({ id: 'creation-entry-v1' as const, version: 1 as const });
+  const quoteAsset = Object.freeze({ ...input.candidate.quoteAsset });
+  const entryCursor = Object.freeze({ ...input.entryCursor });
+  const lastCountedCursor = input.lastCountedCursor === null
+    ? null
+    : Object.freeze({ ...input.lastCountedCursor });
+  const countedTradeIds = Object.freeze([...input.countedTradeIds]);
+  const countedBuyerWallets = Object.freeze([...input.countedBuyerWallets]);
+  const lastQuote = input.lastQuote === null ? null : Object.freeze({ ...input.lastQuote });
+  const lastError = input.lastError === null ? null : Object.freeze({ ...input.lastError });
+  const id = createSessionId(input.candidate.id, strategy);
+  const openCommandId = `paper_open_${hash([
+    id, input.candidate.id, strategy.id, String(strategy.version),
+  ])}`;
+  const closeCommandId = input.pendingExitReason !== null && input.positionId !== null
+    ? `paper_sell_${hash([
+      input.positionId,
+      strategy.id,
+      String(strategy.version),
+      input.pendingExitReason,
+    ])}`
+    : null;
+  return Object.freeze({
+    id,
+    mint: input.candidate.mint,
+    quoteAsset,
+    strategy,
+    candidateId: input.candidate.id,
+    qualificationReportId: input.candidate.qualificationReportId,
+    actorKind: PAPER_SIMULATION_ACTOR_KIND,
+    state: input.state,
+    reasonCode: input.reasonCode,
+    positionId: input.positionId,
+    openCommandId,
+    closeCommandId,
+    entryCursor,
+    externalBuyTarget: input.externalBuyTarget,
+    externalBuyCount: input.externalBuyCount,
+    countedTradeIds,
+    countedBuyerWallets,
+    lastCountedCursor,
+    minimumConfirmation: input.minimumConfirmation,
+    lastQuote,
+    lastError,
+    pendingExitReason: input.pendingExitReason,
+    createdAtMs: input.createdAtMs,
+    updatedAtMs: input.updatedAtMs,
+    purgeAfterMs: input.purgeAfterMs,
+    payloadVersion: 2,
   });
 }
 

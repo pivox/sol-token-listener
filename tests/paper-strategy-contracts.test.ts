@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  createCreationEntrySession,
   countExternalBuy,
   createDeterministicPaperSellCommandId,
   createPaperStrategySession,
@@ -61,6 +62,47 @@ void test('counts confirmed post-entry external buys idempotently through the ta
   );
 });
 
+void test('creates a deterministic V2 creation session with paired unique buyer evidence', () => {
+  const candidate = eligibleCandidate('creation-entry-v1');
+  const input = {
+    ...sessionInput(candidate),
+    reasonCode: 'EXTERNAL_UNIQUE_BUY_OBSERVED' as const,
+    externalBuyCount: 1,
+    countedTradeIds: ['trade-a'],
+    countedBuyerWallets: ['wallet-a'],
+    lastCountedCursor: {
+      slot: 10n, transactionIndex: 1, instructionIndex: 3, innerInstructionIndex: null,
+    },
+    pendingExitReason: null,
+    updatedAtMs: 2_003,
+  };
+  const first = createCreationEntrySession(input);
+  const second = createCreationEntrySession(input);
+
+  assert.equal(first.payloadVersion, 2);
+  assert.equal(first.id, second.id);
+  assert.deepEqual(first.strategy, { id: 'creation-entry-v1', version: 1 });
+  assert.deepEqual(first.countedBuyerWallets, ['wallet-a']);
+  assert.equal(Object.isFrozen(first.countedBuyerWallets), true);
+  for (const reason of [
+    'CREATION_ENTRY_EXPIRED', 'CREATION_ENTRY_REJECTED',
+    'EXTERNAL_UNIQUE_BUY_OBSERVED', 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+    'TAKE_PROFIT_2X_EXECUTABLE', 'CREATOR_EARLY_SELL', 'MANUAL_KILL_SWITCH',
+    'SELL_QUOTE_UNAVAILABLE_OR_STALE',
+  ]) assert.ok(PAPER_DECISION_REASON_CODES.includes(reason as never));
+
+  assert.throws(() => createCreationEntrySession({
+    ...input,
+    externalBuyCount: 2,
+    countedTradeIds: ['trade-a', 'trade-b'],
+    countedBuyerWallets: ['wallet-a', 'wallet-a'],
+  }), /wallet|buyer|count/iu);
+  assert.throws(() => createCreationEntrySession({
+    ...input,
+    countedBuyerWallets: [],
+  }), /wallet|buyer|count/iu);
+});
+
 void test('enforces target, count, cursor, mint, quote and minimum confirmation', () => {
   for (const target of [0, 1_001]) {
     assert.throws(() => createPaperStrategySession({ ...sessionInput(), externalBuyTarget: target }), /target/iu);
@@ -79,8 +121,7 @@ void test('enforces target, count, cursor, mint, quote and minimum confirmation'
   ]) assert.throws(() => countExternalBuy(session, evidence), /external buy|evidence/iu);
 });
 
-function sessionInput() {
-  const candidate = eligibleCandidate();
+function sessionInput(candidate = eligibleCandidate()) {
   return {
     candidate,
     state: 'WAITING_EXTERNAL_BUYS' as const,
@@ -100,10 +141,10 @@ function sessionInput() {
   };
 }
 
-function eligibleCandidate() {
+function eligibleCandidate(strategyId: 'validated-external-buys' | 'creation-entry-v1' = 'validated-external-buys') {
   return createTradingCandidate({
     mint: 'MINT',
-    strategy: Object.freeze({ id: 'validated-external-buys', version: 1 }),
+    strategy: Object.freeze({ id: strategyId, version: 1 }),
     qualificationReportId: 'qreport_1',
     qualificationProfile: Object.freeze({
       id: 'pumpfun-v1-initial', version: 1, fingerprint: 'a'.repeat(64),
