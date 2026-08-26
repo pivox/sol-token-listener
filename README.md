@@ -120,10 +120,17 @@ reste active.
 Le WebSocket est le chemin nominal. Sans checkpoint, le premier rattrapage
 prend une seule page récente comme baseline au lieu de parcourir l'historique.
 Après l'ouverture des souscriptions, un second rattrapage ferme la fenêtre de
-course et converge par l'inbox idempotente. Chaque rattrapage HTTP est borné
-par `LISTENER_CATCH_UP_MAX_PAGES` pages de
-`LISTENER_CATCH_UP_PAGE_SIZE` signatures pour chacun des programmes Pump.fun
-et PumpSwap (20 × 100 par défaut). Une panne retryable est replanifiée avec un
+course et converge par l'inbox idempotente. La politique V1 par défaut,
+`LISTENER_CATCH_UP_POLICY=live-edge`, lit au plus une page de
+`LISTENER_CATCH_UP_PAGE_SIZE` signatures par programme et par scan. Si un
+checkpoint ancien n'est plus dans cette page, aucune transaction historique
+abandonnée n'est publiée comme nouvelle : le listener persiste atomiquement
+la lacune pendant quatre heures, déplace son checkpoint au bord courant et
+émet `listener.catch_up_gap_recorded` sans signature ni URL RPC. La politique
+`strict` conserve le parcours borné à `LISTENER_CATCH_UP_MAX_PAGES` pages et
+échoue avec `CATCH_UP_WINDOW_EXCEEDED` si la frontière reste introuvable.
+
+Une panne retryable est replanifiée avec un
 délai exponentiel piloté par `RPC_RETRY_BASE_DELAY_MS` et plafonné à 60 s.
 `RPC_RETRY_MAX_ATTEMPTS` compte les prises de lease d'un cycle, première
 tentative comprise (5 par défaut, maximum 100). La policy est persistée avec la

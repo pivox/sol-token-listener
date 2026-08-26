@@ -1,7 +1,9 @@
 import type {
+  CatchUpGap,
   ProcessingCheckpoint,
   TransactionNotification,
 } from '../domain/transaction-ingestion.js';
+import { createCatchUpGap } from '../domain/transaction-ingestion.js';
 import { reconcileConfirmationStatus } from '../domain/confirmation-status.js';
 import { PUMP_PROGRAM_ID } from '../launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../markets/pumpswap/constants.js';
@@ -24,13 +26,15 @@ export interface CatchUpSource {
 
 export type CatchUpScannerRepository = Pick<
   TransactionInboxRepository,
-  'enqueue' | 'readCheckpoint' | 'storeCheckpoint'
+  'enqueue' | 'readCheckpoint' | 'storeCheckpoint' | 'recordCatchUpGap'
 >;
 
 export interface CatchUpScannerOptions {
   readonly pageSize: number;
   readonly maxPages: number;
+  readonly policy?: 'live-edge' | 'strict';
   readonly now?: () => number;
+  readonly onGap?: (gap: CatchUpGap) => void;
 }
 
 export interface CatchUpScanResult {
@@ -72,6 +76,7 @@ interface ProgramScan {
   readonly rows: readonly CatchUpSignature[];
   readonly newest: CatchUpSignature | null;
   readonly pageCount: number;
+  readonly gap: CatchUpGap | null;
 }
 
 interface MergedDiscovery extends CatchUpSignature {
@@ -87,6 +92,8 @@ export class CatchUpScanner {
   private readonly now: () => number;
   private readonly pageSize: number;
   private readonly maxPages: number;
+  private readonly policy: 'live-edge' | 'strict';
+  private readonly onGap: ((gap: CatchUpGap) => void) | undefined;
 
   public constructor(
     private readonly source: CatchUpSource,
@@ -96,13 +103,19 @@ export class CatchUpScanner {
     const pageSize = optionValue(options, 'pageSize');
     const maxPages = optionValue(options, 'maxPages');
     const now = optionValue(options, 'now');
+    const policy: unknown = optionValue(options, 'policy');
+    const onGap = optionValue(options, 'onGap');
     if (!positiveBound(pageSize, MAX_CATCH_UP_PAGE_SIZE)
       || !positiveBound(maxPages, MAX_CATCH_UP_PAGES)
+      || (policy !== undefined && policy !== 'live-edge' && policy !== 'strict')
+      || (onGap !== undefined && typeof onGap !== 'function')
       || (now !== undefined && typeof now !== 'function')) {
       throw new TypeError('Catch-up scanner bounds are invalid.');
     }
     this.pageSize = pageSize;
     this.maxPages = maxPages;
+    this.policy = policy ?? 'strict';
+    this.onGap = onGap;
     this.now = now ?? Date.now;
   }
 
@@ -111,7 +124,7 @@ export class CatchUpScanner {
     const scans: ProgramScan[] = [];
     for (const program of PROGRAMS) {
       const checkpoint = await this.readCheckpoint(program.key);
-      scans.push(await this.scanProgram(program, checkpoint));
+      scans.push(await this.scanProgram(program, checkpoint, observedAtMs));
     }
 
     const merged = merge(scans);
@@ -141,7 +154,12 @@ export class CatchUpScanner {
         updatedAtMs: observedAtMs,
       });
       try {
-        await this.repository.storeCheckpoint(checkpoint);
+        if (scan.gap === null) {
+          await this.repository.storeCheckpoint(checkpoint);
+        } else {
+          await this.repository.recordCatchUpGap(scan.gap);
+          this.reportGap(scan.gap);
+        }
         checkpointWriteCount += 1;
       } catch {
         throw new CatchUpScannerError('checkpoint-write');
@@ -159,6 +177,7 @@ export class CatchUpScanner {
   private async scanProgram(
     program: ProgramDefinition,
     checkpoint: ProcessingCheckpoint | null,
+    observedAtMs: number,
   ): Promise<ProgramScan> {
     const rows: CatchUpSignature[] = [];
     const signatures = new Set<string>();
@@ -204,9 +223,28 @@ export class CatchUpScanner {
         completed = true;
         break;
       }
+      if (this.policy === 'live-edge') {
+        const baseline = page[0];
+        if (baseline === undefined) {
+          throw new CatchUpWindowExceededError(program.key);
+        }
+        const baselineCheckpoint: ProcessingCheckpoint = Object.freeze({
+          key: program.key,
+          slot: baseline.slot,
+          signature: baseline.signature,
+          updatedAtMs: observedAtMs,
+        });
+        const gap = createCatchUpGap(checkpoint, baselineCheckpoint, baselineCheckpoint.updatedAtMs);
+        return Object.freeze({
+          program,
+          rows: Object.freeze([]),
+          newest: baseline,
+          pageCount,
+          gap,
+        });
+      }
       if (page.length < this.pageSize) {
-        completed = true;
-        break;
+        throw new CatchUpWindowExceededError(program.key);
       }
       const cursor = page.at(-1)?.signature;
       if (cursor === undefined || cursor === before || cursors.has(cursor)) {
@@ -226,6 +264,7 @@ export class CatchUpScanner {
       rows: Object.freeze(rows),
       newest: monotonicNewest,
       pageCount,
+      gap: null,
     });
   }
 
@@ -254,6 +293,15 @@ export class CatchUpScanner {
       throw new TypeError('Catch-up scanner clock is invalid.');
     }
     return value;
+  }
+
+  private reportGap(gap: CatchUpGap): void {
+    if (this.onGap === undefined) return;
+    try {
+      this.onGap(gap);
+    } catch {
+      // Durable recovery must not be rolled back by an observational logger.
+    }
   }
 }
 

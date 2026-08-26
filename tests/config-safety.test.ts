@@ -263,6 +263,7 @@ void test('le modèle d’environnement publie les valeurs API sûres exactes', 
 void test('le listener durable est activé avec des bornes sûres par défaut', () => {
   const config = parseConfig(base);
   assert.equal(config.listenerEnabled, true);
+  assert.equal(config.listenerCatchUpPolicy, 'live-edge');
   assert.equal(config.listenerWorkerLeaseSeconds, 120);
   assert.equal(config.listenerCatchUpMaxPages, 20);
   assert.equal(config.listenerCatchUpPageSize, 100);
@@ -271,6 +272,19 @@ void test('le listener durable est activé avec des bornes sûres par défaut', 
   assert.equal(config.rpcRetryMaxAttempts, 5);
   assert.equal(config.rpcRetryBaseDelayMs, 500);
   assert.equal(config.reconcileSeconds, 15);
+});
+
+void test('la politique de rattrapage accepte uniquement live-edge ou strict', () => {
+  assert.equal(
+    parseConfig({ ...base, LISTENER_CATCH_UP_POLICY: 'strict' }).listenerCatchUpPolicy,
+    'strict',
+  );
+  for (const value of ['latest', 'fail', 'LIVE-EDGE', ' live-edge', 'live-edge ']) {
+    assert.throws(
+      () => parseConfig({ ...base, LISTENER_CATCH_UP_POLICY: value }),
+      /LISTENER_CATCH_UP_POLICY/u,
+    );
+  }
 });
 
 void test('la configuration listener accepte ses bornes exactes', () => {
@@ -337,6 +351,7 @@ void test('le modèle d’environnement publie les valeurs listener sûres exact
   const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
   for (const line of [
     'LISTENER_ENABLED=true',
+    'LISTENER_CATCH_UP_POLICY=live-edge',
     'LISTENER_WORKER_LEASE_SECONDS=120',
     'LISTENER_CATCH_UP_MAX_PAGES=20',
     'LISTENER_CATCH_UP_PAGE_SIZE=100',

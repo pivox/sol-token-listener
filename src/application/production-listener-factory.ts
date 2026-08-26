@@ -1,6 +1,7 @@
 import type { Commitment, Finality, PublicKey } from '@solana/web3.js';
-import type { AppConfig } from '../config/env.js';
+import type { AppConfig, ListenerCatchUpPolicy } from '../config/env.js';
 import type {
+  CatchUpGap,
   ListenerRuntimeState,
   RuntimeHeartbeat,
 } from '../domain/transaction-ingestion.js';
@@ -59,6 +60,7 @@ import { TradingCandidateService } from './trading-candidate.service.js';
 import { ValidatedExternalBuysStrategy } from './validated-external-buys.strategy.js';
 import { QualificationEngine } from '../qualification/qualification-engine.js';
 import { loadQualificationProfile } from '../qualification/qualification-profile.js';
+import { logger } from '../utils/logger.js';
 
 type ProductionPool = ReturnType<typeof getDatabasePool>;
 export const MAX_LISTENER_TIMER_DELAY_MS = 2_147_483_647;
@@ -95,6 +97,13 @@ export function createProductionListenerRuntime(
     {
       pageSize: config.listenerCatchUpPageSize,
       maxPages: config.listenerCatchUpMaxPages,
+      policy: config.listenerCatchUpPolicy,
+      onGap: (gap): void => {
+        logger.warn(
+          catchUpGapLogContext(gap, config.listenerCatchUpPolicy),
+          'Lacune de rattrapage persistée; reprise au bord courant.',
+        );
+      },
     },
   );
   const scanner = new StartupScanner(catchUp);
@@ -271,6 +280,25 @@ export function createProductionListenerRuntime(
     reconciler,
     heartbeat,
   }, { shutdownTimeoutMs: config.listenerShutdownTimeoutMs });
+}
+
+export function catchUpGapLogContext(
+  gap: CatchUpGap,
+  policy: ListenerCatchUpPolicy,
+): Readonly<{
+  event: 'listener.catch_up_gap_recorded';
+  program: CatchUpGap['key'];
+  previousSlot: string;
+  baselineSlot: string;
+  policy: ListenerCatchUpPolicy;
+}> {
+  return Object.freeze({
+    event: 'listener.catch_up_gap_recorded',
+    program: gap.key,
+    previousSlot: gap.previousSlot.toString(),
+    baselineSlot: gap.baselineSlot.toString(),
+    policy,
+  });
 }
 
 class StartupScanner {

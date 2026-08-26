@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { PublicKey } from '@solana/web3.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { reconcileConfirmationStatus } from './confirmation-status.js';
@@ -13,6 +14,7 @@ export const MAX_TRANSACTION_SNAPSHOT_INSTRUCTION_BYTES = 1_232;
 export const MAX_TRANSACTION_NOTIFICATION_PROGRAM_IDS = 16;
 export const MIN_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES = 32;
 export const MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES = 44;
+export const CATCH_UP_GAP_RETENTION_MS = 14_400_000;
 
 export const TRANSACTION_INBOX_STATUSES = Object.freeze([
   'PENDING',
@@ -139,6 +141,52 @@ export interface ProcessingCheckpoint {
   readonly slot: bigint;
   readonly signature: string;
   readonly updatedAtMs: number;
+}
+
+export interface CatchUpGap {
+  readonly gapId: string;
+  readonly key: ProcessingCheckpointKey;
+  readonly previousSlot: bigint;
+  readonly previousSignature: string;
+  readonly baselineSlot: bigint;
+  readonly baselineSignature: string;
+  readonly observedAtMs: number;
+  readonly purgeAfterMs: number;
+}
+
+export function createCatchUpGap(
+  previous: ProcessingCheckpoint,
+  baseline: ProcessingCheckpoint,
+  observedAtMs: number,
+): CatchUpGap {
+  assertValidProcessingCheckpoint(previous);
+  assertValidProcessingCheckpoint(baseline);
+  assertMilliseconds(observedAtMs, 'Catch-up gap observedAtMs');
+  if (previous.key !== baseline.key) {
+    throw new TypeError('Catch-up gap checkpoint keys do not match.');
+  }
+  const purgeAfterMs = observedAtMs + CATCH_UP_GAP_RETENTION_MS;
+  if (!Number.isSafeInteger(purgeAfterMs)) {
+    throw new TypeError('Catch-up gap purgeAfterMs is invalid.');
+  }
+  const value: CatchUpGap = Object.freeze({
+    gapId: catchUpGapId(
+      previous.key,
+      previous.slot,
+      previous.signature,
+      baseline.slot,
+      baseline.signature,
+    ),
+    key: previous.key,
+    previousSlot: previous.slot,
+    previousSignature: previous.signature,
+    baselineSlot: baseline.slot,
+    baselineSignature: baseline.signature,
+    observedAtMs,
+    purgeAfterMs,
+  });
+  assertValidCatchUpGap(value);
+  return value;
 }
 
 export interface FinalityCandidate {
@@ -359,6 +407,61 @@ export function assertValidProcessingCheckpoint(
   assertSlot(record.slot, 'Processing checkpoint slot');
   assertText(record.signature, 'Processing checkpoint signature');
   assertMilliseconds(record.updatedAtMs, 'Processing checkpoint updatedAtMs');
+}
+
+export function assertValidCatchUpGap(value: unknown): asserts value is CatchUpGap {
+  const record = frozenRecord(value, 'Catch-up gap');
+  if (record.key !== 'launchpad' && record.key !== 'market') {
+    throw new TypeError('Catch-up gap key is invalid.');
+  }
+  assertSlot(record.previousSlot, 'Catch-up gap previousSlot');
+  assertCatchUpSignature(record.previousSignature, 'Catch-up gap previousSignature');
+  assertSlot(record.baselineSlot, 'Catch-up gap baselineSlot');
+  assertCatchUpSignature(record.baselineSignature, 'Catch-up gap baselineSignature');
+  assertMilliseconds(record.observedAtMs, 'Catch-up gap observedAtMs');
+  assertMilliseconds(record.purgeAfterMs, 'Catch-up gap purgeAfterMs');
+  if (record.baselineSlot < record.previousSlot
+    || (record.baselineSlot === record.previousSlot
+      && record.baselineSignature === record.previousSignature)) {
+    throw new TypeError('Catch-up gap baseline does not advance the checkpoint.');
+  }
+  if (record.purgeAfterMs !== record.observedAtMs + CATCH_UP_GAP_RETENTION_MS) {
+    throw new TypeError('Catch-up gap purgeAfterMs is invalid.');
+  }
+  const expectedId = catchUpGapId(
+    record.key,
+    record.previousSlot,
+    record.previousSignature,
+    record.baselineSlot,
+    record.baselineSignature,
+  );
+  if (record.gapId !== expectedId) {
+    throw new TypeError('Catch-up gap gapId is invalid.');
+  }
+}
+
+function catchUpGapId(
+  key: ProcessingCheckpointKey,
+  previousSlot: bigint,
+  previousSignature: string,
+  baselineSlot: bigint,
+  baselineSignature: string,
+): string {
+  const canonical = [
+    key,
+    previousSlot.toString(),
+    previousSignature,
+    baselineSlot.toString(),
+    baselineSignature,
+  ].join('\u001f');
+  return `catchup_gap_${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+function assertCatchUpSignature(value: unknown, name: string): asserts value is string {
+  assertText(value, name);
+  if (value.length > 128 || Buffer.byteLength(value, 'utf8') > 128) {
+    throw new TypeError(`${name} exceeds 128 bytes.`);
+  }
 }
 
 export function assertValidFinalityCandidate(
