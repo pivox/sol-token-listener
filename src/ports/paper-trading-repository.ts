@@ -24,11 +24,14 @@ export interface PaperTradingTransaction {
     position: PaperPosition,
     trade: PaperTrade,
     event: PaperPositionOpenedEventV1,
+    entryDecisionAtMs: number | null,
+    entryDecisionJobId: string | null,
   ): Promise<void>;
   updateClosed(
     position: PaperPosition,
     trade: PaperTrade,
     event: PaperPositionClosedEventV1,
+    exitTriggerAtMs: number | null,
   ): Promise<void>;
   reconcileEventConfirmation(
     eventId: string,

@@ -62,6 +62,10 @@ export interface PaperPosition {
   readonly openCommandHash: string;
   readonly closeCommandHash: string | null;
   readonly triggerEventId: string;
+  readonly entryDecisionAtMs?: number | null;
+  readonly entryDecisionJobId?: string | null;
+  readonly closeEventId?: string | null;
+  readonly exitTriggerAtMs?: number | null;
   readonly strategySessionId?: string;
   readonly qualificationReportId?: string;
   readonly candidateId?: string;
@@ -95,6 +99,8 @@ export interface OpenPaperPositionCommand {
   readonly qualificationReportId?: string;
   readonly candidateId?: string;
   readonly expectedCurrentQualification?:PaperCurrentQualificationIdentity;
+  readonly entryDecisionAtMs?: number;
+  readonly entryDecisionJobId?: string;
 }
 
 export interface ClosePaperPositionCommand {
@@ -102,6 +108,7 @@ export interface ClosePaperPositionCommand {
   readonly trigger: DomainEvent;
   readonly sellQuote: PaperExecutionQuote;
   readonly reason: string;
+  readonly exitTriggerAtMs?: number;
 }
 
 export interface PaperPositionOpenedPayloadV1 {

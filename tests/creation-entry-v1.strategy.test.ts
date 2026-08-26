@@ -32,6 +32,8 @@ void test('opens one creation position and moves the V2 session to monitoring', 
     qualification: Object.freeze({}) as QualificationReport,
     qualificationEvent: candidateEvent(),
     maximumRoundTripLossBps: 3_000n,
+    entryDecisionAtMs: 500,
+    entryDecisionJobId: 'paper-job-open',
   });
 
   assert.equal(result.requestedAction, 'OPEN');
@@ -40,6 +42,8 @@ void test('opens one creation position and moves the V2 session to monitoring', 
   assert.equal(result.session.state, 'WAITING_EXTERNAL_BUYS');
   assert.equal(result.session.positionId, POSITION.id);
   assert.equal(ledger.openCalls.length, 1);
+  assert.equal(ledger.openCalls[0]?.entryDecisionAtMs, 500);
+  assert.equal(ledger.openCalls[0]?.entryDecisionJobId, 'paper-job-open');
 });
 
 void test('keeps the persisted minimum buy threshold when runtime configuration changes', async () => {
@@ -169,6 +173,7 @@ void test('closes the full position when the executable minimum proceeds reach 2
   assert.equal(ledger.closeCalls.length, 1);
   assert.equal(ledger.closeCalls[0]?.sellQuote.amountInRaw, POSITION.remainingBaseRaw);
   assert.equal(ledger.closeCalls[0]?.reason, 'TAKE_PROFIT_2X_EXECUTABLE');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, 1_000);
   assert.equal(router.requests[0]?.side, 'SELL');
 });
 
@@ -217,6 +222,7 @@ void test('prioritizes creator sell over take profit and buyer target', async ()
 
   assert.equal(result.session.reasonCode, 'CREATOR_EARLY_SELL');
   assert.equal(ledger.closeCalls[0]?.reason, 'CREATOR_EARLY_SELL');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, 1_003);
 });
 
 void test('prioritizes the manual kill switch over every market trigger', async () => {
@@ -245,6 +251,7 @@ void test('prioritizes the manual kill switch over every market trigger', async 
 
   assert.equal(result.session.reasonCode, 'MANUAL_KILL_SWITCH');
   assert.equal(ledger.closeCalls[0]?.reason, 'MANUAL_KILL_SWITCH');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, 4_000);
 });
 
 void test('keeps a mandatory exit pending when the full sell quote is unavailable', async () => {
@@ -271,6 +278,40 @@ void test('keeps a mandatory exit pending when the full sell quote is unavailabl
   assert.equal(result.session.reasonCode, 'SELL_QUOTE_UNAVAILABLE_OR_STALE');
   assert.equal(result.session.pendingExitReason, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
   assert.equal(ledger.closeCalls.length, 0);
+});
+
+void test('preserves the exact target-buy observation across a quote retry', async () => {
+  const ledger = new FakeLedger();
+  const candidate = eligibleCandidate();
+  const failed = new CreationEntryV1Strategy(
+    ledger,
+    new FakeRouter(new PaperQuoteError('QUOTE_STATE_UNAVAILABLE', 'state unavailable')),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const prepared = failed.prepare(candidate, {
+    externalBuyTarget: 1, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(prepared);
+  const sourceBuy = launchBuy('target-source', 2, 'wallet-a', 2_000n);
+  const pending = await failed.reconcile({
+    candidate, session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    position:POSITION,creator:'creator',launchTrades:[sourceBuy],marketTrades:[],nowMs:4_000,
+    contextEvent:candidateEvent(),
+  });
+  assert.equal(pending.session.state, 'EXIT_PENDING_QUOTE');
+
+  const recovered = new CreationEntryV1Strategy(
+    ledger, new FakeRouter(quote('sell-retry', 'MINT', 'SOL', 900n, 1_100n)),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  await recovered.reconcile({
+    candidate,session:pending.session,position:POSITION,creator:'creator',
+    launchTrades:[sourceBuy],marketTrades:[],nowMs:5_000,contextEvent:candidateEvent(),
+  });
+
+  assert.equal(ledger.closeCalls[0]?.reason, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, sourceBuy.observedAtMs);
+  assert.equal(ledger.closeCalls[0]?.trigger.id, sourceBuy.id);
 });
 
 void test('recovers a committed creation close without quoting or closing twice', async () => {

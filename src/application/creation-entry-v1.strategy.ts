@@ -112,6 +112,8 @@ export class CreationEntryV1Strategy {
     qualification: QualificationReport;
     qualificationEvent: DomainEvent;
     maximumRoundTripLossBps: bigint;
+    entryDecisionAtMs?: number;
+    entryDecisionJobId?: string;
   }>): Promise<CreationEntryStrategyResult> {
     return this.openOrRecover(input, false);
   }
@@ -122,6 +124,8 @@ export class CreationEntryV1Strategy {
     qualification: QualificationReport;
     qualificationEvent: DomainEvent;
     maximumRoundTripLossBps: bigint;
+    entryDecisionAtMs?: number;
+    entryDecisionJobId?: string;
   }>): Promise<CreationEntryStrategyResult> {
     return this.openOrRecover(input, true);
   }
@@ -132,6 +136,8 @@ export class CreationEntryV1Strategy {
     qualification: QualificationReport;
     qualificationEvent: DomainEvent;
     maximumRoundTripLossBps: bigint;
+    entryDecisionAtMs?: number;
+    entryDecisionJobId?: string;
   }>, recovery: boolean): Promise<CreationEntryStrategyResult> {
     const { candidate, session } = input;
     if (
@@ -156,6 +162,10 @@ export class CreationEntryV1Strategy {
         mint: candidate.mint,
         reportId: candidate.qualificationReportId,
         qualificationEventId: input.qualificationEvent.id,
+      }),
+      ...(input.entryDecisionAtMs === undefined || input.entryDecisionJobId === undefined ? {} : {
+        entryDecisionAtMs: input.entryDecisionAtMs,
+        entryDecisionJobId: input.entryDecisionJobId,
       }),
     } as const;
     const position = recovery
@@ -251,12 +261,14 @@ export class CreationEntryV1Strategy {
       updatedAtMs: Math.max(input.session.createdAtMs, input.position.openedAtMs),
     });
     if (input.position.status === 'PAPER_HOLDING') {
-      return this.reconcile({ ...input, session: baseline });
+      return this.reconcile({ ...input, session: baseline, contextEvent:input.orphanedEvent });
     }
 
     let rebuilt = baseline;
     const counted: PaperExternalBuyEvidenceV2[] = [];
-    for (const buy of canonicalBuys({ ...input, session: baseline })) {
+    for (const buy of canonicalBuys({
+      ...input, session: baseline, contextEvent:input.orphanedEvent,
+    })) {
       const result = countUniqueExternalBuy(rebuilt, {
         tradeId: buy.id,
         mint: input.candidate.mint,
@@ -270,7 +282,9 @@ export class CreationEntryV1Strategy {
       rebuilt = result.session;
       if (result.evidence !== null) counted.push(result.evidence);
     }
-    const creatorSell = earliestCreatorSell({ ...input, session: rebuilt });
+    const creatorSell = earliestCreatorSell({
+      ...input, session: rebuilt, contextEvent:input.orphanedEvent,
+    });
     const priorQuote = input.session.lastQuote;
     const profitStillSupported = priorQuote !== null
       && priorQuote.inputMint === input.candidate.mint
@@ -322,6 +336,7 @@ export class CreationEntryV1Strategy {
     launchTrades: readonly BondingCurveTradeObservedEventV1[];
     marketTrades: readonly MarketTrade[];
     nowMs: number;
+    contextEvent?: DomainEvent;
   }>): Promise<CreationEntryStrategyResult> {
     if (
       input.candidate.strategy.id !== 'creation-entry-v1'
@@ -332,8 +347,9 @@ export class CreationEntryV1Strategy {
 
     let session = input.session;
     const counted: PaperExternalBuyEvidenceV2[] = [];
-    let trigger: DomainEvent = candidateTrigger(input.candidate);
-    for (const buy of canonicalBuys(input)) {
+    const canonical = canonicalBuys(input);
+    let trigger: DomainEvent = input.contextEvent ?? candidateTrigger(input.candidate);
+    for (const buy of canonical) {
       const result = countUniqueExternalBuy(session, {
         tradeId: buy.id,
         mint: input.candidate.mint,
@@ -352,13 +368,17 @@ export class CreationEntryV1Strategy {
       if (result.targetReached) break;
     }
     const creatorSell = earliestCreatorSell(input);
+    const targetBuy = session.externalBuyCount >= session.externalBuyTarget
+      ? canonical[session.externalBuyTarget - 1] ?? null
+      : null;
     const mandatoryReason = this.options.manualKillSwitch
       ? 'MANUAL_KILL_SWITCH'
       : creatorSell === null
         ? session.pendingExitReason
         : 'CREATOR_EARLY_SELL';
-    if (this.options.manualKillSwitch) trigger = candidateTrigger(input.candidate);
+    if (this.options.manualKillSwitch) trigger = input.contextEvent ?? candidateTrigger(input.candidate);
     else if (creatorSell !== null) trigger = creatorSell;
+    else if (targetBuy !== null) trigger = targetBuy.trigger;
 
     if (input.position.status === 'PAPER_CLOSED') {
       if (
@@ -441,11 +461,24 @@ export class CreationEntryV1Strategy {
       return strategyResult(monitoring, counted, input.position, trigger);
     }
 
+    let exitTriggerAtMs: number;
+    if (exitReason === 'MANUAL_KILL_SWITCH') exitTriggerAtMs=input.nowMs;
+    else if (exitReason === 'TAKE_PROFIT_2X_EXECUTABLE') {
+      exitTriggerAtMs=sellQuote.observedAtMs;
+    } else if (exitReason === 'CREATOR_EARLY_SELL') {
+      if (creatorSell === null) throw new TypeError('Creator exit source is missing.');
+      exitTriggerAtMs=creatorSell.observedAtMs;
+    } else {
+      if (targetBuy === null) throw new TypeError('External buyer exit source is missing.');
+      exitTriggerAtMs=targetBuy.observedAtMs;
+    }
+
     const position = await this.ledger.close({
       positionId: input.position.id,
       trigger,
       sellQuote,
       reason: exitReason,
+      exitTriggerAtMs,
     });
     const closedAtMs = position.closedAtMs ?? input.nowMs;
     const closed = updateSession(input.candidate, session, {

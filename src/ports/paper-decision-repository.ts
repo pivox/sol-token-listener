@@ -29,6 +29,7 @@ export interface ClaimedPaperDecisionJob extends PaperDecisionJobInput {
   readonly maxAttempts: number;
   readonly leaseToken: string;
   readonly leaseExpiresAtMs: number;
+  readonly createdAtMs: number;
 }
 
 export interface PaperDecisionQueueCounts {

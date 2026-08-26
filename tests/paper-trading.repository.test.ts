@@ -16,7 +16,7 @@ void test('persiste position, trade et événement dans une transaction', async 
   });
 
   await repository.transact(async (transaction) => {
-    await transaction.insertOpened(position(), trade(), event());
+    await transaction.insertOpened(position(), trade(), event(), 500, 'job-open');
   });
 
   assert.deepEqual(client.commands, [
@@ -28,6 +28,9 @@ void test('persiste position, trade et événement dans une transaction', async 
   ]);
   assert.equal(client.released, true);
   assert.equal(client.values.flat().some((value) => typeof value === 'bigint'), false);
+  assert.equal((client.values[1]?.at(-2) as Date).getTime(), 500);
+  assert.equal(client.values[1]?.at(-1), 'job-open');
+  assert.equal((client.values[2]?.at(-1) as Date).getTime(), 1);
 });
 
 void test('persiste et relit la lignée de stratégie sans casser les anciennes positions', async () => {
@@ -37,9 +40,9 @@ void test('persiste et relit la lignée de stratégie sans casser les anciennes 
   const writer = new RecordingClient();
   const repository = new PostgresPaperTradingRepository({ connect:async () => writer });
   await repository.transact(async (transaction) => {
-    await transaction.insertOpened(lineagePosition, trade(), event());
+    await transaction.insertOpened(lineagePosition, trade(), event(), 500, 'job-open');
   });
-  assert.deepEqual(writer.values[1]?.slice(-3), ['paper-session','report','candidate']);
+  assert.deepEqual(writer.values[1]?.slice(-5, -2), ['paper-session','report','candidate']);
 
   const reader = new RecordingClient(false, [{ payload:toJsonValue(lineagePosition) }]);
   const readRepository = new PostgresPaperTradingRepository({ connect:async () => reader });
@@ -56,7 +59,7 @@ void test('rollback si l’événement ne peut pas être persisté', async () =>
   });
 
   await assert.rejects(repository.transact(async (transaction) => {
-    await transaction.insertOpened(position(), trade(), event());
+    await transaction.insertOpened(position(), trade(), event(), 500, 'job-open');
   }), /event failure/u);
 
   assert.equal(client.commands.at(-1), 'ROLLBACK');
@@ -127,7 +130,7 @@ void test('rolls back a stale current qualification before paper writes',async()
     await transaction.requireCurrentQualification({
       mint:'MINT',reportId:'report',qualificationEventId:'qualification-event',
     });
-    await transaction.insertOpened(position(),trade(),event());
+    await transaction.insertOpened(position(),trade(),event(),null,null);
   }),hasCode('QUALIFICATION_NOT_CURRENT'));
 
   assert.equal(client.commands.includes('INSERT paper_positions'),false);
@@ -141,22 +144,23 @@ void test('rend les événements paper purgeables à la fermeture', async () => 
   });
 
   await repository.transact(async (transaction) => {
-    await transaction.updateClosed(closedPosition(), sellTrade(), closedEvent());
+    await transaction.updateClosed(closedPosition(), sellTrade(), closedEvent(), 900);
   });
 
   assert.deepEqual(client.commands, [
     'BEGIN',
+    'INSERT domain_events',
     'UPDATE paper_positions',
     'INSERT paper_trades',
     'UPDATE domain_events',
-    'INSERT domain_events',
     'COMMIT',
   ]);
-  assert.deepEqual(client.values[3]?.slice(0, 1), ['position']);
-  assert.equal(client.values[3]?.[1] instanceof Date, true);
-  assert.equal(client.values[3]?.[2] instanceof Date, true);
-  assert.equal(client.values[4]?.[15] instanceof Date, true);
-  assert.equal(client.values[4]?.[16] instanceof Date, true);
+  assert.equal(client.values[1]?.[12] instanceof Date, true);
+  assert.deepEqual(client.values[4]?.slice(0, 1), ['position']);
+  assert.equal(client.values[4]?.[1] instanceof Date, true);
+  assert.equal(client.values[4]?.[2] instanceof Date, true);
+  assert.equal(client.values[2]?.includes('closed-event'), true);
+  assert.equal(client.values[2]?.some((value) => value instanceof Date && value.getTime() === 900), true);
 });
 
 void test('réconcilie durablement la finalité d’un événement paper', async () => {

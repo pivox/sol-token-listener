@@ -29,8 +29,12 @@ void test('defines replayable paper MVP runs and immutable samples', async () =>
   assert.match(sql, /sample_status = 'UNKNOWN' AND unknown_reason IS NOT NULL/u);
   assert.match(sql, /paper-mvp-unknown-position\.v1/u);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS entry_decision_at TIMESTAMPTZ/u);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS entry_decision_job_id TEXT/u);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS quote_observed_at TIMESTAMPTZ/u);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS close_event_id TEXT REFERENCES domain_events\(event_id\)/u);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS exit_trigger_at TIMESTAMPTZ/u);
+  assert.match(sql, /paper_positions_mvp_collect_idx/u);
+  assert.match(sql, /POSITION_RETRACTED/u);
   assert.match(sql, /prevent_paper_mvp_sample_mutation/u);
   assert.match(sql, /prevent_paper_mvp_run_immutable_mutation/u);
   assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);

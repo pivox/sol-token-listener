@@ -1,17 +1,25 @@
 ALTER TABLE paper_positions
   ADD COLUMN IF NOT EXISTS entry_decision_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS entry_decision_job_id TEXT,
   ADD COLUMN IF NOT EXISTS close_event_id TEXT REFERENCES domain_events(event_id),
   ADD COLUMN IF NOT EXISTS exit_trigger_at TIMESTAMPTZ;
+
+ALTER TABLE paper_trades
+  ADD COLUMN IF NOT EXISTS quote_observed_at TIMESTAMPTZ;
 
 ALTER TABLE paper_positions
   DROP CONSTRAINT IF EXISTS paper_positions_mvp_source_times_check;
 ALTER TABLE paper_positions
   ADD CONSTRAINT paper_positions_mvp_source_times_check CHECK (
-    (entry_decision_at IS NULL OR entry_decision_at <= opened_at)
-    AND (exit_trigger_at IS NULL OR closed_at IS NULL OR exit_trigger_at <= closed_at)
+    (entry_decision_at IS NULL) = (entry_decision_job_id IS NULL)
+    AND (entry_decision_job_id IS NULL
+      OR OCTET_LENGTH(entry_decision_job_id) BETWEEN 1 AND 256)
   );
 CREATE UNIQUE INDEX IF NOT EXISTS paper_positions_close_event_idx
   ON paper_positions (close_event_id) WHERE close_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS paper_positions_mvp_collect_idx
+  ON paper_positions (strategy_id,strategy_version,opened_at,closed_at,position_id)
+  WHERE status IN ('PAPER_CLOSED','PAPER_RETRACTED');
 
 -- Historical rows remain NULL: migration 018 cannot reconstruct these exact
 -- application observation times without inventing evidence.
@@ -78,7 +86,8 @@ CREATE TABLE IF NOT EXISTS paper_mvp_position_samples (
     'MISSING_CREATION_DETECTED_AT','MISSING_ENTRY_DECISION_AT','MISSING_ENTRY_QUOTE_AT',
     'MISSING_PAPER_BUY_AT','MISSING_EXIT_TRIGGER_AT','MISSING_EXIT_QUOTE_AT',
     'MISSING_PAPER_SELL_AT','INVALID_TIMESTAMP_ORDER','MISSING_BUY_TRADE',
-    'MISSING_SELL_TRADE','UNSUPPORTED_EXIT_REASON','SOURCE_CONTRADICTION'
+    'MISSING_SELL_TRADE','UNSUPPORTED_EXIT_REASON','SOURCE_CONTRADICTION',
+    'POSITION_RETRACTED'
   )),
   mint TEXT CHECK (mint IS NULL OR OCTET_LENGTH(mint) BETWEEN 1 AND 512),
   quote_mint TEXT CHECK (quote_mint IS NULL OR OCTET_LENGTH(quote_mint) BETWEEN 1 AND 512),

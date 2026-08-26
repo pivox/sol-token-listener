@@ -288,6 +288,8 @@ export class PaperDecisionWorker {
           candidate:candidateResult.candidate,session:pending,
           qualification:rebuilt.report,qualificationEvent:rebuilt.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
+          entryDecisionAtMs:job.createdAtMs,
+          entryDecisionJobId:job.jobId,
         });
       } catch (error:unknown) {
         if(isQualificationNotCurrent(error)){
@@ -367,6 +369,8 @@ export class PaperDecisionWorker {
         opened=await openStrategy(this.strategy, {
           candidate,session,qualification:context.report,qualificationEvent:context.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
+          entryDecisionAtMs:job.createdAtMs,
+          entryDecisionJobId:job.jobId,
         });
       }catch(error:unknown){
         if(isQualificationNotCurrent(error)){
@@ -417,7 +421,7 @@ export class PaperDecisionWorker {
         reconciled=await reconcileStrategy(this.strategy, {
           candidate,session,position:snapshot.activePosition,creator:snapshot.launch.creator,
           launchTrades:snapshot.activeLaunchTrades,marketTrades:snapshot.activeMarketTrades,
-          nowMs:this.readNow(),
+          nowMs:this.readNow(),contextEvent:decisionSnapshot.candidateEvent,
         });
       }
     } catch (error:unknown) {
@@ -579,9 +583,12 @@ type LegacyEvidenceInput = Parameters<ValidatedExternalBuysStrategy['reconcileEv
 type CreationEvidenceInput = Parameters<CreationEntryV1Strategy['reconcileEvidence']>[0];
 type AnyOpenInput = Omit<LegacyOpenInput, 'session'> & Readonly<{
   session: PaperStrategySession;
+  entryDecisionAtMs?: number;
+  entryDecisionJobId?: string;
 }>;
 type AnyReconcileInput = Omit<LegacyReconcileInput, 'session'> & Readonly<{
   session: PaperStrategySession;
+  contextEvent?: DomainEvent;
 }>;
 type AnySourceInput = Omit<LegacySourceInput, 'session'> & Readonly<{
   session: PaperStrategySession;

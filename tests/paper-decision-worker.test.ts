@@ -914,7 +914,7 @@ function claim(): ClaimedPaperDecisionJob {
   return Object.freeze({
     jobId:'paper-job',mint:'MINT',sourceEventId:'evt_source',sourceRawEventId:'raw_source',
     sourceConfirmationStatus:'confirmed',inputFingerprint:'a'.repeat(64),attempts:1,
-    maxAttempts:3,leaseToken:'lease',leaseExpiresAtMs:11_000,
+    maxAttempts:3,leaseToken:'lease',leaseExpiresAtMs:11_000,createdAtMs:500,
   });
 }
 
