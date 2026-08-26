@@ -5,7 +5,9 @@ import type { BondingCurveTradeObservedEventV1 } from '../domain/launchpad-event
 import type { MarketTrade } from '../domain/market.js';
 import {
   countUniqueExternalBuy,
+  createDeterministicCreationExitCommandId,
   createCreationEntrySession,
+  type CreationExitReason,
   type PaperExternalBuyEvidenceV2,
   type PaperMinimumConfirmation,
   type PaperStrategySessionV2,
@@ -13,7 +15,7 @@ import {
 import type { PaperPosition } from '../domain/paper-trading.js';
 import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
 import type { ChainConfirmationStatus, ChainCursor } from '../domain/types.js';
-import type { PaperQuoteRouter } from '../ports/paper-quote-router.js';
+import { PaperQuoteError, type PaperQuoteRouter } from '../ports/paper-quote-router.js';
 import { canonicalStringifyJson } from '../utils/json.js';
 import type { PaperTradingActions } from './validated-external-buys.strategy.js';
 
@@ -28,6 +30,8 @@ export interface CreationEntryStrategyResult {
 interface CreationEntryOptions {
   readonly retentionMs: number;
   readonly externalMinimumBuyAmountRaw: bigint;
+  readonly takeProfitMultiplierBps?: bigint;
+  readonly manualKillSwitch?: boolean;
 }
 
 interface CanonicalBuy {
@@ -41,19 +45,33 @@ interface CanonicalBuy {
 }
 
 export class CreationEntryV1Strategy {
-  private readonly options: CreationEntryOptions;
+  private readonly options: Readonly<{
+    retentionMs: number;
+    externalMinimumBuyAmountRaw: bigint;
+    takeProfitMultiplierBps: bigint;
+    manualKillSwitch: boolean;
+  }>;
 
   public constructor(
-    ledger: PaperTradingActions,
-    quotes: PaperQuoteRouter,
+    private readonly ledger: PaperTradingActions,
+    private readonly quotes: PaperQuoteRouter,
     options: CreationEntryOptions,
   ) {
-    void ledger;
-    void quotes;
-    if (options.retentionMs !== 14_400_000 || options.externalMinimumBuyAmountRaw <= 0n) {
+    const takeProfitMultiplierBps = options.takeProfitMultiplierBps ?? 20_000n;
+    if (
+      options.retentionMs !== 14_400_000
+      || options.externalMinimumBuyAmountRaw <= 0n
+      || takeProfitMultiplierBps < 10_000n
+      || takeProfitMultiplierBps > 1_000_000n
+    ) {
       throw new RangeError('Creation entry strategy options are invalid.');
     }
-    this.options = Object.freeze({ ...options });
+    this.options = Object.freeze({
+      retentionMs: options.retentionMs,
+      externalMinimumBuyAmountRaw: options.externalMinimumBuyAmountRaw,
+      takeProfitMultiplierBps,
+      manualKillSwitch: options.manualKillSwitch ?? false,
+    });
   }
 
   public prepare(
@@ -86,7 +104,7 @@ export class CreationEntryV1Strategy {
     });
   }
 
-  public reconcile(input: Readonly<{
+  public async reconcile(input: Readonly<{
     candidate: TradingCandidateV1;
     session: PaperStrategySessionV2;
     position: PaperPosition;
@@ -123,8 +141,147 @@ export class CreationEntryV1Strategy {
       }
       if (result.targetReached) break;
     }
-    return Promise.resolve(strategyResult(session, counted, input.position, trigger));
+    const creatorSell = earliestCreatorSell(input);
+    const mandatoryReason = this.options.manualKillSwitch
+      ? 'MANUAL_KILL_SWITCH'
+      : creatorSell === null
+        ? session.pendingExitReason
+        : 'CREATOR_EARLY_SELL';
+    if (this.options.manualKillSwitch) trigger = candidateTrigger(input.candidate);
+    else if (creatorSell !== null) trigger = creatorSell;
+
+    let sellQuote;
+    try {
+      sellQuote = await this.quotes.quote({
+        mint: input.candidate.mint,
+        quoteAsset: input.candidate.quoteAsset,
+        side: 'SELL',
+        amountInRaw: input.position.remainingBaseRaw,
+        slippageBps: input.candidate.buyQuote?.slippageBps ?? 0n,
+      });
+      if (
+        sellQuote.inputMint !== input.candidate.mint
+        || sellQuote.outputMint !== input.candidate.quoteAsset.mint
+        || sellQuote.amountInRaw !== input.position.remainingBaseRaw
+      ) {
+        throw new PaperQuoteError('QUOTE_STATE_INCONSISTENT', 'Full-position sell quote is inconsistent.');
+      }
+    } catch (error: unknown) {
+      if (mandatoryReason === null) return strategyResult(session, counted, input.position, trigger);
+      const known = error instanceof PaperQuoteError ? error : null;
+      const pending = updateSession(input.candidate, session, {
+        state: 'EXIT_PENDING_QUOTE',
+        reasonCode: 'SELL_QUOTE_UNAVAILABLE_OR_STALE',
+        pendingExitReason: mandatoryReason,
+        lastError: Object.freeze({
+          code: known?.code ?? 'QUOTE_FAILURE',
+          message: known?.message ?? 'Full-position sell quote failed.',
+          retryable: known?.retryable ?? false,
+        }),
+        updatedAtMs: input.nowMs,
+      });
+      return strategyResult(pending, counted, input.position, trigger);
+    }
+
+    const takeProfitReached = sellQuote.minimumAmountOutRaw * 10_000n
+      >= input.position.quoteCostRaw * this.options.takeProfitMultiplierBps;
+    const exitReason: CreationExitReason | null = mandatoryReason
+      ?? (takeProfitReached ? 'TAKE_PROFIT_2X_EXECUTABLE' : null)
+      ?? (session.externalBuyCount >= session.externalBuyTarget
+        ? 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED'
+        : null);
+    if (exitReason === null) {
+      const monitoring = updateSession(input.candidate, session, {
+        state: 'WAITING_EXTERNAL_BUYS',
+        lastQuote: sellQuote,
+        lastError: null,
+        updatedAtMs: input.nowMs,
+      });
+      return strategyResult(monitoring, counted, input.position, trigger);
+    }
+
+    const position = await this.ledger.close({
+      positionId: input.position.id,
+      trigger,
+      sellQuote,
+      reason: exitReason,
+    });
+    const closedAtMs = position.closedAtMs ?? input.nowMs;
+    const closed = updateSession(input.candidate, session, {
+      state: 'PAPER_CLOSED',
+      reasonCode: exitReason,
+      pendingExitReason: exitReason,
+      closeCommandId: createDeterministicCreationExitCommandId(
+        input.position.id,
+        session.strategy,
+        exitReason,
+      ),
+      lastQuote: sellQuote,
+      lastError: null,
+      updatedAtMs: closedAtMs,
+      purgeAfterMs: position.purgeAfterMs ?? closedAtMs + this.options.retentionMs,
+    });
+    return strategyResult(closed, counted, position, trigger, 'CLOSE');
   }
+}
+
+function updateSession(
+  candidate: TradingCandidateV1,
+  session: PaperStrategySessionV2,
+  update: Partial<PaperStrategySessionV2>,
+): PaperStrategySessionV2 {
+  const next = { ...session, ...update };
+  return createCreationEntrySession({
+    candidate,
+    state: next.state,
+    reasonCode: next.reasonCode,
+    positionId: next.positionId,
+    entryCursor: next.entryCursor,
+    externalBuyTarget: next.externalBuyTarget,
+    externalBuyCount: next.externalBuyCount,
+    countedTradeIds: next.countedTradeIds,
+    countedBuyerWallets: next.countedBuyerWallets,
+    lastCountedCursor: next.lastCountedCursor,
+    minimumConfirmation: next.minimumConfirmation,
+    lastQuote: next.lastQuote,
+    lastError: next.lastError,
+    pendingExitReason: next.pendingExitReason,
+    createdAtMs: next.createdAtMs,
+    updatedAtMs: next.updatedAtMs,
+    purgeAfterMs: next.purgeAfterMs,
+  });
+}
+
+function earliestCreatorSell(
+  input: Parameters<CreationEntryV1Strategy['reconcile']>[0],
+): DomainEvent | null {
+  const sells: DomainEvent[] = [];
+  for (const event of input.launchTrades) {
+    const trade = event.payload.trade;
+    if (
+      trade.kind === 'SELL'
+      && trade.trader === input.creator
+      && trade.launchMint === input.candidate.mint
+      && trade.quoteAsset.mint === input.candidate.quoteAsset.mint
+      && confirmationReached(event.confirmationStatus, input.session.minimumConfirmation)
+      && compareCursors(trade.cursor, input.session.entryCursor) > 0
+    ) sells.push(event as unknown as DomainEvent);
+  }
+  for (const trade of input.marketTrades) {
+    if (
+      trade.kind === 'SELL'
+      && trade.trader === input.creator
+      && trade.mint === input.candidate.mint
+      && trade.quoteAsset.mint === input.candidate.quoteAsset.mint
+      && confirmationReached(trade.confirmationStatus, input.session.minimumConfirmation)
+      && compareCursors(trade.cursor, input.session.entryCursor) > 0
+    ) sells.push(marketTrigger(trade));
+  }
+  sells.sort((left, right) => {
+    const order = compareCursors(left.cursor, right.cursor);
+    return order === 0 ? left.id.localeCompare(right.id) : order;
+  });
+  return sells[0] ?? null;
 }
 
 function canonicalBuys(
@@ -199,13 +356,14 @@ function strategyResult(
   countedExternalBuys: readonly PaperExternalBuyEvidenceV2[],
   position: PaperPosition,
   trigger: DomainEvent,
+  requestedAction: CreationEntryStrategyResult['requestedAction'] = 'NONE',
 ): CreationEntryStrategyResult {
   const sessionEvent = createSessionEvent(session, trigger);
   return Object.freeze({
     session,
     sessionEvent,
     countedExternalBuys: Object.freeze([...countedExternalBuys]),
-    requestedAction: 'NONE',
+    requestedAction,
     position,
   });
 }

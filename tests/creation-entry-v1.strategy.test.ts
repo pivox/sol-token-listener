@@ -11,6 +11,7 @@ import type {
   PaperPosition,
 } from '../src/domain/paper-trading.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
+import { PaperQuoteError, type PaperQuoteRequest } from '../src/ports/paper-quote-router.js';
 
 void test('counts one wallet once across repeated Pump.fun and PumpSwap buys', async () => {
   const strategy = new CreationEntryV1Strategy(
@@ -73,9 +74,144 @@ void test('counts ten distinct eligible wallets and rejects below-minimum or inv
 
   assert.equal(result.session.externalBuyCount, 10);
   assert.equal(new Set(result.session.countedBuyerWallets).size, 10);
-  assert.equal(result.session.state, 'EXIT_PENDING_QUOTE');
+  assert.equal(result.session.state, 'PAPER_CLOSED');
   assert.equal(result.session.reasonCode, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
   assert.equal(result.session.pendingExitReason, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
+  assert.equal(result.requestedAction, 'CLOSE');
+});
+
+void test('closes the full position when the executable minimum proceeds reach 2x', async () => {
+  const ledger = new FakeLedger();
+  const router = new FakeRouter(quote('sell-2x', 'MINT', 'SOL', 900n, 2_100n, 2_000n));
+  const strategy = new CreationEntryV1Strategy(ledger, router, {
+    retentionMs: 14_400_000,
+    externalMinimumBuyAmountRaw: 1_000n,
+    takeProfitMultiplierBps: 20_000n,
+  });
+  const candidate = eligibleCandidate();
+  const session = strategy.prepare(candidate, {
+    externalBuyTarget: 10, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(session);
+
+  const result = await strategy.reconcile({
+    candidate,
+    session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    position: POSITION,
+    creator: 'creator',
+    launchTrades: [],
+    marketTrades: [],
+    nowMs: 4_000,
+  });
+
+  assert.equal(result.requestedAction, 'CLOSE');
+  assert.equal(result.session.reasonCode, 'TAKE_PROFIT_2X_EXECUTABLE');
+  assert.equal(result.session.state, 'PAPER_CLOSED');
+  assert.equal(ledger.closeCalls.length, 1);
+  assert.equal(ledger.closeCalls[0]?.sellQuote.amountInRaw, POSITION.remainingBaseRaw);
+  assert.equal(ledger.closeCalls[0]?.reason, 'TAKE_PROFIT_2X_EXECUTABLE');
+  assert.equal(router.requests[0]?.side, 'SELL');
+});
+
+void test('does not close on a theoretical 2x when minimum executable proceeds are below 2x', async () => {
+  const ledger = new FakeLedger();
+  const strategy = new CreationEntryV1Strategy(
+    ledger,
+    new FakeRouter(quote('sell-theoretical', 'MINT', 'SOL', 900n, 2_500n, 1_900n)),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const candidate = eligibleCandidate();
+  const session = strategy.prepare(candidate, {
+    externalBuyTarget: 10, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(session);
+
+  const result = await strategy.reconcile({
+    candidate, session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    position: POSITION, creator: 'creator', launchTrades: [], marketTrades: [], nowMs: 4_000,
+  });
+
+  assert.equal(result.requestedAction, 'NONE');
+  assert.equal(result.session.state, 'WAITING_EXTERNAL_BUYS');
+  assert.equal(ledger.closeCalls.length, 0);
+});
+
+void test('prioritizes creator sell over take profit and buyer target', async () => {
+  const ledger = new FakeLedger();
+  const strategy = new CreationEntryV1Strategy(
+    ledger,
+    new FakeRouter(quote('sell', 'MINT', 'SOL', 900n, 2_100n, 2_000n)),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const candidate = eligibleCandidate();
+  const session = strategy.prepare(candidate, {
+    externalBuyTarget: 1, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(session);
+
+  const result = await strategy.reconcile({
+    candidate, session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    position: POSITION, creator: 'creator',
+    launchTrades: [launchBuy('external', 2, 'wallet-a', 2_000n), launchSell('creator-sell', 3, 'creator')],
+    marketTrades: [], nowMs: 4_000,
+  });
+
+  assert.equal(result.session.reasonCode, 'CREATOR_EARLY_SELL');
+  assert.equal(ledger.closeCalls[0]?.reason, 'CREATOR_EARLY_SELL');
+});
+
+void test('prioritizes the manual kill switch over every market trigger', async () => {
+  const ledger = new FakeLedger();
+  const strategy = new CreationEntryV1Strategy(
+    ledger,
+    new FakeRouter(quote('sell', 'MINT', 'SOL', 900n, 2_100n, 2_000n)),
+    {
+      retentionMs: 14_400_000,
+      externalMinimumBuyAmountRaw: 1_000n,
+      manualKillSwitch: true,
+    },
+  );
+  const candidate = eligibleCandidate();
+  const session = strategy.prepare(candidate, {
+    externalBuyTarget: 1, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(session);
+
+  const result = await strategy.reconcile({
+    candidate, session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    position: POSITION, creator: 'creator',
+    launchTrades: [launchBuy('external', 2, 'wallet-a', 2_000n), launchSell('creator-sell', 3, 'creator')],
+    marketTrades: [], nowMs: 4_000,
+  });
+
+  assert.equal(result.session.reasonCode, 'MANUAL_KILL_SWITCH');
+  assert.equal(ledger.closeCalls[0]?.reason, 'MANUAL_KILL_SWITCH');
+});
+
+void test('keeps a mandatory exit pending when the full sell quote is unavailable', async () => {
+  const ledger = new FakeLedger();
+  const router = new FakeRouter(new PaperQuoteError('QUOTE_STATE_UNAVAILABLE', 'state unavailable'));
+  const strategy = new CreationEntryV1Strategy(
+    ledger, router,
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const candidate = eligibleCandidate();
+  const session = strategy.prepare(candidate, {
+    externalBuyTarget: 1, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(session);
+
+  const result = await strategy.reconcile({
+    candidate, session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    position: POSITION, creator: 'creator', launchTrades: [launchBuy('external', 2, 'wallet-a', 2_000n)],
+    marketTrades: [], nowMs: 4_000,
+  });
+
+  assert.equal(result.requestedAction, 'NONE');
+  assert.equal(result.session.state, 'EXIT_PENDING_QUOTE');
+  assert.equal(result.session.reasonCode, 'SELL_QUOTE_UNAVAILABLE_OR_STALE');
+  assert.equal(result.session.pendingExitReason, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
+  assert.equal(ledger.closeCalls.length, 0);
 });
 
 class FakeLedger {
@@ -88,14 +224,31 @@ class FakeLedger {
   public async reconcileOpen(): Promise<PaperPosition> { return POSITION; }
   public async close(command: ClosePaperPositionCommand): Promise<PaperPosition> {
     this.closeCalls.push(command);
-    return POSITION;
+    return Object.freeze({
+      ...POSITION,
+      status: 'PAPER_CLOSED',
+      remainingBaseRaw: 0n,
+      quoteProceedsRaw: command.sellQuote.minimumAmountOutRaw,
+      grossPnlQuoteRaw: command.sellQuote.minimumAmountOutRaw - POSITION.quoteCostRaw,
+      netPnlQuoteRaw: command.sellQuote.minimumAmountOutRaw - POSITION.quoteCostRaw,
+      exitTradeId: 'exit',
+      closeCommandHash: 'close',
+      closedAtMs: 4_000,
+      purgeAfterMs: 14_404_000,
+    });
   }
   public async retract(): Promise<PaperPosition> { return POSITION; }
 }
 
 class FakeRouter {
-  public async quote(): Promise<PaperExecutionQuote> {
-    return quote('sell', 'MINT', 'SOL', 900n, 1_000n);
+  public readonly requests: PaperQuoteRequest[] = [];
+  public constructor(
+    private readonly response: PaperExecutionQuote | Error = quote('sell', 'MINT', 'SOL', 900n, 1_000n),
+  ) {}
+  public async quote(request: PaperQuoteRequest): Promise<PaperExecutionQuote> {
+    this.requests.push(request);
+    if (this.response instanceof Error) throw this.response;
+    return this.response;
   }
 }
 
@@ -160,6 +313,20 @@ function launchBuy(
   });
 }
 
+function launchSell(
+  id: string,
+  instructionIndex: number,
+  trader: string,
+): BondingCurveTradeObservedEventV1 {
+  const buy = launchBuy(id, instructionIndex, trader, 2_000n);
+  return Object.freeze({
+    ...buy,
+    payload: Object.freeze({
+      trade: Object.freeze({ ...buy.payload.trade, kind: 'SELL' as const }),
+    }),
+  });
+}
+
 function marketBuy(
   id: string,
   instructionIndex: number,
@@ -184,10 +351,11 @@ function quote(
   outputMint: string,
   amountInRaw: bigint,
   amountOutRaw: bigint,
+  minimumAmountOutRaw = amountOutRaw,
 ): PaperExecutionQuote {
   return Object.freeze({
     id, inputMint, outputMint, amountInRaw, amountOutRaw,
-    minimumAmountOutRaw: amountOutRaw, feesRaw: 1n, slippageBps: 100n,
+    minimumAmountOutRaw, feesRaw: 1n, slippageBps: 100n,
     priceImpactBps: 10n, observedAtMs: 1_000, observedSlot: 10n,
   });
 }
