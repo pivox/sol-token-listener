@@ -58,6 +58,7 @@ import { QualificationRebuildService } from './qualification-rebuild.service.js'
 import { SocialQualificationRefreshService } from './social-qualification-refresh.service.js';
 import { TradingCandidateService } from './trading-candidate.service.js';
 import { ValidatedExternalBuysStrategy } from './validated-external-buys.strategy.js';
+import { CreationEntryV1Strategy } from './creation-entry-v1.strategy.js';
 import { QualificationEngine } from '../qualification/qualification-engine.js';
 import { loadQualificationProfile } from '../qualification/qualification-profile.js';
 import { logger } from '../utils/logger.js';
@@ -192,11 +193,18 @@ export function createProductionListenerRuntime(
     qualificationProfile,
     qualificationEngine,
   );
-  const paperStrategy = new ValidatedExternalBuysStrategy(
-    paperTrading,
-    quoteRouter,
-    { retentionMs: 14_400_000 },
-  );
+  const paperStrategy = config.creationStrategyEnabled
+    ? new CreationEntryV1Strategy(paperTrading, quoteRouter, {
+      retentionMs: 14_400_000,
+      externalMinimumBuyAmountRaw: config.externalMinimumBuyAmountRaw ?? 1n,
+      takeProfitMultiplierBps: config.creationTakeProfitMultiplierBps,
+      manualKillSwitch: config.creationManualKillSwitch,
+    })
+    : new ValidatedExternalBuysStrategy(
+      paperTrading,
+      quoteRouter,
+      { retentionMs: 14_400_000 },
+    );
   const paperWorker = new PaperDecisionWorker(
     paperRepository,
     quoteRouter,
@@ -209,6 +217,8 @@ export function createProductionListenerRuntime(
       maximumQuoteAgeMs: config.paperQuoteMaxAgeMs,
       maximumQuoteSlotLag: BigInt(config.paperQuoteMaxSlotLag),
       retentionMs: 14_400_000,
+      creationEntryMaxAgeMs: config.creationEntryMaxAgeMs,
+      creationEntryMaxSlotLag: BigInt(config.creationEntryMaxSlotLag),
     }),
     paperStrategy,
     {
@@ -227,6 +237,7 @@ export function createProductionListenerRuntime(
         Math.floor(config.paperDecisionWorkerLeaseSeconds * 1_000 / 3),
       ),
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+      manualKillSwitch: config.creationManualKillSwitch,
     },
   );
   const pipeline = new ObservedTransactionPipeline(

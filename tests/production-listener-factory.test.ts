@@ -110,6 +110,19 @@ void test('production composes one canonical qualification writer before paper d
   assert.match(source, /new ObservedTransactionPipeline\([\s\S]*?paperRepository,\s*qualification,\s*\)/u);
 });
 
+void test('production selects creation-entry-v1 without adding a second paper pipeline', async () => {
+  const source = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+
+  assert.equal(count(source, /new PaperDecisionWorker\(/gu), 1);
+  assert.match(source, /config\.creationStrategyEnabled[\s\S]*?new CreationEntryV1Strategy\(/u);
+  assert.match(source, /externalMinimumBuyAmountRaw/u);
+  assert.match(source, /creationTakeProfitMultiplierBps/u);
+  assert.match(source, /creationManualKillSwitch/u);
+});
+
 void test('public social runtime components have no signer or submission path', async () => {
   for (const path of [
     '../src/application/social-enrichment-worker.ts',

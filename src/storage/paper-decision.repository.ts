@@ -45,7 +45,7 @@ interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number
 interface Client { query(text: string, values?: readonly unknown[]): Promise<Result>; release(): void }
 interface Pool { connect(): Promise<Client> }
 
-type Operation = 'enqueue' | 'claim' | 'renew' | 'snapshot' | 'stage' | 'complete' | 'fail' | 'counts';
+type Operation = 'enqueue' | 'wake' | 'claim' | 'renew' | 'snapshot' | 'stage' | 'complete' | 'fail' | 'counts';
 
 export class PaperDecisionRepositoryError extends Error {
   public constructor(public readonly operation: Operation, options?: ErrorOptions) {
@@ -118,6 +118,54 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     } finally {
       release(client);
     }
+  }
+
+  public async enqueueActiveSessions(nowMs: number): Promise<number> {
+    timestamp(nowMs, 'nowMs');
+    const client = await this.connect('wake');
+    const inputs: PaperDecisionJobInput[] = [];
+    try {
+      const result = await client.query(`SELECT session.session_id,session.mint,session.updated_at,
+        source.event_id,source.raw_event_id,source.confirmation_status
+        FROM paper_strategy_sessions session
+        JOIN domain_events source ON source.event_id=session.source_event_id
+        JOIN raw_chain_events raw ON raw.event_id=source.raw_event_id
+        WHERE session.strategy_id='creation-entry-v1'
+          AND session.state IN (
+            'PAPER_HOLDING','WAITING_EXTERNAL_BUYS','EXIT_PENDING_QUOTE','SELL_PENDING'
+          )
+          AND source.confirmation_status<>'orphaned'
+          AND raw.confirmation_status<>'orphaned'
+        ORDER BY session.session_id`);
+      for (const row of result.rows) {
+        const sessionId = textField(row, 'session_id');
+        const sourceEventId = textField(row, 'event_id');
+        const sourceRawEventId = textField(row, 'raw_event_id');
+        const sourceConfirmationStatus = textField(
+          row,
+          'confirmation_status',
+        ) as PaperDecisionJobInput['sourceConfirmationStatus'];
+        inputs.push(Object.freeze({
+          mint: textField(row, 'mint'),
+          sourceEventId,
+          sourceRawEventId,
+          sourceConfirmationStatus,
+          inputFingerprint: hash([
+            'creation-manual-kill-v1',
+            sessionId,
+            dateField(row, 'updated_at').toISOString(),
+            sourceEventId,
+            sourceConfirmationStatus,
+          ]),
+        }));
+      }
+    } catch (error: unknown) {
+      throw repositoryError('wake', error);
+    } finally {
+      release(client);
+    }
+    for (const input of inputs) await this.enqueue(input);
+    return inputs.length;
   }
 
   public async enqueueLatest(
@@ -285,7 +333,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       await client.query('COMMIT');
       return deepFreeze({
         mint: job.mint,asOfEvent,canonicalLaunchActive:launchSnapshot.canonicalLaunchActive,
-        hasPaperLineage,launch:launchSnapshot.launch,metadata,social,creatorProfile,holderSnapshot,
+        hasPaperLineage,launch:launchSnapshot.launch,
+        launchDetectedAtMs:launchSnapshot.launchDetectedAtMs,
+        metadata,social,creatorProfile,holderSnapshot,
         walletGraph,activeLaunchTrades: launchTrades,activeMarketTrades: marketTrades,
         currentQualification,currentCandidate: candidate,currentDecision,
         currentSession: session,activePosition: position,
@@ -846,7 +896,11 @@ async function loadLaunch(
   client: Client,
   mint: string,
   includeOrphaned: boolean,
-): Promise<Readonly<{ launch:TokenLaunch; canonicalLaunchActive:boolean }>> {
+): Promise<Readonly<{
+  launch:TokenLaunch;
+  launchDetectedAtMs:number;
+  canonicalLaunchActive:boolean;
+}>> {
   const result = await client.query(`SELECT launch.*,
     EXISTS(SELECT 1 FROM domain_events active
       WHERE active.mint=$1 AND active.type='TokenLaunchDetected'
@@ -859,6 +913,7 @@ async function loadLaunch(
   const event = decodeDomainEvent(requiredRow(result, 'Token launch event is missing.'));
   return Object.freeze({
     launch:payloadProperty(event.payload,'launch') as TokenLaunch,
+    launchDetectedAtMs:event.observedAtMs,
     canonicalLaunchActive:booleanField(result.rows[0],'canonical_launch_active'),
   });
 }

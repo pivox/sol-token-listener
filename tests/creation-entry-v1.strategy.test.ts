@@ -10,8 +10,36 @@ import type {
   PaperExecutionQuote,
   PaperPosition,
 } from '../src/domain/paper-trading.js';
+import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
 import { PaperQuoteError, type PaperQuoteRequest } from '../src/ports/paper-quote-router.js';
+
+void test('opens one creation position and moves the V2 session to monitoring', async () => {
+  const ledger = new FakeLedger();
+  const strategy = new CreationEntryV1Strategy(
+    ledger, new FakeRouter(),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const candidate = eligibleCandidate();
+  const session = strategy.prepare(candidate, {
+    externalBuyTarget: 10, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(session);
+
+  const result = await strategy.open({
+    candidate,
+    session,
+    qualification: Object.freeze({}) as QualificationReport,
+    qualificationEvent: candidateEvent(),
+    maximumRoundTripLossBps: 3_000n,
+  });
+
+  assert.equal(result.requestedAction, 'OPEN');
+  assert.equal(result.session.payloadVersion, 2);
+  assert.equal(result.session.state, 'WAITING_EXTERNAL_BUYS');
+  assert.equal(result.session.positionId, POSITION.id);
+  assert.equal(ledger.openCalls.length, 1);
+});
 
 void test('counts one wallet once across repeated Pump.fun and PumpSwap buys', async () => {
   const strategy = new CreationEntryV1Strategy(

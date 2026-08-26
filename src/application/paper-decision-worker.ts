@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { compareCursors } from '../domain/cursor.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
-import type { PaperStrategySessionV1 } from '../domain/paper-strategy.js';
+import type { PaperStrategySession } from '../domain/paper-strategy.js';
 import { PaperTradingError,type PaperExecutionQuote } from '../domain/paper-trading.js';
 import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
 import type { QuoteAsset } from '../domain/types.js';
@@ -24,6 +24,10 @@ import type {
   ExternalBuysStrategyResult,
   ValidatedExternalBuysStrategy,
 } from './validated-external-buys.strategy.js';
+import type {
+  CreationEntryStrategyResult,
+  CreationEntryV1Strategy,
+} from './creation-entry-v1.strategy.js';
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -40,6 +44,7 @@ export interface PaperDecisionWorkerOptions {
   readonly leaseMs: number;
   readonly renewalIntervalMs: number;
   readonly shutdownTimeoutMs: number;
+  readonly manualKillSwitch: boolean;
 }
 
 export interface PaperDecisionWorkerScheduler {
@@ -69,14 +74,13 @@ interface CandidateBuilder {
   ): TradingCandidateResult | Promise<TradingCandidateResult>;
 }
 
-interface StrategyActions {
-  prepare: ValidatedExternalBuysStrategy['prepare'];
-  open: ValidatedExternalBuysStrategy['open'];
-  recoverOpen: ValidatedExternalBuysStrategy['recoverOpen'];
-  reconcile: ValidatedExternalBuysStrategy['reconcile'];
-  reconcileSource: ValidatedExternalBuysStrategy['reconcileSource'];
-  reconcileEvidence: ValidatedExternalBuysStrategy['reconcileEvidence'];
-}
+type StrategyActions = Pick<ValidatedExternalBuysStrategy,
+'prepare' | 'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
+> | Pick<CreationEntryV1Strategy,
+'prepare' | 'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
+>;
+
+type StrategyResult = ExternalBuysStrategyResult | CreationEntryStrategyResult;
 
 const systemScheduler: PaperDecisionWorkerScheduler = Object.freeze({
   schedule(callback: () => void, delayMs: number): ReturnType<typeof setTimeout> {
@@ -97,6 +101,7 @@ export class PaperDecisionWorker {
   private activeLease: PaperLeaseGuard | null = null;
   private started = false;
   private permanentlyClosed = false;
+  private activeSessionsWoken = false;
 
   public constructor(
     private readonly repository: PaperDecisionRepository,
@@ -142,6 +147,15 @@ export class PaperDecisionWorker {
 
   private async performRunOnce(): Promise<PaperDecisionRunResult> {
     if (this.permanentlyClosed) return Object.freeze({ kind:'closed' as const });
+    if (this.options.manualKillSwitch && !this.activeSessionsWoken) {
+      try {
+        await this.repository.enqueueActiveSessions(this.readNow());
+        this.activeSessionsWoken=true;
+      } catch {
+        this.currentState='DEGRADED';
+        throw new PaperDecisionWorkerError('claim');
+      }
+    }
     let job: ClaimedPaperDecisionJob | null;
     try {
       job=await this.repository.claim({ leaseMs:this.options.leaseMs,nowMs:this.readNow() });
@@ -251,9 +265,9 @@ export class PaperDecisionWorker {
         return this.fail(job,lease,'RPC_TRANSIENT',true,staged);
       }
       if (!await lease.checkpoint()) return this.leaseLost(job,lease);
-      let opened: ExternalBuysStrategyResult;
+      let opened: StrategyResult;
       try {
-        opened=await this.strategy.open({
+        opened=await openStrategy(this.strategy, {
           candidate:candidateResult.candidate,session:pending,
           qualification:rebuilt.report,qualificationEvent:rebuilt.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
@@ -331,9 +345,9 @@ export class PaperDecisionWorker {
       try{await this.repository.stageDecision(job,staged);}
       catch{return this.fail(job,lease,'RPC_TRANSIENT',true,staged);}
       if(!await lease.checkpoint())return this.leaseLost(job,lease);
-      let opened:ExternalBuysStrategyResult;
+      let opened:StrategyResult;
       try{
-        opened=await this.strategy.open({
+        opened=await openStrategy(this.strategy, {
           candidate,session,qualification:context.report,qualificationEvent:context.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
         });
@@ -354,7 +368,7 @@ export class PaperDecisionWorker {
       );
       return this.fail(job,lease,'DECISION_INVALID',false,terminal);
     }
-    let reconciled:ExternalBuysStrategyResult;
+    let reconciled:StrategyResult;
     try {
       const staged=decision(
         context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'NONE',
@@ -365,25 +379,25 @@ export class PaperDecisionWorker {
       if (snapshot.asOfEvent.confirmationStatus === 'orphaned') {
         reconciled=snapshot.asOfEvent.type === 'TokenLaunchDetected'
           || compareCursors(candidate.asOf.cursor,snapshot.asOfEvent.cursor) === 0
-          ? await this.strategy.reconcileSource({
+          ? await reconcileStrategySource(this.strategy, {
             candidate,session,qualification:context.report,
             qualificationEvent:context.event,
             maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
           })
-          : await this.strategy.reconcileEvidence({
+          : await reconcileStrategyEvidence(this.strategy, {
             candidate,session,position:snapshot.activePosition,
             creator:snapshot.launch.creator,launchTrades:snapshot.activeLaunchTrades,
             marketTrades:snapshot.activeMarketTrades,orphanedEvent:snapshot.asOfEvent,
             nowMs:this.readNow(),
           });
       } else if (session.state === 'BUY_PENDING') {
-        reconciled=await this.strategy.recoverOpen({
+        reconciled=await recoverOpenStrategy(this.strategy, {
           candidate,session,qualification:context.report,
           qualificationEvent:context.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
         });
       } else {
-        reconciled=await this.strategy.reconcile({
+        reconciled=await reconcileStrategy(this.strategy, {
           candidate,session,position:snapshot.activePosition,creator:snapshot.launch.creator,
           launchTrades:snapshot.activeLaunchTrades,marketTrades:snapshot.activeMarketTrades,
           nowMs:this.readNow(),
@@ -538,10 +552,96 @@ class PaperLeaseGuard {
   }
 }
 
+type LegacyOpenInput = Parameters<ValidatedExternalBuysStrategy['open']>[0];
+type CreationOpenInput = Parameters<CreationEntryV1Strategy['open']>[0];
+type LegacyReconcileInput = Parameters<ValidatedExternalBuysStrategy['reconcile']>[0];
+type CreationReconcileInput = Parameters<CreationEntryV1Strategy['reconcile']>[0];
+type LegacySourceInput = Parameters<ValidatedExternalBuysStrategy['reconcileSource']>[0];
+type CreationSourceInput = Parameters<CreationEntryV1Strategy['reconcileSource']>[0];
+type LegacyEvidenceInput = Parameters<ValidatedExternalBuysStrategy['reconcileEvidence']>[0];
+type CreationEvidenceInput = Parameters<CreationEntryV1Strategy['reconcileEvidence']>[0];
+type AnyOpenInput = Omit<LegacyOpenInput, 'session'> & Readonly<{
+  session: PaperStrategySession;
+}>;
+type AnyReconcileInput = Omit<LegacyReconcileInput, 'session'> & Readonly<{
+  session: PaperStrategySession;
+}>;
+type AnySourceInput = Omit<LegacySourceInput, 'session'> & Readonly<{
+  session: PaperStrategySession;
+}>;
+type AnyEvidenceInput = Omit<LegacyEvidenceInput, 'session'> & Readonly<{
+  session: PaperStrategySession;
+}>;
+
+function creationStrategy(
+  strategy: StrategyActions,
+): Pick<CreationEntryV1Strategy,
+'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
+> {
+  return strategy as Pick<CreationEntryV1Strategy,
+  'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
+  >;
+}
+
+function legacyStrategy(
+  strategy: StrategyActions,
+): Pick<ValidatedExternalBuysStrategy,
+'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
+> {
+  return strategy as Pick<ValidatedExternalBuysStrategy,
+  'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
+  >;
+}
+
+function openStrategy(
+  strategy: StrategyActions,
+  input: AnyOpenInput,
+): Promise<StrategyResult> {
+  return input.session.payloadVersion === 2
+    ? creationStrategy(strategy).open(input as CreationOpenInput)
+    : legacyStrategy(strategy).open(input as LegacyOpenInput);
+}
+
+function recoverOpenStrategy(
+  strategy: StrategyActions,
+  input: AnyOpenInput,
+): Promise<StrategyResult> {
+  return input.session.payloadVersion === 2
+    ? creationStrategy(strategy).recoverOpen(input as CreationOpenInput)
+    : legacyStrategy(strategy).recoverOpen(input as LegacyOpenInput);
+}
+
+function reconcileStrategy(
+  strategy: StrategyActions,
+  input: AnyReconcileInput,
+): Promise<StrategyResult> {
+  return input.session.payloadVersion === 2
+    ? creationStrategy(strategy).reconcile(input as CreationReconcileInput)
+    : legacyStrategy(strategy).reconcile(input as LegacyReconcileInput);
+}
+
+function reconcileStrategySource(
+  strategy: StrategyActions,
+  input: AnySourceInput,
+): Promise<StrategyResult> {
+  return input.session.payloadVersion === 2
+    ? creationStrategy(strategy).reconcileSource(input as CreationSourceInput)
+    : legacyStrategy(strategy).reconcileSource(input as LegacySourceInput);
+}
+
+function reconcileStrategyEvidence(
+  strategy: StrategyActions,
+  input: AnyEvidenceInput,
+): Promise<StrategyResult> {
+  return input.session.payloadVersion === 2
+    ? creationStrategy(strategy).reconcileEvidence(input as CreationEvidenceInput)
+    : legacyStrategy(strategy).reconcileEvidence(input as LegacyEvidenceInput);
+}
+
 function decision(
   rebuilt:RebuiltQualification,
   candidate:TradingCandidateResult,
-  session:PaperStrategySessionV1|null,
+  session:PaperStrategySession|null,
   sessionEvent:DomainEvent|null,
   countedExternalBuys:PaperDecisionResult['countedExternalBuys'],
   requestedAction:PaperDecisionResult['requestedAction'],
@@ -574,7 +674,7 @@ function isQualificationNotCurrent(error:unknown):boolean{
 function manualReviewDecision(
   qualification:RebuiltQualification,
   candidate:TradingCandidateResult,
-  session:PaperStrategySessionV1,
+  session:PaperStrategySession,
   candidateEvent:DomainEvent,
   nowMs:number,
 ):PaperDecisionResult{
@@ -589,7 +689,7 @@ function manualReviewDecision(
   );
 }
 
-function sessionEvent(session:PaperStrategySessionV1,trigger:DomainEvent):DomainEvent {
+function sessionEvent(session:PaperStrategySession,trigger:DomainEvent):DomainEvent {
   const id=createDeterministicDerivedEventId({
     type:'PaperStrategySessionUpdated',mint:session.mint,source:'paper-decision',
     program:trigger.program,signature:trigger.signature,cursor:trigger.cursor,

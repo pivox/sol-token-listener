@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { DomainEvent } from '../src/domain/events.js';
+import type { BondingCurveTradeObservedEventV1 } from '../src/domain/launchpad-events.js';
 import type { PaperExecutionQuote } from '../src/domain/paper-trading.js';
 import type { QualificationReport } from '../src/domain/qualification.js';
 import type { PaperDecisionSnapshot } from '../src/ports/paper-decision-repository.js';
@@ -76,12 +77,61 @@ void test('accepts a confirmed canonical qualification selected by an older proc
   assert.equal(result.candidate.asOf.confirmationStatus,'confirmed');
 });
 
+void test('anchors creation entry freshness to the immutable launch observation', () => {
+  const service = creationCandidateService();
+  const fresh = service.create(candidateInput({
+    nowMs: 46_000,
+    buyQuote: quote('buy-fresh', 'SOL', 'MINT', 1_000n, 900n, 900n, 46_000),
+    reverseSellQuote: quote('sell-fresh', 'MINT', 'SOL', 900n, 820n, 800n, 46_000),
+  }));
+  const stale = service.create(candidateInput({
+    nowMs: 46_001,
+    qualificationEvent: event({
+      id: 'evt_late_qualification', type: 'QualificationUpdated', observedAtMs: 46_000,
+    }),
+    buyQuote: quote('buy-stale', 'SOL', 'MINT', 1_000n, 900n, 900n, 46_000),
+    reverseSellQuote: quote('sell-stale', 'MINT', 'SOL', 900n, 820n, 800n, 46_000),
+  }));
+
+  assert.equal(fresh.candidate.state, 'ELIGIBLE');
+  assert.equal(fresh.candidate.eligibleUntilMs, 46_000);
+  assert.equal(stale.candidate.state, 'EXPIRED');
+  assert.deepEqual(stale.candidate.reasonCodes, ['CREATION_ENTRY_EXPIRED']);
+});
+
+void test('rejects creation entry after excessive slot lag or a creator sell', () => {
+  const service = creationCandidateService();
+  const lagged = service.create(candidateInput({
+    buyQuote: quote('buy-lagged', 'SOL', 'MINT', 1_000n, 900n, 900n, 1_000, 43n),
+    reverseSellQuote: quote('sell-lagged', 'MINT', 'SOL', 900n, 820n, 800n, 1_000, 43n),
+  }));
+  const sold = service.create(candidateInput({
+    snapshot: snapshot({ activeLaunchTrades: Object.freeze([creatorSell()]) }),
+  }));
+
+  assert.equal(lagged.candidate.state, 'NOT_ELIGIBLE');
+  assert.deepEqual(lagged.candidate.reasonCodes, ['CREATION_ENTRY_REJECTED']);
+  assert.equal(sold.candidate.state, 'NOT_ELIGIBLE');
+  assert.deepEqual(sold.candidate.reasonCodes, ['CREATION_ENTRY_REJECTED']);
+});
+
 function candidateService(): TradingCandidateService {
   return new TradingCandidateService({
     strategy: Object.freeze({ id: 'validated-external-buys', version: 1 }),
     quoteMintAllowlist: Object.freeze(['SOL']), minimumConfirmation: 'confirmed',
     entryWindowMs: 45_000, maximumQuoteAgeMs: 5_000, maximumQuoteSlotLag: 32n,
     retentionMs: 14_400_000,
+  });
+}
+
+function creationCandidateService(): TradingCandidateService {
+  return new TradingCandidateService({
+    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+    quoteMintAllowlist: Object.freeze(['SOL']), minimumConfirmation: 'confirmed',
+    entryWindowMs: 45_000, maximumQuoteAgeMs: 5_000, maximumQuoteSlotLag: 32n,
+    retentionMs: 14_400_000,
+    creationEntryMaxAgeMs: 45_000,
+    creationEntryMaxSlotLag: 32n,
   });
 }
 
@@ -101,7 +151,8 @@ function candidateInput(overrides: Partial<Parameters<TradingCandidateService['c
 function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecisionSnapshot {
   const asOfEvent = event();
   return Object.freeze({
-    mint:'MINT',asOfEvent,canonicalLaunchActive:true,hasPaperLineage:false,launch:Object.freeze({
+    mint:'MINT',asOfEvent,canonicalLaunchActive:true,hasPaperLineage:false,
+    launchDetectedAtMs:1_000,launch:Object.freeze({
       mint:'MINT',creator:'creator',tokenProgram:'SPL_TOKEN' as const,
       quoteAssets:Object.freeze([Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const })]),
       launchpad:'pumpfun',createdAt:Object.freeze({ ...asOfEvent.cursor }),parameters:Object.freeze({}),
@@ -132,10 +183,26 @@ function report(verdict: QualificationReport['verdict']): QualificationReport {
 
 function quote(
   id:string,inputMint:string,outputMint:string,amountInRaw:bigint,
-  amountOutRaw:bigint,minimumAmountOutRaw:bigint,observedAtMs:number,
+  amountOutRaw:bigint,minimumAmountOutRaw:bigint,observedAtMs:number,observedSlot=10n,
 ): PaperExecutionQuote {
   return Object.freeze({
     id,inputMint,outputMint,amountInRaw,amountOutRaw,minimumAmountOutRaw,feesRaw:1n,
-    slippageBps:100n,priceImpactBps:10n,observedAtMs,observedSlot:10n,
+    slippageBps:100n,priceImpactBps:10n,observedAtMs,observedSlot,
+  });
+}
+
+function creatorSell(): BondingCurveTradeObservedEventV1 {
+  const cursor = Object.freeze({
+    slot:10n,transactionIndex:0,instructionIndex:1,innerInstructionIndex:null,
+  });
+  return Object.freeze({
+    id:'evt_creator_sell',type:'BondingCurveTradeObserved',mint:'MINT',source:'pumpfun',
+    program:'pump',signature:'creator-sell',cursor,confirmationStatus:'confirmed',
+    blockchainTimeMs:950,observedAtMs:1_000,payloadVersion:1,
+    payload:Object.freeze({ trade:Object.freeze({
+      id:'creator-sell',launchMint:'MINT',kind:'SELL',trader:'creator',
+      baseAmountRaw:1n,quoteAmountRaw:1n,
+      quoteAsset:Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' }),cursor,
+    }) }),
   });
 }

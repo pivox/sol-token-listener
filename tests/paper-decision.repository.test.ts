@@ -79,6 +79,34 @@ void test('claims one idempotent job concurrently, renews it, and reports queue 
   });
 });
 
+void test('enqueues one deterministic wake-up for each active creation session', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    const repository = paperDecisionRepository(pool, { maxAttempts: 3, baseDelayMs: 100 });
+    await repository.enqueue(jobInput());
+    const initial = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(initial);
+    const active = decisionWithSession(decisionResult(), 'WAITING_EXTERNAL_BUYS', 0, 1_001);
+    await repository.stageDecision(initial, active);
+    await pool.query(
+      `UPDATE paper_strategy_sessions SET strategy_id='creation-entry-v1'
+        WHERE session_id=$1`,
+      [active.session?.id],
+    );
+
+    assert.equal(await repository.enqueueActiveSessions(2_000), 1);
+    assert.equal(await repository.enqueueActiveSessions(2_001), 1);
+    const jobs = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM paper_decision_jobs WHERE status='PENDING'`,
+    );
+    assert.equal(jobs.rows[0]?.count, 1);
+  });
+});
+
 void test('loads the immutable launch when a later trade triggers the decision', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');

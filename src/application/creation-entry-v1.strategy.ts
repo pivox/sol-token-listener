@@ -13,6 +13,7 @@ import {
   type PaperStrategySessionV2,
 } from '../domain/paper-strategy.js';
 import type { PaperPosition } from '../domain/paper-trading.js';
+import type { QualificationReport } from '../domain/qualification.js';
 import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
 import type { ChainConfirmationStatus, ChainCursor } from '../domain/types.js';
 import { PaperQuoteError, type PaperQuoteRouter } from '../ports/paper-quote-router.js';
@@ -102,6 +103,214 @@ export class CreationEntryV1Strategy {
       updatedAtMs: input.nowMs,
       purgeAfterMs: input.nowMs + this.options.retentionMs,
     });
+  }
+
+  public async open(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV2;
+    qualification: QualificationReport;
+    qualificationEvent: DomainEvent;
+    maximumRoundTripLossBps: bigint;
+  }>): Promise<CreationEntryStrategyResult> {
+    return this.openOrRecover(input, false);
+  }
+
+  public async recoverOpen(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV2;
+    qualification: QualificationReport;
+    qualificationEvent: DomainEvent;
+    maximumRoundTripLossBps: bigint;
+  }>): Promise<CreationEntryStrategyResult> {
+    return this.openOrRecover(input, true);
+  }
+
+  private async openOrRecover(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV2;
+    qualification: QualificationReport;
+    qualificationEvent: DomainEvent;
+    maximumRoundTripLossBps: bigint;
+  }>, recovery: boolean): Promise<CreationEntryStrategyResult> {
+    const { candidate, session } = input;
+    if (
+      session.state !== 'BUY_PENDING'
+      || session.candidateId !== candidate.id
+      || candidate.buyQuote === null
+      || candidate.reverseSellQuote === null
+    ) throw new TypeError('Creation paper entry is inconsistent.');
+    const command = {
+      mint: candidate.mint,
+      quoteAsset: candidate.quoteAsset,
+      strategy: candidate.strategy,
+      trigger: input.qualificationEvent,
+      qualification: input.qualification,
+      buyQuote: candidate.buyQuote,
+      reverseSellQuote: candidate.reverseSellQuote,
+      maximumRoundTripLossBps: input.maximumRoundTripLossBps,
+      strategySessionId: session.id,
+      qualificationReportId: candidate.qualificationReportId,
+      candidateId: candidate.id,
+      expectedCurrentQualification: Object.freeze({
+        mint: candidate.mint,
+        reportId: candidate.qualificationReportId,
+        qualificationEventId: input.qualificationEvent.id,
+      }),
+    } as const;
+    const position = recovery
+      ? await this.ledger.reconcileOpen(command)
+      : await this.ledger.open(command);
+    if (recovery && position.status !== 'PAPER_HOLDING') {
+      throw new TypeError('Creation paper entry recovery did not find a holding position.');
+    }
+    const updated = updateSession(candidate, session, {
+      state: 'WAITING_EXTERNAL_BUYS',
+      reasonCode: 'QUALIFIED_ENTRY',
+      positionId: position.id,
+      lastQuote: candidate.buyQuote,
+      lastError: null,
+      updatedAtMs: position.openedAtMs,
+      purgeAfterMs: position.openedAtMs + this.options.retentionMs,
+    });
+    return strategyResult(
+      updated,
+      [],
+      position,
+      input.qualificationEvent,
+      recovery ? 'NONE' : 'OPEN',
+    );
+  }
+
+  public async reconcileSource(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV2;
+    qualification: QualificationReport;
+    qualificationEvent: DomainEvent;
+    maximumRoundTripLossBps: bigint;
+  }>): Promise<CreationEntryStrategyResult> {
+    const { candidate, session } = input;
+    if (
+      session.candidateId !== candidate.id
+      || candidate.buyQuote === null
+      || candidate.reverseSellQuote === null
+      || input.qualificationEvent.confirmationStatus !== 'orphaned'
+    ) throw new TypeError('Creation paper source reconciliation is inconsistent.');
+    const position = await this.ledger.reconcileOpen({
+      mint: candidate.mint,
+      quoteAsset: candidate.quoteAsset,
+      strategy: candidate.strategy,
+      trigger: input.qualificationEvent,
+      qualification: input.qualification,
+      buyQuote: candidate.buyQuote,
+      reverseSellQuote: candidate.reverseSellQuote,
+      maximumRoundTripLossBps: input.maximumRoundTripLossBps,
+      strategySessionId: session.id,
+      qualificationReportId: candidate.qualificationReportId,
+      candidateId: candidate.id,
+    });
+    if (
+      position.status !== 'PAPER_RETRACTED'
+      || position.closedAtMs === null
+      || position.purgeAfterMs === null
+    ) throw new TypeError('Creation paper source reconciliation did not retract the position.');
+    const updated = updateSession(candidate, session, {
+      state: 'PAPER_RETRACTED',
+      reasonCode: 'SOURCE_ORPHANED',
+      positionId: position.id,
+      lastError: null,
+      updatedAtMs: Math.max(session.updatedAtMs, position.closedAtMs),
+      purgeAfterMs: position.purgeAfterMs,
+    });
+    return strategyResult(updated, [], position, input.qualificationEvent);
+  }
+
+  public async reconcileEvidence(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV2;
+    position: PaperPosition;
+    creator: string;
+    launchTrades: readonly BondingCurveTradeObservedEventV1[];
+    marketTrades: readonly MarketTrade[];
+    orphanedEvent: DomainEvent;
+    nowMs: number;
+  }>): Promise<CreationEntryStrategyResult> {
+    if (input.orphanedEvent.confirmationStatus !== 'orphaned') {
+      throw new TypeError('Creation evidence reconciliation requires an orphaned event.');
+    }
+    const baseline = updateSession(input.candidate, input.session, {
+      state: 'WAITING_EXTERNAL_BUYS',
+      reasonCode: 'QUALIFIED_ENTRY',
+      externalBuyCount: 0,
+      countedTradeIds: Object.freeze([]),
+      countedBuyerWallets: Object.freeze([]),
+      lastCountedCursor: null,
+      pendingExitReason: null,
+      lastQuote: input.candidate.buyQuote,
+      lastError: null,
+      updatedAtMs: Math.max(input.session.createdAtMs, input.position.openedAtMs),
+    });
+    if (input.position.status === 'PAPER_HOLDING') {
+      return this.reconcile({ ...input, session: baseline });
+    }
+
+    let rebuilt = baseline;
+    const counted: PaperExternalBuyEvidenceV2[] = [];
+    for (const buy of canonicalBuys({ ...input, session: baseline }, this.options.externalMinimumBuyAmountRaw)) {
+      const result = countUniqueExternalBuy(rebuilt, {
+        tradeId: buy.id,
+        mint: input.candidate.mint,
+        quoteMint: input.candidate.quoteAsset.mint,
+        trader: buy.trader,
+        quoteAmountRaw: buy.quoteAmountRaw,
+        cursor: buy.cursor,
+        confirmationStatus: buy.confirmationStatus,
+        observedAtMs: buy.observedAtMs,
+      });
+      rebuilt = result.session;
+      if (result.evidence !== null) counted.push(result.evidence);
+    }
+    const creatorSell = earliestCreatorSell({ ...input, session: rebuilt });
+    const priorQuote = input.session.lastQuote;
+    const profitStillSupported = priorQuote !== null
+      && priorQuote.inputMint === input.candidate.mint
+      && priorQuote.outputMint === input.candidate.quoteAsset.mint
+      && priorQuote.amountInRaw === input.position.baseFilledRaw
+      && priorQuote.minimumAmountOutRaw * 10_000n
+        >= input.position.quoteCostRaw * this.options.takeProfitMultiplierBps;
+    const reason: CreationExitReason | null = this.options.manualKillSwitch
+      ? 'MANUAL_KILL_SWITCH'
+      : creatorSell !== null
+        ? 'CREATOR_EARLY_SELL'
+        : profitStillSupported
+          ? 'TAKE_PROFIT_2X_EXECUTABLE'
+          : rebuilt.externalBuyCount >= rebuilt.externalBuyTarget
+            ? 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED'
+            : null;
+    if (reason !== null && input.position.status === 'PAPER_CLOSED') {
+      if (input.position.closedAtMs === null || input.position.purgeAfterMs === null) {
+        throw new TypeError('Closed creation position is missing terminal timestamps.');
+      }
+      const closed = updateSession(input.candidate, rebuilt, {
+        state: 'PAPER_CLOSED',
+        reasonCode: reason,
+        pendingExitReason: reason,
+        updatedAtMs: input.position.closedAtMs,
+        purgeAfterMs: input.position.purgeAfterMs,
+      });
+      return strategyResult(closed, counted, input.position, creatorSell ?? input.orphanedEvent);
+    }
+    const position = await this.ledger.retract(input.position.id, input.orphanedEvent);
+    if (position.status !== 'PAPER_RETRACTED' || position.purgeAfterMs === null) {
+      throw new TypeError('Creation evidence reconciliation did not retract the position.');
+    }
+    const retracted = updateSession(input.candidate, rebuilt, {
+      state: 'PAPER_RETRACTED',
+      reasonCode: 'SOURCE_ORPHANED',
+      pendingExitReason: null,
+      updatedAtMs: Math.max(rebuilt.updatedAtMs, input.orphanedEvent.observedAtMs),
+      purgeAfterMs: position.purgeAfterMs,
+    });
+    return strategyResult(retracted, counted, position, input.orphanedEvent);
   }
 
   public async reconcile(input: Readonly<{
