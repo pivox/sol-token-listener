@@ -61,7 +61,7 @@ create `tests/paper-mvp-cli.test.ts`.
 
 - [ ] Test strict arguments, paper/Mainnet/creation safety gates, automatic compatible resume,
   incompatible-run rejection, target/timeout/signal finalization, `0600` exclusive report output,
-  and redacted failures.
+  required positive initial capital, and redacted failures.
 - [ ] Run the existing application bootstrap and poll the durable collector; never import a signer
   or transaction submission port.
 - [ ] Add `npm run paper:mvp` and operator documentation.
@@ -84,4 +84,3 @@ where coverage is missing.
   database window, and verify its hash.
 - [ ] Close #49 only if the report is reproducible and its verdict is honest. A non-PASS result is
   evidence for calibration, not permission to implement live execution.
-

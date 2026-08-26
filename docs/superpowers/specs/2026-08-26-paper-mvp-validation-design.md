@@ -61,14 +61,16 @@ npm run paper:mvp -- \
   --target-closed=50 \
   --max-duration-seconds=14400 \
   --poll-seconds=5 \
+  --initial-capital-raw=1000000000 \
   --network-fee-raw-per-transaction=5000 \
   --report-file=paper-mvp.json
 ```
 
 The target is bounded to 1–1000, duration to 60–14400 seconds, polling to 1–60 seconds, and network
-fee to a canonical non-negative 78-digit integer. The report is created with mode `0600` and never
-overwrites an existing file. SIGINT/SIGTERM and timeout finalize an honest non-PASS report after one
-last collection.
+fee to a canonical non-negative 78-digit integer. Initial capital is a required positive 78-digit
+integer and is the denominator of the equity drawdown; it is never inferred from profitable
+positions. The report is created with mode `0600` and never overwrites an existing file.
+SIGINT/SIGTERM and timeout finalize an honest non-PASS report after one last collection.
 
 ## Per-position facts
 
@@ -113,6 +115,11 @@ The configured network fee is immutable for the run and currently valid only for
 quote allowlist. Multi-quote results remain grouped, but the PASS gate fails closed unless every
 sample uses the one configured quote mint.
 
+Maximum drawdown uses an equity curve initialized at `initialCapitalRaw`, ordered by paper SELL
+time. Each model-net PnL changes equity; drawdown basis points use ceiling integer division from the
+highest prior equity. Equity at or below zero is a 100% drawdown. Mean latency/PnL use floor integer
+division and p95 uses the nearest-rank observation.
+
 ## Report and gate
 
 `paper-mvp.v1` contains the period, counts, exit categories, gross/model-net PnL, mean net PnL,
@@ -150,4 +157,3 @@ Mainnet, and transaction submission disabled. A report PASS authorizes only late
 The provider-specific credit adapter and its credentials cannot be selected from repository facts.
 Until the operator chooses a provider with an authoritative usage API, runs are valid but receive a
 truthful `DEGRADED`/non-PASS provider status. No secret is stored in PostgreSQL or the report.
-
