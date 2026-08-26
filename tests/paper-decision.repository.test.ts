@@ -188,6 +188,87 @@ void test('removes V2 buyer evidence orphaned without a replacement trade', asyn
   });
 });
 
+void test('retains V2 evidence when an entry source is orphaned', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const initial = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(initial);
+    const counted = creationDecisionWithEvidence('trade-retained', 2_000);
+    await repository.complete(initial, counted);
+
+    await repository.enqueue(jobInput({
+      sourceConfirmationStatus: 'orphaned',
+      inputFingerprint: 'd'.repeat(64),
+    }));
+    const orphaned = await repository.claim({ nowMs: 3_000, leaseMs: 10_000 });
+    assert.ok(orphaned);
+    await repository.complete(orphaned, creationSourceOrphanDecision(counted, 3_000));
+
+    const rows = await pool.query(
+      'SELECT trade_id FROM paper_external_buy_events WHERE session_id=$1',
+      [counted.session?.id],
+    );
+    assert.deepEqual(rows.rows, [{ trade_id: 'trade-retained' }]);
+  });
+});
+
+void test('does not let a stale orphan completion delete newer V2 evidence', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const initial = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(initial);
+    const counted = creationDecisionWithEvidence('trade-old', 2_000);
+    await repository.complete(initial, counted);
+
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [TRADE_RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [TRADE_EVENT_ID],
+    );
+    await repository.enqueue(jobInput({
+      sourceEventId: TRADE_EVENT_ID,
+      sourceRawEventId: TRADE_RAW_EVENT_ID,
+      sourceConfirmationStatus: 'orphaned',
+      inputFingerprint: 'b'.repeat(64),
+    }));
+    const stale = await repository.claim({ nowMs: 3_000, leaseMs: 10_000 });
+    assert.ok(stale);
+
+    await repository.enqueue(jobInput({ inputFingerprint: 'c'.repeat(64) }));
+    const newer = await repository.claim({ nowMs: 3_100, leaseMs: 10_000 });
+    assert.ok(newer);
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='confirmed' WHERE event_id=$1`,
+      [TRADE_RAW_EVENT_ID],
+    );
+    await repository.complete(newer, creationDecisionWithEvidence('trade-new', 4_000));
+    await repository.complete(stale, creationDecisionWithEvidence('trade-stale', 3_000));
+
+    const rows = await pool.query(
+      'SELECT trade_id FROM paper_external_buy_events WHERE session_id=$1',
+      [counted.session?.id],
+    );
+    assert.deepEqual(rows.rows, [{ trade_id: 'trade-new' }]);
+  });
+});
+
 void test('loads the immutable launch when a later trade triggers the decision', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
@@ -1436,6 +1517,47 @@ function creationDecisionWithoutEvidence(
   const sessionEvent = Object.freeze({
     ...derivedEvent(
       'PaperStrategySessionUpdated', `${session.id}:orphaned-evidence`, { session },
+      'confirmed', base.candidate.asOf.cursor, updatedAtMs,
+    ),
+    confirmationStatus: 'orphaned' as const,
+  });
+  return Object.freeze({
+    ...base,
+    session,
+    sessionEvent,
+    countedExternalBuys: Object.freeze([]),
+    requestedAction: 'NONE' as const,
+  });
+}
+
+function creationSourceOrphanDecision(
+  base: PaperDecisionResult,
+  updatedAtMs: number,
+): PaperDecisionResult {
+  assert.ok(base.session?.payloadVersion === 2);
+  const session = createCreationEntrySession({
+    candidate: base.candidate,
+    state: 'PAPER_RETRACTED',
+    reasonCode: 'SOURCE_ORPHANED',
+    positionId: base.session.positionId,
+    entryCursor: base.session.entryCursor,
+    externalBuyTarget: base.session.externalBuyTarget,
+    externalBuyCount: base.session.externalBuyCount,
+    externalMinimumBuyAmountRaw: base.session.externalMinimumBuyAmountRaw,
+    countedTradeIds: base.session.countedTradeIds,
+    countedBuyerWallets: base.session.countedBuyerWallets,
+    lastCountedCursor: base.session.lastCountedCursor,
+    minimumConfirmation: base.session.minimumConfirmation,
+    lastQuote: base.session.lastQuote,
+    lastError: null,
+    pendingExitReason: null,
+    createdAtMs: base.session.createdAtMs,
+    updatedAtMs,
+    purgeAfterMs: updatedAtMs + 14_400_000,
+  });
+  const sessionEvent = Object.freeze({
+    ...derivedEvent(
+      'PaperStrategySessionUpdated', `${session.id}:source-orphaned`, { session },
       'confirmed', base.candidate.asOf.cursor, updatedAtMs,
     ),
     confirmationStatus: 'orphaned' as const,

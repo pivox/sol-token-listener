@@ -6,6 +6,7 @@ import type { MarketTrade } from '../domain/market.js';
 import type {
   PaperStrategySession,
   PaperStrategySessionV1,
+  PaperStrategySessionV2,
 } from '../domain/paper-strategy.js';
 import type { PaperPosition } from '../domain/paper-trading.js';
 import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
@@ -612,19 +613,18 @@ async function writeDecision(
   ]);
   }
   if (result.sessionEvent !== null) await insertDomainEvent(client, job, result.sessionEvent);
-  if (result.session !== null && result.sessionEvent !== null) {
-    await upsertSession(client, job, result.session, result.sessionEvent.id);
-  }
+  const sessionWriteAccepted = result.session !== null && result.sessionEvent !== null
+    ? await upsertSession(client, job, result.session, result.sessionEvent.id)
+    : false;
   const countedBuyPurgeAfter = result.session === null ? null : sessionPurgeAfter(result.session);
   const countedBuyStrategyId = result.session?.strategy.id ?? null;
   if (result.countedExternalBuys.length > 0 && countedBuyStrategyId === null) {
     throw new TypeError('External buy strategy identity is missing.');
   }
-  if (
-    synchronizeOrphanedEvidence
+  const replacesCreationEvidence = synchronizeOrphanedEvidence
     && job.sourceConfirmationStatus === 'orphaned'
-    && result.session?.payloadVersion === 2
-  ) {
+    && hasCompleteCreationEvidence(result);
+  if (replacesCreationEvidence && sessionWriteAccepted) {
     await client.query(`DELETE FROM paper_external_buy_events
       WHERE session_id=$1 AND strategy_id='creation-entry-v1'
         AND NOT (trade_id=ANY($2::text[]))`, [
@@ -632,7 +632,10 @@ async function writeDecision(
       result.countedExternalBuys.map((evidence) => evidence.tradeId),
     ]);
   }
-  for (const evidence of result.countedExternalBuys) {
+  const countedExternalBuys = replacesCreationEvidence && !sessionWriteAccepted
+    ? []
+    : result.countedExternalBuys;
+  for (const evidence of countedExternalBuys) {
     const source = await client.query(`SELECT event_id,program,signature,blockchain_time
       FROM raw_chain_events
       WHERE mint=$1 AND slot=$2 AND transaction_index=$3 AND instruction_index=$4
@@ -776,10 +779,10 @@ async function upsertSession(
   job: ClaimedPaperDecisionJob,
   session: PaperStrategySession,
   sessionEventId: string,
-): Promise<void> {
+): Promise<boolean> {
   const terminal = ['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state);
   const purgeAfter = sessionPurgeAfter(session);
-  await client.query(`INSERT INTO paper_strategy_sessions (
+  const written = await client.query(`INSERT INTO paper_strategy_sessions (
     session_id,mint,candidate_id,report_id,source_event_id,session_event_id,
     strategy_id,strategy_version,actor_kind,state,reason_code,quote_mint,
     quote_decimals,quote_token_program,position_id,open_command_id,close_command_id,
@@ -821,11 +824,36 @@ async function upsertSession(
     purgeAfter,session.payloadVersion,toJsonValue(session),
     job.sourceConfirmationStatus === 'orphaned',
   ]);
-  if (purgeAfter !== null) {
+  if (written.rowCount === 1 && purgeAfter !== null) {
     await client.query(`UPDATE paper_external_buy_events
       SET purge_after=COALESCE(purge_after,$2)
       WHERE session_id=$1`, [session.id,purgeAfter]);
   }
+  return written.rowCount === 1;
+}
+
+function hasCompleteCreationEvidence(
+  result: PaperDecisionResult,
+): result is PaperDecisionResult & Readonly<{ session: PaperStrategySessionV2 }> {
+  const session = result.session;
+  if (
+    session?.payloadVersion !== 2
+    || result.countedExternalBuys.length !== session.externalBuyCount
+  ) return false;
+  const tradeIds = new Set<string>();
+  const traders = new Set<string>();
+  for (const evidence of result.countedExternalBuys) {
+    if (
+      evidence.payloadVersion !== 2
+      || evidence.sessionId !== session.id
+      || tradeIds.has(evidence.tradeId)
+      || traders.has(evidence.trader)
+    ) return false;
+    tradeIds.add(evidence.tradeId);
+    traders.add(evidence.trader);
+  }
+  return session.countedTradeIds.every((tradeId) => tradeIds.has(tradeId))
+    && session.countedBuyerWallets.every((trader) => traders.has(trader));
 }
 
 function sessionPurgeAfter(session: PaperStrategySession): Date | null {
