@@ -272,6 +272,7 @@ class FakeLedger {
       closedAtMs:3_000,purgeAfterMs:14_403_000,
     });
   }
+  public async reconcileClose(): Promise<PaperPosition> { return POSITION; }
   public async retract(positionId: string, trigger: DomainEvent): Promise<PaperPosition> {
     this.retractCalls.push({ positionId,trigger });
     return Object.freeze({

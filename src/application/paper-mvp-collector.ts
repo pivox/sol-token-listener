@@ -26,6 +26,19 @@ export class PaperMvpCollector {
     if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
       throw new RangeError('Paper MVP collector limit must be between 1 and 1000.');
     }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await this.collectAttempt(input);
+      } catch (error: unknown) {
+        if (!isStaleProgress(error) || attempt === 2) throw error;
+      }
+    }
+    throw new Error('Unreachable paper MVP collector retry state.');
+  }
+
+  private async collectAttempt(
+    input: Readonly<{ runId: string; limit: number }>,
+  ): Promise<PaperMvpCollectorResult> {
     const before = await this.repository.load(input.runId);
     if (before?.run.state !== 'RUNNING') {
       throw new PaperMvpCollectorError('RUN_NOT_ACTIVE');
@@ -53,9 +66,10 @@ export class PaperMvpCollector {
       if ('reason' in classified) unknownPositions.push(classified);
       else samples.push(classified);
     }
-    const observedAtMs = this.clock();
+    const observedAtMs = Math.max(this.clock(),before.run.updatedAtMs + 1);
     const after = await this.repository.recordProgress({
       runId: before.run.runId,
+      expectedUpdatedAtMs: before.run.updatedAtMs,
       observedAtMs,
       counters: Object.freeze({
         creationsObserved: before.run.counters.creationsObserved,
@@ -81,6 +95,11 @@ export class PaperMvpCollector {
       duplicateLogicalSells: after.counters.duplicateLogicalSells,
     });
   }
+}
+
+function isStaleProgress(error: unknown): boolean {
+  return typeof error === 'object' && error !== null
+    && 'code' in error && error.code === 'PROGRESS_SNAPSHOT_STALE';
 }
 
 export type PaperMvpCollectorErrorCode = 'RUN_NOT_ACTIVE' | 'STRATEGY_UNSUPPORTED';

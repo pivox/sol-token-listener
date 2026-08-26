@@ -860,6 +860,26 @@ void test('autorise le retry manuel legacy sans inventer son horodatage', async 
   assert.equal(closed.exitTriggerAtMs, null);
 });
 
+void test('reconciles a terminal close finality without another sell trade', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository,'paper');
+  const opened = await engine.open({
+    ...openCommand(),strategy:{ id:'creation-entry-v1',version:1 },
+  });
+  const command = Object.freeze({
+    ...closeCommand(opened.id),exitTriggerAtMs:1,
+  });
+  const closed = await engine.close(command);
+
+  const finalized = await engine.reconcileClose(closed.id,Object.freeze({
+    ...command.trigger,confirmationStatus:'finalized' as const,
+  }));
+
+  assert.equal(finalized,closed);
+  assert.equal(repository.writeCount,2);
+  assert.deepEqual([...repository.eventStatuses.values()],['confirmed','finalized']);
+});
+
 void test('refuse un replay de fermeture contradictoire sans second trade', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');

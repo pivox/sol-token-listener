@@ -111,6 +111,7 @@ void test('persists only explicit configuration, sample, and provider projection
     const run = await repository.startOrResume(typedConfiguration, 1_000);
     const progressed = await repository.recordProgress({
       runId: run.runId,
+      expectedUpdatedAtMs: run.updatedAtMs,
       observedAtMs: 2_000,
       counters: progressCounters,
       providerUsage: typedProvider,
@@ -154,6 +155,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })));
     assert.equal((await repository.recordProgress({
       runId: run.runId,
+      expectedUpdatedAtMs: run.updatedAtMs,
       observedAtMs: 2_000,
       counters: progressCounters,
       providerUsage: usage,
@@ -162,6 +164,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })).closedPositions, 1_000);
     assert.equal((await repository.recordProgress({
       runId: run.runId,
+      expectedUpdatedAtMs: 2_000,
       observedAtMs: 2_001,
       counters: progressCounters,
       providerUsage: usage,
@@ -171,6 +174,7 @@ void test('bounds cumulative observations without charging identical replays', a
 
     await assert.rejects(repository.recordProgress({
       runId: run.runId,
+      expectedUpdatedAtMs: 2_001,
       observedAtMs: 2_002,
       counters: progressCounters,
       providerUsage: usage,
@@ -191,6 +195,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })));
     assert.equal((await repository.recordProgress({
       runId: run.runId,
+      expectedUpdatedAtMs: 2_001,
       observedAtMs: 2_003,
       counters: progressCounters,
       providerUsage: usage,
@@ -199,6 +204,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })).counters.unknownTerminalPositions, 1_000);
     assert.equal((await repository.recordProgress({
       runId: run.runId,
+      expectedUpdatedAtMs: 2_003,
       observedAtMs: 2_004,
       counters: progressCounters,
       providerUsage: usage,
@@ -207,6 +213,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })).counters.unknownTerminalPositions, 1_000);
     await assert.rejects(repository.recordProgress({
       runId: run.runId,
+      expectedUpdatedAtMs: 2_004,
       observedAtMs: 2_005,
       counters: progressCounters,
       providerUsage: usage,
@@ -220,6 +227,33 @@ void test('bounds cumulative observations without charging identical replays', a
     assert.ok(afterUnknownOverflow);
     assert.equal(afterUnknownOverflow.unknownPositions.length, 1_000);
     assert.equal(afterUnknownOverflow.run.updatedAtMs, 2_004);
+  });
+});
+
+void test('rejects a stale progress snapshot before inserting observations', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL stale progress test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(configuration,1_000);
+    const progressed = await repository.recordProgress({
+      runId:run.runId,expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:2_000,
+      counters:progressCounters,providerUsage:run.providerUsage,
+      samples:Object.freeze([sample()]),unknownPositions:Object.freeze([]),
+    });
+
+    await assert.rejects(repository.recordProgress({
+      runId:run.runId,expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:3_000,
+      counters:progressCounters,providerUsage:progressed.providerUsage,
+      samples:Object.freeze([Object.freeze({ ...sample(),positionId:'stale-position' })]),
+      unknownPositions:Object.freeze([]),
+    }), isConflict('PROGRESS_SNAPSHOT_STALE'));
+    const stored = await repository.load(run.runId);
+    assert.equal(stored?.run.updatedAtMs,2_000);
+    assert.deepEqual(stored?.samples.map((value) => value.positionId),['position']);
   });
 });
 
@@ -256,7 +290,8 @@ void test('loads one repeatable read snapshot while progress commits concurrentl
     const loading = reader.load(run.runId);
     await runSelected;
     await writer.recordProgress({
-      runId: run.runId, observedAtMs: 2_000, counters: progressCounters,
+      runId: run.runId, expectedUpdatedAtMs: run.updatedAtMs,
+      observedAtMs: 2_000, counters: progressCounters,
       providerUsage: Object.freeze({
         status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 101n,
         rateLimitedCount: 0,
@@ -285,7 +320,8 @@ void test('rejects a report not canonically rebuilt from durable samples', async
       rateLimitedCount: 0,
     });
     await repository.recordProgress({
-      runId: run.runId, observedAtMs: 2_000, counters: progressCounters,
+      runId: run.runId, expectedUpdatedAtMs: run.updatedAtMs,
+      observedAtMs: 2_000, counters: progressCounters,
       providerUsage: usage, samples: Object.freeze([losingSample()]),
       unknownPositions: Object.freeze([]),
     });
@@ -338,7 +374,8 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
 
     const firstSample = sample();
     const progressed = await repository.recordProgress({
-      runId: run.runId, observedAtMs: 2_000, counters: progressCounters,
+      runId: run.runId, expectedUpdatedAtMs: run.updatedAtMs,
+      observedAtMs: 2_000, counters: progressCounters,
       providerUsage: Object.freeze({
         status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 101n,
         rateLimitedCount: 0,
@@ -348,7 +385,8 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     });
     assert.equal(progressed.closedPositions, 1);
     const replayed = await repository.recordProgress({
-      runId: run.runId, observedAtMs: 2_001, counters: progressCounters,
+      runId: run.runId, expectedUpdatedAtMs: progressed.updatedAtMs,
+      observedAtMs: 2_001, counters: progressCounters,
       providerUsage: progressed.providerUsage,
       samples: Object.freeze([firstSample]),
       unknownPositions: Object.freeze([]),
@@ -356,7 +394,8 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     assert.equal(replayed.closedPositions, 1);
 
     const withUnknown = await repository.recordProgress({
-      runId: run.runId, observedAtMs: 2_001, counters: progressCounters,
+      runId: run.runId, expectedUpdatedAtMs: replayed.updatedAtMs,
+      observedAtMs: 2_002, counters: progressCounters,
       providerUsage: progressed.providerUsage, samples: Object.freeze([]),
       unknownPositions: Object.freeze([Object.freeze({
         positionId: 'position-unknown', reason: 'MISSING_SELL_TRADE',
@@ -364,14 +403,16 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     });
     assert.equal(withUnknown.counters.unknownTerminalPositions, 1);
     assert.equal((await repository.recordProgress({
-      runId: run.runId, observedAtMs: 2_001, counters: progressCounters,
+      runId: run.runId, expectedUpdatedAtMs: withUnknown.updatedAtMs,
+      observedAtMs: 2_003, counters: progressCounters,
       providerUsage: progressed.providerUsage, samples: Object.freeze([]),
       unknownPositions: Object.freeze([Object.freeze({
         positionId: 'position-unknown', reason: 'MISSING_SELL_TRADE',
       })]),
     })).counters.unknownTerminalPositions, 1);
     await assert.rejects(repository.recordProgress({
-      runId: run.runId, observedAtMs: 2_001, counters: progressCounters,
+      runId: run.runId, expectedUpdatedAtMs: 2_003,
+      observedAtMs: 2_004, counters: progressCounters,
       providerUsage: progressed.providerUsage, samples: Object.freeze([]),
       unknownPositions: Object.freeze([Object.freeze({
         positionId: 'position-unknown', reason: 'MISSING_BUY_TRADE',
@@ -379,7 +420,8 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     }), isConflict('SAMPLE_CONTRADICTION'));
 
     await assert.rejects(repository.recordProgress({
-      runId: run.runId, observedAtMs: 2_002,
+      runId: run.runId, expectedUpdatedAtMs: 2_003,
+      observedAtMs: 2_004,
       counters: Object.freeze({ ...progressCounters, creationsObserved: 2 }),
       providerUsage: progressed.providerUsage,
       samples: Object.freeze([Object.freeze({ ...firstSample, mint: 'contradiction' })]),

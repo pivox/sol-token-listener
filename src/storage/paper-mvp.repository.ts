@@ -32,7 +32,7 @@ export interface PaperMvpPool { connect(): Promise<Client> }
 type Operation = 'start' | 'progress' | 'load' | 'terminalize';
 export type PaperMvpConflictCode =
   | 'ACTIVE_RUN_INCOMPATIBLE' | 'RUN_NOT_ACTIVE' | 'SAMPLE_CONTRADICTION'
-  | 'PROGRESS_REGRESSION' | 'PROGRESS_LIMIT_EXCEEDED'
+  | 'PROGRESS_REGRESSION' | 'PROGRESS_LIMIT_EXCEEDED' | 'PROGRESS_SNAPSHOT_STALE'
   | 'TERMINALIZATION_CONTRADICTION';
 
 export class PaperMvpConflictError extends Error {
@@ -107,6 +107,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
 
   public async recordProgress(progress: PaperMvpProgress): Promise<PaperMvpRun> {
     boundedText(progress.runId, 'runId');
+    timestamp(progress.expectedUpdatedAtMs, 'expectedUpdatedAtMs');
     timestamp(progress.observedAtMs, 'observedAtMs');
     const counters = validateCounters(progress.counters);
     const usage = validateProviderUsage(progress.providerUsage);
@@ -127,6 +128,9 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       const before = await selectRun(client, progress.runId, true);
       if (before?.state !== 'RUNNING') {
         throw new PaperMvpConflictError('RUN_NOT_ACTIVE');
+      }
+      if (before.updatedAtMs !== progress.expectedUpdatedAtMs) {
+        throw new PaperMvpConflictError('PROGRESS_SNAPSHOT_STALE');
       }
       assertProgress(before, counters, usage, progress.observedAtMs);
       for (const sample of samples) {
@@ -473,7 +477,7 @@ function assertProgress(
     if (counters[field] < run.counters[field]) throw new PaperMvpConflictError('PROGRESS_REGRESSION');
   }
   const old = run.providerUsage;
-  if (observedAtMs < run.updatedAtMs || usage.rateLimitedCount < old.rateLimitedCount
+  if (observedAtMs <= run.updatedAtMs || usage.rateLimitedCount < old.rateLimitedCount
     || (old.status === 'AVAILABLE' && usage.status !== 'AVAILABLE')
     || (old.status === 'AVAILABLE' && usage.status === 'AVAILABLE'
       && (usage.creditsUsedStart !== old.creditsUsedStart

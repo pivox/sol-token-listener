@@ -7,7 +7,10 @@ import type { PaperMvpSource } from '../src/ports/paper-mvp-source.js';
 import { PaperMvpCollector } from '../src/application/paper-mvp-collector.js';
 import { PostgresPaperMvpSource } from '../src/storage/paper-mvp-source.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
-import { PostgresPaperMvpRepository } from '../src/storage/paper-mvp.repository.js';
+import {
+  PaperMvpConflictError,
+  PostgresPaperMvpRepository,
+} from '../src/storage/paper-mvp.repository.js';
 
 const runSnapshot: PaperMvpRunSnapshot = Object.freeze({
   run: Object.freeze({
@@ -135,6 +138,22 @@ void test('accumulates bounded duplicate counts across distinct collection polls
   });
 });
 
+void test('retries an interleaved stale collection without losing distinct duplicate counts', async () => {
+  const result = await interleavedCollections(false);
+
+  assert.equal(result.first.inserted + result.second.inserted, 2);
+  assert.equal(result.snapshot.run.closedPositions, 2);
+  assert.equal(result.snapshot.run.counters.duplicateLogicalBuys, 11);
+});
+
+void test('retries an interleaved stale collection without charging the same position twice', async () => {
+  const result = await interleavedCollections(true);
+
+  assert.equal(result.first.inserted + result.second.inserted, 1);
+  assert.equal(result.snapshot.run.closedPositions, 1);
+  assert.equal(result.snapshot.run.counters.duplicateLogicalBuys, 6);
+});
+
 void test('classifies terminal source gaps and contradictions as durable unknown positions', async () => {
   const facts = validFacts();
   const positions = Object.freeze([
@@ -252,9 +271,6 @@ void test('collects and replays exact PostgreSQL facts before source retention',
     await seedPostgresFacts(pool);
     const repository = new PostgresPaperMvpRepository(pool);
     const run = await repository.startOrResume(runSnapshot.run.configuration, 1_000);
-    const purged = await purgeExpiredFoundationData(pool);
-    assert.equal(purged.paperTrades, 0);
-    assert.equal(purged.paperPositions, 0);
     assert.equal((await pool.query('SELECT 1 FROM paper_positions')).rowCount, 2);
     assert.equal((await pool.query('SELECT 1 FROM paper_trades')).rowCount, 4);
     const collector = new PaperMvpCollector(
@@ -340,6 +356,10 @@ void test('retains an expired entry decision job until the active run samples it
       `paper_job_${'a'.repeat(64)}`,new Date(terminalAt - 1_000),
       new Date(terminalAt),new Date(expiredAt),
     ]);
+    await pool.query(`UPDATE domain_events SET terminal_at=$2,purge_after=$3
+      WHERE event_id=$1`, ['source-open',new Date(terminalAt),new Date(expiredAt)]);
+    await pool.query(`UPDATE raw_chain_events SET terminal_at=$2,purge_after=$3
+      WHERE event_id=$1`, ['raw-open',new Date(terminalAt),new Date(expiredAt)]);
     await pool.query(`UPDATE paper_positions SET opened_at=$2,closed_at=$3,purge_after=$4
       WHERE position_id=$1`, [
       'position-1',new Date(now - 50_000),new Date(now - 40_000),new Date(expiredAt),
@@ -350,9 +370,11 @@ void test('retains an expired entry decision job until the active run samples it
     const protectedPurge = await purgeExpiredFoundationData(pool);
     assert.equal(protectedPurge.paperDecisionJobs,0);
     assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id='source-open'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM raw_chain_events WHERE event_id='raw-open'")).rowCount,1);
 
     await repository.recordProgress({
-      runId:run.runId,observedAtMs:now,counters:Object.freeze({
+      runId:run.runId,expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:now,counters:Object.freeze({
         creationsObserved:0,entriesRejected:0,duplicateLogicalBuys:0,duplicateLogicalSells:0,
       }),providerUsage:run.providerUsage,samples:Object.freeze([]),unknownPositions:Object.freeze([
         Object.freeze({ positionId:'position-1',reason:'SOURCE_CONTRADICTION' as const }),
@@ -361,6 +383,61 @@ void test('retains an expired entry decision job until the active run samples it
     const releasedPurge = await purgeExpiredFoundationData(pool);
     assert.equal(releasedPurge.paperDecisionJobs,1);
     assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id='source-open'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM raw_chain_events WHERE event_id='raw-open'")).rowCount,0);
+  });
+});
+
+void test('fails an abandoned run deterministically and releases its retained sources', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL abandoned run test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const now = Date.now();
+    const expiredAt = now - 1_000;
+    const jobTerminalAt = expiredAt - 14_400_000;
+    const startedAt = now - 181_000;
+    const expectedTerminalAt = startedAt + 60_000 + 120_000;
+    await pool.query(`UPDATE paper_decision_jobs SET
+      updated_at=$2,terminal_at=$2,purge_after=$3 WHERE job_id=$1`, [
+      `paper_job_${'a'.repeat(64)}`,new Date(jobTerminalAt),new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE domain_events SET terminal_at=$1,purge_after=$1
+      WHERE event_id='source-open'`, [new Date(expiredAt)]);
+    await pool.query(`UPDATE raw_chain_events SET terminal_at=$1,purge_after=$1
+      WHERE event_id='raw-open'`, [new Date(expiredAt)]);
+    await pool.query(`UPDATE paper_positions SET opened_at=$1,closed_at=$2,purge_after=$3
+      WHERE position_id='position-1'`, [
+      new Date(startedAt + 1_000),new Date(startedAt + 2_000),new Date(expiredAt),
+    ]);
+    const repository = new PostgresPaperMvpRepository(pool);
+    const abandoned = await repository.startOrResume(runSnapshot.run.configuration,startedAt);
+
+    await purgeExpiredFoundationData(pool);
+
+    const failed = await repository.load(abandoned.runId);
+    assert.equal(failed?.run.state,'FAILED');
+    assert.equal(failed?.run.failureCode,'RUN_DEADLINE_ABANDONED');
+    assert.equal(failed?.run.terminalAtMs,expectedTerminalAt);
+    assert.equal(failed?.run.purgeAfterMs,expectedTerminalAt + 14_400_000);
+    assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,0);
+    const replacement = await repository.startOrResume(runSnapshot.run.configuration,now);
+    assert.notEqual(replacement.runId,abandoned.runId);
+
+    await repository.terminalize({
+      runId:replacement.runId,terminalAtMs:now,state:'FAILED',report:null,
+      failureCode:'TEST_TERMINAL',
+    });
+    const ancientStartedAt = now - 14_400_000 - 181_000;
+    const ancient = await repository.startOrResume(
+      runSnapshot.run.configuration,ancientStartedAt,
+    );
+    const finalPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(finalPurge.paperMvpRuns,1);
+    assert.equal(await repository.load(ancient.runId),null);
   });
 });
 
@@ -373,6 +450,73 @@ function fakeRepository(
     recordProgress,
     terminalize: async () => runSnapshot.run,
   });
+}
+
+async function interleavedCollections(samePosition: boolean): Promise<Readonly<{
+  first: Awaited<ReturnType<PaperMvpCollector['collect']>>;
+  second: Awaited<ReturnType<PaperMvpCollector['collect']>>;
+  snapshot: PaperMvpRunSnapshot;
+}>> {
+  let snapshot = runSnapshot;
+  const sampled = new Set<string>();
+  let releaseFirst: (() => void) | undefined;
+  const firstMayContinue = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let firstEntered: (() => void) | undefined;
+  const firstSourceEntered = new Promise<void>((resolve) => { firstEntered = resolve; });
+  let sourceCalls = 0;
+  const repository: PaperMvpRepository = Object.freeze({
+    startOrResume: async () => snapshot.run,
+    load: async () => snapshot,
+    recordProgress: async (progress: Parameters<PaperMvpRepository['recordProgress']>[0]) => {
+      if (progress.expectedUpdatedAtMs !== snapshot.run.updatedAtMs) {
+        throw new PaperMvpConflictError('PROGRESS_SNAPSHOT_STALE');
+      }
+      if (progress.observedAtMs <= snapshot.run.updatedAtMs) {
+        throw new PaperMvpConflictError('PROGRESS_REGRESSION');
+      }
+      for (const sample of progress.samples) sampled.add(sample.positionId);
+      snapshot = Object.freeze({
+        ...snapshot,
+        run: Object.freeze({
+          ...snapshot.run,
+          counters: Object.freeze({
+            ...snapshot.run.counters,
+            ...progress.counters,
+          }),
+          closedPositions: sampled.size,
+          updatedAtMs: progress.observedAtMs,
+        }),
+      });
+      return snapshot.run;
+    },
+    terminalize: async () => snapshot.run,
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => {
+      sourceCalls += 1;
+      if (sourceCalls === 1) {
+        firstEntered?.();
+        await firstMayContinue;
+      }
+      const positionId = sourceCalls === 2 && !samePosition ? 'position-2' : 'position-1';
+      const alreadySampled = sampled.has(positionId);
+      return Object.freeze({
+        positions: alreadySampled ? Object.freeze([]) : Object.freeze([
+          Object.freeze({ ...validFacts(), positionId }),
+        ]),
+        duplicateLogicalBuys: alreadySampled ? 0 : sourceCalls === 2 ? 6 : 5,
+        duplicateLogicalSells: 0,
+      });
+    },
+  });
+  const firstCollector = new PaperMvpCollector(repository,source,() => 2_000);
+  const secondCollector = new PaperMvpCollector(repository,source,() => 2_000);
+  const firstPromise = firstCollector.collect({ runId:'run-1',limit:1 });
+  await firstSourceEntered;
+  const second = await secondCollector.collect({ runId:'run-1',limit:1 });
+  releaseFirst?.();
+  const first = await firstPromise;
+  return Object.freeze({ first,second,snapshot });
 }
 
 function validFacts(): Awaited<ReturnType<PaperMvpSource['collectBatch']>>['positions'][number] {

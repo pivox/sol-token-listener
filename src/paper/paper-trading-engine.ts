@@ -246,6 +246,36 @@ export class PaperTradingEngine {
     });
   }
 
+  public async reconcileClose(
+    positionId: string,
+    triggerEvent: DomainEvent,
+  ): Promise<PaperPosition> {
+    this.requirePaperMode();
+    const trigger = snapshotTrigger(triggerEvent);
+    return this.repository.transact(async (transaction) => {
+      const current = await transaction.findPosition(positionId);
+      if (current === null) {
+        throw new PaperTradingError('POSITION_NOT_FOUND','Position paper introuvable.');
+      }
+      if (current.status === 'PAPER_RETRACTED') return current;
+      if (current.status !== 'PAPER_CLOSED'
+        || current.exitTradeId === null
+        || current.closeEventId === null
+        || current.closeEventId === undefined) conflict();
+      if (current.closeEventId !== paperEventId(
+        'PaperPositionClosed',current.id,current.exitTradeId,trigger.id,
+      )) {
+        throw new PaperTradingError(
+          'CLOSE_TRIGGER_MISMATCH','L’événement observé ne déclenche pas cette clôture paper.',
+        );
+      }
+      await transaction.reconcileEventConfirmation(current.closeEventId,trigger);
+      return trigger.confirmationStatus === 'orphaned'
+        ? this.retractPosition(transaction,current)
+        : current;
+    });
+  }
+
   public async close(command: ClosePaperPositionCommand): Promise<PaperPosition> {
     this.requirePaperMode();
     const snapshot = snapshotCloseCommand(command);

@@ -462,6 +462,7 @@ class FakeLedger {
       purgeAfterMs: 14_404_000,
     });
   }
+  public async reconcileClose(): Promise<PaperPosition> { return POSITION; }
   public async retract(): Promise<PaperPosition> { return POSITION; }
 }
 

@@ -242,6 +242,32 @@ export class CreationEntryV1Strategy {
     return strategyResult(updated, [], position, input.qualificationEvent);
   }
 
+  public async reconcileClose(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV2;
+    position: PaperPosition;
+    trigger: DomainEvent;
+  }>): Promise<CreationEntryStrategyResult> {
+    if (input.session.state !== 'PAPER_CLOSED'
+      || input.session.positionId !== input.position.id
+      || input.position.status !== 'PAPER_CLOSED') {
+      throw new TypeError('Creation close reconciliation is inconsistent.');
+    }
+    const position = await this.ledger.reconcileClose(input.position.id,input.trigger);
+    if (position.status === 'PAPER_RETRACTED') {
+      const retracted = updateSession(input.candidate,input.session,{
+        state:'PAPER_RETRACTED',reasonCode:'SOURCE_ORPHANED',pendingExitReason:null,
+        pendingExitTriggerAtMs:null,updatedAtMs:position.closedAtMs ?? input.session.updatedAtMs,
+        purgeAfterMs:position.purgeAfterMs ?? input.session.purgeAfterMs,
+      });
+      return strategyResult(retracted,[],position,input.trigger);
+    }
+    if (position.status !== 'PAPER_CLOSED') {
+      throw new TypeError('Creation close reconciliation did not find a terminal position.');
+    }
+    return strategyResult(input.session,[],position,input.trigger);
+  }
+
   public async reconcileEvidence(input: Readonly<{
     candidate: TradingCandidateV1;
     session: PaperStrategySessionV2;

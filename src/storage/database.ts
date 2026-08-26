@@ -229,6 +229,18 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const migrations = await client.query(
       'DELETE FROM migrations WHERE purge_after <= NOW()',
     );
+    await client.query(
+      `UPDATE paper_mvp_runs SET
+        state='FAILED',
+        terminal_at=deadline_at + INTERVAL '2 minutes',
+        purge_after=deadline_at + INTERVAL '4 hours 2 minutes',
+        updated_at=deadline_at + INTERVAL '2 minutes',
+        verdict=NULL,
+        failure_code='RUN_DEADLINE_ABANDONED',
+        report_payload=NULL
+       WHERE state='RUNNING'
+         AND deadline_at + INTERVAL '2 minutes' <= statement_timestamp()`,
+    );
     const paperMvpSamples = await client.query(
       `DELETE FROM paper_mvp_position_samples sample USING paper_mvp_runs run
        WHERE sample.run_id = run.run_id
@@ -445,7 +457,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          AND NOT EXISTS (
            SELECT 1 FROM paper_decision_jobs job
            WHERE job.source_event_id = domain_events.event_id
-             AND (job.purge_after IS NULL OR job.purge_after > statement_timestamp())
          )
          AND NOT EXISTS (
            SELECT 1 FROM qualification_reports report
@@ -485,7 +496,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          AND NOT EXISTS (
            SELECT 1 FROM paper_decision_jobs job
            WHERE job.source_raw_event_id = raw.event_id
-             AND (job.purge_after IS NULL OR job.purge_after > statement_timestamp())
          )
          AND NOT EXISTS (
            SELECT 1 FROM qualification_reports report

@@ -145,7 +145,8 @@ export type PaperTradingErrorCode =
   | 'TRIGGER_ORPHANED'
   | 'POSITION_NOT_FOUND'
   | 'POSITION_NOT_OPEN'
-  | 'POSITION_CONFLICT';
+  | 'POSITION_CONFLICT'
+  | 'CLOSE_TRIGGER_MISMATCH';
 
 export class PaperTradingError extends Error {
   public constructor(

@@ -60,6 +60,7 @@ export interface PaperMvpRun {
 
 export interface PaperMvpProgress {
   readonly runId: string;
+  readonly expectedUpdatedAtMs: number;
   readonly observedAtMs: number;
   readonly counters: PaperMvpProgressCounters;
   readonly providerUsage: PaperMvpProviderUsage;

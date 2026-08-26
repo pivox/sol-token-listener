@@ -77,7 +77,7 @@ interface CandidateBuilder {
 type StrategyActions = Pick<ValidatedExternalBuysStrategy,
 'prepare' | 'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
 > | Pick<CreationEntryV1Strategy,
-'prepare' | 'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
+'prepare' | 'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence' | 'reconcileClose'
 >;
 
 type StrategyResult = ExternalBuysStrategyResult | CreationEntryStrategyResult;
@@ -335,6 +335,28 @@ export class PaperDecisionWorker {
         || session.state === 'PAPER_RETRACTED'
       )
     ) {
+      if (session.payloadVersion === 2 && session.state === 'PAPER_CLOSED'
+        && snapshot.activePosition?.status === 'PAPER_CLOSED') {
+        if (!await lease.checkpoint()) return this.leaseLost(job,lease);
+        let reconciled: StrategyResult;
+        try {
+          reconciled=await reconcileClosedStrategy(this.strategy,{
+            candidate,session,position:snapshot.activePosition,trigger:snapshot.asOfEvent,
+          });
+        } catch (error: unknown) {
+          if (error instanceof PaperTradingError && error.code === 'CLOSE_TRIGGER_MISMATCH') {
+            return this.complete(job,lease,decision(
+              context,candidateResult,session,
+              sessionEvent(session,decisionSnapshot.candidateEvent),[],'NONE',
+            ));
+          }
+          return this.fail(job,lease,'DECISION_INVALID',false,null);
+        }
+        return this.complete(job,lease,decision(
+          context,candidateResult,reconciled.session,reconciled.sessionEvent,
+          reconciled.countedExternalBuys,reconciled.requestedAction,
+        ));
+      }
       return this.complete(job,lease,decision(
         context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'NONE',
       ));
@@ -590,6 +612,7 @@ type LegacySourceInput = Parameters<ValidatedExternalBuysStrategy['reconcileSour
 type CreationSourceInput = Parameters<CreationEntryV1Strategy['reconcileSource']>[0];
 type LegacyEvidenceInput = Parameters<ValidatedExternalBuysStrategy['reconcileEvidence']>[0];
 type CreationEvidenceInput = Parameters<CreationEntryV1Strategy['reconcileEvidence']>[0];
+type CreationCloseInput = Parameters<CreationEntryV1Strategy['reconcileClose']>[0];
 type AnyOpenInput = Omit<LegacyOpenInput, 'session'> & Readonly<{
   session: PaperStrategySession;
   entryDecisionAtMs?: number;
@@ -611,10 +634,10 @@ type AnyEvidenceInput = Omit<LegacyEvidenceInput, 'session'> & Readonly<{
 function creationStrategy(
   strategy: StrategyActions,
 ): Pick<CreationEntryV1Strategy,
-'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
+'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence' | 'reconcileClose'
 > {
   return strategy as Pick<CreationEntryV1Strategy,
-  'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence'
+  'open' | 'recoverOpen' | 'reconcile' | 'reconcileSource' | 'reconcileEvidence' | 'reconcileClose'
   >;
 }
 
@@ -701,6 +724,13 @@ function reconcileStrategyEvidence(
   return input.session.payloadVersion === 2
     ? creationStrategy(selected).reconcileEvidence(input as CreationEvidenceInput)
     : legacyStrategy(selected).reconcileEvidence(input as LegacyEvidenceInput);
+}
+
+function reconcileClosedStrategy(
+  strategy: StrategyProvider,
+  input: CreationCloseInput,
+): Promise<StrategyResult> {
+  return creationStrategy(sessionStrategy(strategy,input.session)).reconcileClose(input);
 }
 
 function decision(
