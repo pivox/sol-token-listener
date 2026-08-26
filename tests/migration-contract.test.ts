@@ -39,6 +39,8 @@ void test('la migration ne crée aucun chemin de secret ou d’exécution réell
 void test('la purge paper respecte l’ordre enfant avant parent et les lignées non expirées', async () => {
   const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
   const order = [
+    'DELETE FROM paper_mvp_position_samples',
+    'DELETE FROM paper_mvp_runs',
     'DELETE FROM paper_external_buy_events',
     'DELETE FROM paper_strategy_sessions',
     'DELETE FROM trading_candidates',
@@ -54,4 +56,5 @@ void test('la purge paper respecte l’ordre enfant avant parent et les lignées
   assert.deepEqual([...order].sort((left, right) => left - right), order);
   assert.match(source, /NOT EXISTS \([\s\S]*social_evidence_collections[\s\S]*purge_after > statement_timestamp\(\)/u);
   assert.match(source, /NOT EXISTS \([\s\S]*paper_strategy_sessions[\s\S]*purge_after IS NULL/u);
+  assert.match(source, /NOT EXISTS \([\s\S]*paper_positions position[\s\S]*position\.close_event_id = domain_events\.event_id/u);
 });

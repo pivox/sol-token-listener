@@ -136,6 +136,8 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly marketReserveSnapshots: number;
   readonly marketPools: number;
   readonly migrations: number;
+  readonly paperMvpSamples: number;
+  readonly paperMvpRuns: number;
   readonly paperExternalBuys: number;
   readonly paperSessions: number;
   readonly tradingCandidates: number;
@@ -226,6 +228,14 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     );
     const migrations = await client.query(
       'DELETE FROM migrations WHERE purge_after <= NOW()',
+    );
+    const paperMvpSamples = await client.query(
+      `DELETE FROM paper_mvp_position_samples sample USING paper_mvp_runs run
+       WHERE sample.run_id = run.run_id
+         AND run.purge_after <= statement_timestamp()`,
+    );
+    const paperMvpRuns = await client.query(
+      'DELETE FROM paper_mvp_runs WHERE purge_after <= statement_timestamp()',
     );
     const paperExternalBuys = await client.query(
       'DELETE FROM paper_external_buy_events WHERE purge_after <= statement_timestamp()',
@@ -412,6 +422,10 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          AND NOT EXISTS (
            SELECT 1 FROM paper_external_buy_events counted
            WHERE counted.source_event_id = domain_events.event_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_positions position
+           WHERE position.close_event_id = domain_events.event_id
          )`,
     );
     const rawEvents = await client.query(
@@ -492,6 +506,8 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       marketReserveSnapshots: marketReserveSnapshots.rowCount ?? 0,
       marketPools: marketPools.rowCount ?? 0,
       migrations: migrations.rowCount ?? 0,
+      paperMvpSamples: paperMvpSamples.rowCount ?? 0,
+      paperMvpRuns: paperMvpRuns.rowCount ?? 0,
       paperExternalBuys: paperExternalBuys.rowCount ?? 0,
       paperSessions: paperSessions.rowCount ?? 0,
       tradingCandidates: tradingCandidates.rowCount ?? 0,
