@@ -840,6 +840,26 @@ void test('ferme entièrement et calcule le PnL conservateur', async () => {
   assert.equal(repository.writeCount, 2);
 });
 
+void test('autorise le retry manuel legacy sans inventer son horodatage', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const opened = await engine.open({
+    ...openCommand(),
+    strategy: { id: 'creation-entry-v1', version: 1 },
+  });
+  const command = closeCommand(opened.id);
+
+  const closed = await engine.close({
+    positionId: command.positionId,
+    trigger: command.trigger,
+    sellQuote: command.sellQuote,
+    reason: 'MANUAL_KILL_SWITCH',
+  });
+
+  assert.equal(closed.status, 'PAPER_CLOSED');
+  assert.equal(closed.exitTriggerAtMs, null);
+});
+
 void test('refuse un replay de fermeture contradictoire sans second trade', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');

@@ -412,6 +412,8 @@ void test('recovers a staged BUY_PENDING session after its paper position opened
   assert.equal((await worker.runOnce()).kind, 'completed');
   assert.equal(quotes.calls, 0);
   assert.deepEqual(operations, ['stage','recover-open','complete']);
+  assert.equal(services.strategy.recoverOpenInputs[0]?.entryDecisionAtMs, 500);
+  assert.equal(services.strategy.recoverOpenInputs[0]?.entryDecisionJobId, 'paper-job');
   assert.equal(repository.completions[0]?.result.session?.state, 'WAITING_EXTERNAL_BUYS');
 });
 
@@ -604,10 +606,13 @@ void test('retracts a later paper session when its launch becomes orphaned', asy
     lastQuote:candidate.buyQuote,lastError:null,createdAtMs:2_000,updatedAtMs:2_000,
     purgeAfterMs:14_402_000,
   });
+  const persistedPosition=Object.freeze({
+    ...POSITION,entryDecisionAtMs:450,entryDecisionJobId:'persisted-paper-job',
+  });
   repository.snapshotValue=snapshot({
     asOfEvent:event('TokenLaunchDetected','evt_source','orphaned'),
     canonicalLaunchActive:false,currentQualification:null,currentCandidate:candidate,
-    currentSession:session,activePosition:POSITION,
+    currentSession:session,activePosition:persistedPosition,
     currentDecision:persistedDecision(candidate,'orphaned'),
   });
   const services=fakeServices('ELIGIBLE',operations);
@@ -619,6 +624,8 @@ void test('retracts a later paper session when its launch becomes orphaned', asy
   assert.equal((await worker.runOnce()).kind,'completed');
   assert.ok(operations.includes('reconcile-source'));
   assert.equal(operations.includes('reconcile-evidence'),false);
+  assert.equal(services.strategy.reconcileSourceInputs[0]?.entryDecisionAtMs,450);
+  assert.equal(services.strategy.reconcileSourceInputs[0]?.entryDecisionJobId,'persisted-paper-job');
   assert.equal(repository.completions[0]?.result.session?.state,'PAPER_RETRACTED');
 });
 
@@ -825,6 +832,14 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
   };
   const strategy = {
     openError:null as Error|null,
+    recoverOpenInputs:[] as Readonly<{
+      readonly entryDecisionAtMs?:number;
+      readonly entryDecisionJobId?:string;
+    }>[],
+    reconcileSourceInputs:[] as Readonly<{
+      readonly entryDecisionAtMs?:number;
+      readonly entryDecisionJobId?:string;
+    }>[],
     prepare() {
       return state === 'ELIGIBLE' ? createPaperStrategySession({
         candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
@@ -843,8 +858,13 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
         countedExternalBuys:Object.freeze([]),requestedAction:'OPEN' as const,position:POSITION,
       });
     },
-    async recoverOpen(input: { readonly session: ReturnType<typeof createPaperStrategySession> }) {
+    async recoverOpen(input: {
+      readonly session: ReturnType<typeof createPaperStrategySession>;
+      readonly entryDecisionAtMs?:number;
+      readonly entryDecisionJobId?:string;
+    }) {
       operations.push('recover-open');
+      this.recoverOpenInputs.push(input);
       return Object.freeze({
         session:Object.freeze({ ...input.session,state:'WAITING_EXTERNAL_BUYS' as const,positionId:'position' }),
         sessionEvent:event('PaperStrategySessionUpdated','evt_session_open_recovered'),
@@ -857,8 +877,13 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
         countedExternalBuys:Object.freeze([]),requestedAction:'NONE' as const,position:POSITION,
       });
     },
-    async reconcileSource(input: { readonly session:ReturnType<typeof createPaperStrategySession> }) {
+    async reconcileSource(input: {
+      readonly session:ReturnType<typeof createPaperStrategySession>;
+      readonly entryDecisionAtMs?:number;
+      readonly entryDecisionJobId?:string;
+    }) {
       operations.push('reconcile-source');
+      this.reconcileSourceInputs.push(input);
       const session=Object.freeze({
         ...input.session,state:'PAPER_RETRACTED' as const,reasonCode:'SOURCE_ORPHANED' as const,
         updatedAtMs:2_000,purgeAfterMs:14_402_000,

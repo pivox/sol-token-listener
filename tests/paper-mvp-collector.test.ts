@@ -144,6 +144,8 @@ void test('classifies terminal source gaps and contradictions as durable unknown
       closeEventObservedAtMs: 1_200 }),
     Object.freeze({ ...facts, positionId: 'fill', buyFillAmountOutRaw: '13999' }),
     Object.freeze({ ...facts, positionId: 'reason', sellReason: 'UNSUPPORTED' }),
+    Object.freeze({ ...facts, positionId: 'orphaned-close',
+      closeEventConfirmationStatus: 'orphaned' }),
   ]);
   const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
   const repository = fakeRepository(async (progress) => {
@@ -165,10 +167,10 @@ void test('classifies terminal source gaps and contradictions as durable unknown
   });
 
   const result = await new PaperMvpCollector(repository, source, () => 8_000)
-    .collect({ runId: 'run-1', limit: 5 });
+    .collect({ runId: 'run-1', limit: 6 });
 
   assert.deepEqual(result, {
-    scanned: 5, inserted: 5, valid: 0, unknown: 5,
+    scanned: 6, inserted: 6, valid: 0, unknown: 6,
     duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
   });
   assert.deepEqual(recordedProgress[0]?.unknownPositions, [
@@ -177,7 +179,31 @@ void test('classifies terminal source gaps and contradictions as durable unknown
     { positionId: 'causal', reason: 'INVALID_TIMESTAMP_ORDER' },
     { positionId: 'fill', reason: 'SOURCE_CONTRADICTION' },
     { positionId: 'reason', reason: 'UNSUPPORTED_EXIT_REASON' },
+    { positionId: 'orphaned-close', reason: 'POSITION_RETRACTED' },
   ]);
+});
+
+void test('defensively waits when a non-finalized close reaches the collector', async () => {
+  const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
+  const repository = fakeRepository(async (progress) => {
+    recordedProgress.push(progress);
+    return runSnapshot.run;
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => Object.freeze({
+      positions:Object.freeze([
+        Object.freeze({ ...validFacts(),closeEventConfirmationStatus:'confirmed' }),
+      ]),duplicateLogicalBuys:0,duplicateLogicalSells:0,
+    }),
+  });
+
+  assert.deepEqual(await new PaperMvpCollector(repository,source,() => 8_000)
+    .collect({ runId:'run-1',limit:1 }), {
+    scanned:0,inserted:0,valid:0,unknown:0,
+    duplicateLogicalBuys:0,duplicateLogicalSells:0,
+  });
+  assert.equal(recordedProgress[0]?.samples.length,0);
+  assert.equal(recordedProgress[0]?.unknownPositions.length,0);
 });
 
 void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and all-trade duplicates', async () => {
@@ -206,6 +232,7 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
   assert.match(queries[0]?.text ?? '', /exit_trade_id/u);
   assert.match(queries[0]?.text ?? '', /GREATEST\(COUNT\(\*\) FILTER[\s\S]*- 1, 0\)/u);
   assert.match(queries[0]?.text ?? '', /opened_at <= \$3[\s\S]*closed_at <= \$3/u);
+  assert.match(queries[0]?.text ?? '', /close_event\.confirmation_status[\s\S]*finalized[\s\S]*orphaned/u);
   assert.match(queries[0]?.text ?? '', /WITH candidates AS MATERIALIZED[\s\S]*LIMIT \$6/u);
   assert.doesNotMatch(queries[0]?.text ?? '', /FROM paper_trades trade JOIN eligible/u);
   await assert.rejects(source.collectBatch({
@@ -235,11 +262,13 @@ void test('collects and replays exact PostgreSQL facts before source retention',
     );
 
     assert.deepEqual(await collector.collect({ runId:run.runId,limit:1 }), {
-      scanned:1,inserted:1,valid:1,unknown:0,
-      duplicateLogicalBuys:1,duplicateLogicalSells:1,
-    });
-    assert.deepEqual(await collector.collect({ runId:run.runId,limit:1 }), {
       scanned:1,inserted:1,valid:0,unknown:1,
+      duplicateLogicalBuys:0,duplicateLogicalSells:0,
+    });
+    assert.equal((await repository.load(run.runId))?.samples.length,0);
+    await pool.query("UPDATE domain_events SET confirmation_status='finalized' WHERE event_id='close-event'");
+    assert.deepEqual(await collector.collect({ runId:run.runId,limit:1 }), {
+      scanned:1,inserted:1,valid:1,unknown:0,
       duplicateLogicalBuys:1,duplicateLogicalSells:1,
     });
     assert.deepEqual(await collector.collect({ runId:run.runId,limit:1 }), {
@@ -258,6 +287,80 @@ void test('collects and replays exact PostgreSQL facts before source retention',
     assert.deepEqual(stored?.unknownPositions, [
       { positionId:'position-retracted',reason:'POSITION_RETRACTED' },
     ]);
+  });
+});
+
+void test('waits on a confirmed close and records only UNKNOWN after its orphan replay', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL close finality test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    await pool.query("DELETE FROM paper_positions WHERE position_id='position-retracted'");
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(runSnapshot.run.configuration,1_000);
+    const collector = new PaperMvpCollector(
+      repository,new PostgresPaperMvpSource(pool),() => 2_000,
+    );
+
+    assert.deepEqual(await collector.collect({ runId:run.runId,limit:10 }), {
+      scanned:0,inserted:0,valid:0,unknown:0,
+      duplicateLogicalBuys:0,duplicateLogicalSells:0,
+    });
+    await pool.query("UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id='close-event'");
+    await pool.query("UPDATE paper_positions SET status='PAPER_RETRACTED' WHERE position_id='position-1'");
+    assert.deepEqual(await collector.collect({ runId:run.runId,limit:10 }), {
+      scanned:1,inserted:1,valid:0,unknown:1,
+      duplicateLogicalBuys:1,duplicateLogicalSells:1,
+    });
+    const stored = await repository.load(run.runId);
+    assert.equal(stored?.samples.length,0);
+    assert.deepEqual(stored?.unknownPositions,[
+      { positionId:'position-1',reason:'POSITION_RETRACTED' },
+    ]);
+  });
+});
+
+void test('retains an expired entry decision job until the active run samples its position', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL decision job retention test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const now = Date.now();
+    const expiredAt = now - 1_000;
+    const terminalAt = expiredAt - 14_400_000;
+    await pool.query(`UPDATE paper_decision_jobs SET
+      created_at=$2,updated_at=$3,terminal_at=$3,purge_after=$4
+      WHERE job_id=$1`, [
+      `paper_job_${'a'.repeat(64)}`,new Date(terminalAt - 1_000),
+      new Date(terminalAt),new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE paper_positions SET opened_at=$2,closed_at=$3,purge_after=$4
+      WHERE position_id=$1`, [
+      'position-1',new Date(now - 50_000),new Date(now - 40_000),new Date(expiredAt),
+    ]);
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(runSnapshot.run.configuration, now - 61_000);
+
+    const protectedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.paperDecisionJobs,0);
+    assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,1);
+
+    await repository.recordProgress({
+      runId:run.runId,observedAtMs:now,counters:Object.freeze({
+        creationsObserved:0,entriesRejected:0,duplicateLogicalBuys:0,duplicateLogicalSells:0,
+      }),providerUsage:run.providerUsage,samples:Object.freeze([]),unknownPositions:Object.freeze([
+        Object.freeze({ positionId:'position-1',reason:'SOURCE_CONTRADICTION' as const }),
+      ]),
+    });
+    const releasedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(releasedPurge.paperDecisionJobs,1);
+    assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,0);
   });
 });
 
@@ -280,7 +383,8 @@ function validFacts(): Awaited<ReturnType<PaperMvpSource['collectBatch']>>['posi
     entryQuoteAtMs: 1_300, paperBuyAtMs: 1_400,
     exitTriggerAtMs: 1_500, closeEventId: 'close-event-1',
     closeEventType: 'PaperPositionClosed', closeEventSource: 'paper-trading',
-    closeEventObservedAtMs: 1_500, exitQuoteAtMs: 1_600, paperSellAtMs: 1_700,
+    closeEventConfirmationStatus: 'finalized',closeEventObservedAtMs: 1_500,
+    exitQuoteAtMs: 1_600, paperSellAtMs: 1_700,
     entryTradeId: 'buy-1', buyTradeId: 'buy-1', buySide: 'BUY',
     buyInputMint: 'SOL', buyOutputMint: 'MINT',
     buyAmountInRaw: '9007199254740993', buyAmountOutRaw: '15000',

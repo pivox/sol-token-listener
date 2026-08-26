@@ -404,6 +404,13 @@ export class PaperDecisionWorker {
             candidate,session,qualification:context.report,
             qualificationEvent:context.event,
             maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
+            ...(snapshot.activePosition.entryDecisionAtMs === null
+              || snapshot.activePosition.entryDecisionAtMs === undefined
+              || snapshot.activePosition.entryDecisionJobId === null
+              || snapshot.activePosition.entryDecisionJobId === undefined ? {} : {
+                entryDecisionAtMs:snapshot.activePosition.entryDecisionAtMs,
+                entryDecisionJobId:snapshot.activePosition.entryDecisionJobId,
+              }),
           })
           : await reconcileStrategyEvidence(this.strategy, {
             candidate,session,position:snapshot.activePosition,
@@ -416,6 +423,8 @@ export class PaperDecisionWorker {
           candidate,session,qualification:context.report,
           qualificationEvent:context.event,
           maximumRoundTripLossBps:this.options.maximumRoundTripLossBps,
+          entryDecisionAtMs:job.createdAtMs,
+          entryDecisionJobId:job.jobId,
         });
       } else {
         reconciled=await reconcileStrategy(this.strategy, {
@@ -592,6 +601,8 @@ type AnyReconcileInput = Omit<LegacyReconcileInput, 'session'> & Readonly<{
 }>;
 type AnySourceInput = Omit<LegacySourceInput, 'session'> & Readonly<{
   session: PaperStrategySession;
+  entryDecisionAtMs?: number;
+  entryDecisionJobId?: string;
 }>;
 type AnyEvidenceInput = Omit<LegacyEvidenceInput, 'session'> & Readonly<{
   session: PaperStrategySession;

@@ -43,13 +43,21 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
 }
 
 const COLLECT_SQL = `WITH candidates AS MATERIALIZED (
-  SELECT position.*
+  SELECT position.*,close_event.type AS close_event_type,
+    close_event.source AS close_event_source,
+    close_event.confirmation_status AS close_event_confirmation_status,
+    close_event.observed_at AS close_event_observed_at
   FROM paper_positions position
+  LEFT JOIN domain_events close_event ON close_event.event_id=position.close_event_id
   WHERE position.strategy_id=$4 AND position.strategy_version=$5
     AND position.opened_at >= $2
     AND position.opened_at <= $3
     AND position.closed_at <= $3
-    AND position.status IN ('PAPER_CLOSED','PAPER_RETRACTED')
+    AND (
+      position.status='PAPER_RETRACTED'
+      OR (position.status='PAPER_CLOSED'
+        AND close_event.confirmation_status IN ('finalized','orphaned'))
+    )
     AND NOT EXISTS (
       SELECT 1 FROM paper_mvp_position_samples observation
       WHERE observation.run_id=$1 AND observation.position_id=position.position_id
@@ -87,9 +95,7 @@ const COLLECT_SQL = `WITH candidates AS MATERIALIZED (
     sell.fill_amount_out_raw::text AS sell_fill_amount_out_raw,
     sell.fees_raw::text AS sell_fees_raw,sell.slippage_bps::text AS sell_slippage_bps,
     sell.price_impact_bps::text AS sell_price_impact_bps,
-    sell.quote_observed_at AS exit_quote_at,sell.created_at AS paper_sell_at,
-    close_event.type AS close_event_type,close_event.source AS close_event_source,
-    close_event.observed_at AS close_event_observed_at
+    sell.quote_observed_at AS exit_quote_at,sell.created_at AS paper_sell_at
   FROM candidates
   LEFT JOIN token_launches launch ON launch.mint=candidates.mint
   LEFT JOIN paper_decision_jobs entry_job
@@ -98,7 +104,6 @@ const COLLECT_SQL = `WITH candidates AS MATERIALIZED (
     AND buy.position_id=candidates.position_id
   LEFT JOIN paper_trades sell ON sell.trade_id=candidates.exit_trade_id
     AND sell.position_id=candidates.position_id
-  LEFT JOIN domain_events close_event ON close_event.event_id=candidates.close_event_id
 )
 SELECT facts.*,duplicate_totals.*
 FROM duplicate_totals LEFT JOIN facts ON TRUE
@@ -114,6 +119,7 @@ function positionFromRow(row: Row): PaperMvpSourcePosition {
     entryQuoteAtMs:dateMs(row.entry_quote_at),paperBuyAtMs:dateMs(row.paper_buy_at),
     exitTriggerAtMs:dateMs(row.exit_trigger_at),closeEventId:row.close_event_id,
     closeEventType:row.close_event_type,closeEventSource:row.close_event_source,
+    closeEventConfirmationStatus:row.close_event_confirmation_status,
     closeEventObservedAtMs:dateMs(row.close_event_observed_at),
     exitQuoteAtMs:dateMs(row.exit_quote_at),paperSellAtMs:dateMs(row.paper_sell_at),
     entryTradeId:row.entry_trade_id,buyTradeId:row.buy_trade_id,buySide:row.buy_side,

@@ -629,8 +629,11 @@ function validateCloseCommand(
 ): void {
   rejectOrphanedTrigger(command.trigger);
   if (position.strategy.id === 'creation-entry-v1') {
-    if (command.exitTriggerAtMs === undefined) invalidQuote('exitTriggerAtMs');
-    assertValidTimestampMs('occurredAtMs', command.exitTriggerAtMs);
+    if (command.exitTriggerAtMs === undefined) {
+      if (command.reason !== 'MANUAL_KILL_SWITCH') invalidQuote('exitTriggerAtMs');
+    } else {
+      assertValidTimestampMs('occurredAtMs', command.exitTriggerAtMs);
+    }
   }
   if (command.trigger.mint !== position.mint) invalidQuote('trigger.mint');
   if (command.reason.trim() === '') invalidQuote('reason');

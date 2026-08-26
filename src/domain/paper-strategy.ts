@@ -95,6 +95,7 @@ PaperStrategySessionV1,
   readonly externalMinimumBuyAmountRaw: bigint;
   readonly countedBuyerWallets: readonly string[];
   readonly pendingExitReason: CreationExitReason | null;
+  readonly pendingExitTriggerAtMs?: number | null;
   readonly payloadVersion: 2;
 }
 
@@ -122,6 +123,7 @@ export interface CreateCreationEntrySessionInput extends CreatePaperStrategySess
   readonly externalMinimumBuyAmountRaw: bigint;
   readonly countedBuyerWallets: readonly string[];
   readonly pendingExitReason: CreationExitReason | null;
+  readonly pendingExitTriggerAtMs?: number | null;
 }
 
 export interface PaperExternalBuyEvidence {
@@ -236,6 +238,13 @@ export function createCreationEntrySession(
     input.pendingExitReason !== null
     && !CREATION_EXIT_REASONS.includes(input.pendingExitReason)
   ) throw new TypeError('Creation session pending exit reason is invalid.');
+  const pendingExitTriggerAtMs = input.pendingExitTriggerAtMs ?? null;
+  if (pendingExitTriggerAtMs !== null) {
+    assertValidTimestampMs('pendingExitTriggerAtMs', pendingExitTriggerAtMs);
+    if (input.pendingExitReason !== 'MANUAL_KILL_SWITCH') {
+      throw new TypeError('Creation session manual exit trigger is inconsistent.');
+    }
+  }
 
   const strategy = Object.freeze({ id: 'creation-entry-v1' as const, version: 1 as const });
   const quoteAsset = Object.freeze({ ...input.candidate.quoteAsset });
@@ -283,6 +292,7 @@ export function createCreationEntrySession(
     lastQuote,
     lastError,
     pendingExitReason: input.pendingExitReason,
+    pendingExitTriggerAtMs,
     createdAtMs: input.createdAtMs,
     updatedAtMs: input.updatedAtMs,
     purgeAfterMs: input.purgeAfterMs,

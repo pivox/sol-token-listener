@@ -43,7 +43,12 @@ export class PaperMvpCollector {
     });
     const samples = [];
     const unknownPositions: PaperMvpUnknownPosition[] = [];
-    for (const facts of batch.positions) {
+    const readyPositions = batch.positions.filter((facts) => (
+      facts.status === 'PAPER_RETRACTED'
+      || facts.closeEventConfirmationStatus === 'finalized'
+      || facts.closeEventConfirmationStatus === 'orphaned'
+    ));
+    for (const facts of readyPositions) {
       const classified = classify(facts, before.run.configuration.networkFeeRawPerTransaction);
       if ('reason' in classified) unknownPositions.push(classified);
       else samples.push(classified);
@@ -67,7 +72,7 @@ export class PaperMvpCollector {
     const beforeCount = before.run.closedPositions + before.run.counters.unknownTerminalPositions;
     const afterCount = after.closedPositions + after.counters.unknownTerminalPositions;
     return Object.freeze({
-      scanned: batch.positions.length,
+      scanned: readyPositions.length,
       inserted: afterCount - beforeCount,
       valid: after.closedPositions - before.run.closedPositions,
       unknown: after.counters.unknownTerminalPositions
@@ -92,7 +97,10 @@ function classify(
   networkFeeRawPerTransaction: bigint,
 ): ReturnType<typeof createPaperMvpPositionSample> | PaperMvpUnknownPosition {
   const positionId = requiredText(facts.positionId);
-  if (facts.status === 'PAPER_RETRACTED') return unknown(positionId, 'POSITION_RETRACTED');
+  if (facts.status === 'PAPER_RETRACTED'
+    || facts.closeEventConfirmationStatus === 'orphaned') {
+    return unknown(positionId, 'POSITION_RETRACTED');
+  }
   const missing = missingReason(facts);
   if (missing !== null) return unknown(positionId, missing);
   if (!sourceMatches(facts)) return unknown(positionId, 'SOURCE_CONTRADICTION');
@@ -163,6 +171,7 @@ function sourceMatches(facts: PaperMvpSourcePosition): boolean {
     && typeof facts.closeEventId === 'string'
     && facts.closeEventType === 'PaperPositionClosed'
     && facts.closeEventSource === 'paper-trading'
+    && facts.closeEventConfirmationStatus === 'finalized'
     && facts.closeEventObservedAtMs === facts.exitTriggerAtMs;
 }
 

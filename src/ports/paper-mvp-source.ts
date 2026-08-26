@@ -13,6 +13,7 @@ export interface PaperMvpSourcePosition {
   readonly closeEventId: unknown;
   readonly closeEventType: unknown;
   readonly closeEventSource: unknown;
+  readonly closeEventConfirmationStatus: unknown;
   readonly closeEventObservedAtMs: unknown;
   readonly exitQuoteAtMs: unknown;
   readonly paperSellAtMs: unknown;
