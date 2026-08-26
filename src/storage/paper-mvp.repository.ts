@@ -32,7 +32,8 @@ export interface PaperMvpPool { connect(): Promise<Client> }
 type Operation = 'start' | 'progress' | 'load' | 'terminalize';
 export type PaperMvpConflictCode =
   | 'ACTIVE_RUN_INCOMPATIBLE' | 'RUN_NOT_ACTIVE' | 'SAMPLE_CONTRADICTION'
-  | 'PROGRESS_REGRESSION' | 'TERMINALIZATION_CONTRADICTION';
+  | 'PROGRESS_REGRESSION' | 'PROGRESS_LIMIT_EXCEEDED'
+  | 'TERMINALIZATION_CONTRADICTION';
 
 export class PaperMvpConflictError extends Error {
   public constructor(public readonly code: PaperMvpConflictCode) {
@@ -138,6 +139,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       for (const unknown of unknowns) {
         await insertUnknownObservation(client, progress.runId, progress.observedAtMs, unknown);
       }
+      await assertObservationLimits(client, progress.runId);
       const updated = await client.query(
         `UPDATE paper_mvp_runs run SET
           creations_observed=$2,entries_rejected=$3,
@@ -380,6 +382,21 @@ async function requireMatchingObservation(
   }
 }
 
+async function assertObservationLimits(client: Client, runId: string): Promise<void> {
+  const result = await client.query(
+    `SELECT
+      COUNT(*) FILTER (WHERE sample_status='VALID')::integer AS valid_count,
+      COUNT(*) FILTER (WHERE sample_status='UNKNOWN')::integer AS unknown_count
+     FROM paper_mvp_position_samples WHERE run_id=$1`,
+    [runId],
+  );
+  const row = result.rows[0];
+  if (row === undefined || safeNumber(row.valid_count) > 1_000
+    || safeNumber(row.unknown_count) > 1_000) {
+    throw new PaperMvpConflictError('PROGRESS_LIMIT_EXCEEDED');
+  }
+}
+
 function validateConfiguration(value: PaperMvpRunConfiguration): PaperMvpRunConfiguration {
   boundedText(value.strategyId, 'strategy id');
   integer(value.strategyVersion, 1, 1_000_000, 'strategy version');
@@ -389,35 +406,61 @@ function validateConfiguration(value: PaperMvpRunConfiguration): PaperMvpRunConf
   nonNegativeBigint(value.networkFeeRawPerTransaction, 'network fee');
   integer(value.maxDurationMs, 60_000, 14_400_000, 'max duration');
   boundedText(value.providerIdentity, 'provider identity');
-  return Object.freeze({ ...value });
+  return Object.freeze({
+    strategyId: value.strategyId,
+    strategyVersion: value.strategyVersion,
+    quoteMint: value.quoteMint,
+    targetClosedPositions: value.targetClosedPositions,
+    initialCapitalRaw: value.initialCapitalRaw,
+    networkFeeRawPerTransaction: value.networkFeeRawPerTransaction,
+    maxDurationMs: value.maxDurationMs,
+    providerIdentity: value.providerIdentity,
+  });
 }
 
 function validateCounters(value: PaperMvpProgressCounters): PaperMvpProgressCounters {
   for (const field of [
     'creationsObserved','entriesRejected','duplicateLogicalBuys','duplicateLogicalSells',
   ] as const) integer(value[field], 0, 1_000_000, field);
-  return Object.freeze({ ...value });
+  return Object.freeze({
+    creationsObserved: value.creationsObserved,
+    entriesRejected: value.entriesRejected,
+    duplicateLogicalBuys: value.duplicateLogicalBuys,
+    duplicateLogicalSells: value.duplicateLogicalSells,
+  });
 }
 
 function validateRunCounters(value: PaperMvpRunCounters): PaperMvpRunCounters {
   validateCounters(value);
   integer(value.unknownTerminalPositions, 0, 1_000_000, 'unknownTerminalPositions');
-  return Object.freeze({ ...value });
+  return Object.freeze({
+    creationsObserved: value.creationsObserved,
+    entriesRejected: value.entriesRejected,
+    unknownTerminalPositions: value.unknownTerminalPositions,
+    duplicateLogicalBuys: value.duplicateLogicalBuys,
+    duplicateLogicalSells: value.duplicateLogicalSells,
+  });
 }
 
 function validateProviderUsage(value: PaperMvpProviderUsage): PaperMvpProviderUsage {
   integer(value.rateLimitedCount, 0, 1_000_000, 'rate limited count');
-  if (value.status === 'UNAVAILABLE') {
+  const status: unknown = value.status;
+  if (status === 'UNAVAILABLE') {
     if (value.creditsUsedStart !== null || value.creditsUsedEnd !== null) {
       throw new TypeError('Paper MVP provider usage is invalid.');
     }
-  } else {
+  } else if (status === 'AVAILABLE') {
     if (value.creditsUsedStart === null || value.creditsUsedEnd === null
       || value.creditsUsedStart < 0n || value.creditsUsedEnd < value.creditsUsedStart) {
       throw new TypeError('Paper MVP provider usage is invalid.');
     }
-  }
-  return Object.freeze({ ...value });
+  } else throw new TypeError('Paper MVP provider usage is invalid.');
+  return Object.freeze({
+    status,
+    creditsUsedStart: value.creditsUsedStart,
+    creditsUsedEnd: value.creditsUsedEnd,
+    rateLimitedCount: value.rateLimitedCount,
+  });
 }
 
 function assertProgress(
@@ -507,7 +550,32 @@ function sampleFromRow(row: Row): PaperMvpPositionSample {
 }
 
 function canonicalSample(value: PaperMvpPositionSample): PaperMvpPositionSample {
-  const canonical = createPaperMvpPositionSample(value);
+  const canonical = createPaperMvpPositionSample({
+    positionId: value.positionId,
+    mint: value.mint,
+    quoteMint: value.quoteMint,
+    exitReason: value.exitReason,
+    creationDetectedAtMs: value.creationDetectedAtMs,
+    entryDecisionAtMs: value.entryDecisionAtMs,
+    entryQuoteAtMs: value.entryQuoteAtMs,
+    paperBuyAtMs: value.paperBuyAtMs,
+    exitTriggerAtMs: value.exitTriggerAtMs,
+    exitQuoteAtMs: value.exitQuoteAtMs,
+    paperSellAtMs: value.paperSellAtMs,
+    buyAmountInRaw: value.buyAmountInRaw,
+    buyAmountOutRaw: value.buyAmountOutRaw,
+    buyMinimumAmountOutRaw: value.buyMinimumAmountOutRaw,
+    buyFeesRaw: value.buyFeesRaw,
+    buySlippageBps: value.buySlippageBps,
+    buyPriceImpactBps: value.buyPriceImpactBps,
+    sellAmountInRaw: value.sellAmountInRaw,
+    sellAmountOutRaw: value.sellAmountOutRaw,
+    sellMinimumAmountOutRaw: value.sellMinimumAmountOutRaw,
+    sellFeesRaw: value.sellFeesRaw,
+    sellSlippageBps: value.sellSlippageBps,
+    sellPriceImpactBps: value.sellPriceImpactBps,
+    networkFeeRawPerTransaction: value.networkFeeRawPerTransaction,
+  });
   if (value.exitCategory !== canonical.exitCategory
     || value.grossPnlRaw !== canonical.grossPnlRaw || value.modelNetPnlRaw !== canonical.modelNetPnlRaw
     || value.detectionToEntryLatencyMs !== canonical.detectionToEntryLatencyMs
@@ -528,7 +596,13 @@ function unknownReason(value: unknown): PaperMvpUnknownReason {
 }
 
 function sampleJson(value: PaperMvpPositionSample): string {
-  return JSON.stringify({ schemaVersion:'paper-mvp-position-sample.v1',...value,
+  return JSON.stringify({
+    schemaVersion:'paper-mvp-position-sample.v1',
+    positionId:value.positionId,mint:value.mint,quoteMint:value.quoteMint,
+    exitReason:value.exitReason,creationDetectedAtMs:value.creationDetectedAtMs,
+    entryDecisionAtMs:value.entryDecisionAtMs,entryQuoteAtMs:value.entryQuoteAtMs,
+    paperBuyAtMs:value.paperBuyAtMs,exitTriggerAtMs:value.exitTriggerAtMs,
+    exitQuoteAtMs:value.exitQuoteAtMs,paperSellAtMs:value.paperSellAtMs,
     buyAmountInRaw:value.buyAmountInRaw.toString(),buyAmountOutRaw:value.buyAmountOutRaw.toString(),
     buyMinimumAmountOutRaw:value.buyMinimumAmountOutRaw.toString(),buyFeesRaw:value.buyFeesRaw.toString(),
     buySlippageBps:value.buySlippageBps.toString(),buyPriceImpactBps:value.buyPriceImpactBps.toString(),
@@ -537,13 +611,19 @@ function sampleJson(value: PaperMvpPositionSample): string {
     sellSlippageBps:value.sellSlippageBps.toString(),sellPriceImpactBps:value.sellPriceImpactBps.toString(),
     networkFeeRawPerTransaction:value.networkFeeRawPerTransaction.toString(),
     grossPnlRaw:value.grossPnlRaw.toString(),modelNetPnlRaw:value.modelNetPnlRaw.toString(),
+    exitCategory:value.exitCategory,detectionToEntryLatencyMs:value.detectionToEntryLatencyMs,
+    exitTriggerToSellLatencyMs:value.exitTriggerToSellLatencyMs,payloadVersion:value.payloadVersion,
   });
 }
 
 function configurationJson(value: PaperMvpRunConfiguration): string {
-  return JSON.stringify({ schemaVersion:'paper-mvp-run-configuration.v1',...value,
+  return JSON.stringify({
+    schemaVersion:'paper-mvp-run-configuration.v1',strategyId:value.strategyId,
+    strategyVersion:value.strategyVersion,quoteMint:value.quoteMint,
+    targetClosedPositions:value.targetClosedPositions,
     initialCapitalRaw:value.initialCapitalRaw.toString(),
     networkFeeRawPerTransaction:value.networkFeeRawPerTransaction.toString(),
+    maxDurationMs:value.maxDurationMs,providerIdentity:value.providerIdentity,
   });
 }
 

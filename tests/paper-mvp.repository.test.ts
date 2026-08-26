@@ -5,9 +5,12 @@ import pg from 'pg';
 import {
   createPaperMvpPositionSample,
   createPaperMvpReport,
+  type PaperMvpPositionSample,
+  type PaperMvpProviderUsage,
 } from '../src/domain/paper-mvp.js';
 import type {
   PaperMvpRunConfiguration,
+  PaperMvpUnknownPosition,
 } from '../src/ports/paper-mvp-repository.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import {
@@ -65,6 +68,159 @@ void test('rejects invalid financial configuration before opening PostgreSQL', a
     /network fee/u,
   );
   assert.equal(connected, false);
+});
+
+void test('persists only explicit configuration, sample, and provider projections', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL projection test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const configurationCandidate = Object.freeze({
+      ...configuration,
+      providerApiKey: 'configuration-api-key-secret',
+      secretSentinel: 'configuration-secret-sentinel',
+    });
+    const typedConfiguration: PaperMvpRunConfiguration = configurationCandidate;
+    const sampleCandidate = Object.freeze({
+      ...sample(),
+      positionId: 'secret-position',
+      providerApiKey: 'sample-api-key-secret',
+      secretSentinel: 'sample-secret-sentinel',
+    });
+    const typedSample: PaperMvpPositionSample = sampleCandidate;
+    const unknownCandidate = Object.freeze({
+      positionId: 'secret-unknown-position',
+      reason: 'MISSING_SELL_TRADE' as const,
+      providerApiKey: 'unknown-api-key-secret',
+      secretSentinel: 'unknown-secret-sentinel',
+    });
+    const typedUnknown: PaperMvpUnknownPosition = unknownCandidate;
+    const providerCandidate = Object.freeze({
+      status: 'AVAILABLE' as const,
+      creditsUsedStart: 100n,
+      creditsUsedEnd: 101n,
+      rateLimitedCount: 0,
+      providerApiKey: 'provider-api-key-secret',
+      secretSentinel: 'provider-secret-sentinel',
+    });
+    const typedProvider: PaperMvpProviderUsage = providerCandidate;
+    const repository = new PostgresPaperMvpRepository(pool);
+
+    const run = await repository.startOrResume(typedConfiguration, 1_000);
+    const progressed = await repository.recordProgress({
+      runId: run.runId,
+      observedAtMs: 2_000,
+      counters: progressCounters,
+      providerUsage: typedProvider,
+      samples: Object.freeze([typedSample]),
+      unknownPositions: Object.freeze([typedUnknown]),
+    });
+    const stored = await pool.query(
+      `SELECT run.configuration_payload,observation.sample_payload
+       FROM paper_mvp_runs run JOIN paper_mvp_position_samples observation USING (run_id)
+       WHERE run.run_id=$1`,
+      [run.runId],
+    );
+    const storedJson = JSON.stringify(stored.rows);
+    assert.doesNotMatch(storedJson, /providerApiKey|secretSentinel|api-key-secret|secret-sentinel/u);
+    assert.equal(Object.hasOwn(run.configuration, 'providerApiKey'), false);
+    assert.equal(Object.hasOwn(progressed.providerUsage, 'providerApiKey'), false);
+  });
+});
+
+void test('bounds cumulative observations without charging identical replays', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL observation limit test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(Object.freeze({
+      ...configuration,
+      targetClosedPositions: 1_000,
+    }), 1_000);
+    const usage = Object.freeze({
+      status: 'AVAILABLE' as const,
+      creditsUsedStart: 100n,
+      creditsUsedEnd: 101n,
+      rateLimitedCount: 0,
+    });
+    const samples = Object.freeze(Array.from({ length: 1_000 }, (_, index) => Object.freeze({
+      ...sample(),
+      positionId: `bounded-position-${index.toString().padStart(4, '0')}`,
+    })));
+    assert.equal((await repository.recordProgress({
+      runId: run.runId,
+      observedAtMs: 2_000,
+      counters: progressCounters,
+      providerUsage: usage,
+      samples,
+      unknownPositions: Object.freeze([]),
+    })).closedPositions, 1_000);
+    assert.equal((await repository.recordProgress({
+      runId: run.runId,
+      observedAtMs: 2_001,
+      counters: progressCounters,
+      providerUsage: usage,
+      samples,
+      unknownPositions: Object.freeze([]),
+    })).closedPositions, 1_000);
+
+    await assert.rejects(repository.recordProgress({
+      runId: run.runId,
+      observedAtMs: 2_002,
+      counters: progressCounters,
+      providerUsage: usage,
+      samples: Object.freeze([Object.freeze({
+        ...sample(),
+        positionId: 'bounded-position-overflow',
+      })]),
+      unknownPositions: Object.freeze([]),
+    }), isConflict('PROGRESS_LIMIT_EXCEEDED'));
+    const afterOverflow = await repository.load(run.runId);
+    assert.ok(afterOverflow);
+    assert.equal(afterOverflow.samples.length, 1_000);
+    assert.equal(afterOverflow.run.updatedAtMs, 2_001);
+
+    const unknownPositions = Object.freeze(Array.from({ length: 1_000 }, (_, index) => Object.freeze({
+      positionId: `bounded-unknown-${index.toString().padStart(4, '0')}`,
+      reason: 'MISSING_SELL_TRADE' as const,
+    })));
+    assert.equal((await repository.recordProgress({
+      runId: run.runId,
+      observedAtMs: 2_003,
+      counters: progressCounters,
+      providerUsage: usage,
+      samples: Object.freeze([]),
+      unknownPositions,
+    })).counters.unknownTerminalPositions, 1_000);
+    assert.equal((await repository.recordProgress({
+      runId: run.runId,
+      observedAtMs: 2_004,
+      counters: progressCounters,
+      providerUsage: usage,
+      samples: Object.freeze([]),
+      unknownPositions,
+    })).counters.unknownTerminalPositions, 1_000);
+    await assert.rejects(repository.recordProgress({
+      runId: run.runId,
+      observedAtMs: 2_005,
+      counters: progressCounters,
+      providerUsage: usage,
+      samples: Object.freeze([]),
+      unknownPositions: Object.freeze([Object.freeze({
+        positionId: 'bounded-unknown-overflow',
+        reason: 'MISSING_SELL_TRADE',
+      })]),
+    }), isConflict('PROGRESS_LIMIT_EXCEEDED'));
+    const afterUnknownOverflow = await repository.load(run.runId);
+    assert.ok(afterUnknownOverflow);
+    assert.equal(afterUnknownOverflow.unknownPositions.length, 1_000);
+    assert.equal(afterUnknownOverflow.run.updatedAtMs, 2_004);
+  });
 });
 
 void test('loads one repeatable read snapshot while progress commits concurrently', async (context) => {
