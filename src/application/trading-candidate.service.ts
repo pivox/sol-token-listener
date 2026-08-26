@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { compareCursors } from '../domain/cursor.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { PaperExecutionQuote, PaperStrategyIdentity } from '../domain/paper-trading.js';
 import type { QualificationReport } from '../domain/qualification.js';
@@ -19,6 +20,8 @@ export interface TradingCandidateServiceOptions {
   readonly maximumQuoteAgeMs: number;
   readonly maximumQuoteSlotLag: bigint;
   readonly retentionMs: number;
+  readonly creationEntryMaxAgeMs?: number;
+  readonly creationEntryMaxSlotLag?: bigint;
 }
 
 export interface TradingCandidateInput {
@@ -56,18 +59,23 @@ export class TradingCandidateService {
       && input.snapshot.currentCandidate.strategy.version === this.options.strategy.version
       ? input.snapshot.currentCandidate
       : null;
-    const createdAtMs = existing?.createdAtMs ?? input.snapshot.asOfEvent.observedAtMs;
+    const creationStrategy = this.options.strategy.id === 'creation-entry-v1';
+    const createdAtMs = creationStrategy
+      ? input.snapshot.launchDetectedAtMs
+      : existing?.createdAtMs ?? input.snapshot.asOfEvent.observedAtMs;
     const eligibleUntilMs = existing?.eligibleUntilMs
-      ?? createdAtMs + this.options.entryWindowMs;
+      ?? createdAtMs + (creationStrategy
+        ? this.options.creationEntryMaxAgeMs ?? this.options.entryWindowMs
+        : this.options.entryWindowMs);
     const quotesCoherent = coherentQuotePair(input);
     const state = this.state(input, eligibleUntilMs, quotesCoherent);
     const reasonCodes = state === 'ELIGIBLE'
       ? ['QUALIFIED_ENTRY'] as const
       : state === 'EXPIRED'
-        ? ['ENTRY_WINDOW_EXPIRED'] as const
+        ? [creationStrategy ? 'CREATION_ENTRY_EXPIRED' : 'ENTRY_WINDOW_EXPIRED'] as const
         : state === 'REVOKED'
           ? ['SOURCE_ORPHANED'] as const
-          : ['QUALIFICATION_NOT_ELIGIBLE'] as const;
+          : [creationStrategy ? 'CREATION_ENTRY_REJECTED' : 'QUALIFICATION_NOT_ELIGIBLE'] as const;
     const candidate = createTradingCandidate({
       mint:input.snapshot.mint,strategy:this.options.strategy,
       qualificationReportId:input.reportId,
@@ -123,8 +131,47 @@ export class TradingCandidateService {
       || !freshQuote(input.reverseSellQuote, input.nowMs, this.options.maximumQuoteAgeMs)
       || slotDistance(input.buyQuote.observedSlot, input.reverseSellQuote.observedSlot)
         > this.options.maximumQuoteSlotLag
+      || this.creationEntryRejected(input)
     ) return 'NOT_ELIGIBLE';
     return 'ELIGIBLE';
+  }
+
+  private creationEntryRejected(input: TradingCandidateInput): boolean {
+    if (this.options.strategy.id !== 'creation-entry-v1') return false;
+    if (
+      !input.snapshot.canonicalLaunchActive
+      || !confirmationReached(
+        input.snapshot.launchConfirmationStatus,
+        this.options.minimumConfirmation,
+      )
+    ) return true;
+    const maximumSlotLag = this.options.creationEntryMaxSlotLag
+      ?? this.options.maximumQuoteSlotLag;
+    if (
+      input.buyQuote !== null
+      && (
+        input.buyQuote.observedSlot < input.snapshot.launch.createdAt.slot
+        || input.buyQuote.observedSlot - input.snapshot.launch.createdAt.slot > maximumSlotLag
+      )
+    ) return true;
+    if (
+      input.reverseSellQuote !== null
+      && (
+        input.reverseSellQuote.observedSlot < input.snapshot.launch.createdAt.slot
+        || input.reverseSellQuote.observedSlot - input.snapshot.launch.createdAt.slot > maximumSlotLag
+      )
+    ) return true;
+    return input.snapshot.activeLaunchTrades.some((event) => (
+      event.payload.trade.kind === 'SELL'
+      && event.payload.trade.trader === input.snapshot.launch.creator
+      && event.confirmationStatus !== 'orphaned'
+      && compareCursors(event.cursor, input.qualificationEvent.cursor) <= 0
+    )) || input.snapshot.activeMarketTrades.some((trade) => (
+      trade.kind === 'SELL'
+      && trade.trader === input.snapshot.launch.creator
+      && trade.confirmationStatus !== 'orphaned'
+      && compareCursors(trade.cursor, input.qualificationEvent.cursor) <= 0
+    ));
   }
 }
 
@@ -175,6 +222,16 @@ function validateOptions(options: TradingCandidateServiceOptions): void {
     || options.maximumQuoteSlotLag < 0n
     || !Number.isSafeInteger(options.retentionMs)
     || options.retentionMs !== 14_400_000
+    || (
+      options.strategy.id === 'creation-entry-v1'
+      && (
+        options.creationEntryMaxAgeMs === undefined
+        || !Number.isSafeInteger(options.creationEntryMaxAgeMs)
+        || options.creationEntryMaxAgeMs <= 0
+        || options.creationEntryMaxSlotLag === undefined
+        || options.creationEntryMaxSlotLag < 0n
+      )
+    )
   ) throw new TypeError('Trading candidate service options are invalid.');
 }
 

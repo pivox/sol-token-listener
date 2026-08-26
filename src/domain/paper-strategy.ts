@@ -32,10 +32,27 @@ export const PAPER_DECISION_REASON_CODES = Object.freeze([
   'EXIT_QUOTE_UNAVAILABLE',
   'SOURCE_ORPHANED',
   'RECONCILIATION_REQUIRED',
+  'CREATION_ENTRY_EXPIRED',
+  'CREATION_ENTRY_REJECTED',
+  'EXTERNAL_UNIQUE_BUY_OBSERVED',
+  'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+  'TAKE_PROFIT_2X_EXECUTABLE',
+  'CREATOR_EARLY_SELL',
+  'MANUAL_KILL_SWITCH',
+  'SELL_QUOTE_UNAVAILABLE_OR_STALE',
 ] as const);
 
 export type PaperDecisionReasonCode = (typeof PAPER_DECISION_REASON_CODES)[number];
 export type PaperMinimumConfirmation = 'confirmed' | 'finalized';
+
+export const CREATION_EXIT_REASONS = Object.freeze([
+  'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+  'TAKE_PROFIT_2X_EXECUTABLE',
+  'CREATOR_EARLY_SELL',
+  'MANUAL_KILL_SWITCH',
+] as const);
+
+export type CreationExitReason = (typeof CREATION_EXIT_REASONS)[number];
 
 export interface PaperStrategyErrorEvidence {
   readonly code: string;
@@ -70,6 +87,19 @@ export interface PaperStrategySessionV1 {
   readonly payloadVersion: 1;
 }
 
+export interface PaperStrategySessionV2 extends Omit<
+PaperStrategySessionV1,
+'strategy' | 'payloadVersion'
+> {
+  readonly strategy: Readonly<{ readonly id: 'creation-entry-v1'; readonly version: 1 }>;
+  readonly externalMinimumBuyAmountRaw: bigint;
+  readonly countedBuyerWallets: readonly string[];
+  readonly pendingExitReason: CreationExitReason | null;
+  readonly payloadVersion: 2;
+}
+
+export type PaperStrategySession = PaperStrategySessionV1 | PaperStrategySessionV2;
+
 export interface CreatePaperStrategySessionInput {
   readonly candidate: TradingCandidateV1;
   readonly state: PaperStrategySessionState;
@@ -88,6 +118,12 @@ export interface CreatePaperStrategySessionInput {
   readonly purgeAfterMs: number;
 }
 
+export interface CreateCreationEntrySessionInput extends CreatePaperStrategySessionInput {
+  readonly externalMinimumBuyAmountRaw: bigint;
+  readonly countedBuyerWallets: readonly string[];
+  readonly pendingExitReason: CreationExitReason | null;
+}
+
 export interface PaperExternalBuyEvidence {
   readonly sessionId: string;
   readonly tradeId: string;
@@ -100,6 +136,19 @@ export interface PaperExternalBuyEvidence {
   readonly payloadVersion: 1;
 }
 
+export interface PaperExternalBuyEvidenceV2 extends Omit<
+PaperExternalBuyEvidence,
+'trader' | 'payloadVersion'
+> {
+  readonly trader: string;
+  readonly quoteAmountRaw: bigint;
+  readonly payloadVersion: 2;
+}
+
+export type AnyPaperExternalBuyEvidence =
+  | PaperExternalBuyEvidence
+  | PaperExternalBuyEvidenceV2;
+
 export type PaperExternalBuyEvidenceInput = Omit<
 PaperExternalBuyEvidence,
 'sessionId' | 'payloadVersion'
@@ -108,6 +157,12 @@ PaperExternalBuyEvidence,
 export interface CountExternalBuyResult {
   readonly session: PaperStrategySessionV1;
   readonly evidence: PaperExternalBuyEvidence | null;
+  readonly targetReached: boolean;
+}
+
+export interface CountUniqueExternalBuyResult {
+  readonly session: PaperStrategySessionV2;
+  readonly evidence: PaperExternalBuyEvidenceV2 | null;
   readonly targetReached: boolean;
 }
 
@@ -158,6 +213,83 @@ export function createPaperStrategySession(
   });
 }
 
+export function createCreationEntrySession(
+  input: CreateCreationEntrySessionInput,
+): PaperStrategySessionV2 {
+  validateSessionInput(input);
+  if (
+    input.candidate.strategy.id !== 'creation-entry-v1'
+    || input.candidate.strategy.version !== 1
+  ) throw new TypeError('Creation session strategy is invalid.');
+  if (
+    input.countedBuyerWallets.length !== input.externalBuyCount
+    || new Set(input.countedBuyerWallets).size !== input.countedBuyerWallets.length
+  ) throw new TypeError('Creation session buyer wallet count is invalid.');
+  if (
+    typeof input.externalMinimumBuyAmountRaw !== 'bigint'
+    || input.externalMinimumBuyAmountRaw <= 0n
+  ) {
+    throw new TypeError('Creation session minimum buy amount is invalid.');
+  }
+  for (const wallet of input.countedBuyerWallets) text(wallet, 'buyer wallet');
+  if (
+    input.pendingExitReason !== null
+    && !CREATION_EXIT_REASONS.includes(input.pendingExitReason)
+  ) throw new TypeError('Creation session pending exit reason is invalid.');
+
+  const strategy = Object.freeze({ id: 'creation-entry-v1' as const, version: 1 as const });
+  const quoteAsset = Object.freeze({ ...input.candidate.quoteAsset });
+  const entryCursor = Object.freeze({ ...input.entryCursor });
+  const lastCountedCursor = input.lastCountedCursor === null
+    ? null
+    : Object.freeze({ ...input.lastCountedCursor });
+  const countedTradeIds = Object.freeze([...input.countedTradeIds]);
+  const countedBuyerWallets = Object.freeze([...input.countedBuyerWallets]);
+  const lastQuote = input.lastQuote === null ? null : Object.freeze({ ...input.lastQuote });
+  const lastError = input.lastError === null ? null : Object.freeze({ ...input.lastError });
+  const id = createSessionId(input.candidate.id, strategy);
+  const openCommandId = `paper_open_${hash([
+    id, input.candidate.id, strategy.id, String(strategy.version),
+  ])}`;
+  const closeCommandId = input.pendingExitReason !== null && input.positionId !== null
+    ? `paper_sell_${hash([
+      input.positionId,
+      strategy.id,
+      String(strategy.version),
+      input.pendingExitReason,
+    ])}`
+    : null;
+  return Object.freeze({
+    id,
+    mint: input.candidate.mint,
+    quoteAsset,
+    strategy,
+    candidateId: input.candidate.id,
+    qualificationReportId: input.candidate.qualificationReportId,
+    actorKind: PAPER_SIMULATION_ACTOR_KIND,
+    state: input.state,
+    reasonCode: input.reasonCode,
+    positionId: input.positionId,
+    openCommandId,
+    closeCommandId,
+    entryCursor,
+    externalBuyTarget: input.externalBuyTarget,
+    externalBuyCount: input.externalBuyCount,
+    externalMinimumBuyAmountRaw: input.externalMinimumBuyAmountRaw,
+    countedTradeIds,
+    countedBuyerWallets,
+    lastCountedCursor,
+    minimumConfirmation: input.minimumConfirmation,
+    lastQuote,
+    lastError,
+    pendingExitReason: input.pendingExitReason,
+    createdAtMs: input.createdAtMs,
+    updatedAtMs: input.updatedAtMs,
+    purgeAfterMs: input.purgeAfterMs,
+    payloadVersion: 2,
+  });
+}
+
 export function countExternalBuy(
   session: PaperStrategySessionV1,
   input: PaperExternalBuyEvidenceInput,
@@ -203,6 +335,67 @@ export function countExternalBuy(
   return Object.freeze({ session: updated, evidence, targetReached });
 }
 
+export function countUniqueExternalBuy(
+  session: PaperStrategySessionV2,
+  input: Omit<PaperExternalBuyEvidenceV2, 'sessionId' | 'payloadVersion'>,
+): CountUniqueExternalBuyResult {
+  validateExternalBuy(session, input);
+  text(input.trader, 'buyer wallet');
+  if (input.quoteAmountRaw <= 0n) {
+    throw new TypeError('Creation external buy amount is invalid.');
+  }
+  if (
+    session.countedTradeIds.includes(input.tradeId)
+    || session.countedBuyerWallets.includes(input.trader)
+    || session.externalBuyCount === session.externalBuyTarget
+  ) {
+    return Object.freeze({
+      session,
+      evidence: null,
+      targetReached: session.externalBuyCount === session.externalBuyTarget,
+    });
+  }
+  const evidence: PaperExternalBuyEvidenceV2 = Object.freeze({
+    sessionId: session.id,
+    tradeId: input.tradeId,
+    mint: input.mint,
+    quoteMint: input.quoteMint,
+    trader: input.trader,
+    quoteAmountRaw: input.quoteAmountRaw,
+    cursor: Object.freeze({ ...input.cursor }),
+    confirmationStatus: input.confirmationStatus,
+    observedAtMs: input.observedAtMs,
+    payloadVersion: 2,
+  });
+  const externalBuyCount = session.externalBuyCount + 1;
+  const targetReached = externalBuyCount === session.externalBuyTarget;
+  const pendingExitReason = targetReached
+    ? 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED' as const
+    : session.pendingExitReason;
+  const updated: PaperStrategySessionV2 = Object.freeze({
+    ...session,
+    state: targetReached ? 'EXIT_PENDING_QUOTE' : 'WAITING_EXTERNAL_BUYS',
+    reasonCode: targetReached
+      ? 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED'
+      : 'EXTERNAL_UNIQUE_BUY_OBSERVED',
+    externalBuyCount,
+    countedTradeIds: Object.freeze([...session.countedTradeIds, input.tradeId]),
+    countedBuyerWallets: Object.freeze([...session.countedBuyerWallets, input.trader]),
+    lastCountedCursor: Object.freeze({ ...input.cursor }),
+    pendingExitReason,
+    closeCommandId: targetReached && session.positionId !== null
+      ? createDeterministicCreationExitCommandId(
+        session.positionId,
+        session.strategy,
+        'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+      )
+      : session.closeCommandId,
+    lastError: null,
+    updatedAtMs: input.observedAtMs,
+  });
+  return Object.freeze({ session: updated, evidence, targetReached });
+}
+
 export function createDeterministicPaperSellCommandId(
   positionId: string,
   strategy: PaperStrategyIdentity,
@@ -213,6 +406,23 @@ export function createDeterministicPaperSellCommandId(
   positiveInteger(strategy.version, 'strategy version');
   boundedTarget(target);
   return `paper_sell_${hash([positionId, strategy.id, String(strategy.version), String(target)])}`;
+}
+
+export function createDeterministicCreationExitCommandId(
+  positionId: string,
+  strategy: Readonly<{ readonly id: 'creation-entry-v1'; readonly version: 1 }>,
+  reason: CreationExitReason,
+): string {
+  text(positionId, 'position id');
+  if (!CREATION_EXIT_REASONS.includes(reason)) {
+    throw new TypeError('Creation exit reason is invalid.');
+  }
+  return `paper_sell_${hash([
+    positionId,
+    strategy.id,
+    String(strategy.version),
+    reason,
+  ])}`;
 }
 
 function validateSessionInput(input: CreatePaperStrategySessionInput): void {
@@ -249,7 +459,7 @@ function validateSessionInput(input: CreatePaperStrategySessionInput): void {
 }
 
 function validateExternalBuy(
-  session: PaperStrategySessionV1,
+  session: PaperStrategySession,
   input: PaperExternalBuyEvidenceInput,
 ): void {
   text(input.tradeId, 'external buy trade id');

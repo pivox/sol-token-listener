@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../src/domain/events.js';
-import { createPaperStrategySession } from '../src/domain/paper-strategy.js';
+import {
+  createCreationEntrySession,
+  createPaperStrategySession,
+} from '../src/domain/paper-strategy.js';
 import type { PaperPosition } from '../src/domain/paper-trading.js';
 import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
@@ -79,6 +82,193 @@ void test('claims one idempotent job concurrently, renews it, and reports queue 
   });
 });
 
+void test('enqueues one deterministic wake-up for each active creation session', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    const repository = paperDecisionRepository(pool, { maxAttempts: 3, baseDelayMs: 100 });
+    await repository.enqueue(jobInput());
+    const initial = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(initial);
+    const active = decisionWithSession(decisionResult(), 'WAITING_EXTERNAL_BUYS', 0, 1_001);
+    await repository.stageDecision(initial, active);
+    await pool.query(
+      `UPDATE paper_strategy_sessions SET strategy_id='creation-entry-v1'
+        WHERE session_id=$1`,
+      [active.session?.id],
+    );
+
+    assert.equal(await repository.enqueueActiveSessions(2_000), 1);
+    assert.equal(await repository.enqueueActiveSessions(2_001), 1);
+    const jobs = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM paper_decision_jobs WHERE status='PENDING'`,
+    );
+    assert.equal(jobs.rows[0]?.count, 1);
+  });
+});
+
+void test('persists V2 buyer evidence and replaces an orphaned wallet trade projection', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const claim = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(claim);
+
+    await repository.stageDecision(claim, creationDecisionWithEvidence('trade-old', 2_000));
+    const persisted = await repository.loadSnapshot(claim);
+    assert.ok(persisted.currentSession?.payloadVersion === 2);
+    assert.equal(persisted.currentSession.externalMinimumBuyAmountRaw, 1_000n);
+    await repository.stageDecision(claim, creationDecisionWithEvidence('trade-active', 2_001));
+
+    const rows = await pool.query(`SELECT trade_id,trader,quote_amount_raw::text,
+      payload_version,payload FROM paper_external_buy_events`);
+    assert.equal(rows.rowCount, 1);
+    assert.equal(rows.rows[0]?.trade_id, 'trade-active');
+    assert.equal(rows.rows[0]?.trader, 'external-wallet');
+    assert.equal(rows.rows[0]?.quote_amount_raw, '2000');
+    assert.equal(rows.rows[0]?.payload_version, 2);
+    assert.equal((rows.rows[0]?.payload as { payloadVersion?: unknown }).payloadVersion, 2);
+  });
+});
+
+void test('removes V2 buyer evidence orphaned without a replacement trade', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const initial = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(initial);
+    const counted = creationDecisionWithEvidence('trade-orphaned', 2_000);
+    await repository.complete(initial, counted);
+
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [TRADE_RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [TRADE_EVENT_ID],
+    );
+    await repository.enqueue(jobInput({
+      sourceEventId: TRADE_EVENT_ID,
+      sourceRawEventId: TRADE_RAW_EVENT_ID,
+      sourceConfirmationStatus: 'orphaned',
+      inputFingerprint: 'b'.repeat(64),
+    }));
+    const orphaned = await repository.claim({ nowMs: 3_000, leaseMs: 10_000 });
+    assert.ok(orphaned);
+    const rebuilt = creationDecisionWithoutEvidence(counted, 3_000);
+    await repository.stageDecision(orphaned, rebuilt);
+    const stagedRows = await pool.query(
+      'SELECT trade_id FROM paper_external_buy_events WHERE session_id=$1',
+      [counted.session?.id],
+    );
+    assert.equal(stagedRows.rowCount, 1);
+    await repository.complete(orphaned, rebuilt);
+
+    const rows = await pool.query(
+      'SELECT trade_id FROM paper_external_buy_events WHERE session_id=$1',
+      [counted.session?.id],
+    );
+    assert.equal(rows.rowCount, 0);
+  });
+});
+
+void test('retains V2 evidence when an entry source is orphaned', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const initial = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(initial);
+    const counted = creationDecisionWithEvidence('trade-retained', 2_000);
+    await repository.complete(initial, counted);
+
+    await repository.enqueue(jobInput({
+      sourceConfirmationStatus: 'orphaned',
+      inputFingerprint: 'd'.repeat(64),
+    }));
+    const orphaned = await repository.claim({ nowMs: 3_000, leaseMs: 10_000 });
+    assert.ok(orphaned);
+    await repository.complete(orphaned, creationSourceOrphanDecision(counted, 3_000));
+
+    const rows = await pool.query(
+      'SELECT trade_id FROM paper_external_buy_events WHERE session_id=$1',
+      [counted.session?.id],
+    );
+    assert.deepEqual(rows.rows, [{ trade_id: 'trade-retained' }]);
+  });
+});
+
+void test('does not let a stale orphan completion delete newer V2 evidence', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const initial = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(initial);
+    const counted = creationDecisionWithEvidence('trade-old', 2_000);
+    await repository.complete(initial, counted);
+
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [TRADE_RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [TRADE_EVENT_ID],
+    );
+    await repository.enqueue(jobInput({
+      sourceEventId: TRADE_EVENT_ID,
+      sourceRawEventId: TRADE_RAW_EVENT_ID,
+      sourceConfirmationStatus: 'orphaned',
+      inputFingerprint: 'b'.repeat(64),
+    }));
+    const stale = await repository.claim({ nowMs: 3_000, leaseMs: 10_000 });
+    assert.ok(stale);
+
+    await repository.enqueue(jobInput({ inputFingerprint: 'c'.repeat(64) }));
+    const newer = await repository.claim({ nowMs: 3_100, leaseMs: 10_000 });
+    assert.ok(newer);
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='confirmed' WHERE event_id=$1`,
+      [TRADE_RAW_EVENT_ID],
+    );
+    await repository.complete(newer, creationDecisionWithEvidence('trade-new', 4_000));
+    await repository.complete(stale, creationDecisionWithEvidence('trade-stale', 3_000));
+
+    const rows = await pool.query(
+      'SELECT trade_id FROM paper_external_buy_events WHERE session_id=$1',
+      [counted.session?.id],
+    );
+    assert.deepEqual(rows.rows, [{ trade_id: 'trade-new' }]);
+  });
+});
+
 void test('loads the immutable launch when a later trade triggers the decision', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
@@ -97,6 +287,8 @@ void test('loads the immutable launch when a later trade triggers the decision',
     assert.equal(snapshot.asOfEvent.id, TRADE_EVENT_ID);
     assert.equal(snapshot.launch.mint, MINT);
     assert.equal(snapshot.launch.creator, 'creator');
+    assert.equal(snapshot.launchDetectedAtMs, 1_000);
+    assert.equal(snapshot.launchConfirmationStatus, 'confirmed');
   });
 });
 
@@ -1248,6 +1440,134 @@ function terminalDecisionResult(): PaperDecisionResult {
       payloadVersion: 1 as const,
     })]),
     requestedAction: 'CLOSE' as const,
+  });
+}
+
+function creationDecisionWithEvidence(tradeId: string, updatedAtMs: number): PaperDecisionResult {
+  const base = decisionResult();
+  const candidate = createTradingCandidate({
+    mint:base.candidate.mint,
+    strategy:Object.freeze({ id:'creation-entry-v1',version:1 }),
+    qualificationReportId:base.candidate.qualificationReportId,
+    qualificationProfile:base.candidate.qualificationProfile,
+    evidenceFingerprint:base.candidate.evidenceFingerprint,
+    asOfEvent:base.qualificationEvent,
+    state:'ELIGIBLE',quoteAsset:base.candidate.quoteAsset,
+    buyQuote:base.candidate.buyQuote,reverseSellQuote:base.candidate.reverseSellQuote,
+    eligibleUntilMs:base.candidate.eligibleUntilMs,
+    reasonCodes:['QUALIFIED_ENTRY'],createdAtMs:base.candidate.createdAtMs,
+    purgeAfterMs:base.candidate.purgeAfterMs,
+  });
+  const candidateEvent = derivedEvent(
+    'TradingCandidateUpdated',candidate.id,{ candidate },'confirmed',
+    candidate.asOf.cursor,candidate.createdAtMs,
+  );
+  const cursor = Object.freeze({
+    slot:11n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+  });
+  const session = createCreationEntrySession({
+    candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'EXTERNAL_UNIQUE_BUY_OBSERVED',
+    positionId:'paper-position',entryCursor:candidate.asOf.cursor,externalBuyTarget:10,
+    externalBuyCount:1,countedTradeIds:[tradeId],countedBuyerWallets:['external-wallet'],
+    externalMinimumBuyAmountRaw:1_000n,
+    lastCountedCursor:cursor,minimumConfirmation:'confirmed',lastQuote:candidate.buyQuote,
+    lastError:null,pendingExitReason:null,createdAtMs:candidate.createdAtMs,updatedAtMs,
+    purgeAfterMs:updatedAtMs+14_400_000,
+  });
+  const sessionEvent = derivedEvent(
+    'PaperStrategySessionUpdated',`${session.id}:${tradeId}`,{ session },
+    'confirmed',candidate.asOf.cursor,updatedAtMs,
+  );
+  return Object.freeze({
+    ...base,candidate,candidateEvent,session,sessionEvent,
+    countedExternalBuys:Object.freeze([Object.freeze({
+      sessionId:session.id,tradeId,mint:MINT,quoteMint:'SOL',trader:'external-wallet',
+      quoteAmountRaw:2_000n,cursor,confirmationStatus:'confirmed' as const,
+      observedAtMs:updatedAtMs,payloadVersion:2 as const,
+    })]),
+    requestedAction:'NONE' as const,
+  });
+}
+
+function creationDecisionWithoutEvidence(
+  base: PaperDecisionResult,
+  updatedAtMs: number,
+): PaperDecisionResult {
+  assert.ok(base.session?.payloadVersion === 2);
+  const session = createCreationEntrySession({
+    candidate: base.candidate,
+    state: 'WAITING_EXTERNAL_BUYS',
+    reasonCode: 'QUALIFIED_ENTRY',
+    positionId: 'paper-position',
+    entryCursor: base.candidate.asOf.cursor,
+    externalBuyTarget: base.session.externalBuyTarget,
+    externalBuyCount: 0,
+    externalMinimumBuyAmountRaw: base.session.externalMinimumBuyAmountRaw,
+    countedTradeIds: [],
+    countedBuyerWallets: [],
+    lastCountedCursor: null,
+    minimumConfirmation: base.session.minimumConfirmation,
+    lastQuote: base.candidate.buyQuote,
+    lastError: null,
+    pendingExitReason: null,
+    createdAtMs: base.session.createdAtMs,
+    updatedAtMs,
+    purgeAfterMs: updatedAtMs + 14_400_000,
+  });
+  const sessionEvent = Object.freeze({
+    ...derivedEvent(
+      'PaperStrategySessionUpdated', `${session.id}:orphaned-evidence`, { session },
+      'confirmed', base.candidate.asOf.cursor, updatedAtMs,
+    ),
+    confirmationStatus: 'orphaned' as const,
+  });
+  return Object.freeze({
+    ...base,
+    session,
+    sessionEvent,
+    countedExternalBuys: Object.freeze([]),
+    requestedAction: 'NONE' as const,
+  });
+}
+
+function creationSourceOrphanDecision(
+  base: PaperDecisionResult,
+  updatedAtMs: number,
+): PaperDecisionResult {
+  assert.ok(base.session?.payloadVersion === 2);
+  const session = createCreationEntrySession({
+    candidate: base.candidate,
+    state: 'PAPER_RETRACTED',
+    reasonCode: 'SOURCE_ORPHANED',
+    positionId: base.session.positionId,
+    entryCursor: base.session.entryCursor,
+    externalBuyTarget: base.session.externalBuyTarget,
+    externalBuyCount: base.session.externalBuyCount,
+    externalMinimumBuyAmountRaw: base.session.externalMinimumBuyAmountRaw,
+    countedTradeIds: base.session.countedTradeIds,
+    countedBuyerWallets: base.session.countedBuyerWallets,
+    lastCountedCursor: base.session.lastCountedCursor,
+    minimumConfirmation: base.session.minimumConfirmation,
+    lastQuote: base.session.lastQuote,
+    lastError: null,
+    pendingExitReason: null,
+    createdAtMs: base.session.createdAtMs,
+    updatedAtMs,
+    purgeAfterMs: updatedAtMs + 14_400_000,
+  });
+  const sessionEvent = Object.freeze({
+    ...derivedEvent(
+      'PaperStrategySessionUpdated', `${session.id}:source-orphaned`, { session },
+      'confirmed', base.candidate.asOf.cursor, updatedAtMs,
+    ),
+    confirmationStatus: 'orphaned' as const,
+  });
+  return Object.freeze({
+    ...base,
+    session,
+    sessionEvent,
+    countedExternalBuys: Object.freeze([]),
+    requestedAction: 'NONE' as const,
   });
 }
 

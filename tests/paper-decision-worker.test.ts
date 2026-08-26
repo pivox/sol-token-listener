@@ -29,8 +29,11 @@ import type {
 import { PaperQuoteError } from '../src/ports/paper-quote-router.js';
 import {
   PaperDecisionWorker,
+  createPaperDecisionStrategyRegistry,
   type PaperDecisionWorkerScheduler,
 } from '../src/application/paper-decision-worker.js';
+import { CreationEntryV1Strategy } from '../src/application/creation-entry-v1.strategy.js';
+import { ValidatedExternalBuysStrategy } from '../src/application/validated-external-buys.strategy.js';
 
 void test('persists explainable observe decisions without requesting quotes or paper actions', async () => {
   const repository = new FakeRepository([claim()]);
@@ -306,6 +309,48 @@ void test('reuses the persisted decision for an active session without entry quo
   assert.equal((await worker.runOnce()).kind, 'completed');
   assert.equal(quotes.calls, 0);
   assert.equal(repository.stages.length, 1);
+});
+
+void test('routes a persisted V1 session to legacy while creation is active', async () => {
+  const repository = new FakeRepository([claim()]);
+  const candidate = tradingCandidate('ELIGIBLE');
+  const session = createPaperStrategySession({
+    candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'QUALIFIED_ENTRY',positionId:'position',
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentCandidate:candidate,currentSession:session,activePosition:POSITION,
+    currentDecision:Object.freeze({
+      qualification:canonicalQualification(),
+      candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const unreachableLedger = {
+    async open(): Promise<never> { throw new Error('not called'); },
+    async reconcileOpen(): Promise<never> { throw new Error('not called'); },
+    async close(): Promise<never> { throw new Error('not called'); },
+    async retract(): Promise<never> { throw new Error('not called'); },
+  };
+  const quotes = new FakeQuotes();
+  const services = fakeServices('ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,
+    createPaperDecisionStrategyRegistry({
+      activeStrategyId:'creation-entry-v1',
+      legacy:new ValidatedExternalBuysStrategy(unreachableLedger,quotes,{ retentionMs:14_400_000 }),
+      creation:new CreationEntryV1Strategy(unreachableLedger,quotes,{
+        retentionMs:14_400_000,externalMinimumBuyAmountRaw:1n,
+      }),
+    }),
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.equal(quotes.calls,0);
+  assert.equal(repository.completions[0]?.result.session?.payloadVersion,1);
 });
 
 void test('reconciles the exact historical qualification without opening a new position', async () => {
@@ -683,6 +728,21 @@ void test('starts idempotently, polls without a busy loop and closes all timers'
   assert.equal(scheduler.activeCount, 0);
 });
 
+void test('wakes active creation sessions once before normal claims when kill switch is set', async () => {
+  const repository = new FakeRepository([null, null]);
+  const services = fakeServices('ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository, new FakeQuotes(), services.qualification, services.candidates, services.strategy,
+    options({ manualKillSwitch: true }), new ManualScheduler(),
+  );
+
+  await worker.runOnce();
+  await worker.runOnce();
+
+  assert.equal(repository.activeSessionWakeups, 1);
+  assert.equal(repository.claimCalls, 2);
+});
+
 class FakeRepository implements PaperDecisionRepository {
   public readonly stages: PaperDecisionResult[] = [];
   public readonly completions: { readonly result:PaperDecisionResult }[] = [];
@@ -690,13 +750,22 @@ class FakeRepository implements PaperDecisionRepository {
   public renewResult = true;
   public noopCompletions = 0;
   public obsoleteCompletions = 0;
+  public activeSessionWakeups = 0;
+  public claimCalls = 0;
   public snapshotValue: PaperDecisionSnapshot = snapshot();
   public constructor(
     private readonly claims: (ClaimedPaperDecisionJob|null)[],
     private readonly operations: string[] = [],
   ) {}
   public async enqueue(_input: PaperDecisionJobInput): Promise<void> {}
-  public async claim(): Promise<ClaimedPaperDecisionJob|null> { return this.claims.shift() ?? null; }
+  public async enqueueActiveSessions(): Promise<number> {
+    this.activeSessionWakeups += 1;
+    return 0;
+  }
+  public async claim(): Promise<ClaimedPaperDecisionJob|null> {
+    this.claimCalls += 1;
+    return this.claims.shift() ?? null;
+  }
   public async renew(): Promise<boolean> { return this.renewResult; }
   public async loadSnapshot(): Promise<PaperDecisionSnapshot> { return this.snapshotValue; }
   public async stageDecision(_job:ClaimedPaperDecisionJob,result:PaperDecisionResult): Promise<void> {
@@ -837,7 +906,7 @@ function options(overrides: Partial<ConstructorParameters<typeof PaperDecisionWo
     quoteMintAllowlist:Object.freeze(['SOL']),
     slippageBps:100n,externalBuyTarget:10,minimumConfirmation:'confirmed' as const,
     maximumRoundTripLossBps:3_000n,pollIntervalMs:100,leaseMs:10_000,
-    renewalIntervalMs:1_000,shutdownTimeoutMs:100,...overrides,
+    renewalIntervalMs:1_000,shutdownTimeoutMs:100,manualKillSwitch:false,...overrides,
   });
 }
 
@@ -852,7 +921,8 @@ function claim(): ClaimedPaperDecisionJob {
 function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecisionSnapshot {
   const asOfEvent=event('TokenLaunchDetected','evt_source');
   return Object.freeze({
-    mint:'MINT',asOfEvent,canonicalLaunchActive:true,hasPaperLineage:false,launch:Object.freeze({
+    mint:'MINT',asOfEvent,canonicalLaunchActive:true,hasPaperLineage:false,
+    launchDetectedAtMs:1_000,launchConfirmationStatus:'confirmed',launch:Object.freeze({
       mint:'MINT',creator:'creator',tokenProgram:'SPL_TOKEN' as const,
       quoteAssets:Object.freeze([Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const })]),
       launchpad:'pumpfun',createdAt:asOfEvent.cursor,parameters:Object.freeze({}),

@@ -306,7 +306,7 @@ void test('loads qualification, candidate, and paper progress set-wise for a lau
       reason_code: 'EXTERNAL_BUY_OBSERVED', strategy_id: 'validated-external-buys',
       strategy_version: 1, position_id: 'position-a', quote_mint: 'quote',
       external_buy_target: 10, external_buy_count: 3, minimum_confirmation: 'confirmed',
-      updated_at: detectedAt, payload: toJsonValue({ lastError: null }),
+      updated_at: detectedAt, payload_version: 1, payload: toJsonValue({ lastError: null }),
     }];
     return projectionRows(call);
   });
@@ -369,7 +369,7 @@ void test('exposes current candidate and bounded paper strategy progress on laun
       reason_code: 'EXTERNAL_BUY_OBSERVED', strategy_id: 'validated-external-buys',
       strategy_version: 1, position_id: 'position-a', quote_mint: 'quote',
       external_buy_target: 10, external_buy_count: 3, minimum_confirmation: 'confirmed',
-      updated_at: detectedAt,
+      updated_at: detectedAt, payload_version: 1,
       payload: toJsonValue({ lastError: { code: 'QUOTE_UNAVAILABLE', message: 'hidden', retryable: true } }),
     }];
     return projectionRows(call);
@@ -387,6 +387,7 @@ void test('exposes current candidate and bounded paper strategy progress on laun
   assert.deepEqual(detail?.paperStrategy, {
     id: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
     reasonCode: 'EXTERNAL_BUY_OBSERVED', strategyId: 'validated-external-buys',
+    pendingExitReason: null,
     strategyVersion: 1, positionId: 'position-a', quoteMint: 'quote',
     externalBuyTarget: 10, externalBuyCount: 3, minimumConfirmation: 'confirmed',
     updatedAt: detectedAt.toISOString(), lastErrorCode: 'QUOTE_UNAVAILABLE',
@@ -407,7 +408,7 @@ void test('fails closed on incoherent candidate windows and paper progress', asy
     reason_code: 'EXTERNAL_BUY_OBSERVED', strategy_id: 'validated-external-buys',
     strategy_version: 1, position_id: 'position-a', quote_mint: 'quote',
     external_buy_target: 10, external_buy_count: 3, minimum_confirmation: 'confirmed',
-    updated_at: detectedAt, payload: toJsonValue({ lastError: null }),
+    updated_at: detectedAt, payload_version: 1, payload: toJsonValue({ lastError: null }),
   };
   const repository = (candidateRow: Record<string, unknown>, sessionRow: Record<string, unknown>) =>
     new PostgresApiProjectionRepository(new FakeQueryable((call) => {
@@ -423,6 +424,36 @@ void test('fails closed on incoherent candidate windows and paper progress', asy
   );
   await assert.rejects(
     repository(candidate, { ...session, external_buy_count: 11 }).getLaunch('mint-a'),
+    ApiProjectionDataError,
+  );
+});
+
+void test('exposes a validated creation exit cause and rejects its wrong payload version', async () => {
+  const session = {
+    mint: 'mint-a', session_id: `paper_session_${'d'.repeat(64)}`,
+    state: 'EXIT_PENDING_QUOTE', reason_code: 'SELL_QUOTE_UNAVAILABLE_OR_STALE',
+    strategy_id: 'creation-entry-v1', strategy_version: 1, position_id: 'position-a',
+    quote_mint: 'quote', external_buy_target: 10, external_buy_count: 4,
+    minimum_confirmation: 'confirmed', updated_at: detectedAt, payload_version: 2,
+    payload: toJsonValue({
+      pendingExitReason: 'CREATOR_EARLY_SELL',
+      lastError: { code: 'QUOTE_STALE', message: 'hidden', retryable: true },
+    }),
+  };
+  const repository = (row: Record<string, unknown>) => new PostgresApiProjectionRepository(
+    new FakeQueryable((call) => {
+      if (call.text.includes('FROM token_launches AS launch')) return [launch('mint-a')];
+      if (call.text.includes('FROM paper_strategy_sessions')) return [row];
+      return projectionRows(call);
+    }),
+  );
+
+  const detail = await repository(session).getLaunch('mint-a');
+  assert.equal(detail?.paperStrategy?.pendingExitReason, 'CREATOR_EARLY_SELL');
+  assert.equal(detail?.paperStrategy?.reasonCode, 'SELL_QUOTE_UNAVAILABLE_OR_STALE');
+  assert.doesNotMatch(JSON.stringify(detail), /hidden/u);
+  await assert.rejects(
+    repository({ ...session, payload_version: 1 }).getLaunch('mint-a'),
     ApiProjectionDataError,
   );
 });

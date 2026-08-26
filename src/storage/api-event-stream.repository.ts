@@ -6,6 +6,7 @@ import {
 } from '../api/contracts.js';
 import { DOMAIN_EVENT_TYPES, type DomainEventType } from '../domain/events.js';
 import {
+  CREATION_EXIT_REASONS,
   PAPER_DECISION_REASON_CODES,
   PAPER_STRATEGY_SESSION_STATES,
 } from '../domain/paper-strategy.js';
@@ -428,6 +429,17 @@ function summarizePaperPayload(value: unknown, type: DomainEventType): unknown {
     case 'PaperStrategySessionUpdated': {
       const session = nestedRecord(value, 'session');
       const strategy = nestedRecord(session, 'strategy');
+      const strategyId = stringValue(strategy, 'id');
+      const sessionPayloadVersion = positiveIntegerValue(session, 'payloadVersion');
+      if (
+        (strategyId === 'creation-entry-v1' && sessionPayloadVersion !== 2)
+        || (strategyId !== 'creation-entry-v1' && sessionPayloadVersion !== 1)
+      ) throw invalid();
+      const pendingExitValue = session.pendingExitReason;
+      const pendingExitReason = pendingExitValue === undefined || pendingExitValue === null
+        ? null
+        : enumStringValue(session, 'pendingExitReason', CREATION_EXIT_REASONS);
+      if (strategyId !== 'creation-entry-v1' && pendingExitReason !== null) throw invalid();
       const externalBuyCount = integerValue(session, 'externalBuyCount');
       const externalBuyTarget = positiveIntegerValue(session, 'externalBuyTarget');
       if (externalBuyCount > externalBuyTarget) throw invalid();
@@ -435,8 +447,9 @@ function summarizePaperPayload(value: unknown, type: DomainEventType): unknown {
         sessionId: stringValue(session, 'id'),
         state: enumStringValue(session, 'state', PAPER_STRATEGY_SESSION_STATES),
         reasonCode: enumStringValue(session, 'reasonCode', PAPER_DECISION_REASON_CODES),
+        pendingExitReason,
         strategy: {
-          id: stringValue(strategy, 'id'),
+          id: strategyId,
           version: positiveIntegerValue(strategy, 'version'),
         },
         positionId: nullableStringValue(session, 'positionId'),

@@ -275,6 +275,7 @@ void test('projects bounded paper event summaries before exposing SSE payloads',
       strategy: { id: 'validated-external-buys', version: 1 }, positionId: 'position-a',
       quoteAsset: { mint: 'quote', decimals: 9, tokenProgram: 'SPL_TOKEN' },
       externalBuyCount: 3, externalBuyTarget: 10, minimumConfirmation: 'confirmed',
+      payloadVersion: 1,
       updatedAtMs: 1_800_000_000_000,
       countedTradeIds: new Array(1000).fill('must-not-stream'),
       lastQuote: { private: 'must-not-stream' },
@@ -308,6 +309,7 @@ void test('projects bounded paper event summaries before exposing SSE payloads',
   assert.deepEqual(payloads[1], {
     sessionId: `paper_session_${'c'.repeat(64)}`, state: 'WAITING_EXTERNAL_BUYS',
     reasonCode: 'EXTERNAL_BUY_OBSERVED',
+    pendingExitReason: null,
     strategy: { id: 'validated-external-buys', version: 1 }, positionId: 'position-a',
     quoteMint: 'quote', externalBuyCount: 3, externalBuyTarget: 10,
     minimumConfirmation: 'confirmed', updatedAt: '2027-01-15T08:00:00.000Z',
@@ -329,6 +331,9 @@ void test('projects bounded paper event summaries before exposing SSE payloads',
     }],
     ['PaperStrategySessionUpdated', {
       session: { ...sessionPayload.session, externalBuyCount: 11 },
+    }],
+    ['PaperStrategySessionUpdated', {
+      session: { ...sessionPayload.session, payloadVersion: 2 },
     }],
     ['PaperStrategySessionUpdated', {
       session: {

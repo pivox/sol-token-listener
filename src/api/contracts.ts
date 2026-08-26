@@ -13,6 +13,7 @@ import type { QualificationReasonCode } from '../domain/qualification-reasons.js
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
 import type {
+  CreationExitReason,
   PaperDecisionReasonCode,
   PaperMinimumConfirmation,
   PaperStrategySessionState,
@@ -127,6 +128,7 @@ export interface ApiPaperStrategyProgress {
   readonly id: string;
   readonly state: PaperStrategySessionState;
   readonly reasonCode: PaperDecisionReasonCode;
+  readonly pendingExitReason: CreationExitReason | null;
   readonly strategyId: string;
   readonly strategyVersion: number;
   readonly positionId: string | null;

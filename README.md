@@ -11,10 +11,37 @@ secondaire isolé; son code n'est pas activé par ce bootstrap.
 
 Le parcours paper E2E est opt-in. Après une qualification sans blocker, un
 worker durable produit un candidat, ouvre une position simulée, compte les
-achats externes confirmés après l'entrée puis cote et simule la sortie. La
+achats externes confirmés après l'entrée puis cote et simule la sortie. Avec
+`creation-entry-v1`, un wallet distinct n'est compté qu'une fois et seulement
+au-dessus du montant brut minimal configuré. La
 venue de cotation est Pump.fun tant que la bonding curve est active, puis le
 pool PumpSwap canonique après graduation. Aucun de ces chemins ne construit,
 ne signe ou n'envoie une transaction Solana.
+
+Configuration minimale de la stratégie de création, toujours simulée :
+
+```dotenv
+EXECUTION_MODE=paper
+CREATION_STRATEGY_ENABLED=true
+PAPER_STRATEGY_ENABLED=false
+PAPER_ENTRY_QUOTE_AMOUNT_RAW=10000000
+PAPER_SLIPPAGE_BPS=500
+PAPER_QUOTE_MINT_ALLOWLIST=So11111111111111111111111111111111111111112
+EXTERNAL_UNIQUE_BUYERS_TARGET=10
+EXTERNAL_MIN_BUY_AMOUNT_RAW=1000000
+CREATION_TAKE_PROFIT_MULTIPLIER_BPS=20000
+CREATION_MANUAL_KILL_SWITCH=false
+QUALIFICATION_PROFILE_PATH=config/qualification/pumpfun-v1-unvalidated.json
+RISK_MAX_ROUNDTRIP_LOSS_BPS=3000
+```
+
+L'entrée expire 45 secondes après l'observation de la création et reste soumise
+à la qualification canonique sans blocker, aux deux quotes et à la simulation
+aller-retour. Les sorties sont arbitrées dans l'ordre : kill switch, vente du
+créateur, ×2 exécutable, puis cible de wallets uniques. Le ×2 utilise
+`minimumAmountOutRaw` d'une quote SELL sur la position complète, pas un prix
+théorique. Une quote indisponible conserve la cause de sortie en attente. Cette
+première mesure d'unicité ne détecte pas encore les Sybil ou clusters liés.
 
 ## Profil de qualification Pump.fun
 

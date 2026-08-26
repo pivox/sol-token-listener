@@ -1,7 +1,10 @@
 import type { DomainEvent } from '../domain/events.js';
 import type { LaunchpadObservationEventV1 } from '../domain/launchpad-events.js';
 import type { MarketTrade } from '../domain/market.js';
-import type { PaperStrategySessionV1, PaperExternalBuyEvidence } from '../domain/paper-strategy.js';
+import type {
+  AnyPaperExternalBuyEvidence,
+  PaperStrategySession,
+} from '../domain/paper-strategy.js';
 import type { PaperPosition } from '../domain/paper-trading.js';
 import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
 import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
@@ -41,6 +44,8 @@ export interface PaperDecisionSnapshot {
   readonly canonicalLaunchActive: boolean;
   readonly hasPaperLineage: boolean;
   readonly launch: TokenLaunch;
+  readonly launchDetectedAtMs: number;
+  readonly launchConfirmationStatus: ChainConfirmationStatus;
   readonly metadata: TokenMetadataSnapshot | null;
   readonly social: SocialEvidenceCollectionV1 | null;
   readonly creatorProfile: CreatorProfile | null;
@@ -57,7 +62,7 @@ export interface PaperDecisionSnapshot {
     readonly qualification: CanonicalQualificationProjection;
     readonly candidateEvent: DomainEvent;
   }> | null;
-  readonly currentSession: PaperStrategySessionV1 | null;
+  readonly currentSession: PaperStrategySession | null;
   readonly activePosition: PaperPosition | null;
 }
 
@@ -66,9 +71,9 @@ export interface PaperDecisionResult {
   readonly qualificationEvent: DomainEvent;
   readonly candidate: TradingCandidateV1;
   readonly candidateEvent: DomainEvent;
-  readonly session: PaperStrategySessionV1 | null;
+  readonly session: PaperStrategySession | null;
   readonly sessionEvent: DomainEvent | null;
-  readonly countedExternalBuys: readonly PaperExternalBuyEvidence[];
+  readonly countedExternalBuys: readonly AnyPaperExternalBuyEvidence[];
   readonly requestedAction: 'NONE' | 'OPEN' | 'CLOSE';
 }
 
@@ -80,6 +85,7 @@ export interface PaperDecisionFailure {
 
 export interface PaperDecisionRepository {
   enqueue(input: PaperDecisionJobInput): Promise<void>;
+  enqueueActiveSessions(nowMs: number): Promise<number>;
   claim(options: Readonly<{ leaseMs: number; nowMs: number }>): Promise<ClaimedPaperDecisionJob | null>;
   renew(job: ClaimedPaperDecisionJob, nowMs: number, leaseMs: number): Promise<boolean>;
   loadSnapshot(job: ClaimedPaperDecisionJob): Promise<PaperDecisionSnapshot>;

@@ -3,7 +3,11 @@ import { compareCursors } from '../domain/cursor.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { BondingCurveTradeObservedEventV1 } from '../domain/launchpad-events.js';
 import type { MarketTrade } from '../domain/market.js';
-import type { PaperStrategySessionV1 } from '../domain/paper-strategy.js';
+import type {
+  PaperStrategySession,
+  PaperStrategySessionV1,
+  PaperStrategySessionV2,
+} from '../domain/paper-strategy.js';
 import type { PaperPosition } from '../domain/paper-trading.js';
 import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
 import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
@@ -42,7 +46,7 @@ interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number
 interface Client { query(text: string, values?: readonly unknown[]): Promise<Result>; release(): void }
 interface Pool { connect(): Promise<Client> }
 
-type Operation = 'enqueue' | 'claim' | 'renew' | 'snapshot' | 'stage' | 'complete' | 'fail' | 'counts';
+type Operation = 'enqueue' | 'wake' | 'claim' | 'renew' | 'snapshot' | 'stage' | 'complete' | 'fail' | 'counts';
 
 export class PaperDecisionRepositoryError extends Error {
   public constructor(public readonly operation: Operation, options?: ErrorOptions) {
@@ -115,6 +119,54 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     } finally {
       release(client);
     }
+  }
+
+  public async enqueueActiveSessions(nowMs: number): Promise<number> {
+    timestamp(nowMs, 'nowMs');
+    const client = await this.connect('wake');
+    const inputs: PaperDecisionJobInput[] = [];
+    try {
+      const result = await client.query(`SELECT session.session_id,session.mint,session.updated_at,
+        source.event_id,source.raw_event_id,source.confirmation_status
+        FROM paper_strategy_sessions session
+        JOIN domain_events source ON source.event_id=session.source_event_id
+        JOIN raw_chain_events raw ON raw.event_id=source.raw_event_id
+        WHERE session.strategy_id='creation-entry-v1'
+          AND session.state IN (
+            'PAPER_HOLDING','WAITING_EXTERNAL_BUYS','EXIT_PENDING_QUOTE','SELL_PENDING'
+          )
+          AND source.confirmation_status<>'orphaned'
+          AND raw.confirmation_status<>'orphaned'
+        ORDER BY session.session_id`);
+      for (const row of result.rows) {
+        const sessionId = textField(row, 'session_id');
+        const sourceEventId = textField(row, 'event_id');
+        const sourceRawEventId = textField(row, 'raw_event_id');
+        const sourceConfirmationStatus = textField(
+          row,
+          'confirmation_status',
+        ) as PaperDecisionJobInput['sourceConfirmationStatus'];
+        inputs.push(Object.freeze({
+          mint: textField(row, 'mint'),
+          sourceEventId,
+          sourceRawEventId,
+          sourceConfirmationStatus,
+          inputFingerprint: hash([
+            'creation-manual-kill-v1',
+            sessionId,
+            dateField(row, 'updated_at').toISOString(),
+            sourceEventId,
+            sourceConfirmationStatus,
+          ]),
+        }));
+      }
+    } catch (error: unknown) {
+      throw repositoryError('wake', error);
+    } finally {
+      release(client);
+    }
+    for (const input of inputs) await this.enqueue(input);
+    return inputs.length;
   }
 
   public async enqueueLatest(
@@ -282,7 +334,10 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       await client.query('COMMIT');
       return deepFreeze({
         mint: job.mint,asOfEvent,canonicalLaunchActive:launchSnapshot.canonicalLaunchActive,
-        hasPaperLineage,launch:launchSnapshot.launch,metadata,social,creatorProfile,holderSnapshot,
+        hasPaperLineage,launch:launchSnapshot.launch,
+        launchDetectedAtMs:launchSnapshot.launchDetectedAtMs,
+        launchConfirmationStatus:launchSnapshot.launchConfirmationStatus,
+        metadata,social,creatorProfile,holderSnapshot,
         walletGraph,activeLaunchTrades: launchTrades,activeMarketTrades: marketTrades,
         currentQualification,currentCandidate: candidate,currentDecision,
         currentSession: session,activePosition: position,
@@ -403,7 +458,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         ]);
       } else {
         if (failure.terminalResult !== null) {
-          await writeDecision(client, job, failure.terminalResult, this.qualificationProfile);
+          await writeDecision(
+            client, job, failure.terminalResult, this.qualificationProfile, false,
+          );
         }
         const terminalStatus = failure.terminalResult === null ? 'CANCELLED' : 'COMPLETED';
         await exact(client, `UPDATE paper_decision_jobs SET
@@ -483,7 +540,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       ) {
         throw new PaperDecisionLeaseLostError();
       }
-      await writeDecision(client, job, result, this.qualificationProfile);
+      await writeDecision(client, job, result, this.qualificationProfile, terminal);
       const nowMs = Math.max(result.candidate.createdAtMs, result.session?.updatedAtMs ?? 0);
       if (terminal) {
         await exact(client, `UPDATE paper_decision_jobs SET
@@ -524,6 +581,7 @@ async function writeDecision(
   job: ClaimedPaperDecisionJob,
   result: PaperDecisionResult,
   qualificationProfile: QualificationProfileIdentity,
+  synchronizeOrphanedEvidence: boolean,
 ): Promise<void> {
   const qualification=await assertPersistedQualification(client,result,qualificationProfile);
   const candidate = result.candidate;
@@ -555,11 +613,29 @@ async function writeDecision(
   ]);
   }
   if (result.sessionEvent !== null) await insertDomainEvent(client, job, result.sessionEvent);
-  if (result.session !== null && result.sessionEvent !== null) {
-    await upsertSession(client, job, result.session, result.sessionEvent.id);
-  }
+  const sessionWriteAccepted = result.session !== null && result.sessionEvent !== null
+    ? await upsertSession(client, job, result.session, result.sessionEvent.id)
+    : false;
   const countedBuyPurgeAfter = result.session === null ? null : sessionPurgeAfter(result.session);
-  for (const evidence of result.countedExternalBuys) {
+  const countedBuyStrategyId = result.session?.strategy.id ?? null;
+  if (result.countedExternalBuys.length > 0 && countedBuyStrategyId === null) {
+    throw new TypeError('External buy strategy identity is missing.');
+  }
+  const replacesCreationEvidence = synchronizeOrphanedEvidence
+    && job.sourceConfirmationStatus === 'orphaned'
+    && hasCompleteCreationEvidence(result);
+  if (replacesCreationEvidence && sessionWriteAccepted) {
+    await client.query(`DELETE FROM paper_external_buy_events
+      WHERE session_id=$1 AND strategy_id='creation-entry-v1'
+        AND NOT (trade_id=ANY($2::text[]))`, [
+      result.session.id,
+      result.countedExternalBuys.map((evidence) => evidence.tradeId),
+    ]);
+  }
+  const countedExternalBuys = replacesCreationEvidence && !sessionWriteAccepted
+    ? []
+    : result.countedExternalBuys;
+  for (const evidence of countedExternalBuys) {
     const source = await client.query(`SELECT event_id,program,signature,blockchain_time
       FROM raw_chain_events
       WHERE mint=$1 AND slot=$2 AND transaction_index=$3 AND instruction_index=$4
@@ -585,17 +661,30 @@ async function writeDecision(
       payload:Object.freeze({ sessionId:evidence.sessionId,tradeId:evidence.tradeId }),
     });
     await insertDomainEventWithRaw(client, rawEventId, countedEvent);
+    const quoteAmountRaw = 'quoteAmountRaw' in evidence
+      && typeof evidence.quoteAmountRaw === 'bigint'
+      ? evidence.quoteAmountRaw.toString()
+      : null;
+    if (countedBuyStrategyId === 'creation-entry-v1' && evidence.trader !== null) {
+      await client.query(`DELETE FROM paper_external_buy_events
+        WHERE session_id=$1 AND strategy_id='creation-entry-v1'
+          AND trader=$2 AND trade_id<>$3`, [
+        evidence.sessionId,evidence.trader,evidence.tradeId,
+      ]);
+    }
     await client.query(`INSERT INTO paper_external_buy_events (
-      session_id,trade_id,source_event_id,mint,quote_mint,trader,slot,
+      session_id,trade_id,source_event_id,mint,quote_mint,trader,
+      strategy_id,quote_amount_raw,slot,
       transaction_index,instruction_index,inner_instruction_index,
       confirmation_status,observed_at,purge_after,payload_version,payload
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,$14)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
     ON CONFLICT (session_id,trade_id) DO NOTHING`, [
       evidence.sessionId,evidence.tradeId,countedEvent.id,evidence.mint,evidence.quoteMint,
-      evidence.trader,evidence.cursor.slot.toString(),evidence.cursor.transactionIndex,
+      evidence.trader,countedBuyStrategyId,quoteAmountRaw,evidence.cursor.slot.toString(),
+      evidence.cursor.transactionIndex,
       evidence.cursor.instructionIndex,evidence.cursor.innerInstructionIndex,
       evidence.confirmationStatus,new Date(evidence.observedAtMs),countedBuyPurgeAfter,
-      toJsonValue(evidence),
+      evidence.payloadVersion,toJsonValue(evidence),
     ]);
   }
 }
@@ -688,12 +777,12 @@ function assertCandidateEvent(result:PaperDecisionResult):void{
 async function upsertSession(
   client: Client,
   job: ClaimedPaperDecisionJob,
-  session: PaperStrategySessionV1,
+  session: PaperStrategySession,
   sessionEventId: string,
-): Promise<void> {
+): Promise<boolean> {
   const terminal = ['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state);
   const purgeAfter = sessionPurgeAfter(session);
-  await client.query(`INSERT INTO paper_strategy_sessions (
+  const written = await client.query(`INSERT INTO paper_strategy_sessions (
     session_id,mint,candidate_id,report_id,source_event_id,session_event_id,
     strategy_id,strategy_version,actor_kind,state,reason_code,quote_mint,
     quote_decimals,quote_token_program,position_id,open_command_id,close_command_id,
@@ -701,20 +790,21 @@ async function upsertSession(
     entry_inner_instruction_index,external_buy_target,external_buy_count,
     minimum_confirmation,created_at,updated_at,terminal_at,purge_after,payload_version,payload
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-    $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,1,$29)
+    $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
   ON CONFLICT (session_id) DO UPDATE SET
     session_event_id=EXCLUDED.session_event_id,state=EXCLUDED.state,
     reason_code=EXCLUDED.reason_code,position_id=EXCLUDED.position_id,
     close_command_id=EXCLUDED.close_command_id,external_buy_count=EXCLUDED.external_buy_count,
     updated_at=EXCLUDED.updated_at,terminal_at=EXCLUDED.terminal_at,
-    purge_after=EXCLUDED.purge_after,payload=EXCLUDED.payload
+    purge_after=EXCLUDED.purge_after,payload_version=EXCLUDED.payload_version,
+    payload=EXCLUDED.payload
   WHERE (
       paper_strategy_sessions.updated_at < EXCLUDED.updated_at
       OR (
         paper_strategy_sessions.updated_at = EXCLUDED.updated_at
         AND (
           EXCLUDED.external_buy_count >= paper_strategy_sessions.external_buy_count
-          OR $30::boolean
+          OR $31::boolean
         )
       )
     )
@@ -731,16 +821,42 @@ async function upsertSession(
     session.entryCursor.innerInstructionIndex,session.externalBuyTarget,
     session.externalBuyCount,session.minimumConfirmation,new Date(session.createdAtMs),
     new Date(session.updatedAtMs),terminal ? new Date(session.updatedAtMs) : null,
-    purgeAfter,toJsonValue(session),job.sourceConfirmationStatus === 'orphaned',
+    purgeAfter,session.payloadVersion,toJsonValue(session),
+    job.sourceConfirmationStatus === 'orphaned',
   ]);
-  if (purgeAfter !== null) {
+  if (written.rowCount === 1 && purgeAfter !== null) {
     await client.query(`UPDATE paper_external_buy_events
       SET purge_after=COALESCE(purge_after,$2)
       WHERE session_id=$1`, [session.id,purgeAfter]);
   }
+  return written.rowCount === 1;
 }
 
-function sessionPurgeAfter(session: PaperStrategySessionV1): Date | null {
+function hasCompleteCreationEvidence(
+  result: PaperDecisionResult,
+): result is PaperDecisionResult & Readonly<{ session: PaperStrategySessionV2 }> {
+  const session = result.session;
+  if (
+    session?.payloadVersion !== 2
+    || result.countedExternalBuys.length !== session.externalBuyCount
+  ) return false;
+  const tradeIds = new Set<string>();
+  const traders = new Set<string>();
+  for (const evidence of result.countedExternalBuys) {
+    if (
+      evidence.payloadVersion !== 2
+      || evidence.sessionId !== session.id
+      || tradeIds.has(evidence.tradeId)
+      || traders.has(evidence.trader)
+    ) return false;
+    tradeIds.add(evidence.tradeId);
+    traders.add(evidence.trader);
+  }
+  return session.countedTradeIds.every((tradeId) => tradeIds.has(tradeId))
+    && session.countedBuyerWallets.every((trader) => traders.has(trader));
+}
+
+function sessionPurgeAfter(session: PaperStrategySession): Date | null {
   return ['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state)
     ? new Date(session.updatedAtMs + 14_400_000)
     : null;
@@ -831,7 +947,12 @@ async function loadLaunch(
   client: Client,
   mint: string,
   includeOrphaned: boolean,
-): Promise<Readonly<{ launch:TokenLaunch; canonicalLaunchActive:boolean }>> {
+): Promise<Readonly<{
+  launch:TokenLaunch;
+  launchDetectedAtMs:number;
+  launchConfirmationStatus:ChainConfirmationStatus;
+  canonicalLaunchActive:boolean;
+}>> {
   const result = await client.query(`SELECT launch.*,
     EXISTS(SELECT 1 FROM domain_events active
       WHERE active.mint=$1 AND active.type='TokenLaunchDetected'
@@ -844,6 +965,8 @@ async function loadLaunch(
   const event = decodeDomainEvent(requiredRow(result, 'Token launch event is missing.'));
   return Object.freeze({
     launch:payloadProperty(event.payload,'launch') as TokenLaunch,
+    launchDetectedAtMs:event.observedAtMs,
+    launchConfirmationStatus:event.confirmationStatus,
     canonicalLaunchActive:booleanField(result.rows[0],'canonical_launch_active'),
   });
 }
