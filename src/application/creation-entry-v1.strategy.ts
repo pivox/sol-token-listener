@@ -92,6 +92,7 @@ export class CreationEntryV1Strategy {
       entryCursor: candidate.asOf.cursor,
       externalBuyTarget: input.externalBuyTarget,
       externalBuyCount: 0,
+      externalMinimumBuyAmountRaw: this.options.externalMinimumBuyAmountRaw,
       countedTradeIds: [],
       countedBuyerWallets: [],
       lastCountedCursor: null,
@@ -255,7 +256,7 @@ export class CreationEntryV1Strategy {
 
     let rebuilt = baseline;
     const counted: PaperExternalBuyEvidenceV2[] = [];
-    for (const buy of canonicalBuys({ ...input, session: baseline }, this.options.externalMinimumBuyAmountRaw)) {
+    for (const buy of canonicalBuys({ ...input, session: baseline })) {
       const result = countUniqueExternalBuy(rebuilt, {
         tradeId: buy.id,
         mint: input.candidate.mint,
@@ -332,7 +333,7 @@ export class CreationEntryV1Strategy {
     let session = input.session;
     const counted: PaperExternalBuyEvidenceV2[] = [];
     let trigger: DomainEvent = candidateTrigger(input.candidate);
-    for (const buy of canonicalBuys(input, this.options.externalMinimumBuyAmountRaw)) {
+    for (const buy of canonicalBuys(input)) {
       const result = countUniqueExternalBuy(session, {
         tradeId: buy.id,
         mint: input.candidate.mint,
@@ -479,6 +480,7 @@ function updateSession(
     entryCursor: next.entryCursor,
     externalBuyTarget: next.externalBuyTarget,
     externalBuyCount: next.externalBuyCount,
+    externalMinimumBuyAmountRaw: next.externalMinimumBuyAmountRaw,
     countedTradeIds: next.countedTradeIds,
     countedBuyerWallets: next.countedBuyerWallets,
     lastCountedCursor: next.lastCountedCursor,
@@ -526,8 +528,8 @@ function earliestCreatorSell(
 
 function canonicalBuys(
   input: Parameters<CreationEntryV1Strategy['reconcile']>[0],
-  minimumAmountRaw: bigint,
 ): readonly CanonicalBuy[] {
+  const minimumAmountRaw = input.session.externalMinimumBuyAmountRaw;
   const buys: CanonicalBuy[] = [];
   for (const event of input.launchTrades) {
     const trade = event.payload.trade;

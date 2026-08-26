@@ -69,6 +69,7 @@ void test('creates a deterministic V2 creation session with paired unique buyer 
     reasonCode: 'EXTERNAL_UNIQUE_BUY_OBSERVED' as const,
     externalBuyCount: 1,
     countedTradeIds: ['trade-a'],
+    externalMinimumBuyAmountRaw: 1_000n,
     countedBuyerWallets: ['wallet-a'],
     lastCountedCursor: {
       slot: 10n, transactionIndex: 1, instructionIndex: 3, innerInstructionIndex: null,
@@ -101,6 +102,10 @@ void test('creates a deterministic V2 creation session with paired unique buyer 
     ...input,
     countedBuyerWallets: [],
   }), /wallet|buyer|count/iu);
+  assert.throws(() => createCreationEntrySession({
+    ...input,
+    externalMinimumBuyAmountRaw: 0n,
+  }), /minimum|amount/iu);
 });
 
 void test('enforces target, count, cursor, mint, quote and minimum confirmation', () => {

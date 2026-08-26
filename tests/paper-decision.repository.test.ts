@@ -124,6 +124,9 @@ void test('persists V2 buyer evidence and replaces an orphaned wallet trade proj
     assert.ok(claim);
 
     await repository.stageDecision(claim, creationDecisionWithEvidence('trade-old', 2_000));
+    const persisted = await repository.loadSnapshot(claim);
+    assert.ok(persisted.currentSession?.payloadVersion === 2);
+    assert.equal(persisted.currentSession.externalMinimumBuyAmountRaw, 1_000n);
     await repository.stageDecision(claim, creationDecisionWithEvidence('trade-active', 2_001));
 
     const rows = await pool.query(`SELECT trade_id,trader,quote_amount_raw::text,
@@ -134,6 +137,54 @@ void test('persists V2 buyer evidence and replaces an orphaned wallet trade proj
     assert.equal(rows.rows[0]?.quote_amount_raw, '2000');
     assert.equal(rows.rows[0]?.payload_version, 2);
     assert.equal((rows.rows[0]?.payload as { payloadVersion?: unknown }).payloadVersion, 2);
+  });
+});
+
+void test('removes V2 buyer evidence orphaned without a replacement trade', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const initial = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(initial);
+    const counted = creationDecisionWithEvidence('trade-orphaned', 2_000);
+    await repository.complete(initial, counted);
+
+    await pool.query(
+      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [TRADE_RAW_EVENT_ID],
+    );
+    await pool.query(
+      `UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
+      [TRADE_EVENT_ID],
+    );
+    await repository.enqueue(jobInput({
+      sourceEventId: TRADE_EVENT_ID,
+      sourceRawEventId: TRADE_RAW_EVENT_ID,
+      sourceConfirmationStatus: 'orphaned',
+      inputFingerprint: 'b'.repeat(64),
+    }));
+    const orphaned = await repository.claim({ nowMs: 3_000, leaseMs: 10_000 });
+    assert.ok(orphaned);
+    const rebuilt = creationDecisionWithoutEvidence(counted, 3_000);
+    await repository.stageDecision(orphaned, rebuilt);
+    const stagedRows = await pool.query(
+      'SELECT trade_id FROM paper_external_buy_events WHERE session_id=$1',
+      [counted.session?.id],
+    );
+    assert.equal(stagedRows.rowCount, 1);
+    await repository.complete(orphaned, rebuilt);
+
+    const rows = await pool.query(
+      'SELECT trade_id FROM paper_external_buy_events WHERE session_id=$1',
+      [counted.session?.id],
+    );
+    assert.equal(rows.rowCount, 0);
   });
 });
 
@@ -1337,6 +1388,7 @@ function creationDecisionWithEvidence(tradeId: string, updatedAtMs: number): Pap
     candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'EXTERNAL_UNIQUE_BUY_OBSERVED',
     positionId:'paper-position',entryCursor:candidate.asOf.cursor,externalBuyTarget:10,
     externalBuyCount:1,countedTradeIds:[tradeId],countedBuyerWallets:['external-wallet'],
+    externalMinimumBuyAmountRaw:1_000n,
     lastCountedCursor:cursor,minimumConfirmation:'confirmed',lastQuote:candidate.buyQuote,
     lastError:null,pendingExitReason:null,createdAtMs:candidate.createdAtMs,updatedAtMs,
     purgeAfterMs:updatedAtMs+14_400_000,
@@ -1353,6 +1405,47 @@ function creationDecisionWithEvidence(tradeId: string, updatedAtMs: number): Pap
       observedAtMs:updatedAtMs,payloadVersion:2 as const,
     })]),
     requestedAction:'NONE' as const,
+  });
+}
+
+function creationDecisionWithoutEvidence(
+  base: PaperDecisionResult,
+  updatedAtMs: number,
+): PaperDecisionResult {
+  assert.ok(base.session?.payloadVersion === 2);
+  const session = createCreationEntrySession({
+    candidate: base.candidate,
+    state: 'WAITING_EXTERNAL_BUYS',
+    reasonCode: 'QUALIFIED_ENTRY',
+    positionId: 'paper-position',
+    entryCursor: base.candidate.asOf.cursor,
+    externalBuyTarget: base.session.externalBuyTarget,
+    externalBuyCount: 0,
+    externalMinimumBuyAmountRaw: base.session.externalMinimumBuyAmountRaw,
+    countedTradeIds: [],
+    countedBuyerWallets: [],
+    lastCountedCursor: null,
+    minimumConfirmation: base.session.minimumConfirmation,
+    lastQuote: base.candidate.buyQuote,
+    lastError: null,
+    pendingExitReason: null,
+    createdAtMs: base.session.createdAtMs,
+    updatedAtMs,
+    purgeAfterMs: updatedAtMs + 14_400_000,
+  });
+  const sessionEvent = Object.freeze({
+    ...derivedEvent(
+      'PaperStrategySessionUpdated', `${session.id}:orphaned-evidence`, { session },
+      'confirmed', base.candidate.asOf.cursor, updatedAtMs,
+    ),
+    confirmationStatus: 'orphaned' as const,
+  });
+  return Object.freeze({
+    ...base,
+    session,
+    sessionEvent,
+    countedExternalBuys: Object.freeze([]),
+    requestedAction: 'NONE' as const,
   });
 }
 

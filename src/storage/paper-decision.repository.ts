@@ -457,7 +457,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         ]);
       } else {
         if (failure.terminalResult !== null) {
-          await writeDecision(client, job, failure.terminalResult, this.qualificationProfile);
+          await writeDecision(
+            client, job, failure.terminalResult, this.qualificationProfile, false,
+          );
         }
         const terminalStatus = failure.terminalResult === null ? 'CANCELLED' : 'COMPLETED';
         await exact(client, `UPDATE paper_decision_jobs SET
@@ -537,7 +539,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       ) {
         throw new PaperDecisionLeaseLostError();
       }
-      await writeDecision(client, job, result, this.qualificationProfile);
+      await writeDecision(client, job, result, this.qualificationProfile, terminal);
       const nowMs = Math.max(result.candidate.createdAtMs, result.session?.updatedAtMs ?? 0);
       if (terminal) {
         await exact(client, `UPDATE paper_decision_jobs SET
@@ -578,6 +580,7 @@ async function writeDecision(
   job: ClaimedPaperDecisionJob,
   result: PaperDecisionResult,
   qualificationProfile: QualificationProfileIdentity,
+  synchronizeOrphanedEvidence: boolean,
 ): Promise<void> {
   const qualification=await assertPersistedQualification(client,result,qualificationProfile);
   const candidate = result.candidate;
@@ -616,6 +619,18 @@ async function writeDecision(
   const countedBuyStrategyId = result.session?.strategy.id ?? null;
   if (result.countedExternalBuys.length > 0 && countedBuyStrategyId === null) {
     throw new TypeError('External buy strategy identity is missing.');
+  }
+  if (
+    synchronizeOrphanedEvidence
+    && job.sourceConfirmationStatus === 'orphaned'
+    && result.session?.payloadVersion === 2
+  ) {
+    await client.query(`DELETE FROM paper_external_buy_events
+      WHERE session_id=$1 AND strategy_id='creation-entry-v1'
+        AND NOT (trade_id=ANY($2::text[]))`, [
+      result.session.id,
+      result.countedExternalBuys.map((evidence) => evidence.tradeId),
+    ]);
   }
   for (const evidence of result.countedExternalBuys) {
     const source = await client.query(`SELECT event_id,program,signature,blockchain_time

@@ -92,6 +92,7 @@ PaperStrategySessionV1,
 'strategy' | 'payloadVersion'
 > {
   readonly strategy: Readonly<{ readonly id: 'creation-entry-v1'; readonly version: 1 }>;
+  readonly externalMinimumBuyAmountRaw: bigint;
   readonly countedBuyerWallets: readonly string[];
   readonly pendingExitReason: CreationExitReason | null;
   readonly payloadVersion: 2;
@@ -118,6 +119,7 @@ export interface CreatePaperStrategySessionInput {
 }
 
 export interface CreateCreationEntrySessionInput extends CreatePaperStrategySessionInput {
+  readonly externalMinimumBuyAmountRaw: bigint;
   readonly countedBuyerWallets: readonly string[];
   readonly pendingExitReason: CreationExitReason | null;
 }
@@ -223,6 +225,12 @@ export function createCreationEntrySession(
     input.countedBuyerWallets.length !== input.externalBuyCount
     || new Set(input.countedBuyerWallets).size !== input.countedBuyerWallets.length
   ) throw new TypeError('Creation session buyer wallet count is invalid.');
+  if (
+    typeof input.externalMinimumBuyAmountRaw !== 'bigint'
+    || input.externalMinimumBuyAmountRaw <= 0n
+  ) {
+    throw new TypeError('Creation session minimum buy amount is invalid.');
+  }
   for (const wallet of input.countedBuyerWallets) text(wallet, 'buyer wallet');
   if (
     input.pendingExitReason !== null
@@ -267,6 +275,7 @@ export function createCreationEntrySession(
     entryCursor,
     externalBuyTarget: input.externalBuyTarget,
     externalBuyCount: input.externalBuyCount,
+    externalMinimumBuyAmountRaw: input.externalMinimumBuyAmountRaw,
     countedTradeIds,
     countedBuyerWallets,
     lastCountedCursor,

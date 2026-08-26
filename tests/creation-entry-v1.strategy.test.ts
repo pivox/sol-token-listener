@@ -36,9 +36,40 @@ void test('opens one creation position and moves the V2 session to monitoring', 
 
   assert.equal(result.requestedAction, 'OPEN');
   assert.equal(result.session.payloadVersion, 2);
+  assert.equal(result.session.externalMinimumBuyAmountRaw, 1_000n);
   assert.equal(result.session.state, 'WAITING_EXTERNAL_BUYS');
   assert.equal(result.session.positionId, POSITION.id);
   assert.equal(ledger.openCalls.length, 1);
+});
+
+void test('keeps the persisted minimum buy threshold when runtime configuration changes', async () => {
+  const strictStrategy = new CreationEntryV1Strategy(
+    new FakeLedger(), new FakeRouter(),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const permissiveStrategy = new CreationEntryV1Strategy(
+    new FakeLedger(), new FakeRouter(),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1n },
+  );
+  const candidate = eligibleCandidate();
+  const session = strictStrategy.prepare(candidate, {
+    externalBuyTarget: 10, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(session);
+
+  const result = await permissiveStrategy.reconcile({
+    candidate,
+    session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    position: POSITION,
+    creator: 'creator',
+    launchTrades: [launchBuy('below-persisted-threshold', 2, 'wallet-a', 999n)],
+    marketTrades: [],
+    nowMs: 3_000,
+  });
+
+  assert.equal(result.session.externalMinimumBuyAmountRaw, 1_000n);
+  assert.equal(result.session.externalBuyCount, 0);
+  assert.deepEqual(result.session.countedBuyerWallets, []);
 });
 
 void test('counts one wallet once across repeated Pump.fun and PumpSwap buys', async () => {
