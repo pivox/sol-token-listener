@@ -105,12 +105,17 @@ void test('rejects creation entry after excessive slot lag or a creator sell', (
     buyQuote: quote('buy-lagged', 'SOL', 'MINT', 1_000n, 900n, 900n, 1_000, 43n),
     reverseSellQuote: quote('sell-lagged', 'MINT', 'SOL', 900n, 820n, 800n, 1_000, 43n),
   }));
+  const preLaunchQuote = service.create(candidateInput({
+    buyQuote: quote('buy-before-launch', 'SOL', 'MINT', 1_000n, 900n, 900n, 1_000, 9n),
+    reverseSellQuote: quote('sell-before-launch', 'MINT', 'SOL', 900n, 820n, 800n, 1_000, 9n),
+  }));
   const sold = service.create(candidateInput({
     snapshot: snapshot({ activeLaunchTrades: Object.freeze([creatorSell()]) }),
   }));
 
   assert.equal(lagged.candidate.state, 'NOT_ELIGIBLE');
   assert.deepEqual(lagged.candidate.reasonCodes, ['CREATION_ENTRY_REJECTED']);
+  assert.equal(preLaunchQuote.candidate.state, 'NOT_ELIGIBLE');
   assert.equal(sold.candidate.state, 'NOT_ELIGIBLE');
   assert.deepEqual(sold.candidate.reasonCodes, ['CREATION_ENTRY_REJECTED']);
 });

@@ -242,6 +242,48 @@ void test('keeps a mandatory exit pending when the full sell quote is unavailabl
   assert.equal(ledger.closeCalls.length, 0);
 });
 
+void test('recovers a committed creation close without quoting or closing twice', async () => {
+  const ledger = new FakeLedger();
+  const router = new FakeRouter(new Error('must not quote'));
+  const strategy = new CreationEntryV1Strategy(
+    ledger, router,
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const candidate = eligibleCandidate();
+  const session = strategy.prepare(candidate, {
+    externalBuyTarget: 1, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(session);
+  const committed = Object.freeze({
+    ...POSITION,
+    status: 'PAPER_CLOSED' as const,
+    remainingBaseRaw: 0n,
+    quoteProceedsRaw: 1_000n,
+    grossPnlQuoteRaw: 0n,
+    netPnlQuoteRaw: 0n,
+    exitTradeId: 'exit',
+    closeCommandHash: 'close',
+    closedAtMs: 4_000,
+    purgeAfterMs: 14_404_000,
+  });
+
+  const result = await strategy.reconcile({
+    candidate,
+    session: { ...session, state: 'WAITING_EXTERNAL_BUYS', positionId: POSITION.id },
+    position: committed,
+    creator: 'creator',
+    launchTrades: [launchBuy('external', 2, 'wallet-a', 2_000n)],
+    marketTrades: [],
+    nowMs: 5_000,
+  });
+
+  assert.equal(result.requestedAction, 'NONE');
+  assert.equal(result.session.state, 'PAPER_CLOSED');
+  assert.equal(result.session.reasonCode, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
+  assert.equal(router.requests.length, 0);
+  assert.equal(ledger.closeCalls.length, 0);
+});
+
 class FakeLedger {
   public readonly openCalls: OpenPaperPositionCommand[] = [];
   public readonly closeCalls: ClosePaperPositionCommand[] = [];

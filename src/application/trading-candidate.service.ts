@@ -142,11 +142,17 @@ export class TradingCandidateService {
       ?? this.options.maximumQuoteSlotLag;
     if (
       input.buyQuote !== null
-      && input.buyQuote.observedSlot - input.snapshot.launch.createdAt.slot > maximumSlotLag
+      && (
+        input.buyQuote.observedSlot < input.snapshot.launch.createdAt.slot
+        || input.buyQuote.observedSlot - input.snapshot.launch.createdAt.slot > maximumSlotLag
+      )
     ) return true;
     if (
       input.reverseSellQuote !== null
-      && input.reverseSellQuote.observedSlot - input.snapshot.launch.createdAt.slot > maximumSlotLag
+      && (
+        input.reverseSellQuote.observedSlot < input.snapshot.launch.createdAt.slot
+        || input.reverseSellQuote.observedSlot - input.snapshot.launch.createdAt.slot > maximumSlotLag
+      )
     ) return true;
     return input.snapshot.activeLaunchTrades.some((event) => (
       event.payload.trade.kind === 'SELL'

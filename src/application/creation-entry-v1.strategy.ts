@@ -326,7 +326,7 @@ export class CreationEntryV1Strategy {
       input.candidate.strategy.id !== 'creation-entry-v1'
       || input.session.candidateId !== input.candidate.id
       || input.position.id !== input.session.positionId
-      || input.position.status !== 'PAPER_HOLDING'
+      || !['PAPER_HOLDING', 'PAPER_CLOSED'].includes(input.position.status)
     ) throw new TypeError('Creation entry reconciliation is inconsistent.');
 
     let session = input.session;
@@ -358,6 +358,37 @@ export class CreationEntryV1Strategy {
         : 'CREATOR_EARLY_SELL';
     if (this.options.manualKillSwitch) trigger = candidateTrigger(input.candidate);
     else if (creatorSell !== null) trigger = creatorSell;
+
+    if (input.position.status === 'PAPER_CLOSED') {
+      if (
+        input.position.closedAtMs === null
+        || input.position.purgeAfterMs === null
+        || input.position.quoteProceedsRaw === null
+      ) throw new TypeError('Closed creation position is missing terminal evidence.');
+      const recoveredProfit = input.position.quoteProceedsRaw * 10_000n
+        >= input.position.quoteCostRaw * this.options.takeProfitMultiplierBps;
+      const recoveredReason: CreationExitReason | null = this.options.manualKillSwitch
+        ? 'MANUAL_KILL_SWITCH'
+        : creatorSell !== null
+          ? 'CREATOR_EARLY_SELL'
+          : recoveredProfit
+            ? 'TAKE_PROFIT_2X_EXECUTABLE'
+            : session.externalBuyCount >= session.externalBuyTarget
+              ? 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED'
+              : session.pendingExitReason;
+      if (recoveredReason === null) {
+        throw new TypeError('Closed creation position has no recoverable exit reason.');
+      }
+      const recovered = updateSession(input.candidate, session, {
+        state: 'PAPER_CLOSED',
+        reasonCode: recoveredReason,
+        pendingExitReason: recoveredReason,
+        lastError: null,
+        updatedAtMs: input.position.closedAtMs,
+        purgeAfterMs: input.position.purgeAfterMs,
+      });
+      return strategyResult(recovered, counted, input.position, trigger);
+    }
 
     let sellQuote;
     try {
