@@ -1,7 +1,7 @@
 # `creation-entry-v1` paper strategy design
 
-Date: 2026-08-26  
-Issue: #48  
+Date: 2026-08-26
+Issue: #48
 Status: approved through the standing instruction to select the recommended option
 
 ## Objective

@@ -46,7 +46,7 @@ assert.throws(() => parseConfig({ ...creation, PAPER_STRATEGY_ENABLED: 'true' })
 
 - [ ] **Step 2: Run the tests and verify RED**
 
-Run: `npx tsx --test --test-name-pattern='creation strategy' tests/config-safety.test.ts`  
+Run: `npx tsx --test --test-name-pattern='creation strategy' tests/config-safety.test.ts`
 Expected: FAIL because the creation fields do not exist.
 
 - [ ] **Step 3: Implement strict parsing**
@@ -63,7 +63,7 @@ do not add any wallet, signer, private key, or live-execution variable.
 
 - [ ] **Step 5: Run GREEN and commit**
 
-Run: `npx tsx --test tests/config-safety.test.ts`  
+Run: `npx tsx --test tests/config-safety.test.ts`
 Expected: all configuration tests pass.
 
 ```bash
@@ -115,7 +115,7 @@ assert.throws(() => createCreationEntrySession({
 
 - [ ] **Step 2: Run RED**
 
-Run: `npx tsx --test tests/paper-strategy-contracts.test.ts tests/trading-candidate-contracts.test.ts`  
+Run: `npx tsx --test tests/paper-strategy-contracts.test.ts tests/trading-candidate-contracts.test.ts`
 Expected: FAIL because V2 and the creation reasons are undefined.
 
 - [ ] **Step 3: Add explicit V1/V2 unions**
@@ -140,7 +140,7 @@ dependent on a `QUALIFIED` report with no blockers.
 
 - [ ] **Step 5: Run GREEN and commit**
 
-Run: `npx tsx --test tests/paper-strategy-contracts.test.ts tests/trading-candidate-contracts.test.ts`  
+Run: `npx tsx --test tests/paper-strategy-contracts.test.ts tests/trading-candidate-contracts.test.ts`
 Expected: all pass.
 
 ```bash
@@ -255,7 +255,7 @@ mint, orphaned status, and one wallet buying once on each venue.
 
 - [ ] **Step 2: Run RED**
 
-Run: `npx tsx --test tests/creation-entry-v1.strategy.test.ts`  
+Run: `npx tsx --test tests/creation-entry-v1.strategy.test.ts`
 Expected: FAIL because the creation strategy does not exist.
 
 - [ ] **Step 3: Implement canonical unique-wallet selection**
@@ -272,7 +272,7 @@ the existing retraction path handles a close whose trigger disappeared.
 
 - [ ] **Step 5: Run GREEN and commit**
 
-Run: `npx tsx --test tests/creation-entry-v1.strategy.test.ts tests/validated-external-buys.strategy.test.ts`  
+Run: `npx tsx --test tests/creation-entry-v1.strategy.test.ts tests/validated-external-buys.strategy.test.ts`
 Expected: all new and legacy strategy tests pass.
 
 ```bash
@@ -302,7 +302,7 @@ assert.equal(ledger.closeCalls.length, 1);
 
 - [ ] **Step 2: Run RED**
 
-Run: `npx tsx --test --test-name-pattern='2x|creator|kill|priority' tests/creation-entry-v1.strategy.test.ts`  
+Run: `npx tsx --test --test-name-pattern='2x|creator|kill|priority' tests/creation-entry-v1.strategy.test.ts`
 Expected: FAIL because exit arbitration is absent.
 
 - [ ] **Step 3: Add a pure exit selector**
@@ -331,7 +331,7 @@ close hash remains the authority; a committed terminal position is returned with
 
 - [ ] **Step 6: Run GREEN and commit**
 
-Run: `npx tsx --test tests/creation-entry-v1.strategy.test.ts tests/paper-trading-engine.test.ts`  
+Run: `npx tsx --test tests/creation-entry-v1.strategy.test.ts tests/paper-trading-engine.test.ts`
 Expected: all pass.
 
 ```bash
@@ -470,22 +470,22 @@ git commit -m "docs: expose creation strategy evidence (#48)"
 
 - [ ] **Step 1: Run formatting and generated-artifact guards**
 
-Run: `git diff --check && npm run docs:check`  
+Run: `git diff --check && npm run docs:check`
 Expected: exit 0.
 
 - [ ] **Step 2: Run compiler and lint gates**
 
-Run: `npm run build && npm run check && npm run lint`  
+Run: `npm run build && npm run check && npm run lint`
 Expected: exit 0; build packages 17 migrations.
 
 - [ ] **Step 3: Run the full PostgreSQL-backed test suite**
 
-Run: `TEST_DATABASE_URL=postgresql:///solanabot npm test`  
+Run: `TEST_DATABASE_URL=postgresql:///solanabot npm test`
 Expected: backend and frontend pass with zero failures and zero skipped PostgreSQL tests.
 
 - [ ] **Step 4: Run the deployment contract**
 
-Run: `npm run deployment:smoke`  
+Run: `npm run deployment:smoke`
 Expected: pass when Docker has sufficient disk. If local Docker reports `No space left on device`,
 record that environmental blocker and require the clean GitHub deployment-contract job to pass.
 
