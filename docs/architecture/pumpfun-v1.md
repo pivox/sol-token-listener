@@ -569,3 +569,30 @@ Le schéma frontend exige `pipeline.qualification` ainsi que
 affiche cet état et ces métriques bornées ; l’absence d’un champ requis est une
 dérive de contrat, tandis que les champs métier additifs restent acceptés selon
 les règles Zod V1.
+
+## Stratégie paper `creation-entry-v1`
+
+La stratégie réutilise le candidat canonique, le worker durable, le routeur de
+quotes et le ledger paper existants. Elle ne crée aucun second pipeline. Sa
+fenêtre est ancrée sur `TokenLaunchDetected.observedAtMs`, jamais sur une
+métadonnée ou une qualification tardive. Un SELL du créateur observé avant
+l'entrée rend le candidat inéligible.
+
+Après l'ouverture simulée, les BUY Pump.fun et PumpSwap actifs sont normalisés
+par curseur. Le créateur, les traders inconnus, les événements orphaned, les
+quote mints incohérents et les montants sous le seuil sont exclus. Un wallet
+n'est compté qu'une fois entre les deux venues. Cela mesure la diversité
+observée mais ne constitue pas une détection Sybil; le graphe de wallets reste
+une analyse séparée.
+
+L'arbitre de sortie est déterministe : kill switch manuel, vente du créateur,
+seuil ×2 exécutable, puis cible d'acheteurs uniques. Toute sortie exige une
+quote SELL fraîche couvrant exactement `remainingBaseRaw`. Le seuil ×2 compare
+en `bigint` le `minimumAmountOutRaw` au coût d'entrée. En cas d'indisponibilité,
+la session passe à `EXIT_PENDING_QUOTE`, conserve `pendingExitReason` et ne
+produit aucun fill. Les sessions, preuves, positions et événements terminaux
+sont purgés après quatre heures selon l'ordre enfant-avant-parent existant.
+
+Le kill switch ne signe rien : au démarrage, il ajoute idempotemment un job
+pour chaque session `creation-entry-v1` active afin que le worker tente la même
+sortie paper. `observe` ne crée toujours ni session, ni position, ni trade.

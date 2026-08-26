@@ -26,6 +26,7 @@ export const paperStrategy = {
   id: `paper_session_${'c'.repeat(64)}`,
   state: 'WAITING_EXTERNAL_BUYS',
   reasonCode: 'EXTERNAL_BUY_OBSERVED',
+  pendingExitReason: null,
   strategyId: 'validated-external-buys',
   strategyVersion: 1,
   positionId: 'paper-position-a',

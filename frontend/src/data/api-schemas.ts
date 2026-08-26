@@ -61,6 +61,14 @@ const paperReasonCodeSchema = z.enum([
   'QUALIFICATION_NOT_ELIGIBLE', 'ENTRY_WINDOW_EXPIRED', 'EVIDENCE_REVOKED',
   'QUALIFIED_ENTRY', 'EXTERNAL_BUY_OBSERVED', 'EXTERNAL_BUY_TARGET_REACHED',
   'EXIT_QUOTE_UNAVAILABLE', 'SOURCE_ORPHANED', 'RECONCILIATION_REQUIRED',
+  'CREATION_ENTRY_EXPIRED', 'CREATION_ENTRY_REJECTED',
+  'EXTERNAL_UNIQUE_BUY_OBSERVED', 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED',
+  'TAKE_PROFIT_2X_EXECUTABLE', 'CREATOR_EARLY_SELL', 'MANUAL_KILL_SWITCH',
+  'SELL_QUOTE_UNAVAILABLE_OR_STALE',
+]);
+const creationExitReasonSchema = z.enum([
+  'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED', 'TAKE_PROFIT_2X_EXECUTABLE',
+  'CREATOR_EARLY_SELL', 'MANUAL_KILL_SWITCH',
 ]);
 
 const scoreSchema = z.object({
@@ -101,6 +109,7 @@ const paperStrategySchema = z.object({
     'SELL_PENDING', 'PAPER_CLOSED', 'PAPER_RETRACTED', 'MANUAL_REVIEW',
   ]),
   reasonCode: paperReasonCodeSchema,
+  pendingExitReason: creationExitReasonSchema.nullable(),
   strategyId: z.string().min(1),
   strategyVersion: versionSchema,
   positionId: z.string().min(1).nullable(),

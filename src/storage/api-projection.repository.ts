@@ -56,6 +56,7 @@ import {
 } from '../domain/transaction-ingestion.js';
 import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
 import {
+  CREATION_EXIT_REASONS,
   PAPER_DECISION_REASON_CODES,
   PAPER_STRATEGY_SESSION_STATES,
 } from '../domain/paper-strategy.js';
@@ -745,7 +746,8 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
           session.state, session.reason_code, session.strategy_id,
           session.strategy_version, session.position_id, session.quote_mint,
           session.external_buy_target, session.external_buy_count,
-          session.minimum_confirmation, session.updated_at, session.payload
+          session.minimum_confirmation, session.updated_at, session.payload_version,
+          session.payload
          FROM paper_strategy_sessions AS session
          WHERE session.mint = ANY($1)
            AND (session.purge_after IS NULL OR session.purge_after > clock_timestamp())
@@ -1192,6 +1194,20 @@ function toTradingCandidate(row: Record<string, unknown>): ApiTradingCandidate {
 
 function toPaperStrategy(row: Record<string, unknown>): ApiPaperStrategyProgress {
   const payload = restoredRecord(row.payload);
+  const strategyId = text(row.strategy_id);
+  const payloadVersion = positiveSafeNumber(row.payload_version);
+  if (
+    (strategyId === 'creation-entry-v1' && payloadVersion !== 2)
+    || (strategyId !== 'creation-entry-v1' && payloadVersion !== 1)
+  ) throw invalid();
+  const pendingExitValue = payload.pendingExitReason;
+  const pendingExitReason = pendingExitValue === undefined || pendingExitValue === null
+    ? null
+    : validated(
+      pendingExitValue,
+      CREATION_EXIT_REASONS,
+    ) as ApiPaperStrategyProgress['pendingExitReason'];
+  if (strategyId !== 'creation-entry-v1' && pendingExitReason !== null) throw invalid();
   const lastErrorValue = payload.lastError;
   const lastError = lastErrorValue === null ? null : record(lastErrorValue);
   const lastErrorCode = lastError === null ? null : text(lastError.code);
@@ -1209,7 +1225,8 @@ function toPaperStrategy(row: Record<string, unknown>): ApiPaperStrategyProgress
       row.reason_code,
       PAPER_DECISION_REASON_CODES,
     ) as ApiPaperStrategyProgress['reasonCode'],
-    strategyId: text(row.strategy_id),
+    pendingExitReason,
+    strategyId,
     strategyVersion: positiveSafeNumber(row.strategy_version),
     positionId: nullableText(row.position_id),
     quoteMint: text(row.quote_mint),

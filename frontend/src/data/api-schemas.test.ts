@@ -61,6 +61,24 @@ describe('frontend-owned API V1 schemas', () => {
     expect(() => apiLaunchListEnvelopeSchema.parse({ ...success([launchSummary]), secret: 'unexpected' })).toThrow();
   });
 
+  it('accepts creation strategy reasons and requires a stable pending exit reason', () => {
+    const creation = {
+      ...launchSummary,
+      paperStrategy: {
+        ...launchSummary.paperStrategy,
+        strategyId: 'creation-entry-v1',
+        reasonCode: 'SELL_QUOTE_UNAVAILABLE_OR_STALE',
+        pendingExitReason: 'CREATOR_EARLY_SELL',
+      },
+    };
+    expect(apiLaunchListEnvelopeSchema.parse(success([creation])).data[0]
+      ?.paperStrategy?.pendingExitReason).toBe('CREATOR_EARLY_SELL');
+    expect(() => apiLaunchListEnvelopeSchema.parse(success([{
+      ...creation,
+      paperStrategy: { ...creation.paperStrategy, pendingExitReason: 'UNSTABLE_REASON' },
+    }]))).toThrow();
+  });
+
   it.each(DOMAIN_EVENT_TYPES)('accepts the stable event type %s', (type) => {
     expect(domainEventTypeSchema.parse(type)).toBe(type);
     expect(apiSseEventSchema.parse({ ...sseEvent, type }).type).toBe(type);
