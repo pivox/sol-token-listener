@@ -30,7 +30,7 @@ boundary converge through the idempotent inbox.
 
 ## Durable gap evidence
 
-Migration `015_listener_catch_up_gaps.sql` creates
+Migration `016_listener_catch_up_gaps.sql` creates
 `listener_catch_up_gaps`. Each row contains a deterministic SHA-256 identity,
 the program key, previous checkpoint, new baseline, observation time, and a
 four-hour purge deadline. The repository inserts the gap and advances the

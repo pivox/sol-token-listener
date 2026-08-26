@@ -10,7 +10,7 @@ import type {
   TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
-import { restoreNormalizedTransactionSnapshot } from '../src/domain/transaction-ingestion.js';
+import { createCatchUpGap, restoreNormalizedTransactionSnapshot } from '../src/domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
@@ -583,6 +583,36 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
     const secondPurge = await purgeExpiredFoundationData(pool);
     assert.equal(secondPurge.transactionInbox, 0);
     assert.equal(secondPurge.transactionInboxRecoveries, 1);
+  });
+});
+
+void test('records a catch-up gap and advances its checkpoint atomically and idempotently', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.storeCheckpoint(Object.freeze({
+      key: 'launchpad', slot: 40n, signature: 'previous', updatedAtMs: 300_000,
+    }));
+    const gap = createCatchUpGap(
+      Object.freeze({ key: 'launchpad', slot: 40n, signature: 'previous', updatedAtMs: 300_000 }),
+      Object.freeze({ key: 'launchpad', slot: 50n, signature: 'baseline', updatedAtMs: 301_000 }),
+      301_000,
+    );
+
+    await repository.recordCatchUpGap(gap);
+    await repository.recordCatchUpGap(gap);
+
+    assert.deepEqual(await repository.readCheckpoint('launchpad'), {
+      key: 'launchpad', slot: 50n, signature: 'baseline', updatedAtMs: 301_000,
+    });
+    const rows = await pool.query(
+      'SELECT gap_id,checkpoint_key,previous_slot,baseline_slot FROM listener_catch_up_gaps',
+    );
+    assert.deepEqual(rows.rows, [{
+      gap_id: gap.gapId,
+      checkpoint_key: 'launchpad',
+      previous_slot: '40',
+      baseline_slot: '50',
+    }]);
   });
 });
 

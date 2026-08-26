@@ -10,6 +10,7 @@ export type ExecutionMode = 'observe' | 'paper';
 export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
 export type PaperStrategyId = 'validated-external-buys';
 export type PaperMinimumConfirmation = 'confirmed' | 'finalized';
+export type ListenerCatchUpPolicy = 'live-edge' | 'strict';
 
 export interface AppConfig {
   readonly cluster: string;
@@ -41,6 +42,7 @@ export interface AppConfig {
   readonly dataRetentionHours: number;
   readonly listenerEnabled: boolean;
   readonly listenerWorkerLeaseSeconds: number;
+  readonly listenerCatchUpPolicy: ListenerCatchUpPolicy;
   readonly listenerCatchUpMaxPages: number;
   readonly listenerCatchUpPageSize: number;
   readonly listenerFinalityMissingPolls: number;
@@ -194,6 +196,12 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     listenerEnabled: parseBoolean(environment.LISTENER_ENABLED, true, 'LISTENER_ENABLED'),
     listenerWorkerLeaseSeconds: parseInteger(
       environment.LISTENER_WORKER_LEASE_SECONDS, 120, 'LISTENER_WORKER_LEASE_SECONDS', 30, 900,
+    ),
+    listenerCatchUpPolicy: parseClosedLiteral(
+      environment.LISTENER_CATCH_UP_POLICY,
+      'live-edge',
+      'LISTENER_CATCH_UP_POLICY',
+      ['live-edge', 'strict'],
     ),
     listenerCatchUpMaxPages: parseInteger(
       environment.LISTENER_CATCH_UP_MAX_PAGES, 20, 'LISTENER_CATCH_UP_MAX_PAGES', 1, 100,

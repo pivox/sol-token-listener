@@ -5,6 +5,7 @@ import {
 } from '../domain/confirmation-status.js';
 import {
   assertValidClaimedTransaction,
+  assertValidCatchUpGap,
   assertValidFinalityCandidate,
   assertValidFinalityPollObservation,
   assertValidFinalityRevision,
@@ -17,6 +18,7 @@ import {
   createDurableTransactionSnapshot,
   isCanonicalSolanaProgramId,
   type ClaimedTransaction,
+  type CatchUpGap,
   type DurableNormalizedTransaction,
   type FinalityCandidate,
   type FinalityPollObservation,
@@ -733,6 +735,89 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           [value.key, value.slot.toString(), value.signature, dateFromMs(value.updatedAtMs)],
         );
         requireOne(result.rowCount);
+      });
+    });
+  }
+
+  public async recordCatchUpGap(value: CatchUpGap): Promise<void> {
+    return this.safely(async () => {
+      assertValidCatchUpGap(value);
+      await this.transaction(async (client) => {
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended('transaction-checkpoint:' || $1, 0))",
+          [value.key],
+        );
+        const selected = await client.query(
+          `SELECT slot, signature FROM processing_checkpoints
+           WHERE checkpoint_key = $1 FOR UPDATE`,
+          [value.key],
+        );
+        const row = selected.rows[0];
+        if (row === undefined) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        const currentSlot = numericBigInt(row.slot, 'checkpoint slot');
+        const currentSignature = requiredText(row.signature, 'checkpoint signature');
+        const alreadyAdvanced = currentSlot === value.baselineSlot
+          && currentSignature === value.baselineSignature;
+        const expectedPrevious = currentSlot === value.previousSlot
+          && currentSignature === value.previousSignature;
+        if (!alreadyAdvanced && !expectedPrevious) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        const inserted = await client.query(
+          `INSERT INTO listener_catch_up_gaps (
+             gap_id, checkpoint_key, previous_slot, previous_signature,
+             baseline_slot, baseline_signature, observed_at, purge_after
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (gap_id) DO NOTHING`,
+          [
+            value.gapId,
+            value.key,
+            value.previousSlot.toString(),
+            value.previousSignature,
+            value.baselineSlot.toString(),
+            value.baselineSignature,
+            dateFromMs(value.observedAtMs),
+            dateFromMs(value.purgeAfterMs),
+          ],
+        );
+        if (inserted.rowCount !== 0 && inserted.rowCount !== 1) {
+          throw new TypeError('Catch-up gap insert count is invalid.');
+        }
+        if (alreadyAdvanced) {
+          const existing = await client.query(
+            `SELECT checkpoint_key,previous_slot,previous_signature,baseline_slot,
+               baseline_signature,observed_at,purge_after
+             FROM listener_catch_up_gaps WHERE gap_id = $1`,
+            [value.gapId],
+          );
+          const gap = existing.rows[0];
+          if (gap?.checkpoint_key !== value.key
+            || numericBigInt(gap.previous_slot, 'gap previous slot') !== value.previousSlot
+            || requiredText(gap.previous_signature, 'gap previous signature') !== value.previousSignature
+            || numericBigInt(gap.baseline_slot, 'gap baseline slot') !== value.baselineSlot
+            || requiredText(gap.baseline_signature, 'gap baseline signature') !== value.baselineSignature
+            || dateMs(gap.observed_at, 'gap observed at') !== value.observedAtMs
+            || dateMs(gap.purge_after, 'gap purge after') !== value.purgeAfterMs) {
+            throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+          }
+          return;
+        }
+        const updated = await client.query(
+          `UPDATE processing_checkpoints SET
+             slot = $2, signature = $3, updated_at = $4
+           WHERE checkpoint_key = $1 AND slot = $5 AND signature = $6`,
+          [
+            value.key,
+            value.baselineSlot.toString(),
+            value.baselineSignature,
+            dateFromMs(value.observedAtMs),
+            value.previousSlot.toString(),
+            value.previousSignature,
+          ],
+        );
+        requireOne(updated.rowCount);
       });
     });
   }

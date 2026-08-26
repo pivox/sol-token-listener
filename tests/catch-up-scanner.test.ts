@@ -14,6 +14,7 @@ import {
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import type {
+  CatchUpGap,
   ProcessingCheckpoint,
   TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
@@ -148,6 +149,77 @@ void test('throws on a full max-page restart window and performs no durable writ
   });
   assert.deepEqual(inbox.enqueued, []);
   assert.deepEqual(inbox.stored, []);
+});
+
+void test('strict mode rejects a missing checkpoint even when RPC history is exhausted', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('only-current', 50)]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  });
+  const inbox = new FakeInbox({ launchpad: checkpoint('launchpad', 'missing', 40) });
+
+  await assert.rejects(
+    scanner(source, inbox, { pageSize: 2, policy: 'strict' }).scan(),
+    (error) => error instanceof CatchUpWindowExceededError && error.program === 'launchpad',
+  );
+  assert.deepEqual(inbox.enqueued, []);
+  assert.deepEqual(inbox.stored, []);
+  assert.deepEqual(inbox.gaps, []);
+});
+
+void test('rebaselines one stale live-edge page without enqueueing abandoned history', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch-newest', 50), sig('launch-recent', 49)]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  });
+  const inbox = new FakeInbox({ launchpad: checkpoint('launchpad', 'stale', 40) });
+
+  const result = await scanner(source, inbox, {
+    pageSize: 2,
+    maxPages: 20,
+    policy: 'live-edge',
+  }).scan();
+
+  assert.deepEqual(source.calls, [
+    [PUMP_PROGRAM_ID, undefined, 2],
+    [PUMPSWAP_PROGRAM_ID, undefined, 2],
+  ]);
+  assert.deepEqual(inbox.enqueued, []);
+  assert.equal(inbox.gaps.length, 1);
+  assert.deepEqual(inbox.gaps[0], {
+    gapId: inbox.gaps[0]?.gapId,
+    key: 'launchpad',
+    previousSlot: 40n,
+    previousSignature: 'stale',
+    baselineSlot: 50n,
+    baselineSignature: 'launch-newest',
+    observedAtMs: 9_000,
+    purgeAfterMs: 14_409_000,
+  });
+  assert.match(inbox.gaps[0]?.gapId ?? '', /^catchup_gap_[a-f0-9]{64}$/u);
+  assert.deepEqual(result, {
+    discoveredCount: 0,
+    enqueuedCount: 0,
+    checkpointWriteCount: 1,
+    pageCount: 2,
+  });
+});
+
+void test('keeps a recent live-edge checkpoint lossless within the first page', async () => {
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('newest', 12), sig('boundary', 11)]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  });
+  const inbox = new FakeInbox({ launchpad: checkpoint('launchpad', 'boundary', 11) });
+
+  await scanner(source, inbox, { pageSize: 2, policy: 'live-edge' }).scan();
+
+  assert.deepEqual(inbox.enqueued.map(({ signature }) => signature), ['newest']);
+  assert.deepEqual(inbox.gaps, []);
+  assert.deepEqual(source.calls, [
+    [PUMP_PROGRAM_ID, undefined, 2],
+    [PUMPSWAP_PROGRAM_ID, undefined, 2],
+  ]);
 });
 
 void test('rejects pagination cursor cycles and repeated rows', async () => {
@@ -392,11 +464,16 @@ void test('rejects hostile checkpoints without invoking accessors or leaking val
 function scanner(
   source: CatchUpSource,
   inbox: FakeInbox,
-  options: { readonly pageSize?: number; readonly maxPages?: number } = {},
+  options: {
+    readonly pageSize?: number;
+    readonly maxPages?: number;
+    readonly policy?: 'live-edge' | 'strict';
+  } = {},
 ): CatchUpScanner {
   return new CatchUpScanner(source, inbox, {
     pageSize: options.pageSize ?? 2,
     maxPages: options.maxPages ?? 3,
+    policy: options.policy ?? 'strict',
     now: () => 9_000,
   });
 }
@@ -437,9 +514,13 @@ class FakeSource implements CatchUpSource {
   }
 }
 
-class FakeInbox implements Pick<TransactionInboxRepository, 'enqueue' | 'readCheckpoint' | 'storeCheckpoint'> {
+class FakeInbox implements Pick<
+TransactionInboxRepository,
+'enqueue' | 'readCheckpoint' | 'storeCheckpoint' | 'recordCatchUpGap'
+> {
   readonly enqueued: TransactionNotification[] = [];
   readonly stored: ProcessingCheckpoint[] = [];
+  readonly gaps: CatchUpGap[] = [];
   failEnqueueAt: number | null = null;
   failCheckpointAt: number | null = null;
 
@@ -457,6 +538,16 @@ class FakeInbox implements Pick<TransactionInboxRepository, 'enqueue' | 'readChe
   async storeCheckpoint(value: ProcessingCheckpoint): Promise<void> {
     if (this.failCheckpointAt === this.stored.length + 1) throw new Error('secret checkpoint');
     this.stored.push(value);
+  }
+
+  async recordCatchUpGap(value: CatchUpGap): Promise<void> {
+    this.gaps.push(value);
+    this.checkpoints[value.key] = Object.freeze({
+      key: value.key,
+      slot: value.baselineSlot,
+      signature: value.baselineSignature,
+      updatedAtMs: value.observedAtMs,
+    });
   }
 }
 

@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { parseConfig } from '../src/config/env.js';
 import type { TokenLaunch } from '../src/domain/types.js';
+import { createCatchUpGap } from '../src/domain/transaction-ingestion.js';
 import type { getDatabasePool } from '../src/storage/database.js';
 import {
   BondingCurveReadUnavailableError,
@@ -11,9 +12,30 @@ import {
   PersistentListenerHeartbeat,
   RecurringFinalityReconciler,
   createProductionListenerRuntime,
+  catchUpGapLogContext,
   createUnavailableBondingCurveReader,
   type ListenerRuntimeScheduler,
 } from '../src/application/production-listener-factory.js';
+
+void test('builds a redacted structured live-edge gap warning', () => {
+  const gap = createCatchUpGap(
+    Object.freeze({ key: 'launchpad', slot: 40n, signature: 'secret-old', updatedAtMs: 1_000 }),
+    Object.freeze({ key: 'launchpad', slot: 50n, signature: 'secret-new', updatedAtMs: 2_000 }),
+    2_000,
+  );
+
+  const context = catchUpGapLogContext(gap, 'live-edge');
+
+  assert.deepEqual(context, {
+    event: 'listener.catch_up_gap_recorded',
+    program: 'launchpad',
+    previousSlot: '40',
+    baselineSlot: '50',
+    policy: 'live-edge',
+  });
+  assert.ok(Object.isFrozen(context));
+  assert.doesNotMatch(JSON.stringify(context), /secret-old|secret-new/u);
+});
 
 void test('composes the passive production listener without opening resources', () => {
   const runtime = createProductionListenerRuntime(
@@ -66,6 +88,8 @@ void test('production factory has no transaction execution or Raydium builder pa
   );
 
   assert.doesNotMatch(source, /(?:sendRawTransaction|sendTransaction|transaction-builder|execution\/wallet|\.\.\/execution\/|raydium)/iu);
+  assert.match(source, /policy: config\.listenerCatchUpPolicy/u);
+  assert.match(source, /listener\.catch_up_gap_recorded/u);
 });
 
 void test('production composes one canonical qualification writer before paper decisions', async () => {

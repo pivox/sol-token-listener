@@ -1,5 +1,6 @@
 import type {
   ClaimedTransaction,
+  CatchUpGap,
   FinalityCandidate,
   FinalityPollObservation,
   FinalityRevision,
@@ -41,6 +42,7 @@ export interface TransactionInboxRepository {
   enqueueRevision(value: FinalityRevision): Promise<void>;
   readCheckpoint(key: 'launchpad' | 'market'): Promise<ProcessingCheckpoint | null>;
   storeCheckpoint(value: ProcessingCheckpoint): Promise<void>;
+  recordCatchUpGap(value: CatchUpGap): Promise<void>;
   writeHeartbeat(value: RuntimeHeartbeat): Promise<void>;
   counts(): Promise<InboxCounts>;
 }

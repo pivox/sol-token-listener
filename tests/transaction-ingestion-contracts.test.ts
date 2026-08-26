@@ -17,6 +17,7 @@ import {
   MAX_TRANSACTION_SNAPSHOT_STRING_LENGTH,
   TRANSACTION_INBOX_STATUSES,
   assertValidClaimedTransaction,
+  assertValidCatchUpGap,
   assertValidFinalityCandidate,
   assertValidFinalityPollObservation,
   assertValidIngestionFailure,
@@ -26,8 +27,10 @@ import {
   assertValidRuntimeHeartbeat,
   assertValidTransactionNotification,
   createDurableTransactionSnapshot,
+  createCatchUpGap,
   restoreNormalizedTransactionSnapshot,
   type ClaimedTransaction,
+  type CatchUpGap,
   type FinalityCandidate,
   type FinalityPollObservation,
   type IngestionFailure,
@@ -40,6 +43,63 @@ import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
 const observedAtMs = 1_720_000_000_000;
+
+void test('creates one deterministic frozen four-hour catch-up gap', () => {
+  const previous = Object.freeze({
+    key: 'launchpad' as const,
+    slot: 40n,
+    signature: 'previous-signature',
+    updatedAtMs: observedAtMs - 1_000,
+  });
+  const baseline = Object.freeze({
+    key: 'launchpad' as const,
+    slot: 50n,
+    signature: 'baseline-signature',
+    updatedAtMs: observedAtMs,
+  });
+
+  const first = createCatchUpGap(previous, baseline, observedAtMs);
+  const replay = createCatchUpGap(previous, baseline, observedAtMs + 1_000);
+
+  assert.match(first.gapId, /^catchup_gap_[a-f0-9]{64}$/u);
+  assert.equal(first.gapId, replay.gapId);
+  assert.equal(first.purgeAfterMs, observedAtMs + 14_400_000);
+  assert.ok(Object.isFrozen(first));
+  assert.doesNotThrow(() => { assertValidCatchUpGap(first); });
+});
+
+void test('rejects mutable, regressive, mismatched and malformed catch-up gaps', () => {
+  const canonical: CatchUpGap = createCatchUpGap(
+    Object.freeze({ key: 'market', slot: 40n, signature: 'old', updatedAtMs: observedAtMs - 1 }),
+    Object.freeze({ key: 'market', slot: 50n, signature: 'new', updatedAtMs: observedAtMs }),
+    observedAtMs,
+  );
+  const cases: unknown[] = [
+    { ...canonical },
+    Object.freeze({ ...canonical, gapId: 'catchup_gap_bad' }),
+    Object.freeze({ ...canonical, baselineSlot: 39n }),
+    Object.freeze({ ...canonical, purgeAfterMs: canonical.purgeAfterMs + 1 }),
+  ];
+  for (const value of cases) {
+    assert.throws(() => { assertValidCatchUpGap(value); }, /Catch-up gap/u);
+  }
+  assert.throws(
+    () => createCatchUpGap(
+      Object.freeze({ key: 'launchpad', slot: 40n, signature: 'old', updatedAtMs: observedAtMs }),
+      Object.freeze({ key: 'market', slot: 50n, signature: 'new', updatedAtMs: observedAtMs }),
+      observedAtMs,
+    ),
+    /Catch-up gap/u,
+  );
+  assert.throws(
+    () => createCatchUpGap(
+      Object.freeze({ key: 'launchpad', slot: 40n, signature: 'x'.repeat(129), updatedAtMs: observedAtMs }),
+      Object.freeze({ key: 'launchpad', slot: 50n, signature: 'new', updatedAtMs: observedAtMs }),
+      observedAtMs,
+    ),
+    /Catch-up gap/u,
+  );
+});
 
 void test('publishes exact frozen ingestion status constants', () => {
   assert.deepEqual(TRANSACTION_INBOX_STATUSES, [

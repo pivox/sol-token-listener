@@ -28,7 +28,7 @@
 ### Task 2: Persist gaps atomically
 
 **Files:**
-- Create: `migrations/015_listener_catch_up_gaps.sql`
+- Create: `migrations/016_listener_catch_up_gaps.sql`
 - Modify: `src/storage/transaction-inbox.repository.ts`
 - Modify: `src/storage/database.ts`
 - Test: `tests/transaction-ingestion-migration.test.ts`

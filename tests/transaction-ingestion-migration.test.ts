@@ -7,6 +7,27 @@ import { PublicKey } from '@solana/web3.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 
 const migrationUrl = new URL('../migrations/009_transaction_ingestion.sql', import.meta.url);
+const catchUpGapMigrationUrl = new URL('../migrations/016_listener_catch_up_gaps.sql', import.meta.url);
+
+void test('creates replayable four-hour catch-up gap evidence', async () => {
+  const sql = await readFile(catchUpGapMigrationUrl, 'utf8');
+
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS listener_catch_up_gaps/u);
+  assert.match(sql, /gap_id TEXT PRIMARY KEY/u);
+  assert.match(sql, /checkpoint_key TEXT NOT NULL/u);
+  assert.match(sql, /previous_slot NUMERIC\(78,0\) NOT NULL/u);
+  assert.match(sql, /baseline_slot NUMERIC\(78,0\) NOT NULL/u);
+  assert.match(sql, /observed_at TIMESTAMPTZ NOT NULL/u);
+  assert.match(sql, /purge_after TIMESTAMPTZ NOT NULL/u);
+  assert.match(sql, /purge_after = observed_at \+ INTERVAL '4 hours'/u);
+  assert.match(sql, /checkpoint_key IN \('launchpad', 'market'\)/u);
+  assert.match(sql, /baseline_slot >= previous_slot/u);
+  assert.match(sql, /OCTET_LENGTH\(previous_signature\) BETWEEN 1 AND 128/u);
+  assert.match(sql, /OCTET_LENGTH\(baseline_signature\) BETWEEN 1 AND 128/u);
+  assert.match(sql, /listener_catch_up_gaps_purge_idx/u);
+  assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
+  assert.doesNotMatch(sql, /DROP TABLE|private[_ ]?key|send[_ ]?transaction/iu);
+});
 
 void test('creates a replayable bigint-safe transaction inbox with strict lifecycle checks', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
@@ -106,6 +127,7 @@ void test('defines the transaction inbox port at the canonical snapshot conversi
     'enqueueRevision',
     'readCheckpoint',
     'storeCheckpoint',
+    'recordCatchUpGap',
     'writeHeartbeat',
     'counts',
   ]) assert.match(source, new RegExp(`\\b${method}\\(`, 'u'));
@@ -146,7 +168,7 @@ void test('purges every retained terminal inbox row and exposes their count', as
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
 
-void test('applies migrations 001-014 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-016 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -162,7 +184,7 @@ void test('applies migrations 001-014 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '015_paper_active_session_per_mint.sql');
+    assert.equal(applied.at(-1), '016_listener_catch_up_gaps.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
