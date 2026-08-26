@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   createPaperMvpPositionSample,
+  createPaperMvpReport,
   type PaperMvpPositionSample,
   type PaperMvpProviderUsage,
 } from '../domain/paper-mvp.js';
@@ -17,6 +18,7 @@ import type {
   PaperMvpUnknownPosition,
   PaperMvpUnknownReason,
 } from '../ports/paper-mvp-repository.js';
+import { canonicalStringifyJson } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 
 type Row = Readonly<Record<string, unknown>>;
@@ -162,30 +164,14 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
     return this.transaction('load', async (client) => {
       const run = await selectRun(client, runId, false);
       if (run === null) return null;
-      const result = await client.query(
-        `SELECT * FROM paper_mvp_position_samples WHERE run_id=$1
-         ORDER BY paper_sell_at NULLS LAST,position_id`, [runId],
-      );
-      const samples: PaperMvpPositionSample[] = [];
-      const unknownPositions: PaperMvpUnknownPosition[] = [];
-      for (const row of result.rows) {
-        const status = text(row.sample_status, 'sample status');
-        if (status === 'VALID') samples.push(sampleFromRow(row));
-        else if (status === 'UNKNOWN') unknownPositions.push(Object.freeze({
-          positionId: text(row.position_id, 'position id'),
-          reason: unknownReason(row.unknown_reason),
-        }));
-        else throw new PaperMvpRepositoryError('load');
-      }
-      if (unknownPositions.length !== run.counters.unknownTerminalPositions) {
-        throw new PaperMvpRepositoryError('load');
-      }
+      const observations = await selectObservations(client, runId);
+      assertObservationCounts(run, observations);
       return Object.freeze({
         run,
-        samples: Object.freeze(samples),
-        unknownPositions: Object.freeze(unknownPositions),
+        samples: observations.samples,
+        unknownPositions: observations.unknownPositions,
       });
-    });
+    }, 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
   }
 
   public async terminalize(input: PaperMvpTerminalization): Promise<PaperMvpRun> {
@@ -194,7 +180,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       await lockRun(client, input.runId);
       const before = await selectRun(client, input.runId, true);
       if (before === null) throw new PaperMvpConflictError('RUN_NOT_ACTIVE');
-      const reportJson = input.report === null ? null : JSON.stringify(input.report);
+      let reportJson = input.report === null ? null : canonicalStringifyJson(input.report);
       if (before.state !== 'RUNNING') {
         const stored = await client.query(
           `SELECT state,terminal_at,failure_code,
@@ -211,7 +197,30 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       if (input.terminalAtMs < before.updatedAtMs) {
         throw new TypeError('Paper MVP terminalAtMs is invalid.');
       }
-      if (input.state === 'COMPLETED') assertReportMatches(input, before);
+      if (input.state === 'COMPLETED') {
+        const observations = await selectObservations(client, input.runId);
+        assertObservationCounts(before, observations);
+        const canonicalReport = createPaperMvpReport({
+          runId: before.runId,
+          startedAtMs: before.startedAtMs,
+          completedAtMs: input.terminalAtMs,
+          targetClosedPositions: before.configuration.targetClosedPositions,
+          initialCapitalRaw: before.configuration.initialCapitalRaw,
+          quoteMint: before.configuration.quoteMint,
+          creationsObserved: before.counters.creationsObserved,
+          entriesRejected: before.counters.entriesRejected,
+          samples: observations.samples,
+          unknownTerminalPositions: observations.unknownPositions.length,
+          duplicateLogicalBuys: before.counters.duplicateLogicalBuys,
+          duplicateLogicalSells: before.counters.duplicateLogicalSells,
+          providerUsage: before.providerUsage,
+        });
+        const canonicalReportJson = canonicalStringifyJson(canonicalReport);
+        if (canonicalStringifyJson(input.report) !== canonicalReportJson) {
+          throw new PaperMvpConflictError('TERMINALIZATION_CONTRADICTION');
+        }
+        reportJson = canonicalReportJson;
+      }
       const result = await client.query(
         `UPDATE paper_mvp_runs run SET state=$2,terminal_at=$3::timestamptz,
           purge_after=$3::timestamptz + INTERVAL '4 hours',updated_at=$3::timestamptz,
@@ -229,6 +238,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
   private async transaction<TResult>(
     operation: Operation,
     action: (client: Client) => Promise<TResult>,
+    beginStatement = 'BEGIN',
   ): Promise<TResult> {
     let client: Client;
     try {
@@ -237,7 +247,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       throw new PaperMvpRepositoryError(operation);
     }
     try {
-      await client.query('BEGIN');
+      await client.query(beginStatement);
       const result = await action(client);
       await client.query('COMMIT');
       return result;
@@ -249,6 +259,46 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
     } finally {
       client.release();
     }
+  }
+}
+
+interface PersistedObservations {
+  readonly samples: readonly PaperMvpPositionSample[];
+  readonly unknownPositions: readonly PaperMvpUnknownPosition[];
+}
+
+async function selectObservations(
+  client: Client,
+  runId: string,
+): Promise<PersistedObservations> {
+  const result = await client.query(
+    `SELECT * FROM paper_mvp_position_samples WHERE run_id=$1
+     ORDER BY paper_sell_at NULLS LAST,position_id`, [runId],
+  );
+  const samples: PaperMvpPositionSample[] = [];
+  const unknownPositions: PaperMvpUnknownPosition[] = [];
+  for (const row of result.rows) {
+    const status = text(row.sample_status, 'sample status');
+    if (status === 'VALID') samples.push(sampleFromRow(row));
+    else if (status === 'UNKNOWN') unknownPositions.push(Object.freeze({
+      positionId: text(row.position_id, 'position id'),
+      reason: unknownReason(row.unknown_reason),
+    }));
+    else throw new PaperMvpRepositoryError('load');
+  }
+  return Object.freeze({
+    samples: Object.freeze(samples),
+    unknownPositions: Object.freeze(unknownPositions),
+  });
+}
+
+function assertObservationCounts(
+  run: PaperMvpRun,
+  observations: PersistedObservations,
+): void {
+  if (observations.samples.length !== run.closedPositions
+    || observations.unknownPositions.length !== run.counters.unknownTerminalPositions) {
+    throw new PaperMvpRepositoryError('load');
   }
 }
 
@@ -396,24 +446,6 @@ function validateTerminalization(value: PaperMvpTerminalization): void {
   if (value.state === 'FAILED') boundedText(value.failureCode, 'failure code');
   else if (value.report.runId !== value.runId) {
     throw new TypeError('Paper MVP terminalization is invalid.');
-  }
-}
-
-function assertReportMatches(value: Extract<PaperMvpTerminalization, { state: 'COMPLETED' }>, run: PaperMvpRun): void {
-  const report = value.report;
-  if (Date.parse(report.startedAt) !== run.startedAtMs
-    || Date.parse(report.completedAt) !== value.terminalAtMs
-    || report.targetClosedPositions !== run.configuration.targetClosedPositions
-    || report.closedPositions !== run.closedPositions
-    || report.creationsObserved !== run.counters.creationsObserved
-    || report.entriesRejected !== run.counters.entriesRejected
-    || report.unknownTerminalPositions !== run.counters.unknownTerminalPositions
-    || report.duplicateLogicalBuys !== run.counters.duplicateLogicalBuys
-    || report.duplicateLogicalSells !== run.counters.duplicateLogicalSells
-    || report.creditsUsedStartRaw !== (run.providerUsage.creditsUsedStart?.toString() ?? null)
-    || report.creditsUsedEndRaw !== (run.providerUsage.creditsUsedEnd?.toString() ?? null)
-    || report.rateLimitedCount !== run.providerUsage.rateLimitedCount) {
-    throw new TypeError('Paper MVP report does not match its run.');
   }
 }
 

@@ -67,6 +67,89 @@ void test('rejects invalid financial configuration before opening PostgreSQL', a
   assert.equal(connected, false);
 });
 
+void test('loads one repeatable read snapshot while progress commits concurrently', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL snapshot test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const writer = new PostgresPaperMvpRepository(pool);
+    const run = await writer.startOrResume(configuration, 1_000);
+    let selectedRun: (() => void) | undefined;
+    const runSelected = new Promise<void>((resolve) => { selectedRun = resolve; });
+    let resumeRead: (() => void) | undefined;
+    const readMayContinue = new Promise<void>((resolve) => { resumeRead = resolve; });
+    const reader = new PostgresPaperMvpRepository({
+      connect: async () => {
+        const client = await pool.connect();
+        return {
+          query: async (text: string, values?: readonly unknown[]) => {
+            const result = await client.query(text, values === undefined ? [] : [...values]);
+            if (text.includes('FROM paper_mvp_runs run WHERE run.run_id=$1')) {
+              selectedRun?.();
+              await readMayContinue;
+            }
+            return result;
+          },
+          release: () => { client.release(); },
+        };
+      },
+    });
+
+    const loading = reader.load(run.runId);
+    await runSelected;
+    await writer.recordProgress({
+      runId: run.runId, observedAtMs: 2_000, counters: progressCounters,
+      providerUsage: Object.freeze({
+        status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 101n,
+        rateLimitedCount: 0,
+      }),
+      samples: Object.freeze([sample()]), unknownPositions: Object.freeze([]),
+    });
+    resumeRead?.();
+    const snapshot = await loading;
+    assert.ok(snapshot);
+    assert.equal(snapshot.run.closedPositions, 0);
+    assert.equal(snapshot.samples.length, 0);
+  });
+});
+
+void test('rejects a report not canonically rebuilt from durable samples', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL durable report test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(configuration, 1_000);
+    const usage = Object.freeze({
+      status: 'AVAILABLE' as const, creditsUsedStart: 100n, creditsUsedEnd: 101n,
+      rateLimitedCount: 0,
+    });
+    await repository.recordProgress({
+      runId: run.runId, observedAtMs: 2_000, counters: progressCounters,
+      providerUsage: usage, samples: Object.freeze([losingSample()]),
+      unknownPositions: Object.freeze([]),
+    });
+    const fabricatedPass = createPaperMvpReport({
+      runId: run.runId, startedAtMs: run.startedAtMs, completedAtMs: 3_000,
+      targetClosedPositions: 1, initialCapitalRaw: configuration.initialCapitalRaw,
+      quoteMint: configuration.quoteMint, creationsObserved: 1, entriesRejected: 0,
+      samples: Object.freeze([sample()]), unknownTerminalPositions: 0,
+      duplicateLogicalBuys: 0, duplicateLogicalSells: 0, providerUsage: usage,
+    });
+    assert.equal(fabricatedPass.verdict, 'PASS');
+
+    await assert.rejects(repository.terminalize({
+      runId: run.runId, terminalAtMs: 3_000, state: 'COMPLETED',
+      report: fabricatedPass, failureCode: null,
+    }), isConflict('TERMINALIZATION_CONTRADICTION'));
+    assert.equal((await repository.load(run.runId))?.run.state, 'RUNNING');
+  });
+});
+
 void test('starts or resumes exactly, persists progress atomically, terminalizes and purges', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -173,6 +256,11 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       runId: run.runId, terminalAtMs: 3_000, state: 'COMPLETED', report,
       failureCode: null,
     })).state, 'COMPLETED');
+    await assert.rejects(
+      pool.query(`UPDATE paper_mvp_runs SET entries_rejected=entries_rejected+1
+        WHERE run_id=$1`, [run.runId]),
+      /terminal.*immutable/iu,
+    );
 
     const unavailableRun = await repository.startOrResume(configuration, 4_000);
     const unavailableReport = createPaperMvpReport({
@@ -188,10 +276,20 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       report: unavailableReport, failureCode: null,
     })).state, 'COMPLETED');
 
-    await pool.query("UPDATE paper_mvp_runs SET terminal_at=NOW()-INTERVAL '5 hours', purge_after=NOW()-INTERVAL '1 hour'");
+    const failedRun = await repository.startOrResume(configuration, 6_000);
+    assert.equal((await repository.terminalize({
+      runId: failedRun.runId, terminalAtMs: 7_000, state: 'FAILED',
+      report: null, failureCode: 'SOURCE_CONTRADICTION',
+    })).state, 'FAILED');
+    await assert.rejects(
+      pool.query(`UPDATE paper_mvp_runs SET provider_rate_limited_count=1
+        WHERE run_id=$1`, [failedRun.runId]),
+      /terminal.*immutable/iu,
+    );
+
     const purged = await purgeExpiredFoundationData(pool);
     assert.equal(purged.paperMvpSamples, 2);
-    assert.equal(purged.paperMvpRuns, 2);
+    assert.equal(purged.paperMvpRuns, 3);
     assert.equal((await pool.query('SELECT 1 FROM paper_mvp_position_samples')).rowCount, 0);
     assert.equal((await pool.query('SELECT 1 FROM paper_mvp_runs')).rowCount, 0);
   });
@@ -208,6 +306,14 @@ function sample() {
     buyPriceImpactBps: 20n, sellAmountInRaw: 90n, sellAmountOutRaw: 30_001n,
     sellMinimumAmountOutRaw: 30_000n, sellFeesRaw: 1n, sellSlippageBps: 10n,
     sellPriceImpactBps: 20n, networkFeeRawPerTransaction: 5_000n,
+  });
+}
+
+function losingSample() {
+  return createPaperMvpPositionSample({
+    ...sample(),
+    sellAmountOutRaw: 19_001n,
+    sellMinimumAmountOutRaw: 19_000n,
   });
 }
 

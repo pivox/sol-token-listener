@@ -171,6 +171,9 @@ CREATE TRIGGER paper_mvp_position_samples_immutable_trigger
 CREATE OR REPLACE FUNCTION prevent_paper_mvp_run_immutable_mutation()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
+  IF OLD.state IN ('COMPLETED','FAILED') THEN
+    RAISE EXCEPTION 'paper MVP terminal run is immutable';
+  END IF;
   IF ROW(
     NEW.strategy_id,NEW.strategy_version,NEW.quote_mint,NEW.target_closed_positions,
     NEW.initial_capital_raw,NEW.network_fee_raw_per_transaction,NEW.max_duration_ms,
