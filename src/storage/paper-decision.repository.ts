@@ -3,7 +3,10 @@ import { compareCursors } from '../domain/cursor.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { BondingCurveTradeObservedEventV1 } from '../domain/launchpad-events.js';
 import type { MarketTrade } from '../domain/market.js';
-import type { PaperStrategySessionV1 } from '../domain/paper-strategy.js';
+import type {
+  PaperStrategySession,
+  PaperStrategySessionV1,
+} from '../domain/paper-strategy.js';
 import type { PaperPosition } from '../domain/paper-trading.js';
 import type { CreatorProfile, HolderDistribution } from '../domain/participant-analytics.js';
 import type { TokenMetadataSnapshot } from '../domain/pumpfun-observation.js';
@@ -559,6 +562,10 @@ async function writeDecision(
     await upsertSession(client, job, result.session, result.sessionEvent.id);
   }
   const countedBuyPurgeAfter = result.session === null ? null : sessionPurgeAfter(result.session);
+  const countedBuyStrategyId = result.session?.strategy.id ?? null;
+  if (result.countedExternalBuys.length > 0 && countedBuyStrategyId === null) {
+    throw new TypeError('External buy strategy identity is missing.');
+  }
   for (const evidence of result.countedExternalBuys) {
     const source = await client.query(`SELECT event_id,program,signature,blockchain_time
       FROM raw_chain_events
@@ -585,14 +592,20 @@ async function writeDecision(
       payload:Object.freeze({ sessionId:evidence.sessionId,tradeId:evidence.tradeId }),
     });
     await insertDomainEventWithRaw(client, rawEventId, countedEvent);
+    const quoteAmountRaw = 'quoteAmountRaw' in evidence
+      && typeof evidence.quoteAmountRaw === 'bigint'
+      ? evidence.quoteAmountRaw.toString()
+      : null;
     await client.query(`INSERT INTO paper_external_buy_events (
-      session_id,trade_id,source_event_id,mint,quote_mint,trader,slot,
+      session_id,trade_id,source_event_id,mint,quote_mint,trader,
+      strategy_id,quote_amount_raw,slot,
       transaction_index,instruction_index,inner_instruction_index,
       confirmation_status,observed_at,purge_after,payload_version,payload
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,$14)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1,$16)
     ON CONFLICT (session_id,trade_id) DO NOTHING`, [
       evidence.sessionId,evidence.tradeId,countedEvent.id,evidence.mint,evidence.quoteMint,
-      evidence.trader,evidence.cursor.slot.toString(),evidence.cursor.transactionIndex,
+      evidence.trader,countedBuyStrategyId,quoteAmountRaw,evidence.cursor.slot.toString(),
+      evidence.cursor.transactionIndex,
       evidence.cursor.instructionIndex,evidence.cursor.innerInstructionIndex,
       evidence.confirmationStatus,new Date(evidence.observedAtMs),countedBuyPurgeAfter,
       toJsonValue(evidence),
@@ -688,7 +701,7 @@ function assertCandidateEvent(result:PaperDecisionResult):void{
 async function upsertSession(
   client: Client,
   job: ClaimedPaperDecisionJob,
-  session: PaperStrategySessionV1,
+  session: PaperStrategySession,
   sessionEventId: string,
 ): Promise<void> {
   const terminal = ['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state);
@@ -701,20 +714,21 @@ async function upsertSession(
     entry_inner_instruction_index,external_buy_target,external_buy_count,
     minimum_confirmation,created_at,updated_at,terminal_at,purge_after,payload_version,payload
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-    $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,1,$29)
+    $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
   ON CONFLICT (session_id) DO UPDATE SET
     session_event_id=EXCLUDED.session_event_id,state=EXCLUDED.state,
     reason_code=EXCLUDED.reason_code,position_id=EXCLUDED.position_id,
     close_command_id=EXCLUDED.close_command_id,external_buy_count=EXCLUDED.external_buy_count,
     updated_at=EXCLUDED.updated_at,terminal_at=EXCLUDED.terminal_at,
-    purge_after=EXCLUDED.purge_after,payload=EXCLUDED.payload
+    purge_after=EXCLUDED.purge_after,payload_version=EXCLUDED.payload_version,
+    payload=EXCLUDED.payload
   WHERE (
       paper_strategy_sessions.updated_at < EXCLUDED.updated_at
       OR (
         paper_strategy_sessions.updated_at = EXCLUDED.updated_at
         AND (
           EXCLUDED.external_buy_count >= paper_strategy_sessions.external_buy_count
-          OR $30::boolean
+          OR $31::boolean
         )
       )
     )
@@ -731,7 +745,8 @@ async function upsertSession(
     session.entryCursor.innerInstructionIndex,session.externalBuyTarget,
     session.externalBuyCount,session.minimumConfirmation,new Date(session.createdAtMs),
     new Date(session.updatedAtMs),terminal ? new Date(session.updatedAtMs) : null,
-    purgeAfter,toJsonValue(session),job.sourceConfirmationStatus === 'orphaned',
+    purgeAfter,session.payloadVersion,toJsonValue(session),
+    job.sourceConfirmationStatus === 'orphaned',
   ]);
   if (purgeAfter !== null) {
     await client.query(`UPDATE paper_external_buy_events
@@ -740,7 +755,7 @@ async function upsertSession(
   }
 }
 
-function sessionPurgeAfter(session: PaperStrategySessionV1): Date | null {
+function sessionPurgeAfter(session: PaperStrategySession): Date | null {
   return ['PAPER_CLOSED','PAPER_RETRACTED','MANUAL_REVIEW'].includes(session.state)
     ? new Date(session.updatedAtMs + 14_400_000)
     : null;

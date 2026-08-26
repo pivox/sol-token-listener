@@ -51,6 +51,7 @@ const canonicalMigrations = Object.freeze([
   '014_social_persistence_retry.sql',
   '015_paper_active_session_per_mint.sql',
   '016_listener_catch_up_gaps.sql',
+  '017_creation_entry_strategy.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',

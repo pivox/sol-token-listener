@@ -370,6 +370,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.equal((smoke.match(/\['compose'/g) ?? []).length, 1);
   assert.match(smoke, /com\.docker\.compose\.project=/);
   assert.match(smoke, /'016_listener_catch_up_gaps\.sql'/);
+  assert.match(smoke, /'017_creation_entry_strategy\.sql'/);
   assert.match(smoke, /'listenerCatchUpGaps'/);
   assert.doesNotMatch(smoke, /Migration history does not contain exactly 14 rows\./);
   assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key|\bwallet\b/iu);
