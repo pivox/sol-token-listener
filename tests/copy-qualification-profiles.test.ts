@@ -107,7 +107,7 @@ void test('rejects the current working directory as a target without deleting it
   const sourceDirectory = join(root, 'source');
   const sentinel = join(childWorkingDirectory, 'sentinel');
   const copierPath = fileURLToPath(new URL('../scripts/copy-qualification-profiles.ts', import.meta.url));
-  const tsxLoaderPath = fileURLToPath(new URL('../node_modules/tsx/dist/loader.mjs', import.meta.url));
+  const tsxLoaderPath = fileURLToPath(import.meta.resolve('tsx'));
   try {
     await mkdir(sourceDirectory);
     await mkdir(childWorkingDirectory);
