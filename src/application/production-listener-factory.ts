@@ -52,7 +52,10 @@ import { WalletEvidenceObservationService } from './wallet-evidence-observation.
 import { WalletGraphRebuildService } from './wallet-graph-rebuild.service.js';
 import { PublicSocialVerificationProvider } from '../social/public-social-verification.provider.js';
 import { SocialEnrichmentWorker } from './social-enrichment-worker.js';
-import { PaperDecisionWorker } from './paper-decision-worker.js';
+import {
+  PaperDecisionWorker,
+  createPaperDecisionStrategyRegistry,
+} from './paper-decision-worker.js';
 import { QualificationProjectionService } from './qualification-projection.service.js';
 import { QualificationRebuildService } from './qualification-rebuild.service.js';
 import { SocialQualificationRefreshService } from './social-qualification-refresh.service.js';
@@ -193,18 +196,24 @@ export function createProductionListenerRuntime(
     qualificationProfile,
     qualificationEngine,
   );
-  const paperStrategy = config.creationStrategyEnabled
-    ? new CreationEntryV1Strategy(paperTrading, quoteRouter, {
-      retentionMs: 14_400_000,
-      externalMinimumBuyAmountRaw: config.externalMinimumBuyAmountRaw ?? 1n,
-      takeProfitMultiplierBps: config.creationTakeProfitMultiplierBps,
-      manualKillSwitch: config.creationManualKillSwitch,
-    })
-    : new ValidatedExternalBuysStrategy(
-      paperTrading,
-      quoteRouter,
-      { retentionMs: 14_400_000 },
-    );
+  const legacyPaperStrategy = new ValidatedExternalBuysStrategy(
+    paperTrading,
+    quoteRouter,
+    { retentionMs: 14_400_000 },
+  );
+  const creationPaperStrategy = new CreationEntryV1Strategy(paperTrading, quoteRouter, {
+    retentionMs: 14_400_000,
+    externalMinimumBuyAmountRaw: config.externalMinimumBuyAmountRaw ?? 1n,
+    takeProfitMultiplierBps: config.creationTakeProfitMultiplierBps,
+    manualKillSwitch: config.creationManualKillSwitch,
+  });
+  const paperStrategy = createPaperDecisionStrategyRegistry({
+    activeStrategyId: config.creationStrategyEnabled
+      ? 'creation-entry-v1'
+      : 'validated-external-buys',
+    legacy: legacyPaperStrategy,
+    creation: creationPaperStrategy,
+  });
   const paperWorker = new PaperDecisionWorker(
     paperRepository,
     quoteRouter,

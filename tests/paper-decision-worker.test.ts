@@ -29,8 +29,11 @@ import type {
 import { PaperQuoteError } from '../src/ports/paper-quote-router.js';
 import {
   PaperDecisionWorker,
+  createPaperDecisionStrategyRegistry,
   type PaperDecisionWorkerScheduler,
 } from '../src/application/paper-decision-worker.js';
+import { CreationEntryV1Strategy } from '../src/application/creation-entry-v1.strategy.js';
+import { ValidatedExternalBuysStrategy } from '../src/application/validated-external-buys.strategy.js';
 
 void test('persists explainable observe decisions without requesting quotes or paper actions', async () => {
   const repository = new FakeRepository([claim()]);
@@ -306,6 +309,48 @@ void test('reuses the persisted decision for an active session without entry quo
   assert.equal((await worker.runOnce()).kind, 'completed');
   assert.equal(quotes.calls, 0);
   assert.equal(repository.stages.length, 1);
+});
+
+void test('routes a persisted V1 session to legacy while creation is active', async () => {
+  const repository = new FakeRepository([claim()]);
+  const candidate = tradingCandidate('ELIGIBLE');
+  const session = createPaperStrategySession({
+    candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'QUALIFIED_ENTRY',positionId:'position',
+    entryCursor:candidate.asOf.cursor,externalBuyTarget:10,externalBuyCount:0,
+    countedTradeIds:[],lastCountedCursor:null,minimumConfirmation:'confirmed',
+    lastQuote:candidate.buyQuote,lastError:null,createdAtMs:1_000,updatedAtMs:1_000,
+    purgeAfterMs:14_401_000,
+  });
+  repository.snapshotValue=snapshot({
+    currentCandidate:candidate,currentSession:session,activePosition:POSITION,
+    currentDecision:Object.freeze({
+      qualification:canonicalQualification(),
+      candidateEvent:event('TradingCandidateUpdated','evt_candidate'),
+    }),
+  });
+  const unreachableLedger = {
+    async open(): Promise<never> { throw new Error('not called'); },
+    async reconcileOpen(): Promise<never> { throw new Error('not called'); },
+    async close(): Promise<never> { throw new Error('not called'); },
+    async retract(): Promise<never> { throw new Error('not called'); },
+  };
+  const quotes = new FakeQuotes();
+  const services = fakeServices('ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,
+    createPaperDecisionStrategyRegistry({
+      activeStrategyId:'creation-entry-v1',
+      legacy:new ValidatedExternalBuysStrategy(unreachableLedger,quotes,{ retentionMs:14_400_000 }),
+      creation:new CreationEntryV1Strategy(unreachableLedger,quotes,{
+        retentionMs:14_400_000,externalMinimumBuyAmountRaw:1n,
+      }),
+    }),
+    options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.equal(quotes.calls,0);
+  assert.equal(repository.completions[0]?.result.session?.payloadVersion,1);
 });
 
 void test('reconciles the exact historical qualification without opening a new position', async () => {
@@ -877,7 +922,7 @@ function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecision
   const asOfEvent=event('TokenLaunchDetected','evt_source');
   return Object.freeze({
     mint:'MINT',asOfEvent,canonicalLaunchActive:true,hasPaperLineage:false,
-    launchDetectedAtMs:1_000,launch:Object.freeze({
+    launchDetectedAtMs:1_000,launchConfirmationStatus:'confirmed',launch:Object.freeze({
       mint:'MINT',creator:'creator',tokenProgram:'SPL_TOKEN' as const,
       quoteAssets:Object.freeze([Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const })]),
       launchpad:'pumpfun',createdAt:asOfEvent.cursor,parameters:Object.freeze({}),

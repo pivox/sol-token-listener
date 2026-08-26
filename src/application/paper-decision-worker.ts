@@ -82,6 +82,23 @@ type StrategyActions = Pick<ValidatedExternalBuysStrategy,
 
 type StrategyResult = ExternalBuysStrategyResult | CreationEntryStrategyResult;
 
+export interface PaperDecisionStrategyRegistry {
+  readonly kind: 'paper-decision-strategy-registry';
+  readonly activeStrategyId: 'validated-external-buys' | 'creation-entry-v1';
+  readonly legacy: ValidatedExternalBuysStrategy;
+  readonly creation: CreationEntryV1Strategy;
+}
+
+type StrategyProvider = StrategyActions | PaperDecisionStrategyRegistry;
+
+export function createPaperDecisionStrategyRegistry(input: Readonly<{
+  activeStrategyId: PaperDecisionStrategyRegistry['activeStrategyId'];
+  legacy: ValidatedExternalBuysStrategy;
+  creation: CreationEntryV1Strategy;
+}>): PaperDecisionStrategyRegistry {
+  return Object.freeze({ kind:'paper-decision-strategy-registry', ...input });
+}
+
 const systemScheduler: PaperDecisionWorkerScheduler = Object.freeze({
   schedule(callback: () => void, delayMs: number): ReturnType<typeof setTimeout> {
     return setTimeout(callback, delayMs);
@@ -108,7 +125,7 @@ export class PaperDecisionWorker {
     private readonly quotes: PaperQuoteRouter,
     private readonly qualification: QualificationRebuilder,
     private readonly candidates: CandidateBuilder,
-    private readonly strategy: StrategyActions,
+    private readonly strategy: StrategyProvider,
     private readonly options: PaperDecisionWorkerOptions,
     private readonly scheduler: PaperDecisionWorkerScheduler = systemScheduler,
   ) {
@@ -251,7 +268,7 @@ export class PaperDecisionWorker {
 
     const session=snapshot.currentSession;
     if (session === null || session.state === 'BUY_PENDING') {
-      const pending=session ?? this.strategy.prepare(candidateResult.candidate, {
+      const pending=session ?? activeStrategy(this.strategy).prepare(candidateResult.candidate, {
         externalBuyTarget:this.options.externalBuyTarget,
         minimumConfirmation:this.options.minimumConfirmation,nowMs:this.readNow(),
       });
@@ -583,6 +600,31 @@ function creationStrategy(
   >;
 }
 
+function isStrategyRegistry(value: StrategyProvider): value is PaperDecisionStrategyRegistry {
+  return 'kind' in value;
+}
+
+function activeStrategy(provider: StrategyProvider): StrategyActions {
+  if (!isStrategyRegistry(provider)) return provider;
+  return provider.activeStrategyId === 'creation-entry-v1'
+    ? provider.creation
+    : provider.legacy;
+}
+
+function sessionStrategy(
+  provider: StrategyProvider,
+  session: PaperStrategySession,
+): StrategyActions {
+  if (!isStrategyRegistry(provider)) return provider;
+  if (session.payloadVersion === 2) {
+    return provider.creation;
+  }
+  if (session.strategy.id === 'validated-external-buys') {
+    return provider.legacy;
+  }
+  throw new TypeError('Persisted paper session strategy is unsupported.');
+}
+
 function legacyStrategy(
   strategy: StrategyActions,
 ): Pick<ValidatedExternalBuysStrategy,
@@ -594,48 +636,53 @@ function legacyStrategy(
 }
 
 function openStrategy(
-  strategy: StrategyActions,
+  strategy: StrategyProvider,
   input: AnyOpenInput,
 ): Promise<StrategyResult> {
+  const selected = sessionStrategy(strategy, input.session);
   return input.session.payloadVersion === 2
-    ? creationStrategy(strategy).open(input as CreationOpenInput)
-    : legacyStrategy(strategy).open(input as LegacyOpenInput);
+    ? creationStrategy(selected).open(input as CreationOpenInput)
+    : legacyStrategy(selected).open(input as LegacyOpenInput);
 }
 
 function recoverOpenStrategy(
-  strategy: StrategyActions,
+  strategy: StrategyProvider,
   input: AnyOpenInput,
 ): Promise<StrategyResult> {
+  const selected = sessionStrategy(strategy, input.session);
   return input.session.payloadVersion === 2
-    ? creationStrategy(strategy).recoverOpen(input as CreationOpenInput)
-    : legacyStrategy(strategy).recoverOpen(input as LegacyOpenInput);
+    ? creationStrategy(selected).recoverOpen(input as CreationOpenInput)
+    : legacyStrategy(selected).recoverOpen(input as LegacyOpenInput);
 }
 
 function reconcileStrategy(
-  strategy: StrategyActions,
+  strategy: StrategyProvider,
   input: AnyReconcileInput,
 ): Promise<StrategyResult> {
+  const selected = sessionStrategy(strategy, input.session);
   return input.session.payloadVersion === 2
-    ? creationStrategy(strategy).reconcile(input as CreationReconcileInput)
-    : legacyStrategy(strategy).reconcile(input as LegacyReconcileInput);
+    ? creationStrategy(selected).reconcile(input as CreationReconcileInput)
+    : legacyStrategy(selected).reconcile(input as LegacyReconcileInput);
 }
 
 function reconcileStrategySource(
-  strategy: StrategyActions,
+  strategy: StrategyProvider,
   input: AnySourceInput,
 ): Promise<StrategyResult> {
+  const selected = sessionStrategy(strategy, input.session);
   return input.session.payloadVersion === 2
-    ? creationStrategy(strategy).reconcileSource(input as CreationSourceInput)
-    : legacyStrategy(strategy).reconcileSource(input as LegacySourceInput);
+    ? creationStrategy(selected).reconcileSource(input as CreationSourceInput)
+    : legacyStrategy(selected).reconcileSource(input as LegacySourceInput);
 }
 
 function reconcileStrategyEvidence(
-  strategy: StrategyActions,
+  strategy: StrategyProvider,
   input: AnyEvidenceInput,
 ): Promise<StrategyResult> {
+  const selected = sessionStrategy(strategy, input.session);
   return input.session.payloadVersion === 2
-    ? creationStrategy(strategy).reconcileEvidence(input as CreationEvidenceInput)
-    : legacyStrategy(strategy).reconcileEvidence(input as LegacyEvidenceInput);
+    ? creationStrategy(selected).reconcileEvidence(input as CreationEvidenceInput)
+    : legacyStrategy(selected).reconcileEvidence(input as LegacyEvidenceInput);
 }
 
 function decision(

@@ -138,6 +138,13 @@ export class TradingCandidateService {
 
   private creationEntryRejected(input: TradingCandidateInput): boolean {
     if (this.options.strategy.id !== 'creation-entry-v1') return false;
+    if (
+      !input.snapshot.canonicalLaunchActive
+      || !confirmationReached(
+        input.snapshot.launchConfirmationStatus,
+        this.options.minimumConfirmation,
+      )
+    ) return true;
     const maximumSlotLag = this.options.creationEntryMaxSlotLag
       ?? this.options.maximumQuoteSlotLag;
     if (

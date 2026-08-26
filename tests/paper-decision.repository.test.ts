@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../src/domain/events.js';
-import { createPaperStrategySession } from '../src/domain/paper-strategy.js';
+import {
+  createCreationEntrySession,
+  createPaperStrategySession,
+} from '../src/domain/paper-strategy.js';
 import type { PaperPosition } from '../src/domain/paper-trading.js';
 import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
@@ -107,6 +110,33 @@ void test('enqueues one deterministic wake-up for each active creation session',
   });
 });
 
+void test('persists V2 buyer evidence and replaces an orphaned wallet trade projection', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL is not configured');
+    return;
+  }
+  await withSchema(async (pool) => {
+    await seed(pool);
+    await seedTrade(pool);
+    const repository = paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const claim = await repository.claim({ nowMs: 1_000, leaseMs: 10_000 });
+    assert.ok(claim);
+
+    await repository.stageDecision(claim, creationDecisionWithEvidence('trade-old', 2_000));
+    await repository.stageDecision(claim, creationDecisionWithEvidence('trade-active', 2_001));
+
+    const rows = await pool.query(`SELECT trade_id,trader,quote_amount_raw::text,
+      payload_version,payload FROM paper_external_buy_events`);
+    assert.equal(rows.rowCount, 1);
+    assert.equal(rows.rows[0]?.trade_id, 'trade-active');
+    assert.equal(rows.rows[0]?.trader, 'external-wallet');
+    assert.equal(rows.rows[0]?.quote_amount_raw, '2000');
+    assert.equal(rows.rows[0]?.payload_version, 2);
+    assert.equal((rows.rows[0]?.payload as { payloadVersion?: unknown }).payloadVersion, 2);
+  });
+});
+
 void test('loads the immutable launch when a later trade triggers the decision', async (context) => {
   if (databaseUrl === undefined) {
     context.skip('TEST_DATABASE_URL is not configured');
@@ -125,6 +155,8 @@ void test('loads the immutable launch when a later trade triggers the decision',
     assert.equal(snapshot.asOfEvent.id, TRADE_EVENT_ID);
     assert.equal(snapshot.launch.mint, MINT);
     assert.equal(snapshot.launch.creator, 'creator');
+    assert.equal(snapshot.launchDetectedAtMs, 1_000);
+    assert.equal(snapshot.launchConfirmationStatus, 'confirmed');
   });
 });
 
@@ -1276,6 +1308,51 @@ function terminalDecisionResult(): PaperDecisionResult {
       payloadVersion: 1 as const,
     })]),
     requestedAction: 'CLOSE' as const,
+  });
+}
+
+function creationDecisionWithEvidence(tradeId: string, updatedAtMs: number): PaperDecisionResult {
+  const base = decisionResult();
+  const candidate = createTradingCandidate({
+    mint:base.candidate.mint,
+    strategy:Object.freeze({ id:'creation-entry-v1',version:1 }),
+    qualificationReportId:base.candidate.qualificationReportId,
+    qualificationProfile:base.candidate.qualificationProfile,
+    evidenceFingerprint:base.candidate.evidenceFingerprint,
+    asOfEvent:base.qualificationEvent,
+    state:'ELIGIBLE',quoteAsset:base.candidate.quoteAsset,
+    buyQuote:base.candidate.buyQuote,reverseSellQuote:base.candidate.reverseSellQuote,
+    eligibleUntilMs:base.candidate.eligibleUntilMs,
+    reasonCodes:['QUALIFIED_ENTRY'],createdAtMs:base.candidate.createdAtMs,
+    purgeAfterMs:base.candidate.purgeAfterMs,
+  });
+  const candidateEvent = derivedEvent(
+    'TradingCandidateUpdated',candidate.id,{ candidate },'confirmed',
+    candidate.asOf.cursor,candidate.createdAtMs,
+  );
+  const cursor = Object.freeze({
+    slot:11n,transactionIndex:0,instructionIndex:2,innerInstructionIndex:null,
+  });
+  const session = createCreationEntrySession({
+    candidate,state:'WAITING_EXTERNAL_BUYS',reasonCode:'EXTERNAL_UNIQUE_BUY_OBSERVED',
+    positionId:'paper-position',entryCursor:candidate.asOf.cursor,externalBuyTarget:10,
+    externalBuyCount:1,countedTradeIds:[tradeId],countedBuyerWallets:['external-wallet'],
+    lastCountedCursor:cursor,minimumConfirmation:'confirmed',lastQuote:candidate.buyQuote,
+    lastError:null,pendingExitReason:null,createdAtMs:candidate.createdAtMs,updatedAtMs,
+    purgeAfterMs:updatedAtMs+14_400_000,
+  });
+  const sessionEvent = derivedEvent(
+    'PaperStrategySessionUpdated',`${session.id}:${tradeId}`,{ session },
+    'confirmed',candidate.asOf.cursor,updatedAtMs,
+  );
+  return Object.freeze({
+    ...base,candidate,candidateEvent,session,sessionEvent,
+    countedExternalBuys:Object.freeze([Object.freeze({
+      sessionId:session.id,tradeId,mint:MINT,quoteMint:'SOL',trader:'external-wallet',
+      quoteAmountRaw:2_000n,cursor,confirmationStatus:'confirmed' as const,
+      observedAtMs:updatedAtMs,payloadVersion:2 as const,
+    })]),
+    requestedAction:'NONE' as const,
   });
 }
 

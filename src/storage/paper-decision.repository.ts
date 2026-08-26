@@ -335,6 +335,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         mint: job.mint,asOfEvent,canonicalLaunchActive:launchSnapshot.canonicalLaunchActive,
         hasPaperLineage,launch:launchSnapshot.launch,
         launchDetectedAtMs:launchSnapshot.launchDetectedAtMs,
+        launchConfirmationStatus:launchSnapshot.launchConfirmationStatus,
         metadata,social,creatorProfile,holderSnapshot,
         walletGraph,activeLaunchTrades: launchTrades,activeMarketTrades: marketTrades,
         currentQualification,currentCandidate: candidate,currentDecision,
@@ -646,19 +647,26 @@ async function writeDecision(
       && typeof evidence.quoteAmountRaw === 'bigint'
       ? evidence.quoteAmountRaw.toString()
       : null;
+    if (countedBuyStrategyId === 'creation-entry-v1' && evidence.trader !== null) {
+      await client.query(`DELETE FROM paper_external_buy_events
+        WHERE session_id=$1 AND strategy_id='creation-entry-v1'
+          AND trader=$2 AND trade_id<>$3`, [
+        evidence.sessionId,evidence.trader,evidence.tradeId,
+      ]);
+    }
     await client.query(`INSERT INTO paper_external_buy_events (
       session_id,trade_id,source_event_id,mint,quote_mint,trader,
       strategy_id,quote_amount_raw,slot,
       transaction_index,instruction_index,inner_instruction_index,
       confirmation_status,observed_at,purge_after,payload_version,payload
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1,$16)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
     ON CONFLICT (session_id,trade_id) DO NOTHING`, [
       evidence.sessionId,evidence.tradeId,countedEvent.id,evidence.mint,evidence.quoteMint,
       evidence.trader,countedBuyStrategyId,quoteAmountRaw,evidence.cursor.slot.toString(),
       evidence.cursor.transactionIndex,
       evidence.cursor.instructionIndex,evidence.cursor.innerInstructionIndex,
       evidence.confirmationStatus,new Date(evidence.observedAtMs),countedBuyPurgeAfter,
-      toJsonValue(evidence),
+      evidence.payloadVersion,toJsonValue(evidence),
     ]);
   }
 }
@@ -899,6 +907,7 @@ async function loadLaunch(
 ): Promise<Readonly<{
   launch:TokenLaunch;
   launchDetectedAtMs:number;
+  launchConfirmationStatus:ChainConfirmationStatus;
   canonicalLaunchActive:boolean;
 }>> {
   const result = await client.query(`SELECT launch.*,
@@ -914,6 +923,7 @@ async function loadLaunch(
   return Object.freeze({
     launch:payloadProperty(event.payload,'launch') as TokenLaunch,
     launchDetectedAtMs:event.observedAtMs,
+    launchConfirmationStatus:event.confirmationStatus,
     canonicalLaunchActive:booleanField(result.rows[0],'canonical_launch_active'),
   });
 }

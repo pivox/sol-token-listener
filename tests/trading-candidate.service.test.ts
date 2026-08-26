@@ -112,12 +112,20 @@ void test('rejects creation entry after excessive slot lag or a creator sell', (
   const sold = service.create(candidateInput({
     snapshot: snapshot({ activeLaunchTrades: Object.freeze([creatorSell()]) }),
   }));
+  const orphanedLaunch = service.create(candidateInput({
+    snapshot: snapshot({ canonicalLaunchActive: false }),
+  }));
+  const underConfirmedLaunch = service.create(candidateInput({
+    snapshot: snapshot({ launchConfirmationStatus: 'processed' }),
+  }));
 
   assert.equal(lagged.candidate.state, 'NOT_ELIGIBLE');
   assert.deepEqual(lagged.candidate.reasonCodes, ['CREATION_ENTRY_REJECTED']);
   assert.equal(preLaunchQuote.candidate.state, 'NOT_ELIGIBLE');
   assert.equal(sold.candidate.state, 'NOT_ELIGIBLE');
   assert.deepEqual(sold.candidate.reasonCodes, ['CREATION_ENTRY_REJECTED']);
+  assert.equal(orphanedLaunch.candidate.state, 'NOT_ELIGIBLE');
+  assert.equal(underConfirmedLaunch.candidate.state, 'NOT_ELIGIBLE');
 });
 
 function candidateService(): TradingCandidateService {
@@ -157,7 +165,7 @@ function snapshot(overrides: Partial<PaperDecisionSnapshot> = {}): PaperDecision
   const asOfEvent = event();
   return Object.freeze({
     mint:'MINT',asOfEvent,canonicalLaunchActive:true,hasPaperLineage:false,
-    launchDetectedAtMs:1_000,launch:Object.freeze({
+    launchDetectedAtMs:1_000,launchConfirmationStatus:'confirmed',launch:Object.freeze({
       mint:'MINT',creator:'creator',tokenProgram:'SPL_TOKEN' as const,
       quoteAssets:Object.freeze([Object.freeze({ mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const })]),
       launchpad:'pumpfun',createdAt:Object.freeze({ ...asOfEvent.cursor }),parameters:Object.freeze({}),

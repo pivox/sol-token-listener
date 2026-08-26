@@ -45,6 +45,7 @@ export interface PaperDecisionSnapshot {
   readonly hasPaperLineage: boolean;
   readonly launch: TokenLaunch;
   readonly launchDetectedAtMs: number;
+  readonly launchConfirmationStatus: ChainConfirmationStatus;
   readonly metadata: TokenMetadataSnapshot | null;
   readonly social: SocialEvidenceCollectionV1 | null;
   readonly creatorProfile: CreatorProfile | null;

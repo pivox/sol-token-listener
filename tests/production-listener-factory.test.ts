@@ -117,7 +117,9 @@ void test('production selects creation-entry-v1 without adding a second paper pi
   );
 
   assert.equal(count(source, /new PaperDecisionWorker\(/gu), 1);
-  assert.match(source, /config\.creationStrategyEnabled[\s\S]*?new CreationEntryV1Strategy\(/u);
+  assert.equal(count(source, /new CreationEntryV1Strategy\(/gu), 1);
+  assert.equal(count(source, /new ValidatedExternalBuysStrategy\(/gu), 1);
+  assert.match(source, /createPaperDecisionStrategyRegistry\(\{[\s\S]*?config\.creationStrategyEnabled/u);
   assert.match(source, /externalMinimumBuyAmountRaw/u);
   assert.match(source, /creationTakeProfitMultiplierBps/u);
   assert.match(source, /creationManualKillSwitch/u);
