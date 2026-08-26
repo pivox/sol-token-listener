@@ -8,7 +8,7 @@ const MAX_RECONCILE_SECONDS = 2_147_483;
 
 export type ExecutionMode = 'observe' | 'paper';
 export type QualificationRuleSetStatus = 'UNVALIDATED_RULE_SET';
-export type PaperStrategyId = 'validated-external-buys';
+export type PaperStrategyId = 'validated-external-buys' | 'creation-entry-v1';
 export type PaperMinimumConfirmation = 'confirmed' | 'finalized';
 export type ListenerCatchUpPolicy = 'live-edge' | 'strict';
 
@@ -23,6 +23,7 @@ export interface AppConfig {
   readonly executionMode: ExecutionMode;
   readonly paperQuoteMintAllowlist: readonly string[];
   readonly paperStrategyEnabled: boolean;
+  readonly creationStrategyEnabled: boolean;
   readonly paperStrategyId: PaperStrategyId;
   readonly paperStrategyVersion: 1;
   readonly paperEntryQuoteAmountRaw: bigint | null;
@@ -36,6 +37,11 @@ export interface AppConfig {
   readonly paperDecisionWorkerLeaseSeconds: number;
   readonly paperDecisionRetryMaxAttempts: number;
   readonly paperDecisionRetryBaseDelayMs: number;
+  readonly creationEntryMaxAgeMs: number;
+  readonly creationEntryMaxSlotLag: number;
+  readonly externalMinimumBuyAmountRaw: bigint | null;
+  readonly creationTakeProfitMultiplierBps: bigint;
+  readonly creationManualKillSwitch: boolean;
   readonly qualificationProfilePath: string | null;
   readonly qualificationRuleSetStatus: QualificationRuleSetStatus;
   readonly qualificationMinimumScore: number | null;
@@ -109,6 +115,7 @@ export interface TransactionInboxRetryPolicyConfig {
 
 interface PaperStrategyConfig {
   readonly paperStrategyEnabled: boolean;
+  readonly creationStrategyEnabled: boolean;
   readonly paperStrategyId: PaperStrategyId;
   readonly paperStrategyVersion: 1;
   readonly paperEntryQuoteAmountRaw: bigint | null;
@@ -122,6 +129,11 @@ interface PaperStrategyConfig {
   readonly paperDecisionWorkerLeaseSeconds: number;
   readonly paperDecisionRetryMaxAttempts: number;
   readonly paperDecisionRetryBaseDelayMs: number;
+  readonly creationEntryMaxAgeMs: number;
+  readonly creationEntryMaxSlotLag: number;
+  readonly externalMinimumBuyAmountRaw: bigint | null;
+  readonly creationTakeProfitMultiplierBps: bigint;
+  readonly creationManualKillSwitch: boolean;
 }
 
 export function parseTransactionInboxRetryPolicy(
@@ -318,25 +330,45 @@ function parsePaperStrategyConfig(
   executionMode: ExecutionMode,
   qualificationProfilePath: string | null,
 ): PaperStrategyConfig {
-  const paperStrategyEnabled = parseBoolean(
+  const legacyPaperStrategyEnabled = parseBoolean(
     environment.PAPER_STRATEGY_ENABLED,
     false,
     'PAPER_STRATEGY_ENABLED',
   );
-  const paperStrategyId = parseClosedLiteral(
+  const creationStrategyEnabled = parseBoolean(
+    environment.CREATION_STRATEGY_ENABLED,
+    false,
+    'CREATION_STRATEGY_ENABLED',
+  );
+  if (legacyPaperStrategyEnabled && creationStrategyEnabled) {
+    throw new Error('Paper strategy flags cannot be enabled simultaneously.');
+  }
+  const legacyPaperStrategyId = parseClosedLiteral(
     environment.PAPER_STRATEGY_ID,
     'validated-external-buys',
     'PAPER_STRATEGY_ID',
     ['validated-external-buys'],
   );
+  const paperStrategyId: PaperStrategyId = creationStrategyEnabled
+    ? 'creation-entry-v1'
+    : legacyPaperStrategyId;
+  const paperStrategyEnabled = legacyPaperStrategyEnabled || creationStrategyEnabled;
   const paperStrategyVersion = parseClosedIntegerLiteral(
     environment.PAPER_STRATEGY_VERSION,
     1,
     'PAPER_STRATEGY_VERSION',
   );
-  const paperExternalBuyTarget = parseCanonicalBoundedInteger(
-    environment.PAPER_EXTERNAL_BUY_TARGET, 10, 'PAPER_EXTERNAL_BUY_TARGET', 1, 1_000,
-  );
+  const paperExternalBuyTarget = creationStrategyEnabled
+    ? parseCanonicalBoundedInteger(
+      environment.EXTERNAL_UNIQUE_BUYERS_TARGET,
+      10,
+      'EXTERNAL_UNIQUE_BUYERS_TARGET',
+      1,
+      1_000,
+    )
+    : parseCanonicalBoundedInteger(
+      environment.PAPER_EXTERNAL_BUY_TARGET, 10, 'PAPER_EXTERNAL_BUY_TARGET', 1, 1_000,
+    );
   const paperMinimumConfirmation = parseClosedLiteral(
     environment.PAPER_MINIMUM_CONFIRMATION,
     'confirmed',
@@ -364,10 +396,41 @@ function parsePaperStrategyConfig(
   const paperDecisionRetryBaseDelayMs = parseCanonicalBoundedInteger(
     environment.PAPER_DECISION_RETRY_BASE_DELAY_MS, 500, 'PAPER_DECISION_RETRY_BASE_DELAY_MS', 100, 60_000,
   );
+  const creationEntryMaxAgeMs = parseCanonicalBoundedInteger(
+    environment.CREATION_ENTRY_MAX_AGE_MS,
+    45_000,
+    'CREATION_ENTRY_MAX_AGE_MS',
+    100,
+    3_600_000,
+  );
+  const creationEntryMaxSlotLag = parseCanonicalBoundedInteger(
+    environment.CREATION_ENTRY_MAX_SLOT_LAG,
+    32,
+    'CREATION_ENTRY_MAX_SLOT_LAG',
+    0,
+    10_000,
+  );
+  const configuredMinimumBuyAmountRaw = parseCanonicalBigInt(
+    environment.EXTERNAL_MIN_BUY_AMOUNT_RAW,
+    'EXTERNAL_MIN_BUY_AMOUNT_RAW',
+  );
+  const creationTakeProfitMultiplierBps = BigInt(parseCanonicalBoundedInteger(
+    environment.CREATION_TAKE_PROFIT_MULTIPLIER_BPS,
+    20_000,
+    'CREATION_TAKE_PROFIT_MULTIPLIER_BPS',
+    10_000,
+    1_000_000,
+  ));
+  const creationManualKillSwitch = parseBoolean(
+    environment.CREATION_MANUAL_KILL_SWITCH,
+    false,
+    'CREATION_MANUAL_KILL_SWITCH',
+  );
 
   if (!paperStrategyEnabled) {
     return {
       paperStrategyEnabled,
+      creationStrategyEnabled,
       paperStrategyId,
       paperStrategyVersion,
       paperEntryQuoteAmountRaw: null,
@@ -381,11 +444,17 @@ function parsePaperStrategyConfig(
       paperDecisionWorkerLeaseSeconds,
       paperDecisionRetryMaxAttempts,
       paperDecisionRetryBaseDelayMs,
+      creationEntryMaxAgeMs,
+      creationEntryMaxSlotLag,
+      externalMinimumBuyAmountRaw: null,
+      creationTakeProfitMultiplierBps,
+      creationManualKillSwitch,
     };
   }
 
   if (executionMode !== 'paper') {
-    throw new Error('PAPER_STRATEGY_ENABLED requires EXECUTION_MODE=paper.');
+    const flag = creationStrategyEnabled ? 'CREATION_STRATEGY_ENABLED' : 'PAPER_STRATEGY_ENABLED';
+    throw new Error(`${flag} requires EXECUTION_MODE=paper.`);
   }
   if (qualificationProfilePath === null) {
     throw new Error('PAPER_STRATEGY_ENABLED requires an explicit QUALIFICATION_PROFILE_PATH.');
@@ -411,9 +480,16 @@ function parsePaperStrategyConfig(
   if (slippage < 0) {
     throw new Error('PAPER_SLIPPAGE_BPS must be explicitly configured.');
   }
+  if (
+    creationStrategyEnabled
+    && (configuredMinimumBuyAmountRaw === null || configuredMinimumBuyAmountRaw === 0n)
+  ) {
+    throw new Error('EXTERNAL_MIN_BUY_AMOUNT_RAW must be explicitly configured above zero.');
+  }
 
   return {
     paperStrategyEnabled,
+    creationStrategyEnabled,
     paperStrategyId,
     paperStrategyVersion,
     paperEntryQuoteAmountRaw,
@@ -427,6 +503,11 @@ function parsePaperStrategyConfig(
     paperDecisionWorkerLeaseSeconds,
     paperDecisionRetryMaxAttempts,
     paperDecisionRetryBaseDelayMs,
+    creationEntryMaxAgeMs,
+    creationEntryMaxSlotLag,
+    externalMinimumBuyAmountRaw: creationStrategyEnabled ? configuredMinimumBuyAmountRaw : null,
+    creationTakeProfitMultiplierBps,
+    creationManualKillSwitch,
   };
 }
 

@@ -80,6 +80,60 @@ void test('la stratégie paper exige un mode et des seuils explicitement sûrs',
   assert.throws(() => parseConfig({ ...enabled, RISK_MAX_ROUNDTRIP_LOSS_BPS: undefined }), /RISK_MAX_ROUNDTRIP_LOSS_BPS/u);
 });
 
+void test('la stratégie creation-entry-v1 est fermée, explicite et exclusivement paper', () => {
+  const enabled = {
+    ...base,
+    EXECUTION_MODE: 'paper',
+    CREATION_STRATEGY_ENABLED: 'true',
+    CREATION_ENTRY_MAX_AGE_MS: '45000',
+    CREATION_ENTRY_MAX_SLOT_LAG: '32',
+    EXTERNAL_UNIQUE_BUYERS_TARGET: '10',
+    EXTERNAL_MIN_BUY_AMOUNT_RAW: '1000000',
+    CREATION_TAKE_PROFIT_MULTIPLIER_BPS: '20000',
+    CREATION_MANUAL_KILL_SWITCH: 'false',
+    PAPER_ENTRY_QUOTE_AMOUNT_RAW: '10000000',
+    PAPER_SLIPPAGE_BPS: '500',
+    QUALIFICATION_PROFILE_PATH: './config/qualification/pumpfun-v1-unvalidated.json',
+    RISK_MAX_ROUNDTRIP_LOSS_BPS: '3000',
+  } as const;
+  const config = parseConfig(enabled);
+
+  assert.deepEqual({
+    enabled: config.creationStrategyEnabled,
+    id: config.paperStrategyId,
+    version: config.paperStrategyVersion,
+    maximumAgeMs: config.creationEntryMaxAgeMs,
+    maximumSlotLag: config.creationEntryMaxSlotLag,
+    uniqueBuyerTarget: config.paperExternalBuyTarget,
+    minimumBuyAmountRaw: config.externalMinimumBuyAmountRaw,
+    takeProfitMultiplierBps: config.creationTakeProfitMultiplierBps,
+    manualKillSwitch: config.creationManualKillSwitch,
+  }, {
+    enabled: true,
+    id: 'creation-entry-v1',
+    version: 1,
+    maximumAgeMs: 45_000,
+    maximumSlotLag: 32,
+    uniqueBuyerTarget: 10,
+    minimumBuyAmountRaw: 1_000_000n,
+    takeProfitMultiplierBps: 20_000n,
+    manualKillSwitch: false,
+  });
+
+  assert.throws(
+    () => parseConfig({ ...enabled, EXECUTION_MODE: 'observe' }),
+    /CREATION_STRATEGY_ENABLED.*paper/u,
+  );
+  assert.throws(
+    () => parseConfig({ ...enabled, PAPER_STRATEGY_ENABLED: 'true' }),
+    /strategy.*simultaneously|simultaneous.*strategy/iu,
+  );
+  assert.throws(() => parseConfig({ ...enabled, EXTERNAL_MIN_BUY_AMOUNT_RAW: '' }));
+  assert.throws(() => parseConfig({ ...enabled, EXTERNAL_MIN_BUY_AMOUNT_RAW: '0' }));
+  assert.throws(() => parseConfig({ ...enabled, CREATION_TAKE_PROFIT_MULTIPLIER_BPS: '9999' }));
+  assert.throws(() => parseConfig({ ...enabled, CREATION_MANUAL_KILL_SWITCH: '1' }));
+});
+
 void test('la configuration paper accepte ses bornes inclusives exactes', () => {
   const minimums = parseConfig({
     ...base,
@@ -157,6 +211,10 @@ void test('le modèle d’environnement publie la stratégie paper inactive et s
     'PAPER_QUOTE_MAX_SLOT_LAG=32', 'PAPER_SLIPPAGE_BPS=',
     'PAPER_DECISION_WORKER_POLL_MS=1000', 'PAPER_DECISION_WORKER_LEASE_SECONDS=30',
     'PAPER_DECISION_RETRY_MAX_ATTEMPTS=5', 'PAPER_DECISION_RETRY_BASE_DELAY_MS=500',
+    'CREATION_STRATEGY_ENABLED=false', 'CREATION_ENTRY_MAX_AGE_MS=45000',
+    'CREATION_ENTRY_MAX_SLOT_LAG=32', 'EXTERNAL_UNIQUE_BUYERS_TARGET=10',
+    'EXTERNAL_MIN_BUY_AMOUNT_RAW=', 'CREATION_TAKE_PROFIT_MULTIPLIER_BPS=20000',
+    'CREATION_MANUAL_KILL_SWITCH=false',
   ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
 });
 
