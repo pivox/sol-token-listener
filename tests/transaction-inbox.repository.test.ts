@@ -586,7 +586,7 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
   });
 });
 
-void test('records a catch-up gap and advances its checkpoint atomically and idempotently', async (context) => {
+void test('records a catch-up gap and replays its logical cursor independently of observation time', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
     await repository.storeCheckpoint(Object.freeze({
@@ -597,21 +597,32 @@ void test('records a catch-up gap and advances its checkpoint atomically and ide
       Object.freeze({ key: 'launchpad', slot: 50n, signature: 'baseline', updatedAtMs: 301_000 }),
       301_000,
     );
+    const concurrentReplay = createCatchUpGap(
+      Object.freeze({ key: 'launchpad', slot: 40n, signature: 'previous', updatedAtMs: 300_000 }),
+      Object.freeze({ key: 'launchpad', slot: 50n, signature: 'baseline', updatedAtMs: 302_000 }),
+      302_000,
+    );
+    assert.equal(concurrentReplay.gapId, gap.gapId);
 
     await repository.recordCatchUpGap(gap);
-    await repository.recordCatchUpGap(gap);
+    await repository.recordCatchUpGap(concurrentReplay);
 
     assert.deepEqual(await repository.readCheckpoint('launchpad'), {
       key: 'launchpad', slot: 50n, signature: 'baseline', updatedAtMs: 301_000,
     });
     const rows = await pool.query(
-      'SELECT gap_id,checkpoint_key,previous_slot,baseline_slot FROM listener_catch_up_gaps',
+      `SELECT gap_id,checkpoint_key,previous_slot,baseline_slot,
+         (EXTRACT(EPOCH FROM observed_at) * 1000)::bigint AS observed_at_ms,
+         (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms
+       FROM listener_catch_up_gaps`,
     );
     assert.deepEqual(rows.rows, [{
       gap_id: gap.gapId,
       checkpoint_key: 'launchpad',
       previous_slot: '40',
       baseline_slot: '50',
+      observed_at_ms: '301000',
+      purge_after_ms: '14701000',
     }]);
   });
 });

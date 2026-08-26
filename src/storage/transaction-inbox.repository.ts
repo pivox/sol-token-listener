@@ -788,7 +788,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (alreadyAdvanced) {
           const existing = await client.query(
             `SELECT checkpoint_key,previous_slot,previous_signature,baseline_slot,
-               baseline_signature,observed_at,purge_after
+               baseline_signature
              FROM listener_catch_up_gaps WHERE gap_id = $1`,
             [value.gapId],
           );
@@ -797,9 +797,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             || numericBigInt(gap.previous_slot, 'gap previous slot') !== value.previousSlot
             || requiredText(gap.previous_signature, 'gap previous signature') !== value.previousSignature
             || numericBigInt(gap.baseline_slot, 'gap baseline slot') !== value.baselineSlot
-            || requiredText(gap.baseline_signature, 'gap baseline signature') !== value.baselineSignature
-            || dateMs(gap.observed_at, 'gap observed at') !== value.observedAtMs
-            || dateMs(gap.purge_after, 'gap purge after') !== value.purgeAfterMs) {
+            || requiredText(gap.baseline_signature, 'gap baseline signature') !== value.baselineSignature) {
             throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
           }
           return;
