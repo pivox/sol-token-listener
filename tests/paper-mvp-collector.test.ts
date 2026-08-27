@@ -533,11 +533,21 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
   assert.match(queries[0]?.text ?? '', /SELECT DISTINCT candidate\.mint[\s\S]*CREATION_ENTRY_REJECTED[\s\S]*CREATION_ENTRY_EXPIRED/u);
   assert.match(queries[0]?.text ?? '', /candidate\.created_at BETWEEN \$2 AND \$3/u);
   assert.doesNotMatch(queries[0]?.text ?? '', /FROM paper_trades trade JOIN eligible/u);
+  assert.equal((queries[0]?.text.match(
+    /position\.opened_at BETWEEN \$2 AND LEAST\(\$3::timestamptz,\$4::timestamptz\)/gu,
+  ) ?? []).length,2);
+  await source.collectBatch({
+    runId:'run-1',startedAtMs:1_000,deadlineAtMs:61_000,observedAtMs:62_000,
+    strategyId:'creation-entry-v1',strategyVersion:1,limit:100,
+  });
+  assert.deepEqual(queries[1]?.values, [
+    'run-1',new Date(1_000),new Date(61_000),new Date(62_000),'creation-entry-v1',1,100,
+  ]);
   await assert.rejects(source.collectBatch({
     runId: 'run-1', startedAtMs: 1_000, strategyId: 'creation-entry-v1',
     strategyVersion: 1, deadlineAtMs: 61_000, limit: 1_001,
   }), /limit/u);
-  assert.equal(queries.length, 1);
+  assert.equal(queries.length, 2);
 });
 
 void test('counts exact opened and holding positions without sampling non-terminal facts', async (context) => {
@@ -601,6 +611,45 @@ void test('counts exact opened and holding positions without sampling non-termin
     assert.deepEqual([stored?.run.counters.openedPositions,stored?.run.counters.openPositions],[2,1]);
     assert.deepEqual(stored?.samples.map((sample) => sample.positionId),['position-1']);
     assert.deepEqual(stored?.unknownPositions,[]);
+  });
+});
+
+void test('caps live PostgreSQL position coverage at the immutable run deadline', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL deadline coverage test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    await pool.query('DELETE FROM paper_trades');
+    await pool.query('DELETE FROM paper_positions');
+    await pool.query(`INSERT INTO token_launches (
+      mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+      created_signature,created_slot,created_transaction_index,created_instruction_index,
+      created_inner_instruction_index,detected_at,updated_at
+    ) VALUES ('MINT-GRACE','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+      'grace-signature',2,0,0,NULL,$1,$1)`, [new Date(61_500)]);
+    await pool.query(`INSERT INTO paper_positions (
+      position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+      strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+      round_trip_loss_bps,entry_trade_id,open_command_hash,trigger_event_id,
+      payload_version,payload,opened_at
+    ) VALUES
+      ('position-before-deadline','MINT','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'before-buy','before-open','before-source',1,'{}',$1),
+      ('position-during-grace','MINT-GRACE','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'grace-buy','grace-open','grace-source',1,'{}',$2)`,
+    [new Date(60_000),new Date(61_500)]);
+
+    const batch = await new PostgresPaperMvpSource(pool).collectBatch({
+      runId:'run-deadline',startedAtMs:1_000,deadlineAtMs:61_000,observedAtMs:62_000,
+      strategyId:'creation-entry-v1',strategyVersion:1,limit:10,
+    });
+
+    assert.equal(batch.openedPositions,1);
+    assert.equal(batch.openPositions,1);
+    assert.deepEqual(batch.positions,[]);
   });
 });
 

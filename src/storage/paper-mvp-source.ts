@@ -29,7 +29,8 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
     }
     input.signal?.throwIfAborted();
     const result = await this.pool.query(COLLECT_SQL, [
-      input.runId, new Date(input.startedAtMs), new Date(input.deadlineAtMs), new Date(input.observedAtMs ?? input.deadlineAtMs),
+      input.runId,new Date(input.startedAtMs),new Date(input.deadlineAtMs),
+      new Date(input.observedAtMs ?? input.deadlineAtMs),
       input.strategyId, input.strategyVersion, input.limit,
     ]);
     input.signal?.throwIfAborted();
@@ -75,14 +76,14 @@ const COLLECT_SQL = `WITH run_creations AS MATERIALIZED (
     (SELECT COUNT(*)::integer FROM (
       SELECT 1 FROM paper_positions position
       WHERE position.strategy_id=$5 AND position.strategy_version=$6
-        AND position.opened_at BETWEEN $2 AND $4::timestamptz
+        AND position.opened_at BETWEEN $2 AND LEAST($3::timestamptz,$4::timestamptz)
       LIMIT 1000001
     ) bounded) AS opened_positions,
     (SELECT COUNT(*)::integer FROM (
       SELECT 1 FROM paper_positions position
       WHERE position.strategy_id=$5 AND position.strategy_version=$6
         AND position.status='PAPER_HOLDING'
-        AND position.opened_at BETWEEN $2 AND $4::timestamptz
+        AND position.opened_at BETWEEN $2 AND LEAST($3::timestamptz,$4::timestamptz)
       LIMIT 1000001
     ) bounded) AS open_positions
 ), candidates AS MATERIALIZED (
