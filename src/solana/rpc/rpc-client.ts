@@ -102,10 +102,12 @@ export class SolanaRpcClient {
     slot: bigint,
     confirmationStatus: Exclude<LegacyConfirmationStatus, 'ORPHANED'>,
   ): Promise<readonly string[]> {
-    const numericSlot = Number(slot);
-    if (!Number.isSafeInteger(numericSlot) || numericSlot < 0) {
+    if (typeof slot !== 'bigint'
+      || slot < 0n
+      || slot > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new TypeError('Solana block slot is invalid.');
     }
+    const numericSlot = Number(slot);
     const block = await this.http.getBlockSignatures(numericSlot, rpcFinality(confirmationStatus));
     return Object.freeze([...block.signatures]);
   }

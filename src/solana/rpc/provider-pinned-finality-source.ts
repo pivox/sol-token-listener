@@ -246,7 +246,10 @@ function canonicalSignature(value: unknown): value is string {
 }
 
 function validSlot(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= 0
+    && !Object.is(value, -0);
 }
 
 function validConfirmationStatus(value: unknown): value is HistoryStatus['confirmationStatus'] {

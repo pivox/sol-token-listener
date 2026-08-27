@@ -100,6 +100,33 @@ void test('validates and freezes detached history, root, and block evidence', as
   assert.equal(await pass.getFinalizedSlot(), 99n);
 });
 
+void test('rejects negative-zero history slots as fixed unavailable evidence', async () => {
+  const rpc = new FakeRpc();
+  rpc.historyResponse = {
+    value: [{ slot: -0, confirmationStatus: 'finalized', remote: 'history-slot-secret' }],
+  };
+  const pass = createProviderPinnedFinalityPass(catalog(), 'primary', dependencies(() => rpc));
+
+  await assert.rejects(pass.getHistoryStatuses(Object.freeze([SIGNATURE])), (error: unknown) => {
+    invalid(error, 'HISTORY_UNAVAILABLE');
+    assert.equal(Object.hasOwn(error as object, 'cause'), false);
+    assert.doesNotMatch(JSON.stringify(error), /history-slot-secret/u);
+    return true;
+  });
+});
+
+void test('rejects a negative-zero finalized root as fixed unavailable evidence', async () => {
+  const rpc = new FakeRpc();
+  rpc.slotResponse = -0;
+  const pass = createProviderPinnedFinalityPass(catalog(), 'primary', dependencies(() => rpc));
+
+  await assert.rejects(pass.getFinalizedSlot(), (error: unknown) => {
+    invalid(error, 'ROOT_UNAVAILABLE');
+    assert.equal(Object.hasOwn(error as object, 'cause'), false);
+    return true;
+  });
+});
+
 void test('rejects invalid bigint block slots before RPC use', async () => {
   const rpc = new FakeRpc();
   const pass = createProviderPinnedFinalityPass(catalog(), 'primary', dependencies(() => rpc));
