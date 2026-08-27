@@ -21,6 +21,10 @@ interface PinnedCatchUpRpc extends SignaturesForAddressRpc {
   getGenesisHash(): Promise<unknown>;
 }
 
+const BASE58_TEXT = /^[1-9A-HJ-NP-Za-km-z]+$/u;
+const MIN_GENESIS_HASH_LENGTH = 32;
+const MAX_GENESIS_HASH_LENGTH = 44;
+
 export interface ProviderPinnedCatchUpSourceDependencies {
   readonly createRpc?: (httpUrl: string, commitment: Commitment) => unknown;
 }
@@ -149,7 +153,10 @@ function createDefaultRpc(httpUrl: string, commitment: Commitment): Connection {
 }
 
 function canonicalGenesisHash(value: unknown): value is string {
-  if (typeof value !== 'string') return false;
+  if (typeof value !== 'string'
+    || value.length < MIN_GENESIS_HASH_LENGTH
+    || value.length > MAX_GENESIS_HASH_LENGTH
+    || !BASE58_TEXT.test(value)) return false;
   try {
     const decoded = bs58.decode(value);
     return decoded.length === 32 && bs58.encode(decoded) === value;

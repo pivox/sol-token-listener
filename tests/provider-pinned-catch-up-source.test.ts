@@ -144,6 +144,58 @@ void test('rejects malformed, noncanonical, and non-32-byte expected genesis val
   }
 });
 
+void test('rejects oversized and forbidden expected hashes before base58 decoding', () => {
+  const originalDecode = bs58.decode;
+  let decodeCalls = 0;
+  Object.defineProperty(bs58, 'decode', {
+    configurable: true,
+    value: ((value: string) => {
+      decodeCalls += 1;
+      return originalDecode(value);
+    }) satisfies typeof bs58.decode,
+  });
+  try {
+    for (const value of ['1'.repeat(10_000), `${'1'.repeat(31)}0`]) {
+      let resolved = 0;
+      assert.throws(() => createProviderPinnedCatchUpSource(
+        catalog(() => { resolved += 1; return pair(); }), 'primary', 'confirmed', value,
+      ), (error: unknown) => invalid(error, 'CONFIG_INVALID', 'primary'));
+      assert.equal(resolved, 0);
+    }
+    assert.equal(decodeCalls, 0);
+  } finally {
+    Object.defineProperty(bs58, 'decode', { configurable: true, value: originalDecode });
+  }
+});
+
+void test('rejects oversized and forbidden RPC hashes before base58 decoding or signatures', async () => {
+  const originalDecode = bs58.decode;
+  let decodeCalls = 0;
+  Object.defineProperty(bs58, 'decode', {
+    configurable: true,
+    value: ((value: string) => {
+      decodeCalls += 1;
+      return originalDecode(value);
+    }) satisfies typeof bs58.decode,
+  });
+  try {
+    for (const actualGenesis of ['1'.repeat(10_000), `${'1'.repeat(31)}0`]) {
+      const rpc = new FakeRpc([], actualGenesis, [page('never')]);
+      const source = createProviderPinnedCatchUpSource(
+        catalog(), 'primary', 'confirmed', EXPECTED_GENESIS, dependencies(() => rpc),
+      );
+      decodeCalls = 0;
+      await assert.rejects(source.list(PROGRAM, undefined, 1), (error: unknown) => (
+        invalid(error, 'GENESIS_UNAVAILABLE', 'primary')
+      ));
+      assert.equal(decodeCalls, 0);
+      assert.equal(rpc.calls.length, 0);
+    }
+  } finally {
+    Object.defineProperty(bs58, 'decode', { configurable: true, value: originalDecode });
+  }
+});
+
 void test('reports a malformed actual genesis response as a fixed redacted unavailable error without signatures', async () => {
   const secret = 'provider-secret.invalid';
   const rpc = new FakeRpc([], `1${EXPECTED_GENESIS}`, [page('never')]);
