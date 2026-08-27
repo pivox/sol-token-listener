@@ -11,12 +11,15 @@ conditional finalized-block proof before orphaning.
 
 **Architecture:** A neutral provider-pass port separates the application from
 one pinned `Connection`. Migration 027 adds the last missing provider to the
-durable inbox, repository CAS covers provider plus count, and orphan revisions
-carry an exact transactional proof precondition. Production uses a fixed
-primary pass until #63 supplies the promoted provider.
+durable inbox, repository CAS covers provider, count and a monotone evidence
+version, and orphan revisions carry an exact transactional proof precondition.
+Production uses a fixed primary pass until #63 supplies the promoted provider.
 
 **Tech Stack:** TypeScript strict ESM, `@solana/web3.js` 1.98.4, PostgreSQL,
 bigint, Node test runner, migration 027.
+
+**Plan version:** 1.0.1. Revision 1.0.1 adds a monotone durable evidence
+generation to close provider/count/status ABA cycles.
 
 ---
 
@@ -55,6 +58,7 @@ const candidate: FinalityCandidate = Object.freeze({
   confirmationStatus: 'confirmed',
   missingFinalityPolls: 2,
   lastMissingFinalityProviderId: 'primary',
+  finalityEvidenceVersion: 7n,
   processedAtMs: 1_720_000_000_000,
 });
 
@@ -64,13 +68,15 @@ const orphaned: FinalityRevision = Object.freeze({
   expectedConfirmationStatus: 'confirmed',
   expectedMissingFinalityPolls: 3,
   expectedLastMissingFinalityProviderId: 'primary',
+  expectedFinalityEvidenceVersion: 8n,
   observedAtMs: 1_720_000_001_000,
 });
 ```
 
 Test both invalid correlations: count zero with a provider and positive count
 without one. Test invalid provider IDs, mutable/accessor-backed inputs,
-negative/unsafe counts and extra proof fields on the finalized branch.
+negative/unsafe counts, negative evidence versions and extra proof fields on
+the finalized branch.
 
 The migration test must create the schema through 026, insert one legacy row
 with `missing_finality_polls = 3`, apply 027, and assert `0/NULL`. It must then
@@ -105,6 +111,7 @@ export interface OrphanedFinalityRevision {
   readonly expectedConfirmationStatus: 'processed' | 'confirmed';
   readonly expectedMissingFinalityPolls: number;
   readonly expectedLastMissingFinalityProviderId: RpcProviderId;
+  readonly expectedFinalityEvidenceVersion: bigint;
   readonly observedAtMs: number;
 }
 
@@ -115,7 +122,8 @@ Migration 027 must be replay-safe:
 
 ```sql
 ALTER TABLE chain_transaction_inbox
-  ADD COLUMN IF NOT EXISTS last_missing_finality_provider_id TEXT;
+  ADD COLUMN IF NOT EXISTS last_missing_finality_provider_id TEXT,
+  ADD COLUMN IF NOT EXISTS finality_evidence_version BIGINT NOT NULL DEFAULT 0;
 
 UPDATE chain_transaction_inbox
 SET missing_finality_polls = 0,
@@ -141,6 +149,15 @@ BEGIN
             'primary', 'fallback-1', 'fallback-2', 'fallback-3'
           ))
       );
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chain_transaction_inbox_finality_evidence_version_check'
+      AND conrelid = 'chain_transaction_inbox'::regclass
+  ) THEN
+    ALTER TABLE chain_transaction_inbox
+      ADD CONSTRAINT chain_transaction_inbox_finality_evidence_version_check
+      CHECK (finality_evidence_version >= 0);
   END IF;
 END;
 $$;
@@ -183,8 +200,12 @@ N/provider + present status -> 0/null
 
 Add two concurrent observations with the same expected count but different
 expected providers and require exactly one success. Test stale count, stale
-provider, stale confirmation status, reset after a new confirmed notification,
-and all terminal revision paths.
+provider, stale evidence version, stale confirmation status, reset after a new
+confirmed notification, and all terminal revision paths.
+
+Add a true ABA test: retain an orphan proof at `3/primary/version N`, switch to
+fallback, then return to `3/primary/version N+k`; the retained proof must fail
+despite identical visible provider/count/status values.
 
 For orphaning, require an exact revision to succeed and each of these variants
 to fail with `TransactionInboxConflictError('finality')`:
@@ -193,6 +214,7 @@ to fail with `TransactionInboxConflictError('finality')`:
 Object.freeze({ ...proof, expectedMissingFinalityPolls: proof.expectedMissingFinalityPolls - 1 });
 Object.freeze({ ...proof, expectedLastMissingFinalityProviderId: 'fallback-1' });
 Object.freeze({ ...proof, expectedConfirmationStatus: 'processed' });
+Object.freeze({ ...proof, expectedFinalityEvidenceVersion: proof.expectedFinalityEvidenceVersion - 1n });
 ```
 
 Simulate a response lost after commit by submitting the same orphan revision
@@ -214,8 +236,8 @@ the new provider and orphan revisions have no proof guard. Without
 - [ ] **Step 3: Implement exact provider/count CAS**
 
 Extend every finality candidate `SELECT` and `RETURNING` list with
-`last_missing_finality_provider_id`. Under the existing `FOR UPDATE`, validate
-the current pair and compute:
+`last_missing_finality_provider_id` and `finality_evidence_version`. Under the
+existing `FOR UPDATE`, validate the current tuple and compute:
 
 ```ts
 const nextMissing = value.confirmationStatus !== null
@@ -231,10 +253,15 @@ The update guard must include:
 ```sql
 AND missing_finality_polls = $expected_count
 AND last_missing_finality_provider_id IS NOT DISTINCT FROM $expected_provider
+AND finality_evidence_version = $expected_version
 ```
 
 Every existing SQL path that resets `missing_finality_polls` must set
-`last_missing_finality_provider_id = NULL` in the same statement.
+`last_missing_finality_provider_id = NULL`. Every poll, existing-row durable
+notification and terminal revision enqueue must increment
+`finality_evidence_version` in the same statement. An existing-row notification
+must clear the missing sequence even when its target status is unchanged, so
+an old proof cannot survive fresh existence evidence.
 
 - [ ] **Step 4: Implement conditional orphan enqueue**
 
@@ -244,11 +271,12 @@ current confirmation, provider and counter with the revision proof. Add the
 same fields to the final `UPDATE` predicate. A stale proof must update zero
 rows and become the existing redacted finality conflict.
 
-The successful update must clear both missing fields:
+The successful update must clear both missing fields and advance the version:
 
 ```sql
 missing_finality_polls = 0,
-last_missing_finality_provider_id = NULL
+last_missing_finality_provider_id = NULL,
+finality_evidence_version = finality_evidence_version + 1
 ```
 
 - [ ] **Step 5: Run focused tests with PostgreSQL until green**
@@ -397,8 +425,8 @@ Add tests for:
 - block null, rejection or malformed data raises fixed `block`;
 - candidates sharing a slot cause one block read;
 - seventeen unique eligible slots read only the first sixteen and defer one;
-- a repository race changing provider/count makes the revision fail at stage
-  `revision`;
+- a repository race changing provider/count/version makes the revision fail at
+  stage `revision`;
 - 256 is the maximum constructor limit.
 
 The memory repository must implement provider-aware transitions exactly like
@@ -438,6 +466,7 @@ Object.freeze({
   providerId: pass.providerId,
   expectedMissingFinalityPolls: candidate.missingFinalityPolls,
   expectedLastMissingFinalityProviderId: candidate.lastMissingFinalityProviderId,
+  expectedFinalityEvidenceVersion: candidate.finalityEvidenceVersion,
   observedAtMs,
 });
 ```
@@ -455,6 +484,7 @@ Object.freeze({
   expectedConfirmationStatus: polled.confirmationStatus,
   expectedMissingFinalityPolls: polled.missingFinalityPolls,
   expectedLastMissingFinalityProviderId: pass.providerId,
+  expectedFinalityEvidenceVersion: polled.finalityEvidenceVersion,
   observedAtMs,
 });
 ```

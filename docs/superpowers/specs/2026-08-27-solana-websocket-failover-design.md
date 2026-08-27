@@ -3,8 +3,11 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.2.0
+Version: 1.2.1
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.2.1 adds a monotone durable finality-evidence generation to prevent
+an old block proof becoming valid again after a provider/count ABA cycle.
 
 Revision 1.2.0 specifies issue #61 through the dedicated provider-affine
 finality design. It makes the currently active reconciler primary-pinned,
@@ -372,7 +375,7 @@ in-memory transition journal:
 
 Issue #61 is specified in
 `docs/superpowers/specs/2026-08-27-provider-affine-finality-design.md` version
-1.0.0. One finality reconciliation pass captures one provider-pinned HTTP
+1.0.1. One finality reconciliation pass captures one provider-pinned HTTP
 capability and uses it for status reads, finalized root and finalized block
 proofs. The inbox records the positional provider ID behind the current
 missing-status sequence. A provider change starts a fresh sequence at one.
@@ -383,6 +386,8 @@ same-provider finalized canonical block that is available and does not
 contain the signature. The enqueue is conditional on the exact durable
 provider, counter and pre-terminal status still being current. A concurrent
 provider switch or status observation therefore invalidates the stale proof.
+The same precondition includes a monotone evidence generation, so an old
+proof cannot become valid again if visible provider/count values later repeat.
 
 Unavailable archive or block evidence retries and degrades; it does not prove
 orphaning. Block reads are deduplicated by slot and limited to sixteen unique

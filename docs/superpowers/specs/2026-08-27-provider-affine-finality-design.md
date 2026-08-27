@@ -3,8 +3,13 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.0
+Version: 1.0.1
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.1 adds a monotone durable finality-evidence generation. Exact
+provider/count/status checks alone permit an ABA where those visible values
+leave and later return to the same tuple, so every evidence mutation now
+invalidates all earlier orphan proofs permanently.
 
 ## Purpose
 
@@ -105,11 +110,12 @@ or weaken the explicit genesis requirement defined for #63.
 
 ## Durable model and migration 027
 
-Migration `027_listener_provider_affine_finality.sql` adds one nullable column
-to `chain_transaction_inbox`:
+Migration `027_listener_provider_affine_finality.sql` adds two columns to
+`chain_transaction_inbox`:
 
 ```sql
 last_missing_finality_provider_id TEXT
+finality_evidence_version BIGINT NOT NULL DEFAULT 0
 ```
 
 The allowed durable states are:
@@ -117,6 +123,7 @@ The allowed durable states are:
 ```text
 missing_finality_polls = 0  <=> last_missing_finality_provider_id IS NULL
 missing_finality_polls > 0  =>  provider is primary or fallback-1..3
+finality_evidence_version >= 0
 ```
 
 Existing positive counters have no trustworthy provenance because they may
@@ -138,6 +145,7 @@ export interface FinalityCandidate {
   readonly confirmationStatus: 'processed' | 'confirmed';
   readonly missingFinalityPolls: number;
   readonly lastMissingFinalityProviderId: RpcProviderId | null;
+  readonly finalityEvidenceVersion: bigint;
   readonly processedAtMs: number;
 }
 
@@ -147,29 +155,36 @@ export interface FinalityPollObservation {
   readonly providerId: RpcProviderId;
   readonly expectedMissingFinalityPolls: number;
   readonly expectedLastMissingFinalityProviderId: RpcProviderId | null;
+  readonly expectedFinalityEvidenceVersion: bigint;
   readonly observedAtMs: number;
 }
 ```
 
 `FinalityRevision` becomes a discriminated union. The `finalized` branch keeps
 its existing shape. The `orphaned` branch also carries the exact expected
-pre-terminal confirmation status, missing counter and last missing provider.
-These fields are internal evidence preconditions and are not added to public
-API responses.
+pre-terminal confirmation status, missing counter, last missing provider and
+post-poll evidence version. These fields are internal evidence preconditions
+and are not added to public API responses.
 
-Every inbox write that clears `missing_finality_polls` also clears
-`last_missing_finality_provider_id` in the same statement.
+Every inbox write that records a poll, accepts another durable notification,
+clears or replaces missing evidence, or enqueues a terminal revision increments
+`finality_evidence_version` in the same statement. An existing-row notification
+also clears the missing sequence because it is fresh evidence that the
+transaction exists. Every write that clears `missing_finality_polls` also
+clears `last_missing_finality_provider_id`.
 
 ## Poll transitions and compare-and-swap
 
-`recordFinalityPoll` locks the signature row and compares both expected fields.
-The provider is part of the CAS to prevent an ABA where two providers each
-produce the same numeric count.
+`recordFinalityPoll` locks the signature row and compares the expected count,
+provider and evidence version. The provider prevents confusing simultaneous
+same-count observations; the monotone version prevents a true ABA where a
+later sequence returns to the same visible provider/count tuple.
 
 ```text
 missing + same provider       -> count + 1, same provider
 missing + different provider  -> count 1, current pass provider
 processed/confirmed present   -> count 0, provider null
+every successful transition   -> evidence version + 1
 ```
 
 An observed `processed` status never regresses a durable `confirmed` status.
@@ -183,11 +198,14 @@ requires all of the following to remain exact:
 - processing status is `PROCESSED`;
 - target confirmation is the expected `processed` or `confirmed` value;
 - missing counter equals the post-poll counter;
-- last missing provider equals the current pass provider.
+- last missing provider equals the current pass provider;
+- evidence version equals the post-poll monotone version.
 
-A status observation, provider switch, competing poll or competing revision
-invalidates the proof and returns the existing fixed finality conflict. A
-reconciler failure then leaves the component `DEGRADED` until a later pass
+A status observation, provider switch, competing poll, duplicate durable
+notification or competing revision increments the version and permanently
+invalidates the proof. Repeating the same visible provider/count/status tuple
+does not restore an old version. A stale enqueue returns the existing fixed
+finality conflict, and the reconciler remains `DEGRADED` until a later pass
 builds fresh evidence.
 
 Idempotent replay remains valid. If the first orphan enqueue committed but its
@@ -207,7 +225,7 @@ For each non-empty bounded candidate page:
 4. Enqueue an explicit `finalized` status through the existing durable replay
    path.
 5. Record every `processed`, `confirmed` or missing observation with the pass
-   provider and exact expected provider/count CAS.
+   provider and exact expected provider/count/version CAS.
 6. Consider only returned missing candidates whose same-provider count has
    reached the configured threshold and whose slot is strictly below the
    same-provider finalized root.
@@ -281,13 +299,17 @@ The implementation follows the official Solana contracts for
 - Crash after orphan enqueue is handled by the existing durable `PENDING`
   worker replay.
 - A lost database response is safe because orphan replay is idempotent.
-- Two process replicas may duplicate RPC reads, but exact provider/count/status
-  preconditions prevent a stale pass from mixing or overwriting evidence.
+- Two process replicas may duplicate RPC reads, but exact
+  provider/count/status/version preconditions prevent a stale pass from
+  mixing or overwriting evidence.
+- A provider/count tuple may repeat after any number of switches or resets,
+  but its strictly greater evidence version can never satisfy an old proof.
 - A finalized/orphaned terminal contradiction remains rejected by the
   existing monotonic confirmation domain.
 
-No process-local proof cache survives a pass or restart. Only the positional
-provider behind consecutive misses is durable.
+No process-local proof cache survives a pass or restart. The positional
+provider behind consecutive misses and its monotone evidence generation are
+durable.
 
 ## Error handling and redaction
 
@@ -328,10 +350,12 @@ projection or terminal retention row is deleted.
 
 ### Domain and unit tests
 
-- frozen provider-aware candidates, observations and revision union;
+- frozen provider-aware candidates, evidence versions, observations and
+  revision union;
 - count/provider correlation and invalid positional IDs;
 - same-provider increments and provider-switch reset to one;
-- exact expected provider/count CAS and ABA rejection;
+- exact expected provider/count/version CAS and true ABA rejection after a
+  switch away and back to the same tuple;
 - status present resets count/provider without status regression;
 - status/root/block calls use one captured provider pass;
 - finalized status, equal root, higher root and mismatched slots;
@@ -358,7 +382,8 @@ projection or terminal retention row is deleted.
 - legacy positive counter reset and direct migration replay;
 - SQL correlation constraint and allowed provider IDs;
 - same-provider increment, switch reset and provider-aware CAS conflict;
-- conditional orphan enqueue with stale count, provider and status variants;
+- conditional orphan enqueue with stale count, provider, status and evidence
+  version variants;
 - response-lost idempotent replay;
 - crash/restart after each poll/proof/revision boundary;
 - finalized and orphaned worker replay remains idempotent;
