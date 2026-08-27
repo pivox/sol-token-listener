@@ -15,6 +15,7 @@ export type ListenerCatchUpPolicy = 'live-edge' | 'strict';
 export interface AppConfig {
   readonly cluster: string;
   readonly httpRpcUrl: string;
+  readonly httpRpcFallbackUrls: readonly string[];
   readonly wsRpcUrl: string;
   readonly commitment: 'processed' | 'confirmed' | 'finalized';
   readonly finality: 'confirmed' | 'finalized';
@@ -183,10 +184,16 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     executionMode,
     qualificationProfilePath,
   );
+  const httpRpcUrl = requiredUrl(environment.SOLANA_HTTP_RPC_URL, 'SOLANA_HTTP_RPC_URL', ['http:', 'https:']);
+  const httpRpcFallbackUrls = parseHttpRpcFallbackUrls(
+    environment.SOLANA_HTTP_RPC_FALLBACK_URLS,
+    httpRpcUrl,
+  );
 
   return {
     cluster: optional(environment.SOLANA_CLUSTER, 'mainnet-beta'),
-    httpRpcUrl: requiredUrl(environment.SOLANA_HTTP_RPC_URL, 'SOLANA_HTTP_RPC_URL', ['http:', 'https:']),
+    httpRpcUrl,
+    httpRpcFallbackUrls,
     wsRpcUrl: requiredUrl(environment.SOLANA_WS_RPC_URL, 'SOLANA_WS_RPC_URL', ['ws:', 'wss:']),
     commitment: parseEnum(environment.SOLANA_COMMITMENT, 'confirmed', ['processed', 'confirmed', 'finalized']),
     finality: parseEnum(environment.SOLANA_FINALITY_COMMITMENT, 'finalized', ['confirmed', 'finalized']),
@@ -693,6 +700,48 @@ function requiredUrl(raw: string | undefined, name: string, protocols: readonly 
     throw new Error(`${name} must use ${protocols.join(' or ')}.`);
   }
   return parsed.toString();
+}
+
+function parseHttpRpcFallbackUrls(raw: string | undefined, primaryUrl: string): readonly string[] {
+  if (!hasValue(raw)) return Object.freeze([]);
+
+  const entries = raw.split(',').map((entry) => entry.trim());
+  if (entries.some((entry) => entry.length === 0)) {
+    throw new Error('SOLANA_HTTP_RPC_FALLBACK_URLS must not contain empty endpoints.');
+  }
+  if (entries.length > 3) {
+    throw new Error('SOLANA_HTTP_RPC_FALLBACK_URLS supports at most 3 fallback endpoints.');
+  }
+
+  const primary = new URL(primaryUrl);
+  if (primary.href.includes('#')) {
+    throw new Error('HTTP RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+  }
+  const primaryProtocol = primary.protocol;
+  const canonicalUrls: string[] = [];
+  for (const entry of entries) {
+    let parsed: URL;
+    try {
+      parsed = new URL(entry);
+    } catch {
+      throw new Error('SOLANA_HTTP_RPC_FALLBACK_URLS must contain valid absolute HTTP(S) URLs.');
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('SOLANA_HTTP_RPC_FALLBACK_URLS must contain valid absolute HTTP(S) URLs.');
+    }
+    if (parsed.href.includes('#')) {
+      throw new Error('HTTP RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+    }
+    if (parsed.protocol !== primaryProtocol) {
+      throw new Error('SOLANA_HTTP_RPC_FALLBACK_URLS must use the same scheme as SOLANA_HTTP_RPC_URL.');
+    }
+    const canonicalUrl = parsed.toString();
+    if (canonicalUrl === primaryUrl || canonicalUrls.includes(canonicalUrl)) {
+      throw new Error('SOLANA_HTTP_RPC_FALLBACK_URLS must not contain duplicate endpoints.');
+    }
+    canonicalUrls.push(canonicalUrl);
+  }
+  return Object.freeze(canonicalUrls);
 }
 
 function parseEnum<const T extends string>(

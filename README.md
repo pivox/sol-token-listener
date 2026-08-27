@@ -125,7 +125,22 @@ un statut visible lors d’une resynchronisation SSE. Voir le
 [guide frontend](frontend/README.md).
 
 Renseigner `SOLANA_HTTP_RPC_URL`, `SOLANA_WS_RPC_URL` et `DATABASE_URL`, sans
-secret de wallet. Les migrations ne sont pas lancées automatiquement par
+secret de wallet. Pour un basculement HTTP optionnel en production, définir
+`SOLANA_HTTP_RPC_FALLBACK_URLS` comme une liste ordonnée séparée par des
+virgules de maximum trois fallbacks; l'endpoint principal reste
+`SOLANA_HTTP_RPC_URL`, les doublons canoniques sont refusés et toutes les URLs
+HTTP doivent utiliser le même schéma.
+Sans fallback, le comportement single-endpoint web3.js et son rate-limit retry
+restent exactement inchangés. Avec des fallbacks, la rotation est limitée aux
+rejets réseau et aux statuts 429/502/503/504; elle ne s'applique ni aux autres
+4xx, ni à une erreur JSON-RPC en HTTP 200, ni à un résultat archive `null`.
+`SOLANA_WS_RPC_URL` demeure une seule URL : le basculement WebSocket contrôlé
+relève de l'issue #57. Les événements sans secret `rpc.http_endpoint_degraded`,
+`rpc.http_failover` et `rpc.http_endpoints_exhausted` sont la source des
+métriques V1 dérivées des logs. Voir le [guide d'exploitation RPC](docs/operations/rpc-qualification.md)
+pour les délais de refroidissement, les limites et la qualification mono-fournisseur du soak.
+
+Les migrations ne sont pas lancées automatiquement par
 défaut. `npm run build` les embarque dans `dist/migrations`, de sorte que
 `POSTGRES_AUTO_MIGRATE=true npm start` fonctionne avec l'artefact compilé.
 Les exécuter explicitement si nécessaire :
@@ -286,6 +301,11 @@ création exclusive du fichier échoue, le résultat terminal reste immuable dan
 déjà durable vers un nouveau chemin, toujours en création exclusive, puis
 vérifiez son contenu/hash. Voir le
 [runbook paper MVP](docs/operations/paper-mvp-validation.md).
+
+La validation terrain Issue #49 des 50 positions Mainnet reste non exécutée et
+non validée; elle ne constitue donc ni une preuve de préparation opérationnelle
+ni de profitabilité. Le produit reste observe/paper only, sans wallet, signature
+ni soumission de transaction.
 
 ## API V1
 

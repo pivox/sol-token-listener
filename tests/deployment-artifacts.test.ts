@@ -220,7 +220,10 @@ void test('Compose defines an observe-only, five-service deployment without expo
 
   const app = composeService(compose, 'app');
   assert.match(app, /^ {4}environment:\s*\n {6}<<: \*database-environment$/m);
-  assert.match(app, /^ {6}SOLANA_HTTP_RPC_URL: \$\{SOLANA_HTTP_RPC_URL:\?SOLANA_HTTP_RPC_URL is required\}$/m);
+  assert.match(
+    app,
+    /^ {6}SOLANA_HTTP_RPC_URL: \$\{SOLANA_HTTP_RPC_URL:\?SOLANA_HTTP_RPC_URL is required\}\n {6}SOLANA_HTTP_RPC_FALLBACK_URLS: \$\{SOLANA_HTTP_RPC_FALLBACK_URLS:-\}$/m,
+  );
   assert.match(app, /^ {6}SOLANA_WS_RPC_URL: \$\{SOLANA_WS_RPC_URL:\?SOLANA_WS_RPC_URL is required\}$/m);
   assert.match(app, /^ {6}EXECUTION_MODE: observe$/m);
   assert.match(app, /^ {6}PAPER_STRATEGY_ENABLED: "false"$/m);
@@ -324,6 +327,7 @@ void test('Compose environment template contains documentation-only required inp
     `BACKEND_IMAGE=registry.invalid/sol-token-listener/backend@sha256:${'0'.repeat(64)}`,
     `FRONTEND_IMAGE=registry.invalid/sol-token-listener/frontend@sha256:${'1'.repeat(64)}`,
     'SOLANA_HTTP_RPC_URL=https://rpc-provider.invalid',
+    'SOLANA_HTTP_RPC_FALLBACK_URLS=',
     'SOLANA_WS_RPC_URL=wss://rpc-provider.invalid',
     'FRONTEND_PORT=8080',
     'LISTENER_ENABLED=true',
@@ -335,6 +339,10 @@ void test('Compose environment template contains documentation-only required inp
   assert.match(environment, /must be replaced/i);
   assert.match(environment, /POSTGRES_PASSWORD_URI_ENCODED must be the percent-encoding of POSTGRES_PASSWORD/i);
   assert.match(environment, /unreserved example values can be identical/i);
+  assert.match(
+    environment,
+    /^# Optional ordered, comma-separated fallback HTTP RPC URLs \(maximum 3\); use the same scheme and this can remain blank\.\nSOLANA_HTTP_RPC_FALLBACK_URLS=$/m,
+  );
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/i);
   for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE']) {
     assert.match(environment, new RegExp(`^${name}=registry\\.invalid/[^\\s@]+@sha256:[0-9a-f]{64}$`, 'm'));

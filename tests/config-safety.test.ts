@@ -11,6 +11,134 @@ const base = {
   SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
 };
 
+void test('fallback HTTP RPC defaults to a frozen empty list when absent or whitespace-only', () => {
+  for (const value of [undefined, '   ']) {
+    const config = parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: value });
+    assert.deepEqual(config.httpRpcFallbackUrls, []);
+    assert.equal(Object.isFrozen(config.httpRpcFallbackUrls), true);
+  }
+});
+
+void test('fallback HTTP RPC preserves order and canonicalizes valid endpoints', () => {
+  const config = parseConfig({
+    ...base,
+    SOLANA_HTTP_RPC_FALLBACK_URLS: 'HTTPS://ONE.EXAMPLE.INVALID,https://two.example.invalid/path',
+  });
+  assert.deepEqual(config.httpRpcFallbackUrls, [
+    'https://one.example.invalid/',
+    'https://two.example.invalid/path',
+  ]);
+  assert.equal(Object.isFrozen(config.httpRpcFallbackUrls), true);
+});
+
+void test('fallback HTTP RPC rejects canonical duplicates including the primary endpoint', () => {
+  for (const value of [
+    'https://rpc.example.invalid/',
+    'https://fallback.example.invalid,https://fallback.example.invalid/',
+  ]) {
+    assert.throws(
+      () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: value }),
+      /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+    );
+  }
+});
+
+void test('fallback HTTP RPC rejects empty entries', () => {
+  for (const value of [
+    ',https://fallback.example.invalid',
+    'https://fallback.example.invalid,',
+    'https://one.example.invalid,,https://two.example.invalid',
+  ]) {
+    assert.throws(
+      () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: value }),
+      /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+    );
+  }
+});
+
+void test('fallback HTTP RPC rejects invalid URLs and protocols', () => {
+  for (const value of ['not a URL', 'ftp://fallback.example.invalid']) {
+    assert.throws(
+      () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: value }),
+      /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+    );
+  }
+});
+
+void test('fallback HTTP RPC rejects a fallback URL fragment with a fixed redacted error', () => {
+  const fallback = 'https://fallback.example.invalid/rpc#fallback-secret';
+  assert.throws(
+    () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: fallback }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, 'HTTP RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+      assert.doesNotMatch(String(error), /fallback-secret|fallback\.example\.invalid|\/rpc/iu);
+      return true;
+    },
+  );
+});
+
+void test('fallback HTTP RPC rejects a primary URL fragment only when fallbacks are configured', () => {
+  const primary = 'https://rpc.example.invalid/rpc#primary-secret';
+  assert.equal(parseConfig({ ...base, SOLANA_HTTP_RPC_URL: primary }).httpRpcUrl, primary);
+
+  assert.throws(
+    () => parseConfig({
+      ...base,
+      SOLANA_HTTP_RPC_URL: primary,
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://fallback.example.invalid/rpc',
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, 'HTTP RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+      assert.doesNotMatch(String(error), /primary-secret|rpc\.example\.invalid|\/rpc/iu);
+      return true;
+    },
+  );
+});
+
+void test('fallback HTTP RPC rejects mixed schemes', () => {
+  assert.throws(
+    () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: 'http://fallback.example.invalid' }),
+    /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+  );
+});
+
+void test('fallback HTTP RPC rejects more than three fallback endpoints', () => {
+  assert.throws(
+    () => parseConfig({
+      ...base,
+      SOLANA_HTTP_RPC_FALLBACK_URLS: [
+        'https://one.example.invalid',
+        'https://two.example.invalid',
+        'https://three.example.invalid',
+        'https://four.example.invalid',
+      ].join(','),
+    }),
+    /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+  );
+});
+
+void test('fallback HTTP RPC validation errors redact configured endpoint secrets', () => {
+  const secretEndpoint = 'ftp://user:super-secret@private.example.invalid/path?apiKey=private-key';
+  assert.throws(
+    () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: secretEndpoint }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      for (const secret of [
+        secretEndpoint,
+        'user',
+        'super-secret',
+        'private.example.invalid',
+        '/path',
+        'apiKey',
+        'private-key',
+      ]) assert.equal(error.message.includes(secret), false);
+      return true;
+    },
+  );
+});
+
 void test('le mode par défaut est strictement observe', () => {
   const config = parseConfig(base);
   assert.equal(config.executionMode, 'observe');
@@ -598,6 +726,55 @@ void test('Pump.fun calibration documentation states the initial profile, semant
   assert.match(architecture, /inconnu.*UNKNOWN.*ne.*faux/isu);
   assert.match(readme, /métadonnées.*liens sociaux.*ne prouvent.*sérieux/isu);
   assert.doesNotMatch(systemOverview, /704 tests réussis/iu);
+});
+
+void test('HTTP RPC failover documentation states the bounded production and soak contract', async () => {
+  const [readme, operations] = await Promise.all([
+    readFile(new URL('../README.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/operations/rpc-qualification.md', import.meta.url), 'utf8'),
+  ]);
+  const documentation = `${readme}\n${operations}`;
+
+  for (const statement of [
+    'SOLANA_HTTP_RPC_FALLBACK_URLS',
+    'liste ordonnée',
+    'séparée par',
+    'des virgules',
+    'principal',
+    'fallback-1',
+    'fallback-2',
+    'fallback-3',
+    'au plus trois',
+    'même schéma HTTP',
+    'doublons canoniques',
+    "fragments d'URL sont interdits",
+    'ne sont pas transmis',
+    'réinitialise la préférence vers le principal',
+    'rpc.http_endpoint_degraded',
+    'rpc.http_failover',
+    'rpc.http_endpoints_exhausted',
+    'Retry-After',
+    '60 secondes',
+    'erreur JSON-RPC',
+    'résultat archive null',
+    'SOLANA_WS_RPC_URL',
+    'issue #57',
+    'mono-fournisseur',
+    'SOLANA_HTTP_RPC_URL + SOLANA_WS_RPC_URL',
+    '50 positions Mainnet',
+    'non exécutée',
+    'non validée',
+    'observe/paper only',
+  ]) assert.ok(documentation.includes(statement), `missing HTTP RPC failover documentation statement: ${statement}`);
+
+  assert.match(readme, /Sans fallback[\s\S]{0,180}web3\.js[\s\S]{0,100}rate.limit retry/iu);
+  assert.match(operations, /rejet réseau[\s\S]{0,180}429[\s\S]{0,180}502[\s\S]{0,180}503[\s\S]{0,180}504/iu);
+  assert.match(operations, /chaque endpoint éligible[\s\S]{0,120}au plus une fois[\s\S]{0,120}requête logique/iu);
+  assert.match(operations, /refroidissement[\s\S]{0,120}aucune attente interne/iu);
+  assert.match(operations, /URL[\s\S]{0,120}hôte[\s\S]{0,120}en-tête[\s\S]{0,120}corps[\s\S]{0,120}erreur fournisseur[\s\S]{0,120}clé API/iu);
+  assert.match(operations, /indépendamment[\s\S]{0,180}quota[\s\S]{0,180}cohérence archive/iu);
+  assert.match(operations, /basculement de production[\s\S]{0,180}soak/iu);
+  assert.match(readme, /wallet[\s\S]{0,80}signature[\s\S]{0,80}soumission/iu);
 });
 
 void test('qualification loader, evaluator, profile, and public API boundaries exclude execution primitives', async () => {

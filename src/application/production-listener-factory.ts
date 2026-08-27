@@ -25,6 +25,7 @@ import { SolanaCatchUpSource } from '../solana/rpc/catch-up-source.js';
 import { SolanaMarketRpcReader } from '../solana/rpc/market-rpc-reader.js';
 import { SolanaProgramSubscriber } from '../solana/rpc/program-subscriber.js';
 import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
+import type { RpcHttpFailoverEvent } from '../solana/rpc/http-failover-transport.js';
 import { SolanaTransactionLocator } from '../solana/rpc/transaction-locator.js';
 import { SolanaWalletFundingEvidenceExtractor } from '../solana/wallet-funding-evidence-extractor.js';
 import { getDatabasePool } from '../storage/database.js';
@@ -85,11 +86,17 @@ export function createUnavailableBondingCurveReader(): PumpFunBondingCurveStateR
   });
 }
 
+function logRpcHttpFailoverEvent(event: RpcHttpFailoverEvent): void {
+  logger.warn(event, 'Événement de basculement HTTP RPC observé.');
+}
+
 export function createProductionListenerRuntime(
   config: AppConfig,
   pool: ProductionPool = getDatabasePool(),
 ): ListenerRuntime {
-  const rpc = new SolanaRpcClient(config);
+  const rpc = new SolanaRpcClient(config, {
+    onHttpFailoverEvent: logRpcHttpFailoverEvent,
+  });
   const inbox = new PostgresTransactionInboxRepository(pool, Object.freeze({
     maxAttempts: config.rpcRetryMaxAttempts,
     baseDelayMs: config.rpcRetryBaseDelayMs,
