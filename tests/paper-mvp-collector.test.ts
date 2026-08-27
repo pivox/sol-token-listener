@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
+import { createPaperMvpPositionSample } from '../src/domain/paper-mvp.js';
 import type { PaperMvpRepository, PaperMvpRunSnapshot } from '../src/ports/paper-mvp-repository.js';
 import type { PaperMvpSource } from '../src/ports/paper-mvp-source.js';
 import { PaperMvpCollector } from '../src/application/paper-mvp-collector.js';
@@ -731,7 +732,7 @@ void test('waits on a confirmed close and records only UNKNOWN after its orphan 
   });
 });
 
-void test('retains an expired entry decision job until the active run samples its position', async (context) => {
+void test('retains sampled expired position coverage until the active run terminalizes', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: PostgreSQL decision job retention test skipped');
@@ -741,43 +742,143 @@ void test('retains an expired entry decision job until the active run samples it
     await seedPostgresFacts(pool);
     const now = Date.now();
     const expiredAt = now - 1_000;
-    const terminalAt = expiredAt - 14_400_000;
+    const startedAt = now - 61_000;
+    const sourceTerminalAt = expiredAt - 14_400_000;
+    await pool.query(`UPDATE token_launches SET detected_at=$2,updated_at=$2,
+      terminal_at=$3,purge_after=$3 WHERE mint=$1`, [
+      'MINT',new Date(startedAt - 1),new Date(expiredAt),
+    ]);
     await pool.query(`UPDATE paper_decision_jobs SET
       created_at=$2,updated_at=$3,terminal_at=$3,purge_after=$4
       WHERE job_id=$1`, [
-      `paper_job_${'a'.repeat(64)}`,new Date(terminalAt - 1_000),
-      new Date(terminalAt),new Date(expiredAt),
+      `paper_job_${'a'.repeat(64)}`,new Date(sourceTerminalAt - 1_000),
+      new Date(sourceTerminalAt),new Date(expiredAt),
     ]);
     await pool.query(`UPDATE domain_events SET terminal_at=$2,purge_after=$3
-      WHERE event_id=$1`, ['source-open',new Date(terminalAt),new Date(expiredAt)]);
+      WHERE event_id=$1`, ['source-open',new Date(sourceTerminalAt),new Date(expiredAt)]);
     await pool.query(`UPDATE raw_chain_events SET terminal_at=$2,purge_after=$3
-      WHERE event_id=$1`, ['raw-open',new Date(terminalAt),new Date(expiredAt)]);
+      WHERE event_id=$1`, ['raw-open',new Date(sourceTerminalAt),new Date(expiredAt)]);
     await pool.query(`UPDATE paper_positions SET opened_at=$2,closed_at=$3,purge_after=$4
       WHERE position_id=$1`, [
-      'position-1',new Date(now - 50_000),new Date(now - 40_000),new Date(expiredAt),
+      'position-1',new Date(startedAt + 4_000),new Date(startedAt + 8_000),new Date(expiredAt),
     ]);
     const repository = new PostgresPaperMvpRepository(pool);
-    const run = await repository.startOrResume(runSnapshot.run.configuration, OWNER, now - 61_000);
+    const run = await repository.startOrResume(runSnapshot.run.configuration,OWNER,startedAt);
+    const sample = createPaperMvpPositionSample({
+      positionId:'position-1',mint:'MINT',quoteMint:'SOL',exitReason:'TAKE_PROFIT_2X_EXECUTABLE',
+      creationDetectedAtMs:startedAt - 1,entryDecisionAtMs:startedAt + 2_000,
+      entryQuoteAtMs:startedAt + 3_000,paperBuyAtMs:startedAt + 4_000,
+      exitTriggerAtMs:startedAt + 5_000,exitQuoteAtMs:startedAt + 6_000,
+      paperSellAtMs:startedAt + 8_000,buyAmountInRaw:1_000n,buyAmountOutRaw:110n,
+      buyMinimumAmountOutRaw:100n,buyFeesRaw:1n,buySlippageBps:10n,
+      buyPriceImpactBps:20n,sellAmountInRaw:100n,sellAmountOutRaw:2_001n,
+      sellMinimumAmountOutRaw:2_000n,sellFeesRaw:1n,sellSlippageBps:11n,
+      sellPriceImpactBps:21n,networkFeeRawPerTransaction:5_000n,
+    });
+    const progressed = await repository.recordProgress({
+      runId:run.runId,runnerOwnerId:OWNER,expectedUpdatedAtMs:run.updatedAtMs,
+      observedAtMs:now,counters:Object.freeze({
+        creationsObserved:1,entriesRejected:0,duplicateLogicalBuys:0,duplicateLogicalSells:0,
+        openedPositions:1,openPositions:0,
+      }),providerUsage:run.providerUsage,samples:Object.freeze([sample]),
+      unknownPositions:Object.freeze([]),
+    });
 
     const protectedPurge = await purgeExpiredFoundationData(pool);
     assert.equal(protectedPurge.paperDecisionJobs,0);
+    assert.equal(protectedPurge.paperTrades,0);
     assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,1);
-    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id='source-open'")).rowCount,1);
-    assert.equal((await pool.query("SELECT 1 FROM raw_chain_events WHERE event_id='raw-open'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM paper_positions WHERE position_id='position-1'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM paper_trades WHERE position_id='position-1'")).rowCount,4);
+    assert.equal((await pool.query("SELECT 1 FROM token_launches WHERE mint='MINT'")).rowCount,1);
+    const coverage = await new PostgresPaperMvpSource(pool).collectBatch({
+      runId:run.runId,startedAtMs:run.startedAtMs,deadlineAtMs:run.deadlineAtMs,
+      observedAtMs:now,strategyId:'creation-entry-v1',strategyVersion:1,limit:10,
+    });
+    assert.equal(coverage.openedPositions,1);
+    assert.equal(coverage.openPositions,0);
+    assert.deepEqual(coverage.positions,[]);
 
-    await repository.recordProgress({
-      runId:run.runId,runnerOwnerId:OWNER,
-      expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:now,counters:Object.freeze({
-        creationsObserved:0,entriesRejected:0,duplicateLogicalBuys:0,duplicateLogicalSells:0,
-      }),providerUsage:run.providerUsage,samples:Object.freeze([]),unknownPositions:Object.freeze([
-        Object.freeze({ positionId:'position-1',reason:'SOURCE_CONTRADICTION' as const }),
-      ]),
+    await repository.terminalize({
+      runId:run.runId,runnerOwnerId:OWNER,terminalAtMs:progressed.updatedAtMs,
+      state:'FAILED',completionReason:null,report:null,failureCode:'TEST_TERMINAL',
     });
     const releasedPurge = await purgeExpiredFoundationData(pool);
     assert.equal(releasedPurge.paperDecisionJobs,1);
     assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,0);
-    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id='source-open'")).rowCount,0);
-    assert.equal((await pool.query("SELECT 1 FROM raw_chain_events WHERE event_id='raw-open'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM paper_positions WHERE position_id='position-1'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM paper_trades WHERE position_id='position-1'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM token_launches WHERE mint='MINT'")).rowCount,0);
+  });
+});
+
+void test('retains holding jobs and positions closed after deadline for an active run', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL active position retention test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const now = Date.now();
+    const startedAt = now - 60_001;
+    const deadlineAt = startedAt + 60_000;
+    const expiredAt = now - 1;
+    const jobTerminalAt = expiredAt - 14_400_000;
+    const holdingJobId = `paper_job_${'a'.repeat(64)}`;
+    const lateJobId = `paper_job_${'c'.repeat(64)}`;
+    await pool.query(`UPDATE paper_decision_jobs SET created_at=$2,updated_at=$3,
+      terminal_at=$3,purge_after=$4 WHERE job_id=$1`, [
+      holdingJobId,new Date(jobTerminalAt - 1_000),new Date(jobTerminalAt),new Date(expiredAt),
+    ]);
+    await pool.query(`INSERT INTO paper_decision_jobs (
+      job_id,mint,source_event_id,source_raw_event_id,source_confirmation_status,
+      input_fingerprint,status,max_attempts,base_delay_ms,created_at,updated_at,
+      terminal_at,purge_after,payload_version,payload
+    ) VALUES ($1,'MINT','source-open','raw-open','confirmed',$2,'COMPLETED',3,100,
+      $3,$4,$4,$5,1,'{}')`, [
+      lateJobId,'d'.repeat(64),new Date(jobTerminalAt - 1_000),new Date(jobTerminalAt),
+      new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE paper_positions SET status='PAPER_HOLDING',opened_at=$2,
+      closed_at=NULL,purge_after=NULL,entry_decision_at=$3 WHERE position_id=$1`, [
+      'position-1',new Date(startedAt + 1_000),new Date(startedAt),
+    ]);
+    await pool.query(`INSERT INTO paper_positions (
+      position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+      strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+      quote_proceeds_raw,gross_pnl_quote_raw,net_pnl_quote_raw,round_trip_loss_bps,
+      entry_trade_id,exit_trade_id,open_command_hash,close_command_hash,trigger_event_id,
+      payload_version,payload,opened_at,closed_at,purge_after,entry_decision_at,
+      entry_decision_job_id
+    ) VALUES ('position-after-deadline','MINT','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+      'PAPER_CLOSED',1,0,1,1,0,0,0,'late-buy','late-sell','late-open','late-close',
+      'source-open',1,'{}',$1,$2,$2,$3,$4)`, [
+      new Date(startedAt + 2_000),new Date(deadlineAt + 1),new Date(startedAt + 1_000),lateJobId,
+    ]);
+    const tradeSql = `INSERT INTO paper_trades (
+      trade_id,position_id,side,quote_id,input_mint,output_mint,amount_in_raw,
+      amount_out_raw,minimum_amount_out_raw,fill_amount_out_raw,fees_raw,slippage_bps,
+      price_impact_bps,reason,payload_version,payload,created_at,quote_observed_at
+    ) VALUES ($1,'position-after-deadline',$2,$3,$4,$5,1,1,1,1,0,0,0,$6,1,'{}',$7,$7)`;
+    await pool.query(tradeSql, ['late-buy','BUY','late-buy-quote','SOL','MINT',
+      'QUALIFIED_ENTRY',new Date(deadlineAt)]);
+    await pool.query(tradeSql, ['late-sell','SELL','late-sell-quote','MINT','SOL',
+      'MANUAL_KILL_SWITCH',new Date(deadlineAt + 1)]);
+    const repository = new PostgresPaperMvpRepository(pool);
+    await repository.startOrResume(runSnapshot.run.configuration,OWNER,startedAt);
+
+    const protectedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.paperDecisionJobs,0);
+    assert.equal(protectedPurge.paperTrades,0);
+    assert.equal((await pool.query('SELECT job_id FROM paper_decision_jobs')).rowCount,2);
+    assert.equal((await pool.query("SELECT 1 FROM paper_positions WHERE position_id='position-1'")).rowCount,1);
+    assert.equal((await pool.query(
+      "SELECT 1 FROM paper_positions WHERE position_id='position-after-deadline'",
+    )).rowCount,1);
+    assert.equal((await pool.query(
+      "SELECT 1 FROM paper_trades WHERE position_id='position-after-deadline'",
+    )).rowCount,2);
   });
 });
 

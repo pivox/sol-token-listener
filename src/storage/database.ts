@@ -305,13 +305,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            AND run.strategy_id=position.strategy_id
            AND run.strategy_version=position.strategy_version
            AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-            AND position.closed_at <= run.deadline_at
            WHERE position.entry_decision_job_id=job.job_id
-             AND NOT EXISTS (
-               SELECT 1 FROM paper_mvp_position_samples sample
-               WHERE sample.run_id=run.run_id
-                 AND sample.position_id=position.position_id
-             )
          )`,
     );
     const paperTrades = await client.query(
@@ -324,12 +318,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
              AND run.strategy_id = position.strategy_id
              AND run.strategy_version = position.strategy_version
              AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-             AND position.closed_at <= run.deadline_at
-             AND NOT EXISTS (
-               SELECT 1 FROM paper_mvp_position_samples sample
-               WHERE sample.run_id = run.run_id
-                 AND sample.position_id = position.position_id
-             )
          )`,
     );
     const paperPositions = await client.query(
@@ -341,12 +329,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
              AND run.strategy_id = position.strategy_id
              AND run.strategy_version = position.strategy_version
              AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-             AND position.closed_at <= run.deadline_at
-             AND NOT EXISTS (
-               SELECT 1 FROM paper_mvp_position_samples sample
-               WHERE sample.run_id = run.run_id
-                 AND sample.position_id = position.position_id
-             )
          )`,
     );
     const transitions = await client.query(
@@ -574,12 +556,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
                    AND run.strategy_id = position.strategy_id
                    AND run.strategy_version = position.strategy_version
                    AND position.opened_at BETWEEN run.started_at AND run.deadline_at
-                   AND position.closed_at <= run.deadline_at
-                   AND NOT EXISTS (
-                     SELECT 1 FROM paper_mvp_position_samples sample
-                     WHERE sample.run_id = run.run_id
-                       AND sample.position_id = position.position_id
-                   )
                ))
          )`,
     );
