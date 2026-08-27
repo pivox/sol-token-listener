@@ -2,7 +2,7 @@ import type {
   PaperMvpCompletionReason,
   PaperMvpPositionSample,
   PaperMvpProviderUsage,
-  PaperMvpReportV1,
+  PaperMvpReportV2,
 } from '../domain/paper-mvp.js';
 
 export interface PaperMvpRunConfiguration {
@@ -83,7 +83,7 @@ export type PaperMvpTerminalization =
     terminalAtMs: number;
     state: 'COMPLETED';
     completionReason: Exclude<PaperMvpCompletionReason, 'LEGACY'>;
-    report: PaperMvpReportV1;
+    report: PaperMvpReportV2;
     failureCode: null;
   }>
   | Readonly<{

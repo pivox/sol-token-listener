@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   createPaperMvpPositionSample,
   createPaperMvpReport,
+  type PaperMvpReportV1,
 } from '../src/domain/paper-mvp.js';
 
 void test('creates an exact causal sample and applies both network fees', () => {
@@ -48,7 +49,7 @@ void test('builds a deterministic PASS report with integer rates and provider us
     },
   });
 
-  assert.equal(report.schemaVersion, 'paper-mvp.v1');
+  assert.equal(report.schemaVersion, 'paper-mvp.v2');
   assert.equal(report.completionReason, 'TARGET_REACHED');
   assert.equal(report.verdict, 'PASS');
   assert.equal(report.closedPositions, 50);
@@ -58,6 +59,25 @@ void test('builds a deterministic PASS report with integer rates and provider us
   assert.equal(report.maximumDrawdownBps, 0);
   assert.equal(report.creditsPerClosedPositionRaw, '2');
   assert.deepEqual(report.exitCounts, { '10_UNIQUE_BUYERS': 50, '2X': 0, SAFETY: 0 });
+});
+
+void test('keeps the historical paper-mvp.v1 type free of v2-only metrics', () => {
+  const historical: PaperMvpReportV1 = Object.freeze({
+    schemaVersion:'paper-mvp.v1',runId:'legacy-run',completionReason:'LEGACY',
+    startedAt:'2026-08-27T00:00:00.000Z',completedAt:'2026-08-27T00:01:00.000Z',
+    technicalStatus:'COMPLETED',verdict:'PASS',targetClosedPositions:1,closedPositions:1,
+    creationsObserved:1,entriesRejected:0,
+    exitCounts:Object.freeze({ '10_UNIQUE_BUYERS':1,'2X':0,SAFETY:0 }),
+    grossPnlRaw:'1',netPnlRaw:'1',meanNetPnlRaw:'1',winRateBps:10_000,
+    maximumDrawdownBps:0,detectionToEntryLatencyMeanMs:1,detectionToEntryLatencyP95Ms:1,
+    venueFeesRaw:'0',networkFeesRaw:'0',unknownTerminalPositions:0,
+    duplicateLogicalBuys:0,duplicateLogicalSells:0,creditsUsedStartRaw:'0',
+    creditsUsedEndRaw:'1',creditsPerClosedPositionRaw:'1',rateLimitedCount:0,
+    failedGateCodes:Object.freeze([]),
+  });
+
+  assert.equal('openedPositions' in historical,false);
+  assert.equal('averageBuySlippageBps' in historical,false);
 });
 
 void test('reports opened and open positions with floored closed-sample execution means', () => {

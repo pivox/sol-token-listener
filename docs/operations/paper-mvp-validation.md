@@ -1,6 +1,6 @@
 # Runbook de validation paper MVP Mainnet
 
-Cette procédure produit une preuve `paper-mvp.v1` autour du runtime paper
+Cette procédure produit une preuve `paper-mvp.v2` autour du runtime paper
 existant. Elle ne signe et ne soumet aucune transaction.
 
 ## Préparation
@@ -66,12 +66,14 @@ reste prioritaire et laisse le run reprenable.
 021 et n'est jamais produit par cette commande. Il ajoute uniquement le champ de
 compatibilité : verdict, statut technique et gates historiques restent inchangés.
 
-Le rapport expose aussi `openedPositions` (positions `creation-entry-v1` ouvertes
-dans la fenêtre inclusive observée) et `openPositions` (sous-ensemble encore
-`PAPER_HOLDING` lors du snapshot). Les moyennes de slippage et d'impact sont des
-divisions entières arrondies vers le bas des seuls samples clos, et valent zéro
-sans sample. La migration 024 initialise explicitement les rapports terminaux
-historiques à zéro car cette couverture ne peut pas être reconstruite.
+Le rapport v2 expose aussi `openedPositions` (positions `creation-entry-v1`
+ouvertes dans la fenêtre inclusive allant du début du run au minimum entre le
+snapshot courant et sa deadline immuable) et `openPositions` (sous-ensemble
+encore `PAPER_HOLDING` lors du snapshot). Les moyennes de slippage et d'impact
+sont des divisions entières arrondies vers le bas des seuls samples clos, et
+valent zéro sans sample. La migration 024 initialise uniquement les nouvelles
+colonnes de compteurs. Les payloads historiques `paper-mvp.v1` restent immuables
+et ne contiennent ni ces deux compteurs ni les quatre moyennes d'exécution.
 
 Codes processus :
 

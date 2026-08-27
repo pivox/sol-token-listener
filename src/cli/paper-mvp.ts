@@ -1,7 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import type { PaperMvpCollectorResult } from '../application/paper-mvp-collector.js';
 import { loadConfig, type AppConfig } from '../config/env.js';
-import { createPaperMvpReport, type PaperMvpReportV1 } from '../domain/paper-mvp.js';
+import { createPaperMvpReport, type PaperMvpReportV2 } from '../domain/paper-mvp.js';
 import type { PaperMvpRepository, PaperMvpRun, PaperMvpRunSnapshot } from '../ports/paper-mvp-repository.js';
 import type { ProviderUsageProbe } from '../ports/provider-usage-probe.js';
 import { logger } from '../utils/logger.js';
@@ -68,7 +68,7 @@ export interface PaperMvpRunnerDependencies {
 
 export interface PaperMvpRunResult {
   readonly exitCode: 0 | 2;
-  readonly report: PaperMvpReportV1 | null;
+  readonly report: PaperMvpReportV2 | null;
 }
 
 export type PaperMvpCliErrorCode =
@@ -484,7 +484,7 @@ function reportFromSnapshot(
   snapshot: PaperMvpRunSnapshot,
   completedAtMs: number,
   completionReason: 'TARGET_REACHED' | 'TIMEOUT' | 'SIGINT' | 'SIGTERM',
-): PaperMvpReportV1 {
+): PaperMvpReportV2 {
   return createPaperMvpReport({
     runId: snapshot.run.runId,
     completionReason,

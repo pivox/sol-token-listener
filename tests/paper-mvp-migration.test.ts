@@ -95,6 +95,55 @@ void test('adds replayable bounded opened and open position coverage', async () 
   assert.match(sql, /ADD COLUMN IF NOT EXISTS open_positions INTEGER NOT NULL DEFAULT 0/u);
   assert.match(sql, /open_positions BETWEEN 0 AND opened_positions/u);
   assert.match(sql, /paper_positions_mvp_open_coverage_idx/u);
+  assert.doesNotMatch(sql, /report_payload|jsonb_set/iu);
+});
+
+void test('migration 024 preserves an immutable historical paper-mvp.v1 payload', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL v1 report preservation test skipped');
+    return;
+  }
+  const schema = `paper_mvp_report_v1_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    const directory = new URL('../migrations/', import.meta.url);
+    const throughExactStrategy = (await readdir(directory))
+      .filter((name) => /^(?:00[1-9]|01[0-9]|02[0-3])_[a-z0-9_-]+\.sql$/u.test(name))
+      .sort((left, right) => left.localeCompare(right));
+    for (const name of throughExactStrategy) {
+      await pool.query(await readFile(new URL(name,directory),'utf8'));
+    }
+    const historicalReport = Object.freeze({
+      schemaVersion:'paper-mvp.v1',runId:'historical-v1',completionReason:'LEGACY',
+      technicalStatus:'COMPLETED',verdict:'PASS',failedGateCodes:Object.freeze([]),
+    });
+    await pool.query(`INSERT INTO paper_mvp_runs (
+      run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
+      initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
+      provider_identity,state,started_at,deadline_at,updated_at,terminal_at,
+      purge_after,verdict,payload_version,configuration_payload,report_payload,
+      runner_owner_id,completion_reason
+    ) VALUES ('historical-v1','creation-entry-v1',1,'SOL',1,1000,5,60000,
+      'probe','COMPLETED',$1,$2,$2,$2,$3,'PASS',1,'{}',$4,NULL,'LEGACY')`, [
+      new Date(1_000),new Date(61_000),new Date(14_461_000),JSON.stringify(historicalReport),
+    ]);
+
+    const sql = await readFile(positionCoverageMigrationUrl,'utf8');
+    await pool.query(sql);
+    await pool.query(sql);
+    const row = (await pool.query(`SELECT report_payload,opened_positions,open_positions
+      FROM paper_mvp_runs WHERE run_id='historical-v1'`)).rows[0];
+    assert.deepEqual(row?.report_payload,historicalReport);
+    assert.equal(row?.opened_positions,0);
+    assert.equal(row?.open_positions,0);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
 });
 
 void test('applies migrations 001-024 on an empty schema and replays cleanly', async (context) => {

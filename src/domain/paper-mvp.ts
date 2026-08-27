@@ -100,8 +100,6 @@ export interface PaperMvpReportV1 {
   readonly closedPositions: number;
   readonly creationsObserved: number;
   readonly entriesRejected: number;
-  readonly openedPositions: number;
-  readonly openPositions: number;
   readonly exitCounts: Readonly<Record<PaperMvpExitCategory, number>>;
   readonly grossPnlRaw: string;
   readonly netPnlRaw: string;
@@ -110,10 +108,6 @@ export interface PaperMvpReportV1 {
   readonly maximumDrawdownBps: number;
   readonly detectionToEntryLatencyMeanMs: number;
   readonly detectionToEntryLatencyP95Ms: number;
-  readonly averageBuySlippageBps: number;
-  readonly averageSellSlippageBps: number;
-  readonly averageBuyPriceImpactBps: number;
-  readonly averageSellPriceImpactBps: number;
   readonly venueFeesRaw: string;
   readonly networkFeesRaw: string;
   readonly unknownTerminalPositions: number;
@@ -124,6 +118,16 @@ export interface PaperMvpReportV1 {
   readonly creditsPerClosedPositionRaw: string | null;
   readonly rateLimitedCount: number;
   readonly failedGateCodes: readonly PaperMvpGateCode[];
+}
+
+export interface PaperMvpReportV2 extends Omit<PaperMvpReportV1, 'schemaVersion'> {
+  readonly schemaVersion: 'paper-mvp.v2';
+  readonly openedPositions: number;
+  readonly openPositions: number;
+  readonly averageBuySlippageBps: number;
+  readonly averageSellSlippageBps: number;
+  readonly averageBuyPriceImpactBps: number;
+  readonly averageSellPriceImpactBps: number;
 }
 
 export function createPaperMvpPositionSample(
@@ -174,7 +178,7 @@ export function createPaperMvpPositionSample(
   });
 }
 
-export function createPaperMvpReport(input: CreatePaperMvpReportInput): PaperMvpReportV1 {
+export function createPaperMvpReport(input: CreatePaperMvpReportInput): PaperMvpReportV2 {
   boundedText(input.runId);
   if (!isCompletionReason(input.completionReason)) throw invalid('completion reason');
   boundedText(input.quoteMint);
@@ -240,7 +244,7 @@ export function createPaperMvpReport(input: CreatePaperMvpReportInput): PaperMvp
     ? null : usage.creditsUsedEnd - usage.creditsUsedStart;
   const completed = ordered.length;
   return Object.freeze({
-    schemaVersion: 'paper-mvp.v1', runId: input.runId,
+    schemaVersion: 'paper-mvp.v2', runId: input.runId,
     completionReason: input.completionReason,
     startedAt: new Date(input.startedAtMs).toISOString(),
     completedAt: new Date(input.completedAtMs).toISOString(),
