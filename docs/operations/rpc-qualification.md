@@ -58,6 +58,7 @@ Par exemple :
 SOLANA_HTTP_RPC_URL=https://primary.example.invalid
 SOLANA_HTTP_RPC_FALLBACK_URLS=https://fallback-one.example.invalid,https://fallback-two.example.invalid
 SOLANA_WS_RPC_URL=wss://primary.example.invalid
+SOLANA_WS_RPC_FALLBACK_URLS=wss://fallback-one.example.invalid,wss://fallback-two.example.invalid
 ```
 
 Sans fallback, le listener conserve exactement le comportement à endpoint unique
@@ -83,11 +84,17 @@ L'opérateur provisionne les endpoints indépendamment et vérifie auprès de ch
 fournisseur les quotas, la facturation et la cohérence archive. Ce dépôt ne peut
 pas valider les contrats de quota ou de facturation des fournisseurs.
 
-`SOLANA_WS_RPC_URL` reste une seule URL inchangée : le basculement WebSocket
-contrôlé est le sujet séparé de l'issue #57.
+La configuration accepte désormais `SOLANA_WS_RPC_FALLBACK_URLS` comme liste
+ordonnée appairée à la liste HTTP. Une liste HTTP sans liste WS conserve le
+fallback HTTP-only de l'issue #56. Dès qu'une liste WS est renseignée, la liste
+HTTP doit exister avec la même taille et chaque paire utilise `https/wss` ou
+`http/ws`. Les identités publiques restent strictement positionnelles.
+L'issue #59 valide et expose ce catalogue, mais ne l'active pas encore dans le
+subscriber de production : le basculement WebSocket contrôlé ne sera
+opérationnel qu'après l'issue #63.
 
 Le basculement de production est distinct du soak : `npm run rpc:soak` reste
-intentionnellement mono-fournisseur et ignore conceptuellement la liste de
+intentionnellement mono-fournisseur et ignore conceptuellement les listes de
 fallbacks. Il qualifie exactement `SOLANA_HTTP_RPC_URL + SOLANA_WS_RPC_URL`
 d'un seul fournisseur, pas une chaîne de basculement de production.
 

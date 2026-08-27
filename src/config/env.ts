@@ -17,6 +17,7 @@ export interface AppConfig {
   readonly httpRpcUrl: string;
   readonly httpRpcFallbackUrls: readonly string[];
   readonly wsRpcUrl: string;
+  readonly wsRpcFallbackUrls: readonly string[];
   readonly commitment: 'processed' | 'confirmed' | 'finalized';
   readonly finality: 'confirmed' | 'finalized';
   readonly databaseUrl: string;
@@ -189,12 +190,19 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     environment.SOLANA_HTTP_RPC_FALLBACK_URLS,
     httpRpcUrl,
   );
+  const wsRpcUrl = requiredUrl(environment.SOLANA_WS_RPC_URL, 'SOLANA_WS_RPC_URL', ['ws:', 'wss:']);
+  const wsRpcFallbackUrls = parseWsRpcFallbackUrls(
+    environment.SOLANA_WS_RPC_FALLBACK_URLS,
+    wsRpcUrl,
+  );
+  assertPairedRpcEndpoints(httpRpcUrl, httpRpcFallbackUrls, wsRpcUrl, wsRpcFallbackUrls);
 
   return {
     cluster: optional(environment.SOLANA_CLUSTER, 'mainnet-beta'),
     httpRpcUrl,
     httpRpcFallbackUrls,
-    wsRpcUrl: requiredUrl(environment.SOLANA_WS_RPC_URL, 'SOLANA_WS_RPC_URL', ['ws:', 'wss:']),
+    wsRpcUrl,
+    wsRpcFallbackUrls,
     commitment: parseEnum(environment.SOLANA_COMMITMENT, 'confirmed', ['processed', 'confirmed', 'finalized']),
     finality: parseEnum(environment.SOLANA_FINALITY_COMMITMENT, 'finalized', ['confirmed', 'finalized']),
     databaseUrl: optional(environment.DATABASE_URL, 'postgresql://solanabot:solanabot@127.0.0.1:5432/solanabot'),
@@ -742,6 +750,83 @@ function parseHttpRpcFallbackUrls(raw: string | undefined, primaryUrl: string): 
     canonicalUrls.push(canonicalUrl);
   }
   return Object.freeze(canonicalUrls);
+}
+
+function parseWsRpcFallbackUrls(raw: string | undefined, primaryUrl: string): readonly string[] {
+  if (!hasValue(raw)) return Object.freeze([]);
+
+  const entries = raw.split(',').map((entry) => entry.trim());
+  if (entries.some((entry) => entry.length === 0)) {
+    throw new Error('SOLANA_WS_RPC_FALLBACK_URLS must not contain empty endpoints.');
+  }
+  if (entries.length > 3) {
+    throw new Error('SOLANA_WS_RPC_FALLBACK_URLS supports at most 3 fallback endpoints.');
+  }
+
+  const primary = new URL(primaryUrl);
+  if (primary.href.includes('#')) {
+    throw new Error('WebSocket RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+  }
+  const primaryProtocol = primary.protocol;
+  const canonicalUrls: string[] = [];
+  for (const entry of entries) {
+    let parsed: URL;
+    try {
+      parsed = new URL(entry);
+    } catch {
+      throw new Error('SOLANA_WS_RPC_FALLBACK_URLS must contain valid absolute WS(S) URLs.');
+    }
+    if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+      throw new Error('SOLANA_WS_RPC_FALLBACK_URLS must contain valid absolute WS(S) URLs.');
+    }
+    if (parsed.href.includes('#')) {
+      throw new Error('WebSocket RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+    }
+    if (parsed.protocol !== primaryProtocol) {
+      throw new Error('SOLANA_WS_RPC_FALLBACK_URLS must use the same scheme as SOLANA_WS_RPC_URL.');
+    }
+    const canonicalUrl = parsed.toString();
+    if (canonicalUrl === primaryUrl || canonicalUrls.includes(canonicalUrl)) {
+      throw new Error('SOLANA_WS_RPC_FALLBACK_URLS must not contain duplicate endpoints.');
+    }
+    canonicalUrls.push(canonicalUrl);
+  }
+  return Object.freeze(canonicalUrls);
+}
+
+function assertPairedRpcEndpoints(
+  httpPrimaryUrl: string,
+  httpFallbackUrls: readonly string[],
+  wsPrimaryUrl: string,
+  wsFallbackUrls: readonly string[],
+): void {
+  if (wsFallbackUrls.length === 0) return;
+  if (httpFallbackUrls.length !== wsFallbackUrls.length) {
+    throw new Error('RPC fallback endpoint lists must be configured together with matching cardinality.');
+  }
+  const httpUrls = [httpPrimaryUrl, ...httpFallbackUrls];
+  const wsUrls = [wsPrimaryUrl, ...wsFallbackUrls];
+  if (httpFallbackUrls.length > 0 && (hasUrlFragment(httpPrimaryUrl) || hasUrlFragment(wsPrimaryUrl))) {
+    throw new Error('RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+  }
+  for (let index = 0; index < httpUrls.length; index += 1) {
+    const httpUrl = httpUrls[index];
+    const wsUrl = wsUrls[index];
+    if (httpUrl === undefined || wsUrl === undefined || !pairedRpcProtocols(httpUrl, wsUrl)) {
+      throw new Error('RPC endpoint protocols must pair https with wss or http with ws.');
+    }
+  }
+}
+
+function hasUrlFragment(value: string): boolean {
+  return new URL(value).href.includes('#');
+}
+
+function pairedRpcProtocols(httpUrl: string, wsUrl: string): boolean {
+  const httpProtocol = new URL(httpUrl).protocol;
+  const wsProtocol = new URL(wsUrl).protocol;
+  return (httpProtocol === 'https:' && wsProtocol === 'wss:')
+    || (httpProtocol === 'http:' && wsProtocol === 'ws:');
 }
 
 function parseEnum<const T extends string>(

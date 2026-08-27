@@ -1,4 +1,5 @@
 import type { FetchFn } from '@solana/web3.js';
+import type { RpcProviderId } from './rpc-provider-catalog.js';
 
 type FetchInput = Parameters<FetchFn>[0];
 type FetchInit = Parameters<FetchFn>[1];
@@ -10,7 +11,7 @@ export type RpcHttpFailureReason =
   | 'UNAVAILABLE'
   | 'GATEWAY_TIMEOUT';
 
-export type RpcHttpEndpointId = 'primary' | `fallback-${1 | 2 | 3}`;
+export type RpcHttpEndpointId = RpcProviderId;
 
 export type RpcHttpFailoverEvent =
   | Readonly<{
