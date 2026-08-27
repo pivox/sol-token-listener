@@ -36,6 +36,6 @@ ALTER TABLE paper_mvp_runs
   ADD CONSTRAINT paper_mvp_runs_runner_lifecycle_check CHECK (
     (state='RUNNING' AND runner_owner_id IS NOT NULL AND completion_reason IS NULL)
     OR (state='COMPLETED' AND runner_owner_id IS NULL AND completion_reason IS NOT NULL
-      AND report_payload->>'completionReason'=completion_reason)
+      AND (report_payload->>'completionReason'=completion_reason) IS TRUE)
     OR (state='FAILED' AND runner_owner_id IS NULL AND completion_reason IS NULL)
   );

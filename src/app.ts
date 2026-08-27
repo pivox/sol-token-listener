@@ -119,6 +119,7 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
       if (config.listenerEnabled || config.apiEnabled) {
         await dependencies.lifecycleGuard.checkpoint();
         await dependencies.waitForShutdownSignal();
+        await dependencies.lifecycleGuard.checkpoint();
       }
     }
   } catch (error) {

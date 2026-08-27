@@ -32,8 +32,7 @@ interface PaperMvpRunnerClient {
 
 export function productionRunnerDependencies(config: AppConfig): PaperMvpRunnerDependencies {
   const providerUsageProbe = new UnavailableProviderUsageProbe();
-  let preparedLease: PaperMvpRunnerLease | null = null;
-  let preparedPool: unknown = null;
+  const runnerLifecycle = createPaperMvpRunnerLifecycle(acquirePostgresRunner);
   const dependencies: PaperMvpRunnerDependencies = {
     config,
     now: Date.now,
@@ -48,25 +47,14 @@ export function productionRunnerDependencies(config: AppConfig): PaperMvpRunnerD
             return activePool;
           },
           beforeStart: async (pool) => {
-            if (activePool === null || pool !== activePool || preparedLease !== null) {
+            if (activePool === null || pool !== activePool) {
               throw new PaperMvpCliError('RUN_FAILED');
             }
-            preparedLease = await acquirePostgresRunner(pool);
-            preparedPool = pool;
+            await runnerLifecycle.beforeStart(pool);
           },
-          beforeDatabaseClose: async () => {
-            const strandedLease = preparedLease;
-            preparedLease = null;
-            preparedPool = null;
-            if (strandedLease !== null) await strandedLease.release();
-          },
+          beforeDatabaseClose: runnerLifecycle.beforeDatabaseClose,
           lifecycleGuard: Object.freeze({
-            checkpoint: () => {
-              if (preparedLease === null || preparedLease.isLost()) {
-                throw new PaperMvpCliError('RUNNER_LOCK_LOST');
-              }
-              return Promise.resolve();
-            },
+            checkpoint: runnerLifecycle.checkpoint,
           }),
           waitForShutdownSignal: async () => {
             if (activePool === null) throw new PaperMvpCliError('RUN_FAILED');
@@ -74,10 +62,7 @@ export function productionRunnerDependencies(config: AppConfig): PaperMvpRunnerD
           },
         });
       } finally {
-        const strandedLease = preparedLease;
-        preparedLease = null;
-        preparedPool = null;
-        if (strandedLease !== null) await strandedLease.release();
+        await runnerLifecycle.releaseStranded();
       }
     },
     createRepository: (pool) => new PostgresPaperMvpRepository(
@@ -91,19 +76,69 @@ export function productionRunnerDependencies(config: AppConfig): PaperMvpRunnerD
       Date.now,
       probe,
     ),
-    acquireRunner: (pool) => {
-      if (preparedLease === null || preparedPool !== pool) {
-        throw new PaperMvpCliError('RUN_FAILED');
-      }
-      const lease = preparedLease;
-      preparedLease = null;
-      preparedPool = null;
-      return Promise.resolve(lease);
-    },
+    acquireRunner: runnerLifecycle.acquireRunner,
     createStopController: () => createProcessStopController(),
     writeReport: async (path, contents) => writeFile(path, contents, { flag: 'wx', mode: 0o600 }),
   };
   return Object.freeze(dependencies);
+}
+
+export interface PaperMvpRunnerLifecycle {
+  readonly beforeStart: (pool: unknown) => Promise<void>;
+  readonly beforeDatabaseClose: () => Promise<void>;
+  readonly checkpoint: () => Promise<void>;
+  readonly acquireRunner: (pool: unknown) => Promise<PaperMvpRunnerLease>;
+  readonly releaseStranded: () => Promise<void>;
+}
+
+export function createPaperMvpRunnerLifecycle(
+  acquire: (pool: unknown) => Promise<PaperMvpRunnerLease>,
+): PaperMvpRunnerLifecycle {
+  let preparedLease: PaperMvpRunnerLease | null = null;
+  let activeLease: PaperMvpRunnerLease | null = null;
+  let preparedPool: unknown = null;
+
+  const releaseHeldLease = async (): Promise<void> => {
+    const heldLease = activeLease ?? preparedLease;
+    activeLease = null;
+    preparedLease = null;
+    preparedPool = null;
+    if (heldLease !== null) await heldLease.release();
+  };
+
+  return Object.freeze({
+    beforeStart: async (pool: unknown) => {
+      if (preparedLease !== null || activeLease !== null || preparedPool !== null) {
+        throw new PaperMvpCliError('RUN_FAILED');
+      }
+      preparedLease = await acquire(pool);
+      preparedPool = pool;
+    },
+    beforeDatabaseClose: releaseHeldLease,
+    checkpoint: () => {
+      const heldLease = activeLease ?? preparedLease;
+      if (heldLease === null || heldLease.isLost()) {
+        throw new PaperMvpCliError('RUNNER_LOCK_LOST');
+      }
+      return Promise.resolve();
+    },
+    acquireRunner: (pool: unknown) => {
+      if (preparedLease === null || activeLease !== null || preparedPool !== pool) {
+        throw new PaperMvpCliError('RUN_FAILED');
+      }
+      const lease = preparedLease;
+      activeLease = lease;
+      preparedLease = null;
+      preparedPool = null;
+      return Promise.resolve(Object.freeze({
+        ownerId: lease.ownerId,
+        lost: lease.lost,
+        isLost: () => lease.isLost(),
+        release: () => Promise.resolve(),
+      }));
+    },
+    releaseStranded: releaseHeldLease,
+  });
 }
 
 export async function acquirePostgresRunner(pool: unknown): Promise<PaperMvpRunnerLease> {

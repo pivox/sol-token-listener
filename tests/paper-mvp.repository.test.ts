@@ -380,6 +380,22 @@ void test('rejects a report not canonically rebuilt from durable samples', async
       runId: run.runId, runnerOwnerId: OWNER, terminalAtMs: 3_000, state: 'COMPLETED',
       completionReason: 'TARGET_REACHED', report: fabricatedPass, failureCode: null,
     }), isConflict('TERMINALIZATION_CONTRADICTION'));
+    const targetEvaluation = createPaperMvpReport({
+      runId: run.runId, completionReason: 'TARGET_REACHED',
+      startedAtMs: run.startedAtMs, completedAtMs: 3_000,
+      targetClosedPositions: 1, initialCapitalRaw: configuration.initialCapitalRaw,
+      quoteMint: configuration.quoteMint, creationsObserved: 1, entriesRejected: 0,
+      samples: Object.freeze([losingSample()]), unknownTerminalPositions: 0,
+      duplicateLogicalBuys: 0, duplicateLogicalSells: 0, providerUsage: usage,
+    });
+    const mismatchedReasonEvaluation = Object.freeze({
+      ...targetEvaluation,
+      completionReason: 'TIMEOUT' as const,
+    });
+    await assert.rejects(repository.terminalize({
+      runId: run.runId, runnerOwnerId: OWNER, terminalAtMs: 3_000, state: 'COMPLETED',
+      completionReason: 'TIMEOUT', report: mismatchedReasonEvaluation, failureCode: null,
+    }), isConflict('TERMINALIZATION_CONTRADICTION'));
     assert.equal((await repository.load(run.runId))?.run.state, 'RUNNING');
   });
 });
@@ -415,6 +431,12 @@ void test('replacement ownership fences stale progress and terminalization', asy
       unknownPositions: Object.freeze([]),
     });
     assert.equal(progressed.runnerOwnerId, 'owner-b');
+    const terminal = await repository.terminalize({
+      runId: first.runId, runnerOwnerId: 'owner-b', terminalAtMs: 2_002,
+      state: 'FAILED', completionReason: null, report: null, failureCode: 'REPLACEMENT_STOPPED',
+    });
+    assert.equal(terminal.runnerOwnerId, null);
+    assert.equal(terminal.state, 'FAILED');
   });
 });
 

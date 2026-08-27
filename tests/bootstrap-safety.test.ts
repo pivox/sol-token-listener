@@ -12,6 +12,7 @@ import {
   waitForShutdownSignal,
   type ApplicationDependencies,
 } from '../src/app.js';
+import { createPaperMvpRunnerLifecycle } from '../src/cli/paper-mvp-runtime.js';
 import type { ApiEventStreamRepository } from '../src/ports/api-event-stream-repository.js';
 import type { ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
 import { QualificationProfileError } from '../src/qualification/qualification-profile.js';
@@ -235,18 +236,22 @@ void test('listener startup failure fails the process and cleans listener before
   ]);
 });
 
-void test('lifecycle ownership loss after migration prevents listener startup', async () => {
+void test('lifecycle ownership loss during migration prevents listener startup', async () => {
   const calls: string[] = [];
-  let checkpoints = 0;
+  let ownershipLost = false;
   const loss = new Error('runner ownership lost');
   await assert.rejects(runApplication(dependencies(calls, {
     loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: true }),
     lifecycleGuard: Object.freeze({
       checkpoint: async () => {
-        checkpoints += 1;
-        if (checkpoints === 3) throw loss;
+        if (ownershipLost) throw loss;
       },
     }),
+    migrateDatabase: async () => {
+      calls.push('migrate');
+      ownershipLost = true;
+      return [];
+    },
   })), (error: unknown) => error === loss);
   assert.equal(calls.includes('migrate'), true);
   assert.equal(calls.includes('listener.create'), false);
@@ -254,22 +259,82 @@ void test('lifecycle ownership loss after migration prevents listener startup', 
   assert.equal(calls.at(-1), 'database.close');
 });
 
-void test('lifecycle ownership loss after listener start closes it before API startup', async () => {
+void test('lifecycle ownership loss during listener start closes it before API startup', async () => {
   const calls: string[] = [];
-  let checkpoints = 0;
+  let ownershipLost = false;
   const loss = new Error('runner ownership lost');
   await assert.rejects(runApplication(dependencies(calls, {
     loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: false }),
     lifecycleGuard: Object.freeze({
       checkpoint: async () => {
-        checkpoints += 1;
-        if (checkpoints === 5) throw loss;
+        if (ownershipLost) throw loss;
       },
+    }),
+    createListener: () => ({
+      async start() { calls.push('listener.start'); ownershipLost = true; },
+      async close() { calls.push('listener.close'); },
+      state: () => 'RUNNING',
+      pipelineState: () => ({
+        httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING', qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+      }),
     }),
   })), (error: unknown) => error === loss);
   assert.equal(calls.includes('listener.start'), true);
   assert.equal(calls.includes('server.create'), false);
   assert.ok(calls.indexOf('listener.close') < calls.indexOf('database.close'));
+});
+
+void test('lifecycle ownership loss during shutdown wait is observed before cleanup', async () => {
+  const calls: string[] = [];
+  let ownershipLost = false;
+  const loss = new Error('runner ownership lost');
+  await assert.rejects(runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: false, autoMigrate: false }),
+    lifecycleGuard: Object.freeze({
+      checkpoint: async () => {
+        if (ownershipLost) throw loss;
+      },
+    }),
+    waitForShutdownSignal: async () => {
+      calls.push('signal.wait');
+      ownershipLost = true;
+      return 'SIGTERM';
+    },
+  })), (error: unknown) => error === loss);
+  assert.ok(calls.indexOf('signal.wait') < calls.indexOf('listener.close'));
+  assert.ok(calls.indexOf('listener.close') < calls.indexOf('database.close'));
+});
+
+void test('paper MVP runner ownership remains held through listener and API teardown', async () => {
+  const calls: string[] = [];
+  const pool = Object.freeze({});
+  const lifecycle = createPaperMvpRunnerLifecycle(async (receivedPool) => {
+    assert.equal(receivedPool, pool);
+    return Object.freeze({
+      ownerId: 'paper-mvp-owner-test',
+      lost: new Promise<void>(() => undefined),
+      isLost: () => false,
+      release: async () => { calls.push('runner.release'); },
+    });
+  });
+  await runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: false }),
+    getDatabasePool: () => { calls.push('pool'); return pool; },
+    beforeStart: lifecycle.beforeStart,
+    lifecycleGuard: Object.freeze({ checkpoint: lifecycle.checkpoint }),
+    beforeDatabaseClose: lifecycle.beforeDatabaseClose,
+    waitForShutdownSignal: async () => {
+      const scopedLease = await lifecycle.acquireRunner(pool);
+      await scopedLease.release();
+      calls.push('runner.scope.closed');
+      return 'SIGTERM';
+    },
+  }));
+  assert.ok(calls.indexOf('runner.scope.closed') < calls.indexOf('listener.close'));
+  assert.ok(calls.indexOf('listener.close') < calls.indexOf('server.close'));
+  assert.ok(calls.indexOf('server.close') < calls.indexOf('runner.release'));
+  assert.ok(calls.indexOf('runner.release') < calls.indexOf('database.close'));
+  assert.equal(calls.filter((call) => call === 'runner.release').length, 1);
 });
 
 void test('API bind failure aggregates listener, server, and database cleanup in order', async () => {

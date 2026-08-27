@@ -65,7 +65,7 @@ void test('adds durable runner ownership and completion reason without rewriting
   assert.match(sql, /jsonb_set\(report_payload, '\{completionReason\}', '"LEGACY"'::jsonb, true\)/u);
   assert.match(sql, /state='RUNNING'.*runner_owner_id IS NOT NULL.*completion_reason IS NULL/su);
   assert.match(sql, /state='COMPLETED'.*runner_owner_id IS NULL.*completion_reason IS NOT NULL/su);
-  assert.match(sql, /report_payload->>'completionReason'=completion_reason/u);
+  assert.match(sql, /\(report_payload->>'completionReason'=completion_reason\) IS TRUE/u);
   assert.match(sql, /state='FAILED'.*runner_owner_id IS NULL.*completion_reason IS NULL/su);
 });
 
@@ -205,6 +205,21 @@ void test('backfills legacy run owners and completion reasons without changing r
     });
     assert.equal(failed?.runner_owner_id, null);
     assert.equal(failed?.completion_reason, null);
+    for (const [runId, reportPayload] of [
+      ['invalid-completed-missing-reason', '{}'],
+      ['invalid-completed-null-reason', '{"completionReason":null}'],
+    ] as const) {
+      await assert.rejects(pool.query(`INSERT INTO paper_mvp_runs (
+        run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
+        initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
+        provider_identity,state,started_at,deadline_at,updated_at,terminal_at,
+        purge_after,verdict,failure_code,payload_version,configuration_payload,
+        report_payload,runner_owner_id,completion_reason
+      ) VALUES ($1,'creation-entry-v1',1,'SOL',1,1000,5,60000,'probe','COMPLETED',
+        '2026-08-27T00:00:00Z','2026-08-27T00:01:00Z','2026-08-27T00:01:00Z',
+        '2026-08-27T00:01:00Z','2026-08-27T04:01:00Z','FAIL',NULL,1,'{}'::jsonb,
+        $2::jsonb,NULL,'TIMEOUT')`, [runId, reportPayload]), /runner_lifecycle|check constraint/iu);
+    }
     await assert.rejects(
       pool.query("UPDATE paper_mvp_runs SET runner_owner_id=NULL WHERE run_id='legacy-running'"),
       /runner_lifecycle|check constraint/iu,

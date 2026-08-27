@@ -217,6 +217,7 @@ void test('timeout and signal each perform a final collect and cannot turn a lat
   for (const stop of ['TIMEOUT', 'SIGINT', 'SIGTERM'] as const) {
     const repository = new MemoryRepository();
     let collects = 0;
+    const writes: string[] = [];
     const result = await runPaperMvp(options(), {
       ...dependencies(repository),
       now: stop === 'TIMEOUT'
@@ -234,7 +235,7 @@ void test('timeout and signal each perform a final collect and cannot turn a lat
       }),
       createStopController: () => stop === 'TIMEOUT'
         ? stopController('POLL') : sequenceStopController(['POLL', 'POLL', stop]),
-      writeReport: async () => undefined,
+      writeReport: async (_path, contents) => { writes.push(contents); },
     });
     assert.equal(collects, 2, stop);
     assert.equal(result.exitCode, 2, stop);
@@ -244,6 +245,10 @@ void test('timeout and signal each perform a final collect and cannot turn a lat
     assert.deepEqual(result.report?.failedGateCodes,
       [stop === 'TIMEOUT' ? 'RUN_TIMED_OUT' : 'RUN_INTERRUPTED']);
     assert.equal(repository.snapshot?.run.state, 'COMPLETED', stop);
+    assert.equal(repository.snapshot?.run.completionReason, stop, stop);
+    assert.equal(repository.snapshot?.run.verdict, 'FAIL', stop);
+    assert.equal(writes.length, 1, stop);
+    assert.deepEqual(JSON.parse(writes[0] ?? 'null'), result.report, stop);
   }
 });
 
@@ -356,35 +361,44 @@ void test('releases PostgreSQL runner clients on acquisition failure and verifie
 
 void test('does not mutate durable state when PostgreSQL runner ownership is lost', async () => {
   const repository = new MemoryRepository();
+  const calls: string[] = [];
+  const ownership = controlledRunnerLease(async () => { calls.push('runner.release'); });
+  ownership.lose();
   await assert.rejects(runPaperMvp(options(), {
     ...dependencies(repository),
-    acquireRunner: async () => runnerLease(async () => undefined, Promise.resolve()),
+    acquireRunner: async () => ownership.lease,
     createStopController: () => ({ wait: async () => new Promise(() => undefined), close: () => undefined }),
   }), isCliError('RUNNER_LOCK_LOST'));
   assert.equal(repository.snapshot, null);
   assert.equal(repository.starts, 0);
+  assert.deepEqual(calls, ['runner.release']);
 });
 
 void test('loss during the final collection leaves the resumable run unterminated', async () => {
   const repository = new MemoryRepository();
-  const ownership = controlledRunnerLease();
+  const calls: string[] = [];
+  const ownership = controlledRunnerLease(async () => { calls.push('runner.release'); });
   let writes = 0;
   await assert.rejects(runPaperMvp(options(), {
     ...dependencies(repository),
     acquireRunner: async () => ownership.lease,
     createCollector: () => ({
       collect: async () => {
-        repository.addSample(sample());
         ownership.lose();
         return emptyCollection();
       },
     }),
-    createStopController: () => stopController('POLL'),
+    createStopController: () => Object.freeze({
+      wait: async () => 'POLL' as const,
+      close: () => { calls.push('signals.close'); },
+    }),
     writeReport: async () => { writes += 1; },
   }), isCliError('RUNNER_LOCK_LOST'));
   assert.equal(repository.snapshot?.run.state, 'RUNNING');
+  assert.equal(repository.snapshot?.run.closedPositions, 0);
   assert.equal(repository.terminalizations, 0);
   assert.equal(writes, 0);
+  assert.deepEqual(calls, ['signals.close', 'runner.release']);
 });
 
 void test('loss immediately before terminalization prevents terminal state and export', async () => {
@@ -407,6 +421,26 @@ void test('loss immediately before terminalization prevents terminal state and e
   }), isCliError('RUNNER_LOCK_LOST'));
   assert.equal(repository.snapshot?.run.state, 'RUNNING');
   assert.equal(repository.terminalizations, 0);
+  assert.equal(writes, 0);
+});
+
+void test('loss immediately before export suppresses the artifact and returns operational failure', async () => {
+  const repository = new MemoryRepository();
+  const ownership = controlledRunnerLease();
+  let writes = 0;
+  repository.seed(configuration(), OWNER, 1_000, sample(), availableProbeSnapshot());
+  repository.onLoad = (snapshot) => {
+    if (snapshot?.run.state === 'COMPLETED') ownership.lose();
+  };
+  await assert.rejects(runPaperMvp(options(), {
+    ...dependencies(repository),
+    acquireRunner: async () => ownership.lease,
+    createStopController: () => stopController('SIGINT'),
+    writeReport: async () => { writes += 1; },
+  }), isCliError('RUNNER_LOCK_LOST'));
+  assert.equal(repository.snapshot?.run.state, 'COMPLETED');
+  assert.equal(repository.snapshot?.run.completionReason, 'SIGINT');
+  assert.equal(repository.snapshot?.run.verdict, 'FAIL');
   assert.equal(writes, 0);
 });
 
@@ -503,7 +537,7 @@ function runnerLease(release: () => Promise<void>, lost = new Promise<void>(() =
   return Object.freeze({ ownerId: OWNER, release, lost, isLost: () => lockLost });
 }
 
-function controlledRunnerLease() {
+function controlledRunnerLease(release: () => Promise<void> = async () => undefined) {
   let lockLost = false;
   let resolveLoss: (() => void) | undefined;
   const lost = new Promise<void>((resolve) => { resolveLoss = resolve; });
@@ -515,7 +549,7 @@ function controlledRunnerLease() {
   return Object.freeze({
     lose,
     lease: Object.freeze({
-      ownerId: OWNER, lost, isLost: () => lockLost, release: async () => undefined,
+      ownerId: OWNER, lost, isLost: () => lockLost, release,
     }),
   });
 }
@@ -570,6 +604,7 @@ class MemoryRepository implements PaperMvpRepository {
   public snapshot: PaperMvpRunSnapshot | null = null;
   public starts = 0;
   public terminalizations = 0;
+  public onLoad: ((snapshot: PaperMvpRunSnapshot | null) => void) | null = null;
 
   public async startOrResume(
     config: PaperMvpRunConfiguration,
@@ -605,7 +640,10 @@ class MemoryRepository implements PaperMvpRepository {
     return this.snapshot.run;
   }
 
-  public async load(): Promise<PaperMvpRunSnapshot | null> { return this.snapshot; }
+  public async load(): Promise<PaperMvpRunSnapshot | null> {
+    this.onLoad?.(this.snapshot);
+    return this.snapshot;
+  }
 
   public async terminalize(value: PaperMvpTerminalization): Promise<PaperMvpRun> {
     if (this.snapshot === null) throw new Error('missing');
