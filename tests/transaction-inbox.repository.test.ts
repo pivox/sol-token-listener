@@ -963,6 +963,7 @@ void test('records immutable strict failures once and resolves only the exact nu
     await repository.recordStrictCatchUpFailure(absentPrimary);
     await repository.recordStrictCatchUpFailure(Object.freeze({ ...absentPrimary, detectedAtMs: 600_000 }));
     await repository.recordStrictCatchUpFailure(absentFallback);
+    await repository.compareAndSwapCheckpoint(null, previous);
     await repository.recordStrictCatchUpFailure(present);
     await repository.recordStrictCatchUpFailure(otherBoundary);
     await repository.recordStrictCatchUpFailure(otherKey);

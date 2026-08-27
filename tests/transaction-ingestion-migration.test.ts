@@ -126,17 +126,20 @@ void test('enforces strict failure lifecycle and finite numeric boundaries in Po
       insert(`${prefix}${'e'.repeat(64)}`, { detectedAt: '-infinity' }),
       /listener_strict_catch_up_failures_detected_at_check/u,
     );
+    // A finite purge timestamp avoids purge_after_check; lifecycle_check remains
+    // legitimately concurrent because no finite value can equal infinity + four hours.
+    const resolvedAtOrLifecycle = /listener_strict_catch_up_failures_(?:resolved_at|lifecycle)_check/u;
     await assert.rejects(
       insert(`${prefix}${'f'.repeat(64)}`, {
         resolvedAt: 'infinity', purgeAfter: '2025-01-01T04:00:00.000Z',
       }),
-      /listener_strict_catch_up_failures_resolved_at_check/u,
+      resolvedAtOrLifecycle,
     );
     await assert.rejects(
       insert(`${prefix}${'0'.repeat(64)}`, {
         resolvedAt: '-infinity', purgeAfter: '2025-01-01T04:00:00.000Z',
       }),
-      /listener_strict_catch_up_failures_resolved_at_check/u,
+      resolvedAtOrLifecycle,
     );
     await assert.rejects(
       insert(`${prefix}${'1'.repeat(64)}`, {
