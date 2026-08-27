@@ -4,6 +4,7 @@ import bs58 from 'bs58';
 import {
   FinalityReconciler,
   FinalityReconcilerError,
+  type FinalityReconcilerRepository,
 } from '../src/application/finality-reconciler.js';
 import {
   MAX_FINALITY_EVIDENCE_VERSION,
@@ -87,12 +88,21 @@ void test('enqueues already finalized candidates without a poll or block proof',
   const value = candidate(4, 9n, { confirmationStatus: 'confirmed' });
   const repository = memoryRepository([value]);
   const source = passHarness({ history: [history(9n, 'finalized')], root: 9n });
-  const result = await reconciler(source.source, repository, { limit: 1, now: () => NOW }).runOnce();
+  const finalityReconciler = reconciler(source.source, repository, { limit: 1, now: () => NOW });
+  const result = await finalityReconciler.runOnce();
   assert.deepEqual(result, { candidateCount: 1, pollCount: 0, revisionCount: 1 });
   assert.deepEqual(repository.revisions, [Object.freeze({
     signature: value.signature, confirmationStatus: 'finalized', observedAtMs: NOW,
   })]);
   assert.deepEqual(source.calls, ['open:primary', 'history:primary', 'root:primary']);
+
+  const callsAfterTerminalRevision = [...source.calls];
+  assert.deepEqual(await finalityReconciler.runOnce(), {
+    candidateCount: 0, pollCount: 0, revisionCount: 0,
+  });
+  assert.deepEqual(source.calls, callsAfterTerminalRevision);
+  assert.equal(source.opened, 1);
+  assert.equal(repository.revisions.length, 1);
 });
 
 void test('validates every history slot and finalized root before the first repository mutation', async () => {
@@ -184,6 +194,16 @@ void test('fails closed on null, rejected, malformed, sparse, duplicate, oversiz
   const customPrototypeBlock = [signature(60)];
   Object.setPrototypeOf(customPrototypeBlock, Object.create(Array.prototype));
   Object.freeze(customPrototypeBlock);
+  const extraStringKeyBlock = [uniqueSignature(30_001)];
+  Object.defineProperty(extraStringKeyBlock, 'metadata', {
+    enumerable: true, value: 'unsupported',
+  });
+  Object.freeze(extraStringKeyBlock);
+  const extraSymbolKeyBlock = [uniqueSignature(30_002)];
+  Object.defineProperty(extraSymbolKeyBlock, Symbol('unsupported'), {
+    enumerable: true, value: 'unsupported',
+  });
+  Object.freeze(extraSymbolKeyBlock);
   const sixtyThreeByteSignature = bs58.encode(Buffer.alloc(63, 1));
   const sixtyFiveByteSignature = bs58.encode(Buffer.alloc(65, 1));
   assert.equal(bs58.decode(sixtyThreeByteSignature).length, 63);
@@ -191,9 +211,10 @@ void test('fails closed on null, rejected, malformed, sparse, duplicate, oversiz
   const values: readonly [string, unknown][] = [
     ['null', null], ['rejected', new Error('https://secret.invalid/block')], ['object', Object.freeze({})],
     ['sparse', Object.assign(new Array<string>(1), {})], ['duplicate', Object.freeze([signature(11), signature(11)])],
-    ['oversized', Object.freeze(Array.from({ length: 10_001 }, (_, index) => signature(index + 12)))],
+    ['oversized', uniqueSignatures(10_001, 40_000)],
     ['noncanonical', Object.freeze(['noncanonical'])], ['accessor', accessorBlock],
     ['custom prototype', customPrototypeBlock],
+    ['extra string key', extraStringKeyBlock], ['extra symbol key', extraSymbolKeyBlock],
     ['63-byte signature', Object.freeze([sixtyThreeByteSignature])],
     ['65-byte signature', Object.freeze([sixtyFiveByteSignature])],
   ];
@@ -205,6 +226,43 @@ void test('fails closed on null, rejected, malformed, sparse, duplicate, oversiz
     assert.equal(repository.revisions.length, 0, name);
   }
   assert.equal(accessorReads, 0);
+});
+
+void test('accepts exactly ten thousand unique unrelated canonical block signatures', async () => {
+  const value = candidate(73, 42n, {
+    missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY,
+  });
+  const block = uniqueSignatures(10_000, 60_000);
+  assert.equal(new Set(block).size, 10_000);
+  assert.equal(block.includes(value.signature), false);
+  const repository = memoryRepository([value]);
+  const source = passHarness({ history: [null], root: 43n, blocks: new Map([[42n, block]]) });
+
+  const runResult = await reconciler(source.source, repository, {
+    limit: 1, missingPollThreshold: 2,
+  }).runOnce();
+
+  assert.deepEqual(runResult, { candidateCount: 1, pollCount: 1, revisionCount: 1 });
+  assert.deepEqual(repository.revisions.map((revision) => revision.signature), [value.signature]);
+  assert.equal(repository.candidates.length, 0);
+});
+
+void test('rejects ten thousand and one unique signatures specifically at the block cap', async () => {
+  const value = candidate(74, 43n, {
+    missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY,
+  });
+  const block = uniqueSignatures(10_001, 80_000);
+  assert.equal(new Set(block).size, 10_001);
+  assert.equal(block.includes(value.signature), false);
+  const repository = memoryRepository([value]);
+  const source = passHarness({ history: [null], root: 44n, blocks: new Map([[43n, block]]) });
+
+  await fails(reconciler(source.source, repository, {
+    limit: 1, missingPollThreshold: 2,
+  }).runOnce(), 'block');
+
+  assert.equal(repository.revisions.length, 0);
+  assert.equal(repository.candidates.length, 1);
 });
 
 void test('detaches proxy block evidence without consulting its poisoned iterator', async () => {
@@ -314,6 +372,64 @@ void test('reads eligible blocks sequentially without starting the next slot ear
   assert.deepEqual(await operation, { candidateCount: 2, pollCount: 2, revisionCount: 2 });
 });
 
+void test('keeps earlier orphan revisions durable and stops later slots after a partial failure', async () => {
+  const values = [
+    candidate(75, 120n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY }),
+    candidate(76, 121n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY }),
+    candidate(77, 122n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY }),
+  ] as const;
+  const blockRepository = memoryRepository(values);
+  const blockSource = passHarness({
+    history: [null, null, null],
+    root: 123n,
+    blocks: new Map<bigint, unknown>([
+      [120n, Object.freeze([])],
+      [121n, new Error('https://secret.invalid/second-block')],
+      [122n, Object.freeze([])],
+    ]),
+  });
+
+  await fails(reconciler(blockSource.source, blockRepository, {
+    limit: 3, missingPollThreshold: 2,
+  }).runOnce(), 'block');
+
+  assert.deepEqual(blockSource.calls.filter((call) => call.startsWith('block:')), [
+    'block:primary:120', 'block:primary:121',
+  ]);
+  assert.deepEqual(blockRepository.revisions.map((revision) => revision.signature), [
+    values[0].signature,
+  ]);
+  assert.deepEqual(blockRepository.candidates.map((entry) => entry.signature), [
+    values[1].signature, values[2].signature,
+  ]);
+
+  const revisionRepository = memoryRepository(values);
+  let enqueueAttempts = 0;
+  revisionRepository.beforeEnqueue = () => {
+    enqueueAttempts += 1;
+    if (enqueueAttempts === 2) throw new Error('https://secret.invalid/second-revision');
+  };
+  const revisionSource = passHarness({
+    history: [null, null, null],
+    root: 123n,
+    blocks: new Map(values.map((entry) => [entry.slot, Object.freeze([])])),
+  });
+
+  await fails(reconciler(revisionSource.source, revisionRepository, {
+    limit: 3, missingPollThreshold: 2,
+  }).runOnce(), 'revision');
+
+  assert.deepEqual(revisionSource.calls.filter((call) => call.startsWith('block:')), [
+    'block:primary:120', 'block:primary:121',
+  ]);
+  assert.deepEqual(revisionRepository.revisions.map((revision) => revision.signature), [
+    values[0].signature,
+  ]);
+  assert.deepEqual(revisionRepository.candidates.map((entry) => entry.signature), [
+    values[1].signature, values[2].signature,
+  ]);
+});
+
 void test('turns a stale provider/count/version race at orphan enqueue into a redacted revision failure', async () => {
   const value = candidate(40, 70n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY, finalityEvidenceVersion: 3n });
   const repository = memoryRepository([value]);
@@ -326,6 +442,7 @@ void test('turns a stale provider/count/version race at orphan enqueue into a re
     limit: 1, missingPollThreshold: 2,
   }).runOnce(), 'revision');
   assert.equal(repository.revisions.length, 0);
+  assert.deepEqual(finalityState(repository.candidates[0]), [1, FALLBACK, 5n]);
 });
 
 void test('rejects forged poll evidence versions and provider/count/status transitions before block work', async () => {
@@ -505,7 +622,7 @@ void test('rejects hostile candidate and history arrays, invalid clocks, and kee
   }
 });
 
-interface MemoryRepository {
+interface MemoryRepository extends FinalityReconcilerRepository {
   readonly candidates: FinalityCandidate[];
   readonly polls: FinalityPollObservation[];
   readonly revisions: FinalityRevision[];
@@ -550,7 +667,8 @@ function memoryRepository(initial: readonly FinalityCandidate[]): MemoryReposito
     },
     async enqueueRevision(value) {
       repository.beforeEnqueue?.();
-      const current = candidates.find((candidateValue) => candidateValue.signature === value.signature);
+      const index = candidates.findIndex((candidateValue) => candidateValue.signature === value.signature);
+      const current = candidates[index];
       assert.ok(current);
       if (value.confirmationStatus === 'orphaned') {
         assert.equal(value.expectedConfirmationStatus, current.confirmationStatus);
@@ -559,6 +677,7 @@ function memoryRepository(initial: readonly FinalityCandidate[]): MemoryReposito
         assert.equal(value.expectedFinalityEvidenceVersion, current.finalityEvidenceVersion);
       }
       revisions.push(value);
+      candidates.splice(index, 1);
     },
     replace(signature, patch) {
       const index = candidates.findIndex((candidateValue) => candidateValue.signature === signature);
@@ -603,7 +722,7 @@ function passHarness(options: PassHarnessOptions = {}) {
 }
 
 function reconciler(source: FinalityProviderPassSource, repository: MemoryRepository, options: { readonly limit: number; readonly missingPollThreshold?: number; readonly now?: () => number }) {
-  return new FinalityReconciler(source as never, repository as never, options);
+  return new FinalityReconciler(source, repository, options);
 }
 
 function candidate(byte: number, slot: bigint, patch: Partial<FinalityCandidate> = {}): FinalityCandidate {
@@ -620,6 +739,19 @@ function history(slot: bigint, confirmationStatus: 'processed' | 'confirmed' | '
 }
 
 function signature(byte: number): string { return bs58.encode(Buffer.alloc(64, byte)); }
+
+function uniqueSignature(index: number): string {
+  const bytes = Buffer.alloc(64);
+  bytes.writeBigUInt64BE(BigInt(index), 0);
+  return bs58.encode(bytes);
+}
+
+function uniqueSignatures(count: number, start = 0): readonly string[] {
+  return Object.freeze(Array.from(
+    { length: count },
+    (_, offset) => uniqueSignature(start + offset),
+  ));
+}
 
 function finalityState(value: FinalityCandidate | undefined) {
   assert.ok(value);
