@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import test from 'node:test';
 import bs58 from 'bs58';
 import type { Commitment, PublicKey } from '@solana/web3.js';
@@ -8,9 +12,11 @@ import {
   type ProviderPinnedCatchUpSourceDependencies,
 } from '../src/solana/rpc/provider-pinned-catch-up-source.js';
 import type { RpcProviderCatalog } from '../src/solana/rpc/rpc-provider-catalog.js';
+import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
 const PROGRAM = '11111111111111111111111111111111';
 const EXPECTED_GENESIS = genesis(7);
+const execFileAsync = promisify(execFile);
 
 void test('resolves once, creates one fixed RPC, validates genesis before signatures, and reuses it for pages', async () => {
   const events: string[] = [];
@@ -58,6 +64,58 @@ void test('shares one in-flight genesis verification between concurrent first pa
   await Promise.all([first, second]);
   assert.equal(rpc.genesisCalls, 1);
   assert.equal(rpc.calls.length, 2);
+});
+
+void test('uses the default Connection against only the selected URL with no internal 429 retry', async () => {
+  const selectedUrl = 'https://selected-provider.invalid/rpc';
+  const fallbackUrl = 'https://fallback-provider.invalid/rpc';
+  const script = `
+const expectedGenesis = ${JSON.stringify(EXPECTED_GENESIS)};
+const selectedUrl = ${JSON.stringify(selectedUrl)};
+const fallbackUrl = ${JSON.stringify(fallbackUrl)};
+const originalFetch = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+const calls = [];
+try {
+  Object.defineProperty(globalThis, 'fetch', {
+    configurable: true,
+    writable: true,
+    value: async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const request = JSON.parse(String(init?.body));
+      calls.push({ url, method: request.method, params: request.params });
+      if (request.method === 'getGenesisHash') {
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: expectedGenesis }), { status: 200 });
+      }
+      return new Response('limited', { status: 429, statusText: 'Too Many Requests' });
+    },
+  });
+  const { createProviderPinnedCatchUpSource } = await import('./src/solana/rpc/provider-pinned-catch-up-source.ts');
+  const catalog = Object.freeze({
+    ids: Object.freeze(['fallback-1']),
+    resolve: (id) => Object.freeze({ id, httpUrl: selectedUrl, websocketUrl: fallbackUrl }),
+  });
+  const source = createProviderPinnedCatchUpSource(catalog, 'fallback-1', 'confirmed', expectedGenesis);
+  try { await source.list('11111111111111111111111111111111', undefined, 1); } catch {}
+  process.stdout.write(JSON.stringify(calls));
+} finally {
+  if (originalFetch === undefined) delete globalThis.fetch;
+  else Object.defineProperty(globalThis, 'fetch', originalFetch);
+}
+`;
+  const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+  const { stdout } = await execFileAsync(process.execPath, [
+    '--import', 'tsx', '--input-type=module', '--eval', script,
+  ], { cwd: repositoryRoot, encoding: 'utf8' });
+  const calls = JSON.parse(stdout) as readonly {
+    readonly url: string;
+    readonly method: string;
+    readonly params: readonly unknown[];
+  }[];
+
+  assert.deepEqual(calls.map(({ url }) => url), [selectedUrl, selectedUrl]);
+  assert.equal(calls.filter(({ url }) => url === fallbackUrl).length, 0);
+  assert.deepEqual(calls.map(({ method }) => method), ['getGenesisHash', 'getSignaturesForAddress']);
+  assert.deepEqual(calls[1]?.params, [PROGRAM, { commitment: 'confirmed', limit: 1 }]);
 });
 
 void test('rejects malformed, noncanonical, and non-32-byte expected genesis values before catalog or RPC use', () => {
@@ -163,7 +221,7 @@ void test('treats hostile catalog, pair, RPC, and dependency inputs as fixed con
 
 void test('does not import the HTTP failover transport or expose URL and RPC internals', async () => {
   const sourcePath = new URL('../src/solana/rpc/provider-pinned-catch-up-source.ts', import.meta.url);
-  const content = await (await import('node:fs/promises')).readFile(sourcePath, 'utf8');
+  const content = await readFile(sourcePath, 'utf8');
   assert.doesNotMatch(content, /http-failover-transport/u);
   const source = createProviderPinnedCatchUpSource(
     catalog(() => pair('https://url-secret.invalid/rpc')), 'primary', 'confirmed', EXPECTED_GENESIS,
@@ -171,6 +229,13 @@ void test('does not import the HTTP failover transport or expose URL and RPC int
   );
   assert.deepEqual(Reflect.ownKeys(source), ['providerId', 'list']);
   assert.doesNotMatch(JSON.stringify(source), /url-secret|rpc/i);
+});
+
+void test('keeps the provider-pinned source outside signing, submission, and wallet boundaries', async () => {
+  const sourceUrl = new URL('../src/solana/rpc/provider-pinned-catch-up-source.ts', import.meta.url);
+  const source = await readFile(sourceUrl, 'utf8');
+  const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+  assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(sourceUrl), repositoryRoot), []);
 });
 
 function dependencies(
