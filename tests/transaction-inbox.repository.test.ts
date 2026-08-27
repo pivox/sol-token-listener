@@ -706,6 +706,9 @@ void test('rejects non-canonical strict checkpoint signatures before I/O and acc
           }
           if (text.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
           if (text.includes('INSERT INTO processing_checkpoints')) return { rows: [], rowCount: 1 };
+          if (text.includes('UPDATE listener_strict_catch_up_failures')) {
+            return { rows: [], rowCount: 0 };
+          }
           throw new Error('Unexpected strict checkpoint query.');
         },
         release: () => {},
@@ -766,6 +769,138 @@ void test('allows one concurrent exact strict checkpoint CAS winner', async (con
     assert.equal(outcomes.filter((outcome) => outcome.status === 'fulfilled').length, 1);
     assert.equal(outcomes.filter((outcome) =>
       outcome.status === 'rejected' && outcome.reason instanceof TransactionInboxConflictError).length, 1);
+  });
+});
+
+void test('resolves strict failure evidence inside a successful CAS but not a failed CAS', async () => {
+  const successfulQueries: string[] = [];
+  const successfulRepository = new PostgresTransactionInboxRepository({
+    connect: async () => ({
+      query: async (text: string) => {
+        successfulQueries.push(text);
+        if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
+        if (text.includes('INSERT INTO processing_checkpoints')) return { rows: [], rowCount: 1 };
+        if (text.includes('UPDATE listener_strict_catch_up_failures')) {
+          return { rows: [], rowCount: 0 };
+        }
+        throw new Error('Unexpected successful strict CAS query.');
+      },
+      release: () => {},
+    }),
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+  await successfulRepository.compareAndSwapCheckpoint(
+    null,
+    checkpoint('launchpad', 50n, 'successful-cas', 400_000),
+  );
+  assert.ok(successfulQueries.some((text) => text.includes('UPDATE listener_strict_catch_up_failures')));
+
+  const failedQueries: string[] = [];
+  const failedRepository = new PostgresTransactionInboxRepository({
+    connect: async () => ({
+      query: async (text: string) => {
+        failedQueries.push(text);
+        if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
+        if (text.includes('UPDATE processing_checkpoints')) return { rows: [], rowCount: 0 };
+        throw new Error('Unexpected failed strict CAS query.');
+      },
+      release: () => {},
+    }),
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+  await assert.rejects(
+    failedRepository.compareAndSwapCheckpoint(
+      checkpoint('market', 50n, 'failed-cas', 400_000),
+      checkpoint('market', 51n, 'failed-cas-next', 400_001),
+    ),
+    TransactionInboxConflictError,
+  );
+  assert.equal(failedQueries.some((text) => text.includes('UPDATE listener_strict_catch_up_failures')), false);
+});
+
+void test('locks the checkpoint before recording strict catch-up evidence', async () => {
+  const queries: string[] = [];
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => ({
+      query: async (text: string) => {
+        queries.push(text);
+        if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
+        if (text.includes('FROM processing_checkpoints')) return { rows: [], rowCount: 0 };
+        if (text.includes('INSERT INTO listener_strict_catch_up_failures')) {
+          return { rows: [], rowCount: 1 };
+        }
+        throw new Error('Unexpected strict failure record query.');
+      },
+      release: () => {},
+    }),
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+  await repository.recordStrictCatchUpFailure(
+    strictFailure('launchpad', null, 'primary', 50n, 400_000),
+  );
+  const lockIndex = queries.findIndex((text) => text.includes('pg_advisory_xact_lock'));
+  const checkpointIndex = queries.findIndex((text) => text.includes('FROM processing_checkpoints'));
+  const insertIndex = queries.findIndex((text) => text.includes('INSERT INTO listener_strict_catch_up_failures'));
+  assert.ok(lockIndex > 0);
+  assert.ok(checkpointIndex > lockIndex);
+  assert.ok(insertIndex > checkpointIndex);
+});
+
+void test('leaves strict race evidence resolved in record-first and CAS-first orders', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const recordFirst = strictFailure('launchpad', null, 'primary', 50n, 30_000);
+    await repository.recordStrictCatchUpFailure(recordFirst);
+    const firstAdvance = checkpoint('launchpad', 50n, 'record-first-advance', 20_000);
+    await repository.compareAndSwapCheckpoint(null, firstAdvance);
+
+    const delayedAdvance = checkpoint('launchpad', 51n, 'cas-first-advance', 26_000);
+    await repository.compareAndSwapCheckpoint(firstAdvance, delayedAdvance);
+    const casFirst = strictFailure('launchpad', firstAdvance, 'fallback-1', 51n, 25_000);
+    await repository.recordStrictCatchUpFailure(casFirst);
+
+    const failedPrevious = checkpoint('market', 60n, 'failed-cas-previous', 40_000);
+    await repository.compareAndSwapCheckpoint(null, failedPrevious);
+    const failedCas = strictFailure('market', failedPrevious, 'fallback-2', 60n, 41_000);
+    await repository.recordStrictCatchUpFailure(failedCas);
+    await assert.rejects(
+      repository.compareAndSwapCheckpoint(
+        checkpoint('market', 60n, 'wrong-failed-cas-expected', 40_000),
+        checkpoint('market', 61n, 'failed-cas-next', 42_000),
+      ),
+      TransactionInboxConflictError,
+    );
+
+    const rows = await pool.query(
+      `SELECT failure_id, resolved_at IS NOT NULL AS resolved,
+         (EXTRACT(EPOCH FROM resolved_at) * 1000)::bigint AS resolved_at_ms,
+         (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms
+       FROM listener_strict_catch_up_failures WHERE failure_id = ANY($1::TEXT[]) ORDER BY failure_id`,
+      [[recordFirst.failureId, casFirst.failureId, failedCas.failureId]],
+    );
+    assert.deepEqual(rows.rows, [
+      {
+        failure_id: casFirst.failureId, resolved: true,
+        resolved_at_ms: '26000', purge_after_ms: '14426000',
+      },
+      {
+        failure_id: failedCas.failureId, resolved: false,
+        resolved_at_ms: null, purge_after_ms: null,
+      },
+      {
+        failure_id: recordFirst.failureId, resolved: true,
+        resolved_at_ms: '30000', purge_after_ms: '14430000',
+      },
+    ].sort((left, right) => left.failure_id.localeCompare(right.failure_id)));
   });
 });
 
