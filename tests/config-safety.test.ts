@@ -11,6 +11,102 @@ const base = {
   SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
 };
 
+void test('fallback HTTP RPC defaults to a frozen empty list when absent or whitespace-only', () => {
+  for (const value of [undefined, '   ']) {
+    const config = parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: value });
+    assert.deepEqual(config.httpRpcFallbackUrls, []);
+    assert.equal(Object.isFrozen(config.httpRpcFallbackUrls), true);
+  }
+});
+
+void test('fallback HTTP RPC preserves order and canonicalizes valid endpoints', () => {
+  const config = parseConfig({
+    ...base,
+    SOLANA_HTTP_RPC_FALLBACK_URLS: 'HTTPS://ONE.EXAMPLE.INVALID,https://two.example.invalid/path',
+  });
+  assert.deepEqual(config.httpRpcFallbackUrls, [
+    'https://one.example.invalid/',
+    'https://two.example.invalid/path',
+  ]);
+  assert.equal(Object.isFrozen(config.httpRpcFallbackUrls), true);
+});
+
+void test('fallback HTTP RPC rejects canonical duplicates including the primary endpoint', () => {
+  for (const value of [
+    'https://rpc.example.invalid/',
+    'https://fallback.example.invalid,https://fallback.example.invalid/',
+  ]) {
+    assert.throws(
+      () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: value }),
+      /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+    );
+  }
+});
+
+void test('fallback HTTP RPC rejects empty entries', () => {
+  for (const value of [
+    ',https://fallback.example.invalid',
+    'https://fallback.example.invalid,',
+    'https://one.example.invalid,,https://two.example.invalid',
+  ]) {
+    assert.throws(
+      () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: value }),
+      /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+    );
+  }
+});
+
+void test('fallback HTTP RPC rejects invalid URLs and protocols', () => {
+  for (const value of ['not a URL', 'ftp://fallback.example.invalid']) {
+    assert.throws(
+      () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: value }),
+      /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+    );
+  }
+});
+
+void test('fallback HTTP RPC rejects mixed schemes', () => {
+  assert.throws(
+    () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: 'http://fallback.example.invalid' }),
+    /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+  );
+});
+
+void test('fallback HTTP RPC rejects more than three fallback endpoints', () => {
+  assert.throws(
+    () => parseConfig({
+      ...base,
+      SOLANA_HTTP_RPC_FALLBACK_URLS: [
+        'https://one.example.invalid',
+        'https://two.example.invalid',
+        'https://three.example.invalid',
+        'https://four.example.invalid',
+      ].join(','),
+    }),
+    /SOLANA_HTTP_RPC_FALLBACK_URLS/u,
+  );
+});
+
+void test('fallback HTTP RPC validation errors redact configured endpoint secrets', () => {
+  const secretEndpoint = 'ftp://user:super-secret@private.example.invalid/path?apiKey=private-key';
+  assert.throws(
+    () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: secretEndpoint }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      for (const secret of [
+        secretEndpoint,
+        'user',
+        'super-secret',
+        'private.example.invalid',
+        '/path',
+        'apiKey',
+        'private-key',
+      ]) assert.equal(error.message.includes(secret), false);
+      return true;
+    },
+  );
+});
+
 void test('le mode par défaut est strictement observe', () => {
   const config = parseConfig(base);
   assert.equal(config.executionMode, 'observe');
