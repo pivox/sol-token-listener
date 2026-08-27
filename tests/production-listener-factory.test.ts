@@ -108,6 +108,16 @@ void test('production wires the redacted HTTP RPC failover event sink', async ()
   assert.doesNotMatch(sink, /(?:httpRpcUrl|wsRpcUrl|fallbackUrls|endpointUrl|host|provider|key|cause|error)/iu);
 });
 
+void test('keeps the acknowledged WebSocket session foundation inactive until issue 63', async () => {
+  const source = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+
+  assert.doesNotMatch(source, /ws-program-session/u);
+  assert.match(source, /new SolanaProgramSubscriber\(/u);
+});
+
 void test('production composes one canonical qualification writer before paper decisions', async () => {
   const source = await readFile(
     new URL('../src/application/production-listener-factory.ts', import.meta.url),

@@ -29,6 +29,7 @@ void test('fallback HTTP RPC preserves order and canonicalizes valid endpoints',
     'https://two.example.invalid/path',
   ]);
   assert.equal(Object.isFrozen(config.httpRpcFallbackUrls), true);
+  assert.deepEqual(config.wsRpcFallbackUrls, []);
 });
 
 void test('fallback HTTP RPC rejects canonical duplicates including the primary endpoint', () => {
@@ -136,6 +137,116 @@ void test('fallback HTTP RPC validation errors redact configured endpoint secret
       ]) assert.equal(error.message.includes(secret), false);
       return true;
     },
+  );
+});
+
+void test('fallback WebSocket RPC defaults to a frozen empty list when both fallback lists are absent or whitespace-only', () => {
+  for (const value of [undefined, '   ']) {
+    const config = parseConfig({
+      ...base,
+      SOLANA_HTTP_RPC_FALLBACK_URLS: value,
+      SOLANA_WS_RPC_FALLBACK_URLS: value,
+    });
+    assert.deepEqual(config.wsRpcFallbackUrls, []);
+    assert.equal(Object.isFrozen(config.wsRpcFallbackUrls), true);
+  }
+});
+
+void test('paired RPC fallbacks preserve canonical order for HTTP and WebSocket endpoints', () => {
+  const config = parseConfig({
+    ...base,
+    SOLANA_HTTP_RPC_FALLBACK_URLS: 'HTTPS://ONE.EXAMPLE.INVALID,https://two.example.invalid/path',
+    SOLANA_WS_RPC_FALLBACK_URLS: 'WSS://ONE.EXAMPLE.INVALID,wss://two.example.invalid/path',
+  });
+  assert.deepEqual(config.httpRpcFallbackUrls, [
+    'https://one.example.invalid/',
+    'https://two.example.invalid/path',
+  ]);
+  assert.deepEqual(config.wsRpcFallbackUrls, [
+    'wss://one.example.invalid/',
+    'wss://two.example.invalid/path',
+  ]);
+  assert.equal(Object.isFrozen(config.wsRpcFallbackUrls), true);
+});
+
+void test('paired RPC fallbacks require both lists with the same cardinality', () => {
+  for (const environment of [
+    { SOLANA_WS_RPC_FALLBACK_URLS: 'wss://one.example.invalid' },
+    {
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://one.example.invalid,https://two.example.invalid',
+      SOLANA_WS_RPC_FALLBACK_URLS: 'wss://one.example.invalid',
+    },
+  ]) {
+    assert.throws(() => parseConfig({ ...base, ...environment }), /RPC fallback endpoint lists/u);
+  }
+});
+
+void test('paired RPC endpoints require https/wss or http/ws at every position', () => {
+  for (const environment of [
+    {
+      SOLANA_WS_RPC_URL: 'ws://rpc.example.invalid',
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://one.example.invalid',
+      SOLANA_WS_RPC_FALLBACK_URLS: 'ws://one.example.invalid',
+    },
+    {
+      SOLANA_HTTP_RPC_URL: 'http://rpc.example.invalid',
+      SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'http://one.example.invalid',
+      SOLANA_WS_RPC_FALLBACK_URLS: 'wss://one.example.invalid',
+    },
+  ]) {
+    assert.throws(() => parseConfig({ ...base, ...environment }), /RPC endpoint protocols/u);
+  }
+});
+
+void test('fallback WebSocket RPC rejects blanks, fragments, and canonical duplicates without leaking endpoints', () => {
+  const secret = 'wss://user:super-secret@private.example.invalid/rpc#fragment-secret';
+  for (const environment of [
+    {
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://one.example.invalid',
+      SOLANA_WS_RPC_FALLBACK_URLS: 'wss://one.example.invalid,',
+    },
+    {
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://one.example.invalid',
+      SOLANA_WS_RPC_FALLBACK_URLS: 'wss://rpc.example.invalid/',
+    },
+    {
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://one.example.invalid,https://two.example.invalid',
+      SOLANA_WS_RPC_FALLBACK_URLS: 'wss://one.example.invalid,wss://one.example.invalid/',
+    },
+    {
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://one.example.invalid',
+      SOLANA_WS_RPC_FALLBACK_URLS: secret,
+    },
+  ]) {
+    assert.throws(
+      () => parseConfig({ ...base, ...environment }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.doesNotMatch(error.message, /super-secret|private\.example\.invalid|fragment-secret|\/rpc/iu);
+        return true;
+      },
+    );
+  }
+});
+
+void test('fallback WebSocket RPC rejects more than three paired endpoints', () => {
+  assert.throws(
+    () => parseConfig({
+      ...base,
+      SOLANA_HTTP_RPC_FALLBACK_URLS: [
+        'https://one.example.invalid',
+        'https://two.example.invalid',
+        'https://three.example.invalid',
+      ].join(','),
+      SOLANA_WS_RPC_FALLBACK_URLS: [
+        'wss://one.example.invalid',
+        'wss://two.example.invalid',
+        'wss://three.example.invalid',
+        'wss://four.example.invalid',
+      ].join(','),
+    }),
+    /SOLANA_WS_RPC_FALLBACK_URLS/u,
   );
 });
 

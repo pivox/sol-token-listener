@@ -224,7 +224,10 @@ void test('Compose defines an observe-only, five-service deployment without expo
     app,
     /^ {6}SOLANA_HTTP_RPC_URL: \$\{SOLANA_HTTP_RPC_URL:\?SOLANA_HTTP_RPC_URL is required\}\n {6}SOLANA_HTTP_RPC_FALLBACK_URLS: \$\{SOLANA_HTTP_RPC_FALLBACK_URLS:-\}$/m,
   );
-  assert.match(app, /^ {6}SOLANA_WS_RPC_URL: \$\{SOLANA_WS_RPC_URL:\?SOLANA_WS_RPC_URL is required\}$/m);
+  assert.match(
+    app,
+    /^ {6}SOLANA_WS_RPC_URL: \$\{SOLANA_WS_RPC_URL:\?SOLANA_WS_RPC_URL is required\}\n {6}SOLANA_WS_RPC_FALLBACK_URLS: \$\{SOLANA_WS_RPC_FALLBACK_URLS:-\}$/m,
+  );
   assert.match(app, /^ {6}EXECUTION_MODE: observe$/m);
   assert.match(app, /^ {6}PAPER_STRATEGY_ENABLED: "false"$/m);
   assert.match(app, /^ {6}API_ENABLED: "true"$/m);
@@ -329,6 +332,7 @@ void test('Compose environment template contains documentation-only required inp
     'SOLANA_HTTP_RPC_URL=https://rpc-provider.invalid',
     'SOLANA_HTTP_RPC_FALLBACK_URLS=',
     'SOLANA_WS_RPC_URL=wss://rpc-provider.invalid',
+    'SOLANA_WS_RPC_FALLBACK_URLS=',
     'FRONTEND_PORT=8080',
     'LISTENER_ENABLED=true',
     'RETENTION_PURGE_INTERVAL_MS=900000',
@@ -342,6 +346,10 @@ void test('Compose environment template contains documentation-only required inp
   assert.match(
     environment,
     /^# Optional ordered, comma-separated fallback HTTP RPC URLs \(maximum 3\); use the same scheme and this can remain blank\.\nSOLANA_HTTP_RPC_FALLBACK_URLS=$/m,
+  );
+  assert.match(
+    environment,
+    /^# Optional paired WebSocket fallbacks; positions must match the HTTP fallback list and this can remain blank\.\nSOLANA_WS_RPC_FALLBACK_URLS=$/m,
   );
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/i);
   for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE']) {
