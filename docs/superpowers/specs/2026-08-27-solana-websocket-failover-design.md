@@ -3,8 +3,12 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.1.0
+Version: 1.1.1
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.1.1 aligns strict-failure values with PostgreSQL numeric and
+timestamp limits, rejects hostile proxies before reflection, and centralizes
+the positional provider identifier in one neutral domain contract.
 
 Revision 1.1.0 selects an inactive dedicated strict scanner for issue #60,
 defines explicit genesis-hash trust, exact checkpoint CAS semantics,
