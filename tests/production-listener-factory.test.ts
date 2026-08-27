@@ -92,6 +92,22 @@ void test('production factory has no transaction execution or Raydium builder pa
   assert.match(source, /listener\.catch_up_gap_recorded/u);
 });
 
+void test('production wires the redacted HTTP RPC failover event sink', async () => {
+  const source = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(
+    source,
+    /new SolanaRpcClient\(config,\s*\{\s*onHttpFailoverEvent: logRpcHttpFailoverEvent,\s*\}\)/u,
+  );
+  const sink = /function logRpcHttpFailoverEvent\([\s\S]*?\n\}/u.exec(source)?.[0];
+  assert.ok(sink);
+  assert.match(sink, /logger\.warn\(event, 'Événement de basculement HTTP RPC observé\.'\)/u);
+  assert.doesNotMatch(sink, /(?:httpRpcUrl|wsRpcUrl|fallbackUrls|endpointUrl|host|provider|key|cause|error)/iu);
+});
+
 void test('production composes one canonical qualification writer before paper decisions', async () => {
   const source = await readFile(
     new URL('../src/application/production-listener-factory.ts', import.meta.url),

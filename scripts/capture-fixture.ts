@@ -181,6 +181,7 @@ async function main(): Promise<void> {
 
   const client = new SolanaRpcClient({
     httpRpcUrl,
+    httpRpcFallbackUrls: Object.freeze([]),
     wsRpcUrl: webSocketUrl(httpRpcUrl),
     commitment: 'finalized',
     finality: 'finalized',
