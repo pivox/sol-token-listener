@@ -23,6 +23,15 @@ void test('creates immutable available authoritative usage evidence', () => {
   }, TypeError);
 });
 
+void test('accepts the exact bounded provider rate-limit counter maximum', () => {
+  const snapshot = createProviderUsageSnapshot({
+    status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 125n,
+    rateLimitedCount: 1_000_000,
+  });
+
+  assert.equal(snapshot.rateLimitedCount, 1_000_000);
+});
+
 void test('creates immutable unavailable evidence without fabricated credit usage', () => {
   const snapshot = createProviderUsageSnapshot({
     status: 'UNAVAILABLE', creditsUsedStart: null, creditsUsedEnd: null, rateLimitedCount: 0,
@@ -40,6 +49,11 @@ void test('rejects malformed provider usage evidence at the port boundary', () =
     { status: 'AVAILABLE', creditsUsedStart: 2n, creditsUsedEnd: 1n, rateLimitedCount: 0 },
     { status: 'AVAILABLE', creditsUsedStart: 0n, creditsUsedEnd: 1n, rateLimitedCount: -1 },
     { status: 'AVAILABLE', creditsUsedStart: 0n, creditsUsedEnd: 1n, rateLimitedCount: 0.5 },
+    { status: 'AVAILABLE', creditsUsedStart: 0n, creditsUsedEnd: 1n, rateLimitedCount: 1_000_001 },
+    {
+      status: 'AVAILABLE', creditsUsedStart: 0n, creditsUsedEnd: 1n,
+      rateLimitedCount: Number.MAX_SAFE_INTEGER,
+    },
     { status: 'UNAVAILABLE', creditsUsedStart: 0n, creditsUsedEnd: null, rateLimitedCount: 0 },
     { status: 'UNAVAILABLE', creditsUsedStart: null, creditsUsedEnd: null, rateLimitedCount: 0, apiKey: 'secret' },
   ];

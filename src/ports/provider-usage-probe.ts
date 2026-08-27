@@ -1,5 +1,6 @@
 import type { PaperMvpProviderUsage } from '../domain/paper-mvp.js';
 
+const MAX_RATE_LIMITED_COUNT = 1_000_000;
 const providerUsageSnapshotBrand: unique symbol = Symbol('providerUsageSnapshot');
 
 export type ProviderUsageSnapshotInput = Readonly<{
@@ -34,7 +35,8 @@ export function createProviderUsageSnapshot(
   const rateLimitedCount = input.rateLimitedCount;
   if (
     typeof rateLimitedCount !== 'number'
-    || !Number.isSafeInteger(rateLimitedCount) || rateLimitedCount < 0
+    || !Number.isSafeInteger(rateLimitedCount)
+    || rateLimitedCount < 0 || rateLimitedCount > MAX_RATE_LIMITED_COUNT
   ) invalid();
 
   if (status === 'AVAILABLE') {
