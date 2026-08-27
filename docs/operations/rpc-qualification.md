@@ -43,6 +43,50 @@ Avant un test prolongé, relever dans le tableau de bord du fournisseur le
 quota restant, les crédits par méthode et les limites de connexions WebSocket.
 Ces données sont contractuelles et ne peuvent pas être déduites du rapport.
 
+## Basculement HTTP de production
+
+`SOLANA_HTTP_RPC_URL` reste l'endpoint principal. En production, on peut ajouter
+`SOLANA_HTTP_RPC_FALLBACK_URLS` sous la forme d'une liste ordonnée, séparée par
+des virgules, de fallbacks : au plus trois fallbacks (donc quatre endpoints au total).
+Les URLs sont canonicalisées : les doublons canoniques, y compris le principal,
+sont refusés, et tous les endpoints HTTP doivent avoir le même schéma HTTP
+(`http` ou `https`). Par exemple :
+
+```dotenv
+SOLANA_HTTP_RPC_URL=https://primary.example.invalid
+SOLANA_HTTP_RPC_FALLBACK_URLS=https://fallback-one.example.invalid,https://fallback-two.example.invalid
+SOLANA_WS_RPC_URL=wss://primary.example.invalid
+```
+
+Sans fallback, le listener conserve exactement le comportement à endpoint unique
+de web3.js, y compris son rate-limit retry. Avec des fallbacks, le transport HTTP
+de production ne bascule que sur un rejet réseau ou HTTP 429, 502, 503 et 504.
+Il essaie chaque endpoint éligible au plus une fois par requête logique; le
+dernier endpoint sain reste privilégié. Il ne bascule pas pour un autre 4xx,
+une erreur JSON-RPC en HTTP 200, ou un résultat archive null applicatif.
+
+`Retry-After` et le délai de refroidissement sont bornés à 60 secondes. Lorsque
+tous les endpoints sont en refroidissement, il n'y a aucune attente interne :
+l'épuisement fixe est propagé au comportement existant de démarrage ou de retry
+durable. Les métriques V1 sont uniquement dérivées des logs. Les seuls
+identifiants d'endpoint publiés sont
+`primary`, `fallback-1`, `fallback-2` et `fallback-3`; les événements stables
+sont `rpc.http_endpoint_degraded`, `rpc.http_failover` et
+`rpc.http_endpoints_exhausted`. Les logs ne contiennent jamais URL, hôte,
+en-tête, corps, erreur fournisseur, clé API, ni erreur fournisseur brute.
+
+L'opérateur provisionne les endpoints indépendamment et vérifie auprès de chaque
+fournisseur les quotas, la facturation et la cohérence archive. Ce dépôt ne peut
+pas valider les contrats de quota ou de facturation des fournisseurs.
+
+`SOLANA_WS_RPC_URL` reste une seule URL inchangée : le basculement WebSocket
+contrôlé est le sujet séparé de l'issue #57.
+
+Le basculement de production est distinct du soak : `npm run rpc:soak` reste
+intentionnellement mono-fournisseur et ignore conceptuellement la liste de
+fallbacks. Il qualifie exactement `SOLANA_HTTP_RPC_URL + SOLANA_WS_RPC_URL`
+d'un seul fournisseur, pas une chaîne de basculement de production.
+
 ## Exécution
 
 Commencer par le test par défaut :
@@ -103,3 +147,8 @@ les métriques du tableau de bord, et valider explicitement :
 Le soak ne promet ni première position, ni présence dans le même slot, ni
 sellabilité, ni profit. Il mesure seulement un petit contrat de disponibilité
 RPC en observation.
+
+La validation terrain Issue #49 à 50 positions Mainnet reste non exécutée et
+non validée. Ce soak, comme le basculement, ne prouve donc ni la préparation
+opérationnelle ni la profitabilité; le produit demeure observe/paper only, sans
+wallet, signature ni soumission.

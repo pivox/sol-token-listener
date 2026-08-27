@@ -696,6 +696,52 @@ void test('Pump.fun calibration documentation states the initial profile, semant
   assert.doesNotMatch(systemOverview, /704 tests réussis/iu);
 });
 
+void test('HTTP RPC failover documentation states the bounded production and soak contract', async () => {
+  const [readme, operations] = await Promise.all([
+    readFile(new URL('../README.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/operations/rpc-qualification.md', import.meta.url), 'utf8'),
+  ]);
+  const documentation = `${readme}\n${operations}`;
+
+  for (const statement of [
+    'SOLANA_HTTP_RPC_FALLBACK_URLS',
+    'liste ordonnée',
+    'séparée par',
+    'des virgules',
+    'principal',
+    'fallback-1',
+    'fallback-2',
+    'fallback-3',
+    'au plus trois',
+    'même schéma HTTP',
+    'doublons canoniques',
+    'rpc.http_endpoint_degraded',
+    'rpc.http_failover',
+    'rpc.http_endpoints_exhausted',
+    'Retry-After',
+    '60 secondes',
+    'erreur JSON-RPC',
+    'résultat archive null',
+    'SOLANA_WS_RPC_URL',
+    'issue #57',
+    'mono-fournisseur',
+    'SOLANA_HTTP_RPC_URL + SOLANA_WS_RPC_URL',
+    '50 positions Mainnet',
+    'non exécutée',
+    'non validée',
+    'observe/paper only',
+  ]) assert.ok(documentation.includes(statement), `missing HTTP RPC failover documentation statement: ${statement}`);
+
+  assert.match(readme, /Sans fallback[\s\S]{0,180}web3\.js[\s\S]{0,100}rate.limit retry/iu);
+  assert.match(operations, /rejet réseau[\s\S]{0,180}429[\s\S]{0,180}502[\s\S]{0,180}503[\s\S]{0,180}504/iu);
+  assert.match(operations, /chaque endpoint éligible[\s\S]{0,120}au plus une fois[\s\S]{0,120}requête logique/iu);
+  assert.match(operations, /refroidissement[\s\S]{0,120}aucune attente interne/iu);
+  assert.match(operations, /URL[\s\S]{0,120}hôte[\s\S]{0,120}en-tête[\s\S]{0,120}corps[\s\S]{0,120}erreur fournisseur[\s\S]{0,120}clé API/iu);
+  assert.match(operations, /indépendamment[\s\S]{0,180}quota[\s\S]{0,180}cohérence archive/iu);
+  assert.match(operations, /basculement de production[\s\S]{0,180}soak/iu);
+  assert.match(readme, /wallet[\s\S]{0,80}signature[\s\S]{0,80}soumission/iu);
+});
+
 void test('qualification loader, evaluator, profile, and public API boundaries exclude execution primitives', async () => {
   const modulePaths = [
     '../src/qualification/qualification-engine.ts',
