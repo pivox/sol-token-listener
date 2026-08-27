@@ -1214,6 +1214,7 @@ function assertValidStrictCheckpoint(
   if (value.slot > MAX_STRICT_CATCH_UP_SLOT) {
     throw new TypeError('Strict checkpoint slot exceeds persistence bounds.');
   }
+  strictCatchUpSignature(value.signature, 'Strict checkpoint signature');
 }
 
 function strictCatchUpFailureIdentityMatches(

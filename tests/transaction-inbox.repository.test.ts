@@ -673,6 +673,53 @@ void test('uses exact checkpoint CAS identities and rejects invalid strict check
   );
 });
 
+void test('rejects non-canonical strict checkpoint signatures before I/O and accepts 128 UTF-8 bytes', async () => {
+  const valid = checkpoint('launchpad', 41n, 'strict-signature', 300_000);
+  for (const signature of [' leading', 'trailing ', 'a'.repeat(129), 'é'.repeat(65)]) {
+    let connections = 0;
+    const repository = new PostgresTransactionInboxRepository({
+      connect: async () => {
+        connections += 1;
+        throw new Error('database access must not occur');
+      },
+      query: async () => { throw new Error('database access must not occur'); },
+    });
+    const invalid = checkpoint('launchpad', 40n, signature, 300_000);
+    await assert.rejects(repository.compareAndSwapCheckpoint(null, invalid), TransactionInboxRepositoryError);
+    await assert.rejects(repository.compareAndSwapCheckpoint(invalid, valid), TransactionInboxRepositoryError);
+    await assert.rejects(
+      repository.resolveStrictCatchUpFailures('launchpad', invalid, 300_000),
+      TransactionInboxRepositoryError,
+    );
+    assert.equal(connections, 0);
+  }
+
+  const exactSignature = 'é'.repeat(64);
+  let connections = 0;
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => {
+      connections += 1;
+      return {
+        query: async (text: string) => {
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+            return { rows: [], rowCount: 0 };
+          }
+          if (text.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
+          if (text.includes('INSERT INTO processing_checkpoints')) return { rows: [], rowCount: 1 };
+          throw new Error('Unexpected strict checkpoint query.');
+        },
+        release: () => {},
+      };
+    },
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+  await repository.compareAndSwapCheckpoint(
+    null,
+    checkpoint('launchpad', 42n, exactSignature, 300_000),
+  );
+  assert.equal(connections, 1);
+});
+
 void test('compares strict checkpoints by exact key slot and signature without timestamp identity', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -729,11 +776,17 @@ void test('records immutable strict failures once and resolves only the exact nu
     const absentFallback = strictFailure('launchpad', null, 'fallback-1', 99n, 500_001);
     const previous = checkpoint('launchpad', 45n, 'resolved-boundary', 499_000);
     const present = strictFailure('launchpad', previous, 'primary', 100n, 500_002);
+    const otherPrevious = checkpoint('launchpad', 46n, 'other-boundary', 499_001);
+    const otherBoundary = strictFailure('launchpad', otherPrevious, 'fallback-2', 101n, 500_003);
+    const otherKeyPrevious = checkpoint('market', 47n, 'other-key-boundary', 499_002);
+    const otherKey = strictFailure('market', otherKeyPrevious, 'fallback-3', 102n, 500_004);
 
     await repository.recordStrictCatchUpFailure(absentPrimary);
     await repository.recordStrictCatchUpFailure(Object.freeze({ ...absentPrimary, detectedAtMs: 600_000 }));
     await repository.recordStrictCatchUpFailure(absentFallback);
     await repository.recordStrictCatchUpFailure(present);
+    await repository.recordStrictCatchUpFailure(otherBoundary);
+    await repository.recordStrictCatchUpFailure(otherKey);
 
     const replayed = await pool.query(
       `SELECT (EXTRACT(EPOCH FROM detected_at) * 1000)::bigint AS detected_at_ms
@@ -757,15 +810,34 @@ void test('records immutable strict failures once and resolves only the exact nu
     assert.deepEqual(rows.rows.find((row) => row.failure_id === present.failureId), {
       failure_id: present.failureId, resolved: false, purge_after_ms: null,
     });
+    assert.deepEqual(rows.rows.find((row) => row.failure_id === otherBoundary.failureId), {
+      failure_id: otherBoundary.failureId, resolved: false, purge_after_ms: null,
+    });
+    assert.deepEqual(rows.rows.find((row) => row.failure_id === otherKey.failureId), {
+      failure_id: otherKey.failureId, resolved: false, purge_after_ms: null,
+    });
 
     await repository.resolveStrictCatchUpFailures('launchpad', previous, 700_001);
+    await repository.resolveStrictCatchUpFailures('launchpad', previous, 700_999);
     const resolvedPresent = await pool.query(
       `SELECT resolved_at IS NOT NULL AS resolved,
+         (EXTRACT(EPOCH FROM resolved_at) * 1000)::bigint AS resolved_at_ms,
          (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms
        FROM listener_strict_catch_up_failures WHERE failure_id = $1`,
       [present.failureId],
     );
-    assert.deepEqual(resolvedPresent.rows, [{ resolved: true, purge_after_ms: '15100001' }]);
+    assert.deepEqual(resolvedPresent.rows, [{
+      resolved: true, resolved_at_ms: '700001', purge_after_ms: '15100001',
+    }]);
+    const retained = await pool.query(
+      `SELECT failure_id, resolved_at IS NOT NULL AS resolved, purge_after
+       FROM listener_strict_catch_up_failures WHERE failure_id = ANY($1::TEXT[]) ORDER BY failure_id`,
+      [[otherBoundary.failureId, otherKey.failureId]],
+    );
+    assert.deepEqual(retained.rows, [
+      { failure_id: otherBoundary.failureId, resolved: false, purge_after: null },
+      { failure_id: otherKey.failureId, resolved: false, purge_after: null },
+    ].sort((left, right) => left.failure_id.localeCompare(right.failure_id)));
   });
 });
 
