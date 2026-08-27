@@ -268,9 +268,21 @@ void test('defines the transaction inbox port at the canonical snapshot conversi
   assert.doesNotMatch(source, /purge/u);
 });
 
-void test('purges every retained terminal inbox row and exposes their count', async () => {
+void test('purges only expired resolved strict failures and exposes their count', async () => {
   const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
 
+  assert.match(source, /readonly listenerStrictCatchUpFailures: number;/u);
+  assert.match(
+    source,
+    /DELETE FROM listener_strict_catch_up_failures[\s\S]*resolved_at IS NOT NULL[\s\S]*purge_after <= clock_timestamp\(\)/u,
+  );
+  const strictFailureDeletion = /DELETE FROM listener_strict_catch_up_failures[\s\S]*?purge_after <= clock_timestamp\(\)/u
+    .exec(source)?.[0] ?? '';
+  assert.doesNotMatch(strictFailureDeletion, /resolved_at IS NULL/u);
+  assert.match(
+    source,
+    /listenerStrictCatchUpFailures: listenerStrictCatchUpFailures\.rowCount \?\? 0,/u,
+  );
   assert.match(source, /readonly transactionInbox: number;/u);
   assert.match(source, /DELETE FROM chain_transaction_inbox[\s\S]*terminal_at IS NOT NULL[\s\S]*purge_after <= clock_timestamp\(\)/u);
   const deletion = /DELETE FROM chain_transaction_inbox[\s\S]*?purge_after <= clock_timestamp\(\)/u
@@ -285,6 +297,9 @@ void test('purges every retained terminal inbox row and exposes their count', as
   const client = {
     query: async (text: string) => {
       queries.push(text);
+      if (text.includes('DELETE FROM listener_strict_catch_up_failures')) {
+        return { rows: [], rowCount: 2 };
+      }
       if (text.includes('DELETE FROM chain_transaction_inbox')) return { rows: [], rowCount: 3 };
       if (text.includes('WITH deleted AS')) {
         return { rows: [{ deleted_count: '0' }], rowCount: 1 };
@@ -296,8 +311,54 @@ void test('purges every retained terminal inbox row and exposes their count', as
   const pool = { connect: async () => client } as unknown as InstanceType<typeof pg.Pool>;
 
   const result = await purgeExpiredFoundationData(pool);
+  assert.equal(result.listenerStrictCatchUpFailures, 2);
   assert.equal(result.transactionInbox, 3);
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
+});
+
+void test('retains unresolved and unexpired strict failure evidence in PostgreSQL', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
+    return;
+  }
+  const schema = `strict_catch_up_retention_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    const strictFailure = async (
+      id: string,
+      resolvedAt: string | null,
+      purgeAfter: string | null,
+    ) => pool.query(`INSERT INTO listener_strict_catch_up_failures (
+      failure_id, checkpoint_key, previous_slot, previous_signature, provider_id,
+      observed_head_slot, reason_code, detected_at, resolved_at, purge_after
+    ) VALUES ($1, 'launchpad', 1, 'strict-boundary', 'primary', 2,
+      'CATCH_UP_WINDOW_EXCEEDED', '2025-01-01T00:00:00.000Z', $2, $3)`,
+    [id, resolvedAt, purgeAfter]);
+    const prefix = 'strict_catchup_failure_';
+    await strictFailure(`${prefix}${'a'.repeat(64)}`, '2025-01-01T00:00:00.000Z', '2025-01-01T04:00:00.000Z');
+    await strictFailure(`${prefix}${'b'.repeat(64)}`, null, null);
+    await strictFailure(`${prefix}${'c'.repeat(64)}`, '2999-01-01T00:00:00.000Z', '2999-01-01T04:00:00.000Z');
+
+    const result = await purgeExpiredFoundationData(pool);
+
+    assert.equal(result.listenerStrictCatchUpFailures, 1);
+    assert.deepEqual((await pool.query(`SELECT failure_id FROM listener_strict_catch_up_failures
+      ORDER BY failure_id`)).rows, [
+      { failure_id: `${prefix}${'b'.repeat(64)}` },
+      { failure_id: `${prefix}${'c'.repeat(64)}` },
+    ]);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
 });
 
 void test('applies migrations 001-026 on an empty PostgreSQL schema and replays cleanly', async (context) => {

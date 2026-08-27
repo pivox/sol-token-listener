@@ -165,6 +165,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly walletGraphSnapshots: number;
   readonly transactionInboxRecoveries: number;
   readonly listenerCatchUpGaps: number;
+  readonly listenerStrictCatchUpFailures: number;
   readonly transactionInbox: number;
   readonly apiEventStream: number;
   readonly domainEvents: number;
@@ -438,6 +439,11 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const listenerCatchUpGaps = await client.query(
       'DELETE FROM listener_catch_up_gaps WHERE purge_after <= clock_timestamp()',
     );
+    const listenerStrictCatchUpFailures = await client.query(
+      `DELETE FROM listener_strict_catch_up_failures
+       WHERE resolved_at IS NOT NULL
+         AND purge_after <= clock_timestamp()`,
+    );
     await client.query(
       `UPDATE chain_transaction_inbox
        SET terminal_at = processed_at,
@@ -662,6 +668,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       walletGraphSnapshots: walletGraphSnapshots.rowCount ?? 0,
       transactionInboxRecoveries: transactionInboxRecoveries.rowCount ?? 0,
       listenerCatchUpGaps: listenerCatchUpGaps.rowCount ?? 0,
+      listenerStrictCatchUpFailures: listenerStrictCatchUpFailures.rowCount ?? 0,
       transactionInbox: transactionInbox.rowCount ?? 0,
       apiEventStream: Number(apiEventStream.rows[0]?.deleted_count ?? 0),
       domainEvents: (participantDomainEvents.rowCount ?? 0)
