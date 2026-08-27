@@ -128,13 +128,13 @@ void test('enforces strict failure lifecycle and finite numeric boundaries in Po
     );
     await assert.rejects(
       insert(`${prefix}${'f'.repeat(64)}`, {
-        resolvedAt: 'infinity', purgeAfter: 'infinity',
+        resolvedAt: 'infinity', purgeAfter: '2025-01-01T04:00:00.000Z',
       }),
       /listener_strict_catch_up_failures_resolved_at_check/u,
     );
     await assert.rejects(
       insert(`${prefix}${'0'.repeat(64)}`, {
-        resolvedAt: '-infinity', purgeAfter: '-infinity',
+        resolvedAt: '-infinity', purgeAfter: '2025-01-01T04:00:00.000Z',
       }),
       /listener_strict_catch_up_failures_resolved_at_check/u,
     );

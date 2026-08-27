@@ -787,7 +787,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             ? `INSERT INTO listener_strict_catch_up_failures (
                  failure_id, checkpoint_key, previous_slot, previous_signature,
                  provider_id, observed_head_slot, reason_code, detected_at, resolved_at, purge_after
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9 + INTERVAL '4 hours')
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz,$9::timestamptz + INTERVAL '4 hours')
                ON CONFLICT (failure_id) DO NOTHING`
             : `INSERT INTO listener_strict_catch_up_failures (
                  failure_id, checkpoint_key, previous_slot, previous_signature,

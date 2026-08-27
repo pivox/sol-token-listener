@@ -855,6 +855,50 @@ void test('locks the checkpoint before recording strict catch-up evidence', asyn
   assert.ok(insertIndex > checkpointIndex);
 });
 
+void test('casts the obsolete strict failure retention timestamp explicitly', async () => {
+  const queries: string[] = [];
+  const previous = checkpoint('launchpad', 50n, 'stale-boundary', 400_000);
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => ({
+      query: async (text: string) => {
+        queries.push(text);
+        if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
+        if (text.includes('FROM processing_checkpoints')) {
+          return {
+            rows: [{
+              checkpoint_key: 'launchpad', slot: '51', signature: 'advanced-boundary',
+              updated_at: new Date(401_000),
+            }],
+            rowCount: 1,
+          };
+        }
+        if (text.includes('INSERT INTO listener_strict_catch_up_failures')) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (text.includes('UPDATE listener_strict_catch_up_failures')) {
+          return { rows: [], rowCount: 1 };
+        }
+        throw new Error('Unexpected obsolete strict failure record query.');
+      },
+      release: () => {},
+    }),
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+
+  await repository.recordStrictCatchUpFailure(
+    strictFailure('launchpad', previous, 'primary', 51n, 402_000),
+  );
+
+  const insertion = queries.find((text) => text.includes('INSERT INTO listener_strict_catch_up_failures'));
+  assert.match(
+    insertion ?? '',
+    /\$9::timestamptz,\$9::timestamptz \+ INTERVAL '4 hours'/u,
+  );
+});
+
 void test('leaves strict race evidence resolved in record-first and CAS-first orders', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
