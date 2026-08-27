@@ -545,7 +545,7 @@ function sampleFromRow(row: Row): PaperMvpPositionSample {
     networkFeeRawPerTransaction:bigint(row.network_fee_raw_per_transaction),
   });
   if (signedBigint(row.gross_pnl_raw) !== sample.grossPnlRaw
-    || signedBigint(row.model_net_pnl_raw) !== sample.modelNetPnlRaw
+    || derivedSignedBigint(row.model_net_pnl_raw) !== sample.modelNetPnlRaw
     || safeNumber(row.detection_to_entry_latency_ms) !== sample.detectionToEntryLatencyMs
     || safeNumber(row.exit_trigger_to_sell_latency_ms) !== sample.exitTriggerToSellLatencyMs) {
     throw stored();
@@ -655,6 +655,7 @@ function text(value:unknown,field:string):string { if(typeof value!=='string'||v
 function safeNumber(value:unknown):number { const parsed=typeof value==='number'?value:typeof value==='string'?Number(value):NaN; if(!Number.isSafeInteger(parsed)||parsed<0)throw stored(); return parsed; }
 function bigint(value:unknown):bigint { if(typeof value!=='string'||!/^\d{1,78}$/u.test(value))throw stored(); return BigInt(value); }
 function signedBigint(value:unknown):bigint { if(typeof value!=='string'||!/^-?\d{1,78}$/u.test(value))throw stored(); return BigInt(value); }
+function derivedSignedBigint(value:unknown):bigint { if(typeof value!=='string'||!/^[-]?\d{1,79}$/u.test(value))throw stored(); return BigInt(value); }
 function nullableBigint(value:unknown):bigint|null { return value===null?null:bigint(value); }
 function dateMs(value:unknown):number { if(!(value instanceof Date)||!Number.isSafeInteger(value.getTime()))throw stored(); return value.getTime(); }
 function nullableDateMs(value:unknown):number|null { return value===null?null:dateMs(value); }

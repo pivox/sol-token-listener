@@ -46,6 +46,8 @@ export interface PaperMvpSourcePosition {
 
 export interface PaperMvpSourceBatch {
   readonly positions: readonly PaperMvpSourcePosition[];
+  readonly creationsObserved: number;
+  readonly entriesRejected: number;
   readonly duplicateLogicalBuys: number;
   readonly duplicateLogicalSells: number;
 }

@@ -7,6 +7,7 @@ import type { PaperMvpSource } from '../src/ports/paper-mvp-source.js';
 import { PaperMvpCollector } from '../src/application/paper-mvp-collector.js';
 import { PostgresPaperMvpSource } from '../src/storage/paper-mvp-source.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
+import { createProviderUsageSnapshot } from '../src/ports/provider-usage-probe.js';
 import {
   PaperMvpConflictError,
   PostgresPaperMvpRepository,
@@ -54,6 +55,8 @@ void test('collects exact authoritative position facts and preserves bigint valu
   const source: PaperMvpSource = Object.freeze({
     collectBatch: async () => Object.freeze({
       positions: Object.freeze([validFacts()]),
+      creationsObserved: 12,
+      entriesRejected: 4,
       duplicateLogicalBuys: 2,
       duplicateLogicalSells: 3,
     }),
@@ -89,8 +92,36 @@ void test('collects exact authoritative position facts and preserves bigint valu
     payloadVersion: 1,
   });
   assert.deepEqual(recorded.counters, {
-    creationsObserved: 0, entriesRejected: 0,
+    creationsObserved: 12, entriesRejected: 4,
     duplicateLogicalBuys: 2, duplicateLogicalSells: 3,
+  });
+});
+
+void test('persists the authoritative provider probe snapshot on every collection', async () => {
+  const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
+  const repository = fakeRepository(async (progress) => {
+    recordedProgress.push(progress);
+    return Object.freeze({ ...runSnapshot.run, updatedAtMs: progress.observedAtMs });
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => Object.freeze({
+      positions: Object.freeze([]), creationsObserved: 3, entriesRejected: 2,
+      duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    }),
+  });
+  const evidence = createProviderUsageSnapshot({
+    status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 125n,
+    rateLimitedCount: 1,
+  });
+
+  await new PaperMvpCollector(repository, source, () => 8_000, Object.freeze({
+    identity: 'provider:test:v1', snapshot: async () => evidence,
+  })).collect({ runId: 'run-1', limit: 100 });
+
+  assert.deepEqual(recordedProgress[0]?.providerUsage, evidence);
+  assert.deepEqual(recordedProgress[0]?.counters, {
+    creationsObserved: 3, entriesRejected: 2,
+    duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
   });
 });
 
@@ -124,6 +155,8 @@ void test('accumulates bounded duplicate counts across distinct collection polls
         positions: Object.freeze([
           Object.freeze({ ...validFacts(), positionId: `position-${poll}` }),
         ]),
+        creationsObserved: 0,
+        entriesRejected: 0,
         duplicateLogicalBuys: poll === 1 ? 2 : 3,
         duplicateLogicalSells: poll === 1 ? 1 : 4,
       });
@@ -181,7 +214,8 @@ void test('classifies terminal source gaps and contradictions as durable unknown
   });
   const source: PaperMvpSource = Object.freeze({
     collectBatch: async () => Object.freeze({
-      positions, duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+      positions, creationsObserved: 0, entriesRejected: 0,
+      duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
     }),
   });
 
@@ -212,7 +246,8 @@ void test('defensively waits when a non-finalized close reaches the collector', 
     collectBatch: async () => Object.freeze({
       positions:Object.freeze([
         Object.freeze({ ...validFacts(),closeEventConfirmationStatus:'confirmed' }),
-      ]),duplicateLogicalBuys:0,duplicateLogicalSells:0,
+      ]),creationsObserved:0,entriesRejected:0,
+      duplicateLogicalBuys:0,duplicateLogicalSells:0,
     }),
   });
 
@@ -240,7 +275,8 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
   });
 
   assert.deepEqual(result, {
-    positions: [], duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    positions: [], creationsObserved: 0, entriesRejected: 0,
+    duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
   });
   assert.equal(queries.length, 1);
   assert.deepEqual(queries[0]?.values, [
@@ -252,7 +288,10 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
   assert.match(queries[0]?.text ?? '', /GREATEST\(COUNT\(\*\) FILTER[\s\S]*- 1, 0\)/u);
   assert.match(queries[0]?.text ?? '', /opened_at <= \$3[\s\S]*closed_at <= \$3/u);
   assert.match(queries[0]?.text ?? '', /close_event\.confirmation_status[\s\S]*finalized[\s\S]*orphaned/u);
-  assert.match(queries[0]?.text ?? '', /WITH candidates AS MATERIALIZED[\s\S]*LIMIT \$6/u);
+  assert.match(queries[0]?.text ?? '', /candidates AS MATERIALIZED[\s\S]*LIMIT \$6/u);
+  assert.match(queries[0]?.text ?? '', /run_creations AS MATERIALIZED[\s\S]*detected_at BETWEEN \$2 AND \$3/u);
+  assert.match(queries[0]?.text ?? '', /SELECT DISTINCT candidate\.mint[\s\S]*CREATION_ENTRY_REJECTED[\s\S]*CREATION_ENTRY_EXPIRED/u);
+  assert.match(queries[0]?.text ?? '', /candidate\.created_at BETWEEN \$2 AND \$3/u);
   assert.doesNotMatch(queries[0]?.text ?? '', /FROM paper_trades trade JOIN eligible/u);
   await assert.rejects(source.collectBatch({
     runId: 'run-1', startedAtMs: 1_000, strategyId: 'creation-entry-v1',
@@ -441,6 +480,45 @@ void test('fails an abandoned run deterministically and releases its retained so
   });
 });
 
+void test('excludes rejected candidates created after the immutable run deadline', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL rejection-window test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const reportId = `qreport_${'c'.repeat(64)}`;
+    await pool.query(`INSERT INTO qualification_reports (
+      report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
+      profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
+      preparation_score,social_score,onchain_score,total_score,as_of_slot,
+      as_of_transaction_index,as_of_instruction_index,confirmation_status,evaluated_at,
+      purge_after,payload_version,payload
+    ) VALUES ($1,'MINT','source-open','raw-open','source-open','profile',1,$2,$3,
+      'REJECTED',0,0,0,0,1,0,0,'confirmed',$4,$5,1,'{}')`, [
+      reportId, 'd'.repeat(64), 'e'.repeat(64), new Date(1_200), new Date(14_401_200),
+    ]);
+    await pool.query(`INSERT INTO trading_candidates (
+      candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
+      strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,
+      quote_decimals,quote_token_program,reason_codes,created_at,purge_after,
+      payload_version,payload
+    ) VALUES ($1,'MINT',$2,'source-open','source-open','creation-entry-v1',1,$3,
+      'confirmed','NOT_ELIGIBLE','SOL',9,'SPL_TOKEN',$4,$5,$6,1,'{}')`, [
+      `candidate_${'f'.repeat(64)}`, reportId, 'a'.repeat(64),
+      JSON.stringify(['CREATION_ENTRY_REJECTED']), new Date(62_000), new Date(14_462_000),
+    ]);
+
+    const batch = await new PostgresPaperMvpSource(pool).collectBatch({
+      runId: 'run-window', startedAtMs: 1_000, deadlineAtMs: 61_000,
+      strategyId: 'creation-entry-v1', strategyVersion: 1, limit: 10,
+    });
+    assert.equal(batch.creationsObserved, 1);
+    assert.equal(batch.entriesRejected, 0);
+  });
+});
+
 function fakeRepository(
   recordProgress: PaperMvpRepository['recordProgress'],
 ): PaperMvpRepository {
@@ -504,6 +582,8 @@ async function interleavedCollections(samePosition: boolean): Promise<Readonly<{
         positions: alreadySampled ? Object.freeze([]) : Object.freeze([
           Object.freeze({ ...validFacts(), positionId }),
         ]),
+        creationsObserved: 0,
+        entriesRejected: 0,
         duplicateLogicalBuys: alreadySampled ? 0 : sourceCalls === 2 ? 6 : 5,
         duplicateLogicalSells: 0,
       });

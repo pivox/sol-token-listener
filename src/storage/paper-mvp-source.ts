@@ -30,19 +30,37 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
       input.strategyId, input.strategyVersion, input.limit,
     ]);
     const first = result.rows[0];
+    const creationsObserved = first === undefined ? 0 : count(first.creations_observed);
+    const entriesRejected = first === undefined ? 0 : count(first.entries_rejected);
     const duplicateLogicalBuys = first === undefined ? 0 : count(first.duplicate_logical_buys);
     const duplicateLogicalSells = first === undefined ? 0 : count(first.duplicate_logical_sells);
     return Object.freeze({
       positions: Object.freeze(result.rows
         .filter((row) => row.position_id !== null)
         .map(positionFromRow)),
+      creationsObserved,
+      entriesRejected,
       duplicateLogicalBuys,
       duplicateLogicalSells,
     });
   }
 }
 
-const COLLECT_SQL = `WITH candidates AS MATERIALIZED (
+const COLLECT_SQL = `WITH run_creations AS MATERIALIZED (
+  SELECT launch.mint
+  FROM token_launches launch
+  WHERE launch.detected_at BETWEEN $2 AND $3
+), rejected_entries AS MATERIALIZED (
+  SELECT DISTINCT candidate.mint
+  FROM trading_candidates candidate
+  JOIN run_creations creation ON creation.mint=candidate.mint
+  WHERE candidate.strategy_id=$4 AND candidate.strategy_version=$5
+    AND candidate.created_at BETWEEN $2 AND $3
+    AND candidate.reason_codes ?| ARRAY['CREATION_ENTRY_REJECTED','CREATION_ENTRY_EXPIRED']
+), coverage AS (
+  SELECT (SELECT COUNT(*)::integer FROM run_creations) AS creations_observed,
+    (SELECT COUNT(*)::integer FROM rejected_entries) AS entries_rejected
+), candidates AS MATERIALIZED (
   SELECT position.*,close_event.type AS close_event_type,
     close_event.source AS close_event_source,
     close_event.confirmation_status AS close_event_confirmation_status,
@@ -105,8 +123,8 @@ const COLLECT_SQL = `WITH candidates AS MATERIALIZED (
   LEFT JOIN paper_trades sell ON sell.trade_id=candidates.exit_trade_id
     AND sell.position_id=candidates.position_id
 )
-SELECT facts.*,duplicate_totals.*
-FROM duplicate_totals LEFT JOIN facts ON TRUE
+SELECT facts.*,duplicate_totals.*,coverage.*
+FROM duplicate_totals CROSS JOIN coverage LEFT JOIN facts ON TRUE
 ORDER BY facts.closed_at,facts.position_id`;
 
 function positionFromRow(row: Row): PaperMvpSourcePosition {

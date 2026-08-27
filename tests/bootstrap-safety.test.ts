@@ -78,6 +78,10 @@ void test('migrates, starts listener before API, then closes listener before API
   await runApplication(dependencies(calls, {
     loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: true }),
     getDatabasePool: () => { calls.push('pool'); return pool; },
+    beforeStart: async (received) => {
+      assert.equal(received, pool);
+      calls.push('before.start');
+    },
     migrateDatabase: async (received) => {
       assert.equal(received, pool);
       calls.push('migrate');
@@ -102,7 +106,8 @@ void test('migrates, starts listener before API, then closes listener before API
   }));
 
   assert.deepEqual(calls, [
-    'log:listener.foundation_ready', 'pool', 'migrate', 'log:database.migrations_applied',
+    'log:listener.foundation_ready', 'pool', 'before.start', 'migrate',
+    'log:database.migrations_applied',
     'listener.create', 'listener.start', 'projections', 'stream', 'server.create',
     'server.listen', 'log:api.started', 'signal.wait', 'listener.close',
     'server.close', 'database.close',
@@ -222,10 +227,11 @@ void test('listener startup failure fails the process and cleans listener before
         httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED', qualification: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
       }),
     }),
+    beforeDatabaseClose: async () => { calls.push('runner.release'); },
   })), (error: unknown) => error === startupFailure);
   assert.deepEqual(calls, [
     'log:listener.foundation_ready', 'pool', 'listener.start', 'listener.close',
-    'database.close',
+    'runner.release', 'database.close',
   ]);
 });
 

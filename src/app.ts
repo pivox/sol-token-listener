@@ -34,6 +34,8 @@ export interface ApplicationDependencies {
     profileSummary: QualificationProfileSummary;
   }>;
   readonly getDatabasePool: (databaseUrl: string) => ApplicationPool;
+  readonly beforeStart: (pool: ApplicationPool) => Promise<void>;
+  readonly beforeDatabaseClose: () => Promise<void>;
   readonly migrateDatabase: (pool: ApplicationPool) => Promise<readonly string[]>;
   readonly createListener: (pool: ApplicationPool, config: AppConfig) => ListenerRuntime;
   readonly createProjectionRepository: (
@@ -65,6 +67,7 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
     if (config.listenerEnabled || config.apiEnabled || config.autoMigrate) {
       const pool = dependencies.getDatabasePool(config.databaseUrl);
       databaseOpened = true;
+      await dependencies.beforeStart(pool);
       if (config.autoMigrate) {
         const appliedMigrations = await dependencies.migrateDatabase(pool);
         dependencies.logInfo({ event: 'database.migrations_applied', count: appliedMigrations.length }, 'Migrations PostgreSQL appliquées.');
@@ -116,6 +119,7 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
     try { await server.close(); } catch (error) { cleanupErrors.push(error); }
   }
   if (databaseOpened) {
+    try { await dependencies.beforeDatabaseClose(); } catch (error) { cleanupErrors.push(error); }
     try { await dependencies.closeDatabase(); } catch (error) { cleanupErrors.push(error); }
   }
   if (primaryError !== null) {
@@ -148,6 +152,8 @@ const productionDependencies: ApplicationDependencies = {
   loadConfig,
   createQualificationEngine,
   getDatabasePool,
+  beforeStart: () => Promise.resolve(),
+  beforeDatabaseClose: () => Promise.resolve(),
   migrateDatabase: async (pool) => migrateDatabase({ pool: pool as ReturnType<typeof getDatabasePool> }),
   createListener: (pool, config) => createProductionListenerRuntime(
     config,

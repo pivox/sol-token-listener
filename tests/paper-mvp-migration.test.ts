@@ -7,6 +7,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationUrl = new URL('../migrations/018_paper_mvp_validation.sql', import.meta.url);
 const collectionMigrationUrl = new URL('../migrations/019_paper_mvp_collection.sql', import.meta.url);
+const derivedPnlMigrationUrl = new URL('../migrations/020_paper_mvp_derived_pnl.sql', import.meta.url);
 
 void test('defines replayable paper MVP runs and immutable samples', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
@@ -49,7 +50,13 @@ void test('defines the collection upgrade without rewriting migration 018', asyn
   assert.match(sql, /exit_trigger_at IS NULL OR closed_at IS NULL OR exit_trigger_at <= closed_at/u);
 });
 
-void test('applies migrations 001-019 on an empty schema and replays cleanly', async (context) => {
+void test('widens only the derived model PnL for two 78-digit network fees', async () => {
+  const sql = await readFile(derivedPnlMigrationUrl, 'utf8');
+  assert.match(sql, /ALTER COLUMN model_net_pnl_raw TYPE NUMERIC\(79,0\)/u);
+  assert.doesNotMatch(sql, /ALTER COLUMN (?!model_net_pnl_raw)/u);
+});
+
+void test('applies migrations 001-020 on an empty schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: PostgreSQL paper MVP migration test skipped');
@@ -61,7 +68,7 @@ void test('applies migrations 001-019 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '019_paper_mvp_collection.sql');
+    assert.equal(applied.at(-1), '020_paper_mvp_derived_pnl.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(collectionMigrationUrl, 'utf8');
     await pool.query(sql);

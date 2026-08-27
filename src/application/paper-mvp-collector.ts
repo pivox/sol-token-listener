@@ -5,6 +5,7 @@ import type {
   PaperMvpUnknownReason,
 } from '../ports/paper-mvp-repository.js';
 import type { PaperMvpSource, PaperMvpSourcePosition } from '../ports/paper-mvp-source.js';
+import type { ProviderUsageProbe } from '../ports/provider-usage-probe.js';
 
 export interface PaperMvpCollectorResult {
   readonly scanned: number;
@@ -20,6 +21,7 @@ export class PaperMvpCollector {
     private readonly repository: PaperMvpRepository,
     private readonly source: PaperMvpSource,
     private readonly clock: () => number = Date.now,
+    private readonly providerUsageProbe?: ProviderUsageProbe,
   ) {}
 
   public async collect(input: Readonly<{ runId: string; limit: number }>): Promise<PaperMvpCollectorResult> {
@@ -67,19 +69,22 @@ export class PaperMvpCollector {
       else samples.push(classified);
     }
     const observedAtMs = Math.max(this.clock(),before.run.updatedAtMs + 1);
+    const providerUsage = this.providerUsageProbe === undefined
+      ? before.run.providerUsage
+      : await this.providerUsageProbe.snapshot();
     const after = await this.repository.recordProgress({
       runId: before.run.runId,
       expectedUpdatedAtMs: before.run.updatedAtMs,
       observedAtMs,
       counters: Object.freeze({
-        creationsObserved: before.run.counters.creationsObserved,
-        entriesRejected: before.run.counters.entriesRejected,
+        creationsObserved: batch.creationsObserved,
+        entriesRejected: batch.entriesRejected,
         duplicateLogicalBuys: before.run.counters.duplicateLogicalBuys
           + batch.duplicateLogicalBuys,
         duplicateLogicalSells: before.run.counters.duplicateLogicalSells
           + batch.duplicateLogicalSells,
       }),
-      providerUsage: before.run.providerUsage,
+      providerUsage,
       samples: Object.freeze(samples),
       unknownPositions: Object.freeze(unknownPositions),
     });

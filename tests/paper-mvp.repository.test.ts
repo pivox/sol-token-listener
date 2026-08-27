@@ -70,6 +70,37 @@ void test('rejects invalid financial configuration before opening PostgreSQL', a
   assert.equal(connected, false);
 });
 
+void test('persists the exact 79-digit derived PnL at the accepted 78-digit fee boundary', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL numeric boundary test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const maximumFee = BigInt('9'.repeat(78));
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume({
+      ...configuration, networkFeeRawPerTransaction: maximumFee,
+    }, 1_000);
+    const boundarySample = createPaperMvpPositionSample({
+      ...sample(), buyAmountInRaw: 1n, buyAmountOutRaw: 1n,
+      buyMinimumAmountOutRaw: 1n, sellAmountInRaw: 1n, sellAmountOutRaw: 1n,
+      sellMinimumAmountOutRaw: 1n, networkFeeRawPerTransaction: maximumFee,
+    });
+    await repository.recordProgress({
+      runId: run.runId, expectedUpdatedAtMs: run.updatedAtMs, observedAtMs: 2_000,
+      counters: progressCounters,
+      providerUsage: Object.freeze({
+        status: 'AVAILABLE', creditsUsedStart: 1n, creditsUsedEnd: 2n,
+        rateLimitedCount: 0,
+      }),
+      samples: Object.freeze([boundarySample]), unknownPositions: Object.freeze([]),
+    });
+    assert.equal((await repository.load(run.runId))?.samples[0]?.modelNetPnlRaw,
+      -2n * maximumFee);
+  });
+});
+
 void test('persists only explicit configuration, sample, and provider projections', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
