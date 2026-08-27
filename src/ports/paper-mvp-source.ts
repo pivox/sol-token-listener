@@ -50,6 +50,8 @@ export interface PaperMvpSourceBatch {
   readonly entriesRejected: number;
   readonly duplicateLogicalBuys: number;
   readonly duplicateLogicalSells: number;
+  readonly openedPositions?: number;
+  readonly openPositions?: number;
 }
 
 export interface PaperMvpSource {
@@ -57,6 +59,7 @@ export interface PaperMvpSource {
     runId: string;
     startedAtMs: number;
     deadlineAtMs: number;
+    observedAtMs?: number;
     strategyId: string;
     strategyVersion: number;
     limit: number;

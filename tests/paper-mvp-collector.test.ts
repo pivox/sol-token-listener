@@ -98,7 +98,7 @@ void test('collects exact authoritative position facts and preserves bigint valu
   });
   assert.deepEqual(recorded.counters, {
     creationsObserved: 12, entriesRejected: 4,
-    duplicateLogicalBuys: 2, duplicateLogicalSells: 3,
+    duplicateLogicalBuys: 2, duplicateLogicalSells: 3, openedPositions: 0, openPositions: 0,
   });
 });
 
@@ -155,7 +155,7 @@ void test('persists the authoritative provider probe snapshot on every collectio
   assert.deepEqual(recordedProgress[0]?.providerUsage, evidence);
   assert.deepEqual(recordedProgress[0]?.counters, {
     creationsObserved: 3, entriesRejected: 2,
-    duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    duplicateLogicalBuys: 0, duplicateLogicalSells: 0, openedPositions: 0, openPositions: 0,
   });
 });
 
@@ -509,16 +509,16 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
 
   const result = await source.collectBatch({
     runId: 'run-1', startedAtMs: 1_000, strategyId: 'creation-entry-v1',
-    strategyVersion: 1, deadlineAtMs: 61_000, limit: 100,
+    strategyVersion: 1, deadlineAtMs: 61_000, observedAtMs: 2_000, limit: 100,
   });
 
   assert.deepEqual(result, {
     positions: [], creationsObserved: 0, entriesRejected: 0,
-    duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    duplicateLogicalBuys: 0, duplicateLogicalSells: 0, openedPositions: 0, openPositions: 0,
   });
   assert.equal(queries.length, 1);
   assert.deepEqual(queries[0]?.values, [
-    'run-1', new Date(1_000), new Date(61_000), 'creation-entry-v1', 1, 100,
+    'run-1', new Date(1_000), new Date(61_000), new Date(2_000), 'creation-entry-v1', 1, 100,
   ]);
   assert.match(queries[0]?.text ?? '', /NOT EXISTS[\s\S]*paper_mvp_position_samples/u);
   assert.match(queries[0]?.text ?? '', /entry_trade_id/u);
@@ -526,7 +526,7 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
   assert.match(queries[0]?.text ?? '', /GREATEST\(COUNT\(\*\) FILTER[\s\S]*- 1, 0\)/u);
   assert.match(queries[0]?.text ?? '', /opened_at <= \$3[\s\S]*closed_at <= \$3/u);
   assert.match(queries[0]?.text ?? '', /close_event\.confirmation_status[\s\S]*finalized[\s\S]*orphaned/u);
-  assert.match(queries[0]?.text ?? '', /candidates AS MATERIALIZED[\s\S]*LIMIT \$6/u);
+  assert.match(queries[0]?.text ?? '', /candidates AS MATERIALIZED[\s\S]*LIMIT \$7/u);
   assert.match(queries[0]?.text ?? '', /run_creations AS MATERIALIZED[\s\S]*detected_at BETWEEN \$2 AND \$3/u);
   assert.match(queries[0]?.text ?? '', /run_creations AS MATERIALIZED[\s\S]*LIMIT 1000001/u);
   assert.match(queries[0]?.text ?? '', /rejected_entries AS MATERIALIZED[\s\S]*LIMIT 1000001/u);

@@ -60,6 +60,48 @@ void test('builds a deterministic PASS report with integer rates and provider us
   assert.deepEqual(report.exitCounts, { '10_UNIQUE_BUYERS': 50, '2X': 0, SAFETY: 0 });
 });
 
+void test('reports opened and open positions with floored closed-sample execution means', () => {
+  const first = createPaperMvpPositionSample(sampleInput({
+    positionId: 'metrics-1', buySlippageBps: 101n, sellSlippageBps: 102n,
+    buyPriceImpactBps: 103n, sellPriceImpactBps: 104n,
+  }));
+  const second = createPaperMvpPositionSample(sampleInput({
+    positionId: 'metrics-2', paperSellAtMs: 221, buySlippageBps: 102n, sellSlippageBps: 103n,
+    buyPriceImpactBps: 104n, sellPriceImpactBps: 105n,
+  }));
+  const report = createPaperMvpReport({
+    runId: 'paper_mvp_run_metrics', completionReason: 'TARGET_REACHED',
+    startedAtMs: 100, completedAtMs: 1_000, targetClosedPositions: 2,
+    initialCapitalRaw: 10_000n, quoteMint: 'SOL', creationsObserved: 2,
+    entriesRejected: 0, samples: [first, second], openedPositions: 3, openPositions: 1,
+    unknownTerminalPositions: 0, duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    providerUsage: { status: 'AVAILABLE', creditsUsedStart: 0n, creditsUsedEnd: 2n, rateLimitedCount: 0 },
+  });
+
+  assert.equal(report.openedPositions, 3);
+  assert.equal(report.openPositions, 1);
+  assert.equal(report.averageBuySlippageBps, 101);
+  assert.equal(report.averageSellSlippageBps, 102);
+  assert.equal(report.averageBuyPriceImpactBps, 103);
+  assert.equal(report.averageSellPriceImpactBps, 104);
+});
+
+void test('reports zero execution means when no closed samples exist', () => {
+  const report = createPaperMvpReport({
+    runId: 'paper_mvp_run_empty_metrics', completionReason: 'TIMEOUT',
+    startedAtMs: 100, completedAtMs: 1_000, targetClosedPositions: 1,
+    initialCapitalRaw: 10_000n, quoteMint: 'SOL', creationsObserved: 0,
+    entriesRejected: 0, samples: [], openedPositions: 0, openPositions: 0,
+    unknownTerminalPositions: 0, duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    providerUsage: { status: 'UNAVAILABLE', creditsUsedStart: null, creditsUsedEnd: null, rateLimitedCount: 0 },
+  });
+
+  assert.deepEqual([
+    report.averageBuySlippageBps, report.averageSellSlippageBps,
+    report.averageBuyPriceImpactBps, report.averageSellPriceImpactBps,
+  ], [0, 0, 0, 0]);
+});
+
 void test('maps creator and manual exits directly to the SAFETY report category', () => {
   const samples = ['CREATOR_EARLY_SELL', 'MANUAL_KILL_SWITCH'].map((exitReason, index) => (
     createPaperMvpPositionSample(sampleInput({

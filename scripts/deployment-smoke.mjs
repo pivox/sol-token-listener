@@ -58,6 +58,7 @@ const canonicalMigrations = Object.freeze([
   '021_paper_mvp_runner_hardening.sql',
   '022_paper_mvp_coverage_indexes.sql',
   '023_paper_mvp_exact_strategy.sql',
+  '024_paper_mvp_position_coverage.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',

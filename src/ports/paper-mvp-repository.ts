@@ -24,6 +24,8 @@ export interface PaperMvpRunCounters {
   readonly unknownTerminalPositions: number;
   readonly duplicateLogicalBuys: number;
   readonly duplicateLogicalSells: number;
+  readonly openedPositions?: number;
+  readonly openPositions?: number;
 }
 
 export type PaperMvpProgressCounters = Omit<

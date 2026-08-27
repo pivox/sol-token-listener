@@ -18,6 +18,7 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
     runId: string;
     startedAtMs: number;
     deadlineAtMs: number;
+    observedAtMs?: number;
     strategyId: string;
     strategyVersion: number;
     limit: number;
@@ -28,7 +29,7 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
     }
     input.signal?.throwIfAborted();
     const result = await this.pool.query(COLLECT_SQL, [
-      input.runId, new Date(input.startedAtMs), new Date(input.deadlineAtMs),
+      input.runId, new Date(input.startedAtMs), new Date(input.deadlineAtMs), new Date(input.observedAtMs ?? input.deadlineAtMs),
       input.strategyId, input.strategyVersion, input.limit,
     ]);
     input.signal?.throwIfAborted();
@@ -37,6 +38,8 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
     const entriesRejected = first === undefined ? 0 : count(first.entries_rejected);
     const duplicateLogicalBuys = first === undefined ? 0 : count(first.duplicate_logical_buys);
     const duplicateLogicalSells = first === undefined ? 0 : count(first.duplicate_logical_sells);
+    const openedPositions = first === undefined ? 0 : count(first.opened_positions);
+    const openPositions = first === undefined ? 0 : count(first.open_positions);
     return Object.freeze({
       positions: Object.freeze(result.rows
         .filter((row) => row.position_id !== null)
@@ -45,6 +48,8 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
       entriesRejected,
       duplicateLogicalBuys,
       duplicateLogicalSells,
+      openedPositions,
+      openPositions,
     });
   }
 }
@@ -59,14 +64,27 @@ const COLLECT_SQL = `WITH run_creations AS MATERIALIZED (
   SELECT DISTINCT candidate.mint
   FROM trading_candidates candidate
   JOIN run_creations creation ON creation.mint=candidate.mint
-  WHERE candidate.strategy_id=$4 AND candidate.strategy_version=$5
+  WHERE candidate.strategy_id=$5 AND candidate.strategy_version=$6
     AND candidate.created_at BETWEEN $2 AND $3
     AND candidate.reason_codes ?| ARRAY['CREATION_ENTRY_REJECTED','CREATION_ENTRY_EXPIRED']
   ORDER BY candidate.mint
   LIMIT 1000001
 ), coverage AS (
   SELECT (SELECT COUNT(*)::integer FROM run_creations) AS creations_observed,
-    (SELECT COUNT(*)::integer FROM rejected_entries) AS entries_rejected
+    (SELECT COUNT(*)::integer FROM rejected_entries) AS entries_rejected,
+    (SELECT COUNT(*)::integer FROM (
+      SELECT 1 FROM paper_positions position
+      WHERE position.strategy_id=$5 AND position.strategy_version=$6
+        AND position.opened_at BETWEEN $2 AND $4::timestamptz
+      LIMIT 1000001
+    ) bounded) AS opened_positions,
+    (SELECT COUNT(*)::integer FROM (
+      SELECT 1 FROM paper_positions position
+      WHERE position.strategy_id=$5 AND position.strategy_version=$6
+        AND position.status='PAPER_HOLDING'
+        AND position.opened_at BETWEEN $2 AND $4::timestamptz
+      LIMIT 1000001
+    ) bounded) AS open_positions
 ), candidates AS MATERIALIZED (
   SELECT position.*,close_event.type AS close_event_type,
     close_event.source AS close_event_source,
@@ -74,7 +92,7 @@ const COLLECT_SQL = `WITH run_creations AS MATERIALIZED (
     close_event.observed_at AS close_event_observed_at
   FROM paper_positions position
   LEFT JOIN domain_events close_event ON close_event.event_id=position.close_event_id
-  WHERE position.strategy_id=$4 AND position.strategy_version=$5
+  WHERE position.strategy_id=$5 AND position.strategy_version=$6
     AND position.opened_at >= $2
     AND position.opened_at <= $3
     AND position.closed_at <= $3
@@ -88,7 +106,7 @@ const COLLECT_SQL = `WITH run_creations AS MATERIALIZED (
       WHERE observation.run_id=$1 AND observation.position_id=position.position_id
     )
   ORDER BY position.closed_at,position.position_id
-  LIMIT $6
+  LIMIT $7
 ), trade_counts AS (
   SELECT trade.position_id,
     GREATEST(COUNT(*) FILTER (WHERE trade.side='BUY') - 1, 0)::integer AS duplicate_buys,

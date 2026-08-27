@@ -495,6 +495,8 @@ function reportFromSnapshot(
     quoteMint: snapshot.run.configuration.quoteMint,
     creationsObserved: snapshot.run.counters.creationsObserved,
     entriesRejected: snapshot.run.counters.entriesRejected,
+    openedPositions: snapshot.run.counters.openedPositions ?? 0,
+    openPositions: snapshot.run.counters.openPositions ?? 0,
     samples: snapshot.samples,
     unknownTerminalPositions: snapshot.unknownPositions.length,
     duplicateLogicalBuys: snapshot.run.counters.duplicateLogicalBuys,

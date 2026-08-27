@@ -11,6 +11,7 @@ const derivedPnlMigrationUrl = new URL('../migrations/020_paper_mvp_derived_pnl.
 const runnerHardeningMigrationUrl = new URL('../migrations/021_paper_mvp_runner_hardening.sql', import.meta.url);
 const coverageIndexesMigrationUrl = new URL('../migrations/022_paper_mvp_coverage_indexes.sql', import.meta.url);
 const exactStrategyMigrationUrl = new URL('../migrations/023_paper_mvp_exact_strategy.sql', import.meta.url);
+const positionCoverageMigrationUrl = new URL('../migrations/024_paper_mvp_position_coverage.sql', import.meta.url);
 
 void test('defines replayable paper MVP runs and immutable samples', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
@@ -88,7 +89,15 @@ void test('versions the exact paper MVP strategy configuration and leaves v1 row
   assert.doesNotMatch(sql, /UPDATE paper_mvp_runs[\s\S]*external_unique_buyers_target/iu);
 });
 
-void test('applies migrations 001-023 on an empty schema and replays cleanly', async (context) => {
+void test('adds replayable bounded opened and open position coverage', async () => {
+  const sql = await readFile(positionCoverageMigrationUrl, 'utf8');
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS opened_positions INTEGER NOT NULL DEFAULT 0/u);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS open_positions INTEGER NOT NULL DEFAULT 0/u);
+  assert.match(sql, /open_positions BETWEEN 0 AND opened_positions/u);
+  assert.match(sql, /paper_positions_mvp_open_coverage_idx/u);
+});
+
+void test('applies migrations 001-024 on an empty schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: PostgreSQL paper MVP migration test skipped');
@@ -100,7 +109,7 @@ void test('applies migrations 001-023 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '023_paper_mvp_exact_strategy.sql');
+    assert.equal(applied.at(-1), '024_paper_mvp_position_coverage.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query('SET enable_seqscan=off');
     const launchPlan = await pool.query<Readonly<{ 'QUERY PLAN': string }>>(`EXPLAIN (COSTS OFF)

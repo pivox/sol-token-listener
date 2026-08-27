@@ -79,6 +79,8 @@ export interface CreatePaperMvpReportInput {
   readonly quoteMint: string;
   readonly creationsObserved: number;
   readonly entriesRejected: number;
+  readonly openedPositions?: number;
+  readonly openPositions?: number;
   readonly samples: readonly PaperMvpPositionSample[];
   readonly unknownTerminalPositions: number;
   readonly duplicateLogicalBuys: number;
@@ -98,6 +100,8 @@ export interface PaperMvpReportV1 {
   readonly closedPositions: number;
   readonly creationsObserved: number;
   readonly entriesRejected: number;
+  readonly openedPositions: number;
+  readonly openPositions: number;
   readonly exitCounts: Readonly<Record<PaperMvpExitCategory, number>>;
   readonly grossPnlRaw: string;
   readonly netPnlRaw: string;
@@ -106,6 +110,10 @@ export interface PaperMvpReportV1 {
   readonly maximumDrawdownBps: number;
   readonly detectionToEntryLatencyMeanMs: number;
   readonly detectionToEntryLatencyP95Ms: number;
+  readonly averageBuySlippageBps: number;
+  readonly averageSellSlippageBps: number;
+  readonly averageBuyPriceImpactBps: number;
+  readonly averageSellPriceImpactBps: number;
   readonly venueFeesRaw: string;
   readonly networkFeesRaw: string;
   readonly unknownTerminalPositions: number;
@@ -175,10 +183,14 @@ export function createPaperMvpReport(input: CreatePaperMvpReportInput): PaperMvp
   if (input.completedAtMs < input.startedAtMs) throw invalid('report time');
   count(input.targetClosedPositions, 1, 1_000);
   positive(input.initialCapitalRaw, 'initial capital');
+  const openedPositions = input.openedPositions ?? 0;
+  const openPositions = input.openPositions ?? 0;
   for (const value of [
-    input.creationsObserved, input.entriesRejected, input.unknownTerminalPositions,
+    input.creationsObserved, input.entriesRejected, openedPositions, openPositions,
+    input.unknownTerminalPositions,
     input.duplicateLogicalBuys, input.duplicateLogicalSells,
   ]) count(value, 0, MAX_COUNT);
+  if (openPositions > openedPositions) throw invalid('open positions');
   if (input.samples.length > 1_000) throw invalid('sample count');
   const ids = new Set<string>();
   let gross = 0n;
@@ -238,12 +250,17 @@ export function createPaperMvpReport(input: CreatePaperMvpReportInput): PaperMvp
     verdict: failed.length === 0 ? 'PASS' : 'FAIL',
     targetClosedPositions: input.targetClosedPositions, closedPositions: completed,
     creationsObserved: input.creationsObserved, entriesRejected: input.entriesRejected,
+    openedPositions, openPositions,
     exitCounts: Object.freeze(exitCounts), grossPnlRaw: gross.toString(), netPnlRaw: net.toString(),
     meanNetPnlRaw: (completed === 0 ? 0n : net / BigInt(completed)).toString(),
     winRateBps: completed === 0 ? 0 : Number(BigInt(wins) * BPS / BigInt(completed)),
     maximumDrawdownBps: drawdown,
     detectionToEntryLatencyMeanMs: integerMean(latencies),
     detectionToEntryLatencyP95Ms: nearestRank(latencies, 95),
+    averageBuySlippageBps: integerBigintMean(ordered.map((sample) => sample.buySlippageBps)),
+    averageSellSlippageBps: integerBigintMean(ordered.map((sample) => sample.sellSlippageBps)),
+    averageBuyPriceImpactBps: integerBigintMean(ordered.map((sample) => sample.buyPriceImpactBps)),
+    averageSellPriceImpactBps: integerBigintMean(ordered.map((sample) => sample.sellPriceImpactBps)),
     venueFeesRaw: venueFees.toString(), networkFeesRaw: networkFees.toString(),
     unknownTerminalPositions: input.unknownTerminalPositions,
     duplicateLogicalBuys: input.duplicateLogicalBuys,
@@ -314,6 +331,11 @@ function exitCategory(reason: PaperMvpExitReason): PaperMvpExitCategory {
 
 function integerMean(values: readonly number[]): number {
   return values.length === 0 ? 0 : Math.floor(values.reduce((sum, value) => sum + value, 0) / values.length);
+}
+
+function integerBigintMean(values: readonly bigint[]): number {
+  if (values.length === 0) return 0;
+  return Number(values.reduce((sum, value) => sum + value, 0n) / BigInt(values.length));
 }
 
 function nearestRank(values: readonly number[], percentile: number): number {

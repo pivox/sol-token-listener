@@ -68,10 +68,12 @@ export class PaperMvpCollector {
       });
     }
     const effectiveLimit = Math.min(input.limit,remaining);
+    const observedAtMs = Math.max(this.clock(), before.run.updatedAtMs + 1);
     const batch = await this.source.collectBatch({
       runId: before.run.runId,
       startedAtMs: before.run.startedAtMs,
       deadlineAtMs: before.run.deadlineAtMs,
+      observedAtMs,
       strategyId: before.run.configuration.strategyId,
       strategyVersion: before.run.configuration.strategyVersion,
       limit: effectiveLimit,
@@ -90,7 +92,6 @@ export class PaperMvpCollector {
       if ('reason' in classified) unknownPositions.push(classified);
       else samples.push(classified);
     }
-    const observedAtMs = Math.max(this.clock(),before.run.updatedAtMs + 1);
     const providerUsage = this.providerUsageProbe === undefined
       ? before.run.providerUsage
       : await this.providerUsageProbe.snapshot(input.signal);
@@ -107,6 +108,8 @@ export class PaperMvpCollector {
           + batch.duplicateLogicalBuys,
         duplicateLogicalSells: before.run.counters.duplicateLogicalSells
           + batch.duplicateLogicalSells,
+        openedPositions: batch.openedPositions ?? before.run.counters.openedPositions ?? 0,
+        openPositions: batch.openPositions ?? before.run.counters.openPositions ?? 0,
       }),
       providerUsage,
       samples: Object.freeze(samples),

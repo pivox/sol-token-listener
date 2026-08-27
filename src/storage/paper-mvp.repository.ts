@@ -181,13 +181,14 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
             FROM paper_mvp_position_samples observation
             WHERE observation.run_id=run.run_id AND observation.sample_status='UNKNOWN'),
           duplicate_logical_buys=$4,duplicate_logical_sells=$5,
-          provider_status=$6,provider_credits_used_start=$7,
-          provider_credits_used_end=$8,provider_rate_limited_count=$9,updated_at=$10
+          opened_positions=$6,open_positions=$7,provider_status=$8,provider_credits_used_start=$9,
+          provider_credits_used_end=$10,provider_rate_limited_count=$11,updated_at=$12
          WHERE run.run_id=$1 RETURNING run.*,
           (SELECT COUNT(*)::integer FROM paper_mvp_position_samples observation
             WHERE observation.run_id=run.run_id AND observation.sample_status='VALID') AS closed_positions`,
         [progress.runId,counters.creationsObserved,counters.entriesRejected,
-          counters.duplicateLogicalBuys,counters.duplicateLogicalSells,usage.status,
+          counters.duplicateLogicalBuys,counters.duplicateLogicalSells,
+          counters.openedPositions,counters.openPositions,usage.status,
           decimal(usage.creditsUsedStart),decimal(usage.creditsUsedEnd),
           usage.rateLimitedCount,new Date(progress.observedAtMs)],
       );
@@ -251,6 +252,8 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
           quoteMint: before.configuration.quoteMint,
           creationsObserved: before.counters.creationsObserved,
           entriesRejected: before.counters.entriesRejected,
+          openedPositions: before.counters.openedPositions ?? 0,
+          openPositions: before.counters.openPositions ?? 0,
           samples: observations.samples,
           unknownTerminalPositions: observations.unknownPositions.length,
           duplicateLogicalBuys: before.counters.duplicateLogicalBuys,
@@ -471,14 +474,20 @@ function validateConfiguration(value: PaperMvpRunConfiguration): PaperMvpRunConf
 }
 
 function validateCounters(value: PaperMvpProgressCounters): PaperMvpProgressCounters {
+  const openedPositions = value.openedPositions ?? 0;
+  const openPositions = value.openPositions ?? 0;
   for (const field of [
     'creationsObserved','entriesRejected','duplicateLogicalBuys','duplicateLogicalSells',
-  ] as const) integer(value[field], 0, 1_000_000, field);
+    'openedPositions','openPositions',
+  ] as const) integer(field === 'openedPositions' ? openedPositions
+    : field === 'openPositions' ? openPositions : value[field], 0, 1_000_000, field);
   return Object.freeze({
     creationsObserved: value.creationsObserved,
     entriesRejected: value.entriesRejected,
     duplicateLogicalBuys: value.duplicateLogicalBuys,
     duplicateLogicalSells: value.duplicateLogicalSells,
+    openedPositions,
+    openPositions,
   });
 }
 
@@ -491,6 +500,8 @@ function validateRunCounters(value: PaperMvpRunCounters): PaperMvpRunCounters {
     unknownTerminalPositions: value.unknownTerminalPositions,
     duplicateLogicalBuys: value.duplicateLogicalBuys,
     duplicateLogicalSells: value.duplicateLogicalSells,
+    openedPositions: value.openedPositions ?? 0,
+    openPositions: value.openPositions ?? 0,
   });
 }
 
@@ -553,6 +564,9 @@ function assertProgress(
   for (const field of ['creationsObserved','entriesRejected','duplicateLogicalBuys','duplicateLogicalSells'] as const) {
     if (counters[field] < run.counters[field]) throw new PaperMvpConflictError('PROGRESS_REGRESSION');
   }
+  if ((counters.openPositions ?? 0) > (counters.openedPositions ?? 0)) {
+    throw new PaperMvpConflictError('PROGRESS_REGRESSION');
+  }
   const old = run.providerUsage;
   if (observedAtMs <= run.updatedAtMs || usage.rateLimitedCount < old.rateLimitedCount
     || (old.status === 'AVAILABLE' && usage.status !== 'AVAILABLE')
@@ -606,6 +620,8 @@ function runFromRow(row: Row): PaperMvpRun {
     unknownTerminalPositions:safeNumber(row.unknown_terminal_positions),
     duplicateLogicalBuys:safeNumber(row.duplicate_logical_buys),
     duplicateLogicalSells:safeNumber(row.duplicate_logical_sells),
+    openedPositions:safeNumber(row.opened_positions),
+    openPositions:safeNumber(row.open_positions),
   });
   const providerUsage = validateProviderUsage({
     status:providerStatus,creditsUsedStart:nullableBigint(row.provider_credits_used_start),

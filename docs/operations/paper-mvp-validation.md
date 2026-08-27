@@ -66,6 +66,13 @@ reste prioritaire et laisse le run reprenable.
 021 et n'est jamais produit par cette commande. Il ajoute uniquement le champ de
 compatibilité : verdict, statut technique et gates historiques restent inchangés.
 
+Le rapport expose aussi `openedPositions` (positions `creation-entry-v1` ouvertes
+dans la fenêtre inclusive observée) et `openPositions` (sous-ensemble encore
+`PAPER_HOLDING` lors du snapshot). Les moyennes de slippage et d'impact sont des
+divisions entières arrondies vers le bas des seuls samples clos, et valent zéro
+sans sample. La migration 024 initialise explicitement les rapports terminaux
+historiques à zéro car cette couverture ne peut pas être reconstruite.
+
 Codes processus :
 
 - `0` : verdict `PASS` uniquement ;
