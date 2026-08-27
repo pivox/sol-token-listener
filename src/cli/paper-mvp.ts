@@ -371,7 +371,6 @@ async function collectRemaining(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<'TIMEOUT'>((resolve) => {
     timer = setTimeout(() => { resolve('TIMEOUT'); }, Math.max(0,timeoutMs));
-    timer.unref();
   });
   const races: Promise<PaperMvpStopReason | 'TIMEOUT' | 'RUNNER_LOCK_LOST' | 'FORCED' | null>[] = [
     operation.then(() => null), deadline,
