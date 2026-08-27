@@ -44,20 +44,84 @@ void test('creates replayable strict catch-up failure evidence without unsafe di
   assert.match(sql, /previous_signature TEXT/u);
   assert.match(sql, /\(previous_slot IS NULL\) = \(previous_signature IS NULL\)/u);
   assert.match(sql, /previous_slot >= 0/u);
+  assert.match(sql, /previous_slot <> 'NaN'::NUMERIC/u);
   assert.match(sql, /OCTET_LENGTH\(previous_signature\) BETWEEN 1 AND 128/u);
   assert.match(sql, /provider_id IN \('primary', 'fallback-1', 'fallback-2', 'fallback-3'\)/u);
   assert.match(sql, /observed_head_slot NUMERIC\(78,0\)/u);
   assert.match(sql, /observed_head_slot >= 0/u);
+  assert.match(sql, /observed_head_slot <> 'NaN'::NUMERIC/u);
   assert.match(sql, /reason_code IN \('CATCH_UP_WINDOW_EXCEEDED'\)/u);
   assert.match(sql, /detected_at TIMESTAMPTZ NOT NULL/u);
   assert.match(sql, /resolved_at TIMESTAMPTZ/u);
   assert.match(sql, /purge_after TIMESTAMPTZ/u);
   assert.match(sql, /resolved_at IS NULL AND purge_after IS NULL/u);
+  assert.match(sql, /resolved_at IS NOT NULL[\s\S]*purge_after IS NOT NULL/u);
   assert.match(sql, /purge_after = resolved_at \+ INTERVAL '4 hours'/u);
   assert.match(sql, /listener_strict_catch_up_failures_unresolved_boundary_idx/u);
   assert.match(sql, /listener_strict_catch_up_failures_resolved_purge_idx/u);
   assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
   assert.doesNotMatch(sql, /error|url|private[_ ]?key|secret|DROP TABLE|send[_ ]?transaction/iu);
+});
+
+void test('enforces strict failure lifecycle and finite numeric boundaries in PostgreSQL', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
+    return;
+  }
+  const schema = `strict_catch_up_failure_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    const sql = await readFile(strictCatchUpFailureMigrationUrl, 'utf8');
+    await pool.query(sql);
+    await pool.query(sql);
+    const insert = async (failureId: string, values: Readonly<{
+      readonly previousSlot?: string;
+      readonly previousSignature?: string | null;
+      readonly observedHeadSlot?: string | null;
+      readonly resolvedAt?: string | null;
+      readonly purgeAfter?: string | null;
+    }> = {}) => pool.query(`INSERT INTO listener_strict_catch_up_failures (
+      failure_id, checkpoint_key, previous_slot, previous_signature, provider_id,
+      observed_head_slot, reason_code, detected_at, resolved_at, purge_after
+    ) VALUES ($1, 'launchpad', $2::NUMERIC, $3, 'primary', $4::NUMERIC,
+      'CATCH_UP_WINDOW_EXCEEDED', '2025-01-01T00:00:00.000Z', $5::TIMESTAMPTZ,
+      $6::TIMESTAMPTZ)`, [
+      failureId,
+      values.previousSlot ?? '1',
+      values.previousSignature ?? 'strict-boundary',
+      values.observedHeadSlot ?? '2',
+      values.resolvedAt ?? null,
+      values.purgeAfter ?? null,
+    ]);
+    const prefix = 'strict_catchup_failure_';
+    await assert.rejects(
+      insert(`${prefix}${'a'.repeat(64)}`, { resolvedAt: '2025-01-01T00:00:00.000Z' }),
+      /listener_strict_catch_up_failures_lifecycle_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'b'.repeat(64)}`, { previousSlot: 'NaN' }),
+      /listener_strict_catch_up_failures_previous_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'c'.repeat(64)}`, { observedHeadSlot: 'NaN' }),
+      /listener_strict_catch_up_failures_head_check/u,
+    );
+    await insert(`${prefix}${'d'.repeat(64)}`, {
+      resolvedAt: '2025-01-01T00:00:00.000Z',
+      purgeAfter: '2025-01-01T04:00:00.000Z',
+    });
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
 });
 
 void test('creates a replayable bigint-safe transaction inbox with strict lifecycle checks', async () => {

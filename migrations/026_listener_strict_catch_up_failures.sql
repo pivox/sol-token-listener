@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS listener_strict_catch_up_failures (
   CONSTRAINT listener_strict_catch_up_failures_previous_check CHECK (
     (previous_slot IS NULL) = (previous_signature IS NULL)
     AND (previous_slot IS NULL OR previous_slot >= 0)
+    AND (previous_slot IS NULL OR previous_slot <> 'NaN'::NUMERIC)
     AND (
       previous_signature IS NULL
       OR (
@@ -30,7 +31,8 @@ CREATE TABLE IF NOT EXISTS listener_strict_catch_up_failures (
     provider_id IN ('primary', 'fallback-1', 'fallback-2', 'fallback-3')
   ),
   CONSTRAINT listener_strict_catch_up_failures_head_check CHECK (
-    observed_head_slot IS NULL OR observed_head_slot >= 0
+    (observed_head_slot IS NULL OR observed_head_slot >= 0)
+    AND (observed_head_slot IS NULL OR observed_head_slot <> 'NaN'::NUMERIC)
   ),
   CONSTRAINT listener_strict_catch_up_failures_reason_check CHECK (
     reason_code IN ('CATCH_UP_WINDOW_EXCEEDED')
@@ -39,6 +41,7 @@ CREATE TABLE IF NOT EXISTS listener_strict_catch_up_failures (
     (resolved_at IS NULL AND purge_after IS NULL)
     OR (
       resolved_at IS NOT NULL
+      AND purge_after IS NOT NULL
       AND purge_after = resolved_at + INTERVAL '4 hours'
     )
   )
