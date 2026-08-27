@@ -130,13 +130,16 @@ void test('production catch-up wiring guard rejects strict paths, symbols, and b
     "import scanner from './strict-catch-up-scanner.js';",
     "import coordinator from './strict-catch-up-coordinator.js';",
     "import pinnedSource from '../solana/rpc/provider-pinned-catch-up-source.js';",
+    "import { createProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';",
     "import { StrictCatchUpScanner } from './strict-catch-up-scanner.js';",
     "import { StrictCatchUpCoordinator } from './strict-catch-up-coordinator.js';",
     "import { ProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';",
     "import { StrictCatchUpScanner } from './application.js';",
+    "import { createProviderPinnedCatchUpSource } from './application.js';",
     'const scanner = new StrictCatchUpScanner();',
     'const coordinator = new StrictCatchUpCoordinator();',
     'const source = ProviderPinnedCatchUpSource;',
+    'const source = createProviderPinnedCatchUpSource();',
   ]) {
     assert.throws(() => { assertProductionCatchUpWiring(source); }, /strict catch-up/i);
   }
@@ -432,7 +435,7 @@ function count(source: string, pattern: RegExp): number {
 function assertProductionCatchUpWiring(source: string): void {
   assert.doesNotMatch(
     source,
-    /\b(?:StrictCatchUpScanner|StrictCatchUpCoordinator|ProviderPinnedCatchUpSource)\b/u,
+    /\b(?:StrictCatchUpScanner|StrictCatchUpCoordinator|ProviderPinnedCatchUpSource|createProviderPinnedCatchUpSource)\b/u,
     'Strict catch-up symbols must remain inactive until issue 63.',
   );
   assert.doesNotMatch(
