@@ -3,8 +3,11 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.1.2
+Version: 1.1.3
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.1.3 moves the catch-up source contract to a neutral port so the
+provider-pinned RPC adapter does not depend on application orchestration.
 
 Revision 1.1.2 serializes strict-failure recording with checkpoint CAS,
 resolves matching evidence atomically on successful advancement, and stores a
