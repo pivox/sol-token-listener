@@ -116,6 +116,8 @@ void test('keeps the acknowledged WebSocket session foundation inactive until is
 
   assert.doesNotMatch(source, /ws-program-session/u);
   assert.match(source, /new SolanaProgramSubscriber\(/u);
+  assert.match(source, /new CatchUpScanner\(/u);
+  assert.doesNotMatch(source, /strict-catch-up-scanner|strict-catch-up-coordinator|provider-pinned-catch-up-source/u);
 });
 
 void test('production composes one canonical qualification writer before paper decisions', async () => {
