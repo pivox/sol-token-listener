@@ -31,6 +31,7 @@ void test('builds a deterministic PASS report with integer rates and provider us
   })));
   const report = createPaperMvpReport({
     runId: 'paper_mvp_run_1',
+    completionReason: 'TARGET_REACHED',
     startedAtMs: 100,
     completedAtMs: 1_000,
     targetClosedPositions: 50,
@@ -48,6 +49,7 @@ void test('builds a deterministic PASS report with integer rates and provider us
   });
 
   assert.equal(report.schemaVersion, 'paper-mvp.v1');
+  assert.equal(report.completionReason, 'TARGET_REACHED');
   assert.equal(report.verdict, 'PASS');
   assert.equal(report.closedPositions, 50);
   assert.equal(report.netPnlRaw, '9500');
@@ -64,7 +66,8 @@ void test('fails closed on drawdown, unknowns, duplicates, quote mismatch or pro
     sellMinimumAmountOutRaw: 980n,
   }));
   const failing = createPaperMvpReport({
-    runId: 'paper_mvp_run_2', startedAtMs: 100, completedAtMs: 1_000,
+    runId: 'paper_mvp_run_2', completionReason: 'TARGET_REACHED',
+    startedAtMs: 100, completedAtMs: 1_000,
     targetClosedPositions: 1, initialCapitalRaw: 100n, quoteMint: 'SOL',
     creationsObserved: 1, entriesRejected: 0,
     samples: [loss],
@@ -82,6 +85,65 @@ void test('fails closed on drawdown, unknowns, duplicates, quote mismatch or pro
     'DUPLICATE_LOGICAL_BUYS', 'DUPLICATE_LOGICAL_SELLS', 'PROVIDER_USAGE_UNAVAILABLE',
     'PROVIDER_RATE_LIMITED',
   ]);
+});
+
+void test('forces non-target completion to a durable degraded FAIL report', () => {
+  const samples = [createPaperMvpPositionSample(sampleInput())];
+  for (const reason of ['TIMEOUT', 'SIGINT', 'SIGTERM'] as const) {
+    const report = createPaperMvpReport({
+      runId: `paper_mvp_run_${reason}`,
+      completionReason: reason,
+      startedAtMs: 100,
+      completedAtMs: 1_000,
+      targetClosedPositions: 1,
+      initialCapitalRaw: 10_000n,
+      quoteMint: 'SOL',
+      creationsObserved: 1,
+      entriesRejected: 0,
+      samples,
+      unknownTerminalPositions: 0,
+      duplicateLogicalBuys: 0,
+      duplicateLogicalSells: 0,
+      providerUsage: {
+        status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 101n,
+        rateLimitedCount: 0,
+      },
+    });
+
+    assert.equal(report.completionReason, reason);
+    assert.equal(report.technicalStatus, 'DEGRADED');
+    assert.equal(report.verdict, 'FAIL');
+    assert.deepEqual(report.failedGateCodes, [
+      reason === 'TIMEOUT' ? 'RUN_TIMED_OUT' : 'RUN_INTERRUPTED',
+    ]);
+  }
+});
+
+void test('keeps legacy report evaluation unchanged while exposing its compatibility reason', () => {
+  const report = createPaperMvpReport({
+    runId: 'paper_mvp_run_legacy',
+    completionReason: 'LEGACY',
+    startedAtMs: 100,
+    completedAtMs: 1_000,
+    targetClosedPositions: 1,
+    initialCapitalRaw: 10_000n,
+    quoteMint: 'SOL',
+    creationsObserved: 1,
+    entriesRejected: 0,
+    samples: [createPaperMvpPositionSample(sampleInput())],
+    unknownTerminalPositions: 0,
+    duplicateLogicalBuys: 0,
+    duplicateLogicalSells: 0,
+    providerUsage: {
+      status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 101n,
+      rateLimitedCount: 0,
+    },
+  });
+
+  assert.equal(report.completionReason, 'LEGACY');
+  assert.equal(report.technicalStatus, 'COMPLETED');
+  assert.equal(report.verdict, 'PASS');
+  assert.deepEqual(report.failedGateCodes, []);
 });
 
 function sampleInput(overrides: Record<string, unknown> = {}) {

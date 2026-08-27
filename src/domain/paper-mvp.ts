@@ -11,6 +11,8 @@ const EXIT_REASONS = [
 
 export type PaperMvpExitReason = (typeof EXIT_REASONS)[number];
 export type PaperMvpExitCategory = '10_UNIQUE_BUYERS' | '2X' | 'SAFETY';
+export type PaperMvpCompletionReason =
+  | 'TARGET_REACHED' | 'TIMEOUT' | 'SIGINT' | 'SIGTERM' | 'LEGACY';
 export type PaperMvpGateCode =
   | 'CLOSED_POSITIONS_BELOW_TARGET'
   | 'NET_PNL_NOT_POSITIVE'
@@ -20,7 +22,9 @@ export type PaperMvpGateCode =
   | 'DUPLICATE_LOGICAL_SELLS'
   | 'UNSUPPORTED_QUOTE_MINT'
   | 'PROVIDER_USAGE_UNAVAILABLE'
-  | 'PROVIDER_RATE_LIMITED';
+  | 'PROVIDER_RATE_LIMITED'
+  | 'RUN_TIMED_OUT'
+  | 'RUN_INTERRUPTED';
 
 export interface PaperMvpPositionSampleInput {
   readonly positionId: string;
@@ -67,6 +71,7 @@ export interface PaperMvpProviderUsage {
 
 export interface CreatePaperMvpReportInput {
   readonly runId: string;
+  readonly completionReason: PaperMvpCompletionReason;
   readonly startedAtMs: number;
   readonly completedAtMs: number;
   readonly targetClosedPositions: number;
@@ -84,6 +89,7 @@ export interface CreatePaperMvpReportInput {
 export interface PaperMvpReportV1 {
   readonly schemaVersion: 'paper-mvp.v1';
   readonly runId: string;
+  readonly completionReason: PaperMvpCompletionReason;
   readonly startedAt: string;
   readonly completedAt: string;
   readonly technicalStatus: 'COMPLETED' | 'DEGRADED';
@@ -162,6 +168,7 @@ export function createPaperMvpPositionSample(
 
 export function createPaperMvpReport(input: CreatePaperMvpReportInput): PaperMvpReportV1 {
   boundedText(input.runId);
+  if (!isCompletionReason(input.completionReason)) throw invalid('completion reason');
   boundedText(input.quoteMint);
   assertValidTimestampMs('occurredAtMs', input.startedAtMs);
   assertValidTimestampMs('occurredAtMs', input.completedAtMs);
@@ -211,14 +218,22 @@ export function createPaperMvpReport(input: CreatePaperMvpReportInput): PaperMvp
   const usage = validateProviderUsage(input.providerUsage);
   if (usage.status === 'UNAVAILABLE') failed.push('PROVIDER_USAGE_UNAVAILABLE');
   if (usage.rateLimitedCount !== 0) failed.push('PROVIDER_RATE_LIMITED');
+  if (input.completionReason === 'TIMEOUT') failed.push('RUN_TIMED_OUT');
+  if (input.completionReason === 'SIGINT' || input.completionReason === 'SIGTERM') {
+    failed.push('RUN_INTERRUPTED');
+  }
+  const nonTargetCompletion = input.completionReason !== 'TARGET_REACHED'
+    && input.completionReason !== 'LEGACY';
   const credits = usage.creditsUsedStart === null || usage.creditsUsedEnd === null
     ? null : usage.creditsUsedEnd - usage.creditsUsedStart;
   const completed = ordered.length;
   return Object.freeze({
     schemaVersion: 'paper-mvp.v1', runId: input.runId,
+    completionReason: input.completionReason,
     startedAt: new Date(input.startedAtMs).toISOString(),
     completedAt: new Date(input.completedAtMs).toISOString(),
-    technicalStatus: usage.status === 'AVAILABLE' && usage.rateLimitedCount === 0
+    technicalStatus: !nonTargetCompletion
+      && usage.status === 'AVAILABLE' && usage.rateLimitedCount === 0
       ? 'COMPLETED' : 'DEGRADED',
     verdict: failed.length === 0 ? 'PASS' : 'FAIL',
     targetClosedPositions: input.targetClosedPositions, closedPositions: completed,
@@ -240,6 +255,11 @@ export function createPaperMvpReport(input: CreatePaperMvpReportInput): PaperMvp
     rateLimitedCount: usage.rateLimitedCount,
     failedGateCodes: Object.freeze(failed),
   });
+}
+
+function isCompletionReason(value: unknown): value is PaperMvpCompletionReason {
+  return value === 'TARGET_REACHED' || value === 'TIMEOUT' || value === 'SIGINT'
+    || value === 'SIGTERM' || value === 'LEGACY';
 }
 
 function validateSample(sample: PaperMvpPositionSample): PaperMvpPositionSample {

@@ -208,6 +208,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
         assertObservationCounts(before, observations);
         const canonicalReport = createPaperMvpReport({
           runId: before.runId,
+          completionReason: 'TARGET_REACHED',
           startedAtMs: before.startedAtMs,
           completedAtMs: input.terminalAtMs,
           targetClosedPositions: before.configuration.targetClosedPositions,

@@ -357,7 +357,8 @@ void test('rejects a report not canonically rebuilt from durable samples', async
       unknownPositions: Object.freeze([]),
     });
     const fabricatedPass = createPaperMvpReport({
-      runId: run.runId, startedAtMs: run.startedAtMs, completedAtMs: 3_000,
+      runId: run.runId, completionReason: 'TARGET_REACHED',
+      startedAtMs: run.startedAtMs, completedAtMs: 3_000,
       targetClosedPositions: 1, initialCapitalRaw: configuration.initialCapitalRaw,
       quoteMint: configuration.quoteMint, creationsObserved: 1, entriesRejected: 0,
       samples: Object.freeze([sample()]), unknownTerminalPositions: 0,
@@ -468,7 +469,8 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     ]);
 
     const report = createPaperMvpReport({
-      runId: run.runId, startedAtMs: run.startedAtMs, completedAtMs: 3_000,
+      runId: run.runId, completionReason: 'TARGET_REACHED',
+      startedAtMs: run.startedAtMs, completedAtMs: 3_000,
       targetClosedPositions: 1, initialCapitalRaw: configuration.initialCapitalRaw,
       quoteMint: configuration.quoteMint, creationsObserved: 1, entriesRejected: 0,
       samples: Object.freeze([firstSample]), unknownTerminalPositions: 1,
@@ -493,7 +495,8 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
 
     const unavailableRun = await repository.startOrResume(configuration, 4_000);
     const unavailableReport = createPaperMvpReport({
-      runId: unavailableRun.runId, startedAtMs: 4_000, completedAtMs: 5_000,
+      runId: unavailableRun.runId, completionReason: 'TARGET_REACHED',
+      startedAtMs: 4_000, completedAtMs: 5_000,
       targetClosedPositions: 1, initialCapitalRaw: configuration.initialCapitalRaw,
       quoteMint: configuration.quoteMint, creationsObserved: 0, entriesRejected: 0,
       samples: Object.freeze([]), unknownTerminalPositions: 0,

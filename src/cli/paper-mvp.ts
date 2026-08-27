@@ -333,6 +333,7 @@ async function completeAndExport(
 function reportFromSnapshot(snapshot: PaperMvpRunSnapshot, completedAtMs: number): PaperMvpReportV1 {
   return createPaperMvpReport({
     runId: snapshot.run.runId,
+    completionReason: 'TARGET_REACHED',
     startedAtMs: snapshot.run.startedAtMs,
     completedAtMs,
     targetClosedPositions: snapshot.run.configuration.targetClosedPositions,
