@@ -3,6 +3,7 @@ import { PublicKey } from '@solana/web3.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { reconcileConfirmationStatus } from './confirmation-status.js';
 import { assertValidChainCursor, assertValidTransactionCursor } from './cursor.js';
+import { isRpcProviderId, type RpcProviderId } from './rpc-provider.js';
 import type { ChainConfirmationStatus } from './types.js';
 
 export const MAX_TRANSACTION_SNAPSHOT_DEPTH = 64;
@@ -15,6 +16,7 @@ export const MAX_TRANSACTION_NOTIFICATION_PROGRAM_IDS = 16;
 export const MIN_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES = 32;
 export const MAX_TRANSACTION_NOTIFICATION_PROGRAM_ID_BYTES = 44;
 export const CATCH_UP_GAP_RETENTION_MS = 14_400_000;
+export const MAX_FINALITY_EVIDENCE_VERSION = 9_223_372_036_854_775_807n;
 
 export const TRANSACTION_INBOX_STATUSES = Object.freeze([
   'PENDING',
@@ -194,21 +196,38 @@ export interface FinalityCandidate {
   readonly slot: bigint;
   readonly confirmationStatus: Extract<ChainConfirmationStatus, 'processed' | 'confirmed'>;
   readonly missingFinalityPolls: number;
+  readonly lastMissingFinalityProviderId: RpcProviderId | null;
+  readonly finalityEvidenceVersion: bigint;
   readonly processedAtMs: number;
 }
 
 export interface FinalityPollObservation {
   readonly signature: string;
   readonly confirmationStatus: Extract<ChainConfirmationStatus, 'processed' | 'confirmed'> | null;
+  readonly providerId: RpcProviderId;
   readonly expectedMissingFinalityPolls: number;
+  readonly expectedLastMissingFinalityProviderId: RpcProviderId | null;
+  readonly expectedFinalityEvidenceVersion: bigint;
   readonly observedAtMs: number;
 }
 
-export interface FinalityRevision {
+export interface FinalizedFinalityRevision {
   readonly signature: string;
-  readonly confirmationStatus: Extract<ChainConfirmationStatus, 'finalized' | 'orphaned'>;
+  readonly confirmationStatus: 'finalized';
   readonly observedAtMs: number;
 }
+
+export interface OrphanedFinalityRevision {
+  readonly signature: string;
+  readonly confirmationStatus: 'orphaned';
+  readonly expectedConfirmationStatus: Extract<ChainConfirmationStatus, 'processed' | 'confirmed'>;
+  readonly expectedMissingFinalityPolls: number;
+  readonly expectedLastMissingFinalityProviderId: RpcProviderId;
+  readonly expectedFinalityEvidenceVersion: bigint;
+  readonly observedAtMs: number;
+}
+
+export type FinalityRevision = FinalizedFinalityRevision | OrphanedFinalityRevision;
 
 export interface RuntimeHeartbeat {
   readonly runtimeState: ListenerRuntimeState;
@@ -474,6 +493,12 @@ export function assertValidFinalityCandidate(
     throw new TypeError('Finality candidate confirmation status is invalid.');
   }
   assertCount(record.missingFinalityPolls, 'Finality candidate missingFinalityPolls');
+  assertMissingFinalityProviderCorrelation(
+    record.missingFinalityPolls,
+    record.lastMissingFinalityProviderId,
+    'Finality candidate',
+  );
+  assertFinalityEvidenceVersion(record.finalityEvidenceVersion, 'Finality candidate finalityEvidenceVersion');
   assertMilliseconds(record.processedAtMs, 'Finality candidate processedAtMs');
 }
 
@@ -487,9 +512,19 @@ export function assertValidFinalityPollObservation(
     && record.confirmationStatus !== 'confirmed') {
     throw new TypeError('Finality poll observation confirmationStatus is invalid.');
   }
+  assertRpcProviderId(record.providerId, 'Finality poll observation providerId');
   assertCount(
     record.expectedMissingFinalityPolls,
     'Finality poll observation expectedMissingFinalityPolls',
+  );
+  assertMissingFinalityProviderCorrelation(
+    record.expectedMissingFinalityPolls,
+    record.expectedLastMissingFinalityProviderId,
+    'Finality poll observation',
+  );
+  assertFinalityEvidenceVersion(
+    record.expectedFinalityEvidenceVersion,
+    'Finality poll observation expectedFinalityEvidenceVersion',
   );
   assertMilliseconds(record.observedAtMs, 'Finality poll observation observedAtMs');
 }
@@ -499,9 +534,43 @@ export function assertValidFinalityRevision(
 ): asserts value is FinalityRevision {
   const record = frozenRecord(value, 'Finality revision');
   assertText(record.signature, 'Finality revision signature');
-  if (record.confirmationStatus !== 'finalized' && record.confirmationStatus !== 'orphaned') {
+  if (record.confirmationStatus === 'finalized') {
+    assertOnlyRecordFields(record, [
+      'signature',
+      'confirmationStatus',
+      'observedAtMs',
+    ], 'Finality revision');
+    assertMilliseconds(record.observedAtMs, 'Finality revision observedAtMs');
+    return;
+  }
+  if (record.confirmationStatus !== 'orphaned') {
     throw new TypeError('Finality revision confirmation status is invalid.');
   }
+  assertOnlyRecordFields(record, [
+    'signature',
+    'confirmationStatus',
+    'expectedConfirmationStatus',
+    'expectedMissingFinalityPolls',
+    'expectedLastMissingFinalityProviderId',
+    'expectedFinalityEvidenceVersion',
+    'observedAtMs',
+  ], 'Finality revision');
+  if (record.expectedConfirmationStatus !== 'processed'
+    && record.expectedConfirmationStatus !== 'confirmed') {
+    throw new TypeError('Finality revision expectedConfirmationStatus is invalid.');
+  }
+  assertPositiveCount(
+    record.expectedMissingFinalityPolls,
+    'Finality revision expectedMissingFinalityPolls',
+  );
+  assertRpcProviderId(
+    record.expectedLastMissingFinalityProviderId,
+    'Finality revision expectedLastMissingFinalityProviderId',
+  );
+  assertFinalityEvidenceVersion(
+    record.expectedFinalityEvidenceVersion,
+    'Finality revision expectedFinalityEvidenceVersion',
+  );
   assertMilliseconds(record.observedAtMs, 'Finality revision observedAtMs');
 }
 
@@ -588,6 +657,45 @@ function assertMilliseconds(value: unknown, name: string): asserts value is numb
 function assertCount(value: unknown, name: string): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < 0 || Object.is(value, -0)) {
     throw new TypeError(`${name} must be a non-negative safe integer.`);
+  }
+}
+
+function assertPositiveCount(value: unknown, name: string): asserts value is number {
+  assertCount(value, name);
+  if (value === 0) throw new TypeError(`${name} must be a positive safe integer.`);
+}
+
+function assertMissingFinalityProviderCorrelation(
+  missingFinalityPolls: number,
+  providerId: unknown,
+  name: string,
+): asserts providerId is RpcProviderId | null {
+  if (missingFinalityPolls === 0) {
+    if (providerId !== null) throw new TypeError(`${name} last missing provider must be null at zero polls.`);
+    return;
+  }
+  assertRpcProviderId(providerId, `${name} last missing provider`);
+}
+
+function assertRpcProviderId(value: unknown, name: string): asserts value is RpcProviderId {
+  if (!isRpcProviderId(value)) throw new TypeError(`${name} is invalid.`);
+}
+
+function assertFinalityEvidenceVersion(value: unknown, name: string): asserts value is bigint {
+  if (typeof value !== 'bigint'
+    || value < 0n
+    || value > MAX_FINALITY_EVIDENCE_VERSION) {
+    throw new TypeError(`${name} must be a non-negative PostgreSQL BIGINT.`);
+  }
+}
+
+function assertOnlyRecordFields(
+  record: Readonly<Record<string, unknown>>,
+  allowed: readonly string[],
+  name: string,
+): void {
+  if (Object.keys(record).some((field) => !allowed.includes(field))) {
+    throw new TypeError(`${name} contains unsupported fields.`);
   }
 }
 

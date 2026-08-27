@@ -20,6 +20,7 @@ import {
   assertValidCatchUpGap,
   assertValidFinalityCandidate,
   assertValidFinalityPollObservation,
+  assertValidFinalityRevision,
   assertValidIngestionFailure,
   assertValidInboxCounts,
   assertValidInboxRecoveryResult,
@@ -33,12 +34,14 @@ import {
   type CatchUpGap,
   type FinalityCandidate,
   type FinalityPollObservation,
+  type FinalityRevision,
   type IngestionFailure,
   type InboxRecoveryResult,
   type ProcessingCheckpoint,
   type RuntimeHeartbeat,
   type TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
+import { RPC_PROVIDER_IDS, isRpcProviderId } from '../src/domain/rpc-provider.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { normalizeTransaction } from '../src/solana/rpc/transaction-fetcher.js';
 
@@ -153,12 +156,31 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
     slot: 42n,
     confirmationStatus: 'confirmed',
     missingFinalityPolls: 0,
+    lastMissingFinalityProviderId: null,
+    finalityEvidenceVersion: 0n,
     processedAtMs: observedAtMs,
   });
   const finalityPoll: FinalityPollObservation = Object.freeze({
     signature: 'signature',
     confirmationStatus: null,
+    providerId: 'primary',
     expectedMissingFinalityPolls: 0,
+    expectedLastMissingFinalityProviderId: null,
+    expectedFinalityEvidenceVersion: 0n,
+    observedAtMs,
+  });
+  const finalizedRevision: FinalityRevision = Object.freeze({
+    signature: 'signature',
+    confirmationStatus: 'finalized',
+    observedAtMs,
+  });
+  const orphanedRevision: FinalityRevision = Object.freeze({
+    signature: 'signature',
+    confirmationStatus: 'orphaned',
+    expectedConfirmationStatus: 'confirmed',
+    expectedMissingFinalityPolls: 3,
+    expectedLastMissingFinalityProviderId: 'primary',
+    expectedFinalityEvidenceVersion: 8n,
     observedAtMs,
   });
   const heartbeat: RuntimeHeartbeat = Object.freeze({
@@ -188,10 +210,20 @@ void test('accepts canonical frozen ingestion contracts with bigint slots and in
   assert.doesNotThrow(() => { assertValidProcessingCheckpoint(checkpoint); });
   assert.doesNotThrow(() => { assertValidFinalityCandidate(candidate); });
   assert.doesNotThrow(() => { assertValidFinalityPollObservation(finalityPoll); });
+  assert.doesNotThrow(() => { assertValidFinalityRevision(finalizedRevision); });
+  assert.doesNotThrow(() => { assertValidFinalityRevision(orphanedRevision); });
   assert.doesNotThrow(() => { assertValidRuntimeHeartbeat(heartbeat); });
   assert.doesNotThrow(() => { assertValidInboxRecoveryResult(recovery); });
   assert.equal(typeof notification.slot, 'bigint');
   assert.ok(Number.isSafeInteger(heartbeat.updatedAtMs));
+});
+
+void test('publishes exact frozen positional RPC provider identifiers', () => {
+  assert.deepEqual(RPC_PROVIDER_IDS, ['primary', 'fallback-1', 'fallback-2', 'fallback-3']);
+  assert.ok(Object.isFrozen(RPC_PROVIDER_IDS));
+  for (const providerId of RPC_PROVIDER_IDS) assert.equal(isRpcProviderId(providerId), true);
+  assert.equal(isRpcProviderId('fallback-4'), false);
+  assert.equal(isRpcProviderId(null), false);
 });
 
 void test('accepts a deeply frozen snapshot whose earlier finality can advance on the claim', () => {
@@ -568,6 +600,8 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
     slot: 42n,
     confirmationStatus: 'confirmed' as const,
     missingFinalityPolls: 0,
+    lastMissingFinalityProviderId: null,
+    finalityEvidenceVersion: 0n,
     processedAtMs: observedAtMs,
   });
   for (const missingFinalityPolls of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
@@ -578,6 +612,9 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
   }
   const poll = Object.freeze({
     signature: 'signature', confirmationStatus: null, expectedMissingFinalityPolls: 0,
+    providerId: 'primary' as const,
+    expectedLastMissingFinalityProviderId: null,
+    expectedFinalityEvidenceVersion: 0n,
     observedAtMs,
   });
   for (const expectedMissingFinalityPolls of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
@@ -617,6 +654,81 @@ void test('rejects negative, fractional and unsafe ingestion counts', () => {
     })); },
     /exhaustedCount/u,
   );
+});
+
+void test('rejects incoherent, unproven and accessor-backed finality evidence', () => {
+  const candidate = Object.freeze({
+    signature: 'signature',
+    slot: 42n,
+    confirmationStatus: 'confirmed' as const,
+    missingFinalityPolls: 2,
+    lastMissingFinalityProviderId: 'primary' as const,
+    finalityEvidenceVersion: 7n,
+    processedAtMs: observedAtMs,
+  });
+  for (const value of [
+    Object.freeze({ ...candidate, missingFinalityPolls: 0 }),
+    Object.freeze({ ...candidate, lastMissingFinalityProviderId: null }),
+    Object.freeze({ ...candidate, lastMissingFinalityProviderId: 'fallback-4' }),
+    Object.freeze({ ...candidate, finalityEvidenceVersion: -1n }),
+    Object.freeze({ ...candidate, finalityEvidenceVersion: 9_223_372_036_854_775_808n }),
+  ]) {
+    assert.throws(() => { assertValidFinalityCandidate(value); }, /Finality candidate/u);
+  }
+  const observation = Object.freeze({
+    signature: 'signature',
+    confirmationStatus: null,
+    providerId: 'primary' as const,
+    expectedMissingFinalityPolls: 3,
+    expectedLastMissingFinalityProviderId: 'primary' as const,
+    expectedFinalityEvidenceVersion: 8n,
+    observedAtMs,
+  });
+  for (const value of [
+    Object.freeze({ ...observation, expectedMissingFinalityPolls: 0 }),
+    Object.freeze({ ...observation, expectedLastMissingFinalityProviderId: null }),
+    Object.freeze({ ...observation, providerId: 'fallback-4' }),
+    Object.freeze({ ...observation, expectedFinalityEvidenceVersion: -1n }),
+    Object.freeze({ ...observation, expectedFinalityEvidenceVersion: 9_223_372_036_854_775_808n }),
+  ]) {
+    assert.throws(() => { assertValidFinalityPollObservation(value); }, /Finality poll/u);
+  }
+  const accessorBacked = Object.freeze(Object.defineProperty({ ...candidate }, 'providerId', {
+    enumerable: true,
+    get: () => 'primary',
+  }));
+  assert.throws(() => { assertValidFinalityCandidate(accessorBacked); }, /accessor/u);
+  assert.throws(() => { assertValidFinalityCandidate({ ...candidate }); }, /frozen/u);
+});
+
+void test('rejects malformed finality revision proof branches', () => {
+  const finalized = Object.freeze({
+    signature: 'signature',
+    confirmationStatus: 'finalized' as const,
+    observedAtMs,
+  });
+  const orphaned = Object.freeze({
+    signature: 'signature',
+    confirmationStatus: 'orphaned' as const,
+    expectedConfirmationStatus: 'confirmed' as const,
+    expectedMissingFinalityPolls: 3,
+    expectedLastMissingFinalityProviderId: 'primary' as const,
+    expectedFinalityEvidenceVersion: 8n,
+    observedAtMs,
+  });
+  assert.throws(() => { assertValidFinalityRevision(Object.freeze({
+    ...finalized,
+    expectedMissingFinalityPolls: 3,
+  })); }, /Finality revision/u);
+  for (const value of [
+    Object.freeze({ ...orphaned, expectedConfirmationStatus: 'finalized' }),
+    Object.freeze({ ...orphaned, expectedMissingFinalityPolls: 0 }),
+    Object.freeze({ ...orphaned, expectedLastMissingFinalityProviderId: 'fallback-4' }),
+    Object.freeze({ ...orphaned, expectedFinalityEvidenceVersion: -1n }),
+    Object.freeze({ ...orphaned, expectedFinalityEvidenceVersion: 9_223_372_036_854_775_808n }),
+  ]) {
+    assert.throws(() => { assertValidFinalityRevision(value); }, /Finality revision/u);
+  }
 });
 
 void test('rejects invalid discovery sources and ingestion error codes', () => {
