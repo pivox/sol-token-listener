@@ -713,7 +713,11 @@ function parseHttpRpcFallbackUrls(raw: string | undefined, primaryUrl: string): 
     throw new Error('SOLANA_HTTP_RPC_FALLBACK_URLS supports at most 3 fallback endpoints.');
   }
 
-  const primaryProtocol = new URL(primaryUrl).protocol;
+  const primary = new URL(primaryUrl);
+  if (primary.href.includes('#')) {
+    throw new Error('HTTP RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+  }
+  const primaryProtocol = primary.protocol;
   const canonicalUrls: string[] = [];
   for (const entry of entries) {
     let parsed: URL;
@@ -724,6 +728,9 @@ function parseHttpRpcFallbackUrls(raw: string | undefined, primaryUrl: string): 
     }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new Error('SOLANA_HTTP_RPC_FALLBACK_URLS must contain valid absolute HTTP(S) URLs.');
+    }
+    if (parsed.href.includes('#')) {
+      throw new Error('HTTP RPC endpoint URLs must not contain fragments when fallbacks are configured.');
     }
     if (parsed.protocol !== primaryProtocol) {
       throw new Error('SOLANA_HTTP_RPC_FALLBACK_URLS must use the same scheme as SOLANA_HTTP_RPC_URL.');

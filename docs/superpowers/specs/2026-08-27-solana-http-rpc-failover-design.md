@@ -2,8 +2,12 @@
 
 Date: 2026-08-27
 Issue: #56
-Version: 1.0.1
+Version: 1.0.2
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.2: only HTTP-success responses update the sticky endpoint;
+endpoint fragments are forbidden because they are not transmitted in HTTP
+requests.
 
 ## Purpose
 
@@ -73,6 +77,7 @@ Configuration parsing:
 - requires all configured endpoints to use the same scheme, which preserves
   web3.js agent behavior and still supports HTTP-only local development;
 - canonicalizes and rejects duplicates, including the primary endpoint;
+- rejects primary and fallback URL fragments when failover is configured;
 - never includes a configured URL in a validation error;
 - freezes the resulting ordered endpoint list;
 - preserves the existing single-endpoint `Connection` and its web3.js retry
@@ -105,7 +110,8 @@ For each logical HTTP request:
 3. inspect each eligible endpoint at most once, in circular configured order;
 4. forward the original request initialization, including method, headers,
    body and abort signal, without parsing or retaining the JSON-RPC body;
-5. return immediately on a non-transient HTTP response;
+5. return immediately on a non-transient HTTP response, updating the sticky
+   endpoint only when the HTTP response is successful;
 6. on a transient failure, put that endpoint in cooldown and try the next
    eligible endpoint;
 7. if no endpoint remains eligible, throw one fixed typed transport error.
@@ -117,10 +123,13 @@ Transient failures are deliberately closed and explicit:
 - HTTP `502`, `503`, or `504`.
 
 HTTP `400`, `401`, `403`, other status codes, and JSON-RPC errors transported
-inside HTTP `200` are returned to web3.js without rotation. This prevents a
-fallback from hiding invalid credentials, malformed requests or deterministic
-RPC errors. A `null` application result such as unavailable archive history is
-also not a transport failure; existing durable retries remain authoritative.
+inside HTTP `200` are returned to web3.js without rotation. Only an HTTP-success
+response becomes sticky, so an authentication failure does not pin later
+requests to that endpoint while HTTP `200` JSON-RPC responses remain healthy.
+This prevents a fallback from hiding invalid credentials, malformed requests
+or deterministic RPC errors. A `null` application result such as unavailable
+archive history is also not a transport failure; existing durable retries
+remain authoritative.
 
 When at least one fallback is configured, the transport sets
 `disableRetryOnRateLimit: true` on `Connection`. Otherwise web3.js would
@@ -200,6 +209,7 @@ Configuration tests cover:
 - ordered valid fallbacks and exact maximum;
 - whitespace, empty entries, duplicates and maximum plus one;
 - invalid or mixed protocols;
+- forbidden fragments when failover is configured;
 - redacted errors and safe `.env.example` placeholders.
 
 Transport tests cover:

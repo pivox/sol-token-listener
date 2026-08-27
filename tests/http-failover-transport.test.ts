@@ -121,6 +121,53 @@ void test('returns an HTTP 200 JSON-RPC error body untouched and unconsumed', as
   });
 });
 
+void test('does not make an auth-failing fallback sticky after the primary cooldown expires', async () => {
+  for (const status of [401, 403]) {
+    let currentTime = 0;
+    let primaryCalls = 0;
+    const calls: string[] = [];
+    const authFailure = reply(status);
+    const recovered = reply(200);
+    const fetch = createRpcHttpFailoverFetch({
+      endpoints: endpoints.slice(0, 2),
+      now: () => currentTime,
+      fetch: async (input) => {
+        const url = inputUrl(input);
+        calls.push(url);
+        if (url === endpoints[0].url) {
+          primaryCalls += 1;
+          return primaryCalls === 1 ? reply(503) : recovered;
+        }
+        return authFailure;
+      },
+    });
+
+    assert.equal(await fetch(endpoints[0].url), authFailure);
+    currentTime = 1000;
+    assert.equal(await fetch(endpoints[0].url), recovered);
+    assert.deepEqual(calls, [endpoints[0].url, endpoints[1].url, endpoints[0].url], String(status));
+  }
+});
+
+void test('keeps an HTTP 200 JSON-RPC error endpoint sticky', async () => {
+  const calls: string[] = [];
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    fetch: async (input) => {
+      const url = inputUrl(input);
+      calls.push(url);
+      if (url === endpoints[0].url) return reply(503);
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0', id: 1, error: { message: 'provider detail' },
+      }), { status: 200 });
+    },
+  });
+
+  assert.equal((await fetch(endpoints[0].url)).status, 200);
+  assert.equal((await fetch(endpoints[0].url)).status, 200);
+  assert.deepEqual(calls, [endpoints[0].url, endpoints[1].url, endpoints[1].url]);
+});
+
 void test('uses strict Retry-After delta seconds, IMF-fixdate, past dates, fallback, and clamp', async () => {
   const base = Date.parse('Wed, 27 Aug 2025 10:00:00 GMT');
   const cases: readonly { readonly value: string; readonly expectedMs: number }[] = [
@@ -507,7 +554,11 @@ void test('rejects a non-primary string or Request input without fetching, event
     method: 'POST', body: 'body-secret',
   });
 
-  for (const input of ['https://arbitrary-secret.invalid/key', mismatchedRequest]) {
+  for (const input of [
+    'https://arbitrary-secret.invalid/key',
+    `${endpoints[0].url}#request-secret-fragment`,
+    mismatchedRequest,
+  ]) {
     await assert.rejects(fetch(input), (error: unknown) => {
       assert.ok(error instanceof TypeError);
       assert.equal(error.message, 'HTTP RPC request URL must match the configured primary endpoint.');
@@ -588,6 +639,29 @@ void test('validates endpoint count, positional IDs, and canonical URL uniquenes
         assert.ok(error instanceof TypeError);
         assert.equal(error.message, entry.message);
         assert.doesNotMatch(String(error), /secret|primary\.invalid|rpc-key/iu);
+        return true;
+      },
+    );
+  }
+});
+
+void test('rejects configured endpoint URL fragments with a fixed redacted error', () => {
+  for (const fragmentedEndpoints of [
+    [
+      { id: 'primary', url: 'https://primary.invalid/rpc#primary-secret' },
+      { id: 'fallback-1', url: 'https://fallback.invalid/rpc' },
+    ],
+    [
+      { id: 'primary', url: 'https://primary.invalid/rpc' },
+      { id: 'fallback-1', url: 'https://fallback.invalid/rpc#fallback-secret' },
+    ],
+  ]) {
+    assert.throws(
+      () => createRpcHttpFailoverFetch({ endpoints: fragmentedEndpoints as never }),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, 'HTTP RPC endpoint URLs must not contain fragments.');
+        assert.doesNotMatch(String(error), /primary-secret|fallback-secret|primary\.invalid|fallback\.invalid/iu);
         return true;
       },
     );

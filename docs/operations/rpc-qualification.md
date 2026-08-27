@@ -50,7 +50,9 @@ Ces données sont contractuelles et ne peuvent pas être déduites du rapport.
 des virgules, de fallbacks : au plus trois fallbacks (donc quatre endpoints au total).
 Les URLs sont canonicalisées : les doublons canoniques, y compris le principal,
 sont refusés, et tous les endpoints HTTP doivent avoir le même schéma HTTP
-(`http` ou `https`). Par exemple :
+(`http` ou `https`). Dans une chaîne de basculement, les fragments d'URL sont interdits
+car ils ne sont pas transmis par HTTP et ne peuvent donc pas identifier un endpoint.
+Par exemple :
 
 ```dotenv
 SOLANA_HTTP_RPC_URL=https://primary.example.invalid

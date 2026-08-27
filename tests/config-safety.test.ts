@@ -65,6 +65,38 @@ void test('fallback HTTP RPC rejects invalid URLs and protocols', () => {
   }
 });
 
+void test('fallback HTTP RPC rejects a fallback URL fragment with a fixed redacted error', () => {
+  const fallback = 'https://fallback.example.invalid/rpc#fallback-secret';
+  assert.throws(
+    () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: fallback }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, 'HTTP RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+      assert.doesNotMatch(String(error), /fallback-secret|fallback\.example\.invalid|\/rpc/iu);
+      return true;
+    },
+  );
+});
+
+void test('fallback HTTP RPC rejects a primary URL fragment only when fallbacks are configured', () => {
+  const primary = 'https://rpc.example.invalid/rpc#primary-secret';
+  assert.equal(parseConfig({ ...base, SOLANA_HTTP_RPC_URL: primary }).httpRpcUrl, primary);
+
+  assert.throws(
+    () => parseConfig({
+      ...base,
+      SOLANA_HTTP_RPC_URL: primary,
+      SOLANA_HTTP_RPC_FALLBACK_URLS: 'https://fallback.example.invalid/rpc',
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, 'HTTP RPC endpoint URLs must not contain fragments when fallbacks are configured.');
+      assert.doesNotMatch(String(error), /primary-secret|rpc\.example\.invalid|\/rpc/iu);
+      return true;
+    },
+  );
+});
+
 void test('fallback HTTP RPC rejects mixed schemes', () => {
   assert.throws(
     () => parseConfig({ ...base, SOLANA_HTTP_RPC_FALLBACK_URLS: 'http://fallback.example.invalid' }),
@@ -715,6 +747,8 @@ void test('HTTP RPC failover documentation states the bounded production and soa
     'au plus trois',
     'même schéma HTTP',
     'doublons canoniques',
+    "fragments d'URL sont interdits",
+    'ne sont pas transmis',
     'rpc.http_endpoint_degraded',
     'rpc.http_failover',
     'rpc.http_endpoints_exhausted',

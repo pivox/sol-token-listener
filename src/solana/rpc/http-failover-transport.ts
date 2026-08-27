@@ -134,7 +134,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
 
       const reason = transientReason(response.status);
       if (reason === undefined) {
-        stickyIndex = endpointIndex;
+        if (response.ok) stickyIndex = endpointIndex;
         return response;
       }
 
@@ -173,6 +173,9 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
     if (typeof value.url !== 'string') {
       throw new TypeError('HTTP RPC endpoint URL is invalid.');
     }
+    if (hasUrlFragment(value.url)) {
+      throw new TypeError('HTTP RPC endpoint URLs must not contain fragments.');
+    }
     const canonicalUrl = canonicalHttpUrl(value.url);
     if (canonicalUrl === undefined) throw new TypeError('HTTP RPC endpoint URL is invalid.');
     endpoints.push(Object.freeze({ id: value.id as RpcHttpEndpointId, url: canonicalUrl }));
@@ -204,6 +207,14 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
     ...(candidate.now === undefined ? {} : { now: candidate.now }),
     ...(candidate.onEvent === undefined ? {} : { onEvent: candidate.onEvent }),
   });
+}
+
+function hasUrlFragment(value: string): boolean {
+  try {
+    return new URL(value).href.includes('#');
+  } catch {
+    return false;
+  }
 }
 
 function canonicalHttpUrl(value: string): string | undefined {
