@@ -3,8 +3,12 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.1.1
+Version: 1.1.2
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.1.2 serializes strict-failure recording with checkpoint CAS,
+resolves matching evidence atomically on successful advancement, and stores a
+late obsolete failure as already resolved.
 
 Revision 1.1.1 aligns strict-failure values with PostgreSQL numeric and
 timestamp limits, rejects hostile proxies before reflection, and centralizes
@@ -237,6 +241,13 @@ CAS conflict is a fixed transient scanner failure; it never falls back to the
 monotonic `storeCheckpoint` method. A crash or conflict after one program CAS
 is safe: the next scan captures the new durable boundary for that program and
 replays the other through the idempotent inbox.
+
+Failure recording, exact checkpoint CAS and explicit resolution use the same
+checkpoint-scoped database lock. A successful CAS resolves matching
+unresolved evidence in the same transaction. If a stale failure arrives after
+the boundary has already advanced, it is inserted idempotently as resolved
+with four-hour retention. No crash or record/CAS ordering can therefore leave
+obsolete evidence unresolved forever.
 
 `listener_strict_catch_up_failures` is distinct from voluntary
 `listener_catch_up_gaps`. Its deterministic identity covers checkpoint key,
