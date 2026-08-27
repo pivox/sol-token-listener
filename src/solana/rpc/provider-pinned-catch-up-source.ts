@@ -59,10 +59,13 @@ export function createProviderPinnedCatchUpSource(
   const httpUrl = resolveHttpUrl(catalog, providerId);
   const rpc = createPinnedRpc(createRpc, httpUrl, commitment, providerId);
   const source = new SolanaCatchUpSource(rpc, commitment);
-  let genesisState: Promise<void> | undefined;
+  let genesisValidated = false;
+  let genesisInFlight: Promise<void> | undefined;
 
   const verifyGenesis = (): Promise<void> => {
-    genesisState ??= (async (): Promise<void> => {
+    if (genesisValidated) return Promise.resolve();
+    if (genesisInFlight !== undefined) return genesisInFlight;
+    const attempt = Promise.resolve().then(async (): Promise<void> => {
       let actual: unknown;
       try {
         actual = await rpc.getGenesisHash();
@@ -75,8 +78,15 @@ export function createProviderPinnedCatchUpSource(
       if (actual !== expectedGenesisHash) {
         throw failure('GENESIS_MISMATCH', providerId);
       }
-    })();
-    return genesisState;
+      genesisValidated = true;
+    });
+    genesisInFlight = attempt;
+    void attempt.then(clearAttempt, clearAttempt);
+    return attempt;
+
+    function clearAttempt(): void {
+      if (genesisInFlight === attempt) genesisInFlight = undefined;
+    }
   };
 
   return Object.freeze({

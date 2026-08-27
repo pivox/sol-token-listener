@@ -662,12 +662,7 @@ void test('uses exact checkpoint CAS identities and rejects invalid strict check
       && error.message === 'Transaction inbox repository operation failed.',
   );
   await assert.rejects(
-    strictRepository.resolveStrictCatchUpFailures('invalid' as never, null, 300_000),
-    (error) => error instanceof TransactionInboxRepositoryError
-      && error.message === 'Transaction inbox repository operation failed.',
-  );
-  await assert.rejects(
-    strictRepository.resolveStrictCatchUpFailures('launchpad', null, -0),
+    strictRepository.resolveStrictCatchUpFailures('invalid' as never, null),
     (error) => error instanceof TransactionInboxRepositoryError
       && error.message === 'Transaction inbox repository operation failed.',
   );
@@ -688,7 +683,7 @@ void test('rejects non-canonical strict checkpoint signatures before I/O and acc
     await assert.rejects(repository.compareAndSwapCheckpoint(null, invalid), TransactionInboxRepositoryError);
     await assert.rejects(repository.compareAndSwapCheckpoint(invalid, valid), TransactionInboxRepositoryError);
     await assert.rejects(
-      repository.resolveStrictCatchUpFailures('launchpad', invalid, 300_000),
+      repository.resolveStrictCatchUpFailures('launchpad', invalid),
       TransactionInboxRepositoryError,
     );
     assert.equal(connections, 0);
@@ -796,7 +791,13 @@ void test('resolves strict failure evidence inside a successful CAS but not a fa
     null,
     checkpoint('launchpad', 50n, 'successful-cas', 400_000),
   );
-  assert.ok(successfulQueries.some((text) => text.includes('UPDATE listener_strict_catch_up_failures')));
+  const successfulResolution = successfulQueries.find((text) =>
+    text.includes('UPDATE listener_strict_catch_up_failures'));
+  assert.match(
+    successfulResolution ?? '',
+    /WITH resolution_clock AS[\s\S]*clock_timestamp\(\)[\s\S]*UPDATE/u,
+  );
+  assert.equal(successfulResolution?.match(/clock_timestamp\(\)/gu)?.length, 1);
 
   const failedQueries: string[] = [];
   const failedRepository = new PostgresTransactionInboxRepository({
@@ -822,6 +823,35 @@ void test('resolves strict failure evidence inside a successful CAS but not a fa
     TransactionInboxConflictError,
   );
   assert.equal(failedQueries.some((text) => text.includes('UPDATE listener_strict_catch_up_failures')), false);
+});
+
+void test('captures one database clock for explicit strict failure resolution', async () => {
+  const calls: { readonly text: string; readonly values: readonly unknown[] | undefined }[] = [];
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => ({
+      query: async (text: string, values?: readonly unknown[]) => {
+        calls.push({ text, values });
+        if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.includes('pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
+        if (text.includes('UPDATE listener_strict_catch_up_failures')) {
+          return { rows: [], rowCount: 0 };
+        }
+        throw new Error('Unexpected explicit strict resolution query.');
+      },
+      release: () => {},
+    }),
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+
+  await repository.resolveStrictCatchUpFailures('launchpad', null);
+
+  const resolution = calls.find(({ text }) => text.includes('UPDATE listener_strict_catch_up_failures'));
+  assert.ok(resolution);
+  assert.match(resolution.text, /WITH resolution_clock AS[\s\S]*clock_timestamp\(\)[\s\S]*UPDATE/u);
+  assert.equal(resolution.text.match(/clock_timestamp\(\)/gu)?.length, 1);
+  assert.deepEqual(resolution.values, ['launchpad']);
 });
 
 void test('locks the checkpoint before recording strict catch-up evidence', async () => {
@@ -855,7 +885,7 @@ void test('locks the checkpoint before recording strict catch-up evidence', asyn
   assert.ok(insertIndex > checkpointIndex);
 });
 
-void test('casts the obsolete strict failure retention timestamp explicitly', async () => {
+void test('anchors obsolete strict failure retention to one database resolution clock', async () => {
   const queries: string[] = [];
   const previous = checkpoint('launchpad', 50n, 'stale-boundary', 400_000);
   const repository = new PostgresTransactionInboxRepository({
@@ -893,15 +923,16 @@ void test('casts the obsolete strict failure retention timestamp explicitly', as
   );
 
   const insertion = queries.find((text) => text.includes('INSERT INTO listener_strict_catch_up_failures'));
-  assert.match(
-    insertion ?? '',
-    /\$9::timestamptz,\$9::timestamptz \+ INTERVAL '4 hours'/u,
-  );
+  assert.doesNotMatch(insertion ?? '', /resolved_at|purge_after/u);
+  const resolution = queries.find((text) => text.includes('UPDATE listener_strict_catch_up_failures'));
+  assert.match(resolution ?? '', /WITH resolution_clock AS[\s\S]*clock_timestamp\(\)[\s\S]*UPDATE/u);
+  assert.equal(resolution?.match(/clock_timestamp\(\)/gu)?.length, 1);
 });
 
 void test('leaves strict race evidence resolved in record-first and CAS-first orders', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
+    const resolutionWindowStartedAt = Date.now();
     const recordFirst = strictFailure('launchpad', null, 'primary', 50n, 30_000);
     await repository.recordStrictCatchUpFailure(recordFirst);
     const firstAdvance = checkpoint('launchpad', 50n, 'record-first-advance', 20_000);
@@ -923,34 +954,35 @@ void test('leaves strict race evidence resolved in record-first and CAS-first or
       ),
       TransactionInboxConflictError,
     );
+    const resolutionWindowFinishedAt = Date.now();
 
     const rows = await pool.query(
       `SELECT failure_id, resolved_at IS NOT NULL AS resolved,
-         (EXTRACT(EPOCH FROM resolved_at) * 1000)::bigint AS resolved_at_ms,
-         (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms
+         resolved_at, purge_after
        FROM listener_strict_catch_up_failures WHERE failure_id = ANY($1::TEXT[]) ORDER BY failure_id`,
       [[recordFirst.failureId, casFirst.failureId, failedCas.failureId]],
     );
-    assert.deepEqual(rows.rows, [
-      {
-        failure_id: casFirst.failureId, resolved: true,
-        resolved_at_ms: '26000', purge_after_ms: '14426000',
-      },
-      {
-        failure_id: failedCas.failureId, resolved: false,
-        resolved_at_ms: null, purge_after_ms: null,
-      },
-      {
-        failure_id: recordFirst.failureId, resolved: true,
-        resolved_at_ms: '30000', purge_after_ms: '14430000',
-      },
-    ].sort((left, right) => left.failure_id.localeCompare(right.failure_id)));
+    for (const failure of [recordFirst, casFirst]) {
+      const row = rows.rows.find(({ failure_id: failureId }) => failureId === failure.failureId);
+      assert.equal(row?.resolved, true);
+      assert.ok(row?.resolved_at instanceof Date);
+      assert.ok(row?.purge_after instanceof Date);
+      assert.ok(row.resolved_at.getTime() >= resolutionWindowStartedAt);
+      assert.ok(row.resolved_at.getTime() <= resolutionWindowFinishedAt);
+      assert.ok(row.resolved_at.getTime() >= failure.detectedAtMs);
+      assert.equal(row.purge_after.getTime() - row.resolved_at.getTime(), 4 * 60 * 60 * 1_000);
+    }
+    assert.deepEqual(
+      rows.rows.find(({ failure_id: failureId }) => failureId === failedCas.failureId),
+      { failure_id: failedCas.failureId, resolved: false, resolved_at: null, purge_after: null },
+    );
   });
 });
 
 void test('records immutable strict failures once and resolves only the exact nullable boundary', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
+    const lifecycleStartedAt = Date.now();
     const absentPrimary = strictFailure('launchpad', null, 'primary', 99n, 500_000);
     const absentFallback = strictFailure('launchpad', null, 'fallback-1', 99n, 500_001);
     const previous = checkpoint('launchpad', 45n, 'resolved-boundary', 499_000);
@@ -968,6 +1000,7 @@ void test('records immutable strict failures once and resolves only the exact nu
     await repository.recordStrictCatchUpFailure(otherBoundary);
     await repository.compareAndSwapCheckpoint(null, otherKeyPrevious);
     await repository.recordStrictCatchUpFailure(otherKey);
+    const lifecycleFinishedAt = Date.now();
 
     const replayed = await pool.query(
       `SELECT (EXTRACT(EPOCH FROM detected_at) * 1000)::bigint AS detected_at_ms
@@ -976,42 +1009,49 @@ void test('records immutable strict failures once and resolves only the exact nu
     );
     assert.equal(replayed.rows[0]?.detected_at_ms, '500000');
 
-    await repository.resolveStrictCatchUpFailures('launchpad', null, 700_000);
+    await repository.resolveStrictCatchUpFailures('launchpad', null);
     const rows = await pool.query(
       `SELECT failure_id, resolved_at IS NOT NULL AS resolved,
-         (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms
+         resolved_at, purge_after
        FROM listener_strict_catch_up_failures ORDER BY failure_id`,
     );
     const absentRows = rows.rows.filter((row) =>
       row.failure_id === absentPrimary.failureId || row.failure_id === absentFallback.failureId);
-    assert.deepEqual(absentRows.map((row) => ({
-      failure_id: row.failure_id, resolved: row.resolved, purge_after_ms: row.purge_after_ms,
-    })), [
-      { failure_id: absentPrimary.failureId, resolved: true, purge_after_ms: '14900000' },
-      { failure_id: absentFallback.failureId, resolved: true, purge_after_ms: '14900001' },
-    ].sort((left, right) => left.failure_id.localeCompare(right.failure_id)));
+    for (const row of [
+      ...absentRows,
+      rows.rows.find(({ failure_id: failureId }) => failureId === otherBoundary.failureId),
+    ]) {
+      assert.equal(row?.resolved, true);
+      assert.ok(row?.resolved_at instanceof Date);
+      assert.ok(row?.purge_after instanceof Date);
+      assert.ok(row.resolved_at.getTime() >= lifecycleStartedAt);
+      assert.ok(row.resolved_at.getTime() <= lifecycleFinishedAt);
+      assert.equal(row.purge_after.getTime() - row.resolved_at.getTime(), 4 * 60 * 60 * 1_000);
+    }
     assert.deepEqual(rows.rows.find((row) => row.failure_id === present.failureId), {
-      failure_id: present.failureId, resolved: false, purge_after_ms: null,
-    });
-    assert.deepEqual(rows.rows.find((row) => row.failure_id === otherBoundary.failureId), {
-      failure_id: otherBoundary.failureId, resolved: true, purge_after_ms: '14900003',
+      failure_id: present.failureId, resolved: false, resolved_at: null, purge_after: null,
     });
     assert.deepEqual(rows.rows.find((row) => row.failure_id === otherKey.failureId), {
-      failure_id: otherKey.failureId, resolved: false, purge_after_ms: null,
+      failure_id: otherKey.failureId, resolved: false, resolved_at: null, purge_after: null,
     });
 
-    await repository.resolveStrictCatchUpFailures('launchpad', previous, 700_001);
-    await repository.resolveStrictCatchUpFailures('launchpad', previous, 700_999);
+    const resolutionStartedAt = Date.now();
+    await repository.resolveStrictCatchUpFailures('launchpad', previous);
+    const resolutionFinishedAt = Date.now();
+    await repository.resolveStrictCatchUpFailures('launchpad', previous);
     const resolvedPresent = await pool.query(
-      `SELECT resolved_at IS NOT NULL AS resolved,
-         (EXTRACT(EPOCH FROM resolved_at) * 1000)::bigint AS resolved_at_ms,
-         (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms
+      `SELECT resolved_at IS NOT NULL AS resolved, resolved_at, purge_after
        FROM listener_strict_catch_up_failures WHERE failure_id = $1`,
       [present.failureId],
     );
-    assert.deepEqual(resolvedPresent.rows, [{
-      resolved: true, resolved_at_ms: '700001', purge_after_ms: '15100001',
-    }]);
+    assert.equal(resolvedPresent.rows[0]?.resolved, true);
+    assert.ok(resolvedPresent.rows[0]?.resolved_at instanceof Date);
+    assert.ok(resolvedPresent.rows[0]?.purge_after instanceof Date);
+    const resolvedAtMs = resolvedPresent.rows[0].resolved_at.getTime();
+    const purgeAfterMs = resolvedPresent.rows[0].purge_after.getTime();
+    assert.ok(resolvedAtMs >= resolutionStartedAt);
+    assert.ok(resolvedAtMs <= resolutionFinishedAt);
+    assert.equal(purgeAfterMs - resolvedAtMs, 4 * 60 * 60 * 1_000);
     const retainedOtherKey = await pool.query(
       `SELECT failure_id, resolved_at IS NOT NULL AS resolved, purge_after
        FROM listener_strict_catch_up_failures WHERE failure_id = $1`,

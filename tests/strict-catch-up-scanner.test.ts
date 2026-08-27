@@ -121,7 +121,7 @@ void test('cold start consumes exactly one bounded newest page and handles empty
   assert.deepEqual(repository.cas, [[
     null, checkpoint('launchpad', 'launch-new', 4, 9_000),
   ]]);
-  assert.deepEqual(repository.resolutions, [['market', null, 9_000]]);
+  assert.deepEqual(repository.resolutions, [['market', null]]);
   assert.deepEqual(result, {
     providerId: 'primary', discoveredCount: 2, enqueuedCount: 2,
     checkpointCasCount: 1, pageCount: 2,
@@ -294,7 +294,7 @@ void test('resolves exact unchanged and empty boundaries when no CAS is required
 
   assert.deepEqual(repository.cas, []);
   assert.deepEqual(repository.resolutions, [
-    ['launchpad', launchpad, 9_000], ['market', null, 9_000],
+    ['launchpad', launchpad], ['market', null],
   ]);
   assert.equal(result.checkpointCasCount, 0);
 });
@@ -310,7 +310,7 @@ void test('uses captured expected and newest next values for changed CAS', async
   assert.deepEqual(repository.cas, [[
     previous, checkpoint('launchpad', 'launch-head', 12, 9_000),
   ]]);
-  assert.deepEqual(repository.resolutions, [['market', null, 9_000]]);
+  assert.deepEqual(repository.resolutions, [['market', null]]);
 });
 
 void test('surfaces a transient second CAS conflict after the first CAS and replays safely', async () => {
@@ -485,7 +485,7 @@ class FakeRepository implements StrictCatchUpRepository {
   readonly enqueued: TransactionNotification[] = [];
   readonly cas: [ProcessingCheckpoint | null, ProcessingCheckpoint][] = [];
   readonly failures: StrictCatchUpFailure[] = [];
-  readonly resolutions: [ProcessingCheckpointKey, ProcessingCheckpoint | null, number][] = [];
+  readonly resolutions: [ProcessingCheckpointKey, ProcessingCheckpoint | null][] = [];
   failEnqueueAt: number | null = null;
   failCasAt: number | null = null;
   failResolveAt: number | null = null;
@@ -529,12 +529,11 @@ class FakeRepository implements StrictCatchUpRepository {
   async resolveStrictCatchUpFailures(
     key: ProcessingCheckpointKey,
     previous: ProcessingCheckpoint | null,
-    resolvedAtMs: number,
   ): Promise<void> {
     this.resolveAttempts += 1;
     this.events.push(`resolve:${key}`);
     if (this.failResolveAt === this.resolveAttempts) throw new Error('resolve-secret');
-    this.resolutions.push([key, previous, resolvedAtMs]);
+    this.resolutions.push([key, previous]);
   }
 }
 

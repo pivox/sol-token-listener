@@ -738,7 +738,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
           }
           requireOne(inserted.rowCount);
-          await resolveStrictCatchUpFailuresAt(client, next.key, null, dateFromMs(next.updatedAtMs));
+          await resolveStrictCatchUpFailuresAt(client, next.key, null);
           return;
         }
         const updated = await client.query(
@@ -758,7 +758,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
         }
         requireOne(updated.rowCount);
-        await resolveStrictCatchUpFailuresAt(client, next.key, expected, dateFromMs(next.updatedAtMs));
+        await resolveStrictCatchUpFailuresAt(client, next.key, expected);
       });
     });
   }
@@ -781,19 +781,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           throw new TypeError('Strict catch-up checkpoint query returned an invalid row count.');
         }
         const stale = !matchesCheckpointBoundary(current, value.previous);
-        const resolvedAt = stale ? staleStrictCatchUpFailureResolvedAt(value, current) : null;
         const inserted = await client.query(
-          stale
-            ? `INSERT INTO listener_strict_catch_up_failures (
-                 failure_id, checkpoint_key, previous_slot, previous_signature,
-                 provider_id, observed_head_slot, reason_code, detected_at, resolved_at, purge_after
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::timestamptz,$9::timestamptz + INTERVAL '4 hours')
-               ON CONFLICT (failure_id) DO NOTHING`
-            : `INSERT INTO listener_strict_catch_up_failures (
-                 failure_id, checkpoint_key, previous_slot, previous_signature,
-                 provider_id, observed_head_slot, reason_code, detected_at
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-               ON CONFLICT (failure_id) DO NOTHING`,
+          `INSERT INTO listener_strict_catch_up_failures (
+             failure_id, checkpoint_key, previous_slot, previous_signature,
+             provider_id, observed_head_slot, reason_code, detected_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (failure_id) DO NOTHING`,
           [
             value.failureId,
             value.checkpointKey,
@@ -803,7 +796,6 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             nullableBigInt(value.observedHeadSlot),
             value.reasonCode,
             dateFromMs(value.detectedAtMs),
-            ...(resolvedAt === null ? [] : [resolvedAt]),
           ],
         );
         requireZeroOrOne(inserted.rowCount);
@@ -819,8 +811,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
             throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
           }
         }
-        if (resolvedAt !== null) {
-          await resolveStrictCatchUpFailureById(client, value.failureId, resolvedAt);
+        if (stale) {
+          await resolveStrictCatchUpFailureById(client, value.failureId);
         }
       });
     });
@@ -829,7 +821,6 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
   public async resolveStrictCatchUpFailures(
     key: 'launchpad' | 'market',
     previous: ProcessingCheckpoint | null,
-    resolvedAtMs: number,
   ): Promise<void> {
     return this.safely(async () => {
       requireCheckpointKey(key);
@@ -837,16 +828,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         assertValidStrictCheckpoint(previous);
         if (previous.key !== key) throw new TypeError('Checkpoint keys must match.');
       }
-      if (Object.is(resolvedAtMs, -0)) {
-        throw new TypeError('Strict catch-up resolution timestamp is invalid.');
-      }
-      const resolvedAt = dateFromMs(resolvedAtMs);
       await this.transaction(async (client) => {
         await client.query(
           "SELECT pg_advisory_xact_lock(hashtextextended('transaction-checkpoint:' || $1, 0))",
           [key],
         );
-        await resolveStrictCatchUpFailuresAt(client, key, previous, resolvedAt);
+        await resolveStrictCatchUpFailuresAt(client, key, previous);
       });
     });
   }
@@ -1301,53 +1288,56 @@ function matchesCheckpointBoundary(
     && current.signature === previous.signature;
 }
 
-function staleStrictCatchUpFailureResolvedAt(
-  value: StrictCatchUpFailure,
-  current: ProcessingCheckpoint | null,
-): Date {
-  const resolvedAtMs = Math.max(value.detectedAtMs, current?.updatedAtMs ?? 0);
-  return dateFromMs(resolvedAtMs);
-}
-
 async function resolveStrictCatchUpFailuresAt(
   client: Queryable,
   key: ProcessingCheckpoint['key'],
   previous: ProcessingCheckpoint | null,
-  resolvedAt: Date,
 ): Promise<void> {
   if (previous === null) {
     await client.query(
-      `UPDATE listener_strict_catch_up_failures SET
-         resolved_at = GREATEST(detected_at, $2),
-         purge_after = GREATEST(detected_at, $2) + INTERVAL '4 hours'
-       WHERE checkpoint_key = $1
-         AND previous_slot IS NULL AND previous_signature IS NULL
-         AND resolved_at IS NULL`,
-      [key, resolvedAt],
+      `WITH resolution_clock AS (
+         SELECT clock_timestamp() AS captured_at
+       )
+       UPDATE listener_strict_catch_up_failures AS failure SET
+         resolved_at = GREATEST(failure.detected_at, resolution_clock.captured_at),
+         purge_after = GREATEST(failure.detected_at, resolution_clock.captured_at) + INTERVAL '4 hours'
+       FROM resolution_clock
+       WHERE failure.checkpoint_key = $1
+         AND failure.previous_slot IS NULL AND failure.previous_signature IS NULL
+         AND failure.resolved_at IS NULL`,
+      [key],
     );
     return;
   }
   await client.query(
-    `UPDATE listener_strict_catch_up_failures SET
-       resolved_at = GREATEST(detected_at, $4),
-       purge_after = GREATEST(detected_at, $4) + INTERVAL '4 hours'
-     WHERE checkpoint_key = $1 AND previous_slot = $2 AND previous_signature = $3
-       AND resolved_at IS NULL`,
-    [key, previous.slot.toString(), previous.signature, resolvedAt],
+    `WITH resolution_clock AS (
+       SELECT clock_timestamp() AS captured_at
+     )
+     UPDATE listener_strict_catch_up_failures AS failure SET
+       resolved_at = GREATEST(failure.detected_at, resolution_clock.captured_at),
+       purge_after = GREATEST(failure.detected_at, resolution_clock.captured_at) + INTERVAL '4 hours'
+     FROM resolution_clock
+     WHERE failure.checkpoint_key = $1
+       AND failure.previous_slot = $2 AND failure.previous_signature = $3
+       AND failure.resolved_at IS NULL`,
+    [key, previous.slot.toString(), previous.signature],
   );
 }
 
 async function resolveStrictCatchUpFailureById(
   client: Queryable,
   failureId: string,
-  resolvedAt: Date,
 ): Promise<void> {
   await client.query(
-    `UPDATE listener_strict_catch_up_failures SET
-       resolved_at = GREATEST(detected_at, $2),
-       purge_after = GREATEST(detected_at, $2) + INTERVAL '4 hours'
-     WHERE failure_id = $1 AND resolved_at IS NULL`,
-    [failureId, resolvedAt],
+    `WITH resolution_clock AS (
+       SELECT clock_timestamp() AS captured_at
+     )
+     UPDATE listener_strict_catch_up_failures AS failure SET
+       resolved_at = GREATEST(failure.detected_at, resolution_clock.captured_at),
+       purge_after = GREATEST(failure.detected_at, resolution_clock.captured_at) + INTERVAL '4 hours'
+     FROM resolution_clock
+     WHERE failure.failure_id = $1 AND failure.resolved_at IS NULL`,
+    [failureId],
   );
 }
 

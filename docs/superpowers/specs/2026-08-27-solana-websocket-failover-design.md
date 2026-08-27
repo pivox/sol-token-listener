@@ -3,8 +3,13 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.1.3
+Version: 1.1.4
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.1.4 caches only successful provider genesis validation, shares one
+in-flight validation attempt, retries after every rejection, and anchors every
+effective strict-failure resolution and its retention to one captured
+PostgreSQL clock instant.
 
 Revision 1.1.3 moves the catch-up source contract to a neutral port so the
 provider-pinned RPC adapter does not depend on application orchestration.
@@ -221,7 +226,11 @@ when the supervisor is activated. This avoids changing current startup
 configuration before the new path is complete and avoids embedding resettable
 Devnet/Testnet values. The official RPC contract returns the connected
 cluster's base58 genesis hash; a mismatch is a fixed, redacted provider
-failure. The implementation is based on the official Solana
+failure. Concurrent first pages share one in-flight validation. Only a
+successful validation is cached; RPC rejection, malformed data and mismatch
+all clear that attempt so a later `list` call performs `getGenesisHash` again.
+No signatures request starts before its own shared validation succeeds. The
+implementation is based on the official Solana
 [`getGenesisHash`](https://solana.com/docs/rpc/http/getgenesishash) and
 [`getSignaturesForAddress`](https://solana.com/docs/rpc/http/getsignaturesforaddress)
 contracts.
@@ -248,9 +257,14 @@ replays the other through the idempotent inbox.
 Failure recording, exact checkpoint CAS and explicit resolution use the same
 checkpoint-scoped database lock. A successful CAS resolves matching
 unresolved evidence in the same transaction. If a stale failure arrives after
-the boundary has already advanced, it is inserted idempotently as resolved
-with four-hour retention. No crash or record/CAS ordering can therefore leave
-obsolete evidence unresolved forever.
+the boundary has already advanced, it is inserted idempotently and resolved
+before the same transaction commits. Every effective resolution captures
+`clock_timestamp()` once in PostgreSQL; neither the scan observation time nor
+the checkpoint application timestamp controls retention. `resolved_at` is the
+later of that captured database instant and `detected_at`, and `purge_after`
+is exactly four hours after that effective resolution. No crash or record/CAS
+ordering can therefore leave obsolete evidence unresolved forever or shorten
+its post-resolution retention.
 
 `listener_strict_catch_up_failures` is distinct from voluntary
 `listener_catch_up_gaps`. Its deterministic identity covers checkpoint key,
@@ -259,8 +273,8 @@ reason. The stored provider is only the positional ID. Repeating the same
 evidence is idempotent and preserves the first detection time. A successful
 later strict scan resolves failures for the reached exact boundary. Unresolved
 rows have no purge timestamp; resolution sets `resolved_at` and
-`purge_after = resolved_at + 4 hours`. Purge deletes resolved expired rows
-only.
+`purge_after = resolved_at + 4 hours` from the same captured database clock.
+Purge deletes resolved expired rows only.
 
 The issue #60 coordinator accepts concurrent scan requests but runs at most
 one scan. Requests received while active share the current promise rather than

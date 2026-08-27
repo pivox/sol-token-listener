@@ -190,7 +190,6 @@ export class StrictCatchUpScanner {
           await this.repository.resolveStrictCatchUpFailures(
             scan.program.key,
             scan.expected,
-            observedAtMs,
           );
         } catch {
           throw this.failure('failure-resolve', scan.program.key);

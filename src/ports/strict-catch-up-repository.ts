@@ -16,6 +16,5 @@ export interface StrictCatchUpRepository {
   resolveStrictCatchUpFailures(
     key: ProcessingCheckpointKey,
     previous: ProcessingCheckpoint | null,
-    resolvedAtMs: number,
   ): Promise<void>;
 }

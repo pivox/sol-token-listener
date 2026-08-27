@@ -203,15 +203,18 @@ void test('reports a malformed actual genesis response as a fixed redacted unava
     catalog(() => pair(`https://${secret}/rpc`, 'fallback-2')), 'fallback-2', 'confirmed', EXPECTED_GENESIS,
     dependencies(() => rpc),
   );
-  await assert.rejects(source.list(PROGRAM, undefined, 1), (error: unknown) => {
-    invalid(error, 'GENESIS_UNAVAILABLE', 'fallback-2');
-    assert.doesNotMatch(JSON.stringify(error), /provider-secret|https|rpc/i);
-    return true;
-  });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await assert.rejects(source.list(PROGRAM, undefined, 1), (error: unknown) => {
+      invalid(error, 'GENESIS_UNAVAILABLE', 'fallback-2');
+      assert.doesNotMatch(JSON.stringify(error), /provider-secret|https|rpc/i);
+      return true;
+    });
+  }
+  assert.equal(rpc.genesisCalls, 2);
   assert.equal(rpc.calls.length, 0);
 });
 
-void test('reports a valid unequal genesis hash as a fixed mismatch error and never retries that source', async () => {
+void test('reports a valid unequal genesis hash as a fixed mismatch error and retries validation later', async () => {
   const rpc = new FakeRpc([], genesis(8), [page('never')]);
   const source = createProviderPinnedCatchUpSource(
     catalog(), 'primary', 'confirmed', EXPECTED_GENESIS, dependencies(() => rpc),
@@ -222,11 +225,11 @@ void test('reports a valid unequal genesis hash as a fixed mismatch error and ne
       return true;
     });
   }
-  assert.equal(rpc.genesisCalls, 1);
+  assert.equal(rpc.genesisCalls, 2);
   assert.equal(rpc.calls.length, 0);
 });
 
-void test('redacts a throwing genesis request and shares its fixed failed state with concurrent callers', async () => {
+void test('redacts a throwing genesis request, shares only the attempt, and retries later', async () => {
   const secret = 'throwing-provider-secret.invalid';
   const rpc = new FakeRpc([], EXPECTED_GENESIS, [], undefined, new Error(`https://${secret}/boom`));
   const source = createProviderPinnedCatchUpSource(
@@ -245,6 +248,34 @@ void test('redacts a throwing genesis request and shares its fixed failed state 
   }
   assert.equal(rpc.genesisCalls, 1);
   assert.equal(rpc.calls.length, 0);
+
+  await assert.rejects(source.list(PROGRAM, undefined, 1), (error: unknown) => (
+    invalid(error, 'GENESIS_UNAVAILABLE', 'primary')
+  ));
+  assert.equal(rpc.genesisCalls, 2);
+  assert.equal(rpc.calls.length, 0);
+});
+
+void test('retries a transient genesis failure and caches only the later successful validation', async () => {
+  const events: string[] = [];
+  const rpc = new FakeRpc(
+    events,
+    EXPECTED_GENESIS,
+    [page('after-retry'), page('cached-success')],
+    undefined,
+    (attempt) => attempt === 1 ? new Error('transient-provider-secret') : undefined,
+  );
+  const source = createProviderPinnedCatchUpSource(
+    catalog(), 'primary', 'confirmed', EXPECTED_GENESIS, dependencies(() => rpc),
+  );
+
+  await assert.rejects(source.list(PROGRAM, undefined, 1), (error: unknown) => (
+    invalid(error, 'GENESIS_UNAVAILABLE', 'primary')
+  ));
+  assert.deepEqual(await source.list(PROGRAM, undefined, 1), [signature('after-retry')]);
+  assert.deepEqual(await source.list(PROGRAM, 'after-retry', 1), [signature('cached-success')]);
+  assert.equal(rpc.genesisCalls, 2);
+  assert.deepEqual(events, ['genesis', 'genesis', 'signatures', 'signatures']);
 });
 
 void test('preserves fixed redacted page failures from the normalizing source', async () => {
@@ -346,7 +377,7 @@ class FakeRpc {
     private readonly actualGenesis: unknown,
     pages: unknown[],
     private readonly genesisGate?: Promise<void>,
-    private readonly genesisFailure?: Error,
+    private readonly genesisFailure?: Error | ((attempt: number) => Error | undefined),
   ) {
     this.pages = [...pages];
   }
@@ -355,7 +386,10 @@ class FakeRpc {
     this.genesisCalls += 1;
     this.events.push('genesis');
     await this.genesisGate;
-    if (this.genesisFailure !== undefined) throw this.genesisFailure;
+    const failure = typeof this.genesisFailure === 'function'
+      ? this.genesisFailure(this.genesisCalls)
+      : this.genesisFailure;
+    if (failure !== undefined) throw failure;
     return this.actualGenesis;
   }
 

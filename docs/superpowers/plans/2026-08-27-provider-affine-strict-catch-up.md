@@ -124,14 +124,14 @@ export interface StrictCatchUpRepository {
   resolveStrictCatchUpFailures(
     key: ProcessingCheckpointKey,
     previous: ProcessingCheckpoint | null,
-    resolvedAtMs: number,
   ): Promise<void>;
 }
 ```
 
 Cover absent-to-present CAS, exact present-to-next CAS, same-slot signatures,
-stale expected rows, invalid timestamps, idempotent failure replay preserving
-the first detection, boundary-specific resolution and four-hour retention.
+stale expected rows, idempotent failure replay preserving the first detection,
+boundary-specific resolution, one captured PostgreSQL resolution clock and
+four-hour retention anchored to the effective resolution.
 
 - [ ] **Step 2: Run and observe missing-method failures**
 
@@ -150,8 +150,11 @@ Translate a zero-row CAS into the existing redacted
 
 Insert strict failures with `ON CONFLICT (failure_id) DO NOTHING`, then verify
 any existing row has the same immutable identity. Resolve every unresolved row
-for the exact nullable boundary with one database clock and set four-hour
-retention.
+for the exact nullable boundary with one `clock_timestamp()` captured by a CTE.
+Use the same mechanism when a late stale failure is inserted and resolved in
+one transaction. Set `resolved_at` to at least `detected_at` and
+`purge_after = resolved_at + INTERVAL '4 hours'`; accept no resolution timestamp
+from the scanner or another application clock.
 
 - [ ] **Step 4: Run focused repository and migration tests until green**
 
@@ -180,6 +183,9 @@ provider ID plus a `CatchUpSource`. Tests must prove that the catalog resolves
 exactly once, `getGenesisHash` runs before signatures, every page uses the same
 RPC object, a canonical 32-byte base58 expected hash is required, and mismatch,
 RPC failure and hostile errors become fixed typed failures without URL leakage.
+Concurrent callers must share only the current genesis attempt; transient,
+malformed and mismatch failures must be retried by the next `list` call, while
+only successful validation remains cached.
 
 - [ ] **Step 2: Run and observe the missing-module failure**
 
@@ -209,7 +215,9 @@ export function createProviderPinnedCatchUpSource(
 The default factory constructs one `Connection` from the selected `httpUrl`
 with no failover fetch. Validate genesis once per source instance before the
 first list call, cache only a successful validation, and delegate page
-normalization to `SolanaCatchUpSource`.
+normalization to `SolanaCatchUpSource`. Publish the in-flight promise before
+calling the RPC and clear it with an identity guard after rejection so
+re-entrance or stale cleanup cannot replace a newer attempt.
 
 - [ ] **Step 4: Run the focused source tests until green**
 
