@@ -166,7 +166,9 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       for (const unknown of unknowns) {
         await insertUnknownObservation(client, progress.runId, progress.observedAtMs, unknown);
       }
-      await assertObservationLimits(client, progress.runId);
+      await assertObservationLimits(
+        client, progress.runId, before.configuration.targetClosedPositions,
+      );
       const updated = await client.query(
         `UPDATE paper_mvp_runs run SET
           creations_observed=$2,entries_rejected=$3,
@@ -416,7 +418,11 @@ async function requireMatchingObservation(
   }
 }
 
-async function assertObservationLimits(client: Client, runId: string): Promise<void> {
+async function assertObservationLimits(
+  client: Client,
+  runId: string,
+  targetClosedPositions: number,
+): Promise<void> {
   const result = await client.query(
     `SELECT
       COUNT(*) FILTER (WHERE sample_status='VALID')::integer AS valid_count,
@@ -425,7 +431,7 @@ async function assertObservationLimits(client: Client, runId: string): Promise<v
     [runId],
   );
   const row = result.rows[0];
-  if (row === undefined || safeNumber(row.valid_count) > 1_000
+  if (row === undefined || safeNumber(row.valid_count) > targetClosedPositions
     || safeNumber(row.unknown_count) > 1_000) {
     throw new PaperMvpConflictError('PROGRESS_LIMIT_EXCEEDED');
   }

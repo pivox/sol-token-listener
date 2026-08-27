@@ -191,6 +191,210 @@ void test('retries an interleaved stale collection without charging the same pos
   assert.equal(result.snapshot.run.counters.duplicateLogicalBuys, 6);
 });
 
+void test('stops an OCC retry at the refreshed target without another dependency call', async () => {
+  let snapshot = Object.freeze({
+    ...runSnapshot,
+    run: Object.freeze({
+      ...runSnapshot.run,
+      configuration: Object.freeze({ ...runSnapshot.run.configuration,targetClosedPositions:1 }),
+    }),
+  });
+  let sourceCalls = 0;
+  let providerCalls = 0;
+  let progressCalls = 0;
+  const repository: PaperMvpRepository = Object.freeze({
+    startOrResume: async () => snapshot.run,
+    load: async () => snapshot,
+    recordProgress: async () => {
+      progressCalls += 1;
+      if (progressCalls !== 1) throw new Error('progress called after target');
+      snapshot = Object.freeze({
+        ...snapshot,
+        run: Object.freeze({
+          ...snapshot.run,closedPositions:1,updatedAtMs:2_000,
+          counters:Object.freeze({
+            ...snapshot.run.counters,duplicateLogicalBuys:7,duplicateLogicalSells:3,
+          }),
+        }),
+      });
+      throw new PaperMvpConflictError('PROGRESS_SNAPSHOT_STALE');
+    },
+    terminalize: async () => snapshot.run,
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => {
+      sourceCalls += 1;
+      if (sourceCalls !== 1) throw new Error('source called after target');
+      return Object.freeze({
+        positions:Object.freeze([validFacts()]),creationsObserved:1,entriesRejected:0,
+        duplicateLogicalBuys:1,duplicateLogicalSells:0,
+      });
+    },
+  });
+  const result = await new PaperMvpCollector(repository,source,() => 2_000,Object.freeze({
+    identity:'provider:test',
+    snapshot:async () => {
+      providerCalls += 1;
+      return createProviderUsageSnapshot({
+        status:'UNAVAILABLE',creditsUsedStart:null,creditsUsedEnd:null,rateLimitedCount:0,
+      });
+    },
+  })).collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 });
+
+  assert.deepEqual(result,{
+    scanned:0,inserted:0,valid:0,unknown:0,
+    duplicateLogicalBuys:7,duplicateLogicalSells:3,
+  });
+  assert.equal(sourceCalls,1);
+  assert.equal(providerCalls,1);
+  assert.equal(progressCalls,1);
+});
+
+void test('caps the source batch at the refreshed remaining target', async () => {
+  const before = Object.freeze({
+    ...runSnapshot,
+    run:Object.freeze({
+      ...runSnapshot.run,closedPositions:49,
+      configuration:Object.freeze({
+        ...runSnapshot.run.configuration,targetClosedPositions:50,
+      }),
+    }),
+  });
+  let sourceLimit: number | undefined;
+  const repository: PaperMvpRepository = Object.freeze({
+    startOrResume: async () => before.run,
+    load: async () => before,
+    recordProgress: async (progress: Parameters<PaperMvpRepository['recordProgress']>[0]) => Object.freeze({
+      ...before.run,closedPositions:50,updatedAtMs:progress.observedAtMs,
+    }),
+    terminalize: async () => before.run,
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async (input: Parameters<PaperMvpSource['collectBatch']>[0]) => {
+      sourceLimit = input.limit;
+      return Object.freeze({
+        positions:Object.freeze([validFacts()]),creationsObserved:0,entriesRejected:0,
+        duplicateLogicalBuys:0,duplicateLogicalSells:0,
+      });
+    },
+  });
+
+  assert.equal((await new PaperMvpCollector(repository,source,() => 2_000).collect({
+    runId:'run-1',runnerOwnerId:OWNER,limit:100,
+  })).valid,1);
+  assert.equal(sourceLimit,1);
+});
+
+for (const shutdownKind of ['signal','deadline'] as const) {
+  void test(`does not overfill a live target when ${shutdownKind} collection commits late`, {
+    timeout:15_000,
+  }, async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: PostgreSQL interleaving test skipped');
+      return;
+    }
+    await withSchema(databaseUrl, async (pool) => {
+      const repository = new PostgresPaperMvpRepository(pool);
+      const configuration = Object.freeze({
+        ...runSnapshot.run.configuration,targetClosedPositions:1,
+      });
+      const run = await repository.startOrResume(configuration,OWNER,1_000);
+      let markRegularProgressEntered = ():void => {
+        assert.fail('regular progress gate was not initialized');
+      };
+      const regularProgressEntered = new Promise<void>((resolve) => {
+        markRegularProgressEntered = resolve;
+      });
+      let releaseRegularProgress = ():void => {
+        assert.fail('regular progress release was not initialized');
+      };
+      const regularProgressMayContinue = new Promise<void>((resolve) => {
+        releaseRegularProgress = resolve;
+      });
+      const delayedRepository: PaperMvpRepository = Object.freeze({
+        startOrResume: (...args: Parameters<PaperMvpRepository['startOrResume']>) => (
+          repository.startOrResume(...args)
+        ),
+        load: (...args: Parameters<PaperMvpRepository['load']>) => repository.load(...args),
+        recordProgress: async (
+          progress: Parameters<PaperMvpRepository['recordProgress']>[0],
+        ) => {
+          markRegularProgressEntered();
+          await regularProgressMayContinue;
+          return repository.recordProgress(progress);
+        },
+        terminalize: (...args: Parameters<PaperMvpRepository['terminalize']>) => (
+          repository.terminalize(...args)
+        ),
+      });
+      const regularSource: PaperMvpSource = Object.freeze({
+        collectBatch: async () => Object.freeze({
+          positions:Object.freeze([
+            Object.freeze({ ...validFacts(),positionId:`regular-${shutdownKind}` }),
+          ]),creationsObserved:0,entriesRejected:0,
+          duplicateLogicalBuys:0,duplicateLogicalSells:0,
+        }),
+      });
+      const abortController = new AbortController();
+      const regularPromise = new PaperMvpCollector(
+        delayedRepository,regularSource,() => 2_000,
+      ).collect({
+        runId:run.runId,runnerOwnerId:OWNER,limit:1,signal:abortController.signal,
+      });
+      await regularProgressEntered;
+      abortController.abort(shutdownKind === 'signal' ? 'SIGTERM' : 'RUN_DEADLINE');
+
+      let finalSourceCalls = 0;
+      let markFinalSourceEntered = ():void => {
+        assert.fail('final source gate was not initialized');
+      };
+      const finalSourceEntered = new Promise<void>((resolve) => {
+        markFinalSourceEntered = resolve;
+      });
+      let releaseFinalSource = ():void => {
+        assert.fail('final source release was not initialized');
+      };
+      const finalSourceMayContinue = new Promise<void>((resolve) => {
+        releaseFinalSource = resolve;
+      });
+      const finalSource: PaperMvpSource = Object.freeze({
+        collectBatch: async () => {
+          finalSourceCalls += 1;
+          if (finalSourceCalls === 1) {
+            markFinalSourceEntered();
+            await finalSourceMayContinue;
+          }
+          return Object.freeze({
+            positions:Object.freeze([
+              Object.freeze({ ...validFacts(),positionId:`final-${shutdownKind}` }),
+            ]),creationsObserved:0,entriesRejected:0,
+            duplicateLogicalBuys:0,duplicateLogicalSells:0,
+          });
+        },
+      });
+      const finalPromise = new PaperMvpCollector(
+        repository,finalSource,() => 2_000,
+      ).collect({ runId:run.runId,runnerOwnerId:OWNER,limit:1 });
+      await finalSourceEntered;
+      releaseRegularProgress();
+      await regularPromise;
+      releaseFinalSource();
+
+      assert.deepEqual(await finalPromise,{
+        scanned:0,inserted:0,valid:0,unknown:0,
+        duplicateLogicalBuys:0,duplicateLogicalSells:0,
+      });
+      assert.equal(finalSourceCalls,1);
+      const stored = await repository.load(run.runId);
+      assert.equal(stored?.run.closedPositions,1);
+      assert.deepEqual(stored?.samples.map((sample) => sample.positionId),[
+        `regular-${shutdownKind}`,
+      ]);
+    });
+  });
+}
+
 void test('classifies terminal source gaps and contradictions as durable unknown positions', async () => {
   const facts = validFacts();
   const positions = Object.freeze([

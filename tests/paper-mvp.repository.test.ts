@@ -306,6 +306,46 @@ void test('bounds cumulative observations without charging identical replays', a
   });
 });
 
+void test('rolls back a distinct valid sample that would exceed the immutable run target', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL run target cap test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(configuration,OWNER,1_000);
+    const first = await repository.recordProgress({
+      runId:run.runId,runnerOwnerId:OWNER,expectedUpdatedAtMs:run.updatedAtMs,
+      observedAtMs:2_000,counters:progressCounters,providerUsage:run.providerUsage,
+      samples:Object.freeze([sample()]),unknownPositions:Object.freeze([]),
+    });
+    const withUnknown = await repository.recordProgress({
+      runId:run.runId,runnerOwnerId:OWNER,expectedUpdatedAtMs:first.updatedAtMs,
+      observedAtMs:2_500,counters:progressCounters,providerUsage:first.providerUsage,
+      samples:Object.freeze([]),unknownPositions:Object.freeze([Object.freeze({
+        positionId:'target-full-unknown',reason:'MISSING_SELL_TRADE',
+      })]),
+    });
+    await assert.rejects(repository.recordProgress({
+      runId:run.runId,runnerOwnerId:OWNER,expectedUpdatedAtMs:withUnknown.updatedAtMs,
+      observedAtMs:3_000,counters:Object.freeze({ ...progressCounters,creationsObserved:2 }),
+      providerUsage:withUnknown.providerUsage,
+      samples:Object.freeze([Object.freeze({ ...sample(),positionId:'target-overflow' })]),
+      unknownPositions:Object.freeze([]),
+    }),isConflict('PROGRESS_LIMIT_EXCEEDED'));
+    const after = await repository.load(run.runId);
+    assert.ok(after);
+    assert.equal(after.run.closedPositions,1);
+    assert.equal(after.run.updatedAtMs,2_500);
+    assert.equal(after.run.counters.creationsObserved,1);
+    assert.deepEqual(after.samples.map((value) => value.positionId),['position']);
+    assert.deepEqual(after.unknownPositions,[
+      { positionId:'target-full-unknown',reason:'MISSING_SELL_TRADE' },
+    ]);
+  });
+});
+
 void test('rejects a stale progress snapshot before inserting observations', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {

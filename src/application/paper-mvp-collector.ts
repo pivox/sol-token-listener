@@ -55,13 +55,26 @@ export class PaperMvpCollector {
     if (before.run.configuration.strategyId !== 'creation-entry-v1') {
       throw new PaperMvpCollectorError('STRATEGY_UNSUPPORTED');
     }
+    const remaining = before.run.configuration.targetClosedPositions
+      - before.run.closedPositions;
+    if (remaining <= 0) {
+      return Object.freeze({
+        scanned: 0,
+        inserted: 0,
+        valid: 0,
+        unknown: 0,
+        duplicateLogicalBuys: before.run.counters.duplicateLogicalBuys,
+        duplicateLogicalSells: before.run.counters.duplicateLogicalSells,
+      });
+    }
+    const effectiveLimit = Math.min(input.limit,remaining);
     const batch = await this.source.collectBatch({
       runId: before.run.runId,
       startedAtMs: before.run.startedAtMs,
       deadlineAtMs: before.run.deadlineAtMs,
       strategyId: before.run.configuration.strategyId,
       strategyVersion: before.run.configuration.strategyVersion,
-      limit: input.limit,
+      limit: effectiveLimit,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
     input.signal?.throwIfAborted();
