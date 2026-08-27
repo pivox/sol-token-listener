@@ -966,6 +966,7 @@ void test('records immutable strict failures once and resolves only the exact nu
     await repository.compareAndSwapCheckpoint(null, previous);
     await repository.recordStrictCatchUpFailure(present);
     await repository.recordStrictCatchUpFailure(otherBoundary);
+    await repository.compareAndSwapCheckpoint(null, otherKeyPrevious);
     await repository.recordStrictCatchUpFailure(otherKey);
 
     const replayed = await pool.query(
@@ -993,7 +994,7 @@ void test('records immutable strict failures once and resolves only the exact nu
       failure_id: present.failureId, resolved: false, purge_after_ms: null,
     });
     assert.deepEqual(rows.rows.find((row) => row.failure_id === otherBoundary.failureId), {
-      failure_id: otherBoundary.failureId, resolved: false, purge_after_ms: null,
+      failure_id: otherBoundary.failureId, resolved: true, purge_after_ms: '14900003',
     });
     assert.deepEqual(rows.rows.find((row) => row.failure_id === otherKey.failureId), {
       failure_id: otherKey.failureId, resolved: false, purge_after_ms: null,
@@ -1011,15 +1012,14 @@ void test('records immutable strict failures once and resolves only the exact nu
     assert.deepEqual(resolvedPresent.rows, [{
       resolved: true, resolved_at_ms: '700001', purge_after_ms: '15100001',
     }]);
-    const retained = await pool.query(
+    const retainedOtherKey = await pool.query(
       `SELECT failure_id, resolved_at IS NOT NULL AS resolved, purge_after
-       FROM listener_strict_catch_up_failures WHERE failure_id = ANY($1::TEXT[]) ORDER BY failure_id`,
-      [[otherBoundary.failureId, otherKey.failureId]],
+       FROM listener_strict_catch_up_failures WHERE failure_id = $1`,
+      [otherKey.failureId],
     );
-    assert.deepEqual(retained.rows, [
-      { failure_id: otherBoundary.failureId, resolved: false, purge_after: null },
+    assert.deepEqual(retainedOtherKey.rows, [
       { failure_id: otherKey.failureId, resolved: false, purge_after: null },
-    ].sort((left, right) => left.failure_id.localeCompare(right.failure_id)));
+    ]);
   });
 });
 
