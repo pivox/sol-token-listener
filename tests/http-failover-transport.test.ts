@@ -30,8 +30,8 @@ void test('starts at the sticky healthy endpoint and rotates in circular order',
     },
   });
 
-  assert.equal((await fetch('https://ignored.invalid', { method: 'POST' })).status, 200);
-  assert.equal((await fetch('https://ignored.invalid', { method: 'POST' })).status, 200);
+  assert.equal((await fetch(endpoints[0].url, { method: 'POST' })).status, 200);
+  assert.equal((await fetch(endpoints[0].url, { method: 'POST' })).status, 200);
   assert.deepEqual(calls, [
     endpoints[0].url,
     endpoints[1].url,
@@ -52,19 +52,19 @@ void test('maps network rejection, degrades, fails over, and tries each endpoint
     onEvent: (event) => { events.push(event); },
   });
 
-  await assert.rejects(fetch('https://request-secret.invalid'), assertExhausted);
+  await assert.rejects(fetch(endpoints[0].url), assertExhausted);
   assert.deepEqual(calls, endpoints.map(({ url }) => url));
   assert.deepEqual(events, [
-    { type: 'rpc.http_endpoint_degraded', endpointId: 'primary', reason: 'NETWORK', cooldownMs: 1000 },
-    { type: 'rpc.http_failover', fromEndpointId: 'primary', toEndpointId: 'fallback-1', reason: 'NETWORK' },
-    { type: 'rpc.http_endpoint_degraded', endpointId: 'fallback-1', reason: 'NETWORK', cooldownMs: 1000 },
-    { type: 'rpc.http_failover', fromEndpointId: 'fallback-1', toEndpointId: 'fallback-2', reason: 'NETWORK' },
-    { type: 'rpc.http_endpoint_degraded', endpointId: 'fallback-2', reason: 'NETWORK', cooldownMs: 1000 },
-    { type: 'rpc.http_endpoints_exhausted', attemptedEndpointIds: ['primary', 'fallback-1', 'fallback-2'] },
+    { event: 'rpc.http_endpoint_degraded', endpointId: 'primary', reason: 'NETWORK', cooldownMs: 1000 },
+    { event: 'rpc.http_failover', fromEndpointId: 'primary', toEndpointId: 'fallback-1', reason: 'NETWORK' },
+    { event: 'rpc.http_endpoint_degraded', endpointId: 'fallback-1', reason: 'NETWORK', cooldownMs: 1000 },
+    { event: 'rpc.http_failover', fromEndpointId: 'fallback-1', toEndpointId: 'fallback-2', reason: 'NETWORK' },
+    { event: 'rpc.http_endpoint_degraded', endpointId: 'fallback-2', reason: 'NETWORK', cooldownMs: 1000 },
+    { event: 'rpc.http_endpoints_exhausted', attemptedEndpointIds: ['primary', 'fallback-1', 'fallback-2'] },
   ]);
 });
 
-void test('maps every transient HTTP status and returns 400 without retrying', async () => {
+void test('maps every transient status and does not rotate 400, 401, 403, or 418', async () => {
   const cases: readonly [number, RpcHttpFailureReason][] = [
     [429, 'RATE_LIMITED'],
     [502, 'BAD_GATEWAY'],
@@ -81,25 +81,27 @@ void test('maps every transient HTTP status and returns 400 without retrying', a
       fetch: async () => (++calls === 1 ? reply(status) : expected),
       onEvent: (event) => { events.push(event); },
     });
-    assert.equal(await fetch('https://ignored.invalid'), expected, String(status));
-    assert.equal(events[0]?.type, 'rpc.http_endpoint_degraded');
-    if (events[0]?.type === 'rpc.http_endpoint_degraded') assert.equal(events[0].reason, reason);
+    assert.equal(await fetch(endpoints[0].url), expected, String(status));
+    assert.equal(events[0]?.event, 'rpc.http_endpoint_degraded');
+    if (events[0]?.event === 'rpc.http_endpoint_degraded') assert.equal(events[0].reason, reason);
     assert.deepEqual(events[1], {
-      type: 'rpc.http_failover',
+      event: 'rpc.http_failover',
       fromEndpointId: 'primary',
       toEndpointId: 'fallback-1',
       reason,
     });
   }
 
-  let badRequestCalls = 0;
-  const badRequest = reply(400);
-  const fetch = createRpcHttpFailoverFetch({
-    endpoints: endpoints.slice(0, 2),
-    fetch: async () => { badRequestCalls += 1; return badRequest; },
-  });
-  assert.equal(await fetch('https://ignored.invalid'), badRequest);
-  assert.equal(badRequestCalls, 1);
+  for (const status of [400, 401, 403, 418]) {
+    let nonTransientCalls = 0;
+    const expected = reply(status);
+    const fetch = createRpcHttpFailoverFetch({
+      endpoints: endpoints.slice(0, 2),
+      fetch: async () => { nonTransientCalls += 1; return expected; },
+    });
+    assert.equal(await fetch(endpoints[0].url), expected);
+    assert.equal(nonTransientCalls, 1, String(status));
+  }
 });
 
 void test('returns an HTTP 200 JSON-RPC error body untouched and unconsumed', async () => {
@@ -111,7 +113,7 @@ void test('returns an HTTP 200 JSON-RPC error body untouched and unconsumed', as
     fetch: async () => expected,
   });
 
-  const actual = await fetch('https://ignored.invalid');
+  const actual = await fetch(endpoints[0].url);
   assert.equal(actual, expected);
   assert.equal(actual.bodyUsed, false);
   assert.deepEqual(await actual.json(), {
@@ -143,9 +145,9 @@ void test('uses strict Retry-After delta seconds, IMF-fixdate, past dates, fallb
       onEvent: (event) => { events.push(event); },
     });
 
-    await fetch('https://ignored.invalid');
+    await fetch(endpoints[0].url);
     assert.deepEqual(events[0], {
-      type: 'rpc.http_endpoint_degraded',
+      event: 'rpc.http_endpoint_degraded',
       endpointId: 'primary',
       reason: 'RATE_LIMITED',
       cooldownMs: entry.expectedMs,
@@ -164,9 +166,9 @@ void test('ignores Retry-After on non-429 responses', async () => {
     onEvent: (event) => { events.push(event); },
   });
 
-  await fetch('https://ignored.invalid');
+  await fetch(endpoints[0].url);
   assert.deepEqual(events[0], {
-    type: 'rpc.http_endpoint_degraded', endpointId: 'primary', reason: 'UNAVAILABLE', cooldownMs: 1000,
+    event: 'rpc.http_endpoint_degraded', endpointId: 'primary', reason: 'UNAVAILABLE', cooldownMs: 1000,
   });
 });
 
@@ -180,14 +182,48 @@ void test('immediately exhausts with no attempts when every endpoint is cooling'
     fetch: async () => { calls += 1; throw new Error('private'); },
     onEvent: (event) => { events.push(event); },
   });
-  await assert.rejects(fetch('https://ignored.invalid'), assertExhausted);
+  await assert.rejects(fetch(endpoints[0].url), assertExhausted);
   assert.equal(calls, 2);
 
   events.length = 0;
   currentTime = 500;
-  await assert.rejects(fetch('https://ignored.invalid'), assertExhausted);
+  await assert.rejects(fetch(endpoints[0].url), assertExhausted);
   assert.equal(calls, 2);
-  assert.deepEqual(events, [{ type: 'rpc.http_endpoints_exhausted', attemptedEndpointIds: [] }]);
+  assert.deepEqual(events, [{ event: 'rpc.http_endpoints_exhausted', attemptedEndpointIds: [] }]);
+});
+
+void test('makes an endpoint eligible again exactly when its cooldown expires', async () => {
+  let currentTime = 0;
+  let primaryCalls = 0;
+  let fallbackCalls = 0;
+  const calls: string[] = [];
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    now: () => currentTime,
+    fetch: async (input) => {
+      const url = inputUrl(input);
+      calls.push(url);
+      if (url === endpoints[0].url) {
+        primaryCalls += 1;
+        if (primaryCalls === 1) throw new Error('network');
+        return reply(200);
+      }
+      fallbackCalls += 1;
+      return fallbackCalls === 1 ? reply(200) : reply(503);
+    },
+  });
+
+  await fetch(endpoints[0].url);
+  currentTime = 500;
+  await assert.rejects(fetch(endpoints[0].url), assertExhausted);
+  currentTime = 1000;
+  assert.equal((await fetch(endpoints[0].url)).status, 200);
+  assert.deepEqual(calls, [
+    endpoints[0].url,
+    endpoints[1].url,
+    endpoints[1].url,
+    endpoints[0].url,
+  ]);
 });
 
 void test('best-effort cancels discarded responses and survives cancellation rejection', async () => {
@@ -209,7 +245,7 @@ void test('best-effort cancels discarded responses and survives cancellation rej
     },
   });
 
-  assert.equal(await fetch('https://ignored.invalid'), expected);
+  assert.equal(await fetch(endpoints[0].url), expected);
   assert.equal(firstCancelled, 1);
   assert.equal(secondCancelled, 1);
 });
@@ -229,7 +265,7 @@ void test('propagates an aborted fetch rejection unchanged and emits no events',
     onEvent: (event) => { events.push(event); },
   });
 
-  await assert.rejects(fetch('https://ignored.invalid', { signal: controller.signal }), (error: unknown) => {
+  await assert.rejects(fetch(endpoints[0].url, { signal: controller.signal }), (error: unknown) => {
     assert.equal(error, abortError);
     return true;
   });
@@ -252,7 +288,7 @@ void test('preserves method, headers, body, signal, and init while rewriting onl
     },
   });
 
-  await fetch('https://incoming.invalid/private', init);
+  await fetch(endpoints[0].url, init);
   assert.equal(calls.length, 2);
   for (const [index, call] of calls.entries()) {
     assert.equal(inputUrl(call.input), endpoints[index]?.url);
@@ -264,35 +300,83 @@ void test('preserves method, headers, body, signal, and init while rewriting onl
   }
 });
 
-void test('preserves Request input semantics without consuming its body', async () => {
+void test('preserves a Request POST body across actual failover without consuming the input', async () => {
   const requestEndpoints = Object.freeze([
     Object.freeze({ id: 'primary' as const, url: 'https://primary.invalid/rpc-key' }),
     Object.freeze({ id: 'fallback-1' as const, url: 'https://fallback.invalid/rpc-key' }),
   ] as const);
   const controller = new AbortController();
-  const input = new Request('https://incoming.invalid/private', {
+  const input = new Request(requestEndpoints[0].url, {
     method: 'POST',
     headers: { authorization: 'private' },
     body: 'body-secret',
     signal: controller.signal,
   });
-  const seen: Request[] = [];
+  const seen: {
+    readonly url: string;
+    readonly method: string;
+    readonly authorization: string | null;
+    readonly body: string;
+    readonly aborted: boolean;
+  }[] = [];
   const fetch = createRpcHttpFailoverFetch({
     endpoints: requestEndpoints,
     fetch: async (received) => {
       assert.ok(received instanceof Request);
-      seen.push(received);
-      return reply(200);
+      seen.push({
+        url: received.url,
+        method: received.method,
+        authorization: received.headers.get('authorization'),
+        body: await received.text(),
+        aborted: received.signal.aborted,
+      });
+      return seen.length === 1 ? reply(503) : reply(200);
     },
   });
 
   await fetch(input);
   assert.equal(input.bodyUsed, false);
-  assert.equal(seen[0]?.url, requestEndpoints[0].url);
-  assert.equal(seen[0]?.method, 'POST');
-  assert.equal(seen[0]?.headers.get('authorization'), 'private');
-  assert.equal(seen[0]?.signal.aborted, false);
-  assert.equal(await seen[0]?.text(), 'body-secret');
+  assert.deepEqual(seen, [
+    {
+      url: requestEndpoints[0].url,
+      method: 'POST',
+      authorization: 'private',
+      body: 'body-secret',
+      aborted: false,
+    },
+    {
+      url: requestEndpoints[1].url,
+      method: 'POST',
+      authorization: 'private',
+      body: 'body-secret',
+      aborted: false,
+    },
+  ]);
+});
+
+void test('rejects a non-primary string or Request input without fetching, events, or body use', async () => {
+  let calls = 0;
+  const events: RpcHttpFailoverEvent[] = [];
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    fetch: async () => { calls += 1; return reply(200); },
+    onEvent: (event) => { events.push(event); },
+  });
+  const mismatchedRequest = new Request('https://request-secret.invalid/private', {
+    method: 'POST', body: 'body-secret',
+  });
+
+  for (const input of ['https://arbitrary-secret.invalid/key', mismatchedRequest]) {
+    await assert.rejects(fetch(input), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message, 'HTTP RPC request URL must match the configured primary endpoint.');
+      assert.doesNotMatch(String(error), /secret|arbitrary|invalid|key|body/iu);
+      return true;
+    });
+  }
+  assert.equal(mismatchedRequest.bodyUsed, false);
+  assert.equal(calls, 0);
+  assert.deepEqual(events, []);
 });
 
 void test('emits closed, frozen, fixed-ID events and a frozen redacted exhaustion error', async () => {
@@ -303,7 +387,7 @@ void test('emits closed, frozen, fixed-ID events and a frozen redacted exhaustio
     onEvent: (event) => { events.push(event); },
   });
 
-  await assert.rejects(fetch('https://incoming-secret.invalid/key'), (error: unknown) => {
+  await assert.rejects(fetch(endpoints[0].url), (error: unknown) => {
     assert.ok(error instanceof RpcHttpEndpointsExhaustedError);
     assert.equal(error.name, 'RpcHttpEndpointsExhaustedError');
     assert.equal(error.code, 'RPC_HTTP_ENDPOINTS_EXHAUSTED');
@@ -317,12 +401,12 @@ void test('emits closed, frozen, fixed-ID events and a frozen redacted exhaustio
   for (const event of events) {
     assert.equal(Object.isFrozen(event), true);
     assert.doesNotMatch(JSON.stringify(event), /secret|provider|hostname|original|invalid|rpc-key/iu);
-    if (event.type === 'rpc.http_endpoint_degraded') assert.ok(allowedIds.includes(event.endpointId));
-    if (event.type === 'rpc.http_failover') {
+    if (event.event === 'rpc.http_endpoint_degraded') assert.ok(allowedIds.includes(event.endpointId));
+    if (event.event === 'rpc.http_failover') {
       assert.ok(allowedIds.includes(event.fromEndpointId));
       assert.ok(allowedIds.includes(event.toEndpointId));
     }
-    if (event.type === 'rpc.http_endpoints_exhausted') {
+    if (event.event === 'rpc.http_endpoints_exhausted') {
       assert.equal(Object.isFrozen(event.attemptedEndpointIds), true);
     }
   }
@@ -337,18 +421,21 @@ void test('isolates callback failures from failover behavior', async () => {
     onEvent: () => { throw new Error('callback failure'); },
   });
 
-  assert.equal(await fetch('https://ignored.invalid'), expected);
+  assert.equal(await fetch(endpoints[0].url), expected);
   assert.equal(calls, 2);
 });
 
-void test('validates endpoint count, IDs, URLs, and uniqueness with fixed secret-free errors', () => {
+void test('validates endpoint count, positional IDs, and canonical URL uniqueness with fixed errors', () => {
   const cases: readonly { readonly endpoints: readonly unknown[]; readonly message: string }[] = [
     { endpoints: [], message: 'HTTP RPC failover requires between 2 and 4 endpoints.' },
     { endpoints: [endpoints[0]], message: 'HTTP RPC failover requires between 2 and 4 endpoints.' },
     { endpoints: [...endpoints, { id: 'fallback-3', url: 'https://four.invalid' }, { id: 'primary', url: 'https://five.invalid' }], message: 'HTTP RPC failover requires between 2 and 4 endpoints.' },
     { endpoints: [endpoints[0], { id: 'fallback-9', url: 'https://secret.invalid' }], message: 'HTTP RPC endpoint identifier is invalid.' },
     { endpoints: [endpoints[0], { id: 'primary', url: 'https://secret.invalid' }], message: 'HTTP RPC endpoint identifiers must be unique.' },
+    { endpoints: [endpoints[1], endpoints[0]], message: 'HTTP RPC endpoint identifier does not match its position.' },
+    { endpoints: [endpoints[0], endpoints[2]], message: 'HTTP RPC endpoint identifier does not match its position.' },
     { endpoints: [endpoints[0], { id: 'fallback-1', url: endpoints[0].url }], message: 'HTTP RPC endpoint URLs must be unique.' },
+    { endpoints: [{ id: 'primary', url: 'https://same.invalid' }, { id: 'fallback-1', url: 'https://same.invalid/' }], message: 'HTTP RPC endpoint URLs must be unique.' },
     { endpoints: [endpoints[0], { id: 'fallback-1', url: '' }], message: 'HTTP RPC endpoint URL is invalid.' },
     { endpoints: [endpoints[0], null], message: 'HTTP RPC endpoint is invalid.' },
   ];
@@ -364,6 +451,24 @@ void test('validates endpoint count, IDs, URLs, and uniqueness with fixed secret
       },
     );
   }
+});
+
+void test('canonicalizes configured and incoming URLs before matching and attempts', async () => {
+  const canonicalEndpoints = Object.freeze([
+    Object.freeze({ id: 'primary' as const, url: 'https://PRIMARY.invalid:443' }),
+    Object.freeze({ id: 'fallback-1' as const, url: 'https://FALLBACK.invalid:443/rpc' }),
+  ] as const);
+  const calls: string[] = [];
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: canonicalEndpoints,
+    fetch: async (input) => {
+      calls.push(inputUrl(input));
+      return calls.length === 1 ? reply(503) : reply(200);
+    },
+  });
+
+  await fetch(new URL('https://primary.invalid/'));
+  assert.deepEqual(calls, ['https://primary.invalid/', 'https://fallback.invalid/rpc']);
 });
 
 void test('validates malformed options and injected functions with fixed errors', () => {
@@ -387,39 +492,57 @@ void test('validates malformed options and injected functions with fixed errors'
   }
 });
 
-void test('shares cooldown state so a later concurrent request avoids a just-degraded endpoint', async () => {
-  let releasePrimary: (() => void) | undefined;
-  const primaryStarted = new Promise<void>((resolve) => { releasePrimary = resolve; });
-  let resolvePrimaryFailure: (() => void) | undefined;
-  const primaryFailure = new Promise<void>((resolve) => { resolvePrimaryFailure = resolve; });
+void test('deduplicates concurrent degradation and retains the longest cooldown deadline', async () => {
+  const firstPrimary = deferred<Response>();
+  const secondPrimary = deferred<Response>();
   const calls: string[] = [];
-  let launchLater: (() => void) | undefined;
-  const degraded = new Promise<void>((resolve) => { launchLater = resolve; });
+  const events: RpcHttpFailoverEvent[] = [];
+  let currentTime = 0;
+  let primaryCalls = 0;
+  let fallbackCalls = 0;
   const fetch = createRpcHttpFailoverFetch({
     endpoints: endpoints.slice(0, 2),
+    now: () => currentTime,
     fetch: async (input) => {
       const url = inputUrl(input);
       calls.push(url);
       if (url === endpoints[0].url) {
-        releasePrimary?.();
-        await primaryFailure;
-        throw new Error('network');
+        primaryCalls += 1;
+        if (primaryCalls === 1) return firstPrimary.promise;
+        if (primaryCalls === 2) return secondPrimary.promise;
+        return reply(200);
       }
-      return reply(200);
+      fallbackCalls += 1;
+      return fallbackCalls <= 2 ? reply(200) : reply(503);
     },
-    onEvent: (event) => {
-      if (event.type === 'rpc.http_endpoint_degraded' && event.endpointId === 'primary') launchLater?.();
-    },
+    onEvent: (event) => { events.push(event); },
   });
 
-  const first = fetch('https://first.invalid');
-  await primaryStarted;
-  resolvePrimaryFailure?.();
-  await degraded;
-  const second = fetch('https://second.invalid');
-  await Promise.all([first, second]);
+  const first = fetch(endpoints[0].url);
+  const second = fetch(endpoints[0].url);
+  assert.equal(primaryCalls, 2);
+  firstPrimary.reject(new Error('network'));
+  await first;
+  currentTime = 100;
+  secondPrimary.resolve(reply(429, { headers: { 'retry-after': '5' } }));
+  await second;
 
-  assert.deepEqual(calls, [endpoints[0].url, endpoints[1].url, endpoints[1].url]);
+  const primaryDegraded = events.filter((event) => (
+    event.event === 'rpc.http_endpoint_degraded' && event.endpointId === 'primary'
+  ));
+  assert.deepEqual(primaryDegraded, [{
+    event: 'rpc.http_endpoint_degraded',
+    endpointId: 'primary',
+    reason: 'NETWORK',
+    cooldownMs: 1000,
+  }]);
+
+  currentTime = 2000;
+  await assert.rejects(fetch(endpoints[0].url), assertExhausted);
+  assert.equal(primaryCalls, 2);
+  currentTime = 5100;
+  assert.equal((await fetch(endpoints[0].url)).status, 200);
+  assert.equal(primaryCalls, 3);
 });
 
 function reply(status: number, init: Omit<ResponseInit, 'status'> = {}): Response {
@@ -441,6 +564,24 @@ function assertExhausted(error: unknown): boolean {
   assert.ok(error instanceof RpcHttpEndpointsExhaustedError);
   assert.equal(error.code, 'RPC_HTTP_ENDPOINTS_EXHAUSTED');
   return true;
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+  readonly reject: (error: unknown) => void;
+} {
+  let resolvePromise: ((value: T) => void) | undefined;
+  let rejectPromise: ((error: unknown) => void) | undefined;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return {
+    promise,
+    resolve: (value: T): void => { resolvePromise?.(value); },
+    reject: (error: unknown): void => { rejectPromise?.(error); },
+  };
 }
 
 const _fetchTypeCheck: FetchFn = createRpcHttpFailoverFetch({ endpoints: endpoints.slice(0, 2) });

@@ -14,19 +14,19 @@ export type RpcHttpEndpointId = 'primary' | `fallback-${1 | 2 | 3}`;
 
 export type RpcHttpFailoverEvent =
   | Readonly<{
-    type: 'rpc.http_endpoint_degraded';
+    event: 'rpc.http_endpoint_degraded';
     endpointId: RpcHttpEndpointId;
     reason: RpcHttpFailureReason;
     cooldownMs: number;
   }>
   | Readonly<{
-    type: 'rpc.http_failover';
+    event: 'rpc.http_failover';
     fromEndpointId: RpcHttpEndpointId;
     toEndpointId: RpcHttpEndpointId;
     reason: RpcHttpFailureReason;
   }>
   | Readonly<{
-    type: 'rpc.http_endpoints_exhausted';
+    event: 'rpc.http_endpoints_exhausted';
     attemptedEndpointIds: readonly RpcHttpEndpointId[];
   }>;
 
@@ -82,6 +82,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
   let stickyIndex = 0;
 
   return async (input, init): Promise<Response> => {
+    requirePrimaryInput(input, states[0]?.url);
     const startIndex = stickyIndex;
     const attemptedIndices = new Set<number>();
     const attemptedEndpointIds: RpcHttpEndpointId[] = [];
@@ -91,7 +92,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
       const endpointIndex = nextEligibleIndex(states, startIndex, attemptedIndices, now());
       if (endpointIndex === undefined) {
         emit(onEvent, Object.freeze({
-          type: 'rpc.http_endpoints_exhausted',
+          event: 'rpc.http_endpoints_exhausted',
           attemptedEndpointIds: Object.freeze([...attemptedEndpointIds]),
         }));
         throw new RpcHttpEndpointsExhaustedError();
@@ -101,7 +102,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
       if (endpoint === undefined) throw new RpcHttpEndpointsExhaustedError();
       if (lastFailure !== undefined) {
         emit(onEvent, Object.freeze({
-          type: 'rpc.http_failover',
+          event: 'rpc.http_failover',
           fromEndpointId: lastFailure.endpointId,
           toEndpointId: endpoint.id,
           reason: lastFailure.reason,
@@ -160,13 +161,21 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
     if (typeof value.id !== 'string' || !validEndpointIds.has(value.id)) {
       throw new TypeError('HTTP RPC endpoint identifier is invalid.');
     }
-    if (typeof value.url !== 'string' || !validHttpUrl(value.url)) {
+    if (typeof value.url !== 'string') {
       throw new TypeError('HTTP RPC endpoint URL is invalid.');
     }
-    endpoints.push(Object.freeze({ id: value.id as RpcHttpEndpointId, url: value.url }));
+    const canonicalUrl = canonicalHttpUrl(value.url);
+    if (canonicalUrl === undefined) throw new TypeError('HTTP RPC endpoint URL is invalid.');
+    endpoints.push(Object.freeze({ id: value.id as RpcHttpEndpointId, url: canonicalUrl }));
   }
   if (new Set(endpoints.map(({ id }) => id)).size !== endpoints.length) {
     throw new TypeError('HTTP RPC endpoint identifiers must be unique.');
+  }
+  for (const [index, endpoint] of endpoints.entries()) {
+    const expectedId: RpcHttpEndpointId = index === 0 ? 'primary' : `fallback-${index}` as RpcHttpEndpointId;
+    if (endpoint.id !== expectedId) {
+      throw new TypeError('HTTP RPC endpoint identifier does not match its position.');
+    }
   }
   if (new Set(endpoints.map(({ url }) => url)).size !== endpoints.length) {
     throw new TypeError('HTTP RPC endpoint URLs must be unique.');
@@ -188,12 +197,23 @@ function validateOptions(options: RpcHttpFailoverFetchOptions): RpcHttpFailoverF
   });
 }
 
-function validHttpUrl(value: string): boolean {
+function canonicalHttpUrl(value: string): string | undefined {
   try {
     const url = new URL(value);
-    return (url.protocol === 'http:' || url.protocol === 'https:') && url.href.length > 0;
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined;
+    return url.toString();
   } catch {
-    return false;
+    return undefined;
+  }
+}
+
+function requirePrimaryInput(input: FetchInput, primaryUrl: string | undefined): void {
+  let inputUrl: string;
+  if (typeof input === 'string') inputUrl = input;
+  else if (input instanceof URL) inputUrl = input.toString();
+  else inputUrl = input.url;
+  if (primaryUrl === undefined || canonicalHttpUrl(inputUrl) !== primaryUrl) {
+    throw new TypeError('HTTP RPC request URL must match the configured primary endpoint.');
   }
 }
 
@@ -256,9 +276,11 @@ function degrade(
   degradedAt: number,
   onEvent: ((event: RpcHttpFailoverEvent) => void) | undefined,
 ): void {
-  endpoint.cooldownUntil = degradedAt + cooldownMs;
+  const alreadyCooling = endpoint.cooldownUntil > degradedAt;
+  endpoint.cooldownUntil = Math.max(endpoint.cooldownUntil, degradedAt + cooldownMs);
+  if (alreadyCooling) return;
   emit(onEvent, Object.freeze({
-    type: 'rpc.http_endpoint_degraded',
+    event: 'rpc.http_endpoint_degraded',
     endpointId: endpoint.id,
     reason,
     cooldownMs,
