@@ -435,16 +435,28 @@ async function completeAndExport(
   dependencies: PaperMvpRunnerDependencies,
   lease: PaperMvpRunnerLease,
 ): Promise<PaperMvpRunResult> {
-  const canonicalTerminalAtMs = Math.max(terminalAtMs, snapshot.run.updatedAtMs);
-  const candidate = reportFromSnapshot(snapshot, canonicalTerminalAtMs, completionReason);
+  let current = snapshot;
+  let canonicalTerminalAtMs = Math.max(terminalAtMs, current.run.updatedAtMs);
+  let candidate = reportFromSnapshot(current, canonicalTerminalAtMs, completionReason);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    assertRunnerOwnership(lease);
+    try {
+      await repository.terminalize({
+        runId: current.run.runId, runnerOwnerId: lease.ownerId,
+        terminalAtMs: canonicalTerminalAtMs, state: 'COMPLETED', completionReason,
+        report: candidate, failureCode: null,
+      });
+      break;
+    } catch (error: unknown) {
+      if (!hasCode(error, 'TERMINALIZATION_CONTRADICTION') || attempt === 2) throw error;
+      assertRunnerOwnership(lease);
+      current = await requiredRunningSnapshot(repository, current.run.runId);
+      canonicalTerminalAtMs = Math.max(canonicalTerminalAtMs,current.run.updatedAtMs);
+      candidate = reportFromSnapshot(current,canonicalTerminalAtMs,completionReason);
+    }
+  }
   assertRunnerOwnership(lease);
-  await repository.terminalize({
-    runId: snapshot.run.runId, runnerOwnerId: lease.ownerId,
-    terminalAtMs: canonicalTerminalAtMs, state: 'COMPLETED', completionReason,
-    report: candidate, failureCode: null,
-  });
-  assertRunnerOwnership(lease);
-  const durable = await repository.load(snapshot.run.runId);
+  const durable = await repository.load(current.run.runId);
   assertRunnerOwnership(lease);
   if (
     durable?.run.state !== 'COMPLETED'

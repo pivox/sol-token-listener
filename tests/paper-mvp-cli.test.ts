@@ -335,6 +335,32 @@ void test('first signal aborts the current collection and a second signal forces
   assert.equal(aborts,2);
 });
 
+void test('rebuilds an interrupted report when an already-started late progress wins the row lock', async () => {
+  class InterleavedRepository extends MemoryRepository {
+    public completedAttempts = 0;
+    public override async terminalize(value: PaperMvpTerminalization): Promise<PaperMvpRun> {
+      if (value.state === 'COMPLETED' && this.completedAttempts++ === 0) {
+        this.addSample(sample());
+        const error = new Error('late progress') as Error & { code: string };
+        error.code = 'TERMINALIZATION_CONTRADICTION';
+        throw error;
+      }
+      return super.terminalize(value);
+    }
+  }
+  const repository = new InterleavedRepository();
+  const result = await runPaperMvp(options(), {
+    ...dependencies(repository),
+    createCollector: () => ({ collect: async () => emptyCollection() }),
+    createStopController: () => stopController('SIGINT'),
+  });
+  assert.equal(repository.completedAttempts,2);
+  assert.equal(result.report?.completionReason,'SIGINT');
+  assert.equal(result.report?.closedPositions,1);
+  assert.equal(result.report?.verdict,'FAIL');
+  assert.equal(result.exitCode,2);
+});
+
 void test('lease loss aborts a never-settling collection without terminalization or report', async () => {
   const repository = new MemoryRepository();
   const controlled = controlledRunnerLease();

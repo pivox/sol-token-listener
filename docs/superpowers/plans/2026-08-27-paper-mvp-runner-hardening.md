@@ -318,4 +318,4 @@ git commit -m "docs: explain paper MVP runner completion (#49)"
 - [x] Retain active-run launch and rejected-candidate coverage inputs.
 - [x] Add migration 022 coverage indexes and bounded materialized sets.
 - [x] Validate provider credits as hostile-safe unsigned `NUMERIC(78,0)` values.
-- [ ] Run the complete PostgreSQL-backed and frontend verification matrix.
+- [x] Run the complete PostgreSQL-backed and frontend verification matrix.
