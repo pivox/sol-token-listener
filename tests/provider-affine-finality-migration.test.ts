@@ -26,17 +26,16 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
       .sort((left, right) => left.localeCompare(right));
     assert.equal(legacyNames.at(-1), '026_listener_strict_catch_up_failures.sql');
     for (const name of legacyNames) await pool.query(await readFile(new URL(name, migrationsDirectory), 'utf8'));
-    await pool.query(`CREATE TABLE migration_history (
-      version TEXT PRIMARY KEY,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`);
     for (const version of legacyNames) {
-      await pool.query('INSERT INTO migration_history(version) VALUES ($1)', [version]);
+      await pool.query(
+        'INSERT INTO migration_history(version) VALUES ($1) ON CONFLICT (version) DO NOTHING',
+        [version],
+      );
     }
-    await insertInbox(pool, 'legacy-positive', 3, null);
+    await insertLegacyInbox(pool, 'legacy-positive', 3);
 
     const sql = await readFile(migrationUrl, 'utf8');
-    await pool.query(sql);
+    assert.deepEqual(await migrateDatabase({ pool }), [migrationName]);
     assert.deepEqual((await pool.query(`SELECT missing_finality_polls,
       last_missing_finality_provider_id, finality_evidence_version::TEXT AS finality_evidence_version
       FROM chain_transaction_inbox WHERE signature = 'legacy-positive'`)).rows, [{
@@ -61,7 +60,32 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
     )`, [programId]));
 
     await pool.query(sql);
-    await pool.query('INSERT INTO migration_history(version) VALUES ($1)', [migrationName]);
+    assert.deepEqual((await pool.query(`SELECT missing_finality_polls,
+      last_missing_finality_provider_id,
+      finality_evidence_version::TEXT AS finality_evidence_version
+      FROM chain_transaction_inbox WHERE signature LIKE 'valid-%'
+      ORDER BY signature`)).rows, [
+      {
+        missing_finality_polls: 1,
+        last_missing_finality_provider_id: 'fallback-1',
+        finality_evidence_version: '0',
+      },
+      {
+        missing_finality_polls: 1,
+        last_missing_finality_provider_id: 'fallback-2',
+        finality_evidence_version: '0',
+      },
+      {
+        missing_finality_polls: 1,
+        last_missing_finality_provider_id: 'fallback-3',
+        finality_evidence_version: '0',
+      },
+      {
+        missing_finality_polls: 1,
+        last_missing_finality_provider_id: 'primary',
+        finality_evidence_version: '0',
+      },
+    ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
   } finally {
     await pool.end();
@@ -84,6 +108,21 @@ async function insertInbox(
     programId,
     missingFinalityPolls,
     providerId,
+  ]);
+}
+
+async function insertLegacyInbox(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+  missingFinalityPolls: number,
+): Promise<void> {
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
+    processing_status, missing_finality_polls, observed_at
+  ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY[$2], 'confirmed', 'PENDING', $3, NOW())`, [
+    signature,
+    programId,
+    missingFinalityPolls,
   ]);
 }
 

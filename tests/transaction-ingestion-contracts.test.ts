@@ -8,6 +8,7 @@ import {
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import {
   LISTENER_RUNTIME_STATES,
+  MAX_FINALITY_EVIDENCE_VERSION,
   TRANSACTION_INBOX_RECOVERY_RESULT_CODES,
   MAX_TRANSACTION_SNAPSHOT_ARRAY_LENGTH,
   MAX_TRANSACTION_SNAPSHOT_DEPTH,
@@ -666,12 +667,18 @@ void test('rejects incoherent, unproven and accessor-backed finality evidence', 
     finalityEvidenceVersion: 7n,
     processedAtMs: observedAtMs,
   });
+  assert.doesNotThrow(() => { assertValidFinalityCandidate(Object.freeze({
+    ...candidate,
+    finalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION,
+  })); });
   for (const value of [
     Object.freeze({ ...candidate, missingFinalityPolls: 0 }),
     Object.freeze({ ...candidate, lastMissingFinalityProviderId: null }),
     Object.freeze({ ...candidate, lastMissingFinalityProviderId: 'fallback-4' }),
     Object.freeze({ ...candidate, finalityEvidenceVersion: -1n }),
-    Object.freeze({ ...candidate, finalityEvidenceVersion: 9_223_372_036_854_775_808n }),
+    Object.freeze({ ...candidate, finalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION + 1n }),
+    Object.freeze({ ...candidate, finalityEvidenceVersion: 7 }),
+    Object.freeze({ ...candidate, finalityEvidenceVersion: '7' }),
   ]) {
     assert.throws(() => { assertValidFinalityCandidate(value); }, /Finality candidate/u);
   }
@@ -684,12 +691,21 @@ void test('rejects incoherent, unproven and accessor-backed finality evidence', 
     expectedFinalityEvidenceVersion: 8n,
     observedAtMs,
   });
+  assert.doesNotThrow(() => { assertValidFinalityPollObservation(Object.freeze({
+    ...observation,
+    expectedFinalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION,
+  })); });
   for (const value of [
     Object.freeze({ ...observation, expectedMissingFinalityPolls: 0 }),
     Object.freeze({ ...observation, expectedLastMissingFinalityProviderId: null }),
     Object.freeze({ ...observation, providerId: 'fallback-4' }),
     Object.freeze({ ...observation, expectedFinalityEvidenceVersion: -1n }),
-    Object.freeze({ ...observation, expectedFinalityEvidenceVersion: 9_223_372_036_854_775_808n }),
+    Object.freeze({
+      ...observation,
+      expectedFinalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION + 1n,
+    }),
+    Object.freeze({ ...observation, expectedFinalityEvidenceVersion: 8 }),
+    Object.freeze({ ...observation, expectedFinalityEvidenceVersion: '8' }),
   ]) {
     assert.throws(() => { assertValidFinalityPollObservation(value); }, /Finality poll/u);
   }
@@ -716,6 +732,10 @@ void test('rejects malformed finality revision proof branches', () => {
     expectedFinalityEvidenceVersion: 8n,
     observedAtMs,
   });
+  assert.doesNotThrow(() => { assertValidFinalityRevision(Object.freeze({
+    ...orphaned,
+    expectedFinalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION,
+  })); });
   assert.throws(() => { assertValidFinalityRevision(Object.freeze({
     ...finalized,
     expectedMissingFinalityPolls: 3,
@@ -725,7 +745,12 @@ void test('rejects malformed finality revision proof branches', () => {
     Object.freeze({ ...orphaned, expectedMissingFinalityPolls: 0 }),
     Object.freeze({ ...orphaned, expectedLastMissingFinalityProviderId: 'fallback-4' }),
     Object.freeze({ ...orphaned, expectedFinalityEvidenceVersion: -1n }),
-    Object.freeze({ ...orphaned, expectedFinalityEvidenceVersion: 9_223_372_036_854_775_808n }),
+    Object.freeze({
+      ...orphaned,
+      expectedFinalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION + 1n,
+    }),
+    Object.freeze({ ...orphaned, expectedFinalityEvidenceVersion: 8 }),
+    Object.freeze({ ...orphaned, expectedFinalityEvidenceVersion: '8' }),
   ]) {
     assert.throws(() => { assertValidFinalityRevision(value); }, /Finality revision/u);
   }

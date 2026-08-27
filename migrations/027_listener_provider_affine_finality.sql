@@ -22,6 +22,7 @@ BEGIN
           AND last_missing_finality_provider_id IS NULL)
         OR
         (missing_finality_polls > 0
+          AND last_missing_finality_provider_id IS NOT NULL
           AND last_missing_finality_provider_id IN (
             'primary', 'fallback-1', 'fallback-2', 'fallback-3'
           ))
