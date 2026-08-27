@@ -141,17 +141,20 @@ void test('enforces strict failure lifecycle and finite numeric boundaries in Po
       }),
       resolvedAtOrLifecycle,
     );
+    // An infinite purge timestamp violates its finite bound and cannot satisfy
+    // the lifecycle equation with a finite resolved timestamp.
+    const purgeAfterOrLifecycle = /listener_strict_catch_up_failures_(?:purge_after|lifecycle)_check/u;
     await assert.rejects(
       insert(`${prefix}${'1'.repeat(64)}`, {
         resolvedAt: '2025-01-01T00:00:00.000Z', purgeAfter: 'infinity',
       }),
-      /listener_strict_catch_up_failures_purge_after_check/u,
+      purgeAfterOrLifecycle,
     );
     await assert.rejects(
       insert(`${prefix}${'2'.repeat(64)}`, {
         resolvedAt: '2025-01-01T00:00:00.000Z', purgeAfter: '-infinity',
       }),
-      /listener_strict_catch_up_failures_purge_after_check/u,
+      purgeAfterOrLifecycle,
     );
     await insert(`${prefix}${'3'.repeat(64)}`, {
       resolvedAt: '2025-01-01T00:00:00.000Z',

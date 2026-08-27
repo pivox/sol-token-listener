@@ -983,10 +983,12 @@ void test('records immutable strict failures once and resolves only the exact nu
     );
     const absentRows = rows.rows.filter((row) =>
       row.failure_id === absentPrimary.failureId || row.failure_id === absentFallback.failureId);
-    assert.deepEqual(absentRows.map((row) => ({ resolved: row.resolved, purge_after_ms: row.purge_after_ms })), [
-      { resolved: true, purge_after_ms: '15100000' },
-      { resolved: true, purge_after_ms: '15100000' },
-    ]);
+    assert.deepEqual(absentRows.map((row) => ({
+      failure_id: row.failure_id, resolved: row.resolved, purge_after_ms: row.purge_after_ms,
+    })), [
+      { failure_id: absentPrimary.failureId, resolved: true, purge_after_ms: '14900000' },
+      { failure_id: absentFallback.failureId, resolved: true, purge_after_ms: '14900001' },
+    ].sort((left, right) => left.failure_id.localeCompare(right.failure_id)));
     assert.deepEqual(rows.rows.find((row) => row.failure_id === present.failureId), {
       failure_id: present.failureId, resolved: false, purge_after_ms: null,
     });
