@@ -376,17 +376,28 @@ void test('guards orphan revisions with the complete finality proof and accepts 
       expectedFinalityEvidenceVersion: 4n, observedAtMs: 201_004,
     }));
     assert.equal(proof.missingFinalityPolls, 3);
-    await pool.query(
-      `UPDATE chain_transaction_inbox
-       SET target_confirmation_status = 'processed'
-       WHERE signature = 'proof'`,
-    );
-    await assert.rejects(repository.enqueueRevision(orphanRevision(proof, 201_004)), TransactionInboxConflictError);
-    await pool.query(
-      `UPDATE chain_transaction_inbox
-       SET target_confirmation_status = 'confirmed'
-       WHERE signature = 'proof'`,
-    );
+    const currentTuple = await finalityRowTuple(pool, 'proof');
+    for (const staleRevision of [
+      Object.freeze({
+        ...orphanRevision(proof, 201_004),
+        expectedMissingFinalityPolls: proof.missingFinalityPolls - 1,
+      }),
+      Object.freeze({
+        ...orphanRevision(proof, 201_005),
+        expectedLastMissingFinalityProviderId: 'fallback-1' as const,
+      }),
+      Object.freeze({
+        ...orphanRevision(proof, 201_006),
+        expectedFinalityEvidenceVersion: proof.finalityEvidenceVersion - 1n,
+      }),
+      Object.freeze({
+        ...orphanRevision(proof, 201_007),
+        expectedConfirmationStatus: 'processed' as const,
+      }),
+    ]) {
+      await assertFinalityConflict(repository.enqueueRevision(staleRevision));
+      assert.deepEqual(await finalityRowTuple(pool, 'proof'), currentTuple);
+    }
     await assert.rejects(repository.recordFinalityPoll(Object.freeze({
       signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
       expectedMissingFinalityPolls: 2, expectedLastMissingFinalityProviderId: 'primary' as const,
@@ -433,7 +444,9 @@ void test('guards orphan revisions with the complete finality proof and accepts 
       lastMissingFinalityProviderId: proof.lastMissingFinalityProviderId,
       finalityEvidenceVersion: 9n,
     });
-    await assert.rejects(repository.enqueueRevision(orphanRevision(proof, 201_012)), TransactionInboxConflictError);
+    const abaTuple = await finalityRowTuple(pool, 'proof');
+    await assertFinalityConflict(repository.enqueueRevision(orphanRevision(proof, 201_012)));
+    assert.deepEqual(await finalityRowTuple(pool, 'proof'), abaTuple);
 
     await repository.enqueueRevision(orphanRevision(aba, 201_013));
     let stored = await row(pool, 'proof');
@@ -1753,6 +1766,28 @@ function orphanRevision(
     expectedFinalityEvidenceVersion: value.finalityEvidenceVersion,
     observedAtMs,
   });
+}
+
+async function assertFinalityConflict(operation: Promise<unknown>): Promise<void> {
+  await assert.rejects(operation, (error: unknown) => {
+    assert.ok(error instanceof TransactionInboxConflictError);
+    assert.equal(error.conflict, 'finality');
+    return true;
+  });
+}
+
+async function finalityRowTuple(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+): Promise<object> {
+  const stored = await row(pool, signature);
+  return {
+    confirmationStatus: stored.target_confirmation_status,
+    processingStatus: stored.processing_status,
+    missingFinalityPolls: stored.missing_finality_polls,
+    lastMissingFinalityProviderId: stored.last_missing_finality_provider_id,
+    finalityEvidenceVersion: stored.finality_evidence_version,
+  };
 }
 
 async function row(pool: InstanceType<typeof pg.Pool>, signature: string): Promise<any> {
