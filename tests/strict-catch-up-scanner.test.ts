@@ -148,6 +148,36 @@ void test('rejects ascending slots, duplicate signatures, and repeated paginatio
   }
 });
 
+void test('rejects non-canonical source signatures before every durable write', async () => {
+  const signatures = [
+    '',
+    ' padded',
+    'trailing ',
+    ' ',
+    'é'.repeat(65),
+  ];
+  for (const signature of signatures) {
+    const repository = new FakeRepository();
+    await assert.rejects(scanner(new FakeSource({
+      [PUMP_PROGRAM_ID]: [[sig(signature, 2)]],
+      [PUMPSWAP_PROGRAM_ID]: [[]],
+    }), repository).scan(), (error) => sourceResponseFailure(error, 'launchpad'));
+    assertNoWrites(repository);
+  }
+});
+
+void test('rejects source block times outside the integer Date range before every durable write', async () => {
+  const blockTimes = [-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER, MAX_DATE_MS + 1];
+  for (const blockTimeMs of blockTimes) {
+    const repository = new FakeRepository();
+    await assert.rejects(scanner(new FakeSource({
+      [PUMP_PROGRAM_ID]: [[sig('hostile-time', 2, 'confirmed', blockTimeMs)]],
+      [PUMPSWAP_PROGRAM_ID]: [[]],
+    }), repository).scan(), (error) => sourceResponseFailure(error, 'launchpad'));
+    assertNoWrites(repository);
+  }
+});
+
 void test('merges identical signatures with legacy finality, immutability, program sorting, and order', async () => {
   const source = new FakeSource({
     [PUMP_PROGRAM_ID]: [[
@@ -527,6 +557,13 @@ function sourceFailure(value: unknown, key: ProcessingCheckpointKey): boolean {
   scannerFailure(value, 'source', key);
   assert.ok(value instanceof StrictCatchUpScannerError);
   assert.ok(value.sourceStage === 'response' || value.sourceStage === 'pagination');
+  return true;
+}
+
+function sourceResponseFailure(value: unknown, key: ProcessingCheckpointKey): boolean {
+  scannerFailure(value, 'source', key);
+  assert.ok(value instanceof StrictCatchUpScannerError);
+  assert.equal(value.sourceStage, 'response');
   return true;
 }
 

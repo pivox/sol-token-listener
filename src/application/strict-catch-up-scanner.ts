@@ -236,7 +236,11 @@ export class StrictCatchUpScanner {
       const page = await this.readPage(program, before);
       if (pageCount === 1) observedHeadSlot = page[0]?.slot ?? null;
       for (const row of page) {
-        if (row.slot > MAX_STRICT_CATCH_UP_SLOT) {
+        if (row.slot > MAX_STRICT_CATCH_UP_SLOT
+          || row.signature.length === 0
+          || row.signature !== row.signature.trim()
+          || Buffer.byteLength(row.signature, 'utf8') > 128
+          || (row.blockTimeMs !== null && !validMilliseconds(row.blockTimeMs))) {
           throw this.failure('source', program.key, 'response');
         }
         if (previousSlot !== null && row.slot > previousSlot) {
