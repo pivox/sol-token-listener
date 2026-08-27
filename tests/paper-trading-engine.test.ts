@@ -840,6 +840,24 @@ void test('ferme entièrement et calcule le PnL conservateur', async () => {
   assert.equal(repository.writeCount, 2);
 });
 
+void test('refuse une quote de clôture antérieure au déclencheur avant toute mutation', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const opened = await engine.open({
+    ...openCommand(),
+    strategy: { id: 'creation-entry-v1', version: 1 },
+  });
+  const command = closeCommand(opened.id);
+
+  await assert.rejects(engine.close({
+    ...command,
+    exitTriggerAtMs: command.sellQuote.observedAtMs + 1,
+  }), hasCode('QUOTE_INVALID'));
+
+  assert.equal(repository.positions.get(opened.id)?.status, 'PAPER_HOLDING');
+  assert.equal(repository.writeCount, 1);
+});
+
 void test('autorise le retry manuel legacy sans inventer son horodatage', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository, 'paper');
@@ -860,7 +878,7 @@ void test('autorise le retry manuel legacy sans inventer son horodatage', async 
   assert.equal(closed.exitTriggerAtMs, null);
 });
 
-void test('reconciles a terminal close finality without another sell trade', async () => {
+void test('accepts a quote exactly at the trigger and reconciles finality without another sell trade', async () => {
   const repository = new MemoryPaperRepository();
   const engine = makeEngine(repository,'paper');
   const opened = await engine.open({

@@ -280,6 +280,10 @@ export class PaperTradingEngine {
     this.requirePaperMode();
     const snapshot = snapshotCloseCommand(command);
     validatePaperQuote(snapshot.sellQuote);
+    if (snapshot.exitTriggerAtMs !== undefined
+      && snapshot.sellQuote.observedAtMs < snapshot.exitTriggerAtMs) {
+      invalidQuote('sellQuote.observedAtMs');
+    }
     const { exitTriggerAtMs:_exitTriggerAtMs,...stableSnapshot }=snapshot;
     void _exitTriggerAtMs;
     const closeCommandHash = hashValue('paper_close_command', {
