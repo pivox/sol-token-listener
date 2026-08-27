@@ -423,22 +423,37 @@ void test('finality recurrence degrades on an unavailable block then returns to 
   const scheduler = new ManualScheduler();
   const candidate: FinalityCandidate = Object.freeze({
     signature: '1'.repeat(64), slot: 10n, confirmationStatus: 'processed',
-    missingFinalityPolls: 1, lastMissingFinalityProviderId: 'primary',
-    finalityEvidenceVersion: 1n, processedAtMs: 1,
+    missingFinalityPolls: 0, lastMissingFinalityProviderId: null,
+    finalityEvidenceVersion: 0n, processedAtMs: 1,
   });
   let current = candidate;
   const revisions: FinalityRevision[] = [];
-  let blockAvailable = false;
+  const passSnapshots: Readonly<{ readonly pass: number }>[] = [];
+  const blockProofs: Readonly<{
+    readonly snapshot: Readonly<{ readonly pass: number }>;
+    readonly slot: bigint;
+  }>[] = [];
   const source: FinalityProviderPassSource = Object.freeze({
-    openPass: () => Object.freeze({
-      providerId: 'primary' as const,
-      async getHistoryStatuses() { return [null]; },
-      async getFinalizedSlot() { return 11n; },
-      async getFinalizedBlockSignatures() {
-        if (!blockAvailable) throw new Error('block unavailable');
-        return [];
-      },
-    }),
+    openPass: () => {
+      const snapshot = Object.freeze({ pass: passSnapshots.length + 1 });
+      passSnapshots.push(snapshot);
+      let historyRead = false;
+      return Object.freeze({
+        providerId: 'primary' as const,
+        async getHistoryStatuses() {
+          if (historyRead) throw new Error('stale pass reused');
+          historyRead = true;
+          return [null];
+        },
+        async getFinalizedSlot() { return 11n; },
+        async getFinalizedBlockSignatures(slot: bigint) {
+          blockProofs.push(Object.freeze({ snapshot, slot }));
+          if (snapshot.pass === 2) throw new Error('block unavailable');
+          if (snapshot.pass !== 3) throw new Error('unexpected finality pass');
+          return [];
+        },
+      });
+    },
   });
   const repository = {
     async listForFinality() { return Object.freeze([current]); },
@@ -465,13 +480,27 @@ void test('finality recurrence degrades on an unavailable block then returns to 
     { intervalMs: 5, shutdownTimeoutMs: 100, scheduler },
   );
 
-  await assert.rejects(recurring.start());
-  assert.equal(recurring.state(), 'DEGRADED');
-  assert.equal(revisions.length, 0);
-
-  blockAvailable = true;
   await recurring.start();
   assert.equal(recurring.state(), 'RUNNING');
+  assert.equal(passSnapshots.length, 1);
+
+  const degradedRescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await degradedRescheduled;
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(revisions.length, 0);
+  assert.deepEqual(blockProofs.map(({ snapshot }) => snapshot.pass), [2]);
+
+  const recoveredRescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await recoveredRescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.deepEqual(passSnapshots.map(({ pass }) => pass), [1, 2, 3]);
+  assert.equal(new Set(passSnapshots).size, 3);
+  assert.deepEqual(blockProofs.map(({ snapshot, slot }) => ({ pass: snapshot.pass, slot })), [
+    { pass: 2, slot: 10n },
+    { pass: 3, slot: 10n },
+  ]);
   assert.deepEqual(revisions.map((revision) => revision.confirmationStatus), ['orphaned']);
   await recurring.close();
 });
@@ -542,10 +571,17 @@ function assertProductionCatchUpWiring(source: string): void {
 class ManualScheduler implements ListenerRuntimeScheduler {
   private callback: (() => void) | null = null;
   private lastCallback: (() => void) | null = null;
+  private scheduledCount = 0;
+  private readonly nextScheduleWaiters: { readonly after: number; readonly resolve: () => void }[] = [];
 
   public schedule(callback: () => void): object {
     this.callback = callback;
     this.lastCallback = callback;
+    this.scheduledCount += 1;
+    for (const waiter of this.nextScheduleWaiters.splice(0)) {
+      if (this.scheduledCount > waiter.after) waiter.resolve();
+      else this.nextScheduleWaiters.push(waiter);
+    }
     return Object.freeze({});
   }
 
@@ -564,6 +600,13 @@ class ManualScheduler implements ListenerRuntimeScheduler {
     const callback = this.lastCallback;
     if (callback === null) throw new Error('No callback was scheduled.');
     callback();
+  }
+
+  public waitForNextSchedule(): Promise<void> {
+    const after = this.scheduledCount;
+    return new Promise<void>((resolve) => {
+      this.nextScheduleWaiters.push(Object.freeze({ after, resolve }));
+    });
   }
 }
 

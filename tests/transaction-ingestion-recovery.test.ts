@@ -292,7 +292,7 @@ void test('resets missing finality evidence after a restart on fallback before a
     );
 
     const primary = new FinalityReconciler(
-      missingFinalityPass('primary', transaction.slot), repository,
+      missingFinalityPass('primary', transaction.slot).source, repository,
       { limit: 1, missingPollThreshold: 3, now: () => 2_000 },
     );
     await primary.runOnce();
@@ -302,8 +302,9 @@ void test('resets missing finality evidence after a restart on fallback before a
       processingStatus: 'PROCESSED',
     });
 
+    const fallback = missingFinalityPass('fallback-1', transaction.slot);
     const restartedFallback = new FinalityReconciler(
-      missingFinalityPass('fallback-1', transaction.slot), repository,
+      fallback.source, repository,
       { limit: 1, missingPollThreshold: 3, now: () => 3_000 },
     );
     await restartedFallback.runOnce();
@@ -318,6 +319,9 @@ void test('resets missing finality evidence after a restart on fallback before a
       missingPolls: 0, providerId: null, confirmationStatus: 'orphaned',
       processingStatus: 'PENDING',
     });
+    assert.deepEqual(fallback.blockProofs, [
+      Object.freeze({ providerId: 'fallback-1', slot: transaction.slot }),
+    ]);
   });
 });
 
@@ -863,14 +867,24 @@ async function inboxRow(pool: InstanceType<typeof pg.Pool>, signature: string): 
 function missingFinalityPass(
   providerId: 'primary' | 'fallback-1',
   slot: bigint,
-): FinalityProviderPassSource {
+): Readonly<{
+  readonly source: FinalityProviderPassSource;
+  readonly blockProofs: readonly Readonly<{ readonly providerId: string; readonly slot: bigint }>[];
+}> {
+  const blockProofs: Readonly<{ readonly providerId: string; readonly slot: bigint }>[] = [];
   return Object.freeze({
-    openPass: () => Object.freeze({
-      providerId,
-      async getHistoryStatuses() { return [null]; },
-      async getFinalizedSlot() { return slot + 1n; },
-      async getFinalizedBlockSignatures() { return []; },
+    source: Object.freeze({
+      openPass: () => Object.freeze({
+        providerId,
+        async getHistoryStatuses() { return [null]; },
+        async getFinalizedSlot() { return slot + 1n; },
+        async getFinalizedBlockSignatures(proofSlot: bigint) {
+          blockProofs.push(Object.freeze({ providerId, slot: proofSlot }));
+          return [];
+        },
+      }),
     }),
+    blockProofs,
   });
 }
 
