@@ -1,372 +1,386 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import bs58 from 'bs58';
 import {
   FinalityReconciler,
   FinalityReconcilerError,
-  type FinalityHistoryStatus,
-  type FinalityReconcilerRepository,
-  type FinalityReconcilerSource,
 } from '../src/application/finality-reconciler.js';
-import type {
-  FinalityCandidate,
-  FinalityPollObservation,
-  FinalityRevision,
+import {
+  MAX_FINALITY_EVIDENCE_VERSION,
+  type FinalityCandidate,
+  type FinalityPollObservation,
+  type FinalityRevision,
 } from '../src/domain/transaction-ingestion.js';
+import type { RpcProviderId } from '../src/domain/rpc-provider.js';
+import type {
+  FinalityProviderPass,
+  FinalityProviderPassSource,
+} from '../src/ports/finality-provider-pass.js';
 
-void test('reads statuses in one batch and exactly one finalized root before finalizing rows', async () => {
-  const calls: string[] = [];
-  const repository = memoryRepository([
-    candidate('a', 10n, 'processed'), candidate('b', 11n, 'confirmed'),
-  ], calls);
-  let statusReads = 0;
-  let rootReads = 0;
-  const source: FinalityReconcilerSource = {
-    async getHistoryStatuses(signatures) {
-      statusReads += 1;
-      calls.push(`statuses:${signatures.join(',')}`);
-      return Object.freeze([
-        history(10n, 'finalized'), history(11n, 'finalized'),
-      ]);
-    },
-    async getFinalizedSlot() { rootReads += 1; calls.push('root'); return 12n; },
-  };
-  const reconciler = new FinalityReconciler(source, repository, { limit: 20, now: () => 1_000 });
+const NOW = 1_000;
+const PRIMARY: RpcProviderId = 'primary';
+const FALLBACK: RpcProviderId = 'fallback-1';
+const LIMIT = 256;
 
-  const result = await reconciler.runOnce();
+void test('opens no pass for an empty page and binds every pass operation to one provider receiver', async () => {
+  const empty = passHarness();
+  const emptyRepository = memoryRepository([]);
+  const emptyResult = await reconciler(empty.source, emptyRepository, { limit: 1 }).runOnce();
+  assert.deepEqual(emptyResult, { candidateCount: 0, pollCount: 0, revisionCount: 0 });
+  assert.ok(Object.isFrozen(emptyResult));
+  assert.equal(empty.opened, 0);
+  assert.deepEqual(empty.calls, []);
 
-  assert.deepEqual(calls, ['list:20', 'statuses:a,b', 'root', 'revision:a:finalized', 'revision:b:finalized']);
-  assert.equal(statusReads, 1);
-  assert.equal(rootReads, 1);
-  assert.deepEqual(repository.revisions, [
-    Object.freeze({ signature: 'a', confirmationStatus: 'finalized', observedAtMs: 1_000 }),
-    Object.freeze({ signature: 'b', confirmationStatus: 'finalized', observedAtMs: 1_000 }),
-  ]);
-  assert.deepEqual(result, { candidateCount: 2, pollCount: 0, revisionCount: 2 });
-  assert.ok(Object.isFrozen(result));
-});
-
-void test('requires three consecutive missing polls and a strictly higher finalized root', async () => {
-  const repository = memoryRepository([candidate('missing', 20n)]);
-  let finalizedRoot = 20n;
-  const source = sequenceSource(() => null, () => finalizedRoot);
-  const reconciler = new FinalityReconciler(source, repository, { limit: 1, now: () => 2_000 });
-
-  await reconciler.runOnce();
-  await reconciler.runOnce();
-  await reconciler.runOnce();
-  assert.equal(repository.revisions.length, 0);
-  assert.equal(repository.candidates[0]?.missingFinalityPolls, 3);
-
-  finalizedRoot = 21n;
-  await reconciler.runOnce();
-  assert.deepEqual(repository.revisions, [
-    Object.freeze({ signature: 'missing', confirmationStatus: 'orphaned', observedAtMs: 2_000 }),
-  ]);
-});
-
-void test('supports threshold two and resets the counter on confirmation or regression', async () => {
-  const repository = memoryRepository([
-    candidate('reset', 30n, 'confirmed'),
-    candidate('regression', 31n, 'confirmed', 2),
-  ]);
-  let statuses: readonly (FinalityHistoryStatus | null)[] = Object.freeze([
-    null, history(31n, 'processed'),
-  ]);
-  const source: FinalityReconcilerSource = {
-    async getHistoryStatuses() { return statuses; },
-    async getFinalizedSlot() { return 40n; },
-  };
-  const reconciler = new FinalityReconciler(source, repository, {
-    limit: 2, missingPollThreshold: 2, now: () => 3_000,
+  const value = candidate(1, 7n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY, finalityEvidenceVersion: 4n });
+  const repository = memoryRepository([value]);
+  const source = passHarness({
+    history: [null], root: 8n, blocks: new Map([[7n, []]]),
   });
+  const result = await reconciler(source.source, repository, { limit: 1, missingPollThreshold: 2, now: () => NOW }).runOnce();
 
-  await reconciler.runOnce();
-  assert.deepEqual(repository.candidates.map((value) => [
-    value.signature, value.confirmationStatus, value.missingFinalityPolls,
-  ]), [
-    ['reset', 'confirmed', 1], ['regression', 'confirmed', 0],
-  ]);
-
-  statuses = Object.freeze([history(30n, 'confirmed'), history(31n, 'confirmed')]);
-  await reconciler.runOnce();
-  assert.deepEqual(repository.candidates.map((value) => value.missingFinalityPolls), [0, 0]);
-  statuses = Object.freeze([null, null]);
-  await reconciler.runOnce();
-  assert.equal(repository.revisions.length, 0);
-  await reconciler.runOnce();
-  assert.deepEqual(repository.revisions.map((value) => value.confirmationStatus), [
-    'orphaned', 'orphaned',
-  ]);
+  assert.deepEqual(result, { candidateCount: 1, pollCount: 1, revisionCount: 1 });
+  assert.deepEqual(source.calls, ['open:primary', 'history:primary', 'root:primary', 'block:primary:7']);
+  assert.deepEqual(repository.polls, [Object.freeze({
+    signature: value.signature, confirmationStatus: null, providerId: PRIMARY,
+    expectedMissingFinalityPolls: 1, expectedLastMissingFinalityProviderId: PRIMARY,
+    expectedFinalityEvidenceVersion: 4n, observedAtMs: NOW,
+  })]);
+  assert.deepEqual(repository.revisions, [Object.freeze({
+    signature: value.signature, confirmationStatus: 'orphaned', expectedConfirmationStatus: 'processed',
+    expectedMissingFinalityPolls: 2, expectedLastMissingFinalityProviderId: PRIMARY,
+    expectedFinalityEvidenceVersion: 5n, observedAtMs: NOW,
+  })]);
 });
 
-void test('throws a fixed contradiction without retracting impossible finalized history', async () => {
-  for (const status of [history(39n, 'finalized'), history(40n, 'finalized')] as const) {
-    const repository = memoryRepository([candidate('contradiction', 40n, 'confirmed')]);
-    const source: FinalityReconcilerSource = {
-      async getHistoryStatuses() { return Object.freeze([status]); },
-      async getFinalizedSlot() { return status.slot === 40n ? 39n : 50n; },
-    };
-    const reconciler = new FinalityReconciler(source, repository, { limit: 1 });
-    await assert.rejects(reconciler.runOnce(), (error: unknown) => {
-      assert.ok(error instanceof FinalityReconcilerError);
-      assert.equal(error.stage, 'finality-contradiction');
-      assert.equal(error.message, 'Transaction finality reconciliation failed.');
-      assert.equal(Object.hasOwn(error, 'cause'), false);
-      assert.ok(Object.isFrozen(error));
-      return true;
+void test('fails malformed pass capabilities without reading accessors or shadowed call properties', async () => {
+  let getterReads = 0;
+  const accessorSource = Object.freeze(Object.defineProperty({}, 'openPass', {
+    enumerable: true, get() { getterReads += 1; return () => undefined; },
+  })) as FinalityProviderPassSource;
+  await fails(reconciler(accessorSource, memoryRepository([candidate(2, 2n)]), { limit: 1 }).runOnce(), 'pass');
+  assert.equal(getterReads, 0);
+
+  const pass = passHarness();
+  Object.defineProperty(pass.source.openPass, 'call', {
+    configurable: true, get() { getterReads += 1; throw new Error('https://secret.invalid/open-pass-call'); },
+  });
+  const getHistoryStatuses = pass.pass.getHistoryStatuses;
+  Object.defineProperty(getHistoryStatuses, 'call', {
+    configurable: true, get() { getterReads += 1; throw new Error('https://secret.invalid/call'); },
+  });
+  Object.defineProperty(pass.pass, 'getFinalizedSlot', {
+    configurable: true, enumerable: true, get() { getterReads += 1; return async () => 3n; },
+  });
+  await fails(reconciler(pass.source, memoryRepository([candidate(3, 2n)]), { limit: 1 }).runOnce(), 'pass');
+  assert.equal(getterReads, 0);
+});
+
+void test('accepts the 256 maximum and rejects every invalid or oversized limit', () => {
+  const source = passHarness().source;
+  assert.doesNotThrow(() => reconciler(source, memoryRepository([]), { limit: LIMIT }));
+  for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 257, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => reconciler(source, memoryRepository([]), { limit }));
+  }
+});
+
+void test('enqueues already finalized candidates without a poll or block proof', async () => {
+  const value = candidate(4, 9n, { confirmationStatus: 'confirmed' });
+  const repository = memoryRepository([value]);
+  const source = passHarness({ history: [history(9n, 'finalized')], root: 9n });
+  const result = await reconciler(source.source, repository, { limit: 1, now: () => NOW }).runOnce();
+  assert.deepEqual(result, { candidateCount: 1, pollCount: 0, revisionCount: 1 });
+  assert.deepEqual(repository.revisions, [Object.freeze({
+    signature: value.signature, confirmationStatus: 'finalized', observedAtMs: NOW,
+  })]);
+  assert.deepEqual(source.calls, ['open:primary', 'history:primary', 'root:primary']);
+});
+
+void test('proves an absent signature before enqueuing an orphan with its exact evidence revision', async () => {
+  const value = candidate(5, 10n, {
+    confirmationStatus: 'confirmed', missingFinalityPolls: 1,
+    lastMissingFinalityProviderId: PRIMARY, finalityEvidenceVersion: 11n,
+  });
+  const repository = memoryRepository([value]);
+  const source = passHarness({ history: [null], root: 11n, blocks: new Map([[10n, []]]) });
+  await reconciler(source.source, repository, { limit: 1, missingPollThreshold: 2, now: () => NOW }).runOnce();
+  assert.deepEqual(repository.revisions, [Object.freeze({
+    signature: value.signature, confirmationStatus: 'orphaned', expectedConfirmationStatus: 'confirmed',
+    expectedMissingFinalityPolls: 2, expectedLastMissingFinalityProviderId: PRIMARY,
+    expectedFinalityEvidenceVersion: 12n, observedAtMs: NOW,
+  })]);
+});
+
+void test('uses provider-scoped missing evidence, resets it on a present status, and requires a strictly higher root', async () => {
+  const fallback = candidate(6, 20n, { missingFinalityPolls: 2, lastMissingFinalityProviderId: PRIMARY, finalityEvidenceVersion: 3n });
+  const fallbackRepository = memoryRepository([fallback]);
+  const fallbackSource = passHarness({ providerId: FALLBACK, history: [null], root: 21n });
+  await reconciler(fallbackSource.source, fallbackRepository, {
+    limit: 1, missingPollThreshold: 2,
+  }).runOnce();
+  assert.deepEqual(finalityState(fallbackRepository.candidates[0]), [1, FALLBACK, 4n]);
+  assert.equal(fallbackRepository.revisions.length, 0);
+  assert.equal(fallbackSource.calls.some((value) => value.startsWith('block:')), false);
+
+  const present = candidate(7, 20n, { missingFinalityPolls: 2, lastMissingFinalityProviderId: PRIMARY, finalityEvidenceVersion: 3n });
+  const presentRepository = memoryRepository([present]);
+  const presentSource = passHarness({ history: [history(20n, 'confirmed')], root: 21n });
+  await reconciler(presentSource.source, presentRepository, { limit: 1 }).runOnce();
+  assert.deepEqual(finalityState(presentRepository.candidates[0]), [0, null, 4n]);
+  assert.equal(presentSource.calls.some((value) => value.startsWith('block:')), false);
+
+  const equalRoot = candidate(8, 20n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY });
+  const equalSource = passHarness({ history: [null], root: 20n });
+  await reconciler(equalSource.source, memoryRepository([equalRoot]), { limit: 1, missingPollThreshold: 2 }).runOnce();
+  assert.equal(equalSource.calls.some((value) => value.startsWith('block:')), false);
+});
+
+void test('rejects a present eligible signature as a finality contradiction before orphaning', async () => {
+  const value = candidate(9, 30n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY });
+  const repository = memoryRepository([value]);
+  const source = passHarness({ history: [null], root: 31n, blocks: new Map([[30n, [value.signature]]]) });
+  await fails(reconciler(source.source, repository, { limit: 1, missingPollThreshold: 2 }).runOnce(), 'finality-contradiction');
+  assert.equal(repository.revisions.length, 0);
+});
+
+void test('fails closed on null, rejected, malformed, sparse, duplicate, oversized, or noncanonical blocks', async () => {
+  const values: readonly [string, unknown][] = [
+    ['null', null], ['rejected', new Error('https://secret.invalid/block')], ['object', Object.freeze({})],
+    ['sparse', Object.assign(new Array<string>(1), {})], ['duplicate', Object.freeze([signature(11), signature(11)])],
+    ['oversized', Object.freeze(Array.from({ length: 10_001 }, (_, index) => signature(index + 12)))],
+    ['noncanonical', Object.freeze(['noncanonical'])],
+  ];
+  for (const [, block] of values) {
+    const value = candidate(10, 40n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY });
+    const repository = memoryRepository([value]);
+    const source = passHarness({ history: [null], root: 41n, blocks: new Map([[40n, block]]) });
+    await fails(reconciler(source.source, repository, { limit: 1, missingPollThreshold: 2 }).runOnce(), 'block');
+    assert.equal(repository.revisions.length, 0);
+  }
+});
+
+void test('shares one block read by slot and validates that block before enqueuing any orphan', async () => {
+  const first = candidate(12, 50n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY });
+  const second = candidate(13, 50n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY });
+  const repository = memoryRepository([first, second]);
+  const source = passHarness({ history: [null, null], root: 51n, blocks: new Map([[50n, []]]) });
+  await reconciler(source.source, repository, { limit: 2, missingPollThreshold: 2 }).runOnce();
+  assert.deepEqual(source.calls.filter((value) => value.startsWith('block:')), ['block:primary:50']);
+  assert.equal(repository.revisions.length, 2);
+
+  const malformedRepository = memoryRepository([first, second]);
+  const malformed = passHarness({ history: [null, null], root: 51n, blocks: new Map([[50n, Object.freeze([signature(14), signature(14)])]]) });
+  await fails(reconciler(malformed.source, malformedRepository, { limit: 2, missingPollThreshold: 2 }).runOnce(), 'block');
+  assert.equal(malformedRepository.revisions.length, 0);
+});
+
+void test('caps absent-slot block proof work at sixteen unique slots in candidate order', async () => {
+  const values = Array.from({ length: 17 }, (_, index) => candidate(index + 20, BigInt(100 + index), {
+    missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY,
+  }));
+  const blocks = new Map<bigint, unknown>(values.map((value) => [value.slot, Object.freeze([])]));
+  const repository = memoryRepository(values);
+  const source = passHarness({ history: values.map(() => null), root: 200n, blocks });
+  const result = await reconciler(source.source, repository, { limit: 17, missingPollThreshold: 2 }).runOnce();
+  assert.deepEqual(result, { candidateCount: 17, pollCount: 17, revisionCount: 16 });
+  assert.deepEqual(source.calls.filter((value) => value.startsWith('block:')), values.slice(0, 16).map((value) => `block:primary:${value.slot}`));
+  assert.deepEqual(repository.revisions.map((value) => value.signature), values.slice(0, 16).map((value) => value.signature));
+});
+
+void test('turns a stale provider/count/version race at orphan enqueue into a redacted revision failure', async () => {
+  const value = candidate(40, 70n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY, finalityEvidenceVersion: 3n });
+  const repository = memoryRepository([value]);
+  repository.beforeEnqueue = () => {
+    repository.replace(value.signature, {
+      missingFinalityPolls: 1, lastMissingFinalityProviderId: FALLBACK, finalityEvidenceVersion: 5n,
     });
-    assert.equal(repository.revisions.length, 0);
-    assert.equal(repository.polls.length, 0);
-  }
-});
-
-void test('does no RPC work for an empty page and rejects unsafe integer options', async () => {
-  let reads = 0;
-  const source: FinalityReconcilerSource = {
-    async getHistoryStatuses() { reads += 1; return Object.freeze([]); },
-    async getFinalizedSlot() { reads += 1; return 0n; },
   };
-  const empty = new FinalityReconciler(source, memoryRepository([]), { limit: 1 });
-  assert.deepEqual(await empty.runOnce(), { candidateCount: 0, pollCount: 0, revisionCount: 0 });
-  assert.equal(reads, 0);
-
-  for (const options of [
-    { limit: 0 }, { limit: 1.5 }, { limit: 1, missingPollThreshold: 1 },
-    { limit: Number.MAX_SAFE_INTEGER + 1 },
-  ]) {
-    assert.throws(() => new FinalityReconciler(source, memoryRepository([]), options), TypeError);
-  }
-});
-
-void test('snapshots repository candidates without invoking stateful reads or getters', async () => {
-  let reads = 0;
-  const stable = candidate('stable', 50n);
-  const proxied = new Proxy(stable, {
-    get(target, key, receiver) {
-      reads += 1;
-      return Reflect.get(target, key, receiver) as unknown;
-    },
-  });
-  const repository = memoryRepository([]);
-  repository.listForFinality = async () => Object.freeze([proxied]);
-  const source: FinalityReconcilerSource = {
-    async getHistoryStatuses(signatures) {
-      assert.deepEqual(signatures, Object.freeze(['stable']));
-      return Object.freeze([history(50n, 'finalized')]);
-    },
-    async getFinalizedSlot() { return 51n; },
-  };
-  await new FinalityReconciler(source, repository, { limit: 1 }).runOnce();
-  assert.equal(reads, 0);
-  assert.equal(repository.revisions[0]?.signature, 'stable');
-
-  let getterReads = 0;
-  const getterCandidate = Object.freeze(Object.defineProperties({}, {
-    signature: { enumerable: true, get() { getterReads += 1; return 'https://secret.invalid/getter'; } },
-    slot: { enumerable: true, value: 51n },
-    confirmationStatus: { enumerable: true, value: 'processed' },
-    missingFinalityPolls: { enumerable: true, value: 0 },
-    processedAtMs: { enumerable: true, value: 100 },
-  })) as FinalityCandidate;
-  const rejected = new FinalityReconciler(source, {
-    ...memoryRepository([]), async listForFinality() { return Object.freeze([getterCandidate]); },
-  }, { limit: 1 });
-  await assert.rejects(rejected.runOnce(), (error: unknown) => {
-    assert.ok(error instanceof FinalityReconcilerError);
-    assert.equal(error.stage, 'list');
-    assert.doesNotMatch(String(error), /secret|getter|invalid/u);
-    return true;
-  });
-  assert.equal(getterReads, 0);
-});
-
-void test('snapshots poll results and rejects forged missing jumps before orphaning', async () => {
-  let reads = 0;
-  const original = candidate('poll-proxy', 60n);
-  const correct = freezeCandidate({ ...original, missingFinalityPolls: 1 });
-  const proxied = new Proxy(correct, {
-    get(target, key, receiver) {
-      if (key !== 'then') reads += 1;
-      return Reflect.get(target, key, receiver) as unknown;
-    },
-  });
-  const repository = memoryRepository([original]);
-  repository.recordFinalityPoll = async () => proxied;
-  const reconciler = new FinalityReconciler(
-    sequenceSource(() => null, () => 61n), repository,
-    { limit: 1, missingPollThreshold: 2 },
-  );
-  assert.deepEqual(await reconciler.runOnce(), {
-    candidateCount: 1, pollCount: 1, revisionCount: 0,
-  });
-  assert.equal(reads, 0);
-  assert.equal(repository.revisions.length, 0);
-
-  let getterReads = 0;
-  const getterPoll = Object.freeze(Object.defineProperties({}, {
-    signature: { enumerable: true, get() { getterReads += 1; return 'https://secret.invalid/poll'; } },
-    slot: { enumerable: true, value: 60n },
-    confirmationStatus: { enumerable: true, value: 'processed' },
-    missingFinalityPolls: { enumerable: true, value: 1 },
-    processedAtMs: { enumerable: true, value: 100 },
-  })) as FinalityCandidate;
-  const getterRepository = memoryRepository([original]);
-  getterRepository.recordFinalityPoll = async () => getterPoll;
-  const getterReconciler = new FinalityReconciler(
-    sequenceSource(() => null, () => 61n), getterRepository, { limit: 1 },
-  );
-  await assert.rejects(getterReconciler.runOnce(), (error: unknown) => {
-    assert.ok(error instanceof FinalityReconcilerError);
-    assert.equal(error.stage, 'poll');
-    assert.doesNotMatch(String(error), /secret|poll.invalid/u);
-    return true;
-  });
-  assert.equal(getterReads, 0);
-  assert.equal(getterRepository.revisions.length, 0);
-
-  const forgedRepository = memoryRepository([candidate('jump', 62n)]);
-  forgedRepository.recordFinalityPoll = async () => candidate('jump', 62n, 'processed', 3);
-  const forged = new FinalityReconciler(
-    sequenceSource(() => null, () => 63n), forgedRepository,
-    { limit: 1, missingPollThreshold: 2 },
-  );
-  await assert.rejects(forged.runOnce(), (error: unknown) => {
-    assert.ok(error instanceof FinalityReconcilerError);
-    assert.equal(error.stage, 'poll');
-    assert.equal(error.message, 'Transaction finality reconciliation failed.');
-    return true;
-  });
-  assert.equal(forgedRepository.revisions.length, 0);
-});
-
-void test('rejects forged non-null reset and downgrade poll results', async () => {
-  for (const scenario of [
-    {
-      current: candidate('bad-reset', 70n, 'processed', 1),
-      observed: history(70n, 'confirmed'),
-      returned: candidate('bad-reset', 70n, 'confirmed', 1),
-    },
-    {
-      current: candidate('bad-downgrade', 71n, 'confirmed', 1),
-      observed: history(71n, 'processed'),
-      returned: candidate('bad-downgrade', 71n, 'processed', 0),
-    },
-  ]) {
-    const repository = memoryRepository([scenario.current]);
-    repository.recordFinalityPoll = async () => scenario.returned;
-    const reconciler = new FinalityReconciler(
-      sequenceSource(() => scenario.observed, () => 80n), repository, { limit: 1 },
-    );
-    await assert.rejects(reconciler.runOnce(), (error: unknown) =>
-      error instanceof FinalityReconcilerError && error.stage === 'poll');
-    assert.equal(repository.revisions.length, 0);
-  }
-});
-
-void test('rejects hostile candidate arrays without calling dependency methods or leaking', async () => {
-  let methodReads = 0;
-  let descriptorReads = 0;
-  const target = Object.freeze([candidate('safe', 90n)]);
-  const hostile = new Proxy(target, {
-    get(array, key, receiver) {
-      if (key === 'map' || key === Symbol.iterator) {
-        methodReads += 1;
-        return () => [candidate('https://secret.invalid/forged', 90n)];
-      }
-      return Reflect.get(array, key, receiver) as unknown;
-    },
-    getOwnPropertyDescriptor(array, key) {
-      if (key === '0') {
-        descriptorReads += 1;
-        throw new Error('https://secret.invalid/descriptor');
-      }
-      return Reflect.getOwnPropertyDescriptor(array, key);
-    },
-  });
-  const repository = memoryRepository([]);
-  repository.listForFinality = async () => hostile;
-  let sourceReads = 0;
-  const reconciler = new FinalityReconciler({
-    async getHistoryStatuses() { sourceReads += 1; return Object.freeze([]); },
-    async getFinalizedSlot() { sourceReads += 1; return 100n; },
-  }, repository, { limit: 1 });
-
-  await assert.rejects(reconciler.runOnce(), (error: unknown) => {
-    assert.ok(error instanceof FinalityReconcilerError);
-    assert.equal(error.stage, 'list');
-    assert.equal(error.message, 'Transaction finality reconciliation failed.');
-    assert.doesNotMatch(String(error), /secret|descriptor|forged/u);
-    return true;
-  });
-  assert.equal(methodReads, 0);
-  assert.equal(descriptorReads, 1);
-  assert.equal(sourceReads, 0);
+  await fails(reconciler(passHarness({ history: [null], root: 71n, blocks: new Map([[70n, []]]) }).source, repository, {
+    limit: 1, missingPollThreshold: 2,
+  }).runOnce(), 'revision');
   assert.equal(repository.revisions.length, 0);
 });
 
-interface MemoryRepository extends FinalityReconcilerRepository {
+void test('rejects forged poll evidence versions and provider/count/status transitions before block work', async () => {
+  const initial = candidate(41, 80n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY, finalityEvidenceVersion: 5n });
+  const forged = [
+    { finalityEvidenceVersion: 5n }, { finalityEvidenceVersion: 4n }, { finalityEvidenceVersion: 7n },
+    { finalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION }, { finalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION + 1n },
+    { missingFinalityPolls: 3 }, { lastMissingFinalityProviderId: FALLBACK }, { confirmationStatus: 'confirmed' as const },
+  ];
+  for (const patch of forged) {
+    const repository = memoryRepository([initial]);
+    repository.recordFinalityPoll = async () => freezeCandidate({
+      ...initial, missingFinalityPolls: 2, lastMissingFinalityProviderId: PRIMARY,
+      finalityEvidenceVersion: 6n, ...patch,
+    });
+    const source = passHarness({ history: [null], root: 81n, blocks: new Map([[80n, []]]) });
+    await fails(reconciler(source.source, repository, { limit: 1, missingPollThreshold: 2 }).runOnce(), 'poll');
+    assert.equal(source.calls.some((value) => value.startsWith('block:')), false);
+  }
+});
+
+void test('rejects hostile candidate and history arrays, invalid clocks, and keeps fixed errors redacted', async () => {
+  let candidateGetterReads = 0;
+  const hostileCandidates = new Proxy(Object.freeze([candidate(50, 90n)]), {
+    get(target, key, receiver) {
+      if (key === Symbol.iterator || key === 'map') candidateGetterReads += 1;
+      return Reflect.get(target, key, receiver) as unknown;
+    },
+    getOwnPropertyDescriptor(target, key) {
+      if (key === '0') throw new Error('https://secret.invalid/candidates');
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  const hostileRepository = memoryRepository([]);
+  hostileRepository.listForFinality = async () => hostileCandidates as unknown as readonly FinalityCandidate[];
+  await fails(reconciler(passHarness().source, hostileRepository, { limit: 1 }).runOnce(), 'list');
+  assert.equal(candidateGetterReads, 0);
+
+  const historyRepository = memoryRepository([candidate(51, 91n)]);
+  const hostileHistory = new Proxy(Object.freeze([null]), {
+    getOwnPropertyDescriptor(target, key) {
+      if (key === '0') throw new Error('https://secret.invalid/history');
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+  });
+  await fails(reconciler(passHarness({ history: hostileHistory }).source, historyRepository, { limit: 1 }).runOnce(), 'history');
+
+  for (const now of [() => -1, () => 1.5, () => { throw new Error('https://secret.invalid/clock'); }]) {
+    await fails(reconciler(passHarness({ history: [history(91n, 'finalized')], root: 91n }).source, memoryRepository([candidate(52, 91n)]), {
+      limit: 1, now,
+    }).runOnce(), 'clock');
+  }
+});
+
+interface MemoryRepository {
   readonly candidates: FinalityCandidate[];
   readonly polls: FinalityPollObservation[];
   readonly revisions: FinalityRevision[];
+  beforeEnqueue: (() => void) | undefined;
+  listForFinality(limit: number): Promise<readonly FinalityCandidate[]>;
+  recordFinalityPoll(value: FinalityPollObservation): Promise<FinalityCandidate>;
+  enqueueRevision(value: FinalityRevision): Promise<void>;
+  replace(signature: string, patch: Partial<FinalityCandidate>): void;
 }
 
-function memoryRepository(initial: readonly FinalityCandidate[], calls: string[] = []): MemoryRepository {
-  const candidates = initial.map((value) => ({ ...value }));
+function memoryRepository(initial: readonly FinalityCandidate[]): MemoryRepository {
+  const candidates = initial.map(freezeCandidate);
   const polls: FinalityPollObservation[] = [];
   const revisions: FinalityRevision[] = [];
-  return {
-    candidates,
-    polls,
-    revisions,
-    async listForFinality(limit) { calls.push(`list:${limit}`); return Object.freeze(candidates.slice(0, limit).map(freezeCandidate)); },
+  const repository: MemoryRepository = {
+    candidates, polls, revisions, beforeEnqueue: undefined,
+    async listForFinality(limit) { return Object.freeze(candidates.slice(0, limit)); },
     async recordFinalityPoll(value) {
       polls.push(value);
-      calls.push(`poll:${value.signature}:${value.confirmationStatus ?? 'missing'}`);
       const index = candidates.findIndex((candidateValue) => candidateValue.signature === value.signature);
       const current = candidates[index];
       assert.ok(current);
-      assert.equal(current.missingFinalityPolls, value.expectedMissingFinalityPolls);
-      const confirmationStatus = value.confirmationStatus === 'confirmed'
-        || (value.confirmationStatus === 'processed' && current.confirmationStatus === 'processed')
-        ? value.confirmationStatus
-        : current.confirmationStatus;
+      assert.equal(value.expectedMissingFinalityPolls, current.missingFinalityPolls);
+      assert.equal(value.expectedLastMissingFinalityProviderId, current.lastMissingFinalityProviderId);
+      assert.equal(value.expectedFinalityEvidenceVersion, current.finalityEvidenceVersion);
+      assert.equal(value.providerId === PRIMARY || value.providerId === FALLBACK, true);
+      if (current.finalityEvidenceVersion >= MAX_FINALITY_EVIDENCE_VERSION) throw new Error('version');
+      const missing = value.confirmationStatus === null
+        ? current.lastMissingFinalityProviderId === value.providerId ? current.missingFinalityPolls + 1 : 1
+        : 0;
       const updated = freezeCandidate({
         ...current,
-        confirmationStatus,
-        missingFinalityPolls: value.confirmationStatus === null
-          ? current.missingFinalityPolls + 1
-          : 0,
+        confirmationStatus: value.confirmationStatus === null
+          ? current.confirmationStatus
+          : current.confirmationStatus === 'confirmed' || value.confirmationStatus === 'confirmed' ? 'confirmed' : 'processed',
+        missingFinalityPolls: missing,
+        lastMissingFinalityProviderId: value.confirmationStatus === null ? value.providerId : null,
+        finalityEvidenceVersion: current.finalityEvidenceVersion + 1n,
       });
       candidates[index] = updated;
       return updated;
     },
-    async enqueueRevision(value) { revisions.push(value); calls.push(`revision:${value.signature}:${value.confirmationStatus}`); },
+    async enqueueRevision(value) {
+      repository.beforeEnqueue?.();
+      const current = candidates.find((candidateValue) => candidateValue.signature === value.signature);
+      assert.ok(current);
+      if (value.confirmationStatus === 'orphaned') {
+        assert.equal(value.expectedConfirmationStatus, current.confirmationStatus);
+        assert.equal(value.expectedMissingFinalityPolls, current.missingFinalityPolls);
+        assert.equal(value.expectedLastMissingFinalityProviderId, current.lastMissingFinalityProviderId);
+        assert.equal(value.expectedFinalityEvidenceVersion, current.finalityEvidenceVersion);
+      }
+      revisions.push(value);
+    },
+    replace(signature, patch) {
+      const index = candidates.findIndex((candidateValue) => candidateValue.signature === signature);
+      assert.notEqual(index, -1);
+      const current = candidates[index];
+      assert.ok(current);
+      candidates[index] = freezeCandidate({ ...current, ...patch });
+    },
   };
+  return repository;
 }
 
-function candidate(
-  signature: string,
-  slot: bigint,
-  confirmationStatus: FinalityCandidate['confirmationStatus'] = 'processed',
-  missingFinalityPolls = 0,
-): FinalityCandidate {
-  return freezeCandidate({ signature, slot, confirmationStatus, missingFinalityPolls, processedAtMs: 100 });
+interface PassHarnessOptions {
+  readonly providerId?: RpcProviderId;
+  readonly history?: unknown;
+  readonly root?: unknown;
+  readonly blocks?: ReadonlyMap<bigint, unknown>;
 }
 
-function freezeCandidate(value: FinalityCandidate): FinalityCandidate {
-  return Object.freeze({ ...value });
+function passHarness(options: PassHarnessOptions = {}) {
+  const providerId = options.providerId ?? PRIMARY;
+  const calls: string[] = [];
+  let opened = 0;
+  const pass: FinalityProviderPass = {
+    providerId,
+    async getHistoryStatuses() { assert.equal(this, pass); calls.push(`history:${this.providerId}`); return options.history ?? Object.freeze([]); },
+    async getFinalizedSlot() { assert.equal(this, pass); calls.push(`root:${this.providerId}`); return options.root ?? 0n; },
+    async getFinalizedBlockSignatures(slot) {
+      assert.equal(this, pass); calls.push(`block:${this.providerId}:${slot}`);
+      const value = options.blocks?.has(slot) === true
+        ? options.blocks.get(slot)
+        : Object.freeze([]);
+      if (value instanceof Error) throw value;
+      return value;
+    },
+  };
+  const openPass = function openPass(this: FinalityProviderPassSource): FinalityProviderPass {
+    assert.equal(this, source); opened += 1; calls.push(`open:${providerId}`); return pass;
+  };
+  const source: FinalityProviderPassSource = { openPass };
+  return { source, pass, calls, get opened() { return opened; } };
 }
 
-function history(slot: bigint, confirmationStatus: NonNullable<FinalityHistoryStatus>['confirmationStatus']): FinalityHistoryStatus {
+function reconciler(source: FinalityProviderPassSource, repository: MemoryRepository, options: { readonly limit: number; readonly missingPollThreshold?: number; readonly now?: () => number }) {
+  return new FinalityReconciler(source as never, repository as never, options);
+}
+
+function candidate(byte: number, slot: bigint, patch: Partial<FinalityCandidate> = {}): FinalityCandidate {
+  return freezeCandidate({
+    signature: signature(byte), slot, confirmationStatus: 'processed', missingFinalityPolls: 0,
+    lastMissingFinalityProviderId: null, finalityEvidenceVersion: 0n, processedAtMs: 100, ...patch,
+  });
+}
+
+function freezeCandidate(value: FinalityCandidate): FinalityCandidate { return Object.freeze({ ...value }); }
+
+function history(slot: bigint, confirmationStatus: 'processed' | 'confirmed' | 'finalized') {
   return Object.freeze({ slot, confirmationStatus });
 }
 
-function sequenceSource(
-  status: () => FinalityHistoryStatus | null,
-  root: () => bigint,
-): FinalityReconcilerSource {
-  return {
-    async getHistoryStatuses(signatures) { return Object.freeze(signatures.map(() => status())); },
-    async getFinalizedSlot() { return root(); },
-  };
+function signature(byte: number): string { return bs58.encode(Buffer.alloc(64, byte)); }
+
+function finalityState(value: FinalityCandidate | undefined) {
+  assert.ok(value);
+  return [value.missingFinalityPolls, value.lastMissingFinalityProviderId, value.finalityEvidenceVersion];
+}
+
+async function fails(operation: Promise<unknown>, stage: string): Promise<void> {
+  await assert.rejects(operation, (error: unknown) => {
+    assert.ok(error instanceof FinalityReconcilerError);
+    assert.equal((error as { stage: unknown }).stage, stage);
+    assert.equal(error.message, 'Transaction finality reconciliation failed.');
+    assert.equal(Object.hasOwn(error, 'cause'), false);
+    assert.ok(Object.isFrozen(error));
+    assert.doesNotMatch(String(error), /secret|invalid|candidates|history|clock|block/u);
+    return true;
+  });
 }
