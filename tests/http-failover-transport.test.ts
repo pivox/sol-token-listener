@@ -250,6 +250,54 @@ void test('best-effort cancels discarded responses and survives cancellation rej
   assert.equal(secondCancelled, 1);
 });
 
+void test('does not let a never-settling cancellation delay a healthy fallback', async () => {
+  let cancelCalls = 0;
+  let fallbackCalls = 0;
+  const transient = responseWithCancelableBody(503, () => {
+    cancelCalls += 1;
+    return new Promise<void>(() => undefined);
+  });
+  const expected = reply(200);
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    fetch: async (input) => {
+      if (inputUrl(input) === endpoints[0].url) return transient;
+      fallbackCalls += 1;
+      return expected;
+    },
+  });
+
+  const pending = fetch(endpoints[0].url);
+  await Promise.resolve();
+  assert.equal(cancelCalls, 1);
+  assert.equal(fallbackCalls, 1);
+  assert.equal(await pending, expected);
+});
+
+void test('contains a synchronous cancellation throw and still attempts fallback', async () => {
+  let cancelCalls = 0;
+  let calls = 0;
+  const transient = {
+    status: 503,
+    headers: new Headers(),
+    body: {
+      cancel: (): Promise<void> => {
+        cancelCalls += 1;
+        throw new Error('private synchronous cancellation');
+      },
+    },
+  } as unknown as Response;
+  const expected = reply(200);
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    fetch: async () => (++calls === 1 ? transient : expected),
+  });
+
+  assert.equal(await fetch(endpoints[0].url), expected);
+  assert.equal(cancelCalls, 1);
+  assert.equal(calls, 2);
+});
+
 void test('propagates an aborted fetch rejection unchanged and emits no events', async () => {
   const controller = new AbortController();
   const abortError = new Error('abort error includes request secret');
@@ -271,6 +319,70 @@ void test('propagates an aborted fetch rejection unchanged and emits no events',
   });
   assert.equal(calls, 1);
   assert.deepEqual(events, []);
+});
+
+void test('propagates init signal reason when abort follows a transient response resolution', async () => {
+  const requestController = new AbortController();
+  const initController = new AbortController();
+  const abortReason = new Error('private abort reason');
+  const events: RpcHttpFailoverEvent[] = [];
+  let calls = 0;
+  const input = new Request('https://primary.invalid/rpc', {
+    method: 'POST', body: 'body-secret', signal: requestController.signal,
+  });
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: [
+      { id: 'primary', url: 'https://primary.invalid/rpc' },
+      { id: 'fallback-1', url: 'https://fallback.invalid/rpc' },
+    ],
+    fetch: async () => {
+      calls += 1;
+      initController.abort(abortReason);
+      return reply(503);
+    },
+    onEvent: (event) => { events.push(event); },
+  });
+
+  await assert.rejects(fetch(input, { signal: initController.signal }), (error: unknown) => {
+    assert.equal(error, abortReason);
+    return true;
+  });
+  assert.equal(input.bodyUsed, false);
+  assert.equal(requestController.signal.aborted, false);
+  assert.equal(calls, 1);
+  assert.deepEqual(events, []);
+});
+
+void test('propagates abort during pending cancellation without failover or fallback fetch', async () => {
+  const controller = new AbortController();
+  const abortReason = new Error('private cancellation abort reason');
+  const events: RpcHttpFailoverEvent[] = [];
+  let calls = 0;
+  let cancelCalls = 0;
+  const transient = responseWithCancelableBody(503, () => {
+    cancelCalls += 1;
+    controller.abort(abortReason);
+    return new Promise<void>(() => undefined);
+  });
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    fetch: async () => { calls += 1; return transient; },
+    onEvent: (event) => { events.push(event); },
+  });
+
+  const noOutcome = Symbol('no outcome');
+  let outcome: unknown = noOutcome;
+  void fetch(endpoints[0].url, { signal: controller.signal }).then(
+    () => { outcome = new Error('unexpected resolution'); },
+    (error: unknown) => { outcome = error; },
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(outcome, abortReason);
+  assert.equal(cancelCalls, 1);
+  assert.equal(calls, 1);
+  assert.equal(events.some((event) => event.event === 'rpc.http_failover'), false);
+  assert.doesNotMatch(JSON.stringify(events), /private|cancellation abort/iu);
 });
 
 void test('preserves method, headers, body, signal, and init while rewriting only the URL', async () => {

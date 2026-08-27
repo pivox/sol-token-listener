@@ -83,12 +83,15 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
 
   return async (input, init): Promise<Response> => {
     requirePrimaryInput(input, states[0]?.url);
+    const signal = requestSignal(input, init);
+    throwIfAborted(signal);
     const startIndex = stickyIndex;
     const attemptedIndices = new Set<number>();
     const attemptedEndpointIds: RpcHttpEndpointId[] = [];
     let lastFailure: LastFailure | undefined;
 
     for (;;) {
+      throwIfAborted(signal);
       const endpointIndex = nextEligibleIndex(states, startIndex, attemptedIndices, now());
       if (endpointIndex === undefined) {
         emit(onEvent, Object.freeze({
@@ -101,6 +104,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
       const endpoint = states[endpointIndex];
       if (endpoint === undefined) throw new RpcHttpEndpointsExhaustedError();
       if (lastFailure !== undefined) {
+        throwIfAborted(signal);
         emit(onEvent, Object.freeze({
           event: 'rpc.http_failover',
           fromEndpointId: lastFailure.endpointId,
@@ -113,15 +117,17 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
       attemptedEndpointIds.push(endpoint.id);
       const rewrittenInput = rewriteInput(input, endpoint.url);
       let response: Response;
+      throwIfAborted(signal);
       try {
         response = await fetch(rewrittenInput, init);
       } catch (error) {
-        if (requestSignal(input, init)?.aborted === true) throw error;
+        if (signal?.aborted === true) throw error;
         const reason = 'NETWORK';
         degrade(endpoint, reason, DEFAULT_COOLDOWN_MS, now(), onEvent);
         lastFailure = { endpointId: endpoint.id, reason };
         continue;
       }
+      throwIfAborted(signal);
 
       const reason = transientReason(response.status);
       if (reason === undefined) {
@@ -134,7 +140,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
         ? retryAfterCooldown(response.headers.get('retry-after'), degradedAt)
         : DEFAULT_COOLDOWN_MS;
       degrade(endpoint, reason, cooldownMs, degradedAt, onEvent);
-      await cancelResponse(response);
+      cancelResponse(response);
       lastFailure = { endpointId: endpoint.id, reason };
     }
   };
@@ -245,6 +251,12 @@ function requestSignal(input: FetchInput, init: FetchInit): AbortSignal | undefi
   return input instanceof Request ? input.signal : undefined;
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return;
+  if (signal.reason !== undefined) throw signal.reason;
+  throw new DOMException('This operation was aborted.', 'AbortError');
+}
+
 function transientReason(status: number): RpcHttpFailureReason | undefined {
   switch (status) {
     case 429: return 'RATE_LIMITED';
@@ -287,9 +299,10 @@ function degrade(
   }));
 }
 
-async function cancelResponse(response: Response): Promise<void> {
+function cancelResponse(response: Response): void {
   try {
-    await response.body?.cancel();
+    const cancellation = response.body?.cancel();
+    if (cancellation !== undefined) void cancellation.catch(() => undefined);
   } catch {
     // A discarded provider body is never allowed to corrupt failover.
   }
