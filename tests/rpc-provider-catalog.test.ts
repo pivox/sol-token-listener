@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createRpcProviderCatalog } from '../src/solana/rpc/rpc-provider-catalog.js';
+import type { RpcProviderId as DomainRpcProviderId } from '../src/domain/rpc-provider.js';
+import type { RpcProviderId as CatalogRpcProviderId } from '../src/solana/rpc/rpc-provider-catalog.js';
+
+void test('re-exports the canonical neutral RPC provider identity', () => {
+  const domainProvider: DomainRpcProviderId = 'fallback-2';
+  const catalogProvider: CatalogRpcProviderId = domainProvider;
+  assert.equal(catalogProvider, 'fallback-2');
+});
 
 void test('keeps only the primary pair when issue 56 HTTP-only fallbacks are configured', () => {
   const catalog = createRpcProviderCatalog({

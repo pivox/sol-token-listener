@@ -1,6 +1,7 @@
 import type { AppConfig } from '../../config/env.js';
+import type { RpcProviderId } from '../../domain/rpc-provider.js';
 
-export type RpcProviderId = 'primary' | `fallback-${1 | 2 | 3}`;
+export type { RpcProviderId } from '../../domain/rpc-provider.js';
 
 export interface RpcProviderPair {
   readonly id: RpcProviderId;

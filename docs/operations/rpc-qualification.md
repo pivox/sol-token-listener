@@ -98,6 +98,36 @@ intentionnellement mono-fournisseur et ignore conceptuellement les listes de
 fallbacks. Il qualifie exactement `SOLANA_HTTP_RPC_URL + SOLANA_WS_RPC_URL`
 d'un seul fournisseur, pas une chaîne de basculement de production.
 
+## Fondations strictes de reprise (#60)
+
+La fondation #60 est inactive : elle n'est pas raccordée au listener de
+production. Celui-ci conserve le scanner et le subscriber legacy jusqu'au
+raccordement explicite de #63. Elle ne modifie donc ni le démarrage actuel ni
+la qualification `rpc:soak`.
+
+Lorsqu'elle sera activée par #63, une reprise stricte recevra à son
+constructeur un hash de genèse canonique explicitement approuvé par
+l'opérateur. Cette valeur de confiance ne doit jamais être apprise depuis le
+RPC `primary` pendant le même démarrage. Chaque reprise est épinglée à un seul
+provider positionnel ; les diagnostics et erreurs ne contiennent ni endpoint,
+ni hôte, ni URL, ni secret.
+
+La reprise reste exclusivement en observation ou paper : elle ne signe,
+construit, simule ni soumet de transaction. Elle lit les deux checkpoints,
+parcourt les deux programmes sur le même provider, puis enfile les découvertes
+avant d'avancer chaque checkpoint par CAS exact `(slot, signature)`. Un conflit
+CAS impose une reprise ultérieure depuis des limites durables fraîches ; il ne
+déclenche jamais un rebasage `live-edge`. Les appels concurrents sont coalescés
+en une seule analyse en vol, sans file de scans ni rotation de provider dans
+#60.
+
+Si une fenêtre bornée ne rejoint pas la limite exacte, une preuve strictement
+redactée est conservée avec cette limite. Une preuve non résolue ne reçoit pas
+de date de purge et reste conservée. Une analyse stricte ultérieure qui atteint
+la même limite la résout ; elle devient alors purgeable quatre heures après sa
+résolution. Ces limites volontairement bornées échouent de façon visible au
+lieu d'augmenter le trafic ou de prétendre à une continuité non démontrée.
+
 ## Exécution
 
 Commencer par le test par défaut :

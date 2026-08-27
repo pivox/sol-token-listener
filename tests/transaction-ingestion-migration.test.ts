@@ -8,6 +8,10 @@ import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/data
 
 const migrationUrl = new URL('../migrations/009_transaction_ingestion.sql', import.meta.url);
 const catchUpGapMigrationUrl = new URL('../migrations/016_listener_catch_up_gaps.sql', import.meta.url);
+const strictCatchUpFailureMigrationUrl = new URL(
+  '../migrations/026_listener_strict_catch_up_failures.sql',
+  import.meta.url,
+);
 
 void test('creates replayable four-hour catch-up gap evidence', async () => {
   const sql = await readFile(catchUpGapMigrationUrl, 'utf8');
@@ -27,6 +31,140 @@ void test('creates replayable four-hour catch-up gap evidence', async () => {
   assert.match(sql, /listener_catch_up_gaps_purge_idx/u);
   assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
   assert.doesNotMatch(sql, /DROP TABLE|private[_ ]?key|send[_ ]?transaction/iu);
+});
+
+void test('creates replayable strict catch-up failure evidence without unsafe diagnostics', async () => {
+  const sql = await readFile(strictCatchUpFailureMigrationUrl, 'utf8');
+
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS listener_strict_catch_up_failures/u);
+  assert.match(sql, /failure_id TEXT PRIMARY KEY/u);
+  assert.match(sql, /failure_id ~ '\^strict_catchup_failure_\[0-9a-f\]\{64\}\$'/u);
+  assert.match(sql, /checkpoint_key IN \('launchpad', 'market'\)/u);
+  assert.match(sql, /previous_slot NUMERIC\(78,0\)/u);
+  assert.match(sql, /previous_signature TEXT/u);
+  assert.match(sql, /\(previous_slot IS NULL\) = \(previous_signature IS NULL\)/u);
+  assert.match(sql, /previous_slot >= 0/u);
+  assert.match(sql, /previous_slot <> 'NaN'::NUMERIC/u);
+  assert.match(sql, /OCTET_LENGTH\(previous_signature\) BETWEEN 1 AND 128/u);
+  assert.match(sql, /provider_id IN \('primary', 'fallback-1', 'fallback-2', 'fallback-3'\)/u);
+  assert.match(sql, /observed_head_slot NUMERIC\(78,0\)/u);
+  assert.match(sql, /observed_head_slot >= 0/u);
+  assert.match(sql, /observed_head_slot <> 'NaN'::NUMERIC/u);
+  assert.match(sql, /reason_code IN \('CATCH_UP_WINDOW_EXCEEDED'\)/u);
+  assert.match(sql, /detected_at TIMESTAMPTZ NOT NULL/u);
+  assert.match(sql, /resolved_at TIMESTAMPTZ/u);
+  assert.match(sql, /purge_after TIMESTAMPTZ/u);
+  assert.match(sql, /isfinite\(detected_at\)/u);
+  assert.match(sql, /resolved_at IS NULL OR isfinite\(resolved_at\)/u);
+  assert.match(sql, /purge_after IS NULL OR isfinite\(purge_after\)/u);
+  assert.match(sql, /resolved_at IS NULL AND purge_after IS NULL/u);
+  assert.match(sql, /resolved_at IS NOT NULL[\s\S]*purge_after IS NOT NULL/u);
+  assert.match(sql, /purge_after = resolved_at \+ INTERVAL '4 hours'/u);
+  assert.match(sql, /listener_strict_catch_up_failures_unresolved_boundary_idx/u);
+  assert.match(sql, /listener_strict_catch_up_failures_resolved_purge_idx/u);
+  assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
+  assert.doesNotMatch(sql, /error|url|private[_ ]?key|secret|DROP TABLE|send[_ ]?transaction/iu);
+});
+
+void test('enforces strict failure lifecycle and finite numeric boundaries in PostgreSQL', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
+    return;
+  }
+  const schema = `strict_catch_up_failure_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    const sql = await readFile(strictCatchUpFailureMigrationUrl, 'utf8');
+    await pool.query(sql);
+    await pool.query(sql);
+    const insert = async (failureId: string, values: Readonly<{
+      readonly previousSlot?: string;
+      readonly previousSignature?: string | null;
+      readonly observedHeadSlot?: string | null;
+      readonly detectedAt?: string;
+      readonly resolvedAt?: string | null;
+      readonly purgeAfter?: string | null;
+    }> = {}) => pool.query(`INSERT INTO listener_strict_catch_up_failures (
+      failure_id, checkpoint_key, previous_slot, previous_signature, provider_id,
+      observed_head_slot, reason_code, detected_at, resolved_at, purge_after
+    ) VALUES ($1, 'launchpad', $2::NUMERIC, $3, 'primary', $4::NUMERIC,
+      'CATCH_UP_WINDOW_EXCEEDED', $5::TIMESTAMPTZ, $6::TIMESTAMPTZ,
+      $7::TIMESTAMPTZ)`, [
+      failureId,
+      values.previousSlot ?? '1',
+      values.previousSignature ?? 'strict-boundary',
+      values.observedHeadSlot ?? '2',
+      values.detectedAt ?? '2025-01-01T00:00:00.000Z',
+      values.resolvedAt ?? null,
+      values.purgeAfter ?? null,
+    ]);
+    const prefix = 'strict_catchup_failure_';
+    await assert.rejects(
+      insert(`${prefix}${'a'.repeat(64)}`, { resolvedAt: '2025-01-01T00:00:00.000Z' }),
+      /listener_strict_catch_up_failures_lifecycle_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'b'.repeat(64)}`, { previousSlot: 'NaN' }),
+      /listener_strict_catch_up_failures_previous_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'c'.repeat(64)}`, { observedHeadSlot: 'NaN' }),
+      /listener_strict_catch_up_failures_head_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'d'.repeat(64)}`, { detectedAt: 'infinity' }),
+      /listener_strict_catch_up_failures_detected_at_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'e'.repeat(64)}`, { detectedAt: '-infinity' }),
+      /listener_strict_catch_up_failures_detected_at_check/u,
+    );
+    // A finite purge timestamp avoids purge_after_check; lifecycle_check remains
+    // legitimately concurrent because no finite value can equal infinity + four hours.
+    const resolvedAtOrLifecycle = /listener_strict_catch_up_failures_(?:resolved_at|lifecycle)_check/u;
+    await assert.rejects(
+      insert(`${prefix}${'f'.repeat(64)}`, {
+        resolvedAt: 'infinity', purgeAfter: '2025-01-01T04:00:00.000Z',
+      }),
+      resolvedAtOrLifecycle,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'0'.repeat(64)}`, {
+        resolvedAt: '-infinity', purgeAfter: '2025-01-01T04:00:00.000Z',
+      }),
+      resolvedAtOrLifecycle,
+    );
+    // An infinite purge timestamp violates its finite bound and cannot satisfy
+    // the lifecycle equation with a finite resolved timestamp.
+    const purgeAfterOrLifecycle = /listener_strict_catch_up_failures_(?:purge_after|lifecycle)_check/u;
+    await assert.rejects(
+      insert(`${prefix}${'1'.repeat(64)}`, {
+        resolvedAt: '2025-01-01T00:00:00.000Z', purgeAfter: 'infinity',
+      }),
+      purgeAfterOrLifecycle,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'2'.repeat(64)}`, {
+        resolvedAt: '2025-01-01T00:00:00.000Z', purgeAfter: '-infinity',
+      }),
+      purgeAfterOrLifecycle,
+    );
+    await insert(`${prefix}${'3'.repeat(64)}`, {
+      resolvedAt: '2025-01-01T00:00:00.000Z',
+      purgeAfter: '2025-01-01T04:00:00.000Z',
+    });
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
 });
 
 void test('creates a replayable bigint-safe transaction inbox with strict lifecycle checks', async () => {
@@ -136,9 +274,21 @@ void test('defines the transaction inbox port at the canonical snapshot conversi
   assert.doesNotMatch(source, /purge/u);
 });
 
-void test('purges every retained terminal inbox row and exposes their count', async () => {
+void test('purges only expired resolved strict failures and exposes their count', async () => {
   const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
 
+  assert.match(source, /readonly listenerStrictCatchUpFailures: number;/u);
+  assert.match(
+    source,
+    /DELETE FROM listener_strict_catch_up_failures[\s\S]*resolved_at IS NOT NULL[\s\S]*purge_after <= clock_timestamp\(\)/u,
+  );
+  const strictFailureDeletion = /DELETE FROM listener_strict_catch_up_failures[\s\S]*?purge_after <= clock_timestamp\(\)/u
+    .exec(source)?.[0] ?? '';
+  assert.doesNotMatch(strictFailureDeletion, /resolved_at IS NULL/u);
+  assert.match(
+    source,
+    /listenerStrictCatchUpFailures: listenerStrictCatchUpFailures\.rowCount \?\? 0,/u,
+  );
   assert.match(source, /readonly transactionInbox: number;/u);
   assert.match(source, /DELETE FROM chain_transaction_inbox[\s\S]*terminal_at IS NOT NULL[\s\S]*purge_after <= clock_timestamp\(\)/u);
   const deletion = /DELETE FROM chain_transaction_inbox[\s\S]*?purge_after <= clock_timestamp\(\)/u
@@ -153,6 +303,9 @@ void test('purges every retained terminal inbox row and exposes their count', as
   const client = {
     query: async (text: string) => {
       queries.push(text);
+      if (text.includes('DELETE FROM listener_strict_catch_up_failures')) {
+        return { rows: [], rowCount: 2 };
+      }
       if (text.includes('DELETE FROM chain_transaction_inbox')) return { rows: [], rowCount: 3 };
       if (text.includes('WITH deleted AS')) {
         return { rows: [{ deleted_count: '0' }], rowCount: 1 };
@@ -164,11 +317,57 @@ void test('purges every retained terminal inbox row and exposes their count', as
   const pool = { connect: async () => client } as unknown as InstanceType<typeof pg.Pool>;
 
   const result = await purgeExpiredFoundationData(pool);
+  assert.equal(result.listenerStrictCatchUpFailures, 2);
   assert.equal(result.transactionInbox, 3);
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
 
-void test('applies migrations 001-025 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('retains unresolved and unexpired strict failure evidence in PostgreSQL', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
+    return;
+  }
+  const schema = `strict_catch_up_retention_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${schema}`,
+  });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    const strictFailure = async (
+      id: string,
+      resolvedAt: string | null,
+      purgeAfter: string | null,
+    ) => pool.query(`INSERT INTO listener_strict_catch_up_failures (
+      failure_id, checkpoint_key, previous_slot, previous_signature, provider_id,
+      observed_head_slot, reason_code, detected_at, resolved_at, purge_after
+    ) VALUES ($1, 'launchpad', 1, 'strict-boundary', 'primary', 2,
+      'CATCH_UP_WINDOW_EXCEEDED', '2025-01-01T00:00:00.000Z', $2, $3)`,
+    [id, resolvedAt, purgeAfter]);
+    const prefix = 'strict_catchup_failure_';
+    await strictFailure(`${prefix}${'a'.repeat(64)}`, '2025-01-01T00:00:00.000Z', '2025-01-01T04:00:00.000Z');
+    await strictFailure(`${prefix}${'b'.repeat(64)}`, null, null);
+    await strictFailure(`${prefix}${'c'.repeat(64)}`, '2999-01-01T00:00:00.000Z', '2999-01-01T04:00:00.000Z');
+
+    const result = await purgeExpiredFoundationData(pool);
+
+    assert.equal(result.listenerStrictCatchUpFailures, 1);
+    assert.deepEqual((await pool.query(`SELECT failure_id FROM listener_strict_catch_up_failures
+      ORDER BY failure_id`)).rows, [
+      { failure_id: `${prefix}${'b'.repeat(64)}` },
+      { failure_id: `${prefix}${'c'.repeat(64)}` },
+    ]);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
+void test('applies migrations 001-026 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -184,7 +383,7 @@ void test('applies migrations 001-025 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '025_paper_mvp_effective_configuration.sql');
+    assert.equal(applied.at(-1), '026_listener_strict_catch_up_failures.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);

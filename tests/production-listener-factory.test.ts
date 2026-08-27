@@ -115,7 +115,34 @@ void test('keeps the acknowledged WebSocket session foundation inactive until is
   );
 
   assert.doesNotMatch(source, /ws-program-session/u);
-  assert.match(source, /new SolanaProgramSubscriber\(/u);
+  assertProductionCatchUpWiring(source);
+});
+
+void test('production catch-up wiring guard rejects strict paths, symbols, and barrel references', () => {
+  assert.doesNotThrow(() => { assertProductionCatchUpWiring([
+    "import { CatchUpScanner } from './catch-up-scanner.js';",
+    "import { SolanaProgramSubscriber } from '../solana/rpc/program-subscriber.js';",
+    'const scanner = new CatchUpScanner();',
+    'const subscriber = new SolanaProgramSubscriber();',
+  ].join('\n')); });
+
+  for (const source of [
+    "import scanner from './strict-catch-up-scanner.js';",
+    "import coordinator from './strict-catch-up-coordinator.js';",
+    "import pinnedSource from '../solana/rpc/provider-pinned-catch-up-source.js';",
+    "import { createProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';",
+    "import { StrictCatchUpScanner } from './strict-catch-up-scanner.js';",
+    "import { StrictCatchUpCoordinator } from './strict-catch-up-coordinator.js';",
+    "import { ProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';",
+    "import { StrictCatchUpScanner } from './application.js';",
+    "import { createProviderPinnedCatchUpSource } from './application.js';",
+    'const scanner = new StrictCatchUpScanner();',
+    'const coordinator = new StrictCatchUpCoordinator();',
+    'const source = ProviderPinnedCatchUpSource;',
+    'const source = createProviderPinnedCatchUpSource();',
+  ]) {
+    assert.throws(() => { assertProductionCatchUpWiring(source); }, /strict catch-up/i);
+  }
 });
 
 void test('production composes one canonical qualification writer before paper decisions', async () => {
@@ -403,6 +430,29 @@ function config(overrides: Record<string, string> = {}): ReturnType<typeof parse
 
 function count(source: string, pattern: RegExp): number {
   return [...source.matchAll(pattern)].length;
+}
+
+function assertProductionCatchUpWiring(source: string): void {
+  assert.doesNotMatch(
+    source,
+    /\b(?:StrictCatchUpScanner|StrictCatchUpCoordinator|ProviderPinnedCatchUpSource|createProviderPinnedCatchUpSource)\b/u,
+    'Strict catch-up symbols must remain inactive until issue 63.',
+  );
+  assert.doesNotMatch(
+    source,
+    /(?:strict-catch-up-scanner|strict-catch-up-coordinator|provider-pinned-catch-up-source)/u,
+    'Strict catch-up module paths must remain inactive until issue 63.',
+  );
+  assert.match(
+    source,
+    /import\s*\{[^}]*\bCatchUpScanner\b[^}]*\}\s*from\s*['"]\.\/catch-up-scanner\.js['"]/u,
+  );
+  assert.match(source, /\bnew\s+CatchUpScanner\s*\(/u);
+  assert.match(
+    source,
+    /import\s*\{[^}]*\bSolanaProgramSubscriber\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/program-subscriber\.js['"]/u,
+  );
+  assert.match(source, /\bnew\s+SolanaProgramSubscriber\s*\(/u);
 }
 
 class ManualScheduler implements ListenerRuntimeScheduler {

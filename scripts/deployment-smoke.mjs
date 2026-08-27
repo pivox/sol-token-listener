@@ -60,6 +60,7 @@ const canonicalMigrations = Object.freeze([
   '023_paper_mvp_exact_strategy.sql',
   '024_paper_mvp_position_coverage.sql',
   '025_paper_mvp_effective_configuration.sql',
+  '026_listener_strict_catch_up_failures.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
@@ -69,6 +70,7 @@ const canonicalRetentionCounters = Object.freeze([
   'holderSnapshots',
   'launchTrades',
   'listenerCatchUpGaps',
+  'listenerStrictCatchUpFailures',
   'marketPools',
   'marketReserveSnapshots',
   'marketTrades',
