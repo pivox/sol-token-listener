@@ -53,10 +53,10 @@ void test('uses a transaction-wide advisory lock and releases after start failur
 });
 
 void test('rejects invalid financial configuration before opening PostgreSQL', async () => {
-  let connected = false;
+  let connectionCount = 0;
   const repository = new PostgresPaperMvpRepository({
     connect: async () => {
-      connected = true;
+      connectionCount += 1;
       throw new Error('must not connect');
     },
   });
@@ -68,7 +68,44 @@ void test('rejects invalid financial configuration before opening PostgreSQL', a
     repository.startOrResume({ ...configuration, networkFeeRawPerTransaction: -1n }, OWNER, 1_000),
     /network fee/u,
   );
-  assert.equal(connected, false);
+  assert.equal(connectionCount, 0);
+});
+
+void test('validates provider numeric(78) boundaries and hostile values before PostgreSQL', async () => {
+  let connectionCount = 0;
+  const repository = new PostgresPaperMvpRepository({
+    connect: async () => {
+      connectionCount += 1;
+      throw new Error('must not connect');
+    },
+  });
+  const maximum = 10n ** 78n - 1n;
+  const progress = (providerUsage: unknown) => repository.recordProgress({
+    runId: 'provider-validation-run', runnerOwnerId: OWNER,
+    expectedUpdatedAtMs: 1_000, observedAtMs: 2_000, counters: progressCounters,
+    providerUsage: providerUsage as PaperMvpProviderUsage,
+    samples: Object.freeze([]), unknownPositions: Object.freeze([]),
+  });
+  await assert.rejects(progress({
+    status: 'AVAILABLE', creditsUsedStart: maximum, creditsUsedEnd: maximum,
+    rateLimitedCount: 0,
+  }), /repository operation failed/u);
+  for (const invalid of [
+    { status: 'AVAILABLE', creditsUsedStart: 0n, creditsUsedEnd: 10n ** 78n, rateLimitedCount: 0 },
+    { status: 'AVAILABLE', creditsUsedStart: 0, creditsUsedEnd: 1n, rateLimitedCount: 0 },
+    { status: 'AVAILABLE', creditsUsedStart: '0', creditsUsedEnd: '1', rateLimitedCount: 0 },
+    { status: 'AVAILABLE', creditsUsedStart: -1n, creditsUsedEnd: 1n, rateLimitedCount: 0 },
+    { status: 'AVAILABLE', creditsUsedStart: 2n, creditsUsedEnd: 1n, rateLimitedCount: 0 },
+    new Proxy({
+      status: 'AVAILABLE', creditsUsedStart: 0n, creditsUsedEnd: 1n, rateLimitedCount: 0,
+    }, {}),
+    Object.defineProperty({
+      creditsUsedStart: 0n, creditsUsedEnd: 1n, rateLimitedCount: 0,
+    }, 'status', { get: () => { throw new Error('provider-secret'); } }),
+  ]) {
+    await assert.rejects(progress(invalid), /^TypeError: Paper MVP provider usage is invalid\.$/u);
+  }
+  assert.equal(connectionCount, 1);
 });
 
 void test('persists the exact 79-digit derived PnL at the accepted 78-digit fee boundary', async (context) => {
@@ -437,6 +474,60 @@ void test('replacement ownership fences stale progress and terminalization', asy
     });
     assert.equal(terminal.runnerOwnerId, null);
     assert.equal(terminal.state, 'FAILED');
+  });
+});
+
+void test('replacement claim waits for in-flight progress then fences every later stale write', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL fencing barrier test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const initial = await new PostgresPaperMvpRepository(pool)
+      .startOrResume(configuration, 'owner-a', 1_000);
+    let resolveShared: (() => void) | undefined;
+    const sharedAcquired = new Promise<void>((resolve) => { resolveShared = resolve; });
+    let releaseShared: (() => void) | undefined;
+    const mayProgress = new Promise<void>((resolve) => { releaseShared = resolve; });
+    const oldOwner = new PostgresPaperMvpRepository({
+      connect: async () => {
+        const client = await pool.connect();
+        return {
+          query: async (text: string, values?: readonly unknown[]) => {
+            const result = await client.query(text, values === undefined ? [] : [...values]);
+            if (text.includes('pg_advisory_xact_lock_shared')) {
+              resolveShared?.();
+              await mayProgress;
+            }
+            return result;
+          },
+          release: () => { client.release(); },
+        };
+      },
+    });
+    const inFlight = oldOwner.recordProgress({
+      runId: initial.runId, runnerOwnerId: 'owner-a', expectedUpdatedAtMs: initial.updatedAtMs,
+      observedAtMs: 1_500, counters: progressCounters, providerUsage: initial.providerUsage,
+      samples: Object.freeze([]), unknownPositions: Object.freeze([]),
+    });
+    await sharedAcquired;
+    let replacementSettled = false;
+    const replacementPromise = new PostgresPaperMvpRepository(pool)
+      .startOrResume(configuration, 'owner-b', 2_000)
+      .finally(() => { replacementSettled = true; });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.equal(replacementSettled, false);
+    releaseShared?.();
+    assert.equal((await inFlight).runnerOwnerId, 'owner-a');
+    const replacement = await replacementPromise;
+    assert.equal(replacement.runnerOwnerId, 'owner-b');
+    assert.equal(replacement.updatedAtMs, 1_500);
+    await assert.rejects(oldOwner.recordProgress({
+      runId: initial.runId, runnerOwnerId: 'owner-a', expectedUpdatedAtMs: 1_500,
+      observedAtMs: 2_001, counters: progressCounters, providerUsage: initial.providerUsage,
+      samples: Object.freeze([]), unknownPositions: Object.freeze([]),
+    }), isConflict('RUN_OWNERSHIP_LOST'));
   });
 });
 

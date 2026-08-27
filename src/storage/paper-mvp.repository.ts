@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { types } from 'node:util';
 import {
   createPaperMvpPositionSample,
   createPaperMvpReport,
@@ -60,6 +61,11 @@ const UNKNOWN_REASONS = Object.freeze([
   'MISSING_PAPER_SELL_AT','INVALID_TIMESTAMP_ORDER','MISSING_BUY_TRADE',
   'MISSING_SELL_TRADE','UNSUPPORTED_EXIT_REASON','SOURCE_CONTRADICTION','POSITION_RETRACTED',
 ] as const);
+const MAX_NUMERIC_78 = 10n ** 78n - 1n;
+const OWNER_FENCE_SQL =
+  "SELECT pg_advisory_xact_lock(hashtextextended('paper-mvp-owner-fence:v1', 0))";
+const SHARED_OWNER_FENCE_SQL =
+  "SELECT pg_advisory_xact_lock_shared(hashtextextended('paper-mvp-owner-fence:v1', 0))";
 
 export class PostgresPaperMvpRepository implements PaperMvpRepository {
   public constructor(private readonly pool: PaperMvpPool = getDatabasePool()) {}
@@ -74,6 +80,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
     timestamp(nowMs, 'nowMs');
     timestamp(nowMs + config.maxDurationMs, 'deadlineAtMs');
     return this.transaction('start', async (client) => {
+      await client.query(OWNER_FENCE_SQL);
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended('paper-mvp-active-run', 0))",
       );
@@ -136,6 +143,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       ids.add(positionId);
     }
     return this.transaction('progress', async (client) => {
+      await client.query(SHARED_OWNER_FENCE_SQL);
       await lockRun(client, progress.runId);
       const before = await selectRun(client, progress.runId, true);
       if (before?.state !== 'RUNNING') {
@@ -198,6 +206,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
   public async terminalize(input: PaperMvpTerminalization): Promise<PaperMvpRun> {
     validateTerminalization(input);
     return this.transaction('terminalize', async (client) => {
+      await client.query(SHARED_OWNER_FENCE_SQL);
       await lockRun(client, input.runId);
       const before = await selectRun(client, input.runId, true);
       if (before === null) throw new PaperMvpConflictError('RUN_NOT_ACTIVE');
@@ -468,24 +477,53 @@ function validateRunCounters(value: PaperMvpRunCounters): PaperMvpRunCounters {
 }
 
 function validateProviderUsage(value: PaperMvpProviderUsage): PaperMvpProviderUsage {
-  integer(value.rateLimitedCount, 0, 1_000_000, 'rate limited count');
-  const status: unknown = value.status;
+  const fields = providerUsageFields(value);
+  if (typeof fields.rateLimitedCount !== 'number') {
+    throw new TypeError('Paper MVP provider usage is invalid.');
+  }
+  integer(fields.rateLimitedCount, 0, 1_000_000, 'rate limited count');
+  const status = fields.status;
   if (status === 'UNAVAILABLE') {
-    if (value.creditsUsedStart !== null || value.creditsUsedEnd !== null) {
+    if (fields.creditsUsedStart !== null || fields.creditsUsedEnd !== null) {
       throw new TypeError('Paper MVP provider usage is invalid.');
     }
   } else if (status === 'AVAILABLE') {
-    if (value.creditsUsedStart === null || value.creditsUsedEnd === null
-      || value.creditsUsedStart < 0n || value.creditsUsedEnd < value.creditsUsedStart) {
+    if (typeof fields.creditsUsedStart !== 'bigint' || typeof fields.creditsUsedEnd !== 'bigint'
+      || fields.creditsUsedStart < 0n || fields.creditsUsedStart > MAX_NUMERIC_78
+      || fields.creditsUsedEnd < fields.creditsUsedStart || fields.creditsUsedEnd > MAX_NUMERIC_78) {
       throw new TypeError('Paper MVP provider usage is invalid.');
     }
   } else throw new TypeError('Paper MVP provider usage is invalid.');
   return Object.freeze({
     status,
-    creditsUsedStart: value.creditsUsedStart,
-    creditsUsedEnd: value.creditsUsedEnd,
-    rateLimitedCount: value.rateLimitedCount,
+    creditsUsedStart: fields.creditsUsedStart,
+    creditsUsedEnd: fields.creditsUsedEnd,
+    rateLimitedCount: fields.rateLimitedCount,
   });
+}
+
+function providerUsageFields(value: unknown): Readonly<Record<
+  'status' | 'creditsUsedStart' | 'creditsUsedEnd' | 'rateLimitedCount', unknown
+>> {
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value) || types.isProxy(value)) {
+      throw new TypeError('Paper MVP provider usage is invalid.');
+    }
+    const result: Record<'status' | 'creditsUsedStart' | 'creditsUsedEnd' | 'rateLimitedCount', unknown> = {
+      status: undefined, creditsUsedStart: undefined, creditsUsedEnd: undefined,
+      rateLimitedCount: undefined,
+    };
+    for (const field of ['status','creditsUsedStart','creditsUsedEnd','rateLimitedCount'] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, field);
+      if (descriptor === undefined || !('value' in descriptor)) {
+        throw new TypeError('Paper MVP provider usage is invalid.');
+      }
+      result[field] = descriptor.value;
+    }
+    return result;
+  } catch {
+    throw new TypeError('Paper MVP provider usage is invalid.');
+  }
 }
 
 function assertProgress(

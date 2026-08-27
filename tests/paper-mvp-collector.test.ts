@@ -294,6 +294,8 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
   assert.match(queries[0]?.text ?? '', /close_event\.confirmation_status[\s\S]*finalized[\s\S]*orphaned/u);
   assert.match(queries[0]?.text ?? '', /candidates AS MATERIALIZED[\s\S]*LIMIT \$6/u);
   assert.match(queries[0]?.text ?? '', /run_creations AS MATERIALIZED[\s\S]*detected_at BETWEEN \$2 AND \$3/u);
+  assert.match(queries[0]?.text ?? '', /run_creations AS MATERIALIZED[\s\S]*LIMIT 1000001/u);
+  assert.match(queries[0]?.text ?? '', /rejected_entries AS MATERIALIZED[\s\S]*LIMIT 1000001/u);
   assert.match(queries[0]?.text ?? '', /SELECT DISTINCT candidate\.mint[\s\S]*CREATION_ENTRY_REJECTED[\s\S]*CREATION_ENTRY_EXPIRED/u);
   assert.match(queries[0]?.text ?? '', /candidate\.created_at BETWEEN \$2 AND \$3/u);
   assert.doesNotMatch(queries[0]?.text ?? '', /FROM paper_trades trade JOIN eligible/u);
@@ -522,6 +524,67 @@ void test('excludes rejected candidates created after the immutable run deadline
     });
     assert.equal(batch.creationsObserved, 1);
     assert.equal(batch.entriesRejected, 0);
+  });
+});
+
+void test('retains inclusive-window launch and rejected candidate coverage only while the run is active', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL coverage retention test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    await pool.query('DELETE FROM paper_trades');
+    await pool.query('DELETE FROM paper_positions');
+    await pool.query('DELETE FROM paper_decision_jobs');
+    await pool.query("DELETE FROM domain_events WHERE event_id='close-event'");
+    const deadlineAt = Date.now();
+    const startedAt = deadlineAt - 14_400_000;
+    await pool.query(`UPDATE token_launches SET detected_at=$1,updated_at=$2,
+      terminal_at=$2,purge_after=$2 WHERE mint='MINT'`, [new Date(deadlineAt),new Date(startedAt)]);
+    const reportId = `qreport_${'c'.repeat(64)}`;
+    await pool.query(`INSERT INTO qualification_reports (
+      report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
+      profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
+      preparation_score,social_score,onchain_score,total_score,as_of_slot,
+      as_of_transaction_index,as_of_instruction_index,confirmation_status,evaluated_at,
+      purge_after,payload_version,payload
+    ) VALUES ($1,'MINT','source-open','raw-open','source-open','profile',1,$2,$3,
+      'REJECTED',0,0,0,0,1,0,0,'confirmed',$4,$5,1,'{}')`, [
+      reportId,'d'.repeat(64),'e'.repeat(64),new Date(startedAt),new Date(deadlineAt),
+    ]);
+    const candidateId = `candidate_${'f'.repeat(64)}`;
+    await pool.query(`INSERT INTO trading_candidates (
+      candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
+      strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,
+      quote_decimals,quote_token_program,reason_codes,created_at,purge_after,
+      payload_version,payload
+    ) VALUES ($1,'MINT',$2,'source-open','source-open','creation-entry-v1',1,$3,
+      'confirmed','NOT_ELIGIBLE','SOL',9,'SPL_TOKEN',$4,$5,$6,1,'{}')`, [
+      candidateId,reportId,'a'.repeat(64),JSON.stringify(['CREATION_ENTRY_REJECTED']),
+      new Date(startedAt),new Date(deadlineAt),
+    ]);
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(Object.freeze({
+      ...runSnapshot.run.configuration,maxDurationMs:14_400_000,
+    }),OWNER,startedAt);
+
+    const protectedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.tradingCandidates,0);
+    assert.equal(protectedPurge.tokenLaunches,0);
+    assert.equal((await pool.query('SELECT 1 FROM trading_candidates')).rowCount,1);
+    assert.equal((await pool.query('SELECT 1 FROM token_launches')).rowCount,1);
+
+    await repository.terminalize({
+      runId:run.runId,runnerOwnerId:OWNER,terminalAtMs:deadlineAt,
+      state:'FAILED',completionReason:null,report:null,failureCode:'TEST_TERMINAL',
+    });
+    const releasedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(releasedPurge.tradingCandidates,1);
+    assert.equal(releasedPurge.tokenLaunches,1);
+    assert.equal((await pool.query('SELECT 1 FROM trading_candidates')).rowCount,0);
+    assert.equal((await pool.query('SELECT 1 FROM token_launches')).rowCount,0);
   });
 });
 

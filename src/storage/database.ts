@@ -8,12 +8,17 @@ type PgPool = InstanceType<typeof pg.Pool>;
 let sharedPool: PgPool | null = null;
 const migrationAdvisoryLockId = 7_347_662_125;
 
-export function getDatabasePool(databaseUrl = process.env.DATABASE_URL): PgPool {
+export function getDatabasePool(
+  databaseUrl = process.env.DATABASE_URL,
+  options: Readonly<Pick<pg.PoolConfig,
+    'connectionTimeoutMillis' | 'query_timeout' | 'statement_timeout' | 'lock_timeout'
+    | 'idle_in_transaction_session_timeout'>> = {},
+): PgPool {
   if (sharedPool !== null) return sharedPool;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     throw new Error('DATABASE_URL is required to access PostgreSQL.');
   }
-  sharedPool = new pg.Pool({ connectionString: databaseUrl });
+  sharedPool = new pg.Pool({ connectionString: databaseUrl, ...options });
   return sharedPool;
 }
 
@@ -263,6 +268,19 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          AND NOT EXISTS (
            SELECT 1 FROM paper_strategy_sessions session
            WHERE session.candidate_id = candidate.candidate_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_mvp_runs run
+           WHERE run.state='RUNNING'
+             AND run.strategy_id=candidate.strategy_id
+             AND run.strategy_version=candidate.strategy_version
+             AND candidate.created_at BETWEEN run.started_at AND run.deadline_at
+             AND candidate.reason_codes ?| ARRAY['CREATION_ENTRY_REJECTED','CREATION_ENTRY_EXPIRED']
+             AND EXISTS (
+               SELECT 1 FROM token_launches launch
+               WHERE launch.mint=candidate.mint
+                 AND launch.detected_at BETWEEN run.started_at AND run.deadline_at
+             )
          )`,
     );
     const qualificationReports = await client.query(
@@ -539,6 +557,11 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            WHERE session.mint = launch.mint
              AND (session.purge_after IS NULL
                OR session.purge_after > statement_timestamp())
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM paper_mvp_runs run
+           WHERE run.state='RUNNING'
+             AND launch.detected_at BETWEEN run.started_at AND run.deadline_at
          )
          AND NOT EXISTS (
            SELECT 1 FROM paper_positions position

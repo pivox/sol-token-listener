@@ -21,14 +21,17 @@ export class PostgresPaperMvpSource implements PaperMvpSource {
     strategyId: string;
     strategyVersion: number;
     limit: number;
+    signal?: AbortSignal;
   }>): Promise<PaperMvpSourceBatch> {
     if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
       throw new RangeError('Paper MVP source limit must be between 1 and 1000.');
     }
+    input.signal?.throwIfAborted();
     const result = await this.pool.query(COLLECT_SQL, [
       input.runId, new Date(input.startedAtMs), new Date(input.deadlineAtMs),
       input.strategyId, input.strategyVersion, input.limit,
     ]);
+    input.signal?.throwIfAborted();
     const first = result.rows[0];
     const creationsObserved = first === undefined ? 0 : count(first.creations_observed);
     const entriesRejected = first === undefined ? 0 : count(first.entries_rejected);
@@ -50,6 +53,8 @@ const COLLECT_SQL = `WITH run_creations AS MATERIALIZED (
   SELECT launch.mint
   FROM token_launches launch
   WHERE launch.detected_at BETWEEN $2 AND $3
+  ORDER BY launch.detected_at,launch.mint
+  LIMIT 1000001
 ), rejected_entries AS MATERIALIZED (
   SELECT DISTINCT candidate.mint
   FROM trading_candidates candidate
@@ -57,6 +62,8 @@ const COLLECT_SQL = `WITH run_creations AS MATERIALIZED (
   WHERE candidate.strategy_id=$4 AND candidate.strategy_version=$5
     AND candidate.created_at BETWEEN $2 AND $3
     AND candidate.reason_codes ?| ARRAY['CREATION_ENTRY_REJECTED','CREATION_ENTRY_EXPIRED']
+  ORDER BY candidate.mint
+  LIMIT 1000001
 ), coverage AS (
   SELECT (SELECT COUNT(*)::integer FROM run_creations) AS creations_observed,
     (SELECT COUNT(*)::integer FROM rejected_entries) AS entries_rejected

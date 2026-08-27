@@ -9,6 +9,7 @@ const migrationUrl = new URL('../migrations/018_paper_mvp_validation.sql', impor
 const collectionMigrationUrl = new URL('../migrations/019_paper_mvp_collection.sql', import.meta.url);
 const derivedPnlMigrationUrl = new URL('../migrations/020_paper_mvp_derived_pnl.sql', import.meta.url);
 const runnerHardeningMigrationUrl = new URL('../migrations/021_paper_mvp_runner_hardening.sql', import.meta.url);
+const coverageIndexesMigrationUrl = new URL('../migrations/022_paper_mvp_coverage_indexes.sql', import.meta.url);
 
 void test('defines replayable paper MVP runs and immutable samples', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
@@ -69,7 +70,14 @@ void test('adds durable runner ownership and completion reason without rewriting
   assert.match(sql, /state='FAILED'.*runner_owner_id IS NULL.*completion_reason IS NULL/su);
 });
 
-void test('applies migrations 001-021 on an empty schema and replays cleanly', async (context) => {
+void test('adds replayable covering indexes for bounded paper MVP coverage scans', async () => {
+  const sql = await readFile(coverageIndexesMigrationUrl, 'utf8');
+  assert.match(sql, /CREATE INDEX IF NOT EXISTS token_launches_paper_mvp_coverage_idx[\s\S]*\(detected_at, mint\)/u);
+  assert.match(sql, /CREATE INDEX IF NOT EXISTS trading_candidates_paper_mvp_coverage_idx[\s\S]*\(strategy_id, strategy_version, created_at, mint\)/u);
+  assert.doesNotMatch(sql, /DROP\s|DELETE\s|UPDATE\s|private[_ ]?key|keypair/iu);
+});
+
+void test('applies migrations 001-022 on an empty schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: PostgreSQL paper MVP migration test skipped');
@@ -81,8 +89,22 @@ void test('applies migrations 001-021 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '021_paper_mvp_runner_hardening.sql');
+    assert.equal(applied.at(-1), '022_paper_mvp_coverage_indexes.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
+    await pool.query('SET enable_seqscan=off');
+    const launchPlan = await pool.query<Readonly<{ 'QUERY PLAN': string }>>(`EXPLAIN (COSTS OFF)
+      SELECT mint FROM token_launches
+      WHERE detected_at BETWEEN NOW() - INTERVAL '1 hour' AND NOW()
+      ORDER BY detected_at,mint LIMIT 1000001`);
+    const candidatePlan = await pool.query<Readonly<{ 'QUERY PLAN': string }>>(`EXPLAIN (COSTS OFF)
+      SELECT DISTINCT mint FROM trading_candidates
+      WHERE strategy_id='creation-entry-v1' AND strategy_version=1
+        AND created_at BETWEEN NOW() - INTERVAL '1 hour' AND NOW()
+      ORDER BY mint LIMIT 1000001`);
+    assert.match(launchPlan.rows.map((row) => row['QUERY PLAN']).join('\n'),
+      /token_launches_paper_mvp_coverage_idx/u);
+    assert.match(candidatePlan.rows.map((row) => row['QUERY PLAN']).join('\n'),
+      /trading_candidates_paper_mvp_coverage_idx/u);
     const sql = await readFile(collectionMigrationUrl, 'utf8');
     await pool.query(sql);
     await pool.query(sql);
