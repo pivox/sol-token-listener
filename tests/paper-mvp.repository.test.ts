@@ -29,7 +29,7 @@ const configuration: PaperMvpRunConfiguration = Object.freeze({
 const OWNER = 'paper-mvp-owner-test';
 const progressCounters = Object.freeze({
   creationsObserved: 1, entriesRejected: 0,
-  duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+  duplicateLogicalBuys: 0, duplicateLogicalSells: 0, openedPositions: 2, openPositions: 1,
 });
 
 void test('uses a transaction-wide advisory lock and releases after start failure', async () => {
@@ -653,6 +653,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       unknownPositions: Object.freeze([]),
     });
     assert.equal(progressed.closedPositions, 1);
+    assert.deepEqual([progressed.counters.openedPositions, progressed.counters.openPositions], [2, 1]);
     const replayed = await repository.recordProgress({
       runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: progressed.updatedAtMs,
       observedAtMs: 2_001, counters: progressCounters,
@@ -661,6 +662,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       unknownPositions: Object.freeze([]),
     });
     assert.equal(replayed.closedPositions, 1);
+    assert.deepEqual([replayed.counters.openedPositions, replayed.counters.openPositions], [2, 1]);
 
     const withUnknown = await repository.recordProgress({
       runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: replayed.updatedAtMs,
@@ -710,6 +712,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       startedAtMs: run.startedAtMs, completedAtMs: 3_000,
       targetClosedPositions: 1, initialCapitalRaw: configuration.initialCapitalRaw,
       quoteMint: configuration.quoteMint, creationsObserved: 1, entriesRejected: 0,
+      openedPositions: 2, openPositions: 1,
       samples: Object.freeze([firstSample]), unknownTerminalPositions: 1,
       duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
       providerUsage: progressed.providerUsage,
@@ -719,6 +722,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       failureCode: null,
     });
     assert.equal(terminal.state, 'COMPLETED');
+    assert.deepEqual([terminal.counters.openedPositions, terminal.counters.openPositions], [2, 1]);
     assert.equal(terminal.purgeAfterMs, 3_000 + 4 * 60 * 60 * 1_000);
     assert.equal((await repository.terminalize({
       runId: run.runId, runnerOwnerId: OWNER, terminalAtMs: 3_000, state: 'COMPLETED', completionReason: 'TARGET_REACHED', report,
