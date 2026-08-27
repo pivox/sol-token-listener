@@ -2,7 +2,7 @@
 
 Date: 2026-08-27
 Issue: #56
-Version: 1.0.0
+Version: 1.0.1
 Status: approved through the standing instruction to use the recommended option
 
 ## Purpose
@@ -75,7 +75,8 @@ Configuration parsing:
 - canonicalizes and rejects duplicates, including the primary endpoint;
 - never includes a configured URL in a validation error;
 - freezes the resulting ordered endpoint list;
-- preserves single-endpoint behavior when the fallback variable is absent.
+- preserves the existing single-endpoint `Connection` and its web3.js retry
+  behavior when the fallback variable is absent.
 
 Endpoint identities are positional and non-secret: `primary`, `fallback-1`,
 `fallback-2`, and `fallback-3`. Provider names and URL-derived identifiers are
@@ -121,9 +122,11 @@ fallback from hiding invalid credentials, malformed requests or deterministic
 RPC errors. A `null` application result such as unavailable archive history is
 also not a transport failure; existing durable retries remain authoritative.
 
-The transport sets `disableRetryOnRateLimit: true` on `Connection`. Otherwise
-web3.js would perform its own 500/1,000/2,000/4,000 ms retry cycle independently
-for every fallback endpoint.
+When at least one fallback is configured, the transport sets
+`disableRetryOnRateLimit: true` on `Connection`. Otherwise web3.js would
+perform its own 500/1,000/2,000/4,000 ms retry cycle independently for every
+fallback endpoint. With no fallback, no rotating fetch is injected and the
+existing web3.js rate-limit retry remains unchanged.
 
 ## Cooldown and concurrency
 
@@ -168,10 +171,11 @@ Public API and PostgreSQL schemas remain unchanged in issue #56.
 
 ## Integration
 
-`SolanaRpcClient` constructs the rotating fetch from the parsed endpoint list
-and injects it into the one production `Connection`. The existing primary URL
-remains the `Connection` endpoint so web3.js request construction and its
-HTTP/HTTPS agent selection stay compatible.
+When the parsed list contains a fallback, `SolanaRpcClient` constructs the
+rotating fetch and injects it into the one production `Connection`. The
+existing primary URL remains the `Connection` endpoint so web3.js request
+construction and its HTTP/HTTPS agent selection stay compatible. A list
+containing only the primary uses the existing unmodified `Connection` setup.
 
 The following production paths therefore receive the same fallback behavior:
 
