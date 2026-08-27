@@ -33,9 +33,10 @@ sous la forme canonique `--nom=valeur`.
 
 ## Arrêt, reprise et résultat
 
-Le processus acquiert son verrou PostgreSQL de runner avant de démarrer le
-listener ou l'API, vérifie sa propriété avant et après chaque étape de démarrage,
-puis collecte sériellement. Chaque mutation durable porte aussi l'identifiant
+Le processus acquiert son verrou PostgreSQL de runner, applique les migrations,
+revendique le run durable, puis seulement démarre le listener ou l'API. Il
+vérifie sa propriété avant et après chaque étape de démarrage, puis collecte
+sériellement. Chaque mutation durable porte aussi l'identifiant
 opaque du propriétaire courant. Une perte de la session du verrou arrête donc
 le processus avec le code `1` sans terminaliser le run : il reste `RUNNING` et
 reprenable, tandis qu'un propriétaire remplacé ne peut plus progresser ni
@@ -45,12 +46,14 @@ exacte du run `RUNNING`. Une configuration différente ou un second runner
 échoue sans adopter ni faire progresser le run.
 
 La cible produit le rapport terminal. Deadline, `SIGINT` et `SIGTERM` demandent
-une dernière collecte, puis produisent toujours un run `COMPLETED` et un rapport
-exporté non-PASS. Le champ `completionReason` vaut `TARGET_REACHED`, `TIMEOUT`,
+une dernière collecte bornée à cinq secondes, puis produisent toujours un run
+`COMPLETED` et un rapport exporté non-PASS. Le champ `completionReason` vaut `TARGET_REACHED`, `TIMEOUT`,
 `SIGINT` ou `SIGTERM`. `TIMEOUT` ajoute la gate `RUN_TIMED_OUT`; les deux signaux
 ajoutent `RUN_INTERRUPTED`. Ces trois raisons imposent `technicalStatus=DEGRADED`
 et `verdict=FAIL`, même si la dernière collecte atteint la cible. Si la cible
 reste incomplète, `CLOSED_POSITIONS_BELOW_TARGET` s'ajoute également.
+Un second signal force la fin de cette dernière tentative. La perte du verrou
+reste prioritaire et laisse le run reprenable.
 
 `LEGACY` est réservé au backfill des rapports terminaux antérieurs à la migration
 021 et n'est jamais produit par cette commande. Il ajoute uniquement le champ de

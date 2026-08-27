@@ -102,9 +102,11 @@ void test('runs the real bootstrap lifetime, reaches target, verifies durable st
   const result = await runPaperMvp({ ...options(), targetClosedPositions: 1, reportFile }, {
     ...dependencies(repository),
     now: sequenceClock(1_000, 2_000, 2_001, 3_000),
-    runBootstrap: async (inside) => {
+    runBootstrap: async (prepare, inside, cleanup) => {
       calls.push('bootstrap:start');
-      assert.equal(await inside(Object.freeze({})), 'SIGTERM');
+      const pool = Object.freeze({});
+      await prepare(pool);
+      try { assert.equal(await inside(pool), 'SIGTERM'); } finally { await cleanup(); }
       calls.push('bootstrap:closed');
     },
     createCollector: () => ({
@@ -269,6 +271,95 @@ void test('a timeout below target exports the durable failing report with exit c
   assert.equal(writes.length, 1);
 });
 
+void test('bounds a never-settling final timeout collection and suppresses its late rejection', async () => {
+  const repository = new MemoryRepository();
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  let aborts = 0;
+  try {
+    const result = await runPaperMvp(options(), {
+      ...dependencies(repository),
+      now: sequenceClock(1_000,61_000,61_001,61_002),
+      finalCollectionGraceMs: 10,
+      createCollector: () => ({
+        collect: ({ signal }) => new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            aborts += 1;
+            queueMicrotask(() => { reject(new Error('late-provider-secret')); });
+          }, { once:true });
+        }),
+      }),
+      createStopController: () => stopController('POLL'),
+    });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.equal(result.report?.completionReason,'TIMEOUT');
+    assert.equal(result.exitCode,2);
+    assert.equal(aborts,1);
+    assert.deepEqual(unhandled,[]);
+  } finally {
+    process.off('unhandledRejection',onUnhandled);
+  }
+});
+
+void test('first signal aborts the current collection and a second signal forces the final attempt', async () => {
+  const repository = new MemoryRepository();
+  let resolveFirst: ((signal: 'SIGINT') => void) | undefined;
+  const firstSignal = new Promise<'SIGINT'>((resolve) => { resolveFirst = resolve; });
+  let resolveForced: (() => void) | undefined;
+  const forced = new Promise<void>((resolve) => { resolveForced = resolve; });
+  let collects = 0;
+  let aborts = 0;
+  const result = await runPaperMvp(options(), {
+    ...dependencies(repository),
+    createCollector: () => ({
+      collect: ({ signal }) => {
+        collects += 1;
+        if (collects === 1) resolveFirst?.('SIGINT');
+        else resolveForced?.();
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            aborts += 1;
+            reject(new Error('aborted'));
+          }, { once:true });
+        });
+      },
+    }),
+    createStopController: () => Object.freeze({
+      firstSignal,forced,wait:async () => 'POLL' as const,close:() => undefined,
+    }),
+  });
+  assert.equal(result.report?.completionReason,'SIGINT');
+  assert.equal(result.exitCode,2);
+  assert.equal(collects,2);
+  assert.equal(aborts,2);
+});
+
+void test('lease loss aborts a never-settling collection without terminalization or report', async () => {
+  const repository = new MemoryRepository();
+  const controlled = controlledRunnerLease();
+  let aborted = false;
+  await assert.rejects(runPaperMvp(options(), {
+    ...dependencies(repository),
+    acquireRunner: async () => controlled.lease,
+    createCollector: () => ({
+      collect: ({ signal }) => {
+        controlled.lose();
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            aborted = true;
+            reject(new Error('aborted'));
+          }, { once:true });
+        });
+      },
+    }),
+    createStopController: () => stopController('POLL'),
+  }), isCliError('RUNNER_LOCK_LOST'));
+  assert.equal(aborted,true);
+  assert.equal(repository.terminalizations,0);
+  assert.equal(repository.snapshot?.run.state,'RUNNING');
+});
+
 void test('redacts runtime failures, closes signal and ownership resources, and leaves no report', async () => {
   const repository = new MemoryRepository();
   const calls: string[] = [];
@@ -302,6 +393,30 @@ void test('redacts bootstrap and cleanup failures outside the runner callback', 
     assert.doesNotMatch(error.message, /database|url|secret/iu);
     return true;
   });
+});
+
+void test('claims after migrations before listener startup and terminalizes a later startup failure', async () => {
+  const repository = new MemoryRepository();
+  const calls: string[] = [];
+  await assert.rejects(runPaperMvp(options(), {
+    ...dependencies(repository),
+    runBootstrap: async (prepare,_inside,cleanup) => {
+      const pool = Object.freeze({});
+      calls.push('migrations.complete');
+      await prepare(pool);
+      calls.push('run.claimed');
+      try {
+        calls.push('listener.start');
+        throw new Error('listener-startup-secret');
+      } finally {
+        await cleanup();
+      }
+    },
+  }), isCliError('RUN_FAILED'));
+  assert.deepEqual(calls,['migrations.complete','run.claimed','listener.start']);
+  assert.equal(repository.starts,1);
+  assert.equal(repository.snapshot?.run.state,'FAILED');
+  assert.equal(repository.snapshot?.run.failureCode,'RUNNER_OPERATION_FAILED');
 });
 
 void test('releases PostgreSQL runner clients on acquisition failure and verifies unlock', async () => {
@@ -510,7 +625,12 @@ function dependencies(
   return {
     config, now: sequenceClock(1_000, 1_001, 2_000, 2_001, 3_000),
     providerUsageProbe: unavailableProbe(),
-    runBootstrap: async (inside) => { await inside(Object.freeze({})); },
+    finalCollectionGraceMs: 20,
+    runBootstrap: async (prepare, inside, cleanup) => {
+      const pool = Object.freeze({});
+      await prepare(pool);
+      try { await inside(pool); } finally { await cleanup(); }
+    },
     createRepository: () => repository,
     createCollector: () => ({ collect: async () => emptyCollection() }),
     acquireRunner: async () => runnerLease(async () => undefined),

@@ -16,6 +16,13 @@ import {
 } from './paper-mvp.js';
 
 const RUNNER_UNLOCK_TIMEOUT_MS = 5_000;
+const PAPER_MVP_DATABASE_TIMEOUTS = Object.freeze({
+  connectionTimeoutMillis: 10_000,
+  query_timeout: 30_000,
+  statement_timeout: 30_000,
+  lock_timeout: 10_000,
+  idle_in_transaction_session_timeout: 30_000,
+});
 
 interface PaperMvpRuntimePool {
   connect(): Promise<PaperMvpRunnerClient>;
@@ -37,13 +44,14 @@ export function productionRunnerDependencies(config: AppConfig): PaperMvpRunnerD
     config,
     now: Date.now,
     providerUsageProbe,
-    runBootstrap: async (runInsideBootstrap) => {
+    finalCollectionGraceMs: 5_000,
+    runBootstrap: async (prepareAfterMigrations, runInsideBootstrap, cleanupBeforeLeaseRelease) => {
       let activePool: unknown = null;
       try {
         await runApplication({
           loadConfig: () => config,
           getDatabasePool: (databaseUrl) => {
-            activePool = getDatabasePool(databaseUrl);
+            activePool = getDatabasePool(databaseUrl, PAPER_MVP_DATABASE_TIMEOUTS);
             return activePool;
           },
           beforeStart: async (pool) => {
@@ -52,7 +60,19 @@ export function productionRunnerDependencies(config: AppConfig): PaperMvpRunnerD
             }
             await runnerLifecycle.beforeStart(pool);
           },
-          beforeDatabaseClose: runnerLifecycle.beforeDatabaseClose,
+          afterMigrations: async (pool) => {
+            if (activePool === null || pool !== activePool) {
+              throw new PaperMvpCliError('RUN_FAILED');
+            }
+            await prepareAfterMigrations(pool);
+          },
+          beforeDatabaseClose: async () => {
+            try {
+              await cleanupBeforeLeaseRelease();
+            } finally {
+              await runnerLifecycle.beforeDatabaseClose();
+            }
+          },
           lifecycleGuard: Object.freeze({
             checkpoint: runnerLifecycle.checkpoint,
           }),
@@ -216,22 +236,39 @@ export async function acquirePostgresRunner(pool: unknown): Promise<PaperMvpRunn
 }
 
 function createProcessStopController(
-  signalSource: Pick<NodeJS.Process, 'once' | 'off'> = process,
+  signalSource: Pick<NodeJS.Process, 'on' | 'off'> = process,
 ): PaperMvpStopController {
   let closed = false;
   let signal: Exclude<PaperMvpStopReason, 'POLL'> | null = null;
+  let forceNotified = false;
+  let resolveFirst: ((value: Exclude<PaperMvpStopReason, 'POLL'>) => void) | undefined;
+  let resolveForced: (() => void) | undefined;
+  const firstSignal = new Promise<Exclude<PaperMvpStopReason, 'POLL'>>((resolve) => {
+    resolveFirst = resolve;
+  });
+  const forced = new Promise<void>((resolve) => { resolveForced = resolve; });
   const listeners = new Set<(value: PaperMvpStopReason) => void>();
   const notify = (value: Exclude<PaperMvpStopReason, 'POLL'>): void => {
-    if (closed || signal !== null) return;
+    if (closed) return;
+    if (signal !== null) {
+      if (!forceNotified) {
+        forceNotified = true;
+        resolveForced?.();
+      }
+      return;
+    }
     signal = value;
+    resolveFirst?.(value);
     for (const listener of listeners) listener(value);
     listeners.clear();
   };
   const onSigint = (): void => { notify('SIGINT'); };
   const onSigterm = (): void => { notify('SIGTERM'); };
-  signalSource.once('SIGINT', onSigint);
-  signalSource.once('SIGTERM', onSigterm);
+  signalSource.on('SIGINT', onSigint);
+  signalSource.on('SIGTERM', onSigterm);
   return Object.freeze({
+    firstSignal,
+    forced,
     wait: async (durationMs: number) => {
       if (signal !== null) return signal;
       return new Promise<PaperMvpStopReason>((resolve) => {

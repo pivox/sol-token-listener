@@ -64,3 +64,31 @@ Terminalization stores the completion reason and clears the owner atomically. Hi
 ## Verification
 
 Deterministic tests inject ownership loss during migration, listener startup, before `startOrResume`, during the final collection, and immediately before terminalization. Repository tests prove that replacement ownership fences stale progress and terminal writes. Domain, migration, CLI, deployment, documentation, lint, typecheck, build, and the complete test suite must pass with zero skipped tests.
+
+## Review cycle 1 addendum
+
+The durable run claim occurs in a dedicated application hook after the migration
+stage and before listener or API construction. The prepared repository, run,
+collector, stop controller, and scoped lease are then passed into the wait loop.
+If later startup fails, cleanup terminalizes the run with the stable operational
+failure only while the owner still matches, before teardown releases the session
+lease.
+
+Ownership changes use a second fixed advisory key. `startOrResume` takes its
+exclusive transaction lock; progress and terminalization take its shared
+transaction lock. A replacement therefore waits for every already-started old
+mutation, commits the new owner, and fences every later stale mutation.
+
+Collection accepts an abort signal and is raced against the immutable run
+deadline, first and second process signals, and lease loss. The first signal
+permits one final collection with a five-second production grace; a second signal
+or lease loss aborts immediately. Late collector rejection is observed and cannot
+become an unhandled rejection or overwrite a terminal report. The Paper MVP pool
+alone uses finite connection, query, statement, lock, and idle-transaction
+timeouts; ordinary application pool defaults are unchanged.
+
+While a matching run is `RUNNING`, retention protects launches detected in its
+inclusive time window and rejected/expired candidates that contribute to the
+same strategy/version coverage. Terminalization releases that protection.
+Migration 022 adds the two coverage indexes, while both materialized coverage
+sets stop at 1,000,001 rows so the existing one-million validator fails closed.

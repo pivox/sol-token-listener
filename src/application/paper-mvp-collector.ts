@@ -28,6 +28,7 @@ export class PaperMvpCollector {
     runId: string;
     runnerOwnerId: string;
     limit: number;
+    signal?: AbortSignal;
   }>): Promise<PaperMvpCollectorResult> {
     if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
       throw new RangeError('Paper MVP collector limit must be between 1 and 1000.');
@@ -43,9 +44,11 @@ export class PaperMvpCollector {
   }
 
   private async collectAttempt(
-    input: Readonly<{ runId: string; runnerOwnerId: string; limit: number }>,
+    input: Readonly<{ runId: string; runnerOwnerId: string; limit: number; signal?: AbortSignal }>,
   ): Promise<PaperMvpCollectorResult> {
+    input.signal?.throwIfAborted();
     const before = await this.repository.load(input.runId);
+    input.signal?.throwIfAborted();
     if (before?.run.state !== 'RUNNING') {
       throw new PaperMvpCollectorError('RUN_NOT_ACTIVE');
     }
@@ -59,7 +62,9 @@ export class PaperMvpCollector {
       strategyId: before.run.configuration.strategyId,
       strategyVersion: before.run.configuration.strategyVersion,
       limit: input.limit,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
+    input.signal?.throwIfAborted();
     const samples = [];
     const unknownPositions: PaperMvpUnknownPosition[] = [];
     const readyPositions = batch.positions.filter((facts) => (
@@ -75,7 +80,8 @@ export class PaperMvpCollector {
     const observedAtMs = Math.max(this.clock(),before.run.updatedAtMs + 1);
     const providerUsage = this.providerUsageProbe === undefined
       ? before.run.providerUsage
-      : await this.providerUsageProbe.snapshot();
+      : await this.providerUsageProbe.snapshot(input.signal);
+    input.signal?.throwIfAborted();
     const after = await this.repository.recordProgress({
       runId: before.run.runId,
       runnerOwnerId: input.runnerOwnerId,

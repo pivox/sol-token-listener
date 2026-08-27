@@ -88,6 +88,10 @@ void test('migrates, starts listener before API, then closes listener before API
       calls.push('migrate');
       return [];
     },
+    afterMigrations: async (received) => {
+      assert.equal(received, pool);
+      calls.push('after.migrations');
+    },
     createListener: (received, receivedConfig) => {
       assert.equal(received, pool);
       assert.equal(receivedConfig.executionMode, 'observe');
@@ -108,7 +112,7 @@ void test('migrates, starts listener before API, then closes listener before API
 
   assert.deepEqual(calls, [
     'log:listener.foundation_ready', 'pool', 'before.start', 'migrate',
-    'log:database.migrations_applied',
+    'log:database.migrations_applied', 'after.migrations',
     'listener.create', 'listener.start', 'projections', 'stream', 'server.create',
     'server.listen', 'log:api.started', 'signal.wait', 'listener.close',
     'server.close', 'database.close',

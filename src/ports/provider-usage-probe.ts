@@ -28,7 +28,7 @@ export type ProviderUsageSnapshot = PaperMvpProviderUsage & Readonly<{
 
 export interface ProviderUsageProbe {
   readonly identity: string;
-  snapshot(): Promise<ProviderUsageSnapshot>;
+  snapshot(signal?: AbortSignal): Promise<ProviderUsageSnapshot>;
 }
 
 export function createProviderUsageSnapshot(

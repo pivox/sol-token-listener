@@ -35,6 +35,7 @@ export interface ApplicationDependencies {
   }>;
   readonly getDatabasePool: (databaseUrl: string) => ApplicationPool;
   readonly beforeStart: (pool: ApplicationPool) => Promise<void>;
+  readonly afterMigrations: (pool: ApplicationPool) => Promise<void>;
   readonly beforeDatabaseClose: () => Promise<void>;
   readonly lifecycleGuard: Readonly<{ checkpoint(): Promise<void> }>;
   readonly migrateDatabase: (pool: ApplicationPool) => Promise<readonly string[]>;
@@ -76,6 +77,9 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
         await dependencies.lifecycleGuard.checkpoint();
         dependencies.logInfo({ event: 'database.migrations_applied', count: appliedMigrations.length }, 'Migrations PostgreSQL appliquées.');
       }
+      await dependencies.lifecycleGuard.checkpoint();
+      await dependencies.afterMigrations(pool);
+      await dependencies.lifecycleGuard.checkpoint();
       if (config.listenerEnabled) {
         await dependencies.lifecycleGuard.checkpoint();
         listener = dependencies.createListener(pool, config);
@@ -167,6 +171,7 @@ const productionDependencies: ApplicationDependencies = {
   createQualificationEngine,
   getDatabasePool,
   beforeStart: () => Promise.resolve(),
+  afterMigrations: () => Promise.resolve(),
   beforeDatabaseClose: () => Promise.resolve(),
   lifecycleGuard: Object.freeze({ checkpoint: () => Promise.resolve() }),
   migrateDatabase: async (pool) => migrateDatabase({ pool: pool as ReturnType<typeof getDatabasePool> }),

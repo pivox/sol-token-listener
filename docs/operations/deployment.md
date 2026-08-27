@@ -66,6 +66,11 @@ compatibilité que le prochain runner revendique. Arrêtez donc impérativement 
 ancien runner Paper MVP avant la fenêtre de migration et ne le redémarrez qu'avec
 l'image contenant la migration 021.
 
+La migration additive `022_paper_mvp_coverage_indexes.sql` indexe les fenêtres
+de couverture des launches et candidats du runner. Elle doit être appliquée
+avant de lancer la commande Paper MVP correspondante ; les migrations 018 à 021
+restent immuables.
+
 ## Démarrage
 
 Avant toute migration, effectuez et vérifiez une sauvegarde de la base. Puis

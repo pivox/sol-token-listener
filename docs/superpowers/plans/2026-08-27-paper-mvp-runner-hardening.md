@@ -309,3 +309,13 @@ Review the entire range `c8e74c42373427996d04c2156afc7cb84c45906e..HEAD` for Cri
 git add docs/operations/paper-mvp-validation.md docs/operations/deployment.md
 git commit -m "docs: explain paper MVP runner completion (#49)"
 ```
+
+### Review cycle 1 hardening
+
+- [x] Claim the durable owner after migrations and before listener/API startup.
+- [x] Serialize replacement claims behind in-flight shared mutation fences.
+- [x] Bound collection on deadline, signals, second signal, and lease loss.
+- [x] Retain active-run launch and rejected-candidate coverage inputs.
+- [x] Add migration 022 coverage indexes and bounded materialized sets.
+- [x] Validate provider credits as hostile-safe unsigned `NUMERIC(78,0)` values.
+- [ ] Run the complete PostgreSQL-backed and frontend verification matrix.

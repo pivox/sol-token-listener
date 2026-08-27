@@ -60,5 +60,6 @@ export interface PaperMvpSource {
     strategyId: string;
     strategyVersion: number;
     limit: number;
+    signal?: AbortSignal;
   }>): Promise<PaperMvpSourceBatch>;
 }

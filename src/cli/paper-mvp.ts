@@ -24,6 +24,8 @@ export type PaperMvpStopReason = 'POLL' | 'SIGINT' | 'SIGTERM';
 
 export interface PaperMvpStopController {
   wait(durationMs: number): Promise<PaperMvpStopReason>;
+  readonly firstSignal?: Promise<Exclude<PaperMvpStopReason, 'POLL'>>;
+  readonly forced?: Promise<void>;
   close(): void;
 }
 
@@ -39,6 +41,7 @@ export interface PaperMvpCollectorPort {
     runId: string;
     runnerOwnerId: string;
     limit: number;
+    signal?: AbortSignal;
   }>): Promise<PaperMvpCollectorResult>;
 }
 
@@ -46,8 +49,11 @@ export interface PaperMvpRunnerDependencies {
   readonly config: AppConfig;
   readonly now: () => number;
   readonly providerUsageProbe: ProviderUsageProbe;
+  readonly finalCollectionGraceMs: number;
   readonly runBootstrap: (
+    prepareAfterMigrations: (pool: unknown) => Promise<void>,
     runInsideBootstrap: (pool: unknown) => Promise<NodeJS.Signals>,
+    cleanupBeforeLeaseRelease: () => Promise<void>,
   ) => Promise<void>;
   readonly createRepository: (pool: unknown) => PaperMvpRepository;
   readonly createCollector: (
@@ -114,11 +120,19 @@ export async function runPaperMvp(
   assertOptions(options);
   assertPaperMvpSafety(dependencies.config);
   const results: PaperMvpRunResult[] = [];
+  let prepared: PreparedPaperMvpRun | null = null;
   try {
-    await dependencies.runBootstrap(async (pool) => {
-      results.push(await runInsideBootstrap(options, dependencies, pool));
-      return INTERNAL_SHUTDOWN_SIGNAL;
-    });
+    await dependencies.runBootstrap(
+      async (pool) => { prepared = await preparePaperMvpRun(options, dependencies, pool); },
+      async (pool) => {
+        if (prepared === null || prepared.pool !== pool) throw new PaperMvpCliError('RUN_FAILED');
+        results.push(await runInsideBootstrap(options, dependencies, prepared));
+        return INTERNAL_SHUTDOWN_SIGNAL;
+      },
+      async () => {
+        if (prepared !== null) await cleanupPreparedRun(prepared, dependencies);
+      },
+    );
   } catch (error: unknown) {
     if (error instanceof PaperMvpCliError) throw error;
     throw new PaperMvpCliError('RUN_FAILED');
@@ -129,31 +143,32 @@ export async function runPaperMvp(
   return results[0];
 }
 
-async function runInsideBootstrap(
+interface PreparedPaperMvpRun {
+  readonly pool: unknown;
+  readonly runnerLease: PaperMvpRunnerLease;
+  readonly stopController: PaperMvpStopController;
+  readonly repository: PaperMvpRepository;
+  readonly collector: PaperMvpCollectorPort;
+  readonly run: PaperMvpRun;
+  terminal: boolean;
+  cleaned: boolean;
+}
+
+async function preparePaperMvpRun(
   options: PaperMvpCliOptions,
   dependencies: PaperMvpRunnerDependencies,
   pool: unknown,
-): Promise<PaperMvpRunResult> {
+): Promise<PreparedPaperMvpRun> {
   let runnerLease: PaperMvpRunnerLease | null = null;
   let stopController: PaperMvpStopController | null = null;
-  let repository: PaperMvpRepository | null = null;
-  let run: PaperMvpRun | null = null;
-  let terminal = false;
-  let result: PaperMvpRunResult | null = null;
-  let cleanupFailed = false;
-  let failureCode: PaperMvpCliErrorCode = 'RUN_FAILED';
-  const durableFailureCode = 'RUNNER_OPERATION_FAILED';
   try {
     runnerLease = await dependencies.acquireRunner(pool);
     assertRunnerOwnership(runnerLease);
     stopController = dependencies.createStopController();
-    repository = dependencies.createRepository(pool);
-    const collector = dependencies.createCollector(
-      repository, pool, dependencies.providerUsageProbe,
-    );
+    const repository = dependencies.createRepository(pool);
+    const collector = dependencies.createCollector(repository, pool, dependencies.providerUsageProbe);
     const configuration = Object.freeze({
-      strategyId: 'creation-entry-v1',
-      strategyVersion: 1,
+      strategyId: 'creation-entry-v1', strategyVersion: 1,
       quoteMint: dependencies.config.wsolMint,
       targetClosedPositions: options.targetClosedPositions,
       initialCapitalRaw: options.initialCapitalRaw,
@@ -161,27 +176,41 @@ async function runInsideBootstrap(
       maxDurationMs: options.maxDurationMs,
       providerIdentity: dependencies.providerUsageProbe.identity,
     });
-    try {
-      assertRunnerOwnership(runnerLease);
-      run = await repository.startOrResume(
-        configuration, runnerLease.ownerId, validNow(dependencies.now()),
-      );
-      assertRunnerOwnership(runnerLease);
-    } catch (error: unknown) {
-      if (hasCode(error, 'ACTIVE_RUN_INCOMPATIBLE')) {
-        failureCode = 'ACTIVE_RUN_INCOMPATIBLE';
-      }
-      throw error;
+    const run = await repository.startOrResume(
+      configuration, runnerLease.ownerId, validNow(dependencies.now()),
+    );
+    assertRunnerOwnership(runnerLease);
+    return { pool,runnerLease,stopController,repository,collector,run,terminal:false,cleaned:false };
+  } catch (error: unknown) {
+    stopController?.close();
+    try { await runnerLease?.release(); } catch { /* retain the primary preparation failure */ }
+    if (hasCode(error, 'ACTIVE_RUN_INCOMPATIBLE')) {
+      throw new PaperMvpCliError('ACTIVE_RUN_INCOMPATIBLE');
     }
+    if (error instanceof PaperMvpCliError) throw error;
+    throw new PaperMvpCliError('RUN_FAILED');
+  }
+}
 
+async function runInsideBootstrap(
+  options: PaperMvpCliOptions,
+  dependencies: PaperMvpRunnerDependencies,
+  prepared: PreparedPaperMvpRun,
+): Promise<PaperMvpRunResult> {
+  const { runnerLease,stopController,repository,collector,run } = prepared;
+  let result: PaperMvpRunResult | null = null;
+  let failureCode: PaperMvpCliErrorCode = 'RUN_FAILED';
+  const durableFailureCode = 'RUNNER_OPERATION_FAILED';
+  try {
     while (result === null) {
       const before = await requiredRunningSnapshot(repository, run.runId);
       const beforeNow = validNow(dependencies.now());
       const beforeStop = await waitForStop(stopController, runnerLease, 0);
       if (beforeStop === 'RUNNER_LOCK_LOST') throw new PaperMvpCliError(beforeStop);
       if (beforeStop !== 'POLL') {
-        await collectRemaining(collector, before, options.targetClosedPositions, runnerLease);
-        ({ result, terminal } = await finishBoundedStop(
+        await collectFinal(collector,before,options.targetClosedPositions,runnerLease,stopController,
+          dependencies.finalCollectionGraceMs);
+        ({ result } = await finishBoundedStop(
           beforeStop, repository, run.runId, dependencies, options, runnerLease,
         ));
         continue;
@@ -191,32 +220,47 @@ async function runInsideBootstrap(
         result = await completeAndExport(
           before, beforeNow, 'TARGET_REACHED', repository, options, dependencies, runnerLease,
         );
-        terminal = true;
+        prepared.terminal = true;
         continue;
       }
       if (beforeNow >= before.run.deadlineAtMs) {
-        await collectRemaining(collector, before, options.targetClosedPositions, runnerLease);
-        ({ result, terminal } = await finishBoundedStop(
+        await collectFinal(collector,before,options.targetClosedPositions,runnerLease,stopController,
+          dependencies.finalCollectionGraceMs);
+        ({ result } = await finishBoundedStop(
           'TIMEOUT', repository, run.runId, dependencies, options, runnerLease,
         ));
         continue;
       }
 
-      await collectRemaining(collector, before, options.targetClosedPositions, runnerLease);
+      const collectionStop = await collectRemaining(
+        collector,before,options.targetClosedPositions,runnerLease,stopController,
+        before.run.deadlineAtMs - beforeNow,true,
+      );
+      if (collectionStop !== null) {
+        if (collectionStop === 'RUNNER_LOCK_LOST') throw new PaperMvpCliError(collectionStop);
+        await collectFinal(collector,before,options.targetClosedPositions,runnerLease,stopController,
+          dependencies.finalCollectionGraceMs);
+        ({ result } = await finishBoundedStop(
+          collectionStop, repository, run.runId, dependencies, options, runnerLease,
+        ));
+        continue;
+      }
       const after = await requiredRunningSnapshot(repository, run.runId);
       const afterNow = validNow(dependencies.now());
       const afterStop = await waitForStop(stopController, runnerLease, 0);
       if (afterStop === 'RUNNER_LOCK_LOST') throw new PaperMvpCliError(afterStop);
       if (afterStop !== 'POLL') {
-        await collectRemaining(collector, after, options.targetClosedPositions, runnerLease);
-        ({ result, terminal } = await finishBoundedStop(
+        await collectFinal(collector,after,options.targetClosedPositions,runnerLease,stopController,
+          dependencies.finalCollectionGraceMs);
+        ({ result } = await finishBoundedStop(
           afterStop, repository, run.runId, dependencies, options, runnerLease,
         ));
         continue;
       }
       if (afterNow >= after.run.deadlineAtMs) {
-        await collectRemaining(collector, after, options.targetClosedPositions, runnerLease);
-        ({ result, terminal } = await finishBoundedStop(
+        await collectFinal(collector,after,options.targetClosedPositions,runnerLease,stopController,
+          dependencies.finalCollectionGraceMs);
+        ({ result } = await finishBoundedStop(
           'TIMEOUT', repository, run.runId, dependencies, options, runnerLease,
         ));
         continue;
@@ -225,7 +269,7 @@ async function runInsideBootstrap(
         result = await completeAndExport(
           after, afterNow, 'TARGET_REACHED', repository, options, dependencies, runnerLease,
         );
-        terminal = true;
+        prepared.terminal = true;
         continue;
       }
       const waitMs = Math.min(options.pollMs, after.run.deadlineAtMs - afterNow);
@@ -233,18 +277,19 @@ async function runInsideBootstrap(
       if (stop === 'RUNNER_LOCK_LOST') throw new PaperMvpCliError(stop);
       if (stop === 'POLL') continue;
       const interrupted = await requiredRunningSnapshot(repository, run.runId);
-      await collectRemaining(collector, interrupted, options.targetClosedPositions, runnerLease);
-      ({ result, terminal } = await finishBoundedStop(
+      await collectFinal(collector,interrupted,options.targetClosedPositions,runnerLease,stopController,
+        dependencies.finalCollectionGraceMs);
+      ({ result } = await finishBoundedStop(
         stop, repository, run.runId, dependencies, options, runnerLease,
       ));
     }
   } catch (error: unknown) {
     const ownershipLost = (error instanceof PaperMvpCliError && error.code === 'RUNNER_LOCK_LOST')
-      || hasCode(error, 'RUN_OWNERSHIP_LOST') || runnerLease?.isLost() === true;
+      || hasCode(error, 'RUN_OWNERSHIP_LOST') || runnerLease.isLost();
     if (ownershipLost) {
       failureCode = 'RUNNER_LOCK_LOST';
     }
-    if (!ownershipLost && repository !== null && run !== null && runnerLease !== null && !terminal) {
+    if (!ownershipLost && !prepared.terminal) {
       try {
         assertRunnerOwnership(runnerLease);
         const snapshot = await repository.load(run.runId);
@@ -255,22 +300,40 @@ async function runInsideBootstrap(
             state: 'FAILED', completionReason: null, report: null,
             failureCode: durableFailureCode,
           });
+          prepared.terminal = true;
         }
       } catch { /* retain the stable outer failure */ }
     }
     if (ownershipLost) throw new PaperMvpCliError('RUNNER_LOCK_LOST');
     if (error instanceof PaperMvpCliError) throw error;
     throw new PaperMvpCliError(failureCode);
-  } finally {
-    stopController?.close();
-    if (runnerLease !== null) {
-      try { await runnerLease.release(); } catch {
-        cleanupFailed = true;
-      }
-    }
   }
-  if (cleanupFailed) throw new PaperMvpCliError('RUN_FAILED');
+  prepared.terminal = true;
   return result;
+}
+
+async function cleanupPreparedRun(
+  prepared: PreparedPaperMvpRun,
+  dependencies: PaperMvpRunnerDependencies,
+): Promise<void> {
+  if (prepared.cleaned) return;
+  prepared.cleaned = true;
+  prepared.stopController.close();
+  if (!prepared.terminal && !prepared.runnerLease.isLost()) {
+    try {
+      const snapshot = await prepared.repository.load(prepared.run.runId);
+      if (snapshot?.run.state === 'RUNNING'
+        && snapshot.run.runnerOwnerId === prepared.runnerLease.ownerId) {
+        await prepared.repository.terminalize({
+          runId: prepared.run.runId, runnerOwnerId: prepared.runnerLease.ownerId,
+          terminalAtMs: Math.max(validNow(dependencies.now()), snapshot.run.updatedAtMs),
+          state: 'FAILED', completionReason: null, report: null,
+          failureCode: 'RUNNER_OPERATION_FAILED',
+        });
+      }
+    } catch { /* preserve the startup/shutdown failure and durable audit */ }
+  }
+  await prepared.runnerLease.release();
 }
 
 async function waitForStop(
@@ -290,13 +353,60 @@ async function collectRemaining(
   snapshot: PaperMvpRunSnapshot,
   targetClosedPositions: number,
   lease: PaperMvpRunnerLease,
-): Promise<void> {
+  controller: PaperMvpStopController,
+  timeoutMs: number,
+  observeFirstSignal: boolean,
+): Promise<'TIMEOUT' | 'SIGINT' | 'SIGTERM' | 'RUNNER_LOCK_LOST' | null> {
   const remaining = targetClosedPositions - snapshot.run.closedPositions;
-  if (remaining <= 0) return;
+  if (remaining <= 0) return null;
   assertRunnerOwnership(lease);
-  await collector.collect({
+  const abortController = new AbortController();
+  const operation = collector.collect({
     runId: snapshot.run.runId, runnerOwnerId: lease.ownerId, limit: remaining,
+    signal: abortController.signal,
   });
+  void operation.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<'TIMEOUT'>((resolve) => {
+    timer = setTimeout(() => { resolve('TIMEOUT'); }, Math.max(0,timeoutMs));
+    timer.unref();
+  });
+  const races: Promise<PaperMvpStopReason | 'TIMEOUT' | 'RUNNER_LOCK_LOST' | 'FORCED' | null>[] = [
+    operation.then(() => null), deadline,
+    lease.lost.then(() => 'RUNNER_LOCK_LOST' as const),
+  ];
+  if (observeFirstSignal && controller.firstSignal !== undefined) races.push(controller.firstSignal);
+  if (controller.forced !== undefined) races.push(controller.forced.then(() => 'FORCED' as const));
+  let outcome: PaperMvpStopReason | 'TIMEOUT' | 'RUNNER_LOCK_LOST' | 'FORCED' | null;
+  try {
+    outcome = await Promise.race(races);
+  } catch (error: unknown) {
+    abortController.abort();
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+  if (outcome === null) {
+    assertRunnerOwnership(lease);
+    return null;
+  }
+  abortController.abort();
+  if (outcome === 'FORCED') return null;
+  return outcome === 'POLL' ? 'TIMEOUT' : outcome;
+}
+
+async function collectFinal(
+  collector: PaperMvpCollectorPort,
+  snapshot: PaperMvpRunSnapshot,
+  targetClosedPositions: number,
+  lease: PaperMvpRunnerLease,
+  controller: PaperMvpStopController,
+  graceMs: number,
+): Promise<void> {
+  const stop = await collectRemaining(
+    collector,snapshot,targetClosedPositions,lease,controller,graceMs,false,
+  );
+  if (stop === 'RUNNER_LOCK_LOST') throw new PaperMvpCliError(stop);
   assertRunnerOwnership(lease);
 }
 
