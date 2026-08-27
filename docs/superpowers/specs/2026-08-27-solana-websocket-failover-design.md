@@ -3,8 +3,11 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.2.1
+Version: 1.2.2
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.2.2 bounds the monotone evidence generation to PostgreSQL `BIGINT`
+and requires the hostile application boundary to verify an exact increment.
 
 Revision 1.2.1 adds a monotone durable finality-evidence generation to prevent
 an old block proof becoming valid again after a provider/count ABA cycle.
@@ -375,7 +378,7 @@ in-memory transition journal:
 
 Issue #61 is specified in
 `docs/superpowers/specs/2026-08-27-provider-affine-finality-design.md` version
-1.0.1. One finality reconciliation pass captures one provider-pinned HTTP
+1.0.2. One finality reconciliation pass captures one provider-pinned HTTP
 capability and uses it for status reads, finalized root and finalized block
 proofs. The inbox records the positional provider ID behind the current
 missing-status sequence. A provider change starts a fresh sequence at one.

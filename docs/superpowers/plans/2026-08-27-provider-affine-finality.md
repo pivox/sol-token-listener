@@ -18,8 +18,8 @@ Production uses a fixed primary pass until #63 supplies the promoted provider.
 **Tech Stack:** TypeScript strict ESM, `@solana/web3.js` 1.98.4, PostgreSQL,
 bigint, Node test runner, migration 027.
 
-**Plan version:** 1.0.1. Revision 1.0.1 adds a monotone durable evidence
-generation to close provider/count/status ABA cycles.
+**Plan version:** 1.0.2. Revision 1.0.2 bounds the monotone evidence generation
+to PostgreSQL `BIGINT` and requires exact +1 application-boundary validation.
 
 ---
 
@@ -75,8 +75,9 @@ const orphaned: FinalityRevision = Object.freeze({
 
 Test both invalid correlations: count zero with a provider and positive count
 without one. Test invalid provider IDs, mutable/accessor-backed inputs,
-negative/unsafe counts, negative evidence versions and extra proof fields on
-the finalized branch.
+negative/unsafe counts, evidence versions outside
+`0n..9_223_372_036_854_775_807n`, and extra proof fields on the finalized
+branch.
 
 The migration test must create the schema through 026, insert one legacy row
 with `missing_finality_polls = 3`, apply 027, and assert `0/NULL`. It must then
@@ -427,6 +428,8 @@ Add tests for:
 - seventeen unique eligible slots read only the first sixteen and defer one;
 - a repository race changing provider/count/version makes the revision fail at
   stage `revision`;
+- forged poll results with an unchanged, regressive or skipped evidence
+  version fail at stage `poll` before any block proof;
 - 256 is the maximum constructor limit.
 
 The memory repository must implement provider-aware transitions exactly like
@@ -454,6 +457,19 @@ export type FinalityReconcilerErrorStage =
 ```
 
 Keep one history batch and one finalized root read on the captured pass.
+
+Extend `assertPollTransition` to require:
+
+```ts
+if (before.finalityEvidenceVersion
+  === 9_223_372_036_854_775_807n
+  || after.finalityEvidenceVersion !== before.finalityEvidenceVersion + 1n) {
+  throw new TypeError('Finality evidence version transition is invalid.');
+}
+```
+
+Test unchanged, regressive, skipped and out-of-range repository versions. None
+may reach `getFinalizedBlockSignatures` or `enqueueRevision`.
 
 - [ ] **Step 4: Implement provider-aware polls and block proofs**
 

@@ -3,8 +3,12 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.1
+Version: 1.0.2
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.2 bounds evidence versions to signed PostgreSQL `BIGINT` and
+requires the reconciler to reject a repository result unless its version is
+exactly the prior version plus one.
 
 Revision 1.0.1 adds a monotone durable finality-evidence generation. Exact
 provider/count/status checks alone permit an ABA where those visible values
@@ -126,6 +130,10 @@ missing_finality_polls > 0  =>  provider is primary or fallback-1..3
 finality_evidence_version >= 0
 ```
 
+The maximum version is `9_223_372_036_854_775_807`, the positive signed
+PostgreSQL `BIGINT` limit. Domain validation rejects values outside this range.
+Reaching the limit fails closed instead of wrapping or accepting another poll.
+
 Existing positive counters have no trustworthy provenance because they may
 already combine request-level failover responses. The migration resets only
 rows with a positive counter and a null provider to `0/NULL`. This is a
@@ -186,6 +194,12 @@ missing + different provider  -> count 1, current pass provider
 processed/confirmed present   -> count 0, provider null
 every successful transition   -> evidence version + 1
 ```
+
+The reconciler treats repository output as hostile. After every poll it
+requires the returned version to equal the candidate version plus exactly one,
+in addition to the existing identity, status, provider and counter checks.
+An unchanged, regressive, skipped or overflowing version is a fixed poll-stage
+failure and cannot reach block proof or revision enqueue.
 
 An observed `processed` status never regresses a durable `confirmed` status.
 The existing behavior where a polled `processed -> confirmed` promotion does
@@ -356,6 +370,8 @@ projection or terminal retention row is deleted.
 - same-provider increments and provider-switch reset to one;
 - exact expected provider/count/version CAS and true ABA rejection after a
   switch away and back to the same tuple;
+- hostile repository poll results with unchanged, regressive, skipped or
+  overflowing evidence versions;
 - status present resets count/provider without status regression;
 - status/root/block calls use one captured provider pass;
 - finalized status, equal root, higher root and mismatched slots;
