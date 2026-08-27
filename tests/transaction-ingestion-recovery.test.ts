@@ -207,10 +207,24 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
       currentQualifications: '1',
     });
 
+    const orphanProof = await repository.recordFinalityPoll(Object.freeze({
+      signature: confirmed.signature,
+      confirmationStatus: null,
+      providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0,
+      expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: 0n,
+      observedAtMs: Date.now() + 1,
+    }));
+    assert.ok(orphanProof.lastMissingFinalityProviderId);
     await repository.enqueueRevision(Object.freeze({
       signature: confirmed.signature,
       confirmationStatus: 'orphaned' as const,
-      observedAtMs: Date.now() + 1,
+      expectedConfirmationStatus: orphanProof.confirmationStatus,
+      expectedMissingFinalityPolls: orphanProof.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: orphanProof.lastMissingFinalityProviderId,
+      expectedFinalityEvidenceVersion: orphanProof.finalityEvidenceVersion,
+      observedAtMs: Date.now() + 2,
     }));
     const orphanOrder: ReplayStage[] = [];
     const orphaned = Object.freeze({ ...confirmed, confirmationStatus: 'ORPHANED' as const });

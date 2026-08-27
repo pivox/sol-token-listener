@@ -6,6 +6,7 @@ import pg from 'pg';
 import { CatchUpScanner } from '../src/application/catch-up-scanner.js';
 import type {
   IngestionFailure,
+  FinalityCandidate,
   ProcessingCheckpoint,
   RuntimeHeartbeat,
   TransactionNotification,
@@ -223,33 +224,54 @@ void test('reconciles processing finality, replays immutable revisions, and reje
     await repository.saveSnapshot('finality', initial.leaseToken, normalized('finality', 30n));
     await repository.markProcessed('finality', initial.leaseToken, 'confirmed');
     const firstMissing = await repository.recordFinalityPoll(Object.freeze({
-      signature: 'finality', confirmationStatus: null,
-      expectedMissingFinalityPolls: 0, observedAtMs: 101_000,
+      signature: 'finality', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: 0n, observedAtMs: 101_000,
     }));
-    assert.equal(firstMissing.missingFinalityPolls, 1);
+    assert.deepEqual(finalityProof(firstMissing), {
+      confirmationStatus: 'confirmed', missingFinalityPolls: 1,
+      lastMissingFinalityProviderId: 'primary', finalityEvidenceVersion: 1n,
+    });
     const concurrentMissing = await Promise.allSettled([
       repository.recordFinalityPoll(Object.freeze({
-        signature: 'finality', confirmationStatus: null,
-        expectedMissingFinalityPolls: 1, observedAtMs: 102_000,
+        signature: 'finality', confirmationStatus: null, providerId: 'primary' as const,
+        expectedMissingFinalityPolls: 1, expectedLastMissingFinalityProviderId: 'primary' as const,
+        expectedFinalityEvidenceVersion: 1n, observedAtMs: 102_000,
       })),
       repository.recordFinalityPoll(Object.freeze({
-        signature: 'finality', confirmationStatus: null,
-        expectedMissingFinalityPolls: 1, observedAtMs: 102_001,
+        signature: 'finality', confirmationStatus: null, providerId: 'fallback-1' as const,
+        expectedMissingFinalityPolls: 1, expectedLastMissingFinalityProviderId: 'fallback-1' as const,
+        expectedFinalityEvidenceVersion: 1n, observedAtMs: 102_001,
       })),
     ]);
     assert.equal(concurrentMissing.filter((result) => result.status === 'fulfilled').length, 1);
     assert.equal(concurrentMissing.filter((result) =>
       result.status === 'rejected' && result.reason instanceof TransactionInboxConflictError).length, 1);
+    const fallbackMissing = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'finality', confirmationStatus: null, providerId: 'fallback-1' as const,
+      expectedMissingFinalityPolls: 2, expectedLastMissingFinalityProviderId: 'primary' as const,
+      expectedFinalityEvidenceVersion: 2n, observedAtMs: 102_500,
+    }));
+    assert.deepEqual(finalityProof(fallbackMissing), {
+      confirmationStatus: 'confirmed', missingFinalityPolls: 1,
+      lastMissingFinalityProviderId: 'fallback-1', finalityEvidenceVersion: 3n,
+    });
     const reset = await repository.recordFinalityPoll(Object.freeze({
       signature: 'finality', confirmationStatus: 'processed',
-      expectedMissingFinalityPolls: 2, observedAtMs: 103_000,
+      providerId: 'primary' as const, expectedMissingFinalityPolls: 1,
+      expectedLastMissingFinalityProviderId: 'fallback-1' as const,
+      expectedFinalityEvidenceVersion: 3n, observedAtMs: 103_000,
     }));
     assert.equal(reset.confirmationStatus, 'confirmed');
-    assert.equal(reset.missingFinalityPolls, 0);
+    assert.deepEqual(finalityProof(reset), {
+      confirmationStatus: 'confirmed', missingFinalityPolls: 0,
+      lastMissingFinalityProviderId: null, finalityEvidenceVersion: 4n,
+    });
     const processedAtMs = new Date((await row(pool, 'finality')).processed_at).getTime();
     assert.deepEqual(await repository.listForFinality(10), [{
       signature: 'finality', slot: 30n, confirmationStatus: 'confirmed',
-      missingFinalityPolls: 0, processedAtMs,
+      missingFinalityPolls: 0, lastMissingFinalityProviderId: null,
+      finalityEvidenceVersion: 4n, processedAtMs,
     }]);
 
     await repository.enqueueRevision(Object.freeze({
@@ -264,7 +286,10 @@ void test('reconciles processing finality, replays immutable revisions, and reje
     assert.equal(terminal.processing_status, 'PROCESSED');
     assert.equal(new Date(terminal.purge_after).getTime() - new Date(terminal.terminal_at).getTime(), 4 * 60 * 60 * 1_000);
     await assert.rejects(repository.enqueueRevision(Object.freeze({
-      signature: 'finality', confirmationStatus: 'orphaned', observedAtMs: 120_000,
+      signature: 'finality', confirmationStatus: 'orphaned',
+      expectedConfirmationStatus: 'confirmed' as const,
+      expectedMissingFinalityPolls: 1, expectedLastMissingFinalityProviderId: 'primary' as const,
+      expectedFinalityEvidenceVersion: 4n, observedAtMs: 120_000,
     })), TransactionInboxConflictError);
 
     await repository.enqueue(notification('orphan', 31n));
@@ -272,8 +297,19 @@ void test('reconciles processing finality, replays immutable revisions, and reje
     assert.ok(orphan);
     await repository.saveSnapshot('orphan', orphan.leaseToken, normalized('orphan', 31n));
     await repository.markProcessed('orphan', orphan.leaseToken, 'processed');
+    const orphanProof = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'orphan', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: 0n, observedAtMs: 129_000,
+    }));
+    assert.ok(orphanProof.lastMissingFinalityProviderId);
     await repository.enqueueRevision(Object.freeze({
-      signature: 'orphan', confirmationStatus: 'orphaned', observedAtMs: 130_000,
+      signature: 'orphan', confirmationStatus: 'orphaned',
+      expectedConfirmationStatus: orphanProof.confirmationStatus,
+      expectedMissingFinalityPolls: orphanProof.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: orphanProof.lastMissingFinalityProviderId,
+      expectedFinalityEvidenceVersion: orphanProof.finalityEvidenceVersion,
+      observedAtMs: 130_000,
     }));
     const orphanRevision = await repository.claim(130_001, 120);
     assert.equal(orphanRevision?.confirmationStatus, 'orphaned');
@@ -301,6 +337,164 @@ void test('starts a fresh retry cycle for a durable finality replay', async (con
     assert.ok(replay);
     assert.equal(replay.attempts, 2);
     assert.equal((await row(pool, 'cycle-replay')).attempts_in_cycle, 1);
+  });
+});
+
+void test('guards orphan revisions with the complete finality proof and accepts idempotent replays', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('proof', 40n));
+    const initial = await repository.claim(200_000, 120);
+    assert.ok(initial);
+    await repository.saveSnapshot('proof', initial.leaseToken, normalized('proof', 40n));
+    await repository.markProcessed('proof', initial.leaseToken, 'confirmed');
+
+    const first = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: 0n, observedAtMs: 201_000,
+    }));
+    await repository.enqueue(notification('proof', 40n, 'WEBSOCKET', 'confirmed', 201_001));
+    assert.deepEqual(finalityProof(await onlyFinalityCandidate(repository, 'proof')), {
+      confirmationStatus: 'confirmed', missingFinalityPolls: 0,
+      lastMissingFinalityProviderId: null, finalityEvidenceVersion: 2n,
+    });
+
+    const one = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: 2n, observedAtMs: 201_002,
+    }));
+    const two = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 1, expectedLastMissingFinalityProviderId: 'primary' as const,
+      expectedFinalityEvidenceVersion: 3n, observedAtMs: 201_003,
+    }));
+    const proof = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 2, expectedLastMissingFinalityProviderId: 'primary' as const,
+      expectedFinalityEvidenceVersion: 4n, observedAtMs: 201_004,
+    }));
+    assert.equal(proof.missingFinalityPolls, 3);
+    await pool.query(
+      `UPDATE chain_transaction_inbox
+       SET target_confirmation_status = 'processed'
+       WHERE signature = 'proof'`,
+    );
+    await assert.rejects(repository.enqueueRevision(orphanRevision(proof, 201_004)), TransactionInboxConflictError);
+    await pool.query(
+      `UPDATE chain_transaction_inbox
+       SET target_confirmation_status = 'confirmed'
+       WHERE signature = 'proof'`,
+    );
+    await assert.rejects(repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 2, expectedLastMissingFinalityProviderId: 'primary' as const,
+      expectedFinalityEvidenceVersion: proof.finalityEvidenceVersion, observedAtMs: 201_005,
+    })), TransactionInboxConflictError);
+    await assert.rejects(repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: proof.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: 'fallback-1' as const,
+      expectedFinalityEvidenceVersion: proof.finalityEvidenceVersion, observedAtMs: 201_006,
+    })), TransactionInboxConflictError);
+    await assert.rejects(repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: proof.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: proof.lastMissingFinalityProviderId,
+      expectedFinalityEvidenceVersion: proof.finalityEvidenceVersion - 1n, observedAtMs: 201_007,
+    })), TransactionInboxConflictError);
+
+    await repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: 'confirmed', providerId: 'primary' as const,
+      expectedMissingFinalityPolls: proof.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: proof.lastMissingFinalityProviderId,
+      expectedFinalityEvidenceVersion: proof.finalityEvidenceVersion, observedAtMs: 201_008,
+    }));
+    let aba = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: 6n, observedAtMs: 201_009,
+    }));
+    aba = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: aba.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: aba.lastMissingFinalityProviderId,
+      expectedFinalityEvidenceVersion: aba.finalityEvidenceVersion, observedAtMs: 201_010,
+    }));
+    aba = await repository.recordFinalityPoll(Object.freeze({
+      signature: 'proof', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: aba.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: aba.lastMissingFinalityProviderId,
+      expectedFinalityEvidenceVersion: aba.finalityEvidenceVersion, observedAtMs: 201_011,
+    }));
+    assert.deepEqual(finalityProof(aba), {
+      confirmationStatus: proof.confirmationStatus, missingFinalityPolls: proof.missingFinalityPolls,
+      lastMissingFinalityProviderId: proof.lastMissingFinalityProviderId,
+      finalityEvidenceVersion: 9n,
+    });
+    await assert.rejects(repository.enqueueRevision(orphanRevision(proof, 201_012)), TransactionInboxConflictError);
+
+    await repository.enqueueRevision(orphanRevision(aba, 201_013));
+    let stored = await row(pool, 'proof');
+    assert.deepEqual({
+      processing: stored.processing_status, confirmation: stored.target_confirmation_status,
+      missing: stored.missing_finality_polls, provider: stored.last_missing_finality_provider_id,
+      version: BigInt(stored.finality_evidence_version),
+    }, {
+      processing: 'PENDING', confirmation: 'orphaned', missing: 0, provider: null, version: 10n,
+    });
+    await repository.enqueueRevision(orphanRevision(aba, 201_014));
+    assert.equal(BigInt((await row(pool, 'proof')).finality_evidence_version), 10n);
+    const replay = await repository.claim(201_015, 120);
+    assert.ok(replay);
+    await repository.markProcessed('proof', replay.leaseToken, 'orphaned');
+    await repository.enqueueRevision(orphanRevision(aba, 201_016));
+    stored = await row(pool, 'proof');
+    assert.equal(stored.processing_status, 'PROCESSED');
+    assert.equal(BigInt(stored.finality_evidence_version), 11n);
+
+    assert.equal(first.finalityEvidenceVersion, 1n);
+    assert.equal(one.finalityEvidenceVersion, 3n);
+    assert.equal(two.finalityEvidenceVersion, 4n);
+  });
+});
+
+void test('fails closed at the PostgreSQL finality evidence version limit without mutation', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(notification('max-finality-version', 41n));
+    const initial = await repository.claim(210_000, 120);
+    assert.ok(initial);
+    await repository.saveSnapshot(
+      'max-finality-version', initial.leaseToken, normalized('max-finality-version', 41n),
+    );
+    await repository.markProcessed('max-finality-version', initial.leaseToken, 'confirmed');
+    await pool.query(
+      `UPDATE chain_transaction_inbox
+       SET finality_evidence_version = 9223372036854775807
+       WHERE signature = 'max-finality-version'`,
+    );
+    const before = await row(pool, 'max-finality-version');
+    await assert.rejects(repository.recordFinalityPoll(Object.freeze({
+      signature: 'max-finality-version', confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: 9_223_372_036_854_775_807n, observedAtMs: 210_001,
+    })), TransactionInboxConflictError);
+    await assert.rejects(
+      repository.enqueue(notification('max-finality-version', 41n, 'WEBSOCKET', 'confirmed', 210_002)),
+      TransactionInboxConflictError,
+    );
+    const after = await row(pool, 'max-finality-version');
+    assert.deepEqual({
+      missing: after.missing_finality_polls,
+      provider: after.last_missing_finality_provider_id,
+      version: after.finality_evidence_version,
+    }, {
+      missing: before.missing_finality_polls,
+      provider: before.last_missing_finality_provider_id,
+      version: before.finality_evidence_version,
+    });
   });
 });
 
@@ -1518,6 +1712,47 @@ function normalized(signature: string, slot: bigint): NormalizedTransaction {
     preBalancesLamports: [9_007_199_254_740_994n], postBalancesLamports: [9_007_199_254_740_993n],
     feeLamports: 9_007_199_254_740_995n, computeUnits: 123n, logs: ['ok'], error: null,
   };
+}
+
+function finalityProof(value: {
+  readonly confirmationStatus: 'processed' | 'confirmed';
+  readonly missingFinalityPolls: number;
+  readonly lastMissingFinalityProviderId: string | null;
+  readonly finalityEvidenceVersion: bigint;
+}): object {
+  return {
+    confirmationStatus: value.confirmationStatus,
+    missingFinalityPolls: value.missingFinalityPolls,
+    lastMissingFinalityProviderId: value.lastMissingFinalityProviderId,
+    finalityEvidenceVersion: value.finalityEvidenceVersion,
+  };
+}
+
+async function onlyFinalityCandidate(
+  repository: PostgresTransactionInboxRepository,
+  signature: string,
+) {
+  const candidates = await repository.listForFinality(1);
+  assert.equal(candidates.length, 1);
+  const candidate = candidates[0];
+  if (candidate === undefined) throw new Error('Expected finality candidate.');
+  assert.equal(candidate.signature, signature);
+  return candidate;
+}
+
+function orphanRevision(
+  value: FinalityCandidate,
+  observedAtMs: number,
+) {
+  if (value.lastMissingFinalityProviderId === null) throw new Error('Expected an orphan proof.');
+  return Object.freeze({
+    signature: 'proof', confirmationStatus: 'orphaned' as const,
+    expectedConfirmationStatus: value.confirmationStatus,
+    expectedMissingFinalityPolls: value.missingFinalityPolls,
+    expectedLastMissingFinalityProviderId: value.lastMissingFinalityProviderId,
+    expectedFinalityEvidenceVersion: value.finalityEvidenceVersion,
+    observedAtMs,
+  });
 }
 
 async function row(pool: InstanceType<typeof pg.Pool>, signature: string): Promise<any> {
