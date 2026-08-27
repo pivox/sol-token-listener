@@ -353,6 +353,35 @@ void test('propagates init signal reason when abort follows a transient response
   assert.deepEqual(events, []);
 });
 
+void test('cancels a response discarded because its signal aborted during fetch resolution', async () => {
+  const controller = new AbortController();
+  const abortReason = new Error('private post-response abort reason');
+  const events: RpcHttpFailoverEvent[] = [];
+  let calls = 0;
+  let cancelCalls = 0;
+  const transient = responseWithCancelableBody(503, () => {
+    cancelCalls += 1;
+    return new Promise<void>(() => undefined);
+  });
+  const fetch = createRpcHttpFailoverFetch({
+    endpoints: endpoints.slice(0, 2),
+    fetch: async () => {
+      calls += 1;
+      controller.abort(abortReason);
+      return transient;
+    },
+    onEvent: (event) => { events.push(event); },
+  });
+
+  await assert.rejects(fetch(endpoints[0].url, { signal: controller.signal }), (error: unknown) => {
+    assert.equal(error, abortReason);
+    return true;
+  });
+  assert.equal(cancelCalls, 1);
+  assert.equal(calls, 1);
+  assert.deepEqual(events, []);
+});
+
 void test('propagates abort during pending cancellation without failover or fallback fetch', async () => {
   const controller = new AbortController();
   const abortReason = new Error('private cancellation abort reason');

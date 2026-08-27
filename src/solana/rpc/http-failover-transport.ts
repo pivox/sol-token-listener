@@ -127,7 +127,10 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
         lastFailure = { endpointId: endpoint.id, reason };
         continue;
       }
-      throwIfAborted(signal);
+      if (signal?.aborted === true) {
+        cancelResponse(response);
+        throwIfAborted(signal);
+      }
 
       const reason = transientReason(response.status);
       if (reason === undefined) {
