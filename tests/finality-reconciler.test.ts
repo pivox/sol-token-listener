@@ -207,40 +207,53 @@ void test('fails closed on null, rejected, malformed, sparse, duplicate, oversiz
   assert.equal(accessorReads, 0);
 });
 
-void test('detaches mutable block evidence before deciding and persisting an orphan revision', async () => {
+void test('detaches proxy block evidence without consulting its poisoned iterator', async () => {
   const value = candidate(61, 45n, {
     missingFinalityPolls: 1,
     lastMissingFinalityProviderId: PRIMARY,
   });
   const repository = memoryRepository([value]);
-  const callerOwnedBlock: string[] = [];
-  let stateAtEnqueue: readonly string[] | undefined;
-  repository.beforeEnqueue = () => {
-    assert.equal(Object.isFrozen(callerOwnedBlock), false);
-    stateAtEnqueue = [...callerOwnedBlock];
-    callerOwnedBlock.push(value.signature);
-  };
+  const unrelatedSignature = signature(62);
+  const callerOwnedBlock = [unrelatedSignature];
+  let iteratorReads = 0;
+  const hostileBlock = new Proxy(callerOwnedBlock, {
+    get(target, key, receiver) {
+      if (key === Symbol.iterator) {
+        iteratorReads += 1;
+        target.push(value.signature);
+        throw new Error('https://secret.invalid/block-iterator');
+      }
+      return Reflect.get(target, key, receiver) as unknown;
+    },
+  });
+  assert.equal(Array.isArray(hostileBlock), true);
+  assert.equal(Object.getPrototypeOf(hostileBlock), Array.prototype);
   const source = passHarness({
-    history: [null], root: 46n, blocks: new Map([[45n, callerOwnedBlock]]),
+    history: [null], root: 46n, blocks: new Map([[45n, hostileBlock]]),
   });
 
   const runResult = await reconciler(source.source, repository, {
     limit: 1, missingPollThreshold: 2, now: () => NOW,
   }).runOnce();
 
-  assert.deepEqual(stateAtEnqueue, []);
+  assert.equal(iteratorReads, 0);
+  assert.deepEqual(callerOwnedBlock, [unrelatedSignature]);
   assert.equal(Object.isFrozen(callerOwnedBlock), false);
+  assert.equal(Object.isFrozen(hostileBlock), false);
   assert.deepEqual(runResult, { candidateCount: 1, pollCount: 1, revisionCount: 1 });
-  assert.deepEqual(repository.revisions, [Object.freeze({
+  const expectedRevision = Object.freeze({
     signature: value.signature, confirmationStatus: 'orphaned',
     expectedConfirmationStatus: 'processed', expectedMissingFinalityPolls: 2,
     expectedLastMissingFinalityProviderId: PRIMARY, expectedFinalityEvidenceVersion: 1n,
     observedAtMs: NOW,
-  })]);
+  });
+  assert.deepEqual(repository.revisions, [expectedRevision]);
 
-  callerOwnedBlock.push(signature(62));
+  hostileBlock.push(value.signature);
+  assert.equal(iteratorReads, 0);
+  assert.deepEqual(callerOwnedBlock, [unrelatedSignature, value.signature]);
   assert.deepEqual(runResult, { candidateCount: 1, pollCount: 1, revisionCount: 1 });
-  assert.equal(repository.revisions.length, 1);
+  assert.deepEqual(repository.revisions, [expectedRevision]);
 });
 
 void test('shares one block read by slot and validates that block before enqueuing any orphan', async () => {
