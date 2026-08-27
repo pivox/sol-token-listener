@@ -540,6 +540,70 @@ void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and a
   assert.equal(queries.length, 1);
 });
 
+void test('counts exact opened and holding positions without sampling non-terminal facts', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL position coverage test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    await pool.query("DELETE FROM paper_positions WHERE position_id='position-retracted'");
+    await pool.query("UPDATE domain_events SET confirmation_status='finalized' WHERE event_id='close-event'");
+    await pool.query(`INSERT INTO token_launches (
+      mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+      created_signature,created_slot,created_transaction_index,created_instruction_index,
+      created_inner_instruction_index,detected_at,updated_at
+    ) VALUES
+      ('MINT-HOLDING','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+        'holding-signature',2,0,0,NULL,$1,$1),
+      ('MINT-BEFORE','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+        'before-signature',3,0,0,NULL,$2,$2),
+      ('MINT-AFTER','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+        'after-signature',4,0,0,NULL,$3,$3),
+      ('MINT-OTHER','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+        'other-signature',5,0,0,NULL,$1,$1)`, [new Date(1_800),new Date(900),new Date(2_100)]);
+    await pool.query(`INSERT INTO paper_positions (
+      position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+      strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+      round_trip_loss_bps,entry_trade_id,open_command_hash,trigger_event_id,
+      payload_version,payload,opened_at
+    ) VALUES
+      ('position-holding','MINT-HOLDING','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'holding-buy','holding-open','holding-source',1,'{}',$1),
+      ('position-before','MINT-BEFORE','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'before-buy','before-open','before-source',1,'{}',$2),
+      ('position-after','MINT-AFTER','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'after-buy','after-open','after-source',1,'{}',$3),
+      ('position-other','MINT-OTHER','SOL',9,'SPL_TOKEN','other-strategy',1,
+        'PAPER_HOLDING',100,100,1000,0,'other-buy','other-open','other-source',1,'{}',$1)`,
+    [new Date(1_800),new Date(900),new Date(2_100)]);
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(runSnapshot.run.configuration,OWNER,1_000);
+    const source = new PostgresPaperMvpSource(pool);
+
+    const batch = await source.collectBatch({
+      runId:run.runId,startedAtMs:run.startedAtMs,deadlineAtMs:run.deadlineAtMs,
+      observedAtMs:2_000,strategyId:'creation-entry-v1',strategyVersion:1,limit:10,
+    });
+
+    assert.equal(batch.openedPositions,2);
+    assert.equal(batch.openPositions,1);
+    assert.deepEqual(batch.positions.map((position) => position.positionId),['position-1']);
+
+    assert.deepEqual(await new PaperMvpCollector(repository,source,() => 2_000).collect({
+      runId:run.runId,runnerOwnerId:OWNER,limit:10,
+    }), {
+      scanned:1,inserted:1,valid:1,unknown:0,
+      duplicateLogicalBuys:1,duplicateLogicalSells:1,
+    });
+    const stored = await repository.load(run.runId);
+    assert.deepEqual([stored?.run.counters.openedPositions,stored?.run.counters.openPositions],[2,1]);
+    assert.deepEqual(stored?.samples.map((sample) => sample.positionId),['position-1']);
+    assert.deepEqual(stored?.unknownPositions,[]);
+  });
+});
+
 void test('collects and replays exact PostgreSQL facts before source retention', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
