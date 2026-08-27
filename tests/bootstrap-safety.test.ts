@@ -235,6 +235,43 @@ void test('listener startup failure fails the process and cleans listener before
   ]);
 });
 
+void test('lifecycle ownership loss after migration prevents listener startup', async () => {
+  const calls: string[] = [];
+  let checkpoints = 0;
+  const loss = new Error('runner ownership lost');
+  await assert.rejects(runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: true }),
+    lifecycleGuard: Object.freeze({
+      checkpoint: async () => {
+        checkpoints += 1;
+        if (checkpoints === 3) throw loss;
+      },
+    }),
+  })), (error: unknown) => error === loss);
+  assert.equal(calls.includes('migrate'), true);
+  assert.equal(calls.includes('listener.create'), false);
+  assert.equal(calls.includes('server.create'), false);
+  assert.equal(calls.at(-1), 'database.close');
+});
+
+void test('lifecycle ownership loss after listener start closes it before API startup', async () => {
+  const calls: string[] = [];
+  let checkpoints = 0;
+  const loss = new Error('runner ownership lost');
+  await assert.rejects(runApplication(dependencies(calls, {
+    loadConfig: () => ({ ...config, listenerEnabled: true, apiEnabled: true, autoMigrate: false }),
+    lifecycleGuard: Object.freeze({
+      checkpoint: async () => {
+        checkpoints += 1;
+        if (checkpoints === 5) throw loss;
+      },
+    }),
+  })), (error: unknown) => error === loss);
+  assert.equal(calls.includes('listener.start'), true);
+  assert.equal(calls.includes('server.create'), false);
+  assert.ok(calls.indexOf('listener.close') < calls.indexOf('database.close'));
+});
+
 void test('API bind failure aggregates listener, server, and database cleanup in order', async () => {
   const calls: string[] = [];
   const bindFailure = new Error('bind failure');

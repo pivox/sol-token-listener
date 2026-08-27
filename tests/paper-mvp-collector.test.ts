@@ -13,9 +13,13 @@ import {
   PostgresPaperMvpRepository,
 } from '../src/storage/paper-mvp.repository.js';
 
+const OWNER = 'paper-mvp-owner-test';
+
 const runSnapshot: PaperMvpRunSnapshot = Object.freeze({
   run: Object.freeze({
     runId: 'run-1',
+    runnerOwnerId: OWNER,
+    completionReason: null,
     configuration: Object.freeze({
       strategyId: 'creation-entry-v1', strategyVersion: 1, quoteMint: 'SOL',
       targetClosedPositions: 50, initialCapitalRaw: 1_000_000n,
@@ -63,7 +67,7 @@ void test('collects exact authoritative position facts and preserves bigint valu
   });
 
   const result = await new PaperMvpCollector(repository, source, () => 8_000)
-    .collect({ runId: 'run-1', limit: 100 });
+    .collect({ runId: 'run-1', runnerOwnerId: OWNER, limit: 100 });
 
   assert.deepEqual(result, {
     scanned: 1, inserted: 1, valid: 1, unknown: 0,
@@ -116,7 +120,7 @@ void test('persists the authoritative provider probe snapshot on every collectio
 
   await new PaperMvpCollector(repository, source, () => 8_000, Object.freeze({
     identity: 'provider:test:v1', snapshot: async () => evidence,
-  })).collect({ runId: 'run-1', limit: 100 });
+  })).collect({ runId: 'run-1', runnerOwnerId: OWNER, limit: 100 });
 
   assert.deepEqual(recordedProgress[0]?.providerUsage, evidence);
   assert.deepEqual(recordedProgress[0]?.counters, {
@@ -164,8 +168,8 @@ void test('accumulates bounded duplicate counts across distinct collection polls
   });
   const collector = new PaperMvpCollector(repository, source, () => 8_000 + poll);
 
-  assert.equal((await collector.collect({ runId:'run-1',limit:1 })).duplicateLogicalBuys, 2);
-  assert.deepEqual(await collector.collect({ runId:'run-1',limit:1 }), {
+  assert.equal((await collector.collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 })).duplicateLogicalBuys, 2);
+  assert.deepEqual(await collector.collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 }), {
     scanned:1,inserted:1,valid:1,unknown:0,
     duplicateLogicalBuys:5,duplicateLogicalSells:5,
   });
@@ -220,7 +224,7 @@ void test('classifies terminal source gaps and contradictions as durable unknown
   });
 
   const result = await new PaperMvpCollector(repository, source, () => 8_000)
-    .collect({ runId: 'run-1', limit: 6 });
+    .collect({ runId: 'run-1', runnerOwnerId: OWNER, limit: 6 });
 
   assert.deepEqual(result, {
     scanned: 6, inserted: 6, valid: 0, unknown: 6,
@@ -252,7 +256,7 @@ void test('defensively waits when a non-finalized close reaches the collector', 
   });
 
   assert.deepEqual(await new PaperMvpCollector(repository,source,() => 8_000)
-    .collect({ runId:'run-1',limit:1 }), {
+    .collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 }), {
     scanned:0,inserted:0,valid:0,unknown:0,
     duplicateLogicalBuys:0,duplicateLogicalSells:0,
   });
@@ -309,24 +313,24 @@ void test('collects and replays exact PostgreSQL facts before source retention',
   await withSchema(databaseUrl, async (pool) => {
     await seedPostgresFacts(pool);
     const repository = new PostgresPaperMvpRepository(pool);
-    const run = await repository.startOrResume(runSnapshot.run.configuration, 1_000);
+    const run = await repository.startOrResume(runSnapshot.run.configuration, OWNER, 1_000);
     assert.equal((await pool.query('SELECT 1 FROM paper_positions')).rowCount, 2);
     assert.equal((await pool.query('SELECT 1 FROM paper_trades')).rowCount, 4);
     const collector = new PaperMvpCollector(
       repository, new PostgresPaperMvpSource(pool), () => 2_000,
     );
 
-    assert.deepEqual(await collector.collect({ runId:run.runId,limit:1 }), {
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:1 }), {
       scanned:1,inserted:1,valid:0,unknown:1,
       duplicateLogicalBuys:0,duplicateLogicalSells:0,
     });
     assert.equal((await repository.load(run.runId))?.samples.length,0);
     await pool.query("UPDATE domain_events SET confirmation_status='finalized' WHERE event_id='close-event'");
-    assert.deepEqual(await collector.collect({ runId:run.runId,limit:1 }), {
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:1 }), {
       scanned:1,inserted:1,valid:1,unknown:0,
       duplicateLogicalBuys:1,duplicateLogicalSells:1,
     });
-    assert.deepEqual(await collector.collect({ runId:run.runId,limit:1 }), {
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:1 }), {
       scanned:0,inserted:0,valid:0,unknown:0,
       duplicateLogicalBuys:1,duplicateLogicalSells:1,
     });
@@ -355,18 +359,18 @@ void test('waits on a confirmed close and records only UNKNOWN after its orphan 
     await seedPostgresFacts(pool);
     await pool.query("DELETE FROM paper_positions WHERE position_id='position-retracted'");
     const repository = new PostgresPaperMvpRepository(pool);
-    const run = await repository.startOrResume(runSnapshot.run.configuration,1_000);
+    const run = await repository.startOrResume(runSnapshot.run.configuration, OWNER, 1_000);
     const collector = new PaperMvpCollector(
       repository,new PostgresPaperMvpSource(pool),() => 2_000,
     );
 
-    assert.deepEqual(await collector.collect({ runId:run.runId,limit:10 }), {
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:10 }), {
       scanned:0,inserted:0,valid:0,unknown:0,
       duplicateLogicalBuys:0,duplicateLogicalSells:0,
     });
     await pool.query("UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id='close-event'");
     await pool.query("UPDATE paper_positions SET status='PAPER_RETRACTED' WHERE position_id='position-1'");
-    assert.deepEqual(await collector.collect({ runId:run.runId,limit:10 }), {
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:10 }), {
       scanned:1,inserted:1,valid:0,unknown:1,
       duplicateLogicalBuys:1,duplicateLogicalSells:1,
     });
@@ -404,7 +408,7 @@ void test('retains an expired entry decision job until the active run samples it
       'position-1',new Date(now - 50_000),new Date(now - 40_000),new Date(expiredAt),
     ]);
     const repository = new PostgresPaperMvpRepository(pool);
-    const run = await repository.startOrResume(runSnapshot.run.configuration, now - 61_000);
+    const run = await repository.startOrResume(runSnapshot.run.configuration, OWNER, now - 61_000);
 
     const protectedPurge = await purgeExpiredFoundationData(pool);
     assert.equal(protectedPurge.paperDecisionJobs,0);
@@ -413,7 +417,8 @@ void test('retains an expired entry decision job until the active run samples it
     assert.equal((await pool.query("SELECT 1 FROM raw_chain_events WHERE event_id='raw-open'")).rowCount,1);
 
     await repository.recordProgress({
-      runId:run.runId,expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:now,counters:Object.freeze({
+      runId:run.runId,runnerOwnerId:OWNER,
+      expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:now,counters:Object.freeze({
         creationsObserved:0,entriesRejected:0,duplicateLogicalBuys:0,duplicateLogicalSells:0,
       }),providerUsage:run.providerUsage,samples:Object.freeze([]),unknownPositions:Object.freeze([
         Object.freeze({ positionId:'position-1',reason:'SOURCE_CONTRADICTION' as const }),
@@ -453,7 +458,7 @@ void test('fails an abandoned run deterministically and releases its retained so
       new Date(startedAt + 1_000),new Date(startedAt + 2_000),new Date(expiredAt),
     ]);
     const repository = new PostgresPaperMvpRepository(pool);
-    const abandoned = await repository.startOrResume(runSnapshot.run.configuration,startedAt);
+    const abandoned = await repository.startOrResume(runSnapshot.run.configuration, OWNER, startedAt);
 
     await purgeExpiredFoundationData(pool);
 
@@ -463,16 +468,17 @@ void test('fails an abandoned run deterministically and releases its retained so
     assert.equal(failed?.run.terminalAtMs,expectedTerminalAt);
     assert.equal(failed?.run.purgeAfterMs,expectedTerminalAt + 14_400_000);
     assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,0);
-    const replacement = await repository.startOrResume(runSnapshot.run.configuration,now);
+    const replacement = await repository.startOrResume(runSnapshot.run.configuration, OWNER, now);
     assert.notEqual(replacement.runId,abandoned.runId);
 
     await repository.terminalize({
-      runId:replacement.runId,terminalAtMs:now,state:'FAILED',report:null,
+      runId:replacement.runId,runnerOwnerId:OWNER,terminalAtMs:now,
+      state:'FAILED',completionReason:null,report:null,
       failureCode:'TEST_TERMINAL',
     });
     const ancientStartedAt = now - 14_400_000 - 181_000;
     const ancient = await repository.startOrResume(
-      runSnapshot.run.configuration,ancientStartedAt,
+      runSnapshot.run.configuration,OWNER,ancientStartedAt,
     );
     const finalPurge = await purgeExpiredFoundationData(pool);
     assert.equal(finalPurge.paperMvpRuns,1);
@@ -591,9 +597,9 @@ async function interleavedCollections(samePosition: boolean): Promise<Readonly<{
   });
   const firstCollector = new PaperMvpCollector(repository,source,() => 2_000);
   const secondCollector = new PaperMvpCollector(repository,source,() => 2_000);
-  const firstPromise = firstCollector.collect({ runId:'run-1',limit:1 });
+  const firstPromise = firstCollector.collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 });
   await firstSourceEntered;
-  const second = await secondCollector.collect({ runId:'run-1',limit:1 });
+  const second = await secondCollector.collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 });
   releaseFirst?.();
   const first = await firstPromise;
   return Object.freeze({ first,second,snapshot });

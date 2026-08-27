@@ -24,7 +24,11 @@ export class PaperMvpCollector {
     private readonly providerUsageProbe?: ProviderUsageProbe,
   ) {}
 
-  public async collect(input: Readonly<{ runId: string; limit: number }>): Promise<PaperMvpCollectorResult> {
+  public async collect(input: Readonly<{
+    runId: string;
+    runnerOwnerId: string;
+    limit: number;
+  }>): Promise<PaperMvpCollectorResult> {
     if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
       throw new RangeError('Paper MVP collector limit must be between 1 and 1000.');
     }
@@ -39,7 +43,7 @@ export class PaperMvpCollector {
   }
 
   private async collectAttempt(
-    input: Readonly<{ runId: string; limit: number }>,
+    input: Readonly<{ runId: string; runnerOwnerId: string; limit: number }>,
   ): Promise<PaperMvpCollectorResult> {
     const before = await this.repository.load(input.runId);
     if (before?.run.state !== 'RUNNING') {
@@ -74,6 +78,7 @@ export class PaperMvpCollector {
       : await this.providerUsageProbe.snapshot();
     const after = await this.repository.recordProgress({
       runId: before.run.runId,
+      runnerOwnerId: input.runnerOwnerId,
       expectedUpdatedAtMs: before.run.updatedAtMs,
       observedAtMs,
       counters: Object.freeze({

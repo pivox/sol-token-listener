@@ -237,7 +237,9 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
         updated_at=deadline_at + INTERVAL '2 minutes',
         verdict=NULL,
         failure_code='RUN_DEADLINE_ABANDONED',
-        report_payload=NULL
+        report_payload=NULL,
+        runner_owner_id=NULL,
+        completion_reason=NULL
        WHERE state='RUNNING'
          AND deadline_at + INTERVAL '2 minutes' <= statement_timestamp()`,
     );

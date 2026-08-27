@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { runApplication } from '../app.js';
 import { PaperMvpCollector } from '../application/paper-mvp-collector.js';
@@ -59,6 +60,14 @@ export function productionRunnerDependencies(config: AppConfig): PaperMvpRunnerD
             preparedPool = null;
             if (strandedLease !== null) await strandedLease.release();
           },
+          lifecycleGuard: Object.freeze({
+            checkpoint: () => {
+              if (preparedLease === null || preparedLease.isLost()) {
+                throw new PaperMvpCliError('RUNNER_LOCK_LOST');
+              }
+              return Promise.resolve();
+            },
+          }),
           waitForShutdownSignal: async () => {
             if (activePool === null) throw new PaperMvpCliError('RUN_FAILED');
             return runInsideBootstrap(activePool);
@@ -129,8 +138,10 @@ export async function acquirePostgresRunner(pool: unknown): Promise<PaperMvpRunn
     throw new PaperMvpCliError('RUN_FAILED');
   }
   const runnerClient = client;
+  const ownerId = `paper_mvp_owner_${randomUUID()}`;
   let released = false;
   return Object.freeze({
+    ownerId,
     lost,
     isLost: () => lockLost,
     release: async () => {

@@ -25,6 +25,7 @@ const configuration: PaperMvpRunConfiguration = Object.freeze({
   networkFeeRawPerTransaction: 5_000n, maxDurationMs: 60_000,
   providerIdentity: 'provider:test:v1',
 });
+const OWNER = 'paper-mvp-owner-test';
 const progressCounters = Object.freeze({
   creationsObserved: 1, entriesRejected: 0,
   duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
@@ -44,7 +45,7 @@ void test('uses a transaction-wide advisory lock and releases after start failur
     }),
   });
 
-  await assert.rejects(repository.startOrResume(configuration, 1_000), /operation failed/u);
+  await assert.rejects(repository.startOrResume(configuration, OWNER, 1_000), /operation failed/u);
   assert.equal(commands[0], 'BEGIN');
   assert.match(commands[1] ?? '', /pg_advisory_xact_lock/u);
   assert.equal(commands.at(-1), 'ROLLBACK');
@@ -60,11 +61,11 @@ void test('rejects invalid financial configuration before opening PostgreSQL', a
     },
   });
   await assert.rejects(
-    repository.startOrResume({ ...configuration, initialCapitalRaw: 0n }, 1_000),
+    repository.startOrResume({ ...configuration, initialCapitalRaw: 0n }, OWNER, 1_000),
     /initial capital/u,
   );
   await assert.rejects(
-    repository.startOrResume({ ...configuration, networkFeeRawPerTransaction: -1n }, 1_000),
+    repository.startOrResume({ ...configuration, networkFeeRawPerTransaction: -1n }, OWNER, 1_000),
     /network fee/u,
   );
   assert.equal(connected, false);
@@ -81,14 +82,14 @@ void test('persists the exact 79-digit derived PnL at the accepted 78-digit fee 
     const repository = new PostgresPaperMvpRepository(pool);
     const run = await repository.startOrResume({
       ...configuration, networkFeeRawPerTransaction: maximumFee,
-    }, 1_000);
+    }, OWNER, 1_000);
     const boundarySample = createPaperMvpPositionSample({
       ...sample(), buyAmountInRaw: 1n, buyAmountOutRaw: 1n,
       buyMinimumAmountOutRaw: 1n, sellAmountInRaw: 1n, sellAmountOutRaw: 1n,
       sellMinimumAmountOutRaw: 1n, networkFeeRawPerTransaction: maximumFee,
     });
     await repository.recordProgress({
-      runId: run.runId, expectedUpdatedAtMs: run.updatedAtMs, observedAtMs: 2_000,
+      runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: run.updatedAtMs, observedAtMs: 2_000,
       counters: progressCounters,
       providerUsage: Object.freeze({
         status: 'AVAILABLE', creditsUsedStart: 1n, creditsUsedEnd: 2n,
@@ -139,9 +140,10 @@ void test('persists only explicit configuration, sample, and provider projection
     const typedProvider: PaperMvpProviderUsage = providerCandidate;
     const repository = new PostgresPaperMvpRepository(pool);
 
-    const run = await repository.startOrResume(typedConfiguration, 1_000);
+    const run = await repository.startOrResume(typedConfiguration, OWNER, 1_000);
     const progressed = await repository.recordProgress({
       runId: run.runId,
+      runnerOwnerId: OWNER,
       expectedUpdatedAtMs: run.updatedAtMs,
       observedAtMs: 2_000,
       counters: progressCounters,
@@ -173,7 +175,7 @@ void test('bounds cumulative observations without charging identical replays', a
     const run = await repository.startOrResume(Object.freeze({
       ...configuration,
       targetClosedPositions: 1_000,
-    }), 1_000);
+    }), OWNER, 1_000);
     const usage = Object.freeze({
       status: 'AVAILABLE' as const,
       creditsUsedStart: 100n,
@@ -186,6 +188,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })));
     assert.equal((await repository.recordProgress({
       runId: run.runId,
+      runnerOwnerId: OWNER,
       expectedUpdatedAtMs: run.updatedAtMs,
       observedAtMs: 2_000,
       counters: progressCounters,
@@ -195,6 +198,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })).closedPositions, 1_000);
     assert.equal((await repository.recordProgress({
       runId: run.runId,
+      runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_000,
       observedAtMs: 2_001,
       counters: progressCounters,
@@ -205,6 +209,7 @@ void test('bounds cumulative observations without charging identical replays', a
 
     await assert.rejects(repository.recordProgress({
       runId: run.runId,
+      runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_001,
       observedAtMs: 2_002,
       counters: progressCounters,
@@ -226,6 +231,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })));
     assert.equal((await repository.recordProgress({
       runId: run.runId,
+      runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_001,
       observedAtMs: 2_003,
       counters: progressCounters,
@@ -235,6 +241,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })).counters.unknownTerminalPositions, 1_000);
     assert.equal((await repository.recordProgress({
       runId: run.runId,
+      runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_003,
       observedAtMs: 2_004,
       counters: progressCounters,
@@ -244,6 +251,7 @@ void test('bounds cumulative observations without charging identical replays', a
     })).counters.unknownTerminalPositions, 1_000);
     await assert.rejects(repository.recordProgress({
       runId: run.runId,
+      runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_004,
       observedAtMs: 2_005,
       counters: progressCounters,
@@ -269,15 +277,17 @@ void test('rejects a stale progress snapshot before inserting observations', asy
   }
   await withSchema(databaseUrl, async (pool) => {
     const repository = new PostgresPaperMvpRepository(pool);
-    const run = await repository.startOrResume(configuration,1_000);
+    const run = await repository.startOrResume(configuration, OWNER, 1_000);
     const progressed = await repository.recordProgress({
-      runId:run.runId,expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:2_000,
+      runId:run.runId,runnerOwnerId:OWNER,
+      expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:2_000,
       counters:progressCounters,providerUsage:run.providerUsage,
       samples:Object.freeze([sample()]),unknownPositions:Object.freeze([]),
     });
 
     await assert.rejects(repository.recordProgress({
-      runId:run.runId,expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:3_000,
+      runId:run.runId,runnerOwnerId:OWNER,
+      expectedUpdatedAtMs:run.updatedAtMs,observedAtMs:3_000,
       counters:progressCounters,providerUsage:progressed.providerUsage,
       samples:Object.freeze([Object.freeze({ ...sample(),positionId:'stale-position' })]),
       unknownPositions:Object.freeze([]),
@@ -296,7 +306,7 @@ void test('loads one repeatable read snapshot while progress commits concurrentl
   }
   await withSchema(databaseUrl, async (pool) => {
     const writer = new PostgresPaperMvpRepository(pool);
-    const run = await writer.startOrResume(configuration, 1_000);
+    const run = await writer.startOrResume(configuration, OWNER, 1_000);
     let selectedRun: (() => void) | undefined;
     const runSelected = new Promise<void>((resolve) => { selectedRun = resolve; });
     let resumeRead: (() => void) | undefined;
@@ -321,7 +331,7 @@ void test('loads one repeatable read snapshot while progress commits concurrentl
     const loading = reader.load(run.runId);
     await runSelected;
     await writer.recordProgress({
-      runId: run.runId, expectedUpdatedAtMs: run.updatedAtMs,
+      runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: run.updatedAtMs,
       observedAtMs: 2_000, counters: progressCounters,
       providerUsage: Object.freeze({
         status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 101n,
@@ -345,13 +355,13 @@ void test('rejects a report not canonically rebuilt from durable samples', async
   }
   await withSchema(databaseUrl, async (pool) => {
     const repository = new PostgresPaperMvpRepository(pool);
-    const run = await repository.startOrResume(configuration, 1_000);
+    const run = await repository.startOrResume(configuration, OWNER, 1_000);
     const usage = Object.freeze({
       status: 'AVAILABLE' as const, creditsUsedStart: 100n, creditsUsedEnd: 101n,
       rateLimitedCount: 0,
     });
     await repository.recordProgress({
-      runId: run.runId, expectedUpdatedAtMs: run.updatedAtMs,
+      runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: run.updatedAtMs,
       observedAtMs: 2_000, counters: progressCounters,
       providerUsage: usage, samples: Object.freeze([losingSample()]),
       unknownPositions: Object.freeze([]),
@@ -367,10 +377,44 @@ void test('rejects a report not canonically rebuilt from durable samples', async
     assert.equal(fabricatedPass.verdict, 'PASS');
 
     await assert.rejects(repository.terminalize({
-      runId: run.runId, terminalAtMs: 3_000, state: 'COMPLETED',
-      report: fabricatedPass, failureCode: null,
+      runId: run.runId, runnerOwnerId: OWNER, terminalAtMs: 3_000, state: 'COMPLETED',
+      completionReason: 'TARGET_REACHED', report: fabricatedPass, failureCode: null,
     }), isConflict('TERMINALIZATION_CONTRADICTION'));
     assert.equal((await repository.load(run.runId))?.run.state, 'RUNNING');
+  });
+});
+
+void test('replacement ownership fences stale progress and terminalization', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL runner fencing test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const repository = new PostgresPaperMvpRepository(pool);
+    const first = await repository.startOrResume(configuration, 'owner-a', 1_000);
+    const replacement = await repository.startOrResume(configuration, 'owner-b', 2_000);
+    assert.equal(replacement.runId, first.runId);
+    assert.equal(replacement.runnerOwnerId, 'owner-b');
+
+    await assert.rejects(repository.recordProgress({
+      runId: first.runId, runnerOwnerId: 'owner-a', expectedUpdatedAtMs: first.updatedAtMs,
+      observedAtMs: 2_001, counters: progressCounters,
+      providerUsage: first.providerUsage, samples: Object.freeze([]),
+      unknownPositions: Object.freeze([]),
+    }), isConflict('RUN_OWNERSHIP_LOST'));
+    await assert.rejects(repository.terminalize({
+      runId: first.runId, runnerOwnerId: 'owner-a', terminalAtMs: 2_001,
+      state: 'FAILED', completionReason: null, report: null, failureCode: 'STALE_OWNER',
+    }), isConflict('RUN_OWNERSHIP_LOST'));
+
+    const progressed = await repository.recordProgress({
+      runId: first.runId, runnerOwnerId: 'owner-b', expectedUpdatedAtMs: first.updatedAtMs,
+      observedAtMs: 2_001, counters: progressCounters,
+      providerUsage: first.providerUsage, samples: Object.freeze([]),
+      unknownPositions: Object.freeze([]),
+    });
+    assert.equal(progressed.runnerOwnerId, 'owner-b');
   });
 });
 
@@ -382,13 +426,13 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
   }
   await withSchema(databaseUrl, async (pool) => {
     const repository = new PostgresPaperMvpRepository(pool);
-    const run = await repository.startOrResume(configuration, 1_000);
+    const run = await repository.startOrResume(configuration, OWNER, 1_000);
     assert.equal(run.state, 'RUNNING');
     assert.equal(run.startedAtMs, 1_000);
     assert.equal(run.deadlineAtMs, 61_000);
-    assert.deepEqual((await repository.startOrResume(configuration, 2_000)).configuration, configuration);
+    assert.deepEqual((await repository.startOrResume(configuration, OWNER, 2_000)).configuration, configuration);
     await assert.rejects(
-      repository.startOrResume({ ...configuration, targetClosedPositions: 2 }, 2_000),
+      repository.startOrResume({ ...configuration, targetClosedPositions: 2 }, OWNER, 2_000),
       isConflict('ACTIVE_RUN_INCOMPATIBLE'),
     );
     await assert.rejects(
@@ -396,17 +440,18 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
         run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
         initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
         provider_identity,state,started_at,deadline_at,updated_at,
-        payload_version,configuration_payload
+        payload_version,configuration_payload,runner_owner_id
       ) SELECT 'second-active',strategy_id,strategy_version,quote_mint,target_closed_positions,
         initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
         provider_identity,state,started_at,deadline_at,updated_at,
-        payload_version,configuration_payload FROM paper_mvp_runs WHERE run_id=$1`, [run.runId]),
+        payload_version,configuration_payload,'second-owner'
+        FROM paper_mvp_runs WHERE run_id=$1`, [run.runId]),
       /paper_mvp_runs_one_active_idx/u,
     );
 
     const firstSample = sample();
     const progressed = await repository.recordProgress({
-      runId: run.runId, expectedUpdatedAtMs: run.updatedAtMs,
+      runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: run.updatedAtMs,
       observedAtMs: 2_000, counters: progressCounters,
       providerUsage: Object.freeze({
         status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 101n,
@@ -417,7 +462,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     });
     assert.equal(progressed.closedPositions, 1);
     const replayed = await repository.recordProgress({
-      runId: run.runId, expectedUpdatedAtMs: progressed.updatedAtMs,
+      runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: progressed.updatedAtMs,
       observedAtMs: 2_001, counters: progressCounters,
       providerUsage: progressed.providerUsage,
       samples: Object.freeze([firstSample]),
@@ -426,7 +471,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     assert.equal(replayed.closedPositions, 1);
 
     const withUnknown = await repository.recordProgress({
-      runId: run.runId, expectedUpdatedAtMs: replayed.updatedAtMs,
+      runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: replayed.updatedAtMs,
       observedAtMs: 2_002, counters: progressCounters,
       providerUsage: progressed.providerUsage, samples: Object.freeze([]),
       unknownPositions: Object.freeze([Object.freeze({
@@ -435,7 +480,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     });
     assert.equal(withUnknown.counters.unknownTerminalPositions, 1);
     assert.equal((await repository.recordProgress({
-      runId: run.runId, expectedUpdatedAtMs: withUnknown.updatedAtMs,
+      runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: withUnknown.updatedAtMs,
       observedAtMs: 2_003, counters: progressCounters,
       providerUsage: progressed.providerUsage, samples: Object.freeze([]),
       unknownPositions: Object.freeze([Object.freeze({
@@ -443,7 +488,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       })]),
     })).counters.unknownTerminalPositions, 1);
     await assert.rejects(repository.recordProgress({
-      runId: run.runId, expectedUpdatedAtMs: 2_003,
+      runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: 2_003,
       observedAtMs: 2_004, counters: progressCounters,
       providerUsage: progressed.providerUsage, samples: Object.freeze([]),
       unknownPositions: Object.freeze([Object.freeze({
@@ -452,7 +497,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     }), isConflict('SAMPLE_CONTRADICTION'));
 
     await assert.rejects(repository.recordProgress({
-      runId: run.runId, expectedUpdatedAtMs: 2_003,
+      runId: run.runId, runnerOwnerId: OWNER, expectedUpdatedAtMs: 2_003,
       observedAtMs: 2_004,
       counters: Object.freeze({ ...progressCounters, creationsObserved: 2 }),
       providerUsage: progressed.providerUsage,
@@ -478,13 +523,13 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       providerUsage: progressed.providerUsage,
     });
     const terminal = await repository.terminalize({
-      runId: run.runId, terminalAtMs: 3_000, state: 'COMPLETED', report,
+      runId: run.runId, runnerOwnerId: OWNER, terminalAtMs: 3_000, state: 'COMPLETED', completionReason: 'TARGET_REACHED', report,
       failureCode: null,
     });
     assert.equal(terminal.state, 'COMPLETED');
     assert.equal(terminal.purgeAfterMs, 3_000 + 4 * 60 * 60 * 1_000);
     assert.equal((await repository.terminalize({
-      runId: run.runId, terminalAtMs: 3_000, state: 'COMPLETED', report,
+      runId: run.runId, runnerOwnerId: OWNER, terminalAtMs: 3_000, state: 'COMPLETED', completionReason: 'TARGET_REACHED', report,
       failureCode: null,
     })).state, 'COMPLETED');
     await assert.rejects(
@@ -493,7 +538,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       /terminal.*immutable/iu,
     );
 
-    const unavailableRun = await repository.startOrResume(configuration, 4_000);
+    const unavailableRun = await repository.startOrResume(configuration, OWNER, 4_000);
     const unavailableReport = createPaperMvpReport({
       runId: unavailableRun.runId, completionReason: 'TARGET_REACHED',
       startedAtMs: 4_000, completedAtMs: 5_000,
@@ -504,14 +549,14 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       providerUsage: unavailableRun.providerUsage,
     });
     assert.equal((await repository.terminalize({
-      runId: unavailableRun.runId, terminalAtMs: 5_000, state: 'COMPLETED',
-      report: unavailableReport, failureCode: null,
+      runId: unavailableRun.runId, runnerOwnerId: OWNER, terminalAtMs: 5_000, state: 'COMPLETED',
+      completionReason: 'TARGET_REACHED', report: unavailableReport, failureCode: null,
     })).state, 'COMPLETED');
 
-    const failedRun = await repository.startOrResume(configuration, 6_000);
+    const failedRun = await repository.startOrResume(configuration, OWNER, 6_000);
     assert.equal((await repository.terminalize({
-      runId: failedRun.runId, terminalAtMs: 7_000, state: 'FAILED',
-      report: null, failureCode: 'SOURCE_CONTRADICTION',
+      runId: failedRun.runId, runnerOwnerId: OWNER, terminalAtMs: 7_000, state: 'FAILED',
+      completionReason: null, report: null, failureCode: 'SOURCE_CONTRADICTION',
     })).state, 'FAILED');
     await assert.rejects(
       pool.query(`UPDATE paper_mvp_runs SET provider_rate_limited_count=1

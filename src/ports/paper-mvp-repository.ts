@@ -1,4 +1,5 @@
 import type {
+  PaperMvpCompletionReason,
   PaperMvpPositionSample,
   PaperMvpProviderUsage,
   PaperMvpReportV1,
@@ -44,6 +45,8 @@ export interface PaperMvpUnknownPosition {
 
 export interface PaperMvpRun {
   readonly runId: string;
+  readonly runnerOwnerId: string | null;
+  readonly completionReason: PaperMvpCompletionReason | null;
   readonly configuration: PaperMvpRunConfiguration;
   readonly state: 'RUNNING' | 'COMPLETED' | 'FAILED';
   readonly counters: PaperMvpRunCounters;
@@ -60,6 +63,7 @@ export interface PaperMvpRun {
 
 export interface PaperMvpProgress {
   readonly runId: string;
+  readonly runnerOwnerId: string;
   readonly expectedUpdatedAtMs: number;
   readonly observedAtMs: number;
   readonly counters: PaperMvpProgressCounters;
@@ -71,15 +75,19 @@ export interface PaperMvpProgress {
 export type PaperMvpTerminalization =
   | Readonly<{
     runId: string;
+    runnerOwnerId: string;
     terminalAtMs: number;
     state: 'COMPLETED';
+    completionReason: Exclude<PaperMvpCompletionReason, 'LEGACY'>;
     report: PaperMvpReportV1;
     failureCode: null;
   }>
   | Readonly<{
     runId: string;
+    runnerOwnerId: string;
     terminalAtMs: number;
     state: 'FAILED';
+    completionReason: null;
     report: null;
     failureCode: string;
   }>;
@@ -91,7 +99,11 @@ export interface PaperMvpRunSnapshot {
 }
 
 export interface PaperMvpRepository {
-  startOrResume(configuration: PaperMvpRunConfiguration, nowMs: number): Promise<PaperMvpRun>;
+  startOrResume(
+    configuration: PaperMvpRunConfiguration,
+    runnerOwnerId: string,
+    nowMs: number,
+  ): Promise<PaperMvpRun>;
   recordProgress(progress: PaperMvpProgress): Promise<PaperMvpRun>;
   load(runId: string): Promise<PaperMvpRunSnapshot | null>;
   terminalize(terminalization: PaperMvpTerminalization): Promise<PaperMvpRun>;

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   createPaperMvpPositionSample,
   createPaperMvpReport,
+  type PaperMvpCompletionReason,
   type PaperMvpPositionSample,
   type PaperMvpProviderUsage,
 } from '../domain/paper-mvp.js';
@@ -32,6 +33,7 @@ export interface PaperMvpPool { connect(): Promise<Client> }
 type Operation = 'start' | 'progress' | 'load' | 'terminalize';
 export type PaperMvpConflictCode =
   | 'ACTIVE_RUN_INCOMPATIBLE' | 'RUN_NOT_ACTIVE' | 'SAMPLE_CONTRADICTION'
+  | 'RUN_OWNERSHIP_LOST'
   | 'PROGRESS_REGRESSION' | 'PROGRESS_LIMIT_EXCEEDED' | 'PROGRESS_SNAPSHOT_STALE'
   | 'TERMINALIZATION_CONTRADICTION';
 
@@ -64,9 +66,11 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
 
   public async startOrResume(
     configuration: PaperMvpRunConfiguration,
+    runnerOwnerId: string,
     nowMs: number,
   ): Promise<PaperMvpRun> {
     const config = validateConfiguration(configuration);
+    ownerId(runnerOwnerId);
     timestamp(nowMs, 'nowMs');
     timestamp(nowMs + config.maxDurationMs, 'deadlineAtMs');
     return this.transaction('start', async (client) => {
@@ -83,7 +87,14 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
         if (!sameConfiguration(run.configuration, config)) {
           throw new PaperMvpConflictError('ACTIVE_RUN_INCOMPATIBLE');
         }
-        return run;
+        const claimed = await client.query(
+          `UPDATE paper_mvp_runs run SET runner_owner_id=$2
+           WHERE run_id=$1 RETURNING run.*,
+            (SELECT COUNT(*)::integer FROM paper_mvp_position_samples observation
+              WHERE observation.run_id=run.run_id AND observation.sample_status='VALID') AS closed_positions`,
+          [run.runId, runnerOwnerId],
+        );
+        return requiredRun(claimed.rows[0]);
       }
       const runId = `paper_mvp_run_${randomUUID()}`;
       const startedAt = new Date(nowMs);
@@ -93,13 +104,13 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
           run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
           initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
           provider_identity,state,started_at,deadline_at,updated_at,payload_version,
-          configuration_payload
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'RUNNING',$10,$11,$10,1,$12::jsonb)
+          configuration_payload,runner_owner_id
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'RUNNING',$10,$11,$10,1,$12::jsonb,$13)
         RETURNING *,0::integer AS closed_positions`,
         [runId,config.strategyId,config.strategyVersion,config.quoteMint,
           config.targetClosedPositions,config.initialCapitalRaw.toString(),
           config.networkFeeRawPerTransaction.toString(),config.maxDurationMs,
-          config.providerIdentity,startedAt,deadlineAt,configurationJson(config)],
+          config.providerIdentity,startedAt,deadlineAt,configurationJson(config),runnerOwnerId],
       );
       return requiredRun(inserted.rows[0]);
     });
@@ -107,6 +118,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
 
   public async recordProgress(progress: PaperMvpProgress): Promise<PaperMvpRun> {
     boundedText(progress.runId, 'runId');
+    ownerId(progress.runnerOwnerId);
     timestamp(progress.expectedUpdatedAtMs, 'expectedUpdatedAtMs');
     timestamp(progress.observedAtMs, 'observedAtMs');
     const counters = validateCounters(progress.counters);
@@ -128,6 +140,9 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       const before = await selectRun(client, progress.runId, true);
       if (before?.state !== 'RUNNING') {
         throw new PaperMvpConflictError('RUN_NOT_ACTIVE');
+      }
+      if (before.runnerOwnerId !== progress.runnerOwnerId) {
+        throw new PaperMvpConflictError('RUN_OWNERSHIP_LOST');
       }
       if (before.updatedAtMs !== progress.expectedUpdatedAtMs) {
         throw new PaperMvpConflictError('PROGRESS_SNAPSHOT_STALE');
@@ -189,7 +204,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       let reportJson = input.report === null ? null : canonicalStringifyJson(input.report);
       if (before.state !== 'RUNNING') {
         const stored = await client.query(
-          `SELECT state,terminal_at,failure_code,
+          `SELECT state,terminal_at,failure_code,completion_reason,
             report_payload IS NOT DISTINCT FROM $2::jsonb AS same_report
            FROM paper_mvp_runs WHERE run_id=$1`, [input.runId,reportJson],
         );
@@ -197,8 +212,12 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
         if (row !== undefined && text(row.state, 'state') === input.state
           && nullableDateMs(row.terminal_at) === input.terminalAtMs
           && nullableText(row.failure_code) === input.failureCode
+          && completionReason(row.completion_reason) === input.completionReason
           && row.same_report === true) return before;
         throw new PaperMvpConflictError('TERMINALIZATION_CONTRADICTION');
+      }
+      if (before.runnerOwnerId !== input.runnerOwnerId) {
+        throw new PaperMvpConflictError('RUN_OWNERSHIP_LOST');
       }
       if (input.terminalAtMs < before.updatedAtMs) {
         throw new TypeError('Paper MVP terminalAtMs is invalid.');
@@ -208,7 +227,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
         assertObservationCounts(before, observations);
         const canonicalReport = createPaperMvpReport({
           runId: before.runId,
-          completionReason: 'TARGET_REACHED',
+          completionReason: input.completionReason,
           startedAtMs: before.startedAtMs,
           completedAtMs: input.terminalAtMs,
           targetClosedPositions: before.configuration.targetClosedPositions,
@@ -231,12 +250,13 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       const result = await client.query(
         `UPDATE paper_mvp_runs run SET state=$2,terminal_at=$3::timestamptz,
           purge_after=$3::timestamptz + INTERVAL '4 hours',updated_at=$3::timestamptz,
-          verdict=$4,failure_code=$5,report_payload=$6::jsonb
+          verdict=$4,failure_code=$5,report_payload=$6::jsonb,
+          completion_reason=$7,runner_owner_id=NULL
          WHERE run_id=$1 RETURNING run.*,
           (SELECT COUNT(*)::integer FROM paper_mvp_position_samples observation
             WHERE observation.run_id=run.run_id AND observation.sample_status='VALID') AS closed_positions`,
         [input.runId,input.state,new Date(input.terminalAtMs),
-          input.report?.verdict ?? null,input.failureCode,reportJson],
+          input.report?.verdict ?? null,input.failureCode,reportJson,input.completionReason],
       );
       return requiredRun(result.rows[0]);
     });
@@ -490,9 +510,21 @@ function assertProgress(
 
 function validateTerminalization(value: PaperMvpTerminalization): void {
   boundedText(value.runId, 'runId');
+  ownerId(value.runnerOwnerId);
   timestamp(value.terminalAtMs, 'terminalAtMs');
-  if (value.state === 'FAILED') boundedText(value.failureCode, 'failure code');
-  else if (value.report.runId !== value.runId) {
+  const raw = value as unknown as Readonly<Record<string, unknown>>;
+  if (value.state === 'FAILED') {
+    boundedText(value.failureCode, 'failure code');
+    if (raw.completionReason !== null || raw.report !== null) {
+      throw new TypeError('Paper MVP terminalization is invalid.');
+    }
+  } else if ((raw.completionReason !== 'TARGET_REACHED'
+      && raw.completionReason !== 'TIMEOUT'
+      && raw.completionReason !== 'SIGINT'
+      && raw.completionReason !== 'SIGTERM')
+    || raw.failureCode !== null || typeof raw.report !== 'object' || raw.report === null
+    || value.report.runId !== value.runId
+    || value.report.completionReason !== value.completionReason) {
     throw new TypeError('Paper MVP terminalization is invalid.');
   }
 }
@@ -520,8 +552,16 @@ function runFromRow(row: Row): PaperMvpRun {
     creditsUsedEnd:nullableBigint(row.provider_credits_used_end),
     rateLimitedCount:safeNumber(row.provider_rate_limited_count),
   });
+  const runnerOwnerId = nullableText(row.runner_owner_id);
+  const durableCompletionReason = completionReason(row.completion_reason);
+  if ((state === 'RUNNING' && (runnerOwnerId === null || durableCompletionReason !== null))
+    || (state === 'COMPLETED' && (runnerOwnerId !== null || durableCompletionReason === null))
+    || (state === 'FAILED' && (runnerOwnerId !== null || durableCompletionReason !== null))) {
+    throw stored();
+  }
   return Object.freeze({
-    runId:text(row.run_id,'run id'),configuration,state,counters,providerUsage,
+    runId:text(row.run_id,'run id'),runnerOwnerId,
+    completionReason:durableCompletionReason,configuration,state,counters,providerUsage,
     closedPositions:safeNumber(row.closed_positions),startedAtMs:dateMs(row.started_at),
     deadlineAtMs:dateMs(row.deadline_at),updatedAtMs:dateMs(row.updated_at),
     terminalAtMs:nullableDateMs(row.terminal_at),purgeAfterMs:nullableDateMs(row.purge_after),
@@ -647,6 +687,7 @@ function requiredRun(row: Row | undefined): PaperMvpRun { if (row === undefined)
 function stored(): PaperMvpRepositoryError { return new PaperMvpRepositoryError('load'); }
 function timestamp(value:number,field:string):void { try { assertValidTimestampMs('occurredAtMs',value); } catch { throw new TypeError(`Paper MVP ${field} is invalid.`); } }
 function boundedText(value:string,field:string):void { if(typeof value!=='string'||value.length===0||value!==value.trim()||Buffer.byteLength(value)>512)throw new TypeError(`Paper MVP ${field} is invalid.`); }
+function ownerId(value:string):void { if(typeof value!=='string'||value.length===0||value!==value.trim()||Buffer.byteLength(value)>256)throw new TypeError('Paper MVP runner owner is invalid.'); }
 function integer(value:number,min:number,max:number,field:string):void { if(!Number.isSafeInteger(value)||value<min||value>max)throw new TypeError(`Paper MVP ${field} is invalid.`); }
 function positiveBigint(value:bigint,field:string):void { if(typeof value!=='bigint'||value<=0n||value.toString().length>78)throw new TypeError(`Paper MVP ${field} is invalid.`); }
 function nonNegativeBigint(value:bigint,field:string):void { if(typeof value!=='bigint'||value<0n||value.toString().length>78)throw new TypeError(`Paper MVP ${field} is invalid.`); }
@@ -661,5 +702,6 @@ function nullableBigint(value:unknown):bigint|null { return value===null?null:bi
 function dateMs(value:unknown):number { if(!(value instanceof Date)||!Number.isSafeInteger(value.getTime()))throw stored(); return value.getTime(); }
 function nullableDateMs(value:unknown):number|null { return value===null?null:dateMs(value); }
 function nullableText(value:unknown):string|null { return value===null?null:text(value,'text'); }
+function completionReason(value:unknown):PaperMvpCompletionReason|null { if(value===null)return null; if(value==='TARGET_REACHED'||value==='TIMEOUT'||value==='SIGINT'||value==='SIGTERM'||value==='LEGACY')return value; throw stored(); }
 function verdict(value:unknown):'PASS'|'FAIL'|null { if(value===null||value==='PASS'||value==='FAIL')return value; throw stored(); }
 function exitReason(value:unknown):PaperMvpPositionSample['exitReason'] { if(value==='EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED'||value==='TAKE_PROFIT_2X_EXECUTABLE'||value==='CREATOR_EARLY_SELL'||value==='MANUAL_KILL_SWITCH')return value; throw stored(); }

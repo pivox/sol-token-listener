@@ -28,6 +28,7 @@ import { acquirePostgresRunner } from '../src/cli/paper-mvp-runtime.js';
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+const OWNER = 'paper-mvp-owner-test';
 
 void test('parses the exact bounded canonical paper MVP arguments', () => {
   assert.deepEqual(parsePaperMvpArguments([
@@ -146,7 +147,7 @@ void test('runs the real bootstrap lifetime, reaches target, verifies durable st
 
 void test('resumes compatible state, rejects incompatible state, and keeps provider-unavailable honest', async () => {
   const repository = new MemoryRepository();
-  await repository.startOrResume(configuration(), 1_000);
+  await repository.startOrResume(configuration(), OWNER, 1_000);
   const writes: string[] = [];
   const resumed = await runPaperMvp(options(), {
     ...dependencies(repository), now: sequenceClock(2_000, 2_001, 3_000),
@@ -163,7 +164,9 @@ void test('resumes compatible state, rejects incompatible state, and keeps provi
   assert.equal(writes.length, 1);
 
   const incompatible = new MemoryRepository();
-  await incompatible.startOrResume({ ...configuration(), targetClosedPositions: 2 }, 1_000);
+  await incompatible.startOrResume(
+    { ...configuration(), targetClosedPositions: 2 }, OWNER, 1_000,
+  );
   await assert.rejects(runPaperMvp(options(), dependencies(incompatible)),
     isCliError('ACTIVE_RUN_INCOMPATIBLE'));
 });
@@ -204,8 +207,10 @@ void test('a signal latched during collection wins over a newly reached target',
     createStopController: () => sequenceStopController(['POLL', 'SIGINT']),
   });
   assert.equal(result.exitCode, 2);
-  assert.equal(result.report, null);
-  assert.equal(repository.snapshot?.run.failureCode, 'RUN_INTERRUPTED_SIGINT');
+  assert.equal(result.report?.completionReason, 'SIGINT');
+  assert.equal(result.report?.technicalStatus, 'DEGRADED');
+  assert.deepEqual(result.report?.failedGateCodes, ['RUN_INTERRUPTED']);
+  assert.equal(repository.snapshot?.run.state, 'COMPLETED');
 });
 
 void test('timeout and signal each perform a final collect and cannot turn a late target into PASS', async () => {
@@ -233,10 +238,12 @@ void test('timeout and signal each perform a final collect and cannot turn a lat
     });
     assert.equal(collects, 2, stop);
     assert.equal(result.exitCode, 2, stop);
-    assert.equal(result.report, null, stop);
-    assert.equal(repository.snapshot?.run.state, 'FAILED', stop);
-    assert.equal(repository.snapshot?.run.failureCode,
-      stop === 'TIMEOUT' ? 'RUN_TIMEOUT_AFTER_TARGET' : `RUN_INTERRUPTED_${stop}`);
+    assert.equal(result.report?.completionReason, stop, stop);
+    assert.equal(result.report?.technicalStatus, 'DEGRADED', stop);
+    assert.equal(result.report?.verdict, 'FAIL', stop);
+    assert.deepEqual(result.report?.failedGateCodes,
+      [stop === 'TIMEOUT' ? 'RUN_TIMED_OUT' : 'RUN_INTERRUPTED']);
+    assert.equal(repository.snapshot?.run.state, 'COMPLETED', stop);
   }
 });
 
@@ -252,6 +259,7 @@ void test('a timeout below target exports the durable failing report with exit c
   assert.equal(result.exitCode, 2);
   assert.equal(result.report?.verdict, 'FAIL');
   assert.ok(result.report?.failedGateCodes.includes('CLOSED_POSITIONS_BELOW_TARGET'));
+  assert.ok(result.report?.failedGateCodes.includes('RUN_TIMED_OUT'));
   assert.equal(repository.snapshot?.run.state, 'COMPLETED');
   assert.equal(writes.length, 1);
 });
@@ -338,21 +346,68 @@ void test('releases PostgreSQL runner clients on acquisition failure and verifie
     release: (destroy?: boolean | Error) => { normalReleases.push(destroy); },
   });
   const normalLease = await acquirePostgresRunner({ connect: async () => normalClient });
+  assert.match(normalLease.ownerId, /^paper_mvp_owner_[0-9a-f-]{36}$/u);
+  assert.notEqual(normalLease.ownerId, lease.ownerId);
   await normalLease.release();
   await normalLease.release();
   assert.equal(normalQueries, 2);
   assert.deepEqual(normalReleases, [undefined]);
 });
 
-void test('terminalizes fail-closed when PostgreSQL runner ownership is lost', async () => {
+void test('does not mutate durable state when PostgreSQL runner ownership is lost', async () => {
   const repository = new MemoryRepository();
   await assert.rejects(runPaperMvp(options(), {
     ...dependencies(repository),
     acquireRunner: async () => runnerLease(async () => undefined, Promise.resolve()),
     createStopController: () => ({ wait: async () => new Promise(() => undefined), close: () => undefined }),
   }), isCliError('RUNNER_LOCK_LOST'));
-  assert.equal(repository.snapshot?.run.state, 'FAILED');
-  assert.equal(repository.snapshot?.run.failureCode, 'RUNNER_LOCK_LOST');
+  assert.equal(repository.snapshot, null);
+  assert.equal(repository.starts, 0);
+});
+
+void test('loss during the final collection leaves the resumable run unterminated', async () => {
+  const repository = new MemoryRepository();
+  const ownership = controlledRunnerLease();
+  let writes = 0;
+  await assert.rejects(runPaperMvp(options(), {
+    ...dependencies(repository),
+    acquireRunner: async () => ownership.lease,
+    createCollector: () => ({
+      collect: async () => {
+        repository.addSample(sample());
+        ownership.lose();
+        return emptyCollection();
+      },
+    }),
+    createStopController: () => stopController('POLL'),
+    writeReport: async () => { writes += 1; },
+  }), isCliError('RUNNER_LOCK_LOST'));
+  assert.equal(repository.snapshot?.run.state, 'RUNNING');
+  assert.equal(repository.terminalizations, 0);
+  assert.equal(writes, 0);
+});
+
+void test('loss immediately before terminalization prevents terminal state and export', async () => {
+  const repository = new MemoryRepository();
+  const ownership = controlledRunnerLease();
+  let writes = 0;
+  repository.seed(configuration(), OWNER, 1_000, sample(), availableProbeSnapshot());
+  await assert.rejects(runPaperMvp(options(), {
+    ...dependencies(repository),
+    acquireRunner: async () => ownership.lease,
+    now: sequenceClock(2_000, 2_001),
+    createStopController: () => Object.freeze({
+      wait: async () => {
+        queueMicrotask(ownership.lose);
+        return 'POLL' as const;
+      },
+      close: () => undefined,
+    }),
+    writeReport: async () => { writes += 1; },
+  }), isCliError('RUNNER_LOCK_LOST'));
+  assert.equal(repository.snapshot?.run.state, 'RUNNING');
+  assert.equal(repository.terminalizations, 0);
+  assert.equal(writes, 0);
 });
 
 void test('publishes an executable ESM command with no signing or submission import graph', async () => {
@@ -445,7 +500,24 @@ function sequenceStopController(values: readonly ('POLL' | 'SIGINT' | 'SIGTERM')
 function runnerLease(release: () => Promise<void>, lost = new Promise<void>(() => undefined)) {
   let lockLost = false;
   void lost.then(() => { lockLost = true; });
-  return Object.freeze({ release, lost, isLost: () => lockLost });
+  return Object.freeze({ ownerId: OWNER, release, lost, isLost: () => lockLost });
+}
+
+function controlledRunnerLease() {
+  let lockLost = false;
+  let resolveLoss: (() => void) | undefined;
+  const lost = new Promise<void>((resolve) => { resolveLoss = resolve; });
+  const lose = (): void => {
+    if (lockLost) return;
+    lockLost = true;
+    resolveLoss?.();
+  };
+  return Object.freeze({
+    lose,
+    lease: Object.freeze({
+      ownerId: OWNER, lost, isLost: () => lockLost, release: async () => undefined,
+    }),
+  });
 }
 
 function unavailableProbe(): ProviderUsageProbe {
@@ -497,8 +569,13 @@ function isCliError(code: string): (error: unknown) => boolean {
 class MemoryRepository implements PaperMvpRepository {
   public snapshot: PaperMvpRunSnapshot | null = null;
   public starts = 0;
+  public terminalizations = 0;
 
-  public async startOrResume(config: PaperMvpRunConfiguration, nowMs: number): Promise<PaperMvpRun> {
+  public async startOrResume(
+    config: PaperMvpRunConfiguration,
+    runnerOwnerId: string,
+    nowMs: number,
+  ): Promise<PaperMvpRun> {
     this.starts += 1;
     if (this.snapshot !== null) {
       if (JSON.stringify(config, bigintJson) !== JSON.stringify(this.snapshot.run.configuration, bigintJson)) {
@@ -506,10 +583,13 @@ class MemoryRepository implements PaperMvpRepository {
         error.code = 'ACTIVE_RUN_INCOMPATIBLE';
         throw error;
       }
-      return this.snapshot.run;
+      const run = Object.freeze({ ...this.snapshot.run, runnerOwnerId });
+      this.snapshot = Object.freeze({ ...this.snapshot, run });
+      return run;
     }
     const run: PaperMvpRun = Object.freeze({
-      runId: 'run-1', configuration: Object.freeze({ ...config }), state: 'RUNNING',
+      runId: 'run-1', runnerOwnerId, completionReason: null,
+      configuration: Object.freeze({ ...config }), state: 'RUNNING',
       counters: Object.freeze({ creationsObserved: 1, entriesRejected: 0,
         unknownTerminalPositions: 0, duplicateLogicalBuys: 0, duplicateLogicalSells: 0 }),
       providerUsage: availableProbeSnapshot('UNAVAILABLE'), closedPositions: 0,
@@ -529,10 +609,12 @@ class MemoryRepository implements PaperMvpRepository {
 
   public async terminalize(value: PaperMvpTerminalization): Promise<PaperMvpRun> {
     if (this.snapshot === null) throw new Error('missing');
+    this.terminalizations += 1;
     const run = Object.freeze({
       ...this.snapshot.run, state: value.state, terminalAtMs: value.terminalAtMs,
       updatedAtMs: value.terminalAtMs, verdict: value.report?.verdict ?? null,
-      failureCode: value.failureCode,
+      failureCode: value.failureCode, runnerOwnerId: null,
+      completionReason: value.completionReason,
     });
     this.snapshot = Object.freeze({ ...this.snapshot, run });
     return run;
@@ -551,6 +633,27 @@ class MemoryRepository implements PaperMvpRepository {
     const run = Object.freeze({ ...this.snapshot.run, providerUsage: value,
       updatedAtMs: this.snapshot.run.updatedAtMs + 1 });
     this.snapshot = Object.freeze({ ...this.snapshot, run });
+  }
+
+  public seed(
+    config: PaperMvpRunConfiguration,
+    runnerOwnerId: string,
+    nowMs: number,
+    value: ReturnType<typeof sample>,
+    usage: ReturnType<typeof availableProbeSnapshot>,
+  ): void {
+    const run: PaperMvpRun = Object.freeze({
+      runId: 'run-1', runnerOwnerId, completionReason: null,
+      configuration: Object.freeze({ ...config }), state: 'RUNNING',
+      counters: Object.freeze({ creationsObserved: 1, entriesRejected: 0,
+        unknownTerminalPositions: 0, duplicateLogicalBuys: 0, duplicateLogicalSells: 0 }),
+      providerUsage: usage, closedPositions: 1, startedAtMs: nowMs,
+      deadlineAtMs: nowMs + config.maxDurationMs, updatedAtMs: nowMs + 1,
+      terminalAtMs: null, purgeAfterMs: null, verdict: null, failureCode: null,
+    });
+    this.snapshot = Object.freeze({
+      run, samples: Object.freeze([value]), unknownPositions: Object.freeze([]),
+    });
   }
 }
 
