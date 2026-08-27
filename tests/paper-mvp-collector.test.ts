@@ -25,7 +25,16 @@ const runSnapshot: PaperMvpRunSnapshot = Object.freeze({
       strategyId: 'creation-entry-v1', strategyVersion: 1, quoteMint: 'SOL',
       targetClosedPositions: 50, initialCapitalRaw: 1_000_000n,
       networkFeeRawPerTransaction: 5_000n, maxDurationMs: 60_000,
+      entryQuoteAmountRaw: 1_000n, slippageBps: 100n,
+      minimumConfirmation: 'confirmed', entryWindowMs: 45_000,
+      quoteMaxAgeMs: 5_000, quoteMaxSlotLag: 32,
+      creationEntryMaxAgeMs: 45_000, creationEntryMaxSlotLag: 32,
+      externalMinimumBuyAmountRaw: 1n,
       externalUniqueBuyersTarget: 10, takeProfitMultiplierBps: 20_000n,
+      manualKillSwitch: false, maximumRoundTripLossBps: 3_000n,
+      decisionPollIntervalMs: 1_000, decisionLeaseMs: 30_000,
+      decisionRetryMaxAttempts: 5, decisionRetryBaseDelayMs: 500,
+      qualificationProfileFingerprint: 'a'.repeat(64),
       providerIdentity: 'provider:test',
     }),
     state: 'RUNNING',
@@ -365,6 +374,7 @@ for (const shutdownKind of ['signal','deadline'] as const) {
             Object.freeze({ ...validFacts(),positionId:`regular-${shutdownKind}` }),
           ]),creationsObserved:0,entriesRejected:0,
           duplicateLogicalBuys:0,duplicateLogicalSells:0,
+          openedPositions:1,openPositions:0,
         }),
       });
       const abortController = new AbortController();
@@ -401,6 +411,7 @@ for (const shutdownKind of ['signal','deadline'] as const) {
               Object.freeze({ ...validFacts(),positionId:`final-${shutdownKind}` }),
             ]),creationsObserved:0,entriesRejected:0,
             duplicateLogicalBuys:0,duplicateLogicalSells:0,
+            openedPositions:1,openPositions:0,
           });
         },
       });

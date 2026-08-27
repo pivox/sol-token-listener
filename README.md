@@ -265,6 +265,12 @@ projection candidate `CREATION_ENTRY_REJECTED` ou `CREATION_ENTRY_EXPIRED` pour
 la stratégie/version. Une régression de ces projections retenues est une panne
 technique fail-closed, jamais un compteur inventé.
 
+La reprise compare la configuration effective durable v3 : taille d'entrée,
+slippage, finalité, fenêtres/limites de quote et de slot, minimum d'achat,
+seuils de sortie, kill switch, risque aller-retour, paramètres du worker et
+fingerprint du profil de qualification. Les anciens runs v1/v2 sont refusés
+sans backfill afin de ne jamais mélanger des échantillons non comparables.
+
 La cible, la deadline, `SIGINT` et `SIGTERM` déclenchent une dernière collecte
 quand elle reste faisable. Le rapport terminal est recalculé depuis le snapshot
 PostgreSQL durable et revérifié dans la transaction de terminalisation avant

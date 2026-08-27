@@ -13,8 +13,24 @@ export interface PaperMvpRunConfiguration {
   readonly initialCapitalRaw: bigint;
   readonly networkFeeRawPerTransaction: bigint;
   readonly maxDurationMs: number;
+  readonly entryQuoteAmountRaw: bigint;
+  readonly slippageBps: bigint;
+  readonly minimumConfirmation: 'confirmed' | 'finalized';
+  readonly entryWindowMs: number;
+  readonly quoteMaxAgeMs: number;
+  readonly quoteMaxSlotLag: number;
+  readonly creationEntryMaxAgeMs: number;
+  readonly creationEntryMaxSlotLag: number;
+  readonly externalMinimumBuyAmountRaw: bigint;
   readonly externalUniqueBuyersTarget: number;
   readonly takeProfitMultiplierBps: bigint;
+  readonly manualKillSwitch: boolean;
+  readonly maximumRoundTripLossBps: bigint;
+  readonly decisionPollIntervalMs: number;
+  readonly decisionLeaseMs: number;
+  readonly decisionRetryMaxAttempts: number;
+  readonly decisionRetryBaseDelayMs: number;
+  readonly qualificationProfileFingerprint: string;
   readonly providerIdentity: string;
 }
 

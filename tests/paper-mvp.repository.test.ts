@@ -23,7 +23,16 @@ const configuration: PaperMvpRunConfiguration = Object.freeze({
   quoteMint: 'So11111111111111111111111111111111111111112',
   targetClosedPositions: 1, initialCapitalRaw: 1_000_000n,
   networkFeeRawPerTransaction: 5_000n, maxDurationMs: 60_000,
+  entryQuoteAmountRaw: 1_000n, slippageBps: 100n,
+  minimumConfirmation: 'confirmed', entryWindowMs: 45_000,
+  quoteMaxAgeMs: 5_000, quoteMaxSlotLag: 32,
+  creationEntryMaxAgeMs: 45_000, creationEntryMaxSlotLag: 32,
+  externalMinimumBuyAmountRaw: 1n,
   externalUniqueBuyersTarget: 10, takeProfitMultiplierBps: 20_000n,
+  manualKillSwitch: false, maximumRoundTripLossBps: 3_000n,
+  decisionPollIntervalMs: 1_000, decisionLeaseMs: 30_000,
+  decisionRetryMaxAttempts: 5, decisionRetryBaseDelayMs: 500,
+  qualificationProfileFingerprint: 'a'.repeat(64),
   providerIdentity: 'provider:test:v1',
 });
 const OWNER = 'paper-mvp-owner-test';
@@ -224,12 +233,15 @@ void test('bounds cumulative observations without charging identical replays', a
       ...sample(),
       positionId: `bounded-position-${index.toString().padStart(4, '0')}`,
     })));
+    const thousandPositionsCounters = Object.freeze({
+      ...progressCounters,openedPositions:1_000,openPositions:0,
+    });
     assert.equal((await repository.recordProgress({
       runId: run.runId,
       runnerOwnerId: OWNER,
       expectedUpdatedAtMs: run.updatedAtMs,
       observedAtMs: 2_000,
-      counters: progressCounters,
+      counters: thousandPositionsCounters,
       providerUsage: usage,
       samples,
       unknownPositions: Object.freeze([]),
@@ -239,7 +251,7 @@ void test('bounds cumulative observations without charging identical replays', a
       runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_000,
       observedAtMs: 2_001,
-      counters: progressCounters,
+      counters: thousandPositionsCounters,
       providerUsage: usage,
       samples,
       unknownPositions: Object.freeze([]),
@@ -250,7 +262,7 @@ void test('bounds cumulative observations without charging identical replays', a
       runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_001,
       observedAtMs: 2_002,
-      counters: progressCounters,
+      counters: thousandPositionsCounters,
       providerUsage: usage,
       samples: Object.freeze([Object.freeze({
         ...sample(),
@@ -272,7 +284,7 @@ void test('bounds cumulative observations without charging identical replays', a
       runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_001,
       observedAtMs: 2_003,
-      counters: progressCounters,
+      counters: thousandPositionsCounters,
       providerUsage: usage,
       samples: Object.freeze([]),
       unknownPositions,
@@ -282,7 +294,7 @@ void test('bounds cumulative observations without charging identical replays', a
       runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_003,
       observedAtMs: 2_004,
-      counters: progressCounters,
+      counters: thousandPositionsCounters,
       providerUsage: usage,
       samples: Object.freeze([]),
       unknownPositions,
@@ -292,7 +304,7 @@ void test('bounds cumulative observations without charging identical replays', a
       runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_004,
       observedAtMs: 2_005,
-      counters: progressCounters,
+      counters: thousandPositionsCounters,
       providerUsage: usage,
       samples: Object.freeze([]),
       unknownPositions: Object.freeze([Object.freeze({
@@ -373,6 +385,52 @@ void test('rejects a stale progress snapshot before inserting observations', asy
     const stored = await repository.load(run.runId);
     assert.equal(stored?.run.updatedAtMs,2_000);
     assert.deepEqual(stored?.samples.map((value) => value.positionId),['position']);
+  });
+});
+
+void test('rejects an opened-position counter regression', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL opened counter regression test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(configuration,OWNER,1_000);
+    const first = await repository.recordProgress({
+      runId:run.runId,runnerOwnerId:OWNER,expectedUpdatedAtMs:run.updatedAtMs,
+      observedAtMs:2_000,counters:progressCounters,providerUsage:run.providerUsage,
+      samples:Object.freeze([]),unknownPositions:Object.freeze([]),
+    });
+    await assert.rejects(repository.recordProgress({
+      runId:run.runId,runnerOwnerId:OWNER,expectedUpdatedAtMs:first.updatedAtMs,
+      observedAtMs:3_000,
+      counters:Object.freeze({ ...progressCounters,openedPositions:1,openPositions:1 }),
+      providerUsage:first.providerUsage,samples:Object.freeze([]),unknownPositions:Object.freeze([]),
+    }),isConflict('PROGRESS_REGRESSION'));
+    assert.equal((await repository.load(run.runId))?.run.counters.openedPositions,2);
+  });
+});
+
+void test('rolls back a valid sample when opened positions would under-report it', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL sample coverage invariant test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(configuration,OWNER,1_000);
+    await assert.rejects(repository.recordProgress({
+      runId:run.runId,runnerOwnerId:OWNER,expectedUpdatedAtMs:run.updatedAtMs,
+      observedAtMs:2_000,
+      counters:Object.freeze({ ...progressCounters,openedPositions:0,openPositions:0 }),
+      providerUsage:run.providerUsage,samples:Object.freeze([sample()]),
+      unknownPositions:Object.freeze([]),
+    }),isConflict('PROGRESS_REGRESSION'));
+    const after = await repository.load(run.runId);
+    assert.equal(after?.samples.length,0);
+    assert.equal(after?.run.updatedAtMs,1_000);
   });
 });
 
@@ -600,6 +658,43 @@ void test('fails closed instead of claiming a legacy v1 run with unknown strateg
   });
 });
 
+void test('fails closed instead of claiming a legacy v2 run with incomplete effective inputs', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL legacy v2 configuration test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const v2Payload = Object.freeze({
+      schemaVersion:'paper-mvp-run-configuration.v2',strategyId:'creation-entry-v1',
+      strategyVersion:1,quoteMint:configuration.quoteMint,targetClosedPositions:1,
+      initialCapitalRaw:'1000000',networkFeeRawPerTransaction:'5000',maxDurationMs:60_000,
+      externalUniqueBuyersTarget:10,takeProfitMultiplierBps:'20000',
+      providerIdentity:'provider:test:v1',
+    });
+    await pool.query(`INSERT INTO paper_mvp_runs (
+      run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
+      initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
+      external_unique_buyers_target,take_profit_multiplier_bps,
+      provider_identity,state,started_at,deadline_at,updated_at,payload_version,
+      configuration_payload,runner_owner_id
+    ) VALUES ('legacy-v2','creation-entry-v1',1,$1,1,1000000,5000,60000,
+      10,20000,'provider:test:v1','RUNNING',$2,$3,$2,2,$4::jsonb,'legacy-owner')`, [
+      configuration.quoteMint,new Date(1_000),new Date(61_000),JSON.stringify(v2Payload),
+    ]);
+
+    const repository = new PostgresPaperMvpRepository(pool);
+    await assert.rejects(
+      repository.startOrResume(configuration, OWNER, 2_000),
+      isConflict('ACTIVE_RUN_INCOMPATIBLE'),
+    );
+    assert.deepEqual((await pool.query(
+      `SELECT runner_owner_id,payload_version,entry_quote_amount_raw
+       FROM paper_mvp_runs WHERE run_id='legacy-v2'`,
+    )).rows, [{ runner_owner_id:'legacy-owner',payload_version:2,entry_quote_amount_raw:null }]);
+  });
+});
+
 void test('starts or resumes exactly, persists progress atomically, terminalizes and purges', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -625,16 +720,49 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       repository.startOrResume({ ...configuration, takeProfitMultiplierBps: 25_000n }, OWNER, 2_000),
       isConflict('ACTIVE_RUN_INCOMPATIBLE'),
     );
+    const behaviorChanges = [
+      { entryQuoteAmountRaw: 2_000n }, { slippageBps: 101n },
+      { minimumConfirmation: 'finalized' as const }, { entryWindowMs: 46_000 },
+      { quoteMaxAgeMs: 5_001 }, { quoteMaxSlotLag: 33 },
+      { creationEntryMaxAgeMs: 45_001 }, { creationEntryMaxSlotLag: 33 },
+      { externalMinimumBuyAmountRaw: 2n }, { manualKillSwitch: true },
+      { maximumRoundTripLossBps: 3_001n }, { decisionPollIntervalMs: 1_001 },
+      { decisionLeaseMs: 31_000 }, { decisionRetryMaxAttempts: 6 },
+      { decisionRetryBaseDelayMs: 501 },
+      { qualificationProfileFingerprint: 'b'.repeat(64) },
+    ] as const;
+    for (const change of behaviorChanges) {
+      await assert.rejects(
+        repository.startOrResume(
+          { ...configuration, ...change } as PaperMvpRunConfiguration,
+          OWNER,
+          2_000,
+        ),
+        isConflict('ACTIVE_RUN_INCOMPATIBLE'),
+      );
+    }
     await assert.rejects(
       pool.query(`INSERT INTO paper_mvp_runs (
         run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
         initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
+        entry_quote_amount_raw,slippage_bps,minimum_confirmation,entry_window_ms,
+        quote_max_age_ms,quote_max_slot_lag,creation_entry_max_age_ms,
+        creation_entry_max_slot_lag,external_minimum_buy_amount_raw,
         external_unique_buyers_target,take_profit_multiplier_bps,
+        manual_kill_switch,maximum_round_trip_loss_bps,decision_poll_interval_ms,
+        decision_lease_ms,decision_retry_max_attempts,decision_retry_base_delay_ms,
+        qualification_profile_fingerprint,
         provider_identity,state,started_at,deadline_at,updated_at,
         payload_version,configuration_payload,runner_owner_id
       ) SELECT 'second-active',strategy_id,strategy_version,quote_mint,target_closed_positions,
         initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
+        entry_quote_amount_raw,slippage_bps,minimum_confirmation,entry_window_ms,
+        quote_max_age_ms,quote_max_slot_lag,creation_entry_max_age_ms,
+        creation_entry_max_slot_lag,external_minimum_buy_amount_raw,
         external_unique_buyers_target,take_profit_multiplier_bps,
+        manual_kill_switch,maximum_round_trip_loss_bps,decision_poll_interval_ms,
+        decision_lease_ms,decision_retry_max_attempts,decision_retry_base_delay_ms,
+        qualification_profile_fingerprint,
         provider_identity,state,started_at,deadline_at,updated_at,
         payload_version,configuration_payload,'second-owner'
         FROM paper_mvp_runs WHERE run_id=$1`, [run.runId]),

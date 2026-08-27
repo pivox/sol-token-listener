@@ -90,7 +90,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       );
       const row = active.rows[0];
       if (row !== undefined) {
-        if (safeNumber(row.payload_version) !== 2) {
+        if (safeNumber(row.payload_version) !== 3) {
           throw new PaperMvpConflictError('ACTIVE_RUN_INCOMPATIBLE');
         }
         const run = runFromRow(row);
@@ -113,16 +113,33 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
         `INSERT INTO paper_mvp_runs (
           run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
           initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
-          external_unique_buyers_target,take_profit_multiplier_bps,provider_identity,
+          entry_quote_amount_raw,slippage_bps,minimum_confirmation,entry_window_ms,
+          quote_max_age_ms,quote_max_slot_lag,creation_entry_max_age_ms,
+          creation_entry_max_slot_lag,external_minimum_buy_amount_raw,
+          external_unique_buyers_target,take_profit_multiplier_bps,manual_kill_switch,
+          maximum_round_trip_loss_bps,decision_poll_interval_ms,decision_lease_ms,
+          decision_retry_max_attempts,decision_retry_base_delay_ms,
+          qualification_profile_fingerprint,provider_identity,
           state,started_at,deadline_at,updated_at,payload_version,
           configuration_payload,runner_owner_id
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'RUNNING',$12,$13,$12,2,$14::jsonb,$15)
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+          $19,$20,$21,$22,$23,$24,$25,$26,$27,'RUNNING',$28,$29,$28,3,$30::jsonb,$31
+        )
         RETURNING *,0::integer AS closed_positions`,
         [runId,config.strategyId,config.strategyVersion,config.quoteMint,
           config.targetClosedPositions,config.initialCapitalRaw.toString(),
           config.networkFeeRawPerTransaction.toString(),config.maxDurationMs,
+          config.entryQuoteAmountRaw.toString(),config.slippageBps.toString(),
+          config.minimumConfirmation,config.entryWindowMs,config.quoteMaxAgeMs,
+          config.quoteMaxSlotLag,config.creationEntryMaxAgeMs,
+          config.creationEntryMaxSlotLag,config.externalMinimumBuyAmountRaw.toString(),
           config.externalUniqueBuyersTarget,config.takeProfitMultiplierBps.toString(),
-          config.providerIdentity,startedAt,deadlineAt,configurationJson(config),runnerOwnerId],
+          config.manualKillSwitch,config.maximumRoundTripLossBps.toString(),
+          config.decisionPollIntervalMs,config.decisionLeaseMs,
+          config.decisionRetryMaxAttempts,config.decisionRetryBaseDelayMs,
+          config.qualificationProfileFingerprint,config.providerIdentity,
+          startedAt,deadlineAt,configurationJson(config),runnerOwnerId],
       );
       return requiredRun(inserted.rows[0]);
     });
@@ -173,6 +190,7 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       }
       await assertObservationLimits(
         client, progress.runId, before.configuration.targetClosedPositions,
+        counters.openedPositions ?? 0,
       );
       const updated = await client.query(
         `UPDATE paper_mvp_runs run SET
@@ -430,6 +448,7 @@ async function assertObservationLimits(
   client: Client,
   runId: string,
   targetClosedPositions: number,
+  openedPositions: number,
 ): Promise<void> {
   const result = await client.query(
     `SELECT
@@ -439,9 +458,13 @@ async function assertObservationLimits(
     [runId],
   );
   const row = result.rows[0];
-  if (row === undefined || safeNumber(row.valid_count) > targetClosedPositions
-    || safeNumber(row.unknown_count) > 1_000) {
+  if (row === undefined) throw new PaperMvpConflictError('PROGRESS_LIMIT_EXCEEDED');
+  const validCount = safeNumber(row.valid_count);
+  if (validCount > targetClosedPositions || safeNumber(row.unknown_count) > 1_000) {
     throw new PaperMvpConflictError('PROGRESS_LIMIT_EXCEEDED');
+  }
+  if (validCount > openedPositions) {
+    throw new PaperMvpConflictError('PROGRESS_REGRESSION');
   }
 }
 
@@ -453,10 +476,34 @@ function validateConfiguration(value: PaperMvpRunConfiguration): PaperMvpRunConf
   positiveBigint(value.initialCapitalRaw, 'initial capital');
   nonNegativeBigint(value.networkFeeRawPerTransaction, 'network fee');
   integer(value.maxDurationMs, 60_000, 14_400_000, 'max duration');
+  positiveBigint(value.entryQuoteAmountRaw, 'entry quote amount');
+  nonNegativeBigint(value.slippageBps, 'slippage');
+  if (value.slippageBps > 10_000n) throw new TypeError('Paper MVP slippage is invalid.');
+  const confirmation = validateMinimumConfirmation(value.minimumConfirmation);
+  integer(value.entryWindowMs, 1_000, 3_600_000, 'entry window');
+  integer(value.quoteMaxAgeMs, 100, 60_000, 'quote maximum age');
+  integer(value.quoteMaxSlotLag, 0, 10_000, 'quote maximum slot lag');
+  integer(value.creationEntryMaxAgeMs, 100, 3_600_000, 'creation entry maximum age');
+  integer(value.creationEntryMaxSlotLag, 0, 10_000, 'creation entry maximum slot lag');
+  positiveBigint(value.externalMinimumBuyAmountRaw, 'external minimum buy amount');
   integer(value.externalUniqueBuyersTarget, 1, 1_000, 'external unique buyers target');
   positiveBigint(value.takeProfitMultiplierBps, 'take profit multiplier');
   if (value.takeProfitMultiplierBps < 10_000n || value.takeProfitMultiplierBps > 1_000_000n) {
     throw new TypeError('Paper MVP take profit multiplier is invalid.');
+  }
+  if (typeof value.manualKillSwitch !== 'boolean') {
+    throw new TypeError('Paper MVP manual kill switch is invalid.');
+  }
+  nonNegativeBigint(value.maximumRoundTripLossBps, 'maximum round-trip loss');
+  if (value.maximumRoundTripLossBps > 10_000n) {
+    throw new TypeError('Paper MVP maximum round-trip loss is invalid.');
+  }
+  integer(value.decisionPollIntervalMs, 100, 60_000, 'decision poll interval');
+  integer(value.decisionLeaseMs, 5_000, 900_000, 'decision lease');
+  integer(value.decisionRetryMaxAttempts, 1, 100, 'decision retry maximum attempts');
+  integer(value.decisionRetryBaseDelayMs, 100, 60_000, 'decision retry base delay');
+  if (!/^[a-f0-9]{64}$/u.test(value.qualificationProfileFingerprint)) {
+    throw new TypeError('Paper MVP qualification profile fingerprint is invalid.');
   }
   boundedText(value.providerIdentity, 'provider identity');
   return Object.freeze({
@@ -467,8 +514,24 @@ function validateConfiguration(value: PaperMvpRunConfiguration): PaperMvpRunConf
     initialCapitalRaw: value.initialCapitalRaw,
     networkFeeRawPerTransaction: value.networkFeeRawPerTransaction,
     maxDurationMs: value.maxDurationMs,
+    entryQuoteAmountRaw: value.entryQuoteAmountRaw,
+    slippageBps: value.slippageBps,
+    minimumConfirmation: confirmation,
+    entryWindowMs: value.entryWindowMs,
+    quoteMaxAgeMs: value.quoteMaxAgeMs,
+    quoteMaxSlotLag: value.quoteMaxSlotLag,
+    creationEntryMaxAgeMs: value.creationEntryMaxAgeMs,
+    creationEntryMaxSlotLag: value.creationEntryMaxSlotLag,
+    externalMinimumBuyAmountRaw: value.externalMinimumBuyAmountRaw,
     externalUniqueBuyersTarget: value.externalUniqueBuyersTarget,
     takeProfitMultiplierBps: value.takeProfitMultiplierBps,
+    manualKillSwitch: value.manualKillSwitch,
+    maximumRoundTripLossBps: value.maximumRoundTripLossBps,
+    decisionPollIntervalMs: value.decisionPollIntervalMs,
+    decisionLeaseMs: value.decisionLeaseMs,
+    decisionRetryMaxAttempts: value.decisionRetryMaxAttempts,
+    decisionRetryBaseDelayMs: value.decisionRetryBaseDelayMs,
+    qualificationProfileFingerprint: value.qualificationProfileFingerprint,
     providerIdentity: value.providerIdentity,
   });
 }
@@ -564,7 +627,8 @@ function assertProgress(
   for (const field of ['creationsObserved','entriesRejected','duplicateLogicalBuys','duplicateLogicalSells'] as const) {
     if (counters[field] < run.counters[field]) throw new PaperMvpConflictError('PROGRESS_REGRESSION');
   }
-  if ((counters.openPositions ?? 0) > (counters.openedPositions ?? 0)) {
+  if ((counters.openedPositions ?? 0) < (run.counters.openedPositions ?? 0)
+    || (counters.openPositions ?? 0) > (counters.openedPositions ?? 0)) {
     throw new PaperMvpConflictError('PROGRESS_REGRESSION');
   }
   const old = run.providerUsage;
@@ -600,7 +664,7 @@ function validateTerminalization(value: PaperMvpTerminalization): void {
 }
 
 function runFromRow(row: Row): PaperMvpRun {
-  if (safeNumber(row.payload_version) !== 2) throw stored();
+  if (safeNumber(row.payload_version) !== 3) throw stored();
   const state = text(row.state, 'state');
   if (state !== 'RUNNING' && state !== 'COMPLETED' && state !== 'FAILED') throw stored();
   const providerStatus = text(row.provider_status, 'provider status');
@@ -611,8 +675,26 @@ function runFromRow(row: Row): PaperMvpRun {
     initialCapitalRaw:bigint(row.initial_capital_raw),
     networkFeeRawPerTransaction:bigint(row.network_fee_raw_per_transaction),
     maxDurationMs:safeNumber(row.max_duration_ms),
+    entryQuoteAmountRaw:bigint(row.entry_quote_amount_raw),
+    slippageBps:bigint(row.slippage_bps),
+    minimumConfirmation:storedMinimumConfirmation(row.minimum_confirmation),
+    entryWindowMs:safeNumber(row.entry_window_ms),
+    quoteMaxAgeMs:safeNumber(row.quote_max_age_ms),
+    quoteMaxSlotLag:safeNumber(row.quote_max_slot_lag),
+    creationEntryMaxAgeMs:safeNumber(row.creation_entry_max_age_ms),
+    creationEntryMaxSlotLag:safeNumber(row.creation_entry_max_slot_lag),
+    externalMinimumBuyAmountRaw:bigint(row.external_minimum_buy_amount_raw),
     externalUniqueBuyersTarget:safeNumber(row.external_unique_buyers_target),
     takeProfitMultiplierBps:bigint(row.take_profit_multiplier_bps),
+    manualKillSwitch:boolean(row.manual_kill_switch),
+    maximumRoundTripLossBps:bigint(row.maximum_round_trip_loss_bps),
+    decisionPollIntervalMs:safeNumber(row.decision_poll_interval_ms),
+    decisionLeaseMs:safeNumber(row.decision_lease_ms),
+    decisionRetryMaxAttempts:safeNumber(row.decision_retry_max_attempts),
+    decisionRetryBaseDelayMs:safeNumber(row.decision_retry_base_delay_ms),
+    qualificationProfileFingerprint:text(
+      row.qualification_profile_fingerprint,'qualification profile fingerprint',
+    ),
     providerIdentity:text(row.provider_identity,'provider identity'),
   });
   const counters = validateRunCounters({
@@ -739,14 +821,30 @@ function sampleJson(value: PaperMvpPositionSample): string {
 
 function configurationJson(value: PaperMvpRunConfiguration): string {
   return JSON.stringify({
-    schemaVersion:'paper-mvp-run-configuration.v2',strategyId:value.strategyId,
+    schemaVersion:'paper-mvp-run-configuration.v3',strategyId:value.strategyId,
     strategyVersion:value.strategyVersion,quoteMint:value.quoteMint,
     targetClosedPositions:value.targetClosedPositions,
     initialCapitalRaw:value.initialCapitalRaw.toString(),
     networkFeeRawPerTransaction:value.networkFeeRawPerTransaction.toString(),
     maxDurationMs:value.maxDurationMs,
+    entryQuoteAmountRaw:value.entryQuoteAmountRaw.toString(),
+    slippageBps:value.slippageBps.toString(),
+    minimumConfirmation:value.minimumConfirmation,
+    entryWindowMs:value.entryWindowMs,
+    quoteMaxAgeMs:value.quoteMaxAgeMs,
+    quoteMaxSlotLag:value.quoteMaxSlotLag,
+    creationEntryMaxAgeMs:value.creationEntryMaxAgeMs,
+    creationEntryMaxSlotLag:value.creationEntryMaxSlotLag,
+    externalMinimumBuyAmountRaw:value.externalMinimumBuyAmountRaw.toString(),
     externalUniqueBuyersTarget:value.externalUniqueBuyersTarget,
     takeProfitMultiplierBps:value.takeProfitMultiplierBps.toString(),
+    manualKillSwitch:value.manualKillSwitch,
+    maximumRoundTripLossBps:value.maximumRoundTripLossBps.toString(),
+    decisionPollIntervalMs:value.decisionPollIntervalMs,
+    decisionLeaseMs:value.decisionLeaseMs,
+    decisionRetryMaxAttempts:value.decisionRetryMaxAttempts,
+    decisionRetryBaseDelayMs:value.decisionRetryBaseDelayMs,
+    qualificationProfileFingerprint:value.qualificationProfileFingerprint,
     providerIdentity:value.providerIdentity,
   });
 }
@@ -774,6 +872,9 @@ function date(ms:number):Date { return new Date(ms); }
 function decimal(value:bigint|null):string|null { return value?.toString() ?? null; }
 function text(value:unknown,field:string):string { if(typeof value!=='string'||value.length===0)throw new PaperMvpRepositoryError('load'); void field; return value; }
 function safeNumber(value:unknown):number { const parsed=typeof value==='number'?value:typeof value==='string'?Number(value):NaN; if(!Number.isSafeInteger(parsed)||parsed<0)throw stored(); return parsed; }
+function boolean(value:unknown):boolean { if(typeof value!=='boolean')throw stored(); return value; }
+function validateMinimumConfirmation(value:unknown):'confirmed'|'finalized' { if(value!=='confirmed'&&value!=='finalized')throw new TypeError('Paper MVP minimum confirmation is invalid.'); return value; }
+function storedMinimumConfirmation(value:unknown):'confirmed'|'finalized' { if(value!=='confirmed'&&value!=='finalized')throw stored(); return value; }
 function bigint(value:unknown):bigint { if(typeof value!=='string'||!/^\d{1,78}$/u.test(value))throw stored(); return BigInt(value); }
 function signedBigint(value:unknown):bigint { if(typeof value!=='string'||!/^-?\d{1,78}$/u.test(value))throw stored(); return BigInt(value); }
 function derivedSignedBigint(value:unknown):bigint { if(typeof value!=='string'||!/^[-]?\d{1,79}$/u.test(value))throw stored(); return BigInt(value); }

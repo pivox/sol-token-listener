@@ -7,6 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { parseConfig, type AppConfig } from '../src/config/env.js';
 import { createPaperMvpPositionSample } from '../src/domain/paper-mvp.js';
+import { createQualificationEngine } from '../src/qualification/qualification-engine.js';
 import type {
   PaperMvpRepository,
   PaperMvpRun,
@@ -128,6 +129,23 @@ void test('runs the real bootstrap lifetime, reaches target, verifies durable st
   assert.equal(repository.snapshot?.run.state, 'COMPLETED');
   assert.equal(repository.snapshot?.run.configuration.externalUniqueBuyersTarget, 10);
   assert.equal(repository.snapshot?.run.configuration.takeProfitMultiplierBps, 20_000n);
+  assert.deepEqual(repository.snapshot?.run.configuration, {
+    strategyId: 'creation-entry-v1', strategyVersion: 1,
+    quoteMint: paperConfig().wsolMint,
+    targetClosedPositions: 1, initialCapitalRaw: 1_000_000n,
+    networkFeeRawPerTransaction: 5n, maxDurationMs: 60_000,
+    entryQuoteAmountRaw: 1_000n, slippageBps: 100n,
+    minimumConfirmation: 'confirmed', entryWindowMs: 45_000,
+    quoteMaxAgeMs: 5_000, quoteMaxSlotLag: 32,
+    creationEntryMaxAgeMs: 45_000, creationEntryMaxSlotLag: 32,
+    externalMinimumBuyAmountRaw: 1n,
+    externalUniqueBuyersTarget: 10, takeProfitMultiplierBps: 20_000n,
+    manualKillSwitch: false, maximumRoundTripLossBps: 3_000n,
+    decisionPollIntervalMs: 1_000, decisionLeaseMs: 30_000,
+    decisionRetryMaxAttempts: 5, decisionRetryBaseDelayMs: 500,
+    qualificationProfileFingerprint: createQualificationEngine(paperConfig()).profileSummary.fingerprint,
+    providerIdentity: 'provider-usage:unavailable:v1',
+  });
   assert.deepEqual(calls, ['bootstrap:start', 'collect', 'bootstrap:closed']);
   const serialized = await readFile(reportFile, 'utf8');
   assert.deepEqual(JSON.parse(serialized), result.report);
@@ -175,6 +193,44 @@ void test('resumes compatible state, rejects incompatible state, and keeps provi
   );
   await assert.rejects(runPaperMvp(options(), dependencies(incompatible)),
     isCliError('ACTIVE_RUN_INCOMPATIBLE'));
+});
+
+void test('rejects every changed effective creation-entry input before listener startup', async () => {
+  const baseline = paperConfig();
+  const changedConfigurations: readonly AppConfig[] = [
+    { ...baseline,paperEntryQuoteAmountRaw:1_001n },
+    { ...baseline,paperSlippageBps:101n },
+    { ...baseline,paperMinimumConfirmation:'finalized' },
+    { ...baseline,paperEntryWindowSeconds:46 },
+    { ...baseline,paperQuoteMaxAgeMs:5_001 },
+    { ...baseline,paperQuoteMaxSlotLag:33 },
+    { ...baseline,creationEntryMaxAgeMs:45_001 },
+    { ...baseline,creationEntryMaxSlotLag:33 },
+    { ...baseline,externalMinimumBuyAmountRaw:2n },
+    { ...baseline,creationManualKillSwitch:true },
+    { ...baseline,riskMaxRoundTripLossBps:3_001 },
+    { ...baseline,paperDecisionWorkerPollMs:1_001 },
+    { ...baseline,paperDecisionWorkerLeaseSeconds:31 },
+    { ...baseline,paperDecisionRetryMaxAttempts:6 },
+    { ...baseline,paperDecisionRetryBaseDelayMs:501 },
+    { ...baseline,qualificationMinimumScore:61 },
+  ];
+  for (const config of changedConfigurations) {
+    const repository = new MemoryRepository();
+    await repository.startOrResume(configuration(),OWNER,1_000);
+    let listenerStarted = false;
+    await assert.rejects(runPaperMvp(options(), {
+      ...dependencies(repository,config),
+      runBootstrap: async (prepare,inside) => {
+        const pool = Object.freeze({});
+        await prepare(pool);
+        listenerStarted = true;
+        await inside(pool);
+      },
+    }),isCliError('ACTIVE_RUN_INCOMPATIBLE'));
+    assert.equal(listenerStarted,false);
+    assert.equal(repository.starts,2);
+  }
 });
 
 void test('bounds every collection to the number of target positions still missing', async () => {
@@ -644,7 +700,23 @@ function configuration(): PaperMvpRunConfiguration {
     strategyId: 'creation-entry-v1', strategyVersion: 1, quoteMint: config.wsolMint,
     targetClosedPositions: 1, initialCapitalRaw: 1_000_000n,
     networkFeeRawPerTransaction: 5n, maxDurationMs: 60_000,
+    entryQuoteAmountRaw: config.paperEntryQuoteAmountRaw ?? 1n,
+    slippageBps: config.paperSlippageBps ?? 0n,
+    minimumConfirmation: config.paperMinimumConfirmation,
+    entryWindowMs: config.paperEntryWindowSeconds * 1_000,
+    quoteMaxAgeMs: config.paperQuoteMaxAgeMs,
+    quoteMaxSlotLag: config.paperQuoteMaxSlotLag,
+    creationEntryMaxAgeMs: config.creationEntryMaxAgeMs,
+    creationEntryMaxSlotLag: config.creationEntryMaxSlotLag,
+    externalMinimumBuyAmountRaw: config.externalMinimumBuyAmountRaw ?? 1n,
     externalUniqueBuyersTarget: 10, takeProfitMultiplierBps: 20_000n,
+    manualKillSwitch: config.creationManualKillSwitch,
+    maximumRoundTripLossBps: BigInt(config.riskMaxRoundTripLossBps),
+    decisionPollIntervalMs: config.paperDecisionWorkerPollMs,
+    decisionLeaseMs: config.paperDecisionWorkerLeaseSeconds * 1_000,
+    decisionRetryMaxAttempts: config.paperDecisionRetryMaxAttempts,
+    decisionRetryBaseDelayMs: config.paperDecisionRetryBaseDelayMs,
+    qualificationProfileFingerprint: createQualificationEngine(config).profileSummary.fingerprint,
     providerIdentity: 'provider-usage:unavailable:v1',
   });
 }

@@ -168,7 +168,7 @@ void test('purges every retained terminal inbox row and exposes their count', as
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
 
-void test('applies migrations 001-024 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-025 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -184,7 +184,7 @@ void test('applies migrations 001-024 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '024_paper_mvp_position_coverage.sql');
+    assert.equal(applied.at(-1), '025_paper_mvp_effective_configuration.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);

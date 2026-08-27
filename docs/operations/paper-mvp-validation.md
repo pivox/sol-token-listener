@@ -45,12 +45,15 @@ le processus avec le code `1` sans terminaliser le run : il reste `RUNNING` et
 reprenable, tandis qu'un propriétaire remplacé ne peut plus progresser ni
 terminaliser la ligne.
 Après crash, la même commande reprend uniquement la configuration immuable
-exacte du run `RUNNING`. La configuration durable v2 inclut les cibles de dix
-acheteurs uniques et de prise de profit exécutable à 2x dans ses colonnes et son
-payload versionné ; elles participent donc à la comparaison de reprise. Une
-ligne v1 antérieure ne contient pas ces faits et est refusée sans revendication,
-plutôt que complétée par une valeur supposée. Une configuration différente ou
-un second runner échoue sans adopter ni faire progresser le run.
+exacte du run `RUNNING`. La configuration durable v3 fige les montants d'entrée,
+slippage, finalité minimale, fenêtres et fraîcheur des quotes, limites de slot,
+minimum d'achat externe, cibles de dix acheteurs et de prise de profit à 2x,
+kill switch, perte aller-retour maximale, paramètres de poll/lease/retry et
+fingerprint du profil de qualification effectif. Ces valeurs sont dupliquées
+dans des colonnes contrôlées et un payload versionné, sans chemin local, URL ni
+secret. Une ligne v1 ou v2 ne contient pas tous ces faits et est refusée sans
+revendication ni backfill. Une configuration différente ou un second runner
+échoue sans adopter ni faire progresser le run.
 
 La cible produit le rapport terminal. Deadline, `SIGINT` et `SIGTERM` demandent
 une dernière collecte bornée à cinq secondes, puis produisent toujours un run
@@ -74,6 +77,9 @@ sont des divisions entières arrondies vers le bas des seuls samples clos, et
 valent zéro sans sample. La migration 024 initialise uniquement les nouvelles
 colonnes de compteurs. Les payloads historiques `paper-mvp.v1` restent immuables
 et ne contiennent ni ces deux compteurs ni les quatre moyennes d'exécution.
+Pendant qu'un run reste `RUNNING`, la purge protège toutes ses positions ouvertes
+dans sa fenêtre, leurs trades et jobs, y compris les positions déjà échantillonnées
+ou encore ouvertes. La rétention normale reprend seulement après terminalisation.
 
 Codes processus :
 

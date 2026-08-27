@@ -53,7 +53,7 @@ void test('applies all migrations, replays and backfills legacy retries', async 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '024_paper_mvp_position_coverage.sql');
+    assert.equal(applied.at(-1), '025_paper_mvp_effective_configuration.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,

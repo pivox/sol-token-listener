@@ -4,6 +4,7 @@ import { loadConfig, type AppConfig } from '../config/env.js';
 import { createPaperMvpReport, type PaperMvpReportV2 } from '../domain/paper-mvp.js';
 import type { PaperMvpRepository, PaperMvpRun, PaperMvpRunSnapshot } from '../ports/paper-mvp-repository.js';
 import type { ProviderUsageProbe } from '../ports/provider-usage-probe.js';
+import { createQualificationEngine } from '../qualification/qualification-engine.js';
 import { logger } from '../utils/logger.js';
 import { productionRunnerDependencies } from './paper-mvp-runtime.js';
 
@@ -168,14 +169,31 @@ async function preparePaperMvpRun(
     const repository = dependencies.createRepository(pool);
     const collector = dependencies.createCollector(repository, pool, dependencies.providerUsageProbe);
     const configuration = Object.freeze({
-      strategyId: 'creation-entry-v1', strategyVersion: 1,
+      strategyId: 'creation-entry-v1', strategyVersion: dependencies.config.paperStrategyVersion,
       quoteMint: dependencies.config.wsolMint,
       targetClosedPositions: options.targetClosedPositions,
       initialCapitalRaw: options.initialCapitalRaw,
       networkFeeRawPerTransaction: options.networkFeeRawPerTransaction,
       maxDurationMs: options.maxDurationMs,
+      entryQuoteAmountRaw: dependencies.config.paperEntryQuoteAmountRaw ?? 1n,
+      slippageBps: dependencies.config.paperSlippageBps ?? 0n,
+      minimumConfirmation: dependencies.config.paperMinimumConfirmation,
+      entryWindowMs: dependencies.config.paperEntryWindowSeconds * 1_000,
+      quoteMaxAgeMs: dependencies.config.paperQuoteMaxAgeMs,
+      quoteMaxSlotLag: dependencies.config.paperQuoteMaxSlotLag,
+      creationEntryMaxAgeMs: dependencies.config.creationEntryMaxAgeMs,
+      creationEntryMaxSlotLag: dependencies.config.creationEntryMaxSlotLag,
+      externalMinimumBuyAmountRaw: dependencies.config.externalMinimumBuyAmountRaw ?? 1n,
       externalUniqueBuyersTarget: dependencies.config.paperExternalBuyTarget,
       takeProfitMultiplierBps: dependencies.config.creationTakeProfitMultiplierBps,
+      manualKillSwitch: dependencies.config.creationManualKillSwitch,
+      maximumRoundTripLossBps: BigInt(dependencies.config.riskMaxRoundTripLossBps),
+      decisionPollIntervalMs: dependencies.config.paperDecisionWorkerPollMs,
+      decisionLeaseMs: dependencies.config.paperDecisionWorkerLeaseSeconds * 1_000,
+      decisionRetryMaxAttempts: dependencies.config.paperDecisionRetryMaxAttempts,
+      decisionRetryBaseDelayMs: dependencies.config.paperDecisionRetryBaseDelayMs,
+      qualificationProfileFingerprint:
+        createQualificationEngine(dependencies.config).profileSummary.fingerprint,
       providerIdentity: dependencies.providerUsageProbe.identity,
     });
     const run = await repository.startOrResume(

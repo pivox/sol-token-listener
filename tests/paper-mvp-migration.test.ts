@@ -12,6 +12,7 @@ const runnerHardeningMigrationUrl = new URL('../migrations/021_paper_mvp_runner_
 const coverageIndexesMigrationUrl = new URL('../migrations/022_paper_mvp_coverage_indexes.sql', import.meta.url);
 const exactStrategyMigrationUrl = new URL('../migrations/023_paper_mvp_exact_strategy.sql', import.meta.url);
 const positionCoverageMigrationUrl = new URL('../migrations/024_paper_mvp_position_coverage.sql', import.meta.url);
+const effectiveConfigurationMigrationUrl = new URL('../migrations/025_paper_mvp_effective_configuration.sql', import.meta.url);
 
 void test('defines replayable paper MVP runs and immutable samples', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
@@ -98,6 +99,25 @@ void test('adds replayable bounded opened and open position coverage', async () 
   assert.doesNotMatch(sql, /report_payload|jsonb_set/iu);
 });
 
+void test('fences every effective paper strategy input without rewriting v1 or v2 rows', async () => {
+  const sql = await readFile(effectiveConfigurationMigrationUrl, 'utf8');
+  for (const column of [
+    'entry_quote_amount_raw','slippage_bps','minimum_confirmation','entry_window_ms',
+    'quote_max_age_ms','quote_max_slot_lag','creation_entry_max_age_ms',
+    'creation_entry_max_slot_lag','external_minimum_buy_amount_raw','manual_kill_switch',
+    'maximum_round_trip_loss_bps','decision_poll_interval_ms','decision_lease_ms',
+    'decision_retry_max_attempts','decision_retry_base_delay_ms',
+    'qualification_profile_fingerprint',
+  ]) assert.match(sql, new RegExp(`ADD COLUMN IF NOT EXISTS ${column}`, 'u'));
+  assert.match(sql, /payload_version IN \(1,2,3\)/u);
+  assert.match(sql, /paper-mvp-run-configuration\.v3/u);
+  assert.match(sql, /payload_version=1[\s\S]*entry_quote_amount_raw IS NULL/u);
+  assert.match(sql, /payload_version=2[\s\S]*entry_quote_amount_raw IS NULL/u);
+  assert.match(sql, /payload_version=3[\s\S]*entry_quote_amount_raw > 0/u);
+  assert.match(sql, /qualification_profile_fingerprint ~ '\^\[a-f0-9\]\{64\}\$'/u);
+  assert.doesNotMatch(sql, /UPDATE paper_mvp_runs/u);
+});
+
 void test('migration 024 preserves an immutable historical paper-mvp.v1 payload', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -146,7 +166,7 @@ void test('migration 024 preserves an immutable historical paper-mvp.v1 payload'
   }
 });
 
-void test('applies migrations 001-024 on an empty schema and replays cleanly', async (context) => {
+void test('applies migrations 001-025 on an empty schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: PostgreSQL paper MVP migration test skipped');
@@ -158,7 +178,7 @@ void test('applies migrations 001-024 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '024_paper_mvp_position_coverage.sql');
+    assert.equal(applied.at(-1), '025_paper_mvp_effective_configuration.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query('SET enable_seqscan=off');
     const launchPlan = await pool.query<Readonly<{ 'QUERY PLAN': string }>>(`EXPLAIN (COSTS OFF)
@@ -180,6 +200,9 @@ void test('applies migrations 001-024 on an empty schema and replays cleanly', a
     const exactStrategySql = await readFile(exactStrategyMigrationUrl, 'utf8');
     await pool.query(exactStrategySql);
     await pool.query(exactStrategySql);
+    const effectiveConfigurationSql = await readFile(effectiveConfigurationMigrationUrl, 'utf8');
+    await pool.query(effectiveConfigurationSql);
+    await pool.query(effectiveConfigurationSql);
     const tables = await pool.query(`SELECT table_name FROM information_schema.tables
       WHERE table_schema=current_schema()
         AND table_name IN ('paper_mvp_runs','paper_mvp_position_samples')
