@@ -58,6 +58,14 @@ Une connexion perdue libère le verrou. Les migrations transactionnelles sont
 rejouables : ne modifiez, ne supprimez et n’inversez jamais à la main une
 migration appliquée.
 
+La migration `021_paper_mvp_runner_hardening.sql` ajoute le propriétaire durable
+et la raison de fin des runs Paper MVP. Elle marque les rapports `COMPLETED`
+existants avec `completionReason=LEGACY` sans modifier leur verdict, leur statut
+technique ni leurs gates. Les runs `RUNNING` reçoivent un propriétaire de
+compatibilité que le prochain runner revendique. Arrêtez donc impérativement tout
+ancien runner Paper MVP avant la fenêtre de migration et ne le redémarrez qu'avec
+l'image contenant la migration 021.
+
 ## Démarrage
 
 Avant toute migration, effectuez et vérifiez une sauvegarde de la base. Puis
