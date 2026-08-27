@@ -8,6 +8,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 const migrationUrl = new URL('../migrations/018_paper_mvp_validation.sql', import.meta.url);
 const collectionMigrationUrl = new URL('../migrations/019_paper_mvp_collection.sql', import.meta.url);
 const derivedPnlMigrationUrl = new URL('../migrations/020_paper_mvp_derived_pnl.sql', import.meta.url);
+const runnerHardeningMigrationUrl = new URL('../migrations/021_paper_mvp_runner_hardening.sql', import.meta.url);
 
 void test('defines replayable paper MVP runs and immutable samples', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
@@ -56,7 +57,19 @@ void test('widens only the derived model PnL for two 78-digit network fees', asy
   assert.doesNotMatch(sql, /ALTER COLUMN (?!model_net_pnl_raw)/u);
 });
 
-void test('applies migrations 001-020 on an empty schema and replays cleanly', async (context) => {
+void test('adds durable runner ownership and completion reason without rewriting reports', async () => {
+  const sql = await readFile(runnerHardeningMigrationUrl, 'utf8');
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS runner_owner_id TEXT/u);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS completion_reason TEXT/u);
+  assert.match(sql, /'TARGET_REACHED','TIMEOUT','SIGINT','SIGTERM','LEGACY'/u);
+  assert.match(sql, /jsonb_set\(report_payload, '\{completionReason\}', '"LEGACY"'::jsonb, true\)/u);
+  assert.match(sql, /state='RUNNING'.*runner_owner_id IS NOT NULL.*completion_reason IS NULL/su);
+  assert.match(sql, /state='COMPLETED'.*runner_owner_id IS NULL.*completion_reason IS NOT NULL/su);
+  assert.match(sql, /report_payload->>'completionReason'=completion_reason/u);
+  assert.match(sql, /state='FAILED'.*runner_owner_id IS NULL.*completion_reason IS NULL/su);
+});
+
+void test('applies migrations 001-021 on an empty schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: PostgreSQL paper MVP migration test skipped');
@@ -68,7 +81,7 @@ void test('applies migrations 001-020 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '020_paper_mvp_derived_pnl.sql');
+    assert.equal(applied.at(-1), '021_paper_mvp_runner_hardening.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(collectionMigrationUrl, 'utf8');
     await pool.query(sql);
@@ -131,6 +144,75 @@ void test('upgrades a database that already applied immutable migration 018', as
       FROM paper_positions WHERE position_id='historical'`)).rows, [
       { entry_decision_job_id:null },
     ]);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+});
+
+void test('backfills legacy run owners and completion reasons without changing report evaluation', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL paper MVP hardening upgrade test skipped');
+    return;
+  }
+  const schema = `paper_mvp_hardening_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    const directory = new URL('../migrations/', import.meta.url);
+    const legacy = (await readdir(directory))
+      .filter((name) => /^(?:00[1-9]|01[0-9]|020)_[a-z0-9_-]+\.sql$/u.test(name))
+      .sort((left, right) => left.localeCompare(right));
+    for (const name of legacy) await pool.query(await readFile(new URL(name, directory), 'utf8'));
+    const historicalReport = Object.freeze({
+      schemaVersion: 'paper-mvp.v1', technicalStatus: 'COMPLETED', verdict: 'PASS',
+      failedGateCodes: Object.freeze([]), preserved: Object.freeze({ exact: true }),
+    });
+    const insert = `INSERT INTO paper_mvp_runs (
+      run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
+      initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
+      provider_identity,state,started_at,deadline_at,updated_at,terminal_at,
+      purge_after,verdict,failure_code,payload_version,configuration_payload,report_payload
+    ) VALUES ($1,'creation-entry-v1',1,'SOL',1,1000,5,60000,'probe',$2,
+      $3::timestamptz,$3::timestamptz + INTERVAL '60 seconds',$4::timestamptz,
+      $5::timestamptz,$6::timestamptz,$7,$8,1,'{}'::jsonb,$9::jsonb)`;
+    await pool.query(insert, ['legacy-running','RUNNING','2026-08-27T00:00:00Z',
+      '2026-08-27T00:00:01Z',null,null,null,null,null]);
+    await pool.query(insert, ['legacy-completed','COMPLETED','2026-08-27T00:00:00Z',
+      '2026-08-27T00:01:00Z','2026-08-27T00:01:00Z','2026-08-27T04:01:00Z',
+      'PASS',null,JSON.stringify(historicalReport)]);
+    await pool.query(insert, ['legacy-failed','FAILED','2026-08-27T00:00:00Z',
+      '2026-08-27T00:01:00Z','2026-08-27T00:01:00Z','2026-08-27T04:01:00Z',
+      null,'RUN_FAILED',null]);
+
+    const hardening = await readFile(runnerHardeningMigrationUrl, 'utf8');
+    await pool.query(hardening);
+    await pool.query(hardening);
+    const rows = (await pool.query(`SELECT run_id,state,runner_owner_id,completion_reason,
+      report_payload FROM paper_mvp_runs ORDER BY run_id`)).rows;
+    const completed = rows.find((row) => row.run_id === 'legacy-completed');
+    const failed = rows.find((row) => row.run_id === 'legacy-failed');
+    const running = rows.find((row) => row.run_id === 'legacy-running');
+    assert.match(String(running?.runner_owner_id), /^legacy:[a-f0-9]{32}$/u);
+    assert.equal(running?.completion_reason, null);
+    assert.equal(completed?.runner_owner_id, null);
+    assert.equal(completed?.completion_reason, 'LEGACY');
+    assert.deepEqual(completed?.report_payload, {
+      ...historicalReport, completionReason: 'LEGACY',
+    });
+    assert.equal(failed?.runner_owner_id, null);
+    assert.equal(failed?.completion_reason, null);
+    await assert.rejects(
+      pool.query("UPDATE paper_mvp_runs SET runner_owner_id=NULL WHERE run_id='legacy-running'"),
+      /runner_lifecycle|check constraint/iu,
+    );
+    await assert.rejects(
+      pool.query("UPDATE paper_mvp_runs SET completion_reason='TIMEOUT' WHERE run_id='legacy-completed'"),
+      /terminal.*immutable/iu,
+    );
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
