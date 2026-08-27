@@ -118,6 +118,34 @@ void test('rejects and resets after a native scan promise has a hostile then get
   assert.equal(scanner.calls, 2);
 });
 
+void test('coalesces a synchronous reentrant run before the scanner returns', async () => {
+  const scanResult = result('primary');
+  let calls = 0;
+  let nested: Promise<StrictCatchUpScanResult> | undefined;
+  let coordinator: StrictCatchUpCoordinator | null = null;
+  const scanner: StrictCatchUpScannerPort = {
+    scan() {
+      calls += 1;
+      if (calls === 1) {
+        if (coordinator === null) throw new Error('Coordinator is unavailable.');
+        nested = coordinator.run();
+      }
+      return Promise.resolve(scanResult);
+    },
+  };
+  coordinator = new StrictCatchUpCoordinator(scanner);
+
+  const first = coordinator.run();
+
+  assert.equal(nested, first);
+  assert.equal(calls, 1);
+  assert.equal(await first, scanResult);
+
+  const next = coordinator.run();
+  assert.notEqual(next, first);
+  assert.equal(calls, 2);
+});
+
 void test('converts a synchronous scanner throw into its original rejected error', async () => {
   const error = new Error('unavailable');
   const successfulResult = result('fallback-1');
