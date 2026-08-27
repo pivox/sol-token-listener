@@ -233,6 +233,60 @@ RPC/DB, ni transaction, signature, contenu social brut ou message d'erreur.
 `NO_CLOSED_POSITION` est un résultat de couverture valide, pas une panne
 technique. Un rapport dry run ne prouve ni profit, ni sellabilité.
 
+## Validation paper MVP Mainnet
+
+La commande reprenable `paper:mvp` exécute le même bootstrap production et la
+stratégie `creation-entry-v1`; elle n'ajoute ni moteur de trading, ni wallet,
+ni signature ou soumission. Elle refuse de démarrer avant toute ressource si
+le cluster n'est pas exactement `mainnet-beta`, si le listener ou la stratégie
+de création sont désactivés, si le mode n'est pas `paper`, ou si l'allowlist
+quote n'est pas exactement le seul mint WSOL configuré.
+
+Après application des migrations, lancer avec les six arguments fermés :
+
+```bash
+npm run paper:mvp -- \
+  --target-closed=50 \
+  --max-duration-seconds=14400 \
+  --poll-seconds=5 \
+  --initial-capital-raw=1000000000 \
+  --network-fee-raw-per-transaction=5000 \
+  --report-file=paper-mvp.json
+```
+
+Un seul processus collecte un run à la fois; il acquiert le verrou avant le
+démarrage du listener ou de l'API et échoue fermé si la session du verrou est
+perdue. Un redémarrage reprend uniquement
+le run `RUNNING` dont la configuration immuable est identique; tout autre run
+actif ou second collecteur échoue explicitement. Les créations observées sont
+les mints distincts de `token_launches.detected_at` dans la fenêtre. Les entrées
+rejetées sont les mints distincts de cette fenêtre ayant produit au moins une
+projection candidate `CREATION_ENTRY_REJECTED` ou `CREATION_ENTRY_EXPIRED` pour
+la stratégie/version. Une régression de ces projections retenues est une panne
+technique fail-closed, jamais un compteur inventé.
+
+La reprise compare la configuration effective durable v3 : taille d'entrée,
+slippage, finalité, fenêtres/limites de quote et de slot, minimum d'achat,
+seuils de sortie, kill switch, risque aller-retour, paramètres du worker et
+fingerprint du profil de qualification. Les anciens runs v1/v2 sont refusés
+sans backfill afin de ne jamais mélanger des échantillons non comparables.
+
+La cible, la deadline, `SIGINT` et `SIGTERM` déclenchent une dernière collecte
+quand elle reste faisable. Le rapport terminal est recalculé depuis le snapshot
+PostgreSQL durable et revérifié dans la transaction de terminalisation avant
+son export JSON exclusif en mode `0600`. Le code de sortie vaut `0` uniquement
+pour `PASS`, `2` pour un résultat terminal `FAIL`/`DEGRADED`, et `1` pour une
+panne de configuration, de données, de ressource ou d'export. L'adaptateur
+provider par défaut publie honnêtement `UNAVAILABLE` avec crédits inconnus :
+zéro réponse 429 ne constitue alors aucune preuve de santé et empêche `PASS`.
+
+PostgreSQL et le fichier ne peuvent pas être validés atomiquement. Si la
+création exclusive du fichier échoue, le résultat terminal reste immuable dans
+`paper_mvp_runs.report_payload`; ne relancez pas la collecte. Exportez ce JSON
+déjà durable vers un nouveau chemin, toujours en création exclusive, puis
+vérifiez son contenu/hash. Voir le
+[runbook paper MVP](docs/operations/paper-mvp-validation.md).
+
 ## API V1
 
 L'API est activée par défaut (`API_ENABLED=true`) et écoute sur

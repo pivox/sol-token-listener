@@ -52,6 +52,14 @@ const canonicalMigrations = Object.freeze([
   '015_paper_active_session_per_mint.sql',
   '016_listener_catch_up_gaps.sql',
   '017_creation_entry_strategy.sql',
+  '018_paper_mvp_validation.sql',
+  '019_paper_mvp_collection.sql',
+  '020_paper_mvp_derived_pnl.sql',
+  '021_paper_mvp_runner_hardening.sql',
+  '022_paper_mvp_coverage_indexes.sql',
+  '023_paper_mvp_exact_strategy.sql',
+  '024_paper_mvp_position_coverage.sql',
+  '025_paper_mvp_effective_configuration.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
@@ -69,6 +77,8 @@ const canonicalRetentionCounters = Object.freeze([
   'observedWalletPositions',
   'paperDecisionJobs',
   'paperExternalBuys',
+  'paperMvpRuns',
+  'paperMvpSamples',
   'paperPositions',
   'paperSessions',
   'paperTrades',

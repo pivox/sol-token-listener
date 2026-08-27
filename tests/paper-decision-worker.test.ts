@@ -332,6 +332,7 @@ void test('routes a persisted V1 session to legacy while creation is active', as
     async open(): Promise<never> { throw new Error('not called'); },
     async reconcileOpen(): Promise<never> { throw new Error('not called'); },
     async close(): Promise<never> { throw new Error('not called'); },
+    async reconcileClose(): Promise<never> { throw new Error('not called'); },
     async retract(): Promise<never> { throw new Error('not called'); },
   };
   const quotes = new FakeQuotes();
@@ -412,6 +413,8 @@ void test('recovers a staged BUY_PENDING session after its paper position opened
   assert.equal((await worker.runOnce()).kind, 'completed');
   assert.equal(quotes.calls, 0);
   assert.deepEqual(operations, ['stage','recover-open','complete']);
+  assert.equal(services.strategy.recoverOpenInputs[0]?.entryDecisionAtMs, 500);
+  assert.equal(services.strategy.recoverOpenInputs[0]?.entryDecisionJobId, 'paper-job');
   assert.equal(repository.completions[0]?.result.session?.state, 'WAITING_EXTERNAL_BUYS');
 });
 
@@ -604,10 +607,13 @@ void test('retracts a later paper session when its launch becomes orphaned', asy
     lastQuote:candidate.buyQuote,lastError:null,createdAtMs:2_000,updatedAtMs:2_000,
     purgeAfterMs:14_402_000,
   });
+  const persistedPosition=Object.freeze({
+    ...POSITION,entryDecisionAtMs:450,entryDecisionJobId:'persisted-paper-job',
+  });
   repository.snapshotValue=snapshot({
     asOfEvent:event('TokenLaunchDetected','evt_source','orphaned'),
     canonicalLaunchActive:false,currentQualification:null,currentCandidate:candidate,
-    currentSession:session,activePosition:POSITION,
+    currentSession:session,activePosition:persistedPosition,
     currentDecision:persistedDecision(candidate,'orphaned'),
   });
   const services=fakeServices('ELIGIBLE',operations);
@@ -619,6 +625,8 @@ void test('retracts a later paper session when its launch becomes orphaned', asy
   assert.equal((await worker.runOnce()).kind,'completed');
   assert.ok(operations.includes('reconcile-source'));
   assert.equal(operations.includes('reconcile-evidence'),false);
+  assert.equal(services.strategy.reconcileSourceInputs[0]?.entryDecisionAtMs,450);
+  assert.equal(services.strategy.reconcileSourceInputs[0]?.entryDecisionJobId,'persisted-paper-job');
   assert.equal(repository.completions[0]?.result.session?.state,'PAPER_RETRACTED');
 });
 
@@ -685,6 +693,86 @@ void test('retracts a closed paper session when its entry source becomes orphane
   assert.equal((await worker.runOnce()).kind, 'completed');
   assert.ok(operations.includes('reconcile-source'));
   assert.equal(repository.completions[0]?.result.session?.state, 'PAPER_RETRACTED');
+});
+
+void test('reconciles a finalized creation close without requesting another quote or trade', async () => {
+  const repository = new FakeRepository([claim()]);
+  const candidate = Object.freeze({
+    ...tradingCandidate('ELIGIBLE'),
+    strategy:Object.freeze({ id:'creation-entry-v1',version:1 }),
+  });
+  const quotes = new FakeQuotes();
+  const reconciled: PaperPosition[] = [];
+  const closedPosition = Object.freeze({
+    ...POSITION,strategy:candidate.strategy,status:'PAPER_CLOSED' as const,
+    remainingBaseRaw:0n,quoteProceedsRaw:1_100n,grossPnlQuoteRaw:100n,netPnlQuoteRaw:100n,
+    exitTradeId:'exit',closeCommandHash:'close',closeEventId:'close-event',exitTriggerAtMs:1_500,
+    closedAtMs:2_000,purgeAfterMs:14_402_000,
+  });
+  const ledger = {
+    async open(): Promise<never> { throw new Error('not called'); },
+    async reconcileOpen(): Promise<never> { throw new Error('not called'); },
+    async close(): Promise<never> { throw new Error('not called'); },
+    async retract(): Promise<never> { throw new Error('not called'); },
+    async reconcileClose(_positionId:string,trigger:DomainEvent):Promise<PaperPosition>{
+      if (trigger.id !== 'close-trigger') {
+        throw new PaperTradingError('CLOSE_TRIGGER_MISMATCH','unrelated terminal event');
+      }
+      reconciled.push(closedPosition);return closedPosition;
+    },
+  };
+  const creation = new CreationEntryV1Strategy(ledger,quotes,{
+    retentionMs:14_400_000,externalMinimumBuyAmountRaw:1n,
+  });
+  const prepared = creation.prepare(candidate,{
+    externalBuyTarget:10,minimumConfirmation:'confirmed',nowMs:1_000,
+  });
+  assert.ok(prepared);
+  const session = Object.freeze({
+    ...prepared,state:'PAPER_CLOSED' as const,reasonCode:'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED' as const,
+    positionId:closedPosition.id,externalBuyCount:10,
+    countedTradeIds:Object.freeze(Array.from({ length:10 },(_,index) => `trade-${index}`)),
+    countedBuyerWallets:Object.freeze(Array.from({ length:10 },(_,index) => `wallet-${index}`)),
+    lastQuote:quote('sell','MINT','SOL',900n,1_100n,1_100n),
+    updatedAtMs:2_000,purgeAfterMs:14_402_000,
+  });
+  repository.snapshotValue=snapshot({
+    asOfEvent:event('BondingCurveTradeObserved','close-trigger','finalized'),
+    currentCandidate:candidate,currentSession:session,activePosition:closedPosition,
+    currentDecision:persistedDecision(candidate),
+  });
+  const services = fakeServices('ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository,quotes,services.qualification,services.candidates,
+    createPaperDecisionStrategyRegistry({
+      activeStrategyId:'creation-entry-v1',
+      legacy:new ValidatedExternalBuysStrategy(ledger,quotes,{ retentionMs:14_400_000 }),
+      creation,
+    }),options(),new ManualScheduler(),
+  );
+
+  assert.equal((await worker.runOnce()).kind,'completed');
+  assert.equal(reconciled.length,1);
+  assert.equal(quotes.calls,0);
+  assert.equal(repository.completions[0]?.result.session,session);
+
+  const unrelatedRepository = new FakeRepository([claim()]);
+  unrelatedRepository.snapshotValue=snapshot({
+    asOfEvent:event('BondingCurveTradeObserved','unrelated-trigger','finalized'),
+    currentCandidate:candidate,currentSession:session,activePosition:closedPosition,
+    currentDecision:persistedDecision(candidate),
+  });
+  const unrelatedWorker = new PaperDecisionWorker(
+    unrelatedRepository,quotes,services.qualification,services.candidates,
+    createPaperDecisionStrategyRegistry({
+      activeStrategyId:'creation-entry-v1',
+      legacy:new ValidatedExternalBuysStrategy(ledger,quotes,{ retentionMs:14_400_000 }),
+      creation,
+    }),options(),new ManualScheduler(),
+  );
+  assert.equal((await unrelatedWorker.runOnce()).kind,'completed');
+  assert.equal(unrelatedRepository.failures.length,0);
+  assert.equal(reconciled.length,1);
 });
 
 void test('suppresses all commit work after renewal reports a lost lease', async () => {
@@ -825,6 +913,14 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
   };
   const strategy = {
     openError:null as Error|null,
+    recoverOpenInputs:[] as Readonly<{
+      readonly entryDecisionAtMs?:number;
+      readonly entryDecisionJobId?:string;
+    }>[],
+    reconcileSourceInputs:[] as Readonly<{
+      readonly entryDecisionAtMs?:number;
+      readonly entryDecisionJobId?:string;
+    }>[],
     prepare() {
       return state === 'ELIGIBLE' ? createPaperStrategySession({
         candidate,state:'BUY_PENDING',reasonCode:'QUALIFIED_ENTRY',positionId:null,
@@ -843,8 +939,13 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
         countedExternalBuys:Object.freeze([]),requestedAction:'OPEN' as const,position:POSITION,
       });
     },
-    async recoverOpen(input: { readonly session: ReturnType<typeof createPaperStrategySession> }) {
+    async recoverOpen(input: {
+      readonly session: ReturnType<typeof createPaperStrategySession>;
+      readonly entryDecisionAtMs?:number;
+      readonly entryDecisionJobId?:string;
+    }) {
       operations.push('recover-open');
+      this.recoverOpenInputs.push(input);
       return Object.freeze({
         session:Object.freeze({ ...input.session,state:'WAITING_EXTERNAL_BUYS' as const,positionId:'position' }),
         sessionEvent:event('PaperStrategySessionUpdated','evt_session_open_recovered'),
@@ -857,8 +958,13 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
         countedExternalBuys:Object.freeze([]),requestedAction:'NONE' as const,position:POSITION,
       });
     },
-    async reconcileSource(input: { readonly session:ReturnType<typeof createPaperStrategySession> }) {
+    async reconcileSource(input: {
+      readonly session:ReturnType<typeof createPaperStrategySession>;
+      readonly entryDecisionAtMs?:number;
+      readonly entryDecisionJobId?:string;
+    }) {
       operations.push('reconcile-source');
+      this.reconcileSourceInputs.push(input);
       const session=Object.freeze({
         ...input.session,state:'PAPER_RETRACTED' as const,reasonCode:'SOURCE_ORPHANED' as const,
         updatedAtMs:2_000,purgeAfterMs:14_402_000,
@@ -914,7 +1020,7 @@ function claim(): ClaimedPaperDecisionJob {
   return Object.freeze({
     jobId:'paper-job',mint:'MINT',sourceEventId:'evt_source',sourceRawEventId:'raw_source',
     sourceConfirmationStatus:'confirmed',inputFingerprint:'a'.repeat(64),attempts:1,
-    maxAttempts:3,leaseToken:'lease',leaseExpiresAtMs:11_000,
+    maxAttempts:3,leaseToken:'lease',leaseExpiresAtMs:11_000,createdAtMs:500,
   });
 }
 
@@ -1042,7 +1148,7 @@ function canonicalTamperingCases():readonly Readonly<{
 function event(
   type:DomainEvent['type'],
   id:string,
-  confirmationStatus: 'confirmed' | 'orphaned' = 'confirmed',
+  confirmationStatus: 'confirmed' | 'finalized' | 'orphaned' = 'confirmed',
 ): DomainEvent {
   return Object.freeze({
     id,type,mint:'MINT',source:'pumpfun',program:'pump',signature:'signature',

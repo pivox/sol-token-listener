@@ -130,7 +130,8 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
 
   public async findPosition(id: string): Promise<PaperPosition | null> {
     const result = await this.client.query(
-      'SELECT payload FROM paper_positions WHERE position_id = $1 FOR UPDATE',
+      `SELECT payload,entry_decision_at,entry_decision_job_id,close_event_id,exit_trigger_at
+       FROM paper_positions WHERE position_id = $1 FOR UPDATE`,
       [id],
     );
     return decodePosition(result.rows[0]);
@@ -146,7 +147,7 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
       [lockKey],
     );
     const result = await this.client.query(
-      `SELECT payload FROM paper_positions
+      `SELECT payload,entry_decision_at,entry_decision_job_id,close_event_id,exit_trigger_at FROM paper_positions
        WHERE mint = $1 AND strategy_id = $2 AND strategy_version = $3
          AND status = 'PAPER_HOLDING'
        FOR UPDATE`,
@@ -159,8 +160,10 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     position: PaperPosition,
     trade: PaperTrade,
     event: PaperPositionOpenedEventV1,
+    entryDecisionAtMs: number | null,
+    entryDecisionJobId: string | null,
   ): Promise<void> {
-    await this.insertPosition(position);
+    await this.insertPosition(position, entryDecisionAtMs, entryDecisionJobId);
     await this.insertTrade(trade);
     await this.insertEvent(event);
   }
@@ -169,12 +172,15 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     position: PaperPosition,
     trade: PaperTrade,
     event: PaperPositionClosedEventV1,
+    exitTriggerAtMs: number | null,
   ): Promise<void> {
+    await this.insertEvent(event, position.closedAtMs, position.purgeAfterMs);
     await this.client.query(
       `UPDATE paper_positions SET
         status = $2, remaining_base_raw = $3, quote_proceeds_raw = $4,
         gross_pnl_quote_raw = $5, net_pnl_quote_raw = $6, exit_trade_id = $7,
-        close_command_hash = $8, payload = $9, closed_at = $10, purge_after = $11
+        close_command_hash = $8, payload = $9, closed_at = $10, purge_after = $11,
+        close_event_id = $12, exit_trigger_at = $13
        WHERE position_id = $1 AND status = 'PAPER_HOLDING'`,
       [
         position.id,
@@ -188,11 +194,12 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
         toJsonValue(position),
         date(position.closedAtMs),
         date(position.purgeAfterMs),
+        event.id,
+        date(exitTriggerAtMs),
       ],
     );
     await this.insertTrade(trade);
     await this.markPositionEventsTerminal(position);
-    await this.insertEvent(event, position.closedAtMs, position.purgeAfterMs);
   }
 
   public async reconcileEventConfirmation(
@@ -242,7 +249,11 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     await this.markPositionEventsTerminal(position);
   }
 
-  private async insertPosition(position: PaperPosition): Promise<void> {
+  private async insertPosition(
+    position: PaperPosition,
+    entryDecisionAtMs: number | null,
+    entryDecisionJobId: string | null,
+  ): Promise<void> {
     await this.client.query(
       `INSERT INTO paper_positions (
         position_id, mint, quote_mint, quote_decimals, quote_token_program,
@@ -251,10 +262,10 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
         round_trip_loss_bps, entry_trade_id, exit_trade_id, open_command_hash,
         close_command_hash, trigger_event_id, payload_version, payload, opened_at,
         closed_at, purge_after, strategy_session_id, qualification_report_id,
-        candidate_id
+        candidate_id, entry_decision_at, entry_decision_job_id
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-        $20,$21,$22,$23,$24,$25,$26,$27,$28
+        $20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
       )`,
       [
         position.id, position.mint, position.quoteAsset.mint,
@@ -270,6 +281,8 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
         date(position.purgeAfterMs),
         position.strategySessionId ?? null,position.qualificationReportId ?? null,
         position.candidateId ?? null,
+        date(entryDecisionAtMs),
+        entryDecisionJobId,
       ],
     );
   }
@@ -281,8 +294,8 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
         trade_id, position_id, side, quote_id, input_mint, output_mint,
         amount_in_raw, amount_out_raw, minimum_amount_out_raw, fill_amount_out_raw,
         fees_raw, slippage_bps, price_impact_bps, reason, payload_version,
-        payload, created_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+        payload, created_at, quote_observed_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
       [
         trade.id, trade.positionId, trade.side, quote.id, quote.inputMint,
         quote.outputMint, quote.amountInRaw.toString(), quote.amountOutRaw.toString(),
@@ -290,6 +303,7 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
         quote.feesRaw.toString(), quote.slippageBps.toString(),
         quote.priceImpactBps.toString(), trade.reason, trade.payloadVersion,
         toJsonValue(trade), new Date(trade.createdAtMs),
+        new Date(quote.observedAtMs),
       ],
     );
   }
@@ -332,7 +346,7 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
 
 function decodePosition(row: unknown): PaperPosition | null {
   if (row === undefined) return null;
-  if (typeof row !== 'object' || row === null || !('payload' in row)) {
+  if (!isRecord(row) || !('payload' in row)) {
     throw new TypeError('Projection paper position invalide.');
   }
   const value = fromJsonValue(row.payload);
@@ -381,6 +395,10 @@ function decodePosition(row: unknown): PaperPosition | null {
     openCommandHash: text(value.openCommandHash, 'openCommandHash'),
     closeCommandHash: nullableText(value.closeCommandHash, 'closeCommandHash'),
     triggerEventId: text(value.triggerEventId, 'triggerEventId'),
+    entryDecisionAtMs: nullableRowDateMs(row.entry_decision_at),
+    entryDecisionJobId: nullableRowText(row.entry_decision_job_id),
+    closeEventId: nullableRowText(row.close_event_id),
+    exitTriggerAtMs: nullableRowDateMs(row.exit_trigger_at),
     ...lineage,
     openedAtMs: integer(value.openedAtMs, 'openedAtMs'),
     closedAtMs: nullableInteger(value.closedAtMs, 'closedAtMs'),
@@ -404,6 +422,17 @@ function text(value: unknown, field: string): string {
 }
 function nullableText(value: unknown, field: string): string | null {
   return value === null ? null : text(value, field);
+}
+function nullableRowText(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  return text(value, 'source text');
+}
+function nullableRowDateMs(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  if (!(value instanceof Date) || !Number.isSafeInteger(value.getTime())) {
+    invalidPayload('source timestamp');
+  }
+  return value.getTime();
 }
 function qualificationNotCurrent():never{
   throw new PaperTradingError(

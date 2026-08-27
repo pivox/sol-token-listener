@@ -1656,6 +1656,7 @@ function claimedJob(row: unknown): ClaimedPaperDecisionJob {
     inputFingerprint:textField(row,'input_fingerprint'),attempts:integerField(row,'attempts'),
     maxAttempts:integerField(row,'max_attempts'),leaseToken:textField(row,'lease_token'),
     leaseExpiresAtMs:dateField(row,'lease_expires_at').getTime(),
+    createdAtMs:dateField(row,'created_at').getTime(),
   });
 }
 

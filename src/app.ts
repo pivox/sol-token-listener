@@ -34,6 +34,10 @@ export interface ApplicationDependencies {
     profileSummary: QualificationProfileSummary;
   }>;
   readonly getDatabasePool: (databaseUrl: string) => ApplicationPool;
+  readonly beforeStart: (pool: ApplicationPool) => Promise<void>;
+  readonly afterMigrations: (pool: ApplicationPool) => Promise<void>;
+  readonly beforeDatabaseClose: () => Promise<void>;
+  readonly lifecycleGuard: Readonly<{ checkpoint(): Promise<void> }>;
   readonly migrateDatabase: (pool: ApplicationPool) => Promise<readonly string[]>;
   readonly createListener: (pool: ApplicationPool, config: AppConfig) => ListenerRuntime;
   readonly createProjectionRepository: (
@@ -65,15 +69,26 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
     if (config.listenerEnabled || config.apiEnabled || config.autoMigrate) {
       const pool = dependencies.getDatabasePool(config.databaseUrl);
       databaseOpened = true;
+      await dependencies.beforeStart(pool);
+      await dependencies.lifecycleGuard.checkpoint();
       if (config.autoMigrate) {
+        await dependencies.lifecycleGuard.checkpoint();
         const appliedMigrations = await dependencies.migrateDatabase(pool);
+        await dependencies.lifecycleGuard.checkpoint();
         dependencies.logInfo({ event: 'database.migrations_applied', count: appliedMigrations.length }, 'Migrations PostgreSQL appliquées.');
       }
+      await dependencies.lifecycleGuard.checkpoint();
+      await dependencies.afterMigrations(pool);
+      await dependencies.lifecycleGuard.checkpoint();
       if (config.listenerEnabled) {
+        await dependencies.lifecycleGuard.checkpoint();
         listener = dependencies.createListener(pool, config);
+        await dependencies.lifecycleGuard.checkpoint();
         await listener.start();
+        await dependencies.lifecycleGuard.checkpoint();
       }
       if (config.apiEnabled) {
+        await dependencies.lifecycleGuard.checkpoint();
         const pipeline = listener === null
           ? disabledPipelineState
           : (): ApiProjectionPipelineState => listener?.pipelineState() ?? disabledPipelineState();
@@ -96,14 +111,20 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
           sseHeartbeatMs: config.apiSseHeartbeatMs,
           logError: (context) => { dependencies.logInfo(context, 'La requête API a échoué.'); },
         });
+        await dependencies.lifecycleGuard.checkpoint();
         const address = await server.listen();
+        await dependencies.lifecycleGuard.checkpoint();
         dependencies.logInfo({
           event: 'api.started', host: address.host, port: address.port,
           apiEnabled: config.apiEnabled, executionMode: config.executionMode,
           transactionSubmissionEnabled: false,
         }, 'API publique d’observation disponible.');
       }
-      if (config.listenerEnabled || config.apiEnabled) await dependencies.waitForShutdownSignal();
+      if (config.listenerEnabled || config.apiEnabled) {
+        await dependencies.lifecycleGuard.checkpoint();
+        await dependencies.waitForShutdownSignal();
+        await dependencies.lifecycleGuard.checkpoint();
+      }
     }
   } catch (error) {
     primaryError = { value: error };
@@ -116,6 +137,7 @@ export async function runApplication(overrides: Partial<ApplicationDependencies>
     try { await server.close(); } catch (error) { cleanupErrors.push(error); }
   }
   if (databaseOpened) {
+    try { await dependencies.beforeDatabaseClose(); } catch (error) { cleanupErrors.push(error); }
     try { await dependencies.closeDatabase(); } catch (error) { cleanupErrors.push(error); }
   }
   if (primaryError !== null) {
@@ -148,6 +170,10 @@ const productionDependencies: ApplicationDependencies = {
   loadConfig,
   createQualificationEngine,
   getDatabasePool,
+  beforeStart: () => Promise.resolve(),
+  afterMigrations: () => Promise.resolve(),
+  beforeDatabaseClose: () => Promise.resolve(),
+  lifecycleGuard: Object.freeze({ checkpoint: () => Promise.resolve() }),
   migrateDatabase: async (pool) => migrateDatabase({ pool: pool as ReturnType<typeof getDatabasePool> }),
   createListener: (pool, config) => createProductionListenerRuntime(
     config,

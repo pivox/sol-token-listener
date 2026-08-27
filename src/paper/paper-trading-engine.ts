@@ -72,10 +72,13 @@ export class PaperTradingEngine {
       triggerEventId: trigger.id,
     })) invalidQualification();
     const snapshot = snapshotOpenCommand(command, qualification, mint, trigger);
+    const openedAtMs = this.clock.now();
+    assertValidTimestampMs('occurredAtMs', openedAtMs);
     validateOpenCommand(
       snapshot,
       this.config.paperQuoteMintAllowlist,
       this.qualificationProfile,
+      openedAtMs,
     );
     const roundTrip = calculateRoundTrip(snapshot.buyQuote, snapshot.reverseSellQuote);
     validateQualificationExecutionFacts(
@@ -93,9 +96,6 @@ export class PaperTradingEngine {
       snapshot.trigger.id,
     ]);
     const openCommandHashes = hashOpenCommand(snapshot);
-    const openedAtMs = this.clock.now();
-    assertValidTimestampMs('occurredAtMs', openedAtMs);
-
     return this.repository.transact(async (transaction) => {
       if(snapshot.expectedCurrentQualification!==undefined){
         await transaction.requireCurrentQualification(snapshot.expectedCurrentQualification);
@@ -107,6 +107,8 @@ export class PaperTradingEngine {
           existing,
           openCommandHashes,
           snapshot.trigger,
+          snapshot.entryDecisionAtMs ?? null,
+          snapshot.entryDecisionJobId ?? null,
         );
       }
       const active = await transaction.findActivePosition(snapshot.mint, snapshot.strategy);
@@ -117,6 +119,8 @@ export class PaperTradingEngine {
             active,
             openCommandHashes,
             snapshot.trigger,
+            snapshot.entryDecisionAtMs ?? null,
+            snapshot.entryDecisionJobId ?? null,
           );
         }
         conflict();
@@ -128,6 +132,8 @@ export class PaperTradingEngine {
           terminalReplay,
           openCommandHashes,
           snapshot.trigger,
+          snapshot.entryDecisionAtMs ?? null,
+          snapshot.entryDecisionJobId ?? null,
         );
       }
       rejectOrphanedTrigger(snapshot.trigger);
@@ -160,6 +166,10 @@ export class PaperTradingEngine {
         openCommandHash: openCommandHashes.current,
         closeCommandHash: null,
         triggerEventId: snapshot.trigger.id,
+        entryDecisionAtMs: snapshot.entryDecisionAtMs ?? null,
+        entryDecisionJobId: snapshot.entryDecisionJobId ?? null,
+        closeEventId: null,
+        exitTriggerAtMs: null,
         ...(snapshot.strategySessionId === undefined ? {} : {
           strategySessionId:snapshot.strategySessionId,
           qualificationReportId:snapshot.qualificationReportId,
@@ -174,6 +184,8 @@ export class PaperTradingEngine {
         position,
         trade,
         createPaperEvent('PaperPositionOpened', position, trade, snapshot.trigger),
+        snapshot.entryDecisionAtMs ?? null,
+        snapshot.entryDecisionJobId ?? null,
       );
       return position;
     });
@@ -188,6 +200,7 @@ export class PaperTradingEngine {
       snapshot,
       this.config.paperQuoteMintAllowlist,
       this.qualificationProfile,
+      this.clock.now(),
     );
     const roundTrip = calculateRoundTrip(snapshot.buyQuote, snapshot.reverseSellQuote);
     validateQualificationExecutionFacts(
@@ -212,6 +225,7 @@ export class PaperTradingEngine {
       }
       return this.reconcileOpenReplay(
         transaction,existing,openCommandHashes,snapshot.trigger,
+        snapshot.entryDecisionAtMs ?? null,snapshot.entryDecisionJobId ?? null,
       );
     });
   }
@@ -233,12 +247,48 @@ export class PaperTradingEngine {
     });
   }
 
+  public async reconcileClose(
+    positionId: string,
+    triggerEvent: DomainEvent,
+  ): Promise<PaperPosition> {
+    this.requirePaperMode();
+    const trigger = snapshotTrigger(triggerEvent);
+    return this.repository.transact(async (transaction) => {
+      const current = await transaction.findPosition(positionId);
+      if (current === null) {
+        throw new PaperTradingError('POSITION_NOT_FOUND','Position paper introuvable.');
+      }
+      if (current.status === 'PAPER_RETRACTED') return current;
+      if (current.status !== 'PAPER_CLOSED'
+        || current.exitTradeId === null
+        || current.closeEventId === null
+        || current.closeEventId === undefined) conflict();
+      if (current.closeEventId !== paperEventId(
+        'PaperPositionClosed',current.id,current.exitTradeId,trigger.id,
+      )) {
+        throw new PaperTradingError(
+          'CLOSE_TRIGGER_MISMATCH','L’événement observé ne déclenche pas cette clôture paper.',
+        );
+      }
+      await transaction.reconcileEventConfirmation(current.closeEventId,trigger);
+      return trigger.confirmationStatus === 'orphaned'
+        ? this.retractPosition(transaction,current)
+        : current;
+    });
+  }
+
   public async close(command: ClosePaperPositionCommand): Promise<PaperPosition> {
     this.requirePaperMode();
     const snapshot = snapshotCloseCommand(command);
     validatePaperQuote(snapshot.sellQuote);
+    if (snapshot.exitTriggerAtMs !== undefined
+      && snapshot.sellQuote.observedAtMs < snapshot.exitTriggerAtMs) {
+      invalidQuote('sellQuote.observedAtMs');
+    }
+    const { exitTriggerAtMs:_exitTriggerAtMs,...stableSnapshot }=snapshot;
+    void _exitTriggerAtMs;
     const closeCommandHash = hashValue('paper_close_command', {
-      ...snapshot,
+      ...stableSnapshot,
       trigger: snapshot.trigger.id,
     });
     const closedAtMs = this.clock.now();
@@ -252,14 +302,20 @@ export class PaperTradingEngine {
       if (current.status !== 'PAPER_HOLDING') {
         if (current.closeCommandHash !== closeCommandHash) conflict();
         if (current.exitTradeId === null) conflict();
+        if (current.exitTriggerAtMs !== null
+          && current.exitTriggerAtMs !== undefined
+          && current.exitTriggerAtMs !== snapshot.exitTriggerAtMs) conflict();
         await transaction.reconcileEventConfirmation(
-          paperEventId(
+          current.closeEventId ?? paperEventId(
             'PaperPositionClosed',
             current.id,
             current.exitTradeId,
             snapshot.trigger.id,
           ),
-          snapshot.trigger,
+          Object.freeze({
+            ...snapshot.trigger,
+            observedAtMs: current.exitTriggerAtMs ?? snapshot.trigger.observedAtMs,
+          }),
         );
         if (snapshot.trigger.confirmationStatus === 'orphaned') {
           return this.retractPosition(transaction, current);
@@ -279,6 +335,9 @@ export class PaperTradingEngine {
         payloadVersion: 1,
       } satisfies PaperTrade);
       const retentionMs = this.config.dataRetentionHours * 60 * 60 * 1_000;
+      const closeEventId = paperEventId(
+        'PaperPositionClosed', current.id, trade.id, snapshot.trigger.id,
+      );
       const position = freeze({
         ...current,
         status: 'PAPER_CLOSED',
@@ -288,13 +347,19 @@ export class PaperTradingEngine {
         netPnlQuoteRaw: snapshot.sellQuote.minimumAmountOutRaw - current.quoteCostRaw,
         exitTradeId: tradeId,
         closeCommandHash,
+        closeEventId,
+        exitTriggerAtMs: snapshot.exitTriggerAtMs ?? null,
         closedAtMs,
         purgeAfterMs: closedAtMs + retentionMs,
       } satisfies PaperPosition);
       await transaction.updateClosed(
         position,
         trade,
-        createPaperEvent('PaperPositionClosed', position, trade, snapshot.trigger),
+        createPaperEvent(
+          'PaperPositionClosed', position, trade, snapshot.trigger,
+          snapshot.exitTriggerAtMs ?? snapshot.trigger.observedAtMs,
+        ),
+        snapshot.exitTriggerAtMs ?? null,
       );
       return position;
     });
@@ -305,8 +370,13 @@ export class PaperTradingEngine {
     position: PaperPosition,
     openCommandHashes: OpenCommandHashes,
     trigger: DomainEvent,
+    entryDecisionAtMs: number | null,
+    entryDecisionJobId: string | null,
   ): Promise<PaperPosition> {
     if (!matchesOpenCommandHash(position, openCommandHashes)) conflict();
+    if ((position.entryDecisionAtMs !== null && position.entryDecisionAtMs !== undefined)
+      && (position.entryDecisionAtMs !== entryDecisionAtMs
+        || position.entryDecisionJobId !== entryDecisionJobId)) conflict();
     await transaction.reconcileEventConfirmation(
       paperEventId(
         'PaperPositionOpened',
@@ -356,8 +426,15 @@ interface OpenCommandHashes {
 }
 
 function hashOpenCommand(command: OpenPaperPositionCommand): OpenCommandHashes {
-  const { expectedCurrentQualification:_expectedCurrentQualification,...stableCommand }=command;
+  const {
+    expectedCurrentQualification:_expectedCurrentQualification,
+    entryDecisionAtMs:_entryDecisionAtMs,
+    entryDecisionJobId:_entryDecisionJobId,
+    ...stableCommand
+  }=command;
   void _expectedCurrentQualification;
+  void _entryDecisionAtMs;
+  void _entryDecisionJobId;
   const current = {
     ...stableCommand,
     trigger: command.trigger.id,
@@ -422,8 +499,26 @@ function validateOpenCommand(
   command: OpenPaperPositionCommand,
   allowlist: readonly string[],
   qualificationProfile: EffectiveQualificationProfile,
+  openedAtMs: number,
 ): void {
   if (command.mint.trim() === '' || command.trigger.mint !== command.mint) invalidQuote('mint');
+  const creationEntry = command.strategy.id === 'creation-entry-v1';
+  if (
+    (command.entryDecisionAtMs === undefined) !== (command.entryDecisionJobId === undefined)
+    || (creationEntry && (command.entryDecisionAtMs === undefined || command.entryDecisionJobId === undefined))
+  ) {
+    invalidQuote('entryDecision');
+  }
+  if (command.entryDecisionAtMs !== undefined) {
+    assertValidTimestampMs('occurredAtMs', command.entryDecisionAtMs);
+    if (command.entryDecisionAtMs > command.buyQuote.observedAtMs) invalidQuote('buyQuote.observedAtMs');
+  }
+  if (command.entryDecisionJobId?.trim() === '') {
+    invalidQuote('entryDecisionJobId');
+  }
+  if (creationEntry && command.buyQuote.observedAtMs > openedAtMs) {
+    invalidQuote('buyQuote.observedAtMs');
+  }
   if (command.strategy.id.trim() === '' || !Number.isSafeInteger(command.strategy.version) || command.strategy.version <= 0) {
     invalidQuote('strategy');
   }
@@ -580,6 +675,13 @@ function validateCloseCommand(
   position: PaperPosition,
 ): void {
   rejectOrphanedTrigger(command.trigger);
+  if (position.strategy.id === 'creation-entry-v1') {
+    if (command.exitTriggerAtMs === undefined) {
+      if (command.reason !== 'MANUAL_KILL_SWITCH') invalidQuote('exitTriggerAtMs');
+    } else {
+      assertValidTimestampMs('occurredAtMs', command.exitTriggerAtMs);
+    }
+  }
   if (command.trigger.mint !== position.mint) invalidQuote('trigger.mint');
   if (command.reason.trim() === '') invalidQuote('reason');
   if (
@@ -622,6 +724,10 @@ function snapshotOpenCommand(
     buyQuote: snapshotQuote(command.buyQuote),
     reverseSellQuote: snapshotQuote(command.reverseSellQuote),
     maximumRoundTripLossBps: command.maximumRoundTripLossBps,
+    ...(command.entryDecisionAtMs === undefined ? {} : {
+      entryDecisionAtMs: command.entryDecisionAtMs,
+      entryDecisionJobId: command.entryDecisionJobId ?? '',
+    }),
     ...(command.strategySessionId === undefined ? {} : {
       strategySessionId:command.strategySessionId,
       qualificationReportId:command.qualificationReportId,
@@ -641,6 +747,9 @@ function snapshotCloseCommand(command: ClosePaperPositionCommand): ClosePaperPos
     trigger: snapshotTrigger(command.trigger),
     sellQuote: snapshotQuote(command.sellQuote),
     reason: command.reason,
+    ...(command.exitTriggerAtMs === undefined ? {} : {
+      exitTriggerAtMs: command.exitTriggerAtMs,
+    }),
   });
 }
 
@@ -854,12 +963,14 @@ function createPaperEvent(
   position: PaperPosition,
   trade: PaperTrade,
   trigger: DomainEvent,
+  observedAtMs: number,
 ): PaperPositionClosedEventV1;
 function createPaperEvent(
   type: 'PaperPositionOpened' | 'PaperPositionClosed',
   position: PaperPosition,
   trade: PaperTrade,
   trigger: DomainEvent,
+  observedAtMs?: number,
 ): PaperPositionOpenedEventV1 | PaperPositionClosedEventV1 {
   return freeze({
     id: paperEventId(type, position.id, trade.id, trigger.id),
@@ -871,7 +982,7 @@ function createPaperEvent(
     cursor: trigger.cursor,
     confirmationStatus: trigger.confirmationStatus,
     blockchainTimeMs: trigger.blockchainTimeMs,
-    observedAtMs: trigger.observedAtMs,
+    observedAtMs: observedAtMs ?? trigger.observedAtMs,
     payloadVersion: 1,
     payload: freeze({ position, trade }),
   });

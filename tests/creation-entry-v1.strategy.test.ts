@@ -32,6 +32,8 @@ void test('opens one creation position and moves the V2 session to monitoring', 
     qualification: Object.freeze({}) as QualificationReport,
     qualificationEvent: candidateEvent(),
     maximumRoundTripLossBps: 3_000n,
+    entryDecisionAtMs: 500,
+    entryDecisionJobId: 'paper-job-open',
   });
 
   assert.equal(result.requestedAction, 'OPEN');
@@ -40,6 +42,8 @@ void test('opens one creation position and moves the V2 session to monitoring', 
   assert.equal(result.session.state, 'WAITING_EXTERNAL_BUYS');
   assert.equal(result.session.positionId, POSITION.id);
   assert.equal(ledger.openCalls.length, 1);
+  assert.equal(ledger.openCalls[0]?.entryDecisionAtMs, 500);
+  assert.equal(ledger.openCalls[0]?.entryDecisionJobId, 'paper-job-open');
 });
 
 void test('keeps the persisted minimum buy threshold when runtime configuration changes', async () => {
@@ -169,6 +173,7 @@ void test('closes the full position when the executable minimum proceeds reach 2
   assert.equal(ledger.closeCalls.length, 1);
   assert.equal(ledger.closeCalls[0]?.sellQuote.amountInRaw, POSITION.remainingBaseRaw);
   assert.equal(ledger.closeCalls[0]?.reason, 'TAKE_PROFIT_2X_EXECUTABLE');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, 4_000);
   assert.equal(router.requests[0]?.side, 'SELL');
 });
 
@@ -217,6 +222,7 @@ void test('prioritizes creator sell over take profit and buyer target', async ()
 
   assert.equal(result.session.reasonCode, 'CREATOR_EARLY_SELL');
   assert.equal(ledger.closeCalls[0]?.reason, 'CREATOR_EARLY_SELL');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, 1_003);
 });
 
 void test('prioritizes the manual kill switch over every market trigger', async () => {
@@ -245,6 +251,84 @@ void test('prioritizes the manual kill switch over every market trigger', async 
 
   assert.equal(result.session.reasonCode, 'MANUAL_KILL_SWITCH');
   assert.equal(ledger.closeCalls[0]?.reason, 'MANUAL_KILL_SWITCH');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, 4_000);
+  assert.equal(result.session.pendingExitTriggerAtMs, 4_000);
+});
+
+void test('preserves the first manual kill detection time across a quote retry', async () => {
+  const ledger = new FakeLedger();
+  const candidate = eligibleCandidate();
+  const failed = new CreationEntryV1Strategy(
+    ledger,new FakeRouter(new PaperQuoteError('QUOTE_STATE_UNAVAILABLE','unavailable')),
+    { retentionMs:14_400_000,externalMinimumBuyAmountRaw:1_000n,manualKillSwitch:true },
+  );
+  const prepared = failed.prepare(candidate, {
+    externalBuyTarget:10,minimumConfirmation:'confirmed',nowMs:1_000,
+  });
+  assert.ok(prepared);
+  const pending = await failed.reconcile({
+    candidate,session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    position:POSITION,creator:'creator',launchTrades:[],marketTrades:[],nowMs:4_000,
+  });
+  assert.equal(pending.session.pendingExitTriggerAtMs, 4_000);
+
+  const recovered = new CreationEntryV1Strategy(
+    ledger,new FakeRouter(quote('manual-retry','MINT','SOL',900n,1_100n)),
+    { retentionMs:14_400_000,externalMinimumBuyAmountRaw:1_000n,manualKillSwitch:true },
+  );
+  await recovered.reconcile({
+    candidate,session:pending.session,position:POSITION,creator:'creator',
+    launchTrades:[],marketTrades:[],nowMs:5_000,
+  });
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, 4_000);
+});
+
+void test('does not invent a manual trigger time for a legacy pending session', async () => {
+  const ledger = new FakeLedger();
+  const candidate = eligibleCandidate();
+  const strategy = new CreationEntryV1Strategy(
+    ledger,new FakeRouter(quote('legacy-manual','MINT','SOL',900n,1_100n)),
+    { retentionMs:14_400_000,externalMinimumBuyAmountRaw:1_000n,manualKillSwitch:true },
+  );
+  const prepared = strategy.prepare(candidate, {
+    externalBuyTarget:10,minimumConfirmation:'confirmed',nowMs:1_000,
+  });
+  assert.ok(prepared);
+  const { pendingExitTriggerAtMs:_missing,...legacy } = prepared;
+  void _missing;
+
+  const result = await strategy.reconcile({
+    candidate,session:{ ...legacy,state:'EXIT_PENDING_QUOTE',positionId:POSITION.id,
+      pendingExitReason:'MANUAL_KILL_SWITCH' },position:POSITION,creator:'creator',
+    launchTrades:[],marketTrades:[],nowMs:5_000,
+  });
+
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs,undefined);
+  assert.equal(result.session.pendingExitTriggerAtMs,null);
+});
+
+void test('replays an orphaned open with provenance persisted on the position', async () => {
+  const ledger = new FakeLedger();
+  const strategy = new CreationEntryV1Strategy(
+    ledger,new FakeRouter(),
+    { retentionMs:14_400_000,externalMinimumBuyAmountRaw:1_000n },
+  );
+  const candidate = eligibleCandidate();
+  const session = strategy.prepare(candidate, {
+    externalBuyTarget:10,minimumConfirmation:'confirmed',nowMs:1_000,
+  });
+  assert.ok(session);
+  const orphaned = Object.freeze({ ...candidateEvent(),confirmationStatus:'orphaned' as const });
+
+  await strategy.reconcileSource({
+    candidate,session:{ ...session,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    qualification:Object.freeze({}) as QualificationReport,qualificationEvent:orphaned,
+    maximumRoundTripLossBps:3_000n,entryDecisionAtMs:500,
+    entryDecisionJobId:'persisted-paper-job',
+  });
+
+  assert.equal(ledger.reconcileOpenCalls[0]?.entryDecisionAtMs, 500);
+  assert.equal(ledger.reconcileOpenCalls[0]?.entryDecisionJobId, 'persisted-paper-job');
 });
 
 void test('keeps a mandatory exit pending when the full sell quote is unavailable', async () => {
@@ -271,6 +355,115 @@ void test('keeps a mandatory exit pending when the full sell quote is unavailabl
   assert.equal(result.session.reasonCode, 'SELL_QUOTE_UNAVAILABLE_OR_STALE');
   assert.equal(result.session.pendingExitReason, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
   assert.equal(ledger.closeCalls.length, 0);
+});
+
+void test('preserves the exact target-buy observation across a quote retry', async () => {
+  const ledger = new FakeLedger();
+  const candidate = eligibleCandidate();
+  const failed = new CreationEntryV1Strategy(
+    ledger,
+    new FakeRouter(new PaperQuoteError('QUOTE_STATE_UNAVAILABLE', 'state unavailable')),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const prepared = failed.prepare(candidate, {
+    externalBuyTarget: 1, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(prepared);
+  const sourceBuy = launchBuy('target-source', 2, 'wallet-a', 2_000n);
+  const pending = await failed.reconcile({
+    candidate, session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    position:POSITION,creator:'creator',launchTrades:[sourceBuy],marketTrades:[],nowMs:4_000,
+    contextEvent:candidateEvent(),
+  });
+  assert.equal(pending.session.state, 'EXIT_PENDING_QUOTE');
+
+  const recovered = new CreationEntryV1Strategy(
+    ledger, new FakeRouter(quote('sell-retry', 'MINT', 'SOL', 900n, 1_100n)),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  await recovered.reconcile({
+    candidate,session:pending.session,position:POSITION,creator:'creator',
+    launchTrades:[sourceBuy],marketTrades:[],nowMs:5_000,contextEvent:candidateEvent(),
+  });
+
+  assert.equal(ledger.closeCalls[0]?.reason, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, sourceBuy.observedAtMs);
+  assert.equal(ledger.closeCalls[0]?.trigger.id, sourceBuy.id);
+});
+
+void test('keeps a retrospective exit quote pending until a post-trigger retry', async () => {
+  const ledger = new FakeLedger();
+  const candidate = eligibleCandidate();
+  const sourceBuy = launchBuy('causal-target', 2, 'wallet-a', 2_000n);
+  const strategy = new CreationEntryV1Strategy(
+    ledger,
+    new FakeRouter({ ...quote('retrospective', 'MINT', 'SOL', 900n, 1_100n), observedAtMs: 1_001 }),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const prepared = strategy.prepare(candidate, {
+    externalBuyTarget: 1, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(prepared);
+
+  const pending = await strategy.reconcile({
+    candidate, session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    position:POSITION,creator:'creator',launchTrades:[sourceBuy],marketTrades:[],nowMs:4_000,
+  });
+
+  assert.equal(pending.requestedAction, 'NONE');
+  assert.equal(pending.session.state, 'EXIT_PENDING_QUOTE');
+  assert.equal(pending.session.reasonCode, 'SELL_QUOTE_UNAVAILABLE_OR_STALE');
+  assert.equal(pending.session.pendingExitReason, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
+  assert.equal(pending.session.lastError?.code, 'QUOTE_STALE');
+  assert.equal(pending.session.lastError?.retryable, true);
+  assert.equal(ledger.closeCalls.length, 0);
+
+  const recovered = new CreationEntryV1Strategy(
+    ledger, new FakeRouter(quote('post-trigger', 'MINT', 'SOL', 900n, 1_100n)),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const closed = await recovered.reconcile({
+    candidate,session:pending.session,position:POSITION,creator:'creator',
+    launchTrades:[sourceBuy],marketTrades:[],nowMs:5_000,
+  });
+  assert.equal(closed.requestedAction, 'CLOSE');
+  assert.equal(ledger.closeCalls.length, 1);
+  assert.equal(ledger.closeCalls[0]?.sellQuote.observedAtMs, 4_000);
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, sourceBuy.observedAtMs);
+});
+
+void test('uses the exact Nth new wallet trade when prior-wallet duplicates are interleaved', async () => {
+  const ledger = new FakeLedger();
+  const candidate = eligibleCandidate();
+  const strategy = new CreationEntryV1Strategy(
+    ledger, new FakeRouter(),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const prepared = strategy.prepare(candidate, {
+    externalBuyTarget: 3, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(prepared);
+  const first = await strategy.reconcile({
+    candidate, session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    position:POSITION,creator:'creator',
+    launchTrades:[
+      launchBuy('wallet-a-first', 2, 'wallet-a', 2_000n),
+      launchBuy('wallet-b-first', 3, 'wallet-b', 2_000n),
+    ],marketTrades:[],nowMs:3_000,
+  });
+  const target = launchBuy('wallet-c-target', 6, 'wallet-c', 2_000n);
+  const closed = await strategy.reconcile({
+    candidate,session:first.session,position:POSITION,creator:'creator',
+    launchTrades:[
+      launchBuy('wallet-b-duplicate-1', 4, 'wallet-b', 2_000n),
+      launchBuy('wallet-b-duplicate-2', 5, 'wallet-b', 2_000n),
+      target,
+    ],marketTrades:[],nowMs:4_000,
+  });
+
+  assert.equal(closed.requestedAction, 'CLOSE');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, target.observedAtMs);
+  assert.equal(ledger.closeCalls[0]?.trigger.id, target.id);
 });
 
 void test('recovers a committed creation close without quoting or closing twice', async () => {
@@ -317,12 +510,18 @@ void test('recovers a committed creation close without quoting or closing twice'
 
 class FakeLedger {
   public readonly openCalls: OpenPaperPositionCommand[] = [];
+  public readonly reconcileOpenCalls: OpenPaperPositionCommand[] = [];
   public readonly closeCalls: ClosePaperPositionCommand[] = [];
   public async open(command: OpenPaperPositionCommand): Promise<PaperPosition> {
     this.openCalls.push(command);
     return POSITION;
   }
-  public async reconcileOpen(): Promise<PaperPosition> { return POSITION; }
+  public async reconcileOpen(command: OpenPaperPositionCommand): Promise<PaperPosition> {
+    this.reconcileOpenCalls.push(command);
+    return Object.freeze({
+      ...POSITION,status:'PAPER_RETRACTED',closedAtMs:2_000,purgeAfterMs:14_402_000,
+    });
+  }
   public async close(command: ClosePaperPositionCommand): Promise<PaperPosition> {
     this.closeCalls.push(command);
     return Object.freeze({
@@ -338,6 +537,7 @@ class FakeLedger {
       purgeAfterMs: 14_404_000,
     });
   }
+  public async reconcileClose(): Promise<PaperPosition> { return POSITION; }
   public async retract(): Promise<PaperPosition> { return POSITION; }
 }
 
@@ -457,6 +657,6 @@ function quote(
   return Object.freeze({
     id, inputMint, outputMint, amountInRaw, amountOutRaw,
     minimumAmountOutRaw, feesRaw: 1n, slippageBps: 100n,
-    priceImpactBps: 10n, observedAtMs: 1_000, observedSlot: 10n,
+    priceImpactBps: 10n, observedAtMs: 4_000, observedSlot: 10n,
   });
 }

@@ -99,6 +99,7 @@ void test('la stratégie creation-entry-v1 est fermée, explicite et exclusiveme
   const config = parseConfig(enabled);
 
   assert.deepEqual({
+    paperStrategyEnabled: config.paperStrategyEnabled,
     enabled: config.creationStrategyEnabled,
     id: config.paperStrategyId,
     version: config.paperStrategyVersion,
@@ -109,6 +110,7 @@ void test('la stratégie creation-entry-v1 est fermée, explicite et exclusiveme
     takeProfitMultiplierBps: config.creationTakeProfitMultiplierBps,
     manualKillSwitch: config.creationManualKillSwitch,
   }, {
+    paperStrategyEnabled: true,
     enabled: true,
     id: 'creation-entry-v1',
     version: 1,

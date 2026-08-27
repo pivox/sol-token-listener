@@ -100,6 +100,7 @@ export class CreationEntryV1Strategy {
       lastQuote: candidate.buyQuote,
       lastError: null,
       pendingExitReason: null,
+      pendingExitTriggerAtMs: null,
       createdAtMs: input.nowMs,
       updatedAtMs: input.nowMs,
       purgeAfterMs: input.nowMs + this.options.retentionMs,
@@ -112,6 +113,8 @@ export class CreationEntryV1Strategy {
     qualification: QualificationReport;
     qualificationEvent: DomainEvent;
     maximumRoundTripLossBps: bigint;
+    entryDecisionAtMs?: number;
+    entryDecisionJobId?: string;
   }>): Promise<CreationEntryStrategyResult> {
     return this.openOrRecover(input, false);
   }
@@ -122,6 +125,8 @@ export class CreationEntryV1Strategy {
     qualification: QualificationReport;
     qualificationEvent: DomainEvent;
     maximumRoundTripLossBps: bigint;
+    entryDecisionAtMs?: number;
+    entryDecisionJobId?: string;
   }>): Promise<CreationEntryStrategyResult> {
     return this.openOrRecover(input, true);
   }
@@ -132,6 +137,8 @@ export class CreationEntryV1Strategy {
     qualification: QualificationReport;
     qualificationEvent: DomainEvent;
     maximumRoundTripLossBps: bigint;
+    entryDecisionAtMs?: number;
+    entryDecisionJobId?: string;
   }>, recovery: boolean): Promise<CreationEntryStrategyResult> {
     const { candidate, session } = input;
     if (
@@ -156,6 +163,10 @@ export class CreationEntryV1Strategy {
         mint: candidate.mint,
         reportId: candidate.qualificationReportId,
         qualificationEventId: input.qualificationEvent.id,
+      }),
+      ...(input.entryDecisionAtMs === undefined || input.entryDecisionJobId === undefined ? {} : {
+        entryDecisionAtMs: input.entryDecisionAtMs,
+        entryDecisionJobId: input.entryDecisionJobId,
       }),
     } as const;
     const position = recovery
@@ -188,6 +199,8 @@ export class CreationEntryV1Strategy {
     qualification: QualificationReport;
     qualificationEvent: DomainEvent;
     maximumRoundTripLossBps: bigint;
+    entryDecisionAtMs?: number;
+    entryDecisionJobId?: string;
   }>): Promise<CreationEntryStrategyResult> {
     const { candidate, session } = input;
     if (
@@ -208,6 +221,10 @@ export class CreationEntryV1Strategy {
       strategySessionId: session.id,
       qualificationReportId: candidate.qualificationReportId,
       candidateId: candidate.id,
+      ...(input.entryDecisionAtMs === undefined || input.entryDecisionJobId === undefined ? {} : {
+        entryDecisionAtMs:input.entryDecisionAtMs,
+        entryDecisionJobId:input.entryDecisionJobId,
+      }),
     });
     if (
       position.status !== 'PAPER_RETRACTED'
@@ -223,6 +240,32 @@ export class CreationEntryV1Strategy {
       purgeAfterMs: position.purgeAfterMs,
     });
     return strategyResult(updated, [], position, input.qualificationEvent);
+  }
+
+  public async reconcileClose(input: Readonly<{
+    candidate: TradingCandidateV1;
+    session: PaperStrategySessionV2;
+    position: PaperPosition;
+    trigger: DomainEvent;
+  }>): Promise<CreationEntryStrategyResult> {
+    if (input.session.state !== 'PAPER_CLOSED'
+      || input.session.positionId !== input.position.id
+      || input.position.status !== 'PAPER_CLOSED') {
+      throw new TypeError('Creation close reconciliation is inconsistent.');
+    }
+    const position = await this.ledger.reconcileClose(input.position.id,input.trigger);
+    if (position.status === 'PAPER_RETRACTED') {
+      const retracted = updateSession(input.candidate,input.session,{
+        state:'PAPER_RETRACTED',reasonCode:'SOURCE_ORPHANED',pendingExitReason:null,
+        pendingExitTriggerAtMs:null,updatedAtMs:position.closedAtMs ?? input.session.updatedAtMs,
+        purgeAfterMs:position.purgeAfterMs ?? input.session.purgeAfterMs,
+      });
+      return strategyResult(retracted,[],position,input.trigger);
+    }
+    if (position.status !== 'PAPER_CLOSED') {
+      throw new TypeError('Creation close reconciliation did not find a terminal position.');
+    }
+    return strategyResult(input.session,[],position,input.trigger);
   }
 
   public async reconcileEvidence(input: Readonly<{
@@ -245,18 +288,25 @@ export class CreationEntryV1Strategy {
       countedTradeIds: Object.freeze([]),
       countedBuyerWallets: Object.freeze([]),
       lastCountedCursor: null,
-      pendingExitReason: null,
+      pendingExitReason: input.session.pendingExitReason === 'MANUAL_KILL_SWITCH'
+        ? 'MANUAL_KILL_SWITCH'
+        : null,
+      pendingExitTriggerAtMs: input.session.pendingExitReason === 'MANUAL_KILL_SWITCH'
+        ? input.session.pendingExitTriggerAtMs ?? null
+        : null,
       lastQuote: input.candidate.buyQuote,
       lastError: null,
       updatedAtMs: Math.max(input.session.createdAtMs, input.position.openedAtMs),
     });
     if (input.position.status === 'PAPER_HOLDING') {
-      return this.reconcile({ ...input, session: baseline });
+      return this.reconcile({ ...input, session: baseline, contextEvent:input.orphanedEvent });
     }
 
     let rebuilt = baseline;
     const counted: PaperExternalBuyEvidenceV2[] = [];
-    for (const buy of canonicalBuys({ ...input, session: baseline })) {
+    for (const buy of canonicalBuys({
+      ...input, session: baseline, contextEvent:input.orphanedEvent,
+    })) {
       const result = countUniqueExternalBuy(rebuilt, {
         tradeId: buy.id,
         mint: input.candidate.mint,
@@ -270,7 +320,9 @@ export class CreationEntryV1Strategy {
       rebuilt = result.session;
       if (result.evidence !== null) counted.push(result.evidence);
     }
-    const creatorSell = earliestCreatorSell({ ...input, session: rebuilt });
+    const creatorSell = earliestCreatorSell({
+      ...input, session: rebuilt, contextEvent:input.orphanedEvent,
+    });
     const priorQuote = input.session.lastQuote;
     const profitStillSupported = priorQuote !== null
       && priorQuote.inputMint === input.candidate.mint
@@ -295,6 +347,9 @@ export class CreationEntryV1Strategy {
         state: 'PAPER_CLOSED',
         reasonCode: reason,
         pendingExitReason: reason,
+        pendingExitTriggerAtMs: reason === 'MANUAL_KILL_SWITCH'
+          ? input.session.pendingExitTriggerAtMs ?? input.position.exitTriggerAtMs ?? null
+          : null,
         updatedAtMs: input.position.closedAtMs,
         purgeAfterMs: input.position.purgeAfterMs,
       });
@@ -308,6 +363,7 @@ export class CreationEntryV1Strategy {
       state: 'PAPER_RETRACTED',
       reasonCode: 'SOURCE_ORPHANED',
       pendingExitReason: null,
+      pendingExitTriggerAtMs: null,
       updatedAtMs: Math.max(rebuilt.updatedAtMs, input.orphanedEvent.observedAtMs),
       purgeAfterMs: position.purgeAfterMs,
     });
@@ -322,6 +378,7 @@ export class CreationEntryV1Strategy {
     launchTrades: readonly BondingCurveTradeObservedEventV1[];
     marketTrades: readonly MarketTrade[];
     nowMs: number;
+    contextEvent?: DomainEvent;
   }>): Promise<CreationEntryStrategyResult> {
     if (
       input.candidate.strategy.id !== 'creation-entry-v1'
@@ -332,8 +389,10 @@ export class CreationEntryV1Strategy {
 
     let session = input.session;
     const counted: PaperExternalBuyEvidenceV2[] = [];
-    let trigger: DomainEvent = candidateTrigger(input.candidate);
-    for (const buy of canonicalBuys(input)) {
+    const canonical = canonicalBuys(input);
+    let trigger: DomainEvent = input.contextEvent ?? candidateTrigger(input.candidate);
+    let targetBuy: CanonicalBuy | null = null;
+    for (const buy of canonical) {
       const result = countUniqueExternalBuy(session, {
         tradeId: buy.id,
         mint: input.candidate.mint,
@@ -349,16 +408,28 @@ export class CreationEntryV1Strategy {
         counted.push(result.evidence);
         trigger = buy.trigger;
       }
-      if (result.targetReached) break;
+      if (result.targetReached) {
+        if (result.evidence !== null) targetBuy = buy;
+        break;
+      }
     }
     const creatorSell = earliestCreatorSell(input);
+    if (targetBuy === null && session.externalBuyCount >= session.externalBuyTarget) {
+      const targetTradeId = session.countedTradeIds[session.externalBuyTarget - 1];
+      targetBuy = canonical.find((buy) => buy.id === targetTradeId) ?? null;
+    }
     const mandatoryReason = this.options.manualKillSwitch
       ? 'MANUAL_KILL_SWITCH'
       : creatorSell === null
         ? session.pendingExitReason
         : 'CREATOR_EARLY_SELL';
-    if (this.options.manualKillSwitch) trigger = candidateTrigger(input.candidate);
+    const manualExitTriggerAtMs = mandatoryReason === 'MANUAL_KILL_SWITCH'
+      ? session.pendingExitTriggerAtMs
+        ?? (session.pendingExitReason === 'MANUAL_KILL_SWITCH' ? null : input.nowMs)
+      : null;
+    if (this.options.manualKillSwitch) trigger = input.contextEvent ?? candidateTrigger(input.candidate);
     else if (creatorSell !== null) trigger = creatorSell;
+    else if (targetBuy !== null) trigger = targetBuy.trigger;
 
     if (input.position.status === 'PAPER_CLOSED') {
       if (
@@ -384,6 +455,9 @@ export class CreationEntryV1Strategy {
         state: 'PAPER_CLOSED',
         reasonCode: recoveredReason,
         pendingExitReason: recoveredReason,
+        pendingExitTriggerAtMs: recoveredReason === 'MANUAL_KILL_SWITCH'
+          ? session.pendingExitTriggerAtMs ?? input.position.exitTriggerAtMs ?? null
+          : null,
         lastError: null,
         updatedAtMs: input.position.closedAtMs,
         purgeAfterMs: input.position.purgeAfterMs,
@@ -414,6 +488,7 @@ export class CreationEntryV1Strategy {
         state: 'EXIT_PENDING_QUOTE',
         reasonCode: 'SELL_QUOTE_UNAVAILABLE_OR_STALE',
         pendingExitReason: mandatoryReason,
+        pendingExitTriggerAtMs: manualExitTriggerAtMs,
         lastError: Object.freeze({
           code: known?.code ?? 'QUOTE_FAILURE',
           message: known?.message ?? 'Full-position sell quote failed.',
@@ -434,6 +509,7 @@ export class CreationEntryV1Strategy {
     if (exitReason === null) {
       const monitoring = updateSession(input.candidate, session, {
         state: 'WAITING_EXTERNAL_BUYS',
+        pendingExitTriggerAtMs: null,
         lastQuote: sellQuote,
         lastError: null,
         updatedAtMs: input.nowMs,
@@ -441,17 +517,57 @@ export class CreationEntryV1Strategy {
       return strategyResult(monitoring, counted, input.position, trigger);
     }
 
+    let exitTriggerAtMs: number | undefined;
+    if (exitReason === 'MANUAL_KILL_SWITCH') {
+      exitTriggerAtMs=manualExitTriggerAtMs ?? undefined;
+    }
+    else if (exitReason === 'TAKE_PROFIT_2X_EXECUTABLE') {
+      exitTriggerAtMs=sellQuote.observedAtMs;
+    } else if (exitReason === 'CREATOR_EARLY_SELL') {
+      if (creatorSell === null) throw new TypeError('Creator exit source is missing.');
+      exitTriggerAtMs=creatorSell.observedAtMs;
+    } else {
+      if (targetBuy === null) throw new TypeError('External buyer exit source is missing.');
+      exitTriggerAtMs=targetBuy.observedAtMs;
+    }
+
+    if (exitTriggerAtMs !== undefined && sellQuote.observedAtMs < exitTriggerAtMs) {
+      const stale = new PaperQuoteError(
+        'QUOTE_STALE',
+        'Full-position sell quote predates the selected exit trigger.',
+      );
+      const pending = updateSession(input.candidate, session, {
+        state: 'EXIT_PENDING_QUOTE',
+        reasonCode: 'SELL_QUOTE_UNAVAILABLE_OR_STALE',
+        pendingExitReason: exitReason,
+        pendingExitTriggerAtMs: exitReason === 'MANUAL_KILL_SWITCH'
+          ? exitTriggerAtMs
+          : null,
+        lastError: Object.freeze({
+          code: stale.code,
+          message: stale.message,
+          retryable: stale.retryable,
+        }),
+        updatedAtMs: input.nowMs,
+      });
+      return strategyResult(pending, counted, input.position, trigger);
+    }
+
     const position = await this.ledger.close({
       positionId: input.position.id,
       trigger,
       sellQuote,
       reason: exitReason,
+      ...(exitTriggerAtMs === undefined ? {} : { exitTriggerAtMs }),
     });
     const closedAtMs = position.closedAtMs ?? input.nowMs;
     const closed = updateSession(input.candidate, session, {
       state: 'PAPER_CLOSED',
       reasonCode: exitReason,
       pendingExitReason: exitReason,
+      pendingExitTriggerAtMs: exitReason === 'MANUAL_KILL_SWITCH'
+        ? exitTriggerAtMs ?? null
+        : null,
       closeCommandId: createDeterministicCreationExitCommandId(
         input.position.id,
         session.strategy,
@@ -488,6 +604,7 @@ function updateSession(
     lastQuote: next.lastQuote,
     lastError: next.lastError,
     pendingExitReason: next.pendingExitReason,
+    pendingExitTriggerAtMs: next.pendingExitTriggerAtMs ?? null,
     createdAtMs: next.createdAtMs,
     updatedAtMs: next.updatedAtMs,
     purgeAfterMs: next.purgeAfterMs,

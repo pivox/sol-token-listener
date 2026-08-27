@@ -89,6 +89,68 @@ void test('attache la lignée décisionnelle complète à la position paper', as
   assert.equal(position.candidateId, `candidate_${'c'.repeat(64)}`);
 });
 
+void test('refuse une entrée creation-entry-v1 sans provenance décisionnelle avant toute mutation', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = Object.freeze({
+    ...openCommand(),
+    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+  });
+
+  await assert.rejects(engine.open(command), hasCode('QUOTE_INVALID'));
+
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('refuse une quote creation-entry-v1 antérieure à sa décision avant toute mutation', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = Object.freeze({
+    ...openCommand(),
+    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+    entryDecisionAtMs: 2,
+    entryDecisionJobId: 'paper_decision_job_1',
+    buyQuote: Object.freeze({ ...openCommand().buyQuote, observedAtMs: 1 }),
+  });
+
+  await assert.rejects(engine.open(command), hasCode('QUOTE_INVALID'));
+
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('refuse une quote creation-entry-v1 postérieure à l’horloge avant toute mutation', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = Object.freeze({
+    ...openCommand(),
+    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+    entryDecisionAtMs: 1,
+    entryDecisionJobId: 'paper_decision_job_1',
+    buyQuote: Object.freeze({ ...openCommand().buyQuote, observedAtMs: 1_001 }),
+  });
+
+  await assert.rejects(engine.open(command), hasCode('QUOTE_INVALID'));
+
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('accepte une décision et une quote creation-entry-v1 aux bornes causales', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = Object.freeze({
+    ...openCommand(),
+    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+    entryDecisionAtMs: 1_000,
+    entryDecisionJobId: 'paper_decision_job_1',
+    buyQuote: Object.freeze({ ...openCommand().buyQuote, observedAtMs: 1_000 }),
+  });
+
+  const position = await engine.open(command);
+
+  assert.equal(position.status, 'PAPER_HOLDING');
+  assert.equal(repository.writeCount, 1);
+});
+
 void test('guards the current qualification before every strategy-linked position read',async()=>{
   const operations:string[]=[];
   const repository:PaperTradingRepository={
@@ -838,6 +900,69 @@ void test('ferme entièrement et calcule le PnL conservateur', async () => {
   assert.equal(closed.purgeAfterMs, 14_401_000);
   assert.equal(replay.id, closed.id);
   assert.equal(repository.writeCount, 2);
+});
+
+void test('refuse une quote de clôture antérieure au déclencheur avant toute mutation', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const opened = await engine.open({
+    ...openCommand(),
+    strategy: { id: 'creation-entry-v1', version: 1 },
+    entryDecisionAtMs: 1,
+    entryDecisionJobId: 'paper_decision_job_1',
+  });
+  const command = closeCommand(opened.id);
+
+  await assert.rejects(engine.close({
+    ...command,
+    exitTriggerAtMs: command.sellQuote.observedAtMs + 1,
+  }), hasCode('QUOTE_INVALID'));
+
+  assert.equal(repository.positions.get(opened.id)?.status, 'PAPER_HOLDING');
+  assert.equal(repository.writeCount, 1);
+});
+
+void test('autorise le retry manuel legacy sans inventer son horodatage', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const opened = await engine.open({
+    ...openCommand(),
+    strategy: { id: 'creation-entry-v1', version: 1 },
+    entryDecisionAtMs: 1,
+    entryDecisionJobId: 'paper_decision_job_1',
+  });
+  const command = closeCommand(opened.id);
+
+  const closed = await engine.close({
+    positionId: command.positionId,
+    trigger: command.trigger,
+    sellQuote: command.sellQuote,
+    reason: 'MANUAL_KILL_SWITCH',
+  });
+
+  assert.equal(closed.status, 'PAPER_CLOSED');
+  assert.equal(closed.exitTriggerAtMs, null);
+});
+
+void test('accepts a quote exactly at the trigger and reconciles finality without another sell trade', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository,'paper');
+  const opened = await engine.open({
+    ...openCommand(),strategy:{ id:'creation-entry-v1',version:1 },
+    entryDecisionAtMs:1,entryDecisionJobId:'paper_decision_job_1',
+  });
+  const command = Object.freeze({
+    ...closeCommand(opened.id),exitTriggerAtMs:1,
+  });
+  const closed = await engine.close(command);
+
+  const finalized = await engine.reconcileClose(closed.id,Object.freeze({
+    ...command.trigger,confirmationStatus:'finalized' as const,
+  }));
+
+  assert.equal(finalized,closed);
+  assert.equal(repository.writeCount,2);
+  assert.deepEqual([...repository.eventStatuses.values()],['confirmed','finalized']);
 });
 
 void test('refuse un replay de fermeture contradictoire sans second trade', async () => {

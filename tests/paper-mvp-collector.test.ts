@@ -1,0 +1,1410 @@
+import { randomUUID } from 'node:crypto';
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import pg from 'pg';
+import { createPaperMvpPositionSample } from '../src/domain/paper-mvp.js';
+import type { PaperMvpRepository, PaperMvpRunSnapshot } from '../src/ports/paper-mvp-repository.js';
+import type { PaperMvpSource } from '../src/ports/paper-mvp-source.js';
+import { PaperMvpCollector } from '../src/application/paper-mvp-collector.js';
+import { PostgresPaperMvpSource } from '../src/storage/paper-mvp-source.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
+import { createProviderUsageSnapshot } from '../src/ports/provider-usage-probe.js';
+import {
+  PaperMvpConflictError,
+  PostgresPaperMvpRepository,
+} from '../src/storage/paper-mvp.repository.js';
+
+const OWNER = 'paper-mvp-owner-test';
+
+const runSnapshot: PaperMvpRunSnapshot = Object.freeze({
+  run: Object.freeze({
+    runId: 'run-1',
+    runnerOwnerId: OWNER,
+    completionReason: null,
+    configuration: Object.freeze({
+      strategyId: 'creation-entry-v1', strategyVersion: 1, quoteMint: 'SOL',
+      targetClosedPositions: 50, initialCapitalRaw: 1_000_000n,
+      networkFeeRawPerTransaction: 5_000n, maxDurationMs: 60_000,
+      entryQuoteAmountRaw: 1_000n, slippageBps: 100n,
+      minimumConfirmation: 'confirmed', entryWindowMs: 45_000,
+      quoteMaxAgeMs: 5_000, quoteMaxSlotLag: 32,
+      creationEntryMaxAgeMs: 45_000, creationEntryMaxSlotLag: 32,
+      externalMinimumBuyAmountRaw: 1n,
+      externalUniqueBuyersTarget: 10, takeProfitMultiplierBps: 20_000n,
+      manualKillSwitch: false, maximumRoundTripLossBps: 3_000n,
+      decisionPollIntervalMs: 1_000, decisionLeaseMs: 30_000,
+      decisionRetryMaxAttempts: 5, decisionRetryBaseDelayMs: 500,
+      qualificationProfileFingerprint: 'a'.repeat(64),
+      providerIdentity: 'provider:test',
+    }),
+    state: 'RUNNING',
+    counters: Object.freeze({
+      creationsObserved: 0, entriesRejected: 0, unknownTerminalPositions: 0,
+      duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    }),
+    providerUsage: Object.freeze({
+      status: 'UNAVAILABLE', creditsUsedStart: null, creditsUsedEnd: null,
+      rateLimitedCount: 0,
+    }),
+    closedPositions: 0, startedAtMs: 1_000, deadlineAtMs: 61_000,
+    updatedAtMs: 1_000, terminalAtMs: null, purgeAfterMs: null,
+    verdict: null, failureCode: null,
+  }),
+  samples: Object.freeze([]), unknownPositions: Object.freeze([]),
+});
+
+void test('collects exact authoritative position facts and preserves bigint values', async () => {
+  const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
+  const repository = fakeRepository(async (progress) => {
+    recordedProgress.push(progress);
+    return Object.freeze({
+      ...runSnapshot.run,
+      counters: Object.freeze({
+        ...runSnapshot.run.counters,
+        ...progress.counters,
+      }),
+      closedPositions: 1,
+      updatedAtMs: 8_000,
+    });
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => Object.freeze({
+      positions: Object.freeze([validFacts()]),
+      creationsObserved: 12,
+      entriesRejected: 4,
+      duplicateLogicalBuys: 2,
+      duplicateLogicalSells: 3,
+    }),
+  });
+
+  const result = await new PaperMvpCollector(repository, source, () => 8_000)
+    .collect({ runId: 'run-1', runnerOwnerId: OWNER, limit: 100 });
+
+  assert.deepEqual(result, {
+    scanned: 1, inserted: 1, valid: 1, unknown: 0,
+    duplicateLogicalBuys: 2, duplicateLogicalSells: 3,
+  });
+  const recorded = recordedProgress[0];
+  assert.ok(recorded);
+  assert.equal(recorded.samples.length, 1);
+  assert.equal(recorded.unknownPositions.length, 0);
+  assert.deepEqual(recorded.samples[0], {
+    positionId: 'position-1', mint: 'MINT', quoteMint: 'SOL',
+    exitReason: 'TAKE_PROFIT_2X_EXECUTABLE', exitCategory: '2X',
+    creationDetectedAtMs: 1_100, entryDecisionAtMs: 1_200,
+    entryQuoteAtMs: 1_300, paperBuyAtMs: 1_400,
+    exitTriggerAtMs: 1_500, exitQuoteAtMs: 1_600, paperSellAtMs: 1_700,
+    buyAmountInRaw: 9_007_199_254_740_993n,
+    buyAmountOutRaw: 15_000n, buyMinimumAmountOutRaw: 14_000n,
+    buyFeesRaw: 10n, buySlippageBps: 100n, buyPriceImpactBps: 20n,
+    sellAmountInRaw: 14_000n, sellAmountOutRaw: 10_000_000_000_000_000n,
+    sellMinimumAmountOutRaw: 9_500_000_000_000_000n,
+    sellFeesRaw: 11n, sellSlippageBps: 101n, sellPriceImpactBps: 21n,
+    networkFeeRawPerTransaction: 5_000n,
+    grossPnlRaw: 992_800_745_259_007n,
+    modelNetPnlRaw: 492_800_745_249_007n,
+    detectionToEntryLatencyMs: 300, exitTriggerToSellLatencyMs: 200,
+    payloadVersion: 1,
+  });
+  assert.deepEqual(recorded.counters, {
+    creationsObserved: 12, entriesRejected: 4,
+    duplicateLogicalBuys: 2, duplicateLogicalSells: 3, openedPositions: 0, openPositions: 0,
+  });
+});
+
+void test('marks a closed position with no exact entry-decision job as unknown', async () => {
+  const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
+  const repository = fakeRepository(async (progress) => {
+    recordedProgress.push(progress);
+    return Object.freeze({
+      ...runSnapshot.run,
+      counters: Object.freeze({
+        ...runSnapshot.run.counters,
+        unknownTerminalPositions: progress.unknownPositions.length,
+      }),
+      updatedAtMs: progress.observedAtMs,
+    });
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => Object.freeze({
+      positions: Object.freeze([Object.freeze({ ...validFacts(), entryDecisionJobCount: 0 })]),
+      creationsObserved: 0, entriesRejected: 0,
+      duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    }),
+  });
+
+  await new PaperMvpCollector(repository, source, () => 8_000)
+    .collect({ runId: 'run-1', runnerOwnerId: OWNER, limit: 1 });
+
+  assert.deepEqual(recordedProgress[0]?.unknownPositions, [
+    { positionId: 'position-1', reason: 'SOURCE_CONTRADICTION' },
+  ]);
+});
+
+void test('persists the authoritative provider probe snapshot on every collection', async () => {
+  const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
+  const repository = fakeRepository(async (progress) => {
+    recordedProgress.push(progress);
+    return Object.freeze({ ...runSnapshot.run, updatedAtMs: progress.observedAtMs });
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => Object.freeze({
+      positions: Object.freeze([]), creationsObserved: 3, entriesRejected: 2,
+      duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    }),
+  });
+  const evidence = createProviderUsageSnapshot({
+    status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 125n,
+    rateLimitedCount: 1,
+  });
+
+  await new PaperMvpCollector(repository, source, () => 8_000, Object.freeze({
+    identity: 'provider:test:v1', snapshot: async () => evidence,
+  })).collect({ runId: 'run-1', runnerOwnerId: OWNER, limit: 100 });
+
+  assert.deepEqual(recordedProgress[0]?.providerUsage, evidence);
+  assert.deepEqual(recordedProgress[0]?.counters, {
+    creationsObserved: 3, entriesRejected: 2,
+    duplicateLogicalBuys: 0, duplicateLogicalSells: 0, openedPositions: 0, openPositions: 0,
+  });
+});
+
+void test('accumulates bounded duplicate counts across distinct collection polls', async () => {
+  let snapshot = runSnapshot;
+  let poll = 0;
+  const repository: PaperMvpRepository = Object.freeze({
+    startOrResume: async () => snapshot.run,
+    load: async () => snapshot,
+    recordProgress: async (progress: Parameters<PaperMvpRepository['recordProgress']>[0]) => {
+      snapshot = Object.freeze({
+        ...snapshot,
+        run: Object.freeze({
+          ...snapshot.run,
+          counters: Object.freeze({
+            ...snapshot.run.counters,
+            ...progress.counters,
+          }),
+          closedPositions: snapshot.run.closedPositions + progress.samples.length,
+          updatedAtMs: progress.observedAtMs,
+        }),
+      });
+      return snapshot.run;
+    },
+    terminalize: async () => snapshot.run,
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => {
+      poll += 1;
+      return Object.freeze({
+        positions: Object.freeze([
+          Object.freeze({ ...validFacts(), positionId: `position-${poll}` }),
+        ]),
+        creationsObserved: 0,
+        entriesRejected: 0,
+        duplicateLogicalBuys: poll === 1 ? 2 : 3,
+        duplicateLogicalSells: poll === 1 ? 1 : 4,
+      });
+    },
+  });
+  const collector = new PaperMvpCollector(repository, source, () => 8_000 + poll);
+
+  assert.equal((await collector.collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 })).duplicateLogicalBuys, 2);
+  assert.deepEqual(await collector.collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 }), {
+    scanned:1,inserted:1,valid:1,unknown:0,
+    duplicateLogicalBuys:5,duplicateLogicalSells:5,
+  });
+});
+
+void test('retries an interleaved stale collection without losing distinct duplicate counts', async () => {
+  const result = await interleavedCollections(false);
+
+  assert.equal(result.first.inserted + result.second.inserted, 2);
+  assert.equal(result.snapshot.run.closedPositions, 2);
+  assert.equal(result.snapshot.run.counters.duplicateLogicalBuys, 11);
+});
+
+void test('retries an interleaved stale collection without charging the same position twice', async () => {
+  const result = await interleavedCollections(true);
+
+  assert.equal(result.first.inserted + result.second.inserted, 1);
+  assert.equal(result.snapshot.run.closedPositions, 1);
+  assert.equal(result.snapshot.run.counters.duplicateLogicalBuys, 6);
+});
+
+void test('stops an OCC retry at the refreshed target without another dependency call', async () => {
+  let snapshot = Object.freeze({
+    ...runSnapshot,
+    run: Object.freeze({
+      ...runSnapshot.run,
+      configuration: Object.freeze({ ...runSnapshot.run.configuration,targetClosedPositions:1 }),
+    }),
+  });
+  let sourceCalls = 0;
+  let providerCalls = 0;
+  let progressCalls = 0;
+  const repository: PaperMvpRepository = Object.freeze({
+    startOrResume: async () => snapshot.run,
+    load: async () => snapshot,
+    recordProgress: async () => {
+      progressCalls += 1;
+      if (progressCalls !== 1) throw new Error('progress called after target');
+      snapshot = Object.freeze({
+        ...snapshot,
+        run: Object.freeze({
+          ...snapshot.run,closedPositions:1,updatedAtMs:2_000,
+          counters:Object.freeze({
+            ...snapshot.run.counters,duplicateLogicalBuys:7,duplicateLogicalSells:3,
+          }),
+        }),
+      });
+      throw new PaperMvpConflictError('PROGRESS_SNAPSHOT_STALE');
+    },
+    terminalize: async () => snapshot.run,
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => {
+      sourceCalls += 1;
+      if (sourceCalls !== 1) throw new Error('source called after target');
+      return Object.freeze({
+        positions:Object.freeze([validFacts()]),creationsObserved:1,entriesRejected:0,
+        duplicateLogicalBuys:1,duplicateLogicalSells:0,
+      });
+    },
+  });
+  const result = await new PaperMvpCollector(repository,source,() => 2_000,Object.freeze({
+    identity:'provider:test',
+    snapshot:async () => {
+      providerCalls += 1;
+      return createProviderUsageSnapshot({
+        status:'UNAVAILABLE',creditsUsedStart:null,creditsUsedEnd:null,rateLimitedCount:0,
+      });
+    },
+  })).collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 });
+
+  assert.deepEqual(result,{
+    scanned:0,inserted:0,valid:0,unknown:0,
+    duplicateLogicalBuys:7,duplicateLogicalSells:3,
+  });
+  assert.equal(sourceCalls,1);
+  assert.equal(providerCalls,1);
+  assert.equal(progressCalls,1);
+});
+
+void test('caps the source batch at the refreshed remaining target', async () => {
+  const before = Object.freeze({
+    ...runSnapshot,
+    run:Object.freeze({
+      ...runSnapshot.run,closedPositions:49,
+      configuration:Object.freeze({
+        ...runSnapshot.run.configuration,targetClosedPositions:50,
+      }),
+    }),
+  });
+  let sourceLimit: number | undefined;
+  const repository: PaperMvpRepository = Object.freeze({
+    startOrResume: async () => before.run,
+    load: async () => before,
+    recordProgress: async (progress: Parameters<PaperMvpRepository['recordProgress']>[0]) => Object.freeze({
+      ...before.run,closedPositions:50,updatedAtMs:progress.observedAtMs,
+    }),
+    terminalize: async () => before.run,
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async (input: Parameters<PaperMvpSource['collectBatch']>[0]) => {
+      sourceLimit = input.limit;
+      return Object.freeze({
+        positions:Object.freeze([validFacts()]),creationsObserved:0,entriesRejected:0,
+        duplicateLogicalBuys:0,duplicateLogicalSells:0,
+      });
+    },
+  });
+
+  assert.equal((await new PaperMvpCollector(repository,source,() => 2_000).collect({
+    runId:'run-1',runnerOwnerId:OWNER,limit:100,
+  })).valid,1);
+  assert.equal(sourceLimit,1);
+});
+
+for (const shutdownKind of ['signal','deadline'] as const) {
+  void test(`does not overfill a live target when ${shutdownKind} collection commits late`, {
+    timeout:15_000,
+  }, async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: PostgreSQL interleaving test skipped');
+      return;
+    }
+    await withSchema(databaseUrl, async (pool) => {
+      const repository = new PostgresPaperMvpRepository(pool);
+      const configuration = Object.freeze({
+        ...runSnapshot.run.configuration,targetClosedPositions:1,
+      });
+      const run = await repository.startOrResume(configuration,OWNER,1_000);
+      let markRegularProgressEntered = ():void => {
+        assert.fail('regular progress gate was not initialized');
+      };
+      const regularProgressEntered = new Promise<void>((resolve) => {
+        markRegularProgressEntered = resolve;
+      });
+      let releaseRegularProgress = ():void => {
+        assert.fail('regular progress release was not initialized');
+      };
+      const regularProgressMayContinue = new Promise<void>((resolve) => {
+        releaseRegularProgress = resolve;
+      });
+      const delayedRepository: PaperMvpRepository = Object.freeze({
+        startOrResume: (...args: Parameters<PaperMvpRepository['startOrResume']>) => (
+          repository.startOrResume(...args)
+        ),
+        load: (...args: Parameters<PaperMvpRepository['load']>) => repository.load(...args),
+        recordProgress: async (
+          progress: Parameters<PaperMvpRepository['recordProgress']>[0],
+        ) => {
+          markRegularProgressEntered();
+          await regularProgressMayContinue;
+          return repository.recordProgress(progress);
+        },
+        terminalize: (...args: Parameters<PaperMvpRepository['terminalize']>) => (
+          repository.terminalize(...args)
+        ),
+      });
+      const regularSource: PaperMvpSource = Object.freeze({
+        collectBatch: async () => Object.freeze({
+          positions:Object.freeze([
+            Object.freeze({ ...validFacts(),positionId:`regular-${shutdownKind}` }),
+          ]),creationsObserved:0,entriesRejected:0,
+          duplicateLogicalBuys:0,duplicateLogicalSells:0,
+          openedPositions:1,openPositions:0,
+        }),
+      });
+      const abortController = new AbortController();
+      const regularPromise = new PaperMvpCollector(
+        delayedRepository,regularSource,() => 2_000,
+      ).collect({
+        runId:run.runId,runnerOwnerId:OWNER,limit:1,signal:abortController.signal,
+      });
+      await regularProgressEntered;
+      abortController.abort(shutdownKind === 'signal' ? 'SIGTERM' : 'RUN_DEADLINE');
+
+      let finalSourceCalls = 0;
+      let markFinalSourceEntered = ():void => {
+        assert.fail('final source gate was not initialized');
+      };
+      const finalSourceEntered = new Promise<void>((resolve) => {
+        markFinalSourceEntered = resolve;
+      });
+      let releaseFinalSource = ():void => {
+        assert.fail('final source release was not initialized');
+      };
+      const finalSourceMayContinue = new Promise<void>((resolve) => {
+        releaseFinalSource = resolve;
+      });
+      const finalSource: PaperMvpSource = Object.freeze({
+        collectBatch: async () => {
+          finalSourceCalls += 1;
+          if (finalSourceCalls === 1) {
+            markFinalSourceEntered();
+            await finalSourceMayContinue;
+          }
+          return Object.freeze({
+            positions:Object.freeze([
+              Object.freeze({ ...validFacts(),positionId:`final-${shutdownKind}` }),
+            ]),creationsObserved:0,entriesRejected:0,
+            duplicateLogicalBuys:0,duplicateLogicalSells:0,
+            openedPositions:1,openPositions:0,
+          });
+        },
+      });
+      const finalPromise = new PaperMvpCollector(
+        repository,finalSource,() => 2_000,
+      ).collect({ runId:run.runId,runnerOwnerId:OWNER,limit:1 });
+      await finalSourceEntered;
+      releaseRegularProgress();
+      await regularPromise;
+      releaseFinalSource();
+
+      assert.deepEqual(await finalPromise,{
+        scanned:0,inserted:0,valid:0,unknown:0,
+        duplicateLogicalBuys:0,duplicateLogicalSells:0,
+      });
+      assert.equal(finalSourceCalls,1);
+      const stored = await repository.load(run.runId);
+      assert.equal(stored?.run.closedPositions,1);
+      assert.deepEqual(stored?.samples.map((sample) => sample.positionId),[
+        `regular-${shutdownKind}`,
+      ]);
+    });
+  });
+}
+
+void test('classifies terminal source gaps and contradictions as durable unknown positions', async () => {
+  const facts = validFacts();
+  const positions = Object.freeze([
+    Object.freeze({ ...facts, positionId: 'retracted', status: 'PAPER_RETRACTED' }),
+    Object.freeze({ ...facts, positionId: 'missing-time', exitTriggerAtMs: null }),
+    Object.freeze({ ...facts, positionId: 'causal', exitTriggerAtMs: 1_200,
+      closeEventObservedAtMs: 1_200 }),
+    Object.freeze({ ...facts, positionId: 'fill', buyFillAmountOutRaw: '13999' }),
+    Object.freeze({ ...facts, positionId: 'reason', sellReason: 'UNSUPPORTED' }),
+    Object.freeze({ ...facts, positionId: 'orphaned-close',
+      closeEventConfirmationStatus: 'orphaned' }),
+  ]);
+  const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
+  const repository = fakeRepository(async (progress) => {
+    recordedProgress.push(progress);
+    return Object.freeze({
+      ...runSnapshot.run,
+      counters: Object.freeze({
+        ...runSnapshot.run.counters,
+        ...progress.counters,
+        unknownTerminalPositions: progress.unknownPositions.length,
+      }),
+      updatedAtMs: progress.observedAtMs,
+    });
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => Object.freeze({
+      positions, creationsObserved: 0, entriesRejected: 0,
+      duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    }),
+  });
+
+  const result = await new PaperMvpCollector(repository, source, () => 8_000)
+    .collect({ runId: 'run-1', runnerOwnerId: OWNER, limit: 6 });
+
+  assert.deepEqual(result, {
+    scanned: 6, inserted: 6, valid: 0, unknown: 6,
+    duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+  });
+  assert.deepEqual(recordedProgress[0]?.unknownPositions, [
+    { positionId: 'retracted', reason: 'POSITION_RETRACTED' },
+    { positionId: 'missing-time', reason: 'MISSING_EXIT_TRIGGER_AT' },
+    { positionId: 'causal', reason: 'INVALID_TIMESTAMP_ORDER' },
+    { positionId: 'fill', reason: 'SOURCE_CONTRADICTION' },
+    { positionId: 'reason', reason: 'UNSUPPORTED_EXIT_REASON' },
+    { positionId: 'orphaned-close', reason: 'POSITION_RETRACTED' },
+  ]);
+});
+
+void test('defensively waits when a non-finalized close reaches the collector', async () => {
+  const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
+  const repository = fakeRepository(async (progress) => {
+    recordedProgress.push(progress);
+    return runSnapshot.run;
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => Object.freeze({
+      positions:Object.freeze([
+        Object.freeze({ ...validFacts(),closeEventConfirmationStatus:'confirmed' }),
+      ]),creationsObserved:0,entriesRejected:0,
+      duplicateLogicalBuys:0,duplicateLogicalSells:0,
+    }),
+  });
+
+  assert.deepEqual(await new PaperMvpCollector(repository,source,() => 8_000)
+    .collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 }), {
+    scanned:0,inserted:0,valid:0,unknown:0,
+    duplicateLogicalBuys:0,duplicateLogicalSells:0,
+  });
+  assert.equal(recordedProgress[0]?.samples.length,0);
+  assert.equal(recordedProgress[0]?.unknownPositions.length,0);
+});
+
+void test('uses one bounded set-wise PostgreSQL query with exact trade IDs and all-trade duplicates', async () => {
+  const queries: Readonly<{ text: string; values?: readonly unknown[] }>[] = [];
+  const source = new PostgresPaperMvpSource({
+    query: async (text, values) => {
+      queries.push(values === undefined ? { text } : { text, values });
+      return { rows: [], rowCount: 0 };
+    },
+  });
+
+  const result = await source.collectBatch({
+    runId: 'run-1', startedAtMs: 1_000, strategyId: 'creation-entry-v1',
+    strategyVersion: 1, deadlineAtMs: 61_000, observedAtMs: 2_000, limit: 100,
+  });
+
+  assert.deepEqual(result, {
+    positions: [], creationsObserved: 0, entriesRejected: 0,
+    duplicateLogicalBuys: 0, duplicateLogicalSells: 0, openedPositions: 0, openPositions: 0,
+  });
+  assert.equal(queries.length, 1);
+  assert.deepEqual(queries[0]?.values, [
+    'run-1', new Date(1_000), new Date(61_000), new Date(2_000), 'creation-entry-v1', 1, 100,
+  ]);
+  assert.match(queries[0]?.text ?? '', /NOT EXISTS[\s\S]*paper_mvp_position_samples/u);
+  assert.match(queries[0]?.text ?? '', /entry_trade_id/u);
+  assert.match(queries[0]?.text ?? '', /exit_trade_id/u);
+  assert.match(queries[0]?.text ?? '', /GREATEST\(COUNT\(\*\) FILTER[\s\S]*- 1, 0\)/u);
+  assert.match(queries[0]?.text ?? '', /opened_at <= \$3[\s\S]*closed_at <= \$3/u);
+  assert.match(queries[0]?.text ?? '', /close_event\.confirmation_status[\s\S]*finalized[\s\S]*orphaned/u);
+  assert.match(queries[0]?.text ?? '', /candidates AS MATERIALIZED[\s\S]*LIMIT \$7/u);
+  assert.match(queries[0]?.text ?? '', /run_creations AS MATERIALIZED[\s\S]*detected_at BETWEEN \$2 AND \$3/u);
+  assert.match(queries[0]?.text ?? '', /run_creations AS MATERIALIZED[\s\S]*LIMIT 1000001/u);
+  assert.match(queries[0]?.text ?? '', /rejected_entries AS MATERIALIZED[\s\S]*LIMIT 1000001/u);
+  assert.match(queries[0]?.text ?? '', /SELECT DISTINCT candidate\.mint[\s\S]*CREATION_ENTRY_REJECTED[\s\S]*CREATION_ENTRY_EXPIRED/u);
+  assert.match(queries[0]?.text ?? '', /candidate\.created_at BETWEEN \$2 AND \$3/u);
+  assert.doesNotMatch(queries[0]?.text ?? '', /FROM paper_trades trade JOIN eligible/u);
+  assert.equal((queries[0]?.text.match(
+    /position\.opened_at BETWEEN \$2 AND LEAST\(\$3::timestamptz,\$4::timestamptz\)/gu,
+  ) ?? []).length,2);
+  await source.collectBatch({
+    runId:'run-1',startedAtMs:1_000,deadlineAtMs:61_000,observedAtMs:62_000,
+    strategyId:'creation-entry-v1',strategyVersion:1,limit:100,
+  });
+  assert.deepEqual(queries[1]?.values, [
+    'run-1',new Date(1_000),new Date(61_000),new Date(62_000),'creation-entry-v1',1,100,
+  ]);
+  await assert.rejects(source.collectBatch({
+    runId: 'run-1', startedAtMs: 1_000, strategyId: 'creation-entry-v1',
+    strategyVersion: 1, deadlineAtMs: 61_000, limit: 1_001,
+  }), /limit/u);
+  assert.equal(queries.length, 2);
+});
+
+void test('counts exact opened and holding positions without sampling non-terminal facts', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL position coverage test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    await pool.query("DELETE FROM paper_positions WHERE position_id='position-retracted'");
+    await pool.query("UPDATE domain_events SET confirmation_status='finalized' WHERE event_id='close-event'");
+    await pool.query(`INSERT INTO token_launches (
+      mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+      created_signature,created_slot,created_transaction_index,created_instruction_index,
+      created_inner_instruction_index,detected_at,updated_at
+    ) VALUES
+      ('MINT-HOLDING','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+        'holding-signature',2,0,0,NULL,$1,$1),
+      ('MINT-BEFORE','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+        'before-signature',3,0,0,NULL,$2,$2),
+      ('MINT-AFTER','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+        'after-signature',4,0,0,NULL,$3,$3),
+      ('MINT-OTHER','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+        'other-signature',5,0,0,NULL,$1,$1)`, [new Date(1_800),new Date(900),new Date(2_100)]);
+    await pool.query(`INSERT INTO paper_positions (
+      position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+      strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+      round_trip_loss_bps,entry_trade_id,open_command_hash,trigger_event_id,
+      payload_version,payload,opened_at
+    ) VALUES
+      ('position-holding','MINT-HOLDING','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'holding-buy','holding-open','holding-source',1,'{}',$1),
+      ('position-before','MINT-BEFORE','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'before-buy','before-open','before-source',1,'{}',$2),
+      ('position-after','MINT-AFTER','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'after-buy','after-open','after-source',1,'{}',$3),
+      ('position-other','MINT-OTHER','SOL',9,'SPL_TOKEN','other-strategy',1,
+        'PAPER_HOLDING',100,100,1000,0,'other-buy','other-open','other-source',1,'{}',$1)`,
+    [new Date(1_800),new Date(900),new Date(2_100)]);
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(runSnapshot.run.configuration,OWNER,1_000);
+    const source = new PostgresPaperMvpSource(pool);
+
+    const batch = await source.collectBatch({
+      runId:run.runId,startedAtMs:run.startedAtMs,deadlineAtMs:run.deadlineAtMs,
+      observedAtMs:2_000,strategyId:'creation-entry-v1',strategyVersion:1,limit:10,
+    });
+
+    assert.equal(batch.openedPositions,2);
+    assert.equal(batch.openPositions,1);
+    assert.deepEqual(batch.positions.map((position) => position.positionId),['position-1']);
+
+    assert.deepEqual(await new PaperMvpCollector(repository,source,() => 2_000).collect({
+      runId:run.runId,runnerOwnerId:OWNER,limit:10,
+    }), {
+      scanned:1,inserted:1,valid:1,unknown:0,
+      duplicateLogicalBuys:1,duplicateLogicalSells:1,
+    });
+    const stored = await repository.load(run.runId);
+    assert.deepEqual([stored?.run.counters.openedPositions,stored?.run.counters.openPositions],[2,1]);
+    assert.deepEqual(stored?.samples.map((sample) => sample.positionId),['position-1']);
+    assert.deepEqual(stored?.unknownPositions,[]);
+  });
+});
+
+void test('caps live PostgreSQL position coverage at the immutable run deadline', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL deadline coverage test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    await pool.query('DELETE FROM paper_trades');
+    await pool.query('DELETE FROM paper_positions');
+    await pool.query(`INSERT INTO token_launches (
+      mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+      created_signature,created_slot,created_transaction_index,created_instruction_index,
+      created_inner_instruction_index,detected_at,updated_at
+    ) VALUES ('MINT-GRACE','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+      'grace-signature',2,0,0,NULL,$1,$1)`, [new Date(61_500)]);
+    await pool.query(`INSERT INTO paper_positions (
+      position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+      strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+      round_trip_loss_bps,entry_trade_id,open_command_hash,trigger_event_id,
+      payload_version,payload,opened_at
+    ) VALUES
+      ('position-before-deadline','MINT','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'before-buy','before-open','before-source',1,'{}',$1),
+      ('position-during-grace','MINT-GRACE','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+        'PAPER_HOLDING',100,100,1000,0,'grace-buy','grace-open','grace-source',1,'{}',$2)`,
+    [new Date(60_000),new Date(61_500)]);
+
+    const batch = await new PostgresPaperMvpSource(pool).collectBatch({
+      runId:'run-deadline',startedAtMs:1_000,deadlineAtMs:61_000,observedAtMs:62_000,
+      strategyId:'creation-entry-v1',strategyVersion:1,limit:10,
+    });
+
+    assert.equal(batch.openedPositions,1);
+    assert.equal(batch.openPositions,1);
+    assert.deepEqual(batch.positions,[]);
+  });
+});
+
+void test('collects and replays exact PostgreSQL facts before source retention', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL collector test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(runSnapshot.run.configuration, OWNER, 1_000);
+    assert.equal((await pool.query('SELECT 1 FROM paper_positions')).rowCount, 2);
+    assert.equal((await pool.query('SELECT 1 FROM paper_trades')).rowCount, 4);
+    const collector = new PaperMvpCollector(
+      repository, new PostgresPaperMvpSource(pool), () => 2_000,
+    );
+
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:1 }), {
+      scanned:1,inserted:1,valid:0,unknown:1,
+      duplicateLogicalBuys:0,duplicateLogicalSells:0,
+    });
+    assert.equal((await repository.load(run.runId))?.samples.length,0);
+    await pool.query("UPDATE domain_events SET confirmation_status='finalized' WHERE event_id='close-event'");
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:1 }), {
+      scanned:1,inserted:1,valid:1,unknown:0,
+      duplicateLogicalBuys:1,duplicateLogicalSells:1,
+    });
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:1 }), {
+      scanned:0,inserted:0,valid:0,unknown:0,
+      duplicateLogicalBuys:1,duplicateLogicalSells:1,
+    });
+    const stored = await repository.load(run.runId);
+    assert.equal(stored?.samples[0]?.creationDetectedAtMs, 1_100);
+    assert.equal(stored?.samples[0]?.entryDecisionAtMs, 1_200);
+    assert.equal(stored?.samples[0]?.entryQuoteAtMs, 1_300);
+    assert.equal(stored?.samples[0]?.paperBuyAtMs, 1_400);
+    assert.equal(stored?.samples[0]?.exitTriggerAtMs, 1_500);
+    assert.equal(stored?.samples[0]?.exitQuoteAtMs, 1_600);
+    assert.equal(stored?.samples[0]?.paperSellAtMs, 1_700);
+    assert.equal(stored?.samples[0]?.buyAmountInRaw, 9_007_199_254_740_993n);
+    assert.deepEqual(stored?.unknownPositions, [
+      { positionId:'position-retracted',reason:'POSITION_RETRACTED' },
+    ]);
+  });
+});
+
+void test('waits on a confirmed close and records only UNKNOWN after its orphan replay', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL close finality test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    await pool.query("DELETE FROM paper_positions WHERE position_id='position-retracted'");
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(runSnapshot.run.configuration, OWNER, 1_000);
+    const collector = new PaperMvpCollector(
+      repository,new PostgresPaperMvpSource(pool),() => 2_000,
+    );
+
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:10 }), {
+      scanned:0,inserted:0,valid:0,unknown:0,
+      duplicateLogicalBuys:0,duplicateLogicalSells:0,
+    });
+    await pool.query("UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id='close-event'");
+    await pool.query("UPDATE paper_positions SET status='PAPER_RETRACTED' WHERE position_id='position-1'");
+    assert.deepEqual(await collector.collect({ runId:run.runId,runnerOwnerId:OWNER,limit:10 }), {
+      scanned:1,inserted:1,valid:0,unknown:1,
+      duplicateLogicalBuys:1,duplicateLogicalSells:1,
+    });
+    const stored = await repository.load(run.runId);
+    assert.equal(stored?.samples.length,0);
+    assert.deepEqual(stored?.unknownPositions,[
+      { positionId:'position-1',reason:'POSITION_RETRACTED' },
+    ]);
+  });
+});
+
+void test('retains sampled expired position coverage until the active run terminalizes', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL decision job retention test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const now = Date.now();
+    const expiredAt = now - 1_000;
+    const startedAt = now - 61_000;
+    const sourceTerminalAt = expiredAt - 14_400_000;
+    await pool.query(`UPDATE token_launches SET detected_at=$2,updated_at=$2,
+      terminal_at=$3,purge_after=$3 WHERE mint=$1`, [
+      'MINT',new Date(startedAt - 1),new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE paper_decision_jobs SET
+      created_at=$2,updated_at=$3,terminal_at=$3,purge_after=$4
+      WHERE job_id=$1`, [
+      `paper_job_${'a'.repeat(64)}`,new Date(sourceTerminalAt - 1_000),
+      new Date(sourceTerminalAt),new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE domain_events SET terminal_at=$2,purge_after=$3
+      WHERE event_id=$1`, ['source-open',new Date(sourceTerminalAt),new Date(expiredAt)]);
+    await pool.query(`UPDATE raw_chain_events SET terminal_at=$2,purge_after=$3
+      WHERE event_id=$1`, ['raw-open',new Date(sourceTerminalAt),new Date(expiredAt)]);
+    await pool.query(`UPDATE paper_positions SET opened_at=$2,closed_at=$3,purge_after=$4
+      WHERE position_id=$1`, [
+      'position-1',new Date(startedAt + 4_000),new Date(startedAt + 8_000),new Date(expiredAt),
+    ]);
+    await seedExpiredVenueEvidence(pool,new Date(expiredAt));
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(runSnapshot.run.configuration,OWNER,startedAt);
+    const sample = createPaperMvpPositionSample({
+      positionId:'position-1',mint:'MINT',quoteMint:'SOL',exitReason:'TAKE_PROFIT_2X_EXECUTABLE',
+      creationDetectedAtMs:startedAt - 1,entryDecisionAtMs:startedAt + 2_000,
+      entryQuoteAtMs:startedAt + 3_000,paperBuyAtMs:startedAt + 4_000,
+      exitTriggerAtMs:startedAt + 5_000,exitQuoteAtMs:startedAt + 6_000,
+      paperSellAtMs:startedAt + 8_000,buyAmountInRaw:1_000n,buyAmountOutRaw:110n,
+      buyMinimumAmountOutRaw:100n,buyFeesRaw:1n,buySlippageBps:10n,
+      buyPriceImpactBps:20n,sellAmountInRaw:100n,sellAmountOutRaw:2_001n,
+      sellMinimumAmountOutRaw:2_000n,sellFeesRaw:1n,sellSlippageBps:11n,
+      sellPriceImpactBps:21n,networkFeeRawPerTransaction:5_000n,
+    });
+    const progressed = await repository.recordProgress({
+      runId:run.runId,runnerOwnerId:OWNER,expectedUpdatedAtMs:run.updatedAtMs,
+      observedAtMs:now,counters:Object.freeze({
+        creationsObserved:1,entriesRejected:0,duplicateLogicalBuys:0,duplicateLogicalSells:0,
+        openedPositions:1,openPositions:0,
+      }),providerUsage:run.providerUsage,samples:Object.freeze([sample]),
+      unknownPositions:Object.freeze([]),
+    });
+
+    const protectedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.paperDecisionJobs,0);
+    assert.equal(protectedPurge.paperTrades,0);
+    assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM paper_positions WHERE position_id='position-1'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM paper_trades WHERE position_id='position-1'")).rowCount,4);
+    assert.equal((await pool.query("SELECT 1 FROM token_launches WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM bonding_curve_snapshots WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM launch_trades WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM market_trades WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM market_reserve_snapshots WHERE pool_address='POOL'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id IN ('curve-trade','migration-event','activation-event')")).rowCount,3);
+    const coverage = await new PostgresPaperMvpSource(pool).collectBatch({
+      runId:run.runId,startedAtMs:run.startedAtMs,deadlineAtMs:run.deadlineAtMs,
+      observedAtMs:now,strategyId:'creation-entry-v1',strategyVersion:1,limit:10,
+    });
+    assert.equal(coverage.openedPositions,1);
+    assert.equal(coverage.openPositions,0);
+    assert.deepEqual(coverage.positions,[]);
+
+    await repository.terminalize({
+      runId:run.runId,runnerOwnerId:OWNER,terminalAtMs:progressed.updatedAtMs,
+      state:'FAILED',completionReason:null,report:null,failureCode:'TEST_TERMINAL',
+    });
+    const releasedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(releasedPurge.paperDecisionJobs,1);
+    assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM paper_positions WHERE position_id='position-1'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM paper_trades WHERE position_id='position-1'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM token_launches WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM bonding_curve_snapshots WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM launch_trades WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_trades WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_reserve_snapshots WHERE pool_address='POOL'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id IN ('curve-trade','migration-event','activation-event')")).rowCount,0);
+  });
+});
+
+void test('retains holding jobs and positions closed after deadline for an active run', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL active position retention test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const now = Date.now();
+    const startedAt = now - 60_001;
+    const deadlineAt = startedAt + 60_000;
+    const expiredAt = now - 1;
+    const jobTerminalAt = expiredAt - 14_400_000;
+    const holdingJobId = `paper_job_${'a'.repeat(64)}`;
+    const lateJobId = `paper_job_${'c'.repeat(64)}`;
+    await pool.query(`UPDATE paper_decision_jobs SET created_at=$2,updated_at=$3,
+      terminal_at=$3,purge_after=$4 WHERE job_id=$1`, [
+      holdingJobId,new Date(jobTerminalAt - 1_000),new Date(jobTerminalAt),new Date(expiredAt),
+    ]);
+    await pool.query(`INSERT INTO paper_decision_jobs (
+      job_id,mint,source_event_id,source_raw_event_id,source_confirmation_status,
+      input_fingerprint,status,max_attempts,base_delay_ms,created_at,updated_at,
+      terminal_at,purge_after,payload_version,payload
+    ) VALUES ($1,'MINT','source-open','raw-open','confirmed',$2,'COMPLETED',3,100,
+      $3,$4,$4,$5,1,'{}')`, [
+      lateJobId,'d'.repeat(64),new Date(jobTerminalAt - 1_000),new Date(jobTerminalAt),
+      new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE paper_positions SET status='PAPER_HOLDING',opened_at=$2,
+      closed_at=NULL,purge_after=NULL,entry_decision_at=$3 WHERE position_id=$1`, [
+      'position-1',new Date(startedAt + 1_000),new Date(startedAt),
+    ]);
+    await pool.query(`INSERT INTO paper_positions (
+      position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+      strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+      quote_proceeds_raw,gross_pnl_quote_raw,net_pnl_quote_raw,round_trip_loss_bps,
+      entry_trade_id,exit_trade_id,open_command_hash,close_command_hash,trigger_event_id,
+      payload_version,payload,opened_at,closed_at,purge_after,entry_decision_at,
+      entry_decision_job_id
+    ) VALUES ('position-after-deadline','MINT','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+      'PAPER_CLOSED',1,0,1,1,0,0,0,'late-buy','late-sell','late-open','late-close',
+      'source-open',1,'{}',$1,$2,$2,$3,$4)`, [
+      new Date(startedAt + 2_000),new Date(deadlineAt + 1),new Date(startedAt + 1_000),lateJobId,
+    ]);
+    const tradeSql = `INSERT INTO paper_trades (
+      trade_id,position_id,side,quote_id,input_mint,output_mint,amount_in_raw,
+      amount_out_raw,minimum_amount_out_raw,fill_amount_out_raw,fees_raw,slippage_bps,
+      price_impact_bps,reason,payload_version,payload,created_at,quote_observed_at
+    ) VALUES ($1,'position-after-deadline',$2,$3,$4,$5,1,1,1,1,0,0,0,$6,1,'{}',$7,$7)`;
+    await pool.query(tradeSql, ['late-buy','BUY','late-buy-quote','SOL','MINT',
+      'QUALIFIED_ENTRY',new Date(deadlineAt)]);
+    await pool.query(tradeSql, ['late-sell','SELL','late-sell-quote','MINT','SOL',
+      'MANUAL_KILL_SWITCH',new Date(deadlineAt + 1)]);
+    const repository = new PostgresPaperMvpRepository(pool);
+    await repository.startOrResume(runSnapshot.run.configuration,OWNER,startedAt);
+
+    const protectedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.paperDecisionJobs,0);
+    assert.equal(protectedPurge.paperTrades,0);
+    assert.equal((await pool.query('SELECT job_id FROM paper_decision_jobs')).rowCount,2);
+    assert.equal((await pool.query("SELECT 1 FROM paper_positions WHERE position_id='position-1'")).rowCount,1);
+    assert.equal((await pool.query(
+      "SELECT 1 FROM paper_positions WHERE position_id='position-after-deadline'",
+    )).rowCount,1);
+    assert.equal((await pool.query(
+      "SELECT 1 FROM paper_trades WHERE position_id='position-after-deadline'",
+    )).rowCount,2);
+  });
+});
+
+void test('fails an abandoned run deterministically and releases its retained sources', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL abandoned run test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const now = Date.now();
+    const expiredAt = now - 1_000;
+    const jobTerminalAt = expiredAt - 14_400_000;
+    const startedAt = now - 181_000;
+    const expectedTerminalAt = startedAt + 60_000 + 120_000;
+    await pool.query(`UPDATE token_launches SET detected_at=$1,updated_at=$1,
+      terminal_at=$2,purge_after=$2 WHERE mint='MINT'`, [
+      new Date(startedAt - 1),new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE paper_decision_jobs SET
+      updated_at=$2,terminal_at=$2,purge_after=$3 WHERE job_id=$1`, [
+      `paper_job_${'a'.repeat(64)}`,new Date(jobTerminalAt),new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE domain_events SET terminal_at=$1,purge_after=$1
+      WHERE event_id='source-open'`, [new Date(expiredAt)]);
+    await pool.query(`UPDATE raw_chain_events SET terminal_at=$1,purge_after=$1
+      WHERE event_id='raw-open'`, [new Date(expiredAt)]);
+    await pool.query(`UPDATE paper_positions SET opened_at=$1,closed_at=$2,purge_after=$3
+      WHERE position_id='position-1'`, [
+      new Date(startedAt + 1_000),new Date(startedAt + 2_000),new Date(expiredAt),
+    ]);
+    await seedExpiredVenueEvidence(pool,new Date(expiredAt));
+    const repository = new PostgresPaperMvpRepository(pool);
+    const abandoned = await repository.startOrResume(runSnapshot.run.configuration, OWNER, startedAt);
+
+    await purgeExpiredFoundationData(pool);
+
+    const failed = await repository.load(abandoned.runId);
+    assert.equal(failed?.run.state,'FAILED');
+    assert.equal(failed?.run.failureCode,'RUN_DEADLINE_ABANDONED');
+    assert.equal(failed?.run.terminalAtMs,expectedTerminalAt);
+    assert.equal(failed?.run.purgeAfterMs,expectedTerminalAt + 14_400_000);
+    assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM bonding_curve_snapshots WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM launch_trades WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_trades WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_reserve_snapshots WHERE pool_address='POOL'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,0);
+    const replacement = await repository.startOrResume(runSnapshot.run.configuration, OWNER, now);
+    assert.notEqual(replacement.runId,abandoned.runId);
+
+    await repository.terminalize({
+      runId:replacement.runId,runnerOwnerId:OWNER,terminalAtMs:now,
+      state:'FAILED',completionReason:null,report:null,
+      failureCode:'TEST_TERMINAL',
+    });
+    const ancientStartedAt = now - 14_400_000 - 181_000;
+    const ancient = await repository.startOrResume(
+      runSnapshot.run.configuration,OWNER,ancientStartedAt,
+    );
+    const finalPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(finalPurge.paperMvpRuns,1);
+    assert.equal(await repository.load(ancient.runId),null);
+  });
+});
+
+void test('serializes active-run terminalization across the complete retention transaction', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL retention serialization test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const now = Date.now();
+    const startedAt = now - 61_000;
+    const expiredAt = now - 1_000;
+    await pool.query(`UPDATE token_launches SET detected_at=$1,updated_at=$1,
+      terminal_at=$2,purge_after=$2 WHERE mint='MINT'`, [
+      new Date(startedAt - 1),new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE paper_positions SET opened_at=$1,closed_at=$2,purge_after=$3
+      WHERE position_id='position-1'`, [
+      new Date(startedAt + 4_000),new Date(startedAt + 8_000),new Date(expiredAt),
+    ]);
+    await seedExpiredVenueEvidence(pool,new Date(expiredAt));
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(runSnapshot.run.configuration,OWNER,startedAt);
+    const advisoryKey = 4_900_055;
+    await pool.query(`CREATE FUNCTION block_retracted_position_purge()
+      RETURNS trigger LANGUAGE plpgsql AS $function$
+      BEGIN
+        IF OLD.position_id='position-retracted' THEN
+          PERFORM pg_advisory_lock(${advisoryKey});
+          PERFORM pg_advisory_unlock(${advisoryKey});
+        END IF;
+        RETURN OLD;
+      END
+      $function$`);
+    await pool.query(`CREATE TRIGGER block_retracted_position_purge_trigger
+      BEFORE DELETE ON paper_positions FOR EACH ROW
+      EXECUTE FUNCTION block_retracted_position_purge()`);
+    const blocker = await pool.connect();
+    let blockerLocked = false;
+    let purge: Promise<Awaited<ReturnType<typeof purgeExpiredFoundationData>>> | undefined;
+    let terminalization: Promise<unknown> | undefined;
+    try {
+      await blocker.query('SELECT pg_advisory_lock($1)',[advisoryKey]);
+      blockerLocked = true;
+      purge = purgeExpiredFoundationData(pool);
+      await waitForDatabaseWait(pool,'%DELETE FROM paper_positions position%');
+      terminalization = repository.terminalize({
+        runId:run.runId,runnerOwnerId:OWNER,terminalAtMs:now,
+        state:'FAILED',completionReason:null,report:null,failureCode:'TEST_TERMINAL',
+      });
+      await waitForDatabaseWait(pool,'%pg_advisory_xact_lock_shared%');
+      await blocker.query('SELECT pg_advisory_unlock($1)',[advisoryKey]);
+      blockerLocked = false;
+      await purge;
+      await terminalization;
+    } finally {
+      if (blockerLocked) await blocker.query('SELECT pg_advisory_unlock($1)',[advisoryKey]);
+      blocker.release();
+      await Promise.allSettled([purge,terminalization].filter((value) => value !== undefined));
+    }
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id='migration-event'")).rowCount,1);
+    await purgeExpiredFoundationData(pool);
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id='migration-event'")).rowCount,0);
+  });
+});
+
+void test('excludes rejected candidates created after the immutable run deadline', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL rejection-window test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const reportId = `qreport_${'c'.repeat(64)}`;
+    await pool.query(`INSERT INTO qualification_reports (
+      report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
+      profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
+      preparation_score,social_score,onchain_score,total_score,as_of_slot,
+      as_of_transaction_index,as_of_instruction_index,confirmation_status,evaluated_at,
+      purge_after,payload_version,payload
+    ) VALUES ($1,'MINT','source-open','raw-open','source-open','profile',1,$2,$3,
+      'REJECTED',0,0,0,0,1,0,0,'confirmed',$4,$5,1,'{}')`, [
+      reportId, 'd'.repeat(64), 'e'.repeat(64), new Date(1_200), new Date(14_401_200),
+    ]);
+    await pool.query(`INSERT INTO trading_candidates (
+      candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
+      strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,
+      quote_decimals,quote_token_program,reason_codes,created_at,purge_after,
+      payload_version,payload
+    ) VALUES ($1,'MINT',$2,'source-open','source-open','creation-entry-v1',1,$3,
+      'confirmed','NOT_ELIGIBLE','SOL',9,'SPL_TOKEN',$4,$5,$6,1,'{}')`, [
+      `candidate_${'f'.repeat(64)}`, reportId, 'a'.repeat(64),
+      JSON.stringify(['CREATION_ENTRY_REJECTED']), new Date(62_000), new Date(14_462_000),
+    ]);
+
+    const batch = await new PostgresPaperMvpSource(pool).collectBatch({
+      runId: 'run-window', startedAtMs: 1_000, deadlineAtMs: 61_000,
+      strategyId: 'creation-entry-v1', strategyVersion: 1, limit: 10,
+    });
+    assert.equal(batch.creationsObserved, 1);
+    assert.equal(batch.entriesRejected, 0);
+  });
+});
+
+void test('retains inclusive-window launch and rejected candidate coverage only while the run is active', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL coverage retention test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    await pool.query('DELETE FROM paper_trades');
+    await pool.query('DELETE FROM paper_positions');
+    await pool.query('DELETE FROM paper_decision_jobs');
+    await pool.query("DELETE FROM domain_events WHERE event_id='close-event'");
+    const deadlineAt = Date.now();
+    const startedAt = deadlineAt - 14_400_000;
+    await pool.query(`UPDATE token_launches SET detected_at=$1,updated_at=$2,
+      terminal_at=$2,purge_after=$2 WHERE mint='MINT'`, [new Date(deadlineAt),new Date(startedAt)]);
+    const reportId = `qreport_${'c'.repeat(64)}`;
+    await pool.query(`INSERT INTO qualification_reports (
+      report_id,mint,source_event_id,source_raw_event_id,qualification_event_id,
+      profile_id,profile_version,profile_fingerprint,evidence_fingerprint,verdict,
+      preparation_score,social_score,onchain_score,total_score,as_of_slot,
+      as_of_transaction_index,as_of_instruction_index,confirmation_status,evaluated_at,
+      purge_after,payload_version,payload
+    ) VALUES ($1,'MINT','source-open','raw-open','source-open','profile',1,$2,$3,
+      'REJECTED',0,0,0,0,1,0,0,'confirmed',$4,$5,1,'{}')`, [
+      reportId,'d'.repeat(64),'e'.repeat(64),new Date(startedAt),new Date(deadlineAt),
+    ]);
+    const candidateId = `candidate_${'f'.repeat(64)}`;
+    await pool.query(`INSERT INTO trading_candidates (
+      candidate_id,mint,report_id,source_event_id,candidate_event_id,strategy_id,
+      strategy_version,evidence_fingerprint,confirmation_status,state,quote_mint,
+      quote_decimals,quote_token_program,reason_codes,created_at,purge_after,
+      payload_version,payload
+    ) VALUES ($1,'MINT',$2,'source-open','source-open','creation-entry-v1',1,$3,
+      'confirmed','NOT_ELIGIBLE','SOL',9,'SPL_TOKEN',$4,$5,$6,1,'{}')`, [
+      candidateId,reportId,'a'.repeat(64),JSON.stringify(['CREATION_ENTRY_REJECTED']),
+      new Date(startedAt),new Date(deadlineAt),
+    ]);
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(Object.freeze({
+      ...runSnapshot.run.configuration,maxDurationMs:14_400_000,
+    }),OWNER,startedAt);
+
+    const protectedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.tradingCandidates,0);
+    assert.equal(protectedPurge.tokenLaunches,0);
+    assert.equal((await pool.query('SELECT 1 FROM trading_candidates')).rowCount,1);
+    assert.equal((await pool.query('SELECT 1 FROM token_launches')).rowCount,1);
+
+    await repository.terminalize({
+      runId:run.runId,runnerOwnerId:OWNER,terminalAtMs:deadlineAt,
+      state:'FAILED',completionReason:null,report:null,failureCode:'TEST_TERMINAL',
+    });
+    const releasedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(releasedPurge.tradingCandidates,1);
+    assert.equal(releasedPurge.tokenLaunches,1);
+    assert.equal((await pool.query('SELECT 1 FROM trading_candidates')).rowCount,0);
+    assert.equal((await pool.query('SELECT 1 FROM token_launches')).rowCount,0);
+  });
+});
+
+function fakeRepository(
+  recordProgress: PaperMvpRepository['recordProgress'],
+): PaperMvpRepository {
+  return Object.freeze({
+    startOrResume: async () => runSnapshot.run,
+    load: async () => runSnapshot,
+    recordProgress,
+    terminalize: async () => runSnapshot.run,
+  });
+}
+
+async function interleavedCollections(samePosition: boolean): Promise<Readonly<{
+  first: Awaited<ReturnType<PaperMvpCollector['collect']>>;
+  second: Awaited<ReturnType<PaperMvpCollector['collect']>>;
+  snapshot: PaperMvpRunSnapshot;
+}>> {
+  let snapshot = runSnapshot;
+  const sampled = new Set<string>();
+  let releaseFirst: (() => void) | undefined;
+  const firstMayContinue = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let firstEntered: (() => void) | undefined;
+  const firstSourceEntered = new Promise<void>((resolve) => { firstEntered = resolve; });
+  let sourceCalls = 0;
+  const repository: PaperMvpRepository = Object.freeze({
+    startOrResume: async () => snapshot.run,
+    load: async () => snapshot,
+    recordProgress: async (progress: Parameters<PaperMvpRepository['recordProgress']>[0]) => {
+      if (progress.expectedUpdatedAtMs !== snapshot.run.updatedAtMs) {
+        throw new PaperMvpConflictError('PROGRESS_SNAPSHOT_STALE');
+      }
+      if (progress.observedAtMs <= snapshot.run.updatedAtMs) {
+        throw new PaperMvpConflictError('PROGRESS_REGRESSION');
+      }
+      for (const sample of progress.samples) sampled.add(sample.positionId);
+      snapshot = Object.freeze({
+        ...snapshot,
+        run: Object.freeze({
+          ...snapshot.run,
+          counters: Object.freeze({
+            ...snapshot.run.counters,
+            ...progress.counters,
+          }),
+          closedPositions: sampled.size,
+          updatedAtMs: progress.observedAtMs,
+        }),
+      });
+      return snapshot.run;
+    },
+    terminalize: async () => snapshot.run,
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => {
+      sourceCalls += 1;
+      if (sourceCalls === 1) {
+        firstEntered?.();
+        await firstMayContinue;
+      }
+      const positionId = sourceCalls === 2 && !samePosition ? 'position-2' : 'position-1';
+      const alreadySampled = sampled.has(positionId);
+      return Object.freeze({
+        positions: alreadySampled ? Object.freeze([]) : Object.freeze([
+          Object.freeze({ ...validFacts(), positionId }),
+        ]),
+        creationsObserved: 0,
+        entriesRejected: 0,
+        duplicateLogicalBuys: alreadySampled ? 0 : sourceCalls === 2 ? 6 : 5,
+        duplicateLogicalSells: 0,
+      });
+    },
+  });
+  const firstCollector = new PaperMvpCollector(repository,source,() => 2_000);
+  const secondCollector = new PaperMvpCollector(repository,source,() => 2_000);
+  const firstPromise = firstCollector.collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 });
+  await firstSourceEntered;
+  const second = await secondCollector.collect({ runId:'run-1',runnerOwnerId:OWNER,limit:1 });
+  releaseFirst?.();
+  const first = await firstPromise;
+  return Object.freeze({ first,second,snapshot });
+}
+
+function validFacts(): Awaited<ReturnType<PaperMvpSource['collectBatch']>>['positions'][number] {
+  return Object.freeze({
+    positionId: 'position-1', status: 'PAPER_CLOSED', mint: 'MINT', quoteMint: 'SOL',
+    creationDetectedAtMs: 1_100, entryDecisionAtMs: 1_200,
+    entryDecisionJobCount: 1, entryDecisionJobAtMs: 1_200,
+    entryQuoteAtMs: 1_300, paperBuyAtMs: 1_400,
+    exitTriggerAtMs: 1_500, closeEventId: 'close-event-1',
+    closeEventType: 'PaperPositionClosed', closeEventSource: 'paper-trading',
+    closeEventConfirmationStatus: 'finalized',closeEventObservedAtMs: 1_500,
+    exitQuoteAtMs: 1_600, paperSellAtMs: 1_700,
+    entryTradeId: 'buy-1', buyTradeId: 'buy-1', buySide: 'BUY',
+    buyInputMint: 'SOL', buyOutputMint: 'MINT',
+    buyAmountInRaw: '9007199254740993', buyAmountOutRaw: '15000',
+    buyMinimumAmountOutRaw: '14000', buyFillAmountOutRaw: '14000',
+    buyFeesRaw: '10', buySlippageBps: '100', buyPriceImpactBps: '20',
+    exitTradeId: 'sell-1', sellTradeId: 'sell-1', sellSide: 'SELL',
+    sellInputMint: 'MINT', sellOutputMint: 'SOL', sellReason: 'TAKE_PROFIT_2X_EXECUTABLE',
+    sellAmountInRaw: '14000', sellAmountOutRaw: '10000000000000000',
+    sellMinimumAmountOutRaw: '9500000000000000', sellFillAmountOutRaw: '9500000000000000',
+    sellFeesRaw: '11', sellSlippageBps: '101', sellPriceImpactBps: '21',
+  });
+}
+
+async function withSchema(
+  databaseUrl: string,
+  operation: (pool: InstanceType<typeof pg.Pool>) => Promise<void>,
+): Promise<void> {
+  const schema = `paper_mvp_collector_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString:databaseUrl });
+  const pool = new pg.Pool({ connectionString:databaseUrl,options:`-c search_path=${schema}` });
+  try {
+    await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+    await migrateDatabase({ pool });
+    await operation(pool);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+    await admin.end();
+  }
+}
+
+async function seedPostgresFacts(pool: InstanceType<typeof pg.Pool>): Promise<void> {
+  const date = (ms:number):Date => new Date(ms);
+  await pool.query(`INSERT INTO token_launches (
+    mint,launchpad,program_id,creator,token_program,quote_assets,current_state,
+    created_signature,created_slot,created_transaction_index,created_instruction_index,
+    created_inner_instruction_index,detected_at,updated_at
+  ) VALUES ('MINT','pumpfun','pump','creator','SPL_TOKEN','[]','ACTIVE',
+    'signature',1,0,0,NULL,$1,$1)`, [date(1_100)]);
+  await pool.query(`INSERT INTO raw_chain_events (
+    event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+    confirmation_status,observed_at,payload_version,payload
+  ) VALUES ('raw-open','pumpfun','pump','MINT','signature',1,0,0,
+    'confirmed',$1,1,'{}')`, [date(1_100)]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+    instruction_index,confirmation_status,observed_at,payload_version,payload
+  ) VALUES ('source-open','raw-open','TokenLaunchDetected','MINT','pumpfun','pump',
+    'signature',1,0,0,'confirmed',$1,1,'{}')`, [date(1_100)]);
+  const jobId = `paper_job_${'a'.repeat(64)}`;
+  await pool.query(`INSERT INTO paper_decision_jobs (
+    job_id,mint,source_event_id,source_raw_event_id,source_confirmation_status,
+    input_fingerprint,status,max_attempts,base_delay_ms,created_at,updated_at,
+    terminal_at,purge_after,payload_version,payload
+  ) VALUES ($1,'MINT','source-open','raw-open','confirmed',$2,'COMPLETED',3,100,
+    $3,$4,$4,$5,1,$6)`, [jobId,'b'.repeat(64),date(1_200),date(1_400),
+    date(1_400 + 14_400_000),JSON.stringify({ result:{ requestedAction:'OPEN',sessionId:'session' } })]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,type,mint,source,program,signature,slot,transaction_index,
+    instruction_index,confirmation_status,observed_at,payload_version,payload,
+    terminal_at,purge_after
+  ) VALUES ('close-event','PaperPositionClosed','MINT','paper-trading','pump',
+    'close-signature',2,0,0,'confirmed',$1,1,'{}',$2,$3)`, [
+    date(1_500),date(1_700),date(1_700 + 14_400_000),
+  ]);
+  await pool.query(`INSERT INTO paper_positions (
+    position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+    strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+    quote_proceeds_raw,gross_pnl_quote_raw,net_pnl_quote_raw,round_trip_loss_bps,
+    entry_trade_id,exit_trade_id,open_command_hash,close_command_hash,trigger_event_id,
+    payload_version,payload,opened_at,closed_at,purge_after,strategy_session_id,
+    entry_decision_at,entry_decision_job_id,close_event_id,exit_trigger_at
+  ) VALUES ('position-1','MINT','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+    'PAPER_CLOSED',14000,0,9007199254740993,9500000000000000,1,1,100,
+    'buy-1','sell-1','open-hash','close-hash','source-open',1,'{}',$1,$2,$3,
+    'session',$4,$5,'close-event',$6)`, [date(1_400),date(1_700),
+    date(1_700 + 14_400_000),date(1_200),jobId,date(1_500)]);
+  await pool.query('ALTER TABLE paper_trades DROP CONSTRAINT paper_trades_position_id_side_key');
+  const tradeSql = `INSERT INTO paper_trades (
+    trade_id,position_id,side,quote_id,input_mint,output_mint,amount_in_raw,
+    amount_out_raw,minimum_amount_out_raw,fill_amount_out_raw,fees_raw,slippage_bps,
+    price_impact_bps,reason,payload_version,payload,created_at,quote_observed_at
+  ) VALUES ($1,'position-1',$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11,$12,1,'{}',$13,$14)`;
+  await pool.query(tradeSql, ['buy-1','BUY','buy-quote','SOL','MINT','9007199254740993',
+    '15000','14000','10','100','20','QUALIFIED_ENTRY',date(1_400),date(1_300)]);
+  await pool.query(tradeSql, ['buy-duplicate','BUY','buy-quote-2','SOL','MINT','1',
+    '1','1','0','0','0','QUALIFIED_ENTRY',date(1_401),date(1_301)]);
+  await pool.query(tradeSql, ['sell-1','SELL','sell-quote','MINT','SOL','14000',
+    '10000000000000000','9500000000000000','11','101','21',
+    'TAKE_PROFIT_2X_EXECUTABLE',date(1_700),date(1_600)]);
+  await pool.query(tradeSql, ['sell-duplicate','SELL','sell-quote-2','MINT','SOL','1',
+    '1','1','0','0','0','TAKE_PROFIT_2X_EXECUTABLE',date(1_701),date(1_601)]);
+  await pool.query(`INSERT INTO paper_positions (
+    position_id,mint,quote_mint,quote_decimals,quote_token_program,strategy_id,
+    strategy_version,status,base_filled_raw,remaining_base_raw,quote_cost_raw,
+    round_trip_loss_bps,entry_trade_id,open_command_hash,trigger_event_id,payload_version,
+    payload,opened_at,closed_at,purge_after
+  ) VALUES ('position-retracted','MINT','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
+    'PAPER_RETRACTED',1,1,1,0,'missing-buy','open-hash-2','source-open',1,'{}',
+    $1,$2,$3)`, [date(1_500),date(1_800),date(1_800 + 14_400_000)]);
+}
+
+async function seedExpiredVenueEvidence(
+  pool:InstanceType<typeof pg.Pool>,purgeAfter:Date,
+):Promise<void> {
+  await pool.query(`INSERT INTO bonding_curve_snapshots (
+    snapshot_id,mint,quote_mint,quote_decimals,quote_token_program,
+    real_base_reserves_raw,real_quote_reserves_raw,virtual_base_reserves_raw,
+    virtual_quote_reserves_raw,progress_bps,complete,slot,transaction_index,
+    instruction_index,confirmation_status,purge_after
+  ) VALUES ('curve-snapshot','MINT','SOL',9,'SPL_TOKEN',100,200,300,400,5000,
+    false,2,0,0,'confirmed',$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO launch_trades (
+    trade_id,mint,trade_kind,trader,base_amount_raw,quote_amount_raw,quote_mint,
+    quote_decimals,quote_token_program,slot,transaction_index,instruction_index,
+    confirmation_status,purge_after
+  ) VALUES ('launch-trade','MINT','BUY','buyer',10,20,'SOL',9,'SPL_TOKEN',
+    2,0,1,'confirmed',$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,type,mint,source,program,signature,slot,transaction_index,
+    instruction_index,confirmation_status,observed_at,payload_version,payload,
+    terminal_at,purge_after
+  ) VALUES
+    ('curve-trade','BondingCurveTradeObserved','MINT','pumpfun','pump','curve-signature',
+      2,0,1,'confirmed',$1,1,'{}',$1,$1),
+    ('migration-event','MigrationObserved','MINT','pumpfun','pump','migration-signature',
+      3,0,0,'confirmed',$1,1,'{}',$1,$1),
+    ('activation-event','PumpSwapPoolActivated','MINT','pumpswap','pumpswap','activation-signature',
+      4,0,0,'confirmed',$1,1,'{}',$1,$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO migrations (
+    migration_id,event_id,mint,bonding_curve,announced_pool,instruction_kind,
+    quote_mint,quote_decimals,base_token_program,quote_token_program,
+    confirmation_status,payload_version,payload,terminal_at,purge_after
+  ) VALUES ('migration','migration-event','MINT','CURVE','POOL','MIGRATE','SOL',9,
+    'SPL_TOKEN','SPL_TOKEN','confirmed',1,'{}',$1,$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO market_pools (
+    pool_address,market,program_id,pool_index,creator,base_mint,quote_mint,
+    quote_decimals,base_token_program,quote_token_program,base_vault,quote_vault,
+    lp_mint,migration_id,activation_event_id,pool_state,confirmation_status,slot,
+    transaction_index,instruction_index,payload_version,payload,terminal_at,purge_after
+  ) VALUES ('POOL','pumpswap','pumpswap',0,'creator','MINT','SOL',9,'SPL_TOKEN',
+    'SPL_TOKEN','BASE_VAULT','QUOTE_VAULT','LP','migration','activation-event','active',
+    'confirmed',4,0,0,1,'{}',$1,$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO market_reserve_snapshots (
+    snapshot_id,pool_address,base_reserves_raw,quote_vault_amount_raw,
+    virtual_quote_reserves_raw,effective_quote_reserves_raw,observed_slot,trigger_slot,
+    transaction_index,instruction_index,confirmation_status,observed_at,terminal_at,purge_after
+  ) VALUES ('market-snapshot','POOL',100,200,10,210,4,4,0,0,'confirmed',$1,$1,$1)`,
+  [purgeAfter]);
+  await pool.query(`INSERT INTO market_trades (
+    trade_id,pool_address,mint,quote_mint,trade_kind,trader,base_amount_raw,
+    quote_amount_raw,signature,slot,transaction_index,instruction_index,
+    confirmation_status,payload_version,payload,observed_at,terminal_at,purge_after
+  ) VALUES ('market-trade','POOL','MINT','SOL','BUY','buyer',10,20,
+    'market-signature',5,0,0,'confirmed',1,'{}',$1,$1,$1)`,[purgeAfter]);
+}
+
+async function waitForDatabaseWait(
+  pool:InstanceType<typeof pg.Pool>,queryPattern:string,
+):Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ readonly waiting:boolean }>(`SELECT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+      WHERE datname=current_database() AND wait_event='advisory' AND query ILIKE $1
+    ) AS waiting`,[queryPattern]);
+    if (result.rows[0]?.waiting === true) return;
+    await new Promise((resolve) => setTimeout(resolve,25));
+  }
+  throw new Error('PostgreSQL retention wait was not observed before timeout.');
+}
+
+function quoteIdentifier(identifier:string):string {
+  assert.match(identifier,/^[a-z_][a-z0-9_]*$/u);
+  return `"${identifier}"`;
+}

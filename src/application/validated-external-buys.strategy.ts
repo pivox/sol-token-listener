@@ -25,6 +25,7 @@ export interface PaperTradingActions {
   open(command: OpenPaperPositionCommand): Promise<PaperPosition>;
   reconcileOpen(command: OpenPaperPositionCommand): Promise<PaperPosition>;
   close(command: ClosePaperPositionCommand): Promise<PaperPosition>;
+  reconcileClose(positionId: string, trigger: DomainEvent): Promise<PaperPosition>;
   retract(positionId: string, trigger: DomainEvent): Promise<PaperPosition>;
 }
 

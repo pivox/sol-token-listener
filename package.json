@@ -32,6 +32,7 @@
     "rpc:check": "tsx scripts/check-rpc.ts",
     "rpc:soak": "tsx scripts/rpc-soak.ts",
     "paper:dry-run": "tsx src/cli/paper-dry-run.ts",
+    "paper:mvp": "tsx src/cli/paper-mvp.ts",
     "pool:diagnose": "tsx scripts/diagnose-pool.ts",
     "tx:diagnose": "tsx scripts/diagnose-transaction.ts",
     "fixture:capture": "tsx scripts/capture-fixture.ts",
