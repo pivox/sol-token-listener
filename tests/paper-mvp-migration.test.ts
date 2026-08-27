@@ -10,6 +10,7 @@ const collectionMigrationUrl = new URL('../migrations/019_paper_mvp_collection.s
 const derivedPnlMigrationUrl = new URL('../migrations/020_paper_mvp_derived_pnl.sql', import.meta.url);
 const runnerHardeningMigrationUrl = new URL('../migrations/021_paper_mvp_runner_hardening.sql', import.meta.url);
 const coverageIndexesMigrationUrl = new URL('../migrations/022_paper_mvp_coverage_indexes.sql', import.meta.url);
+const exactStrategyMigrationUrl = new URL('../migrations/023_paper_mvp_exact_strategy.sql', import.meta.url);
 
 void test('defines replayable paper MVP runs and immutable samples', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
@@ -77,7 +78,17 @@ void test('adds replayable covering indexes for bounded paper MVP coverage scans
   assert.doesNotMatch(sql, /DROP\s|DELETE\s|UPDATE\s|private[_ ]?key|keypair/iu);
 });
 
-void test('applies migrations 001-022 on an empty schema and replays cleanly', async (context) => {
+void test('versions the exact paper MVP strategy configuration and leaves v1 rows fail-closed', async () => {
+  const sql = await readFile(exactStrategyMigrationUrl, 'utf8');
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS external_unique_buyers_target INTEGER/u);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS take_profit_multiplier_bps NUMERIC\(78,0\)/u);
+  assert.match(sql, /payload_version IN \(1,2\)/u);
+  assert.match(sql, /payload_version=1[\s\S]*external_unique_buyers_target IS NULL/u);
+  assert.match(sql, /payload_version=2[\s\S]*external_unique_buyers_target IS NOT NULL/u);
+  assert.doesNotMatch(sql, /UPDATE paper_mvp_runs[\s\S]*external_unique_buyers_target/iu);
+});
+
+void test('applies migrations 001-023 on an empty schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: PostgreSQL paper MVP migration test skipped');
@@ -89,7 +100,7 @@ void test('applies migrations 001-022 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '022_paper_mvp_coverage_indexes.sql');
+    assert.equal(applied.at(-1), '023_paper_mvp_exact_strategy.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query('SET enable_seqscan=off');
     const launchPlan = await pool.query<Readonly<{ 'QUERY PLAN': string }>>(`EXPLAIN (COSTS OFF)
@@ -108,6 +119,9 @@ void test('applies migrations 001-022 on an empty schema and replays cleanly', a
     const sql = await readFile(collectionMigrationUrl, 'utf8');
     await pool.query(sql);
     await pool.query(sql);
+    const exactStrategySql = await readFile(exactStrategyMigrationUrl, 'utf8');
+    await pool.query(exactStrategySql);
+    await pool.query(exactStrategySql);
     const tables = await pool.query(`SELECT table_name FROM information_schema.tables
       WHERE table_schema=current_schema()
         AND table_name IN ('paper_mvp_runs','paper_mvp_position_samples')

@@ -24,6 +24,7 @@ const runSnapshot: PaperMvpRunSnapshot = Object.freeze({
       strategyId: 'creation-entry-v1', strategyVersion: 1, quoteMint: 'SOL',
       targetClosedPositions: 50, initialCapitalRaw: 1_000_000n,
       networkFeeRawPerTransaction: 5_000n, maxDurationMs: 60_000,
+      externalUniqueBuyersTarget: 10, takeProfitMultiplierBps: 20_000n,
       providerIdentity: 'provider:test',
     }),
     state: 'RUNNING',

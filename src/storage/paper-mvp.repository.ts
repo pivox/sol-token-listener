@@ -90,6 +90,9 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
       );
       const row = active.rows[0];
       if (row !== undefined) {
+        if (safeNumber(row.payload_version) !== 2) {
+          throw new PaperMvpConflictError('ACTIVE_RUN_INCOMPATIBLE');
+        }
         const run = runFromRow(row);
         if (!sameConfiguration(run.configuration, config)) {
           throw new PaperMvpConflictError('ACTIVE_RUN_INCOMPATIBLE');
@@ -110,13 +113,15 @@ export class PostgresPaperMvpRepository implements PaperMvpRepository {
         `INSERT INTO paper_mvp_runs (
           run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
           initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
-          provider_identity,state,started_at,deadline_at,updated_at,payload_version,
+          external_unique_buyers_target,take_profit_multiplier_bps,provider_identity,
+          state,started_at,deadline_at,updated_at,payload_version,
           configuration_payload,runner_owner_id
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'RUNNING',$10,$11,$10,1,$12::jsonb,$13)
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'RUNNING',$12,$13,$12,2,$14::jsonb,$15)
         RETURNING *,0::integer AS closed_positions`,
         [runId,config.strategyId,config.strategyVersion,config.quoteMint,
           config.targetClosedPositions,config.initialCapitalRaw.toString(),
           config.networkFeeRawPerTransaction.toString(),config.maxDurationMs,
+          config.externalUniqueBuyersTarget,config.takeProfitMultiplierBps.toString(),
           config.providerIdentity,startedAt,deadlineAt,configurationJson(config),runnerOwnerId],
       );
       return requiredRun(inserted.rows[0]);
@@ -445,6 +450,11 @@ function validateConfiguration(value: PaperMvpRunConfiguration): PaperMvpRunConf
   positiveBigint(value.initialCapitalRaw, 'initial capital');
   nonNegativeBigint(value.networkFeeRawPerTransaction, 'network fee');
   integer(value.maxDurationMs, 60_000, 14_400_000, 'max duration');
+  integer(value.externalUniqueBuyersTarget, 1, 1_000, 'external unique buyers target');
+  positiveBigint(value.takeProfitMultiplierBps, 'take profit multiplier');
+  if (value.takeProfitMultiplierBps < 10_000n || value.takeProfitMultiplierBps > 1_000_000n) {
+    throw new TypeError('Paper MVP take profit multiplier is invalid.');
+  }
   boundedText(value.providerIdentity, 'provider identity');
   return Object.freeze({
     strategyId: value.strategyId,
@@ -454,6 +464,8 @@ function validateConfiguration(value: PaperMvpRunConfiguration): PaperMvpRunConf
     initialCapitalRaw: value.initialCapitalRaw,
     networkFeeRawPerTransaction: value.networkFeeRawPerTransaction,
     maxDurationMs: value.maxDurationMs,
+    externalUniqueBuyersTarget: value.externalUniqueBuyersTarget,
+    takeProfitMultiplierBps: value.takeProfitMultiplierBps,
     providerIdentity: value.providerIdentity,
   });
 }
@@ -574,6 +586,7 @@ function validateTerminalization(value: PaperMvpTerminalization): void {
 }
 
 function runFromRow(row: Row): PaperMvpRun {
+  if (safeNumber(row.payload_version) !== 2) throw stored();
   const state = text(row.state, 'state');
   if (state !== 'RUNNING' && state !== 'COMPLETED' && state !== 'FAILED') throw stored();
   const providerStatus = text(row.provider_status, 'provider status');
@@ -583,7 +596,10 @@ function runFromRow(row: Row): PaperMvpRun {
     quoteMint:text(row.quote_mint,'quote mint'),targetClosedPositions:safeNumber(row.target_closed_positions),
     initialCapitalRaw:bigint(row.initial_capital_raw),
     networkFeeRawPerTransaction:bigint(row.network_fee_raw_per_transaction),
-    maxDurationMs:safeNumber(row.max_duration_ms),providerIdentity:text(row.provider_identity,'provider identity'),
+    maxDurationMs:safeNumber(row.max_duration_ms),
+    externalUniqueBuyersTarget:safeNumber(row.external_unique_buyers_target),
+    takeProfitMultiplierBps:bigint(row.take_profit_multiplier_bps),
+    providerIdentity:text(row.provider_identity,'provider identity'),
   });
   const counters = validateRunCounters({
     creationsObserved:safeNumber(row.creations_observed),entriesRejected:safeNumber(row.entries_rejected),
@@ -707,12 +723,15 @@ function sampleJson(value: PaperMvpPositionSample): string {
 
 function configurationJson(value: PaperMvpRunConfiguration): string {
   return JSON.stringify({
-    schemaVersion:'paper-mvp-run-configuration.v1',strategyId:value.strategyId,
+    schemaVersion:'paper-mvp-run-configuration.v2',strategyId:value.strategyId,
     strategyVersion:value.strategyVersion,quoteMint:value.quoteMint,
     targetClosedPositions:value.targetClosedPositions,
     initialCapitalRaw:value.initialCapitalRaw.toString(),
     networkFeeRawPerTransaction:value.networkFeeRawPerTransaction.toString(),
-    maxDurationMs:value.maxDurationMs,providerIdentity:value.providerIdentity,
+    maxDurationMs:value.maxDurationMs,
+    externalUniqueBuyersTarget:value.externalUniqueBuyersTarget,
+    takeProfitMultiplierBps:value.takeProfitMultiplierBps.toString(),
+    providerIdentity:value.providerIdentity,
   });
 }
 

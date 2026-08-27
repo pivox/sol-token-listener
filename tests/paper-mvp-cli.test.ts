@@ -82,6 +82,8 @@ void test('fails every safety gate before bootstrap, database, collector, or fil
     { ...valid, paperStrategyId: 'validated-external-buys' },
     { ...valid, paperQuoteMintAllowlist: [valid.wsolMint, 'other'] },
     { ...valid, paperQuoteMintAllowlist: ['other'] },
+    { ...valid, paperExternalBuyTarget: 9 },
+    { ...valid, creationTakeProfitMultiplierBps: 19_999n },
   ];
   for (const config of invalid) {
     let bootstrapCalls = 0;
@@ -124,6 +126,8 @@ void test('runs the real bootstrap lifetime, reaches target, verifies durable st
   assert.equal(result.exitCode, 0);
   assert.equal(result.report?.verdict, 'PASS');
   assert.equal(repository.snapshot?.run.state, 'COMPLETED');
+  assert.equal(repository.snapshot?.run.configuration.externalUniqueBuyersTarget, 10);
+  assert.equal(repository.snapshot?.run.configuration.takeProfitMultiplierBps, 20_000n);
   assert.deepEqual(calls, ['bootstrap:start', 'collect', 'bootstrap:closed']);
   const serialized = await readFile(reportFile, 'utf8');
   assert.deepEqual(JSON.parse(serialized), result.report);
@@ -640,6 +644,7 @@ function configuration(): PaperMvpRunConfiguration {
     strategyId: 'creation-entry-v1', strategyVersion: 1, quoteMint: config.wsolMint,
     targetClosedPositions: 1, initialCapitalRaw: 1_000_000n,
     networkFeeRawPerTransaction: 5n, maxDurationMs: 60_000,
+    externalUniqueBuyersTarget: 10, takeProfitMultiplierBps: 20_000n,
     providerIdentity: 'provider-usage:unavailable:v1',
   });
 }

@@ -391,6 +391,7 @@ export class CreationEntryV1Strategy {
     const counted: PaperExternalBuyEvidenceV2[] = [];
     const canonical = canonicalBuys(input);
     let trigger: DomainEvent = input.contextEvent ?? candidateTrigger(input.candidate);
+    let targetBuy: CanonicalBuy | null = null;
     for (const buy of canonical) {
       const result = countUniqueExternalBuy(session, {
         tradeId: buy.id,
@@ -407,12 +408,16 @@ export class CreationEntryV1Strategy {
         counted.push(result.evidence);
         trigger = buy.trigger;
       }
-      if (result.targetReached) break;
+      if (result.targetReached) {
+        if (result.evidence !== null) targetBuy = buy;
+        break;
+      }
     }
     const creatorSell = earliestCreatorSell(input);
-    const targetBuy = session.externalBuyCount >= session.externalBuyTarget
-      ? canonical[session.externalBuyTarget - 1] ?? null
-      : null;
+    if (targetBuy === null && session.externalBuyCount >= session.externalBuyTarget) {
+      const targetTradeId = session.countedTradeIds[session.externalBuyTarget - 1];
+      targetBuy = canonical.find((buy) => buy.id === targetTradeId) ?? null;
+    }
     const mandatoryReason = this.options.manualKillSwitch
       ? 'MANUAL_KILL_SWITCH'
       : creatorSell === null
@@ -524,6 +529,28 @@ export class CreationEntryV1Strategy {
     } else {
       if (targetBuy === null) throw new TypeError('External buyer exit source is missing.');
       exitTriggerAtMs=targetBuy.observedAtMs;
+    }
+
+    if (exitTriggerAtMs !== undefined && sellQuote.observedAtMs < exitTriggerAtMs) {
+      const stale = new PaperQuoteError(
+        'QUOTE_STALE',
+        'Full-position sell quote predates the selected exit trigger.',
+      );
+      const pending = updateSession(input.candidate, session, {
+        state: 'EXIT_PENDING_QUOTE',
+        reasonCode: 'SELL_QUOTE_UNAVAILABLE_OR_STALE',
+        pendingExitReason: exitReason,
+        pendingExitTriggerAtMs: exitReason === 'MANUAL_KILL_SWITCH'
+          ? exitTriggerAtMs
+          : null,
+        lastError: Object.freeze({
+          code: stale.code,
+          message: stale.message,
+          retryable: stale.retryable,
+        }),
+        updatedAtMs: input.nowMs,
+      });
+      return strategyResult(pending, counted, input.position, trigger);
     }
 
     const position = await this.ledger.close({

@@ -173,7 +173,7 @@ void test('closes the full position when the executable minimum proceeds reach 2
   assert.equal(ledger.closeCalls.length, 1);
   assert.equal(ledger.closeCalls[0]?.sellQuote.amountInRaw, POSITION.remainingBaseRaw);
   assert.equal(ledger.closeCalls[0]?.reason, 'TAKE_PROFIT_2X_EXECUTABLE');
-  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, 1_000);
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, 4_000);
   assert.equal(router.requests[0]?.side, 'SELL');
 });
 
@@ -391,6 +391,81 @@ void test('preserves the exact target-buy observation across a quote retry', asy
   assert.equal(ledger.closeCalls[0]?.trigger.id, sourceBuy.id);
 });
 
+void test('keeps a retrospective exit quote pending until a post-trigger retry', async () => {
+  const ledger = new FakeLedger();
+  const candidate = eligibleCandidate();
+  const sourceBuy = launchBuy('causal-target', 2, 'wallet-a', 2_000n);
+  const strategy = new CreationEntryV1Strategy(
+    ledger,
+    new FakeRouter({ ...quote('retrospective', 'MINT', 'SOL', 900n, 1_100n), observedAtMs: 1_001 }),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const prepared = strategy.prepare(candidate, {
+    externalBuyTarget: 1, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(prepared);
+
+  const pending = await strategy.reconcile({
+    candidate, session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    position:POSITION,creator:'creator',launchTrades:[sourceBuy],marketTrades:[],nowMs:4_000,
+  });
+
+  assert.equal(pending.requestedAction, 'NONE');
+  assert.equal(pending.session.state, 'EXIT_PENDING_QUOTE');
+  assert.equal(pending.session.reasonCode, 'SELL_QUOTE_UNAVAILABLE_OR_STALE');
+  assert.equal(pending.session.pendingExitReason, 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED');
+  assert.equal(pending.session.lastError?.code, 'QUOTE_STALE');
+  assert.equal(pending.session.lastError?.retryable, true);
+  assert.equal(ledger.closeCalls.length, 0);
+
+  const recovered = new CreationEntryV1Strategy(
+    ledger, new FakeRouter(quote('post-trigger', 'MINT', 'SOL', 900n, 1_100n)),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const closed = await recovered.reconcile({
+    candidate,session:pending.session,position:POSITION,creator:'creator',
+    launchTrades:[sourceBuy],marketTrades:[],nowMs:5_000,
+  });
+  assert.equal(closed.requestedAction, 'CLOSE');
+  assert.equal(ledger.closeCalls.length, 1);
+  assert.equal(ledger.closeCalls[0]?.sellQuote.observedAtMs, 4_000);
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, sourceBuy.observedAtMs);
+});
+
+void test('uses the exact Nth new wallet trade when prior-wallet duplicates are interleaved', async () => {
+  const ledger = new FakeLedger();
+  const candidate = eligibleCandidate();
+  const strategy = new CreationEntryV1Strategy(
+    ledger, new FakeRouter(),
+    { retentionMs: 14_400_000, externalMinimumBuyAmountRaw: 1_000n },
+  );
+  const prepared = strategy.prepare(candidate, {
+    externalBuyTarget: 3, minimumConfirmation: 'confirmed', nowMs: 1_000,
+  });
+  assert.ok(prepared);
+  const first = await strategy.reconcile({
+    candidate, session:{ ...prepared,state:'WAITING_EXTERNAL_BUYS',positionId:POSITION.id },
+    position:POSITION,creator:'creator',
+    launchTrades:[
+      launchBuy('wallet-a-first', 2, 'wallet-a', 2_000n),
+      launchBuy('wallet-b-first', 3, 'wallet-b', 2_000n),
+    ],marketTrades:[],nowMs:3_000,
+  });
+  const target = launchBuy('wallet-c-target', 6, 'wallet-c', 2_000n);
+  const closed = await strategy.reconcile({
+    candidate,session:first.session,position:POSITION,creator:'creator',
+    launchTrades:[
+      launchBuy('wallet-b-duplicate-1', 4, 'wallet-b', 2_000n),
+      launchBuy('wallet-b-duplicate-2', 5, 'wallet-b', 2_000n),
+      target,
+    ],marketTrades:[],nowMs:4_000,
+  });
+
+  assert.equal(closed.requestedAction, 'CLOSE');
+  assert.equal(ledger.closeCalls[0]?.exitTriggerAtMs, target.observedAtMs);
+  assert.equal(ledger.closeCalls[0]?.trigger.id, target.id);
+});
+
 void test('recovers a committed creation close without quoting or closing twice', async () => {
   const ledger = new FakeLedger();
   const router = new FakeRouter(new Error('must not quote'));
@@ -582,6 +657,6 @@ function quote(
   return Object.freeze({
     id, inputMint, outputMint, amountInRaw, amountOutRaw,
     minimumAmountOutRaw, feesRaw: 1n, slippageBps: 100n,
-    priceImpactBps: 10n, observedAtMs: 1_000, observedSlot: 10n,
+    priceImpactBps: 10n, observedAtMs: 4_000, observedSlot: 10n,
   });
 }

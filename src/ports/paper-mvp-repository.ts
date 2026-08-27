@@ -13,6 +13,8 @@ export interface PaperMvpRunConfiguration {
   readonly initialCapitalRaw: bigint;
   readonly networkFeeRawPerTransaction: bigint;
   readonly maxDurationMs: number;
+  readonly externalUniqueBuyersTarget: number;
+  readonly takeProfitMultiplierBps: bigint;
   readonly providerIdentity: string;
 }
 

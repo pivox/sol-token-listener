@@ -23,6 +23,7 @@ const configuration: PaperMvpRunConfiguration = Object.freeze({
   quoteMint: 'So11111111111111111111111111111111111111112',
   targetClosedPositions: 1, initialCapitalRaw: 1_000_000n,
   networkFeeRawPerTransaction: 5_000n, maxDurationMs: 60_000,
+  externalUniqueBuyersTarget: 10, takeProfitMultiplierBps: 20_000n,
   providerIdentity: 'provider:test:v1',
 });
 const OWNER = 'paper-mvp-owner-test';
@@ -571,6 +572,34 @@ void test('replacement claim waits for in-flight progress then fences every late
   });
 });
 
+void test('fails closed instead of claiming a legacy v1 run with unknown strategy thresholds', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL legacy configuration test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await pool.query(`INSERT INTO paper_mvp_runs (
+      run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
+      initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
+      provider_identity,state,started_at,deadline_at,updated_at,payload_version,
+      configuration_payload,runner_owner_id
+    ) VALUES ('legacy-v1','creation-entry-v1',1,$1,1,1000000,5000,60000,
+      'provider:test:v1','RUNNING',$2,$3,$2,1,'{}'::jsonb,'legacy-owner')`, [
+      configuration.quoteMint, new Date(1_000), new Date(61_000),
+    ]);
+
+    const repository = new PostgresPaperMvpRepository(pool);
+    await assert.rejects(
+      repository.startOrResume(configuration, OWNER, 2_000),
+      isConflict('ACTIVE_RUN_INCOMPATIBLE'),
+    );
+    assert.deepEqual((await pool.query(
+      "SELECT runner_owner_id,payload_version FROM paper_mvp_runs WHERE run_id='legacy-v1'",
+    )).rows, [{ runner_owner_id:'legacy-owner', payload_version:1 }]);
+  });
+});
+
 void test('starts or resumes exactly, persists progress atomically, terminalizes and purges', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -589,13 +618,23 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
       isConflict('ACTIVE_RUN_INCOMPATIBLE'),
     );
     await assert.rejects(
+      repository.startOrResume({ ...configuration, externalUniqueBuyersTarget: 11 }, OWNER, 2_000),
+      isConflict('ACTIVE_RUN_INCOMPATIBLE'),
+    );
+    await assert.rejects(
+      repository.startOrResume({ ...configuration, takeProfitMultiplierBps: 25_000n }, OWNER, 2_000),
+      isConflict('ACTIVE_RUN_INCOMPATIBLE'),
+    );
+    await assert.rejects(
       pool.query(`INSERT INTO paper_mvp_runs (
         run_id,strategy_id,strategy_version,quote_mint,target_closed_positions,
         initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
+        external_unique_buyers_target,take_profit_multiplier_bps,
         provider_identity,state,started_at,deadline_at,updated_at,
         payload_version,configuration_payload,runner_owner_id
       ) SELECT 'second-active',strategy_id,strategy_version,quote_mint,target_closed_positions,
         initial_capital_raw,network_fee_raw_per_transaction,max_duration_ms,
+        external_unique_buyers_target,take_profit_multiplier_bps,
         provider_identity,state,started_at,deadline_at,updated_at,
         payload_version,configuration_payload,'second-owner'
         FROM paper_mvp_runs WHERE run_id=$1`, [run.runId]),

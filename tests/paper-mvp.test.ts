@@ -60,6 +60,28 @@ void test('builds a deterministic PASS report with integer rates and provider us
   assert.deepEqual(report.exitCounts, { '10_UNIQUE_BUYERS': 50, '2X': 0, SAFETY: 0 });
 });
 
+void test('maps creator and manual exits directly to the SAFETY report category', () => {
+  const samples = ['CREATOR_EARLY_SELL', 'MANUAL_KILL_SWITCH'].map((exitReason, index) => (
+    createPaperMvpPositionSample(sampleInput({
+      positionId: `safety-${index}`,
+      exitReason: exitReason as 'CREATOR_EARLY_SELL' | 'MANUAL_KILL_SWITCH',
+      paperSellAtMs: 220 + index,
+    }))
+  ));
+  const report = createPaperMvpReport({
+    runId: 'paper_mvp_run_safety', completionReason: 'TARGET_REACHED',
+    startedAtMs: 100, completedAtMs: 1_000, targetClosedPositions: 2,
+    initialCapitalRaw: 10_000n, quoteMint: 'SOL', creationsObserved: 2,
+    entriesRejected: 0, samples, unknownTerminalPositions: 0,
+    duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    providerUsage: {
+      status: 'AVAILABLE', creditsUsedStart: 100n, creditsUsedEnd: 102n, rateLimitedCount: 0,
+    },
+  });
+
+  assert.deepEqual(report.exitCounts, { '10_UNIQUE_BUYERS': 0, '2X': 0, SAFETY: 2 });
+});
+
 void test('fails closed on drawdown, unknowns, duplicates, quote mismatch or provider gaps', () => {
   const loss = createPaperMvpPositionSample(sampleInput({
     sellAmountOutRaw: 990n,

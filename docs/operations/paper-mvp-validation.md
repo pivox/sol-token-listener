@@ -11,7 +11,10 @@ existant. Elle ne signe et ne soumet aucune transaction.
    `PAPER_STRATEGY_ENABLED=false`, `PAPER_STRATEGY_VERSION=1` et
    `PAPER_QUOTE_MINT_ALLOWLIST` avec exactement `WSOL_MINT`.
 3. Configurer les seuils paper/création requis décrits dans le README, sans
-   clé privée ni capacité de signature/soumission.
+   clé privée ni capacité de signature/soumission. Le runner exige exactement
+   `EXTERNAL_UNIQUE_BUYERS_TARGET=10` et
+   `CREATION_TAKE_PROFIT_MULTIPLIER_BPS=20000` avant tout bootstrap ou accès
+   PostgreSQL.
 4. Choisir un chemin `.json` inexistant. La commande ne l'écrase jamais.
 
 Lancer :
@@ -42,8 +45,12 @@ le processus avec le code `1` sans terminaliser le run : il reste `RUNNING` et
 reprenable, tandis qu'un propriétaire remplacé ne peut plus progresser ni
 terminaliser la ligne.
 Après crash, la même commande reprend uniquement la configuration immuable
-exacte du run `RUNNING`. Une configuration différente ou un second runner
-échoue sans adopter ni faire progresser le run.
+exacte du run `RUNNING`. La configuration durable v2 inclut les cibles de dix
+acheteurs uniques et de prise de profit exécutable à 2x dans ses colonnes et son
+payload versionné ; elles participent donc à la comparaison de reprise. Une
+ligne v1 antérieure ne contient pas ces faits et est refusée sans revendication,
+plutôt que complétée par une valeur supposée. Une configuration différente ou
+un second runner échoue sans adopter ni faire progresser le run.
 
 La cible produit le rapport terminal. Deadline, `SIGINT` et `SIGTERM` demandent
 une dernière collecte bornée à cinq secondes, puis produisent toujours un run

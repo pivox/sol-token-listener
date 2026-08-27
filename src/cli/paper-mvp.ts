@@ -174,6 +174,8 @@ async function preparePaperMvpRun(
       initialCapitalRaw: options.initialCapitalRaw,
       networkFeeRawPerTransaction: options.networkFeeRawPerTransaction,
       maxDurationMs: options.maxDurationMs,
+      externalUniqueBuyersTarget: dependencies.config.paperExternalBuyTarget,
+      takeProfitMultiplierBps: dependencies.config.creationTakeProfitMultiplierBps,
       providerIdentity: dependencies.providerUsageProbe.identity,
     });
     const run = await repository.startOrResume(
@@ -522,6 +524,8 @@ export function assertPaperMvpSafety(config: AppConfig): void {
     || !config.creationStrategyEnabled
     || !config.paperStrategyEnabled
     || config.paperStrategyId !== 'creation-entry-v1'
+    || config.paperExternalBuyTarget !== 10
+    || config.creationTakeProfitMultiplierBps !== 20_000n
     || config.paperQuoteMintAllowlist.length !== 1
     || config.paperQuoteMintAllowlist[0] !== config.wsolMint
   ) throw new PaperMvpCliError('SAFETY_GATE_FAILED');
