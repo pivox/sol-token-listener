@@ -1,5 +1,10 @@
 # Solana HTTP RPC failover design
 
+Date: 2026-08-27
+Issue: #56
+Version: 1.0.0
+Status: approved through the standing instruction to use the recommended option
+
 ## Purpose
 
 Issue #56 must keep the Pump.fun observation pipeline usable when one Solana
