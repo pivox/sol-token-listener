@@ -30,7 +30,14 @@ import {
   type RuntimeHeartbeat,
   type TransactionNotification,
 } from '../domain/transaction-ingestion.js';
+import {
+  assertValidStrictCatchUpFailure,
+  MAX_STRICT_CATCH_UP_SLOT,
+  STRICT_CATCH_UP_FAILURE_REASON,
+  type StrictCatchUpFailure,
+} from '../domain/strict-catch-up.js';
 import type { ChainConfirmationStatus } from '../domain/types.js';
+import type { StrictCatchUpRepository } from '../ports/strict-catch-up-repository.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
 import type { NormalizedTransaction } from '../solana/rpc/types.js';
 import { fromJsonValue, stringifyJson, toJsonValue } from '../utils/json.js';
@@ -107,7 +114,7 @@ export class TransactionInboxLeaseError extends TransactionInboxRepositoryError 
   }
 }
 
-export class PostgresTransactionInboxRepository implements TransactionInboxRepository {
+export class PostgresTransactionInboxRepository implements TransactionInboxRepository, StrictCatchUpRepository {
   private readonly retryPolicy: TransactionInboxRetryPolicy;
 
   public constructor(
@@ -700,6 +707,139 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
     });
   }
 
+  public async compareAndSwapCheckpoint(
+    expected: ProcessingCheckpoint | null,
+    next: ProcessingCheckpoint,
+  ): Promise<void> {
+    return this.safely(async () => {
+      assertValidStrictCheckpoint(next);
+      if (expected !== null) {
+        assertValidStrictCheckpoint(expected);
+        if (expected.key !== next.key) throw new TypeError('Checkpoint keys must match.');
+        if (isCheckpointRegression(expected, next)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+      }
+      await this.transaction(async (client) => {
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended('transaction-checkpoint:' || $1, 0))",
+          [next.key],
+        );
+        if (expected === null) {
+          const inserted = await client.query(
+            `INSERT INTO processing_checkpoints (
+               checkpoint_key, source, program, slot, signature, transaction_index,
+               payload, updated_at
+             ) VALUES ($1,'transaction-inbox',$1,$2,$3,NULL,'{}'::jsonb,$4)
+             ON CONFLICT (checkpoint_key) DO NOTHING`,
+            [next.key, next.slot.toString(), next.signature, dateFromMs(next.updatedAtMs)],
+          );
+          if (inserted.rowCount === 0) {
+            throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+          }
+          requireOne(inserted.rowCount);
+          return;
+        }
+        const updated = await client.query(
+          `UPDATE processing_checkpoints SET
+             slot = $2, signature = $3, updated_at = $4
+           WHERE checkpoint_key = $1 AND slot = $5 AND signature = $6`,
+          [
+            next.key,
+            next.slot.toString(),
+            next.signature,
+            dateFromMs(next.updatedAtMs),
+            expected.slot.toString(),
+            expected.signature,
+          ],
+        );
+        if (updated.rowCount === 0) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+        requireOne(updated.rowCount);
+      });
+    });
+  }
+
+  public async recordStrictCatchUpFailure(value: StrictCatchUpFailure): Promise<void> {
+    return this.safely(async () => {
+      assertValidStrictCatchUpFailure(value);
+      await this.transaction(async (client) => {
+        const inserted = await client.query(
+          `INSERT INTO listener_strict_catch_up_failures (
+             failure_id, checkpoint_key, previous_slot, previous_signature,
+             provider_id, observed_head_slot, reason_code, detected_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (failure_id) DO NOTHING`,
+          [
+            value.failureId,
+            value.checkpointKey,
+            value.previous?.slot.toString() ?? null,
+            value.previous?.signature ?? null,
+            value.providerId,
+            nullableBigInt(value.observedHeadSlot),
+            value.reasonCode,
+            dateFromMs(value.detectedAtMs),
+          ],
+        );
+        requireZeroOrOne(inserted.rowCount);
+        if (inserted.rowCount === 1) return;
+        const existing = await client.query(
+          `SELECT checkpoint_key, previous_slot, previous_signature, provider_id,
+             observed_head_slot, reason_code
+           FROM listener_strict_catch_up_failures WHERE failure_id = $1`,
+          [value.failureId],
+        );
+        const row = requiredRow(existing.rows[0]);
+        if (existing.rowCount !== 1 || !strictCatchUpFailureIdentityMatches(row, value)) {
+          throw internalRepositoryError(new TransactionInboxConflictError('checkpoint'));
+        }
+      });
+    });
+  }
+
+  public async resolveStrictCatchUpFailures(
+    key: 'launchpad' | 'market',
+    previous: ProcessingCheckpoint | null,
+    resolvedAtMs: number,
+  ): Promise<void> {
+    return this.safely(async () => {
+      requireCheckpointKey(key);
+      if (previous !== null) {
+        assertValidStrictCheckpoint(previous);
+        if (previous.key !== key) throw new TypeError('Checkpoint keys must match.');
+      }
+      if (Object.is(resolvedAtMs, -0)) {
+        throw new TypeError('Strict catch-up resolution timestamp is invalid.');
+      }
+      const resolvedAt = dateFromMs(resolvedAtMs);
+      await this.transaction(async (client) => {
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended('transaction-checkpoint:' || $1, 0))",
+          [key],
+        );
+        if (previous === null) {
+          await client.query(
+            `UPDATE listener_strict_catch_up_failures SET
+               resolved_at = $2, purge_after = $2 + INTERVAL '4 hours'
+             WHERE checkpoint_key = $1
+               AND previous_slot IS NULL AND previous_signature IS NULL
+               AND resolved_at IS NULL`,
+            [key, resolvedAt],
+          );
+          return;
+        }
+        await client.query(
+          `UPDATE listener_strict_catch_up_failures SET
+             resolved_at = $4, purge_after = $4 + INTERVAL '4 hours'
+           WHERE checkpoint_key = $1 AND previous_slot = $2 AND previous_signature = $3
+             AND resolved_at IS NULL`,
+          [key, previous.slot.toString(), previous.signature, resolvedAt],
+        );
+      });
+    });
+  }
+
   public async storeCheckpoint(value: ProcessingCheckpoint): Promise<void> {
     return this.safely(async () => {
       assertValidProcessingCheckpoint(value);
@@ -1055,6 +1195,88 @@ function checkpointFromRow(row: QueryResultRow): ProcessingCheckpoint {
   });
   assertValidProcessingCheckpoint(value);
   return value;
+}
+
+function isCheckpointRegression(
+  expected: ProcessingCheckpoint,
+  next: ProcessingCheckpoint,
+): boolean {
+  return next.slot < expected.slot
+    || (next.slot === expected.slot
+      && next.signature === expected.signature
+      && next.updatedAtMs < expected.updatedAtMs);
+}
+
+function assertValidStrictCheckpoint(
+  value: unknown,
+): asserts value is ProcessingCheckpoint {
+  assertValidProcessingCheckpoint(value);
+  if (value.slot > MAX_STRICT_CATCH_UP_SLOT) {
+    throw new TypeError('Strict checkpoint slot exceeds persistence bounds.');
+  }
+}
+
+function strictCatchUpFailureIdentityMatches(
+  row: QueryResultRow,
+  value: StrictCatchUpFailure,
+): boolean {
+  requireCheckpointKey(row.checkpoint_key);
+  if (row.checkpoint_key !== value.checkpointKey) return false;
+  const previous = strictFailurePrevious(row);
+  if (value.previous === null) {
+    if (previous !== null) return false;
+  } else if (previous === null) {
+    return false;
+  } else if (previous.slot !== value.previous.slot
+    || previous.signature !== value.previous.signature) {
+    return false;
+  }
+  requireRpcProviderId(row.provider_id);
+  if (row.provider_id !== value.providerId) return false;
+  const observedHeadSlot = nullableStrictCatchUpSlot(
+    row.observed_head_slot,
+    'strict catch-up observed head slot',
+  );
+  if (observedHeadSlot !== value.observedHeadSlot) return false;
+  if (row.reason_code !== STRICT_CATCH_UP_FAILURE_REASON) {
+    throw new TypeError('Stored strict catch-up failure reason is invalid.');
+  }
+  return true;
+}
+
+function strictFailurePrevious(row: QueryResultRow): { readonly slot: bigint; readonly signature: string } | null {
+  if (row.previous_slot === null && row.previous_signature === null) return null;
+  if (row.previous_slot === null || row.previous_signature === null) {
+    throw new TypeError('Stored strict catch-up failure boundary is invalid.');
+  }
+  const slot = nullableStrictCatchUpSlot(row.previous_slot, 'strict catch-up previous slot');
+  if (slot === null) throw new TypeError('Stored strict catch-up failure boundary is invalid.');
+  return Object.freeze({
+    slot,
+    signature: strictCatchUpSignature(row.previous_signature, 'strict catch-up previous signature'),
+  });
+}
+
+function nullableStrictCatchUpSlot(value: unknown, name: string): bigint | null {
+  if (value === null) return null;
+  const slot = numericBigInt(value, name);
+  if (slot > MAX_STRICT_CATCH_UP_SLOT) throw new TypeError(`Stored ${name} is invalid.`);
+  return slot;
+}
+
+function strictCatchUpSignature(value: unknown, name: string): string {
+  const signature = requiredText(value, name);
+  if (signature !== signature.trim() || Buffer.byteLength(signature, 'utf8') > 128) {
+    throw new TypeError(`Stored ${name} is invalid.`);
+  }
+  return signature;
+}
+
+function requireRpcProviderId(value: unknown): asserts value is StrictCatchUpFailure['providerId'] {
+  if (value !== 'primary' && value !== 'fallback-1'
+    && value !== 'fallback-2' && value !== 'fallback-3') {
+    throw new TypeError('Stored strict catch-up provider is invalid.');
+  }
 }
 
 function reconciledStatus(

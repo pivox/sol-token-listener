@@ -6,11 +6,17 @@ import pg from 'pg';
 import { CatchUpScanner } from '../src/application/catch-up-scanner.js';
 import type {
   IngestionFailure,
+  ProcessingCheckpoint,
   RuntimeHeartbeat,
   TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { createCatchUpGap, restoreNormalizedTransactionSnapshot } from '../src/domain/transaction-ingestion.js';
+import {
+  createStrictCatchUpFailure,
+  type StrictCatchUpFailure,
+} from '../src/domain/strict-catch-up.js';
+import type { StrictCatchUpRepository } from '../src/ports/strict-catch-up-repository.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
@@ -627,6 +633,179 @@ void test('records a catch-up gap and replays its logical cursor independently o
   });
 });
 
+void test('uses exact checkpoint CAS identities and rejects invalid strict checkpoint inputs before I/O', async () => {
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => { throw new Error('database access must not occur'); },
+    query: async () => { throw new Error('database access must not occur'); },
+  });
+  const strictRepository: StrictCatchUpRepository = repository;
+  const valid = checkpoint('launchpad', 40n, 'strict-valid', 300_000);
+
+  await assert.rejects(
+    strictRepository.compareAndSwapCheckpoint(null, { ...valid } as ProcessingCheckpoint),
+    (error) => error instanceof TransactionInboxRepositoryError
+      && error.message === 'Transaction inbox repository operation failed.',
+  );
+  await assert.rejects(
+    strictRepository.compareAndSwapCheckpoint(
+      checkpoint('market', 40n, 'foreign-key', 300_000), valid,
+    ),
+    (error) => error instanceof TransactionInboxRepositoryError
+      && error.message === 'Transaction inbox repository operation failed.',
+  );
+  await assert.rejects(
+    strictRepository.compareAndSwapCheckpoint(
+      null,
+      checkpoint('launchpad', 10n ** 78n, 'outside-postgresql-numeric-bound', 300_000),
+    ),
+    (error) => error instanceof TransactionInboxRepositoryError
+      && error.message === 'Transaction inbox repository operation failed.',
+  );
+  await assert.rejects(
+    strictRepository.resolveStrictCatchUpFailures('invalid' as never, null, 300_000),
+    (error) => error instanceof TransactionInboxRepositoryError
+      && error.message === 'Transaction inbox repository operation failed.',
+  );
+  await assert.rejects(
+    strictRepository.resolveStrictCatchUpFailures('launchpad', null, -0),
+    (error) => error instanceof TransactionInboxRepositoryError
+      && error.message === 'Transaction inbox repository operation failed.',
+  );
+});
+
+void test('compares strict checkpoints by exact key slot and signature without timestamp identity', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const first = checkpoint('launchpad', 40n, 'first-head', 300_000);
+    const sameSlot = checkpoint('launchpad', 40n, 'same-slot-head', 300_001);
+    const second = checkpoint('launchpad', 41n, 'second-head', 300_002);
+
+    await repository.compareAndSwapCheckpoint(null, first);
+    await repository.compareAndSwapCheckpoint(
+      checkpoint('launchpad', 40n, 'first-head', 1), sameSlot,
+    );
+    await repository.compareAndSwapCheckpoint(
+      checkpoint('launchpad', 40n, 'same-slot-head', 2), second,
+    );
+    assert.deepEqual(await repository.readCheckpoint('launchpad'), second);
+
+    await assert.rejects(
+      repository.compareAndSwapCheckpoint(first, checkpoint('launchpad', 42n, 'stale', 300_003)),
+      (error) => error instanceof TransactionInboxConflictError && error.conflict === 'checkpoint',
+    );
+    await assert.rejects(
+      repository.compareAndSwapCheckpoint(
+        checkpoint('launchpad', 41n, 'wrong-head', 300_002),
+        checkpoint('launchpad', 42n, 'wrong-expected', 300_003),
+      ),
+      (error) => error instanceof TransactionInboxConflictError && error.conflict === 'checkpoint',
+    );
+    await assert.rejects(
+      repository.compareAndSwapCheckpoint(second, checkpoint('launchpad', 40n, 'older', 300_003)),
+      (error) => error instanceof TransactionInboxConflictError && error.conflict === 'checkpoint',
+    );
+  });
+});
+
+void test('allows one concurrent exact strict checkpoint CAS winner', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const expected = checkpoint('market', 50n, 'concurrent-base', 400_000);
+    await repository.compareAndSwapCheckpoint(null, expected);
+    const outcomes = await Promise.allSettled([
+      repository.compareAndSwapCheckpoint(expected, checkpoint('market', 51n, 'winner-a', 400_001)),
+      repository.compareAndSwapCheckpoint(expected, checkpoint('market', 52n, 'winner-b', 400_002)),
+    ]);
+    assert.equal(outcomes.filter((outcome) => outcome.status === 'fulfilled').length, 1);
+    assert.equal(outcomes.filter((outcome) =>
+      outcome.status === 'rejected' && outcome.reason instanceof TransactionInboxConflictError).length, 1);
+  });
+});
+
+void test('records immutable strict failures once and resolves only the exact nullable boundary', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const absentPrimary = strictFailure('launchpad', null, 'primary', 99n, 500_000);
+    const absentFallback = strictFailure('launchpad', null, 'fallback-1', 99n, 500_001);
+    const previous = checkpoint('launchpad', 45n, 'resolved-boundary', 499_000);
+    const present = strictFailure('launchpad', previous, 'primary', 100n, 500_002);
+
+    await repository.recordStrictCatchUpFailure(absentPrimary);
+    await repository.recordStrictCatchUpFailure(Object.freeze({ ...absentPrimary, detectedAtMs: 600_000 }));
+    await repository.recordStrictCatchUpFailure(absentFallback);
+    await repository.recordStrictCatchUpFailure(present);
+
+    const replayed = await pool.query(
+      `SELECT (EXTRACT(EPOCH FROM detected_at) * 1000)::bigint AS detected_at_ms
+       FROM listener_strict_catch_up_failures WHERE failure_id = $1`,
+      [absentPrimary.failureId],
+    );
+    assert.equal(replayed.rows[0]?.detected_at_ms, '500000');
+
+    await repository.resolveStrictCatchUpFailures('launchpad', null, 700_000);
+    const rows = await pool.query(
+      `SELECT failure_id, resolved_at IS NOT NULL AS resolved,
+         (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms
+       FROM listener_strict_catch_up_failures ORDER BY failure_id`,
+    );
+    const absentRows = rows.rows.filter((row) =>
+      row.failure_id === absentPrimary.failureId || row.failure_id === absentFallback.failureId);
+    assert.deepEqual(absentRows.map((row) => ({ resolved: row.resolved, purge_after_ms: row.purge_after_ms })), [
+      { resolved: true, purge_after_ms: '15100000' },
+      { resolved: true, purge_after_ms: '15100000' },
+    ]);
+    assert.deepEqual(rows.rows.find((row) => row.failure_id === present.failureId), {
+      failure_id: present.failureId, resolved: false, purge_after_ms: null,
+    });
+
+    await repository.resolveStrictCatchUpFailures('launchpad', previous, 700_001);
+    const resolvedPresent = await pool.query(
+      `SELECT resolved_at IS NOT NULL AS resolved,
+         (EXTRACT(EPOCH FROM purge_after) * 1000)::bigint AS purge_after_ms
+       FROM listener_strict_catch_up_failures WHERE failure_id = $1`,
+      [present.failureId],
+    );
+    assert.deepEqual(resolvedPresent.rows, [{ resolved: true, purge_after_ms: '15100001' }]);
+  });
+});
+
+void test('redacts strict failure identity conflicts', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const failure = strictFailure('market', null, 'primary', 88n, 800_000);
+    await repository.recordStrictCatchUpFailure(failure);
+    await pool.query(
+      'UPDATE listener_strict_catch_up_failures SET provider_id = $2 WHERE failure_id = $1',
+      [failure.failureId, 'fallback-3'],
+    );
+    await assert.rejects(repository.recordStrictCatchUpFailure(failure), (error) =>
+      error instanceof TransactionInboxConflictError
+      && error.conflict === 'checkpoint'
+      && !error.message.includes('fallback-3'));
+  });
+});
+
+void test('redacts strict failure transactional database failures', async () => {
+  const secret = 'postgresql://strict-failure-secret@db.invalid/listener';
+  const repository = new PostgresTransactionInboxRepository({
+    connect: async () => ({
+      query: async (text: string) => {
+        if (text === 'ROLLBACK') throw new Error(secret);
+        throw new Error(secret);
+      },
+      release: () => {},
+    }),
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+  await assert.rejects(repository.recordStrictCatchUpFailure(
+    strictFailure('market', null, 'primary', 88n, 800_000),
+  ), (error) => {
+    assert.ok(error instanceof TransactionInboxRepositoryError);
+    assertNoSecretSurface(error, secret);
+    return true;
+  });
+});
+
 void test('wraps malformed rows and database rollback failures in safe typed errors', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -1005,6 +1184,31 @@ function notification(
     ])
     : Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']);
   return Object.freeze({ signature, slot, source, programIds, confirmationStatus, observedAtMs });
+}
+
+function checkpoint(
+  key: ProcessingCheckpoint['key'],
+  slot: bigint,
+  signature: string,
+  updatedAtMs: number,
+): ProcessingCheckpoint {
+  return Object.freeze({ key, slot, signature, updatedAtMs });
+}
+
+function strictFailure(
+  checkpointKey: ProcessingCheckpoint['key'],
+  previous: ProcessingCheckpoint | null,
+  providerId: StrictCatchUpFailure['providerId'],
+  observedHeadSlot: bigint | null,
+  detectedAtMs: number,
+): StrictCatchUpFailure {
+  return createStrictCatchUpFailure({
+    checkpointKey,
+    previous,
+    providerId,
+    observedHeadSlot,
+    detectedAtMs,
+  });
 }
 
 function normalized(signature: string, slot: bigint): NormalizedTransaction {
