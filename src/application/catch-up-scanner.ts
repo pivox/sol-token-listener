@@ -4,7 +4,6 @@ import type {
   TransactionNotification,
 } from '../domain/transaction-ingestion.js';
 import { createCatchUpGap } from '../domain/transaction-ingestion.js';
-import { reconcileConfirmationStatus } from '../domain/confirmation-status.js';
 import { PUMP_PROGRAM_ID } from '../launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../markets/pumpswap/constants.js';
 import type { CatchUpSource } from '../ports/catch-up-source.js';
@@ -16,6 +15,7 @@ import {
   trustedCatchUpSourceErrorStage,
   type CatchUpSignature,
 } from '../solana/rpc/catch-up-source.js';
+import { mergeCatchUpDiscoveries } from './catch-up-discovery.js';
 
 export const MAX_CATCH_UP_PAGES = 100;
 
@@ -78,10 +78,6 @@ interface ProgramScan {
   readonly gap: CatchUpGap | null;
 }
 
-interface MergedDiscovery extends CatchUpSignature {
-  readonly programIds: readonly string[];
-}
-
 const PROGRAMS: readonly ProgramDefinition[] = Object.freeze([
   Object.freeze({ key: 'launchpad', id: PUMP_PROGRAM_ID }),
   Object.freeze({ key: 'market', id: PUMPSWAP_PROGRAM_ID }),
@@ -126,7 +122,7 @@ export class CatchUpScanner {
       scans.push(await this.scanProgram(program, checkpoint, observedAtMs));
     }
 
-    const merged = merge(scans);
+    const merged = mergeCatchUpDiscoveries(scans);
     for (const discovery of merged) {
       const notification: TransactionNotification = Object.freeze({
         signature: discovery.signature,
@@ -351,63 +347,6 @@ function optionValue<K extends keyof CatchUpScannerOptions>(
   } catch {
     throw new TypeError('Catch-up scanner bounds are invalid.');
   }
-}
-
-function merge(scans: readonly ProgramScan[]): readonly MergedDiscovery[] {
-  const bySignature = new Map<string, MergedDiscovery>();
-  for (const scan of scans) {
-    for (const row of scan.rows) {
-      const previous = bySignature.get(row.signature);
-      if (previous === undefined) {
-        bySignature.set(row.signature, Object.freeze({
-          ...row,
-          programIds: Object.freeze([scan.program.id]),
-        }));
-        continue;
-      }
-      const reconciled = reconcileDiscovery(previous, row, scan.program.key);
-      bySignature.set(row.signature, Object.freeze({
-        ...reconciled,
-        programIds: Object.freeze([...previous.programIds, scan.program.id].sort(lexicalOrder)),
-      }));
-    }
-  }
-  return Object.freeze([...bySignature.values()].sort(discoveryOrder));
-}
-
-function reconcileDiscovery(
-  current: CatchUpSignature,
-  incoming: CatchUpSignature,
-  program: ProgramKey,
-): CatchUpSignature {
-  if (current.slot !== incoming.slot) throw new CatchUpSourceError('response', program);
-  if (current.blockTimeMs !== null
-    && incoming.blockTimeMs !== null
-    && current.blockTimeMs !== incoming.blockTimeMs) {
-    throw new CatchUpSourceError('response', program);
-  }
-  const confirmationStatus = reconcileConfirmationStatus(
-    current.confirmationStatus,
-    incoming.confirmationStatus,
-  ) === 'update' ? incoming.confirmationStatus : current.confirmationStatus;
-  return Object.freeze({
-    signature: current.signature,
-    slot: current.slot,
-    confirmationStatus,
-    blockTimeMs: current.blockTimeMs ?? incoming.blockTimeMs,
-  });
-}
-
-function discoveryOrder(left: MergedDiscovery, right: MergedDiscovery): number {
-  if (left.slot !== right.slot) return left.slot < right.slot ? -1 : 1;
-  const signature = lexicalOrder(left.signature, right.signature);
-  if (signature !== 0) return signature;
-  return lexicalOrder(left.programIds[0] ?? '', right.programIds[0] ?? '');
-}
-
-function lexicalOrder(left: string, right: string): number {
-  if (left === right) return 0;
-  return left < right ? -1 : 1;
 }
 
 function positiveBound(value: unknown, maximum: number): value is number {
