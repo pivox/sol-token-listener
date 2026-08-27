@@ -90,6 +90,34 @@ void test('normalizes a scanner thenable without duplicating its scan', async ()
   assert.equal(await first, value);
 });
 
+void test('rejects and resets after a native scan promise has a hostile then getter', async () => {
+  const error = new Error('unavailable');
+  const hostileResult = Promise.resolve(result('primary'));
+  void Object.defineProperty(hostileResult, 'then', {
+    get() { throw error; },
+  });
+  const successfulResult = result('fallback-1');
+  const scanner = new FakeScanner([
+    hostileResult,
+    Promise.resolve(successfulResult),
+  ]);
+  const coordinator = new StrictCatchUpCoordinator(scanner);
+
+  let first: Promise<StrictCatchUpScanResult> | undefined;
+  assert.doesNotThrow(() => { first = coordinator.run(); });
+  assert.ok(first);
+  const second = coordinator.run();
+
+  assert.equal(first, second);
+  assert.notEqual(first, hostileResult);
+  assert.equal(first.then, Promise.prototype.then);
+  await assert.rejects(first, (value: unknown) => value === error);
+  await assert.rejects(second, (value: unknown) => value === error);
+
+  assert.equal(await coordinator.run(), successfulResult);
+  assert.equal(scanner.calls, 2);
+});
+
 void test('converts a synchronous scanner throw into its original rejected error', async () => {
   const error = new Error('unavailable');
   const successfulResult = result('fallback-1');

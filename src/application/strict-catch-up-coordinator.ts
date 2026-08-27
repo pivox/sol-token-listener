@@ -22,11 +22,9 @@ export class StrictCatchUpCoordinator {
   }
 
   private startScan(): Promise<StrictCatchUpScanResult> {
-    try {
-      return Promise.resolve(this.scanner.scan());
-    } catch (error) {
-      return Promise.resolve().then(() => { throw error; });
-    }
+    return new Promise<StrictCatchUpScanResult>((resolve) => {
+      resolve(this.scanner.scan());
+    });
   }
 
   private clear(run: Promise<StrictCatchUpScanResult>): void {
