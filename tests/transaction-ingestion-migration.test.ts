@@ -8,6 +8,10 @@ import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/data
 
 const migrationUrl = new URL('../migrations/009_transaction_ingestion.sql', import.meta.url);
 const catchUpGapMigrationUrl = new URL('../migrations/016_listener_catch_up_gaps.sql', import.meta.url);
+const strictCatchUpFailureMigrationUrl = new URL(
+  '../migrations/026_listener_strict_catch_up_failures.sql',
+  import.meta.url,
+);
 
 void test('creates replayable four-hour catch-up gap evidence', async () => {
   const sql = await readFile(catchUpGapMigrationUrl, 'utf8');
@@ -27,6 +31,33 @@ void test('creates replayable four-hour catch-up gap evidence', async () => {
   assert.match(sql, /listener_catch_up_gaps_purge_idx/u);
   assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
   assert.doesNotMatch(sql, /DROP TABLE|private[_ ]?key|send[_ ]?transaction/iu);
+});
+
+void test('creates replayable strict catch-up failure evidence without unsafe diagnostics', async () => {
+  const sql = await readFile(strictCatchUpFailureMigrationUrl, 'utf8');
+
+  assert.match(sql, /CREATE TABLE IF NOT EXISTS listener_strict_catch_up_failures/u);
+  assert.match(sql, /failure_id TEXT PRIMARY KEY/u);
+  assert.match(sql, /failure_id ~ '\^strict_catchup_failure_\[0-9a-f\]\{64\}\$'/u);
+  assert.match(sql, /checkpoint_key IN \('launchpad', 'market'\)/u);
+  assert.match(sql, /previous_slot NUMERIC\(78,0\)/u);
+  assert.match(sql, /previous_signature TEXT/u);
+  assert.match(sql, /\(previous_slot IS NULL\) = \(previous_signature IS NULL\)/u);
+  assert.match(sql, /previous_slot >= 0/u);
+  assert.match(sql, /OCTET_LENGTH\(previous_signature\) BETWEEN 1 AND 128/u);
+  assert.match(sql, /provider_id IN \('primary', 'fallback-1', 'fallback-2', 'fallback-3'\)/u);
+  assert.match(sql, /observed_head_slot NUMERIC\(78,0\)/u);
+  assert.match(sql, /observed_head_slot >= 0/u);
+  assert.match(sql, /reason_code IN \('CATCH_UP_WINDOW_EXCEEDED'\)/u);
+  assert.match(sql, /detected_at TIMESTAMPTZ NOT NULL/u);
+  assert.match(sql, /resolved_at TIMESTAMPTZ/u);
+  assert.match(sql, /purge_after TIMESTAMPTZ/u);
+  assert.match(sql, /resolved_at IS NULL AND purge_after IS NULL/u);
+  assert.match(sql, /purge_after = resolved_at \+ INTERVAL '4 hours'/u);
+  assert.match(sql, /listener_strict_catch_up_failures_unresolved_boundary_idx/u);
+  assert.match(sql, /listener_strict_catch_up_failures_resolved_purge_idx/u);
+  assert.doesNotMatch(sql, /\b(?:FLOAT|REAL|DOUBLE PRECISION)\b/iu);
+  assert.doesNotMatch(sql, /error|url|private[_ ]?key|secret|DROP TABLE|send[_ ]?transaction/iu);
 });
 
 void test('creates a replayable bigint-safe transaction inbox with strict lifecycle checks', async () => {
@@ -168,7 +199,7 @@ void test('purges every retained terminal inbox row and exposes their count', as
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
 
-void test('applies migrations 001-025 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-026 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -184,7 +215,7 @@ void test('applies migrations 001-025 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '025_paper_mvp_effective_configuration.sql');
+    assert.equal(applied.at(-1), '026_listener_strict_catch_up_failures.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
