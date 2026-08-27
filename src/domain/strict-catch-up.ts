@@ -1,17 +1,20 @@
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
+import type { RpcProviderId } from './rpc-provider.js';
 import type { ProcessingCheckpoint, ProcessingCheckpointKey } from './transaction-ingestion.js';
+
+export type { RpcProviderId } from './rpc-provider.js';
 
 export const STRICT_CATCH_UP_FAILURE_ID_VERSION = 1 as const;
 export const STRICT_CATCH_UP_FAILURE_REASON = 'CATCH_UP_WINDOW_EXCEEDED' as const;
-
-export type StrictCatchUpProviderId = 'primary' | 'fallback-1' | 'fallback-2' | 'fallback-3';
-export type RpcProviderId = StrictCatchUpProviderId;
+export const MAX_STRICT_CATCH_UP_SLOT = 10n ** 78n - 1n;
+export const MAX_DATE_MS = 8_640_000_000_000_000;
 
 export interface StrictCatchUpFailure {
   readonly failureId: string;
   readonly checkpointKey: ProcessingCheckpointKey;
   readonly previous: ProcessingCheckpoint | null;
-  readonly providerId: StrictCatchUpProviderId;
+  readonly providerId: RpcProviderId;
   readonly observedHeadSlot: bigint | null;
   readonly reasonCode: typeof STRICT_CATCH_UP_FAILURE_REASON;
   readonly detectedAtMs: number;
@@ -50,6 +53,7 @@ export function assertValidStrictCatchUpFailure(
   value: unknown,
 ): asserts value is StrictCatchUpFailure {
   try {
+    if (isObject(value) && isProxy(value)) throw invalid();
     if (!Object.isFrozen(value)) throw invalid();
     const record = ownEnumerableDataRecord(value, [
       'failureId', 'checkpointKey', 'previous', 'providerId', 'observedHeadSlot', 'reasonCode',
@@ -75,6 +79,7 @@ function checkedPrevious(
   checkpointKey: ProcessingCheckpointKey,
 ): ProcessingCheckpoint | null {
   if (value === null) return null;
+  if (isObject(value) && isProxy(value)) throw invalid();
   if (!Object.isFrozen(value)) throw invalid();
   return snapshotCheckpoint(value, checkpointKey);
 }
@@ -103,7 +108,7 @@ function snapshotCheckpoint(
 function strictCatchUpFailureId(
   checkpointKey: ProcessingCheckpointKey,
   previous: ProcessingCheckpoint | null,
-  providerId: StrictCatchUpProviderId,
+  providerId: RpcProviderId,
   observedHeadSlot: bigint | null,
 ): string {
   const boundary = previous === null ? null : [previous.slot.toString(), previous.signature];
@@ -123,7 +128,9 @@ function ownEnumerableDataRecord(
   expectedKeys: readonly string[],
 ): Readonly<Record<string, unknown>> {
   try {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid();
+    if (typeof value !== 'object' || value === null || isProxy(value) || Array.isArray(value)) {
+      throw invalid();
+    }
     const prototype: object | null = Object.getPrototypeOf(value) as object | null;
     if (prototype !== Object.prototype && prototype !== null) throw invalid();
     const keys = Reflect.ownKeys(value);
@@ -148,7 +155,7 @@ function checkpointKeyFrom(value: unknown): ProcessingCheckpointKey {
   return value;
 }
 
-function providerIdFrom(value: unknown): StrictCatchUpProviderId {
+function providerIdFrom(value: unknown): RpcProviderId {
   if (value === 'primary' || value === 'fallback-1' || value === 'fallback-2' || value === 'fallback-3') {
     return value;
   }
@@ -161,7 +168,9 @@ function nullableSlotFrom(value: unknown): bigint | null {
 }
 
 function slotFrom(value: unknown): bigint {
-  if (typeof value !== 'bigint' || value < 0n) throw invalid();
+  if (typeof value !== 'bigint' || value < 0n || value > MAX_STRICT_CATCH_UP_SLOT) {
+    throw invalid();
+  }
   return value;
 }
 
@@ -176,7 +185,12 @@ function signatureFrom(value: unknown): string {
 }
 
 function millisecondsFrom(value: unknown): number {
-  if (!Number.isSafeInteger(value) || (value as number) < 0 || Object.is(value, -0)) {
+  if (
+    !Number.isSafeInteger(value)
+    || (value as number) < 0
+    || (value as number) > MAX_DATE_MS
+    || Object.is(value, -0)
+  ) {
     throw invalid();
   }
   return value as number;
@@ -184,4 +198,8 @@ function millisecondsFrom(value: unknown): number {
 
 function invalid(): StrictCatchUpFailureValidationError {
   return new StrictCatchUpFailureValidationError();
+}
+
+function isObject(value: unknown): value is object {
+  return typeof value === 'object' && value !== null;
 }

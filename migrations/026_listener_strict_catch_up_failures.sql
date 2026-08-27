@@ -37,6 +37,15 @@ CREATE TABLE IF NOT EXISTS listener_strict_catch_up_failures (
   CONSTRAINT listener_strict_catch_up_failures_reason_check CHECK (
     reason_code IN ('CATCH_UP_WINDOW_EXCEEDED')
   ),
+  CONSTRAINT listener_strict_catch_up_failures_detected_at_check CHECK (
+    isfinite(detected_at)
+  ),
+  CONSTRAINT listener_strict_catch_up_failures_resolved_at_check CHECK (
+    resolved_at IS NULL OR isfinite(resolved_at)
+  ),
+  CONSTRAINT listener_strict_catch_up_failures_purge_after_check CHECK (
+    purge_after IS NULL OR isfinite(purge_after)
+  ),
   CONSTRAINT listener_strict_catch_up_failures_lifecycle_check CHECK (
     (resolved_at IS NULL AND purge_after IS NULL)
     OR (

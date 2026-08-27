@@ -54,6 +54,9 @@ void test('creates replayable strict catch-up failure evidence without unsafe di
   assert.match(sql, /detected_at TIMESTAMPTZ NOT NULL/u);
   assert.match(sql, /resolved_at TIMESTAMPTZ/u);
   assert.match(sql, /purge_after TIMESTAMPTZ/u);
+  assert.match(sql, /isfinite\(detected_at\)/u);
+  assert.match(sql, /resolved_at IS NULL OR isfinite\(resolved_at\)/u);
+  assert.match(sql, /purge_after IS NULL OR isfinite\(purge_after\)/u);
   assert.match(sql, /resolved_at IS NULL AND purge_after IS NULL/u);
   assert.match(sql, /resolved_at IS NOT NULL[\s\S]*purge_after IS NOT NULL/u);
   assert.match(sql, /purge_after = resolved_at \+ INTERVAL '4 hours'/u);
@@ -85,18 +88,20 @@ void test('enforces strict failure lifecycle and finite numeric boundaries in Po
       readonly previousSlot?: string;
       readonly previousSignature?: string | null;
       readonly observedHeadSlot?: string | null;
+      readonly detectedAt?: string;
       readonly resolvedAt?: string | null;
       readonly purgeAfter?: string | null;
     }> = {}) => pool.query(`INSERT INTO listener_strict_catch_up_failures (
       failure_id, checkpoint_key, previous_slot, previous_signature, provider_id,
       observed_head_slot, reason_code, detected_at, resolved_at, purge_after
     ) VALUES ($1, 'launchpad', $2::NUMERIC, $3, 'primary', $4::NUMERIC,
-      'CATCH_UP_WINDOW_EXCEEDED', '2025-01-01T00:00:00.000Z', $5::TIMESTAMPTZ,
-      $6::TIMESTAMPTZ)`, [
+      'CATCH_UP_WINDOW_EXCEEDED', $5::TIMESTAMPTZ, $6::TIMESTAMPTZ,
+      $7::TIMESTAMPTZ)`, [
       failureId,
       values.previousSlot ?? '1',
       values.previousSignature ?? 'strict-boundary',
       values.observedHeadSlot ?? '2',
+      values.detectedAt ?? '2025-01-01T00:00:00.000Z',
       values.resolvedAt ?? null,
       values.purgeAfter ?? null,
     ]);
@@ -113,7 +118,39 @@ void test('enforces strict failure lifecycle and finite numeric boundaries in Po
       insert(`${prefix}${'c'.repeat(64)}`, { observedHeadSlot: 'NaN' }),
       /listener_strict_catch_up_failures_head_check/u,
     );
-    await insert(`${prefix}${'d'.repeat(64)}`, {
+    await assert.rejects(
+      insert(`${prefix}${'d'.repeat(64)}`, { detectedAt: 'infinity' }),
+      /listener_strict_catch_up_failures_detected_at_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'e'.repeat(64)}`, { detectedAt: '-infinity' }),
+      /listener_strict_catch_up_failures_detected_at_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'f'.repeat(64)}`, {
+        resolvedAt: 'infinity', purgeAfter: 'infinity',
+      }),
+      /listener_strict_catch_up_failures_resolved_at_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'0'.repeat(64)}`, {
+        resolvedAt: '-infinity', purgeAfter: '-infinity',
+      }),
+      /listener_strict_catch_up_failures_resolved_at_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'1'.repeat(64)}`, {
+        resolvedAt: '2025-01-01T00:00:00.000Z', purgeAfter: 'infinity',
+      }),
+      /listener_strict_catch_up_failures_purge_after_check/u,
+    );
+    await assert.rejects(
+      insert(`${prefix}${'2'.repeat(64)}`, {
+        resolvedAt: '2025-01-01T00:00:00.000Z', purgeAfter: '-infinity',
+      }),
+      /listener_strict_catch_up_failures_purge_after_check/u,
+    );
+    await insert(`${prefix}${'3'.repeat(64)}`, {
       resolvedAt: '2025-01-01T00:00:00.000Z',
       purgeAfter: '2025-01-01T04:00:00.000Z',
     });
