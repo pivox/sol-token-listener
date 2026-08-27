@@ -2,7 +2,14 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { parseConfig } from '../src/config/env.js';
+import { FinalityReconciler } from '../src/application/finality-reconciler.js';
+import type {
+  FinalityCandidate,
+  FinalityPollObservation,
+  FinalityRevision,
+} from '../src/domain/transaction-ingestion.js';
 import type { TokenLaunch } from '../src/domain/types.js';
+import type { FinalityProviderPassSource } from '../src/ports/finality-provider-pass.js';
 import { createCatchUpGap } from '../src/domain/transaction-ingestion.js';
 import type { getDatabasePool } from '../src/storage/database.js';
 import {
@@ -106,6 +113,26 @@ void test('production wires the redacted HTTP RPC failover event sink', async ()
   assert.ok(sink);
   assert.match(sink, /logger\.warn\(event, 'Événement de basculement HTTP RPC observé\.'\)/u);
   assert.doesNotMatch(sink, /(?:httpRpcUrl|wsRpcUrl|fallbackUrls|endpointUrl|host|provider|key|cause|error)/iu);
+});
+
+void test('production pins finality to one primary provider pass without coupling it to HTTP failover', async () => {
+  const factory = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+  const pinnedAdapter = await readFile(
+    new URL('../src/solana/rpc/provider-pinned-finality-source.ts', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(factory, /import\s*\{[^}]*\bcreateRpcProviderCatalog\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/rpc-provider-catalog\.js['"]/u);
+  assert.match(factory, /import\s*\{[^}]*\bcreateProviderPinnedFinalityPass\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/provider-pinned-finality-source\.js['"]/u);
+  assert.match(factory, /const providers = createRpcProviderCatalog\(config\);/u);
+  assert.match(factory, /const primaryFinality = createProviderPinnedFinalityPass\(providers, 'primary'\);/u);
+  assert.match(factory, /const finalitySource: FinalityProviderPassSource = Object\.freeze\(\{\s*openPass: \(\) => primaryFinality,\s*\}\);/u);
+  assert.match(factory, /new FinalityReconciler\(finalitySource, inbox,/u);
+  assert.doesNotMatch(factory, /new FinalityReconciler\(rpc, inbox,/u);
+  assert.doesNotMatch(pinnedAdapter, /http-failover-transport/u);
 });
 
 void test('keeps the acknowledged WebSocket session foundation inactive until issue 63', async () => {
@@ -390,6 +417,63 @@ void test('finality close fences an in-flight pass and rejects stale timer activ
   await Promise.resolve();
   assert.equal(runs, 2);
   assert.equal(reconciler.state(), 'STOPPED');
+});
+
+void test('finality recurrence degrades on an unavailable block then returns to RUNNING with a fresh proof', async () => {
+  const scheduler = new ManualScheduler();
+  const candidate: FinalityCandidate = Object.freeze({
+    signature: '1'.repeat(64), slot: 10n, confirmationStatus: 'processed',
+    missingFinalityPolls: 1, lastMissingFinalityProviderId: 'primary',
+    finalityEvidenceVersion: 1n, processedAtMs: 1,
+  });
+  let current = candidate;
+  const revisions: FinalityRevision[] = [];
+  let blockAvailable = false;
+  const source: FinalityProviderPassSource = Object.freeze({
+    openPass: () => Object.freeze({
+      providerId: 'primary' as const,
+      async getHistoryStatuses() { return [null]; },
+      async getFinalizedSlot() { return 11n; },
+      async getFinalizedBlockSignatures() {
+        if (!blockAvailable) throw new Error('block unavailable');
+        return [];
+      },
+    }),
+  });
+  const repository = {
+    async listForFinality() { return Object.freeze([current]); },
+    async recordFinalityPoll(value: FinalityPollObservation) {
+      assert.equal(value.expectedMissingFinalityPolls, current.missingFinalityPolls);
+      assert.equal(value.expectedLastMissingFinalityProviderId, current.lastMissingFinalityProviderId);
+      assert.equal(value.expectedFinalityEvidenceVersion, current.finalityEvidenceVersion);
+      current = Object.freeze({
+        ...current,
+        missingFinalityPolls: current.lastMissingFinalityProviderId === value.providerId
+          ? current.missingFinalityPolls + 1
+          : 1,
+        lastMissingFinalityProviderId: value.providerId,
+        finalityEvidenceVersion: current.finalityEvidenceVersion + 1n,
+      });
+      return current;
+    },
+    async enqueueRevision(value: FinalityRevision) { revisions.push(value); },
+  };
+  const recurring = new RecurringFinalityReconciler(
+    new FinalityReconciler(source, repository, {
+      limit: 1, missingPollThreshold: 2, now: () => 1_000,
+    }),
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler },
+  );
+
+  await assert.rejects(recurring.start());
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(revisions.length, 0);
+
+  blockAvailable = true;
+  await recurring.start();
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.deepEqual(revisions.map((revision) => revision.confirmationStatus), ['orphaned']);
+  await recurring.close();
 });
 
 void test('accepts the exact Node timer bound and rejects overflow or fractions', () => {

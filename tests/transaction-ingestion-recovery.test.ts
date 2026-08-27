@@ -7,6 +7,7 @@ import { LaunchParticipantAnalyticsService } from '../src/application/launch-par
 import { LaunchpadObservationService } from '../src/application/launchpad-observation.service.js';
 import { MarketObservationService } from '../src/application/market-observation.service.js';
 import { ObservedTransactionPipeline } from '../src/application/observed-transaction-pipeline.js';
+import { FinalityReconciler } from '../src/application/finality-reconciler.js';
 import { QualificationProjectionService } from '../src/application/qualification-projection.service.js';
 import { QualificationRebuildService } from '../src/application/qualification-rebuild.service.js';
 import { PersistentListenerHeartbeat } from '../src/application/production-listener-factory.js';
@@ -34,6 +35,7 @@ import { PaperTradingEngine } from '../src/paper/paper-trading-engine.js';
 import { createDefaultQualificationRuleSet, QualificationEngine } from '../src/qualification/qualification-engine.js';
 import { SolanaWalletFundingEvidenceExtractor } from '../src/solana/wallet-funding-evidence-extractor.js';
 import type { NormalizedInstruction, NormalizedTransaction } from '../src/solana/rpc/types.js';
+import type { FinalityProviderPassSource } from '../src/ports/finality-provider-pass.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { PostgresLaunchpadEventRepository } from '../src/storage/launchpad-event.repository.js';
 import { PostgresApiProjectionRepository } from '../src/storage/api-projection.repository.js';
@@ -267,6 +269,54 @@ void test('processes a compound confirmed-to-orphaned replay and preserves audit
       participantProfiles: '0', participantPositions: '0', graphProfiles: '0',
       graphRelationships: '0', graphClusters: '0', activeMarketPools: '0',
       currentQualifications: '0',
+    });
+  });
+});
+
+void test('resets missing finality evidence after a restart on fallback before accepting its fresh orphan proof', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const fixture = await loadPumpFixture('create-v2-initial-buy-mainnet.json');
+    const transaction = migrationTransaction(fixture.transaction);
+    const repository = new PostgresTransactionInboxRepository(pool);
+    await repository.enqueue(Object.freeze({
+      signature: transaction.signature,
+      slot: transaction.slot,
+      source: 'WEBSOCKET' as const,
+      programIds: Object.freeze([PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID].sort()),
+      confirmationStatus: 'confirmed' as const,
+      observedAtMs: 1_000,
+    }));
+    assert.deepEqual(
+      await worker(repository, transaction, pipeline(pool, null, [])).runOnce(),
+      { kind: 'processed', signature: transaction.signature },
+    );
+
+    const primary = new FinalityReconciler(
+      missingFinalityPass('primary', transaction.slot), repository,
+      { limit: 1, missingPollThreshold: 3, now: () => 2_000 },
+    );
+    await primary.runOnce();
+    await primary.runOnce();
+    assert.deepEqual(await finalityEvidence(pool, transaction.signature), {
+      missingPolls: 2, providerId: 'primary', confirmationStatus: 'confirmed',
+      processingStatus: 'PROCESSED',
+    });
+
+    const restartedFallback = new FinalityReconciler(
+      missingFinalityPass('fallback-1', transaction.slot), repository,
+      { limit: 1, missingPollThreshold: 3, now: () => 3_000 },
+    );
+    await restartedFallback.runOnce();
+    assert.deepEqual(await finalityEvidence(pool, transaction.signature), {
+      missingPolls: 1, providerId: 'fallback-1', confirmationStatus: 'confirmed',
+      processingStatus: 'PROCESSED',
+    });
+
+    await restartedFallback.runOnce();
+    await restartedFallback.runOnce();
+    assert.deepEqual(await finalityEvidence(pool, transaction.signature), {
+      missingPolls: 0, providerId: null, confirmationStatus: 'orphaned',
+      processingStatus: 'PENDING',
     });
   });
 });
@@ -808,6 +858,46 @@ async function inboxRow(pool: InstanceType<typeof pg.Pool>, signature: string): 
   const row = result.rows[0];
   if (row === undefined) throw new Error('Inbox row missing');
   return row;
+}
+
+function missingFinalityPass(
+  providerId: 'primary' | 'fallback-1',
+  slot: bigint,
+): FinalityProviderPassSource {
+  return Object.freeze({
+    openPass: () => Object.freeze({
+      providerId,
+      async getHistoryStatuses() { return [null]; },
+      async getFinalizedSlot() { return slot + 1n; },
+      async getFinalizedBlockSignatures() { return []; },
+    }),
+  });
+}
+
+async function finalityEvidence(
+  pool: InstanceType<typeof pg.Pool>,
+  signature: string,
+): Promise<{
+  readonly missingPolls: number;
+  readonly providerId: string | null;
+  readonly confirmationStatus: string;
+  readonly processingStatus: string;
+}> {
+  const row = (await pool.query<{
+    missing_finality_polls: number;
+    last_missing_finality_provider_id: string | null;
+    target_confirmation_status: string;
+    processing_status: string;
+  }>(`SELECT missing_finality_polls, last_missing_finality_provider_id,
+      target_confirmation_status, processing_status
+    FROM chain_transaction_inbox WHERE signature = $1`, [signature])).rows[0];
+  if (row === undefined) throw new Error('Finality evidence row missing');
+  return Object.freeze({
+    missingPolls: row.missing_finality_polls,
+    providerId: row.last_missing_finality_provider_id,
+    confirmationStatus: row.target_confirmation_status,
+    processingStatus: row.processing_status,
+  });
 }
 
 async function truncateRuntimeData(pool: InstanceType<typeof pg.Pool>): Promise<void> {
