@@ -40,6 +40,7 @@ services:
     environment:
       <<: *database-environment
       SOLANA_HTTP_RPC_URL: ${SOLANA_HTTP_RPC_URL:?SOLANA_HTTP_RPC_URL is required}
+      SOLANA_HTTP_RPC_FALLBACK_URLS: ${SOLANA_HTTP_RPC_FALLBACK_URLS:-}
       SOLANA_WS_RPC_URL: ${SOLANA_WS_RPC_URL:?SOLANA_WS_RPC_URL is required}
       EXECUTION_MODE: observe
       PAPER_STRATEGY_ENABLED: "false"
