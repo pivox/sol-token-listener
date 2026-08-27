@@ -1,7 +1,7 @@
 import { Connection, type Commitment } from '@solana/web3.js';
 import bs58 from 'bs58';
-import type { CatchUpSource } from '../../application/catch-up-scanner.js';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
+import type { CatchUpSource } from '../../ports/catch-up-source.js';
 import {
   SolanaCatchUpSource,
   type SignaturesForAddressRpc,

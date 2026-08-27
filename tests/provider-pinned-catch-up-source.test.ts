@@ -12,6 +12,8 @@ import {
   type ProviderPinnedCatchUpSourceDependencies,
 } from '../src/solana/rpc/provider-pinned-catch-up-source.js';
 import type { RpcProviderCatalog } from '../src/solana/rpc/rpc-provider-catalog.js';
+import type { CatchUpSource as LegacyCatchUpSource } from '../src/application/catch-up-scanner.js';
+import type { CatchUpSource as CanonicalCatchUpSource } from '../src/ports/catch-up-source.js';
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
 const PROGRAM = '11111111111111111111111111111111';
@@ -64,6 +66,14 @@ void test('shares one in-flight genesis verification between concurrent first pa
   await Promise.all([first, second]);
   assert.equal(rpc.genesisCalls, 1);
   assert.equal(rpc.calls.length, 2);
+});
+
+void test('shares the neutral catch-up source contract with the legacy scanner export', () => {
+  const pinned: CanonicalCatchUpSource = createProviderPinnedCatchUpSource(
+    catalog(), 'primary', 'confirmed', EXPECTED_GENESIS, dependencies(() => new FakeRpc([], EXPECTED_GENESIS, [])),
+  );
+  const legacy: LegacyCatchUpSource = pinned;
+  assert.equal(typeof legacy.list, 'function');
 });
 
 void test('uses the default Connection against only the selected URL with no internal 429 retry', async () => {
@@ -223,6 +233,7 @@ void test('does not import the HTTP failover transport or expose URL and RPC int
   const sourcePath = new URL('../src/solana/rpc/provider-pinned-catch-up-source.ts', import.meta.url);
   const content = await readFile(sourcePath, 'utf8');
   assert.doesNotMatch(content, /http-failover-transport/u);
+  assert.doesNotMatch(content, /from ['"]\.\.\/\.\.\/application\//u);
   const source = createProviderPinnedCatchUpSource(
     catalog(() => pair('https://url-secret.invalid/rpc')), 'primary', 'confirmed', EXPECTED_GENESIS,
     dependencies(() => new FakeRpc([], EXPECTED_GENESIS, [])),

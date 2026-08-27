@@ -7,6 +7,7 @@ import { createCatchUpGap } from '../domain/transaction-ingestion.js';
 import { reconcileConfirmationStatus } from '../domain/confirmation-status.js';
 import { PUMP_PROGRAM_ID } from '../launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../markets/pumpswap/constants.js';
+import type { CatchUpSource } from '../ports/catch-up-source.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
 import {
   CatchUpSourceError,
@@ -20,9 +21,7 @@ export const MAX_CATCH_UP_PAGES = 100;
 
 type ProgramKey = 'launchpad' | 'market';
 
-export interface CatchUpSource {
-  list(programId: string, before: string | undefined, limit: number): Promise<unknown>;
-}
+export type { CatchUpSource } from '../ports/catch-up-source.js';
 
 export type CatchUpScannerRepository = Pick<
   TransactionInboxRepository,
