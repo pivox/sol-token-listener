@@ -202,10 +202,8 @@ function missingReason(facts: PaperMvpSourcePosition): PaperMvpUnknownReason | n
 
 function sourceMatches(facts: PaperMvpSourcePosition): boolean {
   return facts.status === 'PAPER_CLOSED'
-    && (facts.entryDecisionJobCount === 0 || (
-      facts.entryDecisionJobCount === 1
-      && facts.entryDecisionJobAtMs === facts.entryDecisionAtMs
-    ))
+    && facts.entryDecisionJobCount === 1
+    && facts.entryDecisionJobAtMs === facts.entryDecisionAtMs
     && facts.entryTradeId === facts.buyTradeId
     && facts.buySide === 'BUY'
     && facts.buyInputMint === facts.quoteMint

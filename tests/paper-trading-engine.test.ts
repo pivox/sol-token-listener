@@ -89,6 +89,68 @@ void test('attache la lignée décisionnelle complète à la position paper', as
   assert.equal(position.candidateId, `candidate_${'c'.repeat(64)}`);
 });
 
+void test('refuse une entrée creation-entry-v1 sans provenance décisionnelle avant toute mutation', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = Object.freeze({
+    ...openCommand(),
+    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+  });
+
+  await assert.rejects(engine.open(command), hasCode('QUOTE_INVALID'));
+
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('refuse une quote creation-entry-v1 antérieure à sa décision avant toute mutation', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = Object.freeze({
+    ...openCommand(),
+    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+    entryDecisionAtMs: 2,
+    entryDecisionJobId: 'paper_decision_job_1',
+    buyQuote: Object.freeze({ ...openCommand().buyQuote, observedAtMs: 1 }),
+  });
+
+  await assert.rejects(engine.open(command), hasCode('QUOTE_INVALID'));
+
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('refuse une quote creation-entry-v1 postérieure à l’horloge avant toute mutation', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = Object.freeze({
+    ...openCommand(),
+    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+    entryDecisionAtMs: 1,
+    entryDecisionJobId: 'paper_decision_job_1',
+    buyQuote: Object.freeze({ ...openCommand().buyQuote, observedAtMs: 1_001 }),
+  });
+
+  await assert.rejects(engine.open(command), hasCode('QUOTE_INVALID'));
+
+  assert.equal(repository.writeCount, 0);
+});
+
+void test('accepte une décision et une quote creation-entry-v1 aux bornes causales', async () => {
+  const repository = new MemoryPaperRepository();
+  const engine = makeEngine(repository, 'paper');
+  const command = Object.freeze({
+    ...openCommand(),
+    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+    entryDecisionAtMs: 1_000,
+    entryDecisionJobId: 'paper_decision_job_1',
+    buyQuote: Object.freeze({ ...openCommand().buyQuote, observedAtMs: 1_000 }),
+  });
+
+  const position = await engine.open(command);
+
+  assert.equal(position.status, 'PAPER_HOLDING');
+  assert.equal(repository.writeCount, 1);
+});
+
 void test('guards the current qualification before every strategy-linked position read',async()=>{
   const operations:string[]=[];
   const repository:PaperTradingRepository={
@@ -846,6 +908,8 @@ void test('refuse une quote de clôture antérieure au déclencheur avant toute 
   const opened = await engine.open({
     ...openCommand(),
     strategy: { id: 'creation-entry-v1', version: 1 },
+    entryDecisionAtMs: 1,
+    entryDecisionJobId: 'paper_decision_job_1',
   });
   const command = closeCommand(opened.id);
 
@@ -864,6 +928,8 @@ void test('autorise le retry manuel legacy sans inventer son horodatage', async 
   const opened = await engine.open({
     ...openCommand(),
     strategy: { id: 'creation-entry-v1', version: 1 },
+    entryDecisionAtMs: 1,
+    entryDecisionJobId: 'paper_decision_job_1',
   });
   const command = closeCommand(opened.id);
 
@@ -883,6 +949,7 @@ void test('accepts a quote exactly at the trigger and reconciles finality withou
   const engine = makeEngine(repository,'paper');
   const opened = await engine.open({
     ...openCommand(),strategy:{ id:'creation-entry-v1',version:1 },
+    entryDecisionAtMs:1,entryDecisionJobId:'paper_decision_job_1',
   });
   const command = Object.freeze({
     ...closeCommand(opened.id),exitTriggerAtMs:1,

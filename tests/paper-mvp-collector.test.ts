@@ -102,6 +102,35 @@ void test('collects exact authoritative position facts and preserves bigint valu
   });
 });
 
+void test('marks a closed position with no exact entry-decision job as unknown', async () => {
+  const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
+  const repository = fakeRepository(async (progress) => {
+    recordedProgress.push(progress);
+    return Object.freeze({
+      ...runSnapshot.run,
+      counters: Object.freeze({
+        ...runSnapshot.run.counters,
+        unknownTerminalPositions: progress.unknownPositions.length,
+      }),
+      updatedAtMs: progress.observedAtMs,
+    });
+  });
+  const source: PaperMvpSource = Object.freeze({
+    collectBatch: async () => Object.freeze({
+      positions: Object.freeze([Object.freeze({ ...validFacts(), entryDecisionJobCount: 0 })]),
+      creationsObserved: 0, entriesRejected: 0,
+      duplicateLogicalBuys: 0, duplicateLogicalSells: 0,
+    }),
+  });
+
+  await new PaperMvpCollector(repository, source, () => 8_000)
+    .collect({ runId: 'run-1', runnerOwnerId: OWNER, limit: 1 });
+
+  assert.deepEqual(recordedProgress[0]?.unknownPositions, [
+    { positionId: 'position-1', reason: 'SOURCE_CONTRADICTION' },
+  ]);
+});
+
 void test('persists the authoritative provider probe snapshot on every collection', async () => {
   const recordedProgress: Parameters<PaperMvpRepository['recordProgress']>[0][] = [];
   const repository = fakeRepository(async (progress) => {

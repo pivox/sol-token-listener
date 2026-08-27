@@ -72,10 +72,13 @@ export class PaperTradingEngine {
       triggerEventId: trigger.id,
     })) invalidQualification();
     const snapshot = snapshotOpenCommand(command, qualification, mint, trigger);
+    const openedAtMs = this.clock.now();
+    assertValidTimestampMs('occurredAtMs', openedAtMs);
     validateOpenCommand(
       snapshot,
       this.config.paperQuoteMintAllowlist,
       this.qualificationProfile,
+      openedAtMs,
     );
     const roundTrip = calculateRoundTrip(snapshot.buyQuote, snapshot.reverseSellQuote);
     validateQualificationExecutionFacts(
@@ -93,9 +96,6 @@ export class PaperTradingEngine {
       snapshot.trigger.id,
     ]);
     const openCommandHashes = hashOpenCommand(snapshot);
-    const openedAtMs = this.clock.now();
-    assertValidTimestampMs('occurredAtMs', openedAtMs);
-
     return this.repository.transact(async (transaction) => {
       if(snapshot.expectedCurrentQualification!==undefined){
         await transaction.requireCurrentQualification(snapshot.expectedCurrentQualification);
@@ -200,6 +200,7 @@ export class PaperTradingEngine {
       snapshot,
       this.config.paperQuoteMintAllowlist,
       this.qualificationProfile,
+      this.clock.now(),
     );
     const roundTrip = calculateRoundTrip(snapshot.buyQuote, snapshot.reverseSellQuote);
     validateQualificationExecutionFacts(
@@ -498,13 +499,25 @@ function validateOpenCommand(
   command: OpenPaperPositionCommand,
   allowlist: readonly string[],
   qualificationProfile: EffectiveQualificationProfile,
+  openedAtMs: number,
 ): void {
   if (command.mint.trim() === '' || command.trigger.mint !== command.mint) invalidQuote('mint');
-  if ((command.entryDecisionAtMs === undefined) !== (command.entryDecisionJobId === undefined)) {
+  const creationEntry = command.strategy.id === 'creation-entry-v1';
+  if (
+    (command.entryDecisionAtMs === undefined) !== (command.entryDecisionJobId === undefined)
+    || (creationEntry && (command.entryDecisionAtMs === undefined || command.entryDecisionJobId === undefined))
+  ) {
     invalidQuote('entryDecision');
   }
   if (command.entryDecisionAtMs !== undefined) {
     assertValidTimestampMs('occurredAtMs', command.entryDecisionAtMs);
+    if (command.entryDecisionAtMs > command.buyQuote.observedAtMs) invalidQuote('buyQuote.observedAtMs');
+  }
+  if (command.entryDecisionJobId?.trim() === '') {
+    invalidQuote('entryDecisionJobId');
+  }
+  if (creationEntry && command.buyQuote.observedAtMs > openedAtMs) {
+    invalidQuote('buyQuote.observedAtMs');
   }
   if (command.strategy.id.trim() === '' || !Number.isSafeInteger(command.strategy.version) || command.strategy.version <= 0) {
     invalidQuote('strategy');
