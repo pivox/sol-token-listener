@@ -3,8 +3,12 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.0.5
+Version: 1.1.0
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.1.0 selects an inactive dedicated strict scanner for issue #60,
+defines explicit genesis-hash trust, exact checkpoint CAS semantics,
+coalescing behavior, and the durable lifecycle of strict-window failures.
 
 Revision 1.0.5 makes setup failure await the actual socket close under the
 five-second cleanup bound, including the partial-ACK notification path.
@@ -106,12 +110,12 @@ diagnostic may contain a URL, hostname, provider name, header, query secret,
 close reason, raw frame or remote error.
 
 Before a candidate can be promoted, its provider-pinned HTTP client must
-report the expected genesis hash. Issue #60 must define that expectation from
-a reviewed closed mapping for standard clusters or an explicit validated
-custom-cluster value; it must never derive the expectation from the primary
-endpoint during the same boot. Ordinary HTTP consumers may keep the bounded
-request-level failover introduced by issue #56; one logical recovery or
-finality proof must instead remain pinned to one provider.
+report an explicit, validated, operator-supplied expected genesis hash. It
+must never derive the expectation from the primary endpoint during the same
+boot. This remains explicit for public clusters because Devnet and Testnet can
+reset. Ordinary HTTP consumers may keep the bounded request-level failover
+introduced by issue #56; one logical recovery or finality proof must instead
+remain pinned to one provider.
 
 ## Acknowledged program-log session
 
@@ -189,6 +193,62 @@ observed head slot, fixed reason, and detected/resolved timestamps. It is not
 automatically purged while unresolved. Once resolved, it is retained for four
 hours and then purged. Checkpoints remain unchanged until a later strict scan
 reaches the same boundary.
+
+Issue #60 introduces a dedicated strict scanner instead of changing the
+legacy policy-aware startup scanner. The production factory continues to use
+the legacy scanner and `SolanaProgramSubscriber` until #63. The strict scanner
+receives one already selected provider ID and a provider-pinned HTTP source;
+it has no URL selection, fallback, timer, WebSocket, health or promotion
+responsibility.
+
+Before its first page request, the pinned source calls `getGenesisHash` and
+compares the canonical base58 result with an explicit expected hash supplied
+by trusted configuration. The expectation is never learned from the primary
+RPC endpoint during the same boot. #60 keeps this value at the inactive
+constructor boundary; #63 will expose and validate the deployment setting
+when the supervisor is activated. This avoids changing current startup
+configuration before the new path is complete and avoids embedding resettable
+Devnet/Testnet values. The official RPC contract returns the connected
+cluster's base58 genesis hash; a mismatch is a fixed, redacted provider
+failure. The implementation is based on the official Solana
+[`getGenesisHash`](https://solana.com/docs/rpc/http/getgenesishash) and
+[`getSignaturesForAddress`](https://solana.com/docs/rpc/http/getsignaturesforaddress)
+contracts.
+
+One logical scan captures both exact checkpoints before network pagination.
+For each program, it walks `getSignaturesForAddress` newest-to-oldest using
+`before`, on the same provider, until it encounters the captured `(slot,
+signature)` pair. A missing checkpoint intentionally establishes only the
+newest bounded page as the initial frontier, matching the existing cold-start
+contract. An existing checkpoint is always strict. Partial page results stay
+in memory: if either program cannot reach its boundary, no notification or
+checkpoint from that logical scan is written.
+
+After both walks succeed, merged discoveries are enqueued oldest-to-newest.
+Only after every enqueue is durable does the scanner advance each changed
+program checkpoint through `compareAndSwapCheckpoint(expected, next)`. The
+expected value includes exact absence on cold start, or exact key, slot and
+signature for an existing row. Timestamps are evidence, not CAS identity. A
+CAS conflict is a fixed transient scanner failure; it never falls back to the
+monotonic `storeCheckpoint` method. A crash or conflict after one program CAS
+is safe: the next scan captures the new durable boundary for that program and
+replays the other through the idempotent inbox.
+
+`listener_strict_catch_up_failures` is distinct from voluntary
+`listener_catch_up_gaps`. Its deterministic identity covers checkpoint key,
+exact starting boundary (including absence), observed head slot and fixed
+reason. The stored provider is only the positional ID. Repeating the same
+evidence is idempotent and preserves the first detection time. A successful
+later strict scan resolves failures for the reached exact boundary. Unresolved
+rows have no purge timestamp; resolution sets `resolved_at` and
+`purge_after = resolved_at + 4 hours`. Purge deletes resolved expired rows
+only.
+
+The issue #60 coordinator accepts concurrent scan requests but runs at most
+one scan. Requests received while active share the current promise rather than
+queueing an unbounded second run. Scheduling the 30-second periodic trigger,
+provider rotation, unanimous-window evaluation and health transitions remain
+owned by #63.
 
 To limit quota without weakening the invariant, the supervisor serializes and
 coalesces strict scans on one fixed 30-second V1 interval. It never starts a
