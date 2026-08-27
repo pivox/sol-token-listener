@@ -460,10 +460,11 @@ async function assertObservationLimits(
   const row = result.rows[0];
   if (row === undefined) throw new PaperMvpConflictError('PROGRESS_LIMIT_EXCEEDED');
   const validCount = safeNumber(row.valid_count);
-  if (validCount > targetClosedPositions || safeNumber(row.unknown_count) > 1_000) {
+  const unknownCount = safeNumber(row.unknown_count);
+  if (validCount > targetClosedPositions || unknownCount > 1_000) {
     throw new PaperMvpConflictError('PROGRESS_LIMIT_EXCEEDED');
   }
-  if (validCount > openedPositions) {
+  if (validCount + unknownCount > openedPositions) {
     throw new PaperMvpConflictError('PROGRESS_REGRESSION');
   }
 }

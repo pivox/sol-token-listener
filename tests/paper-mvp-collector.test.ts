@@ -773,6 +773,7 @@ void test('retains sampled expired position coverage until the active run termin
       WHERE position_id=$1`, [
       'position-1',new Date(startedAt + 4_000),new Date(startedAt + 8_000),new Date(expiredAt),
     ]);
+    await seedExpiredVenueEvidence(pool,new Date(expiredAt));
     const repository = new PostgresPaperMvpRepository(pool);
     const run = await repository.startOrResume(runSnapshot.run.configuration,OWNER,startedAt);
     const sample = createPaperMvpPositionSample({
@@ -802,6 +803,13 @@ void test('retains sampled expired position coverage until the active run termin
     assert.equal((await pool.query("SELECT 1 FROM paper_positions WHERE position_id='position-1'")).rowCount,1);
     assert.equal((await pool.query("SELECT 1 FROM paper_trades WHERE position_id='position-1'")).rowCount,4);
     assert.equal((await pool.query("SELECT 1 FROM token_launches WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM bonding_curve_snapshots WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM launch_trades WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM market_trades WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM market_reserve_snapshots WHERE pool_address='POOL'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id IN ('curve-trade','migration-event','activation-event')")).rowCount,3);
     const coverage = await new PostgresPaperMvpSource(pool).collectBatch({
       runId:run.runId,startedAtMs:run.startedAtMs,deadlineAtMs:run.deadlineAtMs,
       observedAtMs:now,strategyId:'creation-entry-v1',strategyVersion:1,limit:10,
@@ -820,6 +828,13 @@ void test('retains sampled expired position coverage until the active run termin
     assert.equal((await pool.query("SELECT 1 FROM paper_positions WHERE position_id='position-1'")).rowCount,0);
     assert.equal((await pool.query("SELECT 1 FROM paper_trades WHERE position_id='position-1'")).rowCount,0);
     assert.equal((await pool.query("SELECT 1 FROM token_launches WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM bonding_curve_snapshots WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM launch_trades WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_trades WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_reserve_snapshots WHERE pool_address='POOL'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id IN ('curve-trade','migration-event','activation-event')")).rowCount,0);
   });
 });
 
@@ -906,6 +921,10 @@ void test('fails an abandoned run deterministically and releases its retained so
     const jobTerminalAt = expiredAt - 14_400_000;
     const startedAt = now - 181_000;
     const expectedTerminalAt = startedAt + 60_000 + 120_000;
+    await pool.query(`UPDATE token_launches SET detected_at=$1,updated_at=$1,
+      terminal_at=$2,purge_after=$2 WHERE mint='MINT'`, [
+      new Date(startedAt - 1),new Date(expiredAt),
+    ]);
     await pool.query(`UPDATE paper_decision_jobs SET
       updated_at=$2,terminal_at=$2,purge_after=$3 WHERE job_id=$1`, [
       `paper_job_${'a'.repeat(64)}`,new Date(jobTerminalAt),new Date(expiredAt),
@@ -918,6 +937,7 @@ void test('fails an abandoned run deterministically and releases its retained so
       WHERE position_id='position-1'`, [
       new Date(startedAt + 1_000),new Date(startedAt + 2_000),new Date(expiredAt),
     ]);
+    await seedExpiredVenueEvidence(pool,new Date(expiredAt));
     const repository = new PostgresPaperMvpRepository(pool);
     const abandoned = await repository.startOrResume(runSnapshot.run.configuration, OWNER, startedAt);
 
@@ -929,6 +949,12 @@ void test('fails an abandoned run deterministically and releases its retained so
     assert.equal(failed?.run.terminalAtMs,expectedTerminalAt);
     assert.equal(failed?.run.purgeAfterMs,expectedTerminalAt + 14_400_000);
     assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM bonding_curve_snapshots WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM launch_trades WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_trades WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_reserve_snapshots WHERE pool_address='POOL'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,0);
     const replacement = await repository.startOrResume(runSnapshot.run.configuration, OWNER, now);
     assert.notEqual(replacement.runId,abandoned.runId);
 
@@ -944,6 +970,75 @@ void test('fails an abandoned run deterministically and releases its retained so
     const finalPurge = await purgeExpiredFoundationData(pool);
     assert.equal(finalPurge.paperMvpRuns,1);
     assert.equal(await repository.load(ancient.runId),null);
+  });
+});
+
+void test('serializes active-run terminalization across the complete retention transaction', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL retention serialization test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    await seedPostgresFacts(pool);
+    const now = Date.now();
+    const startedAt = now - 61_000;
+    const expiredAt = now - 1_000;
+    await pool.query(`UPDATE token_launches SET detected_at=$1,updated_at=$1,
+      terminal_at=$2,purge_after=$2 WHERE mint='MINT'`, [
+      new Date(startedAt - 1),new Date(expiredAt),
+    ]);
+    await pool.query(`UPDATE paper_positions SET opened_at=$1,closed_at=$2,purge_after=$3
+      WHERE position_id='position-1'`, [
+      new Date(startedAt + 4_000),new Date(startedAt + 8_000),new Date(expiredAt),
+    ]);
+    await seedExpiredVenueEvidence(pool,new Date(expiredAt));
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(runSnapshot.run.configuration,OWNER,startedAt);
+    const advisoryKey = 4_900_055;
+    await pool.query(`CREATE FUNCTION block_retracted_position_purge()
+      RETURNS trigger LANGUAGE plpgsql AS $function$
+      BEGIN
+        IF OLD.position_id='position-retracted' THEN
+          PERFORM pg_advisory_lock(${advisoryKey});
+          PERFORM pg_advisory_unlock(${advisoryKey});
+        END IF;
+        RETURN OLD;
+      END
+      $function$`);
+    await pool.query(`CREATE TRIGGER block_retracted_position_purge_trigger
+      BEFORE DELETE ON paper_positions FOR EACH ROW
+      EXECUTE FUNCTION block_retracted_position_purge()`);
+    const blocker = await pool.connect();
+    let blockerLocked = false;
+    let purge: Promise<Awaited<ReturnType<typeof purgeExpiredFoundationData>>> | undefined;
+    let terminalization: Promise<unknown> | undefined;
+    try {
+      await blocker.query('SELECT pg_advisory_lock($1)',[advisoryKey]);
+      blockerLocked = true;
+      purge = purgeExpiredFoundationData(pool);
+      await waitForDatabaseWait(pool,'%DELETE FROM paper_positions position%');
+      terminalization = repository.terminalize({
+        runId:run.runId,runnerOwnerId:OWNER,terminalAtMs:now,
+        state:'FAILED',completionReason:null,report:null,failureCode:'TEST_TERMINAL',
+      });
+      await waitForDatabaseWait(pool,'%pg_advisory_xact_lock_shared%');
+      await blocker.query('SELECT pg_advisory_unlock($1)',[advisoryKey]);
+      blockerLocked = false;
+      await purge;
+      await terminalization;
+    } finally {
+      if (blockerLocked) await blocker.query('SELECT pg_advisory_unlock($1)',[advisoryKey]);
+      blocker.release();
+      await Promise.allSettled([purge,terminalization].filter((value) => value !== undefined));
+    }
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,1);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id='migration-event'")).rowCount,1);
+    await purgeExpiredFoundationData(pool);
+    assert.equal((await pool.query("SELECT 1 FROM market_pools WHERE base_mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM migrations WHERE mint='MINT'")).rowCount,0);
+    assert.equal((await pool.query("SELECT 1 FROM domain_events WHERE event_id='migration-event'")).rowCount,0);
   });
 });
 
@@ -1237,6 +1332,76 @@ async function seedPostgresFacts(pool: InstanceType<typeof pg.Pool>): Promise<vo
   ) VALUES ('position-retracted','MINT','SOL',9,'SPL_TOKEN','creation-entry-v1',1,
     'PAPER_RETRACTED',1,1,1,0,'missing-buy','open-hash-2','source-open',1,'{}',
     $1,$2,$3)`, [date(1_500),date(1_800),date(1_800 + 14_400_000)]);
+}
+
+async function seedExpiredVenueEvidence(
+  pool:InstanceType<typeof pg.Pool>,purgeAfter:Date,
+):Promise<void> {
+  await pool.query(`INSERT INTO bonding_curve_snapshots (
+    snapshot_id,mint,quote_mint,quote_decimals,quote_token_program,
+    real_base_reserves_raw,real_quote_reserves_raw,virtual_base_reserves_raw,
+    virtual_quote_reserves_raw,progress_bps,complete,slot,transaction_index,
+    instruction_index,confirmation_status,purge_after
+  ) VALUES ('curve-snapshot','MINT','SOL',9,'SPL_TOKEN',100,200,300,400,5000,
+    false,2,0,0,'confirmed',$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO launch_trades (
+    trade_id,mint,trade_kind,trader,base_amount_raw,quote_amount_raw,quote_mint,
+    quote_decimals,quote_token_program,slot,transaction_index,instruction_index,
+    confirmation_status,purge_after
+  ) VALUES ('launch-trade','MINT','BUY','buyer',10,20,'SOL',9,'SPL_TOKEN',
+    2,0,1,'confirmed',$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,type,mint,source,program,signature,slot,transaction_index,
+    instruction_index,confirmation_status,observed_at,payload_version,payload,
+    terminal_at,purge_after
+  ) VALUES
+    ('curve-trade','BondingCurveTradeObserved','MINT','pumpfun','pump','curve-signature',
+      2,0,1,'confirmed',$1,1,'{}',$1,$1),
+    ('migration-event','MigrationObserved','MINT','pumpfun','pump','migration-signature',
+      3,0,0,'confirmed',$1,1,'{}',$1,$1),
+    ('activation-event','PumpSwapPoolActivated','MINT','pumpswap','pumpswap','activation-signature',
+      4,0,0,'confirmed',$1,1,'{}',$1,$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO migrations (
+    migration_id,event_id,mint,bonding_curve,announced_pool,instruction_kind,
+    quote_mint,quote_decimals,base_token_program,quote_token_program,
+    confirmation_status,payload_version,payload,terminal_at,purge_after
+  ) VALUES ('migration','migration-event','MINT','CURVE','POOL','MIGRATE','SOL',9,
+    'SPL_TOKEN','SPL_TOKEN','confirmed',1,'{}',$1,$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO market_pools (
+    pool_address,market,program_id,pool_index,creator,base_mint,quote_mint,
+    quote_decimals,base_token_program,quote_token_program,base_vault,quote_vault,
+    lp_mint,migration_id,activation_event_id,pool_state,confirmation_status,slot,
+    transaction_index,instruction_index,payload_version,payload,terminal_at,purge_after
+  ) VALUES ('POOL','pumpswap','pumpswap',0,'creator','MINT','SOL',9,'SPL_TOKEN',
+    'SPL_TOKEN','BASE_VAULT','QUOTE_VAULT','LP','migration','activation-event','active',
+    'confirmed',4,0,0,1,'{}',$1,$1)`,[purgeAfter]);
+  await pool.query(`INSERT INTO market_reserve_snapshots (
+    snapshot_id,pool_address,base_reserves_raw,quote_vault_amount_raw,
+    virtual_quote_reserves_raw,effective_quote_reserves_raw,observed_slot,trigger_slot,
+    transaction_index,instruction_index,confirmation_status,observed_at,terminal_at,purge_after
+  ) VALUES ('market-snapshot','POOL',100,200,10,210,4,4,0,0,'confirmed',$1,$1,$1)`,
+  [purgeAfter]);
+  await pool.query(`INSERT INTO market_trades (
+    trade_id,pool_address,mint,quote_mint,trade_kind,trader,base_amount_raw,
+    quote_amount_raw,signature,slot,transaction_index,instruction_index,
+    confirmation_status,payload_version,payload,observed_at,terminal_at,purge_after
+  ) VALUES ('market-trade','POOL','MINT','SOL','BUY','buyer',10,20,
+    'market-signature',5,0,0,'confirmed',1,'{}',$1,$1,$1)`,[purgeAfter]);
+}
+
+async function waitForDatabaseWait(
+  pool:InstanceType<typeof pg.Pool>,queryPattern:string,
+):Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ readonly waiting:boolean }>(`SELECT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+      WHERE datname=current_database() AND wait_event='advisory' AND query ILIKE $1
+    ) AS waiting`,[queryPattern]);
+    if (result.rows[0]?.waiting === true) return;
+    await new Promise((resolve) => setTimeout(resolve,25));
+  }
+  throw new Error('PostgreSQL retention wait was not observed before timeout.');
 }
 
 function quoteIdentifier(identifier:string):string {

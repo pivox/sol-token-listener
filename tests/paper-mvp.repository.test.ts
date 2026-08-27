@@ -279,12 +279,15 @@ void test('bounds cumulative observations without charging identical replays', a
       positionId: `bounded-unknown-${index.toString().padStart(4, '0')}`,
       reason: 'MISSING_SELL_TRADE' as const,
     })));
+    const twoThousandPositionsCounters = Object.freeze({
+      ...thousandPositionsCounters,openedPositions:2_000,
+    });
     assert.equal((await repository.recordProgress({
       runId: run.runId,
       runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_001,
       observedAtMs: 2_003,
-      counters: thousandPositionsCounters,
+      counters: twoThousandPositionsCounters,
       providerUsage: usage,
       samples: Object.freeze([]),
       unknownPositions,
@@ -294,7 +297,7 @@ void test('bounds cumulative observations without charging identical replays', a
       runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_003,
       observedAtMs: 2_004,
-      counters: thousandPositionsCounters,
+      counters: twoThousandPositionsCounters,
       providerUsage: usage,
       samples: Object.freeze([]),
       unknownPositions,
@@ -304,7 +307,7 @@ void test('bounds cumulative observations without charging identical replays', a
       runnerOwnerId: OWNER,
       expectedUpdatedAtMs: 2_004,
       observedAtMs: 2_005,
-      counters: thousandPositionsCounters,
+      counters: twoThousandPositionsCounters,
       providerUsage: usage,
       samples: Object.freeze([]),
       unknownPositions: Object.freeze([Object.freeze({
@@ -430,6 +433,30 @@ void test('rolls back a valid sample when opened positions would under-report it
     }),isConflict('PROGRESS_REGRESSION'));
     const after = await repository.load(run.runId);
     assert.equal(after?.samples.length,0);
+    assert.equal(after?.run.updatedAtMs,1_000);
+  });
+});
+
+void test('rolls back an unknown terminal observation when opened positions under-report it', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: PostgreSQL unknown coverage invariant test skipped');
+    return;
+  }
+  await withSchema(databaseUrl, async (pool) => {
+    const repository = new PostgresPaperMvpRepository(pool);
+    const run = await repository.startOrResume(configuration,OWNER,1_000);
+    await assert.rejects(repository.recordProgress({
+      runId:run.runId,runnerOwnerId:OWNER,expectedUpdatedAtMs:run.updatedAtMs,
+      observedAtMs:2_000,
+      counters:Object.freeze({ ...progressCounters,openedPositions:0,openPositions:0 }),
+      providerUsage:run.providerUsage,samples:Object.freeze([]),
+      unknownPositions:Object.freeze([Object.freeze({
+        positionId:'unknown-position',reason:'SOURCE_CONTRADICTION',
+      })]),
+    }),isConflict('PROGRESS_REGRESSION'));
+    const after = await repository.load(run.runId);
+    assert.equal(after?.unknownPositions.length,0);
     assert.equal(after?.run.updatedAtMs,1_000);
   });
 });
