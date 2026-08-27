@@ -132,6 +132,41 @@ void test('forwards web3 RequestInit and attempts a rate-limited primary exactly
   }
 });
 
+void test('uses web3 getBlockSignatures so getBlock receives its official signatures-only request and returns signatures', async () => {
+  const calls: { readonly method: string; readonly params: readonly unknown[] }[] = [];
+  const fetch: FetchFn = async (_input, init) => {
+    const request = parseRequestBody(init) as {
+      readonly id: string;
+      readonly method: string;
+      readonly params: readonly unknown[];
+    };
+    calls.push({ method: request.method, params: request.params });
+    return jsonRpcResponse(request.id, {
+      blockhash: 'blockhash',
+      previousBlockhash: 'previous-blockhash',
+      parentSlot: 3,
+      signatures: ['signature-one', 'signature-two'],
+      blockTime: null,
+    });
+  };
+  const rpc = new SolanaRpcClient({
+    httpRpcUrl: 'https://primary.invalid/rpc',
+    httpRpcFallbackUrls: Object.freeze(['https://fallback.invalid/rpc']),
+    wsRpcUrl: 'wss://websocket.invalid/rpc',
+    commitment: 'confirmed',
+    finality: 'finalized',
+  }, { fetch });
+
+  const signatures = await rpc.getBlockSignatures(4n, 'FINALIZED');
+
+  assert.deepEqual(signatures, ['signature-one', 'signature-two']);
+  assert.equal(Object.isFrozen(signatures), true);
+  assert.deepEqual(calls, [{
+    method: 'getBlock',
+    params: [4, { commitment: 'finalized', transactionDetails: 'signatures', rewards: false }],
+  }]);
+});
+
 function inputUrl(input: FetchInput): string {
   if (typeof input === 'string') return input;
   if (input instanceof URL) return input.toString();

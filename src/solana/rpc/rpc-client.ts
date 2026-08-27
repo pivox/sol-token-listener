@@ -101,21 +101,13 @@ export class SolanaRpcClient {
   async getBlockSignatures(
     slot: bigint,
     confirmationStatus: Exclude<LegacyConfirmationStatus, 'ORPHANED'>,
-  ): Promise<readonly string[] | null> {
+  ): Promise<readonly string[]> {
     const numericSlot = Number(slot);
     if (!Number.isSafeInteger(numericSlot) || numericSlot < 0) {
       throw new TypeError('Solana block slot is invalid.');
     }
-    const response = await this.http.getBlock(numericSlot, {
-      commitment: rpcFinality(confirmationStatus),
-      transactionDetails: 'signatures',
-      rewards: false,
-      maxSupportedTransactionVersion: 0,
-    });
-    const block = response as unknown as { readonly signatures: readonly string[] } | null;
-    return block === null
-      ? null
-      : Object.freeze([...block.signatures]);
+    const block = await this.http.getBlockSignatures(numericSlot, rpcFinality(confirmationStatus));
+    return Object.freeze([...block.signatures]);
   }
 
   async getHistoryStatuses(signatures: readonly string[]): Promise<readonly ({
