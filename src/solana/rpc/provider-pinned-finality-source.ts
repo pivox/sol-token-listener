@@ -116,7 +116,7 @@ function resolveHttpUrl(catalog: RpcProviderCatalog, providerId: RpcProviderId):
   let pair: unknown;
   try {
     const resolve = dataMethod(catalog, 'resolve');
-    pair = resolve.call(catalog, providerId);
+    pair = Reflect.apply(resolve, catalog, [providerId]);
   } catch {
     throw failure('CONFIG_INVALID', providerId);
   }
@@ -144,10 +144,12 @@ function createPinnedCalls(
     const block = dataMethod(rpc, 'getBlockSignatures');
     return Object.freeze({
       history: (signatures: string[], options: { searchTransactionHistory: true }) => (
-        Promise.resolve(history.call(rpc, signatures, options))
+        Promise.resolve(Reflect.apply(history, rpc, [signatures, options]))
       ),
-      root: (commitment: 'finalized') => Promise.resolve(root.call(rpc, commitment)),
-      block: (slot: number, commitment: 'finalized') => Promise.resolve(block.call(rpc, slot, commitment)),
+      root: (commitment: 'finalized') => Promise.resolve(Reflect.apply(root, rpc, [commitment])),
+      block: (slot: number, commitment: 'finalized') => (
+        Promise.resolve(Reflect.apply(block, rpc, [slot, commitment]))
+      ),
     });
   } catch {
     throw failure('CONFIG_INVALID', providerId);
@@ -221,12 +223,12 @@ function trustedArray(value: unknown, maximumLength: number, requireFrozen: bool
     || !Number.isSafeInteger(length)
     || length < 0
     || length > maximumLength) throw new TypeError();
-  const keys = Reflect.ownKeys(value);
-  if (keys.length !== length + 1 || !keys.includes('length')) throw new TypeError();
+  const keys = new Set(Reflect.ownKeys(value));
+  if (keys.size !== length + 1 || !keys.has('length')) throw new TypeError();
   const entries: unknown[] = [];
   for (let index = 0; index < length; index += 1) {
     const key = String(index);
-    if (!keys.includes(key)) throw new TypeError();
+    if (!keys.has(key)) throw new TypeError();
     entries.push(dataProperty(value, key));
   }
   return entries;

@@ -14,6 +14,7 @@ const SIGNATURE = bs58.encode(Uint8Array.from({ length: 64 }, () => 7));
 
 void test('resolves once, creates one direct RPC, and keeps all finality reads on it', async () => {
   const rpc = new FakeRpc();
+  const laterRpc = new FakeRpc();
   let resolved = 0;
   let created = 0;
   const pass: FinalityProviderPass = createProviderPinnedFinalityPass(
@@ -25,12 +26,10 @@ void test('resolves once, creates one direct RPC, and keeps all finality reads o
     dependencies((url) => {
       created += 1;
       assert.equal(url, 'https://provider-secret.invalid/rpc');
-      return rpc;
+      return created === 1 ? rpc : laterRpc;
     }),
   );
 
-  assert.equal(resolved, 1);
-  assert.equal(created, 1);
   assert.deepEqual(Reflect.ownKeys(pass), ['providerId', 'getHistoryStatuses', 'getFinalizedSlot', 'getFinalizedBlockSignatures']);
   assert.equal(Object.isFrozen(pass), true);
   assert.equal(JSON.stringify(pass), '{"providerId":"fallback-1"}');
@@ -40,10 +39,101 @@ void test('resolves once, creates one direct RPC, and keeps all finality reads o
   ]);
   assert.equal(await pass.getFinalizedSlot(), 99n);
   assert.deepEqual(await pass.getFinalizedBlockSignatures(88n), [SIGNATURE]);
+  assert.deepEqual(await pass.getFinalizedBlockSignatures(89n), [SIGNATURE]);
+  assert.equal(resolved, 1);
+  assert.equal(created, 1);
   assert.deepEqual(rpc.calls, [
     ['history', [SIGNATURE], { searchTransactionHistory: true }],
     ['slot', 'finalized'],
     ['block', 88, 'finalized'],
+    ['block', 89, 'finalized'],
+  ]);
+  assert.deepEqual(laterRpc.calls, []);
+});
+
+void test('invokes a captured catalog resolver without consulting its hostile call property', () => {
+  let callGetterReads = 0;
+  const resolve = function resolveProvider(
+    this: unknown,
+    id: Parameters<RpcProviderCatalog['resolve']>[0],
+  ) {
+    assert.equal(this, inputCatalog);
+    return pair('https://provider.invalid/rpc', id);
+  };
+  Object.defineProperty(resolve, 'call', {
+    configurable: true,
+    get() {
+      callGetterReads += 1;
+      throw new Error('resolver-call-secret');
+    },
+  });
+  const inputCatalog: RpcProviderCatalog = Object.freeze({
+    ids: Object.freeze(['primary'] as const), resolve,
+  });
+
+  const pass = createProviderPinnedFinalityPass(
+    inputCatalog, 'primary', dependencies(() => new FakeRpc()),
+  );
+
+  assert.equal(pass.providerId, 'primary');
+  assert.equal(callGetterReads, 0);
+});
+
+void test('invokes captured RPC methods without consulting hostile call properties and preserves receivers', async () => {
+  const callGetterReads = { history: 0, root: 0, block: 0 };
+  const calls: unknown[] = [];
+  const history = function getSignatureStatuses(
+    this: unknown,
+    signatures: readonly string[],
+    options: unknown,
+  ): unknown {
+    assert.equal(this, rpc);
+    calls.push(['history', [...signatures], options]);
+    return { value: [{ slot: 1, confirmationStatus: 'confirmed' }] };
+  };
+  const root = function getSlot(this: unknown, commitment: unknown): unknown {
+    assert.equal(this, rpc);
+    calls.push(['slot', commitment]);
+    return 2;
+  };
+  const block = function getBlockSignatures(this: unknown, slot: number, commitment: unknown): unknown {
+    assert.equal(this, rpc);
+    calls.push(['block', slot, commitment]);
+    return { signatures: [SIGNATURE] };
+  };
+  for (const [name, method] of [
+    ['history', history], ['root', root], ['block', block],
+  ] as const) {
+    Object.defineProperty(method, 'call', {
+      configurable: true,
+      get() {
+        callGetterReads[name] += 1;
+        throw new Error(`${name}-call-secret`);
+      },
+    });
+  }
+  const rpc = Object.freeze({
+    getSignatureStatuses: history,
+    getSlot: root,
+    getBlockSignatures: block,
+  });
+  const pass = createProviderPinnedFinalityPass(catalog(), 'primary', dependencies(() => rpc));
+
+  const results = await Promise.allSettled([
+    pass.getHistoryStatuses(Object.freeze([SIGNATURE])),
+    pass.getFinalizedSlot(),
+    pass.getFinalizedBlockSignatures(3n),
+  ]);
+
+  assert.equal(results.every(({ status }) => status === 'fulfilled'), true);
+  assert.deepEqual(results.map((result) => result.status === 'fulfilled' ? result.value : null), [
+    [{ slot: 1n, confirmationStatus: 'confirmed' }], 2n, [SIGNATURE],
+  ]);
+  assert.deepEqual(callGetterReads, { history: 0, root: 0, block: 0 });
+  assert.deepEqual(calls, [
+    ['history', [SIGNATURE], { searchTransactionHistory: true }],
+    ['slot', 'finalized'],
+    ['block', 3, 'finalized'],
   ]);
 });
 
@@ -57,9 +147,17 @@ void test('accepts 256 canonical history signatures and rejects empty, oversized
   assert.equal(rpc.calls.length, 1);
 
   const sparse = new Array<string>(1);
+  let accessorReads = 0;
   const accessor: string[] = [];
-  Object.defineProperty(accessor, '0', { enumerable: true, get() { throw new Error('accessor-secret'); } });
+  Object.defineProperty(accessor, '0', {
+    enumerable: true,
+    get() {
+      accessorReads += 1;
+      throw new Error('accessor-secret');
+    },
+  });
   accessor.length = 1;
+  Object.freeze(accessor);
   const hostile = new Proxy(Object.freeze([SIGNATURE]), {
     getPrototypeOf() { throw new Error('proxy-secret'); },
   });
@@ -74,6 +172,7 @@ void test('accepts 256 canonical history signatures and rejects empty, oversized
   ]) {
     await assert.rejects(pass.getHistoryStatuses(value), (error: unknown) => invalid(error, 'CONFIG_INVALID'));
   }
+  assert.equal(accessorReads, 0);
 });
 
 void test('validates and freezes detached history, root, and block evidence', async () => {
@@ -164,11 +263,20 @@ void test('maps rejected, null, malformed, and hostile remote values to fixed re
   const pass = createProviderPinnedFinalityPass(
     catalog(() => pair(`https://${secret}/rpc`)), 'primary', dependencies(() => rpc),
   );
+  let remoteGetterReads = 0;
+  const hostileResponse = Object.create(null) as { value?: unknown };
+  Object.defineProperty(hostileResponse, 'value', {
+    enumerable: true,
+    get() {
+      remoteGetterReads += 1;
+      throw new Error(secret);
+    },
+  });
   const scenarios: readonly [keyof FakeRpc, unknown, () => Promise<unknown>, string][] = [
     ['historyResponse', new Error(`https://${secret}/history`), () => pass.getHistoryStatuses(Object.freeze([SIGNATURE])), 'HISTORY_UNAVAILABLE'],
     ['slotResponse', -1, () => pass.getFinalizedSlot(), 'ROOT_UNAVAILABLE'],
     ['blockResponse', null, () => pass.getFinalizedBlockSignatures(1n), 'BLOCK_UNAVAILABLE'],
-    ['historyResponse', { get value() { throw new Error(secret); } }, () => pass.getHistoryStatuses(Object.freeze([SIGNATURE])), 'HISTORY_UNAVAILABLE'],
+    ['historyResponse', hostileResponse, () => pass.getHistoryStatuses(Object.freeze([SIGNATURE])), 'HISTORY_UNAVAILABLE'],
   ];
   for (const [key, value, operation, reason] of scenarios) {
     (rpc as unknown as Record<string, unknown>)[key] = value;
@@ -179,6 +287,7 @@ void test('maps rejected, null, malformed, and hostile remote values to fixed re
       return true;
     });
   }
+  assert.equal(remoteGetterReads, 0);
 });
 
 void test('does not import failover or execution boundaries and does not expose URL or RPC internals', async () => {
@@ -186,6 +295,7 @@ void test('does not import failover or execution boundaries and does not expose 
   const source = await readFile(sourcePath, 'utf8');
   assert.doesNotMatch(source, /http-failover-transport|createRpcHttpFailoverFetch/u);
   assert.doesNotMatch(source, /(?:submission|wallet|signer)/iu);
+  assert.doesNotMatch(source, /\bkeys\.includes\s*\(/u);
   const pass = createProviderPinnedFinalityPass(catalog(() => pair('https://url-secret.invalid/rpc')), 'primary', dependencies(() => new FakeRpc()));
   assert.doesNotMatch(JSON.stringify(pass), /url-secret|rpc/i);
 });
@@ -194,11 +304,14 @@ function dependencies(createRpc: (httpUrl: string) => unknown): ProviderPinnedFi
   return Object.freeze({ createRpc });
 }
 
-function catalog(resolve: () => { id: 'primary' | 'fallback-1'; httpUrl: string; websocketUrl: string } = pair): RpcProviderCatalog {
+function catalog(resolve: () => ReturnType<RpcProviderCatalog['resolve']> = pair): RpcProviderCatalog {
   return Object.freeze({ ids: Object.freeze(['primary'] as const), resolve: () => resolve() });
 }
 
-function pair(httpUrl = 'https://provider.invalid/rpc', id: 'primary' | 'fallback-1' = 'primary') {
+function pair(
+  httpUrl = 'https://provider.invalid/rpc',
+  id: Parameters<RpcProviderCatalog['resolve']>[0] = 'primary',
+): ReturnType<RpcProviderCatalog['resolve']> {
   return Object.freeze({ id, httpUrl, websocketUrl: 'wss://provider.invalid/rpc' });
 }
 
