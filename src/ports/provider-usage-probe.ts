@@ -1,7 +1,14 @@
+import { types } from 'node:util';
 import type { PaperMvpProviderUsage } from '../domain/paper-mvp.js';
 
+const MAX_CREDITS_USED = 10n ** 78n - 1n;
 const MAX_RATE_LIMITED_COUNT = 1_000_000;
+const SNAPSHOT_FIELDS = [
+  'status', 'creditsUsedStart', 'creditsUsedEnd', 'rateLimitedCount',
+] as const;
 const providerUsageSnapshotBrand: unique symbol = Symbol('providerUsageSnapshot');
+
+type SnapshotField = (typeof SNAPSHOT_FIELDS)[number];
 
 export type ProviderUsageSnapshotInput = Readonly<{
   status: 'AVAILABLE';
@@ -30,9 +37,9 @@ export function createProviderUsageSnapshot(
 export function createProviderUsageSnapshot(
   input: unknown,
 ): ProviderUsageSnapshot {
-  if (!isRecord(input) || !hasExactSnapshotFields(input)) invalid();
-  const status = input.status;
-  const rateLimitedCount = input.rateLimitedCount;
+  const fields = snapshotFields(input);
+  const status = fields.status;
+  const rateLimitedCount = fields.rateLimitedCount;
   if (
     typeof rateLimitedCount !== 'number'
     || !Number.isSafeInteger(rateLimitedCount)
@@ -40,11 +47,12 @@ export function createProviderUsageSnapshot(
   ) invalid();
 
   if (status === 'AVAILABLE') {
-    const creditsUsedStart = input.creditsUsedStart;
-    const creditsUsedEnd = input.creditsUsedEnd;
+    const creditsUsedStart = fields.creditsUsedStart;
+    const creditsUsedEnd = fields.creditsUsedEnd;
     if (
       typeof creditsUsedStart !== 'bigint' || typeof creditsUsedEnd !== 'bigint'
-      || creditsUsedStart < 0n || creditsUsedEnd < creditsUsedStart
+      || creditsUsedStart < 0n || creditsUsedStart > MAX_CREDITS_USED
+      || creditsUsedEnd < creditsUsedStart || creditsUsedEnd > MAX_CREDITS_USED
     ) invalid();
     return branded({
       status: 'AVAILABLE' as const,
@@ -56,7 +64,7 @@ export function createProviderUsageSnapshot(
 
   if (
     status !== 'UNAVAILABLE'
-    || input.creditsUsedStart !== null || input.creditsUsedEnd !== null
+    || fields.creditsUsedStart !== null || fields.creditsUsedEnd !== null
   ) invalid();
   return branded({
     status: 'UNAVAILABLE' as const,
@@ -71,17 +79,38 @@ function branded(snapshot: PaperMvpProviderUsage): ProviderUsageSnapshot {
   return Object.freeze(snapshot) as ProviderUsageSnapshot;
 }
 
-function hasExactSnapshotFields(value: Readonly<Record<string, unknown>>): boolean {
-  const fields = Object.keys(value).sort();
-  return fields.length === 4
-    && fields[0] === 'creditsUsedEnd'
-    && fields[1] === 'creditsUsedStart'
-    && fields[2] === 'rateLimitedCount'
-    && fields[3] === 'status';
-}
-
-function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+function snapshotFields(input: unknown): Record<SnapshotField, unknown> {
+  try {
+    if (
+      typeof input !== 'object' || input === null
+      || types.isProxy(input) || Array.isArray(input)
+      || Object.getPrototypeOf(input) !== Object.prototype
+    ) invalid();
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.length !== SNAPSHOT_FIELDS.length
+      || keys.some((key) => typeof key !== 'string' || !SNAPSHOT_FIELDS.includes(key as SnapshotField))
+    ) invalid();
+    const fields: Record<SnapshotField, unknown> = {
+      status: undefined,
+      creditsUsedStart: undefined,
+      creditsUsedEnd: undefined,
+      rateLimitedCount: undefined,
+    };
+    for (const field of SNAPSHOT_FIELDS) {
+      const descriptor = descriptors[field];
+      if (
+        descriptor === undefined || !('value' in descriptor)
+        || descriptor.enumerable !== true || descriptor.writable !== true
+        || descriptor.configurable !== true
+      ) invalid();
+      fields[field] = descriptor.value;
+    }
+    return fields;
+  } catch {
+    invalid();
+  }
 }
 
 function invalid(): never {
