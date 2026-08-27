@@ -149,6 +149,45 @@ void test('does not make an auth-failing fallback sticky after the primary coold
   }
 });
 
+void test('clears stale fallback stickiness after a later auth failure', async () => {
+  for (const status of [401, 403]) {
+    let currentTime = 0;
+    let primaryCalls = 0;
+    let fallbackCalls = 0;
+    const calls: string[] = [];
+    const healthyFallback = reply(200);
+    const authFailure = reply(status);
+    const recoveredPrimary = reply(200);
+    const fetch = createRpcHttpFailoverFetch({
+      endpoints: endpoints.slice(0, 2),
+      now: () => currentTime,
+      fetch: async (input) => {
+        const url = inputUrl(input);
+        calls.push(url);
+        if (url === endpoints[0].url) {
+          primaryCalls += 1;
+          return primaryCalls === 1 ? reply(503) : recoveredPrimary;
+        }
+        fallbackCalls += 1;
+        return fallbackCalls === 1 ? healthyFallback : authFailure;
+      },
+    });
+
+    assert.equal(await fetch(endpoints[0].url), healthyFallback);
+    assert.equal(await fetch(endpoints[0].url), authFailure);
+    assert.deepEqual(calls, [endpoints[0].url, endpoints[1].url, endpoints[1].url], String(status));
+
+    currentTime = 1000;
+    assert.equal(await fetch(endpoints[0].url), recoveredPrimary);
+    assert.deepEqual(calls, [
+      endpoints[0].url,
+      endpoints[1].url,
+      endpoints[1].url,
+      endpoints[0].url,
+    ], String(status));
+  }
+});
+
 void test('keeps an HTTP 200 JSON-RPC error endpoint sticky', async () => {
   const calls: string[] = [];
   const fetch = createRpcHttpFailoverFetch({

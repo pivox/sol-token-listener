@@ -2,8 +2,11 @@
 
 Date: 2026-08-27
 Issue: #56
-Version: 1.0.2
+Version: 1.0.3
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.3: a non-success HTTP response clears stale fallback stickiness
+and makes the primary endpoint preferred for the next logical request.
 
 Revision 1.0.2: only HTTP-success responses update the sticky endpoint;
 endpoint fragments are forbidden because they are not transmitted in HTTP
@@ -111,7 +114,8 @@ For each logical HTTP request:
 4. forward the original request initialization, including method, headers,
    body and abort signal, without parsing or retaining the JSON-RPC body;
 5. return immediately on a non-transient HTTP response, updating the sticky
-   endpoint only when the HTTP response is successful;
+   endpoint when the HTTP response is successful and resetting preference to
+   the primary when it is not;
 6. on a transient failure, put that endpoint in cooldown and try the next
    eligible endpoint;
 7. if no endpoint remains eligible, throw one fixed typed transport error.
@@ -126,6 +130,9 @@ HTTP `400`, `401`, `403`, other status codes, and JSON-RPC errors transported
 inside HTTP `200` are returned to web3.js without rotation. Only an HTTP-success
 response becomes sticky, so an authentication failure does not pin later
 requests to that endpoint while HTTP `200` JSON-RPC responses remain healthy.
+If an already-sticky fallback later returns a non-success response, that
+response is returned unchanged without rotation and the primary becomes the
+preferred starting endpoint for the next logical request.
 This prevents a fallback from hiding invalid credentials, malformed requests
 or deterministic RPC errors. A `null` application result such as unavailable
 archive history is also not a transport failure; existing durable retries

@@ -64,8 +64,10 @@ Sans fallback, le listener conserve exactement le comportement à endpoint uniqu
 de web3.js, y compris son rate-limit retry. Avec des fallbacks, le transport HTTP
 de production ne bascule que sur un rejet réseau ou HTTP 429, 502, 503 et 504.
 Il essaie chaque endpoint éligible au plus une fois par requête logique; le
-dernier endpoint sain reste privilégié. Il ne bascule pas pour un autre 4xx,
-une erreur JSON-RPC en HTTP 200, ou un résultat archive null applicatif.
+dernier endpoint sain reste privilégié. Une réponse HTTP non réussie est
+retournée sans rotation et réinitialise la préférence vers le principal pour
+la requête logique suivante. Il ne bascule pas pour un autre 4xx, une erreur
+JSON-RPC en HTTP 200, ou un résultat archive null applicatif.
 
 `Retry-After` et le délai de refroidissement sont bornés à 60 secondes. Lorsque
 tous les endpoints sont en refroidissement, il n'y a aucune attente interne :

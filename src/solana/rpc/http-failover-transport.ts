@@ -134,7 +134,7 @@ export function createRpcHttpFailoverFetch(options: RpcHttpFailoverFetchOptions)
 
       const reason = transientReason(response.status);
       if (reason === undefined) {
-        if (response.ok) stickyIndex = endpointIndex;
+        stickyIndex = response.ok ? endpointIndex : 0;
         return response;
       }
 

@@ -749,6 +749,7 @@ void test('HTTP RPC failover documentation states the bounded production and soa
     'doublons canoniques',
     "fragments d'URL sont interdits",
     'ne sont pas transmis',
+    'réinitialise la préférence vers le principal',
     'rpc.http_endpoint_degraded',
     'rpc.http_failover',
     'rpc.http_endpoints_exhausted',

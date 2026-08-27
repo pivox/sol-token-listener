@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript 5 strict ESM, Node.js 22 test runner, `@solana/web3.js` 1.98, Pino structured logging.
 
-**Spec:** `docs/superpowers/specs/2026-08-27-solana-http-rpc-failover-design.md` version 1.0.2.
+**Spec:** `docs/superpowers/specs/2026-08-27-solana-http-rpc-failover-design.md` version 1.0.3.
 
 ---
 
