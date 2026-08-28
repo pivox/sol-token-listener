@@ -268,10 +268,12 @@ export class WebSocketFailoverSupervisor {
     }
   }
 
-  #stopReporterOnce(cleanup: () => Promise<void> = () => Promise.resolve()): Promise<void> {
+  #stopReporterOnce(fencedRecords: readonly SessionRecord[] = []): Promise<void> {
     if (!this.#touchStarted) return Promise.resolve();
     this.#reporterStopPromise ??= Promise.resolve().then(
-      () => this.#dependencies.reporter.stop(cleanup),
+      () => this.#dependencies.reporter.stop(
+        () => this.#settleShutdownResources(fencedRecords),
+      ),
     );
     return this.#reporterStopPromise;
   }
@@ -502,7 +504,7 @@ export class WebSocketFailoverSupervisor {
         const cleaned = await this.#cleanupCandidate(candidate);
         return this.#isPermanentlyClosed()
           ? abortedAttempt()
-          : cleaned ? attemptFailureFrom(error) : cleanupFailureAttempt();
+          : cleaned ? strictScanFailureFrom(error, candidate) : cleanupFailureAttempt();
       }
       if (this.#candidate !== candidate || this.#isPermanentlyClosed()
         || controller.signal.aborted) {
@@ -546,6 +548,11 @@ export class WebSocketFailoverSupervisor {
       this.#failedCycleCount = 0;
       this.#pendingRecoveryReason = recoveryReason;
       this.#dependencies.promoted.promote(providerId);
+      const queuedCompletion = candidate.queuedCompletion;
+      candidate.queuedCompletion = null;
+      if (queuedCompletion !== null) {
+        await this.#degradePromotedSession(candidate, queuedCompletion);
+      }
       if (previousIncumbent !== null && previousIncumbent !== candidate) {
         try {
           await this.#closeSession(previousIncumbent);
@@ -558,12 +565,7 @@ export class WebSocketFailoverSupervisor {
           return promotedAttempt();
         }
       }
-      const queuedCompletion = candidate.queuedCompletion;
-      candidate.queuedCompletion = null;
-      if (queuedCompletion !== null) {
-        await this.#degradePromotedSession(candidate, queuedCompletion);
-        return promotedAttempt();
-      }
+      if (queuedCompletion !== null) return promotedAttempt();
       this.#armPeriodicFrontier();
       return promotedAttempt();
     } catch (error) {
@@ -1099,20 +1101,10 @@ export class WebSocketFailoverSupervisor {
       }
     }
     if (this.#touchStarted) {
-      const reporterAlreadyStopping = this.#reporterStopPromise !== null;
       try {
-        await this.#stopReporterOnce(
-          () => this.#settleShutdownResources(fencedRecords),
-        );
+        await this.#stopReporterOnce(fencedRecords);
       } catch {
         cleanupFailed = true;
-      }
-      if (reporterAlreadyStopping) {
-        try {
-          await this.#settleShutdownResources(fencedRecords);
-        } catch {
-          cleanupFailed = true;
-        }
       }
     } else {
       try {
@@ -1523,14 +1515,7 @@ function disconnectReasonFromCompletion(
 }
 
 function attemptFailureFrom(error: unknown): ProviderAttemptResult {
-  if (error instanceof StrictCatchUpAbortedError) return abortedAttempt();
-  if (error instanceof StrictCatchUpWindowExceededError) {
-    return Object.freeze({
-      kind: 'window',
-      error,
-      recoveryReason: 'CATCH_UP_WINDOW_EXCEEDED',
-    });
-  }
+  if (error instanceof StrictCatchUpAbortedError) return nonShutdownAbortFailure();
   if (error instanceof StrictCatchUpScannerError) {
     return Object.freeze({
       kind: 'transient',
@@ -1554,6 +1539,32 @@ function attemptFailureFrom(error: unknown): ProviderAttemptResult {
     kind: 'transient',
     recoveryReason: 'RPC_UNAVAILABLE',
     disconnectReason: null,
+  });
+}
+
+function strictScanFailureFrom(
+  error: unknown,
+  record: SessionRecord,
+): ProviderAttemptResult {
+  if (error instanceof StrictCatchUpAbortedError) return nonShutdownAbortFailure(record);
+  if (error instanceof StrictCatchUpWindowExceededError) {
+    return Object.freeze({
+      kind: 'window',
+      error,
+      recoveryReason: 'CATCH_UP_WINDOW_EXCEEDED',
+    });
+  }
+  return attemptFailureFrom(error);
+}
+
+function nonShutdownAbortFailure(record?: SessionRecord): ProviderAttemptResult {
+  const completionReason = record?.queuedCompletion;
+  return Object.freeze({
+    kind: 'transient',
+    recoveryReason: 'SESSION_FAILURE',
+    disconnectReason: completionReason === null || completionReason === undefined
+      ? 'ABORTED'
+      : disconnectReasonFromCompletion(completionReason),
   });
 }
 

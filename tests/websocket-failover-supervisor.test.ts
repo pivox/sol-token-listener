@@ -221,6 +221,109 @@ void test('mixed or different frontier exhaustion remains degraded with one back
   }
 });
 
+void test('window errors thrown by openSession are transient and never prove unrecoverable', async () => {
+  const providerIds = Object.freeze(['primary', 'fallback-1'] as const);
+  const frontier = strictFrontier('hostile-open');
+  const fixture = supervisorFixture({
+    providerIds,
+    random: () => 0,
+    sessionFactories: providerIds.map((providerId) => () => rejected(
+      new StrictCatchUpWindowExceededError(providerId, 'launchpad', frontier),
+    )),
+  });
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.deepEqual(
+    fixture.calls.filter((call) => call.startsWith('session.open:')),
+    ['session.open:primary', 'session.open:fallback-1'],
+  );
+  assert.equal(fixture.strictCalls.length, 0);
+  assert.equal(
+    fixture.reporter.transitions.some(({ phase }) => phase === 'UNRECOVERABLE'),
+    false,
+  );
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'DEGRADED');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+});
+
+void test('window errors thrown by provider resolution are transient and never prove unrecoverable', async () => {
+  const providerIds = Object.freeze(['primary', 'fallback-1'] as const);
+  const frontier = strictFrontier('hostile-resolve');
+  const fixture = supervisorFixture({
+    providerIds,
+    random: () => 0,
+    resolveFailures: providerIds.map((providerId) => (
+      new StrictCatchUpWindowExceededError(providerId, 'market', frontier)
+    )),
+  });
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.deepEqual(
+    fixture.calls.filter((call) => call.startsWith('catalog.resolve:')),
+    ['catalog.resolve:primary', 'catalog.resolve:fallback-1'],
+  );
+  assert.equal(fixture.calls.some((call) => call.startsWith('session.open:')), false);
+  assert.equal(fixture.strictCalls.length, 0);
+  assert.equal(
+    fixture.reporter.transitions.some(({ phase }) => phase === 'UNRECOVERABLE'),
+    false,
+  );
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'DEGRADED');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+});
+
+void test('non-shutdown strict aborts remain transient, rotate, and schedule one backoff', async () => {
+  const providerIds = Object.freeze(['primary', 'fallback-1'] as const);
+  const primary = controlledSession('primary');
+  const fallback = controlledSession('fallback-1');
+  const primaryScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    providerIds,
+    random: () => 0,
+    sessionFactories: [
+      () => Promise.resolve(primary.session),
+      () => Promise.resolve(fallback.session),
+    ],
+  });
+  fixture.strictResults.push(
+    primaryScan.promise,
+    rejected(new StrictCatchUpAbortedError()),
+  );
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(fixture.strictCalls.length, 1);
+
+  primary.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  primaryScan.reject(new StrictCatchUpAbortedError());
+  await flushLifecycle();
+
+  assert.deepEqual(
+    fixture.calls.filter((call) => call.startsWith('session.open:')),
+    ['session.open:primary', 'session.open:fallback-1'],
+  );
+  assert.deepEqual(
+    fixture.strictCalls.map(({ providerId }) => providerId),
+    ['primary', 'fallback-1'],
+  );
+  assert.equal(primary.closeCalls(), 1);
+  assert.equal(fallback.closeCalls(), 1);
+  assert.equal(
+    fixture.reporter.transitions.some(({ phase }) => phase === 'UNRECOVERABLE'),
+    false,
+  );
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'DEGRADED');
+  assert.equal(fixture.reporter.transitions.at(-1)?.recoveryReasonCode, 'SESSION_FAILURE');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+});
+
 void test('periodic frontier rearms only after successful settlement and never from notifications', async () => {
   const incumbent = controlledSession('primary');
   const periodic = deferred<StrictCatchUpScanResult>();
@@ -343,6 +446,55 @@ void test('stale incumbent completion cannot degrade a replacement promoted afte
   assert.equal(fixture.reporter.transitions.length, transitionCount);
   assert.equal(fixture.supervisor.state(), 'RUNNING');
   assert.equal(fixture.dependencies.promoted.activeProviderId(), 'primary');
+});
+
+void test('queued completion degrades before the previous incumbent close settles', async () => {
+  const previousClose = deferred<undefined>();
+  const incumbent = controlledSession('primary', previousClose.promise);
+  const candidate = controlledSession('primary');
+  const fixture = supervisorFixture({
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    Promise.resolve(scanResult('primary')),
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+
+  const running = deferred<WebSocketHealthSnapshot>();
+  fixture.reporter.transitionOverrides.set('RUNNING', running.promise);
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'RUNNING');
+  const beforeRunning = fixture.reporter.snapshots.at(-1);
+  assert.ok(beforeRunning !== undefined);
+
+  candidate.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+  const runningInput = fixture.reporter.transitions.at(-1);
+  assert.ok(runningInput !== undefined);
+  running.resolve(snapshotFromTransition(runningInput, beforeRunning));
+  await flushLifecycle();
+
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'DEGRADED');
+  assert.equal(fixture.reporter.transitions.at(-1)?.recoveryReasonCode, 'SESSION_FAILURE');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(previousClose.settled(), false);
+
+  previousClose.resolve(undefined);
+  await flushLifecycle();
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [0]);
 });
 
 void test('shutdown during strict recovery aborts, closes once, and waits for the scan', async () => {
@@ -482,6 +634,62 @@ void test('shutdown drains incumbent and candidate overlap exactly once', async 
   assert.equal(fixture.reporter.transitions.length, transitionCount);
   assert.equal(fixture.reporter.stopCalls, 1);
   assert.equal(fixture.supervisor.state(), 'STOPPED');
+});
+
+void test('reporter owns one bounded shutdown cleanup when strict HTTP ignores abort', async () => {
+  const incumbent = controlledSession('primary');
+  const candidate = controlledSession('primary');
+  const ignoredAbortScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    reporterStopFailure: new Error('Expected reporter-owned cleanup timeout.'),
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    ignoredAbortScan.promise,
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  fixture.reporter.transitionOverrides.set(
+    'DEGRADED',
+    rejected(new Error('Expected active degradation failure.')),
+  );
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(fixture.strictCalls.length, 3);
+
+  incumbent.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assert.equal(fixture.reporter.stopCleanupCalls, 1);
+  assert.equal(candidate.closeCalls(), 1);
+
+  const closing = fixture.supervisor.close();
+  let closeSettled = false;
+  void closing.then(
+    () => { closeSettled = true; },
+    () => { closeSettled = true; },
+  );
+  await flushLifecycle();
+
+  assert.equal(fixture.strictCalls.at(-1)?.signal.aborted, true);
+  assert.equal(closeSettled, true);
+  await assertStage(closing, 'cleanup', 'Expected reporter-owned cleanup timeout.');
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assert.equal(fixture.reporter.stopCleanupCalls, 1);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+
+  ignoredAbortScan.reject(new StrictCatchUpAbortedError());
+  await flushLifecycle();
 });
 
 void test('shutdown cleanup timeout aborts the close signal and never reports stopped', async () => {
@@ -1431,6 +1639,8 @@ interface FixtureOptions {
   readonly sessionResult?: Promise<WsProgramSession>;
   readonly sessionResults?: Promise<WsProgramSession>[];
   readonly sessionFactories?: (() => Promise<WsProgramSession>)[];
+  readonly resolveFailures?: Error[];
+  readonly reporterStopFailure?: Error;
   readonly scheduleFailureDelay?: number;
   readonly scheduleError?: Error;
 }
@@ -1479,6 +1689,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     settings.transitionError,
     settings.mutableTransitionResult,
     settings.wrongDisconnectResult,
+    settings.reporterStopFailure,
   );
   const selector = new RecordingSelector(calls, providerIds);
   const strictResults: Promise<StrictCatchUpScanResult>[] = [];
@@ -1507,7 +1718,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
       ?? settings.sessionResult
       ?? openSessionDeferred.promise;
   };
-  const providers = new RecordingCatalog(calls, providerIds);
+  const providers = new RecordingCatalog(calls, providerIds, settings.resolveFailures);
   const dependencies: WebSocketFailoverSupervisorDependencies = Object.freeze({
     providers,
     health: Object.freeze({
@@ -1564,12 +1775,15 @@ class RecordingCatalog implements RpcProviderCatalog {
   public constructor(
     private readonly calls: string[],
     ids: readonly RpcProviderId[],
+    private readonly resolveFailures: Error[] = [],
   ) {
     this.ids = ids;
   }
 
   public resolve(id: RpcProviderId): RpcProviderPair {
     this.calls.push(`catalog.resolve:${id}`);
+    const failure = this.resolveFailures.shift();
+    if (failure !== undefined) throw failure;
     return Object.freeze({
       id,
       httpUrl: 'https://rpc.example/http',
@@ -1587,6 +1801,7 @@ class RecordingReporter extends PersistentWebSocketHealthReporter {
     Promise<WebSocketHealthSnapshot>
   >();
   public stopCalls = 0;
+  public stopCleanupCalls = 0;
   #latestSnapshot = snapshot('CONNECTING', 1n);
 
   public constructor(
@@ -1595,6 +1810,7 @@ class RecordingReporter extends PersistentWebSocketHealthReporter {
     private readonly transitionError: Error = new Error('Expected transition failure.'),
     private readonly mutableTransitionResult?: WebSocketHealthTransition['phase'],
     private readonly wrongDisconnectResult?: WebSocketHealthTransition['phase'],
+    private readonly stopFailure?: Error,
   ) {
     super(
       { async enqueue() {} },
@@ -1645,7 +1861,13 @@ class RecordingReporter extends PersistentWebSocketHealthReporter {
   public override async stop(cleanup: () => Promise<void>): Promise<void> {
     this.stopCalls += 1;
     this.calls.push('reporter.stop');
-    await cleanup();
+    this.stopCleanupCalls += 1;
+    const operation = cleanup();
+    if (this.stopFailure !== undefined) {
+      void operation.catch(() => undefined);
+      throw this.stopFailure;
+    }
+    await operation;
   }
 }
 
