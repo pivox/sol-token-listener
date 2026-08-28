@@ -373,6 +373,43 @@ void test('websocket health reporter accepts exact option records and snapshots 
   ));
 });
 
+void test('websocket health reporter preserves a validated exact scheduler receiver', async () => {
+  const repository = new FakeHealthRepository();
+  repository.transitionResults.push(
+    Promise.resolve(snapshot('STOPPING', 3n)),
+    Promise.resolve(snapshot('STOPPED', 4n)),
+  );
+  const receivers = new WeakSet();
+  const scheduled: unknown[] = [];
+  const cancelled: unknown[] = [];
+  const scheduler = {
+    schedule(this: object, _callback: () => void, _delayMs: number): object {
+      assert.equal(receivers.has(this), true);
+      const handle = Object.freeze({ id: scheduled.length + 1 });
+      scheduled.push(handle);
+      return handle;
+    },
+    cancel(this: object, handle: unknown): void {
+      assert.equal(receivers.has(this), true);
+      cancelled.push(handle);
+    },
+  };
+  receivers.add(scheduler);
+  const reporter = new PersistentWebSocketHealthReporter(
+    { async enqueue() {} },
+    repository,
+    { touchIntervalMs: 5, shutdownTimeoutMs: 20, scheduler },
+  );
+  scheduler.schedule = () => { throw new Error('secret replacement schedule'); };
+  scheduler.cancel = () => { throw new Error('secret replacement cancel'); };
+
+  reporter.startTouch(snapshot('RUNNING', 2n));
+  await reporter.stop(async () => undefined);
+
+  assert.ok(scheduled.length >= 1);
+  assert.equal(cancelled.includes(scheduled[0]), true);
+});
+
 void test('websocket health reporter rejects non-exact schedulers without exposing hostile values', () => {
   let schedulerProxyTraps = 0;
   const hostileScheduler = new Proxy({}, {

@@ -459,9 +459,16 @@ function schedulerFrom(value: unknown): WebSocketHealthReporterScheduler {
   if (typeof scheduler.schedule !== 'function' || typeof scheduler.cancel !== 'function') {
     throw new TypeError();
   }
+  const receiver = value as object;
+  const schedule = scheduler.schedule as WebSocketHealthReporterScheduler['schedule'];
+  const cancel = scheduler.cancel as WebSocketHealthReporterScheduler['cancel'];
   return Object.freeze({
-    schedule: scheduler.schedule as WebSocketHealthReporterScheduler['schedule'],
-    cancel: scheduler.cancel as WebSocketHealthReporterScheduler['cancel'],
+    schedule(callback: () => void, delayMs: number): unknown {
+      return Reflect.apply(schedule, receiver, [callback, delayMs]);
+    },
+    cancel(handle: unknown): void {
+      Reflect.apply(cancel, receiver, [handle]);
+    },
   });
 }
 
