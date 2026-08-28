@@ -3,8 +3,20 @@
 Date: 2026-08-28
 Issue: #62
 Parent issue: #57
-Version: 1.0.3
+Version: 1.0.5
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.5 makes bounded settlement safe when the injected scheduler
+fails or fires synchronously. Promise handlers are attached before timeout
+registration, every rejection remains contained, and only an initialized timer
+handle can be cancelled. Scheduler failure therefore cannot bypass cleanup or
+surface an unhandled dependency rejection.
+
+Revision 1.0.4 closes the resource-safety boundary around failed durable
+shutdown writes. A lifecycle fence, missing snapshot, or `STOPPING` persistence
+failure retains its primary redacted error, but can no longer bypass the
+captured touch fence and bounded session cleanup. No terminal durable transition
+is invented when `STOPPING` was not confirmed.
 
 Revision 1.0.3 records the reviewed shutdown and restart fences. Lifecycle
 transitions accepted before shutdown are serialized before `STOPPING`, while
@@ -285,12 +297,13 @@ bounded periodic `touch`, and fences shutdown against an in-flight write. The
 touch cadence is independent from persistence latency: each timer rearms before
 the write, overlapping ticks are serialized, and at most one immediate
 follow-up is coalesced. Transition persistence failure degrades in memory and
-fails closed. Graceful shutdown writes `STOPPING` after fencing accepted
-lifecycle transitions and always attempts bounded session cleanup after
-fencing an in-flight touch. It writes `STOPPED` only after the caller has
-drained and closed sessions. A preceding touch failure remains explicit as
-`STOPPED/FAILED/CLEANUP_FAILED`; cleanup failure remains
-`DEGRADED/FAILED/CLEANUP_FAILED`.
+fails closed. Graceful shutdown attempts `STOPPING` after fencing accepted
+lifecycle transitions, then always fences the captured in-flight touch and
+attempts bounded session cleanup even when the lifecycle fence, snapshot, or
+`STOPPING` write fails. It writes `STOPPED` only after `STOPPING` was confirmed
+and the caller drained and closed sessions. A preceding touch failure remains
+explicit as `STOPPED/FAILED/CLEANUP_FAILED`; cleanup failure after confirmed
+`STOPPING` remains `DEGRADED/FAILED/CLEANUP_FAILED`.
 
 The reporter and repository are delivered inactive. They are not constructed
 by `createProductionListenerRuntime`, `runApplication`, or configuration in

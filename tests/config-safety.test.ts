@@ -848,10 +848,10 @@ void test('durable WebSocket health documentation is versioned and exposes the e
     readFile(new URL('../docs/superpowers/plans/2026-08-28-durable-websocket-health.md', import.meta.url), 'utf8'),
   ]);
 
-  assert.match(design, /^Version: 1\.0\.3$/mu);
-  assert.match(umbrella, /^Version: 1\.3\.3$/mu);
-  assert.match(umbrella, /durable-websocket-health-design\.md` version\s+1\.0\.3/isu);
-  assert.match(plan, /design v1\.0\.3/iu);
+  assert.match(design, /^Version: 1\.0\.5$/mu);
+  assert.match(umbrella, /^Version: 1\.3\.5$/mu);
+  assert.match(umbrella, /durable-websocket-health-design\.md` version\s+1\.0\.5/isu);
+  assert.match(plan, /design v1\.0\.5/iu);
 
   const sectionStart = api.indexOf('### Santé WebSocket durable');
   const sectionEnd = api.indexOf('\n## SSE', sectionStart);

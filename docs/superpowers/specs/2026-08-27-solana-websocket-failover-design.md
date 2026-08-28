@@ -3,8 +3,18 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.3.3
+Version: 1.3.5
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.3.5 aligns issue #62 with dedicated design version 1.0.5. Bounded
+reporter settlement now contains source rejections before timeout scheduling
+and safely handles scheduler failure or synchronous callbacks without
+cancelling an uninitialized handle.
+
+Revision 1.3.4 aligns issue #62 with dedicated design version 1.0.4. Every
+pre-cleanup reporter failure now preserves its primary result while still
+fencing the captured heartbeat write and attempting bounded resource cleanup;
+no terminal durable phase is invented without a confirmed `STOPPING` write.
 
 Revision 1.3.3 aligns issue #62 with dedicated design version 1.0.3. It
 serializes accepted lifecycle transitions before shutdown, requires bounded
@@ -426,7 +436,7 @@ of falling back request by request.
 
 Issue #62 is specified in
 `docs/superpowers/specs/2026-08-28-durable-websocket-health-design.md` version
-1.0.3. The public object below is backed by an independent bounded snapshot,
+1.0.5. The public object below is backed by an independent bounded snapshot,
 uses generation fencing, and exposes a five-state summary alongside the
 detailed phase. `supervision=INACTIVE` preserves the legacy production health
 contract until #63 atomically activates a new owner before network and API

@@ -290,6 +290,7 @@ export class PersistentWebSocketHealthReporter {
         this.scheduler,
       );
       if (lifecycleResult !== 'complete') {
+        await this.settleShutdownResources(cleanup, pendingTouch);
         this.degraded = true;
         throw reporterError(
           lifecycleResult === 'timeout' ? 'SHUTDOWN_TIMEOUT' : 'TRANSITION_FAILED',
@@ -298,38 +299,21 @@ export class PersistentWebSocketHealthReporter {
     }
     const initial = this.currentSnapshot;
     if (initial === null) {
+      await this.settleShutdownResources(cleanup, pendingTouch);
       this.degraded = true;
       throw reporterError('STATE_CONFLICT');
     }
     const stoppingResult = await this.boundedTransition(stopTransition(initial, 'STOPPING'));
+    const { touchResult, cleanupResult } = await this.settleShutdownResources(
+      cleanup,
+      pendingTouch,
+    );
     if (stoppingResult.kind !== 'complete') {
       this.degraded = true;
       throw reporterError(
         stoppingResult.kind === 'timeout' ? 'SHUTDOWN_TIMEOUT' : 'TRANSITION_FAILED',
       );
     }
-
-    let touchResult: Settlement = 'complete';
-    if (pendingTouch !== null) {
-      touchResult = await settleWithin(
-        pendingTouch,
-        this.shutdownTimeoutMs,
-        this.scheduler,
-      );
-      if (touchResult !== 'complete') this.degraded = true;
-    }
-
-    let cleanupOperation: Promise<void>;
-    try {
-      cleanupOperation = Promise.resolve(cleanup());
-    } catch {
-      cleanupOperation = Promise.reject(new Error());
-    }
-    const cleanupResult = await settleWithin(
-      cleanupOperation,
-      this.shutdownTimeoutMs,
-      this.scheduler,
-    );
     if (touchResult !== 'complete' || cleanupResult !== 'complete') {
       await this.persistShutdownFailure(
         stoppingResult.value,
@@ -351,6 +335,34 @@ export class PersistentWebSocketHealthReporter {
     this.currentSnapshot = stoppedResult.value;
     this.currentPhase = 'STOPPED';
     this.degraded = false;
+  }
+
+  private async settleShutdownResources(
+    cleanup: () => Promise<void>,
+    pendingTouch: Promise<void> | null,
+  ): Promise<ShutdownResourceSettlement> {
+    let touchResult: Settlement = 'complete';
+    if (pendingTouch !== null) {
+      touchResult = await settleWithin(
+        pendingTouch,
+        this.shutdownTimeoutMs,
+        this.scheduler,
+      );
+      if (touchResult !== 'complete') this.degraded = true;
+    }
+
+    let cleanupOperation: Promise<void>;
+    try {
+      cleanupOperation = Promise.resolve(cleanup());
+    } catch {
+      cleanupOperation = Promise.reject(new Error());
+    }
+    const cleanupResult = await settleWithin(
+      cleanupOperation,
+      this.shutdownTimeoutMs,
+      this.scheduler,
+    );
+    return Object.freeze({ touchResult, cleanupResult });
   }
 
   private async persistShutdownFailure(
@@ -376,6 +388,10 @@ export class PersistentWebSocketHealthReporter {
 }
 
 type Settlement = 'complete' | 'failed' | 'timeout';
+type ShutdownResourceSettlement = Readonly<{
+  touchResult: Settlement;
+  cleanupResult: Settlement;
+}>;
 type SettledValue<TValue> =
   | Readonly<{ kind: 'complete'; value: TValue }>
   | Readonly<{ kind: 'failed' | 'timeout' }>;
@@ -417,18 +433,18 @@ function settleValueWithin<TValue>(
       }
       resolve(result);
     };
-    try {
-      timeoutHandle = scheduler.schedule(() => {
-        finish(Object.freeze({ kind: 'timeout' as const }));
-      }, timeoutMs);
-    } catch {
-      resolve(Object.freeze({ kind: 'failed' as const }));
-      return;
-    }
     void operation.then(
       (value) => { finish(Object.freeze({ kind: 'complete' as const, value })); },
       () => { finish(Object.freeze({ kind: 'failed' as const })); },
     );
+    try {
+      timeoutHandle = scheduler.schedule(() => {
+        queueMicrotask(() => { finish(Object.freeze({ kind: 'timeout' as const })); });
+      }, timeoutMs);
+    } catch {
+      settled = true;
+      resolve(Object.freeze({ kind: 'failed' as const }));
+    }
   });
 }
 
