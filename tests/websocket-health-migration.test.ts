@@ -112,6 +112,22 @@ void test('websocket health migration accepts scale-bearing mathematical integer
   });
 });
 
+void test('websocket health retention purge includes the exact expiry boundary', async () => {
+  const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
+  const statement = /const websocketHealthEvidence = await client\.query\(\s*`(?<sql>[\s\S]*?)`,\s*\);/u
+    .exec(source)?.groups?.sql;
+  assert.ok(statement !== undefined);
+  const inclusiveBoundary = /WHERE evidence_purge_after <= clock_timestamp\(\)/u;
+  assert.match(statement, inclusiveBoundary);
+
+  const exclusiveMutation = statement.replace(
+    'evidence_purge_after <= clock_timestamp()',
+    'evidence_purge_after < clock_timestamp()',
+  );
+  assert.notEqual(exclusiveMutation, statement);
+  assert.doesNotMatch(exclusiveMutation, inclusiveBoundary);
+});
+
 void test('websocket health retention keeps unresolved evidence and purges exact four-hour boundaries', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
