@@ -39,6 +39,24 @@ void test('clears only the currently promoted provider', () => {
   assert.throws(() => selector.openPass(), unavailable);
 });
 
+void test('keeps promoted provider state private from runtime property injection', () => {
+  const primary = pass('primary');
+  const fallback = pass('fallback-1');
+  const selector = new PromotedProviderSelector([primary, fallback]);
+  const hostile = 'https://secret.invalid/rpc?token=hostile';
+
+  selector.promote('primary');
+  const storedPasses = Reflect.get(selector, 'passes');
+  if (storedPasses instanceof Map) storedPasses.set('primary', fallback);
+  Reflect.set(selector, 'activeProvider', 'fallback-1');
+  Reflect.set(selector, 'activeProvider', hostile);
+  Reflect.set(selector, 'passes', new Map([['primary', fallback]]));
+
+  assert.equal(selector.activeProviderId(), 'primary');
+  assert.equal(selector.openPass(), primary);
+  assert.doesNotMatch(String(selector.activeProviderId()), /secret|hostile|invalid\/rpc/u);
+});
+
 void test('rejects empty, duplicate, unsupported, and malformed provider-pinned passes without exposing hostile values', () => {
   const primary = pass('primary');
   const duplicate = pass('primary');

@@ -15,8 +15,8 @@ export class PromotedProviderUnavailableError extends Error {
 }
 
 export class PromotedProviderSelector implements FinalityProviderPassSource {
-  private readonly passes: ReadonlyMap<RpcProviderId, FinalityProviderPass>;
-  private activeProvider: RpcProviderId | null = null;
+  readonly #passes: ReadonlyMap<RpcProviderId, FinalityProviderPass>;
+  #activeProvider: RpcProviderId | null = null;
 
   public constructor(passes: readonly FinalityProviderPass[]) {
     const selected = new Map<RpcProviderId, FinalityProviderPass>();
@@ -30,28 +30,28 @@ export class PromotedProviderSelector implements FinalityProviderPassSource {
     } catch {
       throw new TypeError('Provider-pinned finality passes are invalid.');
     }
-    this.passes = selected;
+    this.#passes = selected;
   }
 
   public activeProviderId(): RpcProviderId | null {
-    return this.activeProvider;
+    return this.#activeProvider;
   }
 
   public promote(providerId: RpcProviderId): void {
-    if (!isRpcProviderId(providerId) || !this.passes.has(providerId)) {
+    if (!isRpcProviderId(providerId) || !this.#passes.has(providerId)) {
       throw new TypeError('Promoted RPC provider is invalid.');
     }
-    this.activeProvider = providerId;
+    this.#activeProvider = providerId;
   }
 
   public clear(providerId: RpcProviderId): void {
-    if (this.activeProvider === providerId) this.activeProvider = null;
+    if (this.#activeProvider === providerId) this.#activeProvider = null;
   }
 
   public openPass(): FinalityProviderPass {
-    const providerId = this.activeProvider;
+    const providerId = this.#activeProvider;
     if (providerId === null) throw new PromotedProviderUnavailableError();
-    const pass = this.passes.get(providerId);
+    const pass = this.#passes.get(providerId);
     if (pass === undefined) throw new PromotedProviderUnavailableError();
     return pass;
   }
