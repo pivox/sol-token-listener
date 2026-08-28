@@ -70,6 +70,7 @@ export class PersistentWebSocketHealthReporter {
   private touchSequence = 0;
   private touchRequested = false;
   private touchInFlight: Promise<void> | null = null;
+  private lifecycleTransitionTail: Promise<void> | null = null;
   private permanentlyClosed = false;
   private stopPromise: Promise<void> | null = null;
 
@@ -89,6 +90,34 @@ export class PersistentWebSocketHealthReporter {
   }
 
   public transition(input: WebSocketHealthTransition): Promise<WebSocketHealthSnapshot> {
+    if (this.permanentlyClosed) return Promise.reject(reporterError('STATE_CONFLICT'));
+    const predecessor = this.lifecycleTransitionTail;
+    let releaseFence: () => void = () => undefined;
+    const fence = new Promise<void>((resolve) => { releaseFence = resolve; });
+    this.lifecycleTransitionTail = fence;
+    return new Promise<WebSocketHealthSnapshot>((resolve, reject) => {
+      const finish = (): void => {
+        if (this.lifecycleTransitionTail === fence) this.lifecycleTransitionTail = null;
+        releaseFence();
+      };
+      const start = (): void => {
+        void this.persistTransition(input).then(
+          (snapshot) => {
+            finish();
+            resolve(snapshot);
+          },
+          () => {
+            finish();
+            reject(reporterError('TRANSITION_FAILED'));
+          },
+        );
+      };
+      if (predecessor === null) start();
+      else void predecessor.then(start);
+    });
+  }
+
+  private persistTransition(input: WebSocketHealthTransition): Promise<WebSocketHealthSnapshot> {
     let persistence: Promise<WebSocketHealthSnapshot>;
     try {
       persistence = this.health.transition(input);
@@ -184,7 +213,11 @@ export class PersistentWebSocketHealthReporter {
       }
       this.touchTimer = null;
     }
-    const operation = this.performStop(cleanup);
+    const operation = this.performStop(
+      cleanup,
+      this.lifecycleTransitionTail,
+      this.touchInFlight,
+    );
     this.stopPromise = operation;
     return operation;
   }
@@ -226,11 +259,12 @@ export class PersistentWebSocketHealthReporter {
     } catch {
       dependency = Promise.reject(new Error());
     }
-    const operation = Promise.resolve(dependency).then(
+    const operation = Promise.resolve(dependency);
+    this.touchInFlight = operation;
+    void operation.then(
       () => { this.finishTouch(operation, false); },
       () => { this.finishTouch(operation, true); },
     );
-    this.touchInFlight = operation;
   }
 
   private finishTouch(operation: Promise<void>, failed: boolean): void {
@@ -244,7 +278,24 @@ export class PersistentWebSocketHealthReporter {
     }
   }
 
-  private async performStop(cleanup: () => Promise<void>): Promise<void> {
+  private async performStop(
+    cleanup: () => Promise<void>,
+    lifecycleFence: Promise<void> | null,
+    pendingTouch: Promise<void> | null,
+  ): Promise<void> {
+    if (lifecycleFence !== null) {
+      const lifecycleResult = await settleWithin(
+        lifecycleFence,
+        this.shutdownTimeoutMs,
+        this.scheduler,
+      );
+      if (lifecycleResult !== 'complete') {
+        this.degraded = true;
+        throw reporterError(
+          lifecycleResult === 'timeout' ? 'SHUTDOWN_TIMEOUT' : 'TRANSITION_FAILED',
+        );
+      }
+    }
     const initial = this.currentSnapshot;
     if (initial === null) {
       this.degraded = true;
@@ -258,7 +309,6 @@ export class PersistentWebSocketHealthReporter {
       );
     }
 
-    const pendingTouch = this.touchInFlight;
     if (pendingTouch !== null) {
       const touchResult = await settleWithin(
         pendingTouch,
@@ -318,7 +368,7 @@ export class PersistentWebSocketHealthReporter {
     input: WebSocketHealthTransition,
   ): Promise<SettledValue<WebSocketHealthSnapshot>> {
     return settleValueWithin(
-      this.transition(input),
+      this.persistTransition(input),
       this.shutdownTimeoutMs,
       this.scheduler,
     );

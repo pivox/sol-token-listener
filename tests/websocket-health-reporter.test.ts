@@ -58,6 +58,90 @@ void test('websocket health reporter rejects a mutable repository snapshot and r
   assert.equal(reporter.state(), 'DEGRADED');
 });
 
+void test('websocket health reporter serializes concurrent lifecycle transitions by revision', async () => {
+  const repository = new FakeHealthRepository();
+  const firstTransition = deferred<WebSocketHealthSnapshot>();
+  const secondTransition = deferred<WebSocketHealthSnapshot>();
+  repository.transitionResults.push(firstTransition.promise, secondTransition.promise);
+  const reporter = reporterFixture(repository).reporter;
+  const connecting = snapshot('CONNECTING', 1n);
+  const waiting = snapshot('WAITING_FOR_ACKS', 2n);
+  const acknowledged = snapshot('ACKNOWLEDGED', 3n);
+  reporter.startTouch(connecting);
+
+  const first = reporter.transition(transitionFrom(connecting, { phase: 'WAITING_FOR_ACKS' }));
+  const second = reporter.transition(transitionFrom(waiting, {
+    phase: 'ACKNOWLEDGED',
+    acknowledged: true,
+  }));
+
+  assert.equal(repository.transitions.length, 1);
+  assert.equal(repository.transitions[0]?.expectedRevision, 1n);
+  firstTransition.resolve(waiting);
+  assert.equal(await first, waiting);
+  await flushMicrotasks();
+  assert.equal(reporter.state(), 'WAITING_FOR_ACKS');
+  assert.equal(repository.transitions.length, 2);
+  assert.equal(repository.transitions[1]?.expectedRevision, 2n);
+
+  secondTransition.resolve(acknowledged);
+  assert.equal(await second, acknowledged);
+  assert.equal(reporter.state(), 'ACKNOWLEDGED');
+});
+
+void test('websocket health reporter fences a successful lifecycle transition before stopping', async () => {
+  const repository = new FakeHealthRepository();
+  const sessionTransition = deferred<WebSocketHealthSnapshot>();
+  repository.transitionResults.push(
+    sessionTransition.promise,
+    Promise.resolve(snapshot('STOPPING', 4n)),
+    Promise.resolve(snapshot('STOPPED', 5n)),
+  );
+  const { reporter } = reporterFixture(repository);
+  const running = snapshot('RUNNING', 2n);
+  const advanced = snapshot('RUNNING', 3n);
+  reporter.startTouch(running);
+
+  const advancing = reporter.transition(transitionFrom(running));
+  let cleanupCalls = 0;
+  const stopping = reporter.stop(async () => { cleanupCalls += 1; });
+
+  assert.deepEqual(repository.transitions.map((value) => value.phase), ['RUNNING']);
+  assert.equal(cleanupCalls, 0);
+  sessionTransition.resolve(advanced);
+  assert.equal(await advancing, advanced);
+  await stopping;
+
+  assert.deepEqual(repository.transitions.map((value) => value.phase), [
+    'RUNNING',
+    'STOPPING',
+    'STOPPED',
+  ]);
+  assert.deepEqual(repository.transitions.map((value) => value.expectedRevision), [2n, 3n, 4n]);
+  assert.equal(cleanupCalls, 1);
+  assert.equal(reporter.state(), 'STOPPED');
+});
+
+void test('websocket health reporter rejects lifecycle transitions accepted after stop begins', async () => {
+  const repository = new FakeHealthRepository();
+  const stoppingSnapshot = deferred<WebSocketHealthSnapshot>();
+  repository.transitionResults.push(
+    stoppingSnapshot.promise,
+    Promise.resolve(snapshot('STOPPED', 4n)),
+  );
+  const { reporter } = reporterFixture(repository);
+  const running = snapshot('RUNNING', 2n);
+  reporter.startTouch(running);
+
+  const stopping = reporter.stop(async () => undefined);
+  await assertReporterCode(reporter.transition(transitionFrom(running)), 'STATE_CONFLICT');
+  assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING']);
+
+  stoppingSnapshot.resolve(snapshot('STOPPING', 3n));
+  await stopping;
+  assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING', 'STOPPED']);
+});
+
 void test('websocket health reporter serializes and coalesces periodic touches', async () => {
   const repository = new FakeHealthRepository();
   const firstTouch = deferred<undefined>();
@@ -174,6 +258,29 @@ void test('websocket health reporter bounds a stuck touch before invoking cleanu
   scheduler.fireNext(20);
 
   await assertReporterCode(stopping, 'SHUTDOWN_TIMEOUT');
+  assert.equal(cleanupCalls, 0);
+  assert.equal(reporter.state(), 'DEGRADED');
+  assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING']);
+});
+
+void test('websocket health reporter preserves a rejected touch during shutdown', async () => {
+  const repository = new FakeHealthRepository();
+  const touch = deferred<undefined>();
+  repository.touchResults.push(touch.promise);
+  repository.transitionResults.push(
+    Promise.resolve(snapshot('STOPPING', 3n)),
+    Promise.resolve(snapshot('STOPPED', 4n)),
+  );
+  const { reporter, scheduler } = reporterFixture(repository);
+  reporter.startTouch(snapshot('RUNNING', 2n));
+  scheduler.fireNext(5);
+  await flushMicrotasks();
+
+  let cleanupCalls = 0;
+  const stopping = reporter.stop(async () => { cleanupCalls += 1; });
+  touch.reject(new Error('secret heartbeat write'));
+
+  await assertReporterCode(stopping, 'CLEANUP_FAILED');
   assert.equal(cleanupCalls, 0);
   assert.equal(reporter.state(), 'DEGRADED');
   assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING']);
@@ -631,16 +738,25 @@ interface ManualTask {
 interface Deferred<TValue> {
   readonly promise: Promise<TValue>;
   readonly resolve: (value: TValue) => void;
+  readonly reject: (reason: unknown) => void;
 }
 
 function deferred<TValue>(): Deferred<TValue> {
   let resolve: ((value: TValue) => void) | undefined;
-  const promise = new Promise<TValue>((received) => { resolve = received; });
+  let reject: ((reason: unknown) => void) | undefined;
+  const promise = new Promise<TValue>((received, rejected) => {
+    resolve = received;
+    reject = rejected;
+  });
   return {
     promise,
     resolve(value: TValue) {
       if (resolve === undefined) throw new Error('Deferred resolver unavailable.');
       resolve(value);
+    },
+    reject(reason: unknown) {
+      if (reject === undefined) throw new Error('Deferred rejecter unavailable.');
+      reject(reason);
     },
   };
 }

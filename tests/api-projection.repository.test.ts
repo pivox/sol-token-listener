@@ -1929,11 +1929,16 @@ void test('ignores an absent or inactive WebSocket snapshot but degrades stale a
     call.text.includes('listener_strict_catch_up_failures'));
   assert.match(strictQuery?.text ?? '', /EXISTS\s*\(/iu);
   assert.match(strictQuery?.text ?? '', /resolved_at IS NULL/u);
+});
 
-  const inactiveUnresolved = await healthyRepository(
-    healthyHealthDatabase(websocketRowForPhase('STOPPED', 'INACTIVE'), true),
-  ).getHealth();
-  assert.equal(inactiveUnresolved.status, 'DEGRADED');
+void test('ignores unresolved strict failures while WebSocket supervision is inactive', async () => {
+  const health = await healthyRepository(healthyHealthDatabase(
+    websocketRowForPhase('STOPPED', 'INACTIVE'),
+    true,
+  )).getHealth();
+
+  assert.equal(health.heartbeat.websocket.supervision, 'INACTIVE');
+  assert.equal(health.status, 'OK');
 });
 
 void test('redacts malformed WebSocket rows and WebSocket dependency failures', async () => {

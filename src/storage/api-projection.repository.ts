@@ -641,14 +641,14 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       const websocketStale = websocketHeartbeatAge === null
         || websocketHeartbeatAge < 0
         || websocketHeartbeatAge > WEBSOCKET_HEALTH_STALE_AFTER_MS;
-      const websocketDegraded = hasUnresolvedStrictFailure
-        || (websocket.supervision === 'ACTIVE' && (
-          websocketStale
-          || websocket.phase !== 'RUNNING'
-          || websocket.state !== 'ACKNOWLEDGED'
-          || (websocket.recovery.status !== 'NOT_REQUIRED'
-            && websocket.recovery.status !== 'RECOVERED')
-        ));
+      const websocketDegraded = websocket.supervision === 'ACTIVE' && (
+        hasUnresolvedStrictFailure
+        || websocketStale
+        || websocket.phase !== 'RUNNING'
+        || websocket.state !== 'ACKNOWLEDGED'
+        || (websocket.recovery.status !== 'NOT_REQUIRED'
+          && websocket.recovery.status !== 'RECOVERED')
+      );
       const degraded = database.rows.length === 0 || stale || runtimeDegraded || websocketDegraded
       || !pipeline.httpAvailable
       || pipeline.pumpfun === 'DEGRADED' || pipeline.pumpfun === 'STOPPED'
