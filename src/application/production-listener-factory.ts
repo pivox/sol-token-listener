@@ -422,9 +422,9 @@ export class RecurringFinalityReconciler {
       await this.reconciler.runOnce();
       this.currentState = 'RUNNING';
       this.schedule();
-    } catch (error) {
+    } catch {
       this.currentState = 'DEGRADED';
-      throw error;
+      this.schedule();
     }
   }
 

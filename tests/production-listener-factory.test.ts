@@ -419,6 +419,55 @@ void test('finality close fences an in-flight pass and rejects stale timer activ
   assert.equal(reconciler.state(), 'STOPPED');
 });
 
+void test('finality startup degrades without aborting and recovers on a fresh scheduled pass', async () => {
+  const scheduler = new ManualScheduler();
+  const candidate: FinalityCandidate = Object.freeze({
+    signature: '1'.repeat(64), slot: 10n, confirmationStatus: 'processed',
+    missingFinalityPolls: 0, lastMissingFinalityProviderId: null,
+    finalityEvidenceVersion: 0n, processedAtMs: 1,
+  });
+  const revisions: FinalityRevision[] = [];
+  const passes: Readonly<{ readonly number: number }>[] = [];
+  const source: FinalityProviderPassSource = Object.freeze({
+    openPass: () => {
+      const snapshot = Object.freeze({ number: passes.length + 1 });
+      passes.push(snapshot);
+      return Object.freeze({
+        providerId: 'primary' as const,
+        async getHistoryStatuses() {
+          if (snapshot.number === 1) throw new Error('provider unavailable');
+          return [Object.freeze({ slot: 10n, confirmationStatus: 'finalized' })];
+        },
+        async getFinalizedSlot() { return 11n; },
+        async getFinalizedBlockSignatures() { return []; },
+      });
+    },
+  });
+  const recurring = new RecurringFinalityReconciler(
+    new FinalityReconciler(source, {
+      async listForFinality() { return Object.freeze([candidate]); },
+      async recordFinalityPoll() { throw new Error('unexpected poll'); },
+      async enqueueRevision(value: FinalityRevision) { revisions.push(value); },
+    }, { limit: 1, now: () => 1_000 }),
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler },
+  );
+
+  await recurring.start();
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(revisions.length, 0);
+  assert.deepEqual(passes.map(({ number }) => number), [1]);
+
+  const recoveredRescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await recoveredRescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.deepEqual(passes.map(({ number }) => number), [1, 2]);
+  assert.equal(new Set(passes).size, 2);
+  assert.deepEqual(revisions.map((revision) => revision.confirmationStatus), ['finalized']);
+  await recurring.close();
+  assert.equal(hasSchedulerWaiterState(scheduler), false);
+});
+
 void test('finality recurrence degrades on an unavailable block then returns to RUNNING with a fresh proof', async () => {
   const scheduler = new ManualScheduler();
   const candidate: FinalityCandidate = Object.freeze({

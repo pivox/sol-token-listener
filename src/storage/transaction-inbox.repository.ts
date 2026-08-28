@@ -394,11 +394,15 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              purge_after = CASE WHEN $4 THEN completed.completed_at + INTERVAL '4 hours' ELSE NULL END,
              missing_finality_polls = CASE WHEN $4 THEN 0 ELSE missing_finality_polls END,
              last_missing_finality_provider_id = CASE WHEN $4 THEN NULL ELSE last_missing_finality_provider_id END,
-             finality_evidence_version = CASE WHEN $4 THEN finality_evidence_version + 1 ELSE finality_evidence_version END,
+             finality_evidence_version = CASE
+               WHEN $4 AND finality_evidence_version < $5::BIGINT
+                 THEN finality_evidence_version + 1
+               ELSE finality_evidence_version
+             END,
              updated_at = completed.completed_at
            FROM (SELECT clock_timestamp() AS completed_at) completed
            WHERE signature = $1 AND lease_token = $2 AND processing_status = 'PROCESSING'`,
-          [signature, token, next, terminal],
+          [signature, token, next, terminal, MAX_FINALITY_EVIDENCE_VERSION.toString()],
         );
         requireLease(result.rowCount);
       });

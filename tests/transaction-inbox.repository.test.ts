@@ -12,7 +12,11 @@ import type {
   TransactionNotification,
 } from '../src/domain/transaction-ingestion.js';
 import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
-import { createCatchUpGap, restoreNormalizedTransactionSnapshot } from '../src/domain/transaction-ingestion.js';
+import {
+  createCatchUpGap,
+  MAX_FINALITY_EVIDENCE_VERSION,
+  restoreNormalizedTransactionSnapshot,
+} from '../src/domain/transaction-ingestion.js';
 import {
   createStrictCatchUpFailure,
   type StrictCatchUpFailure,
@@ -508,6 +512,129 @@ void test('fails closed at the PostgreSQL finality evidence version limit withou
       provider: before.last_missing_finality_provider_id,
       version: before.finality_evidence_version,
     });
+  });
+});
+
+void test('saturates finality evidence when processing a finalized terminal revision at the PostgreSQL limit', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'max-finalized-terminal';
+    await repository.enqueue(notification(signature, 42n));
+    const initial = await repository.claim(220_000, 120);
+    assert.ok(initial);
+    await repository.saveSnapshot(signature, initial.leaseToken, normalized(signature, 42n));
+    await repository.markProcessed(signature, initial.leaseToken, 'confirmed');
+    await pool.query(
+      `UPDATE chain_transaction_inbox
+       SET finality_evidence_version = $2
+       WHERE signature = $1`,
+      [signature, (MAX_FINALITY_EVIDENCE_VERSION - 1n).toString()],
+    );
+
+    await repository.enqueueRevision(Object.freeze({
+      signature, confirmationStatus: 'finalized' as const, observedAtMs: 220_001,
+    }));
+    let stored = await row(pool, signature);
+    assert.deepEqual({
+      processing: stored.processing_status,
+      confirmation: stored.target_confirmation_status,
+      version: BigInt(stored.finality_evidence_version),
+    }, {
+      processing: 'PENDING', confirmation: 'finalized', version: MAX_FINALITY_EVIDENCE_VERSION,
+    });
+    const replay = await repository.claim(220_002, 120);
+    assert.ok(replay);
+    await repository.markProcessed(signature, replay.leaseToken, 'finalized');
+    await repository.enqueueRevision(Object.freeze({
+      signature, confirmationStatus: 'finalized' as const, observedAtMs: 220_003,
+    }));
+    stored = await row(pool, signature);
+    assert.deepEqual({
+      processing: stored.processing_status,
+      confirmation: stored.target_confirmation_status,
+      version: BigInt(stored.finality_evidence_version),
+    }, {
+      processing: 'PROCESSED', confirmation: 'finalized', version: MAX_FINALITY_EVIDENCE_VERSION,
+    });
+    await assertFinalityConflict(repository.recordFinalityPoll(Object.freeze({
+      signature, confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION, observedAtMs: 220_004,
+    })));
+  });
+});
+
+void test('saturates finality evidence when processing an orphaned terminal revision at the PostgreSQL limit', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    const signature = 'max-orphaned-terminal';
+    await repository.enqueue(notification(signature, 43n));
+    const initial = await repository.claim(230_000, 120);
+    assert.ok(initial);
+    await repository.saveSnapshot(signature, initial.leaseToken, normalized(signature, 43n));
+    await repository.markProcessed(signature, initial.leaseToken, 'confirmed');
+    await pool.query(
+      `UPDATE chain_transaction_inbox
+       SET finality_evidence_version = $2,
+           missing_finality_polls = $3,
+           last_missing_finality_provider_id = $4
+       WHERE signature = $1`,
+      [
+        signature,
+        (MAX_FINALITY_EVIDENCE_VERSION - 1n).toString(),
+        1,
+        'primary',
+      ],
+    );
+
+    await repository.enqueueRevision(Object.freeze({
+      signature,
+      confirmationStatus: 'orphaned' as const,
+      expectedConfirmationStatus: 'confirmed' as const,
+      expectedMissingFinalityPolls: 1,
+      expectedLastMissingFinalityProviderId: 'primary' as const,
+      expectedFinalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION - 1n,
+      observedAtMs: 230_001,
+    }));
+    let stored = await row(pool, signature);
+    assert.deepEqual({
+      processing: stored.processing_status,
+      confirmation: stored.target_confirmation_status,
+      missing: stored.missing_finality_polls,
+      provider: stored.last_missing_finality_provider_id,
+      version: BigInt(stored.finality_evidence_version),
+    }, {
+      processing: 'PENDING', confirmation: 'orphaned', missing: 0, provider: null,
+      version: MAX_FINALITY_EVIDENCE_VERSION,
+    });
+    const replay = await repository.claim(230_002, 120);
+    assert.ok(replay);
+    await repository.markProcessed(signature, replay.leaseToken, 'orphaned');
+    await repository.enqueueRevision(Object.freeze({
+      signature,
+      confirmationStatus: 'orphaned' as const,
+      expectedConfirmationStatus: 'confirmed' as const,
+      expectedMissingFinalityPolls: 1,
+      expectedLastMissingFinalityProviderId: 'primary' as const,
+      expectedFinalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION - 1n,
+      observedAtMs: 230_003,
+    }));
+    stored = await row(pool, signature);
+    assert.deepEqual({
+      processing: stored.processing_status,
+      confirmation: stored.target_confirmation_status,
+      missing: stored.missing_finality_polls,
+      provider: stored.last_missing_finality_provider_id,
+      version: BigInt(stored.finality_evidence_version),
+    }, {
+      processing: 'PROCESSED', confirmation: 'orphaned', missing: 0, provider: null,
+      version: MAX_FINALITY_EVIDENCE_VERSION,
+    });
+    await assertFinalityConflict(repository.recordFinalityPoll(Object.freeze({
+      signature, confirmationStatus: null, providerId: 'primary' as const,
+      expectedMissingFinalityPolls: 0, expectedLastMissingFinalityProviderId: null,
+      expectedFinalityEvidenceVersion: MAX_FINALITY_EVIDENCE_VERSION, observedAtMs: 230_004,
+    })));
   });
 });
 
