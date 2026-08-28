@@ -3,8 +3,14 @@
 Date: 2026-08-28
 Issue: #62
 Parent issue: #57
-Version: 1.0.0
+Version: 1.0.1
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.1 stores the observation slot as unconstrained PostgreSQL
+`NUMERIC` with explicit finite, nonnegative, integral, and 78-digit range
+checks. PostgreSQL rounds fractional input to the declared scale before a
+`NUMERIC(78,0)` check can reject it, so the typmod cannot preserve the strict
+integer boundary required by this contract.
 
 ## Purpose
 
@@ -79,7 +85,7 @@ candidate_provider_id           RpcProviderId | null
 phase                           WebSocketHealthPhase
 acknowledged_at                 timestamptz | null
 last_observation_at             timestamptz | null
-last_observation_slot           numeric(78,0) | null
+last_observation_slot           numeric | null
 disconnect_occurred_at          timestamptz | null
 disconnect_reason_code          WebSocketDisconnectReasonCode | null
 recovery_status                 WebSocketRecoveryStatus
@@ -109,7 +115,9 @@ secret has a storage column.
 - Generations and revision are nonnegative and cannot overflow PostgreSQL
   `BIGINT` at an application boundary.
 - Observation timestamp and slot are jointly null or non-null; the slot is a
-  finite nonnegative integer.
+  finite nonnegative integer strictly below `10^78`. The SQL column has no
+  numeric typmod: explicit checks reject `NaN`, fractional values, negative
+  values, and values outside the 78-digit bound before storage.
 - Disconnect timestamp and reason are jointly null or non-null.
 - Every timestamp is finite and recovery completion cannot precede recovery
   start.

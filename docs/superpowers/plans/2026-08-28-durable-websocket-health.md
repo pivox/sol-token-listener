@@ -32,6 +32,8 @@
 - Create: `tests/websocket-health-migration.test.ts`
 - Modify: `scripts/deployment-smoke.mjs`
 - Modify: `tests/deployment-artifacts.test.ts`
+- Modify: `tests/migration-lock.test.ts`
+- Modify: `tests/paper-claim-scheduler-migration.test.ts`
 - Modify: `tests/transaction-ingestion-migration.test.ts`
 - Modify: `tests/api-event-stream-migration.test.ts`
 - Modify: `tests/creation-entry-migration.test.ts`
@@ -84,8 +86,11 @@ Expected: failure because migration 030 and its table do not exist.
 
 - [ ] **Step 3: Add the normalized snapshot and checks**
 
-Create the table with the exact columns from spec v1.0.0. Use
-`NUMERIC(78,0)` for the observation slot and `BIGINT` for generations/revision.
+Create the table with the exact columns from spec v1.0.1. Use unconstrained
+`NUMERIC` plus explicit `NaN`, nonnegative, integral and `< 10^78` checks for
+the observation slot, and `BIGINT` for generations/revision. A
+`NUMERIC(78,0)` typmod is forbidden because PostgreSQL rounds fractional input
+before a check constraint can reject it.
 The SQL must define fixed checks for provider IDs, phases, reasons, paired null
 fields, phase/provider/session coherence, recovery timestamps, nonnegative
 integer numerics, and inactive generation zero. Seed only
@@ -135,7 +140,9 @@ Expected: all selected tests pass and direct replay adds no duplicate row.
 ```bash
 git add migrations/030_listener_websocket_health.sql \
   tests/websocket-health-migration.test.ts scripts/deployment-smoke.mjs \
-  tests/deployment-artifacts.test.ts tests/api-event-stream-migration.test.ts \
+  tests/deployment-artifacts.test.ts tests/migration-lock.test.ts \
+  tests/paper-claim-scheduler-migration.test.ts \
+  tests/api-event-stream-migration.test.ts \
   tests/creation-entry-migration.test.ts tests/paper-finality-replay-migration.test.ts \
   tests/paper-mvp-migration.test.ts tests/participant-analytics-migration.test.ts \
   tests/provider-affine-finality-migration.test.ts \
@@ -625,7 +632,7 @@ object, and no live/wallet/submission instructions.
 
 - [ ] **Step 4: Mark completed plan steps and bump spec revision only if implementation differs**
 
-Keep design version 1.0.0 when implementation matches exactly. If a reviewed
+Keep design version 1.0.1 when implementation matches exactly. If a reviewed
 implementation change is necessary, increment to 1.0.1 and describe the change
 at the top rather than silently editing semantics.
 
@@ -688,7 +695,7 @@ generic remote-error serialization.
 
 - [ ] **Step 4: Obtain sequential internal reviews**
 
-First request specification compliance against design v1.0.0. After PASS,
+First request specification compliance against design v1.0.1. After PASS,
 request code quality/security/concurrency review. Address Critical/Important
 findings with focused tests and rerun affected gates.
 
