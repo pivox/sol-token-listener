@@ -25,6 +25,11 @@ test('public operator journey is resumable and read-only across origins', async 
   await expect(page.getByRole('heading', { name: 'Santé technique' })).toBeVisible();
   await expect(page.getByLabel('Qualification : RUNNING')).toBeVisible();
   await expect(page.getByText('Rapports courants : 2')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'WebSocket Solana' })).toBeVisible();
+  await expect(page.getByText('Fournisseur actif : primary')).toBeVisible();
+  await expect(page.getByText('Motif de récupération : SESSION_FAILURE')).toBeVisible();
+  await expect(page.locator('body')).not.toContainText('e2e-secret');
+  await expect(page.locator('body')).not.toContainText('e2e raw close detail');
 
   const resumeCountBefore = await resumeCount(request);
   await request.post(`${API}/__test/reconnect`);
