@@ -378,7 +378,7 @@ in-memory transition journal:
 
 Issue #61 is specified in
 `docs/superpowers/specs/2026-08-27-provider-affine-finality-design.md` version
-1.0.2. One finality reconciliation pass captures one provider-pinned HTTP
+1.0.6. One finality reconciliation pass captures one provider-pinned HTTP
 capability and uses it for status reads, finalized root and finalized block
 proofs. The inbox records the positional provider ID behind the current
 missing-status sequence. A provider change starts a fresh sequence at one.

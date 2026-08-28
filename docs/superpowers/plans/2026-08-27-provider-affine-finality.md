@@ -75,24 +75,24 @@ application-boundary validation.
 
 ### Review correction 1: starvation and paper bootstrap gate
 
-- [ ] RED in `tests/finality-reconciler.test.ts`: a rejected middle-slot block
+- [x] RED in `tests/finality-reconciler.test.ts`: a rejected middle-slot block
   must still read the next slot, preserve valid revisions on both sides, never
   orphan the bad slot, then reject with the fixed `block` stage. GREEN keeps
   block reads sequential and preserves the 16-slot, 256-candidate and 10,000
   signature caps.
-- [ ] RED in `tests/transaction-inbox.repository.test.ts`: create more rows
+- [x] RED in `tests/transaction-inbox.repository.test.ts`: create more rows
   than the list limit, poll the first with a skewed application timestamp, and
   require a previously out-of-page candidate on the next page. GREEN orders by
   `updated_at, observed_slot, signature` and advances attempts with
   `GREATEST(updated_at, observedAt, clock_timestamp())`.
-- [ ] RED in `tests/provider-affine-finality-migration.test.ts`: require the
+- [x] RED in `tests/provider-affine-finality-migration.test.ts`: require the
   updated partial index after migration 026 → 027 and after direct replay.
   GREEN uses `DROP INDEX IF EXISTS` followed by the canonical partial index.
-- [ ] RED in `tests/production-listener-factory.test.ts`: observe startup may
+- [x] RED in `tests/production-listener-factory.test.ts`: observe startup may
   resolve `DEGRADED`, schedule one normal interval and recover; default/paper
   startup must rethrow without a schedule. GREEN adds strict
   `initialFailureMode` validation and branches production on `executionMode`.
-- [ ] Prove listener rollback in `tests/listener-runtime.test.ts`: a fail-closed
+- [x] Prove listener rollback in `tests/listener-runtime.test.ts`: a fail-closed
   reconciler startup returns a redacted runtime failure. Revision 1.0.4 below
   supersedes the original assumption that paper could start before this gate.
 
@@ -103,19 +103,19 @@ Run the focused suite with live PostgreSQL, then `build`, `check:backend`,
 
 ### Review correction 2: initial finality activation barrier
 
-- [ ] RED in `tests/listener-runtime.test.ts` with a deferred
+- [x] RED in `tests/listener-runtime.test.ts` with a deferred
   `reconciler.start`: after `runtime.start()` and queued microtasks, require the
   call sequence to stop at `reconciler.start` with no paper or social worker
   activation. Resolve finality, await startup, then require paper, social and
   heartbeat to start in their exact order.
-- [ ] RED the initial-failure path: require paper to be neither started nor
+- [x] RED the initial-failure path: require paper to be neither started nor
   closed when finality rejects, while the inbox worker and subscriber are
   rolled back in reverse order.
-- [ ] GREEN in `src/application/listener-runtime.ts`: start and register the
+- [x] GREEN in `src/application/listener-runtime.ts`: start and register the
   reconciler immediately after the inbox worker and before paper/social. Keep
   observe behavior because `DEGRADED_RETRY` resolves before the later workers;
   keep paper fail-closed because `FAIL_START` rejects at the barrier.
-- [ ] Update spec, plan, README and diagnostic HTML to version 1.0.4 semantics,
+- [x] Update spec, plan, README and diagnostic HTML to version 1.0.4 semantics,
   then run the focused runtime/factory/finality tests and all delivery gates.
 
 ---
@@ -130,7 +130,7 @@ Run the focused suite with live PostgreSQL, then `build`, `check:backend`,
 - Create: `tests/provider-affine-finality-migration.test.ts`
 - Modify: `tests/transaction-ingestion-contracts.test.ts`
 
-- [ ] **Step 1: Write failing domain and migration tests**
+- [x] **Step 1: Write failing domain and migration tests**
 
 Add canonical positional provider constants and test the new frozen contracts:
 
@@ -182,7 +182,7 @@ accept all four positional IDs only with a positive count, reject impossible
 count/provider combinations, apply 027 again directly, and verify a full
 `migrateDatabase` replay returns no newly applied migration.
 
-- [ ] **Step 2: Run focused tests and observe missing-field/migration failures**
+- [x] **Step 2: Run focused tests and observe missing-field/migration failures**
 
 ```bash
 node --import tsx --test \
@@ -192,7 +192,7 @@ node --import tsx --test \
 
 Expected: FAIL because migration 027 and the new contract fields do not exist.
 
-- [ ] **Step 3: Implement the domain union and migration**
+- [x] **Step 3: Implement the domain union and migration**
 
 Use these domain shapes:
 
@@ -265,11 +265,11 @@ Replayably replace `chain_transaction_inbox_finality_idx` with the same partial
 predicate and `(updated_at, observed_slot, signature)` keys. Do not expose the
 column through an API projection.
 
-- [ ] **Step 4: Run focused tests until green**
+- [x] **Step 4: Run focused tests until green**
 
 Run the Step 2 command and `npm run check:backend`.
 
-- [ ] **Step 5: Commit the slice**
+- [x] **Step 5: Commit the slice**
 
 ```bash
 git add src/domain/rpc-provider.ts src/domain/transaction-ingestion.ts \
@@ -287,7 +287,7 @@ git commit -m "feat: persist finality provider provenance (#61)"
 - Modify: `tests/transaction-inbox.repository.test.ts`
 - Modify: `tests/transaction-ingestion-recovery.test.ts`
 
-- [ ] **Step 1: Write failing PostgreSQL repository tests**
+- [x] **Step 1: Write failing PostgreSQL repository tests**
 
 Cover the exact transition matrix:
 
@@ -321,7 +321,7 @@ Simulate a response lost after commit by submitting the same orphan revision
 again while the row is `PENDING/orphaned`; require an idempotent no-op. Complete
 the worker replay, submit it once more, and require another no-op.
 
-- [ ] **Step 2: Run the repository and recovery tests and observe failures**
+- [x] **Step 2: Run the repository and recovery tests and observe failures**
 
 ```bash
 node --import tsx --test \
@@ -333,7 +333,7 @@ Expected with PostgreSQL: FAIL because repository queries do not read or write
 the new provider and orphan revisions have no proof guard. Without
 `TEST_DATABASE_URL`, live cases may report explicit skips during this red step.
 
-- [ ] **Step 3: Implement exact provider/count CAS**
+- [x] **Step 3: Implement exact provider/count CAS**
 
 Extend every finality candidate `SELECT` and `RETURNING` list with
 `last_missing_finality_provider_id` and `finality_evidence_version`. Under the
@@ -363,7 +363,7 @@ notification and terminal revision enqueue must increment
 must clear the missing sequence even when its target status is unchanged, so
 an old proof cannot survive fresh existence evidence.
 
-- [ ] **Step 4: Implement conditional orphan enqueue**
+- [x] **Step 4: Implement conditional orphan enqueue**
 
 Keep finalized handling unchanged. For a real transition to `orphaned`, after
 the idempotent same-target returns and while the row is locked, compare the
@@ -379,12 +379,12 @@ last_missing_finality_provider_id = NULL,
 finality_evidence_version = finality_evidence_version + 1
 ```
 
-- [ ] **Step 5: Run focused tests with PostgreSQL until green**
+- [x] **Step 5: Run focused tests with PostgreSQL until green**
 
 Run the Step 2 command with `TEST_DATABASE_URL` set to the isolated test
 database, then run `npm run check:backend`.
 
-- [ ] **Step 6: Commit the slice**
+- [x] **Step 6: Commit the slice**
 
 ```bash
 git add src/storage/transaction-inbox.repository.ts \
@@ -403,7 +403,7 @@ git commit -m "feat: guard orphan revisions with durable proof (#61)"
 - Modify: `src/solana/rpc/rpc-client.ts`
 - Modify: `tests/rpc-client.test.ts`
 
-- [ ] **Step 1: Write failing adapter and RPC regression tests**
+- [x] **Step 1: Write failing adapter and RPC regression tests**
 
 Specify this neutral port:
 
@@ -439,7 +439,7 @@ Add an HTTP-level regression test proving `SolanaRpcClient.getBlockSignatures`
 accepts the official `getBlock` response with top-level `signatures` and sends
 `transactionDetails: 'signatures'`, `rewards: false`.
 
-- [ ] **Step 2: Run focused tests and observe missing adapter/parser failure**
+- [x] **Step 2: Run focused tests and observe missing adapter/parser failure**
 
 ```bash
 node --import tsx --test \
@@ -447,7 +447,7 @@ node --import tsx --test \
   tests/rpc-client.test.ts
 ```
 
-- [ ] **Step 3: Implement the pinned adapter**
+- [x] **Step 3: Implement the pinned adapter**
 
 Expose a constructor boundary like:
 
@@ -473,7 +473,7 @@ export type ProviderPinnedFinalityErrorReason =
   | 'BLOCK_UNAVAILABLE';
 ```
 
-- [ ] **Step 4: Fix the shared block-signature parser path**
+- [x] **Step 4: Fix the shared block-signature parser path**
 
 Replace generic `Connection.getBlock(... transactionDetails: 'signatures')`
 usage in `SolanaRpcClient.getBlockSignatures` with:
@@ -489,11 +489,11 @@ return Object.freeze([...block.signatures]);
 Let unavailable blocks reject into the locator's existing retryable RPC path;
 do not translate them into signature absence.
 
-- [ ] **Step 5: Run focused tests and type checking until green**
+- [x] **Step 5: Run focused tests and type checking until green**
 
 Run the Step 2 command and `npm run check:backend`.
 
-- [ ] **Step 6: Commit the slice**
+- [x] **Step 6: Commit the slice**
 
 ```bash
 git add src/ports/finality-provider-pass.ts \
@@ -510,7 +510,7 @@ git commit -m "feat: add pinned Solana finality pass (#61)"
 - Modify: `src/application/finality-reconciler.ts`
 - Modify: `tests/finality-reconciler.test.ts`
 
-- [ ] **Step 1: Rewrite the reconciler tests against pass capture**
+- [x] **Step 1: Rewrite the reconciler tests against pass capture**
 
 Require one `openPass()` call per non-empty run and no call for an empty page.
 Add tests for:
@@ -534,13 +534,13 @@ Add tests for:
 The memory repository must implement provider-aware transitions exactly like
 PostgreSQL and reject stale orphan proof fields before recording a revision.
 
-- [ ] **Step 2: Run the reconciler test and observe contract failures**
+- [x] **Step 2: Run the reconciler test and observe contract failures**
 
 ```bash
 node --import tsx --test tests/finality-reconciler.test.ts
 ```
 
-- [ ] **Step 3: Capture and validate one pass**
+- [x] **Step 3: Capture and validate one pass**
 
 Change `MAX_FINALITY_RECONCILE_LIMIT` to `256`. Accept a
 `FinalityProviderPassSource`, call `openPass` once after a non-empty page, and
@@ -570,7 +570,7 @@ if (before.finalityEvidenceVersion
 Test unchanged, regressive, skipped and out-of-range repository versions. None
 may reach `getFinalizedBlockSignatures` or `enqueueRevision`.
 
-- [ ] **Step 4: Implement provider-aware polls and block proofs**
+- [x] **Step 4: Implement provider-aware polls and block proofs**
 
 Pass these exact poll fields:
 
@@ -609,7 +609,7 @@ arrays and unsafe values as stage `block`, never as absence. Remember the first
 block failure, skip orphaning only for that slot, continue later slots within
 the sixteen-slot budget, then throw the remembered failure after the loop.
 
-- [ ] **Step 5: Run focused tests and static checks until green**
+- [x] **Step 5: Run focused tests and static checks until green**
 
 ```bash
 node --import tsx --test tests/finality-reconciler.test.ts
@@ -617,7 +617,7 @@ npm run check:backend
 npm run lint:backend
 ```
 
-- [ ] **Step 6: Commit the slice**
+- [x] **Step 6: Commit the slice**
 
 ```bash
 git add src/application/finality-reconciler.ts tests/finality-reconciler.test.ts
@@ -632,7 +632,7 @@ git commit -m "feat: require canonical block proof for orphaning (#61)"
 - Modify: `tests/production-listener-factory.test.ts`
 - Modify: `tests/transaction-ingestion-recovery.test.ts`
 
-- [ ] **Step 1: Write failing production-boundary tests**
+- [x] **Step 1: Write failing production-boundary tests**
 
 Require the production source to be built from `createRpcProviderCatalog`,
 `createProviderPinnedFinalityPass`, and positional ID `primary`. Add a source
@@ -653,7 +653,7 @@ fallback pass starts -> first miss persists as count one/fallback
 fallback reaches threshold -> fresh finalized block proof -> orphan revision
 ```
 
-- [ ] **Step 2: Run focused production and recovery tests**
+- [x] **Step 2: Run focused production and recovery tests**
 
 ```bash
 node --import tsx --test \
@@ -661,7 +661,7 @@ node --import tsx --test \
   tests/transaction-ingestion-recovery.test.ts
 ```
 
-- [ ] **Step 3: Wire a fixed primary pass**
+- [x] **Step 3: Wire a fixed primary pass**
 
 In `createProductionListenerRuntime`, construct the paired catalog once and a
 dedicated primary pass once. Inject an immutable source whose `openPass`
@@ -679,11 +679,11 @@ Keep the general failover-enabled `SolanaRpcClient` for transaction lookup,
 market reads, catch-up and heartbeat. Do not change the production WebSocket
 subscriber or activate #63 behavior.
 
-- [ ] **Step 4: Run focused lifecycle tests and static checks until green**
+- [x] **Step 4: Run focused lifecycle tests and static checks until green**
 
 Run the Step 2 command, `npm run check:backend`, and `npm run lint:backend`.
 
-- [ ] **Step 5: Commit the slice**
+- [x] **Step 5: Commit the slice**
 
 ```bash
 git add src/application/production-listener-factory.ts \
@@ -709,7 +709,7 @@ git commit -m "feat: pin production finality to primary RPC (#61)"
 - Modify: `docs/system-overview.html`
 - Modify: `README.md`
 
-- [ ] **Step 1: Update every migration manifest assertion**
+- [x] **Step 1: Update every migration manifest assertion**
 
 Use a repository-wide search:
 
@@ -722,7 +722,7 @@ Advance all authoritative last-migration lists and assertions to
 `027_listener_provider_affine_finality.sql`. Do not mechanically change
 historical statements that intentionally describe migration 026 itself.
 
-- [ ] **Step 2: Document the operational behavior**
+- [x] **Step 2: Document the operational behavior**
 
 Add concise versioned documentation explaining:
 
@@ -740,7 +740,7 @@ execution: observe/paper only, transaction submission disabled
 Keep the Bootstrap diagnostic HTML consistent with the independent frontend
 contract and do not present it as the product interface.
 
-- [ ] **Step 3: Run focused migration and safety validation**
+- [x] **Step 3: Run focused migration and safety validation**
 
 ```bash
 node --import tsx --test \
@@ -757,7 +757,7 @@ rg -n "sendTransaction|sendRawTransaction|Keypair|privateKey|secretKey" \
 Expected: tests pass and the safety search prints no match in the new finality
 surface.
 
-- [ ] **Step 4: Run every local gate with PostgreSQL**
+- [x] **Step 4: Run every local gate with PostgreSQL**
 
 ```bash
 npm install
@@ -773,7 +773,7 @@ Expected: every command exits zero; backend PostgreSQL tests run rather than
 skip, frontend tests remain green, migration 027 applies on an empty schema and
 replays cleanly.
 
-- [ ] **Step 5: Perform spec and quality review**
+- [x] **Step 5: Perform spec and quality review**
 
 Review the diff against every requirement in
 `docs/superpowers/specs/2026-08-27-provider-affine-finality-design.md`. Then run
@@ -781,7 +781,7 @@ a separate code-quality review focused on hostile inputs, redaction,
 concurrency, crash recovery, PostgreSQL rollout and quota bounds. Fix every
 blocking finding and rerun the affected focused tests plus all gates.
 
-- [ ] **Step 6: Commit delivery documentation**
+- [x] **Step 6: Commit delivery documentation**
 
 ```bash
 git add scripts/deployment-smoke.mjs tests docs/system-overview.html README.md
