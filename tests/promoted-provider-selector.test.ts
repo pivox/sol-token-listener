@@ -11,7 +11,7 @@ void test('captures the promoted provider pass for each open and leaves prior pa
   const fallback = pass('fallback-1');
   const selector = new PromotedProviderSelector([primary, fallback]);
 
-  assert.equal(selector.activeProviderId, null);
+  assert.equal(selector.activeProviderId(), null);
   assert.throws(() => selector.openPass(), unavailable);
 
   selector.promote('primary');
@@ -21,7 +21,7 @@ void test('captures the promoted provider pass for each open and leaves prior pa
 
   selector.promote('fallback-1');
   assert.equal(captured, primary);
-  assert.equal(selector.activeProviderId, 'fallback-1');
+  assert.equal(selector.activeProviderId(), 'fallback-1');
   assert.equal(selector.openPass(), fallback);
 });
 
@@ -32,10 +32,10 @@ void test('clears only the currently promoted provider', () => {
 
   selector.promote('primary');
   selector.clear('fallback-1');
-  assert.equal(selector.activeProviderId, 'primary');
+  assert.equal(selector.activeProviderId(), 'primary');
 
   selector.clear('primary');
-  assert.equal(selector.activeProviderId, null);
+  assert.equal(selector.activeProviderId(), null);
   assert.throws(() => selector.openPass(), unavailable);
 });
 

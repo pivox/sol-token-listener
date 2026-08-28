@@ -33,7 +33,7 @@ export class PromotedProviderSelector implements FinalityProviderPassSource {
     this.passes = selected;
   }
 
-  public get activeProviderId(): RpcProviderId | null {
+  public activeProviderId(): RpcProviderId | null {
     return this.activeProvider;
   }
 
