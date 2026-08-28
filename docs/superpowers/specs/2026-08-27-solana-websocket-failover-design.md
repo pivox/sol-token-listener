@@ -3,8 +3,14 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.2.2
+Version: 1.3.0
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.3.0 specifies issue #62 through the dedicated durable WebSocket
+health design. It separates the WebSocket snapshot from the generic heartbeat,
+adds owner/session generation fencing, defines the five-state public mapping,
+keeps supervision inactive until #63, and limits resolved operational evidence
+to four hours.
 
 Revision 1.2.2 bounds the monotone evidence generation to PostgreSQL `BIGINT`
 and requires the hostile application boundary to verify an exact increment.
@@ -378,7 +384,7 @@ in-memory transition journal:
 
 Issue #61 is specified in
 `docs/superpowers/specs/2026-08-27-provider-affine-finality-design.md` version
-1.0.6. One finality reconciliation pass captures one provider-pinned HTTP
+1.0.8. One finality reconciliation pass captures one provider-pinned HTTP
 capability and uses it for status reads, finalized root and finalized block
 proofs. The inbox records the positional provider ID behind the current
 missing-status sequence. A provider change starts a fresh sequence at one.
@@ -400,13 +406,26 @@ of falling back request by request.
 
 ## Durable health and public API
 
+Issue #62 is specified in
+`docs/superpowers/specs/2026-08-28-durable-websocket-health-design.md` version
+1.0.0. The public object below is backed by an independent bounded snapshot,
+uses generation fencing, and exposes a five-state summary alongside the
+detailed phase. `supervision=INACTIVE` preserves the legacy production health
+contract until #63 atomically activates a new owner before network and API
+startup.
+
 The runtime heartbeat gains an additive versioned WebSocket object:
 
 ```text
+version: 1
+supervision: INACTIVE | ACTIVE
+state: STOPPED | CONNECTING | ACKNOWLEDGED | RECOVERING | DEGRADED
 providerId: primary | fallback-1..3 | null
 candidateProviderId: primary | fallback-1..3 | null
-phase: STOPPED | CONNECTING | WAITING_FOR_ACKS | RECOVERING | RUNNING |
+phase: STOPPED | CONNECTING | WAITING_FOR_ACKS | ACKNOWLEDGED | RECOVERING | RUNNING |
        DEGRADED | UNRECOVERABLE | STOPPING
+updatedAt: ISO timestamp | null
+heartbeatAt: ISO timestamp | null
 acknowledgedAt: ISO timestamp | null
 lastObservation: { observedAt, slot } | null
 disconnect: { occurredAt, reasonCode } | null
@@ -415,13 +434,15 @@ recovery: { status, startedAt, completedAt, reasonCode }
 
 The last observation is updated only after durable enqueue succeeds. It is a
 watermark, not a completeness frontier. Signatures remain private to internal
-storage and are not added to the public object. A stale heartbeat that claimed
-an active session at process start becomes `UNEXPECTED_RESTART` and requires
-the same strict recovery before health can return `OK`.
+storage and are not added to the public object. A fresh active owner refuses a
+second process with fixed `ACTIVE_INSTANCE`. A stale heartbeat that claimed an
+active session becomes `UNEXPECTED_RESTART` and requires the same strict
+recovery before health can return `OK`.
 
-Before any network or public API startup, the new process durably records
-`CONNECTING` and `UNEXPECTED_RESTART` when the prior heartbeat claimed an
-active phase. `OK` requires exactly `phase=RUNNING` plus recovery
+Before any network or public API startup, #63 must acquire the durable owner;
+after a stale active predecessor it records `CONNECTING` and
+`UNEXPECTED_RESTART`. `OK` under active supervision requires exactly
+`phase=RUNNING` plus recovery
 `NOT_REQUIRED` or `RECOVERED`. Connecting, waiting for ACKs, recovering,
 unresolved strict failure, stale heartbeat, stopping and failed cleanup are
 `DEGRADED`. Deployment `--require-ok` uses the same rule. Stable structured
