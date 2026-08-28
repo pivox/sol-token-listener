@@ -18,12 +18,12 @@ Production uses a fixed primary pass until #63 supplies the promoted provider.
 **Tech Stack:** TypeScript strict ESM, `@solana/web3.js` 1.98.4, PostgreSQL,
 bigint, Node test runner, migration 027.
 
-**Plan version:** 1.0.3. Revision 1.0.3 addresses the first PR review cycle:
-block-stage failures no longer stop later bounded slot proofs, finality pages
-rotate by durable database attempt time, and only observe mode may recover from
-an initial finality failure without aborting listener startup. Revision 1.0.2
-bounds the monotone evidence generation to PostgreSQL `BIGINT` and requires
-exact +1 application-boundary validation.
+**Plan version:** 1.0.4. Revision 1.0.4 makes the initial finality pass precede
+paper-worker activation so no simulated effect can persist during a failing
+bootstrap proof. Revision 1.0.3 addresses starvation, durable page rotation
+and the observe/paper initial-failure policy. Revision 1.0.2 bounds the
+monotone evidence generation to PostgreSQL `BIGINT` and requires exact +1
+application-boundary validation.
 
 ---
 
@@ -47,11 +47,30 @@ exact +1 application-boundary validation.
   startup must rethrow without a schedule. GREEN adds strict
   `initialFailureMode` validation and branches production on `executionMode`.
 - [ ] Prove listener rollback in `tests/listener-runtime.test.ts`: a fail-closed
-  reconciler startup closes social, paper, inbox and subscriber resources in
-  reverse order before returning the redacted runtime failure.
+  reconciler startup returns a redacted runtime failure. Revision 1.0.4 below
+  supersedes the original assumption that paper could start before this gate.
 
 Run the focused suite with live PostgreSQL, then `build`, `check:backend`,
 `lint:backend`, `docs:check`, diff-check and the full test suite.
+
+---
+
+### Review correction 2: initial finality activation barrier
+
+- [ ] RED in `tests/listener-runtime.test.ts` with a deferred
+  `reconciler.start`: after `runtime.start()` and queued microtasks, require the
+  call sequence to stop at `reconciler.start` with no paper or social worker
+  activation. Resolve finality, await startup, then require paper, social and
+  heartbeat to start in their exact order.
+- [ ] RED the initial-failure path: require paper to be neither started nor
+  closed when finality rejects, while the inbox worker and subscriber are
+  rolled back in reverse order.
+- [ ] GREEN in `src/application/listener-runtime.ts`: start and register the
+  reconciler immediately after the inbox worker and before paper/social. Keep
+  observe behavior because `DEGRADED_RETRY` resolves before the later workers;
+  keep paper fail-closed because `FAIL_START` rejects at the barrier.
+- [ ] Update spec, plan, README and diagnostic HTML to version 1.0.4 semantics,
+  then run the focused runtime/factory/finality tests and all delivery gates.
 
 ---
 

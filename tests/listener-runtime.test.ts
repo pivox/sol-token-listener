@@ -14,7 +14,7 @@ void test('starts dependencies in exact order and exposes honest frozen pipeline
 
   assert.deepEqual(calls, [
     'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
-    'paperWorker.start', 'socialWorker.start', 'reconciler.start', 'heartbeat.start',
+    'reconciler.start', 'paperWorker.start', 'socialWorker.start', 'heartbeat.start',
   ]);
   assert.equal(runtime.state(), 'RUNNING');
   assert.deepEqual(runtime.pipelineState(), {
@@ -74,7 +74,8 @@ void test('rolls back the inbox worker when paper startup fails', async () => {
   });
   assert.deepEqual(calls, [
     'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
-    'paperWorker.start', 'worker.close', 'subscriber.close',
+    'reconciler.start', 'paperWorker.start', 'reconciler.close', 'worker.close',
+    'subscriber.close',
   ]);
 });
 
@@ -97,12 +98,37 @@ void test('rolls back the transaction worker and producers when social startup f
   });
   assert.deepEqual(calls, [
     'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
-    'paperWorker.start', 'socialWorker.start', 'paperWorker.close', 'worker.close',
-    'subscriber.close',
+    'reconciler.start', 'paperWorker.start', 'socialWorker.start', 'paperWorker.close',
+    'reconciler.close', 'worker.close', 'subscriber.close',
   ]);
 });
 
-void test('closes the paper worker when fail-closed finality startup rejects', async () => {
+void test('does not activate paper work while initial finality is still pending', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  const initialFinality = deferred<undefined>();
+  deps.reconciler.start = async () => {
+    calls.push('reconciler.start');
+    await initialFinality.promise;
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+
+  const starting = runtime.start();
+  for (let attempt = 0; attempt < 16; attempt += 1) await Promise.resolve();
+  assert.deepEqual(calls, [
+    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
+    'reconciler.start',
+  ]);
+
+  initialFinality.resolve(undefined);
+  await starting;
+  assert.deepEqual(calls, [
+    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
+    'reconciler.start', 'paperWorker.start', 'socialWorker.start', 'heartbeat.start',
+  ]);
+});
+
+void test('never starts or closes the paper worker when fail-closed finality startup rejects', async () => {
   const calls: string[] = [];
   const deps = dependencies(calls);
   deps.reconciler.start = async () => {
@@ -121,8 +147,7 @@ void test('closes the paper worker when fail-closed finality startup rejects', a
   });
   assert.deepEqual(calls, [
     'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
-    'paperWorker.start', 'socialWorker.start', 'reconciler.start',
-    'socialWorker.close', 'paperWorker.close', 'worker.close', 'subscriber.close',
+    'reconciler.start', 'worker.close', 'subscriber.close',
   ]);
   assert.equal(runtime.state(), 'DEGRADED');
 });
@@ -438,6 +463,21 @@ function dependencies(calls: string[]): ListenerRuntimeDependencies {
       async start() { calls.push('heartbeat.start'); },
       async stop(state) { calls.push(`heartbeat.stop:${state}`); },
       state: () => 'RUNNING',
+    },
+  };
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolvePromise: ((value: T | PromiseLike<T>) => void) | undefined;
+  const promise = new Promise<T>((resolve) => { resolvePromise = resolve; });
+  return {
+    promise,
+    resolve(value) {
+      if (resolvePromise === undefined) throw new Error('Deferred is unavailable.');
+      resolvePromise(value);
     },
   };
 }

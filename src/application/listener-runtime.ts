@@ -191,6 +191,11 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       started.push('worker');
       this.activeResources.add('worker');
       this.assertStartOpen();
+      stage = 'reconciler-start';
+      await this.dependencies.reconciler.start();
+      started.push('reconciler');
+      this.activeResources.add('reconciler');
+      this.assertStartOpen();
       stage = 'paper-worker-start';
       await this.dependencies.paperWorker.start();
       started.push('paperWorker');
@@ -200,11 +205,6 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       await this.dependencies.socialWorker.start();
       started.push('socialWorker');
       this.activeResources.add('socialWorker');
-      this.assertStartOpen();
-      stage = 'reconciler-start';
-      await this.dependencies.reconciler.start();
-      started.push('reconciler');
-      this.activeResources.add('reconciler');
       this.assertStartOpen();
       stage = 'heartbeat-start';
       await this.dependencies.heartbeat.start();

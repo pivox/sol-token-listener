@@ -3,8 +3,12 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.3
+Version: 1.0.4
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.4 makes the initial finality pass a runtime activation barrier.
+The paper worker cannot start, schedule immediate work or persist simulated
+effects until the reconciler's initial coherent pass succeeds.
 
 Revision 1.0.3 prevents permanent-block starvation by continuing sequential
 slot proofs after a block-stage failure, rotates bounded pages by durable poll
@@ -370,9 +374,14 @@ then, primary finality unavailability never causes cross-provider orphaning.
 for `executionMode === 'observe'`: the first failure resolves startup in
 `DEGRADED`, schedules exactly one normal interval, and a successful fresh pass
 restores `RUNNING`. Paper mode selects `FAIL_START`: the first failure is
-rethrown, no interval is scheduled, and the listener runtime rolls back the
-already started paper worker and producers. Scheduled failures after a
-successful start remain `DEGRADED` and retry on the next normal interval.
+rethrown and no interval is scheduled. The listener starts the reconciler
+after the inbox worker but before the paper and social workers, so paper cannot
+schedule its immediate run while initial finality is pending. On initial
+failure the paper worker was never started and therefore needs no compensating
+close; only earlier subscriber/inbox resources are rolled back. In observe
+mode, `DEGRADED_RETRY` resolves the initial call before later workers start, so
+observe keeps its retry behavior. Scheduled failures after a successful start
+remain `DEGRADED` and retry on the next normal interval.
 
 ## Migration and rollout
 
@@ -439,8 +448,10 @@ projection or terminal retention row is deleted.
 - every counter reset path clears the provider;
 - full migration runner replay reports no new migration on its second run;
 - observe startup degradation schedules one fresh pass and can recover;
-- default/paper startup rejects without a schedule and runtime rollback closes
-  the paper worker.
+- initial finality pending prevents `paperWorker.start`, then success releases
+  paper activation;
+- default/paper startup rejects without a schedule, never starts or closes the
+  paper worker, and rolls back only resources started before finality.
 
 ### Delivery gates
 

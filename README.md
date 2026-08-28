@@ -162,8 +162,12 @@ derrière les autres candidates au lieu de monopoliser la première page.
 Au bootstrap, observe accepte une première passe en échec comme
 <code>DEGRADED</code> et programme un seul intervalle normal avec une preuve
 fraîche. Paper échoue fermé : la première erreur de finalité interrompt le
-démarrage, ne programme aucun retry et déclenche le rollback des workers déjà
-ouverts, dont le worker de simulation paper.
+démarrage et ne programme aucun retry. La passe initiale de finalité précède
+l’activation du worker paper : tant qu’elle est en attente, aucune simulation
+n’est planifiée; si elle échoue, le worker paper n’a été ni démarré ni fermé et
+seules les ressources antérieures sont rollbackées. En observe, la politique
+<code>DEGRADED_RETRY</code> résout cette barrière avant de démarrer les workers
+suivants et conserve la reprise à l’intervalle normal.
 
 Pour le rollout de `027_listener_provider_affine_finality.sql`, arrêter les
 anciennes réplicas avant d’appliquer la migration, puis démarrer le nouveau
