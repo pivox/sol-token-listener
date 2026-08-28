@@ -166,6 +166,19 @@ describe('frontend-owned API V1 schemas', () => {
 
   it('strictly validates every known WebSocket enum, timestamp, and slot', () => {
     const websocket = health.heartbeat.websocket;
+    const maximumSlot = '9'.repeat(78);
+    const maximum = apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat,
+        websocket: {
+          ...websocket,
+          lastObservation: { ...websocket.lastObservation, slot: maximumSlot },
+        },
+      },
+    })).data;
+    expect(maximum.heartbeat.websocket?.lastObservation?.slot).toBe(maximumSlot);
+
     const invalidWebSockets: readonly Record<string, unknown>[] = [
       { ...websocket, version: 2 },
       { ...websocket, supervision: 'ENABLED' },
@@ -178,6 +191,8 @@ describe('frontend-owned API V1 schemas', () => {
       { ...websocket, acknowledgedAt: 'today' },
       { ...websocket, lastObservation: { ...websocket.lastObservation, observedAt: 'today' } },
       { ...websocket, lastObservation: { ...websocket.lastObservation, slot: '-1' } },
+      { ...websocket, lastObservation: { ...websocket.lastObservation, slot: '01' } },
+      { ...websocket, lastObservation: { ...websocket.lastObservation, slot: '9'.repeat(79) } },
       { ...websocket, disconnect: { ...websocket.disconnect, occurredAt: 'today' } },
       { ...websocket, disconnect: { ...websocket.disconnect, reasonCode: 'RAW_REMOTE_REASON' } },
       { ...websocket, recovery: { ...websocket.recovery, status: 'DONE' } },

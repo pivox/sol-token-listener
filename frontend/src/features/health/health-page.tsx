@@ -57,7 +57,7 @@ function WebSocketDiagnostic({
     <p>ACK : <Timestamp value={websocket.acknowledgedAt} /></p>
     {websocket.lastObservation === null
       ? <p>Watermark diagnostic — pas une preuve de continuité : Indisponible</p>
-      : <p>Watermark diagnostic — pas une preuve de continuité : {websocket.lastObservation.slot} — <Timestamp value={websocket.lastObservation.observedAt} /></p>}
+      : <p>Watermark diagnostic — pas une preuve de continuité : <code className="text-break">{websocket.lastObservation.slot}</code> — <Timestamp value={websocket.lastObservation.observedAt} /></p>}
     {websocket.disconnect === null
       ? <p>Déconnexion : Aucune</p>
       : <p>Déconnexion : {websocket.disconnect.reasonCode} — <Timestamp value={websocket.disconnect.occurredAt} /></p>}

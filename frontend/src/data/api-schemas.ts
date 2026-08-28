@@ -412,6 +412,7 @@ const paperPositionSchema = z.object({
 
 const runtimeStateSchema = z.enum(['STARTING', 'RUNNING', 'DEGRADED', 'STOPPING', 'STOPPED']);
 const rpcProviderIdSchema = z.enum(['primary', 'fallback-1', 'fallback-2', 'fallback-3']);
+const websocketSlotSchema = z.string().regex(/^(?:0|[1-9]\d*)$/u).max(78);
 const websocketHealthSchema = z.object({
   version: z.literal(1),
   supervision: z.enum(['INACTIVE', 'ACTIVE']),
@@ -427,7 +428,7 @@ const websocketHealthSchema = z.object({
   acknowledgedAt: timestampSchema.nullable(),
   lastObservation: z.object({
     observedAt: timestampSchema,
-    slot: unsignedIntegerSchema,
+    slot: websocketSlotSchema,
   }).loose().nullable(),
   disconnect: z.object({
     occurredAt: timestampSchema,

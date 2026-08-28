@@ -64,13 +64,35 @@ describe('technical health page', () => {
     expect(diagnostic.getByText(/Phase détaillée : RECOVERING/)).toBeVisible();
     expect(diagnostic.getByText(/Fournisseur actif : primary/)).toBeVisible();
     expect(diagnostic.getByText(/Fournisseur candidat : fallback-1/)).toBeVisible();
-    expect(diagnostic.getByText(/Heartbeat WebSocket/)).toBeVisible();
-    expect(diagnostic.getByText(/ACK/)).toBeVisible();
-    expect(diagnostic.getByText(/Watermark diagnostic — pas une preuve de continuité/)).toHaveTextContent('900719925474099312345');
-    expect(diagnostic.getByText(/Déconnexion : REMOTE_CLOSE/)).toBeVisible();
+    expect(diagnostic.getByText(/Mis à jour :/).querySelector('time')).toHaveAttribute(
+      'datetime', health.heartbeat.websocket.updatedAt,
+    );
+    expect(diagnostic.getByText(/Heartbeat WebSocket :/).querySelector('time')).toHaveAttribute(
+      'datetime', health.heartbeat.websocket.heartbeatAt,
+    );
+    expect(diagnostic.getByText(/^ACK :/).querySelector('time')).toHaveAttribute(
+      'datetime', health.heartbeat.websocket.acknowledgedAt,
+    );
+    const watermark = diagnostic.getByText(/Watermark diagnostic — pas une preuve de continuité/);
+    expect(watermark.querySelector('time')).toHaveAttribute(
+      'datetime', health.heartbeat.websocket.lastObservation.observedAt,
+    );
+    const slot = within(watermark).getByText(health.heartbeat.websocket.lastObservation.slot);
+    expect(slot).toHaveClass('text-break');
+    expect(slot.tagName).toBe('CODE');
+    expect(slot).toHaveTextContent(health.heartbeat.websocket.lastObservation.slot);
+    const disconnect = diagnostic.getByText(/Déconnexion : REMOTE_CLOSE/);
+    expect(disconnect.querySelector('time')).toHaveAttribute(
+      'datetime', health.heartbeat.websocket.disconnect.occurredAt,
+    );
     expect(diagnostic.getByText(/Récupération : IN_PROGRESS/)).toBeVisible();
     expect(diagnostic.getByText(/Motif de récupération : SESSION_FAILURE/)).toBeVisible();
-    expect(websocketCard?.querySelectorAll(`time[datetime="${health.observedAt}"]`)).toHaveLength(6);
+    expect(diagnostic.getByText(/Début de récupération :/).querySelector('time')).toHaveAttribute(
+      'datetime', health.heartbeat.websocket.recovery.startedAt,
+    );
+    const recoveryCompleted = diagnostic.getByText(/Fin de récupération :/);
+    expect(recoveryCompleted).toHaveTextContent('Indisponible');
+    expect(recoveryCompleted.querySelector('time')).toBeNull();
     expect(document.body).not.toHaveTextContent('secret-rpc');
     expect(document.body).not.toHaveTextContent('database password');
     expect(document.body).not.toHaveTextContent('websocket-secret-signature');
