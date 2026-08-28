@@ -20,10 +20,13 @@ import { BoundedPublicHttpClient } from '../metadata/bounded-public-http.client.
 import { HttpMetadataProvider } from '../metadata/http-metadata.provider.js';
 import { RpcPumpSwapPoolValidator } from '../markets/pumpswap/pool-validator.js';
 import type { ListenerRuntime } from '../ports/listener-runtime.js';
+import type { FinalityProviderPassSource } from '../ports/finality-provider-pass.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
 import { SolanaCatchUpSource } from '../solana/rpc/catch-up-source.js';
 import { SolanaMarketRpcReader } from '../solana/rpc/market-rpc-reader.js';
 import { SolanaProgramSubscriber } from '../solana/rpc/program-subscriber.js';
+import { createProviderPinnedFinalityPass } from '../solana/rpc/provider-pinned-finality-source.js';
+import { createRpcProviderCatalog } from '../solana/rpc/rpc-provider-catalog.js';
 import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
 import type { RpcHttpFailoverEvent } from '../solana/rpc/http-failover-transport.js';
 import { SolanaTransactionLocator } from '../solana/rpc/transaction-locator.js';
@@ -94,6 +97,11 @@ export function createProductionListenerRuntime(
   config: AppConfig,
   pool: ProductionPool = getDatabasePool(),
 ): ListenerRuntime {
+  const providers = createRpcProviderCatalog(config);
+  const primaryFinality = createProviderPinnedFinalityPass(providers, 'primary');
+  const finalitySource: FinalityProviderPassSource = Object.freeze({
+    openPass: () => primaryFinality,
+  });
   const rpc = new SolanaRpcClient(config, {
     onHttpFailoverEvent: logRpcHttpFailoverEvent,
   });
@@ -274,13 +282,16 @@ export function createProductionListenerRuntime(
     idlePollMs: 1_000,
   });
   const reconciler = new RecurringFinalityReconciler(
-    new FinalityReconciler(rpc, inbox, {
+    new FinalityReconciler(finalitySource, inbox, {
       limit: 100,
       missingPollThreshold: config.listenerFinalityMissingPolls,
     }),
     {
       intervalMs: config.reconcileSeconds * 1_000,
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+      initialFailureMode: config.executionMode === 'observe'
+        ? 'DEGRADED_RETRY'
+        : 'FAIL_START',
     },
   );
   const subscriberComponent = lifecycleComponent(subscriber);
@@ -365,6 +376,12 @@ export interface RecurringListenerOptions {
   readonly scheduler?: ListenerRuntimeScheduler;
 }
 
+export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
+
+export interface RecurringFinalityOptions extends RecurringListenerOptions {
+  readonly initialFailureMode?: InitialFinalityFailureMode;
+}
+
 export class ListenerControllerCloseError extends Error {
   public constructor(
     public readonly component: 'heartbeat' | 'reconciler',
@@ -392,6 +409,7 @@ export class RecurringFinalityReconciler {
   private readonly intervalMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly scheduler: ListenerRuntimeScheduler;
+  private readonly initialFailureMode: InitialFinalityFailureMode;
   private timer: unknown = null;
   private inFlight: Promise<unknown> | null = null;
   private closePromise: Promise<void> | null = null;
@@ -399,12 +417,18 @@ export class RecurringFinalityReconciler {
 
   public constructor(
     private readonly reconciler: { readonly runOnce: () => Promise<unknown> },
-    options: RecurringListenerOptions,
+    options: RecurringFinalityOptions,
   ) {
     validateRecurringOptions(options);
+    const configuredInitialFailureMode: unknown = options.initialFailureMode;
+    const initialFailureMode = configuredInitialFailureMode ?? 'FAIL_START';
+    if (initialFailureMode !== 'FAIL_START' && initialFailureMode !== 'DEGRADED_RETRY') {
+      throw new TypeError('Initial finality failure mode is invalid.');
+    }
     this.intervalMs = options.intervalMs;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs;
     this.scheduler = options.scheduler ?? listenerScheduler;
+    this.initialFailureMode = initialFailureMode;
   }
 
   public async start(): Promise<void> {
@@ -416,7 +440,8 @@ export class RecurringFinalityReconciler {
       this.schedule();
     } catch (error) {
       this.currentState = 'DEGRADED';
-      throw error;
+      if (this.initialFailureMode === 'FAIL_START') throw error;
+      this.schedule();
     }
   }
 

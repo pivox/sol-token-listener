@@ -2,7 +2,14 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { parseConfig } from '../src/config/env.js';
+import { FinalityReconciler } from '../src/application/finality-reconciler.js';
+import type {
+  FinalityCandidate,
+  FinalityPollObservation,
+  FinalityRevision,
+} from '../src/domain/transaction-ingestion.js';
 import type { TokenLaunch } from '../src/domain/types.js';
+import type { FinalityProviderPassSource } from '../src/ports/finality-provider-pass.js';
 import { createCatchUpGap } from '../src/domain/transaction-ingestion.js';
 import type { getDatabasePool } from '../src/storage/database.js';
 import {
@@ -14,6 +21,7 @@ import {
   createProductionListenerRuntime,
   catchUpGapLogContext,
   createUnavailableBondingCurveReader,
+  type RecurringFinalityOptions,
   type ListenerRuntimeScheduler,
 } from '../src/application/production-listener-factory.js';
 
@@ -106,6 +114,30 @@ void test('production wires the redacted HTTP RPC failover event sink', async ()
   assert.ok(sink);
   assert.match(sink, /logger\.warn\(event, 'Événement de basculement HTTP RPC observé\.'\)/u);
   assert.doesNotMatch(sink, /(?:httpRpcUrl|wsRpcUrl|fallbackUrls|endpointUrl|host|provider|key|cause|error)/iu);
+});
+
+void test('production pins finality to one primary provider pass without coupling it to HTTP failover', async () => {
+  const factory = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+  const pinnedAdapter = await readFile(
+    new URL('../src/solana/rpc/provider-pinned-finality-source.ts', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(factory, /import\s*\{[^}]*\bcreateRpcProviderCatalog\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/rpc-provider-catalog\.js['"]/u);
+  assert.match(factory, /import\s*\{[^}]*\bcreateProviderPinnedFinalityPass\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/provider-pinned-finality-source\.js['"]/u);
+  assert.match(factory, /const providers = createRpcProviderCatalog\(config\);/u);
+  assert.match(factory, /const primaryFinality = createProviderPinnedFinalityPass\(providers, 'primary'\);/u);
+  assert.match(factory, /const finalitySource: FinalityProviderPassSource = Object\.freeze\(\{\s*openPass: \(\) => primaryFinality,\s*\}\);/u);
+  assert.match(factory, /new FinalityReconciler\(finalitySource, inbox,/u);
+  assert.match(
+    factory,
+    /initialFailureMode:\s*config\.executionMode === 'observe'\s*\? 'DEGRADED_RETRY'\s*:\s*'FAIL_START'/u,
+  );
+  assert.doesNotMatch(factory, /new FinalityReconciler\(rpc, inbox,/u);
+  assert.doesNotMatch(pinnedAdapter, /http-failover-transport/u);
 });
 
 void test('keeps the acknowledged WebSocket session foundation inactive until issue 63', async () => {
@@ -392,6 +424,190 @@ void test('finality close fences an in-flight pass and rejects stale timer activ
   assert.equal(reconciler.state(), 'STOPPED');
 });
 
+void test('finality startup degrades without aborting and recovers on a fresh scheduled pass', async () => {
+  const scheduler = new ManualScheduler();
+  const candidate: FinalityCandidate = Object.freeze({
+    signature: '1'.repeat(64), slot: 10n, confirmationStatus: 'processed',
+    missingFinalityPolls: 0, lastMissingFinalityProviderId: null,
+    finalityEvidenceVersion: 0n, processedAtMs: 1,
+  });
+  const revisions: FinalityRevision[] = [];
+  const passes: Readonly<{ readonly number: number }>[] = [];
+  const source: FinalityProviderPassSource = Object.freeze({
+    openPass: () => {
+      const snapshot = Object.freeze({ number: passes.length + 1 });
+      passes.push(snapshot);
+      return Object.freeze({
+        providerId: 'primary' as const,
+        async getHistoryStatuses() {
+          if (snapshot.number === 1) throw new Error('provider unavailable');
+          return [Object.freeze({ slot: 10n, confirmationStatus: 'finalized' })];
+        },
+        async getFinalizedSlot() { return 11n; },
+        async getFinalizedBlockSignatures() { return []; },
+      });
+    },
+  });
+  const recurring = new RecurringFinalityReconciler(
+    new FinalityReconciler(source, {
+      async listForFinality() { return Object.freeze([candidate]); },
+      async recordFinalityPoll() { throw new Error('unexpected poll'); },
+      async enqueueRevision(value: FinalityRevision) { revisions.push(value); },
+    }, { limit: 1, now: () => 1_000 }),
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      initialFailureMode: 'DEGRADED_RETRY',
+    },
+  );
+
+  await recurring.start();
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(revisions.length, 0);
+  assert.deepEqual(passes.map(({ number }) => number), [1]);
+
+  const recoveredRescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await recoveredRescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.deepEqual(passes.map(({ number }) => number), [1, 2]);
+  assert.equal(new Set(passes).size, 2);
+  assert.deepEqual(revisions.map((revision) => revision.confirmationStatus), ['finalized']);
+  await recurring.close();
+  assert.equal(hasSchedulerWaiterState(scheduler), false);
+});
+
+void test('finality startup fails closed by default without scheduling a retry', async () => {
+  const cases: readonly RecurringFinalityOptions[] = [
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler() },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler: new ManualScheduler(),
+      initialFailureMode: 'FAIL_START',
+    },
+  ];
+  for (const options of cases) {
+    const scheduler = options.scheduler as ManualScheduler;
+    const recurring = new RecurringFinalityReconciler(
+      { async runOnce() { throw new Error('private startup failure'); } },
+      options,
+    );
+
+    await assert.rejects(recurring.start(), /private startup failure/u);
+    assert.equal(recurring.state(), 'DEGRADED');
+    assert.throws(() => { scheduler.fireScheduled(); }, /No callback is scheduled/u);
+    await recurring.close();
+  }
+});
+
+void test('finality recurrence degrades on an unavailable block then returns to RUNNING with a fresh proof', async () => {
+  const scheduler = new ManualScheduler();
+  const candidate: FinalityCandidate = Object.freeze({
+    signature: '1'.repeat(64), slot: 10n, confirmationStatus: 'processed',
+    missingFinalityPolls: 0, lastMissingFinalityProviderId: null,
+    finalityEvidenceVersion: 0n, processedAtMs: 1,
+  });
+  let current = candidate;
+  const revisions: FinalityRevision[] = [];
+  const passSnapshots: Readonly<{ readonly pass: number }>[] = [];
+  const blockProofs: Readonly<{
+    readonly snapshot: Readonly<{ readonly pass: number }>;
+    readonly slot: bigint;
+  }>[] = [];
+  const source: FinalityProviderPassSource = Object.freeze({
+    openPass: () => {
+      const snapshot = Object.freeze({ pass: passSnapshots.length + 1 });
+      passSnapshots.push(snapshot);
+      let historyRead = false;
+      return Object.freeze({
+        providerId: 'primary' as const,
+        async getHistoryStatuses() {
+          if (historyRead) throw new Error('stale pass reused');
+          historyRead = true;
+          return [null];
+        },
+        async getFinalizedSlot() { return 11n; },
+        async getFinalizedBlockSignatures(slot: bigint) {
+          blockProofs.push(Object.freeze({ snapshot, slot }));
+          if (snapshot.pass === 2) throw new Error('block unavailable');
+          if (snapshot.pass !== 3) throw new Error('unexpected finality pass');
+          return [];
+        },
+      });
+    },
+  });
+  const repository = {
+    async listForFinality() { return Object.freeze([current]); },
+    async recordFinalityPoll(value: FinalityPollObservation) {
+      assert.equal(value.expectedMissingFinalityPolls, current.missingFinalityPolls);
+      assert.equal(value.expectedLastMissingFinalityProviderId, current.lastMissingFinalityProviderId);
+      assert.equal(value.expectedFinalityEvidenceVersion, current.finalityEvidenceVersion);
+      current = Object.freeze({
+        ...current,
+        missingFinalityPolls: current.lastMissingFinalityProviderId === value.providerId
+          ? current.missingFinalityPolls + 1
+          : 1,
+        lastMissingFinalityProviderId: value.providerId,
+        finalityEvidenceVersion: current.finalityEvidenceVersion + 1n,
+      });
+      return current;
+    },
+    async enqueueRevision(value: FinalityRevision) { revisions.push(value); },
+  };
+  const recurring = new RecurringFinalityReconciler(
+    new FinalityReconciler(source, repository, {
+      limit: 1, missingPollThreshold: 2, now: () => 1_000,
+    }),
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler },
+  );
+
+  await recurring.start();
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.equal(passSnapshots.length, 1);
+
+  const degradedRescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await degradedRescheduled;
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(revisions.length, 0);
+  assert.deepEqual(blockProofs.map(({ snapshot }) => snapshot.pass), [2]);
+
+  const recoveredRescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await recoveredRescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.deepEqual(passSnapshots.map(({ pass }) => pass), [1, 2, 3]);
+  assert.equal(new Set(passSnapshots).size, 3);
+  assert.deepEqual(blockProofs.map(({ snapshot, slot }) => ({ pass: snapshot.pass, slot })), [
+    { pass: 2, slot: 10n },
+    { pass: 3, slot: 10n },
+  ]);
+  assert.deepEqual(revisions.map((revision) => revision.confirmationStatus), ['orphaned']);
+  await recurring.close();
+  assert.equal(hasSchedulerWaiterState(scheduler), false);
+});
+
+void test('manual scheduler bounds a missing reschedule without retaining a waiter', async () => {
+  const scheduler = new ManualScheduler();
+  let outcome: 'pending' | 'resolved' | 'rejected' = 'pending';
+  let reason = '';
+  void scheduler.waitForNextSchedule().then(
+    () => { outcome = 'resolved'; },
+    (error: unknown) => {
+      outcome = 'rejected';
+      reason = error instanceof Error ? error.message : '';
+    },
+  );
+
+  for (let index = 0; index < 128; index += 1) await Promise.resolve();
+
+  assert.equal(outcome, 'rejected');
+  assert.equal(reason, 'Manual scheduler was not rescheduled.');
+  assert.equal(hasSchedulerWaiterState(scheduler), false);
+});
+
 void test('accepts the exact Node timer bound and rejects overflow or fractions', () => {
   const scheduler = new ManualScheduler();
   assert.doesNotThrow(() => new RecurringFinalityReconciler(
@@ -405,6 +621,15 @@ void test('accepts the exact Node timer bound and rejects overflow or fractions'
   assert.throws(() => new RecurringFinalityReconciler(
     { async runOnce() { return undefined; } },
     { intervalMs: 1.5, shutdownTimeoutMs: 100, scheduler },
+  ), TypeError);
+  assert.throws(() => new RecurringFinalityReconciler(
+    { async runOnce() { return undefined; } },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      initialFailureMode: 'INVALID' as 'FAIL_START',
+    },
   ), TypeError);
 
   assert.equal(config({ RECONCILE_SECONDS: '2147483' }).reconcileSeconds, 2_147_483);
@@ -455,13 +680,23 @@ function assertProductionCatchUpWiring(source: string): void {
   assert.match(source, /\bnew\s+SolanaProgramSubscriber\s*\(/u);
 }
 
+function hasSchedulerWaiterState(scheduler: ManualScheduler): boolean {
+  return Reflect.ownKeys(scheduler).some(
+    (key) => typeof key === 'string' && /waiter/iu.test(key),
+  );
+}
+
+const MAX_MANUAL_SCHEDULER_WAIT_MICROTASKS = 64;
+
 class ManualScheduler implements ListenerRuntimeScheduler {
   private callback: (() => void) | null = null;
   private lastCallback: (() => void) | null = null;
+  private scheduledCount = 0;
 
   public schedule(callback: () => void): object {
     this.callback = callback;
     this.lastCallback = callback;
+    this.scheduledCount += 1;
     return Object.freeze({});
   }
 
@@ -480,6 +715,15 @@ class ManualScheduler implements ListenerRuntimeScheduler {
     const callback = this.lastCallback;
     if (callback === null) throw new Error('No callback was scheduled.');
     callback();
+  }
+
+  public async waitForNextSchedule(): Promise<void> {
+    const after = this.scheduledCount;
+    for (let attempt = 0; attempt < MAX_MANUAL_SCHEDULER_WAIT_MICROTASKS; attempt += 1) {
+      await Promise.resolve();
+      if (this.scheduledCount > after) return;
+    }
+    throw new Error('Manual scheduler was not rescheduled.');
   }
 }
 

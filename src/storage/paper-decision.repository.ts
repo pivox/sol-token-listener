@@ -41,12 +41,18 @@ import {
   toJsonValue,
 } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
+import {
+  assertPaperFinalityReplayCurrent,
+  MAX_PAPER_FINALITY_RAW_ROWS,
+  paperFinalityRelevantRawSql,
+} from './paper-finality-barrier.js';
 
 interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number | null }
 interface Client { query(text: string, values?: readonly unknown[]): Promise<Result>; release(): void }
 interface Pool { connect(): Promise<Client> }
 
 type Operation = 'enqueue' | 'wake' | 'claim' | 'renew' | 'snapshot' | 'stage' | 'complete' | 'fail' | 'counts';
+const MAX_PAPER_FINALITY_PREFLIGHT_JOBS=16;
 
 export class PaperDecisionRepositoryError extends Error {
   public constructor(public readonly operation: Operation, options?: ErrorOptions) {
@@ -225,37 +231,12 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     try {
       await client.query('BEGIN');
       const now = new Date(options.nowMs);
-      await client.query(`UPDATE paper_decision_jobs SET
-        status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
-        error_code='LEASE_EXPIRED',retry_exhausted_at=$1,terminal_at=$1,
-        purge_after=$2,updated_at=$1
-        WHERE status='PROCESSING' AND lease_expires_at <= $1
-          AND attempts_in_cycle >= max_attempts`, [
-        now,new Date(options.nowMs + this.retentionMs),
-      ]);
       const leaseToken = `paper_lease_${randomUUID()}`;
-      const result = await client.query(`WITH candidate AS (
-        SELECT job.job_id
-        FROM paper_decision_jobs job
-        JOIN domain_events source ON source.event_id=job.source_event_id
-        WHERE (source.confirmation_status <> 'orphaned'
-            OR job.source_confirmation_status = 'orphaned')
-          AND job.attempts_in_cycle < job.max_attempts
-          AND (
-            job.status='PENDING'
-            OR (job.status='RETRYABLE_FAILED' AND job.next_attempt_at <= $1)
-            OR (job.status='PROCESSING' AND job.lease_expires_at <= $1)
-          )
-        ORDER BY COALESCE(job.next_attempt_at,job.created_at),job.created_at,job.job_id
-        FOR UPDATE OF job SKIP LOCKED
-        LIMIT 1
-      )
-      UPDATE paper_decision_jobs job SET
-        status='PROCESSING',attempts=job.attempts+1,
-        attempts_in_cycle=job.attempts_in_cycle+1,lease_token=$2,
-        lease_expires_at=$3,next_attempt_at=NULL,error_code=NULL,updated_at=$1
-      FROM candidate WHERE job.job_id=candidate.job_id
-      RETURNING job.*`, [now,leaseToken,new Date(options.nowMs + options.leaseMs)]);
+      const result = await client.query(paperDecisionClaimSql(),[
+        now,leaseToken,new Date(options.nowMs + options.leaseMs),
+        MAX_PAPER_FINALITY_RAW_ROWS+1,MAX_PAPER_FINALITY_PREFLIGHT_JOBS,
+        new Date(options.nowMs + this.retentionMs),
+      ]);
       await client.query('COMMIT');
       const row = result.rows[0];
       return row === undefined ? null : claimedJob(row);
@@ -295,6 +276,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       await lockMint(client, job.mint);
       await lockQualificationMint(client,job.mint);
       await assertActiveLease(client, job);
+      await assertPaperFinalityReplayCurrent(client,{
+        mint:job.mint,sourceRawEventId:job.sourceRawEventId,
+      });
       const sourceResult = await client.query(
         'SELECT * FROM domain_events WHERE event_id=$1 AND mint=$2',
         [job.sourceEventId,job.mint],
@@ -576,6 +560,106 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
   }
 }
 
+export function paperDecisionClaimSql():string{
+  const relevantRawSql=paperFinalityRelevantRawSql('paper-decision-job');
+  const effectiveAt=`CASE job.status
+    WHEN 'PENDING' THEN COALESCE(job.finality_checked_at,job.created_at)
+    WHEN 'RETRYABLE_FAILED' THEN GREATEST(
+      job.next_attempt_at,COALESCE(job.finality_checked_at,job.created_at)
+    )
+    WHEN 'PROCESSING' THEN GREATEST(
+      job.lease_expires_at,COALESCE(job.finality_checked_at,job.created_at)
+    )
+  END`;
+  return `WITH inspection AS MATERIALIZED (
+    SELECT job.job_id,job.mint,job.source_event_id,job.source_raw_event_id,
+      job.source_confirmation_status,job.status,job.attempts_in_cycle,
+      job.max_attempts,job.created_at,job.claim_scan_generation,
+      ${effectiveAt} AS effective_at
+    FROM paper_decision_jobs job
+    WHERE job.status IN ('PENDING','RETRYABLE_FAILED','PROCESSING')
+      AND (job.status='PROCESSING' OR job.attempts_in_cycle<job.max_attempts)
+      AND ${effectiveAt}<=$1
+    ORDER BY ${effectiveAt},job.claim_scan_generation,job.created_at,job.job_id
+    FOR UPDATE OF job SKIP LOCKED
+    LIMIT $5
+  ), terminalized AS (
+    UPDATE paper_decision_jobs job SET
+      status='CANCELLED',lease_token=NULL,lease_expires_at=NULL,next_attempt_at=NULL,
+      error_code='LEASE_EXPIRED',retry_exhausted_at=$1,terminal_at=$1,
+      purge_after=$6,updated_at=$1
+    FROM inspection
+    WHERE job.job_id=inspection.job_id
+      AND inspection.status='PROCESSING'
+      AND inspection.attempts_in_cycle>=inspection.max_attempts
+    RETURNING job.job_id
+  ), evaluated AS MATERIALIZED (
+    SELECT job.job_id,job.created_at,job.claim_scan_generation,job.effective_at,
+      (source.confirmation_status<>'orphaned'
+        OR job.source_confirmation_status='orphaned')
+      AND finality.raw_count>0
+      AND finality.raw_count<$4
+      AND finality.replay_current AS replay_current
+    FROM inspection job
+    JOIN domain_events source ON source.event_id=job.source_event_id
+    JOIN LATERAL (
+      SELECT COUNT(*)::integer AS raw_count,
+        COALESCE(BOOL_AND(COALESCE((
+          SELECT inbox.processing_status='PROCESSED'
+            AND inbox.target_confirmation_status=raw.confirmation_status
+          FROM chain_transaction_inbox inbox
+          WHERE inbox.signature=raw.signature
+        ),
+          raw.confirmation_status IN ('finalized','orphaned')
+          AND EXISTS (
+            SELECT 1
+            FROM chain_transaction_finality_replay_receipts receipt
+            WHERE receipt.signature=raw.signature
+              AND receipt.observed_slot=raw.observed_slot::numeric
+              AND receipt.confirmation_status=raw.confirmation_status
+          )
+        )),FALSE) AS replay_current
+      FROM (${relevantRawSql}) raw
+    ) finality ON TRUE
+    WHERE job.status<>'PROCESSING'
+      OR job.attempts_in_cycle<job.max_attempts
+  ), rotated AS (
+    UPDATE paper_decision_jobs job SET
+      finality_checked_at=GREATEST(
+        COALESCE(job.finality_checked_at,job.created_at),$1
+      ),
+      claim_scan_generation=nextval('paper_decision_claim_scan_generation_seq')
+    FROM evaluated
+    WHERE job.job_id=evaluated.job_id AND NOT evaluated.replay_current
+    RETURNING job.job_id
+  ), candidate AS (
+    SELECT evaluated.job_id
+    FROM evaluated
+    WHERE evaluated.replay_current
+      AND NOT EXISTS (
+        SELECT 1 FROM evaluated preceding
+        WHERE preceding.replay_current
+          AND ROW(
+            preceding.effective_at,preceding.claim_scan_generation,
+            preceding.created_at,preceding.job_id
+          ) < ROW(
+            evaluated.effective_at,evaluated.claim_scan_generation,
+            evaluated.created_at,evaluated.job_id
+          )
+      )
+    LIMIT 1
+  ), claimed AS (
+    UPDATE paper_decision_jobs job SET
+      status='PROCESSING',attempts=job.attempts+1,
+      attempts_in_cycle=job.attempts_in_cycle+1,lease_token=$2,
+      lease_expires_at=$3,next_attempt_at=NULL,error_code=NULL,updated_at=$1
+    FROM candidate
+    WHERE job.job_id=candidate.job_id
+    RETURNING job.*
+  )
+  SELECT * FROM claimed`;
+}
+
 async function writeDecision(
   client: Client,
   job: ClaimedPaperDecisionJob,
@@ -583,6 +667,9 @@ async function writeDecision(
   qualificationProfile: QualificationProfileIdentity,
   synchronizeOrphanedEvidence: boolean,
 ): Promise<void> {
+  await assertPaperFinalityReplayCurrent(client,{
+    mint:job.mint,sourceRawEventId:job.sourceRawEventId,
+  });
   const qualification=await assertPersistedQualification(client,result,qualificationProfile);
   const candidate = result.candidate;
   if(!qualification.existingCandidate){

@@ -1,0 +1,862 @@
+# Provider-affine Solana finality implementation plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> superpowers:subagent-driven-development (recommended) or
+> superpowers:executing-plans to implement this plan task-by-task. Steps use
+> checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Deliver issue #61 so every active finality decision uses one pinned
+Solana provider, persists consecutive-miss provenance, and requires a
+conditional finalized-block proof before orphaning.
+
+**Architecture:** A neutral provider-pass port separates the application from
+one pinned `Connection`. Migration 027 adds the last missing provider to the
+durable inbox, repository CAS covers provider, count and a monotone evidence
+version, and orphan revisions carry an exact transactional proof precondition.
+Production uses a fixed primary pass until #63 supplies the promoted provider.
+
+**Tech Stack:** TypeScript strict ESM, `@solana/web3.js` 1.98.4, PostgreSQL,
+bigint, Node test runner, migrations 027–029.
+
+**Plan version:** 1.0.8. Revision 1.0.8 retains orphaned predecessors in every
+paper fence and applies one indexed 4,097-row limit across all statuses.
+Revision 1.0.7 makes the raw cursor an index condition,
+rotates a durable sixteen-job finality preflight and retains exact receipts for
+both terminal statuses. Revision 1.0.6 bounds claim to an indexed 4,097-row
+probe and adds exact finalized replay receipts that survive the four-hour inbox
+purge. Revision 1.0.5 adds a bounded transactional paper
+replay barrier and permits finalized replay to preserve a saturated evidence
+version without overflow. Revision 1.0.4 makes the initial finality pass precede
+paper-worker activation so no simulated effect can persist during a failing
+bootstrap proof. Revision 1.0.3 addresses starvation, durable page rotation
+and the observe/paper initial-failure policy. Revision 1.0.2 bounds the
+monotone evidence generation to PostgreSQL `BIGINT` and requires exact +1
+application-boundary validation.
+
+---
+
+### Review correction 6: retain orphaned predecessors in the paper fence
+
+- [x] Trace the replay pipeline and prove that raw/domain orphaning can commit
+  before later projection stages fail, leaving the inbox non-processed and
+  downstream paper inputs stale.
+- [x] RED an earlier orphaned raw with pending inbox replay before a later
+  aligned source. GREEN makes claim, snapshot, stage and paper open share one
+  all-status cursor fence; processed orphan replay and its exact post-purge
+  receipt resume work.
+- [x] Replace migration 028's partial raw cursor index with a full covering
+  index and prove mixed-status 4,096/4,097 boundaries plus a hostile 100,000-row
+  same-mint `EXPLAIN ANALYZE` without raw sequential scan, sort or join filter.
+- [x] Update spec, plan, README and diagnostic HTML to v1.0.8; run targeted and
+  full PostgreSQL gates, then obtain specification and quality reviews before
+  the exact final commit.
+
+---
+
+### Review correction 5: bounded finality preflight and terminal replay retention
+
+- [x] RED hostile same-mint `EXPLAIN ANALYZE` with 100,000 rows at the first
+  source cursor. GREEN replaces the cursor join filter with a scalar init/subplan
+  used in `raw_chain_events_paper_finality_cursor_idx` index conditions; reject
+  raw sequential scans, sorts, join filters and unbounded actual rows.
+- [x] RED a 1,000-job backlog. GREEN migration 029 adds
+  `paper_decision_jobs.finality_checked_at`, a sequence-backed monotone
+  `claim_scan_generation`, deterministic backfill and an exact partial
+  `effective_at` fairness index. Claim materializes a constant sixteen-job
+  `SKIP LOCKED` batch before replay joins, rotates only blocked jobs durably and
+  claims the first ready job.
+- [x] Prove at most sixteen jobs are evaluated per claim, a ready job beyond the
+  first batch becomes claimable after bounded rotations/restart, and concurrent
+  replicas do not inspect or claim the same locked batch.
+- [x] RED an orphan retraction job retained while its processed inbox ages past
+  four hours. GREEN backfills/writes/protects/reads/tombstones exact receipts for
+  both `finalized` and `orphaned`; pending inbox remains authoritative and a late
+  notification cannot resurrect an orphan tombstone.
+- [x] RED late provenance on an exact present `PROCESSED/finalized` inbox. GREEN
+  merges discovery sources/program IDs without changing target status, finality
+  evidence version, processed timestamp or receipt; a purged tombstone stays a
+  no-op.
+- [x] Run targeted PostgreSQL tests, the complete PostgreSQL backend suite,
+  check, lint, build, docs and diff-check; obtain an independent re-review and
+  resolve every Critical/Important finding before the final commit.
+
+---
+
+### Review correction 4: indexed claim bound and post-purge replay receipt
+
+- [x] RED claim above 4,096 relevant raw rows while exactly 4,096 aligned rows
+  remain eligible. GREEN shares a source-plus-active cursor query, caps every
+  job at 4,097 rows and uses a partial covering index without `OR` or sort.
+- [x] RED a later manual-kill wake after the aligned finalized inbox is really
+  purged. GREEN writes an exact finalized replay receipt transactionally and
+  lets only a missing finalized inbox use it; a present inbox remains
+  authoritative and missing nonterminal/orphaned evidence stays closed.
+- [x] Protect processed finalized inbox purge until an exact receipt exists,
+  retain the receipt while any raw signature remains, and prove a divergent
+  receipt rolls back final completion.
+- [x] Treat the purged finalized receipt as a terminal enqueue tombstone and
+  keep exact pre-purge duplicates idempotent, including a concurrent
+  purge-to-manual-kill claim/enqueue regression.
+- [x] Add migration 028 backfill/replay tests and a 100,000-row PostgreSQL
+  `EXPLAIN`, advance manifests and document the v1.0.6 retention contract.
+
+---
+
+### Review correction 3: paper replay fence and saturated finalized revision
+
+- [x] RED PostgreSQL paper claim for missing, pending, processing, failed or
+  confirmation-misaligned inbox rows, including an earlier active signature of
+  the same mint. GREEN adds the full-cursor fail-fast predicate while keeping
+  confirmed, aligned projections eligible.
+- [x] RED snapshot, stage and `PaperTradingEngine.open` after a revision becomes
+  pending. GREEN adds one reusable MAX-4,096 raw barrier, a separate lexical
+  inbox `FOR SHARE`, and fixed retryable failure mapping before any candidate,
+  session, position or trade materialization.
+- [x] Prove the inbox share lock serializes a concurrent `enqueueRevision`
+  until paper commit, and prove more than 4,096 relevant raw rows fail closed.
+- [x] RED repository and reconciler at
+  `MAX_FINALITY_EVIDENCE_VERSION`. GREEN allows only the genuine finalized
+  transition, using `CASE WHEN version < max THEN version + 1 ELSE version END`;
+  orphan and poll paths remain strict and idempotent terminal replay remains
+  saturated.
+- [x] Update spec, plan, README and diagnostic HTML to version 1.0.5 semantics,
+  then run targeted PostgreSQL tests and the backend delivery gates.
+
+---
+
+### Review correction 1: starvation and paper bootstrap gate
+
+- [x] RED in `tests/finality-reconciler.test.ts`: a rejected middle-slot block
+  must still read the next slot, preserve valid revisions on both sides, never
+  orphan the bad slot, then reject with the fixed `block` stage. GREEN keeps
+  block reads sequential and preserves the 16-slot, 256-candidate and 10,000
+  signature caps.
+- [x] RED in `tests/transaction-inbox.repository.test.ts`: create more rows
+  than the list limit, poll the first with a skewed application timestamp, and
+  require a previously out-of-page candidate on the next page. GREEN orders by
+  `updated_at, observed_slot, signature` and advances attempts with
+  `GREATEST(updated_at, observedAt, clock_timestamp())`.
+- [x] RED in `tests/provider-affine-finality-migration.test.ts`: require the
+  updated partial index after migration 026 → 027 and after direct replay.
+  GREEN uses `DROP INDEX IF EXISTS` followed by the canonical partial index.
+- [x] RED in `tests/production-listener-factory.test.ts`: observe startup may
+  resolve `DEGRADED`, schedule one normal interval and recover; default/paper
+  startup must rethrow without a schedule. GREEN adds strict
+  `initialFailureMode` validation and branches production on `executionMode`.
+- [x] Prove listener rollback in `tests/listener-runtime.test.ts`: a fail-closed
+  reconciler startup returns a redacted runtime failure. Revision 1.0.4 below
+  supersedes the original assumption that paper could start before this gate.
+
+Run the focused suite with live PostgreSQL, then `build`, `check:backend`,
+`lint:backend`, `docs:check`, diff-check and the full test suite.
+
+---
+
+### Review correction 2: initial finality activation barrier
+
+- [x] RED in `tests/listener-runtime.test.ts` with a deferred
+  `reconciler.start`: after `runtime.start()` and queued microtasks, require the
+  call sequence to stop at `reconciler.start` with no paper or social worker
+  activation. Resolve finality, await startup, then require paper, social and
+  heartbeat to start in their exact order.
+- [x] RED the initial-failure path: require paper to be neither started nor
+  closed when finality rejects, while the inbox worker and subscriber are
+  rolled back in reverse order.
+- [x] GREEN in `src/application/listener-runtime.ts`: start and register the
+  reconciler immediately after the inbox worker and before paper/social. Keep
+  observe behavior because `DEGRADED_RETRY` resolves before the later workers;
+  keep paper fail-closed because `FAIL_START` rejects at the barrier.
+- [x] Update spec, plan, README and diagnostic HTML to version 1.0.4 semantics,
+  then run the focused runtime/factory/finality tests and all delivery gates.
+
+---
+
+### Task 1: Provider-aware domain contracts and replayable migration
+
+**Files:**
+
+- Modify: `src/domain/rpc-provider.ts`
+- Modify: `src/domain/transaction-ingestion.ts`
+- Create: `migrations/027_listener_provider_affine_finality.sql`
+- Create: `tests/provider-affine-finality-migration.test.ts`
+- Modify: `tests/transaction-ingestion-contracts.test.ts`
+
+- [x] **Step 1: Write failing domain and migration tests**
+
+Add canonical positional provider constants and test the new frozen contracts:
+
+```ts
+export const RPC_PROVIDER_IDS = Object.freeze([
+  'primary', 'fallback-1', 'fallback-2', 'fallback-3',
+] as const);
+
+export function isRpcProviderId(value: unknown): value is RpcProviderId {
+  return typeof value === 'string'
+    && (RPC_PROVIDER_IDS as readonly string[]).includes(value);
+}
+```
+
+Require candidates with `lastMissingFinalityProviderId`, observations with
+`providerId` and the exact expected provider, and a discriminated revision:
+
+```ts
+const candidate: FinalityCandidate = Object.freeze({
+  signature: 'signature',
+  slot: 42n,
+  confirmationStatus: 'confirmed',
+  missingFinalityPolls: 2,
+  lastMissingFinalityProviderId: 'primary',
+  finalityEvidenceVersion: 7n,
+  processedAtMs: 1_720_000_000_000,
+});
+
+const orphaned: FinalityRevision = Object.freeze({
+  signature: 'signature',
+  confirmationStatus: 'orphaned',
+  expectedConfirmationStatus: 'confirmed',
+  expectedMissingFinalityPolls: 3,
+  expectedLastMissingFinalityProviderId: 'primary',
+  expectedFinalityEvidenceVersion: 8n,
+  observedAtMs: 1_720_000_001_000,
+});
+```
+
+Test both invalid correlations: count zero with a provider and positive count
+without one. Test invalid provider IDs, mutable/accessor-backed inputs,
+negative/unsafe counts, evidence versions outside
+`0n..9_223_372_036_854_775_807n`, and extra proof fields on the finalized
+branch.
+
+The migration test must create the schema through 026, insert one legacy row
+with `missing_finality_polls = 3`, apply 027, and assert `0/NULL`. It must then
+accept all four positional IDs only with a positive count, reject impossible
+count/provider combinations, apply 027 again directly, and verify a full
+`migrateDatabase` replay returns no newly applied migration.
+
+- [x] **Step 2: Run focused tests and observe missing-field/migration failures**
+
+```bash
+node --import tsx --test \
+  tests/transaction-ingestion-contracts.test.ts \
+  tests/provider-affine-finality-migration.test.ts
+```
+
+Expected: FAIL because migration 027 and the new contract fields do not exist.
+
+- [x] **Step 3: Implement the domain union and migration**
+
+Use these domain shapes:
+
+```ts
+export interface FinalizedFinalityRevision {
+  readonly signature: string;
+  readonly confirmationStatus: 'finalized';
+  readonly observedAtMs: number;
+}
+
+export interface OrphanedFinalityRevision {
+  readonly signature: string;
+  readonly confirmationStatus: 'orphaned';
+  readonly expectedConfirmationStatus: 'processed' | 'confirmed';
+  readonly expectedMissingFinalityPolls: number;
+  readonly expectedLastMissingFinalityProviderId: RpcProviderId;
+  readonly expectedFinalityEvidenceVersion: bigint;
+  readonly observedAtMs: number;
+}
+
+export type FinalityRevision = FinalizedFinalityRevision | OrphanedFinalityRevision;
+```
+
+Migration 027 must be replay-safe:
+
+```sql
+ALTER TABLE chain_transaction_inbox
+  ADD COLUMN IF NOT EXISTS last_missing_finality_provider_id TEXT,
+  ADD COLUMN IF NOT EXISTS finality_evidence_version BIGINT NOT NULL DEFAULT 0;
+
+UPDATE chain_transaction_inbox
+SET missing_finality_polls = 0,
+    last_missing_finality_provider_id = NULL
+WHERE missing_finality_polls > 0
+  AND last_missing_finality_provider_id IS NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chain_transaction_inbox_missing_finality_provider_check'
+      AND conrelid = 'chain_transaction_inbox'::regclass
+  ) THEN
+    ALTER TABLE chain_transaction_inbox
+      ADD CONSTRAINT chain_transaction_inbox_missing_finality_provider_check
+      CHECK (
+        (missing_finality_polls = 0
+          AND last_missing_finality_provider_id IS NULL)
+        OR
+        (missing_finality_polls > 0
+          AND last_missing_finality_provider_id IN (
+            'primary', 'fallback-1', 'fallback-2', 'fallback-3'
+          ))
+      );
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chain_transaction_inbox_finality_evidence_version_check'
+      AND conrelid = 'chain_transaction_inbox'::regclass
+  ) THEN
+    ALTER TABLE chain_transaction_inbox
+      ADD CONSTRAINT chain_transaction_inbox_finality_evidence_version_check
+      CHECK (finality_evidence_version >= 0);
+  END IF;
+END;
+$$;
+```
+
+Replayably replace `chain_transaction_inbox_finality_idx` with the same partial
+predicate and `(updated_at, observed_slot, signature)` keys. Do not expose the
+column through an API projection.
+
+- [x] **Step 4: Run focused tests until green**
+
+Run the Step 2 command and `npm run check:backend`.
+
+- [x] **Step 5: Commit the slice**
+
+```bash
+git add src/domain/rpc-provider.ts src/domain/transaction-ingestion.ts \
+  migrations/027_listener_provider_affine_finality.sql \
+  tests/provider-affine-finality-migration.test.ts \
+  tests/transaction-ingestion-contracts.test.ts
+git commit -m "feat: persist finality provider provenance (#61)"
+```
+
+### Task 2: Provider-aware inbox CAS and conditional orphan revision
+
+**Files:**
+
+- Modify: `src/storage/transaction-inbox.repository.ts`
+- Modify: `tests/transaction-inbox.repository.test.ts`
+- Modify: `tests/transaction-ingestion-recovery.test.ts`
+
+- [x] **Step 1: Write failing PostgreSQL repository tests**
+
+Cover the exact transition matrix:
+
+```text
+0/null + primary miss       -> 1/primary
+1/primary + primary miss    -> 2/primary
+2/primary + fallback-1 miss -> 1/fallback-1
+N/provider + present status -> 0/null
+```
+
+Add two concurrent observations with the same expected count but different
+expected providers and require exactly one success. Test stale count, stale
+provider, stale evidence version, stale confirmation status, reset after a new
+confirmed notification, and all terminal revision paths.
+
+Add a true ABA test: retain an orphan proof at `3/primary/version N`, switch to
+fallback, then return to `3/primary/version N+k`; the retained proof must fail
+despite identical visible provider/count/status values.
+
+For orphaning, require an exact revision to succeed and each of these variants
+to fail with `TransactionInboxConflictError('finality')`:
+
+```ts
+Object.freeze({ ...proof, expectedMissingFinalityPolls: proof.expectedMissingFinalityPolls - 1 });
+Object.freeze({ ...proof, expectedLastMissingFinalityProviderId: 'fallback-1' });
+Object.freeze({ ...proof, expectedConfirmationStatus: 'processed' });
+Object.freeze({ ...proof, expectedFinalityEvidenceVersion: proof.expectedFinalityEvidenceVersion - 1n });
+```
+
+Simulate a response lost after commit by submitting the same orphan revision
+again while the row is `PENDING/orphaned`; require an idempotent no-op. Complete
+the worker replay, submit it once more, and require another no-op.
+
+- [x] **Step 2: Run the repository and recovery tests and observe failures**
+
+```bash
+node --import tsx --test \
+  tests/transaction-inbox.repository.test.ts \
+  tests/transaction-ingestion-recovery.test.ts
+```
+
+Expected with PostgreSQL: FAIL because repository queries do not read or write
+the new provider and orphan revisions have no proof guard. Without
+`TEST_DATABASE_URL`, live cases may report explicit skips during this red step.
+
+- [x] **Step 3: Implement exact provider/count CAS**
+
+Extend every finality candidate `SELECT` and `RETURNING` list with
+`last_missing_finality_provider_id` and `finality_evidence_version`. Under the
+existing `FOR UPDATE`, validate the current tuple and compute:
+
+```ts
+const nextMissing = value.confirmationStatus !== null
+  ? 0
+  : currentProvider === value.providerId
+    ? missing + 1
+    : 1;
+const nextProvider = value.confirmationStatus === null ? value.providerId : null;
+```
+
+The update guard must include:
+
+```sql
+AND missing_finality_polls = $expected_count
+AND last_missing_finality_provider_id IS NOT DISTINCT FROM $expected_provider
+AND finality_evidence_version = $expected_version
+```
+
+Every existing SQL path that resets `missing_finality_polls` must set
+`last_missing_finality_provider_id = NULL`. Every poll, existing-row durable
+notification and terminal revision enqueue must increment
+`finality_evidence_version` in the same statement. An existing-row notification
+must clear the missing sequence even when its target status is unchanged, so
+an old proof cannot survive fresh existence evidence.
+
+- [x] **Step 4: Implement conditional orphan enqueue**
+
+Keep finalized handling unchanged. For a real transition to `orphaned`, after
+the idempotent same-target returns and while the row is locked, compare the
+current confirmation, provider and counter with the revision proof. Add the
+same fields to the final `UPDATE` predicate. A stale proof must update zero
+rows and become the existing redacted finality conflict.
+
+The successful update must clear both missing fields and advance the version:
+
+```sql
+missing_finality_polls = 0,
+last_missing_finality_provider_id = NULL,
+finality_evidence_version = finality_evidence_version + 1
+```
+
+- [x] **Step 5: Run focused tests with PostgreSQL until green**
+
+Run the Step 2 command with `TEST_DATABASE_URL` set to the isolated test
+database, then run `npm run check:backend`.
+
+- [x] **Step 6: Commit the slice**
+
+```bash
+git add src/storage/transaction-inbox.repository.ts \
+  tests/transaction-inbox.repository.test.ts \
+  tests/transaction-ingestion-recovery.test.ts
+git commit -m "feat: guard orphan revisions with durable proof (#61)"
+```
+
+### Task 3: Provider-pinned finality pass adapter
+
+**Files:**
+
+- Create: `src/ports/finality-provider-pass.ts`
+- Create: `src/solana/rpc/provider-pinned-finality-source.ts`
+- Create: `tests/provider-pinned-finality-source.test.ts`
+- Modify: `src/solana/rpc/rpc-client.ts`
+- Modify: `tests/rpc-client.test.ts`
+
+- [x] **Step 1: Write failing adapter and RPC regression tests**
+
+Specify this neutral port:
+
+```ts
+export interface FinalityProviderPass {
+  readonly providerId: RpcProviderId;
+  getHistoryStatuses(signatures: readonly string[]): Promise<unknown>;
+  getFinalizedSlot(): Promise<unknown>;
+  getFinalizedBlockSignatures(slot: bigint): Promise<unknown>;
+}
+
+export interface FinalityProviderPassSource {
+  openPass(): unknown;
+}
+```
+
+Inject a fake RPC factory into the adapter. Assert one catalog resolution and
+one RPC construction. Invoke history, root and two block reads and prove all
+four calls hit the same fake instance. Verify exact calls equivalent to:
+
+```ts
+rpc.getSignatureStatuses(signatures, { searchTransactionHistory: true });
+rpc.getSlot('finalized');
+rpc.getBlockSignatures(Number(slot), 'finalized');
+```
+
+Test 256 signatures accepted, 257 rejected, invalid slots, block arrays above
+10,000 entries, sparse/duplicate/non-canonical signatures, hostile accessors,
+RPC rejection and remote messages containing secret URLs. Fixed public errors
+must contain no cause or remote data, and no fallback factory may be called.
+
+Add an HTTP-level regression test proving `SolanaRpcClient.getBlockSignatures`
+accepts the official `getBlock` response with top-level `signatures` and sends
+`transactionDetails: 'signatures'`, `rewards: false`.
+
+- [x] **Step 2: Run focused tests and observe missing adapter/parser failure**
+
+```bash
+node --import tsx --test \
+  tests/provider-pinned-finality-source.test.ts \
+  tests/rpc-client.test.ts
+```
+
+- [x] **Step 3: Implement the pinned adapter**
+
+Expose a constructor boundary like:
+
+```ts
+export function createProviderPinnedFinalityPass(
+  catalog: RpcProviderCatalog,
+  providerId: RpcProviderId,
+  dependencies?: ProviderPinnedFinalityDependencies,
+): FinalityProviderPass;
+```
+
+Resolve the catalog once, construct a direct `Connection` for the exact HTTP
+URL with `disableRetryOnRateLimit: true`, and never use
+`createRpcHttpFailoverFetch`. Snapshot statuses as frozen `{ slot: bigint,
+confirmationStatus } | null` values. Snapshot at most 10,000 unique canonical
+64-byte base58 block signatures. Use fixed errors:
+
+```ts
+export type ProviderPinnedFinalityErrorReason =
+  | 'CONFIG_INVALID'
+  | 'HISTORY_UNAVAILABLE'
+  | 'ROOT_UNAVAILABLE'
+  | 'BLOCK_UNAVAILABLE';
+```
+
+- [x] **Step 4: Fix the shared block-signature parser path**
+
+Replace generic `Connection.getBlock(... transactionDetails: 'signatures')`
+usage in `SolanaRpcClient.getBlockSignatures` with:
+
+```ts
+const block = await this.http.getBlockSignatures(
+  numericSlot,
+  rpcFinality(confirmationStatus),
+);
+return Object.freeze([...block.signatures]);
+```
+
+Let unavailable blocks reject into the locator's existing retryable RPC path;
+do not translate them into signature absence.
+
+- [x] **Step 5: Run focused tests and type checking until green**
+
+Run the Step 2 command and `npm run check:backend`.
+
+- [x] **Step 6: Commit the slice**
+
+```bash
+git add src/ports/finality-provider-pass.ts \
+  src/solana/rpc/provider-pinned-finality-source.ts \
+  src/solana/rpc/rpc-client.ts \
+  tests/provider-pinned-finality-source.test.ts tests/rpc-client.test.ts
+git commit -m "feat: add pinned Solana finality pass (#61)"
+```
+
+### Task 4: Same-provider canonical block proof algorithm
+
+**Files:**
+
+- Modify: `src/application/finality-reconciler.ts`
+- Modify: `tests/finality-reconciler.test.ts`
+
+- [x] **Step 1: Rewrite the reconciler tests against pass capture**
+
+Require one `openPass()` call per non-empty run and no call for an empty page.
+Add tests for:
+
+- same-provider missing sequence reaches the threshold and reads one block;
+- primary count two followed by fallback miss returns count one and no block;
+- a present status resets count/provider;
+- root equal to candidate slot reads no block;
+- signature absent enqueues an orphan revision with exact proof fields;
+- signature present raises `finality-contradiction` and enqueues no orphan for
+  that slot;
+- block null, rejection or malformed data raises fixed `block`;
+- candidates sharing a slot cause one block read;
+- seventeen unique eligible slots read only the first sixteen and defer one;
+- a repository race changing provider/count/version makes the revision fail at
+  stage `revision`;
+- forged poll results with an unchanged, regressive or skipped evidence
+  version fail at stage `poll` before any block proof;
+- 256 is the maximum constructor limit.
+
+The memory repository must implement provider-aware transitions exactly like
+PostgreSQL and reject stale orphan proof fields before recording a revision.
+
+- [x] **Step 2: Run the reconciler test and observe contract failures**
+
+```bash
+node --import tsx --test tests/finality-reconciler.test.ts
+```
+
+- [x] **Step 3: Capture and validate one pass**
+
+Change `MAX_FINALITY_RECONCILE_LIMIT` to `256`. Accept a
+`FinalityProviderPassSource`, call `openPass` once after a non-empty page, and
+snapshot `providerId` plus all three methods through own/prototype data
+descriptors without invoking accessors.
+
+Add fixed stages:
+
+```ts
+export type FinalityReconcilerErrorStage =
+  | 'list' | 'pass' | 'history' | 'root' | 'block'
+  | 'poll' | 'revision' | 'clock' | 'finality-contradiction';
+```
+
+Keep one history batch and one finalized root read on the captured pass.
+
+Extend `assertPollTransition` to require:
+
+```ts
+if (before.finalityEvidenceVersion
+  === 9_223_372_036_854_775_807n
+  || after.finalityEvidenceVersion !== before.finalityEvidenceVersion + 1n) {
+  throw new TypeError('Finality evidence version transition is invalid.');
+}
+```
+
+Test unchanged, regressive, skipped and out-of-range repository versions. None
+may reach `getFinalizedBlockSignatures` or `enqueueRevision`.
+
+- [x] **Step 4: Implement provider-aware polls and block proofs**
+
+Pass these exact poll fields:
+
+```ts
+Object.freeze({
+  signature: candidate.signature,
+  confirmationStatus: status?.confirmationStatus ?? null,
+  providerId: pass.providerId,
+  expectedMissingFinalityPolls: candidate.missingFinalityPolls,
+  expectedLastMissingFinalityProviderId: candidate.lastMissingFinalityProviderId,
+  expectedFinalityEvidenceVersion: candidate.finalityEvidenceVersion,
+  observedAtMs,
+});
+```
+
+After polls, group threshold-eligible missing candidates by slot in candidate
+order. For the first sixteen unique slots, read and snapshot one complete
+block signature list. If any eligible signature for the slot is present,
+throw `finality-contradiction` before enqueueing any orphan from that slot.
+Otherwise enqueue:
+
+```ts
+Object.freeze({
+  signature: candidate.signature,
+  confirmationStatus: 'orphaned',
+  expectedConfirmationStatus: polled.confirmationStatus,
+  expectedMissingFinalityPolls: polled.missingFinalityPolls,
+  expectedLastMissingFinalityProviderId: pass.providerId,
+  expectedFinalityEvidenceVersion: polled.finalityEvidenceVersion,
+  observedAtMs,
+});
+```
+
+Read blocks sequentially. Treat null, rejection, sparse/duplicate/oversized
+arrays and unsafe values as stage `block`, never as absence. Remember the first
+block failure, skip orphaning only for that slot, continue later slots within
+the sixteen-slot budget, then throw the remembered failure after the loop.
+
+- [x] **Step 5: Run focused tests and static checks until green**
+
+```bash
+node --import tsx --test tests/finality-reconciler.test.ts
+npm run check:backend
+npm run lint:backend
+```
+
+- [x] **Step 6: Commit the slice**
+
+```bash
+git add src/application/finality-reconciler.ts tests/finality-reconciler.test.ts
+git commit -m "feat: require canonical block proof for orphaning (#61)"
+```
+
+### Task 5: Primary-pinned production wiring and lifecycle regression
+
+**Files:**
+
+- Modify: `src/application/production-listener-factory.ts`
+- Modify: `tests/production-listener-factory.test.ts`
+- Modify: `tests/transaction-ingestion-recovery.test.ts`
+
+- [x] **Step 1: Write failing production-boundary tests**
+
+Require the production source to be built from `createRpcProviderCatalog`,
+`createProviderPinnedFinalityPass`, and positional ID `primary`. Add a source
+scan that rejects passing the general `SolanaRpcClient` directly to
+`FinalityReconciler` and rejects importing the HTTP failover transport from the
+pinned adapter.
+
+Exercise `RecurringFinalityReconciler` with a block-unavailable first pass:
+observe startup becomes `DEGRADED` and a later coherent scheduled pass returns
+it to `RUNNING` using a fresh proof; default/paper startup rejects and schedules
+nothing. A scheduled failure after a successful startup remains retryable.
+
+Add a crash/restart integration scenario:
+
+```text
+primary poll commits at count two -> process stops
+fallback pass starts -> first miss persists as count one/fallback
+fallback reaches threshold -> fresh finalized block proof -> orphan revision
+```
+
+- [x] **Step 2: Run focused production and recovery tests**
+
+```bash
+node --import tsx --test \
+  tests/production-listener-factory.test.ts \
+  tests/transaction-ingestion-recovery.test.ts
+```
+
+- [x] **Step 3: Wire a fixed primary pass**
+
+In `createProductionListenerRuntime`, construct the paired catalog once and a
+dedicated primary pass once. Inject an immutable source whose `openPass`
+returns that pass:
+
+```ts
+const providers = createRpcProviderCatalog(config);
+const primaryFinality = createProviderPinnedFinalityPass(providers, 'primary');
+const finalitySource: FinalityProviderPassSource = Object.freeze({
+  openPass: () => primaryFinality,
+});
+```
+
+Keep the general failover-enabled `SolanaRpcClient` for transaction lookup,
+market reads, catch-up and heartbeat. Do not change the production WebSocket
+subscriber or activate #63 behavior.
+
+- [x] **Step 4: Run focused lifecycle tests and static checks until green**
+
+Run the Step 2 command, `npm run check:backend`, and `npm run lint:backend`.
+
+- [x] **Step 5: Commit the slice**
+
+```bash
+git add src/application/production-listener-factory.ts \
+  tests/production-listener-factory.test.ts \
+  tests/transaction-ingestion-recovery.test.ts
+git commit -m "feat: pin production finality to primary RPC (#61)"
+```
+
+### Task 6: Migration manifests, documentation, full validation and PR
+
+**Files:**
+
+- Modify: `scripts/deployment-smoke.mjs`
+- Modify: `tests/api-event-stream-migration.test.ts`
+- Modify: `tests/creation-entry-migration.test.ts`
+- Modify: `tests/participant-analytics-migration.test.ts`
+- Modify: `tests/paper-mvp-migration.test.ts`
+- Modify: `tests/social-persistence-retry-migration.test.ts`
+- Modify: `tests/transaction-inbox-retry-migration.test.ts`
+- Modify: `tests/transaction-inbox-timestamp-migration.test.ts`
+- Modify: `tests/transaction-ingestion-migration.test.ts`
+- Modify: `tests/wallet-graph-migration.test.ts`
+- Modify: `docs/system-overview.html`
+- Modify: `README.md`
+
+- [x] **Step 1: Update every migration manifest assertion**
+
+Use a repository-wide search:
+
+```bash
+rg -n "026_listener_strict_catch_up_failures|001-026|last migration" \
+  scripts tests docs README.md
+```
+
+Advance all authoritative last-migration lists and assertions to
+`027_listener_provider_affine_finality.sql`. Do not mechanically change
+historical statements that intentionally describe migration 026 itself.
+
+- [x] **Step 2: Document the operational behavior**
+
+Add concise versioned documentation explaining:
+
+```text
+finality source in #61: primary-only pinned HTTP
+provider unavailable: observe DEGRADED/retry; paper bootstrap fail closed
+bounded pages: database-time attempt rotation on updated_at
+bad block slot: nonterminal; later slots continue; throw block after loop
+orphan proof: same-provider misses + higher finalized root + available block
+deployment: stop old replicas before applying migration 027
+public data: positional provider IDs only; URLs remain secret
+execution: observe/paper only, transaction submission disabled
+```
+
+Keep the Bootstrap diagnostic HTML consistent with the independent frontend
+contract and do not present it as the product interface.
+
+- [x] **Step 3: Run focused migration and safety validation**
+
+```bash
+node --import tsx --test \
+  tests/provider-affine-finality-migration.test.ts \
+  tests/transaction-ingestion-migration.test.ts \
+  tests/deployment-artifacts.test.ts \
+  tests/production-listener-factory.test.ts
+rg -n "sendTransaction|sendRawTransaction|Keypair|privateKey|secretKey" \
+  src/application/finality-reconciler.ts \
+  src/solana/rpc/provider-pinned-finality-source.ts \
+  src/ports/finality-provider-pass.ts
+```
+
+Expected: tests pass and the safety search prints no match in the new finality
+surface.
+
+- [x] **Step 4: Run every local gate with PostgreSQL**
+
+```bash
+npm install
+npm run build
+npm run check
+npm run lint
+npm run docs:check
+npm test
+git diff --check origin/main...HEAD
+```
+
+Expected: every command exits zero; backend PostgreSQL tests run rather than
+skip, frontend tests remain green, migration 027 applies on an empty schema and
+replays cleanly.
+
+- [x] **Step 5: Perform spec and quality review**
+
+Review the diff against every requirement in
+`docs/superpowers/specs/2026-08-27-provider-affine-finality-design.md`. Then run
+a separate code-quality review focused on hostile inputs, redaction,
+concurrency, crash recovery, PostgreSQL rollout and quota bounds. Fix every
+blocking finding and rerun the affected focused tests plus all gates.
+
+- [x] **Step 6: Commit delivery documentation**
+
+```bash
+git add scripts/deployment-smoke.mjs tests docs/system-overview.html README.md
+git commit -m "docs: describe provider-affine finality operations (#61)"
+```
+
+- [ ] **Step 7: Push, open PR and complete at most three review cycles**
+
+```bash
+git push -u origin feature/issue-61-provider-finality
+gh pr create --repo pivox/sol-token-listener \
+  --base main --head feature/issue-61-provider-finality \
+  --title "feat: guarantee provider-affine Solana finality" \
+  --body-file /tmp/issue-61-pr-body.md
+```
+
+The PR body must link #61 and #57, summarize migration 027 and primary-pinned
+production behavior, list exact test/gate evidence, state that #49 was not run,
+and state that no signing/submission capability was added. Request Codex review
+in a PR comment. Use no more than three correction/re-review cycles. Merge only
+after CI is green and no blocking thread remains.
+
+- [ ] **Step 8: Merge and synchronize the umbrella**
+
+After merge, verify #61 is closed, check #61 in issue #57, fetch/pull `main`,
+and create the isolated branch/worktree for #62. Keep #49 explicitly separate
+and unexecuted.

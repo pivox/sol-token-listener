@@ -140,6 +140,77 @@ relève de l'issue #57. Les événements sans secret `rpc.http_endpoint_degraded
 métriques V1 dérivées des logs. Voir le [guide d'exploitation RPC](docs/operations/rpc-qualification.md)
 pour les délais de refroidissement, les limites et la qualification mono-fournisseur du soak.
 
+## Finalité affine au fournisseur (#61, v1.0.8, migrations 027–029)
+
+La finalité utilise un pass HTTP épinglé au fournisseur primaire : statuts,
+racine <code>finalized</code> et signatures du bloc sont toujours lus par ce
+même fournisseur, sans failover HTTP. Si ce fournisseur ou le bloc finalized
+exact est indisponible, le slot concerné reste nonterminal et ne produit jamais
+<code>orphaned</code>. Les autres slots de la passe continuent séquentiellement,
+dans la limite de 16, puis le composant signale <code>DEGRADED</code> et réessaie
+à l’intervalle suivant en mode observe.
+L’orphaning exige N statuts absents consécutifs du même fournisseur, une racine
+finalized strictement supérieure au slot, le bloc finalized exact disponible et
+l’absence de la signature dans ce bloc. Un changement de fournisseur remet le
+compteur à 1. La preuve durable conserve l’identifiant public positionnel du
+fournisseur, le compteur et une version ; chaque transition est un CAS exact.
+La page bornée est ordonnée par la dernière tentative durable
+<code>updated_at</code>. Chaque poll avance cette horloge avec le temps PostgreSQL
+en plus du temps observé, de sorte qu’une ligne durablement indisponible tourne
+derrière les autres candidates au lieu de monopoliser la première page.
+
+Au bootstrap, observe accepte une première passe en échec comme
+<code>DEGRADED</code> et programme un seul intervalle normal avec une preuve
+fraîche. Paper échoue fermé : la première erreur de finalité interrompt le
+démarrage et ne programme aucun retry. La passe initiale de finalité précède
+l’activation du worker paper : tant qu’elle est en attente, aucune simulation
+n’est planifiée; si elle échoue, le worker paper n’a été ni démarré ni fermé et
+seules les ressources antérieures sont rollbackées. En observe, la politique
+<code>DEGRADED_RETRY</code> résout cette barrière avant de démarrer les workers
+suivants et conserve la reprise à l’intervalle normal.
+
+Avant toute simulation, la lignée paper vérifie aussi le replay de finalité
+jusqu’au curseur source complet. Toutes les raw antérieures ou égales sont
+incluses, même orphaned : leur pipeline peut avoir rétracté la raw avant
+d’échouer sur une projection ultérieure, tandis que l’inbox reste non traitée.
+Le claim et la barrière examinent au plus 4 097 raw par job, tous statuts
+confondus, refusent au-dessus de 4 096 et utilisent un index couvrant complet
+dont la borne cursor est une condition d’index, sans scan, tri complet ni join
+filter du mint. Une inbox présente reste autoritaire : elle doit être
+<code>PROCESSED</code> et exactement alignée. Après sa purge terminale à quatre
+heures, une raw <code>finalized</code> ou <code>orphaned</code> peut utiliser une
+receipt durable exacte écrite atomiquement par le replay; une preuve absente ou
+nonterminale reste fermée. Les verrous de lecture sont conservés jusqu’au
+commit. La receipt sert aussi de tombstone terminale : une découverte finalized
+identique après purge est un no-op, tandis qu’une notification après tombstone
+orphaned ou une identité divergente est refusée; avant purge, un doublon
+finalized terminal peut seulement enrichir ses sources/programmes et ne change
+jamais la cible, la version de preuve, le timestamp traité ou la receipt. Toute
+révision <code>PENDING</code>/<code>PROCESSING</code>/
+<code>FAILED</code> ou décalée produit donc un retry sans candidate, session,
+position ni trade. Les sources <code>confirmed</code> alignées restent autorisées.
+
+À la version maximale de preuve, polls manquants et orphaning restent refusés,
+mais une vraie transition <code>confirmed → finalized</code> est rejouée en
+conservant la version saturée, sans addition susceptible de dépasser
+<code>BIGINT</code>.
+
+Pour le rollout de `027_listener_provider_affine_finality.sql`, arrêter les
+anciennes réplicas avant d’appliquer la migration, puis démarrer le nouveau
+binaire. La migration est rejouable et remplace l’index partiel de finalité par
+<code>(updated_at, observed_slot, signature)</code>. Les identifiants de
+fournisseur sont publics et positionnels ; les URLs restent secrètes. Cette
+capacité reste observe/paper uniquement : aucune signature ni soumission de
+transaction n’est ajoutée. La migration
+`028_paper_finality_replay_evidence.sql`, également rejouable, ajoute la receipt
+durable pour les deux états terminaux `finalized` et `orphaned`, ainsi que
+l’index couvrant de la barrière, sans prolonger la rétention de l’inbox au-delà
+de quatre heures. `029_paper_finality_claim_scheduler.sql` ajoute une génération
+monotone durable et un index d’échéance effectif : chaque claim verrouille au
+plus seize jobs avant les jointures de replay, annule les leases épuisés de ce
+seul lot, réclame le premier job prêt et fait tourner uniquement les jobs
+bloqués, même si plusieurs appels partagent exactement le même timestamp.
+
 Les migrations ne sont pas lancées automatiquement par
 défaut. `npm run build` les embarque dans `dist/migrations`, de sorte que
 `POSTGRES_AUTO_MIGRATE=true npm start` fonctionne avec l'artefact compilé.

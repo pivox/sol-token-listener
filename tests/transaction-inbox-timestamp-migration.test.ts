@@ -28,7 +28,7 @@ void test('bulk inserts cannot violate inbox timestamp ordering', async (context
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '026_listener_strict_catch_up_failures.sql');
+    assert.equal(applied.at(-1), '029_paper_finality_claim_scheduler.sql');
     await pool.query(`INSERT INTO chain_transaction_inbox (
       signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
       processing_status, observed_at

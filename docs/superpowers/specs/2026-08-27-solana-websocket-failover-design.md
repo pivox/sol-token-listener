@@ -3,8 +3,20 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.1.4
+Version: 1.2.2
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.2.2 bounds the monotone evidence generation to PostgreSQL `BIGINT`
+and requires the hostile application boundary to verify an exact increment.
+
+Revision 1.2.1 adds a monotone durable finality-evidence generation to prevent
+an old block proof becoming valid again after a provider/count ABA cycle.
+
+Revision 1.2.0 specifies issue #61 through the dedicated provider-affine
+finality design. It makes the currently active reconciler primary-pinned,
+persists the positional provider behind consecutive missing statuses, requires
+a finalized canonical block before orphaning, and closes the poll-to-revision
+race with an exact transactional proof precondition.
 
 Revision 1.1.4 caches only successful provider genesis validation, shares one
 in-flight validation attempt, retries after every rejection, and anchors every
@@ -364,16 +376,27 @@ in-memory transition journal:
 
 ## Provider-affine finality
 
-One finality reconciliation pass pins status reads, finalized root and block
-proof to the same provider. The inbox records the positional provider ID that
-returned a missing status. A provider change resets the consecutive-missing
-counter. A signature can become `ORPHANED` only after the configured number of
+Issue #61 is specified in
+`docs/superpowers/specs/2026-08-27-provider-affine-finality-design.md` version
+1.0.6. One finality reconciliation pass captures one provider-pinned HTTP
+capability and uses it for status reads, finalized root and finalized block
+proofs. The inbox records the positional provider ID behind the current
+missing-status sequence. A provider change starts a fresh sequence at one.
+
+A signature can become `ORPHANED` only after the configured number of
 same-provider misses, a strictly higher same-provider finalized root, and a
-same-provider finalized block proof that the signature is absent.
+same-provider finalized canonical block that is available and does not
+contain the signature. The enqueue is conditional on the exact durable
+provider, counter and pre-terminal status still being current. A concurrent
+provider switch or status observation therefore invalidates the stale proof.
+The same precondition includes a monotone evidence generation, so an old
+proof cannot become valid again if visible provider/count values later repeat.
 
 Unavailable archive or block evidence retries and degrades; it does not prove
-orphaning. This closes the cross-provider contradiction exposed by the HTTP
-fallback audit.
+orphaning. Block reads are deduplicated by slot and limited to sixteen unique
+slots per pass. Until #63 owns provider promotion, the active production
+reconciler uses a dedicated primary-only connection and fails closed instead
+of falling back request by request.
 
 ## Durable health and public API
 

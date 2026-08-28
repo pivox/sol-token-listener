@@ -17,6 +17,7 @@ import {
   assertValidTransactionNotification,
   createDurableTransactionSnapshot,
   isCanonicalSolanaProgramId,
+  MAX_FINALITY_EVIDENCE_VERSION,
   type ClaimedTransaction,
   type CatchUpGap,
   type DurableNormalizedTransaction,
@@ -68,6 +69,19 @@ interface InboxIdentityRow extends QueryResultRow {
   readonly target_confirmation_status: unknown;
   readonly processing_status: unknown;
   readonly normalized_transaction: unknown;
+  readonly immutable_fingerprint: unknown;
+  readonly processed_at: unknown;
+  readonly missing_finality_polls: unknown;
+  readonly last_missing_finality_provider_id: unknown;
+  readonly finality_evidence_version: unknown;
+}
+
+interface TerminalReplayReceiptRow extends QueryResultRow {
+  readonly observed_slot: unknown;
+  readonly confirmation_status: unknown;
+  readonly finality_evidence_version: unknown;
+  readonly immutable_fingerprint: unknown;
+  readonly replay_completed_at: unknown;
 }
 
 const SERVICE_KEY = 'transaction-listener';
@@ -134,12 +148,26 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         );
         const existing = await client.query(
           `SELECT observed_slot, discovery_sources, program_ids, target_confirmation_status,
-             processing_status, normalized_transaction
+             processing_status, normalized_transaction, immutable_fingerprint, processed_at,
+             missing_finality_polls,
+             last_missing_finality_provider_id, finality_evidence_version
            FROM chain_transaction_inbox WHERE signature = $1 FOR UPDATE`,
           [value.signature],
         );
         const row = existing.rows[0] as InboxIdentityRow | undefined;
+        const receiptResult = await client.query(
+          `SELECT observed_slot, confirmation_status, finality_evidence_version,
+             immutable_fingerprint, replay_completed_at
+           FROM chain_transaction_finality_replay_receipts
+           WHERE signature = $1 FOR SHARE`,
+          [value.signature],
+        );
+        const receipt = receiptResult.rows[0] as TerminalReplayReceiptRow | undefined;
         if (row === undefined) {
+          if (receipt !== undefined) {
+            assertTerminalReceiptAcceptsNotification(receipt, value);
+            return;
+          }
           const inserted = await client.query(
             `INSERT INTO chain_transaction_inbox (
               signature, observed_slot, discovery_sources, program_ids, target_confirmation_status,
@@ -163,7 +191,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           throw internalRepositoryError(new TransactionInboxConflictError('identity'));
         }
         const current = confirmation(row.target_confirmation_status);
-        const next = reconciledStatus(current, value.confirmationStatus);
+        const processingStatus = inboxStatus(row.processing_status);
         const sources = discoverySources(row.discovery_sources);
         if (!sources.includes(value.source)) sources.push(value.source);
         sources.sort(sourceOrder);
@@ -173,7 +201,23 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         }
         programs.sort(lexicalOrder);
         if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
-        const processingStatus = inboxStatus(row.processing_status);
+        if (current === 'finalized' && processingStatus === 'PROCESSED') {
+          reconciledStatus(current, value.confirmationStatus);
+          assertTerminalReceiptMatchesInbox(receipt, row);
+          const updated = await client.query(
+            `UPDATE chain_transaction_inbox SET
+               discovery_sources=$2,program_ids=$3,updated_at=GREATEST(updated_at,$4)
+             WHERE signature=$1`,[
+              value.signature,sources,programs,dateFromMs(value.observedAtMs),
+            ],
+          );
+          requireOne(updated.rowCount);
+          return;
+        }
+        const next = reconciledStatus(current, value.confirmationStatus);
+        if (finalityEvidenceVersion(row.finality_evidence_version) === MAX_FINALITY_EVIDENCE_VERSION) {
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+        }
         const shouldReplay = processingStatus === 'PROCESSED' && next !== current;
         if (shouldReplay && row.normalized_transaction === null) {
           throw internalRepositoryError(new TransactionInboxConflictError('snapshot'));
@@ -189,7 +233,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              purge_after = CASE WHEN $5 THEN NULL ELSE purge_after END,
              attempts_in_cycle = CASE WHEN $5 THEN 0 ELSE attempts_in_cycle END,
              retry_exhausted_at = CASE WHEN $5 THEN NULL ELSE retry_exhausted_at END,
-             missing_finality_polls = CASE WHEN $5 THEN 0 ELSE missing_finality_polls END,
+             missing_finality_polls = 0,
+             last_missing_finality_provider_id = NULL,
+             finality_evidence_version = finality_evidence_version + 1,
              updated_at = GREATEST(updated_at, $6)
            WHERE signature = $1`,
           [value.signature, sources, programs, next, shouldReplay, dateFromMs(value.observedAtMs)],
@@ -375,18 +421,54 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         );
         const terminal = next === 'finalized' || next === 'orphaned';
         const result = await client.query(
-          `UPDATE chain_transaction_inbox SET
-             target_confirmation_status = $3, processing_status = 'PROCESSED',
-             lease_token = NULL, lease_expires_at = NULL, next_attempt_at = NULL,
-             error_code = NULL, error_name = NULL, error_retryable = NULL,
-             processed_at = completed.completed_at,
-             terminal_at = CASE WHEN $4 THEN completed.completed_at ELSE NULL END,
-             purge_after = CASE WHEN $4 THEN completed.completed_at + INTERVAL '4 hours' ELSE NULL END,
-             missing_finality_polls = CASE WHEN $4 THEN 0 ELSE missing_finality_polls END,
-             updated_at = completed.completed_at
-           FROM (SELECT clock_timestamp() AS completed_at) completed
-           WHERE signature = $1 AND lease_token = $2 AND processing_status = 'PROCESSING'`,
-          [signature, token, next, terminal],
+          `WITH completed AS MATERIALIZED (
+             SELECT clock_timestamp() AS completed_at
+           ), updated_inbox AS (
+             UPDATE chain_transaction_inbox SET
+               target_confirmation_status = $3, processing_status = 'PROCESSED',
+               lease_token = NULL, lease_expires_at = NULL, next_attempt_at = NULL,
+               error_code = NULL, error_name = NULL, error_retryable = NULL,
+               processed_at = completed.completed_at,
+               terminal_at = CASE WHEN $4 THEN completed.completed_at ELSE NULL END,
+               purge_after = CASE WHEN $4 THEN
+                 completed.completed_at + INTERVAL '4 hours' ELSE NULL END,
+               missing_finality_polls = CASE WHEN $4 THEN 0 ELSE missing_finality_polls END,
+               last_missing_finality_provider_id = CASE
+                 WHEN $4 THEN NULL ELSE last_missing_finality_provider_id END,
+               finality_evidence_version = CASE
+                 WHEN $4 AND finality_evidence_version < $5::BIGINT
+                   THEN finality_evidence_version + 1
+                 ELSE finality_evidence_version
+               END,
+               updated_at = completed.completed_at
+             FROM completed
+             WHERE signature = $1 AND lease_token = $2
+               AND processing_status = 'PROCESSING'
+             RETURNING signature,observed_slot,target_confirmation_status,
+               finality_evidence_version,immutable_fingerprint,processed_at
+           ), replay_receipt AS (
+             INSERT INTO chain_transaction_finality_replay_receipts AS receipt (
+               signature,observed_slot,confirmation_status,finality_evidence_version,
+               immutable_fingerprint,replay_completed_at
+             )
+             SELECT signature,observed_slot,target_confirmation_status,
+               finality_evidence_version,immutable_fingerprint,processed_at
+             FROM updated_inbox
+             WHERE target_confirmation_status IN ('finalized','orphaned')
+             ON CONFLICT (signature) DO UPDATE SET signature=EXCLUDED.signature
+             WHERE receipt.observed_slot=EXCLUDED.observed_slot
+               AND receipt.confirmation_status=EXCLUDED.confirmation_status
+               AND receipt.finality_evidence_version=EXCLUDED.finality_evidence_version
+               AND receipt.immutable_fingerprint=EXCLUDED.immutable_fingerprint
+               AND receipt.replay_completed_at=EXCLUDED.replay_completed_at
+             RETURNING signature
+           )
+           SELECT updated.signature
+           FROM updated_inbox updated
+           LEFT JOIN replay_receipt receipt ON receipt.signature=updated.signature
+           WHERE updated.target_confirmation_status NOT IN ('finalized','orphaned')
+             OR receipt.signature IS NOT NULL`,
+          [signature, token, next, terminal, MAX_FINALITY_EVIDENCE_VERSION.toString()],
         );
         requireLease(result.rowCount);
       });
@@ -578,11 +660,12 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       }
       const result = await this.pool.query(
         `SELECT signature, observed_slot, target_confirmation_status,
-           missing_finality_polls, processed_at
+           missing_finality_polls, last_missing_finality_provider_id,
+           finality_evidence_version, processed_at
          FROM chain_transaction_inbox
          WHERE processing_status = 'PROCESSED'
            AND target_confirmation_status IN ('processed', 'confirmed')
-         ORDER BY processed_at, observed_slot, signature
+         ORDER BY updated_at, observed_slot, signature
          LIMIT $1`,
         [limit],
       );
@@ -596,7 +679,8 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       return this.transaction(async (client) => {
         const selected = await client.query(
           `SELECT observed_slot, target_confirmation_status, processing_status,
-             missing_finality_polls, processed_at
+             signature, missing_finality_polls, last_missing_finality_provider_id,
+             finality_evidence_version, processed_at
            FROM chain_transaction_inbox WHERE signature = $1 FOR UPDATE`,
           [value.signature],
         );
@@ -609,14 +693,20 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (current !== 'processed' && current !== 'confirmed') {
           throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
-        const missing = safeCount(row.missing_finality_polls, 'missing finality polls');
-        if (missing !== value.expectedMissingFinalityPolls) {
+        const candidate = finalityCandidateFromRow(row);
+        if (candidate.missingFinalityPolls !== value.expectedMissingFinalityPolls
+          || candidate.lastMissingFinalityProviderId !== value.expectedLastMissingFinalityProviderId
+          || candidate.finalityEvidenceVersion !== value.expectedFinalityEvidenceVersion
+          || candidate.finalityEvidenceVersion === MAX_FINALITY_EVIDENCE_VERSION) {
           throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
         const nextStatus = value.confirmationStatus === null
           ? current
           : reconciledStatus(current, value.confirmationStatus);
-        const nextMissing = value.confirmationStatus === null ? missing + 1 : 0;
+        const nextMissing = value.confirmationStatus === null
+          ? candidate.lastMissingFinalityProviderId === value.providerId
+            ? candidate.missingFinalityPolls + 1 : 1
+          : 0;
         if (!Number.isSafeInteger(nextMissing)) {
           throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
@@ -624,19 +714,28 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
           `UPDATE chain_transaction_inbox SET
              target_confirmation_status = $2,
              missing_finality_polls = $3,
-             updated_at = GREATEST(updated_at, $5)
+             last_missing_finality_provider_id = $4,
+             finality_evidence_version = finality_evidence_version + 1,
+             updated_at = GREATEST(updated_at, $8, clock_timestamp())
            WHERE signature = $1
              AND processing_status = 'PROCESSED'
-             AND target_confirmation_status IN ('processed', 'confirmed')
-             AND missing_finality_polls = $4
+             AND target_confirmation_status = $5
+             AND missing_finality_polls = $6
+             AND last_missing_finality_provider_id IS NOT DISTINCT FROM $7
+             AND finality_evidence_version = $9
            RETURNING signature, observed_slot, target_confirmation_status,
-             missing_finality_polls, processed_at`,
+             missing_finality_polls, last_missing_finality_provider_id,
+             finality_evidence_version, processed_at`,
           [
             value.signature,
             nextStatus,
             nextMissing,
+            value.confirmationStatus === null ? value.providerId : null,
+            candidate.confirmationStatus,
             value.expectedMissingFinalityPolls,
+            value.expectedLastMissingFinalityProviderId,
             dateFromMs(value.observedAtMs),
+            value.expectedFinalityEvidenceVersion.toString(),
           ],
         );
         if (updated.rowCount !== 1) {
@@ -653,7 +752,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
       await this.transaction(async (client) => {
         const selected = await client.query(
           `SELECT observed_slot, target_confirmation_status, processing_status,
-             normalized_transaction, immutable_fingerprint
+             signature, normalized_transaction, immutable_fingerprint,
+             missing_finality_polls, last_missing_finality_provider_id,
+             finality_evidence_version, processed_at
            FROM chain_transaction_inbox WHERE signature = $1 FOR UPDATE`,
           [value.signature],
         );
@@ -679,15 +780,63 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (status !== 'PROCESSED') {
           throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
+        if (value.confirmationStatus !== 'finalized'
+          && finalityEvidenceVersion(row.finality_evidence_version)
+            === MAX_FINALITY_EVIDENCE_VERSION) {
+          throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+        }
+        if (value.confirmationStatus === 'orphaned') {
+          const candidate = finalityCandidateFromRow(row);
+          if (candidate.confirmationStatus !== value.expectedConfirmationStatus
+            || candidate.missingFinalityPolls !== value.expectedMissingFinalityPolls
+            || candidate.lastMissingFinalityProviderId !== value.expectedLastMissingFinalityProviderId
+            || candidate.finalityEvidenceVersion !== value.expectedFinalityEvidenceVersion
+            || candidate.finalityEvidenceVersion === MAX_FINALITY_EVIDENCE_VERSION) {
+            throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+          }
+          const result = await client.query(
+            `UPDATE chain_transaction_inbox SET
+               target_confirmation_status = $2, processing_status = 'PENDING',
+               processed_at = NULL, terminal_at = NULL, purge_after = NULL,
+               attempts_in_cycle = 0, retry_exhausted_at = NULL,
+               missing_finality_polls = 0, last_missing_finality_provider_id = NULL,
+               finality_evidence_version = finality_evidence_version + 1,
+               updated_at = GREATEST(updated_at, $7)
+             WHERE signature = $1 AND processing_status = 'PROCESSED'
+               AND normalized_transaction IS NOT NULL
+               AND target_confirmation_status = $3
+               AND missing_finality_polls = $4
+               AND last_missing_finality_provider_id IS NOT DISTINCT FROM $5
+               AND finality_evidence_version = $6`,
+            [
+              value.signature, next, value.expectedConfirmationStatus,
+              value.expectedMissingFinalityPolls, value.expectedLastMissingFinalityProviderId,
+              value.expectedFinalityEvidenceVersion.toString(), dateFromMs(value.observedAtMs),
+            ],
+          );
+          if (result.rowCount !== 1) {
+            throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+          }
+          return;
+        }
         const result = await client.query(
           `UPDATE chain_transaction_inbox SET
              target_confirmation_status = $2, processing_status = 'PENDING',
              processed_at = NULL, terminal_at = NULL, purge_after = NULL,
              attempts_in_cycle = 0, retry_exhausted_at = NULL,
-             missing_finality_polls = 0, updated_at = GREATEST(updated_at, $3)
+             missing_finality_polls = 0, last_missing_finality_provider_id = NULL,
+             finality_evidence_version = CASE
+               WHEN finality_evidence_version < $4
+                 THEN finality_evidence_version + 1
+               ELSE finality_evidence_version
+             END,
+             updated_at = GREATEST(updated_at, $3)
            WHERE signature = $1 AND processing_status = 'PROCESSED'
              AND normalized_transaction IS NOT NULL`,
-          [value.signature, next, dateFromMs(value.observedAtMs)],
+          [
+            value.signature,next,dateFromMs(value.observedAtMs),
+            MAX_FINALITY_EVIDENCE_VERSION.toString(),
+          ],
         );
         requireOne(result.rowCount);
       });
@@ -1171,11 +1320,14 @@ function finalityCandidateFromRow(row: QueryResultRow): FinalityCandidate {
   if (status !== 'processed' && status !== 'confirmed') {
     throw new TypeError('Stored finality candidate status is invalid.');
   }
+  const lastMissingFinalityProviderId: unknown = row.last_missing_finality_provider_id;
   const value = Object.freeze({
     signature: requiredText(row.signature, 'finality signature'),
     slot: numericBigInt(row.observed_slot, 'finality slot'),
     confirmationStatus: status,
     missingFinalityPolls: safeCount(row.missing_finality_polls, 'missing finality polls'),
+    lastMissingFinalityProviderId,
+    finalityEvidenceVersion: finalityEvidenceVersion(row.finality_evidence_version),
     processedAtMs: dateMs(row.processed_at, 'processed at'),
   });
   assertValidFinalityCandidate(value);
@@ -1352,6 +1504,48 @@ function reconciledStatus(
   }
 }
 
+function assertTerminalReceiptAcceptsNotification(
+  receipt: TerminalReplayReceiptRow,
+  notification: TransactionNotification,
+): void {
+  if (numericBigInt(receipt.observed_slot, 'receipt observed slot') !== notification.slot) {
+    throw internalRepositoryError(new TransactionInboxConflictError('identity'));
+  }
+  const status = confirmation(receipt.confirmation_status);
+  if (status !== 'finalized' && status !== 'orphaned') {
+    throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+  }
+  finalityEvidenceVersion(receipt.finality_evidence_version);
+  requiredFingerprint(receipt.immutable_fingerprint);
+  dateMs(receipt.replay_completed_at, 'receipt completion');
+  reconciledStatus(status, notification.confirmationStatus);
+}
+
+function assertTerminalReceiptMatchesInbox(
+  receipt: TerminalReplayReceiptRow | undefined,
+  inbox: InboxIdentityRow,
+): void {
+  if (receipt === undefined) {
+    throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+  }
+  try {
+    const matches = numericBigInt(receipt.observed_slot, 'receipt observed slot')
+        === numericBigInt(inbox.observed_slot, 'observed slot')
+      && confirmation(receipt.confirmation_status)
+        === confirmation(inbox.target_confirmation_status)
+      && finalityEvidenceVersion(receipt.finality_evidence_version)
+        === finalityEvidenceVersion(inbox.finality_evidence_version)
+      && requiredFingerprint(receipt.immutable_fingerprint)
+        === requiredFingerprint(inbox.immutable_fingerprint)
+      && dateMs(receipt.replay_completed_at, 'receipt completion')
+        === dateMs(inbox.processed_at, 'processed at');
+    if (matches) return;
+  } catch {
+    // Map malformed or divergent durable terminal evidence to one fixed conflict.
+  }
+  throw internalRepositoryError(new TransactionInboxConflictError('finality'));
+}
+
 function confirmation(value: unknown): ChainConfirmationStatus {
   requireConfirmation(value);
   return value;
@@ -1436,6 +1630,14 @@ function numericBigInt(value: unknown, name: string): bigint {
     throw new TypeError(`Stored ${name} is invalid.`);
   }
   return BigInt(value);
+}
+
+function finalityEvidenceVersion(value: unknown): bigint {
+  const parsed = numericBigInt(value, 'finality evidence version');
+  if (parsed > MAX_FINALITY_EVIDENCE_VERSION) {
+    throw new TypeError('Stored finality evidence version is invalid.');
+  }
+  return parsed;
 }
 
 function safeCount(value: unknown, name: string): number {

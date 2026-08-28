@@ -367,7 +367,7 @@ void test('retains unresolved and unexpired strict failure evidence in PostgreSQ
   }
 });
 
-void test('applies migrations 001-026 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-029 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -383,7 +383,7 @@ void test('applies migrations 001-026 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '026_listener_strict_catch_up_failures.sql');
+    assert.equal(applied.at(-1), '029_paper_finality_claim_scheduler.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
@@ -724,6 +724,12 @@ void test('enforces inbox lifecycle checks and terminal-only purge in PostgreSQL
       'orphaned', snapshot, fingerprint, '2020-01-01T00:00:01Z',
       '2020-01-01T00:00:02Z', '2020-01-01T04:00:02Z',
     ), { observedAt: '2020-01-01T00:00:00Z' }));
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature,observed_slot,confirmation_status,finality_evidence_version,
+      immutable_fingerprint,replay_completed_at
+    ) SELECT signature,observed_slot,target_confirmation_status,finality_evidence_version,
+      immutable_fingerprint,processed_at FROM chain_transaction_inbox
+      WHERE signature IN ('purge-finalized','purge-orphaned')`);
     await insertInbox(pool, inboxValue('pending-retry', {
       ...failedState(true), nextAttemptAt: '2099-01-01T00:00:00Z',
     }));

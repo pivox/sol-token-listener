@@ -16,6 +16,10 @@ import type {
 } from '../ports/paper-trading-repository.js';
 import { fromJsonValue, toJsonValue } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
+import {
+  assertPaperFinalityReplayCurrent,
+  PaperFinalityBarrierError,
+} from './paper-finality-barrier.js';
 
 interface QueryResultLike {
   readonly rows: readonly unknown[];
@@ -125,6 +129,14 @@ class PostgresPaperTradingTransaction implements PaperTradingTransaction {
     );
     if(source.rows.length!==1){
       qualificationNotCurrent();
+    }
+    try{
+      await assertPaperFinalityReplayCurrent(this.client,{
+        mint:identity.mint,sourceRawEventId,
+      });
+    }catch(error:unknown){
+      if(error instanceof PaperFinalityBarrierError)qualificationNotCurrent();
+      throw error;
     }
   }
 

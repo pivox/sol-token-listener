@@ -132,6 +132,73 @@ void test('forwards web3 RequestInit and attempts a rate-limited primary exactly
   }
 });
 
+void test('uses web3 getBlockSignatures so getBlock receives its official signatures-only request and returns signatures', async () => {
+  const calls: { readonly method: string; readonly params: readonly unknown[] }[] = [];
+  const fetch: FetchFn = async (_input, init) => {
+    const request = parseRequestBody(init) as {
+      readonly id: string;
+      readonly method: string;
+      readonly params: readonly unknown[];
+    };
+    calls.push({ method: request.method, params: request.params });
+    return jsonRpcResponse(request.id, {
+      blockhash: 'blockhash',
+      previousBlockhash: 'previous-blockhash',
+      parentSlot: 3,
+      signatures: ['signature-one', 'signature-two'],
+      blockTime: null,
+    });
+  };
+  const rpc = new SolanaRpcClient({
+    httpRpcUrl: 'https://primary.invalid/rpc',
+    httpRpcFallbackUrls: Object.freeze(['https://fallback.invalid/rpc']),
+    wsRpcUrl: 'wss://websocket.invalid/rpc',
+    commitment: 'confirmed',
+    finality: 'finalized',
+  }, { fetch });
+
+  const signatures = await rpc.getBlockSignatures(4n, 'FINALIZED');
+
+  assert.deepEqual(signatures, ['signature-one', 'signature-two']);
+  assert.equal(Object.isFrozen(signatures), true);
+  assert.deepEqual(calls, [{
+    method: 'getBlock',
+    params: [4, { commitment: 'finalized', transactionDetails: 'signatures', rewards: false }],
+  }]);
+});
+
+void test('rejects non-bigint and out-of-range block slots before any RPC request', async () => {
+  let fetchCalls = 0;
+  const fetch: FetchFn = async (_input, init) => {
+    fetchCalls += 1;
+    const request = parseRequestBody(init) as { readonly id: string };
+    return jsonRpcResponse(request.id, {
+      blockhash: 'blockhash', previousBlockhash: 'previous-blockhash', parentSlot: 0,
+      signatures: [], blockTime: null,
+    });
+  };
+  const rpc = new SolanaRpcClient({
+    httpRpcUrl: 'https://primary.invalid/rpc',
+    httpRpcFallbackUrls: Object.freeze(['https://fallback.invalid/rpc']),
+    wsRpcUrl: 'wss://websocket.invalid/rpc',
+    commitment: 'confirmed',
+    finality: 'finalized',
+  }, { fetch });
+  const getBlockSignatures = rpc.getBlockSignatures.bind(rpc) as (
+    slot: unknown,
+    confirmationStatus: 'FINALIZED',
+  ) => Promise<unknown>;
+
+  for (const slot of [4, '4', null, false, -1n, BigInt(Number.MAX_SAFE_INTEGER) + 1n]) {
+    await assert.rejects(getBlockSignatures(slot, 'FINALIZED'), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message, 'Solana block slot is invalid.');
+      return true;
+    });
+  }
+  assert.equal(fetchCalls, 0);
+});
+
 function inputUrl(input: FetchInput): string {
   if (typeof input === 'string') return input;
   if (input instanceof URL) return input.toString();
