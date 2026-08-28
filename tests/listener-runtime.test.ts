@@ -102,6 +102,31 @@ void test('rolls back the transaction worker and producers when social startup f
   ]);
 });
 
+void test('closes the paper worker when fail-closed finality startup rejects', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  deps.reconciler.start = async () => {
+    calls.push('reconciler.start');
+    throw new Error('private finality startup');
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+
+  await assert.rejects(runtime.start(), (error: unknown) => {
+    assert.ok(error instanceof ListenerRuntimeError);
+    assert.deepEqual(error.failures, [
+      Object.freeze({ stage: 'reconciler-start', errorName: 'ListenerDependencyError' }),
+    ]);
+    assert.doesNotMatch(String(error), /private|finality/u);
+    return true;
+  });
+  assert.deepEqual(calls, [
+    'rpc.health', 'scanner.scan', 'subscriber.start', 'scanner.scan', 'worker.start',
+    'paperWorker.start', 'socialWorker.start', 'reconciler.start',
+    'socialWorker.close', 'paperWorker.close', 'worker.close', 'subscriber.close',
+  ]);
+  assert.equal(runtime.state(), 'DEGRADED');
+});
+
 void test('rolls back only started resources in reverse after startup failure', async () => {
   const calls: string[] = [];
   const deps = dependencies(calls);

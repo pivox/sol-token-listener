@@ -39,3 +39,9 @@ BEGIN
   END IF;
 END;
 $$;
+
+DROP INDEX IF EXISTS chain_transaction_inbox_finality_idx;
+CREATE INDEX chain_transaction_inbox_finality_idx
+  ON chain_transaction_inbox (updated_at, observed_slot, signature)
+  WHERE processing_status = 'PROCESSED'
+    AND target_confirmation_status IN ('processed', 'confirmed');

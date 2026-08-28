@@ -372,7 +372,7 @@ void test('reads eligible blocks sequentially without starting the next slot ear
   assert.deepEqual(await operation, { candidateCount: 2, pollCount: 2, revisionCount: 2 });
 });
 
-void test('keeps earlier orphan revisions durable and stops later slots after a partial failure', async () => {
+void test('keeps valid slot revisions durable around a bad middle block then reports block degradation', async () => {
   const values = [
     candidate(75, 120n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY }),
     candidate(76, 121n, { missingFinalityPolls: 1, lastMissingFinalityProviderId: PRIMARY }),
@@ -394,13 +394,13 @@ void test('keeps earlier orphan revisions durable and stops later slots after a 
   }).runOnce(), 'block');
 
   assert.deepEqual(blockSource.calls.filter((call) => call.startsWith('block:')), [
-    'block:primary:120', 'block:primary:121',
+    'block:primary:120', 'block:primary:121', 'block:primary:122',
   ]);
   assert.deepEqual(blockRepository.revisions.map((revision) => revision.signature), [
-    values[0].signature,
+    values[0].signature, values[2].signature,
   ]);
   assert.deepEqual(blockRepository.candidates.map((entry) => entry.signature), [
-    values[1].signature, values[2].signature,
+    values[1].signature,
   ]);
 
   const revisionRepository = memoryRepository(values);

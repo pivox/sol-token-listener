@@ -21,6 +21,7 @@ import {
   createProductionListenerRuntime,
   catchUpGapLogContext,
   createUnavailableBondingCurveReader,
+  type RecurringFinalityOptions,
   type ListenerRuntimeScheduler,
 } from '../src/application/production-listener-factory.js';
 
@@ -131,6 +132,10 @@ void test('production pins finality to one primary provider pass without couplin
   assert.match(factory, /const primaryFinality = createProviderPinnedFinalityPass\(providers, 'primary'\);/u);
   assert.match(factory, /const finalitySource: FinalityProviderPassSource = Object\.freeze\(\{\s*openPass: \(\) => primaryFinality,\s*\}\);/u);
   assert.match(factory, /new FinalityReconciler\(finalitySource, inbox,/u);
+  assert.match(
+    factory,
+    /initialFailureMode:\s*config\.executionMode === 'observe'\s*\? 'DEGRADED_RETRY'\s*:\s*'FAIL_START'/u,
+  );
   assert.doesNotMatch(factory, /new FinalityReconciler\(rpc, inbox,/u);
   assert.doesNotMatch(pinnedAdapter, /http-failover-transport/u);
 });
@@ -449,7 +454,12 @@ void test('finality startup degrades without aborting and recovers on a fresh sc
       async recordFinalityPoll() { throw new Error('unexpected poll'); },
       async enqueueRevision(value: FinalityRevision) { revisions.push(value); },
     }, { limit: 1, now: () => 1_000 }),
-    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      initialFailureMode: 'DEGRADED_RETRY',
+    },
   );
 
   await recurring.start();
@@ -466,6 +476,30 @@ void test('finality startup degrades without aborting and recovers on a fresh sc
   assert.deepEqual(revisions.map((revision) => revision.confirmationStatus), ['finalized']);
   await recurring.close();
   assert.equal(hasSchedulerWaiterState(scheduler), false);
+});
+
+void test('finality startup fails closed by default without scheduling a retry', async () => {
+  const cases: readonly RecurringFinalityOptions[] = [
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler() },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler: new ManualScheduler(),
+      initialFailureMode: 'FAIL_START',
+    },
+  ];
+  for (const options of cases) {
+    const scheduler = options.scheduler as ManualScheduler;
+    const recurring = new RecurringFinalityReconciler(
+      { async runOnce() { throw new Error('private startup failure'); } },
+      options,
+    );
+
+    await assert.rejects(recurring.start(), /private startup failure/u);
+    assert.equal(recurring.state(), 'DEGRADED');
+    assert.throws(() => { scheduler.fireScheduled(); }, /No callback is scheduled/u);
+    await recurring.close();
+  }
 });
 
 void test('finality recurrence degrades on an unavailable block then returns to RUNNING with a fresh proof', async () => {
@@ -587,6 +621,15 @@ void test('accepts the exact Node timer bound and rejects overflow or fractions'
   assert.throws(() => new RecurringFinalityReconciler(
     { async runOnce() { return undefined; } },
     { intervalMs: 1.5, shutdownTimeoutMs: 100, scheduler },
+  ), TypeError);
+  assert.throws(() => new RecurringFinalityReconciler(
+    { async runOnce() { return undefined; } },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      initialFailureMode: 'INVALID' as 'FAIL_START',
+    },
   ), TypeError);
 
   assert.equal(config({ RECONCILE_SECONDS: '2147483' }).reconcileSeconds, 2_147_483);

@@ -36,6 +36,10 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
 
     const sql = await readFile(migrationUrl, 'utf8');
     assert.deepEqual(await migrateDatabase({ pool }), [migrationName]);
+    assert.match(
+      await finalityIndexDefinition(pool),
+      /\(updated_at, observed_slot, signature\).*processing_status.*PROCESSED.*target_confirmation_status/iu,
+    );
     assert.deepEqual((await pool.query(`SELECT missing_finality_polls,
       last_missing_finality_provider_id, finality_evidence_version::TEXT AS finality_evidence_version
       FROM chain_transaction_inbox WHERE signature = 'legacy-positive'`)).rows, [{
@@ -60,6 +64,10 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
     )`, [programId]));
 
     await pool.query(sql);
+    assert.match(
+      await finalityIndexDefinition(pool),
+      /\(updated_at, observed_slot, signature\).*processing_status.*PROCESSED.*target_confirmation_status/iu,
+    );
     assert.deepEqual((await pool.query(`SELECT missing_finality_polls,
       last_missing_finality_provider_id,
       finality_evidence_version::TEXT AS finality_evidence_version
@@ -93,6 +101,19 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
     await admin.end();
   }
 });
+
+async function finalityIndexDefinition(
+  pool: InstanceType<typeof pg.Pool>,
+): Promise<string> {
+  const result = await pool.query(`SELECT indexdef
+    FROM pg_indexes
+    WHERE schemaname = CURRENT_SCHEMA()
+      AND indexname = 'chain_transaction_inbox_finality_idx'`);
+  assert.equal(result.rows.length, 1);
+  const definition: unknown = result.rows[0]?.indexdef;
+  assert.equal(typeof definition, 'string');
+  return definition as string;
+}
 
 async function insertInbox(
   pool: InstanceType<typeof pg.Pool>,

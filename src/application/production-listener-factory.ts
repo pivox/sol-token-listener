@@ -289,6 +289,9 @@ export function createProductionListenerRuntime(
     {
       intervalMs: config.reconcileSeconds * 1_000,
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+      initialFailureMode: config.executionMode === 'observe'
+        ? 'DEGRADED_RETRY'
+        : 'FAIL_START',
     },
   );
   const subscriberComponent = lifecycleComponent(subscriber);
@@ -373,6 +376,12 @@ export interface RecurringListenerOptions {
   readonly scheduler?: ListenerRuntimeScheduler;
 }
 
+export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
+
+export interface RecurringFinalityOptions extends RecurringListenerOptions {
+  readonly initialFailureMode?: InitialFinalityFailureMode;
+}
+
 export class ListenerControllerCloseError extends Error {
   public constructor(
     public readonly component: 'heartbeat' | 'reconciler',
@@ -400,6 +409,7 @@ export class RecurringFinalityReconciler {
   private readonly intervalMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly scheduler: ListenerRuntimeScheduler;
+  private readonly initialFailureMode: InitialFinalityFailureMode;
   private timer: unknown = null;
   private inFlight: Promise<unknown> | null = null;
   private closePromise: Promise<void> | null = null;
@@ -407,12 +417,18 @@ export class RecurringFinalityReconciler {
 
   public constructor(
     private readonly reconciler: { readonly runOnce: () => Promise<unknown> },
-    options: RecurringListenerOptions,
+    options: RecurringFinalityOptions,
   ) {
     validateRecurringOptions(options);
+    const configuredInitialFailureMode: unknown = options.initialFailureMode;
+    const initialFailureMode = configuredInitialFailureMode ?? 'FAIL_START';
+    if (initialFailureMode !== 'FAIL_START' && initialFailureMode !== 'DEGRADED_RETRY') {
+      throw new TypeError('Initial finality failure mode is invalid.');
+    }
     this.intervalMs = options.intervalMs;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs;
     this.scheduler = options.scheduler ?? listenerScheduler;
+    this.initialFailureMode = initialFailureMode;
   }
 
   public async start(): Promise<void> {
@@ -422,8 +438,9 @@ export class RecurringFinalityReconciler {
       await this.reconciler.runOnce();
       this.currentState = 'RUNNING';
       this.schedule();
-    } catch {
+    } catch (error) {
       this.currentState = 'DEGRADED';
+      if (this.initialFailureMode === 'FAIL_START') throw error;
       this.schedule();
     }
   }

@@ -3,8 +3,13 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.2
+Version: 1.0.3
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.3 prevents permanent-block starvation by continuing sequential
+slot proofs after a block-stage failure, rotates bounded pages by durable poll
+attempt time, and permits startup retry only in observe mode. Paper startup
+fails closed so simulation cannot continue without an initial finality pass.
 
 Revision 1.0.2 bounds evidence versions to signed PostgreSQL `BIGINT` and
 requires the reconciler to reject a repository result unless its version is
@@ -140,9 +145,13 @@ rows with a positive counter and a null provider to `0/NULL`. This is a
 fail-closed invalidation of unsafe evidence, not deletion of a transaction or
 projection. Replaying migration 027 leaves new valid sequences untouched.
 
-No new index is added. The existing partial finality index already supports
-candidate selection, while indexing a field updated on each poll would add
-write churn without serving a query.
+Migration 027 replayably replaces `chain_transaction_inbox_finality_idx` with
+the same partial predicate and key `(updated_at, observed_slot, signature)`.
+`listForFinality` uses that exact order. Every successful poll advances
+`updated_at` to the greatest of its current value, the supplied `observedAt`
+and PostgreSQL `clock_timestamp()`. Database time prevents an application
+clock behind the database from leaving a permanently failing candidate at the
+front of every bounded page; the polled row rotates behind older attempts.
 
 The domain contracts become:
 
@@ -245,10 +254,15 @@ For each non-empty bounded candidate page:
    same-provider finalized root.
 7. Group eligible candidates by slot. Read each finalized block at most once,
    in deterministic slot order, for at most sixteen unique slots per pass.
-8. Validate the complete block signature set before enqueuing any orphan
-   revisions for that slot.
-9. If every eligible signature is absent, enqueue each orphan revision with
-   its exact durable proof precondition.
+8. For null, rejected or malformed block evidence, remember the first fixed
+   `block` failure, enqueue no orphan for that slot, and continue sequentially
+   with later slots inside the same sixteen-slot budget.
+9. For every valid block, validate the complete signature set before enqueuing
+   any orphan revisions for that slot. If every eligible signature is absent,
+   enqueue each orphan revision with its exact durable proof precondition.
+10. After the slot loop, throw the remembered first `block` failure so the
+    recurring component remains `DEGRADED`. A later `finality-contradiction`
+    or `revision` failure may still abort immediately.
 
 The official `getSignatureStatuses` contract accepts at most 256 signatures,
 so `MAX_FINALITY_RECONCILE_LIMIT` becomes 256. The current production page of
@@ -257,9 +271,11 @@ eligible slots are deferred, not dropped. Their durable polls remain and they
 are reconsidered on a later pass. Candidates from the same slot share one
 block response.
 
-Block reads are sequential to avoid a burst of identical RPC methods. There
-is no immediate retry inside the pass. The recurring scheduler supplies the
-next bounded retry.
+Block reads are sequential to avoid a burst of identical RPC methods. A bad
+slot is never absence evidence and never orphaned, but it cannot prevent valid
+later slots from receiving durable revisions. There is no immediate retry
+inside the pass. In observe mode the recurring scheduler supplies the next
+bounded retry.
 
 ## Canonical block proof
 
@@ -289,9 +305,12 @@ The following never prove orphaning:
 
 When a missing status is followed by a block containing the signature, the
 reconciler raises a fixed `finality-contradiction`. Missing, pruned or otherwise
-unavailable block evidence raises a fixed `block` stage. Both paths fail
-closed, enqueue no orphan for that slot and leave the recurring component
-`DEGRADED` until a coherent pass succeeds.
+unavailable block evidence records a fixed `block` stage. The reconciler
+continues later slots sequentially, then throws the first recorded block
+failure after the bounded loop. The affected slot remains nonterminal while
+valid earlier and later slots may commit orphan revisions. A contradiction may
+retain immediate failure. Every path fails closed for the affected slot and
+leaves the recurring component `DEGRADED` until a coherent pass succeeds.
 
 No `getFirstAvailableBlock` or `minimumLedgerSlot` call is made on the nominal
 path. Those calls add quota but cannot strengthen a positive canonical block
@@ -345,16 +364,24 @@ scanner, heartbeat schema and supervisor behavior remain unchanged.
 
 Issue #63 will provide the active promoted provider to `openPass`. It must not
 reintroduce the general request-level failover client at this boundary. Until
-then, primary finality unavailability is visible as `DEGRADED` and never causes
-cross-provider orphaning.
+then, primary finality unavailability never causes cross-provider orphaning.
+`RecurringFinalityReconciler` defaults to
+`initialFailureMode: 'FAIL_START'`. Production selects `DEGRADED_RETRY` only
+for `executionMode === 'observe'`: the first failure resolves startup in
+`DEGRADED`, schedules exactly one normal interval, and a successful fresh pass
+restores `RUNNING`. Paper mode selects `FAIL_START`: the first failure is
+rethrown, no interval is scheduled, and the listener runtime rolls back the
+already started paper worker and producers. Scheduled failures after a
+successful start remain `DEGRADED` and retry on the next normal interval.
 
 ## Migration and rollout
 
-Migration 027 is additive and replayable on a database at migration 026 or on
-an empty database. Because old binaries do not write the new provider column,
-the rollout must stop old listener replicas before applying 027 and starting
-the new binary. If an old replica remains, the new constraint rejects its
-unsafe positive counter write and therefore fails closed.
+Migration 027 is replayable on a database at migration 026 or on an empty
+database. It adds the evidence columns and replaces the partial finality index
+before the new binary starts. Because old binaries do not write the new
+provider column, the rollout must stop old listener replicas before applying
+027 and starting the new binary. If an old replica remains, the new constraint
+rejects its unsafe positive counter write and therefore fails closed.
 
 All migration manifests, deployment smoke lists and tests that assert the last
 migration must advance from 026 to 027. No existing transaction, event,
@@ -376,6 +403,8 @@ projection or terminal retention row is deleted.
 - status/root/block calls use one captured provider pass;
 - finalized status, equal root, higher root and mismatched slots;
 - one block read per slot and sixteen-slot deferral;
+- a bad middle block leaves that slot nonterminal, permits valid later slot
+  revisions, and produces the fixed block failure after the loop;
 - signature absent, signature present contradiction and malformed arrays;
 - unavailable/pruned/null block degrades without orphan revision;
 - stale orphan proof rejected after status reset or provider switch;
@@ -395,6 +424,10 @@ projection or terminal retention row is deleted.
 ### PostgreSQL and recovery tests
 
 - migration 027 on empty schema and after migration 026;
+- finality index definition uses `(updated_at, observed_slot, signature)` and
+  direct migration replay preserves it;
+- polling the first row of a page advances it with database time and exposes a
+  previously out-of-page candidate on the next bounded read;
 - legacy positive counter reset and direct migration replay;
 - SQL correlation constraint and allowed provider IDs;
 - same-provider increment, switch reset and provider-aware CAS conflict;
@@ -404,7 +437,10 @@ projection or terminal retention row is deleted.
 - crash/restart after each poll/proof/revision boundary;
 - finalized and orphaned worker replay remains idempotent;
 - every counter reset path clears the provider;
-- full migration runner replay reports no new migration on its second run.
+- full migration runner replay reports no new migration on its second run;
+- observe startup degradation schedules one fresh pass and can recover;
+- default/paper startup rejects without a schedule and runtime rollback closes
+  the paper worker.
 
 ### Delivery gates
 

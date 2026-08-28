@@ -599,7 +599,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
          FROM chain_transaction_inbox
          WHERE processing_status = 'PROCESSED'
            AND target_confirmation_status IN ('processed', 'confirmed')
-         ORDER BY processed_at, observed_slot, signature
+         ORDER BY updated_at, observed_slot, signature
          LIMIT $1`,
         [limit],
       );
@@ -650,7 +650,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              missing_finality_polls = $3,
              last_missing_finality_provider_id = $4,
              finality_evidence_version = finality_evidence_version + 1,
-             updated_at = GREATEST(updated_at, $8)
+             updated_at = GREATEST(updated_at, $8, clock_timestamp())
            WHERE signature = $1
              AND processing_status = 'PROCESSED'
              AND target_confirmation_status = $5

@@ -320,6 +320,49 @@ void test('reconciles processing finality, replays immutable revisions, and reje
   });
 });
 
+void test('rotates a bounded finality page after every durable poll using database time', async (context) => {
+  await withDatabase(context, async (pool) => {
+    const repository = new PostgresTransactionInboxRepository(pool);
+    for (const [index, signature] of [
+      'finality-fairness-0', 'finality-fairness-1', 'finality-fairness-2',
+    ].entries()) {
+      await pool.query(`INSERT INTO chain_transaction_inbox (
+        signature, observed_slot, discovery_sources, program_ids,
+        target_confirmation_status, processing_status, normalized_transaction,
+        immutable_fingerprint, observed_at, processed_at, created_at, updated_at
+      ) VALUES (
+        $1, $2::BIGINT, ARRAY['WEBSOCKET'], ARRAY[$3], 'confirmed', 'PROCESSED',
+        '{}'::JSONB, $4, '2000-01-01T00:00:00Z'::TIMESTAMPTZ,
+        '2000-01-01T00:00:00Z'::TIMESTAMPTZ + ($2::BIGINT * INTERVAL '1 second'),
+        '2000-01-01T00:00:00Z'::TIMESTAMPTZ,
+        '2000-01-01T00:00:00Z'::TIMESTAMPTZ + ($2::BIGINT * INTERVAL '1 second')
+      )`, [signature, index + 1, PUMP_PROGRAM_ID, 'a'.repeat(64)]);
+    }
+
+    const firstPage = await repository.listForFinality(2);
+    assert.deepEqual(firstPage.map(({ signature }) => signature), [
+      'finality-fairness-0', 'finality-fairness-1',
+    ]);
+    const first = firstPage[0];
+    assert.ok(first);
+    await repository.recordFinalityPoll(Object.freeze({
+      signature: first.signature,
+      confirmationStatus: null,
+      providerId: 'primary' as const,
+      expectedMissingFinalityPolls: first.missingFinalityPolls,
+      expectedLastMissingFinalityProviderId: first.lastMissingFinalityProviderId,
+      expectedFinalityEvidenceVersion: first.finalityEvidenceVersion,
+      observedAtMs: 0,
+    }));
+
+    const nextPage = await repository.listForFinality(2);
+    assert.deepEqual(nextPage.map(({ signature }) => signature), [
+      'finality-fairness-1', 'finality-fairness-2',
+    ]);
+    assert.equal(nextPage.some(({ signature }) => signature === first.signature), false);
+  });
+});
+
 void test('starts a fresh retry cycle for a durable finality replay', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool, Object.freeze({

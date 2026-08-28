@@ -145,17 +145,30 @@ pour les délais de refroidissement, les limites et la qualification mono-fourni
 La finalité utilise un pass HTTP épinglé au fournisseur primaire : statuts,
 racine <code>finalized</code> et signatures du bloc sont toujours lus par ce
 même fournisseur, sans failover HTTP. Si ce fournisseur ou le bloc finalized
-exact est indisponible, le composant passe à <code>DEGRADED</code> et réessaie à
-l’intervalle suivant ; il ne produit jamais <code>orphaned</code> sans preuve.
+exact est indisponible, le slot concerné reste nonterminal et ne produit jamais
+<code>orphaned</code>. Les autres slots de la passe continuent séquentiellement,
+dans la limite de 16, puis le composant signale <code>DEGRADED</code> et réessaie
+à l’intervalle suivant en mode observe.
 L’orphaning exige N statuts absents consécutifs du même fournisseur, une racine
 finalized strictement supérieure au slot, le bloc finalized exact disponible et
 l’absence de la signature dans ce bloc. Un changement de fournisseur remet le
 compteur à 1. La preuve durable conserve l’identifiant public positionnel du
 fournisseur, le compteur et une version ; chaque transition est un CAS exact.
+La page bornée est ordonnée par la dernière tentative durable
+<code>updated_at</code>. Chaque poll avance cette horloge avec le temps PostgreSQL
+en plus du temps observé, de sorte qu’une ligne durablement indisponible tourne
+derrière les autres candidates au lieu de monopoliser la première page.
+
+Au bootstrap, observe accepte une première passe en échec comme
+<code>DEGRADED</code> et programme un seul intervalle normal avec une preuve
+fraîche. Paper échoue fermé : la première erreur de finalité interrompt le
+démarrage, ne programme aucun retry et déclenche le rollback des workers déjà
+ouverts, dont le worker de simulation paper.
 
 Pour le rollout de `027_listener_provider_affine_finality.sql`, arrêter les
 anciennes réplicas avant d’appliquer la migration, puis démarrer le nouveau
-binaire. La migration est additive et rejouable. Les identifiants de
+binaire. La migration est rejouable et remplace l’index partiel de finalité par
+<code>(updated_at, observed_slot, signature)</code>. Les identifiants de
 fournisseur sont publics et positionnels ; les URLs restent secrètes. Cette
 capacité reste observe/paper uniquement : aucune signature ni soumission de
 transaction n’est ajoutée.

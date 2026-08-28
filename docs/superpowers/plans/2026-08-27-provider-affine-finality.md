@@ -18,8 +18,40 @@ Production uses a fixed primary pass until #63 supplies the promoted provider.
 **Tech Stack:** TypeScript strict ESM, `@solana/web3.js` 1.98.4, PostgreSQL,
 bigint, Node test runner, migration 027.
 
-**Plan version:** 1.0.2. Revision 1.0.2 bounds the monotone evidence generation
-to PostgreSQL `BIGINT` and requires exact +1 application-boundary validation.
+**Plan version:** 1.0.3. Revision 1.0.3 addresses the first PR review cycle:
+block-stage failures no longer stop later bounded slot proofs, finality pages
+rotate by durable database attempt time, and only observe mode may recover from
+an initial finality failure without aborting listener startup. Revision 1.0.2
+bounds the monotone evidence generation to PostgreSQL `BIGINT` and requires
+exact +1 application-boundary validation.
+
+---
+
+### Review correction 1: starvation and paper bootstrap gate
+
+- [ ] RED in `tests/finality-reconciler.test.ts`: a rejected middle-slot block
+  must still read the next slot, preserve valid revisions on both sides, never
+  orphan the bad slot, then reject with the fixed `block` stage. GREEN keeps
+  block reads sequential and preserves the 16-slot, 256-candidate and 10,000
+  signature caps.
+- [ ] RED in `tests/transaction-inbox.repository.test.ts`: create more rows
+  than the list limit, poll the first with a skewed application timestamp, and
+  require a previously out-of-page candidate on the next page. GREEN orders by
+  `updated_at, observed_slot, signature` and advances attempts with
+  `GREATEST(updated_at, observedAt, clock_timestamp())`.
+- [ ] RED in `tests/provider-affine-finality-migration.test.ts`: require the
+  updated partial index after migration 026 → 027 and after direct replay.
+  GREEN uses `DROP INDEX IF EXISTS` followed by the canonical partial index.
+- [ ] RED in `tests/production-listener-factory.test.ts`: observe startup may
+  resolve `DEGRADED`, schedule one normal interval and recover; default/paper
+  startup must rethrow without a schedule. GREEN adds strict
+  `initialFailureMode` validation and branches production on `executionMode`.
+- [ ] Prove listener rollback in `tests/listener-runtime.test.ts`: a fail-closed
+  reconciler startup closes social, paper, inbox and subscriber resources in
+  reverse order before returning the redacted runtime failure.
+
+Run the focused suite with live PostgreSQL, then `build`, `check:backend`,
+`lint:backend`, `docs:check`, diff-check and the full test suite.
 
 ---
 
@@ -164,7 +196,9 @@ END;
 $$;
 ```
 
-Do not add an index or expose the column through an API projection.
+Replayably replace `chain_transaction_inbox_finality_idx` with the same partial
+predicate and `(updated_at, observed_slot, signature)` keys. Do not expose the
+column through an API projection.
 
 - [ ] **Step 4: Run focused tests until green**
 
@@ -506,7 +540,9 @@ Object.freeze({
 ```
 
 Read blocks sequentially. Treat null, rejection, sparse/duplicate/oversized
-arrays and unsafe values as stage `block`, never as absence.
+arrays and unsafe values as stage `block`, never as absence. Remember the first
+block failure, skip orphaning only for that slot, continue later slots within
+the sixteen-slot budget, then throw the remembered failure after the loop.
 
 - [ ] **Step 5: Run focused tests and static checks until green**
 
@@ -540,8 +576,9 @@ scan that rejects passing the general `SolanaRpcClient` directly to
 pinned adapter.
 
 Exercise `RecurringFinalityReconciler` with a block-unavailable first pass:
-startup or scheduled run becomes `DEGRADED`, no orphan revision is present,
-and a later coherent pass returns it to `RUNNING` using a fresh proof.
+observe startup becomes `DEGRADED` and a later coherent scheduled pass returns
+it to `RUNNING` using a fresh proof; default/paper startup rejects and schedules
+nothing. A scheduled failure after a successful startup remains retryable.
 
 Add a crash/restart integration scenario:
 
@@ -626,7 +663,9 @@ Add concise versioned documentation explaining:
 
 ```text
 finality source in #61: primary-only pinned HTTP
-provider unavailable: DEGRADED and retry next interval
+provider unavailable: observe DEGRADED/retry; paper bootstrap fail closed
+bounded pages: database-time attempt rotation on updated_at
+bad block slot: nonterminal; later slots continue; throw block after loop
 orphan proof: same-provider misses + higher finalized root + available block
 deployment: stop old replicas before applying migration 027
 public data: positional provider IDs only; URLs remain secret

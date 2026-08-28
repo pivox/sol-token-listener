@@ -151,10 +151,20 @@ export class FinalityReconciler {
     }
 
     let blockSlotCount = 0;
+    let firstBlockFailure: FinalityReconcilerError | null = null;
     for (const [slot, eligible] of eligibleBySlot) {
       if (blockSlotCount >= MAX_FINALITY_BLOCK_SLOTS_PER_RUN) break;
       blockSlotCount += 1;
-      const signaturesInBlock = await this.readBlock(pass, slot);
+      let signaturesInBlock: readonly string[];
+      try {
+        signaturesInBlock = await this.readBlock(pass, slot);
+      } catch (error) {
+        if (error instanceof FinalityReconcilerError && error.stage === 'block') {
+          firstBlockFailure ??= error;
+          continue;
+        }
+        throw error;
+      }
       const signatureSet = new Set(signaturesInBlock);
       if (eligible.some(({ candidate }) => signatureSet.has(candidate.signature))) {
         throw new FinalityReconcilerError('finality-contradiction');
@@ -164,6 +174,7 @@ export class FinalityReconciler {
         revisionCount += 1;
       }
     }
+    if (firstBlockFailure !== null) throw firstBlockFailure;
     return result(candidates.length, pollCount, revisionCount);
   }
 
