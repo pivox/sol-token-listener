@@ -54,6 +54,7 @@ void test('exports the exact immutable WebSocket health vocabulary and public ma
 
 void test('creates a detached deeply frozen snapshot and validates every detailed phase', () => {
   const observation = { observedAtMs: NOW_MS - 2, slot: 42n };
+  const disconnect = { occurredAtMs: NOW_MS - 1, reasonCode: 'REMOTE_CLOSE' };
   const recovery = {
     status: 'RECOVERED', startedAtMs: NOW_MS - 5, completedAtMs: NOW_MS - 3,
     reasonCode: 'STARTUP',
@@ -61,6 +62,7 @@ void test('creates a detached deeply frozen snapshot and validates every detaile
   const input = validInput({
     phase: 'RUNNING', activeSessionGeneration: 3n, providerId: 'fallback-2',
     acknowledgedAtMs: NOW_MS - 4, lastObservation: observation, recovery,
+    disconnect,
     heartbeatAtMs: NOW_MS - 1, evidencePurgeAfterMs: NOW_MS + 14_400_000,
   });
 
@@ -68,14 +70,18 @@ void test('creates a detached deeply frozen snapshot and validates every detaile
 
   assert.notEqual(snapshot, input);
   assert.notEqual(snapshot.lastObservation, observation);
+  assert.notEqual(snapshot.disconnect, disconnect);
   assert.notEqual(snapshot.recovery, recovery);
   assert.ok(Object.isFrozen(snapshot));
   assert.ok(Object.isFrozen(snapshot.lastObservation));
+  assert.ok(Object.isFrozen(snapshot.disconnect));
   assert.ok(Object.isFrozen(snapshot.recovery));
   assert.doesNotThrow(() => { assertValidWebSocketHealthSnapshot(snapshot); });
   observation.slot = 99n;
+  disconnect.reasonCode = 'SOCKET_ERROR';
   recovery.reasonCode = 'SESSION_FAILURE';
   assert.equal(snapshot.lastObservation?.slot, 42n);
+  assert.equal(snapshot.disconnect?.reasonCode, 'REMOTE_CLOSE');
   assert.equal(snapshot.recovery.reasonCode, 'STARTUP');
 
   for (const inputForPhase of validInputsForEveryPhase()) {
@@ -214,6 +220,31 @@ void test('rejects top-level and nested proxies without invoking their traps', (
   assert.equal(traps, 0);
 });
 
+void test('rejects callable top-level and nested proxies before freezing or reflection', () => {
+  let traps = 0;
+  const trap = (): never => {
+    traps += 1;
+    throw new Error('callable proxy trap must not run');
+  };
+  const callableProxy = (): unknown => undefined;
+  const hostile = new Proxy(callableProxy, {
+    getPrototypeOf: trap,
+    ownKeys: trap,
+    getOwnPropertyDescriptor: trap,
+    isExtensible: trap,
+    preventExtensions: trap,
+  });
+  const canonical = createWebSocketHealthSnapshot(validInput());
+
+  assertInvalid(() => createWebSocketHealthSnapshot(hostile));
+  assertInvalid(() => { assertValidWebSocketHealthSnapshot(hostile); });
+  for (const field of ['lastObservation', 'disconnect', 'recovery'] as const) {
+    const nested = Object.freeze({ ...canonical, [field]: hostile });
+    assertInvalid(() => { assertValidWebSocketHealthSnapshot(nested); });
+  }
+  assert.equal(traps, 0);
+});
+
 void test('assertion rejects mutable top-level and nested snapshots', () => {
   const canonical = createWebSocketHealthSnapshot(validInput());
   const mutableTopLevel = { ...canonical };
@@ -222,10 +253,15 @@ void test('assertion rejects mutable top-level and nested snapshots', () => {
     ...canonical,
     lastObservation: { observedAtMs: NOW_MS, slot: 1n },
   });
+  const mutableDisconnect = Object.freeze({
+    ...canonical,
+    disconnect: { occurredAtMs: NOW_MS, reasonCode: 'REMOTE_CLOSE' },
+  });
 
   assertInvalid(() => { assertValidWebSocketHealthSnapshot(mutableTopLevel); });
   assertInvalid(() => { assertValidWebSocketHealthSnapshot(mutableRecovery); });
   assertInvalid(() => { assertValidWebSocketHealthSnapshot(mutableObservation); });
+  assertInvalid(() => { assertValidWebSocketHealthSnapshot(mutableDisconnect); });
 });
 
 function validInput(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
