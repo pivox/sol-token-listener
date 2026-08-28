@@ -140,6 +140,26 @@ relève de l'issue #57. Les événements sans secret `rpc.http_endpoint_degraded
 métriques V1 dérivées des logs. Voir le [guide d'exploitation RPC](docs/operations/rpc-qualification.md)
 pour les délais de refroidissement, les limites et la qualification mono-fournisseur du soak.
 
+## Finalité affine au fournisseur (#61, migration 027)
+
+La finalité utilise un pass HTTP épinglé au fournisseur primaire : statuts,
+racine <code>finalized</code> et signatures du bloc sont toujours lus par ce
+même fournisseur, sans failover HTTP. Si ce fournisseur ou le bloc finalized
+exact est indisponible, le composant passe à <code>DEGRADED</code> et réessaie à
+l’intervalle suivant ; il ne produit jamais <code>orphaned</code> sans preuve.
+L’orphaning exige N statuts absents consécutifs du même fournisseur, une racine
+finalized strictement supérieure au slot, le bloc finalized exact disponible et
+l’absence de la signature dans ce bloc. Un changement de fournisseur remet le
+compteur à 1. La preuve durable conserve l’identifiant public positionnel du
+fournisseur, le compteur et une version ; chaque transition est un CAS exact.
+
+Pour le rollout de `027_listener_provider_affine_finality.sql`, arrêter les
+anciennes réplicas avant d’appliquer la migration, puis démarrer le nouveau
+binaire. La migration est additive et rejouable. Les identifiants de
+fournisseur sont publics et positionnels ; les URLs restent secrètes. Cette
+capacité reste observe/paper uniquement : aucune signature ni soumission de
+transaction n’est ajoutée.
+
 Les migrations ne sont pas lancées automatiquement par
 défaut. `npm run build` les embarque dans `dist/migrations`, de sorte que
 `POSTGRES_AUTO_MIGRATE=true npm start` fonctionne avec l'artefact compilé.

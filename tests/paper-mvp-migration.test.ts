@@ -166,7 +166,7 @@ void test('migration 024 preserves an immutable historical paper-mvp.v1 payload'
   }
 });
 
-void test('applies migrations 001-026 on an empty schema and replays cleanly', async (context) => {
+void test('applies migrations 001-027 on an empty schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: PostgreSQL paper MVP migration test skipped');
@@ -178,7 +178,7 @@ void test('applies migrations 001-026 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '026_listener_strict_catch_up_failures.sql');
+    assert.equal(applied.at(-1), '027_listener_provider_affine_finality.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query('SET enable_seqscan=off');
     const launchPlan = await pool.query<Readonly<{ 'QUERY PLAN': string }>>(`EXPLAIN (COSTS OFF)
