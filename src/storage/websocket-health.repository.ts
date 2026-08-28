@@ -82,7 +82,9 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
       const operationResult = await safeQuery(client,
         `WITH operation AS MATERIALIZED (SELECT clock_timestamp() AS at)
          SELECT operation.at AS operation_at,
-           health.heartbeat_at >= operation.at - INTERVAL '30 seconds' AS owner_is_fresh
+           COALESCE(
+             health.heartbeat_at >= operation.at - INTERVAL '30 seconds', FALSE
+           ) AS owner_is_fresh
          FROM listener_websocket_health health CROSS JOIN operation
          WHERE health.service_key = $1`,
         [SERVICE_KEY],
@@ -91,10 +93,13 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
       const rawOperationRow = operationResult.rows[0];
       if (rawOperationRow === undefined) throw repositoryError('STATE_CONFLICT');
       const operationRow = databaseRecord(rawOperationRow);
+      if (typeof operationRow.owner_is_fresh !== 'boolean') {
+        throw repositoryError('STATE_CONFLICT');
+      }
       const operationAt = timestampFromDatabase(operationRow.operation_at);
       const isUnrecoverable = current.phase === 'UNRECOVERABLE';
       const isClean = current.supervision === 'INACTIVE' || current.phase === 'STOPPED';
-      const isFresh = operationRow.owner_is_fresh === true;
+      const isFresh = operationRow.owner_is_fresh;
       if (!isClean && !isUnrecoverable && isFresh) {
         throw repositoryError('ACTIVE_INSTANCE');
       }
@@ -170,7 +175,6 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
             THEN COALESCE(health.acknowledged_at, operation.at) ELSE NULL END,
           disconnect_occurred_at = CASE
             WHEN $9::TEXT IS NULL THEN health.disconnect_occurred_at
-            WHEN health.disconnect_reason_code = $9 THEN health.disconnect_occurred_at
             ELSE operation.at END,
           disconnect_reason_code = COALESCE($9, health.disconnect_reason_code),
           recovery_status = $10,
@@ -545,7 +549,7 @@ function snapshotFromRow(row: Row): WebSocketHealthSnapshot {
         ? null
         : {
             observedAtMs: timestampFromDatabase(data.last_observation_at),
-            slot: bigintFromDatabase(data.last_observation_slot),
+            slot: numericIntegerFromDatabase(data.last_observation_slot),
           },
       disconnect: data.disconnect_occurred_at === null && data.disconnect_reason_code === null
         ? null
@@ -597,6 +601,14 @@ function bigintFromDatabase(value: unknown): bigint {
     throw repositoryError('STATE_CONFLICT');
   }
   return BigInt(value);
+}
+
+function numericIntegerFromDatabase(value: unknown): bigint {
+  if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)(?:\.0+)?$/u.test(value)) {
+    throw repositoryError('STATE_CONFLICT');
+  }
+  const decimalPoint = value.indexOf('.');
+  return BigInt(decimalPoint === -1 ? value : value.slice(0, decimalPoint));
 }
 
 function nullableBigintFromDatabase(value: unknown): bigint | null {

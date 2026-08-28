@@ -448,11 +448,18 @@ void test('websocket health repository records candidate and active observations
       candidateProviderId: null, candidateSessionGeneration: null,
     })), 'STATE_CONFLICT');
     assert.deepEqual(await repository.read(), rotating);
+    await pool.query("SELECT pg_sleep(0.005)");
+    const repeated = await repository.transition(transitionFrom(rotating, {
+      disconnectReasonCode: 'SOCKET_ERROR',
+    }));
+    assert.equal(repeated.disconnect?.reasonCode, 'SOCKET_ERROR');
+    assert.ok(requiredValue(repeated.disconnect?.occurredAtMs)
+      > rotatingDisconnect.occurredAtMs);
     assert.equal(await repository.recordObservation({
       ownerGeneration: 1n, sessionGeneration: 3n, slot: 60n,
     }), 'RECORDED');
     const recoveryBefore = await databaseNowMs(pool);
-    const recovering = await repository.transition(transitionFrom(rotating, {
+    const recovering = await repository.transition(transitionFrom(repeated, {
       phase: 'RECOVERING', recoveryStatus: 'IN_PROGRESS',
       recoveryReasonCode: 'SESSION_FAILURE',
     }));
@@ -597,6 +604,233 @@ void test('websocket health repository rolls back trigger failures and exposes f
   assert.equal(traps, 0);
 });
 
+void test('websocket health repository decodes canonical scale-bearing NUMERIC integers in read, begin, and transition', async () => {
+  const operationAt = new Date('2026-08-28T10:00:00.000Z');
+  const previousAt = new Date(operationAt.getTime() - 1_000);
+  const runningRow = databaseSnapshotRow({
+    supervision: 'ACTIVE', owner_generation: '1', revision: '1',
+    active_session_generation: '1', provider_id: 'primary', phase: 'RUNNING',
+    acknowledged_at: previousAt, last_observation_at: previousAt,
+    last_observation_slot: '1.0', heartbeat_at: previousAt, updated_at: previousAt,
+  });
+  let row = runningRow;
+  let freshnessSql = '';
+  const repository = new PostgresWebSocketHealthRepository({
+    async connect() {
+      return {
+        async query(text: string) {
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+            return { rows: [], rowCount: null };
+          }
+          if (text.includes('owner_is_fresh')) {
+            freshnessSql = text;
+            return { rows: [{ operation_at: operationAt, owner_is_fresh: false }], rowCount: 1 };
+          }
+          if (text.includes('SELECT health.owner_generation::TEXT')) {
+            return {
+              rows: [{ owner_generation: row.owner_generation, revision: row.revision }],
+              rowCount: 1,
+            };
+          }
+          if (text.includes('UPDATE listener_websocket_health health SET')) {
+            row = databaseSnapshotRow({
+              supervision: 'ACTIVE', owner_generation: '2', revision: '3',
+              candidate_session_generation: '2', candidate_provider_id: 'fallback-1',
+              phase: 'WAITING_FOR_ACKS', last_observation_at: previousAt,
+              last_observation_slot: '1.0',
+              disconnect_occurred_at: operationAt,
+              disconnect_reason_code: 'UNEXPECTED_RESTART',
+              recovery_status: 'REQUIRED', recovery_reason_code: 'UNEXPECTED_RESTART',
+              heartbeat_at: operationAt, updated_at: operationAt,
+            });
+            return { rows: [row], rowCount: 1 };
+          }
+          if (text.includes('UPDATE listener_websocket_health SET')) {
+            row = databaseSnapshotRow({
+              supervision: 'ACTIVE', owner_generation: '2', revision: '2',
+              candidate_session_generation: '2', candidate_provider_id: 'fallback-1',
+              phase: 'CONNECTING', last_observation_at: previousAt,
+              last_observation_slot: '1.0',
+              disconnect_occurred_at: operationAt,
+              disconnect_reason_code: 'UNEXPECTED_RESTART',
+              recovery_status: 'REQUIRED', recovery_reason_code: 'UNEXPECTED_RESTART',
+              heartbeat_at: operationAt, updated_at: operationAt,
+            });
+            return { rows: [row], rowCount: 1 };
+          }
+          return { rows: [row], rowCount: 1 };
+        },
+        release() {},
+      };
+    },
+  });
+
+  const running = await repository.read();
+  assert.equal(running.lastObservation?.slot, 1n);
+  const connecting = await repository.beginOwner({ candidateProviderId: 'fallback-1' });
+  assert.equal(connecting.ownerGeneration, 2n);
+  assert.equal(connecting.revision, 2n);
+  assert.equal(connecting.lastObservation?.slot, 1n);
+  assert.match(freshnessSql,
+    /COALESCE\(\s+health\.heartbeat_at >= operation\.at - INTERVAL '30 seconds', FALSE\s+\) AS owner_is_fresh/u);
+  const waiting = await repository.transition(transitionFrom(connecting, {
+    phase: 'WAITING_FOR_ACKS',
+  }));
+  assert.equal(waiting.ownerGeneration, 2n);
+  assert.equal(waiting.revision, 3n);
+  assert.equal(waiting.lastObservation?.slot, 1n);
+
+  const zeroSlot = repositoryWithQueryResult({
+    rows: [{ ...runningRow, last_observation_slot: '0.00' }], rowCount: 1,
+  });
+  assert.equal((await zeroSlot.read()).lastObservation?.slot, 0n);
+
+  for (const invalidNumeric of ['1.1', '01.0', '1.', '+1', '1e0']) {
+    const malformed = repositoryWithQueryResult({
+      rows: [{ ...runningRow, last_observation_slot: invalidNumeric }],
+      rowCount: 1,
+    });
+    await expectCode(malformed.read(), 'STATE_CONFLICT');
+  }
+  for (const bigintColumn of [
+    'owner_generation', 'revision', 'active_session_generation',
+  ] as const) {
+    const malformed = repositoryWithQueryResult({
+      rows: [{ ...runningRow, [bigintColumn]: '1.0' }], rowCount: 1,
+    });
+    await expectCode(malformed.read(), 'STATE_CONFLICT');
+  }
+});
+
+void test('websocket health repository rejects non-boolean owner freshness without mutation', async () => {
+  const operationAt = new Date('2026-08-28T10:00:00.000Z');
+  const invalidRows: readonly Readonly<Record<string, unknown>>[] = [
+    { operation_at: operationAt },
+    { operation_at: operationAt, owner_is_fresh: 'false' },
+    { operation_at: operationAt, owner_is_fresh: { value: false } },
+  ];
+  for (const operationRow of invalidRows) {
+    const statements: string[] = [];
+    const releases: boolean[] = [];
+    let updates = 0;
+    const repository = new PostgresWebSocketHealthRepository({
+      async connect() {
+        return {
+          async query(text: string) {
+            statements.push(text);
+            if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+              return { rows: [], rowCount: null };
+            }
+            if (text.includes('SELECT health.*')) {
+              return { rows: [databaseSnapshotRow()], rowCount: 1 };
+            }
+            if (text.includes('owner_is_fresh')) {
+              return { rows: [operationRow], rowCount: 1 };
+            }
+            updates += 1;
+            return {
+              rows: [databaseSnapshotRow({
+                supervision: 'ACTIVE', owner_generation: '1', revision: '1',
+                candidate_session_generation: '1', candidate_provider_id: 'primary',
+                phase: 'CONNECTING', heartbeat_at: operationAt, updated_at: operationAt,
+              })],
+              rowCount: 1,
+            };
+          },
+          release(evict = false) { releases.push(evict); },
+        };
+      },
+    });
+
+    await expectCode(repository.beginOwner({ candidateProviderId: 'primary' }), 'STATE_CONFLICT');
+    assert.equal(updates, 0);
+    assert.equal(statements.at(-1), 'ROLLBACK');
+    assert.deepEqual(releases, [false]);
+  }
+});
+
+void test('websocket health repository evicts rollback failures and redacts release failures', async () => {
+  const statements: string[] = [];
+  const releases: boolean[] = [];
+  const rollbackFailure = new PostgresWebSocketHealthRepository({
+    async connect() {
+      return {
+        async query(text: string) {
+          statements.push(text);
+          if (text === 'BEGIN') return { rows: [], rowCount: null };
+          if (text === 'ROLLBACK') throw new Error('postgres rollback secret');
+          return { rows: [], rowCount: 0 };
+        },
+        release(evict = false) { releases.push(evict); },
+      };
+    },
+  });
+  await expectCode(
+    rollbackFailure.beginOwner({ candidateProviderId: 'primary' }),
+    'DEPENDENCY_FAILED',
+  );
+  assert.equal(statements.at(-1), 'ROLLBACK');
+  assert.deepEqual(releases, [true]);
+
+  const releaseFailure = new PostgresWebSocketHealthRepository({
+    async connect() {
+      return {
+        async query() { return { rows: [databaseSnapshotRow()], rowCount: 1 }; },
+        release() { throw new Error('postgres release secret'); },
+      };
+    },
+  });
+  await expectCode(releaseFailure.read(), 'DEPENDENCY_FAILED');
+});
+
+void test('websocket health repository records a repeated disconnect code as a new incident', async () => {
+  const previousIncident = new Date('2026-08-28T10:00:00.000Z');
+  const nextIncident = new Date('2026-08-28T10:00:01.000Z');
+  const currentRow = databaseSnapshotRow({
+    supervision: 'ACTIVE', owner_generation: '1', revision: '1',
+    active_session_generation: '1', provider_id: 'primary', phase: 'DEGRADED',
+    acknowledged_at: previousIncident,
+    disconnect_occurred_at: previousIncident, disconnect_reason_code: 'SOCKET_ERROR',
+    recovery_status: 'REQUIRED', recovery_reason_code: 'SESSION_FAILURE',
+    heartbeat_at: previousIncident, updated_at: previousIncident,
+  });
+  const current = await repositoryWithQueryResult({ rows: [currentRow], rowCount: 1 }).read();
+  let updateSql = '';
+  const repository = new PostgresWebSocketHealthRepository({
+    async connect() {
+      return {
+        async query(text: string) {
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+            return { rows: [], rowCount: null };
+          }
+          if (text.includes('SELECT health.owner_generation::TEXT')) {
+            return { rows: [{ owner_generation: '1', revision: '1' }], rowCount: 1 };
+          }
+          updateSql = text;
+          return {
+            rows: [databaseSnapshotRow({
+              ...currentRow,
+              revision: '2', disconnect_occurred_at: nextIncident,
+              heartbeat_at: nextIncident, updated_at: nextIncident,
+            })],
+            rowCount: 1,
+          };
+        },
+        release() {},
+      };
+    },
+  });
+
+  const repeated = await repository.transition(transitionFrom(current, {
+    disconnectReasonCode: 'SOCKET_ERROR',
+  }));
+
+  assert.equal(repeated.disconnect?.occurredAtMs, nextIncident.getTime());
+  assert.match(updateSql,
+    /disconnect_occurred_at = CASE\s+WHEN \$9::TEXT IS NULL THEN health\.disconnect_occurred_at\s+ELSE operation\.at END/u);
+  assert.doesNotMatch(updateSql, /health\.disconnect_reason_code = \$9/u);
+});
+
 void test('websocket health repository never trusts hostile database values or forged public errors', async () => {
   let rowTraps = 0;
   const rowProxy = new Proxy({}, {
@@ -662,7 +896,7 @@ function transitionFrom(
     candidateProviderId: snapshot.candidateProviderId,
     candidateSessionGeneration: snapshot.candidateSessionGeneration,
     acknowledged: snapshot.acknowledgedAtMs !== null,
-    disconnectReasonCode: snapshot.disconnect?.reasonCode ?? null,
+    disconnectReasonCode: null,
     recoveryStatus: snapshot.recovery.status,
     recoveryReasonCode: snapshot.recovery.reasonCode,
     ...overrides,
@@ -810,7 +1044,9 @@ function repositoryWithQueryResult(result: {
   });
 }
 
-function databaseSnapshotRow(): Readonly<Record<string, unknown>> {
+function databaseSnapshotRow(
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
   const now = new Date();
   return {
     payload_version: 1,
@@ -834,6 +1070,7 @@ function databaseSnapshotRow(): Readonly<Record<string, unknown>> {
     heartbeat_at: null,
     updated_at: now,
     evidence_purge_after: null,
+    ...overrides,
   };
 }
 
