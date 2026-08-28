@@ -497,6 +497,65 @@ void test('queued completion degrades before the previous incumbent close settle
   assert.deepEqual(fixture.scheduler.pendingDelays(), [0]);
 });
 
+void test('queued degradation failure still closes the previous incumbent during concurrent close', async () => {
+  const previousClose = deferred<undefined>();
+  const incumbent = controlledSession('primary', previousClose.promise);
+  const candidate = controlledSession('primary');
+  const stopFailure = 'Expected reporter-owned overlap cleanup timeout.';
+  const fixture = supervisorFixture({
+    reporterStopFailure: new Error(stopFailure),
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    Promise.resolve(scanResult('primary')),
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+
+  const running = deferred<WebSocketHealthSnapshot>();
+  fixture.reporter.transitionOverrides.set('RUNNING', running.promise);
+  fixture.reporter.transitionOverrides.set(
+    'DEGRADED',
+    rejected(new Error('Expected queued degradation failure.')),
+  );
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  const beforeRunning = fixture.reporter.snapshots.at(-1);
+  assert.ok(beforeRunning !== undefined);
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'RUNNING');
+
+  candidate.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+  const runningInput = fixture.reporter.transitions.at(-1);
+  assert.ok(runningInput !== undefined);
+  running.resolve(snapshotFromTransition(runningInput, beforeRunning));
+  await flushLifecycle();
+
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'DEGRADED');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(previousClose.settled(), false);
+
+  await assertStage(fixture.supervisor.close(), 'cleanup', stopFailure);
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(incumbent.closeCalls(), 1);
+
+  previousClose.resolve(undefined);
+  await flushLifecycle();
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(incumbent.closeCalls(), 1);
+});
+
 void test('shutdown during strict recovery aborts, closes once, and waits for the scan', async () => {
   const candidate = controlledSession('primary');
   const strict = deferred<StrictCatchUpScanResult>();

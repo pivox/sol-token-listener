@@ -550,20 +550,27 @@ export class WebSocketFailoverSupervisor {
       this.#dependencies.promoted.promote(providerId);
       const queuedCompletion = candidate.queuedCompletion;
       candidate.queuedCompletion = null;
-      if (queuedCompletion !== null) {
-        await this.#degradePromotedSession(candidate, queuedCompletion);
-      }
-      if (previousIncumbent !== null && previousIncumbent !== candidate) {
-        try {
-          await this.#closeSession(previousIncumbent);
-        } catch {
-          await this.#degradeActiveIncumbent(
-            candidate,
-            'CLEANUP_FAILED',
-            'SESSION_FAILURE',
-          );
-          return promotedAttempt();
+      let previousCleanupFailed = false;
+      try {
+        if (queuedCompletion !== null) {
+          await this.#degradePromotedSession(candidate, queuedCompletion);
         }
+      } finally {
+        if (previousIncumbent !== null && previousIncumbent !== candidate) {
+          try {
+            await this.#closeSession(previousIncumbent);
+          } catch {
+            previousCleanupFailed = true;
+          }
+        }
+      }
+      if (previousCleanupFailed) {
+        await this.#degradeActiveIncumbent(
+          candidate,
+          'CLEANUP_FAILED',
+          'SESSION_FAILURE',
+        );
+        return promotedAttempt();
       }
       if (queuedCompletion !== null) return promotedAttempt();
       this.#armPeriodicFrontier();
