@@ -45,6 +45,37 @@ void test('production qualification import graph has no signing, simulation, or 
   assert.deepEqual(violations, []);
 });
 
+void test('bootstrap leaves the acknowledged WebSocket supervisor inactive until issue 63', async () => {
+  for (const path of [
+    '../src/app.ts',
+    '../src/application/production-listener-factory.ts',
+  ]) {
+    const source = await readFile(new URL(path, import.meta.url), 'utf8');
+    assert.doesNotMatch(
+      source,
+      /\b(?:openWsProgramSession|StrictCatchUpScanner|ProviderPinnedStrictCatchUpSource|PersistentWebSocketHealthReporter)\b/u,
+      path,
+    );
+    assert.doesNotMatch(
+      source,
+      /(?:ws-program-session|strict-catch-up-scanner|provider-pinned-catch-up-source|websocket-health-reporter)/u,
+      path,
+    );
+  }
+});
+
+void test('inactive WebSocket health reporter owns no network, provider, runtime, or configuration capability', async () => {
+  const source = await readFile(
+    new URL('../src/application/websocket-health-reporter.ts', import.meta.url),
+    'utf8',
+  );
+  assert.doesNotMatch(
+    source,
+    /(?:ws-program-session|rpc-provider-catalog|strict-catch-up|production-listener-factory|\.\.\/config\/|\.\.\/storage\/|openWsProgramSession|SolanaProgramSubscriber)/u,
+  );
+  assert.doesNotMatch(source, /notification\.signature/u);
+});
+
 void test('paper dry-run bootstrap imports no signing, submission, or live execution path', async () => {
   const path = fileURLToPath(new URL('../src/cli/paper-dry-run.ts', import.meta.url));
   const source = await readFile(path, 'utf8');
