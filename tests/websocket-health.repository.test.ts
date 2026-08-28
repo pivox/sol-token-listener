@@ -67,6 +67,42 @@ void test('websocket health repository restarts clean STOPPED and rejects a fres
   });
 });
 
+void test('websocket health repository schedules stopped evidence retention unless recovery is unresolved', async (context) => {
+  await withRepository(context, 'websocket_health_stopped_retention', async ({ repository }) => {
+    const connecting = await repository.beginOwner({ candidateProviderId: 'primary' });
+    assert.equal(await repository.recordObservation({
+      ownerGeneration: connecting.ownerGeneration,
+      sessionGeneration: requiredValue(connecting.candidateSessionGeneration),
+      slot: 77n,
+    }), 'RECORDED');
+
+    const stopped = await repository.transition(transitionFrom(await repository.read(), {
+      phase: 'STOPPED',
+      candidateProviderId: null,
+      candidateSessionGeneration: null,
+      recoveryStatus: 'NOT_REQUIRED',
+      recoveryReasonCode: null,
+    }));
+    assert.equal(stopped.lastObservation?.slot, 77n);
+    assert.equal(
+      requiredValue(stopped.evidencePurgeAfterMs) - stopped.updatedAtMs,
+      4 * 60 * 60 * 1_000,
+    );
+
+    const restarted = await repository.beginOwner({ candidateProviderId: 'fallback-1' });
+    const unresolved = await repository.transition(transitionFrom(restarted, {
+      phase: 'STOPPED',
+      candidateProviderId: null,
+      candidateSessionGeneration: null,
+      disconnectReasonCode: 'CLEANUP_FAILED',
+      recoveryStatus: 'FAILED',
+      recoveryReasonCode: 'SESSION_FAILURE',
+    }));
+    assert.equal(unresolved.recovery.status, 'FAILED');
+    assert.equal(unresolved.evidencePurgeAfterMs, null);
+  });
+});
+
 void test('websocket health repository replaces stale active ownership and preserves its diagnostic watermark', async (context) => {
   await withRepository(context, 'websocket_health_stale', async ({ pool, repository }) => {
     const connecting = await repository.beginOwner({ candidateProviderId: 'primary' });

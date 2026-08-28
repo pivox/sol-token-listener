@@ -189,8 +189,9 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
           heartbeat_at = operation.at,
           updated_at = operation.at,
           evidence_purge_after = CASE
-            WHEN $10 = 'RECOVERED' THEN operation.at + INTERVAL '4 hours'
             WHEN $10 IN ('REQUIRED', 'IN_PROGRESS', 'FAILED') THEN NULL
+            WHEN $7 = 'STOPPED' OR $10 = 'RECOVERED'
+              THEN operation.at + INTERVAL '4 hours'
             ELSE health.evidence_purge_after END
          FROM operation
          WHERE health.service_key = $1

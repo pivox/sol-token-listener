@@ -4,6 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
+import { PostgresWebSocketHealthRepository } from '../src/storage/websocket-health.repository.js';
 
 const migrationsDirectory = new URL('../migrations/', import.meta.url);
 const migrationName = '030_listener_websocket_health.sql';
@@ -126,6 +127,60 @@ void test('websocket health retention purge includes the exact expiry boundary',
   );
   assert.notEqual(exclusiveMutation, statement);
   assert.doesNotMatch(exclusiveMutation, inclusiveBoundary);
+});
+
+void test('nominal STOPPED health retains its watermark for four hours then purges it without refreshing freshness', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: websocket health retention test skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'websocket_health_nominal_stop_retention', async (pool) => {
+    await migrateDatabase({ pool });
+    const repository = new PostgresWebSocketHealthRepository(pool);
+    const connecting = await repository.beginOwner({ candidateProviderId: 'primary' });
+    assert.equal(await repository.recordObservation({
+      ownerGeneration: connecting.ownerGeneration,
+      sessionGeneration: connecting.candidateSessionGeneration ?? 0n,
+      slot: 4242n,
+    }), 'RECORDED');
+    const observed = await repository.read();
+    const stopped = await repository.transition({
+      ownerGeneration: observed.ownerGeneration,
+      expectedRevision: observed.revision,
+      phase: 'STOPPED',
+      providerId: null,
+      activeSessionGeneration: null,
+      candidateProviderId: null,
+      candidateSessionGeneration: null,
+      acknowledged: false,
+      disconnectReasonCode: null,
+      recoveryStatus: 'NOT_REQUIRED',
+      recoveryReasonCode: null,
+    });
+    assert.equal(stopped.lastObservation?.slot, 4242n);
+    assert.equal(
+      (stopped.evidencePurgeAfterMs ?? 0) - stopped.updatedAtMs,
+      4 * 60 * 60 * 1_000,
+    );
+
+    assert.equal((await purgeExpiredFoundationData(pool)).websocketHealthEvidence, 0);
+    assert.deepEqual(await repository.read(), stopped);
+
+    await pool.query(`UPDATE listener_websocket_health
+      SET evidence_purge_after = clock_timestamp()
+      WHERE service_key = 'transaction-listener'`);
+    const beforeBoundaryPurge = await repository.read();
+    assert.equal(beforeBoundaryPurge.lastObservation?.slot, 4242n);
+    assert.equal((await purgeExpiredFoundationData(pool)).websocketHealthEvidence, 1);
+    const purged = await repository.read();
+    assert.equal(purged.lastObservation, null);
+    assert.equal(purged.evidencePurgeAfterMs, null);
+    assert.equal(purged.heartbeatAtMs, beforeBoundaryPurge.heartbeatAtMs);
+    assert.equal(purged.updatedAtMs, beforeBoundaryPurge.updatedAtMs);
+    assert.equal(purged.revision, beforeBoundaryPurge.revision);
+  });
 });
 
 void test('websocket health retention keeps unresolved evidence and purges exact four-hour boundaries', async (context) => {
