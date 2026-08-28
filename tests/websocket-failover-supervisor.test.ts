@@ -167,6 +167,124 @@ void test('promotion is abandoned when candidate completion wins before recovery
   assert.equal(fixture.supervisor.activeProviderId(), null);
 });
 
+void test('completion after the running fence is serialized through durable degradation', async () => {
+  const fixture = supervisorFixture();
+  const running = deferred<WebSocketHealthSnapshot>();
+  fixture.reporter.transitionOverrides.set('RUNNING', running.promise);
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  fixture.resolveOpenSession();
+  await flushMicrotasks();
+
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'RUNNING');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  fixture.completionDeferred.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushMicrotasks();
+  assert.equal(fixture.openSignal?.aborted, false);
+
+  const runningInput = fixture.reporter.transitions.at(-1);
+  assert.ok(runningInput !== undefined);
+  running.resolve(snapshotFromTransition(runningInput));
+  await flushMicrotasks();
+
+  assert.deepEqual(fixture.reporter.transitions.map(({ phase }) => phase), [
+    'WAITING_FOR_ACKS',
+    'ACKNOWLEDGED',
+    'RECOVERING',
+    'RUNNING',
+    'DEGRADED',
+  ]);
+  assert.deepEqual(fixture.reporter.transitions.at(-1), {
+    ownerGeneration: 1n,
+    expectedRevision: 5n,
+    phase: 'DEGRADED',
+    providerId: 'primary',
+    activeSessionGeneration: 1n,
+    candidateProviderId: null,
+    candidateSessionGeneration: null,
+    acknowledged: true,
+    disconnectReasonCode: 'REMOTE_CLOSE',
+    recoveryStatus: 'REQUIRED',
+    recoveryReasonCode: 'SESSION_FAILURE',
+  });
+  assert.ok(
+    fixture.calls.indexOf('selector.promote:primary')
+      < fixture.calls.indexOf('health.transition:DEGRADED'),
+  );
+  assert.ok(
+    fixture.calls.indexOf('health.transition:DEGRADED')
+      < fixture.calls.indexOf('selector.clear:primary'),
+  );
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.scheduler.pendingDelays().includes(WEBSOCKET_FRONTIER_INTERVAL_MS), false);
+  assert.equal(fixture.completionThenCalls, 1);
+});
+
+void test('running transition rejection invalidates a queued completion without publication', async () => {
+  const fixture = supervisorFixture();
+  const running = deferred<WebSocketHealthSnapshot>();
+  fixture.reporter.transitionOverrides.set('RUNNING', running.promise);
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  fixture.resolveOpenSession();
+  await flushMicrotasks();
+
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'RUNNING');
+  fixture.completionDeferred.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushMicrotasks();
+  assert.equal(fixture.openSignal?.aborted, false);
+  running.reject(new Error('wss://secret.invalid/running-transition'));
+  await flushMicrotasks();
+
+  assert.equal(fixture.openSignal?.aborted, true);
+  assert.equal(fixture.calls.includes('selector.promote:primary'), false);
+  assert.equal(fixture.calls.includes('scheduler.periodic:30000'), false);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.completionThenCalls, 1);
+});
+
+void test('hostile websocket program is rejected redacted before clock or observation', async () => {
+  const hostile = 'wss://secret.invalid/ws?program=signature-secret';
+  let nowCalls = 0;
+  const fixture = supervisorFixture({
+    now: () => {
+      nowCalls += 1;
+      return 1_000;
+    },
+  });
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+
+  const observe = fixture.observe;
+  assert.ok(observe !== null);
+  await assert.rejects(
+    observe(Object.freeze({
+      endpointId: 'primary',
+      program: hostile,
+      signature: '2'.repeat(64),
+      slot: 42n,
+    }) as unknown as WsProgramNotification),
+    (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message, 'WebSocket failover supervisor configuration is invalid.');
+      assert.equal(Object.hasOwn(error, 'cause'), false);
+      assert.equal(String(error).includes(hostile), false);
+      return true;
+    },
+  );
+  assert.equal(nowCalls, 1);
+  assert.equal(fixture.reporter.observations.length, 0);
+});
+
 void test('owner failure is redacted before touch, scheduling, socket, or strict HTTP', async () => {
   const hostile = 'wss://secret.invalid/ws?token=owner-secret';
   const fixture = supervisorFixture({ ownerFailure: new Error(hostile) });
@@ -244,6 +362,85 @@ void test('initial scheduling failure stops touch without cancelling a phantom h
   assert.equal(fixture.reporter.stopCalls, 1);
   assert.deepEqual(fixture.scheduler.cancelledHandles, []);
   assert.equal(fixture.scheduler.pendingDelays().length, 0);
+});
+
+void test('close waits for deferred owner acquisition and fences every later startup effect', async () => {
+  const owner = deferred<WebSocketHealthSnapshot>();
+  const fixture = supervisorFixture({ ownerResult: owner.promise });
+  const starting = fixture.supervisor.start();
+  const closing = fixture.supervisor.close();
+  let closeSettled = false;
+  void closing.then(() => { closeSettled = true; });
+  await flushMicrotasks();
+  const settledBeforeOwner = closeSettled;
+
+  owner.resolve(snapshot('CONNECTING', 1n));
+  await assertStage(starting, 'cleanup', 'never-leaked');
+  await closing;
+
+  assert.equal(settledBeforeOwner, false);
+  assert.deepEqual(fixture.calls, ['health.beginOwner:primary']);
+  assert.equal(fixture.reporter.stopCalls, 0);
+  assert.equal(fixture.scheduler.pendingDelays().length, 0);
+  assert.equal(fixture.scheduler.cancelledHandles.length, 0);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assertNoSolanaCall(fixture);
+});
+
+void test('close waits for deferred initial transition and stops touch without recovery effects', async () => {
+  const waiting = deferred<WebSocketHealthSnapshot>();
+  const fixture = supervisorFixture();
+  fixture.reporter.transitionOverrides.set('WAITING_FOR_ACKS', waiting.promise);
+  const starting = fixture.supervisor.start();
+  await flushMicrotasks();
+  const waitingInput = fixture.reporter.transitions.at(-1);
+  assert.equal(waitingInput?.phase, 'WAITING_FOR_ACKS');
+
+  const closing = fixture.supervisor.close();
+  let closeSettled = false;
+  void closing.then(() => { closeSettled = true; });
+  await flushMicrotasks();
+  const settledBeforeTransition = closeSettled;
+  assert.ok(waitingInput !== undefined);
+  waiting.resolve(snapshotFromTransition(waitingInput));
+  await assertStage(starting, 'cleanup', 'never-leaked');
+  await closing;
+
+  assert.equal(settledBeforeTransition, false);
+  assert.deepEqual(fixture.calls, [
+    'health.beginOwner:primary',
+    'reporter.startTouch:1',
+    'health.transition:WAITING_FOR_ACKS',
+    'reporter.stop',
+  ]);
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assert.equal(fixture.scheduler.pendingDelays().length, 0);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assertNoSolanaCall(fixture);
+});
+
+void test('reentrant close cancels a just-produced recovery handle before publication', async () => {
+  const fixture = supervisorFixture();
+  const closeOperations: Promise<void>[] = [];
+  fixture.scheduler.onSchedule = (_handle, delayMs) => {
+    if (delayMs === 0) closeOperations.push(fixture.supervisor.close());
+  };
+
+  const starting = fixture.supervisor.start();
+  await assertStage(starting, 'cleanup', 'never-leaked');
+  assert.equal(closeOperations.length, 1);
+  await Promise.all(closeOperations);
+
+  assert.equal(fixture.scheduler.cancelledHandles.length, 1);
+  assert.equal(fixture.scheduler.pendingDelays().length, 0);
+  fixture.scheduler.invokeFirst(0);
+  await flushMicrotasks();
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assertNoSolanaCall(fixture);
 });
 
 void test('constructor rejects hostile options, dependencies, catalog IDs, clock, and random redacted', () => {
@@ -343,7 +540,7 @@ void test('close is idempotent, cancels handles, aborts setup, and prevents late
   await firstClose;
   assert.equal(scheduled.scheduler.pendingDelays().length, 0);
   assert.equal(scheduled.scheduler.cancelledHandles.length, 1);
-  assert.equal(scheduled.reporter.stopCalls, 0);
+  assert.equal(scheduled.reporter.stopCalls, 1);
   assert.equal(scheduled.supervisor.state(), 'STOPPED');
 
   const closedBeforeStart = supervisorFixture();
@@ -384,7 +581,9 @@ void test('close is idempotent, cancels handles, aborts setup, and prevents late
 });
 
 interface FixtureOptions {
+  readonly now?: () => number;
   readonly ownerFailure?: Error;
+  readonly ownerResult?: Promise<WebSocketHealthSnapshot>;
   readonly ownerSnapshot?: WebSocketHealthSnapshot;
   readonly transitionFailure?: WebSocketHealthTransition['phase'];
   readonly transitionError?: Error;
@@ -466,6 +665,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
       beginOwner(input: Readonly<{ candidateProviderId: RpcProviderId }>) {
         calls.push(`health.beginOwner:${input.candidateProviderId}`);
         if (settings.ownerFailure !== undefined) return Promise.reject(settings.ownerFailure);
+        if (settings.ownerResult !== undefined) return settings.ownerResult;
         return Promise.resolve(settings.ownerSnapshot ?? snapshot('CONNECTING', 1n));
       },
     }),
@@ -479,7 +679,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     },
   });
   const options: WebSocketFailoverSupervisorOptions = Object.freeze({
-    now: () => 1_000,
+    now: settings.now ?? (() => 1_000),
     random: () => 0.5,
     scheduler: Object.freeze({
       schedule(callback: () => void, delayMs: number): unknown {
@@ -527,6 +727,10 @@ class RecordingCatalog implements RpcProviderCatalog {
 class RecordingReporter extends PersistentWebSocketHealthReporter {
   public readonly transitions: WebSocketHealthTransition[] = [];
   public readonly observations: RecordedObservation[] = [];
+  public readonly transitionOverrides = new Map<
+    WebSocketHealthTransition['phase'],
+    Promise<WebSocketHealthSnapshot>
+  >();
   public stopCalls = 0;
 
   public constructor(
@@ -554,6 +758,8 @@ class RecordingReporter extends PersistentWebSocketHealthReporter {
     this.calls.push(`health.transition:${input.phase}`);
     this.transitions.push(input);
     if (input.phase === this.transitionFailure) return Promise.reject(this.transitionError);
+    const override = this.transitionOverrides.get(input.phase);
+    if (override !== undefined) return override;
     const next = snapshotFromTransition(input);
     return Promise.resolve(input.phase === this.mutableTransitionResult ? { ...next } : next);
   }
@@ -600,6 +806,7 @@ class ManualScheduler {
   private readonly tasks: ManualTask[] = [];
   private nextId = 0;
   public readonly cancelledHandles: unknown[] = [];
+  public onSchedule: ((handle: unknown, delayMs: number) => void) | null = null;
 
   public constructor(
     private readonly calls: string[],
@@ -612,6 +819,7 @@ class ManualScheduler {
     if (delayMs === this.failureDelay) throw this.failure;
     const handle = Object.freeze({ id: ++this.nextId });
     this.tasks.push({ callback, delayMs, handle, cancelled: false, fired: false });
+    this.onSchedule?.(handle, delayMs);
     return handle;
   }
 
@@ -634,6 +842,12 @@ class ManualScheduler {
     return this.tasks
       .filter((value) => !value.cancelled && !value.fired)
       .map(({ delayMs }) => delayMs);
+  }
+
+  public invokeFirst(delayMs: number): void {
+    const task = this.tasks.find((value) => value.delayMs === delayMs);
+    if (task === undefined) throw new Error('No matching scheduler task.');
+    task.callback();
   }
 }
 
@@ -823,18 +1037,27 @@ function assertInvalidConstructor(
 interface Deferred<TValue> {
   readonly promise: Promise<TValue>;
   readonly resolve: (value: TValue) => void;
+  readonly reject: (reason: Error) => void;
   readonly settled: () => boolean;
 }
 
 function deferred<TValue>(): Deferred<TValue> {
   let complete = false;
   let resolvePromise: ((value: TValue) => void) | undefined;
-  const promise = new Promise<TValue>((resolve) => { resolvePromise = resolve; });
+  let rejectPromise: ((reason: Error) => void) | undefined;
+  const promise = new Promise<TValue>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
   return Object.freeze({
     promise,
     resolve(value: TValue): void {
       complete = true;
       resolvePromise?.(value);
+    },
+    reject(reason: Error): void {
+      complete = true;
+      rejectPromise?.(reason);
     },
     settled(): boolean { return complete; },
   });

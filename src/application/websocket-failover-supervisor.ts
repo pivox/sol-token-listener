@@ -31,6 +31,7 @@ import type {
   openWsProgramSession,
   WsProgramNotification,
   WsProgramSession,
+  WsProgramSessionCompletion,
 } from '../solana/rpc/ws-program-session.js';
 
 export const WEBSOCKET_FRONTIER_INTERVAL_MS = 30_000;
@@ -77,7 +78,13 @@ interface SessionRecord {
   readonly sessionGeneration: bigint;
   readonly session: WsProgramSession;
   readonly controller: AbortController;
+  promotionFenced: boolean;
+  queuedCompletion: WsProgramSessionCompletion | null;
 }
+
+const REJECTED_SESSION_COMPLETION: WsProgramSessionCompletion = Object.freeze({
+  reason: 'PROTOCOL_INVALID',
+});
 
 interface ValidatedReporter {
   startTouch(snapshot: WebSocketHealthSnapshot): void;
@@ -115,6 +122,8 @@ export class WebSocketFailoverSupervisor {
   #incumbent: SessionRecord | null = null;
   #currentState: ListenerRuntimeState = 'STOPPED';
   #currentProviderId: RpcProviderId | null = null;
+  #touchStarted = false;
+  #reporterStopPromise: Promise<void> | null = null;
   #permanentlyClosed = false;
 
   public constructor(
@@ -162,36 +171,58 @@ export class WebSocketFailoverSupervisor {
         || snapshot.candidateProviderId !== 'primary'
         || snapshot.candidateSessionGeneration === null) throw new TypeError();
     } catch {
+      if (this.#permanentlyClosed) throw new WebSocketFailoverSupervisorError('cleanup');
       this.#currentState = 'DEGRADED';
       throw new WebSocketFailoverSupervisorError('owner');
     }
+    this.#assertStartupOpen();
     this.#snapshot = snapshot;
-    let touchStarted = false;
     try {
+      this.#assertStartupOpen();
       this.#dependencies.reporter.startTouch(snapshot);
-      touchStarted = true;
-      this.#snapshot = await this.#transitionToWaiting(snapshot);
+      this.#touchStarted = true;
+      this.#assertStartupOpen();
+      const waiting = await this.#transitionToWaiting(snapshot);
+      this.#assertStartupOpen();
+      this.#snapshot = waiting;
     } catch {
+      if (this.#touchStarted) await this.#stopReporterAfterStartFailure();
+      if (this.#permanentlyClosed) throw new WebSocketFailoverSupervisorError('cleanup');
       this.#currentState = 'DEGRADED';
-      if (touchStarted) await this.#stopReporterAfterStartFailure();
       throw new WebSocketFailoverSupervisorError('transition');
     }
+    this.#assertStartupOpen();
     this.#currentState = 'STARTING';
     try {
+      this.#assertStartupOpen();
       this.#scheduleRecovery();
+      this.#assertStartupOpen();
     } catch {
-      this.#currentState = 'DEGRADED';
       await this.#stopReporterAfterStartFailure();
+      if (this.#permanentlyClosed) throw new WebSocketFailoverSupervisorError('cleanup');
+      this.#currentState = 'DEGRADED';
       throw new WebSocketFailoverSupervisorError('schedule');
     }
   }
 
   async #stopReporterAfterStartFailure(): Promise<void> {
     try {
-      await this.#dependencies.reporter.stop(() => Promise.resolve());
+      await this.#stopReporterOnce();
     } catch {
       // The original startup stage remains the stable public failure.
     }
+  }
+
+  #stopReporterOnce(): Promise<void> {
+    if (!this.#touchStarted) return Promise.resolve();
+    this.#reporterStopPromise ??= Promise.resolve().then(
+      () => this.#dependencies.reporter.stop(() => Promise.resolve()),
+    );
+    return this.#reporterStopPromise;
+  }
+
+  #assertStartupOpen(): void {
+    if (this.#permanentlyClosed) throw new WebSocketFailoverSupervisorError('cleanup');
   }
 
   async #transitionToWaiting(snapshot: WebSocketHealthSnapshot): Promise<WebSocketHealthSnapshot> {
@@ -227,6 +258,10 @@ export class WebSocketFailoverSupervisor {
       );
     }, 0);
     scheduled = Object.freeze({ value });
+    if (this.#permanentlyClosed) {
+      this.#options.scheduler.cancel(value);
+      return;
+    }
     this.#loopHandle = scheduled;
   }
 
@@ -258,16 +293,18 @@ export class WebSocketFailoverSupervisor {
     );
     openedSession = session;
     if (this.#isPermanentlyClosed() || this.#candidateAbort !== controller) return;
-    const candidate: SessionRecord = Object.freeze({
+    const candidate: SessionRecord = {
       providerId,
       sessionGeneration,
       session,
       controller,
-    });
+      promotionFenced: false,
+      queuedCompletion: null,
+    };
     this.#candidate = candidate;
     void session.completion.then(
-      () => { this.#completeSession(candidate); },
-      () => { this.#completeSession(candidate); },
+      (completion) => { this.#completeSession(candidate, completion); },
+      () => { this.#completeSession(candidate, REJECTED_SESSION_COMPLETION); },
     );
 
     await this.#transition({
@@ -297,17 +334,23 @@ export class WebSocketFailoverSupervisor {
     await this.#dependencies.runStrictScan(providerId, controller.signal);
     if (this.#candidate !== candidate || this.#isPermanentlyClosed()
       || controller.signal.aborted) return;
-    await this.#transition({
-      phase: 'RUNNING',
-      providerId,
-      activeSessionGeneration: sessionGeneration,
-      candidateProviderId: null,
-      candidateSessionGeneration: null,
-      acknowledged: true,
-      disconnectReasonCode: null,
-      recoveryStatus: 'RECOVERED',
-      recoveryReasonCode: snapshot.recovery.reasonCode ?? 'STARTUP',
-    });
+    candidate.promotionFenced = true;
+    try {
+      await this.#transition({
+        phase: 'RUNNING',
+        providerId,
+        activeSessionGeneration: sessionGeneration,
+        candidateProviderId: null,
+        candidateSessionGeneration: null,
+        acknowledged: true,
+        disconnectReasonCode: null,
+        recoveryStatus: 'RECOVERED',
+        recoveryReasonCode: snapshot.recovery.reasonCode ?? 'STARTUP',
+      });
+    } catch (error) {
+      this.#invalidateCandidate(candidate);
+      throw error;
+    }
     if (this.#candidate !== candidate || this.#isPermanentlyClosed()) return;
     this.#incumbent = candidate;
     this.#candidate = null;
@@ -315,6 +358,12 @@ export class WebSocketFailoverSupervisor {
     this.#currentProviderId = providerId;
     this.#currentState = 'RUNNING';
     this.#dependencies.promoted.promote(providerId);
+    const queuedCompletion = candidate.queuedCompletion;
+    candidate.queuedCompletion = null;
+    if (queuedCompletion !== null) {
+      await this.#degradePromotedSession(candidate, queuedCompletion);
+      return;
+    }
     this.#armPeriodicFrontier();
   }
 
@@ -352,13 +401,18 @@ export class WebSocketFailoverSupervisor {
     if (openedSession !== null
       && this.#candidate?.session !== openedSession
       && this.#incumbent?.session !== openedSession) return Promise.resolve();
+    let programId: string | null;
+    try {
+      programId = programIdFrom(value.program);
+    } catch {
+      return Promise.reject(configurationError());
+    }
+    if (programId === null) return Promise.reject(configurationError());
     const notification: TransactionNotification = Object.freeze({
       signature: value.signature,
       slot: value.slot,
       source: 'WEBSOCKET',
-      programIds: Object.freeze([
-        value.program === 'pumpfun' ? PUMP_PROGRAM_ID : PUMPSWAP_PROGRAM_ID,
-      ]),
+      programIds: Object.freeze([programId]),
       confirmationStatus: 'confirmed',
       observedAtMs: this.#options.now(),
     });
@@ -369,12 +423,14 @@ export class WebSocketFailoverSupervisor {
     );
   }
 
-  #completeSession(record: SessionRecord): void {
+  #completeSession(record: SessionRecord, completion: WsProgramSessionCompletion): void {
     if (this.#permanentlyClosed) return;
     if (this.#candidate === record) {
-      this.#candidate = null;
-      if (this.#candidateAbort === record.controller) this.#candidateAbort = null;
-      record.controller.abort();
+      if (record.promotionFenced) {
+        record.queuedCompletion ??= completion;
+        return;
+      }
+      this.#invalidateCandidate(record);
       return;
     }
     if (this.#incumbent === record) {
@@ -382,6 +438,34 @@ export class WebSocketFailoverSupervisor {
       this.#currentProviderId = null;
       this.#currentState = 'DEGRADED';
     }
+  }
+
+  #invalidateCandidate(record: SessionRecord): void {
+    if (this.#candidate === record) this.#candidate = null;
+    if (this.#candidateAbort === record.controller) this.#candidateAbort = null;
+    record.controller.abort();
+  }
+
+  async #degradePromotedSession(
+    record: SessionRecord,
+    completion: WsProgramSessionCompletion,
+  ): Promise<void> {
+    await this.#transition({
+      phase: 'DEGRADED',
+      providerId: record.providerId,
+      activeSessionGeneration: record.sessionGeneration,
+      candidateProviderId: null,
+      candidateSessionGeneration: null,
+      acknowledged: true,
+      disconnectReasonCode: disconnectReasonFromCompletion(completion),
+      recoveryStatus: 'REQUIRED',
+      recoveryReasonCode: 'SESSION_FAILURE',
+    });
+    if (this.#permanentlyClosed || this.#incumbent !== record) return;
+    this.#dependencies.promoted.clear(record.providerId);
+    this.#incumbent = null;
+    this.#currentProviderId = null;
+    this.#currentState = 'DEGRADED';
   }
 
   #finishRecovery(operation: Promise<void>, failed: boolean): void {
@@ -408,6 +492,7 @@ export class WebSocketFailoverSupervisor {
   async #performClose(): Promise<void> {
     this.#permanentlyClosed = true;
     this.#currentState = 'STOPPING';
+    let cleanupFailed = false;
     const handle = this.#loopHandle;
     this.#loopHandle = null;
     const periodic = this.#periodicHandle;
@@ -422,8 +507,7 @@ export class WebSocketFailoverSupervisor {
       try {
         this.#dependencies.promoted.clear(activeProviderId);
       } catch {
-        this.#currentState = 'DEGRADED';
-        throw new WebSocketFailoverSupervisorError('cleanup');
+        cleanupFailed = true;
       }
     }
     for (const scheduled of [handle, periodic]) {
@@ -431,12 +515,29 @@ export class WebSocketFailoverSupervisor {
       try {
         this.#options.scheduler.cancel(scheduled.value);
       } catch {
-        this.#currentState = 'DEGRADED';
-        throw new WebSocketFailoverSupervisorError('cleanup');
+        cleanupFailed = true;
       }
     }
+    const starting = this.#startPromise;
+    if (starting !== null) {
+      try {
+        await starting;
+      } catch {
+        // Startup observes the permanent fence and settles before close completes.
+      }
+    }
+    if (this.#touchStarted) {
+      try {
+        await this.#stopReporterOnce();
+      } catch {
+        cleanupFailed = true;
+      }
+    }
+    if (cleanupFailed) {
+      this.#currentState = 'DEGRADED';
+      throw new WebSocketFailoverSupervisorError('cleanup');
+    }
     this.#currentState = 'STOPPED';
-    await Promise.resolve();
   }
 }
 
@@ -726,6 +827,27 @@ function exactOwnData(value: unknown, expectedKeys: readonly string[]): Readonly
 
 function objectValue(value: unknown): value is object {
   return typeof value === 'object' && value !== null && !Array.isArray(value) && !isProxy(value);
+}
+
+function disconnectReasonFromCompletion(
+  completion: WsProgramSessionCompletion,
+): NonNullable<WebSocketHealthTransition['disconnectReasonCode']> {
+  switch (completion.reason) {
+    case 'LOCAL_CLOSE': return 'UNEXPECTED_RESTART';
+    case 'SOCKET_ERROR': return 'SOCKET_ERROR';
+    case 'REMOTE_CLOSE': return 'REMOTE_CLOSE';
+    case 'PROTOCOL_INVALID': return 'PROTOCOL_INVALID';
+    case 'NOTIFICATION_FAILED': return 'NOTIFICATION_FAILED';
+    case 'CLEANUP_FAILED': return 'CLEANUP_FAILED';
+  }
+}
+
+function programIdFrom(value: unknown): string | null {
+  switch (value) {
+    case 'pumpfun': return PUMP_PROGRAM_ID;
+    case 'pumpswap': return PUMPSWAP_PROGRAM_ID;
+    default: return null;
+  }
 }
 
 function configurationError(): TypeError {
