@@ -171,18 +171,30 @@ export class StrictCatchUpScanner {
   public async scan(signal: AbortSignal): Promise<StrictCatchUpScanResult> {
     assertNotAborted(signal);
     const observedAtMs = this.readNow();
-    const launchpad = await this.readCheckpoint('launchpad', signal);
-    const market = await this.readCheckpoint('market', signal);
+    const launchpad = await this.awaited(
+      signal,
+      () => this.readCheckpoint('launchpad', signal),
+    );
+    const market = await this.awaited(
+      signal,
+      () => this.readCheckpoint('market', signal),
+    );
     const boundaries: StrictCatchUpBoundaries = Object.freeze({ launchpad, market });
     const scans: StrictProgramScan[] = [];
 
     for (const program of PROGRAMS) {
       const expected = boundaries[program.key];
       try {
-        scans.push(await this.scanProgram(program, expected, signal));
+        scans.push(await this.awaited(
+          signal,
+          () => this.scanProgram(program, expected, signal),
+        ));
       } catch (error) {
         if (isWindowExceeded(error)) {
-          await this.recordWindowFailure(error, observedAtMs, signal);
+          await this.awaited(
+            signal,
+            () => this.recordWindowFailure(error, observedAtMs, signal),
+          );
           throw new StrictCatchUpWindowExceededError(
             this.providerId,
             error.checkpointKey,
@@ -274,7 +286,10 @@ export class StrictCatchUpScanner {
     let observedHeadSlot: bigint | null = null;
 
     for (let pageCount = 1; pageCount <= this.maxPages; pageCount += 1) {
-      const page = await this.readPage(program, before, signal);
+      const page = await this.awaited(
+        signal,
+        () => this.readPage(program, before, signal),
+      );
       if (pageCount === 1) observedHeadSlot = page[0]?.slot ?? null;
       for (const row of page) {
         if (row.slot > MAX_STRICT_CATCH_UP_SLOT
@@ -374,9 +389,11 @@ export class StrictCatchUpScanner {
 
   private async awaited<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
     assertNotAborted(signal);
-    const value = await operation();
-    assertNotAborted(signal);
-    return value;
+    try {
+      return await operation();
+    } finally {
+      assertNotAborted(signal);
+    }
   }
 
   private readNow(): number {

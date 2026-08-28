@@ -55,6 +55,48 @@ void test('aborts before the scan without calling the clock, repository, or sour
   assert.deepEqual(events, []);
 });
 
+void test('aborts after the launchpad checkpoint settles without reading the market checkpoint', async () => {
+  const checkpointRead = deferred<undefined>();
+  const controller = new AbortController();
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch', 1)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  });
+  const repository = new FakeRepository();
+  repository.nextReads.set('launchpad', checkpointRead.promise);
+
+  const scan = scanner(source, repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('read:launchpad'));
+  controller.abort();
+  checkpointRead.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(repository.eventsSeen, ['read:launchpad']);
+  assert.deepEqual(source.calls, []);
+  assertNoWrites(repository);
+});
+
+void test('aborts after the market checkpoint settles without reading a provider page', async () => {
+  const checkpointRead = deferred<undefined>();
+  const controller = new AbortController();
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch', 1)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  });
+  const repository = new FakeRepository();
+  repository.nextReads.set('market', checkpointRead.promise);
+
+  const scan = scanner(source, repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('read:market'));
+  controller.abort();
+  checkpointRead.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(repository.eventsSeen, ['read:launchpad', 'read:market']);
+  assert.deepEqual(source.calls, []);
+  assertNoWrites(repository);
+});
+
 void test('aborts after a provider page settles without enqueueing', async () => {
   const page = deferred<unknown>();
   const controller = new AbortController();
@@ -69,6 +111,26 @@ void test('aborts after a provider page settles without enqueueing', async () =>
   await waitFor(() => source.calls.length === 1);
   controller.abort();
   page.resolve([sig('launch', 1)]);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(source.calls, [[PUMP_PROGRAM_ID, undefined, 2]]);
+  assertNoWrites(repository);
+});
+
+void test('makes abort dominate a provider page rejection after the signal is aborted', async () => {
+  const page = deferred<unknown>();
+  const controller = new AbortController();
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  });
+  source.nextList = page.promise;
+  const repository = new FakeRepository();
+
+  const scan = scanner(source, repository).scan(controller.signal);
+  await waitFor(() => source.calls.length === 1);
+  controller.abort();
+  page.reject(new Error('source-secret'));
 
   await assert.rejects(scan, abortedScan);
   assert.deepEqual(source.calls, [[PUMP_PROGRAM_ID, undefined, 2]]);
@@ -112,6 +174,50 @@ void test('aborts after the first CAS settles without rolling it back or startin
   await assert.rejects(scan, abortedScan);
   assert.deepEqual(repository.cas.map(([, next]) => next.key), ['launchpad']);
   assert.deepEqual(repository.resolutions, []);
+});
+
+void test('aborts after a strict failure write settles without starting another durable write', async () => {
+  const failureWrite = deferred<undefined>();
+  const controller = new AbortController();
+  const repository = new FakeRepository({
+    launchpad: checkpoint('launchpad', 'missing', 1),
+  });
+  repository.nextFailureWrite = failureWrite.promise;
+  const scan = scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  }), repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('failure:launchpad'));
+
+  controller.abort();
+  failureWrite.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.equal(repository.failures.length, 1);
+  assert.deepEqual(repository.enqueued, []);
+  assert.deepEqual(repository.cas, []);
+  assert.deepEqual(repository.resolutions, []);
+});
+
+void test('aborts after failure resolution settles without starting the next durable write', async () => {
+  const failureResolve = deferred<undefined>();
+  const controller = new AbortController();
+  const repository = new FakeRepository();
+  repository.nextFailureResolve = failureResolve.promise;
+  const scan = scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  }), repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('resolve:launchpad'));
+
+  controller.abort();
+  failureResolve.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(repository.resolutions, [['launchpad', null]]);
+  assert.deepEqual(repository.enqueued, []);
+  assert.deepEqual(repository.cas, []);
+  assert.deepEqual(repository.failures, []);
 });
 
 void test('compares private exact window frontiers without enumerating or serializing signatures', () => {
@@ -597,8 +703,11 @@ class FakeRepository implements StrictCatchUpRepository {
   failCasAt: number | null = null;
   failResolveAt: number | null = null;
   failFailureWrite = false;
+  readonly nextReads = new Map<ProcessingCheckpointKey, Promise<void>>();
   nextEnqueue: Promise<void> | null = null;
   nextCas: Promise<void> | null = null;
+  nextFailureWrite: Promise<void> | null = null;
+  nextFailureResolve: Promise<void> | null = null;
   private casAttempts = 0;
   private resolveAttempts = 0;
 
@@ -624,6 +733,9 @@ class FakeRepository implements StrictCatchUpRepository {
 
   async readCheckpoint(key: ProcessingCheckpointKey): Promise<ProcessingCheckpoint | null> {
     this.events.push(`read:${key}`);
+    const pending = this.nextReads.get(key);
+    this.nextReads.delete(key);
+    if (pending !== undefined) await pending;
     return this.checkpoints[key] ?? null;
   }
 
@@ -645,6 +757,11 @@ class FakeRepository implements StrictCatchUpRepository {
 
   async recordStrictCatchUpFailure(value: StrictCatchUpFailure): Promise<void> {
     this.events.push(`failure:${value.checkpointKey}`);
+    if (this.nextFailureWrite !== null) {
+      const pending = this.nextFailureWrite;
+      this.nextFailureWrite = null;
+      await pending;
+    }
     if (this.failFailureWrite) throw new Error('failure-write-secret');
     this.failures.push(value);
   }
@@ -655,6 +772,11 @@ class FakeRepository implements StrictCatchUpRepository {
   ): Promise<void> {
     this.resolveAttempts += 1;
     this.events.push(`resolve:${key}`);
+    if (this.nextFailureResolve !== null) {
+      const pending = this.nextFailureResolve;
+      this.nextFailureResolve = null;
+      await pending;
+    }
     if (this.failResolveAt === this.resolveAttempts) throw new Error('resolve-secret');
     this.resolutions.push([key, previous]);
   }
