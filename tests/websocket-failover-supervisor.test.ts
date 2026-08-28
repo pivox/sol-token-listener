@@ -185,6 +185,128 @@ void test('same-frontier exhaustion becomes durable unrecoverable without any ti
   assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
 });
 
+void test('live incumbent completion after unrecoverable only detaches and closes the session', async () => {
+  const terminalClose = deferred<undefined>();
+  const incumbent = controlledSession('primary', terminalClose.promise);
+  const candidate = controlledSession('primary');
+  const frontier = strictFrontier('terminal');
+  const fixture = supervisorFixture({
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    rejected(new StrictCatchUpWindowExceededError('primary', 'launchpad', frontier)),
+  );
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'UNRECOVERABLE');
+  assert.equal(incumbent.closeCalls(), 0);
+  assert.equal(candidate.closeCalls(), 1);
+  const transitionCount = fixture.reporter.transitions.length;
+  const openCount = fixture.openedAttempts.length;
+  const strictCount = fixture.strictCalls.length;
+
+  incumbent.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+
+  assert.equal(fixture.reporter.transitions.length, transitionCount);
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'UNRECOVERABLE');
+  assert.equal(fixture.openedAttempts.length, openCount);
+  assert.equal(fixture.strictCalls.length, strictCount);
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WS_PROGRAM_SESSION_CLEANUP_TIMEOUT_MS]);
+
+  const closing = fixture.supervisor.close();
+  let closeSettled = false;
+  void closing.then(
+    () => { closeSettled = true; },
+    () => { closeSettled = true; },
+  );
+  await flushLifecycle();
+  assert.equal(closeSettled, false);
+  terminalClose.resolve(undefined);
+  await closing;
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+});
+
+void test('unrecoverable waits for an in-flight active degradation before its terminal transition', async () => {
+  const incumbentClose = deferred<undefined>();
+  const reporterStop = deferred<undefined>();
+  const incumbent = controlledSession('primary', incumbentClose.promise);
+  const candidate = controlledSession('primary');
+  const candidateScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    reporterStopResult: reporterStop.promise,
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    candidateScan.promise,
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  fixture.reporter.transitionOverrides.set(
+    'DEGRADED',
+    rejected(new Error('Expected active degradation failure.')),
+  );
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(fixture.strictCalls.length, 3);
+
+  incumbent.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  candidateScan.reject(new StrictCatchUpWindowExceededError(
+    'primary',
+    'launchpad',
+    strictFrontier('active-terminal'),
+  ));
+  await flushLifecycle();
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(
+    fixture.reporter.transitions.some(({ phase }) => phase === 'UNRECOVERABLE'),
+    false,
+  );
+
+  incumbentClose.resolve(undefined);
+  await flushLifecycle();
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assert.equal(
+    fixture.reporter.transitions.some(({ phase }) => phase === 'UNRECOVERABLE'),
+    false,
+  );
+
+  reporterStop.resolve(undefined);
+  await flushLifecycle();
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'UNRECOVERABLE');
+  const transitionCount = fixture.reporter.transitions.length;
+  await flushLifecycle();
+  assert.equal(fixture.reporter.transitions.length, transitionCount);
+
+  await fixture.supervisor.close();
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(fixture.reporter.stopCalls, 1);
+});
+
 void test('mixed or different frontier exhaustion remains degraded with one backoff', async () => {
   const variants = [
     [
@@ -446,6 +568,55 @@ void test('stale incumbent completion cannot degrade a replacement promoted afte
   assert.equal(fixture.reporter.transitions.length, transitionCount);
   assert.equal(fixture.supervisor.state(), 'RUNNING');
   assert.equal(fixture.dependencies.promoted.activeProviderId(), 'primary');
+});
+
+void test('healthy overlap promotion consumes recovery requested by the old incumbent', async () => {
+  const incumbent = controlledSession('primary');
+  const candidate = controlledSession('primary');
+  const candidateScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    candidateScan.promise,
+    Promise.resolve(scanResult('primary')),
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(fixture.strictCalls.length, 3);
+
+  incumbent.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+  candidateScan.resolve(scanResult('primary'));
+  await flushLifecycle();
+
+  assert.equal(fixture.supervisor.state(), 'RUNNING');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), 'primary');
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(candidate.closeCalls(), 0);
+  assert.equal(fixture.openedAttempts.length, 2);
+  assert.equal(fixture.strictCalls.length, 3);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
+
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  assert.equal(fixture.openedAttempts.length, 2);
+  assert.equal(fixture.strictCalls.length, 4);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
+
+  await fixture.supervisor.close();
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(candidate.closeCalls(), 1);
 });
 
 void test('queued completion degrades before the previous incumbent close settles', async () => {
@@ -1700,6 +1871,7 @@ interface FixtureOptions {
   readonly sessionFactories?: (() => Promise<WsProgramSession>)[];
   readonly resolveFailures?: Error[];
   readonly reporterStopFailure?: Error;
+  readonly reporterStopResult?: Promise<undefined>;
   readonly scheduleFailureDelay?: number;
   readonly scheduleError?: Error;
 }
@@ -1749,6 +1921,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     settings.mutableTransitionResult,
     settings.wrongDisconnectResult,
     settings.reporterStopFailure,
+    settings.reporterStopResult,
   );
   const selector = new RecordingSelector(calls, providerIds);
   const strictResults: Promise<StrictCatchUpScanResult>[] = [];
@@ -1870,6 +2043,7 @@ class RecordingReporter extends PersistentWebSocketHealthReporter {
     private readonly mutableTransitionResult?: WebSocketHealthTransition['phase'],
     private readonly wrongDisconnectResult?: WebSocketHealthTransition['phase'],
     private readonly stopFailure?: Error,
+    private readonly stopResult?: Promise<undefined>,
   ) {
     super(
       { async enqueue() {} },
@@ -1922,6 +2096,11 @@ class RecordingReporter extends PersistentWebSocketHealthReporter {
     this.calls.push('reporter.stop');
     this.stopCleanupCalls += 1;
     const operation = cleanup();
+    if (this.stopResult !== undefined) {
+      void operation.catch(() => undefined);
+      await this.stopResult;
+      return;
+    }
     if (this.stopFailure !== undefined) {
       void operation.catch(() => undefined);
       throw this.stopFailure;

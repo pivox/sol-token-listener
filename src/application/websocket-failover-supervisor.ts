@@ -177,6 +177,7 @@ export class WebSocketFailoverSupervisor {
   #unrecoverable = false;
   #recoveryRequested = false;
   #activeFailurePromise: Promise<void> | null = null;
+  #terminalCleanupPromise: Promise<void> | null = null;
   #transitionActive = false;
   readonly #transitionWaiters: (() => void)[] = [];
   #shutdownResourceFailed = false;
@@ -548,6 +549,7 @@ export class WebSocketFailoverSupervisor {
       this.#failedCycleCount = 0;
       this.#pendingRecoveryReason = recoveryReason;
       this.#dependencies.promoted.promote(providerId);
+      this.#recoveryRequested = false;
       const queuedCompletion = candidate.queuedCompletion;
       candidate.queuedCompletion = null;
       let previousCleanupFailed = false;
@@ -718,6 +720,11 @@ export class WebSocketFailoverSupervisor {
   async #becomeUnrecoverable(): Promise<void> {
     this.#unrecoverable = true;
     this.#cancelPeriodicFrontier();
+    const activeFailure = this.#activeFailurePromise;
+    if (activeFailure !== null) {
+      try { await activeFailure; } catch { /* terminal transition remains authoritative */ }
+      if (this.#isPermanentlyClosed()) return;
+    }
     const incumbent = this.#incumbent;
     if (incumbent?.completed === true) {
       this.#incumbent = null;
@@ -847,6 +854,10 @@ export class WebSocketFailoverSupervisor {
       return;
     }
     if (this.#incumbent === record) {
+      if (this.#unrecoverable) {
+        this.#detachUnrecoverableIncumbent(record);
+        return;
+      }
       this.#currentState = 'DEGRADED';
       if (this.#activeFailurePromise !== null) return;
       const operation = this.#degradeIncumbent(record, reason);
@@ -860,6 +871,22 @@ export class WebSocketFailoverSupervisor {
         },
       );
     }
+  }
+
+  #detachUnrecoverableIncumbent(record: SessionRecord): void {
+    if (this.#incumbent === record) this.#incumbent = null;
+    record.controller.abort();
+    const operation = this.#closeSession(record);
+    this.#terminalCleanupPromise = operation;
+    void operation.then(
+      () => { this.#finishTerminalCleanup(operation, false); },
+      () => { this.#finishTerminalCleanup(operation, true); },
+    );
+  }
+
+  #finishTerminalCleanup(operation: Promise<void>, failed: boolean): void {
+    if (this.#terminalCleanupPromise === operation) this.#terminalCleanupPromise = null;
+    if (failed) this.#shutdownResourceFailed = true;
   }
 
   #invalidateCandidate(record: SessionRecord): void {
@@ -1145,6 +1172,7 @@ export class WebSocketFailoverSupervisor {
       this.#loopPromise,
       this.#periodicPromise,
       this.#activeFailurePromise,
+      this.#terminalCleanupPromise,
     ]) {
       if (pending !== null) operations.push(pending);
     }
