@@ -68,11 +68,12 @@ void test('websocket health reporter serializes and coalesces periodic touches',
   scheduler.fireNext(5);
   await flushMicrotasks();
   assert.deepEqual(repository.touches, [1n]);
+  assert.deepEqual(scheduler.pendingDelays(), [5]);
 
-  scheduler.fireLastAgain();
-  scheduler.fireLastAgain();
+  scheduler.fireNext(5);
   await flushMicrotasks();
   assert.deepEqual(repository.touches, [1n]);
+  assert.deepEqual(scheduler.pendingDelays(), [5]);
 
   firstTouch.resolve(undefined);
   await flushMicrotasks();
@@ -87,13 +88,14 @@ void test('websocket health reporter fences an in-flight touch, stops once, and 
   const cleanup = deferred<undefined>();
   repository.touchResults.push(touch.promise);
   repository.transitionResults.push(
-    Promise.resolve(snapshot('STOPPING', 3n)),
-    Promise.resolve(snapshot('STOPPED', 4n)),
+    Promise.resolve(snapshot('STOPPING', 3n, true)),
+    Promise.resolve(snapshot('STOPPED', 4n, true)),
   );
   const { reporter, scheduler } = reporterFixture(repository);
-  reporter.startTouch(snapshot('RUNNING', 2n));
+  reporter.startTouch(snapshot('RUNNING', 2n, true));
+  const consumedTouchCallback = scheduler.latestCallback();
   scheduler.fireNext(5);
-  const staleTouchCallback = scheduler.latestCallback();
+  const pendingTouchCallback = scheduler.latestCallback();
   await flushMicrotasks();
 
   let cleanupCalls = 0;
@@ -103,6 +105,7 @@ void test('websocket health reporter fences an in-flight touch, stops once, and 
   });
   assert.equal(reporter.stop(async () => undefined), stopping);
   assert.equal(repository.transitions[0]?.phase, 'STOPPING');
+  assert.equal(scheduler.pendingDelays().includes(5), false);
   await flushMicrotasks();
   assert.equal(cleanupCalls, 0);
   assert.equal(repository.transitions.some((value) => value.phase === 'STOPPED'), false);
@@ -115,9 +118,11 @@ void test('websocket health reporter fences an in-flight touch, stops once, and 
   cleanup.resolve(undefined);
   await stopping;
   assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING', 'STOPPED']);
+  assert.deepEqual(repository.transitions.map((value) => value.disconnectReasonCode), [null, null]);
   assert.equal(reporter.state(), 'STOPPED');
   const touchCount = repository.touches.length;
-  staleTouchCallback();
+  consumedTouchCallback();
+  pendingTouchCallback();
   await flushMicrotasks();
   assert.equal(repository.touches.length, touchCount);
 });
@@ -455,11 +460,6 @@ class ManualScheduler implements WebSocketHealthReporterScheduler {
     task.fired = true;
     this.lastCallback = task.callback;
     task.callback();
-  }
-
-  public fireLastAgain(): void {
-    if (this.lastCallback === null) throw new Error('No callback has been scheduled.');
-    this.lastCallback();
   }
 
   public latestCallback(): () => void {

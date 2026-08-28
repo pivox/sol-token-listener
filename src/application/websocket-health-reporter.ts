@@ -195,6 +195,10 @@ export class PersistentWebSocketHealthReporter {
       this.touchTimer = this.scheduler.schedule(() => {
         if (!this.touching || sequence !== this.touchSequence) return;
         this.touchTimer = null;
+        if (!this.scheduleTouch()) {
+          this.touching = false;
+          return;
+        }
         this.requestTouch();
       }, this.touchIntervalMs);
       return true;
@@ -237,7 +241,6 @@ export class PersistentWebSocketHealthReporter {
       this.requestTouch();
       return;
     }
-    void this.scheduleTouch();
   }
 
   private async performStop(cleanup: () => Promise<void>): Promise<void> {
@@ -384,7 +387,7 @@ function stopTransition(
       ? null
       : snapshot.candidateSessionGeneration,
     acknowledged: phase === 'STOPPED' ? false : snapshot.acknowledgedAtMs !== null,
-    disconnectReasonCode: snapshot.disconnect?.reasonCode ?? null,
+    disconnectReasonCode: null,
     recoveryStatus: snapshot.recovery.status,
     recoveryReasonCode: snapshot.recovery.reasonCode,
   });
