@@ -317,6 +317,7 @@ void test('purges only expired resolved strict failures and exposes their count'
   const pool = { connect: async () => client } as unknown as InstanceType<typeof pg.Pool>;
 
   const result = await purgeExpiredFoundationData(pool);
+  assert.equal(result.websocketHealthEvidence, 0);
   assert.equal(result.listenerStrictCatchUpFailures, 2);
   assert.equal(result.transactionInbox, 3);
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
@@ -354,6 +355,7 @@ void test('retains unresolved and unexpired strict failure evidence in PostgreSQ
 
     const result = await purgeExpiredFoundationData(pool);
 
+    assert.equal(result.websocketHealthEvidence, 0);
     assert.equal(result.listenerStrictCatchUpFailures, 1);
     assert.deepEqual((await pool.query(`SELECT failure_id FROM listener_strict_catch_up_failures
       ORDER BY failure_id`)).rows, [
@@ -367,7 +369,7 @@ void test('retains unresolved and unexpired strict failure evidence in PostgreSQ
   }
 });
 
-void test('applies migrations 001-029 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-030 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -383,7 +385,7 @@ void test('applies migrations 001-029 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '029_paper_finality_claim_scheduler.sql');
+    assert.equal(applied.at(-1), '030_listener_websocket_health.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);
@@ -745,6 +747,7 @@ void test('enforces inbox lifecycle checks and terminal-only purge in PostgreSQL
     ), { observedAt: '2099-01-01T00:00:00Z', createdAt: '2099-01-01T00:00:00Z', updatedAt: '2099-01-01T00:00:00Z' }));
 
     const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.websocketHealthEvidence, 0);
     assert.equal(purged.transactionInbox, 2);
     assert.deepEqual((await pool.query<{ readonly signature: string }>(
       'SELECT signature FROM chain_transaction_inbox ORDER BY signature',

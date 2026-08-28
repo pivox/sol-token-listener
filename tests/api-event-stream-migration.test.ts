@@ -142,6 +142,7 @@ void test('la purge retourne le compteur agrégé de l’outbox, pas le rowCount
   const result = await purgeExpiredFoundationData(pool);
 
   assert.equal(result.apiEventStream, 7);
+  assert.equal(result.websocketHealthEvidence, 0);
   assert.ok(queries.some((query) => query.includes('RETURNING sequence')));
   assert.deepEqual(queries.slice(-1), ['COMMIT']);
 });
@@ -177,6 +178,7 @@ void test('la purge retire les projections participants expirées avant leurs é
 
   const result = await purgeExpiredFoundationData(pool);
 
+  assert.equal(result.websocketHealthEvidence, 0);
   assert.equal(result.creatorProfiles, 1);
   assert.equal(result.observedWalletPositions, 2);
   assert.equal(result.holderSnapshots, 1);
@@ -277,6 +279,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '027_listener_provider_affine_finality.sql',
       '028_paper_finality_replay_evidence.sql',
       '029_paper_finality_claim_scheduler.sql',
+      '030_listener_websocket_health.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(
@@ -453,6 +456,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
 
     const partialPurge = await purgeExpiredFoundationData(pool);
     assert.equal(partialPurge.apiEventStream, 2);
+    assert.equal(partialPurge.websocketHealthEvidence, 0);
     assert.equal((await pool.query(
       `SELECT 1 FROM api_event_stream
        WHERE domain_event_id IN ('purge-prefix-first', 'purge-prefix-second')`,
@@ -470,6 +474,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
     assert.equal(stateAfterPartialPurge?.backfill_completed, stateBeforePurge?.backfill_completed);
     const emptyPurge = await purgeExpiredFoundationData(pool);
     assert.equal(emptyPurge.apiEventStream, 0);
+    assert.equal(emptyPurge.websocketHealthEvidence, 0);
     assert.deepEqual((await pool.query(
       `SELECT backfill_completed, expired_through_sequence, last_sequence
        FROM api_event_stream_state WHERE id = 1`,
@@ -522,6 +527,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
     );
     const totalPurge = await purgeExpiredFoundationData(pool);
     assert.equal(totalPurge.apiEventStream, Number(visibleBeforeTotalPurge));
+    assert.equal(totalPurge.websocketHealthEvidence, 0);
     assert.equal((await pool.query('SELECT 1 FROM api_event_stream')).rowCount, 0);
     const stateAfterTotalPurge = (await pool.query<{
       readonly backfill_completed: boolean;

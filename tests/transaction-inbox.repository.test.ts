@@ -1175,6 +1175,7 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
            1, 1, 1, 500, 'LOCAL_CLI', recovered_at + INTERVAL '4 hours'
     FROM recovery_clock`);
     const firstPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(firstPurge.websocketHealthEvidence, 0);
     assert.equal(firstPurge.transactionInbox, 2);
     assert.equal(firstPurge.transactionInboxRecoveries, 0);
     assert.equal((await pool.query("SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature = 'keep-me'")).rows[0]?.count, '1');
@@ -1191,6 +1192,7 @@ void test('stores monotonic checkpoints, runtime heartbeats, and purges only ter
           purge_after = TIMESTAMPTZ '2020-01-01T05:00:00Z'
       WHERE signature = 'failed-purge-me'`);
     const secondPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(secondPurge.websocketHealthEvidence, 0);
     assert.equal(secondPurge.transactionInbox, 0);
     assert.equal(secondPurge.transactionInboxRecoveries, 1);
   });

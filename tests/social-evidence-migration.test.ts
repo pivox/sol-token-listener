@@ -93,6 +93,7 @@ void test('purges a complete terminal social graph child-first at its own four-h
 
     const purged = await purgeExpiredFoundationData(pool);
 
+    assert.equal(purged.websocketHealthEvidence, 0);
     assert.deepEqual(await socialCounts(pool), {
       jobs: 0, collections: 0, links: 0, observations: 0, evidence: 0,
     });

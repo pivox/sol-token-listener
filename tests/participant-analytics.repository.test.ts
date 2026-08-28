@@ -181,6 +181,7 @@ void test('rejoue, réconcilie la finalité et rollback atomiquement sur Postgre
           purge_after = NOW() - INTERVAL '1 hour'
       WHERE mint = 'mint'`);
     const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.websocketHealthEvidence, 0);
     assert.equal(purged.creatorProfiles, 1);
     assert.equal(purged.observedWalletPositions, 1);
     assert.ok(purged.holderSnapshots >= 1);

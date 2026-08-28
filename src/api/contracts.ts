@@ -13,6 +13,15 @@ import type { QualificationReasonCode } from '../domain/qualification-reasons.js
 import type { ChainConfirmationStatus } from '../domain/types.js';
 import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
 import type {
+  PublicWebSocketHealthState,
+  WebSocketDisconnectReasonCode,
+  WebSocketHealthPhase,
+  WebSocketHealthSupervision,
+  WebSocketRecoveryReasonCode,
+  WebSocketRecoveryStatus,
+} from '../domain/websocket-health.js';
+import type { RpcProviderId } from '../domain/rpc-provider.js';
+import type {
   CreationExitReason,
   PaperDecisionReasonCode,
   PaperMinimumConfirmation,
@@ -488,6 +497,32 @@ export interface ApiCheckpoints {
   readonly market: string | null;
 }
 
+export interface ApiWebSocketHealth {
+  readonly version: 1;
+  readonly supervision: WebSocketHealthSupervision;
+  readonly state: PublicWebSocketHealthState;
+  readonly phase: WebSocketHealthPhase;
+  readonly providerId: RpcProviderId | null;
+  readonly candidateProviderId: RpcProviderId | null;
+  readonly updatedAt: string | null;
+  readonly heartbeatAt: string | null;
+  readonly acknowledgedAt: string | null;
+  readonly lastObservation: Readonly<{
+    readonly observedAt: string;
+    readonly slot: string;
+  }> | null;
+  readonly disconnect: Readonly<{
+    readonly occurredAt: string;
+    readonly reasonCode: WebSocketDisconnectReasonCode;
+  }> | null;
+  readonly recovery: Readonly<{
+    readonly status: WebSocketRecoveryStatus;
+    readonly startedAt: string | null;
+    readonly completedAt: string | null;
+    readonly reasonCode: WebSocketRecoveryReasonCode | null;
+  }>;
+}
+
 export interface ApiHeartbeat {
   readonly runtimeState?: ListenerRuntimeState | null;
   readonly subscriberState?: ListenerRuntimeState | null;
@@ -502,9 +537,10 @@ export interface ApiHeartbeat {
   readonly lastHttpSlot: string | null;
   readonly lastWebsocketSlot: string | null;
   readonly lastFinalizedSlot: string | null;
-  readonly lastSignature: string | null;
+  readonly lastSignature: null;
   readonly pendingTransactions: number | null;
   readonly activeSessions: number | null;
+  readonly websocket: ApiWebSocketHealth;
 }
 
 export interface ApiSseEvent {

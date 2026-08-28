@@ -668,6 +668,16 @@ function assertProductionCatchUpWiring(source: string): void {
     /(?:strict-catch-up-scanner|strict-catch-up-coordinator|provider-pinned-catch-up-source)/u,
     'Strict catch-up module paths must remain inactive until issue 63.',
   );
+  assert.doesNotMatch(
+    source,
+    /\b(?:openWsProgramSession|PersistentWebSocketHealthReporter)\b/u,
+    'The acknowledged WebSocket supervisor must remain inactive until issue 63.',
+  );
+  assert.doesNotMatch(
+    source,
+    /(?:ws-program-session|websocket-health-reporter)/u,
+    'Inactive WebSocket supervisor modules must not enter the production graph.',
+  );
   assert.match(
     source,
     /import\s*\{[^}]*\bCatchUpScanner\b[^}]*\}\s*from\s*['"]\.\/catch-up-scanner\.js['"]/u,

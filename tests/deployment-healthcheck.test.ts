@@ -330,7 +330,18 @@ function healthResponse(status: 'OK' | 'DEGRADED', postgresql = 'AVAILABLE'): Re
   return new Response(JSON.stringify({
     apiVersion: 'v1',
     meta: { generatedAt: '2026-08-11T00:00:00.000Z', nextCursor: null },
-    data: { status, postgresql: { status: postgresql } },
+    data: {
+      status,
+      postgresql: { status: postgresql },
+      heartbeat: {
+        websocket: {
+          version: 1, supervision: 'INACTIVE', state: 'STOPPED', phase: 'STOPPED',
+          providerId: null, candidateProviderId: null, updatedAt: null, heartbeatAt: null,
+          acknowledgedAt: null, lastObservation: null, disconnect: null,
+          recovery: { status: 'NOT_REQUIRED', startedAt: null, completedAt: null, reasonCode: null },
+        },
+      },
+    },
   }));
 }
 

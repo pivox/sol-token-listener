@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   apiFailureSchema,
   apiHealthEnvelopeSchema,
@@ -128,6 +128,85 @@ describe('frontend-owned API V1 schemas', () => {
       pipeline: { ...health.pipeline, qualification: 'RUNNING' },
       qualification: { currentCount: 3, lastSuccessAt: 'not-a-timestamp' },
     }))).toThrow();
+  });
+
+  it('accepts the complete WebSocket diagnostic and an older backend without it', () => {
+    const current = apiHealthEnvelopeSchema.parse(success(health)).data;
+    expect(current.heartbeat.websocket).toEqual(health.heartbeat.websocket);
+
+    const legacyHeartbeat: Record<string, unknown> = { ...health.heartbeat };
+    delete legacyHeartbeat.websocket;
+    legacyHeartbeat.lastSignature = 'legacy-backend-signature';
+    const legacy = apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: legacyHeartbeat,
+    })).data;
+    expect(legacy.heartbeat.websocket).toBeUndefined();
+  });
+
+  it('keeps hostile additive WebSocket fields opaque in the inferred client contract', () => {
+    const decoded = apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat,
+        websocket: {
+          ...health.heartbeat.websocket,
+          rpcUrl: 'https://secret-rpc.invalid/key',
+          signature: 'secret-signature',
+          ownerGeneration: '9223372036854775807',
+        },
+      },
+    })).data;
+
+    expect(decoded.heartbeat.websocket?.state).toBe('DEGRADED');
+    expectTypeOf(decoded.heartbeat.websocket?.rpcUrl).toEqualTypeOf<unknown>();
+    expectTypeOf(decoded.heartbeat.websocket?.signature).toEqualTypeOf<unknown>();
+    expectTypeOf(decoded.heartbeat.websocket?.ownerGeneration).toEqualTypeOf<unknown>();
+  });
+
+  it('strictly validates every known WebSocket enum, timestamp, and slot', () => {
+    const websocket = health.heartbeat.websocket;
+    const maximumSlot = '9'.repeat(78);
+    const maximum = apiHealthEnvelopeSchema.parse(success({
+      ...health,
+      heartbeat: {
+        ...health.heartbeat,
+        websocket: {
+          ...websocket,
+          lastObservation: { ...websocket.lastObservation, slot: maximumSlot },
+        },
+      },
+    })).data;
+    expect(maximum.heartbeat.websocket?.lastObservation?.slot).toBe(maximumSlot);
+
+    const invalidWebSockets: readonly Record<string, unknown>[] = [
+      { ...websocket, version: 2 },
+      { ...websocket, supervision: 'ENABLED' },
+      { ...websocket, state: 'UNKNOWN' },
+      { ...websocket, phase: 'ROTATING' },
+      { ...websocket, providerId: 'https://secret-rpc.invalid' },
+      { ...websocket, candidateProviderId: 'fallback-99' },
+      { ...websocket, updatedAt: 'today' },
+      { ...websocket, heartbeatAt: 'today' },
+      { ...websocket, acknowledgedAt: 'today' },
+      { ...websocket, lastObservation: { ...websocket.lastObservation, observedAt: 'today' } },
+      { ...websocket, lastObservation: { ...websocket.lastObservation, slot: '-1' } },
+      { ...websocket, lastObservation: { ...websocket.lastObservation, slot: '01' } },
+      { ...websocket, lastObservation: { ...websocket.lastObservation, slot: '9'.repeat(79) } },
+      { ...websocket, disconnect: { ...websocket.disconnect, occurredAt: 'today' } },
+      { ...websocket, disconnect: { ...websocket.disconnect, reasonCode: 'RAW_REMOTE_REASON' } },
+      { ...websocket, recovery: { ...websocket.recovery, status: 'DONE' } },
+      { ...websocket, recovery: { ...websocket.recovery, startedAt: 'today' } },
+      { ...websocket, recovery: { ...websocket.recovery, completedAt: 'today' } },
+      { ...websocket, recovery: { ...websocket.recovery, reasonCode: 'STACK_TRACE' } },
+    ];
+
+    for (const invalidWebsocket of invalidWebSockets) {
+      expect(() => apiHealthEnvelopeSchema.parse(success({
+        ...health,
+        heartbeat: { ...health.heartbeat, websocket: invalidWebsocket },
+      }))).toThrow();
+    }
   });
 
   it('accepts stable public failures and rejects leaked fields', () => {

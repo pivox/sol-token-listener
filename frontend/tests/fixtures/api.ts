@@ -259,7 +259,28 @@ export const health = {
     workerState: 'RUNNING', reconcilerState: 'RUNNING', backlogCount: 1,
     leasedCount: 0, exhaustedCount: 0, startedAt: NOW, updatedAt: NOW,
     lastHttpSlot: '100', lastWebsocketSlot: '100', lastFinalizedSlot: '99',
-    lastSignature: 'synthetic-signature', pendingTransactions: 1, activeSessions: 1,
+    lastSignature: null, pendingTransactions: 1, activeSessions: 1,
+    websocket: {
+      version: 1,
+      supervision: 'ACTIVE',
+      state: 'DEGRADED',
+      phase: 'RECOVERING',
+      providerId: 'primary',
+      candidateProviderId: 'fallback-1',
+      updatedAt: '2026-08-11T00:00:01.000Z',
+      heartbeatAt: '2026-08-11T00:00:02.000Z',
+      acknowledgedAt: '2026-08-11T00:00:03.000Z',
+      lastObservation: {
+        observedAt: '2026-08-11T00:00:04.000Z', slot: '900719925474099312345',
+      },
+      disconnect: {
+        occurredAt: '2026-08-11T00:00:05.000Z', reasonCode: 'REMOTE_CLOSE',
+      },
+      recovery: {
+        status: 'IN_PROGRESS', startedAt: '2026-08-11T00:00:06.000Z',
+        completedAt: null, reasonCode: 'SESSION_FAILURE',
+      },
+    },
   },
   lagSlots: '1',
 } as const;

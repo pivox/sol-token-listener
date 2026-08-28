@@ -411,6 +411,42 @@ const paperPositionSchema = z.object({
 }).loose();
 
 const runtimeStateSchema = z.enum(['STARTING', 'RUNNING', 'DEGRADED', 'STOPPING', 'STOPPED']);
+const rpcProviderIdSchema = z.enum(['primary', 'fallback-1', 'fallback-2', 'fallback-3']);
+const websocketSlotSchema = z.string().regex(/^(?:0|[1-9]\d*)$/u).max(78);
+const websocketHealthSchema = z.object({
+  version: z.literal(1),
+  supervision: z.enum(['INACTIVE', 'ACTIVE']),
+  state: z.enum(['STOPPED', 'CONNECTING', 'ACKNOWLEDGED', 'RECOVERING', 'DEGRADED']),
+  phase: z.enum([
+    'STOPPED', 'CONNECTING', 'WAITING_FOR_ACKS', 'ACKNOWLEDGED', 'RECOVERING',
+    'RUNNING', 'DEGRADED', 'UNRECOVERABLE', 'STOPPING',
+  ]),
+  providerId: rpcProviderIdSchema.nullable(),
+  candidateProviderId: rpcProviderIdSchema.nullable(),
+  updatedAt: timestampSchema.nullable(),
+  heartbeatAt: timestampSchema.nullable(),
+  acknowledgedAt: timestampSchema.nullable(),
+  lastObservation: z.object({
+    observedAt: timestampSchema,
+    slot: websocketSlotSchema,
+  }).loose().nullable(),
+  disconnect: z.object({
+    occurredAt: timestampSchema,
+    reasonCode: z.enum([
+      'SETUP_TIMEOUT', 'ABORTED', 'SOCKET_ERROR', 'REMOTE_CLOSE', 'PROTOCOL_INVALID',
+      'NOTIFICATION_FAILED', 'CLEANUP_FAILED', 'UNEXPECTED_RESTART',
+    ]),
+  }).loose().nullable(),
+  recovery: z.object({
+    status: z.enum(['NOT_REQUIRED', 'REQUIRED', 'IN_PROGRESS', 'RECOVERED', 'FAILED']),
+    startedAt: timestampSchema.nullable(),
+    completedAt: timestampSchema.nullable(),
+    reasonCode: z.enum([
+      'STARTUP', 'UNEXPECTED_RESTART', 'SESSION_FAILURE', 'RPC_UNAVAILABLE',
+      'CHECKPOINT_CONFLICT', 'CATCH_UP_WINDOW_EXCEEDED',
+    ]).nullable(),
+  }).loose(),
+}).loose();
 const jobCountsSchema = z.object({
   pendingCount: countSchema,
   leasedCount: countSchema,
@@ -459,6 +495,7 @@ const healthSchema = z.object({
     lastSignature: z.string().nullable(),
     pendingTransactions: countSchema.nullable(),
     activeSessions: countSchema.nullable(),
+    websocket: websocketHealthSchema.optional(),
   }).loose(),
   lagSlots: unsignedIntegerSchema.nullable(),
 }).loose();

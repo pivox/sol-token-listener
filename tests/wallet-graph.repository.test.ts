@@ -165,6 +165,7 @@ void test('replays, revises and dissolves an orphaned cluster atomically', async
           purge_after = NOW() - INTERVAL '1 hour'
       WHERE mint = 'mint'`);
     const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.websocketHealthEvidence, 0);
     assert.equal(purged.walletFundingObservations, 2);
     assert.equal(purged.walletFundingEvidence, 2);
     assert.equal(purged.walletRelationships, 0);

@@ -33,7 +33,10 @@ void test('adds a replay-safe monotone paper finality claim scheduler',async(con
     await seedSource(pool);
     await insertJobs(pool,3);
 
-    assert.deepEqual(await migrateDatabase({pool}),[migrationName]);
+    assert.deepEqual(await migrateDatabase({pool}),[
+      migrationName,
+      '030_listener_websocket_health.sql',
+    ]);
     assert.deepEqual((await pool.query(`SELECT mint,finality_checked_at,
       claim_scan_generation::text AS claim_scan_generation
       FROM paper_decision_jobs ORDER BY created_at,job_id`)).rows,[

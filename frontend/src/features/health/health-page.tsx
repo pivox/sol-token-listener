@@ -25,6 +25,7 @@ export function HealthPage(): ReactNode {
         <HealthCard title="Décisions paper"><JobCounts value={health.paperDecisionJobs} /><p>Dernier succès : <Timestamp value={health.paperDecisionJobs.lastSuccessAt} /></p><p>Dernière erreur : <code>{health.paperDecisionJobs.lastErrorCode ?? 'Aucune'}</code></p></HealthCard>
         <HealthCard title="Qualification"><p>Rapports courants : {health.qualification.currentCount}</p><p>Dernier succès : <Timestamp value={health.qualification.lastSuccessAt} /></p></HealthCard>
         <HealthCard title="Heartbeat"><p>Runtime : {health.heartbeat.runtimeState ?? 'Indisponible'}</p><p>Backlog : {health.heartbeat.backlogCount ?? 'Indisponible'} ; épuisés : {health.heartbeat.exhaustedCount ?? 'Indisponible'}</p><p>Dernier slot finalisé : {health.heartbeat.lastFinalizedSlot ?? 'Indisponible'}</p></HealthCard>
+        <HealthCard title="WebSocket Solana"><WebSocketDiagnostic websocket={health.heartbeat.websocket} /></HealthCard>
         <HealthCard title="Checkpoints"><p>Launchpad : {health.checkpoints.launchpad ?? 'Indisponible'}</p><p>Marché : {health.checkpoints.market ?? 'Indisponible'}</p><p>Retard : {health.lagSlots ?? 'Indisponible'} slot(s)</p></HealthCard>
       </div>
     </section>
@@ -37,6 +38,34 @@ function HealthCard({ title, children }: { readonly title: string; readonly chil
 
 function PipelineRows({ health }: { readonly health: ApiHealth }): ReactNode {
   return <><p>Pompe Pump.fun : <span aria-label={`Pump.fun : ${health.pipeline.pumpfun}`}>{health.pipeline.pumpfun}</span></p><p>Pool PumpSwap : {health.pipeline.pumpswap}</p><p>Paper decision : <span aria-label={`Paper decision : ${health.pipeline.paperDecision}`}>{health.pipeline.paperDecision}</span></p><p>Qualification : <span aria-label={`Qualification : ${health.pipeline.qualification}`}>{health.pipeline.qualification}</span></p><p>Social : {health.pipeline.social}</p></>;
+}
+
+function WebSocketDiagnostic({
+  websocket,
+}: {
+  readonly websocket: ApiHealth['heartbeat']['websocket'];
+}): ReactNode {
+  if (websocket === undefined) return <p>Non disponible — backend antérieur</p>;
+  return <>
+    <p>Supervision : {websocket.supervision}</p>
+    <p>État public : {websocket.state}</p>
+    <p>Phase détaillée : {websocket.phase}</p>
+    <p>Fournisseur actif : {websocket.providerId ?? 'Indisponible'}</p>
+    <p>Fournisseur candidat : {websocket.candidateProviderId ?? 'Indisponible'}</p>
+    <p>Mis à jour : <Timestamp value={websocket.updatedAt} /></p>
+    <p>Heartbeat WebSocket : <Timestamp value={websocket.heartbeatAt} /></p>
+    <p>ACK : <Timestamp value={websocket.acknowledgedAt} /></p>
+    {websocket.lastObservation === null
+      ? <p>Watermark diagnostic — pas une preuve de continuité : Indisponible</p>
+      : <p>Watermark diagnostic — pas une preuve de continuité : <code className="text-break">{websocket.lastObservation.slot}</code> — <Timestamp value={websocket.lastObservation.observedAt} /></p>}
+    {websocket.disconnect === null
+      ? <p>Déconnexion : Aucune</p>
+      : <p>Déconnexion : {websocket.disconnect.reasonCode} — <Timestamp value={websocket.disconnect.occurredAt} /></p>}
+    <p>Récupération : {websocket.recovery.status}</p>
+    <p>Motif de récupération : {websocket.recovery.reasonCode ?? 'Aucun'}</p>
+    <p>Début de récupération : <Timestamp value={websocket.recovery.startedAt} /></p>
+    <p>Fin de récupération : <Timestamp value={websocket.recovery.completedAt} /></p>
+  </>;
 }
 
 function JobCounts({ value }: { readonly value: { readonly pendingCount: number; readonly leasedCount: number; readonly retryableFailedCount: number; readonly exhaustedCount: number } }): ReactNode {
