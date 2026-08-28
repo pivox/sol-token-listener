@@ -3,8 +3,16 @@
 Date: 2026-08-28
 Issue: #63
 Parent issue: #57
-Version: 1.0.0
+Version: 1.0.1
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.1 makes the delayed activation path as strict as the former paper
+startup barrier. Paper readiness now requires both a running promoted
+WebSocket provider and a successful current finality pass, with a fence before
+claim and every durable paper mutation. It also serializes supervisor cleanup
+before downstream workers, defines candidate completion versus promotion,
+retains only a surviving incumbent in `UNRECOVERABLE`, and keeps the genesis
+hash optional in deployment wiring only when the listener is disabled.
 
 ## Purpose
 
@@ -95,10 +103,11 @@ Activation also makes the primary HTTP/WS pair strict even without fallbacks:
 - validation failures name configuration fields only and never include a URL,
   hostname, query, header or supplied hash.
 
-The hash is present as a blank value in safe examples and as a required
-deployment variable. Operations documentation obtains and independently
-verifies it; examples must not pretend that a placeholder is a real cluster
-hash.
+The hash is present as a blank value in safe examples. Compose passes it with
+an empty default so listener-disabled smoke and migration jobs remain valid;
+application validation makes it mandatory only when the listener is active.
+Operations documentation obtains and independently verifies it; examples must
+not pretend that a placeholder is a real cluster hash.
 
 ## Supervisor contract
 
@@ -170,8 +179,9 @@ For a fresh process:
    HTTP provider.
 8. Only a successful scan, including every enqueue and required checkpoint
    CAS, permits the candidate-to-active `RUNNING/RECOVERED` transition.
-9. That durable transition is the promotion linearization point. The promoted
-   provider selector is updated immediately afterward.
+9. A serialized local promotion fence orders lifecycle events before the
+   transition is sent. The successful durable transition is the publication
+   point, and the promoted provider selector is updated immediately afterward.
 10. Any incumbent is detached and then closed. Its late completion cannot
     modify the promoted generation.
 
@@ -226,8 +236,12 @@ automatic rotation and remains fail-closed until process restart or later
 operator-controlled recovery work. Restart always re-enters dual ACK and
 strict catch-up; it never selects `live-edge`.
 
-The incumbent may continue adding idempotent observations while health is
-degraded, but qualification and paper entry are not authorized by this state.
+Before persisting `UNRECOVERABLE`, the last candidate is closed and removed.
+A genuinely surviving incumbent remains as the snapshot's active pair and may
+continue adding idempotent observations; an already completed incumbent is
+closed and removed. No setup, backoff, periodic or recovery timer remains
+armed. Qualification may retain observational evidence, but paper readiness is
+false and no paper position mutation is authorized.
 
 ## Cooperative scan cancellation
 
@@ -262,18 +276,32 @@ switches provider mid-run. Before first promotion it throws one fixed redacted
 unavailable result.
 
 The recurring finality controller retries initial unavailability in both
-observe and paper modes instead of terminating the process. Existing orphan
-proof rules remain unchanged: same-provider missing sequence, higher finalized
-root, canonical finalized block and transactional generation precondition.
+observe and paper modes instead of terminating the process. It exposes a
+read-only readiness bit that becomes true only after a coherent pass succeeds,
+returns false again whenever the controller is degraded, and never substitutes
+an earlier provider's success for the current promoted provider. This replaces
+the issue #61 paper startup barrier with an equally strict dynamic barrier that
+can coexist with an observable background WebSocket activation. Existing
+orphan proof rules remain unchanged: same-provider missing sequence, higher
+finalized root, canonical finalized block and transactional generation
+precondition.
 
 ## Paper safety while degraded
 
-The paper worker receives an injected readiness predicate from the supervisor.
-When execution mode is `paper` and the supervisor is not `RUNNING`, it does not
-claim a new decision job or mutate a paper position. It remains scheduled and
-self-resumes after promotion. Observe mode continues projections without
-creating paper actions. This is an additional simulation safety gate; it does
-not add an execution capability.
+The paper worker receives one injected readiness predicate that is true only
+when the supervisor is `RUNNING`, a provider is promoted, and the current
+finality controller has completed a successful pass. The worker checks this
+fence before manual-kill-switch wake-up, before claim, after every awaited
+external operation that can cross a health transition, and immediately before
+each decision, session, trade or position write. If readiness is lost after a
+claim, only bounded lease release/retry bookkeeping may be persisted; no new
+paper decision or position mutation is allowed.
+
+The worker remains scheduled and self-resumes only after the joint predicate
+becomes true. Observe mode continues read projections without creating paper
+actions. This dynamic barrier preserves and strengthens the issue #61 rule
+that paper effects require a successful initial finality pass; it does not add
+an execution capability.
 
 ## Runtime and shutdown ordering
 
@@ -289,16 +317,29 @@ supervisor.start (durable owner first, recovery loop armed)
   -> public API created by runApplication
 ```
 
-Shutdown wins every race. The runtime first closes the supervisor so it stops
-accepting, aborts setup/backoff/scan and drains both native sessions. It then
-drains workers and controllers within the existing global deadline. The
-reporter owns `STOPPING`, bounded session cleanup and the final `STOPPED` or
-explicit failed-cleanup transition.
+Shutdown wins every race. The runtime first awaits supervisor close to stop
+acceptance, abort setup/backoff/scan and drain both native sessions. Only after
+that settlement does it close paper, social and finality producers, then drain
+the inbox worker, and finally stop the generic heartbeat. Every stage consumes
+the same global deadline; the runtime does not reintroduce parallel
+producer/consumer close.
+The reporter owns `STOPPING`, bounded session cleanup and the final `STOPPED`
+or explicit failed-cleanup transition.
 
 `close()` is idempotent. Old timer, callback and completion generations cannot
 restart recovery or alter health. A scheduler, transition, touch or cleanup
 failure is redacted, aggregated by the runtime, and leaves state degraded
 rather than inventing a clean stop.
+
+Candidate completion and promotion share one serialized session record. A
+completion processed before the local promotion fence marks that candidate
+invalid, aborts its scan and forbids `RUNNING`. A completion delivered after
+the fence while the PostgreSQL transition is pending is queued, not discarded.
+If the transition commits, the queued completion belongs to the newly active
+session and immediately persists degradation; if the transition fails, the
+candidate never becomes active and the same completion invalidates and closes
+it. No simple invocation is treated as a successful durable promotion, and a
+role-changing candidate completion is never mistaken for a stale generation.
 
 ## Crash and idempotence matrix
 
@@ -352,7 +393,7 @@ The PR must prove:
 - WS/WS/HTTP deduplication;
 - unanimous exact-frontier `UNRECOVERABLE` and mixed-cycle degradation;
 - periodic scan serialization and provider-pinned finality selection;
-- paper claim suppression outside `RUNNING`;
+- joint WebSocket/finality paper fences before claim and every paper mutation;
 - active API/deployment health, redaction and four-hour retention;
 - absence of wallet, signer, transaction construction, simulation submission
   and transaction submission from the complete production import graph.

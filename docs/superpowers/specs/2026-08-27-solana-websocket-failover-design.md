@@ -3,8 +3,14 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.4.0
+Version: 1.4.1
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.4.1 aligns issue #63 with dedicated activation design version
+1.0.1 and provider-affine finality design version 1.0.9. Delayed observable
+activation preserves paper safety through a joint current WS/finality fence,
+serializes producer cleanup, arbitrates candidate completion and defines the
+session resources retained by an unrecoverable frontier.
 
 Revision 1.4.0 specifies issue #63 through the dedicated WebSocket supervisor
 activation design version 1.0.0. Production acquires its durable owner before

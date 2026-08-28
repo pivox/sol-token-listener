@@ -3,8 +3,15 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.8
+Version: 1.0.9
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.9 adapts the paper activation barrier to issue #63's observable
+background WebSocket recovery. The recurring controller may retry initial
+unavailability in both modes, but paper readiness is false until a coherent
+pass on the currently promoted provider succeeds and becomes false again on
+degradation. The paper worker fences claim and every durable effect with this
+joint WS/finality readiness, preserving the original fail-closed guarantee.
 
 Revision 1.0.8 retains every raw predecessor through the source cursor,
 including orphaned rows whose replay pipeline has not completed. Migration 028
@@ -469,18 +476,21 @@ Issue #63 will provide the active promoted provider to `openPass`. It must not
 reintroduce the general request-level failover client at this boundary. Until
 then, primary finality unavailability never causes cross-provider orphaning.
 `RecurringFinalityReconciler` defaults to
-`initialFailureMode: 'FAIL_START'`. Production selects `DEGRADED_RETRY` only
-for `executionMode === 'observe'`: the first failure resolves startup in
-`DEGRADED`, schedules exactly one normal interval, and a successful fresh pass
-restores `RUNNING`. Paper mode selects `FAIL_START`: the first failure is
-rethrown and no interval is scheduled. The listener starts the reconciler
-after the inbox worker but before the paper and social workers, so paper cannot
-schedule its immediate run while initial finality is pending. On initial
-failure the paper worker was never started and therefore needs no compensating
-close; only earlier subscriber/inbox resources are rolled back. In observe
-mode, `DEGRADED_RETRY` resolves the initial call before later workers start, so
-observe keeps its retry behavior. Scheduled failures after a successful start
-remain `DEGRADED` and retry on the next normal interval.
+`initialFailureMode: 'FAIL_START'` for isolated callers. Issue #63 production
+selects `DEGRADED_RETRY` in both modes so the public API can expose background
+provider activation: the first failure resolves startup in `DEGRADED`,
+schedules exactly one normal interval, and a successful fresh pass restores
+`RUNNING`. The controller exposes current readiness only after such a pass and
+clears it on every later failure or provider-unavailable result.
+
+The listener still starts the reconciler after the inbox worker and before the
+paper and social workers. Paper no longer relies only on start ordering: its
+joint readiness requires a running promoted WebSocket provider and current
+finality readiness before claim, after awaited external work, and immediately
+before every durable paper effect. Losing readiness after claim permits only
+lease release/retry bookkeeping. This preserves the original paper
+fail-closed activation barrier while allowing the technical health API to stay
+available during recovery.
 
 ## Migration and rollout
 
@@ -569,11 +579,12 @@ advance to 029. No existing transaction, event or projection row is deleted.
 - finalized and orphaned worker replay remains idempotent;
 - every counter reset path clears the provider;
 - full migration runner replay reports no new migration on its second run;
-- observe startup degradation schedules one fresh pass and can recover;
-- initial finality pending prevents `paperWorker.start`, then success releases
-  paper activation;
-- default/paper startup rejects without a schedule, never starts or closes the
-  paper worker, and rolls back only resources started before finality.
+- isolated default `FAIL_START` still rejects without scheduling a retry;
+- issue #63 production degradation in either mode schedules one fresh pass and
+  can recover on the provider promoted at that pass;
+- pending or later degraded finality keeps joint paper readiness false before
+  claim and every durable paper mutation, then a current successful pass
+  releases paper activation.
 
 ### Delivery gates
 
