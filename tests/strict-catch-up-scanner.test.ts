@@ -26,6 +26,7 @@ import {
   StrictCatchUpScanner,
   StrictCatchUpScannerError,
   StrictCatchUpWindowExceededError,
+  type StrictCatchUpBoundaries,
   type StrictCatchUpSource,
 } from '../src/application/strict-catch-up-scanner.js';
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
@@ -238,6 +239,75 @@ void test('compares private exact window frontiers without enumerating or serial
     'code', 'stage', 'retryable', 'providerId', 'checkpointKey',
   ]);
   assert.doesNotMatch(JSON.stringify(first), /launch-secret|market-secret/u);
+});
+
+void test('rejects a proxy window frontier without invoking any hostile trap', () => {
+  let trapCalls = 0;
+  const frontier = new Proxy({ launchpad: null, market: null }, {
+    get() { trapCalls += 1; throw new Error('proxy-frontier-secret'); },
+    getPrototypeOf() { trapCalls += 1; throw new Error('proxy-frontier-secret'); },
+    ownKeys() { trapCalls += 1; throw new Error('proxy-frontier-secret'); },
+    getOwnPropertyDescriptor() { trapCalls += 1; throw new Error('proxy-frontier-secret'); },
+  });
+
+  assert.throws(
+    () => new StrictCatchUpWindowExceededError('primary', 'launchpad', frontier),
+    invalidFrontier,
+  );
+  assert.equal(trapCalls, 0);
+});
+
+void test('rejects accessor-backed window frontiers without invoking or retaining their getters', () => {
+  let getterCalls = 0;
+  const frontier = {};
+  Object.defineProperties(frontier, {
+    launchpad: {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        Object.defineProperty(frontier, 'market', { value: 'mutated-secret' });
+        throw new Error('accessor-frontier-secret');
+      },
+    },
+    market: {
+      configurable: true,
+      enumerable: true,
+      get() { getterCalls += 1; throw new Error('accessor-frontier-secret'); },
+    },
+  });
+
+  assert.throws(
+    () => new StrictCatchUpWindowExceededError(
+      'primary',
+      'launchpad',
+      frontier as StrictCatchUpBoundaries,
+    ),
+    invalidFrontier,
+  );
+  assert.equal(getterCalls, 0);
+});
+
+void test('rejects non-canonical window frontier containers with a fixed redacted error', () => {
+  const nonEnumerable = Object.defineProperties({}, {
+    launchpad: { enumerable: true, value: null },
+    market: { enumerable: false, value: null },
+  });
+  for (const frontier of [
+    null,
+    [],
+    Object.freeze({ launchpad: null }),
+    Object.freeze({ launchpad: null, market: null, extra: 'container-frontier-secret' }),
+    nonEnumerable,
+  ]) {
+    assert.throws(
+      () => new StrictCatchUpWindowExceededError(
+        'primary',
+        'launchpad',
+        frontier as StrictCatchUpBoundaries,
+      ),
+      invalidFrontier,
+    );
+  }
 });
 
 void test('captures now and both exact checkpoints before the first provider page', async () => {
@@ -836,6 +906,14 @@ function abortedScan(value: unknown): boolean {
   assert.equal(value.name, 'StrictCatchUpAbortedError');
   assert.equal(value.message, 'Strict catch-up scan was aborted.');
   assert.ok(Object.isFrozen(value));
+  return true;
+}
+
+function invalidFrontier(value: unknown): boolean {
+  assert.ok(value instanceof TypeError);
+  assert.equal(value.message, 'Strict catch-up frontier is invalid.');
+  assert.equal(Object.hasOwn(value, 'cause'), false);
+  assert.doesNotMatch(String(value), /secret/u);
   return true;
 }
 

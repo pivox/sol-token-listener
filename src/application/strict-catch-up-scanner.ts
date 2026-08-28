@@ -420,15 +420,30 @@ function assertNotAborted(signal: AbortSignal): void {
   if (signal.aborted) throw new StrictCatchUpAbortedError();
 }
 
-function snapshotBoundaries(value: StrictCatchUpBoundaries): StrictCatchUpBoundaries {
-  return Object.freeze({
-    launchpad: value.launchpad === null
-      ? null
-      : snapshotCheckpoint(value.launchpad, 'launchpad'),
-    market: value.market === null
-      ? null
-      : snapshotCheckpoint(value.market, 'market'),
-  });
+function snapshotBoundaries(value: unknown): StrictCatchUpBoundaries {
+  try {
+    if (typeof value !== 'object' || value === null || isProxy(value) || Array.isArray(value)) {
+      throw new TypeError();
+    }
+    const prototype: object | null = Object.getPrototypeOf(value) as object | null;
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError();
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== 2 || !keys.includes('launchpad') || !keys.includes('market')) {
+      throw new TypeError();
+    }
+    const launchpad = ownData(value, 'launchpad');
+    const market = ownData(value, 'market');
+    return Object.freeze({
+      launchpad: launchpad === null
+        ? null
+        : snapshotCheckpoint(launchpad, 'launchpad'),
+      market: market === null
+        ? null
+        : snapshotCheckpoint(market, 'market'),
+    });
+  } catch {
+    throw new TypeError('Strict catch-up frontier is invalid.');
+  }
 }
 
 function sameCheckpoint(
