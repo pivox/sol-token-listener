@@ -1,5 +1,5 @@
 import { Connection, type Commitment } from '@solana/web3.js';
-import bs58 from 'bs58';
+import { canonicalSolanaGenesisHash } from '../../domain/solana-genesis-hash.js';
 import type { RpcProviderId } from '../../domain/rpc-provider.js';
 import type { CatchUpSource } from '../../ports/catch-up-source.js';
 import {
@@ -20,10 +20,6 @@ export interface ProviderPinnedCatchUpSource extends CatchUpSource {
 interface PinnedCatchUpRpc extends SignaturesForAddressRpc {
   getGenesisHash(): Promise<unknown>;
 }
-
-const BASE58_TEXT = /^[1-9A-HJ-NP-Za-km-z]+$/u;
-const MIN_GENESIS_HASH_LENGTH = 32;
-const MAX_GENESIS_HASH_LENGTH = 44;
 
 export interface ProviderPinnedCatchUpSourceDependencies {
   readonly createRpc?: (httpUrl: string, commitment: Commitment) => unknown;
@@ -51,7 +47,7 @@ export function createProviderPinnedCatchUpSource(
   const exposedProviderId = validProviderId(providerId) ? providerId : null;
   if (!validProviderId(providerId)
     || !validCommitment(commitment)
-    || !canonicalGenesisHash(expectedGenesisHash)) {
+    || !canonicalSolanaGenesisHash(expectedGenesisHash)) {
     throw failure('CONFIG_INVALID', exposedProviderId);
   }
 
@@ -72,7 +68,7 @@ export function createProviderPinnedCatchUpSource(
       } catch {
         throw failure('GENESIS_UNAVAILABLE', providerId);
       }
-      if (!canonicalGenesisHash(actual)) {
+      if (!canonicalSolanaGenesisHash(actual)) {
         throw failure('GENESIS_UNAVAILABLE', providerId);
       }
       if (actual !== expectedGenesisHash) {
@@ -160,19 +156,6 @@ function createPinnedRpc(
 
 function createDefaultRpc(httpUrl: string, commitment: Commitment): Connection {
   return new Connection(httpUrl, { commitment, disableRetryOnRateLimit: true });
-}
-
-function canonicalGenesisHash(value: unknown): value is string {
-  if (typeof value !== 'string'
-    || value.length < MIN_GENESIS_HASH_LENGTH
-    || value.length > MAX_GENESIS_HASH_LENGTH
-    || !BASE58_TEXT.test(value)) return false;
-  try {
-    const decoded = bs58.decode(value);
-    return decoded.length === 32 && bs58.encode(decoded) === value;
-  } catch {
-    return false;
-  }
 }
 
 function validHttpUrl(value: unknown): value is string {

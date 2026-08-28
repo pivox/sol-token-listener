@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { isIP } from 'node:net';
+import { requireSolanaGenesisHash } from '../domain/solana-genesis-hash.js';
 import { MAX_API_PAGE_LIMIT } from '../ports/api-projection-repository.js';
 
 const DEFAULT_WSOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -49,6 +50,7 @@ export interface AppConfig {
   readonly qualificationMinimumScore: number | null;
   readonly dataRetentionHours: number;
   readonly listenerEnabled: boolean;
+  readonly expectedGenesisHash: string | null;
   readonly listenerWorkerLeaseSeconds: number;
   readonly listenerCatchUpPolicy: ListenerCatchUpPolicy;
   readonly listenerCatchUpMaxPages: number;
@@ -154,6 +156,12 @@ export function parseTransactionInboxRetryPolicy(
 export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, string | undefined>): AppConfig {
   rejectPrivateKeyConfiguration(environment);
 
+  const listenerEnabled = parseBoolean(environment.LISTENER_ENABLED, true, 'LISTENER_ENABLED');
+  const expectedGenesisHash = requireSolanaGenesisHash(
+    environment.SOLANA_EXPECTED_GENESIS_HASH,
+    listenerEnabled,
+  );
+
   const executionMode = parseExecutionMode(environment.EXECUTION_MODE);
   const dashboardActionsEnabled = parseBoolean(environment.DASHBOARD_ACTIONS_ENABLED, false, 'DASHBOARD_ACTIONS_ENABLED');
   if (dashboardActionsEnabled) {
@@ -220,7 +228,8 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
       100,
     ),
     dataRetentionHours: parseInteger(environment.DATA_RETENTION_HOURS, 4, 'DATA_RETENTION_HOURS', 1, 168),
-    listenerEnabled: parseBoolean(environment.LISTENER_ENABLED, true, 'LISTENER_ENABLED'),
+    listenerEnabled,
+    expectedGenesisHash,
     listenerWorkerLeaseSeconds: parseInteger(
       environment.LISTENER_WORKER_LEASE_SECONDS, 120, 'LISTENER_WORKER_LEASE_SECONDS', 30, 900,
     ),

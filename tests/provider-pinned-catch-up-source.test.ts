@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import bs58 from 'bs58';
+import { canonicalSolanaGenesisHash } from '../src/domain/solana-genesis-hash.js';
 import type { Commitment, PublicKey } from '@solana/web3.js';
 import {
   ProviderPinnedCatchUpSourceError,
@@ -142,6 +143,11 @@ void test('rejects malformed, noncanonical, and non-32-byte expected genesis val
     ), (error: unknown) => invalid(error, 'CONFIG_INVALID', 'primary'));
     assert.equal(resolved, 0);
   }
+});
+
+void test('uses the shared canonical genesis validator for the configured expected hash', () => {
+  assert.equal(canonicalSolanaGenesisHash(EXPECTED_GENESIS), true);
+  assert.equal(canonicalSolanaGenesisHash(`${EXPECTED_GENESIS.slice(0, -1)}0`), false);
 });
 
 void test('rejects oversized and forbidden expected hashes before base58 decoding', () => {

@@ -10,23 +10,59 @@ void test('re-exports the canonical neutral RPC provider identity', () => {
   assert.equal(catalogProvider, 'fallback-2');
 });
 
-void test('keeps only the primary pair when issue 56 HTTP-only fallbacks are configured', () => {
+void test('keeps only a strict primary pair when HTTP-only fallbacks are configured', () => {
   const catalog = createRpcProviderCatalog({
-    httpRpcUrl: 'https://primary.invalid/rpc#legacy-primary',
+    httpRpcUrl: 'https://primary.invalid/rpc',
     httpRpcFallbackUrls: Object.freeze(['https://http-only.invalid/rpc']),
-    wsRpcUrl: 'wss://primary.invalid/rpc#legacy-primary',
+    wsRpcUrl: 'wss://primary.invalid/rpc',
     wsRpcFallbackUrls: Object.freeze([]),
   });
 
   assert.deepEqual(catalog.ids, ['primary']);
   assert.deepEqual(catalog.resolve('primary'), {
     id: 'primary',
-    httpUrl: 'https://primary.invalid/rpc#legacy-primary',
-    websocketUrl: 'wss://primary.invalid/rpc#legacy-primary',
+    httpUrl: 'https://primary.invalid/rpc',
+    websocketUrl: 'wss://primary.invalid/rpc',
   });
   assert.equal(Object.isFrozen(catalog), true);
   assert.equal(Object.isFrozen(catalog.ids), true);
   assert.equal(Object.isFrozen(catalog.resolve('primary')), true);
+});
+
+void test('accepts strict primary-only HTTPS/WSS and HTTP/WS pairs', () => {
+  for (const [httpRpcUrl, wsRpcUrl] of [
+    ['https://primary.invalid/rpc', 'wss://primary.invalid/rpc'],
+    ['http://primary.invalid/rpc', 'ws://primary.invalid/rpc'],
+  ] as const) {
+    const catalog = createRpcProviderCatalog({
+      httpRpcUrl,
+      httpRpcFallbackUrls: Object.freeze([]),
+      wsRpcUrl,
+      wsRpcFallbackUrls: Object.freeze([]),
+    });
+    assert.deepEqual(catalog.ids, ['primary']);
+  }
+});
+
+void test('rejects non-strict or fragmented primary-only endpoint pairs without leaking URLs', () => {
+  const secret = 'primary-secret.invalid/rpc#fragment';
+  for (const [httpRpcUrl, wsRpcUrl] of [
+    ['https://primary.invalid/rpc', 'ws://primary.invalid/rpc'],
+    ['http://primary.invalid/rpc', 'wss://primary.invalid/rpc'],
+    [`https://${secret}`, `wss://${secret}`],
+  ] as const) {
+    assert.throws(() => createRpcProviderCatalog({
+      httpRpcUrl,
+      httpRpcFallbackUrls: Object.freeze([]),
+      wsRpcUrl,
+      wsRpcFallbackUrls: Object.freeze([]),
+    }), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message, 'RPC provider catalog is invalid.');
+      assert.doesNotMatch(String(error), /primary-secret|fragment|invalid\/rpc/i);
+      return true;
+    });
+  }
 });
 
 void test('creates frozen positional provider pairs without deriving public identities from URLs', () => {
