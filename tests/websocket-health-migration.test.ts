@@ -91,6 +91,27 @@ void test('websocket health migration applies on an empty schema and records mig
   });
 });
 
+void test('websocket health migration accepts scale-bearing mathematical integers', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: websocket health migration test skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'websocket_health_integral_slots', async (pool) => {
+    await migrateDatabase({ pool });
+    await pool.query(activeSessionRow('integral-slot', 'RUNNING', recoveryNotRequired()));
+
+    for (const slot of ['1.0', '0.00'] as const) {
+      const result = await pool.query(`UPDATE listener_websocket_health
+        SET last_observation_at = clock_timestamp(), last_observation_slot = $1::NUMERIC
+        WHERE service_key = 'valid-integral-slot'
+        RETURNING last_observation_slot::TEXT`, [slot]);
+      assert.equal(result.rows[0]?.last_observation_slot, slot);
+    }
+  });
+});
+
 void test('websocket health migration enforces every durable lifecycle invariant', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -102,45 +123,63 @@ void test('websocket health migration enforces every durable lifecycle invariant
     await migrateDatabase({ pool });
 
     const invalidUpdates = [
-      "provider_id = 'fallback-4', active_session_generation = 1, supervision = 'ACTIVE', owner_generation = 1, phase = 'DEGRADED'",
-      "supervision = 'ACTIVE', owner_generation = 1, phase = 'DEGRADED', provider_id = 'primary'",
-      "supervision = 'ACTIVE', owner_generation = 1, phase = 'DEGRADED', candidate_session_generation = 1",
-      "supervision = 'ACTIVE', owner_generation = 1, phase = 'DEGRADED', provider_id = 'primary', active_session_generation = 1, candidate_provider_id = 'fallback-1', candidate_session_generation = 1",
-      "last_observation_at = clock_timestamp(), last_observation_slot = NULL",
-      "last_observation_at = NULL, last_observation_slot = 1",
-      "last_observation_at = clock_timestamp(), last_observation_slot = 'NaN'::NUMERIC",
-      "last_observation_at = clock_timestamp(), last_observation_slot = -1",
-      "last_observation_at = clock_timestamp(), last_observation_slot = 1.5",
-      "last_observation_at = clock_timestamp(), last_observation_slot = 1e78",
-      "disconnect_occurred_at = clock_timestamp(), disconnect_reason_code = NULL",
-      "disconnect_occurred_at = NULL, disconnect_reason_code = 'SOCKET_ERROR'",
-      "recovery_status = 'RECOVERED', recovery_started_at = clock_timestamp(), recovery_completed_at = clock_timestamp() - INTERVAL '1 second', recovery_reason_code = 'STARTUP'",
-      "supervision = 'ACTIVE', owner_generation = 1, phase = 'CONNECTING'",
-      "supervision = 'ACTIVE', owner_generation = 1, phase = 'RUNNING', candidate_provider_id = 'primary', candidate_session_generation = 1, acknowledged_at = clock_timestamp()",
-      "supervision = 'INACTIVE', owner_generation = 1",
-      "revision = 1",
-      "last_observation_at = clock_timestamp(), last_observation_slot = 1",
-      "disconnect_occurred_at = clock_timestamp(), disconnect_reason_code = 'SOCKET_ERROR'",
-      "heartbeat_at = clock_timestamp()",
-      "evidence_purge_after = clock_timestamp()",
-      "supervision = 'ACTIVE', owner_generation = 1, phase = 'DEGRADED', acknowledged_at = clock_timestamp()",
-      "owner_generation = -1",
-      "revision = -1",
-      "payload_version = 2",
-      "supervision = 'UNKNOWN'",
-      "phase = 'UNKNOWN'",
-      "recovery_status = 'UNKNOWN'",
-      "recovery_status = 'REQUIRED', recovery_reason_code = 'UNKNOWN'",
-      "disconnect_occurred_at = clock_timestamp(), disconnect_reason_code = 'UNKNOWN'",
-      "acknowledged_at = 'infinity'::TIMESTAMPTZ",
-      "updated_at = 'infinity'::TIMESTAMPTZ",
-      "heartbeat_at = '-infinity'::TIMESTAMPTZ",
-      "evidence_purge_after = 'infinity'::TIMESTAMPTZ",
+      constraintCase('payload_version_check', 'payload_version = 2'),
+      constraintCase('supervision_check', "supervision = 'UNKNOWN', phase = 'STOPPED'"),
+      constraintCase('owner_generation_check', 'owner_generation = 0'),
+      constraintCase('revision_check', 'revision = -1'),
+      constraintCase('session_generation_check', "provider_id = 'primary', active_session_generation = 0"),
+      constraintCase('provider_check', "provider_id = 'fallback-4', active_session_generation = 1"),
+      constraintCase('session_pair_check', "provider_id = 'primary'"),
+      constraintCase(
+        'distinct_sessions_check',
+        "provider_id = 'primary', active_session_generation = 1, candidate_provider_id = 'fallback-1', candidate_session_generation = 1",
+      ),
+      constraintCase('phase_check', "phase = 'UNKNOWN'"),
+      constraintCase(
+        'acknowledged_at_check',
+        "provider_id = 'primary', active_session_generation = 1, acknowledged_at = 'infinity'::TIMESTAMPTZ",
+      ),
+      constraintCase('observation_check', 'last_observation_at = clock_timestamp(), last_observation_slot = NULL'),
+      constraintCase('observation_check', 'last_observation_at = NULL, last_observation_slot = 1'),
+      constraintCase('observation_check', "last_observation_at = clock_timestamp(), last_observation_slot = 'NaN'::NUMERIC"),
+      constraintCase('observation_check', 'last_observation_at = clock_timestamp(), last_observation_slot = -1'),
+      constraintCase('observation_check', 'last_observation_at = clock_timestamp(), last_observation_slot = 1.5'),
+      constraintCase('observation_check', 'last_observation_at = clock_timestamp(), last_observation_slot = 1e78'),
+      constraintCase('observation_check', "last_observation_at = 'infinity'::TIMESTAMPTZ, last_observation_slot = 1"),
+      constraintCase('disconnect_check', 'disconnect_occurred_at = clock_timestamp(), disconnect_reason_code = NULL'),
+      constraintCase('disconnect_check', "disconnect_occurred_at = NULL, disconnect_reason_code = 'SOCKET_ERROR'"),
+      constraintCase('disconnect_check', "disconnect_occurred_at = clock_timestamp(), disconnect_reason_code = 'UNKNOWN'"),
+      constraintCase('disconnect_check', "disconnect_occurred_at = 'infinity'::TIMESTAMPTZ, disconnect_reason_code = 'SOCKET_ERROR'"),
+      constraintCase('recovery_status_check', "recovery_status = 'UNKNOWN'"),
+      constraintCase('recovery_reason_check', "recovery_status = 'REQUIRED', recovery_reason_code = 'UNKNOWN'"),
+      constraintCase(
+        'recovery_timestamp_check',
+        "recovery_status = 'RECOVERED', recovery_started_at = clock_timestamp(), recovery_completed_at = clock_timestamp() - INTERVAL '1 second', recovery_reason_code = 'STARTUP'",
+      ),
+      constraintCase(
+        'recovery_lifecycle_check',
+        "recovery_status = 'REQUIRED', recovery_started_at = clock_timestamp(), recovery_reason_code = 'STARTUP'",
+      ),
+      constraintCase('heartbeat_at_check', "heartbeat_at = '-infinity'::TIMESTAMPTZ"),
+      constraintCase('updated_at_check', "updated_at = 'infinity'::TIMESTAMPTZ"),
+      constraintCase('evidence_purge_after_check', "evidence_purge_after = 'infinity'::TIMESTAMPTZ"),
+      constraintCase(
+        'inactive_check',
+        "supervision = 'INACTIVE', owner_generation = 0, phase = 'STOPPED', revision = 1",
+      ),
+      constraintCase('phase_session_check', "phase = 'CONNECTING'"),
     ] as const;
-    for (const assignment of invalidUpdates) {
+    for (const [index, { assignment, constraint }] of invalidUpdates.entries()) {
+      const serviceKey = `valid-constraint-${index}`;
+      await pool.query(activeRow(`constraint-${index}`, 'DEGRADED', recoveryNotRequired()));
       await assert.rejects(
-        pool.query(`UPDATE listener_websocket_health SET ${assignment} WHERE service_key = 'transaction-listener'`),
-        /listener_websocket_health_/u,
+        pool.query(`UPDATE listener_websocket_health SET ${assignment} WHERE service_key = $1`, [serviceKey]),
+        (error: unknown) => {
+          assert.ok(error instanceof pg.DatabaseError);
+          assert.equal(error.code, '23514');
+          assert.equal(error.constraint, constraint);
+          return true;
+        },
         assignment,
       );
     }
@@ -163,7 +202,9 @@ void test('websocket health migration enforces every durable lifecycle invariant
           last_observation_slot = 999999999999999999999999999999999999999999999999999999999999999999999999999999
       WHERE service_key = 'valid-running'`);
     assert.deepEqual(
-      (await pool.query("SELECT phase FROM listener_websocket_health WHERE service_key LIKE 'valid-%' ORDER BY service_key")).rows.map((row) => row.phase).sort(),
+      (await pool.query(`SELECT phase FROM listener_websocket_health
+        WHERE service_key LIKE 'valid-%' AND service_key NOT LIKE 'valid-constraint-%'
+        ORDER BY service_key`)).rows.map((row) => row.phase).sort(),
       ['ACKNOWLEDGED', 'CONNECTING', 'DEGRADED', 'DEGRADED', 'RECOVERING', 'RUNNING', 'STOPPED', 'STOPPING', 'UNRECOVERABLE', 'WAITING_FOR_ACKS'].sort(),
     );
 
@@ -187,6 +228,16 @@ void test('websocket health migration enforces every durable lifecycle invariant
     );
   });
 });
+
+function constraintCase(
+  constraintSuffix: string,
+  assignment: string,
+): Readonly<{ assignment: string; constraint: string }> {
+  return Object.freeze({
+    assignment,
+    constraint: `listener_websocket_health_${constraintSuffix}`,
+  });
+}
 
 function activeRow(serviceKey: string, phase: string, recovery: string): string {
   return `INSERT INTO listener_websocket_health (

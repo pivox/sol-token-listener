@@ -32,10 +32,8 @@ CREATE TABLE IF NOT EXISTS listener_websocket_health (
   ),
   CONSTRAINT listener_websocket_health_owner_generation_check CHECK (
     owner_generation >= 0
-    AND (
-      (supervision = 'INACTIVE' AND owner_generation = 0)
-      OR (supervision = 'ACTIVE' AND owner_generation > 0)
-    )
+    AND (supervision <> 'INACTIVE' OR owner_generation = 0)
+    AND (supervision <> 'ACTIVE' OR owner_generation > 0)
   ),
   CONSTRAINT listener_websocket_health_revision_check CHECK (
     revision >= 0
@@ -77,7 +75,7 @@ CREATE TABLE IF NOT EXISTS listener_websocket_health (
       OR (
         last_observation_slot <> 'NaN'::NUMERIC
         AND last_observation_slot >= 0
-        AND scale(last_observation_slot) = 0
+        AND last_observation_slot = trunc(last_observation_slot)
         AND last_observation_slot < 1e78::NUMERIC
       )
     )
@@ -116,7 +114,8 @@ CREATE TABLE IF NOT EXISTS listener_websocket_health (
     )
   ),
   CONSTRAINT listener_websocket_health_recovery_lifecycle_check CHECK (
-    (
+    recovery_status NOT IN ('NOT_REQUIRED', 'REQUIRED', 'IN_PROGRESS', 'RECOVERED', 'FAILED')
+    OR (
       recovery_status = 'NOT_REQUIRED'
       AND recovery_started_at IS NULL
       AND recovery_completed_at IS NULL
@@ -170,7 +169,11 @@ CREATE TABLE IF NOT EXISTS listener_websocket_health (
     )
   ),
   CONSTRAINT listener_websocket_health_phase_session_check CHECK (
-    (
+    phase NOT IN (
+      'STOPPED', 'CONNECTING', 'WAITING_FOR_ACKS', 'ACKNOWLEDGED',
+      'RECOVERING', 'RUNNING', 'DEGRADED', 'UNRECOVERABLE', 'STOPPING'
+    )
+    OR (
       phase = 'STOPPED'
       AND provider_id IS NULL
       AND active_session_generation IS NULL
