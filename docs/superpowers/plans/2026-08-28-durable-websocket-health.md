@@ -86,7 +86,7 @@ Expected: failure because migration 030 and its table do not exist.
 
 - [x] **Step 3: Add the normalized snapshot and checks**
 
-Create the table with the exact columns from spec v1.0.2. Use unconstrained
+Create the table with the exact columns from spec v1.0.3. Use unconstrained
 `NUMERIC` plus explicit `NaN`, nonnegative, integral and `< 10^78` checks for
 the observation slot, and `BIGINT` for generations/revision. A
 `NUMERIC(78,0)` typmod is forbidden because PostgreSQL rounds fractional input
@@ -697,7 +697,7 @@ generic remote-error serialization.
 
 - [x] **Step 4: Obtain sequential internal reviews**
 
-First request specification compliance against design v1.0.2. After PASS,
+First request specification compliance against design v1.0.3. After PASS,
 request code quality/security/concurrency review. Address Critical/Important
 findings with focused tests and rerun affected gates.
 

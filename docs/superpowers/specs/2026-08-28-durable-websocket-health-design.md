@@ -3,8 +3,19 @@
 Date: 2026-08-28
 Issue: #62
 Parent issue: #57
-Version: 1.0.2
+Version: 1.0.3
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.3 records the reviewed shutdown and restart fences. Lifecycle
+transitions accepted before shutdown are serialized before `STOPPING`, while
+late transitions are rejected. A failed or timed-out heartbeat write never
+prevents bounded session cleanup: successful cleanup persists
+`STOPPED/FAILED` without provider or session ownership, whereas failed cleanup
+persists `DEGRADED/FAILED` with the ownership evidence needed for recovery. A
+`STOPPED` predecessor is clean only when recovery is `NOT_REQUIRED` or
+`RECOVERED`; unresolved stopped evidence restarts immediately through strict
+recovery. Finally, unresolved strict catch-up evidence affects aggregate health
+only while WebSocket supervision is `ACTIVE`.
 
 Revision 1.0.2 records four reviewed implementation semantics. PostgreSQL
 `NUMERIC` observation slots use a dedicated decoder for mathematical integers,
@@ -274,9 +285,12 @@ bounded periodic `touch`, and fences shutdown against an in-flight write. The
 touch cadence is independent from persistence latency: each timer rearms before
 the write, overlapping ticks are serialized, and at most one immediate
 follow-up is coalesced. Transition persistence failure degrades in memory and
-fails closed. Graceful shutdown writes `STOPPING` immediately and `STOPPED` only
-after the caller has drained and closed sessions; cleanup failure remains
-`DEGRADED/CLEANUP_FAILED`.
+fails closed. Graceful shutdown writes `STOPPING` after fencing accepted
+lifecycle transitions and always attempts bounded session cleanup after
+fencing an in-flight touch. It writes `STOPPED` only after the caller has
+drained and closed sessions. A preceding touch failure remains explicit as
+`STOPPED/FAILED/CLEANUP_FAILED`; cleanup failure remains
+`DEGRADED/FAILED/CLEANUP_FAILED`.
 
 The reporter and repository are delivered inactive. They are not constructed
 by `createProductionListenerRuntime`, `runApplication`, or configuration in

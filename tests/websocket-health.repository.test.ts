@@ -103,6 +103,40 @@ void test('websocket health repository schedules stopped evidence retention unle
   });
 });
 
+void test('websocket health repository restarts unresolved STOPPED through recovery without losing diagnostics', async (context) => {
+  await withRepository(context, 'websocket_health_stopped_failed_restart', async ({ repository }) => {
+    const connecting = await repository.beginOwner({ candidateProviderId: 'primary' });
+    assert.equal(await repository.recordObservation({
+      ownerGeneration: connecting.ownerGeneration,
+      sessionGeneration: requiredValue(connecting.candidateSessionGeneration),
+      slot: 88n,
+    }), 'RECORDED');
+    const unresolved = await repository.transition(transitionFrom(await repository.read(), {
+      phase: 'STOPPED',
+      candidateProviderId: null,
+      candidateSessionGeneration: null,
+      disconnectReasonCode: 'CLEANUP_FAILED',
+      recoveryStatus: 'FAILED',
+      recoveryReasonCode: 'SESSION_FAILURE',
+    }));
+
+    const restarted = await repository.beginOwner({ candidateProviderId: 'fallback-1' });
+
+    assert.equal(restarted.ownerGeneration, unresolved.ownerGeneration + 1n);
+    assert.equal(restarted.revision, unresolved.revision + 1n);
+    assert.equal(restarted.phase, 'CONNECTING');
+    assert.equal(restarted.candidateProviderId, 'fallback-1');
+    assert.equal(restarted.candidateSessionGeneration, restarted.ownerGeneration);
+    assert.deepEqual(restarted.lastObservation, unresolved.lastObservation);
+    assert.deepEqual(restarted.disconnect, unresolved.disconnect);
+    assert.deepEqual(restarted.recovery, {
+      status: 'REQUIRED', startedAtMs: null, completedAtMs: null,
+      reasonCode: 'SESSION_FAILURE',
+    });
+    assert.equal(restarted.evidencePurgeAfterMs, null);
+  });
+});
+
 void test('websocket health repository replaces stale active ownership and preserves its diagnostic watermark', async (context) => {
   await withRepository(context, 'websocket_health_stale', async ({ pool, repository }) => {
     const connecting = await repository.beginOwner({ candidateProviderId: 'primary' });

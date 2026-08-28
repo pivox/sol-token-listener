@@ -309,18 +309,14 @@ export class PersistentWebSocketHealthReporter {
       );
     }
 
+    let touchResult: Settlement = 'complete';
     if (pendingTouch !== null) {
-      const touchResult = await settleWithin(
+      touchResult = await settleWithin(
         pendingTouch,
         this.shutdownTimeoutMs,
         this.scheduler,
       );
-      if (touchResult !== 'complete') {
-        this.degraded = true;
-        throw reporterError(
-          touchResult === 'timeout' ? 'SHUTDOWN_TIMEOUT' : 'CLEANUP_FAILED',
-        );
-      }
+      if (touchResult !== 'complete') this.degraded = true;
     }
 
     let cleanupOperation: Promise<void>;
@@ -334,12 +330,13 @@ export class PersistentWebSocketHealthReporter {
       this.shutdownTimeoutMs,
       this.scheduler,
     );
-    if (cleanupResult !== 'complete') {
-      await this.persistCleanupFailure(stoppingResult.value);
-      this.degraded = true;
-      throw reporterError(
-        cleanupResult === 'timeout' ? 'SHUTDOWN_TIMEOUT' : 'CLEANUP_FAILED',
+    if (touchResult !== 'complete' || cleanupResult !== 'complete') {
+      await this.persistShutdownFailure(
+        stoppingResult.value,
+        cleanupResult === 'complete' ? 'STOPPED' : 'DEGRADED',
       );
+      this.degraded = true;
+      throw reporterError(shutdownFailureCode(touchResult, cleanupResult));
     }
 
     const stoppedResult = await this.boundedTransition(
@@ -356,11 +353,14 @@ export class PersistentWebSocketHealthReporter {
     this.degraded = false;
   }
 
-  private async persistCleanupFailure(snapshot: WebSocketHealthSnapshot): Promise<void> {
-    const result = await this.boundedTransition(cleanupFailureTransition(snapshot));
+  private async persistShutdownFailure(
+    snapshot: WebSocketHealthSnapshot,
+    phase: 'STOPPED' | 'DEGRADED',
+  ): Promise<void> {
+    const result = await this.boundedTransition(shutdownFailureTransition(snapshot, phase));
     if (result.kind === 'complete') {
       this.currentSnapshot = result.value;
-      this.currentPhase = 'DEGRADED';
+      this.currentPhase = result.value.phase;
     }
   }
 
@@ -379,6 +379,15 @@ type Settlement = 'complete' | 'failed' | 'timeout';
 type SettledValue<TValue> =
   | Readonly<{ kind: 'complete'; value: TValue }>
   | Readonly<{ kind: 'failed' | 'timeout' }>;
+
+function shutdownFailureCode(
+  touchResult: Settlement,
+  cleanupResult: Settlement,
+): 'SHUTDOWN_TIMEOUT' | 'CLEANUP_FAILED' {
+  return touchResult === 'timeout' || cleanupResult === 'timeout'
+    ? 'SHUTDOWN_TIMEOUT'
+    : 'CLEANUP_FAILED';
+}
 
 async function settleWithin(
   operation: Promise<unknown>,
@@ -444,18 +453,20 @@ function stopTransition(
   });
 }
 
-function cleanupFailureTransition(
+function shutdownFailureTransition(
   snapshot: WebSocketHealthSnapshot,
+  phase: 'STOPPED' | 'DEGRADED',
 ): WebSocketHealthTransition {
+  const stopped = phase === 'STOPPED';
   return Object.freeze({
     ownerGeneration: snapshot.ownerGeneration,
     expectedRevision: snapshot.revision,
-    phase: 'DEGRADED',
-    providerId: snapshot.providerId,
-    activeSessionGeneration: snapshot.activeSessionGeneration,
-    candidateProviderId: snapshot.candidateProviderId,
-    candidateSessionGeneration: snapshot.candidateSessionGeneration,
-    acknowledged: snapshot.acknowledgedAtMs !== null,
+    phase,
+    providerId: stopped ? null : snapshot.providerId,
+    activeSessionGeneration: stopped ? null : snapshot.activeSessionGeneration,
+    candidateProviderId: stopped ? null : snapshot.candidateProviderId,
+    candidateSessionGeneration: stopped ? null : snapshot.candidateSessionGeneration,
+    acknowledged: stopped ? false : snapshot.acknowledgedAtMs !== null,
     disconnectReasonCode: 'CLEANUP_FAILED',
     recoveryStatus: 'FAILED',
     recoveryReasonCode: 'SESSION_FAILURE',

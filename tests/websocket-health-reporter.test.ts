@@ -241,26 +241,33 @@ void test('websocket health reporter bounds stuck cleanup and persists cleanup f
   assert.equal(reporter.stop(async () => undefined), stopping);
 });
 
-void test('websocket health reporter bounds a stuck touch before invoking cleanup', async () => {
+void test('websocket health reporter times out a stuck touch then performs bounded cleanup', async () => {
   const repository = new FakeHealthRepository();
   repository.touchResults.push(new Promise<undefined>(() => undefined));
-  repository.transitionResults.push(Promise.resolve(snapshot('STOPPING', 3n)));
+  repository.transitionResults.push(
+    Promise.resolve(snapshot('STOPPING', 3n)),
+    Promise.resolve(snapshot('STOPPED', 4n, true)),
+  );
   const { reporter, scheduler } = reporterFixture(repository);
   reporter.startTouch(snapshot('RUNNING', 2n));
   scheduler.fireNext(5);
   await flushMicrotasks();
 
   let cleanupCalls = 0;
-  const stopping = reporter.stop(async () => { cleanupCalls += 1; });
+  const stopping = reporter.stop(async () => {
+    cleanupCalls += 1;
+    assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING']);
+  });
   await flushMicrotasks();
   assert.equal(cleanupCalls, 0);
   assert.deepEqual(scheduler.pendingDelays(), [20]);
   scheduler.fireNext(20);
 
   await assertReporterCode(stopping, 'SHUTDOWN_TIMEOUT');
-  assert.equal(cleanupCalls, 0);
+  assert.equal(cleanupCalls, 1);
   assert.equal(reporter.state(), 'DEGRADED');
-  assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING']);
+  assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING', 'STOPPED']);
+  assertStoppedCleanupFailure(repository.transitions[1]);
 });
 
 void test('websocket health reporter preserves a rejected touch during shutdown', async () => {
@@ -269,7 +276,7 @@ void test('websocket health reporter preserves a rejected touch during shutdown'
   repository.touchResults.push(touch.promise);
   repository.transitionResults.push(
     Promise.resolve(snapshot('STOPPING', 3n)),
-    Promise.resolve(snapshot('STOPPED', 4n)),
+    Promise.resolve(snapshot('STOPPED', 4n, true)),
   );
   const { reporter, scheduler } = reporterFixture(repository);
   reporter.startTouch(snapshot('RUNNING', 2n));
@@ -277,13 +284,54 @@ void test('websocket health reporter preserves a rejected touch during shutdown'
   await flushMicrotasks();
 
   let cleanupCalls = 0;
-  const stopping = reporter.stop(async () => { cleanupCalls += 1; });
+  const stopping = reporter.stop(async () => {
+    cleanupCalls += 1;
+    assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING']);
+  });
   touch.reject(new Error('secret heartbeat write'));
 
   await assertReporterCode(stopping, 'CLEANUP_FAILED');
-  assert.equal(cleanupCalls, 0);
+  assert.equal(cleanupCalls, 1);
   assert.equal(reporter.state(), 'DEGRADED');
-  assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING']);
+  assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING', 'STOPPED']);
+  assertStoppedCleanupFailure(repository.transitions[1]);
+});
+
+void test('websocket health reporter gives cleanup its own bound after a rejected touch', async () => {
+  const repository = new FakeHealthRepository();
+  const touch = deferred<undefined>();
+  repository.touchResults.push(touch.promise);
+  repository.transitionResults.push(
+    Promise.resolve(snapshot('STOPPING', 3n)),
+    Promise.resolve(snapshot('DEGRADED', 4n, true)),
+  );
+  const { reporter, scheduler } = reporterFixture(repository);
+  reporter.startTouch(snapshot('RUNNING', 2n));
+  scheduler.fireNext(5);
+  await flushMicrotasks();
+
+  let cleanupCalls = 0;
+  const stopping = reporter.stop(() => {
+    cleanupCalls += 1;
+    assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING']);
+    return new Promise<void>(() => undefined);
+  });
+  touch.reject(new Error('secret heartbeat write'));
+  await flushMicrotasks();
+
+  assert.equal(cleanupCalls, 1);
+  assert.deepEqual(scheduler.pendingDelays(), [20]);
+  scheduler.fireNext(20);
+  await assertReporterCode(stopping, 'SHUTDOWN_TIMEOUT');
+  assert.equal(reporter.state(), 'DEGRADED');
+  assert.deepEqual(repository.transitions.map((value) => value.phase), ['STOPPING', 'DEGRADED']);
+  const degraded = repository.transitions[1];
+  assert.equal(degraded?.providerId, 'primary');
+  assert.equal(degraded?.activeSessionGeneration, 1n);
+  assert.equal(degraded?.acknowledged, true);
+  assert.equal(degraded?.disconnectReasonCode, 'CLEANUP_FAILED');
+  assert.equal(degraded?.recoveryStatus, 'FAILED');
+  assert.equal(degraded?.recoveryReasonCode, 'SESSION_FAILURE');
 });
 
 void test('websocket health reporter keeps rejected cleanup degraded and redacted', async () => {
@@ -686,6 +734,18 @@ function transitionFrom(
     recoveryReasonCode: value.recovery.reasonCode,
     ...overrides,
   };
+}
+
+function assertStoppedCleanupFailure(value: WebSocketHealthTransition | undefined): void {
+  assert.equal(value?.phase, 'STOPPED');
+  assert.equal(value?.providerId, null);
+  assert.equal(value?.activeSessionGeneration, null);
+  assert.equal(value?.candidateProviderId, null);
+  assert.equal(value?.candidateSessionGeneration, null);
+  assert.equal(value?.acknowledged, false);
+  assert.equal(value?.disconnectReasonCode, 'CLEANUP_FAILED');
+  assert.equal(value?.recoveryStatus, 'FAILED');
+  assert.equal(value?.recoveryReasonCode, 'SESSION_FAILURE');
 }
 
 class ManualScheduler implements WebSocketHealthReporterScheduler {

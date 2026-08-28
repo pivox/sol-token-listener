@@ -97,10 +97,13 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
         throw repositoryError('STATE_CONFLICT');
       }
       const operationAt = timestampFromDatabase(operationRow.operation_at);
+      const isStopped = current.phase === 'STOPPED';
       const isUnrecoverable = current.phase === 'UNRECOVERABLE';
-      const isClean = current.supervision === 'INACTIVE' || current.phase === 'STOPPED';
+      const recoveryResolved = current.recovery.status === 'NOT_REQUIRED'
+        || current.recovery.status === 'RECOVERED';
+      const isClean = current.supervision === 'INACTIVE' || (isStopped && recoveryResolved);
       const isFresh = operationRow.owner_is_fresh;
-      if (!isClean && !isUnrecoverable && isFresh) {
+      if (!isClean && !isStopped && !isUnrecoverable && isFresh) {
         throw repositoryError('ACTIVE_INSTANCE');
       }
       if (current.ownerGeneration === MAX_WEBSOCKET_HEALTH_GENERATION
@@ -110,9 +113,11 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
 
       const ownerGeneration = current.ownerGeneration + 1n;
       const abnormal = !isClean;
-      const recoveryReason = isUnrecoverable
+      const preserveStoppedFailure = isStopped && abnormal;
+      const recoveryReason = isUnrecoverable || preserveStoppedFailure
         ? current.recovery.reasonCode ?? 'CATCH_UP_WINDOW_EXCEEDED'
         : abnormal ? 'UNEXPECTED_RESTART' : null;
+      const recordUnexpectedRestart = abnormal && !preserveStoppedFailure;
       const updated = await safeQuery(client,
         `UPDATE listener_websocket_health SET
           supervision = 'ACTIVE',
@@ -124,9 +129,9 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
           candidate_provider_id = $3,
           phase = 'CONNECTING',
           acknowledged_at = NULL,
-          disconnect_occurred_at = CASE WHEN $4::BOOLEAN THEN $5::TIMESTAMPTZ
+          disconnect_occurred_at = CASE WHEN $7::BOOLEAN THEN $5::TIMESTAMPTZ
             ELSE disconnect_occurred_at END,
-          disconnect_reason_code = CASE WHEN $4::BOOLEAN THEN 'UNEXPECTED_RESTART'
+          disconnect_reason_code = CASE WHEN $7::BOOLEAN THEN 'UNEXPECTED_RESTART'
             ELSE disconnect_reason_code END,
           recovery_status = CASE WHEN $4::BOOLEAN THEN 'REQUIRED' ELSE 'NOT_REQUIRED' END,
           recovery_started_at = NULL,
@@ -138,7 +143,7 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
          WHERE service_key = $1
          RETURNING *`,
         [SERVICE_KEY, ownerGeneration.toString(), begin.candidateProviderId,
-          abnormal, new Date(operationAt), recoveryReason],
+          abnormal, new Date(operationAt), recoveryReason, recordUnexpectedRestart],
       );
       return requiredSnapshot(updated.rows);
     });
