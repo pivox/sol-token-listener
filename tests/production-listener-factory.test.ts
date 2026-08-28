@@ -503,6 +503,26 @@ void test('finality recurrence degrades on an unavailable block then returns to 
   ]);
   assert.deepEqual(revisions.map((revision) => revision.confirmationStatus), ['orphaned']);
   await recurring.close();
+  assert.equal(hasSchedulerWaiterState(scheduler), false);
+});
+
+void test('manual scheduler bounds a missing reschedule without retaining a waiter', async () => {
+  const scheduler = new ManualScheduler();
+  let outcome: 'pending' | 'resolved' | 'rejected' = 'pending';
+  let reason = '';
+  void scheduler.waitForNextSchedule().then(
+    () => { outcome = 'resolved'; },
+    (error: unknown) => {
+      outcome = 'rejected';
+      reason = error instanceof Error ? error.message : '';
+    },
+  );
+
+  for (let index = 0; index < 128; index += 1) await Promise.resolve();
+
+  assert.equal(outcome, 'rejected');
+  assert.equal(reason, 'Manual scheduler was not rescheduled.');
+  assert.equal(hasSchedulerWaiterState(scheduler), false);
 });
 
 void test('accepts the exact Node timer bound and rejects overflow or fractions', () => {
@@ -568,20 +588,23 @@ function assertProductionCatchUpWiring(source: string): void {
   assert.match(source, /\bnew\s+SolanaProgramSubscriber\s*\(/u);
 }
 
+function hasSchedulerWaiterState(scheduler: ManualScheduler): boolean {
+  return Reflect.ownKeys(scheduler).some(
+    (key) => typeof key === 'string' && /waiter/iu.test(key),
+  );
+}
+
+const MAX_MANUAL_SCHEDULER_WAIT_MICROTASKS = 64;
+
 class ManualScheduler implements ListenerRuntimeScheduler {
   private callback: (() => void) | null = null;
   private lastCallback: (() => void) | null = null;
   private scheduledCount = 0;
-  private readonly nextScheduleWaiters: { readonly after: number; readonly resolve: () => void }[] = [];
 
   public schedule(callback: () => void): object {
     this.callback = callback;
     this.lastCallback = callback;
     this.scheduledCount += 1;
-    for (const waiter of this.nextScheduleWaiters.splice(0)) {
-      if (this.scheduledCount > waiter.after) waiter.resolve();
-      else this.nextScheduleWaiters.push(waiter);
-    }
     return Object.freeze({});
   }
 
@@ -602,11 +625,13 @@ class ManualScheduler implements ListenerRuntimeScheduler {
     callback();
   }
 
-  public waitForNextSchedule(): Promise<void> {
+  public async waitForNextSchedule(): Promise<void> {
     const after = this.scheduledCount;
-    return new Promise<void>((resolve) => {
-      this.nextScheduleWaiters.push(Object.freeze({ after, resolve }));
-    });
+    for (let attempt = 0; attempt < MAX_MANUAL_SCHEDULER_WAIT_MICROTASKS; attempt += 1) {
+      await Promise.resolve();
+      if (this.scheduledCount > after) return;
+    }
+    throw new Error('Manual scheduler was not rescheduled.');
   }
 }
 
