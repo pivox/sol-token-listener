@@ -645,7 +645,7 @@ npm run docs:check
 git diff --check
 ```
 
-- [ ] **Step 6: Commit documentation**
+- [x] **Step 6: Commit documentation**
 
 ```bash
 git add README.md docs tests
