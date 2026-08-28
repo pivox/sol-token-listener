@@ -3,8 +3,18 @@
 Date: 2026-08-28
 Issue: #62
 Parent issue: #57
-Version: 1.0.1
+Version: 1.0.2
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.2 records four reviewed implementation semantics. PostgreSQL
+`NUMERIC` observation slots use a dedicated decoder for mathematical integers,
+including values such as `1.0` or `0.00`, while all `BIGINT` fields keep their
+strict unscaled canonical decoder. A non-null `disconnectReasonCode` represents
+a newly observed incident and refreshes its persisted clock even when the fixed
+code repeats; `null` carries forward existing evidence. Periodic touch cadence
+is independent from persistence latency, with at most one pending coalesced
+follow-up. Finally, API freshness is evaluated from a coherent canonical
+snapshot with the freshness clock captured after the reads complete.
 
 Revision 1.0.1 stores the observation slot as unconstrained PostgreSQL
 `NUMERIC` with explicit finite, nonnegative, integral, and 78-digit range
@@ -41,10 +51,12 @@ checkpoint compare-and-swap, and durable strict-window failures. Issue #61
 provides primary-pinned finality reconciliation. Production still uses the
 legacy `SolanaProgramSubscriber`; issue #63 alone may activate the supervisor.
 
-`GET /api/v1/health` currently reads the latest generic heartbeat, applies a
-30-second freshness bound, and returns `OK` or `DEGRADED`. It does not expose a
-WebSocket lifecycle or check unresolved strict catch-up failures. The frontend
-polls health and accepts additive fields through loose object schemas.
+Before issue #62, `GET /api/v1/health` read only the latest generic heartbeat,
+applied a 30-second freshness bound, and did not expose a WebSocket lifecycle
+or check unresolved strict catch-up failures. The issue #62 projection reads
+the canonical generic heartbeat, WebSocket snapshot and strict-failure flag as
+one coherent snapshot. The frontend polls health and accepts additive fields
+through loose object schemas.
 
 ## Considered storage approaches
 
@@ -117,7 +129,10 @@ secret has a storage column.
 - Observation timestamp and slot are jointly null or non-null; the slot is a
   finite nonnegative integer strictly below `10^78`. The SQL column has no
   numeric typmod: explicit checks reject `NaN`, fractional values, negative
-  values, and values outside the 78-digit bound before storage.
+  values, and values outside the 78-digit bound before storage. The dedicated
+  read decoder accepts a mathematical integer returned with a zero scale, such
+  as `1`, `1.0`, or `0.00`; `BIGINT` generation, revision and session fields
+  remain strict canonical unscaled strings.
 - Disconnect timestamp and reason are jointly null or non-null.
 - Every timestamp is finite and recovery completion cannot precede recovery
   start.
@@ -210,6 +225,10 @@ Every immediate transition compares the exact owner generation and revision,
 then increments the revision. A stale transition fails without modifying the
 row. `touch` updates only `heartbeat_at` for the current owner generation and
 does not rewrite lifecycle fields or increment the transition revision.
+A non-null transition `disconnectReasonCode` always means a new incident: it
+refreshes `disconnect_occurred_at` even when the same fixed reason repeats.
+`disconnectReasonCode=null` conserves the previously persisted disconnect
+evidence and does not invent a new incident.
 
 Active and candidate sessions have distinct monotonically allocated session
 generations. `recordObservation` updates the diagnostic watermark only when
@@ -251,10 +270,12 @@ continuity proof. It contains only PostgreSQL observation time and slot.
 
 `PersistentWebSocketHealthReporter` owns no network connection and performs no
 provider selection. It persists transitions synchronously, schedules one
-bounded periodic `touch`, serializes or coalesces touches, and fences shutdown
-against an in-flight write. Transition persistence failure degrades in memory
-and fails closed. Graceful shutdown writes `STOPPING` immediately and `STOPPED`
-only after the caller has drained and closed sessions; cleanup failure remains
+bounded periodic `touch`, and fences shutdown against an in-flight write. The
+touch cadence is independent from persistence latency: each timer rearms before
+the write, overlapping ticks are serialized, and at most one immediate
+follow-up is coalesced. Transition persistence failure degrades in memory and
+fails closed. Graceful shutdown writes `STOPPING` immediately and `STOPPED` only
+after the caller has drained and closed sessions; cleanup failure remains
 `DEGRADED/CLEANUP_FAILED`.
 
 The reporter and repository are delivered inactive. They are not constructed
@@ -340,6 +361,11 @@ a false ACK and a deployment-wide degradation before #63. When supervision is
 All other active states are `DEGRADED`. PostgreSQL unavailability preserves the
 existing HTTP 503 behavior; an available database with degraded WebSocket
 health returns HTTP 200 and `data.status=DEGRADED`.
+
+The API derives the generic heartbeat, canonical `transaction-listener`
+WebSocket row and unresolved strict-failure flag from one coherent projection
+read. It captures the freshness clock only after those reads finish, so query
+latency cannot make a stale snapshot appear newer than it is.
 
 No health event is added to the domain SSE stream. That stream requires mint,
 signature, cursor, and domain-event replay semantics; technical health remains

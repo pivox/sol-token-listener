@@ -669,3 +669,30 @@ void test('operator documentation links the deployment runbook and smoke command
   assert.match(overview, /sauvegarde externe/i);
   assert.match(overview, /aucune promesse[^<]*(?:première position|sellabilité|profit)/i);
 });
+
+void test('operator overview renders the durable WebSocket lifecycle without exposing connection material', async () => {
+  const overview = await readArtifact('docs/system-overview.html');
+  const sectionStart = overview.indexOf('<section id="websocket-health-lifecycle"');
+  const sectionEnd = overview.indexOf('</section>', sectionStart);
+  assert.notEqual(sectionStart, -1, 'missing durable WebSocket lifecycle section');
+  assert.notEqual(sectionEnd, -1, 'durable WebSocket lifecycle section must be bounded');
+  const section = overview.slice(sectionStart, sectionEnd);
+
+  assert.match(section, /class="card/);
+  assert.match(section, /class="alert/);
+  assert.match(section, /class="table-responsive/);
+  assert.match(section, /<svg id="diagram-websocket-health"/);
+  assert.match(section, /<title id="diagram-websocket-health-title">/);
+  assert.match(section, /<desc id="diagram-websocket-health-desc">/);
+  for (const phase of [
+    'STOPPED', 'CONNECTING', 'WAITING_FOR_ACKS', 'ACKNOWLEDGED', 'RECOVERING',
+    'RUNNING', 'DEGRADED',
+  ]) assert.ok(section.includes(phase), `missing lifecycle phase: ${phase}`);
+  assert.match(section, /INACTIVE[^<]*#63/iu);
+  assert.match(section, /30 secondes/iu);
+  assert.match(section, /quatre heures/iu);
+  assert.match(section, /dernière observation[^<]*pas[^<]*frontière[^<]*complétude/iu);
+  assert.match(section, /primary[^<]*fallback-1[^<]*fallback-2[^<]*fallback-3/iu);
+  assert.doesNotMatch(section, /(?:https?|wss):\/\//iu);
+  assert.doesNotMatch(section, /EXECUTION_MODE=live|sendTransaction\s*\(|signTransaction\s*\(|private[_ -]?key/iu);
+});

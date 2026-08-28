@@ -76,6 +76,43 @@ void test('inactive WebSocket health reporter owns no network, provider, runtime
   assert.doesNotMatch(source, /notification\.signature/u);
 });
 
+void test('durable WebSocket health documentation cannot activate issue 63 or instruct live execution', async () => {
+  const [readme, api, overview, design] = await Promise.all([
+    readFile(new URL('../README.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/api/v1.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/system-overview.html', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/superpowers/specs/2026-08-28-durable-websocket-health-design.md', import.meta.url), 'utf8'),
+  ]);
+
+  const apiStart = api.indexOf('### Santé WebSocket durable');
+  const apiEnd = api.indexOf('\n## SSE', apiStart);
+  const overviewStart = overview.indexOf('<section id="websocket-health-lifecycle"');
+  const overviewEnd = overview.indexOf('</section>', overviewStart);
+  const deliveryStart = design.indexOf('## Delivery boundaries');
+  const deliveryEnd = design.indexOf('## Acceptance tests', deliveryStart);
+  for (const [name, start, end] of [
+    ['API', apiStart, apiEnd],
+    ['overview', overviewStart, overviewEnd],
+    ['design', deliveryStart, deliveryEnd],
+  ] as const) {
+    assert.notEqual(start, -1, `missing ${name} safety section`);
+    assert.notEqual(end, -1, `${name} safety section must be bounded`);
+  }
+
+  const safetyDocumentation = [
+    readme.slice(readme.indexOf('### Santé WebSocket durable'), readme.indexOf('\n## Architecture')),
+    api.slice(apiStart, apiEnd),
+    overview.slice(overviewStart, overviewEnd),
+    design.slice(deliveryStart, deliveryEnd),
+  ].join('\n');
+  assert.match(safetyDocumentation, /INACTIVE[\s\S]*#63/iu);
+  assert.match(safetyDocumentation, /#62[^.]*n['’]active pas/iu);
+  assert.doesNotMatch(
+    safetyDocumentation,
+    /(?:https?|wss):\/\/|EXECUTION_MODE=live|(?:export|set)\s+SOLANA_PRIVATE_KEY|sendTransaction\s*\(|signTransaction\s*\(|new\s+Keypair/iu,
+  );
+});
+
 void test('paper dry-run bootstrap imports no signing, submission, or live execution path', async () => {
   const path = fileURLToPath(new URL('../src/cli/paper-dry-run.ts', import.meta.url));
   const source = await readFile(path, 'utf8');

@@ -64,7 +64,7 @@ for (const reference of localReferences) {
 }
 
 const svgBlocks = [...html.matchAll(/<svg\s[\s\S]*?<\/svg>/g)].map((match) => match[0]);
-if (svgBlocks.length !== 7) failures.push(`sept diagrammes SVG attendus, trouvés: ${svgBlocks.length}`);
+if (svgBlocks.length !== 8) failures.push(`huit diagrammes SVG attendus, trouvés: ${svgBlocks.length}`);
 for (const [index, svg] of svgBlocks.entries()) {
   if (!/\bid="diagram-[^"]+"/.test(svg)) failures.push(`SVG ${index + 1}: id stable absent`);
   if (!/\brole="img"/.test(svg)) failures.push(`SVG ${index + 1}: role img absent`);

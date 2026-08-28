@@ -3,8 +3,14 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.3.1
+Version: 1.3.2
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.3.2 aligns issue #62 with dedicated design version 1.0.2. It records
+the separate mathematical-integer `NUMERIC` decoder, strict canonical `BIGINT`
+decoding, new-incident versus carry-forward disconnect semantics, persistence-
+independent touch cadence with one coalesced follow-up, and health freshness
+computed after one coherent canonical projection read.
 
 Revision 1.3.1 aligns the issue #62 observation-slot schema with its dedicated
 design version 1.0.1: an unconstrained PostgreSQL `NUMERIC` plus explicit
@@ -413,7 +419,7 @@ of falling back request by request.
 
 Issue #62 is specified in
 `docs/superpowers/specs/2026-08-28-durable-websocket-health-design.md` version
-1.0.1. The public object below is backed by an independent bounded snapshot,
+1.0.2. The public object below is backed by an independent bounded snapshot,
 uses generation fencing, and exposes a five-state summary alongside the
 detailed phase. `supervision=INACTIVE` preserves the legacy production health
 contract until #63 atomically activates a new owner before network and API

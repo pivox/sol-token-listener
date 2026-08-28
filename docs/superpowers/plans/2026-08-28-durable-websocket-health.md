@@ -86,7 +86,7 @@ Expected: failure because migration 030 and its table do not exist.
 
 - [ ] **Step 3: Add the normalized snapshot and checks**
 
-Create the table with the exact columns from spec v1.0.1. Use unconstrained
+Create the table with the exact columns from spec v1.0.2. Use unconstrained
 `NUMERIC` plus explicit `NaN`, nonnegative, integral and `< 10^78` checks for
 the observation slot, and `BIGINT` for generations/revision. A
 `NUMERIC(78,0)` typmod is forbidden because PostgreSQL rounds fractional input
@@ -599,19 +599,20 @@ git commit -m "feat: show websocket health in operator console (#62)"
 - Modify: `docs/api/v1.md`
 - Modify: `docs/system-overview.html`
 - Modify: `docs/superpowers/specs/2026-08-28-durable-websocket-health-design.md`
+- Modify: `docs/superpowers/specs/2026-08-27-solana-websocket-failover-design.md`
 - Modify: `docs/superpowers/plans/2026-08-28-durable-websocket-health.md`
 - Modify: `tests/config-safety.test.ts`
 - Modify: `tests/deployment-artifacts.test.ts`
 - Modify: `tests/bootstrap-safety.test.ts`
 
-- [ ] **Step 1: Document the exact API object and transitional mode**
+- [x] **Step 1: Document the exact API object and transitional mode**
 
 Describe backend-required/client-optional `heartbeat.websocket`, the five-state
 summary, detailed phases, 30-second freshness, four-hour evidence cleanup,
 strict-failure degradation, `lastSignature=null`, and `INACTIVE` behavior until
 #63.
 
-- [ ] **Step 2: Update the diagnostic HTML**
+- [x] **Step 2: Update the diagnostic HTML**
 
 Add a Bootstrap section and SVG lifecycle:
 
@@ -624,19 +625,20 @@ failure -> DEGRADED -> recovery
 State explicitly that last observation is not a completeness frontier and the
 supervisor is not activated by #62.
 
-- [ ] **Step 3: Add redaction and safety assertions**
+- [x] **Step 3: Add redaction and safety assertions**
 
 Assert docs and public examples contain only positional provider IDs and fixed
 codes, no provider URL placeholder that looks usable, no signature in the new
 object, and no live/wallet/submission instructions.
 
-- [ ] **Step 4: Mark completed plan steps and bump spec revision only if implementation differs**
+- [x] **Step 4: Mark completed plan steps and record reviewed implementation differences**
 
-Keep design version 1.0.1 when implementation matches exactly. If a reviewed
-implementation change is necessary, increment to 1.0.1 and describe the change
-at the top rather than silently editing semantics.
+The reviewed implementation differs from version 1.0.1 in its mathematical-
+integer `NUMERIC` decoder, disconnect incident refresh, persistence-independent
+touch cadence and coherent health freshness clock. Dedicated design version
+1.0.2 and umbrella version 1.3.2 record these semantics explicitly.
 
-- [ ] **Step 5: Run documentation checks**
+- [x] **Step 5: Run documentation checks**
 
 ```bash
 npm run docs:check
@@ -695,7 +697,7 @@ generic remote-error serialization.
 
 - [ ] **Step 4: Obtain sequential internal reviews**
 
-First request specification compliance against design v1.0.1. After PASS,
+First request specification compliance against design v1.0.2. After PASS,
 request code quality/security/concurrency review. Address Critical/Important
 findings with focused tests and rerun affected gates.
 

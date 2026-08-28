@@ -495,6 +495,31 @@ exige tous les composants actifs; une dépendance, un heartbeat périmé ou un
 nettoyage incomplet produit `DEGRADED`; `STOPPED` désigne l'arrêt ou la
 désactivation explicite.
 
+### Santé WebSocket durable
+
+Le backend ajoute l’objet requis `heartbeat.websocket`; le client le garde
+optionnel pendant un déploiement progressif. Il publie les cinq états publics
+`STOPPED`, `CONNECTING`, `ACKNOWLEDGED`, `RECOVERING` et `DEGRADED`, la phase
+détaillée, des identifiants de fournisseur uniquement positionnels
+(`primary`, `fallback-1`, `fallback-2`, `fallback-3`) et des reason codes
+fixes. La fraîcheur du heartbeat WebSocket est limitée à 30 secondes et les
+preuves résolues sont supprimées après quatre heures. Une erreur stricte non
+résolue dégrade la santé ; `heartbeat.lastSignature` reste toujours `null`.
+
+La dernière observation est un diagnostic après mise en file durable, pas une
+preuve de continuité ni une frontière de complétude. Le slot PostgreSQL
+`NUMERIC` est décodé comme un entier mathématique, tandis que les champs
+`BIGINT` restent strictement canoniques. Un `disconnectReasonCode` non nul
+signale un nouvel incident, même si le code est identique au précédent ;
+`disconnectReasonCode=null` conserve la preuve déjà persistée. La cadence des
+touches reste indépendante de la latence de persistance avec une seule relance
+coalescée. La projection est calculée depuis un snapshot cohérent et son
+horloge de fraîcheur est capturée après les lectures.
+
+L’issue #62 n’active pas ce superviseur : il reste `INACTIVE/STOPPED` jusqu’au
+câblage explicite de l’issue #63. Cette projection n’expose ni matériel de
+connexion ni capacité d’exécution.
+
 ## Architecture
 
 - [Vue complète du système (HTML Bootstrap hors ligne)](docs/system-overview.html)

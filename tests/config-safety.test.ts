@@ -839,6 +839,82 @@ void test('Pump.fun calibration documentation states the initial profile, semant
   assert.doesNotMatch(systemOverview, /704 tests réussis/iu);
 });
 
+void test('durable WebSocket health documentation is versioned and exposes the exact redacted contract', async () => {
+  const [readme, api, design, umbrella, plan] = await Promise.all([
+    readFile(new URL('../README.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/api/v1.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/superpowers/specs/2026-08-28-durable-websocket-health-design.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/superpowers/specs/2026-08-27-solana-websocket-failover-design.md', import.meta.url), 'utf8'),
+    readFile(new URL('../docs/superpowers/plans/2026-08-28-durable-websocket-health.md', import.meta.url), 'utf8'),
+  ]);
+
+  assert.match(design, /^Version: 1\.0\.2$/mu);
+  assert.match(umbrella, /^Version: 1\.3\.2$/mu);
+  assert.match(umbrella, /durable-websocket-health-design\.md` version\s+1\.0\.2/isu);
+  assert.match(plan, /design v1\.0\.2/iu);
+
+  const sectionStart = api.indexOf('### Santé WebSocket durable');
+  const sectionEnd = api.indexOf('\n## SSE', sectionStart);
+  assert.notEqual(sectionStart, -1, 'missing durable WebSocket API section');
+  assert.notEqual(sectionEnd, -1, 'durable WebSocket API section must be bounded');
+  const apiSection = api.slice(sectionStart, sectionEnd);
+  const jsonStart = apiSection.indexOf('```json\n');
+  const jsonEnd = apiSection.indexOf('\n```', jsonStart + 8);
+  assert.notEqual(jsonStart, -1, 'missing durable WebSocket JSON example');
+  assert.notEqual(jsonEnd, -1, 'durable WebSocket JSON example must be closed');
+  const example = JSON.parse(apiSection.slice(jsonStart + 8, jsonEnd)) as {
+    readonly heartbeat?: {
+      readonly lastSignature?: unknown;
+      readonly websocket?: Readonly<Record<string, unknown>>;
+    };
+  };
+  assert.equal(example.heartbeat?.lastSignature, null);
+  const websocket = example.heartbeat?.websocket;
+  assert.ok(websocket);
+  assert.deepEqual(Object.keys(websocket).sort(), [
+    'acknowledgedAt',
+    'candidateProviderId',
+    'disconnect',
+    'heartbeatAt',
+    'lastObservation',
+    'phase',
+    'providerId',
+    'recovery',
+    'state',
+    'supervision',
+    'updatedAt',
+    'version',
+  ]);
+  assert.equal(Object.hasOwn(websocket, 'signature'), false);
+  assert.deepEqual(websocket.recovery, {
+    status: 'NOT_REQUIRED',
+    startedAt: null,
+    completedAt: null,
+    reasonCode: null,
+  });
+
+  for (const value of [
+    'STOPPED', 'CONNECTING', 'ACKNOWLEDGED', 'RECOVERING', 'DEGRADED',
+    'WAITING_FOR_ACKS', 'RUNNING', 'UNRECOVERABLE', 'STOPPING',
+    'listener_strict_catch_up_failures', '30 secondes', 'quatre heures',
+    'backend requis', 'client optionnel', 'primary', 'fallback-1', 'fallback-2',
+    'fallback-3', 'INACTIVE', '#63',
+  ]) assert.ok(apiSection.includes(value), `missing WebSocket API documentation: ${value}`);
+
+  assert.match(apiSection, /dernière observation[^.]*diagnostique[^.]*pas[^.]*continuité/isu);
+  assert.match(apiSection, /PostgreSQL[^.]*503[^.]*DEGRADED[^.]*200/isu);
+  assert.doesNotMatch(apiSection, /(?:https?|wss):\/\//iu);
+  assert.doesNotMatch(apiSection, /EXECUTION_MODE=live|sendTransaction\s*\(|signTransaction\s*\(|private[_ -]?key/iu);
+
+  const revisedSemantics = `${readme}\n${design}`;
+  assert.match(revisedSemantics, /NUMERIC[^.]*entier mathématique[^.]*BIGINT[^.]*strict/isu);
+  assert.match(revisedSemantics, /disconnectReasonCode[^.]*non nul[^.]*nouvel incident/isu);
+  assert.match(revisedSemantics, /disconnectReasonCode[^.]*null[^.]*conserve/isu);
+  assert.match(revisedSemantics, /cadence[^.]*indépendante[^.]*latence[^.]*coalesc/isu);
+  assert.match(revisedSemantics, /snapshot cohérent/iu);
+  assert.match(revisedSemantics, /horloge[^.]*après[^.]*lectures/isu);
+});
+
 void test('HTTP RPC failover documentation states the bounded production and soak contract', async () => {
   const [readme, operations] = await Promise.all([
     readFile(new URL('../README.md', import.meta.url), 'utf8'),
