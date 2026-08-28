@@ -13,6 +13,7 @@ import type {
 import {
   PersistentWebSocketHealthReporter,
   WebSocketHealthReporterError,
+  type WebSocketHealthReporterOptions,
   type WebSocketHealthReporterScheduler,
 } from '../src/application/websocket-health-reporter.js';
 
@@ -285,7 +286,7 @@ void test('websocket health reporter enforces fixed timing and scheduler bounds'
     {
       touchIntervalMs: 2_147_483_647,
       shutdownTimeoutMs: 120_000,
-      scheduler: new ManualScheduler(),
+      scheduler: schedulerAdapter(new ManualScheduler()),
     },
   ));
   for (const options of [
@@ -306,6 +307,105 @@ void test('websocket health reporter enforces fixed timing and scheduler bounds'
         && error.code === 'STATE_CONFLICT',
     );
   }
+});
+
+void test('websocket health reporter rejects hostile option records with a redacted state conflict', () => {
+  let optionProxyTraps = 0;
+  const hostileOptions = new Proxy({}, {
+    get() { optionProxyTraps += 1; throw new Error('secret option getter'); },
+    ownKeys() { optionProxyTraps += 1; throw new Error('secret option keys'); },
+  });
+  let getterCalls = 0;
+  const mutableGetter = { shutdownTimeoutMs: 20 } as Record<string, unknown>;
+  Object.defineProperty(mutableGetter, 'touchIntervalMs', {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return getterCalls <= 3 ? 5 : 0;
+    },
+  });
+  const symbolOptions = { touchIntervalMs: 5, shutdownTimeoutMs: 20 } as Record<PropertyKey, unknown>;
+  symbolOptions[Symbol('secret')] = 'secret option symbol';
+
+  for (const options of [
+    null,
+    hostileOptions,
+    mutableGetter,
+    symbolOptions,
+    Object.assign(Object.create({ inherited: true }), {
+      touchIntervalMs: 5, shutdownTimeoutMs: 20,
+    }),
+  ]) {
+    assertOptionsStateConflict(options);
+  }
+  assert.equal(optionProxyTraps, 0);
+  assert.equal(getterCalls, 0);
+});
+
+void test('websocket health reporter accepts exact option records and snapshots their data once', () => {
+  const nullPrototypeOptions = Object.assign(Object.create(null) as Record<string, unknown>, {
+    touchIntervalMs: 5,
+    shutdownTimeoutMs: 20,
+  });
+  const nullPrototypeScheduler = Object.assign(Object.create(null) as Record<string, unknown>, {
+    schedule: (_callback: () => void, _delayMs: number) => Object.freeze({}),
+    cancel: (_handle: unknown) => undefined,
+  });
+
+  assert.doesNotThrow(() => new PersistentWebSocketHealthReporter(
+    { async enqueue() {} },
+    new FakeHealthRepository(),
+    { touchIntervalMs: 5, shutdownTimeoutMs: 20 },
+  ));
+  assert.doesNotThrow(() => new PersistentWebSocketHealthReporter(
+    { async enqueue() {} },
+    new FakeHealthRepository(),
+    nullPrototypeOptions as unknown as WebSocketHealthReporterOptions,
+  ));
+  assert.doesNotThrow(() => new PersistentWebSocketHealthReporter(
+    { async enqueue() {} },
+    new FakeHealthRepository(),
+    {
+      touchIntervalMs: 5,
+      shutdownTimeoutMs: 20,
+      scheduler: nullPrototypeScheduler as unknown as WebSocketHealthReporterScheduler,
+    },
+  ));
+});
+
+void test('websocket health reporter rejects non-exact schedulers without exposing hostile values', () => {
+  let schedulerProxyTraps = 0;
+  const hostileScheduler = new Proxy({}, {
+    get() { schedulerProxyTraps += 1; throw new Error('secret scheduler getter'); },
+    ownKeys() { schedulerProxyTraps += 1; throw new Error('secret scheduler keys'); },
+  });
+  let schedulerGetterCalls = 0;
+  const accessorScheduler = { cancel() {} } as Record<string, unknown>;
+  Object.defineProperty(accessorScheduler, 'schedule', {
+    enumerable: true,
+    get() {
+      schedulerGetterCalls += 1;
+      return () => Object.freeze({});
+    },
+  });
+  const symbolScheduler = {
+    schedule: () => Object.freeze({}),
+    cancel: () => undefined,
+    [Symbol('secret')]: 'secret scheduler symbol',
+  };
+
+  for (const scheduler of [
+    null,
+    hostileScheduler,
+    accessorScheduler,
+    symbolScheduler,
+    new ManualScheduler(),
+    { schedule: () => Object.freeze({}), cancel: () => undefined, extra: true },
+  ]) {
+    assertOptionsStateConflict({ touchIntervalMs: 5, shutdownTimeoutMs: 20, scheduler });
+  }
+  assert.equal(schedulerProxyTraps, 0);
+  assert.equal(schedulerGetterCalls, 0);
 });
 
 const notification: TransactionNotification = Object.freeze({
@@ -373,7 +473,22 @@ function reporterOptions(scheduler: ManualScheduler = new ManualScheduler()): {
   readonly shutdownTimeoutMs: number;
   readonly scheduler: WebSocketHealthReporterScheduler;
 } {
-  return Object.freeze({ touchIntervalMs: 5, shutdownTimeoutMs: 20, scheduler });
+  return Object.freeze({
+    touchIntervalMs: 5,
+    shutdownTimeoutMs: 20,
+    scheduler: schedulerAdapter(scheduler),
+  });
+}
+
+function schedulerAdapter(scheduler: ManualScheduler): WebSocketHealthReporterScheduler {
+  return Object.freeze({
+    schedule(callback: () => void, delayMs: number): unknown {
+      return scheduler.schedule(callback, delayMs);
+    },
+    cancel(handle: unknown): void {
+      scheduler.cancel(handle);
+    },
+  });
 }
 
 function snapshot(
@@ -508,4 +623,21 @@ async function assertReporterCode(
     assert.doesNotMatch(String(error), /secret|rpc|database|signature|remote/iu);
     return true;
   });
+}
+
+function assertOptionsStateConflict(options: unknown): void {
+  assert.throws(
+    () => new PersistentWebSocketHealthReporter(
+      { async enqueue() {} },
+      new FakeHealthRepository(),
+      options as WebSocketHealthReporterOptions,
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof WebSocketHealthReporterError);
+      assert.equal(error.code, 'STATE_CONFLICT');
+      assert.equal(Object.hasOwn(error, 'cause'), false);
+      assert.doesNotMatch(String(error), /secret|getter|symbol|proxy|scheduler|option/iu);
+      return true;
+    },
+  );
 }

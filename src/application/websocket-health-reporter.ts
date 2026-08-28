@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import {
   assertValidWebSocketHealthSnapshot,
   MAX_WEBSOCKET_HEALTH_SLOT,
@@ -77,10 +78,10 @@ export class PersistentWebSocketHealthReporter {
     private readonly health: WebSocketHealthRepository,
     options: WebSocketHealthReporterOptions,
   ) {
-    validateOptions(options);
-    this.touchIntervalMs = options.touchIntervalMs;
-    this.shutdownTimeoutMs = options.shutdownTimeoutMs;
-    this.scheduler = options.scheduler ?? systemScheduler;
+    const validated = validateOptions(options);
+    this.touchIntervalMs = validated.touchIntervalMs;
+    this.shutdownTimeoutMs = validated.shutdownTimeoutMs;
+    this.scheduler = validated.scheduler;
   }
 
   public state(): WebSocketHealthPhase {
@@ -423,18 +424,74 @@ function validatedSnapshot(
   }
 }
 
-function validateOptions(options: WebSocketHealthReporterOptions): void {
-  if (!Number.isSafeInteger(options.touchIntervalMs)
-    || options.touchIntervalMs <= 0
-    || options.touchIntervalMs > MAX_TIMER_DELAY_MS
-    || !Number.isSafeInteger(options.shutdownTimeoutMs)
-    || options.shutdownTimeoutMs <= 0
-    || options.shutdownTimeoutMs > MAX_SHUTDOWN_TIMEOUT_MS
-    || (options.scheduler !== undefined
-      && (typeof options.scheduler.schedule !== 'function'
-        || typeof options.scheduler.cancel !== 'function'))) {
+function validateOptions(value: unknown): Readonly<{
+  touchIntervalMs: number;
+  shutdownTimeoutMs: number;
+  scheduler: WebSocketHealthReporterScheduler;
+}> {
+  try {
+    const options = exactOwnData(value, ['touchIntervalMs', 'shutdownTimeoutMs'], ['scheduler']);
+    const touchIntervalMs = options.touchIntervalMs;
+    const shutdownTimeoutMs = options.shutdownTimeoutMs;
+    const scheduler = options.scheduler === undefined
+      ? systemScheduler
+      : schedulerFrom(options.scheduler);
+    if (!Number.isSafeInteger(touchIntervalMs)
+      || (touchIntervalMs as number) <= 0
+      || (touchIntervalMs as number) > MAX_TIMER_DELAY_MS
+      || !Number.isSafeInteger(shutdownTimeoutMs)
+      || (shutdownTimeoutMs as number) <= 0
+      || (shutdownTimeoutMs as number) > MAX_SHUTDOWN_TIMEOUT_MS) {
+      throw new TypeError();
+    }
+    return Object.freeze({
+      touchIntervalMs: touchIntervalMs as number,
+      shutdownTimeoutMs: shutdownTimeoutMs as number,
+      scheduler,
+    });
+  } catch {
     throw reporterError('STATE_CONFLICT');
   }
+}
+
+function schedulerFrom(value: unknown): WebSocketHealthReporterScheduler {
+  const scheduler = exactOwnData(value, ['schedule', 'cancel']);
+  if (typeof scheduler.schedule !== 'function' || typeof scheduler.cancel !== 'function') {
+    throw new TypeError();
+  }
+  return Object.freeze({
+    schedule: scheduler.schedule as WebSocketHealthReporterScheduler['schedule'],
+    cancel: scheduler.cancel as WebSocketHealthReporterScheduler['cancel'],
+  });
+}
+
+function exactOwnData(
+  value: unknown,
+  requiredKeys: readonly string[],
+  optionalKeys: readonly string[] = [],
+): Readonly<Record<string, unknown>> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value)) {
+    throw new TypeError();
+  }
+  const prototype: object | null = Object.getPrototypeOf(value) as object | null;
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError();
+  const keys = Reflect.ownKeys(value);
+  const allowedKeys = [...requiredKeys, ...optionalKeys];
+  if (keys.length < requiredKeys.length || keys.length > allowedKeys.length
+    || requiredKeys.some((key) => !keys.includes(key))
+    || keys.some((key) => typeof key !== 'string' || !allowedKeys.includes(key))) {
+    throw new TypeError();
+  }
+  const snapshot = Object.create(null) as Record<string, unknown>;
+  for (const key of allowedKeys) {
+    if (!keys.includes(key)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new TypeError();
+    }
+    snapshot[key] = descriptor.value;
+  }
+  return Object.freeze(snapshot);
 }
 
 function reporterError(code: WebSocketHealthReporterErrorCode): WebSocketHealthReporterError {
