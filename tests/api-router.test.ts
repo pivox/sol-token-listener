@@ -18,6 +18,10 @@ import { encodeLaunchCursor, encodePaperPositionCursor, encodeTimelineCursor } f
 import { failure, success, writeJson } from '../src/interfaces/http/api-response.js';
 import { createApiRouter } from '../src/interfaces/http/api-router.js';
 import { MAX_API_PAGE_LIMIT, type ApiProjectionRepository } from '../src/ports/api-projection-repository.js';
+import {
+  PostgresApiProjectionRepository,
+  type Queryable,
+} from '../src/storage/api-projection.repository.js';
 
 const MINT = bs58.encode(new Uint8Array(32).fill(7));
 const OTHER_MINT = bs58.encode(new Uint8Array(32).fill(8));
@@ -137,7 +141,21 @@ function inactiveWebSocketHealth(): ApiHealth['heartbeat']['websocket'] {
   };
 }
 
-function makeRouter(repository = makeRepository(), now: () => number = () => NOW) {
+interface RouterFixture<T extends ApiProjectionRepository> {
+  readonly router: ReturnType<typeof createApiRouter>;
+  readonly repository: T;
+  readonly logged: readonly unknown[];
+}
+
+function makeRouter(): RouterFixture<ReturnType<typeof makeRepository>>;
+function makeRouter<T extends ApiProjectionRepository>(
+  repository: T,
+  now?: () => number,
+): RouterFixture<T>;
+function makeRouter(
+  repository: ApiProjectionRepository = makeRepository(),
+  now: () => number = () => NOW,
+): RouterFixture<ApiProjectionRepository> {
   const logged: unknown[] = [];
   const router = createApiRouter({
     projections: repository, now, defaultLimit: 20, maximumLimit: 100,
@@ -397,6 +415,79 @@ void test('keeps an available PostgreSQL health projection with degraded WebSock
   assert.equal(body.status, 'DEGRADED');
   assert.equal(body.postgresql.status, 'AVAILABLE');
   assert.equal(body.heartbeat.websocket.state, 'DEGRADED');
+});
+
+void test('maps a malformed WebSocket projection to a redacted HTTP 503 dependency envelope', async () => {
+  const timestamp = new Date(NOW);
+  const heartbeat = {
+    updated_at: timestamp, started_at: timestamp, last_http_slot: '1',
+    last_websocket_slot: '1', last_finalized_slot: '1', pending_transactions: 0,
+    active_sessions: 1, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
+    scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
+    leased_transactions: 0, exhausted_transactions: 0,
+  };
+  const websocket = {
+    payload_version: 1, supervision: 'ACTIVE', owner_generation: '1', revision: '1',
+    active_session_generation: '1', candidate_session_generation: null,
+    provider_id: 'wss://secret.invalid/private', candidate_provider_id: null,
+    phase: 'RUNNING', acknowledged_at: timestamp, last_observation_at: timestamp,
+    last_observation_slot: '1', disconnect_occurred_at: null,
+    disconnect_reason_code: null, recovery_status: 'NOT_REQUIRED',
+    recovery_started_at: null, recovery_completed_at: null, recovery_reason_code: null,
+    heartbeat_at: timestamp, updated_at: timestamp, evidence_purge_after: null,
+  };
+  const database: Queryable = {
+    async query(text) {
+      if (text.includes('SELECT 1 AS available')) return { rows: [{ available: 1 }] };
+      if (text.includes('listener_heartbeats')
+        && text.includes('listener_websocket_health')
+        && text.includes('listener_strict_catch_up_failures')) {
+        return { rows: [{
+          heartbeat_service_key: 'transaction-listener',
+          heartbeat_updated_at: heartbeat.updated_at,
+          started_at: heartbeat.started_at,
+          last_http_slot: heartbeat.last_http_slot,
+          last_websocket_slot: heartbeat.last_websocket_slot,
+          last_finalized_slot: heartbeat.last_finalized_slot,
+          pending_transactions: heartbeat.pending_transactions,
+          active_sessions: heartbeat.active_sessions,
+          runtime_state: heartbeat.runtime_state,
+          subscriber_state: heartbeat.subscriber_state,
+          scanner_state: heartbeat.scanner_state,
+          worker_state: heartbeat.worker_state,
+          reconciler_state: heartbeat.reconciler_state,
+          leased_transactions: heartbeat.leased_transactions,
+          exhausted_transactions: heartbeat.exhausted_transactions,
+          websocket_service_key: 'transaction-listener',
+          ...websocket,
+          has_unresolved: false,
+        }] };
+      }
+      if (text.includes('listener_heartbeats')) return { rows: [heartbeat] };
+      if (text.includes('listener_websocket_health')) return { rows: [websocket] };
+      if (text.includes('listener_strict_catch_up_failures')) {
+        return { rows: [{ has_unresolved: false }] };
+      }
+      return { rows: [] };
+    },
+  };
+  const repository = new PostgresApiProjectionRepository(database, () => timestamp, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+  });
+  const { router } = makeRouter(repository);
+
+  const response = await invoke(router, 'GET', '/api/v1/health');
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(parseBody(response), {
+    apiVersion: 'v1',
+    error: {
+      code: 'DEPENDENCY_UNAVAILABLE',
+      message: 'A required service is temporarily unavailable',
+    },
+  });
+  assert.doesNotMatch(response.body, /secret|wss?:\/\//iu);
 });
 
 void test('rejects invalid pagination configuration at construction', () => {

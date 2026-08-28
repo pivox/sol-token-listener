@@ -106,6 +106,8 @@ export interface ApiProjectionPipelineState {
   readonly social: ApiHealth['pipeline']['social'];
 }
 
+const LISTENER_SERVICE_KEY = 'transaction-listener';
+
 export type ApiProjectionPipelineStateProvider = () => ApiProjectionPipelineState;
 
 export interface ApiHolderProjectionLimits {
@@ -461,7 +463,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
   }
 
   public async getHealth(): Promise<ApiHealth> {
-    const observedAt = validDate(this.clock());
+    const responseObservedAt = validDate(this.clock());
     let pipeline = DEGRADED_PIPELINE_STATE;
     try {
       pipeline = pipelineState(this.pipeline);
@@ -471,43 +473,51 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
          WHERE checkpoint_key = ANY($1)`,
         [['launchpad', 'market']],
       );
-      const heartbeats = await this.database.query(
-        `SELECT updated_at, started_at, last_http_slot, last_websocket_slot,
-            last_finalized_slot, pending_transactions, active_sessions,
-            runtime_state, subscriber_state, scanner_state, worker_state,
-            reconciler_state, leased_transactions, exhausted_transactions
-         FROM listener_heartbeats
-         WHERE service_key = $1`,
-        ['transaction-listener'],
+      const healthSnapshot = await this.database.query(
+        `SELECT
+            heartbeat.service_key AS heartbeat_service_key,
+            heartbeat.updated_at AS heartbeat_updated_at,
+            heartbeat.started_at, heartbeat.last_http_slot,
+            heartbeat.last_websocket_slot, heartbeat.last_finalized_slot,
+            heartbeat.pending_transactions, heartbeat.active_sessions,
+            heartbeat.runtime_state, heartbeat.subscriber_state,
+            heartbeat.scanner_state, heartbeat.worker_state,
+            heartbeat.reconciler_state, heartbeat.leased_transactions,
+            heartbeat.exhausted_transactions,
+            websocket.service_key AS websocket_service_key,
+            websocket.payload_version, websocket.supervision,
+            websocket.owner_generation, websocket.revision,
+            websocket.active_session_generation, websocket.candidate_session_generation,
+            websocket.provider_id, websocket.candidate_provider_id, websocket.phase,
+            websocket.acknowledged_at, websocket.last_observation_at,
+            websocket.last_observation_slot, websocket.disconnect_occurred_at,
+            websocket.disconnect_reason_code, websocket.recovery_status,
+            websocket.recovery_started_at, websocket.recovery_completed_at,
+            websocket.recovery_reason_code, websocket.heartbeat_at,
+            websocket.updated_at, websocket.evidence_purge_after,
+            EXISTS (
+              SELECT 1 FROM listener_strict_catch_up_failures
+              WHERE resolved_at IS NULL
+              LIMIT 1
+            ) AS has_unresolved
+         FROM (VALUES ($1::text)) AS health_anchor(service_key)
+         LEFT JOIN listener_heartbeats AS heartbeat
+           ON heartbeat.service_key = health_anchor.service_key
+         LEFT JOIN listener_websocket_health AS websocket
+           ON websocket.service_key = health_anchor.service_key`,
+        [LISTENER_SERVICE_KEY],
       );
-      const websocketRows = await this.database.query(
-        `SELECT payload_version, supervision, owner_generation, revision,
-            active_session_generation, candidate_session_generation,
-            provider_id, candidate_provider_id, phase, acknowledged_at,
-            last_observation_at, last_observation_slot,
-            disconnect_occurred_at, disconnect_reason_code,
-            recovery_status, recovery_started_at, recovery_completed_at,
-            recovery_reason_code, heartbeat_at, updated_at, evidence_purge_after
-         FROM listener_websocket_health
-         WHERE service_key = $1`,
-        ['transaction-listener'],
-      );
-      const strictFailures = await this.database.query(
-        `SELECT EXISTS (
-           SELECT 1 FROM listener_strict_catch_up_failures
-           WHERE resolved_at IS NULL
-           LIMIT 1
-         ) AS has_unresolved`,
-      );
-      const websocketRow = websocketRows.rows[0];
-      const websocket = websocketRow === undefined
+      const healthSnapshotRow = healthSnapshot.rows[0];
+      if (healthSnapshotRow === undefined) throw invalid();
+      const heartbeatPresent = canonicalHealthRowPresent(healthSnapshotRow.heartbeat_service_key);
+      const websocketPresent = canonicalHealthRowPresent(healthSnapshotRow.websocket_service_key);
+      const websocket = !websocketPresent
         ? inactiveWebSocketHealth()
-        : webSocketHealthFromRow(websocketRow);
-      const strictFailureRow = strictFailures.rows[0];
-      if (strictFailureRow === undefined || typeof strictFailureRow.has_unresolved !== 'boolean') {
+        : webSocketHealthFromRow(healthSnapshotRow);
+      if (typeof healthSnapshotRow.has_unresolved !== 'boolean') {
         throw invalid();
       }
-      const hasUnresolvedStrictFailure = strictFailureRow.has_unresolved;
+      const hasUnresolvedStrictFailure = healthSnapshotRow.has_unresolved;
       let socialJobs = emptySocialJobs();
       let paperDecisionJobs = emptyPaperDecisionJobs();
       let qualification = emptyQualificationHealth();
@@ -610,12 +620,14 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         pipeline = freeze({ ...pipeline, qualification: 'DEGRADED' });
       }
       const checkpoint = new Map(checkpoints.rows.map((item) => [text(item.checkpoint_key), decimal(item.slot)]));
-      const row = heartbeats.rows[0];
-      const heartbeat = row === undefined ? emptyHeartbeat(websocket) : heartbeatFromRow(row, websocket);
+      const heartbeat = !heartbeatPresent
+        ? emptyHeartbeat(websocket)
+        : heartbeatFromRow(healthSnapshotRow, websocket);
       const lagSlots = heartbeat.lastHttpSlot === null || heartbeat.lastWebsocketSlot === null
         ? null : (BigInt(heartbeat.lastHttpSlot) - BigInt(heartbeat.lastWebsocketSlot)).toString();
+      const freshnessObservedAt = validDate(this.clock());
       const heartbeatAge = heartbeat.updatedAt === null
-        ? null : observedAt.getTime() - Date.parse(heartbeat.updatedAt);
+        ? null : freshnessObservedAt.getTime() - Date.parse(heartbeat.updatedAt);
       const stale = heartbeatAge === null
         || heartbeatAge < 0
         || heartbeatAge > HEARTBEAT_STALE_AFTER_MS;
@@ -625,7 +637,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         || heartbeat.workerState !== 'RUNNING'
         || heartbeat.reconcilerState !== 'RUNNING';
       const websocketHeartbeatAge = websocket.heartbeatAt === null
-        ? null : observedAt.getTime() - Date.parse(websocket.heartbeatAt);
+        ? null : freshnessObservedAt.getTime() - Date.parse(websocket.heartbeatAt);
       const websocketStale = websocketHeartbeatAge === null
         || websocketHeartbeatAge < 0
         || websocketHeartbeatAge > WEBSOCKET_HEALTH_STALE_AFTER_MS;
@@ -646,12 +658,12 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       || pipeline.social === 'DEGRADED' || pipeline.social === 'STOPPED'
       || !socialCountsAvailable || !paperCountsAvailable || !qualificationCountsAvailable;
       return healthResult(
-        observedAt, database.rows.length > 0, degraded, checkpoint, heartbeat,
+        responseObservedAt, database.rows.length > 0, degraded, checkpoint, heartbeat,
         lagSlots, pipeline, qualification, socialJobs, paperDecisionJobs,
       );
     } catch {
       return healthResult(
-        observedAt,
+        responseObservedAt,
         false,
         true,
         new Map(),
@@ -2159,7 +2171,7 @@ function heartbeatFromRow(
   const exhaustedCount = nonNegativeSafeNumber(row.exhausted_transactions);
   if (leasedCount > backlogCount) throw invalid();
   const startedAt = nullableTimestamp(row.started_at);
-  const updatedAt = timestamp(row.updated_at).toISOString();
+  const updatedAt = timestamp(row.heartbeat_updated_at).toISOString();
   if (startedAt !== null && Date.parse(startedAt) > Date.parse(updatedAt)) throw invalid();
   return freeze({
     runtimeState, subscriberState, scannerState, workerState, reconcilerState,
@@ -2169,6 +2181,12 @@ function heartbeatFromRow(
     lastSignature: null, pendingTransactions: backlogCount,
     activeSessions: nullableSafeNumber(row.active_sessions), websocket,
   });
+}
+
+function canonicalHealthRowPresent(value: unknown): boolean {
+  if (value === null) return false;
+  if (value !== LISTENER_SERVICE_KEY) throw invalid();
+  return true;
 }
 
 function inactiveWebSocketHealth(): ApiWebSocketHealth {

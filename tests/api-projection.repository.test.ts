@@ -42,12 +42,36 @@ class FakeQueryable implements Queryable {
   ): Promise<{ readonly rows: readonly Record<string, unknown>[] }> {
     const call = { text, values };
     this.calls.push(call);
+    if (isJoinedHealthSnapshotQuery(text)) {
+      const heartbeatRows = this.respond({
+        text: 'FROM listener_heartbeats WHERE service_key = $1', values,
+      });
+      const websocketRows = this.respond({
+        text: 'FROM listener_websocket_health WHERE service_key = $1', values,
+      });
+      const strictRows = this.respond({
+        text: 'FROM listener_strict_catch_up_failures WHERE resolved_at IS NULL',
+        values: undefined,
+      });
+      const hasUnresolved = strictRows.length === 0
+        ? false
+        : strictRows[0]?.has_unresolved;
+      return { rows: [joinedHealthSnapshotRow(
+        heartbeatRows[0], websocketRows[0], hasUnresolved,
+      )] };
+    }
     const rows = this.respond(call);
     if (rows.length === 0 && text.includes('listener_strict_catch_up_failures')) {
       return { rows: [{ has_unresolved: false }] };
     }
     return { rows };
   }
+}
+
+function isJoinedHealthSnapshotQuery(text: string): boolean {
+  return text.includes('listener_heartbeats')
+    && text.includes('listener_websocket_health')
+    && text.includes('listener_strict_catch_up_failures');
 }
 
 class FakeConnectable implements Queryable {
@@ -1737,8 +1761,61 @@ void test('pins the generic heartbeat projection to the canonical listener servi
   assert.equal(health.status, 'OK');
   assert.equal(health.heartbeat.runtimeState, 'RUNNING');
   const heartbeatQuery = database.calls.find((call) => call.text.includes('listener_heartbeats'));
-  assert.match(heartbeatQuery?.text ?? '', /FROM listener_heartbeats\s+WHERE service_key = \$1/u);
+  assert.match(
+    heartbeatQuery?.text ?? '',
+    /LEFT JOIN listener_heartbeats AS heartbeat[\s\S]*heartbeat\.service_key = health_anchor\.service_key/u,
+  );
   assert.deepEqual(heartbeatQuery?.values, ['transaction-listener']);
+});
+
+void test('reads canonical runtime, WebSocket, and strict-failure health from one anchored snapshot', async () => {
+  const database = new CausalHealthQueryable(healthSnapshotRow(websocketRow()));
+
+  const health = await healthyRepository(database).getHealth();
+
+  assert.equal(health.status, 'OK');
+  const snapshotQueries = database.calls.filter((call) =>
+    call.text.includes('listener_heartbeats')
+    || call.text.includes('listener_websocket_health')
+    || call.text.includes('listener_strict_catch_up_failures'));
+  assert.equal(snapshotQueries.length, 1);
+  const snapshotQuery = snapshotQueries[0];
+  assert.match(snapshotQuery?.text ?? '', /FROM \(VALUES \(\$1::text\)\) AS health_anchor\(service_key\)/u);
+  assert.match(snapshotQuery?.text ?? '', /LEFT JOIN listener_heartbeats AS heartbeat[\s\S]*heartbeat\.service_key = health_anchor\.service_key/u);
+  assert.match(snapshotQuery?.text ?? '', /LEFT JOIN listener_websocket_health AS websocket[\s\S]*websocket\.service_key = health_anchor\.service_key/u);
+  assert.match(snapshotQuery?.text ?? '', /EXISTS \([\s\S]*listener_strict_catch_up_failures[\s\S]*resolved_at IS NULL[\s\S]*LIMIT 1/u);
+  assert.deepEqual(snapshotQuery?.values, ['transaction-listener']);
+});
+
+void test('evaluates heartbeat freshness after the causal health snapshot is read', async () => {
+  const requestStartedAt = new Date('2026-07-02T12:00:00.000Z');
+  const heartbeatWrittenAt = new Date(requestStartedAt.getTime() + 1);
+  const readCompletedAt = new Date(requestStartedAt.getTime() + 2);
+  const database = new CausalHealthQueryable(healthSnapshotRow(
+    websocketRow({
+      acknowledged_at: heartbeatWrittenAt,
+      last_observation_at: heartbeatWrittenAt,
+      heartbeat_at: heartbeatWrittenAt,
+      updated_at: heartbeatWrittenAt,
+    }),
+    false,
+    healthyHeartbeatRow({ updated_at: heartbeatWrittenAt }),
+  ));
+  const clockReads: string[] = [];
+  const repository = new PostgresApiProjectionRepository(database, () => {
+    const clockValue = database.snapshotRead ? readCompletedAt : requestStartedAt;
+    clockReads.push(clockValue.toISOString());
+    return clockValue;
+  }, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+  });
+
+  const health = await repository.getHealth();
+
+  assert.equal(health.status, 'OK');
+  assert.equal(health.observedAt, requestStartedAt.toISOString());
+  assert.deepEqual(clockReads, [requestStartedAt.toISOString(), readCompletedAt.toISOString()]);
 });
 
 void test('projects the canonical WebSocket snapshot through exact frozen redacted fields', async () => {
@@ -1850,7 +1927,7 @@ void test('ignores an absent or inactive WebSocket snapshot but degrades stale a
   assert.equal(unresolved.status, 'DEGRADED');
   const strictQuery = unresolvedDatabase.calls.find((call) =>
     call.text.includes('listener_strict_catch_up_failures'));
-  assert.match(strictQuery?.text ?? '', /SELECT\s+EXISTS\s*\(/iu);
+  assert.match(strictQuery?.text ?? '', /EXISTS\s*\(/iu);
   assert.match(strictQuery?.text ?? '', /resolved_at IS NULL/u);
 
   const inactiveUnresolved = await healthyRepository(
@@ -2008,6 +2085,12 @@ class HealthQueryable implements Queryable {
     const call = { text, values };
     this.calls.push(call);
     if (text.includes('SELECT 1 AS available')) return { rows: [{ available: 1 }] };
+    if (isJoinedHealthSnapshotQuery(text)) {
+      if (this.failWebSocket) throw new Error('postgresql://secret/websocket dependency');
+      return { rows: [joinedHealthSnapshotRow(
+        healthyHeartbeatRow(), this.websocket, this.unresolvedStrictFailure,
+      )] };
+    }
     if (text.includes('listener_heartbeats')) return { rows: [healthyHeartbeatRow()] };
     if (text.includes('listener_websocket_health')) {
       if (this.failWebSocket) throw new Error('postgresql://secret/websocket dependency');
@@ -2034,13 +2117,16 @@ function healthyRepository(database: Queryable): PostgresApiProjectionRepository
   });
 }
 
-function healthyHeartbeatRow(): Readonly<Record<string, unknown>> {
+function healthyHeartbeatRow(
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
   return {
     updated_at: openedAt, started_at: detectedAt, last_http_slot: '60',
     last_websocket_slot: '60', last_finalized_slot: '59', last_signature: 'secret-signature',
     pending_transactions: 0, active_sessions: 1, leased_transactions: 0,
     exhausted_transactions: 0, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
     scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
+    ...overrides,
   };
 }
 
@@ -2055,6 +2141,142 @@ function websocketRow(overrides: Readonly<Record<string, unknown>> = {}): Readon
     recovery_completed_at: null, recovery_reason_code: null,
     heartbeat_at: openedAt, updated_at: openedAt, evidence_purge_after: null,
     ...overrides,
+  };
+}
+
+class CausalHealthQueryable implements Queryable {
+  public readonly calls: Call[] = [];
+  public snapshotRead = false;
+
+  public constructor(private readonly snapshot: Readonly<Record<string, unknown>>) {}
+
+  public async query(
+    text: string,
+    values?: readonly unknown[],
+  ): Promise<{ readonly rows: readonly Record<string, unknown>[] }> {
+    this.calls.push({ text, values });
+    if (text.includes('SELECT 1 AS available')) return { rows: [{ available: 1 }] };
+    if (text.includes('listener_heartbeats')
+      && text.includes('listener_websocket_health')
+      && text.includes('listener_strict_catch_up_failures')) {
+      this.snapshotRead = true;
+      return { rows: [this.snapshot] };
+    }
+    if (text.includes('listener_heartbeats')) {
+      return { rows: [heartbeatRowFromSnapshot(this.snapshot)] };
+    }
+    if (text.includes('listener_websocket_health')) {
+      return { rows: [webSocketRowFromSnapshot(this.snapshot)] };
+    }
+    if (text.includes('listener_strict_catch_up_failures')) {
+      this.snapshotRead = true;
+      return { rows: [{ has_unresolved: this.snapshot.has_unresolved }] };
+    }
+    return { rows: [] };
+  }
+}
+
+function healthSnapshotRow(
+  websocket: Readonly<Record<string, unknown>> | undefined,
+  hasUnresolved = false,
+  heartbeat: Readonly<Record<string, unknown>> = healthyHeartbeatRow(),
+): Readonly<Record<string, unknown>> {
+  return joinedHealthSnapshotRow(heartbeat, websocket, hasUnresolved);
+}
+
+function joinedHealthSnapshotRow(
+  heartbeat: Readonly<Record<string, unknown>> | undefined,
+  websocket: Readonly<Record<string, unknown>> | undefined,
+  hasUnresolved: unknown,
+): Readonly<Record<string, unknown>> {
+  return {
+    heartbeat_service_key: heartbeat === undefined ? null : 'transaction-listener',
+    heartbeat_updated_at: heartbeat?.updated_at ?? null,
+    started_at: heartbeat?.started_at ?? null,
+    last_http_slot: heartbeat?.last_http_slot ?? null,
+    last_websocket_slot: heartbeat?.last_websocket_slot ?? null,
+    last_finalized_slot: heartbeat?.last_finalized_slot ?? null,
+    pending_transactions: heartbeat?.pending_transactions ?? null,
+    active_sessions: heartbeat?.active_sessions ?? null,
+    runtime_state: heartbeat?.runtime_state ?? null,
+    subscriber_state: heartbeat?.subscriber_state ?? null,
+    scanner_state: heartbeat?.scanner_state ?? null,
+    worker_state: heartbeat?.worker_state ?? null,
+    reconciler_state: heartbeat?.reconciler_state ?? null,
+    leased_transactions: heartbeat?.leased_transactions ?? null,
+    exhausted_transactions: heartbeat?.exhausted_transactions ?? null,
+    websocket_service_key: websocket === undefined ? null : 'transaction-listener',
+    payload_version: websocket?.payload_version ?? null,
+    supervision: websocket?.supervision ?? null,
+    owner_generation: websocket?.owner_generation ?? null,
+    revision: websocket?.revision ?? null,
+    active_session_generation: websocket?.active_session_generation ?? null,
+    candidate_session_generation: websocket?.candidate_session_generation ?? null,
+    provider_id: websocket?.provider_id ?? null,
+    candidate_provider_id: websocket?.candidate_provider_id ?? null,
+    phase: websocket?.phase ?? null,
+    acknowledged_at: websocket?.acknowledged_at ?? null,
+    last_observation_at: websocket?.last_observation_at ?? null,
+    last_observation_slot: websocket?.last_observation_slot ?? null,
+    disconnect_occurred_at: websocket?.disconnect_occurred_at ?? null,
+    disconnect_reason_code: websocket?.disconnect_reason_code ?? null,
+    recovery_status: websocket?.recovery_status ?? null,
+    recovery_started_at: websocket?.recovery_started_at ?? null,
+    recovery_completed_at: websocket?.recovery_completed_at ?? null,
+    recovery_reason_code: websocket?.recovery_reason_code ?? null,
+    heartbeat_at: websocket?.heartbeat_at ?? null,
+    updated_at: websocket?.updated_at ?? null,
+    evidence_purge_after: websocket?.evidence_purge_after ?? null,
+    has_unresolved: hasUnresolved,
+  };
+}
+
+function heartbeatRowFromSnapshot(
+  snapshot: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  return {
+    updated_at: snapshot.heartbeat_updated_at,
+    started_at: snapshot.started_at,
+    last_http_slot: snapshot.last_http_slot,
+    last_websocket_slot: snapshot.last_websocket_slot,
+    last_finalized_slot: snapshot.last_finalized_slot,
+    pending_transactions: snapshot.pending_transactions,
+    active_sessions: snapshot.active_sessions,
+    runtime_state: snapshot.runtime_state,
+    subscriber_state: snapshot.subscriber_state,
+    scanner_state: snapshot.scanner_state,
+    worker_state: snapshot.worker_state,
+    reconciler_state: snapshot.reconciler_state,
+    leased_transactions: snapshot.leased_transactions,
+    exhausted_transactions: snapshot.exhausted_transactions,
+  };
+}
+
+function webSocketRowFromSnapshot(
+  snapshot: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  return {
+    payload_version: snapshot.payload_version,
+    supervision: snapshot.supervision,
+    owner_generation: snapshot.owner_generation,
+    revision: snapshot.revision,
+    active_session_generation: snapshot.active_session_generation,
+    candidate_session_generation: snapshot.candidate_session_generation,
+    provider_id: snapshot.provider_id,
+    candidate_provider_id: snapshot.candidate_provider_id,
+    phase: snapshot.phase,
+    acknowledged_at: snapshot.acknowledged_at,
+    last_observation_at: snapshot.last_observation_at,
+    last_observation_slot: snapshot.last_observation_slot,
+    disconnect_occurred_at: snapshot.disconnect_occurred_at,
+    disconnect_reason_code: snapshot.disconnect_reason_code,
+    recovery_status: snapshot.recovery_status,
+    recovery_started_at: snapshot.recovery_started_at,
+    recovery_completed_at: snapshot.recovery_completed_at,
+    recovery_reason_code: snapshot.recovery_reason_code,
+    heartbeat_at: snapshot.heartbeat_at,
+    updated_at: snapshot.updated_at,
+    evidence_purge_after: snapshot.evidence_purge_after,
   };
 }
 
