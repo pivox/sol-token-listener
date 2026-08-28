@@ -1,4 +1,5 @@
 import { isProxy } from 'node:util/types';
+import bs58 from 'bs58';
 import type { StrictCatchUpScanResult } from './strict-catch-up-scanner.js';
 import { PromotedProviderSelector } from './promoted-provider-selector.js';
 import {
@@ -8,9 +9,10 @@ import {
   assertValidWebSocketHealthSnapshot,
   type WebSocketHealthSnapshot,
 } from '../domain/websocket-health.js';
-import type {
-  ListenerRuntimeState,
-  TransactionNotification,
+import {
+  assertValidTransactionNotification,
+  type TransactionNotification,
+  type ListenerRuntimeState,
 } from '../domain/transaction-ingestion.js';
 import {
   RPC_PROVIDER_IDS,
@@ -32,6 +34,7 @@ import type {
   WsProgramNotification,
   WsProgramSession,
   WsProgramSessionCompletion,
+  WsProgramSessionCompletionReason,
 } from '../solana/rpc/ws-program-session.js';
 
 export const WEBSOCKET_FRONTIER_INTERVAL_MS = 30_000;
@@ -79,12 +82,10 @@ interface SessionRecord {
   readonly session: WsProgramSession;
   readonly controller: AbortController;
   promotionFenced: boolean;
-  queuedCompletion: WsProgramSessionCompletion | null;
+  queuedCompletion: WsProgramSessionCompletionReason | null;
 }
 
-const REJECTED_SESSION_COMPLETION: WsProgramSessionCompletion = Object.freeze({
-  reason: 'PROTOCOL_INVALID',
-});
+const REJECTED_SESSION_COMPLETION_REASON: WsProgramSessionCompletionReason = 'PROTOCOL_INVALID';
 
 interface ValidatedReporter {
   startTouch(snapshot: WebSocketHealthSnapshot): void;
@@ -280,10 +281,11 @@ export class WebSocketFailoverSupervisor {
     const controller = new AbortController();
     this.#candidateAbort = controller;
     let openedSession: WsProgramSession | null = null;
-    const session = await this.#dependencies.openSession(
+    const opened = await this.#dependencies.openSession(
       Object.freeze({ id: providerId, url: endpoint.websocketUrl }),
       (value) => this.#notification(
         value,
+        providerId,
         ownerGeneration,
         sessionGeneration,
         controller,
@@ -291,8 +293,16 @@ export class WebSocketFailoverSupervisor {
       ),
       controller.signal,
     );
-    openedSession = session;
     if (this.#isPermanentlyClosed() || this.#candidateAbort !== controller) return;
+    let session: WsProgramSession;
+    try {
+      session = sessionFrom(opened, providerId);
+    } catch (error) {
+      controller.abort();
+      if (this.#candidateAbort === controller) this.#candidateAbort = null;
+      throw error;
+    }
+    openedSession = session;
     const candidate: SessionRecord = {
       providerId,
       sessionGeneration,
@@ -303,8 +313,10 @@ export class WebSocketFailoverSupervisor {
     };
     this.#candidate = candidate;
     void session.completion.then(
-      (completion) => { this.#completeSession(candidate, completion); },
-      () => { this.#completeSession(candidate, REJECTED_SESSION_COMPLETION); },
+      (completion) => {
+        this.#completeSession(candidate, completionReasonFrom(completion));
+      },
+      () => { this.#completeSession(candidate, REJECTED_SESSION_COMPLETION_REASON); },
     );
 
     await this.#transition({
@@ -392,30 +404,49 @@ export class WebSocketFailoverSupervisor {
 
   #notification(
     value: WsProgramNotification,
+    providerId: RpcProviderId,
     ownerGeneration: bigint,
     sessionGeneration: bigint,
     controller: AbortController,
     openedSession: WsProgramSession | null,
   ): Promise<void> {
-    if (this.#permanentlyClosed || this.#candidateAbort !== controller) return Promise.resolve();
-    if (openedSession !== null
-      && this.#candidate?.session !== openedSession
-      && this.#incumbent?.session !== openedSession) return Promise.resolve();
-    let programId: string | null;
+    if (this.#permanentlyClosed) return Promise.resolve();
+    if (openedSession === null) {
+      if (this.#candidateAbort !== controller) return Promise.resolve();
+    } else {
+      const record = this.#candidate?.session === openedSession
+        ? this.#candidate
+        : this.#incumbent?.session === openedSession ? this.#incumbent : null;
+      if (record?.controller !== controller
+        || record.providerId !== providerId
+        || record.sessionGeneration !== sessionGeneration) return Promise.resolve();
+    }
+    let preliminary: TransactionNotification;
     try {
-      programId = programIdFrom(value.program);
+      const payload = exactOwnData(value, ['endpointId', 'program', 'signature', 'slot']);
+      const programId = programIdFrom(payload.program);
+      if (payload.endpointId !== providerId
+        || programId === null
+        || !isCanonicalWebSocketSignature(payload.signature)) throw new TypeError();
+      preliminary = Object.freeze({
+        signature: payload.signature,
+        slot: payload.slot as bigint,
+        source: 'WEBSOCKET',
+        programIds: Object.freeze([programId]),
+        confirmationStatus: 'confirmed',
+        observedAtMs: 0,
+      });
+      assertValidTransactionNotification(preliminary);
     } catch {
       return Promise.reject(configurationError());
     }
-    if (programId === null) return Promise.reject(configurationError());
-    const notification: TransactionNotification = Object.freeze({
-      signature: value.signature,
-      slot: value.slot,
-      source: 'WEBSOCKET',
-      programIds: Object.freeze([programId]),
-      confirmationStatus: 'confirmed',
-      observedAtMs: this.#options.now(),
-    });
+    let notification: TransactionNotification;
+    try {
+      notification = Object.freeze({ ...preliminary, observedAtMs: this.#options.now() });
+      assertValidTransactionNotification(notification);
+    } catch {
+      return Promise.reject(configurationError());
+    }
     return this.#dependencies.reporter.observe(
       notification,
       ownerGeneration,
@@ -423,11 +454,11 @@ export class WebSocketFailoverSupervisor {
     );
   }
 
-  #completeSession(record: SessionRecord, completion: WsProgramSessionCompletion): void {
+  #completeSession(record: SessionRecord, reason: WsProgramSessionCompletionReason): void {
     if (this.#permanentlyClosed) return;
     if (this.#candidate === record) {
       if (record.promotionFenced) {
-        record.queuedCompletion ??= completion;
+        record.queuedCompletion ??= reason;
         return;
       }
       this.#invalidateCandidate(record);
@@ -448,24 +479,36 @@ export class WebSocketFailoverSupervisor {
 
   async #degradePromotedSession(
     record: SessionRecord,
-    completion: WsProgramSessionCompletion,
+    completionReason: WsProgramSessionCompletionReason,
   ): Promise<void> {
-    await this.#transition({
-      phase: 'DEGRADED',
-      providerId: record.providerId,
-      activeSessionGeneration: record.sessionGeneration,
-      candidateProviderId: null,
-      candidateSessionGeneration: null,
-      acknowledged: true,
-      disconnectReasonCode: disconnectReasonFromCompletion(completion),
-      recoveryStatus: 'REQUIRED',
-      recoveryReasonCode: 'SESSION_FAILURE',
-    });
-    if (this.#permanentlyClosed || this.#incumbent !== record) return;
-    this.#dependencies.promoted.clear(record.providerId);
-    this.#incumbent = null;
-    this.#currentProviderId = null;
-    this.#currentState = 'DEGRADED';
+    try {
+      await this.#transition({
+        phase: 'DEGRADED',
+        providerId: record.providerId,
+        activeSessionGeneration: record.sessionGeneration,
+        candidateProviderId: null,
+        candidateSessionGeneration: null,
+        acknowledged: true,
+        disconnectReasonCode: disconnectReasonFromCompletion(completionReason),
+        recoveryStatus: 'REQUIRED',
+        recoveryReasonCode: 'SESSION_FAILURE',
+      });
+    } catch (error) {
+      this.#abandonPromotedSession(record);
+      await this.#stopReporterAfterStartFailure();
+      throw error;
+    }
+    this.#abandonPromotedSession(record);
+  }
+
+  #abandonPromotedSession(record: SessionRecord): void {
+    record.controller.abort();
+    if (this.#incumbent === record) this.#incumbent = null;
+    if (this.#currentProviderId === record.providerId) {
+      this.#currentProviderId = null;
+      this.#dependencies.promoted.clear(record.providerId);
+    }
+    if (!this.#permanentlyClosed) this.#currentState = 'DEGRADED';
   }
 
   #finishRecovery(operation: Promise<void>, failed: boolean): void {
@@ -683,6 +726,10 @@ function assertTransitionResult(
   value: unknown,
 ): asserts value is WebSocketHealthSnapshot {
   assertValidWebSocketHealthSnapshot(value);
+  const expectedDisconnectReason = input.disconnectReasonCode
+    ?? previous.disconnect?.reasonCode
+    ?? null;
+  const actualDisconnectReason = value.disconnect?.reasonCode ?? null;
   if (value.ownerGeneration !== previous.ownerGeneration
     || value.revision !== previous.revision + 1n
     || value.phase !== input.phase
@@ -691,6 +738,7 @@ function assertTransitionResult(
     || value.candidateProviderId !== input.candidateProviderId
     || value.candidateSessionGeneration !== input.candidateSessionGeneration
     || (value.acknowledgedAtMs !== null) !== input.acknowledged
+    || actualDisconnectReason !== expectedDisconnectReason
     || value.recovery.status !== input.recoveryStatus
     || value.recovery.reasonCode !== input.recoveryReasonCode) throw new TypeError();
 }
@@ -783,6 +831,44 @@ function providerPairFrom(value: unknown, expectedId: RpcProviderId): RpcProvide
   }
 }
 
+function sessionFrom(value: unknown, expectedProviderId: RpcProviderId): WsProgramSession {
+  try {
+    if (!objectValue(value) || !Object.isFrozen(value)) throw new TypeError();
+    const session = exactOwnData(value, ['endpointId', 'completion', 'close']);
+    const completion = session.completion;
+    const close = session.close;
+    if (session.endpointId !== expectedProviderId
+      || !nativePromise(completion)
+      || typeof close !== 'function'
+      || isProxy(close)) throw new TypeError();
+    const receiver = value;
+    return Object.freeze({
+      endpointId: expectedProviderId,
+      completion: completion as Promise<WsProgramSessionCompletion>,
+      close(signal: AbortSignal): Promise<void> {
+        try {
+          const result: unknown = Reflect.apply(close, receiver, [signal]);
+          return nativePromise(result)
+            ? result as Promise<void>
+            : Promise.reject(configurationError());
+        } catch {
+          return Promise.reject(configurationError());
+        }
+      },
+    });
+  } catch {
+    throw configurationError();
+  }
+}
+
+function nativePromise(value: unknown): value is Promise<unknown> {
+  return typeof value === 'object'
+    && value !== null
+    && !isProxy(value)
+    && value instanceof Promise
+    && Object.getPrototypeOf(value) === Promise.prototype;
+}
+
 type UnknownMethod = (...parameters: never[]) => unknown;
 
 // The return-only type binds a descriptor snapshot without invoking the method.
@@ -839,9 +925,9 @@ function objectValue(value: unknown): value is object {
 }
 
 function disconnectReasonFromCompletion(
-  completion: WsProgramSessionCompletion,
+  reason: WsProgramSessionCompletionReason,
 ): NonNullable<WebSocketHealthTransition['disconnectReasonCode']> {
-  switch (completion.reason) {
+  switch (reason) {
     case 'LOCAL_CLOSE': return 'UNEXPECTED_RESTART';
     case 'SOCKET_ERROR': return 'SOCKET_ERROR';
     case 'REMOTE_CLOSE': return 'REMOTE_CLOSE';
@@ -851,11 +937,39 @@ function disconnectReasonFromCompletion(
   }
 }
 
+function completionReasonFrom(value: unknown): WsProgramSessionCompletionReason {
+  try {
+    if (!objectValue(value) || !Object.isFrozen(value)) throw new TypeError();
+    const completion = exactOwnData(value, ['reason']);
+    switch (completion.reason) {
+      case 'LOCAL_CLOSE': return 'LOCAL_CLOSE';
+      case 'SOCKET_ERROR': return 'SOCKET_ERROR';
+      case 'REMOTE_CLOSE': return 'REMOTE_CLOSE';
+      case 'PROTOCOL_INVALID': return 'PROTOCOL_INVALID';
+      case 'NOTIFICATION_FAILED': return 'NOTIFICATION_FAILED';
+      case 'CLEANUP_FAILED': return 'CLEANUP_FAILED';
+      default: return 'PROTOCOL_INVALID';
+    }
+  } catch {
+    return 'PROTOCOL_INVALID';
+  }
+}
+
 function programIdFrom(value: unknown): string | null {
   switch (value) {
     case 'pumpfun': return PUMP_PROGRAM_ID;
     case 'pumpswap': return PUMPSWAP_PROGRAM_ID;
     default: return null;
+  }
+}
+
+function isCanonicalWebSocketSignature(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 88) return false;
+  try {
+    const decoded = bs58.decode(value);
+    return decoded.byteLength === 64 && bs58.encode(decoded) === value;
+  } catch {
+    return false;
   }
 }
 

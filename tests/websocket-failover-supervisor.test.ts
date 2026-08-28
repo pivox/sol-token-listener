@@ -20,6 +20,7 @@ import {
 import type { RpcProviderId } from '../src/domain/rpc-provider.js';
 import type { TransactionNotification } from '../src/domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
+import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import type { FinalityProviderPass } from '../src/ports/finality-provider-pass.js';
 import type {
   WebSocketHealthRepository,
@@ -144,6 +145,39 @@ void test('dual ACK forwards a partial notification and promotion follows strict
   assert.equal(fixture.completionThenCalls, 1);
 });
 
+void test('promoted incumbent keeps forwarding valid websocket notifications', async () => {
+  const fixture = supervisorFixture();
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  fixture.resolveOpenSession();
+  await flushMicrotasks();
+
+  assert.equal(fixture.supervisor.state(), 'RUNNING');
+  const observe = fixture.observe;
+  assert.ok(observe !== null);
+  await observe(Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpswap',
+    signature: '1'.repeat(64),
+    slot: 43n,
+  }));
+
+  assert.deepEqual(fixture.reporter.observations.at(-1), {
+    notification: {
+      signature: '1'.repeat(64),
+      slot: 43n,
+      source: 'WEBSOCKET',
+      programIds: [PUMPSWAP_PROGRAM_ID],
+      confirmationStatus: 'confirmed',
+      observedAtMs: 1_000,
+    },
+    ownerGeneration: 1n,
+    sessionGeneration: 1n,
+  });
+});
+
 void test('promotion is abandoned when candidate completion wins before recovery', async () => {
   const fixture = supervisorFixture();
   fixture.strictResults.push(Promise.resolve(scanResult('primary')));
@@ -220,8 +254,139 @@ void test('completion after the running fence is serialized through durable degr
   assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
   assert.equal(fixture.supervisor.activeProviderId(), null);
   assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.reporter.snapshots.at(-1)?.disconnect?.reasonCode, 'REMOTE_CLOSE');
   assert.equal(fixture.scheduler.pendingDelays().includes(WEBSOCKET_FRONTIER_INTERVAL_MS), false);
   assert.equal(fixture.completionThenCalls, 1);
+});
+
+void test('queued degradation persistence failure clears and stops the promoted incumbent', async () => {
+  const hostile = 'wss://secret.invalid/degraded-transition';
+  const fixture = supervisorFixture({
+    transitionFailure: 'DEGRADED',
+    transitionError: new Error(hostile),
+  });
+  const running = deferred<WebSocketHealthSnapshot>();
+  fixture.reporter.transitionOverrides.set('RUNNING', running.promise);
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  fixture.resolveOpenSession();
+  await flushMicrotasks();
+
+  fixture.completionDeferred.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushMicrotasks();
+  const runningInput = fixture.reporter.transitions.at(-1);
+  assert.equal(runningInput?.phase, 'RUNNING');
+  assert.ok(runningInput !== undefined);
+  running.resolve(snapshotFromTransition(runningInput));
+  await flushMicrotasks();
+
+  assert.equal(fixture.calls.includes('health.transition:DEGRADED'), true);
+  assert.equal(fixture.calls.includes('selector.clear:primary'), true);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.openSignal?.aborted, true);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.scheduler.pendingDelays().includes(WEBSOCKET_FRONTIER_INTERVAL_MS), false);
+  assert.equal(fixture.reporter.stopCalls, 1);
+
+  const observe = fixture.observe;
+  assert.ok(observe !== null);
+  await observe(Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpfun',
+    signature: '4'.repeat(64),
+    slot: 44n,
+  }));
+  assert.equal(fixture.reporter.observations.length, 0);
+  assert.equal(fixture.completionThenCalls, 1);
+});
+
+void test('degradation rejects a durable snapshot with the wrong disconnect reason', async () => {
+  const fixture = supervisorFixture({ wrongDisconnectResult: 'DEGRADED' });
+  const running = deferred<WebSocketHealthSnapshot>();
+  fixture.reporter.transitionOverrides.set('RUNNING', running.promise);
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  fixture.resolveOpenSession();
+  await flushMicrotasks();
+
+  fixture.completionDeferred.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushMicrotasks();
+  const runningInput = fixture.reporter.transitions.at(-1);
+  assert.equal(runningInput?.phase, 'RUNNING');
+  assert.ok(runningInput !== undefined);
+  running.resolve(snapshotFromTransition(runningInput));
+  await flushMicrotasks();
+
+  assert.equal(fixture.reporter.transitions.at(-1)?.disconnectReasonCode, 'REMOTE_CLOSE');
+  assert.equal(fixture.reporter.snapshots.at(-1)?.disconnect?.reasonCode, 'SOCKET_ERROR');
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+});
+
+void test('hostile completion payloads become immutable protocol-invalid degradation', async () => {
+  const hostile = 'wss://secret.invalid/completion?reason=secret';
+  let proxyTraps = 0;
+  let getterCalls = 0;
+  const proxy = new Proxy(Object.freeze({ reason: 'REMOTE_CLOSE' }), {
+    get(_target, key) {
+      if (key === 'then') return undefined;
+      proxyTraps += 1;
+      throw new Error(hostile);
+    },
+    getPrototypeOf() { proxyTraps += 1; throw new Error(hostile); },
+    ownKeys() { proxyTraps += 1; throw new Error(hostile); },
+    getOwnPropertyDescriptor() { proxyTraps += 1; throw new Error(hostile); },
+  });
+  const accessor = {};
+  Object.defineProperty(accessor, 'reason', {
+    enumerable: true,
+    get() { getterCalls += 1; throw new Error(hostile); },
+  });
+  Object.freeze(accessor);
+  const mutable = { reason: 'REMOTE_CLOSE' };
+  const variants: Readonly<{ value: unknown; mutate?: () => void }>[] = [
+    { value: proxy },
+    { value: accessor },
+    { value: mutable, mutate: () => { mutable.reason = 'SOCKET_ERROR'; } },
+  ];
+
+  for (const variant of variants) {
+    const fixture = supervisorFixture();
+    const running = deferred<WebSocketHealthSnapshot>();
+    fixture.reporter.transitionOverrides.set('RUNNING', running.promise);
+    fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+    await fixture.supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushMicrotasks();
+    fixture.resolveOpenSession();
+    await flushMicrotasks();
+
+    fixture.completionDeferred.resolve(variant.value as WsProgramSessionCompletion);
+    variant.mutate?.();
+    await flushMicrotasks();
+    const runningInput = fixture.reporter.transitions.at(-1);
+    assert.equal(runningInput?.phase, 'RUNNING');
+    assert.ok(runningInput !== undefined);
+    running.resolve(snapshotFromTransition(runningInput));
+    await flushMicrotasks();
+
+    const degraded = fixture.reporter.transitions.at(-1);
+    assert.equal(degraded?.phase, 'DEGRADED');
+    assert.equal(degraded.disconnectReasonCode, 'PROTOCOL_INVALID');
+    assert.equal(fixture.reporter.snapshots.at(-1)?.disconnect?.reasonCode, 'PROTOCOL_INVALID');
+    assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+    assert.equal(fixture.supervisor.activeProviderId(), null);
+    assert.equal(fixture.completionThenCalls, 1);
+  }
+  assert.equal(proxyTraps, 0);
+  assert.equal(getterCalls, 0);
 });
 
 void test('running transition rejection invalidates a queued completion without publication', async () => {
@@ -283,6 +448,118 @@ void test('hostile websocket program is rejected redacted before clock or observ
   );
   assert.equal(nowCalls, 1);
   assert.equal(fixture.reporter.observations.length, 0);
+});
+
+void test('hostile notification payloads are rejected without traps, clock, or observation', async () => {
+  const hostile = 'wss://secret.invalid/notification?signature=secret';
+  let nowCalls = 0;
+  let proxyTraps = 0;
+  let getterCalls = 0;
+  const fixture = supervisorFixture({
+    now: () => {
+      nowCalls += 1;
+      return 1_000;
+    },
+  });
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  const observe = fixture.observe;
+  assert.ok(observe !== null);
+
+  const proxy = new Proxy(Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpfun',
+    signature: '5'.repeat(64),
+    slot: 45n,
+  }), {
+    get() { proxyTraps += 1; throw new Error(hostile); },
+    getPrototypeOf() { proxyTraps += 1; throw new Error(hostile); },
+    ownKeys() { proxyTraps += 1; throw new Error(hostile); },
+    getOwnPropertyDescriptor() { proxyTraps += 1; throw new Error(hostile); },
+  });
+  const accessor = {
+    endpointId: 'primary',
+    signature: '5'.repeat(64),
+    slot: 45n,
+  };
+  Object.defineProperty(accessor, 'program', {
+    enumerable: true,
+    get() { getterCalls += 1; throw new Error(hostile); },
+  });
+  const invalidSignature = Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpfun',
+    signature: hostile,
+    slot: 45n,
+  });
+  const invalidSlot = Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpfun',
+    signature: '5'.repeat(64),
+    slot: 45,
+  });
+
+  for (const value of [proxy, accessor, invalidSignature, invalidSlot]) {
+    await assertConfigurationRejection(
+      Promise.resolve().then(() => observe(value as unknown as WsProgramNotification)),
+      hostile,
+    );
+  }
+  assert.equal(proxyTraps, 0);
+  assert.equal(getterCalls, 0);
+  assert.equal(nowCalls, 1);
+  assert.equal(fixture.reporter.observations.length, 0);
+});
+
+void test('hostile opened sessions are rejected before record or strict scan', async () => {
+  const hostile = 'wss://secret.invalid/session?token=secret';
+  let proxyTraps = 0;
+  let getterCalls = 0;
+  const completion = new Promise<WsProgramSessionCompletion>(() => undefined);
+  const close = async (): Promise<void> => undefined;
+  const valid = Object.freeze({ endpointId: 'primary', completion, close });
+  const proxy = new Proxy(valid, {
+    get(_target, key) {
+      if (key === 'then') return undefined;
+      proxyTraps += 1;
+      throw new Error(hostile);
+    },
+    getPrototypeOf() { proxyTraps += 1; throw new Error(hostile); },
+    ownKeys() { proxyTraps += 1; throw new Error(hostile); },
+    getOwnPropertyDescriptor() { proxyTraps += 1; throw new Error(hostile); },
+  });
+  const accessor = { completion, close };
+  Object.defineProperty(accessor, 'endpointId', {
+    enumerable: true,
+    get() { getterCalls += 1; throw new Error(hostile); },
+  });
+  Object.freeze(accessor);
+  const variants = [
+    proxy,
+    accessor,
+    { endpointId: 'primary', completion, close },
+    Object.freeze({ endpointId: 'fallback-1', completion, close }),
+    Object.freeze({ endpointId: 'primary', completion: hostile, close }),
+  ];
+
+  for (const value of variants) {
+    const fixture = supervisorFixture({
+      sessionResult: Promise.resolve(value as unknown as WsProgramSession),
+    });
+    await fixture.supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushMicrotasks();
+
+    assert.equal(fixture.openSignal?.aborted, true);
+    assert.equal(fixture.strictCalls.length, 0);
+    assert.equal(fixture.calls.includes('health.transition:ACKNOWLEDGED'), false);
+    assert.equal(fixture.calls.includes('selector.promote:primary'), false);
+    assert.equal(fixture.supervisor.activeProviderId(), null);
+    assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  }
+  assert.equal(proxyTraps, 0);
+  assert.equal(getterCalls, 0);
 });
 
 void test('owner failure is redacted before touch, scheduling, socket, or strict HTTP', async () => {
@@ -621,6 +898,8 @@ interface FixtureOptions {
   readonly transitionFailure?: WebSocketHealthTransition['phase'];
   readonly transitionError?: Error;
   readonly mutableTransitionResult?: WebSocketHealthTransition['phase'];
+  readonly wrongDisconnectResult?: WebSocketHealthTransition['phase'];
+  readonly sessionResult?: Promise<WsProgramSession>;
   readonly scheduleFailureDelay?: number;
   readonly scheduleError?: Error;
 }
@@ -660,6 +939,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     settings.transitionFailure,
     settings.transitionError,
     settings.mutableTransitionResult,
+    settings.wrongDisconnectResult,
   );
   const selector = new RecordingSelector(calls);
   const strictResults: Promise<StrictCatchUpScanResult>[] = [];
@@ -689,7 +969,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     openedEndpoint = endpoint;
     observe = nextObserve;
     openSignal = signal;
-    return openSessionDeferred.promise;
+    return settings.sessionResult ?? openSessionDeferred.promise;
   };
   const providers = new RecordingCatalog(calls);
   const dependencies: WebSocketFailoverSupervisorDependencies = Object.freeze({
@@ -760,17 +1040,20 @@ class RecordingCatalog implements RpcProviderCatalog {
 class RecordingReporter extends PersistentWebSocketHealthReporter {
   public readonly transitions: WebSocketHealthTransition[] = [];
   public readonly observations: RecordedObservation[] = [];
+  public readonly snapshots: WebSocketHealthSnapshot[] = [];
   public readonly transitionOverrides = new Map<
     WebSocketHealthTransition['phase'],
     Promise<WebSocketHealthSnapshot>
   >();
   public stopCalls = 0;
+  #latestSnapshot = snapshot('CONNECTING', 1n);
 
   public constructor(
     private readonly calls: string[],
     private readonly transitionFailure?: WebSocketHealthTransition['phase'],
     private readonly transitionError: Error = new Error('Expected transition failure.'),
     private readonly mutableTransitionResult?: WebSocketHealthTransition['phase'],
+    private readonly wrongDisconnectResult?: WebSocketHealthTransition['phase'],
   ) {
     super(
       { async enqueue() {} },
@@ -792,8 +1075,20 @@ class RecordingReporter extends PersistentWebSocketHealthReporter {
     this.transitions.push(input);
     if (input.phase === this.transitionFailure) return Promise.reject(this.transitionError);
     const override = this.transitionOverrides.get(input.phase);
-    if (override !== undefined) return override;
-    const next = snapshotFromTransition(input);
+    if (override !== undefined) {
+      return override.then((next) => {
+        this.#latestSnapshot = next;
+        this.snapshots.push(next);
+        return next;
+      });
+    }
+    const next = snapshotFromTransition(
+      input,
+      this.#latestSnapshot,
+      input.phase === this.wrongDisconnectResult ? 'SOCKET_ERROR' : undefined,
+    );
+    this.#latestSnapshot = next;
+    this.snapshots.push(next);
     return Promise.resolve(input.phase === this.mutableTransitionResult ? { ...next } : next);
   }
 
@@ -957,7 +1252,11 @@ function connectingSnapshot(providerId: RpcProviderId): WebSocketHealthSnapshot 
   });
 }
 
-function snapshotFromTransition(input: WebSocketHealthTransition): WebSocketHealthSnapshot {
+function snapshotFromTransition(
+  input: WebSocketHealthTransition,
+  previous?: WebSocketHealthSnapshot,
+  disconnectReasonOverride?: NonNullable<WebSocketHealthTransition['disconnectReasonCode']>,
+): WebSocketHealthSnapshot {
   const startedAtMs = input.recoveryStatus === 'REQUIRED'
     || input.recoveryStatus === 'NOT_REQUIRED' ? null : 1_000;
   const completedAtMs = input.recoveryStatus === 'RECOVERED'
@@ -974,7 +1273,12 @@ function snapshotFromTransition(input: WebSocketHealthTransition): WebSocketHeal
     phase: input.phase,
     acknowledgedAtMs: input.acknowledged ? 1_000 : null,
     lastObservation: null,
-    disconnect: null,
+    disconnect: input.disconnectReasonCode === null
+      ? previous?.disconnect ?? null
+      : {
+          occurredAtMs: 1_000,
+          reasonCode: disconnectReasonOverride ?? input.disconnectReasonCode,
+        },
     recovery: {
       status: input.recoveryStatus,
       startedAtMs,
@@ -1034,6 +1338,19 @@ async function assertStage(
     assert.equal(error.message, 'WebSocket failover supervisor operation failed.');
     assert.equal(error.stage, stage);
     assert.equal(Object.isFrozen(error), true);
+    assert.equal(Object.hasOwn(error, 'cause'), false);
+    assert.equal(String(error).includes(hostile), false);
+    return true;
+  });
+}
+
+async function assertConfigurationRejection(
+  operation: Promise<unknown>,
+  hostile: string,
+): Promise<void> {
+  await assert.rejects(operation, (error: unknown) => {
+    assert.ok(error instanceof TypeError);
+    assert.equal(error.message, 'WebSocket failover supervisor configuration is invalid.');
     assert.equal(Object.hasOwn(error, 'cause'), false);
     assert.equal(String(error).includes(hostile), false);
     return true;
