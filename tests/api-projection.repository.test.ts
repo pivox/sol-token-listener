@@ -1716,6 +1716,31 @@ void test('returns health without exposing database URLs or secrets', async () =
   assert.doesNotMatch(JSON.stringify(health), /:\/\/|DATABASE_URL|password|secret|localhost/u);
 });
 
+void test('pins the generic heartbeat projection to the canonical listener service', async () => {
+  const foreignHeartbeat = {
+    ...healthyHeartbeatRow(),
+    updated_at: new Date(openedAt.getTime() + 1),
+    runtime_state: 'STOPPED',
+  };
+  const database = new FakeQueryable((call) => {
+    if (call.text.includes('SELECT 1 AS available')) return [{ available: 1 }];
+    if (call.text.includes('listener_heartbeats')) {
+      const canonicalRead = call.text.includes('WHERE service_key = $1')
+        && call.values?.[0] === 'transaction-listener';
+      return [canonicalRead ? healthyHeartbeatRow() : foreignHeartbeat];
+    }
+    return [];
+  });
+
+  const health = await healthyRepository(database).getHealth();
+
+  assert.equal(health.status, 'OK');
+  assert.equal(health.heartbeat.runtimeState, 'RUNNING');
+  const heartbeatQuery = database.calls.find((call) => call.text.includes('listener_heartbeats'));
+  assert.match(heartbeatQuery?.text ?? '', /FROM listener_heartbeats\s+WHERE service_key = \$1/u);
+  assert.deepEqual(heartbeatQuery?.values, ['transaction-listener']);
+});
+
 void test('projects the canonical WebSocket snapshot through exact frozen redacted fields', async () => {
   const database = healthyHealthDatabase(websocketRow({
     phase: 'DEGRADED',

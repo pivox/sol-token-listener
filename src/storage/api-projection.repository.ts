@@ -476,7 +476,9 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
             last_finalized_slot, pending_transactions, active_sessions,
             runtime_state, subscriber_state, scanner_state, worker_state,
             reconciler_state, leased_transactions, exhausted_transactions
-         FROM listener_heartbeats ORDER BY updated_at DESC LIMIT 1`,
+         FROM listener_heartbeats
+         WHERE service_key = $1`,
+        ['transaction-listener'],
       );
       const websocketRows = await this.database.query(
         `SELECT payload_version, supervision, owner_generation, revision,
