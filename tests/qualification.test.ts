@@ -15,6 +15,7 @@ import type { QualificationReasonCode } from '../src/domain/qualification-reason
 import { parseQualificationProfile } from '../src/qualification/qualification-profile.js';
 
 const defaultQualificationRuleSet = createDefaultQualificationRuleSet(60);
+const LISTENER_DISABLED = 'false';
 
 function noCalibrationFacts(): QualificationCalibrationFacts {
   return Object.freeze({
@@ -286,6 +287,7 @@ void test('injecte le seuil d’environnement dans le moteur construit pour l’
   const config = parseConfig({
     SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
     SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+    LISTENER_ENABLED: LISTENER_DISABLED,
     QUALIFICATION_MIN_SCORE: '61',
   });
   const report = createQualificationEngine(config).evaluate({
@@ -316,6 +318,7 @@ void test('preserves the selected profile minimum unless the environment overrid
     const baseEnvironment = {
       SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
       SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+      LISTENER_ENABLED: LISTENER_DISABLED,
       QUALIFICATION_PROFILE_PATH: profilePath,
     };
 
@@ -408,6 +411,7 @@ void test('uses the effective profile minimum override and keeps null facts comp
   const config = parseConfig({
     SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
     SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+    LISTENER_ENABLED: LISTENER_DISABLED,
     QUALIFICATION_MIN_SCORE: '61',
   });
   const report = createQualificationEngine(config).evaluate({

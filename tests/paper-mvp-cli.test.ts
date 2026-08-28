@@ -30,6 +30,7 @@ import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const OWNER = 'paper-mvp-owner-test';
+const TEST_GENESIS_HASH = '11111111111111111111111111111111';
 
 void test('parses the exact bounded canonical paper MVP arguments', () => {
   assert.deepEqual(parsePaperMvpArguments([
@@ -687,6 +688,7 @@ function paperConfig(): AppConfig {
   return parseConfig({
     SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
     SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid', EXECUTION_MODE: 'paper',
+    SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
     CREATION_STRATEGY_ENABLED: 'true', PAPER_ENTRY_QUOTE_AMOUNT_RAW: '1000',
     PAPER_SLIPPAGE_BPS: '100', EXTERNAL_MIN_BUY_AMOUNT_RAW: '1',
     QUALIFICATION_PROFILE_PATH: 'config/qualification/pumpfun-v1-unvalidated.json',

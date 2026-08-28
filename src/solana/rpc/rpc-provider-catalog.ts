@@ -29,10 +29,8 @@ export function createRpcProviderCatalog(
     || websocketFallbacks.length > 3
     || (websocketFallbacks.length > 0 && websocketFallbacks.length !== httpFallbacks.length)
     || !validStrictPair(config.httpRpcUrl, config.wsRpcUrl)
-    || (websocketFallbacks.length > 0 && (
-      !uniqueUrls([config.httpRpcUrl, ...httpFallbacks])
-      || !uniqueUrls([config.wsRpcUrl, ...websocketFallbacks])
-    ))) {
+    || !uniqueUrls([config.httpRpcUrl, ...httpFallbacks])
+    || !uniqueUrls([config.wsRpcUrl, ...websocketFallbacks])) {
     throw invalidCatalog();
   }
 

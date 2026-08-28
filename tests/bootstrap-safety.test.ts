@@ -20,10 +20,12 @@ import { createQualificationEngine as buildQualificationEngine } from '../src/qu
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+const TEST_GENESIS_HASH = '11111111111111111111111111111111';
 
 const config = parseConfig({
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
   SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+  SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
 });
 
 void test('bootstrap imports no signing, submission, or live execution path', async () => {

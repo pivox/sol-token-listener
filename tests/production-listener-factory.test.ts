@@ -25,6 +25,8 @@ import {
   type ListenerRuntimeScheduler,
 } from '../src/application/production-listener-factory.js';
 
+const TEST_GENESIS_HASH = '11111111111111111111111111111111';
+
 void test('builds a redacted structured live-edge gap warning', () => {
   const gap = createCatchUpGap(
     Object.freeze({ key: 'launchpad', slot: 40n, signature: 'secret-old', updatedAtMs: 1_000 }),
@@ -50,6 +52,7 @@ void test('composes the passive production listener without opening resources', 
     parseConfig({
       SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
       SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+      SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
     }),
     inertPool as unknown as ReturnType<typeof getDatabasePool>,
   );
@@ -70,6 +73,7 @@ void test('keeps fixed social retention compatible with a different foundation r
     parseConfig({
       SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
       SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+      SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
       DATA_RETENTION_HOURS: '24',
     }),
     inertPool as unknown as ReturnType<typeof getDatabasePool>,
@@ -649,6 +653,7 @@ function config(overrides: Record<string, string> = {}): ReturnType<typeof parse
   return parseConfig({
     SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
     SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+    SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
     ...overrides,
   });
 }

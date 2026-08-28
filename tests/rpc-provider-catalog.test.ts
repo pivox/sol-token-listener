@@ -29,6 +29,25 @@ void test('keeps only a strict primary pair when HTTP-only fallbacks are configu
   assert.equal(Object.isFrozen(catalog.resolve('primary')), true);
 });
 
+void test('rejects duplicate or invalid HTTP-only fallbacks with a fixed redacted error', () => {
+  for (const httpRpcFallbackUrls of [
+    Object.freeze(['HTTPS://PRIMARY.INVALID/rpc']),
+    Object.freeze(['not-a-valid-http-url-secret']),
+  ]) {
+    assert.throws(() => createRpcProviderCatalog({
+      httpRpcUrl: 'https://primary.invalid/rpc',
+      httpRpcFallbackUrls,
+      wsRpcUrl: 'wss://primary.invalid/rpc',
+      wsRpcFallbackUrls: Object.freeze([]),
+    }), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message, 'RPC provider catalog is invalid.');
+      assert.doesNotMatch(String(error), /secret|invalid\/rpc/i);
+      return true;
+    });
+  }
+});
+
 void test('accepts strict primary-only HTTPS/WSS and HTTP/WS pairs', () => {
   for (const [httpRpcUrl, wsRpcUrl] of [
     ['https://primary.invalid/rpc', 'wss://primary.invalid/rpc'],
