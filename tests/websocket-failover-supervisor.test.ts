@@ -6,13 +6,19 @@ import {
   WEBSOCKET_FRONTIER_INTERVAL_MS,
   WEBSOCKET_BACKOFF_BASE_MS,
   WEBSOCKET_BACKOFF_CAP_MS,
+  equalJitterDelay,
   WebSocketFailoverSupervisor,
   WebSocketFailoverSupervisorError,
   type WebSocketFailoverScheduler,
   type WebSocketFailoverSupervisorDependencies,
   type WebSocketFailoverSupervisorOptions,
 } from '../src/application/websocket-failover-supervisor.js';
-import type { StrictCatchUpScanResult } from '../src/application/strict-catch-up-scanner.js';
+import {
+  StrictCatchUpAbortedError,
+  StrictCatchUpScannerError,
+  StrictCatchUpWindowExceededError,
+  type StrictCatchUpScanResult,
+} from '../src/application/strict-catch-up-scanner.js';
 import {
   createWebSocketHealthSnapshot,
   type WebSocketHealthSnapshot,
@@ -27,12 +33,489 @@ import type {
   WebSocketHealthTransition,
 } from '../src/ports/websocket-health-repository.js';
 import type { RpcProviderCatalog, RpcProviderPair } from '../src/solana/rpc/rpc-provider-catalog.js';
+import {
+  WS_PROGRAM_SESSION_CLEANUP_TIMEOUT_MS,
+  WsProgramSessionError,
+} from '../src/solana/rpc/ws-program-session.js';
 import type {
   openWsProgramSession,
   WsProgramNotification,
   WsProgramSession,
   WsProgramSessionCompletion,
 } from '../src/solana/rpc/ws-program-session.js';
+
+void test('equal-jitter backoff uses exact capped zero-based delays and rejects hostile inputs', () => {
+  assert.equal(equalJitterDelay(0, 0), 500);
+  assert.equal(equalJitterDelay(0, 0.999), 999);
+  assert.equal(equalJitterDelay(1, 0), 1_000);
+  assert.equal(equalJitterDelay(20, 0), 30_000);
+  assert.equal(equalJitterDelay(20, 0.999), 59_970);
+
+  for (const [count, random] of [
+    [-1, 0],
+    [0.5, 0],
+    [Number.MAX_SAFE_INTEGER + 1, 0],
+    [0, -0.1],
+    [0, 1],
+    [0, Number.NaN],
+    [0, Number.POSITIVE_INFINITY],
+  ] as const) {
+    assert.throws(
+      () => equalJitterDelay(count, random),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, 'WebSocket recovery backoff input is invalid.');
+        assert.equal(Object.hasOwn(error, 'cause'), false);
+        return true;
+      },
+    );
+  }
+});
+
+void test('finite rotation resumes after fallback-1 and schedules one zero-based backoff', async () => {
+  const providerIds = Object.freeze([
+    'primary', 'fallback-1', 'fallback-2', 'fallback-3',
+  ] as const);
+  const fallbackOne = controlledSession('fallback-1');
+  const fixture = supervisorFixture({
+    providerIds,
+    random: () => 0.5,
+    sessionFactories: [
+      () => Promise.reject(new WsProgramSessionError('SETUP_TIMEOUT')),
+      () => Promise.resolve(fallbackOne.session),
+      () => Promise.reject(new WsProgramSessionError('PROTOCOL_INVALID')),
+      () => Promise.reject(new WsProgramSessionError('SOCKET_ERROR')),
+      () => Promise.reject(new WsProgramSessionError('REMOTE_CLOSE')),
+      () => Promise.reject(new WsProgramSessionError('NOTIFICATION_FAILED')),
+    ],
+  });
+  fixture.strictResults.push(Promise.resolve(scanResult('fallback-1')));
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(fixture.supervisor.activeProviderId(), 'fallback-1');
+
+  fallbackOne.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.deepEqual(
+    fixture.calls
+      .filter((call) => call.startsWith('session.open:'))
+      .map((call) => call.slice('session.open:'.length)),
+    ['primary', 'fallback-1', 'fallback-2', 'fallback-3', 'primary', 'fallback-1'],
+  );
+  assert.deepEqual(fixture.strictCalls.map(({ providerId }) => providerId), ['fallback-1']);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [750]);
+  assert.equal(fixture.reporter.transitions.filter(({ phase }) => phase === 'DEGRADED').length, 2);
+  for (const transition of fixture.reporter.transitions.filter(
+    ({ phase }) => phase === 'CONNECTING',
+  )) {
+    assert.equal(transition.candidateSessionGeneration, transition.expectedRevision + 1n);
+  }
+});
+
+void test('rotation gives every acknowledged provider one strict scan and cleans each candidate', async () => {
+  const providerIds = Object.freeze([
+    'primary', 'fallback-1', 'fallback-2', 'fallback-3',
+  ] as const);
+  const sessions = providerIds.map((providerId) => controlledSession(providerId));
+  const fixture = supervisorFixture({
+    providerIds,
+    random: () => 0,
+    sessionFactories: sessions.map(({ session }) => () => Promise.resolve(session)),
+  });
+  fixture.strictResults.push(
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'launchpad', 'request')),
+    rejected(new StrictCatchUpScannerError(
+      'checkpoint-cas', 'fallback-1', 'market', null,
+    )),
+    rejected(new StrictCatchUpScannerError('source', 'fallback-2', 'market', 'response')),
+    rejected(new StrictCatchUpScannerError(
+      'checkpoint-read', 'fallback-3', 'launchpad', null,
+    )),
+  );
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.deepEqual(
+    fixture.calls.filter((call) => call.startsWith('session.open:')),
+    providerIds.map((id) => `session.open:${id}`),
+  );
+  assert.deepEqual(fixture.strictCalls.map(({ providerId }) => providerId), providerIds);
+  assert.equal(sessions.every((session) => session.closeCalls() === 1), true);
+  assert.equal(sessions.every((session) => session.closeSignals[0]?.aborted === false), true);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+});
+
+void test('same-frontier exhaustion becomes durable unrecoverable without any timer', async () => {
+  const providerIds = Object.freeze(['primary', 'fallback-1'] as const);
+  const sessions = providerIds.map((providerId) => controlledSession(providerId));
+  const frontier = strictFrontier('same');
+  const fixture = supervisorFixture({
+    providerIds,
+    sessionFactories: sessions.map(({ session }) => () => Promise.resolve(session)),
+  });
+  fixture.strictResults.push(
+    rejected(new StrictCatchUpWindowExceededError('primary', 'launchpad', frontier)),
+    rejected(new StrictCatchUpWindowExceededError('fallback-1', 'market', frontier)),
+  );
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  const final = fixture.reporter.transitions.at(-1);
+  assert.equal(final?.phase, 'UNRECOVERABLE');
+  assert.equal(final?.candidateProviderId, null);
+  assert.equal(final?.candidateSessionGeneration, null);
+  assert.equal(final?.recoveryStatus, 'FAILED');
+  assert.equal(final?.recoveryReasonCode, 'CATCH_UP_WINDOW_EXCEEDED');
+  assert.equal(sessions.every((session) => session.closeCalls() === 1), true);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+});
+
+void test('mixed or different frontier exhaustion remains degraded with one backoff', async () => {
+  const variants = [
+    [
+      new StrictCatchUpWindowExceededError('primary', 'launchpad', strictFrontier('mixed')),
+      new StrictCatchUpScannerError('source', 'fallback-1', 'market', 'request'),
+    ],
+    [
+      new StrictCatchUpWindowExceededError('primary', 'launchpad', strictFrontier('left')),
+      new StrictCatchUpWindowExceededError('fallback-1', 'market', strictFrontier('right')),
+    ],
+  ] as const;
+
+  for (const failures of variants) {
+    const providerIds = Object.freeze(['primary', 'fallback-1'] as const);
+    const sessions = providerIds.map((providerId) => controlledSession(providerId));
+    const fixture = supervisorFixture({
+      providerIds,
+      random: () => 0,
+      sessionFactories: sessions.map(({ session }) => () => Promise.resolve(session)),
+    });
+    fixture.strictResults.push(...failures.map((failure) => rejected(failure)));
+
+    await fixture.supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+
+    assert.equal(
+      fixture.reporter.transitions.some(({ phase }) => phase === 'UNRECOVERABLE'),
+      false,
+    );
+    assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'DEGRADED');
+    assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+    assert.equal(sessions.every((session) => session.closeCalls() === 1), true);
+  }
+});
+
+void test('periodic frontier rearms only after successful settlement and never from notifications', async () => {
+  const incumbent = controlledSession('primary');
+  const periodic = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(incumbent.session)],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    periodic.promise,
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
+
+  const observe = fixture.openedAttempts[0]?.observe;
+  assert.ok(observe !== undefined);
+  await observe(Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpfun',
+    signature: '1'.repeat(64),
+    slot: 50n,
+  }));
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
+
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  assert.deepEqual(fixture.strictCalls.map(({ providerId }) => providerId), [
+    'primary', 'primary',
+  ]);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+
+  periodic.resolve(scanResult('primary'));
+  await flushLifecycle();
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WEBSOCKET_FRONTIER_INTERVAL_MS]);
+  assert.equal(fixture.supervisor.state(), 'RUNNING');
+});
+
+void test('periodic frontier failure degrades once and coalesces one recovery loop', async () => {
+  const incumbent = controlledSession('primary');
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(incumbent.session)],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+
+  assert.equal(fixture.reporter.transitions.filter(({ phase }) => phase === 'DEGRADED').length, 1);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(incumbent.closeCalls(), 0);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [0]);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+});
+
+void test('stale incumbent completion cannot degrade a replacement promoted after overlap', async () => {
+  const events: string[] = [];
+  const incumbent = controlledSession(
+    'primary',
+    Promise.resolve(),
+    () => { events.push('incumbent.close'); },
+  );
+  const candidate = controlledSession('primary');
+  const candidateScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    candidateScan.promise,
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.equal(fixture.strictCalls.length, 3);
+  assert.equal(incumbent.closeCalls(), 0);
+  const incumbentObserve = fixture.openedAttempts[0]?.observe;
+  assert.ok(incumbentObserve !== undefined);
+  await incumbentObserve(Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpswap',
+    signature: '1'.repeat(64),
+    slot: 51n,
+  }));
+  assert.equal(fixture.reporter.observations.at(-1)?.sessionGeneration, 1n);
+
+  const runningCallsBefore = fixture.calls.filter(
+    (call) => call === 'health.transition:RUNNING',
+  ).length;
+  candidateScan.resolve(scanResult('primary'));
+  await flushLifecycle();
+
+  assert.equal(
+    fixture.calls.filter((call) => call === 'health.transition:RUNNING').length,
+    runningCallsBefore + 1,
+  );
+  assert.equal(fixture.calls.filter((call) => call === 'selector.promote:primary').length, 2);
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.deepEqual(events, ['incumbent.close']);
+  assert.equal(fixture.supervisor.state(), 'RUNNING');
+
+  const transitionCount = fixture.reporter.transitions.length;
+  incumbent.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+  assert.equal(fixture.reporter.transitions.length, transitionCount);
+  assert.equal(fixture.supervisor.state(), 'RUNNING');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), 'primary');
+});
+
+void test('shutdown during strict recovery aborts, closes once, and waits for the scan', async () => {
+  const candidate = controlledSession('primary');
+  const strict = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(candidate.session)],
+  });
+  fixture.strictResults.push(strict.promise);
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(fixture.strictCalls.length, 1);
+
+  const firstClose = fixture.supervisor.close();
+  assert.equal(fixture.supervisor.close(), firstClose);
+  let settled = false;
+  void firstClose.then(
+    () => { settled = true; },
+    () => { settled = true; },
+  );
+  await flushLifecycle();
+
+  assert.equal(fixture.strictCalls[0]?.signal.aborted, true);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assert.equal(settled, false);
+
+  strict.reject(new StrictCatchUpAbortedError());
+  await firstClose;
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+});
+
+void test('shutdown during backoff cancels the sole timer and fences its stale callback', async () => {
+  const fixture = supervisorFixture({
+    random: () => 0,
+    sessionFactories: [
+      () => Promise.reject(new WsProgramSessionError('SETUP_TIMEOUT')),
+    ],
+  });
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+
+  await fixture.supervisor.close();
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+  assert.equal(fixture.reporter.stopCalls, 1);
+  const callsAfterClose = fixture.calls.length;
+
+  fixture.scheduler.invokeFirst(500);
+  await flushLifecycle();
+  assert.equal(fixture.calls.length, callsAfterClose);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+});
+
+void test('shutdown during periodic frontier aborts and waits without a late transition', async () => {
+  const incumbent = controlledSession('primary');
+  const periodic = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(incumbent.session)],
+  });
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')), periodic.promise);
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  const transitionCount = fixture.reporter.transitions.length;
+
+  const closing = fixture.supervisor.close();
+  let settled = false;
+  void closing.then(
+    () => { settled = true; },
+    () => { settled = true; },
+  );
+  await flushLifecycle();
+  assert.equal(fixture.strictCalls.at(-1)?.signal.aborted, true);
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(settled, false);
+
+  periodic.resolve(scanResult('primary'));
+  await closing;
+  assert.equal(fixture.reporter.transitions.length, transitionCount);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+});
+
+void test('shutdown drains incumbent and candidate overlap exactly once', async () => {
+  const observerDrain = deferred<undefined>();
+  const incumbent = controlledSession('primary', observerDrain.promise);
+  const candidate = controlledSession('primary');
+  const candidateScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    candidateScan.promise,
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  const transitionCount = fixture.reporter.transitions.length;
+  const closing = fixture.supervisor.close();
+  let settled = false;
+  void closing.then(
+    () => { settled = true; },
+    () => { settled = true; },
+  );
+  await flushLifecycle();
+  assert.equal(candidateScan.settled(), false);
+  assert.equal(fixture.strictCalls.at(-1)?.signal.aborted, true);
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(settled, false);
+
+  candidateScan.reject(new StrictCatchUpAbortedError());
+  await flushLifecycle();
+  assert.equal(settled, false);
+  observerDrain.resolve(undefined);
+  await closing;
+
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(fixture.reporter.transitions.length, transitionCount);
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+});
+
+void test('shutdown cleanup timeout aborts the close signal and never reports stopped', async () => {
+  const incumbent = controlledSession(
+    'primary',
+    (signal) => new Promise<void>((_resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        reject(new WsProgramSessionError('CLEANUP_FAILED'));
+      }, { once: true });
+    }),
+  );
+  const fixture = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(incumbent.session)],
+  });
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  const firstClose = fixture.supervisor.close();
+  assert.equal(fixture.supervisor.close(), firstClose);
+  await flushLifecycle();
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [WS_PROGRAM_SESSION_CLEANUP_TIMEOUT_MS]);
+  assert.equal(incumbent.closeSignals[0]?.aborted, false);
+
+  fixture.scheduler.fireNext(WS_PROGRAM_SESSION_CLEANUP_TIMEOUT_MS);
+  await assertStage(firstClose, 'cleanup', 'never-leaked');
+  assert.equal(incumbent.closeSignals[0]?.aborted, true);
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(fixture.reporter.stopCalls, 1);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.notEqual(fixture.supervisor.state(), 'STOPPED');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+});
 
 void test('owner acquisition starts touch, persists waiting, and schedules recovery before sockets', async () => {
   const fixture = supervisorFixture();
@@ -902,10 +1385,17 @@ void test('close is idempotent, cancels handles, aborts setup, and prevents late
   await flushMicrotasks();
   assert.equal(opening.openSignal?.aborted, false);
 
-  await opening.supervisor.close();
-  assert.equal(opening.openSignal?.aborted, true);
-  opening.resolveOpenSession();
+  const openingClose = opening.supervisor.close();
+  let openingCloseSettled = false;
+  void openingClose.then(
+    () => { openingCloseSettled = true; },
+    () => { openingCloseSettled = true; },
+  );
   await flushMicrotasks();
+  assert.equal(opening.openSignal?.aborted, true);
+  assert.equal(openingCloseSettled, false);
+  opening.resolveOpenSession();
+  await openingClose;
   assert.equal(opening.calls.includes('selector.promote:primary'), false);
   assert.equal(opening.calls.includes('scheduler.periodic:30000'), false);
   assert.equal(opening.supervisor.activeProviderId(), null);
@@ -929,6 +1419,8 @@ void test('close is idempotent, cancels handles, aborts setup, and prevents late
 
 interface FixtureOptions {
   readonly now?: () => number;
+  readonly random?: () => number;
+  readonly providerIds?: readonly RpcProviderId[];
   readonly ownerFailure?: Error;
   readonly ownerResult?: Promise<WebSocketHealthSnapshot>;
   readonly ownerSnapshot?: WebSocketHealthSnapshot;
@@ -937,6 +1429,8 @@ interface FixtureOptions {
   readonly mutableTransitionResult?: WebSocketHealthTransition['phase'];
   readonly wrongDisconnectResult?: WebSocketHealthTransition['phase'];
   readonly sessionResult?: Promise<WsProgramSession>;
+  readonly sessionResults?: Promise<WsProgramSession>[];
+  readonly sessionFactories?: (() => Promise<WsProgramSession>)[];
   readonly scheduleFailureDelay?: number;
   readonly scheduleError?: Error;
 }
@@ -956,6 +1450,13 @@ interface SupervisorFixture {
   readonly observe: ((notification: WsProgramNotification) => Promise<void>) | null;
   readonly openedEndpoint: Readonly<{ id: RpcProviderId; url: string }> | null;
   readonly openSignal: AbortSignal | null;
+  readonly openedAttempts: readonly OpenedAttempt[];
+}
+
+interface OpenedAttempt {
+  readonly endpoint: Readonly<{ id: RpcProviderId; url: string }>;
+  readonly observe: (notification: WsProgramNotification) => Promise<void>;
+  readonly signal: AbortSignal;
 }
 
 interface StrictCall {
@@ -965,6 +1466,8 @@ interface StrictCall {
 
 function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
   const calls: string[] = [];
+  const providerIds = settings.providerIds
+    ?? Object.freeze(['primary'] as const);
   const scheduler = new ManualScheduler(
     calls,
     settings.scheduleFailureDelay,
@@ -977,7 +1480,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     settings.mutableTransitionResult,
     settings.wrongDisconnectResult,
   );
-  const selector = new RecordingSelector(calls);
+  const selector = new RecordingSelector(calls, providerIds);
   const strictResults: Promise<StrictCatchUpScanResult>[] = [];
   const strictCalls: StrictCall[] = [];
   const openSessionDeferred = deferred<WsProgramSession>();
@@ -991,14 +1494,20 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
   let observe: ((notification: WsProgramNotification) => Promise<void>) | null = null;
   let openedEndpoint: Readonly<{ id: RpcProviderId; url: string }> | null = null;
   let openSignal: AbortSignal | null = null;
+  const openedAttempts: OpenedAttempt[] = [];
   const openSession: typeof openWsProgramSession = (endpoint, nextObserve, signal) => {
     calls.push(`session.open:${endpoint.id}`);
     openedEndpoint = endpoint;
     observe = nextObserve;
     openSignal = signal;
-    return settings.sessionResult ?? openSessionDeferred.promise;
+    openedAttempts.push(Object.freeze({ endpoint, observe: nextObserve, signal }));
+    const factory = settings.sessionFactories?.shift();
+    return factory?.()
+      ?? settings.sessionResults?.shift()
+      ?? settings.sessionResult
+      ?? openSessionDeferred.promise;
   };
-  const providers = new RecordingCatalog(calls);
+  const providers = new RecordingCatalog(calls, providerIds);
   const dependencies: WebSocketFailoverSupervisorDependencies = Object.freeze({
     providers,
     health: Object.freeze({
@@ -1020,7 +1529,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
   });
   const options: WebSocketFailoverSupervisorOptions = Object.freeze({
     now: settings.now ?? (() => 1_000),
-    random: () => 0.5,
+    random: settings.random ?? (() => 0.5),
     scheduler: Object.freeze({
       schedule(callback: () => void, delayMs: number): unknown {
         return scheduler.schedule(callback, delayMs);
@@ -1045,13 +1554,19 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     get observe() { return observe; },
     get openedEndpoint() { return openedEndpoint; },
     get openSignal() { return openSignal; },
+    openedAttempts,
   };
 }
 
 class RecordingCatalog implements RpcProviderCatalog {
-  public readonly ids = Object.freeze(['primary'] as const);
+  public readonly ids: readonly RpcProviderId[];
 
-  public constructor(private readonly calls: string[]) {}
+  public constructor(
+    private readonly calls: string[],
+    ids: readonly RpcProviderId[],
+  ) {
+    this.ids = ids;
+  }
 
   public resolve(id: RpcProviderId): RpcProviderPair {
     this.calls.push(`catalog.resolve:${id}`);
@@ -1141,8 +1656,11 @@ interface RecordedObservation {
 }
 
 class RecordingSelector extends PromotedProviderSelector {
-  public constructor(private readonly calls: string[]) {
-    super([providerPass('primary')]);
+  public constructor(
+    private readonly calls: string[],
+    ids: readonly RpcProviderId[] = Object.freeze(['primary'] as const),
+  ) {
+    super(ids.map(providerPass));
   }
 
   public override promote(providerId: RpcProviderId): void {
@@ -1353,6 +1871,62 @@ function scanResult(providerId: RpcProviderId): StrictCatchUpScanResult {
   });
 }
 
+interface ControlledSession {
+  readonly session: WsProgramSession;
+  readonly completion: Deferred<WsProgramSessionCompletion>;
+  readonly closeSignals: AbortSignal[];
+  readonly closeCalls: () => number;
+}
+
+function controlledSession(
+  providerId: RpcProviderId,
+  closeResult: Promise<void> | ((signal: AbortSignal) => Promise<void>) = Promise.resolve(),
+  onClose: () => void = () => undefined,
+): ControlledSession {
+  const completion = deferred<WsProgramSessionCompletion>();
+  const closeSignals: AbortSignal[] = [];
+  let closes = 0;
+  const session: WsProgramSession = Object.freeze({
+    endpointId: providerId,
+    completion: completion.promise,
+    close(signal: AbortSignal): Promise<void> {
+      closes += 1;
+      closeSignals.push(signal);
+      onClose();
+      return typeof closeResult === 'function' ? closeResult(signal) : closeResult;
+    },
+  });
+  return Object.freeze({
+    session,
+    completion,
+    closeSignals,
+    closeCalls(): number { return closes; },
+  });
+}
+
+function strictFrontier(seed: string) {
+  return Object.freeze({
+    launchpad: Object.freeze({
+      key: 'launchpad' as const,
+      signature: `${seed}-launchpad`,
+      slot: 10n,
+      updatedAtMs: 100,
+    }),
+    market: Object.freeze({
+      key: 'market' as const,
+      signature: `${seed}-market`,
+      slot: 11n,
+      updatedAtMs: 100,
+    }),
+  });
+}
+
+function rejected<TValue = never>(error: Error): Promise<TValue> {
+  const operation = Promise.reject<TValue>(error);
+  void operation.catch(() => undefined);
+  return operation;
+}
+
 async function assertStage(
   operation: Promise<unknown>,
   stage: WebSocketFailoverSupervisorError['stage'],
@@ -1441,4 +2015,8 @@ function deferred<TValue>(): Deferred<TValue> {
 
 async function flushMicrotasks(): Promise<void> {
   for (let index = 0; index < 8; index += 1) await Promise.resolve();
+}
+
+async function flushLifecycle(): Promise<void> {
+  for (let index = 0; index < 80; index += 1) await Promise.resolve();
 }
