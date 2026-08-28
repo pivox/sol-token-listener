@@ -916,6 +916,7 @@ void test('starts or resumes exactly, persists progress atomically, terminalizes
     );
 
     const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.websocketHealthEvidence, 0);
     assert.equal(purged.paperMvpSamples, 2);
     assert.equal(purged.paperMvpRuns, 3);
     assert.equal((await pool.query('SELECT 1 FROM paper_mvp_position_samples')).rowCount, 0);

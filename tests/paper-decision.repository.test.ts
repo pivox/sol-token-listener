@@ -1250,6 +1250,7 @@ void test('manual-kill wake remains claimable after aligned finalized inbox rete
     await pool.query(`DELETE FROM chain_transaction_finality_replay_receipts
       WHERE signature='signature'`);
     const protectedPurge=await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.websocketHealthEvidence,0);
     assert.equal(protectedPurge.transactionInbox,0);
     await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
       signature,observed_slot,confirmation_status,finality_evidence_version,
@@ -1258,6 +1259,7 @@ void test('manual-kill wake remains claimable after aligned finalized inbox rete
       immutable_fingerprint,processed_at FROM chain_transaction_inbox
       WHERE signature='signature'`);
     const purged=await purgeExpiredFoundationData(pool);
+    assert.equal(purged.websocketHealthEvidence,0);
     assert.equal(purged.transactionInbox,1);
     assert.equal((await pool.query(`SELECT COUNT(*)
       FROM chain_transaction_finality_replay_receipts
@@ -1847,6 +1849,7 @@ void test('purges counted external buys before their terminal paper session', as
     assert.ok(before.rows[0]?.purge_after instanceof Date);
 
     const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.websocketHealthEvidence, 0);
     assert.equal(purged.paperExternalBuys, 1);
     assert.equal(purged.paperSessions, 1);
   });

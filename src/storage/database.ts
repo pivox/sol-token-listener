@@ -166,6 +166,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly transactionInboxRecoveries: number;
   readonly listenerCatchUpGaps: number;
   readonly listenerStrictCatchUpFailures: number;
+  readonly websocketHealthEvidence: number;
   readonly transactionInbox: number;
   readonly apiEventStream: number;
   readonly domainEvents: number;
@@ -444,6 +445,20 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        WHERE resolved_at IS NOT NULL
          AND purge_after <= clock_timestamp()`,
     );
+    const websocketHealthEvidence = await client.query(
+      `UPDATE listener_websocket_health
+       SET disconnect_occurred_at = NULL,
+           disconnect_reason_code = NULL,
+           recovery_status = 'NOT_REQUIRED',
+           recovery_started_at = NULL,
+           recovery_completed_at = NULL,
+           recovery_reason_code = NULL,
+           acknowledged_at = CASE WHEN phase = 'STOPPED' THEN NULL ELSE acknowledged_at END,
+           last_observation_at = CASE WHEN phase = 'STOPPED' THEN NULL ELSE last_observation_at END,
+           last_observation_slot = CASE WHEN phase = 'STOPPED' THEN NULL ELSE last_observation_slot END,
+           evidence_purge_after = NULL
+       WHERE evidence_purge_after <= clock_timestamp()`,
+    );
     await client.query(
       `UPDATE chain_transaction_inbox
        SET terminal_at = processed_at,
@@ -696,6 +711,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       transactionInboxRecoveries: transactionInboxRecoveries.rowCount ?? 0,
       listenerCatchUpGaps: listenerCatchUpGaps.rowCount ?? 0,
       listenerStrictCatchUpFailures: listenerStrictCatchUpFailures.rowCount ?? 0,
+      websocketHealthEvidence: websocketHealthEvidence.rowCount ?? 0,
       transactionInbox: transactionInbox.rowCount ?? 0,
       apiEventStream: Number(apiEventStream.rows[0]?.deleted_count ?? 0),
       domainEvents: (participantDomainEvents.rowCount ?? 0)

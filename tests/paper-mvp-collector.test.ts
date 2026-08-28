@@ -797,6 +797,7 @@ void test('retains sampled expired position coverage until the active run termin
     });
 
     const protectedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.websocketHealthEvidence,0);
     assert.equal(protectedPurge.paperDecisionJobs,0);
     assert.equal(protectedPurge.paperTrades,0);
     assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,1);
@@ -823,6 +824,7 @@ void test('retains sampled expired position coverage until the active run termin
       state:'FAILED',completionReason:null,report:null,failureCode:'TEST_TERMINAL',
     });
     const releasedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(releasedPurge.websocketHealthEvidence,0);
     assert.equal(releasedPurge.paperDecisionJobs,1);
     assert.equal((await pool.query('SELECT 1 FROM paper_decision_jobs')).rowCount,0);
     assert.equal((await pool.query("SELECT 1 FROM paper_positions WHERE position_id='position-1'")).rowCount,0);
@@ -895,6 +897,7 @@ void test('retains holding jobs and positions closed after deadline for an activ
     await repository.startOrResume(runSnapshot.run.configuration,OWNER,startedAt);
 
     const protectedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.websocketHealthEvidence,0);
     assert.equal(protectedPurge.paperDecisionJobs,0);
     assert.equal(protectedPurge.paperTrades,0);
     assert.equal((await pool.query('SELECT job_id FROM paper_decision_jobs')).rowCount,2);
@@ -968,6 +971,7 @@ void test('fails an abandoned run deterministically and releases its retained so
       runSnapshot.run.configuration,OWNER,ancientStartedAt,
     );
     const finalPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(finalPurge.websocketHealthEvidence,0);
     assert.equal(finalPurge.paperMvpRuns,1);
     assert.equal(await repository.load(ancient.runId),null);
   });
@@ -1125,6 +1129,7 @@ void test('retains inclusive-window launch and rejected candidate coverage only 
     }),OWNER,startedAt);
 
     const protectedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.websocketHealthEvidence,0);
     assert.equal(protectedPurge.tradingCandidates,0);
     assert.equal(protectedPurge.tokenLaunches,0);
     assert.equal((await pool.query('SELECT 1 FROM trading_candidates')).rowCount,1);
@@ -1135,6 +1140,7 @@ void test('retains inclusive-window launch and rejected candidate coverage only 
       state:'FAILED',completionReason:null,report:null,failureCode:'TEST_TERMINAL',
     });
     const releasedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(releasedPurge.websocketHealthEvidence,0);
     assert.equal(releasedPurge.tradingCandidates,1);
     assert.equal(releasedPurge.tokenLaunches,1);
     assert.equal((await pool.query('SELECT 1 FROM trading_candidates')).rowCount,0);

@@ -112,6 +112,7 @@ void test('adds replay-safe terminal receipts and bounded finality preflight ind
     assert.equal(planNodes.some((node)=>
       node['Node Type']==='Seq Scan'&&node['Relation Name']==='raw_chain_events'),false);
     const purged=await purgeExpiredFoundationData(pool);
+    assert.equal(purged.websocketHealthEvidence,0);
     assert.equal(purged.transactionInbox,2);
     assert.equal((await pool.query(
       'SELECT COUNT(*) FROM chain_transaction_finality_replay_receipts',

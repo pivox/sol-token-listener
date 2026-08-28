@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
-import { migrateDatabase } from '../src/storage/database.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 
 const migrationsDirectory = new URL('../migrations/', import.meta.url);
 const migrationName = '030_listener_websocket_health.sql';
@@ -109,6 +109,124 @@ void test('websocket health migration accepts scale-bearing mathematical integer
         RETURNING last_observation_slot::TEXT`, [slot]);
       assert.equal(result.rows[0]?.last_observation_slot, slot);
     }
+  });
+});
+
+void test('websocket health retention keeps unresolved evidence and purges exact four-hour boundaries', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: websocket health retention test skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'websocket_health_retention', async (pool) => {
+    await migrateDatabase({ pool });
+    await pool.query(`WITH instant AS (SELECT clock_timestamp() AS now)
+      INSERT INTO listener_websocket_health (
+        service_key, supervision, owner_generation, revision,
+        active_session_generation, provider_id, phase, acknowledged_at,
+        last_observation_at, last_observation_slot,
+        disconnect_occurred_at, disconnect_reason_code,
+        recovery_status, recovery_started_at, recovery_completed_at,
+        recovery_reason_code, heartbeat_at, updated_at, evidence_purge_after
+      ) SELECT
+        'retention-running-boundary', 'ACTIVE', 1, 7,
+        1, 'primary', 'RUNNING', now - INTERVAL '5 hours',
+        now - INTERVAL '5 hours', 101,
+        now - INTERVAL '4 hours', 'REMOTE_CLOSE',
+        'RECOVERED', now - INTERVAL '5 hours', now - INTERVAL '4 hours',
+        'SESSION_FAILURE', now - INTERVAL '6 hours', now - INTERVAL '4 hours', now
+      FROM instant`);
+    await pool.query(`WITH instant AS (SELECT clock_timestamp() AS now)
+      INSERT INTO listener_websocket_health (
+        service_key, supervision, owner_generation, revision, phase,
+        last_observation_at, last_observation_slot,
+        disconnect_occurred_at, disconnect_reason_code,
+        recovery_status, recovery_started_at, recovery_completed_at,
+        recovery_reason_code, heartbeat_at, updated_at, evidence_purge_after
+      ) SELECT
+        'retention-stopped-boundary', 'ACTIVE', 1, 8, 'STOPPED',
+        now - INTERVAL '5 hours', 202,
+        now - INTERVAL '4 hours', 'ABORTED',
+        'RECOVERED', now - INTERVAL '5 hours', now - INTERVAL '4 hours',
+        'STARTUP', now - INTERVAL '6 hours', now - INTERVAL '4 hours', now
+      FROM instant`);
+    await pool.query(`WITH instant AS (SELECT clock_timestamp() AS now)
+      INSERT INTO listener_websocket_health (
+        service_key, supervision, owner_generation, revision,
+        active_session_generation, provider_id, phase, acknowledged_at,
+        last_observation_at, last_observation_slot,
+        disconnect_occurred_at, disconnect_reason_code,
+        recovery_status, recovery_started_at, recovery_completed_at,
+        recovery_reason_code, heartbeat_at, updated_at, evidence_purge_after
+      ) SELECT
+        'retention-running-before-boundary', 'ACTIVE', 1, 9,
+        2, 'fallback-1', 'RUNNING', now - INTERVAL '2 hours',
+        now - INTERVAL '1 hour', 303,
+        now - INTERVAL '1 hour', 'SOCKET_ERROR',
+        'RECOVERED', now - INTERVAL '2 hours', now - INTERVAL '1 hour',
+        'RPC_UNAVAILABLE', now - INTERVAL '3 hours', now - INTERVAL '1 hour',
+        now - INTERVAL '1 hour' + INTERVAL '4 hours'
+      FROM instant`);
+    await pool.query(`WITH instant AS (SELECT clock_timestamp() AS now)
+      INSERT INTO listener_websocket_health (
+        service_key, supervision, owner_generation, revision, phase,
+        disconnect_occurred_at, disconnect_reason_code,
+        recovery_status, recovery_started_at, recovery_completed_at,
+        recovery_reason_code, heartbeat_at, updated_at, evidence_purge_after
+      ) SELECT
+        'retention-unresolved', 'ACTIVE', 1, 10, 'DEGRADED',
+        now - INTERVAL '1 hour', 'CLEANUP_FAILED',
+        'FAILED', now - INTERVAL '2 hours', now - INTERVAL '1 hour',
+        'SESSION_FAILURE', now - INTERVAL '3 hours', now - INTERVAL '1 hour', NULL
+      FROM instant`);
+
+    const before = await retentionRows(pool);
+    assert.equal(before.get('retention-running-boundary')?.exact_four_hour_deadline, true);
+    assert.equal(before.get('retention-stopped-boundary')?.exact_four_hour_deadline, true);
+    assert.equal(before.get('retention-running-before-boundary')?.exact_four_hour_deadline, true);
+    assert.equal(before.get('retention-running-before-boundary')?.deadline_is_future, true);
+
+    const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.websocketHealthEvidence, 2);
+    const after = await retentionRows(pool);
+
+    const running = after.get('retention-running-boundary');
+    assert.equal(running?.acknowledged_at?.getTime(), before.get('retention-running-boundary')?.acknowledged_at?.getTime());
+    assert.equal(running?.last_observation_at?.getTime(), before.get('retention-running-boundary')?.last_observation_at?.getTime());
+    assert.equal(running?.last_observation_slot, '101');
+    assert.equal(running?.disconnect_occurred_at, null);
+    assert.equal(running?.disconnect_reason_code, null);
+    assert.equal(running?.recovery_status, 'NOT_REQUIRED');
+    assert.equal(running?.recovery_started_at, null);
+    assert.equal(running?.recovery_completed_at, null);
+    assert.equal(running?.recovery_reason_code, null);
+    assert.equal(running?.evidence_purge_after, null);
+    assert.equal(running?.heartbeat_at?.getTime(), before.get('retention-running-boundary')?.heartbeat_at?.getTime());
+    assert.equal(running?.updated_at.getTime(), before.get('retention-running-boundary')?.updated_at.getTime());
+    assert.equal(running?.revision, '7');
+
+    const stopped = after.get('retention-stopped-boundary');
+    assert.equal(stopped?.acknowledged_at, null);
+    assert.equal(stopped?.last_observation_at, null);
+    assert.equal(stopped?.last_observation_slot, null);
+    assert.equal(stopped?.disconnect_occurred_at, null);
+    assert.equal(stopped?.disconnect_reason_code, null);
+    assert.equal(stopped?.recovery_status, 'NOT_REQUIRED');
+    assert.equal(stopped?.recovery_started_at, null);
+    assert.equal(stopped?.recovery_completed_at, null);
+    assert.equal(stopped?.recovery_reason_code, null);
+    assert.equal(stopped?.evidence_purge_after, null);
+    assert.equal(stopped?.heartbeat_at?.getTime(), before.get('retention-stopped-boundary')?.heartbeat_at?.getTime());
+    assert.equal(stopped?.updated_at.getTime(), before.get('retention-stopped-boundary')?.updated_at.getTime());
+    assert.equal(stopped?.revision, '8');
+
+    assert.deepEqual(after.get('retention-running-before-boundary'), before.get('retention-running-before-boundary'));
+    assert.deepEqual(after.get('retention-unresolved'), before.get('retention-unresolved'));
+
+    const repeatedPurge = await purgeExpiredFoundationData(pool);
+    assert.equal(repeatedPurge.websocketHealthEvidence, 0);
+    assert.deepEqual(await retentionRows(pool), after);
   });
 });
 
@@ -237,6 +355,41 @@ function constraintCase(
     assignment,
     constraint: `listener_websocket_health_${constraintSuffix}`,
   });
+}
+
+interface RetentionRow {
+  readonly service_key: string;
+  readonly revision: string;
+  readonly acknowledged_at: Date | null;
+  readonly last_observation_at: Date | null;
+  readonly last_observation_slot: string | null;
+  readonly disconnect_occurred_at: Date | null;
+  readonly disconnect_reason_code: string | null;
+  readonly recovery_status: string;
+  readonly recovery_started_at: Date | null;
+  readonly recovery_completed_at: Date | null;
+  readonly recovery_reason_code: string | null;
+  readonly heartbeat_at: Date | null;
+  readonly updated_at: Date;
+  readonly evidence_purge_after: Date | null;
+  readonly exact_four_hour_deadline: boolean | null;
+  readonly deadline_is_future: boolean | null;
+}
+
+async function retentionRows(
+  pool: InstanceType<typeof pg.Pool>,
+): Promise<ReadonlyMap<string, RetentionRow>> {
+  const result = await pool.query<RetentionRow>(`SELECT
+    service_key, revision::TEXT, acknowledged_at, last_observation_at,
+    last_observation_slot::TEXT, disconnect_occurred_at, disconnect_reason_code,
+    recovery_status, recovery_started_at, recovery_completed_at,
+    recovery_reason_code, heartbeat_at, updated_at, evidence_purge_after,
+    evidence_purge_after = recovery_completed_at + INTERVAL '4 hours'
+      AS exact_four_hour_deadline,
+    evidence_purge_after > clock_timestamp() AS deadline_is_future
+    FROM listener_websocket_health WHERE service_key LIKE 'retention-%'
+    ORDER BY service_key`);
+  return new Map(result.rows.map((row) => [row.service_key, row]));
 }
 
 function activeRow(serviceKey: string, phase: string, recovery: string): string {

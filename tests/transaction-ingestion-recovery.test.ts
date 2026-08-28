@@ -162,6 +162,7 @@ void test('terminalizes legacy finality rows for four hours without purging pend
 
     const result = await purgeExpiredFoundationData(pool);
 
+    assert.equal(result.websocketHealthEvidence, 0);
     assert.equal(result.transactionInbox, 1);
     for (const signature of ['recent-finalized', 'recent-orphaned']) {
       const row = (await pool.query(
