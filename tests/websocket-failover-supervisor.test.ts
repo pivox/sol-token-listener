@@ -96,11 +96,6 @@ void test('dual ACK forwards a partial notification and promotion follows strict
 
   fixture.resolveOpenSession();
   await flushMicrotasks();
-  assert.equal(fixture.completionThenCalls, 1);
-  assert.ok(
-    fixture.calls.indexOf('session.completion.attach')
-      < fixture.calls.indexOf('health.transition:ACKNOWLEDGED'),
-  );
   assert.deepEqual(fixture.reporter.transitions.map(({ phase }) => phase), [
     'WAITING_FOR_ACKS',
     'ACKNOWLEDGED',
@@ -142,7 +137,6 @@ void test('dual ACK forwards a partial notification and promotion follows strict
   assert.equal(fixture.scheduler.pendingDelays().includes(WEBSOCKET_FRONTIER_INTERVAL_MS), true);
   assert.equal(fixture.supervisor.state(), 'RUNNING');
   assert.equal(fixture.supervisor.activeProviderId(), 'primary');
-  assert.equal(fixture.completionThenCalls, 1);
 });
 
 void test('promoted incumbent keeps forwarding valid websocket notifications', async () => {
@@ -189,11 +183,6 @@ void test('promotion is abandoned when candidate completion wins before recovery
   fixture.resolveOpenSession();
   await flushMicrotasks();
 
-  assert.equal(fixture.completionThenCalls, 1);
-  assert.ok(
-    fixture.calls.indexOf('session.completion.attach')
-      < fixture.calls.indexOf('health.transition:ACKNOWLEDGED'),
-  );
   assert.equal(fixture.openSignal?.aborted, true);
   assert.equal(fixture.strictCalls.length, 0);
   assert.equal(fixture.calls.includes('health.transition:RUNNING'), false);
@@ -256,7 +245,6 @@ void test('completion after the running fence is serialized through durable degr
   assert.equal(fixture.supervisor.state(), 'DEGRADED');
   assert.equal(fixture.reporter.snapshots.at(-1)?.disconnect?.reasonCode, 'REMOTE_CLOSE');
   assert.equal(fixture.scheduler.pendingDelays().includes(WEBSOCKET_FRONTIER_INTERVAL_MS), false);
-  assert.equal(fixture.completionThenCalls, 1);
 });
 
 void test('queued degradation persistence failure clears and stops the promoted incumbent', async () => {
@@ -300,7 +288,6 @@ void test('queued degradation persistence failure clears and stops the promoted 
     slot: 44n,
   }));
   assert.equal(fixture.reporter.observations.length, 0);
-  assert.equal(fixture.completionThenCalls, 1);
 });
 
 void test('degradation rejects a durable snapshot with the wrong disconnect reason', async () => {
@@ -383,7 +370,6 @@ void test('hostile completion payloads become immutable protocol-invalid degrada
     assert.equal(fixture.reporter.snapshots.at(-1)?.disconnect?.reasonCode, 'PROTOCOL_INVALID');
     assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
     assert.equal(fixture.supervisor.activeProviderId(), null);
-    assert.equal(fixture.completionThenCalls, 1);
   }
   assert.equal(proxyTraps, 0);
   assert.equal(getterCalls, 0);
@@ -413,7 +399,6 @@ void test('running transition rejection invalidates a queued completion without 
   assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
   assert.equal(fixture.supervisor.activeProviderId(), null);
   assert.equal(fixture.supervisor.state(), 'DEGRADED');
-  assert.equal(fixture.completionThenCalls, 1);
 });
 
 void test('hostile websocket program is rejected redacted before clock or observation', async () => {
@@ -560,6 +545,58 @@ void test('hostile opened sessions are rejected before record or strict scan', a
   }
   assert.equal(proxyTraps, 0);
   assert.equal(getterCalls, 0);
+});
+
+void test('opened session rejects own completion then without invoking it or retaining candidate', async () => {
+  const hostile = 'wss://secret.invalid/completion-then?token=secret';
+  let getterCalls = 0;
+  let dataThenCalls = 0;
+  const accessorCompletion = new Promise<WsProgramSessionCompletion>(() => undefined);
+  void Object.defineProperty(accessorCompletion, 'then', {
+    configurable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error(hostile);
+    },
+  });
+  const dataCompletion = new Promise<WsProgramSessionCompletion>(() => undefined);
+  void Object.defineProperty(dataCompletion, 'then', {
+    configurable: true,
+    value: () => {
+      dataThenCalls += 1;
+      throw new Error(hostile);
+    },
+  });
+
+  for (const completion of [accessorCompletion, dataCompletion]) {
+    const session: WsProgramSession = Object.freeze({
+      endpointId: 'primary',
+      completion,
+      async close(): Promise<void> {},
+    });
+    const fixture = supervisorFixture({ sessionResult: Promise.resolve(session) });
+    await fixture.supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushMicrotasks();
+
+    assert.equal(fixture.openSignal?.aborted, true);
+    assert.equal(fixture.calls.includes('health.transition:ACKNOWLEDGED'), false);
+    assert.equal(fixture.strictCalls.length, 0);
+    assert.equal(fixture.calls.includes('selector.promote:primary'), false);
+    assert.equal(fixture.supervisor.activeProviderId(), null);
+    assert.equal(fixture.supervisor.state(), 'DEGRADED');
+    const observe = fixture.observe;
+    assert.ok(observe !== null);
+    await observe(Object.freeze({
+      endpointId: 'primary',
+      program: 'pumpfun',
+      signature: '1'.repeat(64),
+      slot: 46n,
+    }));
+    assert.equal(fixture.reporter.observations.length, 0);
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(dataThenCalls, 0);
 });
 
 void test('owner failure is redacted before touch, scheduling, socket, or strict HTTP', async () => {
@@ -916,7 +953,6 @@ interface SupervisorFixture {
   readonly openSessionDeferred: Deferred<WsProgramSession>;
   readonly completionDeferred: Deferred<WsProgramSessionCompletion>;
   readonly resolveOpenSession: () => void;
-  readonly completionThenCalls: number;
   readonly observe: ((notification: WsProgramNotification) => Promise<void>) | null;
   readonly openedEndpoint: Readonly<{ id: RpcProviderId; url: string }> | null;
   readonly openSignal: AbortSignal | null;
@@ -946,16 +982,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
   const strictCalls: StrictCall[] = [];
   const openSessionDeferred = deferred<WsProgramSession>();
   const completionDeferred = deferred<WsProgramSessionCompletion>();
-  let completionThenCalls = 0;
   const completion = completionDeferred.promise;
-  const originalThen = completion.then.bind(completion);
-  void Object.defineProperty(completion, 'then', {
-    value: (...parameters: Parameters<typeof originalThen>): ReturnType<typeof originalThen> => {
-      completionThenCalls += 1;
-      calls.push('session.completion.attach');
-      return originalThen(...parameters);
-    },
-  });
   const session: WsProgramSession = Object.freeze({
     endpointId: 'primary',
     completion,
@@ -1015,7 +1042,6 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     openSessionDeferred,
     completionDeferred,
     resolveOpenSession() { openSessionDeferred.resolve(session); },
-    get completionThenCalls() { return completionThenCalls; },
     get observe() { return observe; },
     get openedEndpoint() { return openedEndpoint; },
     get openSignal() { return openSignal; },

@@ -41,6 +41,10 @@ export const WEBSOCKET_FRONTIER_INTERVAL_MS = 30_000;
 export const WEBSOCKET_BACKOFF_BASE_MS = 1_000;
 export const WEBSOCKET_BACKOFF_CAP_MS = 60_000;
 
+// The captured intrinsic is invoked only through Reflect.apply with an explicit receiver.
+// eslint-disable-next-line @typescript-eslint/unbound-method
+const PROMISE_THEN = Promise.prototype.then;
+
 export interface WebSocketFailoverScheduler {
   schedule(callback: () => void, delayMs: number): unknown;
   cancel(handle: unknown): void;
@@ -312,12 +316,17 @@ export class WebSocketFailoverSupervisor {
       queuedCompletion: null,
     };
     this.#candidate = candidate;
-    void session.completion.then(
-      (completion) => {
-        this.#completeSession(candidate, completionReasonFrom(completion));
-      },
-      () => { this.#completeSession(candidate, REJECTED_SESSION_COMPLETION_REASON); },
-    );
+    try {
+      void Reflect.apply(PROMISE_THEN, session.completion, [
+        (completion: unknown): void => {
+          this.#completeSession(candidate, completionReasonFrom(completion));
+        },
+        (): void => { this.#completeSession(candidate, REJECTED_SESSION_COMPLETION_REASON); },
+      ]);
+    } catch {
+      this.#invalidateCandidate(candidate);
+      throw configurationError();
+    }
 
     await this.#transition({
       phase: 'ACKNOWLEDGED',
@@ -866,7 +875,8 @@ function nativePromise(value: unknown): value is Promise<unknown> {
     && value !== null
     && !isProxy(value)
     && value instanceof Promise
-    && Object.getPrototypeOf(value) === Promise.prototype;
+    && Object.getPrototypeOf(value) === Promise.prototype
+    && Object.getOwnPropertyDescriptor(value, 'then') === undefined;
 }
 
 type UnknownMethod = (...parameters: never[]) => unknown;
