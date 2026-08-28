@@ -169,6 +169,21 @@ seules les ressources antérieures sont rollbackées. En observe, la politique
 <code>DEGRADED_RETRY</code> résout cette barrière avant de démarrer les workers
 suivants et conserve la reprise à l’intervalle normal.
 
+Avant toute simulation, la lignée paper vérifie aussi le replay de finalité
+jusqu’au curseur source complet. Chaque raw active du mint — ainsi que la raw
+source même orphaned — doit avoir une inbox <code>PROCESSED</code> dont le statut
+est exactement aligné. Le claim applique un filtre rapide, puis snapshot,
+matérialisation et ouverture reprennent une barrière transactionnelle bornée à
+4 096 raw et verrouillent les inbox en lecture jusqu’au commit. Une révision
+<code>PENDING</code>/<code>PROCESSING</code>/<code>FAILED</code>, une inbox absente ou
+un statut décalé produit donc un retry paper sans candidate, session, position
+ni trade. Les sources <code>confirmed</code> alignées restent autorisées.
+
+À la version maximale de preuve, polls manquants et orphaning restent refusés,
+mais une vraie transition <code>confirmed → finalized</code> est rejouée en
+conservant la version saturée, sans addition susceptible de dépasser
+<code>BIGINT</code>.
+
 Pour le rollout de `027_listener_provider_affine_finality.sql`, arrêter les
 anciennes réplicas avant d’appliquer la migration, puis démarrer le nouveau
 binaire. La migration est rejouable et remplace l’index partiel de finalité par

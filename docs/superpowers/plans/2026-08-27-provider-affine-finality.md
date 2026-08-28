@@ -18,12 +18,36 @@ Production uses a fixed primary pass until #63 supplies the promoted provider.
 **Tech Stack:** TypeScript strict ESM, `@solana/web3.js` 1.98.4, PostgreSQL,
 bigint, Node test runner, migration 027.
 
-**Plan version:** 1.0.4. Revision 1.0.4 makes the initial finality pass precede
+**Plan version:** 1.0.5. Revision 1.0.5 adds a bounded transactional paper
+replay barrier and permits finalized replay to preserve a saturated evidence
+version without overflow. Revision 1.0.4 makes the initial finality pass precede
 paper-worker activation so no simulated effect can persist during a failing
 bootstrap proof. Revision 1.0.3 addresses starvation, durable page rotation
 and the observe/paper initial-failure policy. Revision 1.0.2 bounds the
 monotone evidence generation to PostgreSQL `BIGINT` and requires exact +1
 application-boundary validation.
+
+---
+
+### Review correction 3: paper replay fence and saturated finalized revision
+
+- [x] RED PostgreSQL paper claim for missing, pending, processing, failed or
+  confirmation-misaligned inbox rows, including an earlier active signature of
+  the same mint. GREEN adds the full-cursor fail-fast predicate while keeping
+  confirmed, aligned projections eligible.
+- [x] RED snapshot, stage and `PaperTradingEngine.open` after a revision becomes
+  pending. GREEN adds one reusable MAX-4,096 raw barrier, a separate lexical
+  inbox `FOR SHARE`, and fixed retryable failure mapping before any candidate,
+  session, position or trade materialization.
+- [x] Prove the inbox share lock serializes a concurrent `enqueueRevision`
+  until paper commit, and prove more than 4,096 relevant raw rows fail closed.
+- [x] RED repository and reconciler at
+  `MAX_FINALITY_EVIDENCE_VERSION`. GREEN allows only the genuine finalized
+  transition, using `CASE WHEN version < max THEN version + 1 ELSE version END`;
+  orphan and poll paths remain strict and idempotent terminal replay remains
+  saturated.
+- [x] Update spec, plan, README and diagnostic HTML to version 1.0.5 semantics,
+  then run targeted PostgreSQL tests and the backend delivery gates.
 
 ---
 

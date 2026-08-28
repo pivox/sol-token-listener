@@ -4,6 +4,7 @@ import { inspect } from 'node:util';
 import test from 'node:test';
 import pg from 'pg';
 import { CatchUpScanner } from '../src/application/catch-up-scanner.js';
+import { FinalityReconciler } from '../src/application/finality-reconciler.js';
 import type {
   IngestionFailure,
   FinalityCandidate,
@@ -554,6 +555,103 @@ void test('fails closed at the PostgreSQL finality evidence version limit withou
       missing: before.missing_finality_polls,
       provider: before.last_missing_finality_provider_id,
       version: before.finality_evidence_version,
+    });
+  });
+});
+
+void test('finalizes and replays a processed confirmed row while saturating an exhausted evidence version',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    const repository=new PostgresTransactionInboxRepository(pool);
+    const signature='1'.repeat(64);
+    await repository.enqueue(notification(signature,42n));
+    const initial=await repository.claim(220_000,120);
+    assert.ok(initial);
+    await repository.saveSnapshot(signature,initial.leaseToken,normalized(signature,42n));
+    await repository.markProcessed(signature,initial.leaseToken,'confirmed');
+    await pool.query(`UPDATE chain_transaction_inbox
+      SET finality_evidence_version=$2,missing_finality_polls=1,
+        last_missing_finality_provider_id='primary' WHERE signature=$1`,[
+      signature,MAX_FINALITY_EVIDENCE_VERSION.toString(),
+    ]);
+    const before=await finalityRowTuple(pool,signature);
+    await assertFinalityConflict(repository.enqueueRevision(Object.freeze({
+      signature,confirmationStatus:'orphaned' as const,
+      expectedConfirmationStatus:'confirmed' as const,expectedMissingFinalityPolls:1,
+      expectedLastMissingFinalityProviderId:'primary' as const,
+      expectedFinalityEvidenceVersion:MAX_FINALITY_EVIDENCE_VERSION,
+      observedAtMs:220_001,
+    })));
+    for(const [confirmationStatus,observedAtMs] of [
+      [null,220_002],['confirmed',220_003],
+    ] as const){
+      await assertFinalityConflict(repository.recordFinalityPoll(Object.freeze({
+        signature,confirmationStatus,providerId:'primary' as const,
+        expectedMissingFinalityPolls:1,
+        expectedLastMissingFinalityProviderId:'primary' as const,
+        expectedFinalityEvidenceVersion:MAX_FINALITY_EVIDENCE_VERSION,observedAtMs,
+      })));
+    }
+    assert.deepEqual(await finalityRowTuple(pool,signature),before);
+
+    await repository.enqueueRevision(Object.freeze({
+      signature,confirmationStatus:'finalized' as const,observedAtMs:220_004,
+    }));
+    assert.deepEqual(await finalityRowTuple(pool,signature),{
+      confirmationStatus:'finalized',processingStatus:'PENDING',missingFinalityPolls:0,
+      lastMissingFinalityProviderId:null,
+      finalityEvidenceVersion:MAX_FINALITY_EVIDENCE_VERSION.toString(),
+    });
+    const replay=await repository.claim(220_005,120);
+    assert.ok(replay);
+    await repository.markProcessed(signature,replay.leaseToken,'finalized');
+    await repository.enqueueRevision(Object.freeze({
+      signature,confirmationStatus:'finalized' as const,observedAtMs:220_006,
+    }));
+    assert.deepEqual(await finalityRowTuple(pool,signature),{
+      confirmationStatus:'finalized',processingStatus:'PROCESSED',missingFinalityPolls:0,
+      lastMissingFinalityProviderId:null,
+      finalityEvidenceVersion:MAX_FINALITY_EVIDENCE_VERSION.toString(),
+    });
+  });
+});
+
+void test('the reconciler emits a finalized MAX revision and the replay removes it from the next page',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    const repository=new PostgresTransactionInboxRepository(pool);
+    const signature='2'.repeat(64);
+    await repository.enqueue(notification(signature,43n));
+    const initial=await repository.claim(230_000,120);
+    assert.ok(initial);
+    await repository.saveSnapshot(signature,initial.leaseToken,normalized(signature,43n));
+    await repository.markProcessed(signature,initial.leaseToken,'confirmed');
+    await pool.query(`UPDATE chain_transaction_inbox
+      SET finality_evidence_version=$2 WHERE signature=$1`,[
+      signature,MAX_FINALITY_EVIDENCE_VERSION.toString(),
+    ]);
+    const reconciler=new FinalityReconciler({
+      openPass(){return{
+        providerId:'primary' as const,
+        async getHistoryStatuses(){return Object.freeze([
+          Object.freeze({ slot:43n,confirmationStatus:'finalized' as const }),
+        ]);},
+        async getFinalizedSlot(){return 43n;},
+        async getFinalizedBlockSignatures(){throw new Error('block should not be read');},
+      };},
+    },repository,{ limit:1,now:()=>230_001 });
+
+    assert.deepEqual(await reconciler.runOnce(),{
+      candidateCount:1,pollCount:0,revisionCount:1,
+    });
+    assert.deepEqual(await finalityRowTuple(pool,signature),{
+      confirmationStatus:'finalized',processingStatus:'PENDING',missingFinalityPolls:0,
+      lastMissingFinalityProviderId:null,
+      finalityEvidenceVersion:MAX_FINALITY_EVIDENCE_VERSION.toString(),
+    });
+    const replay=await repository.claim(230_002,120);
+    assert.ok(replay);
+    await repository.markProcessed(signature,replay.leaseToken,'finalized');
+    assert.deepEqual(await reconciler.runOnce(),{
+      candidateCount:0,pollCount:0,revisionCount:0,
     });
   });
 });

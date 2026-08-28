@@ -3,8 +3,15 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.4
+Version: 1.0.5
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.5 closes the replay-to-paper race. Paper claim, snapshot,
+materialization and position opening require every relevant raw source through
+the decision cursor to have a processed, confirmation-aligned inbox replay.
+The transactional guards are bounded and hold inbox share locks through paper
+commit. A genuine confirmed-to-finalized revision may saturate an already
+maximum evidence version without overflowing PostgreSQL `BIGINT`.
 
 Revision 1.0.4 makes the initial finality pass a runtime activation barrier.
 The paper worker cannot start, schedule immediate work or persist simulated
@@ -347,6 +354,41 @@ The implementation follows the official Solana contracts for
 No process-local proof cache survives a pass or restart. The positional
 provider behind consecutive misses and its monotone evidence generation are
 durable.
+
+## Paper replay barrier
+
+Paper decisions must never consume raw projections while a finality revision
+is waiting for inbox replay. For a paper source, the relevant set is the
+mandatory `source_raw_event_id` plus every non-orphaned raw row for the same
+mint whose full cursor `(slot, transaction_index, instruction_index,
+COALESCE(inner_instruction_index, -1))` is not later than the source cursor.
+Confirmed rows remain eligible; the barrier does not require global
+finalization.
+
+Claim uses a fail-fast predicate: every relevant signature must already have
+an inbox row with `processing_status = 'PROCESSED'` and
+`target_confirmation_status` exactly equal to the raw confirmation status.
+Missing, `PENDING`, `PROCESSING`, `FAILED` or misaligned inbox state prevents
+election. Claim is only an optimization, not the safety guarantee.
+
+The reusable transactional barrier reads at most 4,097 relevant raw rows and
+fails closed above 4,096. It then locks the distinct inbox signatures in
+lexical order with a separate `FOR SHARE` query and revalidates presence,
+processing state and confirmation alignment. Paper snapshot and every decision
+materialization call this barrier while holding the qualification transaction
+lock. `PaperTradingEngine.open` repeats it after validating the exact current
+qualification and holds the share locks until the position transaction
+commits. Therefore finality wins first and paper retries, or paper wins first
+and `enqueueRevision` waits; the later replay can then retract the paper
+lineage. Barrier failures are fixed and redacted and become bounded retryable
+paper failures, never terminal decisions.
+
+At `MAX_FINALITY_EVIDENCE_VERSION`, missing polls and orphan proofs remain
+rejected without mutation. A real `PROCESSED/confirmed` to
+`PENDING/finalized` transition is still permitted: its SQL `CASE` increments
+only below the maximum and otherwise preserves the maximum. Replay and the
+terminal finalized idempotence path keep that saturated value unchanged; no
+`LEAST(version + 1, max)` expression may evaluate an overflowing addition.
 
 ## Error handling and redaction
 

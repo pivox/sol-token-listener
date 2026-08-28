@@ -714,7 +714,9 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         if (status !== 'PROCESSED') {
           throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
-        if (finalityEvidenceVersion(row.finality_evidence_version) === MAX_FINALITY_EVIDENCE_VERSION) {
+        if (value.confirmationStatus !== 'finalized'
+          && finalityEvidenceVersion(row.finality_evidence_version)
+            === MAX_FINALITY_EVIDENCE_VERSION) {
           throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
         if (value.confirmationStatus === 'orphaned') {
@@ -757,11 +759,18 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              processed_at = NULL, terminal_at = NULL, purge_after = NULL,
              attempts_in_cycle = 0, retry_exhausted_at = NULL,
              missing_finality_polls = 0, last_missing_finality_provider_id = NULL,
-             finality_evidence_version = finality_evidence_version + 1,
+             finality_evidence_version = CASE
+               WHEN finality_evidence_version < $4
+                 THEN finality_evidence_version + 1
+               ELSE finality_evidence_version
+             END,
              updated_at = GREATEST(updated_at, $3)
            WHERE signature = $1 AND processing_status = 'PROCESSED'
              AND normalized_transaction IS NOT NULL`,
-          [value.signature, next, dateFromMs(value.observedAtMs)],
+          [
+            value.signature,next,dateFromMs(value.observedAtMs),
+            MAX_FINALITY_EVIDENCE_VERSION.toString(),
+          ],
         );
         requireOne(result.rowCount);
       });
