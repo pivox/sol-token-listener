@@ -3,8 +3,15 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.3.5
+Version: 1.4.0
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.4.0 specifies issue #63 through the dedicated WebSocket supervisor
+activation design version 1.0.0. Production acquires its durable owner before
+network or API startup, replaces the legacy scan/subscriber sequence with one
+background fail-closed supervisor, requires an explicit genesis hash, gates
+paper claims outside `RUNNING`, supplies the promoted provider to finality and
+adds cooperative strict-scan cancellation plus exact-frontier unanimity.
 
 Revision 1.3.5 aligns issue #62 with dedicated design version 1.0.5. Bounded
 reporter settlement now contains source rejections before timeout scheduling
