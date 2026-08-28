@@ -107,6 +107,7 @@ const canonicalRetentionCounters = Object.freeze([
   'walletGraphProfiles',
   'walletGraphSnapshots',
   'walletRelationships',
+  'websocketHealthEvidence',
 ]);
 const projectResourceChecks = projectResourceChecksFor(projectLabel);
 

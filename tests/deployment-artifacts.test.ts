@@ -428,6 +428,11 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
   assert.match(retention, /MAX_RETENTION_OUTPUT_BYTES/);
   assert.match(retention, /JSON\.parse\(serialized\)/);
   assert.match(retention, /canonicalRetentionCounters/);
+  assert.match(
+    smoke,
+    /'walletRelationships',\n {2}'websocketHealthEvidence',\n\]\);/u,
+    'deployment smoke must expect the sorted WebSocket retention counter',
+  );
   assert.doesNotMatch(retention, /\.split\('\n'\).*\.filter/s);
   assert.doesNotMatch(retention, /new Error\(`[^`]*\$\{(?:stdout|stderr)\}/);
   assert.doesNotMatch(retention, /new Error\([^)]*\+\s*(?:stdout|stderr)/s);
