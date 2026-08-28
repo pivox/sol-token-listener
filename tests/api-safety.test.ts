@@ -20,7 +20,13 @@ const health: ApiHealth = {
   },
   checkpoints: { launchpad: null, market: null },
   heartbeat: { startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
-    lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null }, lagSlots: null,
+    lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
+    websocket: {
+      version: 1, supervision: 'INACTIVE', state: 'STOPPED', phase: 'STOPPED',
+      providerId: null, candidateProviderId: null, updatedAt: null, heartbeatAt: null,
+      acknowledgedAt: null, lastObservation: null, disconnect: null,
+      recovery: { status: 'NOT_REQUIRED', startedAt: null, completedAt: null, reasonCode: null },
+    } }, lagSlots: null,
 };
 
 const projections: ApiProjectionRepository = {

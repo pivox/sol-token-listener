@@ -42,7 +42,11 @@ class FakeQueryable implements Queryable {
   ): Promise<{ readonly rows: readonly Record<string, unknown>[] }> {
     const call = { text, values };
     this.calls.push(call);
-    return { rows: this.respond(call) };
+    const rows = this.respond(call);
+    if (rows.length === 0 && text.includes('listener_strict_catch_up_failures')) {
+      return { rows: [{ has_unresolved: false }] };
+    }
+    return { rows };
   }
 }
 
@@ -1685,11 +1689,12 @@ void test('returns health without exposing database URLs or secrets', async () =
       workerState: 'RUNNING', reconcilerState: 'RUNNING', backlogCount: 0, leasedCount: 0,
       exhaustedCount: 2,
       startedAt: openedAt.toISOString(), updatedAt: openedAt.toISOString(), lastHttpSlot: '60',
-      lastWebsocketSlot: '59', lastFinalizedSlot: '58', lastSignature: 'signature',
-      pendingTransactions: 0, activeSessions: 1,
+      lastWebsocketSlot: '59', lastFinalizedSlot: '58', lastSignature: null,
+      pendingTransactions: 0, activeSessions: 1, websocket: inactiveWebSocketHealth(),
     }, lagSlots: '1',
   });
   assert.match(database.calls[2]?.text ?? '', /started_at/u);
+  assert.doesNotMatch(database.calls[2]?.text ?? '', /last_signature/u);
   const qualificationQuery = database.calls.find((call) => call.text.includes('FROM qualification_reports AS report'))?.text ?? '';
   assert.match(qualificationQuery, /superseded_at IS NULL/u);
   assert.match(qualificationQuery, /report\.purge_after > clock_timestamp\(\)/u);
@@ -1709,6 +1714,138 @@ void test('returns health without exposing database URLs or secrets', async () =
   assert.match(qualificationQuery, /source\.confirmation_status <> 'orphaned'/u);
   assert.match(qualificationQuery, /raw\.confirmation_status <> 'orphaned'/u);
   assert.doesNotMatch(JSON.stringify(health), /:\/\/|DATABASE_URL|password|secret|localhost/u);
+});
+
+void test('projects the canonical WebSocket snapshot through exact frozen redacted fields', async () => {
+  const database = healthyHealthDatabase(websocketRow({
+    phase: 'DEGRADED',
+    provider_id: 'primary', active_session_generation: '3',
+    candidate_provider_id: 'fallback-2', candidate_session_generation: '4',
+    acknowledged_at: openedAt,
+    last_observation_at: openedAt, last_observation_slot: '999999999999999999',
+    disconnect_occurred_at: openedAt, disconnect_reason_code: 'REMOTE_CLOSE',
+    recovery_status: 'IN_PROGRESS', recovery_started_at: detectedAt,
+    recovery_completed_at: null, recovery_reason_code: 'SESSION_FAILURE',
+    rpc_url: 'wss://secret.invalid/private', last_signature: 'secret-signature',
+  }));
+
+  const health = await healthyRepository(database).getHealth();
+
+  assert.deepEqual(health.heartbeat.websocket, {
+    version: 1, supervision: 'ACTIVE', state: 'DEGRADED', phase: 'DEGRADED',
+    providerId: 'primary', candidateProviderId: 'fallback-2',
+    updatedAt: openedAt.toISOString(), heartbeatAt: openedAt.toISOString(),
+    acknowledgedAt: openedAt.toISOString(),
+    lastObservation: { observedAt: openedAt.toISOString(), slot: '999999999999999999' },
+    disconnect: { occurredAt: openedAt.toISOString(), reasonCode: 'REMOTE_CLOSE' },
+    recovery: {
+      status: 'IN_PROGRESS', startedAt: detectedAt.toISOString(), completedAt: null,
+      reasonCode: 'SESSION_FAILURE',
+    },
+  });
+  assert.ok(Object.isFrozen(health));
+  assert.ok(Object.isFrozen(health.heartbeat));
+  assert.ok(Object.isFrozen(health.heartbeat.websocket));
+  assert.ok(Object.isFrozen(health.heartbeat.websocket.lastObservation));
+  assert.ok(Object.isFrozen(health.heartbeat.websocket.disconnect));
+  assert.ok(Object.isFrozen(health.heartbeat.websocket.recovery));
+  assert.equal(health.heartbeat.lastSignature, null);
+  assert.doesNotMatch(
+    JSON.stringify(health),
+    /ownerGeneration|revision|sessionGeneration|rpc_url|secret-signature|wss?:\/\//iu,
+  );
+  const websocketQuery = database.calls.find((call) => call.text.includes('listener_websocket_health'));
+  assert.deepEqual(websocketQuery?.values, ['transaction-listener']);
+  assert.doesNotMatch(websocketQuery?.text ?? '', /SELECT\s+\*/iu);
+});
+
+void test('maps every detailed WebSocket phase and applies the active aggregate gate', async () => {
+  const expected = new Map([
+    ['STOPPED', 'STOPPED'], ['CONNECTING', 'CONNECTING'],
+    ['WAITING_FOR_ACKS', 'CONNECTING'], ['ACKNOWLEDGED', 'ACKNOWLEDGED'],
+    ['RECOVERING', 'RECOVERING'], ['RUNNING', 'ACKNOWLEDGED'],
+    ['DEGRADED', 'DEGRADED'], ['UNRECOVERABLE', 'DEGRADED'], ['STOPPING', 'DEGRADED'],
+  ] as const);
+  for (const [phase, state] of expected) {
+    const health = await healthyRepository(
+      healthyHealthDatabase(websocketRowForPhase(phase)),
+    ).getHealth();
+    assert.equal(health.heartbeat.websocket.phase, phase);
+    assert.equal(health.heartbeat.websocket.state, state);
+    assert.equal(health.status, phase === 'RUNNING' ? 'OK' : 'DEGRADED');
+  }
+
+  const recovered = await healthyRepository(healthyHealthDatabase(websocketRow({
+    recovery_status: 'RECOVERED', recovery_started_at: detectedAt,
+    recovery_completed_at: openedAt, recovery_reason_code: 'STARTUP',
+  }))).getHealth();
+  assert.equal(recovered.status, 'OK');
+
+  for (const recovery of [{
+    recovery_status: 'REQUIRED', recovery_started_at: null,
+    recovery_completed_at: null, recovery_reason_code: 'SESSION_FAILURE',
+  }, {
+    recovery_status: 'IN_PROGRESS', recovery_started_at: detectedAt,
+    recovery_completed_at: null, recovery_reason_code: 'SESSION_FAILURE',
+  }, {
+    recovery_status: 'FAILED', recovery_started_at: detectedAt,
+    recovery_completed_at: openedAt, recovery_reason_code: 'SESSION_FAILURE',
+  }] as const) {
+    const health = await healthyRepository(
+      healthyHealthDatabase(websocketRow(recovery)),
+    ).getHealth();
+    assert.equal(health.heartbeat.websocket.phase, 'RUNNING');
+    assert.equal(health.status, 'DEGRADED');
+  }
+});
+
+void test('ignores an absent or inactive WebSocket snapshot but degrades stale and unresolved active health', async () => {
+  const absentDatabase = healthyHealthDatabase();
+  const absent = await healthyRepository(absentDatabase).getHealth();
+  assert.equal(absent.status, 'OK');
+  assert.deepEqual(absent.heartbeat.websocket, inactiveWebSocketHealth());
+  assert.ok(Object.isFrozen(absent.heartbeat.websocket));
+
+  const inactive = await healthyRepository(
+    healthyHealthDatabase(websocketRowForPhase('STOPPED', 'INACTIVE')),
+  ).getHealth();
+  assert.equal(inactive.status, 'OK');
+
+  const stale = await healthyRepository(healthyHealthDatabase(websocketRow({
+    heartbeat_at: new Date(openedAt.getTime() - 30_001),
+  }))).getHealth();
+  assert.equal(stale.status, 'DEGRADED');
+  const future = await healthyRepository(healthyHealthDatabase(websocketRow({
+    heartbeat_at: new Date(openedAt.getTime() + 1),
+  }))).getHealth();
+  assert.equal(future.status, 'DEGRADED');
+
+  const unresolvedDatabase = healthyHealthDatabase(websocketRow(), true);
+  const unresolved = await healthyRepository(unresolvedDatabase).getHealth();
+  assert.equal(unresolved.status, 'DEGRADED');
+  const strictQuery = unresolvedDatabase.calls.find((call) =>
+    call.text.includes('listener_strict_catch_up_failures'));
+  assert.match(strictQuery?.text ?? '', /SELECT\s+EXISTS\s*\(/iu);
+  assert.match(strictQuery?.text ?? '', /resolved_at IS NULL/u);
+
+  const inactiveUnresolved = await healthyRepository(
+    healthyHealthDatabase(websocketRowForPhase('STOPPED', 'INACTIVE'), true),
+  ).getHealth();
+  assert.equal(inactiveUnresolved.status, 'DEGRADED');
+});
+
+void test('redacts malformed WebSocket rows and WebSocket dependency failures', async () => {
+  const malformed = healthyHealthDatabase(websocketRow({ provider_id: 'wss://secret.invalid' }));
+  const dependency = healthyHealthDatabase(websocketRow());
+  dependency.failWebSocket = true;
+
+  for (const database of [malformed, dependency]) {
+    const health = await healthyRepository(database).getHealth();
+    assert.equal(health.status, 'DEGRADED');
+    assert.equal(health.postgresql.status, 'UNAVAILABLE');
+    assert.deepEqual(health.heartbeat.websocket, inactiveWebSocketHealth());
+    assert.doesNotMatch(JSON.stringify(health), /secret|wss?:\/\//iu);
+  }
 });
 
 void test('degrades only social health when its bounded count projection fails', async () => {
@@ -1825,9 +1962,117 @@ void test('returns nullable unknown heartbeat fields when no heartbeat exists', 
     reconcilerState: null, backlogCount: null, leasedCount: null, exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
     lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
+    websocket: inactiveWebSocketHealth(),
   });
   assert.equal(health.lagSlots, null);
 });
+
+class HealthQueryable implements Queryable {
+  public readonly calls: Call[] = [];
+  public failWebSocket = false;
+
+  public constructor(
+    private readonly websocket: Readonly<Record<string, unknown>> | undefined,
+    private readonly unresolvedStrictFailure: boolean,
+  ) {}
+
+  public async query(
+    text: string,
+    values?: readonly unknown[],
+  ): Promise<{ readonly rows: readonly Record<string, unknown>[] }> {
+    const call = { text, values };
+    this.calls.push(call);
+    if (text.includes('SELECT 1 AS available')) return { rows: [{ available: 1 }] };
+    if (text.includes('listener_heartbeats')) return { rows: [healthyHeartbeatRow()] };
+    if (text.includes('listener_websocket_health')) {
+      if (this.failWebSocket) throw new Error('postgresql://secret/websocket dependency');
+      return { rows: this.websocket === undefined ? [] : [this.websocket] };
+    }
+    if (text.includes('listener_strict_catch_up_failures')) {
+      return { rows: [{ has_unresolved: this.unresolvedStrictFailure }] };
+    }
+    return { rows: [] };
+  }
+}
+
+function healthyHealthDatabase(
+  websocket?: Readonly<Record<string, unknown>>,
+  unresolvedStrictFailure = false,
+): HealthQueryable {
+  return new HealthQueryable(websocket, unresolvedStrictFailure);
+}
+
+function healthyRepository(database: Queryable): PostgresApiProjectionRepository {
+  return new PostgresApiProjectionRepository(database, () => openedAt, {
+    httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
+    qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
+  });
+}
+
+function healthyHeartbeatRow(): Readonly<Record<string, unknown>> {
+  return {
+    updated_at: openedAt, started_at: detectedAt, last_http_slot: '60',
+    last_websocket_slot: '60', last_finalized_slot: '59', last_signature: 'secret-signature',
+    pending_transactions: 0, active_sessions: 1, leased_transactions: 0,
+    exhausted_transactions: 0, runtime_state: 'RUNNING', subscriber_state: 'RUNNING',
+    scanner_state: 'RUNNING', worker_state: 'RUNNING', reconciler_state: 'RUNNING',
+  };
+}
+
+function websocketRow(overrides: Readonly<Record<string, unknown>> = {}): Readonly<Record<string, unknown>> {
+  return {
+    payload_version: 1, supervision: 'ACTIVE', owner_generation: '1', revision: '1',
+    provider_id: 'primary', active_session_generation: '1',
+    candidate_provider_id: null, candidate_session_generation: null, phase: 'RUNNING',
+    acknowledged_at: openedAt, last_observation_at: openedAt, last_observation_slot: '60',
+    disconnect_occurred_at: null, disconnect_reason_code: null,
+    recovery_status: 'NOT_REQUIRED', recovery_started_at: null,
+    recovery_completed_at: null, recovery_reason_code: null,
+    heartbeat_at: openedAt, updated_at: openedAt, evidence_purge_after: null,
+    ...overrides,
+  };
+}
+
+function websocketRowForPhase(
+  phase: string,
+  supervision: 'INACTIVE' | 'ACTIVE' = 'ACTIVE',
+): Readonly<Record<string, unknown>> {
+  if (supervision === 'INACTIVE') return websocketRow({
+    supervision, owner_generation: '0', revision: '0', phase: 'STOPPED',
+    provider_id: null, active_session_generation: null,
+    acknowledged_at: null, last_observation_at: null, last_observation_slot: null,
+    heartbeat_at: null, updated_at: openedAt,
+  });
+  if (phase === 'CONNECTING' || phase === 'WAITING_FOR_ACKS') return websocketRow({
+    phase, provider_id: null, active_session_generation: null,
+    candidate_provider_id: 'fallback-1', candidate_session_generation: '2',
+    acknowledged_at: null,
+  });
+  if (phase === 'ACKNOWLEDGED' || phase === 'RECOVERING') return websocketRow({
+    phase, provider_id: null, active_session_generation: null,
+    candidate_provider_id: 'fallback-1', candidate_session_generation: '2',
+    recovery_status: phase === 'RECOVERING' ? 'IN_PROGRESS' : 'NOT_REQUIRED',
+    recovery_started_at: phase === 'RECOVERING' ? detectedAt : null,
+    recovery_reason_code: phase === 'RECOVERING' ? 'STARTUP' : null,
+  });
+  if (phase === 'RUNNING') return websocketRow();
+  return websocketRow({
+    phase, provider_id: null, active_session_generation: null, acknowledged_at: null,
+    recovery_status: phase === 'UNRECOVERABLE' ? 'FAILED' : 'NOT_REQUIRED',
+    recovery_started_at: phase === 'UNRECOVERABLE' ? detectedAt : null,
+    recovery_completed_at: phase === 'UNRECOVERABLE' ? openedAt : null,
+    recovery_reason_code: phase === 'UNRECOVERABLE' ? 'CATCH_UP_WINDOW_EXCEEDED' : null,
+  });
+}
+
+function inactiveWebSocketHealth(): Readonly<Record<string, unknown>> {
+  return {
+    version: 1, supervision: 'INACTIVE', state: 'STOPPED', phase: 'STOPPED',
+    providerId: null, candidateProviderId: null, updatedAt: null, heartbeatAt: null,
+    acknowledgedAt: null, lastObservation: null, disconnect: null,
+    recovery: { status: 'NOT_REQUIRED', startedAt: null, completedAt: null, reasonCode: null },
+  };
+}
 
 void test('degrades stale heartbeats and reads the canonical runtime start column', async () => {
   const staleAt = new Date(openedAt.getTime() - 30_001);

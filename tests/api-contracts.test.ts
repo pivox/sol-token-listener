@@ -8,6 +8,7 @@ import {
   type ApiDomainPayload,
   type ApiFailure,
   type ApiHealth,
+  type ApiWebSocketHealth,
   type ApiJsonObject,
   type ApiLaunchSummary,
   type ApiQualificationSummary,
@@ -321,6 +322,16 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
       startedAt: '2026-07-29T12:00:00.000Z', updatedAt: '2026-07-29T12:00:00.000Z',
       lastHttpSlot: '1', lastWebsocketSlot: '1', lastFinalizedSlot: '1', lastSignature: null,
       pendingTransactions: 0, activeSessions: 0,
+      websocket: {
+        version: 1, supervision: 'ACTIVE', state: 'ACKNOWLEDGED', phase: 'RUNNING',
+        providerId: 'primary', candidateProviderId: null,
+        updatedAt: '2026-07-29T12:00:00.000Z', heartbeatAt: '2026-07-29T12:00:00.000Z',
+        acknowledgedAt: '2026-07-29T12:00:00.000Z',
+        lastObservation: { observedAt: '2026-07-29T12:00:00.000Z', slot: '1' },
+        disconnect: null,
+        recovery: { status: 'RECOVERED', startedAt: '2026-07-29T11:59:59.000Z',
+          completedAt: '2026-07-29T12:00:00.000Z', reasonCode: 'STARTUP' },
+      },
     },
     lagSlots: '0',
   };
@@ -352,6 +363,8 @@ void test('exposes V1 envelopes at the root and ISO dates in public projections'
   assert.equal(health.pipeline.qualification, 'RUNNING');
   assert.equal(health.qualification.currentCount, 1);
   assert.equal(health.socialJobs.pendingCount, 1);
+  const websocket: ApiWebSocketHealth = health.heartbeat.websocket;
+  assert.equal(websocket.state, 'ACKNOWLEDGED');
   assert.equal(sseEvent.eventId, 'evt_1');
 });
 

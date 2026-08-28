@@ -111,7 +111,8 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
     },
     checkpoints: { launchpad: null, market: null },
     heartbeat: { startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
-      lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null }, lagSlots: null,
+      lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
+      websocket: inactiveWebSocketHealth() }, lagSlots: null,
   };
   const page = <T>(items: readonly T[]): ApiPage<T> => ({ items, nextCursor: null });
   return {
@@ -124,6 +125,15 @@ function makeRepository(): ApiProjectionRepository & { readonly calls: string[] 
     async getLaunchHolders(mint) { calls.push(`holders:${mint}`); return holders; },
     async listPaperPositions(request) { calls.push(`positions:${request.limit}:${request.after?.id ?? 'none'}`); return page([position]); },
     async getHealth() { calls.push('health'); return health; },
+  };
+}
+
+function inactiveWebSocketHealth(): ApiHealth['heartbeat']['websocket'] {
+  return {
+    version: 1, supervision: 'INACTIVE', state: 'STOPPED', phase: 'STOPPED',
+    providerId: null, candidateProviderId: null, updatedAt: null, heartbeatAt: null,
+    acknowledgedAt: null, lastObservation: null, disconnect: null,
+    recovery: { status: 'NOT_REQUIRED', startedAt: null, completedAt: null, reasonCode: null },
   };
 }
 
@@ -355,6 +365,38 @@ void test('maps a returned unavailable PostgreSQL health projection to a 503 dep
   assert.equal(head.status, 503);
   assert.equal(head.body, '');
   assert.deepEqual(head.headers, get.headers);
+});
+
+void test('keeps an available PostgreSQL health projection with degraded WebSocket health on HTTP 200', async () => {
+  const repository = makeRepository();
+  const original = repository.getHealth;
+  Object.assign(repository, {
+    getHealth: async () => {
+      const health = await original();
+      return {
+        ...health,
+        status: 'DEGRADED' as const,
+        heartbeat: {
+          ...health.heartbeat,
+          websocket: {
+            ...health.heartbeat.websocket,
+            supervision: 'ACTIVE' as const,
+            state: 'DEGRADED' as const,
+            phase: 'CONNECTING' as const,
+          },
+        },
+      };
+    },
+  });
+  const { router } = makeRouter(repository);
+
+  const response = await invoke(router, 'GET', '/api/v1/health');
+
+  assert.equal(response.status, 200);
+  const body = (parseBody(response) as { readonly data: ApiHealth }).data;
+  assert.equal(body.status, 'DEGRADED');
+  assert.equal(body.postgresql.status, 'AVAILABLE');
+  assert.equal(body.heartbeat.websocket.state, 'DEGRADED');
 });
 
 void test('rejects invalid pagination configuration at construction', () => {

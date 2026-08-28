@@ -5,6 +5,7 @@ import {
   MAX_API_TOTAL_CLUSTER_QUOTE_ASSETS,
   toApiDomainPayload,
   type ApiHealth,
+  type ApiWebSocketHealth,
   type ApiHolders,
   type ApiHolderSnapshot,
   type ApiLaunchDetail,
@@ -54,6 +55,12 @@ import {
   LISTENER_RUNTIME_STATES,
   type ListenerRuntimeState,
 } from '../domain/transaction-ingestion.js';
+import {
+  WEBSOCKET_HEALTH_STALE_AFTER_MS,
+  createWebSocketHealthSnapshot,
+  publicWebSocketState,
+  type WebSocketHealthSnapshot,
+} from '../domain/websocket-health.js';
 import { QUALIFICATION_REASON_CODES } from '../domain/qualification-reasons.js';
 import {
   CREATION_EXIT_REASONS,
@@ -466,11 +473,39 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       );
       const heartbeats = await this.database.query(
         `SELECT updated_at, started_at, last_http_slot, last_websocket_slot,
-            last_finalized_slot, last_signature, pending_transactions, active_sessions,
+            last_finalized_slot, pending_transactions, active_sessions,
             runtime_state, subscriber_state, scanner_state, worker_state,
             reconciler_state, leased_transactions, exhausted_transactions
          FROM listener_heartbeats ORDER BY updated_at DESC LIMIT 1`,
       );
+      const websocketRows = await this.database.query(
+        `SELECT payload_version, supervision, owner_generation, revision,
+            active_session_generation, candidate_session_generation,
+            provider_id, candidate_provider_id, phase, acknowledged_at,
+            last_observation_at, last_observation_slot,
+            disconnect_occurred_at, disconnect_reason_code,
+            recovery_status, recovery_started_at, recovery_completed_at,
+            recovery_reason_code, heartbeat_at, updated_at, evidence_purge_after
+         FROM listener_websocket_health
+         WHERE service_key = $1`,
+        ['transaction-listener'],
+      );
+      const strictFailures = await this.database.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM listener_strict_catch_up_failures
+           WHERE resolved_at IS NULL
+           LIMIT 1
+         ) AS has_unresolved`,
+      );
+      const websocketRow = websocketRows.rows[0];
+      const websocket = websocketRow === undefined
+        ? inactiveWebSocketHealth()
+        : webSocketHealthFromRow(websocketRow);
+      const strictFailureRow = strictFailures.rows[0];
+      if (strictFailureRow === undefined || typeof strictFailureRow.has_unresolved !== 'boolean') {
+        throw invalid();
+      }
+      const hasUnresolvedStrictFailure = strictFailureRow.has_unresolved;
       let socialJobs = emptySocialJobs();
       let paperDecisionJobs = emptyPaperDecisionJobs();
       let qualification = emptyQualificationHealth();
@@ -574,7 +609,7 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
       }
       const checkpoint = new Map(checkpoints.rows.map((item) => [text(item.checkpoint_key), decimal(item.slot)]));
       const row = heartbeats.rows[0];
-      const heartbeat = row === undefined ? emptyHeartbeat() : heartbeatFromRow(row);
+      const heartbeat = row === undefined ? emptyHeartbeat(websocket) : heartbeatFromRow(row, websocket);
       const lagSlots = heartbeat.lastHttpSlot === null || heartbeat.lastWebsocketSlot === null
         ? null : (BigInt(heartbeat.lastHttpSlot) - BigInt(heartbeat.lastWebsocketSlot)).toString();
       const heartbeatAge = heartbeat.updatedAt === null
@@ -587,7 +622,21 @@ export class PostgresApiProjectionRepository implements ApiProjectionRepository 
         || heartbeat.scannerState !== 'RUNNING'
         || heartbeat.workerState !== 'RUNNING'
         || heartbeat.reconcilerState !== 'RUNNING';
-      const degraded = database.rows.length === 0 || stale || runtimeDegraded || !pipeline.httpAvailable
+      const websocketHeartbeatAge = websocket.heartbeatAt === null
+        ? null : observedAt.getTime() - Date.parse(websocket.heartbeatAt);
+      const websocketStale = websocketHeartbeatAge === null
+        || websocketHeartbeatAge < 0
+        || websocketHeartbeatAge > WEBSOCKET_HEALTH_STALE_AFTER_MS;
+      const websocketDegraded = hasUnresolvedStrictFailure
+        || (websocket.supervision === 'ACTIVE' && (
+          websocketStale
+          || websocket.phase !== 'RUNNING'
+          || websocket.state !== 'ACKNOWLEDGED'
+          || (websocket.recovery.status !== 'NOT_REQUIRED'
+            && websocket.recovery.status !== 'RECOVERED')
+        ));
+      const degraded = database.rows.length === 0 || stale || runtimeDegraded || websocketDegraded
+      || !pipeline.httpAvailable
       || pipeline.pumpfun === 'DEGRADED' || pipeline.pumpfun === 'STOPPED'
       || pipeline.pumpswap === 'DEGRADED' || pipeline.pumpswap === 'STOPPED'
       || pipeline.qualification === 'DEGRADED' || pipeline.qualification === 'STOPPED'
@@ -2025,12 +2074,15 @@ const DEGRADED_PIPELINE_STATE: ApiProjectionPipelineState = Object.freeze({
   social: 'DEGRADED',
 });
 
-function emptyHeartbeat(): ApiHealth['heartbeat'] {
+function emptyHeartbeat(
+  websocket: ApiWebSocketHealth = inactiveWebSocketHealth(),
+): ApiHealth['heartbeat'] {
   return freeze({ runtimeState: null, subscriberState: null, scannerState: null,
     workerState: null, reconcilerState: null, backlogCount: null, leasedCount: null,
     exhaustedCount: null,
     startedAt: null, updatedAt: null, lastHttpSlot: null, lastWebsocketSlot: null,
-    lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null });
+    lastFinalizedSlot: null, lastSignature: null, pendingTransactions: null, activeSessions: null,
+    websocket });
 }
 
 function emptySocialJobs(): ApiHealth['socialJobs'] {
@@ -2091,7 +2143,10 @@ function paperDecisionJobsFromRow(
   });
 }
 
-function heartbeatFromRow(row: Record<string, unknown>): ApiHealth['heartbeat'] {
+function heartbeatFromRow(
+  row: Record<string, unknown>,
+  websocket: ApiWebSocketHealth,
+): ApiHealth['heartbeat'] {
   const runtimeState = listenerRuntimeState(row.runtime_state);
   const subscriberState = listenerRuntimeState(row.subscriber_state);
   const scannerState = listenerRuntimeState(row.scanner_state);
@@ -2109,9 +2164,128 @@ function heartbeatFromRow(row: Record<string, unknown>): ApiHealth['heartbeat'] 
     backlogCount, leasedCount, exhaustedCount, startedAt, updatedAt,
     lastHttpSlot: nullableDecimal(row.last_http_slot),
     lastWebsocketSlot: nullableDecimal(row.last_websocket_slot), lastFinalizedSlot: nullableDecimal(row.last_finalized_slot),
-    lastSignature: nullableText(row.last_signature), pendingTransactions: backlogCount,
-    activeSessions: nullableSafeNumber(row.active_sessions),
+    lastSignature: null, pendingTransactions: backlogCount,
+    activeSessions: nullableSafeNumber(row.active_sessions), websocket,
   });
+}
+
+function inactiveWebSocketHealth(): ApiWebSocketHealth {
+  return freeze({
+    version: 1,
+    supervision: 'INACTIVE',
+    state: 'STOPPED',
+    phase: 'STOPPED',
+    providerId: null,
+    candidateProviderId: null,
+    updatedAt: null,
+    heartbeatAt: null,
+    acknowledgedAt: null,
+    lastObservation: null,
+    disconnect: null,
+    recovery: freeze({
+      status: 'NOT_REQUIRED', startedAt: null, completedAt: null, reasonCode: null,
+    }),
+  });
+}
+
+function webSocketHealthFromRow(row: Record<string, unknown>): ApiWebSocketHealth {
+  const snapshot = createWebSocketHealthSnapshot({
+    payloadVersion: safeNumber(row.payload_version),
+    supervision: row.supervision,
+    ownerGeneration: databaseBigInt(row.owner_generation),
+    revision: databaseBigInt(row.revision),
+    activeSessionGeneration: nullableDatabaseBigInt(row.active_session_generation),
+    candidateSessionGeneration: nullableDatabaseBigInt(row.candidate_session_generation),
+    providerId: row.provider_id,
+    candidateProviderId: row.candidate_provider_id,
+    phase: row.phase,
+    acknowledgedAtMs: nullableWebSocketTimestampMs(row.acknowledged_at),
+    lastObservation: webSocketObservationFromRow(row),
+    disconnect: webSocketDisconnectFromRow(row),
+    recovery: {
+      status: row.recovery_status,
+      startedAtMs: nullableWebSocketTimestampMs(row.recovery_started_at),
+      completedAtMs: nullableWebSocketTimestampMs(row.recovery_completed_at),
+      reasonCode: row.recovery_reason_code,
+    },
+    heartbeatAtMs: nullableWebSocketTimestampMs(row.heartbeat_at),
+    updatedAtMs: webSocketTimestampMs(row.updated_at),
+    evidencePurgeAfterMs: nullableWebSocketTimestampMs(row.evidence_purge_after),
+  });
+  return projectWebSocketHealth(snapshot);
+}
+
+function webSocketObservationFromRow(
+  row: Record<string, unknown>,
+): Readonly<{ observedAtMs: number; slot: bigint }> | null {
+  if (row.last_observation_at === null && row.last_observation_slot === null) return null;
+  return {
+    observedAtMs: webSocketTimestampMs(row.last_observation_at),
+    slot: databaseNumericInteger(row.last_observation_slot),
+  };
+}
+
+function webSocketDisconnectFromRow(
+  row: Record<string, unknown>,
+): Readonly<{ occurredAtMs: number; reasonCode: unknown }> | null {
+  if (row.disconnect_occurred_at === null && row.disconnect_reason_code === null) return null;
+  return {
+    occurredAtMs: webSocketTimestampMs(row.disconnect_occurred_at),
+    reasonCode: row.disconnect_reason_code,
+  };
+}
+
+function projectWebSocketHealth(snapshot: WebSocketHealthSnapshot): ApiWebSocketHealth {
+  return freeze({
+    version: 1,
+    supervision: snapshot.supervision,
+    state: publicWebSocketState(snapshot.phase),
+    phase: snapshot.phase,
+    providerId: snapshot.providerId,
+    candidateProviderId: snapshot.candidateProviderId,
+    updatedAt: new Date(snapshot.updatedAtMs).toISOString(),
+    heartbeatAt: nullableIsoFromMs(snapshot.heartbeatAtMs),
+    acknowledgedAt: nullableIsoFromMs(snapshot.acknowledgedAtMs),
+    lastObservation: snapshot.lastObservation === null ? null : freeze({
+      observedAt: new Date(snapshot.lastObservation.observedAtMs).toISOString(),
+      slot: snapshot.lastObservation.slot.toString(),
+    }),
+    disconnect: snapshot.disconnect === null ? null : freeze({
+      occurredAt: new Date(snapshot.disconnect.occurredAtMs).toISOString(),
+      reasonCode: snapshot.disconnect.reasonCode,
+    }),
+    recovery: freeze({
+      status: snapshot.recovery.status,
+      startedAt: nullableIsoFromMs(snapshot.recovery.startedAtMs),
+      completedAt: nullableIsoFromMs(snapshot.recovery.completedAtMs),
+      reasonCode: snapshot.recovery.reasonCode,
+    }),
+  });
+}
+
+function databaseBigInt(value: unknown): bigint {
+  return BigInt(decimal(value));
+}
+
+function nullableDatabaseBigInt(value: unknown): bigint | null {
+  return value === null ? null : databaseBigInt(value);
+}
+
+function databaseNumericInteger(value: unknown): bigint {
+  if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)(?:\.0+)?$/u.test(value)) throw invalid();
+  return BigInt(value.split('.')[0] ?? value);
+}
+
+function webSocketTimestampMs(value: unknown): number {
+  return timestamp(value).getTime();
+}
+
+function nullableWebSocketTimestampMs(value: unknown): number | null {
+  return value === null ? null : webSocketTimestampMs(value);
+}
+
+function nullableIsoFromMs(value: number | null): string | null {
+  return value === null ? null : new Date(value).toISOString();
 }
 
 function listenerRuntimeState(value: unknown): ListenerRuntimeState {
