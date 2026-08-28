@@ -320,13 +320,13 @@ void test('websocket health migration enforces every durable lifecycle invariant
           last_observation_slot = 999999999999999999999999999999999999999999999999999999999999999999999999999999
       WHERE service_key = 'valid-running'`);
     assert.deepEqual(
-      (await pool.query(`SELECT phase FROM listener_websocket_health
+      (await pool.query<{ readonly phase: string }>(`SELECT phase FROM listener_websocket_health
         WHERE service_key LIKE 'valid-%' AND service_key NOT LIKE 'valid-constraint-%'
         ORDER BY service_key`)).rows.map((row) => row.phase).sort(),
       ['ACKNOWLEDGED', 'CONNECTING', 'DEGRADED', 'DEGRADED', 'RECOVERING', 'RUNNING', 'STOPPED', 'STOPPING', 'UNRECOVERABLE', 'WAITING_FOR_ACKS'].sort(),
     );
 
-    const columns = (await pool.query(`SELECT column_name
+    const columns = (await pool.query<{ readonly column_name: string }>(`SELECT column_name
       FROM information_schema.columns
       WHERE table_schema = CURRENT_SCHEMA() AND table_name = 'listener_websocket_health'
       ORDER BY ordinal_position`)).rows.map((row) => row.column_name);
