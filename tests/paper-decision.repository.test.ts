@@ -905,6 +905,81 @@ void test('claim also waits for an earlier active raw signature of the same mint
   });
 });
 
+void test('claim waits for an earlier orphaned raw replay before using a later source',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await seedRaw(pool,Object.freeze({
+      eventId:'raw-earlier-orphaned',signature:'earlier-orphaned-signature',slot:9n,
+      transactionIndex:7,instructionIndex:3,confirmationStatus:'orphaned',
+    }));
+    await seedProcessedInbox(pool,'earlier-orphaned-signature',9n,'orphaned');
+    await setInboxState(pool,'earlier-orphaned-signature','PENDING','orphaned');
+    const repository=paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+
+    assert.equal(await repository.claim({nowMs:1_000,leaseMs:1_000}),null);
+    await setInboxState(pool,'earlier-orphaned-signature','PROCESSED','orphaned');
+    assert.ok(await repository.claim({nowMs:1_000,leaseMs:1_000}));
+  });
+});
+
+void test('orphaned predecessor replay fences snapshot, stage, and paper open',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await seedRaw(pool,Object.freeze({
+      eventId:'raw-earlier-fence',signature:'earlier-fence-signature',slot:9n,
+      transactionIndex:7,instructionIndex:3,confirmationStatus:'confirmed',
+    }));
+    await seedProcessedInbox(pool,'earlier-fence-signature',9n,'confirmed');
+    const decisions=paperDecisionRepository(pool);
+    await decisions.enqueue(jobInput());
+    const job=await decisions.claim({nowMs:1_000,leaseMs:10_000});
+    assert.ok(job);
+    await decisions.loadSnapshot(job);
+
+    await pool.query(`UPDATE raw_chain_events SET confirmation_status='orphaned'
+      WHERE event_id='raw-earlier-fence'`);
+    await setInboxState(pool,'earlier-fence-signature','PENDING','orphaned');
+    await assert.rejects(decisions.loadSnapshot(job),PaperDecisionRepositoryError);
+    await assert.rejects(decisions.stageDecision(job,decisionResult()),PaperDecisionRepositoryError);
+
+    const fixture=paperEngineOpenFixture();
+    await replaceCurrentQualification(pool,fixture.projection);
+    const engine=new PaperTradingEngine({
+      executionMode:'paper',paperQuoteMintAllowlist:['SOL'],dataRetentionHours:4,
+    },new PostgresPaperTradingRepository(pool),fixture.profile,fixture.authority,{
+      now:()=>QUALIFICATION_EVALUATED_AT_MS+1_000,
+    });
+    await assert.rejects(engine.open(fixture.command),hasCode('QUALIFICATION_NOT_CURRENT'));
+    assert.deepEqual(await paperOpenRows(pool),{
+      positions:0,trades:0,opened_events:0,sessions:0,candidates:0,
+    });
+  });
+});
+
+void test('a purged orphaned predecessor receipt resumes the later paper claim',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await seedRaw(pool,Object.freeze({
+      eventId:'raw-earlier-receipt',signature:'earlier-receipt-signature',slot:9n,
+      transactionIndex:7,instructionIndex:3,confirmationStatus:'orphaned',
+    }));
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature,observed_slot,confirmation_status,finality_evidence_version,
+      immutable_fingerprint,replay_completed_at
+    ) VALUES ('earlier-receipt-signature',9,'orphaned',1,$1,$2)`,[
+      'f'.repeat(64),new Date(1_000),
+    ]);
+    const repository=paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+
+    assert.ok(await repository.claim({nowMs:1_000,leaseMs:1_000}));
+  });
+});
+
 void test('rotates at most sixteen finality-blocked jobs before a later ready claim',async(context)=>{
   if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
   await withSchema(async(pool)=>{
@@ -1110,20 +1185,7 @@ void test('the reusable paper replay barrier fails closed above 4096 relevant ra
   if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
   await withSchema(async(pool)=>{
     await seed(pool);
-    await pool.query(`INSERT INTO raw_chain_events (
-      event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
-      confirmation_status,observed_at,payload_version,payload
-    ) SELECT 'raw-bulk-'||value,'pumpfun','pump',$1,'bulk-signature-'||value,
-      9,value,0,'confirmed',$2,1,'{}'::jsonb FROM generate_series(1,4096) value`,[
-      MINT,new Date(900),
-    ]);
-    await pool.query(`INSERT INTO chain_transaction_inbox (
-      signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
-      processing_status,normalized_transaction,immutable_fingerprint,observed_at,processed_at
-    ) SELECT 'bulk-signature-'||value,9,ARRAY['WEBSOCKET'],
-      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],'confirmed','PROCESSED',
-      jsonb_build_object('signature','bulk-signature-'||value),$1,$2,$2
-      FROM generate_series(1,4096) value`,['e'.repeat(64),new Date(900)]);
+    await seedMixedReplayRows(pool,'bulk',4_096);
     const repository=paperDecisionRepository(pool);
     await repository.enqueue(jobInput());
     assert.equal(await repository.claim({ nowMs:1_000,leaseMs:10_000 }),null);
@@ -1137,20 +1199,7 @@ void test('paper replay claim accepts exactly 4096 aligned relevant raw rows',as
   if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
   await withSchema(async(pool)=>{
     await seed(pool);
-    await pool.query(`INSERT INTO raw_chain_events (
-      event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
-      confirmation_status,observed_at,payload_version,payload
-    ) SELECT 'raw-boundary-'||value,'pumpfun','pump',$1,'boundary-signature-'||value,
-      9,value,0,'confirmed',$2,1,'{}'::jsonb FROM generate_series(1,4095) value`,[
-      MINT,new Date(900),
-    ]);
-    await pool.query(`INSERT INTO chain_transaction_inbox (
-      signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
-      processing_status,normalized_transaction,immutable_fingerprint,observed_at,processed_at
-    ) SELECT 'boundary-signature-'||value,9,ARRAY['WEBSOCKET'],
-      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],'confirmed','PROCESSED',
-      jsonb_build_object('signature','boundary-signature-'||value),$1,$2,$2
-      FROM generate_series(1,4095) value`,['e'.repeat(64),new Date(900)]);
+    await seedMixedReplayRows(pool,'boundary',4_095);
     const repository=paperDecisionRepository(pool);
     await repository.enqueue(jobInput());
 
@@ -2550,6 +2599,36 @@ async function seedRaw(
     input.eventId,MINT,input.signature,input.slot.toString(),input.transactionIndex,
     input.instructionIndex,input.confirmationStatus,new Date(900),
   ]);
+}
+
+async function seedMixedReplayRows(
+  pool:InstanceType<typeof pg.Pool>,
+  prefix:string,
+  count:number,
+):Promise<void>{
+  await pool.query(`WITH replay AS MATERIALIZED (
+    SELECT value,CASE MOD(value,4)
+      WHEN 0 THEN 'processed' WHEN 1 THEN 'orphaned'
+      WHEN 2 THEN 'confirmed' ELSE 'finalized' END AS confirmation_status
+    FROM generate_series(1,$3) value
+  ), inserted_raw AS (
+    INSERT INTO raw_chain_events (
+      event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+      confirmation_status,observed_at,payload_version,payload
+    ) SELECT 'raw-'||$2||'-'||value,'pumpfun','pump',$1,
+      $2||'-signature-'||value,9,value,0,confirmation_status,$4,1,'{}'::jsonb
+      FROM replay
+  ) INSERT INTO chain_transaction_inbox (
+    signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+    processing_status,normalized_transaction,immutable_fingerprint,observed_at,processed_at,
+    terminal_at,purge_after
+  ) SELECT $2||'-signature-'||value,9,ARRAY['WEBSOCKET'],
+    ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],confirmation_status,
+    'PROCESSED',jsonb_build_object('signature',$2||'-signature-'||value),$5,$4,$4,
+    CASE WHEN confirmation_status IN ('finalized','orphaned') THEN $4::timestamptz END,
+    CASE WHEN confirmation_status IN ('finalized','orphaned')
+      THEN $4::timestamptz+INTERVAL '4 hours' END
+    FROM replay`,[MINT,prefix,count,new Date(900),'e'.repeat(64)]);
 }
 
 async function setRawConfirmation(

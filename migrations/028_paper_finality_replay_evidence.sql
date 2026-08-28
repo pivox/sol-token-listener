@@ -51,7 +51,9 @@ BEGIN
 END
 $migration$;
 
-CREATE INDEX IF NOT EXISTS raw_chain_events_paper_finality_cursor_idx
+DROP INDEX IF EXISTS raw_chain_events_paper_finality_cursor_idx;
+
+CREATE INDEX raw_chain_events_paper_finality_cursor_idx
   ON raw_chain_events (
     mint,
     slot,
@@ -60,5 +62,4 @@ CREATE INDEX IF NOT EXISTS raw_chain_events_paper_finality_cursor_idx
     (COALESCE(inner_instruction_index, -1)),
     event_id
   )
-  INCLUDE (signature, confirmation_status)
-  WHERE confirmation_status <> 'orphaned';
+  INCLUDE (signature, confirmation_status);

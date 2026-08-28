@@ -84,12 +84,14 @@ void test('adds replay-safe terminal receipts and bounded finality preflight ind
         AND indexname='raw_chain_events_paper_finality_cursor_idx'`)).rows[0]?.indexdef;
     assert.equal(typeof index,'string');
     assert.match(index,/mint, slot, transaction_index, instruction_index.*COALESCE.*event_id/iu);
-    assert.match(index,/WHERE \(confirmation_status <> 'orphaned'/iu);
+    assert.doesNotMatch(index,/\bWHERE\b/iu);
     await pool.query(`INSERT INTO raw_chain_events (
       event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
       confirmation_status,observed_at,payload_version,payload
     ) SELECT 'hostile-'||value,'pumpfun','pump','hostile-mint',
-      'hostile-signature-'||value,10,value,0,'confirmed',$1,1,'{}'::jsonb
+      'hostile-signature-'||value,10,value,0,
+      CASE MOD(value,4) WHEN 0 THEN 'processed' WHEN 1 THEN 'orphaned'
+        WHEN 2 THEN 'confirmed' ELSE 'finalized' END,$1,1,'{}'::jsonb
       FROM generate_series(1,100000) value`,[
       new Date(900),
     ]);

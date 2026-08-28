@@ -18,7 +18,9 @@ Production uses a fixed primary pass until #63 supplies the promoted provider.
 **Tech Stack:** TypeScript strict ESM, `@solana/web3.js` 1.98.4, PostgreSQL,
 bigint, Node test runner, migrations 027–029.
 
-**Plan version:** 1.0.7. Revision 1.0.7 makes the raw cursor an index condition,
+**Plan version:** 1.0.8. Revision 1.0.8 retains orphaned predecessors in every
+paper fence and applies one indexed 4,097-row limit across all statuses.
+Revision 1.0.7 makes the raw cursor an index condition,
 rotates a durable sixteen-job finality preflight and retains exact receipts for
 both terminal statuses. Revision 1.0.6 bounds claim to an indexed 4,097-row
 probe and adds exact finalized replay receipts that survive the four-hour inbox
@@ -30,6 +32,24 @@ bootstrap proof. Revision 1.0.3 addresses starvation, durable page rotation
 and the observe/paper initial-failure policy. Revision 1.0.2 bounds the
 monotone evidence generation to PostgreSQL `BIGINT` and requires exact +1
 application-boundary validation.
+
+---
+
+### Review correction 6: retain orphaned predecessors in the paper fence
+
+- [x] Trace the replay pipeline and prove that raw/domain orphaning can commit
+  before later projection stages fail, leaving the inbox non-processed and
+  downstream paper inputs stale.
+- [x] RED an earlier orphaned raw with pending inbox replay before a later
+  aligned source. GREEN makes claim, snapshot, stage and paper open share one
+  all-status cursor fence; processed orphan replay and its exact post-purge
+  receipt resume work.
+- [x] Replace migration 028's partial raw cursor index with a full covering
+  index and prove mixed-status 4,096/4,097 boundaries plus a hostile 100,000-row
+  same-mint `EXPLAIN ANALYZE` without raw sequential scan, sort or join filter.
+- [x] Update spec, plan, README and diagnostic HTML to v1.0.8; run targeted and
+  full PostgreSQL gates, then obtain specification and quality reviews before
+  the exact final commit.
 
 ---
 

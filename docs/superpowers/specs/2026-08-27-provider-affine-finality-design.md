@@ -3,8 +3,13 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.7
+Version: 1.0.8
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.8 retains every raw predecessor through the source cursor,
+including orphaned rows whose replay pipeline has not completed. Migration 028
+uses one full covering cursor index and the shared fence applies one global
+4,097-row limit across all confirmation statuses.
 
 Revision 1.0.7 moves the raw cursor bound into an index condition, caps each
 paper claim preflight at sixteen durably rotated jobs, and retains exact replay
@@ -369,12 +374,14 @@ durable.
 ## Paper replay barrier
 
 Paper decisions must never consume raw projections while a finality revision
-is waiting for inbox replay. For a paper source, the relevant set is the
-mandatory `source_raw_event_id` plus every non-orphaned raw row for the same
-mint whose full cursor `(slot, transaction_index, instruction_index,
-COALESCE(inner_instruction_index, -1))` is not later than the source cursor.
-Confirmed rows remain eligible; the barrier does not require global
-finalization.
+is waiting for inbox replay. For a paper source, the relevant set is every raw
+row for the same mint whose full cursor `(slot, transaction_index,
+instruction_index, COALESCE(inner_instruction_index, -1))` is not later than
+the mandatory `source_raw_event_id` cursor, regardless of confirmation status.
+This includes orphaned predecessors: replay updates raw/domain state before
+later pipeline stages, so a downstream failure can leave stale projections
+while the authoritative inbox remains non-processed. Confirmed rows remain
+eligible; the barrier does not require global finalization.
 
 Claim uses a fail-fast predicate. A present inbox row is authoritative and must
 have `processing_status = 'PROCESSED'` with `target_confirmation_status`
@@ -386,12 +393,12 @@ use an exact durable replay receipt for the same signature, observed slot and
 fail-closed. Claim is only an optimization, not the safety guarantee.
 
 The reusable transactional barrier reads at most 4,097 relevant raw rows and
-fails closed above 4,096. The shared relevant-row SQL fetches the mandatory
-source by primary key, then reads non-orphaned rows in cursor order through the
-partial covering `raw_chain_events_paper_finality_cursor_idx`; the source is
-unioned separately only when orphaned. Scalar source-cursor subqueries become
-PostgreSQL init/subplans whose tuple bound is an index condition; there is no
-cursor `OR`, join filter, full-mint sort or unbounded anti-join. It then locks
+fails closed above 4,096 across all statuses. The shared relevant-row SQL
+fetches the mandatory source cursor by primary key, then performs one ordered
+read through the full covering `raw_chain_events_paper_finality_cursor_idx`.
+Scalar source-cursor subqueries become PostgreSQL init/subplans whose tuple
+bound is an index condition; there is no status filter, union, cursor `OR`,
+join filter, full-mint sort or unbounded anti-join. It then locks
 distinct inbox signatures and any needed receipts in lexical order with
 separate `FOR SHARE` queries and revalidates the
 same rules. Paper snapshot and every decision materialization call this barrier
@@ -486,7 +493,7 @@ rejects its unsafe positive counter write and therefore fails closed.
 
 Migration 028 is replayable after 027 or as part of an empty-database migration.
 It adds the terminal replay receipt table, strictly backfills aligned durable
-`PROCESSED/finalized|orphaned` inbox evidence, and creates the partial covering
+`PROCESSED/finalized|orphaned` inbox evidence, and creates the full covering
 paper-finality cursor index. It does not extend inbox retention beyond four
 hours. Migration 029 adds `finality_checked_at`, the sequence-backed monotone
 `claim_scan_generation`, its deterministic legacy backfill, and the exact
@@ -539,6 +546,12 @@ advance to 029. No existing transaction, event or projection row is deleted.
 - a 1,000-job claim backlog evaluates no more than sixteen jobs per call,
   rotates blocked jobs durably, reaches a later ready job and remains safe under
   concurrent `SKIP LOCKED` claimers;
+- an earlier orphaned raw with pending replay blocks a later aligned source at
+  claim, snapshot, stage and paper open; processed orphan replay or its exact
+  post-purge receipt resumes work without paper writes during the blocked state;
+- mixed-status 4,096/4,097 boundaries count orphaned rows, and a hostile 100,000
+  same-mint plan uses the full cursor index without a sort, join filter or raw
+  sequential scan;
 - finalized and orphaned receipt exactness, divergent-receipt rollback,
   four-hour protected purge, later manual-kill wake and post-restart orphan
   retraction; missing nonterminal inbox remains blocked;

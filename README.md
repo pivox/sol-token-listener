@@ -140,7 +140,7 @@ relève de l'issue #57. Les événements sans secret `rpc.http_endpoint_degraded
 métriques V1 dérivées des logs. Voir le [guide d'exploitation RPC](docs/operations/rpc-qualification.md)
 pour les délais de refroidissement, les limites et la qualification mono-fournisseur du soak.
 
-## Finalité affine au fournisseur (#61, v1.0.7, migrations 027–029)
+## Finalité affine au fournisseur (#61, v1.0.8, migrations 027–029)
 
 La finalité utilise un pass HTTP épinglé au fournisseur primaire : statuts,
 racine <code>finalized</code> et signatures du bloc sont toujours lus par ce
@@ -170,10 +170,13 @@ seules les ressources antérieures sont rollbackées. En observe, la politique
 suivants et conserve la reprise à l’intervalle normal.
 
 Avant toute simulation, la lignée paper vérifie aussi le replay de finalité
-jusqu’au curseur source complet. Le claim et la barrière examinent au plus
-4 097 raw par job, refusent au-dessus de 4 096 et utilisent un index couvrant
-ordonné dont la borne cursor est une condition d’index, sans scan, tri complet
-ni join filter du mint. Une inbox présente reste autoritaire : elle doit être
+jusqu’au curseur source complet. Toutes les raw antérieures ou égales sont
+incluses, même orphaned : leur pipeline peut avoir rétracté la raw avant
+d’échouer sur une projection ultérieure, tandis que l’inbox reste non traitée.
+Le claim et la barrière examinent au plus 4 097 raw par job, tous statuts
+confondus, refusent au-dessus de 4 096 et utilisent un index couvrant complet
+dont la borne cursor est une condition d’index, sans scan, tri complet ni join
+filter du mint. Une inbox présente reste autoritaire : elle doit être
 <code>PROCESSED</code> et exactement alignée. Après sa purge terminale à quatre
 heures, une raw <code>finalized</code> ou <code>orphaned</code> peut utiliser une
 receipt durable exacte écrite atomiquement par le replay; une preuve absente ou

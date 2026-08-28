@@ -119,7 +119,11 @@ void test('locks and verifies the exact current qualification before paper write
   assert.match(client.texts[4] ?? '',/raw\.source=source\.source/u);
   assert.match(client.texts[4] ?? '',/FOR SHARE OF source,raw/u);
   assert.match(client.texts[5] ?? '',/\$3::integer/u);
-  assert.match(client.texts[5] ?? '',/LIMIT \(SELECT active_limit FROM source_raw\)/u);
+  assert.match(client.texts[5] ?? '',/LIMIT \$3::integer/u);
+  assert.doesNotMatch(
+    client.texts[5] ?? '',
+    /active_limit|UNION ALL|raw\.confirmation_status\s*<>/u,
+  );
   assert.match(client.texts[5] ?? '',/COALESCE\(raw\.inner_instruction_index,-1\)/u);
   assert.match(client.texts[6] ?? '',/ORDER BY signature COLLATE "C"/u);
   assert.match(client.texts[6] ?? '',/FOR SHARE/u);

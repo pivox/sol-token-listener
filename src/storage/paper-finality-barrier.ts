@@ -96,36 +96,24 @@ export function paperFinalityRelevantRawSql(
   const sourceRawEventId=context==='parameters'?'$2':'job.source_raw_event_id';
   const rowLimit=context==='parameters'?'$3':'$4';
   return `WITH source_raw AS MATERIALIZED (
-    SELECT event_id,signature,slot,transaction_index,instruction_index,
-      inner_instruction_index,confirmation_status,
-      ${rowLimit}::integer-CASE WHEN confirmation_status='orphaned' THEN 1 ELSE 0 END
-        AS active_limit
+    SELECT slot,transaction_index,instruction_index,inner_instruction_index
     FROM raw_chain_events
     WHERE event_id=${sourceRawEventId} AND mint=${mint}
   )
-  SELECT relevant.event_id,relevant.signature,relevant.slot::text AS observed_slot,
-    relevant.confirmation_status
-  FROM (
-    (SELECT raw.event_id,raw.signature,raw.slot,raw.confirmation_status
-     FROM raw_chain_events raw
-     WHERE raw.mint=${mint}
-       AND raw.confirmation_status<>'orphaned'
-       AND ROW(
-         raw.slot,raw.transaction_index,raw.instruction_index,
-         COALESCE(raw.inner_instruction_index,-1)
-       ) <= (SELECT
-         source.slot,source.transaction_index,source.instruction_index,
-         COALESCE(source.inner_instruction_index,-1)
-       FROM source_raw source
-       )
-     ORDER BY raw.slot,raw.transaction_index,raw.instruction_index,
-       COALESCE(raw.inner_instruction_index,-1),raw.event_id
-     LIMIT (SELECT active_limit FROM source_raw))
-    UNION ALL
-    SELECT source.event_id,source.signature,source.slot,source.confirmation_status
-    FROM source_raw source
-    WHERE source.confirmation_status='orphaned'
-  ) relevant`;
+  SELECT raw.event_id,raw.signature,raw.slot::text AS observed_slot,
+    raw.confirmation_status
+  FROM raw_chain_events raw
+  WHERE raw.mint=${mint}
+    AND ROW(
+      raw.slot,raw.transaction_index,raw.instruction_index,
+      COALESCE(raw.inner_instruction_index,-1)
+    ) <= (SELECT
+      source.slot,source.transaction_index,source.instruction_index,
+      COALESCE(source.inner_instruction_index,-1)
+    FROM source_raw source)
+  ORDER BY raw.slot,raw.transaction_index,raw.instruction_index,
+    COALESCE(raw.inner_instruction_index,-1),raw.event_id
+  LIMIT ${rowLimit}::integer`;
 }
 
 function rawReplayState(value:unknown):RawReplayState{
