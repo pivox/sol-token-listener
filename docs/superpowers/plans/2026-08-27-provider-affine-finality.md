@@ -16,9 +16,11 @@ version, and orphan revisions carry an exact transactional proof precondition.
 Production uses a fixed primary pass until #63 supplies the promoted provider.
 
 **Tech Stack:** TypeScript strict ESM, `@solana/web3.js` 1.98.4, PostgreSQL,
-bigint, Node test runner, migration 027.
+bigint, Node test runner, migrations 027–029.
 
-**Plan version:** 1.0.6. Revision 1.0.6 bounds claim to an indexed 4,097-row
+**Plan version:** 1.0.7. Revision 1.0.7 makes the raw cursor an index condition,
+rotates a durable sixteen-job finality preflight and retains exact receipts for
+both terminal statuses. Revision 1.0.6 bounds claim to an indexed 4,097-row
 probe and adds exact finalized replay receipts that survive the four-hour inbox
 purge. Revision 1.0.5 adds a bounded transactional paper
 replay barrier and permits finalized replay to preserve a saturated evidence
@@ -28,6 +30,35 @@ bootstrap proof. Revision 1.0.3 addresses starvation, durable page rotation
 and the observe/paper initial-failure policy. Revision 1.0.2 bounds the
 monotone evidence generation to PostgreSQL `BIGINT` and requires exact +1
 application-boundary validation.
+
+---
+
+### Review correction 5: bounded finality preflight and terminal replay retention
+
+- [x] RED hostile same-mint `EXPLAIN ANALYZE` with 100,000 rows at the first
+  source cursor. GREEN replaces the cursor join filter with a scalar init/subplan
+  used in `raw_chain_events_paper_finality_cursor_idx` index conditions; reject
+  raw sequential scans, sorts, join filters and unbounded actual rows.
+- [x] RED a 1,000-job backlog. GREEN migration 029 adds
+  `paper_decision_jobs.finality_checked_at`, a sequence-backed monotone
+  `claim_scan_generation`, deterministic backfill and an exact partial
+  `effective_at` fairness index. Claim materializes a constant sixteen-job
+  `SKIP LOCKED` batch before replay joins, rotates only blocked jobs durably and
+  claims the first ready job.
+- [x] Prove at most sixteen jobs are evaluated per claim, a ready job beyond the
+  first batch becomes claimable after bounded rotations/restart, and concurrent
+  replicas do not inspect or claim the same locked batch.
+- [x] RED an orphan retraction job retained while its processed inbox ages past
+  four hours. GREEN backfills/writes/protects/reads/tombstones exact receipts for
+  both `finalized` and `orphaned`; pending inbox remains authoritative and a late
+  notification cannot resurrect an orphan tombstone.
+- [x] RED late provenance on an exact present `PROCESSED/finalized` inbox. GREEN
+  merges discovery sources/program IDs without changing target status, finality
+  evidence version, processed timestamp or receipt; a purged tombstone stays a
+  no-op.
+- [x] Run targeted PostgreSQL tests, the complete PostgreSQL backend suite,
+  check, lint, build, docs and diff-check; obtain an independent re-review and
+  resolve every Critical/Important finding before the final commit.
 
 ---
 

@@ -461,7 +461,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          AND purge_after <= clock_timestamp()
          AND (
            processing_status<>'PROCESSED'
-           OR target_confirmation_status<>'finalized'
+           OR target_confirmation_status NOT IN ('finalized','orphaned')
            OR EXISTS (
              SELECT 1
              FROM chain_transaction_finality_replay_receipts receipt

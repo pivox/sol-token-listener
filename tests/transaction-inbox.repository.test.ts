@@ -740,7 +740,7 @@ void test('rolls back finalized completion when a divergent durable replay recei
   });
 });
 
-void test('keeps an exact finalized receipt aligned on duplicate discovery before purge',async(context)=>{
+void test('merges late finalized discovery provenance without changing terminal proof',async(context)=>{
   await withDatabase(context,async(pool)=>{
     const repository=new PostgresTransactionInboxRepository(pool);
     const signature='finalized-receipt-duplicate';
@@ -749,22 +749,31 @@ void test('keeps an exact finalized receipt aligned on duplicate discovery befor
     assert.ok(claim);
     await repository.saveSnapshot(signature,claim.leaseToken,normalized(signature,42n));
     await repository.markProcessed(signature,claim.leaseToken,'finalized');
-    const before=await pool.query(`SELECT inbox.finality_evidence_version::text AS version,
-      inbox.updated_at,receipt.finality_evidence_version::text AS receipt_version,
-      receipt.replay_completed_at
+    const before=await pool.query(`SELECT inbox.discovery_sources,inbox.program_ids,
+      inbox.target_confirmation_status,inbox.finality_evidence_version::text AS version,
+      inbox.processed_at,receipt.finality_evidence_version::text AS receipt_version,
+      receipt.immutable_fingerprint,receipt.replay_completed_at
       FROM chain_transaction_inbox inbox
       JOIN chain_transaction_finality_replay_receipts receipt USING (signature)
       WHERE inbox.signature=$1`,[signature]);
 
     await repository.enqueue(notification(signature,42n,'CATCH_UP','confirmed',220_001));
 
-    const after=await pool.query(`SELECT inbox.finality_evidence_version::text AS version,
-      inbox.updated_at,receipt.finality_evidence_version::text AS receipt_version,
-      receipt.replay_completed_at
+    const after=await pool.query(`SELECT inbox.discovery_sources,inbox.program_ids,
+      inbox.target_confirmation_status,inbox.finality_evidence_version::text AS version,
+      inbox.processed_at,receipt.finality_evidence_version::text AS receipt_version,
+      receipt.immutable_fingerprint,receipt.replay_completed_at
       FROM chain_transaction_inbox inbox
       JOIN chain_transaction_finality_replay_receipts receipt USING (signature)
       WHERE inbox.signature=$1`,[signature]);
-    assert.deepEqual(after.rows,before.rows);
+    assert.deepEqual(after.rows,[{
+      ...before.rows[0],
+      discovery_sources:['WEBSOCKET','CATCH_UP'],
+      program_ids:[
+        '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+        'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+      ],
+    }]);
   });
 });
 
@@ -796,6 +805,32 @@ void test('uses a purged finalized receipt as a terminal enqueue tombstone',asyn
       expectedFinalityEvidenceVersion: 1n,
       observedAtMs: 230_003,
     })), TransactionInboxConflictError);
+  });
+});
+
+void test('uses a purged orphaned receipt as a non-resurrectable terminal tombstone',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    const repository=new PostgresTransactionInboxRepository(pool);
+    const signature='orphaned-receipt-tombstone';
+    await repository.enqueue(notification(signature,44n,'WEBSOCKET','confirmed'));
+    const claim=await repository.claim(240_000,120);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature,claim.leaseToken,normalized(signature,44n));
+    await pool.query(`UPDATE chain_transaction_inbox SET target_confirmation_status='orphaned'
+      WHERE signature=$1`,[signature]);
+    await repository.markProcessed(signature,claim.leaseToken,'orphaned');
+    await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1',[signature]);
+
+    await assert.rejects(
+      repository.enqueue(notification(signature,44n,'CATCH_UP','confirmed',240_001)),
+      TransactionInboxConflictError,
+    );
+    assert.equal((await pool.query(
+      'SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature=$1',[signature],
+    )).rows[0]?.count,'0');
+    assert.equal((await pool.query(`SELECT confirmation_status
+      FROM chain_transaction_finality_replay_receipts WHERE signature=$1`,[signature]))
+      .rows[0]?.confirmation_status,'orphaned');
   });
 });
 

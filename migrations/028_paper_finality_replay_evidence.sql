@@ -1,7 +1,9 @@
 CREATE TABLE IF NOT EXISTS chain_transaction_finality_replay_receipts (
   signature TEXT PRIMARY KEY,
   observed_slot NUMERIC(78,0) NOT NULL CHECK (observed_slot >= 0),
-  confirmation_status TEXT NOT NULL CHECK (confirmation_status = 'finalized'),
+  confirmation_status TEXT NOT NULL CHECK (
+    confirmation_status IN ('finalized', 'orphaned')
+  ),
   finality_evidence_version BIGINT NOT NULL CHECK (finality_evidence_version >= 0),
   immutable_fingerprint TEXT NOT NULL CHECK (
     immutable_fingerprint ~ '^[0-9a-f]{64}$'
@@ -17,7 +19,7 @@ SELECT inbox.signature,inbox.observed_slot,inbox.target_confirmation_status,
   inbox.finality_evidence_version,inbox.immutable_fingerprint,inbox.processed_at
 FROM chain_transaction_inbox inbox
 WHERE inbox.processing_status='PROCESSED'
-  AND inbox.target_confirmation_status='finalized'
+  AND inbox.target_confirmation_status IN ('finalized','orphaned')
   AND inbox.normalized_transaction IS NOT NULL
   AND inbox.immutable_fingerprint IS NOT NULL
   AND inbox.processed_at IS NOT NULL
@@ -29,7 +31,7 @@ BEGIN
     SELECT 1
     FROM chain_transaction_inbox inbox
     WHERE inbox.processing_status='PROCESSED'
-      AND inbox.target_confirmation_status='finalized'
+      AND inbox.target_confirmation_status IN ('finalized','orphaned')
       AND inbox.normalized_transaction IS NOT NULL
       AND inbox.immutable_fingerprint IS NOT NULL
       AND inbox.processed_at IS NOT NULL
@@ -44,7 +46,7 @@ BEGIN
           AND receipt.replay_completed_at=inbox.processed_at
       )
   ) THEN
-    RAISE EXCEPTION 'finalized replay receipt conflicts with processed inbox';
+    RAISE EXCEPTION 'terminal replay receipt conflicts with processed inbox';
   END IF;
 END
 $migration$;

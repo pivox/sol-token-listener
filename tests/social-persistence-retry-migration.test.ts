@@ -26,7 +26,7 @@ void test('applies social persistence retry migration and replays cleanly',async
   try{
     await admin.query(`CREATE SCHEMA ${schema}`);
     const applied=await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '028_paper_finality_replay_evidence.sql');
+    assert.equal(applied.at(-1), '029_paper_finality_claim_scheduler.sql');
     assert.deepEqual(await migrateDatabase({ pool }),[]);
     const row=await pool.query(`SELECT column_default,is_nullable FROM information_schema.columns
       WHERE table_schema=current_schema() AND table_name='social_enrichment_jobs'

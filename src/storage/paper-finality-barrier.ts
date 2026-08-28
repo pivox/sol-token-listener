@@ -31,6 +31,7 @@ interface InboxReplayState {
 interface FinalityReplayReceipt {
   readonly signature:string;
   readonly observedSlot:string;
+  readonly confirmationStatus:string;
 }
 
 export async function assertPaperFinalityReplayCurrent(
@@ -57,16 +58,18 @@ export async function assertPaperFinalityReplayCurrent(
   const inboxBySignature=new Map(
     inboxResult.rows.map(inboxReplayState).map((row)=>[row.signature,row] as const),
   );
-  const missingFinalizedSignatures=Object.freeze([...new Set(rawRows
-    .filter((raw)=>!inboxBySignature.has(raw.signature)&&raw.confirmationStatus==='finalized')
+  const missingTerminalSignatures=Object.freeze([...new Set(rawRows
+    .filter((raw)=>!inboxBySignature.has(raw.signature)
+      &&isTerminalConfirmation(raw.confirmationStatus))
     .map((raw)=>raw.signature))].sort());
-  const receiptResult=missingFinalizedSignatures.length===0
+  const receiptResult=missingTerminalSignatures.length===0
     ? { rows:[] as readonly unknown[] }
-    : await client.query(`SELECT signature,observed_slot::text AS observed_slot
+    : await client.query(`SELECT signature,observed_slot::text AS observed_slot,
+        confirmation_status
       FROM chain_transaction_finality_replay_receipts
       WHERE signature=ANY($1::text[])
       ORDER BY signature COLLATE "C"
-      FOR SHARE`,[missingFinalizedSignatures]);
+      FOR SHARE`,[missingTerminalSignatures]);
   const receiptBySignature=new Map(
     receiptResult.rows.map(finalityReplayReceipt).map((row)=>[row.signature,row] as const),
   );
@@ -74,8 +77,9 @@ export async function assertPaperFinalityReplayCurrent(
     const inbox=inboxBySignature.get(raw.signature);
     if(inbox===undefined){
       const receipt=receiptBySignature.get(raw.signature);
-      if(raw.confirmationStatus!=='finalized'
-        ||receipt?.observedSlot!==raw.observedSlot){
+      if(!isTerminalConfirmation(raw.confirmationStatus)
+        ||receipt?.observedSlot!==raw.observedSlot
+        ||receipt.confirmationStatus!==raw.confirmationStatus){
         throw new PaperFinalityBarrierError();
       }
     }else if(inbox.processingStatus!=='PROCESSED'
@@ -104,15 +108,15 @@ export function paperFinalityRelevantRawSql(
   FROM (
     (SELECT raw.event_id,raw.signature,raw.slot,raw.confirmation_status
      FROM raw_chain_events raw
-     CROSS JOIN source_raw source
      WHERE raw.mint=${mint}
        AND raw.confirmation_status<>'orphaned'
        AND ROW(
          raw.slot,raw.transaction_index,raw.instruction_index,
          COALESCE(raw.inner_instruction_index,-1)
-       ) <= ROW(
+       ) <= (SELECT
          source.slot,source.transaction_index,source.instruction_index,
          COALESCE(source.inner_instruction_index,-1)
+       FROM source_raw source
        )
      ORDER BY raw.slot,raw.transaction_index,raw.instruction_index,
        COALESCE(raw.inner_instruction_index,-1),raw.event_id
@@ -137,7 +141,12 @@ function finalityReplayReceipt(value:unknown):FinalityReplayReceipt{
   const row=record(value);
   return Object.freeze({
     signature:text(row.signature),observedSlot:text(row.observed_slot),
+    confirmationStatus:text(row.confirmation_status),
   });
+}
+
+function isTerminalConfirmation(value:string):boolean{
+  return value==='finalized'||value==='orphaned';
 }
 
 function inboxReplayState(value:unknown):InboxReplayState{

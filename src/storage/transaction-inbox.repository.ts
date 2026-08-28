@@ -76,7 +76,7 @@ interface InboxIdentityRow extends QueryResultRow {
   readonly finality_evidence_version: unknown;
 }
 
-interface FinalizedReplayReceiptRow extends QueryResultRow {
+interface TerminalReplayReceiptRow extends QueryResultRow {
   readonly observed_slot: unknown;
   readonly confirmation_status: unknown;
   readonly finality_evidence_version: unknown;
@@ -162,10 +162,10 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            WHERE signature = $1 FOR SHARE`,
           [value.signature],
         );
-        const receipt = receiptResult.rows[0] as FinalizedReplayReceiptRow | undefined;
+        const receipt = receiptResult.rows[0] as TerminalReplayReceiptRow | undefined;
         if (row === undefined) {
           if (receipt !== undefined) {
-            assertFinalizedReceiptAcceptsNotification(receipt, value);
+            assertTerminalReceiptAcceptsNotification(receipt, value);
             return;
           }
           const inserted = await client.query(
@@ -192,12 +192,6 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         }
         const current = confirmation(row.target_confirmation_status);
         const processingStatus = inboxStatus(row.processing_status);
-        if (current === 'finalized' && processingStatus === 'PROCESSED') {
-          reconciledStatus(current, value.confirmationStatus);
-          assertFinalizedReceiptMatchesInbox(receipt, row);
-          return;
-        }
-        const next = reconciledStatus(current, value.confirmationStatus);
         const sources = discoverySources(row.discovery_sources);
         if (!sources.includes(value.source)) sources.push(value.source);
         sources.sort(sourceOrder);
@@ -207,6 +201,20 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
         }
         programs.sort(lexicalOrder);
         if (programs.length > 16) throw new TypeError('Stored program IDs exceed the limit.');
+        if (current === 'finalized' && processingStatus === 'PROCESSED') {
+          reconciledStatus(current, value.confirmationStatus);
+          assertTerminalReceiptMatchesInbox(receipt, row);
+          const updated = await client.query(
+            `UPDATE chain_transaction_inbox SET
+               discovery_sources=$2,program_ids=$3,updated_at=GREATEST(updated_at,$4)
+             WHERE signature=$1`,[
+              value.signature,sources,programs,dateFromMs(value.observedAtMs),
+            ],
+          );
+          requireOne(updated.rowCount);
+          return;
+        }
+        const next = reconciledStatus(current, value.confirmationStatus);
         if (finalityEvidenceVersion(row.finality_evidence_version) === MAX_FINALITY_EVIDENCE_VERSION) {
           throw internalRepositoryError(new TransactionInboxConflictError('finality'));
         }
@@ -446,7 +454,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
              SELECT signature,observed_slot,target_confirmation_status,
                finality_evidence_version,immutable_fingerprint,processed_at
              FROM updated_inbox
-             WHERE target_confirmation_status='finalized'
+             WHERE target_confirmation_status IN ('finalized','orphaned')
              ON CONFLICT (signature) DO UPDATE SET signature=EXCLUDED.signature
              WHERE receipt.observed_slot=EXCLUDED.observed_slot
                AND receipt.confirmation_status=EXCLUDED.confirmation_status
@@ -458,7 +466,7 @@ export class PostgresTransactionInboxRepository implements TransactionInboxRepos
            SELECT updated.signature
            FROM updated_inbox updated
            LEFT JOIN replay_receipt receipt ON receipt.signature=updated.signature
-           WHERE updated.target_confirmation_status<>'finalized'
+           WHERE updated.target_confirmation_status NOT IN ('finalized','orphaned')
              OR receipt.signature IS NOT NULL`,
           [signature, token, next, terminal, MAX_FINALITY_EVIDENCE_VERSION.toString()],
         );
@@ -1496,15 +1504,15 @@ function reconciledStatus(
   }
 }
 
-function assertFinalizedReceiptAcceptsNotification(
-  receipt: FinalizedReplayReceiptRow,
+function assertTerminalReceiptAcceptsNotification(
+  receipt: TerminalReplayReceiptRow,
   notification: TransactionNotification,
 ): void {
   if (numericBigInt(receipt.observed_slot, 'receipt observed slot') !== notification.slot) {
     throw internalRepositoryError(new TransactionInboxConflictError('identity'));
   }
   const status = confirmation(receipt.confirmation_status);
-  if (status !== 'finalized') {
+  if (status !== 'finalized' && status !== 'orphaned') {
     throw internalRepositoryError(new TransactionInboxConflictError('finality'));
   }
   finalityEvidenceVersion(receipt.finality_evidence_version);
@@ -1513,8 +1521,8 @@ function assertFinalizedReceiptAcceptsNotification(
   reconciledStatus(status, notification.confirmationStatus);
 }
 
-function assertFinalizedReceiptMatchesInbox(
-  receipt: FinalizedReplayReceiptRow | undefined,
+function assertTerminalReceiptMatchesInbox(
+  receipt: TerminalReplayReceiptRow | undefined,
   inbox: InboxIdentityRow,
 ): void {
   if (receipt === undefined) {
@@ -1523,7 +1531,8 @@ function assertFinalizedReceiptMatchesInbox(
   try {
     const matches = numericBigInt(receipt.observed_slot, 'receipt observed slot')
         === numericBigInt(inbox.observed_slot, 'observed slot')
-      && confirmation(receipt.confirmation_status) === 'finalized'
+      && confirmation(receipt.confirmation_status)
+        === confirmation(inbox.target_confirmation_status)
       && finalityEvidenceVersion(receipt.finality_evidence_version)
         === finalityEvidenceVersion(inbox.finality_evidence_version)
       && requiredFingerprint(receipt.immutable_fingerprint)

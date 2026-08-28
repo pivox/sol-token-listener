@@ -33,7 +33,10 @@ import {
   type PaperDecisionRepositoryOptions,
 } from '../src/storage/paper-decision.repository.js';
 import { PostgresPaperTradingRepository } from '../src/storage/paper-trading.repository.js';
-import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
+import {
+  PostgresTransactionInboxRepository,
+  TransactionInboxConflictError,
+} from '../src/storage/transaction-inbox.repository.js';
 import { toJsonValue } from '../src/utils/json.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -54,7 +57,7 @@ class PostgresPaperDecisionRepository extends ProductionPaperDecisionRepository 
     options: PaperDecisionRepositoryOptions = {},
     qualificationProfile = EFFECTIVE_QUALIFICATION_PROFILE,
   ) {
-    super(pool, options, qualificationProfile);
+    super(pool, {clock:()=>1_000,...options}, qualificationProfile);
   }
 }
 
@@ -828,14 +831,16 @@ void test('retry-only reconciliation failure preserves every paper domain row',a
   if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
   await withSchema(async(pool)=>{
     await seed(pool);
+    let nowMs=1_000;
     const repository=new PostgresPaperDecisionRepository(pool,{
-      maxAttempts:3,baseDelayMs:100,clock:()=>2_000,
+      maxAttempts:3,baseDelayMs:100,clock:()=>nowMs,
     });
     await repository.enqueue(jobInput());
     const entryJob=await repository.claim({ nowMs:1_000,leaseMs:1_000 });
     assert.ok(entryJob);
     await repository.complete(entryJob,decisionResult());
     await seedTrade(pool);
+    nowMs=2_000;
     await repository.enqueue(jobInput({
       sourceEventId:TRADE_EVENT_ID,sourceRawEventId:TRADE_RAW_EVENT_ID,
       inputFingerprint:'8'.repeat(64),
@@ -897,6 +902,147 @@ void test('claim also waits for an earlier active raw signature of the same mint
 
     await seedProcessedInbox(pool,'earlier-signature',9n,'confirmed');
     assert.ok(await repository.claim({ nowMs:1_000,leaseMs:1_000 }));
+  });
+});
+
+void test('rotates at most sixteen finality-blocked jobs before a later ready claim',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await migrateDatabase({pool});
+    await seedFinalityPreflightBacklog(pool,1_000,[33]);
+    const repository=paperDecisionRepository(pool);
+
+    assert.equal(await repository.claim({nowMs:100_000,leaseMs:10_000}),null);
+    assert.equal((await pool.query(`SELECT COUNT(*)::int AS count
+      FROM paper_decision_jobs WHERE finality_checked_at IS NOT NULL`)).rows[0]?.count,16);
+
+    const firstRestart=paperDecisionRepository(pool);
+    assert.equal(await firstRestart.claim({nowMs:100_000,leaseMs:10_000}),null);
+    assert.equal((await pool.query(`SELECT COUNT(*)::int AS count
+      FROM paper_decision_jobs WHERE finality_checked_at IS NOT NULL`)).rows[0]?.count,32);
+
+    const secondRestart=paperDecisionRepository(pool);
+    const ready=await secondRestart.claim({nowMs:100_000,leaseMs:10_000});
+    assert.equal(ready?.mint,'fair-mint-33');
+    assert.equal((await pool.query(`SELECT COUNT(*)::int AS count
+      FROM paper_decision_jobs WHERE finality_checked_at IS NOT NULL`)).rows[0]?.count,47);
+  });
+});
+
+void test('concurrent claimers rotate distinct bounded finality preflight batches',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await migrateDatabase({pool});
+    await seedFinalityPreflightBacklog(pool,1_000,[]);
+    const left=paperDecisionRepository(pool);
+    const right=paperDecisionRepository(pool);
+
+    assert.deepEqual(await Promise.all([
+      left.claim({nowMs:100_000,leaseMs:10_000}),
+      right.claim({nowMs:100_000,leaseMs:10_000}),
+    ]),[null,null]);
+    assert.equal((await pool.query(`SELECT COUNT(*)::int AS count
+      FROM paper_decision_jobs WHERE finality_checked_at IS NOT NULL`)).rows[0]?.count,32);
+  });
+});
+
+void test('leaves additional ready jobs at the finality preflight head',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await migrateDatabase({pool});
+    await seedFinalityPreflightBacklog(pool,1_000,[1,2]);
+    const repository=paperDecisionRepository(pool);
+
+    assert.equal((await repository.claim({nowMs:100_000,leaseMs:10_000}))?.mint,'fair-mint-1');
+    const secondBefore=await pool.query(`SELECT finality_checked_at,claim_scan_generation
+      FROM paper_decision_jobs WHERE mint='fair-mint-2'`);
+    assert.equal(secondBefore.rows[0]?.finality_checked_at,null);
+    assert.equal((await repository.claim({nowMs:100_000,leaseMs:10_000}))?.mint,'fair-mint-2');
+    assert.equal((await pool.query(`SELECT finality_checked_at,claim_scan_generation
+      FROM paper_decision_jobs WHERE mint='fair-mint-2'`)).rows[0]?.finality_checked_at,null);
+  });
+});
+
+void test('bounds expired maximum-attempt cleanup to the locked preflight batch',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await migrateDatabase({pool});
+    await seedFinalityPreflightBacklog(pool,1_000,[]);
+    await pool.query(`UPDATE paper_decision_jobs SET status='PROCESSING',attempts=1,
+      attempts_in_cycle=1,max_attempts=1,lease_token='expired-max',
+      lease_expires_at=to_timestamp(90),updated_at=to_timestamp(90)`);
+    const repository=paperDecisionRepository(pool);
+
+    assert.equal(await repository.claim({nowMs:100_000,leaseMs:10_000}),null);
+    const counts=await pool.query(`SELECT status,COUNT(*)::int AS count
+      FROM paper_decision_jobs GROUP BY status ORDER BY status`);
+    assert.deepEqual(counts.rows,[
+      {status:'CANCELLED',count:16},
+      {status:'PROCESSING',count:984},
+    ]);
+    const cancelled=await pool.query(`SELECT DISTINCT
+      EXTRACT(EPOCH FROM purge_after-terminal_at)::int AS retention_seconds
+      FROM paper_decision_jobs WHERE status='CANCELLED'`);
+    assert.deepEqual(cancelled.rows,[{retention_seconds:14_400}]);
+  });
+});
+
+void test('honors retry and processing effective-time boundaries in preflight order',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await migrateDatabase({pool});
+    await seedFinalityPreflightBacklog(pool,4,[1,2,3,4]);
+    await pool.query(`UPDATE paper_decision_jobs SET status='RETRYABLE_FAILED',
+      next_attempt_at=to_timestamp(101),error_code='RPC_TRANSIENT'
+      WHERE mint='fair-mint-1'`);
+    await pool.query(`UPDATE paper_decision_jobs SET status='PROCESSING',
+      lease_token='active',lease_expires_at=to_timestamp(101)
+      WHERE mint='fair-mint-2'`);
+    await pool.query(`UPDATE paper_decision_jobs SET status='RETRYABLE_FAILED',
+      next_attempt_at=to_timestamp(100),error_code='RPC_TRANSIENT'
+      WHERE mint='fair-mint-3'`);
+    await pool.query(`UPDATE paper_decision_jobs SET status='PROCESSING',
+      lease_token='expired',lease_expires_at=to_timestamp(90)
+      WHERE mint='fair-mint-4'`);
+    const repository=paperDecisionRepository(pool);
+
+    assert.equal((await repository.claim({nowMs:100_000,leaseMs:10_000}))?.mint,'fair-mint-4');
+    assert.equal((await repository.claim({nowMs:100_000,leaseMs:10_000}))?.mint,'fair-mint-3');
+    assert.equal(await repository.claim({nowMs:100_000,leaseMs:10_000}),null);
+    const untouched=await pool.query(`SELECT mint,status FROM paper_decision_jobs
+      WHERE mint IN ('fair-mint-1','fair-mint-2') ORDER BY mint`);
+    assert.deepEqual(untouched.rows,[
+      {mint:'fair-mint-1',status:'RETRYABLE_FAILED'},
+      {mint:'fair-mint-2',status:'PROCESSING'},
+    ]);
+  });
+});
+
+void test('rolls back blocked rotation when claiming a ready preflight job fails',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await migrateDatabase({pool});
+    await seedFinalityPreflightBacklog(pool,32,[16]);
+    await pool.query(`CREATE FUNCTION reject_paper_claim() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN
+        IF NEW.status='PROCESSING' AND OLD.status<>'PROCESSING' THEN
+          RAISE EXCEPTION 'reject paper claim';
+        END IF;
+        RETURN NEW;
+      END $$`);
+    await pool.query(`CREATE TRIGGER reject_paper_claim
+      BEFORE UPDATE ON paper_decision_jobs FOR EACH ROW EXECUTE FUNCTION reject_paper_claim()`);
+    const repository=paperDecisionRepository(pool);
+
+    await assert.rejects(
+      repository.claim({nowMs:100_000,leaseMs:10_000}),
+      PaperDecisionRepositoryError,
+    );
+    const rows=await pool.query(`SELECT
+      COUNT(*) FILTER (WHERE finality_checked_at IS NOT NULL)::int AS checked,
+      COUNT(*) FILTER (WHERE status='PENDING')::int AS pending
+      FROM paper_decision_jobs`);
+    assert.deepEqual(rows.rows,[{checked:0,pending:32}]);
   });
 });
 
@@ -1040,10 +1186,13 @@ void test('manual-kill wake remains claimable after aligned finalized inbox rete
     await pool.query(`UPDATE domain_events SET confirmation_status='finalized'
       WHERE event_id=$1`,[SOURCE_EVENT_ID]);
     await inbox.markProcessed('signature',replay.leaseToken,'finalized');
-    await pool.query(`UPDATE chain_transaction_inbox SET
-      processed_at=clock_timestamp()-INTERVAL '5 hours',
-      terminal_at=clock_timestamp()-INTERVAL '5 hours',
-      purge_after=clock_timestamp()-INTERVAL '1 hour'
+    await pool.query(`WITH retention AS MATERIALIZED (
+      SELECT clock_timestamp() AS now
+    ) UPDATE chain_transaction_inbox SET
+      processed_at=retention.now-INTERVAL '5 hours',
+      terminal_at=retention.now-INTERVAL '5 hours',
+      purge_after=retention.now-INTERVAL '1 hour'
+      FROM retention
       WHERE signature='signature'`);
     await pool.query(`UPDATE chain_transaction_finality_replay_receipts receipt SET
       replay_completed_at=inbox.processed_at
@@ -1077,6 +1226,117 @@ void test('manual-kill wake remains claimable after aligned finalized inbox rete
     assert.ok(manualKillClaim);
     assert.equal((await pool.query(`SELECT COUNT(*) FROM chain_transaction_inbox
       WHERE signature='signature'`)).rows[0]?.count,'0');
+  });
+});
+
+void test('orphan retraction survives terminal inbox retention and a paper-worker restart',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await seedTrade(pool);
+    const decisions=paperDecisionRepository(pool);
+    await decisions.enqueue(jobInput());
+    const initial=await decisions.claim({nowMs:1_000,leaseMs:10_000});
+    assert.ok(initial);
+    const active=creationDecisionWithEvidence('orphan-retained-trade',2_000);
+    await decisions.complete(initial,active);
+
+    await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
+    const inbox=new PostgresTransactionInboxRepository(pool);
+    await inbox.enqueue(Object.freeze({
+      signature:'signature',slot:10n,source:'WEBSOCKET' as const,
+      programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
+      confirmationStatus:'confirmed' as const,observedAtMs:2_100,
+    }));
+    const confirmed=await inbox.claim(2_101,120);
+    assert.ok(confirmed);
+    await inbox.saveSnapshot('signature',confirmed.leaseToken,paperNormalizedTransaction());
+    await inbox.markProcessed('signature',confirmed.leaseToken,'confirmed');
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      target_confirmation_status='orphaned',processing_status='PENDING',
+      processed_at=NULL,terminal_at=NULL,purge_after=NULL,
+      finality_evidence_version=finality_evidence_version+1
+      WHERE signature='signature'`);
+    await pool.query(`UPDATE raw_chain_events SET confirmation_status='orphaned'
+      WHERE event_id=$1`,[RAW_EVENT_ID]);
+    await pool.query(`UPDATE domain_events SET confirmation_status='orphaned'
+      WHERE event_id=$1`,[SOURCE_EVENT_ID]);
+    await pool.query(`UPDATE domain_events event SET confirmation_status='orphaned'
+      FROM qualification_reports report
+      WHERE event.event_id=report.qualification_event_id AND report.mint=$1`,[MINT]);
+    await decisions.enqueue(jobInput({
+      sourceConfirmationStatus:'orphaned',inputFingerprint:'7'.repeat(64),
+    }));
+
+    const orphanReplay=await inbox.claim(2_102,120);
+    assert.ok(orphanReplay);
+    await inbox.markProcessed('signature',orphanReplay.leaseToken,'orphaned');
+    await pool.query(`WITH retention AS MATERIALIZED (
+      SELECT clock_timestamp() AS now
+    ) UPDATE chain_transaction_inbox SET
+      processed_at=retention.now-INTERVAL '5 hours',
+      terminal_at=retention.now-INTERVAL '5 hours',
+      purge_after=retention.now-INTERVAL '1 hour'
+      FROM retention
+      WHERE signature='signature'`);
+    await pool.query(`UPDATE chain_transaction_finality_replay_receipts receipt SET
+      replay_completed_at=inbox.processed_at
+      FROM chain_transaction_inbox inbox
+      WHERE receipt.signature=inbox.signature AND inbox.signature='signature'`);
+
+    await pool.query(`DELETE FROM chain_transaction_finality_replay_receipts
+      WHERE signature='signature'`);
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox,0);
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature,observed_slot,confirmation_status,finality_evidence_version,
+      immutable_fingerprint,replay_completed_at
+    ) SELECT signature,observed_slot,target_confirmation_status,finality_evidence_version,
+      immutable_fingerprint,processed_at FROM chain_transaction_inbox
+      WHERE signature='signature'`);
+    assert.equal((await purgeExpiredFoundationData(pool)).transactionInbox,1);
+    assert.equal((await pool.query(`SELECT confirmation_status
+      FROM chain_transaction_finality_replay_receipts WHERE signature='signature'`))
+      .rows[0]?.confirmation_status,'orphaned');
+    await assert.rejects(inbox.enqueue(Object.freeze({
+      signature:'signature',slot:10n,source:'CATCH_UP' as const,
+      programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
+      confirmationStatus:'confirmed' as const,observedAtMs:3_000,
+    })),TransactionInboxConflictError);
+    assert.equal((await pool.query(`SELECT COUNT(*)::int AS count
+      FROM chain_transaction_inbox WHERE signature='signature'`)).rows[0]?.count,0);
+
+    const restarted=paperDecisionRepository(pool);
+    const orphanJob=await restarted.claim({nowMs:3_001,leaseMs:10_000});
+    assert.ok(orphanJob);
+    await restarted.complete(orphanJob,creationSourceOrphanDecision(active,3_001));
+    assert.equal((await pool.query(`SELECT state FROM paper_strategy_sessions
+      WHERE session_id=$1`,[active.session?.id])).rows[0]?.state,'PAPER_RETRACTED');
+  });
+});
+
+void test('orphan receipt mismatch and present pending inbox both block claim',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await pool.query(`UPDATE raw_chain_events SET confirmation_status='orphaned'
+      WHERE event_id=$1`,[RAW_EVENT_ID]);
+    await pool.query(`UPDATE domain_events SET confirmation_status='orphaned'
+      WHERE event_id=$1`,[SOURCE_EVENT_ID]);
+    await setInboxState(pool,'signature','PENDING','orphaned');
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature,observed_slot,confirmation_status,finality_evidence_version,
+      immutable_fingerprint,replay_completed_at
+    ) VALUES ('signature',10,'orphaned',1,$1,$2)`,['f'.repeat(64),new Date(1_000)]);
+    const decisions=paperDecisionRepository(pool);
+    await decisions.enqueue(jobInput({
+      sourceConfirmationStatus:'orphaned',inputFingerprint:'6'.repeat(64),
+    }));
+
+    assert.equal(await decisions.claim({nowMs:1_000,leaseMs:1_000}),null);
+    await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
+    await pool.query(`UPDATE chain_transaction_finality_replay_receipts
+      SET observed_slot=11 WHERE signature='signature'`);
+    assert.equal(await decisions.claim({nowMs:1_001,leaseMs:1_000}),null);
   });
 });
 
@@ -2144,6 +2404,55 @@ async function seed(pool: InstanceType<typeof pg.Pool>): Promise<void> {
     SOURCE_EVENT_ID,RAW_EVENT_ID,MINT,new Date(900),new Date(1_000),toJsonValue({ launch }),
   ]);
   await seedQualification(pool,canonicalProjection(decisionResult()));
+}
+
+async function seedFinalityPreflightBacklog(
+  pool:InstanceType<typeof pg.Pool>,
+  count:number,
+  readyRanks:readonly number[],
+):Promise<void>{
+  await pool.query(`INSERT INTO token_launches (
+    mint,launchpad,program_id,creator,token_program,current_state,created_signature,
+    created_slot,created_transaction_index,created_instruction_index,detected_at,updated_at
+  ) SELECT 'fair-mint-'||value,'pumpfun','pump','creator','SPL_TOKEN','DETECTED',
+    'fair-signature-'||value,10,0,1,to_timestamp(1),to_timestamp(1)
+    FROM generate_series(1,$1) value`,[count]);
+  await pool.query(`INSERT INTO raw_chain_events (
+    event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+    confirmation_status,observed_at,payload_version,payload
+  ) SELECT 'fair-raw-'||value,'pumpfun','pump','fair-mint-'||value,
+    'fair-signature-'||value,10,0,1,'confirmed',to_timestamp(1),1,'{}'::jsonb
+    FROM generate_series(1,$1) value`,[count]);
+  await pool.query(`INSERT INTO domain_events (
+    event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
+    instruction_index,confirmation_status,observed_at,payload_version,payload
+  ) SELECT 'fair-event-'||value,'fair-raw-'||value,'TokenLaunchDetected',
+    'fair-mint-'||value,'pumpfun','pump','fair-signature-'||value,10,0,1,
+    'confirmed',to_timestamp(1),1,'{}'::jsonb FROM generate_series(1,$1) value`,[count]);
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+    processing_status,observed_at
+  ) SELECT 'fair-signature-'||value,10,ARRAY['WEBSOCKET'],
+    ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],'confirmed','PENDING',
+    to_timestamp(1) FROM generate_series(1,$1) value`,[count]);
+  if(readyRanks.length>0){
+    await pool.query(`UPDATE chain_transaction_inbox SET processing_status='PROCESSED',
+      normalized_transaction=jsonb_build_object('signature',signature),
+      immutable_fingerprint=$2,processed_at=to_timestamp(1)
+      WHERE signature=ANY($1::text[])`,[
+      readyRanks.map((rank)=>`fair-signature-${rank}`),'f'.repeat(64),
+    ]);
+  }
+  await pool.query(`INSERT INTO paper_decision_jobs (
+    job_id,mint,source_event_id,source_raw_event_id,source_confirmation_status,
+    input_fingerprint,status,max_attempts,base_delay_ms,created_at,updated_at,
+    payload_version,payload
+  ) SELECT 'paper_job_'||md5(value::text)||md5('job-'||value),
+    'fair-mint-'||value,'fair-event-'||value,'fair-raw-'||value,'confirmed',
+    md5('left-'||value)||md5('right-'||value),'PENDING',5,500,
+    to_timestamp(1)+value*INTERVAL '1 millisecond',
+    to_timestamp(1)+value*INTERVAL '1 millisecond',1,'{}'::jsonb
+    FROM generate_series(1,$1) value`,[count]);
 }
 
 async function seedTrade(pool: InstanceType<typeof pg.Pool>): Promise<void> {

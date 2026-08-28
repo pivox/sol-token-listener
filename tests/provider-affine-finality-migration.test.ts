@@ -36,7 +36,9 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
     await insertLegacyInbox(pool, 'legacy-positive', 3);
 
     const sql = await readFile(migrationUrl, 'utf8');
-    assert.deepEqual(await migrateDatabase({ pool }), [migrationName, paperFinalityMigrationName]);
+    assert.deepEqual(await migrateDatabase({ pool }), [
+      migrationName,paperFinalityMigrationName,'029_paper_finality_claim_scheduler.sql',
+    ]);
     assert.match(
       await finalityIndexDefinition(pool),
       /\(updated_at, observed_slot, signature\).*processing_status.*PROCESSED.*target_confirmation_status/iu,
