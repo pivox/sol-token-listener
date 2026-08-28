@@ -46,7 +46,7 @@
 - Modify: `tests/transaction-inbox-timestamp-migration.test.ts`
 - Modify: `tests/wallet-graph-migration.test.ts`
 
-- [ ] **Step 1: Write the failing upgrade, empty-schema and replay tests**
+- [x] **Step 1: Write the failing upgrade, empty-schema and replay tests**
 
 Build a temporary PostgreSQL schema, apply 001–029, insert a hostile legacy
 heartbeat whose WebSocket slot/signature are populated, then apply migration
@@ -73,7 +73,7 @@ Apply the SQL directly a second time and assert that the row is unchanged.
 Also apply 001–030 to an empty schema and assert the migration history tail is
 `030_listener_websocket_health.sql`.
 
-- [ ] **Step 2: Prove the migration tests fail before SQL exists**
+- [x] **Step 2: Prove the migration tests fail before SQL exists**
 
 Run:
 
@@ -84,7 +84,7 @@ TEST_DATABASE_URL='postgresql:///postgres?host=/tmp' \
 
 Expected: failure because migration 030 and its table do not exist.
 
-- [ ] **Step 3: Add the normalized snapshot and checks**
+- [x] **Step 3: Add the normalized snapshot and checks**
 
 Create the table with the exact columns from spec v1.0.2. Use unconstrained
 `NUMERIC` plus explicit `NaN`, nonnegative, integral and `< 10^78` checks for
@@ -109,7 +109,7 @@ INSERT INTO listener_websocket_health (
 The migration must not select legacy `last_signature` or
 `last_websocket_slot`.
 
-- [ ] **Step 4: Exercise every SQL invariant**
+- [x] **Step 4: Exercise every SQL invariant**
 
 Add table-driven rejected updates for invalid provider IDs, equal active and
 candidate sessions, half-present observation/disconnect pairs, numeric `NaN`,
@@ -117,14 +117,14 @@ negative or fractional slots, incoherent recovery timestamps, phase/session
 mismatches, and `INACTIVE` with positive generation. Add accepted rows for all
 nine detailed phases.
 
-- [ ] **Step 5: Advance all migration manifests to 030**
+- [x] **Step 5: Advance all migration manifests to 030**
 
 Replace assertions whose only purpose is the migration tail. Add
 `030_listener_websocket_health.sql` to the deployment smoke allowlist and
 artifact test. Do not rewrite tests that intentionally stop at an earlier
 legacy migration fixture.
 
-- [ ] **Step 6: Run migration-focused tests**
+- [x] **Step 6: Run migration-focused tests**
 
 Run:
 
@@ -135,7 +135,7 @@ TEST_DATABASE_URL='postgresql:///postgres?host=/tmp' npm run test:backend -- \
 
 Expected: all selected tests pass and direct replay adds no duplicate row.
 
-- [ ] **Step 7: Commit the migration foundation**
+- [x] **Step 7: Commit the migration foundation**
 
 ```bash
 git add migrations/030_listener_websocket_health.sql \
@@ -161,7 +161,7 @@ git commit -m "feat: add durable websocket health schema (#62)"
 - Create: `src/domain/websocket-health.ts`
 - Create: `tests/websocket-health-domain.test.ts`
 
-- [ ] **Step 1: Write failing enum, mapping and hostile-boundary tests**
+- [x] **Step 1: Write failing enum, mapping and hostile-boundary tests**
 
 Test the exact phase, recovery and reason sets from the spec, plus this public
 mapping:
@@ -178,7 +178,7 @@ Test frozen valid snapshots, non-data properties, getters, proxies, inherited
 values, invalid dates, unsafe numbers, non-bigint generations, generation
 overflow, provider/session mismatches, and mutable nested input.
 
-- [ ] **Step 2: Run the domain tests RED**
+- [x] **Step 2: Run the domain tests RED**
 
 ```bash
 npm run test:backend -- --test-name-pattern='websocket health domain'
@@ -186,7 +186,7 @@ npm run test:backend -- --test-name-pattern='websocket health domain'
 
 Expected: module-not-found or missing exported symbols.
 
-- [ ] **Step 3: Implement constants, types and validator**
+- [x] **Step 3: Implement constants, types and validator**
 
 Export immutable constants and types:
 
@@ -206,7 +206,7 @@ Use `RpcProviderId` from `src/domain/rpc-provider.ts`. Validate own enumerable
 data properties without invoking accessors, snapshot every nested input, and
 return fully frozen values. Domain errors must use fixed messages only.
 
-- [ ] **Step 4: Run domain tests GREEN and strict check**
+- [x] **Step 4: Run domain tests GREEN and strict check**
 
 ```bash
 npm run test:backend -- --test-name-pattern='websocket health domain'
@@ -215,7 +215,7 @@ npm run check:backend
 
 Expected: all domain tests and TypeScript strict checking pass.
 
-- [ ] **Step 5: Commit the domain**
+- [x] **Step 5: Commit the domain**
 
 ```bash
 git add src/domain/websocket-health.ts tests/websocket-health-domain.test.ts
@@ -231,7 +231,7 @@ git commit -m "feat: define websocket health lifecycle (#62)"
 - Create: `src/storage/websocket-health.repository.ts`
 - Create: `tests/websocket-health.repository.test.ts`
 
-- [ ] **Step 1: Write failing canonical-read and owner-acquisition tests**
+- [x] **Step 1: Write failing canonical-read and owner-acquisition tests**
 
 Use real PostgreSQL schemas. Cover:
 
@@ -253,14 +253,14 @@ await assert.rejects(repository.beginOwner(input), (error: unknown) => {
 });
 ```
 
-- [ ] **Step 2: Write failing transition, touch and observation tests**
+- [x] **Step 2: Write failing transition, touch and observation tests**
 
 Cover exact revision CAS, stale owner/revision rejection, generation exhaustion,
 concurrent begin serialization, periodic `touch` that changes only
 `heartbeat_at`, active/candidate session generations, provider-ID ABA, partial
 ACK observations, out-of-order slots, and retired-session `STALE_SESSION`.
 
-- [ ] **Step 3: Run repository tests RED**
+- [x] **Step 3: Run repository tests RED**
 
 ```bash
 TEST_DATABASE_URL='postgresql:///postgres?host=/tmp' npm run test:backend -- \
@@ -269,7 +269,7 @@ TEST_DATABASE_URL='postgresql:///postgres?host=/tmp' npm run test:backend -- \
 
 Expected: missing repository/port failures.
 
-- [ ] **Step 4: Define the neutral repository contract**
+- [x] **Step 4: Define the neutral repository contract**
 
 Export exact inputs/results without `pg` types:
 
@@ -288,7 +288,7 @@ Fixed repository codes are `ACTIVE_INSTANCE`, `STALE_OWNER`,
 `STALE_REVISION`, `GENERATION_EXHAUSTED`, `STATE_CONFLICT`, and
 `DEPENDENCY_FAILED`.
 
-- [ ] **Step 5: Implement transactional PostgreSQL behavior**
+- [x] **Step 5: Implement transactional PostgreSQL behavior**
 
 Use one canonical service key and parameterized SQL only. `beginOwner` uses
 `SELECT ... FOR UPDATE`; transitions update with exact generation/revision in
@@ -297,14 +297,14 @@ PostgreSQL time and accepts only the current active/candidate session pair.
 Differentiate an expected zero-row stale result from an actual dependency
 failure without exposing database text.
 
-- [ ] **Step 6: Prove concurrency and rollback**
+- [x] **Step 6: Prove concurrency and rollback**
 
 Add two-pool concurrent tests showing one fresh owner wins, stale revision does
 not mutate the row, a forced trigger failure rolls back every field, and a
 retired provider reappearing with a new session generation cannot accept an old
 callback.
 
-- [ ] **Step 7: Run repository and migration tests GREEN**
+- [x] **Step 7: Run repository and migration tests GREEN**
 
 ```bash
 TEST_DATABASE_URL='postgresql:///postgres?host=/tmp' npm run test:backend -- \
@@ -312,7 +312,7 @@ TEST_DATABASE_URL='postgresql:///postgres?host=/tmp' npm run test:backend -- \
 npm run check:backend
 ```
 
-- [ ] **Step 8: Commit the repository**
+- [x] **Step 8: Commit the repository**
 
 ```bash
 git add src/ports/websocket-health-repository.ts \
@@ -331,14 +331,14 @@ git commit -m "feat: fence websocket health ownership (#62)"
 - Modify: `tests/bootstrap-safety.test.ts`
 - Modify: `tests/production-listener-factory.test.ts`
 
-- [ ] **Step 1: Write failing reporter lifecycle tests**
+- [x] **Step 1: Write failing reporter lifecycle tests**
 
 Use a manual scheduler and fake repository. Cover immediate transition writes,
 one periodic touch at a time, coalescing while a touch is pending, stale timer
 callbacks after stop, bounded shutdown, cleanup failure remaining degraded, and
 idempotent stop.
 
-- [ ] **Step 2: Write failing enqueue-before-watermark tests**
+- [x] **Step 2: Write failing enqueue-before-watermark tests**
 
 Use ordered spies around the future session callback:
 
@@ -350,13 +350,13 @@ Assert enqueue rejection makes zero health calls; health rejection occurs only
 after durable enqueue and rejects the callback; `STALE_SESSION` is a safe no-op
 after enqueue; no signature is passed to the health repository.
 
-- [ ] **Step 3: Run reporter tests RED**
+- [x] **Step 3: Run reporter tests RED**
 
 ```bash
 npm run test:backend -- --test-name-pattern='websocket health reporter'
 ```
 
-- [ ] **Step 4: Implement the inactive reporter**
+- [x] **Step 4: Implement the inactive reporter**
 
 The reporter depends only on `TransactionInboxRepository.enqueue`,
 `WebSocketHealthRepository`, an injected scheduler and fixed interval/shutdown
@@ -364,21 +364,21 @@ bounds. It exposes transition, observe, start-touch and stop operations but
 does not import the WebSocket factory, provider catalog, strict scanner, app
 configuration, or production runtime.
 
-- [ ] **Step 5: Prove #63 remains inactive**
+- [x] **Step 5: Prove #63 remains inactive**
 
 Extend source-safety tests to assert `createProductionListenerRuntime` still
 constructs `SolanaProgramSubscriber` and does not import or instantiate
 `openWsProgramSession`, `StrictCatchUpScanner`,
 `ProviderPinnedStrictCatchUpSource`, or `PersistentWebSocketHealthReporter`.
 
-- [ ] **Step 6: Run reporter, bootstrap and factory tests GREEN**
+- [x] **Step 6: Run reporter, bootstrap and factory tests GREEN**
 
 ```bash
 npm run test:backend -- --test-name-pattern='websocket health reporter|bootstrap safety|production listener factory'
 npm run check:backend
 ```
 
-- [ ] **Step 7: Commit the inactive application seam**
+- [x] **Step 7: Commit the inactive application seam**
 
 ```bash
 git add src/application/websocket-health-reporter.ts \
@@ -406,21 +406,21 @@ git commit -m "feat: add inactive websocket health reporter (#62)"
 - Modify: `tests/transaction-ingestion-recovery.test.ts`
 - Modify: `tests/wallet-graph.repository.test.ts`
 
-- [ ] **Step 1: Write failing retention tests**
+- [x] **Step 1: Write failing retention tests**
 
 Cover unresolved evidence retained without deadline, resolved evidence retained
 at `completed_at + 4 hours`, exact pre-boundary preservation, exact boundary
 purge, running-row disconnect/recovery clearing, stopped-row ACK/observation
 clearing, and no `heartbeat_at` refresh during purge.
 
-- [ ] **Step 2: Run retention tests RED**
+- [x] **Step 2: Run retention tests RED**
 
 ```bash
 TEST_DATABASE_URL='postgresql:///postgres?host=/tmp' npm run test:backend -- \
   --test-name-pattern='websocket health.*retention'
 ```
 
-- [ ] **Step 3: Add one bounded purge projection**
+- [x] **Step 3: Add one bounded purge projection**
 
 Inside `purgeExpiredFoundationData`, update only rows whose
 `evidence_purge_after <= clock_timestamp()`. Clear resolved reason/timestamp
@@ -428,19 +428,19 @@ fields and set recovery to `NOT_REQUIRED`; for `STOPPED`, also clear ACK and
 observation. Return a new `websocketHealthEvidence` count. Do not change
 `heartbeat_at` or create a transition.
 
-- [ ] **Step 4: Align existing purge result assertions**
+- [x] **Step 4: Align existing purge result assertions**
 
 Add the new zero/nonzero count to typed fixtures without loosening exact
 deep-equality checks.
 
-- [ ] **Step 5: Run all retention/migration tests GREEN**
+- [x] **Step 5: Run all retention/migration tests GREEN**
 
 ```bash
 TEST_DATABASE_URL='postgresql:///postgres?host=/tmp' npm run test:backend -- \
   --test-name-pattern='purge|retention|websocket health migration'
 ```
 
-- [ ] **Step 6: Commit retention**
+- [x] **Step 6: Commit retention**
 
 ```bash
 git add src/storage/database.ts tests/websocket-health-migration.test.ts \
@@ -466,13 +466,13 @@ git commit -m "feat: expire resolved websocket health evidence (#62)"
 - Modify: `tests/api-safety.test.ts`
 - Modify: `tests/deployment-healthcheck.test.ts`
 
-- [ ] **Step 1: Write failing contract and projection tests**
+- [x] **Step 1: Write failing contract and projection tests**
 
 Add exact backend fixtures for inactive stopped and every active detailed phase.
 Assert the five-state mapping, positional IDs, timestamps, fixed reason codes,
 `lastSignature: null`, frozen output, and absence of internal generations.
 
-- [ ] **Step 2: Write failing aggregate-health tests**
+- [x] **Step 2: Write failing aggregate-health tests**
 
 Cover:
 
@@ -484,40 +484,40 @@ Cover:
 - malformed WS rows and dependency failures return redacted degraded health;
 - PostgreSQL unavailable retains HTTP 503 behavior.
 
-- [ ] **Step 3: Run API tests RED**
+- [x] **Step 3: Run API tests RED**
 
 ```bash
 npm run test:backend -- --test-name-pattern='API|health|deployment healthcheck'
 ```
 
-- [ ] **Step 4: Extend backend contracts**
+- [x] **Step 4: Extend backend contracts**
 
 Add `ApiWebSocketHealth` and required `ApiHeartbeat.websocket`. Keep the V1
 `lastSignature` property but document and enforce `null`. Every public nested
 object is readonly and returned frozen.
 
-- [ ] **Step 5: Project the canonical snapshot safely**
+- [x] **Step 5: Project the canonical snapshot safely**
 
 Read `transaction-listener` by primary key, not latest arbitrary service. Read
 unresolved strict-failure existence with a bounded `EXISTS`. Decode each field
 through explicit allowlists; never serialize a database row wholesale. Return
 the inactive stopped default if no WS row exists during a rolling migration.
 
-- [ ] **Step 6: Apply the transitional aggregate rule**
+- [x] **Step 6: Apply the transitional aggregate rule**
 
 Ignore WS state only when supervision is `INACTIVE`. Under `ACTIVE`, require
 fresh `heartbeatAt`, detailed `RUNNING`, public `ACKNOWLEDGED`, recovery
 `NOT_REQUIRED|RECOVERED`, and no unresolved strict failure. Keep every existing
 health gate.
 
-- [ ] **Step 7: Run backend API and safety tests GREEN**
+- [x] **Step 7: Run backend API and safety tests GREEN**
 
 ```bash
 npm run test:backend -- --test-name-pattern='API|health|safety'
 npm run check:backend
 ```
 
-- [ ] **Step 8: Commit the API projection**
+- [x] **Step 8: Commit the API projection**
 
 ```bash
 git add src/api/contracts.ts src/storage/api-projection.repository.ts \
@@ -540,50 +540,50 @@ git commit -m "feat: expose redacted websocket health API (#62)"
 - Modify: `frontend/src/features/health/health-page.test.tsx`
 - Modify: `frontend/tests/e2e/operator-console.spec.ts`
 
-- [ ] **Step 1: Write failing rolling-compatibility schema tests**
+- [x] **Step 1: Write failing rolling-compatibility schema tests**
 
 Assert a complete new object parses, an old backend without `websocket` still
 parses, invalid known enums/timestamps fail, and additive hostile fields remain
 unrepresented in the inferred output used by the UI.
 
-- [ ] **Step 2: Write failing health-card tests**
+- [x] **Step 2: Write failing health-card tests**
 
 Assert allowlisted rendering of public state, detailed phase, active/candidate
 positional IDs, heartbeat/ACK times, diagnostic watermark, fixed disconnect and
 recovery codes. Assert the old-backend fallback text and absence of injected
 URL, signature, stack, remote reason and arbitrary JSON fields.
 
-- [ ] **Step 3: Run frontend tests RED**
+- [x] **Step 3: Run frontend tests RED**
 
 ```bash
 npm test --workspace frontend -- --run api-schemas health-page
 ```
 
-- [ ] **Step 4: Add the optional rolling schema**
+- [x] **Step 4: Add the optional rolling schema**
 
 Define the full strict field enums inside a loose `websocket` object, then make
 only that object optional on the client. Keep slots as decimal strings and
 timestamps through the existing timestamp schema.
 
-- [ ] **Step 5: Render an explicit Bootstrap card**
+- [x] **Step 5: Render an explicit Bootstrap card**
 
 Use fixed labels and `Timestamp`; do not render generic object entries. Label
 `lastObservation` as “watermark diagnostic — pas une preuve de continuité”.
 Display “Non disponible — backend antérieur” when absent.
 
-- [ ] **Step 6: Update mock API and browser assertion**
+- [x] **Step 6: Update mock API and browser assertion**
 
 Add one active degraded fixture to the E2E mock and assert the health page shows
 the positional provider and fixed reason without any secret-like field.
 
-- [ ] **Step 7: Run frontend unit and E2E tests GREEN**
+- [x] **Step 7: Run frontend unit and E2E tests GREEN**
 
 ```bash
 npm test --workspace frontend -- --run api-schemas health-page
 npm run frontend:e2e
 ```
 
-- [ ] **Step 8: Commit the frontend**
+- [x] **Step 8: Commit the frontend**
 
 ```bash
 git add frontend/src/data frontend/src/features/health frontend/tests
@@ -660,7 +660,7 @@ git commit -m "docs: document durable websocket health (#62)"
 - Verify all files changed since `origin/main`
 - Update: issue #57 checklist only after merge
 
-- [ ] **Step 1: Run a clean dependency and build gate**
+- [x] **Step 1: Run a clean dependency and build gate**
 
 ```bash
 npm install
@@ -673,7 +673,7 @@ npm run docs:check
 Expected: all commands exit zero. Record, but do not automatically modify, the
 existing npm vulnerability count.
 
-- [ ] **Step 2: Run all backend and frontend tests on PostgreSQL**
+- [x] **Step 2: Run all backend and frontend tests on PostgreSQL**
 
 ```bash
 TEST_DATABASE_URL='postgresql:///postgres?host=/tmp' npm test
@@ -683,7 +683,7 @@ npm run frontend:e2e
 Expected: zero failures/skips caused by the change, migration 001–030 succeeds
 on an empty schema, and every pre-existing test remains green.
 
-- [ ] **Step 3: Run final safety and diff checks**
+- [x] **Step 3: Run final safety and diff checks**
 
 ```bash
 git diff --check origin/main...HEAD
@@ -695,7 +695,7 @@ rg -n 'Keypair|sendTransaction|sendRawTransaction|signTransaction|private.?key|E
 Inspect matches and confirm no new live capability, secret, provider URL or
 generic remote-error serialization.
 
-- [ ] **Step 4: Obtain sequential internal reviews**
+- [x] **Step 4: Obtain sequential internal reviews**
 
 First request specification compliance against design v1.0.2. After PASS,
 request code quality/security/concurrency review. Address Critical/Important
