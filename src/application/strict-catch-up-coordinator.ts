@@ -1,7 +1,7 @@
 import type { StrictCatchUpScanResult } from './strict-catch-up-scanner.js';
 
 export interface StrictCatchUpScannerPort {
-  scan(): Promise<StrictCatchUpScanResult>;
+  scan(signal: AbortSignal): Promise<StrictCatchUpScanResult>;
 }
 
 export class StrictCatchUpCoordinator {
@@ -9,7 +9,7 @@ export class StrictCatchUpCoordinator {
 
   public constructor(private readonly scanner: StrictCatchUpScannerPort) {}
 
-  public run(): Promise<StrictCatchUpScanResult> {
+  public run(signal: AbortSignal): Promise<StrictCatchUpScanResult> {
     if (this.inFlight !== null) return this.inFlight;
 
     const deferred = deferredStrictCatchUpScan();
@@ -20,7 +20,7 @@ export class StrictCatchUpCoordinator {
       () => { this.clear(run); },
     );
     try {
-      deferred.resolve(this.scanner.scan());
+      deferred.resolve(this.scanner.scan(signal));
     } catch (error) {
       deferred.reject(error);
     }

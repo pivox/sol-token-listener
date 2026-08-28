@@ -6,16 +6,21 @@ import {
   type StrictCatchUpScannerPort,
 } from '../src/application/strict-catch-up-coordinator.js';
 
+const NEVER_ABORTED = new AbortController().signal;
+
 void test('coalesces concurrent runs into the exact same promise and scan', async () => {
   const pending = deferred<StrictCatchUpScanResult>();
   const scanner = new FakeScanner([pending.promise]);
   const coordinator = new StrictCatchUpCoordinator(scanner);
+  const firstController = new AbortController();
+  const secondController = new AbortController();
 
-  const first = coordinator.run();
-  const second = coordinator.run();
+  const first = coordinator.run(firstController.signal);
+  const second = coordinator.run(secondController.signal);
 
   assert.equal(first, second);
   assert.equal(scanner.calls, 1);
+  assert.deepEqual(scanner.signals, [firstController.signal]);
 
   pending.resolve(result('primary'));
 
@@ -28,8 +33,8 @@ void test('shares the original scan error between concurrent callers', async () 
   const coordinator = new StrictCatchUpCoordinator(scanner);
   const error = new Error('unavailable');
 
-  const first = coordinator.run();
-  const second = coordinator.run();
+  const first = coordinator.run(NEVER_ABORTED);
+  const second = coordinator.run(NEVER_ABORTED);
   pending.reject(error);
 
   await assert.rejects(first, (value: unknown) => value === error);
@@ -46,10 +51,10 @@ void test('starts a new scan after a successful run settles', async () => {
   ]);
   const coordinator = new StrictCatchUpCoordinator(scanner);
 
-  const first = coordinator.run();
+  const first = coordinator.run(NEVER_ABORTED);
   assert.equal(await first, firstResult);
 
-  const second = coordinator.run();
+  const second = coordinator.run(NEVER_ABORTED);
   assert.notEqual(second, first);
   assert.equal(await second, secondResult);
   assert.equal(scanner.calls, 2);
@@ -64,9 +69,9 @@ void test('starts a new scan after a failed run settles', async () => {
   ]);
   const coordinator = new StrictCatchUpCoordinator(scanner);
 
-  await assert.rejects(coordinator.run(), (value: unknown) => value === error);
+  await assert.rejects(coordinator.run(NEVER_ABORTED), (value: unknown) => value === error);
 
-  assert.equal(await coordinator.run(), successfulResult);
+  assert.equal(await coordinator.run(NEVER_ABORTED), successfulResult);
   assert.equal(scanner.calls, 2);
 });
 
@@ -83,8 +88,8 @@ void test('normalizes a scanner thenable without duplicating its scan', async ()
   };
   const coordinator = new StrictCatchUpCoordinator(scanner);
 
-  const first = coordinator.run();
-  const second = coordinator.run();
+  const first = coordinator.run(NEVER_ABORTED);
+  const second = coordinator.run(NEVER_ABORTED);
 
   assert.equal(first, second);
   assert.equal(await first, value);
@@ -104,9 +109,9 @@ void test('rejects and resets after a native scan promise has a hostile then get
   const coordinator = new StrictCatchUpCoordinator(scanner);
 
   let first: Promise<StrictCatchUpScanResult> | undefined;
-  assert.doesNotThrow(() => { first = coordinator.run(); });
+  assert.doesNotThrow(() => { first = coordinator.run(NEVER_ABORTED); });
   assert.ok(first);
-  const second = coordinator.run();
+  const second = coordinator.run(NEVER_ABORTED);
 
   assert.equal(first, second);
   assert.notEqual(first, hostileResult);
@@ -114,7 +119,7 @@ void test('rejects and resets after a native scan promise has a hostile then get
   await assert.rejects(first, (value: unknown) => value === error);
   await assert.rejects(second, (value: unknown) => value === error);
 
-  assert.equal(await coordinator.run(), successfulResult);
+  assert.equal(await coordinator.run(NEVER_ABORTED), successfulResult);
   assert.equal(scanner.calls, 2);
 });
 
@@ -128,20 +133,20 @@ void test('coalesces a synchronous reentrant run before the scanner returns', as
       calls += 1;
       if (calls === 1) {
         if (coordinator === null) throw new Error('Coordinator is unavailable.');
-        nested = coordinator.run();
+        nested = coordinator.run(NEVER_ABORTED);
       }
       return Promise.resolve(scanResult);
     },
   };
   coordinator = new StrictCatchUpCoordinator(scanner);
 
-  const first = coordinator.run();
+  const first = coordinator.run(NEVER_ABORTED);
 
   assert.equal(nested, first);
   assert.equal(calls, 1);
   assert.equal(await first, scanResult);
 
-  const next = coordinator.run();
+  const next = coordinator.run(NEVER_ABORTED);
   assert.notEqual(next, first);
   assert.equal(calls, 2);
 });
@@ -159,18 +164,20 @@ void test('converts a synchronous scanner throw into its original rejected error
   };
   const coordinator = new StrictCatchUpCoordinator(scanner);
 
-  await assert.rejects(coordinator.run(), (value: unknown) => value === error);
-  assert.equal(await coordinator.run(), successfulResult);
+  await assert.rejects(coordinator.run(NEVER_ABORTED), (value: unknown) => value === error);
+  assert.equal(await coordinator.run(NEVER_ABORTED), successfulResult);
   assert.equal(calls, 2);
 });
 
 class FakeScanner implements StrictCatchUpScannerPort {
   public calls = 0;
+  public readonly signals: AbortSignal[] = [];
 
   public constructor(private readonly responses: Promise<StrictCatchUpScanResult>[]) {}
 
-  public scan(): Promise<StrictCatchUpScanResult> {
+  public scan(signal: AbortSignal): Promise<StrictCatchUpScanResult> {
     this.calls += 1;
+    this.signals.push(signal);
     const next = this.responses.shift();
     if (next === undefined) throw new Error('Unexpected scan.');
     return next;

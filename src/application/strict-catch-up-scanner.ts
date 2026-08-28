@@ -75,18 +75,48 @@ export class StrictCatchUpScannerError extends Error {
   }
 }
 
+const WINDOW_FRONTIERS = new WeakMap<
+  StrictCatchUpWindowExceededError,
+  StrictCatchUpBoundaries
+>();
+
+export class StrictCatchUpAbortedError extends Error {
+  public constructor() {
+    super('Strict catch-up scan was aborted.');
+    Object.defineProperty(this, 'name', { value: 'StrictCatchUpAbortedError' });
+    Object.freeze(this);
+  }
+}
+
 export class StrictCatchUpWindowExceededError extends Error {
-  public readonly code = 'CATCH_UP_WINDOW_EXCEEDED' as const;
-  public readonly stage = 'window' as const;
-  public readonly retryable = false;
+  public readonly code: 'CATCH_UP_WINDOW_EXCEEDED';
+  public readonly stage: 'window';
+  public readonly retryable: false;
+  public readonly providerId: RpcProviderId;
+  public readonly checkpointKey: ProcessingCheckpointKey;
 
   public constructor(
-    public readonly providerId: RpcProviderId,
-    public readonly checkpointKey: ProcessingCheckpointKey,
+    providerId: RpcProviderId,
+    checkpointKey: ProcessingCheckpointKey,
+    frontier: StrictCatchUpBoundaries,
   ) {
     super('Strict catch-up scan window was exceeded.');
-    this.name = 'StrictCatchUpWindowExceededError';
+    this.code = 'CATCH_UP_WINDOW_EXCEEDED';
+    this.stage = 'window';
+    this.retryable = false;
+    this.providerId = providerId;
+    this.checkpointKey = checkpointKey;
+    Object.defineProperty(this, 'name', { value: 'StrictCatchUpWindowExceededError' });
+    WINDOW_FRONTIERS.set(this, snapshotBoundaries(frontier));
     Object.freeze(this);
+  }
+
+  public sameFrontier(other: StrictCatchUpWindowExceededError): boolean {
+    const left = WINDOW_FRONTIERS.get(this);
+    const right = WINDOW_FRONTIERS.get(other);
+    return left !== undefined && right !== undefined
+      && sameCheckpoint(left.launchpad, right.launchpad)
+      && sameCheckpoint(left.market, right.market);
   }
 }
 
@@ -138,21 +168,26 @@ export class StrictCatchUpScanner {
     this.now = now === undefined ? Date.now : now as () => number;
   }
 
-  public async scan(): Promise<StrictCatchUpScanResult> {
+  public async scan(signal: AbortSignal): Promise<StrictCatchUpScanResult> {
+    assertNotAborted(signal);
     const observedAtMs = this.readNow();
-    const launchpad = await this.readCheckpoint('launchpad');
-    const market = await this.readCheckpoint('market');
+    const launchpad = await this.readCheckpoint('launchpad', signal);
+    const market = await this.readCheckpoint('market', signal);
     const boundaries: StrictCatchUpBoundaries = Object.freeze({ launchpad, market });
     const scans: StrictProgramScan[] = [];
 
     for (const program of PROGRAMS) {
       const expected = boundaries[program.key];
       try {
-        scans.push(await this.scanProgram(program, expected));
+        scans.push(await this.scanProgram(program, expected, signal));
       } catch (error) {
         if (isWindowExceeded(error)) {
-          await this.recordWindowFailure(error, observedAtMs);
-          throw new StrictCatchUpWindowExceededError(this.providerId, error.checkpointKey);
+          await this.recordWindowFailure(error, observedAtMs, signal);
+          throw new StrictCatchUpWindowExceededError(
+            this.providerId,
+            error.checkpointKey,
+            boundaries,
+          );
         }
         throw error;
       }
@@ -176,24 +211,28 @@ export class StrictCatchUpScanner {
         confirmationStatus: discovery.confirmationStatus,
         observedAtMs,
       });
-      try {
-        await this.repository.enqueue(notification);
-      } catch {
-        throw this.failure('enqueue', discoveryKey(discovery.programIds));
-      }
+      await this.awaited(signal, async () => {
+        try {
+          await this.repository.enqueue(notification);
+        } catch {
+          throw this.failure('enqueue', discoveryKey(discovery.programIds));
+        }
+      });
     }
 
     let checkpointCasCount = 0;
     for (const scan of scans) {
       if (scan.newest === null) {
-        try {
-          await this.repository.resolveStrictCatchUpFailures(
-            scan.program.key,
-            scan.expected,
-          );
-        } catch {
-          throw this.failure('failure-resolve', scan.program.key);
-        }
+        await this.awaited(signal, async () => {
+          try {
+            await this.repository.resolveStrictCatchUpFailures(
+              scan.program.key,
+              scan.expected,
+            );
+          } catch {
+            throw this.failure('failure-resolve', scan.program.key);
+          }
+        });
         continue;
       }
       const next: ProcessingCheckpoint = Object.freeze({
@@ -202,11 +241,13 @@ export class StrictCatchUpScanner {
         signature: scan.newest.signature,
         updatedAtMs: observedAtMs,
       });
-      try {
-        await this.repository.compareAndSwapCheckpoint(scan.expected, next);
-      } catch {
-        throw this.failure('checkpoint-cas', scan.program.key);
-      }
+      await this.awaited(signal, async () => {
+        try {
+          await this.repository.compareAndSwapCheckpoint(scan.expected, next);
+        } catch {
+          throw this.failure('checkpoint-cas', scan.program.key);
+        }
+      });
       checkpointCasCount += 1;
     }
 
@@ -223,6 +264,7 @@ export class StrictCatchUpScanner {
   private async scanProgram(
     program: CatchUpDiscoveryProgram,
     expected: ProcessingCheckpoint | null,
+    signal: AbortSignal,
   ): Promise<StrictProgramScan> {
     const rows: CatchUpSignature[] = [];
     const signatures = new Set<string>();
@@ -232,7 +274,7 @@ export class StrictCatchUpScanner {
     let observedHeadSlot: bigint | null = null;
 
     for (let pageCount = 1; pageCount <= this.maxPages; pageCount += 1) {
-      const page = await this.readPage(program, before);
+      const page = await this.readPage(program, before, signal);
       if (pageCount === 1) observedHeadSlot = page[0]?.slot ?? null;
       for (const row of page) {
         if (row.slot > MAX_STRICT_CATCH_UP_SLOT
@@ -275,17 +317,19 @@ export class StrictCatchUpScanner {
   private async readPage(
     program: CatchUpDiscoveryProgram,
     before: string | undefined,
+    signal: AbortSignal,
   ): Promise<readonly CatchUpSignature[]> {
-    let value: unknown;
-    try {
-      value = await this.source.list(program.id, before, this.pageSize);
-    } catch (error) {
-      throw this.failure(
-        'source',
-        program.key,
-        trustedCatchUpSourceErrorStage(error) ?? 'request',
-      );
-    }
+    const value = await this.awaited(signal, async () => {
+      try {
+        return await this.source.list(program.id, before, this.pageSize);
+      } catch (error) {
+        throw this.failure(
+          'source',
+          program.key,
+          trustedCatchUpSourceErrorStage(error) ?? 'request',
+        );
+      }
+    });
     try {
       return snapshotCatchUpSignatures(value, this.pageSize);
     } catch {
@@ -295,31 +339,44 @@ export class StrictCatchUpScanner {
 
   private async readCheckpoint(
     key: ProcessingCheckpointKey,
+    signal: AbortSignal,
   ): Promise<ProcessingCheckpoint | null> {
-    try {
-      const value = await this.repository.readCheckpoint(key);
-      return value === null ? null : snapshotCheckpoint(value, key);
-    } catch {
-      throw this.failure('checkpoint-read', key);
-    }
+    return this.awaited(signal, async () => {
+      try {
+        const value = await this.repository.readCheckpoint(key);
+        return value === null ? null : snapshotCheckpoint(value, key);
+      } catch {
+        throw this.failure('checkpoint-read', key);
+      }
+    });
   }
 
   private async recordWindowFailure(
     value: StrictCatchUpWindowSignal,
     detectedAtMs: number,
+    signal: AbortSignal,
   ): Promise<void> {
-    try {
-      const failure = createStrictCatchUpFailure({
-        checkpointKey: value.checkpointKey,
-        previous: value.previous,
-        providerId: this.providerId,
-        observedHeadSlot: value.observedHeadSlot,
-        detectedAtMs,
-      });
-      await this.repository.recordStrictCatchUpFailure(failure);
-    } catch {
-      throw this.failure('failure-write', value.checkpointKey);
-    }
+    await this.awaited(signal, async () => {
+      try {
+        const failure = createStrictCatchUpFailure({
+          checkpointKey: value.checkpointKey,
+          previous: value.previous,
+          providerId: this.providerId,
+          observedHeadSlot: value.observedHeadSlot,
+          detectedAtMs,
+        });
+        await this.repository.recordStrictCatchUpFailure(failure);
+      } catch {
+        throw this.failure('failure-write', value.checkpointKey);
+      }
+    });
+  }
+
+  private async awaited<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    assertNotAborted(signal);
+    const value = await operation();
+    assertNotAborted(signal);
+    return value;
   }
 
   private readNow(): number {
@@ -340,6 +397,32 @@ export class StrictCatchUpScanner {
   ): StrictCatchUpScannerError {
     return new StrictCatchUpScannerError(stage, this.providerId, checkpointKey, sourceStage);
   }
+}
+
+function assertNotAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new StrictCatchUpAbortedError();
+}
+
+function snapshotBoundaries(value: StrictCatchUpBoundaries): StrictCatchUpBoundaries {
+  return Object.freeze({
+    launchpad: value.launchpad === null
+      ? null
+      : snapshotCheckpoint(value.launchpad, 'launchpad'),
+    market: value.market === null
+      ? null
+      : snapshotCheckpoint(value.market, 'market'),
+  });
+}
+
+function sameCheckpoint(
+  left: ProcessingCheckpoint | null,
+  right: ProcessingCheckpoint | null,
+): boolean {
+  return left === null || right === null
+    ? left === right
+    : left.key === right.key
+      && left.slot === right.slot
+      && left.signature === right.signature;
 }
 
 function successfulScan(
