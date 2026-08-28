@@ -7,7 +7,11 @@ import {
   createCreationEntrySession,
   createPaperStrategySession,
 } from '../src/domain/paper-strategy.js';
-import type { PaperPosition } from '../src/domain/paper-trading.js';
+import type {
+  OpenPaperPositionCommand,
+  PaperExecutionQuote,
+  PaperPosition,
+} from '../src/domain/paper-trading.js';
 import type { QualificationReport } from '../src/domain/qualification.js';
 import { createTradingCandidate } from '../src/domain/trading-candidate.js';
 import type { ChainCursor, TokenLaunch } from '../src/domain/types.js';
@@ -16,12 +20,20 @@ import type {
   PaperDecisionResult,
 } from '../src/ports/paper-decision-repository.js';
 import type { CanonicalQualificationProjection } from '../src/ports/qualification-projection-repository.js';
+import { PaperTradingEngine } from '../src/paper/paper-trading-engine.js';
+import {
+  createDefaultQualificationRuleSet,
+  QualificationEngine,
+} from '../src/qualification/qualification-engine.js';
+import type { NormalizedTransaction } from '../src/solana/rpc/types.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import {
+  PaperDecisionRepositoryError,
   PostgresPaperDecisionRepository as ProductionPaperDecisionRepository,
   type PaperDecisionRepositoryOptions,
 } from '../src/storage/paper-decision.repository.js';
 import { PostgresPaperTradingRepository } from '../src/storage/paper-trading.repository.js';
+import { PostgresTransactionInboxRepository } from '../src/storage/transaction-inbox.repository.js';
 import { toJsonValue } from '../src/utils/json.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -155,10 +167,7 @@ void test('removes V2 buyer evidence orphaned without a replacement trade', asyn
     const counted = creationDecisionWithEvidence('trade-orphaned', 2_000);
     await repository.complete(initial, counted);
 
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
-      [TRADE_RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,TRADE_RAW_EVENT_ID,'trade-signature','orphaned');
     await pool.query(
       `UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
       [TRADE_EVENT_ID],
@@ -234,10 +243,7 @@ void test('does not let a stale orphan completion delete newer V2 evidence', asy
     const counted = creationDecisionWithEvidence('trade-old', 2_000);
     await repository.complete(initial, counted);
 
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
-      [TRADE_RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,TRADE_RAW_EVENT_ID,'trade-signature','orphaned');
     await pool.query(
       `UPDATE domain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
       [TRADE_EVENT_ID],
@@ -254,10 +260,7 @@ void test('does not let a stale orphan completion delete newer V2 evidence', asy
     await repository.enqueue(jobInput({ inputFingerprint: 'c'.repeat(64) }));
     const newer = await repository.claim({ nowMs: 3_100, leaseMs: 10_000 });
     assert.ok(newer);
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='confirmed' WHERE event_id=$1`,
-      [TRADE_RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,TRADE_RAW_EVENT_ID,'trade-signature','confirmed');
     await repository.complete(newer, creationDecisionWithEvidence('trade-new', 4_000));
     await repository.complete(stale, creationDecisionWithEvidence('trade-stale', 3_000));
 
@@ -412,10 +415,7 @@ for(const invalidState of ['superseded','orphaned','payload'] as const){
       await seed(pool);
       if(invalidState==='superseded'){
         const replacement=decisionResult('finalized',result.qualificationEvent.cursor,2_000,'e');
-        await pool.query(
-          `UPDATE raw_chain_events SET confirmation_status='finalized' WHERE event_id=$1`,
-          [RAW_EVENT_ID],
-        );
+        await setRawConfirmation(pool,RAW_EVENT_ID,'signature','finalized');
         await pool.query(
           `UPDATE domain_events SET confirmation_status='finalized' WHERE event_id=$1`,
           [SOURCE_EVENT_ID],
@@ -534,10 +534,7 @@ void test('claims an orphaned source revision and reloads its paper lineage', as
     const decision = decisionResult();
     await repository.complete(confirmed, decision);
 
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
-      [RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,RAW_EVENT_ID,'signature','orphaned');
     await pool.query(
       `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
       [RAW_EVENT_ID],
@@ -579,10 +576,7 @@ void test('terminalizes an orphan-only launch no-op without exhausting the backl
   await withSchema(async (pool) => {
     await seed(pool);
     const repository = new PostgresPaperDecisionRepository(pool);
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
-      [RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,RAW_EVENT_ID,'signature','orphaned');
     await pool.query(
       `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
       [RAW_EVENT_ID],
@@ -631,10 +625,7 @@ void test('terminalizes an obsolete orphan job without changing later paper line
     await repository.complete(laterJob,later);
     await pool.query(`UPDATE qualification_reports SET superseded_at=evaluated_at
       WHERE mint=$1 AND superseded_at IS NULL`,[MINT]);
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
-      [RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,RAW_EVENT_ID,'signature','orphaned');
     await pool.query(
       `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
       [RAW_EVENT_ID],
@@ -670,10 +661,7 @@ void test('obsolete completion rejects exact lineage committed after its snapsho
   await withSchema(async (pool) => {
     await seed(pool);
     const repository = new PostgresPaperDecisionRepository(pool);
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
-      [RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,RAW_EVENT_ID,'signature','orphaned');
     await pool.query(
       `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
       [RAW_EVENT_ID],
@@ -738,10 +726,7 @@ void test('reloads the entry candidate when a later trade becomes orphaned', asy
     const entry = decisionResult();
     await repository.complete(entryJob,entry);
     await seedTrade(pool);
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
-      [TRADE_RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,TRADE_RAW_EVENT_ID,'trade-signature','orphaned');
     await pool.query(
       `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
       [TRADE_RAW_EVENT_ID],
@@ -784,10 +769,7 @@ void test('reloads an active later session when its launch becomes orphaned', as
     await repository.complete(entryJob,entry);
     await pool.query(`UPDATE qualification_reports SET superseded_at=evaluated_at
       WHERE mint=$1 AND superseded_at IS NULL`,[MINT]);
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='orphaned' WHERE event_id=$1`,
-      [RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,RAW_EVENT_ID,'signature','orphaned');
     await pool.query(
       `UPDATE domain_events SET confirmation_status='orphaned' WHERE raw_event_id=$1`,
       [RAW_EVENT_ID],
@@ -880,6 +862,114 @@ void test('retry-only reconciliation failure preserves every paper domain row',a
   });
 });
 
+void test('claim waits for every relevant inbox replay state and exact confirmation alignment',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    const repository=paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+
+    for(const state of ['PENDING','PROCESSING','FAILED'] as const){
+      await setInboxState(pool,'signature',state,'confirmed');
+      assert.equal(await repository.claim({ nowMs:1_000,leaseMs:1_000 }),null,state);
+    }
+    await setInboxState(pool,'signature','PROCESSED','processed');
+    assert.equal(await repository.claim({ nowMs:1_000,leaseMs:1_000 }),null,'misaligned');
+    await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
+    assert.equal(await repository.claim({ nowMs:1_000,leaseMs:1_000 }),null,'missing');
+
+    await seedProcessedInbox(pool,'signature',10n,'confirmed');
+    assert.ok(await repository.claim({ nowMs:1_000,leaseMs:1_000 }));
+  });
+});
+
+void test('claim also waits for an earlier active raw signature of the same mint',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await seedRaw(pool,Object.freeze({
+      eventId:'raw-earlier',signature:'earlier-signature',slot:9n,
+      transactionIndex:7,instructionIndex:3,confirmationStatus:'confirmed',
+    }));
+    const repository=paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    assert.equal(await repository.claim({ nowMs:1_000,leaseMs:1_000 }),null);
+
+    await seedProcessedInbox(pool,'earlier-signature',9n,'confirmed');
+    assert.ok(await repository.claim({ nowMs:1_000,leaseMs:1_000 }));
+  });
+});
+
+void test('a revision after claim blocks snapshot and resumes after aligned replay',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    const repository=paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const job=await repository.claim({ nowMs:1_000,leaseMs:10_000 });
+    assert.ok(job);
+
+    await setInboxState(pool,'signature','PENDING','finalized');
+    await assert.rejects(repository.loadSnapshot(job),PaperDecisionRepositoryError);
+    assert.deepEqual(await paperOpenRows(pool),{
+      positions:0,trades:0,opened_events:0,sessions:0,candidates:0,
+    });
+
+    await setInboxState(pool,'signature','PROCESSED','finalized');
+    await pool.query(`UPDATE raw_chain_events SET confirmation_status='finalized'
+      WHERE event_id=$1`,[RAW_EVENT_ID]);
+    assert.equal((await repository.loadSnapshot(job)).mint,MINT);
+  });
+});
+
+void test('a revision after claim blocks staging without candidate or session materialization',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    const repository=paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const job=await repository.claim({ nowMs:1_000,leaseMs:10_000 });
+    assert.ok(job);
+    await repository.loadSnapshot(job);
+
+    await setInboxState(pool,'signature','PENDING','finalized');
+    await assert.rejects(repository.stageDecision(job,decisionResult()),PaperDecisionRepositoryError);
+    assert.deepEqual(await paperOpenRows(pool),{
+      positions:0,trades:0,opened_events:0,sessions:0,candidates:0,
+    });
+  });
+});
+
+void test('the reusable paper replay barrier fails closed above 4096 relevant raw rows',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await pool.query(`INSERT INTO raw_chain_events (
+      event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+      confirmation_status,observed_at,payload_version,payload
+    ) SELECT 'raw-bulk-'||value,'pumpfun','pump',$1,'bulk-signature-'||value,
+      9,value,0,'confirmed',$2,1,'{}'::jsonb FROM generate_series(1,4096) value`,[
+      MINT,new Date(900),
+    ]);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+      processing_status,normalized_transaction,immutable_fingerprint,observed_at,processed_at
+    ) SELECT 'bulk-signature-'||value,9,ARRAY['WEBSOCKET'],
+      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],'confirmed','PROCESSED',
+      jsonb_build_object('signature','bulk-signature-'||value),$1,$2,$2
+      FROM generate_series(1,4096) value`,['e'.repeat(64),new Date(900)]);
+    const repository=paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+    const job=await repository.claim({ nowMs:1_000,leaseMs:10_000 });
+    assert.ok(job);
+
+    await assert.rejects(repository.loadSnapshot(job),PaperDecisionRepositoryError);
+    assert.deepEqual(await paperOpenRows(pool),{
+      positions:0,trades:0,opened_events:0,sessions:0,candidates:0,
+    });
+  });
+});
+
 void test('rejects a staged paper open superseded before the atomic ledger guard',async(context)=>{
   if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
   await withSchema(async(pool)=>{
@@ -906,6 +996,26 @@ void test('rejects a staged paper open superseded before the atomic ledger guard
 
     assert.deepEqual(await paperOpenRows(pool),before);
     assert.deepEqual(before,{ positions:0,trades:0,opened_events:0,sessions:1,candidates:1 });
+  });
+});
+
+void test('PaperTradingEngine.open writes no position or trade while source replay is pending',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    const fixture=paperEngineOpenFixture();
+    await replaceCurrentQualification(pool,fixture.projection);
+    await setInboxState(pool,'signature','PENDING','finalized');
+    const engine=new PaperTradingEngine({
+      executionMode:'paper',paperQuoteMintAllowlist:['SOL'],dataRetentionHours:4,
+    },new PostgresPaperTradingRepository(pool),fixture.profile,fixture.authority,{
+      now:()=>QUALIFICATION_EVALUATED_AT_MS+1_000,
+    });
+
+    await assert.rejects(engine.open(fixture.command),hasCode('QUALIFICATION_NOT_CURRENT'));
+    assert.deepEqual(await paperOpenRows(pool),{
+      positions:0,trades:0,opened_events:0,sessions:0,candidates:0,
+    });
   });
 });
 
@@ -954,6 +1064,74 @@ void test('holds the qualification advisory lock from validation through paper c
       await holding;
       contender.release();
     }
+  });
+});
+
+void test('the paper inbox SHARE lock serializes enqueueRevision until paper commit',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
+    const replayableInbox=new PostgresTransactionInboxRepository(pool);
+    await replayableInbox.enqueue(Object.freeze({
+      signature:'signature',slot:10n,source:'WEBSOCKET' as const,
+      programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
+      confirmationStatus:'confirmed' as const,observedAtMs:QUALIFICATION_EVALUATED_AT_MS,
+    }));
+    const inboxClaim=await replayableInbox.claim(QUALIFICATION_EVALUATED_AT_MS+1,120);
+    assert.ok(inboxClaim);
+    await replayableInbox.saveSnapshot(
+      'signature',inboxClaim.leaseToken,paperNormalizedTransaction(),
+    );
+    await replayableInbox.markProcessed('signature',inboxClaim.leaseToken,'confirmed');
+    const projection=canonicalProjection(decisionResult());
+    const ledger=new PostgresPaperTradingRepository(pool);
+    let guardedResolve!:()=>void;
+    const guarded=new Promise<void>((resolve)=>{guardedResolve=resolve;});
+    let releaseResolve!:()=>void;
+    const releaseGuard=new Promise<void>((resolve)=>{releaseResolve=resolve;});
+    const holding=ledger.transact(async transaction=>{
+      await transaction.requireCurrentQualification({
+        mint:MINT,reportId:projection.reportId,
+        qualificationEventId:projection.qualificationEvent.id,
+      });
+      guardedResolve();
+      await releaseGuard;
+    });
+    await guarded;
+    const schema=(await pool.query<{readonly current_schema:string}>(
+      'SELECT current_schema() AS current_schema',
+    )).rows[0]?.current_schema;
+    assert.ok(schema);
+    const contenderPool=new pg.Pool({
+      connectionString:databaseUrl,max:1,
+      options:`-c search_path=${schema} -c lock_timeout=100ms`,
+    });
+    try{
+      const contender=new PostgresTransactionInboxRepository(contenderPool);
+      await assert.rejects(contender.enqueueRevision(Object.freeze({
+        signature:'signature',confirmationStatus:'finalized' as const,
+        observedAtMs:QUALIFICATION_EVALUATED_AT_MS+2_000,
+      })));
+      assert.equal((await pool.query<{readonly processing_status:string}>(
+        `SELECT processing_status FROM chain_transaction_inbox
+          WHERE signature='signature'`,
+      )).rows[0]?.processing_status,'PROCESSED');
+    }finally{
+      await contenderPool.end();
+      releaseResolve();
+      await holding;
+    }
+    await new PostgresTransactionInboxRepository(pool).enqueueRevision(Object.freeze({
+      signature:'signature',confirmationStatus:'finalized' as const,
+      observedAtMs:QUALIFICATION_EVALUATED_AT_MS+3_000,
+    }));
+    assert.deepEqual((await pool.query<{
+      readonly processing_status:string;readonly target_confirmation_status:string;
+    }>(`SELECT processing_status,target_confirmation_status
+      FROM chain_transaction_inbox WHERE signature='signature'`)).rows[0],{
+      processing_status:'PENDING',target_confirmation_status:'finalized',
+    });
   });
 });
 
@@ -1101,10 +1279,7 @@ void test('persists a finalized candidate revision after a confirmed decision', 
       ...confirmed, session: null, sessionEvent: null, requestedAction: 'NONE' as const,
     }));
 
-    await pool.query(
-      `UPDATE raw_chain_events SET confirmation_status='finalized' WHERE event_id=$1`,
-      [RAW_EVENT_ID],
-    );
+    await setRawConfirmation(pool,RAW_EVENT_ID,'signature','finalized');
     await pool.query(
       `UPDATE domain_events SET confirmation_status='finalized' WHERE event_id=$1`,
       [SOURCE_EVENT_ID],
@@ -1587,6 +1762,82 @@ function qualificationReport(evaluatedAtMs = 1_000): QualificationReport {
   });
 }
 
+function paperEngineOpenFixture(){
+  const profile=createDefaultQualificationRuleSet(60);
+  const authority=new QualificationEngine(profile);
+  const reportId=`qreport_${'9'.repeat(64)}`;
+  const qualificationEvent=derivedEvent(
+    'QualificationUpdated',reportId,Object.freeze({ reportId }),
+    'confirmed',Object.freeze({
+      slot:10n,transactionIndex:0,instructionIndex:1,innerInstructionIndex:null,
+    }),QUALIFICATION_EVALUATED_AT_MS,'qualification','signature',
+  );
+  const report=authority.evaluateAuthorized({
+    mint:MINT,triggerEventId:qualificationEvent.id,
+  },{
+    evaluatedAtMs:QUALIFICATION_EVALUATED_AT_MS,
+    signals:Object.freeze({
+      imageValid:true,socialCrossLinkConfirmed:true,creatorHasNotSold:true,
+    }),
+    blockers:Object.freeze([]),
+    calibrationFacts:Object.freeze({
+      top1HolderBps:null,top5HoldersBps:null,top10HoldersBps:null,
+      maximumRelatedClusterBps:null,maximumSharedFunderCount:null,
+      buySimulationSucceeded:true,sellQuoteAvailable:true,roundTripLossBps:1_100n,
+      upstreamConditions:Object.freeze([]),
+    }),
+  });
+  const projection:CanonicalQualificationProjection=Object.freeze({
+    reportId,sourceEventId:SOURCE_EVENT_ID,sourceRawEventId:RAW_EVENT_ID,
+    evidenceFingerprint:'9'.repeat(64),
+    evaluation:canonicalProjection(decisionResult()).evaluation,
+    report,qualificationEvent,
+  });
+  const command:OpenPaperPositionCommand=Object.freeze({
+    mint:MINT,quoteAsset:Object.freeze({
+      mint:'SOL',decimals:9,tokenProgram:'SPL_TOKEN' as const,
+    }),
+    strategy:Object.freeze({ id:'recovery',version:1 }),
+    trigger:qualificationEvent,qualification:report,
+    strategySessionId:`paper_session_${'7'.repeat(64)}`,
+    qualificationReportId:reportId,candidateId:`candidate_${'8'.repeat(64)}`,
+    buyQuote:paperEngineQuote('paper-engine-buy','SOL',MINT,100n,95n,90n),
+    reverseSellQuote:paperEngineQuote('paper-engine-sell',MINT,'SOL',90n,91n,89n),
+    maximumRoundTripLossBps:10_000n,
+    expectedCurrentQualification:Object.freeze({
+      mint:MINT,reportId,qualificationEventId:qualificationEvent.id,
+    }),
+  });
+  return Object.freeze({ profile,authority,projection,command });
+}
+
+function paperEngineQuote(
+  id:string,inputMint:string,outputMint:string,
+  amountInRaw:bigint,amountOutRaw:bigint,minimumAmountOutRaw:bigint,
+):PaperExecutionQuote{
+  return Object.freeze({
+    id,inputMint,outputMint,amountInRaw,amountOutRaw,
+    minimumAmountOutRaw,feesRaw:1n,slippageBps:100n,
+    priceImpactBps:50n,observedAtMs:QUALIFICATION_EVALUATED_AT_MS,observedSlot:10n,
+  });
+}
+
+function paperNormalizedTransaction():NormalizedTransaction{
+  return Object.freeze({
+    signature:'signature',slot:10n,transactionIndex:0,
+    confirmationStatus:'PROCESSED' as const,version:'legacy' as const,
+    blockTimeMs:900,accountKeys:Object.freeze(['account']),
+    signerKeys:Object.freeze(['account']),instructions:Object.freeze([Object.freeze({
+      programId:'program',accounts:Object.freeze(['account']),
+      data:Uint8Array.from([0,1,255]),instructionIndex:0,
+      innerInstructionIndex:null,parentInstructionIndex:null,stackHeight:null,
+    })]),
+    preTokenBalances:Object.freeze([]),postTokenBalances:Object.freeze([]),
+    preBalancesLamports:Object.freeze([100n]),postBalancesLamports:Object.freeze([99n]),
+    feeLamports:1n,computeUnits:123n,logs:Object.freeze(['ok']),error:null,
+  });
+}
+
 function derivedEvent(
   type: DomainEvent['type'],
   qualifier: string,
@@ -1774,6 +2025,7 @@ async function seed(pool: InstanceType<typeof pg.Pool>): Promise<void> {
   ) VALUES ($1,'pumpfun','pump',$2,'signature',10,0,1,'confirmed',$3,1,'{}')`, [
     RAW_EVENT_ID, MINT, new Date(1_000),
   ]);
+  await seedProcessedInbox(pool,'signature',10n,'confirmed');
   await pool.query(`INSERT INTO domain_events (
     event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
     instruction_index,confirmation_status,blockchain_time,observed_at,payload_version,payload
@@ -1791,6 +2043,7 @@ async function seedTrade(pool: InstanceType<typeof pg.Pool>): Promise<void> {
   ) VALUES ($1,'pumpfun','pump',$2,'trade-signature',11,0,2,'confirmed',$3,1,'{}')`, [
     TRADE_RAW_EVENT_ID, MINT, new Date(2_000),
   ]);
+  await seedProcessedInbox(pool,'trade-signature',11n,'confirmed');
   await pool.query(`INSERT INTO domain_events (
     event_id,raw_event_id,type,mint,source,program,signature,slot,transaction_index,
     instruction_index,confirmation_status,blockchain_time,observed_at,payload_version,payload
@@ -1814,4 +2067,79 @@ async function withSchema(run: (pool: InstanceType<typeof pg.Pool>) => Promise<v
     await admin.query(`DROP SCHEMA ${schema} CASCADE`);
     await admin.end();
   }
+}
+
+async function seedProcessedInbox(
+  pool:InstanceType<typeof pg.Pool>,
+  signature:string,
+  slot:bigint,
+  confirmationStatus:'processed'|'confirmed'|'finalized'|'orphaned',
+):Promise<void>{
+  const terminal=confirmationStatus==='finalized'||confirmationStatus==='orphaned';
+  await pool.query(`INSERT INTO chain_transaction_inbox (
+    signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+    processing_status,normalized_transaction,immutable_fingerprint,observed_at,
+    processed_at,terminal_at,purge_after
+  ) VALUES ($1,$2,ARRAY['WEBSOCKET'],
+    ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],$3,'PROCESSED',
+    $4,$5,$6,$6,$7,$8)
+  ON CONFLICT (signature) DO UPDATE SET
+    target_confirmation_status=EXCLUDED.target_confirmation_status,
+    processing_status='PROCESSED',processed_at=EXCLUDED.processed_at,
+    terminal_at=EXCLUDED.terminal_at,purge_after=EXCLUDED.purge_after`,[
+    signature,slot.toString(),confirmationStatus,toJsonValue({ signature }),
+    'f'.repeat(64),new Date(1_000),terminal?new Date(1_000):null,
+    terminal?new Date(1_000+14_400_000):null,
+  ]);
+}
+
+async function setInboxState(
+  pool:InstanceType<typeof pg.Pool>,
+  signature:string,
+  state:'PENDING'|'PROCESSING'|'PROCESSED'|'FAILED',
+  confirmationStatus:'processed'|'confirmed'|'finalized'|'orphaned',
+):Promise<void>{
+  const processed=state==='PROCESSED';
+  const terminal=processed&&(confirmationStatus==='finalized'||confirmationStatus==='orphaned');
+  await pool.query(`UPDATE chain_transaction_inbox SET
+    target_confirmation_status=$2,processing_status=$3,
+    lease_token=CASE WHEN $3='PROCESSING' THEN 'paper-finality-test-lease' END,
+    lease_expires_at=CASE WHEN $3='PROCESSING' THEN clock_timestamp()+INTERVAL '1 minute' END,
+    next_attempt_at=CASE WHEN $3='FAILED' THEN clock_timestamp()+INTERVAL '1 minute' END,
+    error_code=CASE WHEN $3='FAILED' THEN 'RPC_TRANSIENT' END,
+    error_name=CASE WHEN $3='FAILED' THEN 'PaperFinalityTestFailure' END,
+    error_retryable=CASE WHEN $3='FAILED' THEN TRUE END,
+    processed_at=CASE WHEN $3='PROCESSED' THEN $4::timestamptz END,
+    terminal_at=CASE WHEN $5 THEN $4::timestamptz END,
+    purge_after=CASE WHEN $5 THEN $4::timestamptz+INTERVAL '4 hours' END
+    WHERE signature=$1`,[
+    signature,confirmationStatus,state,new Date(1_000),terminal,
+  ]);
+}
+
+async function seedRaw(
+  pool:InstanceType<typeof pg.Pool>,
+  input:Readonly<{
+    eventId:string;signature:string;slot:bigint;transactionIndex:number;
+    instructionIndex:number;confirmationStatus:'processed'|'confirmed'|'finalized'|'orphaned';
+  }>,
+):Promise<void>{
+  await pool.query(`INSERT INTO raw_chain_events (
+    event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+    confirmation_status,observed_at,payload_version,payload
+  ) VALUES ($1,'pumpfun','pump',$2,$3,$4,$5,$6,$7,$8,1,'{}')`,[
+    input.eventId,MINT,input.signature,input.slot.toString(),input.transactionIndex,
+    input.instructionIndex,input.confirmationStatus,new Date(900),
+  ]);
+}
+
+async function setRawConfirmation(
+  pool:InstanceType<typeof pg.Pool>,
+  eventId:string,
+  signature:string,
+  confirmationStatus:'processed'|'confirmed'|'finalized'|'orphaned',
+):Promise<void>{
+  await setInboxState(pool,signature,'PROCESSED',confirmationStatus);
+  await pool.query(`UPDATE raw_chain_events SET confirmation_status=$2
+    WHERE event_id=$1`,[eventId,confirmationStatus]);
 }

@@ -86,7 +86,11 @@ void test('sérialise les ouvertures concurrentes pour une stratégie et un mint
 
 void test('locks and verifies the exact current qualification before paper writes',async()=>{
   const client=new RecordingClient(false,[
-    { report_id:'report',source_event_id:'source',source_raw_event_id:'raw' },
+    {
+      report_id:'report',source_event_id:'source',source_raw_event_id:'raw',
+      event_id:'raw',signature:'signature',confirmation_status:'confirmed',
+      processing_status:'PROCESSED',target_confirmation_status:'confirmed',
+    },
   ]);
   const repository=new PostgresPaperTradingRepository({ connect:async()=>client });
 
@@ -114,12 +118,18 @@ void test('locks and verifies the exact current qualification before paper write
   assert.match(client.texts[4] ?? '',/source\.type IN/u);
   assert.match(client.texts[4] ?? '',/raw\.source=source\.source/u);
   assert.match(client.texts[4] ?? '',/FOR SHARE OF source,raw/u);
+  assert.match(client.texts[5] ?? '',/LIMIT \$3/u);
+  assert.match(client.texts[5] ?? '',/COALESCE\(raw\.inner_instruction_index,-1\)/u);
+  assert.match(client.texts[6] ?? '',/ORDER BY signature COLLATE "C"/u);
+  assert.match(client.texts[6] ?? '',/FOR SHARE/u);
   assert.deepEqual(client.values[1],['MINT']);
   assert.deepEqual(client.values[2],['MINT','report','qualification-event']);
   assert.deepEqual(client.values[3],['raw','MINT']);
   assert.deepEqual(client.values[4],[
     'source','raw','MINT','report','qualification-event',
   ]);
+  assert.deepEqual(client.values[5],['MINT','raw',4097]);
+  assert.deepEqual(client.values[6],[['signature']]);
 });
 
 void test('rolls back a stale current qualification before paper writes',async()=>{
@@ -363,7 +373,9 @@ class RecordingClient {
     this.values.push([...(values ?? [])]);
     if (this.failEvent && command === 'INSERT domain_events') throw new Error('event failure');
     return {
-      rows: command.startsWith('SELECT') ? this.selectRows : [],
+      rows: command.startsWith('SELECT') || text.trimStart().startsWith('WITH')
+        ? this.selectRows
+        : [],
       rowCount: 0, command: '', oid: 0, fields: [],
     };
   }

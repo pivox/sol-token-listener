@@ -41,6 +41,7 @@ import {
   toJsonValue,
 } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
+import { assertPaperFinalityReplayCurrent } from './paper-finality-barrier.js';
 
 interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number | null }
 interface Client { query(text: string, values?: readonly unknown[]): Promise<Result>; release(): void }
@@ -240,6 +241,39 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         JOIN domain_events source ON source.event_id=job.source_event_id
         WHERE (source.confirmation_status <> 'orphaned'
             OR job.source_confirmation_status = 'orphaned')
+          AND EXISTS (
+            SELECT 1 FROM raw_chain_events source_raw
+            WHERE source_raw.event_id=job.source_raw_event_id
+              AND source_raw.mint=job.mint
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM raw_chain_events raw
+            JOIN raw_chain_events source_raw
+              ON source_raw.event_id=job.source_raw_event_id
+             AND source_raw.mint=job.mint
+            WHERE raw.mint=job.mint
+              AND (
+                raw.event_id=job.source_raw_event_id
+                OR (
+                  raw.confirmation_status<>'orphaned'
+                  AND ROW(
+                    raw.slot,raw.transaction_index,raw.instruction_index,
+                    COALESCE(raw.inner_instruction_index,-1)
+                  ) <= ROW(
+                    source_raw.slot,source_raw.transaction_index,
+                    source_raw.instruction_index,
+                    COALESCE(source_raw.inner_instruction_index,-1)
+                  )
+                )
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM chain_transaction_inbox inbox
+                WHERE inbox.signature=raw.signature
+                  AND inbox.processing_status='PROCESSED'
+                  AND inbox.target_confirmation_status=raw.confirmation_status
+              )
+          )
           AND job.attempts_in_cycle < job.max_attempts
           AND (
             job.status='PENDING'
@@ -295,6 +329,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       await lockMint(client, job.mint);
       await lockQualificationMint(client,job.mint);
       await assertActiveLease(client, job);
+      await assertPaperFinalityReplayCurrent(client,{
+        mint:job.mint,sourceRawEventId:job.sourceRawEventId,
+      });
       const sourceResult = await client.query(
         'SELECT * FROM domain_events WHERE event_id=$1 AND mint=$2',
         [job.sourceEventId,job.mint],
@@ -583,6 +620,9 @@ async function writeDecision(
   qualificationProfile: QualificationProfileIdentity,
   synchronizeOrphanedEvidence: boolean,
 ): Promise<void> {
+  await assertPaperFinalityReplayCurrent(client,{
+    mint:job.mint,sourceRawEventId:job.sourceRawEventId,
+  });
   const qualification=await assertPersistedQualification(client,result,qualificationProfile);
   const candidate = result.candidate;
   if(!qualification.existingCandidate){
