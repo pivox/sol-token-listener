@@ -3,8 +3,14 @@
 Date: 2026-08-27
 Issue: #61
 Parent issue: #57
-Version: 1.0.5
+Version: 1.0.6
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.0.6 bounds paper claim itself to 4,097 indexed raw reads per job and
+removes the cursor `OR`/sort plan. A durable finalized replay receipt preserves
+exact processed evidence after the terminal inbox row's four-hour purge;
+present inbox state remains authoritative and nonterminal or orphaned missing
+inbox evidence remains fail-closed.
 
 Revision 1.0.5 closes the replay-to-paper race. Paper claim, snapshot,
 materialization and position opening require every relevant raw source through
@@ -365,23 +371,46 @@ COALESCE(inner_instruction_index, -1))` is not later than the source cursor.
 Confirmed rows remain eligible; the barrier does not require global
 finalization.
 
-Claim uses a fail-fast predicate: every relevant signature must already have
-an inbox row with `processing_status = 'PROCESSED'` and
-`target_confirmation_status` exactly equal to the raw confirmation status.
-Missing, `PENDING`, `PROCESSING`, `FAILED` or misaligned inbox state prevents
-election. Claim is only an optimization, not the safety guarantee.
+Claim uses a fail-fast predicate. A present inbox row is authoritative and must
+have `processing_status = 'PROCESSED'` with `target_confirmation_status`
+exactly equal to the raw confirmation status. `PENDING`, `PROCESSING`, `FAILED`
+or misaligned state therefore always prevents election and can never be masked
+by historical evidence. Only when the inbox row is absent may a `finalized`
+raw use an exact durable replay receipt for the same signature and observed
+slot. Missing nonterminal and orphaned inbox evidence remains fail-closed.
+Claim is only an optimization, not the safety guarantee.
 
 The reusable transactional barrier reads at most 4,097 relevant raw rows and
-fails closed above 4,096. It then locks the distinct inbox signatures in
-lexical order with a separate `FOR SHARE` query and revalidates presence,
-processing state and confirmation alignment. Paper snapshot and every decision
-materialization call this barrier while holding the qualification transaction
-lock. `PaperTradingEngine.open` repeats it after validating the exact current
-qualification and holds the share locks until the position transaction
-commits. Therefore finality wins first and paper retries, or paper wins first
-and `enqueueRevision` waits; the later replay can then retract the paper
-lineage. Barrier failures are fixed and redacted and become bounded retryable
-paper failures, never terminal decisions.
+fails closed above 4,096. The shared relevant-row SQL fetches the mandatory
+source by primary key, then reads non-orphaned rows in cursor order through the
+partial covering `raw_chain_events_paper_finality_cursor_idx`; the source is
+unioned separately only when orphaned. There is no cursor `OR`, full-mint sort
+or unbounded anti-join. It then locks distinct inbox signatures and any needed
+receipts in lexical order with separate `FOR SHARE` queries and revalidates the
+same rules. Paper snapshot and every decision materialization call this barrier
+while holding the qualification transaction lock. `PaperTradingEngine.open`
+repeats it after validating the exact current qualification and holds the share
+locks until the position transaction commits. Therefore finality wins first
+and paper retries, or paper wins first and `enqueueRevision` waits; the later
+replay can then retract the paper lineage. Barrier failures are fixed and
+redacted and become bounded retryable paper failures, never terminal decisions.
+
+`markProcessed(finalized)` writes
+`chain_transaction_finality_replay_receipts` from the final inbox update in the
+same transaction. The immutable receipt records signature, observed slot,
+finality evidence version, transaction fingerprint and completion timestamp;
+an existing divergent receipt makes the whole completion roll back. Migration
+028 backfills only `PROCESSED/finalized` rows with a durable snapshot and
+fingerprint. The purge deletes a processed finalized inbox after four hours
+only when every receipt field exactly matches it. Orphaned purge behavior is
+unchanged. A receipt survives that inbox deletion and is removed only after no
+raw row for its signature remains. It is also a terminal enqueue tombstone under
+the per-signature advisory lock: rediscovery at the same slot and no later than
+`finalized` is an idempotent no-op, while a divergent slot is a conflict. Before
+purge, duplicate discovery of an exact `PROCESSED/finalized` inbox is likewise a
+no-op after exact receipt validation, so the inbox and receipt evidence versions
+cannot drift. This preserves the barrier's missing-inbox decision when enqueue
+races it after purge.
 
 At `MAX_FINALITY_EVIDENCE_VERSION`, missing polls and orphan proofs remain
 rejected without mutation. A real `PROCESSED/confirmed` to
@@ -434,9 +463,12 @@ provider column, the rollout must stop old listener replicas before applying
 027 and starting the new binary. If an old replica remains, the new constraint
 rejects its unsafe positive counter write and therefore fails closed.
 
-All migration manifests, deployment smoke lists and tests that assert the last
-migration must advance from 026 to 027. No existing transaction, event,
-projection or terminal retention row is deleted.
+Migration 028 is replayable after 027 or as part of an empty-database migration.
+It adds the finalized receipt table, strictly backfills aligned durable inbox
+evidence, and creates the partial covering paper-finality cursor index. It does
+not extend inbox retention beyond four hours. All migration manifests,
+deployment smoke lists and tests that assert the last migration advance to
+028. No existing transaction, event or projection row is deleted.
 
 ## Test matrix
 
@@ -475,6 +507,11 @@ projection or terminal retention row is deleted.
 ### PostgreSQL and recovery tests
 
 - migration 027 on empty schema and after migration 026;
+- migration 028 backfill/replay on 027 and the full chain on an empty schema;
+- 100,000-row `EXPLAIN` proving the bounded cursor path uses the partial index
+  without a raw sequential scan or sort;
+- finalized receipt exactness, divergent-receipt rollback, four-hour protected
+  purge and later manual-kill wake; missing nonterminal inbox remains blocked;
 - finality index definition uses `(updated_at, observed_slot, signature)` and
   direct migration replay preserves it;
 - polling the first row of a page advances it with database time and exposes a

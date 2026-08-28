@@ -392,7 +392,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /'023_paper_mvp_exact_strategy\.sql'/);
   assert.match(smoke, /'024_paper_mvp_position_coverage\.sql'/);
   assert.match(smoke, /'025_paper_mvp_effective_configuration\.sql'/);
-  assert.match(smoke, /'027_listener_provider_affine_finality\.sql'/);
+  assert.match(smoke, /'028_paper_finality_replay_evidence\.sql'/);
   assert.match(smoke, /'paperMvpRuns'/);
   assert.match(smoke, /'paperMvpSamples'/);
   assert.match(smoke, /'listenerCatchUpGaps'/);

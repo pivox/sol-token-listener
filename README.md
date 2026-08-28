@@ -140,7 +140,7 @@ relève de l'issue #57. Les événements sans secret `rpc.http_endpoint_degraded
 métriques V1 dérivées des logs. Voir le [guide d'exploitation RPC](docs/operations/rpc-qualification.md)
 pour les délais de refroidissement, les limites et la qualification mono-fournisseur du soak.
 
-## Finalité affine au fournisseur (#61, migration 027)
+## Finalité affine au fournisseur (#61, migrations 027–028)
 
 La finalité utilise un pass HTTP épinglé au fournisseur primaire : statuts,
 racine <code>finalized</code> et signatures du bloc sont toujours lus par ce
@@ -170,14 +170,19 @@ seules les ressources antérieures sont rollbackées. En observe, la politique
 suivants et conserve la reprise à l’intervalle normal.
 
 Avant toute simulation, la lignée paper vérifie aussi le replay de finalité
-jusqu’au curseur source complet. Chaque raw active du mint — ainsi que la raw
-source même orphaned — doit avoir une inbox <code>PROCESSED</code> dont le statut
-est exactement aligné. Le claim applique un filtre rapide, puis snapshot,
-matérialisation et ouverture reprennent une barrière transactionnelle bornée à
-4 096 raw et verrouillent les inbox en lecture jusqu’au commit. Une révision
-<code>PENDING</code>/<code>PROCESSING</code>/<code>FAILED</code>, une inbox absente ou
-un statut décalé produit donc un retry paper sans candidate, session, position
-ni trade. Les sources <code>confirmed</code> alignées restent autorisées.
+jusqu’au curseur source complet. Le claim et la barrière examinent au plus
+4 097 raw par job, refusent au-dessus de 4 096 et utilisent un index couvrant
+ordonné sans scan/sort complet du mint. Une inbox présente reste autoritaire :
+elle doit être <code>PROCESSED</code> et exactement alignée. Après sa purge
+terminale à quatre heures, seule une raw <code>finalized</code> peut utiliser une
+receipt durable exacte écrite atomiquement par le replay; une preuve absente,
+nonterminale ou orphaned reste fermée. Les verrous de lecture sont conservés
+jusqu’au commit. La receipt sert aussi de tombstone terminale : une découverte
+finalized identique après purge est un no-op, tandis qu’une identité divergente
+est refusée; avant purge, un doublon terminal ne désynchronise jamais la version
+de preuve de l’inbox et de la receipt. Toute révision <code>PENDING</code>/<code>PROCESSING</code>/
+<code>FAILED</code> ou décalée produit donc un retry sans candidate, session,
+position ni trade. Les sources <code>confirmed</code> alignées restent autorisées.
 
 À la version maximale de preuve, polls manquants et orphaning restent refusés,
 mais une vraie transition <code>confirmed → finalized</code> est rejouée en
@@ -190,7 +195,10 @@ binaire. La migration est rejouable et remplace l’index partiel de finalité p
 <code>(updated_at, observed_slot, signature)</code>. Les identifiants de
 fournisseur sont publics et positionnels ; les URLs restent secrètes. Cette
 capacité reste observe/paper uniquement : aucune signature ni soumission de
-transaction n’est ajoutée.
+transaction n’est ajoutée. La migration
+`028_paper_finality_replay_evidence.sql`, également rejouable, ajoute la receipt
+finalized durable et l’index couvrant de la barrière sans prolonger la rétention
+de l’inbox au-delà de quatre heures.
 
 Les migrations ne sont pas lancées automatiquement par
 défaut. `npm run build` les embarque dans `dist/migrations`, de sorte que

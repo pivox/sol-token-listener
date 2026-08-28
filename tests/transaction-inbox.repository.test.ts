@@ -705,6 +705,100 @@ void test('saturates finality evidence when processing a finalized terminal revi
   });
 });
 
+void test('rolls back finalized completion when a divergent durable replay receipt exists',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    const repository=new PostgresTransactionInboxRepository(pool);
+    const signature='divergent-finalized-receipt';
+    await repository.enqueue(notification(signature,42n));
+    const initial=await repository.claim(220_000,120);
+    assert.ok(initial);
+    await repository.saveSnapshot(signature,initial.leaseToken,normalized(signature,42n));
+    await repository.markProcessed(signature,initial.leaseToken,'confirmed');
+    await repository.enqueueRevision(Object.freeze({
+      signature,confirmationStatus:'finalized' as const,observedAtMs:220_001,
+    }));
+    const replay=await repository.claim(220_002,120);
+    assert.ok(replay);
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature,observed_slot,confirmation_status,finality_evidence_version,
+      immutable_fingerprint,replay_completed_at
+    ) VALUES ($1,42,'finalized',999,$2,$3)`,[
+      signature,'b'.repeat(64),new Date(200_000),
+    ]);
+
+    await assert.rejects(
+      repository.markProcessed(signature,replay.leaseToken,'finalized'),
+      TransactionInboxLeaseError,
+    );
+    const stored=await row(pool,signature);
+    assert.equal(stored.processing_status,'PROCESSING');
+    assert.equal(stored.target_confirmation_status,'finalized');
+    assert.equal((await pool.query(`SELECT immutable_fingerprint
+      FROM chain_transaction_finality_replay_receipts WHERE signature=$1`,[
+      signature,
+    ])).rows[0]?.immutable_fingerprint,'b'.repeat(64));
+  });
+});
+
+void test('keeps an exact finalized receipt aligned on duplicate discovery before purge',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    const repository=new PostgresTransactionInboxRepository(pool);
+    const signature='finalized-receipt-duplicate';
+    await repository.enqueue(notification(signature,42n,'WEBSOCKET','finalized'));
+    const claim=await repository.claim(220_000,120);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature,claim.leaseToken,normalized(signature,42n));
+    await repository.markProcessed(signature,claim.leaseToken,'finalized');
+    const before=await pool.query(`SELECT inbox.finality_evidence_version::text AS version,
+      inbox.updated_at,receipt.finality_evidence_version::text AS receipt_version,
+      receipt.replay_completed_at
+      FROM chain_transaction_inbox inbox
+      JOIN chain_transaction_finality_replay_receipts receipt USING (signature)
+      WHERE inbox.signature=$1`,[signature]);
+
+    await repository.enqueue(notification(signature,42n,'CATCH_UP','confirmed',220_001));
+
+    const after=await pool.query(`SELECT inbox.finality_evidence_version::text AS version,
+      inbox.updated_at,receipt.finality_evidence_version::text AS receipt_version,
+      receipt.replay_completed_at
+      FROM chain_transaction_inbox inbox
+      JOIN chain_transaction_finality_replay_receipts receipt USING (signature)
+      WHERE inbox.signature=$1`,[signature]);
+    assert.deepEqual(after.rows,before.rows);
+  });
+});
+
+void test('uses a purged finalized receipt as a terminal enqueue tombstone',async(context)=>{
+  await withDatabase(context,async(pool)=>{
+    const repository=new PostgresTransactionInboxRepository(pool);
+    const signature='finalized-receipt-tombstone';
+    await repository.enqueue(notification(signature,43n,'WEBSOCKET','finalized'));
+    const claim=await repository.claim(230_000,120);
+    assert.ok(claim);
+    await repository.saveSnapshot(signature,claim.leaseToken,normalized(signature,43n));
+    await repository.markProcessed(signature,claim.leaseToken,'finalized');
+    await pool.query('DELETE FROM chain_transaction_inbox WHERE signature=$1',[signature]);
+
+    await repository.enqueue(notification(signature,43n,'CATCH_UP','confirmed',230_001));
+    assert.equal((await pool.query(
+      'SELECT COUNT(*) FROM chain_transaction_inbox WHERE signature=$1',[signature],
+    )).rows[0]?.count,'0');
+    await assert.rejects(
+      repository.enqueue(notification(signature,44n,'WEBSOCKET','finalized',230_002)),
+      TransactionInboxConflictError,
+    );
+    await assert.rejects(repository.enqueueRevision(Object.freeze({
+      signature,
+      confirmationStatus: 'orphaned',
+      expectedConfirmationStatus: 'confirmed',
+      expectedMissingFinalityPolls: 1,
+      expectedLastMissingFinalityProviderId: 'primary',
+      expectedFinalityEvidenceVersion: 1n,
+      observedAtMs: 230_003,
+    })), TransactionInboxConflictError);
+  });
+});
+
 void test('saturates finality evidence when processing an orphaned terminal revision at the PostgreSQL limit', async (context) => {
   await withDatabase(context, async (pool) => {
     const repository = new PostgresTransactionInboxRepository(pool);
@@ -2076,6 +2170,12 @@ async function insertTerminal(
   ) VALUES ($1, 1, ARRAY['WEBSOCKET'], ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'], 'finalized', 'PROCESSED', $2, $3,
     $4::TIMESTAMPTZ, $4::TIMESTAMPTZ, $4::TIMESTAMPTZ,
     $4::TIMESTAMPTZ + INTERVAL '4 hours')`, [signature, snapshot, 'a'.repeat(64), completedAt]);
+  await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+    signature,observed_slot,confirmation_status,finality_evidence_version,
+    immutable_fingerprint,replay_completed_at
+  ) VALUES ($1,1,'finalized',0,$2,$3)`,[
+    signature,'a'.repeat(64),completedAt,
+  ]);
 }
 
 function quoteIdentifier(value: string): string {

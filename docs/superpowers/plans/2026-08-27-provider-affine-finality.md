@@ -18,7 +18,9 @@ Production uses a fixed primary pass until #63 supplies the promoted provider.
 **Tech Stack:** TypeScript strict ESM, `@solana/web3.js` 1.98.4, PostgreSQL,
 bigint, Node test runner, migration 027.
 
-**Plan version:** 1.0.5. Revision 1.0.5 adds a bounded transactional paper
+**Plan version:** 1.0.6. Revision 1.0.6 bounds claim to an indexed 4,097-row
+probe and adds exact finalized replay receipts that survive the four-hour inbox
+purge. Revision 1.0.5 adds a bounded transactional paper
 replay barrier and permits finalized replay to preserve a saturated evidence
 version without overflow. Revision 1.0.4 makes the initial finality pass precede
 paper-worker activation so no simulated effect can persist during a failing
@@ -26,6 +28,26 @@ bootstrap proof. Revision 1.0.3 addresses starvation, durable page rotation
 and the observe/paper initial-failure policy. Revision 1.0.2 bounds the
 monotone evidence generation to PostgreSQL `BIGINT` and requires exact +1
 application-boundary validation.
+
+---
+
+### Review correction 4: indexed claim bound and post-purge replay receipt
+
+- [x] RED claim above 4,096 relevant raw rows while exactly 4,096 aligned rows
+  remain eligible. GREEN shares a source-plus-active cursor query, caps every
+  job at 4,097 rows and uses a partial covering index without `OR` or sort.
+- [x] RED a later manual-kill wake after the aligned finalized inbox is really
+  purged. GREEN writes an exact finalized replay receipt transactionally and
+  lets only a missing finalized inbox use it; a present inbox remains
+  authoritative and missing nonterminal/orphaned evidence stays closed.
+- [x] Protect processed finalized inbox purge until an exact receipt exists,
+  retain the receipt while any raw signature remains, and prove a divergent
+  receipt rolls back final completion.
+- [x] Treat the purged finalized receipt as a terminal enqueue tombstone and
+  keep exact pre-purge duplicates idempotent, including a concurrent
+  purge-to-manual-kill claim/enqueue regression.
+- [x] Add migration 028 backfill/replay tests and a 100,000-row PostgreSQL
+  `EXPLAIN`, advance manifests and document the v1.0.6 retention contract.
 
 ---
 

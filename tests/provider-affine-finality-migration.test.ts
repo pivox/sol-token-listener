@@ -7,6 +7,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationsDirectory = new URL('../migrations/', import.meta.url);
 const migrationName = '027_listener_provider_affine_finality.sql';
+const paperFinalityMigrationName = '028_paper_finality_replay_evidence.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const programId = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 
@@ -35,7 +36,7 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
     await insertLegacyInbox(pool, 'legacy-positive', 3);
 
     const sql = await readFile(migrationUrl, 'utf8');
-    assert.deepEqual(await migrateDatabase({ pool }), [migrationName]);
+    assert.deepEqual(await migrateDatabase({ pool }), [migrationName, paperFinalityMigrationName]);
     assert.match(
       await finalityIndexDefinition(pool),
       /\(updated_at, observed_slot, signature\).*processing_status.*PROCESSED.*target_confirmation_status/iu,

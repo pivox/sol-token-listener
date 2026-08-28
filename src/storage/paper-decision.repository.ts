@@ -41,7 +41,11 @@ import {
   toJsonValue,
 } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
-import { assertPaperFinalityReplayCurrent } from './paper-finality-barrier.js';
+import {
+  assertPaperFinalityReplayCurrent,
+  MAX_PAPER_FINALITY_RAW_ROWS,
+  paperFinalityRelevantRawSql,
+} from './paper-finality-barrier.js';
 
 interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number | null }
 interface Client { query(text: string, values?: readonly unknown[]): Promise<Result>; release(): void }
@@ -235,45 +239,34 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         now,new Date(options.nowMs + this.retentionMs),
       ]);
       const leaseToken = `paper_lease_${randomUUID()}`;
+      const relevantRawSql=paperFinalityRelevantRawSql('paper-decision-job');
       const result = await client.query(`WITH candidate AS (
         SELECT job.job_id
         FROM paper_decision_jobs job
         JOIN domain_events source ON source.event_id=job.source_event_id
+        JOIN LATERAL (
+          SELECT COUNT(*)::integer AS raw_count,
+            COALESCE(BOOL_AND(COALESCE((
+              SELECT inbox.processing_status='PROCESSED'
+                AND inbox.target_confirmation_status=raw.confirmation_status
+              FROM chain_transaction_inbox inbox
+              WHERE inbox.signature=raw.signature
+            ),
+              raw.confirmation_status='finalized'
+              AND EXISTS (
+                SELECT 1
+                FROM chain_transaction_finality_replay_receipts receipt
+                WHERE receipt.signature=raw.signature
+                  AND receipt.observed_slot=raw.observed_slot::numeric
+                  AND receipt.confirmation_status='finalized'
+              )
+            )),FALSE) AS replay_current
+          FROM (${relevantRawSql}) raw
+        ) finality ON finality.raw_count>0
+          AND finality.raw_count<$4
+          AND finality.replay_current
         WHERE (source.confirmation_status <> 'orphaned'
             OR job.source_confirmation_status = 'orphaned')
-          AND EXISTS (
-            SELECT 1 FROM raw_chain_events source_raw
-            WHERE source_raw.event_id=job.source_raw_event_id
-              AND source_raw.mint=job.mint
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM raw_chain_events raw
-            JOIN raw_chain_events source_raw
-              ON source_raw.event_id=job.source_raw_event_id
-             AND source_raw.mint=job.mint
-            WHERE raw.mint=job.mint
-              AND (
-                raw.event_id=job.source_raw_event_id
-                OR (
-                  raw.confirmation_status<>'orphaned'
-                  AND ROW(
-                    raw.slot,raw.transaction_index,raw.instruction_index,
-                    COALESCE(raw.inner_instruction_index,-1)
-                  ) <= ROW(
-                    source_raw.slot,source_raw.transaction_index,
-                    source_raw.instruction_index,
-                    COALESCE(source_raw.inner_instruction_index,-1)
-                  )
-                )
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM chain_transaction_inbox inbox
-                WHERE inbox.signature=raw.signature
-                  AND inbox.processing_status='PROCESSED'
-                  AND inbox.target_confirmation_status=raw.confirmation_status
-              )
-          )
           AND job.attempts_in_cycle < job.max_attempts
           AND (
             job.status='PENDING'
@@ -289,7 +282,10 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
         attempts_in_cycle=job.attempts_in_cycle+1,lease_token=$2,
         lease_expires_at=$3,next_attempt_at=NULL,error_code=NULL,updated_at=$1
       FROM candidate WHERE job.job_id=candidate.job_id
-      RETURNING job.*`, [now,leaseToken,new Date(options.nowMs + options.leaseMs)]);
+      RETURNING job.*`, [
+        now,leaseToken,new Date(options.nowMs + options.leaseMs),
+        MAX_PAPER_FINALITY_RAW_ROWS+1,
+      ]);
       await client.query('COMMIT');
       const row = result.rows[0];
       return row === undefined ? null : claimedJob(row);

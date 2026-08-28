@@ -458,7 +458,23 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const transactionInbox = await client.query(
       `DELETE FROM chain_transaction_inbox
        WHERE terminal_at IS NOT NULL
-         AND purge_after <= clock_timestamp()`,
+         AND purge_after <= clock_timestamp()
+         AND (
+           processing_status<>'PROCESSED'
+           OR target_confirmation_status<>'finalized'
+           OR EXISTS (
+             SELECT 1
+             FROM chain_transaction_finality_replay_receipts receipt
+             WHERE receipt.signature=chain_transaction_inbox.signature
+               AND receipt.observed_slot=chain_transaction_inbox.observed_slot
+               AND receipt.confirmation_status=target_confirmation_status
+               AND receipt.finality_evidence_version=
+                 chain_transaction_inbox.finality_evidence_version
+               AND receipt.immutable_fingerprint=
+                 chain_transaction_inbox.immutable_fingerprint
+               AND receipt.replay_completed_at=processed_at
+           )
+         )`,
     );
     const apiEventStream = await client.query<{ readonly deleted_count: string }>(
       `WITH deleted AS (
@@ -575,6 +591,17 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          AND NOT EXISTS (
            SELECT 1 FROM qualification_reports report
            WHERE report.source_raw_event_id = raw.event_id
+         )`,
+    );
+    await client.query(
+      `DELETE FROM chain_transaction_finality_replay_receipts receipt
+       WHERE NOT EXISTS (
+         SELECT 1 FROM raw_chain_events raw
+         WHERE raw.signature=receipt.signature
+       )
+         AND NOT EXISTS (
+           SELECT 1 FROM chain_transaction_inbox inbox
+           WHERE inbox.signature=receipt.signature
          )`,
     );
     const launches = await client.query(

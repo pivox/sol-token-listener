@@ -900,6 +900,26 @@ void test('claim also waits for an earlier active raw signature of the same mint
   });
 });
 
+void test('a durable finalized receipt never masks a present pending inbox',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await pool.query(`UPDATE raw_chain_events SET confirmation_status='finalized'
+      WHERE event_id=$1`,[RAW_EVENT_ID]);
+    await setInboxState(pool,'signature','PENDING','finalized');
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature,observed_slot,confirmation_status,finality_evidence_version,
+      immutable_fingerprint,replay_completed_at
+    ) VALUES ('signature',10,'finalized',1,$1,$2)`,[
+      'f'.repeat(64),new Date(1_000),
+    ]);
+    const repository=paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+
+    assert.equal(await repository.claim({nowMs:1_000,leaseMs:1_000}),null);
+  });
+});
+
 void test('a revision after claim blocks snapshot and resumes after aligned replay',async(context)=>{
   if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
   await withSchema(async(pool)=>{
@@ -960,13 +980,103 @@ void test('the reusable paper replay barrier fails closed above 4096 relevant ra
       FROM generate_series(1,4096) value`,['e'.repeat(64),new Date(900)]);
     const repository=paperDecisionRepository(pool);
     await repository.enqueue(jobInput());
-    const job=await repository.claim({ nowMs:1_000,leaseMs:10_000 });
-    assert.ok(job);
-
-    await assert.rejects(repository.loadSnapshot(job),PaperDecisionRepositoryError);
+    assert.equal(await repository.claim({ nowMs:1_000,leaseMs:10_000 }),null);
     assert.deepEqual(await paperOpenRows(pool),{
       positions:0,trades:0,opened_events:0,sessions:0,candidates:0,
     });
+  });
+});
+
+void test('paper replay claim accepts exactly 4096 aligned relevant raw rows',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    await pool.query(`INSERT INTO raw_chain_events (
+      event_id,source,program,mint,signature,slot,transaction_index,instruction_index,
+      confirmation_status,observed_at,payload_version,payload
+    ) SELECT 'raw-boundary-'||value,'pumpfun','pump',$1,'boundary-signature-'||value,
+      9,value,0,'confirmed',$2,1,'{}'::jsonb FROM generate_series(1,4095) value`,[
+      MINT,new Date(900),
+    ]);
+    await pool.query(`INSERT INTO chain_transaction_inbox (
+      signature,observed_slot,discovery_sources,program_ids,target_confirmation_status,
+      processing_status,normalized_transaction,immutable_fingerprint,observed_at,processed_at
+    ) SELECT 'boundary-signature-'||value,9,ARRAY['WEBSOCKET'],
+      ARRAY['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'],'confirmed','PROCESSED',
+      jsonb_build_object('signature','boundary-signature-'||value),$1,$2,$2
+      FROM generate_series(1,4095) value`,['e'.repeat(64),new Date(900)]);
+    const repository=paperDecisionRepository(pool);
+    await repository.enqueue(jobInput());
+
+    assert.ok(await repository.claim({ nowMs:1_000,leaseMs:10_000 }));
+  });
+});
+
+void test('manual-kill wake remains claimable after aligned finalized inbox retention expires',async(context)=>{
+  if(databaseUrl===undefined){context.skip('TEST_DATABASE_URL is not configured');return;}
+  await withSchema(async(pool)=>{
+    await seed(pool);
+    const decisions=paperDecisionRepository(pool);
+    await decisions.enqueue(jobInput());
+    const initial=await decisions.claim({ nowMs:1_000,leaseMs:10_000 });
+    assert.ok(initial);
+    const active=decisionWithSession(decisionResult(),'WAITING_EXTERNAL_BUYS',0,1_001);
+    await decisions.stageDecision(initial,active);
+    await pool.query(`UPDATE paper_strategy_sessions SET strategy_id='creation-entry-v1'
+      WHERE session_id=$1`,[active.session?.id]);
+
+    await pool.query(`DELETE FROM chain_transaction_inbox WHERE signature='signature'`);
+    const inbox=new PostgresTransactionInboxRepository(pool);
+    await inbox.enqueue(Object.freeze({
+      signature:'signature',slot:10n,source:'WEBSOCKET' as const,
+      programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
+      confirmationStatus:'finalized' as const,observedAtMs:1_000,
+    }));
+    const replay=await inbox.claim(2_000,120);
+    assert.ok(replay);
+    await inbox.saveSnapshot('signature',replay.leaseToken,paperNormalizedTransaction());
+    await pool.query(`UPDATE raw_chain_events SET confirmation_status='finalized'
+      WHERE event_id=$1`,[RAW_EVENT_ID]);
+    await pool.query(`UPDATE domain_events SET confirmation_status='finalized'
+      WHERE event_id=$1`,[SOURCE_EVENT_ID]);
+    await inbox.markProcessed('signature',replay.leaseToken,'finalized');
+    await pool.query(`UPDATE chain_transaction_inbox SET
+      processed_at=clock_timestamp()-INTERVAL '5 hours',
+      terminal_at=clock_timestamp()-INTERVAL '5 hours',
+      purge_after=clock_timestamp()-INTERVAL '1 hour'
+      WHERE signature='signature'`);
+    await pool.query(`UPDATE chain_transaction_finality_replay_receipts receipt SET
+      replay_completed_at=inbox.processed_at
+      FROM chain_transaction_inbox inbox
+      WHERE receipt.signature=inbox.signature AND inbox.signature='signature'`);
+    await pool.query(`DELETE FROM chain_transaction_finality_replay_receipts
+      WHERE signature='signature'`);
+    const protectedPurge=await purgeExpiredFoundationData(pool);
+    assert.equal(protectedPurge.transactionInbox,0);
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature,observed_slot,confirmation_status,finality_evidence_version,
+      immutable_fingerprint,replay_completed_at
+    ) SELECT signature,observed_slot,target_confirmation_status,finality_evidence_version,
+      immutable_fingerprint,processed_at FROM chain_transaction_inbox
+      WHERE signature='signature'`);
+    const purged=await purgeExpiredFoundationData(pool);
+    assert.equal(purged.transactionInbox,1);
+    assert.equal((await pool.query(`SELECT COUNT(*)
+      FROM chain_transaction_finality_replay_receipts
+      WHERE signature='signature'`)).rows[0]?.count,'1');
+
+    assert.equal(await decisions.enqueueActiveSessions(3_000),1);
+    const [manualKillClaim]=await Promise.all([
+      decisions.claim({nowMs:3_000,leaseMs:10_000}),
+      inbox.enqueue(Object.freeze({
+        signature:'signature',slot:10n,source:'CATCH_UP' as const,
+        programIds:Object.freeze(['6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P']),
+        confirmationStatus:'finalized' as const,observedAtMs:3_000,
+      })),
+    ]);
+    assert.ok(manualKillClaim);
+    assert.equal((await pool.query(`SELECT COUNT(*) FROM chain_transaction_inbox
+      WHERE signature='signature'`)).rows[0]?.count,'0');
   });
 });
 

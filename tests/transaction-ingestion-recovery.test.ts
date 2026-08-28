@@ -961,6 +961,14 @@ async function insertProcessed(
        clock_timestamp() - ($4 * INTERVAL '1 hour'))`,
     [signature, confirmationStatus, 'a'.repeat(64), ageHours],
   );
+  if (confirmationStatus === 'finalized') {
+    await pool.query(`INSERT INTO chain_transaction_finality_replay_receipts (
+      signature,observed_slot,confirmation_status,finality_evidence_version,
+      immutable_fingerprint,replay_completed_at
+    ) SELECT signature,observed_slot,target_confirmation_status,finality_evidence_version,
+      immutable_fingerprint,processed_at FROM chain_transaction_inbox
+      WHERE signature=$1`,[signature]);
+  }
 }
 
 function openCommand(

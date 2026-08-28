@@ -61,7 +61,7 @@ void test('applies all migrations on an empty PostgreSQL schema and replays clea
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '027_listener_provider_affine_finality.sql');
+    assert.equal(applied.at(-1), '028_paper_finality_replay_evidence.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);

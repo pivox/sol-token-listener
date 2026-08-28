@@ -88,7 +88,7 @@ void test('locks and verifies the exact current qualification before paper write
   const client=new RecordingClient(false,[
     {
       report_id:'report',source_event_id:'source',source_raw_event_id:'raw',
-      event_id:'raw',signature:'signature',confirmation_status:'confirmed',
+      event_id:'raw',signature:'signature',observed_slot:'1',confirmation_status:'confirmed',
       processing_status:'PROCESSED',target_confirmation_status:'confirmed',
     },
   ]);
@@ -118,7 +118,8 @@ void test('locks and verifies the exact current qualification before paper write
   assert.match(client.texts[4] ?? '',/source\.type IN/u);
   assert.match(client.texts[4] ?? '',/raw\.source=source\.source/u);
   assert.match(client.texts[4] ?? '',/FOR SHARE OF source,raw/u);
-  assert.match(client.texts[5] ?? '',/LIMIT \$3/u);
+  assert.match(client.texts[5] ?? '',/\$3::integer/u);
+  assert.match(client.texts[5] ?? '',/LIMIT \(SELECT active_limit FROM source_raw\)/u);
   assert.match(client.texts[5] ?? '',/COALESCE\(raw\.inner_instruction_index,-1\)/u);
   assert.match(client.texts[6] ?? '',/ORDER BY signature COLLATE "C"/u);
   assert.match(client.texts[6] ?? '',/FOR SHARE/u);
