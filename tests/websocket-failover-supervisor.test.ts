@@ -443,6 +443,39 @@ void test('reentrant close cancels a just-produced recovery handle before public
   assertNoSolanaCall(fixture);
 });
 
+void test('reentrant close cancels a just-produced periodic handle before publication', async () => {
+  const fixture = supervisorFixture();
+  const closeOperations: Promise<void>[] = [];
+  fixture.scheduler.onSchedule = (_handle, delayMs) => {
+    if (delayMs === WEBSOCKET_FRONTIER_INTERVAL_MS) {
+      closeOperations.push(fixture.supervisor.close());
+    }
+  };
+  fixture.strictResults.push(Promise.resolve(scanResult('primary')));
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  fixture.resolveOpenSession();
+  await flushMicrotasks();
+
+  assert.equal(closeOperations.length, 1);
+  await Promise.all(closeOperations);
+  assert.equal(fixture.calls.includes('selector.promote:primary'), true);
+  assert.equal(fixture.calls.includes('selector.clear:primary'), true);
+  assert.equal(fixture.scheduler.cancelledHandles.length, 1);
+  assert.equal(fixture.scheduler.pendingDelays().length, 0);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+
+  const callsBeforeLateCallback = fixture.calls.length;
+  fixture.scheduler.invokeFirst(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushMicrotasks();
+  assert.equal(fixture.calls.length, callsBeforeLateCallback);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+});
+
 void test('constructor rejects hostile options, dependencies, catalog IDs, clock, and random redacted', () => {
   const hostile = 'wss://secret.invalid/ws?hash=signature-secret';
   const fixture = supervisorFixture();

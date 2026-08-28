@@ -486,6 +486,15 @@ export class WebSocketFailoverSupervisor {
       }
     }, WEBSOCKET_FRONTIER_INTERVAL_MS);
     scheduled = Object.freeze({ value });
+    if (this.#isPermanentlyClosed()) {
+      try {
+        this.#options.scheduler.cancel(value);
+      } catch {
+        this.#currentState = 'DEGRADED';
+        throw new WebSocketFailoverSupervisorError('cleanup');
+      }
+      return;
+    }
     this.#periodicHandle = scheduled;
   }
 
