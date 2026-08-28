@@ -70,10 +70,7 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
     const begin = beginOwnerInput(input);
     return this.transaction(async (client) => {
       const currentResult = await safeQuery(client,
-        `WITH operation AS MATERIALIZED (SELECT clock_timestamp() AS at)
-         SELECT health.*, operation.at AS operation_at,
-           health.heartbeat_at >= operation.at - INTERVAL '30 seconds' AS owner_is_fresh
-         FROM listener_websocket_health health CROSS JOIN operation
+        `SELECT health.* FROM listener_websocket_health health
          WHERE service_key = $1 FOR UPDATE OF health`,
         [SERVICE_KEY],
       );
@@ -82,10 +79,22 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
       if (rawCurrentRow === undefined) throw repositoryError('STATE_CONFLICT');
       const currentRow = databaseRecord(rawCurrentRow);
       const current = snapshotFromRow(currentRow);
-      const operationAt = timestampFromDatabase(currentRow.operation_at);
+      const operationResult = await safeQuery(client,
+        `WITH operation AS MATERIALIZED (SELECT clock_timestamp() AS at)
+         SELECT operation.at AS operation_at,
+           health.heartbeat_at >= operation.at - INTERVAL '30 seconds' AS owner_is_fresh
+         FROM listener_websocket_health health CROSS JOIN operation
+         WHERE health.service_key = $1`,
+        [SERVICE_KEY],
+      );
+      if (operationResult.rows.length !== 1) throw repositoryError('STATE_CONFLICT');
+      const rawOperationRow = operationResult.rows[0];
+      if (rawOperationRow === undefined) throw repositoryError('STATE_CONFLICT');
+      const operationRow = databaseRecord(rawOperationRow);
+      const operationAt = timestampFromDatabase(operationRow.operation_at);
       const isUnrecoverable = current.phase === 'UNRECOVERABLE';
       const isClean = current.supervision === 'INACTIVE' || current.phase === 'STOPPED';
-      const isFresh = currentRow.owner_is_fresh === true;
+      const isFresh = operationRow.owner_is_fresh === true;
       if (!isClean && !isUnrecoverable && isFresh) {
         throw repositoryError('ACTIVE_INSTANCE');
       }
@@ -136,6 +145,18 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
       throw repositoryError('GENERATION_EXHAUSTED');
     }
     return this.transaction(async (client) => {
+      const lockedResult = await safeQuery(client,
+        `SELECT health.owner_generation::TEXT AS owner_generation,
+           health.revision::TEXT AS revision
+         FROM listener_websocket_health health
+         WHERE health.service_key = $1 FOR UPDATE OF health`,
+        [SERVICE_KEY],
+      );
+      const rawLocked = lockedResult.rows[0];
+      if (rawLocked === undefined || lockedResult.rows.length !== 1) {
+        throw repositoryError('STATE_CONFLICT');
+      }
+      const locked = databaseRecord(rawLocked);
       const result = await safeQuery(client,
         `WITH operation AS MATERIALIZED (SELECT clock_timestamp() AS at)
          UPDATE listener_websocket_health health SET
@@ -199,20 +220,10 @@ export class PostgresWebSocketHealthRepository implements WebSocketHealthReposit
       );
       if (result.rows.length === 1) return requiredSnapshot(result.rows);
       if (result.rows.length !== 0) throw repositoryError('STATE_CONFLICT');
-      const currentResult = await safeQuery(client,
-        `SELECT owner_generation::TEXT AS owner_generation, revision::TEXT AS revision
-         FROM listener_websocket_health WHERE service_key = $1 FOR UPDATE`,
-        [SERVICE_KEY],
-      );
-      const rawCurrent = currentResult.rows[0];
-      if (rawCurrent === undefined || currentResult.rows.length !== 1) {
-        throw repositoryError('STATE_CONFLICT');
-      }
-      const current = databaseRecord(rawCurrent);
-      if (bigintFromDatabase(current.owner_generation) !== transition.ownerGeneration) {
+      if (bigintFromDatabase(locked.owner_generation) !== transition.ownerGeneration) {
         throw repositoryError('STALE_OWNER');
       }
-      if (bigintFromDatabase(current.revision) !== transition.expectedRevision) {
+      if (bigintFromDatabase(locked.revision) !== transition.expectedRevision) {
         throw repositoryError('STALE_REVISION');
       }
       throw repositoryError('STATE_CONFLICT');

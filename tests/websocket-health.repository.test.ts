@@ -261,6 +261,91 @@ void test('websocket health repository serializes concurrent owner acquisition a
   }
 });
 
+void test('websocket health repository transition captures one database clock after its row lock', async (context) => {
+  await withRepository(context, 'websocket_health_transition_clock_order', async ({ pool, repository }) => {
+    const started = await repository.beginOwner({ candidateProviderId: 'primary' });
+    const blocker = await pool.connect();
+    let locked = false;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SELECT 1 FROM listener_websocket_health
+        WHERE service_key = 'transaction-listener' FOR UPDATE`);
+      locked = true;
+      const pending = repository.transition(transitionFrom(started, {
+        phase: 'RUNNING',
+        providerId: 'primary',
+        activeSessionGeneration: 1n,
+        candidateProviderId: null,
+        candidateSessionGeneration: null,
+        acknowledged: true,
+        disconnectReasonCode: 'SOCKET_ERROR',
+        recoveryStatus: 'RECOVERED',
+        recoveryReasonCode: 'STARTUP',
+      }));
+      await waitForRowLock(pool, '%SELECT health.owner_generation::TEXT AS owner_generation%');
+      await pool.query("SELECT pg_sleep(0.05)");
+      const releasingWriteMs = await writeHealthClock(blocker);
+      await blocker.query('COMMIT');
+      locked = false;
+      const transitioned = await pending;
+      const operationTimes = [
+        transitioned.heartbeatAtMs,
+        transitioned.updatedAtMs,
+        transitioned.acknowledgedAtMs,
+        transitioned.disconnect?.occurredAtMs,
+        transitioned.recovery.startedAtMs,
+        transitioned.recovery.completedAtMs,
+      ];
+      assert.ok(operationTimes.every((value) => value !== null && value !== undefined));
+      assert.equal(new Set(operationTimes).size, 1);
+      assert.ok(requiredValue(transitioned.heartbeatAtMs) >= releasingWriteMs);
+    } finally {
+      if (locked) await blocker.query('ROLLBACK');
+      blocker.release();
+    }
+  });
+});
+
+void test('websocket health repository beginOwner captures its database clock after its row lock', async (context) => {
+  await withRepository(context, 'websocket_health_begin_clock_order', async ({ pool, repository }) => {
+    const started = await repository.beginOwner({ candidateProviderId: 'primary' });
+    const unrecoverable = await repository.transition(transitionFrom(started, {
+      phase: 'UNRECOVERABLE',
+      candidateProviderId: null,
+      candidateSessionGeneration: null,
+      disconnectReasonCode: 'CLEANUP_FAILED',
+      recoveryStatus: 'FAILED',
+      recoveryReasonCode: 'CATCH_UP_WINDOW_EXCEEDED',
+    }));
+    const blocker = await pool.connect();
+    let locked = false;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SELECT 1 FROM listener_websocket_health
+        WHERE service_key = 'transaction-listener' FOR UPDATE`);
+      locked = true;
+      const pending = repository.beginOwner({ candidateProviderId: 'fallback-1' });
+      await waitForRowLock(pool, '%FOR UPDATE OF health%');
+      await pool.query("SELECT pg_sleep(0.05)");
+      const releasingWriteMs = await writeHealthClock(blocker);
+      await blocker.query('COMMIT');
+      locked = false;
+      const restarted = await pending;
+      assert.equal(restarted.ownerGeneration, unrecoverable.ownerGeneration + 1n);
+      assert.equal(restarted.heartbeatAtMs, restarted.updatedAtMs);
+      assert.equal(restarted.heartbeatAtMs, restarted.disconnect?.occurredAtMs);
+      assert.ok(requiredValue(restarted.heartbeatAtMs) >= releasingWriteMs);
+      assert.deepEqual(restarted.recovery, {
+        status: 'REQUIRED', startedAtMs: null, completedAtMs: null,
+        reasonCode: 'CATCH_UP_WINDOW_EXCEEDED',
+      });
+    } finally {
+      if (locked) await blocker.query('ROLLBACK');
+      blocker.release();
+    }
+  });
+});
+
 void test('websocket health repository touch changes only owner heartbeat freshness', async (context) => {
   await withRepository(context, 'websocket_health_touch', async ({ pool, repository }) => {
     const started = await repository.beginOwner({ candidateProviderId: 'primary' });
@@ -277,6 +362,32 @@ void test('websocket health repository touch changes only owner heartbeat freshn
     assert.deepEqual({ ...after, heartbeatAtMs: before.heartbeatAtMs }, before);
     await expectCode(repository.touch(2n), 'STALE_OWNER');
     assert.deepEqual(await repository.read(), after);
+  });
+});
+
+void test('websocket health repository touch captures its database clock after its row lock', async (context) => {
+  await withRepository(context, 'websocket_health_touch_clock_order', async ({ pool, repository }) => {
+    const started = await repository.beginOwner({ candidateProviderId: 'primary' });
+    const blocker = await pool.connect();
+    let locked = false;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SELECT 1 FROM listener_websocket_health
+        WHERE service_key = 'transaction-listener' FOR UPDATE`);
+      locked = true;
+      const pending = repository.touch(started.ownerGeneration);
+      await waitForRowLock(pool, '%SET heartbeat_at = clock_timestamp()%');
+      await pool.query("SELECT pg_sleep(0.05)");
+      const releasingWriteMs = await writeHealthClock(blocker);
+      await blocker.query('COMMIT');
+      locked = false;
+      await pending;
+      const touched = await repository.read();
+      assert.ok(requiredValue(touched.heartbeatAtMs) >= releasingWriteMs);
+    } finally {
+      if (locked) await blocker.query('ROLLBACK');
+      blocker.release();
+    }
   });
 });
 
@@ -418,6 +529,37 @@ void test('websocket health repository keeps the slot from the latest completed 
     assert.deepEqual(await Promise.all([first, second]), ['RECORDED', 'RECORDED']);
     assert.deepEqual(completions, [100n, 50n]);
     assert.equal((await repository.read()).lastObservation?.slot, 50n);
+  });
+});
+
+void test('websocket health repository observation captures its database clock after its row lock', async (context) => {
+  await withRepository(context, 'websocket_health_observation_clock_order', async ({ pool, repository }) => {
+    const connecting = await repository.beginOwner({ candidateProviderId: 'primary' });
+    const blocker = await pool.connect();
+    let locked = false;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SELECT 1 FROM listener_websocket_health
+        WHERE service_key = 'transaction-listener' FOR UPDATE`);
+      locked = true;
+      const pending = repository.recordObservation({
+        ownerGeneration: connecting.ownerGeneration,
+        sessionGeneration: requiredValue(connecting.candidateSessionGeneration),
+        slot: 100n,
+      });
+      await waitForRowLock(pool, '%last_observation_at = clock_timestamp()%');
+      await pool.query("SELECT pg_sleep(0.05)");
+      const releasingWriteMs = await writeObservationClock(blocker);
+      await blocker.query('COMMIT');
+      locked = false;
+      assert.equal(await pending, 'RECORDED');
+      const observed = requiredValue((await repository.read()).lastObservation);
+      assert.equal(observed.slot, 100n);
+      assert.ok(observed.observedAtMs >= releasingWriteMs);
+    } finally {
+      if (locked) await blocker.query('ROLLBACK');
+      blocker.release();
+    }
   });
 });
 
@@ -700,6 +842,50 @@ async function databaseNowMs(pool: InstanceType<typeof pg.Pool>): Promise<number
     "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::TEXT AS now_ms",
   );
   return Number(result.rows[0]?.now_ms);
+}
+
+async function waitForRowLock(
+  pool: InstanceType<typeof pg.Pool>,
+  queryPattern: string,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ readonly waiting: boolean }>(`SELECT EXISTS (
+      SELECT 1 FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND wait_event_type = 'Lock'
+        AND query ILIKE $1
+    ) AS waiting`, [queryPattern]);
+    if (result.rows[0]?.waiting === true) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error('PostgreSQL WebSocket health row-lock wait was not observed.');
+}
+
+async function writeHealthClock(client: pg.PoolClient): Promise<number> {
+  const result = await client.query<{ readonly operation_at: Date }>(
+    `WITH operation AS MATERIALIZED (SELECT clock_timestamp() AS at)
+     UPDATE listener_websocket_health health
+     SET heartbeat_at = operation.at, updated_at = operation.at
+     FROM operation WHERE health.service_key = 'transaction-listener'
+     RETURNING operation.at AS operation_at`,
+  );
+  const operationAt = result.rows[0]?.operation_at;
+  assert.ok(operationAt instanceof Date);
+  return operationAt.getTime();
+}
+
+async function writeObservationClock(client: pg.PoolClient): Promise<number> {
+  const result = await client.query<{ readonly operation_at: Date }>(
+    `WITH operation AS MATERIALIZED (SELECT clock_timestamp() AS at)
+     UPDATE listener_websocket_health health
+     SET last_observation_at = operation.at, last_observation_slot = 999
+     FROM operation WHERE health.service_key = 'transaction-listener'
+     RETURNING operation.at AS operation_at`,
+  );
+  const operationAt = result.rows[0]?.operation_at;
+  assert.ok(operationAt instanceof Date);
+  return operationAt.getTime();
 }
 
 async function rawCanonicalRow(pool: InstanceType<typeof pg.Pool>): Promise<Readonly<Record<string, unknown>>> {
