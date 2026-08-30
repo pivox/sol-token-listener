@@ -25,6 +25,28 @@ void test('captures the promoted provider pass for each open and leaves prior pa
   assert.equal(selector.openPass(), fallback);
 });
 
+void test('publishes an immutable monotone selection epoch for every promotion and effective clear', () => {
+  const selector = new PromotedProviderSelector([pass('primary'), pass('fallback-1')]);
+
+  const initial = selector.selection();
+  assert.deepEqual(initial, { providerId: null, revision: 0n });
+  assert.ok(Object.isFrozen(initial));
+
+  selector.promote('primary');
+  const first = selector.selection();
+  assert.deepEqual(first, { providerId: 'primary', revision: 1n });
+
+  selector.promote('primary');
+  assert.deepEqual(selector.selection(), { providerId: 'primary', revision: 2n });
+  assert.deepEqual(first, { providerId: 'primary', revision: 1n });
+
+  selector.clear('fallback-1');
+  assert.deepEqual(selector.selection(), { providerId: 'primary', revision: 2n });
+
+  selector.clear('primary');
+  assert.deepEqual(selector.selection(), { providerId: null, revision: 3n });
+});
+
 void test('clears only the currently promoted provider', () => {
   const primary = pass('primary');
   const fallback = pass('fallback-1');
@@ -51,8 +73,10 @@ void test('keeps promoted provider state private from runtime property injection
   Reflect.set(selector, 'activeProvider', 'fallback-1');
   Reflect.set(selector, 'activeProvider', hostile);
   Reflect.set(selector, 'passes', new Map([['primary', fallback]]));
+  Reflect.set(selector, 'revision', 9_223_372_036_854_775_807n);
 
   assert.equal(selector.activeProviderId(), 'primary');
+  assert.deepEqual(selector.selection(), { providerId: 'primary', revision: 1n });
   assert.equal(selector.openPass(), primary);
   assert.doesNotMatch(String(selector.activeProviderId()), /secret|hostile|invalid\/rpc/u);
 });

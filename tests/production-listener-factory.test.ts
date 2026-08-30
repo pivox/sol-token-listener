@@ -3,13 +3,17 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { parseConfig } from '../src/config/env.js';
 import { FinalityReconciler } from '../src/application/finality-reconciler.js';
+import { PromotedProviderSelector } from '../src/application/promoted-provider-selector.js';
 import type {
   FinalityCandidate,
   FinalityPollObservation,
   FinalityRevision,
 } from '../src/domain/transaction-ingestion.js';
 import type { TokenLaunch } from '../src/domain/types.js';
-import type { FinalityProviderPassSource } from '../src/ports/finality-provider-pass.js';
+import type {
+  FinalityProviderPass,
+  FinalityProviderPassSource,
+} from '../src/ports/finality-provider-pass.js';
 import { createCatchUpGap } from '../src/domain/transaction-ingestion.js';
 import type { getDatabasePool } from '../src/storage/database.js';
 import {
@@ -137,8 +141,13 @@ void test('production binds finality to immutable passes selected by the promote
   assert.match(factory, /initialFailureMode:\s*'DEGRADED_RETRY'/u);
   assert.match(
     factory,
-    /currentProviderId:\s*\(\): RpcProviderId \| null => promoted\.activeProviderId\(\)/u,
+    /currentSelection:\s*\(\): PromotedProviderSelection => promoted\.selection\(\)/u,
   );
+  assert.match(
+    factory,
+    /isReady:\s*\(\): boolean => \{\s*const selection = promoted\.selection\(\);[\s\S]*?reconciler\.isReadyFor\(selection\)/u,
+  );
+  assert.doesNotMatch(factory, /reconciler\.readyProviderId\(\) === providerId/u);
   assert.doesNotMatch(factory, /new FinalityReconciler\(rpc, inbox,/u);
   assert.doesNotMatch(pinnedAdapter, /http-failover-transport/u);
 });
@@ -491,6 +500,7 @@ void test('finality startup degrades without aborting and recovers on a fresh sc
 void test('finality readiness is current only after an unchanged promoted-provider pass', async () => {
   const scheduler = new ManualScheduler();
   let provider: 'primary' | 'fallback-1' | null = null;
+  let revision = 0n;
   let runs = 0;
   let gate: ReturnType<typeof deferred<undefined>> | null = null;
   let rejectNext = false;
@@ -507,7 +517,7 @@ void test('finality readiness is current only after an unchanged promoted-provid
       shutdownTimeoutMs: 100,
       scheduler,
       initialFailureMode: 'DEGRADED_RETRY',
-      currentProviderId: () => provider,
+      currentSelection: () => Object.freeze({ providerId: provider, revision }),
     },
   );
 
@@ -517,6 +527,7 @@ void test('finality readiness is current only after an unchanged promoted-provid
   assert.equal(runs, 0);
 
   provider = 'primary';
+  revision += 1n;
   let rescheduled = scheduler.waitForNextSchedule();
   scheduler.fireScheduled();
   await rescheduled;
@@ -530,6 +541,7 @@ void test('finality readiness is current only after an unchanged promoted-provid
   await Promise.resolve();
   assert.equal(recurring.readyProviderId(), null);
   provider = 'fallback-1';
+  revision += 1n;
   gate.resolve(undefined);
   await rescheduled;
   assert.equal(recurring.state(), 'DEGRADED');
@@ -550,6 +562,84 @@ void test('finality readiness is current only after an unchanged promoted-provid
   assert.equal(recurring.readyProviderId(), null);
   await recurring.close();
   assert.equal(recurring.readyProviderId(), null);
+});
+
+void test('finality readiness rejects clear and same-provider repromotion until a fresh pass', async () => {
+  const scheduler = new ManualScheduler();
+  const promoted = new PromotedProviderSelector([pass('primary')]);
+  promoted.promote('primary');
+  let runs = 0;
+  const recurring = new RecurringFinalityReconciler(
+    { async runOnce() { runs += 1; } },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      initialFailureMode: 'DEGRADED_RETRY',
+      currentSelection: () => promoted.selection(),
+    },
+  );
+
+  await recurring.start();
+  assert.equal(recurring.readyProviderId(), 'primary');
+  assert.equal(recurring.isReadyFor(promoted.selection()), true);
+
+  promoted.clear('primary');
+  promoted.promote('primary');
+  assert.equal(recurring.readyProviderId(), null);
+  assert.equal(recurring.isReadyFor(promoted.selection()), false);
+  assert.equal(runs, 1);
+
+  const rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await rescheduled;
+  assert.equal(recurring.readyProviderId(), 'primary');
+  assert.equal(recurring.isReadyFor(promoted.selection()), true);
+  assert.equal(runs, 2);
+  await recurring.close();
+});
+
+void test('a deferred A to B to A promotion epoch degrades and retries before readiness', async () => {
+  const scheduler = new ManualScheduler();
+  const promoted = new PromotedProviderSelector([pass('primary'), pass('fallback-1')]);
+  promoted.promote('primary');
+  const gate = deferred<undefined>();
+  let runs = 0;
+  const recurring = new RecurringFinalityReconciler(
+    {
+      async runOnce() {
+        runs += 1;
+        if (runs === 1) await gate.promise;
+      },
+    },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      initialFailureMode: 'DEGRADED_RETRY',
+      currentSelection: () => promoted.selection(),
+    },
+  );
+
+  const starting = recurring.start();
+  await Promise.resolve();
+  promoted.promote('fallback-1');
+  promoted.promote('primary');
+  gate.resolve(undefined);
+  await starting;
+
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(recurring.readyProviderId(), null);
+  assert.equal(recurring.isReadyFor(promoted.selection()), false);
+
+  const rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await rescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.equal(recurring.readyProviderId(), 'primary');
+  assert.equal(recurring.isReadyFor(promoted.selection()), true);
+  assert.equal(runs, 2);
+  await recurring.close();
 });
 
 void test('finality startup fails closed by default without scheduling a retry', async () => {
@@ -725,6 +815,15 @@ function config(overrides: Record<string, string> = {}): ReturnType<typeof parse
     SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
     SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
     ...overrides,
+  });
+}
+
+function pass(providerId: 'primary' | 'fallback-1'): FinalityProviderPass {
+  return Object.freeze({
+    providerId,
+    async getHistoryStatuses() { return Object.freeze([]); },
+    async getFinalizedSlot() { return 0n; },
+    async getFinalizedBlockSignatures() { return Object.freeze([]); },
   });
 }
 

@@ -3,7 +3,7 @@ import {
   requireSolanaGenesisHash,
   SolanaGenesisHashError,
 } from '../domain/solana-genesis-hash.js';
-import type { RpcProviderId } from '../domain/rpc-provider.js';
+import { isRpcProviderId, type RpcProviderId } from '../domain/rpc-provider.js';
 import type {
   CatchUpGap,
   ListenerRuntimeState,
@@ -54,7 +54,10 @@ import { MarketObservationService } from './market-observation.service.js';
 import { ObservedTransactionPipeline } from './observed-transaction-pipeline.js';
 import { PumpSwapObservationPipeline } from './pumpswap-observation-pipeline.js';
 import { SolanaListenerRuntime } from './listener-runtime.js';
-import { PromotedProviderSelector } from './promoted-provider-selector.js';
+import {
+  PromotedProviderSelector,
+  type PromotedProviderSelection,
+} from './promoted-provider-selector.js';
 import { StrictCatchUpCoordinator } from './strict-catch-up-coordinator.js';
 import { StrictCatchUpScanner } from './strict-catch-up-scanner.js';
 import { TransactionInboxWorker } from './transaction-inbox-worker.js';
@@ -180,7 +183,7 @@ export function createProductionListenerRuntime(
       intervalMs: config.reconcileSeconds * 1_000,
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       initialFailureMode: 'DEGRADED_RETRY',
-      currentProviderId: (): RpcProviderId | null => promoted.activeProviderId(),
+      currentSelection: (): PromotedProviderSelection => promoted.selection(),
     },
   );
 
@@ -321,11 +324,11 @@ export function createProductionListenerRuntime(
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       manualKillSwitch: config.creationManualKillSwitch,
       isReady: (): boolean => {
-        const providerId = promoted.activeProviderId();
+        const selection = promoted.selection();
         return supervisor.state() === 'RUNNING'
-          && providerId !== null
+          && selection.providerId !== null
           && reconciler.state() === 'RUNNING'
-          && reconciler.readyProviderId() === providerId;
+          && reconciler.isReadyFor(selection);
       },
     },
   );
@@ -403,7 +406,7 @@ export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
 
 export interface RecurringFinalityOptions extends RecurringListenerOptions {
   readonly initialFailureMode?: InitialFinalityFailureMode;
-  readonly currentProviderId?: () => RpcProviderId | null;
+  readonly currentSelection?: () => PromotedProviderSelection;
 }
 
 export class ListenerControllerCloseError extends Error {
@@ -434,8 +437,8 @@ export class RecurringFinalityReconciler {
   private readonly shutdownTimeoutMs: number;
   private readonly scheduler: ListenerRuntimeScheduler;
   private readonly initialFailureMode: InitialFinalityFailureMode;
-  private readonly currentProviderId: (() => RpcProviderId | null) | null;
-  private currentReadyProviderId: RpcProviderId | null = null;
+  private readonly currentSelection: (() => PromotedProviderSelection) | null;
+  private currentReadySelection: PromotedProviderSelection | null = null;
   private timer: unknown = null;
   private inFlight: Promise<unknown> | null = null;
   private closePromise: Promise<void> | null = null;
@@ -455,17 +458,17 @@ export class RecurringFinalityReconciler {
     this.shutdownTimeoutMs = options.shutdownTimeoutMs;
     this.scheduler = options.scheduler ?? listenerScheduler;
     this.initialFailureMode = initialFailureMode;
-    if (options.currentProviderId !== undefined
-      && typeof options.currentProviderId !== 'function') {
+    if (options.currentSelection !== undefined
+      && typeof options.currentSelection !== 'function') {
       throw new TypeError('Current finality provider selector is invalid.');
     }
-    this.currentProviderId = options.currentProviderId ?? null;
+    this.currentSelection = options.currentSelection ?? null;
   }
 
   public async start(): Promise<void> {
     if (this.closed) return;
     this.currentState = 'STARTING';
-    this.currentReadyProviderId = null;
+    this.currentReadySelection = null;
     try {
       await this.runCurrentPass();
       this.currentState = 'RUNNING';
@@ -492,7 +495,15 @@ export class RecurringFinalityReconciler {
   }
 
   public readyProviderId(): RpcProviderId | null {
-    return this.currentReadyProviderId;
+    return this.currentReadySelectionIfCurrent()?.providerId ?? null;
+  }
+
+  public isReadyFor(selection: PromotedProviderSelection): boolean {
+    const expected = snapshotProviderSelection(selection);
+    const ready = this.currentReadySelectionIfCurrent();
+    return this.currentState === 'RUNNING'
+      && ready !== null
+      && sameProviderSelection(ready, expected);
   }
 
   private schedule(): void {
@@ -500,7 +511,7 @@ export class RecurringFinalityReconciler {
     this.timer = this.scheduler.schedule(() => {
       this.timer = null;
       if (this.closed) return;
-      this.currentReadyProviderId = null;
+      this.currentReadySelection = null;
       const operation = this.runCurrentPass();
       this.inFlight = operation;
       void operation.then(
@@ -513,7 +524,7 @@ export class RecurringFinalityReconciler {
         () => {
           if (this.inFlight === operation) this.inFlight = null;
           if (this.closed) return;
-          this.currentReadyProviderId = null;
+          this.currentReadySelection = null;
           this.currentState = 'DEGRADED';
           this.schedule();
         },
@@ -522,7 +533,7 @@ export class RecurringFinalityReconciler {
   }
 
   private async performClose(): Promise<void> {
-    this.currentReadyProviderId = null;
+    this.currentReadySelection = null;
     const running = this.inFlight;
     if (running !== null) {
       const result = await settleController(running, this.shutdownTimeoutMs);
@@ -535,31 +546,71 @@ export class RecurringFinalityReconciler {
   }
 
   private async runCurrentPass(): Promise<void> {
-    this.currentReadyProviderId = null;
-    if (this.currentProviderId === null) {
+    this.currentReadySelection = null;
+    if (this.currentSelection === null) {
       await this.reconciler.runOnce();
       return;
     }
-    const providerId = this.readCurrentProviderId();
-    if (providerId === null) throw new Error('Current finality provider is unavailable.');
+    const selection = this.readCurrentSelection();
+    if (selection.providerId === null) throw new Error('Current finality provider is unavailable.');
     await this.reconciler.runOnce();
-    if (this.readCurrentProviderId() !== providerId) {
+    if (!sameProviderSelection(this.readCurrentSelection(), selection)) {
       throw new Error('Current finality provider changed.');
     }
-    if (!this.closed) this.currentReadyProviderId = providerId;
+    if (!this.closed) this.currentReadySelection = selection;
   }
 
-  private readCurrentProviderId(): RpcProviderId | null {
+  private currentReadySelectionIfCurrent(): PromotedProviderSelection | null {
+    const ready = this.currentReadySelection;
+    if (ready === null || this.currentSelection === null) return null;
     try {
-      const providerId: unknown = Reflect.apply(this.currentProviderId as () => unknown, undefined, []);
-      if (providerId === null || providerId === 'primary'
-        || providerId === 'fallback-1' || providerId === 'fallback-2'
-        || providerId === 'fallback-3') return providerId;
+      if (sameProviderSelection(ready, this.readCurrentSelection())) return ready;
+    } catch {
+      // Invalid or unavailable current selections revoke readiness below.
+    }
+    this.currentReadySelection = null;
+    return null;
+  }
+
+  private readCurrentSelection(): PromotedProviderSelection {
+    try {
+      const selection: unknown = Reflect.apply(
+        this.currentSelection as () => unknown,
+        undefined,
+        [],
+      );
+      return snapshotProviderSelection(selection);
     } catch {
       // Converted to one fixed provider-unavailable result below.
     }
     throw new Error('Current finality provider is unavailable.');
   }
+}
+
+function snapshotProviderSelection(value: unknown): PromotedProviderSelection {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('Current finality provider selection is invalid.');
+  }
+  const providerDescriptor = Object.getOwnPropertyDescriptor(value, 'providerId');
+  const revisionDescriptor = Object.getOwnPropertyDescriptor(value, 'revision');
+  const providerId: unknown = providerDescriptor !== undefined && 'value' in providerDescriptor
+    ? providerDescriptor.value
+    : undefined;
+  const revision: unknown = revisionDescriptor !== undefined && 'value' in revisionDescriptor
+    ? revisionDescriptor.value
+    : undefined;
+  if ((providerId !== null && !isRpcProviderId(providerId))
+    || typeof revision !== 'bigint' || revision < 0n) {
+    throw new TypeError('Current finality provider selection is invalid.');
+  }
+  return Object.freeze({ providerId, revision });
+}
+
+function sameProviderSelection(
+  left: PromotedProviderSelection,
+  right: PromotedProviderSelection,
+): boolean {
+  return left.providerId === right.providerId && left.revision === right.revision;
 }
 
 export class PersistentListenerHeartbeat {

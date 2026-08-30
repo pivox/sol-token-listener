@@ -14,9 +14,15 @@ export class PromotedProviderUnavailableError extends Error {
   }
 }
 
+export interface PromotedProviderSelection {
+  readonly providerId: RpcProviderId | null;
+  readonly revision: bigint;
+}
+
 export class PromotedProviderSelector implements FinalityProviderPassSource {
   readonly #passes: ReadonlyMap<RpcProviderId, FinalityProviderPass>;
   #activeProvider: RpcProviderId | null = null;
+  #revision = 0n;
 
   public constructor(passes: readonly FinalityProviderPass[]) {
     const selected = new Map<RpcProviderId, FinalityProviderPass>();
@@ -37,15 +43,25 @@ export class PromotedProviderSelector implements FinalityProviderPassSource {
     return this.#activeProvider;
   }
 
+  public selection(): PromotedProviderSelection {
+    return Object.freeze({
+      providerId: this.#activeProvider,
+      revision: this.#revision,
+    });
+  }
+
   public promote(providerId: RpcProviderId): void {
     if (!isRpcProviderId(providerId) || !this.#passes.has(providerId)) {
       throw new TypeError('Promoted RPC provider is invalid.');
     }
+    this.#revision += 1n;
     this.#activeProvider = providerId;
   }
 
   public clear(providerId: RpcProviderId): void {
-    if (this.#activeProvider === providerId) this.#activeProvider = null;
+    if (this.#activeProvider !== providerId) return;
+    this.#revision += 1n;
+    this.#activeProvider = null;
   }
 
   public openPass(): FinalityProviderPass {
