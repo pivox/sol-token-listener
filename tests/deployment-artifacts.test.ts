@@ -409,10 +409,14 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /'028_paper_finality_replay_evidence\.sql'/);
   assert.match(smoke, /'029_paper_finality_claim_scheduler\.sql'/);
   assert.match(smoke, /'030_listener_websocket_health\.sql'/);
+  assert.match(smoke, /'031_execution_intents\.sql'/);
   assert.match(smoke, /'paperMvpRuns'/);
   assert.match(smoke, /'paperMvpSamples'/);
   assert.match(smoke, /'listenerCatchUpGaps'/);
   assert.match(smoke, /'listenerStrictCatchUpFailures'/);
+  assert.match(smoke, /'executionIntentTransitions'/);
+  assert.match(smoke, /'executionAttempts'/);
+  assert.match(smoke, /'executionIntents'/);
   assert.doesNotMatch(smoke, /Migration history does not contain exactly 14 rows\./);
   assert.doesNotMatch(smoke, /--privileged|network_mode|host networking|docker system prune|private[_ -]?key|\bwallet\b/iu);
   assert.doesNotMatch(smoke, /sol-token-listener-(?:backend|frontend):(?:smoke|latest)/u);
@@ -444,8 +448,8 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
   assert.match(retention, /canonicalRetentionCounters/);
   assert.match(
     smoke,
-    /'walletRelationships',\n {2}'websocketHealthEvidence',\n\]\);/u,
-    'deployment smoke must expect the sorted WebSocket retention counter',
+    /'executionAttempts',\n {2}'executionIntents',\n {2}'executionIntentTransitions',/u,
+    'deployment smoke must expect the three sorted execution retention counters',
   );
   assert.doesNotMatch(retention, /\.split\('\n'\).*\.filter/s);
   assert.doesNotMatch(retention, /new Error\(`[^`]*\$\{(?:stdout|stderr)\}/);

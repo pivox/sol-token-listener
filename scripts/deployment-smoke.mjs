@@ -65,12 +65,16 @@ const canonicalMigrations = Object.freeze([
   '028_paper_finality_replay_evidence.sql',
   '029_paper_finality_claim_scheduler.sql',
   '030_listener_websocket_health.sql',
+  '031_execution_intents.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
   'bondingCurveSnapshots',
   'creatorProfiles',
   'domainEvents',
+  'executionAttempts',
+  'executionIntents',
+  'executionIntentTransitions',
   'holderSnapshots',
   'launchTrades',
   'listenerCatchUpGaps',
