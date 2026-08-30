@@ -107,10 +107,13 @@ void test('requires a non-empty database URL and accepts only canonical dry-run 
   }
 });
 
-void test('rejects all twelve secret variables even when their value is empty', () => {
+void test('accepts absent, undefined and empty secret variables but rejects all non-empty values', () => {
   assert.equal(SECRET_KEYS.length, 12);
+  assert.equal(parseExecutorConfig({ DATABASE_URL }).databaseUrl, DATABASE_URL);
   for (const key of SECRET_KEYS) {
-    assertConfigFailure({ DATABASE_URL, [key]: '' });
+    assert.equal(parseExecutorConfig({ DATABASE_URL, [key]: undefined }).databaseUrl, DATABASE_URL);
+    assert.equal(parseExecutorConfig({ DATABASE_URL, [key]: '' }).databaseUrl, DATABASE_URL);
+    assertConfigFailure({ DATABASE_URL, [key]: ' ' });
     assertConfigFailure({ DATABASE_URL, [key]: `sensitive-${key}` });
   }
 });

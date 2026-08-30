@@ -39,7 +39,8 @@ export function parseExecutorConfig(
   try {
     if (!isPlainEnvironment(environment)) throw invalid();
     for (const key of SECRET_KEYS) {
-      if (environmentValue(environment, key) !== undefined) throw invalid();
+      const value = environmentValue(environment, key);
+      if (value !== undefined && value.length > 0) throw invalid();
     }
     const mode = environmentValue(environment, 'EXECUTOR_MODE') ?? 'dry-run';
     const liveTradingEnabled = environmentValue(environment, 'LIVE_TRADING_ENABLED');
