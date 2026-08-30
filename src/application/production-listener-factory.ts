@@ -469,15 +469,28 @@ export class RecurringFinalityReconciler {
     if (this.closed) return;
     this.currentState = 'STARTING';
     this.currentReadySelection = null;
+    const operation = this.runCurrentPass();
+    this.inFlight = operation;
     try {
-      await this.runCurrentPass();
+      await operation;
+      if (this.inFlight === operation) this.inFlight = null;
+      if (this.hasClosed()) return;
       this.currentState = 'RUNNING';
       this.schedule();
     } catch (error) {
+      if (this.inFlight === operation) this.inFlight = null;
+      if (this.hasClosed()) {
+        if (this.initialFailureMode === 'FAIL_START') throw error;
+        return;
+      }
       this.currentState = 'DEGRADED';
       if (this.initialFailureMode === 'FAIL_START') throw error;
       this.schedule();
     }
+  }
+
+  private hasClosed(): boolean {
+    return this.closed;
   }
 
   public close(): Promise<void> {

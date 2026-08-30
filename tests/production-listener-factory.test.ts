@@ -443,6 +443,80 @@ void test('finality close fences an in-flight pass and rejects stale timer activ
   assert.equal(reconciler.state(), 'STOPPED');
 });
 
+void test('finality close waits for the initial pass and fences its late success', async () => {
+  const scheduler = new ManualScheduler();
+  const initial = deferred<undefined>();
+  const reconciler = new RecurringFinalityReconciler(
+    { async runOnce() { await initial.promise; } },
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler },
+  );
+
+  const starting = reconciler.start();
+  await Promise.resolve();
+  let closeSettled = false;
+  const closing = reconciler.close().then(() => { closeSettled = true; });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+
+  initial.resolve(undefined);
+  await Promise.all([starting, closing]);
+  assert.equal(reconciler.state(), 'STOPPED');
+  assert.equal(reconciler.readyProviderId(), null);
+  assert.throws(() => { scheduler.fireScheduled(); }, /No callback is scheduled/u);
+  await Promise.resolve();
+  assert.equal(reconciler.state(), 'STOPPED');
+});
+
+void test('finality close bounds a stuck initial pass and fences its eventual success', async () => {
+  const scheduler = new ManualScheduler();
+  const initial = deferred<undefined>();
+  const reconciler = new RecurringFinalityReconciler(
+    { async runOnce() { await initial.promise; } },
+    { intervalMs: 5, shutdownTimeoutMs: 5, scheduler },
+  );
+
+  const starting = reconciler.start();
+  await Promise.resolve();
+  await assert.rejects(reconciler.close(), (error: unknown) => {
+    assert.ok(error instanceof ListenerControllerCloseError);
+    assert.equal(error.component, 'reconciler');
+    assert.equal(error.reason, 'timeout');
+    return true;
+  });
+  assert.equal(reconciler.state(), 'DEGRADED');
+
+  initial.resolve(undefined);
+  await starting;
+  assert.equal(reconciler.state(), 'DEGRADED');
+  assert.equal(reconciler.readyProviderId(), null);
+  assert.throws(() => { scheduler.fireScheduled(); }, /No callback is scheduled/u);
+});
+
+void test('finality close preserves fail-start rejection without a post-close transition', async () => {
+  const scheduler = new ManualScheduler();
+  const initial = deferred<undefined>();
+  const reconciler = new RecurringFinalityReconciler(
+    {
+      async runOnce() {
+        await initial.promise;
+        throw new Error('private initial finality failure');
+      },
+    },
+    { intervalMs: 5, shutdownTimeoutMs: 100, scheduler },
+  );
+
+  const starting = reconciler.start();
+  await Promise.resolve();
+  const closing = reconciler.close();
+  initial.resolve(undefined);
+  await assert.rejects(starting, /private initial finality failure/u);
+  await closing;
+
+  assert.equal(reconciler.state(), 'STOPPED');
+  assert.equal(reconciler.readyProviderId(), null);
+  assert.throws(() => { scheduler.fireScheduled(); }, /No callback is scheduled/u);
+});
+
 void test('finality startup degrades without aborting and recovers on a fresh scheduled pass', async () => {
   const scheduler = new ManualScheduler();
   const candidate: FinalityCandidate = Object.freeze({
