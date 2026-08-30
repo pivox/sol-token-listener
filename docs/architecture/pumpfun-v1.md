@@ -444,9 +444,12 @@ celui de la session et son TTL est borné. Il ne lit ni PostgreSQL, ni RPC, ni
 horloge, et ne produit aucun effet.
 
 Le purgeur fixe une heure PostgreSQL, verrouille une cohorte ordonnée
-d'intentions terminales réconciliées puis supprime ses transitions, ses
-tentatives et enfin ses intentions dans la même transaction. Les trois
-compteurs agrégés sont exposés par le seul événement de rétention.
+d'intentions terminales réconciliées, écrit d'abord leurs tombstones anti-rejeu
+minimaux, puis supprime leurs transitions, leurs tentatives et enfin leurs
+intentions dans la même transaction. Les tombstones durables ne contiennent que
+l'ID, la clé d'ordre logique, l'empreinte de décision, une version et la date de
+retrait : aucun mint, wallet, montant, quote ou payload. Les trois compteurs
+agrégés de suppression restent exposés par le seul événement de rétention.
 
 Cette fondation reste totalement non composée. Le bootstrap, l'API et les
 workers existants ne créent ni ne claim aucune intention. Aucun executor,

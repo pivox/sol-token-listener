@@ -216,6 +216,31 @@ CREATE TABLE IF NOT EXISTS execution_intents (
   )
 );
 
+-- Minimal permanent anti-replay marker. This deliberately retains no business
+-- payload and has no parent foreign key: the execution intent can be removed
+-- after its retention window while its logical identity remains retired.
+CREATE TABLE IF NOT EXISTS execution_intent_tombstones (
+  intent_id TEXT PRIMARY KEY,
+  payload_version SMALLINT NOT NULL DEFAULT 1,
+  logical_order_key TEXT NOT NULL UNIQUE,
+  decision_fingerprint TEXT NOT NULL,
+  retired_at TIMESTAMPTZ NOT NULL DEFAULT date_trunc('milliseconds', clock_timestamp()),
+  CONSTRAINT execution_intent_tombstones_payload_version_check CHECK (payload_version = 1),
+  CONSTRAINT execution_intent_tombstones_text_check CHECK (
+    octet_length(intent_id) BETWEEN 1 AND 256
+    AND octet_length(logical_order_key) BETWEEN 1 AND 256
+  ),
+  CONSTRAINT execution_intent_tombstones_fingerprint_check CHECK (
+    decision_fingerprint ~ '^[0-9a-f]{64}$'
+  ),
+  CONSTRAINT execution_intent_tombstones_retired_at_check CHECK (
+    isfinite(retired_at)
+    AND retired_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+    AND retired_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+    AND date_trunc('milliseconds', retired_at) = retired_at
+  )
+);
+
 CREATE TABLE IF NOT EXISTS execution_attempts (
   intent_id TEXT NOT NULL REFERENCES execution_intents(id) ON DELETE CASCADE,
   attempt_number INTEGER NOT NULL,

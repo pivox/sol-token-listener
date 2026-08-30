@@ -23,7 +23,10 @@ ne signe ou n'envoie une transaction Solana.
 La migration `031_execution_intents.sql` ajoute un ledger PostgreSQL séparé
 d'intentions, de tentatives et de transitions, avec identité déterministe,
 leases clôturés par révision monotone et rétention terminale réconciliée de
-quatre heures. Un mapper pur sait dériver un draft depuis l'événement canonique
+quatre heures. La purge conserve durablement un tombstone anti-rejeu minimal
+(identifiants et empreinte seulement, sans mint, wallet, montant ni payload),
+afin qu'un ordre logique ne puisse pas être recréé avec des preuves fraîches.
+Un mapper pur sait dériver un draft depuis l'événement canonique
 `PaperStrategySessionUpdated`, sa qualification et sa quote causale.
 
 Cette fondation est entièrement inerte : le mapper et le repository ne sont

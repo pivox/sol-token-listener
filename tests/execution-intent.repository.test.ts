@@ -30,8 +30,10 @@ void test('create uses database timestamps and replays only an exactly matching 
   const client = new ScriptedClient([
     command('BEGIN'),
     result([stored], 1),
+    result([], 0),
     command('COMMIT'),
     command('BEGIN'),
+    result([], 0),
     result([], 0),
     result([stored], 1),
     command('COMMIT'),
@@ -67,7 +69,8 @@ void test('create rejects logical-key and id collisions with fixed redacted type
   ];
   for (const conflicting of conflicts) {
     const client = new ScriptedClient([
-      command('BEGIN'), result([], 0), result([intentRow(conflicting)], 1), command('ROLLBACK'),
+      command('BEGIN'), result([], 0), result([], 0),
+      result([intentRow(conflicting)], 1), command('ROLLBACK'),
     ]);
     const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
@@ -76,11 +79,36 @@ void test('create rejects logical-key and id collisions with fixed redacted type
   }
 });
 
+void test('create rejects and rolls back when a durable tombstone matches the inserted identity', async () => {
+  const incoming = executionDraft('tombstoned-create');
+  const client = new ScriptedClient([
+    command('BEGIN'),
+    result([intentRow(incoming)], 1),
+    result([{
+      intent_id: incoming.id,
+      logical_order_key: incoming.logicalOrderKey,
+    }], 1),
+    command('ROLLBACK'),
+  ]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  await expectCode(repository.create(incoming), 'INTENT_DUPLICATE');
+
+  const tombstoneRead = client.calls.find((call) => call.text.includes('execution_intent_tombstones'));
+  assert.ok(tombstoneRead);
+  assert.match(
+    tombstoneRead.text,
+    /tombstone\.intent_id\s*=\s*\$1\s+OR\s+tombstone\.logical_order_key\s*=\s*\$2/u,
+  );
+  assert.deepEqual(tombstoneRead.values, [incoming.id, incoming.logicalOrderKey]);
+  assertRedacted(client.calls);
+});
+
 void test('create rejects a contradictory INSERT RETURNING identity', async () => {
   const incoming = executionDraft('returning-incoming');
   const other = executionDraft('returning-other');
   const client = new ScriptedClient([
-    command('BEGIN'), result([intentRow(other)], 1), command('ROLLBACK'),
+    command('BEGIN'), result([intentRow(other)], 1), result([], 0), command('ROLLBACK'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
@@ -862,7 +890,7 @@ void test('public input validation is exact, bounded, typed, and does not invoke
   assert.equal(pool.connectCount, 0);
 });
 
-void test('a purged identity can only be recreated as expired and cannot be claimed for execution', async (context) => {
+void test('a purged logical order cannot be recreated with fresh evidence and timestamps', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: post-purge replay test skipped');
@@ -896,17 +924,101 @@ void test('a purged identity can only be recreated as expired and cannot be clai
       FROM operation WHERE intent.id=$1
       RETURNING trunc(EXTRACT(EPOCH FROM requested_at) * 1000)::TEXT AS requested_at_ms,
         trunc(EXTRACT(EPOCH FROM expires_at) * 1000)::TEXT AS expires_at_ms`, [live.id]);
-    const agedRow = required(aged.rows[0]);
+    required(aged.rows[0]);
+    assert.equal((await purgeExpiredFoundationData(pool)).executionIntents, 1);
+    const freshNow = await databaseNowMs(pool);
     const replay = executionDraft('post-purge-replay', {
-      requestedAtMs: Number(agedRow.requested_at_ms),
-      expiresAtMs: Number(agedRow.expires_at_ms),
+      decisionEventId: 'event-post-purge-replay-fresh',
+      decisionFingerprint: 'b'.repeat(64),
+      requestedAtMs: freshNow,
+      expiresAtMs: freshNow + 60_000,
     });
     assert.equal(replay.id, live.id);
-    assert.equal((await purgeExpiredFoundationData(pool)).executionIntents, 1);
-    assert.equal((await repository.create(replay)).kind, 'CREATED');
+    assert.equal(replay.logicalOrderKey, live.logicalOrderKey);
+    await expectCode(repository.create(replay), 'INTENT_DUPLICATE');
+    assert.equal(await repository.read(live.id), null);
     assert.equal(await repository.claim({
       ownerId: 'replay-worker', leaseMs: 30_000, purpose: 'EXECUTE',
     }), null);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intents WHERE id=$1', [live.id],
+    )).rows[0]?.count, 0);
+  });
+});
+
+void test('create racing a locked purge fails closed on the committed tombstone', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: concurrent tombstone test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, 'execution_intent_concurrent_tombstone', async (
+    firstPool,
+    secondPool,
+  ) => {
+    await migrateDatabase({ pool: firstPool });
+    const original = executionDraft('concurrent-post-purge');
+    await firstPool.query(`INSERT INTO execution_intents (
+      id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+      logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+      quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+      decision_event_id,decision_fingerprint,requested_at,expires_at,status,
+      last_reason_code,terminal_at,reconciliation_completed_at,purge_after
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+      to_timestamp(0),to_timestamp(1),'SUCCEEDED','INTENT_SUCCEEDED',to_timestamp(1),
+      to_timestamp(2),to_timestamp(14402))`, [
+      original.id, original.payloadVersion, original.logicalOrderKey, original.strategyId,
+      original.strategyVersion, original.positionId, original.logicalCommandId, original.mint,
+      original.side, original.venuePolicy, original.quoteMint, original.quoteTokenProgram,
+      original.quoteDecimals, original.quoteAmountRaw?.toString(), original.baseAmountRaw,
+      original.minimumAmountOutRaw.toString(), original.decisionEventId,
+      original.decisionFingerprint,
+    ]);
+    const advisoryKey = 5_100_091;
+    await firstPool.query(`CREATE FUNCTION block_execution_intent_parent_delete()
+      RETURNS trigger LANGUAGE plpgsql AS $function$
+      BEGIN
+        PERFORM pg_advisory_lock(${advisoryKey});
+        PERFORM pg_advisory_unlock(${advisoryKey});
+        RETURN OLD;
+      END
+      $function$`);
+    await firstPool.query(`CREATE TRIGGER block_execution_intent_parent_delete_trigger
+      AFTER DELETE ON execution_intents FOR EACH ROW
+      EXECUTE FUNCTION block_execution_intent_parent_delete()`);
+
+    const blocker = await secondPool.connect();
+    let blockerLocked = false;
+    let purge: Promise<Awaited<ReturnType<typeof purgeExpiredFoundationData>>> | undefined;
+    let replay: Promise<unknown> | undefined;
+    try {
+      await blocker.query('SELECT pg_advisory_lock($1)', [advisoryKey]);
+      blockerLocked = true;
+      purge = purgeExpiredFoundationData(firstPool);
+      await waitForDatabaseQuery(secondPool, '%DELETE FROM execution_intents intent%');
+      const now = await databaseNowMs(secondPool);
+      const fresh = executionDraft('concurrent-post-purge', {
+        decisionEventId: 'event-concurrent-post-purge-fresh',
+        decisionFingerprint: 'c'.repeat(64), requestedAtMs: now, expiresAtMs: now + 60_000,
+      });
+      replay = new PostgresExecutionIntentRepository(secondPool).create(fresh);
+      await waitForDatabaseQuery(firstPool, '%INSERT INTO execution_intents AS intent%');
+      await blocker.query('SELECT pg_advisory_unlock($1)', [advisoryKey]);
+      blockerLocked = false;
+      assert.equal((await purge).executionIntents, 1);
+      await expectCode(replay, 'INTENT_DUPLICATE');
+    } finally {
+      if (blockerLocked) await blocker.query('SELECT pg_advisory_unlock($1)', [advisoryKey]);
+      blocker.release();
+      await Promise.allSettled([purge, replay].filter((value) => value !== undefined));
+    }
+    assert.equal((await firstPool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intents WHERE id=$1', [original.id],
+    )).rows[0]?.count, 0);
+    assert.equal((await firstPool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_tombstones WHERE intent_id=$1',
+      [original.id],
+    )).rows[0]?.count, 1);
   });
 });
 
@@ -1565,6 +1677,20 @@ async function databaseNowMs(pool: InstanceType<typeof pg.Pool>): Promise<number
     "SELECT trunc(EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::TEXT AS now_ms",
   );
   return Number(required(result.rows[0]).now_ms);
+}
+
+async function waitForDatabaseQuery(
+  pool: InstanceType<typeof pg.Pool>,
+  pattern: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const result = await pool.query(`SELECT 1 FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid() AND state='active' AND wait_event IS NOT NULL
+        AND query ILIKE $1 LIMIT 1`, [pattern]);
+    if (result.rowCount === 1) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`Timed out waiting for blocked PostgreSQL query matching ${pattern}.`);
 }
 
 async function withTemporarySchema(

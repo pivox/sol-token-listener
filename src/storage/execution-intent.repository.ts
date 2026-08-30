@@ -203,6 +203,17 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
            RETURNING ${INTENT_PROJECTION}`,
           draftValues(draft),
         );
+        const tombstone = await client.query(
+          `SELECT tombstone.intent_id,tombstone.logical_order_key
+           FROM execution_intent_tombstones AS tombstone
+           WHERE tombstone.intent_id = $1 OR tombstone.logical_order_key = $2
+           ORDER BY CASE WHEN tombstone.intent_id = $1 THEN 0 ELSE 1 END,
+             tombstone.intent_id
+           LIMIT 1`,
+          [draft.id, draft.logicalOrderKey],
+        );
+        if (tombstone.rowCount === 1 && tombstone.rows.length === 1) throw duplicateError();
+        if (tombstone.rowCount !== 0 || tombstone.rows.length !== 0) throw dataError();
         if (inserted.rowCount === 1 && inserted.rows.length === 1) {
           const intent = intentFromRow(requiredRow(inserted.rows));
           if (intent.status !== 'PENDING' || intent.stateRevision !== 0n

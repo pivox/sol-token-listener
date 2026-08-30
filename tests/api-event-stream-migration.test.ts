@@ -128,7 +128,7 @@ void test('la purge retourne le compteur agrégé de l’outbox, pas le rowCount
   const client = {
     query: async (text: string) => {
       queries.push(text);
-      if (text === 'SELECT statement_timestamp() AS purge_cutoff') {
+      if (text === "SELECT date_trunc('milliseconds', statement_timestamp()) AS purge_cutoff") {
         return { rows: [{ purge_cutoff: new Date(0) }], rowCount: 1 };
       }
       if (text.includes('WITH deleted AS')) {
@@ -155,7 +155,7 @@ void test('la purge retire les projections participants expirées avant leurs é
   const client = {
     query: async (text: string) => {
       queries.push(text);
-      if (text === 'SELECT statement_timestamp() AS purge_cutoff') {
+      if (text === "SELECT date_trunc('milliseconds', statement_timestamp()) AS purge_cutoff") {
         return { rows: [{ purge_cutoff: new Date(0) }], rowCount: 1 };
       }
       if (text.includes('WITH deleted AS')) {

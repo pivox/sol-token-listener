@@ -303,7 +303,7 @@ void test('purges only expired resolved strict failures and exposes their count'
   const client = {
     query: async (text: string) => {
       queries.push(text);
-      if (text === 'SELECT statement_timestamp() AS purge_cutoff') {
+      if (text === "SELECT date_trunc('milliseconds', statement_timestamp()) AS purge_cutoff") {
         return { rows: [{ purge_cutoff: new Date(0) }], rowCount: 1 };
       }
       if (text.includes('DELETE FROM listener_strict_catch_up_failures')) {

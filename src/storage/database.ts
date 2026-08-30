@@ -396,7 +396,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          )`,
     );
     const executionIntentCutoffResult = await client.query<{ readonly purge_cutoff: Date }>(
-      'SELECT statement_timestamp() AS purge_cutoff',
+      "SELECT date_trunc('milliseconds', statement_timestamp()) AS purge_cutoff",
     );
     const executionIntentCutoff = executionIntentCutoffResult.rows[0]?.purge_cutoff;
     if (!(executionIntentCutoff instanceof Date)
@@ -415,6 +415,17 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       [executionIntentCutoff],
     );
     const executionIntentIds = executionIntentCohort.rows.map(({ id }) => id);
+    await client.query(
+      `INSERT INTO execution_intent_tombstones (
+         intent_id,payload_version,logical_order_key,decision_fingerprint,retired_at
+       )
+       SELECT intent.id,intent.payload_version,intent.logical_order_key,
+         intent.decision_fingerprint,$2::TIMESTAMPTZ
+       FROM execution_intents intent
+       WHERE intent.id = ANY($1::TEXT[])
+       ORDER BY intent.id`,
+      [executionIntentIds, executionIntentCutoff],
+    );
     const executionIntentTransitions = await client.query(
       `DELETE FROM execution_intent_transitions transition
        WHERE transition.intent_id = ANY($1::TEXT[])`,

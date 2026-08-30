@@ -17,6 +17,18 @@ void test('execution intent migration defines the inert durable ledger contract'
   assert.match(executableSql, /CREATE TABLE IF NOT EXISTS execution_intents/u);
   assert.match(executableSql, /CREATE TABLE IF NOT EXISTS execution_attempts/u);
   assert.match(executableSql, /CREATE TABLE IF NOT EXISTS execution_intent_transitions/u);
+  assert.match(executableSql, /CREATE TABLE IF NOT EXISTS execution_intent_tombstones/u);
+  assert.match(executableSql, /intent_id TEXT PRIMARY KEY/u);
+  assert.match(executableSql, /logical_order_key TEXT NOT NULL UNIQUE/u);
+  assert.match(executableSql, /decision_fingerprint TEXT NOT NULL/u);
+  assert.match(executableSql, /execution_intent_tombstones_fingerprint_check CHECK \(\s*decision_fingerprint ~ '\^\[0-9a-f\]\{64\}\$'/u);
+  const tombstoneDefinition = /CREATE TABLE IF NOT EXISTS execution_intent_tombstones \(([\s\S]*?)\);/u
+    .exec(executableSql)?.[1];
+  assert.ok(tombstoneDefinition !== undefined);
+  assert.doesNotMatch(
+    tombstoneDefinition,
+    /REFERENCES|mint|wallet|amount|quote|payload(?!_version)|purge_after/iu,
+  );
   assert.match(executableSql, /UNIQUE\s*\(logical_order_key\)/u);
   assert.match(executableSql, /state_revision BIGINT NOT NULL DEFAULT 0/u);
   assert.match(executableSql, /execution_intents_state_revision_check CHECK \(state_revision >= 0\)/u);
@@ -76,6 +88,37 @@ void test('database rejects lifetimes beyond four hours and contradictory reason
     await assert.rejects(pool.query(`INSERT INTO execution_attempts (
       intent_id,attempt_number,status,started_at,completed_at,reason_code
     ) VALUES ($1,2,'ABANDONED',to_timestamp(1),to_timestamp(2),'ATTEMPT_COMPLETED')`, [processing.id]));
+  });
+});
+
+void test('database enforces the minimal tombstone identity and timestamp contract', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: execution intent tombstone invariant test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, 'execution_intent_tombstone_invariants', async (pool) => {
+    await migrateDatabase({ pool });
+    const valid = await pool.query<{ readonly millisecond_aligned: boolean }>(`INSERT INTO
+      execution_intent_tombstones (intent_id,logical_order_key,decision_fingerprint)
+      VALUES ('intent','logical-key',$1)
+      RETURNING retired_at = date_trunc('milliseconds', retired_at) AS millisecond_aligned`, [
+      'a'.repeat(64),
+    ]);
+    assert.equal(valid.rows[0]?.millisecond_aligned, true);
+
+    const invalidRows = [
+      ['', 'another-key', 'a'.repeat(64), '1970-01-01T00:00:00.000Z'],
+      ['another-intent', 'x'.repeat(257), 'a'.repeat(64), '1970-01-01T00:00:00.000Z'],
+      ['another-intent', 'another-key', 'A'.repeat(64), '1970-01-01T00:00:00.000Z'],
+      ['another-intent', 'another-key', 'b'.repeat(64), 'infinity'],
+      ['another-intent', 'another-key', 'b'.repeat(64), '1970-01-01T00:00:00.000001Z'],
+    ] as const;
+    for (const row of invalidRows) {
+      await assert.rejects(pool.query(`INSERT INTO execution_intent_tombstones (
+        intent_id,logical_order_key,decision_fingerprint,retired_at
+      ) VALUES ($1,$2,$3,$4::TIMESTAMPTZ)`, [...row]));
+    }
   });
 });
 
@@ -304,9 +347,16 @@ void test('purges only reconciled terminal execution intent ledgers after retent
     await migrateDatabase({ pool });
     const terminalStatuses = ['SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED'] as const;
     const terminalIds: string[] = [];
+    const expectedTombstones: Record<string, unknown>[] = [];
     for (const status of terminalStatuses) {
       const value = draft(`purge-${status.toLowerCase()}`, 'BUY', 1n, null);
       terminalIds.push(value.id);
+      expectedTombstones.push({
+        intent_id: value.id,
+        payload_version: 1,
+        logical_order_key: value.logicalOrderKey,
+        decision_fingerprint: value.decisionFingerprint,
+      });
       await insertIntent(pool, intentRow(value, {
         status, attemptCount: 1, terminalAtMs: 1_000,
         reconciliationCompletedAtMs: 2_000, purgeAfterMs: 14_402_000,
@@ -352,6 +402,9 @@ void test('purges only reconciled terminal execution intent ledgers after retent
     assert.equal(purged.executionIntentTransitions, terminalStatuses.length);
     assert.equal(purged.executionAttempts, terminalStatuses.length);
     assert.equal(purged.executionIntents, terminalStatuses.length);
+    assert.deepEqual((await pool.query(`SELECT intent_id, payload_version, logical_order_key,
+      decision_fingerprint FROM execution_intent_tombstones ORDER BY intent_id`)).rows,
+    expectedTombstones.sort((left, right) => String(left.intent_id).localeCompare(String(right.intent_id))));
     assert.deepEqual((await pool.query<{ readonly id: string }>(
       'SELECT id FROM execution_intents ORDER BY id',
     )).rows.map(({ id }) => id).sort(), retainedIds.sort());
@@ -401,6 +454,46 @@ void test('rolls back execution intent child purges when the parent delete fails
     )).rows[0]?.count, 1);
     assert.equal((await pool.query(
       'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_transitions WHERE intent_id = $1', [value.id],
+    )).rows[0]?.count, 1);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_tombstones WHERE intent_id = $1', [value.id],
+    )).rows[0]?.count, 0);
+  });
+});
+
+void test('rolls back an execution intent purge when tombstone insertion collides', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: execution intent tombstone collision test skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'execution_intent_tombstone_collision', async (pool) => {
+    await migrateDatabase({ pool });
+    const value = draft('purge-tombstone-collision', 'BUY', 1n, null);
+    await insertIntent(pool, intentRow(value, {
+      status: 'SUCCEEDED', attemptCount: 1, terminalAtMs: 1_000,
+      reconciliationCompletedAtMs: 2_000, purgeAfterMs: 14_402_000,
+    }));
+    await insertAttempt(pool, value.id, 1, 'COMPLETED', 0, 1_000, null);
+    await insertTransition(pool, value.id, {
+      payloadVersion: 1, attemptNumber: 1, sourceEventId: null, observedAtMs: 1_000,
+    }, 1_000);
+    await pool.query(`INSERT INTO execution_intent_tombstones (
+      intent_id,logical_order_key,decision_fingerprint,retired_at
+    ) VALUES ('different-intent',$1,$2,to_timestamp(1))`, [
+      value.logicalOrderKey, value.decisionFingerprint,
+    ]);
+
+    await assert.rejects(purgeExpiredFoundationData(pool), /duplicate key/u);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intents WHERE id=$1', [value.id],
+    )).rows[0]?.count, 1);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_attempts WHERE intent_id=$1', [value.id],
+    )).rows[0]?.count, 1);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_transitions WHERE intent_id=$1', [value.id],
     )).rows[0]?.count, 1);
   });
 });
@@ -674,12 +767,18 @@ async function assertCatalogContract(pool: InstanceType<typeof pg.Pool>): Promis
   const columns = await pool.query<{ readonly table_name: string; readonly column_name: string }>(`SELECT
     table_name, column_name FROM information_schema.columns
     WHERE table_schema = current_schema()
-      AND table_name IN ('execution_intents', 'execution_attempts', 'execution_intent_transitions')
+      AND table_name IN (
+        'execution_intents', 'execution_attempts', 'execution_intent_transitions',
+        'execution_intent_tombstones'
+      )
     ORDER BY table_name, ordinal_position`);
   assert.deepEqual(columns.rows, [
     ...['execution_attempts'].flatMap((table_name) => [
       'intent_id', 'attempt_number', 'status', 'effective_venue', 'provider_id', 'started_at',
       'completed_at', 'reason_code', 'purge_after',
+    ].map((column_name) => ({ table_name, column_name }))),
+    ...['execution_intent_tombstones'].flatMap((table_name) => [
+      'intent_id', 'payload_version', 'logical_order_key', 'decision_fingerprint', 'retired_at',
     ].map((column_name) => ({ table_name, column_name }))),
     ...['execution_intent_transitions'].flatMap((table_name) => [
       'sequence', 'intent_id', 'previous_status', 'next_status', 'reason_code', 'human_message',
@@ -703,7 +802,9 @@ async function assertCatalogContract(pool: InstanceType<typeof pg.Pool>): Promis
     JOIN pg_namespace source_namespace ON source_namespace.oid = source_table.relnamespace
     WHERE constraint_row.contype = 'f'
       AND source_namespace.nspname = current_schema()
-      AND source_table.relname IN ('execution_attempts', 'execution_intent_transitions')
+      AND source_table.relname IN (
+        'execution_attempts', 'execution_intent_transitions', 'execution_intent_tombstones'
+      )
     ORDER BY source_table.relname`);
   assert.deepEqual(foreignKeys.rows, [
     { source: 'execution_attempts', target: 'execution_intents', delete_type: 'c' },
