@@ -85,9 +85,9 @@ La séquence opérationnelle minimale, depuis un fichier opérateur vérifié
 applicatifs et exige une santé `OK` :
 
 ```bash
-npm run rpc:check
+DOTENV_CONFIG_PATH=deploy/.env npm run rpc:check
 docker compose --env-file deploy/.env -f deploy/compose.yaml up -d migrate
-docker compose --env-file deploy/.env -f deploy/compose.yaml up -d app frontend retention
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --wait --wait-timeout 60 app frontend retention
 docker compose --env-file deploy/.env -f deploy/compose.yaml exec -T app \
   node dist/scripts/deployment-healthcheck.js --require-ok
 ```
@@ -102,12 +102,13 @@ construisez ou tirez les images immuables validées. Depuis la racine du dépôt
 
 ```bash
 set -euo pipefail
+DOTENV_CONFIG_PATH="$DEPLOY_ENV" npm run rpc:check
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --images migrate app retention frontend | grep -Fvx 'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3' | npm run --silent deployment:validate-images
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull postgres migrate app retention frontend
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 frontend app retention
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 --no-build postgres
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener run --rm --no-deps migrate
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps app retention
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --wait --wait-timeout 60 --no-build --no-deps app retention
 health_attempt=0
 until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js --require-ok; do
   health_attempt=$((health_attempt + 1))
@@ -137,7 +138,8 @@ pas la migration tant que cette commande n’est pas terminée.
 La commande PostgreSQL attend explicitement un état sain, avec une borne de 60
 secondes ; une migration `--no-deps` ne part donc pas sur une base seulement
 démarrée. Lancez ensuite la migration one-shot, puis exactement une application
-et un worker de rétention. La boucle attend le healthcheck compilé
+et un worker de rétention, dont la préparation est aussi attendue avec une
+borne de 60 secondes. La boucle confirme ensuite le healthcheck compilé
 avant de publier le frontend derrière le proxy TLS externe. Vérifiez health, SSE
 et les logs de rétention. La sonde SSE attend 20 secondes, donc au-delà du
 heartbeat par défaut de 15 secondes. Un `curl` encore connecté doit terminer
@@ -233,7 +235,7 @@ jamais un basculement vers le subscriber legacy dans le processus en cours :
 
 ```bash
 docker compose --env-file deploy/.env -f deploy/compose.yaml stop app
-docker compose --env-file deploy/.env -f deploy/compose.yaml up -d app
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --wait --wait-timeout 60 app
 docker compose --env-file deploy/.env -f deploy/compose.yaml exec -T app \
   node dist/scripts/deployment-healthcheck.js --require-ok
 ```
@@ -256,7 +258,7 @@ set -euo pipefail
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --quiet
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --images migrate app retention frontend | grep -Fvx 'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3' | npm run --silent deployment:validate-images
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull app retention frontend
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps app retention
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --wait --wait-timeout 60 --no-build --no-deps app retention
 health_attempt=0
 until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js --require-ok; do
   health_attempt=$((health_attempt + 1))

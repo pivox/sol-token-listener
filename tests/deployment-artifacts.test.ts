@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
@@ -619,10 +621,10 @@ void test('deployment runbook documents the safe production lifecycle and safety
   assert.notEqual(rollbackStopIndex, -1, 'rollback must stop every application service');
   assert.ok(rollbackStopIndex < rollback.indexOf('BACKEND_IMAGE'));
   assert.ok(rollbackStopIndex < rollback.indexOf('pull app retention frontend'));
-  assert.ok(rollbackStopIndex < rollback.indexOf('up -d --no-build --no-deps app retention'));
+  assert.ok(rollbackStopIndex < rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps app retention'));
   assert.match(rollback, /BACKEND_IMAGE[\s\S]*FRONTEND_IMAGE/);
   assert.match(rollback, /pull app retention frontend/);
-  assert.match(rollback, /up -d --no-build --no-deps app retention/);
+  assert.match(rollback, /up -d --wait --wait-timeout 60 --no-build --no-deps app retention/);
   assert.match(runbook, /restauration[^\n]*répétée/i);
   assert.match(runbook, /EXÉCUTION_MODE=observe|EXECUTION_MODE=observe/);
   assert.match(runbook, /observe|paper/i);
@@ -706,10 +708,50 @@ void test('operator documentation activates the safe websocket failover contract
   ]) assert.ok(documentation.includes(statement), `missing active operational statement: ${statement}`);
   assert.doesNotMatch(documentation, /inactive until #63|inactive.*#63|jusqu[^\n]{0,80}#63/iu);
   assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d migrate/);
-  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d app frontend retention/);
+  assert.match(deployment, /DOTENV_CONFIG_PATH=deploy\/\.env npm run rpc:check/);
+  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d --wait --wait-timeout 60 app frontend retention/);
   assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml exec -T app[\s\S]*deployment-healthcheck\.js --require-ok/);
   assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml stop app/);
   assert.match(deployment, /previous immutable image/i);
+  assert.ok(
+    deployment.indexOf('up -d --wait --wait-timeout 60 app frontend retention')
+      < deployment.indexOf('deployment-healthcheck.js --require-ok'),
+    'Compose readiness must be awaited before the strict healthcheck',
+  );
+});
+
+void test('documented RPC preflight uses dotenv explicit-path support', async () => {
+  const [packageJson, checkRpc, config] = await Promise.all([
+    readArtifact('package.json'),
+    readArtifact('scripts/check-rpc.ts'),
+    readArtifact('src/config/env.ts'),
+  ]);
+  const parsed = JSON.parse(packageJson) as { readonly scripts?: Readonly<Record<string, string>> };
+
+  assert.equal(parsed.scripts?.['rpc:check'], 'tsx scripts/check-rpc.ts');
+  assert.match(checkRpc, /loadConfig\(\)/);
+  assert.match(config, /^import 'dotenv\/config';$/m);
+
+  const directory = await mkdtemp(join(tmpdir(), 'sol-token-listener-dotenv-'));
+  const environmentPath = join(directory, '.env');
+  try {
+    await writeFile(environmentPath, 'TASK8_DOTENV_CONTRACT=loaded\n', 'utf8');
+    const result = spawnSync(
+      process.execPath,
+      ['--import', 'dotenv/config', '--eval', 'process.stdout.write(process.env.TASK8_DOTENV_CONTRACT ?? "")'],
+      {
+        cwd: fileURLToPath(root),
+        encoding: 'utf8',
+        env: { ...process.env, DOTENV_CONFIG_PATH: environmentPath },
+        timeout: 10_000,
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'loaded');
+    assert.equal(result.stderr, '');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 void test('operator overview renders the durable WebSocket lifecycle without exposing connection material', async () => {
