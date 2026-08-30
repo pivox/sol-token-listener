@@ -84,6 +84,10 @@ export interface WebSocketFailoverSupervisorDependencies {
   readonly health: Pick<WebSocketHealthRepository, 'beginOwner'>;
   readonly reporter: PersistentWebSocketHealthReporter;
   readonly promoted: PromotedProviderSelector;
+  readonly verifyProviderGenesis: (
+    providerId: RpcProviderId,
+    signal: AbortSignal,
+  ) => Promise<void>;
   readonly openSession: typeof openWsProgramSession;
   readonly runStrictScan: (
     providerId: RpcProviderId,
@@ -149,6 +153,7 @@ interface ValidatedDependencies {
   readonly health: Pick<WebSocketHealthRepository, 'beginOwner'>;
   readonly reporter: ValidatedReporter;
   readonly promoted: ValidatedPromotedSelector;
+  readonly verifyProviderGenesis: WebSocketFailoverSupervisorDependencies['verifyProviderGenesis'];
   readonly openSession: typeof openWsProgramSession;
   readonly runStrictScan: WebSocketFailoverSupervisorDependencies['runStrictScan'];
 }
@@ -179,7 +184,6 @@ export class WebSocketFailoverSupervisor {
   #recoveryRequested = false;
   #reporterFailureObserved = false;
   #activeFailurePromise: Promise<void> | null = null;
-  #terminalCleanupPromise: Promise<void> | null = null;
   #transitionActive = false;
   readonly #transitionWaiters: (() => void)[] = [];
   #shutdownResourceFailed = false;
@@ -422,14 +426,31 @@ export class WebSocketFailoverSupervisor {
     const prepared = await this.#prepareCandidate(providerId, recoveryReason);
     if (prepared === null || this.#isPermanentlyClosed()) return abortedAttempt();
     const { ownerGeneration, sessionGeneration } = prepared;
+    const controller = new AbortController();
+    this.#candidateAbort = controller;
+    try {
+      await this.#dependencies.verifyProviderGenesis(providerId, controller.signal);
+    } catch (error) {
+      const stopped = this.#isPermanentlyClosed() || controller.signal.aborted;
+      controller.abort();
+      if (this.#candidateAbort === controller) this.#candidateAbort = null;
+      return stopped ? abortedAttempt() : attemptFailureFrom(error);
+    }
+    if (this.#isPermanentlyClosed() || this.#candidateAbort !== controller
+      || controller.signal.aborted) {
+      controller.abort();
+      if (this.#candidateAbort === controller) this.#candidateAbort = null;
+      return abortedAttempt();
+    }
     let endpoint: RpcProviderPair;
     try {
       endpoint = providerPairFrom(this.#dependencies.providers.resolve(providerId), providerId);
     } catch (error) {
-      return attemptFailureFrom(error);
+      const stopped = this.#isPermanentlyClosed() || controller.signal.aborted;
+      controller.abort();
+      if (this.#candidateAbort === controller) this.#candidateAbort = null;
+      return stopped ? abortedAttempt() : attemptFailureFrom(error);
     }
-    const controller = new AbortController();
-    this.#candidateAbort = controller;
     let openedSession: WsProgramSession | null = null;
     let opened: WsProgramSession;
     try {
@@ -545,8 +566,7 @@ export class WebSocketFailoverSupervisor {
           ? abortedAttempt()
           : cleaned ? strictScanFailureFrom(error, candidate) : cleanupFailureAttempt();
       }
-      if (this.#candidate !== candidate || this.#isPermanentlyClosed()
-        || controller.signal.aborted) {
+      if (this.#candidate !== candidate || this.#isPermanentlyClosed()) {
         const result = completionAttemptFailure(candidate);
         const cleaned = await this.#cleanupCandidate(candidate);
         return this.#isPermanentlyClosed()
@@ -764,19 +784,25 @@ export class WebSocketFailoverSupervisor {
       try { await activeFailure; } catch { /* terminal transition remains authoritative */ }
       if (this.#isPermanentlyClosed()) return;
     }
+    this.#currentProviderId = null;
+    try {
+      const selectedProviderId = this.#dependencies.promoted.activeProviderId();
+      if (selectedProviderId !== null) this.#dependencies.promoted.clear(selectedProviderId);
+    } catch {
+      this.#shutdownResourceFailed = true;
+    }
     const incumbent = this.#incumbent;
-    if (incumbent?.completed === true) {
+    if (incumbent !== null) {
       this.#incumbent = null;
+      incumbent.controller.abort();
       try {
         await this.#closeSession(incumbent);
       } catch {
-        // The fixed UNRECOVERABLE fence still prevents publication and retries.
+        this.#shutdownResourceFailed = true;
       }
     }
+    if (this.#isPermanentlyClosed()) return;
     const active = this.#activeTransitionFields();
-    const selectedProviderId = this.#dependencies.promoted.activeProviderId();
-    this.#currentProviderId = null;
-    if (selectedProviderId !== null) this.#dependencies.promoted.clear(selectedProviderId);
     try {
       await this.#transition({
         phase: 'UNRECOVERABLE',
@@ -835,7 +861,7 @@ export class WebSocketFailoverSupervisor {
     controller: AbortController,
     openedSession: WsProgramSession | null,
   ): Promise<void> {
-    if (this.#permanentlyClosed) return Promise.resolve();
+    if (this.#permanentlyClosed || this.#unrecoverable) return Promise.resolve();
     if (openedSession === null) {
       if (this.#candidateAbort !== controller) return Promise.resolve();
     } else {
@@ -893,10 +919,7 @@ export class WebSocketFailoverSupervisor {
       return;
     }
     if (this.#incumbent === record) {
-      if (this.#unrecoverable) {
-        this.#detachUnrecoverableIncumbent(record);
-        return;
-      }
+      if (this.#unrecoverable) return;
       this.#currentState = 'DEGRADED';
       if (this.#activeFailurePromise !== null) return;
       const operation = this.#degradeIncumbent(record, reason);
@@ -910,22 +933,6 @@ export class WebSocketFailoverSupervisor {
         },
       );
     }
-  }
-
-  #detachUnrecoverableIncumbent(record: SessionRecord): void {
-    if (this.#incumbent === record) this.#incumbent = null;
-    record.controller.abort();
-    const operation = this.#closeSession(record);
-    this.#terminalCleanupPromise = operation;
-    void operation.then(
-      () => { this.#finishTerminalCleanup(operation, false); },
-      () => { this.#finishTerminalCleanup(operation, true); },
-    );
-  }
-
-  #finishTerminalCleanup(operation: Promise<void>, failed: boolean): void {
-    if (this.#terminalCleanupPromise === operation) this.#terminalCleanupPromise = null;
-    if (failed) this.#shutdownResourceFailed = true;
   }
 
   #invalidateCandidate(record: SessionRecord): void {
@@ -1223,7 +1230,6 @@ export class WebSocketFailoverSupervisor {
       this.#loopPromise,
       this.#periodicPromise,
       this.#activeFailurePromise,
-      this.#terminalCleanupPromise,
     ]) {
       if (pending !== null) operations.push(pending);
     }
@@ -1247,6 +1253,7 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     'health',
     'reporter',
     'promoted',
+    'verifyProviderGenesis',
     'openSession',
     'runStrictScan',
   ]);
@@ -1254,6 +1261,7 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
   const healthValue = dependencies.health;
   const reporterValue = dependencies.reporter;
   const promotedValue = dependencies.promoted;
+  const verifyProviderGenesis = dependencies.verifyProviderGenesis;
   const openSession = dependencies.openSession;
   const runStrictScan = dependencies.runStrictScan;
   if (!objectValue(providersValue)
@@ -1262,6 +1270,8 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     || isProxy(reporterValue)
     || !(promotedValue instanceof PromotedProviderSelector)
     || isProxy(promotedValue)
+    || typeof verifyProviderGenesis !== 'function'
+    || isProxy(verifyProviderGenesis)
     || typeof openSession !== 'function'
     || isProxy(openSession)
     || typeof runStrictScan !== 'function'
@@ -1355,6 +1365,23 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
         return Reflect.apply(activeProviderId, promotedValue, []);
       },
     }),
+    verifyProviderGenesis(providerId: RpcProviderId, signal: AbortSignal): Promise<void> {
+      try {
+        const result: unknown = Reflect.apply(verifyProviderGenesis, dependencyReceiver, [
+          providerId,
+          signal,
+        ]);
+        if (!nativePromise(result)) return Promise.reject(configurationError());
+        return Reflect.apply(PROMISE_THEN, result, [
+          (value: unknown): void => {
+            if (value !== undefined) throw configurationError();
+          },
+          (error: unknown): never => { throw error; },
+        ]);
+      } catch {
+        return Promise.reject(configurationError());
+      }
+    },
     openSession(
       endpoint: Parameters<typeof openWsProgramSession>[0],
       observeNotification: Parameters<typeof openWsProgramSession>[1],

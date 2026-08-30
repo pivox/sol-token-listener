@@ -155,6 +155,52 @@ void test('rotation gives every acknowledged provider one strict scan and cleans
   assert.equal(fixture.supervisor.state(), 'DEGRADED');
 });
 
+void test('genesis mismatch and unavailability rotate before any websocket open or strict scan', async () => {
+  const providerIds = Object.freeze(['primary', 'fallback-1'] as const);
+  const fixture = supervisorFixture({
+    providerIds,
+    random: () => 0,
+    genesisResults: [
+      rejected(new Error('GENESIS_MISMATCH')),
+      rejected(new Error('GENESIS_UNAVAILABLE')),
+    ],
+  });
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.deepEqual(
+    fixture.calls.filter((call) => call.startsWith('genesis.verify:')),
+    ['genesis.verify:primary', 'genesis.verify:fallback-1'],
+  );
+  assert.equal(fixture.openedAttempts.length, 0);
+  assert.equal(fixture.strictCalls.length, 0);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+});
+
+void test('shutdown aborts an in-flight genesis preflight without opening a websocket', async () => {
+  const verification = deferred<undefined>();
+  const fixture = supervisorFixture({ genesisResults: [verification.promise] });
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushMicrotasks();
+  assert.equal(fixture.genesisSignals.length, 1);
+  assert.equal(fixture.genesisSignals[0]?.aborted, false);
+
+  const closing = fixture.supervisor.close();
+  await flushMicrotasks();
+  assert.equal(fixture.genesisSignals[0]?.aborted, true);
+  verification.resolve(undefined);
+  await closing;
+
+  assert.equal(fixture.openedAttempts.length, 0);
+  assert.equal(fixture.strictCalls.length, 0);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+});
+
 void test('same-frontier exhaustion becomes durable unrecoverable without any timer', async () => {
   const providerIds = Object.freeze(['primary', 'fallback-1'] as const);
   const sessions = providerIds.map((providerId) => controlledSession(providerId));
@@ -185,7 +231,7 @@ void test('same-frontier exhaustion becomes durable unrecoverable without any ti
   assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
 });
 
-void test('live incumbent completion after unrecoverable only detaches and closes the session', async () => {
+void test('unrecoverable fences notifications and closes a live incumbent before publication', async () => {
   const terminalClose = deferred<undefined>();
   const incumbent = controlledSession('primary', terminalClose.promise);
   const candidate = controlledSession('primary');
@@ -209,9 +255,26 @@ void test('live incumbent completion after unrecoverable only detaches and close
   await flushLifecycle();
   fixture.scheduler.fireNext(0);
   await flushLifecycle();
-  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'UNRECOVERABLE');
-  assert.equal(incumbent.closeCalls(), 0);
+  assert.notEqual(fixture.reporter.transitions.at(-1)?.phase, 'UNRECOVERABLE');
+  assert.equal(incumbent.closeCalls(), 1);
   assert.equal(candidate.closeCalls(), 1);
+  assert.equal(fixture.openedAttempts[0]?.signal.aborted, true);
+  const incumbentObserve = fixture.openedAttempts[0]?.observe;
+  assert.ok(incumbentObserve !== undefined);
+  await incumbentObserve(Object.freeze({
+    endpointId: 'primary',
+    program: 'pumpfun',
+    signature: '1'.repeat(64),
+    slot: 47n,
+  }));
+  assert.equal(fixture.reporter.observations.length, 0);
+
+  terminalClose.resolve(undefined);
+  await flushLifecycle();
+  assert.equal(fixture.reporter.transitions.at(-1)?.phase, 'UNRECOVERABLE');
+  assert.equal(fixture.reporter.transitions.at(-1)?.providerId, null);
+  assert.equal(fixture.reporter.transitions.at(-1)?.activeSessionGeneration, null);
+  assert.equal(fixture.reporter.transitions.at(-1)?.acknowledged, false);
   const transitionCount = fixture.reporter.transitions.length;
   const openCount = fixture.openedAttempts.length;
   const strictCount = fixture.strictCalls.length;
@@ -225,21 +288,89 @@ void test('live incumbent completion after unrecoverable only detaches and close
   assert.equal(fixture.strictCalls.length, strictCount);
   assert.equal(incumbent.closeCalls(), 1);
   assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
-  assert.deepEqual(fixture.scheduler.pendingDelays(), [WS_PROGRAM_SESSION_CLEANUP_TIMEOUT_MS]);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), []);
 
-  const closing = fixture.supervisor.close();
-  let closeSettled = false;
-  void closing.then(
-    () => { closeSettled = true; },
-    () => { closeSettled = true; },
-  );
-  await flushLifecycle();
-  assert.equal(closeSettled, false);
-  terminalClose.resolve(undefined);
-  await closing;
+  await fixture.supervisor.close();
   assert.equal(incumbent.closeCalls(), 1);
   assert.equal(candidate.closeCalls(), 1);
   assert.deepEqual(fixture.scheduler.pendingDelays(), []);
+});
+
+void test('unrecoverable publishes fail-closed after a live incumbent close rejection', async () => {
+  const incumbent = controlledSession('primary', rejected(new Error('secret close failure')));
+  const candidate = controlledSession('primary');
+  const fixture = supervisorFixture({
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    rejected(new StrictCatchUpWindowExceededError(
+      'primary', 'launchpad', strictFrontier('terminal-close-rejected'),
+    )),
+  );
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  const terminal = fixture.reporter.transitions.at(-1);
+  assert.equal(terminal?.phase, 'UNRECOVERABLE');
+  assert.equal(terminal?.providerId, null);
+  assert.equal(terminal?.activeSessionGeneration, null);
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  await assertStage(fixture.supervisor.close(), 'cleanup', 'secret close failure');
+  assert.equal(incumbent.closeCalls(), 1);
+});
+
+void test('shutdown joins an in-flight unrecoverable incumbent close exactly once', async () => {
+  const incumbentClose = deferred<undefined>();
+  const incumbent = controlledSession('primary', incumbentClose.promise);
+  const candidate = controlledSession('primary');
+  const fixture = supervisorFixture({
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    rejected(new StrictCatchUpWindowExceededError(
+      'primary', 'launchpad', strictFrontier('terminal-shutdown'),
+    )),
+  );
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.notEqual(fixture.reporter.transitions.at(-1)?.phase, 'UNRECOVERABLE');
+
+  const closing = fixture.supervisor.close();
+  await flushLifecycle();
+  assert.equal(incumbent.closeCalls(), 1);
+  incumbentClose.resolve(undefined);
+  await closing;
+
+  assert.equal(incumbent.closeCalls(), 1);
+  assert.equal(candidate.closeCalls(), 1);
+  assert.equal(fixture.supervisor.state(), 'STOPPED');
+  assert.equal(fixture.dependencies.promoted.activeProviderId(), null);
 });
 
 void test('unrecoverable waits for an in-flight active degradation before its terminal transition', async () => {
@@ -1266,6 +1397,18 @@ void test('dual ACK forwards a partial notification and promotion follows strict
 
   fixture.scheduler.fireNext(0);
   await flushMicrotasks();
+  assert.deepEqual(fixture.calls.filter((call) => (
+    call === 'health.transition:CONNECTING'
+      || call === 'health.transition:WAITING_FOR_ACKS'
+      || call === 'genesis.verify:primary'
+      || call === 'catalog.resolve:primary'
+      || call === 'session.open:primary'
+  )).slice(-4), [
+    'health.transition:WAITING_FOR_ACKS',
+    'genesis.verify:primary',
+    'catalog.resolve:primary',
+    'session.open:primary',
+  ]);
   assert.deepEqual(fixture.calls.slice(-2), [
     'catalog.resolve:primary',
     'session.open:primary',
@@ -2116,6 +2259,8 @@ void test('constructor rejects hostile options, dependencies, catalog IDs, clock
     hostileProxy,
     { ...validDependencies, extra: hostile },
     { ...validDependencies, providers: invalidCatalog },
+    { ...validDependencies, verifyProviderGenesis: hostile },
+    { ...validDependencies, verifyProviderGenesis: hostileCallable },
     { ...validDependencies, openSession: hostile },
     { ...validDependencies, openSession: hostileCallable },
     { ...validDependencies, runStrictScan: hostile },
@@ -2126,6 +2271,35 @@ void test('constructor rejects hostile options, dependencies, catalog IDs, clock
   assert.equal(callableProxyTraps, 0);
   assert.equal(accessorCalls, 0);
   assert.doesNotThrow(() => new WebSocketFailoverSupervisor(validDependencies, validOptions));
+});
+
+void test('hostile genesis verifier returns stay redacted before websocket setup', async () => {
+  let getterCalls = 0;
+  const hostileThenable = Object.create(null) as object;
+  Object.defineProperty(hostileThenable, 'then', {
+    get() {
+      getterCalls += 1;
+      throw new Error('secret hostile verifier then');
+    },
+  });
+  for (const result of [hostileThenable, Promise.resolve('wrong')]) {
+    const fixture = supervisorFixture({ random: () => 0 });
+    const supervisor = new WebSocketFailoverSupervisor({
+      ...fixture.dependencies,
+      verifyProviderGenesis: () => result as never,
+    }, fixture.options);
+
+    await supervisor.start();
+    fixture.scheduler.fireNext(0);
+    await flushLifecycle();
+
+    assert.equal(fixture.openedAttempts.length, 0);
+    assert.equal(fixture.strictCalls.length, 0);
+    assert.equal(supervisor.state(), 'DEGRADED');
+    assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+    await supervisor.close();
+  }
+  assert.equal(getterCalls, 0);
 });
 
 void test('scheduler callables preserve their validated receiver and ignore later replacement', async () => {
@@ -2230,6 +2404,7 @@ interface FixtureOptions {
   readonly sessionResults?: Promise<WsProgramSession>[];
   readonly sessionFactories?: (() => Promise<WsProgramSession>)[];
   readonly resolveFailures?: Error[];
+  readonly genesisResults?: Promise<void>[];
   readonly reporterStopFailure?: Error;
   readonly reporterStopResult?: Promise<undefined>;
   readonly scheduleFailureDelay?: number;
@@ -2245,6 +2420,7 @@ interface SupervisorFixture {
   readonly options: WebSocketFailoverSupervisorOptions;
   readonly strictResults: Promise<StrictCatchUpScanResult>[];
   readonly strictCalls: StrictCall[];
+  readonly genesisSignals: AbortSignal[];
   readonly openSessionDeferred: Deferred<WsProgramSession>;
   readonly completionDeferred: Deferred<WsProgramSessionCompletion>;
   readonly resolveOpenSession: () => void;
@@ -2286,6 +2462,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
   const selector = new RecordingSelector(calls, providerIds);
   const strictResults: Promise<StrictCatchUpScanResult>[] = [];
   const strictCalls: StrictCall[] = [];
+  const genesisSignals: AbortSignal[] = [];
   const openSessionDeferred = deferred<WsProgramSession>();
   const completionDeferred = deferred<WsProgramSessionCompletion>();
   const completion = completionDeferred.promise;
@@ -2323,6 +2500,11 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     }),
     reporter,
     promoted: selector,
+    verifyProviderGenesis(providerId: RpcProviderId, signal: AbortSignal): Promise<void> {
+      calls.push(`genesis.verify:${providerId}`);
+      genesisSignals.push(signal);
+      return settings.genesisResults?.shift() ?? Promise.resolve();
+    },
     openSession,
     runStrictScan(providerId: RpcProviderId, signal: AbortSignal): Promise<StrictCatchUpScanResult> {
       calls.push(`strict.scan:${providerId}`);
@@ -2351,6 +2533,7 @@ function supervisorFixture(settings: FixtureOptions = {}): SupervisorFixture {
     options,
     strictResults,
     strictCalls,
+    genesisSignals,
     openSessionDeferred,
     completionDeferred,
     resolveOpenSession() { openSessionDeferred.resolve(session); },

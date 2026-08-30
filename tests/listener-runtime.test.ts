@@ -92,19 +92,19 @@ void test('rolls back each startup failure in the fixed producer-first shutdown 
     {
       component: 'supervisor' as const,
       stage: 'supervisor-start',
-      expected: ['supervisor.start'],
+      expected: ['supervisor.start', 'supervisor.close'],
     },
     {
       component: 'worker' as const,
       stage: 'worker-start',
-      expected: ['supervisor.start', 'worker.start', 'supervisor.close'],
+      expected: ['supervisor.start', 'worker.start', 'supervisor.close', 'worker.close'],
     },
     {
       component: 'reconciler' as const,
       stage: 'reconciler-start',
       expected: [
         'supervisor.start', 'worker.start', 'reconciler.start',
-        'supervisor.close', 'worker.close',
+        'supervisor.close', 'reconciler.close', 'worker.close',
       ],
     },
     {
@@ -112,7 +112,7 @@ void test('rolls back each startup failure in the fixed producer-first shutdown 
       stage: 'paper-worker-start',
       expected: [
         'supervisor.start', 'worker.start', 'reconciler.start', 'paperWorker.start',
-        'supervisor.close', 'reconciler.close', 'worker.close',
+        'supervisor.close', 'paperWorker.close', 'reconciler.close', 'worker.close',
       ],
     },
     {
@@ -121,7 +121,7 @@ void test('rolls back each startup failure in the fixed producer-first shutdown 
       expected: [
         'supervisor.start', 'worker.start', 'reconciler.start', 'paperWorker.start',
         'socialWorker.start', 'supervisor.close', 'paperWorker.close',
-        'reconciler.close', 'worker.close',
+        'socialWorker.close', 'reconciler.close', 'worker.close',
       ],
     },
     {
@@ -131,6 +131,7 @@ void test('rolls back each startup failure in the fixed producer-first shutdown 
         'supervisor.start', 'worker.start', 'reconciler.start', 'paperWorker.start',
         'socialWorker.start', 'heartbeat.start', 'supervisor.close',
         'paperWorker.close', 'socialWorker.close', 'reconciler.close', 'worker.close',
+        'heartbeat.stop:STOPPED',
       ],
     },
   ];
@@ -256,26 +257,126 @@ void test('aggregates fixed close failures and retries only unresolved resources
   assert.equal(runtime.state(), 'STOPPED');
 });
 
-void test('a startup timeout shares the same deadline and never closes resources that did not start', async () => {
+void test('close owns every currently starting component before a late resolution or rejection', async () => {
+  const cases = [
+    { component: 'supervisor' as const, closeCall: 'supervisor.close', next: 'worker.start' },
+    { component: 'worker' as const, closeCall: 'worker.close', next: 'reconciler.start' },
+    { component: 'reconciler' as const, closeCall: 'reconciler.close', next: 'paperWorker.start' },
+    { component: 'paperWorker' as const, closeCall: 'paperWorker.close', next: 'socialWorker.start' },
+    { component: 'socialWorker' as const, closeCall: 'socialWorker.close', next: 'heartbeat.start' },
+    { component: 'heartbeat' as const, closeCall: 'heartbeat.stop:STOPPED', next: null },
+  ];
+
+  for (const scenario of cases) {
+    for (const lateOutcome of ['resolve', 'reject'] as const) {
+      const calls: string[] = [];
+      const deps = dependencies(calls);
+      const pendingStart = deferred<undefined>();
+      deps[scenario.component].start = async () => {
+        calls.push(`${scenario.component}.start`);
+        await pendingStart.promise;
+      };
+      const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 5 });
+      const starting = runtime.start();
+      void starting.catch(() => undefined);
+      for (let index = 0; index < 16 && !calls.includes(`${scenario.component}.start`); index += 1) {
+        await Promise.resolve();
+      }
+      assert.ok(calls.includes(`${scenario.component}.start`), scenario.component);
+
+      await assert.rejects(runtime.close(), (error: unknown) => {
+        assert.ok(error instanceof ListenerRuntimeError);
+        assert.deepEqual(error.failures, [
+          Object.freeze({ stage: 'startup-timeout', errorName: 'ListenerTimeoutError' }),
+        ]);
+        return true;
+      });
+      assert.equal(
+        calls.filter((call) => call === scenario.closeCall).length,
+        1,
+        `${scenario.component}:${lateOutcome}:cleanup`,
+      );
+      assert.equal(runtime.state(), 'DEGRADED');
+
+      if (lateOutcome === 'resolve') pendingStart.resolve(undefined);
+      else pendingStart.reject(new Error(`private-${scenario.component}`));
+      await assert.rejects(starting, ListenerRuntimeError);
+      await Promise.resolve();
+
+      assert.equal(
+        calls.filter((call) => call === scenario.closeCall).length,
+        1,
+        `${scenario.component}:${lateOutcome}:late`,
+      );
+      if (scenario.next !== null) assert.equal(calls.includes(scenario.next), false);
+      assert.notEqual(runtime.state(), 'RUNNING');
+    }
+  }
+});
+
+void test('coalesces close with startup rollback while a resource cleanup is pending', async () => {
   const calls: string[] = [];
   const deps = dependencies(calls);
+  const pendingStart = deferred<undefined>();
+  const pendingClose = deferred<undefined>();
   deps.supervisor.start = async () => {
     calls.push('supervisor.start');
-    await new Promise<void>(() => undefined);
+    await pendingStart.promise;
   };
-  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 5 });
-  void runtime.start().catch(() => undefined);
+  deps.supervisor.close = async () => {
+    calls.push('supervisor.close');
+    await pendingClose.promise;
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+  const starting = runtime.start();
+  void starting.catch(() => undefined);
+  pendingStart.reject(new Error('private-start'));
+  for (let index = 0; index < 8 && !calls.includes('supervisor.close'); index += 1) {
+    await Promise.resolve();
+  }
+  assert.deepEqual(calls, ['supervisor.start', 'supervisor.close']);
+
+  const closing = runtime.close();
   await Promise.resolve();
+  assert.equal(calls.filter((call) => call === 'supervisor.close').length, 1);
+  pendingClose.resolve(undefined);
+
+  await assert.rejects(starting, ListenerRuntimeError);
+  await closing;
+  assert.equal(calls.filter((call) => call === 'supervisor.close').length, 1);
+  assert.equal(runtime.state(), 'STOPPED');
+});
+
+void test('publishes the close fence before a synchronous reentrant dependency failure', async () => {
+  const calls: string[] = [];
+  const deps = dependencies(calls);
+  let supervisorCloses = 0;
+  deps.supervisor.close = () => {
+    calls.push('supervisor.close');
+    supervisorCloses += 1;
+    if (supervisorCloses === 1) {
+      void runtime.close().catch(() => undefined);
+      throw new Error('private-sync-close');
+    }
+    return Promise.resolve();
+  };
+  const runtime = new SolanaListenerRuntime(deps, { shutdownTimeoutMs: 100 });
+  await runtime.start();
+  calls.length = 0;
 
   await assert.rejects(runtime.close(), (error: unknown) => {
     assert.ok(error instanceof ListenerRuntimeError);
     assert.deepEqual(error.failures, [
-      Object.freeze({ stage: 'startup-timeout', errorName: 'ListenerTimeoutError' }),
+      Object.freeze({ stage: 'supervisor-close', errorName: 'ListenerDependencyError' }),
     ]);
     return true;
   });
-  assert.deepEqual(calls, ['supervisor.start']);
+  assert.equal(supervisorCloses, 1);
   assert.equal(runtime.state(), 'DEGRADED');
+
+  await runtime.close();
+  assert.equal(supervisorCloses, 2);
+  assert.equal(runtime.state(), 'STOPPED');
 });
 
 void test('validates shutdown bounds and returns STOPPED projections before startup', () => {
@@ -333,14 +434,23 @@ function dependencies(calls: string[]): ListenerRuntimeDependencies {
 function deferred<T>(): {
   readonly promise: Promise<T>;
   readonly resolve: (value?: T | PromiseLike<T>) => void;
+  readonly reject: (reason?: unknown) => void;
 } {
   let resolvePromise: ((value: T | PromiseLike<T>) => void) | undefined;
-  const promise = new Promise<T>((resolve) => { resolvePromise = resolve; });
+  let rejectPromise: ((reason?: unknown) => void) | undefined;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
   return {
     promise,
     resolve(value) {
       if (resolvePromise === undefined) throw new Error('Deferred is unavailable.');
       resolvePromise(value as T | PromiseLike<T>);
+    },
+    reject(reason) {
+      if (rejectPromise === undefined) throw new Error('Deferred is unavailable.');
+      rejectPromise(reason);
     },
   };
 }

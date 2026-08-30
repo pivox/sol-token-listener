@@ -132,15 +132,25 @@ export function createProductionListenerRuntime(
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
     },
   );
+  const pinnedCatchUpSources = new Map(
+    providers.ids.map((providerId) => {
+      const source = createProviderPinnedCatchUpSource(
+        providers,
+        providerId,
+        'confirmed',
+        expectedGenesisHash,
+      );
+      return [providerId, source] as const;
+    }),
+  );
   const strictCoordinators = new Map<RpcProviderId, StrictCatchUpCoordinator>(
     providers.ids.map((providerId) => {
+      const source = pinnedCatchUpSources.get(providerId);
+      if (source === undefined) {
+        throw new TypeError('Provider-pinned catch-up source is unavailable.');
+      }
       const scanner = new StrictCatchUpScanner(
-        createProviderPinnedCatchUpSource(
-          providers,
-          providerId,
-          'confirmed',
-          expectedGenesisHash,
-        ),
+        source,
         inbox,
         {
           pageSize: config.listenerCatchUpPageSize,
@@ -159,6 +169,13 @@ export function createProductionListenerRuntime(
       health: websocketHealth,
       reporter: websocketReporter,
       promoted,
+      verifyProviderGenesis: (providerId, signal): Promise<void> => {
+        const source = pinnedCatchUpSources.get(providerId);
+        if (source === undefined) {
+          return Promise.reject(new TypeError('Provider-pinned catch-up source is unavailable.'));
+        }
+        return source.verifyGenesis(signal);
+      },
       openSession: openWsProgramSession,
       runStrictScan: (providerId, signal): ReturnType<StrictCatchUpCoordinator['run']> => {
         const coordinator = strictCoordinators.get(providerId);

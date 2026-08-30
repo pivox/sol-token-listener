@@ -91,6 +91,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
   private startPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
   private readonly activeResources = new Set<ActiveRuntimeResource>();
+  private readonly closingResources = new Map<ActiveRuntimeResource, Promise<void>>();
   private started = false;
   private permanentlyClosed = false;
 
@@ -206,8 +207,10 @@ export class SolanaListenerRuntime implements ListenerRuntime {
       this.currentState = 'RUNNING';
     } catch {
       const failures: ListenerRuntimeFailure[] = [failure(stage)];
-      const deadlineMs = Date.now() + this.options.shutdownTimeoutMs;
-      await this.cleanupActive(deadlineMs, failures);
+      if (!this.permanentlyClosed) {
+        const deadlineMs = Date.now() + this.options.shutdownTimeoutMs;
+        await this.cleanupActive(deadlineMs, failures);
+      }
       this.started = false;
       this.currentState = 'DEGRADED';
       throw new ListenerRuntimeError(failures);
@@ -215,9 +218,9 @@ export class SolanaListenerRuntime implements ListenerRuntime {
   }
 
   private async startComponent(resource: ActiveRuntimeResource): Promise<void> {
+    this.activeResources.add(resource);
     if (resource === 'heartbeat') await this.dependencies.heartbeat.start();
     else await this.dependencies[resource].start();
-    this.activeResources.add(resource);
     this.assertStartOpen();
   }
 
@@ -225,11 +228,11 @@ export class SolanaListenerRuntime implements ListenerRuntime {
     const deadlineMs = Date.now() + this.options.shutdownTimeoutMs;
     const failures: ListenerRuntimeFailure[] = [];
     const starting = this.startPromise;
+    await this.cleanupActive(deadlineMs, failures);
     if (starting !== null) {
       const startupResult = await settleUntil(starting, deadlineMs);
       if (startupResult === 'timeout') failures.push(timeoutFailure('startup-timeout'));
     }
-    await this.cleanupActive(deadlineMs, failures);
     this.started = false;
     this.currentState = failures.length === 0 ? 'STOPPED' : 'DEGRADED';
     if (failures.length > 0) throw new ListenerRuntimeError(failures);
@@ -241,7 +244,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
   ): Promise<void> {
     for (const resource of CLEANUP_ORDER) {
       if (!this.activeResources.has(resource)) continue;
-      const result = await settleUntil(this.closeResource(resource), deadlineMs);
+      const result = await settleUntil(this.closeAttempt(resource), deadlineMs);
       if (result === 'complete') {
         this.activeResources.delete(resource);
         continue;
@@ -256,6 +259,26 @@ export class SolanaListenerRuntime implements ListenerRuntime {
     return invoke(() => resource === 'heartbeat'
       ? this.dependencies.heartbeat.stop('STOPPED')
       : this.dependencies[resource].close());
+  }
+
+  private closeAttempt(resource: ActiveRuntimeResource): Promise<void> {
+    const pending = this.closingResources.get(resource);
+    if (pending !== undefined) return pending;
+    const operation = Promise.resolve().then(() => this.closeResource(resource));
+    this.closingResources.set(resource, operation);
+    void operation.then(
+      () => {
+        if (this.closingResources.get(resource) !== operation) return;
+        this.closingResources.delete(resource);
+        this.activeResources.delete(resource);
+      },
+      () => {
+        if (this.closingResources.get(resource) === operation) {
+          this.closingResources.delete(resource);
+        }
+      },
+    );
+    return operation;
   }
 
   private componentStates(): readonly ListenerRuntimeState[] {

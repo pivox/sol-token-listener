@@ -921,6 +921,9 @@ function assertProductionCatchUpWiring(source: string): void {
     /\b(?:CatchUpScanner|StartupScanner|SolanaCatchUpSource|SolanaProgramSubscriber)\b/u,
   );
   assert.match(source, /new WebSocketFailoverSupervisor\(/u);
+  assert.match(source, /pinnedCatchUpSources/u);
+  assert.match(source, /verifyProviderGenesis:/u);
+  assert.match(source, /source\.verifyGenesis\(signal\)/u);
   assert.match(source, /runStrictScan:/u);
   assert.match(source, /openSession:\s*openWsProgramSession/u);
 }
