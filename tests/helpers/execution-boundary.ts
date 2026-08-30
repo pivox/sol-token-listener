@@ -218,7 +218,9 @@ function isVettedComputedMemberCall(node: ts.CallExpression): boolean {
 
 function isAsyncIteratorCall(node: ts.CallExpression, member: ts.ElementAccessExpression): boolean {
   const argument = member.argumentExpression;
-  return node.questionDotToken === undefined
+  return member.questionDotToken === undefined
+    && node.questionDotToken === undefined
+    && node.typeArguments === undefined
     && node.arguments.length === 0
     && ts.isIdentifier(member.expression)
     && member.expression.text === 'body'
@@ -235,7 +237,9 @@ function isConditionValidatorCall(
 ): boolean {
   const argument = member.argumentExpression;
   const value = node.arguments[0];
-  return node.questionDotToken !== undefined
+  return member.questionDotToken === undefined
+    && node.questionDotToken !== undefined
+    && node.typeArguments === undefined
     && node.arguments.length === 1
     && ts.isIdentifier(member.expression)
     && member.expression.text === validatorName
