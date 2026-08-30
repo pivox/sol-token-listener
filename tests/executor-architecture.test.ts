@@ -226,6 +226,10 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
   assert.match(readme, /ne consomme pas l'intention/iu);
   assert.match(readme, /#51-D[^\n]*quote[^\n]*build[^\n]*simulateTransaction/iu);
   assert.match(readme, /live[^\n]*(?:impossible|inutilisable)/iu);
+  assert.doesNotMatch(readme, /n'existe encore aucun processus executor/iu);
+  assert.doesNotMatch(readme, /#51-C à #51-G[\s\S]{0,160}(?:pas disponibles|indisponibles)/iu);
+  assert.match(readme, /#51-C[^.\n]*livr[^.\n]*dry-run/iu);
+  assert.match(readme, /#51-D à #51-G[^.\n]*ne sont pas livrées/iu);
 
   assert.match(architecture, /### Exécuteur dry-run PostgreSQL non consommant \(#51-C\)/u);
   const executorSection = architecture.slice(

@@ -31,10 +31,11 @@ Un mapper pur sait dériver un draft depuis l'événement canonique
 
 Cette fondation est entièrement inerte : le mapper et le repository ne sont
 composés ni dans le listener, ni dans l'API, ni dans le worker paper. Il
-n'existe encore aucun processus executor, wallet, chargement de clé,
-construction ou simulation de transaction, signature ou envoi. Les capacités
-#51-C à #51-G ne sont donc pas disponibles et les seuls modes exécutables
-restent `observe` et `paper`.
+n'existe aucun wallet, chargement de clé, chemin live, signature ou envoi. Le
+lot #51-C livre désormais un processus executor dry-run PostgreSQL séparé,
+sans construction ni simulation de transaction et sans consommer l'intention.
+#51-D à #51-G ne sont pas livrées et les seuls modes du listener restent
+`observe` et `paper`.
 
 Configuration minimale de la stratégie de création, toujours simulée :
 
