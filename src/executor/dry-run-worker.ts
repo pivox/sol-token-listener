@@ -61,7 +61,15 @@ async function runPass(
     if (!(error instanceof ExecutionDryRunRepositoryError)
       || error.code !== 'COMMIT_OUTCOME_UNKNOWN') throw error;
     if (cancellationRequested(signal)) return 'IDLE';
-    const exact = await dependencies.assessments.findExact(assessment);
+    let exact;
+    try {
+      exact = await dependencies.assessments.findExact(assessment, signal);
+    } catch (recoveryError) {
+      if (recoveryError instanceof ExecutionDryRunRepositoryError
+        && recoveryError.code === 'OPERATION_ABORTED'
+        && cancellationRequested(signal)) return 'IDLE';
+      throw recoveryError;
+    }
     if (exact === null) throw error;
     return 'COMMIT_RECOVERED';
   }

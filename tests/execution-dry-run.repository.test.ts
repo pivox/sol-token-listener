@@ -56,7 +56,7 @@ void test('complete validates and snapshots hostile inputs before connecting', a
       activeSignal(),
     ), 'INVALID_INPUT');
   }
-  await expectCode(repository.findExact(proxy), 'INVALID_INPUT');
+  await expectCode(repository.findExact(proxy, activeSignal()), 'INVALID_INPUT');
   assert.equal(pool.connectCount, 0);
   assert.equal(getterCalls, 0);
   assert.equal(proxyTraps, 0);
@@ -242,7 +242,7 @@ void test('findExact performs one lease-free exact read, returns null, and rejec
   const assessment = createExecutionDryRunAssessment(claim('find').intent);
   const exactClient = new ScriptedClient([result([assessmentRow(assessment, false)], 1)]);
   const exactRepository = new PostgresExecutionDryRunRepository(new ScriptedPool(exactClient));
-  const found = await exactRepository.findExact(assessment);
+  const found = await exactRepository.findExact(assessment, activeSignal());
   assert.deepEqual(found, Object.freeze({ ...assessment, recordedAtMs: NOW_MS }));
   const call = required(exactClient.calls[0]);
   assert.equal(exactClient.calls.length, 1);
@@ -254,7 +254,7 @@ void test('findExact performs one lease-free exact read, returns null, and rejec
   assert.deepEqual(exactClient.releaseErrors, [undefined]);
 
   const missing = new ScriptedClient([result([], 0)]);
-  assert.equal(await new PostgresExecutionDryRunRepository(new ScriptedPool(missing)).findExact(assessment), null);
+  assert.equal(await new PostgresExecutionDryRunRepository(new ScriptedPool(missing)).findExact(assessment, activeSignal()), null);
 
   for (const row of [
     { ...assessmentRow(assessment, false), input_fingerprint: 'f'.repeat(64) },
@@ -263,7 +263,7 @@ void test('findExact performs one lease-free exact read, returns null, and rejec
   ]) {
     const contradictory = new ScriptedClient([result([row], 1)]);
     await expectCode(
-      new PostgresExecutionDryRunRepository(new ScriptedPool(contradictory)).findExact(assessment),
+      new PostgresExecutionDryRunRepository(new ScriptedPool(contradictory)).findExact(assessment, activeSignal()),
       'INVALID_DATA',
     );
     assert.deepEqual(contradictory.releaseErrors, [true]);
@@ -284,7 +284,7 @@ void test('findExact performs one lease-free exact read, returns null, and rejec
   for (const hostile of [accessor, proxy]) {
     const client = new ScriptedClient([result([hostile], 1)]);
     await expectCode(
-      new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment),
+      new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment, activeSignal()),
       'INVALID_DATA',
     );
     assert.deepEqual(client.releaseErrors, [true]);
@@ -302,7 +302,7 @@ void test('findExact rejects another assessment id under the expected logical id
   const client = new ScriptedClient([logicalIdentityResult([conflicting])]);
 
   await expectCode(
-    new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment),
+    new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment, activeSignal()),
     'INVALID_DATA',
   );
   assert.deepEqual(client.releaseErrors, [true]);
@@ -318,7 +318,7 @@ void test('findExact rejects the expected assessment id under another logical id
   const client = new ScriptedClient([logicalIdentityResult([conflicting])]);
 
   await expectCode(
-    new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment),
+    new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment, activeSignal()),
     'INVALID_DATA',
   );
   assert.deepEqual(client.releaseErrors, [true]);
@@ -336,7 +336,7 @@ void test('findExact rejects two rows that split the deterministic and logical i
   const client = new ScriptedClient([logicalIdentityResult([logicalConflict, idConflict])]);
 
   await expectCode(
-    new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment),
+    new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment, activeSignal()),
     'INVALID_DATA',
   );
   assert.deepEqual(client.releaseErrors, [true]);
@@ -346,7 +346,7 @@ void test('findExact evicts on database and cleanup failures with fixed redacted
   const assessment = createExecutionDryRunAssessment(claim('find-failure').intent);
   const queryFailure = new ScriptedClient([() => { throw new Error('query secret'); }]);
   await expectCode(
-    new PostgresExecutionDryRunRepository(new ScriptedPool(queryFailure)).findExact(assessment),
+    new PostgresExecutionDryRunRepository(new ScriptedPool(queryFailure)).findExact(assessment, activeSignal()),
     'DATABASE_FAILURE',
   );
   assert.deepEqual(queryFailure.releaseErrors, [true]);
@@ -355,10 +355,103 @@ void test('findExact evicts on database and cleanup failures with fixed redacted
     () => { throw new Error('cleanup secret'); },
   );
   await expectCode(
-    new PostgresExecutionDryRunRepository(new ScriptedPool(releaseFailure)).findExact(assessment),
+    new PostgresExecutionDryRunRepository(new ScriptedPool(releaseFailure)).findExact(assessment, activeSignal()),
     'DATABASE_FAILURE',
   );
   assert.deepEqual(releaseFailure.releaseErrors, [undefined, true]);
+});
+
+void test('findExact cancellation fences connect without dispatching SQL', async () => {
+  const assessment = createExecutionDryRunAssessment(claim('find-cancel-connect').intent);
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const unusedPool = new ScriptedPool(new ScriptedClient([]));
+
+  await expectCode(
+    new PostgresExecutionDryRunRepository(unusedPool).findExact(assessment, preAborted.signal),
+    'OPERATION_ABORTED',
+  );
+  assert.equal(unusedPool.connectCount, 0);
+
+  const controller = new AbortController();
+  const connectGate = deferred<ScriptedClient>();
+  let connectCount = 0;
+  const pool: ExecutionDryRunPool = {
+    connect: () => { connectCount += 1; return connectGate.promise; },
+  };
+  const client = new ScriptedClient([]);
+  const pending = new PostgresExecutionDryRunRepository(pool).findExact(
+    assessment,
+    controller.signal,
+  );
+
+  await Promise.resolve();
+  assert.equal(connectCount, 1);
+  controller.abort();
+  connectGate.resolve(client);
+
+  await expectCode(pending, 'OPERATION_ABORTED');
+  assert.equal(client.calls.length, 0);
+  assert.deepEqual(client.releaseErrors, [undefined]);
+});
+
+void test('findExact never masks connect, dispatched query or cancellation cleanup failures', async (context) => {
+  const assessment = createExecutionDryRunAssessment(claim('find-cancel-failures').intent);
+
+  await context.test('connect rejection remains a database failure', async () => {
+    const controller = new AbortController();
+    const connectGate = deferred<ScriptedClient>();
+    const pending = new PostgresExecutionDryRunRepository({
+      connect: () => connectGate.promise,
+    }).findExact(assessment, controller.signal);
+    controller.abort();
+    connectGate.reject(new Error('connect secret'));
+    await expectCode(pending, 'DATABASE_FAILURE');
+  });
+
+  await context.test('abort cleanup failure remains a database failure without SQL', async () => {
+    const controller = new AbortController();
+    const connectGate = deferred<ScriptedClient>();
+    const client = new ScriptedClient([], () => { throw new Error('release secret'); });
+    const pending = new PostgresExecutionDryRunRepository({
+      connect: () => connectGate.promise,
+    }).findExact(assessment, controller.signal);
+    controller.abort();
+    connectGate.resolve(client);
+    await expectCode(pending, 'DATABASE_FAILURE');
+    assert.equal(client.calls.length, 0);
+    assert.deepEqual(client.releaseErrors, [undefined, true]);
+  });
+
+  await context.test('dispatched query failure remains a database failure', async () => {
+    const controller = new AbortController();
+    const client = new ScriptedClient([() => {
+      controller.abort();
+      throw new Error('query secret');
+    }]);
+    await expectCode(
+      new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(
+        assessment,
+        controller.signal,
+      ),
+      'DATABASE_FAILURE',
+    );
+    assert.deepEqual(client.releaseErrors, [true]);
+  });
+
+  await context.test('successful dispatched query returns its exact result', async () => {
+    const controller = new AbortController();
+    const client = new ScriptedClient([() => {
+      controller.abort();
+      return result([assessmentRow(assessment, false)], 1);
+    }]);
+    const found = await new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(
+      assessment,
+      controller.signal,
+    );
+    assert.deepEqual(found, Object.freeze({ ...assessment, recordedAtMs: NOW_MS }));
+    assert.deepEqual(client.releaseErrors, [undefined]);
+  });
 });
 
 void test('real PostgreSQL atomically records, releases only the lease, and leaves EXECUTE claimable', async (context) => {
@@ -375,7 +468,7 @@ void test('real PostgreSQL atomically records, releases only the lease, and leav
 
     const recorded = await assessments.complete(claimed, assessment, activeSignal());
 
-    assert.deepEqual(await assessments.findExact(assessment), recorded);
+    assert.deepEqual(await assessments.findExact(assessment, activeSignal()), recorded);
     const after = await parentSnapshot(pool, created.intent.id);
     assert.deepEqual(after.business, before.business);
     assert.deepEqual(after.lease, { lease_owner: null, lease_token: null, lease_expires_at: null });
@@ -437,7 +530,7 @@ void test('real PostgreSQL keeps a conflicting assessment and its lease fail-clo
     await expectCode(
       repository.complete(claimed, assessment, activeSignal()), 'ASSESSMENT_CONFLICT',
     );
-    await expectCode(repository.findExact(assessment), 'INVALID_DATA');
+    await expectCode(repository.findExact(assessment, activeSignal()), 'INVALID_DATA');
     assert.equal((await pool.query(
       'SELECT lease_token::TEXT AS lease_token FROM execution_intents WHERE id=$1', [created.intent.id],
     )).rows[0]?.lease_token, claimed.leaseToken);
@@ -464,16 +557,16 @@ void test('real PostgreSQL exposes deterministic and logical identity contradict
     const idConflict = Object.freeze({ ...other, assessmentId: expected.assessmentId });
 
     await insertAssessment(pool, logicalConflict);
-    await expectCode(repository.findExact(expected), 'INVALID_DATA');
+    await expectCode(repository.findExact(expected, activeSignal()), 'INVALID_DATA');
     await pool.query('DELETE FROM execution_dry_run_assessments');
 
     await insertAssessment(pool, idConflict);
-    await expectCode(repository.findExact(expected), 'INVALID_DATA');
+    await expectCode(repository.findExact(expected, activeSignal()), 'INVALID_DATA');
     await pool.query('DELETE FROM execution_dry_run_assessments');
 
     await insertAssessment(pool, logicalConflict);
     await insertAssessment(pool, idConflict);
-    await expectCode(repository.findExact(expected), 'INVALID_DATA');
+    await expectCode(repository.findExact(expected, activeSignal()), 'INVALID_DATA');
   });
 });
 
@@ -500,7 +593,7 @@ void test('real PostgreSQL rolls back insert when release fails and findExact pr
       repository.complete(rollbackClaim, rollbackAssessment, activeSignal()),
       'COMMIT_OUTCOME_UNKNOWN',
     );
-    assert.equal(await repository.findExact(rollbackAssessment), null);
+    assert.equal(await repository.findExact(rollbackAssessment, activeSignal()), null);
     assert.equal((await pool.query(
       'SELECT lease_token::TEXT AS lease_token FROM execution_intents WHERE id=$1', [rollbackCreated.intent.id],
     )).rows[0]?.lease_token, rollbackClaim.leaseToken);
@@ -513,7 +606,7 @@ void test('real PostgreSQL rolls back insert when release fails and findExact pr
     await expectCode(
       ambiguous.complete(ackClaim, ackAssessment, activeSignal()), 'COMMIT_OUTCOME_UNKNOWN',
     );
-    const exact = await repository.findExact(ackAssessment);
+    const exact = await repository.findExact(ackAssessment, activeSignal());
     assert.ok(exact);
     assert.equal(exact.intentId, ackCreated.intent.id);
   });

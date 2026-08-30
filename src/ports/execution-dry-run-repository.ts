@@ -12,5 +12,6 @@ export interface ExecutionDryRunRepository {
   ) => Promise<ExecutionDryRunAssessmentV1>;
   readonly findExact: (
     assessment: ExecutionDryRunAssessmentDraftV1,
+    signal: AbortSignal,
   ) => Promise<ExecutionDryRunAssessmentV1 | null>;
 }

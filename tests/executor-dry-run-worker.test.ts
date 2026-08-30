@@ -204,10 +204,43 @@ void test('recovers only an exact committed assessment after COMMIT_OUTCOME_UNKN
   const claimed = claim();
   const commitError = new ExecutionDryRunRepositoryError('COMMIT_OUTCOME_UNKNOWN');
   const fake = fakes(claimed, { completeError: commitError, find: 'EXACT' });
+  const signal = activeSignal();
 
-  assert.equal(await createDryRunWorker(fake.dependencies).runOnce(activeSignal()), 'COMMIT_RECOVERED');
+  assert.equal(await createDryRunWorker(fake.dependencies).runOnce(signal), 'COMMIT_RECOVERED');
   assert.equal(fake.findInputs.length, 1);
+  assert.equal(fake.findSignals[0], signal);
   assert.deepEqual(fake.findInputs[0], createExecutionDryRunAssessment(claimed.intent));
+  assertForbiddenCalls(fake);
+});
+
+void test('maps authenticated findExact cancellation to IDLE only after the same signal is aborted', async () => {
+  const controller = new AbortController();
+  const commitError = new ExecutionDryRunRepositoryError('COMMIT_OUTCOME_UNKNOWN');
+  const cancellation = new ExecutionDryRunRepositoryError('OPERATION_ABORTED');
+  const findGate = deferred<ExecutionDryRunAssessmentV1 | null>();
+  const fake = fakes(claim(), { completeError: commitError, findResult: findGate.promise });
+  const pass = createDryRunWorker(fake.dependencies).runOnce(controller.signal);
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(fake.findInputs.length, 1);
+  assert.equal(fake.findSignals[0], controller.signal);
+  controller.abort();
+  findGate.reject(cancellation);
+
+  assert.equal(await pass, 'IDLE');
+  assertForbiddenCalls(fake);
+});
+
+void test('rethrows a constructed findExact cancellation while the signal remains active', async () => {
+  const commitError = new ExecutionDryRunRepositoryError('COMMIT_OUTCOME_UNKNOWN');
+  const cancellation = new ExecutionDryRunRepositoryError('OPERATION_ABORTED');
+  const fake = fakes(claim(), { completeError: commitError, findError: cancellation });
+
+  await assert.rejects(
+    createDryRunWorker(fake.dependencies).runOnce(activeSignal()),
+    (error) => error === cancellation,
+  );
+  assert.equal(fake.findInputs.length, 1);
   assertForbiddenCalls(fake);
 });
 
@@ -350,6 +383,7 @@ function fakes(
     completeResult?: Promise<ExecutionDryRunAssessmentV1>;
     find?: 'EXACT' | 'MISSING';
     findError?: Error;
+    findResult?: Promise<ExecutionDryRunAssessmentV1 | null>;
   }> = {},
 ) {
   const claimOptions: Readonly<{ ownerId: string; leaseMs: number; purpose: string }>[] = [];
@@ -360,6 +394,7 @@ function fakes(
     signal: AbortSignal;
   }>[] = [];
   const findInputs: ReturnType<typeof createExecutionDryRunAssessment>[] = [];
+  const findSignals: AbortSignal[] = [];
   const forbidden = { renew: 0, release: 0, beginAttempt: 0, finishAttempt: 0, transition: 0 };
   const intents = {
     claim: async (
@@ -384,9 +419,11 @@ function fakes(
       if (behavior.completeResult !== undefined) return behavior.completeResult;
       return Object.freeze({ ...assessment, recordedAtMs: 1_000 });
     },
-    findExact: async (assessment) => {
+    findExact: async (assessment, signal) => {
       findInputs.push(assessment);
+      findSignals.push(signal);
       if (behavior.findError !== undefined) return Promise.reject(behavior.findError);
+      if (behavior.findResult !== undefined) return behavior.findResult;
       return behavior.find === 'EXACT'
         ? Object.freeze({ ...assessment, recordedAtMs: 1_000 })
         : null;
@@ -396,7 +433,7 @@ function fakes(
     dependencies: Object.freeze({
       intents, assessments, ownerId: 'executor-dry-run-worker-1', leaseMs: 30_000,
     }),
-    claimOptions, claimSignals, completed, findInputs, forbidden,
+    claimOptions, claimSignals, completed, findInputs, findSignals, forbidden,
   };
 }
 

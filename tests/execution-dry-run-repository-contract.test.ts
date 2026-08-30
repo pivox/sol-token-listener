@@ -39,6 +39,7 @@ interface Surface {
   ) => Promise<ExecutionDryRunAssessmentV1>;
   readonly findExact: (
     assessment: ExecutionDryRunAssessmentDraftV1,
+    signal: AbortSignal,
   ) => Promise<ExecutionDryRunAssessmentV1 | null>;
 }
 
@@ -89,7 +90,9 @@ function compileTimeNegativeAssertions(): void {
     new AbortController().signal,
   );
   // @ts-expect-error sidecar lookup accepts no wallet capability.
-  void repository.findExact({ ...assessment, wallet: 'capability' });
+  void repository.findExact({ ...assessment, wallet: 'capability' }, new AbortController().signal);
+  // @ts-expect-error sidecar lookup requires its trusted cancellation signal.
+  void repository.findExact(assessment);
   // @ts-expect-error sidecar completion accepts only one trusted cancellation signal.
   void repository.complete(claim, assessment, new AbortController().signal, 'extra');
 }

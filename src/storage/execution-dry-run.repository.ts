@@ -225,7 +225,7 @@ export class PostgresExecutionDryRunRepository implements ExecutionDryRunReposit
     } catch {
       throw repositoryError('DATABASE_FAILURE');
     }
-    if (cancellationRequested(signal)) abortBeforeComplete(client);
+    if (cancellationRequested(signal)) abortBeforeQuery(client);
     let result: ExecutionDryRunAssessmentV1 | undefined;
     let primaryFailure: unknown;
     let completed = false;
@@ -256,6 +256,7 @@ export class PostgresExecutionDryRunRepository implements ExecutionDryRunReposit
 
   public async findExact(
     assessmentValue: ExecutionDryRunAssessmentDraftV1,
+    signal: AbortSignal,
   ): Promise<ExecutionDryRunAssessmentV1 | null> {
     let assessment: ExecutionDryRunAssessmentDraftV1;
     try {
@@ -264,12 +265,14 @@ export class PostgresExecutionDryRunRepository implements ExecutionDryRunReposit
       if (isInternalError(error)) throw error;
       throw inputError();
     }
+    if (cancellationRequested(signal)) throw repositoryError('OPERATION_ABORTED');
     let client: ExecutionDryRunClient;
     try {
       client = await this.pool.connect();
     } catch {
       throw repositoryError('DATABASE_FAILURE');
     }
+    if (cancellationRequested(signal)) abortBeforeQuery(client);
     let result: ExecutionDryRunAssessmentV1 | null | undefined;
     let primaryFailure: unknown;
     let completed = false;
@@ -532,7 +535,7 @@ function cancellationRequested(signal: AbortSignal): boolean {
   return signal.aborted;
 }
 
-function abortBeforeComplete(client: ExecutionDryRunClient): never {
+function abortBeforeQuery(client: ExecutionDryRunClient): never {
   try {
     client.release();
   } catch {
