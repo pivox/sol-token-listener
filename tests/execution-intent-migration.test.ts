@@ -7,7 +7,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '031_execution_intents.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
-const paperTableReference = /\bREFERENCES\s+(?:(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*)?(?:"paper_[^"]+"|paper_[a-z0-9_$]*)/iu;
+const paperTableReference = /\bREFERENCES\s+(?:(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*)?(?:"paper_[^"]*"|paper_[a-z0-9_$]*)/iu;
 
 void test('execution intent migration defines the inert durable ledger contract', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
@@ -27,6 +27,26 @@ void test('execution intent migration defines the inert durable ledger contract'
   assert.match(executableSql, /quote_amount_raw NUMERIC,/u);
   assert.match(executableSql, /WHERE status = 'PENDING'/u);
   assert.doesNotMatch(executableSql, /signed_transaction|private_key|keypair/iu);
+});
+
+void test('paper foreign-key guard recognizes executable reference forms without reading prose', () => {
+  for (const reference of [
+    'REFERENCES paper_hidden(id)',
+    'REFERENCES public.paper_hidden(id)',
+    'REFERENCES "paper_" (id)',
+    'REFERENCES "public"."paper_" (id)',
+    'REFERENCES/**/paper_hidden(id)',
+  ]) {
+    assert.match(withoutSqlComments(reference), paperTableReference);
+  }
+  assert.doesNotMatch(
+    withoutSqlComments('-- REFERENCES paper_hidden(id) is forbidden prose'),
+    paperTableReference,
+  );
+  assert.doesNotMatch(
+    withoutSqlComments('/* REFERENCES "paper_" (id) is forbidden prose */'),
+    paperTableReference,
+  );
 });
 
 void test('execution intent migration applies and replays on an isolated schema', async (context) => {
@@ -151,5 +171,5 @@ function quoteIdentifier(value: string): string {
 }
 
 function withoutSqlComments(sql: string): string {
-  return sql.replace(/--[^\r\n]*/gu, '').replace(/\/\*[\s\S]*?\*\//gu, '');
+  return sql.replace(/--[^\r\n]*/gu, ' ').replace(/\/\*[\s\S]*?\*\//gu, ' ');
 }
