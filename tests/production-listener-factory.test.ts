@@ -100,8 +100,6 @@ void test('production factory has no transaction execution or Raydium builder pa
   );
 
   assert.doesNotMatch(source, /(?:sendRawTransaction|sendTransaction|transaction-builder|execution\/wallet|\.\.\/execution\/|raydium)/iu);
-  assert.match(source, /policy: config\.listenerCatchUpPolicy/u);
-  assert.match(source, /listener\.catch_up_gap_recorded/u);
 });
 
 void test('production wires the redacted HTTP RPC failover event sink', async () => {
@@ -120,7 +118,7 @@ void test('production wires the redacted HTTP RPC failover event sink', async ()
   assert.doesNotMatch(sink, /(?:httpRpcUrl|wsRpcUrl|fallbackUrls|endpointUrl|host|provider|key|cause|error)/iu);
 });
 
-void test('production pins finality to one primary provider pass without coupling it to HTTP failover', async () => {
+void test('production binds finality to immutable passes selected by the promoted provider', async () => {
   const factory = await readFile(
     new URL('../src/application/production-listener-factory.ts', import.meta.url),
     'utf8',
@@ -133,52 +131,60 @@ void test('production pins finality to one primary provider pass without couplin
   assert.match(factory, /import\s*\{[^}]*\bcreateRpcProviderCatalog\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/rpc-provider-catalog\.js['"]/u);
   assert.match(factory, /import\s*\{[^}]*\bcreateProviderPinnedFinalityPass\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/provider-pinned-finality-source\.js['"]/u);
   assert.match(factory, /const providers = createRpcProviderCatalog\(config\);/u);
-  assert.match(factory, /const primaryFinality = createProviderPinnedFinalityPass\(providers, 'primary'\);/u);
-  assert.match(factory, /const finalitySource: FinalityProviderPassSource = Object\.freeze\(\{\s*openPass: \(\) => primaryFinality,\s*\}\);/u);
-  assert.match(factory, /new FinalityReconciler\(finalitySource, inbox,/u);
+  assert.match(factory, /providers\.ids\.map\(\(providerId\)[\s\S]*?createProviderPinnedFinalityPass\(providers, providerId\)/u);
+  assert.match(factory, /new PromotedProviderSelector\(/u);
+  assert.match(factory, /new FinalityReconciler\(promoted, inbox,/u);
+  assert.match(factory, /initialFailureMode:\s*'DEGRADED_RETRY'/u);
   assert.match(
     factory,
-    /initialFailureMode:\s*config\.executionMode === 'observe'\s*\? 'DEGRADED_RETRY'\s*:\s*'FAIL_START'/u,
+    /currentProviderId:\s*\(\): RpcProviderId \| null => promoted\.activeProviderId\(\)/u,
   );
   assert.doesNotMatch(factory, /new FinalityReconciler\(rpc, inbox,/u);
   assert.doesNotMatch(pinnedAdapter, /http-failover-transport/u);
 });
 
-void test('keeps the acknowledged WebSocket session foundation inactive until issue 63', async () => {
+void test('activates the acknowledged WebSocket supervisor and strict provider-pinned recovery', async () => {
   const source = await readFile(
     new URL('../src/application/production-listener-factory.ts', import.meta.url),
     'utf8',
   );
 
-  assert.doesNotMatch(source, /ws-program-session/u);
   assertProductionCatchUpWiring(source);
 });
 
-void test('production catch-up wiring guard rejects strict paths, symbols, and barrel references', () => {
-  assert.doesNotThrow(() => { assertProductionCatchUpWiring([
-    "import { CatchUpScanner } from './catch-up-scanner.js';",
-    "import { SolanaProgramSubscriber } from '../solana/rpc/program-subscriber.js';",
-    'const scanner = new CatchUpScanner();',
-    'const subscriber = new SolanaProgramSubscriber();',
-  ].join('\n')); });
+void test('rejects a missing genesis before catalog or PostgreSQL construction', () => {
+  const accesses: string[] = [];
+  const base = parseConfig({
+    SOLANA_HTTP_RPC_URL: 'http://127.0.0.1:8899',
+    SOLANA_WS_RPC_URL: 'ws://127.0.0.1:8900',
+    LISTENER_ENABLED: 'false',
+  });
+  const hostile = new Proxy(base, {
+    get(target, property, receiver) {
+      accesses.push(String(property));
+      if (property !== 'expectedGenesisHash') throw new Error('later construction was reached');
+      return Reflect.get(target, property, receiver);
+    },
+  });
 
-  for (const source of [
-    "import scanner from './strict-catch-up-scanner.js';",
-    "import coordinator from './strict-catch-up-coordinator.js';",
-    "import pinnedSource from '../solana/rpc/provider-pinned-catch-up-source.js';",
-    "import { createProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';",
-    "import { StrictCatchUpScanner } from './strict-catch-up-scanner.js';",
-    "import { StrictCatchUpCoordinator } from './strict-catch-up-coordinator.js';",
-    "import { ProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';",
-    "import { StrictCatchUpScanner } from './application.js';",
-    "import { createProviderPinnedCatchUpSource } from './application.js';",
-    'const scanner = new StrictCatchUpScanner();',
-    'const coordinator = new StrictCatchUpCoordinator();',
-    'const source = ProviderPinnedCatchUpSource;',
-    'const source = createProviderPinnedCatchUpSource();',
-  ]) {
-    assert.throws(() => { assertProductionCatchUpWiring(source); }, /strict catch-up/i);
-  }
+  assert.throws(
+    () => createProductionListenerRuntime(hostile, inertPool as never),
+    /SOLANA_EXPECTED_GENESIS_HASH/u,
+  );
+  assert.deepEqual(accesses, ['expectedGenesisHash']);
+});
+
+void test('production source orders the genesis guard before catalog and database acquisition', async () => {
+  const source = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+  const guard = source.indexOf('const expectedGenesisHash');
+  const catalog = source.indexOf('createRpcProviderCatalog(config)');
+  const database = source.indexOf('getDatabasePool()', guard);
+  assert.ok(guard >= 0);
+  assert.ok(catalog > guard);
+  assert.ok(database > catalog);
 });
 
 void test('production composes one canonical qualification writer before paper decisions', async () => {
@@ -192,7 +198,7 @@ void test('production composes one canonical qualification writer before paper d
   assert.equal(count(source, /new QualificationRebuildService\(/gu), 1);
   assert.equal(count(source, /new PostgresQualificationProjectionRepository\(/gu), 1);
   assert.equal(count(source, /new QualificationProjectionService\(/gu), 1);
-  assert.match(source, /new PostgresQualificationProjectionRepository\(pool,\s*qualificationRebuilder\)/u);
+  assert.match(source, /new PostgresQualificationProjectionRepository\(databasePool,\s*qualificationRebuilder\)/u);
   assert.match(source, /new QualificationProjectionService\([\s\S]*?qualificationRebuilder,[\s\S]*?config\.paperQuoteMintAllowlist[\s\S]*?\)/u);
   assert.match(source,/new SocialQualificationRefreshService\(qualification,paperRepository\)/u);
   assert.match(source, /new PaperDecisionWorker\([\s\S]*?quoteRouter,\s*qualificationRebuilder,/u);
@@ -482,6 +488,70 @@ void test('finality startup degrades without aborting and recovers on a fresh sc
   assert.equal(hasSchedulerWaiterState(scheduler), false);
 });
 
+void test('finality readiness is current only after an unchanged promoted-provider pass', async () => {
+  const scheduler = new ManualScheduler();
+  let provider: 'primary' | 'fallback-1' | null = null;
+  let runs = 0;
+  let gate: ReturnType<typeof deferred<undefined>> | null = null;
+  let rejectNext = false;
+  const recurring = new RecurringFinalityReconciler(
+    {
+      async runOnce() {
+        runs += 1;
+        if (gate !== null) await gate.promise;
+        if (rejectNext) throw new Error('private finality failure');
+      },
+    },
+    {
+      intervalMs: 5,
+      shutdownTimeoutMs: 100,
+      scheduler,
+      initialFailureMode: 'DEGRADED_RETRY',
+      currentProviderId: () => provider,
+    },
+  );
+
+  await recurring.start();
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(recurring.readyProviderId(), null);
+  assert.equal(runs, 0);
+
+  provider = 'primary';
+  let rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await rescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.equal(recurring.readyProviderId(), 'primary');
+  assert.equal(runs, 1);
+
+  gate = deferred<undefined>();
+  rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await Promise.resolve();
+  assert.equal(recurring.readyProviderId(), null);
+  provider = 'fallback-1';
+  gate.resolve(undefined);
+  await rescheduled;
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(recurring.readyProviderId(), null);
+
+  gate = null;
+  rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await rescheduled;
+  assert.equal(recurring.state(), 'RUNNING');
+  assert.equal(recurring.readyProviderId(), 'fallback-1');
+
+  rejectNext = true;
+  rescheduled = scheduler.waitForNextSchedule();
+  scheduler.fireScheduled();
+  await rescheduled;
+  assert.equal(recurring.state(), 'DEGRADED');
+  assert.equal(recurring.readyProviderId(), null);
+  await recurring.close();
+  assert.equal(recurring.readyProviderId(), null);
+});
+
 void test('finality startup fails closed by default without scheduling a retry', async () => {
   const cases: readonly RecurringFinalityOptions[] = [
     { intervalMs: 5, shutdownTimeoutMs: 100, scheduler: new ManualScheduler() },
@@ -663,36 +733,23 @@ function count(source: string, pattern: RegExp): number {
 }
 
 function assertProductionCatchUpWiring(source: string): void {
+  for (const symbol of [
+    'openWsProgramSession',
+    'StrictCatchUpScanner',
+    'StrictCatchUpCoordinator',
+    'createProviderPinnedCatchUpSource',
+    'PersistentWebSocketHealthReporter',
+    'PostgresWebSocketHealthRepository',
+    'WebSocketFailoverSupervisor',
+    'PromotedProviderSelector',
+  ]) assert.match(source, new RegExp(`\\b${symbol}\\b`, 'u'), symbol);
   assert.doesNotMatch(
     source,
-    /\b(?:StrictCatchUpScanner|StrictCatchUpCoordinator|ProviderPinnedCatchUpSource|createProviderPinnedCatchUpSource)\b/u,
-    'Strict catch-up symbols must remain inactive until issue 63.',
+    /\b(?:CatchUpScanner|StartupScanner|SolanaCatchUpSource|SolanaProgramSubscriber)\b/u,
   );
-  assert.doesNotMatch(
-    source,
-    /(?:strict-catch-up-scanner|strict-catch-up-coordinator|provider-pinned-catch-up-source)/u,
-    'Strict catch-up module paths must remain inactive until issue 63.',
-  );
-  assert.doesNotMatch(
-    source,
-    /\b(?:openWsProgramSession|PersistentWebSocketHealthReporter)\b/u,
-    'The acknowledged WebSocket supervisor must remain inactive until issue 63.',
-  );
-  assert.doesNotMatch(
-    source,
-    /(?:ws-program-session|websocket-health-reporter)/u,
-    'Inactive WebSocket supervisor modules must not enter the production graph.',
-  );
-  assert.match(
-    source,
-    /import\s*\{[^}]*\bCatchUpScanner\b[^}]*\}\s*from\s*['"]\.\/catch-up-scanner\.js['"]/u,
-  );
-  assert.match(source, /\bnew\s+CatchUpScanner\s*\(/u);
-  assert.match(
-    source,
-    /import\s*\{[^}]*\bSolanaProgramSubscriber\b[^}]*\}\s*from\s*['"]\.\.\/solana\/rpc\/program-subscriber\.js['"]/u,
-  );
-  assert.match(source, /\bnew\s+SolanaProgramSubscriber\s*\(/u);
+  assert.match(source, /new WebSocketFailoverSupervisor\(/u);
+  assert.match(source, /runStrictScan:/u);
+  assert.match(source, /openSession:\s*openWsProgramSession/u);
 }
 
 function hasSchedulerWaiterState(scheduler: ManualScheduler): boolean {

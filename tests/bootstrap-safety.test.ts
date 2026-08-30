@@ -47,23 +47,31 @@ void test('production qualification import graph has no signing, simulation, or 
   assert.deepEqual(violations, []);
 });
 
-void test('bootstrap leaves the acknowledged WebSocket supervisor inactive until issue 63', async () => {
-  for (const path of [
-    '../src/app.ts',
-    '../src/application/production-listener-factory.ts',
-  ]) {
-    const source = await readFile(new URL(path, import.meta.url), 'utf8');
-    assert.doesNotMatch(
+void test('production bootstrap activates only the acknowledged observational WebSocket graph', async () => {
+  const path = '../src/application/production-listener-factory.ts';
+  const source = await readFile(new URL(path, import.meta.url), 'utf8');
+  for (const symbol of [
+    'openWsProgramSession',
+    'StrictCatchUpScanner',
+    'StrictCatchUpCoordinator',
+    'createProviderPinnedCatchUpSource',
+    'PersistentWebSocketHealthReporter',
+    'PostgresWebSocketHealthRepository',
+    'WebSocketFailoverSupervisor',
+    'PromotedProviderSelector',
+  ]) assert.match(source, new RegExp(`\\b${symbol}\\b`, 'u'), symbol);
+  assert.doesNotMatch(
+    source,
+    /\b(?:CatchUpScanner|StartupScanner|SolanaCatchUpSource|SolanaProgramSubscriber)\b/u,
+  );
+  assert.deepEqual(
+    executionBoundaryViolations(
       source,
-      /\b(?:openWsProgramSession|StrictCatchUpScanner|ProviderPinnedStrictCatchUpSource|PersistentWebSocketHealthReporter)\b/u,
-      path,
-    );
-    assert.doesNotMatch(
-      source,
-      /(?:ws-program-session|strict-catch-up-scanner|provider-pinned-catch-up-source|websocket-health-reporter)/u,
-      path,
-    );
-  }
+      fileURLToPath(new URL(path, import.meta.url)),
+      repositoryRoot,
+    ),
+    [],
+  );
 });
 
 void test('inactive WebSocket health reporter owns no network, provider, runtime, or configuration capability', async () => {

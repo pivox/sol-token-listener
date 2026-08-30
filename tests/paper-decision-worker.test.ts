@@ -831,6 +831,212 @@ void test('wakes active creation sessions once before normal claims when kill sw
   assert.equal(repository.claimCalls, 2);
 });
 
+void test('paper readiness blocks manual wake, clock and claim, then scheduled polling self-resumes', async () => {
+  const scheduler = new ManualScheduler();
+  const repository = new FakeRepository([null]);
+  const services = fakeServices('NOT_ELIGIBLE');
+  let ready = false;
+  const worker = new PaperDecisionWorker(
+    repository, new FakeQuotes(), services.qualification, services.candidates, services.strategy,
+    options({ manualKillSwitch: true, isReady: () => ready }), scheduler,
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind: 'idle' });
+  assert.equal(repository.claimCalls, 0);
+  assert.equal(repository.activeSessionWakeups, 0);
+  assert.equal(repository.mutationCalls, 0);
+  assert.equal(scheduler.nowCalls, 0);
+
+  await worker.start();
+  await scheduler.fireNext();
+  await scheduler.waitForScheduled();
+  assert.equal(repository.claimCalls, 0);
+  ready = true;
+  await scheduler.fireNext();
+  await scheduler.waitForScheduled();
+  assert.equal(repository.activeSessionWakeups, 1);
+  assert.equal(repository.claimCalls, 1);
+  assert.ok(scheduler.nowCalls > 0);
+  await worker.close();
+});
+
+void test('a throwing readiness predicate keeps the scheduled worker degraded until a healthy poll', async () => {
+  const scheduler = new ManualScheduler();
+  const repository = new FakeRepository([null]);
+  const services = fakeServices('NOT_ELIGIBLE');
+  let throws = true;
+  const worker = new PaperDecisionWorker(
+    repository, new FakeQuotes(), services.qualification, services.candidates, services.strategy,
+    options({
+      isReady: () => {
+        if (throws) throw new Error('private readiness failure');
+        return false;
+      },
+    }),
+    scheduler,
+  );
+
+  await worker.start();
+  await scheduler.fireNext();
+  await scheduler.waitForScheduled();
+  assert.equal(worker.state, 'DEGRADED');
+  assert.equal(repository.claimCalls, 0);
+
+  throws = false;
+  await scheduler.fireNext();
+  await scheduler.waitForScheduled();
+  assert.equal(worker.state, 'RUNNING');
+  assert.equal(repository.claimCalls, 0);
+  await worker.close();
+});
+
+void test('observe mode keeps projection claiming active while readiness is false', async () => {
+  const repository = new FakeRepository([claim()]);
+  const services = fakeServices('NOT_ELIGIBLE');
+  const worker = new PaperDecisionWorker(
+    repository, new FakeQuotes(), services.qualification, services.candidates, services.strategy,
+    options({
+      executionMode: 'observe',
+      paperStrategyEnabled: false,
+      isReady: () => false,
+    }),
+    new ManualScheduler(),
+  );
+
+  assert.deepEqual(await worker.runOnce(), { kind: 'completed', jobId: 'paper-job' });
+  assert.equal(repository.claimCalls, 1);
+  assert.equal(repository.completions.length, 1);
+  assert.equal(repository.stages.length, 0);
+});
+
+void test('requires isReady as an own callable data field', () => {
+  const repository = new FakeRepository([null]);
+  const services = fakeServices('NOT_ELIGIBLE');
+  const construct = (candidateOptions: ConstructorParameters<typeof PaperDecisionWorker>[5]): void => {
+    new PaperDecisionWorker(
+      repository, new FakeQuotes(), services.qualification, services.candidates, services.strategy,
+      candidateOptions, new ManualScheduler(),
+    );
+  };
+  const valid = options();
+  const inherited = Object.create(valid) as ConstructorParameters<typeof PaperDecisionWorker>[5];
+  const accessor = { ...valid } as Record<string, unknown>;
+  Object.defineProperty(accessor, 'isReady', { enumerable: true, get: () => () => true });
+
+  assert.doesNotThrow(() => { construct(valid); });
+  assert.throws(() => { construct(inherited); }, TypeError);
+  assert.throws(
+    () => { construct(Object.freeze({ ...valid, isReady: true }) as never); },
+    TypeError,
+  );
+  assert.throws(() => { construct(Object.freeze(accessor) as never); }, TypeError);
+});
+
+void test('losing readiness after snapshot permits only bounded retry bookkeeping', async () => {
+  const repository = new FakeRepository([claim()]);
+  const services = fakeServices('ELIGIBLE');
+  const snapshotGate = deferred<PaperDecisionSnapshot>();
+  repository.loadSnapshot = async () => snapshotGate.promise;
+  let ready = true;
+  const worker = new PaperDecisionWorker(
+    repository, new FakeQuotes(), services.qualification, services.candidates, services.strategy,
+    options({ isReady: () => ready }), new ManualScheduler(),
+  );
+
+  const running = worker.runOnce();
+  await Promise.resolve();
+  ready = false;
+  snapshotGate.resolve(repository.snapshotValue);
+
+  assert.deepEqual(await running, { kind: 'failed', jobId: 'paper-job' });
+  assert.deepEqual(repository.failures.map(({ failure }) => failure), [{
+    code: 'RPC_TRANSIENT', retryable: true, terminalResult: null,
+  }]);
+  assert.equal(repository.stages.length, 0);
+  assert.equal(repository.completions.length, 0);
+  assert.equal(services.candidates.calls.length, 0);
+});
+
+void test('losing readiness after quotes, candidate build, stage or strategy blocks every later paper mutation', async () => {
+  for (const boundary of ['quote', 'candidate', 'stage', 'strategy'] as const) {
+    const operations: string[] = [];
+    const repository = new FakeRepository([claim()], operations);
+    const services = fakeServices('ELIGIBLE', operations);
+    const quotes = new FakeQuotes(operations);
+    services.candidates.beforeCreate = () => { operations.push('candidate'); };
+    let ready = true;
+    const gate = deferred<undefined>();
+    if (boundary === 'quote') quotes.gate = gate.promise;
+    if (boundary === 'candidate') services.candidates.gate = gate.promise;
+    if (boundary === 'stage') repository.stageGate = gate.promise;
+    if (boundary === 'strategy') services.strategy.openGate = gate.promise;
+    const worker = new PaperDecisionWorker(
+      repository, quotes, services.qualification, services.candidates, services.strategy,
+      options({ isReady: () => ready }), new ManualScheduler(),
+    );
+
+    const running = worker.runOnce();
+    await waitForOperation(operations, boundary === 'strategy' ? 'open' : boundary);
+    ready = false;
+    gate.resolve(undefined);
+
+    assert.deepEqual(await running, { kind: 'failed', jobId: 'paper-job' }, boundary);
+    assert.deepEqual(repository.failures.map(({ failure }) => failure), [{
+      code: 'RPC_TRANSIENT', retryable: true, terminalResult: null,
+    }], boundary);
+    assert.equal(repository.completions.length, 0, boundary);
+    if (boundary === 'quote') {
+      assert.equal(quotes.calls, 1);
+      assert.equal(repository.stages.length, 0);
+    }
+    if (boundary === 'candidate') assert.equal(repository.stages.length, 0);
+    if (boundary === 'stage') assert.deepEqual(operations, ['quote', 'quote', 'candidate', 'stage', 'fail']);
+    if (boundary === 'strategy') {
+      assert.deepEqual(operations, ['quote', 'quote', 'candidate', 'stage', 'open', 'fail']);
+    }
+  }
+});
+
+void test('losing readiness during existing-position reconciliation blocks completion', async () => {
+  const operations: string[] = [];
+  const repository = new FakeRepository([claim()], operations);
+  const services = fakeServices('ELIGIBLE', operations);
+  const candidate = tradingCandidate('ELIGIBLE');
+  const session = services.strategy.prepare();
+  assert.ok(session);
+  repository.snapshotValue = snapshot({
+    currentCandidate: candidate,
+    currentDecision: persistedDecision(candidate),
+    currentSession: Object.freeze({
+      ...session,
+      state: 'WAITING_EXTERNAL_BUYS' as const,
+      positionId: 'position',
+    }),
+    activePosition: POSITION,
+  });
+  const gate = deferred<undefined>();
+  services.strategy.reconcileGate = gate.promise;
+  services.strategy.beforeReconcile = () => { operations.push('reconcile'); };
+  let ready = true;
+  const worker = new PaperDecisionWorker(
+    repository, new FakeQuotes(operations), services.qualification,
+    services.candidates, services.strategy,
+    options({ isReady: () => ready }), new ManualScheduler(),
+  );
+
+  const running = worker.runOnce();
+  await waitForOperation(operations, 'reconcile');
+  ready = false;
+  gate.resolve(undefined);
+
+  assert.deepEqual(await running, { kind: 'failed', jobId: 'paper-job' });
+  assert.equal(repository.completions.length, 0);
+  assert.equal(repository.failures.length, 1);
+  assert.deepEqual(repository.failures[0]?.failure, {
+    code: 'RPC_TRANSIENT', retryable: true, terminalResult: null,
+  });
+});
+
 class FakeRepository implements PaperDecisionRepository {
   public readonly stages: PaperDecisionResult[] = [];
   public readonly completions: { readonly result:PaperDecisionResult }[] = [];
@@ -840,6 +1046,11 @@ class FakeRepository implements PaperDecisionRepository {
   public obsoleteCompletions = 0;
   public activeSessionWakeups = 0;
   public claimCalls = 0;
+  public stageGate: Promise<void> = Promise.resolve();
+  public get mutationCalls(): number {
+    return this.activeSessionWakeups + this.stages.length + this.completions.length
+      + this.noopCompletions + this.obsoleteCompletions + this.failures.length;
+  }
   public snapshotValue: PaperDecisionSnapshot = snapshot();
   public constructor(
     private readonly claims: (ClaimedPaperDecisionJob|null)[],
@@ -857,7 +1068,7 @@ class FakeRepository implements PaperDecisionRepository {
   public async renew(): Promise<boolean> { return this.renewResult; }
   public async loadSnapshot(): Promise<PaperDecisionSnapshot> { return this.snapshotValue; }
   public async stageDecision(_job:ClaimedPaperDecisionJob,result:PaperDecisionResult): Promise<void> {
-    this.operations.push('stage'); this.stages.push(result);
+    this.operations.push('stage'); await this.stageGate; this.stages.push(result);
   }
   public async complete(_job:ClaimedPaperDecisionJob,result:PaperDecisionResult): Promise<void> {
     this.operations.push('complete'); this.completions.push({ result });
@@ -879,10 +1090,12 @@ class FakeRepository implements PaperDecisionRepository {
 class FakeQuotes {
   public calls = 0;
   public error: PaperQuoteError|null = null;
+  public gate: Promise<void> = Promise.resolve();
   public constructor(private readonly operations:string[]=[]){ }
   public async quote(request: { readonly side:'BUY'|'SELL'; readonly amountInRaw:bigint }): Promise<PaperExecutionQuote> {
     this.operations.push('quote');
     this.calls += 1;
+    await this.gate;
     if (this.error !== null) throw this.error;
     return request.side === 'BUY'
       ? quote('buy','SOL','MINT',request.amountInRaw,900n,900n)
@@ -913,6 +1126,9 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
   };
   const strategy = {
     openError:null as Error|null,
+    openGate:Promise.resolve() as Promise<void>,
+    reconcileGate:Promise.resolve() as Promise<void>,
+    beforeReconcile:()=>undefined,
     recoverOpenInputs:[] as Readonly<{
       readonly entryDecisionAtMs?:number;
       readonly entryDecisionJobId?:string;
@@ -932,6 +1148,7 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
     },
     async open(input: { readonly session: ReturnType<typeof createPaperStrategySession> }) {
       operations.push('open');
+      await this.openGate;
       if(this.openError!==null)throw this.openError;
       return Object.freeze({
         session:Object.freeze({ ...input.session,state:'WAITING_EXTERNAL_BUYS' as const,positionId:'position' }),
@@ -953,6 +1170,8 @@ function fakeServices(state:'ELIGIBLE'|'NOT_ELIGIBLE', operations: string[] = []
       });
     },
     async reconcile(input: { readonly session:ReturnType<typeof createPaperStrategySession> }) {
+      this.beforeReconcile();
+      await this.reconcileGate;
       return Object.freeze({
         session:input.session,sessionEvent:event('PaperStrategySessionUpdated','evt_session'),
         countedExternalBuys:Object.freeze([]),requestedAction:'NONE' as const,position:POSITION,
@@ -1012,7 +1231,8 @@ function options(overrides: Partial<ConstructorParameters<typeof PaperDecisionWo
     quoteMintAllowlist:Object.freeze(['SOL']),
     slippageBps:100n,externalBuyTarget:10,minimumConfirmation:'confirmed' as const,
     maximumRoundTripLossBps:3_000n,pollIntervalMs:100,leaseMs:10_000,
-    renewalIntervalMs:1_000,shutdownTimeoutMs:100,manualKillSwitch:false,...overrides,
+    renewalIntervalMs:1_000,shutdownTimeoutMs:100,manualKillSwitch:false,
+    isReady:() => true,...overrides,
   });
 }
 
@@ -1175,8 +1395,9 @@ const POSITION: PaperPosition = Object.freeze({
 class ManualScheduler implements PaperDecisionWorkerScheduler {
   readonly #callbacks = new Map<object,()=>void>();
   #waiter:(()=>void)|null=null;
+  public nowCalls = 0;
   public get activeCount():number { return this.#callbacks.size; }
-  public now(): number { return 1_000; }
+  public now(): number { this.nowCalls += 1; return 1_000; }
   public schedule(callback:()=>void,_delayMs:number):object {
     const handle={};this.#callbacks.set(handle,callback);this.#waiter?.();this.#waiter=null;return handle;
   }
@@ -1196,4 +1417,12 @@ function deferred<T>() {
   let resolve!: (value:T)=>void;
   const promise=new Promise<T>((done)=>{resolve=done;});
   return { promise,resolve };
+}
+
+async function waitForOperation(operations: readonly string[], expected: string): Promise<void> {
+  for (let attempt = 0; attempt < 128; attempt += 1) {
+    if (operations.includes(expected)) return;
+    await Promise.resolve();
+  }
+  throw new Error(`Operation ${expected} was not reached.`);
 }

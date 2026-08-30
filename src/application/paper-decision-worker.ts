@@ -45,6 +45,7 @@ export interface PaperDecisionWorkerOptions {
   readonly renewalIntervalMs: number;
   readonly shutdownTimeoutMs: number;
   readonly manualKillSwitch: boolean;
+  readonly isReady: () => boolean;
 }
 
 export interface PaperDecisionWorkerScheduler {
@@ -119,6 +120,8 @@ export class PaperDecisionWorker {
   private started = false;
   private permanentlyClosed = false;
   private activeSessionsWoken = false;
+  private readonly readiness: () => boolean;
+  private readinessFailureGeneration = 0n;
 
   public constructor(
     private readonly repository: PaperDecisionRepository,
@@ -130,6 +133,7 @@ export class PaperDecisionWorker {
     private readonly scheduler: PaperDecisionWorkerScheduler = systemScheduler,
   ) {
     validateOptions(options);
+    this.readiness = readinessFunction(options);
   }
 
   public get state(): ListenerRuntimeState { return this.currentState; }
@@ -164,10 +168,13 @@ export class PaperDecisionWorker {
 
   private async performRunOnce(): Promise<PaperDecisionRunResult> {
     if (this.permanentlyClosed) return Object.freeze({ kind:'closed' as const });
+    if (!this.paperReady()) return Object.freeze({ kind:'idle' as const });
     if (this.options.manualKillSwitch && !this.activeSessionsWoken) {
       try {
+        if (!this.paperReady()) return Object.freeze({ kind:'idle' as const });
         await this.repository.enqueueActiveSessions(this.readNow());
         this.activeSessionsWoken=true;
+        if (!this.paperReady()) return Object.freeze({ kind:'idle' as const });
       } catch {
         this.currentState='DEGRADED';
         throw new PaperDecisionWorkerError('claim');
@@ -175,6 +182,7 @@ export class PaperDecisionWorker {
     }
     let job: ClaimedPaperDecisionJob | null;
     try {
+      if (!this.paperReady()) return Object.freeze({ kind:'idle' as const });
       job=await this.repository.claim({ leaseMs:this.options.leaseMs,nowMs:this.readNow() });
     } catch {
       this.currentState='DEGRADED';
@@ -187,6 +195,7 @@ export class PaperDecisionWorker {
     );
     this.activeLease=lease;
     lease.start();
+    if (!this.paperReady()) return this.readinessLost(job, lease);
 
     let snapshot: PaperDecisionSnapshot;
     try {
@@ -194,12 +203,16 @@ export class PaperDecisionWorker {
     } catch {
       return this.fail(job,lease,'RPC_TRANSIENT',true,null);
     }
+    if (!this.paperReady()) return this.readinessLost(job, lease);
 
     const paperEnabled=this.options.executionMode === 'paper' && this.options.paperStrategyEnabled;
     if (
       paperEnabled
       && snapshot.currentSession !== null
-    ) return this.reconcileExisting(job,lease,snapshot);
+    ) {
+      if (!this.paperReady()) return this.readinessLost(job, lease);
+      return this.reconcileExisting(job,lease,snapshot);
+    }
 
     const persisted=snapshot.currentQualification;
     if (persisted === null) {
@@ -229,24 +242,36 @@ export class PaperDecisionWorker {
     let reverseSellQuote: PaperExecutionQuote | null | undefined;
     let quoteFailure: PaperQuoteError | null = null;
     if (paperEnabled && quoteAsset !== null) {
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       try {
         buyQuote=await this.quotes.quote({
           mint:snapshot.mint,quoteAsset,side:'BUY',
           amountInRaw:this.options.entryQuoteAmountRaw,slippageBps:this.options.slippageBps,
         });
-        reverseSellQuote=await this.quotes.quote({
-          mint:snapshot.mint,quoteAsset,side:'SELL',
-          amountInRaw:buyQuote.minimumAmountOutRaw,slippageBps:this.options.slippageBps,
-        });
       } catch (error: unknown) {
         quoteFailure=error instanceof PaperQuoteError
           ? error
           : new PaperQuoteError('QUOTE_STATE_INCONSISTENT','Paper quote failed.');
-        if (buyQuote === undefined) buyQuote=null;
-        else reverseSellQuote=null;
+        buyQuote=null;
       }
+      if (!this.paperReady()) return this.readinessLost(job, lease);
+      if (buyQuote !== null) {
+        try {
+          reverseSellQuote=await this.quotes.quote({
+            mint:snapshot.mint,quoteAsset,side:'SELL',
+            amountInRaw:buyQuote.minimumAmountOutRaw,slippageBps:this.options.slippageBps,
+          });
+        } catch (error: unknown) {
+          quoteFailure=error instanceof PaperQuoteError
+            ? error
+            : new PaperQuoteError('QUOTE_STATE_INCONSISTENT','Paper quote failed.');
+          reverseSellQuote=null;
+        }
+      }
+      if (!this.paperReady()) return this.readinessLost(job, lease);
     }
     let candidateResult: TradingCandidateResult;
+    if (!this.paperReady()) return this.readinessLost(job, lease);
     try {
       candidateResult=await this.candidates.create({
         snapshot,report:rebuilt.report,reportId:rebuilt.reportId,
@@ -258,6 +283,7 @@ export class PaperDecisionWorker {
     } catch {
       return this.fail(job,lease,'DECISION_INVALID',false,null);
     }
+    if (!this.paperReady()) return this.readinessLost(job, lease);
     const base=decision(rebuilt,candidateResult,null,null,[],'NONE');
     if (quoteFailure !== null) {
       return this.fail(job,lease,'QUOTE_UNAVAILABLE',quoteFailure.retryable,base);
@@ -268,20 +294,25 @@ export class PaperDecisionWorker {
 
     const session=snapshot.currentSession;
     if (session === null || session.state === 'BUY_PENDING') {
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       const pending=session ?? activeStrategy(this.strategy).prepare(candidateResult.candidate, {
         externalBuyTarget:this.options.externalBuyTarget,
         minimumConfirmation:this.options.minimumConfirmation,nowMs:this.readNow(),
       });
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       if (pending === null) return this.complete(job,lease,base);
       const pendingEvent=sessionEvent(pending,rebuilt.event);
       const staged=decision(rebuilt,candidateResult,pending,pendingEvent,[],'OPEN');
       if (!await lease.checkpoint()) return this.leaseLost(job,lease);
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       try {
         await this.repository.stageDecision(job,staged);
       } catch {
         return this.fail(job,lease,'RPC_TRANSIENT',true,staged);
       }
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       if (!await lease.checkpoint()) return this.leaseLost(job,lease);
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       let opened: StrategyResult;
       try {
         opened=await openStrategy(this.strategy, {
@@ -297,6 +328,7 @@ export class PaperDecisionWorker {
         }
         return this.fail(job,lease,'DECISION_INVALID',false,staged);
       }
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       return this.complete(job,lease,decision(
         rebuilt,candidateResult,opened.session,opened.sessionEvent,
         opened.countedExternalBuys,opened.requestedAction,
@@ -310,6 +342,7 @@ export class PaperDecisionWorker {
     lease: PaperLeaseGuard,
     snapshot: PaperDecisionSnapshot,
   ): Promise<PaperDecisionRunResult> {
+    if (!this.paperReady()) return this.readinessLost(job, lease);
     const session=snapshot.currentSession;
     const candidate=snapshot.currentCandidate;
     const decisionSnapshot=snapshot.currentDecision;
@@ -338,6 +371,7 @@ export class PaperDecisionWorker {
       if (session.payloadVersion === 2 && session.state === 'PAPER_CLOSED'
         && snapshot.activePosition?.status === 'PAPER_CLOSED') {
         if (!await lease.checkpoint()) return this.leaseLost(job,lease);
+        if (!this.paperReady()) return this.readinessLost(job, lease);
         let reconciled: StrategyResult;
         try {
           reconciled=await reconcileClosedStrategy(this.strategy,{
@@ -352,6 +386,7 @@ export class PaperDecisionWorker {
           }
           return this.fail(job,lease,'DECISION_INVALID',false,null);
         }
+        if (!this.paperReady()) return this.readinessLost(job, lease);
         return this.complete(job,lease,decision(
           context,candidateResult,reconciled.session,reconciled.sessionEvent,
           reconciled.countedExternalBuys,reconciled.requestedAction,
@@ -383,9 +418,14 @@ export class PaperDecisionWorker {
         context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'OPEN',
       );
       if(!await lease.checkpoint())return this.leaseLost(job,lease);
-      try{await this.repository.stageDecision(job,staged);}
+      if (!this.paperReady()) return this.readinessLost(job, lease);
+      try{
+        await this.repository.stageDecision(job,staged);
+      }
       catch{return this.fail(job,lease,'RPC_TRANSIENT',true,staged);}
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       if(!await lease.checkpoint())return this.leaseLost(job,lease);
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       let opened:StrategyResult;
       try{
         opened=await openStrategy(this.strategy, {
@@ -400,6 +440,7 @@ export class PaperDecisionWorker {
         }
         return this.fail(job,lease,'DECISION_INVALID',false,staged);
       }
+      if (!this.paperReady()) return this.readinessLost(job, lease);
       return this.complete(job,lease,decision(
         context,candidateResult,opened.session,opened.sessionEvent,
         opened.countedExternalBuys,opened.requestedAction,
@@ -412,13 +453,23 @@ export class PaperDecisionWorker {
       return this.fail(job,lease,'DECISION_INVALID',false,terminal);
     }
     let reconciled:StrategyResult;
+    const staged=decision(
+      context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'NONE',
+    );
+    if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
+    if (!this.paperReady()) return this.readinessLost(job, lease);
     try {
-      const staged=decision(
-        context,candidateResult,session,sessionEvent(session,decisionSnapshot.candidateEvent),[],'NONE',
-      );
-      if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
       await this.repository.stageDecision(job,staged);
-      if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
+    } catch (error:unknown) {
+      const retryable=error instanceof PaperQuoteError&&error.retryable;
+      return this.fail(
+        job,lease,retryable?'QUOTE_UNAVAILABLE':'DECISION_INVALID',retryable,null,
+      );
+    }
+    if (!this.paperReady()) return this.readinessLost(job, lease);
+    if (!await lease.checkpoint()) return await this.leaseLost(job,lease);
+    if (!this.paperReady()) return this.readinessLost(job, lease);
+    try {
       if (snapshot.asOfEvent.confirmationStatus === 'orphaned') {
         reconciled=snapshot.asOfEvent.type === 'TokenLaunchDetected'
           || compareCursors(candidate.asOf.cursor,snapshot.asOfEvent.cursor) === 0
@@ -461,6 +512,7 @@ export class PaperDecisionWorker {
         job,lease,retryable?'QUOTE_UNAVAILABLE':'DECISION_INVALID',retryable,null,
       );
     }
+    if (!this.paperReady()) return this.readinessLost(job, lease);
     return this.complete(job,lease,decision(
       context,candidateResult,reconciled.session,reconciled.sessionEvent,
       reconciled.countedExternalBuys,reconciled.requestedAction,
@@ -472,8 +524,12 @@ export class PaperDecisionWorker {
     lease: PaperLeaseGuard,
     value: PaperDecisionResult,
   ): Promise<PaperDecisionRunResult> {
+    if (!this.paperReady()) return this.readinessLost(job, lease);
     if (!await this.finishLease(lease)) return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
-    try { await this.repository.complete(job,value); }
+    if (!this.paperReady()) return this.readinessLost(job, lease);
+    try {
+      await this.repository.complete(job,value);
+    }
     catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
     return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
   }
@@ -482,10 +538,14 @@ export class PaperDecisionWorker {
     job: ClaimedPaperDecisionJob,
     lease: PaperLeaseGuard,
   ): Promise<PaperDecisionRunResult> {
+    if (!this.paperReady()) return this.readinessLost(job, lease);
     if (!await this.finishLease(lease)) {
       return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
     }
-    try { await this.repository.completeNoop(job); }
+    if (!this.paperReady()) return this.readinessLost(job, lease);
+    try {
+      await this.repository.completeNoop(job);
+    }
     catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
     return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
   }
@@ -494,10 +554,14 @@ export class PaperDecisionWorker {
     job: ClaimedPaperDecisionJob,
     lease: PaperLeaseGuard,
   ): Promise<PaperDecisionRunResult> {
+    if (!this.paperReady()) return this.readinessLost(job, lease);
     if (!await this.finishLease(lease)) {
       return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
     }
-    try { await this.repository.completeObsolete(job); }
+    if (!this.paperReady()) return this.readinessLost(job, lease);
+    try {
+      await this.repository.completeObsolete(job);
+    }
     catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('complete'); }
     return Object.freeze({ kind:'completed' as const,jobId:job.jobId });
   }
@@ -509,9 +573,26 @@ export class PaperDecisionWorker {
     retryable: boolean,
     terminalResult: PaperDecisionResult | null,
   ): Promise<PaperDecisionRunResult> {
+    let selectedCode = code;
+    let selectedRetryable = retryable;
+    let selectedTerminalResult = terminalResult;
+    if (!this.paperReady()) {
+      selectedCode = 'RPC_TRANSIENT';
+      selectedRetryable = true;
+      selectedTerminalResult = null;
+    }
     if (!await this.finishLease(lease)) return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
+    if (!this.paperReady()) {
+      selectedCode = 'RPC_TRANSIENT';
+      selectedRetryable = true;
+      selectedTerminalResult = null;
+    }
     try {
-      await this.repository.fail(job,Object.freeze({ code,retryable,terminalResult }));
+      await this.repository.fail(job,Object.freeze({
+        code: selectedCode,
+        retryable: selectedRetryable,
+        terminalResult: selectedTerminalResult,
+      }));
     } catch { this.currentState='DEGRADED';throw new PaperDecisionWorkerError('fail'); }
     return Object.freeze({ kind:'failed' as const,jobId:job.jobId });
   }
@@ -519,6 +600,13 @@ export class PaperDecisionWorker {
   private async leaseLost(job: ClaimedPaperDecisionJob, lease: PaperLeaseGuard): Promise<PaperDecisionRunResult> {
     await this.finishLease(lease);
     return Object.freeze({ kind:'lease-lost' as const,jobId:job.jobId });
+  }
+
+  private readinessLost(
+    job: ClaimedPaperDecisionJob,
+    lease: PaperLeaseGuard,
+  ): Promise<PaperDecisionRunResult> {
+    return this.fail(job, lease, 'RPC_TRANSIENT', true, null);
   }
 
   private async finishLease(lease: PaperLeaseGuard): Promise<boolean> {
@@ -537,7 +625,15 @@ export class PaperDecisionWorker {
   }
 
   private async tick():Promise<void> {
-    try { await this.runOnce(); } catch { this.currentState='DEGRADED'; }
+    const readinessGeneration = this.readinessFailureGeneration;
+    try {
+      await this.runOnce();
+      if (!this.permanentlyClosed
+        && this.started
+        && this.readinessFailureGeneration === readinessGeneration) {
+        this.currentState='RUNNING';
+      }
+    } catch { this.currentState='DEGRADED'; }
     if (!this.permanentlyClosed && this.started) this.scheduleNext(this.options.pollIntervalMs);
   }
 
@@ -555,6 +651,18 @@ export class PaperDecisionWorker {
       this.currentState='DEGRADED';throw new PaperDecisionWorkerError('clock');
     }
     return value;
+  }
+
+  private paperReady(): boolean {
+    if (this.options.executionMode !== 'paper' || !this.options.paperStrategyEnabled) return true;
+    try {
+      const value: unknown = Reflect.apply(this.readiness as () => unknown, undefined, []);
+      return value === true;
+    } catch {
+      this.readinessFailureGeneration += 1n;
+      this.currentState = 'DEGRADED';
+      return false;
+    }
   }
 }
 
@@ -818,6 +926,15 @@ function validateOptions(options:PaperDecisionWorkerOptions):void {
   }
   if(options.renewalIntervalMs>=options.leaseMs)throw new RangeError('Paper lease renewal must precede expiry.');
   if(options.paperStrategyEnabled&&options.executionMode!=='paper')throw new TypeError('Paper strategy requires paper mode.');
+  readinessFunction(options);
+}
+
+function readinessFunction(options: PaperDecisionWorkerOptions): () => boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(options, 'isReady');
+  if (descriptor === undefined || !('value' in descriptor) || typeof descriptor.value !== 'function') {
+    throw new TypeError('Paper decision worker readiness is invalid.');
+  }
+  return descriptor.value as () => boolean;
 }
 
 async function settleWithin(promise:Promise<void>,timeoutMs:number):Promise<boolean>{

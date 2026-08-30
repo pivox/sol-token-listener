@@ -1,5 +1,9 @@
-import type { Commitment, Finality, PublicKey } from '@solana/web3.js';
 import type { AppConfig, ListenerCatchUpPolicy } from '../config/env.js';
+import {
+  requireSolanaGenesisHash,
+  SolanaGenesisHashError,
+} from '../domain/solana-genesis-hash.js';
+import type { RpcProviderId } from '../domain/rpc-provider.js';
 import type {
   CatchUpGap,
   ListenerRuntimeState,
@@ -20,14 +24,13 @@ import { BoundedPublicHttpClient } from '../metadata/bounded-public-http.client.
 import { HttpMetadataProvider } from '../metadata/http-metadata.provider.js';
 import { RpcPumpSwapPoolValidator } from '../markets/pumpswap/pool-validator.js';
 import type { ListenerRuntime } from '../ports/listener-runtime.js';
-import type { FinalityProviderPassSource } from '../ports/finality-provider-pass.js';
 import type { TransactionInboxRepository } from '../ports/transaction-inbox-repository.js';
-import { SolanaCatchUpSource } from '../solana/rpc/catch-up-source.js';
 import { SolanaMarketRpcReader } from '../solana/rpc/market-rpc-reader.js';
-import { SolanaProgramSubscriber } from '../solana/rpc/program-subscriber.js';
+import { createProviderPinnedCatchUpSource } from '../solana/rpc/provider-pinned-catch-up-source.js';
 import { createProviderPinnedFinalityPass } from '../solana/rpc/provider-pinned-finality-source.js';
 import { createRpcProviderCatalog } from '../solana/rpc/rpc-provider-catalog.js';
 import { SolanaRpcClient } from '../solana/rpc/rpc-client.js';
+import { openWsProgramSession } from '../solana/rpc/ws-program-session.js';
 import type { RpcHttpFailoverEvent } from '../solana/rpc/http-failover-transport.js';
 import { SolanaTransactionLocator } from '../solana/rpc/transaction-locator.js';
 import { SolanaWalletFundingEvidenceExtractor } from '../solana/wallet-funding-evidence-extractor.js';
@@ -41,9 +44,9 @@ import { PostgresPaperVenueReader } from '../storage/paper-venue.reader.js';
 import { PostgresQualificationProjectionRepository } from '../storage/qualification-projection.repository.js';
 import { PostgresSocialEvidenceRepository } from '../storage/social-evidence.repository.js';
 import { PostgresTransactionInboxRepository } from '../storage/transaction-inbox.repository.js';
+import { PostgresWebSocketHealthRepository } from '../storage/websocket-health.repository.js';
 import { PostgresWalletEvidenceRepository } from '../storage/wallet-evidence.repository.js';
 import { PostgresWalletGraphRepository } from '../storage/wallet-graph.repository.js';
-import { CatchUpScanner } from './catch-up-scanner.js';
 import { FinalityReconciler } from './finality-reconciler.js';
 import { LaunchParticipantAnalyticsService } from './launch-participant-analytics.service.js';
 import { LaunchpadObservationService } from './launchpad-observation.service.js';
@@ -51,7 +54,12 @@ import { MarketObservationService } from './market-observation.service.js';
 import { ObservedTransactionPipeline } from './observed-transaction-pipeline.js';
 import { PumpSwapObservationPipeline } from './pumpswap-observation-pipeline.js';
 import { SolanaListenerRuntime } from './listener-runtime.js';
+import { PromotedProviderSelector } from './promoted-provider-selector.js';
+import { StrictCatchUpCoordinator } from './strict-catch-up-coordinator.js';
+import { StrictCatchUpScanner } from './strict-catch-up-scanner.js';
 import { TransactionInboxWorker } from './transaction-inbox-worker.js';
+import { WebSocketFailoverSupervisor } from './websocket-failover-supervisor.js';
+import { PersistentWebSocketHealthReporter } from './websocket-health-reporter.js';
 import { WalletEvidenceObservationService } from './wallet-evidence-observation.service.js';
 import { WalletGraphRebuildService } from './wallet-graph-rebuild.service.js';
 import { PublicSocialVerificationProvider } from '../social/public-social-verification.provider.js';
@@ -95,41 +103,89 @@ function logRpcHttpFailoverEvent(event: RpcHttpFailoverEvent): void {
 
 export function createProductionListenerRuntime(
   config: AppConfig,
-  pool: ProductionPool = getDatabasePool(),
+  pool?: ProductionPool,
 ): ListenerRuntime {
+  const expectedGenesisHash = requireSolanaGenesisHash(
+    config.expectedGenesisHash ?? undefined,
+    true,
+  );
+  if (expectedGenesisHash === null) throw new SolanaGenesisHashError();
   const providers = createRpcProviderCatalog(config);
-  const primaryFinality = createProviderPinnedFinalityPass(providers, 'primary');
-  const finalitySource: FinalityProviderPassSource = Object.freeze({
-    openPass: () => primaryFinality,
-  });
+  const databasePool = pool ?? getDatabasePool();
   const rpc = new SolanaRpcClient(config, {
     onHttpFailoverEvent: logRpcHttpFailoverEvent,
   });
-  const inbox = new PostgresTransactionInboxRepository(pool, Object.freeze({
+  const inbox = new PostgresTransactionInboxRepository(databasePool, Object.freeze({
     maxAttempts: config.rpcRetryMaxAttempts,
     baseDelayMs: config.rpcRetryBaseDelayMs,
   }));
   const locator = new SolanaTransactionLocator(rpc);
-  const catchUp = new CatchUpScanner(
-    new SolanaCatchUpSource(catchUpRpc(rpc), config.commitment),
+  const websocketHealth = new PostgresWebSocketHealthRepository(databasePool);
+  const websocketReporter = new PersistentWebSocketHealthReporter(
     inbox,
+    websocketHealth,
     {
-      pageSize: config.listenerCatchUpPageSize,
-      maxPages: config.listenerCatchUpMaxPages,
-      policy: config.listenerCatchUpPolicy,
-      onGap: (gap): void => {
-        logger.warn(
-          catchUpGapLogContext(gap, config.listenerCatchUpPolicy),
-          'Lacune de rattrapage persistée; reprise au bord courant.',
-        );
-      },
+      touchIntervalMs: 5_000,
+      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
     },
   );
-  const scanner = new StartupScanner(catchUp);
-  const subscriber = new SolanaProgramSubscriber(rpc.http, inbox);
+  const strictCoordinators = new Map<RpcProviderId, StrictCatchUpCoordinator>(
+    providers.ids.map((providerId) => {
+      const scanner = new StrictCatchUpScanner(
+        createProviderPinnedCatchUpSource(
+          providers,
+          providerId,
+          'confirmed',
+          expectedGenesisHash,
+        ),
+        inbox,
+        {
+          pageSize: config.listenerCatchUpPageSize,
+          maxPages: config.listenerCatchUpMaxPages,
+        },
+      );
+      return [providerId, new StrictCatchUpCoordinator(scanner)] as const;
+    }),
+  );
+  const promoted = new PromotedProviderSelector(
+    providers.ids.map((providerId) => createProviderPinnedFinalityPass(providers, providerId)),
+  );
+  const supervisor = new WebSocketFailoverSupervisor(
+    {
+      providers,
+      health: websocketHealth,
+      reporter: websocketReporter,
+      promoted,
+      openSession: openWsProgramSession,
+      runStrictScan: (providerId, signal): ReturnType<StrictCatchUpCoordinator['run']> => {
+        const coordinator = strictCoordinators.get(providerId);
+        if (coordinator === undefined) {
+          return Promise.reject(new TypeError('Strict catch-up coordinator is unavailable.'));
+        }
+        return coordinator.run(signal);
+      },
+    },
+    {
+      now: Date.now,
+      random: Math.random,
+      scheduler: listenerScheduler,
+    },
+  );
+  const reconciler = new RecurringFinalityReconciler(
+    new FinalityReconciler(promoted, inbox, {
+      limit: 100,
+      missingPollThreshold: config.listenerFinalityMissingPolls,
+    }),
+    {
+      intervalMs: config.reconcileSeconds * 1_000,
+      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
+      initialFailureMode: 'DEGRADED_RETRY',
+      currentProviderId: (): RpcProviderId | null => promoted.activeProviderId(),
+    },
+  );
 
   const launchpadRepository = new PostgresLaunchpadEventRepository(
-    pool,
+    databasePool,
     config.dataRetentionHours,
     Date.now,
     {
@@ -148,12 +204,14 @@ export function createProductionListenerRuntime(
   const launchpad = new LaunchpadObservationService(pump, launchpadRepository);
   const funding = new WalletEvidenceObservationService(
     new SolanaWalletFundingEvidenceExtractor(),
-    new PostgresWalletEvidenceRepository(pool),
+    new PostgresWalletEvidenceRepository(databasePool),
   );
   const participants = new LaunchParticipantAnalyticsService(
-    new PostgresParticipantAnalyticsRepository(pool),
+    new PostgresParticipantAnalyticsRepository(databasePool),
   );
-  const graph = new WalletGraphRebuildService(new PostgresWalletGraphRepository(pool));
+  const graph = new WalletGraphRebuildService(
+    new PostgresWalletGraphRepository(databasePool),
+  );
 
   const marketRpc = new SolanaMarketRpcReader(rpc.http, config.commitment);
   const feeState = new PumpSwapFeeStateReader(marketRpc);
@@ -165,14 +223,14 @@ export function createProductionListenerRuntime(
     () => undefined,
   );
   const marketService = new MarketObservationService(
-    new PostgresMarketObservationRepository(pool, config.dataRetentionHours),
+    new PostgresMarketObservationRepository(databasePool, config.dataRetentionHours),
   );
   const marketPipeline = new PumpSwapObservationPipeline(pump, market, marketService);
   const qualificationProfile = loadQualificationProfile({
     profilePath: config.qualificationProfilePath,
     minimumScoreOverride: config.qualificationMinimumScore,
   });
-  const paperRepository = new PostgresPaperDecisionRepository(pool, {
+  const paperRepository = new PostgresPaperDecisionRepository(databasePool, {
     maxAttempts: config.paperDecisionRetryMaxAttempts,
     baseDelayMs: config.paperDecisionRetryBaseDelayMs,
     retentionHours: 4,
@@ -180,12 +238,12 @@ export function createProductionListenerRuntime(
   const qualificationEngine = new QualificationEngine(qualificationProfile);
   const qualificationRebuilder = new QualificationRebuildService(qualificationEngine);
   const qualification = new QualificationProjectionService(
-    new PostgresQualificationProjectionRepository(pool, qualificationRebuilder),
+    new PostgresQualificationProjectionRepository(databasePool, qualificationRebuilder),
     qualificationRebuilder,
     config.paperQuoteMintAllowlist,
   );
   const socialWorker = new SocialEnrichmentWorker(
-    new PostgresSocialEvidenceRepository(pool),
+    new PostgresSocialEvidenceRepository(databasePool),
     new HttpMetadataProvider(publicHttp),
     new PublicSocialVerificationProvider(publicHttp),
     new SocialQualificationRefreshService(qualification,paperRepository),
@@ -197,7 +255,7 @@ export function createProductionListenerRuntime(
     },
   );
   const quoteRouter = new CanonicalPaperQuoteRouter(
-    new PostgresPaperVenueReader(() => rpc.getSlot(), pool),
+    new PostgresPaperVenueReader(() => rpc.getSlot(), databasePool),
     new PumpFunPaperQuoteProvider(marketRpc),
     market,
     {
@@ -207,7 +265,7 @@ export function createProductionListenerRuntime(
   );
   const paperTrading = new PaperTradingEngine(
     config,
-    new PostgresPaperTradingRepository(pool),
+    new PostgresPaperTradingRepository(databasePool),
     qualificationProfile,
     qualificationEngine,
   );
@@ -262,6 +320,13 @@ export function createProductionListenerRuntime(
       ),
       shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
       manualKillSwitch: config.creationManualKillSwitch,
+      isReady: (): boolean => {
+        const providerId = promoted.activeProviderId();
+        return supervisor.state() === 'RUNNING'
+          && providerId !== null
+          && reconciler.state() === 'RUNNING'
+          && reconciler.readyProviderId() === providerId;
+      },
     },
   );
   const pipeline = new ObservedTransactionPipeline(
@@ -281,37 +346,21 @@ export function createProductionListenerRuntime(
     renewalIntervalMs: Math.max(1_000, Math.floor(config.listenerWorkerLeaseSeconds * 1_000 / 3)),
     idlePollMs: 1_000,
   });
-  const reconciler = new RecurringFinalityReconciler(
-    new FinalityReconciler(finalitySource, inbox, {
-      limit: 100,
-      missingPollThreshold: config.listenerFinalityMissingPolls,
-    }),
-    {
-      intervalMs: config.reconcileSeconds * 1_000,
-      shutdownTimeoutMs: config.listenerShutdownTimeoutMs,
-      initialFailureMode: config.executionMode === 'observe'
-        ? 'DEGRADED_RETRY'
-        : 'FAIL_START',
-    },
-  );
-  const subscriberComponent = lifecycleComponent(subscriber);
   const workerComponent = lifecycleComponent(worker);
   const socialWorkerComponent = lifecycleComponent(socialWorker);
   const paperWorkerComponent = lifecycleComponent(paperWorker);
   const heartbeat = new PersistentListenerHeartbeat(
     inbox,
     rpc,
-    () => subscriber.state,
-    () => scanner.state(),
+    () => supervisor.state(),
+    () => supervisor.state(),
     () => worker.state,
     () => reconciler.state(),
     { intervalMs: 5_000, shutdownTimeoutMs: config.listenerShutdownTimeoutMs },
   );
 
   return new SolanaListenerRuntime({
-    rpc,
-    scanner,
-    subscriber: subscriberComponent,
+    supervisor,
     worker: workerComponent,
     paperWorker: paperWorkerComponent,
     socialWorker: socialWorkerComponent,
@@ -339,32 +388,6 @@ export function catchUpGapLogContext(
   });
 }
 
-class StartupScanner {
-  private currentState: ListenerRuntimeState = 'STOPPED';
-
-  public constructor(private readonly scanner: CatchUpScanner) {}
-
-  public async scan(): Promise<void> {
-    this.currentState = 'STARTING';
-    try {
-      await this.scanner.scan();
-      this.currentState = 'RUNNING';
-    } catch (error) {
-      this.currentState = 'DEGRADED';
-      throw error;
-    }
-  }
-
-  public close(): Promise<void> {
-    this.currentState = 'STOPPED';
-    return Promise.resolve();
-  }
-
-  public state(): ListenerRuntimeState {
-    return this.currentState;
-  }
-}
-
 export interface ListenerRuntimeScheduler {
   schedule(callback: () => void, delayMs: number): unknown;
   cancel(handle: unknown): void;
@@ -380,6 +403,7 @@ export type InitialFinalityFailureMode = 'FAIL_START' | 'DEGRADED_RETRY';
 
 export interface RecurringFinalityOptions extends RecurringListenerOptions {
   readonly initialFailureMode?: InitialFinalityFailureMode;
+  readonly currentProviderId?: () => RpcProviderId | null;
 }
 
 export class ListenerControllerCloseError extends Error {
@@ -410,6 +434,8 @@ export class RecurringFinalityReconciler {
   private readonly shutdownTimeoutMs: number;
   private readonly scheduler: ListenerRuntimeScheduler;
   private readonly initialFailureMode: InitialFinalityFailureMode;
+  private readonly currentProviderId: (() => RpcProviderId | null) | null;
+  private currentReadyProviderId: RpcProviderId | null = null;
   private timer: unknown = null;
   private inFlight: Promise<unknown> | null = null;
   private closePromise: Promise<void> | null = null;
@@ -429,13 +455,19 @@ export class RecurringFinalityReconciler {
     this.shutdownTimeoutMs = options.shutdownTimeoutMs;
     this.scheduler = options.scheduler ?? listenerScheduler;
     this.initialFailureMode = initialFailureMode;
+    if (options.currentProviderId !== undefined
+      && typeof options.currentProviderId !== 'function') {
+      throw new TypeError('Current finality provider selector is invalid.');
+    }
+    this.currentProviderId = options.currentProviderId ?? null;
   }
 
   public async start(): Promise<void> {
     if (this.closed) return;
     this.currentState = 'STARTING';
+    this.currentReadyProviderId = null;
     try {
-      await this.reconciler.runOnce();
+      await this.runCurrentPass();
       this.currentState = 'RUNNING';
       this.schedule();
     } catch (error) {
@@ -459,12 +491,17 @@ export class RecurringFinalityReconciler {
     return this.currentState;
   }
 
+  public readyProviderId(): RpcProviderId | null {
+    return this.currentReadyProviderId;
+  }
+
   private schedule(): void {
     if (this.closed) return;
     this.timer = this.scheduler.schedule(() => {
       this.timer = null;
       if (this.closed) return;
-      const operation = this.reconciler.runOnce();
+      this.currentReadyProviderId = null;
+      const operation = this.runCurrentPass();
       this.inFlight = operation;
       void operation.then(
         () => {
@@ -476,6 +513,7 @@ export class RecurringFinalityReconciler {
         () => {
           if (this.inFlight === operation) this.inFlight = null;
           if (this.closed) return;
+          this.currentReadyProviderId = null;
           this.currentState = 'DEGRADED';
           this.schedule();
         },
@@ -484,6 +522,7 @@ export class RecurringFinalityReconciler {
   }
 
   private async performClose(): Promise<void> {
+    this.currentReadyProviderId = null;
     const running = this.inFlight;
     if (running !== null) {
       const result = await settleController(running, this.shutdownTimeoutMs);
@@ -493,6 +532,33 @@ export class RecurringFinalityReconciler {
       }
     }
     this.currentState = 'STOPPED';
+  }
+
+  private async runCurrentPass(): Promise<void> {
+    this.currentReadyProviderId = null;
+    if (this.currentProviderId === null) {
+      await this.reconciler.runOnce();
+      return;
+    }
+    const providerId = this.readCurrentProviderId();
+    if (providerId === null) throw new Error('Current finality provider is unavailable.');
+    await this.reconciler.runOnce();
+    if (this.readCurrentProviderId() !== providerId) {
+      throw new Error('Current finality provider changed.');
+    }
+    if (!this.closed) this.currentReadyProviderId = providerId;
+  }
+
+  private readCurrentProviderId(): RpcProviderId | null {
+    try {
+      const providerId: unknown = Reflect.apply(this.currentProviderId as () => unknown, undefined, []);
+      if (providerId === null || providerId === 'primary'
+        || providerId === 'fallback-1' || providerId === 'fallback-2'
+        || providerId === 'fallback-3') return providerId;
+    } catch {
+      // Converted to one fixed provider-unavailable result below.
+    }
+    throw new Error('Current finality provider is unavailable.');
   }
 }
 
@@ -697,23 +763,5 @@ function lifecycleComponent(component: {
     start: () => component.start(),
     close: () => component.close(),
     state: () => component.state,
-  };
-}
-
-function catchUpRpc(rpc: SolanaRpcClient): {
-  getSignaturesForAddress(
-    address: PublicKey,
-    options: { readonly before: string | undefined; readonly limit: number },
-    commitment: Commitment,
-  ): Promise<unknown>;
-} {
-  return {
-    getSignaturesForAddress(address, options, commitment): Promise<unknown> {
-      const request = options.before === undefined
-        ? { limit: options.limit }
-        : { before: options.before, limit: options.limit };
-      const finality: Finality = commitment === 'finalized' ? 'finalized' : 'confirmed';
-      return rpc.http.getSignaturesForAddress(address, request, finality);
-    },
   };
 }
