@@ -231,7 +231,8 @@ void test('transition locks and fences the parent, appends evidence, then update
     updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
-    command('BEGIN'), result([claimRow(draft, 'PENDING')], 1), result([], 1),
+    command('BEGIN'), result([claimRow(draft, 'PENDING')], 1),
+    result([ledgerRow(0)], 1), result([], 1),
     result([updated], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -243,19 +244,19 @@ void test('transition locks and fences the parent, appends evidence, then update
   assert.equal(transitioned.stateRevision, 1n);
   assert.equal(Object.isFrozen(transitioned), true);
   assert.deepEqual(client.calls.map((call) => normalizedCommand(call.text)), [
-    'BEGIN', 'SELECT', 'INSERT', 'UPDATE', 'COMMIT',
+    'BEGIN', 'SELECT', 'UPDATE', 'INSERT', 'UPDATE', 'COMMIT',
   ]);
   const locked = required(client.calls[1]);
   assert.match(locked.text, /FOR UPDATE/u);
   assert.match(locked.text, /status\s*=\s*\$2/u);
   assert.match(locked.text, /lease_token\s*=\s*\$3::UUID/u);
   assert.match(locked.text, /lease_expires_at\s*>\s*statement_timestamp\(\)/u);
-  const journal = required(client.calls[2]);
+  const journal = required(client.calls[3]);
   assert.match(journal.text, /INSERT INTO execution_intent_transitions/u);
   assert.equal(journal.values?.includes('claimed for processing'), true);
   assert.equal(journal.values?.includes('NONE'), true);
   assert.match(String(journal.values?.find((value) => typeof value === 'string' && value.startsWith('{'))), /"payloadVersion":1/u);
-  const parentUpdate = required(client.calls[3]);
+  const parentUpdate = required(client.calls[4]);
   assert.doesNotMatch(parentUpdate.text, /lease_owner\s*=\s*NULL/u);
   assert.match(parentUpdate.text, /state_revision\s*=\s*intent\.state_revision \+ 1/u);
   assert.match(parentUpdate.text, /intent\.state_revision\s*=\s*\$5::BIGINT/u);
@@ -270,11 +271,12 @@ void test('state revision prevents same-millisecond ABA replay with the original
   const unknownRow = claimRow(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0);
   Object.assign(unknownRow, { state_revision: '2', last_reason_code: 'INTENT_DUPLICATE' });
   const client = new ScriptedClient([
-    command('BEGIN'), result([claimRow(draft, original.intent.status, 0)], 1), result([], 1),
+    command('BEGIN'), result([claimRow(draft, original.intent.status, 0)], 1),
+    result([ledgerRow(0)], 1), result([], 1),
     result([confirmedRow], 1), command('COMMIT'),
     command('BEGIN'), result([{
       ...claimRow(draft, confirmed.intent.status, 0), state_revision: '1',
-    }], 1), result([], 1), result([unknownRow], 1), command('COMMIT'),
+    }], 1), result([ledgerRow(0)], 1), result([], 1), result([unknownRow], 1), command('COMMIT'),
     command('BEGIN'), result([], 0), command('ROLLBACK'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -311,7 +313,8 @@ void test('nonterminal transition fail-closes every mismatched retained lease tr
       ...leaseOverride,
     });
     const client = new ScriptedClient([
-      command('BEGIN'), result([claimRow(draft, 'PENDING', 0)], 1), result([], 1),
+      command('BEGIN'), result([claimRow(draft, 'PENDING', 0)], 1),
+      result([ledgerRow(0)], 1), result([], 1),
       result([returned], 1), (text) => {
         assert.match(text, /^(?:COMMIT|ROLLBACK)$/u);
         return result([], null);
@@ -429,7 +432,8 @@ void test('transition rejects a contradictory UPDATE RETURNING status', async ()
   const draft = executionDraft('transition-returning');
   const claim = claimedIntent(draft, 'PENDING');
   const client = new ScriptedClient([
-    command('BEGIN'), result([claimRow(draft, 'PENDING')], 1), result([], 1),
+    command('BEGIN'), result([claimRow(draft, 'PENDING')], 1),
+    result([ledgerRow(0)], 1), result([], 1),
     result([intentRow(draft, {
       status: 'SIMULATED', updated_at_ms: String(NOW_MS + 1),
     })], 1), command('ROLLBACK'),
@@ -545,6 +549,28 @@ void test('PROCESSING cannot transition while its latest attempt is STARTED', as
     claim, transitionInput(claim, 'SIMULATED', 1),
   )).status, 'SIMULATED');
   assert.equal(client.calls.filter((call) => call.text.includes('execution_intent_transitions')).length, 1);
+});
+
+void test('transition rejects an orphan STARTED child when the parent attempt count is zero', async () => {
+  const draft = executionDraft('transition-orphan-attempt');
+  const claim = claimedIntent(draft, 'PROCESSING', 0);
+  const returned = claimRow(draft, 'SIMULATED', 0);
+  Object.assign(returned, {
+    state_revision: '1', last_reason_code: 'INTENT_DUPLICATE', updated_at_ms: String(NOW_MS + 1),
+  });
+  const client = new ScriptedClient([
+    command('BEGIN'), result([claimRow(draft, 'PROCESSING', 0)], 1),
+    result([ledgerRow(1, 'STARTED')], 1),
+    (text) => text === 'ROLLBACK' ? result([], null) : result([returned], 1),
+    command('COMMIT'),
+  ]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  await expectCode(
+    repository.transition(claim, transitionInput(claim, 'SIMULATED')),
+    'ATTEMPT_CONFLICT',
+  );
+  assert.equal(client.calls.some((call) => call.text.includes('execution_intent_transitions')), false);
 });
 
 void test('finishAttempt performs one fenced STARTED CAS and exact replay returns false', async () => {
@@ -1042,6 +1068,33 @@ void test('real PostgreSQL rejects ABA replay, immutable drift, and parent-attem
       ownerId: 'gap-worker', leaseMs: 60_000, purpose: 'EXECUTE',
     }));
     await expectCode(repository.beginAttempt(gapClaim), 'ATTEMPT_CONFLICT');
+
+    const orphanDraft = executionDraft('postgres-orphan-attempt', {
+      requestedAtMs: now - 700, expiresAtMs: now + 120_000,
+    });
+    await repository.create(orphanDraft);
+    await pool.query(`UPDATE execution_intents SET status='PROCESSING' WHERE id=$1`, [
+      orphanDraft.id,
+    ]);
+    await pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,started_at
+    ) VALUES ($1,1,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [orphanDraft.id]);
+    const orphanClaim = required(await repository.claim({
+      ownerId: 'orphan-worker', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    await expectCode(
+      repository.transition(orphanClaim, transitionInput(orphanClaim, 'SIMULATED')),
+      'ATTEMPT_CONFLICT',
+    );
+    assert.deepEqual((await pool.query(`SELECT intent.status,intent.attempt_count,
+      attempt.status AS attempt_status,
+      (SELECT COUNT(*)::INTEGER FROM execution_intent_transitions AS transition
+        WHERE transition.intent_id=intent.id) AS transition_count
+      FROM execution_intents AS intent
+      JOIN execution_attempts AS attempt ON attempt.intent_id=intent.id
+      WHERE intent.id=$1`, [orphanDraft.id])).rows, [{
+      status: 'PROCESSING', attempt_count: 0, attempt_status: 'STARTED', transition_count: 0,
+    }]);
   });
 });
 
