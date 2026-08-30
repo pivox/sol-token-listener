@@ -435,9 +435,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         }
         if (locked.intent.attemptCount > 0) {
           const ledger = await lockAttemptLedger(client, locked);
-          if (ledger.latest === null
-            || input.evidence.attemptNumber !== ledger.latest.attemptNumber
-            || ledger.latest.status === 'STARTED') {
+          if (ledger.latest?.status === undefined
+            || ledger.latest.status === 'STARTED'
+            || input.evidence.attemptNumber !== ledger.latest.attemptNumber) {
             throw attemptConflictError();
           }
         }
