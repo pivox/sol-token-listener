@@ -89,7 +89,7 @@ type ExactSurfaceAssertions = AssertAll<{
     & Expect<Equal<Parameters<ExecutionIntentRepository['transition']>['length'], 2>>
     & Expect<Equal<Parameters<ExecutionIntentRepository['expirePreSubmission']>['length'], 1>>
     & Expect<Equal<Parameters<ExecutionIntentRepository['read']>['length'], 1>>;
-  purpose: Expect<Equal<ExecutionClaimPurpose, 'EXECUTE' | 'CONFIRM' | 'RECONCILE'>>;
+  purpose: Expect<Equal<ExecutionClaimPurpose, 'EXECUTE' | 'CONFIRM' | 'RECONCILE' | 'DRY_RUN'>>;
   claimed: Expect<Equal<keyof ClaimedExecutionIntent, 'intent' | 'leaseOwner' | 'leaseToken' | 'leaseExpiresAtMs'>>
     & Expect<Equal<OptionalKeys<ClaimedExecutionIntent>, never>>
     & Expect<Equal<ReadonlyKeys<ClaimedExecutionIntent>, keyof ClaimedExecutionIntent>>

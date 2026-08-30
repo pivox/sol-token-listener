@@ -5,7 +5,7 @@ import type {
   ExecutionIntentV1,
 } from '../domain/execution-intent.js';
 
-export type ExecutionClaimPurpose = 'EXECUTE' | 'CONFIRM' | 'RECONCILE';
+export type ExecutionClaimPurpose = 'EXECUTE' | 'CONFIRM' | 'RECONCILE' | 'DRY_RUN';
 
 export interface ClaimedExecutionIntent {
   readonly intent: ExecutionIntentV1;
