@@ -110,6 +110,32 @@ void test('does not start findExact when cancellation follows an ambiguous compl
   assertForbiddenCalls(fake);
 });
 
+void test('rethrows known completion errors after cancellation without starting findExact', async (context) => {
+  const errors = [
+    new ExecutionDryRunRepositoryError('INTENT_FENCE_LOST'),
+    new ExecutionDryRunRepositoryError('ASSESSMENT_CONFLICT'),
+    new ExecutionDryRunRepositoryError('DATABASE_FAILURE'),
+  ] as const;
+  for (const expected of errors) {
+    await context.test(expected.code, async () => {
+      const controller = new AbortController();
+      const completeGate = deferred<ExecutionDryRunAssessmentV1>();
+      const fake = fakes(claim(), { completeResult: completeGate.promise });
+      const pass = createDryRunWorker(fake.dependencies).runOnce(controller.signal);
+
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.equal(fake.completed.length, 1);
+      controller.abort();
+      completeGate.reject(expected);
+
+      await assert.rejects(pass, (error) => error === expected);
+      assert.equal(fake.findInputs.length, 0);
+      assertForbiddenCalls(fake);
+    });
+  }
+});
+
 void test('recovers only an exact committed assessment after COMMIT_OUTCOME_UNKNOWN', async () => {
   const claimed = claim();
   const commitError = new ExecutionDryRunRepositoryError('COMMIT_OUTCOME_UNKNOWN');

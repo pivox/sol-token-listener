@@ -46,9 +46,9 @@ async function runPass(
     await dependencies.assessments.complete(claim, assessment);
     return 'RECORDED';
   } catch (error) {
-    if (cancellationRequested(signal)) return 'IDLE';
     if (!(error instanceof ExecutionDryRunRepositoryError)
       || error.code !== 'COMMIT_OUTCOME_UNKNOWN') throw error;
+    if (cancellationRequested(signal)) return 'IDLE';
     const exact = await dependencies.assessments.findExact(assessment);
     if (exact === null) throw error;
     return 'COMMIT_RECOVERED';
