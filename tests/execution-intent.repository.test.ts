@@ -134,6 +134,31 @@ void test('claim validates a closed purpose and preserves each selected business
   assert.equal(pool.connectCount, 0);
 });
 
+void test('claim SQL admits a modeled lease exactly equal to statement_timestamp', async () => {
+  const draft = executionDraft('claim-equality-boundary');
+  const client = new ScriptedClient([(text, values) => {
+    const admitsExactEquality = /\(intent\.lease_expires_at IS NULL\s+OR\s+intent\.lease_expires_at <= statement_timestamp\(\)\)/su
+      .test(text);
+    if (!admitsExactEquality) return result([], 0);
+    return result([{
+      ...claimRow(draft, 'PENDING'),
+      lease_owner: values?.[0],
+      lease_token: values?.[2],
+    }], 1);
+  }]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  const claim = await repository.claim({
+    ownerId: 'boundary-worker', leaseMs: 30_000, purpose: 'EXECUTE',
+  });
+
+  assert.ok(claim);
+  assert.equal(claim.intent.id, draft.id);
+  const capturedClaim = required(client.calls[0]);
+  assert.match(capturedClaim.text, /lease_expires_at <= statement_timestamp\(\)/u);
+  assert.doesNotMatch(capturedClaim.text, /execution_intent_transitions/u);
+});
+
 void test('renew and release fence on id, status, UUID token, and strict database lease freshness', async () => {
   const draft = executionDraft('lease');
   const claim = claimedIntent(draft, 'PROCESSING');
@@ -635,7 +660,7 @@ void test('public input validation is exact, bounded, typed, and does not invoke
   assert.equal(pool.connectCount, 0);
 });
 
-void test('real PostgreSQL provides replay, concurrent claims, exact-boundary reclaim, attempts, and ordered lifecycle journal', async (context) => {
+void test('real PostgreSQL provides replay, concurrent claims, near-boundary reclaim, attempts, and ordered lifecycle journal', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: execution intent repository integration skipped');
@@ -833,7 +858,7 @@ void test('real PostgreSQL replays one STARTED attempt under a reclaimed fresh f
   });
 });
 
-void test('real PostgreSQL enforces exact reclaim and pre-submission expiry boundaries', async (context) => {
+void test('real PostgreSQL covers reclaim and pre-submission expiry near database-time boundaries', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: reclaim boundary integration skipped');
@@ -847,21 +872,21 @@ void test('real PostgreSQL enforces exact reclaim and pre-submission expiry boun
     const now = await databaseNowMs(firstPool);
     const liveTimes = { requestedAtMs: now - 1_000, expiresAtMs: now + 120_000 } as const;
 
-    const exactReclaimDraft = executionDraft('postgres-exact-reclaim', liveTimes);
-    await first.create(exactReclaimDraft);
-    const exactOriginal = required(await first.claim({
+    const boundaryReclaimDraft = executionDraft('postgres-boundary-reclaim', liveTimes);
+    await first.create(boundaryReclaimDraft);
+    const boundaryOriginal = required(await first.claim({
       ownerId: 'exact-owner-a', leaseMs: 60_000, purpose: 'EXECUTE',
     }));
     await firstPool.query(`UPDATE execution_intents
       SET lease_expires_at=date_trunc('milliseconds', statement_timestamp())
-      WHERE id=$1`, [exactReclaimDraft.id]);
-    const exactReclaimed = required(await second.claim({
+      WHERE id=$1`, [boundaryReclaimDraft.id]);
+    const boundaryReclaimed = required(await second.claim({
       ownerId: 'exact-owner-b', leaseMs: 60_000, purpose: 'EXECUTE',
     }));
-    assert.equal(exactReclaimed.intent.id, exactReclaimDraft.id);
-    assert.notEqual(exactReclaimed.leaseToken, exactOriginal.leaseToken);
+    assert.equal(boundaryReclaimed.intent.id, boundaryReclaimDraft.id);
+    assert.notEqual(boundaryReclaimed.leaseToken, boundaryOriginal.leaseToken);
     const reclaimJournal = await firstPool.query(`SELECT COUNT(*)::INTEGER AS count
-      FROM execution_intent_transitions WHERE intent_id=$1`, [exactReclaimDraft.id]);
+      FROM execution_intent_transitions WHERE intent_id=$1`, [boundaryReclaimDraft.id]);
     assert.deepEqual(reclaimJournal.rows, [{ count: 0 }]);
 
     const freshReclaimDraft = executionDraft('postgres-fresh-reclaim', liveTimes);
