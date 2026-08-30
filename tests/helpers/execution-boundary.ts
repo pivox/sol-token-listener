@@ -189,6 +189,7 @@ function hasForbiddenSegment(path: string): boolean {
 
 function appendDangerousCall(node: ts.CallExpression, violations: string[]): void {
   if (ts.isElementAccessExpression(node.expression)) {
+    if (isVettedComputedMemberCall(node)) return;
     const argument = node.expression.argumentExpression;
     if (!ts.isStringLiteralLike(argument) && !ts.isNumericLiteral(argument)) {
       violations.push('Computed member call is prohibited in boundary modules.');
@@ -205,6 +206,44 @@ function appendDangerousCall(node: ts.CallExpression, violations: string[]): voi
         ? node.expression.argumentExpression.text
         : null;
   if (name !== null && FORBIDDEN_CALLS.has(name)) violations.push(`Forbidden execution call: ${name}`);
+}
+
+function isVettedComputedMemberCall(node: ts.CallExpression): boolean {
+  const member = node.expression;
+  if (!ts.isElementAccessExpression(member)) return false;
+  if (isAsyncIteratorCall(node, member)) return true;
+  return isConditionValidatorCall(node, member, 'OBSERVED_CONDITION_VALUE_VALIDATORS')
+    || isConditionValidatorCall(node, member, 'THRESHOLD_CONDITION_VALUE_VALIDATORS');
+}
+
+function isAsyncIteratorCall(node: ts.CallExpression, member: ts.ElementAccessExpression): boolean {
+  const argument = member.argumentExpression;
+  return node.questionDotToken === undefined
+    && node.arguments.length === 0
+    && ts.isIdentifier(member.expression)
+    && member.expression.text === 'body'
+    && ts.isPropertyAccessExpression(argument)
+    && ts.isIdentifier(argument.expression)
+    && argument.expression.text === 'Symbol'
+    && argument.name.text === 'asyncIterator';
+}
+
+function isConditionValidatorCall(
+  node: ts.CallExpression,
+  member: ts.ElementAccessExpression,
+  validatorName: string,
+): boolean {
+  const argument = member.argumentExpression;
+  const value = node.arguments[0];
+  return node.questionDotToken !== undefined
+    && node.arguments.length === 1
+    && ts.isIdentifier(member.expression)
+    && member.expression.text === validatorName
+    && ts.isIdentifier(argument)
+    && argument.text === 'key'
+    && value !== undefined
+    && ts.isIdentifier(value)
+    && value.text === 'value';
 }
 
 function appendExecutorElementAccess(
