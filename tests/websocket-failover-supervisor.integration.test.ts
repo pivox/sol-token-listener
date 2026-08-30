@@ -8,7 +8,6 @@ import { PromotedProviderSelector } from '../src/application/promoted-provider-s
 import {
   StrictCatchUpScanner,
   StrictCatchUpScannerError,
-  StrictCatchUpWindowExceededError,
   type StrictCatchUpScanResult,
 } from '../src/application/strict-catch-up-scanner.js';
 import {
@@ -17,6 +16,8 @@ import {
 } from '../src/application/websocket-failover-supervisor.js';
 import { PersistentWebSocketHealthReporter } from '../src/application/websocket-health-reporter.js';
 import type { RpcProviderId } from '../src/domain/rpc-provider.js';
+import { createStrictCatchUpFailure } from '../src/domain/strict-catch-up.js';
+import type { ProcessingCheckpoint } from '../src/domain/transaction-ingestion.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../src/markets/pumpswap/constants.js';
 import type { CatchUpSource } from '../src/ports/catch-up-source.js';
@@ -44,6 +45,10 @@ const databaseUrl = process.env.TEST_DATABASE_URL;
 const SHARED_SIGNATURE = '1'.repeat(64);
 const MULTI_PAGE_SIGNATURE = bs58.encode(Buffer.alloc(64, 2));
 const MULTI_PAGE_BOUNDARY_SIGNATURE = bs58.encode(Buffer.alloc(64, 3));
+const STRICT_WINDOW_LAUNCHPAD_SIGNATURE = bs58.encode(Buffer.alloc(64, 4));
+const STRICT_WINDOW_MARKET_SIGNATURE = bs58.encode(Buffer.alloc(64, 5));
+const STRICT_WINDOW_HEAD_SIGNATURE = bs58.encode(Buffer.alloc(64, 6));
+const STRICT_WINDOW_HEAD_SLOT = 43n;
 
 void test('merges one signature from incumbent and candidate WS plus strict HTTP before the old session closes', async (context) => {
   await withDatabase(context, async (pool) => {
@@ -215,35 +220,15 @@ void test('restarts every durable WebSocket boundary through a fresh supervisor 
   }
 });
 
-void test('unanimous exact strict frontiers persist UNRECOVERABLE without moving PostgreSQL checkpoints', async (context) => {
+void test('persists matching strict-window evidence for every provider before declaring UNRECOVERABLE', async (context) => {
   await withDatabase(context, async (pool) => {
     const inbox = new PostgresTransactionInboxRepository(pool);
     const health = new PostgresWebSocketHealthRepository(pool);
     const scheduler = new ManualScheduler();
-    const reporterScheduler = new ManualScheduler();
-    const reporter = new PersistentWebSocketHealthReporter(inbox, health, {
-      touchIntervalMs: 60_000,
-      shutdownTimeoutMs: 100,
-      scheduler: Object.freeze({
-        schedule: (callback: () => void, delayMs: number) => reporterScheduler.schedule(callback, delayMs),
-        cancel: (handle: unknown) => { reporterScheduler.cancel(handle); },
-      }),
-    });
-    const sessions = new SessionFactory();
-    const frontier = Object.freeze({ launchpad: null, market: null });
-    const supervisor = new WebSocketFailoverSupervisor({
-      providers: new TestCatalog(['primary', 'fallback-1']), health, reporter,
-      promoted: new PromotedProviderSelector([finalityPass('primary'), finalityPass('fallback-1')]),
-      openSession: sessions.open,
-      runStrictScan: async (providerId) => {
-        throw new StrictCatchUpWindowExceededError(providerId, 'launchpad', frontier);
-      },
-    }, {
-      now: () => 10_000, random: () => 0,
-      scheduler: Object.freeze({
-        schedule: (callback: () => void, delayMs: number) => scheduler.schedule(callback, delayMs),
-        cancel: (handle: unknown) => { scheduler.cancel(handle); },
-      }),
+    const previous = await seedStrictWindowFrontier(inbox);
+    const supervisor = supervisorFor({
+      inbox, health, scheduler, reporter: reporterFor(inbox, health), sessions: new SessionFactory(),
+      strict: (providerId, signal) => strictWindowScanner(providerId, inbox).scan(signal),
     });
 
     await supervisor.start();
@@ -252,27 +237,31 @@ void test('unanimous exact strict frontiers persist UNRECOVERABLE without moving
     const snapshot = await health.read();
     assert.equal(snapshot.recovery.status, 'FAILED');
     assert.equal(snapshot.recovery.reasonCode, 'CATCH_UP_WINDOW_EXCEEDED');
-    assert.equal(await inbox.readCheckpoint('launchpad'), null);
-    assert.equal(await inbox.readCheckpoint('market'), null);
+    assert.deepEqual(await inbox.readCheckpoint('launchpad'), previous.launchpad);
+    assert.deepEqual(await inbox.readCheckpoint('market'), previous.market);
+    assert.deepEqual(await strictFailureRows(pool), [
+      strictFailureRow('fallback-1', previous.launchpad),
+      strictFailureRow('primary', previous.launchpad),
+    ]);
+    assert.equal(await unresolvedStrictFailureCount(pool), 2);
     assert.equal(scheduler.pendingCount(), 0);
     await supervisor.close();
   });
 });
 
-void test('mixed strict failure evidence remains durably DEGRADED with one bounded backoff', async (context) => {
+void test('keeps actual first-provider window evidence unresolved when the next provider has a concrete transient source failure', async (context) => {
   await withDatabase(context, async (pool) => {
     const inbox = new PostgresTransactionInboxRepository(pool);
     const health = new PostgresWebSocketHealthRepository(pool);
     const scheduler = new ManualScheduler();
-    const frontier = Object.freeze({ launchpad: null, market: null });
-    let attempts = 0;
+    const previous = await seedStrictWindowFrontier(inbox);
+    let fallbackSourceCalls = 0;
     const supervisor = supervisorFor({
       inbox, health, scheduler, reporter: reporterFor(inbox, health), sessions: new SessionFactory(),
-      strict: async (providerId) => {
-        attempts += 1;
-        if (attempts === 1) throw new StrictCatchUpWindowExceededError(providerId, 'launchpad', frontier);
-        throw new StrictCatchUpScannerError('source', providerId, 'market', 'request');
-      },
+      strict: (providerId, signal) => providerId === 'primary'
+        ? strictWindowScanner(providerId, inbox).scan(signal)
+        : sourceFaultScanner(providerId, inbox, 'HTTP_429', () => { fallbackSourceCalls += 1; })
+          .scan(signal),
     });
 
     await supervisor.start();
@@ -280,9 +269,13 @@ void test('mixed strict failure evidence remains durably DEGRADED with one bound
     await waitForPhase(health, 'DEGRADED');
     const snapshot = await health.read();
     assert.equal(snapshot.recovery.status, 'REQUIRED');
-    assert.notEqual(snapshot.phase, 'UNRECOVERABLE');
-    assert.equal(await inbox.readCheckpoint('launchpad'), null);
-    assert.equal(await inbox.readCheckpoint('market'), null);
+    assert.equal(snapshot.phase, 'DEGRADED');
+    assert.equal(snapshot.recovery.reasonCode, 'RPC_UNAVAILABLE');
+    assert.equal(fallbackSourceCalls, 1);
+    assert.deepEqual(await inbox.readCheckpoint('launchpad'), previous.launchpad);
+    assert.deepEqual(await inbox.readCheckpoint('market'), previous.market);
+    assert.deepEqual(await strictFailureRows(pool), [strictFailureRow('primary', previous.launchpad)]);
+    assert.equal(await unresolvedStrictFailureCount(pool), 1);
     assert.equal(scheduler.pendingDelays().filter((delay) => delay === 500).length, 1);
     await supervisor.close();
   });
@@ -881,6 +874,40 @@ function strictScanner(providerId: RpcProviderId, inbox: StrictCatchUpRepository
   return new StrictCatchUpScanner(source, inbox, { pageSize: 10, maxPages: 2, now: () => 10_000 });
 }
 
+async function seedStrictWindowFrontier(
+  inbox: PostgresTransactionInboxRepository,
+): Promise<Readonly<{ launchpad: ProcessingCheckpoint; market: ProcessingCheckpoint }>> {
+  const launchpad = Object.freeze({
+    key: 'launchpad' as const, slot: 40n, signature: STRICT_WINDOW_LAUNCHPAD_SIGNATURE, updatedAtMs: 9_000,
+  });
+  const market = Object.freeze({
+    key: 'market' as const, slot: 39n, signature: STRICT_WINDOW_MARKET_SIGNATURE, updatedAtMs: 9_000,
+  });
+  await inbox.compareAndSwapCheckpoint(null, launchpad);
+  await inbox.compareAndSwapCheckpoint(null, market);
+  return Object.freeze({ launchpad, market });
+}
+
+function strictWindowScanner(
+  providerId: RpcProviderId,
+  inbox: StrictCatchUpRepository,
+): StrictCatchUpScanner {
+  const source: CatchUpSource & { readonly providerId: RpcProviderId } = Object.freeze({
+    providerId,
+    async list(programId: string, before: string | undefined) {
+      if (programId !== PUMP_PROGRAM_ID && programId !== PUMPSWAP_PROGRAM_ID) throw new Error('Unexpected program.');
+      if (before !== undefined) return [];
+      return [Object.freeze({
+        signature: STRICT_WINDOW_HEAD_SIGNATURE,
+        slot: STRICT_WINDOW_HEAD_SLOT,
+        confirmationStatus: 'confirmed' as const,
+        blockTimeMs: null,
+      })];
+    },
+  });
+  return new StrictCatchUpScanner(source, inbox, { pageSize: 1, maxPages: 1, now: () => 10_000 });
+}
+
 function multiPageStrictScanner(
   providerId: RpcProviderId,
   inbox: PostgresTransactionInboxRepository,
@@ -1105,6 +1132,50 @@ async function unresolvedStrictFailureCount(pool: pg.Pool): Promise<number> {
     'SELECT count(*)::TEXT AS count FROM listener_strict_catch_up_failures WHERE resolved_at IS NULL',
   );
   return Number(result.rows[0]?.count);
+}
+
+async function strictFailureRows(pool: pg.Pool): Promise<readonly StrictFailureRow[]> {
+  const result = await pool.query<StrictFailureRow>(
+    `SELECT failure_id, checkpoint_key, previous_slot::TEXT AS previous_slot, previous_signature,
+       provider_id, observed_head_slot::TEXT AS observed_head_slot, reason_code,
+       resolved_at IS NULL AS unresolved, purge_after IS NULL AS purge_pending
+     FROM listener_strict_catch_up_failures
+     ORDER BY provider_id, failure_id`,
+  );
+  return result.rows;
+}
+
+interface StrictFailureRow {
+  readonly failure_id: string;
+  readonly checkpoint_key: string;
+  readonly previous_slot: string | null;
+  readonly previous_signature: string | null;
+  readonly provider_id: string;
+  readonly observed_head_slot: string | null;
+  readonly reason_code: string;
+  readonly unresolved: boolean;
+  readonly purge_pending: boolean;
+}
+
+function strictFailureRow(
+  providerId: RpcProviderId,
+  previous: ProcessingCheckpoint,
+): StrictFailureRow {
+  const failure = createStrictCatchUpFailure({
+    checkpointKey: 'launchpad', previous, providerId,
+    observedHeadSlot: STRICT_WINDOW_HEAD_SLOT, detectedAtMs: 10_000,
+  });
+  return Object.freeze({
+    failure_id: failure.failureId,
+    checkpoint_key: 'launchpad',
+    previous_slot: previous.slot.toString(),
+    previous_signature: previous.signature,
+    provider_id: providerId,
+    observed_head_slot: STRICT_WINDOW_HEAD_SLOT.toString(),
+    reason_code: 'CATCH_UP_WINDOW_EXCEEDED',
+    unresolved: true,
+    purge_pending: true,
+  });
 }
 
 async function withDatabase(context: TestContext, action: (pool: pg.Pool) => Promise<void>): Promise<void> {
