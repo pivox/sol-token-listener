@@ -110,6 +110,18 @@ void test('does not start findExact when cancellation follows an ambiguous compl
   assertForbiddenCalls(fake);
 });
 
+void test('passes cancellation to complete and maps only typed repository cancellation to IDLE', async () => {
+  const signal = activeSignal();
+  const cancellation = new ExecutionDryRunRepositoryError('OPERATION_ABORTED');
+  const fake = fakes(claim(), { completeError: cancellation });
+
+  assert.equal(await createDryRunWorker(fake.dependencies).runOnce(signal), 'IDLE');
+  assert.equal(fake.completed.length, 1);
+  assert.equal(fake.completed[0]?.signal, signal);
+  assert.equal(fake.findInputs.length, 0);
+  assertForbiddenCalls(fake);
+});
+
 void test('rethrows known completion errors after cancellation without starting findExact', async (context) => {
   const errors = [
     new ExecutionDryRunRepositoryError('INTENT_FENCE_LOST'),
@@ -289,7 +301,11 @@ function fakes(
   }> = {},
 ) {
   const claimOptions: Readonly<{ ownerId: string; leaseMs: number; purpose: string }>[] = [];
-  const completed: Readonly<{ claim: ClaimedExecutionIntent; assessment: ReturnType<typeof createExecutionDryRunAssessment> }>[] = [];
+  const completed: Readonly<{
+    claim: ClaimedExecutionIntent;
+    assessment: ReturnType<typeof createExecutionDryRunAssessment>;
+    signal: AbortSignal;
+  }>[] = [];
   const findInputs: ReturnType<typeof createExecutionDryRunAssessment>[] = [];
   const forbidden = { renew: 0, release: 0, beginAttempt: 0, finishAttempt: 0, transition: 0 };
   const intents = {
@@ -305,8 +321,8 @@ function fakes(
     transition: async () => { forbidden.transition += 1; throw new Error('forbidden'); },
   } as unknown as ExecutionIntentRepository;
   const assessments: ExecutionDryRunRepository = {
-    complete: async (claimValue, assessment) => {
-      completed.push({ claim: claimValue, assessment });
+    complete: async (claimValue, assessment, signal) => {
+      completed.push({ claim: claimValue, assessment, signal });
       if (behavior.completeError !== undefined) return Promise.reject(behavior.completeError);
       if (behavior.completeResult !== undefined) return behavior.completeResult;
       return Object.freeze({ ...assessment, recordedAtMs: 1_000 });

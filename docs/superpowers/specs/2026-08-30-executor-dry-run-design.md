@@ -1,6 +1,6 @@
 # Exécuteur dry-run V1 — conception #51-C
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.0.2
 
 **Date :** 2026-08-30
 
@@ -12,6 +12,9 @@
 
 ## Historique des versions
 
+- **1.0.2 — 2026-08-31 :** propagation de l'annulation jusqu'au repository
+  de completion et ajout du fence entre acquisition du client PostgreSQL et
+  dispatch du statement atomique.
 - **1.0.1 — 2026-08-31 :** ajout du rejet explicite de la variable privée
   listener `SOLANA_PRIVATE_KEY_BASE58` et définition de l'annulation aux
   frontières de statements pendant l'arrêt.
@@ -170,9 +173,18 @@ statement. Une annulation observée après la résolution du claim et avant
 release, renewal, tentative ou transition, et laisse le lease expirer
 naturellement.
 
+Le worker transmet le même `AbortSignal` à `complete`. Le repository le vérifie
+avant `pool.connect()`, puis de nouveau après la résolution de `connect()` et
+immédiatement avant l'invocation de `COMPLETE_SQL`. Si l'annulation est observée
+à cette seconde frontière, il libère proprement le client sans requête et lève
+`OPERATION_ABORTED`, que le worker seul traduit en `IDLE`. Un échec réel de
+connexion ou de release reste `DATABASE_FAILURE`. Une fois `client.query`
+invoqué, une erreur conserve sa classification réelle ou
+`COMMIT_OUTCOME_UNKNOWN` ; l'annulation ne la masque jamais.
+
 Chaque vérification d'annulation et l'invocation synchrone du statement suivant
 appartiennent au même tour JavaScript : aucun handler de signal ne peut
-s'intercaler entre les deux. Un signal reçu pendant un `complete` déjà en vol
+s'intercaler entre les deux. Un signal reçu pendant `COMPLETE_SQL` déjà en vol
 ne tente pas de l'annuler ; le runtime attend son issue. Un succès durable reste
 `RECORDED`. Si son issue est un commit ambigu après l'annulation, le worker
 retourne `IDLE` sans lancer `findExact`, car ce dernier serait un nouveau

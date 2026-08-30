@@ -43,9 +43,11 @@ async function runPass(
   if (claim === null) return 'IDLE';
   const assessment = createExecutionDryRunAssessment(claim.intent);
   try {
-    await dependencies.assessments.complete(claim, assessment);
+    await dependencies.assessments.complete(claim, assessment, signal);
     return 'RECORDED';
   } catch (error) {
+    if (error instanceof ExecutionDryRunRepositoryError
+      && error.code === 'OPERATION_ABORTED') return 'IDLE';
     if (!(error instanceof ExecutionDryRunRepositoryError)
       || error.code !== 'COMMIT_OUTCOME_UNKNOWN') throw error;
     if (cancellationRequested(signal)) return 'IDLE';

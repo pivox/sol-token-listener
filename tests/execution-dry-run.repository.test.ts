@@ -53,6 +53,7 @@ void test('complete validates and snapshots hostile inputs before connecting', a
     await expectCode(repository.complete(
       candidateClaim as ClaimedExecutionIntent,
       candidateAssessment as ExecutionDryRunAssessmentDraftV1,
+      activeSignal(),
     ), 'INVALID_INPUT');
   }
   await expectCode(repository.findExact(proxy), 'INVALID_INPUT');
@@ -67,7 +68,7 @@ void test('complete dispatches exactly one autocommit CTE and fences every input
   const client = new ScriptedClient([result([assessmentRow(assessment)], 1)]);
   const repository = new PostgresExecutionDryRunRepository(new ScriptedPool(client));
 
-  const stored = await repository.complete(claimed, assessment);
+  const stored = await repository.complete(claimed, assessment, activeSignal());
 
   assert.deepEqual(stored, Object.freeze({ ...assessment, recordedAtMs: NOW_MS }));
   assert.ok(Object.isFrozen(stored));
@@ -121,7 +122,9 @@ void test('complete classifies known cardinalities and treats post-ACK protocol 
   for (const [row, code] of cases) {
     const client = new ScriptedClient([result([row], 1)]);
     await expectCode(
-      new PostgresExecutionDryRunRepository(new ScriptedPool(client)).complete(claimed, assessment),
+      new PostgresExecutionDryRunRepository(new ScriptedPool(client)).complete(
+        claimed, assessment, activeSignal(),
+      ),
       code,
     );
     assert.deepEqual(client.releaseErrors, [true]);
@@ -132,13 +135,17 @@ void test('complete distinguishes pre-dispatch database failure from ambiguous d
   const claimed = claim('failures');
   const assessment = createExecutionDryRunAssessment(claimed.intent);
   await expectCode(
-    new PostgresExecutionDryRunRepository(new RejectingPool()).complete(claimed, assessment),
+    new PostgresExecutionDryRunRepository(new RejectingPool()).complete(
+      claimed, assessment, activeSignal(),
+    ),
     'DATABASE_FAILURE',
   );
 
   const queryFailure = new ScriptedClient([() => { throw new Error('postgresql://secret'); }]);
   await expectCode(
-    new PostgresExecutionDryRunRepository(new ScriptedPool(queryFailure)).complete(claimed, assessment),
+    new PostgresExecutionDryRunRepository(new ScriptedPool(queryFailure)).complete(
+      claimed, assessment, activeSignal(),
+    ),
     'COMMIT_OUTCOME_UNKNOWN',
   );
   assert.deepEqual(queryFailure.releaseErrors, [true]);
@@ -148,9 +155,86 @@ void test('complete distinguishes pre-dispatch database failure from ambiguous d
     () => { throw new Error('release secret'); },
   );
   await expectCode(
-    new PostgresExecutionDryRunRepository(new ScriptedPool(releaseFailure)).complete(claimed, assessment),
+    new PostgresExecutionDryRunRepository(new ScriptedPool(releaseFailure)).complete(
+      claimed, assessment, activeSignal(),
+    ),
     'COMMIT_OUTCOME_UNKNOWN',
   );
+  assert.deepEqual(releaseFailure.releaseErrors, [undefined, true]);
+});
+
+void test('complete fences cancellation before connect and after deferred connect without dispatching SQL', async () => {
+  const claimed = claim('cancel-connect');
+  const assessment = createExecutionDryRunAssessment(claimed.intent);
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const unusedPool = new ScriptedPool(new ScriptedClient([]));
+
+  await expectCode(
+    new PostgresExecutionDryRunRepository(unusedPool).complete(
+      claimed, assessment, preAborted.signal,
+    ),
+    'OPERATION_ABORTED',
+  );
+  assert.equal(unusedPool.connectCount, 0);
+
+  const controller = new AbortController();
+  const connectGate = deferred<ScriptedClient>();
+  let connectCount = 0;
+  const pool: ExecutionDryRunPool = {
+    connect: () => { connectCount += 1; return connectGate.promise; },
+  };
+  const client = new ScriptedClient([]);
+  const pending = new PostgresExecutionDryRunRepository(pool).complete(
+    claimed, assessment, controller.signal,
+  );
+
+  await Promise.resolve();
+  assert.equal(connectCount, 1);
+  controller.abort();
+  connectGate.resolve(client);
+
+  await expectCode(pending, 'OPERATION_ABORTED');
+  assert.equal(client.calls.length, 0);
+  assert.deepEqual(client.releaseErrors, [undefined]);
+});
+
+void test('complete never masks connect, dispatched query or cancellation cleanup failures', async () => {
+  const claimed = claim('cancel-failures');
+  const assessment = createExecutionDryRunAssessment(claimed.intent);
+
+  const connectController = new AbortController();
+  const connectGate = deferred<ScriptedClient>();
+  const connectFailure = new PostgresExecutionDryRunRepository({
+    connect: () => connectGate.promise,
+  }).complete(claimed, assessment, connectController.signal);
+  connectController.abort();
+  connectGate.reject(new Error('connect secret'));
+  await expectCode(connectFailure, 'DATABASE_FAILURE');
+
+  const queryController = new AbortController();
+  const queryFailure = new ScriptedClient([() => {
+    queryController.abort();
+    throw new Error('query secret');
+  }]);
+  await expectCode(
+    new PostgresExecutionDryRunRepository(new ScriptedPool(queryFailure)).complete(
+      claimed, assessment, queryController.signal,
+    ),
+    'COMMIT_OUTCOME_UNKNOWN',
+  );
+  assert.deepEqual(queryFailure.releaseErrors, [true]);
+
+  const releaseController = new AbortController();
+  const releaseGate = deferred<ScriptedClient>();
+  const releaseFailure = new ScriptedClient([], () => { throw new Error('release secret'); });
+  const cancelled = new PostgresExecutionDryRunRepository({
+    connect: () => releaseGate.promise,
+  }).complete(claimed, assessment, releaseController.signal);
+  releaseController.abort();
+  releaseGate.resolve(releaseFailure);
+  await expectCode(cancelled, 'DATABASE_FAILURE');
+  assert.equal(releaseFailure.calls.length, 0);
   assert.deepEqual(releaseFailure.releaseErrors, [undefined, true]);
 });
 
@@ -289,7 +373,7 @@ void test('real PostgreSQL atomically records, releases only the lease, and leav
     const assessment = createExecutionDryRunAssessment(claimed.intent);
     const before = await parentSnapshot(pool, created.intent.id);
 
-    const recorded = await assessments.complete(claimed, assessment);
+    const recorded = await assessments.complete(claimed, assessment, activeSignal());
 
     assert.deepEqual(await assessments.findExact(assessment), recorded);
     const after = await parentSnapshot(pool, created.intent.id);
@@ -326,7 +410,7 @@ void test('real PostgreSQL fails closed on fence drift, ABA, lease loss, and bus
       const assessment = createExecutionDryRunAssessment(claimed.intent);
       await pool.query(`UPDATE execution_intents SET ${mutation} WHERE id=$1`, [created.intent.id]);
       await expectCode(
-        assessments.complete(claimed, assessment),
+        assessments.complete(claimed, assessment, activeSignal()),
         'INTENT_FENCE_LOST',
         `mutation ${index}: ${mutation}`,
       );
@@ -350,7 +434,9 @@ void test('real PostgreSQL keeps a conflicting assessment and its lease fail-clo
     const assessment = createExecutionDryRunAssessment(claimed.intent);
     await insertAssessment(pool, assessment, { inputFingerprint: 'f'.repeat(64) });
 
-    await expectCode(repository.complete(claimed, assessment), 'ASSESSMENT_CONFLICT');
+    await expectCode(
+      repository.complete(claimed, assessment, activeSignal()), 'ASSESSMENT_CONFLICT',
+    );
     await expectCode(repository.findExact(assessment), 'INVALID_DATA');
     assert.equal((await pool.query(
       'SELECT lease_token::TEXT AS lease_token FROM execution_intents WHERE id=$1', [created.intent.id],
@@ -410,7 +496,10 @@ void test('real PostgreSQL rolls back insert when release fails and findExact pr
       END $$`);
     await pool.query(`CREATE TRIGGER reject_dry_run_release_trigger BEFORE UPDATE ON execution_intents
       FOR EACH ROW EXECUTE FUNCTION reject_dry_run_release()`);
-    await expectCode(repository.complete(rollbackClaim, rollbackAssessment), 'COMMIT_OUTCOME_UNKNOWN');
+    await expectCode(
+      repository.complete(rollbackClaim, rollbackAssessment, activeSignal()),
+      'COMMIT_OUTCOME_UNKNOWN',
+    );
     assert.equal(await repository.findExact(rollbackAssessment), null);
     assert.equal((await pool.query(
       'SELECT lease_token::TEXT AS lease_token FROM execution_intents WHERE id=$1', [rollbackCreated.intent.id],
@@ -421,7 +510,9 @@ void test('real PostgreSQL rolls back insert when release fails and findExact pr
     const ackClaim = required(await intents.claim({ ownerId: 'ack-worker', leaseMs: 30_000, purpose: 'DRY_RUN' }));
     const ackAssessment = createExecutionDryRunAssessment(ackClaim.intent);
     const ambiguous = new PostgresExecutionDryRunRepository(new AckLostPool(pool));
-    await expectCode(ambiguous.complete(ackClaim, ackAssessment), 'COMMIT_OUTCOME_UNKNOWN');
+    await expectCode(
+      ambiguous.complete(ackClaim, ackAssessment, activeSignal()), 'COMMIT_OUTCOME_UNKNOWN',
+    );
     const exact = await repository.findExact(ackAssessment);
     assert.ok(exact);
     assert.equal(exact.intentId, ackCreated.intent.id);
@@ -439,7 +530,8 @@ void test('real PostgreSQL allows only one concurrent completion for the same fe
     const claimed = required(await intents.claim({ ownerId: 'concurrent-worker', leaseMs: 30_000, purpose: 'DRY_RUN' }));
     const assessment = createExecutionDryRunAssessment(claimed.intent);
     const settled = await Promise.allSettled([
-      repository.complete(claimed, assessment), repository.complete(claimed, assessment),
+      repository.complete(claimed, assessment, activeSignal()),
+      repository.complete(claimed, assessment, activeSignal()),
     ]);
     assert.equal(settled.filter((item) => item.status === 'fulfilled').length, 1);
     assert.equal(settled.filter((item) => item.status === 'rejected').length, 1);
@@ -684,4 +776,19 @@ function required<Value>(value: Value | null | undefined): Value {
   assert.notEqual(value, null);
   assert.notEqual(value, undefined);
   return value as Value;
+}
+
+function deferred<Value>(): Readonly<{
+  promise: Promise<Value>;
+  resolve(value: Value): void;
+  reject(error: unknown): void;
+}> {
+  let resolve!: (value: Value) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<Value>((settle, fail) => { resolve = settle; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+function activeSignal(): AbortSignal {
+  return new AbortController().signal;
 }

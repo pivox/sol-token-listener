@@ -33,7 +33,8 @@ export type ExecutionDryRunRepositoryErrorCode =
   | 'DATABASE_FAILURE'
   | 'COMMIT_OUTCOME_UNKNOWN'
   | 'INTENT_FENCE_LOST'
-  | 'ASSESSMENT_CONFLICT';
+  | 'ASSESSMENT_CONFLICT'
+  | 'OPERATION_ABORTED';
 
 export class ExecutionDryRunRepositoryError extends Error {
   public constructor(public readonly code: ExecutionDryRunRepositoryErrorCode) {
@@ -198,6 +199,7 @@ export class PostgresExecutionDryRunRepository implements ExecutionDryRunReposit
   public async complete(
     claimValue: ClaimedExecutionIntent,
     assessmentValue: ExecutionDryRunAssessmentDraftV1,
+    signal: AbortSignal,
   ): Promise<ExecutionDryRunAssessmentV1> {
     let inputs: Readonly<{
       readonly claim: ClaimedExecutionIntent;
@@ -215,12 +217,15 @@ export class PostgresExecutionDryRunRepository implements ExecutionDryRunReposit
       throw inputError();
     }
 
+    if (cancellationRequested(signal)) throw repositoryError('OPERATION_ABORTED');
+
     let client: ExecutionDryRunClient;
     try {
       client = await this.pool.connect();
     } catch {
       throw repositoryError('DATABASE_FAILURE');
     }
+    if (cancellationRequested(signal)) abortBeforeComplete(client);
     let result: ExecutionDryRunAssessmentV1 | undefined;
     let primaryFailure: unknown;
     let completed = false;
@@ -521,6 +526,20 @@ function isInternalError(value: unknown): value is ExecutionDryRunRepositoryErro
 function isKnownCompleteOutcomeError(value: unknown): value is ExecutionDryRunRepositoryError {
   return isInternalError(value)
     && (value.code === 'INTENT_FENCE_LOST' || value.code === 'ASSESSMENT_CONFLICT');
+}
+
+function cancellationRequested(signal: AbortSignal): boolean {
+  return signal.aborted;
+}
+
+function abortBeforeComplete(client: ExecutionDryRunClient): never {
+  try {
+    client.release();
+  } catch {
+    try { client.release(true); } catch { /* The fixed database error remains authoritative. */ }
+    throw repositoryError('DATABASE_FAILURE');
+  }
+  throw repositoryError('OPERATION_ABORTED');
 }
 
 function requiredRow(rows: readonly Row[]): Row {

@@ -8,6 +8,7 @@ export interface ExecutionDryRunRepository {
   readonly complete: (
     claim: ClaimedExecutionIntent,
     assessment: ExecutionDryRunAssessmentDraftV1,
+    signal: AbortSignal,
   ) => Promise<ExecutionDryRunAssessmentV1>;
   readonly findExact: (
     assessment: ExecutionDryRunAssessmentDraftV1,

@@ -35,6 +35,7 @@ interface Surface {
   readonly complete: (
     claim: ClaimedExecutionIntent,
     assessment: ExecutionDryRunAssessmentDraftV1,
+    signal: AbortSignal,
   ) => Promise<ExecutionDryRunAssessmentV1>;
   readonly findExact: (
     assessment: ExecutionDryRunAssessmentDraftV1,
@@ -81,11 +82,15 @@ function compileTimeNegativeAssertions(): void {
   const claim = null as never as ClaimedExecutionIntent;
   const assessment = null as never as ExecutionDryRunAssessmentDraftV1;
 
-  // @ts-expect-error sidecar completion accepts no signer capability.
-  void repository.complete(claim, { ...assessment, signer: 'capability' });
+  void repository.complete(
+    claim,
+    // @ts-expect-error sidecar completion accepts no signer capability.
+    { ...assessment, signer: 'capability' },
+    new AbortController().signal,
+  );
   // @ts-expect-error sidecar lookup accepts no wallet capability.
   void repository.findExact({ ...assessment, wallet: 'capability' });
-  // @ts-expect-error sidecar completion has no extra execution parameter.
-  void repository.complete(claim, assessment, 'extra');
+  // @ts-expect-error sidecar completion accepts only one trusted cancellation signal.
+  void repository.complete(claim, assessment, new AbortController().signal, 'extra');
 }
 void compileTimeNegativeAssertions;
