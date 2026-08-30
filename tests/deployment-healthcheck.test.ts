@@ -45,6 +45,24 @@ void test('requires an OK runtime status only when strict production health is r
   });
 });
 
+void test('requires aggregate OK for every degraded WebSocket supervision condition', async () => {
+  const nonRunningPhases = [
+    'CONNECTING', 'WAITING_FOR_ACKS', 'ACKNOWLEDGED', 'RECOVERING', 'DEGRADED',
+    'UNRECOVERABLE', 'STOPPING', 'STALE_HEARTBEAT', 'UNRESOLVED_STRICT_FAILURE',
+    'CLEANUP_FAILED',
+  ] as const;
+  for (const phase of nonRunningPhases) {
+    await assert.rejects(checkDeploymentHealth(HEALTH_URL, {
+      fetch: async () => healthResponse('DEGRADED', 'AVAILABLE', phase),
+      requireOk: true,
+    }), errorCode('HEALTHCHECK_UNHEALTHY'));
+  }
+  await checkDeploymentHealth(HEALTH_URL, {
+    fetch: async () => healthResponse('OK', 'AVAILABLE', 'RUNNING_RECOVERED'),
+    requireOk: true,
+  });
+});
+
 void test('rejects PostgreSQL unavailability, HTTP failures, redirects, and invalid public health envelopes with stable codes', async () => {
   const cases: readonly [Response, string][] = [
     [healthResponse('DEGRADED', 'UNAVAILABLE'), 'HEALTHCHECK_UNHEALTHY'],
@@ -326,7 +344,11 @@ void test('passes an explicit strict mode from the CLI and rejects every other a
   }
 });
 
-function healthResponse(status: 'OK' | 'DEGRADED', postgresql = 'AVAILABLE'): Response {
+function healthResponse(
+  status: 'OK' | 'DEGRADED',
+  postgresql = 'AVAILABLE',
+  phase = 'STOPPED',
+): Response {
   return new Response(JSON.stringify({
     apiVersion: 'v1',
     meta: { generatedAt: '2026-08-11T00:00:00.000Z', nextCursor: null },
@@ -335,7 +357,7 @@ function healthResponse(status: 'OK' | 'DEGRADED', postgresql = 'AVAILABLE'): Re
       postgresql: { status: postgresql },
       heartbeat: {
         websocket: {
-          version: 1, supervision: 'INACTIVE', state: 'STOPPED', phase: 'STOPPED',
+          version: 1, supervision: 'INACTIVE', state: 'STOPPED', phase,
           providerId: null, candidateProviderId: null, updatedAt: null, heartbeatAt: null,
           acknowledgedAt: null, lastObservation: null, disconnect: null,
           recovery: { status: 'NOT_REQUIRED', startedAt: null, completedAt: null, reasonCode: null },
