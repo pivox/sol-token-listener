@@ -161,7 +161,11 @@ void test('claim validates a closed purpose and preserves each selected business
     const setClause = required(/SET([\s\S]*?)FROM candidate/u.exec(call.text)?.[1]);
     assert.doesNotMatch(setClause, /\bstatus\b|attempt_count|last_reason_code|terminal_at/u);
     if (purpose === 'DRY_RUN') {
-      assert.doesNotMatch(setClause, /updated_at|state_revision|reason_code/u);
+      const setColumns = [...setClause.matchAll(/^\s*([a-z_]+)\s*=/gmu)]
+        .map((match) => required(match[1]))
+        .sort();
+      assert.deepEqual(setColumns, ['lease_expires_at', 'lease_owner', 'lease_token']);
+      assert.doesNotMatch(call.text, /execution_attempts/u);
       assert.match(call.text, /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_dry_run_assessments/u);
       assert.match(call.text, /assessment\.intent_id\s*=\s*intent\.id/u);
       assert.match(call.text, /assessment\.evaluator_version\s*=\s*1/u);
