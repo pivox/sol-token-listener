@@ -57,6 +57,14 @@ void test('execution dry-run assessment migration defines an additive, inert con
   assert.doesNotMatch(sql, /ALTER TABLE\s+(?:execution_intents|execution_attempts|execution_intent_transitions)/iu);
 });
 
+void test('catalogue query exposes delete action only for foreign keys', async () => {
+  const source = await readFile(new URL(import.meta.url), 'utf8');
+  assert.match(
+    source,
+    /CASE WHEN c\.contype = 'f' THEN c\.confdeltype END AS confdeltype/u,
+  );
+});
+
 void test('execution dry-run migration applies, upgrades 031, and replays safely', async (context) => {
   const databaseUrl = testDatabaseUrl(context, 'execution dry-run migration test');
   if (databaseUrl === null) return;
@@ -103,7 +111,8 @@ void test('execution dry-run assessments round-trip with exact catalogue identit
       ['outcome', 'text'], ['coverage', 'text'], ['quote_status', 'text'], ['build_status', 'text'], ['simulation_status', 'text'],
       ['signature_status', 'text'], ['submission_status', 'text'], ['recorded_at', 'timestamp with time zone'],
     ]);
-    const constraints = await pool.query<{ readonly contype: string; readonly conkey: string; readonly confkey: string | null; readonly confdeltype: string | null }>(`SELECT c.contype, c.conkey::TEXT, c.confkey::TEXT, c.confdeltype
+    const constraints = await pool.query<{ readonly contype: string; readonly conkey: string; readonly confkey: string | null; readonly confdeltype: string | null }>(`SELECT c.contype, c.conkey::TEXT, c.confkey::TEXT,
+      CASE WHEN c.contype = 'f' THEN c.confdeltype END AS confdeltype
       FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid WHERE t.relname = 'execution_dry_run_assessments'
         AND t.relnamespace = current_schema()::regnamespace AND c.contype IN ('p', 'u', 'f') ORDER BY c.contype`);
     assert.deepEqual(constraints.rows, [
