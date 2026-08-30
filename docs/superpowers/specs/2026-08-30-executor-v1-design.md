@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.3.1
+**Version de spécification :** 1.4.0
 
 **Date :** 2026-08-30
 
@@ -8,11 +8,17 @@
 
 **Issue parente :** #51
 
-**Périmètre livré à cette version :** #51-A (conception) et #51-B (fondation
-inerte des intentions d'exécution)
+**Périmètre livré à cette version :** #51-A (conception), #51-B (fondation
+inerte des intentions d'exécution) et conception détaillée #51-C (processus
+executor dry-run)
 
 ## Historique des versions
 
+- **1.4.0 — 2026-08-30 :** spécifie #51-C : processus executor séparé et
+  évaluation dry-run annexe déterministe. Le claim reste temporaire, le commit
+  atomique persiste l'évaluation et libère le lease sans transition, tentative
+  ou consommation de l'intention. Quote, build, simulation RPC, signature et
+  soumission restent réservés à #51-D et suivantes.
 - **1.3.1 — 2026-08-30 :** applique la preuve
   `RECONCILIATION_PROVED_NO_EFFECT` à toute transition qui lève l'état inconnu :
   vers `FAILED` comme vers `RETRY_READY`. Une autorisation de retry seule ne
@@ -468,6 +474,16 @@ le sizing et enregistre un résultat déterministe sans construire de capacité 
 signature ni appeler une méthode de soumission. Il doit fonctionner sans
 keypair.
 
+#51-C livre d'abord le processus, les claims, leases, reprises et évaluations
+annexes déterministes. Il ne change pas le statut métier, ne crée aucune
+tentative et laisse l'intention disponible pour #51-D. Son évaluation porte
+`FOUNDATION_VALIDATED`, avec une couverture limitée à `INTENT_AND_LEASE_ONLY`,
+et marque quote, build, simulation, signature et soumission `NOT_RUN`. Elle ne
+constitue donc aucune preuve de marché et n'est jamais présentée comme un
+`PASS` de trading. #51-D remplace ces absences par une quote fraîche, un build
+non signé et une simulation sans envoi. La conception détaillée est versionnée
+dans [2026-08-30-executor-dry-run-design.md](2026-08-30-executor-dry-run-design.md).
+
 ### 7.3 Simulation sans envoi
 
 La phase suivante construit une transaction non signée avec la clé publique
@@ -713,8 +729,9 @@ on-chain, soit la preuve qu'aucun effet on-chain n'a été possible. C'est
 seulement alors que `purge_after` est fixé à quatre heures. Un
 artefact signé reste conservé au minimum jusqu'à la preuve finalisée que son
 blockhash ne peut plus atterrir, puis suit cette même fenêtre. La purge supprime
-d'abord artefacts, tentatives et transitions, puis l'intention, dans une
-transaction rejouable. Elle publie seulement des compteurs agrégés.
+d'abord évaluations dry-run, artefacts, transitions et tentatives, puis
+l'intention, dans une transaction rejouable. Elle publie seulement des
+compteurs agrégés.
 
 Le plafond dur d'échéance réduit la fenêtre d'exécution et reste une défense en
 profondeur :
@@ -738,9 +755,10 @@ la ligne parente.
 
 La fondation #51-B fige une heure de coupure PostgreSQL puis verrouille une
 cohorte ordonnée d'identifiants terminaux et réconciliés. Les tombstones de
-cette cohorte exacte sont insérés avant que les transitions, tentatives puis
-intentions soient supprimées dans la même transaction. Une collision de
-tombstone fait échouer toute la purge, sans suppression partielle. Une ligne
+cette cohorte exacte sont insérés avant que les évaluations dry-run,
+transitions, tentatives puis intentions soient supprimées dans la même
+transaction. Une collision de tombstone fait échouer toute la purge, sans
+suppression partielle. Une ligne
 devenue éligible pendant la passe attend la passe suivante; une ligne ouverte,
 inconnue ou non réconciliée n'entre jamais dans la cohorte.
 
@@ -812,7 +830,7 @@ réaffecté à une autre signification.
 | --- | --- | --- |
 | #51-A | Cette spécification et le plan versionné | Aucune |
 | #51-B | Domaine, migration des intentions/tentatives/tombstones, repository, idempotence et rétention | Aucune |
-| #51-C | Processus executor en dry-run, claims, états et rapports factices | Aucune |
+| #51-C | Processus executor dry-run, claim temporaire et évaluation annexe sans consommer l'intention | Aucune |
 | #51-D | Quotes fraîches, build et `simulateTransaction` sans keypair ni envoi | Aucune |
 | #51-E | Réconciliation, verrou/réservation wallet, sizing, exposition, quota provider et matrice de fautes | Aucune |
 | #51-F | Preflight, status, kill switch, armement inerte, rapports opérateur et rôles PostgreSQL séparés | Aucune |
