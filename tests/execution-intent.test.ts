@@ -4,6 +4,7 @@ import {
   assertExecutionAttemptStatusReason,
   assertExecutionIntent,
   assertExecutionIntentTransition,
+  assertExecutionIntentTransitionReason,
   createExecutionIntentDraft,
   createExecutionIntentId,
   EXECUTION_INTENT_MAXIMUM_TTL_MS,
@@ -80,10 +81,51 @@ void test('publishes the exact immutable V1 status and reason vocabularies', () 
     'EXECUTION_STARTED', 'SIMULATION_SUCCEEDED', 'ATTEMPT_COMPLETED',
     'RETRY_AUTHORIZED', 'SIGNATURE_PERSISTED', 'SUBMISSION_ACCEPTED',
     'CONFIRMATION_OBSERVED', 'RECONCILIATION_STARTED', 'INTENT_SUCCEEDED',
-    'INTENT_CANCELLED',
+    'INTENT_CANCELLED', 'RECONCILIATION_PROVED_NO_EFFECT',
   ]);
   assert.ok(Object.isFrozen(EXECUTION_INTENT_STATUSES));
   assert.ok(Object.isFrozen(EXECUTION_INTENT_REASON_CODES));
+});
+
+void test('requires explicit no-effect proof to terminalize an unknown reconciliation state', () => {
+  assert.doesNotThrow(() => {
+    assertExecutionIntentTransitionReason(
+      'UNKNOWN_REQUIRES_RECONCILIATION',
+      'FAILED',
+      'RECONCILIATION_PROVED_NO_EFFECT',
+    );
+  });
+  for (const unsafeReason of [
+    'SUBMISSION_AMBIGUOUS',
+    'CONFIRMATION_TIMEOUT',
+    'RECONCILIATION_REQUIRED',
+    'QUOTE_STALE',
+  ]) {
+    assertValidationFailure(() => {
+      assertExecutionIntentTransitionReason(
+        'UNKNOWN_REQUIRES_RECONCILIATION', 'FAILED', unsafeReason,
+      );
+    });
+  }
+  for (const previous of ['PROCESSING', 'SIMULATED']) {
+    assertValidationFailure(() => {
+      assertExecutionIntentTransitionReason(
+        previous, 'FAILED', 'RECONCILIATION_PROVED_NO_EFFECT',
+      );
+    });
+    assert.doesNotThrow(() => {
+      assertExecutionIntentTransitionReason(previous, 'FAILED', 'QUOTE_STALE');
+    });
+  }
+  assert.doesNotThrow(() => {
+    assertExecutionIntentTransitionReason('PENDING', 'PROCESSING', 'EXECUTION_STARTED');
+  });
+  assertValidationFailure(() => {
+    assertExecutionIntentTransitionReason('PENDING', 'PROCESSING', 'QUOTE_STALE');
+  });
+  assertValidationFailure(() => {
+    assertExecutionIntentTransitionReason('PENDING', 'FAILED', 'QUOTE_STALE');
+  });
 });
 
 void test('rejects contradictory durable status and reason pairs', () => {

@@ -890,6 +890,60 @@ void test('public input validation is exact, bounded, typed, and does not invoke
   assert.equal(pool.connectCount, 0);
 });
 
+void test('transition rejects unsafe UNKNOWN terminalization before acquiring a database client', async () => {
+  for (const reasonCode of [
+    'SUBMISSION_AMBIGUOUS',
+    'CONFIRMATION_TIMEOUT',
+    'RECONCILIATION_REQUIRED',
+    'QUOTE_STALE',
+  ] as const) {
+    const claim = claimedIntent(executionDraft(`unsafe-unknown-${reasonCode}`),
+      'UNKNOWN_REQUIRES_RECONCILIATION', 0);
+    const pool = new ScriptedPool(new ScriptedClient([]));
+    const repository = new PostgresExecutionIntentRepository(pool);
+    await expectCode(repository.transition(claim, {
+      ...transitionInput(claim, 'FAILED'), reasonCode,
+    }), 'INVALID_INPUT');
+    assert.equal(pool.connectCount, 0);
+  }
+  for (const status of ['PROCESSING', 'SIMULATED'] as const) {
+    const claim = claimedIntent(executionDraft(`misplaced-proof-${status}`), status, 0);
+    const pool = new ScriptedPool(new ScriptedClient([]));
+    const repository = new PostgresExecutionIntentRepository(pool);
+    await expectCode(repository.transition(claim, {
+      ...transitionInput(claim, 'FAILED'),
+      reasonCode: 'RECONCILIATION_PROVED_NO_EFFECT',
+    }), 'INVALID_INPUT');
+    assert.equal(pool.connectCount, 0);
+  }
+});
+
+void test('transition accepts exact no-effect proof for UNKNOWN and persists terminal retention', async () => {
+  const draft = executionDraft('proved-no-effect');
+  const claim = claimedIntent(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0);
+  const terminal = intentRow(draft, {
+    status: 'FAILED', attempt_count: 0,
+    last_reason_code: 'RECONCILIATION_PROVED_NO_EFFECT', state_revision: '1',
+    terminal_at_ms: String(NOW_MS + 1), reconciliation_completed_at_ms: String(NOW_MS + 1),
+    purge_after_ms: String(NOW_MS + 14_400_001), updated_at_ms: String(NOW_MS + 1),
+  });
+  const client = new ScriptedClient([
+    command('BEGIN'), result([claimRow(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0)], 1),
+    result([ledgerRow(0)], 1), result([], 1), result([terminal], 1), command('COMMIT'),
+  ]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  const transitioned = await repository.transition(claim, {
+    ...transitionInput(claim, 'FAILED'),
+    reasonCode: 'RECONCILIATION_PROVED_NO_EFFECT',
+  });
+
+  assert.equal(transitioned.status, 'FAILED');
+  assert.equal(transitioned.lastReasonCode, 'RECONCILIATION_PROVED_NO_EFFECT');
+  assert.equal(transitioned.reconciliationCompletedAtMs, transitioned.terminalAtMs);
+  assert.equal(required(client.calls[3]).values?.[3], 'RECONCILIATION_PROVED_NO_EFFECT');
+});
+
 void test('a purged logical order cannot be recreated with fresh evidence and timestamps', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {

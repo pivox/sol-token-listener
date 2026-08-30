@@ -3,8 +3,7 @@ import { isProxy } from 'node:util/types';
 import {
   assertExecutionAttemptStatusReason,
   assertExecutionIntent,
-  assertExecutionIntentStatusReason,
-  assertExecutionIntentTransition,
+  assertExecutionIntentTransitionReason,
   EXECUTION_INTENT_REASON_CODES,
   EXECUTION_INTENT_STATUSES,
   type ExecutionIntentDraftV1,
@@ -862,8 +861,7 @@ function transitionInput(
     || expectedStatus !== claim.intent.status
     || leaseToken !== claim.leaseToken) throw inputError();
   try {
-    assertExecutionIntentTransition(expectedStatus, nextStatus);
-    assertExecutionIntentStatusReason(nextStatus, reasonCode);
+    assertExecutionIntentTransitionReason(expectedStatus, nextStatus, reasonCode);
   } catch {
     throw inputError();
   }

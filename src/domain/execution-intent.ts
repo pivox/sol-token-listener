@@ -62,6 +62,7 @@ export const EXECUTION_INTENT_REASON_CODES = Object.freeze([
   'RECONCILIATION_STARTED',
   'INTENT_SUCCEEDED',
   'INTENT_CANCELLED',
+  'RECONCILIATION_PROVED_NO_EFFECT',
 ] as const);
 
 export type ExecutionIntentStatus = (typeof EXECUTION_INTENT_STATUSES)[number];
@@ -243,6 +244,27 @@ export function assertExecutionIntentTransition(
   const prior = statusFrom(previous);
   const successor = statusFrom(next);
   if (!ALLOWED_TRANSITIONS.get(prior)?.has(successor)) throw invalid();
+}
+
+export function assertExecutionIntentTransitionReason(
+  previous: unknown,
+  next: unknown,
+  reason: unknown,
+): void {
+  try {
+    const prior = statusFrom(previous);
+    const successor = statusFrom(next);
+    const reasonCode = nullableReasonCodeFrom(reason);
+    if (reasonCode === null || !ALLOWED_TRANSITIONS.get(prior)?.has(successor)) throw invalid();
+    assertStatusReason(successor, reasonCode);
+    const provesUnknownHadNoEffect = prior === 'UNKNOWN_REQUIRES_RECONCILIATION'
+      && successor === 'FAILED';
+    if (provesUnknownHadNoEffect !== (reasonCode === 'RECONCILIATION_PROVED_NO_EFFECT')) {
+      throw invalid();
+    }
+  } catch {
+    throw invalid();
+  }
 }
 
 export function assertExecutionIntentStatusReason(

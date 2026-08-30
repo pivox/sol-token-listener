@@ -55,10 +55,59 @@ void test('execution intent migration defines the inert durable ledger contract'
   assert.match(executableSql, /evidence - ARRAY\['payloadVersion', 'attemptNumber', 'sourceEventId', 'observedAtMs'\]/u);
   assert.match(executableSql, /evidence \?& ARRAY\['payloadVersion', 'attemptNumber', 'sourceEventId', 'observedAtMs'\]/u);
   assert.match(executableSql, /execution_attempts_retention_check CHECK \(purge_after IS NULL\)/u);
+  for (const table of [
+    'execution_intents', 'execution_attempts', 'execution_intent_transitions',
+  ]) {
+    const definition = new RegExp(`CREATE TABLE IF NOT EXISTS ${table} \\(([\\s\\S]*?)\\);`, 'u')
+      .exec(executableSql)?.[1];
+    assert.ok(definition !== undefined);
+    assert.match(definition, /'RECONCILIATION_PROVED_NO_EFFECT'/u);
+  }
+  assert.match(
+    executableSql,
+    /execution_intent_transitions_reconciliation_proof_check CHECK \(\s*\(previous_status = 'UNKNOWN_REQUIRES_RECONCILIATION'\s+AND next_status = 'FAILED'\)\s*=\s*\(reason_code = 'RECONCILIATION_PROVED_NO_EFFECT'\)\s*\)/u,
+  );
   assert.match(executableSql, /evidence -> 'attemptNumber' = to_jsonb\(attempt_number\)/u);
   assert.match(executableSql, /quote_amount_raw NUMERIC,/u);
   assert.match(executableSql, /WHERE status = 'PENDING'/u);
   assert.doesNotMatch(executableSql, /signed_transaction|private_key|keypair/iu);
+});
+
+void test('database requires no-effect proof exclusively for UNKNOWN to FAILED transitions', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: reconciliation proof invariant test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, 'execution_intent_reconciliation_proof', async (pool) => {
+    await migrateDatabase({ pool });
+    const unknown = draft('unknown-proof-parent', 'BUY', 1n, null);
+    await insertIntent(pool, intentRow(unknown, { status: 'UNKNOWN_REQUIRES_RECONCILIATION' }));
+
+    for (const reasonCode of [
+      'SUBMISSION_AMBIGUOUS', 'CONFIRMATION_TIMEOUT', 'RECONCILIATION_REQUIRED', 'QUOTE_STALE',
+    ]) {
+      await assert.rejects(insertTransitionReason(pool, unknown.id,
+        'UNKNOWN_REQUIRES_RECONCILIATION', 'FAILED', reasonCode));
+    }
+    await insertTransitionReason(pool, unknown.id, 'UNKNOWN_REQUIRES_RECONCILIATION', 'FAILED',
+      'RECONCILIATION_PROVED_NO_EFFECT');
+
+    const processing = draft('misplaced-proof-parent', 'BUY', 1n, null);
+    await insertIntent(pool, intentRow(processing, {
+      status: 'PROCESSING', lastReasonCode: 'EXECUTION_STARTED',
+    }));
+    await assert.rejects(insertTransitionReason(pool, processing.id, 'PROCESSING', 'FAILED',
+      'RECONCILIATION_PROVED_NO_EFFECT'));
+
+    const failed = draft('proved-failed-parent', 'BUY', 1n, null);
+    await insertIntent(pool, intentRow(failed, {
+      status: 'FAILED', lastReasonCode: 'RECONCILIATION_PROVED_NO_EFFECT',
+      terminalAtMs: 1_000, reconciliationCompletedAtMs: 2_000, purgeAfterMs: 14_402_000,
+    }));
+    await insertAttemptWithReason(pool, processing.id, 1, 'ABANDONED',
+      'RECONCILIATION_PROVED_NO_EFFECT');
+  });
 });
 
 void test('database rejects lifetimes beyond four hours and contradictory reason semantics', async (context) => {
@@ -700,6 +749,35 @@ async function insertTransition(
   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::JSONB, $9)`, [
     intentId, 'PROCESSING', 'SIMULATED', 'SIMULATION_SUCCEEDED', 'migration test', 'NONE', attemptNumber,
     typeof evidence === 'string' ? evidence : JSON.stringify(evidence), timestampParameter(occurredAtMs),
+  ]);
+}
+
+async function insertTransitionReason(
+  pool: InstanceType<typeof pg.Pool>,
+  intentId: string,
+  previousStatus: string,
+  nextStatus: string,
+  reasonCode: string,
+): Promise<void> {
+  await pool.query(`INSERT INTO execution_intent_transitions (
+    intent_id,previous_status,next_status,reason_code,human_message,
+    activation_phase,attempt_number,evidence,occurred_at
+  ) VALUES ($1,$2,$3,$4,'reconciliation proof test','NONE',NULL,
+    '{"payloadVersion":1,"attemptNumber":null,"sourceEventId":null,"observedAtMs":0}'::JSONB,
+    to_timestamp(0))`, [intentId, previousStatus, nextStatus, reasonCode]);
+}
+
+async function insertAttemptWithReason(
+  pool: InstanceType<typeof pg.Pool>,
+  intentId: string,
+  attemptNumber: number,
+  status: 'ABANDONED',
+  reasonCode: string,
+): Promise<void> {
+  await pool.query(`INSERT INTO execution_attempts (
+    intent_id,attempt_number,status,effective_venue,provider_id,started_at,completed_at,reason_code
+  ) VALUES ($1,$2,$3,'PUMP_FUN','provider',to_timestamp(0),to_timestamp(1),$4)`, [
+    intentId, attemptNumber, status, reasonCode,
   ]);
 }
 
