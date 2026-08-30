@@ -194,6 +194,54 @@ void test('main exposes only executor scripts, exact bounded pool options and no
   assert.doesNotMatch(main, /(?:SOLANA_(?:HTTP|WS)_RPC_URL|PRIVATE_KEY|SECRET_KEY|KEYPAIR)/u);
 });
 
+void test('operator documentation describes the PostgreSQL-only, non-consuming executor dry-run', async () => {
+  const [environment, readme, architecture] = await Promise.all([
+    readFile(resolve(repositoryRoot, '.env.example'), 'utf8'),
+    readFile(resolve(repositoryRoot, 'README.md'), 'utf8'),
+    readFile(resolve(repositoryRoot, 'docs/architecture/pumpfun-v1.md'), 'utf8'),
+  ]);
+
+  const executorEnvironment = Object.fromEntries(
+    [...environment.matchAll(/^(EXECUTOR_[A-Z_]+|LIVE_TRADING_ENABLED)=(.*)$/gmu)]
+      .map((match) => [match[1] ?? '', match[2] ?? '']),
+  );
+  assert.deepEqual(executorEnvironment, {
+    EXECUTOR_MODE: 'dry-run',
+    EXECUTOR_POLL_MS: '1000',
+    EXECUTOR_LEASE_MS: '30000',
+    EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
+    EXECUTOR_SHUTDOWN_GRACE_MS: '10000',
+    LIVE_TRADING_ENABLED: 'false',
+  });
+  assert.equal((environment.match(/^DATABASE_URL=postgresql:\/\//gmu) ?? []).length, 1);
+  assert.match(environment, /executor dry-run[\s\S]*?ne requiert ni RPC Solana ni wallet/iu);
+  assert.doesNotMatch(environment, /EXECUTOR_(?:PRIVATE_KEY|SECRET_KEY|KEYPAIR|KEYPAIR_PATH)=/u);
+
+  assert.match(readme, /npm run build:backend\s+npm run db:migrate\s+EXECUTOR_MODE=dry-run DATABASE_URL=postgresql:\/\/\.\.\. npm run executor:start/u);
+  assert.match(readme, /listener[^\n]*`observe`\|`paper`/iu);
+  assert.match(readme, /ne requiert ni RPC Solana ni wallet/iu);
+  assert.match(readme, /FOUNDATION_VALIDATED/);
+  assert.match(readme, /INTENT_AND_LEASE_ONLY/);
+  assert.equal((readme.match(/NOT_RUN/g) ?? []).length, 5);
+  assert.match(readme, /ne consomme pas l'intention/iu);
+  assert.match(readme, /#51-D[^\n]*quote[^\n]*build[^\n]*simulateTransaction/iu);
+  assert.match(readme, /live[^\n]*(?:impossible|inutilisable)/iu);
+
+  assert.match(architecture, /### Exécuteur dry-run PostgreSQL non consommant \(#51-C\)/u);
+  const executorSection = architecture.slice(
+    architecture.indexOf('### Exécuteur dry-run PostgreSQL non consommant (#51-C)'),
+    architecture.indexOf('\n## ', architecture.indexOf('### Exécuteur dry-run PostgreSQL non consommant (#51-C)') + 1),
+  );
+  assert.match(executorSection, /FOUNDATION_VALIDATED/);
+  assert.match(executorSection, /INTENT_AND_LEASE_ONLY/);
+  assert.equal((executorSection.match(/NOT_RUN/g) ?? []).length, 5);
+  assert.match(executorSection, /ne consomme pas l'intention/iu);
+  assert.match(executorSection, /#51-D[^\n]*quote[^\n]*build[^\n]*simulateTransaction/iu);
+  assert.match(executorSection, /ne requiert ni RPC Solana ni wallet/iu);
+  assert.match(executorSection, /live[^\n]*(?:impossible|inutilisable)/iu);
+  assert.doesNotMatch(executorSection, /#51-[DEFG][^\n]*(?:livré|livrée|implemented|complete)/iu);
+});
+
 void test('process integration registers each child immediately and bounds TERM then KILL cleanup', async () => {
   const integration = await readFile(
     resolve(repositoryRoot, 'tests/executor-main.integration.test.ts'),

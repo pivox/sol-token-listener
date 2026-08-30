@@ -452,9 +452,29 @@ retrait : aucun mint, wallet, montant, quote ou payload. Les trois compteurs
 agrégés de suppression restent exposés par le seul événement de rétention.
 
 Cette fondation reste totalement non composée. Le bootstrap, l'API et les
-workers existants ne créent ni ne claim aucune intention. Aucun executor,
-wallet, builder, simulation, signature ou transport d'envoi n'est livré ici ;
-les lots #51-C à #51-G restent futurs.
+workers existants ne créent ni ne claim aucune intention. Le lot #51-B ne
+livre aucun executor, wallet, builder, simulation, signature ou transport
+d'envoi.
+
+### Exécuteur dry-run PostgreSQL non consommant (#51-C)
+
+Le processus executor séparé ne compose que PostgreSQL, le repository des
+intentions, l'assessment annexe et le cycle de vie Node. Il ne requiert ni RPC Solana ni wallet, ne charge aucune clé, ne signe rien et ne soumet aucune transaction. Le listener conserve exclusivement ses modes `observe` et `paper`; le live reste impossible dans #51-C.
+
+Sa configuration fermée est `EXECUTOR_MODE=dry-run`, `DATABASE_URL`,
+`EXECUTOR_POLL_MS=1000`, `EXECUTOR_LEASE_MS=30000`,
+`EXECUTOR_DB_STATEMENT_TIMEOUT_MS=3000`,
+`EXECUTOR_SHUTDOWN_GRACE_MS=10000` et `LIVE_TRADING_ENABLED=false`. Un secret,
+une keypair ou l'activation live fait échouer le bootstrap; `DATABASE_URL` est
+nécessaire mais jamais journalisée.
+
+Une intention `PENDING` ou `RETRY_READY` reçoit une assessment durable
+`FOUNDATION_VALIDATED` avec la couverture `INTENT_AND_LEASE_ONLY`. Les cinq
+gates restent `NOT_RUN` pour la quote, `NOT_RUN` pour la construction,
+`NOT_RUN` pour la simulation, `NOT_RUN` pour la signature et `NOT_RUN` pour la
+soumission. Cette assessment n'est ni une simulation Solana ni un `PASS` : elle
+ne consomme pas l'intention, ne crée aucune tentative ni transition, et libère
+uniquement le lease temporaire. L'intention demeure disponible pour #51-D, encore requis pour quote, build et `simulateTransaction`; #51-E, #51-F et #51-G restent à livrer.
 
 ## Persistance, reprise et rétention
 
