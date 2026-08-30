@@ -949,6 +949,38 @@ check, lint, docs et la suite complète. Passer la spec à `1.3.0` car l'ajout
 d'un reason code est une évolution mineure selon son propre contrat de
 versionnement.
 
+### Task 11: Refuser le retry sans preuve après une soumission ambiguë
+
+**Files:**
+- Modify: `src/domain/execution-intent.ts`
+- Modify: `migrations/031_execution_intents.sql`
+- Modify: `tests/execution-intent.test.ts`
+- Modify: `tests/execution-intent-migration.test.ts`
+- Modify: `tests/execution-intent.repository.test.ts`
+- Modify: `docs/superpowers/specs/2026-08-30-executor-v1-design.md`
+
+- [ ] **Step 1: Écrire les régressions RED du second finding GitHub P1**
+
+Exiger que `UNKNOWN_REQUIRES_RECONCILIATION -> RETRY_READY` refuse
+`RETRY_AUTHORIZED`, accepte uniquement `RECONCILIATION_PROVED_NO_EFFECT`, et
+soit rejetée avant toute connexion PostgreSQL si la preuve manque. Rejeter
+aussi toute ligne parent `RETRY_READY/RETRY_AUTHORIZED` au décodage et en base
+réelle afin qu'elle ne soit jamais réclamable.
+
+- [ ] **Step 2: Étendre l'invariant contextuel sans nouveau vocabulaire**
+
+Exiger le code de preuve comme dernier reason code de toute intention
+`RETRY_READY` : le graphe V1 n'a aucune autre entrée vers cet état. Étendre
+l'équivalence domaine et SQL aux deux sorties qui lèvent le blocage : `FAILED`
+et `RETRY_READY`. Conserver `RETRY_AUTHORIZED` uniquement dans le vocabulaire
+append-only, sans état ni transition active qui l'accepte.
+
+- [ ] **Step 3: Vérifier GREEN et la branche complète**
+
+Lancer les tests ciblés domaine/repository/migration avec PostgreSQL, puis
+build, check, lint, docs et la suite complète. Passer la spec à `1.3.1` : il
+s'agit d'une correction de conformité sans nouveau statut ni reason code.
+
 ## Critères de sortie de #51-B
 
 - migration 031 compatible base vide et replay ;

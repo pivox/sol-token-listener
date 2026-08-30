@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.3.0
+**Version de spécification :** 1.3.1
 
 **Date :** 2026-08-30
 
@@ -13,6 +13,12 @@ inerte des intentions d'exécution)
 
 ## Historique des versions
 
+- **1.3.1 — 2026-08-30 :** applique la preuve
+  `RECONCILIATION_PROVED_NO_EFFECT` à toute transition qui lève l'état inconnu :
+  vers `FAILED` comme vers `RETRY_READY`. Une autorisation de retry seule ne
+  constitue pas une preuve et ne peut pas rendre un BUY de nouveau exécutable.
+  La ligne parent `RETRY_READY` conserve obligatoirement la preuve afin qu'une
+  corruption ou insertion directe ne contourne pas le journal de transitions.
 - **1.3.0 — 2026-08-30 :** ajoute la preuve stable
   `RECONCILIATION_PROVED_NO_EFFECT` et l'exige pour terminaliser en `FAILED`
   une intention auparavant inconnue. Un timeout, une soumission ambiguë ou une
@@ -334,7 +340,6 @@ preuves structurées versionnées.
 
 Les transitions nominales utilisent obligatoirement le reason code du nouvel
 état : `PROCESSING/EXECUTION_STARTED`, `SIMULATED/SIMULATION_SUCCEEDED`,
-`RETRY_READY/RETRY_AUTHORIZED`,
 `SIGNED_NOT_SUBMITTED/SIGNATURE_PERSISTED`,
 `SUBMITTED/SUBMISSION_ACCEPTED`, `CONFIRMED/CONFIRMATION_OBSERVED`,
 `RECONCILING/RECONCILIATION_STARTED`, `SUCCEEDED/INTENT_SUCCEEDED` et
@@ -346,9 +351,13 @@ d'échec et refuse `ATTEMPT_COMPLETED` ainsi que les autres codes positifs.
 Ces couples sont validés avant toute connexion PostgreSQL, au décodage et par
 les contraintes des tables durables concernées.
 
-La transition `UNKNOWN_REQUIRES_RECONCILIATION -> FAILED` est plus stricte :
-elle exige exactement `RECONCILIATION_PROVED_NO_EFFECT`, preuve durable que la
-transaction auparavant ambiguë ne peut plus produire aucun effet on-chain.
+Les transitions `UNKNOWN_REQUIRES_RECONCILIATION -> FAILED|RETRY_READY` sont
+plus strictes : elles exigent exactement `RECONCILIATION_PROVED_NO_EFFECT`,
+preuve durable que la transaction auparavant ambiguë ne peut plus produire
+aucun effet on-chain. Dans ce cas contextuel, l'intention durable
+`RETRY_READY` conserve obligatoirement ce code de preuve comme dernier reason
+code. Le code append-only `RETRY_AUTHORIZED` reste réservé à une évolution du
+graphe mais n'autorise aucun état ni transition de la V1 actuelle.
 `SUBMISSION_AMBIGUOUS`, `CONFIRMATION_TIMEOUT` et
 `RECONCILIATION_REQUIRED` maintiennent l'intention dans un état non terminal ;
 ils ne fixent jamais `reconciliation_completed_at` et ne planifient jamais sa
