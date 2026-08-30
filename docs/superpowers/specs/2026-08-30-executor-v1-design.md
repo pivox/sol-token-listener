@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.2.0
+**Version de spécification :** 1.3.0
 
 **Date :** 2026-08-30
 
@@ -13,6 +13,11 @@ inerte des intentions d'exécution)
 
 ## Historique des versions
 
+- **1.3.0 — 2026-08-30 :** ajoute la preuve stable
+  `RECONCILIATION_PROVED_NO_EFFECT` et l'exige pour terminaliser en `FAILED`
+  une intention auparavant inconnue. Un timeout, une soumission ambiguë ou une
+  réconciliation encore requise ne peuvent plus lever le blocage global ni
+  rendre l'intention purgeable.
 - **1.2.0 — 2026-08-30 :** ajoute un tombstone anti-rejeu durable et minimal
   pour l'identité et la clé logique d'une intention purgée. Le plafond TTL de
   quatre heures reste une défense en profondeur mais n'est plus présenté comme
@@ -340,6 +345,14 @@ Les transitions nominales utilisent obligatoirement le reason code du nouvel
 d'échec et refuse `ATTEMPT_COMPLETED` ainsi que les autres codes positifs.
 Ces couples sont validés avant toute connexion PostgreSQL, au décodage et par
 les contraintes des tables durables concernées.
+
+La transition `UNKNOWN_REQUIRES_RECONCILIATION -> FAILED` est plus stricte :
+elle exige exactement `RECONCILIATION_PROVED_NO_EFFECT`, preuve durable que la
+transaction auparavant ambiguë ne peut plus produire aucun effet on-chain.
+`SUBMISSION_AMBIGUOUS`, `CONFIRMATION_TIMEOUT` et
+`RECONCILIATION_REQUIRED` maintiennent l'intention dans un état non terminal ;
+ils ne fixent jamais `reconciliation_completed_at` et ne planifient jamais sa
+purge. Le code de preuve ne peut pas être réutilisé pour une autre transition.
 
 ### 5.4 Leases et crash/reprise
 
@@ -765,6 +778,7 @@ SIGNATURE_PERSIST_FAILED
 SUBMISSION_AMBIGUOUS
 CONFIRMATION_TIMEOUT
 RECONCILIATION_REQUIRED
+RECONCILIATION_PROVED_NO_EFFECT
 BALANCE_MISMATCH
 RESIDUAL_TOKEN_BALANCE
 DOUBLE_ORDER_SUSPECTED

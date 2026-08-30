@@ -913,6 +913,42 @@ Expected: zéro échec, aucune résurrection possible avec des timestamps frais,
 aucune capacité de signature ou de soumission ajoutée. Passer la spec à
 `1.2.0` et obtenir les revues conformité puis qualité.
 
+### Task 10: Refuser la terminalisation d'une réconciliation ambiguë
+
+**Files:**
+- Modify: `src/domain/execution-intent.ts`
+- Modify: `src/storage/execution-intent.repository.ts`
+- Modify: `migrations/031_execution_intents.sql`
+- Modify: `tests/execution-intent.test.ts`
+- Modify: `tests/execution-intent-migration.test.ts`
+- Modify: `tests/execution-intent.repository.test.ts`
+- Modify: `docs/superpowers/specs/2026-08-30-executor-v1-design.md`
+
+- [ ] **Step 1: Écrire les régressions RED du finding GitHub P1**
+
+Exiger que `UNKNOWN_REQUIRES_RECONCILIATION -> FAILED` refuse
+`SUBMISSION_AMBIGUOUS`, `CONFIRMATION_TIMEOUT`, `RECONCILIATION_REQUIRED` et
+tout échec générique. Exiger qu'elle accepte uniquement
+`RECONCILIATION_PROVED_NO_EFFECT`. Vérifier que le repository rejette avant
+toute connexion et que PostgreSQL refuse aussi une transition contournant le
+repository.
+
+- [ ] **Step 2: Ajouter le reason code stable et le validateur contextuel**
+
+Ajouter `RECONCILIATION_PROVED_NO_EFFECT` au vocabulaire append-only. Le
+validateur domaine doit connaître ancien état, nouvel état et reason code : le
+code de preuve est obligatoire uniquement pour `UNKNOWN... -> FAILED` et
+interdit sur toute autre transition. Conserver les règles existantes des
+autres états `FAILED` pré-signature.
+
+- [ ] **Step 3: Appliquer la défense PostgreSQL et valider**
+
+Aligner les contraintes des intentions, transitions et reason codes. Lancer
+les tests domaine/repository/migration avec `TEST_DATABASE_URL`, puis build,
+check, lint, docs et la suite complète. Passer la spec à `1.3.0` car l'ajout
+d'un reason code est une évolution mineure selon son propre contrat de
+versionnement.
+
 ## Critères de sortie de #51-B
 
 - migration 031 compatible base vide et replay ;
