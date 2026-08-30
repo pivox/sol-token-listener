@@ -3,17 +3,17 @@
 Date: 2026-08-28
 Issue: #63
 Parent issue: #57
-Version: 1.0.2
+Version: 1.0.3
 Status: approved through the standing instruction to use the recommended option
 
-Revision 1.0.2 makes the delayed activation path as strict as the former paper
+Revision 1.0.3 makes the delayed activation path as strict as the former paper
 startup barrier. Paper readiness now requires both a running promoted
 WebSocket provider and a successful current finality pass, with a fence before
 claim and every durable paper mutation. It also serializes supervisor cleanup
 before downstream workers, defines candidate completion versus promotion,
-fences and closes every incumbent before publishing `UNRECOVERABLE`, and keeps
-the genesis hash optional in deployment wiring only when the listener is
-disabled.
+fences, aborts and detaches every incumbent, then waits for its single bounded
+close attempt before publishing `UNRECOVERABLE`. It keeps the genesis hash
+optional in deployment wiring only when the listener is disabled.
 
 ## Purpose
 
@@ -126,15 +126,16 @@ interface WebSocketFailoverSupervisor {
 `start()` performs the durable owner acquisition, starts its fenced health
 touch, persists the initial waiting state and arms exactly one recovery loop.
 It then resolves without waiting indefinitely for a provider. This lets the
-public health API expose `CONNECTING`, `RECOVERING`, `DEGRADED` or
-`UNRECOVERABLE` while recovery continues. It rejects only when the owner,
-initial health transition or recovery-loop scheduling cannot be established
-safely.
+public health API expose `CONNECTING`, `RECOVERING` or `DEGRADED` while
+recovery continues, then `UNRECOVERABLE` if the terminal proof stops automatic
+recovery. It rejects only when the owner, initial health transition or
+recovery-loop scheduling cannot be established safely.
 
 The runtime projection reports `RUNNING` only when the supervisor's durable
 phase is `RUNNING`. Connecting and recovering map to `STARTING`; transient and
-unrecoverable states map to `DEGRADED`; close maps to `STOPPING` then
-`STOPPED`.
+unrecoverable states map to `DEGRADED`. Close first maps to `STOPPING`, then to
+`STOPPED` only after complete cleanup; a rejected or timed-out cleanup rejects
+with fixed evidence and leaves the runtime `DEGRADED`.
 
 ## Notification boundary
 
@@ -183,13 +184,15 @@ For a fresh process:
 9. A serialized local promotion fence orders lifecycle events before the
    transition is sent. The successful durable transition is the publication
    point, and the promoted provider selector is updated immediately afterward.
-10. Any incumbent is detached and then closed. Its late completion cannot
-    modify the promoted generation.
+10. Any incumbent is detached and receives one bounded close attempt. Its late
+    completion cannot modify the promoted generation; a rejected close
+    degrades the new active generation with fixed cleanup evidence.
 
 Every new candidate generation is the exact next value authorized by the
 health repository revision fence. Candidate setup failure or failed recovery
-is cleaned before that candidate is removed from durable health. At most one
-incumbent and one candidate exist.
+triggers one bounded cleanup attempt before that candidate is removed from
+durable health. A rejected attempt produces the fixed cleanup failure and
+cannot authorize promotion. At most one incumbent and one candidate exist.
 
 ## Recovery, rotation and backoff
 
@@ -238,13 +241,17 @@ operator-controlled recovery work. Restart always re-enters dual ACK and
 strict catch-up; it never selects `live-edge`.
 
 Before persisting `UNRECOVERABLE`, publication is fenced, provider selection is
-cleared, and every candidate and incumbent is aborted, closed and removed,
-including a still-connected incumbent. Notifications arriving after the fence
-cannot enter the durable inbox. The terminal snapshot therefore exposes no
-active or candidate provider pair. No setup, backoff, periodic or recovery
-timer remains armed. Qualification may retain evidence already persisted
-before the terminal fence, but paper readiness is false and no paper position
-mutation is authorized.
+cleared, and every candidate and incumbent is aborted, detached and subjected
+to its single bounded close attempt, including a still-connected incumbent.
+The terminal transition waits for that attempt to settle. A rejected close
+does not reopen publication or recovery: the supervisor persists the
+fail-closed terminal state, records cleanup failure internally, and its later
+`close()` rejects with the fixed cleanup error. Notifications arriving after
+the fence cannot enter the durable inbox. The terminal snapshot therefore
+exposes no active or candidate provider pair. No setup, backoff, periodic or
+recovery timer remains armed. Qualification may retain evidence already
+persisted before the terminal fence, but paper readiness is false and no paper
+position mutation is authorized.
 
 ## Cooperative scan cancellation
 
@@ -340,9 +347,11 @@ invalid, aborts its scan and forbids `RUNNING`. A completion delivered after
 the fence while the PostgreSQL transition is pending is queued, not discarded.
 If the transition commits, the queued completion belongs to the newly active
 session and immediately persists degradation; if the transition fails, the
-candidate never becomes active and the same completion invalidates and closes
-it. No simple invocation is treated as a successful durable promotion, and a
-role-changing candidate completion is never mistaken for a stale generation.
+candidate never becomes active and the same completion invalidates it before
+one bounded close attempt. A rejected attempt produces the fixed cleanup
+failure. No simple invocation is treated as a successful durable promotion,
+and a role-changing candidate completion is never mistaken for a stale
+generation.
 
 ## Crash and idempotence matrix
 
