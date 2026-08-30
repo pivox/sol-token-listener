@@ -170,7 +170,7 @@ ExecutionIntentStatus, ExecutionIntentReasonCode
 >>> = Object.freeze({
   PROCESSING: 'EXECUTION_STARTED',
   SIMULATED: 'SIMULATION_SUCCEEDED',
-  RETRY_READY: 'RETRY_AUTHORIZED',
+  RETRY_READY: 'RECONCILIATION_PROVED_NO_EFFECT',
   SIGNED_NOT_SUBMITTED: 'SIGNATURE_PERSISTED',
   SUBMITTED: 'SUBMISSION_ACCEPTED',
   CONFIRMED: 'CONFIRMATION_OBSERVED',
@@ -258,7 +258,7 @@ export function assertExecutionIntentTransitionReason(
     if (reasonCode === null || !ALLOWED_TRANSITIONS.get(prior)?.has(successor)) throw invalid();
     assertStatusReason(successor, reasonCode);
     const provesUnknownHadNoEffect = prior === 'UNKNOWN_REQUIRES_RECONCILIATION'
-      && successor === 'FAILED';
+      && (successor === 'FAILED' || successor === 'RETRY_READY');
     if (provesUnknownHadNoEffect !== (reasonCode === 'RECONCILIATION_PROVED_NO_EFFECT')) {
       throw invalid();
     }

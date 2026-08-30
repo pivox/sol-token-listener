@@ -198,7 +198,8 @@ CREATE TABLE IF NOT EXISTS execution_intents (
     (status = 'PENDING' AND last_reason_code IS NULL)
     OR (status = 'PROCESSING' AND last_reason_code = 'EXECUTION_STARTED')
     OR (status = 'SIMULATED' AND last_reason_code = 'SIMULATION_SUCCEEDED')
-    OR (status = 'RETRY_READY' AND last_reason_code = 'RETRY_AUTHORIZED')
+    OR (status = 'RETRY_READY'
+      AND last_reason_code = 'RECONCILIATION_PROVED_NO_EFFECT')
     OR (status = 'SIGNED_NOT_SUBMITTED' AND last_reason_code = 'SIGNATURE_PERSISTED')
     OR (status = 'SUBMITTED' AND last_reason_code = 'SUBMISSION_ACCEPTED')
     OR (status = 'CONFIRMED' AND last_reason_code = 'CONFIRMATION_OBSERVED')
@@ -363,7 +364,8 @@ CREATE TABLE IF NOT EXISTS execution_intent_transitions (
   CONSTRAINT execution_intent_transitions_status_reason_check CHECK (
     (next_status = 'PROCESSING' AND reason_code = 'EXECUTION_STARTED')
     OR (next_status = 'SIMULATED' AND reason_code = 'SIMULATION_SUCCEEDED')
-    OR (next_status = 'RETRY_READY' AND reason_code = 'RETRY_AUTHORIZED')
+    OR (next_status = 'RETRY_READY'
+      AND reason_code = 'RECONCILIATION_PROVED_NO_EFFECT')
     OR (next_status = 'SIGNED_NOT_SUBMITTED' AND reason_code = 'SIGNATURE_PERSISTED')
     OR (next_status = 'SUBMITTED' AND reason_code = 'SUBMISSION_ACCEPTED')
     OR (next_status = 'CONFIRMED' AND reason_code = 'CONFIRMATION_OBSERVED')
@@ -381,7 +383,8 @@ CREATE TABLE IF NOT EXISTS execution_intent_transitions (
     ))
   ),
   CONSTRAINT execution_intent_transitions_reconciliation_proof_check CHECK (
-    (previous_status = 'UNKNOWN_REQUIRES_RECONCILIATION' AND next_status = 'FAILED')
+    (previous_status = 'UNKNOWN_REQUIRES_RECONCILIATION'
+      AND next_status IN ('FAILED', 'RETRY_READY'))
     = (reason_code = 'RECONCILIATION_PROVED_NO_EFFECT')
   ),
   CONSTRAINT execution_intent_transitions_human_message_check CHECK (

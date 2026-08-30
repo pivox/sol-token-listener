@@ -231,6 +231,20 @@ void test('claim rejects a well-shaped row that contradicts the requested lease 
   }), 'INVALID_DATA');
 });
 
+void test('claim rejects a RETRY_READY parent without durable no-effect proof', async () => {
+  const draft = executionDraft('claim-unsafe-retry-parent');
+  const client = new ScriptedClient([(_text, values) => result([{
+    ...claimRow(draft, 'RETRY_READY', 0),
+    last_reason_code: 'RETRY_AUTHORIZED',
+    lease_token: values?.[2], claim_at_ms: String(NOW_MS),
+  }], 1)]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  await expectCode(repository.claim({
+    ownerId: 'worker-1', leaseMs: 30_000, purpose: 'EXECUTE',
+  }), 'INVALID_DATA');
+});
+
 void test('claim validates its database claim instant and EXECUTE expiry postconditions', async () => {
   const draft = executionDraft('claim-postconditions');
   const malformedRows = [
@@ -906,6 +920,16 @@ void test('transition rejects unsafe UNKNOWN terminalization before acquiring a 
     }), 'INVALID_INPUT');
     assert.equal(pool.connectCount, 0);
   }
+  {
+    const claim = claimedIntent(executionDraft('unsafe-unknown-retry'),
+      'UNKNOWN_REQUIRES_RECONCILIATION', 0);
+    const pool = new ScriptedPool(new ScriptedClient([]));
+    const repository = new PostgresExecutionIntentRepository(pool);
+    await expectCode(repository.transition(claim, {
+      ...transitionInput(claim, 'RETRY_READY'), reasonCode: 'RETRY_AUTHORIZED',
+    }), 'INVALID_INPUT');
+    assert.equal(pool.connectCount, 0);
+  }
   for (const status of ['PROCESSING', 'SIMULATED'] as const) {
     const claim = claimedIntent(executionDraft(`misplaced-proof-${status}`), status, 0);
     const pool = new ScriptedPool(new ScriptedClient([]));
@@ -941,6 +965,31 @@ void test('transition accepts exact no-effect proof for UNKNOWN and persists ter
   assert.equal(transitioned.status, 'FAILED');
   assert.equal(transitioned.lastReasonCode, 'RECONCILIATION_PROVED_NO_EFFECT');
   assert.equal(transitioned.reconciliationCompletedAtMs, transitioned.terminalAtMs);
+  assert.equal(required(client.calls[3]).values?.[3], 'RECONCILIATION_PROVED_NO_EFFECT');
+});
+
+void test('transition accepts exact no-effect proof before making UNKNOWN retryable', async () => {
+  const draft = executionDraft('proved-retry-safe');
+  const claim = claimedIntent(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0);
+  const retryReady = claimRow(draft, 'RETRY_READY', 0);
+  Object.assign(retryReady, {
+    last_reason_code: 'RECONCILIATION_PROVED_NO_EFFECT', state_revision: '1',
+    updated_at_ms: String(NOW_MS + 1),
+  });
+  const client = new ScriptedClient([
+    command('BEGIN'), result([claimRow(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0)], 1),
+    result([ledgerRow(0)], 1), result([], 1), result([retryReady], 1), command('COMMIT'),
+  ]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  const transitioned = await repository.transition(claim, {
+    ...transitionInput(claim, 'RETRY_READY'),
+    reasonCode: 'RECONCILIATION_PROVED_NO_EFFECT',
+  });
+
+  assert.equal(transitioned.status, 'RETRY_READY');
+  assert.equal(transitioned.lastReasonCode, 'RECONCILIATION_PROVED_NO_EFFECT');
+  assert.equal(transitioned.reconciliationCompletedAtMs, null);
   assert.equal(required(client.calls[3]).values?.[3], 'RECONCILIATION_PROVED_NO_EFFECT');
 });
 
@@ -1612,7 +1661,7 @@ function reasonForStatus(status: ExecutionIntentStatus): ExecutionIntentV1['last
   const reasons: Readonly<Partial<Record<ExecutionIntentStatus, ExecutionIntentV1['lastReasonCode']>>> = {
     PROCESSING: 'EXECUTION_STARTED',
     SIMULATED: 'SIMULATION_SUCCEEDED',
-    RETRY_READY: 'RETRY_AUTHORIZED',
+    RETRY_READY: 'RECONCILIATION_PROVED_NO_EFFECT',
     SIGNED_NOT_SUBMITTED: 'SIGNATURE_PERSISTED',
     SUBMITTED: 'SUBMISSION_ACCEPTED',
     CONFIRMED: 'CONFIRMATION_OBSERVED',

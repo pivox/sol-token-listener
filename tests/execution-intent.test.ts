@@ -87,12 +87,24 @@ void test('publishes the exact immutable V1 status and reason vocabularies', () 
   assert.ok(Object.isFrozen(EXECUTION_INTENT_REASON_CODES));
 });
 
-void test('requires explicit no-effect proof to terminalize an unknown reconciliation state', () => {
+void test('requires explicit no-effect proof before releasing an unknown reconciliation state', () => {
   assert.doesNotThrow(() => {
     assertExecutionIntentTransitionReason(
       'UNKNOWN_REQUIRES_RECONCILIATION',
       'FAILED',
       'RECONCILIATION_PROVED_NO_EFFECT',
+    );
+  });
+  assert.doesNotThrow(() => {
+    assertExecutionIntentTransitionReason(
+      'UNKNOWN_REQUIRES_RECONCILIATION',
+      'RETRY_READY',
+      'RECONCILIATION_PROVED_NO_EFFECT',
+    );
+  });
+  assertValidationFailure(() => {
+    assertExecutionIntentTransitionReason(
+      'UNKNOWN_REQUIRES_RECONCILIATION', 'RETRY_READY', 'RETRY_AUTHORIZED',
     );
   });
   for (const unsafeReason of [
@@ -132,7 +144,6 @@ void test('rejects contradictory durable status and reason pairs', () => {
   const exactReasons = {
     PROCESSING: 'EXECUTION_STARTED',
     SIMULATED: 'SIMULATION_SUCCEEDED',
-    RETRY_READY: 'RETRY_AUTHORIZED',
     SIGNED_NOT_SUBMITTED: 'SIGNATURE_PERSISTED',
     SUBMITTED: 'SUBMISSION_ACCEPTED',
     CONFIRMED: 'CONFIRMATION_OBSERVED',
@@ -146,6 +157,12 @@ void test('rejects contradictory durable status and reason pairs', () => {
   }
   assert.doesNotThrow(() => { assertExecutionIntent(validRecord({
     status: 'UNKNOWN_REQUIRES_RECONCILIATION', lastReasonCode: 'RECONCILIATION_REQUIRED',
+  })); });
+  assert.doesNotThrow(() => { assertExecutionIntent(validRecord({
+    status: 'RETRY_READY', lastReasonCode: 'RECONCILIATION_PROVED_NO_EFFECT',
+  })); });
+  assertValidationFailure(() => { assertExecutionIntent(validRecord({
+    status: 'RETRY_READY', lastReasonCode: 'RETRY_AUTHORIZED',
   })); });
   assertValidationFailure(() => { assertExecutionIntent(validRecord({
     status: 'UNKNOWN_REQUIRES_RECONCILIATION', lastReasonCode: 'INTENT_DUPLICATE',

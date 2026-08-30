@@ -65,15 +65,19 @@ void test('execution intent migration defines the inert durable ledger contract'
   }
   assert.match(
     executableSql,
-    /execution_intent_transitions_reconciliation_proof_check CHECK \(\s*\(previous_status = 'UNKNOWN_REQUIRES_RECONCILIATION'\s+AND next_status = 'FAILED'\)\s*=\s*\(reason_code = 'RECONCILIATION_PROVED_NO_EFFECT'\)\s*\)/u,
+    /execution_intent_transitions_reconciliation_proof_check CHECK \(\s*\(previous_status = 'UNKNOWN_REQUIRES_RECONCILIATION'\s+AND next_status IN \('FAILED', 'RETRY_READY'\)\)\s*=\s*\(reason_code = 'RECONCILIATION_PROVED_NO_EFFECT'\)\s*\)/u,
   );
+  assert.match(executableSql,
+    /status = 'RETRY_READY'\s+AND last_reason_code = 'RECONCILIATION_PROVED_NO_EFFECT'/u);
+  assert.match(executableSql,
+    /next_status = 'RETRY_READY'\s+AND reason_code = 'RECONCILIATION_PROVED_NO_EFFECT'/u);
   assert.match(executableSql, /evidence -> 'attemptNumber' = to_jsonb\(attempt_number\)/u);
   assert.match(executableSql, /quote_amount_raw NUMERIC,/u);
   assert.match(executableSql, /WHERE status = 'PENDING'/u);
   assert.doesNotMatch(executableSql, /signed_transaction|private_key|keypair/iu);
 });
 
-void test('database requires no-effect proof exclusively for UNKNOWN to FAILED transitions', async (context) => {
+void test('database requires no-effect proof exclusively when UNKNOWN becomes terminal or retryable', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: reconciliation proof invariant test skipped');
@@ -92,6 +96,22 @@ void test('database requires no-effect proof exclusively for UNKNOWN to FAILED t
     }
     await insertTransitionReason(pool, unknown.id, 'UNKNOWN_REQUIRES_RECONCILIATION', 'FAILED',
       'RECONCILIATION_PROVED_NO_EFFECT');
+
+    const retry = draft('unknown-retry-proof-parent', 'BUY', 1n, null);
+    await insertIntent(pool, intentRow(retry, { status: 'UNKNOWN_REQUIRES_RECONCILIATION' }));
+    await assert.rejects(insertTransitionReason(pool, retry.id,
+      'UNKNOWN_REQUIRES_RECONCILIATION', 'RETRY_READY', 'RETRY_AUTHORIZED'));
+    await insertTransitionReason(pool, retry.id, 'UNKNOWN_REQUIRES_RECONCILIATION', 'RETRY_READY',
+      'RECONCILIATION_PROVED_NO_EFFECT');
+
+    const unsafeRetryParent = draft('unsafe-retry-parent', 'BUY', 1n, null);
+    await assert.rejects(insertIntent(pool, intentRow(unsafeRetryParent, {
+      status: 'RETRY_READY', lastReasonCode: 'RETRY_AUTHORIZED',
+    })));
+    const provedRetryParent = draft('proved-retry-parent', 'BUY', 1n, null);
+    await insertIntent(pool, intentRow(provedRetryParent, {
+      status: 'RETRY_READY', lastReasonCode: 'RECONCILIATION_PROVED_NO_EFFECT',
+    }));
 
     const processing = draft('misplaced-proof-parent', 'BUY', 1n, null);
     await insertIntent(pool, intentRow(processing, {
@@ -691,7 +711,8 @@ function intentRow(draftValue: ReturnType<typeof draft>, overrides: Partial<Inte
 function migrationReasonForStatus(status: string): string | null {
   const reasons: Readonly<Record<string, string>> = {
     PROCESSING: 'EXECUTION_STARTED', SIMULATED: 'SIMULATION_SUCCEEDED',
-    RETRY_READY: 'RETRY_AUTHORIZED', SIGNED_NOT_SUBMITTED: 'SIGNATURE_PERSISTED',
+    RETRY_READY: 'RECONCILIATION_PROVED_NO_EFFECT',
+    SIGNED_NOT_SUBMITTED: 'SIGNATURE_PERSISTED',
     SUBMITTED: 'SUBMISSION_ACCEPTED', CONFIRMED: 'CONFIRMATION_OBSERVED',
     RECONCILING: 'RECONCILIATION_STARTED', SUCCEEDED: 'INTENT_SUCCEEDED',
     FAILED: 'QUOTE_STALE', EXPIRED: 'INTENT_EXPIRED', CANCELLED: 'INTENT_CANCELLED',
