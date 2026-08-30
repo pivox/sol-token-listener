@@ -100,6 +100,8 @@ export class ExecutionIntentValidationError extends TypeError {
 }
 
 const EXECUTION_INTENT_PAYLOAD_VERSION = 1 as const;
+const INT32_MAX = 2_147_483_647;
+const DATE_MAX_MS = 8_640_000_000_000_000;
 const U64_MAX = 18_446_744_073_709_551_615n;
 const RETENTION_MS = 14_400_000;
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -419,11 +421,11 @@ function nullableReasonCodeFrom(value: unknown): ExecutionIntentReasonCode | nul
 }
 
 function positiveIntegerFrom(value: unknown): number {
-  return boundedIntegerFrom(value, 1, Number.MAX_SAFE_INTEGER);
+  return boundedIntegerFrom(value, 1, INT32_MAX);
 }
 
 function nonNegativeIntegerFrom(value: unknown): number {
-  return boundedIntegerFrom(value, 0, Number.MAX_SAFE_INTEGER);
+  return boundedIntegerFrom(value, 0, INT32_MAX);
 }
 
 function boundedIntegerFrom(value: unknown, minimum: number, maximum: number): number {
@@ -434,7 +436,7 @@ function boundedIntegerFrom(value: unknown, minimum: number, maximum: number): n
 }
 
 function timestampFrom(value: unknown): number {
-  return nonNegativeIntegerFrom(value);
+  return boundedIntegerFrom(value, 0, DATE_MAX_MS);
 }
 
 function nullableTimestampFrom(value: unknown): number | null {

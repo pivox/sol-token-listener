@@ -7,12 +7,17 @@ import {
   createExecutionIntentId,
   EXECUTION_INTENT_REASON_CODES,
   EXECUTION_INTENT_STATUSES,
+  ExecutionIntentValidationError,
   type ExecutionIntentDraftV1,
+  type ExecutionIntentStatus,
   type ExecutionIntentV1,
 } from '../src/domain/execution-intent.js';
 
 const REQUESTED_AT_MS = 1_787_990_400_000;
 const EXPIRES_AT_MS = 1_787_990_445_000;
+const DATE_MAX_MS = 8_640_000_000_000_000;
+const INT32_MAX = 2_147_483_647;
+const U64_MAX = 18_446_744_073_709_551_615n;
 
 void test('creates one frozen deterministic BUY intent using bigint amounts', () => {
   const first = createExecutionIntentDraft(validInput());
@@ -20,11 +25,23 @@ void test('creates one frozen deterministic BUY intent using bigint amounts', ()
 
   assert.equal(first.id, createExecutionIntentId(first));
   assert.equal(first.id, second.id);
+  assert.equal(first.id, 'execution_intent_a8328e3681bbe158a8b06cd586cb02bbb187ef88d121bdefce05818b743e7b44');
   assert.equal(first.logicalOrderKey, 'paper_open_abc');
   assert.equal(first.payloadVersion, 1);
   assert.equal(first.quoteAmountRaw, 500_000n);
   assert.equal(first.baseAmountRaw, null);
   assert.equal(Object.isFrozen(first), true);
+});
+
+void test('uses length-prefixed identity fields that cannot collide through concatenation', () => {
+  const first = createExecutionIntentId({
+    strategyId: 'a', strategyVersion: 12, positionId: 'c', side: 'BUY', logicalCommandId: 'd',
+  });
+  const second = createExecutionIntentId({
+    strategyId: 'a1', strategyVersion: 2, positionId: 'c', side: 'BUY', logicalCommandId: 'd',
+  });
+
+  assert.notEqual(first, second);
 });
 
 void test('publishes the exact immutable V1 status and reason vocabularies', () => {
@@ -83,6 +100,73 @@ void test('accepts SELL only with a positive base bigint amount', () => {
   assert.equal(sell.quoteAmountRaw, null);
 });
 
+void test('accepts PostgreSQL integer and Date bounds but rejects one past each bound', () => {
+  const maxDraft = createExecutionIntentDraft(validInput({
+    strategyVersion: INT32_MAX,
+    requestedAtMs: DATE_MAX_MS - 1,
+    expiresAtMs: DATE_MAX_MS,
+  }));
+  const maxRecord = validRecord({
+    ...maxDraft,
+    status: 'PROCESSING',
+    attemptCount: INT32_MAX,
+    createdAtMs: DATE_MAX_MS,
+    updatedAtMs: DATE_MAX_MS,
+  });
+
+  assert.equal(maxDraft.strategyVersion, INT32_MAX);
+  assert.equal(maxDraft.expiresAtMs, DATE_MAX_MS);
+  assert.equal(maxRecord.attemptCount, INT32_MAX);
+  assert.doesNotThrow(() => { assertExecutionIntent(maxRecord); });
+  assertValidationFailure(() => createExecutionIntentDraft(validInput({ strategyVersion: INT32_MAX + 1 })));
+  assertValidationFailure(() => createExecutionIntentDraft(validInput({
+    requestedAtMs: DATE_MAX_MS,
+    expiresAtMs: DATE_MAX_MS + 1,
+  })));
+  assertValidationFailure(() => {
+    assertExecutionIntent(validRecord({ status: 'PROCESSING', attemptCount: INT32_MAX + 1 }));
+  });
+  const terminalRecord = validRecord({
+    status: 'SUCCEEDED',
+    attemptCount: 1,
+    terminalAtMs: DATE_MAX_MS - 14_400_000,
+    reconciliationCompletedAtMs: DATE_MAX_MS - 14_400_000,
+    purgeAfterMs: DATE_MAX_MS,
+    createdAtMs: DATE_MAX_MS,
+    updatedAtMs: DATE_MAX_MS,
+  });
+  for (const field of [
+    'terminalAtMs', 'reconciliationCompletedAtMs', 'purgeAfterMs', 'createdAtMs', 'updatedAtMs',
+  ] as const) {
+    assertValidationFailure(() => {
+      assertExecutionIntent(Object.freeze({ ...terminalRecord, [field]: DATE_MAX_MS + 1 }));
+    });
+  }
+});
+
+void test('accepts exact U64 raw amounts but rejects overflow', () => {
+  const maximum = createExecutionIntentDraft(validInput({ quoteAmountRaw: U64_MAX }));
+
+  assert.equal(maximum.quoteAmountRaw, U64_MAX);
+  assertValidationFailure(() => createExecutionIntentDraft(validInput({ quoteAmountRaw: U64_MAX + 1n })));
+  assertValidationFailure(() => createExecutionIntentDraft(validInput({ minimumAmountOutRaw: U64_MAX + 1n })));
+});
+
+void test('accepts canonical leading-zero public keys and rejects malformed Base58 keys', () => {
+  const canonicalLeadingZero = `${'1'.repeat(31)}2`;
+  const valid = createExecutionIntentDraft(validInput({
+    mint: canonicalLeadingZero,
+    quoteMint: canonicalLeadingZero,
+  }));
+
+  assert.equal(valid.mint, canonicalLeadingZero);
+  for (const mint of [
+    '1'.repeat(31),
+    '1'.repeat(33),
+    `${'1'.repeat(31)}0`,
+  ]) assertValidationFailure(() => createExecutionIntentDraft(validInput({ mint })));
+});
+
 void test('asserts only immutable exact repository records', () => {
   const draft = createExecutionIntentDraft(validInput());
   const record = Object.freeze({
@@ -118,16 +202,56 @@ void test('does not invoke getters or proxy traps while validating execution int
     getOwnPropertyDescriptor: () => { proxyTraps += 1; throw new Error('must not run'); },
   });
 
-  assert.throws(() => { assertExecutionIntent(getter); });
-  assert.throws(() => { assertExecutionIntent(proxy); });
+  assertValidationFailure(() => { assertExecutionIntent(getter); });
+  assertValidationFailure(() => { assertExecutionIntent(proxy); });
   assert.equal(getterCalls, 0);
   assert.equal(proxyTraps, 0);
 });
 
-void test('refuses forbidden execution-intent status transitions', () => {
-  assert.doesNotThrow(() => { assertExecutionIntentTransition('PENDING', 'PROCESSING'); });
-  assert.throws(() => { assertExecutionIntentTransition('PENDING', 'SUCCEEDED'); });
-  assert.throws(() => { assertExecutionIntentTransition('SUCCEEDED', 'PROCESSING'); });
+void test('exposes only redacted validation errors for hostile public inputs', () => {
+  const getter = validInput();
+  Object.defineProperty(getter, 'strategyId', {
+    enumerable: true,
+    get: () => { throw new Error('must not run'); },
+  });
+  const proxy = new Proxy(validRecord(), {
+    getPrototypeOf: () => { throw new Error('must not run'); },
+    ownKeys: () => { throw new Error('must not run'); },
+    getOwnPropertyDescriptor: () => { throw new Error('must not run'); },
+  });
+
+  assertValidationFailure(() => createExecutionIntentDraft(getter));
+  assertValidationFailure(() => createExecutionIntentId(getter));
+  assertValidationFailure(() => { assertExecutionIntent(proxy); });
+  assertValidationFailure(() => { assertExecutionIntentTransition(proxy, 'PENDING'); });
+});
+
+void test('implements the complete specified execution-intent transition adjacency', () => {
+  const expected: Readonly<Record<ExecutionIntentStatus, readonly ExecutionIntentStatus[]>> = {
+    PENDING: ['PROCESSING', 'EXPIRED', 'CANCELLED'],
+    PROCESSING: ['SIMULATED', 'FAILED', 'EXPIRED', 'CANCELLED'],
+    SIMULATED: ['SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED', 'SIGNED_NOT_SUBMITTED'],
+    RETRY_READY: ['PROCESSING', 'EXPIRED', 'CANCELLED'],
+    SIGNED_NOT_SUBMITTED: ['SUBMITTED', 'UNKNOWN_REQUIRES_RECONCILIATION'],
+    SUBMITTED: ['CONFIRMED', 'UNKNOWN_REQUIRES_RECONCILIATION'],
+    CONFIRMED: ['RECONCILING', 'UNKNOWN_REQUIRES_RECONCILIATION', 'SUCCEEDED'],
+    RECONCILING: ['UNKNOWN_REQUIRES_RECONCILIATION', 'SUCCEEDED'],
+    SUCCEEDED: [],
+    FAILED: [],
+    EXPIRED: [],
+    CANCELLED: [],
+    UNKNOWN_REQUIRES_RECONCILIATION: ['CONFIRMED', 'FAILED', 'RETRY_READY'],
+  };
+
+  for (const previous of EXECUTION_INTENT_STATUSES) {
+    for (const next of EXECUTION_INTENT_STATUSES) {
+      if (expected[previous].includes(next)) {
+        assert.doesNotThrow(() => { assertExecutionIntentTransition(previous, next); });
+      } else {
+        assertValidationFailure(() => { assertExecutionIntentTransition(previous, next); });
+      }
+    }
+  }
 });
 
 function validInput(
@@ -155,7 +279,7 @@ function validInput(
   };
 }
 
-function validRecord(): ExecutionIntentV1 {
+function validRecord(overrides: Readonly<Record<string, unknown>> = {}): ExecutionIntentV1 {
   const draft: ExecutionIntentDraftV1 = createExecutionIntentDraft(validInput());
   return Object.freeze({
     ...draft,
@@ -167,5 +291,14 @@ function validRecord(): ExecutionIntentV1 {
     purgeAfterMs: null,
     createdAtMs: REQUESTED_AT_MS,
     updatedAtMs: REQUESTED_AT_MS,
+    ...overrides,
   });
+}
+
+function assertValidationFailure(action: () => void): void {
+  assert.throws(action, (error: unknown) => (
+    error instanceof ExecutionIntentValidationError
+    && error.message === 'Invalid execution intent.'
+    && error.name === 'ExecutionIntentValidationError'
+  ));
 }
