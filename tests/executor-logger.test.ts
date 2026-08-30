@@ -1,13 +1,21 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { createExecutorLogger } from '../src/executor/logger.js';
 
+const LOGGER_SOURCE = readFileSync(new URL('../src/executor/logger.ts', import.meta.url), 'utf8');
+
 const SECRET_KEYS = Object.freeze([
   'EXECUTOR_PRIVATE_KEY', 'EXECUTOR_SECRET_KEY', 'EXECUTOR_KEYPAIR',
-  'EXECUTOR_KEYPAIR_PATH', 'SOLANA_PRIVATE_KEY', 'SOLANA_SECRET_KEY',
+  'EXECUTOR_KEYPAIR_PATH', 'SOLANA_PRIVATE_KEY', 'SOLANA_PRIVATE_KEY_BASE58', 'SOLANA_SECRET_KEY',
   'SOLANA_KEYPAIR', 'SOLANA_KEYPAIR_PATH', 'WALLET_PRIVATE_KEY',
   'WALLET_KEYPAIR', 'WALLET_KEYPAIR_PATH', 'ANCHOR_WALLET',
 ] as const);
+
+void test('redacts the exact 13 prohibited secret variables including the listener private key', () => {
+  assert.equal(SECRET_KEYS.length, 13);
+  assert.match(LOGGER_SOURCE, /'SOLANA_PRIVATE_KEY_BASE58'/u);
+});
 
 void test('emits the executor service base and only the closed safe context', () => {
   const sink = memorySink();

@@ -102,8 +102,13 @@ void test('a signal removes both handlers, forbids another claim and waits for t
   const scheduler = manualScheduler();
   const signals = new EventEmitter();
   const calls: string[] = [];
+  let runtimeSignal: AbortSignal | null = null;
   const runtime = runExecutorRuntime({
-    runOnce: async () => { calls.push('claim'); return gate.promise; },
+    runOnce: async (signal) => {
+      runtimeSignal = signal;
+      calls.push('claim');
+      return gate.promise;
+    },
     logger: logger(),
     closeDatabase: async () => { calls.push('close'); },
     evictDatabase: () => { calls.push('evict'); },
@@ -112,6 +117,7 @@ void test('a signal removes both handlers, forbids another claim and waits for t
 
   await nextTurn();
   signals.emit('SIGTERM');
+  assert.equal(abortState(runtimeSignal), true);
   assert.equal(signals.listenerCount('SIGINT'), 0);
   assert.equal(signals.listenerCount('SIGTERM'), 0);
   await nextTurn();
@@ -120,6 +126,35 @@ void test('a signal removes both handlers, forbids another claim and waits for t
   await runtime;
   assert.deepEqual(calls, ['claim', 'close']);
   assert.equal(scheduler.count(), 0);
+});
+
+void test('aborts the worker signal before a deferred claim resolves and then closes cleanly', async () => {
+  const gate = deferred<'IDLE'>();
+  const scheduler = manualScheduler();
+  const signals = new EventEmitter();
+  const calls: string[] = [];
+  let runtimeSignal: AbortSignal | null = null;
+  const runtime = runExecutorRuntime({
+    runOnce: (signal) => {
+      runtimeSignal = signal;
+      calls.push('claim');
+      return gate.promise;
+    },
+    logger: logger(),
+    closeDatabase: async () => { calls.push('close'); },
+    evictDatabase: () => { calls.push('evict'); },
+    forceExit: () => { calls.push('force'); },
+  }, { pollMs: 1_000, shutdownGraceMs: 10_000, scheduler, signalSource: signals });
+
+  await nextTurn();
+  assert.equal(abortState(runtimeSignal), false);
+  signals.emit('SIGINT');
+  assert.equal(abortState(runtimeSignal), true);
+  assert.deepEqual(calls, ['claim']);
+  gate.resolve('IDLE');
+
+  await runtime;
+  assert.deepEqual(calls, ['claim', 'close']);
 });
 
 void test('the shutdown deadline evicts before logging and forcing exit one', async () => {
@@ -253,4 +288,8 @@ function deferred<Value>(): Readonly<{
 
 async function nextTurn(): Promise<void> {
   await new Promise<void>((resolve) => { setImmediate(resolve); });
+}
+
+function abortState(signal: AbortSignal | null): boolean | null {
+  return signal?.aborted ?? null;
 }

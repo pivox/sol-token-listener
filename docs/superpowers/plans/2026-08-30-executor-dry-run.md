@@ -499,7 +499,7 @@ Attendre cette valeur gelée par défaut :
 
 Tester les bornes exactes, nombres canoniques, relations poll/lease/timeout/grâce,
 DB vide, `LIVE_TRADING_ENABLED` absent/`false`, rejet de toute autre valeur et
-les douze variables de secret listées dans la spec. Vérifier qu'aucun message
+les treize variables de secret listées dans la spec. Vérifier qu'aucun message
 d'erreur ne contient la valeur fautive ou `DATABASE_URL`.
 
 - [ ] **Step 2: écrire les tests rouges du worker**
@@ -515,7 +515,7 @@ export type DryRunPassResult = 'IDLE' | 'RECORDED' | 'COMMIT_RECOVERED';
 
 Dans `tests/executor-logger.test.ts`, écrire dans un sink mémoire et vérifier que
 seuls `event`, `mode`, `intentId`, `side`, `outcome` et `errorCode` peuvent être
-émis. Injecter URL PostgreSQL, mint, montants, objet Error et les douze noms de
+émis. Injecter URL PostgreSQL, mint, montants, objet Error et les treize noms de
 secrets ; aucune valeur ne doit apparaître dans le JSON sérialisé.
 
 - [ ] **Step 3: lancer les tests rouges**
@@ -532,7 +532,7 @@ Expected: FAIL car les modules executor n'existent pas.
 
 Le parser pur accepte `NodeJS.ProcessEnv | Record<string,string|undefined>` et
 n'importe pas `src/config/env.ts`. Le logger Pino porte `base.service =
-'sol-token-executor'`, redacte les douze noms et n'accepte que des contextes
+'sol-token-executor'`, redacte les treize noms et n'accepte que des contextes
 fermés sans mint, amount, URL ou objet Error.
 
 Le worker dépend de :

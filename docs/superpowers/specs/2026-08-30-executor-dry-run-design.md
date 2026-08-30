@@ -1,6 +1,6 @@
 # Exécuteur dry-run V1 — conception #51-C
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.0.1
 
 **Date :** 2026-08-30
 
@@ -12,6 +12,9 @@
 
 ## Historique des versions
 
+- **1.0.1 — 2026-08-31 :** ajout du rejet explicite de la variable privée
+  listener `SOLANA_PRIVATE_KEY_BASE58` et définition de l'annulation aux
+  frontières de statements pendant l'arrêt.
 - **1.0.0 — 2026-08-30 :** conception initiale approuvée de l'évaluation annexe
   non consommatrice. Les brouillons antérieurs n'ont jamais été publiés.
 
@@ -92,7 +95,8 @@ Règles :
 - `DATABASE_URL` est obligatoire mais n'est jamais journalisée ;
 - une valeur non vide dans `EXECUTOR_PRIVATE_KEY`, `EXECUTOR_SECRET_KEY`,
   `EXECUTOR_KEYPAIR`, `EXECUTOR_KEYPAIR_PATH`, `SOLANA_PRIVATE_KEY`,
-  `SOLANA_SECRET_KEY`, `SOLANA_KEYPAIR`, `SOLANA_KEYPAIR_PATH`,
+  `SOLANA_PRIVATE_KEY_BASE58`, `SOLANA_SECRET_KEY`, `SOLANA_KEYPAIR`,
+  `SOLANA_KEYPAIR_PATH`,
   `WALLET_PRIVATE_KEY`, `WALLET_KEYPAIR`, `WALLET_KEYPAIR_PATH` ou
   `ANCHOR_WALLET` fait échouer le bootstrap ;
 - aucune URL RPC Solana n'est nécessaire dans #51-C.
@@ -157,20 +161,36 @@ ligne durable par `NOT EXISTS`.
 | commit réussi, ACK perdu | évaluation + lease libéré | `findExact` prouve le commit ; un autre claim est exclu |
 | arrêt pendant traitement | lease éventuellement actif | arrêt borné, puis expiration récupérable |
 
-Un signal arrête immédiatement les nouveaux claims. Un seul statement
-PostgreSQL peut alors être en vol. Claim, `findExact` et commit atomique sont
-chacun un statement unique. Le pool impose côté client
+Au premier `SIGINT` ou `SIGTERM`, le runtime déclenche son `AbortSignal` interne
+avant d'attendre la passe single-flight. Le worker observe ce signal avant le
+claim, immédiatement après la résolution du claim et avant toute récupération
+`findExact`. Une annulation déjà demandée avant le claim retourne `IDLE` sans
+statement. Une annulation observée après la résolution du claim et avant
+`complete` retourne aussi `IDLE`, ne lance ni `complete`, ni `findExact`, ni
+release, renewal, tentative ou transition, et laisse le lease expirer
+naturellement.
+
+Chaque vérification d'annulation et l'invocation synchrone du statement suivant
+appartiennent au même tour JavaScript : aucun handler de signal ne peut
+s'intercaler entre les deux. Un signal reçu pendant un `complete` déjà en vol
+ne tente pas de l'annuler ; le runtime attend son issue. Un succès durable reste
+`RECORDED`. Si son issue est un commit ambigu après l'annulation, le worker
+retourne `IDLE` sans lancer `findExact`, car ce dernier serait un nouveau
+statement après le signal. Un seul statement PostgreSQL peut donc être en vol
+après l'arrêt. Claim, `findExact` et commit atomique sont chacun un statement
+unique. Le pool impose côté client
 `query_timeout` et côté serveur `statement_timeout`, tous deux égaux à
 `EXECUTOR_DB_STATEMENT_TIMEOUT_MS`; lock et connexion sont également bornés par
 une valeur au plus égale. Une erreur ou un timeout évince la connexion.
 
-Le runtime attend l'issue du statement avant de fermer le pool. Les timeouts
-sont strictement inférieurs à `EXECUTOR_SHUTDOWN_GRACE_MS`. Si la pile réseau ne
-rend malgré ces deux timeouts, le point d'entrée évince le client, journalise un
-arrêt non propre et termine non-zéro à l'échéance. La transaction atomique et le
-timeout serveur empêchent un état partiel ; un commit intervenu avant
-l'annulation reste une évaluation valide et découvrable par `findExact`. Aucune
-nouvelle mutation n'est initiée après le signal ou après perte du lease.
+Le runtime attend l'issue du statement existant avant de fermer le pool. Les
+timeouts sont strictement inférieurs à `EXECUTOR_SHUTDOWN_GRACE_MS`. Si la pile
+réseau ne rend malgré ces deux timeouts, le point d'entrée évince le client,
+journalise un arrêt non propre et termine non-zéro à l'échéance. La transaction
+atomique et le timeout serveur empêchent un état partiel ; un commit intervenu
+avant l'annulation reste une évaluation durable valide, sans autoriser une
+lecture `findExact` pendant cet arrêt. Aucune nouvelle mutation n'est initiée
+après le signal ou après perte du lease.
 
 ## 5. Évaluation durable
 

@@ -12,7 +12,7 @@ export interface ExecutorRuntimeSignalSource {
 }
 
 export interface ExecutorRuntimeDependencies {
-  readonly runOnce: () => Promise<DryRunPassResult>;
+  readonly runOnce: (signal: AbortSignal) => Promise<DryRunPassResult>;
   readonly logger: ExecutorLogger;
   readonly closeDatabase: () => Promise<void>;
   readonly evictDatabase: () => void | Promise<void>;
@@ -44,6 +44,7 @@ export function runExecutorRuntime(
   assertDuration(options.shutdownGraceMs);
   const scheduler = options.scheduler ?? productionScheduler;
   const signals = options.signalSource ?? process;
+  const shutdownController = new AbortController();
   let stopping = false;
   let pollTimer: object | number | null = null;
   let cancelPoll: (() => void) | null = null;
@@ -59,6 +60,7 @@ export function runExecutorRuntime(
   const requestShutdown = (): void => {
     if (stopping) return;
     stopping = true;
+    shutdownController.abort();
     removeSignalHandlers();
     cancelPoll?.();
     deadlineTimer = scheduler.setTimeout(() => {
@@ -74,7 +76,7 @@ export function runExecutorRuntime(
   const runLoop = async (): Promise<void> => {
     while (!shutdownRequested()) {
       try {
-        const result = await dependencies.runOnce();
+        const result = await dependencies.runOnce(shutdownController.signal);
         logPassResult(dependencies.logger, result);
       } catch (error) {
         dependencies.logger.error(Object.freeze({

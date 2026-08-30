@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createExecutionDryRunAssessment } from '../src/domain/execution-dry-run.js';
+import {
+  createExecutionDryRunAssessment,
+  type ExecutionDryRunAssessmentV1,
+} from '../src/domain/execution-dry-run.js';
 import { createExecutionIntentDraft, type ExecutionIntentV1 } from '../src/domain/execution-intent.js';
 import {
   createDryRunWorker,
@@ -15,7 +18,7 @@ import { ExecutionDryRunRepositoryError } from '../src/storage/execution-dry-run
 
 void test('returns IDLE after one exact DRY_RUN claim and performs no other repository operation', async () => {
   const fake = fakes(null);
-  const result = await createDryRunWorker(fake.dependencies).runOnce();
+  const result = await createDryRunWorker(fake.dependencies).runOnce(activeSignal());
 
   assert.equal(result, 'IDLE');
   assert.deepEqual(fake.claimOptions, [Object.freeze({
@@ -25,10 +28,40 @@ void test('returns IDLE after one exact DRY_RUN claim and performs no other repo
   assertForbiddenCalls(fake);
 });
 
+void test('returns IDLE without claiming when cancellation is already requested', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const fake = fakes(claim());
+
+  assert.equal(await createDryRunWorker(fake.dependencies).runOnce(controller.signal), 'IDLE');
+  assert.equal(fake.claimOptions.length, 0);
+  assert.equal(fake.completed.length, 0);
+  assert.equal(fake.findInputs.length, 0);
+  assertForbiddenCalls(fake);
+});
+
+void test('leaves the lease to expire and returns IDLE when cancelled during claim', async () => {
+  const controller = new AbortController();
+  const claimed = claim();
+  const claimGate = deferred<ClaimedExecutionIntent | null>();
+  const fake = fakes(null, { claimResult: claimGate.promise });
+  const pass = createDryRunWorker(fake.dependencies).runOnce(controller.signal);
+
+  await Promise.resolve();
+  assert.equal(fake.claimOptions.length, 1);
+  controller.abort();
+  claimGate.resolve(claimed);
+
+  assert.equal(await pass, 'IDLE');
+  assert.equal(fake.completed.length, 0);
+  assert.equal(fake.findInputs.length, 0);
+  assertForbiddenCalls(fake);
+});
+
 void test('creates the pure frozen assessment, completes it and returns RECORDED', async () => {
   const claimed = claim();
   const fake = fakes(claimed);
-  const result = await createDryRunWorker(fake.dependencies).runOnce();
+  const result = await createDryRunWorker(fake.dependencies).runOnce(activeSignal());
 
   assert.equal(result, 'RECORDED');
   assert.equal(fake.completed.length, 1);
@@ -39,12 +72,50 @@ void test('creates the pure frozen assessment, completes it and returns RECORDED
   assertForbiddenCalls(fake);
 });
 
+void test('does not cancel an in-flight complete statement and reports its durable result', async () => {
+  const controller = new AbortController();
+  const claimed = claim();
+  const completeGate = deferred<ExecutionDryRunAssessmentV1>();
+  const fake = fakes(claimed, { completeResult: completeGate.promise });
+  const pass = createDryRunWorker(fake.dependencies).runOnce(controller.signal);
+
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(fake.completed.length, 1);
+  controller.abort();
+  assert.equal(fake.findInputs.length, 0);
+  const assessment = createExecutionDryRunAssessment(claimed.intent);
+  completeGate.resolve(Object.freeze({ ...assessment, recordedAtMs: 1_000 }));
+
+  assert.equal(await pass, 'RECORDED');
+  assert.equal(fake.findInputs.length, 0);
+  assertForbiddenCalls(fake);
+});
+
+void test('does not start findExact when cancellation follows an ambiguous complete', async () => {
+  const controller = new AbortController();
+  const commitError = new ExecutionDryRunRepositoryError('COMMIT_OUTCOME_UNKNOWN');
+  const completeGate = deferred<ExecutionDryRunAssessmentV1>();
+  const fake = fakes(claim(), { completeResult: completeGate.promise, find: 'EXACT' });
+  const pass = createDryRunWorker(fake.dependencies).runOnce(controller.signal);
+
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(fake.completed.length, 1);
+  controller.abort();
+  completeGate.reject(commitError);
+
+  assert.equal(await pass, 'IDLE');
+  assert.equal(fake.findInputs.length, 0);
+  assertForbiddenCalls(fake);
+});
+
 void test('recovers only an exact committed assessment after COMMIT_OUTCOME_UNKNOWN', async () => {
   const claimed = claim();
   const commitError = new ExecutionDryRunRepositoryError('COMMIT_OUTCOME_UNKNOWN');
   const fake = fakes(claimed, { completeError: commitError, find: 'EXACT' });
 
-  assert.equal(await createDryRunWorker(fake.dependencies).runOnce(), 'COMMIT_RECOVERED');
+  assert.equal(await createDryRunWorker(fake.dependencies).runOnce(activeSignal()), 'COMMIT_RECOVERED');
   assert.equal(fake.findInputs.length, 1);
   assert.deepEqual(fake.findInputs[0], createExecutionDryRunAssessment(claimed.intent));
   assertForbiddenCalls(fake);
@@ -54,7 +125,7 @@ void test('rethrows the original ambiguous commit error when findExact returns n
   const commitError = new ExecutionDryRunRepositoryError('COMMIT_OUTCOME_UNKNOWN');
   const fake = fakes(claim(), { completeError: commitError, find: 'MISSING' });
 
-  await assert.rejects(createDryRunWorker(fake.dependencies).runOnce(), (error) => error === commitError);
+  await assert.rejects(createDryRunWorker(fake.dependencies).runOnce(activeSignal()), (error) => error === commitError);
   assert.equal(fake.findInputs.length, 1);
   assertForbiddenCalls(fake);
 });
@@ -64,7 +135,7 @@ void test('propagates a contradictory findExact failure after an ambiguous commi
   const contradiction = new ExecutionDryRunRepositoryError('INVALID_DATA');
   const fake = fakes(claim(), { completeError: commitError, findError: contradiction });
 
-  await assert.rejects(createDryRunWorker(fake.dependencies).runOnce(), (error) => error === contradiction);
+  await assert.rejects(createDryRunWorker(fake.dependencies).runOnce(activeSignal()), (error) => error === contradiction);
   assert.equal(fake.findInputs.length, 1);
   assertForbiddenCalls(fake);
 });
@@ -78,7 +149,7 @@ void test('never calls findExact for database, fencing, conflict or spoofed comm
   ];
   for (const expected of errors) {
     const fake = fakes(claim(), { completeError: expected });
-    await assert.rejects(createDryRunWorker(fake.dependencies).runOnce(), (error) => error === expected);
+    await assert.rejects(createDryRunWorker(fake.dependencies).runOnce(activeSignal()), (error) => error === expected);
     assert.equal(fake.findInputs.length, 0);
     assertForbiddenCalls(fake);
   }
@@ -88,7 +159,7 @@ void test('propagates a lost claim without attempting assessment completion or r
   const claimError = new Error('claim lost');
   const fake = fakes(null, { claimError });
 
-  await assert.rejects(createDryRunWorker(fake.dependencies).runOnce(), (error) => error === claimError);
+  await assert.rejects(createDryRunWorker(fake.dependencies).runOnce(activeSignal()), (error) => error === claimError);
   assert.equal(fake.completed.length, 0);
   assert.equal(fake.findInputs.length, 0);
   assertForbiddenCalls(fake);
@@ -99,8 +170,9 @@ void test('shares one in-flight pass across concurrent runOnce calls', async () 
   const fake = fakes(null, { claimResult: gate.promise });
   const worker = createDryRunWorker(fake.dependencies);
 
-  const first = worker.runOnce();
-  const second = worker.runOnce();
+  const signal = activeSignal();
+  const first = worker.runOnce(signal);
+  const second = worker.runOnce(signal);
   assert.equal(first, second);
   await Promise.resolve();
   assert.equal(fake.claimOptions.length, 1);
@@ -122,7 +194,7 @@ void test('arms single-flight before a synchronous claim re-enters runOnce', asy
         claimCalls += 1;
         if (!reentered) {
           reentered = true;
-          reentrant = worker.runOnce();
+          reentrant = worker.runOnce(activeSignal());
         }
         return gate.promise;
       },
@@ -130,7 +202,7 @@ void test('arms single-flight before a synchronous claim re-enters runOnce', asy
   });
   const worker = createDryRunWorker(dependencies);
 
-  const first = worker.runOnce();
+  const first = worker.runOnce(activeSignal());
   await Promise.resolve();
   const second = reentrant;
   assert.ok(second !== undefined);
@@ -154,7 +226,7 @@ void test('shares a reentrant rejection and resets before exactly one later pass
       claim: () => {
         claimCalls += 1;
         if (claimCalls === 1) {
-          reentrant = worker.runOnce();
+          reentrant = worker.runOnce(activeSignal());
           return Promise.reject(claimError);
         }
         return Promise.resolve(null);
@@ -163,7 +235,7 @@ void test('shares a reentrant rejection and resets before exactly one later pass
   });
   const worker = createDryRunWorker(dependencies);
 
-  const first = worker.runOnce();
+  const first = worker.runOnce(activeSignal());
   await Promise.resolve();
   const second = reentrant;
   assert.ok(second !== undefined);
@@ -174,7 +246,7 @@ void test('shares a reentrant rejection and resets before exactly one later pass
 
   assert.equal(samePromise, true);
   assert.equal(claimCalls, 1);
-  assert.equal(await worker.runOnce(), 'IDLE');
+  assert.equal(await worker.runOnce(activeSignal()), 'IDLE');
   assert.equal(claimCalls, 2);
   assertForbiddenCalls(fake);
 });
@@ -185,6 +257,7 @@ function fakes(
     claimError?: Error;
     claimResult?: Promise<ClaimedExecutionIntent | null>;
     completeError?: Error;
+    completeResult?: Promise<ExecutionDryRunAssessmentV1>;
     find?: 'EXACT' | 'MISSING';
     findError?: Error;
   }> = {},
@@ -209,6 +282,7 @@ function fakes(
     complete: async (claimValue, assessment) => {
       completed.push({ claim: claimValue, assessment });
       if (behavior.completeError !== undefined) return Promise.reject(behavior.completeError);
+      if (behavior.completeResult !== undefined) return behavior.completeResult;
       return Object.freeze({ ...assessment, recordedAtMs: 1_000 });
     },
     findExact: async (assessment) => {
@@ -257,8 +331,14 @@ function assertForbiddenCalls(fake: ReturnType<typeof fakes>): void {
 function deferred<Value>(): Readonly<{
   promise: Promise<Value>;
   resolve(value: Value): void;
+  reject(error: unknown): void;
 }> {
   let resolve!: (value: Value) => void;
-  const promise = new Promise<Value>((settle) => { resolve = settle; });
-  return { promise, resolve };
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<Value>((settle, fail) => { resolve = settle; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+function activeSignal(): AbortSignal {
+  return new AbortController().signal;
 }

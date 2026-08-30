@@ -12,6 +12,7 @@ const SECRET_KEYS = Object.freeze([
   'EXECUTOR_KEYPAIR',
   'EXECUTOR_KEYPAIR_PATH',
   'SOLANA_PRIVATE_KEY',
+  'SOLANA_PRIVATE_KEY_BASE58',
   'SOLANA_SECRET_KEY',
   'SOLANA_KEYPAIR',
   'SOLANA_KEYPAIR_PATH',
@@ -108,7 +109,7 @@ void test('requires a non-empty database URL and accepts only canonical dry-run 
 });
 
 void test('accepts absent, undefined and empty secret variables but rejects all non-empty values', () => {
-  assert.equal(SECRET_KEYS.length, 12);
+  assert.equal(SECRET_KEYS.length, 13);
   assert.equal(parseExecutorConfig({ DATABASE_URL }).databaseUrl, DATABASE_URL);
   for (const key of SECRET_KEYS) {
     assert.equal(parseExecutorConfig({ DATABASE_URL, [key]: undefined }).databaseUrl, DATABASE_URL);
