@@ -55,6 +55,39 @@ void test('executor graph guard rejects forbidden SDKs, application paths, capab
   ]) assert.ok(violations.some((violation) => violation.includes(expected)), expected);
 });
 
+void test('executor graph guard fails closed on runtime module recovery and computed execution calls', () => {
+  const fixturePath = resolve(repositoryRoot, 'src/executor/main.ts');
+  const fixtures = [
+    {
+      source: "import { createRequire as factory } from 'node:module'; factory(import.meta.url)('@solana/web3.js');",
+      expected: 'createRequire',
+    },
+    {
+      source: "process.getBuiltinModule('module').createRequire(import.meta.url)('@solana/web3.js');",
+      expected: 'getBuiltinModule',
+    },
+    {
+      source: "eval(\"import('@solana/web3.js')\");",
+      expected: 'eval',
+    },
+    {
+      source: "new Function(\"return import('@solana/web3.js')\")();",
+      expected: 'Function',
+    },
+    {
+      source: "client['send' + 'Transaction']();",
+      expected: 'Computed member call',
+    },
+  ] as const;
+  for (const fixture of fixtures) {
+    const violations = executorBoundaryViolations(fixture.source, fixturePath, repositoryRoot);
+    assert.ok(
+      violations.some((violation) => violation.includes(fixture.expected)),
+      `${fixture.expected}: ${JSON.stringify(violations)}`,
+    );
+  }
+});
+
 void test('fatal bootstrap output uses only allowlisted stable error identity and never a message', () => {
   let output = '';
   const runtime = {
@@ -90,6 +123,19 @@ void test('main exposes only executor scripts, exact bounded pool options and no
   ]) assert.match(main, new RegExp(`\\b${option}\\b`, 'u'));
   assert.doesNotMatch(main, /\bmigrateDatabase\b/u);
   assert.doesNotMatch(main, /(?:SOLANA_(?:HTTP|WS)_RPC_URL|PRIVATE_KEY|SECRET_KEY|KEYPAIR)/u);
+});
+
+void test('process integration registers each child immediately and bounds TERM then KILL cleanup', async () => {
+  const integration = await readFile(
+    resolve(repositoryRoot, 'tests/executor-main.integration.test.ts'),
+    'utf8',
+  );
+  assert.match(integration, /context\.after\(\(\) => stopExecutorChild\(child\)\)/u);
+  assert.match(integration, /CHILD_TERM_TIMEOUT_MS/u);
+  assert.match(integration, /CHILD_KILL_TIMEOUT_MS/u);
+  assert.match(integration, /child\.kill\('SIGTERM'\)/u);
+  assert.match(integration, /child\.kill\('SIGKILL'\)/u);
+  assert.match(integration, /Promise\.race/u);
 });
 
 async function readGraph(entry: string): Promise<ReadonlyMap<string, string>> {

@@ -38,7 +38,12 @@ export function createExecutorLogger(destination?: DestinationStream): ExecutorL
     : pino(options(), destination);
   const write = (level: 'info' | 'warn' | 'error', context: ExecutorLogContext): void => {
     const safe = safeContext(context);
-    if (safe !== null) internal[level](safe);
+    if (safe === null) return;
+    switch (level) {
+      case 'info': internal.info(safe); break;
+      case 'warn': internal.warn(safe); break;
+      case 'error': internal.error(safe); break;
+    }
   };
   return Object.freeze({
     info: (context: ExecutorLogContext) => { write('info', context); },

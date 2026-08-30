@@ -27,6 +27,7 @@ const EXECUTOR_ALLOWED_LOCAL_MODULES = [
 const EXECUTOR_FORBIDDEN_IDENTIFIERS = new Set([
   'Keypair', 'Wallet', 'WalletSigner', 'Signer', 'SecretLoader',
   'keypair', 'wallet', 'signer',
+  'createRequire', 'getBuiltinModule', 'eval', 'Function',
   'simulateTransaction', 'sendTransaction', 'sendRawTransaction', 'signTransaction',
 ]);
 
@@ -161,6 +162,10 @@ function hasForbiddenSegment(path: string): boolean {
 }
 
 function appendDangerousCall(node: ts.CallExpression, violations: string[]): void {
+  if (ts.isElementAccessExpression(node.expression)) {
+    violations.push('Computed member call is prohibited in boundary modules.');
+    return;
+  }
   const name = ts.isIdentifier(node.expression)
     ? node.expression.text
     : ts.isPropertyAccessExpression(node.expression)

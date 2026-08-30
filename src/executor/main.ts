@@ -24,12 +24,19 @@ const SAFE_FATAL_ERROR_CODES = new Set([
 
 export async function main(): Promise<void> {
   const config = parseExecutorConfig(process.env);
+  const logger = createExecutorLogger();
   const pool = getDatabasePool(config.databaseUrl, {
     connectionTimeoutMillis: config.databaseStatementTimeoutMs,
     query_timeout: config.databaseStatementTimeoutMs,
     statement_timeout: config.databaseStatementTimeoutMs,
     lock_timeout: config.databaseStatementTimeoutMs,
     idle_in_transaction_session_timeout: config.databaseStatementTimeoutMs,
+  });
+  pool.on('error', () => {
+    logger.error(Object.freeze({
+      event: 'executor.database_client_error',
+      errorCode: 'DATABASE_IDLE_CLIENT_ERROR',
+    }));
   });
   const database = createExecutorDatabase(pool);
   const worker = createDryRunWorker(Object.freeze({
@@ -38,7 +45,6 @@ export async function main(): Promise<void> {
     ownerId: `executor-dry-run-${randomUUID()}`,
     leaseMs: config.leaseMs,
   }));
-  const logger = createExecutorLogger();
   await runExecutorRuntime({
     runOnce: worker.runOnce,
     logger,
