@@ -114,6 +114,55 @@ void test('executor graph guard rejects a computed execution method captured bef
   );
 });
 
+void test('executor graph guard rejects reflective access to forbidden execution capabilities', () => {
+  const fixturePath = resolve(repositoryRoot, 'src/executor/main.ts');
+  const fixtures = [
+    "Reflect.get(client, 'sendTransaction')();",
+    "Reflect['get'](client, 'sendRawTransaction')();",
+    "const get = Reflect.get; get(client, 'signTransaction')();",
+    "const { get: read } = Reflect; read(client, 'submitTransaction')();",
+    "const { ['get']: read } = Reflect; read(client, 'signMessage')();",
+    "let read; read = Reflect.get; read(client, 'submitRawTransaction')();",
+    "const reflection = Reflect; Reflect.apply(reflection.get(client, 'sendAndConfirmTransaction'), client, []);",
+    "Reflect.get.call(Reflect, client, 'submitRawTransaction')();",
+    "Reflect.get.apply(Reflect, [client, 'sendTransaction'])();",
+    "Reflect.apply(Reflect.get, Reflect, [client, 'signAllTransactions'])();",
+    "const get = Reflect['get']; Reflect.apply(get, Reflect, [client, 'signMessage'])();",
+    "Reflect.construct(Reflect.get(client, 'submitSignedTransaction'), []);",
+    'Reflect.get(client, capability)();',
+    'Reflect.apply(Reflect.get, Reflect, argumentsList)();',
+  ] as const;
+  for (const fixture of fixtures) {
+    const violations = executorBoundaryViolations(fixture, fixturePath, repositoryRoot);
+    assert.ok(
+      violations.some((violation) => violation.includes('reflective executor capability')),
+      `${fixture}: ${JSON.stringify(violations)}`,
+    );
+  }
+});
+
+void test('executor graph guard permits reflective access to non-execution data and generic calls', () => {
+  const fixturePath = resolve(repositoryRoot, 'src/executor/main.ts');
+  for (const fixture of [
+    "Reflect.get(record, 'status');",
+    "Reflect['get'](record, 'reason');",
+    "const get = Reflect.get; get(record, 'status');",
+    "const { get: read } = Reflect; read(record, 'reason');",
+    "const reflection = Reflect; reflection.get(record, 'status');",
+    "Reflect.get.call(Reflect, record, 'status');",
+    "Reflect.get.apply(Reflect, [record, 'reason']);",
+    "Reflect.apply(Reflect.get, Reflect, [record, 'status']);",
+    'Reflect.apply(validate, undefined, [value]);',
+    'Reflect.construct(Date, []);',
+    "const Reflect = { get: () => undefined }; Reflect.get(record, 'sendTransaction');",
+    "const get = () => undefined; get(record, 'sendRawTransaction');",
+  ]) assert.deepEqual(
+    executorBoundaryViolations(fixture, fixturePath, repositoryRoot),
+    [],
+    fixture,
+  );
+});
+
 void test('executor graph guard rejects node:vm dynamic SDK execution', () => {
   const fixturePath = resolve(repositoryRoot, 'src/executor/main.ts');
   const fixture = [
