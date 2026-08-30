@@ -620,11 +620,25 @@ void test('deployment runbook documents the safe production lifecycle and safety
   const rollbackStopIndex = rollback.indexOf(startupStop);
   assert.notEqual(rollbackStopIndex, -1, 'rollback must stop every application service');
   assert.ok(rollbackStopIndex < rollback.indexOf('BACKEND_IMAGE'));
-  assert.ok(rollbackStopIndex < rollback.indexOf('pull app retention frontend'));
+  assert.ok(rollbackStopIndex < rollback.indexOf('pull app frontend retention'));
   assert.ok(rollbackStopIndex < rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps app retention'));
-  assert.match(rollback, /BACKEND_IMAGE[\s\S]*FRONTEND_IMAGE/);
-  assert.match(rollback, /pull app retention frontend/);
+  assert.match(rollback, /BACKEND_IMAGE[\s\S]*FRONTEND_IMAGE[\s\S]*références immuables précédentes/iu);
+  assert.match(rollback, /repository@sha256:…/u);
+  assert.match(rollback, /ne doivent pas être vides|refus(?:e|ent) une\s+valeur vide/iu);
+  assert.match(rollback, /pull app frontend retention/);
   assert.match(rollback, /up -d --wait --wait-timeout 60 --no-build --no-deps app retention/);
+  assert.match(rollback, /up -d --wait --wait-timeout 60 --no-build --no-deps frontend/);
+  assert.ok(
+    rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps app retention')
+      < rollback.indexOf('deployment-healthcheck.js --require-ok')
+      && rollback.indexOf('deployment-healthcheck.js --require-ok')
+        < rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps frontend'),
+    'backend readiness and strict health must precede frontend re-exposure',
+  );
+  assert.doesNotMatch(
+    rollback,
+    /stop app\n.*up -d --wait --wait-timeout 60 app\n.*deployment-healthcheck\.js --require-ok/s,
+  );
   assert.match(runbook, /restauration[^\n]*répétée/i);
   assert.match(runbook, /EXÉCUTION_MODE=observe|EXECUTION_MODE=observe/);
   assert.match(runbook, /observe|paper/i);
@@ -711,8 +725,8 @@ void test('operator documentation activates the safe websocket failover contract
   assert.match(deployment, /DOTENV_CONFIG_PATH=deploy\/\.env npm run rpc:check/);
   assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d --wait --wait-timeout 60 app frontend retention/);
   assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml exec -T app[\s\S]*deployment-healthcheck\.js --require-ok/);
-  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml stop app/);
-  assert.match(deployment, /previous immutable image/i);
+  assert.match(deployment, /références immuables précédentes/i);
+  assert.match(deployment, /migrations[^.]*forward-only/i);
   assert.ok(
     deployment.indexOf('up -d --wait --wait-timeout 60 app frontend retention')
       < deployment.indexOf('deployment-healthcheck.js --require-ok'),

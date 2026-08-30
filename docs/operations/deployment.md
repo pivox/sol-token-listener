@@ -230,17 +230,10 @@ de production.
 
 ## Rollback
 
-Le rollback est un arrêt propre suivi du déploiement de la previous immutable image,
-jamais un basculement vers le subscriber legacy dans le processus en cours :
-
-```bash
-docker compose --env-file deploy/.env -f deploy/compose.yaml stop app
-docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --wait --wait-timeout 60 app
-docker compose --env-file deploy/.env -f deploy/compose.yaml exec -T app \
-  node dist/scripts/deployment-healthcheck.js --require-ok
-```
-
-Il ne modifie jamais `EXECUTION_MODE` au-delà de `observe` ou `paper`.
+Il n’existe pas de raccourci « stop puis up » : redémarrer la même image ne
+constitue pas un rollback. La procédure unique ci-dessous remplace explicitement
+les images et ne bascule jamais vers le subscriber legacy dans le processus en
+cours. Elle ne modifie jamais `EXECUTION_MODE` au-delà de `observe` ou `paper`.
 
 Quand l’ancienne application est compatible avec le schéma, arrêtez d’abord les
 trois services applicatifs avec les digests encore déployés :
@@ -249,15 +242,19 @@ trois services applicatifs avec les digests encore déployés :
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 frontend app retention
 ```
 
-La commande attend leur fin avant toute modification de version. Remplacez
-ensuite dans `$DEPLOY_ENV` les valeurs `BACKEND_IMAGE` et `FRONTEND_IMAGE` par
-leurs digests précédents, puis appliquez exactement le même gate strict :
+La commande attend leur fin avant toute modification de version. Avant le
+premier `pull`, l’opérateur remplace explicitement dans `$DEPLOY_ENV` les valeurs
+non vides `BACKEND_IMAGE` et `FRONTEND_IMAGE` par les références immuables précédentes
+exactes, de forme `repository@sha256:…`. Ne recopiez jamais un faux digest valide
+ni un placeholder : `config --quiet` et `deployment:validate-images` refusent une
+valeur vide, mutable, mal formée ou partagée avec le mauvais service. Ensuite
+seulement, appliquez ce gate strict :
 
 ```bash
 set -euo pipefail
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --quiet
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --images migrate app retention frontend | grep -Fvx 'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3' | npm run --silent deployment:validate-images
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull app retention frontend
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull app frontend retention
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --wait --wait-timeout 60 --no-build --no-deps app retention
 health_attempt=0
 until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js --require-ok; do
@@ -271,8 +268,11 @@ until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-n
   fi
   sleep 2
 done
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps frontend
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --wait --wait-timeout 60 --no-build --no-deps frontend
 ```
+
+Le frontend reste volontairement arrêté jusqu’au healthcheck strict de `app` ;
+la dernière commande le réexpose seulement après sa réussite.
 
 Le rollback se fait sans inverser les migrations : le schéma est forward-only.
 Ne relancez pas une ancienne image avant d’avoir vérifié sa compatibilité avec
