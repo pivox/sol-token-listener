@@ -20,11 +20,11 @@ export function createDryRunWorker(dependencies: DryRunWorkerDependencies): DryR
   let active: Promise<DryRunPassResult> | null = null;
   const runOnce = (): Promise<DryRunPassResult> => {
     if (active !== null) return active;
-    const current = runPass(dependencies).finally(() => {
-      if (active === current) active = null;
+    const tracked = Promise.resolve().then(() => runPass(dependencies)).finally(() => {
+      if (active === tracked) active = null;
     });
-    active = current;
-    return current;
+    active = tracked;
+    return tracked;
   };
   return Object.freeze({ runOnce });
 }

@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createExecutionDryRunAssessment } from '../src/domain/execution-dry-run.js';
 import { createExecutionIntentDraft, type ExecutionIntentV1 } from '../src/domain/execution-intent.js';
-import { createDryRunWorker } from '../src/executor/dry-run-worker.js';
+import {
+  createDryRunWorker,
+  type DryRunPassResult,
+} from '../src/executor/dry-run-worker.js';
 import type { ExecutionDryRunRepository } from '../src/ports/execution-dry-run-repository.js';
 import type {
   ClaimedExecutionIntent,
@@ -99,9 +102,80 @@ void test('shares one in-flight pass across concurrent runOnce calls', async () 
   const first = worker.runOnce();
   const second = worker.runOnce();
   assert.equal(first, second);
+  await Promise.resolve();
   assert.equal(fake.claimOptions.length, 1);
   gate.resolve(null);
   assert.deepEqual(await Promise.all([first, second]), ['IDLE', 'IDLE']);
+  assertForbiddenCalls(fake);
+});
+
+void test('arms single-flight before a synchronous claim re-enters runOnce', async () => {
+  const gate = deferred<ClaimedExecutionIntent | null>();
+  const fake = fakes(null);
+  let claimCalls = 0;
+  let reentered = false;
+  let reentrant: Promise<DryRunPassResult> | undefined;
+  const dependencies = Object.freeze({
+    ...fake.dependencies,
+    intents: {
+      claim: () => {
+        claimCalls += 1;
+        if (!reentered) {
+          reentered = true;
+          reentrant = worker.runOnce();
+        }
+        return gate.promise;
+      },
+    },
+  });
+  const worker = createDryRunWorker(dependencies);
+
+  const first = worker.runOnce();
+  await Promise.resolve();
+  const second = reentrant;
+  assert.ok(second !== undefined);
+  const samePromise = first === second;
+  gate.resolve(null);
+  assert.deepEqual(await Promise.all([first, second]), ['IDLE', 'IDLE']);
+
+  assert.equal(samePromise, true);
+  assert.equal(claimCalls, 1);
+  assertForbiddenCalls(fake);
+});
+
+void test('shares a reentrant rejection and resets before exactly one later pass', async () => {
+  const claimError = new Error('reentrant claim failure');
+  const fake = fakes(null);
+  let claimCalls = 0;
+  let reentrant: Promise<DryRunPassResult> | undefined;
+  const dependencies = Object.freeze({
+    ...fake.dependencies,
+    intents: {
+      claim: () => {
+        claimCalls += 1;
+        if (claimCalls === 1) {
+          reentrant = worker.runOnce();
+          return Promise.reject(claimError);
+        }
+        return Promise.resolve(null);
+      },
+    },
+  });
+  const worker = createDryRunWorker(dependencies);
+
+  const first = worker.runOnce();
+  await Promise.resolve();
+  const second = reentrant;
+  assert.ok(second !== undefined);
+  const samePromise = first === second;
+  const firstRejection = assert.rejects(first, (error) => error === claimError);
+  const secondRejection = assert.rejects(second, (error) => error === claimError);
+  await Promise.all([firstRejection, secondRejection]);
+
+  assert.equal(samePromise, true);
+  assert.equal(claimCalls, 1);
+  assert.equal(await worker.runOnce(), 'IDLE');
+  assert.equal(claimCalls, 2);
   assertForbiddenCalls(fake);
 });
 
