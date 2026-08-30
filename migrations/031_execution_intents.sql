@@ -249,7 +249,8 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
       completed_at IS NOT NULL
       AND purge_after >= completed_at
     ))
-  )
+  ),
+  CONSTRAINT execution_attempts_retention_check CHECK (purge_after IS NULL)
 );
 
 CREATE TABLE IF NOT EXISTS execution_intent_transitions (
@@ -311,6 +312,13 @@ CREATE TABLE IF NOT EXISTS execution_intent_transitions (
           char_length(evidence ->> 'attemptNumber') < 10
           OR evidence ->> 'attemptNumber' <= '2147483647'
         )
+      )
+    )
+    AND (
+      (attempt_number IS NULL AND evidence -> 'attemptNumber' = 'null'::JSONB)
+      OR (
+        attempt_number IS NOT NULL
+        AND evidence -> 'attemptNumber' = to_jsonb(attempt_number)
       )
     )
     AND (

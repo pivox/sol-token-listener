@@ -35,6 +35,8 @@ void test('execution intent migration defines the inert durable ledger contract'
   assert.doesNotMatch(executableSql, /purge_after = completed_at \+ INTERVAL '4 hours'/u);
   assert.match(executableSql, /evidence - ARRAY\['payloadVersion', 'attemptNumber', 'sourceEventId', 'observedAtMs'\]/u);
   assert.match(executableSql, /evidence \?& ARRAY\['payloadVersion', 'attemptNumber', 'sourceEventId', 'observedAtMs'\]/u);
+  assert.match(executableSql, /execution_attempts_retention_check CHECK \(purge_after IS NULL\)/u);
+  assert.match(executableSql, /evidence -> 'attemptNumber' = to_jsonb\(attempt_number\)/u);
   assert.match(executableSql, /quote_amount_raw NUMERIC,/u);
   assert.match(executableSql, /WHERE status = 'PENDING'/u);
   assert.doesNotMatch(executableSql, /signed_transaction|private_key|keypair/iu);
@@ -91,7 +93,7 @@ void test('execution intent migration applies and replays on an isolated schema'
       (EXTRACT(EPOCH FROM created_at) * 1000)::TEXT AS created_at_ms,
       (EXTRACT(EPOCH FROM updated_at) * 1000)::TEXT AS updated_at_ms
       FROM execution_intents WHERE id = $1`, [canonical.id]);
-    assertExecutionIntent(Object.freeze(intentFromRow(canonical, roundTrip.rows[0])));
+    assertExecutionIntent(Object.freeze(intentFromRow(roundTrip.rows[0])));
 
     const u64Maximum = 18_446_744_073_709_551_615n;
     await insertIntent(pool, intentRow(draft('u64-buy', 'BUY', u64Maximum, null)));
@@ -128,7 +130,10 @@ void test('execution intent migration applies and replays on an isolated schema'
         minimumAmountOutRaw: amount,
       })],
     ] as const) {
-      for (const amount of ['1.0', '1.000', 'NaN', 'Infinity', '-Infinity', '18446744073709551616']) {
+      for (const amount of [
+        '0', '-1', '1.0', '1.000', '1.5', 'NaN', 'Infinity', '-Infinity',
+        '18446744073709551616',
+      ]) {
         await assert.rejects(
           insertIntent(pool, invalidRow(amount)),
           /execution_intents_amounts_check/u,
@@ -187,14 +192,21 @@ void test('execution intent migration applies and replays on an isolated schema'
     ])).rows, [{ purge_after: null }]);
     await assert.rejects(
       insertAttempt(pool, processing.id, 2, 'COMPLETED', 0, 1, 0),
-      /execution_attempts_temporal_check/u,
+      /execution_attempts_retention_check/u,
+    );
+    await assert.rejects(
+      insertAttempt(pool, processing.id, 3, 'COMPLETED', 0, 1, 2),
+      /execution_attempts_retention_check/u,
     );
 
     const exactEvidence = {
-      payloadVersion: 1, attemptNumber: null, sourceEventId: null, observedAtMs: 0,
+      payloadVersion: 1, attemptNumber: 1, sourceEventId: null, observedAtMs: 0,
     };
     await insertTransition(pool, processing.id, exactEvidence);
     for (const evidence of [
+      null,
+      [],
+      true,
       {},
       { ...exactEvidence, extra: true },
       { ...exactEvidence, payloadVersion: '1' },
@@ -210,6 +222,18 @@ void test('execution intent migration applies and replays on an isolated schema'
         /execution_intent_transitions_evidence_check/u,
       );
     }
+    await assert.rejects(
+      insertTransition(pool, processing.id, { ...exactEvidence, attemptNumber: null }),
+      /execution_intent_transitions_evidence_check/u,
+    );
+    await assert.rejects(
+      insertTransition(pool, processing.id, { ...exactEvidence, attemptNumber: 2 }),
+      /execution_intent_transitions_evidence_check/u,
+    );
+    await assert.rejects(
+      insertTransition(pool, processing.id, exactEvidence, 0, null),
+      /execution_intent_transitions_evidence_check/u,
+    );
 
     const timedProcessing = draft('timestamped-attempts', 'BUY', 1n, null);
     await insertIntent(pool, intentRow(timedProcessing, { status: 'PROCESSING', attemptCount: 1 }));
@@ -325,13 +349,14 @@ async function insertAttempt(
 }
 
 async function insertTransition(
-  pool: InstanceType<typeof pg.Pool>, intentId: string, evidence: unknown, occurredAtMs: TimestampInput = 0,
+  pool: InstanceType<typeof pg.Pool>, intentId: string, evidence: unknown,
+  occurredAtMs: TimestampInput = 0, attemptNumber: number | null = 1,
 ): Promise<void> {
   await pool.query(`INSERT INTO execution_intent_transitions (
     intent_id, previous_status, next_status, reason_code, human_message,
     activation_phase, attempt_number, evidence, occurred_at
   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::JSONB, $9)`, [
-    intentId, 'PROCESSING', 'SIMULATED', 'QUOTE_STALE', 'migration test', 'NONE', 1,
+    intentId, 'PROCESSING', 'SIMULATED', 'QUOTE_STALE', 'migration test', 'NONE', attemptNumber,
     typeof evidence === 'string' ? evidence : JSON.stringify(evidence), timestampParameter(occurredAtMs),
   ]);
 }
@@ -351,13 +376,19 @@ function timestampTextToMs(value: unknown): number {
   return milliseconds;
 }
 
-function intentFromRow(draftValue: ReturnType<typeof draft>, row: Record<string, unknown> | undefined): object {
+function intentFromRow(row: Record<string, unknown> | undefined): object {
   assert.ok(row !== undefined);
   return {
-    ...draftValue,
+    id: text(row.id), payloadVersion: integer(row.payload_version),
+    logicalOrderKey: text(row.logical_order_key), strategyId: text(row.strategy_id),
+    strategyVersion: integer(row.strategy_version), positionId: text(row.position_id),
+    logicalCommandId: text(row.logical_command_id), mint: text(row.mint), side: text(row.side),
+    venuePolicy: text(row.venue_policy), quoteMint: text(row.quote_mint),
+    quoteTokenProgram: text(row.quote_token_program), quoteDecimals: integer(row.quote_decimals),
     quoteAmountRaw: BigInt(text(row.quote_amount_raw)),
     baseAmountRaw: row.base_amount_raw === null ? null : BigInt(text(row.base_amount_raw)),
     minimumAmountOutRaw: BigInt(text(row.minimum_amount_out_raw)),
+    decisionEventId: text(row.decision_event_id), decisionFingerprint: text(row.decision_fingerprint),
     requestedAtMs: integer(row.requested_at_ms), expiresAtMs: integer(row.expires_at_ms),
     status: text(row.status), attemptCount: integer(row.attempt_count),
     lastReasonCode: row.last_reason_code, terminalAtMs: null,
