@@ -744,6 +744,97 @@ git add README.md docs/architecture/pumpfun-v1.md scripts/deployment-smoke.mjs t
 git commit -m "docs: describe inert execution intent foundation (#51)"
 ```
 
+### Task 8: Fermer les deux blockers de la revue finale
+
+**Files:**
+- Modify: `src/domain/execution-intent.ts`
+- Modify: `migrations/031_execution_intents.sql`
+- Modify: `src/application/execution-intent-producer.ts`
+- Modify: `src/storage/execution-intent.repository.ts`
+- Modify: `tests/execution-intent.test.ts`
+- Modify: `tests/execution-intent-migration.test.ts`
+- Modify: `tests/execution-intent-producer.test.ts`
+- Modify: `tests/execution-intent.repository.test.ts`
+- Modify: `tests/websocket-health-migration.test.ts`
+- Modify: `docs/superpowers/specs/2026-08-30-executor-v1-design.md`
+
+- [ ] **Step 1: Écrire les régressions RED anti-replay**
+
+Ajouter un test domaine et PostgreSQL qui refusent tout draft dont
+`expiresAtMs - requestedAtMs` dépasse `14_400_000`. Ajouter le mutant complet
+terminalisation → réconciliation → purge → recréation et vérifier qu'après la
+purge la ligne recréée est nécessairement expirée et que `claim(EXECUTE)`
+retourne `null`.
+
+- [ ] **Step 2: Borner le TTL au même horizon que la rétention**
+
+Exporter `EXECUTION_INTENT_MAXIMUM_TTL_MS = 14_400_000` depuis le domaine,
+l'appliquer dans `immutableFieldsFrom`, dans la contrainte temporelle SQL et
+dans le paramètre `maximumIntentTtlMs` du producteur. La preuve attendue est :
+
+```text
+expires_at <= requested_at + 4h
+requested_at <= terminal_at <= reconciliation_completed_at
+purge_after = reconciliation_completed_at + 4h
+donc expires_at <= purge_after
+```
+
+- [ ] **Step 3: Écrire les régressions RED du journal honnête**
+
+Remplacer les chemins réussis utilisant `INTENT_DUPLICATE` et ajouter des tests
+qui exigent les codes positifs stables :
+
+```text
+EXECUTION_STARTED
+SIMULATION_SUCCEEDED
+ATTEMPT_COMPLETED
+RETRY_AUTHORIZED
+SIGNATURE_PERSISTED
+SUBMISSION_ACCEPTED
+CONFIRMATION_OBSERVED
+RECONCILIATION_STARTED
+INTENT_SUCCEEDED
+INTENT_CANCELLED
+```
+
+Une tentative `COMPLETED` doit porter `ATTEMPT_COMPLETED`; une tentative
+`ABANDONED` doit porter un reason d'échec et ne peut pas porter ce code de
+succès. Les transitions vers les états positifs doivent utiliser le code
+correspondant au nouvel état.
+
+- [ ] **Step 4: Appliquer les invariants TypeScript et PostgreSQL**
+
+Étendre le vocabulaire versionné, le décodage et les contraintes des trois
+tables. Valider avant toute connexion les couples statut/reason des inputs
+publics et refuser les lignes PostgreSQL contradictoires.
+
+- [ ] **Step 5: Corriger la dernière attente historique 030**
+
+Mettre à jour `tests/websocket-health-migration.test.ts` pour reconnaître 031
+comme migration courante sans affaiblir ses assertions d'upgrade historique.
+
+- [ ] **Step 6: Versionner et valider**
+
+Passer la spec de `1.1.0` à `1.1.1`, documenter les deux correctifs et lancer :
+
+```bash
+TEST_DATABASE_URL=postgresql:///postgres npx tsx --test \
+  tests/execution-intent.test.ts \
+  tests/execution-intent-migration.test.ts \
+  tests/execution-intent-producer.test.ts \
+  tests/execution-intent.repository.test.ts \
+  tests/websocket-health-migration.test.ts
+npm run build
+npm run check
+npm run lint
+TEST_DATABASE_URL=postgresql:///postgres npm test
+npm run docs:check
+npm run deployment:smoke
+```
+
+Expected: zéro échec, zéro test PostgreSQL silencieusement omis et le mutant
+post-purge ne peut plus être réclamé.
+
 ## Critères de sortie de #51-B
 
 - migration 031 compatible base vide et replay ;
