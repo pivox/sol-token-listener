@@ -21,6 +21,12 @@ import { getDatabasePool } from './database.js';
 
 type Row = Readonly<Record<string, unknown>>;
 
+interface LeaseIdentity {
+  readonly leaseOwner: string;
+  readonly leaseToken: string;
+  readonly leaseExpiresAtMs: number;
+}
+
 interface QueryResult {
   readonly rows: readonly Row[];
   readonly rowCount: number | null;
@@ -268,7 +274,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
             'INVALID_DATA',
           );
           const attemptNumber = positiveInteger(row.attempt_number, INT32_MAX, 'INVALID_DATA');
-          if (attemptNumber !== locked.attemptCount || locked.attemptCount === 0) {
+          if (attemptNumber !== locked.intent.attemptCount || locked.intent.attemptCount === 0) {
             throw attemptConflictError();
           }
           return Object.freeze({
@@ -277,8 +283,8 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
             startedAtMs: timestampFromDatabase(row.started_at_ms),
           });
         }
-        if (locked.attemptCount === INT32_MAX) throw attemptExhaustedError();
-        const attemptNumber = locked.attemptCount + 1;
+        if (locked.intent.attemptCount === INT32_MAX) throw attemptExhaustedError();
+        const attemptNumber = locked.intent.attemptCount + 1;
         const inserted = await client.query(
           `WITH operation AS MATERIALIZED (
              SELECT date_trunc('milliseconds', statement_timestamp()) AS at
@@ -330,7 +336,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       if (claim.intent.status !== 'PROCESSING') throw attemptConflictError();
       return this.transaction(async (client) => {
         const locked = await lockClaimedIntent(client, claim);
-        if (input.attemptNumber !== locked.attemptCount || locked.attemptCount === 0) {
+        if (input.attemptNumber !== locked.intent.attemptCount || locked.intent.attemptCount === 0) {
           throw attemptConflictError();
         }
         const selected = await client.query(
@@ -398,7 +404,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
              AND intent.lease_expires_at > statement_timestamp()`,
           [claim.intent.id, claim.intent.status, claim.leaseToken, leaseMs],
         );
-        return booleanMutation(renewed);
+        return fencedBooleanMutation(renewed);
       });
     });
   }
@@ -419,7 +425,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
              AND intent.lease_expires_at > statement_timestamp()`,
           [claim.intent.id, claim.intent.status, claim.leaseToken],
         );
-        return booleanMutation(released);
+        return fencedBooleanMutation(released);
       });
     });
   }
@@ -433,8 +439,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const input = transitionInput(inputValue, claim);
       return this.transaction(async (client) => {
         const locked = await lockClaimedIntent(client, claim);
-        if ((locked.attemptCount === 0) !== (input.evidence.attemptNumber === null)
-          || (locked.attemptCount > 0 && input.evidence.attemptNumber !== locked.attemptCount)) {
+        if ((locked.intent.attemptCount === 0) !== (input.evidence.attemptNumber === null)
+          || (locked.intent.attemptCount > 0
+            && input.evidence.attemptNumber !== locked.intent.attemptCount)) {
           throw inputError();
         }
         const journaled = await client.query(
@@ -459,11 +466,15 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         );
         if (updated.rowCount === 0 && updated.rows.length === 0) throw leaseLostError();
         if (updated.rowCount !== 1 || updated.rows.length !== 1) throw dataError();
-        const transitioned = intentFromRow(requiredRow(updated.rows));
-        if (!sameImmutableIntent(locked, transitioned)
+        const returnedRow = requiredRow(updated.rows);
+        const transitioned = intentFromRow(returnedRow);
+        const returnedLease = leaseFromIntentRow(returnedRow);
+        if (!sameImmutableIntent(locked.intent, transitioned)
           || transitioned.status !== input.nextStatus
-          || transitioned.attemptCount !== locked.attemptCount
+          || transitioned.attemptCount !== locked.intent.attemptCount
           || transitioned.lastReasonCode !== input.reasonCode
+          || (!terminal && !sameLeaseIdentity(returnedLease, locked))
+          || (terminal && returnedLease !== null)
           || (terminal && (
             transitioned.terminalAtMs === null
             || transitioned.reconciliationCompletedAtMs !== transitioned.terminalAtMs
@@ -694,20 +705,10 @@ function transitionUpdateSql(terminal: boolean): string {
   RETURNING ${INTENT_PROJECTION}`;
 }
 
-function lockClaimedIntent(
-  client: ExecutionIntentClient,
-  claim: ClaimedExecutionIntent,
-): Promise<ExecutionIntentV1>;
-function lockClaimedIntent(
-  client: ExecutionIntentClient,
-  claim: ClaimedExecutionIntent,
-  optional: true,
-): Promise<ExecutionIntentV1 | null>;
 async function lockClaimedIntent(
   client: ExecutionIntentClient,
   claim: ClaimedExecutionIntent,
-  optional = false,
-): Promise<ExecutionIntentV1 | null> {
+): Promise<ClaimedExecutionIntent> {
   const selected = await client.query(
     `SELECT ${CLAIM_PROJECTION}
      FROM execution_intents AS intent
@@ -718,7 +719,6 @@ async function lockClaimedIntent(
     [claim.intent.id, claim.intent.status, claim.leaseToken],
   );
   if (selected.rowCount === 0 && selected.rows.length === 0) {
-    if (optional) return null;
     throw leaseLostError();
   }
   if (selected.rowCount !== 1 || selected.rows.length !== 1) throw dataError();
@@ -727,7 +727,7 @@ async function lockClaimedIntent(
     || locked.intent.status !== claim.intent.status
     || locked.leaseOwner !== claim.leaseOwner
     || locked.leaseToken !== claim.leaseToken) throw dataError();
-  return locked.intent;
+  return locked;
 }
 
 function draftValues(draft: ExecutionIntentDraftV1): readonly unknown[] {
@@ -873,7 +873,7 @@ function finishAttemptInput(value: unknown): Readonly<{
 function intentFromRow(value: unknown): ExecutionIntentV1 {
   const row = exactRecord(value, INTENT_ROW_KEYS, 'INVALID_DATA');
   const intentStatus = status(row.status, 'INVALID_DATA');
-  validateLeaseRow(row, intentStatus);
+  void leaseFromRow(row, intentStatus);
   const intent: unknown = Object.freeze({
     id: boundedText(row.id, 'INVALID_DATA'),
     payloadVersion: exactOne(row.payload_version, 'INVALID_DATA'),
@@ -912,18 +912,35 @@ function intentFromRow(value: unknown): ExecutionIntentV1 {
   return intent;
 }
 
-function validateLeaseRow(row: Row, intentStatus: ExecutionIntentStatus): void {
+function leaseFromRow(row: Row, intentStatus: ExecutionIntentStatus): LeaseIdentity | null {
   const absent = row.lease_owner === null
     && row.lease_token === null
     && row.lease_expires_at_ms === null;
-  if (absent) return;
+  if (absent) return null;
   if (TERMINAL_STATUSES.has(intentStatus)) throw dataError();
   if (row.lease_owner === null || row.lease_token === null || row.lease_expires_at_ms === null) {
     throw dataError();
   }
-  boundedText(row.lease_owner, 'INVALID_DATA');
-  uuid(row.lease_token, 'INVALID_DATA');
-  timestampFromDatabase(row.lease_expires_at_ms);
+  return Object.freeze({
+    leaseOwner: boundedText(row.lease_owner, 'INVALID_DATA'),
+    leaseToken: uuid(row.lease_token, 'INVALID_DATA'),
+    leaseExpiresAtMs: timestampFromDatabase(row.lease_expires_at_ms),
+  });
+}
+
+function leaseFromIntentRow(value: unknown): LeaseIdentity | null {
+  const row = exactRecord(value, INTENT_ROW_KEYS, 'INVALID_DATA');
+  return leaseFromRow(row, status(row.status, 'INVALID_DATA'));
+}
+
+function sameLeaseIdentity(
+  actual: LeaseIdentity | null,
+  expected: LeaseIdentity,
+): boolean {
+  if (actual === null) return false;
+  return actual.leaseOwner === expected.leaseOwner
+    && actual.leaseToken === expected.leaseToken
+    && actual.leaseExpiresAtMs === expected.leaseExpiresAtMs;
 }
 
 function claimFromRow(value: unknown): ClaimedExecutionIntent {
@@ -931,10 +948,9 @@ function claimFromRow(value: unknown): ClaimedExecutionIntent {
   const intentValues: Record<string, unknown> = {};
   for (const key of INTENT_ROW_KEYS) intentValues[key] = row[key];
   const intent = intentFromRow(intentValues);
-  const leaseOwner = boundedText(row.lease_owner, 'INVALID_DATA');
-  const leaseToken = uuid(row.lease_token, 'INVALID_DATA');
-  const leaseExpiresAtMs = timestampFromDatabase(row.lease_expires_at_ms);
-  return Object.freeze({ intent, leaseOwner, leaseToken, leaseExpiresAtMs });
+  const lease = leaseFromRow(row, intent.status);
+  if (lease === null) throw dataError();
+  return Object.freeze({ intent, ...lease });
 }
 
 type AttemptStatus = 'STARTED' | 'COMPLETED' | 'ABANDONED';
@@ -1234,8 +1250,8 @@ function requireFencedMutation(result: QueryResult): void {
   if (result.rowCount !== 1) throw dataError();
 }
 
-function booleanMutation(result: QueryResult): boolean {
-  if (result.rowCount === 0) return false;
+function fencedBooleanMutation(result: QueryResult): boolean {
+  if (result.rowCount === 0) throw leaseLostError();
   if (result.rowCount !== 1) throw dataError();
   return true;
 }

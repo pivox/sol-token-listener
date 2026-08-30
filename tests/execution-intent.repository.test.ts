@@ -122,6 +122,7 @@ void test('claim validates a closed purpose and preserves each selected business
     for (const candidate of statuses) assert.match(call.text, new RegExp(`'${candidate}'`, 'u'));
     const setClause = required(/SET([\s\S]*?)FROM candidate/u.exec(call.text)?.[1]);
     assert.doesNotMatch(setClause, /\bstatus\b|attempt_count|last_reason_code|terminal_at/u);
+    assert.doesNotMatch(call.text, /execution_intent_transitions/u);
     assert.equal(call.values?.[0], 'worker-1');
     assert.equal(call.values?.[1], 30_000);
     assert.match(String(call.values?.[2]), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
@@ -136,10 +137,14 @@ void test('claim validates a closed purpose and preserves each selected business
 void test('renew and release fence on id, status, UUID token, and strict database lease freshness', async () => {
   const draft = executionDraft('lease');
   const claim = claimedIntent(draft, 'PROCESSING');
-  const client = new ScriptedClient([result([], 0), result([], 1)]);
+  const client = new ScriptedClient([
+    result([], 0), result([], 0), result([], 1), result([], 1),
+  ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
-  assert.equal(await repository.renew(claim, 5_000), false);
+  await expectCode(repository.renew(claim, 5_000), 'INTENT_LEASE_LOST');
+  await expectCode(repository.release(claim), 'INTENT_LEASE_LOST');
+  assert.equal(await repository.renew(claim, 5_000), true);
   assert.equal(await repository.release(claim), true);
 
   for (const call of client.calls) {
@@ -170,7 +175,8 @@ void test('claim rejects a well-shaped row that contradicts the requested lease 
 void test('transition locks and fences the parent, appends evidence, then updates atomically', async () => {
   const draft = executionDraft('transition');
   const claim = claimedIntent(draft, 'PENDING');
-  const updated = intentRow(draft, {
+  const updated = claimRow(draft, 'PROCESSING', 0);
+  Object.assign(updated, {
     status: 'PROCESSING', last_reason_code: 'INTENT_DUPLICATE',
     updated_at_ms: String(NOW_MS + 1),
   });
@@ -200,6 +206,38 @@ void test('transition locks and fences the parent, appends evidence, then update
   assert.match(String(journal.values?.find((value) => typeof value === 'string' && value.startsWith('{'))), /"payloadVersion":1/u);
   const parentUpdate = required(client.calls[3]);
   assert.doesNotMatch(parentUpdate.text, /lease_owner\s*=\s*NULL/u);
+});
+
+void test('nonterminal transition fail-closes every mismatched retained lease triplet', async () => {
+  const draft = executionDraft('transition-lease-returning');
+  const claim = claimedIntent(draft, 'PENDING');
+  const variants = [
+    { lease_owner: null, lease_token: null, lease_expires_at_ms: null },
+    { lease_owner: 'different-worker' },
+    { lease_token: '00000000-0000-4000-8000-000000000002' },
+    { lease_expires_at_ms: String(NOW_MS + 30_001) },
+  ] as const;
+
+  for (const leaseOverride of variants) {
+    const returned = claimRow(draft, 'PROCESSING', 0);
+    Object.assign(returned, {
+      last_reason_code: 'INTENT_DUPLICATE', updated_at_ms: String(NOW_MS + 1),
+      ...leaseOverride,
+    });
+    const client = new ScriptedClient([
+      command('BEGIN'), result([claimRow(draft, 'PENDING', 0)], 1), result([], 1),
+      result([returned], 1), (text) => {
+        assert.match(text, /^(?:COMMIT|ROLLBACK)$/u);
+        return result([], null);
+      },
+    ]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    await expectCode(
+      repository.transition(claim, transitionInput(claim, 'PROCESSING')),
+      'INVALID_DATA',
+    );
+  }
 });
 
 void test('transition rolls back both journal and parent update when fencing is lost', async () => {
@@ -485,6 +523,8 @@ void test('expirePreSubmission locks a bounded ordered batch and journals explic
 
   const call = required(client.calls[1]);
   assert.match(call.text, /FOR UPDATE(?: OF intent)? SKIP LOCKED/u);
+  assert.match(call.text, /expires_at\s*<=\s*statement_timestamp\(\)/u);
+  assert.match(call.text, /lease_expires_at\s+IS NULL[\s\S]*<=\s*statement_timestamp\(\)/u);
   assert.match(call.text, /ORDER BY\s+intent\.requested_at,\s*intent\.id/u);
   assert.match(call.text, /LIMIT\s+\$1/u);
   for (const status of ['PENDING', 'RETRY_READY', 'PROCESSING', 'SIMULATED']) {
@@ -637,13 +677,13 @@ void test('real PostgreSQL provides replay, concurrent claims, exact-boundary re
     await firstPool.query(`UPDATE execution_intents
       SET lease_expires_at = date_trunc('milliseconds', statement_timestamp())
       WHERE id = $1`, [draft.id]);
-    assert.equal(await first.renew(activeClaim, 60_000), false);
+    await expectCode(first.renew(activeClaim, 60_000), 'INTENT_LEASE_LOST');
     await expectCode(first.finishAttempt(activeClaim, finishedAttempt), 'INTENT_LEASE_LOST');
     const reclaimed = await second.claim({ ownerId: 'worker-reclaimer', leaseMs: 60_000, purpose: 'EXECUTE' });
     assert.ok(reclaimed);
     assert.equal(reclaimed.intent.status, 'PROCESSING');
     assert.notEqual(reclaimed.leaseToken, initialClaim.leaseToken);
-    assert.equal(await first.release(activeClaim), false);
+    await expectCode(first.release(activeClaim), 'INTENT_LEASE_LOST');
 
     const simulated = await second.transition(reclaimed, transitionInput(reclaimed, 'SIMULATED', 1));
     const simulatedClaim = Object.freeze({ ...reclaimed, intent: simulated });
@@ -745,6 +785,152 @@ void test('real PostgreSQL provides replay, concurrent claims, exact-boundary re
       status: 'ABANDONED', reason_code: 'INTENT_EXPIRED',
       completed_at_ms: String(required((await first.read(activeExpiryDraft.id))?.terminalAtMs)),
     }]);
+  });
+});
+
+void test('real PostgreSQL replays one STARTED attempt under a reclaimed fresh fence', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: STARTED reclaim integration skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'execution_attempt_reclaim', async (firstPool, secondPool) => {
+    await migrateDatabase({ pool: firstPool });
+    const first = new PostgresExecutionIntentRepository(firstPool);
+    const second = new PostgresExecutionIntentRepository(secondPool);
+    const now = await databaseNowMs(firstPool);
+    const draft = executionDraft('postgres-started-reclaim', {
+      requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+    });
+    await first.create(draft);
+    const initial = required(await first.claim({
+      ownerId: 'attempt-worker-a', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    const processing = await first.transition(initial, transitionInput(initial, 'PROCESSING'));
+    const active = Object.freeze({ ...initial, intent: processing });
+    const started = await first.beginAttempt(active);
+
+    await firstPool.query(`UPDATE execution_intents
+      SET lease_expires_at=date_trunc('milliseconds', statement_timestamp())
+      WHERE id=$1`, [draft.id]);
+    await expectCode(first.beginAttempt(active), 'INTENT_LEASE_LOST');
+    const reclaimed = required(await second.claim({
+      ownerId: 'attempt-worker-b', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    assert.notEqual(reclaimed.leaseToken, initial.leaseToken);
+    assert.deepEqual(await second.beginAttempt(reclaimed), started);
+
+    const counts = await firstPool.query(`SELECT intent.attempt_count,
+      COUNT(attempt.*)::INTEGER AS attempts
+      FROM execution_intents AS intent
+      LEFT JOIN execution_attempts AS attempt ON attempt.intent_id=intent.id
+      WHERE intent.id=$1 GROUP BY intent.attempt_count`, [draft.id]);
+    assert.deepEqual(counts.rows, [{ attempt_count: 1, attempts: 1 }]);
+    const transitionCount = await firstPool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_intent_transitions WHERE intent_id=$1`, [draft.id]);
+    assert.deepEqual(transitionCount.rows, [{ count: 1 }]);
+  });
+});
+
+void test('real PostgreSQL enforces exact reclaim and pre-submission expiry boundaries', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: reclaim boundary integration skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'execution_intent_boundaries', async (firstPool, secondPool) => {
+    await migrateDatabase({ pool: firstPool });
+    const first = new PostgresExecutionIntentRepository(firstPool);
+    const second = new PostgresExecutionIntentRepository(secondPool);
+    const now = await databaseNowMs(firstPool);
+    const liveTimes = { requestedAtMs: now - 1_000, expiresAtMs: now + 120_000 } as const;
+
+    const exactReclaimDraft = executionDraft('postgres-exact-reclaim', liveTimes);
+    await first.create(exactReclaimDraft);
+    const exactOriginal = required(await first.claim({
+      ownerId: 'exact-owner-a', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    await firstPool.query(`UPDATE execution_intents
+      SET lease_expires_at=date_trunc('milliseconds', statement_timestamp())
+      WHERE id=$1`, [exactReclaimDraft.id]);
+    const exactReclaimed = required(await second.claim({
+      ownerId: 'exact-owner-b', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    assert.equal(exactReclaimed.intent.id, exactReclaimDraft.id);
+    assert.notEqual(exactReclaimed.leaseToken, exactOriginal.leaseToken);
+    const reclaimJournal = await firstPool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_intent_transitions WHERE intent_id=$1`, [exactReclaimDraft.id]);
+    assert.deepEqual(reclaimJournal.rows, [{ count: 0 }]);
+
+    const freshReclaimDraft = executionDraft('postgres-fresh-reclaim', liveTimes);
+    await first.create(freshReclaimDraft);
+    const freshClaim = required(await first.claim({
+      ownerId: 'fresh-owner', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    assert.equal(freshClaim.intent.id, freshReclaimDraft.id);
+    assert.equal(await second.claim({
+      ownerId: 'fresh-contender', leaseMs: 60_000, purpose: 'EXECUTE',
+    }), null);
+
+    const expiredFreshDraft = executionDraft('postgres-expired-fresh', liveTimes);
+    await first.create(expiredFreshDraft);
+    const expiredFreshClaim = required(await first.claim({
+      ownerId: 'expired-fresh-owner', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    assert.equal(expiredFreshClaim.intent.id, expiredFreshDraft.id);
+    await firstPool.query(`UPDATE execution_intents
+      SET expires_at=requested_at + INTERVAL '1 millisecond'
+      WHERE id=$1`, [expiredFreshDraft.id]);
+
+    const expiredLeaseDraft = executionDraft('postgres-expired-lease', liveTimes);
+    await first.create(expiredLeaseDraft);
+    const expiredLeaseClaim = required(await first.claim({
+      ownerId: 'expired-lease-owner', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    assert.equal(expiredLeaseClaim.intent.id, expiredLeaseDraft.id);
+    await firstPool.query(`UPDATE execution_intents
+      SET expires_at=requested_at + INTERVAL '1 millisecond',
+        lease_expires_at=date_trunc('milliseconds', statement_timestamp())
+      WHERE id=$1`, [expiredLeaseDraft.id]);
+
+    const liveUnleasedDraft = executionDraft('postgres-live-unleased', liveTimes);
+    await first.create(liveUnleasedDraft);
+    const expiredAbsentDraft = executionDraft('postgres-expired-absent', {
+      requestedAtMs: 0, expiresAtMs: 1,
+    });
+    await first.create(expiredAbsentDraft);
+
+    assert.equal(await first.expirePreSubmission(10), 2);
+    const liveUnleased = required(await first.read(liveUnleasedDraft.id));
+    const expiredFresh = required(await first.read(expiredFreshDraft.id));
+    assert.equal(liveUnleased.status, 'PENDING');
+    assert.equal(liveUnleased.terminalAtMs, null);
+    assert.equal(expiredFresh.status, 'PENDING');
+    assert.equal(expiredFresh.terminalAtMs, null);
+
+    const expiredAbsent = required(await first.read(expiredAbsentDraft.id));
+    const expiredLease = required(await first.read(expiredLeaseDraft.id));
+    for (const expired of [expiredAbsent, expiredLease]) {
+      assert.equal(expired.status, 'EXPIRED');
+      assert.equal(expired.reconciliationCompletedAtMs, expired.terminalAtMs);
+      assert.equal(required(expired.purgeAfterMs) - required(expired.terminalAtMs), 14_400_000);
+    }
+    const boundaryJournal = await firstPool.query(`SELECT intent_id,previous_status,
+      next_status,reason_code FROM execution_intent_transitions
+      WHERE intent_id IN ($1,$2) ORDER BY intent_id`, [expiredAbsentDraft.id, expiredLeaseDraft.id]);
+    assert.deepEqual(boundaryJournal.rows, [expiredAbsentDraft.id, expiredLeaseDraft.id]
+      .sort()
+      .map((intentId) => ({
+        intent_id: intentId, previous_status: 'PENDING', next_status: 'EXPIRED',
+        reason_code: 'INTENT_EXPIRED',
+      })));
+    const unchangedJournal = await firstPool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_intent_transitions WHERE intent_id IN ($1,$2)`, [
+      liveUnleasedDraft.id, expiredFreshDraft.id,
+    ]);
+    assert.deepEqual(unchangedJournal.rows, [{ count: 0 }]);
   });
 });
 
