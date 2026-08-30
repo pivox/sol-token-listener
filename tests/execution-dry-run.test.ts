@@ -16,6 +16,9 @@ import {
 } from '../src/domain/execution-intent.js';
 
 const U64_MAX = 18_446_744_073_709_551_615n;
+const INT32_MAX = 2_147_483_647;
+const INT64_MAX = 9_223_372_036_854_775_807n;
+const DATE_MAX_MS = 8_640_000_000_000_000;
 
 void test('creates the specified immutable deterministic BUY assessment vector', () => {
   const assessment = createExecutionDryRunAssessment(intent());
@@ -172,6 +175,79 @@ void test('rejects hostile accessor and proxy assessment inputs without invoking
   assert.equal(proxyTraps, 0);
 });
 
+void test('normalizes malformed and hostile execution intent inputs at the runtime boundary', () => {
+  const valid = intent();
+  const nonFrozen = { ...valid };
+  const malformed = Object.freeze({ ...valid, status: 'NOT_A_STATUS' });
+  let getterCalls = 0;
+  const getter = { ...valid };
+  Object.defineProperty(getter, 'status', {
+    enumerable: true,
+    get: () => { getterCalls += 1; throw new Error('secret getter failure'); },
+  });
+  Object.freeze(getter);
+  let proxyTraps = 0;
+  const proxy = new Proxy(valid, {
+    getPrototypeOf: () => { proxyTraps += 1; throw new Error('secret proxy failure'); },
+    ownKeys: () => { proxyTraps += 1; throw new Error('secret proxy failure'); },
+    getOwnPropertyDescriptor: () => { proxyTraps += 1; throw new Error('secret proxy failure'); },
+  });
+
+  for (const hostile of [nonFrozen, malformed, getter, proxy]) {
+    assertValidationFailure(() => {
+      createExecutionDryRunAssessment(hostile as ExecutionIntentV1);
+    });
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(proxyTraps, 0);
+});
+
+void test('rejects well-formed but incorrect assessment identifiers and fingerprints', () => {
+  const draft = createExecutionDryRunAssessment(intent());
+  const wrongAssessmentId = `${draft.assessmentId.slice(0, -1)}${differentHexDigit(draft.assessmentId)}`;
+  const wrongInputFingerprint = `${draft.inputFingerprint.slice(0, -1)}${differentHexDigit(draft.inputFingerprint)}`;
+  const wrongResultFingerprint = `${draft.resultFingerprint.slice(0, -1)}${differentHexDigit(draft.resultFingerprint)}`;
+
+  for (const overrides of [
+    { assessmentId: wrongAssessmentId },
+    { inputFingerprint: wrongInputFingerprint },
+    { resultFingerprint: wrongResultFingerprint },
+  ]) {
+    assertValidationFailure(() => {
+      assertExecutionDryRunAssessmentDraft(Object.freeze({ ...draft, ...overrides }));
+    });
+  }
+});
+
+void test('accepts exact numeric maxima and rejects one past each maximum', () => {
+  const maximumStrategy = createExecutionDryRunAssessment(intent({
+    input: { strategyVersion: INT32_MAX },
+  }));
+  const maximumRevision = createExecutionDryRunAssessment(intent({ stateRevision: INT64_MAX }));
+  const maximumRecorded = Object.freeze({
+    ...createExecutionDryRunAssessment(intent()), recordedAtMs: DATE_MAX_MS,
+  });
+
+  assert.doesNotThrow(() => { assertExecutionDryRunAssessmentDraft(maximumStrategy); });
+  assert.doesNotThrow(() => { assertExecutionDryRunAssessmentDraft(maximumRevision); });
+  assert.doesNotThrow(() => { assertExecutionDryRunAssessment(maximumRecorded); });
+  assertValidationFailure(() => {
+    assertExecutionDryRunAssessmentDraft(Object.freeze({
+      ...maximumStrategy, strategyVersion: INT32_MAX + 1,
+    }));
+  });
+  assertValidationFailure(() => {
+    assertExecutionDryRunAssessmentDraft(Object.freeze({
+      ...maximumRevision, intentStateRevision: INT64_MAX + 1n,
+    }));
+  });
+  assertValidationFailure(() => {
+    assertExecutionDryRunAssessment(Object.freeze({
+      ...maximumRecorded, recordedAtMs: DATE_MAX_MS + 1,
+    }));
+  });
+});
+
 void test('rejects invalid assessment versions, values, dates, hashes, and enums', () => {
   const draft = createExecutionDryRunAssessment(intent());
   const invalidDrafts: readonly Readonly<Record<string, unknown>>[] = [
@@ -179,6 +255,8 @@ void test('rejects invalid assessment versions, values, dates, hashes, and enums
     { assessmentId: draft.assessmentId.toUpperCase() }, { inputFingerprint: 'A'.repeat(64) },
     { resultFingerprint: 'x'.repeat(64) }, { intentStateRevision: -1n }, { intentStatus: 'PROCESSING' },
     { outcome: 'OTHER' }, { coverage: 'OTHER' }, { quoteStatus: 'DONE' },
+    { buildStatus: 'DONE' }, { simulationStatus: 'DONE' }, { signatureStatus: 'DONE' },
+    { submissionStatus: 'DONE' },
     { strategyVersion: 0 }, { decisionFingerprint: 'A'.repeat(64) },
   ];
   for (const overrides of invalidDrafts) {
@@ -223,4 +301,8 @@ function assertValidationFailure(action: () => void): void {
     && error.message === 'Invalid execution dry-run assessment.'
     && error.name === 'ExecutionDryRunValidationError'
   ));
+}
+
+function differentHexDigit(value: string): string {
+  return value.endsWith('0') ? '1' : '0';
 }
