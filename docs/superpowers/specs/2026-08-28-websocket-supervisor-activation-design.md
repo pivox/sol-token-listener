@@ -3,16 +3,17 @@
 Date: 2026-08-28
 Issue: #63
 Parent issue: #57
-Version: 1.0.1
+Version: 1.0.2
 Status: approved through the standing instruction to use the recommended option
 
-Revision 1.0.1 makes the delayed activation path as strict as the former paper
+Revision 1.0.2 makes the delayed activation path as strict as the former paper
 startup barrier. Paper readiness now requires both a running promoted
 WebSocket provider and a successful current finality pass, with a fence before
 claim and every durable paper mutation. It also serializes supervisor cleanup
 before downstream workers, defines candidate completion versus promotion,
-retains only a surviving incumbent in `UNRECOVERABLE`, and keeps the genesis
-hash optional in deployment wiring only when the listener is disabled.
+fences and closes every incumbent before publishing `UNRECOVERABLE`, and keeps
+the genesis hash optional in deployment wiring only when the listener is
+disabled.
 
 ## Purpose
 
@@ -236,12 +237,14 @@ automatic rotation and remains fail-closed until process restart or later
 operator-controlled recovery work. Restart always re-enters dual ACK and
 strict catch-up; it never selects `live-edge`.
 
-Before persisting `UNRECOVERABLE`, the last candidate is closed and removed.
-A genuinely surviving incumbent remains as the snapshot's active pair and may
-continue adding idempotent observations; an already completed incumbent is
-closed and removed. No setup, backoff, periodic or recovery timer remains
-armed. Qualification may retain observational evidence, but paper readiness is
-false and no paper position mutation is authorized.
+Before persisting `UNRECOVERABLE`, publication is fenced, provider selection is
+cleared, and every candidate and incumbent is aborted, closed and removed,
+including a still-connected incumbent. Notifications arriving after the fence
+cannot enter the durable inbox. The terminal snapshot therefore exposes no
+active or candidate provider pair. No setup, backoff, periodic or recovery
+timer remains armed. Qualification may retain evidence already persisted
+before the terminal fence, but paper readiness is false and no paper position
+mutation is authorized.
 
 ## Cooperative scan cancellation
 
