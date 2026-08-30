@@ -38,6 +38,13 @@ Fournissez séparément `POSTGRES_PASSWORD` et
 dans `DATABASE_URL`. N’ajoutez aucune variable de wallet, clé privée, keypair
 ou signature : elles sont interdites par la configuration V1.
 
+Quand `LISTENER_ENABLED=true`, fournissez aussi
+`SOLANA_EXPECTED_GENESIS_HASH`. C’est le hash de genèse canonique base58 de
+32 octets du cluster ciblé. Obtenez `getGenesisHash` indépendamment auprès de
+plusieurs sources de confiance, comparez-les avant de renseigner la valeur et
+ne la copiez jamais dans les logs. L’exemple conserve volontairement une valeur
+vide : un hash fictif ne constitue pas une configuration sûre.
+
 Définissez le chemin une fois puis validez le rendu sans imprimer le fichier :
 
 ```bash
@@ -73,17 +80,35 @@ restent immuables.
 
 ## Démarrage
 
+La séquence opérationnelle minimale, depuis un fichier opérateur vérifié
+`deploy/.env`, est la suivante. Elle démarre la migration avant les services
+applicatifs et exige une santé `OK` :
+
+```bash
+DOTENV_CONFIG_PATH=deploy/.env npm run rpc:check
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d migrate
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --wait --wait-timeout 60 app frontend retention
+docker compose --env-file deploy/.env -f deploy/compose.yaml exec -T app \
+  node dist/scripts/deployment-healthcheck.js --require-ok
+```
+
+La supervision active attend le double ACK, vérifie la frontière stricte toutes
+les 30 secondes et utilise seulement les IDs positionnels. Elle ne revient pas
+automatiquement à `SolanaProgramSubscriber`; elle reste strictement
+observe/paper only, sans wallet, signature ni soumission.
+
 Avant toute migration, effectuez et vérifiez une sauvegarde de la base. Puis
 construisez ou tirez les images immuables validées. Depuis la racine du dépôt :
 
 ```bash
 set -euo pipefail
+DOTENV_CONFIG_PATH="$DEPLOY_ENV" npm run rpc:check
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --images migrate app retention frontend | grep -Fvx 'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3' | npm run --silent deployment:validate-images
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull postgres migrate app retention frontend
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 frontend app retention
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up --detach --wait --wait-timeout 60 --no-build postgres
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener run --rm --no-deps migrate
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps app retention
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --wait --wait-timeout 60 --no-build --no-deps app retention
 health_attempt=0
 until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js --require-ok; do
   health_attempt=$((health_attempt + 1))
@@ -113,7 +138,8 @@ pas la migration tant que cette commande n’est pas terminée.
 La commande PostgreSQL attend explicitement un état sain, avec une borne de 60
 secondes ; une migration `--no-deps` ne part donc pas sur une base seulement
 démarrée. Lancez ensuite la migration one-shot, puis exactement une application
-et un worker de rétention. La boucle attend le healthcheck compilé
+et un worker de rétention, dont la préparation est aussi attendue avec une
+borne de 60 secondes. La boucle confirme ensuite le healthcheck compilé
 avant de publier le frontend derrière le proxy TLS externe. Vérifiez health, SSE
 et les logs de rétention. La sonde SSE attend 20 secondes, donc au-delà du
 heartbeat par défaut de 15 secondes. Un `curl` encore connecté doit terminer
@@ -204,6 +230,11 @@ de production.
 
 ## Rollback
 
+Il n’existe pas de raccourci « stop puis up » : redémarrer la même image ne
+constitue pas un rollback. La procédure unique ci-dessous remplace explicitement
+les images et ne bascule jamais vers le subscriber legacy dans le processus en
+cours. Elle ne modifie jamais `EXECUTION_MODE` au-delà de `observe` ou `paper`.
+
 Quand l’ancienne application est compatible avec le schéma, arrêtez d’abord les
 trois services applicatifs avec les digests encore déployés :
 
@@ -211,16 +242,20 @@ trois services applicatifs avec les digests encore déployés :
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener stop --timeout 40 frontend app retention
 ```
 
-La commande attend leur fin avant toute modification de version. Remplacez
-ensuite dans `$DEPLOY_ENV` les valeurs `BACKEND_IMAGE` et `FRONTEND_IMAGE` par
-leurs digests précédents, puis appliquez exactement le même gate strict :
+La commande attend leur fin avant toute modification de version. Avant le
+premier `pull`, l’opérateur remplace explicitement dans `$DEPLOY_ENV` les valeurs
+non vides `BACKEND_IMAGE` et `FRONTEND_IMAGE` par les références immuables précédentes
+exactes, de forme `repository@sha256:…`. Ne recopiez jamais un faux digest valide
+ni un placeholder : `config --quiet` et `deployment:validate-images` refusent une
+valeur vide, mutable, mal formée ou partagée avec le mauvais service. Ensuite
+seulement, appliquez ce gate strict :
 
 ```bash
 set -euo pipefail
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --quiet
 docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener config --images migrate app retention frontend | grep -Fvx 'postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3' | npm run --silent deployment:validate-images
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull app retention frontend
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps app retention
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener pull app frontend retention
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --wait --wait-timeout 60 --no-build --no-deps app retention
 health_attempt=0
 until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener exec -T app node dist/scripts/deployment-healthcheck.js --require-ok; do
   health_attempt=$((health_attempt + 1))
@@ -233,8 +268,11 @@ until docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-n
   fi
   sleep 2
 done
-docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --no-build --no-deps frontend
+docker compose --env-file "$DEPLOY_ENV" -f deploy/compose.yaml --project-name sol-token-listener up -d --wait --wait-timeout 60 --no-build --no-deps frontend
 ```
+
+Le frontend reste volontairement arrêté jusqu’au healthcheck strict de `app` ;
+la dernière commande le réexpose seulement après sa réussite.
 
 Le rollback se fait sans inverser les migrations : le schéma est forward-only.
 Ne relancez pas une ancienne image avant d’avoir vérifié sa compatibilité avec

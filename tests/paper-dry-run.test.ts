@@ -11,6 +11,8 @@ import {
   type PaperDryRunQueryable,
 } from '../src/cli/paper-dry-run.js';
 
+const TEST_GENESIS_HASH = '11111111111111111111111111111111';
+
 void test('parses only bounded canonical dry-run arguments', () => {
   assert.deepEqual(parsePaperDryRunArguments([
     '--duration-seconds=5',
@@ -229,6 +231,7 @@ function paperConfig() {
   return parseConfig({
     SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
     SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+    SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
     EXECUTION_MODE: 'paper', PAPER_STRATEGY_ENABLED: 'true',
     PAPER_ENTRY_QUOTE_AMOUNT_RAW: '1000000', PAPER_SLIPPAGE_BPS: '100',
     QUALIFICATION_PROFILE_PATH: 'config/qualification/pumpfun-v1-unvalidated.json',

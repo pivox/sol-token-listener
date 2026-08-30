@@ -5,10 +5,12 @@ import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config/env.js';
 import { loadQualificationProfile } from '../src/qualification/qualification-profile.js';
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
+import bs58 from 'bs58';
 
 const base = {
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
   SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+  SOLANA_EXPECTED_GENESIS_HASH: bs58.encode(Uint8Array.from({ length: 32 }, () => 7)),
 };
 
 void test('fallback HTTP RPC defaults to a frozen empty list when absent or whitespace-only', () => {
@@ -562,6 +564,7 @@ void test('le modèle d’environnement publie les valeurs API sûres exactes', 
 void test('le listener durable est activé avec des bornes sûres par défaut', () => {
   const config = parseConfig(base);
   assert.equal(config.listenerEnabled, true);
+  assert.equal(config.expectedGenesisHash, base.SOLANA_EXPECTED_GENESIS_HASH);
   assert.equal(config.listenerCatchUpPolicy, 'live-edge');
   assert.equal(config.listenerWorkerLeaseSeconds, 120);
   assert.equal(config.listenerCatchUpMaxPages, 20);
@@ -571,6 +574,29 @@ void test('le listener durable est activé avec des bornes sûres par défaut', 
   assert.equal(config.rpcRetryMaxAttempts, 5);
   assert.equal(config.rpcRetryBaseDelayMs, 500);
   assert.equal(config.reconcileSeconds, 15);
+});
+
+void test('le listener désactivé accepte un hash genesis absent et publie null', () => {
+  const config = parseConfig({
+    ...base,
+    LISTENER_ENABLED: 'false',
+    SOLANA_EXPECTED_GENESIS_HASH: undefined,
+  });
+  assert.equal(config.expectedGenesisHash, null);
+});
+
+void test('le hash genesis requis manque sans divulguer de secret de configuration', () => {
+  const secret = 'https://user:secret@hostname.invalid/rpc?query=secret';
+  assert.throws(() => parseConfig({
+    ...base,
+    SOLANA_EXPECTED_GENESIS_HASH: undefined,
+    SOLANA_HTTP_RPC_URL: secret,
+  }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, 'SOLANA_EXPECTED_GENESIS_HASH is invalid.');
+    assert.doesNotMatch(error.message, /hostname|query|secret|https/i);
+    return true;
+  });
 });
 
 void test('la politique de rattrapage accepte uniquement live-edge ou strict', () => {
@@ -649,6 +675,7 @@ void test('la configuration listener refuse les valeurs ambiguës ou hors limite
 void test('le modèle d’environnement publie les valeurs listener sûres exactes', async () => {
   const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
   for (const line of [
+    'SOLANA_EXPECTED_GENESIS_HASH=',
     'LISTENER_ENABLED=true',
     'LISTENER_CATCH_UP_POLICY=live-edge',
     'LISTENER_WORKER_LEASE_SECONDS=120',
@@ -657,6 +684,7 @@ void test('le modèle d’environnement publie les valeurs listener sûres exact
     'LISTENER_FINALITY_MISSING_POLLS=3',
     'LISTENER_SHUTDOWN_TIMEOUT_MS=30000',
   ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
+  assert.match(source, /canonical 32-byte base58 genesis hash/i);
 });
 
 void test('public social enrichment uses strict bounded non-secret defaults', () => {
@@ -849,7 +877,7 @@ void test('durable WebSocket health documentation is versioned and exposes the e
   ]);
 
   assert.match(design, /^Version: 1\.0\.5$/mu);
-  assert.match(umbrella, /^Version: 1\.3\.5$/mu);
+  assert.match(umbrella, /^Version: 1\.4\.1$/mu);
   assert.match(umbrella, /durable-websocket-health-design\.md` version\s+1\.0\.5/isu);
   assert.match(plan, /design v1\.0\.5/iu);
 
@@ -887,9 +915,9 @@ void test('durable WebSocket health documentation is versioned and exposes the e
   ]);
   assert.equal(Object.hasOwn(websocket, 'signature'), false);
   assert.deepEqual(websocket.recovery, {
-    status: 'NOT_REQUIRED',
-    startedAt: null,
-    completedAt: null,
+    status: 'RECOVERED',
+    startedAt: '2026-08-28T10:00:00.000Z',
+    completedAt: '2026-08-28T10:00:00.000Z',
     reasonCode: null,
   });
 
@@ -898,7 +926,7 @@ void test('durable WebSocket health documentation is versioned and exposes the e
     'WAITING_FOR_ACKS', 'RUNNING', 'UNRECOVERABLE', 'STOPPING',
     'listener_strict_catch_up_failures', '30 secondes', 'quatre heures',
     'backend requis', 'client optionnel', 'primary', 'fallback-1', 'fallback-2',
-    'fallback-3', 'INACTIVE', '#63',
+    'fallback-3', 'ACTIVE', 'double ACK',
   ]) assert.ok(apiSection.includes(value), `missing WebSocket API documentation: ${value}`);
 
   assert.match(apiSection, /dernière observation[^.]*diagnostique[^.]*pas[^.]*continuité/isu);
@@ -945,7 +973,7 @@ void test('HTTP RPC failover documentation states the bounded production and soa
     'erreur JSON-RPC',
     'résultat archive null',
     'SOLANA_WS_RPC_URL',
-    'issue #57',
+    'superviseur de production',
     'mono-fournisseur',
     'SOLANA_HTTP_RPC_URL + SOLANA_WS_RPC_URL',
     '50 positions Mainnet',

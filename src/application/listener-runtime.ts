@@ -1,27 +1,28 @@
+import type { RpcProviderId } from '../domain/rpc-provider.js';
 import type { ListenerRuntimeState } from '../domain/transaction-ingestion.js';
 import type { ListenerRuntime } from '../ports/listener-runtime.js';
 import type { ApiProjectionPipelineState } from '../storage/api-projection.repository.js';
 
 export type ListenerRuntimeFailureStage =
-  | 'rpc-health'
-  | 'scanner-scan'
-  | 'subscriber-start'
+  | 'supervisor-start'
   | 'worker-start'
   | 'paper-worker-start'
   | 'social-worker-start'
   | 'reconciler-start'
   | 'heartbeat-start'
   | 'startup-timeout'
-  | 'subscriber-close'
-  | 'scanner-close'
-  | 'reconciler-close'
-  | 'worker-close'
-  | 'worker-timeout'
+  | 'supervisor-close'
+  | 'supervisor-timeout'
   | 'paper-worker-close'
   | 'paper-worker-timeout'
   | 'social-worker-close'
   | 'social-worker-timeout'
-  | 'heartbeat-stop';
+  | 'reconciler-close'
+  | 'reconciler-timeout'
+  | 'worker-close'
+  | 'worker-timeout'
+  | 'heartbeat-stop'
+  | 'heartbeat-timeout';
 
 export interface ListenerRuntimeFailure {
   readonly stage: ListenerRuntimeFailureStage;
@@ -34,7 +35,7 @@ export class ListenerRuntimeError extends Error {
   public constructor(failures: readonly ListenerRuntimeFailure[]) {
     super('Solana listener runtime operation failed.');
     this.name = 'ListenerRuntimeError';
-    this.failures = Object.freeze(failures.map((failure) => Object.freeze({ ...failure })));
+    this.failures = Object.freeze(failures.map((entry) => Object.freeze({ ...entry })));
     Object.freeze(this);
   }
 }
@@ -45,10 +46,8 @@ interface RuntimeComponent {
   state(): ListenerRuntimeState;
 }
 
-interface RuntimeScanner {
-  scan(): Promise<unknown>;
-  close(): Promise<void>;
-  state(): ListenerRuntimeState;
+interface RuntimeSupervisor extends RuntimeComponent {
+  activeProviderId(): RpcProviderId | null;
 }
 
 interface RuntimeHeartbeat {
@@ -58,9 +57,7 @@ interface RuntimeHeartbeat {
 }
 
 export interface ListenerRuntimeDependencies {
-  readonly rpc: { readonly checkHealth: () => Promise<unknown> };
-  readonly scanner: RuntimeScanner;
-  readonly subscriber: RuntimeComponent;
+  readonly supervisor: RuntimeSupervisor;
   readonly worker: RuntimeComponent;
   readonly paperWorker: RuntimeComponent;
   readonly socialWorker: RuntimeComponent;
@@ -73,14 +70,28 @@ export interface ListenerRuntimeOptions {
 }
 
 type ActiveRuntimeResource =
-  | 'subscriber' | 'worker' | 'paperWorker' | 'socialWorker' | 'reconciler' | 'heartbeat';
+  | 'supervisor'
+  | 'worker'
+  | 'paperWorker'
+  | 'socialWorker'
+  | 'reconciler'
+  | 'heartbeat';
+
+const CLEANUP_ORDER: readonly ActiveRuntimeResource[] = Object.freeze([
+  'supervisor',
+  'paperWorker',
+  'socialWorker',
+  'reconciler',
+  'worker',
+  'heartbeat',
+]);
 
 export class SolanaListenerRuntime implements ListenerRuntime {
   private currentState: ListenerRuntimeState = 'STOPPED';
   private startPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
   private readonly activeResources = new Set<ActiveRuntimeResource>();
-  private scannerNeedsClose = false;
+  private readonly closingResources = new Map<ActiveRuntimeResource, Promise<void>>();
   private started = false;
   private permanentlyClosed = false;
 
@@ -97,7 +108,7 @@ export class SolanaListenerRuntime implements ListenerRuntime {
 
   public start(): Promise<void> {
     if (this.permanentlyClosed) {
-      return Promise.reject(new ListenerRuntimeError([failure('rpc-health')]));
+      return Promise.reject(new ListenerRuntimeError([failure('supervisor-start')]));
     }
     if (this.started) return Promise.resolve();
     if (this.startPromise !== null) return this.startPromise;
@@ -137,256 +148,153 @@ export class SolanaListenerRuntime implements ListenerRuntime {
   public pipelineState(): ApiProjectionPipelineState {
     if (this.currentState === 'STOPPED') {
       return Object.freeze({
-        httpAvailable: true, pumpfun: 'STOPPED', pumpswap: 'STOPPED',
-        qualification: 'STOPPED', paperDecision: 'STOPPED', social: 'STOPPED',
+        httpAvailable: true,
+        pumpfun: 'STOPPED',
+        pumpswap: 'STOPPED',
+        qualification: 'STOPPED',
+        paperDecision: 'STOPPED',
+        social: 'STOPPED',
       });
     }
     if (this.currentState !== 'RUNNING') {
       return Object.freeze({
-        httpAvailable: true, pumpfun: 'DEGRADED', pumpswap: 'DEGRADED',
-        qualification: 'DEGRADED', paperDecision: 'DEGRADED', social: 'DEGRADED',
+        httpAvailable: true,
+        pumpfun: 'DEGRADED',
+        pumpswap: 'DEGRADED',
+        qualification: 'DEGRADED',
+        paperDecision: 'DEGRADED',
+        social: 'DEGRADED',
       });
     }
+
     let chain: 'RUNNING' | 'DEGRADED' = 'DEGRADED';
-    let social: ApiProjectionPipelineState['social'] = 'DEGRADED';
     let paperDecision: ApiProjectionPipelineState['paperDecision'] = 'DEGRADED';
+    let social: ApiProjectionPipelineState['social'] = 'DEGRADED';
     try {
       chain = this.chainComponentStates().every((state) => state === 'RUNNING')
-        ? 'RUNNING' : 'DEGRADED';
-      const socialState = this.dependencies.socialWorker.state();
-      social = socialState === 'RUNNING'
         ? 'RUNNING'
-        : socialState === 'STOPPED' ? 'STOPPED' : 'DEGRADED';
-      const paperState = this.dependencies.paperWorker.state();
-      paperDecision = paperState === 'RUNNING'
-        ? 'RUNNING'
-        : paperState === 'STOPPED' ? 'STOPPED' : 'DEGRADED';
+        : 'DEGRADED';
+      paperDecision = projectionComponentState(this.dependencies.paperWorker.state());
+      social = projectionComponentState(this.dependencies.socialWorker.state());
     } catch {
-      // The failing projection stays DEGRADED without leaking the component error.
+      // A hostile or failing component stays degraded without exposing its error.
     }
     return Object.freeze({
-      httpAvailable: true, pumpfun: chain, pumpswap: chain, qualification: chain, paperDecision, social,
+      httpAvailable: true,
+      pumpfun: chain,
+      pumpswap: chain,
+      qualification: chain,
+      paperDecision,
+      social,
     });
   }
 
   private async performStart(): Promise<void> {
-    const started: ActiveRuntimeResource[] = [];
-    let stage: ListenerRuntimeFailureStage = 'rpc-health';
+    let stage: ListenerRuntimeFailureStage = 'supervisor-start';
     try {
-      await this.dependencies.rpc.checkHealth();
-      this.assertStartOpen();
-      stage = 'scanner-scan';
-      await this.dependencies.scanner.scan();
-      this.assertStartOpen();
-      stage = 'subscriber-start';
-      await this.dependencies.subscriber.start();
-      started.push('subscriber');
-      this.activeResources.add('subscriber');
-      this.assertStartOpen();
-      stage = 'scanner-scan';
-      await this.dependencies.scanner.scan();
-      this.assertStartOpen();
+      await this.startComponent('supervisor');
       stage = 'worker-start';
-      await this.dependencies.worker.start();
-      started.push('worker');
-      this.activeResources.add('worker');
-      this.assertStartOpen();
+      await this.startComponent('worker');
       stage = 'reconciler-start';
-      await this.dependencies.reconciler.start();
-      started.push('reconciler');
-      this.activeResources.add('reconciler');
-      this.assertStartOpen();
+      await this.startComponent('reconciler');
       stage = 'paper-worker-start';
-      await this.dependencies.paperWorker.start();
-      started.push('paperWorker');
-      this.activeResources.add('paperWorker');
-      this.assertStartOpen();
+      await this.startComponent('paperWorker');
       stage = 'social-worker-start';
-      await this.dependencies.socialWorker.start();
-      started.push('socialWorker');
-      this.activeResources.add('socialWorker');
-      this.assertStartOpen();
+      await this.startComponent('socialWorker');
       stage = 'heartbeat-start';
-      await this.dependencies.heartbeat.start();
-      started.push('heartbeat');
-      this.activeResources.add('heartbeat');
-      this.assertStartOpen();
-      this.scannerNeedsClose = true;
+      await this.startComponent('heartbeat');
       this.started = true;
       this.currentState = 'RUNNING';
     } catch {
       const failures: ListenerRuntimeFailure[] = [failure(stage)];
-      await this.rollbackStart(started, failures);
+      if (!this.permanentlyClosed) {
+        const deadlineMs = Date.now() + this.options.shutdownTimeoutMs;
+        await this.cleanupActive(deadlineMs, failures);
+      }
+      this.started = false;
       this.currentState = 'DEGRADED';
       throw new ListenerRuntimeError(failures);
     }
   }
 
-  private async rollbackStart(
-    started: readonly ActiveRuntimeResource[],
-    failures: ListenerRuntimeFailure[],
-  ): Promise<void> {
-    for (let index = started.length - 1; index >= 0; index -= 1) {
-      const component = started[index];
-      if (component === undefined) continue;
-      const closeStage = component === 'heartbeat'
-        ? 'heartbeat-stop'
-        : component === 'socialWorker'
-          ? 'social-worker-close'
-          : component === 'paperWorker'
-            ? 'paper-worker-close'
-            : `${component}-close` as ListenerRuntimeFailureStage;
-      try {
-        if (component === 'heartbeat') await this.dependencies.heartbeat.stop('STOPPED');
-        else await this.dependencies[component].close();
-        this.activeResources.delete(component);
-      } catch {
-        failures.push(failure(closeStage));
-      }
-    }
+  private async startComponent(resource: ActiveRuntimeResource): Promise<void> {
+    this.activeResources.add(resource);
+    if (resource === 'heartbeat') await this.dependencies.heartbeat.start();
+    else await this.dependencies[resource].start();
+    this.assertStartOpen();
   }
 
   private async performClose(): Promise<void> {
     const deadlineMs = Date.now() + this.options.shutdownTimeoutMs;
     const failures: ListenerRuntimeFailure[] = [];
     const starting = this.startPromise;
-    let startupTimedOut = false;
+    await this.cleanupActive(deadlineMs, failures);
     if (starting !== null) {
-      const result = await settleUntil(starting, deadlineMs);
-      if (result === 'timeout') {
-        startupTimedOut = true;
-        failures.push(timeoutFailure('startup-timeout'));
-      }
-    }
-    if (!this.started
-      && !startupTimedOut
-      && this.activeResources.size === 0
-      && !this.scannerNeedsClose) {
-      this.currentState = 'STOPPED';
-      return;
-    }
-
-    const cleanup: {
-      readonly resource: ActiveRuntimeResource | 'scanner';
-      readonly stage: Extract<ListenerRuntimeFailureStage,
-      'subscriber-close' | 'scanner-close' | 'reconciler-close' | 'worker-close'
-      | 'paper-worker-close' | 'social-worker-close'>;
-      readonly operation: Promise<void>;
-    }[] = [];
-    const paperWorkerClosing = startupTimedOut || this.activeResources.has('paperWorker')
-      ? invoke(() => this.dependencies.paperWorker.close())
-      : null;
-    const socialWorkerClosing = startupTimedOut || this.activeResources.has('socialWorker')
-      ? invoke(() => this.dependencies.socialWorker.close())
-      : null;
-    const workerClosing = startupTimedOut || this.activeResources.has('worker')
-      ? invoke(() => this.dependencies.worker.close())
-      : null;
-    if (startupTimedOut || this.activeResources.has('subscriber')) {
-      cleanup.push({
-        resource: 'subscriber',
-        stage: 'subscriber-close',
-        operation: invoke(() => this.dependencies.subscriber.close()),
-      });
-    }
-    if (startupTimedOut || this.scannerNeedsClose) {
-      cleanup.push({
-        resource: 'scanner',
-        stage: 'scanner-close',
-        operation: invoke(() => this.dependencies.scanner.close()),
-      });
-    }
-    if (startupTimedOut || this.activeResources.has('reconciler')) {
-      cleanup.push({
-        resource: 'reconciler',
-        stage: 'reconciler-close',
-        operation: invoke(() => this.dependencies.reconciler.close()),
-      });
-    }
-    if (workerClosing !== null) {
-      cleanup.push({
-        resource: 'worker',
-        stage: 'worker-close',
-        operation: workerClosing,
-      });
-    }
-    if (socialWorkerClosing !== null) {
-      cleanup.unshift({
-        resource: 'socialWorker',
-        stage: 'social-worker-close',
-        operation: socialWorkerClosing,
-      });
-    }
-    if (paperWorkerClosing !== null) {
-      cleanup.unshift({
-        resource: 'paperWorker',
-        stage: 'paper-worker-close',
-        operation: paperWorkerClosing,
-      });
-    }
-    const results = await Promise.all(cleanup.map(async (item) => Object.freeze({
-      resource: item.resource,
-      stage: item.stage,
-      result: await settleUntil(item.operation, deadlineMs),
-    })));
-    for (const result of results) {
-      if (result.result === 'complete') {
-        if (result.resource === 'scanner') this.scannerNeedsClose = false;
-        else this.activeResources.delete(result.resource);
-      } else if (result.result === 'failed') {
-        if (result.resource === 'scanner') this.scannerNeedsClose = true;
-        else this.activeResources.add(result.resource);
-        failures.push(failure(result.stage));
-      }
-      if (result.result === 'timeout') {
-        if (result.resource === 'scanner') this.scannerNeedsClose = true;
-        else this.activeResources.add(result.resource);
-        failures.push(timeoutFailure(
-          result.stage === 'worker-close'
-            ? 'worker-timeout'
-            : result.stage === 'paper-worker-close'
-              ? 'paper-worker-timeout'
-              : result.stage === 'social-worker-close' ? 'social-worker-timeout' : result.stage,
-        ));
-      }
-    }
-
-    if (startupTimedOut || this.activeResources.has('heartbeat')) {
-      const heartbeatResult = await settleUntil(
-        invoke(() => this.dependencies.heartbeat.stop('STOPPED')),
-        deadlineMs,
-      );
-      if (heartbeatResult === 'complete') this.activeResources.delete('heartbeat');
-      if (heartbeatResult === 'failed') {
-        this.activeResources.add('heartbeat');
-        failures.push(failure('heartbeat-stop'));
-      }
-      if (heartbeatResult === 'timeout') {
-        this.activeResources.add('heartbeat');
-        failures.push(timeoutFailure('heartbeat-stop'));
-      }
+      const startupResult = await settleUntil(starting, deadlineMs);
+      if (startupResult === 'timeout') failures.push(timeoutFailure('startup-timeout'));
     }
     this.started = false;
     this.currentState = failures.length === 0 ? 'STOPPED' : 'DEGRADED';
     if (failures.length > 0) throw new ListenerRuntimeError(failures);
   }
 
+  private async cleanupActive(
+    deadlineMs: number,
+    failures: ListenerRuntimeFailure[],
+  ): Promise<void> {
+    for (const resource of CLEANUP_ORDER) {
+      if (!this.activeResources.has(resource)) continue;
+      const result = await settleUntil(this.closeAttempt(resource), deadlineMs);
+      if (result === 'complete') {
+        this.activeResources.delete(resource);
+        continue;
+      }
+      failures.push(result === 'timeout'
+        ? timeoutFailure(timeoutStage(resource))
+        : failure(closeStage(resource)));
+    }
+  }
+
+  private closeResource(resource: ActiveRuntimeResource): Promise<void> {
+    return invoke(() => resource === 'heartbeat'
+      ? this.dependencies.heartbeat.stop('STOPPED')
+      : this.dependencies[resource].close());
+  }
+
+  private closeAttempt(resource: ActiveRuntimeResource): Promise<void> {
+    const pending = this.closingResources.get(resource);
+    if (pending !== undefined) return pending;
+    const operation = Promise.resolve().then(() => this.closeResource(resource));
+    this.closingResources.set(resource, operation);
+    void operation.then(
+      () => {
+        if (this.closingResources.get(resource) !== operation) return;
+        this.closingResources.delete(resource);
+        this.activeResources.delete(resource);
+      },
+      () => {
+        if (this.closingResources.get(resource) === operation) {
+          this.closingResources.delete(resource);
+        }
+      },
+    );
+    return operation;
+  }
+
   private componentStates(): readonly ListenerRuntimeState[] {
     return [
-      this.dependencies.scanner.state(),
-      this.dependencies.subscriber.state(),
+      this.dependencies.supervisor.state(),
       this.dependencies.worker.state(),
+      this.dependencies.reconciler.state(),
       this.dependencies.paperWorker.state(),
       this.dependencies.socialWorker.state(),
-      this.dependencies.reconciler.state(),
       this.dependencies.heartbeat.state(),
     ];
   }
 
   private chainComponentStates(): readonly ListenerRuntimeState[] {
     return [
-      this.dependencies.scanner.state(),
-      this.dependencies.subscriber.state(),
+      this.dependencies.supervisor.state(),
       this.dependencies.worker.state(),
       this.dependencies.reconciler.state(),
       this.dependencies.heartbeat.state(),
@@ -398,8 +306,36 @@ export class SolanaListenerRuntime implements ListenerRuntime {
   }
 }
 
+function projectionComponentState(
+  state: ListenerRuntimeState,
+): 'RUNNING' | 'STOPPED' | 'DEGRADED' {
+  return state === 'RUNNING' ? 'RUNNING' : state === 'STOPPED' ? 'STOPPED' : 'DEGRADED';
+}
+
+function closeStage(resource: ActiveRuntimeResource): ListenerRuntimeFailureStage {
+  if (resource === 'supervisor') return 'supervisor-close';
+  if (resource === 'paperWorker') return 'paper-worker-close';
+  if (resource === 'socialWorker') return 'social-worker-close';
+  if (resource === 'reconciler') return 'reconciler-close';
+  if (resource === 'worker') return 'worker-close';
+  return 'heartbeat-stop';
+}
+
+function timeoutStage(resource: ActiveRuntimeResource): ListenerRuntimeFailureStage {
+  if (resource === 'supervisor') return 'supervisor-timeout';
+  if (resource === 'paperWorker') return 'paper-worker-timeout';
+  if (resource === 'socialWorker') return 'social-worker-timeout';
+  if (resource === 'reconciler') return 'reconciler-timeout';
+  if (resource === 'worker') return 'worker-timeout';
+  return 'heartbeat-timeout';
+}
+
 function invoke(operation: () => Promise<void>): Promise<void> {
-  try { return operation(); } catch { return Promise.reject(new Error('Listener cleanup failed.')); }
+  try {
+    return operation();
+  } catch {
+    return Promise.reject(new Error('Listener cleanup failed.'));
+  }
 }
 
 async function settleUntil(

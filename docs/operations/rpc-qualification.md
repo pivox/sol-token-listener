@@ -89,28 +89,34 @@ ordonnée appairée à la liste HTTP. Une liste HTTP sans liste WS conserve le
 fallback HTTP-only de l'issue #56. Dès qu'une liste WS est renseignée, la liste
 HTTP doit exister avec la même taille et chaque paire utilise `https/wss` ou
 `http/ws`. Les identités publiques restent strictement positionnelles.
-L'issue #59 valide et expose ce catalogue, mais ne l'active pas encore dans le
-subscriber de production : le basculement WebSocket contrôlé ne sera
-opérationnel qu'après l'issue #63.
+Le catalogue est actif dans le superviseur de production. Les identités restent
+strictement positionnelles et une paire HTTP/WS ne mélange jamais ses schémas.
 
 Le basculement de production est distinct du soak : `npm run rpc:soak` reste
 intentionnellement mono-fournisseur et ignore conceptuellement les listes de
 fallbacks. Il qualifie exactement `SOLANA_HTTP_RPC_URL + SOLANA_WS_RPC_URL`
 d'un seul fournisseur, pas une chaîne de basculement de production.
 
-## Fondations strictes de reprise (#60)
+## Supervision WebSocket et reprise stricte
 
-La fondation #60 est inactive : elle n'est pas raccordée au listener de
-production. Celui-ci conserve le scanner et le subscriber legacy jusqu'au
-raccordement explicite de #63. Elle ne modifie donc ni le démarrage actuel ni
-la qualification `rpc:soak`.
+Le superviseur actif acquiert son owner PostgreSQL avant tout appel Solana,
+attend le double ACK des abonnements Pump.fun et PumpSwap, puis réalise une
+frontière stricte sur les deux programmes avec le provider candidat appairé.
+La publication durable de `RUNNING` précède la promotion du fournisseur. Une
+frontière périodique, elle aussi appairée, est exécutée toutes les 30 secondes.
+Chaque cycle donne au plus un setup et une analyse stricte à chaque fournisseur
+positionnel. Après un cycle transitoire exhaustif, l’equal jitter exponentiel
+reste borné de 1–60 secondes. Une preuve `UNRECOVERABLE` exige que tous les
+fournisseurs aient dépassé la même frontière exacte; un échec mixte demeure
+`DEGRADED`.
 
-Lorsqu'elle sera activée par #63, une reprise stricte recevra à son
-constructeur un hash de genèse canonique explicitement approuvé par
-l'opérateur. Cette valeur de confiance ne doit jamais être apprise depuis le
-RPC `primary` pendant le même démarrage. Chaque reprise est épinglée à un seul
-provider positionnel ; les diagnostics et erreurs ne contiennent ni endpoint,
-ni hôte, ni URL, ni secret.
+La reprise stricte reçoit `SOLANA_EXPECTED_GENESIS_HASH`, un hash de genèse
+canonique base58 de 32 octets explicitement approuvé par l’opérateur. Obtenez
+`getGenesisHash` indépendamment auprès du cluster visé et comparez au moins
+deux sources de confiance avant de renseigner cette valeur. Elle ne doit jamais
+être apprise du RPC pendant le même démarrage ni être écrite dans les logs.
+Chaque reprise est épinglée à un provider positionnel ; les diagnostics et
+erreurs ne contiennent ni endpoint, ni hôte, ni URL, ni hash ni secret.
 
 La reprise reste exclusivement en observation ou paper : elle ne signe,
 construit, simule ni soumet de transaction. Elle lit les deux checkpoints,
@@ -118,8 +124,8 @@ parcourt les deux programmes sur le même provider, puis enfile les découvertes
 avant d'avancer chaque checkpoint par CAS exact `(slot, signature)`. Un conflit
 CAS impose une reprise ultérieure depuis des limites durables fraîches ; il ne
 déclenche jamais un rebasage `live-edge`. Les appels concurrents sont coalescés
-en une seule analyse en vol, sans file de scans ni rotation de provider dans
-#60.
+en une seule analyse en vol. Il n’existe aucun fallback legacy automatique : un
+processus actif ne revient jamais à `SolanaProgramSubscriber`.
 
 Si une fenêtre bornée ne rejoint pas la limite exacte, une preuve strictement
 redactée est conservée avec cette limite. Une preuve non résolue ne reçoit pas

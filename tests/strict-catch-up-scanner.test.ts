@@ -26,12 +26,289 @@ import {
   StrictCatchUpScanner,
   StrictCatchUpScannerError,
   StrictCatchUpWindowExceededError,
+  type StrictCatchUpBoundaries,
   type StrictCatchUpSource,
 } from '../src/application/strict-catch-up-scanner.js';
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
 const programs = [PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID] as const;
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+const NEVER_ABORTED = new AbortController().signal;
+
+void test('aborts before the scan without calling the clock, repository, or source', async () => {
+  const events: string[] = [];
+  let nowCalls = 0;
+  const controller = new AbortController();
+  controller.abort();
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch', 1)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  }, 'primary', events);
+  const repository = new FakeRepository({}, events);
+
+  await assert.rejects(new StrictCatchUpScanner(source, repository, {
+    pageSize: 2,
+    maxPages: 3,
+    now: () => { nowCalls += 1; return 9_000; },
+  }).scan(controller.signal), abortedScan);
+
+  assert.equal(nowCalls, 0);
+  assert.deepEqual(events, []);
+});
+
+void test('aborts after the launchpad checkpoint settles without reading the market checkpoint', async () => {
+  const checkpointRead = deferred<undefined>();
+  const controller = new AbortController();
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch', 1)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  });
+  const repository = new FakeRepository();
+  repository.nextReads.set('launchpad', checkpointRead.promise);
+
+  const scan = scanner(source, repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('read:launchpad'));
+  controller.abort();
+  checkpointRead.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(repository.eventsSeen, ['read:launchpad']);
+  assert.deepEqual(source.calls, []);
+  assertNoWrites(repository);
+});
+
+void test('aborts after the market checkpoint settles without reading a provider page', async () => {
+  const checkpointRead = deferred<undefined>();
+  const controller = new AbortController();
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch', 1)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  });
+  const repository = new FakeRepository();
+  repository.nextReads.set('market', checkpointRead.promise);
+
+  const scan = scanner(source, repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('read:market'));
+  controller.abort();
+  checkpointRead.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(repository.eventsSeen, ['read:launchpad', 'read:market']);
+  assert.deepEqual(source.calls, []);
+  assertNoWrites(repository);
+});
+
+void test('aborts after a provider page settles without enqueueing', async () => {
+  const page = deferred<unknown>();
+  const controller = new AbortController();
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  });
+  source.nextList = page.promise;
+  const repository = new FakeRepository();
+
+  const scan = scanner(source, repository).scan(controller.signal);
+  await waitFor(() => source.calls.length === 1);
+  controller.abort();
+  page.resolve([sig('launch', 1)]);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(source.calls, [[PUMP_PROGRAM_ID, undefined, 2]]);
+  assertNoWrites(repository);
+});
+
+void test('makes abort dominate a provider page rejection after the signal is aborted', async () => {
+  const page = deferred<unknown>();
+  const controller = new AbortController();
+  const source = new FakeSource({
+    [PUMP_PROGRAM_ID]: [],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  });
+  source.nextList = page.promise;
+  const repository = new FakeRepository();
+
+  const scan = scanner(source, repository).scan(controller.signal);
+  await waitFor(() => source.calls.length === 1);
+  controller.abort();
+  page.reject(new Error('source-secret'));
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(source.calls, [[PUMP_PROGRAM_ID, undefined, 2]]);
+  assertNoWrites(repository);
+});
+
+void test('aborts after an enqueue settles without starting another durable write', async () => {
+  const enqueue = deferred<undefined>();
+  const controller = new AbortController();
+  const repository = new FakeRepository();
+  repository.nextEnqueue = enqueue.promise;
+  const scan = scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch', 1)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  }), repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('enqueue:launch'));
+
+  controller.abort();
+  enqueue.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(repository.enqueued.map(({ signature }) => signature), ['launch']);
+  assert.deepEqual(repository.cas, []);
+  assert.deepEqual(repository.resolutions, []);
+});
+
+void test('aborts after the first CAS settles without rolling it back or starting the second CAS', async () => {
+  const firstCas = deferred<undefined>();
+  const controller = new AbortController();
+  const repository = new FakeRepository();
+  repository.nextCas = firstCas.promise;
+  const scan = scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[sig('launch', 1)]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  }), repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('cas:launchpad'));
+
+  controller.abort();
+  firstCas.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(repository.cas.map(([, next]) => next.key), ['launchpad']);
+  assert.deepEqual(repository.resolutions, []);
+});
+
+void test('aborts after a strict failure write settles without starting another durable write', async () => {
+  const failureWrite = deferred<undefined>();
+  const controller = new AbortController();
+  const repository = new FakeRepository({
+    launchpad: checkpoint('launchpad', 'missing', 1),
+  });
+  repository.nextFailureWrite = failureWrite.promise;
+  const scan = scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[]],
+    [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
+  }), repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('failure:launchpad'));
+
+  controller.abort();
+  failureWrite.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.equal(repository.failures.length, 1);
+  assert.deepEqual(repository.enqueued, []);
+  assert.deepEqual(repository.cas, []);
+  assert.deepEqual(repository.resolutions, []);
+});
+
+void test('aborts after failure resolution settles without starting the next durable write', async () => {
+  const failureResolve = deferred<undefined>();
+  const controller = new AbortController();
+  const repository = new FakeRepository();
+  repository.nextFailureResolve = failureResolve.promise;
+  const scan = scanner(new FakeSource({
+    [PUMP_PROGRAM_ID]: [[]],
+    [PUMPSWAP_PROGRAM_ID]: [[]],
+  }), repository).scan(controller.signal);
+  await waitFor(() => repository.eventsSeen.includes('resolve:launchpad'));
+
+  controller.abort();
+  failureResolve.resolve(undefined);
+
+  await assert.rejects(scan, abortedScan);
+  assert.deepEqual(repository.resolutions, [['launchpad', null]]);
+  assert.deepEqual(repository.enqueued, []);
+  assert.deepEqual(repository.cas, []);
+  assert.deepEqual(repository.failures, []);
+});
+
+void test('compares private exact window frontiers without enumerating or serializing signatures', () => {
+  const frontier = Object.freeze({
+    launchpad: checkpoint('launchpad', 'launch-secret', 10, 1),
+    market: checkpoint('market', 'market-secret', 11, 1),
+  });
+  const first = new StrictCatchUpWindowExceededError('primary', 'launchpad', frontier);
+  const equal = new StrictCatchUpWindowExceededError('fallback-1', 'market', frontier);
+  const different = new StrictCatchUpWindowExceededError('fallback-2', 'market', Object.freeze({
+    ...frontier,
+    market: checkpoint('market', 'different-secret', 11, 1),
+  }));
+
+  assert.equal(first.sameFrontier(equal), true);
+  assert.equal(first.sameFrontier(different), false);
+  assert.deepEqual(Object.keys(first), [
+    'code', 'stage', 'retryable', 'providerId', 'checkpointKey',
+  ]);
+  assert.doesNotMatch(JSON.stringify(first), /launch-secret|market-secret/u);
+});
+
+void test('rejects a proxy window frontier without invoking any hostile trap', () => {
+  let trapCalls = 0;
+  const frontier = new Proxy({ launchpad: null, market: null }, {
+    get() { trapCalls += 1; throw new Error('proxy-frontier-secret'); },
+    getPrototypeOf() { trapCalls += 1; throw new Error('proxy-frontier-secret'); },
+    ownKeys() { trapCalls += 1; throw new Error('proxy-frontier-secret'); },
+    getOwnPropertyDescriptor() { trapCalls += 1; throw new Error('proxy-frontier-secret'); },
+  });
+
+  assert.throws(
+    () => new StrictCatchUpWindowExceededError('primary', 'launchpad', frontier),
+    invalidFrontier,
+  );
+  assert.equal(trapCalls, 0);
+});
+
+void test('rejects accessor-backed window frontiers without invoking or retaining their getters', () => {
+  let getterCalls = 0;
+  const frontier = {};
+  Object.defineProperties(frontier, {
+    launchpad: {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        Object.defineProperty(frontier, 'market', { value: 'mutated-secret' });
+        throw new Error('accessor-frontier-secret');
+      },
+    },
+    market: {
+      configurable: true,
+      enumerable: true,
+      get() { getterCalls += 1; throw new Error('accessor-frontier-secret'); },
+    },
+  });
+
+  assert.throws(
+    () => new StrictCatchUpWindowExceededError(
+      'primary',
+      'launchpad',
+      frontier as StrictCatchUpBoundaries,
+    ),
+    invalidFrontier,
+  );
+  assert.equal(getterCalls, 0);
+});
+
+void test('rejects non-canonical window frontier containers with a fixed redacted error', () => {
+  const nonEnumerable = Object.defineProperties({}, {
+    launchpad: { enumerable: true, value: null },
+    market: { enumerable: false, value: null },
+  });
+  for (const frontier of [
+    null,
+    [],
+    Object.freeze({ launchpad: null }),
+    Object.freeze({ launchpad: null, market: null, extra: 'container-frontier-secret' }),
+    nonEnumerable,
+  ]) {
+    assert.throws(
+      () => new StrictCatchUpWindowExceededError(
+        'primary',
+        'launchpad',
+        frontier as StrictCatchUpBoundaries,
+      ),
+      invalidFrontier,
+    );
+  }
+});
 
 void test('captures now and both exact checkpoints before the first provider page', async () => {
   const events: string[] = [];
@@ -49,7 +326,7 @@ void test('captures now and both exact checkpoints before the first provider pag
     pageSize: 2,
     maxPages: 3,
     now: () => { nowCalls += 1; events.push('now'); return 9_000; },
-  }).scan();
+  }).scan(NEVER_ABORTED);
 
   assert.equal(nowCalls, 1);
   assert.deepEqual(events.slice(0, 4), [
@@ -78,7 +355,7 @@ void test('walks more than one page with before and stops at an exact mid-page b
     market: checkpoint('market', 'market-boundary', 8),
   });
 
-  const result = await scanner(source, repository, { pageSize: 2 }).scan();
+  const result = await scanner(source, repository, { pageSize: 2 }).scan(NEVER_ABORTED);
 
   assert.deepEqual(source.calls, [
     [PUMP_PROGRAM_ID, undefined, 2],
@@ -98,7 +375,7 @@ void test('finishes both program walks before any durable write', async () => {
   }, 'primary', events);
   const repository = new FakeRepository({}, events);
 
-  await scanner(source, repository).scan();
+  await scanner(source, repository).scan(NEVER_ABORTED);
 
   const lastSource = Math.max(...events.map((value, index) => value.startsWith('source:') ? index : -1));
   const firstWrite = events.findIndex((value) => value.startsWith('enqueue:'));
@@ -112,7 +389,7 @@ void test('cold start consumes exactly one bounded newest page and handles empty
   });
   const repository = new FakeRepository();
 
-  const result = await scanner(source, repository, { pageSize: 2, maxPages: 1 }).scan();
+  const result = await scanner(source, repository, { pageSize: 2, maxPages: 1 }).scan(NEVER_ABORTED);
 
   assert.deepEqual(source.calls, [
     [PUMP_PROGRAM_ID, undefined, 2], [PUMPSWAP_PROGRAM_ID, undefined, 2],
@@ -143,7 +420,7 @@ void test('rejects ascending slots, duplicate signatures, and repeated paginatio
     await assert.rejects(scanner(new FakeSource({
       [PUMP_PROGRAM_ID]: pages,
       [PUMPSWAP_PROGRAM_ID]: [[sig('market-boundary', 1)]],
-    }), repository).scan(), (error) => sourceFailure(error, 'launchpad'));
+    }), repository).scan(NEVER_ABORTED), (error) => sourceFailure(error, 'launchpad'));
     assertNoWrites(repository);
   }
 });
@@ -161,7 +438,7 @@ void test('rejects non-canonical source signatures before every durable write', 
     await assert.rejects(scanner(new FakeSource({
       [PUMP_PROGRAM_ID]: [[sig(signature, 2)]],
       [PUMPSWAP_PROGRAM_ID]: [[]],
-    }), repository).scan(), (error) => sourceResponseFailure(error, 'launchpad'));
+    }), repository).scan(NEVER_ABORTED), (error) => sourceResponseFailure(error, 'launchpad'));
     assertNoWrites(repository);
   }
 });
@@ -173,7 +450,7 @@ void test('rejects source block times outside the integer Date range before ever
     await assert.rejects(scanner(new FakeSource({
       [PUMP_PROGRAM_ID]: [[sig('hostile-time', 2, 'confirmed', blockTimeMs)]],
       [PUMPSWAP_PROGRAM_ID]: [[]],
-    }), repository).scan(), (error) => sourceResponseFailure(error, 'launchpad'));
+    }), repository).scan(NEVER_ABORTED), (error) => sourceResponseFailure(error, 'launchpad'));
     assertNoWrites(repository);
   }
 });
@@ -189,7 +466,7 @@ void test('merges identical signatures with legacy finality, immutability, progr
   });
   const repository = new FakeRepository();
 
-  await scanner(source, repository, { pageSize: 3 }).scan();
+  await scanner(source, repository, { pageSize: 3 }).scan(NEVER_ABORTED);
 
   assert.deepEqual(repository.enqueued.map(({ signature }) => signature), ['a', 'b', 'shared', 'm', 'z']);
   const shared = repository.enqueued[2];
@@ -204,7 +481,7 @@ void test('merges identical signatures with legacy finality, immutability, progr
     await assert.rejects(scanner(new FakeSource({
       [PUMP_PROGRAM_ID]: [[sig('shared', 3, 'confirmed', 2_000)]],
       [PUMPSWAP_PROGRAM_ID]: [[conflicting]],
-    }), new FakeRepository(), { pageSize: 2 }).scan(), (error) => sourceFailure(error, 'market'));
+    }), new FakeRepository(), { pageSize: 2 }).scan(NEVER_ABORTED), (error) => sourceFailure(error, 'market'));
   }
 });
 
@@ -214,7 +491,7 @@ void test('enqueues every discovery before exact sequential CAS operations', asy
   const result = await scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('launch', 1)]],
     [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
-  }, 'fallback-1', events), repository).scan();
+  }, 'fallback-1', events), repository).scan(NEVER_ABORTED);
 
   assert.deepEqual(events.filter((value) => value.startsWith('enqueue:') || value.startsWith('cas:')), [
     'enqueue:launch', 'enqueue:market', 'cas:launchpad', 'cas:market',
@@ -228,7 +505,7 @@ void test('maps enqueue failure to a fixed transient error and performs no CAS o
   await assert.rejects(scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('launch', 1)]],
     [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
-  }), repository).scan(), (error) => scannerFailure(error, 'enqueue', 'market'));
+  }), repository).scan(NEVER_ABORTED), (error) => scannerFailure(error, 'enqueue', 'market'));
   assert.deepEqual(repository.cas, []);
   assert.deepEqual(repository.resolutions, []);
 });
@@ -240,7 +517,7 @@ void test('records exact durable window evidence for a first-program failure and
   await assert.rejects(scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('head', 5)]],
     [PUMPSWAP_PROGRAM_ID]: [[sig('market', 2)]],
-  }, 'fallback-3'), repository, { pageSize: 2 }).scan(), (error) => {
+  }, 'fallback-3'), repository, { pageSize: 2 }).scan(NEVER_ABORTED), (error) => {
     assert.ok(error instanceof StrictCatchUpWindowExceededError);
     assert.equal(error.providerId, 'fallback-3');
     assert.equal(error.checkpointKey, 'launchpad');
@@ -266,7 +543,7 @@ void test('records only second-program window evidence after a successful in-mem
   await assert.rejects(scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('launch', 2)]],
     [PUMPSWAP_PROGRAM_ID]: [[sig('market-head', 9)]],
-  }), repository, { pageSize: 2 }).scan(), (error) =>
+  }), repository, { pageSize: 2 }).scan(NEVER_ABORTED), (error) =>
     error instanceof StrictCatchUpWindowExceededError && error.checkpointKey === 'market');
 
   assert.deepEqual(projectFailure(repository.failures[0]), {
@@ -281,7 +558,7 @@ void test('maps a strict failure persistence rejection to failure-write without 
   repository.failFailureWrite = true;
   await assert.rejects(scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[]], [PUMPSWAP_PROGRAM_ID]: [[]],
-  }), repository).scan(), (error) => scannerFailure(error, 'failure-write', 'launchpad'));
+  }), repository).scan(NEVER_ABORTED), (error) => scannerFailure(error, 'failure-write', 'launchpad'));
 });
 
 void test('resolves exact unchanged and empty boundaries when no CAS is required', async () => {
@@ -290,7 +567,7 @@ void test('resolves exact unchanged and empty boundaries when no CAS is required
   const result = await scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('launch-boundary', 10)]],
     [PUMPSWAP_PROGRAM_ID]: [[]],
-  }), repository).scan();
+  }), repository).scan(NEVER_ABORTED);
 
   assert.deepEqual(repository.cas, []);
   assert.deepEqual(repository.resolutions, [
@@ -305,7 +582,7 @@ void test('uses captured expected and newest next values for changed CAS', async
   await scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[sig('launch-head', 12), sig('launch-boundary', 10)]],
     [PUMPSWAP_PROGRAM_ID]: [[]],
-  }), repository).scan();
+  }), repository).scan(NEVER_ABORTED);
 
   assert.deepEqual(repository.cas, [[
     previous, checkpoint('launchpad', 'launch-head', 12, 9_000),
@@ -320,13 +597,13 @@ void test('surfaces a transient second CAS conflict after the first CAS and repl
   };
   const repository = new FakeRepository();
   repository.failCasAt = 2;
-  await assert.rejects(scanner(new FakeSource(sourcePages), repository).scan(), (error) =>
+  await assert.rejects(scanner(new FakeSource(sourcePages), repository).scan(NEVER_ABORTED), (error) =>
     scannerFailure(error, 'checkpoint-cas', 'market'));
   assert.deepEqual(repository.cas.map(([, next]) => next.key), ['launchpad']);
   assert.deepEqual(repository.enqueued.map(({ signature }) => signature), ['launch', 'market']);
 
   repository.failCasAt = null;
-  await scanner(new FakeSource(sourcePages), repository).scan();
+  await scanner(new FakeSource(sourcePages), repository).scan(NEVER_ABORTED);
   assert.deepEqual(repository.enqueued.map(({ signature }) => signature), [
     'launch', 'market', 'market',
   ]);
@@ -340,9 +617,9 @@ void test('replays duplicate enqueues after an enqueue crash without advancing a
   };
   const repository = new FakeRepository();
   repository.failEnqueueAt = 2;
-  await assert.rejects(scanner(new FakeSource(sourcePages), repository).scan(), StrictCatchUpScannerError);
+  await assert.rejects(scanner(new FakeSource(sourcePages), repository).scan(NEVER_ABORTED), StrictCatchUpScannerError);
   repository.failEnqueueAt = null;
-  await scanner(new FakeSource(sourcePages), repository).scan();
+  await scanner(new FakeSource(sourcePages), repository).scan(NEVER_ABORTED);
   assert.deepEqual(repository.enqueued.map(({ signature }) => signature), ['launch', 'launch', 'market']);
 });
 
@@ -351,7 +628,7 @@ void test('maps exact-boundary failure resolution rejection to failure-resolve',
   repository.failResolveAt = 1;
   await assert.rejects(scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[]], [PUMPSWAP_PROGRAM_ID]: [[]],
-  }), repository).scan(), (error) => scannerFailure(error, 'failure-resolve', 'launchpad'));
+  }), repository).scan(NEVER_ABORTED), (error) => scannerFailure(error, 'failure-resolve', 'launchpad'));
 });
 
 void test('redacts hostile checkpoint, source, repository, clock, and provider inputs', async () => {
@@ -364,7 +641,7 @@ void test('redacts hostile checkpoint, source, repository, clock, and provider i
   const repository = new FakeRepository({ launchpad: hostileCheckpoint });
   await assert.rejects(scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[]], [PUMPSWAP_PROGRAM_ID]: [[]],
-  }), repository).scan(), (error) => scannerFailure(error, 'checkpoint-read', 'launchpad'));
+  }), repository).scan(NEVER_ABORTED), (error) => scannerFailure(error, 'checkpoint-read', 'launchpad'));
   assert.equal(proxyTraps, 0);
 
   const hostileError = new Proxy(new Error('hidden'), {
@@ -372,7 +649,7 @@ void test('redacts hostile checkpoint, source, repository, clock, and provider i
   });
   const source = new FakeSource({ [PUMP_PROGRAM_ID]: [[]], [PUMPSWAP_PROGRAM_ID]: [[]] });
   source.failure = hostileError;
-  await assert.rejects(scanner(source, new FakeRepository()).scan(), (error) => {
+  await assert.rejects(scanner(source, new FakeRepository()).scan(NEVER_ABORTED), (error) => {
     assert.equal(scannerFailure(error, 'source', 'launchpad'), true);
     assert.equal((error as StrictCatchUpScannerError).sourceStage, 'request');
     assert.doesNotMatch(String(error), /secret|invalid|hidden/u);
@@ -385,7 +662,7 @@ void test('redacts hostile checkpoint, source, repository, clock, and provider i
   ), /source is invalid/u);
   await assert.rejects(scanner(new FakeSource({
     [PUMP_PROGRAM_ID]: [[]], [PUMPSWAP_PROGRAM_ID]: [[]],
-  }), new FakeRepository(), { now: () => { throw new Error('clock-secret'); } }).scan());
+  }), new FakeRepository(), { now: () => { throw new Error('clock-secret'); } }).scan(NEVER_ABORTED));
 });
 
 void test('accepts exact bounds and rejects invalid options and checkpoint persistence bounds', async () => {
@@ -412,7 +689,7 @@ void test('accepts exact bounds and rejects invalid options and checkpoint persi
     Object.freeze({ ...checkpoint('launchpad', 'x', 1), extra: 'not-canonical' }),
     Object.freeze(Object.assign(Object.create({ inherited: true }), checkpoint('launchpad', 'x', 1))),
   ]) {
-    await assert.rejects(scanner(source, new FakeRepository({ launchpad: value })).scan(),
+    await assert.rejects(scanner(source, new FakeRepository({ launchpad: value })).scan(NEVER_ABORTED),
       (error) => scannerFailure(error, 'checkpoint-read', 'launchpad'));
   }
 });
@@ -462,6 +739,7 @@ class FakeSource implements StrictCatchUpSource {
   readonly calls: [string, string | undefined, number][] = [];
   readonly providerIdsSeen: RpcProviderId[] = [];
   failure: Error | null = null;
+  nextList: Promise<unknown> | null = null;
   private readonly positions = new Map<string, number>();
 
   constructor(
@@ -475,6 +753,11 @@ class FakeSource implements StrictCatchUpSource {
     this.calls.push([programId, before, limit]);
     this.events.push(`source:${programId}:${before ?? 'head'}`);
     if (this.failure !== null) throw this.failure;
+    if (this.nextList !== null) {
+      const next = this.nextList;
+      this.nextList = null;
+      return next;
+    }
     const position = this.positions.get(programId) ?? 0;
     this.positions.set(programId, position + 1);
     return this.pages[programId]?.[position] ?? [];
@@ -490,6 +773,11 @@ class FakeRepository implements StrictCatchUpRepository {
   failCasAt: number | null = null;
   failResolveAt: number | null = null;
   failFailureWrite = false;
+  readonly nextReads = new Map<ProcessingCheckpointKey, Promise<void>>();
+  nextEnqueue: Promise<void> | null = null;
+  nextCas: Promise<void> | null = null;
+  nextFailureWrite: Promise<void> | null = null;
+  nextFailureResolve: Promise<void> | null = null;
   private casAttempts = 0;
   private resolveAttempts = 0;
 
@@ -498,14 +786,26 @@ class FakeRepository implements StrictCatchUpRepository {
     private readonly events: string[] = [],
   ) {}
 
+  get eventsSeen(): readonly string[] {
+    return this.events;
+  }
+
   async enqueue(value: TransactionNotification): Promise<void> {
     this.events.push(`enqueue:${value.signature}`);
+    if (this.nextEnqueue !== null) {
+      const next = this.nextEnqueue;
+      this.nextEnqueue = null;
+      await next;
+    }
     if (this.failEnqueueAt === this.enqueued.length + 1) throw new Error('enqueue-secret');
     this.enqueued.push(value);
   }
 
   async readCheckpoint(key: ProcessingCheckpointKey): Promise<ProcessingCheckpoint | null> {
     this.events.push(`read:${key}`);
+    const pending = this.nextReads.get(key);
+    this.nextReads.delete(key);
+    if (pending !== undefined) await pending;
     return this.checkpoints[key] ?? null;
   }
 
@@ -515,6 +815,11 @@ class FakeRepository implements StrictCatchUpRepository {
   ): Promise<void> {
     this.casAttempts += 1;
     this.events.push(`cas:${next.key}`);
+    if (this.nextCas !== null) {
+      const pending = this.nextCas;
+      this.nextCas = null;
+      await pending;
+    }
     if (this.failCasAt === this.casAttempts) throw new Error('checkpoint-conflict-secret');
     this.cas.push([expected, next]);
     this.checkpoints[next.key] = next;
@@ -522,6 +827,11 @@ class FakeRepository implements StrictCatchUpRepository {
 
   async recordStrictCatchUpFailure(value: StrictCatchUpFailure): Promise<void> {
     this.events.push(`failure:${value.checkpointKey}`);
+    if (this.nextFailureWrite !== null) {
+      const pending = this.nextFailureWrite;
+      this.nextFailureWrite = null;
+      await pending;
+    }
     if (this.failFailureWrite) throw new Error('failure-write-secret');
     this.failures.push(value);
   }
@@ -532,6 +842,11 @@ class FakeRepository implements StrictCatchUpRepository {
   ): Promise<void> {
     this.resolveAttempts += 1;
     this.events.push(`resolve:${key}`);
+    if (this.nextFailureResolve !== null) {
+      const pending = this.nextFailureResolve;
+      this.nextFailureResolve = null;
+      await pending;
+    }
     if (this.failResolveAt === this.resolveAttempts) throw new Error('resolve-secret');
     this.resolutions.push([key, previous]);
   }
@@ -583,6 +898,49 @@ function projectFailure(value: StrictCatchUpFailure | undefined): object {
     observedHeadSlot: value.observedHeadSlot,
     detectedAtMs: value.detectedAtMs,
   };
+}
+
+function abortedScan(value: unknown): boolean {
+  assert.ok(value instanceof Error);
+  assert.equal(value.constructor.name, 'StrictCatchUpAbortedError');
+  assert.equal(value.name, 'StrictCatchUpAbortedError');
+  assert.equal(value.message, 'Strict catch-up scan was aborted.');
+  assert.ok(Object.isFrozen(value));
+  return true;
+}
+
+function invalidFrontier(value: unknown): boolean {
+  assert.ok(value instanceof TypeError);
+  assert.equal(value.message, 'Strict catch-up frontier is invalid.');
+  assert.equal(Object.hasOwn(value, 'cause'), false);
+  assert.doesNotMatch(String(value), /secret/u);
+  return true;
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) return;
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+  }
+  assert.fail('Expected asynchronous boundary was not reached.');
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+  readonly reject: (reason: unknown) => void;
+} {
+  let resolve: ((value: T) => void) | undefined;
+  let reject: ((reason: unknown) => void) | undefined;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return Object.freeze({
+    promise,
+    resolve(value: T) { resolve?.(value); },
+    reject(reason: unknown) { reject?.(reason); },
+  });
 }
 
 void CatchUpSourceError;

@@ -124,8 +124,13 @@ affiche les blockers avant les scores, les absences de preuve explicitement et
 un statut visible lors d’une resynchronisation SSE. Voir le
 [guide frontend](frontend/README.md).
 
-Renseigner `SOLANA_HTTP_RPC_URL`, `SOLANA_WS_RPC_URL` et `DATABASE_URL`, sans
-secret de wallet. Pour un basculement HTTP optionnel en production, définir
+Renseigner `SOLANA_HTTP_RPC_URL`, `SOLANA_WS_RPC_URL`, `DATABASE_URL` et, lorsque
+`LISTENER_ENABLED=true`, `SOLANA_EXPECTED_GENESIS_HASH`, sans secret de wallet.
+Cette dernière valeur est le hash de genèse canonique base58 de 32 octets du
+cluster ciblé : l’opérateur l’obtient avec `getGenesisHash` auprès de plusieurs
+sources de confiance et compare les résultats avant le déploiement. Le listener
+ne l’apprend jamais pendant son démarrage et ne l’écrit jamais dans les logs.
+Pour un basculement HTTP optionnel en production, définir
 `SOLANA_HTTP_RPC_FALLBACK_URLS` comme une liste ordonnée séparée par des
 virgules de maximum trois fallbacks; l'endpoint principal reste
 `SOLANA_HTTP_RPC_URL`, les doublons canoniques sont refusés et toutes les URLs
@@ -134,15 +139,15 @@ Sans fallback, le comportement single-endpoint web3.js et son rate-limit retry
 restent exactement inchangés. Avec des fallbacks, la rotation est limitée aux
 rejets réseau et aux statuts 429/502/503/504; elle ne s'applique ni aux autres
 4xx, ni à une erreur JSON-RPC en HTTP 200, ni à un résultat archive `null`.
-`SOLANA_WS_RPC_URL` demeure une seule URL : le basculement WebSocket contrôlé
-relève de l'issue #57. Les événements sans secret `rpc.http_endpoint_degraded`,
+Le superviseur WebSocket actif utilise la même chaîne positionnelle HTTP/WS :
+`primary`, puis `fallback-1` à `fallback-3`, sans exposer les URL. Les événements sans secret `rpc.http_endpoint_degraded`,
 `rpc.http_failover` et `rpc.http_endpoints_exhausted` sont la source des
 métriques V1 dérivées des logs. Voir le [guide d'exploitation RPC](docs/operations/rpc-qualification.md)
 pour les délais de refroidissement, les limites et la qualification mono-fournisseur du soak.
 
-## Finalité affine au fournisseur (#61, v1.0.8, migrations 027–029)
+## Finalité affine au fournisseur (#61, v1.0.9, migrations 027–030)
 
-La finalité utilise un pass HTTP épinglé au fournisseur primaire : statuts,
+La finalité utilise un pass HTTP épinglé au fournisseur promu : statuts,
 racine <code>finalized</code> et signatures du bloc sont toujours lus par ce
 même fournisseur, sans failover HTTP. Si ce fournisseur ou le bloc finalized
 exact est indisponible, le slot concerné reste nonterminal et ne produit jamais
@@ -159,15 +164,12 @@ La page bornée est ordonnée par la dernière tentative durable
 en plus du temps observé, de sorte qu’une ligne durablement indisponible tourne
 derrière les autres candidates au lieu de monopoliser la première page.
 
-Au bootstrap, observe accepte une première passe en échec comme
-<code>DEGRADED</code> et programme un seul intervalle normal avec une preuve
-fraîche. Paper échoue fermé : la première erreur de finalité interrompt le
-démarrage et ne programme aucun retry. La passe initiale de finalité précède
-l’activation du worker paper : tant qu’elle est en attente, aucune simulation
-n’est planifiée; si elle échoue, le worker paper n’a été ni démarré ni fermé et
-seules les ressources antérieures sont rollbackées. En observe, la politique
-<code>DEGRADED_RETRY</code> résout cette barrière avant de démarrer les workers
-suivants et conserve la reprise à l’intervalle normal.
+Au bootstrap, observe et paper restent visibles en <code>DEGRADED</code> pendant
+une indisponibilité initiale et programment une reprise bornée. Paper reste
+fermé tant que le superviseur n’est pas <code>RUNNING</code>, qu’aucun fournisseur
+n’est promu, ou qu’une passe de finalité courante n’a pas réussi sur ce même
+fournisseur. La barrière est vérifiée avant chaque claim et mutation paper ;
+elle ne crée aucun chemin d’exécution réelle.
 
 Avant toute simulation, la lignée paper vérifie aussi le replay de finalité
 jusqu’au curseur source complet. Toutes les raw antérieures ou égales sont
@@ -497,7 +499,7 @@ désactivation explicite.
 
 ### Santé WebSocket durable
 
-Le backend ajoute l’objet requis `heartbeat.websocket`; le client le garde
+Le backend actif ajoute l’objet requis `heartbeat.websocket`; le client le garde
 optionnel pendant un déploiement progressif. Il publie les cinq états publics
 `STOPPED`, `CONNECTING`, `ACKNOWLEDGED`, `RECOVERING` et `DEGRADED`, la phase
 détaillée, des identifiants de fournisseur uniquement positionnels
@@ -516,9 +518,18 @@ touches reste indépendante de la latence de persistance avec une seule relance
 coalescée. La projection est calculée depuis un snapshot cohérent et son
 horloge de fraîcheur est capturée après les lectures.
 
-L’issue #62 n’active pas ce superviseur : il reste `INACTIVE/STOPPED` jusqu’au
-câblage explicite de l’issue #63. Cette projection n’expose ni matériel de
-connexion ni capacité d’exécution.
+Le superviseur est `ACTIVE` : il acquiert d’abord son propriétaire durable,
+attend le double ACK Pump.fun/PumpSwap, exécute ensuite une frontière stricte
+HTTP des deux programmes avant de publier `RUNNING`. Il lance une vérification
+de frontière périodique toutes les 30 secondes. Une rotation parcourt une fois
+les fournisseurs positionnels et applique un equal jitter borné de 1–60 secondes
+après un cycle transitoire. Seule une frontière strictement identique et
+dépassée auprès de tous les fournisseurs conduit à `UNRECOVERABLE`; tout cycle
+mixte reste `DEGRADED`. Aucun fallback legacy automatique n’est disponible :
+un même processus ne revient jamais à `SolanaProgramSubscriber`. Cette
+projection n’expose ni matériel de connexion ni capacité d’exécution.
+`SOLANA_EXPECTED_GENESIS_HASH` est vérifié avant toute connexion lorsque le
+listener est activé et n’est jamais exposé par cette santé.
 
 ## Architecture
 

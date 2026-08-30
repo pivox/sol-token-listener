@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import bs58 from 'bs58';
+import { canonicalSolanaGenesisHash } from '../src/domain/solana-genesis-hash.js';
 import type { Commitment, PublicKey } from '@solana/web3.js';
 import {
   ProviderPinnedCatchUpSourceError,
@@ -37,7 +39,7 @@ void test('resolves once, creates one fixed RPC, validates genesis before signat
 
   assert.equal(resolved, 1);
   assert.equal(created, 1);
-  assert.deepEqual(Object.keys(source), ['providerId', 'list']);
+  assert.deepEqual(Object.keys(source), ['providerId', 'verifyGenesis', 'list']);
   assert.equal(JSON.stringify(source), '{"providerId":"fallback-1"}');
   assert.doesNotMatch(JSON.stringify(source), /provider-secret|rpc/i);
 
@@ -66,6 +68,119 @@ void test('shares one in-flight genesis verification between concurrent first pa
   await Promise.all([first, second]);
   assert.equal(rpc.genesisCalls, 1);
   assert.equal(rpc.calls.length, 2);
+});
+
+void test('preflights genesis explicitly and reuses the cached verification for later pages', async () => {
+  const events: string[] = [];
+  const rpc = new FakeRpc(events, EXPECTED_GENESIS, [page('one')]);
+  const source = createProviderPinnedCatchUpSource(
+    catalog(), 'primary', 'confirmed', EXPECTED_GENESIS, dependencies(() => rpc),
+  );
+
+  await source.verifyGenesis(new AbortController().signal);
+  assert.deepEqual(events, ['genesis']);
+
+  assert.deepEqual(await source.list(PROGRAM, undefined, 1), [signature('one')]);
+  assert.deepEqual(events, ['genesis', 'signatures']);
+  assert.equal(rpc.genesisCalls, 1);
+});
+
+void test('does not start genesis I/O when the preflight signal is already aborted', async () => {
+  const events: string[] = [];
+  const source = createProviderPinnedCatchUpSource(
+    catalog(), 'primary', 'confirmed', EXPECTED_GENESIS,
+    dependencies(() => new FakeRpc(events, EXPECTED_GENESIS, [])),
+  );
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(source.verifyGenesis(controller.signal), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'AbortError');
+    return true;
+  });
+  await Promise.resolve();
+  assert.deepEqual(events, []);
+});
+
+void test('waits for the underlying genesis transport to settle after the last waiter aborts', async () => {
+  let startRequest: (() => void) | undefined;
+  const requestStarted = new Promise<void>((resolve) => { startRequest = resolve; });
+  let underlyingSignal: AbortSignal | undefined;
+  let underlyingSettled = false;
+  const rpc = Object.freeze({
+    getGenesisHash(signal?: AbortSignal): Promise<unknown> {
+      underlyingSignal = signal;
+      startRequest?.();
+      return new Promise<unknown>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          underlyingSettled = true;
+          reject(new DOMException('Transport aborted.', 'AbortError'));
+        }, { once: true });
+      });
+    },
+    async getSignaturesForAddress(): Promise<readonly unknown[]> { return Object.freeze([]); },
+  });
+  const source = createProviderPinnedCatchUpSource(
+    catalog(), 'primary', 'confirmed', EXPECTED_GENESIS, dependencies(() => rpc),
+  );
+  const controller = new AbortController();
+  const verification = source.verifyGenesis(controller.signal);
+  await requestStarted;
+
+  controller.abort();
+  await assert.rejects(verification, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'AbortError');
+    return true;
+  });
+
+  assert.ok(underlyingSignal !== undefined);
+  assert.notEqual(underlyingSignal, controller.signal);
+  assert.equal(underlyingSignal.aborted, true);
+  assert.equal(underlyingSettled, true);
+});
+
+void test('keeps a shared genesis request alive when only one waiter aborts and caches success', async () => {
+  let settleGenesis: ((value: string) => void) | undefined;
+  const genesisResult = new Promise<string>((resolve) => { settleGenesis = resolve; });
+  let underlyingSignal: AbortSignal | undefined;
+  let genesisCalls = 0;
+  let signatureCalls = 0;
+  const rpc = Object.freeze({
+    getGenesisHash(signal: AbortSignal): Promise<string> {
+      genesisCalls += 1;
+      underlyingSignal = signal;
+      return genesisResult;
+    },
+    async getSignaturesForAddress(): Promise<readonly unknown[]> {
+      signatureCalls += 1;
+      return Object.freeze([]);
+    },
+  });
+  const source = createProviderPinnedCatchUpSource(
+    catalog(), 'primary', 'confirmed', EXPECTED_GENESIS, dependencies(() => rpc),
+  );
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+  const first = source.verifyGenesis(firstController.signal);
+  const second = source.verifyGenesis(secondController.signal);
+  await Promise.resolve();
+
+  firstController.abort();
+  await assert.rejects(first, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, 'AbortError');
+    return true;
+  });
+  assert.equal(underlyingSignal?.aborted, false);
+  assert.equal(genesisCalls, 1);
+
+  settleGenesis?.(EXPECTED_GENESIS);
+  await second;
+  await source.list(PROGRAM, undefined, 1);
+  assert.equal(genesisCalls, 1);
+  assert.equal(signatureCalls, 1);
 });
 
 void test('shares the neutral catch-up source contract with the legacy scanner export', () => {
@@ -128,6 +243,90 @@ try {
   assert.deepEqual(calls[1]?.params, [PROGRAM, { commitment: 'confirmed', limit: 1 }]);
 });
 
+void test('default genesis HTTP transport propagates abort and settles before its waiter', async () => {
+  const originalFetch = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+  let requestSignal: AbortSignal | undefined;
+  let requestCount = 0;
+  let underlyingSettled = false;
+  let startRequest: (() => void) | undefined;
+  const requestStarted = new Promise<void>((resolve) => { startRequest = resolve; });
+  try {
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      writable: true,
+      value: async (_input: unknown, init?: RequestInit): Promise<Response> => {
+        requestCount += 1;
+        requestSignal = init?.signal instanceof AbortSignal ? init.signal : undefined;
+        startRequest?.();
+        return new Promise<Response>((_resolve, reject) => {
+          requestSignal?.addEventListener('abort', () => {
+            underlyingSettled = true;
+            reject(new DOMException('Fetch aborted.', 'AbortError'));
+          }, { once: true });
+        });
+      },
+    });
+    const source = createProviderPinnedCatchUpSource(
+      catalog(), 'primary', 'confirmed', EXPECTED_GENESIS,
+    );
+    const controller = new AbortController();
+    const verification = source.verifyGenesis(controller.signal);
+    await requestStarted;
+
+    controller.abort();
+    await assert.rejects(verification, (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.name, 'AbortError');
+      return true;
+    });
+
+    assert.equal(requestCount, 1);
+    assert.equal(requestSignal?.aborted, true);
+    assert.equal(underlyingSettled, true);
+  } finally {
+    if (originalFetch === undefined) Reflect.deleteProperty(globalThis, 'fetch');
+    else Object.defineProperty(globalThis, 'fetch', originalFetch);
+  }
+});
+
+void test('rejects a real genesis HTTP redirect without contacting its target', async () => {
+  let originHits = 0;
+  let redirectedHits = 0;
+  const redirected = createServer((_request, response) => {
+    redirectedHits += 1;
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: EXPECTED_GENESIS }));
+  });
+  const origin = createServer((_request, response) => {
+    originHits += 1;
+    const target = redirected.address();
+    assert.ok(typeof target === 'object' && target !== null);
+    response.writeHead(302, { location: `http://127.0.0.1:${target.port}/genesis` });
+    response.end();
+  });
+  try {
+    await Promise.all([listenOnLoopback(redirected), listenOnLoopback(origin)]);
+    const address = origin.address();
+    assert.ok(typeof address === 'object' && address !== null);
+    const source = createProviderPinnedCatchUpSource(
+      catalog(() => pair(`http://127.0.0.1:${address.port}/rpc`)),
+      'primary',
+      'confirmed',
+      EXPECTED_GENESIS,
+    );
+
+    await assert.rejects(source.verifyGenesis(), (error: unknown) => {
+      invalid(error, 'GENESIS_UNAVAILABLE', 'primary');
+      assert.doesNotMatch(String(error), /127\.0\.0\.1|genesis|rpc/iu);
+      return true;
+    });
+    assert.equal(originHits, 1);
+    assert.equal(redirectedHits, 0);
+  } finally {
+    await Promise.all([closeServer(origin), closeServer(redirected)]);
+  }
+});
+
 void test('rejects malformed, noncanonical, and non-32-byte expected genesis values before catalog or RPC use', () => {
   const values = [
     bs58.encode(Uint8Array.from({ length: 31 }, () => 1)),
@@ -142,6 +341,11 @@ void test('rejects malformed, noncanonical, and non-32-byte expected genesis val
     ), (error: unknown) => invalid(error, 'CONFIG_INVALID', 'primary'));
     assert.equal(resolved, 0);
   }
+});
+
+void test('uses the shared canonical genesis validator for the configured expected hash', () => {
+  assert.equal(canonicalSolanaGenesisHash(EXPECTED_GENESIS), true);
+  assert.equal(canonicalSolanaGenesisHash(`${EXPECTED_GENESIS.slice(0, -1)}0`), false);
 });
 
 void test('rejects oversized and forbidden expected hashes before base58 decoding', () => {
@@ -321,7 +525,7 @@ void test('does not import the HTTP failover transport or expose URL and RPC int
     catalog(() => pair('https://url-secret.invalid/rpc')), 'primary', 'confirmed', EXPECTED_GENESIS,
     dependencies(() => new FakeRpc([], EXPECTED_GENESIS, [])),
   );
-  assert.deepEqual(Reflect.ownKeys(source), ['providerId', 'list']);
+  assert.deepEqual(Reflect.ownKeys(source), ['providerId', 'verifyGenesis', 'list']);
   assert.doesNotMatch(JSON.stringify(source), /url-secret|rpc/i);
 });
 
@@ -333,9 +537,30 @@ void test('keeps the provider-pinned source outside signing, submission, and wal
 });
 
 function dependencies(
-  createRpc: (httpUrl: string, commitment: Commitment) => FakeRpc,
+  createRpc: (httpUrl: string, commitment: Commitment) => unknown,
 ): ProviderPinnedCatchUpSourceDependencies {
   return Object.freeze({ createRpc });
+}
+
+function listenOnLoopback(server: ReturnType<typeof createServer>): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const failed = (error: Error): void => { reject(error); };
+    server.once('error', failed);
+    server.listen(0, '127.0.0.1', () => {
+      server.removeListener('error', failed);
+      resolve();
+    });
+  });
+}
+
+function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+  if (!server.listening) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error === undefined) resolve();
+      else reject(error);
+    });
+  });
 }
 
 function catalog(

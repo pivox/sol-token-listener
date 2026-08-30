@@ -20,10 +20,12 @@ import { createQualificationEngine as buildQualificationEngine } from '../src/qu
 import { executionBoundaryViolations } from './helpers/execution-boundary.js';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+const TEST_GENESIS_HASH = '11111111111111111111111111111111';
 
 const config = parseConfig({
   SOLANA_HTTP_RPC_URL: 'https://rpc.example.invalid',
   SOLANA_WS_RPC_URL: 'wss://rpc.example.invalid',
+  SOLANA_EXPECTED_GENESIS_HASH: TEST_GENESIS_HASH,
 });
 
 void test('bootstrap imports no signing, submission, or live execution path', async () => {
@@ -45,23 +47,31 @@ void test('production qualification import graph has no signing, simulation, or 
   assert.deepEqual(violations, []);
 });
 
-void test('bootstrap leaves the acknowledged WebSocket supervisor inactive until issue 63', async () => {
-  for (const path of [
-    '../src/app.ts',
-    '../src/application/production-listener-factory.ts',
-  ]) {
-    const source = await readFile(new URL(path, import.meta.url), 'utf8');
-    assert.doesNotMatch(
+void test('production bootstrap activates only the acknowledged observational WebSocket graph', async () => {
+  const path = '../src/application/production-listener-factory.ts';
+  const source = await readFile(new URL(path, import.meta.url), 'utf8');
+  for (const symbol of [
+    'openWsProgramSession',
+    'StrictCatchUpScanner',
+    'StrictCatchUpCoordinator',
+    'createProviderPinnedCatchUpSource',
+    'PersistentWebSocketHealthReporter',
+    'PostgresWebSocketHealthRepository',
+    'WebSocketFailoverSupervisor',
+    'PromotedProviderSelector',
+  ]) assert.match(source, new RegExp(`\\b${symbol}\\b`, 'u'), symbol);
+  assert.doesNotMatch(
+    source,
+    /\b(?:CatchUpScanner|StartupScanner|SolanaCatchUpSource|SolanaProgramSubscriber)\b/u,
+  );
+  assert.deepEqual(
+    executionBoundaryViolations(
       source,
-      /\b(?:openWsProgramSession|StrictCatchUpScanner|ProviderPinnedStrictCatchUpSource|PersistentWebSocketHealthReporter)\b/u,
-      path,
-    );
-    assert.doesNotMatch(
-      source,
-      /(?:ws-program-session|strict-catch-up-scanner|provider-pinned-catch-up-source|websocket-health-reporter)/u,
-      path,
-    );
-  }
+      fileURLToPath(new URL(path, import.meta.url)),
+      repositoryRoot,
+    ),
+    [],
+  );
 });
 
 void test('inactive WebSocket health reporter owns no network, provider, runtime, or configuration capability', async () => {
@@ -76,24 +86,20 @@ void test('inactive WebSocket health reporter owns no network, provider, runtime
   assert.doesNotMatch(source, /notification\.signature/u);
 });
 
-void test('durable WebSocket health documentation cannot activate issue 63 or instruct live execution', async () => {
-  const [readme, api, overview, design] = await Promise.all([
+void test('durable WebSocket health documentation describes active supervision without execution', async () => {
+  const [readme, api, overview] = await Promise.all([
     readFile(new URL('../README.md', import.meta.url), 'utf8'),
     readFile(new URL('../docs/api/v1.md', import.meta.url), 'utf8'),
     readFile(new URL('../docs/system-overview.html', import.meta.url), 'utf8'),
-    readFile(new URL('../docs/superpowers/specs/2026-08-28-durable-websocket-health-design.md', import.meta.url), 'utf8'),
   ]);
 
   const apiStart = api.indexOf('### Santé WebSocket durable');
   const apiEnd = api.indexOf('\n## SSE', apiStart);
   const overviewStart = overview.indexOf('<section id="websocket-health-lifecycle"');
   const overviewEnd = overview.indexOf('</section>', overviewStart);
-  const deliveryStart = design.indexOf('## Delivery boundaries');
-  const deliveryEnd = design.indexOf('## Acceptance tests', deliveryStart);
   for (const [name, start, end] of [
     ['API', apiStart, apiEnd],
     ['overview', overviewStart, overviewEnd],
-    ['design', deliveryStart, deliveryEnd],
   ] as const) {
     assert.notEqual(start, -1, `missing ${name} safety section`);
     assert.notEqual(end, -1, `${name} safety section must be bounded`);
@@ -103,14 +109,29 @@ void test('durable WebSocket health documentation cannot activate issue 63 or in
     readme.slice(readme.indexOf('### Santé WebSocket durable'), readme.indexOf('\n## Architecture')),
     api.slice(apiStart, apiEnd),
     overview.slice(overviewStart, overviewEnd),
-    design.slice(deliveryStart, deliveryEnd),
   ].join('\n');
-  assert.match(safetyDocumentation, /INACTIVE[\s\S]*#63/iu);
-  assert.match(safetyDocumentation, /#62[^.]*n['’]active pas/iu);
+  for (const statement of ['ACTIVE', 'double ACK', '30 secondes', 'UNRECOVERABLE', 'SOLANA_EXPECTED_GENESIS_HASH']) {
+    assert.ok(safetyDocumentation.includes(statement), `missing active safety statement: ${statement}`);
+  }
+  assert.doesNotMatch(safetyDocumentation, /inactive until #63|inactive.*#63|#62[^.]*n['’]active pas/iu);
   assert.doesNotMatch(
     safetyDocumentation,
     /(?:https?|wss):\/\/|EXECUTION_MODE=live|(?:export|set)\s+SOLANA_PRIVATE_KEY|sendTransaction\s*\(|signTransaction\s*\(|new\s+Keypair/iu,
   );
+});
+
+void test('active runtime documentation keeps paper scheduled and fail-closed on joint readiness', async () => {
+  const overview = await readFile(new URL('../docs/system-overview.html', import.meta.url), 'utf8');
+  const start = overview.indexOf('<section id="runtime"');
+  const end = overview.indexOf('</section>', start);
+  assert.notEqual(start, -1, 'missing runtime documentation');
+  assert.notEqual(end, -1, 'runtime documentation must be bounded');
+  const runtime = overview.slice(start, end);
+
+  assert.match(runtime, /paper worker démarre[^.]*aucune claim ni mutation/iu);
+  assert.match(runtime, /supervisor RUNNING[^.]*selected provider[^.]*finality RUNNING[^.]*same promotion epoch/iu);
+  assert.match(runtime, /observe et paper[^.]*DEGRADED_RETRY/iu);
+  assert.doesNotMatch(runtime, /worker paper ne démarre pas|aucun retry initial/iu);
 });
 
 void test('paper dry-run bootstrap imports no signing, submission, or live execution path', async () => {

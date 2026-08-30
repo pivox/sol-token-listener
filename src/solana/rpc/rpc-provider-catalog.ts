@@ -28,11 +28,9 @@ export function createRpcProviderCatalog(
   if (httpFallbacks.length > 3
     || websocketFallbacks.length > 3
     || (websocketFallbacks.length > 0 && websocketFallbacks.length !== httpFallbacks.length)
-    || !validPrimary(config.httpRpcUrl, config.wsRpcUrl, websocketFallbacks.length > 0)
-    || (websocketFallbacks.length > 0 && (
-      !uniqueUrls([config.httpRpcUrl, ...httpFallbacks])
-      || !uniqueUrls([config.wsRpcUrl, ...websocketFallbacks])
-    ))) {
+    || !validStrictPair(config.httpRpcUrl, config.wsRpcUrl)
+    || !uniqueUrls([config.httpRpcUrl, ...httpFallbacks])
+    || !uniqueUrls([config.wsRpcUrl, ...websocketFallbacks])) {
     throw invalidCatalog();
   }
 
@@ -64,18 +62,6 @@ function validConfigShape(value: unknown): value is RpcProviderCatalogConfig {
       && typeof candidate.wsRpcUrl === 'string'
       && Array.isArray(candidate.wsRpcFallbackUrls)
       && candidate.wsRpcFallbackUrls.every((entry: unknown) => typeof entry === 'string');
-  } catch {
-    return false;
-  }
-}
-
-function validPrimary(httpUrl: string, websocketUrl: string, strict: boolean): boolean {
-  try {
-    const http = new URL(httpUrl);
-    const websocket = new URL(websocketUrl);
-    if (http.protocol !== 'http:' && http.protocol !== 'https:') return false;
-    if (websocket.protocol !== 'ws:' && websocket.protocol !== 'wss:') return false;
-    return !strict || validStrictPair(httpUrl, websocketUrl);
   } catch {
     return false;
   }

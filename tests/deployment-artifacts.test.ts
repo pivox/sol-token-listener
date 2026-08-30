@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
@@ -228,6 +230,10 @@ void test('Compose defines an observe-only, five-service deployment without expo
     app,
     /^ {6}SOLANA_WS_RPC_URL: \$\{SOLANA_WS_RPC_URL:\?SOLANA_WS_RPC_URL is required\}\n {6}SOLANA_WS_RPC_FALLBACK_URLS: \$\{SOLANA_WS_RPC_FALLBACK_URLS:-\}$/m,
   );
+  assert.match(
+    app,
+    /^ {6}SOLANA_EXPECTED_GENESIS_HASH: \$\{SOLANA_EXPECTED_GENESIS_HASH:-\}$/m,
+  );
   assert.match(app, /^ {6}EXECUTION_MODE: observe$/m);
   assert.match(app, /^ {6}PAPER_STRATEGY_ENABLED: "false"$/m);
   assert.match(app, /^ {6}API_ENABLED: "true"$/m);
@@ -245,6 +251,8 @@ void test('Compose defines an observe-only, five-service deployment without expo
   assert.equal(smokeOverride, [
     'services:',
     '  app:',
+    '    environment:',
+    '      LISTENER_ENABLED: "false"',
     '    healthcheck:',
     '      test: ["CMD", "node", "dist/scripts/deployment-healthcheck.js"]',
     '',
@@ -333,6 +341,7 @@ void test('Compose environment template contains documentation-only required inp
     'SOLANA_HTTP_RPC_FALLBACK_URLS=',
     'SOLANA_WS_RPC_URL=wss://rpc-provider.invalid',
     'SOLANA_WS_RPC_FALLBACK_URLS=',
+    'SOLANA_EXPECTED_GENESIS_HASH=',
     'FRONTEND_PORT=8080',
     'LISTENER_ENABLED=true',
     'RETENTION_PURGE_INTERVAL_MS=900000',
@@ -350,6 +359,10 @@ void test('Compose environment template contains documentation-only required inp
   assert.match(
     environment,
     /^# Optional paired WebSocket fallbacks; positions must match the HTTP fallback list and this can remain blank\.\nSOLANA_WS_RPC_FALLBACK_URLS=$/m,
+  );
+  assert.match(
+    environment,
+    /canonical 32-byte base58 genesis hash/i,
   );
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/i);
   for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE']) {
@@ -373,6 +386,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /SOLANA_HTTP_RPC_URL:\s*'https:\/\/rpc\.invalid'/);
   assert.match(smoke, /SOLANA_WS_RPC_URL:\s*'wss:\/\/rpc\.invalid'/);
   assert.match(smoke, /LISTENER_ENABLED:\s*'false'/);
+  assert.doesNotMatch(smoke, /SOLANA_EXPECTED_GENESIS_HASH/);
   assert.match(smoke, /BACKEND_IMAGE:\s*deploymentImages\.backend/);
   assert.match(smoke, /FRONTEND_IMAGE:\s*deploymentImages\.frontend/);
   assert.match(smoke, /const smokeComposeFile = resolve\(root, 'deploy\/compose\.smoke\.yaml'\)/);
@@ -606,11 +620,25 @@ void test('deployment runbook documents the safe production lifecycle and safety
   const rollbackStopIndex = rollback.indexOf(startupStop);
   assert.notEqual(rollbackStopIndex, -1, 'rollback must stop every application service');
   assert.ok(rollbackStopIndex < rollback.indexOf('BACKEND_IMAGE'));
-  assert.ok(rollbackStopIndex < rollback.indexOf('pull app retention frontend'));
-  assert.ok(rollbackStopIndex < rollback.indexOf('up -d --no-build --no-deps app retention'));
-  assert.match(rollback, /BACKEND_IMAGE[\s\S]*FRONTEND_IMAGE/);
-  assert.match(rollback, /pull app retention frontend/);
-  assert.match(rollback, /up -d --no-build --no-deps app retention/);
+  assert.ok(rollbackStopIndex < rollback.indexOf('pull app frontend retention'));
+  assert.ok(rollbackStopIndex < rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps app retention'));
+  assert.match(rollback, /BACKEND_IMAGE[\s\S]*FRONTEND_IMAGE[\s\S]*références immuables précédentes/iu);
+  assert.match(rollback, /repository@sha256:…/u);
+  assert.match(rollback, /ne doivent pas être vides|refus(?:e|ent) une\s+valeur vide/iu);
+  assert.match(rollback, /pull app frontend retention/);
+  assert.match(rollback, /up -d --wait --wait-timeout 60 --no-build --no-deps app retention/);
+  assert.match(rollback, /up -d --wait --wait-timeout 60 --no-build --no-deps frontend/);
+  assert.ok(
+    rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps app retention')
+      < rollback.indexOf('deployment-healthcheck.js --require-ok')
+      && rollback.indexOf('deployment-healthcheck.js --require-ok')
+        < rollback.indexOf('up -d --wait --wait-timeout 60 --no-build --no-deps frontend'),
+    'backend readiness and strict health must precede frontend re-exposure',
+  );
+  assert.doesNotMatch(
+    rollback,
+    /stop app\n.*up -d --wait --wait-timeout 60 app\n.*deployment-healthcheck\.js --require-ok/s,
+  );
   assert.match(runbook, /restauration[^\n]*répétée/i);
   assert.match(runbook, /EXÉCUTION_MODE=observe|EXECUTION_MODE=observe/);
   assert.match(runbook, /observe|paper/i);
@@ -654,9 +682,15 @@ void test('deployment runbook verifies a real SSE heartbeat with a bounded, clea
   assert.doesNotMatch(runbook, /curl --no-buffer --max-time 10/);
 });
 
-void test('operator documentation links the deployment runbook and smoke command', async () => {
-  const readme = await readArtifact('README.md');
-  const overview = await readArtifact('docs/system-overview.html');
+void test('operator documentation activates the safe websocket failover contract', async () => {
+  const [readme, api, overview, deployment, rpcQualification] = await Promise.all([
+    readArtifact('README.md'),
+    readArtifact('docs/api/v1.md'),
+    readArtifact('docs/system-overview.html'),
+    readArtifact('docs/operations/deployment.md'),
+    readArtifact('docs/operations/rpc-qualification.md'),
+  ]);
+  const documentation = [readme, api, overview, deployment, rpcQualification].join('\n');
 
   assert.match(readme, /\[Guide de déploiement\]\(docs\/operations\/deployment\.md\)/);
   assert.match(readme, /npm run deployment:smoke/);
@@ -673,6 +707,65 @@ void test('operator documentation links the deployment runbook and smoke command
   assert.match(overview, /TLS externe/i);
   assert.match(overview, /sauvegarde externe/i);
   assert.match(overview, /aucune promesse[^<]*(?:première position|sellabilité|profit)/i);
+
+  for (const statement of [
+    'double ACK',
+    '30 secondes',
+    'primary',
+    'fallback-1',
+    '1–60 secondes',
+    'UNRECOVERABLE',
+    'SOLANA_EXPECTED_GENESIS_HASH',
+    'getGenesisHash',
+    'observe/paper',
+    'SolanaProgramSubscriber',
+  ]) assert.ok(documentation.includes(statement), `missing active operational statement: ${statement}`);
+  assert.doesNotMatch(documentation, /inactive until #63|inactive.*#63|jusqu[^\n]{0,80}#63/iu);
+  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d migrate/);
+  assert.match(deployment, /DOTENV_CONFIG_PATH=deploy\/\.env npm run rpc:check/);
+  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d --wait --wait-timeout 60 app frontend retention/);
+  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml exec -T app[\s\S]*deployment-healthcheck\.js --require-ok/);
+  assert.match(deployment, /références immuables précédentes/i);
+  assert.match(deployment, /migrations[^.]*forward-only/i);
+  assert.ok(
+    deployment.indexOf('up -d --wait --wait-timeout 60 app frontend retention')
+      < deployment.indexOf('deployment-healthcheck.js --require-ok'),
+    'Compose readiness must be awaited before the strict healthcheck',
+  );
+});
+
+void test('documented RPC preflight uses dotenv explicit-path support', async () => {
+  const [packageJson, checkRpc, config] = await Promise.all([
+    readArtifact('package.json'),
+    readArtifact('scripts/check-rpc.ts'),
+    readArtifact('src/config/env.ts'),
+  ]);
+  const parsed = JSON.parse(packageJson) as { readonly scripts?: Readonly<Record<string, string>> };
+
+  assert.equal(parsed.scripts?.['rpc:check'], 'tsx scripts/check-rpc.ts');
+  assert.match(checkRpc, /loadConfig\(\)/);
+  assert.match(config, /^import 'dotenv\/config';$/m);
+
+  const directory = await mkdtemp(join(tmpdir(), 'sol-token-listener-dotenv-'));
+  const environmentPath = join(directory, '.env');
+  try {
+    await writeFile(environmentPath, 'TASK8_DOTENV_CONTRACT=loaded\n', 'utf8');
+    const result = spawnSync(
+      process.execPath,
+      ['--import', 'dotenv/config', '--eval', 'process.stdout.write(process.env.TASK8_DOTENV_CONTRACT ?? "")'],
+      {
+        cwd: fileURLToPath(root),
+        encoding: 'utf8',
+        env: { ...process.env, DOTENV_CONFIG_PATH: environmentPath },
+        timeout: 10_000,
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'loaded');
+    assert.equal(result.stderr, '');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 void test('operator overview renders the durable WebSocket lifecycle without exposing connection material', async () => {
@@ -693,11 +786,42 @@ void test('operator overview renders the durable WebSocket lifecycle without exp
     'STOPPED', 'CONNECTING', 'WAITING_FOR_ACKS', 'ACKNOWLEDGED', 'RECOVERING',
     'RUNNING', 'DEGRADED',
   ]) assert.ok(section.includes(phase), `missing lifecycle phase: ${phase}`);
-  assert.match(section, /INACTIVE[^<]*#63/iu);
+  assert.match(section, /ACTIVE[^<]*(?:double ACK|deux ACK)/iu);
+  assert.match(section, /UNRECOVERABLE/iu);
   assert.match(section, /30 secondes/iu);
   assert.match(section, /quatre heures/iu);
   assert.match(section, /dernière observation[^<]*pas[^<]*frontière[^<]*complétude/iu);
   assert.match(section, /primary[^<]*fallback-1[^<]*fallback-2[^<]*fallback-3/iu);
   assert.doesNotMatch(section, /(?:https?|wss):\/\//iu);
   assert.doesNotMatch(section, /EXECUTION_MODE=live|sendTransaction\s*\(|signTransaction\s*\(|private[_ -]?key/iu);
+});
+
+void test('operator overview documents the active runtime order and paper readiness fence', async () => {
+  const overview = await readArtifact('docs/system-overview.html');
+  const runtimeStart = overview.indexOf('<section id="runtime"');
+  const runtimeEnd = overview.indexOf('</section>', runtimeStart);
+  assert.notEqual(runtimeStart, -1, 'missing runtime section');
+  assert.notEqual(runtimeEnd, -1, 'runtime section must be bounded');
+  const runtime = overview.slice(runtimeStart, runtimeEnd);
+
+  assert.match(
+    runtime,
+    /supervisor[\s\S]*inbox worker[\s\S]*finality reconciler[\s\S]*paper worker[\s\S]*social worker[\s\S]*heartbeat/iu,
+  );
+  for (const statement of [
+    'beginOwner',
+    'double ACK',
+    'frontière stricte',
+    'avant la promotion',
+    'DEGRADED_RETRY',
+    'supervisor RUNNING',
+    'selected provider',
+    'finality RUNNING',
+    'same promotion epoch',
+    'SOLANA_EXPECTED_GENESIS_HASH',
+    'LISTENER_ENABLED=true',
+    'ne l’écrit jamais dans les logs',
+  ]) assert.ok(runtime.includes(statement), `missing active runtime statement: ${statement}`);
+  assert.doesNotMatch(runtime, /Health RPC|Baseline HTTP|Souscriptions WebSocket|Catch-up de fermeture de fenêtre/iu);
+  assert.doesNotMatch(runtime, /Paper exige une première passe finalité réussie[^.]*worker paper ne démarre pas[^.]*aucun retry initial/iu);
 });
