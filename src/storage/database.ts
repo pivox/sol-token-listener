@@ -152,6 +152,9 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly paperDecisionJobs: number;
   readonly paperTrades: number;
   readonly paperPositions: number;
+  readonly executionIntentTransitions: number;
+  readonly executionAttempts: number;
+  readonly executionIntents: number;
   readonly stateTransitions: number;
   readonly observedWalletPositions: number;
   readonly holderSnapshots: number;
@@ -390,6 +393,31 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
              AND run.strategy_version = position.strategy_version
              AND position.opened_at BETWEEN run.started_at AND run.deadline_at
          )`,
+    );
+    const executionIntentTransitions = await client.query(
+      `DELETE FROM execution_intent_transitions transition
+       USING execution_intents intent
+       WHERE transition.intent_id = intent.id
+         AND intent.status IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
+         AND intent.terminal_at IS NOT NULL
+         AND intent.reconciliation_completed_at IS NOT NULL
+         AND intent.purge_after <= statement_timestamp()`,
+    );
+    const executionAttempts = await client.query(
+      `DELETE FROM execution_attempts attempt
+       USING execution_intents intent
+       WHERE attempt.intent_id = intent.id
+         AND intent.status IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
+         AND intent.terminal_at IS NOT NULL
+         AND intent.reconciliation_completed_at IS NOT NULL
+         AND intent.purge_after <= statement_timestamp()`,
+    );
+    const executionIntents = await client.query(
+      `DELETE FROM execution_intents intent
+       WHERE intent.status IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
+         AND intent.terminal_at IS NOT NULL
+         AND intent.reconciliation_completed_at IS NOT NULL
+         AND intent.purge_after <= statement_timestamp()`,
     );
     const transitions = await client.query(
       'DELETE FROM state_transitions WHERE purge_after <= NOW()',
@@ -697,6 +725,9 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       paperDecisionJobs: paperDecisionJobs.rowCount ?? 0,
       paperTrades: paperTrades.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
+      executionIntentTransitions: executionIntentTransitions.rowCount ?? 0,
+      executionAttempts: executionAttempts.rowCount ?? 0,
+      executionIntents: executionIntents.rowCount ?? 0,
       stateTransitions: transitions.rowCount ?? 0,
       observedWalletPositions: observedWalletPositions.rowCount ?? 0,
       holderSnapshots: holderSnapshots.rowCount ?? 0,

@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
 import { assertExecutionIntent, createExecutionIntentDraft } from '../src/domain/execution-intent.js';
-import { migrateDatabase } from '../src/storage/database.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 
 const migrationName = '031_execution_intents.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
@@ -255,6 +255,118 @@ void test('execution intent migration applies and replays on an isolated schema'
       WHERE intent_id = $1`, [processing.id])).rows[0]?.count, 0);
     assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count FROM execution_intent_transitions
       WHERE intent_id = $1`, [processing.id])).rows[0]?.count, 0);
+  });
+});
+
+void test('purges only reconciled terminal execution intent ledgers after retention', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: execution intent purge test skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'execution_intent_purge', async (pool) => {
+    await migrateDatabase({ pool });
+    const terminalStatuses = ['SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED'] as const;
+    const terminalIds: string[] = [];
+    for (const status of terminalStatuses) {
+      const value = draft(`purge-${status.toLowerCase()}`, 'BUY', 1n, null);
+      terminalIds.push(value.id);
+      await insertIntent(pool, intentRow(value, {
+        status, attemptCount: 1, terminalAtMs: 1_000,
+        reconciliationCompletedAtMs: 2_000, purgeAfterMs: 14_402_000,
+      }));
+      await insertAttempt(pool, value.id, 1, 'COMPLETED', 0, 1_000, null);
+      await insertTransition(pool, value.id, {
+        payloadVersion: 1, attemptNumber: 1, sourceEventId: null, observedAtMs: 1_000,
+      }, 1_000);
+    }
+
+    const retainedIds: string[] = [];
+    const beforeBoundary = Date.now() + 60_000;
+    const retainedTerminal = draft('retain-before-purge-boundary', 'BUY', 1n, null);
+    retainedIds.push(retainedTerminal.id);
+    await insertIntent(pool, intentRow(retainedTerminal, {
+      status: 'SUCCEEDED', terminalAtMs: beforeBoundary - 14_401_000,
+      reconciliationCompletedAtMs: beforeBoundary - 14_400_000,
+      purgeAfterMs: beforeBoundary,
+    }));
+    const nonTerminalIds: string[] = [];
+    for (const status of ['PENDING', 'PROCESSING', 'UNKNOWN_REQUIRES_RECONCILIATION'] as const) {
+      const value = draft(`retain-${status.toLowerCase()}`, 'BUY', 1n, null);
+      retainedIds.push(value.id);
+      nonTerminalIds.push(value.id);
+      await insertIntent(pool, intentRow(value));
+    }
+    // Exercise the purge predicate defensively against legacy/corrupt rows whose
+    // stale retention timestamps no longer satisfy the current schema checks.
+    await pool.query(`ALTER TABLE execution_intents
+      DROP CONSTRAINT execution_intents_pending_check,
+      DROP CONSTRAINT execution_intents_terminal_check,
+      DROP CONSTRAINT execution_intents_reconciliation_retention_check`);
+    for (const [id, status] of nonTerminalIds.map((id, index) => [
+      id, ['PENDING', 'PROCESSING', 'UNKNOWN_REQUIRES_RECONCILIATION'][index],
+    ] as const)) {
+      await pool.query(`UPDATE execution_intents SET
+        status = $2, terminal_at = to_timestamp(1),
+        reconciliation_completed_at = to_timestamp(2), purge_after = to_timestamp(14402)
+        WHERE id = $1`, [id, status]);
+    }
+
+    const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.executionIntentTransitions, terminalStatuses.length);
+    assert.equal(purged.executionAttempts, terminalStatuses.length);
+    assert.equal(purged.executionIntents, terminalStatuses.length);
+    assert.deepEqual((await pool.query<{ readonly id: string }>(
+      'SELECT id FROM execution_intents ORDER BY id',
+    )).rows.map(({ id }) => id).sort(), retainedIds.sort());
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_attempts WHERE intent_id = ANY($1::TEXT[])',
+      [terminalIds],
+    )).rows[0]?.count, 0);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_transitions WHERE intent_id = ANY($1::TEXT[])',
+      [terminalIds],
+    )).rows[0]?.count, 0);
+  });
+});
+
+void test('rolls back execution intent child purges when the parent delete fails', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: execution intent purge rollback test skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'execution_intent_purge_rollback', async (pool) => {
+    await migrateDatabase({ pool });
+    const value = draft('purge-rollback', 'BUY', 1n, null);
+    await insertIntent(pool, intentRow(value, {
+      status: 'SUCCEEDED', attemptCount: 1, terminalAtMs: 1_000,
+      reconciliationCompletedAtMs: 2_000, purgeAfterMs: 14_402_000,
+    }));
+    await insertAttempt(pool, value.id, 1, 'COMPLETED', 0, 1_000, null);
+    await insertTransition(pool, value.id, {
+      payloadVersion: 1, attemptNumber: 1, sourceEventId: null, observedAtMs: 1_000,
+    }, 1_000);
+    await pool.query(`CREATE FUNCTION reject_execution_intent_delete() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced execution intent purge rollback'; END $$`);
+    await pool.query(`CREATE TRIGGER reject_execution_intent_delete
+      BEFORE DELETE ON execution_intents FOR EACH ROW EXECUTE FUNCTION reject_execution_intent_delete()`);
+
+    await assert.rejects(
+      purgeExpiredFoundationData(pool),
+      /forced execution intent purge rollback/u,
+    );
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intents WHERE id = $1', [value.id],
+    )).rows[0]?.count, 1);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_attempts WHERE intent_id = $1', [value.id],
+    )).rows[0]?.count, 1);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_transitions WHERE intent_id = $1', [value.id],
+    )).rows[0]?.count, 1);
   });
 });
 
