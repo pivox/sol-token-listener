@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.1.1
+**Version de spécification :** 1.2.0
 
 **Date :** 2026-08-30
 
@@ -13,9 +13,14 @@ inerte des intentions d'exécution)
 
 ## Historique des versions
 
+- **1.2.0 — 2026-08-30 :** ajoute un tombstone anti-rejeu durable et minimal
+  pour l'identité et la clé logique d'une intention purgée. Le plafond TTL de
+  quatre heures reste une défense en profondeur mais n'est plus présenté comme
+  une preuve suffisante lorsqu'un producteur réémet une décision avec des
+  timestamps frais.
 - **1.1.1 — 2026-08-30 :** borne l'échéance immutable d'une intention à
   quatre heures et rend les reason codes positifs obligatoires par état et par
-  tentative, afin de fermer respectivement le rejeu après purge et le journal
+  tentative, afin de réduire la fenêtre de rejeu et de fermer le journal
   contradictoire identifiés par la revue finale.
 - **1.1.0 — 2026-08-30 :** ajoute sans changer l'identité V1 une révision
   d'état monotone contre les reprises ABA, fixe la décision et son fingerprint
@@ -239,6 +244,14 @@ updated_at
 purge_after
 ```
 
+Après purge de ce payload métier, `execution_intent_tombstones` conserve
+uniquement `intent_id`, `payload_version`, `logical_order_key`,
+`decision_fingerprint` et `retired_at`. Il ne conserve ni mint, ni wallet, ni
+montant, ni quote, ni payload de décision. `intent_id` et
+`decision_fingerprint` sont déjà des empreintes ; `logical_order_key` est la
+clé minimale nécessaire pour préserver la contrainte d'ordre logique entre
+des identités éventuellement différentes.
+
 Une intention BUY exige `quote_amount_raw`; une intention SELL exige
 `base_amount_raw`. Les deux quantités ne sont jamais des nombres JavaScript.
 `minimum_amount_out_raw` vient d'une quote causale et bornée, puis doit être
@@ -326,7 +339,7 @@ Les transitions nominales utilisent obligatoirement le reason code du nouvel
 `COMPLETED` exige `ATTEMPT_COMPLETED`; une tentative `ABANDONED` exige un code
 d'échec et refuse `ATTEMPT_COMPLETED` ainsi que les autres codes positifs.
 Ces couples sont validés avant toute connexion PostgreSQL, au décodage et par
-les contraintes des trois tables durables.
+les contraintes des tables durables concernées.
 
 ### 5.4 Leases et crash/reprise
 
@@ -681,7 +694,8 @@ blockhash ne peut plus atterrir, puis suit cette même fenêtre. La purge suppri
 d'abord artefacts, tentatives et transitions, puis l'intention, dans une
 transaction rejouable. Elle publie seulement des compteurs agrégés.
 
-Le plafond dur d'échéance ferme le rejeu après purge sans tombstone permanent :
+Le plafond dur d'échéance réduit la fenêtre d'exécution et reste une défense en
+profondeur :
 
 ```text
 expires_at <= requested_at + 4h
@@ -690,15 +704,28 @@ purge_after = reconciliation_completed_at + 4h
 donc expires_at <= purge_after
 ```
 
-Une identité recréée après sa purge porte donc nécessairement une échéance
-déjà atteinte et ne peut pas être réclamée avec le purpose `EXECUTE`.
+Cette relation ne suffit pas à empêcher un producteur de recréer le même ordre
+logique avec un nouvel événement et des timestamps frais. Avant de supprimer
+une intention réconciliée, la purge insère donc dans la même transaction un
+tombstone durable de son ID et de sa clé logique. `create()` vérifie le
+tombstone après sa tentative d'insertion, toujours dans la même transaction :
+si l'ID ou la clé logique a déjà été retiré, l'insertion éventuelle est annulée
+et `INTENT_DUPLICATE` est retourné. Ce contrôle post-insertion ferme aussi la
+course entre une création concurrente et une purge qui détenait le verrou sur
+la ligne parente.
 
 La fondation #51-B fige une heure de coupure PostgreSQL puis verrouille une
-cohorte ordonnée d'identifiants terminaux et réconciliés. Les transitions et
-tentatives de cette cohorte exacte sont supprimées avant leurs intentions dans
-la même transaction. Une ligne devenue éligible pendant la passe attend la
-passe suivante; une ligne ouverte, inconnue ou non réconciliée n'entre jamais
-dans la cohorte.
+cohorte ordonnée d'identifiants terminaux et réconciliés. Les tombstones de
+cette cohorte exacte sont insérés avant que les transitions, tentatives puis
+intentions soient supprimées dans la même transaction. Une collision de
+tombstone fait échouer toute la purge, sans suppression partielle. Une ligne
+devenue éligible pendant la passe attend la passe suivante; une ligne ouverte,
+inconnue ou non réconciliée n'entre jamais dans la cohorte.
+
+Les tombstones ne suivent pas la fenêtre de quatre heures : ils restent utiles
+à la garantie « un ordre logique au plus une fois » et sont donc conservés
+durablement. Leur minimisation explicite satisfait la rétention des données
+métier devenues inutiles sans affaiblir l'idempotence.
 
 Le front-end public reste indépendant et en lecture seule. La V1 n'ajoute
 aucune route publique d'armement, de clé, de soumission ou de contrôle. Les
@@ -761,7 +788,7 @@ réaffecté à une autre signification.
 | PR | Livraison | Capacité de signature/envoi |
 | --- | --- | --- |
 | #51-A | Cette spécification et le plan versionné | Aucune |
-| #51-B | Domaine, migration `execution_intents`/`execution_attempts`, repository, idempotence et rétention | Aucune |
+| #51-B | Domaine, migration des intentions/tentatives/tombstones, repository, idempotence et rétention | Aucune |
 | #51-C | Processus executor en dry-run, claims, états et rapports factices | Aucune |
 | #51-D | Quotes fraîches, build et `simulateTransaction` sans keypair ni envoi | Aucune |
 | #51-E | Réconciliation, verrou/réservation wallet, sizing, exposition, quota provider et matrice de fautes | Aucune |
@@ -790,7 +817,8 @@ suivante.
 - keypair absent, invalide, permissions faibles et wallet mismatch ;
 - signature persistée avant tentative d'envoi ;
 - confirmation et balances réelles réconciliées ;
-- rétention quatre heures après réconciliation seulement ;
+- rétention du payload métier quatre heures après réconciliation seulement,
+  avec tombstone anti-rejeu minimal conservé durablement ;
 - aucune fuite de secret dans logs, erreurs, rapports ou API ;
 - aucun import live depuis le listener, l'API publique, le paper ou la
   simulation-only ;

@@ -744,7 +744,7 @@ git add README.md docs/architecture/pumpfun-v1.md scripts/deployment-smoke.mjs t
 git commit -m "docs: describe inert execution intent foundation (#51)"
 ```
 
-### Task 8: Fermer les deux blockers de la revue finale
+### Task 8: Fermer les blockers TTL et journal de la revue finale
 
 **Files:**
 - Modify: `src/domain/execution-intent.ts`
@@ -761,10 +761,11 @@ git commit -m "docs: describe inert execution intent foundation (#51)"
 - [ ] **Step 1: Écrire les régressions RED anti-replay**
 
 Ajouter un test domaine et PostgreSQL qui refusent tout draft dont
-`expiresAtMs - requestedAtMs` dépasse `14_400_000`. Ajouter le mutant complet
-terminalisation → réconciliation → purge → recréation et vérifier qu'après la
-purge la ligne recréée est nécessairement expirée et que `claim(EXECUTE)`
-retourne `null`.
+`expiresAtMs - requestedAtMs` dépasse `14_400_000`. Ajouter une première
+régression terminalisation → réconciliation → purge → recréation avec les
+timestamps d'origine et vérifier que `claim(EXECUTE)` retourne `null`. Cette
+preuve borne le TTL mais ne constitue pas la garantie anti-rejeu permanente ;
+la Task 9 couvre le mutant avec des timestamps frais.
 
 - [ ] **Step 2: Borner le TTL au même horizon que la rétention**
 
@@ -832,8 +833,85 @@ npm run docs:check
 npm run deployment:smoke
 ```
 
-Expected: zéro échec, zéro test PostgreSQL silencieusement omis et le mutant
-post-purge ne peut plus être réclamé.
+Expected: zéro échec, zéro test PostgreSQL silencieusement omis et la fenêtre
+du TTL reste bornée à quatre heures.
+
+### Task 9: Conserver un tombstone durable anti-rejeu
+
+**Files:**
+- Modify: `migrations/031_execution_intents.sql`
+- Modify: `src/storage/execution-intent.repository.ts`
+- Modify: `src/storage/database.ts`
+- Modify: `tests/execution-intent-migration.test.ts`
+- Modify: `tests/execution-intent.repository.test.ts`
+- Modify: `tests/database-retention.test.ts`
+- Modify: `tests/deployment-artifacts.test.ts`
+- Modify: `scripts/deployment-smoke.mjs`
+- Modify: `tests/migration-lock.test.ts`
+- Modify: `docs/superpowers/specs/2026-08-30-executor-v1-design.md`
+
+- [ ] **Step 1: Écrire les régressions RED de résurrection**
+
+Dans le vrai test PostgreSQL, terminaliser, réconcilier et purger une
+intention, puis produire un draft avec le même ID et la même clé logique mais
+un `decisionEventId`, un `decisionFingerprint`, un `requestedAtMs` et un
+`expiresAtMs` frais. Exiger `INTENT_DUPLICATE`, vérifier que `read(id)` reste
+`null` et qu'aucune intention ne peut être réclamée. Ajouter un test de course
+création/purge qui prouve le même comportement fail-closed.
+
+- [ ] **Step 2: Vérifier RED**
+
+Run:
+
+```bash
+TEST_DATABASE_URL=postgresql:///postgres npx tsx --test \
+  tests/execution-intent.repository.test.ts tests/database-retention.test.ts
+```
+
+Expected: le mutant à timestamps frais recrée et réclame encore l'intention,
+ou la table tombstone attendue manque.
+
+- [ ] **Step 3: Ajouter le contrat SQL minimal**
+
+Créer `execution_intent_tombstones` dans la migration 031 avec exactement les
+données durables encore nécessaires : `intent_id` primaire,
+`payload_version=1`, `logical_order_key` unique, `decision_fingerprint` SHA-256
+canonique et `retired_at` PostgreSQL milliseconde. Aucun FK vers l'intention,
+aucun mint, wallet, montant, quote, payload ou `purge_after`.
+
+- [ ] **Step 4: Rendre création et purge atomiques**
+
+Dans la transaction `create()`, effectuer la vérification tombstone après la
+tentative `INSERT ... ON CONFLICT DO NOTHING`. Si l'ID ou la clé logique est
+retiré, lever l'erreur typée et expurgée `INTENT_DUPLICATE` afin d'annuler
+l'éventuelle insertion. Ensuite seulement, traiter `CREATED` ou le replay de
+la ligne parente.
+
+Dans la transaction de purge, insérer les tombstones de la cohorte verrouillée
+avant de supprimer transitions, tentatives et intentions. Ne pas utiliser
+`ON CONFLICT DO NOTHING` : une collision doit rollback toute la passe. Les
+trois compteurs publics restent les compteurs de lignes supprimées.
+
+- [ ] **Step 5: Vérifier GREEN et les artefacts de migration**
+
+Mettre à jour le verrou canonique à 31 migrations, les assertions de schéma et
+le smoke de déploiement. Lancer les tests ciblés PostgreSQL et vérifier zéro
+skip, puis `npm run build`, `npm run check`, `npm run lint` et
+`npm run docs:check`.
+
+- [ ] **Step 6: Valider toute la branche**
+
+Run:
+
+```bash
+TEST_DATABASE_URL=postgresql:///postgres npm test
+npm run deployment:smoke
+git diff --check
+```
+
+Expected: zéro échec, aucune résurrection possible avec des timestamps frais,
+aucune capacité de signature ou de soumission ajoutée. Passer la spec à
+`1.2.0` et obtenir les revues conformité puis qualité.
 
 ## Critères de sortie de #51-B
 
@@ -843,6 +921,7 @@ post-purge ne peut plus être réclamé.
 - claim durable avec lease, fencing et temps PostgreSQL ;
 - transitions append-only et erreurs typées/redacted ;
 - rétention uniquement quatre heures après terminalisation réconciliée ;
+- tombstone durable minimal empêchant la résurrection d'un ordre purgé ;
 - mapper pur présent mais non composé ;
 - listener/API/CLI paper inchangés et toujours incapables de signer/envoyer ;
 - aucun mode, secret, wallet, builder, simulation ou soumission ajouté ;
