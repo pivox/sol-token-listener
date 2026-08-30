@@ -98,7 +98,7 @@ void test('merges one signature from incumbent and candidate WS plus strict HTTP
     await sessions.at(0).observe(wsNotification('pumpfun'));
 
     scheduler.fire(30_000);
-    await settled();
+    await waitForPhase(health, 'DEGRADED');
     assert.equal((await health.read()).phase, 'DEGRADED');
     scheduler.fire(0);
     await waitForSessionCount(sessions, 2);
@@ -1064,13 +1064,6 @@ function healthTransition(
       : phase === 'RECOVERING' ? 'IN_PROGRESS' as const : 'REQUIRED' as const,
     recoveryReasonCode: 'STARTUP' as const,
   });
-}
-
-async function settled(): Promise<void> {
-  for (let index = 0; index < 20; index += 1) {
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-  await new Promise<void>((resolve) => setTimeout(resolve, 10));
 }
 
 async function waitForProvider(
