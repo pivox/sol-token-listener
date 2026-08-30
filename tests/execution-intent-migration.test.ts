@@ -370,6 +370,94 @@ void test('rolls back execution intent child purges when the parent delete fails
   });
 });
 
+void test('pins one execution intent purge cohort across all child and parent deletes', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: execution intent purge cohort test skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'execution_intent_purge_cohort', async (pool) => {
+    await migrateDatabase({ pool });
+    const value = draft('purge-cohort-boundary', 'BUY', 1n, null);
+    const futurePurgeAtMs = Date.now() + 60_000;
+    await insertIntent(pool, intentRow(value, {
+      status: 'SUCCEEDED', attemptCount: 1,
+      terminalAtMs: futurePurgeAtMs - 28_800_000,
+      reconciliationCompletedAtMs: futurePurgeAtMs - 14_400_000,
+      purgeAfterMs: futurePurgeAtMs,
+    }));
+    await insertAttempt(pool, value.id, 1, 'COMPLETED', 0, 1_000, null);
+    await insertTransition(pool, value.id, {
+      payloadVersion: 1, attemptNumber: 1, sourceEventId: null, observedAtMs: 1_000,
+    }, 1_000);
+    await pool.query(`CREATE FUNCTION advance_execution_intent_purge_boundary() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN
+        UPDATE execution_intents SET
+          reconciliation_completed_at = date_trunc('milliseconds', statement_timestamp())
+            - INTERVAL '4 hours',
+          purge_after = date_trunc('milliseconds', statement_timestamp())
+        WHERE id = TG_ARGV[0];
+        RETURN NULL;
+      END $$`);
+    await pool.query(`CREATE TRIGGER advance_execution_intent_purge_boundary
+      AFTER DELETE ON execution_intent_transitions FOR EACH STATEMENT
+      EXECUTE FUNCTION advance_execution_intent_purge_boundary('${value.id}')`);
+
+    const first = await purgeExpiredFoundationData(pool);
+    assert.deepEqual([
+      first.executionIntentTransitions, first.executionAttempts, first.executionIntents,
+    ], [0, 0, 0]);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intents WHERE id = $1', [value.id],
+    )).rows[0]?.count, 1);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_attempts WHERE intent_id = $1', [value.id],
+    )).rows[0]?.count, 1);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_transitions WHERE intent_id = $1',
+      [value.id],
+    )).rows[0]?.count, 1);
+
+    await pool.query('DROP TRIGGER advance_execution_intent_purge_boundary ON execution_intent_transitions');
+    const second = await purgeExpiredFoundationData(pool);
+    assert.deepEqual([
+      second.executionIntentTransitions, second.executionAttempts, second.executionIntents,
+    ], [1, 1, 1]);
+  });
+});
+
+void test('aggregates purge, rollback, and release failures and evicts the client', async () => {
+  const primaryFailure = new Error('secret primary purge failure');
+  const rollbackFailure = new Error('secret rollback failure');
+  const releaseFailure = new Error('secret release failure');
+  const releaseArguments: unknown[] = [];
+  const client = {
+    query: async (sql: string): Promise<{ readonly rowCount: number; readonly rows: readonly [] }> => {
+      if (sql === 'BEGIN') return { rowCount: 0, rows: [] };
+      if (sql === 'ROLLBACK') throw rollbackFailure;
+      throw primaryFailure;
+    },
+    release: (destroy?: unknown): void => {
+      releaseArguments.push(destroy);
+      throw releaseFailure;
+    },
+  };
+  const pool = { connect: async () => client };
+
+  await assert.rejects(
+    purgeExpiredFoundationData(pool as never),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.message, 'Foundation data purge and cleanup failed.');
+      assert.deepEqual(error.errors, [primaryFailure, rollbackFailure, releaseFailure]);
+      assert.doesNotMatch(error.message, /secret/u);
+      return true;
+    },
+  );
+  assert.deepEqual(releaseArguments, [true]);
+});
+
 function draft(
   logicalCommandId: string,
   side: 'BUY' | 'SELL',

@@ -177,6 +177,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly tokenLaunches: number;
 }> {
   const client = await pool.connect();
+  let failureCleanupHandled = false;
   try {
     await client.query('BEGIN');
     await client.query(PAPER_MVP_RETENTION_FENCE_SQL);
@@ -394,30 +395,44 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
              AND position.opened_at BETWEEN run.started_at AND run.deadline_at
          )`,
     );
-    const executionIntentTransitions = await client.query(
-      `DELETE FROM execution_intent_transitions transition
-       USING execution_intents intent
-       WHERE transition.intent_id = intent.id
-         AND intent.status IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
-         AND intent.terminal_at IS NOT NULL
-         AND intent.reconciliation_completed_at IS NOT NULL
-         AND intent.purge_after <= statement_timestamp()`,
+    const executionIntentCutoffResult = await client.query<{ readonly purge_cutoff: Date }>(
+      'SELECT statement_timestamp() AS purge_cutoff',
     );
-    const executionAttempts = await client.query(
-      `DELETE FROM execution_attempts attempt
-       USING execution_intents intent
-       WHERE attempt.intent_id = intent.id
-         AND intent.status IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
-         AND intent.terminal_at IS NOT NULL
-         AND intent.reconciliation_completed_at IS NOT NULL
-         AND intent.purge_after <= statement_timestamp()`,
-    );
-    const executionIntents = await client.query(
-      `DELETE FROM execution_intents intent
+    const executionIntentCutoff = executionIntentCutoffResult.rows[0]?.purge_cutoff;
+    if (!(executionIntentCutoff instanceof Date)
+      || !Number.isFinite(executionIntentCutoff.getTime())) {
+      throw new Error('PostgreSQL returned an invalid execution intent purge cutoff.');
+    }
+    const executionIntentCohort = await client.query<{ readonly id: string }>(
+      `SELECT intent.id
+       FROM execution_intents intent
        WHERE intent.status IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
          AND intent.terminal_at IS NOT NULL
          AND intent.reconciliation_completed_at IS NOT NULL
-         AND intent.purge_after <= statement_timestamp()`,
+         AND intent.purge_after <= $1::TIMESTAMPTZ
+       ORDER BY intent.id
+       FOR UPDATE OF intent`,
+      [executionIntentCutoff],
+    );
+    const executionIntentIds = executionIntentCohort.rows.map(({ id }) => id);
+    const executionIntentTransitions = await client.query(
+      `DELETE FROM execution_intent_transitions transition
+       WHERE transition.intent_id = ANY($1::TEXT[])`,
+      [executionIntentIds],
+    );
+    const executionAttempts = await client.query(
+      `DELETE FROM execution_attempts attempt
+       WHERE attempt.intent_id = ANY($1::TEXT[])`,
+      [executionIntentIds],
+    );
+    const executionIntents = await client.query(
+      `DELETE FROM execution_intents intent
+       WHERE intent.id = ANY($1::TEXT[])
+         AND intent.status IN ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED')
+         AND intent.terminal_at IS NOT NULL
+         AND intent.reconciliation_completed_at IS NOT NULL
+         AND intent.purge_after <= $2::TIMESTAMPTZ`,
+      [executionIntentIds, executionIntentCutoff],
     );
     const transitions = await client.query(
       'DELETE FROM state_transitions WHERE purge_after <= NOW()',
@@ -750,11 +765,31 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       rawChainEvents: rawEvents.rowCount ?? 0,
       tokenLaunches: launches.rowCount ?? 0,
     };
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
+  } catch (primaryFailure) {
+    const cleanupFailures: unknown[] = [];
+    let mustEvictClient = false;
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackFailure) {
+      cleanupFailures.push(rollbackFailure);
+      mustEvictClient = true;
+    }
+    failureCleanupHandled = true;
+    try {
+      if (mustEvictClient) client.release(true);
+      else client.release();
+    } catch (releaseFailure) {
+      cleanupFailures.push(releaseFailure);
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [primaryFailure, ...cleanupFailures],
+        'Foundation data purge and cleanup failed.',
+      );
+    }
+    throw primaryFailure;
   } finally {
-    client.release();
+    if (!failureCleanupHandled) client.release();
   }
 }
 
