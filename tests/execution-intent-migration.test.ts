@@ -18,6 +18,12 @@ void test('execution intent migration defines the inert durable ledger contract'
   assert.match(executableSql, /CREATE TABLE IF NOT EXISTS execution_attempts/u);
   assert.match(executableSql, /CREATE TABLE IF NOT EXISTS execution_intent_transitions/u);
   assert.match(executableSql, /UNIQUE\s*\(logical_order_key\)/u);
+  assert.match(executableSql, /state_revision BIGINT NOT NULL DEFAULT 0/u);
+  assert.match(executableSql, /execution_intents_state_revision_check CHECK \(state_revision >= 0\)/u);
+  assert.match(
+    executableSql,
+    /CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_one_started_idx\s+ON execution_attempts \(intent_id\)\s+WHERE status = 'STARTED'/u,
+  );
   assert.doesNotMatch(executableSql, paperTableReference);
   for (const amountColumn of ['quote_amount_raw', 'base_amount_raw', 'minimum_amount_out_raw']) {
     assert.match(
@@ -281,6 +287,7 @@ type IntentRow = Readonly<{
   readonly expiresAtMs: TimestampInput;
   readonly status: string;
   readonly attemptCount: number;
+  readonly stateRevision: bigint;
   readonly leaseOwner: string | null;
   readonly leaseToken: string | null;
   readonly leaseExpiresAtMs: TimestampInput;
@@ -297,7 +304,7 @@ function intentRow(draftValue: ReturnType<typeof draft>, overrides: Partial<Inte
     baseAmountRaw: draftValue.baseAmountRaw?.toString() ?? null,
     minimumAmountOutRaw: draftValue.minimumAmountOutRaw.toString(),
     requestedAtMs: draftValue.requestedAtMs, expiresAtMs: draftValue.expiresAtMs,
-    status: 'PENDING', attemptCount: 0, leaseOwner: null, leaseToken: null,
+    status: 'PENDING', attemptCount: 0, stateRevision: 0n, leaseOwner: null, leaseToken: null,
     leaseExpiresAtMs: null, lastReasonCode: null, terminalAtMs: null,
     reconciliationCompletedAtMs: null, purgeAfterMs: null, ...overrides,
   };
@@ -310,19 +317,19 @@ async function insertIntent(pool: InstanceType<typeof pg.Pool>, row: IntentRow):
     logical_command_id, mint, side, venue_policy, quote_mint, quote_token_program,
     quote_decimals, quote_amount_raw, base_amount_raw, minimum_amount_out_raw,
     decision_event_id, decision_fingerprint, requested_at, expires_at, status,
-    attempt_count, lease_owner, lease_token, lease_expires_at, last_reason_code,
+    attempt_count, state_revision, lease_owner, lease_token, lease_expires_at, last_reason_code,
     terminal_at, reconciliation_completed_at, purge_after
   ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    $16, $17, $18, $19, $20, $21, $22, $23, $24::UUID, $25, $26, $27, $28, $29
+    $16, $17, $18, $19, $20, $21, $22, $23, $24, $25::UUID, $26, $27, $28, $29, $30
   )`, [
     value.id, value.payloadVersion, value.logicalOrderKey, value.strategyId, value.strategyVersion,
     value.positionId, value.logicalCommandId, value.mint, value.side, value.venuePolicy,
     value.quoteMint, value.quoteTokenProgram, value.quoteDecimals, row.quoteAmountRaw,
     row.baseAmountRaw, row.minimumAmountOutRaw, value.decisionEventId, value.decisionFingerprint,
     timestampParameter(row.requestedAtMs), timestampParameter(row.expiresAtMs), row.status,
-    row.attemptCount, row.leaseOwner, row.leaseToken, timestampParameter(row.leaseExpiresAtMs),
-    row.lastReasonCode, timestampParameter(row.terminalAtMs),
+    row.attemptCount, row.stateRevision.toString(), row.leaseOwner, row.leaseToken,
+    timestampParameter(row.leaseExpiresAtMs), row.lastReasonCode, timestampParameter(row.terminalAtMs),
     timestampParameter(row.reconciliationCompletedAtMs), timestampParameter(row.purgeAfterMs),
   ]);
 }
@@ -381,7 +388,7 @@ async function readIntentRow(
     decision_event_id, decision_fingerprint,
     (EXTRACT(EPOCH FROM requested_at) * 1000)::TEXT AS requested_at_ms,
     (EXTRACT(EPOCH FROM expires_at) * 1000)::TEXT AS expires_at_ms,
-    status, attempt_count, last_reason_code,
+    status, attempt_count, state_revision::TEXT AS state_revision, last_reason_code,
     (EXTRACT(EPOCH FROM terminal_at) * 1000)::TEXT AS terminal_at_ms,
     (EXTRACT(EPOCH FROM reconciliation_completed_at) * 1000)::TEXT AS reconciliation_completed_at_ms,
     (EXTRACT(EPOCH FROM purge_after) * 1000)::TEXT AS purge_after_ms,
@@ -406,6 +413,7 @@ function intentFromRow(row: Record<string, unknown> | undefined): object {
     decisionEventId: text(row.decision_event_id), decisionFingerprint: text(row.decision_fingerprint),
     requestedAtMs: integer(row.requested_at_ms), expiresAtMs: integer(row.expires_at_ms),
     status: text(row.status), attemptCount: integer(row.attempt_count),
+    stateRevision: BigInt(text(row.state_revision)),
     lastReasonCode: row.last_reason_code, terminalAtMs: nullableTimestamp(row.terminal_at_ms),
     reconciliationCompletedAtMs: nullableTimestamp(row.reconciliation_completed_at_ms),
     purgeAfterMs: nullableTimestamp(row.purge_after_ms),
@@ -433,6 +441,7 @@ async function assertCatalogContract(pool: InstanceType<typeof pg.Pool>): Promis
       'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint', 'quote_token_program',
       'quote_decimals', 'quote_amount_raw', 'base_amount_raw', 'minimum_amount_out_raw',
       'decision_event_id', 'decision_fingerprint', 'requested_at', 'expires_at', 'status', 'attempt_count',
+      'state_revision',
       'lease_owner', 'lease_token', 'lease_expires_at', 'last_reason_code', 'terminal_at',
       'reconciliation_completed_at', 'created_at', 'updated_at', 'purge_after',
     ].map((column_name) => ({ table_name, column_name }))),
@@ -451,6 +460,11 @@ async function assertCatalogContract(pool: InstanceType<typeof pg.Pool>): Promis
     { source: 'execution_attempts', target: 'execution_intents', delete_type: 'c' },
     { source: 'execution_intent_transitions', target: 'execution_intents', delete_type: 'c' },
   ]);
+  const indexes = await pool.query<{ readonly indexname: string; readonly indexdef: string }>(`SELECT
+    indexname, indexdef FROM pg_indexes
+    WHERE schemaname = current_schema() AND indexname = 'execution_attempts_one_started_idx'`);
+  assert.equal(indexes.rows.length, 1);
+  assert.match(indexes.rows[0]?.indexdef ?? '', /UNIQUE INDEX .* \(intent_id\) WHERE \(status = 'STARTED'::text\)$/u);
 }
 
 function text(value: unknown): string {

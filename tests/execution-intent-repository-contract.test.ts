@@ -69,6 +69,7 @@ type ActualFinishAttemptInput = Parameters<ExecutionIntentRepository['finishAtte
 
 /* eslint-disable @typescript-eslint/no-duplicate-type-constituents */
 type ExactSurfaceAssertions = AssertAll<{
+  persistedRevision: Expect<Equal<ExecutionIntentV1['stateRevision'], bigint>>;
   repositoryKeys: Expect<Equal<keyof ExecutionIntentRepository, 'create' | 'claim' | 'beginAttempt' | 'finishAttempt' | 'renew' | 'release' | 'transition' | 'expirePreSubmission' | 'read'>>;
   create: Expect<Equal<ExecutionIntentRepository['create'], (draft: ExecutionIntentDraftV1) => Promise<CreateResult>>>;
   claim: Expect<Equal<ExecutionIntentRepository['claim'], (options: ClaimOptions) => Promise<ClaimedExecutionIntent | null>>>;
@@ -264,6 +265,7 @@ class StrictFakeExecutionIntentRepository implements ExecutionIntentRepository {
   public async create(draft: ExecutionIntentDraftV1): Promise<CreateResult> {
     this.intent = Object.freeze({
       ...draft, status: 'PENDING', attemptCount: 0, lastReasonCode: null, terminalAtMs: null,
+      stateRevision: 0n,
       reconciliationCompletedAtMs: null, purgeAfterMs: null, createdAtMs: 1, updatedAtMs: 1,
     });
     return Object.freeze({ kind: 'CREATED', intent: this.intent });

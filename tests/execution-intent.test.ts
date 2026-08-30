@@ -17,6 +17,7 @@ const REQUESTED_AT_MS = 1_787_990_400_000;
 const EXPIRES_AT_MS = 1_787_990_445_000;
 const DATE_MAX_MS = 8_640_000_000_000_000;
 const INT32_MAX = 2_147_483_647;
+const INT64_MAX = 9_223_372_036_854_775_807n;
 const U64_MAX = 18_446_744_073_709_551_615n;
 
 void test('creates one frozen deterministic BUY intent using bigint amounts', () => {
@@ -110,6 +111,7 @@ void test('accepts PostgreSQL integer and Date bounds but rejects one past each 
     ...maxDraft,
     status: 'PROCESSING',
     attemptCount: INT32_MAX,
+    stateRevision: INT64_MAX,
     createdAtMs: DATE_MAX_MS,
     updatedAtMs: DATE_MAX_MS,
   });
@@ -117,6 +119,7 @@ void test('accepts PostgreSQL integer and Date bounds but rejects one past each 
   assert.equal(maxDraft.strategyVersion, INT32_MAX);
   assert.equal(maxDraft.expiresAtMs, DATE_MAX_MS);
   assert.equal(maxRecord.attemptCount, INT32_MAX);
+  assert.equal(maxRecord.stateRevision, INT64_MAX);
   assert.doesNotThrow(() => { assertExecutionIntent(maxRecord); });
   assertValidationFailure(() => createExecutionIntentDraft(validInput({ strategyVersion: INT32_MAX + 1 })));
   assertValidationFailure(() => createExecutionIntentDraft(validInput({
@@ -126,6 +129,9 @@ void test('accepts PostgreSQL integer and Date bounds but rejects one past each 
   assertValidationFailure(() => {
     assertExecutionIntent(validRecord({ status: 'PROCESSING', attemptCount: INT32_MAX + 1 }));
   });
+  for (const stateRevision of [-1n, INT64_MAX + 1n, 0]) {
+    assertValidationFailure(() => { assertExecutionIntent(validRecord({ stateRevision })); });
+  }
   const terminalRecord = validRecord({
     status: 'SUCCEEDED',
     attemptCount: 1,
@@ -173,6 +179,7 @@ void test('asserts only immutable exact repository records', () => {
     ...draft,
     status: 'PENDING' as const,
     attemptCount: 0,
+    stateRevision: 0n,
     lastReasonCode: null,
     terminalAtMs: null,
     reconciliationCompletedAtMs: null,
@@ -285,6 +292,7 @@ function validRecord(overrides: Readonly<Record<string, unknown>> = {}): Executi
     ...draft,
     status: 'PENDING',
     attemptCount: 0,
+    stateRevision: 0n,
     lastReasonCode: null,
     terminalAtMs: null,
     reconciliationCompletedAtMs: null,

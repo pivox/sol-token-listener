@@ -84,6 +84,7 @@ export interface ExecutionIntentDraftV1 {
 export interface ExecutionIntentV1 extends ExecutionIntentDraftV1 {
   readonly status: ExecutionIntentStatus;
   readonly attemptCount: number;
+  readonly stateRevision: bigint;
   readonly lastReasonCode: ExecutionIntentReasonCode | null;
   readonly terminalAtMs: number | null;
   readonly reconciliationCompletedAtMs: number | null;
@@ -101,6 +102,7 @@ export class ExecutionIntentValidationError extends TypeError {
 
 const EXECUTION_INTENT_PAYLOAD_VERSION = 1 as const;
 const INT32_MAX = 2_147_483_647;
+const INT64_MAX = 9_223_372_036_854_775_807n;
 const DATE_MAX_MS = 8_640_000_000_000_000;
 const U64_MAX = 18_446_744_073_709_551_615n;
 const RETENTION_MS = 14_400_000;
@@ -137,6 +139,7 @@ const INTENT_KEYS = Object.freeze([
   ...DRAFT_KEYS,
   'status',
   'attemptCount',
+  'stateRevision',
   'lastReasonCode',
   'terminalAtMs',
   'reconciliationCompletedAtMs',
@@ -235,6 +238,7 @@ function intentFrom(value: unknown, requireFrozen: boolean): ExecutionIntentV1 {
   const draft = draftFrom(Object.freeze(pick(record, DRAFT_KEYS)), requireFrozen);
   const status = statusFrom(record.status);
   const attemptCount = nonNegativeIntegerFrom(record.attemptCount);
+  const stateRevision = stateRevisionFrom(record.stateRevision);
   const lastReasonCode = nullableReasonCodeFrom(record.lastReasonCode);
   const terminalAtMs = nullableTimestampFrom(record.terminalAtMs);
   const reconciliationCompletedAtMs = nullableTimestampFrom(record.reconciliationCompletedAtMs);
@@ -259,6 +263,7 @@ function intentFrom(value: unknown, requireFrozen: boolean): ExecutionIntentV1 {
     ...draft,
     status,
     attemptCount,
+    stateRevision,
     lastReasonCode,
     terminalAtMs,
     reconciliationCompletedAtMs,
@@ -447,6 +452,11 @@ function nullableTimestampFrom(value: unknown): number | null {
 function nullableU64From(value: unknown): bigint | null {
   if (value === null) return null;
   return positiveU64From(value);
+}
+
+function stateRevisionFrom(value: unknown): bigint {
+  if (typeof value !== 'bigint' || value < 0n || value > INT64_MAX) throw invalid();
+  return value;
 }
 
 function positiveU64From(value: unknown): bigint {

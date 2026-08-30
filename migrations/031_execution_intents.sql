@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS execution_intents (
   expires_at TIMESTAMPTZ NOT NULL,
   status TEXT NOT NULL,
   attempt_count INTEGER NOT NULL DEFAULT 0,
+  state_revision BIGINT NOT NULL DEFAULT 0,
   lease_owner TEXT,
   lease_token UUID,
   lease_expires_at TIMESTAMPTZ,
@@ -96,6 +97,7 @@ CREATE TABLE IF NOT EXISTS execution_intents (
     'CANCELLED', 'UNKNOWN_REQUIRES_RECONCILIATION'
   )),
   CONSTRAINT execution_intents_attempt_count_check CHECK (attempt_count >= 0),
+  CONSTRAINT execution_intents_state_revision_check CHECK (state_revision >= 0),
   CONSTRAINT execution_intents_reason_check CHECK (
     last_reason_code IS NULL OR last_reason_code IN (
       'INTENT_EXPIRED', 'INTENT_DUPLICATE', 'INTENT_LEASE_LOST',
@@ -347,3 +349,7 @@ CREATE TABLE IF NOT EXISTS execution_intent_transitions (
 CREATE INDEX IF NOT EXISTS execution_intents_claim_idx
   ON execution_intents (requested_at, id)
   WHERE status = 'PENDING';
+
+CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_one_started_idx
+  ON execution_attempts (intent_id)
+  WHERE status = 'STARTED';
