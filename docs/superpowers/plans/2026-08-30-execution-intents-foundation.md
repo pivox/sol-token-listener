@@ -401,7 +401,7 @@ export interface ExecutionIntentRepository {
     claim: ClaimedExecutionIntent,
     input: ExecutionIntentTransitionInput,
   ): Promise<ExecutionIntentV1>;
-  expirePending(limit: number): Promise<number>;
+  expirePreSubmission(limit: number): Promise<number>;
   read(intentId: string): Promise<ExecutionIntentV1 | null>;
 }
 ```
@@ -444,7 +444,9 @@ Avec un faux pool/client, couvrir :
 - `beginAttempt` incrémente le parent et insère la tentative atomiquement ;
 - `finishAttempt` fait un CAS unique `STARTED -> COMPLETED|ABANDONED` sous le
   même fencing ; un second appel divergent est refusé ;
-- `expirePending` journalise `PENDING|RETRY_READY -> EXPIRED` sans claim ;
+- `expirePreSubmission` journalise
+  `PENDING|RETRY_READY|PROCESSING|SIMULATED -> EXPIRED` sans claim, uniquement
+  avec lease absent/expiré et preuve qu'aucune signature n'existe ;
 - CAS à zéro ligne → `INTENT_LEASE_LOST` ;
 - transition et journal append-only sont dans la même transaction ;
 - rollback/release sont exécutés et les erreurs internes ne sont pas divulguées.
@@ -513,10 +515,12 @@ ligne.
 `attempt_count + 1`, insère `(intent_id, attempt_number)` puis met à jour le
 parent dans la même transaction. `finishAttempt` verrouille parent et tentative,
 vérifie lease/token/numéro, puis fixe une seule fois état terminal, venue,
-provider, date et reason code. `expirePending(limit)` verrouille un lot borné
-de lignes expirées `PENDING|RETRY_READY`, écrit une transition
-`INTENT_EXPIRED`, fixe `terminal_at` et `reconciliation_completed_at` au temps
-DB — aucune tentative n'a alors pu produire d'effet — puis fixe
+provider, date et reason code. `expirePreSubmission(limit)` verrouille un lot
+borné de lignes expirées `PENDING|RETRY_READY|PROCESSING|SIMULATED` dont le
+lease est absent/expiré et qui n'ont aucune tentative signée, écrit une
+transition `INTENT_EXPIRED`, fixe `terminal_at` et
+`reconciliation_completed_at` au temps DB — aucune tentative n'a alors pu
+produire d'effet — puis fixe
 `purge_after = reconciliation_completed_at + INTERVAL '4 hours'`.
 
 - [ ] **Step 5: Vérifier GREEN**

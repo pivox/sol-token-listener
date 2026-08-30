@@ -277,7 +277,7 @@ Transitions principales :
 PENDING -> PROCESSING | EXPIRED | CANCELLED
 RETRY_READY -> PROCESSING | EXPIRED | CANCELLED
 PROCESSING -> SIMULATED | FAILED | EXPIRED | CANCELLED
-SIMULATED -> SUCCEEDED                         dry-run
+SIMULATED -> SUCCEEDED | FAILED | EXPIRED | CANCELLED    dry-run/pré-signature
 SIMULATED -> SIGNED_NOT_SUBMITTED              live seulement
 SIGNED_NOT_SUBMITTED -> SUBMITTED
 SIGNED_NOT_SUBMITTED -> UNKNOWN_REQUIRES_RECONCILIATION
@@ -307,8 +307,10 @@ présents ou absents ensemble, aucun état terminal ne peut en porter, et un
 worker conserve le même lease lorsqu'il traverse plusieurs états non terminaux.
 Le propriétaire, la génération et l'expiration sont contrôlés par CAS pour
 empêcher un worker périmé de muter l'intention. Les claims de travail normal,
-de confirmation et de réconciliation ont des sélections explicites ; une ligne
-`PENDING` expirée est sweepée atomiquement vers `EXPIRED` avec sa transition.
+de confirmation et de réconciliation ont des sélections explicites. Toute
+ligne pré-signature `PENDING`, `RETRY_READY`, `PROCESSING` ou `SIMULATED`
+expirée, sans lease frais, est sweepée atomiquement vers `EXPIRED` avec sa
+transition et la preuve qu'aucune signature n'a pu exister.
 
 Un claim ne constitue pas une tentative d'exécution. `attempt_count` est
 incrémenté seulement lorsque l'exécuteur crée atomiquement une ligne append-only
@@ -403,10 +405,12 @@ Cette phase ne charge aucun keypair et ne peut appeler aucune méthode d'envoi.
 En live, l'exécuteur signe localement, persiste avant envoi la signature, le
 hash du message, le blockhash, sa dernière hauteur valide et les bytes exacts,
 puis simule une dernière fois cette transaction exacte avec vérification des
-signatures. Il revérifie immédiatement avant envoi l'armement, les kill
-switches, le quota, l'exposition, la quote et l'expiration, puis soumet les
-bytes persistés. Une erreur entre signature et confirmation devient ambiguë
-par défaut.
+signatures. Immédiatement avant envoi, un BUY revérifie son armement d'entrée ;
+un SELL revérifie à la place l'autorisation de sortie durable de sa position.
+Les deux revérifient `HARD_STOP`, wallet, cluster, quota, exposition, quote et
+expiration applicables, puis soumettent les bytes persistés. `ENTRY_STOP` et
+l'expiration de l'armement d'entrée ne bloquent donc pas un SELL autorisé. Une
+erreur entre signature et confirmation devient ambiguë par défaut.
 
 La confirmation ne suffit pas à fermer l'intention. La réconciliation compare
 les balances réelles du wallet, les comptes token, la signature, les frais et
