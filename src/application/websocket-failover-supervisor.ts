@@ -131,6 +131,7 @@ type ProviderAttemptResult =
 const REJECTED_SESSION_COMPLETION_REASON: WsProgramSessionCompletionReason = 'PROTOCOL_INVALID';
 
 interface ValidatedReporter {
+  state: PersistentWebSocketHealthReporter['state'];
   startTouch(snapshot: WebSocketHealthSnapshot): void;
   transition: PersistentWebSocketHealthReporter['transition'];
   observe: PersistentWebSocketHealthReporter['observe'];
@@ -176,6 +177,7 @@ export class WebSocketFailoverSupervisor {
   #pendingRecoveryReason: WebSocketRecoveryReasonCode = 'STARTUP';
   #unrecoverable = false;
   #recoveryRequested = false;
+  #reporterFailureObserved = false;
   #activeFailurePromise: Promise<void> | null = null;
   #terminalCleanupPromise: Promise<void> | null = null;
   #transitionActive = false;
@@ -209,11 +211,45 @@ export class WebSocketFailoverSupervisor {
   }
 
   public state(): ListenerRuntimeState {
+    this.#reconcileReporterFailure();
     return this.#currentState;
   }
 
   public activeProviderId(): RpcProviderId | null {
+    this.#reconcileReporterFailure();
     return this.#currentProviderId;
+  }
+
+  #reconcileReporterFailure(): void {
+    if (this.#permanentlyClosed
+      || this.#currentState === 'STOPPING'
+      || this.#currentState === 'STOPPED') return;
+    let reporterDegraded = true;
+    try {
+      reporterDegraded = this.#dependencies.reporter.state() === 'DEGRADED';
+    } catch {
+      // An unreadable reporter is not safe evidence for publication.
+    }
+    if (!reporterDegraded) {
+      this.#reporterFailureObserved = false;
+      return;
+    }
+    this.#cancelPeriodicFrontier();
+    this.#currentProviderId = null;
+    try {
+      const selectedProviderId = this.#dependencies.promoted.activeProviderId();
+      if (selectedProviderId !== null) this.#dependencies.promoted.clear(selectedProviderId);
+    } catch {
+      // The local readiness fence remains authoritative.
+    }
+    this.#currentState = 'DEGRADED';
+    if (this.#reporterFailureObserved) return;
+    this.#reporterFailureObserved = true;
+    try {
+      this.#requestRecovery('SESSION_FAILURE');
+    } catch {
+      // Public readiness observation never exposes dependency failures.
+    }
   }
 
   async #performStart(): Promise<void> {
@@ -231,12 +267,10 @@ export class WebSocketFailoverSupervisor {
       this.#currentState = 'DEGRADED';
       throw new WebSocketFailoverSupervisorError('owner');
     }
-    this.#assertStartupOpen();
     this.#snapshot = snapshot;
     try {
-      this.#assertStartupOpen();
-      this.#dependencies.reporter.startTouch(snapshot);
       this.#touchStarted = true;
+      this.#dependencies.reporter.startTouch(snapshot);
       this.#assertStartupOpen();
       const waiting = await this.#transitionToWaiting(snapshot);
       this.#assertStartupOpen();
@@ -360,6 +394,10 @@ export class WebSocketFailoverSupervisor {
     this.#pendingRecoveryReason = recoveryReason;
     await this.#persistCycleDegraded(recoveryReason, disconnectReason);
     if (this.#isPermanentlyClosed()) return;
+    this.#scheduleCycleRetry();
+  }
+
+  #scheduleCycleRetry(): void {
     const delay = equalJitterDelay(this.#failedCycleCount, this.#options.random());
     this.#failedCycleCount += 1;
     this.#scheduleRecovery(delay);
@@ -528,6 +566,7 @@ export class WebSocketFailoverSupervisor {
           recoveryStatus: 'RECOVERED',
           recoveryReasonCode: recoveryReason,
         });
+        this.#reporterFailureObserved = false;
       } catch (error) {
         this.#currentState = 'DEGRADED';
         const cleaned = await this.#cleanupCandidate(candidate);
@@ -980,7 +1019,19 @@ export class WebSocketFailoverSupervisor {
 
   #finishRecovery(operation: Promise<void>, failed: boolean): void {
     if (this.#loopPromise === operation) this.#loopPromise = null;
-    if (failed && !this.#permanentlyClosed) this.#currentState = 'DEGRADED';
+    if (failed && !this.#permanentlyClosed) {
+      this.#currentState = 'DEGRADED';
+      if (!this.#unrecoverable
+        && this.#loopHandle === null
+        && this.#loopPromise === null) {
+        try {
+          this.#scheduleCycleRetry();
+        } catch {
+          // A failed scheduler remains fail-closed without leaking its error.
+        }
+      }
+      return;
+    }
     if (this.#recoveryRequested
       && !this.#permanentlyClosed
       && !this.#unrecoverable
@@ -1226,6 +1277,10 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
     reporterValue,
     'startTouch',
   );
+  const reporterState = dataMethod<PersistentWebSocketHealthReporter['state']>(
+    reporterValue,
+    'state',
+  );
   const transition = dataMethod<PersistentWebSocketHealthReporter['transition']>(
     reporterValue,
     'transition',
@@ -1265,6 +1320,9 @@ function dependenciesFrom(value: unknown): ValidatedDependencies {
       },
     }),
     reporter: Object.freeze({
+      state() {
+        return Reflect.apply(reporterState, reporterValue, []);
+      },
       startTouch(snapshot: WebSocketHealthSnapshot): void {
         Reflect.apply(startTouch, reporterValue, [snapshot]);
       },

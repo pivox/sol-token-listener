@@ -343,6 +343,105 @@ void test('mixed or different frontier exhaustion remains degraded with one back
   }
 });
 
+void test('cycle-level degraded persistence rejection schedules one equal-jitter retry', async () => {
+  const fixture = supervisorFixture({
+    random: () => 0,
+    transitionFailure: 'DEGRADED',
+    sessionFactories: [
+      () => Promise.reject(new WsProgramSessionError('SETUP_TIMEOUT')),
+    ],
+  });
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.supervisor.activeProviderId(), null);
+  assert.equal(fixture.reporter.transitions.filter(({ phase }) => phase === 'DEGRADED').length, 1);
+  assert.equal(fixture.reporter.snapshots.some(({ phase }) => phase === 'UNRECOVERABLE'), false);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+  await fixture.supervisor.close();
+});
+
+void test('rejected equal-frontier terminal transition reopens recovery with one bounded retry', async () => {
+  const providerIds = Object.freeze(['primary', 'fallback-1'] as const);
+  const firstCycle = providerIds.map((providerId) => controlledSession(providerId));
+  const frontier = strictFrontier('rejected-terminal');
+  const fixture = supervisorFixture({
+    providerIds,
+    random: () => 0,
+    transitionFailure: 'UNRECOVERABLE',
+    sessionFactories: [
+      ...firstCycle.map(({ session }) => () => Promise.resolve(session)),
+      () => Promise.reject(new WsProgramSessionError('SETUP_TIMEOUT')),
+      () => Promise.reject(new WsProgramSessionError('REMOTE_CLOSE')),
+    ],
+  });
+  fixture.strictResults.push(
+    rejected(new StrictCatchUpWindowExceededError('primary', 'launchpad', frontier)),
+    rejected(new StrictCatchUpWindowExceededError('fallback-1', 'market', frontier)),
+  );
+
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.equal(fixture.reporter.snapshots.some(({ phase }) => phase === 'UNRECOVERABLE'), false);
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+  const opensBeforeRetry = fixture.openedAttempts.length;
+
+  fixture.scheduler.fireNext(500);
+  await flushLifecycle();
+  assert.equal(fixture.openedAttempts.length, opensBeforeRetry + providerIds.length);
+  assert.equal(fixture.reporter.snapshots.some(({ phase }) => phase === 'UNRECOVERABLE'), false);
+  await fixture.supervisor.close();
+});
+
+void test('cycle rejection keeps equal-jitter when incumbent concurrently requests recovery', async () => {
+  const incumbent = controlledSession('primary');
+  const candidate = controlledSession('primary');
+  const candidateScan = deferred<StrictCatchUpScanResult>();
+  const fixture = supervisorFixture({
+    random: () => 0,
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(candidate.session),
+    ],
+  });
+  fixture.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    rejected(new StrictCatchUpScannerError('source', 'primary', 'market', 'request')),
+    candidateScan.promise,
+  );
+  await fixture.supervisor.start();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(WEBSOCKET_FRONTIER_INTERVAL_MS);
+  await flushLifecycle();
+  fixture.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  incumbent.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+  fixture.reporter.transitionOverrides.set(
+    'DEGRADED',
+    rejected(new Error('Expected cycle-level persistence rejection.')),
+  );
+  candidateScan.reject(new StrictCatchUpScannerError(
+    'source',
+    'primary',
+    'launchpad',
+    'request',
+  ));
+  await flushLifecycle();
+
+  assert.equal(fixture.supervisor.state(), 'DEGRADED');
+  assert.deepEqual(fixture.scheduler.pendingDelays(), [500]);
+  await fixture.supervisor.close();
+});
+
 void test('window errors thrown by openSession are transient and never prove unrecoverable', async () => {
   const providerIds = Object.freeze(['primary', 'fallback-1'] as const);
   const frontier = strictFrontier('hostile-open');
@@ -505,6 +604,191 @@ void test('periodic frontier failure degrades once and coalesces one recovery lo
   assert.equal(incumbent.closeCalls(), 0);
   assert.deepEqual(fixture.scheduler.pendingDelays(), [0]);
   assert.equal(fixture.supervisor.state(), 'DEGRADED');
+});
+
+for (const failure of ['touch', 'scheduler'] as const) {
+  void test(`reporter ${failure} failure fails paper readiness closed and requests one recovery`, async () => {
+    const touch = deferred<undefined>();
+    const reporterScheduler = new ReporterScheduler(failure === 'scheduler' ? 2 : undefined);
+    const health = new DurableHealthRepository();
+    if (failure === 'touch') health.touchResults.push(touch.promise);
+    const incumbent = controlledSession('primary');
+    const base = supervisorFixture({
+      sessionFactories: [() => Promise.resolve(incumbent.session)],
+    });
+    base.strictResults.push(Promise.resolve(scanResult('primary')));
+    const reporter = new PersistentWebSocketHealthReporter(
+      { async enqueue() {} },
+      health,
+      {
+        touchIntervalMs: 5,
+        shutdownTimeoutMs: 20,
+        scheduler: Object.freeze({
+          schedule(callback: () => void, delayMs: number): unknown {
+            return reporterScheduler.schedule(callback, delayMs);
+          },
+          cancel(handle: unknown): void { reporterScheduler.cancel(handle); },
+        }),
+      },
+    );
+    const dependencies: WebSocketFailoverSupervisorDependencies = Object.freeze({
+      ...base.dependencies,
+      health,
+      reporter,
+    });
+    const supervisor = new WebSocketFailoverSupervisor(dependencies, base.options);
+    const paperReady = (): boolean => {
+      const selection = dependencies.promoted.selection();
+      return supervisor.state() === 'RUNNING'
+        && selection.providerId !== null;
+    };
+
+    await supervisor.start();
+    base.scheduler.fireNext(0);
+    await flushLifecycle();
+    assert.equal(paperReady(), true);
+    assert.equal(supervisor.activeProviderId(), 'primary');
+
+    reporterScheduler.fireNext(5);
+    if (failure === 'touch') touch.reject(new Error('secret heartbeat persistence failure'));
+    await flushLifecycle();
+    assert.equal(reporter.state(), 'DEGRADED');
+
+    let paperClaims = 0;
+    let paperMutations = 0;
+    if (paperReady()) {
+      paperClaims += 1;
+      paperMutations += 1;
+    }
+    assert.equal(paperClaims, 0);
+    assert.equal(paperMutations, 0);
+    assert.equal(supervisor.state(), 'DEGRADED');
+    assert.equal(supervisor.activeProviderId(), null);
+    assert.equal(dependencies.promoted.activeProviderId(), null);
+    assert.deepEqual(base.scheduler.pendingDelays(), [0]);
+
+    await supervisor.close();
+  });
+}
+
+void test('reporter failure clears publication while incumbent degradation is already pending', async () => {
+  const touch = deferred<undefined>();
+  const degradation = deferred<WebSocketHealthSnapshot>();
+  const reporterScheduler = new ReporterScheduler();
+  const health = new DurableHealthRepository();
+  health.touchResults.push(touch.promise);
+  const incumbent = controlledSession('primary');
+  const base = supervisorFixture({
+    sessionFactories: [() => Promise.resolve(incumbent.session)],
+  });
+  base.strictResults.push(Promise.resolve(scanResult('primary')));
+  const reporter = new PersistentWebSocketHealthReporter(
+    { async enqueue() {} },
+    health,
+    {
+      touchIntervalMs: 5,
+      shutdownTimeoutMs: 20,
+      scheduler: Object.freeze({
+        schedule(callback: () => void, delayMs: number): unknown {
+          return reporterScheduler.schedule(callback, delayMs);
+        },
+        cancel(handle: unknown): void { reporterScheduler.cancel(handle); },
+      }),
+    },
+  );
+  const dependencies: WebSocketFailoverSupervisorDependencies = Object.freeze({
+    ...base.dependencies,
+    health,
+    reporter,
+  });
+  const supervisor = new WebSocketFailoverSupervisor(dependencies, base.options);
+  await supervisor.start();
+  base.scheduler.fireNext(0);
+  await flushLifecycle();
+  health.transitionOverrides.set('DEGRADED', degradation.promise);
+
+  incumbent.completion.resolve(Object.freeze({ reason: 'REMOTE_CLOSE' }));
+  await flushLifecycle();
+  assert.equal(supervisor.state(), 'DEGRADED');
+  assert.equal(supervisor.activeProviderId(), 'primary');
+  reporterScheduler.fireNext(5);
+  touch.reject(new Error('secret heartbeat persistence failure'));
+  await flushLifecycle();
+
+  assert.equal(reporter.state(), 'DEGRADED');
+  assert.equal(supervisor.state(), 'DEGRADED');
+  assert.equal(supervisor.activeProviderId(), null);
+  assert.equal(dependencies.promoted.activeProviderId(), null);
+  assert.deepEqual(base.scheduler.pendingDelays(), [0]);
+  assert.equal(base.calls.filter((call) => call === 'scheduler.recovery:0').length, 2);
+
+  const degradationInput = health.transitions.at(-1);
+  assert.ok(degradationInput !== undefined);
+  degradation.resolve(snapshotFromTransition(degradationInput));
+  await flushLifecycle();
+  await supervisor.close();
+});
+
+void test('healthy internal promotion rearms one recovery for a later reporter failure', async () => {
+  const firstTouch = deferred<undefined>();
+  const secondTouch = deferred<undefined>();
+  const reporterScheduler = new ReporterScheduler();
+  const health = new DurableHealthRepository();
+  health.touchResults.push(firstTouch.promise, secondTouch.promise);
+  const incumbent = controlledSession('primary');
+  const replacement = controlledSession('primary');
+  const base = supervisorFixture({
+    sessionFactories: [
+      () => Promise.resolve(incumbent.session),
+      () => Promise.resolve(replacement.session),
+    ],
+  });
+  base.strictResults.push(
+    Promise.resolve(scanResult('primary')),
+    Promise.resolve(scanResult('primary')),
+  );
+  const reporter = new PersistentWebSocketHealthReporter(
+    { async enqueue() {} },
+    health,
+    {
+      touchIntervalMs: 5,
+      shutdownTimeoutMs: 20,
+      scheduler: Object.freeze({
+        schedule(callback: () => void, delayMs: number): unknown {
+          return reporterScheduler.schedule(callback, delayMs);
+        },
+        cancel(handle: unknown): void { reporterScheduler.cancel(handle); },
+      }),
+    },
+  );
+  const dependencies: WebSocketFailoverSupervisorDependencies = Object.freeze({
+    ...base.dependencies,
+    health,
+    reporter,
+  });
+  const supervisor = new WebSocketFailoverSupervisor(dependencies, base.options);
+  await supervisor.start();
+  base.scheduler.fireNext(0);
+  await flushLifecycle();
+
+  reporterScheduler.fireNext(5);
+  firstTouch.reject(new Error('secret first heartbeat persistence failure'));
+  await flushLifecycle();
+  assert.equal(supervisor.state(), 'DEGRADED');
+  assert.deepEqual(base.scheduler.pendingDelays(), [0]);
+  base.scheduler.fireNext(0);
+  await flushLifecycle();
+  assert.equal(reporter.state(), 'RUNNING');
+  assert.equal(dependencies.promoted.activeProviderId(), 'primary');
+
+  reporterScheduler.fireNext(5);
+  secondTouch.reject(new Error('secret second heartbeat persistence failure'));
+  await flushLifecycle();
+  assert.equal(supervisor.state(), 'DEGRADED');
+  assert.equal(supervisor.activeProviderId(), null);
+  assert.deepEqual(base.scheduler.pendingDelays(), [0]);
+
+  await supervisor.close();
 });
 
 void test('stale incumbent completion cannot degrade a replacement promoted after overlap', async () => {
@@ -1614,14 +1898,90 @@ void test('close waits for deferred owner acquisition and fences every later sta
   await closing;
 
   assert.equal(settledBeforeOwner, false);
-  assert.deepEqual(fixture.calls, ['health.beginOwner:primary']);
-  assert.equal(fixture.reporter.stopCalls, 0);
+  assert.deepEqual(fixture.calls, [
+    'health.beginOwner:primary',
+    'reporter.startTouch:1',
+    'reporter.stop',
+  ]);
+  assert.equal(fixture.reporter.stopCalls, 1);
   assert.equal(fixture.scheduler.pendingDelays().length, 0);
   assert.equal(fixture.scheduler.cancelledHandles.length, 0);
   assert.equal(fixture.supervisor.state(), 'STOPPED');
   assert.equal(fixture.supervisor.activeProviderId(), null);
   assertNoSolanaCall(fixture);
 });
+
+for (const lateOwnerCase of [
+  Object.freeze({
+    name: 'is durably stopped before close resolves',
+    stopFailure: false,
+    reporterScheduleFailure: undefined,
+  }),
+  Object.freeze({
+    name: 'rejects close when durable stop fails',
+    stopFailure: true,
+    reporterScheduleFailure: undefined,
+  }),
+  Object.freeze({
+    name: 'is durably stopped when initial reporter touch scheduling fails',
+    stopFailure: false,
+    reporterScheduleFailure: 1,
+  }),
+] as const) {
+  void test(`late owner commit ${lateOwnerCase.name}`, async () => {
+    const owner = deferred<WebSocketHealthSnapshot>();
+    const health = new DurableHealthRepository(
+      owner.promise,
+      lateOwnerCase.stopFailure ? 'STOPPED' : undefined,
+    );
+    const reporterScheduler = new ReporterScheduler(lateOwnerCase.reporterScheduleFailure);
+    const reporter = new PersistentWebSocketHealthReporter(
+      { async enqueue() {} },
+      health,
+      {
+        touchIntervalMs: 5,
+        shutdownTimeoutMs: 20,
+        scheduler: Object.freeze({
+          schedule(callback: () => void, delayMs: number): unknown {
+            return reporterScheduler.schedule(callback, delayMs);
+          },
+          cancel(handle: unknown): void { reporterScheduler.cancel(handle); },
+        }),
+      },
+    );
+    const base = supervisorFixture();
+    const dependencies: WebSocketFailoverSupervisorDependencies = Object.freeze({
+      ...base.dependencies,
+      health,
+      reporter,
+    });
+    const supervisor = new WebSocketFailoverSupervisor(dependencies, base.options);
+    const starting = supervisor.start();
+    const closing = supervisor.close();
+    let closeSettled = false;
+    void closing.then(
+      () => { closeSettled = true; },
+      () => { closeSettled = true; },
+    );
+    await flushLifecycle();
+    assert.equal(closeSettled, false);
+    assert.deepEqual(health.transitions, []);
+    assert.deepEqual(reporterScheduler.pendingDelays(), []);
+
+    owner.resolve(snapshot('CONNECTING', 1n));
+    await assertStage(starting, 'cleanup', 'never-leaked');
+    if (lateOwnerCase.stopFailure) await assertStage(closing, 'cleanup', 'never-leaked');
+    else await closing;
+
+    assert.deepEqual(health.transitions.map(({ phase }) => phase), ['STOPPING', 'STOPPED']);
+    assert.equal(supervisor.state(), lateOwnerCase.stopFailure ? 'DEGRADED' : 'STOPPED');
+    assert.equal(supervisor.activeProviderId(), null);
+    assert.deepEqual(reporterScheduler.pendingDelays(), []);
+    assert.deepEqual(base.scheduler.pendingDelays(), []);
+    assert.equal(base.openedAttempts.length, 0);
+    assert.equal(base.strictCalls.length, 0);
+  });
+}
 
 void test('close waits for deferred initial transition and stops touch without recovery effects', async () => {
   const waiting = deferred<WebSocketHealthSnapshot>();
@@ -2189,6 +2549,87 @@ interface ManualTask {
   readonly handle: object;
   cancelled: boolean;
   fired: boolean;
+}
+
+class ReporterScheduler implements WebSocketFailoverScheduler {
+  readonly #tasks: ManualTask[] = [];
+  #nextId = 0;
+  #scheduleCalls = 0;
+
+  public constructor(private readonly failOnScheduleCall?: number) {}
+
+  public schedule(callback: () => void, delayMs: number): unknown {
+    this.#scheduleCalls += 1;
+    if (this.#scheduleCalls === this.failOnScheduleCall) {
+      throw new Error('secret reporter scheduler failure');
+    }
+    const handle = Object.freeze({ id: ++this.#nextId });
+    this.#tasks.push({ callback, delayMs, handle, cancelled: false, fired: false });
+    return handle;
+  }
+
+  public cancel(handle: unknown): void {
+    const task = this.#tasks.find((value) => value.handle === handle);
+    if (task !== undefined) task.cancelled = true;
+  }
+
+  public fireNext(delayMs: number): void {
+    const task = this.#tasks.find(
+      (value) => value.delayMs === delayMs && !value.cancelled && !value.fired,
+    );
+    if (task === undefined) throw new Error('No matching reporter scheduler task.');
+    task.fired = true;
+    task.callback();
+  }
+
+  public pendingDelays(): number[] {
+    return this.#tasks
+      .filter((value) => !value.cancelled && !value.fired)
+      .map(({ delayMs }) => delayMs);
+  }
+}
+
+class DurableHealthRepository implements WebSocketHealthRepository {
+  public readonly transitions: WebSocketHealthTransition[] = [];
+  public readonly touchResults: Promise<void>[] = [];
+  public readonly transitionOverrides = new Map<
+    WebSocketHealthTransition['phase'],
+    Promise<WebSocketHealthSnapshot>
+  >();
+  #latest = snapshot('CONNECTING', 1n);
+
+  public constructor(
+    private readonly ownerResult: Promise<WebSocketHealthSnapshot> = Promise.resolve(
+      snapshot('CONNECTING', 1n),
+    ),
+    private readonly transitionFailure?: WebSocketHealthTransition['phase'],
+  ) {}
+
+  public read(): Promise<WebSocketHealthSnapshot> { return Promise.resolve(this.#latest); }
+
+  public beginOwner(): Promise<WebSocketHealthSnapshot> { return this.ownerResult; }
+
+  public transition(input: WebSocketHealthTransition): Promise<WebSocketHealthSnapshot> {
+    this.transitions.push(input);
+    if (input.phase === this.transitionFailure) {
+      return Promise.reject(new Error('secret durable stop failure'));
+    }
+    const override = this.transitionOverrides.get(input.phase);
+    if (override !== undefined) {
+      return override.then((value) => {
+        this.#latest = value;
+        return value;
+      });
+    }
+    this.#latest = snapshotFromTransition(input, this.#latest);
+    return Promise.resolve(this.#latest);
+  }
+
+  public touch(): Promise<void> {
+    return this.touchResults.shift() ?? Promise.resolve();
+  }
+
+  public recordObservation(): Promise<'RECORDED'> { return Promise.resolve('RECORDED'); }
 }
 
 class InertHealthRepository implements WebSocketHealthRepository {
