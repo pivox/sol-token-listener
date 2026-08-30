@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import {
   createExecutionIntentDraft,
@@ -24,6 +25,7 @@ export interface DeriveExecutionIntentInput {
   readonly quote: PaperExecutionQuote | null;
   readonly quoteMintAllowlist: readonly string[];
   readonly wsolMint: string;
+  readonly maximumQuoteAgeMs: number;
   readonly qualification: ExecutionIntentQualificationIdentity;
   readonly decisionEventId: string;
   readonly decisionFingerprint: string;
@@ -50,11 +52,19 @@ const INPUT_KEYS = Object.freeze([
   'quote',
   'quoteMintAllowlist',
   'wsolMint',
+  'maximumQuoteAgeMs',
   'qualification',
   'decisionEventId',
   'decisionFingerprint',
   'requestedAtMs',
   'expiresAtMs',
+] as const);
+
+const WRAPPED_SOL_MINT = 'So11111111111111111111111111111111111111112';
+const QUOTE_KEYS = Object.freeze([
+  'id', 'inputMint', 'outputMint', 'amountInRaw', 'amountOutRaw',
+  'minimumAmountOutRaw', 'feesRaw', 'slippageBps', 'priceImpactBps',
+  'observedAtMs', 'observedSlot',
 ] as const);
 
 export function deriveExecutionIntent(
@@ -68,7 +78,10 @@ export function deriveExecutionIntent(
 
   const allowlist = allowlistFrom(record.quoteMintAllowlist);
   const wsolMint = textFrom(record.wsolMint, 'QUOTE_MINT_NOT_ALLOWED');
-  if (allowlist.length !== 1 || allowlist[0] !== wsolMint) quoteMintNotAllowed();
+  if (wsolMint !== WRAPPED_SOL_MINT || allowlist[0] !== wsolMint) quoteMintNotAllowed();
+  const maximumQuoteAgeMs = boundedIntegerFrom(
+    record.maximumQuoteAgeMs, 0, Number.MAX_SAFE_INTEGER, 'QUOTE_STALE',
+  );
 
   const qualification = qualificationFrom(record.qualification);
   const decisionEventId = textFrom(record.decisionEventId, 'DECISION_STALE');
@@ -109,8 +122,15 @@ export function deriveExecutionIntent(
 
   const strategyId = textProperty(strategy, 'id', 'DECISION_STALE');
   const strategyVersion = positiveIntegerProperty(strategy, 'version', 'DECISION_STALE');
+  if (strategyId !== 'creation-entry-v1' || strategyVersion !== 1) staleDecision();
   assertStrategy(session, strategyId, strategyVersion);
   assertStrategy(position, strategyId, strategyVersion);
+  if (
+    ownValue(candidate, 'payloadVersion', 'DECISION_STALE') !== 1
+    || ownValue(session, 'payloadVersion', 'DECISION_STALE') !== 2
+    || ownValue(position, 'payloadVersion', 'DECISION_STALE') !== 1
+    || textProperty(session, 'actorKind', 'DECISION_STALE') !== 'PAPER_SIMULATION'
+  ) staleDecision();
 
   const candidateReportId = textProperty(candidate, 'qualificationReportId', 'QUALIFICATION_STALE');
   if (
@@ -118,16 +138,43 @@ export function deriveExecutionIntent(
     || textProperty(session, 'qualificationReportId', 'QUALIFICATION_STALE') !== candidateReportId
     || nullableTextProperty(position, 'qualificationReportId', 'QUALIFICATION_STALE') !== candidateReportId
   ) qualificationStale();
+  if (
+    !/^qreport_[a-f0-9]{64}$/u.test(candidateReportId)
+    || !/^evt_[a-f0-9]{64}$/u.test(qualification.eventId)
+    || textProperty(position, 'triggerEventId', 'DECISION_STALE') !== qualification.eventId
+    || !/^paper_trade_[a-f0-9]{64}$/u.test(
+      textProperty(position, 'entryTradeId', 'DECISION_STALE'),
+    )
+  ) staleDecision();
   const profile = modelProperty(candidate, 'qualificationProfile', 'QUALIFICATION_STALE');
   const asOf = modelProperty(candidate, 'asOf', 'QUALIFICATION_STALE');
+  const profileId = textProperty(profile, 'id', 'QUALIFICATION_STALE');
+  const profileVersion = positiveIntegerProperty(profile, 'version', 'QUALIFICATION_STALE');
+  const confirmationStatus = textProperty(asOf, 'confirmationStatus', 'QUALIFICATION_STALE');
+  const minimumConfirmation = textProperty(session, 'minimumConfirmation', 'DECISION_STALE');
   if (
     qualification.profileFingerprint
       !== fingerprintProperty(profile, 'fingerprint', 'QUALIFICATION_STALE')
     || qualification.evidenceFingerprint
       !== fingerprintProperty(candidate, 'evidenceFingerprint', 'QUALIFICATION_STALE')
     || qualification.eventId !== textProperty(asOf, 'eventId', 'QUALIFICATION_STALE')
-    || textProperty(asOf, 'confirmationStatus', 'QUALIFICATION_STALE') === 'orphaned'
+    || !confirmationReached(confirmationStatus, minimumConfirmation)
   ) qualificationStale();
+
+  assertCanonicalIds({
+    candidateId,
+    sessionId,
+    positionId,
+    mint,
+    strategyId,
+    strategyVersion,
+    profileId,
+    profileVersion,
+    profileFingerprint: qualification.profileFingerprint,
+    evidenceFingerprint: qualification.evidenceFingerprint,
+    qualificationEventId: qualification.eventId,
+    confirmationStatus,
+  });
 
   const quoteMint = textProperty(quoteAsset, 'mint', 'QUOTE_MINT_NOT_ALLOWED');
   if (quoteMint !== wsolMint || !allowlist.includes(quoteMint)) quoteMintNotAllowed();
@@ -136,8 +183,9 @@ export function deriveExecutionIntent(
   if (quoteTokenProgram !== 'SPL_TOKEN') quoteMintNotAllowed();
   assertSameQuoteAsset(session, quoteMint, quoteDecimals, quoteTokenProgram);
   assertSameQuoteAsset(position, quoteMint, quoteDecimals, quoteTokenProgram);
+  assertCandidateQuotePair(candidate, mint, quoteMint);
 
-  assertQuote(quote, requestedAtMs);
+  assertQuote(quote, requestedAtMs, maximumQuoteAgeMs);
   const amountInRaw = positiveBigintProperty(quote, 'amountInRaw', 'QUOTE_STALE');
   const minimumAmountOutRaw = positiveBigintProperty(quote, 'minimumAmountOutRaw', 'QUOTE_STALE');
   const logicalCommandId = requestedAction === 'OPEN'
@@ -146,6 +194,14 @@ export function deriveExecutionIntent(
 
   if (requestedAction === 'OPEN') {
     if (
+      textProperty(quote, 'inputMint', 'QUOTE_MINT_NOT_ALLOWED') !== quoteMint
+      || textProperty(quote, 'outputMint', 'QUOTE_MINT_NOT_ALLOWED') !== mint
+    ) quoteMintNotAllowed();
+    assertOpenLineage(
+      session, candidate, position, quote, qualification.eventId, decisionEventId,
+      sessionId, candidateId, strategyId, strategyVersion,
+    );
+    if (
       textProperty(candidate, 'state', 'DECISION_STALE') !== 'ELIGIBLE'
       || nullableTimestampProperty(candidate, 'eligibleUntilMs', 'DECISION_STALE') < expiresAtMs
       || textProperty(session, 'state', 'DECISION_STALE') !== 'WAITING_EXTERNAL_BUYS'
@@ -153,21 +209,21 @@ export function deriveExecutionIntent(
       || positiveBigintProperty(position, 'baseFilledRaw', 'DECISION_STALE')
         !== minimumAmountOutRaw
     ) staleDecision();
-    if (
-      textProperty(quote, 'inputMint', 'QUOTE_STALE') !== quoteMint
-      || textProperty(quote, 'outputMint', 'QUOTE_STALE') !== mint
-    ) quoteStale();
   } else {
+    if (
+      textProperty(quote, 'inputMint', 'QUOTE_MINT_NOT_ALLOWED') !== mint
+      || textProperty(quote, 'outputMint', 'QUOTE_MINT_NOT_ALLOWED') !== quoteMint
+    ) quoteMintNotAllowed();
+    assertCloseLineage(
+      session, candidate, position, quote, decisionEventId,
+      positionId, strategyId, strategyVersion,
+    );
     if (
       textProperty(session, 'state', 'DECISION_STALE') !== 'PAPER_CLOSED'
       || textProperty(position, 'status', 'DECISION_STALE') !== 'PAPER_CLOSED'
       || nonNegativeBigintProperty(position, 'remainingBaseRaw', 'DECISION_STALE') !== 0n
       || positiveBigintProperty(position, 'baseFilledRaw', 'DECISION_STALE') !== amountInRaw
     ) staleDecision();
-    if (
-      textProperty(quote, 'inputMint', 'QUOTE_STALE') !== mint
-      || textProperty(quote, 'outputMint', 'QUOTE_STALE') !== quoteMint
-    ) quoteStale();
   }
 
   try {
@@ -195,7 +251,23 @@ export function deriveExecutionIntent(
   }
 }
 
-function assertQuote(quote: PaperExecutionQuote, requestedAtMs: number): void {
+function assertQuote(
+  quote: PaperExecutionQuote,
+  requestedAtMs: number,
+  maximumQuoteAgeMs: number,
+): void {
+  assertQuoteShape(quote);
+  const observedAtMs = timestampProperty(quote, 'observedAtMs', 'QUOTE_STALE');
+  if (
+    observedAtMs > requestedAtMs
+    || requestedAtMs - observedAtMs > maximumQuoteAgeMs
+  ) quoteStale();
+}
+
+function assertQuoteShape(quote: object): void {
+  textProperty(quote, 'id', 'QUOTE_STALE');
+  textProperty(quote, 'inputMint', 'QUOTE_MINT_NOT_ALLOWED');
+  textProperty(quote, 'outputMint', 'QUOTE_MINT_NOT_ALLOWED');
   positiveBigintProperty(quote, 'amountInRaw', 'QUOTE_STALE');
   positiveBigintProperty(quote, 'amountOutRaw', 'QUOTE_STALE');
   const minimum = positiveBigintProperty(quote, 'minimumAmountOutRaw', 'QUOTE_STALE');
@@ -204,7 +276,167 @@ function assertQuote(quote: PaperExecutionQuote, requestedAtMs: number): void {
   boundedBigintProperty(quote, 'slippageBps', 0n, 10_000n, 'QUOTE_STALE');
   boundedBigintProperty(quote, 'priceImpactBps', 0n, 10_000n, 'QUOTE_STALE');
   nonNegativeBigintProperty(quote, 'observedSlot', 'QUOTE_STALE');
-  if (timestampProperty(quote, 'observedAtMs', 'QUOTE_STALE') > requestedAtMs) quoteStale();
+  timestampProperty(quote, 'observedAtMs', 'QUOTE_STALE');
+}
+
+function assertCandidateQuotePair(
+  candidate: TradingCandidateV1,
+  mint: string,
+  quoteMint: string,
+): void {
+  const buy = modelProperty(candidate, 'buyQuote', 'QUOTE_STALE');
+  const reverse = modelProperty(candidate, 'reverseSellQuote', 'QUOTE_STALE');
+  assertQuoteShape(buy);
+  assertQuoteShape(reverse);
+  if (
+    textProperty(buy, 'inputMint', 'QUOTE_MINT_NOT_ALLOWED') !== quoteMint
+    || textProperty(buy, 'outputMint', 'QUOTE_MINT_NOT_ALLOWED') !== mint
+    || textProperty(reverse, 'inputMint', 'QUOTE_MINT_NOT_ALLOWED') !== mint
+    || textProperty(reverse, 'outputMint', 'QUOTE_MINT_NOT_ALLOWED') !== quoteMint
+  ) quoteMintNotAllowed();
+  if (
+    positiveBigintProperty(reverse, 'amountInRaw', 'QUOTE_STALE')
+      !== positiveBigintProperty(buy, 'minimumAmountOutRaw', 'QUOTE_STALE')
+  ) quoteStale();
+}
+
+function assertOpenLineage(
+  session: PaperStrategySession,
+  candidate: TradingCandidateV1,
+  position: PaperPosition,
+  quote: PaperExecutionQuote,
+  qualificationEventId: string,
+  decisionEventId: string,
+  sessionId: string,
+  candidateId: string,
+  strategyId: string,
+  strategyVersion: number,
+): void {
+  const canonicalBuyQuote = modelProperty(candidate, 'buyQuote', 'QUOTE_STALE');
+  const sessionQuote = modelProperty(session, 'lastQuote', 'QUOTE_STALE');
+  if (!sameQuote(quote, canonicalBuyQuote) || !sameQuote(quote, sessionQuote)) quoteStale();
+  if (
+    decisionEventId !== qualificationEventId
+    || textProperty(position, 'triggerEventId', 'DECISION_STALE') !== qualificationEventId
+    || textProperty(session, 'openCommandId', 'DECISION_STALE')
+      !== strategyCommandId('paper_open', [
+        sessionId, candidateId, strategyId, String(strategyVersion),
+      ])
+    || nullableTextProperty(session, 'closeCommandId', 'DECISION_STALE') !== null
+    || nullableTextProperty(session, 'pendingExitReason', 'DECISION_STALE') !== null
+    // Strategy command IDs and execution snapshot hashes are deliberately distinct identities.
+    || !/^paper_open_command_[a-f0-9]{64}$/u.test(
+      textProperty(position, 'openCommandHash', 'DECISION_STALE'),
+    )
+    || nullableTextProperty(position, 'closeCommandHash', 'DECISION_STALE') !== null
+    || nullableTextProperty(position, 'closeEventId', 'DECISION_STALE') !== null
+    || nullableTextProperty(position, 'exitTradeId', 'DECISION_STALE') !== null
+    || nonNegativeBigintProperty(position, 'quoteCostRaw', 'DECISION_STALE')
+      !== positiveBigintProperty(quote, 'amountInRaw', 'QUOTE_STALE')
+    || nonNegativeBigintProperty(position, 'remainingBaseRaw', 'DECISION_STALE')
+      !== positiveBigintProperty(quote, 'minimumAmountOutRaw', 'QUOTE_STALE')
+    || nullableBigintProperty(position, 'quoteProceedsRaw', 'DECISION_STALE') !== null
+  ) staleDecision();
+}
+
+function assertCloseLineage(
+  session: PaperStrategySession,
+  candidate: TradingCandidateV1,
+  position: PaperPosition,
+  quote: PaperExecutionQuote,
+  decisionEventId: string,
+  positionId: string,
+  strategyId: string,
+  strategyVersion: number,
+): void {
+  const sessionQuote = modelProperty(session, 'lastQuote', 'QUOTE_STALE');
+  if (!sameQuote(quote, sessionQuote)) quoteStale();
+  const canonicalBuyQuote = modelProperty(candidate, 'buyQuote', 'QUOTE_STALE');
+  const pendingExitReason = textProperty(session, 'pendingExitReason', 'DECISION_STALE');
+  if (
+    textProperty(session, 'closeCommandId', 'DECISION_STALE')
+      !== strategyCommandId('paper_sell', [
+        positionId, strategyId, String(strategyVersion), pendingExitReason,
+      ])
+    || !/^paper_open_command_[a-f0-9]{64}$/u.test(
+      textProperty(position, 'openCommandHash', 'DECISION_STALE'),
+    )
+    || !/^paper_close_command_[a-f0-9]{64}$/u.test(
+      textProperty(position, 'closeCommandHash', 'DECISION_STALE'),
+    )
+    || textProperty(position, 'closeEventId', 'DECISION_STALE') !== decisionEventId
+    || !/^evt_[a-f0-9]{64}$/u.test(decisionEventId)
+    || !/^paper_trade_[a-f0-9]{64}$/u.test(
+      textProperty(position, 'exitTradeId', 'DECISION_STALE'),
+    )
+    || nonNegativeBigintProperty(position, 'quoteCostRaw', 'DECISION_STALE')
+      !== positiveBigintProperty(canonicalBuyQuote, 'amountInRaw', 'QUOTE_STALE')
+    || positiveBigintProperty(position, 'baseFilledRaw', 'DECISION_STALE')
+      !== positiveBigintProperty(canonicalBuyQuote, 'minimumAmountOutRaw', 'QUOTE_STALE')
+    || nullableBigintProperty(position, 'quoteProceedsRaw', 'DECISION_STALE')
+      !== positiveBigintProperty(quote, 'minimumAmountOutRaw', 'QUOTE_STALE')
+  ) staleDecision();
+}
+
+function sameQuote(left: object, right: object): boolean {
+  const leftRecord = frozenDataRecord(left, QUOTE_KEYS, 'QUOTE_STALE');
+  const rightRecord = frozenDataRecord(right, QUOTE_KEYS, 'QUOTE_STALE');
+  return QUOTE_KEYS.every((key) => Object.is(leftRecord[key], rightRecord[key]));
+}
+
+function assertCanonicalIds(input: Readonly<{
+  candidateId: string;
+  sessionId: string;
+  positionId: string;
+  mint: string;
+  strategyId: string;
+  strategyVersion: number;
+  profileId: string;
+  profileVersion: number;
+  profileFingerprint: string;
+  evidenceFingerprint: string;
+  qualificationEventId: string;
+  confirmationStatus: string;
+}>): void {
+  const candidateId = `candidate_${sha256(JSON.stringify([
+    input.mint,
+    input.strategyId,
+    String(input.strategyVersion),
+    input.profileId,
+    String(input.profileVersion),
+    input.profileFingerprint,
+    input.evidenceFingerprint,
+    input.qualificationEventId,
+    input.confirmationStatus,
+  ]))}`;
+  const sessionId = `paper_session_${sha256(JSON.stringify([
+    candidateId, input.strategyId, String(input.strategyVersion),
+  ]))}`;
+  const positionId = executionSnapshotId('paper_position', [
+    input.mint, input.strategyId, input.strategyVersion, input.qualificationEventId,
+  ]);
+  if (
+    input.candidateId !== candidateId
+    || input.sessionId !== sessionId
+    || input.positionId !== positionId
+  ) staleDecision();
+}
+
+function strategyCommandId(namespace: 'paper_open' | 'paper_sell', parts: readonly string[]): string {
+  return `${namespace}_${sha256(JSON.stringify(parts))}`;
+}
+
+function executionSnapshotId(namespace: string, parts: readonly (string | number)[]): string {
+  return `${namespace}_${sha256(`${namespace}\u001f${JSON.stringify(parts)}`)}`;
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function confirmationReached(actual: string, minimum: string): boolean {
+  if (minimum !== 'confirmed' && minimum !== 'finalized') staleDecision();
+  return actual === 'finalized' || (minimum === 'confirmed' && actual === 'confirmed');
 }
 
 function assertStrategy(value: object, id: string, version: number): void {
@@ -242,7 +474,8 @@ function qualificationFrom(value: unknown): ExecutionIntentQualificationIdentity
 }
 
 function allowlistFrom(value: unknown): readonly string[] {
-  if (!Array.isArray(value) || !Object.isFrozen(value) || isProxy(value)) quoteMintNotAllowed();
+  if (isProxy(value) || !Array.isArray(value) || !Object.isFrozen(value)) quoteMintNotAllowed();
+  if (value.length !== 1) quoteMintNotAllowed();
   const result: string[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
@@ -386,6 +619,21 @@ function timestampFrom(value: unknown, code: ExecutionIntentProducerError['code'
   return value as number;
 }
 
+function boundedIntegerFrom(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+  code: ExecutionIntentProducerError['code'],
+): number {
+  if (
+    !Number.isSafeInteger(value)
+    || (value as number) < minimum
+    || (value as number) > maximum
+    || Object.is(value, -0)
+  ) throw new ExecutionIntentProducerError(code);
+  return value as number;
+}
+
 function positiveIntegerProperty(
   value: object,
   key: string,
@@ -427,6 +675,17 @@ function nonNegativeBigintProperty(
   return boundedBigintProperty(value, key, 0n, 18_446_744_073_709_551_615n, code);
 }
 
+function nullableBigintProperty(
+  value: object,
+  key: string,
+  code: ExecutionIntentProducerError['code'],
+): bigint | null {
+  const property = ownValue(value, key, code);
+  return property === null
+    ? null
+    : boundedBigintValue(property, 0n, 18_446_744_073_709_551_615n, code);
+}
+
 function boundedBigintProperty(
   value: object,
   key: string,
@@ -435,6 +694,15 @@ function boundedBigintProperty(
   code: ExecutionIntentProducerError['code'],
 ): bigint {
   const property = ownValue(value, key, code);
+  return boundedBigintValue(property, minimum, maximum, code);
+}
+
+function boundedBigintValue(
+  property: unknown,
+  minimum: bigint,
+  maximum: bigint,
+  code: ExecutionIntentProducerError['code'],
+): bigint {
   if (typeof property !== 'bigint' || property < minimum || property > maximum) {
     throw new ExecutionIntentProducerError(code);
   }

@@ -1,9 +1,16 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import type { PaperStrategySession } from '../src/domain/paper-strategy.js';
+import {
+  createCreationEntrySession,
+  type PaperStrategySession,
+} from '../src/domain/paper-strategy.js';
 import type { PaperPosition } from '../src/domain/paper-trading.js';
-import type { TradingCandidateV1 } from '../src/domain/trading-candidate.js';
+import {
+  createTradingCandidate,
+  type TradingCandidateV1,
+} from '../src/domain/trading-candidate.js';
 import {
   deriveExecutionIntent,
   ExecutionIntentProducerError,
@@ -18,6 +25,13 @@ const REPORT_ID = `qreport_${'b'.repeat(64)}`;
 const PROFILE_FINGERPRINT = 'c'.repeat(64);
 const EVIDENCE_FINGERPRINT = 'd'.repeat(64);
 const DECISION_FINGERPRINT = 'e'.repeat(64);
+const QUALIFICATION_EVENT_ID = `evt_${'1'.repeat(64)}`;
+const CLOSE_EVENT_ID = `evt_${'2'.repeat(64)}`;
+const POSITION_ID = executionSnapshotIdForTest('paper_position', [
+  MINT, 'creation-entry-v1', 1, QUALIFICATION_EVENT_ID,
+]);
+const OPEN_COMMAND_HASH = `paper_open_command_${'4'.repeat(64)}`;
+const CLOSE_COMMAND_HASH = `paper_close_command_${'5'.repeat(64)}`;
 
 void test('keeps derivation free of storage, RPC, files, clocks, and runtime composition', async () => {
   const source = await readFile(
@@ -42,11 +56,12 @@ void test('derives an inert PUMP_FUN_ONLY BUY from the canonical open command', 
   assert.equal(intent.quoteAmountRaw, 1_000n);
   assert.equal(intent.baseAmountRaw, null);
   assert.equal(intent.minimumAmountOutRaw, 900n);
-  assert.equal(intent.decisionEventId, 'evt_decision');
+  assert.equal(intent.decisionEventId, QUALIFICATION_EVENT_ID);
   assert.equal(intent.decisionFingerprint, DECISION_FINGERPRINT);
   assert.equal(intent.requestedAtMs, REQUESTED_AT_MS);
   assert.equal(intent.expiresAtMs, EXPIRES_AT_MS);
   assert.equal(Object.isFrozen(intent), true);
+  assert.notEqual(input.session?.openCommandId, input.position?.openCommandHash);
 });
 
 void test('derives an inert CANONICAL_EXIT SELL from the canonical close command', () => {
@@ -60,6 +75,7 @@ void test('derives an inert CANONICAL_EXIT SELL from the canonical close command
   assert.equal(intent.quoteAmountRaw, null);
   assert.equal(intent.baseAmountRaw, 900n);
   assert.equal(intent.minimumAmountOutRaw, 800n);
+  assert.notEqual(input.session?.closeCommandId, input.position?.closeCommandHash);
 });
 
 void test('returns null for a canonical NONE decision without inventing an order', () => {
@@ -107,7 +123,7 @@ for (const [name, mutate, code] of [
       ...input,
       quote: Object.freeze({ ...requiredQuote(input), outputMint: WSOL }),
     }),
-    'QUOTE_STALE',
+    'QUOTE_MINT_NOT_ALLOWED',
   ],
   [
     'stale qualification report',
@@ -164,6 +180,150 @@ for (const [name, mutate, code] of [
   });
 }
 
+void test('accepts a quote exactly at the deterministic maximum age boundary', () => {
+  const input = buyInput();
+  assert.equal(input.requestedAtMs - requiredQuote(input).observedAtMs, input.maximumQuoteAgeMs);
+  assert.ok(deriveExecutionIntent(input));
+});
+
+void test('rejects a quote one millisecond older than the deterministic maximum age', () => {
+  const input = buyInput();
+  assert.throws(
+    () => deriveExecutionIntent(Object.freeze({
+      ...input,
+      quote: Object.freeze({
+        ...requiredQuote(input),
+        observedAtMs: input.requestedAtMs - input.maximumQuoteAgeMs - 1,
+      }),
+    })),
+    (error: unknown) => error instanceof ExecutionIntentProducerError
+      && error.code === 'QUOTE_STALE',
+  );
+});
+
+for (const [field, value] of [
+  ['id', 'another-quote'],
+  ['amountInRaw', 1_001n],
+  ['amountOutRaw', 951n],
+  ['minimumAmountOutRaw', 899n],
+  ['feesRaw', 6n],
+  ['slippageBps', 101n],
+  ['priceImpactBps', 21n],
+  ['observedAtMs', REQUESTED_AT_MS - 999],
+  ['observedSlot', 11n],
+] as const) {
+  void test(`rejects a BUY quote whose ${field} differs from the canonical snapshots`, () => {
+    const input = buyInput();
+    assert.throws(
+      () => deriveExecutionIntent(Object.freeze({
+        ...input,
+        quote: Object.freeze({ ...requiredQuote(input), [field]: value }),
+      })),
+      (error: unknown) => error instanceof ExecutionIntentProducerError
+        && error.code === 'QUOTE_STALE',
+    );
+  });
+}
+
+void test('rejects a SELL quote that differs from the canonical session snapshot', () => {
+  const input = sellInput();
+  assert.throws(
+    () => deriveExecutionIntent(Object.freeze({
+      ...input,
+      quote: Object.freeze({ ...requiredQuote(input), feesRaw: 6n }),
+    })),
+    (error: unknown) => error instanceof ExecutionIntentProducerError
+      && error.code === 'QUOTE_STALE',
+  );
+});
+
+for (const [name, mutate] of [
+  ['actor kind', (input: DeriveExecutionIntentInput) => Object.freeze({
+    ...input,
+    session: Object.freeze({ ...requiredSession(input), actorKind: 'OTHER' }),
+  })],
+  ['session payload version', (input: DeriveExecutionIntentInput) => Object.freeze({
+    ...input,
+    session: Object.freeze({ ...requiredSession(input), payloadVersion: 1 }),
+  })],
+  ['candidate payload version', (input: DeriveExecutionIntentInput) => Object.freeze({
+    ...input,
+    candidate: Object.freeze({ ...input.candidate, payloadVersion: 2 }),
+  })],
+  ['position payload version', (input: DeriveExecutionIntentInput) => Object.freeze({
+    ...input,
+    position: Object.freeze({ ...requiredPosition(input), payloadVersion: 2 }),
+  })],
+  ['strategy identity', (input: DeriveExecutionIntentInput) => Object.freeze({
+    ...input,
+    candidate: Object.freeze({
+      ...input.candidate,
+      strategy: Object.freeze({ id: 'other-strategy', version: 1 }),
+    }),
+  })],
+  ['insufficient confirmation', (input: DeriveExecutionIntentInput) => Object.freeze({
+    ...input,
+    candidate: Object.freeze({
+      ...input.candidate,
+      asOf: Object.freeze({ ...input.candidate.asOf, confirmationStatus: 'processed' }),
+    }),
+  })],
+] as const) {
+  void test(`fails closed on an invalid canonical ${name}`, () => {
+    assert.throws(
+      () => deriveExecutionIntent(mutate(buyInput()) as DeriveExecutionIntentInput),
+      ExecutionIntentProducerError,
+    );
+  });
+}
+
+void test('rejects broken command, trigger, amount, and quote-cost lineage', () => {
+  for (const mutate of [
+    (input: DeriveExecutionIntentInput) => Object.freeze({
+      ...input,
+      session: Object.freeze({ ...requiredSession(input), openCommandId: `paper_open_${'9'.repeat(64)}` }),
+    }),
+    (input: DeriveExecutionIntentInput) => Object.freeze({
+      ...input,
+      position: Object.freeze({ ...requiredPosition(input), triggerEventId: CLOSE_EVENT_ID }),
+    }),
+    (input: DeriveExecutionIntentInput) => Object.freeze({
+      ...input,
+      position: Object.freeze({ ...requiredPosition(input), quoteCostRaw: 999n }),
+    }),
+    (input: DeriveExecutionIntentInput) => Object.freeze({
+      ...input,
+      position: Object.freeze({ ...requiredPosition(input), openCommandHash: 'paper_open_command_invalid' }),
+    }),
+  ]) assert.throws(() => deriveExecutionIntent(mutate(buyInput())), ExecutionIntentProducerError);
+});
+
+void test('rejects invalid quote mint data with the stable allowlist reason', () => {
+  const input = buyInput();
+  assert.throws(
+    () => deriveExecutionIntent(Object.freeze({ ...input, wsolMint: 'not-a-mint' })),
+    (error: unknown) => error instanceof ExecutionIntentProducerError
+      && error.code === 'QUOTE_MINT_NOT_ALLOWED',
+  );
+});
+
+void test('rejects a proxied allowlist without invoking any proxy trap', () => {
+  const input = buyInput();
+  let traps = 0;
+  const quoteMintAllowlist = new Proxy([WSOL], {
+    get() { traps += 1; return undefined; },
+    getOwnPropertyDescriptor() { traps += 1; return undefined; },
+    isExtensible() { traps += 1; return false; },
+    ownKeys() { traps += 1; return []; },
+  });
+  assert.throws(
+    () => deriveExecutionIntent(Object.freeze({ ...input, quoteMintAllowlist })),
+    (error: unknown) => error instanceof ExecutionIntentProducerError
+      && error.code === 'QUOTE_MINT_NOT_ALLOWED',
+  );
+  assert.equal(traps, 0);
+});
+
 void test('rejects a zero SELL quantity before creating a draft', () => {
   const input = sellInput();
   assert.throws(
@@ -198,8 +358,9 @@ void test('rejects mutable, extra-property, getter, and proxy inputs without inv
 });
 
 function buyInput(): DeriveExecutionIntentInput {
+  const quote = buyQuoteValue();
   const candidate = candidateValue();
-  const session = sessionValue(candidate, 'WAITING_EXTERNAL_BUYS', 'paper_open_command', null);
+  const session = sessionValue(candidate, 'WAITING_EXTERNAL_BUYS', quote);
   const position = positionValue(candidate, session, 'PAPER_HOLDING', 900n);
   return Object.freeze({
     requestedAction: 'OPEN',
@@ -207,21 +368,17 @@ function buyInput(): DeriveExecutionIntentInput {
     currentSessionId: session.id,
     candidate,
     position,
-    quote: Object.freeze({
-      id: 'buy-quote', inputMint: WSOL, outputMint: MINT,
-      amountInRaw: 1_000n, amountOutRaw: 950n, minimumAmountOutRaw: 900n,
-      feesRaw: 5n, slippageBps: 100n, priceImpactBps: 20n,
-      observedAtMs: REQUESTED_AT_MS - 1_000, observedSlot: 10n,
-    }),
+    quote,
     quoteMintAllowlist: Object.freeze([WSOL]),
     wsolMint: WSOL,
+    maximumQuoteAgeMs: 1_000,
     qualification: Object.freeze({
       reportId: REPORT_ID,
-      eventId: 'evt_qualification',
+      eventId: QUALIFICATION_EVENT_ID,
       profileFingerprint: PROFILE_FINGERPRINT,
       evidenceFingerprint: EVIDENCE_FINGERPRINT,
     }),
-    decisionEventId: 'evt_decision',
+    decisionEventId: QUALIFICATION_EVENT_ID,
     decisionFingerprint: DECISION_FINGERPRINT,
     requestedAtMs: REQUESTED_AT_MS,
     expiresAtMs: EXPIRES_AT_MS,
@@ -238,9 +395,15 @@ function requiredQuote(input: DeriveExecutionIntentInput): NonNullable<DeriveExe
   return input.quote;
 }
 
+function requiredPosition(input: DeriveExecutionIntentInput): PaperPosition {
+  assert.ok(input.position);
+  return input.position;
+}
+
 function sellInput(): DeriveExecutionIntentInput {
   const candidate = candidateValue();
-  const session = sessionValue(candidate, 'PAPER_CLOSED', 'paper_open_command', 'paper_sell_command');
+  const quote = sellQuoteValue();
+  const session = sessionValue(candidate, 'PAPER_CLOSED', quote);
   const position = positionValue(candidate, session, 'PAPER_CLOSED', 0n);
   return Object.freeze({
     ...buyInput(),
@@ -249,65 +412,54 @@ function sellInput(): DeriveExecutionIntentInput {
     currentSessionId: session.id,
     candidate,
     position,
-    quote: Object.freeze({
-      id: 'sell-quote', inputMint: MINT, outputMint: WSOL,
-      amountInRaw: 900n, amountOutRaw: 850n, minimumAmountOutRaw: 800n,
-      feesRaw: 5n, slippageBps: 100n, priceImpactBps: 20n,
-      observedAtMs: REQUESTED_AT_MS - 1_000, observedSlot: 11n,
-    }),
+    quote,
+    decisionEventId: CLOSE_EVENT_ID,
   });
 }
 
 function candidateValue(): TradingCandidateV1 {
-  return Object.freeze({
-    id: `candidate_${'a'.repeat(64)}`,
-    mint: MINT,
-    strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
-    qualificationReportId: REPORT_ID,
-    qualificationProfile: Object.freeze({
+  return createTradingCandidate({
+    mint: MINT, strategy: Object.freeze({ id: 'creation-entry-v1', version: 1 }),
+    qualificationReportId: REPORT_ID, qualificationProfile: Object.freeze({
       id: 'pumpfun-v1-initial', version: 1, fingerprint: PROFILE_FINGERPRINT,
     }),
     evidenceFingerprint: EVIDENCE_FINGERPRINT,
-    asOf: Object.freeze({
-      eventId: 'evt_qualification',
+    asOfEvent: Object.freeze({
+      id: QUALIFICATION_EVENT_ID, type: 'QualificationUpdated', mint: MINT,
+      source: 'qualification', program: 'pumpfun', signature: 'signature',
       cursor: Object.freeze({
         slot: 10n, transactionIndex: 0, instructionIndex: 1, innerInstructionIndex: null,
       }),
-      confirmationStatus: 'confirmed',
-      observedAtMs: REQUESTED_AT_MS - 2_000,
+      confirmationStatus: 'confirmed', blockchainTimeMs: REQUESTED_AT_MS - 2_000,
+      observedAtMs: REQUESTED_AT_MS - 2_000, payloadVersion: 1,
+      payload: Object.freeze({}),
     }),
-    state: 'ELIGIBLE',
-    quoteAsset: Object.freeze({ mint: WSOL, decimals: 9, tokenProgram: 'SPL_TOKEN' }),
-    buyQuote: null,
-    reverseSellQuote: null,
-    eligibleUntilMs: EXPIRES_AT_MS,
-    reasonCodes: Object.freeze(['QUALIFIED_ENTRY'] as const),
-    createdAtMs: REQUESTED_AT_MS - 2_000,
+    state: 'ELIGIBLE', quoteAsset: quoteAsset(), buyQuote: buyQuoteValue(),
+    reverseSellQuote: reverseQuoteValue(), eligibleUntilMs: EXPIRES_AT_MS,
+    reasonCodes: Object.freeze(['QUALIFIED_ENTRY']), createdAtMs: REQUESTED_AT_MS - 2_000,
     purgeAfterMs: REQUESTED_AT_MS + 14_400_000,
-    payloadVersion: 1,
   });
 }
 
 function sessionValue(
   candidate: TradingCandidateV1,
   state: PaperStrategySession['state'],
-  openCommandId: string,
-  closeCommandId: string | null,
+  lastQuote: NonNullable<DeriveExecutionIntentInput['quote']>,
 ): PaperStrategySession {
-  return Object.freeze({
-    id: 'paper_session', mint: candidate.mint, quoteAsset: candidate.quoteAsset,
-    strategy: Object.freeze({ id: 'creation-entry-v1' as const, version: 1 as const }),
-    candidateId: candidate.id,
-    qualificationReportId: candidate.qualificationReportId,
-    actorKind: 'PAPER_SIMULATION', state, reasonCode: 'QUALIFIED_ENTRY',
-    positionId: 'paper_position', openCommandId, closeCommandId,
-    entryCursor: candidate.asOf.cursor, externalBuyTarget: 3, externalBuyCount: 0,
-    externalMinimumBuyAmountRaw: 1n, countedTradeIds: Object.freeze([]),
-    countedBuyerWallets: Object.freeze([]), lastCountedCursor: null,
-    minimumConfirmation: 'confirmed', lastQuote: null, lastError: null,
-    pendingExitReason: null, pendingExitTriggerAtMs: null,
-    createdAtMs: REQUESTED_AT_MS - 2_000, updatedAtMs: REQUESTED_AT_MS,
-    purgeAfterMs: REQUESTED_AT_MS + 14_400_000, payloadVersion: 2,
+  const closed = state === 'PAPER_CLOSED';
+  return createCreationEntrySession({
+    candidate, state, reasonCode: closed
+      ? 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED'
+      : 'QUALIFIED_ENTRY',
+    positionId: POSITION_ID, entryCursor: candidate.asOf.cursor,
+    externalBuyTarget: 3, externalBuyCount: closed ? 3 : 0,
+    externalMinimumBuyAmountRaw: 1n,
+    countedTradeIds: closed ? Object.freeze(['trade-1', 'trade-2', 'trade-3']) : Object.freeze([]),
+    countedBuyerWallets: closed ? Object.freeze(['wallet-1', 'wallet-2', 'wallet-3']) : Object.freeze([]),
+    lastCountedCursor: null, minimumConfirmation: 'confirmed', lastQuote, lastError: null,
+    pendingExitReason: closed ? 'EXTERNAL_UNIQUE_BUYERS_TARGET_REACHED' : null,
+    pendingExitTriggerAtMs: null, createdAtMs: REQUESTED_AT_MS - 2_000,
+    updatedAtMs: REQUESTED_AT_MS, purgeAfterMs: REQUESTED_AT_MS + 14_400_000,
   });
 }
 
@@ -318,19 +470,55 @@ function positionValue(
   remainingBaseRaw: bigint,
 ): PaperPosition {
   return Object.freeze({
-    id: 'paper_position', mint: candidate.mint, quoteAsset: candidate.quoteAsset,
+    id: POSITION_ID, mint: candidate.mint, quoteAsset: candidate.quoteAsset,
     strategy: candidate.strategy, status, baseFilledRaw: 900n, remainingBaseRaw,
-    quoteCostRaw: 1_000n, quoteProceedsRaw: status === 'PAPER_CLOSED' ? 850n : null,
+    quoteCostRaw: 1_000n, quoteProceedsRaw: status === 'PAPER_CLOSED' ? 800n : null,
     grossPnlQuoteRaw: status === 'PAPER_CLOSED' ? -150n : null,
     netPnlQuoteRaw: status === 'PAPER_CLOSED' ? -155n : null,
-    roundTripLossBps: 1_550n, entryTradeId: 'entry-trade',
-    exitTradeId: status === 'PAPER_CLOSED' ? 'exit-trade' : null,
-    openCommandHash: session.openCommandId,
-    closeCommandHash: status === 'PAPER_CLOSED' ? session.closeCommandId : null,
-    triggerEventId: 'evt_qualification', strategySessionId: session.id,
+    roundTripLossBps: 1_550n, entryTradeId: `paper_trade_${'6'.repeat(64)}`,
+    exitTradeId: status === 'PAPER_CLOSED' ? `paper_trade_${'7'.repeat(64)}` : null,
+    openCommandHash: OPEN_COMMAND_HASH,
+    closeCommandHash: status === 'PAPER_CLOSED' ? CLOSE_COMMAND_HASH : null,
+    triggerEventId: QUALIFICATION_EVENT_ID, strategySessionId: session.id,
     qualificationReportId: candidate.qualificationReportId, candidateId: candidate.id,
+    closeEventId: status === 'PAPER_CLOSED' ? CLOSE_EVENT_ID : null,
     openedAtMs: REQUESTED_AT_MS, closedAtMs: status === 'PAPER_CLOSED' ? REQUESTED_AT_MS : null,
     purgeAfterMs: status === 'PAPER_CLOSED' ? REQUESTED_AT_MS + 14_400_000 : null,
     payloadVersion: 1,
   });
+}
+
+function quoteAsset() {
+  return Object.freeze({ mint: WSOL, decimals: 9, tokenProgram: 'SPL_TOKEN' as const });
+}
+
+function buyQuoteValue() {
+  return Object.freeze({
+    id: 'buy-quote', inputMint: WSOL, outputMint: MINT,
+    amountInRaw: 1_000n, amountOutRaw: 950n, minimumAmountOutRaw: 900n,
+    feesRaw: 5n, slippageBps: 100n, priceImpactBps: 20n,
+    observedAtMs: REQUESTED_AT_MS - 1_000, observedSlot: 10n,
+  });
+}
+
+function reverseQuoteValue() {
+  return Object.freeze({
+    id: 'reverse-quote', inputMint: MINT, outputMint: WSOL,
+    amountInRaw: 900n, amountOutRaw: 850n, minimumAmountOutRaw: 800n,
+    feesRaw: 5n, slippageBps: 100n, priceImpactBps: 20n,
+    observedAtMs: REQUESTED_AT_MS - 1_000, observedSlot: 10n,
+  });
+}
+
+function sellQuoteValue() {
+  return Object.freeze({ ...reverseQuoteValue(), id: 'sell-quote', observedSlot: 11n });
+}
+
+function executionSnapshotIdForTest(
+  namespace: string,
+  parts: readonly (string | number)[],
+): string {
+  return `${namespace}_${createHash('sha256')
+    .update(`${namespace}\u001f${JSON.stringify(parts)}`)
+    .digest('hex')}`;
 }
