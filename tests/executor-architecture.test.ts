@@ -10,6 +10,13 @@ import {
 import { reportExecutorEntrypointFailure } from '../src/executor/main.js';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+const EXPECTED_EXECUTOR_NODE_BUILTINS = Object.freeze([
+  'node:crypto',
+  'node:fs/promises',
+  'node:path',
+  'node:url',
+  'node:util/types',
+]);
 
 void test('source and compiled executor graphs stay inside the strict dry-run allowlist', async () => {
   const entries = [
@@ -21,10 +28,19 @@ void test('source and compiled executor graphs stay inside the strict dry-run al
     const graph = await readGraph(entry);
     assert.ok(graph.size >= 8, `executor graph unexpectedly small: ${relative(repositoryRoot, entry)}`);
     const violations: string[] = [];
+    const nodeBuiltins = new Set<string>();
     for (const [path, source] of graph) {
       violations.push(...executorBoundaryViolations(source, path, repositoryRoot));
+      for (const specifier of literalModuleSpecifiers(source, path)) {
+        if (specifier.startsWith('node:')) nodeBuiltins.add(specifier);
+      }
     }
     assert.deepEqual(violations, [], `unsafe executor graph from ${relative(repositoryRoot, entry)}`);
+    assert.deepEqual(
+      [...nodeBuiltins].sort(),
+      EXPECTED_EXECUTOR_NODE_BUILTINS,
+      `unexpected builtin dependency from ${relative(repositoryRoot, entry)}`,
+    );
   }
 });
 
@@ -84,6 +100,59 @@ void test('executor graph guard fails closed on runtime module recovery and comp
     assert.ok(
       violations.some((violation) => violation.includes(fixture.expected)),
       `${fixture.expected}: ${JSON.stringify(violations)}`,
+    );
+  }
+});
+
+void test('executor graph guard rejects a computed execution method captured before invocation', () => {
+  const fixturePath = resolve(repositoryRoot, 'src/executor/main.ts');
+  const fixture = "const submit=client['send'+'Transaction']; submit()";
+  const violations = executorBoundaryViolations(fixture, fixturePath, repositoryRoot);
+  assert.ok(
+    violations.some((violation) => violation.includes('Computed member access')),
+    JSON.stringify(violations),
+  );
+});
+
+void test('executor graph guard rejects node:vm dynamic SDK execution', () => {
+  const fixturePath = resolve(repositoryRoot, 'src/executor/main.ts');
+  const fixture = [
+    "import { runInThisContext } from 'node:vm';",
+    "runInThisContext(\"import('@solana/web3.js')\");",
+  ].join('\n');
+  const violations = executorBoundaryViolations(fixture, fixturePath, repositoryRoot);
+  assert.ok(violations.some((violation) => violation.includes('node:vm')), JSON.stringify(violations));
+});
+
+void test('executor graph guard rejects node:child_process sub-node SDK execution', () => {
+  const fixturePath = resolve(repositoryRoot, 'src/executor/main.ts');
+  const fixture = [
+    "import { execFile } from 'node:child_process';",
+    "execFile(process.execPath, ['-e', \"import('@solana/web3.js')\"]);",
+  ].join('\n');
+  const violations = executorBoundaryViolations(fixture, fixturePath, repositoryRoot);
+  assert.ok(
+    violations.some((violation) => violation.includes('node:child_process')),
+    JSON.stringify(violations),
+  );
+});
+
+void test('executor graph guard uses the exact builtin allowlist required by the real graph', () => {
+  const fixturePath = resolve(repositoryRoot, 'src/executor/main.ts');
+  for (const specifier of EXPECTED_EXECUTOR_NODE_BUILTINS) {
+    assert.deepEqual(
+      executorBoundaryViolations(`import '${specifier}';`, fixturePath, repositoryRoot),
+      [],
+      specifier,
+    );
+  }
+  for (const specifier of [
+    'node:module', 'node:vm', 'node:child_process', 'node:worker_threads',
+  ]) {
+    const violations = executorBoundaryViolations(`import '${specifier}';`, fixturePath, repositoryRoot);
+    assert.ok(
+      violations.some((violation) => violation.includes(specifier)),
+      `${specifier}: ${JSON.stringify(violations)}`,
     );
   }
 });

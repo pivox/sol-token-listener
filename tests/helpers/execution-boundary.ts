@@ -14,6 +14,14 @@ const FORBIDDEN_CALLS = new Set([
 const EXECUTOR_ALLOWED_BARE_MODULES = new Set([
   'pg', 'pino', 'dotenv', 'dotenv/config',
 ]);
+// Exact builtin dependencies observed in both the source and compiled executor graphs.
+const EXECUTOR_ALLOWED_NODE_BUILTINS = new Set([
+  'node:crypto',
+  'node:fs/promises',
+  'node:path',
+  'node:url',
+  'node:util/types',
+]);
 const EXECUTOR_FORBIDDEN_BARE_MODULES = new Set([
   '@solana/web3.js', '@solana/spl-token',
   '@pump-fun/pump-sdk', '@pump-fun/pump-swap-sdk',
@@ -29,6 +37,20 @@ const EXECUTOR_FORBIDDEN_IDENTIFIERS = new Set([
   'keypair', 'wallet', 'signer',
   'createRequire', 'getBuiltinModule', 'eval', 'Function',
   'simulateTransaction', 'sendTransaction', 'sendRawTransaction', 'signTransaction',
+]);
+// These are the only nonliteral element accesses present in the reviewed executor graph.
+const EXECUTOR_ALLOWED_DYNAMIC_ELEMENT_ACCESSES = new Set([
+  'safe[key]',
+  'result[key]',
+  'record[key]',
+  'EXACT_STATUS_REASONS[status]',
+  'value[leadingZeroByteLength]',
+  'assessmentRow[key]',
+  'row[key]',
+  'actual[key]',
+  'expected[key]',
+  'CLAIM_SQL[options.purpose]',
+  'intentValues[key]',
 ]);
 
 export function executionBoundaryViolations(sourceText: string, sourcePath: string, repositoryRoot: string): readonly string[] {
@@ -89,7 +111,8 @@ export function executorBoundaryViolations(
       continue;
     }
     if (!specifier.startsWith('.') && !specifier.startsWith('/')) {
-      if (!specifier.startsWith('node:') && !EXECUTOR_ALLOWED_BARE_MODULES.has(specifier)) {
+      if (!EXECUTOR_ALLOWED_NODE_BUILTINS.has(specifier)
+        && !EXECUTOR_ALLOWED_BARE_MODULES.has(specifier)) {
         violations.push(`Executor module is outside the allowlist: ${specifier}`);
       }
       continue;
@@ -104,6 +127,9 @@ export function executorBoundaryViolations(
     }
   }
   const visit = (node: ts.Node): void => {
+    if (ts.isElementAccessExpression(node)) {
+      appendExecutorElementAccess(node, sourceFile, violations);
+    }
     if (ts.isIdentifier(node) && (
       EXECUTOR_FORBIDDEN_IDENTIFIERS.has(node.text)
       || /(?:load.*secret|secret.*load)/iu.test(node.text)
@@ -163,7 +189,12 @@ function hasForbiddenSegment(path: string): boolean {
 
 function appendDangerousCall(node: ts.CallExpression, violations: string[]): void {
   if (ts.isElementAccessExpression(node.expression)) {
-    violations.push('Computed member call is prohibited in boundary modules.');
+    const argument = node.expression.argumentExpression;
+    if (!ts.isStringLiteralLike(argument) && !ts.isNumericLiteral(argument)) {
+      violations.push('Computed member call is prohibited in boundary modules.');
+    } else if (ts.isStringLiteralLike(argument) && FORBIDDEN_CALLS.has(argument.text)) {
+      violations.push(`Forbidden execution call: ${argument.text}`);
+    }
     return;
   }
   const name = ts.isIdentifier(node.expression)
@@ -174,4 +205,23 @@ function appendDangerousCall(node: ts.CallExpression, violations: string[]): voi
         ? node.expression.argumentExpression.text
         : null;
   if (name !== null && FORBIDDEN_CALLS.has(name)) violations.push(`Forbidden execution call: ${name}`);
+}
+
+function appendExecutorElementAccess(
+  node: ts.ElementAccessExpression,
+  sourceFile: ts.SourceFile,
+  violations: string[],
+): void {
+  const argument = node.argumentExpression;
+  if (ts.isNumericLiteral(argument)) return;
+  if (ts.isStringLiteralLike(argument)) {
+    if (FORBIDDEN_CALLS.has(argument.text) || EXECUTOR_FORBIDDEN_IDENTIFIERS.has(argument.text)) {
+      violations.push(`Forbidden executor capability: ${argument.text}`);
+    }
+    return;
+  }
+  const access = node.getText(sourceFile);
+  if (!EXECUTOR_ALLOWED_DYNAMIC_ELEMENT_ACCESSES.has(access)) {
+    violations.push(`Computed member access is outside the executor allowlist: ${access}`);
+  }
 }
