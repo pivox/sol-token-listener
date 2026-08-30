@@ -122,7 +122,7 @@ EXECUTOR_MODE=dry-run
 LIVE_TRADING_ENABLED=false
 ```
 
-Avant #51-G, la valeur `live` doit être rejetée. Après #51-G, une soumission
+Avant #51-G, la valeur `live` doit être rejetée. Après #51-G, un nouveau BUY
 nécessite simultanément :
 
 1. `EXECUTOR_MODE=live` ;
@@ -132,9 +132,19 @@ nécessite simultanément :
 5. un wallet et une chaîne correspondant exactement à l'armement ;
 6. aucune condition d'arrêt active.
 
-L'absence ou l'incohérence d'un seul contrôle interdit tout nouveau BUY. Les
-SELL et la réconciliation déjà nécessaires restent disponibles en mode
-`EXIT_ONLY`, sauf impossibilité cryptographique ou réseau explicite.
+L'absence ou l'incohérence d'un seul contrôle interdit tout nouveau BUY. À
+l'ouverture, l'exécuteur crée une autorisation de sortie durable, liée à cette
+position, ce wallet, ce cluster et sa quantité maximale réconciliée. Cette
+autorisation n'ouvre aucune nouvelle exposition et reste valide jusqu'à la
+fermeture de la position.
+
+Un SELL autorisé exige `EXECUTOR_MODE=live`, `LIVE_TRADING_ENABLED=true`, la
+correspondance wallet/cluster, l'autorisation de sortie de la position et
+l'absence de `HARD_STOP`. Il ne dépend ni d'un armement d'entrée encore valide,
+ni de `ENTRY_STOP`, ni d'un preflight encore dans son TTL. Il reconstruit et
+revalide néanmoins la transaction exacte selon les règles courantes. Les SELL
+et la réconciliation restent ainsi disponibles en mode `EXIT_ONLY`, sauf
+impossibilité cryptographique ou réseau explicite.
 
 L'armement durable fixe exactement : phase, wallet, cluster `mainnet-beta`,
 hash du build, fingerprint de stratégie/configuration, provider, nombre maximal

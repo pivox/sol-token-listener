@@ -436,9 +436,11 @@ Avec un faux pool/client, couvrir :
 - `create` insère une fois et retourne `REPLAYED` seulement si tous les champs
   immuables relus sont identiques ;
 - collision de `logical_order_key` divergente → erreur typée redacted ;
-- claim utilise `FOR UPDATE SKIP LOCKED`, heure PostgreSQL et UUID généré côté DB ;
+- claim utilise `FOR UPDATE SKIP LOCKED`, heure PostgreSQL et UUID généré côté
+  Node avec `randomUUID()` puis passé en paramètre ;
 - un lease expiré rend la ligne re-claimable sans réécrire son état métier ;
-- renew et transition exigent `id + lease_token + status` ;
+- renew, transition, tentative et release exigent `id + lease_token + status`
+  ainsi que `lease_expires_at > statement_timestamp()` ;
 - `beginAttempt` incrémente le parent et insère la tentative atomiquement ;
 - `finishAttempt` fait un CAS unique `STARTED -> COMPLETED|ABANDONED` sous le
   même fencing ; un second appel divergent est refusé ;
@@ -461,7 +463,7 @@ Utiliser cette forme de claim, adaptée sans interpolation :
 WITH candidate AS (
   SELECT id, status
   FROM execution_intents
-  WHERE status IN ('PENDING', 'RETRY_READY')
+  WHERE status IN ('PENDING', 'RETRY_READY', 'PROCESSING', 'SIMULATED')
     AND expires_at > statement_timestamp()
     AND (lease_expires_at IS NULL OR lease_expires_at <= statement_timestamp())
   ORDER BY requested_at, id
@@ -469,7 +471,10 @@ WITH candidate AS (
   LIMIT 1
 )
 UPDATE execution_intents AS intent
-SET status = 'PROCESSING',
+SET status = CASE
+      WHEN candidate.status IN ('PENDING', 'RETRY_READY') THEN 'PROCESSING'
+      ELSE candidate.status
+    END,
     lease_owner = $1,
     lease_token = $3::UUID,
     lease_expires_at = statement_timestamp() + ($2::BIGINT * INTERVAL '1 millisecond'),
@@ -479,12 +484,13 @@ WHERE intent.id = candidate.id
 RETURNING intent.*
 ```
 
-Ce SQL est exclusivement celui de `purpose='EXECUTE'`. `CONFIRM` sélectionne
-`SUBMITTED`; `RECONCILE` sélectionne `SIGNED_NOT_SUBMITTED`, `CONFIRMED`,
-`RECONCILING` et `UNKNOWN_REQUIRES_RECONCILIATION`. Ces deux claims conservent
-l'état métier au lieu de le remplacer par `PROCESSING`. Tous prennent ou
-remplacent uniquement un lease absent/expiré et journalisent le reclaim d'un
-lease expiré.
+Ce SQL est celui de `purpose='EXECUTE'`. Pour `PROCESSING` et `SIMULATED`, il
+conserve l'état métier afin de reprendre exactement l'étape pré-signature
+interrompue. `CONFIRM` sélectionne `SUBMITTED` ;
+`RECONCILE` sélectionne `SIGNED_NOT_SUBMITTED`, `CONFIRMED`, `RECONCILING` et
+`UNKNOWN_REQUIRES_RECONCILIATION`. Ces claims conservent également l'état
+métier. Tous remplacent uniquement un lease absent/expiré et journalisent le
+reclaim d'un lease expiré.
 
 Générer `$3` avec `randomUUID()` de `node:crypto`, comme le repository inbox
 existant ; la migration ne doit activer aucune extension PostgreSQL.
@@ -492,8 +498,11 @@ existant ; la migration ne doit activer aucune extension PostgreSQL.
 - [ ] **Step 4: Implémenter renew, transition et decode fail-closed**
 
 La transition fait : `BEGIN`, `SELECT ... FOR UPDATE`, validation exacte du
-fencing, validation domaine, `INSERT execution_intent_transitions`, `UPDATE`
-CAS, `COMMIT`. Le decoder PostgreSQL accepte les `NUMERIC` financiers uniquement
+fencing et de `lease_expires_at > statement_timestamp()`, validation domaine,
+`INSERT execution_intent_transitions`, `UPDATE` CAS, `COMMIT`. Renew, release,
+`beginAttempt` et `finishAttempt` appliquent le même prédicat de fraîcheur ; un
+worker expiré ne peut ni se renouveler ni gagner une course contre son
+reclaimer. Le decoder PostgreSQL accepte les `NUMERIC` financiers uniquement
 sous forme de chaîne décimale u64 canonique puis utilise `BigInt`.
 Une transition non terminale conserve le lease courant ; une transition
 terminale le libère atomiquement. `release` retire uniquement le lease, sans
