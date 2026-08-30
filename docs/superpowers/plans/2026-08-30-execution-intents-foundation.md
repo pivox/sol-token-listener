@@ -438,7 +438,9 @@ Avec un faux pool/client, couvrir :
 - collision de `logical_order_key` divergente → erreur typée redacted ;
 - claim utilise `FOR UPDATE SKIP LOCKED`, heure PostgreSQL et UUID généré côté
   Node avec `randomUUID()` puis passé en paramètre ;
-- un lease expiré rend la ligne re-claimable sans réécrire son état métier ;
+- aucun claim ne réécrit l'état métier ; un lease expiré rend la ligne
+  re-claimable et `PENDING|RETRY_READY -> PROCESSING` passe exclusivement par
+  `transition()`, avec son journal atomique ;
 - renew, transition, tentative et release exigent `id + lease_token + status`
   ainsi que `lease_expires_at > statement_timestamp()` ;
 - `beginAttempt` incrémente le parent et insère la tentative atomiquement ;
@@ -473,11 +475,7 @@ WITH candidate AS (
   LIMIT 1
 )
 UPDATE execution_intents AS intent
-SET status = CASE
-      WHEN candidate.status IN ('PENDING', 'RETRY_READY') THEN 'PROCESSING'
-      ELSE candidate.status
-    END,
-    lease_owner = $1,
+SET lease_owner = $1,
     lease_token = $3::UUID,
     lease_expires_at = statement_timestamp() + ($2::BIGINT * INTERVAL '1 millisecond'),
     updated_at = statement_timestamp()
@@ -486,9 +484,13 @@ WHERE intent.id = candidate.id
 RETURNING intent.*
 ```
 
-Ce SQL est celui de `purpose='EXECUTE'`. Pour `PROCESSING` et `SIMULATED`, il
-conserve l'état métier afin de reprendre exactement l'étape pré-signature
-interrompue. `CONFIRM` sélectionne `SUBMITTED` ;
+Ce SQL est celui de `purpose='EXECUTE'` et conserve l'état métier pour tous les
+candidats. Après un claim `PENDING` ou `RETRY_READY`, le worker doit appeler
+`transition(..., 'PROCESSING')` avant `beginAttempt` ; cette transaction écrit
+le journal append-only et l'état parent atomiquement. Un crash avant cette
+transition laisse l'intention dans son état exact pour le prochain claim. Pour
+`PROCESSING` et `SIMULATED`, le worker reprend directement l'étape
+pré-signature interrompue. `CONFIRM` sélectionne `SUBMITTED` ;
 `RECONCILE` sélectionne `SIGNED_NOT_SUBMITTED`, `CONFIRMED`, `RECONCILING` et
 `UNKNOWN_REQUIRES_RECONCILIATION`. Ces claims conservent également l'état
 métier. Tous remplacent uniquement un lease absent/expiré et journalisent le

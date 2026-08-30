@@ -305,6 +305,10 @@ Le claim utilise `FOR UPDATE SKIP LOCKED`, l'heure PostgreSQL et un lease
 renouvelable. Le lease est orthogonal à l'état métier : tous ses champs sont
 présents ou absents ensemble, aucun état terminal ne peut en porter, et un
 worker conserve le même lease lorsqu'il traverse plusieurs états non terminaux.
+Le claim ne modifie jamais l'état métier. Un worker qui réclame une intention
+`PENDING` ou `RETRY_READY` appelle ensuite la transition atomiquement
+journalisée vers `PROCESSING` ; un crash entre ces deux opérations laisse donc
+un état exact et re-claimable, sans transition manquante.
 Le propriétaire, la génération et l'expiration sont contrôlés par CAS pour
 empêcher un worker périmé de muter l'intention. Les claims de travail normal,
 de confirmation et de réconciliation ont des sélections explicites. Toute
@@ -407,10 +411,14 @@ hash du message, le blockhash, sa dernière hauteur valide et les bytes exacts,
 puis simule une dernière fois cette transaction exacte avec vérification des
 signatures. Immédiatement avant envoi, un BUY revérifie son armement d'entrée ;
 un SELL revérifie à la place l'autorisation de sortie durable de sa position.
-Les deux revérifient `HARD_STOP`, wallet, cluster, quota, exposition, quote et
-expiration applicables, puis soumettent les bytes persistés. `ENTRY_STOP` et
-l'expiration de l'armement d'entrée ne bloquent donc pas un SELL autorisé. Une
-erreur entre signature et confirmation devient ambiguë par défaut.
+Les deux revérifient `HARD_STOP`, wallet, cluster, la fraîcheur de leur quote et
+les contraintes applicables, puis soumettent les bytes persistés. Le BUY
+revérifie en plus quota d'entrée, drawdown, plafonds et exposition. Le SELL
+revérifie que sa quantité ne dépasse pas la quantité ouverte réconciliée et
+autorisée ; il n'est jamais bloqué par un plafond d'exposition ou de drawdown
+destiné aux entrées. `ENTRY_STOP` et l'expiration de l'armement d'entrée ne
+bloquent donc pas un SELL autorisé. Une erreur entre signature et confirmation
+devient ambiguë par défaut.
 
 La confirmation ne suffit pas à fermer l'intention. La réconciliation compare
 les balances réelles du wallet, les comptes token, la signature, les frais et
