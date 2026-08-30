@@ -218,7 +218,7 @@ void test('execution intent repository contract supports frozen execution lifecy
   const evidence = Object.freeze({ payloadVersion: 1, attemptNumber: attempt.attemptNumber, sourceEventId: 'event', observedAtMs: 3 } satisfies ExecutionIntentTransitionEvidenceV1);
   const transition = Object.freeze({
     intentId: created.intent.id, expectedStatus: 'PENDING', nextStatus: 'PROCESSING',
-    leaseToken: claim.leaseToken, reasonCode: 'INTENT_LEASE_LOST', humanMessage: 'claimed by worker',
+    leaseToken: claim.leaseToken, reasonCode: 'EXECUTION_STARTED', humanMessage: 'claimed by worker',
     activationPhase: 'NONE', evidence,
   } satisfies ExecutionIntentTransitionInput);
 
@@ -230,7 +230,7 @@ void test('execution intent repository contract supports frozen execution lifecy
   assert.ok(Object.isFrozen(transition));
   assert.equal(await repository.finishAttempt(claim, {
     attemptNumber: attempt.attemptNumber, status: 'COMPLETED', effectiveVenue: 'PUMP_FUN',
-    providerId: 'provider', reasonCode: 'INTENT_DUPLICATE',
+    providerId: 'provider', reasonCode: 'ATTEMPT_COMPLETED',
   }), true);
   assert.equal(await repository.renew(claim, 30_000), true);
   assert.equal((await repository.transition(claim, transition)).id, created.intent.id);

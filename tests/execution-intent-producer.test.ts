@@ -3,6 +3,9 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
+  EXECUTION_INTENT_MAXIMUM_TTL_MS,
+} from '../src/domain/execution-intent.js';
+import {
   createCreationEntrySession,
   CREATION_EXIT_REASONS,
   type PaperStrategySession,
@@ -87,6 +90,20 @@ void test('derives an inert CANONICAL_EXIT SELL from the canonical close command
 void test('returns null for a canonical NONE decision without inventing an order', () => {
   const input = Object.freeze({ ...buyInput(), requestedAction: 'NONE' as const });
   assert.equal(deriveExecutionIntent(input), null);
+});
+
+void test('refuses a configurable TTL above the hard four-hour lifetime', () => {
+  const input = buyInput();
+  assert.equal(EXECUTION_INTENT_MAXIMUM_TTL_MS, 14_400_000);
+  assert.throws(
+    () => deriveExecutionIntent(Object.freeze({
+      ...input,
+      expiresAtMs: input.requestedAtMs + EXECUTION_INTENT_MAXIMUM_TTL_MS + 1,
+      maximumIntentTtlMs: EXECUTION_INTENT_MAXIMUM_TTL_MS + 1,
+    })),
+    (error: unknown) => error instanceof ExecutionIntentProducerError
+      && error.code === 'DECISION_STALE',
+  );
 });
 
 void test('rejects a NONE decision carrying a mutable canonical projection', () => {

@@ -36,6 +36,7 @@ void test('execution intent migration defines the inert durable ledger contract'
     );
   }
   assert.match(executableSql, /date_trunc\('milliseconds', requested_at\) = requested_at/u);
+  assert.match(executableSql, /expires_at <= requested_at \+ INTERVAL '4 hours'/u);
   assert.match(executableSql, /TIMESTAMPTZ '1970-01-01 00:00:00\.000\+00'/u);
   assert.match(executableSql, /TIMESTAMPTZ '275760-09-13 00:00:00\.000\+00'/u);
   assert.doesNotMatch(executableSql, /purge_after = completed_at \+ INTERVAL '4 hours'/u);
@@ -46,6 +47,36 @@ void test('execution intent migration defines the inert durable ledger contract'
   assert.match(executableSql, /quote_amount_raw NUMERIC,/u);
   assert.match(executableSql, /WHERE status = 'PENDING'/u);
   assert.doesNotMatch(executableSql, /signed_transaction|private_key|keypair/iu);
+});
+
+void test('database rejects lifetimes beyond four hours and contradictory reason semantics', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: execution intent invariant test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, 'execution_intent_reason_semantics', async (pool) => {
+    await migrateDatabase({ pool });
+    const tooLong = draft('ttl-too-long', 'BUY', 1n, null);
+    await assert.rejects(insertIntent(pool, intentRow(tooLong, { expiresAtMs: 14_400_001 })));
+
+    const processing = draft('processing-reason', 'BUY', 1n, null);
+    await assert.rejects(insertIntent(pool, intentRow(processing, {
+      status: 'PROCESSING', lastReasonCode: 'INTENT_DUPLICATE',
+    })));
+    await insertIntent(pool, intentRow(processing, {
+      status: 'PROCESSING', lastReasonCode: 'EXECUTION_STARTED',
+    }));
+    await assert.rejects(pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,started_at,completed_at,reason_code
+    ) VALUES ($1,1,'COMPLETED',to_timestamp(1),to_timestamp(2),'QUOTE_STALE')`, [processing.id]));
+    await pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,started_at,completed_at,reason_code
+    ) VALUES ($1,1,'COMPLETED',to_timestamp(1),to_timestamp(2),'ATTEMPT_COMPLETED')`, [processing.id]);
+    await assert.rejects(pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,started_at,completed_at,reason_code
+    ) VALUES ($1,2,'ABANDONED',to_timestamp(1),to_timestamp(2),'ATTEMPT_COMPLETED')`, [processing.id]));
+  });
 });
 
 void test('paper foreign-key guard recognizes executable reference forms without reading prose', () => {
@@ -90,7 +121,7 @@ void test('execution intent migration applies and replays on an isolated schema'
     const reconciled = draft('reconciled-terminal', 'BUY', 1n, null);
     await insertIntent(pool, intentRow(reconciled, {
       status: 'SUCCEEDED', terminalAtMs: 1_000, reconciliationCompletedAtMs: 2_000,
-      purgeAfterMs: 14_402_000,
+      purgeAfterMs: 14_402_000, lastReasonCode: 'INTENT_SUCCEEDED',
     }));
     assertExecutionIntent(Object.freeze(intentFromRow(await readIntentRow(pool, reconciled.id))));
 
@@ -172,6 +203,7 @@ void test('execution intent migration applies and replays on an isolated schema'
     await assert.rejects(
       insertIntent(pool, intentRow(draft('reconciled-missing-terminal', 'BUY', 1n, null), {
         status: 'PROCESSING',
+        lastReasonCode: 'EXECUTION_STARTED',
         reconciliationCompletedAtMs: 1_000,
       })),
       /execution_intents_reconciliation_retention_check/u,
@@ -179,12 +211,15 @@ void test('execution intent migration applies and replays on an isolated schema'
     await assert.rejects(
       insertIntent(pool, intentRow(draft('purge-wrong-time', 'BUY', 1n, null), {
         status: 'SUCCEEDED', terminalAtMs: 1_000, reconciliationCompletedAtMs: 2_000, purgeAfterMs: 2_001,
+        lastReasonCode: 'INTENT_SUCCEEDED',
       })),
       /execution_intents_reconciliation_retention_check/u,
     );
 
     const processing = draft('processing-attempt', 'BUY', 1n, null);
-    await insertIntent(pool, intentRow(processing, { status: 'PROCESSING', attemptCount: 1 }));
+    await insertIntent(pool, intentRow(processing, {
+      status: 'PROCESSING', attemptCount: 1, lastReasonCode: 'EXECUTION_STARTED',
+    }));
     await insertAttempt(pool, processing.id, 1, 'COMPLETED', 0, 1, null);
     assert.deepEqual((await pool.query(`SELECT purge_after FROM execution_attempts WHERE intent_id = $1`, [
       processing.id,
@@ -498,16 +533,29 @@ type IntentRow = Readonly<{
 }>;
 
 function intentRow(draftValue: ReturnType<typeof draft>, overrides: Partial<IntentRow> = {}): IntentRow {
+  const status = overrides.status ?? 'PENDING';
   return {
     draft: draftValue,
     quoteAmountRaw: draftValue.quoteAmountRaw?.toString() ?? null,
     baseAmountRaw: draftValue.baseAmountRaw?.toString() ?? null,
     minimumAmountOutRaw: draftValue.minimumAmountOutRaw.toString(),
     requestedAtMs: draftValue.requestedAtMs, expiresAtMs: draftValue.expiresAtMs,
-    status: 'PENDING', attemptCount: 0, stateRevision: 0n, leaseOwner: null, leaseToken: null,
-    leaseExpiresAtMs: null, lastReasonCode: null, terminalAtMs: null,
+    status, attemptCount: 0, stateRevision: 0n, leaseOwner: null, leaseToken: null,
+    leaseExpiresAtMs: null, lastReasonCode: migrationReasonForStatus(status), terminalAtMs: null,
     reconciliationCompletedAtMs: null, purgeAfterMs: null, ...overrides,
   };
+}
+
+function migrationReasonForStatus(status: string): string | null {
+  const reasons: Readonly<Record<string, string>> = {
+    PROCESSING: 'EXECUTION_STARTED', SIMULATED: 'SIMULATION_SUCCEEDED',
+    RETRY_READY: 'RETRY_AUTHORIZED', SIGNED_NOT_SUBMITTED: 'SIGNATURE_PERSISTED',
+    SUBMITTED: 'SUBMISSION_ACCEPTED', CONFIRMED: 'CONFIRMATION_OBSERVED',
+    RECONCILING: 'RECONCILIATION_STARTED', SUCCEEDED: 'INTENT_SUCCEEDED',
+    FAILED: 'QUOTE_STALE', EXPIRED: 'INTENT_EXPIRED', CANCELLED: 'INTENT_CANCELLED',
+    UNKNOWN_REQUIRES_RECONCILIATION: 'RECONCILIATION_REQUIRED',
+  };
+  return reasons[status] ?? null;
 }
 
 async function insertIntent(pool: InstanceType<typeof pg.Pool>, row: IntentRow): Promise<void> {
@@ -544,7 +592,8 @@ async function insertAttempt(
     started_at, completed_at, reason_code, purge_after
   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, [
     intentId, attemptNumber, status, 'PUMP_FUN', 'provider', timestampParameter(startedAtMs),
-    timestampParameter(completedAtMs), 'QUOTE_STALE', timestampParameter(purgeAfterMs),
+    timestampParameter(completedAtMs), status === 'COMPLETED' ? 'ATTEMPT_COMPLETED' : 'QUOTE_STALE',
+    timestampParameter(purgeAfterMs),
   ]);
 }
 
@@ -556,7 +605,7 @@ async function insertTransition(
     intent_id, previous_status, next_status, reason_code, human_message,
     activation_phase, attempt_number, evidence, occurred_at
   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::JSONB, $9)`, [
-    intentId, 'PROCESSING', 'SIMULATED', 'QUOTE_STALE', 'migration test', 'NONE', attemptNumber,
+    intentId, 'PROCESSING', 'SIMULATED', 'SIMULATION_SUCCEEDED', 'migration test', 'NONE', attemptNumber,
     typeof evidence === 'string' ? evidence : JSON.stringify(evidence), timestampParameter(occurredAtMs),
   ]);
 }

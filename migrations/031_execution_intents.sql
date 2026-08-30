@@ -100,6 +100,10 @@ CREATE TABLE IF NOT EXISTS execution_intents (
   CONSTRAINT execution_intents_state_revision_check CHECK (state_revision >= 0),
   CONSTRAINT execution_intents_reason_check CHECK (
     last_reason_code IS NULL OR last_reason_code IN (
+      'EXECUTION_STARTED', 'SIMULATION_SUCCEEDED', 'ATTEMPT_COMPLETED',
+      'RETRY_AUTHORIZED', 'SIGNATURE_PERSISTED', 'SUBMISSION_ACCEPTED',
+      'CONFIRMATION_OBSERVED', 'RECONCILIATION_STARTED', 'INTENT_SUCCEEDED',
+      'INTENT_CANCELLED',
       'INTENT_EXPIRED', 'INTENT_DUPLICATE', 'INTENT_LEASE_LOST',
       'QUALIFICATION_STALE', 'DECISION_STALE', 'QUOTE_STALE',
       'QUOTE_MINT_NOT_ALLOWED', 'VENUE_UNAVAILABLE', 'BUY_SIMULATION_FAILED',
@@ -156,6 +160,7 @@ CREATE TABLE IF NOT EXISTS execution_intents (
       AND date_trunc('milliseconds', lease_expires_at) = lease_expires_at
     ))
     AND expires_at > requested_at
+    AND expires_at <= requested_at + INTERVAL '4 hours'
     AND updated_at >= created_at
     AND (terminal_at IS NULL OR terminal_at >= requested_at)
     AND (reconciliation_completed_at IS NULL OR reconciliation_completed_at >= terminal_at)
@@ -187,6 +192,27 @@ CREATE TABLE IF NOT EXISTS execution_intents (
       AND reconciliation_completed_at IS NULL
       AND purge_after IS NULL
     )
+  ),
+  CONSTRAINT execution_intents_status_reason_check CHECK (
+    (status = 'PENDING' AND last_reason_code IS NULL)
+    OR (status = 'PROCESSING' AND last_reason_code = 'EXECUTION_STARTED')
+    OR (status = 'SIMULATED' AND last_reason_code = 'SIMULATION_SUCCEEDED')
+    OR (status = 'RETRY_READY' AND last_reason_code = 'RETRY_AUTHORIZED')
+    OR (status = 'SIGNED_NOT_SUBMITTED' AND last_reason_code = 'SIGNATURE_PERSISTED')
+    OR (status = 'SUBMITTED' AND last_reason_code = 'SUBMISSION_ACCEPTED')
+    OR (status = 'CONFIRMED' AND last_reason_code = 'CONFIRMATION_OBSERVED')
+    OR (status = 'RECONCILING' AND last_reason_code = 'RECONCILIATION_STARTED')
+    OR (status = 'SUCCEEDED' AND last_reason_code = 'INTENT_SUCCEEDED')
+    OR (status = 'EXPIRED' AND last_reason_code = 'INTENT_EXPIRED')
+    OR (status = 'CANCELLED' AND last_reason_code = 'INTENT_CANCELLED')
+    OR (status = 'UNKNOWN_REQUIRES_RECONCILIATION'
+      AND last_reason_code = 'RECONCILIATION_REQUIRED')
+    OR (status = 'FAILED' AND last_reason_code IS NOT NULL AND last_reason_code NOT IN (
+      'EXECUTION_STARTED', 'SIMULATION_SUCCEEDED', 'ATTEMPT_COMPLETED',
+      'RETRY_AUTHORIZED', 'SIGNATURE_PERSISTED', 'SUBMISSION_ACCEPTED',
+      'CONFIRMATION_OBSERVED', 'RECONCILIATION_STARTED', 'INTENT_SUCCEEDED',
+      'INTENT_CANCELLED'
+    ))
   )
 );
 
@@ -211,6 +237,10 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
   ),
   CONSTRAINT execution_attempts_reason_check CHECK (
     reason_code IS NULL OR reason_code IN (
+      'EXECUTION_STARTED', 'SIMULATION_SUCCEEDED', 'ATTEMPT_COMPLETED',
+      'RETRY_AUTHORIZED', 'SIGNATURE_PERSISTED', 'SUBMISSION_ACCEPTED',
+      'CONFIRMATION_OBSERVED', 'RECONCILIATION_STARTED', 'INTENT_SUCCEEDED',
+      'INTENT_CANCELLED',
       'INTENT_EXPIRED', 'INTENT_DUPLICATE', 'INTENT_LEASE_LOST',
       'QUALIFICATION_STALE', 'DECISION_STALE', 'QUOTE_STALE',
       'QUOTE_MINT_NOT_ALLOWED', 'VENUE_UNAVAILABLE', 'BUY_SIMULATION_FAILED',
@@ -226,8 +256,16 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
     )
   ),
   CONSTRAINT execution_attempts_lifecycle_check CHECK (
-    (status = 'STARTED' AND completed_at IS NULL)
-    OR (status IN ('COMPLETED', 'ABANDONED') AND completed_at IS NOT NULL)
+    (status = 'STARTED' AND completed_at IS NULL AND reason_code IS NULL)
+    OR (status = 'COMPLETED' AND completed_at IS NOT NULL
+      AND reason_code = 'ATTEMPT_COMPLETED')
+    OR (status = 'ABANDONED' AND completed_at IS NOT NULL
+      AND reason_code IS NOT NULL AND reason_code NOT IN (
+        'EXECUTION_STARTED', 'SIMULATION_SUCCEEDED', 'ATTEMPT_COMPLETED',
+        'RETRY_AUTHORIZED', 'SIGNATURE_PERSISTED', 'SUBMISSION_ACCEPTED',
+        'CONFIRMATION_OBSERVED', 'RECONCILIATION_STARTED', 'INTENT_SUCCEEDED',
+        'INTENT_CANCELLED'
+      ))
   ),
   CONSTRAINT execution_attempts_temporal_check CHECK (
     isfinite(started_at)
@@ -277,6 +315,10 @@ CREATE TABLE IF NOT EXISTS execution_intent_transitions (
     'CANCELLED', 'UNKNOWN_REQUIRES_RECONCILIATION'
   )),
   CONSTRAINT execution_intent_transitions_reason_check CHECK (reason_code IN (
+    'EXECUTION_STARTED', 'SIMULATION_SUCCEEDED', 'ATTEMPT_COMPLETED',
+    'RETRY_AUTHORIZED', 'SIGNATURE_PERSISTED', 'SUBMISSION_ACCEPTED',
+    'CONFIRMATION_OBSERVED', 'RECONCILIATION_STARTED', 'INTENT_SUCCEEDED',
+    'INTENT_CANCELLED',
     'INTENT_EXPIRED', 'INTENT_DUPLICATE', 'INTENT_LEASE_LOST',
     'QUALIFICATION_STALE', 'DECISION_STALE', 'QUOTE_STALE',
     'QUOTE_MINT_NOT_ALLOWED', 'VENUE_UNAVAILABLE', 'BUY_SIMULATION_FAILED',
@@ -290,6 +332,26 @@ CREATE TABLE IF NOT EXISTS execution_intent_transitions (
     'SUBMISSION_AMBIGUOUS', 'CONFIRMATION_TIMEOUT', 'RECONCILIATION_REQUIRED',
     'BALANCE_MISMATCH', 'RESIDUAL_TOKEN_BALANCE', 'DOUBLE_ORDER_SUSPECTED'
   )),
+  CONSTRAINT execution_intent_transitions_status_reason_check CHECK (
+    (next_status = 'PROCESSING' AND reason_code = 'EXECUTION_STARTED')
+    OR (next_status = 'SIMULATED' AND reason_code = 'SIMULATION_SUCCEEDED')
+    OR (next_status = 'RETRY_READY' AND reason_code = 'RETRY_AUTHORIZED')
+    OR (next_status = 'SIGNED_NOT_SUBMITTED' AND reason_code = 'SIGNATURE_PERSISTED')
+    OR (next_status = 'SUBMITTED' AND reason_code = 'SUBMISSION_ACCEPTED')
+    OR (next_status = 'CONFIRMED' AND reason_code = 'CONFIRMATION_OBSERVED')
+    OR (next_status = 'RECONCILING' AND reason_code = 'RECONCILIATION_STARTED')
+    OR (next_status = 'SUCCEEDED' AND reason_code = 'INTENT_SUCCEEDED')
+    OR (next_status = 'EXPIRED' AND reason_code = 'INTENT_EXPIRED')
+    OR (next_status = 'CANCELLED' AND reason_code = 'INTENT_CANCELLED')
+    OR (next_status = 'UNKNOWN_REQUIRES_RECONCILIATION'
+      AND reason_code = 'RECONCILIATION_REQUIRED')
+    OR (next_status = 'FAILED' AND reason_code NOT IN (
+      'EXECUTION_STARTED', 'SIMULATION_SUCCEEDED', 'ATTEMPT_COMPLETED',
+      'RETRY_AUTHORIZED', 'SIGNATURE_PERSISTED', 'SUBMISSION_ACCEPTED',
+      'CONFIRMATION_OBSERVED', 'RECONCILIATION_STARTED', 'INTENT_SUCCEEDED',
+      'INTENT_CANCELLED'
+    ))
+  ),
   CONSTRAINT execution_intent_transitions_human_message_check CHECK (
     octet_length(human_message) BETWEEN 1 AND 256
   ),

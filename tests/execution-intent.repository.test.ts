@@ -13,7 +13,7 @@ import type {
   ExecutionClaimPurpose,
   ExecutionIntentTransitionInput,
 } from '../src/ports/execution-intent-repository.js';
-import { migrateDatabase } from '../src/storage/database.js';
+import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import {
   ExecutionIntentRepositoryError,
   PostgresExecutionIntentRepository,
@@ -226,7 +226,7 @@ void test('transition locks and fences the parent, appends evidence, then update
   const claim = claimedIntent(draft, 'PENDING');
   const updated = claimRow(draft, 'PROCESSING', 0);
   Object.assign(updated, {
-    status: 'PROCESSING', last_reason_code: 'INTENT_DUPLICATE',
+    status: 'PROCESSING', last_reason_code: 'EXECUTION_STARTED',
     state_revision: '1',
     updated_at_ms: String(NOW_MS + 1),
   });
@@ -267,9 +267,9 @@ void test('state revision prevents same-millisecond ABA replay with the original
   const original = claimedIntent(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0, 0n);
   const confirmed = claimedIntent(draft, 'CONFIRMED', 0, 1n);
   const confirmedRow = claimRow(draft, 'CONFIRMED', 0);
-  Object.assign(confirmedRow, { state_revision: '1', last_reason_code: 'INTENT_DUPLICATE' });
+  Object.assign(confirmedRow, { state_revision: '1', last_reason_code: 'CONFIRMATION_OBSERVED' });
   const unknownRow = claimRow(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0);
-  Object.assign(unknownRow, { state_revision: '2', last_reason_code: 'INTENT_DUPLICATE' });
+  Object.assign(unknownRow, { state_revision: '2', last_reason_code: 'RECONCILIATION_REQUIRED' });
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, original.intent.status, 0)], 1),
     result([ledgerRow(0)], 1), result([], 1),
@@ -309,7 +309,7 @@ void test('nonterminal transition fail-closes every mismatched retained lease tr
   for (const leaseOverride of variants) {
     const returned = claimRow(draft, 'PROCESSING', 0);
     Object.assign(returned, {
-      last_reason_code: 'INTENT_DUPLICATE', updated_at_ms: String(NOW_MS + 1),
+      last_reason_code: 'EXECUTION_STARTED', updated_at_ms: String(NOW_MS + 1),
       ...leaseOverride,
     });
     const client = new ScriptedClient([
@@ -361,7 +361,7 @@ void test('terminal pre-signature transitions release the lease and schedule coh
   const draft = executionDraft('terminal');
   const claim = claimedIntent(draft, 'SIMULATED', 1);
   const terminal = intentRow(draft, {
-    status: 'SUCCEEDED', attempt_count: 1, last_reason_code: 'INTENT_DUPLICATE',
+    status: 'SUCCEEDED', attempt_count: 1, last_reason_code: 'INTENT_SUCCEEDED',
     state_revision: '1',
     terminal_at_ms: String(NOW_MS + 1), reconciliation_completed_at_ms: String(NOW_MS + 1),
     purge_after_ms: String(NOW_MS + 14_400_001), updated_at_ms: String(NOW_MS + 1),
@@ -387,7 +387,7 @@ void test('terminal reconciled transitions mark reconciliation complete and beco
   const draft = executionDraft('terminal-reconciled');
   const claim = claimedIntent(draft, 'RECONCILING', 1);
   const terminal = intentRow(draft, {
-    status: 'SUCCEEDED', attempt_count: 1, last_reason_code: 'INTENT_DUPLICATE',
+    status: 'SUCCEEDED', attempt_count: 1, last_reason_code: 'INTENT_SUCCEEDED',
     state_revision: '1',
     terminal_at_ms: String(NOW_MS + 1), reconciliation_completed_at_ms: String(NOW_MS + 1),
     purge_after_ms: String(NOW_MS + 14_400_001), updated_at_ms: String(NOW_MS + 1),
@@ -409,7 +409,7 @@ void test('terminal transitions reject RETURNING rows without required reconcili
   const draft = executionDraft('terminal-retention-missing');
   const claim = claimedIntent(draft, 'SIMULATED', 1);
   const terminal = intentRow(draft, {
-    status: 'SUCCEEDED', attempt_count: 1, last_reason_code: 'INTENT_DUPLICATE',
+    status: 'SUCCEEDED', attempt_count: 1, last_reason_code: 'INTENT_SUCCEEDED',
     terminal_at_ms: String(NOW_MS + 1), updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
@@ -531,7 +531,7 @@ void test('PROCESSING cannot transition while its latest attempt is STARTED', as
   const claim = claimedIntent(draft, 'PROCESSING', 1);
   const returned = claimRow(draft, 'SIMULATED', 1);
   Object.assign(returned, {
-    state_revision: '1', last_reason_code: 'INTENT_DUPLICATE', updated_at_ms: String(NOW_MS + 1),
+    state_revision: '1', last_reason_code: 'SIMULATION_SUCCEEDED', updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
@@ -556,7 +556,7 @@ void test('transition rejects an orphan STARTED child when the parent attempt co
   const claim = claimedIntent(draft, 'PROCESSING', 0);
   const returned = claimRow(draft, 'SIMULATED', 0);
   Object.assign(returned, {
-    state_revision: '1', last_reason_code: 'INTENT_DUPLICATE', updated_at_ms: String(NOW_MS + 1),
+    state_revision: '1', last_reason_code: 'SIMULATION_SUCCEEDED', updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 0)], 1),
@@ -578,7 +578,7 @@ void test('finishAttempt performs one fenced STARTED CAS and exact replay return
   const claim = claimedIntent(draft, 'PROCESSING', 1);
   const finish = {
     attemptNumber: 1, status: 'COMPLETED' as const, effectiveVenue: 'PUMP_FUN' as const,
-    providerId: 'provider-1', reasonCode: 'INTENT_DUPLICATE' as const,
+    providerId: 'provider-1', reasonCode: 'ATTEMPT_COMPLETED' as const,
   };
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
@@ -587,7 +587,7 @@ void test('finishAttempt performs one fenced STARTED CAS and exact replay return
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
     result([ledgerRow(1, 'COMPLETED', {
       latest_effective_venue: 'PUMP_FUN', latest_provider_id: 'provider-1',
-      latest_completed_at_ms: String(NOW_MS + 3), latest_reason_code: 'INTENT_DUPLICATE',
+      latest_completed_at_ms: String(NOW_MS + 3), latest_reason_code: 'ATTEMPT_COMPLETED',
     })], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -615,7 +615,7 @@ void test('finishAttempt refuses a divergent or malformed terminal replay', asyn
 
   await expectCode(repository.finishAttempt(claim, {
     attemptNumber: 1, status: 'COMPLETED', effectiveVenue: 'PUMP_FUN',
-    providerId: 'provider', reasonCode: 'INTENT_DUPLICATE',
+    providerId: 'provider', reasonCode: 'ATTEMPT_COMPLETED',
   }), 'ATTEMPT_CONFLICT');
 });
 
@@ -630,7 +630,7 @@ void test('finishAttempt fail-closes a contradictory selected attempt number', a
 
   await expectCode(repository.finishAttempt(claim, {
     attemptNumber: 1, status: 'COMPLETED', effectiveVenue: null,
-    providerId: null, reasonCode: 'INTENT_DUPLICATE',
+    providerId: null, reasonCode: 'ATTEMPT_COMPLETED',
   }), 'ATTEMPT_CONFLICT');
 });
 
@@ -705,11 +705,14 @@ void test('read decodes exact canonical strings and rejects extra, fractional, o
   const extra = { ...intentRow(draft), extra: 'database-secret' };
   const fractional = { ...intentRow(draft), quote_amount_raw: '1.0' };
   const partialLease = { ...intentRow(draft), lease_owner: 'worker-without-token' };
+  const contradictoryReason = intentRow(draft, {
+    status: 'PROCESSING', last_reason_code: 'QUOTE_STALE',
+  });
   const invalidRevisions = ['-1', '01', '9223372036854775808'].map((state_revision) => ({
     ...intentRow(draft), state_revision,
   }));
   const leasedTerminal = intentRow(draft, {
-    status: 'SUCCEEDED', last_reason_code: 'INTENT_DUPLICATE',
+    status: 'SUCCEEDED', last_reason_code: 'INTENT_SUCCEEDED',
     terminal_at_ms: String(NOW_MS), lease_owner: 'worker-1', lease_token: UUID,
     lease_expires_at_ms: String(NOW_MS + 30_000),
   });
@@ -721,11 +724,12 @@ void test('read decodes exact canonical strings and rejects extra, fractional, o
   });
   const client = new ScriptedClient([
     result([extra], 1), result([fractional], 1), result([hostile], 1),
-    result([partialLease], 1), result([leasedTerminal], 1),
+    result([partialLease], 1), result([leasedTerminal], 1), result([contradictoryReason], 1),
     ...invalidRevisions.map((row) => result([row], 1)), result([intentRow(draft)], 1),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
+  await expectCode(repository.read(draft.id), 'INVALID_DATA');
   await expectCode(repository.read(draft.id), 'INVALID_DATA');
   await expectCode(repository.read(draft.id), 'INVALID_DATA');
   await expectCode(repository.read(draft.id), 'INVALID_DATA');
@@ -843,8 +847,67 @@ void test('public input validation is exact, bounded, typed, and does not invoke
   await expectCode(repository.transition(claim, {
     ...transitionInput(claim, 'SIMULATED'), extra: true,
   } as never), 'INVALID_INPUT');
+  await expectCode(repository.transition(claim, {
+    ...transitionInput(claim, 'SIMULATED'), reasonCode: 'INTENT_DUPLICATE',
+  }), 'INVALID_INPUT');
+  await expectCode(repository.finishAttempt(claim, {
+    attemptNumber: 1, status: 'COMPLETED', effectiveVenue: 'PUMP_FUN',
+    providerId: 'provider', reasonCode: 'QUOTE_STALE',
+  }), 'INVALID_INPUT');
+  await expectCode(repository.finishAttempt(claim, {
+    attemptNumber: 1, status: 'ABANDONED', effectiveVenue: 'PUMP_FUN',
+    providerId: 'provider', reasonCode: 'ATTEMPT_COMPLETED',
+  }), 'INVALID_INPUT');
   assert.equal(getterCalls, 0);
   assert.equal(pool.connectCount, 0);
+});
+
+void test('a purged identity can only be recreated as expired and cannot be claimed for execution', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: post-purge replay test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, 'execution_intent_post_purge_replay', async (pool) => {
+    await migrateDatabase({ pool });
+    const repository = new PostgresExecutionIntentRepository(pool);
+    const now = await databaseNowMs(pool);
+    const live = executionDraft('post-purge-replay', {
+      requestedAtMs: now - 1_000, expiresAtMs: now + 60_000,
+    });
+    await repository.create(live);
+    const claim = required(await repository.claim({
+      ownerId: 'terminal-worker', leaseMs: 30_000, purpose: 'EXECUTE',
+    }));
+    await repository.transition(claim, transitionInput(claim, 'CANCELLED'));
+
+    const aged = await pool.query<{ readonly requested_at_ms: string; readonly expires_at_ms: string }>(`
+      WITH operation AS MATERIALIZED (
+        SELECT date_trunc('milliseconds', statement_timestamp()) AS at
+      )
+      UPDATE execution_intents AS intent
+      SET requested_at=operation.at - INTERVAL '8 hours',
+        expires_at=operation.at - INTERVAL '4 hours',
+        terminal_at=operation.at - INTERVAL '4 hours',
+        reconciliation_completed_at=operation.at - INTERVAL '4 hours',
+        purge_after=operation.at,
+        created_at=operation.at - INTERVAL '8 hours',
+        updated_at=operation.at - INTERVAL '4 hours'
+      FROM operation WHERE intent.id=$1
+      RETURNING trunc(EXTRACT(EPOCH FROM requested_at) * 1000)::TEXT AS requested_at_ms,
+        trunc(EXTRACT(EPOCH FROM expires_at) * 1000)::TEXT AS expires_at_ms`, [live.id]);
+    const agedRow = required(aged.rows[0]);
+    const replay = executionDraft('post-purge-replay', {
+      requestedAtMs: Number(agedRow.requested_at_ms),
+      expiresAtMs: Number(agedRow.expires_at_ms),
+    });
+    assert.equal(replay.id, live.id);
+    assert.equal((await purgeExpiredFoundationData(pool)).executionIntents, 1);
+    assert.equal((await repository.create(replay)).kind, 'CREATED');
+    assert.equal(await repository.claim({
+      ownerId: 'replay-worker', leaseMs: 30_000, purpose: 'EXECUTE',
+    }), null);
+  });
 });
 
 void test('real PostgreSQL provides replay, concurrent claims, near-boundary reclaim, attempts, and ordered lifecycle journal', async (context) => {
@@ -890,7 +953,7 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
     );
     const finishedAttempt = {
       attemptNumber: attempt.attemptNumber, status: 'COMPLETED', effectiveVenue: 'PUMP_FUN',
-      providerId: 'provider-a', reasonCode: 'INTENT_DUPLICATE',
+      providerId: 'provider-a', reasonCode: 'ATTEMPT_COMPLETED',
     } as const;
     assert.equal(await first.finishAttempt(activeClaim, finishedAttempt), true);
 
@@ -922,7 +985,7 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
       provider_id,reason_code,purge_after FROM execution_attempts WHERE intent_id=$1`, [draft.id]);
     assert.deepEqual(attemptRows.rows, [{
       attempt_number: 1, status: 'COMPLETED', effective_venue: 'PUMP_FUN',
-      provider_id: 'provider-a', reason_code: 'INTENT_DUPLICATE', purge_after: null,
+      provider_id: 'provider-a', reason_code: 'ATTEMPT_COMPLETED', purge_after: null,
     }]);
     const journal = await firstPool.query<{
       readonly previous_status: string;
@@ -942,7 +1005,8 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
       requestedAtMs: 0, expiresAtMs: 1,
     });
     await first.create(submittedAfterDeadline);
-    await firstPool.query("UPDATE execution_intents SET status='SUBMITTED' WHERE id=$1", [
+    await firstPool.query(`UPDATE execution_intents
+      SET status='SUBMITTED',last_reason_code='SUBMISSION_ACCEPTED' WHERE id=$1`, [
       submittedAfterDeadline.id,
     ]);
     const confirmationClaim = await second.claim({
@@ -1025,7 +1089,8 @@ void test('real PostgreSQL rejects ABA replay, immutable drift, and parent-attem
     });
     await repository.create(abaDraft);
     await pool.query(`UPDATE execution_intents
-      SET status='UNKNOWN_REQUIRES_RECONCILIATION' WHERE id=$1`, [abaDraft.id]);
+      SET status='UNKNOWN_REQUIRES_RECONCILIATION',
+        last_reason_code='RECONCILIATION_REQUIRED' WHERE id=$1`, [abaDraft.id]);
     const original = required(await repository.claim({
       ownerId: 'aba-worker', leaseMs: 60_000, purpose: 'RECONCILE',
     }));
@@ -1061,7 +1126,8 @@ void test('real PostgreSQL rejects ABA replay, immutable drift, and parent-attem
       requestedAtMs: now - 800, expiresAtMs: now + 120_000,
     });
     await repository.create(gapDraft);
-    await pool.query(`UPDATE execution_intents SET status='PROCESSING',attempt_count=1 WHERE id=$1`, [
+    await pool.query(`UPDATE execution_intents SET status='PROCESSING',attempt_count=1,
+      last_reason_code='EXECUTION_STARTED' WHERE id=$1`, [
       gapDraft.id,
     ]);
     const gapClaim = required(await repository.claim({
@@ -1073,7 +1139,8 @@ void test('real PostgreSQL rejects ABA replay, immutable drift, and parent-attem
       requestedAtMs: now - 700, expiresAtMs: now + 120_000,
     });
     await repository.create(orphanDraft);
-    await pool.query(`UPDATE execution_intents SET status='PROCESSING' WHERE id=$1`, [
+    await pool.query(`UPDATE execution_intents SET status='PROCESSING',
+      last_reason_code='EXECUTION_STARTED' WHERE id=$1`, [
       orphanDraft.id,
     ]);
     await pool.query(`INSERT INTO execution_attempts (
@@ -1266,6 +1333,7 @@ function intentRow(
   draft: ExecutionIntentDraftV1,
   overrides: Readonly<Record<string, unknown>> = {},
 ): Row {
+  const rowStatus = (overrides.status ?? 'PENDING') as ExecutionIntentStatus;
   return {
     id: draft.id,
     payload_version: draft.payloadVersion,
@@ -1287,10 +1355,10 @@ function intentRow(
     decision_fingerprint: draft.decisionFingerprint,
     requested_at_ms: String(draft.requestedAtMs),
     expires_at_ms: String(draft.expiresAtMs),
-    status: 'PENDING',
+    status: rowStatus,
     attempt_count: 0,
     state_revision: '0',
-    last_reason_code: null,
+    last_reason_code: reasonForStatus(rowStatus),
     terminal_at_ms: null,
     reconciliation_completed_at_ms: null,
     purge_after_ms: null,
@@ -1321,7 +1389,7 @@ function claimedIntent(
   stateRevision = 0n,
 ): ClaimedExecutionIntent {
   const intent = Object.freeze({
-    ...draft, status, attemptCount, stateRevision, lastReasonCode: null, terminalAtMs: null,
+    ...draft, status, attemptCount, stateRevision, lastReasonCode: reasonForStatus(status), terminalAtMs: null,
     reconciliationCompletedAtMs: null, purgeAfterMs: null,
     createdAtMs: NOW_MS, updatedAtMs: NOW_MS,
   } satisfies ExecutionIntentV1);
@@ -1347,7 +1415,9 @@ function ledgerRow(
     latest_provider_id: null,
     latest_started_at_ms: attemptCount === 0 ? null : String(NOW_MS + 2),
     latest_completed_at_ms: terminal ? String(NOW_MS + 3) : null,
-    latest_reason_code: terminal ? 'INTENT_DUPLICATE' : null,
+    latest_reason_code: latestStatus === 'COMPLETED'
+      ? 'ATTEMPT_COMPLETED'
+      : latestStatus === 'ABANDONED' ? 'QUOTE_STALE' : null,
     ...overrides,
   };
 }
@@ -1362,7 +1432,7 @@ function transitionInput(
     expectedStatus: claim.intent.status,
     nextStatus,
     leaseToken: claim.leaseToken,
-    reasonCode: 'INTENT_DUPLICATE',
+    reasonCode: reasonForStatus(nextStatus) ?? 'QUOTE_STALE',
     humanMessage: 'claimed for processing',
     activationPhase: 'NONE',
     evidence: Object.freeze({
@@ -1370,6 +1440,24 @@ function transitionInput(
       observedAtMs: claim.intent.updatedAtMs,
     }),
   });
+}
+
+function reasonForStatus(status: ExecutionIntentStatus): ExecutionIntentV1['lastReasonCode'] {
+  const reasons: Readonly<Partial<Record<ExecutionIntentStatus, ExecutionIntentV1['lastReasonCode']>>> = {
+    PROCESSING: 'EXECUTION_STARTED',
+    SIMULATED: 'SIMULATION_SUCCEEDED',
+    RETRY_READY: 'RETRY_AUTHORIZED',
+    SIGNED_NOT_SUBMITTED: 'SIGNATURE_PERSISTED',
+    SUBMITTED: 'SUBMISSION_ACCEPTED',
+    CONFIRMED: 'CONFIRMATION_OBSERVED',
+    RECONCILING: 'RECONCILIATION_STARTED',
+    SUCCEEDED: 'INTENT_SUCCEEDED',
+    FAILED: 'QUOTE_STALE',
+    EXPIRED: 'INTENT_EXPIRED',
+    CANCELLED: 'INTENT_CANCELLED',
+    UNKNOWN_REQUIRES_RECONCILIATION: 'RECONCILIATION_REQUIRED',
+  };
+  return reasons[status] ?? null;
 }
 
 interface QueryCall {

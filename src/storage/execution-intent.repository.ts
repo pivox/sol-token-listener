@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import {
+  assertExecutionAttemptStatusReason,
   assertExecutionIntent,
+  assertExecutionIntentStatusReason,
   assertExecutionIntentTransition,
   EXECUTION_INTENT_REASON_CODES,
   EXECUTION_INTENT_STATUSES,
@@ -850,6 +852,7 @@ function transitionInput(
     || leaseToken !== claim.leaseToken) throw inputError();
   try {
     assertExecutionIntentTransition(expectedStatus, nextStatus);
+    assertExecutionIntentStatusReason(nextStatus, reasonCode);
   } catch {
     throw inputError();
   }
@@ -889,6 +892,11 @@ function finishAttemptInput(value: unknown): Readonly<{
     ? null
     : boundedText(row.providerId, 'INVALID_INPUT');
   const reasonCode = reason(row.reasonCode, 'INVALID_INPUT');
+  try {
+    assertExecutionAttemptStatusReason(row.status, reasonCode);
+  } catch {
+    throw inputError();
+  }
   return Object.freeze({
     attemptNumber, status: row.status, effectiveVenue: row.effectiveVenue,
     providerId, reasonCode,
@@ -1084,6 +1092,11 @@ function attemptFromRow(value: unknown): StoredAttempt {
   const startedAtMs = timestampFromDatabase(row.started_at_ms);
   const completedAtMs = nullableTimestampFromDatabase(row.completed_at_ms);
   const reasonCode = row.reason_code === null ? null : reason(row.reason_code, 'INVALID_DATA');
+  try {
+    assertExecutionAttemptStatusReason(row.status, reasonCode);
+  } catch {
+    throw dataError();
+  }
   if (row.status === 'STARTED') {
     if (row.effective_venue !== null || providerId !== null
       || completedAtMs !== null || reasonCode !== null) throw dataError();

@@ -17,6 +17,8 @@ export const EXECUTION_INTENT_STATUSES = Object.freeze([
   'UNKNOWN_REQUIRES_RECONCILIATION',
 ] as const);
 
+export const EXECUTION_INTENT_MAXIMUM_TTL_MS = 14_400_000;
+
 export const EXECUTION_INTENT_REASON_CODES = Object.freeze([
   'INTENT_EXPIRED',
   'INTENT_DUPLICATE',
@@ -50,6 +52,16 @@ export const EXECUTION_INTENT_REASON_CODES = Object.freeze([
   'BALANCE_MISMATCH',
   'RESIDUAL_TOKEN_BALANCE',
   'DOUBLE_ORDER_SUSPECTED',
+  'EXECUTION_STARTED',
+  'SIMULATION_SUCCEEDED',
+  'ATTEMPT_COMPLETED',
+  'RETRY_AUTHORIZED',
+  'SIGNATURE_PERSISTED',
+  'SUBMISSION_ACCEPTED',
+  'CONFIRMATION_OBSERVED',
+  'RECONCILIATION_STARTED',
+  'INTENT_SUCCEEDED',
+  'INTENT_CANCELLED',
 ] as const);
 
 export type ExecutionIntentStatus = (typeof EXECUTION_INTENT_STATUSES)[number];
@@ -105,7 +117,7 @@ const INT32_MAX = 2_147_483_647;
 const INT64_MAX = 9_223_372_036_854_775_807n;
 const DATE_MAX_MS = 8_640_000_000_000_000;
 const U64_MAX = 18_446_744_073_709_551_615n;
-const RETENTION_MS = 14_400_000;
+const RETENTION_MS = EXECUTION_INTENT_MAXIMUM_TTL_MS;
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
 const DRAFT_INPUT_KEYS = Object.freeze([
@@ -150,6 +162,29 @@ const INTENT_KEYS = Object.freeze([
 
 const TERMINAL_STATUSES = new Set<ExecutionIntentStatus>([
   'SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED',
+]);
+
+const EXACT_STATUS_REASONS: Readonly<Partial<Record<
+ExecutionIntentStatus, ExecutionIntentReasonCode
+>>> = Object.freeze({
+  PROCESSING: 'EXECUTION_STARTED',
+  SIMULATED: 'SIMULATION_SUCCEEDED',
+  RETRY_READY: 'RETRY_AUTHORIZED',
+  SIGNED_NOT_SUBMITTED: 'SIGNATURE_PERSISTED',
+  SUBMITTED: 'SUBMISSION_ACCEPTED',
+  CONFIRMED: 'CONFIRMATION_OBSERVED',
+  RECONCILING: 'RECONCILIATION_STARTED',
+  SUCCEEDED: 'INTENT_SUCCEEDED',
+  EXPIRED: 'INTENT_EXPIRED',
+  CANCELLED: 'INTENT_CANCELLED',
+  UNKNOWN_REQUIRES_RECONCILIATION: 'RECONCILIATION_REQUIRED',
+});
+
+const POSITIVE_REASON_CODES = new Set<ExecutionIntentReasonCode>([
+  'EXECUTION_STARTED', 'SIMULATION_SUCCEEDED', 'ATTEMPT_COMPLETED',
+  'RETRY_AUTHORIZED', 'SIGNATURE_PERSISTED', 'SUBMISSION_ACCEPTED',
+  'CONFIRMATION_OBSERVED', 'RECONCILIATION_STARTED', 'INTENT_SUCCEEDED',
+  'INTENT_CANCELLED',
 ]);
 
 const ALLOWED_TRANSITIONS: ReadonlyMap<ExecutionIntentStatus, ReadonlySet<ExecutionIntentStatus>> = new Map([
@@ -210,6 +245,39 @@ export function assertExecutionIntentTransition(
   if (!ALLOWED_TRANSITIONS.get(prior)?.has(successor)) throw invalid();
 }
 
+export function assertExecutionIntentStatusReason(
+  statusValue: unknown,
+  reasonValue: unknown,
+): void {
+  try {
+    assertStatusReason(statusFrom(statusValue), nullableReasonCodeFrom(reasonValue));
+  } catch {
+    throw invalid();
+  }
+}
+
+export function assertExecutionAttemptStatusReason(
+  statusValue: unknown,
+  reasonValue: unknown,
+): void {
+  try {
+    const reasonCode = nullableReasonCodeFrom(reasonValue);
+    if (statusValue === 'STARTED') {
+      if (reasonCode !== null) throw invalid();
+      return;
+    }
+    if (statusValue === 'COMPLETED') {
+      if (reasonCode !== 'ATTEMPT_COMPLETED') throw invalid();
+      return;
+    }
+    if (statusValue !== 'ABANDONED'
+      || reasonCode === null
+      || POSITIVE_REASON_CODES.has(reasonCode)) throw invalid();
+  } catch {
+    throw invalid();
+  }
+}
+
 function draftInputFrom(value: unknown): Omit<ExecutionIntentDraftV1, 'id' | 'payloadVersion' | 'logicalOrderKey'> {
   const record = ownEnumerableDataRecord(value, DRAFT_INPUT_KEYS);
   return immutableFieldsFrom(record);
@@ -240,6 +308,7 @@ function intentFrom(value: unknown, requireFrozen: boolean): ExecutionIntentV1 {
   const attemptCount = nonNegativeIntegerFrom(record.attemptCount);
   const stateRevision = stateRevisionFrom(record.stateRevision);
   const lastReasonCode = nullableReasonCodeFrom(record.lastReasonCode);
+  assertStatusReason(status, lastReasonCode);
   const terminalAtMs = nullableTimestampFrom(record.terminalAtMs);
   const reconciliationCompletedAtMs = nullableTimestampFrom(record.reconciliationCompletedAtMs);
   const purgeAfterMs = nullableTimestampFrom(record.purgeAfterMs);
@@ -293,7 +362,8 @@ function immutableFieldsFrom(
   const decisionFingerprint = fingerprintFrom(record.decisionFingerprint);
   const requestedAtMs = timestampFrom(record.requestedAtMs);
   const expiresAtMs = timestampFrom(record.expiresAtMs);
-  if (expiresAtMs <= requestedAtMs) throw invalid();
+  if (expiresAtMs <= requestedAtMs
+    || expiresAtMs - requestedAtMs > EXECUTION_INTENT_MAXIMUM_TTL_MS) throw invalid();
   if ((side === 'BUY' && (quoteAmountRaw === null || baseAmountRaw !== null))
     || (side === 'SELL' && (baseAmountRaw === null || quoteAmountRaw !== null))) throw invalid();
   if ((side === 'BUY' && venuePolicy !== 'PUMP_FUN_ONLY')
@@ -317,6 +387,21 @@ function immutableFieldsFrom(
     requestedAtMs,
     expiresAtMs,
   };
+}
+
+function assertStatusReason(
+  status: ExecutionIntentStatus,
+  reasonCode: ExecutionIntentReasonCode | null,
+): void {
+  if (status === 'PENDING') {
+    if (reasonCode !== null) throw invalid();
+    return;
+  }
+  if (status === 'FAILED') {
+    if (reasonCode === null || POSITIVE_REASON_CODES.has(reasonCode)) throw invalid();
+    return;
+  }
+  if (reasonCode !== EXACT_STATUS_REASONS[status]) throw invalid();
 }
 
 function identityFrom(value: unknown): Readonly<{

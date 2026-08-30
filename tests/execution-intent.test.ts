@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  assertExecutionAttemptStatusReason,
   assertExecutionIntent,
   assertExecutionIntentTransition,
   createExecutionIntentDraft,
   createExecutionIntentId,
+  EXECUTION_INTENT_MAXIMUM_TTL_MS,
   EXECUTION_INTENT_REASON_CODES,
   EXECUTION_INTENT_STATUSES,
   ExecutionIntentValidationError,
@@ -19,6 +21,16 @@ const DATE_MAX_MS = 8_640_000_000_000_000;
 const INT32_MAX = 2_147_483_647;
 const INT64_MAX = 9_223_372_036_854_775_807n;
 const U64_MAX = 18_446_744_073_709_551_615n;
+
+void test('bounds every execution intent lifetime to the four-hour retention horizon', () => {
+  assert.equal(EXECUTION_INTENT_MAXIMUM_TTL_MS, 14_400_000);
+  assert.doesNotThrow(() => createExecutionIntentDraft(validInput({
+    expiresAtMs: REQUESTED_AT_MS + EXECUTION_INTENT_MAXIMUM_TTL_MS,
+  })));
+  assertValidationFailure(() => createExecutionIntentDraft(validInput({
+    expiresAtMs: REQUESTED_AT_MS + EXECUTION_INTENT_MAXIMUM_TTL_MS + 1,
+  })));
+});
 
 void test('creates one frozen deterministic BUY intent using bigint amounts', () => {
   const first = createExecutionIntentDraft(validInput());
@@ -65,9 +77,63 @@ void test('publishes the exact immutable V1 status and reason vocabularies', () 
     'SUBMISSION_AMBIGUOUS', 'CONFIRMATION_TIMEOUT',
     'RECONCILIATION_REQUIRED', 'BALANCE_MISMATCH', 'RESIDUAL_TOKEN_BALANCE',
     'DOUBLE_ORDER_SUSPECTED',
+    'EXECUTION_STARTED', 'SIMULATION_SUCCEEDED', 'ATTEMPT_COMPLETED',
+    'RETRY_AUTHORIZED', 'SIGNATURE_PERSISTED', 'SUBMISSION_ACCEPTED',
+    'CONFIRMATION_OBSERVED', 'RECONCILIATION_STARTED', 'INTENT_SUCCEEDED',
+    'INTENT_CANCELLED',
   ]);
   assert.ok(Object.isFrozen(EXECUTION_INTENT_STATUSES));
   assert.ok(Object.isFrozen(EXECUTION_INTENT_REASON_CODES));
+});
+
+void test('rejects contradictory durable status and reason pairs', () => {
+  const exactReasons = {
+    PROCESSING: 'EXECUTION_STARTED',
+    SIMULATED: 'SIMULATION_SUCCEEDED',
+    RETRY_READY: 'RETRY_AUTHORIZED',
+    SIGNED_NOT_SUBMITTED: 'SIGNATURE_PERSISTED',
+    SUBMITTED: 'SUBMISSION_ACCEPTED',
+    CONFIRMED: 'CONFIRMATION_OBSERVED',
+    RECONCILING: 'RECONCILIATION_STARTED',
+  } as const;
+  for (const [status, reason] of Object.entries(exactReasons)) {
+    assert.doesNotThrow(() => { assertExecutionIntent(validRecord({ status, lastReasonCode: reason })); });
+    assertValidationFailure(() => { assertExecutionIntent(validRecord({
+      status, lastReasonCode: 'INTENT_DUPLICATE',
+    })); });
+  }
+  assert.doesNotThrow(() => { assertExecutionIntent(validRecord({
+    status: 'UNKNOWN_REQUIRES_RECONCILIATION', lastReasonCode: 'RECONCILIATION_REQUIRED',
+  })); });
+  assertValidationFailure(() => { assertExecutionIntent(validRecord({
+    status: 'UNKNOWN_REQUIRES_RECONCILIATION', lastReasonCode: 'INTENT_DUPLICATE',
+  })); });
+  assert.doesNotThrow(() => { assertExecutionIntent(validRecord({
+    status: 'FAILED', lastReasonCode: 'BUY_SIMULATION_FAILED',
+    terminalAtMs: REQUESTED_AT_MS, reconciliationCompletedAtMs: REQUESTED_AT_MS,
+    purgeAfterMs: REQUESTED_AT_MS + 14_400_000,
+  })); });
+  assertValidationFailure(() => { assertExecutionIntent(validRecord({
+    status: 'FAILED', lastReasonCode: 'SIMULATION_SUCCEEDED',
+    terminalAtMs: REQUESTED_AT_MS, reconciliationCompletedAtMs: REQUESTED_AT_MS,
+    purgeAfterMs: REQUESTED_AT_MS + 14_400_000,
+  })); });
+});
+
+void test('requires honest attempt completion and abandonment reasons', () => {
+  assert.doesNotThrow(() => { assertExecutionAttemptStatusReason('STARTED', null); });
+  assert.doesNotThrow(() => {
+    assertExecutionAttemptStatusReason('COMPLETED', 'ATTEMPT_COMPLETED');
+  });
+  assert.doesNotThrow(() => { assertExecutionAttemptStatusReason('ABANDONED', 'QUOTE_STALE'); });
+  for (const pair of [
+    ['STARTED', 'QUOTE_STALE'],
+    ['COMPLETED', 'QUOTE_STALE'],
+    ['ABANDONED', 'ATTEMPT_COMPLETED'],
+    ['ABANDONED', 'INTENT_SUCCEEDED'],
+  ] as const) {
+    assertValidationFailure(() => { assertExecutionAttemptStatusReason(pair[0], pair[1]); });
+  }
 });
 
 void test('refuses invalid immutable draft amounts, dates, and canonical values', () => {
@@ -110,6 +176,7 @@ void test('accepts PostgreSQL integer and Date bounds but rejects one past each 
   const maxRecord = validRecord({
     ...maxDraft,
     status: 'PROCESSING',
+    lastReasonCode: 'EXECUTION_STARTED',
     attemptCount: INT32_MAX,
     stateRevision: INT64_MAX,
     createdAtMs: DATE_MAX_MS,
@@ -134,6 +201,7 @@ void test('accepts PostgreSQL integer and Date bounds but rejects one past each 
   }
   const terminalRecord = validRecord({
     status: 'SUCCEEDED',
+    lastReasonCode: 'INTENT_SUCCEEDED',
     attemptCount: 1,
     terminalAtMs: DATE_MAX_MS - 14_400_000,
     reconciliationCompletedAtMs: DATE_MAX_MS - 14_400_000,

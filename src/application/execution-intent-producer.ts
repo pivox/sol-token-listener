@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import {
   createExecutionIntentDraft,
+  EXECUTION_INTENT_MAXIMUM_TTL_MS,
   type ExecutionIntentDraftV1,
   type ExecutionIntentReasonCode,
 } from '../domain/execution-intent.js';
@@ -83,7 +84,7 @@ export function deriveExecutionIntent(
   const requestedAtMs = timestampFrom(record.requestedAtMs, 'DECISION_STALE');
   const expiresAtMs = timestampFrom(record.expiresAtMs, 'DECISION_STALE');
   const maximumIntentTtlMs = boundedIntegerFrom(
-    record.maximumIntentTtlMs, 1, Number.MAX_SAFE_INTEGER, 'DECISION_STALE',
+    record.maximumIntentTtlMs, 1, EXECUTION_INTENT_MAXIMUM_TTL_MS, 'DECISION_STALE',
   );
   if (
     expiresAtMs <= requestedAtMs
