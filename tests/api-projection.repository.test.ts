@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { test } from 'node:test';
 import {
   ApiProjectionDataError,
@@ -6,6 +7,8 @@ import {
   type ApiProjectionPipelineState,
   type Queryable,
 } from '../src/storage/api-projection.repository.js';
+import { checkDeploymentHealth } from '../src/operations/deployment-healthcheck.js';
+import { createApiRouter } from '../src/interfaces/http/api-router.js';
 import {
   MAX_TIMELINE_INDEX,
   encodeLaunchCursor,
@@ -1901,6 +1904,47 @@ void test('maps every detailed WebSocket phase and applies the active aggregate 
   }
 });
 
+void test('feeds actual projected WebSocket health envelopes into the strict deployment gate', async () => {
+  const url = 'http://127.0.0.1:3000/api/v1/health';
+  const healthyRepositoryValue = healthyRepository(healthyHealthDatabase(websocketRow({
+    recovery_status: 'RECOVERED', recovery_started_at: detectedAt,
+    recovery_completed_at: openedAt, recovery_reason_code: 'STARTUP',
+  })));
+  const healthy = await healthyRepositoryValue.getHealth();
+  assert.equal(healthy.heartbeat.websocket.supervision, 'ACTIVE');
+  assert.equal(healthy.heartbeat.websocket.phase, 'RUNNING');
+  assert.equal(healthy.heartbeat.websocket.state, 'ACKNOWLEDGED');
+  assert.equal(healthy.heartbeat.websocket.recovery.status, 'RECOVERED');
+  assert.equal(healthy.status, 'OK');
+  await checkDeploymentHealth(url, {
+    fetch: async () => healthResponseFromRouter(healthyRepositoryValue), requireOk: true,
+  });
+
+  const degradedRows = [
+    ...(['CONNECTING', 'WAITING_FOR_ACKS', 'ACKNOWLEDGED', 'RECOVERING', 'DEGRADED', 'UNRECOVERABLE', 'STOPPING'] as const)
+      .map((phase) => websocketRowForPhase(phase)),
+    websocketRow({ recovery_status: 'REQUIRED', recovery_started_at: null, recovery_completed_at: null, recovery_reason_code: 'SESSION_FAILURE' }),
+    websocketRow({ recovery_status: 'IN_PROGRESS', recovery_started_at: detectedAt, recovery_completed_at: null, recovery_reason_code: 'SESSION_FAILURE' }),
+    websocketRow({ recovery_status: 'FAILED', recovery_started_at: detectedAt, recovery_completed_at: openedAt, recovery_reason_code: 'SESSION_FAILURE' }),
+    websocketRow({ heartbeat_at: new Date(openedAt.getTime() - 30_001) }),
+  ];
+  for (const [index, websocket] of degradedRows.entries()) {
+    const repository = healthyRepository(healthyHealthDatabase(websocket));
+    const health = await repository.getHealth();
+    assert.equal(health.status, 'DEGRADED', `projection ${index}`);
+    await assert.rejects(checkDeploymentHealth(url, {
+      fetch: async () => healthResponseFromRouter(repository), requireOk: true,
+    }), (error: unknown) => error instanceof Error && error.name === 'DeploymentHealthcheckError');
+  }
+
+  const unresolvedRepository = healthyRepository(healthyHealthDatabase(websocketRow(), true));
+  const unresolved = await unresolvedRepository.getHealth();
+  assert.equal(unresolved.status, 'DEGRADED');
+  await assert.rejects(checkDeploymentHealth(url, {
+    fetch: async () => healthResponseFromRouter(unresolvedRepository), requireOk: true,
+  }), (error: unknown) => error instanceof Error && error.name === 'DeploymentHealthcheckError');
+});
+
 void test('ignores an absent or inactive WebSocket snapshot but degrades stale and unresolved active health', async () => {
   const absentDatabase = healthyHealthDatabase();
   const absent = await healthyRepository(absentDatabase).getHealth();
@@ -2120,6 +2164,28 @@ function healthyRepository(database: Queryable): PostgresApiProjectionRepository
     httpAvailable: true, pumpfun: 'RUNNING', pumpswap: 'RUNNING',
     qualification: 'RUNNING', paperDecision: 'RUNNING', social: 'RUNNING',
   });
+}
+
+async function healthResponseFromRouter(
+  projections: PostgresApiProjectionRepository,
+): Promise<Response> {
+  const router = createApiRouter({
+    projections, now: () => openedAt.getTime(), defaultLimit: 20, maximumLimit: 100,
+    correlationId: () => 'health_projection_test', logError: () => undefined,
+  });
+  const response = new HealthRouteResponse();
+  await router(
+    { method: 'GET', url: '/api/v1/health', headers: {} } as unknown as IncomingMessage,
+    response as unknown as ServerResponse,
+  );
+  return new Response(response.body, { status: response.status });
+}
+
+class HealthRouteResponse {
+  public status = 0;
+  public body = '';
+  public writeHead(status: number): this { this.status = status; return this; }
+  public end(chunk?: string): this { this.body = chunk ?? ''; return this; }
 }
 
 function healthyHeartbeatRow(
