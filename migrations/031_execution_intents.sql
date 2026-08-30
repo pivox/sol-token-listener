@@ -29,8 +29,8 @@ CREATE TABLE IF NOT EXISTS execution_intents (
   last_reason_code TEXT,
   terminal_at TIMESTAMPTZ,
   reconciliation_completed_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT date_trunc('milliseconds', clock_timestamp()),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT date_trunc('milliseconds', clock_timestamp()),
   purge_after TIMESTAMPTZ,
   CONSTRAINT execution_intents_payload_version_check CHECK (payload_version = 1),
   CONSTRAINT execution_intents_logical_order_key_unique UNIQUE (logical_order_key),
@@ -71,17 +71,20 @@ CREATE TABLE IF NOT EXISTS execution_intents (
       quote_amount_raw <> 'NaN'::NUMERIC
       AND quote_amount_raw > 0
       AND quote_amount_raw = trunc(quote_amount_raw)
+      AND scale(quote_amount_raw) = 0
       AND quote_amount_raw < 18446744073709551616
     ))
     AND (base_amount_raw IS NULL OR (
       base_amount_raw <> 'NaN'::NUMERIC
       AND base_amount_raw > 0
       AND base_amount_raw = trunc(base_amount_raw)
+      AND scale(base_amount_raw) = 0
       AND base_amount_raw < 18446744073709551616
     ))
     AND minimum_amount_out_raw <> 'NaN'::NUMERIC
     AND minimum_amount_out_raw > 0
     AND minimum_amount_out_raw = trunc(minimum_amount_out_raw)
+    AND scale(minimum_amount_out_raw) = 0
     AND minimum_amount_out_raw < 18446744073709551616
   ),
   CONSTRAINT execution_intents_fingerprint_check CHECK (
@@ -111,13 +114,45 @@ CREATE TABLE IF NOT EXISTS execution_intents (
   ),
   CONSTRAINT execution_intents_temporal_check CHECK (
     isfinite(requested_at)
+    AND requested_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+    AND requested_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+    AND date_trunc('milliseconds', requested_at) = requested_at
     AND isfinite(expires_at)
+    AND expires_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+    AND expires_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+    AND date_trunc('milliseconds', expires_at) = expires_at
     AND isfinite(created_at)
+    AND created_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+    AND created_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+    AND date_trunc('milliseconds', created_at) = created_at
     AND isfinite(updated_at)
-    AND (terminal_at IS NULL OR isfinite(terminal_at))
-    AND (reconciliation_completed_at IS NULL OR isfinite(reconciliation_completed_at))
-    AND (purge_after IS NULL OR isfinite(purge_after))
-    AND (lease_expires_at IS NULL OR isfinite(lease_expires_at))
+    AND updated_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+    AND updated_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+    AND date_trunc('milliseconds', updated_at) = updated_at
+    AND (terminal_at IS NULL OR (
+      isfinite(terminal_at)
+      AND terminal_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+      AND terminal_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+      AND date_trunc('milliseconds', terminal_at) = terminal_at
+    ))
+    AND (reconciliation_completed_at IS NULL OR (
+      isfinite(reconciliation_completed_at)
+      AND reconciliation_completed_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+      AND reconciliation_completed_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+      AND date_trunc('milliseconds', reconciliation_completed_at) = reconciliation_completed_at
+    ))
+    AND (purge_after IS NULL OR (
+      isfinite(purge_after)
+      AND purge_after >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+      AND purge_after <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+      AND date_trunc('milliseconds', purge_after) = purge_after
+    ))
+    AND (lease_expires_at IS NULL OR (
+      isfinite(lease_expires_at)
+      AND lease_expires_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+      AND lease_expires_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+      AND date_trunc('milliseconds', lease_expires_at) = lease_expires_at
+    ))
     AND expires_at > requested_at
     AND updated_at >= created_at
     AND (terminal_at IS NULL OR terminal_at >= requested_at)
@@ -159,7 +194,7 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
   status TEXT NOT NULL,
   effective_venue TEXT,
   provider_id TEXT,
-  started_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  started_at TIMESTAMPTZ NOT NULL DEFAULT date_trunc('milliseconds', clock_timestamp()),
   completed_at TIMESTAMPTZ,
   reason_code TEXT,
   purge_after TIMESTAMPTZ,
@@ -194,12 +229,25 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
   ),
   CONSTRAINT execution_attempts_temporal_check CHECK (
     isfinite(started_at)
-    AND (completed_at IS NULL OR isfinite(completed_at))
-    AND (purge_after IS NULL OR isfinite(purge_after))
+    AND started_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+    AND started_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+    AND date_trunc('milliseconds', started_at) = started_at
+    AND (completed_at IS NULL OR (
+      isfinite(completed_at)
+      AND completed_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+      AND completed_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+      AND date_trunc('milliseconds', completed_at) = completed_at
+    ))
+    AND (purge_after IS NULL OR (
+      isfinite(purge_after)
+      AND purge_after >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+      AND purge_after <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+      AND date_trunc('milliseconds', purge_after) = purge_after
+    ))
     AND (completed_at IS NULL OR completed_at >= started_at)
     AND (purge_after IS NULL OR (
       completed_at IS NOT NULL
-      AND purge_after = completed_at + INTERVAL '4 hours'
+      AND purge_after >= completed_at
     ))
   )
 );
@@ -214,7 +262,7 @@ CREATE TABLE IF NOT EXISTS execution_intent_transitions (
   activation_phase TEXT NOT NULL,
   attempt_number INTEGER,
   evidence JSONB NOT NULL,
-  occurred_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT date_trunc('milliseconds', clock_timestamp()),
   CONSTRAINT execution_intent_transitions_previous_status_check CHECK (previous_status IN (
     'PENDING', 'PROCESSING', 'SIMULATED', 'RETRY_READY', 'SIGNED_NOT_SUBMITTED',
     'SUBMITTED', 'CONFIRMED', 'RECONCILING', 'SUCCEEDED', 'FAILED', 'EXPIRED',
@@ -250,11 +298,42 @@ CREATE TABLE IF NOT EXISTS execution_intent_transitions (
   ),
   CONSTRAINT execution_intent_transitions_evidence_check CHECK (
     jsonb_typeof(evidence) = 'object'
-    AND evidence ? 'payloadVersion'
+    AND evidence ?& ARRAY['payloadVersion', 'attemptNumber', 'sourceEventId', 'observedAtMs']
+    AND evidence - ARRAY['payloadVersion', 'attemptNumber', 'sourceEventId', 'observedAtMs'] = '{}'::JSONB
+    AND jsonb_typeof(evidence -> 'payloadVersion') = 'number'
     AND evidence -> 'payloadVersion' = '1'::JSONB
+    AND (
+      evidence -> 'attemptNumber' = 'null'::JSONB
+      OR (
+        jsonb_typeof(evidence -> 'attemptNumber') = 'number'
+        AND evidence ->> 'attemptNumber' ~ '^[1-9][0-9]{0,9}$'
+        AND (
+          char_length(evidence ->> 'attemptNumber') < 10
+          OR evidence ->> 'attemptNumber' <= '2147483647'
+        )
+      )
+    )
+    AND (
+      evidence -> 'sourceEventId' = 'null'::JSONB
+      OR (
+        jsonb_typeof(evidence -> 'sourceEventId') = 'string'
+        AND octet_length(evidence ->> 'sourceEventId') BETWEEN 1 AND 256
+      )
+    )
+    AND jsonb_typeof(evidence -> 'observedAtMs') = 'number'
+    AND evidence ->> 'observedAtMs' ~ '^(0|[1-9][0-9]{0,15})$'
+    AND (
+      char_length(evidence ->> 'observedAtMs') < 16
+      OR evidence ->> 'observedAtMs' <= '8640000000000000'
+    )
     AND octet_length(evidence::TEXT) <= 16384
   ),
-  CONSTRAINT execution_intent_transitions_occurred_at_check CHECK (isfinite(occurred_at))
+  CONSTRAINT execution_intent_transitions_occurred_at_check CHECK (
+    isfinite(occurred_at)
+    AND occurred_at >= TIMESTAMPTZ '1970-01-01 00:00:00.000+00'
+    AND occurred_at <= TIMESTAMPTZ '275760-09-13 00:00:00.000+00'
+    AND date_trunc('milliseconds', occurred_at) = occurred_at
+  )
 );
 
 CREATE INDEX IF NOT EXISTS execution_intents_claim_idx
