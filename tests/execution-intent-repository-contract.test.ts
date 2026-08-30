@@ -21,10 +21,24 @@ import type {
   ExecutionIntentTransitionInput,
 } from '../src/ports/execution-intent-repository.js';
 
-type Equal<Left, Right> = [Left] extends [Right]
-  ? [Right] extends [Left] ? true : false
-  : false;
+/* eslint-disable @typescript-eslint/no-unnecessary-type-parameters */
+type IfEquals<Left, Right, EqualValue, DifferentValue> = (
+  <Value>() => Value extends Left ? 1 : 2
+) extends (
+  <Value>() => Value extends Right ? 1 : 2
+) ? EqualValue : DifferentValue;
+/* eslint-enable @typescript-eslint/no-unnecessary-type-parameters */
+type Equal<Left, Right> = IfEquals<Left, Right, true, false>;
 type Expect<Value extends true> = Value;
+type OptionalKeys<Value> = {
+  [Key in keyof Value]-?: object extends Pick<Value, Key> ? Key : never;
+}[keyof Value];
+type ReadonlyKeys<Value> = {
+  [Key in keyof Value]-?: IfEquals<
+    Pick<Value, Key>, Readonly<Pick<Value, Key>>, Key, never
+  >;
+}[keyof Value];
+type AssertAll<Assertions extends Readonly<Record<string, true>>> = Assertions;
 
 type CreateResult = Readonly<{
   readonly kind: 'CREATED' | 'REPLAYED';
@@ -48,59 +62,109 @@ type FinishAttemptInput = Readonly<{
   readonly reasonCode: ExecutionIntentReasonCode;
 }>;
 
-type ExactSurfaceAssertions = readonly [
-  Expect<Equal<keyof ExecutionIntentRepository,
-    'create' | 'claim' | 'beginAttempt' | 'finishAttempt' | 'renew' | 'release' | 'transition' | 'expirePreSubmission' | 'read'>>,
-  Expect<Equal<ExecutionIntentRepository['create'], (draft: ExecutionIntentDraftV1) => Promise<CreateResult>>>,
-  Expect<Equal<ExecutionIntentRepository['claim'], (options: ClaimOptions) => Promise<ClaimedExecutionIntent | null>>>,
-  Expect<Equal<ExecutionIntentRepository['beginAttempt'], (claim: ClaimedExecutionIntent) => Promise<AttemptResult>>>,
-  Expect<Equal<ExecutionIntentRepository['finishAttempt'], (claim: ClaimedExecutionIntent, input: FinishAttemptInput) => Promise<boolean>>>,
-  Expect<Equal<ExecutionIntentRepository['renew'], (claim: ClaimedExecutionIntent, leaseMs: number) => Promise<boolean>>>,
-  Expect<Equal<ExecutionIntentRepository['release'], (claim: ClaimedExecutionIntent) => Promise<boolean>>>,
-  Expect<Equal<ExecutionIntentRepository['transition'], (claim: ClaimedExecutionIntent, input: ExecutionIntentTransitionInput) => Promise<ExecutionIntentV1>>>,
-  Expect<Equal<ExecutionIntentRepository['expirePreSubmission'], (limit: number) => Promise<number>>>,
-  Expect<Equal<ExecutionIntentRepository['read'], (intentId: string) => Promise<ExecutionIntentV1 | null>>>,
-  Expect<Equal<ExecutionClaimPurpose, 'EXECUTE' | 'CONFIRM' | 'RECONCILE'>>,
-  Expect<Equal<keyof ClaimedExecutionIntent, 'intent' | 'leaseOwner' | 'leaseToken' | 'leaseExpiresAtMs'>>,
-  Expect<Equal<ClaimedExecutionIntent['intent'], ExecutionIntentV1>>,
-  Expect<Equal<ClaimedExecutionIntent['leaseOwner'], string>>,
-  Expect<Equal<ClaimedExecutionIntent['leaseToken'], string>>,
-  Expect<Equal<ClaimedExecutionIntent['leaseExpiresAtMs'], number>>,
-  Expect<Equal<keyof ExecutionIntentTransitionEvidenceV1, 'payloadVersion' | 'attemptNumber' | 'sourceEventId' | 'observedAtMs'>>,
-  Expect<Equal<ExecutionIntentTransitionEvidenceV1['payloadVersion'], 1>>,
-  Expect<Equal<ExecutionIntentTransitionEvidenceV1['attemptNumber'], number | null>>,
-  Expect<Equal<ExecutionIntentTransitionEvidenceV1['sourceEventId'], string | null>>,
-  Expect<Equal<ExecutionIntentTransitionEvidenceV1['observedAtMs'], number>>,
-  Expect<Equal<keyof ExecutionIntentTransitionInput, 'intentId' | 'expectedStatus' | 'nextStatus' | 'leaseToken' | 'reasonCode' | 'humanMessage' | 'activationPhase' | 'evidence'>>,
-  Expect<Equal<ExecutionIntentTransitionInput['intentId'], string>>,
-  Expect<Equal<ExecutionIntentTransitionInput['expectedStatus'], ExecutionIntentStatus>>,
-  Expect<Equal<ExecutionIntentTransitionInput['nextStatus'], ExecutionIntentStatus>>,
-  Expect<Equal<ExecutionIntentTransitionInput['leaseToken'], string>>,
-  Expect<Equal<ExecutionIntentTransitionInput['reasonCode'], ExecutionIntentReasonCode>>,
-  Expect<Equal<ExecutionIntentTransitionInput['humanMessage'], string>>,
-  Expect<Equal<ExecutionIntentTransitionInput['activationPhase'], 'NONE' | 'CANARY' | 'MICRO_LIVE' | 'PILOT'>>,
-  Expect<Equal<ExecutionIntentTransitionInput['evidence'], ExecutionIntentTransitionEvidenceV1>>,
-];
+type ActualCreateResult = Awaited<ReturnType<ExecutionIntentRepository['create']>>;
+type ActualClaimOptions = Parameters<ExecutionIntentRepository['claim']>[0];
+type ActualAttemptResult = Awaited<ReturnType<ExecutionIntentRepository['beginAttempt']>>;
+type ActualFinishAttemptInput = Parameters<ExecutionIntentRepository['finishAttempt']>[1];
 
-const exactSurfaceAssertions: ExactSurfaceAssertions = [
-  true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-  true, true, true, true, true, true, true, true, true, true, true, true, true, true,
-  true, true,
-];
-void exactSurfaceAssertions;
+/* eslint-disable @typescript-eslint/no-duplicate-type-constituents */
+type ExactSurfaceAssertions = AssertAll<{
+  repositoryKeys: Expect<Equal<keyof ExecutionIntentRepository, 'create' | 'claim' | 'beginAttempt' | 'finishAttempt' | 'renew' | 'release' | 'transition' | 'expirePreSubmission' | 'read'>>;
+  create: Expect<Equal<ExecutionIntentRepository['create'], (draft: ExecutionIntentDraftV1) => Promise<CreateResult>>>;
+  claim: Expect<Equal<ExecutionIntentRepository['claim'], (options: ClaimOptions) => Promise<ClaimedExecutionIntent | null>>>;
+  beginAttempt: Expect<Equal<ExecutionIntentRepository['beginAttempt'], (claim: ClaimedExecutionIntent) => Promise<AttemptResult>>>;
+  finishAttempt: Expect<Equal<ExecutionIntentRepository['finishAttempt'], (claim: ClaimedExecutionIntent, input: FinishAttemptInput) => Promise<boolean>>>;
+  renew: Expect<Equal<ExecutionIntentRepository['renew'], (claim: ClaimedExecutionIntent, leaseMs: number) => Promise<boolean>>>;
+  release: Expect<Equal<ExecutionIntentRepository['release'], (claim: ClaimedExecutionIntent) => Promise<boolean>>>;
+  transition: Expect<Equal<ExecutionIntentRepository['transition'], (claim: ClaimedExecutionIntent, input: ExecutionIntentTransitionInput) => Promise<ExecutionIntentV1>>>;
+  expirePreSubmission: Expect<Equal<ExecutionIntentRepository['expirePreSubmission'], (limit: number) => Promise<number>>>;
+  read: Expect<Equal<ExecutionIntentRepository['read'], (intentId: string) => Promise<ExecutionIntentV1 | null>>>;
+  methodArities: Expect<Equal<Parameters<ExecutionIntentRepository['create']>['length'], 1>>
+    & Expect<Equal<Parameters<ExecutionIntentRepository['claim']>['length'], 1>>
+    & Expect<Equal<Parameters<ExecutionIntentRepository['beginAttempt']>['length'], 1>>
+    & Expect<Equal<Parameters<ExecutionIntentRepository['finishAttempt']>['length'], 2>>
+    & Expect<Equal<Parameters<ExecutionIntentRepository['renew']>['length'], 2>>
+    & Expect<Equal<Parameters<ExecutionIntentRepository['release']>['length'], 1>>
+    & Expect<Equal<Parameters<ExecutionIntentRepository['transition']>['length'], 2>>
+    & Expect<Equal<Parameters<ExecutionIntentRepository['expirePreSubmission']>['length'], 1>>
+    & Expect<Equal<Parameters<ExecutionIntentRepository['read']>['length'], 1>>;
+  purpose: Expect<Equal<ExecutionClaimPurpose, 'EXECUTE' | 'CONFIRM' | 'RECONCILE'>>;
+  claimed: Expect<Equal<keyof ClaimedExecutionIntent, 'intent' | 'leaseOwner' | 'leaseToken' | 'leaseExpiresAtMs'>>
+    & Expect<Equal<OptionalKeys<ClaimedExecutionIntent>, never>>
+    & Expect<Equal<ReadonlyKeys<ClaimedExecutionIntent>, keyof ClaimedExecutionIntent>>
+    & Expect<Equal<ClaimedExecutionIntent['intent'], ExecutionIntentV1>>
+    & Expect<Equal<ClaimedExecutionIntent['leaseOwner'], string>>
+    & Expect<Equal<ClaimedExecutionIntent['leaseToken'], string>>
+    & Expect<Equal<ClaimedExecutionIntent['leaseExpiresAtMs'], number>>;
+  evidence: Expect<Equal<keyof ExecutionIntentTransitionEvidenceV1, 'payloadVersion' | 'attemptNumber' | 'sourceEventId' | 'observedAtMs'>>
+    & Expect<Equal<OptionalKeys<ExecutionIntentTransitionEvidenceV1>, never>>
+    & Expect<Equal<ReadonlyKeys<ExecutionIntentTransitionEvidenceV1>, keyof ExecutionIntentTransitionEvidenceV1>>
+    & Expect<Equal<ExecutionIntentTransitionEvidenceV1['payloadVersion'], 1>>
+    & Expect<Equal<ExecutionIntentTransitionEvidenceV1['attemptNumber'], number | null>>
+    & Expect<Equal<ExecutionIntentTransitionEvidenceV1['sourceEventId'], string | null>>
+    & Expect<Equal<ExecutionIntentTransitionEvidenceV1['observedAtMs'], number>>;
+  transitionInput: Expect<Equal<keyof ExecutionIntentTransitionInput, 'intentId' | 'expectedStatus' | 'nextStatus' | 'leaseToken' | 'reasonCode' | 'humanMessage' | 'activationPhase' | 'evidence'>>
+    & Expect<Equal<OptionalKeys<ExecutionIntentTransitionInput>, never>>
+    & Expect<Equal<ReadonlyKeys<ExecutionIntentTransitionInput>, keyof ExecutionIntentTransitionInput>>
+    & Expect<Equal<ExecutionIntentTransitionInput['intentId'], string>>
+    & Expect<Equal<ExecutionIntentTransitionInput['expectedStatus'], ExecutionIntentStatus>>
+    & Expect<Equal<ExecutionIntentTransitionInput['nextStatus'], ExecutionIntentStatus>>
+    & Expect<Equal<ExecutionIntentTransitionInput['leaseToken'], string>>
+    & Expect<Equal<ExecutionIntentTransitionInput['reasonCode'], ExecutionIntentReasonCode>>
+    & Expect<Equal<ExecutionIntentTransitionInput['humanMessage'], string>>
+    & Expect<Equal<ExecutionIntentTransitionInput['activationPhase'], 'NONE' | 'CANARY' | 'MICRO_LIVE' | 'PILOT'>>
+    & Expect<Equal<ExecutionIntentTransitionInput['evidence'], ExecutionIntentTransitionEvidenceV1>>;
+  claimOptions: Expect<Equal<keyof ActualClaimOptions, keyof ClaimOptions>>
+    & Expect<Equal<OptionalKeys<ActualClaimOptions>, never>>
+    & Expect<Equal<ReadonlyKeys<ActualClaimOptions>, keyof ActualClaimOptions>>
+    & Expect<Equal<ActualClaimOptions['ownerId'], string>>
+    & Expect<Equal<ActualClaimOptions['leaseMs'], number>>
+    & Expect<Equal<ActualClaimOptions['purpose'], ExecutionClaimPurpose>>;
+  finishAttemptInput: Expect<Equal<keyof ActualFinishAttemptInput, keyof FinishAttemptInput>>
+    & Expect<Equal<OptionalKeys<ActualFinishAttemptInput>, never>>
+    & Expect<Equal<ReadonlyKeys<ActualFinishAttemptInput>, keyof ActualFinishAttemptInput>>
+    & Expect<Equal<ActualFinishAttemptInput['attemptNumber'], number>>
+    & Expect<Equal<ActualFinishAttemptInput['status'], 'COMPLETED' | 'ABANDONED'>>
+    & Expect<Equal<ActualFinishAttemptInput['effectiveVenue'], 'PUMP_FUN' | 'PUMP_SWAP' | null>>
+    & Expect<Equal<ActualFinishAttemptInput['providerId'], string | null>>
+    & Expect<Equal<ActualFinishAttemptInput['reasonCode'], ExecutionIntentReasonCode>>;
+  createResult: Expect<Equal<keyof ActualCreateResult, keyof CreateResult>>
+    & Expect<Equal<OptionalKeys<ActualCreateResult>, never>>
+    & Expect<Equal<ReadonlyKeys<ActualCreateResult>, keyof ActualCreateResult>>
+    & Expect<Equal<ActualCreateResult['kind'], 'CREATED' | 'REPLAYED'>>
+    & Expect<Equal<ActualCreateResult['intent'], ExecutionIntentV1>>;
+  attemptResult: Expect<Equal<keyof ActualAttemptResult, keyof AttemptResult>>
+    & Expect<Equal<OptionalKeys<ActualAttemptResult>, never>>
+    & Expect<Equal<ReadonlyKeys<ActualAttemptResult>, keyof ActualAttemptResult>>
+    & Expect<Equal<ActualAttemptResult['intentId'], string>>
+    & Expect<Equal<ActualAttemptResult['attemptNumber'], number>>
+    & Expect<Equal<ActualAttemptResult['startedAtMs'], number>>;
+}>;
+/* eslint-enable @typescript-eslint/no-duplicate-type-constituents */
+void (null as never as ExactSurfaceAssertions);
 
 void test('execution intent repository is an allowlisted domain-only persistence boundary', async () => {
   const sourceUrl = new URL('../src/ports/execution-intent-repository.ts', import.meta.url);
   const sourcePath = fileURLToPath(sourceUrl);
   const source = await readFile(sourceUrl, 'utf8');
   const sourceFile = ts.createSourceFile(sourcePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const imports = sourceFile.statements.filter(ts.isImportDeclaration);
-  const exported = sourceFile.statements.filter(isExportedPortDeclaration);
 
-  assert.equal(imports.length, 1);
-  const [domainImport] = imports;
+  assert.equal(sourceFile.statements.length, 6);
+  const [firstStatement, ...declarations] = sourceFile.statements;
+  assert.ok(firstStatement !== undefined && ts.isImportDeclaration(firstStatement));
+  const domainImport = firstStatement !== undefined && ts.isImportDeclaration(firstStatement)
+    ? firstStatement
+    : undefined;
+  assert.equal(declarations.length, 5);
+  assert.ok(declarations.every(isExportedPortDeclaration));
   assert.ok(domainImport?.importClause?.isTypeOnly);
-  assert.equal(domainImport?.moduleSpecifier.getText(sourceFile), "'../domain/execution-intent.js'");
+  assert.ok(domainImport?.moduleSpecifier !== undefined && ts.isStringLiteral(domainImport.moduleSpecifier));
+  assert.equal(
+    domainImport?.moduleSpecifier !== undefined && ts.isStringLiteral(domainImport.moduleSpecifier)
+      ? domainImport.moduleSpecifier.text
+      : undefined,
+    '../domain/execution-intent.js',
+  );
   assert.ok(domainImport?.importClause?.namedBindings !== undefined);
   assert.ok(domainImport?.importClause?.namedBindings !== undefined
     && ts.isNamedImports(domainImport.importClause.namedBindings));
@@ -112,7 +176,7 @@ void test('execution intent repository is an allowlisted domain-only persistence
     ['ExecutionIntentDraftV1', 'ExecutionIntentReasonCode', 'ExecutionIntentStatus', 'ExecutionIntentV1'],
   );
   assert.deepEqual(
-    exported.map((statement) => declarationName(statement)).sort(),
+    declarations.filter(isExportedPortDeclaration).map(declarationName).sort(),
     [
       'ClaimedExecutionIntent',
       'ExecutionClaimPurpose',
@@ -121,7 +185,6 @@ void test('execution intent repository is an allowlisted domain-only persistence
       'ExecutionIntentTransitionInput',
     ],
   );
-  assert.equal(sourceFile.statements.filter((statement) => hasExportModifier(statement)).length, 5);
   assert.deepEqual(executionBoundaryViolations(source, sourcePath, fileURLToPath(new URL('../', import.meta.url))), []);
   assert.deepEqual(moduleEscapeViolations(sourceFile), []);
   assert.deepEqual(forbiddenTokenViolations(sourceFile), []);
@@ -243,7 +306,7 @@ function declarationName(statement: ts.TypeAliasDeclaration | ts.InterfaceDeclar
 function moduleEscapeViolations(sourceFile: ts.SourceFile): readonly string[] {
   const violations: string[] = [];
   const visit = (node: ts.Node): void => {
-    if (ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined) violations.push('export-from');
+    if (ts.isExportDeclaration(node)) violations.push('export-declaration');
     if (ts.isImportEqualsDeclaration(node)) violations.push('import-equals');
     if (ts.isImportTypeNode(node)) violations.push('import-type');
     if (ts.isCallExpression(node) && (
