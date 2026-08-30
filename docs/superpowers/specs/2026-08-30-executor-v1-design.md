@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.1.0
+**Version de spécification :** 1.1.1
 
 **Date :** 2026-08-30
 
@@ -13,6 +13,10 @@ inerte des intentions d'exécution)
 
 ## Historique des versions
 
+- **1.1.1 — 2026-08-30 :** borne l'échéance immutable d'une intention à
+  quatre heures et rend les reason codes positifs obligatoires par état et par
+  tentative, afin de fermer respectivement le rejeu après purge et le journal
+  contradictoire identifiés par la revue finale.
 - **1.1.0 — 2026-08-30 :** ajoute sans changer l'identité V1 une révision
   d'état monotone contre les reprises ABA, fixe la décision et son fingerprint
   sur l'événement canonique `PaperStrategySessionUpdated` avec un TTL borné,
@@ -310,6 +314,20 @@ Chaque transition est persistée avec : ancien/nouvel état, date PostgreSQL,
 reason code stable, message humain borné, phase d'activation, tentative et
 preuves structurées versionnées.
 
+Les transitions nominales utilisent obligatoirement le reason code du nouvel
+état : `PROCESSING/EXECUTION_STARTED`, `SIMULATED/SIMULATION_SUCCEEDED`,
+`RETRY_READY/RETRY_AUTHORIZED`,
+`SIGNED_NOT_SUBMITTED/SIGNATURE_PERSISTED`,
+`SUBMITTED/SUBMISSION_ACCEPTED`, `CONFIRMED/CONFIRMATION_OBSERVED`,
+`RECONCILING/RECONCILIATION_STARTED`, `SUCCEEDED/INTENT_SUCCEEDED` et
+`CANCELLED/INTENT_CANCELLED`. `EXPIRED` exige `INTENT_EXPIRED` et
+`UNKNOWN_REQUIRES_RECONCILIATION` exige `RECONCILIATION_REQUIRED`. Un état
+`FAILED` exige un code d'échec et refuse tout code positif. Une tentative
+`COMPLETED` exige `ATTEMPT_COMPLETED`; une tentative `ABANDONED` exige un code
+d'échec et refuse `ATTEMPT_COMPLETED` ainsi que les autres codes positifs.
+Ces couples sont validés avant toute connexion PostgreSQL, au décodage et par
+les contraintes des trois tables durables.
+
 ### 5.4 Leases et crash/reprise
 
 Le claim utilise `FOR UPDATE SKIP LOCKED`, l'heure PostgreSQL et un lease
@@ -366,7 +384,8 @@ En #51-B, le mapper pur accepte uniquement l'événement canonique et immuable
 session courante. `requested_at` est le temps observé de cet événement et doit
 égaler `session.updatedAtMs`; le fingerprint est le SHA-256 de sa
 représentation JSON canonique. `expires_at - requested_at` doit rester dans le
-TTL maximal fourni au mapper. Toute lignée, qualification, quote ou échéance
+TTL maximal fourni au mapper, lui-même borné par le maximum dur
+`14_400_000 ms`. Toute lignée, qualification, quote ou échéance
 incohérente est refusée fail-closed. Ce mapper n'est composé dans aucun runtime
 et ne persiste lui-même aucune intention.
 
@@ -662,6 +681,18 @@ blockhash ne peut plus atterrir, puis suit cette même fenêtre. La purge suppri
 d'abord artefacts, tentatives et transitions, puis l'intention, dans une
 transaction rejouable. Elle publie seulement des compteurs agrégés.
 
+Le plafond dur d'échéance ferme le rejeu après purge sans tombstone permanent :
+
+```text
+expires_at <= requested_at + 4h
+requested_at <= terminal_at <= reconciliation_completed_at
+purge_after = reconciliation_completed_at + 4h
+donc expires_at <= purge_after
+```
+
+Une identité recréée après sa purge porte donc nécessairement une échéance
+déjà atteinte et ne peut pas être réclamée avec le purpose `EXECUTE`.
+
 La fondation #51-B fige une heure de coupure PostgreSQL puis verrouille une
 cohorte ordonnée d'identifiants terminaux et réconciliés. Les transitions et
 tentatives de cette cohorte exacte sont supprimées avant leurs intentions dans
@@ -710,6 +741,16 @@ RECONCILIATION_REQUIRED
 BALANCE_MISMATCH
 RESIDUAL_TOKEN_BALANCE
 DOUBLE_ORDER_SUSPECTED
+EXECUTION_STARTED
+SIMULATION_SUCCEEDED
+ATTEMPT_COMPLETED
+RETRY_AUTHORIZED
+SIGNATURE_PERSISTED
+SUBMISSION_ACCEPTED
+CONFIRMATION_OBSERVED
+RECONCILIATION_STARTED
+INTENT_SUCCEEDED
+INTENT_CANCELLED
 ```
 
 La liste est append-only dans la version majeure 1. Un code n'est jamais
