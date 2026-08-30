@@ -41,6 +41,7 @@ void test('execution dry-run assessment migration defines an additive, inert con
     /result_fingerprint ~ '\^\[0-9a-f\]\{64\}\$'/u,
     /octet_length\(strategy_id\) BETWEEN 1 AND 256/u,
     /strategy_version BETWEEN 1 AND 2147483647/u,
+    /evaluator_version = 1/u,
     /intent_state_revision >= 0/u,
     /intent_status IN \('PENDING', 'RETRY_READY'\)/u,
     /outcome = 'FOUNDATION_VALIDATED'/u,
@@ -48,9 +49,11 @@ void test('execution dry-run assessment migration defines an additive, inert con
     /quote_status = 'NOT_RUN'/u, /build_status = 'NOT_RUN'/u,
     /simulation_status = 'NOT_RUN'/u, /signature_status = 'NOT_RUN'/u,
     /submission_status = 'NOT_RUN'/u,
-    /isfinite\(recorded_at\)/u, /date_trunc\('milliseconds', recorded_at\) = recorded_at/u,
+    /isfinite\(recorded_at\)/u,
+    /recorded_at <= TIMESTAMPTZ '275760-09-13 00:00:00\.000\+00'/u,
+    /date_trunc\('milliseconds', recorded_at\) = recorded_at/u,
   ]) assert.match(definition, check);
-  assert.doesNotMatch(definition, /\b(?:json|payload(?!_version)|mint|amount|quote(?!_status)|wallet|signature(?!_status)|transaction|secret)\b/iu);
+  assert.doesNotMatch(definition, /\b(?:json|payload(?!_version)|mint|amount|quote(?!_status)|wallet|signature(?!_status)|transaction|secret|arbitrary)\b/iu);
   assert.doesNotMatch(sql, /ALTER TABLE\s+(?:execution_intents|execution_attempts|execution_intent_transitions)/iu);
 });
 
@@ -124,7 +127,7 @@ void test('execution dry-run assessment rejects every invalid boundary and misma
     const parent = parentDraft('invariants');
     await insertParent(pool, parent);
     const invalid = [
-      { payloadVersion: 2 }, { specificationVersion: '' }, { specificationVersion: '1.4.1' }, { evaluatorVersion: 0 },
+      { payloadVersion: 2 }, { specificationVersion: '' }, { specificationVersion: '1.4.1' }, { evaluatorVersion: 0 }, { evaluatorVersion: 2 },
       { intentStatus: 'PROCESSING' }, { outcome: 'OTHER' }, { coverage: 'FULL' }, { quoteStatus: 'RUN' },
       { buildStatus: 'RUN' }, { simulationStatus: 'RUN' }, { signatureStatus: 'RUN' }, { submissionStatus: 'RUN' },
       { assessmentId: `execution_dry_run_assessment_${'A'.repeat(64)}` }, { intentId: `execution_intent_${'A'.repeat(64)}` },
@@ -140,6 +143,13 @@ void test('execution dry-run assessment rejects every invalid boundary and misma
         ...overrides,
       }));
     }
+    const maximumParent = parentDraft('recorded-at-maximum');
+    await insertParent(pool, maximumParent);
+    await insertAssessment(pool, maximumParent, {
+      assessmentId: `execution_dry_run_assessment_${'e'.repeat(64)}`,
+      evaluatorVersion: 1,
+      recordedAt: '275760-09-13T00:00:00.000Z',
+    });
     await insertAssessment(pool, parent);
     await assert.rejects(insertAssessment(pool, parent, { evaluatorVersion: 1, assessmentId: `execution_dry_run_assessment_${'d'.repeat(64)}` }));
     await assert.rejects(insertAssessment(pool, parent, { evaluatorVersion: 2 }));

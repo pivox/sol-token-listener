@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS execution_dry_run_assessments (
     specification_version = '1.4.0'
   ),
   CONSTRAINT execution_dry_run_assessments_evaluator_version_check CHECK (
-    evaluator_version BETWEEN 1 AND 2147483647
+    evaluator_version = 1
   ),
   CONSTRAINT execution_dry_run_assessments_identifier_check CHECK (
     assessment_id ~ '^execution_dry_run_assessment_[0-9a-f]{64}$'
