@@ -272,7 +272,7 @@ export function deriveExecutionIntent(
 }
 
 export function createExecutionDecisionFingerprint(event: DomainEvent): string {
-  return sha256(canonicalStringifyJson(event));
+  return sha256(canonicalFrozenJson(event));
 }
 
 function assertCanonicalSessionEvent(
@@ -315,16 +315,11 @@ function assertCanonicalSessionEvent(
     || record.source !== 'paper-decision'
     || record.mint !== mint
     || record.payloadVersion !== 1
-    || payload.session !== session
     || observedAtMs !== timestampProperty(session, 'updatedAtMs', 'DECISION_STALE')
     || !confirmationReached(confirmationStatus, minimumConfirmation)
   ) staleDecision();
-  let canonicalSession: string;
-  try {
-    canonicalSession = canonicalStringifyJson(session);
-  } catch {
-    staleDecision();
-  }
+  const canonicalSession = canonicalFrozenJson(session);
+  if (canonicalFrozenJson(payload.session) !== canonicalSession) staleDecision();
   const expectedId = createDeterministicDerivedEventId({
     type: 'PaperStrategySessionUpdated',
     mint,
@@ -526,6 +521,69 @@ function executionSnapshotId(namespace: string, parts: readonly (string | number
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function canonicalFrozenJson(value: unknown): string {
+  try {
+    return canonicalStringifyJson(cloneFrozenData(value, new Set<object>(), { nodes: 0 }, 0));
+  } catch (error: unknown) {
+    if (error instanceof ExecutionIntentProducerError) throw error;
+    staleDecision();
+  }
+}
+
+function cloneFrozenData(
+  value: unknown,
+  ancestors: Set<object>,
+  state: { nodes: number },
+  depth: number,
+): unknown {
+  if (value === null || ['string', 'boolean', 'bigint'].includes(typeof value)) return value;
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) staleDecision();
+    return value;
+  }
+  if (
+    typeof value !== 'object'
+    || isProxy(value)
+    || !Object.isFrozen(value)
+    || depth > 64
+    || (state.nodes += 1) > 10_000
+    || ancestors.has(value)
+  ) staleDecision();
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const keys = Reflect.ownKeys(value);
+      if (keys.length !== value.length + 1 || keys.some((key) => typeof key === 'symbol')) {
+        staleDecision();
+      }
+      const result: unknown[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+          staleDecision();
+        }
+        result.push(cloneFrozenData(descriptor.value, ancestors, state, depth + 1));
+      }
+      return Object.freeze(result);
+    }
+    const prototype = Object.getPrototypeOf(value) as object | null;
+    if (prototype !== Object.prototype && prototype !== null) staleDecision();
+    const keys = Reflect.ownKeys(value);
+    if (keys.some((key) => typeof key === 'symbol')) staleDecision();
+    const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const key of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+        staleDecision();
+      }
+      result[key] = cloneFrozenData(descriptor.value, ancestors, state, depth + 1);
+    }
+    return Object.freeze(result);
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 function confirmationReached(actual: string, minimum: string): boolean {

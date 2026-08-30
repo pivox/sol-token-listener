@@ -368,6 +368,52 @@ void test('rejects a forged PaperStrategySessionUpdated decision event', () => {
   }
 });
 
+void test('accepts canonically equal frozen session snapshots after deserialization', () => {
+  const input = buyInput();
+  const inputSession = deepFrozenClone(requiredSession(input));
+  const eventSession = deepFrozenClone(requiredSession(input));
+  const replay = Object.freeze({
+    ...input,
+    session: inputSession,
+    sessionEvent: sessionEventValue(eventSession, false),
+  });
+
+  assert.ok(deriveExecutionIntent(replay));
+});
+
+void test('canonical replay comparison never invokes a payload getter', () => {
+  const input = buyInput();
+  let reads = 0;
+  const payload = Object.freeze(Object.defineProperty({}, 'session', {
+    enumerable: true,
+    get() { reads += 1; return requiredSession(input); },
+  }));
+  assert.throws(
+    () => deriveExecutionIntent(Object.freeze({
+      ...input,
+      sessionEvent: Object.freeze({ ...input.sessionEvent, payload }),
+    })),
+    ExecutionIntentProducerError,
+  );
+  assert.equal(reads, 0);
+});
+
+void test('rejects a separately deserialized event session differing by one field', () => {
+  const input = buyInput();
+  const eventSession = Object.freeze({
+    ...deepFrozenClone(requiredSession(input)),
+    purgeAfterMs: requiredSession(input).purgeAfterMs + 1,
+  });
+  assert.throws(
+    () => deriveExecutionIntent(Object.freeze({
+      ...input,
+      session: deepFrozenClone(requiredSession(input)),
+      sessionEvent: sessionEventValue(eventSession, false),
+    })),
+    ExecutionIntentProducerError,
+  );
+});
+
 void test('enforces OPEN and CLOSE strategy reason invariants', () => {
   const open = buyInput();
   const badOpen = Object.freeze({ ...requiredSession(open), reasonCode: 'RECONCILIATION_REQUIRED' as const });
@@ -679,4 +725,17 @@ function strategyCommandIdForTest(
   parts: readonly string[],
 ): string {
   return `${namespace}_${createHash('sha256').update(JSON.stringify(parts)).digest('hex')}`;
+}
+
+function deepFrozenClone<T>(value: T): T {
+  return freezeRecursively(structuredClone(value));
+}
+
+function freezeRecursively<T>(value: T): T {
+  if (typeof value !== 'object' || value === null) return value;
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor !== undefined && 'value' in descriptor) freezeRecursively(descriptor.value);
+  }
+  return Object.freeze(value);
 }
