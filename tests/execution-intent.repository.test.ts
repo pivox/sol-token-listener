@@ -100,6 +100,7 @@ void test('claim validates a closed purpose and preserves each selected business
     const draft = executionDraft(`claim-${purpose}`);
     const client = new ScriptedClient([(_text, values) => result([{
       ...claimRow(draft, status), lease_token: values?.[2],
+      claim_at_ms: String(NOW_MS),
     }], 1)]);
     const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
@@ -144,6 +145,7 @@ void test('claim SQL admits a modeled lease exactly equal to statement_timestamp
       ...claimRow(draft, 'PENDING'),
       lease_owner: values?.[0],
       lease_token: values?.[2],
+      claim_at_ms: String(NOW_MS),
     }], 1);
   }]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -163,7 +165,10 @@ void test('renew and release fence on id, status, UUID token, and strict databas
   const draft = executionDraft('lease');
   const claim = claimedIntent(draft, 'PROCESSING');
   const client = new ScriptedClient([
-    result([], 0), result([], 0), result([], 1), result([], 1),
+    command('BEGIN'), result([], 0), command('ROLLBACK'),
+    command('BEGIN'), result([], 0), command('ROLLBACK'),
+    command('BEGIN'), result([claimRow(draft, 'PROCESSING')], 1), result([], 1), command('COMMIT'),
+    command('BEGIN'), result([claimRow(draft, 'PROCESSING')], 1), result([], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
@@ -172,15 +177,15 @@ void test('renew and release fence on id, status, UUID token, and strict databas
   assert.equal(await repository.renew(claim, 5_000), true);
   assert.equal(await repository.release(claim), true);
 
-  for (const call of client.calls) {
+  for (const call of client.calls.filter((candidate) => /^(?:\s*SELECT|\s*WITH)/u.test(candidate.text))) {
     assert.match(call.text, /id\s*=\s*\$1/u);
     assert.match(call.text, /status\s*=\s*\$2/u);
     assert.match(call.text, /lease_token\s*=\s*\$3::UUID/u);
     assert.match(call.text, /lease_expires_at\s*>\s*statement_timestamp\(\)/u);
     assert.deepEqual(call.values?.slice(0, 3), [draft.id, 'PROCESSING', UUID]);
   }
-  assert.match(required(client.calls[0]).text, /statement_timestamp\(\)\s*\+\s*\(\$4::BIGINT/u);
-  assert.match(required(client.calls[1]).text, /lease_owner\s*=\s*NULL/u);
+  assert.match(required(client.calls[8]).text, /statement_timestamp\(\)\s*\+\s*\(\$5::BIGINT/u);
+  assert.match(required(client.calls[12]).text, /lease_owner\s*=\s*NULL/u);
 });
 
 void test('claim rejects a well-shaped row that contradicts the requested lease identity', async () => {
@@ -189,6 +194,7 @@ void test('claim rejects a well-shaped row that contradicts the requested lease 
     ...claimRow(draft, 'PENDING'),
     lease_owner: 'different-worker',
     lease_token: '00000000-0000-4000-8000-000000000002',
+    claim_at_ms: String(NOW_MS),
   }], 1)]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
@@ -197,12 +203,31 @@ void test('claim rejects a well-shaped row that contradicts the requested lease 
   }), 'INVALID_DATA');
 });
 
+void test('claim validates its database claim instant and EXECUTE expiry postconditions', async () => {
+  const draft = executionDraft('claim-postconditions');
+  const malformedRows = [
+    { claim_at_ms: String(NOW_MS + 1) },
+    { expires_at_ms: String(NOW_MS) },
+  ];
+  for (const override of malformedRows) {
+    const client = new ScriptedClient([(_text, values) => result([{
+      ...claimRow(draft, 'PENDING'), lease_token: values?.[2], claim_at_ms: String(NOW_MS),
+      ...override,
+    }], 1)]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+    await expectCode(repository.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'EXECUTE',
+    }), 'INVALID_DATA');
+  }
+});
+
 void test('transition locks and fences the parent, appends evidence, then updates atomically', async () => {
   const draft = executionDraft('transition');
   const claim = claimedIntent(draft, 'PENDING');
   const updated = claimRow(draft, 'PROCESSING', 0);
   Object.assign(updated, {
     status: 'PROCESSING', last_reason_code: 'INTENT_DUPLICATE',
+    state_revision: '1',
     updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
@@ -215,6 +240,7 @@ void test('transition locks and fences the parent, appends evidence, then update
   const transitioned = await repository.transition(claim, input);
 
   assert.equal(transitioned.status, 'PROCESSING');
+  assert.equal(transitioned.stateRevision, 1n);
   assert.equal(Object.isFrozen(transitioned), true);
   assert.deepEqual(client.calls.map((call) => normalizedCommand(call.text)), [
     'BEGIN', 'SELECT', 'INSERT', 'UPDATE', 'COMMIT',
@@ -231,6 +257,41 @@ void test('transition locks and fences the parent, appends evidence, then update
   assert.match(String(journal.values?.find((value) => typeof value === 'string' && value.startsWith('{'))), /"payloadVersion":1/u);
   const parentUpdate = required(client.calls[3]);
   assert.doesNotMatch(parentUpdate.text, /lease_owner\s*=\s*NULL/u);
+  assert.match(parentUpdate.text, /state_revision\s*=\s*intent\.state_revision \+ 1/u);
+  assert.match(parentUpdate.text, /intent\.state_revision\s*=\s*\$5::BIGINT/u);
+});
+
+void test('state revision prevents same-millisecond ABA replay with the original claim', async () => {
+  const draft = executionDraft('state-revision-aba');
+  const original = claimedIntent(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0, 0n);
+  const confirmed = claimedIntent(draft, 'CONFIRMED', 0, 1n);
+  const confirmedRow = claimRow(draft, 'CONFIRMED', 0);
+  Object.assign(confirmedRow, { state_revision: '1', last_reason_code: 'INTENT_DUPLICATE' });
+  const unknownRow = claimRow(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0);
+  Object.assign(unknownRow, { state_revision: '2', last_reason_code: 'INTENT_DUPLICATE' });
+  const client = new ScriptedClient([
+    command('BEGIN'), result([claimRow(draft, original.intent.status, 0)], 1), result([], 1),
+    result([confirmedRow], 1), command('COMMIT'),
+    command('BEGIN'), result([{
+      ...claimRow(draft, confirmed.intent.status, 0), state_revision: '1',
+    }], 1), result([], 1), result([unknownRow], 1), command('COMMIT'),
+    command('BEGIN'), result([], 0), command('ROLLBACK'),
+  ]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  const first = await repository.transition(original, transitionInput(original, 'CONFIRMED'));
+  const second = await repository.transition(confirmed, transitionInput(
+    confirmed, 'UNKNOWN_REQUIRES_RECONCILIATION',
+  ));
+  await expectCode(
+    repository.transition(original, transitionInput(original, 'CONFIRMED')),
+    'INTENT_LEASE_LOST',
+  );
+
+  assert.equal(first.updatedAtMs, second.updatedAtMs);
+  assert.equal(first.stateRevision, 1n);
+  assert.equal(second.stateRevision, 2n);
+  assert.equal(client.calls.filter((call) => call.text.includes('execution_intent_transitions')).length, 2);
 });
 
 void test('nonterminal transition fail-closes every mismatched retained lease triplet', async () => {
@@ -298,11 +359,13 @@ void test('terminal pre-signature transitions release the lease and schedule coh
   const claim = claimedIntent(draft, 'SIMULATED', 1);
   const terminal = intentRow(draft, {
     status: 'SUCCEEDED', attempt_count: 1, last_reason_code: 'INTENT_DUPLICATE',
+    state_revision: '1',
     terminal_at_ms: String(NOW_MS + 1), reconciliation_completed_at_ms: String(NOW_MS + 1),
     purge_after_ms: String(NOW_MS + 14_400_001), updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
-    command('BEGIN'), result([claimRow(draft, 'SIMULATED', 1)], 1), result([], 1),
+    command('BEGIN'), result([claimRow(draft, 'SIMULATED', 1)], 1),
+    result([ledgerRow(1, 'COMPLETED')], 1), result([], 1),
     result([terminal], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -311,7 +374,7 @@ void test('terminal pre-signature transitions release the lease and schedule coh
 
   assert.equal(transitioned.reconciliationCompletedAtMs, transitioned.terminalAtMs);
   assert.equal(required(transitioned.purgeAfterMs) - required(transitioned.terminalAtMs), 14_400_000);
-  const update = required(client.calls[3]);
+  const update = required(client.calls[4]);
   assert.match(update.text, /lease_owner\s*=\s*NULL/u);
   assert.match(update.text, /reconciliation_completed_at\s*=\s*CASE[\s\S]*operation\.at/u);
   assert.match(update.text, /purge_after\s*=\s*CASE[\s\S]*operation\.at\s*\+\s*INTERVAL '4 hours'/u);
@@ -322,11 +385,13 @@ void test('terminal reconciled transitions mark reconciliation complete and beco
   const claim = claimedIntent(draft, 'RECONCILING', 1);
   const terminal = intentRow(draft, {
     status: 'SUCCEEDED', attempt_count: 1, last_reason_code: 'INTENT_DUPLICATE',
+    state_revision: '1',
     terminal_at_ms: String(NOW_MS + 1), reconciliation_completed_at_ms: String(NOW_MS + 1),
     purge_after_ms: String(NOW_MS + 14_400_001), updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
-    command('BEGIN'), result([claimRow(draft, 'RECONCILING', 1)], 1), result([], 1),
+    command('BEGIN'), result([claimRow(draft, 'RECONCILING', 1)], 1),
+    result([ledgerRow(1, 'COMPLETED')], 1), result([], 1),
     result([terminal], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -334,7 +399,7 @@ void test('terminal reconciled transitions mark reconciliation complete and beco
   const transitioned = await repository.transition(claim, transitionInput(claim, 'SUCCEEDED', 1));
 
   assert.equal(transitioned.reconciliationCompletedAtMs, transitioned.terminalAtMs);
-  assert.equal(required(client.calls[3]).values?.[5], true);
+  assert.equal(required(client.calls[4]).values?.[6], true);
 });
 
 void test('terminal transitions reject RETURNING rows without required reconciliation retention', async () => {
@@ -345,7 +410,8 @@ void test('terminal transitions reject RETURNING rows without required reconcili
     terminal_at_ms: String(NOW_MS + 1), updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
-    command('BEGIN'), result([claimRow(draft, 'SIMULATED', 1)], 1), result([], 1),
+    command('BEGIN'), result([claimRow(draft, 'SIMULATED', 1)], 1),
+    result([ledgerRow(1, 'COMPLETED')], 1), result([], 1),
     result([terminal], 1), (text) => {
       assert.match(text, /^(?:COMMIT|ROLLBACK)$/u);
       return result([], null);
@@ -378,7 +444,7 @@ void test('beginAttempt increments the locked processing parent and creates one 
   const claim = claimedIntent(draft, 'PROCESSING', 0);
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 0)], 1),
-    result([], 0),
+    result([ledgerRow(0)], 1),
     result([{ started_at_ms: String(NOW_MS + 2) }], 1), result([], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -392,7 +458,7 @@ void test('beginAttempt increments the locked processing parent and creates one 
   assert.match(required(client.calls[3]).text, /INSERT INTO execution_attempts/u);
   assert.match(required(client.calls[3]).text, /'STARTED'/u);
   assert.match(required(client.calls[3]).text, /lease_expires_at\s*>\s*statement_timestamp\(\)/u);
-  assert.match(required(client.calls[4]).text, /attempt_count\s*=\s*\$4/u);
+  assert.match(required(client.calls[4]).text, /attempt_count\s*=\s*\$5/u);
   assert.match(required(client.calls[4]).text, /lease_expires_at\s*>\s*statement_timestamp\(\)/u);
 });
 
@@ -401,7 +467,7 @@ void test('beginAttempt replays the current STARTED attempt after an ambiguous c
   const claim = claimedIntent(draft, 'PROCESSING', 1);
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
-    result([{ attempt_number: 1, started_at_ms: String(NOW_MS + 2) }], 1),
+    result([ledgerRow(1, 'STARTED', { latest_started_at_ms: String(NOW_MS + 2) })], 1),
     (text) => {
       assert.match(text, /^(?:COMMIT|ROLLBACK)$/u);
       return result([], null);
@@ -417,7 +483,7 @@ void test('beginAttempt replays the current STARTED attempt after an ambiguous c
   assert.match(replayQuery.text, /intent\.status\s*=\s*\$2/u);
   assert.match(replayQuery.text, /intent\.lease_token\s*=\s*\$3::UUID/u);
   assert.match(replayQuery.text, /intent\.lease_expires_at\s*>\s*statement_timestamp\(\)/u);
-  assert.deepEqual(replayQuery.values, [draft.id, 'PROCESSING', UUID]);
+  assert.deepEqual(replayQuery.values, [draft.id, 'PROCESSING', UUID, '0']);
   assert.equal(client.calls.some((call) => call.text.includes('INSERT INTO execution_attempts')), false);
 });
 
@@ -426,14 +492,59 @@ void test('beginAttempt rejects int32 overflow without inserting an attempt', as
   const claim = claimedIntent(draft, 'PROCESSING', INT32_MAX);
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', INT32_MAX)], 1),
-    result([], 0), command('ROLLBACK'),
+    result([ledgerRow(INT32_MAX, 'COMPLETED')], 1), command('ROLLBACK'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
   await expectCode(repository.beginAttempt(claim), 'ATTEMPT_EXHAUSTED');
   assert.deepEqual(client.calls.map((call) => normalizedCommand(call.text)), [
-    'BEGIN', 'SELECT', 'SELECT', 'ROLLBACK',
+    'BEGIN', 'SELECT', 'UPDATE', 'ROLLBACK',
   ]);
+});
+
+void test('beginAttempt validates the fresh fence before exhaustion and rejects ledger gaps', async () => {
+  const draft = executionDraft('attempt-fence-before-overflow');
+  const exhausted = claimedIntent(draft, 'PROCESSING', INT32_MAX);
+  const stale = new ScriptedClient([command('BEGIN'), result([], 0), command('ROLLBACK')]);
+  await expectCode(
+    new PostgresExecutionIntentRepository(new ScriptedPool(stale)).beginAttempt(exhausted),
+    'INTENT_LEASE_LOST',
+  );
+
+  const claim = claimedIntent(draft, 'PROCESSING', 1);
+  const gap = new ScriptedClient([
+    command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
+    result([ledgerRow(0)], 1), command('ROLLBACK'),
+  ]);
+  await expectCode(
+    new PostgresExecutionIntentRepository(new ScriptedPool(gap)).beginAttempt(claim),
+    'ATTEMPT_CONFLICT',
+  );
+});
+
+void test('PROCESSING cannot transition while its latest attempt is STARTED', async () => {
+  const draft = executionDraft('transition-active-attempt');
+  const claim = claimedIntent(draft, 'PROCESSING', 1);
+  const returned = claimRow(draft, 'SIMULATED', 1);
+  Object.assign(returned, {
+    state_revision: '1', last_reason_code: 'INTENT_DUPLICATE', updated_at_ms: String(NOW_MS + 1),
+  });
+  const client = new ScriptedClient([
+    command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
+    result([ledgerRow(1, 'STARTED')], 1), command('ROLLBACK'),
+    command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
+    result([ledgerRow(1, 'COMPLETED')], 1), result([], 1), result([returned], 1), command('COMMIT'),
+  ]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  await expectCode(
+    repository.transition(claim, transitionInput(claim, 'SIMULATED', 1)),
+    'ATTEMPT_CONFLICT',
+  );
+  assert.equal((await repository.transition(
+    claim, transitionInput(claim, 'SIMULATED', 1),
+  )).status, 'SIMULATED');
+  assert.equal(client.calls.filter((call) => call.text.includes('execution_intent_transitions')).length, 1);
 });
 
 void test('finishAttempt performs one fenced STARTED CAS and exact replay returns false', async () => {
@@ -443,17 +554,15 @@ void test('finishAttempt performs one fenced STARTED CAS and exact replay return
     attemptNumber: 1, status: 'COMPLETED' as const, effectiveVenue: 'PUMP_FUN' as const,
     providerId: 'provider-1', reasonCode: 'INTENT_DUPLICATE' as const,
   };
-  const completedAttempt = {
-    attempt_number: 1, status: 'COMPLETED', effective_venue: 'PUMP_FUN',
-    provider_id: 'provider-1', completed_at_ms: String(NOW_MS + 3),
-    reason_code: 'INTENT_DUPLICATE',
-  };
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
-    result([{ ...completedAttempt, status: 'STARTED', effective_venue: null, provider_id: null, completed_at_ms: null, reason_code: null }], 1),
+    result([ledgerRow(1, 'STARTED')], 1),
     result([{ intent_id: draft.id }], 1), command('COMMIT'),
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
-    result([completedAttempt], 1), command('COMMIT'),
+    result([ledgerRow(1, 'COMPLETED', {
+      latest_effective_venue: 'PUMP_FUN', latest_provider_id: 'provider-1',
+      latest_completed_at_ms: String(NOW_MS + 3), latest_reason_code: 'INTENT_DUPLICATE',
+    })], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
@@ -472,10 +581,9 @@ void test('finishAttempt refuses a divergent or malformed terminal replay', asyn
   const claim = claimedIntent(draft, 'PROCESSING', 1);
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
-    result([{
-      attempt_number: 1, status: 'ABANDONED', effective_venue: null, provider_id: null,
-      completed_at_ms: String(NOW_MS + 4), reason_code: 'QUOTE_STALE',
-    }], 1), command('ROLLBACK'),
+    result([ledgerRow(1, 'ABANDONED', {
+      latest_completed_at_ms: String(NOW_MS + 4), latest_reason_code: 'QUOTE_STALE',
+    })], 1), command('ROLLBACK'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
@@ -490,17 +598,14 @@ void test('finishAttempt fail-closes a contradictory selected attempt number', a
   const claim = claimedIntent(draft, 'PROCESSING', 1);
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
-    result([{
-      attempt_number: 2, status: 'STARTED', effective_venue: null, provider_id: null,
-      completed_at_ms: null, reason_code: null,
-    }], 1), command('ROLLBACK'),
+    result([ledgerRow(1, 'STARTED', { latest_attempt_number: 2 })], 1), command('ROLLBACK'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
   await expectCode(repository.finishAttempt(claim, {
     attemptNumber: 1, status: 'COMPLETED', effectiveVenue: null,
     providerId: null, reasonCode: 'INTENT_DUPLICATE',
-  }), 'INVALID_DATA');
+  }), 'ATTEMPT_CONFLICT');
 });
 
 void test('finishAttempt reports stale fencing instead of conflating it with exact replay', async () => {
@@ -518,10 +623,7 @@ void test('finishAttempt reports stale fencing instead of conflating it with exa
   ]);
   const staleCas = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 1)], 1),
-    result([{
-      attempt_number: 1, status: 'STARTED', effective_venue: null, provider_id: null,
-      completed_at_ms: null, reason_code: null,
-    }], 1),
+    result([ledgerRow(1, 'STARTED')], 1),
     result([], 0), (text) => {
       assert.match(text, /^(?:COMMIT|ROLLBACK)$/u);
       return result([], null);
@@ -565,6 +667,10 @@ void test('expirePreSubmission locks a bounded ordered batch and journals explic
   assert.match(call.text, /reconciliation_completed_at\s*=\s*operation\.at/u);
   assert.match(call.text, /purge_after\s*=\s*operation\.at\s*\+\s*INTERVAL '4 hours'/u);
   assert.match(call.text, /lease_owner\s*=\s*NULL/u);
+  assert.match(call.text, /state_revision=candidate\.state_revision \+ 1/u);
+  assert.match(call.text, /intent\.state_revision < 9223372036854775807/u);
+  assert.match(call.text, /COUNT\(\*\)[\s\S]*= intent\.attempt_count/u);
+  assert.match(call.text, /MAX\(attempt\.attempt_number\)[\s\S]*= intent\.attempt_count/u);
   assert.doesNotMatch(call.text, /signed_transaction|keypair|signer capability/iu);
 });
 
@@ -573,6 +679,9 @@ void test('read decodes exact canonical strings and rejects extra, fractional, o
   const extra = { ...intentRow(draft), extra: 'database-secret' };
   const fractional = { ...intentRow(draft), quote_amount_raw: '1.0' };
   const partialLease = { ...intentRow(draft), lease_owner: 'worker-without-token' };
+  const invalidRevisions = ['-1', '01', '9223372036854775808'].map((state_revision) => ({
+    ...intentRow(draft), state_revision,
+  }));
   const leasedTerminal = intentRow(draft, {
     status: 'SUCCEEDED', last_reason_code: 'INTENT_DUPLICATE',
     terminal_at_ms: String(NOW_MS), lease_owner: 'worker-1', lease_token: UUID,
@@ -586,7 +695,8 @@ void test('read decodes exact canonical strings and rejects extra, fractional, o
   });
   const client = new ScriptedClient([
     result([extra], 1), result([fractional], 1), result([hostile], 1),
-    result([partialLease], 1), result([leasedTerminal], 1), result([intentRow(draft)], 1),
+    result([partialLease], 1), result([leasedTerminal], 1),
+    ...invalidRevisions.map((row) => result([row], 1)), result([intentRow(draft)], 1),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
@@ -595,10 +705,37 @@ void test('read decodes exact canonical strings and rejects extra, fractional, o
   await expectCode(repository.read(draft.id), 'INVALID_DATA');
   await expectCode(repository.read(draft.id), 'INVALID_DATA');
   await expectCode(repository.read(draft.id), 'INVALID_DATA');
+  for (const _revision of invalidRevisions) {
+    await expectCode(repository.read(draft.id), 'INVALID_DATA');
+  }
   assert.equal((await repository.read(draft.id))?.id, draft.id);
   const canonicalRead = required(client.calls.at(-1));
   assert.match(canonicalRead.text, /lease_owner[\s\S]*lease_token::TEXT[\s\S]*lease_expires_at_ms/u);
   assert.equal(getterCalls, 0);
+});
+
+void test('read rejects a canonical row whose decoded id differs from the requested id', async () => {
+  const requested = executionDraft('read-requested');
+  const returned = executionDraft('read-returned');
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(
+    new ScriptedClient([result([intentRow(returned)], 1)]),
+  ));
+
+  await expectCode(repository.read(requested.id), 'INVALID_DATA');
+});
+
+void test('every fenced operation binds the complete immutable claim payload and state revision', async () => {
+  const draft = executionDraft('immutable-fence');
+  const claim = claimedIntent(draft, 'PROCESSING');
+  const mutated = claimRow(draft, 'PROCESSING');
+  mutated.minimum_amount_out_raw = '2';
+  const client = new ScriptedClient([
+    command('BEGIN'), result([mutated], 1), command('ROLLBACK'),
+  ]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  await expectCode(repository.renew(claim, 5_000), 'INVALID_DATA');
+  assert.equal(client.calls.some((call) => /state_revision\s*=\s*\$4::BIGINT/u.test(call.text)), true);
 });
 
 void test('transaction rollback and release failures are attempted, aggregated, and fully redacted', async () => {
@@ -619,6 +756,30 @@ void test('transaction rollback and release failures are attempted, aggregated, 
   });
   assert.equal(client.releaseAttempts, 1);
   assert.equal(normalizedCommand(required(client.calls.at(-1)).text), 'ROLLBACK');
+});
+
+void test('a rejected BEGIN is rolled back and rollback failure evicts the client', async () => {
+  const rejectedBegin = new ScriptedClient([
+    () => { throw new Error('BEGIN acknowledgement lost'); }, command('ROLLBACK'),
+  ]);
+  await expectCode(
+    new PostgresExecutionIntentRepository(new ScriptedPool(rejectedBegin))
+      .create(executionDraft('begin-rejected')),
+    'DATABASE_FAILURE',
+  );
+  assert.deepEqual(rejectedBegin.calls.map((call) => normalizedCommand(call.text)), ['BEGIN', 'ROLLBACK']);
+  assert.deepEqual(rejectedBegin.releaseErrors, [false]);
+
+  const failedRollback = new ScriptedClient([
+    () => { throw new Error('BEGIN acknowledgement lost'); },
+    () => { throw new Error('ROLLBACK failed'); },
+  ]);
+  await expectCode(
+    new PostgresExecutionIntentRepository(new ScriptedPool(failedRollback))
+      .create(executionDraft('begin-rollback-failed')),
+    'DATABASE_FAILURE',
+  );
+  assert.deepEqual(failedRollback.releaseErrors, [true]);
 });
 
 void test('hostile database error proxies are redacted without invoking traps', async () => {
@@ -693,6 +854,14 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
     const attempt = await first.beginAttempt(activeClaim);
     assert.deepEqual(await first.beginAttempt(activeClaim), attempt);
     activeClaim = Object.freeze({ ...activeClaim, intent: required(await first.read(draft.id)) });
+    await expectCode(
+      first.transition(activeClaim, transitionInput(activeClaim, 'SIMULATED', attempt.attemptNumber)),
+      'ATTEMPT_CONFLICT',
+    );
+    await expectCode(
+      first.transition(activeClaim, transitionInput(activeClaim, 'FAILED', attempt.attemptNumber)),
+      'ATTEMPT_CONFLICT',
+    );
     const finishedAttempt = {
       attemptNumber: attempt.attemptNumber, status: 'COMPLETED', effectiveVenue: 'PUMP_FUN',
       providerId: 'provider-a', reasonCode: 'INTENT_DUPLICATE',
@@ -810,6 +979,69 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
       status: 'ABANDONED', reason_code: 'INTENT_EXPIRED',
       completed_at_ms: String(required((await first.read(activeExpiryDraft.id))?.terminalAtMs)),
     }]);
+  });
+});
+
+void test('real PostgreSQL rejects ABA replay, immutable drift, and parent-attempt gaps', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: execution intent hardening integration skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'execution_intent_hardening', async (pool) => {
+    await migrateDatabase({ pool });
+    const repository = new PostgresExecutionIntentRepository(pool);
+    const now = await databaseNowMs(pool);
+
+    const abaDraft = executionDraft('postgres-aba', {
+      requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+    });
+    await repository.create(abaDraft);
+    await pool.query(`UPDATE execution_intents
+      SET status='UNKNOWN_REQUIRES_RECONCILIATION' WHERE id=$1`, [abaDraft.id]);
+    const original = required(await repository.claim({
+      ownerId: 'aba-worker', leaseMs: 60_000, purpose: 'RECONCILE',
+    }));
+    const confirmedIntent = await repository.transition(
+      original, transitionInput(original, 'CONFIRMED'),
+    );
+    const confirmed = Object.freeze({ ...original, intent: confirmedIntent });
+    const unknown = await repository.transition(
+      confirmed, transitionInput(confirmed, 'UNKNOWN_REQUIRES_RECONCILIATION'),
+    );
+    await expectCode(
+      repository.transition(original, transitionInput(original, 'CONFIRMED')),
+      'INTENT_LEASE_LOST',
+    );
+    assert.equal(confirmedIntent.stateRevision, 1n);
+    assert.equal(unknown.stateRevision, 2n);
+    assert.deepEqual((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_intent_transitions WHERE intent_id=$1`, [abaDraft.id])).rows, [{ count: 2 }]);
+
+    const immutableDraft = executionDraft('postgres-immutable-drift', {
+      requestedAtMs: now - 900, expiresAtMs: now + 120_000,
+    });
+    await repository.create(immutableDraft);
+    const immutableClaim = required(await repository.claim({
+      ownerId: 'immutable-worker', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    await pool.query(`UPDATE execution_intents SET minimum_amount_out_raw=2 WHERE id=$1`, [
+      immutableDraft.id,
+    ]);
+    await expectCode(repository.renew(immutableClaim, 60_000), 'INVALID_DATA');
+
+    const gapDraft = executionDraft('postgres-attempt-gap', {
+      requestedAtMs: now - 800, expiresAtMs: now + 120_000,
+    });
+    await repository.create(gapDraft);
+    await pool.query(`UPDATE execution_intents SET status='PROCESSING',attempt_count=1 WHERE id=$1`, [
+      gapDraft.id,
+    ]);
+    const gapClaim = required(await repository.claim({
+      ownerId: 'gap-worker', leaseMs: 60_000, purpose: 'EXECUTE',
+    }));
+    await expectCode(repository.beginAttempt(gapClaim), 'ATTEMPT_CONFLICT');
   });
 });
 
@@ -1004,6 +1236,7 @@ function intentRow(
     expires_at_ms: String(draft.expiresAtMs),
     status: 'PENDING',
     attempt_count: 0,
+    state_revision: '0',
     last_reason_code: null,
     terminal_at_ms: null,
     reconciliation_completed_at_ms: null,
@@ -1032,15 +1265,38 @@ function claimedIntent(
   draft: ExecutionIntentDraftV1,
   status: ExecutionIntentStatus,
   attemptCount = status === 'PENDING' ? 0 : 1,
+  stateRevision = 0n,
 ): ClaimedExecutionIntent {
   const intent = Object.freeze({
-    ...draft, status, attemptCount, lastReasonCode: null, terminalAtMs: null,
+    ...draft, status, attemptCount, stateRevision, lastReasonCode: null, terminalAtMs: null,
     reconciliationCompletedAtMs: null, purgeAfterMs: null,
     createdAtMs: NOW_MS, updatedAtMs: NOW_MS,
   } satisfies ExecutionIntentV1);
   return Object.freeze({
     intent, leaseOwner: 'worker-1', leaseToken: UUID, leaseExpiresAtMs: NOW_MS + 30_000,
   });
+}
+
+function ledgerRow(
+  attemptCount: number,
+  latestStatus: 'STARTED' | 'COMPLETED' | 'ABANDONED' | null = null,
+  overrides: Readonly<Record<string, unknown>> = {},
+): Row {
+  const terminal = latestStatus === 'COMPLETED' || latestStatus === 'ABANDONED';
+  return {
+    fenced_count: 1,
+    attempt_count: attemptCount,
+    max_attempt_number: attemptCount,
+    started_count: latestStatus === 'STARTED' ? 1 : 0,
+    latest_attempt_number: attemptCount === 0 ? null : attemptCount,
+    latest_status: latestStatus,
+    latest_effective_venue: null,
+    latest_provider_id: null,
+    latest_started_at_ms: attemptCount === 0 ? null : String(NOW_MS + 2),
+    latest_completed_at_ms: terminal ? String(NOW_MS + 3) : null,
+    latest_reason_code: terminal ? 'INTENT_DUPLICATE' : null,
+    ...overrides,
+  };
 }
 
 function transitionInput(
@@ -1079,6 +1335,7 @@ class ScriptedClient {
   public readonly calls: QueryCall[] = [];
   public released = false;
   public releaseAttempts = 0;
+  public readonly releaseErrors: boolean[] = [];
 
   public constructor(
     private readonly steps: Step[],
@@ -1092,8 +1349,9 @@ class ScriptedClient {
     return typeof step === 'function' ? step(text, values) : step;
   }
 
-  public release(_error?: boolean): void {
+  public release(error = false): void {
     this.releaseAttempts += 1;
+    this.releaseErrors.push(error);
     this.released = true;
     this.onRelease?.();
   }

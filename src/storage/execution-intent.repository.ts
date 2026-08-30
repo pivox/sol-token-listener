@@ -63,6 +63,7 @@ export class ExecutionIntentRepositoryError extends Error {
 const DATE_MAX_MS = 8_640_000_000_000_000;
 const U64_MAX = 18_446_744_073_709_551_615n;
 const INT32_MAX = 2_147_483_647;
+const INT64_MAX = 9_223_372_036_854_775_807n;
 const MAX_LEASE_MS = 86_400_000;
 const MAX_EXPIRE_BATCH = 1_000;
 const RETENTION_MS = 14_400_000;
@@ -100,15 +101,20 @@ const INTENT_ROW_KEYS = Object.freeze([
   'position_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
   'quote_token_program', 'quote_decimals', 'quote_amount_raw', 'base_amount_raw',
   'minimum_amount_out_raw', 'decision_event_id', 'decision_fingerprint',
-  'requested_at_ms', 'expires_at_ms', 'status', 'attempt_count', 'last_reason_code',
+  'requested_at_ms', 'expires_at_ms', 'status', 'attempt_count', 'state_revision', 'last_reason_code',
   'terminal_at_ms', 'reconciliation_completed_at_ms', 'purge_after_ms',
   'created_at_ms', 'updated_at_ms', 'lease_owner', 'lease_token',
   'lease_expires_at_ms',
 ] as const);
-const CLAIM_ROW_KEYS = INTENT_ROW_KEYS;
+const CLAIM_ROW_KEYS = Object.freeze([...INTENT_ROW_KEYS, 'claim_at_ms'] as const);
 const ATTEMPT_ROW_KEYS = Object.freeze([
-  'attempt_number', 'status', 'effective_venue', 'provider_id', 'completed_at_ms',
+  'attempt_number', 'status', 'effective_venue', 'provider_id', 'started_at_ms', 'completed_at_ms',
   'reason_code',
+] as const);
+const ATTEMPT_LEDGER_ROW_KEYS = Object.freeze([
+  'fenced_count', 'attempt_count', 'max_attempt_number', 'started_count',
+  'latest_attempt_number', 'latest_status', 'latest_effective_venue', 'latest_provider_id',
+  'latest_started_at_ms', 'latest_completed_at_ms', 'latest_reason_code',
 ] as const);
 
 const INTENT_PROJECTION = `
@@ -134,6 +140,7 @@ const INTENT_PROJECTION = `
   trunc(EXTRACT(EPOCH FROM intent.expires_at) * 1000)::TEXT AS expires_at_ms,
   intent.status,
   intent.attempt_count,
+  intent.state_revision::TEXT AS state_revision,
   intent.last_reason_code,
   CASE WHEN intent.terminal_at IS NULL THEN NULL
     ELSE trunc(EXTRACT(EPOCH FROM intent.terminal_at) * 1000)::TEXT END AS terminal_at_ms,
@@ -150,7 +157,8 @@ const INTENT_PROJECTION = `
     ELSE trunc(EXTRACT(EPOCH FROM intent.lease_expires_at) * 1000)::TEXT
     END AS lease_expires_at_ms`;
 
-const CLAIM_PROJECTION = INTENT_PROJECTION;
+const CLAIM_PROJECTION = `${INTENT_PROJECTION},
+  trunc(EXTRACT(EPOCH FROM operation.at) * 1000)::TEXT AS claim_at_ms`;
 
 const CLAIM_SQL: Readonly<Record<ExecutionClaimPurpose, string>> = Object.freeze({
   EXECUTE: claimSql(
@@ -195,7 +203,8 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         );
         if (inserted.rowCount === 1 && inserted.rows.length === 1) {
           const intent = intentFromRow(requiredRow(inserted.rows));
-          if (intent.status !== 'PENDING' || !sameImmutableIntent(draft, intent)) throw dataError();
+          if (intent.status !== 'PENDING' || intent.stateRevision !== 0n
+            || !sameImmutableIntent(draft, intent)) throw dataError();
           return createResult('CREATED', intent);
         }
         if (inserted.rowCount !== 0 || inserted.rows.length !== 0) throw dataError();
@@ -231,11 +240,13 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         );
         if (claimed.rowCount === 0 && claimed.rows.length === 0) return null;
         if (claimed.rowCount !== 1 || claimed.rows.length !== 1) throw dataError();
-        const claim = claimFromRow(requiredRow(claimed.rows));
+        const { claim, claimAtMs } = claimFromRow(requiredRow(claimed.rows));
         if (claim.leaseOwner !== options.ownerId || claim.leaseToken !== leaseToken) {
           throw dataError();
         }
         if (!statusMatchesPurpose(claim.intent.status, options.purpose)) throw dataError();
+        if (claim.leaseExpiresAtMs - claimAtMs !== options.leaseMs) throw dataError();
+        if (options.purpose === 'EXECUTE' && claim.intent.expiresAtMs <= claimAtMs) throw dataError();
         return claim;
       });
     });
@@ -251,36 +262,12 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       if (claim.intent.status !== 'PROCESSING') throw attemptConflictError();
       return this.transaction(async (client) => {
         const locked = await lockClaimedIntent(client, claim);
-        const active = await client.query(
-          `SELECT attempt.attempt_number,
-             trunc(EXTRACT(EPOCH FROM attempt.started_at) * 1000)::TEXT AS started_at_ms
-           FROM execution_attempts AS attempt
-           JOIN execution_intents AS intent ON intent.id=attempt.intent_id
-           WHERE attempt.intent_id=$1 AND attempt.status='STARTED'
-             AND intent.status=$2 AND intent.lease_token=$3::UUID
-             AND intent.lease_expires_at > statement_timestamp()
-           ORDER BY attempt.attempt_number DESC
-           FOR UPDATE`,
-          [claim.intent.id, claim.intent.status, claim.leaseToken],
-        );
-        if (active.rowCount === 0 && active.rows.length === 0) {
-          // Allocate the next append-only attempt below.
-        } else if (active.rowCount !== 1 || active.rows.length !== 1) {
-          throw attemptConflictError();
-        } else {
-          const row = exactRecord(
-            requiredRow(active.rows),
-            ['attempt_number', 'started_at_ms'],
-            'INVALID_DATA',
-          );
-          const attemptNumber = positiveInteger(row.attempt_number, INT32_MAX, 'INVALID_DATA');
-          if (attemptNumber !== locked.intent.attemptCount || locked.intent.attemptCount === 0) {
-            throw attemptConflictError();
-          }
+        const ledger = await lockAttemptLedger(client, locked);
+        if (ledger.latest?.status === 'STARTED') {
           return Object.freeze({
             intentId: claim.intent.id,
-            attemptNumber,
-            startedAtMs: timestampFromDatabase(row.started_at_ms),
+            attemptNumber: ledger.latest.attemptNumber,
+            startedAtMs: ledger.latest.startedAtMs,
           });
         }
         if (locked.intent.attemptCount === INT32_MAX) throw attemptExhaustedError();
@@ -290,13 +277,15 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
              SELECT date_trunc('milliseconds', statement_timestamp()) AS at
            )
            INSERT INTO execution_attempts (intent_id,attempt_number,status,started_at)
-           SELECT intent.id,$4,'STARTED',operation.at
+           SELECT intent.id,$5,'STARTED',operation.at
            FROM execution_intents AS intent CROSS JOIN operation
            WHERE intent.id=$1 AND intent.status=$2
              AND intent.lease_token=$3::UUID
+             AND intent.state_revision=$4::BIGINT
              AND intent.lease_expires_at > statement_timestamp()
            RETURNING trunc(EXTRACT(EPOCH FROM started_at) * 1000)::TEXT AS started_at_ms`,
-          [claim.intent.id, claim.intent.status, claim.leaseToken, attemptNumber],
+          [claim.intent.id, claim.intent.status, claim.leaseToken,
+            claim.intent.stateRevision.toString(), attemptNumber],
         );
         if (inserted.rowCount === 0 && inserted.rows.length === 0) throw leaseLostError();
         if (inserted.rowCount !== 1 || inserted.rows.length !== 1) throw dataError();
@@ -307,12 +296,14 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
              SELECT date_trunc('milliseconds', statement_timestamp()) AS at
            )
            UPDATE execution_intents AS intent
-           SET attempt_count=$4, updated_at=operation.at
+           SET attempt_count=$5, updated_at=operation.at
            FROM operation
            WHERE intent.id=$1 AND intent.status=$2
              AND intent.lease_token=$3::UUID
+             AND intent.state_revision=$4::BIGINT
              AND intent.lease_expires_at > statement_timestamp()`,
-          [claim.intent.id, claim.intent.status, claim.leaseToken, attemptNumber],
+          [claim.intent.id, claim.intent.status, claim.leaseToken,
+            claim.intent.stateRevision.toString(), attemptNumber],
         );
         requireFencedMutation(updated);
         return Object.freeze({ intentId: claim.intent.id, attemptNumber, startedAtMs });
@@ -336,23 +327,12 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       if (claim.intent.status !== 'PROCESSING') throw attemptConflictError();
       return this.transaction(async (client) => {
         const locked = await lockClaimedIntent(client, claim);
-        if (input.attemptNumber !== locked.intent.attemptCount || locked.intent.attemptCount === 0) {
+        const ledger = await lockAttemptLedger(client, locked);
+        if (input.attemptNumber !== locked.intent.attemptCount || locked.intent.attemptCount === 0
+          || ledger.latest === null) {
           throw attemptConflictError();
         }
-        const selected = await client.query(
-          `SELECT attempt.attempt_number,attempt.status,attempt.effective_venue,
-             attempt.provider_id,
-             CASE WHEN attempt.completed_at IS NULL THEN NULL
-               ELSE trunc(EXTRACT(EPOCH FROM attempt.completed_at) * 1000)::TEXT
-               END AS completed_at_ms,
-             attempt.reason_code
-           FROM execution_attempts AS attempt
-           WHERE attempt.intent_id=$1 AND attempt.attempt_number=$2
-           FOR UPDATE`,
-          [claim.intent.id, input.attemptNumber],
-        );
-        if (selected.rowCount !== 1 || selected.rows.length !== 1) throw attemptConflictError();
-        const attempt = attemptFromRow(requiredRow(selected.rows));
+        const attempt = ledger.latest;
         if (attempt.attemptNumber !== input.attemptNumber) throw dataError();
         if (attempt.status !== 'STARTED') {
           if (attempt.status === input.status
@@ -366,15 +346,17 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
              SELECT date_trunc('milliseconds', statement_timestamp()) AS at
            )
            UPDATE execution_attempts AS attempt
-           SET status=$5,effective_venue=$6,provider_id=$7,
-             completed_at=operation.at,reason_code=$8
+             SET status=$6,effective_venue=$7,provider_id=$8,
+             completed_at=operation.at,reason_code=$9
            FROM execution_intents AS intent CROSS JOIN operation
-           WHERE attempt.intent_id=$1 AND attempt.attempt_number=$4
+           WHERE attempt.intent_id=$1 AND attempt.attempt_number=$5
              AND attempt.status='STARTED'
              AND intent.id=attempt.intent_id AND intent.id=$1 AND intent.status=$2
              AND intent.lease_token=$3::UUID
+             AND intent.state_revision=$4::BIGINT
              AND intent.lease_expires_at > statement_timestamp()`,
-          [claim.intent.id, claim.intent.status, claim.leaseToken, input.attemptNumber,
+          [claim.intent.id, claim.intent.status, claim.leaseToken,
+            claim.intent.stateRevision.toString(), input.attemptNumber,
             input.status, input.effectiveVenue, input.providerId, input.reasonCode],
         );
         if (updated.rowCount === 0) throw leaseLostError();
@@ -388,21 +370,24 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     return this.safely(async () => {
       const claim = claimedInput(claimValue);
       const leaseMs = positiveInteger(leaseMsValue, MAX_LEASE_MS, 'INVALID_INPUT');
-      return this.withClient(async (client) => {
+      return this.transaction(async (client) => {
+        await lockClaimedIntent(client, claim);
         const renewed = await client.query(
           `WITH operation AS MATERIALIZED (
              SELECT date_trunc('milliseconds', statement_timestamp()) AS at
            )
            UPDATE execution_intents AS intent
            SET lease_expires_at=date_trunc(
-                 'milliseconds', statement_timestamp() + ($4::BIGINT * INTERVAL '1 millisecond')
+                 'milliseconds', statement_timestamp() + ($5::BIGINT * INTERVAL '1 millisecond')
                ),
                updated_at=operation.at
            FROM operation
            WHERE intent.id=$1 AND intent.status=$2
              AND intent.lease_token=$3::UUID
+             AND intent.state_revision=$4::BIGINT
              AND intent.lease_expires_at > statement_timestamp()`,
-          [claim.intent.id, claim.intent.status, claim.leaseToken, leaseMs],
+          [claim.intent.id, claim.intent.status, claim.leaseToken,
+            claim.intent.stateRevision.toString(), leaseMs],
         );
         return fencedBooleanMutation(renewed);
       });
@@ -412,7 +397,8 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
   public async release(claimValue: ClaimedExecutionIntent): Promise<boolean> {
     return this.safely(async () => {
       const claim = claimedInput(claimValue);
-      return this.withClient(async (client) => {
+      return this.transaction(async (client) => {
+        await lockClaimedIntent(client, claim);
         const released = await client.query(
           `WITH operation AS MATERIALIZED (
              SELECT date_trunc('milliseconds', statement_timestamp()) AS at
@@ -422,8 +408,10 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
            FROM operation
            WHERE intent.id=$1 AND intent.status=$2
              AND intent.lease_token=$3::UUID
+             AND intent.state_revision=$4::BIGINT
              AND intent.lease_expires_at > statement_timestamp()`,
-          [claim.intent.id, claim.intent.status, claim.leaseToken],
+          [claim.intent.id, claim.intent.status, claim.leaseToken,
+            claim.intent.stateRevision.toString()],
         );
         return fencedBooleanMutation(released);
       });
@@ -439,10 +427,19 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const input = transitionInput(inputValue, claim);
       return this.transaction(async (client) => {
         const locked = await lockClaimedIntent(client, claim);
+        if (locked.intent.stateRevision === INT64_MAX) throw dataError();
         if ((locked.intent.attemptCount === 0) !== (input.evidence.attemptNumber === null)
           || (locked.intent.attemptCount > 0
             && input.evidence.attemptNumber !== locked.intent.attemptCount)) {
           throw inputError();
+        }
+        if (locked.intent.attemptCount > 0) {
+          const ledger = await lockAttemptLedger(client, locked);
+          if (ledger.latest === null
+            || input.evidence.attemptNumber !== ledger.latest.attemptNumber
+            || ledger.latest.status === 'STARTED') {
+            throw attemptConflictError();
+          }
         }
         const journaled = await client.query(
           `INSERT INTO execution_intent_transitions (
@@ -457,9 +454,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         const terminal = TERMINAL_STATUSES.has(input.nextStatus);
         const updateValues = terminal
           ? [input.intentId, input.expectedStatus, input.leaseToken, input.nextStatus,
-            input.reasonCode, true]
+            claim.intent.stateRevision.toString(), input.reasonCode, true]
           : [input.intentId, input.expectedStatus, input.leaseToken, input.nextStatus,
-            input.reasonCode];
+            claim.intent.stateRevision.toString(), input.reasonCode];
         const updated = await client.query(
           transitionUpdateSql(terminal),
           updateValues,
@@ -472,6 +469,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         if (!sameImmutableIntent(locked.intent, transitioned)
           || transitioned.status !== input.nextStatus
           || transitioned.attemptCount !== locked.intent.attemptCount
+          || transitioned.stateRevision !== locked.intent.stateRevision + 1n
           || transitioned.lastReasonCode !== input.reasonCode
           || (!terminal && !sameLeaseIdentity(returnedLease, locked))
           || (terminal && returnedLease !== null)
@@ -494,12 +492,23 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
           `WITH operation AS MATERIALIZED (
              SELECT date_trunc('milliseconds', statement_timestamp()) AS at
            ), candidates AS MATERIALIZED (
-             SELECT intent.id,intent.status,intent.attempt_count
+             SELECT intent.id,intent.status,intent.attempt_count,intent.state_revision
              FROM execution_intents AS intent CROSS JOIN operation
              WHERE intent.status IN ('PENDING','RETRY_READY','PROCESSING','SIMULATED')
                AND intent.expires_at <= statement_timestamp()
                AND (intent.lease_expires_at IS NULL
                  OR intent.lease_expires_at <= statement_timestamp())
+               AND intent.state_revision < 9223372036854775807
+               AND (SELECT COUNT(*) FROM execution_attempts AS attempt
+                 WHERE attempt.intent_id=intent.id) = intent.attempt_count
+               AND COALESCE((SELECT MAX(attempt.attempt_number)
+                 FROM execution_attempts AS attempt WHERE attempt.intent_id=intent.id),0)
+                 = intent.attempt_count
+               AND (SELECT COUNT(*) FROM execution_attempts AS attempt
+                 WHERE attempt.intent_id=intent.id AND attempt.status='STARTED') <= 1
+               AND NOT EXISTS (SELECT 1 FROM execution_attempts AS attempt
+                 WHERE attempt.intent_id=intent.id AND attempt.status='STARTED'
+                   AND attempt.attempt_number<>intent.attempt_count)
              ORDER BY intent.requested_at,intent.id
              FOR UPDATE OF intent SKIP LOCKED
              LIMIT $1
@@ -533,7 +542,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
                terminal_at=operation.at,reconciliation_completed_at=operation.at,
                purge_after=operation.at + INTERVAL '4 hours',
                lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
-               updated_at=operation.at
+               updated_at=operation.at,state_revision=candidate.state_revision + 1
              FROM candidates AS candidate CROSS JOIN operation
              WHERE intent.id=candidate.id
                AND EXISTS (SELECT 1 FROM journal WHERE journal.intent_id=intent.id)
@@ -560,7 +569,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         );
         if (result.rowCount === 0 && result.rows.length === 0) return null;
         if (result.rowCount !== 1 || result.rows.length !== 1) throw dataError();
-        return intentFromRow(requiredRow(result.rows));
+        const intent = intentFromRow(requiredRow(result.rows));
+        if (intent.id !== intentId) throw dataError();
+        return intent;
       });
     });
   }
@@ -581,8 +592,8 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     let cleanupFailureCount = 0;
     let evict = false;
     try {
-      await client.query('BEGIN');
       transactionStarted = true;
+      await client.query('BEGIN');
       result = await run(client);
       await client.query('COMMIT');
       transactionStarted = false;
@@ -683,10 +694,13 @@ function transitionUpdateSql(terminal: boolean): string {
       SELECT date_trunc('milliseconds', statement_timestamp()) AS at
     )
     UPDATE execution_intents AS intent
-    SET status=$4,last_reason_code=$5,updated_at=operation.at
+    SET status=$4,last_reason_code=$6,updated_at=operation.at,
+      state_revision=intent.state_revision + 1
     FROM operation
     WHERE intent.id=$1 AND intent.status=$2
       AND intent.lease_token=$3::UUID
+      AND intent.state_revision=$5::BIGINT
+      AND intent.state_revision < 9223372036854775807
       AND intent.lease_expires_at > statement_timestamp()
     RETURNING ${INTENT_PROJECTION}`;
   }
@@ -694,13 +708,16 @@ function transitionUpdateSql(terminal: boolean): string {
     SELECT date_trunc('milliseconds', statement_timestamp()) AS at
   )
   UPDATE execution_intents AS intent
-  SET status=$4,last_reason_code=$5,terminal_at=operation.at,
-      reconciliation_completed_at=CASE WHEN $6::BOOLEAN THEN operation.at ELSE NULL END,
-      purge_after=CASE WHEN $6::BOOLEAN THEN operation.at + INTERVAL '4 hours' ELSE NULL END,
+  SET status=$4,last_reason_code=$6,terminal_at=operation.at,
+      reconciliation_completed_at=CASE WHEN $7::BOOLEAN THEN operation.at ELSE NULL END,
+      purge_after=CASE WHEN $7::BOOLEAN THEN operation.at + INTERVAL '4 hours' ELSE NULL END,
       lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=operation.at
+      ,state_revision=intent.state_revision + 1
   FROM operation
   WHERE intent.id=$1 AND intent.status=$2
     AND intent.lease_token=$3::UUID
+    AND intent.state_revision=$5::BIGINT
+    AND intent.state_revision < 9223372036854775807
     AND intent.lease_expires_at > statement_timestamp()
   RETURNING ${INTENT_PROJECTION}`;
 }
@@ -710,21 +727,28 @@ async function lockClaimedIntent(
   claim: ClaimedExecutionIntent,
 ): Promise<ClaimedExecutionIntent> {
   const selected = await client.query(
-    `SELECT ${CLAIM_PROJECTION}
+    `SELECT ${INTENT_PROJECTION}
      FROM execution_intents AS intent
      WHERE intent.id=$1 AND intent.status=$2
        AND intent.lease_token=$3::UUID
+       AND intent.state_revision=$4::BIGINT
        AND intent.lease_expires_at > statement_timestamp()
      FOR UPDATE`,
-    [claim.intent.id, claim.intent.status, claim.leaseToken],
+    [claim.intent.id, claim.intent.status, claim.leaseToken, claim.intent.stateRevision.toString()],
   );
   if (selected.rowCount === 0 && selected.rows.length === 0) {
     throw leaseLostError();
   }
   if (selected.rowCount !== 1 || selected.rows.length !== 1) throw dataError();
-  const locked = claimFromRow(requiredRow(selected.rows));
-  if (locked.intent.id !== claim.intent.id
+  const row = requiredRow(selected.rows);
+  const intent = intentFromRow(row);
+  const lease = leaseFromIntentRow(row);
+  if (lease === null) throw dataError();
+  const locked = Object.freeze({ intent, ...lease });
+  if (!sameImmutableIntent(locked.intent, claim.intent)
+    || locked.intent.id !== claim.intent.id
     || locked.intent.status !== claim.intent.status
+    || locked.intent.stateRevision !== claim.intent.stateRevision
     || locked.leaseOwner !== claim.leaseOwner
     || locked.leaseToken !== claim.leaseToken) throw dataError();
   return locked;
@@ -769,6 +793,7 @@ function draftInput(value: unknown): ExecutionIntentDraftV1 {
   const candidate: unknown = Object.freeze({
     ...(draft as Readonly<Record<string, unknown>>),
     status: 'PENDING', attemptCount: 0, lastReasonCode: null, terminalAtMs: null,
+    stateRevision: 0n,
     reconciliationCompletedAtMs: null, purgeAfterMs: null,
     createdAtMs: row.requestedAtMs, updatedAtMs: row.requestedAtMs,
   });
@@ -897,6 +922,7 @@ function intentFromRow(value: unknown): ExecutionIntentV1 {
     expiresAtMs: timestampFromDatabase(row.expires_at_ms),
     status: intentStatus,
     attemptCount: nonNegativeInteger(row.attempt_count, 'INVALID_DATA'),
+    stateRevision: stateRevision(row.state_revision),
     lastReasonCode: row.last_reason_code === null ? null : reason(row.last_reason_code, 'INVALID_DATA'),
     terminalAtMs: nullableTimestampFromDatabase(row.terminal_at_ms),
     reconciliationCompletedAtMs: nullableTimestampFromDatabase(row.reconciliation_completed_at_ms),
@@ -943,14 +969,20 @@ function sameLeaseIdentity(
     && actual.leaseExpiresAtMs === expected.leaseExpiresAtMs;
 }
 
-function claimFromRow(value: unknown): ClaimedExecutionIntent {
+function claimFromRow(value: unknown): Readonly<{
+  readonly claim: ClaimedExecutionIntent;
+  readonly claimAtMs: number;
+}> {
   const row = exactRecord(value, CLAIM_ROW_KEYS, 'INVALID_DATA');
   const intentValues: Record<string, unknown> = {};
   for (const key of INTENT_ROW_KEYS) intentValues[key] = row[key];
   const intent = intentFromRow(intentValues);
   const lease = leaseFromRow(row, intent.status);
   if (lease === null) throw dataError();
-  return Object.freeze({ intent, ...lease });
+  return Object.freeze({
+    claim: Object.freeze({ intent, ...lease }),
+    claimAtMs: timestampFromDatabase(row.claim_at_ms),
+  });
 }
 
 type AttemptStatus = 'STARTED' | 'COMPLETED' | 'ABANDONED';
@@ -960,8 +992,81 @@ interface StoredAttempt {
   readonly status: AttemptStatus;
   readonly effectiveVenue: 'PUMP_FUN' | 'PUMP_SWAP' | null;
   readonly providerId: string | null;
+  readonly startedAtMs: number;
   readonly completedAtMs: number | null;
   readonly reasonCode: ExecutionIntentReasonCode | null;
+}
+
+interface AttemptLedger {
+  readonly latest: StoredAttempt | null;
+}
+
+async function lockAttemptLedger(
+  client: ExecutionIntentClient,
+  claim: ClaimedExecutionIntent,
+): Promise<AttemptLedger> {
+  const result = await client.query(
+    `WITH fenced_intent AS MATERIALIZED (
+       SELECT intent.id
+       FROM execution_intents AS intent
+       WHERE intent.id=$1 AND intent.status=$2
+         AND intent.lease_token=$3::UUID
+         AND intent.state_revision=$4::BIGINT
+         AND intent.lease_expires_at > statement_timestamp()
+       FOR UPDATE
+     ), locked_attempts AS MATERIALIZED (
+       SELECT attempt.*
+       FROM execution_attempts AS attempt
+       JOIN fenced_intent ON fenced_intent.id=attempt.intent_id
+       FOR UPDATE OF attempt
+     ), latest AS MATERIALIZED (
+       SELECT * FROM locked_attempts ORDER BY attempt_number DESC LIMIT 1
+     )
+     SELECT
+       (SELECT COUNT(*)::INTEGER FROM fenced_intent) AS fenced_count,
+       COUNT(*)::INTEGER AS attempt_count,
+       COALESCE(MAX(locked_attempts.attempt_number),0)::INTEGER AS max_attempt_number,
+       COUNT(*) FILTER (WHERE locked_attempts.status='STARTED')::INTEGER AS started_count,
+       (SELECT attempt_number FROM latest) AS latest_attempt_number,
+       (SELECT status FROM latest) AS latest_status,
+       (SELECT effective_venue FROM latest) AS latest_effective_venue,
+       (SELECT provider_id FROM latest) AS latest_provider_id,
+       (SELECT trunc(EXTRACT(EPOCH FROM started_at) * 1000)::TEXT FROM latest)
+         AS latest_started_at_ms,
+       (SELECT CASE WHEN completed_at IS NULL THEN NULL
+         ELSE trunc(EXTRACT(EPOCH FROM completed_at) * 1000)::TEXT END FROM latest)
+         AS latest_completed_at_ms,
+       (SELECT reason_code FROM latest) AS latest_reason_code
+     FROM locked_attempts`,
+    [claim.intent.id, claim.intent.status, claim.leaseToken, claim.intent.stateRevision.toString()],
+  );
+  if (result.rowCount !== 1 || result.rows.length !== 1) throw dataError();
+  const row = exactRecord(requiredRow(result.rows), ATTEMPT_LEDGER_ROW_KEYS, 'INVALID_DATA');
+  const fencedCount = boundedInteger(row.fenced_count, 0, 1, 'INVALID_DATA');
+  if (fencedCount === 0) throw leaseLostError();
+  const count = nonNegativeInteger(row.attempt_count, 'INVALID_DATA');
+  const maximum = nonNegativeInteger(row.max_attempt_number, 'INVALID_DATA');
+  const startedCount = boundedInteger(row.started_count, 0, 1, 'INVALID_DATA');
+  if (count !== claim.intent.attemptCount || maximum !== count) throw attemptConflictError();
+  if (count === 0) {
+    if (startedCount !== 0 || row.latest_attempt_number !== null || row.latest_status !== null
+      || row.latest_effective_venue !== null || row.latest_provider_id !== null
+      || row.latest_started_at_ms !== null || row.latest_completed_at_ms !== null
+      || row.latest_reason_code !== null) throw dataError();
+    return Object.freeze({ latest: null });
+  }
+  const attempt = attemptFromRow({
+    attempt_number: row.latest_attempt_number,
+    status: row.latest_status,
+    effective_venue: row.latest_effective_venue,
+    provider_id: row.latest_provider_id,
+    started_at_ms: row.latest_started_at_ms,
+    completed_at_ms: row.latest_completed_at_ms,
+    reason_code: row.latest_reason_code,
+  });
+  if (attempt.attemptNumber !== count
+    || (startedCount === 1) !== (attempt.status === 'STARTED')) throw attemptConflictError();
+  return Object.freeze({ latest: attempt });
 }
 
 function attemptFromRow(value: unknown): StoredAttempt {
@@ -976,6 +1081,7 @@ function attemptFromRow(value: unknown): StoredAttempt {
   const providerId = row.provider_id === null
     ? null
     : boundedText(row.provider_id, 'INVALID_DATA');
+  const startedAtMs = timestampFromDatabase(row.started_at_ms);
   const completedAtMs = nullableTimestampFromDatabase(row.completed_at_ms);
   const reasonCode = row.reason_code === null ? null : reason(row.reason_code, 'INVALID_DATA');
   if (row.status === 'STARTED') {
@@ -984,7 +1090,7 @@ function attemptFromRow(value: unknown): StoredAttempt {
   } else if (completedAtMs === null || reasonCode === null) throw dataError();
   return Object.freeze({
     attemptNumber, status: row.status, effectiveVenue: row.effective_venue,
-    providerId, completedAtMs, reasonCode,
+    providerId, startedAtMs, completedAtMs, reasonCode,
   });
 }
 
@@ -1184,6 +1290,13 @@ function u64(value: unknown): bigint {
 
 function nullableU64(value: unknown): bigint | null {
   return value === null ? null : u64(value);
+}
+
+function stateRevision(value: unknown): bigint {
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,18})$/u.test(value)) throw dataError();
+  const revision = BigInt(value);
+  if (revision > INT64_MAX) throw dataError();
+  return revision;
 }
 
 function attemptConflictError(): ExecutionIntentRepositoryError {

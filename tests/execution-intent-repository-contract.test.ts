@@ -191,6 +191,17 @@ void test('execution intent repository is an allowlisted domain-only persistence
   assert.deepEqual(forbiddenTokenViolations(sourceFile), []);
 });
 
+void test('execution intent PostgreSQL adapter cannot import or invoke execution capabilities', async () => {
+  const sourceUrl = new URL('../src/storage/execution-intent.repository.ts', import.meta.url);
+  const sourcePath = fileURLToPath(sourceUrl);
+  const source = await readFile(sourceUrl, 'utf8');
+
+  assert.deepEqual(
+    executionBoundaryViolations(source, sourcePath, fileURLToPath(new URL('../', import.meta.url))),
+    [],
+  );
+});
+
 void test('execution intent repository contract supports frozen execution lifecycle values', async () => {
   const repository = new StrictFakeExecutionIntentRepository();
   const draft = createExecutionIntentDraft({
