@@ -41,7 +41,7 @@ export interface ExecutionIntentRepository {
     readonly ownerId: string;
     readonly leaseMs: number;
     readonly purpose: ExecutionClaimPurpose;
-  }>): Promise<ClaimedExecutionIntent | null>;
+  }>, signal?: AbortSignal): Promise<ClaimedExecutionIntent | null>;
   beginAttempt(claim: ClaimedExecutionIntent): Promise<Readonly<{
     readonly intentId: string;
     readonly attemptNumber: number;

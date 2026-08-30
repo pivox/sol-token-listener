@@ -15,6 +15,7 @@ import type {
   ExecutionIntentRepository,
 } from '../src/ports/execution-intent-repository.js';
 import { ExecutionDryRunRepositoryError } from '../src/storage/execution-dry-run.repository.js';
+import { ExecutionIntentRepositoryError } from '../src/storage/execution-intent.repository.js';
 
 void test('returns IDLE after one exact DRY_RUN claim and performs no other repository operation', async () => {
   const fake = fakes(null);
@@ -49,10 +50,42 @@ void test('leaves the lease to expire and returns IDLE when cancelled during cla
 
   await Promise.resolve();
   assert.equal(fake.claimOptions.length, 1);
+  assert.equal(fake.claimSignals[0], controller.signal);
   controller.abort();
   claimGate.resolve(claimed);
 
   assert.equal(await pass, 'IDLE');
+  assert.equal(fake.completed.length, 0);
+  assert.equal(fake.findInputs.length, 0);
+  assertForbiddenCalls(fake);
+});
+
+void test('maps authenticated claim cancellation to IDLE only after the same signal is aborted', async () => {
+  const controller = new AbortController();
+  const cancellation = new ExecutionIntentRepositoryError('OPERATION_ABORTED');
+  const claimGate = deferred<ClaimedExecutionIntent | null>();
+  const fake = fakes(null, { claimResult: claimGate.promise });
+  const pass = createDryRunWorker(fake.dependencies).runOnce(controller.signal);
+
+  await Promise.resolve();
+  assert.equal(fake.claimSignals[0], controller.signal);
+  controller.abort();
+  claimGate.reject(cancellation);
+
+  assert.equal(await pass, 'IDLE');
+  assert.equal(fake.completed.length, 0);
+  assert.equal(fake.findInputs.length, 0);
+  assertForbiddenCalls(fake);
+});
+
+void test('rethrows a constructed claim cancellation while the signal remains active', async () => {
+  const cancellation = new ExecutionIntentRepositoryError('OPERATION_ABORTED');
+  const fake = fakes(null, { claimError: cancellation });
+
+  await assert.rejects(
+    createDryRunWorker(fake.dependencies).runOnce(activeSignal()),
+    (error) => error === cancellation,
+  );
   assert.equal(fake.completed.length, 0);
   assert.equal(fake.findInputs.length, 0);
   assertForbiddenCalls(fake);
@@ -320,6 +353,7 @@ function fakes(
   }> = {},
 ) {
   const claimOptions: Readonly<{ ownerId: string; leaseMs: number; purpose: string }>[] = [];
+  const claimSignals: (AbortSignal | undefined)[] = [];
   const completed: Readonly<{
     claim: ClaimedExecutionIntent;
     assessment: ReturnType<typeof createExecutionDryRunAssessment>;
@@ -328,8 +362,12 @@ function fakes(
   const findInputs: ReturnType<typeof createExecutionDryRunAssessment>[] = [];
   const forbidden = { renew: 0, release: 0, beginAttempt: 0, finishAttempt: 0, transition: 0 };
   const intents = {
-    claim: async (options: Readonly<{ ownerId: string; leaseMs: number; purpose: 'EXECUTE' | 'CONFIRM' | 'RECONCILE' | 'DRY_RUN' }>) => {
+    claim: async (
+      options: Readonly<{ ownerId: string; leaseMs: number; purpose: 'EXECUTE' | 'CONFIRM' | 'RECONCILE' | 'DRY_RUN' }>,
+      signal?: AbortSignal,
+    ) => {
       claimOptions.push(options);
+      claimSignals.push(signal);
       if (behavior.claimError !== undefined) return Promise.reject(behavior.claimError);
       return behavior.claimResult ?? claimed;
     },
@@ -358,7 +396,7 @@ function fakes(
     dependencies: Object.freeze({
       intents, assessments, ownerId: 'executor-dry-run-worker-1', leaseMs: 30_000,
     }),
-    claimOptions, completed, findInputs, forbidden,
+    claimOptions, claimSignals, completed, findInputs, forbidden,
   };
 }
 

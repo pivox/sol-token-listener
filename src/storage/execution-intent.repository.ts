@@ -46,6 +46,7 @@ export type ExecutionIntentRepositoryErrorCode =
   | 'INVALID_INPUT'
   | 'INVALID_DATA'
   | 'DATABASE_FAILURE'
+  | 'OPERATION_ABORTED'
   | 'INTENT_DUPLICATE'
   | 'INTENT_LEASE_LOST'
   | 'ATTEMPT_EXHAUSTED'
@@ -242,14 +243,12 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     readonly ownerId: string;
     readonly leaseMs: number;
     readonly purpose: ExecutionClaimPurpose;
-  }>): Promise<ClaimedExecutionIntent | null> {
+  }>, signal?: AbortSignal): Promise<ClaimedExecutionIntent | null> {
     return this.safely(async () => {
       const options = claimOptions(optionsValue);
+      if (signal?.aborted === true) throw operationAbortedError();
       const leaseToken = randomUUID();
-      const withClaimClient = options.purpose === 'DRY_RUN'
-        ? this.withDryRunClient.bind(this)
-        : this.withClient.bind(this);
-      return withClaimClient(async (client) => {
+      return this.withClaimClient(signal, options.purpose === 'DRY_RUN', async (client) => {
         const claimed = await client.query(
           CLAIM_SQL[options.purpose],
           [options.ownerId, options.leaseMs, leaseToken],
@@ -669,7 +668,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     throw databaseError((primaryFailure === undefined ? 0 : 1) + (releaseFailed ? 1 : 0));
   }
 
-  private async withDryRunClient<TResult>(
+  private async withClaimClient<TResult>(
+    signal: AbortSignal | undefined,
+    evictOnFailure: boolean,
     run: (client: ExecutionIntentClient) => Promise<TResult>,
   ): Promise<TResult> {
     let client: ExecutionIntentClient;
@@ -678,6 +679,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     } catch {
       throw databaseError(1);
     }
+    if (signal?.aborted === true) abortBeforeClaim(client);
     let result: TResult | undefined;
     let primaryFailure: unknown;
     let completed = false;
@@ -690,7 +692,8 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     } finally {
       try {
         if (completed) client.release();
-        else client.release(true);
+        else if (evictOnFailure) client.release(true);
+        else client.release();
       } catch {
         releaseFailed = true;
       }
@@ -1409,6 +1412,10 @@ function leaseLostError(): ExecutionIntentRepositoryError {
   return repositoryError('INTENT_LEASE_LOST');
 }
 
+function operationAbortedError(): ExecutionIntentRepositoryError {
+  return repositoryError('OPERATION_ABORTED');
+}
+
 function inputError(): ExecutionIntentRepositoryError {
   return repositoryError('INVALID_INPUT');
 }
@@ -1440,6 +1447,16 @@ function repositoryError(
 function isInternalError(value: unknown): value is ExecutionIntentRepositoryError {
   return typeof value === 'object' && value !== null
     && INTERNAL_ERRORS.has(value as ExecutionIntentRepositoryError);
+}
+
+function abortBeforeClaim(client: ExecutionIntentClient): never {
+  try {
+    client.release();
+  } catch {
+    try { client.release(true); } catch { /* The fixed database error remains authoritative. */ }
+    throw databaseError(1);
+  }
+  throw operationAbortedError();
 }
 
 function requiredRow(rows: readonly Row[]): Row {

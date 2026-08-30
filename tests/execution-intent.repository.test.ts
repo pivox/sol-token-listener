@@ -230,6 +230,115 @@ void test('DRY_RUN query failures evict the client without exposing database det
   assert.deepEqual(client.releaseErrors, [true]);
 });
 
+void test('claim cancellation fences connect without dispatching SQL and preserves cleanup failures', async (context) => {
+  await context.test('pre-aborted signal does not connect', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const pool = new ScriptedPool(new ScriptedClient([]));
+    const repository = new PostgresExecutionIntentRepository(pool);
+
+    await expectCode(repository.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, controller.signal), 'OPERATION_ABORTED');
+    assert.equal(pool.connectCount, 0);
+  });
+
+  await context.test('abort while connect waits releases cleanly without a query', async () => {
+    const controller = new AbortController();
+    const connectGate = deferred<ScriptedClient>();
+    let connectCount = 0;
+    const pool: ExecutionIntentPool = {
+      connect: async () => {
+        connectCount += 1;
+        return connectGate.promise;
+      },
+    };
+    const client = new ScriptedClient([]);
+    const repository = new PostgresExecutionIntentRepository(pool);
+    const pending = repository.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, controller.signal);
+
+    await Promise.resolve();
+    assert.equal(connectCount, 1);
+    controller.abort();
+    connectGate.resolve(client);
+
+    await expectCode(pending, 'OPERATION_ABORTED');
+    assert.equal(client.calls.length, 0);
+    assert.deepEqual(client.releaseErrors, [undefined]);
+  });
+
+  await context.test('connect and abort-cleanup failures remain database failures', async () => {
+    const connectController = new AbortController();
+    const connectGate = deferred<ScriptedClient>();
+    const connectFailure = new PostgresExecutionIntentRepository({
+      connect: async () => connectGate.promise,
+    });
+    const connecting = connectFailure.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, connectController.signal);
+    await Promise.resolve();
+    connectController.abort();
+    connectGate.reject(new Error('connect secret'));
+    await expectCode(connecting, 'DATABASE_FAILURE');
+
+    const cleanupController = new AbortController();
+    const cleanupGate = deferred<ScriptedClient>();
+    const cleanupClient = new ScriptedClient([], () => { throw new Error('release secret'); });
+    const cleanupFailure = new PostgresExecutionIntentRepository({
+      connect: async () => cleanupGate.promise,
+    });
+    const cleaning = cleanupFailure.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, cleanupController.signal);
+    await Promise.resolve();
+    cleanupController.abort();
+    cleanupGate.resolve(cleanupClient);
+    await expectCode(cleaning, 'DATABASE_FAILURE');
+    assert.equal(cleanupClient.calls.length, 0);
+    assert.deepEqual(cleanupClient.releaseErrors, [undefined, true]);
+  });
+});
+
+void test('claim keeps dispatched-query semantics when cancellation races SQL', async (context) => {
+  const draft = executionDraft('claim-cancel-dispatched');
+
+  await context.test('query failure remains a database failure', async () => {
+    const controller = new AbortController();
+    const client = new ScriptedClient([() => {
+      controller.abort();
+      throw new Error('query secret');
+    }]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    await expectCode(repository.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, controller.signal), 'DATABASE_FAILURE');
+    assert.deepEqual(client.releaseErrors, [true]);
+  });
+
+  await context.test('successful dispatched query returns its claim', async () => {
+    const controller = new AbortController();
+    const client = new ScriptedClient([(_text, values) => {
+      controller.abort();
+      return result([{
+        ...claimRow(draft, 'PENDING'),
+        lease_owner: values?.[0], lease_token: values?.[2],
+        claim_at_ms: String(NOW_MS),
+      }], 1);
+    }]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    const claimed = await repository.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, controller.signal);
+    assert.ok(claimed);
+    assert.equal(claimed.intent.id, draft.id);
+    assert.deepEqual(client.releaseErrors, [undefined]);
+  });
+});
+
 void test('claim SQL admits a modeled lease exactly equal to statement_timestamp', async () => {
   const draft = executionDraft('claim-equality-boundary');
   const client = new ScriptedClient([(text, values) => {
@@ -1831,6 +1940,20 @@ class ScriptedPool implements ExecutionIntentPool {
     this.connectCount += 1;
     return this.client;
   }
+}
+
+function deferred<TValue>(): Readonly<{
+  promise: Promise<TValue>;
+  resolve: (value: TValue) => void;
+  reject: (reason?: unknown) => void;
+}> {
+  let resolve!: (value: TValue) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<TValue>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return Object.freeze({ promise, resolve, reject });
 }
 
 function result(rows: readonly Row[], rowCount: number | null): QueryResult {

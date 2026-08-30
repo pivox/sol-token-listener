@@ -2,6 +2,7 @@ import { createExecutionDryRunAssessment } from '../domain/execution-dry-run.js'
 import type { ExecutionDryRunRepository } from '../ports/execution-dry-run-repository.js';
 import type { ExecutionIntentRepository } from '../ports/execution-intent-repository.js';
 import { ExecutionDryRunRepositoryError } from '../storage/execution-dry-run.repository.js';
+import { ExecutionIntentRepositoryError } from '../storage/execution-intent.repository.js';
 
 export type DryRunPassResult = 'IDLE' | 'RECORDED' | 'COMMIT_RECOVERED';
 
@@ -34,11 +35,19 @@ async function runPass(
   signal: AbortSignal,
 ): Promise<DryRunPassResult> {
   if (cancellationRequested(signal)) return 'IDLE';
-  const claim = await dependencies.intents.claim(Object.freeze({
-    ownerId: dependencies.ownerId,
-    leaseMs: dependencies.leaseMs,
-    purpose: 'DRY_RUN',
-  }));
+  let claim;
+  try {
+    claim = await dependencies.intents.claim(Object.freeze({
+      ownerId: dependencies.ownerId,
+      leaseMs: dependencies.leaseMs,
+      purpose: 'DRY_RUN',
+    }), signal);
+  } catch (error) {
+    if (error instanceof ExecutionIntentRepositoryError
+      && error.code === 'OPERATION_ABORTED'
+      && cancellationRequested(signal)) return 'IDLE';
+    throw error;
+  }
   if (cancellationRequested(signal)) return 'IDLE';
   if (claim === null) return 'IDLE';
   const assessment = createExecutionDryRunAssessment(claim.intent);
