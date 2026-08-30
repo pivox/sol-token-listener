@@ -162,7 +162,7 @@ void test('findExact performs one lease-free exact read, returns null, and rejec
   assert.deepEqual(found, Object.freeze({ ...assessment, recordedAtMs: NOW_MS }));
   const call = required(exactClient.calls[0]);
   assert.equal(exactClient.calls.length, 1);
-  assert.match(call.text, /WHERE assessment\.assessment_id=\$1\s+AND assessment\.intent_id=\$2\s+AND assessment\.evaluator_version=\$3/u);
+  assert.match(call.text, /WHERE assessment\.assessment_id=\$1\s+OR\s+\(assessment\.intent_id=\$2\s+AND assessment\.evaluator_version=\$3\)/u);
   assert.doesNotMatch(call.text, /lease|FOR UPDATE|BEGIN|COMMIT/iu);
   assert.match(call.text, /intent_state_revision::TEXT AS intent_state_revision/u);
   assert.match(call.text, /EXTRACT\(EPOCH FROM assessment\.recorded_at\) \* 1000\)::TEXT AS recorded_at_ms/u);
@@ -207,6 +207,55 @@ void test('findExact performs one lease-free exact read, returns null, and rejec
   }
   assert.equal(getterCalls, 0);
   assert.equal(proxyTraps, 0);
+});
+
+void test('findExact rejects another assessment id under the expected logical identity', async () => {
+  const assessment = createExecutionDryRunAssessment(claim('logical-conflict').intent);
+  const conflicting = {
+    ...assessmentRow(assessment, false),
+    assessment_id: createExecutionDryRunAssessment(claim('other-assessment-id').intent).assessmentId,
+  };
+  const client = new ScriptedClient([logicalIdentityResult([conflicting])]);
+
+  await expectCode(
+    new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment),
+    'INVALID_DATA',
+  );
+  assert.deepEqual(client.releaseErrors, [true]);
+});
+
+void test('findExact rejects the expected assessment id under another logical identity', async () => {
+  const assessment = createExecutionDryRunAssessment(claim('assessment-id-conflict').intent);
+  const other = createExecutionDryRunAssessment(claim('other-logical-identity').intent);
+  const conflicting = {
+    ...assessmentRow(other, false),
+    assessment_id: assessment.assessmentId,
+  };
+  const client = new ScriptedClient([logicalIdentityResult([conflicting])]);
+
+  await expectCode(
+    new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment),
+    'INVALID_DATA',
+  );
+  assert.deepEqual(client.releaseErrors, [true]);
+});
+
+void test('findExact rejects two rows that split the deterministic and logical identities', async () => {
+  const assessment = createExecutionDryRunAssessment(claim('split-conflicts').intent);
+  const other = createExecutionDryRunAssessment(claim('split-conflicts-other').intent);
+  const logicalConflict = {
+    ...assessmentRow(assessment, false), assessment_id: other.assessmentId,
+  };
+  const idConflict = {
+    ...assessmentRow(other, false), assessment_id: assessment.assessmentId,
+  };
+  const client = new ScriptedClient([logicalIdentityResult([logicalConflict, idConflict])]);
+
+  await expectCode(
+    new PostgresExecutionDryRunRepository(new ScriptedPool(client)).findExact(assessment),
+    'INVALID_DATA',
+  );
+  assert.deepEqual(client.releaseErrors, [true]);
 });
 
 void test('findExact evicts on database and cleanup failures with fixed redacted errors', async () => {
@@ -309,6 +358,36 @@ void test('real PostgreSQL keeps a conflicting assessment and its lease fail-clo
     assert.equal((await pool.query(
       'SELECT 1 FROM execution_dry_run_assessments WHERE intent_id=$1', [created.intent.id],
     )).rowCount, 1);
+  });
+});
+
+void test('real PostgreSQL exposes deterministic and logical identity contradictions to findExact', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'dry-run exact identity conflict integration');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'dry_run_exact_conflict', async (pool) => {
+    await migrateDatabase({ pool });
+    const intents = new PostgresExecutionIntentRepository(pool);
+    const repository = new PostgresExecutionDryRunRepository(pool);
+    const expected = createExecutionDryRunAssessment(
+      (await intents.create(freshDraft('exact-conflict-expected'))).intent,
+    );
+    const other = createExecutionDryRunAssessment(
+      (await intents.create(freshDraft('exact-conflict-other'))).intent,
+    );
+    const logicalConflict = Object.freeze({ ...expected, assessmentId: other.assessmentId });
+    const idConflict = Object.freeze({ ...other, assessmentId: expected.assessmentId });
+
+    await insertAssessment(pool, logicalConflict);
+    await expectCode(repository.findExact(expected), 'INVALID_DATA');
+    await pool.query('DELETE FROM execution_dry_run_assessments');
+
+    await insertAssessment(pool, idConflict);
+    await expectCode(repository.findExact(expected), 'INVALID_DATA');
+    await pool.query('DELETE FROM execution_dry_run_assessments');
+
+    await insertAssessment(pool, logicalConflict);
+    await insertAssessment(pool, idConflict);
+    await expectCode(repository.findExact(expected), 'INVALID_DATA');
   });
 });
 
@@ -424,6 +503,14 @@ class AckLostPool implements ExecutionDryRunPool {
 
 function result(rows: readonly Row[], rowCount: number): QueryResult {
   return { rows, rowCount };
+}
+
+function logicalIdentityResult(rows: readonly Row[]): Step {
+  return (text) => {
+    const exposesContradictions = /WHERE assessment\.assessment_id=\$1\s+OR\s+\(assessment\.intent_id=\$2\s+AND assessment\.evaluator_version=\$3\)/u
+      .test(text);
+    return exposesContradictions ? result(rows, rows.length) : result([], 0);
+  };
 }
 
 function claim(suffix: string): ClaimedExecutionIntent {

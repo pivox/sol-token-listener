@@ -190,8 +190,7 @@ SELECT
 const FIND_EXACT_SQL = `SELECT ${ASSESSMENT_PROJECTION}
 FROM execution_dry_run_assessments AS assessment
 WHERE assessment.assessment_id=$1
-  AND assessment.intent_id=$2
-  AND assessment.evaluator_version=$3`;
+  OR (assessment.intent_id=$2 AND assessment.evaluator_version=$3)`;
 
 export class PostgresExecutionDryRunRepository implements ExecutionDryRunRepository {
   public constructor(private readonly pool: ExecutionDryRunPool = getDatabasePool()) {}
