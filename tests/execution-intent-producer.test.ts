@@ -4,8 +4,13 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
   createCreationEntrySession,
+  CREATION_EXIT_REASONS,
   type PaperStrategySession,
 } from '../src/domain/paper-strategy.js';
+import {
+  createDeterministicDerivedEventId,
+  type DomainEvent,
+} from '../src/domain/events.js';
 import type { PaperPosition } from '../src/domain/paper-trading.js';
 import {
   createTradingCandidate,
@@ -13,9 +18,11 @@ import {
 } from '../src/domain/trading-candidate.js';
 import {
   deriveExecutionIntent,
+  createExecutionDecisionFingerprint,
   ExecutionIntentProducerError,
   type DeriveExecutionIntentInput,
 } from '../src/application/execution-intent-producer.js';
+import { canonicalStringifyJson } from '../src/utils/json.js';
 
 const MINT = '11111111111111111111111111111111';
 const WSOL = 'So11111111111111111111111111111111111111112';
@@ -24,7 +31,6 @@ const EXPIRES_AT_MS = REQUESTED_AT_MS + 30_000;
 const REPORT_ID = `qreport_${'b'.repeat(64)}`;
 const PROFILE_FINGERPRINT = 'c'.repeat(64);
 const EVIDENCE_FINGERPRINT = 'd'.repeat(64);
-const DECISION_FINGERPRINT = 'e'.repeat(64);
 const QUALIFICATION_EVENT_ID = `evt_${'1'.repeat(64)}`;
 const CLOSE_EVENT_ID = `evt_${'2'.repeat(64)}`;
 const POSITION_ID = executionSnapshotIdForTest('paper_position', [
@@ -56,8 +62,8 @@ void test('derives an inert PUMP_FUN_ONLY BUY from the canonical open command', 
   assert.equal(intent.quoteAmountRaw, 1_000n);
   assert.equal(intent.baseAmountRaw, null);
   assert.equal(intent.minimumAmountOutRaw, 900n);
-  assert.equal(intent.decisionEventId, QUALIFICATION_EVENT_ID);
-  assert.equal(intent.decisionFingerprint, DECISION_FINGERPRINT);
+  assert.equal(intent.decisionEventId, input.sessionEvent.id);
+  assert.equal(intent.decisionFingerprint, createExecutionDecisionFingerprint(input.sessionEvent));
   assert.equal(intent.requestedAtMs, REQUESTED_AT_MS);
   assert.equal(intent.expiresAtMs, EXPIRES_AT_MS);
   assert.equal(Object.isFrozen(intent), true);
@@ -324,6 +330,100 @@ void test('rejects a proxied allowlist without invoking any proxy trap', () => {
   assert.equal(traps, 0);
 });
 
+void test('rejects a stale CLOSE decision timestamp and an excessive intent TTL', () => {
+  const close = sellInput();
+  assert.throws(
+    () => deriveExecutionIntent(Object.freeze({
+      ...close, requestedAtMs: close.requestedAtMs + 1,
+    })),
+    (error: unknown) => error instanceof ExecutionIntentProducerError
+      && error.code === 'DECISION_STALE',
+  );
+  const open = buyInput();
+  assert.throws(
+    () => deriveExecutionIntent(Object.freeze({
+      ...open, expiresAtMs: open.requestedAtMs + open.maximumIntentTtlMs + 1,
+    })),
+    (error: unknown) => error instanceof ExecutionIntentProducerError
+      && error.code === 'DECISION_STALE',
+  );
+});
+
+void test('rejects a forged PaperStrategySessionUpdated decision event', () => {
+  for (const mutate of [
+    (event: DomainEvent) => Object.freeze({ ...event, type: 'QualificationUpdated' as const }),
+    (event: DomainEvent) => Object.freeze({ ...event, source: 'other' }),
+    (event: DomainEvent) => Object.freeze({ ...event, mint: WSOL }),
+    (event: DomainEvent) => Object.freeze({ ...event, payloadVersion: 2 }),
+    (event: DomainEvent) => Object.freeze({ ...event, observedAtMs: event.observedAtMs + 1 }),
+    (event: DomainEvent) => Object.freeze({
+      ...event, payload: Object.freeze({ session: requiredSession(sellInput()) }),
+    }),
+  ]) {
+    const input = buyInput();
+    assert.throws(
+      () => deriveExecutionIntent(Object.freeze({ ...input, sessionEvent: mutate(input.sessionEvent) })),
+      ExecutionIntentProducerError,
+    );
+  }
+});
+
+void test('enforces OPEN and CLOSE strategy reason invariants', () => {
+  const open = buyInput();
+  const badOpen = Object.freeze({ ...requiredSession(open), reasonCode: 'RECONCILIATION_REQUIRED' as const });
+  assert.throws(
+    () => deriveExecutionIntent(withSession(open, badOpen, false)),
+    ExecutionIntentProducerError,
+  );
+
+  const close = sellInput();
+  const closeSession = requiredCreationSession(close);
+  const pendingExitReason = CREATION_EXIT_REASONS.find((reason) => (
+    reason !== closeSession.pendingExitReason && reason !== 'MANUAL_KILL_SWITCH'
+  ));
+  assert.ok(pendingExitReason);
+  const forged = Object.freeze({
+    ...closeSession,
+    pendingExitReason,
+    closeCommandId: strategyCommandIdForTest('paper_sell', [
+      requiredPosition(close).id,
+      close.candidate.strategy.id,
+      String(close.candidate.strategy.version),
+      pendingExitReason,
+    ]),
+  });
+  assert.throws(
+    () => deriveExecutionIntent(withSession(close, forged, true)),
+    ExecutionIntentProducerError,
+  );
+});
+
+void test('enforces manual and non-manual kill trigger timestamps', () => {
+  const close = sellInput();
+  const session = requiredCreationSession(close);
+  const missingManualTrigger = Object.freeze({
+    ...session,
+    reasonCode: 'MANUAL_KILL_SWITCH' as const,
+    pendingExitReason: 'MANUAL_KILL_SWITCH' as const,
+    pendingExitTriggerAtMs: null,
+    closeCommandId: strategyCommandIdForTest('paper_sell', [
+      requiredPosition(close).id,
+      close.candidate.strategy.id,
+      String(close.candidate.strategy.version),
+      'MANUAL_KILL_SWITCH',
+    ]),
+  });
+  assert.throws(
+    () => deriveExecutionIntent(withSession(close, missingManualTrigger, true)),
+    ExecutionIntentProducerError,
+  );
+  const nonManualTrigger = Object.freeze({ ...session, pendingExitTriggerAtMs: REQUESTED_AT_MS });
+  assert.throws(
+    () => deriveExecutionIntent(withSession(close, nonManualTrigger, true)),
+    ExecutionIntentProducerError,
+  );
+});
+
 void test('rejects a zero SELL quantity before creating a draft', () => {
   const input = sellInput();
   assert.throws(
@@ -378,16 +478,25 @@ function buyInput(): DeriveExecutionIntentInput {
       profileFingerprint: PROFILE_FINGERPRINT,
       evidenceFingerprint: EVIDENCE_FINGERPRINT,
     }),
-    decisionEventId: QUALIFICATION_EVENT_ID,
-    decisionFingerprint: DECISION_FINGERPRINT,
+    sessionEvent: sessionEventValue(session, false),
     requestedAtMs: REQUESTED_AT_MS,
     expiresAtMs: EXPIRES_AT_MS,
+    maximumIntentTtlMs: 30_000,
   });
 }
 
 function requiredSession(input: DeriveExecutionIntentInput): PaperStrategySession {
   assert.ok(input.session);
   return input.session;
+}
+
+function requiredCreationSession(
+  input: DeriveExecutionIntentInput,
+): Extract<PaperStrategySession, { readonly payloadVersion: 2 }> {
+  const session = requiredSession(input);
+  assert.equal(session.payloadVersion, 2);
+  if (session.payloadVersion !== 2) throw new Error('Expected creation-entry session.');
+  return session;
 }
 
 function requiredQuote(input: DeriveExecutionIntentInput): NonNullable<DeriveExecutionIntentInput['quote']> {
@@ -398,6 +507,14 @@ function requiredQuote(input: DeriveExecutionIntentInput): NonNullable<DeriveExe
 function requiredPosition(input: DeriveExecutionIntentInput): PaperPosition {
   assert.ok(input.position);
   return input.position;
+}
+
+function withSession(
+  input: DeriveExecutionIntentInput,
+  session: PaperStrategySession,
+  close: boolean,
+): DeriveExecutionIntentInput {
+  return Object.freeze({ ...input, session, sessionEvent: sessionEventValue(session, close) });
 }
 
 function sellInput(): DeriveExecutionIntentInput {
@@ -413,7 +530,7 @@ function sellInput(): DeriveExecutionIntentInput {
     candidate,
     position,
     quote,
-    decisionEventId: CLOSE_EVENT_ID,
+    sessionEvent: sessionEventValue(session, true),
   });
 }
 
@@ -521,4 +638,45 @@ function executionSnapshotIdForTest(
   return `${namespace}_${createHash('sha256')
     .update(`${namespace}\u001f${JSON.stringify(parts)}`)
     .digest('hex')}`;
+}
+
+function sessionEventValue(session: PaperStrategySession, close: boolean): DomainEvent {
+  const cursor = Object.freeze({
+    ...session.entryCursor,
+    slot: close ? session.entryCursor.slot + 1n : session.entryCursor.slot,
+  });
+  const program = 'pumpfun';
+  const signature = close ? 'close-signature' : 'open-signature';
+  const id = createDeterministicDerivedEventId({
+    type: 'PaperStrategySessionUpdated',
+    mint: session.mint,
+    source: 'paper-decision',
+    program,
+    signature,
+    cursor,
+    qualifier: `${session.id}:${createHash('sha256')
+      .update(canonicalStringifyJson(session))
+      .digest('hex')}`,
+  });
+  return Object.freeze({
+    id,
+    type: 'PaperStrategySessionUpdated',
+    mint: session.mint,
+    source: 'paper-decision',
+    program,
+    signature,
+    cursor,
+    confirmationStatus: 'confirmed',
+    blockchainTimeMs: REQUESTED_AT_MS,
+    observedAtMs: session.updatedAtMs,
+    payloadVersion: 1,
+    payload: Object.freeze({ session }),
+  });
+}
+
+function strategyCommandIdForTest(
+  namespace: 'paper_open' | 'paper_sell',
+  parts: readonly string[],
+): string {
+  return `${namespace}_${createHash('sha256').update(JSON.stringify(parts)).digest('hex')}`;
 }

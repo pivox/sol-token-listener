@@ -5,9 +5,17 @@ import {
   type ExecutionIntentDraftV1,
   type ExecutionIntentReasonCode,
 } from '../domain/execution-intent.js';
-import type { PaperStrategySession } from '../domain/paper-strategy.js';
+import {
+  CREATION_EXIT_REASONS,
+  type PaperStrategySession,
+} from '../domain/paper-strategy.js';
 import type { PaperExecutionQuote, PaperPosition } from '../domain/paper-trading.js';
 import type { TradingCandidateV1 } from '../domain/trading-candidate.js';
+import {
+  createDeterministicDerivedEventId,
+  type DomainEvent,
+} from '../domain/events.js';
+import { canonicalStringifyJson } from '../utils/json.js';
 
 export interface ExecutionIntentQualificationIdentity {
   readonly reportId: string;
@@ -27,10 +35,10 @@ export interface DeriveExecutionIntentInput {
   readonly wsolMint: string;
   readonly maximumQuoteAgeMs: number;
   readonly qualification: ExecutionIntentQualificationIdentity;
-  readonly decisionEventId: string;
-  readonly decisionFingerprint: string;
+  readonly sessionEvent: DomainEvent;
   readonly requestedAtMs: number;
   readonly expiresAtMs: number;
+  readonly maximumIntentTtlMs: number;
 }
 
 export class ExecutionIntentProducerError extends Error {
@@ -54,10 +62,10 @@ const INPUT_KEYS = Object.freeze([
   'wsolMint',
   'maximumQuoteAgeMs',
   'qualification',
-  'decisionEventId',
-  'decisionFingerprint',
+  'sessionEvent',
   'requestedAtMs',
   'expiresAtMs',
+  'maximumIntentTtlMs',
 ] as const);
 
 const WRAPPED_SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -74,7 +82,13 @@ export function deriveExecutionIntent(
   const requestedAction = actionFrom(record.requestedAction);
   const requestedAtMs = timestampFrom(record.requestedAtMs, 'DECISION_STALE');
   const expiresAtMs = timestampFrom(record.expiresAtMs, 'DECISION_STALE');
-  if (expiresAtMs <= requestedAtMs) staleDecision();
+  const maximumIntentTtlMs = boundedIntegerFrom(
+    record.maximumIntentTtlMs, 1, Number.MAX_SAFE_INTEGER, 'DECISION_STALE',
+  );
+  if (
+    expiresAtMs <= requestedAtMs
+    || expiresAtMs - requestedAtMs > maximumIntentTtlMs
+  ) staleDecision();
 
   const allowlist = allowlistFrom(record.quoteMintAllowlist);
   const wsolMint = textFrom(record.wsolMint, 'QUOTE_MINT_NOT_ALLOWED');
@@ -84,14 +98,13 @@ export function deriveExecutionIntent(
   );
 
   const qualification = qualificationFrom(record.qualification);
-  const decisionEventId = textFrom(record.decisionEventId, 'DECISION_STALE');
-  const decisionFingerprint = fingerprintFrom(record.decisionFingerprint, 'DECISION_STALE');
   const candidate = modelFrom(record.candidate, 'DECISION_STALE') as TradingCandidateV1;
 
   if (requestedAction === 'NONE') {
     if (record.session !== null) modelFrom(record.session, 'DECISION_STALE');
     if (record.position !== null) modelFrom(record.position, 'DECISION_STALE');
     if (record.quote !== null) modelFrom(record.quote, 'QUOTE_STALE');
+    modelFrom(record.sessionEvent, 'DECISION_STALE');
     if (record.currentSessionId !== null) {
       textFrom(record.currentSessionId, 'DECISION_STALE');
     }
@@ -102,6 +115,7 @@ export function deriveExecutionIntent(
   const position = modelFrom(record.position, 'DECISION_STALE') as PaperPosition;
   const quote = modelFrom(record.quote, 'QUOTE_STALE') as PaperExecutionQuote;
   const currentSessionId = textFrom(record.currentSessionId, 'DECISION_STALE');
+  const sessionEvent = modelFrom(record.sessionEvent, 'DECISION_STALE') as DomainEvent;
 
   const sessionId = textProperty(session, 'id', 'DECISION_STALE');
   const candidateId = textProperty(candidate, 'id', 'DECISION_STALE');
@@ -160,6 +174,11 @@ export function deriveExecutionIntent(
     || qualification.eventId !== textProperty(asOf, 'eventId', 'QUALIFICATION_STALE')
     || !confirmationReached(confirmationStatus, minimumConfirmation)
   ) qualificationStale();
+  assertCanonicalSessionEvent(sessionEvent, session, mint, minimumConfirmation);
+  if (
+    requestedAtMs !== timestampProperty(sessionEvent, 'observedAtMs', 'DECISION_STALE')
+    || requestedAtMs !== timestampProperty(session, 'updatedAtMs', 'DECISION_STALE')
+  ) staleDecision();
 
   assertCanonicalIds({
     candidateId,
@@ -193,12 +212,13 @@ export function deriveExecutionIntent(
     : textProperty(session, 'closeCommandId', 'DECISION_STALE');
 
   if (requestedAction === 'OPEN') {
+    // Route or asset identity failures are allowlist failures; snapshot/freshness drift is QUOTE_STALE.
     if (
       textProperty(quote, 'inputMint', 'QUOTE_MINT_NOT_ALLOWED') !== quoteMint
       || textProperty(quote, 'outputMint', 'QUOTE_MINT_NOT_ALLOWED') !== mint
     ) quoteMintNotAllowed();
     assertOpenLineage(
-      session, candidate, position, quote, qualification.eventId, decisionEventId,
+      session, candidate, position, quote, qualification.eventId,
       sessionId, candidateId, strategyId, strategyVersion,
     );
     if (
@@ -215,7 +235,7 @@ export function deriveExecutionIntent(
       || textProperty(quote, 'outputMint', 'QUOTE_MINT_NOT_ALLOWED') !== quoteMint
     ) quoteMintNotAllowed();
     assertCloseLineage(
-      session, candidate, position, quote, decisionEventId,
+      session, candidate, position, quote,
       positionId, strategyId, strategyVersion,
     );
     if (
@@ -241,14 +261,80 @@ export function deriveExecutionIntent(
       quoteAmountRaw: requestedAction === 'OPEN' ? amountInRaw : null,
       baseAmountRaw: requestedAction === 'CLOSE' ? amountInRaw : null,
       minimumAmountOutRaw,
-      decisionEventId,
-      decisionFingerprint,
+      decisionEventId: sessionEvent.id,
+      decisionFingerprint: createExecutionDecisionFingerprint(sessionEvent),
       requestedAtMs,
       expiresAtMs,
     });
   } catch {
     staleDecision();
   }
+}
+
+export function createExecutionDecisionFingerprint(event: DomainEvent): string {
+  return sha256(canonicalStringifyJson(event));
+}
+
+function assertCanonicalSessionEvent(
+  event: DomainEvent,
+  session: PaperStrategySession,
+  mint: string,
+  minimumConfirmation: string,
+): void {
+  const record = frozenDataRecord(event, [
+    'id', 'type', 'mint', 'source', 'program', 'signature', 'cursor',
+    'confirmationStatus', 'blockchainTimeMs', 'observedAtMs', 'payloadVersion', 'payload',
+  ], 'DECISION_STALE');
+  const cursorRecord = frozenDataRecord(record.cursor, [
+    'slot', 'transactionIndex', 'instructionIndex', 'innerInstructionIndex',
+  ], 'DECISION_STALE');
+  const cursor = Object.freeze({
+    slot: nonNegativeBigintFrom(cursorRecord.slot, 'DECISION_STALE'),
+    transactionIndex: boundedIntegerFrom(
+      cursorRecord.transactionIndex, 0, 2_147_483_647, 'DECISION_STALE',
+    ),
+    instructionIndex: boundedIntegerFrom(
+      cursorRecord.instructionIndex, 0, 2_147_483_647, 'DECISION_STALE',
+    ),
+    innerInstructionIndex: cursorRecord.innerInstructionIndex === null
+      ? null
+      : boundedIntegerFrom(
+        cursorRecord.innerInstructionIndex, 0, 2_147_483_647, 'DECISION_STALE',
+      ),
+  });
+  const payload = frozenDataRecord(record.payload, ['session'], 'DECISION_STALE');
+  const program = textFrom(record.program, 'DECISION_STALE');
+  const signature = textFrom(record.signature, 'DECISION_STALE');
+  const confirmationStatus = textFrom(record.confirmationStatus, 'DECISION_STALE');
+  const observedAtMs = timestampFrom(record.observedAtMs, 'DECISION_STALE');
+  if (record.blockchainTimeMs !== null) {
+    timestampFrom(record.blockchainTimeMs, 'DECISION_STALE');
+  }
+  if (
+    record.type !== 'PaperStrategySessionUpdated'
+    || record.source !== 'paper-decision'
+    || record.mint !== mint
+    || record.payloadVersion !== 1
+    || payload.session !== session
+    || observedAtMs !== timestampProperty(session, 'updatedAtMs', 'DECISION_STALE')
+    || !confirmationReached(confirmationStatus, minimumConfirmation)
+  ) staleDecision();
+  let canonicalSession: string;
+  try {
+    canonicalSession = canonicalStringifyJson(session);
+  } catch {
+    staleDecision();
+  }
+  const expectedId = createDeterministicDerivedEventId({
+    type: 'PaperStrategySessionUpdated',
+    mint,
+    source: 'paper-decision',
+    program,
+    signature,
+    cursor,
+    qualifier: `${textProperty(session, 'id', 'DECISION_STALE')}:${sha256(canonicalSession)}`,
+  });
+  if (record.id !== expectedId) staleDecision();
 }
 
 function assertQuote(
@@ -306,7 +392,6 @@ function assertOpenLineage(
   position: PaperPosition,
   quote: PaperExecutionQuote,
   qualificationEventId: string,
-  decisionEventId: string,
   sessionId: string,
   candidateId: string,
   strategyId: string,
@@ -316,8 +401,8 @@ function assertOpenLineage(
   const sessionQuote = modelProperty(session, 'lastQuote', 'QUOTE_STALE');
   if (!sameQuote(quote, canonicalBuyQuote) || !sameQuote(quote, sessionQuote)) quoteStale();
   if (
-    decisionEventId !== qualificationEventId
-    || textProperty(position, 'triggerEventId', 'DECISION_STALE') !== qualificationEventId
+    textProperty(position, 'triggerEventId', 'DECISION_STALE') !== qualificationEventId
+    || textProperty(session, 'reasonCode', 'DECISION_STALE') !== 'QUALIFIED_ENTRY'
     || textProperty(session, 'openCommandId', 'DECISION_STALE')
       !== strategyCommandId('paper_open', [
         sessionId, candidateId, strategyId, String(strategyVersion),
@@ -344,7 +429,6 @@ function assertCloseLineage(
   candidate: TradingCandidateV1,
   position: PaperPosition,
   quote: PaperExecutionQuote,
-  decisionEventId: string,
   positionId: string,
   strategyId: string,
   strategyVersion: number,
@@ -353,7 +437,16 @@ function assertCloseLineage(
   if (!sameQuote(quote, sessionQuote)) quoteStale();
   const canonicalBuyQuote = modelProperty(candidate, 'buyQuote', 'QUOTE_STALE');
   const pendingExitReason = textProperty(session, 'pendingExitReason', 'DECISION_STALE');
+  const reasonCode = textProperty(session, 'reasonCode', 'DECISION_STALE');
+  const pendingExitTriggerAtMs = nullableTimestampOrNullProperty(
+    session, 'pendingExitTriggerAtMs', 'DECISION_STALE',
+  );
   if (
+    !(CREATION_EXIT_REASONS as readonly string[]).includes(pendingExitReason)
+    || reasonCode !== pendingExitReason
+    || (pendingExitReason === 'MANUAL_KILL_SWITCH') !== (pendingExitTriggerAtMs !== null)
+    || (pendingExitReason !== 'MANUAL_KILL_SWITCH' && pendingExitTriggerAtMs !== null)
+    ||
     textProperty(session, 'closeCommandId', 'DECISION_STALE')
       !== strategyCommandId('paper_sell', [
         positionId, strategyId, String(strategyVersion), pendingExitReason,
@@ -364,8 +457,9 @@ function assertCloseLineage(
     || !/^paper_close_command_[a-f0-9]{64}$/u.test(
       textProperty(position, 'closeCommandHash', 'DECISION_STALE'),
     )
-    || textProperty(position, 'closeEventId', 'DECISION_STALE') !== decisionEventId
-    || !/^evt_[a-f0-9]{64}$/u.test(decisionEventId)
+    || !/^evt_[a-f0-9]{64}$/u.test(
+      textProperty(position, 'closeEventId', 'DECISION_STALE'),
+    )
     || !/^paper_trade_[a-f0-9]{64}$/u.test(
       textProperty(position, 'exitTradeId', 'DECISION_STALE'),
     )
@@ -612,6 +706,15 @@ function nullableTimestampProperty(
   return timestampFrom(property, code);
 }
 
+function nullableTimestampOrNullProperty(
+  value: object,
+  key: string,
+  code: ExecutionIntentProducerError['code'],
+): number | null {
+  const property = ownValue(value, key, code);
+  return property === null ? null : timestampFrom(property, code);
+}
+
 function timestampFrom(value: unknown, code: ExecutionIntentProducerError['code']): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0 || Object.is(value, -0)) {
     throw new ExecutionIntentProducerError(code);
@@ -632,6 +735,13 @@ function boundedIntegerFrom(
     || Object.is(value, -0)
   ) throw new ExecutionIntentProducerError(code);
   return value as number;
+}
+
+function nonNegativeBigintFrom(
+  value: unknown,
+  code: ExecutionIntentProducerError['code'],
+): bigint {
+  return boundedBigintValue(value, 0n, 18_446_744_073_709_551_615n, code);
 }
 
 function positiveIntegerProperty(
