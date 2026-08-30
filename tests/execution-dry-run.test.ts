@@ -9,7 +9,11 @@ import {
   EXECUTION_DRY_RUN_SPECIFICATION_VERSION,
   ExecutionDryRunValidationError,
 } from '../src/domain/execution-dry-run.js';
-import { createExecutionIntentDraft, type ExecutionIntentV1 } from '../src/domain/execution-intent.js';
+import {
+  assertExecutionIntent,
+  createExecutionIntentDraft,
+  type ExecutionIntentV1,
+} from '../src/domain/execution-intent.js';
 
 const U64_MAX = 18_446_744_073_709_551_615n;
 
@@ -105,12 +109,30 @@ void test('changes the input fingerprint for every covered intent field', () => 
 });
 
 void test('rejects execution intents outside PENDING and RETRY_READY', () => {
-  for (const status of ['PROCESSING', 'SIMULATED', 'SUCCEEDED', 'FAILED'] as const) {
-    const record = status === 'SUCCEEDED'
-      ? intent({ status, attemptCount: 1, lastReasonCode: 'INTENT_SUCCEEDED', terminalAtMs: 1_000, reconciliationCompletedAtMs: 1_000, purgeAfterMs: 14_401_000 })
-      : status === 'FAILED'
-        ? intent({ status, attemptCount: 1, lastReasonCode: 'QUOTE_STALE', terminalAtMs: 1_000, reconciliationCompletedAtMs: 1_000, purgeAfterMs: 14_401_000 })
-        : intent({ status, attemptCount: 1, lastReasonCode: status === 'PROCESSING' ? 'EXECUTION_STARTED' : 'SIMULATION_SUCCEEDED' });
+  const active = (status: Exclude<ExecutionIntentV1['status'], 'PENDING'>,
+    lastReasonCode: NonNullable<ExecutionIntentV1['lastReasonCode']>) => intent({
+    status, attemptCount: 1, lastReasonCode,
+  });
+  const terminal = (status: 'SUCCEEDED' | 'FAILED' | 'EXPIRED' | 'CANCELLED',
+    lastReasonCode: NonNullable<ExecutionIntentV1['lastReasonCode']>) => intent({
+    status, attemptCount: 1, lastReasonCode, terminalAtMs: 1_000,
+    reconciliationCompletedAtMs: 1_000, purgeAfterMs: 14_401_000,
+  });
+  const forbidden: readonly ExecutionIntentV1[] = [
+    active('PROCESSING', 'EXECUTION_STARTED'),
+    active('SIMULATED', 'SIMULATION_SUCCEEDED'),
+    active('SIGNED_NOT_SUBMITTED', 'SIGNATURE_PERSISTED'),
+    active('SUBMITTED', 'SUBMISSION_ACCEPTED'),
+    active('CONFIRMED', 'CONFIRMATION_OBSERVED'),
+    active('RECONCILING', 'RECONCILIATION_STARTED'),
+    terminal('SUCCEEDED', 'INTENT_SUCCEEDED'),
+    terminal('FAILED', 'QUOTE_STALE'),
+    terminal('EXPIRED', 'INTENT_EXPIRED'),
+    terminal('CANCELLED', 'INTENT_CANCELLED'),
+    active('UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILIATION_REQUIRED'),
+  ];
+  for (const record of forbidden) {
+    assert.doesNotThrow(() => { assertExecutionIntent(record); });
     assertValidationFailure(() => { createExecutionDryRunAssessment(record); });
   }
 });
