@@ -744,6 +744,243 @@ git add README.md docs/architecture/pumpfun-v1.md scripts/deployment-smoke.mjs t
 git commit -m "docs: describe inert execution intent foundation (#51)"
 ```
 
+### Task 8: Fermer les blockers TTL et journal de la revue finale
+
+**Files:**
+- Modify: `src/domain/execution-intent.ts`
+- Modify: `migrations/031_execution_intents.sql`
+- Modify: `src/application/execution-intent-producer.ts`
+- Modify: `src/storage/execution-intent.repository.ts`
+- Modify: `tests/execution-intent.test.ts`
+- Modify: `tests/execution-intent-migration.test.ts`
+- Modify: `tests/execution-intent-producer.test.ts`
+- Modify: `tests/execution-intent.repository.test.ts`
+- Modify: `tests/websocket-health-migration.test.ts`
+- Modify: `docs/superpowers/specs/2026-08-30-executor-v1-design.md`
+
+- [ ] **Step 1: Écrire les régressions RED anti-replay**
+
+Ajouter un test domaine et PostgreSQL qui refusent tout draft dont
+`expiresAtMs - requestedAtMs` dépasse `14_400_000`. Ajouter une première
+régression terminalisation → réconciliation → purge → recréation avec les
+timestamps d'origine et vérifier que `claim(EXECUTE)` retourne `null`. Cette
+preuve borne le TTL mais ne constitue pas la garantie anti-rejeu permanente ;
+la Task 9 couvre le mutant avec des timestamps frais.
+
+- [ ] **Step 2: Borner le TTL au même horizon que la rétention**
+
+Exporter `EXECUTION_INTENT_MAXIMUM_TTL_MS = 14_400_000` depuis le domaine,
+l'appliquer dans `immutableFieldsFrom`, dans la contrainte temporelle SQL et
+dans le paramètre `maximumIntentTtlMs` du producteur. La preuve attendue est :
+
+```text
+expires_at <= requested_at + 4h
+requested_at <= terminal_at <= reconciliation_completed_at
+purge_after = reconciliation_completed_at + 4h
+donc expires_at <= purge_after
+```
+
+- [ ] **Step 3: Écrire les régressions RED du journal honnête**
+
+Remplacer les chemins réussis utilisant `INTENT_DUPLICATE` et ajouter des tests
+qui exigent les codes positifs stables :
+
+```text
+EXECUTION_STARTED
+SIMULATION_SUCCEEDED
+ATTEMPT_COMPLETED
+RETRY_AUTHORIZED
+SIGNATURE_PERSISTED
+SUBMISSION_ACCEPTED
+CONFIRMATION_OBSERVED
+RECONCILIATION_STARTED
+INTENT_SUCCEEDED
+INTENT_CANCELLED
+```
+
+Une tentative `COMPLETED` doit porter `ATTEMPT_COMPLETED`; une tentative
+`ABANDONED` doit porter un reason d'échec et ne peut pas porter ce code de
+succès. Les transitions vers les états positifs doivent utiliser le code
+correspondant au nouvel état.
+
+- [ ] **Step 4: Appliquer les invariants TypeScript et PostgreSQL**
+
+Étendre le vocabulaire versionné, le décodage et les contraintes des trois
+tables. Valider avant toute connexion les couples statut/reason des inputs
+publics et refuser les lignes PostgreSQL contradictoires.
+
+- [ ] **Step 5: Corriger la dernière attente historique 030**
+
+Mettre à jour `tests/websocket-health-migration.test.ts` pour reconnaître 031
+comme migration courante sans affaiblir ses assertions d'upgrade historique.
+
+- [ ] **Step 6: Versionner et valider**
+
+Passer la spec de `1.1.0` à `1.1.1`, documenter les deux correctifs et lancer :
+
+```bash
+TEST_DATABASE_URL=postgresql:///postgres npx tsx --test \
+  tests/execution-intent.test.ts \
+  tests/execution-intent-migration.test.ts \
+  tests/execution-intent-producer.test.ts \
+  tests/execution-intent.repository.test.ts \
+  tests/websocket-health-migration.test.ts
+npm run build
+npm run check
+npm run lint
+TEST_DATABASE_URL=postgresql:///postgres npm test
+npm run docs:check
+npm run deployment:smoke
+```
+
+Expected: zéro échec, zéro test PostgreSQL silencieusement omis et la fenêtre
+du TTL reste bornée à quatre heures.
+
+### Task 9: Conserver un tombstone durable anti-rejeu
+
+**Files:**
+- Modify: `migrations/031_execution_intents.sql`
+- Modify: `src/storage/execution-intent.repository.ts`
+- Modify: `src/storage/database.ts`
+- Modify: `tests/execution-intent-migration.test.ts`
+- Modify: `tests/execution-intent.repository.test.ts`
+- Modify: `tests/database-retention.test.ts`
+- Modify: `tests/deployment-artifacts.test.ts`
+- Modify: `scripts/deployment-smoke.mjs`
+- Modify: `tests/migration-lock.test.ts`
+- Modify: `docs/superpowers/specs/2026-08-30-executor-v1-design.md`
+
+- [ ] **Step 1: Écrire les régressions RED de résurrection**
+
+Dans le vrai test PostgreSQL, terminaliser, réconcilier et purger une
+intention, puis produire un draft avec le même ID et la même clé logique mais
+un `decisionEventId`, un `decisionFingerprint`, un `requestedAtMs` et un
+`expiresAtMs` frais. Exiger `INTENT_DUPLICATE`, vérifier que `read(id)` reste
+`null` et qu'aucune intention ne peut être réclamée. Ajouter un test de course
+création/purge qui prouve le même comportement fail-closed.
+
+- [ ] **Step 2: Vérifier RED**
+
+Run:
+
+```bash
+TEST_DATABASE_URL=postgresql:///postgres npx tsx --test \
+  tests/execution-intent.repository.test.ts tests/database-retention.test.ts
+```
+
+Expected: le mutant à timestamps frais recrée et réclame encore l'intention,
+ou la table tombstone attendue manque.
+
+- [ ] **Step 3: Ajouter le contrat SQL minimal**
+
+Créer `execution_intent_tombstones` dans la migration 031 avec exactement les
+données durables encore nécessaires : `intent_id` primaire,
+`payload_version=1`, `logical_order_key` unique, `decision_fingerprint` SHA-256
+canonique et `retired_at` PostgreSQL milliseconde. Aucun FK vers l'intention,
+aucun mint, wallet, montant, quote, payload ou `purge_after`.
+
+- [ ] **Step 4: Rendre création et purge atomiques**
+
+Dans la transaction `create()`, effectuer la vérification tombstone après la
+tentative `INSERT ... ON CONFLICT DO NOTHING`. Si l'ID ou la clé logique est
+retiré, lever l'erreur typée et expurgée `INTENT_DUPLICATE` afin d'annuler
+l'éventuelle insertion. Ensuite seulement, traiter `CREATED` ou le replay de
+la ligne parente.
+
+Dans la transaction de purge, insérer les tombstones de la cohorte verrouillée
+avant de supprimer transitions, tentatives et intentions. Ne pas utiliser
+`ON CONFLICT DO NOTHING` : une collision doit rollback toute la passe. Les
+trois compteurs publics restent les compteurs de lignes supprimées.
+
+- [ ] **Step 5: Vérifier GREEN et les artefacts de migration**
+
+Mettre à jour le verrou canonique à 31 migrations, les assertions de schéma et
+le smoke de déploiement. Lancer les tests ciblés PostgreSQL et vérifier zéro
+skip, puis `npm run build`, `npm run check`, `npm run lint` et
+`npm run docs:check`.
+
+- [ ] **Step 6: Valider toute la branche**
+
+Run:
+
+```bash
+TEST_DATABASE_URL=postgresql:///postgres npm test
+npm run deployment:smoke
+git diff --check
+```
+
+Expected: zéro échec, aucune résurrection possible avec des timestamps frais,
+aucune capacité de signature ou de soumission ajoutée. Passer la spec à
+`1.2.0` et obtenir les revues conformité puis qualité.
+
+### Task 10: Refuser la terminalisation d'une réconciliation ambiguë
+
+**Files:**
+- Modify: `src/domain/execution-intent.ts`
+- Modify: `src/storage/execution-intent.repository.ts`
+- Modify: `migrations/031_execution_intents.sql`
+- Modify: `tests/execution-intent.test.ts`
+- Modify: `tests/execution-intent-migration.test.ts`
+- Modify: `tests/execution-intent.repository.test.ts`
+- Modify: `docs/superpowers/specs/2026-08-30-executor-v1-design.md`
+
+- [ ] **Step 1: Écrire les régressions RED du finding GitHub P1**
+
+Exiger que `UNKNOWN_REQUIRES_RECONCILIATION -> FAILED` refuse
+`SUBMISSION_AMBIGUOUS`, `CONFIRMATION_TIMEOUT`, `RECONCILIATION_REQUIRED` et
+tout échec générique. Exiger qu'elle accepte uniquement
+`RECONCILIATION_PROVED_NO_EFFECT`. Vérifier que le repository rejette avant
+toute connexion et que PostgreSQL refuse aussi une transition contournant le
+repository.
+
+- [ ] **Step 2: Ajouter le reason code stable et le validateur contextuel**
+
+Ajouter `RECONCILIATION_PROVED_NO_EFFECT` au vocabulaire append-only. Le
+validateur domaine doit connaître ancien état, nouvel état et reason code : le
+code de preuve est obligatoire uniquement pour `UNKNOWN... -> FAILED` et
+interdit sur toute autre transition. Conserver les règles existantes des
+autres états `FAILED` pré-signature.
+
+- [ ] **Step 3: Appliquer la défense PostgreSQL et valider**
+
+Aligner les contraintes des intentions, transitions et reason codes. Lancer
+les tests domaine/repository/migration avec `TEST_DATABASE_URL`, puis build,
+check, lint, docs et la suite complète. Passer la spec à `1.3.0` car l'ajout
+d'un reason code est une évolution mineure selon son propre contrat de
+versionnement.
+
+### Task 11: Refuser le retry sans preuve après une soumission ambiguë
+
+**Files:**
+- Modify: `src/domain/execution-intent.ts`
+- Modify: `migrations/031_execution_intents.sql`
+- Modify: `tests/execution-intent.test.ts`
+- Modify: `tests/execution-intent-migration.test.ts`
+- Modify: `tests/execution-intent.repository.test.ts`
+- Modify: `docs/superpowers/specs/2026-08-30-executor-v1-design.md`
+
+- [ ] **Step 1: Écrire les régressions RED du second finding GitHub P1**
+
+Exiger que `UNKNOWN_REQUIRES_RECONCILIATION -> RETRY_READY` refuse
+`RETRY_AUTHORIZED`, accepte uniquement `RECONCILIATION_PROVED_NO_EFFECT`, et
+soit rejetée avant toute connexion PostgreSQL si la preuve manque. Rejeter
+aussi toute ligne parent `RETRY_READY/RETRY_AUTHORIZED` au décodage et en base
+réelle afin qu'elle ne soit jamais réclamable.
+
+- [ ] **Step 2: Étendre l'invariant contextuel sans nouveau vocabulaire**
+
+Exiger le code de preuve comme dernier reason code de toute intention
+`RETRY_READY` : le graphe V1 n'a aucune autre entrée vers cet état. Étendre
+l'équivalence domaine et SQL aux deux sorties qui lèvent le blocage : `FAILED`
+et `RETRY_READY`. Conserver `RETRY_AUTHORIZED` uniquement dans le vocabulaire
+append-only, sans état ni transition active qui l'accepte.
+
+- [ ] **Step 3: Vérifier GREEN et la branche complète**
+
+Lancer les tests ciblés domaine/repository/migration avec PostgreSQL, puis
+build, check, lint, docs et la suite complète. Passer la spec à `1.3.1` : il
+s'agit d'une correction de conformité sans nouveau statut ni reason code.
+
 ## Critères de sortie de #51-B
 
 - migration 031 compatible base vide et replay ;
@@ -752,6 +989,7 @@ git commit -m "docs: describe inert execution intent foundation (#51)"
 - claim durable avec lease, fencing et temps PostgreSQL ;
 - transitions append-only et erreurs typées/redacted ;
 - rétention uniquement quatre heures après terminalisation réconciliée ;
+- tombstone durable minimal empêchant la résurrection d'un ordre purgé ;
 - mapper pur présent mais non composé ;
 - listener/API/CLI paper inchangés et toujours incapables de signer/envoyer ;
 - aucun mode, secret, wallet, builder, simulation ou soumission ajouté ;

@@ -39,6 +39,7 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
     assert.deepEqual(await migrateDatabase({ pool }), [
       migrationName,paperFinalityMigrationName,'029_paper_finality_claim_scheduler.sql',
       '030_listener_websocket_health.sql',
+      '031_execution_intents.sql',
     ]);
     assert.match(
       await finalityIndexDefinition(pool),

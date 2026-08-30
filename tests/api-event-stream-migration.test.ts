@@ -128,6 +128,9 @@ void test('la purge retourne le compteur agrégé de l’outbox, pas le rowCount
   const client = {
     query: async (text: string) => {
       queries.push(text);
+      if (text === "SELECT date_trunc('milliseconds', statement_timestamp()) AS purge_cutoff") {
+        return { rows: [{ purge_cutoff: new Date(0) }], rowCount: 1 };
+      }
       if (text.includes('WITH deleted AS')) {
         return { rows: [{ deleted_count: '7' }], rowCount: 1 };
       }
@@ -152,6 +155,9 @@ void test('la purge retire les projections participants expirées avant leurs é
   const client = {
     query: async (text: string) => {
       queries.push(text);
+      if (text === "SELECT date_trunc('milliseconds', statement_timestamp()) AS purge_cutoff") {
+        return { rows: [{ purge_cutoff: new Date(0) }], rowCount: 1 };
+      }
       if (text.includes('WITH deleted AS')) {
         return { rows: [{ deleted_count: '0' }], rowCount: 1 };
       }
@@ -280,6 +286,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '028_paper_finality_replay_evidence.sql',
       '029_paper_finality_claim_scheduler.sql',
       '030_listener_websocket_health.sql',
+      '031_execution_intents.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

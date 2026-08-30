@@ -428,6 +428,34 @@ Les événements métier sont source-indépendants :
 - `PaperPositionOpened`, `PaperPositionUpdated`, `PaperPositionClosed` ;
 - `MigrationObserved`, `PumpSwapPoolActivated`.
 
+### Fondation inerte des intentions d'exécution (#51-B)
+
+La migration `031_execution_intents.sql` conserve dans un ledger distinct les
+intentions logiques, leurs tentatives et leur journal de transitions. Les
+montants sont des entiers `bigint`/`NUMERIC`, l'identité est déterministe et
+les opérations sous lease sont clôturées par `state_revision`, qui augmente à
+chaque transition métier afin d'empêcher un replay ABA.
+
+Le mapper pur `deriveExecutionIntent` valide une lignée complète
+`creation-entry-v1` et dérive BUY ou SELL depuis l'événement canonique
+`PaperStrategySessionUpdated`. Son fingerprint couvre la représentation JSON
+canonique de l'événement ; son temps de demande doit correspondre exactement à
+celui de la session et son TTL est borné. Il ne lit ni PostgreSQL, ni RPC, ni
+horloge, et ne produit aucun effet.
+
+Le purgeur fixe une heure PostgreSQL, verrouille une cohorte ordonnée
+d'intentions terminales réconciliées, écrit d'abord leurs tombstones anti-rejeu
+minimaux, puis supprime leurs transitions, leurs tentatives et enfin leurs
+intentions dans la même transaction. Les tombstones durables ne contiennent que
+l'ID, la clé d'ordre logique, l'empreinte de décision, une version et la date de
+retrait : aucun mint, wallet, montant, quote ou payload. Les trois compteurs
+agrégés de suppression restent exposés par le seul événement de rétention.
+
+Cette fondation reste totalement non composée. Le bootstrap, l'API et les
+workers existants ne créent ni ne claim aucune intention. Aucun executor,
+wallet, builder, simulation, signature ou transport d'envoi n'est livré ici ;
+les lots #51-C à #51-G restent futurs.
+
 ## Persistance, reprise et rétention
 
 `raw_chain_events` garde l’entrée technique ; `domain_events`,

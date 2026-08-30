@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.3.1
 
 **Date :** 2026-08-30
 
@@ -8,7 +8,37 @@
 
 **Issue parente :** #51
 
-**Périmètre de cette PR (#51-A) :** documentation uniquement
+**Périmètre livré à cette version :** #51-A (conception) et #51-B (fondation
+inerte des intentions d'exécution)
+
+## Historique des versions
+
+- **1.3.1 — 2026-08-30 :** applique la preuve
+  `RECONCILIATION_PROVED_NO_EFFECT` à toute transition qui lève l'état inconnu :
+  vers `FAILED` comme vers `RETRY_READY`. Une autorisation de retry seule ne
+  constitue pas une preuve et ne peut pas rendre un BUY de nouveau exécutable.
+  La ligne parent `RETRY_READY` conserve obligatoirement la preuve afin qu'une
+  corruption ou insertion directe ne contourne pas le journal de transitions.
+- **1.3.0 — 2026-08-30 :** ajoute la preuve stable
+  `RECONCILIATION_PROVED_NO_EFFECT` et l'exige pour terminaliser en `FAILED`
+  une intention auparavant inconnue. Un timeout, une soumission ambiguë ou une
+  réconciliation encore requise ne peuvent plus lever le blocage global ni
+  rendre l'intention purgeable.
+- **1.2.0 — 2026-08-30 :** ajoute un tombstone anti-rejeu durable et minimal
+  pour l'identité et la clé logique d'une intention purgée. Le plafond TTL de
+  quatre heures reste une défense en profondeur mais n'est plus présenté comme
+  une preuve suffisante lorsqu'un producteur réémet une décision avec des
+  timestamps frais.
+- **1.1.1 — 2026-08-30 :** borne l'échéance immutable d'une intention à
+  quatre heures et rend les reason codes positifs obligatoires par état et par
+  tentative, afin de réduire la fenêtre de rejeu et de fermer le journal
+  contradictoire identifiés par la revue finale.
+- **1.1.0 — 2026-08-30 :** ajoute sans changer l'identité V1 une révision
+  d'état monotone contre les reprises ABA, fixe la décision et son fingerprint
+  sur l'événement canonique `PaperStrategySessionUpdated` avec un TTL borné,
+  et épingle la cohorte PostgreSQL supprimée par une passe de rétention.
+- **1.0.0 — 2026-08-30 :** conception initiale approuvée et découpage
+  #51-A à #51-G.
 
 ## 1. Décision
 
@@ -216,6 +246,7 @@ requested_at
 expires_at
 status
 attempt_count
+state_revision
 lease_owner
 lease_expires_at
 last_reason_code
@@ -223,6 +254,14 @@ created_at
 updated_at
 purge_after
 ```
+
+Après purge de ce payload métier, `execution_intent_tombstones` conserve
+uniquement `intent_id`, `payload_version`, `logical_order_key`,
+`decision_fingerprint` et `retired_at`. Il ne conserve ni mint, ni wallet, ni
+montant, ni quote, ni payload de décision. `intent_id` et
+`decision_fingerprint` sont déjà des empreintes ; `logical_order_key` est la
+clé minimale nécessaire pour préserver la contrainte d'ordre logique entre
+des identités éventuellement différentes.
 
 Une intention BUY exige `quote_amount_raw`; une intention SELL exige
 `base_amount_raw`. Les deux quantités ne sont jamais des nombres JavaScript.
@@ -299,6 +338,31 @@ Chaque transition est persistée avec : ancien/nouvel état, date PostgreSQL,
 reason code stable, message humain borné, phase d'activation, tentative et
 preuves structurées versionnées.
 
+Les transitions nominales utilisent obligatoirement le reason code du nouvel
+état : `PROCESSING/EXECUTION_STARTED`, `SIMULATED/SIMULATION_SUCCEEDED`,
+`SIGNED_NOT_SUBMITTED/SIGNATURE_PERSISTED`,
+`SUBMITTED/SUBMISSION_ACCEPTED`, `CONFIRMED/CONFIRMATION_OBSERVED`,
+`RECONCILING/RECONCILIATION_STARTED`, `SUCCEEDED/INTENT_SUCCEEDED` et
+`CANCELLED/INTENT_CANCELLED`. `EXPIRED` exige `INTENT_EXPIRED` et
+`UNKNOWN_REQUIRES_RECONCILIATION` exige `RECONCILIATION_REQUIRED`. Un état
+`FAILED` exige un code d'échec et refuse tout code positif. Une tentative
+`COMPLETED` exige `ATTEMPT_COMPLETED`; une tentative `ABANDONED` exige un code
+d'échec et refuse `ATTEMPT_COMPLETED` ainsi que les autres codes positifs.
+Ces couples sont validés avant toute connexion PostgreSQL, au décodage et par
+les contraintes des tables durables concernées.
+
+Les transitions `UNKNOWN_REQUIRES_RECONCILIATION -> FAILED|RETRY_READY` sont
+plus strictes : elles exigent exactement `RECONCILIATION_PROVED_NO_EFFECT`,
+preuve durable que la transaction auparavant ambiguë ne peut plus produire
+aucun effet on-chain. Dans ce cas contextuel, l'intention durable
+`RETRY_READY` conserve obligatoirement ce code de preuve comme dernier reason
+code. Le code append-only `RETRY_AUTHORIZED` reste réservé à une évolution du
+graphe mais n'autorise aucun état ni transition de la V1 actuelle.
+`SUBMISSION_AMBIGUOUS`, `CONFIRMATION_TIMEOUT` et
+`RECONCILIATION_REQUIRED` maintiennent l'intention dans un état non terminal ;
+ils ne fixent jamais `reconciliation_completed_at` et ne planifient jamais sa
+purge. Le code de preuve ne peut pas être réutilisé pour une autre transition.
+
 ### 5.4 Leases et crash/reprise
 
 Le claim utilise `FOR UPDATE SKIP LOCKED`, l'heure PostgreSQL et un lease
@@ -320,6 +384,12 @@ Un claim ne constitue pas une tentative d'exécution. `attempt_count` est
 incrémenté seulement lorsque l'exécuteur crée atomiquement une ligne append-only
 `execution_attempts`. Un crash entre claim et tentative ne consomme donc aucun
 numéro.
+
+`state_revision` commence à zéro et augmente atomiquement à chaque transition
+métier, y compris l'expiration pré-soumission. Toutes les mutations sous lease
+comparent aussi la révision portée par le claim. Le retour ultérieur vers un
+statut déjà observé ne permet donc pas à un ancien worker de rejouer une
+transition ABA, même s'il présente encore le même token de lease.
 
 Après crash :
 
@@ -344,6 +414,16 @@ Elle doit être atomique avec la transition source ou protégée par une project
 rejouable déterministe. Elle ne relit pas une qualification obsolète et ne
 transforme pas une simple présence de métadonnées en autorisation.
 
+En #51-B, le mapper pur accepte uniquement l'événement canonique et immuable
+`PaperStrategySessionUpdated` dont le payload correspond exactement à la
+session courante. `requested_at` est le temps observé de cet événement et doit
+égaler `session.updatedAtMs`; le fingerprint est le SHA-256 de sa
+représentation JSON canonique. `expires_at - requested_at` doit rester dans le
+TTL maximal fourni au mapper, lui-même borné par le maximum dur
+`14_400_000 ms`. Toute lignée, qualification, quote ou échéance
+incohérente est refusée fail-closed. Ce mapper n'est composé dans aucun runtime
+et ne persiste lui-même aucune intention.
+
 Configuration initiale :
 
 ```dotenv
@@ -351,8 +431,8 @@ EXECUTION_INTENT_EMISSION_ENABLED=false
 LIVE_QUOTE_MINT_ALLOWLIST=So11111111111111111111111111111111111111112
 ```
 
-La PR #51-B livre le domaine, le schéma, le repository et une production
-inertée ou explicitement désactivée. Aucun executor n'est alors capable de
+La PR #51-B livre le domaine, le schéma, le repository et ce mapper pur inerté.
+Aucun producteur n'est composé et aucun executor n'est alors capable de
 signer ou envoyer. La règle d'émission live sera activée seulement lorsque le
 processus executor et tous les gates correspondants existent.
 
@@ -636,6 +716,39 @@ blockhash ne peut plus atterrir, puis suit cette même fenêtre. La purge suppri
 d'abord artefacts, tentatives et transitions, puis l'intention, dans une
 transaction rejouable. Elle publie seulement des compteurs agrégés.
 
+Le plafond dur d'échéance réduit la fenêtre d'exécution et reste une défense en
+profondeur :
+
+```text
+expires_at <= requested_at + 4h
+requested_at <= terminal_at <= reconciliation_completed_at
+purge_after = reconciliation_completed_at + 4h
+donc expires_at <= purge_after
+```
+
+Cette relation ne suffit pas à empêcher un producteur de recréer le même ordre
+logique avec un nouvel événement et des timestamps frais. Avant de supprimer
+une intention réconciliée, la purge insère donc dans la même transaction un
+tombstone durable de son ID et de sa clé logique. `create()` vérifie le
+tombstone après sa tentative d'insertion, toujours dans la même transaction :
+si l'ID ou la clé logique a déjà été retiré, l'insertion éventuelle est annulée
+et `INTENT_DUPLICATE` est retourné. Ce contrôle post-insertion ferme aussi la
+course entre une création concurrente et une purge qui détenait le verrou sur
+la ligne parente.
+
+La fondation #51-B fige une heure de coupure PostgreSQL puis verrouille une
+cohorte ordonnée d'identifiants terminaux et réconciliés. Les tombstones de
+cette cohorte exacte sont insérés avant que les transitions, tentatives puis
+intentions soient supprimées dans la même transaction. Une collision de
+tombstone fait échouer toute la purge, sans suppression partielle. Une ligne
+devenue éligible pendant la passe attend la passe suivante; une ligne ouverte,
+inconnue ou non réconciliée n'entre jamais dans la cohorte.
+
+Les tombstones ne suivent pas la fenêtre de quatre heures : ils restent utiles
+à la garantie « un ordre logique au plus une fois » et sont donc conservés
+durablement. Leur minimisation explicite satisfait la rétention des données
+métier devenues inutiles sans affaiblir l'idempotence.
+
 Le front-end public reste indépendant et en lecture seule. La V1 n'ajoute
 aucune route publique d'armement, de clé, de soumission ou de contrôle. Les
 signatures, chemins de secrets, wallet executor et preuves détaillées restent
@@ -677,6 +790,17 @@ RECONCILIATION_REQUIRED
 BALANCE_MISMATCH
 RESIDUAL_TOKEN_BALANCE
 DOUBLE_ORDER_SUSPECTED
+EXECUTION_STARTED
+SIMULATION_SUCCEEDED
+ATTEMPT_COMPLETED
+RETRY_AUTHORIZED
+SIGNATURE_PERSISTED
+SUBMISSION_ACCEPTED
+CONFIRMATION_OBSERVED
+RECONCILIATION_STARTED
+INTENT_SUCCEEDED
+INTENT_CANCELLED
+RECONCILIATION_PROVED_NO_EFFECT
 ```
 
 La liste est append-only dans la version majeure 1. Un code n'est jamais
@@ -687,7 +811,7 @@ réaffecté à une autre signification.
 | PR | Livraison | Capacité de signature/envoi |
 | --- | --- | --- |
 | #51-A | Cette spécification et le plan versionné | Aucune |
-| #51-B | Domaine, migration `execution_intents`/`execution_attempts`, repository, idempotence et rétention | Aucune |
+| #51-B | Domaine, migration des intentions/tentatives/tombstones, repository, idempotence et rétention | Aucune |
 | #51-C | Processus executor en dry-run, claims, états et rapports factices | Aucune |
 | #51-D | Quotes fraîches, build et `simulateTransaction` sans keypair ni envoi | Aucune |
 | #51-E | Réconciliation, verrou/réservation wallet, sizing, exposition, quota provider et matrice de fautes | Aucune |
@@ -716,7 +840,8 @@ suivante.
 - keypair absent, invalide, permissions faibles et wallet mismatch ;
 - signature persistée avant tentative d'envoi ;
 - confirmation et balances réelles réconciliées ;
-- rétention quatre heures après réconciliation seulement ;
+- rétention du payload métier quatre heures après réconciliation seulement,
+  avec tombstone anti-rejeu minimal conservé durablement ;
 - aucune fuite de secret dans logs, erreurs, rapports ou API ;
 - aucun import live depuis le listener, l'API publique, le paper ou la
   simulation-only ;

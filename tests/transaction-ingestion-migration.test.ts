@@ -303,6 +303,9 @@ void test('purges only expired resolved strict failures and exposes their count'
   const client = {
     query: async (text: string) => {
       queries.push(text);
+      if (text === "SELECT date_trunc('milliseconds', statement_timestamp()) AS purge_cutoff") {
+        return { rows: [{ purge_cutoff: new Date(0) }], rowCount: 1 };
+      }
       if (text.includes('DELETE FROM listener_strict_catch_up_failures')) {
         return { rows: [], rowCount: 2 };
       }
@@ -369,7 +372,7 @@ void test('retains unresolved and unexpired strict failure evidence in PostgreSQ
   }
 });
 
-void test('applies migrations 001-030 on an empty PostgreSQL schema and replays cleanly', async (context) => {
+void test('applies migrations 001-031 on an empty PostgreSQL schema and replays cleanly', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent : test PostgreSQL live ignoré');
@@ -385,7 +388,7 @@ void test('applies migrations 001-030 on an empty PostgreSQL schema and replays 
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '030_listener_websocket_health.sql');
+    assert.equal(applied.at(-1), '031_execution_intents.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     const sql = await readFile(migrationUrl, 'utf8');
     await pool.query(sql);

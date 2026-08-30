@@ -7,8 +7,9 @@ import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/data
 import { PostgresWebSocketHealthRepository } from '../src/storage/websocket-health.repository.js';
 
 const migrationsDirectory = new URL('../migrations/', import.meta.url);
-const migrationName = '030_listener_websocket_health.sql';
-const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
+const healthMigrationName = '030_listener_websocket_health.sql';
+const latestMigrationName = '031_execution_intents.sql';
+const migrationUrl = new URL(`../migrations/${healthMigrationName}`, import.meta.url);
 
 void test('websocket health migration upgrades legacy state without trusting its websocket evidence', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -36,7 +37,7 @@ void test('websocket health migration upgrades legacy state without trusting its
       '{"rpcUrl":"https://secret.invalid","remoteReason":"hostile"}'::jsonb
     )`);
 
-    assert.deepEqual(await migrateDatabase({ pool }), [migrationName]);
+    assert.deepEqual(await migrateDatabase({ pool }), [healthMigrationName, latestMigrationName]);
     const beforeReplay = await canonicalRow(pool);
     assert.deepEqual(beforeReplay, {
       service_key: 'transaction-listener',
@@ -61,7 +62,7 @@ void test('websocket health migration upgrades legacy state without trusting its
   });
 });
 
-void test('websocket health migration applies on an empty schema and records migration 030', async (context) => {
+void test('websocket health migration applies on an empty schema and records current migration 031', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: websocket health migration test skipped');
@@ -70,10 +71,10 @@ void test('websocket health migration applies on an empty schema and records mig
 
   await withTemporarySchema(databaseUrl, 'websocket_health_empty', async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.equal(applied.at(-1), latestMigrationName);
     assert.deepEqual(
       (await pool.query('SELECT version FROM migration_history ORDER BY version DESC LIMIT 1')).rows,
-      [{ version: migrationName }],
+      [{ version: latestMigrationName }],
     );
     assert.deepEqual(await canonicalRow(pool), {
       service_key: 'transaction-listener',
