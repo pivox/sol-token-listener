@@ -80,20 +80,13 @@ void test('execution intent migration applies and replays on an isolated schema'
 
     const canonical = draft('canonical', 'BUY', 1n, null);
     await insertIntent(pool, intentRow(canonical));
-    const roundTrip = await pool.query(`SELECT
-      id, payload_version, logical_order_key, strategy_id, strategy_version, position_id,
-      logical_command_id, mint, side, venue_policy, quote_mint, quote_token_program,
-      quote_decimals, quote_amount_raw::TEXT AS quote_amount_raw,
-      base_amount_raw::TEXT AS base_amount_raw,
-      minimum_amount_out_raw::TEXT AS minimum_amount_out_raw,
-      decision_event_id, decision_fingerprint,
-      (EXTRACT(EPOCH FROM requested_at) * 1000)::TEXT AS requested_at_ms,
-      (EXTRACT(EPOCH FROM expires_at) * 1000)::TEXT AS expires_at_ms,
-      status, attempt_count, last_reason_code,
-      (EXTRACT(EPOCH FROM created_at) * 1000)::TEXT AS created_at_ms,
-      (EXTRACT(EPOCH FROM updated_at) * 1000)::TEXT AS updated_at_ms
-      FROM execution_intents WHERE id = $1`, [canonical.id]);
-    assertExecutionIntent(Object.freeze(intentFromRow(roundTrip.rows[0])));
+    assertExecutionIntent(Object.freeze(intentFromRow(await readIntentRow(pool, canonical.id))));
+    const reconciled = draft('reconciled-terminal', 'BUY', 1n, null);
+    await insertIntent(pool, intentRow(reconciled, {
+      status: 'SUCCEEDED', terminalAtMs: 1_000, reconciliationCompletedAtMs: 2_000,
+      purgeAfterMs: 14_402_000,
+    }));
+    assertExecutionIntent(Object.freeze(intentFromRow(await readIntentRow(pool, reconciled.id))));
 
     const u64Maximum = 18_446_744_073_709_551_615n;
     await insertIntent(pool, intentRow(draft('u64-buy', 'BUY', u64Maximum, null)));
@@ -376,6 +369,28 @@ function timestampTextToMs(value: unknown): number {
   return milliseconds;
 }
 
+async function readIntentRow(
+  pool: InstanceType<typeof pg.Pool>, intentId: string,
+): Promise<Record<string, unknown> | undefined> {
+  const result = await pool.query<Record<string, unknown>>(`SELECT
+    id, payload_version, logical_order_key, strategy_id, strategy_version, position_id,
+    logical_command_id, mint, side, venue_policy, quote_mint, quote_token_program,
+    quote_decimals, quote_amount_raw::TEXT AS quote_amount_raw,
+    base_amount_raw::TEXT AS base_amount_raw,
+    minimum_amount_out_raw::TEXT AS minimum_amount_out_raw,
+    decision_event_id, decision_fingerprint,
+    (EXTRACT(EPOCH FROM requested_at) * 1000)::TEXT AS requested_at_ms,
+    (EXTRACT(EPOCH FROM expires_at) * 1000)::TEXT AS expires_at_ms,
+    status, attempt_count, last_reason_code,
+    (EXTRACT(EPOCH FROM terminal_at) * 1000)::TEXT AS terminal_at_ms,
+    (EXTRACT(EPOCH FROM reconciliation_completed_at) * 1000)::TEXT AS reconciliation_completed_at_ms,
+    (EXTRACT(EPOCH FROM purge_after) * 1000)::TEXT AS purge_after_ms,
+    (EXTRACT(EPOCH FROM created_at) * 1000)::TEXT AS created_at_ms,
+    (EXTRACT(EPOCH FROM updated_at) * 1000)::TEXT AS updated_at_ms
+    FROM execution_intents WHERE id = $1`, [intentId]);
+  return result.rows[0];
+}
+
 function intentFromRow(row: Record<string, unknown> | undefined): object {
   assert.ok(row !== undefined);
   return {
@@ -391,8 +406,9 @@ function intentFromRow(row: Record<string, unknown> | undefined): object {
     decisionEventId: text(row.decision_event_id), decisionFingerprint: text(row.decision_fingerprint),
     requestedAtMs: integer(row.requested_at_ms), expiresAtMs: integer(row.expires_at_ms),
     status: text(row.status), attemptCount: integer(row.attempt_count),
-    lastReasonCode: row.last_reason_code, terminalAtMs: null,
-    reconciliationCompletedAtMs: null, purgeAfterMs: null,
+    lastReasonCode: row.last_reason_code, terminalAtMs: nullableTimestamp(row.terminal_at_ms),
+    reconciliationCompletedAtMs: nullableTimestamp(row.reconciliation_completed_at_ms),
+    purgeAfterMs: nullableTimestamp(row.purge_after_ms),
     createdAtMs: integer(row.created_at_ms), updatedAtMs: integer(row.updated_at_ms),
   };
 }
@@ -446,6 +462,10 @@ function integer(value: unknown): number {
   const result = typeof value === 'number' ? value : Number(text(value));
   assert.equal(Number.isSafeInteger(result), true);
   return result;
+}
+
+function nullableTimestamp(value: unknown): number | null {
+  return value === null ? null : integer(value);
 }
 
 async function withTemporarySchema(
