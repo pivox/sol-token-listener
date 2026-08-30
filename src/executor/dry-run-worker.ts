@@ -47,7 +47,8 @@ async function runPass(
     return 'RECORDED';
   } catch (error) {
     if (error instanceof ExecutionDryRunRepositoryError
-      && error.code === 'OPERATION_ABORTED') return 'IDLE';
+      && error.code === 'OPERATION_ABORTED'
+      && cancellationRequested(signal)) return 'IDLE';
     if (!(error instanceof ExecutionDryRunRepositoryError)
       || error.code !== 'COMMIT_OUTCOME_UNKNOWN') throw error;
     if (cancellationRequested(signal)) return 'IDLE';

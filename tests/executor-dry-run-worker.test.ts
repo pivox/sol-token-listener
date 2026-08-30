@@ -110,14 +110,33 @@ void test('does not start findExact when cancellation follows an ambiguous compl
   assertForbiddenCalls(fake);
 });
 
-void test('passes cancellation to complete and maps only typed repository cancellation to IDLE', async () => {
-  const signal = activeSignal();
+void test('maps typed repository cancellation to IDLE only after the signal is aborted', async () => {
+  const controller = new AbortController();
+  const cancellation = new ExecutionDryRunRepositoryError('OPERATION_ABORTED');
+  const completeGate = deferred<ExecutionDryRunAssessmentV1>();
+  const fake = fakes(claim(), { completeResult: completeGate.promise });
+  const pass = createDryRunWorker(fake.dependencies).runOnce(controller.signal);
+
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(fake.completed.length, 1);
+  controller.abort();
+  completeGate.reject(cancellation);
+
+  assert.equal(await pass, 'IDLE');
+  assert.equal(fake.completed[0]?.signal, controller.signal);
+  assert.equal(fake.findInputs.length, 0);
+  assertForbiddenCalls(fake);
+});
+
+void test('rethrows a constructed cancellation error while the signal remains active', async () => {
   const cancellation = new ExecutionDryRunRepositoryError('OPERATION_ABORTED');
   const fake = fakes(claim(), { completeError: cancellation });
 
-  assert.equal(await createDryRunWorker(fake.dependencies).runOnce(signal), 'IDLE');
-  assert.equal(fake.completed.length, 1);
-  assert.equal(fake.completed[0]?.signal, signal);
+  await assert.rejects(
+    createDryRunWorker(fake.dependencies).runOnce(activeSignal()),
+    (error) => error === cancellation,
+  );
   assert.equal(fake.findInputs.length, 0);
   assertForbiddenCalls(fake);
 });

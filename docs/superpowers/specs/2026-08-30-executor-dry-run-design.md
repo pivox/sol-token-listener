@@ -1,6 +1,6 @@
 # Exécuteur dry-run V1 — conception #51-C
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
 **Date :** 2026-08-30
 
@@ -12,6 +12,8 @@
 
 ## Historique des versions
 
+- **1.0.3 — 2026-08-31 :** authentification de l'annulation repository par la
+  double condition `OPERATION_ABORTED` et `AbortSignal.aborted` dans le worker.
 - **1.0.2 — 2026-08-31 :** propagation de l'annulation jusqu'au repository
   de completion et ajout du fence entre acquisition du client PostgreSQL et
   dispatch du statement atomique.
@@ -178,8 +180,11 @@ avant `pool.connect()`, puis de nouveau après la résolution de `connect()` et
 immédiatement avant l'invocation de `COMPLETE_SQL`. Si l'annulation est observée
 à cette seconde frontière, il libère proprement le client sans requête et lève
 `OPERATION_ABORTED`, que le worker seul traduit en `IDLE`. Un échec réel de
-connexion ou de release reste `DATABASE_FAILURE`. Une fois `client.query`
-invoqué, une erreur conserve sa classification réelle ou
+connexion ou de release reste `DATABASE_FAILURE`. Cette traduction exige aussi
+que le même `AbortSignal` porte `aborted === true` ; une erreur
+`OPERATION_ABORTED` reçue avec un signal encore actif est repropagée. Une fois
+`client.query` invoqué,
+une erreur conserve sa classification réelle ou
 `COMMIT_OUTCOME_UNKNOWN` ; l'annulation ne la masque jamais.
 
 Chaque vérification d'annulation et l'invocation synchrone du statement suivant
