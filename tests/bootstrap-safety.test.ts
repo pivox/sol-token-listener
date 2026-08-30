@@ -120,6 +120,20 @@ void test('durable WebSocket health documentation describes active supervision w
   );
 });
 
+void test('active runtime documentation keeps paper scheduled and fail-closed on joint readiness', async () => {
+  const overview = await readFile(new URL('../docs/system-overview.html', import.meta.url), 'utf8');
+  const start = overview.indexOf('<section id="runtime"');
+  const end = overview.indexOf('</section>', start);
+  assert.notEqual(start, -1, 'missing runtime documentation');
+  assert.notEqual(end, -1, 'runtime documentation must be bounded');
+  const runtime = overview.slice(start, end);
+
+  assert.match(runtime, /paper worker démarre[^.]*aucune claim ni mutation/iu);
+  assert.match(runtime, /supervisor RUNNING[^.]*selected provider[^.]*finality RUNNING[^.]*same promotion epoch/iu);
+  assert.match(runtime, /observe et paper[^.]*DEGRADED_RETRY/iu);
+  assert.doesNotMatch(runtime, /worker paper ne démarre pas|aucun retry initial/iu);
+});
+
 void test('paper dry-run bootstrap imports no signing, submission, or live execution path', async () => {
   const path = fileURLToPath(new URL('../src/cli/paper-dry-run.ts', import.meta.url));
   const source = await readFile(path, 'utf8');

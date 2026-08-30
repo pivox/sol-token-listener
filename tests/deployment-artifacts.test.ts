@@ -739,3 +739,33 @@ void test('operator overview renders the durable WebSocket lifecycle without exp
   assert.doesNotMatch(section, /(?:https?|wss):\/\//iu);
   assert.doesNotMatch(section, /EXECUTION_MODE=live|sendTransaction\s*\(|signTransaction\s*\(|private[_ -]?key/iu);
 });
+
+void test('operator overview documents the active runtime order and paper readiness fence', async () => {
+  const overview = await readArtifact('docs/system-overview.html');
+  const runtimeStart = overview.indexOf('<section id="runtime"');
+  const runtimeEnd = overview.indexOf('</section>', runtimeStart);
+  assert.notEqual(runtimeStart, -1, 'missing runtime section');
+  assert.notEqual(runtimeEnd, -1, 'runtime section must be bounded');
+  const runtime = overview.slice(runtimeStart, runtimeEnd);
+
+  assert.match(
+    runtime,
+    /supervisor[\s\S]*inbox worker[\s\S]*finality reconciler[\s\S]*paper worker[\s\S]*social worker[\s\S]*heartbeat/iu,
+  );
+  for (const statement of [
+    'beginOwner',
+    'double ACK',
+    'frontière stricte',
+    'avant la promotion',
+    'DEGRADED_RETRY',
+    'supervisor RUNNING',
+    'selected provider',
+    'finality RUNNING',
+    'same promotion epoch',
+    'SOLANA_EXPECTED_GENESIS_HASH',
+    'LISTENER_ENABLED=true',
+    'ne l’écrit jamais dans les logs',
+  ]) assert.ok(runtime.includes(statement), `missing active runtime statement: ${statement}`);
+  assert.doesNotMatch(runtime, /Health RPC|Baseline HTTP|Souscriptions WebSocket|Catch-up de fermeture de fenêtre/iu);
+  assert.doesNotMatch(runtime, /Paper exige une première passe finalité réussie[^.]*worker paper ne démarre pas[^.]*aucun retry initial/iu);
+});
