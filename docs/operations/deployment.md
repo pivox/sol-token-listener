@@ -38,6 +38,13 @@ Fournissez séparément `POSTGRES_PASSWORD` et
 dans `DATABASE_URL`. N’ajoutez aucune variable de wallet, clé privée, keypair
 ou signature : elles sont interdites par la configuration V1.
 
+Quand `LISTENER_ENABLED=true`, fournissez aussi
+`SOLANA_EXPECTED_GENESIS_HASH`. C’est le hash de genèse canonique base58 de
+32 octets du cluster ciblé. Obtenez `getGenesisHash` indépendamment auprès de
+plusieurs sources de confiance, comparez-les avant de renseigner la valeur et
+ne la copiez jamais dans les logs. L’exemple conserve volontairement une valeur
+vide : un hash fictif ne constitue pas une configuration sûre.
+
 Définissez le chemin une fois puis validez le rendu sans imprimer le fichier :
 
 ```bash
@@ -72,6 +79,23 @@ avant de lancer la commande Paper MVP correspondante ; les migrations 018 à 021
 restent immuables.
 
 ## Démarrage
+
+La séquence opérationnelle minimale, depuis un fichier opérateur vérifié
+`deploy/.env`, est la suivante. Elle démarre la migration avant les services
+applicatifs et exige une santé `OK` :
+
+```bash
+npm run rpc:check
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d migrate
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d app frontend retention
+docker compose --env-file deploy/.env -f deploy/compose.yaml exec -T app \
+  node dist/scripts/deployment-healthcheck.js --require-ok
+```
+
+La supervision active attend le double ACK, vérifie la frontière stricte toutes
+les 30 secondes et utilise seulement les IDs positionnels. Elle ne revient pas
+automatiquement à `SolanaProgramSubscriber`; elle reste strictement
+observe/paper only, sans wallet, signature ni soumission.
 
 Avant toute migration, effectuez et vérifiez une sauvegarde de la base. Puis
 construisez ou tirez les images immuables validées. Depuis la racine du dépôt :
@@ -203,6 +227,18 @@ désactivé. Mesurez la durée ; ne branchez jamais cette répétition sur la ba
 de production.
 
 ## Rollback
+
+Le rollback est un arrêt propre suivi du déploiement de la previous immutable image,
+jamais un basculement vers le subscriber legacy dans le processus en cours :
+
+```bash
+docker compose --env-file deploy/.env -f deploy/compose.yaml stop app
+docker compose --env-file deploy/.env -f deploy/compose.yaml up -d app
+docker compose --env-file deploy/.env -f deploy/compose.yaml exec -T app \
+  node dist/scripts/deployment-healthcheck.js --require-ok
+```
+
+Il ne modifie jamais `EXECUTION_MODE` au-delà de `observe` ou `paper`.
 
 Quand l’ancienne application est compatible avec le schéma, arrêtez d’abord les
 trois services applicatifs avec les digests encore déployés :

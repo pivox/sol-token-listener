@@ -675,6 +675,7 @@ void test('la configuration listener refuse les valeurs ambiguës ou hors limite
 void test('le modèle d’environnement publie les valeurs listener sûres exactes', async () => {
   const source = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
   for (const line of [
+    'SOLANA_EXPECTED_GENESIS_HASH=',
     'LISTENER_ENABLED=true',
     'LISTENER_CATCH_UP_POLICY=live-edge',
     'LISTENER_WORKER_LEASE_SECONDS=120',
@@ -683,6 +684,7 @@ void test('le modèle d’environnement publie les valeurs listener sûres exact
     'LISTENER_FINALITY_MISSING_POLLS=3',
     'LISTENER_SHUTDOWN_TIMEOUT_MS=30000',
   ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
+  assert.match(source, /canonical 32-byte base58 genesis hash/i);
 });
 
 void test('public social enrichment uses strict bounded non-secret defaults', () => {
@@ -913,9 +915,9 @@ void test('durable WebSocket health documentation is versioned and exposes the e
   ]);
   assert.equal(Object.hasOwn(websocket, 'signature'), false);
   assert.deepEqual(websocket.recovery, {
-    status: 'NOT_REQUIRED',
-    startedAt: null,
-    completedAt: null,
+    status: 'RECOVERED',
+    startedAt: '2026-08-28T10:00:00.000Z',
+    completedAt: '2026-08-28T10:00:00.000Z',
     reasonCode: null,
   });
 
@@ -924,7 +926,7 @@ void test('durable WebSocket health documentation is versioned and exposes the e
     'WAITING_FOR_ACKS', 'RUNNING', 'UNRECOVERABLE', 'STOPPING',
     'listener_strict_catch_up_failures', '30 secondes', 'quatre heures',
     'backend requis', 'client optionnel', 'primary', 'fallback-1', 'fallback-2',
-    'fallback-3', 'INACTIVE', '#63',
+    'fallback-3', 'ACTIVE', 'double ACK',
   ]) assert.ok(apiSection.includes(value), `missing WebSocket API documentation: ${value}`);
 
   assert.match(apiSection, /dernière observation[^.]*diagnostique[^.]*pas[^.]*continuité/isu);
@@ -971,7 +973,7 @@ void test('HTTP RPC failover documentation states the bounded production and soa
     'erreur JSON-RPC',
     'résultat archive null',
     'SOLANA_WS_RPC_URL',
-    'issue #57',
+    'superviseur de production',
     'mono-fournisseur',
     'SOLANA_HTTP_RPC_URL + SOLANA_WS_RPC_URL',
     '50 positions Mainnet',

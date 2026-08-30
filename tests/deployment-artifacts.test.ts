@@ -228,6 +228,10 @@ void test('Compose defines an observe-only, five-service deployment without expo
     app,
     /^ {6}SOLANA_WS_RPC_URL: \$\{SOLANA_WS_RPC_URL:\?SOLANA_WS_RPC_URL is required\}\n {6}SOLANA_WS_RPC_FALLBACK_URLS: \$\{SOLANA_WS_RPC_FALLBACK_URLS:-\}$/m,
   );
+  assert.match(
+    app,
+    /^ {6}SOLANA_EXPECTED_GENESIS_HASH: \$\{SOLANA_EXPECTED_GENESIS_HASH:-\}$/m,
+  );
   assert.match(app, /^ {6}EXECUTION_MODE: observe$/m);
   assert.match(app, /^ {6}PAPER_STRATEGY_ENABLED: "false"$/m);
   assert.match(app, /^ {6}API_ENABLED: "true"$/m);
@@ -245,6 +249,8 @@ void test('Compose defines an observe-only, five-service deployment without expo
   assert.equal(smokeOverride, [
     'services:',
     '  app:',
+    '    environment:',
+    '      LISTENER_ENABLED: "false"',
     '    healthcheck:',
     '      test: ["CMD", "node", "dist/scripts/deployment-healthcheck.js"]',
     '',
@@ -333,6 +339,7 @@ void test('Compose environment template contains documentation-only required inp
     'SOLANA_HTTP_RPC_FALLBACK_URLS=',
     'SOLANA_WS_RPC_URL=wss://rpc-provider.invalid',
     'SOLANA_WS_RPC_FALLBACK_URLS=',
+    'SOLANA_EXPECTED_GENESIS_HASH=',
     'FRONTEND_PORT=8080',
     'LISTENER_ENABLED=true',
     'RETENTION_PURGE_INTERVAL_MS=900000',
@@ -350,6 +357,10 @@ void test('Compose environment template contains documentation-only required inp
   assert.match(
     environment,
     /^# Optional paired WebSocket fallbacks; positions must match the HTTP fallback list and this can remain blank\.\nSOLANA_WS_RPC_FALLBACK_URLS=$/m,
+  );
+  assert.match(
+    environment,
+    /canonical 32-byte base58 genesis hash/i,
   );
   assert.doesNotMatch(environment, /PRIVATE_KEY|SECRET_KEY|WALLET/i);
   for (const name of ['BACKEND_IMAGE', 'FRONTEND_IMAGE']) {
@@ -373,6 +384,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /SOLANA_HTTP_RPC_URL:\s*'https:\/\/rpc\.invalid'/);
   assert.match(smoke, /SOLANA_WS_RPC_URL:\s*'wss:\/\/rpc\.invalid'/);
   assert.match(smoke, /LISTENER_ENABLED:\s*'false'/);
+  assert.doesNotMatch(smoke, /SOLANA_EXPECTED_GENESIS_HASH/);
   assert.match(smoke, /BACKEND_IMAGE:\s*deploymentImages\.backend/);
   assert.match(smoke, /FRONTEND_IMAGE:\s*deploymentImages\.frontend/);
   assert.match(smoke, /const smokeComposeFile = resolve\(root, 'deploy\/compose\.smoke\.yaml'\)/);
@@ -654,9 +666,15 @@ void test('deployment runbook verifies a real SSE heartbeat with a bounded, clea
   assert.doesNotMatch(runbook, /curl --no-buffer --max-time 10/);
 });
 
-void test('operator documentation links the deployment runbook and smoke command', async () => {
-  const readme = await readArtifact('README.md');
-  const overview = await readArtifact('docs/system-overview.html');
+void test('operator documentation activates the safe websocket failover contract', async () => {
+  const [readme, api, overview, deployment, rpcQualification] = await Promise.all([
+    readArtifact('README.md'),
+    readArtifact('docs/api/v1.md'),
+    readArtifact('docs/system-overview.html'),
+    readArtifact('docs/operations/deployment.md'),
+    readArtifact('docs/operations/rpc-qualification.md'),
+  ]);
+  const documentation = [readme, api, overview, deployment, rpcQualification].join('\n');
 
   assert.match(readme, /\[Guide de déploiement\]\(docs\/operations\/deployment\.md\)/);
   assert.match(readme, /npm run deployment:smoke/);
@@ -673,6 +691,25 @@ void test('operator documentation links the deployment runbook and smoke command
   assert.match(overview, /TLS externe/i);
   assert.match(overview, /sauvegarde externe/i);
   assert.match(overview, /aucune promesse[^<]*(?:première position|sellabilité|profit)/i);
+
+  for (const statement of [
+    'double ACK',
+    '30 secondes',
+    'primary',
+    'fallback-1',
+    '1–60 secondes',
+    'UNRECOVERABLE',
+    'SOLANA_EXPECTED_GENESIS_HASH',
+    'getGenesisHash',
+    'observe/paper',
+    'SolanaProgramSubscriber',
+  ]) assert.ok(documentation.includes(statement), `missing active operational statement: ${statement}`);
+  assert.doesNotMatch(documentation, /inactive until #63|inactive.*#63|jusqu[^\n]{0,80}#63/iu);
+  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d migrate/);
+  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml up -d app frontend retention/);
+  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml exec -T app[\s\S]*deployment-healthcheck\.js --require-ok/);
+  assert.match(deployment, /docker compose --env-file deploy\/\.env -f deploy\/compose\.yaml stop app/);
+  assert.match(deployment, /previous immutable image/i);
 });
 
 void test('operator overview renders the durable WebSocket lifecycle without exposing connection material', async () => {
@@ -693,7 +730,8 @@ void test('operator overview renders the durable WebSocket lifecycle without exp
     'STOPPED', 'CONNECTING', 'WAITING_FOR_ACKS', 'ACKNOWLEDGED', 'RECOVERING',
     'RUNNING', 'DEGRADED',
   ]) assert.ok(section.includes(phase), `missing lifecycle phase: ${phase}`);
-  assert.match(section, /INACTIVE[^<]*#63/iu);
+  assert.match(section, /ACTIVE[^<]*(?:double ACK|deux ACK)/iu);
+  assert.match(section, /UNRECOVERABLE/iu);
   assert.match(section, /30 secondes/iu);
   assert.match(section, /quatre heures/iu);
   assert.match(section, /dernière observation[^<]*pas[^<]*frontière[^<]*complétude/iu);
