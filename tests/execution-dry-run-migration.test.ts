@@ -152,7 +152,9 @@ void test('execution dry-run assessment rejects every invalid boundary and misma
     });
     await insertAssessment(pool, parent);
     await assert.rejects(insertAssessment(pool, parent, { evaluatorVersion: 1, assessmentId: `execution_dry_run_assessment_${'d'.repeat(64)}` }));
-    await assert.rejects(insertAssessment(pool, parent, { evaluatorVersion: 2 }));
+    const duplicateAssessmentParent = parentDraft('duplicate-assessment-id');
+    await insertParent(pool, duplicateAssessmentParent);
+    await assert.rejects(insertAssessment(pool, duplicateAssessmentParent));
   });
 });
 
