@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.1.0
 
 **Date :** 2026-08-30
 
@@ -8,7 +8,17 @@
 
 **Issue parente :** #51
 
-**Périmètre de cette PR (#51-A) :** documentation uniquement
+**Périmètre livré à cette version :** #51-A (conception) et #51-B (fondation
+inerte des intentions d'exécution)
+
+## Historique des versions
+
+- **1.1.0 — 2026-08-30 :** ajoute sans changer l'identité V1 une révision
+  d'état monotone contre les reprises ABA, fixe la décision et son fingerprint
+  sur l'événement canonique `PaperStrategySessionUpdated` avec un TTL borné,
+  et épingle la cohorte PostgreSQL supprimée par une passe de rétention.
+- **1.0.0 — 2026-08-30 :** conception initiale approuvée et découpage
+  #51-A à #51-G.
 
 ## 1. Décision
 
@@ -216,6 +226,7 @@ requested_at
 expires_at
 status
 attempt_count
+state_revision
 lease_owner
 lease_expires_at
 last_reason_code
@@ -321,6 +332,12 @@ incrémenté seulement lorsque l'exécuteur crée atomiquement une ligne append-
 `execution_attempts`. Un crash entre claim et tentative ne consomme donc aucun
 numéro.
 
+`state_revision` commence à zéro et augmente atomiquement à chaque transition
+métier, y compris l'expiration pré-soumission. Toutes les mutations sous lease
+comparent aussi la révision portée par le claim. Le retour ultérieur vers un
+statut déjà observé ne permet donc pas à un ancien worker de rejouer une
+transition ABA, même s'il présente encore le même token de lease.
+
 Après crash :
 
 - avant signature, l'intention peut être reprise après expiration du lease ;
@@ -344,6 +361,15 @@ Elle doit être atomique avec la transition source ou protégée par une project
 rejouable déterministe. Elle ne relit pas une qualification obsolète et ne
 transforme pas une simple présence de métadonnées en autorisation.
 
+En #51-B, le mapper pur accepte uniquement l'événement canonique et immuable
+`PaperStrategySessionUpdated` dont le payload correspond exactement à la
+session courante. `requested_at` est le temps observé de cet événement et doit
+égaler `session.updatedAtMs`; le fingerprint est le SHA-256 de sa
+représentation JSON canonique. `expires_at - requested_at` doit rester dans le
+TTL maximal fourni au mapper. Toute lignée, qualification, quote ou échéance
+incohérente est refusée fail-closed. Ce mapper n'est composé dans aucun runtime
+et ne persiste lui-même aucune intention.
+
 Configuration initiale :
 
 ```dotenv
@@ -351,8 +377,8 @@ EXECUTION_INTENT_EMISSION_ENABLED=false
 LIVE_QUOTE_MINT_ALLOWLIST=So11111111111111111111111111111111111111112
 ```
 
-La PR #51-B livre le domaine, le schéma, le repository et une production
-inertée ou explicitement désactivée. Aucun executor n'est alors capable de
+La PR #51-B livre le domaine, le schéma, le repository et ce mapper pur inerté.
+Aucun producteur n'est composé et aucun executor n'est alors capable de
 signer ou envoyer. La règle d'émission live sera activée seulement lorsque le
 processus executor et tous les gates correspondants existent.
 
@@ -635,6 +661,13 @@ artefact signé reste conservé au minimum jusqu'à la preuve finalisée que son
 blockhash ne peut plus atterrir, puis suit cette même fenêtre. La purge supprime
 d'abord artefacts, tentatives et transitions, puis l'intention, dans une
 transaction rejouable. Elle publie seulement des compteurs agrégés.
+
+La fondation #51-B fige une heure de coupure PostgreSQL puis verrouille une
+cohorte ordonnée d'identifiants terminaux et réconciliés. Les transitions et
+tentatives de cette cohorte exacte sont supprimées avant leurs intentions dans
+la même transaction. Une ligne devenue éligible pendant la passe attend la
+passe suivante; une ligne ouverte, inconnue ou non réconciliée n'entre jamais
+dans la cohorte.
 
 Le front-end public reste indépendant et en lecture seule. La V1 n'ajoute
 aucune route publique d'armement, de clé, de soumission ou de contrôle. Les

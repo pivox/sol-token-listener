@@ -18,6 +18,21 @@ venue de cotation est Pump.fun tant que la bonding curve est active, puis le
 pool PumpSwap canonique après graduation. Aucun de ces chemins ne construit,
 ne signe ou n'envoie une transaction Solana.
 
+## Fondation d'intentions d'exécution (#51-B)
+
+La migration `031_execution_intents.sql` ajoute un ledger PostgreSQL séparé
+d'intentions, de tentatives et de transitions, avec identité déterministe,
+leases clôturés par révision monotone et rétention terminale réconciliée de
+quatre heures. Un mapper pur sait dériver un draft depuis l'événement canonique
+`PaperStrategySessionUpdated`, sa qualification et sa quote causale.
+
+Cette fondation est entièrement inerte : le mapper et le repository ne sont
+composés ni dans le listener, ni dans l'API, ni dans le worker paper. Il
+n'existe encore aucun processus executor, wallet, chargement de clé,
+construction ou simulation de transaction, signature ou envoi. Les capacités
+#51-C à #51-G ne sont donc pas disponibles et les seuls modes exécutables
+restent `observe` et `paper`.
+
 Configuration minimale de la stratégie de création, toujours simulée :
 
 ```dotenv
