@@ -7,19 +7,26 @@ import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '031_execution_intents.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
+const paperTableReference = /\bREFERENCES\s+(?:(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*)?(?:"paper_[^"]+"|paper_[a-z0-9_$]*)/iu;
 
 void test('execution intent migration defines the inert durable ledger contract', async () => {
   const sql = await readFile(migrationUrl, 'utf8');
+  const executableSql = withoutSqlComments(sql);
 
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS execution_intents/u);
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS execution_attempts/u);
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS execution_intent_transitions/u);
-  assert.match(sql, /UNIQUE\s*\(logical_order_key\)/u);
-  assert.doesNotMatch(sql, /REFERENCES\s+paper_(?:positions|trades)/u);
-  assert.match(sql, /quote_amount_raw NUMERIC,/u);
-  assert.match(sql, /quote_amount_raw = trunc\(quote_amount_raw\)/u);
-  assert.match(sql, /WHERE status = 'PENDING'/u);
-  assert.doesNotMatch(sql, /signed_transaction|private_key|keypair/iu);
+  assert.match(executableSql, /CREATE TABLE IF NOT EXISTS execution_intents/u);
+  assert.match(executableSql, /CREATE TABLE IF NOT EXISTS execution_attempts/u);
+  assert.match(executableSql, /CREATE TABLE IF NOT EXISTS execution_intent_transitions/u);
+  assert.match(executableSql, /UNIQUE\s*\(logical_order_key\)/u);
+  assert.doesNotMatch(executableSql, paperTableReference);
+  for (const amountColumn of ['quote_amount_raw', 'base_amount_raw', 'minimum_amount_out_raw']) {
+    assert.match(
+      executableSql,
+      new RegExp(`\\b${amountColumn}\\s*=\\s*trunc\\(\\s*${amountColumn}\\s*\\)`, 'u'),
+    );
+  }
+  assert.match(executableSql, /quote_amount_raw NUMERIC,/u);
+  assert.match(executableSql, /WHERE status = 'PENDING'/u);
+  assert.doesNotMatch(executableSql, /signed_transaction|private_key|keypair/iu);
 });
 
 void test('execution intent migration applies and replays on an isolated schema', async (context) => {
@@ -141,4 +148,8 @@ async function withTemporarySchema(
 function quoteIdentifier(value: string): string {
   if (!/^[a-z_][a-z0-9_]*$/u.test(value)) throw new Error('Unsafe SQL identifier.');
   return `"${value}"`;
+}
+
+function withoutSqlComments(sql: string): string {
+  return sql.replace(/--[^\r\n]*/gu, '').replace(/\/\*[\s\S]*?\*\//gu, '');
 }
