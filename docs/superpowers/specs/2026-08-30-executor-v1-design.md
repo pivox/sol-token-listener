@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.6.4
+**Version de spécification :** 1.7.0
 
 **Date :** 2026-08-31
 
@@ -8,13 +8,14 @@
 
 **Issue parente :** #51
 
-**Périmètre livré à cette version :** #51-A (conception), #51-B (fondation
-inerte des intentions d'exécution), #51-C (processus executor dry-run), #51-D
-(quote, build éphémère et simulation sans envoi) et conception détaillée
-#51-E (risque, quota, exposition et réconciliation sans effet on-chain)
+**Périmètre livré à cette version :** #51-A à #51-F et conception détaillée
+#51-G (graphe live fermé, signature, soumission et canary manuel)
 
 ## Historique des versions
 
+- **1.7.0 — 2026-08-31 :** spécifie #51-G : exécutable live séparé,
+  émission neutre optionnelle, secret local fermé, persistance avant envoi,
+  soumission exacte, confirmation/réconciliation et canary manuel minimal.
 - **1.6.4 — 2026-08-31 :** ferme la projection wallet #51-E à deux positions
   relationnelles explicites et confirme que l'état quota est recalculé lors de
   l'admission plutôt que persisté dans la mesure provider.
@@ -514,6 +515,10 @@ et celle de #51-D dans
 [2026-08-31-executor-quote-build-simulation-design.md](2026-08-31-executor-quote-build-simulation-design.md).
 La conception de #51-E est versionnée dans
 [2026-08-31-executor-risk-reconciliation-design.md](2026-08-31-executor-risk-reconciliation-design.md).
+La conception de #51-F est versionnée dans
+[2026-08-31-executor-preflight-operations-design.md](2026-08-31-executor-preflight-operations-design.md)
+et celle de #51-G dans
+[2026-08-31-executor-live-canary-design.md](2026-08-31-executor-live-canary-design.md).
 
 ### 7.3 Simulation sans envoi
 
