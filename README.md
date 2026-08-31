@@ -192,7 +192,9 @@ signer additionnel ou compte arbitraire n'est accepté.
 Chaque tentative reste sur un seul endpoint positionnel. Elle vérifie le hash
 de genesis attendu, n'effectue ni retry automatique ni failover au milieu de
 quote → build → simulation, et échoue fermé sur timeout, 429 ou réponse
-invalide. La simulation utilise une transaction v0 éphémère avec une signature
+invalide. Le lease doit couvrir trois timeouts RPC séquentiels, un timeout DB
+et une marge fixe de 1 seconde ; une configuration plus courte est rejetée.
+La simulation utilise une transaction v0 éphémère avec une signature
 nulle, `sigVerify=false` et aucune méthode d'envoi. Le message, la transaction
 et les instructions sérialisées ne sont jamais persistés.
 

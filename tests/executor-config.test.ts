@@ -153,6 +153,27 @@ void test('accepts canonical simulation overrides at inclusive safety boundaries
   assert.equal(config.maxRpcCallsPerAttempt, 6);
 });
 
+void test('requires the lease to cover three sequential RPC timeouts and the commit renewal', () => {
+  const accepted = parseExecutorConfig(simulationEnvironment({
+    EXECUTOR_LEASE_MS: '30000',
+    EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
+    EXECUTOR_RPC_TIMEOUT_MS: '8666',
+  }));
+  if (accepted.mode !== 'simulation-only') assert.fail('Expected simulation-only config.');
+  assert.equal(accepted.rpcTimeoutMs, 8_666);
+
+  for (const overrides of [
+    { EXECUTOR_LEASE_MS: '30000', EXECUTOR_RPC_TIMEOUT_MS: '60000' },
+    {
+      EXECUTOR_LEASE_MS: '30000',
+      EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
+      EXECUTOR_RPC_TIMEOUT_MS: '8667',
+    },
+  ]) {
+    assertConfigFailure(simulationEnvironment(overrides));
+  }
+});
+
 void test('rejects noncanonical or unsafe simulation gates and the non-WSOL allowlist', () => {
   const invalid: Readonly<Record<string, string | undefined>>[] = [
     { EXECUTOR_RPC_PROVIDER_ID: '' },

@@ -1,6 +1,6 @@
 # Exécuteur quote, build et simulation V1 — conception #51-D
 
-**Version de spécification :** 1.0.6
+**Version de spécification :** 1.0.7
 
 **Date :** 2026-08-31
 
@@ -12,6 +12,9 @@
 
 ## Historique des versions
 
+- **1.0.7 — 2026-08-31 :** lie le timeout RPC à la durée du lease afin que les
+  trois appels séquentiels précédant le renouvellement de commit, le statement
+  PostgreSQL et une marge fixe d'une seconde tiennent dans le lease.
 - **1.0.6 — 2026-08-31 :** documente l'incompatibilité ESM du SDK Pump.fun
   1.36.0 sur la ligne Node 22 supportée et ferme son unique bridge CommonJS à
   un fichier, une cible littérale et une surface d'exports auditée ; PumpSwap
@@ -209,6 +212,13 @@ Les bornes V1 sont : lag `0..128` slots, compute `1..1_400_000`, fee estimée
 budget `6..16` appels. Le provider ID est un identifiant positionnel ASCII de
 64 caractères au plus ; l'URL HTTP(S) ne peut contenir ni espace périphérique
 ni fragment.
+
+En `simulation-only`, la configuration impose également
+`3 * EXECUTOR_RPC_TIMEOUT_MS + EXECUTOR_DB_STATEMENT_TIMEOUT_MS + 1000
+<= EXECUTOR_LEASE_MS`. Les trois timeouts couvrent blockhash, fee et simulation
+entre le renouvellement `BEFORE_SIMULATION` et celui `BEFORE_COMMIT`; la marge
+fixe absorbe l'ordonnancement local sans prétendre prolonger le lease côté
+application.
 
 `EXECUTOR_PUBLIC_KEY` est une adresse publique uniquement. L'URL RPC peut
 contenir un credential opérateur mais n'est jamais journalisée, persistée ou

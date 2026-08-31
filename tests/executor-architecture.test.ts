@@ -205,7 +205,7 @@ void test('simulation-only graph keeps build receipt, plan builders and gateway 
   );
 });
 
-void test('official SDK bridges expose only the exact spec 1.0.6 surfaces', async () => {
+void test('official SDK bridges expose only the exact spec 1.0.7 surfaces', async () => {
   const pumpFunSurface = {
     runtime: [
       'GLOBAL_PDA', 'PUMP_FEE_CONFIG_PDA', 'PUMP_FEE_PROGRAM_ID', 'PUMP_PROGRAM_ID',

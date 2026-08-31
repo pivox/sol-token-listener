@@ -59,6 +59,7 @@ const SECRET_KEYS = Object.freeze([
 ] as const);
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const QUOTE_MINT_ALLOWLIST = Object.freeze<[string]>([WSOL_MINT]);
+const RPC_LEASE_SAFETY_MARGIN_MS = 1_000;
 
 export function parseExecutorConfig(
   environment: NodeJS.ProcessEnv | Record<string, string | undefined>,
@@ -128,6 +129,8 @@ export function parseExecutorConfig(
     const rpcTimeoutMs = integer(
       environment, 'EXECUTOR_RPC_TIMEOUT_MS', '5000', 1, 60_000,
     );
+    if (rpcTimeoutMs * 3 + databaseStatementTimeoutMs + RPC_LEASE_SAFETY_MARGIN_MS
+      > leaseMs) throw invalid();
     const maxRpcCallsPerAttempt = integer(
       environment, 'EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT', '8', 6, 16,
     );
