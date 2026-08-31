@@ -12,6 +12,7 @@ export const {
   PUMP_AMM_FEE_CONFIG_PDA,
   PUMP_AMM_SDK,
   PUMP_FEE_PROGRAM_ID,
+  pumpPoolAuthorityPda,
   sellBaseInput,
 } = sdk;
 
