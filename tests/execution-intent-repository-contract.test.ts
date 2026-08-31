@@ -15,6 +15,7 @@ import {
 } from './helpers/execution-boundary.js';
 import type {
   ClaimedExecutionIntent,
+  ExecutionBeginAttemptResult,
   ExecutionClaimPurpose,
   ExecutionIntentRepository,
   ExecutionIntentTransitionEvidenceV1,
@@ -49,10 +50,14 @@ type ClaimOptions = Readonly<{
   readonly leaseMs: number;
   readonly purpose: ExecutionClaimPurpose;
 }>;
-type AttemptResult = Readonly<{
+type AttemptIdentity = Readonly<{
   readonly intentId: string;
   readonly attemptNumber: number;
   readonly startedAtMs: number;
+}>;
+type AttemptResult = Readonly<{
+  readonly claim: ClaimedExecutionIntent;
+  readonly attempt: AttemptIdentity;
 }>;
 type FinishAttemptInput = Readonly<{
   readonly attemptNumber: number;
@@ -66,6 +71,7 @@ type ActualCreateResult = Awaited<ReturnType<ExecutionIntentRepository['create']
 type ActualClaimOptions = Parameters<ExecutionIntentRepository['claim']>[0];
 type ActualAttemptResult = Awaited<ReturnType<ExecutionIntentRepository['beginAttempt']>>;
 type ActualFinishAttemptInput = Parameters<ExecutionIntentRepository['finishAttempt']>[1];
+type ActualRenewResult = Awaited<ReturnType<ExecutionIntentRepository['renew']>>;
 
 /* eslint-disable @typescript-eslint/no-duplicate-type-constituents */
 type ExactSurfaceAssertions = AssertAll<{
@@ -76,9 +82,13 @@ type ExactSurfaceAssertions = AssertAll<{
     options: ClaimOptions,
     signal?: AbortSignal,
   ) => Promise<ClaimedExecutionIntent | null>>>;
-  beginAttempt: Expect<Equal<ExecutionIntentRepository['beginAttempt'], (claim: ClaimedExecutionIntent) => Promise<AttemptResult>>>;
+  beginAttempt: Expect<Equal<ExecutionIntentRepository['beginAttempt'], (claim: ClaimedExecutionIntent) => Promise<ExecutionBeginAttemptResult>>>
+    & Expect<Equal<ExecutionBeginAttemptResult, AttemptResult>>;
+  begunAttempt: Expect<Equal<keyof ExecutionBeginAttemptResult, 'claim' | 'attempt'>>
+    & Expect<Equal<OptionalKeys<ExecutionBeginAttemptResult>, never>>
+    & Expect<Equal<ReadonlyKeys<ExecutionBeginAttemptResult>, keyof ExecutionBeginAttemptResult>>;
   finishAttempt: Expect<Equal<ExecutionIntentRepository['finishAttempt'], (claim: ClaimedExecutionIntent, input: FinishAttemptInput) => Promise<boolean>>>;
-  renew: Expect<Equal<ExecutionIntentRepository['renew'], (claim: ClaimedExecutionIntent, leaseMs: number) => Promise<boolean>>>;
+  renew: Expect<Equal<ExecutionIntentRepository['renew'], (claim: ClaimedExecutionIntent, leaseMs: number) => Promise<ClaimedExecutionIntent>>>;
   release: Expect<Equal<ExecutionIntentRepository['release'], (claim: ClaimedExecutionIntent) => Promise<boolean>>>;
   transition: Expect<Equal<ExecutionIntentRepository['transition'], (claim: ClaimedExecutionIntent, input: ExecutionIntentTransitionInput) => Promise<ExecutionIntentV1>>>;
   expirePreSubmission: Expect<Equal<ExecutionIntentRepository['expirePreSubmission'], (limit: number) => Promise<number>>>;
@@ -140,9 +150,9 @@ type ExactSurfaceAssertions = AssertAll<{
   attemptResult: Expect<Equal<keyof ActualAttemptResult, keyof AttemptResult>>
     & Expect<Equal<OptionalKeys<ActualAttemptResult>, never>>
     & Expect<Equal<ReadonlyKeys<ActualAttemptResult>, keyof ActualAttemptResult>>
-    & Expect<Equal<ActualAttemptResult['intentId'], string>>
-    & Expect<Equal<ActualAttemptResult['attemptNumber'], number>>
-    & Expect<Equal<ActualAttemptResult['startedAtMs'], number>>;
+    & Expect<Equal<ActualAttemptResult['claim'], ClaimedExecutionIntent>>
+    & Expect<Equal<ActualAttemptResult['attempt'], AttemptIdentity>>;
+  renewResult: Expect<Equal<ActualRenewResult, ClaimedExecutionIntent>>;
 }>;
 /* eslint-enable @typescript-eslint/no-duplicate-type-constituents */
 void (null as never as ExactSurfaceAssertions);
@@ -153,13 +163,13 @@ void test('execution intent repository is an allowlisted domain-only persistence
   const source = await readFile(sourceUrl, 'utf8');
   const sourceFile = ts.createSourceFile(sourcePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 
-  assert.equal(sourceFile.statements.length, 6);
+  assert.equal(sourceFile.statements.length, 8);
   const [firstStatement, ...declarations] = sourceFile.statements;
   assert.ok(firstStatement !== undefined && ts.isImportDeclaration(firstStatement));
   const domainImport = firstStatement !== undefined && ts.isImportDeclaration(firstStatement)
     ? firstStatement
     : undefined;
-  assert.equal(declarations.length, 5);
+  assert.equal(declarations.length, 7);
   assert.ok(declarations.every(isExportedPortDeclaration));
   assert.ok(domainImport?.importClause?.isTypeOnly);
   assert.ok(domainImport?.moduleSpecifier !== undefined && ts.isStringLiteral(domainImport.moduleSpecifier));
@@ -183,6 +193,8 @@ void test('execution intent repository is an allowlisted domain-only persistence
     declarations.filter(isExportedPortDeclaration).map(declarationName).sort(),
     [
       'ClaimedExecutionIntent',
+      'ExecutionAttemptIdentity',
+      'ExecutionBeginAttemptResult',
       'ExecutionClaimPurpose',
       'ExecutionIntentRepository',
       'ExecutionIntentTransitionEvidenceV1',
@@ -218,7 +230,7 @@ void test('execution intent repository contract supports frozen execution lifecy
   const claim = await repository.claim({ ownerId: 'worker', leaseMs: 30_000, purpose: 'EXECUTE' });
   assert.ok(claim);
   const attempt = await repository.beginAttempt(claim);
-  const evidence = Object.freeze({ payloadVersion: 1, attemptNumber: attempt.attemptNumber, sourceEventId: 'event', observedAtMs: 3 } satisfies ExecutionIntentTransitionEvidenceV1);
+  const evidence = Object.freeze({ payloadVersion: 1, attemptNumber: attempt.attempt.attemptNumber, sourceEventId: 'event', observedAtMs: 3 } satisfies ExecutionIntentTransitionEvidenceV1);
   const transition = Object.freeze({
     intentId: created.intent.id, expectedStatus: 'PENDING', nextStatus: 'PROCESSING',
     leaseToken: claim.leaseToken, reasonCode: 'EXECUTION_STARTED', humanMessage: 'claimed by worker',
@@ -229,13 +241,15 @@ void test('execution intent repository contract supports frozen execution lifecy
   assert.ok(Object.isFrozen(created.intent));
   assert.ok(Object.isFrozen(claim));
   assert.ok(Object.isFrozen(attempt));
+  assert.ok(Object.isFrozen(attempt.claim));
+  assert.ok(Object.isFrozen(attempt.attempt));
   assert.ok(Object.isFrozen(evidence));
   assert.ok(Object.isFrozen(transition));
-  assert.equal(await repository.finishAttempt(claim, {
-    attemptNumber: attempt.attemptNumber, status: 'COMPLETED', effectiveVenue: 'PUMP_FUN',
+  assert.equal(await repository.finishAttempt(attempt.claim, {
+    attemptNumber: attempt.attempt.attemptNumber, status: 'COMPLETED', effectiveVenue: 'PUMP_FUN',
     providerId: 'provider', reasonCode: 'ATTEMPT_COMPLETED',
   }), true);
-  assert.equal(await repository.renew(claim, 30_000), true);
+  assert.equal((await repository.renew(claim, 30_000)).leaseToken, claim.leaseToken);
   assert.equal((await repository.transition(claim, transition)).id, created.intent.id);
   assert.equal(await repository.release(claim), true);
   assert.equal(await repository.expirePreSubmission(10), 0);
@@ -297,11 +311,20 @@ class StrictFakeExecutionIntentRepository implements ExecutionIntentRepository {
   }
 
   public async beginAttempt(claim: ClaimedExecutionIntent): Promise<AttemptResult> {
-    return Object.freeze({ intentId: claim.intent.id, attemptNumber: 1, startedAtMs: 2 });
+    const refreshed = Object.freeze({
+      ...claim,
+      intent: Object.freeze({ ...claim.intent, attemptCount: 1, updatedAtMs: 2 }),
+    });
+    return Object.freeze({
+      claim: refreshed,
+      attempt: Object.freeze({ intentId: claim.intent.id, attemptNumber: 1, startedAtMs: 2 }),
+    });
   }
 
   public async finishAttempt(_claim: ClaimedExecutionIntent, _input: FinishAttemptInput): Promise<boolean> { return true; }
-  public async renew(_claim: ClaimedExecutionIntent, _leaseMs: number): Promise<boolean> { return true; }
+  public async renew(claim: ClaimedExecutionIntent, _leaseMs: number): Promise<ClaimedExecutionIntent> {
+    return claim;
+  }
   public async release(_claim: ClaimedExecutionIntent): Promise<boolean> { return true; }
   public async transition(_claim: ClaimedExecutionIntent, _input: ExecutionIntentTransitionInput): Promise<ExecutionIntentV1> { assert.ok(this.intent); return this.intent; }
   public async expirePreSubmission(_limit: number): Promise<number> { return 0; }

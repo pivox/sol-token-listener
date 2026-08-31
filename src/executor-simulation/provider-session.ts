@@ -1,11 +1,12 @@
 import { isProxy } from 'node:util/types';
 import type {
   ExecutionAccountSnapshot,
+  ExecutionAddressDiscovery,
   ExecutionGenesisEvidence,
+  ExecutionDiscoveryMarketGateway,
   ExecutionInnerInstruction,
   ExecutionInnerInstructionGroup,
   ExecutionLatestBlockhash,
-  ExecutionMarketGateway,
   ExecutionMessageFee,
   ExecutionProviderUsage,
   ExecutionRpcAccount,
@@ -81,7 +82,7 @@ interface RpcContextValue {
   readonly value: unknown;
 }
 
-export class ProviderAffineSession implements ExecutionMarketGateway {
+export class ProviderAffineSession implements ExecutionDiscoveryMarketGateway {
   public readonly providerId: string;
   private readonly config: ValidatedConfig;
   private readonly fetchImplementation: typeof fetch;
@@ -91,6 +92,7 @@ export class ProviderAffineSession implements ExecutionMarketGateway {
   private failed = false;
   private snapshotSlot: bigint | null = null;
   private snapshotReserved = false;
+  private discoveryReserved = false;
   private blockhashContextSlot: bigint | null = null;
   private blockhashReserved = false;
   private feeContextSlot: bigint | null = null;
@@ -137,6 +139,24 @@ export class ProviderAffineSession implements ExecutionMarketGateway {
     return this.issuedSnapshots.has(snapshot);
   }
 
+  public async readAddressDiscovery(
+    addressesValue: readonly string[],
+    signal: AbortSignal,
+  ): Promise<ExecutionAddressDiscovery> {
+    const addresses = addressList(addressesValue, false);
+    if (addresses.length !== 2) throw inputError();
+    this.requireReady(signal);
+    if (this.discoveryReserved || this.snapshotReserved || this.snapshotSlot !== null) throw inputError();
+    this.discoveryReserved = true;
+    const raw = await this.dispatch('getMultipleAccounts', Object.freeze([
+      addresses,
+      Object.freeze({ encoding: 'base64', commitment: 'confirmed' }),
+    ]), signal);
+    try {
+      return accountsResult(raw, this.providerId, addresses);
+    } catch { return this.failInvalidResponse(); }
+  }
+
   public async readAccountSnapshot(
     addressesValue: readonly string[],
     signal: AbortSignal,
@@ -150,23 +170,9 @@ export class ProviderAffineSession implements ExecutionMarketGateway {
       Object.freeze({ encoding: 'base64', commitment: 'confirmed' }),
     ]), signal);
     try {
-      const contextual = contextValue(raw);
-      if (!Array.isArray(contextual.value) || contextual.value.length !== addresses.length) {
-        throw new Error();
-      }
-      const accounts = contextual.value.map((value, index) => {
-        const address = addresses[index];
-        if (address === undefined) throw new Error();
-        return value === null ? null : accountFrom(value, address);
-      });
-      const result = Object.freeze({
-        providerId: this.providerId,
-        slot: contextual.contextSlot,
-        addresses,
-        accounts: Object.freeze(accounts),
-      });
+      const result = accountsResult(raw, this.providerId, addresses);
       this.issuedSnapshots.add(result);
-      this.snapshotSlot = contextual.contextSlot;
+      this.snapshotSlot = result.slot;
       return result;
     } catch { return this.failInvalidResponse(); }
   }
@@ -387,6 +393,28 @@ export class ProviderAffineSession implements ExecutionMarketGateway {
     this.failed = true;
     throw sessionError('RPC_RESPONSE_INVALID');
   }
+}
+
+function accountsResult(
+  raw: unknown,
+  providerId: string,
+  addresses: readonly string[],
+): ExecutionAccountSnapshot {
+  const contextual = contextValue(raw);
+  if (!Array.isArray(contextual.value) || contextual.value.length !== addresses.length) {
+    throw new Error();
+  }
+  const accounts = contextual.value.map((value, index) => {
+    const address = addresses[index];
+    if (address === undefined) throw new Error();
+    return value === null ? null : accountFrom(value, address);
+  });
+  return Object.freeze({
+    providerId,
+    slot: contextual.contextSlot,
+    addresses,
+    accounts: Object.freeze(accounts),
+  });
 }
 
 async function readBoundedResponse(response: Response, signal: AbortSignal): Promise<string> {

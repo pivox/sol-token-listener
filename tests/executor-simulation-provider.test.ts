@@ -123,6 +123,49 @@ void test('pins one provider and normalizes the complete causal RPC sequence', a
   }
 });
 
+void test('keeps address discovery separate from the one provider-owned causal snapshot', async () => {
+  const scripted = new ScriptedFetch([
+    rpcResult(PUBLIC_KEY, 1),
+    rpcResult(context(99, [account(DATA), account(DATA)]), 2),
+    rpcResult(context(100, [account(DATA), null]), 3),
+  ]);
+  const session = new ProviderAffineSession(config(3), scripted.fetch);
+
+  await session.verifyGenesis(activeSignal());
+  const discovery = await session.readAddressDiscovery(
+    Object.freeze([PUBLIC_KEY, OTHER_KEY]), activeSignal(),
+  );
+  const snapshot = await session.readAccountSnapshot(
+    Object.freeze([PUBLIC_KEY, OTHER_KEY]), activeSignal(),
+  );
+
+  assert.equal(discovery.slot, 99n);
+  assert.equal(session.ownsAccountSnapshot(discovery), false);
+  assert.equal(snapshot.slot, 100n);
+  assert.equal(session.ownsAccountSnapshot(snapshot), true);
+  assert.deepEqual(scripted.calls.map((call) => (
+    JSON.parse(call.body) as { readonly method: string }
+  ).method), ['getGenesisHash', 'getMultipleAccounts', 'getMultipleAccounts']);
+});
+
+void test('requires exactly two unique addresses for non-causal discovery', async () => {
+  const scripted = new ScriptedFetch([rpcResult(PUBLIC_KEY, 1)]);
+  const session = new ProviderAffineSession(config(3), scripted.fetch);
+  await session.verifyGenesis(activeSignal());
+
+  await expectCode(
+    session.readAddressDiscovery(Object.freeze([PUBLIC_KEY]), activeSignal()),
+    'INVALID_INPUT',
+  );
+  await expectCode(
+    session.readAddressDiscovery(Object.freeze([
+      PUBLIC_KEY, OTHER_KEY, bs58.encode(new Uint8Array(32).fill(7)),
+    ]), activeSignal()),
+    'INVALID_INPUT',
+  );
+  assert.equal(scripted.calls.length, 1);
+});
+
 void test('requires genesis first, caches it, and enforces the exact dispatch budget', async () => {
   const scripted = new ScriptedFetch([rpcResult(PUBLIC_KEY, 1)]);
   const session = new ProviderAffineSession(config(1), scripted.fetch);

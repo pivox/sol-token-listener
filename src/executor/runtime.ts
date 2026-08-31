@@ -1,5 +1,8 @@
 import type { DryRunPassResult } from './dry-run-worker.js';
 import type { ExecutorLogger } from './logger.js';
+import type { SimulationOnlyPassResult } from './simulation-worker.js';
+
+export type ExecutorPassResult = DryRunPassResult | SimulationOnlyPassResult;
 
 export interface ExecutorRuntimeScheduler {
   readonly setTimeout: (callback: () => void, delayMs: number) => object | number;
@@ -12,7 +15,7 @@ export interface ExecutorRuntimeSignalSource {
 }
 
 export interface ExecutorRuntimeDependencies {
-  readonly runOnce: (signal: AbortSignal) => Promise<DryRunPassResult>;
+  readonly runOnce: (signal: AbortSignal) => Promise<ExecutorPassResult>;
   readonly logger: ExecutorLogger;
   readonly closeDatabase: () => Promise<void>;
   readonly evictDatabase: () => void | Promise<void>;
@@ -33,6 +36,7 @@ const productionScheduler: ExecutorRuntimeScheduler = Object.freeze({
 const SAFE_PASS_ERROR_CODES = new Set([
   'EXECUTOR_DATABASE_BUSY', 'INVALID_INPUT', 'INVALID_DATA', 'DATABASE_FAILURE',
   'COMMIT_OUTCOME_UNKNOWN', 'INTENT_FENCE_LOST', 'ASSESSMENT_CONFLICT',
+  'ARTIFACT_CONFLICT', 'OPERATION_ABORTED',
   'INTENT_DUPLICATE', 'INTENT_LEASE_LOST', 'ATTEMPT_EXHAUSTED', 'ATTEMPT_CONFLICT',
 ]);
 
@@ -138,7 +142,7 @@ async function forceShutdown(dependencies: ExecutorRuntimeDependencies): Promise
   dependencies.forceExit(1);
 }
 
-function logPassResult(logger: ExecutorLogger, result: DryRunPassResult): void {
+function logPassResult(logger: ExecutorLogger, result: ExecutorPassResult): void {
   if (result === 'RECORDED') {
     logger.info(Object.freeze({
       event: 'executor.assessment_recorded', mode: 'dry-run', outcome: 'FOUNDATION_VALIDATED',
@@ -147,6 +151,17 @@ function logPassResult(logger: ExecutorLogger, result: DryRunPassResult): void {
     logger.info(Object.freeze({
       event: 'executor.assessment_recovered', mode: 'dry-run', outcome: 'FOUNDATION_VALIDATED',
     }));
+  } else if (typeof result === 'object') {
+    const context = Object.freeze({
+      event: result.kind === 'RECORDED'
+        ? 'executor.simulation_recorded' : 'executor.simulation_recovered',
+      mode: result.mode,
+      outcome: result.outcome,
+      reasonCode: result.reasonCode,
+      providerId: result.providerId,
+    });
+    if (result.outcome === 'SIMULATION_FAILED') logger.warn(context);
+    else logger.info(context);
   }
 }
 

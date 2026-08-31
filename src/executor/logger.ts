@@ -3,10 +3,12 @@ import pino, { type DestinationStream } from 'pino';
 
 export interface ExecutorLogContext {
   readonly event?: string;
-  readonly mode?: 'dry-run';
+  readonly mode?: 'dry-run' | 'simulation-only';
   readonly intentId?: string;
   readonly side?: 'BUY' | 'SELL';
-  readonly outcome?: 'FOUNDATION_VALIDATED';
+  readonly outcome?: 'FOUNDATION_VALIDATED' | 'SIMULATION_SUCCEEDED' | 'SIMULATION_FAILED';
+  readonly reasonCode?: string;
+  readonly providerId?: string;
   readonly errorCode?: string;
 }
 
@@ -17,7 +19,7 @@ export interface ExecutorLogger {
 }
 
 const CONTEXT_KEYS = Object.freeze([
-  'event', 'mode', 'intentId', 'side', 'outcome', 'errorCode',
+  'event', 'mode', 'intentId', 'side', 'outcome', 'reasonCode', 'providerId', 'errorCode',
 ] as const);
 const SECRET_KEYS = Object.freeze([
   'EXECUTOR_PRIVATE_KEY', 'EXECUTOR_SECRET_KEY', 'EXECUTOR_KEYPAIR',
@@ -84,10 +86,13 @@ function safeValue(key: typeof CONTEXT_KEYS[number], value: unknown): value is s
   if (typeof value !== 'string') return false;
   switch (key) {
     case 'event': return /^[a-z][a-z0-9_.-]{0,127}$/u.test(value);
-    case 'mode': return value === 'dry-run';
+    case 'mode': return value === 'dry-run' || value === 'simulation-only';
     case 'intentId': return /^execution_intent_[0-9a-f]{64}$/u.test(value);
     case 'side': return value === 'BUY' || value === 'SELL';
-    case 'outcome': return value === 'FOUNDATION_VALIDATED';
+    case 'outcome': return value === 'FOUNDATION_VALIDATED'
+      || value === 'SIMULATION_SUCCEEDED' || value === 'SIMULATION_FAILED';
+    case 'reasonCode': return /^[A-Z][A-Z0-9_]{0,63}$/u.test(value);
+    case 'providerId': return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(value);
     case 'errorCode': return /^[A-Z][A-Z0-9_]{0,63}$/u.test(value);
   }
 }

@@ -14,6 +14,18 @@ export interface ClaimedExecutionIntent {
   readonly leaseExpiresAtMs: number;
 }
 
+export interface ExecutionAttemptIdentity {
+  readonly intentId: string;
+  readonly attemptNumber: number;
+  readonly startedAtMs: number;
+}
+
+/** A freshly fenced parent claim paired atomically with its STARTED attempt. */
+export interface ExecutionBeginAttemptResult {
+  readonly claim: ClaimedExecutionIntent;
+  readonly attempt: ExecutionAttemptIdentity;
+}
+
 export interface ExecutionIntentTransitionEvidenceV1 {
   readonly payloadVersion: 1;
   readonly attemptNumber: number | null;
@@ -42,11 +54,7 @@ export interface ExecutionIntentRepository {
     readonly leaseMs: number;
     readonly purpose: ExecutionClaimPurpose;
   }>, signal?: AbortSignal): Promise<ClaimedExecutionIntent | null>;
-  beginAttempt(claim: ClaimedExecutionIntent): Promise<Readonly<{
-    readonly intentId: string;
-    readonly attemptNumber: number;
-    readonly startedAtMs: number;
-  }>>;
+  beginAttempt(claim: ClaimedExecutionIntent): Promise<ExecutionBeginAttemptResult>;
   finishAttempt(claim: ClaimedExecutionIntent, input: Readonly<{
     readonly attemptNumber: number;
     readonly status: 'COMPLETED' | 'ABANDONED';
@@ -54,7 +62,7 @@ export interface ExecutionIntentRepository {
     readonly providerId: string | null;
     readonly reasonCode: ExecutionIntentReasonCode;
   }>): Promise<boolean>;
-  renew(claim: ClaimedExecutionIntent, leaseMs: number): Promise<boolean>;
+  renew(claim: ClaimedExecutionIntent, leaseMs: number): Promise<ClaimedExecutionIntent>;
   release(claim: ClaimedExecutionIntent): Promise<boolean>;
   transition(
     claim: ClaimedExecutionIntent,

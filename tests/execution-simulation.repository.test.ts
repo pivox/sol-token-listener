@@ -227,17 +227,17 @@ void test('real PostgreSQL completes success atomically and terminalizes without
       }),
     });
     const processing = Object.freeze({ ...pending, intent: processingIntent });
-    const attempt = await intents.beginAttempt(processing);
+    const begun = await intents.beginAttempt(processing);
     const artifact = createExecutionSimulationArtifactDraft({
-      ...successArtifactInput(processing), attemptNumber: attempt.attemptNumber,
+      ...successArtifactInput(begun.claim), attemptNumber: begun.attempt.attemptNumber,
     });
 
-    const stored = await repository.complete(processing, artifact, activeSignal());
+    const stored = await repository.complete(begun.claim, artifact, activeSignal());
 
     assert.deepEqual(await repository.findExact(artifact, activeSignal()), stored);
     const terminal = required(await intents.read(created.intent.id));
     assert.equal(terminal.status, 'SUCCEEDED');
-    assert.equal(terminal.stateRevision, processing.intent.stateRevision + 2n);
+    assert.equal(terminal.stateRevision, begun.claim.intent.stateRevision + 2n);
     assert.equal(terminal.attemptCount, 1);
     assert.equal(terminal.lastReasonCode, 'INTENT_SUCCEEDED');
     assert.equal(terminal.terminalAtMs, stored.recordedAtMs);

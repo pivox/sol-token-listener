@@ -27,6 +27,13 @@ export interface ExecutionAccountSnapshot {
   readonly accounts: readonly (ExecutionRpcAccount | null)[];
 }
 
+export interface ExecutionAddressDiscovery {
+  readonly providerId: string;
+  readonly slot: bigint;
+  readonly addresses: readonly string[];
+  readonly accounts: readonly (ExecutionRpcAccount | null)[];
+}
+
 export interface ExecutionLatestBlockhash {
   readonly providerId: string;
   readonly contextSlot: bigint;
@@ -94,4 +101,11 @@ export interface ExecutionMarketGateway {
     signal: AbortSignal,
   ) => Promise<ExecutionUnsignedSimulationResult>;
   readonly usage: () => ExecutionProviderUsage;
+}
+
+export interface ExecutionDiscoveryMarketGateway extends ExecutionMarketGateway {
+  readonly readAddressDiscovery: (
+    addresses: readonly string[],
+    signal: AbortSignal,
+  ) => Promise<ExecutionAddressDiscovery>;
 }

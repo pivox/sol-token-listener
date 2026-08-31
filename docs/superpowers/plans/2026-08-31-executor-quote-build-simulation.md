@@ -21,7 +21,7 @@ Pino, SHA-256.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-quote-build-simulation-design.md`
-version 1.0.4 and parent specification version 1.5.0.
+version 1.0.6 and parent specification version 1.5.0.
 
 ---
 
@@ -71,17 +71,17 @@ official pinned SDK results and contain no wallet secret or provider URL.
 - Create: `src/domain/execution-simulation.ts`
 - Create: `tests/execution-simulation.test.ts`
 
-- [ ] Write failing tests for the closed enums, payload version 1,
+- [x] Write failing tests for the closed enums, payload version 1,
   specification 1.5.0, evaluator version 1 and immutable DTO validation.
-- [ ] Cover BUY Pump.fun, SELL Pump.fun and SELL PumpSwap artifacts.
-- [ ] Cover all `bigint` fields at zero/u64/int64 boundaries and beyond 2^53.
-- [ ] Pin deterministic artifact, quote, snapshot, build, message and result
+- [x] Cover BUY Pump.fun, SELL Pump.fun and SELL PumpSwap artifacts.
+- [x] Cover all `bigint` fields at zero/u64/int64 boundaries and beyond 2^53.
+- [x] Pin deterministic artifact, quote, snapshot, build, message and result
   fingerprint vectors using length-prefixed UTF-8 segments.
-- [ ] Reject proxy, accessor, symbol/extra/missing keys, non-frozen nested
+- [x] Reject proxy, accessor, symbol/extra/missing keys, non-frozen nested
   values, uppercase hashes and noncanonical decimals.
-- [ ] Model success and failure evidence so impossible stage/status
+- [x] Model success and failure evidence so impossible stage/status
   combinations cannot be constructed.
-- [ ] Add the append-only terminal reason codes
+- [x] Add the append-only terminal reason codes
   `EXECUTION_PROVIDER_FAILED`, `EXECUTION_BUILD_FAILED` and
   `EXECUTION_EVIDENCE_INVALID`, and pin the normative internal→terminal
   mapping plus failure-stage nullability matrix.
@@ -118,23 +118,23 @@ git commit -m "feat: define simulation-only execution evidence (#51)"
 - Create tests for migration, port surface and repository
 - Modify migration inventory/deployment tests and `src/storage/database.ts`
 
-- [ ] First test the exact schema from the normative design, enum checks,
+- [x] First test the exact schema from the normative design, enum checks,
   stage-specific nullability matrix, decimal bounds, foreign keys, uniqueness
   and forbidden columns.
-- [ ] Extend the closed reason-code constraints of intents, attempts and
+- [x] Extend the closed reason-code constraints of intents, attempts and
   transitions with the three append-only #51-D codes.
-- [ ] Test base-empty migration, upgrade from 032, replay twice and downgrade
+- [x] Test base-empty migration, upgrade from 032, replay twice and downgrade
   assumptions (no destructive rewrite).
-- [ ] Define `complete` and `findExact` only; no generic query or arbitrary
+- [x] Define `complete` and `findExact` only; no generic query or arbitrary
   JSON interface.
-- [ ] Implement one transaction/statement that fences the intent and STARTED
+- [x] Implement one transaction/statement that fences the intent and STARTED
   attempt, inserts the artifact, completes/abandons the attempt, appends both
   success transitions when applicable, terminalizes and releases the lease.
-- [ ] Assert `terminal_at=reconciliation_completed_at=commit_at` and
+- [x] Assert `terminal_at=reconciliation_completed_at=commit_at` and
   `purge_after=commit_at+4h` for every result because no send capability exists.
-- [ ] Test loss of ACK, exact recovery, artifact conflict, lease expiry, ABA,
+- [x] Test loss of ACK, exact recovery, artifact conflict, lease expiry, ABA,
   immutable mismatch and hostile database rows.
-- [ ] Extend purge accounting and delete the artifact cohort before attempts
+- [x] Extend purge accounting and delete the artifact cohort before attempts
   and intents while preserving the tombstone.
 
 Run red/green:
@@ -166,17 +166,17 @@ git commit -m "feat: persist atomic simulation-only outcomes (#51)"
 - Create `tests/execution-quote-math.test.ts`
 - Preserve all current paper quote tests
 
-- [ ] Write comparison tests proving the extracted Pump.fun computation is
+- [x] Write comparison tests proving the extracted Pump.fun computation is
   byte-for-byte equivalent to current paper quotes.
-- [ ] Add a single-snapshot input containing all accounts needed by quote and
+- [x] Add a single-snapshot input containing all accounts needed by quote and
   build; require one exact slot.
-- [ ] Test dynamic fee tiers, mayhem/cashback state, real/virtual reserves,
+- [x] Test dynamic fee tiers, mayhem/cashback state, real/virtual reserves,
   reverse SELL after BUY and insufficient real quote reserves.
-- [ ] Test `effectiveQuoteReserves` for PumpSwap buy/sell math even though the
+- [x] Test `effectiveQuoteReserves` for PumpSwap buy/sell math even though the
   executor exposes only SELL PumpSwap.
-- [ ] Detect SPL Token/Token-2022 and validate the versioned extension
+- [x] Detect SPL Token/Token-2022 and validate the versioned extension
   allowlist without accepting unknown TLV.
-- [ ] Keep all financial calculations in bigint/BN and use decimal conversion
+- [x] Keep all financial calculations in bigint/BN and use decimal conversion
   only at the SDK boundary.
 
 Run:
@@ -203,17 +203,17 @@ git commit -m "refactor: share causal Pump quote calculations (#51)"
 - Create: `src/ports/execution-market-gateway.ts`
 - Create: `tests/executor-simulation-provider.test.ts`
 
-- [ ] Start with a scripted JSON-RPC server/fetch test, not a live endpoint.
-- [ ] Expose only genesis, one contextual multi-account snapshot,
+- [x] Start with a scripted JSON-RPC server/fetch test, not a live endpoint.
+- [x] Expose only genesis, one contextual multi-account snapshot,
   latest-blockhash-with-context, fee-for-message-with-context and simulation
   operations; all post-snapshot calls carry `minContextSlot`.
-- [ ] Pin one positional provider for an attempt; prohibit mid-attempt
+- [x] Pin one positional provider for an attempt; prohibit mid-attempt
   failover and automatic retry.
-- [ ] Count every dispatched request and enforce the configured cap.
-- [ ] Propagate AbortSignal and enforce a bounded timeout per request.
-- [ ] Normalize 429, timeout, transport, malformed JSON and genesis mismatch
+- [x] Count every dispatched request and enforce the configured cap.
+- [x] Propagate AbortSignal and enforce a bounded timeout per request.
+- [x] Normalize 429, timeout, transport, malformed JSON and genesis mismatch
   without retaining URL, headers, response body or provider messages.
-- [ ] Validate commitment, context slot, canonical integers and bounded base64
+- [x] Validate commitment, context slot, canonical integers and bounded base64
   account payloads.
 
 Run:
@@ -240,20 +240,20 @@ git commit -m "feat: add provider-affine simulation RPC session (#51)"
 - Create: `src/executor-simulation/pumpswap-adapter.ts`
 - Create adapter and venue repository tests
 
-- [ ] Test BUY always routes Pump.fun and fails on complete curve.
-- [ ] Test SELL selects active Pump.fun first, then PumpSwap only with a
+- [x] Test BUY always routes Pump.fun and fails on complete curve.
+- [x] Test SELL selects active Pump.fun first, then PumpSwap only with a
   durable non-orphaned canonical migration/pool proof.
-- [ ] Read all quote/build accounts in one contextual RPC request per venue.
-- [ ] Build Pump.fun V2 with exact BN amounts and deterministic recipients
+- [x] Read all quote/build accounts in one contextual RPC request per venue.
+- [x] Build Pump.fun V2 with exact BN amounts and deterministic recipients
   selected from the on-chain official normal/reserved/buyback lists.
-- [ ] Build PumpSwap SELL through SDK 1.19.0 with exact `baseAmountIn` and
+- [x] Build PumpSwap SELL through SDK 1.19.0 with exact `baseAmountIn` and
   `minQuoteAmountOut`; inspect the recipients randomly selected internally by
   that SDK and require membership in the decoded on-chain lists.
-- [ ] Do not use SDK helpers that transform a financial slippage `number`.
-- [ ] Permit only the exact terminal WSOL `CloseAccount` and expected
+- [x] Do not use SDK helpers that transform a financial slippage `number`.
+- [x] Permit only the exact terminal WSOL `CloseAccount` and expected
   idempotent ATA instruction produced by PumpSwap 1.19.0; reject every
   `SyncNative`, auxiliary signer or other wrap/unwrap instruction.
-- [ ] Test missing user ATA/funds as explicit simulation/build outcomes, never
+- [x] Test missing user ATA/funds as explicit simulation/build outcomes, never
   as an opportunity to generate a keypair.
 
 Run:
@@ -332,26 +332,29 @@ git commit -m "feat: inspect and simulate unsigned Pump transactions (#51)"
 - Modify intent repository only where atomic completion requires it
 - Create worker/config/runtime/integration tests
 
-- [ ] Extend config with a discriminated union: existing `dry-run` shape stays
+- [x] Extend config with a discriminated union: existing `dry-run` shape stays
   unchanged; `simulation-only` requires public/RPC/gate values.
-- [ ] Continue rejecting every private-key variable in both modes.
-- [ ] Claim with `EXECUTE`, transition to PROCESSING, begin or recover the
+- [x] Continue rejecting every private-key variable in both modes.
+- [x] Claim with `EXECUTE`, transition to PROCESSING, begin or recover the
   current attempt, then invoke quote/build/simulation once per pass.
-- [ ] Derive every venue-specific builder input from the exact provider-owned
+- [x] Derive every venue-specific builder input from the exact provider-owned
   `ExecutionAccountSnapshot`, compute its fingerprint internally, bind the
   returned plan to that snapshot object and reject caller-supplied policy or
   fingerprint evidence.
-- [ ] Keep the `BuildReceiptAuthority` private to the trusted worker factory;
+- [x] Keep the `BuildReceiptAuthority` private to the trusted worker factory;
   issue its one-shot receipt only after that exact derivation and pass the same
   plan/snapshot objects to the simulation gateway.
-- [ ] Renew the lease only at specified boundaries; authenticate abort errors
+- [x] Renew the lease only at specified boundaries; authenticate abort errors
   with both typed code and `AbortSignal.aborted`.
-- [ ] Commit success/failure atomically through the new repository.
-- [ ] On unknown commit outcome, recover by exact artifact identity without
+- [x] Treat venue discovery as address-only evidence; rebuild the final
+  provider-owned snapshot, including the canonical Pump.fun curve for a
+  PumpSwap exit, and reject discovery/final-state drift.
+- [x] Commit success/failure atomically through the new repository.
+- [x] On unknown commit outcome, recover by exact artifact identity without
   repeating RPC.
-- [ ] Ensure a recovered PROCESSING/STARTED intent is safe after crash and a
+- [x] Ensure a recovered PROCESSING/STARTED intent is safe after crash and a
   terminal intent is never reclaimed.
-- [ ] Log only event, mode, outcome, stable reason and positional provider.
+- [x] Log only event, mode, outcome, stable reason and positional provider.
 
 Run:
 
@@ -378,15 +381,15 @@ git commit -m "feat: run terminal simulation-only execution attempts (#51)"
 - Modify: `tests/executor-architecture.test.ts`
 - Add targeted boundary fixtures/tests if useful
 
-- [ ] Create an exact source/dist allowlist for the new graph.
-- [ ] Permit `simulateTransaction` in exactly one audited file and nowhere
+- [x] Create an exact source/dist allowlist for the new graph.
+- [x] Permit `simulateTransaction` in exactly one audited file and nowhere
   else in the executor graph.
-- [ ] Continue rejecting Keypair, Signer, wallets, secrets, sign/send/submit,
+- [x] Continue rejecting Keypair, Signer, wallets, secrets, sign/send/submit,
   computed acquisition, dynamic import, `src/execution`, paper, listener and
   Raydium.
-- [ ] Test aliases, element access, destructuring, optional calls,
+- [x] Test aliases, element access, destructuring, optional calls,
   `Reflect`/global escape paths and transitive compiled imports.
-- [ ] Assert no serialized message/transaction columns or log keys exist.
+- [x] Assert no serialized message/transaction columns or log keys exist.
 
 Run source and compiled checks:
 
@@ -411,14 +414,14 @@ git commit -m "test: prove simulation executor cannot sign or send (#51)"
 - Modify: `docs/system-overview.html`
 - Modify docs-check expectations where necessary
 
-- [ ] Document both modes, public-key-only setup, SOL funding for BUY/fees/rent,
+- [x] Document both modes, public-key-only setup, SOL funding for BUY/fees/rent,
   base-token funding for SELL, audited ATA creation/WSOL close and secret
   rejection.
-- [ ] State that #49 is skipped/not PASS and #51-E/F/G remain mandatory.
-- [ ] State that a successful simulation-only intent is terminal and can never
+- [x] State that #49 is skipped/not PASS and #51-E/F/G remain mandatory.
+- [x] State that a successful simulation-only intent is terminal and can never
   be signed later.
-- [ ] Explain RPC pinning, genesis, no failover/retry and non-signable artifact.
-- [ ] Keep the HTML Bootstrap document consistent and regenerate no unrelated
+- [x] Explain RPC pinning, genesis, no failover/retry and non-signable artifact.
+- [x] Keep the HTML Bootstrap document consistent and regenerate no unrelated
   content.
 
 Run:

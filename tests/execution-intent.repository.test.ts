@@ -117,7 +117,7 @@ void test('create rejects a contradictory INSERT RETURNING identity', async () =
 
 void test('claim validates a closed purpose and preserves each selected business state', async () => {
   const cases: readonly [ExecutionClaimPurpose, ExecutionIntentStatus, readonly string[]][] = [
-    ['EXECUTE', 'SIMULATED', ['PENDING', 'RETRY_READY', 'PROCESSING', 'SIMULATED']],
+    ['EXECUTE', 'PROCESSING', ['PENDING', 'RETRY_READY', 'PROCESSING']],
     ['CONFIRM', 'SUBMITTED', ['SUBMITTED']],
     ['RECONCILE', 'UNKNOWN_REQUIRES_RECONCILIATION', [
       'SIGNED_NOT_SUBMITTED', 'CONFIRMED', 'RECONCILING',
@@ -158,6 +158,7 @@ void test('claim validates a closed purpose and preserves each selected business
     assert.match(call.text, /ORDER BY\s+(?:intent\.)?requested_at,\s*(?:intent\.)?id/u);
     assert.doesNotMatch(call.text, /gen_random_uuid|uuid_generate/u);
     for (const candidate of statuses) assert.match(call.text, new RegExp(`'${candidate}'`, 'u'));
+    if (purpose === 'EXECUTE') assert.doesNotMatch(call.text, /'SIMULATED'/u);
     const setClause = required(/SET([\s\S]*?)FROM candidate/u.exec(call.text)?.[1]);
     assert.doesNotMatch(setClause, /\bstatus\b|attempt_count|last_reason_code|terminal_at/u);
     if (purpose === 'DRY_RUN') {
@@ -371,14 +372,24 @@ void test('renew and release fence on id, status, UUID token, and strict databas
   const client = new ScriptedClient([
     command('BEGIN'), result([], 0), command('ROLLBACK'),
     command('BEGIN'), result([], 0), command('ROLLBACK'),
-    command('BEGIN'), result([claimRow(draft, 'PROCESSING')], 1), result([], 1), command('COMMIT'),
+    command('BEGIN'), result([claimRow(draft, 'PROCESSING')], 1), result([
+      {
+        ...claimRow(draft, 'PROCESSING'),
+        updated_at_ms: String(NOW_MS + 30_000),
+        lease_expires_at_ms: String(NOW_MS + 35_000),
+      },
+    ], 1), command('COMMIT'),
     command('BEGIN'), result([claimRow(draft, 'PROCESSING')], 1), result([], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
   await expectCode(repository.renew(claim, 5_000), 'INTENT_LEASE_LOST');
   await expectCode(repository.release(claim), 'INTENT_LEASE_LOST');
-  assert.equal(await repository.renew(claim, 5_000), true);
+  assert.deepEqual(await repository.renew(claim, 5_000), Object.freeze({
+    ...claim,
+    intent: Object.freeze({ ...claim.intent, updatedAtMs: NOW_MS + 30_000 }),
+    leaseExpiresAtMs: NOW_MS + 35_000,
+  }));
   assert.equal(await repository.release(claim), true);
 
   for (const call of client.calls.filter((candidate) => /^(?:\s*SELECT|\s*WITH)/u.test(candidate.text))) {
@@ -401,14 +412,49 @@ void test('renew remains available for expired CONFIRM and RECONCILE claims with
     const draft = executionDraft(`renew-${purpose.toLowerCase()}`, { expiresAtMs: NOW_MS - 1 });
     const claim = claimedIntent(draft, status);
     const client = new ScriptedClient([
-      command('BEGIN'), result([claimRow(draft, status)], 1), result([], 1), command('COMMIT'),
+      command('BEGIN'), result([claimRow(draft, status)], 1), result([
+        {
+          ...claimRow(draft, status),
+          updated_at_ms: String(NOW_MS + 30_000),
+          lease_expires_at_ms: String(NOW_MS + 35_000),
+        },
+      ], 1), command('COMMIT'),
     ]);
     const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
-    assert.equal(await repository.renew(claim, 5_000), true);
+    const renewed = await repository.renew(claim, 5_000);
+    assert.equal(renewed.leaseExpiresAtMs, NOW_MS + 35_000);
+    assert.equal(renewed.intent.status, status);
     const renew = required(client.calls.find((call) => call.text.includes('SET lease_expires_at')));
-    assert.doesNotMatch(renew.text, /intent\.expires_at/u);
+    assert.doesNotMatch(renew.text.split('RETURNING')[0] ?? '', /intent\.expires_at/u);
     assert.match(renew.text, /lease_expires_at\s*>\s*statement_timestamp\(\)/u);
+  }
+});
+
+void test('renew rejects a contradictory RETURNING claim instead of issuing an unfenced lease', async () => {
+  const draft = executionDraft('renew-returning');
+  const claim = claimedIntent(draft, 'PROCESSING');
+  for (const overrides of [
+    { lease_owner: 'different-worker' },
+    { lease_token: '00000000-0000-4000-8000-000000000002' },
+    { status: 'SIMULATED', last_reason_code: 'SIMULATION_SUCCEEDED' },
+    { attempt_count: 2 },
+    { state_revision: '1' },
+    { minimum_amount_out_raw: '2' },
+    { lease_expires_at_ms: String(NOW_MS + 29_999) },
+    { lease_expires_at_ms: String(NOW_MS + 35_001) },
+  ]) {
+    const client = new ScriptedClient([
+      command('BEGIN'), result([claimRow(draft, 'PROCESSING')], 1), result([{
+        ...claimRow(draft, 'PROCESSING'),
+        lease_expires_at_ms: String(NOW_MS + 35_000),
+        ...overrides,
+      }], 1), command('ROLLBACK'),
+    ]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    await expectCode(repository.renew(claim, 5_000), 'INVALID_DATA');
+    assert.deepEqual(client.releaseErrors, [false]);
   }
 });
 
@@ -706,16 +752,31 @@ void test('transition rejects a contradictory UPDATE RETURNING status', async ()
 void test('beginAttempt increments the locked processing parent and creates one STARTED row', async () => {
   const draft = executionDraft('begin-attempt');
   const claim = claimedIntent(draft, 'PROCESSING', 0);
+  const refreshed = {
+    ...claimRow(draft, 'PROCESSING', 1), updated_at_ms: String(NOW_MS + 3),
+  };
   const client = new ScriptedClient([
     command('BEGIN'), result([claimRow(draft, 'PROCESSING', 0)], 1),
     result([ledgerRow(0)], 1),
-    result([{ started_at_ms: String(NOW_MS + 2) }], 1), result([], 1), command('COMMIT'),
+    result([{ started_at_ms: String(NOW_MS + 2) }], 1), result([refreshed], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
   const attempt = await repository.beginAttempt(claim);
 
-  assert.deepEqual(attempt, { intentId: draft.id, attemptNumber: 1, startedAtMs: NOW_MS + 2 });
+  assert.deepEqual(attempt, {
+    claim: Object.freeze({
+      intent: Object.freeze({
+        ...claim.intent,
+        attemptCount: 1,
+        updatedAtMs: NOW_MS + 3,
+      }),
+      leaseOwner: claim.leaseOwner,
+      leaseToken: claim.leaseToken,
+      leaseExpiresAtMs: claim.leaseExpiresAtMs,
+    }),
+    attempt: Object.freeze({ intentId: draft.id, attemptNumber: 1, startedAtMs: NOW_MS + 2 }),
+  });
   assert.ok(Object.isFrozen(attempt));
   assert.match(required(client.calls[2]).text, /status\s*=\s*'STARTED'/u);
   assert.match(required(client.calls[2]).text, /FOR UPDATE/u);
@@ -740,7 +801,8 @@ void test('beginAttempt replays the current STARTED attempt after an ambiguous c
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
   assert.deepEqual(await repository.beginAttempt(claim), {
-    intentId: draft.id, attemptNumber: 1, startedAtMs: NOW_MS + 2,
+    claim,
+    attempt: { intentId: draft.id, attemptNumber: 1, startedAtMs: NOW_MS + 2 },
   });
   const replayQuery = required(client.calls[2]);
   assert.match(replayQuery.text, /intent\.id\s*=\s*attempt\.intent_id/u);
@@ -749,6 +811,32 @@ void test('beginAttempt replays the current STARTED attempt after an ambiguous c
   assert.match(replayQuery.text, /intent\.lease_expires_at\s*>\s*statement_timestamp\(\)/u);
   assert.deepEqual(replayQuery.values, [draft.id, 'PROCESSING', UUID, '0']);
   assert.equal(client.calls.some((call) => call.text.includes('INSERT INTO execution_attempts')), false);
+});
+
+void test('beginAttempt rejects every contradictory refreshed fenced claim', async () => {
+  const draft = executionDraft('attempt-refreshed-claim');
+  const claim = claimedIntent(draft, 'PROCESSING', 0);
+  for (const overrides of [
+    { attempt_count: 0 },
+    { state_revision: '1' },
+    { minimum_amount_out_raw: '2' },
+    { lease_owner: 'other-worker' },
+    { lease_token: '00000000-0000-4000-8000-000000000002' },
+    { lease_expires_at_ms: String(NOW_MS + 30_001) },
+    { updated_at_ms: String(NOW_MS - 1) },
+  ]) {
+    const client = new ScriptedClient([
+      command('BEGIN'), result([claimRow(draft, 'PROCESSING', 0)], 1), result([ledgerRow(0)], 1),
+      result([{ started_at_ms: String(NOW_MS + 2) }], 1), result([{
+        ...claimRow(draft, 'PROCESSING', 1), ...overrides,
+      }], 1), command('ROLLBACK'),
+    ]);
+
+    await expectCode(
+      new PostgresExecutionIntentRepository(new ScriptedPool(client)).beginAttempt(claim),
+      'INVALID_DATA',
+    );
+  }
 });
 
 void test('beginAttempt rejects int32 overflow without inserting an attempt', async () => {
@@ -1373,8 +1461,10 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
     const initialClaim = required(concurrent.find((value) => value !== null));
     const processing = await first.transition(initialClaim, transitionInput(initialClaim, 'PROCESSING'));
     let activeClaim = Object.freeze({ ...initialClaim, intent: processing });
-    const attempt = await first.beginAttempt(activeClaim);
-    assert.deepEqual(await first.beginAttempt(activeClaim), attempt);
+    const begun = await first.beginAttempt(activeClaim);
+    activeClaim = begun.claim;
+    const attempt = begun.attempt;
+    assert.deepEqual(await first.beginAttempt(activeClaim), begun);
     activeClaim = Object.freeze({ ...activeClaim, intent: required(await first.read(draft.id)) });
     await expectCode(
       first.transition(activeClaim, transitionInput(activeClaim, 'SIMULATED', attempt.attemptNumber)),
@@ -1496,7 +1586,7 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
     const abandoned = await firstPool.query(`SELECT status,reason_code,
       trunc(EXTRACT(EPOCH FROM completed_at) * 1000)::TEXT AS completed_at_ms
       FROM execution_attempts WHERE intent_id=$1 AND attempt_number=$2`, [
-      activeExpiryDraft.id, activeExpiryAttempt.attemptNumber,
+      activeExpiryDraft.id, activeExpiryAttempt.attempt.attemptNumber,
     ]);
     assert.deepEqual(abandoned.rows, [{
       status: 'ABANDONED', reason_code: 'INTENT_EXPIRED',
@@ -1629,7 +1719,7 @@ void test('real PostgreSQL replays one STARTED attempt under a reclaimed fresh f
       ownerId: 'attempt-worker-b', leaseMs: 60_000, purpose: 'EXECUTE',
     }));
     assert.notEqual(reclaimed.leaseToken, initial.leaseToken);
-    assert.deepEqual(await second.beginAttempt(reclaimed), started);
+    assert.deepEqual((await second.beginAttempt(reclaimed)).attempt, started.attempt);
 
     const counts = await firstPool.query(`SELECT intent.attempt_count,
       COUNT(attempt.*)::INTEGER AS attempts

@@ -1,4 +1,8 @@
 import {
+  AccountLayout,
+  AccountType,
+  ExtensionType,
+  getExtensionTypes,
   MintLayout,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -44,6 +48,23 @@ export class InvalidPumpSwapFeeStateError extends Error {
   }
 }
 
+export class UnsupportedPumpSwapTokenExtensionError extends InvalidPumpSwapFeeStateError {
+  public constructor() {
+    super('Extension Token-2022 non supportée.');
+    this.name = 'UnsupportedPumpSwapTokenExtensionError';
+  }
+}
+
+const ALLOWED_TOKEN_2022_MINT_EXTENSIONS = new Set<ExtensionType>([
+  ExtensionType.MintCloseAuthority,
+  ExtensionType.MetadataPointer,
+  ExtensionType.TokenMetadata,
+  ExtensionType.GroupPointer,
+  ExtensionType.TokenGroup,
+  ExtensionType.GroupMemberPointer,
+  ExtensionType.TokenGroupMember,
+]);
+
 export class PumpSwapFeeStateReader {
   public constructor(private readonly rpc: MarketRpcReader) {}
 
@@ -81,6 +102,9 @@ export function decodePumpSwapFeeState(
   if (mintAccount.data.length < MintLayout.span) {
     throw new InvalidPumpSwapFeeStateError('Compte mint tronqué.');
   }
+  if (pool.baseTokenProgram === 'TOKEN_2022') {
+    validateToken2022Extensions(mintAccount.data);
+  }
   const mint = MintLayout.decode(mintAccount.data);
   const global = PUMP_AMM_SDK.decodeGlobalConfig(accountInfo(globalAccount));
   const decodedPool = decodePumpSwapPoolAccount(poolAccount);
@@ -108,6 +132,24 @@ export function decodePumpSwapFeeState(
     tiers: Object.freeze(tiers),
     observedSlot: globalAccount.slot,
   });
+}
+
+function validateToken2022Extensions(data: Uint8Array): void {
+  if (data.length === MintLayout.span) return;
+  if (data.length <= AccountLayout.span
+    || data[AccountLayout.span] !== AccountType.Mint
+    || !data.slice(MintLayout.span, AccountLayout.span).every((byte) => byte === 0)) {
+    throw new InvalidPumpSwapFeeStateError('Compte mint Token-2022 non canonique.');
+  }
+  let extensions: readonly ExtensionType[];
+  try {
+    extensions = getExtensionTypes(Buffer.from(data).subarray(AccountLayout.span + 1));
+  } catch {
+    throw new InvalidPumpSwapFeeStateError('Extensions Token-2022 invalides.');
+  }
+  if (extensions.some((extension) => !ALLOWED_TOKEN_2022_MINT_EXTENSIONS.has(extension))) {
+    throw new UnsupportedPumpSwapTokenExtensionError();
+  }
 }
 
 function decodeFeeTiers(account: ReadonlyAccountSnapshot): PumpSwapFeeTier[] {

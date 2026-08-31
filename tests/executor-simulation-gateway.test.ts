@@ -61,9 +61,14 @@ const QUOTE_ATA = getAssociatedTokenAddressSync(
 const BLOCKHASH = key(210);
 const SLOT = 123n;
 
-void test('simulates the strict PumpSwap SELL golden plan against its canonical 13-account snapshot', async () => {
+void test('simulates the strict PumpSwap SELL golden plan against its canonical 14-account snapshot', async () => {
   const fixturePlan = await loadPumpSwapSellGoldenPlan();
   const pre = pumpSwapSnapshot(fixturePlan);
+  assert.equal(pre.addresses.length, 14);
+  assert.equal(
+    pre.addresses[13],
+    bondingCurvePda(new PublicKey(fixturePlan.identity.mint)).toBase58(),
+  );
   const snapshotFingerprint = fingerprint(pre);
   const plan = pumpSwapPlanWithFingerprint(fixturePlan, snapshotFingerprint);
   const base = expectedAddress(plan, 'USER_BASE_ATA');
@@ -111,6 +116,58 @@ void test('rejects a reordered PumpSwap canonical snapshot before RPC', async ()
   await rejectsGateway(
     new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
       gatewayInput(provider, plan, reordered), activeSignal(),
+    ),
+    'BUILD',
+    'SIMULATION_EVIDENCE_INVALID',
+  );
+  assert.deepEqual(provider.calls, []);
+});
+
+void test('requires the canonical Pump.fun bonding curve as a non-executable Pump-owned PumpSwap snapshot account', async () => {
+  const fixturePlan = await loadPumpSwapSellGoldenPlan();
+  const canonical = pumpSwapSnapshot(fixturePlan);
+  const curve = requiredAt(canonical.accounts, 13);
+  assert.ok(curve);
+  const invalidAccounts = [
+    null,
+    opaqueAccount(curve.address, PublicKey.default.toBase58()),
+    Object.freeze({ ...curve, executable: true }),
+  ] as const;
+
+  for (const invalidCurve of invalidAccounts) {
+    const accounts = [...canonical.accounts];
+    accounts[13] = invalidCurve;
+    const snapshot = Object.freeze({ ...canonical, accounts: Object.freeze(accounts) });
+    const plan = pumpSwapPlanWithFingerprint(fixturePlan, fingerprint(snapshot));
+    const provider = new ScriptedGateway(snapshot, successfulSimulation(snapshot));
+
+    await rejectsGateway(
+      new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+        gatewayInput(provider, plan, snapshot), activeSignal(),
+      ),
+      'BUILD',
+      'SIMULATION_EVIDENCE_INVALID',
+    );
+    assert.deepEqual(provider.calls, []);
+  }
+});
+
+void test('binds the PumpSwap snapshot fingerprint to the canonical Pump.fun bonding curve account', async () => {
+  const fixturePlan = await loadPumpSwapSellGoldenPlan();
+  const canonical = pumpSwapSnapshot(fixturePlan);
+  const canonicalFingerprint = fingerprint(canonical);
+  const accounts = [...canonical.accounts];
+  const curve = requiredAt(accounts, 13);
+  assert.ok(curve);
+  accounts[13] = Object.freeze({ ...curve, lamports: curve.lamports + 1n });
+  const changed = Object.freeze({ ...canonical, accounts: Object.freeze(accounts) });
+  assert.notEqual(fingerprint(changed), canonicalFingerprint);
+  const plan = pumpSwapPlanWithFingerprint(fixturePlan, canonicalFingerprint);
+  const provider = new ScriptedGateway(changed, successfulSimulation(changed));
+
+  await rejectsGateway(
+    new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(
+      gatewayInput(provider, plan, changed), activeSignal(),
     ),
     'BUILD',
     'SIMULATION_EVIDENCE_INVALID',
@@ -324,7 +381,7 @@ void test('retains only partial hashes on absent or oversized fee and never simu
   }
 });
 
-void test('maps a simulated program failure without exposing returned logs or transaction bytes', async () => {
+void test('maps a simulated program failure with bounded evidence but no raw logs or transaction bytes', async () => {
   const pre = pumpFunSnapshot([
     systemAccount(PAYER, 10_000_000n),
     tokenAccount(BASE_ATA, MINT, PAYER, 1_000n, 2_039_280n, false),
@@ -334,14 +391,25 @@ void test('maps a simulated program failure without exposing returned logs or tr
   const provider = new ScriptedGateway(pre, Object.freeze({
     providerId: 'primary', contextSlot: 125n, failureKind: 'PROGRAM_ERROR' as const,
     logs: Object.freeze(['private program log']), unitsConsumed: 25_000n,
-    accounts: Object.freeze([null, null, null]), innerInstructions: Object.freeze([]),
-  }));
+    accounts: Object.freeze([
+      systemAccount(PAYER, 9_995_000n),
+      tokenAccount(BASE_ATA, MINT, PAYER, 0n, 2_039_280n, false),
+      tokenAccount(QUOTE_ATA, NATIVE_MINT.toBase58(), PAYER, 50n, 2_039_330n, true),
+    ]),
+    innerInstructions: Object.freeze([]),
+  }), 5_000n);
   const error = await rejectsGateway(
     new SolanaSimulationGateway(provider, provider.receiptAuthority, limits()).simulate(gatewayInput(provider, plan, pre), activeSignal()),
     'SIMULATION',
     'SIMULATION_PROGRAM_ERROR',
   );
-  assert.equal(error.evidence.logsFingerprint, null);
+  assert.equal(error.evidence.simulationSlot, 125n);
+  assert.equal(error.evidence.unitsConsumed, 25_000n);
+  assert.equal(error.evidence.simulatedFeePayerLamportDebit, 5_000n);
+  assert.equal(error.evidence.simulatedBaseDeltaRaw, -1_000n);
+  assert.equal(error.evidence.simulatedQuoteDeltaRaw, 0n);
+  assert.match(error.evidence.logsFingerprint ?? '', /^[0-9a-f]{64}$/u);
+  assert.equal(error.evidence.logsLineCount, 1);
   assert.doesNotMatch(JSON.stringify(error.evidence), /private|transaction|instruction/iu);
 });
 
@@ -544,13 +612,14 @@ function pumpSwapSnapshot(plan: UnsignedBuildPlanV1): ExecutionAccountSnapshot {
     NATIVE_MINT, new PublicKey(volume), true, TOKEN_PROGRAM_ID,
   ).toBase58();
   const poolV2 = poolV2Pda(new PublicKey(plan.identity.mint)).toBase58();
+  const curve = bondingCurvePda(new PublicKey(plan.identity.mint)).toBase58();
   assert.equal(expectedAddress(plan, 'USER_VOLUME_ACCUMULATOR'), volume);
   assert.equal(expectedAddress(plan, 'USER_VOLUME_QUOTE_ATA'), volumeQuote);
   assert.equal(expectedAddress(plan, 'POOL_V2'), poolV2);
   const addresses = Object.freeze([
     GLOBAL_CONFIG_PDA.toBase58(), PUMP_AMM_FEE_CONFIG_PDA.toBase58(), pool,
     plan.identity.mint, NATIVE_MINT.toBase58(), poolBase, poolQuote, plan.feePayer,
-    base, quote, volume, volumeQuote, poolV2,
+    base, quote, volume, volumeQuote, poolV2, curve,
   ]);
   const accounts = Object.freeze([
     opaqueAccount(requiredAt(addresses, 0), PUMP_AMM_PROGRAM_ID.toBase58()),
@@ -566,6 +635,7 @@ function pumpSwapSnapshot(plan: UnsignedBuildPlanV1): ExecutionAccountSnapshot {
     opaqueAccount(volume, PUMP_AMM_PROGRAM_ID.toBase58()),
     opaqueAccount(volumeQuote, TOKEN_PROGRAM_ID.toBase58()),
     opaqueAccount(poolV2, PUMP_AMM_PROGRAM_ID.toBase58()),
+    opaqueAccount(curve, PUMP_PROGRAM_ID.toBase58()),
   ]);
   return Object.freeze({ providerId: 'primary', slot: plan.identity.snapshotSlot, addresses, accounts });
 }

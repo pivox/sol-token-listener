@@ -1,6 +1,6 @@
 # Exécuteur quote, build et simulation V1 — conception #51-D
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.0.6
 
 **Date :** 2026-08-31
 
@@ -12,6 +12,13 @@
 
 ## Historique des versions
 
+- **1.0.6 — 2026-08-31 :** documente l'incompatibilité ESM du SDK Pump.fun
+  1.36.0 sur la ligne Node 22 supportée et ferme son unique bridge CommonJS à
+  un fichier, une cible littérale et une surface d'exports auditée ; PumpSwap
+  reste importé statiquement en ESM.
+- **1.0.5 — 2026-08-31 :** ferme la découverte de venue non autoritative,
+  impose la relecture de la bonding curve dans la snapshot finale PumpSwap et
+  exige qu'un renouvellement de lease retourne le claim fraîchement fenced.
 - **1.0.4 — 2026-08-31 :** versionne la preuve de politique éphémère qui lie
   le plan inspecté à la snapshot causale, aux modes Pump, aux listes actives de
   recipients et aux branches exactes de préparation des comptes.
@@ -138,7 +145,26 @@ Il interdit dans les sources **et** dans `dist` :
 - toute méthode nommée `send*`, `submit*` ou équivalent calculé ;
 - import de l'ancien `src/execution`, du builder Raydium ou du listener ;
 - import dynamique, `require`, `eval`, `Function` ou acquisition réflexive
-  d'une capacité interdite.
+  d'une capacité interdite, sauf le bridge CommonJS Pump.fun fermé décrit
+  ci-dessous.
+
+`@pump-fun/pump-sdk` 1.36.0 publie une condition ESM qui échoue encore sur la
+ligne Node 22 supportée à cause d'une dépendance Anchor/CommonJS transitive.
+L'unique exception est
+`src/launchpads/pumpfun/official-sdk.ts` : elle importe `createRequire`
+directement depuis `node:module`, l'appelle exactement sous la forme
+`createRequire(import.meta.url)('@pump-fun/pump-sdk')` et ne réexporte que la
+surface codec/build nominativement auditée. Toute autre cible, variable,
+alias, récupération dynamique ou occurrence de `createRequire` reste
+interdite dans les sources et dans `dist`. Le bridge PumpSwap utilise des
+exports ESM statiques et ne bénéficie d'aucune exception.
+
+Le scan de capacités couvre le graphe first-party source et compilé ; il ne
+prétend pas que les bundles npm officiels ne contiennent aucun symbole de
+wallet ou signer. La frontière est établie par les versions exactes du lock,
+la surface nominative fermée des deux bridges, l'absence de binding/call
+first-party de signature ou d'envoi, puis l'inspection terminale de chaque
+instruction avant l'unique simulation.
 
 `simulateTransaction` n'est autorisé que dans un adaptateur audité. Le port RPC
 n'expose aucune méthode d'envoi. Une `Connection` complète ne traverse jamais
@@ -155,6 +181,7 @@ EXECUTOR_RPC_PROVIDER_ID=primary
 SOLANA_HTTP_RPC_URL=
 SOLANA_EXPECTED_GENESIS_HASH=
 EXECUTOR_QUOTE_MAX_AGE_MS=3000
+EXECUTOR_SLIPPAGE_BPS=500
 EXECUTOR_SNAPSHOT_MAX_SLOT_LAG=8
 EXECUTOR_MAX_COMPUTE_UNITS=300000
 EXECUTOR_MAX_FEE_LAMPORTS=100000
@@ -169,6 +196,19 @@ LIVE_TRADING_ENABLED=false
 Les seuils sont des entiers décimaux canoniques, bornés et fingerprintés. Les
 valeurs exactes ci-dessus sont des valeurs de développement, pas une validation
 Mainnet. Une valeur privée non vide reste rejetée quel que soit le mode.
+
+En `dry-run`, les variables publiques propres à la simulation sont ignorées et
+aucune dépendance RPC n'est construite ; l'objet de configuration historique à
+six champs reste identique. En `simulation-only`, tous les champs ci-dessus
+sont obligatoires sauf les valeurs possédant un défaut explicite. L'allowlist
+V1 est exactement la liste singleton WSOL, le priority fee est exactement zéro
+et le budget doit permettre les six appels du succès avec découverte. Les
+plafonds financiers et le slippage sont parsés en `bigint`.
+Les bornes V1 sont : lag `0..128` slots, compute `1..1_400_000`, fee estimée
+`0..10_000_000` lamports, débit fee payer `0..10_000_000_000` lamports et
+budget `6..16` appels. Le provider ID est un identifiant positionnel ASCII de
+64 caractères au plus ; l'URL HTTP(S) ne peut contenir ni espace périphérique
+ni fragment.
 
 `EXECUTOR_PUBLIC_KEY` est une adresse publique uniquement. L'URL RPC peut
 contenir un credential opérateur mais n'est jamais journalisée, persistée ou
@@ -200,6 +240,16 @@ feeContextSlot >= snapshotSlot
 ```
 
 Un slot RPC est converti en `bigint` immédiatement.
+
+Une découverte préalable peut lire uniquement la bonding curve et le mint
+afin de calculer la liste d'adresses canonique. Elle reste sur le même endpoint
+et le même budget provider, ne produit aucune preuve persistable et ne fournit
+aucun champ de quote ou de build. La snapshot causale finale relit toutes les
+données utilisées. Pour PumpSwap elle contient aussi la bonding curve canonique
+Pump.fun, qui doit être présente, détenue par le programme officiel et encore
+`complete=true` au slot final ; un changement entre découverte et relecture
+échoue fermé. La quote, le plan, le reçu et l'artefact dépendent uniquement de
+cette snapshot finale.
 
 Le budget compte chaque appel dispatché, succès ou échec. Son usage et sa
 limite sont persistés. La réservation durable de quota et la priorité des
@@ -249,6 +299,14 @@ snapshotFingerprint / quoteFingerprint
 Tous les montants, réserves, frais, bps et slots sont des `bigint`. Les dates
 sont des entiers sûrs en millisecondes. Aucun montant financier n'est converti
 en float JavaScript.
+
+Le DTO executor est construit par un décodeur fermé depuis l'objet exact
+`ExecutionAccountSnapshot` de la session. Le décodeur transmet directement les
+structures de build validées et n'accepte ni snapshot, fingerprint, policy,
+réserves ni frais fournis par l'appelant. `observedAtMs` est capturé juste après
+la lecture de la snapshot finale et `expiresAtMs = observedAtMs +
+EXECUTOR_QUOTE_MAX_AGE_MS`. La fraîcheur est inclusive (`now <= expiresAtMs`)
+et est revérifiée immédiatement avant le build puis avant la simulation.
 
 La quote vérifie :
 
@@ -523,11 +581,31 @@ Le résultat est appliqué par une opération PostgreSQL atomique qui :
   `purge_after=commit_at + 4 heures`. Cette égalité est la preuve SQL qu'aucun
   effet on-chain n'était possible dans un graphe sans méthode d'envoi.
 
+Chaque renouvellement de lease retourne un nouveau `ClaimedExecutionIntent`
+validé, avec la même identité owner/token/intention et la nouvelle expiration
+exacte renvoyée par PostgreSQL. Le worker remplace obligatoirement son claim
+local avant toute opération suivante et remet ce dernier claim au commit
+atomique ; un booléen ou une expiration recalculée côté application sont
+interdits.
+La séquence est fermée et ordonnée : exactement une fois avant la snapshot
+causale finale, exactement une fois avant la simulation, puis exactement une
+fois avant le commit. Une frontière sautée, répétée ou inversée échoue avant
+l'opération aval. `beginAttempt` retourne également le claim frais qui porte
+le nouvel `attemptCount`; conserver le claim antérieur à l'incrément est
+interdit.
+
 Une perte d'ACK produit `COMMIT_OUTCOME_UNKNOWN`. Le worker lit l'artefact exact :
 
 - même identité et mêmes fingerprints : `COMMIT_RECOVERED` ;
 - absent : la tentative reste récupérable après expiration du lease ;
 - différent : `ARTIFACT_CONFLICT`, fail-closed.
+
+Le claim `EXECUTE` de cette phase ne sélectionne que `PENDING`, `RETRY_READY`
+et `PROCESSING`. `SIMULATED` est un état transitoire interne au commit atomique
+de succès et n'est jamais réclamable par ce worker. Après un abort authentifié
+avant le dispatch du commit, aucun artefact terminal n'est créé et le lease est
+laissé expirer ; après dispatch, le résultat ou la récupération durable du
+repository reste autoritaire.
 
 Avant le commit, un crash ne crée aucun effet on-chain et peut refaire quote,
 build et simulation. Après le commit, l'intention terminale n'est plus
@@ -578,6 +656,12 @@ OPERATION_ABORTED
 
 Un message dynamique de provider n'est jamais utilisé comme code, preuve ou
 log.
+
+Les logs du mode sont fermés aux événements `executor.simulation_recorded` et
+`executor.simulation_recovered`, au mode `simulation-only`, à l'outcome
+`SIMULATION_SUCCEEDED` ou `SIMULATION_FAILED`, au reason code métier stable et
+au `providerId` positionnel. URL, mint, montants, bytes, logs RPC et message
+d'erreur restent exclus.
 
 La traduction terminale est normative :
 

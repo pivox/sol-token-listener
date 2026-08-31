@@ -95,6 +95,13 @@ export class ExecutionSimulationGatewayError extends Error {
   }
 
 }
+
+export function isInternalExecutionSimulationGatewayError(
+  error: unknown,
+): error is ExecutionSimulationGatewayError {
+  return error instanceof ExecutionSimulationGatewayError
+    && INTERNAL_GATEWAY_ERRORS.has(error);
+}
 class SimulationOperationAbortedError extends Error {}
 
 interface ValidatedLimits {
@@ -218,6 +225,17 @@ export class SolanaSimulationGateway implements ExecutionSimulationGateway {
         snapshot.providerId, blockhash.contextSlot,
       );
       if (rawSimulation.failureKind === 'PROGRAM_ERROR') {
+        partial = Object.freeze({
+          ...partial,
+          ...programFailureEvidence(
+            simulation,
+            snapshot,
+            requestedAccounts,
+            inspected,
+            fee.feeLamports,
+            this.limits,
+          ),
+        });
         throw failure('SIMULATION', 'SIMULATION_PROGRAM_ERROR', partial);
       }
       if (rawSimulation.failureKind !== null) throw failure('SIMULATION', 'RPC_RESPONSE_INVALID', partial);
@@ -251,6 +269,87 @@ export class SolanaSimulationGateway implements ExecutionSimulationGateway {
       throw failure(stage, 'RPC_RESPONSE_INVALID', partial);
     }
   }
+}
+
+function programFailureEvidence(
+  value: ExecutionUnsignedSimulationResult,
+  snapshot: ValidatedSnapshot,
+  requested: RequiredSimulationAccounts,
+  inspected: Readonly<{
+    readonly identity: UnsignedBuildIdentityV1;
+    readonly allowsMissingUserBaseAta: boolean;
+  }>,
+  estimatedFee: bigint,
+  limits: ValidatedLimits,
+): Readonly<{
+  readonly simulationSlot: bigint;
+  readonly simulatedFeePayerLamportDebit: bigint | null;
+  readonly unitsConsumed: bigint | null;
+  readonly simulatedBaseDeltaRaw: bigint | null;
+  readonly simulatedQuoteDeltaRaw: bigint | null;
+  readonly logsFingerprint: string | null;
+  readonly logsLineCount: number | null;
+}> {
+  const result = record(value, RESULT_KEYS);
+  if (!u64(result.contextSlot)) rejectEvidence();
+  const simulationSlot = result.contextSlot;
+  const units = result.unitsConsumed;
+  if (units !== null && (!u64(units) || units > limits.maxComputeUnits)) rejectEvidence();
+  const logs = result.logs === null ? null : logsFrom(result.logs);
+  if (result.accounts === null) {
+    return Object.freeze({
+      simulationSlot,
+      simulatedFeePayerLamportDebit: null,
+      unitsConsumed: units,
+      simulatedBaseDeltaRaw: null,
+      simulatedQuoteDeltaRaw: null,
+      logsFingerprint: logs === null ? null
+        : sha256(lengthPrefixedUtf8(['execution-simulation-logs-v1', ...logs])),
+      logsLineCount: logs?.length ?? null,
+    });
+  }
+  const accounts = accountResultFrom(result.accounts, requested);
+  const prePayer = lookupAccount(snapshot, requested.feePayer);
+  const preBase = lookupAccount(snapshot, requested.base);
+  const preQuote = lookupAccount(snapshot, requested.quote);
+  const postPayer = requiredAccount(accounts, 0);
+  const postBase = requiredAccount(accounts, 1);
+  const postQuote = requiredAccount(accounts, 2);
+  if (prePayer === null || postPayer === null
+    || (preBase === null && !inspected.allowsMissingUserBaseAta)) rejectEvidence();
+  validateSystemPayer(prePayer, requested.feePayer);
+  validateSystemPayer(postPayer, requested.feePayer);
+  const payerDebit = prePayer.lamports > postPayer.lamports
+    ? prePayer.lamports - postPayer.lamports : 0n;
+  if (payerDebit > limits.maxFeePayerLamportDebit) rejectEvidence();
+  const baseProgram = inspected.identity.baseTokenProgram === 'SPL_TOKEN'
+    ? TOKEN_PROGRAM_ID.toBase58() : TOKEN_2022_PROGRAM_ID.toBase58();
+  const baseDelta = tokenAmount(
+    postBase, requested.base, inspected.identity.mint,
+    requested.feePayer, baseProgram, false,
+  ) - tokenAmount(
+    preBase, requested.base, inspected.identity.mint,
+    requested.feePayer, baseProgram, false,
+  );
+  void tokenAmount(
+    preQuote, requested.quote, NATIVE_MINT.toBase58(),
+    requested.feePayer, TOKEN_PROGRAM_ID.toBase58(), true,
+  );
+  void tokenAmount(
+    postQuote, requested.quote, NATIVE_MINT.toBase58(),
+    requested.feePayer, TOKEN_PROGRAM_ID.toBase58(), true,
+  );
+  return Object.freeze({
+    simulationSlot,
+    simulatedFeePayerLamportDebit: payerDebit,
+    unitsConsumed: units,
+    simulatedBaseDeltaRaw: baseDelta,
+    simulatedQuoteDeltaRaw: liquidLamports(postPayer, postBase, postQuote)
+      - liquidLamports(prePayer, preBase, preQuote) + estimatedFee,
+    logsFingerprint: logs === null ? null
+      : sha256(lengthPrefixedUtf8(['execution-simulation-logs-v1', ...logs])),
+    logsLineCount: logs?.length ?? null,
+  });
 }
 
 function simulationEvidence(
@@ -420,6 +519,7 @@ function validatePumpSwapSnapshot(
       NATIVE_MINT, userVolumeAccumulatorPda(new PublicKey(inspected.feePayer)), true, TOKEN_PROGRAM_ID,
     ).toBase58(),
     poolV2Pda(new PublicKey(inspected.identity.mint)).toBase58(),
+    bondingCurvePda(new PublicKey(inspected.identity.mint)).toBase58(),
   ];
   if (snapshot.addresses.length !== expected.length
     || expected.some((address, index) => snapshot.addresses[index] !== address)
@@ -433,6 +533,9 @@ function validatePumpSwapSnapshot(
   if ((inspected.requiresPumpSwapCashback
       && (snapshot.accounts[10] === null || snapshot.accounts[11] === null))
     || (inspected.requiresPumpSwapPoolV2 && snapshot.accounts[12] === null)) rejectEvidence();
+  const bondingCurve = snapshot.accounts[13];
+  if (bondingCurve?.owner !== PUMP_PROGRAM_ID.toBase58()
+    || bondingCurve.executable) rejectEvidence();
 }
 
 function accountResultFrom(value: unknown, requested: RequiredSimulationAccounts): readonly (ExecutionRpcAccount | null)[] {
