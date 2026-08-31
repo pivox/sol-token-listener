@@ -154,6 +154,11 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly paperPositions: number;
   readonly executionDryRunAssessments: number;
   readonly executionSimulationArtifacts: number;
+  readonly executionControlEvents: number;
+  readonly executionActivationEvents: number;
+  readonly executionActivationArmaments: number;
+  readonly executionOperatorAuthorizations: number;
+  readonly executionSafetyQualifications: number;
   readonly executionIntentTransitions: number;
   readonly executionAttempts: number;
   readonly executionIntents: number;
@@ -414,6 +419,75 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       || !Number.isFinite(executionIntentCutoff.getTime())) {
       throw new Error('PostgreSQL returned an invalid execution intent purge cutoff.');
     }
+    const executionControlEvents = await client.query(
+      `DELETE FROM execution_control_events event
+       WHERE event.event_id IN (
+         SELECT candidate.event_id FROM execution_control_events candidate
+         WHERE candidate.occurred_at + INTERVAL '4 hours' <= $1::TIMESTAMPTZ
+         ORDER BY candidate.event_id LIMIT 1000 FOR UPDATE
+       )`,
+      [executionIntentCutoff],
+    );
+    const executionActivationEvents = await client.query(
+      `DELETE FROM execution_activation_events event
+       WHERE event.event_id IN (
+         SELECT candidate.event_id FROM execution_activation_events candidate
+         JOIN execution_activation_armaments armament
+           ON armament.armament_id=candidate.armament_id
+         WHERE armament.state IN ('CONSUMED','REVOKED','EXPIRED')
+           AND armament.purge_after <= $1::TIMESTAMPTZ
+         ORDER BY candidate.event_id LIMIT 1000 FOR UPDATE OF candidate
+       )`,
+      [executionIntentCutoff],
+    );
+    const executionActivationArmaments = await client.query(
+      `DELETE FROM execution_activation_armaments armament
+       WHERE armament.armament_id IN (
+         SELECT candidate.armament_id FROM execution_activation_armaments candidate
+         WHERE candidate.state IN ('CONSUMED','REVOKED','EXPIRED')
+           AND candidate.purge_after <= $1::TIMESTAMPTZ
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_activation_events event
+             WHERE event.armament_id=candidate.armament_id
+           )
+         ORDER BY candidate.armament_id LIMIT 1000 FOR UPDATE
+       )`,
+      [executionIntentCutoff],
+    );
+    const executionOperatorAuthorizations = await client.query(
+      `DELETE FROM execution_operator_authorizations operator_auth
+       WHERE operator_auth.authorization_id IN (
+         SELECT candidate.authorization_id FROM execution_operator_authorizations candidate
+         WHERE candidate.purge_after <= $1::TIMESTAMPTZ
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_activation_armaments armament
+             WHERE armament.authorization_id=candidate.authorization_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_control_events event
+             WHERE event.authorization_id=candidate.authorization_id
+           )
+         ORDER BY candidate.authorization_id LIMIT 1000 FOR UPDATE
+       )`,
+      [executionIntentCutoff],
+    );
+    const executionSafetyQualifications = await client.query(
+      `DELETE FROM execution_safety_qualifications qualification
+       WHERE qualification.qualification_id IN (
+         SELECT candidate.qualification_id FROM execution_safety_qualifications candidate
+         WHERE candidate.purge_after <= $1::TIMESTAMPTZ
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_activation_armaments armament
+             WHERE armament.qualification_id=candidate.qualification_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_control_events event
+             WHERE event.qualification_id=candidate.qualification_id
+           )
+         ORDER BY candidate.qualification_id LIMIT 1000 FOR UPDATE
+       )`,
+      [executionIntentCutoff],
+    );
     const executionRiskRateLimitEvents = await client.query(
       `DELETE FROM execution_provider_rate_limit_events event
        WHERE event.event_id IN (
@@ -918,6 +992,11 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       paperPositions: paperPositions.rowCount ?? 0,
       executionDryRunAssessments: executionDryRunAssessments.rowCount ?? 0,
       executionSimulationArtifacts: executionSimulationArtifacts.rowCount ?? 0,
+      executionControlEvents: executionControlEvents.rowCount ?? 0,
+      executionActivationEvents: executionActivationEvents.rowCount ?? 0,
+      executionActivationArmaments: executionActivationArmaments.rowCount ?? 0,
+      executionOperatorAuthorizations: executionOperatorAuthorizations.rowCount ?? 0,
+      executionSafetyQualifications: executionSafetyQualifications.rowCount ?? 0,
       executionIntentTransitions: executionIntentTransitions.rowCount ?? 0,
       executionAttempts: executionAttempts.rowCount ?? 0,
       executionIntents: executionIntents.rowCount ?? 0,

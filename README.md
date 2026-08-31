@@ -39,10 +39,13 @@ une preuve non signée sans soumission. #51-E livre désormais uniquement la
 fondation domaine/PostgreSQL de sizing, quota provider, admission, réservation,
 réconciliation, compteur de pannes et rétention. Aucun script ni processus
 courant ne compose ou n'appelle `admitBuy`, `recordFault`, `reconcile` ou
-`recordReconciledSuccess` : cette fondation reste inerte. #51-F (preflight et
-armement manuel) et #51-G (signature/soumission sous gates compensatoires)
-restent obligatoires avant toute transaction réelle. Les seuls modes du
-listener restent `observe` et `paper`.
+`recordReconciledSuccess` : cette fondation reste inerte. #51-F livre désormais
+un preflight durable, des arrêts opérateur et un armement manuel strictement
+inerte. Les gates du preflight doivent être fournis dans une enveloppe Ed25519
+signée et liée au déploiement. Ses six commandes `live:*` refusent les secrets et ne sont importées
+par aucun worker. #51-G (signature/soumission sous gates compensatoires) reste
+obligatoire avant toute transaction réelle. Les seuls modes du listener
+restent `observe` et `paper`.
 
 Configuration minimale de la stratégie de création, toujours simulée :
 
@@ -217,9 +220,11 @@ applicables. Aucun secret n'est accepté et aucun `signTransaction`,
 
 La validation terrain #49 des 50 positions Mainnet a été sautée : son statut
 reste explicitement `NON_EXECUTED` et `NON_VALIDATED`, jamais `PASS`. La
-fondation #51-E ne change pas ce statut et n'active aucun runtime. #51-F
-(preflight et armement manuel), puis #51-G (signature/soumission sous gates
-compensatoires), demeurent obligatoires avant le moindre trade réel.
+fondation #51-E et le preflight inerte #51-F ne changent pas ce statut et
+n'activent aucun runtime de soumission. #51-G (signature/soumission sous gates
+compensatoires) demeure obligatoire avant le moindre trade réel. Le
+[runbook #51-F](docs/operations/executor-preflight.md) décrit les preuves,
+arrêts et commandes locales.
 
 ## Console frontend indépendante
 
@@ -653,6 +658,7 @@ listener est activé et n’est jamais exposé par cette santé.
 - [Architecture Pump.fun V1](docs/architecture/pumpfun-v1.md)
 - [Contrat API V1](docs/api/v1.md)
 - [Qualification RPC](docs/operations/rpc-qualification.md)
+- [Preflight executor inerte](docs/operations/executor-preflight.md)
 - [Guide de déploiement](docs/operations/deployment.md)
 - [Manifeste IDL officiel](vendor/pumpfun/idl/manifest.json)
 

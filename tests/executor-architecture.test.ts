@@ -7,6 +7,7 @@ import ts from 'typescript';
 import {
   executorBoundaryViolations,
   literalRuntimeModuleSpecifiers,
+  operationsFoundationBoundaryViolations,
   riskFoundationBoundaryViolations,
   simulationOnlyExecutorBoundaryViolations,
 } from './helpers/execution-boundary.js';
@@ -20,6 +21,23 @@ const EXPECTED_DRY_RUN_NODE_BUILTINS = Object.freeze([
   'node:url',
   'node:util/types',
 ]);
+
+void test('source and compiled operations graphs remain inert and non-signing', async () => {
+  for (const entry of [
+    resolve(repositoryRoot, 'src/executor-operations/main.ts'),
+    resolve(repositoryRoot, 'dist/src/executor-operations/main.js'),
+  ]) {
+    await access(entry);
+    const graph = await readGraph(entry);
+    assert.ok(graph.size >= 8, `operations graph unexpectedly small: ${relative(repositoryRoot, entry)}`);
+    const violations: string[] = [];
+    for (const [path, source] of graph) {
+      violations.push(...operationsFoundationBoundaryViolations(source, path, repositoryRoot));
+    }
+    assert.deepEqual(violations, [],
+      `unsafe operations graph from ${relative(repositoryRoot, entry)}`);
+  }
+});
 
 void test('source and compiled dry-run worker graphs stay inside the strict dry-run allowlist', async () => {
   const entries = [
@@ -546,7 +564,7 @@ void test('risk foundation source and dist graphs remain inert and closed', asyn
   );
 });
 
-void test('no command or environment setting activates the risk foundation', async () => {
+void test('only the six inert operations commands expose live-prefixed operator vocabulary', async () => {
   const [main, packageText, environment] = await Promise.all([
     readFile(resolve(repositoryRoot, 'src/executor/main.ts'), 'utf8'),
     readFile(resolve(repositoryRoot, 'package.json'), 'utf8'),
@@ -554,7 +572,17 @@ void test('no command or environment setting activates the risk foundation', asy
   ]);
   assert.doesNotMatch(main, /executor-risk|execution-risk\.repository|admitBuy|reconcile/iu);
   const scripts = (JSON.parse(packageText) as { scripts?: Record<string, unknown> }).scripts ?? {};
-  assert.equal(Object.keys(scripts).some((name) => /risk|live/iu.test(name)), false);
+  assert.equal(Object.keys(scripts).some((name) => /risk/iu.test(name)), false);
+  const liveScripts = Object.entries(scripts).filter(([name]) => name.startsWith('live:'));
+  assert.deepEqual(liveScripts.map(([name]) => name).sort(), [
+    'live:arm', 'live:kill-switch', 'live:preflight',
+    'live:report', 'live:resume', 'live:status',
+  ]);
+  for (const [, command] of liveScripts) {
+    assert.equal(typeof command, 'string');
+    assert.match(command as string, /dist\/src\/executor-operations\/main\.js/u);
+    assert.doesNotMatch(command as string, /dist\/src\/executor\/main\.js/u);
+  }
   assert.doesNotMatch(environment, /^EXECUTOR_(?:RISK|ADMISSION|RECONCILIATION|LIVE)_[A-Z_]*=/gmu);
   assert.doesNotMatch(environment, /^EXECUTOR_MODE=(?:risk|live|armed)$/gmu);
 });
@@ -567,7 +595,7 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
   ]);
 
   const executorEnvironment = Object.fromEntries(
-    [...environment.matchAll(/^(EXECUTOR_[A-Z_]+|LIVE_TRADING_ENABLED)=(.*)$/gmu)]
+    [...environment.matchAll(/^(EXECUTOR_[A-Z0-9_]+|LIVE_TRADING_ENABLED)=(.*)$/gmu)]
       .map((match) => [match[1] ?? '', match[2] ?? '']),
   );
   assert.deepEqual(executorEnvironment, {
@@ -578,6 +606,14 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
     EXECUTOR_SHUTDOWN_GRACE_MS: '10000',
     EXECUTOR_PUBLIC_KEY: '',
     EXECUTOR_RPC_PROVIDER_ID: 'primary',
+    EXECUTOR_WALLET_GENERATION_ID: '',
+    EXECUTOR_BUILD_HASH: '',
+    EXECUTOR_CONFIGURATION_FINGERPRINT: '',
+    EXECUTOR_STRATEGY_FINGERPRINT: '',
+    EXECUTOR_ACTIVATION_PHASE: 'CANARY',
+    EXECUTOR_OPERATOR_ID: '',
+    EXECUTOR_PREFLIGHT_EVIDENCE_PATH: '',
+    EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: '',
     EXECUTOR_QUOTE_MAX_AGE_MS: '3000',
     EXECUTOR_SLIPPAGE_BPS: '500',
     EXECUTOR_SNAPSHOT_MAX_SLOT_LAG: '8',
