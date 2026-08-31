@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.6.0
+**Version de spécification :** 1.6.1
 
 **Date :** 2026-08-31
 
@@ -15,6 +15,10 @@ inerte des intentions d'exécution), #51-C (processus executor dry-run), #51-D
 
 ## Historique des versions
 
+- **1.6.1 — 2026-08-31 :** rend les périodes provider ordonnables et
+  vérifiables en ajoutant leurs bornes UTC milliseconde à chaque snapshot
+  d'usage #51-E ; un identifiant opaque seul ne peut pas prouver qu'une période
+  n'a pas régressé.
 - **1.6.0 — 2026-08-31 :** spécifie #51-E comme une fondation inerte : policy
   de sizing en entiers, admission BUY transactionnelle, réservations
   d'exposition, quota provider pessimiste, observations wallet finalisées,

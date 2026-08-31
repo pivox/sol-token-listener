@@ -21,7 +21,7 @@ repository but are not wired into `src/executor/main.ts`.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-risk-reconciliation-design.md`
-version 1.0.0 and parent specification version 1.6.0.
+version 1.0.1 and parent specification version 1.6.1.
 
 ---
 
@@ -166,6 +166,7 @@ const result = evaluateProviderQuota({
   policy,
   snapshot: createProviderUsageSnapshot({
     providerId: 'primary', planId: 'plan-v1', billingPeriodId: '2026-08',
+    billingPeriodStartedAtMs: 0, billingPeriodEndsAtMs: 2_678_400_000,
     limitUnits: 1_000n, usedUnits: 800n, measuredAtMs: 1_000,
     expiresAtMs: 301_000, provenance: 'AUTHORITATIVE_PROBE',
   }),

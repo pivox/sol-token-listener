@@ -1,8 +1,8 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.0.1
 
-**Version de la spécification parente :** 1.6.0
+**Version de la spécification parente :** 1.6.1
 
 **Date :** 2026-08-31
 
@@ -11,6 +11,13 @@
 **Issue parente :** #51
 
 **Dépendance :** #51-D fusionnée par la PR #72
+
+## Historique des versions
+
+- **1.0.1 — 2026-08-31 :** ajoute les bornes temporelles exactes de la période
+  de facturation provider afin de détecter une régression sans interpréter son
+  identifiant opaque.
+- **1.0.0 — 2026-08-31 :** conception initiale de la fondation #51-E.
 
 ## 1. Décision
 
@@ -241,6 +248,8 @@ différent échoue `INVALID_DATA`; aucune insertion partielle n'est conservée.
 provider_id
 plan_id
 billing_period_id
+billing_period_started_at
+billing_period_ends_at
 limit_units
 used_units
 measured_at
@@ -252,7 +261,10 @@ fingerprint
 Le TTL est compris entre 30 et 900 secondes, 300 par défaut futur. Une mesure
 non monotone dans la même période, une régression de période, un changement de
 plan non explicite, un dépassement de limite ou une provenance inconnue rend
-l'état `UNKNOWN`.
+l'état `UNKNOWN`. La période est semi-ouverte
+`[billingPeriodStartedAt, billingPeriodEndsAt)` ; `measuredAt` doit lui
+appartenir. Une nouvelle période cohérente commence au plus tôt à la fin de la
+précédente. `billingPeriodId` reste opaque et n'est jamais trié lexicalement.
 
 `execution_provider_usage_counters` conserve les consommations locales depuis
 la dernière mesure par catégories `ENTRY`, `EXIT`, `CONFIRMATION`,
