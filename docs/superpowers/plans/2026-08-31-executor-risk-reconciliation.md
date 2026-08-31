@@ -155,7 +155,7 @@ git commit -m "feat: add bigint executor risk policy (#51)"
 - Create: `src/domain/execution-provider-quota.ts`
 - Create: `tests/execution-provider-quota.test.ts`
 
-- [ ] **Step 1: Write failing quota tests**
+- [x] **Step 1: Write failing quota tests**
 
 Cover NORMAL, ENTRY_BLOCKED, EXIT_ONLY and UNKNOWN, exact TTL boundaries,
 non-monotone measurements, billing-period changes, protected exit budgets and
@@ -179,7 +179,7 @@ assert.equal(result.state, 'NORMAL');
 assert.equal(result.protectedUnits, 23n);
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -189,7 +189,7 @@ node --import tsx --test tests/execution-provider-quota.test.ts
 
 Expected: module-not-found failure for the new domain.
 
-- [ ] **Step 3: Implement quota DTOs and evaluator**
+- [x] **Step 3: Implement quota DTOs and evaluator**
 
 Export:
 
@@ -207,7 +207,7 @@ Use `remaining = limit - measured - local` and the exact protected formula
 from spec 1.0.0. Clamp no negative arithmetic silently: a negative remainder
 is valid evidence for EXIT_ONLY, while malformed stored counts are invalid.
 
-- [ ] **Step 4: Verify GREEN and Task 1 regression**
+- [x] **Step 4: Verify GREEN and Task 1 regression**
 
 Run:
 
@@ -217,7 +217,7 @@ node --import tsx --test tests/execution-provider-quota.test.ts tests/execution-
 
 Expected: all tests PASS.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```bash
 git add src/domain/execution-provider-quota.ts tests/execution-provider-quota.test.ts
