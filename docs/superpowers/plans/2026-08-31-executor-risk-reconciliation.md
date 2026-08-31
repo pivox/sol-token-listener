@@ -21,7 +21,7 @@ repository but are not wired into `src/executor/main.ts`.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-risk-reconciliation-design.md`
-version 1.0.6 and parent specification version 1.6.4.
+version 1.0.7 and parent specification version 1.6.4.
 
 ---
 
@@ -330,7 +330,7 @@ Expected: migration 034 missing and manifest expectation fails.
 
 - [x] **Step 3: Implement migration 034**
 
-Create the eleven tables named by spec 1.0.6, including
+Create the eleven tables named by spec 1.0.7, including
 `execution_wallet_risk_state`. Use `CREATE TABLE IF NOT EXISTS`, named
 constraints and `CREATE INDEX IF NOT EXISTS`. Store financial integers as
 unscaled `NUMERIC` with explicit integer/u64 or integer/i128 checks. Every terminal
@@ -602,26 +602,26 @@ git commit -m "feat: purge reconciled executor risk payloads (#51)"
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-08-31-executor-risk-reconciliation.md`
 
-- [ ] **Step 1: Write failing architecture assertions**
+- [x] **Step 1: Write failing architecture assertions**
 
 Add source/dist graph checks proving #51-E modules contain no keypair, signer,
 secret loader, dynamic execution, send/submit method or import path into
 listener/API/paper/Raydium. Assert `src/executor/main.ts`, package scripts and
 `.env.example` have no #51-E runtime mode or live setting.
 
-- [ ] **Step 2: Verify RED, then extend the closed graph guard**
+- [x] **Step 2: Verify RED, then extend the closed graph guard**
 
 Run `npm run build:backend` and the architecture test. It must first fail for
 the new unlisted graph; minimally extend the allowlist, rebuild and require
 GREEN for source and `dist`.
 
-- [ ] **Step 3: Document the inert boundary**
+- [x] **Step 3: Document the inert boundary**
 
 README must state: #51-E provides database/domain foundations only; no current
 command runs admission or reconciliation; #49 remains NON_EXECUTED and
 NON_VALIDATED; #51-F and #51-G remain mandatory before any canary.
 
-- [ ] **Step 4: Run focused validation**
+- [x] **Step 4: Run focused validation**
 
 ```bash
 npm run build:backend
@@ -633,7 +633,7 @@ TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot node --i
 
 Expected: every command exits 0, no skipped PostgreSQL #51-E test.
 
-- [ ] **Step 5: Run full repository validation**
+- [x] **Step 5: Run full repository validation**
 
 ```bash
 npm run build
@@ -645,13 +645,13 @@ npm run frontend:e2e
 
 Expected: all backend/frontend tests and Chromium E2E pass.
 
-- [ ] **Step 6: Perform bounded security scans**
+- [x] **Step 6: Perform bounded security scans**
 
 Scan source, `dist`, diff and history range for private-key material,
 send/submit capabilities, URLs/credentials in fixtures and JavaScript floats
 in financial code. Inspect every match; expected: zero unexplained match.
 
-- [ ] **Step 7: Commit documentation and final guard changes**
+- [x] **Step 7: Commit documentation and final guard changes**
 
 ```bash
 git add tests/helpers/execution-boundary.ts tests/executor-architecture.test.ts README.md docs/superpowers/plans/2026-08-31-executor-risk-reconciliation.md
