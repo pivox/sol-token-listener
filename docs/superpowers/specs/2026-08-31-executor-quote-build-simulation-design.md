@@ -1,6 +1,6 @@
 # Exécuteur quote, build et simulation V1 — conception #51-D
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.0.2
 
 **Date :** 2026-08-31
 
@@ -12,6 +12,9 @@
 
 ## Historique des versions
 
+- **1.0.2 — 2026-08-31 :** ferme le code interne des erreurs programme, la
+  traduction d'une réponse provider malformée avant snapshot et l'usage de
+  `NUMERIC` non typé afin d'empêcher l'arrondi PostgreSQL avant validation.
 - **1.0.1 — 2026-08-31 :** ferme la politique WSOL PumpSwap, les contextes
   blockhash/fee, l'orientation du pool canonique, les recipients SDK, la
   matrice d'échec, les reason codes techniques, les fingerprints et la preuve
@@ -436,7 +439,7 @@ La matrice SQL de nullabilité et de statuts est fermée :
 
 | Résultat | quote/build/simulation | Champs obligatoires supplémentaires | Champs obligatoirement nuls | Reason code terminal |
 | --- | --- | --- | --- | --- |
-| `PROVIDER_FAILED` avant snapshot | `FAILED/NOT_RUN/NOT_RUN` | identité, config, genesis disponible, RPC usage, failure | tous les champs quote/build/blockhash/fee/simulation | `GENESIS_MISMATCH` ou `EXECUTION_PROVIDER_FAILED` |
+| `PROVIDER_FAILED` avant snapshot | `FAILED/NOT_RUN/NOT_RUN` | identité, config, genesis disponible, RPC usage, failure | tous les champs quote/build/blockhash/fee/simulation | `GENESIS_MISMATCH`, `EXECUTION_PROVIDER_FAILED` ou `EXECUTION_EVIDENCE_INVALID` |
 | `QUOTE_FAILED` | `FAILED/NOT_RUN/NOT_RUN` | identité, config, genesis, snapshot si obtenue, RPC usage, failure | build, message, blockhash, fee et simulation | code quote spécifique ou `EXECUTION_PROVIDER_FAILED`/`EXECUTION_EVIDENCE_INVALID` |
 | `BUILD_FAILED` | `SUCCEEDED/FAILED/NOT_RUN` | quote et snapshot complets, failure | message, blockhash, fee et simulation | `EXECUTION_BUILD_FAILED` ou `EXECUTION_EVIDENCE_INVALID` |
 | `BLOCKHASH_FAILED` | `SUCCEEDED/SUCCEEDED/NOT_RUN` | quote/build complets, failure | message, blockhash, fee et simulation | `EXECUTION_PROVIDER_FAILED` ou `EXECUTION_EVIDENCE_INVALID` |
@@ -450,10 +453,12 @@ attendu et observé sont tous deux présents. `OPERATION_ABORTED` authentifié p
 le signal et les erreurs PostgreSQL ne terminalisent pas : ils ne créent donc
 aucun artefact d'échec.
 
-Les valeurs numériques financières sont `NUMERIC(20,0)` ou plus larges selon
-leur domaine et sont transportées en chaînes décimales. Les slots et hauteurs
-sont `BIGINT` non négatifs. Les enums et cohérences succès/échec sont protégés
-par contraintes SQL.
+Les valeurs numériques financières sont des `NUMERIC` non typés, transportés
+en chaînes décimales et contraints par `scale(value)=0`, `value=trunc(value)`,
+`value <> NaN` et les bornes du domaine. `NUMERIC(p,0)` est interdit car
+PostgreSQL pourrait arrondir une fraction avant le `CHECK`. Les slots et
+hauteurs sont `BIGINT` non négatifs. Les enums et cohérences succès/échec sont
+protégés par contraintes SQL.
 
 Sont interdits dans cette table : bytes de transaction/message/instruction,
 signature, secret, URL, header RPC, logs bruts, payload SDK et JSON opaque.
@@ -519,6 +524,7 @@ RPC_TIMEOUT
 RPC_UNAVAILABLE
 RPC_RESPONSE_INVALID
 SIMULATION_EVIDENCE_INVALID
+SIMULATION_PROGRAM_ERROR
 INTENT_FENCE_LOST
 ARTIFACT_CONFLICT
 COMMIT_OUTCOME_UNKNOWN
@@ -536,8 +542,8 @@ La traduction terminale est normative :
 | `RPC_RATE_LIMITED`, `RPC_TIMEOUT`, `RPC_UNAVAILABLE` | `EXECUTION_PROVIDER_FAILED` |
 | `RPC_RESPONSE_INVALID`, `SIMULATION_EVIDENCE_INVALID`, `INVALID_DATA` provenant d'une réponse externe | `EXECUTION_EVIDENCE_INVALID` |
 | `BUILD_POLICY_REJECTED` | `EXECUTION_BUILD_FAILED` |
-| erreur programme pendant un BUY | `BUY_SIMULATION_FAILED` |
-| erreur programme pendant un SELL | `SELL_SIMULATION_FAILED` |
+| `SIMULATION_PROGRAM_ERROR` pendant un BUY | `BUY_SIMULATION_FAILED` |
+| `SIMULATION_PROGRAM_ERROR` pendant un SELL | `SELL_SIMULATION_FAILED` |
 | genesis différent | `GENESIS_MISMATCH` |
 | quote expirée / mint / venue / sortie / extension | reason code quote spécifique listé ci-dessus |
 
