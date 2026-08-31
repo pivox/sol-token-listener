@@ -13,6 +13,10 @@ import type {
   ReadonlyAccountSnapshot,
 } from '../../ports/market-rpc-reader.js';
 import { decodePumpSwapPoolAccount } from './pool-account-decoder.js';
+import {
+  computeEffectiveQuoteReservesRaw,
+  InvalidEffectiveQuoteReservesError,
+} from './reserve-math.js';
 
 export class InvalidPumpSwapReserveError extends Error {
   public constructor(message: string) {
@@ -73,10 +77,17 @@ export class PumpSwapReserveReader {
       pool.quoteAsset.mint,
       tokenProgram(pool.quoteAsset.tokenProgram),
     );
-    const effectiveQuoteReservesRaw =
-      quote.amountRaw + decodedPool.virtualQuoteReservesRaw;
-    if (effectiveQuoteReservesRaw <= 0n) {
-      throw new InvalidEffectiveQuoteReserveError(effectiveQuoteReservesRaw);
+    let effectiveQuoteReservesRaw: bigint;
+    try {
+      effectiveQuoteReservesRaw = computeEffectiveQuoteReservesRaw(
+        quote.amountRaw,
+        decodedPool.virtualQuoteReservesRaw,
+      );
+    } catch (error) {
+      if (error instanceof InvalidEffectiveQuoteReservesError) {
+        throw new InvalidEffectiveQuoteReserveError(error.amountRaw);
+      }
+      throw error;
     }
     const observedAtMs = this.now();
     if (!Number.isSafeInteger(observedAtMs) || observedAtMs < 0) {
