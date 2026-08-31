@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.6.3
+**Version de spécification :** 1.6.4
 
 **Date :** 2026-08-31
 
@@ -15,6 +15,9 @@ inerte des intentions d'exécution), #51-C (processus executor dry-run), #51-D
 
 ## Historique des versions
 
+- **1.6.4 — 2026-08-31 :** ferme la projection wallet #51-E à deux positions
+  relationnelles explicites et confirme que l'état quota est recalculé lors de
+  l'admission plutôt que persisté dans la mesure provider.
 - **1.6.3 — 2026-08-31 :** interdit `NUMERIC(p,0)` pour les entiers financiers
   #51-E et exige un `NUMERIC` non scalé avec contrôles d'intégralité et bornes,
   afin d'empêcher l'arrondi silencieux des entrées décimales par PostgreSQL.

@@ -1,8 +1,8 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.0.4
 
-**Version de la spécification parente :** 1.6.3
+**Version de la spécification parente :** 1.6.4
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.4 — 2026-08-31 :** précise que les deux positions ouvertes maximales
+  de la policy V1 sont matérialisées dans deux emplacements relationnels
+  explicites du snapshot wallet. L'état quota reste une décision recalculée à
+  l'admission et n'est pas figé dans un snapshot d'usage provider.
 - **1.0.3 — 2026-08-31 :** impose des colonnes `NUMERIC` non scalées avec
   contrôles explicites d'intégralité et bornes u64/i128. PostgreSQL arrondit
   avant les `CHECK` avec `NUMERIC(p,0)`, ce qui accepterait silencieusement une
@@ -200,6 +204,12 @@ le commitment exactement `finalized`, le solde SOL, les soldes token utiles,
 les positions ouvertes, le PnL net réalisé, un fingerprint et la génération.
 Les payloads sont bornés et ne contiennent ni URL, credential, historique de
 transactions brut, métadonnées token ou secret.
+
+La policy V1 autorise au plus deux positions. La projection relationnelle les
+stocke donc dans deux emplacements optionnels fermés : identifiant, coût,
+liquidation conservatrice éventuelle et statut de réconciliation. Le compteur
+et les emplacements doivent correspondre exactement ; aucun tableau ou JSON
+financier libre n'est accepté.
 
 Un snapshot est utilisable si :
 
