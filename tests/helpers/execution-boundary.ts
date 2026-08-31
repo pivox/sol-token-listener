@@ -35,7 +35,7 @@ const EXECUTOR_ALLOWED_LOCAL_MODULES = [
 const EXECUTOR_FORBIDDEN_IDENTIFIERS = new Set([
   'Keypair', 'Wallet', 'WalletSigner', 'Signer', 'SecretLoader',
   'keypair', 'wallet', 'signer',
-  'createRequire', 'getBuiltinModule', 'eval', 'Function',
+  'createRequire', 'getBuiltinModule', 'eval', 'Function', 'global', 'globalThis',
   'simulateTransaction', 'sendTransaction', 'sendRawTransaction', 'signTransaction',
 ]);
 // These are the only nonliteral element accesses present in the reviewed executor graph.

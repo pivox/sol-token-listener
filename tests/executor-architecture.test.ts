@@ -139,6 +139,8 @@ void test('executor graph guard rejects reflective access and reviewed alias byp
     "const apply = Reflect.apply.bind(Reflect); apply(Reflect.get, Reflect, [client, 'sendTransaction'])();",
     "global.Reflect.get(client, 'sendTransaction')();",
     "globalThis['Reflect'].get(client, 'sendTransaction')();",
+    "const key = 'Reflect'; const R = Object.getOwnPropertyDescriptor(globalThis, key)?.value; R.get(client, 'sendTransaction')();",
+    "const record = globalThis; const key = 'Reflect'; const R = record[key]; R.get(client, 'sendTransaction')();",
   ] as const;
   for (const fixture of fixtures) {
     const violations = executorBoundaryViolations(fixture, fixturePath, repositoryRoot);
