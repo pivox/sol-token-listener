@@ -90,6 +90,8 @@ async function insertExpiredFixture(pool: InstanceType<typeof pg.Pool>): Promise
     authorizationId, '6'.repeat(64), generationId,
     qualificationFingerprint, '7'.repeat(64),
   ]);
+  await pool.query(`ALTER TABLE execution_activation_armaments
+    DISABLE TRIGGER execution_activation_armaments_guarded_insert`);
   await pool.query(`INSERT INTO execution_activation_armaments (
     armament_id,payload_version,armament_fingerprint,qualification_id,
     qualification_fingerprint,generation_id,authorization_id,state,state_revision,phase,
@@ -105,6 +107,8 @@ async function insertExpiredFixture(pool: InstanceType<typeof pg.Pool>): Promise
     generationId, authorizationId, '2'.repeat(64), '3'.repeat(64),
     '4'.repeat(64), publicKey,
   ]);
+  await pool.query(`ALTER TABLE execution_activation_armaments
+    ENABLE TRIGGER execution_activation_armaments_guarded_insert`);
   await pool.query(`INSERT INTO execution_activation_events (
     event_id,payload_version,event_fingerprint,armament_id,generation_id,
     previous_state,next_state,reason_code,occurred_at

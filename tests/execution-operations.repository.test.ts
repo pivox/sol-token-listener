@@ -272,9 +272,26 @@ void test('database rejects a direct transition to RUNNING without guarded evide
     });
     await pool.query(`INSERT INTO execution_control_state (generation_id)
       VALUES ($1)`, [generationId]);
-    await assert.rejects(pool.query(`UPDATE execution_control_state SET
-      state='RUNNING',state_revision=1,updated_at=date_trunc('milliseconds',statement_timestamp())
-      WHERE generation_id=$1`, [generationId]), /guarded control transition/u);
+    const blocker = await pool.connect();
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
+        [generationId],
+      );
+      const mutation = pool.query(`UPDATE execution_control_state SET
+        state='RUNNING',state_revision=1,updated_at=date_trunc('milliseconds',statement_timestamp())
+        WHERE generation_id=$1`, [generationId]);
+      let settled = false;
+      void mutation.then(() => { settled = true; }, () => { settled = true; });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(settled, false, 'guard must wait for the shared generation lock');
+      await blocker.query('ROLLBACK');
+      await assert.rejects(mutation, /guarded control transition/u);
+    } finally {
+      try { await blocker.query('ROLLBACK'); } catch { /* already released */ }
+      blocker.release();
+    }
   });
 });
 

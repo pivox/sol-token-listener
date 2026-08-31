@@ -1,6 +1,6 @@
 # Preflight et opérations Executor V1 — conception #51-F
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.0.5
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.0.5 — 2026-08-31 :** verrou de génération acquis dans les triggers SQL,
+  autorisation resume fraîche et mono-usage, et refus des états armement non
+  `ARMED` à l'insertion.
 - **1.0.4 — 2026-08-31 :** attestation Ed25519 des onze gates, garde SQL
   des transitions de contrôle et armements, et replay concurrent des
   autorisations opérateur.
@@ -265,7 +268,10 @@ Des triggers gardent également la frontière SQL : `RUNNING` exige un événeme
 resume cohérent, une qualification fraîche, une autorisation consommée et un
 risque connu ; un insert `ARMED` exige les mêmes liaisons, un contrôle
 `RUNNING` et aucun `UNKNOWN_HELD`. Un `UPDATE` SQL isolé ne peut donc pas
-contourner les transitions applicatives.
+contourner les transitions applicatives. Les deux triggers acquièrent le même
+verrou advisory que #51-E avant de lire le risque. Une autorisation resume ne
+peut référencer qu'un seul événement et doit rester fraîche au commit. En
+#51-F, tout insert initial autre que `ARMED` est refusé.
 
 Une qualification expirée sans armement actif, une autorisation consommée et
 un armement terminal deviennent purgeables après quatre heures. Un état de

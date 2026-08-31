@@ -1,6 +1,6 @@
 # Executor V1 — preflight et opérations inertes (#51-F)
 
-**Version :** 1.0.3 — 2026-08-31
+**Version :** 1.0.4 — 2026-08-31
 
 #51-F ne permet pas de trader. Il ne charge aucune clé, ne signe rien et
 n'envoie aucune transaction. `EXECUTOR_MODE=live` et
@@ -102,6 +102,10 @@ Au moment exact de l'armement, le backend relit sous le verrou de génération
 les états `unknown_block` et `UNKNOWN_HELD`. Une incertitude apparue depuis le
 resume refuse la commande sans consommer son autorisation. Un replay devenu
 révoqué ou expiré échoue également au lieu de renvoyer un faux état `ARMED`.
+Les gardes SQL utilisent le même verrou de génération que #51-E : une mutation
+de risque concurrente ne peut pas laisser passer un resume ou armement sur un
+état antérieur. Chaque autorisation resume est fraîche et mono-usage. Les états
+`LOCKED` et `CONSUMED` restent impossibles à insérer avant #51-G.
 
 Les lectures masquent immédiatement les armements expirés sans mutation ; ils
 sont terminalisés sous verrou avant tout nouvel armement. Un arrêt révoque

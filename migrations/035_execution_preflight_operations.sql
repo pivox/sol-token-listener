@@ -201,6 +201,10 @@ CREATE TABLE IF NOT EXISTS execution_control_events (
 CREATE INDEX IF NOT EXISTS execution_control_events_generation_occurred_idx
   ON execution_control_events (generation_id, occurred_at DESC, event_id DESC);
 
+CREATE UNIQUE INDEX IF NOT EXISTS execution_control_events_authorization_unique
+  ON execution_control_events (authorization_id)
+  WHERE authorization_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS execution_activation_armaments (
   armament_id TEXT PRIMARY KEY,
   payload_version SMALLINT NOT NULL DEFAULT 1,
@@ -445,6 +449,7 @@ DECLARE
   prior_state TEXT;
   transition_valid BOOLEAN;
 BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended(NEW.generation_id, 51005));
   IF TG_OP = 'INSERT' THEN
     IF NEW.state = 'ENTRY_STOP' AND NEW.state_revision = 0
       AND NEW.last_event_id IS NULL
@@ -503,6 +508,7 @@ BEGIN
         AND operator_auth.operator_id = event.operator_id
         AND operator_auth.consumed_at IS NOT NULL
         AND operator_auth.consumed_at BETWEEN operator_auth.issued_at AND operator_auth.expires_at
+        AND operator_auth.expires_at >= statement_timestamp()
         AND risk.unknown_block = FALSE
         AND NOT EXISTS (
           SELECT 1 FROM execution_exposure_reservations reservation
@@ -530,8 +536,9 @@ DECLARE
   armament_valid BOOLEAN;
 BEGIN
   IF NEW.state <> 'ARMED' THEN
-    RETURN NEW;
+    RAISE EXCEPTION 'guarded armament insert required' USING ERRCODE = '55000';
   END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(NEW.generation_id, 51005));
   SELECT EXISTS (
     SELECT 1
     FROM execution_safety_qualifications qualification

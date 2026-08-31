@@ -29,6 +29,11 @@ void test('migration 035 defines the seven closed preflight and operations table
   assert.match(sql, /maximum_capital_lamports < 18446744073709551616/u);
   assert.match(sql, /guard_execution_control_state_write/u);
   assert.match(sql, /guard_execution_activation_armament_insert/u);
+  assert.equal((sql.match(/pg_advisory_xact_lock\(hashtextextended\(NEW\.generation_id, 51005\)\)/gu)
+    ?? []).length, 2);
+  assert.match(sql, /execution_control_events_authorization_unique[\s\S]*authorization_id IS NOT NULL/u);
+  assert.match(sql, /operator_auth\.expires_at >= statement_timestamp\(\)/u);
+  assert.match(sql, /IF NEW\.state <> 'ARMED' THEN[\s\S]*guarded armament insert required/u);
   assert.doesNotMatch(sql, /NUMERIC\s*\(/iu);
   assert.doesNotMatch(sql, /\b(?:REAL|DOUBLE\s+PRECISION|JSONB?)\b/iu);
   for (const forbidden of [
