@@ -1,8 +1,18 @@
+import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import {
+  createProviderUsageOperationId,
   createProviderUsageSnapshot,
+  evaluateProviderQuota,
   type ProviderUsageSnapshotV1,
 } from '../domain/execution-provider-quota.js';
+import { assertExecutionIntent, type ExecutionIntentV1 } from '../domain/execution-intent.js';
+import {
+  createExecutionRiskPolicy,
+  evaluateBuyRisk,
+  type ExecutionRiskPolicyV1,
+  type ExecutionTechnicalFailureReasonCode,
+} from '../domain/execution-risk-policy.js';
 import type {
   ExecutionBuyAdmissionInputV1,
   ExecutionBuyAdmissionResultV1,
@@ -72,7 +82,11 @@ const WALLET_SNAPSHOT_KEYS = Object.freeze([
 const WALLET_SNAPSHOT_ROW_KEYS = Object.freeze([
   'snapshot_id', 'payload_version', 'snapshot_fingerprint', 'generation_id', 'provider_id',
   'state_revision', 'slot', 'block_time_ms', 'observed_at_ms', 'commitment', 'wallet_lamports',
-  'token_balance_count', 'open_positions', 'realized_net_pnl_raw',
+  'token_balance_count', 'open_positions', 'position_1_id', 'position_1_cost_basis_lamports',
+  'position_1_conservative_liquidation_lamports', 'position_1_reconciliation_status',
+  'position_2_id', 'position_2_cost_basis_lamports',
+  'position_2_conservative_liquidation_lamports', 'position_2_reconciliation_status',
+  'realized_net_pnl_raw',
 ] as const);
 const PROVIDER_SNAPSHOT_KEYS = Object.freeze([
   'snapshotId', 'payloadVersion', 'snapshotFingerprint', 'providerId', 'planId',
@@ -91,6 +105,25 @@ const OPERATION_KEYS = Object.freeze([
 const RATE_LIMIT_KEYS = Object.freeze([
   'eventId', 'payloadVersion', 'providerId', 'billingPeriodId', 'endpointId', 'observedAtMs',
 ] as const);
+const ADMISSION_KEYS = Object.freeze([
+  'payloadVersion', 'intent', 'policy', 'generationId', 'walletSnapshot',
+  'providerSnapshot', 'allEndpointsUnavailable', 'nowMs',
+] as const);
+const POLICY_KEYS = Object.freeze([
+  'payloadVersion', 'policyFingerprint', 'quoteMintAllowlist',
+  'initialCapitalLamports', 'maximumCapitalLamports', 'positionSizeBps',
+  'maximumOpenPositions', 'maximumTotalExposureBps', 'drawdownPauseBps',
+  'feeReserveLamports', 'walletSnapshotMaxAgeMs', 'providerUsageMaxAgeMs',
+  'providerEntryCostUnits', 'providerExitCostUnitsPerPosition',
+  'providerConfirmationCostUnitsPerPosition',
+  'providerReconciliationCostUnitsPerPosition', 'providerSafetyMarginUnits',
+  'maximumConsecutiveTechnicalFailures',
+] as const);
+const ADMISSION_REPORT_ROW_KEYS = Object.freeze([
+  'report_id', 'decision', 'reason_code', 'input_fingerprint', 'policy_fingerprint',
+  'wallet_snapshot_fingerprint', 'provider_snapshot_fingerprint',
+  'wallet_state_revision', 'reservation_id',
+] as const);
 
 const GENERATION_PROJECTION = `generation_id,payload_version,wallet_public_key,cluster,
   genesis_hash,generation,
@@ -103,6 +136,14 @@ const WALLET_SNAPSHOT_PROJECTION = `snapshot_id,payload_version,snapshot_fingerp
     ELSE trunc(EXTRACT(EPOCH FROM block_time) * 1000)::TEXT END AS block_time_ms,
   trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms,
   commitment,wallet_lamports::TEXT AS wallet_lamports,token_balance_count,open_positions,
+  position_1_id,position_1_cost_basis_lamports::TEXT AS position_1_cost_basis_lamports,
+  position_1_conservative_liquidation_lamports::TEXT
+    AS position_1_conservative_liquidation_lamports,
+  position_1_reconciliation_status,
+  position_2_id,position_2_cost_basis_lamports::TEXT AS position_2_cost_basis_lamports,
+  position_2_conservative_liquidation_lamports::TEXT
+    AS position_2_conservative_liquidation_lamports,
+  position_2_reconciliation_status,
   realized_net_pnl_raw::TEXT AS realized_net_pnl_raw`;
 const PROVIDER_PROJECTION = `snapshot_id,payload_version,snapshot_fingerprint,provider_id,
   plan_id,billing_period_id,
@@ -163,12 +204,19 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         const result = await client.query(`INSERT INTO execution_wallet_snapshots (
           snapshot_id,payload_version,snapshot_fingerprint,generation_id,provider_id,
           state_revision,slot,block_time,observed_at,commitment,wallet_lamports,
-          token_balance_count,open_positions,realized_net_pnl_raw
+          token_balance_count,open_positions,
+          position_1_id,position_1_cost_basis_lamports,
+          position_1_conservative_liquidation_lamports,position_1_reconciliation_status,
+          position_2_id,position_2_cost_basis_lamports,
+          position_2_conservative_liquidation_lamports,position_2_reconciliation_status,
+          realized_net_pnl_raw
         ) VALUES ($1,$2,$3,$4,$5,$6::BIGINT,$7::BIGINT,
           CASE WHEN $8::BIGINT IS NULL THEN NULL ELSE TIMESTAMPTZ 'epoch'
             + ($8::BIGINT * INTERVAL '1 millisecond') END,
           TIMESTAMPTZ 'epoch' + ($9::BIGINT * INTERVAL '1 millisecond'),
-          $10,$11::NUMERIC,$12,$13,$14::NUMERIC)
+          $10,$11::NUMERIC,$12,$13,
+          $14,$15::NUMERIC,$16::NUMERIC,$17,
+          $18,$19::NUMERIC,$20::NUMERIC,$21,$22::NUMERIC)
         RETURNING ${WALLET_SNAPSHOT_PROJECTION}`, walletSnapshotValues(draft));
         return decodeWalletSnapshot(singleRow(result));
       } catch (error) {
@@ -279,9 +327,188 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
     });
   }
 
-  public admitBuy(input: ExecutionBuyAdmissionInputV1): Promise<ExecutionBuyAdmissionResultV1> {
-    void input;
-    return Promise.reject(failure('OPERATION_UNAVAILABLE'));
+  public async admitBuy(inputValue: ExecutionBuyAdmissionInputV1): Promise<ExecutionBuyAdmissionResultV1> {
+    const input = admissionFrom(inputValue);
+    const quoteAmountRaw = input.intent.quoteAmountRaw;
+    if (quoteAmountRaw === null) throw failure('INVALID_INPUT');
+    return this.transaction(async (client) => {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
+        [input.generationId],
+      );
+      const operationAtMs = textTimestamp(exactRow(singleRow(await client.query(
+        `SELECT trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds', statement_timestamp()))
+          * 1000)::TEXT AS operation_at_ms`,
+      )), ['operation_at_ms'] as const).operation_at_ms);
+      const generationResult = await client.query(`SELECT generation_id,wallet_public_key,
+        cluster,genesis_hash,generation FROM execution_wallet_generations
+        WHERE generation_id=$1 AND retired_at IS NULL FOR UPDATE`, [input.generationId]);
+      if (generationResult.rows.length !== 1) throw failure('CONFLICT');
+      exactRow(singleRow(generationResult), [
+        'generation_id', 'wallet_public_key', 'cluster', 'genesis_hash', 'generation',
+      ] as const);
+      const stateResult = await client.query(`SELECT state_revision::TEXT AS state_revision,
+        reserved_exposure_raw::TEXT AS reserved_exposure_raw,open_positions,
+        consecutive_technical_failures,last_technical_failure_reason_code,unknown_block
+        FROM execution_wallet_risk_state WHERE generation_id=$1 FOR UPDATE`, [input.generationId]);
+      const state = decodeRiskState(singleRow(stateResult));
+      const intentResult = await client.query(`SELECT id,payload_version,position_id,mint,side,
+        quote_mint,quote_amount_raw::TEXT AS quote_amount_raw,decision_fingerprint,
+        status,trunc(EXTRACT(EPOCH FROM requested_at) * 1000)::TEXT AS requested_at_ms,
+        trunc(EXTRACT(EPOCH FROM expires_at) * 1000)::TEXT AS expires_at_ms
+        FROM execution_intents WHERE id=$1 FOR UPDATE`, [input.intent.id]);
+      assertAdmissionIntentRow(singleRow(intentResult), input.intent);
+
+      const inputFingerprint = admissionInputFingerprint(input);
+      const existing = await findAdmissionResult(client, input.intent.id);
+      if (existing !== null) {
+        if (existing.inputFingerprint !== inputFingerprint
+          || existing.policyFingerprint !== input.policy.policyFingerprint
+          || existing.walletSnapshotFingerprint !== input.walletSnapshot.snapshotFingerprint
+          || existing.providerSnapshotFingerprint !== input.providerSnapshot.snapshotFingerprint) {
+          throw failure('CONFLICT');
+        }
+        return existing.result;
+      }
+
+      const walletSnapshot = await findWalletSnapshot(client, input.walletSnapshot.snapshotId);
+      if (walletSnapshot === null || !sameWalletSnapshot(walletSnapshot, input.walletSnapshot)
+        || walletSnapshot.generationId !== input.generationId) throw failure('CONFLICT');
+      const providerSnapshot = await findProviderSnapshot(client, input.providerSnapshot.snapshotId);
+      if (providerSnapshot === null
+        || !sameProviderSnapshot(providerSnapshot, input.providerSnapshot)) throw failure('CONFLICT');
+
+      const localUsage = unsignedBigint(parseBigint(exactRow(singleRow(await client.query(
+        `SELECT COALESCE(SUM(units),0)::TEXT AS local_units
+         FROM execution_provider_usage_counters WHERE snapshot_id=$1`,
+        [providerSnapshot.snapshotId],
+      )), ['local_units'] as const).local_units));
+      const rateRows = await client.query(`SELECT
+        trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms
+        FROM execution_provider_rate_limit_events
+        WHERE provider_id=$1 AND observed_at >= TIMESTAMPTZ 'epoch'
+          + (($2::BIGINT - 30000) * INTERVAL '1 millisecond')
+        ORDER BY observed_at DESC LIMIT 1000`, [providerSnapshot.providerId, input.nowMs]);
+      const recentRateLimits = rateRows.rows.map((row) => textTimestamp(
+        exactRow(row, ['observed_at_ms'] as const).observed_at_ms,
+      ));
+      const quota = evaluateProviderQuota({
+        policy: input.policy,
+        previousSnapshot: null,
+        snapshot: providerSnapshot,
+        localUsedSinceMeasurement: localUsage,
+        openPositions: walletSnapshot.openPositions.length,
+        consecutiveRateLimits: recentRateLimits,
+        allEndpointsUnavailable: input.allEndpointsUnavailable,
+        nowMs: input.nowMs,
+      });
+      const risk = evaluateBuyRisk({
+        policy: input.policy,
+        quoteMint: input.intent.quoteMint,
+        requestedQuoteAmountRaw: input.intent.quoteAmountRaw,
+        realizedNetPnlLamports: walletSnapshot.realizedNetPnlRaw,
+        reservedExposureLamports: state.reservedExposureRaw,
+        openPositions: walletSnapshot.openPositions,
+        consecutiveTechnicalFailures: state.consecutiveTechnicalFailures,
+        lastTechnicalFailureReasonCode: state.lastTechnicalFailureReasonCode,
+      });
+      const staleWallet = walletSnapshot.stateRevision !== state.stateRevision
+        || walletSnapshot.openPositions.length !== state.openPositions
+        || input.nowMs > walletSnapshot.observedAtMs + input.policy.walletSnapshotMaxAgeMs;
+      const reasonCode = state.unknownBlock ? 'RECONCILIATION_REQUIRED'
+        : staleWallet ? 'WALLET_MISMATCH'
+          : risk.kind === 'REJECTED' ? risk.reasonCode
+            : quota.state !== 'NORMAL' ? quota.reasonCode : null;
+      if (reasonCode === null && (risk.kind !== 'ADMISSIBLE' || quota.state !== 'NORMAL')) {
+        throw failure('INVALID_DATA');
+      }
+      const decision = reasonCode === null ? 'ADMITTED' : 'REJECTED';
+      const targetRevision = decision === 'ADMITTED' ? state.stateRevision + 1n : state.stateRevision;
+      const identity = admissionIdentity(
+        input,
+        inputFingerprint,
+        risk,
+        quota.state,
+        decision,
+        reasonCode,
+      );
+      const reportId = `execution_risk_admission_${identity.reportFingerprint}`;
+      const reservationId = decision === 'ADMITTED'
+        ? `execution_exposure_reservation_${hash(['reservation-v1', reportId])}` : null;
+      const reportInsert = await client.query(`INSERT INTO execution_risk_admission_reports (
+        report_id,payload_version,report_fingerprint,intent_id,generation_id,policy_fingerprint,
+        wallet_snapshot_fingerprint,provider_snapshot_fingerprint,decision,reason_code,
+        quote_amount_raw,projected_capital_raw,projected_exposure_raw,projected_drawdown_raw,
+        quota_state,wallet_state_revision,input_fingerprint,recorded_at,terminal_at,purge_after
+      ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10::NUMERIC,$11::NUMERIC,
+        $12::NUMERIC,$13::NUMERIC,$14,$15::BIGINT,$16,
+        TIMESTAMPTZ 'epoch' + ($17::BIGINT * INTERVAL '1 millisecond'),
+        CASE WHEN $8='REJECTED' THEN TIMESTAMPTZ 'epoch'
+          + ($17::BIGINT * INTERVAL '1 millisecond') ELSE NULL END,
+        CASE WHEN $8='REJECTED' THEN TIMESTAMPTZ 'epoch'
+          + (($17::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END)`, [
+        reportId, identity.reportFingerprint, input.intent.id, input.generationId,
+        input.policy.policyFingerprint, walletSnapshot.snapshotFingerprint,
+        providerSnapshot.snapshotFingerprint, decision, reasonCode,
+        quoteAmountRaw.toString(), risk.reconciledCapitalLamports.toString(),
+        risk.projectedExposureLamports.toString(),
+        risk.conservativeUnrealizedLossLamports.toString(), quota.state,
+        targetRevision.toString(), inputFingerprint, operationAtMs,
+      ]);
+      if (reportInsert.rowCount !== 1) throw failure('INVALID_DATA');
+      if (decision === 'ADMITTED' && reservationId !== null) {
+        const reservationInsert = await client.query(`INSERT INTO execution_exposure_reservations (
+          reservation_id,payload_version,intent_id,generation_id,admission_report_id,position_id,
+          side,mint,quote_mint,maximum_amount_raw,intent_fingerprint,policy_fingerprint,
+          wallet_snapshot_fingerprint,provider_snapshot_fingerprint,state,state_revision,created_at
+        ) VALUES ($1,1,$2,$3,$4,$5,'BUY',$6,$7,$8::NUMERIC,$9,$10,$11,$12,
+          'RESERVED',$13::BIGINT,
+          TIMESTAMPTZ 'epoch' + ($14::BIGINT * INTERVAL '1 millisecond'))`, [
+          reservationId, input.intent.id, input.generationId, reportId, input.intent.positionId,
+          input.intent.mint, input.intent.quoteMint, quoteAmountRaw.toString(),
+          identity.intentFingerprint, input.policy.policyFingerprint,
+          walletSnapshot.snapshotFingerprint, providerSnapshot.snapshotFingerprint,
+          targetRevision.toString(), operationAtMs,
+        ]);
+        if (reservationInsert.rowCount !== 1) throw failure('INVALID_DATA');
+        const operationId = createProviderUsageOperationId({
+          providerId: providerSnapshot.providerId,
+          billingPeriodId: providerSnapshot.billingPeriodId,
+          category: 'ENTRY',
+          logicalOperationId: input.intent.id,
+        });
+        const counterInsert = await client.query(`INSERT INTO execution_provider_usage_counters (
+          operation_id,payload_version,snapshot_id,provider_id,billing_period_id,category,
+          logical_operation_id,units,recorded_at
+        ) VALUES ($1,1,$2,$3,$4,'ENTRY',$5,$6::NUMERIC,
+          TIMESTAMPTZ 'epoch' + ($7::BIGINT * INTERVAL '1 millisecond'))`, [
+          operationId, providerSnapshot.snapshotId, providerSnapshot.providerId,
+          providerSnapshot.billingPeriodId, input.intent.id,
+          input.policy.providerEntryCostUnits.toString(), operationAtMs,
+        ]);
+        if (counterInsert.rowCount !== 1) throw failure('INVALID_DATA');
+        const update = await client.query(`UPDATE execution_wallet_risk_state SET
+          state_revision=$2::BIGINT,reconciled_capital_lamports=$3::NUMERIC,
+          reserved_exposure_raw=$4::NUMERIC,open_positions=$5,
+          conservative_drawdown_raw=$6::NUMERIC,
+          updated_at=TIMESTAMPTZ 'epoch' + ($7::BIGINT * INTERVAL '1 millisecond')
+          WHERE generation_id=$1 AND state_revision=$8::BIGINT`, [
+          input.generationId, targetRevision.toString(), risk.reconciledCapitalLamports.toString(),
+          risk.projectedExposureLamports.toString(), risk.openPositionCount + 1,
+          risk.conservativeUnrealizedLossLamports.toString(), operationAtMs,
+          state.stateRevision.toString(),
+        ]);
+        if (update.rowCount !== 1) throw failure('CONFLICT');
+      }
+      return Object.freeze({
+        payloadVersion: 1,
+        decision,
+        reasonCode,
+        reportId,
+        reservationId,
+        stateRevision: targetRevision,
+      });
+    });
   }
 
   public reconcile(
@@ -362,7 +589,7 @@ function walletSnapshotFrom(value: unknown): WalletSnapshotV1 {
       commitment: enumValue(row.commitment, ['finalized'] as const),
       walletLamports: unsignedBigint(row.walletLamports),
       tokenBalanceCount: integer(row.tokenBalanceCount, 0, 2_147_483_647),
-      openPositions: integer(row.openPositions, 0, 2),
+      openPositions: positionsFrom(row.openPositions),
       realizedNetPnlRaw: signedBigint(row.realizedNetPnlRaw),
     });
   } catch (error) {
@@ -395,6 +622,248 @@ function providerSnapshotFrom(value: unknown): ProviderUsageSnapshotV1 {
   } catch {
     throw failure('INVALID_INPUT');
   }
+}
+
+function admissionFrom(value: unknown): ExecutionBuyAdmissionInputV1 {
+  try {
+    const row = exactInput(value, ADMISSION_KEYS);
+    if (row.payloadVersion !== 1) throw new TypeError();
+    assertExecutionIntent(row.intent);
+    const intent = row.intent;
+    if (intent.side !== 'BUY' || intent.status !== 'PENDING'
+      || intent.quoteAmountRaw === null || intent.baseAmountRaw !== null) throw new TypeError();
+    const policy = policyFrom(row.policy);
+    const walletSnapshot = walletSnapshotFrom(row.walletSnapshot);
+    const providerSnapshot = providerSnapshotFrom(row.providerSnapshot);
+    const generationId = patternedText(
+      row.generationId,
+      /^execution_wallet_generation_[0-9a-f]{64}$/u,
+    );
+    if (walletSnapshot.generationId !== generationId
+      || walletSnapshot.providerId !== providerSnapshot.providerId
+      || intent.quoteMint !== policy.quoteMintAllowlist[0]
+      || typeof row.allEndpointsUnavailable !== 'boolean') throw new TypeError();
+    const nowMs = timestamp(row.nowMs);
+    if (nowMs < intent.requestedAtMs || nowMs >= intent.expiresAtMs) throw new TypeError();
+    return Object.freeze({
+      payloadVersion: 1,
+      intent,
+      policy,
+      generationId,
+      walletSnapshot,
+      providerSnapshot,
+      allEndpointsUnavailable: row.allEndpointsUnavailable,
+      nowMs,
+    });
+  } catch (error) {
+    if (error instanceof ExecutionRiskRepositoryError && INTERNAL_ERRORS.has(error)) throw error;
+    throw failure('INVALID_INPUT');
+  }
+}
+
+function policyFrom(value: unknown): ExecutionRiskPolicyV1 {
+  const row = exactInput(value, POLICY_KEYS);
+  if (row.payloadVersion !== 1) throw new TypeError();
+  const policy = createExecutionRiskPolicy(Object.freeze({
+    quoteMintAllowlist: row.quoteMintAllowlist,
+    initialCapitalLamports: row.initialCapitalLamports,
+    maximumCapitalLamports: row.maximumCapitalLamports,
+    positionSizeBps: row.positionSizeBps,
+    maximumOpenPositions: row.maximumOpenPositions,
+    maximumTotalExposureBps: row.maximumTotalExposureBps,
+    drawdownPauseBps: row.drawdownPauseBps,
+    feeReserveLamports: row.feeReserveLamports,
+    walletSnapshotMaxAgeMs: row.walletSnapshotMaxAgeMs,
+    providerUsageMaxAgeMs: row.providerUsageMaxAgeMs,
+    providerEntryCostUnits: row.providerEntryCostUnits,
+    providerExitCostUnitsPerPosition: row.providerExitCostUnitsPerPosition,
+    providerConfirmationCostUnitsPerPosition: row.providerConfirmationCostUnitsPerPosition,
+    providerReconciliationCostUnitsPerPosition: row.providerReconciliationCostUnitsPerPosition,
+    providerSafetyMarginUnits: row.providerSafetyMarginUnits,
+    maximumConsecutiveTechnicalFailures: row.maximumConsecutiveTechnicalFailures,
+  }));
+  if (row.policyFingerprint !== policy.policyFingerprint) throw new TypeError();
+  return policy;
+}
+
+function decodeRiskState(value: unknown): Readonly<{
+  stateRevision: bigint;
+  reservedExposureRaw: bigint;
+  openPositions: number;
+  consecutiveTechnicalFailures: number;
+  lastTechnicalFailureReasonCode: ExecutionTechnicalFailureReasonCode | null;
+  unknownBlock: boolean;
+}> {
+  try {
+    const row = exactRow(value, [
+      'state_revision', 'reserved_exposure_raw', 'open_positions',
+      'consecutive_technical_failures', 'last_technical_failure_reason_code', 'unknown_block',
+    ] as const);
+    const consecutiveTechnicalFailures = integer(row.consecutive_technical_failures, 0, 2);
+    const lastTechnicalFailureReasonCode = row.last_technical_failure_reason_code === null
+      ? null : enumValue(row.last_technical_failure_reason_code, [
+        'EXECUTION_BUILD_FAILED', 'BUY_SIMULATION_FAILED', 'SELL_SIMULATION_FAILED',
+        'EXECUTION_PROVIDER_FAILED', 'CONFIRMATION_TIMEOUT', 'RECONCILIATION_REQUIRED',
+      ] as const);
+    if ((consecutiveTechnicalFailures === 0) !== (lastTechnicalFailureReasonCode === null)) {
+      throw new TypeError();
+    }
+    if (typeof row.unknown_block !== 'boolean') throw new TypeError();
+    return Object.freeze({
+      stateRevision: unsignedBigint(parseBigint(row.state_revision)),
+      reservedExposureRaw: unsignedBigint(parseBigint(row.reserved_exposure_raw)),
+      openPositions: integer(row.open_positions, 0, 2),
+      consecutiveTechnicalFailures,
+      lastTechnicalFailureReasonCode,
+      unknownBlock: row.unknown_block,
+    });
+  } catch (error) {
+    if (error instanceof ExecutionRiskRepositoryError && INTERNAL_ERRORS.has(error)) throw error;
+    throw failure('INVALID_DATA');
+  }
+}
+
+function assertAdmissionIntentRow(value: unknown, intent: ExecutionIntentV1): void {
+  try {
+    const row = exactRow(value, [
+      'id', 'payload_version', 'position_id', 'mint', 'side', 'quote_mint',
+      'quote_amount_raw', 'decision_fingerprint', 'status', 'requested_at_ms', 'expires_at_ms',
+    ] as const);
+    if (row.id !== intent.id || row.payload_version !== intent.payloadVersion
+      || row.position_id !== intent.positionId || row.mint !== intent.mint
+      || row.side !== 'BUY' || row.quote_mint !== intent.quoteMint
+      || unsignedBigint(parseBigint(row.quote_amount_raw)) !== intent.quoteAmountRaw
+      || row.decision_fingerprint !== intent.decisionFingerprint || row.status !== 'PENDING'
+      || textTimestamp(row.requested_at_ms) !== intent.requestedAtMs
+      || textTimestamp(row.expires_at_ms) !== intent.expiresAtMs) throw new TypeError();
+  } catch (error) {
+    if (error instanceof ExecutionRiskRepositoryError && INTERNAL_ERRORS.has(error)) throw error;
+    throw failure('CONFLICT');
+  }
+}
+
+async function findAdmissionResult(
+  client: ExecutionRiskClient,
+  intentId: string,
+): Promise<Readonly<{
+  inputFingerprint: string;
+  policyFingerprint: string;
+  walletSnapshotFingerprint: string;
+  providerSnapshotFingerprint: string;
+  result: ExecutionBuyAdmissionResultV1;
+}> | null> {
+  const result = await client.query(`SELECT report.report_id,report.decision,report.reason_code,
+    report.input_fingerprint,
+    report.policy_fingerprint,report.wallet_snapshot_fingerprint,
+    report.provider_snapshot_fingerprint,report.wallet_state_revision::TEXT
+      AS wallet_state_revision,reservation.reservation_id
+    FROM execution_risk_admission_reports AS report
+    LEFT JOIN execution_exposure_reservations AS reservation
+      ON reservation.admission_report_id=report.report_id
+    WHERE report.intent_id=$1`, [intentId]);
+  if (result.rows.length === 0) return null;
+  const row = exactRow(singleRow(result), ADMISSION_REPORT_ROW_KEYS);
+  const decision = enumValue(row.decision, ['ADMITTED', 'REJECTED'] as const);
+  const reasonCode = row.reason_code === null ? null : enumValue(row.reason_code, [
+    'CAPITAL_LIMIT_EXCEEDED', 'EXPOSURE_LIMIT_EXCEEDED', 'DRAWDOWN_LIMIT_EXCEEDED',
+    'QUOTE_MINT_NOT_ALLOWED', 'RECONCILIATION_REQUIRED', 'EXECUTION_BUILD_FAILED',
+    'BUY_SIMULATION_FAILED', 'SELL_SIMULATION_FAILED', 'EXECUTION_PROVIDER_FAILED',
+    'CONFIRMATION_TIMEOUT', 'PROVIDER_USAGE_UNKNOWN', 'PROVIDER_ENTRY_LIMIT_REACHED',
+    'PROVIDER_EXIT_ONLY', 'DECISION_STALE', 'WALLET_MISMATCH',
+  ] as const);
+  const reservationId = row.reservation_id === null
+    ? null : patternedText(row.reservation_id, /^execution_exposure_reservation_[0-9a-f]{64}$/u);
+  if ((decision === 'ADMITTED') !== (reasonCode === null)
+    || (decision === 'ADMITTED') !== (reservationId !== null)) throw failure('INVALID_DATA');
+  return Object.freeze({
+    inputFingerprint: patternedText(row.input_fingerprint, HASH),
+    policyFingerprint: patternedText(row.policy_fingerprint, HASH),
+    walletSnapshotFingerprint: patternedText(row.wallet_snapshot_fingerprint, HASH),
+    providerSnapshotFingerprint: patternedText(row.provider_snapshot_fingerprint, HASH),
+    result: Object.freeze({
+      payloadVersion: 1,
+      decision,
+      reasonCode,
+      reportId: patternedText(row.report_id, /^execution_risk_admission_[0-9a-f]{64}$/u),
+      reservationId,
+      stateRevision: unsignedBigint(parseBigint(row.wallet_state_revision)),
+    }),
+  });
+}
+
+function admissionIdentity(
+  input: ExecutionBuyAdmissionInputV1,
+  inputFingerprint: string,
+  risk: ReturnType<typeof evaluateBuyRisk>,
+  quotaState: 'NORMAL' | 'ENTRY_BLOCKED' | 'EXIT_ONLY' | 'UNKNOWN',
+  decision: 'ADMITTED' | 'REJECTED',
+  reasonCode: ExecutionBuyAdmissionResultV1['reasonCode'],
+): Readonly<{ reportFingerprint: string; intentFingerprint: string }> {
+  const intentFingerprint = hash([
+    'execution-intent-risk-v1', input.intent.id, input.intent.logicalOrderKey,
+    input.intent.decisionFingerprint, input.intent.quoteAmountRaw?.toString() ?? '',
+  ]);
+  return Object.freeze({
+    intentFingerprint,
+    reportFingerprint: hash([
+      'execution-risk-admission-v1', inputFingerprint, intentFingerprint, input.policy.policyFingerprint,
+      input.walletSnapshot.snapshotFingerprint, input.providerSnapshot.snapshotFingerprint,
+      risk.reconciledCapitalLamports, risk.projectedExposureLamports,
+      risk.conservativeUnrealizedLossLamports, quotaState, decision, reasonCode ?? '',
+    ]),
+  });
+}
+
+function admissionInputFingerprint(input: ExecutionBuyAdmissionInputV1): string {
+  return hash([
+    'execution-risk-admission-input-v1', input.intent.id, input.intent.decisionFingerprint,
+    input.policy.policyFingerprint, input.generationId,
+    input.walletSnapshot.snapshotFingerprint, input.providerSnapshot.snapshotFingerprint,
+    input.allEndpointsUnavailable ? 1 : 0, input.nowMs,
+  ]);
+}
+
+function positionsFrom(value: unknown): WalletSnapshotV1['openPositions'] {
+  if (!Array.isArray(value) || isProxy(value) || value.length > 2) throw new TypeError();
+  const positions = value.map((candidate) => {
+    const row = exactInput(candidate, [
+      'positionId', 'costBasisLamports', 'conservativeLiquidationLamports',
+      'reconciliationStatus',
+    ] as const);
+    return Object.freeze({
+      positionId: text(row.positionId, 256),
+      costBasisLamports: positiveBigint(row.costBasisLamports),
+      conservativeLiquidationLamports: row.conservativeLiquidationLamports === null
+        ? null : unsignedBigint(row.conservativeLiquidationLamports),
+      reconciliationStatus: enumValue(
+        row.reconciliationStatus,
+        ['RECONCILED', 'UNKNOWN'] as const,
+      ),
+    });
+  });
+  if (positions.length === 2 && positions[0]?.positionId === positions[1]?.positionId) {
+    throw new TypeError();
+  }
+  return Object.freeze(positions);
+}
+
+function positionsFromRow(row: Record<string, unknown>): WalletSnapshotV1['openPositions'] {
+  const count = integer(row.open_positions, 0, 2);
+  const positions: WalletSnapshotV1['openPositions'][number][] = [];
+  for (let index = 1; index <= count; index += 1) {
+    const positionId = row[`position_${index}_id`];
+    const costBasis = row[`position_${index}_cost_basis_lamports`];
+    const liquidation = row[`position_${index}_conservative_liquidation_lamports`];
+    const status = row[`position_${index}_reconciliation_status`];
+    positions.push(Object.freeze({
+      positionId: text(positionId, 256),
+      costBasisLamports: positiveBigint(parseBigint(costBasis)),
+      conservativeLiquidationLamports: liquidation === null
+        ? null : unsignedBigint(parseBigint(liquidation)),
+      reconciliationStatus: enumValue(status, ['RECONCILED', 'UNKNOWN'] as const),
+    }));
+  }
+  return Object.freeze(positions);
 }
 
 function operationFrom(value: unknown): ProviderUsageOperationV1 {
@@ -499,7 +968,7 @@ function decodeWalletSnapshot(value: unknown): WalletSnapshotV1 {
       commitment: row.commitment,
       walletLamports: parseBigint(row.wallet_lamports),
       tokenBalanceCount: row.token_balance_count,
-      openPositions: row.open_positions,
+      openPositions: positionsFromRow(row),
       realizedNetPnlRaw: parseBigint(row.realized_net_pnl_raw),
     });
   } catch (error) {
@@ -569,10 +1038,18 @@ function generationValues(value: WalletGenerationDraftV1): readonly unknown[] {
 }
 
 function walletSnapshotValues(value: WalletSnapshotV1): readonly unknown[] {
+  const [first, second] = value.openPositions;
   return [value.snapshotId, value.payloadVersion, value.snapshotFingerprint, value.generationId,
     value.providerId, value.stateRevision.toString(), value.slot.toString(), value.blockTimeMs,
     value.observedAtMs, value.commitment, value.walletLamports.toString(), value.tokenBalanceCount,
-    value.openPositions, value.realizedNetPnlRaw.toString()];
+    value.openPositions.length,
+    first?.positionId ?? null, first?.costBasisLamports.toString() ?? null,
+    first?.conservativeLiquidationLamports?.toString() ?? null,
+    first?.reconciliationStatus ?? null,
+    second?.positionId ?? null, second?.costBasisLamports.toString() ?? null,
+    second?.conservativeLiquidationLamports?.toString() ?? null,
+    second?.reconciliationStatus ?? null,
+    value.realizedNetPnlRaw.toString()];
 }
 
 function providerSnapshotValues(value: ProviderUsageSnapshotV1): readonly unknown[] {
@@ -599,7 +1076,16 @@ function sameGeneration(left: WalletGenerationV1, right: WalletGenerationDraftV1
 }
 
 function sameWalletSnapshot(left: WalletSnapshotV1, right: WalletSnapshotV1): boolean {
-  return WALLET_SNAPSHOT_KEYS.every((key) => left[key] === right[key]);
+  return WALLET_SNAPSHOT_KEYS.filter((key) => key !== 'openPositions')
+    .every((key) => left[key] === right[key])
+    && left.openPositions.length === right.openPositions.length
+    && left.openPositions.every((position, index) => {
+      const other = right.openPositions[index];
+      return position.positionId === other?.positionId
+        && position.costBasisLamports === other.costBasisLamports
+        && position.conservativeLiquidationLamports === other.conservativeLiquidationLamports
+        && position.reconciliationStatus === other.reconciliationStatus;
+    });
 }
 
 function sameProviderSnapshot(left: ProviderUsageSnapshotV1, right: ProviderUsageSnapshotV1): boolean {
@@ -743,4 +1229,16 @@ function failure(code: ExecutionRiskRepositoryErrorCode): ExecutionRiskRepositor
   const error = new ExecutionRiskRepositoryError(code);
   INTERNAL_ERRORS.add(error);
   return error;
+}
+
+function hash(parts: readonly (string | number | bigint)[]): string {
+  const digest = createHash('sha256');
+  for (const part of parts) {
+    const textValue = String(part);
+    digest.update(String(Buffer.byteLength(textValue)));
+    digest.update(':');
+    digest.update(textValue);
+    digest.update('|');
+  }
+  return digest.digest('hex');
 }

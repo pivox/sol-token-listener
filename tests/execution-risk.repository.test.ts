@@ -34,6 +34,13 @@ void test('wallet generation and snapshot writes replay exactly and reject confl
       repository.appendWalletSnapshot({ ...snapshot, snapshotId: id('wallet_snapshot', 'd') }),
       isRepositoryError('CONFLICT'),
     );
+    const positioned = walletSnapshotDraft(created.generationId, 'e', 1n, [{
+      positionId: 'position:test',
+      costBasisLamports: 500n,
+      conservativeLiquidationLamports: 450n,
+      reconciliationStatus: 'RECONCILED',
+    }]);
+    assert.deepEqual(await repository.appendWalletSnapshot(positioned), positioned);
   });
 });
 
@@ -171,7 +178,17 @@ function generationRow(seed: string) {
   };
 }
 
-function walletSnapshotDraft(generationId: string, seed: string, stateRevision: bigint) {
+function walletSnapshotDraft(
+  generationId: string,
+  seed: string,
+  stateRevision: bigint,
+  openPositions: readonly Readonly<{
+    positionId: string;
+    costBasisLamports: bigint;
+    conservativeLiquidationLamports: bigint | null;
+    reconciliationStatus: 'RECONCILED' | 'UNKNOWN';
+  }>[] = [],
+) {
   return Object.freeze({
     snapshotId: id('wallet_snapshot', seed),
     payloadVersion: 1 as const,
@@ -185,7 +202,7 @@ function walletSnapshotDraft(generationId: string, seed: string, stateRevision: 
     commitment: 'finalized' as const,
     walletLamports: 1_000_000n,
     tokenBalanceCount: 0,
-    openPositions: 0,
+    openPositions: Object.freeze(openPositions),
     realizedNetPnlRaw: 0n,
   });
 }

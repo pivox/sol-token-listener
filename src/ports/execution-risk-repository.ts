@@ -3,6 +3,12 @@ import type {
   ProviderUsageSnapshotV1,
 } from '../domain/execution-provider-quota.js';
 import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reconciliation.js';
+import type {
+  ExecutionBuyRiskReasonCode,
+  ExecutionOpenPositionRiskInputV1,
+  ExecutionRiskPolicyV1,
+} from '../domain/execution-risk-policy.js';
+import type { ExecutionIntentV1 } from '../domain/execution-intent.js';
 
 export type ExecutionCluster = 'mainnet-beta' | 'devnet' | 'testnet';
 
@@ -33,7 +39,7 @@ export interface WalletSnapshotDraftV1 {
   readonly commitment: 'finalized';
   readonly walletLamports: bigint;
   readonly tokenBalanceCount: number;
-  readonly openPositions: number;
+  readonly openPositions: readonly ExecutionOpenPositionRiskInputV1[];
   readonly realizedNetPnlRaw: bigint;
 }
 
@@ -61,14 +67,28 @@ export interface ProviderRateLimitEventV1 {
 
 export interface ExecutionBuyAdmissionInputV1 {
   readonly payloadVersion: 1;
-  readonly intentId: string;
+  readonly intent: ExecutionIntentV1;
+  readonly policy: ExecutionRiskPolicyV1;
+  readonly generationId: string;
+  readonly walletSnapshot: WalletSnapshotV1;
+  readonly providerSnapshot: ProviderUsageSnapshotV1;
+  readonly allEndpointsUnavailable: boolean;
+  readonly nowMs: number;
 }
 
 export interface ExecutionBuyAdmissionResultV1 {
   readonly payloadVersion: 1;
   readonly decision: 'ADMITTED' | 'REJECTED';
+  readonly reasonCode: ExecutionBuyRiskReasonCode
+    | 'PROVIDER_USAGE_UNKNOWN'
+    | 'PROVIDER_ENTRY_LIMIT_REACHED'
+    | 'PROVIDER_EXIT_ONLY'
+    | 'DECISION_STALE'
+    | 'WALLET_MISMATCH'
+    | null;
   readonly reportId: string;
   readonly reservationId: string | null;
+  readonly stateRevision: bigint;
 }
 
 export interface ExecutionReconciliationCommitV1 {

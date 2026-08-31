@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS execution_wallet_risk_state (
   open_positions INTEGER NOT NULL DEFAULT 0,
   conservative_drawdown_raw NUMERIC NOT NULL,
   consecutive_technical_failures SMALLINT NOT NULL DEFAULT 0,
+  last_technical_failure_reason_code TEXT,
   unknown_block BOOLEAN NOT NULL DEFAULT FALSE,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT date_trunc('milliseconds', statement_timestamp()),
   CONSTRAINT execution_wallet_risk_state_generation_fkey
@@ -57,6 +58,13 @@ CREATE TABLE IF NOT EXISTS execution_wallet_risk_state (
   CONSTRAINT execution_wallet_risk_state_counts_check CHECK (
     open_positions BETWEEN 0 AND 2147483647
     AND consecutive_technical_failures BETWEEN 0 AND 32767
+  ),
+  CONSTRAINT execution_wallet_risk_state_failure_check CHECK (
+    (consecutive_technical_failures = 0 AND last_technical_failure_reason_code IS NULL)
+    OR (consecutive_technical_failures > 0 AND last_technical_failure_reason_code IN (
+      'EXECUTION_BUILD_FAILED', 'BUY_SIMULATION_FAILED', 'SELL_SIMULATION_FAILED',
+      'EXECUTION_PROVIDER_FAILED', 'CONFIRMATION_TIMEOUT', 'RECONCILIATION_REQUIRED'
+    ))
   ),
   CONSTRAINT execution_wallet_risk_state_amounts_check CHECK (
     reconciled_capital_lamports <> 'NaN'::NUMERIC
@@ -97,6 +105,14 @@ CREATE TABLE IF NOT EXISTS execution_wallet_snapshots (
   wallet_lamports NUMERIC NOT NULL,
   token_balance_count INTEGER NOT NULL,
   open_positions INTEGER NOT NULL,
+  position_1_id TEXT,
+  position_1_cost_basis_lamports NUMERIC,
+  position_1_conservative_liquidation_lamports NUMERIC,
+  position_1_reconciliation_status TEXT,
+  position_2_id TEXT,
+  position_2_cost_basis_lamports NUMERIC,
+  position_2_conservative_liquidation_lamports NUMERIC,
+  position_2_reconciliation_status TEXT,
   realized_net_pnl_raw NUMERIC NOT NULL,
   superseded_at TIMESTAMPTZ,
   purge_after TIMESTAMPTZ,
@@ -113,19 +129,73 @@ CREATE TABLE IF NOT EXISTS execution_wallet_snapshots (
     AND state_revision >= 0 AND slot >= 0
     AND commitment = 'finalized'
     AND token_balance_count BETWEEN 0 AND 2147483647
-    AND open_positions BETWEEN 0 AND 2147483647
+    AND open_positions BETWEEN 0 AND 2
   ),
   CONSTRAINT execution_wallet_snapshots_amounts_check CHECK (
     wallet_lamports <> 'NaN'::NUMERIC
     AND wallet_lamports >= 0 AND wallet_lamports = trunc(wallet_lamports)
     AND scale(wallet_lamports) = 0
     AND wallet_lamports < 18446744073709551616
+    AND (position_1_cost_basis_lamports IS NULL OR (
+      position_1_cost_basis_lamports <> 'NaN'::NUMERIC
+      AND position_1_cost_basis_lamports > 0
+      AND position_1_cost_basis_lamports = trunc(position_1_cost_basis_lamports)
+      AND scale(position_1_cost_basis_lamports) = 0
+      AND position_1_cost_basis_lamports < 18446744073709551616
+    ))
+    AND (position_1_conservative_liquidation_lamports IS NULL OR (
+      position_1_conservative_liquidation_lamports <> 'NaN'::NUMERIC
+      AND position_1_conservative_liquidation_lamports >= 0
+      AND position_1_conservative_liquidation_lamports
+        = trunc(position_1_conservative_liquidation_lamports)
+      AND scale(position_1_conservative_liquidation_lamports) = 0
+      AND position_1_conservative_liquidation_lamports < 18446744073709551616
+    ))
+    AND (position_2_cost_basis_lamports IS NULL OR (
+      position_2_cost_basis_lamports <> 'NaN'::NUMERIC
+      AND position_2_cost_basis_lamports > 0
+      AND position_2_cost_basis_lamports = trunc(position_2_cost_basis_lamports)
+      AND scale(position_2_cost_basis_lamports) = 0
+      AND position_2_cost_basis_lamports < 18446744073709551616
+    ))
+    AND (position_2_conservative_liquidation_lamports IS NULL OR (
+      position_2_conservative_liquidation_lamports <> 'NaN'::NUMERIC
+      AND position_2_conservative_liquidation_lamports >= 0
+      AND position_2_conservative_liquidation_lamports
+        = trunc(position_2_conservative_liquidation_lamports)
+      AND scale(position_2_conservative_liquidation_lamports) = 0
+      AND position_2_conservative_liquidation_lamports < 18446744073709551616
+    ))
     AND realized_net_pnl_raw <> 'NaN'::NUMERIC
     AND realized_net_pnl_raw = trunc(realized_net_pnl_raw)
     AND scale(realized_net_pnl_raw) = 0
     AND realized_net_pnl_raw BETWEEN
       -170141183460469231731687303715884105728
       AND 170141183460469231731687303715884105727
+  ),
+  CONSTRAINT execution_wallet_snapshots_positions_check CHECK (
+    (open_positions = 0
+      AND position_1_id IS NULL AND position_1_cost_basis_lamports IS NULL
+      AND position_1_conservative_liquidation_lamports IS NULL
+      AND position_1_reconciliation_status IS NULL
+      AND position_2_id IS NULL AND position_2_cost_basis_lamports IS NULL
+      AND position_2_conservative_liquidation_lamports IS NULL
+      AND position_2_reconciliation_status IS NULL)
+    OR (open_positions = 1
+      AND octet_length(position_1_id) BETWEEN 1 AND 256
+      AND position_1_cost_basis_lamports IS NOT NULL
+      AND position_1_reconciliation_status IN ('RECONCILED', 'UNKNOWN')
+      AND position_2_id IS NULL AND position_2_cost_basis_lamports IS NULL
+      AND position_2_conservative_liquidation_lamports IS NULL
+      AND position_2_reconciliation_status IS NULL)
+    OR (open_positions = 2
+      AND octet_length(position_1_id) BETWEEN 1 AND 256
+      AND position_1_cost_basis_lamports IS NOT NULL
+      AND position_1_reconciliation_status IN ('RECONCILED', 'UNKNOWN')
+      AND octet_length(position_2_id) BETWEEN 1 AND 256
+      AND position_2_id <> position_1_id
+      AND position_2_cost_basis_lamports IS NOT NULL
+      AND position_2_reconciliation_status IN ('RECONCILED', 'UNKNOWN'))
   ),
   CONSTRAINT execution_wallet_snapshots_temporal_check CHECK (
     isfinite(observed_at)
@@ -281,6 +351,7 @@ CREATE TABLE IF NOT EXISTS execution_risk_admission_reports (
   report_id TEXT PRIMARY KEY,
   payload_version SMALLINT NOT NULL DEFAULT 1,
   report_fingerprint TEXT NOT NULL UNIQUE,
+  input_fingerprint TEXT NOT NULL,
   intent_id TEXT NOT NULL,
   generation_id TEXT NOT NULL,
   policy_fingerprint TEXT NOT NULL,
@@ -293,6 +364,7 @@ CREATE TABLE IF NOT EXISTS execution_risk_admission_reports (
   projected_exposure_raw NUMERIC NOT NULL,
   projected_drawdown_raw NUMERIC NOT NULL,
   quota_state TEXT NOT NULL,
+  wallet_state_revision BIGINT NOT NULL,
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT date_trunc('milliseconds', statement_timestamp()),
   terminal_at TIMESTAMPTZ,
   purge_after TIMESTAMPTZ,
@@ -307,16 +379,22 @@ CREATE TABLE IF NOT EXISTS execution_risk_admission_reports (
     payload_version = 1
     AND report_id ~ '^execution_risk_admission_[0-9a-f]{64}$'
     AND report_fingerprint ~ '^[0-9a-f]{64}$'
+    AND input_fingerprint ~ '^[0-9a-f]{64}$'
     AND policy_fingerprint ~ '^[0-9a-f]{64}$'
     AND wallet_snapshot_fingerprint ~ '^[0-9a-f]{64}$'
     AND provider_snapshot_fingerprint ~ '^[0-9a-f]{64}$'
     AND decision IN ('ADMITTED', 'REJECTED')
     AND quota_state IN ('NORMAL', 'ENTRY_BLOCKED', 'EXIT_ONLY', 'UNKNOWN')
+    AND wallet_state_revision >= 0
     AND (reason_code IS NULL OR reason_code IN (
       'WALLET_MISMATCH', 'GENESIS_MISMATCH', 'CAPITAL_LIMIT_EXCEEDED',
       'EXPOSURE_LIMIT_EXCEEDED', 'DRAWDOWN_LIMIT_EXCEEDED',
+      'QUOTE_MINT_NOT_ALLOWED', 'EXECUTION_BUILD_FAILED',
+      'BUY_SIMULATION_FAILED', 'SELL_SIMULATION_FAILED',
+      'EXECUTION_PROVIDER_FAILED', 'CONFIRMATION_TIMEOUT',
       'PROVIDER_USAGE_UNKNOWN', 'PROVIDER_ENTRY_LIMIT_REACHED',
-      'PROVIDER_EXIT_ONLY', 'RECONCILIATION_REQUIRED'
+      'PROVIDER_EXIT_ONLY', 'RECONCILIATION_REQUIRED',
+      'DECISION_STALE'
     ))
   ),
   CONSTRAINT execution_risk_admission_reports_amounts_check CHECK (

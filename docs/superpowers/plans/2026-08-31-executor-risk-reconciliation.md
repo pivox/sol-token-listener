@@ -419,19 +419,19 @@ git commit -m "feat: store executor risk snapshots and counters (#51)"
 - Create: `tests/execution-risk-admission.test.ts`
 - Modify: `tests/execution-risk.repository.test.ts`
 
-- [ ] **Step 1: Write failing concurrent-admission tests**
+- [x] **Step 1: Write failing concurrent-admission tests**
 
 Open two PostgreSQL pools and race two BUY admissions whose combined exposure
 exceeds the limit. Assert exactly one ADMITTED reservation, one REJECTED
 report, unchanged intent payloads and a monotone wallet risk revision.
 
-- [ ] **Step 2: Write failing replay, stale-snapshot and crash tests**
+- [x] **Step 2: Write failing replay, stale-snapshot and crash tests**
 
 Prove exact replay returns the same report/reservation; changed fingerprints,
 generation ABA, stale wallet/provider revision and injected failure before
 commit leave no partial reservation.
 
-- [ ] **Step 3: Verify RED**
+- [x] **Step 3: Verify RED**
 
 Run:
 
@@ -441,20 +441,20 @@ TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot node --i
 
 Expected: `admitBuy` is absent/incomplete.
 
-- [ ] **Step 4: Implement the nine-step admission transaction**
+- [x] **Step 4: Implement the nine-step admission transaction**
 
 Use `pg_advisory_xact_lock`, `FOR UPDATE` on generation/state/intent, one
 statement timestamp CTE, exact snapshot fingerprints, pure Task 1/2
 evaluation, append-only report and unique reservation. Do no RPC or external
 await while the transaction is open.
 
-- [ ] **Step 5: Implement the thin admission service**
+- [x] **Step 5: Implement the thin admission service**
 
 Validate own fields, BUY side, WSOL, immutable intent and snapshot identities,
 then call the repository once. It must never retry a database ambiguity by
 itself.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
 Run the Task 6 test command. Expected: both concurrent directions pass. Then:
 
