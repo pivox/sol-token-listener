@@ -21,7 +21,7 @@ repository but are not wired into `src/executor/main.ts`.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-risk-reconciliation-design.md`
-version 1.0.2 and parent specification version 1.6.2.
+version 1.0.3 and parent specification version 1.6.3.
 
 ---
 
@@ -330,10 +330,10 @@ Expected: migration 034 missing and manifest expectation fails.
 
 - [ ] **Step 3: Implement migration 034**
 
-Create the eleven tables named by spec 1.0.2, including
+Create the eleven tables named by spec 1.0.3, including
 `execution_wallet_risk_state`. Use `CREATE TABLE IF NOT EXISTS`, named
-constraints and `CREATE INDEX IF NOT EXISTS`. Store unsigned values as
-`NUMERIC(20,0)` and signed deltas as `NUMERIC(39,0)`. Every terminal
+constraints and `CREATE INDEX IF NOT EXISTS`. Store financial integers as
+unscaled `NUMERIC` with explicit integer/u64 or integer/i128 checks. Every terminal
 `purge_after` must equal its reconciliation/end timestamp plus four hours.
 
 - [ ] **Step 4: Verify base-empty and replay on real PostgreSQL**

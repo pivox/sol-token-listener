@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.6.2
+**Version de spécification :** 1.6.3
 
 **Date :** 2026-08-31
 
@@ -15,6 +15,9 @@ inerte des intentions d'exécution), #51-C (processus executor dry-run), #51-D
 
 ## Historique des versions
 
+- **1.6.3 — 2026-08-31 :** interdit `NUMERIC(p,0)` pour les entiers financiers
+  #51-E et exige un `NUMERIC` non scalé avec contrôles d'intégralité et bornes,
+  afin d'empêcher l'arrondi silencieux des entrées décimales par PostgreSQL.
 - **1.6.2 — 2026-08-31 :** aligne le décompte du schéma #51-E sur sa liste
   normative de onze tables durables ; le périmètre et les invariants restent
   inchangés.

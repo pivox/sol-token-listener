@@ -1,8 +1,8 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
-**Version de la spécification parente :** 1.6.2
+**Version de la spécification parente :** 1.6.3
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.3 — 2026-08-31 :** impose des colonnes `NUMERIC` non scalées avec
+  contrôles explicites d'intégralité et bornes u64/i128. PostgreSQL arrondit
+  avant les `CHECK` avec `NUMERIC(p,0)`, ce qui accepterait silencieusement une
+  entrée décimale.
 - **1.0.2 — 2026-08-31 :** corrige le décompte du schéma durable : la liste
   normative contient onze tables, dont `execution_wallet_risk_state` et les
   tombstones minimaux.
@@ -376,9 +380,11 @@ La migration `034_execution_risk_reconciliation.sql` ajoute :
 
 Les tables brutes/snapshots append-only sont séparées des agrégats courants.
 Les enums sont fermées par `CHECK`; les timestamps sont UTC, finis et tronqués
-à la milliseconde ; les entiers financiers sont `NUMERIC(20,0)` ou
-`NUMERIC(39,0)` selon leur signe. Aucune valeur `DOUBLE PRECISION`, `REAL`,
-JSON financier numérique, URL provider ou secret n'est autorisée.
+à la milliseconde. Les entiers financiers sont des `NUMERIC` non scalés avec
+`scale(value) = 0`, `value = trunc(value)`, rejet explicite de `NaN` et bornes
+u64 ou i128 selon leur signe. `NUMERIC(p,0)` est interdit car PostgreSQL
+arrondit avant le `CHECK`. Aucune valeur `DOUBLE PRECISION`, `REAL`, JSON
+financier numérique, URL provider ou secret n'est autorisée.
 
 La migration est compatible base vide et upgrade depuis 033, rejouable sans
 réécrire les lignes. Les contraintes de FK ne permettent jamais de supprimer
