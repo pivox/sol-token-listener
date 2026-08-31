@@ -8,6 +8,7 @@ import type {
   PumpSwapFeeState,
   PumpSwapFeeTier,
 } from './pumpswap-fee-state.js';
+export { computeEffectiveQuoteReservesRaw } from './reserve-math.js';
 
 export class InvalidPumpSwapQuoteError extends Error {
   public constructor(message: string) {

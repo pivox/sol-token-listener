@@ -1,9 +1,10 @@
 import { createRequire } from 'node:module';
 import type * as PumpSdkModule from '@pump-fun/pump-sdk';
 
-// The official package exposes an ESM condition without declaring its package
-// type. Node 22/24 therefore cannot reliably bind its named exports through
-// TypeScript loaders. Keep that packaging workaround isolated at this edge.
+// @pump-fun/pump-sdk 1.36.0 cannot be loaded through its ESM condition on the
+// supported Node 22 line because one transitive Anchor dependency exposes CJS
+// named exports incompatibly. Keep the literal CJS bridge isolated here and
+// export only the reviewed instruction/codec surface below.
 const sdk = createRequire(import.meta.url)('@pump-fun/pump-sdk') as typeof PumpSdkModule;
 
 export const {

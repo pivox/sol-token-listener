@@ -13,6 +13,7 @@ import {
 } from '../domain/execution-intent.js';
 import type {
   ClaimedExecutionIntent,
+  ExecutionBeginAttemptResult,
   ExecutionClaimPurpose,
   ExecutionIntentRepository,
   ExecutionIntentTransitionEvidenceV1,
@@ -164,7 +165,7 @@ const CLAIM_PROJECTION = `${INTENT_PROJECTION},
 
 const CLAIM_SQL: Readonly<Record<ExecutionClaimPurpose, string>> = Object.freeze({
   EXECUTE: claimSql(
-    "intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING', 'SIMULATED')",
+    "intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')",
     true,
   ),
   CONFIRM: claimSql("intent.status IN ('SUBMITTED')", false),
@@ -270,11 +271,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     });
   }
 
-  public async beginAttempt(claimValue: ClaimedExecutionIntent): Promise<Readonly<{
-    readonly intentId: string;
-    readonly attemptNumber: number;
-    readonly startedAtMs: number;
-  }>> {
+  public async beginAttempt(claimValue: ClaimedExecutionIntent): Promise<ExecutionBeginAttemptResult> {
     return this.safely(async () => {
       const claim = claimedInput(claimValue);
       if (claim.intent.status !== 'PROCESSING') throw attemptConflictError();
@@ -283,9 +280,12 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         const ledger = await lockAttemptLedger(client, locked);
         if (ledger.latest?.status === 'STARTED') {
           return Object.freeze({
-            intentId: claim.intent.id,
-            attemptNumber: ledger.latest.attemptNumber,
-            startedAtMs: ledger.latest.startedAtMs,
+            claim: locked,
+            attempt: Object.freeze({
+              intentId: locked.intent.id,
+              attemptNumber: ledger.latest.attemptNumber,
+              startedAtMs: ledger.latest.startedAtMs,
+            }),
           });
         }
         if (locked.intent.attemptCount === INT32_MAX) throw attemptExhaustedError();
@@ -319,12 +319,23 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
            WHERE intent.id=$1 AND intent.status=$2
              AND intent.lease_token=$3::UUID
              AND intent.state_revision=$4::BIGINT
-             AND intent.lease_expires_at > statement_timestamp()`,
+             AND intent.lease_expires_at > statement_timestamp()
+           RETURNING ${INTENT_PROJECTION}`,
           [claim.intent.id, claim.intent.status, claim.leaseToken,
             claim.intent.stateRevision.toString(), attemptNumber],
         );
-        requireFencedMutation(updated);
-        return Object.freeze({ intentId: claim.intent.id, attemptNumber, startedAtMs });
+        if (updated.rowCount === 0 && updated.rows.length === 0) throw leaseLostError();
+        if (updated.rowCount !== 1 || updated.rows.length !== 1) throw dataError();
+        const row = requiredRow(updated.rows);
+        const intent = intentFromRow(row);
+        const lease = leaseFromIntentRow(row);
+        if (lease === null || !sameBegunAttemptClaim(locked, intent, lease, attemptNumber)) {
+          throw dataError();
+        }
+        return Object.freeze({
+          claim: Object.freeze({ intent, ...lease }),
+          attempt: Object.freeze({ intentId: intent.id, attemptNumber, startedAtMs }),
+        });
       });
     });
   }
@@ -384,7 +395,10 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     });
   }
 
-  public async renew(claimValue: ClaimedExecutionIntent, leaseMsValue: number): Promise<boolean> {
+  public async renew(
+    claimValue: ClaimedExecutionIntent,
+    leaseMsValue: number,
+  ): Promise<ClaimedExecutionIntent> {
     return this.safely(async () => {
       const claim = claimedInput(claimValue);
       const leaseMs = positiveInteger(leaseMsValue, MAX_LEASE_MS, 'INVALID_INPUT');
@@ -403,11 +417,18 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
            WHERE intent.id=$1 AND intent.status=$2
              AND intent.lease_token=$3::UUID
              AND intent.state_revision=$4::BIGINT
-             AND intent.lease_expires_at > statement_timestamp()`,
+             AND intent.lease_expires_at > statement_timestamp()
+           RETURNING ${INTENT_PROJECTION}`,
           [claim.intent.id, claim.intent.status, claim.leaseToken,
             claim.intent.stateRevision.toString(), leaseMs],
         );
-        return fencedBooleanMutation(renewed);
+        if (renewed.rowCount === 0 && renewed.rows.length === 0) throw leaseLostError();
+        if (renewed.rowCount !== 1 || renewed.rows.length !== 1) throw dataError();
+        const row = requiredRow(renewed.rows);
+        const intent = intentFromRow(row);
+        const lease = leaseFromIntentRow(row);
+        if (lease === null || !sameRenewedClaim(claim, intent, lease, leaseMs)) throw dataError();
+        return Object.freeze({ intent, ...lease });
       });
     });
   }
@@ -1058,6 +1079,46 @@ function sameLeaseIdentity(
     && actual.leaseExpiresAtMs === expected.leaseExpiresAtMs;
 }
 
+function sameRenewedClaim(
+  previous: ClaimedExecutionIntent,
+  renewed: ExecutionIntentV1,
+  lease: LeaseIdentity,
+  leaseMs: number,
+): boolean {
+  return sameImmutableIntent(previous.intent, renewed)
+    && renewed.status === previous.intent.status
+    && renewed.attemptCount === previous.intent.attemptCount
+    && renewed.stateRevision === previous.intent.stateRevision
+    && renewed.lastReasonCode === previous.intent.lastReasonCode
+    && renewed.terminalAtMs === previous.intent.terminalAtMs
+    && renewed.reconciliationCompletedAtMs === previous.intent.reconciliationCompletedAtMs
+    && renewed.purgeAfterMs === previous.intent.purgeAfterMs
+    && renewed.updatedAtMs >= previous.intent.updatedAtMs
+    && lease.leaseOwner === previous.leaseOwner
+    && lease.leaseToken === previous.leaseToken
+    && lease.leaseExpiresAtMs >= previous.leaseExpiresAtMs
+    && lease.leaseExpiresAtMs === renewed.updatedAtMs + leaseMs;
+}
+
+function sameBegunAttemptClaim(
+  previous: ClaimedExecutionIntent,
+  refreshed: ExecutionIntentV1,
+  lease: LeaseIdentity,
+  attemptNumber: number,
+): boolean {
+  return sameImmutableIntent(previous.intent, refreshed)
+    && refreshed.status === 'PROCESSING'
+    && refreshed.attemptCount === attemptNumber
+    && attemptNumber === previous.intent.attemptCount + 1
+    && refreshed.stateRevision === previous.intent.stateRevision
+    && refreshed.lastReasonCode === previous.intent.lastReasonCode
+    && refreshed.terminalAtMs === previous.intent.terminalAtMs
+    && refreshed.reconciliationCompletedAtMs === previous.intent.reconciliationCompletedAtMs
+    && refreshed.purgeAfterMs === previous.intent.purgeAfterMs
+    && refreshed.updatedAtMs >= previous.intent.updatedAtMs
+    && sameLeaseIdentity(lease, previous);
+}
+
 function claimFromRow(value: unknown): Readonly<{
   readonly claim: ClaimedExecutionIntent;
   readonly claimAtMs: number;
@@ -1266,8 +1327,7 @@ function statusMatchesPurpose(
   purpose: ExecutionClaimPurpose,
 ): boolean {
   if (purpose === 'EXECUTE') {
-    return value === 'PENDING' || value === 'RETRY_READY'
-      || value === 'PROCESSING' || value === 'SIMULATED';
+    return value === 'PENDING' || value === 'RETRY_READY' || value === 'PROCESSING';
   }
   if (purpose === 'CONFIRM') return value === 'SUBMITTED';
   if (purpose === 'DRY_RUN') return value === 'PENDING' || value === 'RETRY_READY';
@@ -1466,11 +1526,6 @@ function requiredRow(rows: readonly Row[]): Row {
 }
 
 function requireOneMutation(result: QueryResult): void {
-  if (result.rowCount !== 1) throw dataError();
-}
-
-function requireFencedMutation(result: QueryResult): void {
-  if (result.rowCount === 0) throw leaseLostError();
   if (result.rowCount !== 1) throw dataError();
 }
 

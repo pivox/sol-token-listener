@@ -26,6 +26,8 @@ void test('emits the executor service base and only the closed safe context', ()
     intentId: `execution_intent_${'a'.repeat(64)}`,
     side: 'BUY',
     outcome: 'FOUNDATION_VALIDATED',
+    reasonCode: 'INTENT_SUCCEEDED',
+    providerId: 'primary',
     errorCode: 'NONE',
   }));
 
@@ -34,7 +36,8 @@ void test('emits the executor service base and only the closed safe context', ()
   assert.deepEqual(contextFrom(line), {
     event: 'executor.pass_completed', mode: 'dry-run',
     intentId: `execution_intent_${'a'.repeat(64)}`,
-    side: 'BUY', outcome: 'FOUNDATION_VALIDATED', errorCode: 'NONE',
+    side: 'BUY', outcome: 'FOUNDATION_VALIDATED', reasonCode: 'INTENT_SUCCEEDED',
+    providerId: 'primary', errorCode: 'NONE',
   });
 });
 
@@ -114,11 +117,12 @@ function memorySink(): Readonly<{
 
 function contextFrom(line: Record<string, unknown>): Record<string, unknown> {
   const result: Record<string, unknown> = {};
-  for (const key of ['event', 'mode', 'intentId', 'side', 'outcome', 'errorCode']) {
+  for (const key of ['event', 'mode', 'intentId', 'side', 'outcome', 'reasonCode', 'providerId', 'errorCode']) {
     if (Object.hasOwn(line, key)) result[key] = line[key];
   }
   const allowedMetadata = new Set([
-    'level', 'time', 'service', 'event', 'mode', 'intentId', 'side', 'outcome', 'errorCode',
+    'level', 'time', 'service', 'event', 'mode', 'intentId', 'side', 'outcome',
+    'reasonCode', 'providerId', 'errorCode',
   ]);
   assert.deepEqual(Object.keys(line).filter((key) => !allowedMetadata.has(key)), []);
   return result;

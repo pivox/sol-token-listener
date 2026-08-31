@@ -76,6 +76,37 @@ void test('logs only a stable pass error code and resumes after the poll backoff
   await runtime;
 });
 
+void test('logs one closed simulation-only completion without provider payload data', async () => {
+  const scheduler = manualScheduler();
+  const signals = new EventEmitter();
+  const logs: ExecutorLogContext[] = [];
+  let calls = 0;
+  const runtime = runExecutorRuntime({
+    runOnce: async () => {
+      calls += 1;
+      if (calls === 1) return Object.freeze({
+        kind: 'RECORDED' as const, mode: 'simulation-only' as const,
+        intentId: `execution_intent_${'a'.repeat(64)}`, side: 'SELL' as const,
+        outcome: 'SIMULATION_FAILED' as const, reasonCode: 'SELL_SIMULATION_FAILED' as const,
+        providerId: 'primary',
+      });
+      return 'IDLE';
+    },
+    logger: logger(logs), closeDatabase: async () => undefined,
+    evictDatabase: () => undefined, forceExit: () => undefined,
+  }, { pollMs: 750, shutdownGraceMs: 5_000, scheduler, signalSource: signals });
+
+  await nextTurn();
+  assert.deepEqual(logs, [{
+    event: 'executor.simulation_recorded', mode: 'simulation-only',
+    outcome: 'SIMULATION_FAILED', reasonCode: 'SELL_SIMULATION_FAILED', providerId: 'primary',
+  }]);
+  scheduler.fire(750);
+  await nextTurn();
+  signals.emit('SIGTERM');
+  await runtime;
+});
+
 void test('maps an attacker-controlled uppercase error code to one fixed runtime code', async () => {
   const scheduler = manualScheduler();
   const signals = new EventEmitter();

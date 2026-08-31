@@ -4,21 +4,31 @@ import { pathToFileURL } from 'node:url';
 import { closeDatabase, getDatabasePool } from '../storage/database.js';
 import { PostgresExecutionDryRunRepository } from '../storage/execution-dry-run.repository.js';
 import { PostgresExecutionIntentRepository } from '../storage/execution-intent.repository.js';
+import { PostgresExecutionSimulationRepository } from '../storage/execution-simulation.repository.js';
+import { PostgresExecutionVenueRepository } from '../storage/execution-venue.repository.js';
+import { createExecutionAttemptEvaluator } from '../executor-simulation/attempt-evaluator.js';
+import {
+  ProviderAffineSession,
+  type ProviderAffineSessionConfig,
+} from '../executor-simulation/provider-session.js';
 import { parseExecutorConfig } from './config.js';
 import { createExecutorDatabase } from './database.js';
 import { createDryRunWorker } from './dry-run-worker.js';
 import { createExecutorLogger } from './logger.js';
 import { runExecutorRuntime } from './runtime.js';
+import { createSimulationOnlyWorker } from './simulation-worker.js';
 
 const SAFE_FATAL_ERROR_NAMES = new Set([
   'ExecutorConfigError', 'ExecutorDatabaseError',
   'ExecutionIntentRepositoryError', 'ExecutionDryRunRepositoryError',
+  'ExecutionSimulationRepositoryError', 'ExecutionAttemptEvaluatorError',
   'Error', 'TypeError', 'RangeError', 'AggregateError',
 ]);
 const SAFE_FATAL_ERROR_CODES = new Set([
   'INVALID_EXECUTOR_CONFIG', 'EXECUTOR_DATABASE_BUSY',
   'INVALID_INPUT', 'INVALID_DATA', 'DATABASE_FAILURE',
   'COMMIT_OUTCOME_UNKNOWN', 'INTENT_FENCE_LOST', 'ASSESSMENT_CONFLICT',
+  'ARTIFACT_CONFLICT', 'OPERATION_ABORTED',
   'INTENT_DUPLICATE', 'INTENT_LEASE_LOST', 'ATTEMPT_EXHAUSTED', 'ATTEMPT_CONFLICT',
 ]);
 
@@ -39,12 +49,26 @@ export async function main(): Promise<void> {
     }));
   });
   const database = createExecutorDatabase(pool);
-  const worker = createDryRunWorker(Object.freeze({
-    intents: new PostgresExecutionIntentRepository(database.pool),
-    assessments: new PostgresExecutionDryRunRepository(database.pool),
-    ownerId: `executor-dry-run-${randomUUID()}`,
-    leaseMs: config.leaseMs,
-  }));
+  const intents = new PostgresExecutionIntentRepository(database.pool);
+  const worker = config.mode === 'dry-run'
+    ? createDryRunWorker(Object.freeze({
+      intents,
+      assessments: new PostgresExecutionDryRunRepository(database.pool),
+      ownerId: `executor-dry-run-${randomUUID()}`,
+      leaseMs: config.leaseMs,
+    }))
+    : createSimulationOnlyWorker(Object.freeze({
+      intents,
+      artifacts: new PostgresExecutionSimulationRepository(database.pool),
+      evaluator: createExecutionAttemptEvaluator(Object.freeze({
+        config,
+        venues: new PostgresExecutionVenueRepository(database.pool),
+        sessionFactory: (sessionConfig: ProviderAffineSessionConfig) =>
+          new ProviderAffineSession(sessionConfig),
+      })),
+      ownerId: `executor-simulation-only-${randomUUID()}`,
+      leaseMs: config.leaseMs,
+    }));
   await runExecutorRuntime({
     runOnce: worker.runOnce,
     logger,

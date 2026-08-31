@@ -6,6 +6,10 @@ import {
 } from '../src/executor/config.js';
 
 const DATABASE_URL = 'postgresql://executor@127.0.0.1:5432/executor';
+const EXECUTOR_PUBLIC_KEY = 'gCr8XkSUeFUxTpZE8HrZMGC98XdGGVyakeocBNTDibJ';
+const EXPECTED_GENESIS_HASH = '2MPoZYQYPdDkMNKdb7Z3U6ypaiddzuNBAqKNBypSh3pN';
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+const HTTP_RPC_URL = 'https://operator:credential@rpc.example.test/solana';
 const SECRET_KEYS = Object.freeze([
   'EXECUTOR_PRIVATE_KEY',
   'EXECUTOR_SECRET_KEY',
@@ -38,6 +42,175 @@ void test('parses the exact frozen dry-run defaults without importing listener c
     'mode', 'databaseUrl', 'pollMs', 'leaseMs',
     'databaseStatementTimeoutMs', 'shutdownGraceMs',
   ]);
+});
+
+void test('parses the exact frozen simulation-only defaults without any signing material', () => {
+  const config = parseExecutorConfig(simulationEnvironment());
+
+  assert.deepEqual(config, {
+    mode: 'simulation-only',
+    databaseUrl: DATABASE_URL,
+    pollMs: 1_000,
+    leaseMs: 35_000,
+    databaseStatementTimeoutMs: 3_000,
+    shutdownGraceMs: 10_000,
+    executorPublicKey: EXECUTOR_PUBLIC_KEY,
+    providerId: 'primary',
+    httpRpcUrl: HTTP_RPC_URL,
+    expectedGenesisHash: EXPECTED_GENESIS_HASH,
+    quoteMaxAgeMs: 3_000,
+    slippageBps: 500n,
+    snapshotMaxSlotLag: 8,
+    maxComputeUnits: 300_000n,
+    maxFeeLamports: 100_000n,
+    maxFeePayerLamportDebit: 2_500_000n,
+    maxPriorityFeeLamports: 0n,
+    rpcTimeoutMs: 5_000,
+    maxRpcCallsPerAttempt: 8,
+    quoteMintAllowlist: [WSOL_MINT],
+  });
+  assert.equal(Object.isFrozen(config), true);
+  assert.equal(Object.isFrozen(config.quoteMintAllowlist), true);
+  assert.deepEqual(Reflect.ownKeys(config), [
+    'mode', 'databaseUrl', 'pollMs', 'leaseMs',
+    'databaseStatementTimeoutMs', 'shutdownGraceMs', 'executorPublicKey',
+    'providerId', 'httpRpcUrl', 'expectedGenesisHash', 'quoteMaxAgeMs',
+    'slippageBps', 'snapshotMaxSlotLag', 'maxComputeUnits', 'maxFeeLamports',
+    'maxFeePayerLamportDebit', 'maxPriorityFeeLamports', 'rpcTimeoutMs',
+    'maxRpcCallsPerAttempt', 'quoteMintAllowlist',
+  ]);
+});
+
+void test('ignores every public simulation variable in dry-run without invoking accessors', () => {
+  const environment: Record<string, string | undefined> = {
+    DATABASE_URL,
+    EXECUTOR_PUBLIC_KEY: 'not-a-public-key',
+    EXECUTOR_RPC_PROVIDER_ID: '',
+    SOLANA_HTTP_RPC_URL: 'not-a-url',
+    SOLANA_EXPECTED_GENESIS_HASH: 'not-a-hash',
+    EXECUTOR_QUOTE_MAX_AGE_MS: 'invalid',
+    EXECUTOR_SLIPPAGE_BPS: 'invalid',
+    EXECUTOR_SNAPSHOT_MAX_SLOT_LAG: 'invalid',
+    EXECUTOR_MAX_COMPUTE_UNITS: 'invalid',
+    EXECUTOR_MAX_FEE_LAMPORTS: 'invalid',
+    EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT: 'invalid',
+    EXECUTOR_MAX_PRIORITY_FEE_LAMPORTS: 'invalid',
+    EXECUTOR_RPC_TIMEOUT_MS: 'invalid',
+    EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: 'invalid',
+    LIVE_QUOTE_MINT_ALLOWLIST: 'invalid',
+  };
+  let getterCalls = 0;
+  Object.defineProperty(environment, 'EXECUTOR_PUBLIC_KEY', {
+    enumerable: true,
+    get: () => { getterCalls += 1; return 'getter-secret'; },
+  });
+
+  assert.deepEqual(parseExecutorConfig(environment), {
+    mode: 'dry-run', databaseUrl: DATABASE_URL, pollMs: 1_000, leaseMs: 30_000,
+    databaseStatementTimeoutMs: 3_000, shutdownGraceMs: 10_000,
+  });
+  assert.equal(getterCalls, 0);
+});
+
+void test('requires the three public simulation identities and keeps RPC URL errors redacted', () => {
+  for (const key of [
+    'EXECUTOR_PUBLIC_KEY', 'SOLANA_HTTP_RPC_URL', 'SOLANA_EXPECTED_GENESIS_HASH',
+  ] as const) {
+    assertConfigFailure({ ...simulationEnvironment(), [key]: undefined });
+    assertConfigFailure({ ...simulationEnvironment(), [key]: '' });
+  }
+  const secretUrl = 'https://operator:credential@private.invalid/rpc';
+  assertConfigFailure({ ...simulationEnvironment(), SOLANA_HTTP_RPC_URL: secretUrl.replace('https:', 'ftp:') }, [
+    secretUrl, 'operator', 'credential', 'private.invalid',
+  ]);
+  assertConfigFailure({ ...simulationEnvironment(), EXECUTOR_PUBLIC_KEY: 'invalid' });
+  assertConfigFailure({ ...simulationEnvironment(), SOLANA_EXPECTED_GENESIS_HASH: 'invalid' });
+});
+
+void test('accepts canonical simulation overrides at inclusive safety boundaries', () => {
+  const config = parseExecutorConfig(simulationEnvironment({
+    EXECUTOR_RPC_PROVIDER_ID: 'provider-1',
+    EXECUTOR_QUOTE_MAX_AGE_MS: '1',
+    EXECUTOR_SLIPPAGE_BPS: '10000',
+    EXECUTOR_SNAPSHOT_MAX_SLOT_LAG: '0',
+    EXECUTOR_MAX_COMPUTE_UNITS: '1',
+    EXECUTOR_MAX_FEE_LAMPORTS: '0',
+    EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT: '0',
+    EXECUTOR_MAX_PRIORITY_FEE_LAMPORTS: '0',
+    EXECUTOR_RPC_TIMEOUT_MS: '1',
+    EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '6',
+    LIVE_TRADING_ENABLED: 'false',
+  }));
+  assert.equal(config.mode, 'simulation-only');
+  assert.equal(config.quoteMaxAgeMs, 1);
+  assert.equal(config.slippageBps, 10_000n);
+  assert.equal(config.snapshotMaxSlotLag, 0);
+  assert.equal(config.maxComputeUnits, 1n);
+  assert.equal(config.maxFeeLamports, 0n);
+  assert.equal(config.maxFeePayerLamportDebit, 0n);
+  assert.equal(config.maxPriorityFeeLamports, 0n);
+  assert.equal(config.rpcTimeoutMs, 1);
+  assert.equal(config.maxRpcCallsPerAttempt, 6);
+});
+
+void test('requires the lease to cover three RPC timeouts and all five renewal DB phases', () => {
+  const accepted = parseExecutorConfig(simulationEnvironment({
+    EXECUTOR_LEASE_MS: '30000',
+    EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
+    EXECUTOR_RPC_TIMEOUT_MS: '4666',
+  }));
+  if (accepted.mode !== 'simulation-only') assert.fail('Expected simulation-only config.');
+  assert.equal(accepted.rpcTimeoutMs, 4_666);
+
+  for (const overrides of [
+    { EXECUTOR_LEASE_MS: '30000', EXECUTOR_RPC_TIMEOUT_MS: '60000' },
+    {
+      EXECUTOR_LEASE_MS: '30000',
+      EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
+      EXECUTOR_RPC_TIMEOUT_MS: '4667',
+    },
+  ]) {
+    assertConfigFailure(simulationEnvironment(overrides));
+  }
+});
+
+void test('rejects noncanonical or unsafe simulation gates and the non-WSOL allowlist', () => {
+  const invalid: Readonly<Record<string, string | undefined>>[] = [
+    { EXECUTOR_RPC_PROVIDER_ID: '' },
+    { EXECUTOR_RPC_PROVIDER_ID: 'provider with spaces' },
+    { EXECUTOR_RPC_PROVIDER_ID: 'a'.repeat(65) },
+    { EXECUTOR_QUOTE_MAX_AGE_MS: '0' },
+    { EXECUTOR_SLIPPAGE_BPS: '10001' },
+    { EXECUTOR_SNAPSHOT_MAX_SLOT_LAG: '-1' },
+    { EXECUTOR_SNAPSHOT_MAX_SLOT_LAG: '129' },
+    { EXECUTOR_MAX_COMPUTE_UNITS: '0' },
+    { EXECUTOR_MAX_COMPUTE_UNITS: '1400001' },
+    { EXECUTOR_MAX_FEE_LAMPORTS: '-1' },
+    { EXECUTOR_MAX_FEE_LAMPORTS: '10000001' },
+    { EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT: '-1' },
+    { EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT: '10000000001' },
+    { EXECUTOR_MAX_PRIORITY_FEE_LAMPORTS: '1' },
+    { EXECUTOR_RPC_TIMEOUT_MS: '0' },
+    { EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '5' },
+    { EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '17' },
+    { LIVE_QUOTE_MINT_ALLOWLIST: `${WSOL_MINT},11111111111111111111111111111111` },
+    { LIVE_QUOTE_MINT_ALLOWLIST: ` ${WSOL_MINT}` },
+    { LIVE_TRADING_ENABLED: 'true' },
+    { SOLANA_HTTP_RPC_URL: `${HTTP_RPC_URL}#fragment` },
+    { SOLANA_HTTP_RPC_URL: ` ${HTTP_RPC_URL}` },
+  ];
+  for (const key of [
+    'EXECUTOR_QUOTE_MAX_AGE_MS', 'EXECUTOR_SLIPPAGE_BPS',
+    'EXECUTOR_SNAPSHOT_MAX_SLOT_LAG', 'EXECUTOR_MAX_COMPUTE_UNITS',
+    'EXECUTOR_MAX_FEE_LAMPORTS', 'EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT',
+    'EXECUTOR_MAX_PRIORITY_FEE_LAMPORTS', 'EXECUTOR_RPC_TIMEOUT_MS',
+    'EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT',
+  ]) {
+    invalid.push({ [key]: '01' });
+  }
+  for (const overrides of invalid) {
+    assertConfigFailure(simulationEnvironment(overrides));
+  }
 });
 
 void test('accepts a NodeJS ProcessEnv record with the runtime process.env prototype', () => {
@@ -116,6 +289,7 @@ void test('accepts absent, undefined and empty secret variables but rejects all 
     assert.equal(parseExecutorConfig({ DATABASE_URL, [key]: '' }).databaseUrl, DATABASE_URL);
     assertConfigFailure({ DATABASE_URL, [key]: ' ' });
     assertConfigFailure({ DATABASE_URL, [key]: `sensitive-${key}` });
+    assertConfigFailure(simulationEnvironment({ [key]: `sensitive-${key}` }));
   }
 });
 
@@ -158,4 +332,17 @@ function assertConfigFailure(
     }
     return true;
   });
+}
+
+function simulationEnvironment(
+  overrides: Readonly<Record<string, string | undefined>> = {},
+): Record<string, string | undefined> {
+  return {
+    DATABASE_URL,
+    EXECUTOR_MODE: 'simulation-only',
+    EXECUTOR_PUBLIC_KEY,
+    SOLANA_HTTP_RPC_URL: HTTP_RPC_URL,
+    SOLANA_EXPECTED_GENESIS_HASH: EXPECTED_GENESIS_HASH,
+    ...overrides,
+  };
 }

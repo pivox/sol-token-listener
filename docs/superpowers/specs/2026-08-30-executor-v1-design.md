@@ -1,19 +1,26 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.4.0
+**Version de spécification :** 1.5.0
 
-**Date :** 2026-08-30
+**Date :** 2026-08-31
 
 **Statut :** APPROUVÉE
 
 **Issue parente :** #51
 
 **Périmètre livré à cette version :** #51-A (conception), #51-B (fondation
-inerte des intentions d'exécution) et conception détaillée #51-C (processus
-executor dry-run)
+inerte des intentions d'exécution), #51-C (processus executor dry-run) et
+conception détaillée #51-D (quote, build éphémère et simulation sans envoi)
 
 ## Historique des versions
 
+- **1.5.0 — 2026-08-31 :** spécifie #51-D : mode `simulation-only`, provider
+  épinglé, snapshot causal, quote fraîche, plan officiel inspecté, message v0
+  éphémère sans ALT ni signature, simulation avec blockhash explicite et preuve
+  durable non signable. Les intentions propres à cette phase sont
+  terminalisées et ne pourront jamais être réutilisées pour signer. Trois
+  reason codes techniques sont ajoutés de façon append-only. Signature et
+  soumission restent réservées à #51-G.
 - **1.4.0 — 2026-08-30 :** spécifie #51-C : processus executor séparé et
   évaluation dry-run annexe déterministe. Le claim reste temporaire, le commit
   atomique persiste l'évaluation et libère le lease sans transition, tentative
@@ -481,8 +488,10 @@ tentative et laisse l'intention disponible pour #51-D. Son évaluation porte
 et marque quote, build, simulation, signature et soumission `NOT_RUN`. Elle ne
 constitue donc aucune preuve de marché et n'est jamais présentée comme un
 `PASS` de trading. #51-D remplace ces absences par une quote fraîche, un build
-non signé et une simulation sans envoi. La conception détaillée est versionnée
-dans [2026-08-30-executor-dry-run-design.md](2026-08-30-executor-dry-run-design.md).
+non signé et une simulation sans envoi. La conception de #51-C est versionnée
+dans [2026-08-30-executor-dry-run-design.md](2026-08-30-executor-dry-run-design.md)
+et celle de #51-D dans
+[2026-08-31-executor-quote-build-simulation-design.md](2026-08-31-executor-quote-build-simulation-design.md).
 
 ### 7.3 Simulation sans envoi
 
@@ -791,6 +800,9 @@ MINIMUM_AMOUNT_OUT_VIOLATED
 UNSUPPORTED_TOKEN_EXTENSION
 WALLET_MISMATCH
 GENESIS_MISMATCH
+EXECUTION_PROVIDER_FAILED
+EXECUTION_BUILD_FAILED
+EXECUTION_EVIDENCE_INVALID
 CAPITAL_LIMIT_EXCEEDED
 EXPOSURE_LIMIT_EXCEEDED
 DRAWDOWN_LIMIT_EXCEEDED
