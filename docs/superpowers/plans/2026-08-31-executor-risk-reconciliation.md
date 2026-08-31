@@ -21,7 +21,7 @@ repository but are not wired into `src/executor/main.ts`.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-risk-reconciliation-design.md`
-version 1.0.4 and parent specification version 1.6.4.
+version 1.0.5 and parent specification version 1.6.4.
 
 ---
 
@@ -330,7 +330,7 @@ Expected: migration 034 missing and manifest expectation fails.
 
 - [x] **Step 3: Implement migration 034**
 
-Create the eleven tables named by spec 1.0.4, including
+Create the eleven tables named by spec 1.0.5, including
 `execution_wallet_risk_state`. Use `CREATE TABLE IF NOT EXISTS`, named
 constraints and `CREATE INDEX IF NOT EXISTS`. Store financial integers as
 unscaled `NUMERIC` with explicit integer/u64 or integer/i128 checks. Every terminal
@@ -532,24 +532,24 @@ git commit -m "feat: reconcile executor effects without submission (#51)"
 - Modify: `src/storage/execution-risk.repository.ts`
 - Create: `tests/execution-fault-ledger.repository.test.ts`
 
-- [ ] **Step 1: Write failing ledger tests**
+- [x] **Step 1: Write failing ledger tests**
 
 Persist BUILD, SIMULATION, PROVIDER, CONFIRMATION and RECONCILIATION faults by
 wallet generation/phase. Prove validation failures do not increment, the
 second technical failure blocks BUY, restart preserves the count, and only a
 final MATCHED reconciled success resets it.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run the new test with `TEST_DATABASE_URL`; expected: missing ledger methods.
 
-- [ ] **Step 3: Implement append-only fault operations**
+- [x] **Step 3: Implement append-only fault operations**
 
 Add idempotent `recordFault` and fenced `recordReconciledSuccess`. Update the
 wallet risk aggregate in the same transaction as the append-only ledger row.
 Never reset from time, process startup, quote success or NO_EFFECT.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [x] **Step 4: Verify GREEN and commit**
 
 ```bash
 git add src/ports/execution-risk-repository.ts src/storage/execution-risk.repository.ts tests/execution-fault-ledger.repository.test.ts

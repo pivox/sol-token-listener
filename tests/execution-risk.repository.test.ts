@@ -171,13 +171,41 @@ void test('reconciliation atomically consumes, releases or holds reservations an
   for (const [outcome, initialStatus, reservationState, intentStatus] of cases) {
     await withTemporarySchema(databaseUrl, `execution_risk_reconcile_${outcome.toLowerCase()}`, async (pool) => {
       const fixture = await reconciliationFixture(pool, outcome, initialStatus);
+      if (outcome === 'MATCHED') {
+        await pool.query(`UPDATE execution_wallet_risk_state SET
+          consecutive_technical_failures=1,
+          last_technical_failure_reason_code='EXECUTION_PROVIDER_FAILED'
+          WHERE generation_id=$1`, [fixture.generationId]);
+      }
       const evidence = reconciliationEvidence(fixture.intentId, outcome, fixture.snapshotFingerprint);
       const result = await fixture.repository.reconcile({ payloadVersion: 1, evidence });
       assert.equal(result.result, outcome);
       assert.deepEqual(await fixture.repository.reconcile({ payloadVersion: 1, evidence }), result);
+      if (outcome === 'MATCHED') {
+        const success = Object.freeze({
+          payloadVersion: 1 as const,
+          evidenceId: evidence.evidenceId,
+          generationId: fixture.generationId,
+          activationPhase: 'NONE' as const,
+        });
+        const reset = await fixture.repository.recordReconciledSuccess(success);
+        assert.equal(reset.consecutiveTechnicalFailures, 0);
+        assert.equal(reset.buyBlocked, false);
+        assert.deepEqual(await fixture.repository.recordReconciledSuccess(success), reset);
+      } else if (outcome === 'NO_EFFECT') {
+        await assert.rejects(
+          fixture.repository.recordReconciledSuccess({
+            payloadVersion: 1,
+            evidenceId: evidence.evidenceId,
+            generationId: fixture.generationId,
+            activationPhase: 'NONE',
+          }),
+          isRepositoryError('CONFLICT'),
+        );
+      }
       const durable = await pool.query(`SELECT reservation.state,intent.status,
         intent.last_reason_code,risk.reserved_exposure_raw::TEXT AS exposure,
-        risk.open_positions,risk.unknown_block,
+        risk.open_positions,risk.unknown_block,risk.consecutive_technical_failures,
         (SELECT COUNT(*)::INTEGER FROM execution_reconciliation_evidence) AS evidence_count
         FROM execution_exposure_reservations AS reservation
         JOIN execution_intents AS intent ON intent.id=reservation.intent_id
@@ -193,6 +221,9 @@ void test('reconciliation atomically consumes, releases or holds reservations an
         assert.equal(durable.rows[0]?.last_reason_code, 'INTENT_SUCCEEDED');
         assert.equal(durable.rows[0]?.exposure, '90000');
         assert.equal(durable.rows[0]?.open_positions, 1);
+        assert.equal(durable.rows[0]?.consecutive_technical_failures, 0);
+        assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+          FROM execution_fault_ledger WHERE classification='RESOLVED'`)).rows[0]?.count, 1);
       } else {
         assert.equal(durable.rows[0]?.unknown_block, true);
       }
@@ -273,6 +304,7 @@ async function reconciliationFixture(
   ) VALUES ($1,1,'STARTED','PUMP_FUN','rpc-primary')`, [created.intent.id]);
   return Object.freeze({
     repository,
+    generationId: generation.generationId,
     intentId: created.intent.id,
     snapshotFingerprint: snapshot.snapshotFingerprint,
   });

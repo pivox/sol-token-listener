@@ -7,6 +7,10 @@ import {
   type ProviderUsageSnapshotV1,
 } from '../domain/execution-provider-quota.js';
 import { assertExecutionIntent, type ExecutionIntentV1 } from '../domain/execution-intent.js';
+import {
+  classifyExecutionFault,
+  type ExecutionRetryDecision,
+} from '../domain/execution-fault-policy.js';
 import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reconciliation.js';
 import {
   createExecutionRiskPolicy,
@@ -17,8 +21,11 @@ import {
 import type {
   ExecutionBuyAdmissionInputV1,
   ExecutionBuyAdmissionResultV1,
+  ExecutionFaultRecordInputV1,
+  ExecutionFaultRecordResultV1,
   ExecutionReconciliationCommitResultV1,
   ExecutionReconciliationCommitV1,
+  ExecutionReconciledSuccessInputV1,
   ExecutionRiskRepository,
   ProviderRateLimitEventV1,
   ProviderUsageOperationV1,
@@ -134,6 +141,20 @@ const RECONCILIATION_EVIDENCE_KEYS = Object.freeze([
   'observedTransactionFingerprint', 'feeLamports', 'walletLamportDelta', 'baseDeltaRaw',
   'quoteDeltaRaw', 'unexpectedResidualTokenBalanceRaw', 'observedAtMs', 'finalizedAtMs',
   'result', 'reasonCode',
+] as const);
+const FAULT_KEYS = Object.freeze([
+  'faultId', 'payloadVersion', 'generationId', 'intentId', 'activationPhase', 'stage',
+  'side', 'timing', 'classification', 'exactSignedBytesAvailable', 'reasonCode', 'observedAtMs',
+] as const);
+const RECONCILED_SUCCESS_KEYS = Object.freeze([
+  'payloadVersion', 'evidenceId', 'generationId', 'activationPhase',
+] as const);
+const FAULT_REASON_CODES = Object.freeze([
+  'BUY_SIMULATION_FAILED', 'SELL_SIMULATION_FAILED', 'EXECUTION_PROVIDER_FAILED',
+  'EXECUTION_BUILD_FAILED', 'EXECUTION_EVIDENCE_INVALID', 'SIGNATURE_PERSIST_FAILED',
+  'SUBMISSION_AMBIGUOUS', 'CONFIRMATION_TIMEOUT', 'RECONCILIATION_REQUIRED',
+  'RECONCILIATION_PROVED_NO_EFFECT', 'BALANCE_MISMATCH', 'RESIDUAL_TOKEN_BALANCE',
+  'DOUBLE_ORDER_SUSPECTED',
 ] as const);
 
 const GENERATION_PROJECTION = `generation_id,payload_version,wallet_public_key,cluster,
@@ -519,6 +540,158 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         reservationId,
         stateRevision: targetRevision,
       });
+    });
+  }
+
+  public async recordFault(
+    inputValue: ExecutionFaultRecordInputV1,
+  ): Promise<ExecutionFaultRecordResultV1> {
+    const input = faultFrom(inputValue);
+    const fingerprint = faultFingerprint(input);
+    return this.transaction(async (client) => {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
+        [input.generationId],
+      );
+      const stateResult = await client.query(`SELECT
+        risk.state_revision::TEXT AS state_revision,
+        risk.consecutive_technical_failures,
+        generation.retired_at
+        FROM execution_wallet_risk_state AS risk
+        JOIN execution_wallet_generations AS generation
+          ON generation.generation_id=risk.generation_id
+        WHERE risk.generation_id=$1 FOR UPDATE OF risk,generation`, [input.generationId]);
+      const state = exactRow(singleRow(stateResult), [
+        'state_revision', 'consecutive_technical_failures', 'retired_at',
+      ] as const);
+      if (state.retired_at !== null) throw failure('CONFLICT');
+      const existing = await client.query(`SELECT fault_fingerprint,
+        consecutive_failure_count,retry_decision FROM execution_fault_ledger
+        WHERE fault_id=$1`, [input.faultId]);
+      if (existing.rows.length > 0) {
+        if (existing.rows.length !== 1) throw failure('INVALID_DATA');
+        const prior = exactRow(existing.rows[0], [
+          'fault_fingerprint', 'consecutive_failure_count', 'retry_decision',
+        ] as const);
+        if (prior.fault_fingerprint !== fingerprint) throw failure('CONFLICT');
+        return faultResult(
+          input.faultId,
+          integer(prior.consecutive_failure_count, 0, 32_767),
+          enumValue(prior.retry_decision, [
+            'DO_NOT_RETRY', 'RETRY_PRE_SIGNATURE', 'RECONCILE_ONLY', 'RETRY_EXACT_BYTES',
+          ] as const),
+        );
+      }
+      const currentFailures = integer(state.consecutive_technical_failures, 0, 32_767);
+      const technicalReason = technicalFailureReason(input);
+      const nextFailures = technicalReason === null
+        ? currentFailures : Math.min(currentFailures + 1, 32_767);
+      const retryDecision = classifyExecutionFault({
+        stage: input.stage,
+        side: input.side,
+        timing: input.timing,
+        classification: input.classification,
+        consecutiveTechnicalFailures: nextFailures,
+        exactSignedBytesAvailable: input.exactSignedBytesAvailable,
+      });
+      const insert = await client.query(`INSERT INTO execution_fault_ledger (
+        fault_id,payload_version,fault_fingerprint,generation_id,intent_id,activation_phase,
+        stage,classification,retry_decision,reason_code,consecutive_failure_count,observed_at
+      ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        TIMESTAMPTZ 'epoch' + ($11::BIGINT * INTERVAL '1 millisecond'))`, [
+        input.faultId, fingerprint, input.generationId, input.intentId, input.activationPhase,
+        input.stage, input.classification, retryDecision, input.reasonCode, nextFailures,
+        input.observedAtMs,
+      ]);
+      if (insert.rowCount !== 1) throw failure('INVALID_DATA');
+      if (technicalReason !== null) {
+        const revision = unsignedBigint(parseBigint(state.state_revision));
+        const update = await client.query(`UPDATE execution_wallet_risk_state SET
+          state_revision=$2::BIGINT,consecutive_technical_failures=$3,
+          last_technical_failure_reason_code=$4,
+          updated_at=TIMESTAMPTZ 'epoch' + ($5::BIGINT * INTERVAL '1 millisecond')
+          WHERE generation_id=$1 AND state_revision=$6::BIGINT`, [
+          input.generationId, (revision + 1n).toString(), nextFailures, technicalReason,
+          input.observedAtMs, revision.toString(),
+        ]);
+        if (update.rowCount !== 1) throw failure('CONFLICT');
+      }
+      return faultResult(input.faultId, nextFailures, retryDecision);
+    });
+  }
+
+  public async recordReconciledSuccess(
+    inputValue: ExecutionReconciledSuccessInputV1,
+  ): Promise<ExecutionFaultRecordResultV1> {
+    const input = reconciledSuccessFrom(inputValue);
+    const faultId = `execution_fault_${hash([
+      'execution-reconciled-success-v1', input.evidenceId,
+    ])}`;
+    return this.transaction(async (client) => {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
+        [input.generationId],
+      );
+      const proofResult = await client.query(`SELECT evidence.evidence_id,evidence.intent_id,
+        evidence.generation_id,evidence.result,
+        trunc(EXTRACT(EPOCH FROM evidence.finalized_at) * 1000)::TEXT AS finalized_at_ms,
+        risk.state_revision::TEXT AS state_revision,generation.retired_at
+        FROM execution_reconciliation_evidence AS evidence
+        JOIN execution_wallet_risk_state AS risk
+          ON risk.generation_id=evidence.generation_id
+        JOIN execution_wallet_generations AS generation
+          ON generation.generation_id=evidence.generation_id
+        WHERE evidence.evidence_id=$1 FOR UPDATE OF evidence,risk,generation`, [input.evidenceId]);
+      const proof = exactRow(singleRow(proofResult), [
+        'evidence_id', 'intent_id', 'generation_id', 'result', 'finalized_at_ms',
+        'state_revision', 'retired_at',
+      ] as const);
+      if (proof.evidence_id !== input.evidenceId
+        || proof.generation_id !== input.generationId
+        || proof.result !== 'MATCHED'
+        || proof.finalized_at_ms === null
+        || proof.retired_at !== null) throw failure('CONFLICT');
+      const finalizedAtMs = textTimestamp(proof.finalized_at_ms);
+      const intentId = patternedText(proof.intent_id, /^execution_intent_[0-9a-f]{64}$/u);
+      const fingerprint = hash([
+        'execution-reconciled-success-ledger-v1', faultId, input.evidenceId,
+        input.generationId, intentId, input.activationPhase, finalizedAtMs,
+      ]);
+      const existing = await client.query(`SELECT fault_fingerprint,
+        consecutive_failure_count,retry_decision FROM execution_fault_ledger
+        WHERE fault_id=$1`, [faultId]);
+      if (existing.rows.length > 0) {
+        if (existing.rows.length !== 1) throw failure('INVALID_DATA');
+        const prior = exactRow(existing.rows[0], [
+          'fault_fingerprint', 'consecutive_failure_count', 'retry_decision',
+        ] as const);
+        if (prior.fault_fingerprint !== fingerprint
+          || prior.consecutive_failure_count !== 0
+          || prior.retry_decision !== 'DO_NOT_RETRY') throw failure('CONFLICT');
+        return faultResult(faultId, 0, 'DO_NOT_RETRY');
+      }
+      const insert = await client.query(`INSERT INTO execution_fault_ledger (
+        fault_id,payload_version,fault_fingerprint,generation_id,intent_id,activation_phase,
+        stage,classification,retry_decision,reason_code,consecutive_failure_count,
+        observed_at,reset_at,purge_after
+      ) VALUES ($1,1,$2,$3,$4,$5,'RECONCILIATION','RESOLVED','DO_NOT_RETRY',
+        'INTENT_SUCCEEDED',0,
+        TIMESTAMPTZ 'epoch' + ($6::BIGINT * INTERVAL '1 millisecond'),
+        TIMESTAMPTZ 'epoch' + ($6::BIGINT * INTERVAL '1 millisecond'),
+        TIMESTAMPTZ 'epoch' + (($6::BIGINT + 14400000) * INTERVAL '1 millisecond'))`, [
+        faultId, fingerprint, input.generationId, intentId, input.activationPhase, finalizedAtMs,
+      ]);
+      if (insert.rowCount !== 1) throw failure('INVALID_DATA');
+      const revision = unsignedBigint(parseBigint(proof.state_revision));
+      const update = await client.query(`UPDATE execution_wallet_risk_state SET
+        state_revision=$2::BIGINT,consecutive_technical_failures=0,
+        last_technical_failure_reason_code=NULL,
+        updated_at=TIMESTAMPTZ 'epoch' + ($3::BIGINT * INTERVAL '1 millisecond')
+        WHERE generation_id=$1 AND state_revision=$4::BIGINT`, [
+        input.generationId, (revision + 1n).toString(), finalizedAtMs, revision.toString(),
+      ]);
+      if (update.rowCount !== 1) throw failure('CONFLICT');
+      return faultResult(faultId, 0, 'DO_NOT_RETRY');
     });
   }
 
@@ -1219,6 +1392,114 @@ function rateLimitFrom(value: unknown): ProviderRateLimitEventV1 {
   }
 }
 
+function faultFrom(value: unknown): ExecutionFaultRecordInputV1 {
+  try {
+    const row = exactInput(value, FAULT_KEYS);
+    const result = Object.freeze({
+      faultId: patternedText(row.faultId, /^execution_fault_[0-9a-f]{64}$/u),
+      payloadVersion: one(row.payloadVersion),
+      generationId: patternedText(
+        row.generationId,
+        /^execution_wallet_generation_[0-9a-f]{64}$/u,
+      ),
+      intentId: row.intentId === null
+        ? null : patternedText(row.intentId, /^execution_intent_[0-9a-f]{64}$/u),
+      activationPhase: enumValue(
+        row.activationPhase,
+        ['NONE', 'CANARY', 'MICRO_LIVE', 'PILOT'] as const,
+      ),
+      stage: enumValue(row.stage, [
+        'BUILD', 'SIMULATION', 'PROVIDER', 'SUBMISSION', 'CONFIRMATION',
+        'RECONCILIATION', 'VALIDATION', 'POLICY',
+      ] as const),
+      side: enumValue(row.side, ['BUY', 'SELL'] as const),
+      timing: enumValue(row.timing, ['PRE_SIGNATURE', 'AFTER_SIGNATURE'] as const),
+      classification: enumValue(row.classification, [
+        'TRANSIENT', 'DETERMINISTIC', 'AMBIGUOUS', 'PROVED_NO_EFFECT', 'CRITICAL',
+      ] as const),
+      exactSignedBytesAvailable: boolean(row.exactSignedBytesAvailable),
+      reasonCode: enumValue(row.reasonCode, FAULT_REASON_CODES),
+      observedAtMs: timestamp(row.observedAtMs),
+    });
+    technicalFailureReason(result);
+    classifyExecutionFault({
+      stage: result.stage,
+      side: result.side,
+      timing: result.timing,
+      classification: result.classification,
+      consecutiveTechnicalFailures: 0,
+      exactSignedBytesAvailable: result.exactSignedBytesAvailable,
+    });
+    return result;
+  } catch {
+    throw failure('INVALID_INPUT');
+  }
+}
+
+function reconciledSuccessFrom(value: unknown): ExecutionReconciledSuccessInputV1 {
+  try {
+    const row = exactInput(value, RECONCILED_SUCCESS_KEYS);
+    return Object.freeze({
+      payloadVersion: one(row.payloadVersion),
+      evidenceId: patternedText(
+        row.evidenceId,
+        /^execution_reconciliation_[0-9a-f]{64}$/u,
+      ),
+      generationId: patternedText(
+        row.generationId,
+        /^execution_wallet_generation_[0-9a-f]{64}$/u,
+      ),
+      activationPhase: enumValue(
+        row.activationPhase,
+        ['NONE', 'CANARY', 'MICRO_LIVE', 'PILOT'] as const,
+      ),
+    });
+  } catch {
+    throw failure('INVALID_INPUT');
+  }
+}
+
+function technicalFailureReason(
+  input: ExecutionFaultRecordInputV1,
+): ExecutionTechnicalFailureReasonCode | null {
+  const expected = input.stage === 'BUILD' ? 'EXECUTION_BUILD_FAILED'
+    : input.stage === 'SIMULATION'
+      ? (input.side === 'BUY' ? 'BUY_SIMULATION_FAILED' : 'SELL_SIMULATION_FAILED')
+      : input.stage === 'PROVIDER' ? 'EXECUTION_PROVIDER_FAILED'
+        : input.stage === 'CONFIRMATION' ? 'CONFIRMATION_TIMEOUT'
+          : input.stage === 'RECONCILIATION' ? 'RECONCILIATION_REQUIRED'
+            : null;
+  const isTechnicalCode = [
+    'EXECUTION_BUILD_FAILED', 'BUY_SIMULATION_FAILED', 'SELL_SIMULATION_FAILED',
+    'EXECUTION_PROVIDER_FAILED', 'CONFIRMATION_TIMEOUT', 'RECONCILIATION_REQUIRED',
+  ].includes(input.reasonCode);
+  if (isTechnicalCode && input.reasonCode !== expected) throw new TypeError();
+  return expected === input.reasonCode ? expected : null;
+}
+
+function faultFingerprint(input: ExecutionFaultRecordInputV1): string {
+  return hash([
+    'execution-fault-v1', input.faultId, input.payloadVersion, input.generationId,
+    input.intentId ?? '', input.activationPhase, input.stage, input.side, input.timing,
+    input.classification, input.exactSignedBytesAvailable ? 1 : 0,
+    input.reasonCode, input.observedAtMs,
+  ]);
+}
+
+function faultResult(
+  faultId: string,
+  consecutiveTechnicalFailures: number,
+  retryDecision: ExecutionRetryDecision,
+): ExecutionFaultRecordResultV1 {
+  return Object.freeze({
+    payloadVersion: 1,
+    faultId,
+    consecutiveTechnicalFailures,
+    retryDecision,
+    buyBlocked: consecutiveTechnicalFailures >= 2,
+  });
+}
+
 async function findGeneration(
   client: ExecutionRiskClient,
   generationId: string,
@@ -1491,6 +1772,11 @@ function base58(value: unknown, minimum: number, maximum: number): string {
 function integer(value: unknown, minimum: number, maximum: number): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value)
     || value < minimum || value > maximum) throw new TypeError();
+  return value;
+}
+
+function boolean(value: unknown): boolean {
+  if (typeof value !== 'boolean') throw new TypeError();
   return value;
 }
 

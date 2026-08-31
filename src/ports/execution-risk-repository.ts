@@ -9,6 +9,11 @@ import type {
   ExecutionRiskPolicyV1,
 } from '../domain/execution-risk-policy.js';
 import type { ExecutionIntentV1 } from '../domain/execution-intent.js';
+import type {
+  ExecutionFaultClassification,
+  ExecutionFaultStage,
+  ExecutionRetryDecision,
+} from '../domain/execution-fault-policy.js';
 
 export type ExecutionCluster = 'mainnet-beta' | 'devnet' | 'testnet';
 
@@ -102,6 +107,53 @@ export interface ExecutionReconciliationCommitResultV1 {
   readonly evidenceId: string;
 }
 
+export type ExecutionActivationPhase = 'NONE' | 'CANARY' | 'MICRO_LIVE' | 'PILOT';
+
+export type ExecutionFaultReasonCode =
+  | 'BUY_SIMULATION_FAILED'
+  | 'SELL_SIMULATION_FAILED'
+  | 'EXECUTION_PROVIDER_FAILED'
+  | 'EXECUTION_BUILD_FAILED'
+  | 'EXECUTION_EVIDENCE_INVALID'
+  | 'SIGNATURE_PERSIST_FAILED'
+  | 'SUBMISSION_AMBIGUOUS'
+  | 'CONFIRMATION_TIMEOUT'
+  | 'RECONCILIATION_REQUIRED'
+  | 'RECONCILIATION_PROVED_NO_EFFECT'
+  | 'BALANCE_MISMATCH'
+  | 'RESIDUAL_TOKEN_BALANCE'
+  | 'DOUBLE_ORDER_SUSPECTED';
+
+export interface ExecutionFaultRecordInputV1 {
+  readonly faultId: string;
+  readonly payloadVersion: 1;
+  readonly generationId: string;
+  readonly intentId: string | null;
+  readonly activationPhase: ExecutionActivationPhase;
+  readonly stage: ExecutionFaultStage;
+  readonly side: 'BUY' | 'SELL';
+  readonly timing: 'PRE_SIGNATURE' | 'AFTER_SIGNATURE';
+  readonly classification: ExecutionFaultClassification;
+  readonly exactSignedBytesAvailable: boolean;
+  readonly reasonCode: ExecutionFaultReasonCode;
+  readonly observedAtMs: number;
+}
+
+export interface ExecutionFaultRecordResultV1 {
+  readonly payloadVersion: 1;
+  readonly faultId: string;
+  readonly consecutiveTechnicalFailures: number;
+  readonly retryDecision: ExecutionRetryDecision;
+  readonly buyBlocked: boolean;
+}
+
+export interface ExecutionReconciledSuccessInputV1 {
+  readonly payloadVersion: 1;
+  readonly evidenceId: string;
+  readonly generationId: string;
+  readonly activationPhase: ExecutionActivationPhase;
+}
+
 export interface ExecutionRiskRepository {
   registerWalletGeneration(input: WalletGenerationDraftV1): Promise<WalletGenerationV1>;
   appendWalletSnapshot(input: WalletSnapshotDraftV1): Promise<WalletSnapshotV1>;
@@ -109,5 +161,9 @@ export interface ExecutionRiskRepository {
   recordProviderOperation(input: ProviderUsageOperationV1): Promise<'RECORDED' | 'REPLAYED'>;
   recordRateLimit(input: ProviderRateLimitEventV1): Promise<'RECORDED' | 'REPLAYED'>;
   admitBuy(input: ExecutionBuyAdmissionInputV1): Promise<ExecutionBuyAdmissionResultV1>;
+  recordFault(input: ExecutionFaultRecordInputV1): Promise<ExecutionFaultRecordResultV1>;
+  recordReconciledSuccess(
+    input: ExecutionReconciledSuccessInputV1,
+  ): Promise<ExecutionFaultRecordResultV1>;
   reconcile(input: ExecutionReconciliationCommitV1): Promise<ExecutionReconciliationCommitResultV1>;
 }

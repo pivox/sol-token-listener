@@ -119,6 +119,8 @@ function repositoryStub(
     recordProviderOperation: unavailable,
     recordRateLimit: unavailable,
     admitBuy: unavailable,
+    recordFault: unavailable,
+    recordReconciledSuccess: unavailable,
     reconcile,
   };
 }

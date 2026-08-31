@@ -1,6 +1,6 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.0.5
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.5 — 2026-08-31 :** rend le replay du ledger de fautes vérifiable par
+  une empreinte immuable couvrant l'entrée complète. Le reset du compteur est
+  une ligne `RESOLVED` idempotente, autorisée uniquement par une preuve
+  `MATCHED` finalisée de la même génération wallet.
 - **1.0.4 — 2026-08-31 :** précise que les deux positions ouvertes maximales
   de la policy V1 sont matérialisées dans deux emplacements relationnels
   explicites du snapshot wallet. L'état quota reste une décision recalculée à
@@ -389,6 +393,10 @@ La migration `034_execution_risk_reconciliation.sql` ajoute :
 - `execution_risk_tombstones` minimaux.
 
 Les tables brutes/snapshots append-only sont séparées des agrégats courants.
+Chaque faute possède une empreinte immuable de son entrée : le même identifiant
+rejoue exactement la même décision ou produit un conflit, sans nouvelle
+mutation de l'agrégat. Une ligne `RESOLVED` ne peut remettre le compteur à zéro
+qu'en référençant une preuve `MATCHED` finalisée de la même génération.
 Les enums sont fermées par `CHECK`; les timestamps sont UTC, finis et tronqués
 à la milliseconde. Les entiers financiers sont des `NUMERIC` non scalés avec
 `scale(value) = 0`, `value = trunc(value)`, rejet explicite de `NaN` et bornes

@@ -620,6 +620,7 @@ CREATE INDEX IF NOT EXISTS execution_reconciliation_evidence_unresolved_idx
 CREATE TABLE IF NOT EXISTS execution_fault_ledger (
   fault_id TEXT PRIMARY KEY,
   payload_version SMALLINT NOT NULL DEFAULT 1,
+  fault_fingerprint TEXT NOT NULL,
   generation_id TEXT NOT NULL,
   intent_id TEXT,
   activation_phase TEXT NOT NULL,
@@ -640,10 +641,13 @@ CREATE TABLE IF NOT EXISTS execution_fault_ledger (
   CONSTRAINT execution_fault_ledger_identity_check CHECK (
     payload_version = 1
     AND fault_id ~ '^execution_fault_[0-9a-f]{64}$'
+    AND fault_fingerprint ~ '^[0-9a-f]{64}$'
     AND activation_phase IN ('NONE', 'CANARY', 'MICRO_LIVE', 'PILOT')
     AND stage IN ('BUILD', 'SIMULATION', 'PROVIDER', 'SIGNATURE', 'SUBMISSION',
       'CONFIRMATION', 'RECONCILIATION', 'POLICY', 'VALIDATION')
-    AND classification IN ('TRANSIENT', 'DETERMINISTIC', 'AMBIGUOUS', 'RESOLVED', 'CRITICAL')
+    AND classification IN (
+      'TRANSIENT', 'DETERMINISTIC', 'AMBIGUOUS', 'PROVED_NO_EFFECT', 'RESOLVED', 'CRITICAL'
+    )
     AND retry_decision IN ('DO_NOT_RETRY', 'RETRY_PRE_SIGNATURE', 'RECONCILE_ONLY', 'RETRY_EXACT_BYTES')
     AND reason_code IN (
       'BUY_SIMULATION_FAILED', 'SELL_SIMULATION_FAILED',
