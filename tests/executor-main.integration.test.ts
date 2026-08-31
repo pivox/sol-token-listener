@@ -245,7 +245,7 @@ function startSimulationExecutor(
         EXECUTOR_RPC_TIMEOUT_MS: '2000',
         EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '8',
         EXECUTOR_POLL_MS: '100',
-        EXECUTOR_LEASE_MS: '3000',
+        EXECUTOR_LEASE_MS: '30000',
         EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '100',
         EXECUTOR_SHUTDOWN_GRACE_MS: '1100',
       },
