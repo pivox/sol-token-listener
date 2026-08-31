@@ -1,6 +1,6 @@
 # Exécuteur quote, build et simulation V1 — conception #51-D
 
-**Version de spécification :** 1.0.7
+**Version de spécification :** 1.0.8
 
 **Date :** 2026-08-31
 
@@ -12,6 +12,9 @@
 
 ## Historique des versions
 
+- **1.0.8 — 2026-08-31 :** ajoute un renouvellement immédiatement après
+  `beginAttempt`, avant toute construction de session provider, afin de sortir
+  transition et création/récupération de tentative de l'intervalle RPC initial.
 - **1.0.7 — 2026-08-31 :** lie le timeout RPC à la durée du lease afin que les
   trois appels séquentiels précédant le renouvellement de commit, le statement
   PostgreSQL et une marge fixe d'une seconde tiennent dans le lease.
@@ -597,12 +600,15 @@ exacte renvoyée par PostgreSQL. Le worker remplace obligatoirement son claim
 local avant toute opération suivante et remet ce dernier claim au commit
 atomique ; un booléen ou une expiration recalculée côté application sont
 interdits.
-La séquence est fermée et ordonnée : exactement une fois avant la snapshot
-causale finale, exactement une fois avant la simulation, puis exactement une
-fois avant le commit. Une frontière sautée, répétée ou inversée échoue avant
-l'opération aval. `beginAttempt` retourne également le claim frais qui porte
-le nouvel `attemptCount`; conserver le claim antérieur à l'incrément est
-interdit.
+La séquence est fermée et ordonnée : exactement une fois immédiatement après
+`beginAttempt` et avant tout travail provider, exactement une fois avant la
+snapshot causale finale, exactement une fois avant la simulation, puis
+exactement une fois avant le commit. Une frontière sautée, répétée ou inversée
+échoue avant l'opération aval. `beginAttempt` retourne également le claim frais
+qui porte le nouvel `attemptCount`; conserver le claim antérieur à l'incrément
+est interdit. Le premier intervalle provider ne contient alors que genesis,
+découverte et au plus un routage PostgreSQL ; il est strictement plus court que
+la borne des trois RPC déjà imposée à la configuration.
 
 Une perte d'ACK produit `COMMIT_OUTCOME_UNKNOWN`. Le worker lit l'artefact exact :
 

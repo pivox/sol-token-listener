@@ -47,7 +47,8 @@ void test('transitions PENDING, recovers one STARTED attempt, renews exact bound
 
   assert.deepEqual(fake.calls, [
     'claim', 'transition', 'beginAttempt',
-    'evaluate', 'renew:BEFORE_CANONICAL_SNAPSHOT', 'renew:BEFORE_SIMULATION',
+    'renew:AFTER_BEGIN_ATTEMPT', 'evaluate',
+    'renew:BEFORE_CANONICAL_SNAPSHOT', 'renew:BEFORE_SIMULATION',
     'renew:BEFORE_COMMIT', 'complete',
   ]);
   assert.equal(fake.transitions.length, 1);
@@ -65,6 +66,24 @@ void test('transitions PENDING, recovers one STARTED attempt, renews exact bound
   assert.deepEqual(result, passResult('RECORDED', fake.draft));
 });
 
+void test('renews immediately after beginAttempt before constructing provider work', async () => {
+  const failure = new Error('bootstrap lease lost');
+  const fake = fakes(claim('PROCESSING'), {
+    renewErrorAt: 'AFTER_BEGIN_ATTEMPT' as SimulationRenewBoundary,
+    renewError: failure,
+  });
+
+  await assert.rejects(
+    createSimulationOnlyWorker(fake.dependencies).runOnce(activeSignal()),
+    (error) => error === failure,
+  );
+  assert.deepEqual(fake.calls, [
+    'claim', 'beginAttempt', 'renew:AFTER_BEGIN_ATTEMPT',
+  ]);
+  assert.equal(fake.evaluations.length, 0);
+  assert.equal(fake.completed.length, 0);
+});
+
 void test('resumes PROCESSING without another transition and keeps the same attempt number', async () => {
   const fake = fakes(claim('PROCESSING', 1));
   const result = await createSimulationOnlyWorker(fake.dependencies).runOnce(activeSignal());
@@ -79,7 +98,7 @@ void test('stops immediately when an exact renewal loses its fence', async () =>
   const fake = fakes(claim('PROCESSING'), { renewErrorAt: 'BEFORE_SIMULATION', renewError: failure });
   await assert.rejects(createSimulationOnlyWorker(fake.dependencies).runOnce(activeSignal()), (error) => error === failure);
   assert.deepEqual(fake.calls, [
-    'claim', 'beginAttempt', 'evaluate',
+    'claim', 'beginAttempt', 'renew:AFTER_BEGIN_ATTEMPT', 'evaluate',
     'renew:BEFORE_CANONICAL_SNAPSHOT', 'renew:BEFORE_SIMULATION',
   ]);
   assert.equal(fake.completed.length, 0);
@@ -174,7 +193,10 @@ interface FakeOptions {
   readonly completeError?: Error;
   readonly find?: 'EXACT' | 'MISSING';
   readonly draftRevision?: bigint;
-  readonly evaluatorBoundaries?: readonly Exclude<SimulationRenewBoundary, 'BEFORE_COMMIT'>[];
+  readonly evaluatorBoundaries?: readonly Exclude<
+    SimulationRenewBoundary,
+    'AFTER_BEGIN_ATTEMPT' | 'BEFORE_COMMIT'
+  >[];
   readonly abortOnComplete?: AbortController;
 }
 
@@ -217,7 +239,8 @@ function fakes(initial: ClaimedExecutionIntent | null, options: FakeOptions = {}
       });
     },
     renew: async (claimed, leaseMs) => {
-      const boundary = (['BEFORE_CANONICAL_SNAPSHOT', 'BEFORE_SIMULATION', 'BEFORE_COMMIT'] as const)[renewCount];
+      const boundary = (['AFTER_BEGIN_ATTEMPT', 'BEFORE_CANONICAL_SNAPSHOT',
+        'BEFORE_SIMULATION', 'BEFORE_COMMIT'] as const)[renewCount];
       assert.ok(boundary !== undefined);
       calls.push(`renew:${boundary}`);
       if (options.renewErrorAt === boundary) throw options.renewError ?? new Error('renew failed');

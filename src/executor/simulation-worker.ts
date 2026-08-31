@@ -12,6 +12,7 @@ import { ExecutionIntentRepositoryError } from '../storage/execution-intent.repo
 import { ExecutionSimulationRepositoryError } from '../storage/execution-simulation.repository.js';
 
 export type SimulationRenewBoundary =
+  | 'AFTER_BEGIN_ATTEMPT'
   | 'BEFORE_CANONICAL_SNAPSHOT'
   | 'BEFORE_SIMULATION'
   | 'BEFORE_COMMIT';
@@ -29,7 +30,10 @@ export interface SimulationAttemptEvaluator {
   readonly evaluate: (
     context: SimulationAttemptContext,
     signal: AbortSignal,
-    renew: (boundary: Exclude<SimulationRenewBoundary, 'BEFORE_COMMIT'>) => Promise<void>,
+    renew: (boundary: Exclude<
+      SimulationRenewBoundary,
+      'AFTER_BEGIN_ATTEMPT' | 'BEFORE_COMMIT'
+    >) => Promise<void>,
   ) => Promise<ExecutionSimulationArtifactDraftV1>;
 }
 
@@ -133,7 +137,10 @@ async function runPass(
     requireActive(signal);
   };
   const renewForEvaluator = async (
-    boundary: Exclude<SimulationRenewBoundary, 'BEFORE_COMMIT'>,
+    boundary: Exclude<
+      SimulationRenewBoundary,
+      'AFTER_BEGIN_ATTEMPT' | 'BEFORE_COMMIT'
+    >,
   ): Promise<void> => {
     if (boundary !== evaluatorBoundaries[evaluatorBoundaryIndex]) {
       throw new TypeError('Invalid simulation renewal boundary.');
@@ -141,6 +148,7 @@ async function runPass(
     evaluatorBoundaryIndex += 1;
     await renewClaim();
   };
+  await renewClaim();
   const draft = await dependencies.evaluator.evaluate(
     Object.freeze({ claim: activeClaim, attempt }),
     signal,

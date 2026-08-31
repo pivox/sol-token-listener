@@ -21,7 +21,7 @@ Pino, SHA-256.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-quote-build-simulation-design.md`
-version 1.0.7 and parent specification version 1.5.0.
+version 1.0.8 and parent specification version 1.5.0.
 
 ---
 
