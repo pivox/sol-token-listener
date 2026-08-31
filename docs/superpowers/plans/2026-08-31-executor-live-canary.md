@@ -251,12 +251,11 @@ git commit -m "feat: prepare and verify signed transactions (#51)"
 
 **Files:**
 - Create: `src/storage/execution-live.repository.ts`
-- Modify: `src/storage/execution-operations.repository.ts`
-- Modify: `src/storage/execution-risk.repository.ts`
+- Modify: `src/ports/execution-live-repository.ts`
 - Test: `tests/execution-live.repository.test.ts`
-- Modify: `tests/execution-operations.repository.test.ts`
+- Modify: `tests/execution-live-repository-contract.test.ts`
 
-- [ ] **Step 1: Write PostgreSQL concurrency tests and verify RED**
+- [x] **Step 1: Write PostgreSQL concurrency tests and verify RED**
 
 Tester deux BUY concurrents, armement expiré/révoqué, qualification périmée,
 `ENTRY_STOP`, `HARD_STOP`, risque inconnu, quota supplanté, réservation absente,
@@ -267,21 +266,21 @@ Run: `TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot np
 
 Expected: FAIL because the repository is absent.
 
-- [ ] **Step 2: Implement the atomic repository**
+- [x] **Step 2: Implement the atomic repository**
 
 Acquérir `pg_advisory_xact_lock(hashtextextended(generation_id, 51005))`,
 verrouiller les lignes dans un ordre fixe, relire l'heure PostgreSQL et ne
 persister les bytes qu'après toutes les validations. Les opérations retournent
 des records domaine, jamais les rows brutes.
 
-- [ ] **Step 3: Verify crash/replay and commit**
+- [x] **Step 3: Verify crash/replay and commit**
 
 Run: `TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot npx tsx --test tests/execution-live.repository.test.ts tests/execution-operations.repository.test.ts tests/execution-risk.repository.test.ts`
 
 Expected: PASS.
 
 ```bash
-git add src/storage/execution-live.repository.ts src/storage/execution-operations.repository.ts src/storage/execution-risk.repository.ts tests/execution-live.repository.test.ts tests/execution-operations.repository.test.ts
+git add src/storage/execution-live.repository.ts src/ports/execution-live-repository.ts tests/execution-live.repository.test.ts tests/execution-live-repository-contract.test.ts docs/superpowers/specs/2026-08-31-executor-live-canary-design.md docs/superpowers/specs/2026-08-30-executor-v1-design.md
 git commit -m "feat: persist signed execution atomically (#51)"
 ```
 

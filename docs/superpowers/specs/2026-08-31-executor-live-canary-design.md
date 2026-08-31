@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.0.1
 
-**Version de la spécification parente :** 1.7.0
+**Version de la spécification parente :** 1.7.1
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.1 — 2026-08-31 :** distingue le cycle live du cycle
+  `simulation-only` terminal de #51-D : la tentative live reste `STARTED` et la
+  persistance atomique journalise `PROCESSING -> SIMULATED ->
+  SIGNED_NOT_SUBMITTED` avec la preuve non signée liée à l'artefact.
 - **1.0.0 — 2026-08-31 :** conception initiale du graphe live fermé, du
   chargement de secret, de la persistance avant envoi, de la soumission exacte,
   de la confirmation, de la réconciliation et du canary manuel minimal.
@@ -158,6 +162,12 @@ utilisable que dans le même processus et la même tentative. Aucun plan ou
 fingerprint fourni par la base ne permet de fabriquer une transaction.
 
 Séquence BUY avant signature :
+
+Contrairement à la commande `simulation-only`, le cycle live ne clôture ni la
+tentative ni l'intention après la simulation non signée. La preuve est portée
+jusqu'au commit live ; sous un même verrou, ce commit journalise les deux
+transitions et conserve la tentative `STARTED` pour la soumission et la
+réconciliation.
 
 1. claim fenced de l'intention et création d'une tentative `STARTED` ;
 2. snapshot wallet/provider finalisé et `admitBuy()` #51-E ;
@@ -412,4 +422,3 @@ enchaîne automatiquement et aucune PR ne déclenche la transaction réelle.
   verts ;
 - #49 reste `NON_EXECUTED / NON_VALIDATED` ;
 - la fusion prépare le canary manuel mais ne l'arme et ne l'exécute pas.
-

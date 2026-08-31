@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.0
+**Version de spécification :** 1.7.1
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.7.1 — 2026-08-31 :** ferme la frontière entre simulation-only et live :
+  une tentative live reste `STARTED` et son commit signé journalise
+  atomiquement `PROCESSING -> SIMULATED -> SIGNED_NOT_SUBMITTED`, sans réutiliser
+  l'artefact terminal non signable de #51-D.
 - **1.7.0 — 2026-08-31 :** spécifie #51-G : exécutable live séparé,
   émission neutre optionnelle, secret local fermé, persistance avant envoi,
   soumission exacte, confirmation/réconciliation et canary manuel minimal.

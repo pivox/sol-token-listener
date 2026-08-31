@@ -7,6 +7,7 @@ import type {
 import type { ExecutionIntentV1 } from '../domain/execution-intent.js';
 import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reconciliation.js';
 import type { ClaimedExecutionIntent } from './execution-intent-repository.js';
+import type { ExecutionSimulationEvidenceV1 } from './execution-simulation-gateway.js';
 
 export interface ExecutionLiveSignedSimulationEvidenceV1 {
   readonly payloadVersion: 1;
@@ -27,6 +28,7 @@ export interface ExecutionLivePersistSignedInputV1 {
   readonly qualificationId: string;
   readonly reservationId: string | null;
   readonly artifact: SignedTransactionArtifactV1;
+  readonly unsignedSimulation: ExecutionSimulationEvidenceV1;
 }
 
 /** Capability returned only after PostgreSQL re-authenticates exact persisted bytes. */
@@ -73,6 +75,10 @@ export interface ExecutionDeadlineExitResultV1 {
 
 export interface ExecutionLiveRepository {
   persistSigned(input: ExecutionLivePersistSignedInputV1): Promise<SignedTransactionArtifactV1>;
+  authenticatePersistedSignedTransaction(input: Readonly<{
+    readonly claim: ClaimedExecutionIntent;
+    readonly artifactId: string;
+  }>): Promise<AuthenticatedPersistedSignedTransactionV1>;
   recordSignedSimulation(
     claim: ClaimedExecutionIntent,
     evidence: ExecutionLiveSignedSimulationEvidenceV1,
