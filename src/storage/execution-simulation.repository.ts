@@ -5,7 +5,7 @@ import {
   type ExecutionSimulationArtifactDraftV1,
   type ExecutionSimulationArtifactV1,
 } from '../domain/execution-simulation.js';
-import { assertExecutionIntent } from '../domain/execution-intent.js';
+import { assertExecutionIntent, type ExecutionIntentV1 } from '../domain/execution-intent.js';
 import type { ExecutionSimulationRepository } from '../ports/execution-simulation-repository.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
 import { getDatabasePool } from './database.js';
@@ -523,7 +523,17 @@ function matchesClaim(
     && artifact.strategyId === intent.strategyId
     && artifact.strategyVersion === intent.strategyVersion
     && artifact.decisionFingerprint === intent.decisionFingerprint
+    && simulationFailureReasonMatchesSide(intent.side, artifact)
     && intent.stateRevision <= INT64_MAX - revisionIncrement;
+}
+
+function simulationFailureReasonMatchesSide(
+  side: ExecutionIntentV1['side'],
+  artifact: ExecutionSimulationArtifactDraftV1,
+): boolean {
+  if (artifact.failureCode !== 'SIMULATION_PROGRAM_ERROR') return true;
+  return (side === 'BUY' && artifact.terminalReasonCode === 'BUY_SIMULATION_FAILED')
+    || (side === 'SELL' && artifact.terminalReasonCode === 'SELL_SIMULATION_FAILED');
 }
 
 function sameDraft(

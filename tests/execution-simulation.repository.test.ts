@@ -78,6 +78,21 @@ void test('complete validates the PROCESSING fence and exact causal identity bef
   assert.equal(pool.connectCount, 0);
 });
 
+void test('complete rejects a simulation program reason that contradicts the intent side', async () => {
+  const buy = claim('buy-side');
+  const sell = claim('sell-side', 'SELL');
+  const pool = new ScriptedPool(new ScriptedClient([]));
+  const repository = new PostgresExecutionSimulationRepository(pool);
+
+  await expectCode(repository.complete(
+    buy, programFailureArtifact(buy, 'SELL_SIMULATION_FAILED'), activeSignal(),
+  ), 'INVALID_INPUT');
+  await expectCode(repository.complete(
+    sell, programFailureArtifact(sell, 'BUY_SIMULATION_FAILED'), activeSignal(),
+  ), 'INVALID_INPUT');
+  assert.equal(pool.connectCount, 0);
+});
+
 void test('complete distinguishes fence, artifact conflict, hostile data, and ambiguous commit', async () => {
   const claimed = claim('outcomes');
   const artifact = successArtifact(claimed);
@@ -271,14 +286,16 @@ class ScriptedPool implements ExecutionSimulationPool {
   }
 }
 
-function claim(suffix: string): ClaimedExecutionIntent {
+function claim(suffix: string, side: 'BUY' | 'SELL' = 'BUY'): ClaimedExecutionIntent {
   const draft = createExecutionIntentDraft({
     strategyId: 'simulation-strategy', strategyVersion: 1,
     positionId: `position-${suffix}`, logicalCommandId: `command-${suffix}`,
-    mint: PUBLIC_KEY, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
+    mint: PUBLIC_KEY, side,
+    venuePolicy: side === 'BUY' ? 'PUMP_FUN_ONLY' : 'CANONICAL_EXIT',
     quoteMint: 'So11111111111111111111111111111111111111112',
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
-    quoteAmountRaw: 1_000n, baseAmountRaw: null, minimumAmountOutRaw: 850n,
+    quoteAmountRaw: side === 'BUY' ? 1_000n : null,
+    baseAmountRaw: side === 'SELL' ? 1_000n : null, minimumAmountOutRaw: 850n,
     decisionEventId: `event-${suffix}`, decisionFingerprint: HASH,
     requestedAtMs: NOW_MS - 10_000, expiresAtMs: NOW_MS + 60_000,
   });
@@ -346,6 +363,29 @@ function providerFailureArtifact(
     rpcCallsUsed: 1, quoteStatus: 'FAILED', buildStatus: 'NOT_RUN',
     simulationStatus: 'NOT_RUN', failureStage: 'PROVIDER',
     failureCode: 'RPC_UNAVAILABLE', terminalReasonCode: 'EXECUTION_PROVIDER_FAILED',
+    logsFingerprint: null, logsLineCount: null,
+  });
+}
+
+function programFailureArtifact(
+  claimed: ClaimedExecutionIntent,
+  reason: 'BUY_SIMULATION_FAILED' | 'SELL_SIMULATION_FAILED',
+): ExecutionSimulationArtifactDraftV1 {
+  const success = successArtifact(claimed);
+  const {
+    artifactId: _artifactId,
+    payloadVersion: _payloadVersion,
+    specificationVersion: _specificationVersion,
+    evaluatorVersion: _evaluatorVersion,
+    resultFingerprint: _resultFingerprint,
+    ...input
+  } = success;
+  return createExecutionSimulationArtifactDraft({
+    ...input, resultKind: 'SIMULATION_FAILED', simulationStatus: 'FAILED',
+    failureStage: 'SIMULATION', failureCode: 'SIMULATION_PROGRAM_ERROR',
+    terminalReasonCode: reason, simulationSlot: null,
+    simulatedFeePayerLamportDebit: null, unitsConsumed: null,
+    simulatedBaseDeltaRaw: null, simulatedQuoteDeltaRaw: null,
     logsFingerprint: null, logsLineCount: null,
   });
 }
