@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.0.2
 
-**Version de la spécification parente :** 1.7.1
+**Version de la spécification parente :** 1.7.2
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,11 @@
 
 ## Historique des versions
 
+- **1.0.2 — 2026-08-31 :** fixe la frontière de soumission exacte : simulation
+  signée persistée, clôture transactionnelle `SUBMISSION_STARTED` avant RPC,
+  `maxRetries=0` et passage durable en réconciliation pour tout résultat
+  ambigu. Un commit indéterminé du résultat accepté n'est jamais réécrit par
+  une seconde décision concurrente.
 - **1.0.1 — 2026-08-31 :** distingue le cycle live du cycle
   `simulation-only` terminal de #51-D : la tentative live reste `STARTED` et la
   persistance atomique journalise `PROCESSING -> SIMULATED ->
@@ -354,6 +359,7 @@ Les codes parent existants restent inchangés. #51-G ajoute :
 KEYPAIR_UNAVAILABLE
 KEYPAIR_PERMISSIONS_INVALID
 SIGNED_SIMULATION_FAILED
+SIGNED_SIMULATION_SUCCEEDED
 SUBMISSION_SIGNATURE_MISMATCH
 SUBMISSION_STARTED
 MAXIMUM_HOLDING_REACHED

@@ -8,6 +8,8 @@ import { assertExecutionIntent } from '../domain/execution-intent.js';
 import type {
   AuthenticatedPersistedSignedTransactionV1,
   ExecutionLivePersistSignedInputV1,
+  ExecutionLiveSignedSimulationEvidenceV1,
+  ExecutionLiveSubmissionOutcomeV1,
 } from '../ports/execution-live-repository.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
 import { getDatabasePool } from './database.js';
@@ -47,6 +49,21 @@ export class ExecutionLiveRepositoryError extends Error {
 
 const INTERNAL_ERRORS = new WeakSet<ExecutionLiveRepositoryError>();
 const ARTIFACT_ID = /^execution_signed_transaction_[0-9a-f]{64}$/u;
+const HASH = /^[0-9a-f]{64}$/u;
+const LIVE_SUBMISSION_GATE_KEYS = Object.freeze([
+  'artifact_id', 'payload_version', 'specification_version', 'intent_id',
+  'attempt_number', 'generation_id', 'armament_id', 'exit_authorization_id',
+  'provider_id', 'wallet_public_key', 'side', 'effective_venue', 'message_hash',
+  'build_fingerprint', 'snapshot_fingerprint', 'quote_fingerprint', 'blockhash',
+  'last_valid_block_height', 'signature', 'signed_transaction_bytes',
+  'signed_transaction_hash', 'state', 'state_revision', 'signed_at',
+  'signed_simulated_at', 'submission_started_at', 'submitted_at', 'confirmed_at',
+  'reconciled_at', 'purge_after', 'intent_status', 'lease_owner', 'lease_token',
+  'lease_expires_at_ms', 'now_ms', 'signed_at_ms', 'control_state',
+  'armament_state', 'armament_expires_at_ms', 'qualification_expires_at_ms',
+  'reservation_state', 'unknown_block', 'provider_superseded_at',
+  'provider_expires_at_ms',
+] as const);
 
 export class PostgresExecutionLiveRepository {
   readonly #source: DatabaseSource;
@@ -171,6 +188,168 @@ export class PostgresExecutionLiveRepository {
         state: 'PERSISTED',
         stateRevision: 0n,
       });
+    });
+  }
+
+  public async recordSignedSimulation(
+    claimValue: ClaimedExecutionIntent,
+    evidence: ExecutionLiveSignedSimulationEvidenceV1,
+  ): Promise<AuthenticatedPersistedSignedTransactionV1> {
+    const claim = claimFrom(claimValue);
+    validateSignedSimulationEvidence(evidence);
+    return this.transaction(async (client) => {
+      const identity = await artifactIdentity(client, evidence.artifactId);
+      await lockGeneration(client, identity.generationId);
+      const row = await findArtifact(client, evidence.artifactId, true);
+      if (row?.intent_id !== claim.intent.id
+        || row.state !== 'PERSISTED' || unsignedBigint(row.state_revision) !== 0n
+        || row.signed_transaction_hash !== evidence.signedTransactionHash
+        || row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken
+        || timestampText(row.lease_expires_at_ms) <= timestampText(row.now_ms)) {
+        throw failure('LEASE_LOST');
+      }
+      const artifact = artifactFromRow(row);
+      const updated = await client.query(`UPDATE execution_signed_transactions SET
+        state='SIGNED_SIMULATED',state_revision=1,
+        signed_simulated_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond')
+        WHERE artifact_id=$1 AND state='PERSISTED' AND state_revision=0`, [
+        evidence.artifactId, evidence.observedAtMs,
+      ]);
+      if (updated.rowCount !== 1) throw failure('CONFLICT');
+      await insertLiveStateEvent(
+        client, artifact, 'PERSISTED', 'SIGNED_SIMULATED',
+        'SIGNED_SIMULATION_SUCCEEDED', evidence.observedAtMs,
+      );
+      return Object.freeze({
+        payloadVersion: 1, artifact, state: 'SIGNED_SIMULATED', stateRevision: 1n,
+      });
+    });
+  }
+
+  public async beginSubmission(input: Readonly<{
+    readonly claim: ClaimedExecutionIntent;
+    readonly artifactId: string;
+    readonly expectedRevision: bigint;
+    readonly observedAtMs: number;
+  }>): Promise<AuthenticatedPersistedSignedTransactionV1> {
+    const claim = claimFrom(input.claim);
+    if (!ARTIFACT_ID.test(input.artifactId) || input.expectedRevision !== 1n
+      || !validTimestamp(input.observedAtMs)) throw failure('INVALID_INPUT');
+    return this.transaction(async (client) => {
+      const identity = await artifactIdentity(client, input.artifactId);
+      await lockGeneration(client, identity.generationId);
+      const gate = exactRow(singleRow(await client.query(`SELECT
+        transaction.*,intent.status AS intent_status,intent.lease_owner,
+        intent.lease_token::TEXT AS lease_token,
+        trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+        trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
+        trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
+        control.state AS control_state,armament.state AS armament_state,
+        trunc(EXTRACT(EPOCH FROM armament.expires_at)*1000)::TEXT AS armament_expires_at_ms,
+        trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT
+          AS qualification_expires_at_ms,
+        reservation.state AS reservation_state,risk.unknown_block,
+        provider.superseded_at AS provider_superseded_at,
+        trunc(EXTRACT(EPOCH FROM provider.expires_at)*1000)::TEXT AS provider_expires_at_ms
+        FROM execution_signed_transactions transaction
+        JOIN execution_intents intent ON intent.id=transaction.intent_id
+        JOIN execution_control_state control ON control.generation_id=transaction.generation_id
+        JOIN execution_activation_armaments armament ON armament.armament_id=transaction.armament_id
+        JOIN execution_safety_qualifications qualification
+          ON qualification.qualification_id=armament.qualification_id
+        JOIN execution_exposure_reservations reservation
+          ON reservation.intent_id=transaction.intent_id
+        JOIN execution_wallet_risk_state risk ON risk.generation_id=transaction.generation_id
+        JOIN execution_provider_usage_snapshots provider
+          ON provider.snapshot_fingerprint=reservation.provider_snapshot_fingerprint
+          AND provider.provider_id=transaction.provider_id
+        WHERE transaction.artifact_id=$1
+        FOR UPDATE OF transaction,intent,control,armament,qualification,reservation,risk,provider`, [
+        input.artifactId,
+      ])), LIVE_SUBMISSION_GATE_KEYS);
+      validateSubmissionGate(gate, claim, input.expectedRevision);
+      const nowMs = timestampText(gate.now_ms);
+      const updated = await client.query(`UPDATE execution_signed_transactions SET
+        state='SUBMISSION_STARTED',state_revision=$2::BIGINT,
+        submission_started_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
+        WHERE artifact_id=$1 AND state='SIGNED_SIMULATED' AND state_revision=$4::BIGINT`, [
+        input.artifactId, (input.expectedRevision + 1n).toString(), nowMs,
+        input.expectedRevision.toString(),
+      ]);
+      if (updated.rowCount !== 1) throw failure('CONFLICT');
+      const artifact = artifactFromRow(gate);
+      await insertLiveStateEvent(
+        client, artifact, 'SIGNED_SIMULATED', 'SUBMISSION_STARTED',
+        'SUBMISSION_STARTED', nowMs,
+      );
+      return Object.freeze({
+        payloadVersion: 1, artifact, state: 'SUBMISSION_STARTED',
+        stateRevision: input.expectedRevision + 1n,
+      });
+    });
+  }
+
+  public async recordSubmissionOutcome(
+    claimValue: ClaimedExecutionIntent,
+    outcome: ExecutionLiveSubmissionOutcomeV1,
+  ): Promise<SignedTransactionArtifactV1> {
+    const claim = claimFrom(claimValue);
+    validateSubmissionOutcome(outcome);
+    return this.transaction(async (client) => {
+      const identity = await artifactIdentity(client, outcome.artifactId);
+      await lockGeneration(client, identity.generationId);
+      const row = await findArtifact(client, outcome.artifactId, true);
+      if (row?.intent_id !== claim.intent.id
+        || row.state !== 'SUBMISSION_STARTED'
+        || unsignedBigint(row.state_revision) !== outcome.expectedRevision
+        || row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken) {
+        throw failure('LEASE_LOST');
+      }
+      const artifact = artifactFromRow(row);
+      if (outcome.outcome === 'ACCEPTED'
+        && outcome.returnedSignature !== artifact.signature) throw failure('CONFLICT');
+      const nextState = outcome.outcome === 'ACCEPTED' ? 'ACCEPTED' : 'AMBIGUOUS';
+      const nextIntent = outcome.outcome === 'ACCEPTED'
+        ? 'SUBMITTED' : 'UNKNOWN_REQUIRES_RECONCILIATION';
+      const intentReason = outcome.outcome === 'ACCEPTED'
+        ? 'SUBMISSION_ACCEPTED' : 'RECONCILIATION_REQUIRED';
+      const updated = await client.query(`UPDATE execution_signed_transactions SET
+        state=$2,state_revision=$3::BIGINT,
+        submitted_at=CASE WHEN $2='ACCEPTED' THEN
+          TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond') ELSE NULL END
+        WHERE artifact_id=$1 AND state='SUBMISSION_STARTED' AND state_revision=$5::BIGINT`, [
+        artifact.artifactId, nextState, (outcome.expectedRevision + 1n).toString(),
+        outcome.observedAtMs, outcome.expectedRevision.toString(),
+      ]);
+      if (updated.rowCount !== 1) throw failure('CONFLICT');
+      const intent = await client.query(`UPDATE execution_intents SET status=$2,
+        state_revision=state_revision+1,last_reason_code=$3,
+        updated_at=date_trunc('milliseconds',statement_timestamp())
+        WHERE id=$1 AND status='SIGNED_NOT_SUBMITTED' AND lease_owner=$4
+          AND lease_token=$5::UUID`, [
+        artifact.intentId, nextIntent, intentReason, claim.leaseOwner, claim.leaseToken,
+      ]);
+      if (intent.rowCount !== 1) throw failure('LEASE_LOST');
+      await insertStandardIntentTransition(
+        client, artifact, 'SIGNED_NOT_SUBMITTED', nextIntent, intentReason,
+        outcome.observedAtMs,
+      );
+      await insertLiveStateEvent(
+        client, artifact, 'SUBMISSION_STARTED', nextState,
+        outcome.reasonCode, outcome.observedAtMs,
+      );
+      if (outcome.outcome === 'AMBIGUOUS') {
+        const held = await client.query(`UPDATE execution_exposure_reservations SET
+          state='UNKNOWN_HELD',state_revision=state_revision+1
+          WHERE intent_id=$1 AND state='RESERVED'`, [artifact.intentId]);
+        const blocked = await client.query(`UPDATE execution_wallet_risk_state SET
+          unknown_block=TRUE,state_revision=state_revision+1
+          WHERE generation_id=$1 AND unknown_block=FALSE`, [artifact.generationId]);
+        if (held.rowCount !== 1 || (blocked.rowCount !== 0 && blocked.rowCount !== 1)) {
+          throw failure('CONFLICT');
+        }
+      }
+      return artifact;
     });
   }
 
@@ -456,6 +635,116 @@ function sameArtifact(row: Row, artifact: SignedTransactionArtifactV1): boolean 
   } catch { return false; }
 }
 
+async function artifactIdentity(
+  client: DatabaseClient,
+  artifactId: string,
+): Promise<Readonly<{ readonly generationId: string }>> {
+  if (!ARTIFACT_ID.test(artifactId)) throw failure('INVALID_INPUT');
+  const row = exactRow(singleRow(await client.query(`SELECT generation_id
+    FROM execution_signed_transactions WHERE artifact_id=$1`, [artifactId])), [
+    'generation_id',
+  ] as const);
+  if (typeof row.generation_id !== 'string') throw failure('INVALID_DATA');
+  return Object.freeze({ generationId: row.generation_id });
+}
+
+function validateSignedSimulationEvidence(
+  evidence: ExecutionLiveSignedSimulationEvidenceV1,
+): void {
+  if (!ARTIFACT_ID.test(evidence.artifactId)
+    || !HASH.test(evidence.signedTransactionHash)
+    || !HASH.test(evidence.evidenceFingerprint)
+    || !unsigned(evidence.simulationSlot) || !positiveUnsigned(evidence.unitsConsumed)
+    || !unsigned(evidence.feePayerLamportDebit)
+    || typeof evidence.baseDeltaRaw !== 'bigint'
+    || typeof evidence.quoteDeltaRaw !== 'bigint'
+    || !validTimestamp(evidence.observedAtMs)) throw failure('INVALID_INPUT');
+}
+
+function validateSubmissionGate(
+  row: Row,
+  claim: ClaimedExecutionIntent,
+  expectedRevision: bigint,
+): void {
+  const nowMs = timestampText(row.now_ms);
+  if (row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken
+    || timestampText(row.lease_expires_at_ms) <= nowMs) throw failure('LEASE_LOST');
+  if (row.control_state !== 'RUNNING') throw failure('CONTROL_STOPPED');
+  if (row.intent_status !== 'SIGNED_NOT_SUBMITTED'
+    || row.state !== 'SIGNED_SIMULATED'
+    || unsignedBigint(row.state_revision) !== expectedRevision
+    || row.armament_state !== 'LOCKED'
+    || timestampText(row.armament_expires_at_ms) <= nowMs
+    || timestampText(row.qualification_expires_at_ms) <= nowMs
+    || row.reservation_state !== 'RESERVED' || row.unknown_block !== false
+    || row.provider_superseded_at !== null
+    || timestampText(row.provider_expires_at_ms) <= nowMs) throw failure('PREFLIGHT_EXPIRED');
+}
+
+function validateSubmissionOutcome(outcome: ExecutionLiveSubmissionOutcomeV1): void {
+  if (!ARTIFACT_ID.test(outcome.artifactId)
+    || outcome.expectedRevision < 1n || !validTimestamp(outcome.observedAtMs)
+    || (outcome.outcome === 'ACCEPTED'
+      && (outcome.reasonCode !== 'SUBMISSION_ACCEPTED'
+        || typeof outcome.returnedSignature !== 'string'))
+    || (outcome.outcome === 'AMBIGUOUS'
+      && (outcome.returnedSignature !== null
+        || (outcome.reasonCode !== 'SUBMISSION_AMBIGUOUS'
+          && outcome.reasonCode !== 'SUBMISSION_SIGNATURE_MISMATCH')))) {
+    throw failure('INVALID_INPUT');
+  }
+}
+
+async function insertLiveStateEvent(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+  previousState: 'PERSISTED' | 'SIGNED_SIMULATED' | 'SUBMISSION_STARTED',
+  nextState: 'SIGNED_SIMULATED' | 'SUBMISSION_STARTED' | 'ACCEPTED' | 'AMBIGUOUS',
+  reasonCode: 'SIGNED_SIMULATION_SUCCEEDED' | 'SUBMISSION_STARTED'
+    | 'SUBMISSION_ACCEPTED' | 'SUBMISSION_AMBIGUOUS'
+    | 'SUBMISSION_SIGNATURE_MISMATCH',
+  occurredAtMs: number,
+): Promise<void> {
+  const eventFingerprint = hash([
+    'execution-submission-event-v1', artifact.artifactId, previousState,
+    nextState, reasonCode, occurredAtMs,
+  ]);
+  const result = await client.query(`INSERT INTO execution_submission_events (
+    event_id,payload_version,event_fingerprint,artifact_id,generation_id,
+    previous_state,next_state,reason_code,occurred_at
+  ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,
+    TIMESTAMPTZ 'epoch'+($8::BIGINT*INTERVAL '1 millisecond'))`, [
+    `execution_submission_event_${eventFingerprint}`, eventFingerprint,
+    artifact.artifactId, artifact.generationId, previousState, nextState,
+    reasonCode, occurredAtMs,
+  ]);
+  if (result.rowCount !== 1) throw failure('CONFLICT');
+}
+
+async function insertStandardIntentTransition(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+  previousStatus: 'SIGNED_NOT_SUBMITTED',
+  nextStatus: 'SUBMITTED' | 'UNKNOWN_REQUIRES_RECONCILIATION',
+  reasonCode: 'SUBMISSION_ACCEPTED' | 'RECONCILIATION_REQUIRED',
+  occurredAtMs: number,
+): Promise<void> {
+  const result = await client.query(`INSERT INTO execution_intent_transitions (
+    intent_id,previous_status,next_status,reason_code,human_message,activation_phase,
+    attempt_number,evidence,occurred_at
+  ) VALUES ($1,$2,$3,$4,$5,'CANARY',$6,
+    jsonb_build_object('payloadVersion',1,'attemptNumber',$6::INTEGER,
+      'sourceEventId',NULL,'observedAtMs',$7::BIGINT),
+    TIMESTAMPTZ 'epoch'+($7::BIGINT*INTERVAL '1 millisecond'))`, [
+    artifact.intentId, previousStatus, nextStatus, reasonCode,
+    nextStatus === 'SUBMITTED'
+      ? 'Persisted transaction accepted by provider.'
+      : 'Submission outcome requires reconciliation.',
+    artifact.attemptNumber, occurredAtMs,
+  ]);
+  if (result.rowCount !== 1) throw failure('CONFLICT');
+}
+
 async function lockGeneration(client: DatabaseClient, generationId: string): Promise<void> {
   await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))', [generationId]);
 }
@@ -490,6 +779,19 @@ function unsignedBigint(value: unknown): bigint {
     throw failure('INVALID_DATA');
   }
   return BigInt(value);
+}
+
+function unsigned(value: unknown): value is bigint {
+  return typeof value === 'bigint' && value >= 0n && value <= 18_446_744_073_709_551_615n;
+}
+
+function positiveUnsigned(value: unknown): value is bigint {
+  return unsigned(value) && value > 0n;
+}
+
+function validTimestamp(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value)
+    && value >= 0 && value <= 8_640_000_000_000_000;
 }
 
 function integer(value: unknown): number {

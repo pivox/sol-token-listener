@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js, PostgreSQL, `@solana/web3.js` 1.98.4, SDK officiels Pump.fun/PumpSwap épinglés, `node:test`, RPC local scripté.
 
-**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.0, parent version 1.7.0.
+**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.2, parent version 1.7.2.
 
 ---
 
@@ -292,20 +292,20 @@ git commit -m "feat: persist signed execution atomically (#51)"
 - Test: `tests/executor-live-submission-gateway.test.ts`
 - Test: `tests/executor-live-execution-worker.test.ts`
 
-- [ ] **Step 1: Write exact-byte transport failing tests**
+- [x] **Step 1: Write exact-byte transport failing tests**
 
 Tester l'ordre `persist -> signed simulate -> beginSubmission -> RPC`, les
 options `skipPreflight=true`, `maxRetries=0`, la signature retournée exacte,
 timeout/429/réponse divergente et absence de nouvel appel pour des bytes
 différents.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `npx tsx --test tests/executor-live-submission-gateway.test.ts tests/executor-live-execution-worker.test.ts`
 
 Expected: FAIL because transport and worker are absent.
 
-- [ ] **Step 3: Implement gateway and worker**
+- [x] **Step 3: Implement gateway and worker**
 
 Le gateway reçoit :
 
@@ -320,7 +320,7 @@ Le worker fait échouer fermé toute anomalie pré-signature. Après
 `SUBMISSION_STARTED`, toute erreur non prouvée sans dispatch enregistre
 `AMBIGUOUS`, `UNKNOWN_REQUIRES_RECONCILIATION` et `UNKNOWN_HELD`.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `npx tsx --test tests/executor-live-submission-gateway.test.ts tests/executor-live-execution-worker.test.ts`
 

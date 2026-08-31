@@ -112,6 +112,10 @@ class StubLiveGateway implements ExecutionLiveGateway {
     this.request = request;
     return Promise.resolve(this.result);
   }
+  public sendRawTransaction(): Promise<never> {
+    this.sendCalls += 1;
+    return Promise.reject(new Error('must not send'));
+  }
 }
 
 function signedFixture() {

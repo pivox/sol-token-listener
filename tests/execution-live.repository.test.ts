@@ -75,6 +75,53 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
     assert.equal(authenticated.state, 'PERSISTED');
     assert.deepEqual(authenticated.artifact.signedTransactionBytes,
       fixture.artifact.signedTransactionBytes);
+    const signedSimulation = await repository.recordSignedSimulation(
+      fixture.claim,
+      Object.freeze({
+        payloadVersion: 1,
+        artifactId: fixture.artifact.artifactId,
+        signedTransactionHash: fixture.artifact.signedTransactionHash,
+        simulationSlot: 126n,
+        unitsConsumed: 26_000n,
+        feePayerLamportDebit: 5_500n,
+        baseDeltaRaw: 95n,
+        quoteDeltaRaw: -1_000n,
+        evidenceFingerprint: '9'.repeat(64),
+        observedAtMs: fixture.artifact.signedAtMs + 1,
+      }),
+    );
+    assert.equal(signedSimulation.state, 'SIGNED_SIMULATED');
+    assert.equal(signedSimulation.stateRevision, 1n);
+    const submissionStarted = await repository.beginSubmission({
+      claim: fixture.claim,
+      artifactId: fixture.artifact.artifactId,
+      expectedRevision: signedSimulation.stateRevision,
+      observedAtMs: Date.now(),
+    });
+    assert.equal(submissionStarted.state, 'SUBMISSION_STARTED');
+    assert.equal(submissionStarted.stateRevision, 2n);
+    await repository.recordSubmissionOutcome(fixture.claim, Object.freeze({
+      payloadVersion: 1,
+      artifactId: fixture.artifact.artifactId,
+      expectedRevision: submissionStarted.stateRevision,
+      outcome: 'ACCEPTED',
+      returnedSignature: fixture.artifact.signature,
+      reasonCode: 'SUBMISSION_ACCEPTED',
+      observedAtMs: Date.now() + 1_000,
+    }));
+    const accepted = await pool.query(`SELECT
+      (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS artifact_state,
+      (SELECT state_revision::TEXT FROM execution_signed_transactions
+        WHERE artifact_id=$1) AS artifact_revision,
+      (SELECT status FROM execution_intents WHERE id=$2) AS intent_status,
+      (SELECT COUNT(*)::INTEGER FROM execution_submission_events
+        WHERE artifact_id=$1) AS submission_events`, [
+      fixture.artifact.artifactId, fixture.claim.intent.id,
+    ]);
+    assert.deepEqual(accepted.rows, [{
+      artifact_state: 'ACCEPTED', artifact_revision: '3',
+      intent_status: 'SUBMITTED', submission_events: 4,
+    }]);
   });
 });
 

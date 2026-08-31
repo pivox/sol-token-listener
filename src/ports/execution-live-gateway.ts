@@ -21,9 +21,21 @@ export interface ExecutionSignedSimulationResultV1 {
   readonly logsLineCount: number;
 }
 
+export interface ExecutionRawSubmissionRequestV1 {
+  readonly payloadVersion: 1;
+  readonly transactionBase64: string;
+  readonly skipPreflight: true;
+  readonly maxRetries: 0;
+  readonly preflightCommitment: 'confirmed';
+}
+
 export interface ExecutionLiveGateway {
   readonly simulateSignedTransaction: (
     request: ExecutionSignedSimulationRequestV1,
     signal: AbortSignal,
   ) => Promise<ExecutionSignedSimulationResultV1>;
+  readonly sendRawTransaction: (
+    request: ExecutionRawSubmissionRequestV1,
+    signal: AbortSignal,
+  ) => Promise<Readonly<{ readonly signature: string }>>;
 }
