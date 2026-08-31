@@ -35,7 +35,7 @@ export interface ExpectedBuildAccountV1 {
   readonly address: string;
 }
 
-export interface BuildRecipientSelectionV1 {
+export interface DeterministicBuildRecipientSelectionV1 {
   readonly role: 'FEE' | 'BUYBACK_FEE';
   readonly domain: string;
   readonly listKind: 'NORMAL' | 'RESERVED' | 'BUYBACK';
@@ -44,6 +44,19 @@ export interface BuildRecipientSelectionV1 {
   readonly selectedIndex: number;
   readonly selectedAddress: string;
 }
+
+export interface SdkRandomBuildRecipientSelectionV1 {
+  readonly role: 'FEE' | 'BUYBACK_FEE';
+  readonly selectionMethod: 'SDK_RANDOM';
+  readonly listKind: 'NORMAL' | 'RESERVED' | 'BUYBACK';
+  readonly candidates: readonly string[];
+  readonly selectedIndex: number;
+  readonly selectedAddress: string;
+}
+
+export type BuildRecipientSelectionV1 =
+  | DeterministicBuildRecipientSelectionV1
+  | SdkRandomBuildRecipientSelectionV1;
 
 export interface UnsignedBuildPlanV1 {
   readonly payloadVersion: 1;
