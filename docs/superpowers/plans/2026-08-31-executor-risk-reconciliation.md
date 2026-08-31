@@ -21,7 +21,7 @@ repository but are not wired into `src/executor/main.ts`.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-risk-reconciliation-design.md`
-version 1.0.7 and parent specification version 1.6.4.
+version 1.0.8 and parent specification version 1.6.4.
 
 ---
 
@@ -330,7 +330,7 @@ Expected: migration 034 missing and manifest expectation fails.
 
 - [x] **Step 3: Implement migration 034**
 
-Create the eleven tables named by spec 1.0.7, including
+Create the eleven tables named by spec 1.0.8, including
 `execution_wallet_risk_state`. Use `CREATE TABLE IF NOT EXISTS`, named
 constraints and `CREATE INDEX IF NOT EXISTS`. Store financial integers as
 unscaled `NUMERIC` with explicit integer/u64 or integer/i128 checks. Every terminal

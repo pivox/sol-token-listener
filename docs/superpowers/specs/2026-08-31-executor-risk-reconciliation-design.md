@@ -1,6 +1,6 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.7
+**Version de spécification :** 1.0.8
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.0.8 — 2026-08-31 :** ajoute les neuf compteurs de purge #51-E au
+  contrat de smoke test de déploiement, dans l'ordre lexical canonique du log
+  structuré `retention.purged`.
 - **1.0.7 — 2026-08-31 :** ferme explicitement les graphes source et compilé
   de la fondation #51-E. Aucun entrypoint, script ou réglage d'environnement
   ne compose l'admission, le ledger de fautes ou la réconciliation.
