@@ -233,7 +233,7 @@ git commit -m "feat: model durable provider quota gates (#51)"
 - Create: `tests/execution-reconciliation.test.ts`
 - Create: `tests/execution-fault-policy.test.ts`
 
-- [ ] **Step 1: Write failing reconciliation tests**
+- [x] **Step 1: Write failing reconciliation tests**
 
 Pin the full result matrix. In particular, NO_EFFECT must require all three
 proofs and MATCHED must use actual signed deltas:
@@ -257,7 +257,7 @@ Also prove absence without final block height, a current null signature, a
 reorg, nonzero delta, fingerprint mismatch and residual token balance never
 produce NO_EFFECT.
 
-- [ ] **Step 2: Write failing fault-policy tests**
+- [x] **Step 2: Write failing fault-policy tests**
 
 Test every matrix row and the exact two-failure gate:
 
@@ -268,7 +268,7 @@ assert.equal(classifyExecutionFault({
 }), 'RECONCILE_ONLY');
 ```
 
-- [ ] **Step 3: Verify RED for both modules**
+- [x] **Step 3: Verify RED for both modules**
 
 Run:
 
@@ -278,7 +278,7 @@ node --import tsx --test tests/execution-reconciliation.test.ts tests/execution-
 
 Expected: both new modules are missing.
 
-- [ ] **Step 4: Implement immutable proofs and closed classification**
+- [x] **Step 4: Implement immutable proofs and closed classification**
 
 Export exact unions:
 
@@ -295,7 +295,7 @@ export type ExecutionRetryDecision =
 Create deterministic evidence IDs/fingerprints, signed bigint bounds, fixed
 typed errors and strict reason-code/result relationships.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 Run the two Task 3 tests, then:
 
