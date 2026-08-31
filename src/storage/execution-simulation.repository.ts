@@ -146,7 +146,7 @@ const INSERTED_SELECT = ARTIFACT_ROW_KEYS.map((key) => {
 const COMPLETE_SQL = `WITH operation AS MATERIALIZED (
   SELECT date_trunc('milliseconds', statement_timestamp()) AS at
 ), locked AS MATERIALIZED (
-  SELECT intent.id,intent.state_revision,EXISTS (
+  SELECT intent.id,intent.side,intent.state_revision,EXISTS (
     SELECT 1 FROM execution_simulation_artifacts AS existing
     WHERE existing.artifact_id=$27
        OR (existing.intent_id=$1 AND existing.attempt_number=$26)
@@ -206,6 +206,9 @@ const COMPLETE_SQL = `WITH operation AS MATERIALIZED (
     $69,$70,$71,$72,$73,operation.at
   FROM locked JOIN attempt_locked ON attempt_locked.intent_id=locked.id CROSS JOIN operation
   WHERE NOT locked.artifact_conflict
+    AND ($69 IS DISTINCT FROM 'SIMULATION_PROGRAM_ERROR'
+      OR (locked.side='BUY' AND $70='BUY_SIMULATION_FAILED')
+      OR (locked.side='SELL' AND $70='SELL_SIMULATION_FAILED'))
   RETURNING *
 ), finished AS MATERIALIZED (
   UPDATE execution_attempts AS attempt

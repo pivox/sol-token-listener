@@ -50,6 +50,7 @@ void test('complete snapshots inputs and dispatches one atomic terminal CTE', as
   assert.match(call.text, /state_revision=locked\.state_revision \+\s*CASE WHEN inserted\.result_kind='SUCCESS' THEN 2 ELSE 1 END/u);
   assert.match(call.text, /terminal_at=operation\.at[\s\S]*reconciliation_completed_at=operation\.at[\s\S]*purge_after=operation\.at \+ INTERVAL '4 hours'/u);
   assert.match(call.text, /lease_owner=NULL[\s\S]*lease_token=NULL[\s\S]*lease_expires_at=NULL/u);
+  assert.match(call.text, /locked\.side='BUY' AND \$70='BUY_SIMULATION_FAILED'[\s\S]*locked\.side='SELL' AND \$70='SELL_SIMULATION_FAILED'/u);
   assert.doesNotMatch(call.text, /transaction_bytes|message_bytes|instruction_bytes|signature|secret|rpc_url|raw_logs/iu);
   assert.equal(call.values?.[0], claimed.intent.id);
   assert.ok(call.values?.includes(artifact.resultFingerprint));
