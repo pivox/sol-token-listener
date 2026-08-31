@@ -62,14 +62,24 @@ void test('purges only expired executor risk payloads and retains active or ambi
     const currentProvider = providerSnapshot('current', nowMs - 21_600_000, nowMs + 3_600_000,
       nowMs - 18_000_000, nowMs - 17_940_000);
     await repository.appendProviderUsage(oldProvider);
-    await repository.appendProviderUsage(currentProvider);
-    for (const [snapshot, operationSeed] of [[oldProvider, '6'], [currentProvider, '7']] as const) {
+    for (const [snapshot, operationSeed] of [[oldProvider, '6']] as const) {
       await repository.recordProviderOperation({
         operationId: `execution_provider_operation_${operationSeed.repeat(64)}`,
         payloadVersion: 1, snapshotId: snapshot.snapshotId, providerId: snapshot.providerId,
         billingPeriodId: snapshot.billingPeriodId, category: 'TELEMETRY',
         logicalOperationId: `operation:${snapshot.billingPeriodId}`, units: 1n,
       });
+    }
+    await repository.appendProviderUsage(currentProvider);
+    for (const [snapshot, operationSeed] of [[currentProvider, '7']] as const) {
+      await repository.recordProviderOperation({
+        operationId: `execution_provider_operation_${operationSeed.repeat(64)}`,
+        payloadVersion: 1, snapshotId: snapshot.snapshotId, providerId: snapshot.providerId,
+        billingPeriodId: snapshot.billingPeriodId, category: 'TELEMETRY',
+        logicalOperationId: `operation:${snapshot.billingPeriodId}`, units: 1n,
+      });
+    }
+    for (const snapshot of [oldProvider, currentProvider]) {
       await pool.query(`UPDATE execution_provider_usage_snapshots SET
         superseded_at=TIMESTAMPTZ 'epoch' + ($2::BIGINT * INTERVAL '1 millisecond'),
         purge_after=TIMESTAMPTZ 'epoch' + (($2::BIGINT + 14400000) * INTERVAL '1 millisecond')

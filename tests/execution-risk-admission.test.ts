@@ -194,6 +194,76 @@ void test('PostgreSQL time rejects a replay whose caller timestamp predates expi
   });
 });
 
+void test('admission rejects a provider snapshot after it is superseded', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk current provider snapshot test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_current_provider', async (pool) => {
+    const fixture = await createFixture(pool);
+    await fixture.riskRepository.appendProviderUsage(createProviderUsageSnapshot({
+      providerId: fixture.providerSnapshot.providerId,
+      planId: fixture.providerSnapshot.planId,
+      billingPeriodId: fixture.providerSnapshot.billingPeriodId,
+      billingPeriodStartedAtMs: fixture.providerSnapshot.billingPeriodStartedAtMs,
+      billingPeriodEndsAtMs: fixture.providerSnapshot.billingPeriodEndsAtMs,
+      limitUnits: fixture.providerSnapshot.limitUnits,
+      usedUnits: fixture.providerSnapshot.usedUnits + 1n,
+      measuredAtMs: fixture.providerSnapshot.measuredAtMs + 1,
+      expiresAtMs: fixture.providerSnapshot.expiresAtMs,
+      provenance: fixture.providerSnapshot.provenance,
+    }));
+    const created = await fixture.intentRepository.create(intentDraft('superseded-provider'));
+    await assert.rejects(
+      fixture.service.admit(admissionInput(created.intent, fixture)),
+      (error) => error instanceof ExecutionRiskRepositoryError && error.code === 'CONFLICT',
+    );
+  });
+});
+
+void test('admission rejects a wallet snapshot after it is superseded', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk current wallet snapshot test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_current_wallet', async (pool) => {
+    const fixture = await createFixture(pool);
+    await fixture.riskRepository.appendWalletSnapshot(Object.freeze({
+      ...fixture.walletSnapshot,
+      snapshotId: `execution_wallet_snapshot_${'d'.repeat(64)}`,
+      snapshotFingerprint: 'd'.repeat(64),
+      stateRevision: fixture.walletSnapshot.stateRevision + 1n,
+      slot: fixture.walletSnapshot.slot + 1n,
+      blockTimeMs: (fixture.walletSnapshot.blockTimeMs ?? NOW_MS) + 1,
+      observedAtMs: fixture.walletSnapshot.observedAtMs + 1,
+    }));
+    const created = await fixture.intentRepository.create(intentDraft('superseded-wallet'));
+    await assert.rejects(
+      fixture.service.admit(admissionInput(created.intent, fixture)),
+      (error) => error instanceof ExecutionRiskRepositoryError && error.code === 'CONFLICT',
+    );
+  });
+});
+
+void test('three recent rate limits create a durable provider entry rejection', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk rate-limit ordering test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_rate_limits', async (pool) => {
+    const fixture = await createFixture(pool);
+    for (let index = 0; index < 3; index += 1) {
+      await fixture.riskRepository.recordRateLimit({
+        eventId: `execution_provider_rate_limit_${String(index + 1).repeat(64)}`,
+        payloadVersion: 1,
+        providerId: fixture.providerSnapshot.providerId,
+        billingPeriodId: fixture.providerSnapshot.billingPeriodId,
+        endpointId: `endpoint-${index + 1}`,
+        observedAtMs: NOW_MS - 3 + index,
+      });
+    }
+    const created = await fixture.intentRepository.create(intentDraft('rate-limited'));
+    const result = await fixture.service.admit(admissionInput(created.intent, fixture));
+    assert.equal(result.decision, 'REJECTED');
+    assert.equal(result.reasonCode, 'PROVIDER_ENTRY_LIMIT_REACHED');
+    assert.equal(result.reservationId, null);
+  });
+});
+
 type Fixture = Awaited<ReturnType<typeof createFixture>>;
 
 async function createFixture(pool: InstanceType<typeof pg.Pool>) {

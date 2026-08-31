@@ -332,6 +332,8 @@ CREATE TABLE IF NOT EXISTS execution_provider_usage_snapshots (
   purge_after TIMESTAMPTZ,
   CONSTRAINT execution_provider_usage_snapshots_period_measure_unique
     UNIQUE (provider_id, billing_period_id, measured_at),
+  CONSTRAINT execution_provider_usage_snapshots_counter_identity_unique
+    UNIQUE (snapshot_id, provider_id, billing_period_id),
   CONSTRAINT execution_provider_usage_snapshots_identity_check CHECK (
     payload_version = 1
     AND snapshot_id ~ '^execution_provider_usage_[0-9a-f]{64}$'
@@ -390,8 +392,9 @@ CREATE TABLE IF NOT EXISTS execution_provider_usage_counters (
   CONSTRAINT execution_provider_usage_counters_replay_unique
     UNIQUE (provider_id, billing_period_id, category, logical_operation_id),
   CONSTRAINT execution_provider_usage_counters_snapshot_fkey
-    FOREIGN KEY (snapshot_id)
-    REFERENCES execution_provider_usage_snapshots (snapshot_id) ON DELETE RESTRICT,
+    FOREIGN KEY (snapshot_id, provider_id, billing_period_id)
+    REFERENCES execution_provider_usage_snapshots
+      (snapshot_id, provider_id, billing_period_id) ON DELETE RESTRICT,
   CONSTRAINT execution_provider_usage_counters_identity_check CHECK (
     payload_version = 1
     AND operation_id ~ '^execution_provider_operation_[0-9a-f]{64}$'

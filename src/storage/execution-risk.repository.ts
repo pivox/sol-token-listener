@@ -336,6 +336,16 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         if (!sameOperation(decodeOperation(existing.rows[0]), operation)) throw failure('CONFLICT');
         return 'REPLAYED';
       }
+      const snapshotResult = await client.query(`SELECT provider_id,billing_period_id,
+        superseded_at FROM execution_provider_usage_snapshots
+        WHERE snapshot_id=$1 FOR UPDATE`, [operation.snapshotId]);
+      if (snapshotResult.rows.length !== 1) throw failure('CONFLICT');
+      const snapshot = exactRow(snapshotResult.rows[0], [
+        'provider_id', 'billing_period_id', 'superseded_at',
+      ] as const);
+      if (snapshot.provider_id !== operation.providerId
+        || snapshot.billing_period_id !== operation.billingPeriodId
+        || snapshot.superseded_at !== null) throw failure('CONFLICT');
       try {
         const result = await client.query(`INSERT INTO execution_provider_usage_counters (
           operation_id,payload_version,snapshot_id,provider_id,billing_period_id,category,
@@ -423,10 +433,18 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         return existing.result;
       }
 
-      const walletSnapshot = await findWalletSnapshot(client, input.walletSnapshot.snapshotId);
+      const walletSnapshot = await findWalletSnapshot(
+        client,
+        input.walletSnapshot.snapshotId,
+        true,
+      );
       if (walletSnapshot === null || !sameWalletSnapshot(walletSnapshot, input.walletSnapshot)
         || walletSnapshot.generationId !== input.generationId) throw failure('CONFLICT');
-      const providerSnapshot = await findProviderSnapshot(client, input.providerSnapshot.snapshotId);
+      const providerSnapshot = await findProviderSnapshot(
+        client,
+        input.providerSnapshot.snapshotId,
+        true,
+      );
       if (providerSnapshot === null
         || !sameProviderSnapshot(providerSnapshot, input.providerSnapshot)) throw failure('CONFLICT');
 
@@ -440,7 +458,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         FROM execution_provider_rate_limit_events
         WHERE provider_id=$1 AND observed_at >= TIMESTAMPTZ 'epoch'
           + (($2::BIGINT - 30000) * INTERVAL '1 millisecond')
-        ORDER BY observed_at DESC LIMIT 1000`, [providerSnapshot.providerId, decisionAtMs]);
+        ORDER BY observed_at ASC LIMIT 1000`, [providerSnapshot.providerId, decisionAtMs]);
       const recentRateLimits = rateRows.rows.map((row) => textTimestamp(
         exactRow(row, ['observed_at_ms'] as const).observed_at_ms,
       ));
@@ -1591,9 +1609,11 @@ async function findGeneration(
 async function findWalletSnapshot(
   client: ExecutionRiskClient,
   snapshotId: string,
+  currentOnly = false,
 ): Promise<WalletSnapshotV1 | null> {
   const result = await client.query(`SELECT ${WALLET_SNAPSHOT_PROJECTION}
-    FROM execution_wallet_snapshots WHERE snapshot_id=$1 FOR UPDATE`, [snapshotId]);
+    FROM execution_wallet_snapshots WHERE snapshot_id=$1
+      AND (NOT $2::BOOLEAN OR superseded_at IS NULL) FOR UPDATE`, [snapshotId, currentOnly]);
   if (result.rows.length > 1) throw failure('INVALID_DATA');
   return result.rows.length === 0 ? null : decodeWalletSnapshot(result.rows[0]);
 }
@@ -1601,9 +1621,11 @@ async function findWalletSnapshot(
 async function findProviderSnapshot(
   client: ExecutionRiskClient,
   snapshotId: string,
+  currentOnly = false,
 ): Promise<ProviderUsageSnapshotV1 | null> {
   const result = await client.query(`SELECT ${PROVIDER_PROJECTION}
-    FROM execution_provider_usage_snapshots WHERE snapshot_id=$1 FOR UPDATE`, [snapshotId]);
+    FROM execution_provider_usage_snapshots WHERE snapshot_id=$1
+      AND (NOT $2::BOOLEAN OR superseded_at IS NULL) FOR UPDATE`, [snapshotId, currentOnly]);
   if (result.rows.length > 1) throw failure('INVALID_DATA');
   return result.rows.length === 0 ? null : decodeProviderSnapshot(result.rows[0]);
 }

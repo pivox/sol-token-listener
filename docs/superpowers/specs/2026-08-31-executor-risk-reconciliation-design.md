@@ -1,6 +1,6 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.9
+**Version de spécification :** 1.0.10
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.10 — 2026-08-31 :** interdit l'admission sur un snapshot wallet ou
+  provider supplanté, lie chaque consommation provider à l'identité durable
+  complète de son snapshot courant et fournit au domaine les timestamps 429
+  dans leur ordre chronologique strict.
 - **1.0.9 — 2026-08-31 :** lie chaque preuve de réconciliation aux attentes
   immuables de la tentative, autorise une observation `UNKNOWN` plus ancienne
   à être résolue par une preuve plus récente, utilise l'heure PostgreSQL comme
@@ -316,11 +320,16 @@ précédente. `billingPeriodId` reste opaque et n'est jamais trié lexicalement.
 Dans une même période, les bornes, le plan et la limite sont immuables, l'heure
 de mesure avance strictement et l'usage ne régresse pas. Le snapshot provider
 précédent est alors marqué supplanté et purgeable après quatre heures.
+Un snapshot supplanté reste disponible uniquement pour audit et replay exact :
+il ne peut plus servir à une admission ou recevoir une nouvelle consommation.
 
 `execution_provider_usage_counters` conserve les consommations locales depuis
 la dernière mesure par catégories `ENTRY`, `EXIT`, `CONFIRMATION`,
 `RECONCILIATION` et `TELEMETRY`. Les écritures sont idempotentes par
 `operation_id`; un restart ne remet rien à zéro.
+Chaque compteur référence par clé étrangère composite le `snapshot_id`, le
+provider et la période exacts du snapshot courant. Une divergence ou une
+écriture sur un snapshot supplanté échoue sans consommation partielle.
 
 ```text
 remaining = limit - measuredUsed - localUsedSinceMeasurement
@@ -341,6 +350,8 @@ Trois 429 consécutifs dans une fenêtre glissante de 30 secondes créent au
 minimum `ENTRY_BLOCKED`. L'épuisement de tous les endpoints ou l'impossibilité
 de garantir `protected` produit `EXIT_ONLY` ou `UNKNOWN` selon la preuve
 disponible. Les URL et credentials ne sont jamais persistés ni journalisés.
+Le repository fournit ces timestamps au domaine dans un ordre strictement
+croissant afin que la validation monotone reste déterministe.
 
 ## 9. Réconciliation
 

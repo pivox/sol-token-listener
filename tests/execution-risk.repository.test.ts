@@ -94,6 +94,14 @@ void test('provider usage is monotone and operations and 429 events are idempote
       logicalOperationId: 'intent:test',
       units: 3n,
     };
+    await assert.rejects(
+      repository.recordProviderOperation({ ...operation, providerId: 'rpc-secondary' }),
+      isRepositoryError('CONFLICT'),
+    );
+    await assert.rejects(
+      repository.recordProviderOperation({ ...operation, billingPeriodId: 'period-other' }),
+      isRepositoryError('CONFLICT'),
+    );
     assert.equal(await repository.recordProviderOperation(operation), 'RECORDED');
     assert.equal(await repository.recordProviderOperation(operation), 'REPLAYED');
     await assert.rejects(

@@ -33,6 +33,7 @@ void test('migration 034 defines the eleven closed durable risk tables', async (
   assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS execution_exposure_reservations_position_side_active_unique/u);
   assert.match(sql, /FOREIGN KEY \(intent_id\)\s*REFERENCES execution_intents \(id\) ON DELETE RESTRICT/u);
   assert.match(sql, /FOREIGN KEY \(intent_id, attempt_number\)\s*REFERENCES execution_attempts \(intent_id, attempt_number\) ON DELETE RESTRICT/u);
+  assert.match(sql, /FOREIGN KEY \(snapshot_id, provider_id, billing_period_id\)\s*REFERENCES execution_provider_usage_snapshots\s*\(snapshot_id, provider_id, billing_period_id\) ON DELETE RESTRICT/u);
   assert.match(sql, /purge_after = reconciled_at \+ INTERVAL '4 hours'/u);
   assert.match(sql, /purge_after = terminal_at \+ INTERVAL '4 hours'/u);
   assert.match(sql, /commitment = 'finalized'/u);
