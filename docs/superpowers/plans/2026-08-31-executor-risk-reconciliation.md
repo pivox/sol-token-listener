@@ -69,7 +69,7 @@ Existing files modified:
 - Create: `src/domain/execution-risk-policy.ts`
 - Create: `tests/execution-risk-policy.test.ts`
 
-- [ ] **Step 1: Write failing contract and boundary tests**
+- [x] **Step 1: Write failing contract and boundary tests**
 
 Define tests that import the wished-for API and prove frozen exact values,
 position sizing, total exposure, drawdown, WSOL policy and hostile input
@@ -107,7 +107,7 @@ assert.equal(decision.kind, 'ADMISSIBLE');
 assert.equal(decision.positionLimitLamports, 90_000n);
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run:
 
@@ -117,7 +117,7 @@ node --import tsx --test tests/execution-risk-policy.test.ts
 
 Expected: FAIL because `src/domain/execution-risk-policy.ts` does not exist.
 
-- [ ] **Step 3: Implement the minimal strict domain**
+- [x] **Step 3: Implement the minimal strict domain**
 
 Export exact frozen types and functions:
 
@@ -137,11 +137,11 @@ Use multiplication before division with `bigint`, positive/zero-safe clamping,
 exact-own-key validation, proxy/accessor rejection and SHA-256 canonical
 fingerprinting. Never accept a JavaScript `number` for a financial value.
 
-- [ ] **Step 4: Run focused tests and refactor only after GREEN**
+- [x] **Step 4: Run focused tests and refactor only after GREEN**
 
 Run the Task 1 test command. Expected: all Task 1 tests PASS, 0 failures.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add src/domain/execution-risk-policy.ts tests/execution-risk-policy.test.ts
