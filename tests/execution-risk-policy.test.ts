@@ -81,6 +81,24 @@ void test('rejects position and total exposure limit violations independently', 
   assert.equal(exposure.projectedExposureLamports, 200_001n);
 });
 
+void test('saturates persisted exposure and loss aggregates at u64 max', () => {
+  const u64Max = (1n << 64n) - 1n;
+  const exposure = evaluateBuyRisk(riskInput({
+    requestedQuoteAmountRaw: 1n,
+    reservedExposureLamports: u64Max,
+  }));
+  assert.equal(exposure.kind, 'REJECTED');
+  assert.equal(exposure.reasonCode, 'EXPOSURE_LIMIT_EXCEEDED');
+  assert.equal(exposure.projectedExposureLamports, u64Max);
+
+  const loss = evaluateBuyRisk(riskInput({
+    requestedQuoteAmountRaw: 1n,
+    openPositions: [position('one', u64Max, 0n), position('two', u64Max, 0n)],
+  }));
+  assert.equal(loss.conservativeUnrealizedLossLamports, u64Max);
+  assert.equal(loss.reasonCode, 'EXPOSURE_LIMIT_EXCEEDED');
+});
+
 void test('rejects another BUY when the open-position count is already full', () => {
   const decision = evaluateBuyRisk(riskInput({
     openPositions: [position('one', 50_000n, 50_000n), position('two', 50_000n, 50_000n)],

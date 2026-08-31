@@ -1,6 +1,6 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.8
+**Version de spécification :** 1.0.9
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,11 @@
 
 ## Historique des versions
 
+- **1.0.9 — 2026-08-31 :** lie chaque preuve de réconciliation aux attentes
+  immuables de la tentative, autorise une observation `UNKNOWN` plus ancienne
+  à être résolue par une preuve plus récente, utilise l'heure PostgreSQL comme
+  plancher d'admission, interdit les périodes provider chevauchantes, marque
+  les snapshots supplantés et borne les agrégats financiers à `u64`.
 - **1.0.8 — 2026-08-31 :** ajoute les neuf compteurs de purge #51-E au
   contrat de smoke test de déploiement, dans l'ordre lexical canonique du log
   structuré `retention.purged`.
@@ -173,6 +178,10 @@ l'intention. L'exposition après réservation doit rester sous
 `totalExposureLimit`, le nombre de positions sous son plafond et le drawdown
 conservateur strictement sous `drawdownPauseBps`.
 
+Les sommes d'exposition et de perte sont saturées à `u64::MAX` avant toute
+persistance. Un dépassement produit un refus métier explicable ; il ne peut pas
+être transformé en erreur PostgreSQL ni faire disparaître le rapport de refus.
+
 Les gains non réalisés n'augmentent jamais le capital. Une position ouverte
 est valorisée par sa quote SELL conservatrice nette. Sans quote SELL fraîche,
 elle vaut zéro pour le drawdown mais conserve sa réservation maximale pour
@@ -219,6 +228,10 @@ les positions ouvertes, le PnL net réalisé, un fingerprint et la génération.
 Les payloads sont bornés et ne contiennent ni URL, credential, historique de
 transactions brut, métadonnées token ou secret.
 
+Lorsqu'un snapshot plus récent est inséré, le précédent est marqué
+`superseded_at` avec l'heure PostgreSQL et devient purgeable exactement quatre
+heures plus tard. Le snapshot courant conserve ces deux champs à `NULL`.
+
 La policy V1 autorise au plus deux positions. La projection relationnelle les
 stocke donc dans deux emplacements optionnels fermés : identifiant, coût,
 liquidation conservatrice éventuelle et statut de réconciliation. Le compteur
@@ -262,6 +275,10 @@ date de création et, lorsqu'elle est terminale, `reconciled_at` et
 8. incrémente la révision de l'agrégat wallet ;
 9. committe avec l'heure PostgreSQL unique de la transaction.
 
+La fraîcheur est évaluée à `max(nowMs fourni, heure PostgreSQL)`. Une horloge
+appelante retardée ne peut donc ni prolonger une intention expirée, ni rendre
+frais un snapshot wallet/provider devenu périmé.
+
 Aucun RPC ne s'exécute sous le verrou. Les snapshots sont obtenus avant la
 transaction puis authentifiés par ID, fingerprint et révision. Une concurrence
 modifiant l'un d'eux produit un refus/retry borné, jamais une admission sur une
@@ -296,6 +313,9 @@ l'état `UNKNOWN`. La période est semi-ouverte
 `[billingPeriodStartedAt, billingPeriodEndsAt)` ; `measuredAt` doit lui
 appartenir. Une nouvelle période cohérente commence au plus tôt à la fin de la
 précédente. `billingPeriodId` reste opaque et n'est jamais trié lexicalement.
+Dans une même période, les bornes, le plan et la limite sont immuables, l'heure
+de mesure avance strictement et l'usage ne régresse pas. Le snapshot provider
+précédent est alors marqué supplanté et purgeable après quatre heures.
 
 `execution_provider_usage_counters` conserve les consommations locales depuis
 la dernière mesure par catégories `ENTRY`, `EXIT`, `CONFIRMATION`,
@@ -334,6 +354,7 @@ complète opaque au domaine, ni méthode de signature ou soumission.
 ```text
 intentId, attemptNumber, walletGeneration
 providerId, signature, blockhash, lastValidBlockHeight
+maximumFeeLamports, maximumFeePayerLamportDebit
 signatureStatus, confirmationStatus, observedSlot
 feeLamports, walletLamportDelta, baseDeltaRaw, quoteDeltaRaw
 expected fingerprints, observed fingerprints
@@ -351,10 +372,23 @@ historique de signature sur le provider épinglé et l'absence de delta ; elle
 libère la réservation et autorise le reason code
 `RECONCILIATION_PROVED_NO_EFFECT`.
 
+La signature, le blockhash, la dernière hauteur valide, les fingerprints et
+les deux plafonds de frais sont d'abord persistés ensemble sur
+`execution_attempts`. Ce groupe est tout-null ou complet, puis immuable. Le
+repository refuse toute preuve qui ne correspond pas exactement à ces attentes
+durables ; les seules valeurs fournies par l'appelant ne font jamais autorité.
+
 `MISMATCH` conserve la réservation en `UNKNOWN_HELD`, signale
 `BALANCE_MISMATCH`, `RESIDUAL_TOKEN_BALANCE` ou `DOUBLE_ORDER_SUSPECTED` et
 bloque tout BUY. `UNKNOWN` conserve également la réservation et ne peut jamais
 devenir une preuve de non-effet par TTL ou simple absence courante.
+
+Plusieurs observations `UNKNOWN` strictement plus récentes peuvent être
+ajoutées pour une même tentative. Une preuve terminale `MATCHED` ou `NO_EFFECT`
+plus récente résout atomiquement toutes les observations `UNKNOWN` antérieures,
+les rend purgeables après quatre heures et fait progresser l'intention. Une
+preuve terminale ou `MISMATCH` antérieure interdit toute nouvelle divergence ;
+un replay exact reste idempotent.
 
 Le repository persiste preuve, transition d'intention future, mutation de
 réservation et agrégat wallet dans une transaction fenced. #51-E teste cette
@@ -390,6 +424,8 @@ les preuves durables nécessaires. `RETRY_EXACT_BYTES` ne sera utilisable qu'en
 
 La migration `034_execution_risk_reconciliation.sql` ajoute :
 
+- les attentes de réconciliation tout-null ou immuables à
+  `execution_attempts` ;
 - `execution_wallet_generations` ;
 - `execution_wallet_risk_state` ;
 - `execution_wallet_snapshots` ;
@@ -422,8 +458,13 @@ une intention, génération ou réservation encore utile à une ambiguïté.
 
 Une admission rejetée, un snapshot supplanté et une réservation réconciliée
 deviennent purgeables quatre heures après leur fin d'utilité. Une réservation
-`RESERVED` ou `UNKNOWN_HELD`, une preuve `UNKNOWN`/`MISMATCH`, une génération
-active et les compteurs de la période provider courante ne sont jamais purgés.
+`RESERVED` ou `UNKNOWN_HELD`, une preuve `UNKNOWN` non résolue ou `MISMATCH`,
+une génération active et les compteurs de la période provider courante ne sont
+jamais purgés.
+
+Une preuve `UNKNOWN` résolue n'est plus active : elle reçoit l'identité de la
+preuve terminale, `resolved_at` et `purge_after = resolved_at + 4h`. Elle est
+supprimée dans la même cohorte enfant-first que la preuve terminale.
 
 La purge verrouille une cohorte, insère d'abord un tombstone minimal pour les
 identités d'admission/réservation, puis supprime enfants avant parents dans une
@@ -464,6 +505,7 @@ est ajouté de façon append-only dans la spécification parente.
 - sizing, fee reserve, positions, exposition, drawdown et quote SELL absente ;
 - allowlist initiale WSOL sans couplage du domaine ;
 - provider frais, périmé, non monotone, période changée, 429 et `EXIT_ONLY` ;
+- périodes provider sans chevauchement et snapshots supplantés à quatre heures ;
 - budget de sortie pessimiste pour 0, 1 et maximum de positions ;
 - admission concurrente de deux BUY sur la même génération ;
 - replay exact, conflit, lease/CAS perdu et crash à chaque frontière ;
@@ -471,6 +513,7 @@ est ajouté de façon append-only dans la spécification parente.
 - preuve `NO_EFFECT` seulement après hauteur finalisée, absence historique et
   zéro delta ;
 - preuve `MATCHED` avec deltas réels et frais exacts ;
+- progression `UNKNOWN -> MATCHED|NO_EFFECT` et attentes de tentative immuables ;
 - deux fautes techniques, reset uniquement après succès final réconcilié ;
 - migration base vide, replay, upgrade 033 et contraintes de corruption ;
 - rétention à la frontière exacte de quatre heures ;

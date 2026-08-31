@@ -46,6 +46,14 @@ void test('wallet generation and snapshot writes replay exactly and reject confl
       reconciliationStatus: 'RECONCILED',
     }]);
     assert.deepEqual(await repository.appendWalletSnapshot(positioned), positioned);
+    const retention = await pool.query(`SELECT snapshot_id,superseded_at,purge_after,
+      EXTRACT(EPOCH FROM (purge_after-superseded_at))::INTEGER AS retention_seconds
+      FROM execution_wallet_snapshots ORDER BY state_revision`);
+    assert.equal(retention.rows[0]?.snapshot_id, snapshot.snapshotId);
+    assert.ok(retention.rows[0]?.superseded_at instanceof Date);
+    assert.equal(retention.rows[0]?.retention_seconds, 14_400);
+    assert.equal(retention.rows[1]?.superseded_at, null);
+    assert.equal(retention.rows[1]?.purge_after, null);
   });
 });
 
@@ -62,13 +70,26 @@ void test('provider usage is monotone and operations and 429 events are idempote
       repository.appendProviderUsage(providerSnapshot(900, 1_050, 11)),
       isRepositoryError('STALE_MEASUREMENT'),
     );
+    await assert.rejects(
+      repository.appendProviderUsage(providerSnapshot(1_050, 1_200, 1)),
+      isRepositoryError('STALE_MEASUREMENT'),
+    );
+    const second = providerSnapshot(1_000, 1_150, 11);
+    assert.deepEqual(await repository.appendProviderUsage(second), second);
+    const retention = await pool.query(`SELECT snapshot_id,superseded_at,purge_after,
+      EXTRACT(EPOCH FROM (purge_after-superseded_at))::INTEGER AS retention_seconds
+      FROM execution_provider_usage_snapshots ORDER BY measured_at`);
+    assert.equal(retention.rows[0]?.snapshot_id, first.snapshotId);
+    assert.ok(retention.rows[0]?.superseded_at instanceof Date);
+    assert.equal(retention.rows[0]?.retention_seconds, 14_400);
+    assert.equal(retention.rows[1]?.superseded_at, null);
 
     const operation = {
       operationId: `execution_provider_operation_${'d'.repeat(64)}`,
       payloadVersion: 1 as const,
-      snapshotId: first.snapshotId,
+      snapshotId: second.snapshotId,
       providerId: first.providerId,
-      billingPeriodId: first.billingPeriodId,
+      billingPeriodId: second.billingPeriodId,
       category: 'ENTRY' as const,
       logicalOperationId: 'intent:test',
       units: 3n,
@@ -228,10 +249,42 @@ void test('reconciliation atomically consumes, releases or holds reservations an
         assert.equal(durable.rows[0]?.unknown_block, true);
       }
       if (outcome === 'UNKNOWN') {
+        const resolvedEvidence = reconciliationEvidence(
+          fixture.intentId,
+          'MATCHED',
+          fixture.snapshotFingerprint,
+          2_000,
+        );
+        const resolved = await fixture.repository.reconcile({
+          payloadVersion: 1,
+          evidence: resolvedEvidence,
+        });
+        assert.equal(resolved.result, 'MATCHED');
+        const resolvedState = await pool.query(`SELECT reservation.state,intent.status,
+          risk.unknown_block FROM execution_exposure_reservations reservation
+          JOIN execution_intents intent ON intent.id=reservation.intent_id
+          JOIN execution_wallet_risk_state risk ON risk.generation_id=reservation.generation_id`);
+        assert.deepEqual(resolvedState.rows, [{
+          state: 'CONSUMED', status: 'SUCCEEDED', unknown_block: false,
+        }]);
+        assert.deepEqual(await fixture.repository.reconcile({ payloadVersion: 1, evidence }), result);
+        const resolution = await pool.query(`SELECT result,resolved_by_evidence_id,
+          EXTRACT(EPOCH FROM (purge_after-resolved_at))::INTEGER AS retention_seconds
+          FROM execution_reconciliation_evidence ORDER BY observed_at`);
+        assert.deepEqual(resolution.rows, [{
+          result: 'UNKNOWN',
+          resolved_by_evidence_id: resolvedEvidence.evidenceId,
+          retention_seconds: 14_400,
+        }, {
+          result: 'MATCHED',
+          resolved_by_evidence_id: null,
+          retention_seconds: null,
+        }]);
         const conflicting = reconciliationEvidence(
           fixture.intentId,
           'MISMATCH',
           fixture.snapshotFingerprint,
+          3_000,
         );
         await assert.rejects(
           fixture.repository.reconcile({ payloadVersion: 1, evidence: conflicting }),
@@ -240,6 +293,39 @@ void test('reconciliation atomically consumes, releases or holds reservations an
       }
     });
   }
+});
+
+void test('reconciliation rejects caller expectations that differ from the durable attempt', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution reconciliation expectation binding test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_reconciliation_binding', async (pool) => {
+    const fixture = await reconciliationFixture(pool, 'binding', 'SUBMITTED');
+    const evidence = reconciliationEvidence(
+      fixture.intentId,
+      'MATCHED',
+      fixture.snapshotFingerprint,
+      0,
+      '4'.repeat(32),
+    );
+    await assert.rejects(
+      fixture.repository.reconcile({ payloadVersion: 1, evidence }),
+      isRepositoryError('CONFLICT'),
+    );
+    const alteredFeeLimit = reconciliationEvidence(
+      fixture.intentId,
+      'MATCHED',
+      fixture.snapshotFingerprint,
+      0,
+      publicKey,
+      11n,
+    );
+    await assert.rejects(
+      fixture.repository.reconcile({ payloadVersion: 1, evidence: alteredFeeLimit }),
+      isRepositoryError('CONFLICT'),
+    );
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_reconciliation_evidence`)).rows[0]?.count, 0);
+  });
 });
 
 async function reconciliationFixture(
@@ -300,8 +386,15 @@ async function reconciliationFixture(
     last_reason_code=$3,updated_at=date_trunc('milliseconds',statement_timestamp()) WHERE id=$1`,
   [created.intent.id, initialStatus, reason]);
   await pool.query(`INSERT INTO execution_attempts (
-    intent_id,attempt_number,status,effective_venue,provider_id
-  ) VALUES ($1,1,'STARTED','PUMP_FUN','rpc-primary')`, [created.intent.id]);
+    intent_id,attempt_number,status,effective_venue,provider_id,
+    reconciliation_signature,reconciliation_blockhash,reconciliation_last_valid_block_height,
+    reconciliation_message_hash,reconciliation_build_fingerprint,
+    reconciliation_snapshot_fingerprint,reconciliation_maximum_fee_lamports,
+    reconciliation_maximum_fee_payer_lamport_debit
+  ) VALUES ($1,1,'STARTED','PUMP_FUN','rpc-primary',$2,$3,1000,$4,$5,$6,10,1000)`, [
+    created.intent.id, '3'.repeat(88), publicKey, 'd'.repeat(64), 'e'.repeat(64),
+    snapshot.snapshotFingerprint,
+  ]);
   return Object.freeze({
     repository,
     generationId: generation.generationId,
@@ -314,12 +407,15 @@ function reconciliationEvidence(
   intentId: string,
   outcome: 'MATCHED' | 'NO_EFFECT' | 'MISMATCH' | 'UNKNOWN',
   snapshotFingerprint: string,
+  observedOffsetMs = 0,
+  blockhash = publicKey,
+  maximumFeeLamports = 10n,
 ) {
-  const nowMs = Date.now() + 1_000;
+  const nowMs = Date.now() + 1_000 + observedOffsetMs;
   const signature = '3'.repeat(88);
   const transaction = Object.freeze({
     signature,
-    blockhash: publicKey,
+    blockhash,
     messageHash: 'd'.repeat(64),
     buildFingerprint: 'e'.repeat(64),
     snapshotFingerprint,
@@ -350,9 +446,9 @@ function reconciliationEvidence(
   return evaluateExecutionReconciliation({
     expected: Object.freeze({
       intentId, attemptNumber: 1, walletGeneration: 1, providerId: 'rpc-primary',
-      side: 'BUY', signature, blockhash: publicKey, lastValidBlockHeight: 1_000n,
+      side: 'BUY', signature, blockhash, lastValidBlockHeight: 1_000n,
       messageHash: 'd'.repeat(64), buildFingerprint: 'e'.repeat(64), snapshotFingerprint,
-      maximumFeeLamports: 10n, maximumFeePayerLamportDebit: 1_000n,
+      maximumFeeLamports, maximumFeePayerLamportDebit: 1_000n,
     }),
     observed: Object.freeze(observed),
   });

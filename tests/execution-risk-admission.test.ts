@@ -13,7 +13,7 @@ import {
   PostgresExecutionRiskRepository,
 } from '../src/storage/execution-risk.repository.js';
 
-const NOW_MS = 1_788_000_000_000;
+const NOW_MS = Date.now();
 const WSOL = 'So11111111111111111111111111111111111111112';
 const walletKey = '11111111111111111111111111111111';
 const genesisHash = '2'.repeat(32);
@@ -172,6 +172,28 @@ void test('a failure after report insertion rolls back report, reservation and s
   });
 });
 
+void test('PostgreSQL time rejects a replay whose caller timestamp predates expiry', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk database clock test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_admission_clock', async (pool) => {
+    const fixture = await createFixture(pool);
+    const databaseNowMs = Date.now();
+    const draft = createExecutionIntentDraft({
+      ...intentDraftInput('expired-clock'),
+      requestedAtMs: databaseNowMs - 1_000,
+      expiresAtMs: databaseNowMs - 1,
+    });
+    const created = await fixture.intentRepository.create(draft);
+    const result = await fixture.service.admit({
+      ...admissionInput(created.intent, fixture),
+      nowMs: databaseNowMs - 2,
+    });
+    assert.equal(result.decision, 'REJECTED');
+    assert.equal(result.reasonCode, 'DECISION_STALE');
+    assert.equal(result.reservationId, null);
+  });
+});
+
 type Fixture = Awaited<ReturnType<typeof createFixture>>;
 
 async function createFixture(pool: InstanceType<typeof pg.Pool>) {
@@ -242,7 +264,11 @@ function admissionInput(intent: Awaited<ReturnType<
 }
 
 function intentDraft(seed: string, expiresAtMs = NOW_MS + 60_000) {
-  return createExecutionIntentDraft({
+  return createExecutionIntentDraft({ ...intentDraftInput(seed), expiresAtMs });
+}
+
+function intentDraftInput(seed: string) {
+  return {
     strategyId: 'risk-admission-test',
     strategyVersion: 1,
     positionId: `position:${seed}`,
@@ -259,8 +285,8 @@ function intentDraft(seed: string, expiresAtMs = NOW_MS + 60_000) {
     decisionEventId: `decision:${seed}`,
     decisionFingerprint: 'c'.repeat(64),
     requestedAtMs: NOW_MS - 1_000,
-    expiresAtMs,
-  });
+    expiresAtMs: NOW_MS + 60_000,
+  } as const;
 }
 
 function policyInput() {

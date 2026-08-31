@@ -509,7 +509,6 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const executionRiskReconciliationEvidence = await client.query(
       `DELETE FROM execution_reconciliation_evidence evidence
        WHERE evidence.reservation_id = ANY($1::TEXT[])
-         AND evidence.result IN ('MATCHED','NO_EFFECT')
          AND evidence.purge_after <= $2::TIMESTAMPTZ`,
       [reservationIds, executionIntentCutoff],
     );

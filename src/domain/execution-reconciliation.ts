@@ -56,6 +56,8 @@ export interface ExecutionReconciliationEvidenceV1 {
   readonly messageHash: string;
   readonly buildFingerprint: string;
   readonly snapshotFingerprint: string;
+  readonly maximumFeeLamports: bigint;
+  readonly maximumFeePayerLamportDebit: bigint;
   readonly signatureHistory: 'PRESENT' | 'ABSENT' | 'UNKNOWN';
   readonly confirmationStatus: 'FINALIZED' | 'CONFIRMED' | 'ORPHANED' | 'NOT_FOUND';
   readonly finalizedBlockHeight: bigint;
@@ -141,6 +143,8 @@ export function evaluateExecutionReconciliation(
       messageHash: expected.messageHash,
       buildFingerprint: expected.buildFingerprint,
       snapshotFingerprint: expected.snapshotFingerprint,
+      maximumFeeLamports: expected.maximumFeeLamports,
+      maximumFeePayerLamportDebit: expected.maximumFeePayerLamportDebit,
       signatureHistory: observed.signatureHistory,
       confirmationStatus: observed.confirmationStatus,
       finalizedBlockHeight: observed.finalizedBlockHeight,
@@ -313,7 +317,8 @@ function evidenceFingerprintFor(
     'execution-reconciliation-evidence-v1', value.intentId, value.attemptNumber,
     value.walletGeneration, value.providerId, value.side, value.signature,
     value.blockhash, value.lastValidBlockHeight.toString(), value.messageHash,
-    value.buildFingerprint, value.snapshotFingerprint, value.signatureHistory,
+    value.buildFingerprint, value.snapshotFingerprint, value.maximumFeeLamports.toString(),
+    value.maximumFeePayerLamportDebit.toString(), value.signatureHistory,
     value.confirmationStatus, value.finalizedBlockHeight.toString(),
     value.observedSlot?.toString() ?? null, value.observedTransactionFingerprint,
     value.feeLamports.toString(), value.walletLamportDelta.toString(),

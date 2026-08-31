@@ -3,6 +3,98 @@
 -- is stored here. Financial NUMERIC columns are deliberately unscaled because
 -- PostgreSQL rounds NUMERIC(p,0) before CHECK constraints are evaluated.
 
+ALTER TABLE execution_attempts
+  ADD COLUMN IF NOT EXISTS reconciliation_signature TEXT,
+  ADD COLUMN IF NOT EXISTS reconciliation_blockhash TEXT,
+  ADD COLUMN IF NOT EXISTS reconciliation_last_valid_block_height BIGINT,
+  ADD COLUMN IF NOT EXISTS reconciliation_message_hash TEXT,
+  ADD COLUMN IF NOT EXISTS reconciliation_build_fingerprint TEXT,
+  ADD COLUMN IF NOT EXISTS reconciliation_snapshot_fingerprint TEXT,
+  ADD COLUMN IF NOT EXISTS reconciliation_maximum_fee_lamports NUMERIC,
+  ADD COLUMN IF NOT EXISTS reconciliation_maximum_fee_payer_lamport_debit NUMERIC;
+
+ALTER TABLE execution_attempts
+  DROP CONSTRAINT IF EXISTS execution_attempts_reconciliation_expectation_check;
+ALTER TABLE execution_attempts
+  ADD CONSTRAINT execution_attempts_reconciliation_expectation_check CHECK (
+    (reconciliation_signature IS NULL
+      AND reconciliation_blockhash IS NULL
+      AND reconciliation_last_valid_block_height IS NULL
+      AND reconciliation_message_hash IS NULL
+      AND reconciliation_build_fingerprint IS NULL
+      AND reconciliation_snapshot_fingerprint IS NULL
+      AND reconciliation_maximum_fee_lamports IS NULL
+      AND reconciliation_maximum_fee_payer_lamport_debit IS NULL)
+    OR (
+      reconciliation_signature IS NOT NULL
+      AND reconciliation_blockhash IS NOT NULL
+      AND reconciliation_last_valid_block_height IS NOT NULL
+      AND reconciliation_message_hash IS NOT NULL
+      AND reconciliation_build_fingerprint IS NOT NULL
+      AND reconciliation_snapshot_fingerprint IS NOT NULL
+      AND reconciliation_maximum_fee_lamports IS NOT NULL
+      AND reconciliation_maximum_fee_payer_lamport_debit IS NOT NULL
+      AND reconciliation_signature ~ '^[1-9A-HJ-NP-Za-km-z]{32,128}$'
+      AND reconciliation_blockhash ~ '^[1-9A-HJ-NP-Za-km-z]{32,44}$'
+      AND reconciliation_last_valid_block_height >= 0
+      AND reconciliation_message_hash ~ '^[0-9a-f]{64}$'
+      AND reconciliation_build_fingerprint ~ '^[0-9a-f]{64}$'
+      AND reconciliation_snapshot_fingerprint ~ '^[0-9a-f]{64}$'
+      AND reconciliation_maximum_fee_lamports <> 'NaN'::NUMERIC
+      AND reconciliation_maximum_fee_lamports >= 0
+      AND reconciliation_maximum_fee_lamports = trunc(reconciliation_maximum_fee_lamports)
+      AND scale(reconciliation_maximum_fee_lamports) = 0
+      AND reconciliation_maximum_fee_lamports < 18446744073709551616
+      AND reconciliation_maximum_fee_payer_lamport_debit <> 'NaN'::NUMERIC
+      AND reconciliation_maximum_fee_payer_lamport_debit >= 0
+      AND reconciliation_maximum_fee_payer_lamport_debit
+        = trunc(reconciliation_maximum_fee_payer_lamport_debit)
+      AND scale(reconciliation_maximum_fee_payer_lamport_debit) = 0
+      AND reconciliation_maximum_fee_payer_lamport_debit < 18446744073709551616
+    )
+  );
+
+CREATE OR REPLACE FUNCTION reject_execution_attempt_expectation_rewrite()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF OLD.reconciliation_signature IS NOT NULL AND ROW(
+    NEW.reconciliation_signature,
+    NEW.reconciliation_blockhash,
+    NEW.reconciliation_last_valid_block_height,
+    NEW.reconciliation_message_hash,
+    NEW.reconciliation_build_fingerprint,
+    NEW.reconciliation_snapshot_fingerprint,
+    NEW.reconciliation_maximum_fee_lamports,
+    NEW.reconciliation_maximum_fee_payer_lamport_debit
+  ) IS DISTINCT FROM ROW(
+    OLD.reconciliation_signature,
+    OLD.reconciliation_blockhash,
+    OLD.reconciliation_last_valid_block_height,
+    OLD.reconciliation_message_hash,
+    OLD.reconciliation_build_fingerprint,
+    OLD.reconciliation_snapshot_fingerprint,
+    OLD.reconciliation_maximum_fee_lamports,
+    OLD.reconciliation_maximum_fee_payer_lamport_debit
+  ) THEN
+    RAISE EXCEPTION 'execution attempt reconciliation expectation is immutable'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS execution_attempt_expectation_immutable
+  ON execution_attempts;
+CREATE TRIGGER execution_attempt_expectation_immutable
+BEFORE UPDATE OF reconciliation_signature,reconciliation_blockhash,
+  reconciliation_last_valid_block_height,reconciliation_message_hash,
+  reconciliation_build_fingerprint,reconciliation_snapshot_fingerprint,
+  reconciliation_maximum_fee_lamports,reconciliation_maximum_fee_payer_lamport_debit
+ON execution_attempts
+FOR EACH ROW EXECUTE FUNCTION reject_execution_attempt_expectation_rewrite();
+
 CREATE TABLE IF NOT EXISTS execution_wallet_generations (
   generation_id TEXT PRIMARY KEY,
   payload_version SMALLINT NOT NULL DEFAULT 1,
@@ -514,6 +606,8 @@ CREATE TABLE IF NOT EXISTS execution_reconciliation_evidence (
   message_hash TEXT NOT NULL,
   build_fingerprint TEXT NOT NULL,
   snapshot_fingerprint TEXT NOT NULL,
+  maximum_fee_lamports NUMERIC NOT NULL,
+  maximum_fee_payer_lamport_debit NUMERIC NOT NULL,
   signature_history TEXT NOT NULL,
   confirmation_status TEXT NOT NULL,
   finalized_block_height BIGINT NOT NULL,
@@ -528,6 +622,8 @@ CREATE TABLE IF NOT EXISTS execution_reconciliation_evidence (
   finalized_at TIMESTAMPTZ,
   result TEXT NOT NULL,
   reason_code TEXT NOT NULL,
+  resolved_by_evidence_id TEXT,
+  resolved_at TIMESTAMPTZ,
   purge_after TIMESTAMPTZ,
   CONSTRAINT execution_reconciliation_evidence_attempt_unique
     UNIQUE (intent_id, attempt_number, evidence_fingerprint),
@@ -540,6 +636,10 @@ CREATE TABLE IF NOT EXISTS execution_reconciliation_evidence (
   CONSTRAINT execution_reconciliation_evidence_generation_fkey
     FOREIGN KEY (generation_id)
     REFERENCES execution_wallet_generations (generation_id) ON DELETE RESTRICT,
+  CONSTRAINT execution_reconciliation_evidence_resolution_fkey
+    FOREIGN KEY (resolved_by_evidence_id)
+    REFERENCES execution_reconciliation_evidence (evidence_id)
+    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
   CONSTRAINT execution_reconciliation_evidence_identity_check CHECK (
     payload_version = 1
     AND evidence_id ~ '^execution_reconciliation_[0-9a-f]{64}$'
@@ -563,10 +663,21 @@ CREATE TABLE IF NOT EXISTS execution_reconciliation_evidence (
       'RECONCILIATION_REQUIRED', 'BALANCE_MISMATCH',
       'RESIDUAL_TOKEN_BALANCE', 'DOUBLE_ORDER_SUSPECTED'
     )
+    AND (resolved_by_evidence_id IS NULL
+      OR resolved_by_evidence_id ~ '^execution_reconciliation_[0-9a-f]{64}$')
     AND (observed_slot IS NULL OR observed_slot >= 0)
   ),
   CONSTRAINT execution_reconciliation_evidence_amounts_check CHECK (
-    fee_lamports <> 'NaN'::NUMERIC AND fee_lamports >= 0
+    maximum_fee_lamports <> 'NaN'::NUMERIC AND maximum_fee_lamports >= 0
+    AND maximum_fee_lamports = trunc(maximum_fee_lamports)
+    AND scale(maximum_fee_lamports) = 0
+    AND maximum_fee_lamports < 18446744073709551616
+    AND maximum_fee_payer_lamport_debit <> 'NaN'::NUMERIC
+    AND maximum_fee_payer_lamport_debit >= 0
+    AND maximum_fee_payer_lamport_debit = trunc(maximum_fee_payer_lamport_debit)
+    AND scale(maximum_fee_payer_lamport_debit) = 0
+    AND maximum_fee_payer_lamport_debit < 18446744073709551616
+    AND fee_lamports <> 'NaN'::NUMERIC AND fee_lamports >= 0
     AND fee_lamports = trunc(fee_lamports) AND scale(fee_lamports) = 0
     AND fee_lamports < 18446744073709551616
     AND wallet_lamport_delta <> 'NaN'::NUMERIC
@@ -600,8 +711,17 @@ CREATE TABLE IF NOT EXISTS execution_reconciliation_evidence (
     OR (result = 'UNKNOWN' AND reason_code = 'RECONCILIATION_REQUIRED')
   ),
   CONSTRAINT execution_reconciliation_evidence_retention_check CHECK (
-    (result IN ('UNKNOWN', 'MISMATCH') AND purge_after IS NULL)
+    (result = 'MISMATCH' AND resolved_by_evidence_id IS NULL
+      AND resolved_at IS NULL AND purge_after IS NULL)
+    OR (result = 'UNKNOWN' AND (
+      (resolved_by_evidence_id IS NULL AND resolved_at IS NULL AND purge_after IS NULL)
+      OR (resolved_by_evidence_id IS NOT NULL AND resolved_at IS NOT NULL
+        AND purge_after IS NOT NULL
+        AND purge_after = resolved_at + INTERVAL '4 hours')
+    ))
     OR (result IN ('MATCHED', 'NO_EFFECT') AND finalized_at IS NOT NULL
+      AND resolved_by_evidence_id IS NULL AND resolved_at IS NULL
+      AND purge_after IS NOT NULL
       AND purge_after = finalized_at + INTERVAL '4 hours')
   ),
   CONSTRAINT execution_reconciliation_evidence_temporal_check CHECK (
@@ -609,6 +729,10 @@ CREATE TABLE IF NOT EXISTS execution_reconciliation_evidence (
     AND (finalized_at IS NULL OR (
       isfinite(finalized_at) AND finalized_at >= observed_at
       AND date_trunc('milliseconds', finalized_at) = finalized_at
+    ))
+    AND (resolved_at IS NULL OR (
+      isfinite(resolved_at) AND resolved_at >= observed_at
+      AND date_trunc('milliseconds', resolved_at) = resolved_at
     ))
   )
 );

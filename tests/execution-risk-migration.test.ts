@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
+import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase } from '../src/storage/database.js';
+import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 
 const migrationName = '034_execution_risk_reconciliation.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
@@ -106,6 +108,47 @@ void test('migration 034 catalog contains no floating or JSON financial storage'
       assert.equal(/(?:secret|private|url|header|bytes|payload_(?:body|json|raw))/iu
         .test(column.column_name), false);
     }
+  });
+});
+
+void test('migration 034 requires complete immutable reconciliation expectations', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution attempt expectation invariant test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_attempt_expectations', async (pool) => {
+    await migrateDatabase({ pool });
+    const nowMs = Date.now();
+    const created = await new PostgresExecutionIntentRepository(pool).create(
+      createExecutionIntentDraft({
+        strategyId: 'expectation-test', strategyVersion: 1,
+        positionId: 'position:expectation', logicalCommandId: 'command:expectation',
+        mint: '11111111111111111111111111111111', side: 'BUY',
+        venuePolicy: 'PUMP_FUN_ONLY',
+        quoteMint: 'So11111111111111111111111111111111111111112',
+        quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+        quoteAmountRaw: 100n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+        decisionEventId: 'decision:expectation', decisionFingerprint: 'a'.repeat(64),
+        requestedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 60_000,
+      }),
+    );
+    await assert.rejects(pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,reconciliation_signature
+    ) VALUES ($1,1,'STARTED',$2)`, [created.intent.id, '3'.repeat(88)]));
+    await pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status
+    ) VALUES ($1,1,'STARTED')`, [created.intent.id]);
+    await pool.query(`UPDATE execution_attempts SET
+      reconciliation_signature=$2,reconciliation_blockhash=$3,
+      reconciliation_last_valid_block_height=1000,reconciliation_message_hash=$4,
+      reconciliation_build_fingerprint=$5,reconciliation_snapshot_fingerprint=$6,
+      reconciliation_maximum_fee_lamports=10,
+      reconciliation_maximum_fee_payer_lamport_debit=1000
+      WHERE intent_id=$1 AND attempt_number=1`, [
+      created.intent.id, '3'.repeat(88), '11111111111111111111111111111111',
+      'b'.repeat(64), 'c'.repeat(64), 'd'.repeat(64),
+    ]);
+    await assert.rejects(pool.query(`UPDATE execution_attempts SET
+      reconciliation_maximum_fee_lamports=11
+      WHERE intent_id=$1 AND attempt_number=1`, [created.intent.id]));
   });
 });
 

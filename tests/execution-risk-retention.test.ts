@@ -159,9 +159,10 @@ void test('tombstones precede child-first deletion while UNKNOWN_HELD survives',
       terminalIntent.intent.id, nowMs - 18_001_000, nowMs - 18_000_000,
     ]);
     await insertEvidence(pool, terminalIntent.intent.id, '4', nowMs);
+    await insertResolvedUnknownEvidence(pool, terminalIntent.intent.id, nowMs);
 
     const purged = await purgeExpiredFoundationData(pool);
-    assert.equal(purged.executionRiskReconciliationEvidence, 1);
+    assert.equal(purged.executionRiskReconciliationEvidence, 2);
     assert.equal(purged.executionRiskReservations, 1);
     assert.equal(purged.executionRiskAdmissionReports, 1);
     assert.equal(purged.executionRiskTombstones, 2);
@@ -306,11 +307,12 @@ async function insertEvidence(
   await pool.query(`INSERT INTO execution_reconciliation_evidence (
     evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,
     generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,
-    build_fingerprint,snapshot_fingerprint,signature_history,confirmation_status,
+    build_fingerprint,snapshot_fingerprint,maximum_fee_lamports,
+    maximum_fee_payer_lamport_debit,signature_history,confirmation_status,
     finalized_block_height,observed_slot,observed_transaction_fingerprint,fee_lamports,
     wallet_lamport_delta,base_delta_raw,quote_delta_raw,unexpected_residual_token_balance_raw,
     observed_at,finalized_at,result,reason_code,purge_after
-  ) VALUES ($1,1,$2,$3,1,$4,$5,'rpc-primary','BUY',$6,$7,100,$8,$9,$10,
+  ) VALUES ($1,1,$2,$3,1,$4,$5,'rpc-primary','BUY',$6,$7,100,$8,$9,$10,10,1000,
     'PRESENT','FINALIZED',101,102,$11,1,-101,10,-100,0,
     TIMESTAMPTZ 'epoch' + ($12::BIGINT * INTERVAL '1 millisecond'),
     TIMESTAMPTZ 'epoch' + ($13::BIGINT * INTERVAL '1 millisecond'),
@@ -320,6 +322,33 @@ async function insertEvidence(
     `execution_exposure_reservation_${seed.repeat(64)}`, generationId,
     '3'.repeat(88), wallet, 'd'.repeat(64), 'e'.repeat(64), 'f'.repeat(64),
     '1'.repeat(64), nowMs - 14_400_001, nowMs - 14_400_000,
+  ]);
+}
+
+async function insertResolvedUnknownEvidence(
+  pool: InstanceType<typeof pg.Pool>,
+  intentId: string,
+  nowMs: number,
+): Promise<void> {
+  await pool.query(`INSERT INTO execution_reconciliation_evidence (
+    evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,
+    generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,
+    build_fingerprint,snapshot_fingerprint,maximum_fee_lamports,
+    maximum_fee_payer_lamport_debit,signature_history,confirmation_status,
+    finalized_block_height,observed_slot,observed_transaction_fingerprint,fee_lamports,
+    wallet_lamport_delta,base_delta_raw,quote_delta_raw,unexpected_residual_token_balance_raw,
+    observed_at,finalized_at,result,reason_code,resolved_by_evidence_id,resolved_at,purge_after
+  ) VALUES ($1,1,$2,$3,1,$4,$5,'rpc-primary','BUY',$6,$7,100,$8,$9,$10,10,1000,
+    'UNKNOWN','NOT_FOUND',99,NULL,NULL,0,0,0,0,0,
+    TIMESTAMPTZ 'epoch' + ($11::BIGINT * INTERVAL '1 millisecond'),NULL,
+    'UNKNOWN','RECONCILIATION_REQUIRED',$12,
+    TIMESTAMPTZ 'epoch' + ($13::BIGINT * INTERVAL '1 millisecond'),
+    TIMESTAMPTZ 'epoch' + (($13::BIGINT + 14400000) * INTERVAL '1 millisecond'))`, [
+    `execution_reconciliation_${'8'.repeat(64)}`, '8'.repeat(64), intentId,
+    `execution_exposure_reservation_${'4'.repeat(64)}`, generationId,
+    '3'.repeat(88), wallet, 'd'.repeat(64), 'e'.repeat(64), 'f'.repeat(64),
+    nowMs - 14_400_002, `execution_reconciliation_${'4'.repeat(64)}`,
+    nowMs - 14_400_000,
   ]);
 }
 

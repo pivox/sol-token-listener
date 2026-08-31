@@ -147,12 +147,17 @@ export function evaluateBuyRisk(input: unknown): ExecutionBuyRiskDecisionV1 {
       * policy.positionSizeBps / BPS_DENOMINATOR;
     const totalExposureLimitLamports = reconciledCapitalLamports
       * policy.maximumTotalExposureBps / BPS_DENOMINATOR;
-    const projectedExposureLamports = fields.reservedExposureLamports
-      + fields.requestedQuoteAmountRaw;
+    const projectedExposureLamports = saturatedU64Add(
+      fields.reservedExposureLamports,
+      fields.requestedQuoteAmountRaw,
+    );
     const conservativeUnrealizedLossLamports = fields.openPositions.reduce(
-      (sum, position) => sum + maximum(
-        0n,
-        position.costBasisLamports - (position.conservativeLiquidationLamports ?? 0n),
+      (sum, position) => saturatedU64Add(
+        sum,
+        maximum(
+          0n,
+          position.costBasisLamports - (position.conservativeLiquidationLamports ?? 0n),
+        ),
       ),
       0n,
     );
@@ -462,6 +467,10 @@ function minimum(left: bigint, right: bigint): bigint {
 
 function maximum(left: bigint, right: bigint): bigint {
   return left > right ? left : right;
+}
+
+function saturatedU64Add(left: bigint, right: bigint): bigint {
+  return left > U64_MAX - right ? U64_MAX : left + right;
 }
 
 function invalid(): ExecutionRiskValidationError {

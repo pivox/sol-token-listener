@@ -137,6 +137,7 @@ const RECONCILIATION_EVIDENCE_KEYS = Object.freeze([
   'evidenceId', 'payloadVersion', 'evidenceFingerprint', 'intentId', 'attemptNumber',
   'walletGeneration', 'providerId', 'side', 'signature', 'blockhash',
   'lastValidBlockHeight', 'messageHash', 'buildFingerprint', 'snapshotFingerprint',
+  'maximumFeeLamports', 'maximumFeePayerLamportDebit',
   'signatureHistory', 'confirmationStatus', 'finalizedBlockHeight', 'observedSlot',
   'observedTransactionFingerprint', 'feeLamports', 'walletLamportDelta', 'baseDeltaRaw',
   'quoteDeltaRaw', 'unexpectedResidualTokenBalanceRaw', 'observedAtMs', 'finalizedAtMs',
@@ -222,15 +223,17 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         if (!sameWalletSnapshot(existing, draft)) throw failure('CONFLICT');
         return existing;
       }
-      const latest = await client.query(`SELECT state_revision::TEXT AS state_revision
+      const latest = await client.query(`SELECT snapshot_id,state_revision::TEXT AS state_revision,
+        superseded_at
         FROM execution_wallet_snapshots WHERE generation_id=$1
         ORDER BY state_revision DESC LIMIT 1 FOR UPDATE`, [draft.generationId]);
       if (latest.rows.length > 1) throw failure('INVALID_DATA');
-      const latestRevision = latest.rows.length === 0
-        ? null
-        : unsignedBigint(parseBigint(
-          exactRow(latest.rows[0], ['state_revision'] as const).state_revision,
-        ));
+      const latestRow = latest.rows.length === 0 ? null : exactRow(latest.rows[0], [
+        'snapshot_id', 'state_revision', 'superseded_at',
+      ] as const);
+      const latestRevision = latestRow === null
+        ? null : unsignedBigint(parseBigint(latestRow.state_revision));
+      if (latestRow !== null && latestRow.superseded_at !== null) throw failure('INVALID_DATA');
       if (latestRevision !== null && draft.stateRevision <= latestRevision) throw failure('CONFLICT');
       try {
         const result = await client.query(`INSERT INTO execution_wallet_snapshots (
@@ -250,7 +253,15 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
           $14,$15::NUMERIC,$16::NUMERIC,$17,
           $18,$19::NUMERIC,$20::NUMERIC,$21,$22::NUMERIC)
         RETURNING ${WALLET_SNAPSHOT_PROJECTION}`, walletSnapshotValues(draft));
-        return decodeWalletSnapshot(singleRow(result));
+        const inserted = decodeWalletSnapshot(singleRow(result));
+        if (latestRow !== null) {
+          const superseded = await client.query(`UPDATE execution_wallet_snapshots SET
+            superseded_at=date_trunc('milliseconds',statement_timestamp()),
+            purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
+            WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latestRow.snapshot_id]);
+          if (superseded.rowCount !== 1) throw failure('CONFLICT');
+        }
+        return inserted;
       } catch (error) {
         if (['23503', '23505'].includes(databaseCode(error) ?? '')) throw failure('CONFLICT');
         throw error;
@@ -274,16 +285,15 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       if (latestResult.rows.length > 1) throw failure('INVALID_DATA');
       if (latestResult.rows.length === 1) {
         const latest = decodeProviderSnapshot(latestResult.rows[0]);
-        if (snapshot.billingPeriodStartedAtMs < latest.billingPeriodStartedAtMs
-          || (snapshot.billingPeriodStartedAtMs === latest.billingPeriodStartedAtMs
-            && snapshot.measuredAtMs <= latest.measuredAtMs)
-          || (snapshot.billingPeriodStartedAtMs === latest.billingPeriodStartedAtMs
-            && (snapshot.billingPeriodId !== latest.billingPeriodId
-              || snapshot.planId !== latest.planId
-              || snapshot.limitUnits !== latest.limitUnits
-              || snapshot.usedUnits < latest.usedUnits))) {
-          throw failure('STALE_MEASUREMENT');
-        }
+        const samePeriod = snapshot.billingPeriodId === latest.billingPeriodId;
+        const coherent = snapshot.planId === latest.planId && (samePeriod
+          ? snapshot.billingPeriodStartedAtMs === latest.billingPeriodStartedAtMs
+            && snapshot.billingPeriodEndsAtMs === latest.billingPeriodEndsAtMs
+            && snapshot.limitUnits === latest.limitUnits
+            && snapshot.measuredAtMs > latest.measuredAtMs
+            && snapshot.usedUnits >= latest.usedUnits
+          : snapshot.billingPeriodStartedAtMs >= latest.billingPeriodEndsAtMs);
+        if (!coherent) throw failure('STALE_MEASUREMENT');
       }
       try {
         const result = await client.query(`INSERT INTO execution_provider_usage_snapshots (
@@ -296,7 +306,16 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
           TIMESTAMPTZ 'epoch' + ($11::BIGINT * INTERVAL '1 millisecond'),
           TIMESTAMPTZ 'epoch' + ($12::BIGINT * INTERVAL '1 millisecond'),$13)
         RETURNING ${PROVIDER_PROJECTION}`, providerSnapshotValues(snapshot));
-        return decodeProviderSnapshot(singleRow(result));
+        const inserted = decodeProviderSnapshot(singleRow(result));
+        if (latestResult.rows.length === 1) {
+          const latest = decodeProviderSnapshot(latestResult.rows[0]);
+          const superseded = await client.query(`UPDATE execution_provider_usage_snapshots SET
+            superseded_at=date_trunc('milliseconds',statement_timestamp()),
+            purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
+            WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latest.snapshotId]);
+          if (superseded.rowCount !== 1) throw failure('CONFLICT');
+        }
+        return inserted;
       } catch (error) {
         if (databaseCode(error) === '23505') throw failure('CONFLICT');
         throw error;
@@ -372,6 +391,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         `SELECT trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds', statement_timestamp()))
           * 1000)::TEXT AS operation_at_ms`,
       )), ['operation_at_ms'] as const).operation_at_ms);
+      const decisionAtMs = Math.max(operationAtMs, input.nowMs);
       const generationResult = await client.query(`SELECT generation_id,wallet_public_key,
         cluster,genesis_hash,generation FROM execution_wallet_generations
         WHERE generation_id=$1 AND retired_at IS NULL FOR UPDATE`, [input.generationId]);
@@ -420,7 +440,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         FROM execution_provider_rate_limit_events
         WHERE provider_id=$1 AND observed_at >= TIMESTAMPTZ 'epoch'
           + (($2::BIGINT - 30000) * INTERVAL '1 millisecond')
-        ORDER BY observed_at DESC LIMIT 1000`, [providerSnapshot.providerId, input.nowMs]);
+        ORDER BY observed_at DESC LIMIT 1000`, [providerSnapshot.providerId, decisionAtMs]);
       const recentRateLimits = rateRows.rows.map((row) => textTimestamp(
         exactRow(row, ['observed_at_ms'] as const).observed_at_ms,
       ));
@@ -432,7 +452,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         openPositions: walletSnapshot.openPositions.length,
         consecutiveRateLimits: recentRateLimits,
         allEndpointsUnavailable: input.allEndpointsUnavailable,
-        nowMs: input.nowMs,
+        nowMs: decisionAtMs,
       });
       const risk = evaluateBuyRisk({
         policy: input.policy,
@@ -446,9 +466,11 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       });
       const staleWallet = walletSnapshot.stateRevision !== state.stateRevision
         || walletSnapshot.openPositions.length !== state.openPositions
-        || input.nowMs > walletSnapshot.observedAtMs + input.policy.walletSnapshotMaxAgeMs;
+        || decisionAtMs > walletSnapshot.observedAtMs + input.policy.walletSnapshotMaxAgeMs;
+      const staleDecision = decisionAtMs >= input.intent.expiresAtMs;
       const reasonCode = state.unknownBlock ? 'RECONCILIATION_REQUIRED'
-        : staleWallet ? 'WALLET_MISMATCH'
+        : staleDecision ? 'DECISION_STALE'
+          : staleWallet ? 'WALLET_MISMATCH'
           : risk.kind === 'REJECTED' ? risk.reasonCode
             : quota.state !== 'NORMAL' ? quota.reasonCode : null;
       if (reasonCode === null && (risk.kind !== 'ADMISSIBLE' || quota.state !== 'NORMAL')) {
@@ -721,7 +743,18 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         risk.open_positions,risk.unknown_block,
         intent.status AS intent_status,intent.side AS intent_side,
         intent.state_revision::TEXT AS intent_revision,
-        attempt.provider_id,attempt.status AS attempt_status
+        attempt.provider_id,attempt.status AS attempt_status,
+        attempt.reconciliation_signature,
+        attempt.reconciliation_blockhash,
+        attempt.reconciliation_last_valid_block_height::TEXT
+          AS reconciliation_last_valid_block_height,
+        attempt.reconciliation_message_hash,
+        attempt.reconciliation_build_fingerprint,
+        attempt.reconciliation_snapshot_fingerprint,
+        attempt.reconciliation_maximum_fee_lamports::TEXT
+          AS reconciliation_maximum_fee_lamports,
+        attempt.reconciliation_maximum_fee_payer_lamport_debit::TEXT
+          AS reconciliation_maximum_fee_payer_lamport_debit
         FROM execution_exposure_reservations AS reservation
         JOIN execution_wallet_generations AS generation
           ON generation.generation_id=reservation.generation_id
@@ -739,25 +772,53 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         'wallet_snapshot_fingerprint', 'generation',
         'risk_revision', 'reserved_exposure_raw', 'open_positions', 'unknown_block',
         'intent_status', 'intent_side', 'intent_revision', 'provider_id', 'attempt_status',
+        'reconciliation_signature', 'reconciliation_blockhash',
+        'reconciliation_last_valid_block_height', 'reconciliation_message_hash',
+        'reconciliation_build_fingerprint', 'reconciliation_snapshot_fingerprint',
+        'reconciliation_maximum_fee_lamports',
+        'reconciliation_maximum_fee_payer_lamport_debit',
       ] as const);
-      const existing = await client.query(`SELECT evidence_id,evidence_fingerprint,result
-        FROM execution_reconciliation_evidence WHERE intent_id=$1 AND attempt_number=$2`, [
+      const existing = await client.query(`SELECT evidence_id,evidence_fingerprint,result,
+        trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms,
+        resolved_by_evidence_id
+        FROM execution_reconciliation_evidence
+        WHERE intent_id=$1 AND attempt_number=$2
+        ORDER BY observed_at,evidence_id FOR UPDATE`, [
         evidence.intentId, evidence.attemptNumber,
       ]);
-      if (existing.rows.length > 0) {
-        if (existing.rows.length !== 1) throw failure('INVALID_DATA');
-        const prior = exactRow(existing.rows[0], [
-          'evidence_id', 'evidence_fingerprint', 'result',
-        ] as const);
-        if (prior.evidence_id !== evidence.evidenceId
-          || prior.evidence_fingerprint !== evidence.evidenceFingerprint
-          || prior.result !== evidence.result) throw failure('CONFLICT');
+      const priorEvidence = existing.rows.map((candidate) => exactRow(candidate, [
+        'evidence_id', 'evidence_fingerprint', 'result', 'observed_at_ms',
+        'resolved_by_evidence_id',
+      ] as const));
+      const replay = priorEvidence.find((prior) => prior.evidence_id === evidence.evidenceId);
+      if (replay !== undefined) {
+        if (replay.evidence_fingerprint !== evidence.evidenceFingerprint
+          || replay.result !== evidence.result) throw failure('CONFLICT');
         return reconciliationResult(evidence);
+      }
+      if (priorEvidence.length > 0) {
+        const latestObservedAtMs = priorEvidence.reduce(
+          (latest, prior) => Math.max(latest, textTimestamp(prior.observed_at_ms)),
+          0,
+        );
+        if (priorEvidence.some((prior) => prior.result !== 'UNKNOWN'
+          || prior.resolved_by_evidence_id !== null)
+          || evidence.observedAtMs <= latestObservedAtMs) throw failure('CONFLICT');
       }
       if (row.generation !== evidence.walletGeneration
         || row.intent_side !== evidence.side
         || row.provider_id !== evidence.providerId
         || row.wallet_snapshot_fingerprint !== evidence.snapshotFingerprint
+        || row.reconciliation_signature !== evidence.signature
+        || row.reconciliation_blockhash !== evidence.blockhash
+        || row.reconciliation_last_valid_block_height
+          !== evidence.lastValidBlockHeight.toString()
+        || row.reconciliation_message_hash !== evidence.messageHash
+        || row.reconciliation_build_fingerprint !== evidence.buildFingerprint
+        || row.reconciliation_snapshot_fingerprint !== evidence.snapshotFingerprint
+        || row.reconciliation_maximum_fee_lamports !== evidence.maximumFeeLamports.toString()
+        || row.reconciliation_maximum_fee_payer_lamport_debit
+          !== evidence.maximumFeePayerLamportDebit.toString()
         || !['RESERVED', 'UNKNOWN_HELD'].includes(String(row.reservation_state))
         || row.attempt_status !== 'STARTED') throw failure('CONFLICT');
       const reservationId = patternedText(
@@ -779,21 +840,24 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       const inserted = await client.query(`INSERT INTO execution_reconciliation_evidence (
         evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,
         generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,
-        build_fingerprint,snapshot_fingerprint,signature_history,confirmation_status,
+        build_fingerprint,snapshot_fingerprint,maximum_fee_lamports,
+        maximum_fee_payer_lamport_debit,signature_history,confirmation_status,
         finalized_block_height,observed_slot,observed_transaction_fingerprint,fee_lamports,
         wallet_lamport_delta,base_delta_raw,quote_delta_raw,
         unexpected_residual_token_balance_raw,observed_at,finalized_at,result,reason_code,purge_after
-      ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::BIGINT,$12,$13,$14,$15,$16,
-        $17::BIGINT,$18::BIGINT,$19,$20::NUMERIC,$21::NUMERIC,$22::NUMERIC,$23::NUMERIC,
-        $24::NUMERIC,TIMESTAMPTZ 'epoch' + ($25::BIGINT * INTERVAL '1 millisecond'),
-        CASE WHEN $26::BIGINT IS NULL THEN NULL ELSE TIMESTAMPTZ 'epoch'
-          + ($26::BIGINT * INTERVAL '1 millisecond') END,$27,$28,
-        CASE WHEN $27 IN ('MATCHED','NO_EFFECT') THEN TIMESTAMPTZ 'epoch'
-          + (($26::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END)`, [
+      ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::BIGINT,$12,$13,$14,
+        $15::NUMERIC,$16::NUMERIC,$17,$18,$19::BIGINT,$20::BIGINT,$21,
+        $22::NUMERIC,$23::NUMERIC,$24::NUMERIC,$25::NUMERIC,$26::NUMERIC,
+        TIMESTAMPTZ 'epoch' + ($27::BIGINT * INTERVAL '1 millisecond'),
+        CASE WHEN $28::BIGINT IS NULL THEN NULL ELSE TIMESTAMPTZ 'epoch'
+          + ($28::BIGINT * INTERVAL '1 millisecond') END,$29,$30,
+        CASE WHEN $29 IN ('MATCHED','NO_EFFECT') THEN TIMESTAMPTZ 'epoch'
+          + (($28::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END)`, [
         evidence.evidenceId, evidence.evidenceFingerprint, evidence.intentId,
         evidence.attemptNumber, reservationId, generationId, evidence.providerId, evidence.side,
         evidence.signature, evidence.blockhash, evidence.lastValidBlockHeight.toString(),
         evidence.messageHash, evidence.buildFingerprint, evidence.snapshotFingerprint,
+        evidence.maximumFeeLamports.toString(), evidence.maximumFeePayerLamportDebit.toString(),
         evidence.signatureHistory, evidence.confirmationStatus,
         evidence.finalizedBlockHeight.toString(), evidence.observedSlot?.toString() ?? null,
         evidence.observedTransactionFingerprint, evidence.feeLamports.toString(),
@@ -802,6 +866,18 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         evidence.observedAtMs, finalizedAtMs, evidence.result, evidence.reasonCode,
       ]);
       if (inserted.rowCount !== 1) throw failure('INVALID_DATA');
+      if (terminal && priorEvidence.length > 0) {
+        const resolved = await client.query(`UPDATE execution_reconciliation_evidence SET
+          resolved_by_evidence_id=$3,resolved_at=TIMESTAMPTZ 'epoch'
+            + ($4::BIGINT * INTERVAL '1 millisecond'),
+          purge_after=TIMESTAMPTZ 'epoch'
+            + (($4::BIGINT + 14400000) * INTERVAL '1 millisecond')
+          WHERE intent_id=$1 AND attempt_number=$2 AND result='UNKNOWN'
+            AND resolved_by_evidence_id IS NULL`, [
+          evidence.intentId, evidence.attemptNumber, evidence.evidenceId, finalizedAtMs,
+        ]);
+        if (resolved.rowCount !== priorEvidence.length) throw failure('CONFLICT');
+      }
       const reservationState = evidence.result === 'MATCHED' ? 'CONSUMED'
         : evidence.result === 'NO_EFFECT' ? 'RELEASED' : 'UNKNOWN_HELD';
       const reservationUpdate = await client.query(`UPDATE execution_exposure_reservations SET
@@ -1223,6 +1299,8 @@ function reconciliationCommitFrom(value: unknown): ExecutionReconciliationEviden
       messageHash: patternedText(row.messageHash, HASH),
       buildFingerprint: patternedText(row.buildFingerprint, HASH),
       snapshotFingerprint: patternedText(row.snapshotFingerprint, HASH),
+      maximumFeeLamports: unsignedBigint(row.maximumFeeLamports),
+      maximumFeePayerLamportDebit: unsignedBigint(row.maximumFeePayerLamportDebit),
       signatureHistory: enumValue(row.signatureHistory, ['PRESENT', 'ABSENT', 'UNKNOWN'] as const),
       confirmationStatus: enumValue(
         row.confirmationStatus,
