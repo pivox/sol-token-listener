@@ -919,7 +919,11 @@ async function assertCatalogContract(pool: InstanceType<typeof pg.Pool>): Promis
   assert.deepEqual(columns.rows, [
     ...['execution_attempts'].flatMap((table_name) => [
       'intent_id', 'attempt_number', 'status', 'effective_venue', 'provider_id', 'started_at',
-      'completed_at', 'reason_code', 'purge_after',
+      'completed_at', 'reason_code', 'purge_after', 'reconciliation_signature',
+      'reconciliation_blockhash', 'reconciliation_last_valid_block_height',
+      'reconciliation_message_hash', 'reconciliation_build_fingerprint',
+      'reconciliation_snapshot_fingerprint', 'reconciliation_maximum_fee_lamports',
+      'reconciliation_maximum_fee_payer_lamport_debit',
     ].map((column_name) => ({ table_name, column_name }))),
     ...['execution_intent_tombstones'].flatMap((table_name) => [
       'intent_id', 'payload_version', 'logical_order_key', 'decision_fingerprint', 'retired_at',
