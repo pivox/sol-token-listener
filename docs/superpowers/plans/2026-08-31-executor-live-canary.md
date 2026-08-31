@@ -130,7 +130,7 @@ git commit -m "feat: define live execution ledger (#51)"
 - Test: `tests/executor-live-config.test.ts`
 - Test: `tests/executor-live-keypair.test.ts`
 
-- [ ] **Step 1: Write keypair/config failing tests**
+- [x] **Step 1: Write keypair/config failing tests**
 
 Tester l'absence de valeurs implicites, les deux flags exacts, mainnet/genesis,
 WSOL seul, chemin absolu, symlink, mauvais mode, propriétaire, taille/JSON,
@@ -143,18 +143,20 @@ assert.equal(signer.publicKey, config.executorPublicKey);
 await signer.close();
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `npx tsx --test tests/executor-live-config.test.ts tests/executor-live-keypair.test.ts`
 
 Expected: FAIL because live config and loader are absent.
 
-- [ ] **Step 3: Implement minimal config and loader**
+- [x] **Step 3: Implement minimal config and loader**
 
 Utiliser `open(path, O_RDONLY | O_NOFOLLOW)`, puis `handle.stat()`. Refuser tout
 fichier non régulier, `uid !== process.getuid()`, `(mode & 0o077) !== 0`, taille
-hors borne ou JSON non canonique. Construire `Keypair.fromSecretKey`, comparer
-la clé publique et écraser les buffers dans `finally`. Le port n'expose que :
+hors borne ou JSON non canonique. Importer la seed Ed25519, comparer la clé
+publique et écraser les buffers dans `finally`. L'implémentation utilise
+un `KeyObject` Ed25519 natif opaque afin de ne pas conserver un tableau secret
+accessible dans un objet `Keypair`. Le port n'expose que :
 
 ```ts
 export interface ExecutionTransactionSigner {
@@ -166,7 +168,7 @@ export interface ExecutionTransactionSigner {
 }
 ```
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `npx tsx --test tests/executor-live-config.test.ts tests/executor-live-keypair.test.ts`
 
