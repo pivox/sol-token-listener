@@ -97,6 +97,7 @@ export class ProviderAffineSession implements ExecutionMarketGateway {
   private feeReserved = false;
   private simulationCompleted = false;
   private simulationReserved = false;
+  private readonly issuedSnapshots = new WeakSet();
 
   public constructor(
     configValue: ProviderAffineSessionConfig,
@@ -132,6 +133,10 @@ export class ProviderAffineSession implements ExecutionMarketGateway {
     return evidence;
   }
 
+  public ownsAccountSnapshot(snapshot: ExecutionAccountSnapshot): boolean {
+    return this.issuedSnapshots.has(snapshot);
+  }
+
   public async readAccountSnapshot(
     addressesValue: readonly string[],
     signal: AbortSignal,
@@ -157,8 +162,10 @@ export class ProviderAffineSession implements ExecutionMarketGateway {
       const result = Object.freeze({
         providerId: this.providerId,
         slot: contextual.contextSlot,
+        addresses,
         accounts: Object.freeze(accounts),
       });
+      this.issuedSnapshots.add(result);
       this.snapshotSlot = contextual.contextSlot;
       return result;
     } catch { return this.failInvalidResponse(); }
@@ -830,4 +837,8 @@ function inputError(): ExecutionProviderSessionError {
 function isInternalError(value: unknown): value is ExecutionProviderSessionError {
   return typeof value === 'object' && value !== null
     && INTERNAL_ERRORS.has(value as ExecutionProviderSessionError);
+}
+
+export function isExecutionProviderSessionError(value: unknown): value is ExecutionProviderSessionError {
+  return isInternalError(value);
 }

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "execution-build-plan-golden-manifest.v1",
+  "specificationVersion": "1.0.4",
+  "parentSpecificationVersion": "1.5.0",
+  "sdkVersions": {
+    "@pump-fun/pump-sdk": "1.36.0",
+    "@pump-fun/pump-swap-sdk": "1.19.0",
+    "@solana/web3.js": "1.98.4",
+    "@solana/spl-token": "0.4.15"
+  },
+  "idl": {
+    "revision": "9c82f61cb711b044a17f770ab8ce9f9bdf78f333",
+    "pumpSha256": "b90bc471327f671449271d5d1d42354d1fae6f5a06502f5834459a3108138e49",
+    "pumpSwapSha256": "6b5c7ec4e5ef9742fa99dc57b0d75b1031b379bba02a7e1b3c5a4cad68d77e56"
+  },
+  "sanitization": {
+    "publicAccountsOnly": true,
+    "instructionBytesOnly": true,
+    "containsSecret": false,
+    "containsProviderUrl": false,
+    "syntheticPublicKeys": true
+  },
+  "cases": [
+    { "caseId": "pumpfun-buy-v2-base-ata-absent", "file": "pumpfun-buy-v2-plan.json" },
+    { "caseId": "pumpfun-sell-v2-mayhem", "file": "pumpfun-sell-v2-plan.json" },
+    { "caseId": "pumpswap-sell-complex", "file": "pumpswap-sell-plan.json" }
+  ]
+}

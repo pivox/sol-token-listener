@@ -21,7 +21,7 @@ Pino, SHA-256.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-quote-build-simulation-design.md`
-version 1.0.3 and parent specification version 1.5.0.
+version 1.0.4 and parent specification version 1.5.0.
 
 ---
 
@@ -279,37 +279,39 @@ git commit -m "feat: build Pump execution plans from fresh quotes (#51)"
 
 - Create: `src/executor-simulation/instruction-inspector.ts`
 - Create: `src/executor-simulation/solana-simulation-gateway.ts`
+- Create: `src/executor-simulation/build-receipt.ts`
 - Create: `src/ports/execution-simulation-gateway.ts`
+- Modify: builders, provider-affine session and execution market gateway port
 - Create inspector/gateway/golden fixture tests
 
-- [ ] Generate sanitized golden instructions with the pinned official SDKs.
+- [x] Generate sanitized golden instructions with the pinned official SDKs.
   Store public accounts and bytes only; document the SDK and IDL versions.
-- [ ] Decode every top-level instruction and validate exact programs,
+- [x] Decode every top-level instruction and validate exact programs,
   discriminators, amount bounds, fee payer, signer and writable metas.
-- [ ] Allow only expected ATA setup, `extendAccount` when the pool snapshot is
+- [x] Allow only expected ATA setup, `extendAccount` when the pool snapshot is
   shorter than the current SDK size, the Pump swap, and the exact terminal
   WSOL close; reject every other maintenance instruction.
-- [ ] Reject ComputeBudget priority price above zero, ALT, extra signer,
+- [x] Reject ComputeBudget priority price above zero, ALT, extra signer,
   unexpected writable, program, destination, authority or account.
-- [ ] Compile a v0 message with no lookup table and an explicit blockhash from
+- [x] Compile a v0 message with no lookup table and an explicit blockhash from
   `getLatestBlockhashAndContext`; assert one required signer matching the
   public executor address and one zeroed 64-byte signature slot.
-- [ ] Obtain fee estimate and reject absent/oversized values.
-- [ ] Request only the fee payer and expected token accounts in the simulation
+- [x] Obtain fee estimate and reject absent/oversized values.
+- [x] Request only the fee payer and expected token accounts in the simulation
   response; compare them to the causal pre-state and bound fee-payer lamport,
   base-token and quote-token deltas.
-- [ ] Call only `simulateTransaction` with `sigVerify:false`,
+- [x] Call only `simulateTransaction` with `sigVerify:false`,
   `replaceRecentBlockhash:false`, `confirmed`, `minContextSlot` and inner
   instructions.
-- [ ] Bound and normalize error, logs, inner instructions, units and slots.
-- [ ] Return hashes/evidence only; never return or persist message,
+- [x] Bound and normalize error, logs, inner instructions, units and slots.
+- [x] Return hashes/evidence only; never return or persist message,
   transaction, instruction bytes or signatures.
 
 Run:
 
 ```bash
 npx tsx --test \
-  tests/executor-simulation-instruction-inspector.test.ts \
+  tests/instruction-inspector.test.ts \
   tests/executor-simulation-gateway.test.ts \
   tests/executor-simulation-golden.test.ts
 ```
@@ -335,6 +337,13 @@ git commit -m "feat: inspect and simulate unsigned Pump transactions (#51)"
 - [ ] Continue rejecting every private-key variable in both modes.
 - [ ] Claim with `EXECUTE`, transition to PROCESSING, begin or recover the
   current attempt, then invoke quote/build/simulation once per pass.
+- [ ] Derive every venue-specific builder input from the exact provider-owned
+  `ExecutionAccountSnapshot`, compute its fingerprint internally, bind the
+  returned plan to that snapshot object and reject caller-supplied policy or
+  fingerprint evidence.
+- [ ] Keep the `BuildReceiptAuthority` private to the trusted worker factory;
+  issue its one-shot receipt only after that exact derivation and pass the same
+  plan/snapshot objects to the simulation gateway.
 - [ ] Renew the lease only at specified boundaries; authenticate abort errors
   with both typed code and `AbortSignal.aborted`.
 - [ ] Commit success/failure atomically through the new repository.

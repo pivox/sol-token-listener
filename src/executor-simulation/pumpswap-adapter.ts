@@ -61,7 +61,7 @@ const REQUEST_KEYS = Object.freeze(['quote', 'user', 'poolProof', 'snapshot'] as
 const QUOTE_KEYS = Object.freeze([
   'payloadVersion', 'venue', 'side', 'mint', 'quoteMint', 'baseTokenProgram',
   'quoteTokenProgram', 'quoteDecimals', 'amountInRaw', 'expectedAmountOutRaw',
-  'protectedAmountOutRaw', 'snapshotSlot', 'quoteFingerprint',
+  'protectedAmountOutRaw', 'snapshotSlot', 'quoteFingerprint', 'snapshotFingerprint',
 ] as const);
 const POOL_PROOF_KEYS = Object.freeze([
   'migrationId', 'migrationInstruction', 'migrationConfirmationStatus',
@@ -123,6 +123,7 @@ export interface PumpSwapBuildQuoteV1 {
   readonly protectedAmountOutRaw: bigint;
   readonly snapshotSlot: bigint;
   readonly quoteFingerprint: string;
+  readonly snapshotFingerprint: string;
 }
 
 export interface PumpSwapGlobalConfigDecodedV1 {
@@ -322,6 +323,7 @@ export async function buildPumpSwapPlan(
         quoteDecimals: input.quote.quoteDecimals,
         snapshotSlot: input.quote.snapshotSlot,
         quoteFingerprint: input.quote.quoteFingerprint,
+        snapshotFingerprint: input.quote.snapshotFingerprint,
       }),
       amounts: Object.freeze({
         amountInRaw: input.quote.amountInRaw,
@@ -334,8 +336,25 @@ export async function buildPumpSwapPlan(
         Object.freeze({ role: 'POOL_QUOTE_VAULT', address: input.pool.poolQuoteTokenAccount.toBase58() }),
         Object.freeze({ role: 'USER_BASE_ATA', address: input.userBase.address.toBase58() }),
         Object.freeze({ role: 'USER_QUOTE_ATA', address: input.userQuote.address.toBase58() }),
+        Object.freeze({ role: 'POOL_COIN_CREATOR', address: input.pool.coinCreator.toBase58() }),
+        ...(input.pool.isCashbackCoin ? [
+          Object.freeze({ role: 'USER_VOLUME_ACCUMULATOR', address: input.userVolume.address.toBase58() }),
+          Object.freeze({ role: 'USER_VOLUME_QUOTE_ATA', address: input.userVolumeQuote.address.toBase58() }),
+        ] : []),
+        ...(!input.pool.coinCreator.equals(PublicKey.default) ? [
+          Object.freeze({ role: 'POOL_V2', address: input.poolV2.address.toBase58() }),
+        ] : []),
       ]),
-      recipientSelections: selections,
+      policyEvidence: Object.freeze({
+        payloadVersion: 1, venue: 'PUMP_SWAP', snapshotSlot: input.quote.snapshotSlot,
+        snapshotFingerprint: input.quote.snapshotFingerprint,
+        isMayhemMode: input.pool.isMayhemMode, isCashbackCoin: input.pool.isCashbackCoin,
+        poolAddress: input.poolKey.toBase58(),
+        coinCreator: input.pool.coinCreator.toBase58(),
+        requiresExtend: input.poolAccountInfo.data.length < POOL_ACCOUNT_NEW_SIZE,
+        userQuoteAtaExisted: input.userQuote.accountInfo !== null,
+        feeSelection: requiredSelection(selections, 0), buybackSelection: requiredSelection(selections, 1),
+      }),
       instructions,
     });
   } catch {
@@ -432,7 +451,9 @@ function quoteFrom(record: Readonly<Record<string, unknown>>): PumpSwapBuildQuot
     || record.protectedAmountOutRaw > record.expectedAmountOutRaw
     || !nonNegativeU64(record.snapshotSlot)
     || typeof record.quoteFingerprint !== 'string'
-    || !/^[0-9a-f]{64}$/u.test(record.quoteFingerprint)) reject();
+    || !/^[0-9a-f]{64}$/u.test(record.quoteFingerprint)
+    || typeof record.snapshotFingerprint !== 'string'
+    || !/^[0-9a-f]{64}$/u.test(record.snapshotFingerprint)) reject();
   return Object.freeze({
     payloadVersion: 1,
     venue: 'PUMP_SWAP',
@@ -447,6 +468,7 @@ function quoteFrom(record: Readonly<Record<string, unknown>>): PumpSwapBuildQuot
     protectedAmountOutRaw: record.protectedAmountOutRaw,
     snapshotSlot: record.snapshotSlot,
     quoteFingerprint: record.quoteFingerprint,
+    snapshotFingerprint: record.snapshotFingerprint,
   });
 }
 
@@ -1057,6 +1079,15 @@ function officialAccountDiscriminator(name: string): Buffer {
 }
 
 function requiredInstruction(value: TransactionInstruction | undefined): TransactionInstruction {
+  if (value === undefined) reject();
+  return value;
+}
+
+function requiredSelection(
+  values: readonly BuildRecipientSelectionV1[],
+  index: number,
+): BuildRecipientSelectionV1 {
+  const value = values.at(index);
   if (value === undefined) reject();
   return value;
 }

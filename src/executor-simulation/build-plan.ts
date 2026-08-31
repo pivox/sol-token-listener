@@ -22,6 +22,7 @@ export interface UnsignedBuildIdentityV1 {
   readonly quoteDecimals: number;
   readonly snapshotSlot: bigint;
   readonly quoteFingerprint: string;
+  readonly snapshotFingerprint: string;
 }
 
 export interface UnsignedBuildAmountsV1 {
@@ -58,6 +59,33 @@ export type BuildRecipientSelectionV1 =
   | DeterministicBuildRecipientSelectionV1
   | SdkRandomBuildRecipientSelectionV1;
 
+/** Produced only after the builder has validated its exact-slot snapshot evidence. */
+export type BuildPolicyEvidenceV1 = Readonly<{
+  readonly payloadVersion: 1;
+  readonly venue: 'PUMP_FUN';
+  readonly snapshotSlot: bigint;
+  readonly snapshotFingerprint: string;
+  readonly isMayhemMode: boolean;
+  readonly curveAddress: string;
+  readonly creator: string;
+  readonly userBaseAtaExisted: boolean;
+  readonly feeSelection: BuildRecipientSelectionV1;
+  readonly buybackSelection: BuildRecipientSelectionV1;
+}> | Readonly<{
+  readonly payloadVersion: 1;
+  readonly venue: 'PUMP_SWAP';
+  readonly snapshotSlot: bigint;
+  readonly snapshotFingerprint: string;
+  readonly isMayhemMode: boolean;
+  readonly poolAddress: string;
+  readonly isCashbackCoin: boolean;
+  readonly coinCreator: string;
+  readonly requiresExtend: boolean;
+  readonly userQuoteAtaExisted: boolean;
+  readonly feeSelection: BuildRecipientSelectionV1;
+  readonly buybackSelection: BuildRecipientSelectionV1;
+}>;
+
 export interface UnsignedBuildPlanV1 {
   readonly payloadVersion: 1;
   readonly venue: UnsignedBuildVenue;
@@ -66,7 +94,7 @@ export interface UnsignedBuildPlanV1 {
   readonly identity: UnsignedBuildIdentityV1;
   readonly amounts: UnsignedBuildAmountsV1;
   readonly expectedAccounts: readonly ExpectedBuildAccountV1[];
-  readonly recipientSelections: readonly BuildRecipientSelectionV1[];
+  readonly policyEvidence: BuildPolicyEvidenceV1;
   readonly instructions: readonly NormalizedInstructionV1[];
 }
 

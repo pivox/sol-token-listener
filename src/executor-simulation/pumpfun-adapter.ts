@@ -32,7 +32,7 @@ const REQUEST_KEYS = Object.freeze([
 const QUOTE_KEYS = Object.freeze([
   'payloadVersion', 'venue', 'side', 'mint', 'quoteMint', 'baseTokenProgram',
   'quoteTokenProgram', 'quoteDecimals', 'amountInRaw', 'expectedAmountOutRaw',
-  'protectedAmountOutRaw', 'snapshotSlot', 'quoteFingerprint',
+  'protectedAmountOutRaw', 'snapshotSlot', 'quoteFingerprint', 'snapshotFingerprint',
 ] as const);
 const CURVE_KEYS = Object.freeze([
   'mint', 'address', 'ownerProgramId', 'exists', 'complete', 'creator',
@@ -63,6 +63,7 @@ export interface PumpFunBuildQuoteV1 {
   readonly protectedAmountOutRaw: bigint;
   readonly snapshotSlot: bigint;
   readonly quoteFingerprint: string;
+  readonly snapshotFingerprint: string;
 }
 
 export interface PumpFunCurveBuildEvidenceV1 {
@@ -104,6 +105,7 @@ interface ValidatedPumpFunBuildRequest {
   readonly curve: PublicKey;
   readonly userBaseAta: PublicKey;
   readonly userBaseAtaExists: boolean;
+  readonly isMayhemMode: boolean;
   readonly baseTokenProgram: PublicKey;
   readonly feeSelection: BuildRecipientSelectionV1;
   readonly buybackSelection: BuildRecipientSelectionV1;
@@ -170,6 +172,7 @@ export async function buildPumpFunPlan(
         quoteDecimals: quote.quoteDecimals,
         snapshotSlot: quote.snapshotSlot,
         quoteFingerprint: quote.quoteFingerprint,
+        snapshotFingerprint: quote.snapshotFingerprint,
       }),
       amounts: Object.freeze({
         amountInRaw: quote.amountInRaw,
@@ -179,11 +182,22 @@ export async function buildPumpFunPlan(
       expectedAccounts: Object.freeze([
         Object.freeze({ role: 'BONDING_CURVE', address: input.curve.toBase58() }),
         Object.freeze({ role: 'USER_BASE_ATA', address: input.userBaseAta.toBase58() }),
+        Object.freeze({ role: 'CREATOR', address: input.creator.toBase58() }),
+        Object.freeze({
+          role: 'USER_QUOTE_ATA',
+          address: getAssociatedTokenAddressSync(
+            NATIVE_MINT, input.user, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID,
+          ).toBase58(),
+        }),
       ]),
-      recipientSelections: Object.freeze([
-        input.feeSelection,
-        input.buybackSelection,
-      ]),
+      policyEvidence: Object.freeze({
+        payloadVersion: 1, venue: 'PUMP_FUN', snapshotSlot: quote.snapshotSlot,
+        snapshotFingerprint: quote.snapshotFingerprint,
+        isMayhemMode: input.isMayhemMode,
+        curveAddress: input.curve.toBase58(), creator: input.creator.toBase58(),
+        userBaseAtaExisted: input.userBaseAtaExists,
+        feeSelection: input.feeSelection, buybackSelection: input.buybackSelection,
+      }),
       instructions: Object.freeze(instructions),
     });
   } catch {
@@ -273,6 +287,7 @@ function validateRequest(inputValue: unknown): ValidatedPumpFunBuildRequest {
     curve,
     userBaseAta,
     userBaseAtaExists: ataRecord.exists,
+    isMayhemMode: curveRecord.isMayhemMode,
     baseTokenProgram,
     feeSelection,
     buybackSelection,
@@ -295,7 +310,9 @@ function quoteFrom(record: Readonly<Record<string, unknown>>): PumpFunBuildQuote
     || record.protectedAmountOutRaw > record.expectedAmountOutRaw
     || !nonNegativeU64(record.snapshotSlot)
     || typeof record.quoteFingerprint !== 'string'
-    || !/^[0-9a-f]{64}$/u.test(record.quoteFingerprint)) throw policyError();
+    || !/^[0-9a-f]{64}$/u.test(record.quoteFingerprint)
+    || typeof record.snapshotFingerprint !== 'string'
+    || !/^[0-9a-f]{64}$/u.test(record.snapshotFingerprint)) throw policyError();
   return Object.freeze({
     payloadVersion: 1,
     venue: 'PUMP_FUN',
@@ -310,6 +327,7 @@ function quoteFrom(record: Readonly<Record<string, unknown>>): PumpFunBuildQuote
     protectedAmountOutRaw: record.protectedAmountOutRaw,
     snapshotSlot: record.snapshotSlot,
     quoteFingerprint: record.quoteFingerprint,
+    snapshotFingerprint: record.snapshotFingerprint,
   });
 }
 

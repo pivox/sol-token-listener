@@ -52,6 +52,7 @@ void test('builds an exact deterministic official Pump.fun BUY V2 plan above 2^5
       quoteDecimals: 9,
       snapshotSlot: input.quote.snapshotSlot,
       quoteFingerprint: input.quote.quoteFingerprint,
+      snapshotFingerprint: input.quote.snapshotFingerprint,
     }));
     assert.deepEqual(plan.amounts, Object.freeze({
       amountInRaw: input.quote.amountInRaw,
@@ -89,7 +90,7 @@ void test('builds an exact deterministic official Pump.fun BUY V2 plan above 2^5
       input.quote.quoteFingerprint,
       input.recipients.buybackFeeRecipients,
     );
-    assert.deepEqual(plan.recipientSelections, Object.freeze([
+    assert.deepEqual([plan.policyEvidence.feeSelection, plan.policyEvidence.buybackSelection], Object.freeze([
       Object.freeze({
         role: 'FEE', domain: FEE_DOMAIN, listKind: 'NORMAL',
         candidates: Object.freeze([
@@ -112,6 +113,13 @@ void test('builds an exact deterministic official Pump.fun BUY V2 plan above 2^5
     assert.deepEqual(plan.expectedAccounts, Object.freeze([
       Object.freeze({ role: 'BONDING_CURVE', address: input.curve.address }),
       Object.freeze({ role: 'USER_BASE_ATA', address: input.userBaseTokenAccount.address }),
+      Object.freeze({ role: 'CREATOR', address: input.curve.creator }),
+      Object.freeze({
+        role: 'USER_QUOTE_ATA',
+        address: getAssociatedTokenAddressSync(
+          NATIVE_MINT, new PublicKey(input.user), true, TOKEN_PROGRAM_ID,
+        ).toBase58(),
+      }),
     ]));
     assertPlainDeepFrozen(plan);
   } finally {
@@ -132,8 +140,8 @@ void test('uses the reserved fee list in mayhem mode and remains stable across b
     ...input.recipients.reservedFeeRecipients,
   ]);
   assert.deepEqual(first, second);
-  assert.equal(first.recipientSelections[0]?.listKind, 'RESERVED');
-  assert.equal(first.recipientSelections[0]?.selectedAddress, expectedFee.address);
+  assert.equal(first.policyEvidence.feeSelection.listKind, 'RESERVED');
+  assert.equal(first.policyEvidence.feeSelection.selectedAddress, expectedFee.address);
   assert.equal(first.instructions.at(-1)?.accounts[3]?.address, TOKEN_2022_PROGRAM_ID.toBase58());
 });
 
@@ -334,6 +342,7 @@ function quote(
     protectedAmountOutRaw: 850_000n,
     snapshotSlot: 9_007_199_254_740_993n,
     quoteFingerprint,
+    snapshotFingerprint: 'e'.repeat(64),
   });
 }
 

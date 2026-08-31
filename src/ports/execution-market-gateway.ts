@@ -23,6 +23,7 @@ export interface ExecutionRpcAccount {
 export interface ExecutionAccountSnapshot {
   readonly providerId: string;
   readonly slot: bigint;
+  readonly addresses: readonly string[];
   readonly accounts: readonly (ExecutionRpcAccount | null)[];
 }
 
@@ -72,6 +73,8 @@ export interface ExecutionUnsignedSimulationResult {
 
 export interface ExecutionMarketGateway {
   readonly providerId: string;
+  /** Authenticates a snapshot object emitted by this exact provider session. */
+  readonly ownsAccountSnapshot: (snapshot: ExecutionAccountSnapshot) => boolean;
   readonly verifyGenesis: (signal: AbortSignal) => Promise<ExecutionGenesisEvidence>;
   readonly readAccountSnapshot: (
     addresses: readonly string[],

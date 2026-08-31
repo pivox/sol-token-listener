@@ -1,6 +1,6 @@
 # Exécuteur quote, build et simulation V1 — conception #51-D
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.0.4
 
 **Date :** 2026-08-31
 
@@ -12,6 +12,9 @@
 
 ## Historique des versions
 
+- **1.0.4 — 2026-08-31 :** versionne la preuve de politique éphémère qui lie
+  le plan inspecté à la snapshot causale, aux modes Pump, aux listes actives de
+  recipients et aux branches exactes de préparation des comptes.
 - **1.0.3 — 2026-08-31 :** ajoute le code d'échec interne
   `GENESIS_MISMATCH` afin que le reason code terminal homonyme possède une
   représentation durable non ambiguë.
@@ -309,6 +312,18 @@ Le plan contient les instructions, fee payer attendu, snapshot et limites,
 mais n'est jamais persisté. Avant compilation, l'inspecteur reconstruit et
 vérifie :
 
+- un `policyEvidence` V1 fermé et immuable, produit uniquement après validation
+  de la snapshot de venue par le builder ;
+- l'égalité du slot et du `snapshotFingerprint` entre identité de build et
+  preuve de politique ;
+- pour Pump.fun, la curve, le créateur, le mode Mayhem, l'existence préalable
+  de l'ATA base et les listes actives normal/reserved et buyback ;
+- pour PumpSwap, le pool canonique, le coin creator, les modes Mayhem et
+  Cashback, le besoin d'extension, l'existence préalable de l'ATA WSOL et les
+  listes actives normal/reserved et buyback ;
+- la présence exacte des branches ATA, `extendAccount`, Cashback et `poolV2`
+  annoncées par cette preuve ;
+
 - programme, discriminator et ordre des instructions ;
 - fee payer et unique signer requis égaux à `EXECUTOR_PUBLIC_KEY` ;
 - mint, quote mint, bonding curve ou pool canonique ;
@@ -321,6 +336,21 @@ vérifie :
 - absence d'ALT, de priority fee non nulle et d'instruction inconnue ;
 - taille sérialisée sous la limite Solana ;
 - débit maximal et frais estimés sous les plafonds.
+
+Le gateway Task 6 n'est pas, à lui seul, une attestation de provenance des
+champs décodés : l'égalité d'un fingerprint ne prouve pas que les structures
+de venue remises au builder ont été extraites du même objet RPC. Avant que le
+mode `simulation-only` soit disponible, le worker Task 7 DOIT donc construire
+ces structures exclusivement depuis l'unique `ExecutionAccountSnapshot` émise
+par la session provider-affine, lier le plan retourné à l'identité de cet objet
+et refuser tout fingerprint ou `policyEvidence` fourni librement. Une autorité
+locale émet alors un reçu opaque, éphémère et consommable une seule fois pour
+ce couple exact d'objets plan/snapshot ; le gateway exige et consomme ce reçu
+avant tout RPC. Une autre instance d'autorité, une copie du reçu, un rejeu ou
+une substitution d'objet échoue fermé. Task 8 limite statiquement l'émission du
+reçu et l'appel des builders et du gateway à ce worker. Sans cette liaison
+authentifiée, le runtime reste indisponible et aucun artefact terminal n'est
+écrit.
 
 Les créations d'ATA idempotentes produites par le SDK sont autorisées seulement
 pour les ATA attendues. Pour un SELL PumpSwap WSOL, le `CloseAccount` terminal
@@ -424,7 +454,10 @@ configurationFingerprint = sha256(
 )
 snapshotFingerprint = sha256(
   "execution-snapshot-v1", snapshotSlot,
-  chaque compte dans l'ordre demandé: address, owner, lamports, sha256(data)
+  chaque compte dans l'ordre demandé:
+    address, "PRESENT", owner, lamports, sha256(data)
+  ou, pour un compte optionnel absent:
+    address, "ABSENT"
 )
 quoteFingerprint = sha256("execution-quote-v1", tous les champs de quote)
 buildFingerprint = sha256(
@@ -437,6 +470,13 @@ resultFingerprint = sha256(
   artifactId, resultFingerprint et recordedAt
 )
 ```
+
+La liste d'adresses de snapshot est canonique, ordonnée et sans doublon. Le
+marqueur `ABSENT` n'est admis que pour un compte explicitement optionnel dans
+la politique de venue. Le gateway recalcule cette empreinte depuis l'unique
+snapshot de la session provider-affine avant le blockhash ; les valeurs de
+fingerprint transportées par la quote, le plan et `policyEvidence` ne sont
+jamais prises comme source de vérité.
 
 La matrice SQL de nullabilité et de statuts est fermée :
 

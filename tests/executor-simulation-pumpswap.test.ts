@@ -36,6 +36,10 @@ import {
   userVolumeAccumulatorPda,
   poolV2Pda,
 } from '../src/markets/pumpswap/official-sdk.js';
+import {
+  executionBuildFingerprint,
+  loadPumpSwapSellGoldenFixture,
+} from './helpers/executor-simulation-golden.js';
 
 const SYSTEM_PROGRAM = '11111111111111111111111111111111';
 const U64_MAX = (1n << 64n) - 1n;
@@ -133,6 +137,7 @@ void test('builds an exact official PumpSwap SELL plan and records actual SDK se
       quoteDecimals: 9,
       snapshotSlot: 123n,
       quoteFingerprint: 'a'.repeat(64),
+      snapshotFingerprint: 'b'.repeat(64),
     });
     assert.deepEqual(plan.amounts, {
       amountInRaw: U64_MAX,
@@ -167,7 +172,7 @@ void test('builds an exact official PumpSwap SELL plan and records actual SDK se
       true,
       TOKEN_PROGRAM_ID,
     ).toBase58());
-    assert.deepEqual(plan.recipientSelections, [
+    assert.deepEqual([plan.policyEvidence.feeSelection, plan.policyEvidence.buybackSelection], [
       {
         role: 'FEE',
         selectionMethod: 'SDK_RANDOM',
@@ -196,6 +201,7 @@ void test('builds an exact official PumpSwap SELL plan and records actual SDK se
       { role: 'POOL_QUOTE_VAULT', address: QUOTE_VAULT },
       { role: 'USER_BASE_ATA', address: userAta(BASE_MINT, TOKEN_PROGRAM_ID) },
       { role: 'USER_QUOTE_ATA', address: userAta(QUOTE_MINT, TOKEN_PROGRAM_ID) },
+      { role: 'POOL_COIN_CREATOR', address: '11111111111111111111111111111111' },
     ]);
     assertPlainDeepFrozen(plan);
   } finally {
@@ -308,7 +314,7 @@ void test('accepts the exact SDK branch for mayhem, cashback, coin creator, exte
     assert.equal(sell?.accounts[22]?.address, input.snapshot.userVolumeAccumulator.address);
     assert.equal(sell?.accounts[23]?.address, input.snapshot.poolV2.address);
     assert.equal(sell?.accounts[24]?.address, key(67));
-    assert.deepEqual(plan.recipientSelections.map((selection) => ({
+    assert.deepEqual([plan.policyEvidence.feeSelection, plan.policyEvidence.buybackSelection].map((selection) => ({
       selectionMethod: 'selectionMethod' in selection ? selection.selectionMethod : null,
       listKind: selection.listKind,
       selectedIndex: selection.selectedIndex,
@@ -318,6 +324,9 @@ void test('accepts the exact SDK branch for mayhem, cashback, coin creator, exte
     ]);
     assert.equal(close?.programId, TOKEN_PROGRAM_ID.toBase58());
     assertPlainDeepFrozen(plan);
+    const golden = await loadPumpSwapSellGoldenFixture();
+    assert.deepEqual(plan, golden.plan);
+    assert.equal(executionBuildFingerprint(plan), golden.buildFingerprint);
   } finally {
     Math.random = originalRandom;
   }
@@ -746,6 +755,7 @@ function quote() {
     protectedAmountOutRaw: 8n,
     snapshotSlot: 123n,
     quoteFingerprint: 'a'.repeat(64),
+    snapshotFingerprint: 'b'.repeat(64),
   });
 }
 
