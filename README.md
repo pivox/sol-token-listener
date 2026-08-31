@@ -34,8 +34,10 @@ composés ni dans le listener, ni dans l'API, ni dans le worker paper. Il
 n'existe aucun wallet, chargement de clé, chemin live, signature ou envoi. Le
 lot #51-C livre désormais un processus executor dry-run PostgreSQL séparé,
 sans construction ni simulation de transaction et sans consommer l'intention.
-#51-D à #51-G ne sont pas livrées et les seuls modes du listener restent
-`observe` et `paper`.
+#51-D livre un second mode executor `simulation-only`, disponible pour produire
+une preuve non signée sans soumission. Les lots #51-E, #51-F et #51-G restent
+obligatoires avant toute transaction réelle. Les seuls modes du listener
+restent `observe` et `paper`.
 
 Configuration minimale de la stratégie de création, toujours simulée :
 
@@ -136,12 +138,13 @@ npm run db:migrate
 EXECUTOR_MODE=dry-run DATABASE_URL=postgresql://... npm run executor:start
 ```
 
-Les paramètres executor sont `EXECUTOR_MODE=dry-run`, `DATABASE_URL`,
+Les paramètres de ce mode sont `EXECUTOR_MODE=dry-run`, `DATABASE_URL`,
 `EXECUTOR_POLL_MS=1000`, `EXECUTOR_LEASE_MS=30000`,
 `EXECUTOR_DB_STATEMENT_TIMEOUT_MS=3000`,
 `EXECUTOR_SHUTDOWN_GRACE_MS=10000` et `LIVE_TRADING_ENABLED=false`.
 La dernière valeur doit rester `false`; aucune clé, keypair, endpoint RPC ou
-réglage de signature/soumission ne doit être ajouté à l'environnement executor.
+réglage de signature/soumission ne doit être ajouté à l'environnement de ce
+mode PostgreSQL-only.
 
 Pour chaque intention `PENDING` ou `RETRY_READY` éligible, #51-C enregistre
 une assessment déterministe `FOUNDATION_VALIDATED` à couverture
@@ -149,7 +152,61 @@ une assessment déterministe `FOUNDATION_VALIDATED` à couverture
 la construction, `NOT_RUN` pour la simulation, `NOT_RUN` pour la signature et
 `NOT_RUN` pour la soumission. Ce rapport n'est ni une simulation Solana ni un
 `PASS` de trading : il ne consomme pas l'intention, ne crée ni tentative ni
-transition, et libère seulement son lease technique. L'intention reste donc disponible pour #51-D, qui reste requis pour quote, build et `simulateTransaction`; les étapes #51-E à #51-G ne sont pas livrées par ce processus.
+transition, et libère seulement son lease technique. L'intention reste donc
+disponible pour le mode #51-D de quote, build et `simulateTransaction` ; les
+étapes #51-E à #51-G ne sont pas livrées par ce processus.
+
+### Exécuteur `simulation-only` sans signature (#51-D)
+
+#51-D livre un mode séparé qui produit une preuve de quote, de build non signé
+et de simulation Solana. Il est disponible sans capacité live, signature ou
+soumission. Sa configuration publique est :
+
+```dotenv
+EXECUTOR_MODE=simulation-only
+EXECUTOR_PUBLIC_KEY=<ADRESSE_PUBLIQUE_BASE58>
+EXECUTOR_RPC_PROVIDER_ID=primary
+SOLANA_HTTP_RPC_URL=https://<endpoint-qualifie>
+SOLANA_EXPECTED_GENESIS_HASH=<HASH_GENESIS_BASE58_VERIFIE>
+EXECUTOR_QUOTE_MAX_AGE_MS=3000
+EXECUTOR_SLIPPAGE_BPS=500
+EXECUTOR_SNAPSHOT_MAX_SLOT_LAG=8
+EXECUTOR_MAX_COMPUTE_UNITS=300000
+EXECUTOR_MAX_FEE_LAMPORTS=100000
+EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT=2500000
+EXECUTOR_MAX_PRIORITY_FEE_LAMPORTS=0
+EXECUTOR_RPC_TIMEOUT_MS=5000
+EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT=8
+LIVE_QUOTE_MINT_ALLOWLIST=So11111111111111111111111111111111111111112
+LIVE_TRADING_ENABLED=false
+```
+
+`EXECUTOR_PUBLIC_KEY` est seulement l'adresse d'un compte public, pas un wallet
+connecté. Ce compte doit être financé extérieurement en SOL natif pour un BUY,
+les frais et la rent, et détenir les base tokens nécessaires pour un SELL. Le
+builder n'admet que les branches ATA idempotentes attendues. Pour un SELL
+PumpSwap WSOL, il inspecte la création éventuelle de l'ATA WSOL et le
+`CloseAccount` terminal exact du SDK audité ; aucun wrap/unwrap auxiliaire,
+signer additionnel ou compte arbitraire n'est accepté.
+
+Chaque tentative reste sur un seul endpoint positionnel. Elle vérifie le hash
+de genesis attendu, n'effectue ni retry automatique ni failover au milieu de
+quote → build → simulation, et échoue fermé sur timeout, 429 ou réponse
+invalide. La simulation utilise une transaction v0 éphémère avec une signature
+nulle, `sigVerify=false` et aucune méthode d'envoi. Le message, la transaction
+et les instructions sérialisées ne sont jamais persistés.
+
+Une simulation réussie termine l'intention `simulation-only` et écrit un
+artefact versionné non signable. Cet artefact ne pourra jamais être repris pour
+signer ou envoyer la transaction : une future exécution armée devra créer une
+nouvelle intention et refaire quote, build et simulation sous les gates alors
+applicables. Aucun secret n'est accepté et aucun `signTransaction`,
+`sendTransaction` ou mode live n'existe dans ce graphe.
+
+La validation terrain #49 des 50 positions Mainnet a été sautée : elle reste
+non exécutée, non validée et n'est pas un `PASS`. #51-E (quota/sizing/retry),
+#51-F (preflight et armement manuel) puis #51-G (signature/soumission sous
+gates compensatoires) demeurent obligatoires avant le moindre trade réel.
 
 ## Console frontend indépendante
 

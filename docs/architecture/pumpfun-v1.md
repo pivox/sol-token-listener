@@ -474,7 +474,52 @@ gates restent `NOT_RUN` pour la quote, `NOT_RUN` pour la construction,
 `NOT_RUN` pour la simulation, `NOT_RUN` pour la signature et `NOT_RUN` pour la
 soumission. Cette assessment n'est ni une simulation Solana ni un `PASS` : elle
 ne consomme pas l'intention, ne crée aucune tentative ni transition, et libère
-uniquement le lease temporaire. L'intention demeure disponible pour #51-D, encore requis pour quote, build et `simulateTransaction`; #51-E, #51-F et #51-G restent à livrer.
+uniquement le lease temporaire. L'intention demeure disponible pour le mode
+#51-D de quote, build et `simulateTransaction`; #51-E, #51-F et #51-G restent à
+livrer.
+
+### Exécuteur de preuve `simulation-only` (#51-D)
+
+#51-D ajoute au processus executor un mode explicite `simulation-only`, séparé
+du `dry-run`. La frontière snapshot → quote → build → simulation → commit est
+livrée pour produire une preuve non signée, sans capacité live ni soumission.
+Cette disponibilité ne modifie jamais le listener, qui reste limité à
+`observe` et `paper`.
+
+Le graphe accepte uniquement `EXECUTOR_PUBLIC_KEY`, une adresse publique sans
+capacité de signature. Le compte correspondant est financé hors application :
+SOL natif pour les BUY, frais et rent, base tokens pour les SELL. Aucune clé
+privée, keypair, wallet ou acquisition réflexive de signer n'entre dans le
+processus. Les seules préparations de comptes permises sont les créations ATA
+idempotentes attendues et inspectées. Le SELL PumpSwap WSOL accepte uniquement
+la branche SDK auditée, y compris son `CloseAccount` terminal exact ; tout autre
+wrap, unwrap, `SyncNative`, signer ou compte auxiliaire échoue fermé.
+
+Une tentative crée une session RPC mono-provider. L'identifiant du provider est
+positionnel, le hash de genesis est comparé à la valeur vérifiée par l'opérateur
+et toutes les lectures causales restent sur ce même endpoint. #51-D ne fait ni
+retry automatique ni failover en cours de tentative. La bonding curve, le mint
+et tous les comptes de quote/build sont relus dans la snapshot finale ; les
+données de découverte ne sont jamais autoritatives ou persistables.
+
+Le plan officiel inspecté est compilé en message v0 éphémère sans ALT. La
+transaction ne contient qu'un emplacement de signature nul et est transmise
+uniquement à `simulateTransaction` avec `sigVerify=false`; aucune méthode de
+signature ou soumission n'est accessible. Les bytes du message, de la
+transaction et des instructions sont détruits après la tentative et ne sont
+jamais écrits en base.
+
+Le commit atomique conserve seulement une preuve versionnée et non signable.
+Un succès `SIMULATED -> SUCCEEDED` termine définitivement cette intention
+`simulation-only`; il ne prouve ni envoi, fill, profit ou sellabilité et ne peut
+pas être transformé ensuite en ordre signé. Une future exécution armée exige
+une nouvelle intention et une nouvelle preuve complète.
+
+La validation #49 des 50 positions Mainnet a été sautée et reste
+`NON_EXECUTED`, `NON_VALIDATED`, donc jamais `PASS`. Les lots #51-E pour le
+quota/sizing/retry, #51-F pour le preflight et l'armement manuel, puis #51-G
+pour une éventuelle signature/soumission sous gates compensatoires sont tous
+obligatoires avant une transaction réelle. #51-D n'ajoute aucun mode live.
 
 ## Persistance, reprise et rétention
 
