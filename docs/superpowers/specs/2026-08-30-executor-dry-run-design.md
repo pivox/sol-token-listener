@@ -1,6 +1,6 @@
 # Exécuteur dry-run V1 — conception #51-C
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.0.5
 
 **Date :** 2026-08-30
 
@@ -12,6 +12,9 @@
 
 ## Historique des versions
 
+- **1.0.5 — 2026-08-31 :** remplacement de l'analyse de flux réflexive par
+  une politique syntaxique fermée : seul l'appel direct exact
+  `Reflect.ownKeys(value)` est admis dans le graphe executor.
 - **1.0.4 — 2026-08-31 :** fermeture des fenêtres d'annulation après
   acquisition PostgreSQL pour `claim` et `findExact`, et rejet des accès
   réflexifs aux capacités d'exécution interdites dans le garde d'architecture.
@@ -364,8 +367,9 @@ Des tests du graphe d'import source et compilé refusent depuis
 - `Keypair`, wallet, signer, secret loader ou chemin de keypair ;
 - transaction builder, `simulateTransaction`, `sendTransaction` et
   `sendRawTransaction` ;
-- les acquisitions réflexives directes, calculées ou aliasées de ces capacités,
-  notamment via `Reflect.get`, `Reflect.apply`, `.call` et `.apply` ;
+- tout usage de `Reflect`, direct, calculé, global ou aliasable, sauf l'appel
+  syntaxique exact `Reflect.ownKeys(value)` nécessaire à la validation hostile
+  des objets ;
 - tout import du listener ou de `src/execution`.
 
 Les logs n'exposent que l'événement fixe, le mode, l'intent ID déterministe,
