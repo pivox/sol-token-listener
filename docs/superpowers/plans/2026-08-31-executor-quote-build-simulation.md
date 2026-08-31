@@ -440,11 +440,11 @@ git commit -m "docs: explain executor simulation-only safety (#51)"
 
 ## Task 10: Full verification and delivery
 
-- [ ] Inspect `git diff --check`, status and diff against `origin/main`.
-- [ ] Start an isolated PostgreSQL database; never use or destroy an unknown
+- [x] Inspect `git diff --check`, status and diff against `origin/main`.
+- [x] Start an isolated PostgreSQL database; never use or destroy an unknown
   operator database.
-- [ ] Run migrations on empty DB, replay, and upgrade fixture through 032.
-- [ ] Run all mandatory commands:
+- [x] Run migrations on empty DB, replay, and upgrade fixture through 032.
+- [x] Run all mandatory commands:
 
 ```bash
 npm run build
@@ -455,9 +455,9 @@ TEST_DATABASE_URL=postgresql://... npm test
 npm run frontend:e2e
 ```
 
-- [ ] Run an executor compiled integration test against scripted RPC only.
-- [ ] Run a secret scan and architecture graph scan on source and `dist`.
-- [ ] Request one local independent review and address confirmed issues.
+- [x] Run an executor compiled integration test against scripted RPC only.
+- [x] Run a secret scan and architecture graph scan on source and `dist`.
+- [x] Request one local independent review and address confirmed issues.
 - [ ] Push branch and open a PR referencing #51-D, with explicit safety and
   skipped-#49 statements.
 - [ ] Execute exactly three GitHub review requests/correction cycles, never a
