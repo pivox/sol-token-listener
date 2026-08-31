@@ -312,13 +312,13 @@ git commit -m "feat: define execution reconciliation and fault proofs (#51)"
 - Create: `tests/execution-risk-migration.test.ts`
 - Modify: `tests/api-event-stream-migration.test.ts`
 
-- [ ] **Step 1: Write failing migration contract tests**
+- [x] **Step 1: Write failing migration contract tests**
 
 Assert every table, FK, closed enum, canonical timestamp, NUMERIC financial
 column, unique replay key, partial active index and absence of float/secret
 columns. Extend the ordered migration manifest to end at 034.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -328,7 +328,7 @@ node --import tsx --test tests/execution-risk-migration.test.ts tests/api-event-
 
 Expected: migration 034 missing and manifest expectation fails.
 
-- [ ] **Step 3: Implement migration 034**
+- [x] **Step 3: Implement migration 034**
 
 Create the eleven tables named by spec 1.0.3, including
 `execution_wallet_risk_state`. Use `CREATE TABLE IF NOT EXISTS`, named
@@ -336,7 +336,7 @@ constraints and `CREATE INDEX IF NOT EXISTS`. Store financial integers as
 unscaled `NUMERIC` with explicit integer/u64 or integer/i128 checks. Every terminal
 `purge_after` must equal its reconciliation/end timestamp plus four hours.
 
-- [ ] **Step 4: Verify base-empty and replay on real PostgreSQL**
+- [x] **Step 4: Verify base-empty and replay on real PostgreSQL**
 
 Run:
 
@@ -346,7 +346,7 @@ TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot node --i
 
 Expected: migration applies twice in an isolated schema, all tests PASS.
 
-- [ ] **Step 5: Build migration packaging and commit**
+- [x] **Step 5: Build migration packaging and commit**
 
 Run `npm run build:backend`; expect `Packaged 34 PostgreSQL migrations.` Then:
 
