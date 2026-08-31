@@ -1,6 +1,6 @@
 # Preflight et opérations Executor V1 — conception #51-F
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.0.3 — 2026-08-31 :** sérialisation du replay preflight, liaison du
+  build simulé, recontrôle atomique du risque lors de l'armement, rejet des
+  replays terminaux et compatibilité effective avec le rôle opérations.
 - **1.0.2 — 2026-08-31 :** correction du contrat CLI documenté pour aligner
   `live:arm` sur la phase configurée et ses trois options réellement acceptées.
 - **1.0.1 — 2026-08-31 :** liaison vérifiable de la preuve de simulation #51-D,
@@ -181,7 +184,11 @@ Les bornes V1 sont fermées :
 Le plafond lamports est obligatoire, strictement positif et borné en u64. Le
 TTL d'armement est au plus quinze minutes et ne dépasse jamais la qualification
 référencée ; une nouvelle phase exige une nouvelle qualification et un nouvel
-armement. Un seul armement non terminal existe par génération.
+armement. Un seul armement non terminal existe par génération. Sous le verrou
+advisory partagé avec #51-E, la création relit immédiatement `unknown_block`
+et les réservations `UNKNOWN_HELD`. Toute incertitude apparue depuis le resume
+refuse l'armement avant consommation de l'autorisation. Le replay d'un
+armement révoqué ou expiré est également refusé.
 
 En #51-F, aucune méthode ne marque un armement `LOCKED` ou `CONSUMED`. Ces états
 sont réservés au CAS transactionnel de #51-G. Les commandes peuvent seulement

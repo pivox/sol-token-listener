@@ -3,9 +3,11 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
+const repositoryUrl = new URL('../src/storage/execution-operations.repository.ts', import.meta.url);
 
 void test('executor role provisioning is explicit, passwordless and least-privilege', async () => {
   const sql = await readFile(scriptUrl, 'utf8');
+  const repository = await readFile(repositoryUrl, 'utf8');
   const executable = sql.replace(/--[^\r\n]*/gu, ' ');
   for (const role of [
     'sol_token_listener_writer', 'sol_token_executor_worker',
@@ -24,4 +26,15 @@ void test('executor role provisioning is explicit, passwordless and least-privil
   assert.match(sql, /GRANT INSERT,UPDATE ON TABLE\s+execution_operator_authorizations,\s+execution_activation_armaments/iu);
   assert.match(sql, /GRANT INSERT ON TABLE\s+execution_activation_events/iu);
   assert.doesNotMatch(sql, /(?:private_key|secret_key|seed_phrase|signed_bytes|rpc_url)/iu);
+  for (const readOnlyTable of [
+    'execution_wallet_generations',
+    'execution_wallet_risk_state',
+    'execution_safety_qualifications',
+  ]) {
+    assert.doesNotMatch(
+      repository,
+      new RegExp(`FROM\\s+${readOnlyTable}[^;]*FOR UPDATE`, 'iu'),
+      `${readOnlyTable} must remain usable with SELECT-only privileges`,
+    );
+  }
 });

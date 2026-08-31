@@ -1,6 +1,6 @@
 # Executor V1 — preflight et opérations inertes (#51-F)
 
-**Version :** 1.0.1 — 2026-08-31
+**Version :** 1.0.2 — 2026-08-31
 
 #51-F ne permet pas de trader. Il ne charge aucune clé, ne signe rien et
 n'envoie aucune transaction. `EXECUTOR_MODE=live` et
@@ -80,6 +80,11 @@ contextuel est persisté. Il n'existe aucun flag non interactif de contournement
 L'armement produit est inerte. Aucun worker de #51-F ne le lit et aucun mode
 live n'existe encore. Sa présence signifie seulement que la décision opérateur
 a été enregistrée avec les bornes CANARY.
+
+Au moment exact de l'armement, le backend relit sous le verrou de génération
+les états `unknown_block` et `UNKNOWN_HELD`. Une incertitude apparue depuis le
+resume refuse la commande sans consommer son autorisation. Un replay devenu
+révoqué ou expiré échoue également au lieu de renvoyer un faux état `ARMED`.
 
 Les lectures masquent immédiatement les armements expirés sans mutation ; ils
 sont terminalisés sous verrou avant tout nouvel armement. Un arrêt révoque

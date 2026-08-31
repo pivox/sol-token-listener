@@ -61,6 +61,7 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
   ): Promise<ExecutionSafetyQualificationV1> {
     const qualification = qualificationFrom(input);
     return this.transaction(async (client) => {
+      await lockGeneration(client, qualification.generationId);
       const existing = await client.query(`SELECT qualification_id
         FROM execution_safety_qualifications WHERE qualification_id=$1`,
       [qualification.qualificationId]);
@@ -77,7 +78,7 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
       const generation = exactRow(singleRow(await client.query(`SELECT wallet_public_key,cluster,
         genesis_hash,retired_at,
         trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS database_now_ms
-        FROM execution_wallet_generations WHERE generation_id=$1 FOR UPDATE`,
+        FROM execution_wallet_generations WHERE generation_id=$1`,
       [qualification.generationId])), [
         'wallet_public_key', 'cluster', 'genesis_hash', 'retired_at', 'database_now_ms',
       ] as const);
@@ -231,7 +232,7 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
       const qualification = exactRow(singleRow(await client.query(`SELECT generation_id,
         qualification_fingerprint,
         trunc(EXTRACT(EPOCH FROM expires_at)*1000)::TEXT AS expires_at_ms
-        FROM execution_safety_qualifications WHERE qualification_id=$1 FOR UPDATE`,
+        FROM execution_safety_qualifications WHERE qualification_id=$1`,
       [command.qualificationId])), [
         'generation_id', 'qualification_fingerprint', 'expires_at_ms',
       ] as const);
@@ -245,7 +246,7 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
         EXISTS (SELECT 1 FROM execution_exposure_reservations reservation
           WHERE reservation.generation_id=risk.generation_id
             AND reservation.state='UNKNOWN_HELD') AS unknown_reservation
-        FROM execution_wallet_risk_state risk WHERE generation_id=$1 FOR UPDATE`,
+        FROM execution_wallet_risk_state risk WHERE generation_id=$1`,
       [command.generationId])), ['unknown_block', 'unknown_reservation'] as const);
       let decision: ReturnType<typeof decideExecutionControlTransition>;
       try {
@@ -275,18 +276,32 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
 
   public async arm(input: ExecutionActivationArmamentV1): Promise<ExecutionActivationArmamentV1> {
     return this.transaction(async (client) => {
-      const existing = await client.query(`SELECT armament_fingerprint
+      await lockGeneration(client, input.generationId);
+      const existing = await client.query(`SELECT armament_fingerprint,state,
+        expires_at > statement_timestamp() AS fresh
         FROM execution_activation_armaments WHERE armament_id=$1`, [input.armamentId]);
       if (existing.rows.length === 1) {
-        if (exactRow(existing.rows[0], ['armament_fingerprint'] as const).armament_fingerprint
-          !== input.armamentFingerprint) throw failure('CONFLICT');
+        const row = exactRow(existing.rows[0], [
+          'armament_fingerprint', 'state', 'fresh',
+        ] as const);
+        if (row.armament_fingerprint !== input.armamentFingerprint
+          || row.state !== 'ARMED' || row.fresh !== true) throw failure('CONFLICT');
         return input;
       }
-      await lockGeneration(client, input.generationId);
+      if (existing.rows.length !== 0) throw failure('INVALID_DATA');
       await terminalizeActiveArmament(client, input.generationId, 'EXPIRED', true);
       await ensureControlState(client, input.generationId);
       const state = await lockedControlState(client, input.generationId);
       if (state.state !== 'RUNNING') throw failure('CONTROL_STOPPED');
+      const risk = exactRow(singleRow(await client.query(`SELECT unknown_block,
+        EXISTS (SELECT 1 FROM execution_exposure_reservations reservation
+          WHERE reservation.generation_id=risk.generation_id
+            AND reservation.state='UNKNOWN_HELD') AS unknown_reservation
+        FROM execution_wallet_risk_state risk WHERE generation_id=$1`,
+      [input.generationId])), ['unknown_block', 'unknown_reservation'] as const);
+      if (risk.unknown_block === true || risk.unknown_reservation === true) {
+        throw failure('CONFLICT');
+      }
       const now = timestampText(exactRow(singleRow(await client.query(`SELECT
         trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms`)),
       ['now_ms'] as const).now_ms);
@@ -370,12 +385,12 @@ async function verifyMainnetSimulationEvidence(
   }
   const artifact = exactRow(singleRow(await client.query(`SELECT result_fingerprint,result_kind,
     provider_id,executor_public_key,expected_genesis_hash,observed_genesis_hash,
-    configuration_fingerprint,
+    configuration_fingerprint,build_fingerprint,
     trunc(EXTRACT(EPOCH FROM recorded_at)*1000)::TEXT AS recorded_at_ms
     FROM execution_simulation_artifacts WHERE artifact_id=$1`, [gate.evidenceId])), [
     'result_fingerprint', 'result_kind', 'provider_id', 'executor_public_key',
     'expected_genesis_hash', 'observed_genesis_hash', 'configuration_fingerprint',
-    'recorded_at_ms',
+    'build_fingerprint', 'recorded_at_ms',
   ] as const);
   const recordedAtMs = timestampText(artifact.recorded_at_ms);
   const expectedFingerprint = createMainnetSimulationEvidenceFingerprint({
@@ -394,6 +409,7 @@ async function verifyMainnetSimulationEvidence(
     || artifact.expected_genesis_hash !== qualification.genesisHash
     || artifact.observed_genesis_hash !== qualification.genesisHash
     || artifact.configuration_fingerprint !== qualification.configurationFingerprint
+    || artifact.build_fingerprint !== qualification.buildHash
     || recordedAtMs !== gate.observedAtMs
     || recordedAtMs > qualification.qualifiedAtMs
     || gate.evidenceFingerprint !== expectedFingerprint) throw failure('CONFLICT');
@@ -570,7 +586,7 @@ async function qualificationForArm(
     wallet_public_key,cluster,genesis_hash,provider_id,
     trunc(EXTRACT(EPOCH FROM qualified_at)*1000)::TEXT AS qualified_at_ms,
     trunc(EXTRACT(EPOCH FROM expires_at)*1000)::TEXT AS expires_at_ms
-    FROM execution_safety_qualifications WHERE qualification_id=$1 FOR UPDATE`,
+    FROM execution_safety_qualifications WHERE qualification_id=$1`,
   [qualificationId])), [
     'qualification_id', 'payload_version', 'evaluator_version', 'qualification_fingerprint',
     'phase', 'build_hash', 'configuration_fingerprint', 'strategy_fingerprint',
