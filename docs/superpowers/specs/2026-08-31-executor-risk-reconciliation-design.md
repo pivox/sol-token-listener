@@ -1,8 +1,8 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.0.2
 
-**Version de la spécification parente :** 1.6.1
+**Version de la spécification parente :** 1.6.2
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.0.2 — 2026-08-31 :** corrige le décompte du schéma durable : la liste
+  normative contient onze tables, dont `execution_wallet_risk_state` et les
+  tombstones minimaux.
 - **1.0.1 — 2026-08-31 :** ajoute les bornes temporelles exactes de la période
   de facturation provider afin de détecter une régression sans interpréter son
   identifiant opaque.

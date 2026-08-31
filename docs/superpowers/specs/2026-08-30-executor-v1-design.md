@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.6.1
+**Version de spécification :** 1.6.2
 
 **Date :** 2026-08-31
 
@@ -15,6 +15,9 @@ inerte des intentions d'exécution), #51-C (processus executor dry-run), #51-D
 
 ## Historique des versions
 
+- **1.6.2 — 2026-08-31 :** aligne le décompte du schéma #51-E sur sa liste
+  normative de onze tables durables ; le périmètre et les invariants restent
+  inchangés.
 - **1.6.1 — 2026-08-31 :** rend les périodes provider ordonnables et
   vérifiables en ajoutant leurs bornes UTC milliseconde à chaque snapshot
   d'usage #51-E ; un identifiant opaque seul ne peut pas prouver qu'une période
