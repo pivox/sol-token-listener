@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.5.0
+**Version de spécification :** 1.6.0
 
 **Date :** 2026-08-31
 
@@ -9,11 +9,18 @@
 **Issue parente :** #51
 
 **Périmètre livré à cette version :** #51-A (conception), #51-B (fondation
-inerte des intentions d'exécution), #51-C (processus executor dry-run) et
-conception détaillée #51-D (quote, build éphémère et simulation sans envoi)
+inerte des intentions d'exécution), #51-C (processus executor dry-run), #51-D
+(quote, build éphémère et simulation sans envoi) et conception détaillée
+#51-E (risque, quota, exposition et réconciliation sans effet on-chain)
 
 ## Historique des versions
 
+- **1.6.0 — 2026-08-31 :** spécifie #51-E comme une fondation inerte : policy
+  de sizing en entiers, admission BUY transactionnelle, réservations
+  d'exposition, quota provider pessimiste, observations wallet finalisées,
+  preuves de réconciliation et matrice de fautes. Aucun composant #51-E n'est
+  composé dans le runtime et aucune capacité de signature ou d'envoi n'est
+  ajoutée.
 - **1.5.0 — 2026-08-31 :** spécifie #51-D : mode `simulation-only`, provider
   épinglé, snapshot causal, quote fraîche, plan officiel inspecté, message v0
   éphémère sans ALT ni signature, simulation avec blockhash explicite et preuve
@@ -492,6 +499,8 @@ non signé et une simulation sans envoi. La conception de #51-C est versionnée
 dans [2026-08-30-executor-dry-run-design.md](2026-08-30-executor-dry-run-design.md)
 et celle de #51-D dans
 [2026-08-31-executor-quote-build-simulation-design.md](2026-08-31-executor-quote-build-simulation-design.md).
+La conception de #51-E est versionnée dans
+[2026-08-31-executor-risk-reconciliation-design.md](2026-08-31-executor-risk-reconciliation-design.md).
 
 ### 7.3 Simulation sans envoi
 
