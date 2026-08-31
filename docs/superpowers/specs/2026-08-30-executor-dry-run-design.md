@@ -1,6 +1,6 @@
 # Exécuteur dry-run V1 — conception #51-C
 
-**Version de spécification :** 1.0.5
+**Version de spécification :** 1.0.6
 
 **Date :** 2026-08-30
 
@@ -12,6 +12,9 @@
 
 ## Historique des versions
 
+- **1.0.6 — 2026-08-31 :** interdiction de `global` et `globalThis` dans le
+  graphe executor afin de fermer l'acquisition calculée d'une capacité
+  réflexive globale.
 - **1.0.5 — 2026-08-31 :** remplacement de l'analyse de flux réflexive par
   une politique syntaxique fermée : seul l'appel direct exact
   `Reflect.ownKeys(value)` est admis dans le graphe executor.
@@ -370,6 +373,7 @@ Des tests du graphe d'import source et compilé refusent depuis
 - tout usage de `Reflect`, direct, calculé, global ou aliasable, sauf l'appel
   syntaxique exact `Reflect.ownKeys(value)` nécessaire à la validation hostile
   des objets ;
+- toute référence à `global` ou `globalThis`, absente du graphe légitime ;
 - tout import du listener ou de `src/execution`.
 
 Les logs n'exposent que l'événement fixe, le mode, l'intent ID déterministe,
