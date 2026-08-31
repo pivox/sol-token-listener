@@ -10,6 +10,7 @@ export const EXECUTION_SIMULATION_SPECIFICATION_VERSION = '1.5.0' as const;
 export const EXECUTION_SIMULATION_EVALUATOR_VERSION = 1 as const;
 
 export const EXECUTION_SIMULATION_FAILURE_CODES = Object.freeze([
+  'GENESIS_MISMATCH',
   'QUOTE_REJECTED',
   'BUILD_POLICY_REJECTED',
   'RPC_RATE_LIMITED',
@@ -246,7 +247,7 @@ function inputFrom(value: unknown): ExecutionSimulationArtifactInputV1 {
     feesRaw: nullableU64From(record.feesRaw),
     estimatedFeeLamports: nullableU64From(record.estimatedFeeLamports),
     simulatedFeePayerLamportDebit: nullableU64From(record.simulatedFeePayerLamportDebit),
-    unitsConsumed: nullablePositiveU64From(record.unitsConsumed),
+    unitsConsumed: nullablePositiveInt64From(record.unitsConsumed),
     simulatedBaseDeltaRaw: nullableSignedU64From(record.simulatedBaseDeltaRaw),
     simulatedQuoteDeltaRaw: nullableSignedU64From(record.simulatedQuoteDeltaRaw),
     rpcCallsUsed: nonNegativeIntegerFrom(record.rpcCallsUsed),
@@ -297,7 +298,10 @@ function validateResultShape(value: ExecutionSimulationArtifactInputV1): void {
     case 'PROVIDER_FAILED':
       expectStatuses(value, 'FAILED', 'NOT_RUN', 'NOT_RUN', 'PROVIDER');
       expectAllNull([...quoteProof, ...buildProof, ...blockhashProof, ...feeProof, ...simulationProof]);
-      if (value.effectiveVenue !== null || value.observedGenesisHash !== null) throw invalid();
+      if (value.effectiveVenue !== null) throw invalid();
+      if (value.failureCode === 'GENESIS_MISMATCH'
+        && (value.observedGenesisHash === null
+          || value.observedGenesisHash === value.expectedGenesisHash)) throw invalid();
       break;
     case 'QUOTE_FAILED':
       expectStatuses(value, 'FAILED', 'NOT_RUN', 'NOT_RUN', 'QUOTE');
@@ -352,6 +356,10 @@ function validateFailureMapping(
   const providerCodes: readonly ExecutionSimulationFailureCode[] = [
     'RPC_RATE_LIMITED', 'RPC_TIMEOUT', 'RPC_UNAVAILABLE',
   ];
+  if (code === 'GENESIS_MISMATCH') {
+    if (stage !== 'PROVIDER' || reason !== 'GENESIS_MISMATCH') throw invalid();
+    return;
+  }
   if (providerCodes.includes(code)) {
     if (reason !== 'EXECUTION_PROVIDER_FAILED') throw invalid();
     return;
@@ -540,6 +548,12 @@ function nullableNonNegativeInt64From(value: unknown): bigint | null {
   if (value === null) return null;
   if (typeof value !== 'bigint' || value < 0n || value > INT64_MAX) throw invalid();
   return value;
+}
+
+function nullablePositiveInt64From(value: unknown): bigint | null {
+  const parsed = nullableNonNegativeInt64From(value);
+  if (parsed === 0n) throw invalid();
+  return parsed;
 }
 
 function nullableU64From(value: unknown): bigint | null {

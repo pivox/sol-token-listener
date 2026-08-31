@@ -67,6 +67,7 @@ const canonicalMigrations = Object.freeze([
   '030_listener_websocket_health.sql',
   '031_execution_intents.sql',
   '032_execution_dry_run_assessments.sql',
+  '033_execution_simulation_artifacts.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
@@ -77,6 +78,7 @@ const canonicalRetentionCounters = Object.freeze([
   'executionDryRunAssessments',
   'executionIntents',
   'executionIntentTransitions',
+  'executionSimulationArtifacts',
   'holderSnapshots',
   'launchTrades',
   'listenerCatchUpGaps',

@@ -22,7 +22,7 @@ void test('publishes the frozen versioned simulation-only vocabulary', () => {
   assert.equal(EXECUTION_SIMULATION_SPECIFICATION_VERSION, '1.5.0');
   assert.equal(EXECUTION_SIMULATION_EVALUATOR_VERSION, 1);
   assert.deepEqual(EXECUTION_SIMULATION_FAILURE_CODES, [
-    'QUOTE_REJECTED', 'BUILD_POLICY_REJECTED', 'RPC_RATE_LIMITED',
+    'GENESIS_MISMATCH', 'QUOTE_REJECTED', 'BUILD_POLICY_REJECTED', 'RPC_RATE_LIMITED',
     'RPC_TIMEOUT', 'RPC_UNAVAILABLE', 'RPC_RESPONSE_INVALID',
     'SIMULATION_EVIDENCE_INVALID', 'SIMULATION_PROGRAM_ERROR',
   ]);
@@ -86,6 +86,12 @@ void test('accepts the closed provider and build failure shapes', () => {
   assert.equal(provider.quoteFingerprint, null);
   assert.equal(provider.terminalReasonCode, 'EXECUTION_PROVIDER_FAILED');
 
+  const genesisMismatch = createExecutionSimulationArtifactDraft(providerFailureInput({
+    observedGenesisHash: 'So11111111111111111111111111111111111111112',
+    failureCode: 'GENESIS_MISMATCH', terminalReasonCode: 'GENESIS_MISMATCH',
+  }));
+  assert.equal(genesisMismatch.observedGenesisHash, 'So11111111111111111111111111111111111111112');
+
   const build = createExecutionSimulationArtifactDraft(buildFailureInput());
   assert.equal(build.resultKind, 'BUILD_FAILED');
   assert.equal(build.quoteStatus, 'SUCCEEDED');
@@ -116,6 +122,7 @@ void test('rejects unsafe numbers, noncanonical hashes, keys and hostile objects
   const invalid = [
     { amountInRaw: 1 }, { amountInRaw: 0n },
     { estimatedFeeLamports: 18_446_744_073_709_551_616n },
+    { unitsConsumed: 9_223_372_036_854_775_808n },
     { simulatedBaseDeltaRaw: 18_446_744_073_709_551_616n },
     { simulatedQuoteDeltaRaw: -18_446_744_073_709_551_616n },
     { snapshotSlot: -1n }, { attemptNumber: 0 }, { strategyVersion: 0 },
@@ -172,7 +179,9 @@ function successInput(
   };
 }
 
-function providerFailureInput(): Readonly<Record<string, unknown>> {
+function providerFailureInput(
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
   return {
     ...successInput(), resultKind: 'PROVIDER_FAILED', effectiveVenue: null,
     observedGenesisHash: null, quoteFingerprint: null, snapshotFingerprint: null,
@@ -186,6 +195,7 @@ function providerFailureInput(): Readonly<Record<string, unknown>> {
     simulationStatus: 'NOT_RUN', failureStage: 'PROVIDER',
     failureCode: 'RPC_UNAVAILABLE', terminalReasonCode: 'EXECUTION_PROVIDER_FAILED',
     logsFingerprint: null, logsLineCount: null,
+    ...overrides,
   };
 }
 

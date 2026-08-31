@@ -40,6 +40,7 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
       migrationName,paperFinalityMigrationName,'029_paper_finality_claim_scheduler.sql',
       '030_listener_websocket_health.sql',
       '031_execution_intents.sql', '032_execution_dry_run_assessments.sql',
+      '033_execution_simulation_artifacts.sql',
     ]);
     assert.match(
       await finalityIndexDefinition(pool),

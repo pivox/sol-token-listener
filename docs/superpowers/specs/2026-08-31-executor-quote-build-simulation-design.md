@@ -1,6 +1,6 @@
 # Exécuteur quote, build et simulation V1 — conception #51-D
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
 **Date :** 2026-08-31
 
@@ -12,6 +12,9 @@
 
 ## Historique des versions
 
+- **1.0.3 — 2026-08-31 :** ajoute le code d'échec interne
+  `GENESIS_MISMATCH` afin que le reason code terminal homonyme possède une
+  représentation durable non ambiguë.
 - **1.0.2 — 2026-08-31 :** ferme le code interne des erreurs programme, la
   traduction d'une réponse provider malformée avant snapshot et l'usage de
   `NUMERIC` non typé afin d'empêcher l'arrondi PostgreSQL avant validation.
@@ -517,6 +520,7 @@ Les erreurs techniques internes sont fermées :
 ```text
 INVALID_INPUT
 INVALID_DATA
+GENESIS_MISMATCH
 QUOTE_REJECTED
 BUILD_POLICY_REJECTED
 RPC_RATE_LIMITED
@@ -539,12 +543,12 @@ La traduction terminale est normative :
 
 | Failure interne | Reason code |
 | --- | --- |
+| `GENESIS_MISMATCH` | `GENESIS_MISMATCH` |
 | `RPC_RATE_LIMITED`, `RPC_TIMEOUT`, `RPC_UNAVAILABLE` | `EXECUTION_PROVIDER_FAILED` |
 | `RPC_RESPONSE_INVALID`, `SIMULATION_EVIDENCE_INVALID`, `INVALID_DATA` provenant d'une réponse externe | `EXECUTION_EVIDENCE_INVALID` |
 | `BUILD_POLICY_REJECTED` | `EXECUTION_BUILD_FAILED` |
 | `SIMULATION_PROGRAM_ERROR` pendant un BUY | `BUY_SIMULATION_FAILED` |
 | `SIMULATION_PROGRAM_ERROR` pendant un SELL | `SELL_SIMULATION_FAILED` |
-| genesis différent | `GENESIS_MISMATCH` |
 | quote expirée / mint / venue / sortie / extension | reason code quote spécifique listé ci-dessus |
 
 `INVALID_INPUT`, `INTENT_FENCE_LOST`, `ARTIFACT_CONFLICT`,
