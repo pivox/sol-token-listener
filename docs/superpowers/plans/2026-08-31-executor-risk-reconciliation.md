@@ -21,7 +21,7 @@ repository but are not wired into `src/executor/main.ts`.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-risk-reconciliation-design.md`
-version 1.0.5 and parent specification version 1.6.4.
+version 1.0.6 and parent specification version 1.6.4.
 
 ---
 
@@ -330,7 +330,7 @@ Expected: migration 034 missing and manifest expectation fails.
 
 - [x] **Step 3: Implement migration 034**
 
-Create the eleven tables named by spec 1.0.5, including
+Create the eleven tables named by spec 1.0.6, including
 `execution_wallet_risk_state`. Use `CREATE TABLE IF NOT EXISTS`, named
 constraints and `CREATE INDEX IF NOT EXISTS`. Store financial integers as
 unscaled `NUMERIC` with explicit integer/u64 or integer/i128 checks. Every terminal
@@ -564,14 +564,14 @@ git commit -m "feat: persist executor technical fault gates (#51)"
 - Create: `tests/execution-risk-retention.test.ts`
 - Modify: `tests/execution-intent-migration.test.ts`
 
-- [ ] **Step 1: Write failing purge-order and boundary tests**
+- [x] **Step 1: Write failing purge-order and boundary tests**
 
 Build eligible, exact-boundary and one-millisecond-too-young cohorts. Assert
 UNKNOWN_HELD, active generations and current provider periods survive. Assert
 tombstones are inserted before child-first deletion and collision rolls back
 the whole cohort.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -579,14 +579,14 @@ Run:
 TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot node --import tsx --test tests/execution-risk-retention.test.ts tests/execution-intent-migration.test.ts
 ```
 
-- [ ] **Step 3: Extend the existing purge transaction**
+- [x] **Step 3: Extend the existing purge transaction**
 
 Use the existing PostgreSQL cutoff and bounded cohort patterns. Purge
 rate-limit events, evidence, fault rows, reports, terminal reservations and
 superseded snapshots in dependency order; retain minimal risk tombstones and
 return additive aggregate counters.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [x] **Step 4: Verify GREEN and commit**
 
 ```bash
 git add src/storage/database.ts tests/execution-risk-retention.test.ts tests/execution-intent-migration.test.ts

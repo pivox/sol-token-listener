@@ -1,6 +1,6 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.5
+**Version de spécification :** 1.0.6
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.6 — 2026-08-31 :** fixe les cohortes de purge Executor à 1 000 lignes
+  par catégorie et un cutoff PostgreSQL unique inclusif. Les périodes provider
+  non terminées, réservations ambiguës et preuves non terminales restent hors
+  cohorte ; toute collision de tombstone annule la transaction complète.
 - **1.0.5 — 2026-08-31 :** rend le replay du ledger de fautes vérifiable par
   une empreinte immuable couvrant l'entrée complète. Le reset du compteur est
   une ligne `RESOLVED` idempotente, autorisée uniquement par une preuve
@@ -419,6 +423,11 @@ La purge verrouille une cohorte, insère d'abord un tombstone minimal pour les
 identités d'admission/réservation, puis supprime enfants avant parents dans une
 transaction. Les tombstones conservent uniquement les IDs/fingerprints
 nécessaires à l'idempotence, sans mint, wallet, montant ou payload.
+Chaque catégorie utilise au maximum 1 000 lignes et le même cutoff PostgreSQL
+tronqué à la milliseconde, avec une frontière inclusive. Une période de
+facturation provider dont la fin est postérieure au cutoff, une réservation
+`UNKNOWN_HELD`/`RESERVED` et une preuve `UNKNOWN`/`MISMATCH` ne sont jamais
+éligibles. Une collision de tombstone fait rollback de toute la cohorte.
 
 ## 13. Contrats et erreurs
 
