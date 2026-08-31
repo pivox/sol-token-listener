@@ -126,6 +126,25 @@ void test('provider usage is monotone and operations and 429 events are idempote
   });
 });
 
+void test('concurrent initial provider snapshots leave exactly one current newest snapshot', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution provider initial snapshot race test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_provider_initial_race', async (pool) => {
+    await migrateDatabase({ pool });
+    const repository = new PostgresExecutionRiskRepository(pool);
+    const older = providerSnapshot(1_000, 1_100, 10);
+    const newer = providerSnapshot(1_000, 1_150, 11);
+    const results = await Promise.allSettled([
+      repository.appendProviderUsage(older),
+      repository.appendProviderUsage(newer),
+    ]);
+    assert.ok(results.some((result) => result.status === 'fulfilled'));
+    const current = await pool.query(`SELECT snapshot_id FROM execution_provider_usage_snapshots
+      WHERE provider_id=$1 AND superseded_at IS NULL`, [older.providerId]);
+    assert.deepEqual(current.rows, [{ snapshot_id: newer.snapshotId }]);
+  });
+});
+
 void test('repository failures expose only a fixed redacted error', async () => {
   const repository = new PostgresExecutionRiskRepository({
     async connect() {
@@ -201,10 +220,20 @@ void test('reconciliation atomically consumes, releases or holds reservations an
     await withTemporarySchema(databaseUrl, `execution_risk_reconcile_${outcome.toLowerCase()}`, async (pool) => {
       const fixture = await reconciliationFixture(pool, outcome, initialStatus);
       if (outcome === 'MATCHED') {
-        await pool.query(`UPDATE execution_wallet_risk_state SET
-          consecutive_technical_failures=1,
-          last_technical_failure_reason_code='EXECUTION_PROVIDER_FAILED'
-          WHERE generation_id=$1`, [fixture.generationId]);
+        await fixture.repository.recordFault({
+          faultId: `execution_fault_${'6'.repeat(64)}`,
+          payloadVersion: 1,
+          generationId: fixture.generationId,
+          intentId: fixture.intentId,
+          activationPhase: 'NONE',
+          stage: 'PROVIDER',
+          side: 'BUY',
+          timing: 'PRE_SIGNATURE',
+          classification: 'TRANSIENT',
+          exactSignedBytesAvailable: false,
+          reasonCode: 'EXECUTION_PROVIDER_FAILED',
+          observedAtMs: Date.now(),
+        });
       }
       const evidence = reconciliationEvidence(fixture.intentId, outcome, fixture.snapshotFingerprint);
       const result = await fixture.repository.reconcile({ payloadVersion: 1, evidence });
@@ -336,6 +365,126 @@ void test('reconciliation rejects caller expectations that differ from the durab
   });
 });
 
+void test('an older reconciled success cannot clear a newer technical failure', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution reconciled success ordering test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_reconciled_success_order', async (pool) => {
+    const fixture = await reconciliationFixture(pool, 'success-order', 'SUBMITTED');
+    const evidence = reconciliationEvidence(
+      fixture.intentId,
+      'MATCHED',
+      fixture.snapshotFingerprint,
+    );
+    await fixture.repository.reconcile({ payloadVersion: 1, evidence });
+    const newerFaultAtMs = (evidence.finalizedAtMs ?? evidence.observedAtMs) + 1;
+    await fixture.repository.recordFault({
+      faultId: `execution_fault_${'7'.repeat(64)}`,
+      payloadVersion: 1,
+      generationId: fixture.generationId,
+      intentId: fixture.intentId,
+      activationPhase: 'NONE',
+      stage: 'PROVIDER',
+      side: 'BUY',
+      timing: 'PRE_SIGNATURE',
+      classification: 'TRANSIENT',
+      exactSignedBytesAvailable: false,
+      reasonCode: 'EXECUTION_PROVIDER_FAILED',
+      observedAtMs: newerFaultAtMs,
+    });
+    await assert.rejects(
+      fixture.repository.recordReconciledSuccess({
+        payloadVersion: 1,
+        evidenceId: evidence.evidenceId,
+        generationId: fixture.generationId,
+        activationPhase: 'NONE',
+      }),
+      isRepositoryError('CONFLICT'),
+    );
+    const state = await pool.query(`SELECT consecutive_technical_failures,
+      last_technical_failure_reason_code FROM execution_wallet_risk_state`);
+    assert.deepEqual(state.rows, [{
+      consecutive_technical_failures: 1,
+      last_technical_failure_reason_code: 'EXECUTION_PROVIDER_FAILED',
+    }]);
+  });
+});
+
+void test('resolving one reservation preserves another reservation unknown block', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution multiple reservation unknown block test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_multiple_unknown_block', async (pool) => {
+    const fixture = await reconciliationFixture(pool, 'first-reservation', 'SUBMITTED');
+    const currentWallet = await fixture.repository.appendWalletSnapshot({
+      ...fixture.walletSnapshot,
+      snapshotId: id('wallet_snapshot', '8'),
+      snapshotFingerprint: '8'.repeat(64),
+      stateRevision: 1n,
+      slot: fixture.walletSnapshot.slot + 1n,
+      blockTimeMs: fixture.nowMs,
+      observedAtMs: fixture.nowMs,
+      openPositions: Object.freeze([{
+        positionId: 'position:first-reservation',
+        costBasisLamports: 90_000n,
+        conservativeLiquidationLamports: 90_000n,
+        reconciliationStatus: 'RECONCILED' as const,
+      }]),
+    });
+    const secondDraft = createExecutionIntentDraft({
+      strategyId: 'risk-reconciliation-test', strategyVersion: 1,
+      positionId: 'position:second-reservation', logicalCommandId: 'command:second-reservation',
+      mint: publicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
+      quoteMint: 'So11111111111111111111111111111111111111112',
+      quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+      quoteAmountRaw: 90_000n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+      decisionEventId: 'decision:second-reservation', decisionFingerprint: '9'.repeat(64),
+      requestedAtMs: fixture.nowMs - 1_000, expiresAtMs: fixture.nowMs + 60_000,
+    });
+    const second = await fixture.intentRepository.create(secondDraft);
+    const admission = await new ExecutionAdmissionService(fixture.repository).admit({
+      payloadVersion: 1,
+      intent: second.intent,
+      policy: fixture.policy,
+      generationId: fixture.generationId,
+      walletSnapshot: currentWallet,
+      providerSnapshot: fixture.providerSnapshot,
+      allEndpointsUnavailable: false,
+      nowMs: fixture.nowMs,
+    });
+    assert.equal(admission.decision, 'ADMITTED');
+    await pool.query(`UPDATE execution_intents SET status='SUBMITTED',attempt_count=1,
+      state_revision=1,last_reason_code='SUBMISSION_ACCEPTED',
+      updated_at=date_trunc('milliseconds',statement_timestamp()) WHERE id=$1`, [second.intent.id]);
+    await pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,effective_venue,provider_id,
+      reconciliation_signature,reconciliation_blockhash,reconciliation_last_valid_block_height,
+      reconciliation_message_hash,reconciliation_build_fingerprint,
+      reconciliation_snapshot_fingerprint,reconciliation_maximum_fee_lamports,
+      reconciliation_maximum_fee_payer_lamport_debit
+    ) VALUES ($1,1,'STARTED','PUMP_FUN','rpc-primary',$2,$3,1000,$4,$5,$6,10,1000)`, [
+      second.intent.id, '3'.repeat(88), publicKey, 'd'.repeat(64), 'e'.repeat(64),
+      currentWallet.snapshotFingerprint,
+    ]);
+    const unknown = reconciliationEvidence(
+      fixture.intentId,
+      'UNKNOWN',
+      fixture.snapshotFingerprint,
+    );
+    await fixture.repository.reconcile({ payloadVersion: 1, evidence: unknown });
+    const matched = reconciliationEvidence(
+      second.intent.id,
+      'MATCHED',
+      currentWallet.snapshotFingerprint,
+      2_000,
+    );
+    await fixture.repository.reconcile({ payloadVersion: 1, evidence: matched });
+    const state = await pool.query(`SELECT unknown_block,
+      (SELECT COUNT(*)::INTEGER FROM execution_exposure_reservations
+        WHERE state='UNKNOWN_HELD') AS unknown_reservations
+      FROM execution_wallet_risk_state WHERE generation_id=$1`, [fixture.generationId]);
+    assert.deepEqual(state.rows, [{ unknown_block: true, unknown_reservations: 1 }]);
+  });
+});
+
 async function reconciliationFixture(
   pool: InstanceType<typeof pg.Pool>,
   seed: string,
@@ -405,8 +554,13 @@ async function reconciliationFixture(
   ]);
   return Object.freeze({
     repository,
+    intentRepository,
     generationId: generation.generationId,
     intentId: created.intent.id,
+    nowMs,
+    walletSnapshot: snapshot,
+    providerSnapshot: provider,
+    policy,
     snapshotFingerprint: snapshot.snapshotFingerprint,
   });
 }

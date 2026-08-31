@@ -253,7 +253,7 @@ void test('three recent rate limits create a durable provider entry rejection', 
         providerId: fixture.providerSnapshot.providerId,
         billingPeriodId: fixture.providerSnapshot.billingPeriodId,
         endpointId: `endpoint-${index + 1}`,
-        observedAtMs: NOW_MS - 3 + index,
+        observedAtMs: NOW_MS - 1,
       });
     }
     const created = await fixture.intentRepository.create(intentDraft('rate-limited'));
@@ -261,6 +261,85 @@ void test('three recent rate limits create a durable provider entry rejection', 
     assert.equal(result.decision, 'REJECTED');
     assert.equal(result.reasonCode, 'PROVIDER_ENTRY_LIMIT_REACHED');
     assert.equal(result.reservationId, null);
+  });
+});
+
+void test('same-period usage survives replacement of the provider snapshot', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution provider replacement accounting test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_provider_replacement_usage', async (pool) => {
+    const fixture = await createFixture(pool);
+    await fixture.riskRepository.recordProviderOperation({
+      operationId: `execution_provider_operation_${'e'.repeat(64)}`,
+      payloadVersion: 1,
+      snapshotId: fixture.providerSnapshot.snapshotId,
+      providerId: fixture.providerSnapshot.providerId,
+      billingPeriodId: fixture.providerSnapshot.billingPeriodId,
+      category: 'ENTRY',
+      logicalOperationId: 'replacement-accounting',
+      units: 9_980n,
+    });
+    const replacement = createProviderUsageSnapshot({
+      providerId: fixture.providerSnapshot.providerId,
+      planId: fixture.providerSnapshot.planId,
+      billingPeriodId: fixture.providerSnapshot.billingPeriodId,
+      billingPeriodStartedAtMs: fixture.providerSnapshot.billingPeriodStartedAtMs,
+      billingPeriodEndsAtMs: fixture.providerSnapshot.billingPeriodEndsAtMs,
+      limitUnits: fixture.providerSnapshot.limitUnits,
+      usedUnits: fixture.providerSnapshot.usedUnits + 1n,
+      measuredAtMs: fixture.providerSnapshot.measuredAtMs + 1,
+      expiresAtMs: fixture.providerSnapshot.expiresAtMs,
+      provenance: fixture.providerSnapshot.provenance,
+    });
+    await fixture.riskRepository.appendProviderUsage(replacement);
+    const created = await fixture.intentRepository.create(intentDraft('replacement-accounting'));
+    const result = await fixture.service.admit({
+      ...admissionInput(created.intent, fixture),
+      providerSnapshot: replacement,
+    });
+    assert.equal(result.decision, 'REJECTED');
+    assert.equal(result.reasonCode, 'PROVIDER_ENTRY_LIMIT_REACHED');
+  });
+});
+
+void test('a third durable technical failure remains readable and blocks admission', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk third technical failure test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_third_failure', async (pool) => {
+    const fixture = await createFixture(pool);
+    for (let index = 0; index < 3; index += 1) {
+      await fixture.riskRepository.recordFault({
+        faultId: `execution_fault_${String(index + 4).repeat(64)}`,
+        payloadVersion: 1,
+        generationId: fixture.generation.generationId,
+        intentId: null,
+        activationPhase: 'NONE',
+        stage: 'PROVIDER',
+        side: 'BUY',
+        timing: 'PRE_SIGNATURE',
+        classification: 'TRANSIENT',
+        exactSignedBytesAvailable: false,
+        reasonCode: 'EXECUTION_PROVIDER_FAILED',
+        observedAtMs: NOW_MS + index,
+      });
+    }
+    const currentWallet = await fixture.riskRepository.appendWalletSnapshot({
+      ...fixture.walletSnapshot,
+      snapshotId: `execution_wallet_snapshot_${'f'.repeat(64)}`,
+      snapshotFingerprint: 'f'.repeat(64),
+      stateRevision: 3n,
+      slot: fixture.walletSnapshot.slot + 1n,
+      observedAtMs: NOW_MS + 2,
+      blockTimeMs: NOW_MS + 2,
+    });
+    const created = await fixture.intentRepository.create(intentDraft('third-failure'));
+    const result = await fixture.service.admit({
+      ...admissionInput(created.intent, fixture),
+      walletSnapshot: currentWallet,
+      nowMs: NOW_MS + 2,
+    });
+    assert.equal(result.decision, 'REJECTED');
+    assert.equal(result.reasonCode, 'EXECUTION_PROVIDER_FAILED');
   });
 });
 

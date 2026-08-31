@@ -272,6 +272,10 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
   public async appendProviderUsage(input: ProviderUsageSnapshotV1): Promise<ProviderUsageSnapshotV1> {
     const snapshot = providerSnapshotFrom(input);
     return this.transaction(async (client) => {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))',
+        [snapshot.providerId],
+      );
       const existing = await findProviderSnapshot(client, snapshot.snapshotId);
       if (existing !== null) {
         if (!sameProviderSnapshot(existing, snapshot)) throw failure('CONFLICT');
@@ -296,6 +300,14 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         if (!coherent) throw failure('STALE_MEASUREMENT');
       }
       try {
+        if (latestResult.rows.length === 1) {
+          const latest = decodeProviderSnapshot(latestResult.rows[0]);
+          const superseded = await client.query(`UPDATE execution_provider_usage_snapshots SET
+            superseded_at=date_trunc('milliseconds',statement_timestamp()),
+            purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
+            WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latest.snapshotId]);
+          if (superseded.rowCount !== 1) throw failure('CONFLICT');
+        }
         const result = await client.query(`INSERT INTO execution_provider_usage_snapshots (
           snapshot_id,payload_version,snapshot_fingerprint,provider_id,plan_id,billing_period_id,
           billing_period_started_at,billing_period_ends_at,limit_units,used_units,measured_at,
@@ -307,14 +319,6 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
           TIMESTAMPTZ 'epoch' + ($12::BIGINT * INTERVAL '1 millisecond'),$13)
         RETURNING ${PROVIDER_PROJECTION}`, providerSnapshotValues(snapshot));
         const inserted = decodeProviderSnapshot(singleRow(result));
-        if (latestResult.rows.length === 1) {
-          const latest = decodeProviderSnapshot(latestResult.rows[0]);
-          const superseded = await client.query(`UPDATE execution_provider_usage_snapshots SET
-            superseded_at=date_trunc('milliseconds',statement_timestamp()),
-            purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
-            WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latest.snapshotId]);
-          if (superseded.rowCount !== 1) throw failure('CONFLICT');
-        }
         return inserted;
       } catch (error) {
         if (databaseCode(error) === '23505') throw failure('CONFLICT');
@@ -450,15 +454,19 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
 
       const localUsage = unsignedBigint(parseBigint(exactRow(singleRow(await client.query(
         `SELECT COALESCE(SUM(units),0)::TEXT AS local_units
-         FROM execution_provider_usage_counters WHERE snapshot_id=$1`,
-        [providerSnapshot.snapshotId],
+         FROM execution_provider_usage_counters
+         WHERE provider_id=$1 AND billing_period_id=$2
+           AND recorded_at >= TIMESTAMPTZ 'epoch'
+             + ($3::BIGINT * INTERVAL '1 millisecond')`,
+        [providerSnapshot.providerId, providerSnapshot.billingPeriodId,
+          providerSnapshot.measuredAtMs],
       )), ['local_units'] as const).local_units));
       const rateRows = await client.query(`SELECT
         trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms
         FROM execution_provider_rate_limit_events
         WHERE provider_id=$1 AND observed_at >= TIMESTAMPTZ 'epoch'
           + (($2::BIGINT - 30000) * INTERVAL '1 millisecond')
-        ORDER BY observed_at ASC LIMIT 1000`, [providerSnapshot.providerId, decisionAtMs]);
+        ORDER BY observed_at ASC,event_id ASC LIMIT 1000`, [providerSnapshot.providerId, decisionAtMs]);
       const recentRateLimits = rateRows.rows.map((row) => textTimestamp(
         exactRow(row, ['observed_at_ms'] as const).observed_at_ms,
       ));
@@ -675,7 +683,8 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       const proofResult = await client.query(`SELECT evidence.evidence_id,evidence.intent_id,
         evidence.generation_id,evidence.result,
         trunc(EXTRACT(EPOCH FROM evidence.finalized_at) * 1000)::TEXT AS finalized_at_ms,
-        risk.state_revision::TEXT AS state_revision,generation.retired_at
+        risk.state_revision::TEXT AS state_revision,risk.consecutive_technical_failures,
+        generation.retired_at
         FROM execution_reconciliation_evidence AS evidence
         JOIN execution_wallet_risk_state AS risk
           ON risk.generation_id=evidence.generation_id
@@ -684,7 +693,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         WHERE evidence.evidence_id=$1 FOR UPDATE OF evidence,risk,generation`, [input.evidenceId]);
       const proof = exactRow(singleRow(proofResult), [
         'evidence_id', 'intent_id', 'generation_id', 'result', 'finalized_at_ms',
-        'state_revision', 'retired_at',
+        'state_revision', 'consecutive_technical_failures', 'retired_at',
       ] as const);
       if (proof.evidence_id !== input.evidenceId
         || proof.generation_id !== input.generationId
@@ -692,6 +701,21 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         || proof.finalized_at_ms === null
         || proof.retired_at !== null) throw failure('CONFLICT');
       const finalizedAtMs = textTimestamp(proof.finalized_at_ms);
+      const currentFailures = integer(proof.consecutive_technical_failures, 0, 32_767);
+      if (currentFailures > 0) {
+        const latestFaultResult = await client.query(`SELECT
+          trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms
+          FROM execution_fault_ledger
+          WHERE generation_id=$1 AND reason_code IN (
+            'EXECUTION_BUILD_FAILED','BUY_SIMULATION_FAILED','SELL_SIMULATION_FAILED',
+            'EXECUTION_PROVIDER_FAILED','CONFIRMATION_TIMEOUT','RECONCILIATION_REQUIRED'
+          )
+          ORDER BY observed_at DESC,fault_id DESC LIMIT 1`, [input.generationId]);
+        const latestFault = exactRow(singleRow(latestFaultResult), ['observed_at_ms'] as const);
+        if (finalizedAtMs <= textTimestamp(latestFault.observed_at_ms)) {
+          throw failure('CONFLICT');
+        }
+      }
       const intentId = patternedText(proof.intent_id, /^execution_intent_[0-9a-f]{64}$/u);
       const fingerprint = hash([
         'execution-reconciled-success-ledger-v1', faultId, input.evidenceId,
@@ -726,7 +750,8 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       const update = await client.query(`UPDATE execution_wallet_risk_state SET
         state_revision=$2::BIGINT,consecutive_technical_failures=0,
         last_technical_failure_reason_code=NULL,
-        updated_at=TIMESTAMPTZ 'epoch' + ($3::BIGINT * INTERVAL '1 millisecond')
+        updated_at=GREATEST(updated_at,
+          TIMESTAMPTZ 'epoch' + ($3::BIGINT * INTERVAL '1 millisecond'))
         WHERE generation_id=$1 AND state_revision=$4::BIGINT`, [
         input.generationId, (revision + 1n).toString(), finalizedAtMs, revision.toString(),
       ]);
@@ -912,13 +937,16 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       const releasesExposure = evidence.result === 'NO_EFFECT';
       const riskUpdate = await client.query(`UPDATE execution_wallet_risk_state SET
         state_revision=$2::BIGINT,
-        reserved_exposure_raw=$3::NUMERIC,open_positions=$4,unknown_block=$5,
-        updated_at=TIMESTAMPTZ 'epoch' + ($6::BIGINT * INTERVAL '1 millisecond')
-        WHERE generation_id=$1 AND state_revision=$7::BIGINT`, [
+        reserved_exposure_raw=$3::NUMERIC,open_positions=$4,
+        unknown_block=EXISTS (
+          SELECT 1 FROM execution_exposure_reservations
+          WHERE generation_id=$1 AND state='UNKNOWN_HELD'
+        ),
+        updated_at=TIMESTAMPTZ 'epoch' + ($5::BIGINT * INTERVAL '1 millisecond')
+        WHERE generation_id=$1 AND state_revision=$6::BIGINT`, [
         generationId, (riskRevision + 1n).toString(),
         (releasesExposure ? reservedExposure - maximumAmount : reservedExposure).toString(),
         releasesExposure ? openPositions - 1 : openPositions,
-        evidence.result === 'MISMATCH' || evidence.result === 'UNKNOWN',
         evidence.finalizedAtMs ?? evidence.observedAtMs, riskRevision.toString(),
       ]);
       if (riskUpdate.rowCount !== 1) throw failure('CONFLICT');
@@ -1155,7 +1183,7 @@ function decodeRiskState(value: unknown): Readonly<{
       'state_revision', 'reserved_exposure_raw', 'open_positions',
       'consecutive_technical_failures', 'last_technical_failure_reason_code', 'unknown_block',
     ] as const);
-    const consecutiveTechnicalFailures = integer(row.consecutive_technical_failures, 0, 2);
+    const consecutiveTechnicalFailures = integer(row.consecutive_technical_failures, 0, 32_767);
     const lastTechnicalFailureReasonCode = row.last_technical_failure_reason_code === null
       ? null : enumValue(row.last_technical_failure_reason_code, [
         'EXECUTION_BUILD_FAILED', 'BUY_SIMULATION_FAILED', 'SELL_SIMULATION_FAILED',

@@ -311,7 +311,7 @@ function timestampsFrom(value: unknown): readonly number[] {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
     if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw invalid();
     const observedAtMs = timestamp(descriptor.value);
-    if (index > 0 && observedAtMs <= (result[index - 1] ?? -1)) throw invalid();
+    if (index > 0 && observedAtMs < (result[index - 1] ?? -1)) throw invalid();
     result.push(observedAtMs);
   }
   return Object.freeze(result);

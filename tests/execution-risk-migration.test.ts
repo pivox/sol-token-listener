@@ -30,6 +30,7 @@ void test('migration 034 defines the eleven closed durable risk tables', async (
   }
   assert.equal((sql.match(/CREATE TABLE IF NOT EXISTS execution_/gu) ?? []).length, 11);
   assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS execution_wallet_generations_active_unique/u);
+  assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS execution_provider_usage_snapshots_current_provider_unique\s+ON execution_provider_usage_snapshots \(provider_id\)\s+WHERE superseded_at IS NULL/u);
   assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS execution_exposure_reservations_position_side_active_unique/u);
   assert.match(sql, /FOREIGN KEY \(intent_id\)\s*REFERENCES execution_intents \(id\) ON DELETE RESTRICT/u);
   assert.match(sql, /FOREIGN KEY \(intent_id, attempt_number\)\s*REFERENCES execution_attempts \(intent_id, attempt_number\) ON DELETE RESTRICT/u);

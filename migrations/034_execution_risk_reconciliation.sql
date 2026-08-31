@@ -379,6 +379,10 @@ CREATE INDEX IF NOT EXISTS execution_provider_usage_snapshots_period_idx
   ON execution_provider_usage_snapshots
     (provider_id, billing_period_started_at DESC, measured_at DESC);
 
+CREATE UNIQUE INDEX IF NOT EXISTS execution_provider_usage_snapshots_current_provider_unique
+  ON execution_provider_usage_snapshots (provider_id)
+  WHERE superseded_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS execution_provider_usage_counters (
   operation_id TEXT PRIMARY KEY,
   payload_version SMALLINT NOT NULL DEFAULT 1,

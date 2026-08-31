@@ -101,6 +101,16 @@ void test('blocks entry after three recent 429 events and prioritizes exit when 
   assert.equal(unavailable.reasonCode, 'PROVIDER_EXIT_ONLY');
 });
 
+void test('counts distinct rate-limit events that share the same millisecond', () => {
+  const rateLimited = evaluateProviderQuota(quotaInput({
+    nowMs: 50_000,
+    consecutiveRateLimits: [49_999, 49_999, 49_999],
+  }));
+  assert.equal(rateLimited.recentRateLimitCount, 3);
+  assert.equal(rateLimited.state, 'ENTRY_BLOCKED');
+  assert.equal(rateLimited.reasonCode, 'PROVIDER_ENTRY_LIMIT_REACHED');
+});
+
 void test('fails UNKNOWN on non-monotone usage, plan changes and regressed billing periods', () => {
   const previous = createProviderUsageSnapshot(snapshotInput());
   for (const snapshot of [

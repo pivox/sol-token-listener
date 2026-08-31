@@ -1,6 +1,6 @@
 # Risque, quota et réconciliation Executor V1 — conception #51-E
 
-**Version de spécification :** 1.0.10
+**Version de spécification :** 1.0.11
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,12 @@
 
 ## Historique des versions
 
+- **1.0.11 — 2026-08-31 :** sérialise le premier snapshot de chaque provider
+  et garantit son unicité courante, conserve les consommations locales d'une
+  même période après remplacement du snapshot, accepte les événements 429
+  distincts partageant une milliseconde, recalcule le blocage ambigu sur toutes
+  les réservations, interdit à une preuve ancienne d'effacer une faute plus
+  récente et relit tout compteur de fautes durable valide jusqu'à 32 767.
 - **1.0.10 — 2026-08-31 :** interdit l'admission sur un snapshot wallet ou
   provider supplanté, lie chaque consommation provider à l'identité durable
   complète de son snapshot courant et fournit au domaine les timestamps 429
@@ -320,6 +326,9 @@ précédente. `billingPeriodId` reste opaque et n'est jamais trié lexicalement.
 Dans une même période, les bornes, le plan et la limite sont immuables, l'heure
 de mesure avance strictement et l'usage ne régresse pas. Le snapshot provider
 précédent est alors marqué supplanté et purgeable après quatre heures.
+La création et le remplacement sont sérialisés par provider sur une identité
+stable ; un index partiel garantit qu'un provider ne possède jamais plus d'un
+snapshot courant, y compris lors de sa toute première mesure concurrente.
 Un snapshot supplanté reste disponible uniquement pour audit et replay exact :
 il ne peut plus servir à une admission ou recevoir une nouvelle consommation.
 
@@ -330,6 +339,10 @@ la dernière mesure par catégories `ENTRY`, `EXIT`, `CONFIRMATION`,
 Chaque compteur référence par clé étrangère composite le `snapshot_id`, le
 provider et la période exacts du snapshot courant. Une divergence ou une
 écriture sur un snapshot supplanté échoue sans consommation partielle.
+À l'admission, les consommations sont agrégées par provider et période depuis
+`measuredAt` inclus du snapshot courant. Elles restent donc comptées lorsqu'un
+snapshot plus récent de la même période remplace celui auquel l'opération était
+initialement liée.
 
 ```text
 remaining = limit - measuredUsed - localUsedSinceMeasurement
@@ -349,9 +362,9 @@ le coût d'une nouvelle entrée, et `EXIT_ONLY` lorsque le restant est inférieu
 Trois 429 consécutifs dans une fenêtre glissante de 30 secondes créent au
 minimum `ENTRY_BLOCKED`. L'épuisement de tous les endpoints ou l'impossibilité
 de garantir `protected` produit `EXIT_ONLY` ou `UNKNOWN` selon la preuve
-disponible. Les URL et credentials ne sont jamais persistés ni journalisés.
-Le repository fournit ces timestamps au domaine dans un ordre strictement
-croissant afin que la validation monotone reste déterministe.
+disponible. Les événements sont ordonnés de façon déterministe par date puis
+identifiant ; des événements distincts au même milliseconde sont tous comptés.
+Les URL et credentials ne sont jamais persistés ni journalisés.
 
 ## 9. Réconciliation
 
@@ -393,6 +406,9 @@ durables ; les seules valeurs fournies par l'appelant ne font jamais autorité.
 `BALANCE_MISMATCH`, `RESIDUAL_TOKEN_BALANCE` ou `DOUBLE_ORDER_SUSPECTED` et
 bloque tout BUY. `UNKNOWN` conserve également la réservation et ne peut jamais
 devenir une preuve de non-effet par TTL ou simple absence courante.
+Après chaque réconciliation, `unknown_block` est recalculé depuis toutes les
+réservations `UNKNOWN_HELD` de la génération. Résoudre une autre réservation
+ne peut donc pas lever un blocage ambigu encore actif.
 
 Plusieurs observations `UNKNOWN` strictement plus récentes peuvent être
 ajoutées pour une même tentative. Une preuve terminale `MATCHED` ou `NO_EFFECT`
@@ -425,6 +441,11 @@ phase bloquent les nouveaux BUY. Seuls build, simulation, provider,
 confirmation et réconciliation comptent. Une intention entièrement finalisée
 et réconciliée remet le compteur à zéro ; un succès de quote, un restart ou un
 simple délai ne le remet pas à zéro.
+La finalisation doit être strictement postérieure à la dernière faute technique
+comptée. Une preuve plus ancienne est rejetée et ne peut ni remettre le compteur
+à zéro ni faire régresser `updated_at`. Le stockage et le décodage acceptent la
+plage `SMALLINT` non négative jusqu'à 32 767 ; le gate BUY reste actif dès le
+seuil policy de deux fautes.
 
 #51-E ne déclenche aucun retry RPC. Il produit seulement une décision
 `DO_NOT_RETRY | RETRY_PRE_SIGNATURE | RECONCILE_ONLY | RETRY_EXACT_BYTES` et
