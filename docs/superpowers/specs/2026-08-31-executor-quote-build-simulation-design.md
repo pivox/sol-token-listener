@@ -1,6 +1,6 @@
 # Exécuteur quote, build et simulation V1 — conception #51-D
 
-**Version de spécification :** 1.0.8
+**Version de spécification :** 1.0.9
 
 **Date :** 2026-08-31
 
@@ -12,6 +12,10 @@
 
 ## Historique des versions
 
+- **1.0.9 — 2026-08-31 :** réserve les cinq phases PostgreSQL bornées d'un
+  renouvellement complet — acquisition, `BEGIN`, verrouillage, `UPDATE` et
+  `COMMIT` — dans chaque intervalle de lease ; le défaut `simulation-only`
+  passe à 35 secondes tandis que le défaut historique `dry-run` reste inchangé.
 - **1.0.8 — 2026-08-31 :** ajoute un renouvellement immédiatement après
   `beginAttempt`, avant toute construction de session provider, afin de sortir
   transition et création/récupération de tentative de l'intervalle RPC initial.
@@ -182,6 +186,8 @@ Le parseur conserve `dry-run` et ajoute :
 
 ```dotenv
 EXECUTOR_MODE=simulation-only
+EXECUTOR_LEASE_MS=35000
+EXECUTOR_DB_STATEMENT_TIMEOUT_MS=3000
 EXECUTOR_PUBLIC_KEY=
 EXECUTOR_RPC_PROVIDER_ID=primary
 SOLANA_HTTP_RPC_URL=
@@ -217,11 +223,14 @@ budget `6..16` appels. Le provider ID est un identifiant positionnel ASCII de
 ni fragment.
 
 En `simulation-only`, la configuration impose également
-`3 * EXECUTOR_RPC_TIMEOUT_MS + EXECUTOR_DB_STATEMENT_TIMEOUT_MS + 1000
+`3 * EXECUTOR_RPC_TIMEOUT_MS + 5 * EXECUTOR_DB_STATEMENT_TIMEOUT_MS + 1000
 <= EXECUTOR_LEASE_MS`. Les trois timeouts couvrent blockhash, fee et simulation
-entre le renouvellement `BEFORE_SIMULATION` et celui `BEFORE_COMMIT`; la marge
-fixe absorbe l'ordonnancement local sans prétendre prolonger le lease côté
-application.
+entre le renouvellement `BEFORE_SIMULATION` et celui `BEFORE_COMMIT`. Les cinq
+timeouts DB couvrent séparément l'acquisition de connexion, `BEGIN`, le
+`SELECT ... FOR UPDATE`, l'`UPDATE` et `COMMIT` du renouvellement suivant ; la
+marge fixe absorbe l'ordonnancement local sans prétendre prolonger le lease
+côté application. Son défaut est 35 secondes en `simulation-only`; le défaut
+historique reste 30 secondes en `dry-run`.
 
 `EXECUTOR_PUBLIC_KEY` est une adresse publique uniquement. L'URL RPC peut
 contenir un credential opérateur mais n'est jamais journalisée, persistée ou

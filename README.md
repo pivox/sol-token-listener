@@ -164,6 +164,8 @@ soumission. Sa configuration publique est :
 
 ```dotenv
 EXECUTOR_MODE=simulation-only
+EXECUTOR_LEASE_MS=35000
+EXECUTOR_DB_STATEMENT_TIMEOUT_MS=3000
 EXECUTOR_PUBLIC_KEY=<ADRESSE_PUBLIQUE_BASE58>
 EXECUTOR_RPC_PROVIDER_ID=primary
 SOLANA_HTTP_RPC_URL=https://<endpoint-qualifie>
@@ -192,8 +194,11 @@ signer additionnel ou compte arbitraire n'est accepté.
 Chaque tentative reste sur un seul endpoint positionnel. Elle vérifie le hash
 de genesis attendu, n'effectue ni retry automatique ni failover au milieu de
 quote → build → simulation, et échoue fermé sur timeout, 429 ou réponse
-invalide. Le lease doit couvrir trois timeouts RPC séquentiels, un timeout DB
-et une marge fixe de 1 seconde ; une configuration plus courte est rejetée.
+invalide. Le lease doit couvrir trois timeouts RPC séquentiels, les cinq phases
+bornées du renouvellement PostgreSQL (acquisition, `BEGIN`, verrouillage,
+`UPDATE`, `COMMIT`) et une marge fixe de 1 seconde ; une configuration plus
+courte est rejetée. Le défaut `simulation-only` est donc 35 secondes ; le
+défaut historique `dry-run` reste 30 secondes.
 La simulation utilise une transaction v0 éphémère avec une signature
 nulle, `sigVerify=false` et aucune méthode d'envoi. Le message, la transaction
 et les instructions sérialisées ne sont jamais persistés.

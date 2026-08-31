@@ -51,7 +51,7 @@ void test('parses the exact frozen simulation-only defaults without any signing 
     mode: 'simulation-only',
     databaseUrl: DATABASE_URL,
     pollMs: 1_000,
-    leaseMs: 30_000,
+    leaseMs: 35_000,
     databaseStatementTimeoutMs: 3_000,
     shutdownGraceMs: 10_000,
     executorPublicKey: EXECUTOR_PUBLIC_KEY,
@@ -153,21 +153,21 @@ void test('accepts canonical simulation overrides at inclusive safety boundaries
   assert.equal(config.maxRpcCallsPerAttempt, 6);
 });
 
-void test('requires the lease to cover three sequential RPC timeouts and the commit renewal', () => {
+void test('requires the lease to cover three RPC timeouts and all five renewal DB phases', () => {
   const accepted = parseExecutorConfig(simulationEnvironment({
     EXECUTOR_LEASE_MS: '30000',
     EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
-    EXECUTOR_RPC_TIMEOUT_MS: '8666',
+    EXECUTOR_RPC_TIMEOUT_MS: '4666',
   }));
   if (accepted.mode !== 'simulation-only') assert.fail('Expected simulation-only config.');
-  assert.equal(accepted.rpcTimeoutMs, 8_666);
+  assert.equal(accepted.rpcTimeoutMs, 4_666);
 
   for (const overrides of [
     { EXECUTOR_LEASE_MS: '30000', EXECUTOR_RPC_TIMEOUT_MS: '60000' },
     {
       EXECUTOR_LEASE_MS: '30000',
       EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
-      EXECUTOR_RPC_TIMEOUT_MS: '8667',
+      EXECUTOR_RPC_TIMEOUT_MS: '4667',
     },
   ]) {
     assertConfigFailure(simulationEnvironment(overrides));

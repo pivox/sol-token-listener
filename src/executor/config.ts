@@ -60,6 +60,7 @@ const SECRET_KEYS = Object.freeze([
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const QUOTE_MINT_ALLOWLIST = Object.freeze<[string]>([WSOL_MINT]);
 const RPC_LEASE_SAFETY_MARGIN_MS = 1_000;
+const LEASE_RENEWAL_DB_PHASE_COUNT = 5;
 
 export function parseExecutorConfig(
   environment: NodeJS.ProcessEnv | Record<string, string | undefined>,
@@ -80,7 +81,8 @@ export function parseExecutorConfig(
     if (databaseUrl === undefined || databaseUrl.trim().length === 0) throw invalid();
 
     const pollMs = duration(environment, 'EXECUTOR_POLL_MS', 1_000, 100, 60_000);
-    const leaseMs = duration(environment, 'EXECUTOR_LEASE_MS', 30_000, 3_000, 300_000);
+    const leaseDefaultMs = mode === 'simulation-only' ? 35_000 : 30_000;
+    const leaseMs = duration(environment, 'EXECUTOR_LEASE_MS', leaseDefaultMs, 3_000, 300_000);
     const databaseStatementTimeoutMs = duration(
       environment, 'EXECUTOR_DB_STATEMENT_TIMEOUT_MS', 3_000, 100, 10_000,
     );
@@ -129,8 +131,10 @@ export function parseExecutorConfig(
     const rpcTimeoutMs = integer(
       environment, 'EXECUTOR_RPC_TIMEOUT_MS', '5000', 1, 60_000,
     );
-    if (rpcTimeoutMs * 3 + databaseStatementTimeoutMs + RPC_LEASE_SAFETY_MARGIN_MS
-      > leaseMs) throw invalid();
+    const renewalTimeoutBudgetMs = databaseStatementTimeoutMs * LEASE_RENEWAL_DB_PHASE_COUNT;
+    if (rpcTimeoutMs * 3 + renewalTimeoutBudgetMs + RPC_LEASE_SAFETY_MARGIN_MS > leaseMs) {
+      throw invalid();
+    }
     const maxRpcCallsPerAttempt = integer(
       environment, 'EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT', '8', 6, 16,
     );

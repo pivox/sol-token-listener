@@ -205,7 +205,7 @@ void test('simulation-only graph keeps build receipt, plan builders and gateway 
   );
 });
 
-void test('official SDK bridges expose only the exact spec 1.0.8 surfaces', async () => {
+void test('official SDK bridges expose only the exact spec 1.0.9 surfaces', async () => {
   const pumpFunSurface = {
     runtime: [
       'GLOBAL_PDA', 'PUMP_FEE_CONFIG_PDA', 'PUMP_FEE_PROGRAM_ID', 'PUMP_PROGRAM_ID',
@@ -525,7 +525,7 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
   assert.deepEqual(executorEnvironment, {
     EXECUTOR_MODE: 'dry-run',
     EXECUTOR_POLL_MS: '1000',
-    EXECUTOR_LEASE_MS: '30000',
+    EXECUTOR_LEASE_MS: '35000',
     EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
     EXECUTOR_SHUTDOWN_GRACE_MS: '10000',
     EXECUTOR_PUBLIC_KEY: '',
