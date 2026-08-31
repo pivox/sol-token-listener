@@ -14,7 +14,7 @@ worker imports it. No runtime consumes an armament before #51-G.
 
 **Normative design:**
 `docs/superpowers/specs/2026-08-31-executor-preflight-operations-design.md`
-version 1.0.0, parent version 1.6.4.
+version 1.0.2, parent version 1.6.4.
 
 ## Task 1 — Closed domain contracts
 
@@ -30,7 +30,7 @@ version 1.0.0, parent version 1.6.4.
 ## Task 2 — Migration 035
 
 - Add `migrations/035_execution_preflight_operations.sql` with seven closed
-  tables from spec 1.0.0.
+  tables from spec 1.0.2.
 - Use relational gate rows, not JSON evidence.
 - Add partial uniqueness for one current control state and one active armament
   per generation.

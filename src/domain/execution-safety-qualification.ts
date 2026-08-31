@@ -14,6 +14,10 @@ const EVIDENCE_KEYS = Object.freeze([
   'payloadVersion', 'gateId', 'status', 'evidenceType', 'evidenceId',
   'evidenceFingerprint', 'observedAtMs', 'expiresAtMs',
 ] as const);
+const MAINNET_SIMULATION_BINDING_KEYS = Object.freeze([
+  'artifactId', 'resultFingerprint', 'buildHash', 'configurationFingerprint',
+  'strategyFingerprint', 'walletPublicKey', 'genesisHash', 'providerId',
+] as const);
 const PHASES = Object.freeze(['CANARY', 'MICRO_LIVE', 'PILOT'] as const);
 
 export const EXECUTION_SAFETY_GATE_IDS = Object.freeze([
@@ -82,6 +86,29 @@ export class ExecutionSafetyQualificationValidationError extends TypeError {
   public constructor() {
     super('Invalid execution safety qualification.');
     this.name = 'ExecutionSafetyQualificationValidationError';
+  }
+}
+
+export function createMainnetSimulationEvidenceFingerprint(input: unknown): string {
+  try {
+    const record = exactRecord(input, MAINNET_SIMULATION_BINDING_KEYS);
+    return hash([
+      'execution-mainnet-simulation-evidence-v1',
+      patternedText(
+        record.artifactId,
+        /^execution_simulation_artifact_[0-9a-f]{64}$/u,
+        94,
+      ),
+      fingerprint(record.resultFingerprint),
+      fingerprint(record.buildHash),
+      fingerprint(record.configurationFingerprint),
+      fingerprint(record.strategyFingerprint),
+      publicKey(record.walletPublicKey),
+      publicKey(record.genesisHash),
+      identifier(record.providerId),
+    ]);
+  } catch {
+    throw invalid();
   }
 }
 

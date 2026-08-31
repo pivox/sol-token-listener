@@ -335,3 +335,106 @@ CREATE TABLE IF NOT EXISTS execution_activation_events (
 
 CREATE INDEX IF NOT EXISTS execution_activation_events_armament_occurred_idx
   ON execution_activation_events (armament_id, occurred_at, event_id);
+
+CREATE OR REPLACE FUNCTION reject_execution_operations_immutable_update()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'execution operations payload is immutable'
+    USING ERRCODE = '55000';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS execution_safety_qualifications_immutable
+  ON execution_safety_qualifications;
+CREATE TRIGGER execution_safety_qualifications_immutable
+  BEFORE UPDATE ON execution_safety_qualifications
+  FOR EACH ROW EXECUTE FUNCTION reject_execution_operations_immutable_update();
+
+DROP TRIGGER IF EXISTS execution_safety_gate_evidence_immutable
+  ON execution_safety_gate_evidence;
+CREATE TRIGGER execution_safety_gate_evidence_immutable
+  BEFORE UPDATE ON execution_safety_gate_evidence
+  FOR EACH ROW EXECUTE FUNCTION reject_execution_operations_immutable_update();
+
+DROP TRIGGER IF EXISTS execution_control_events_immutable
+  ON execution_control_events;
+CREATE TRIGGER execution_control_events_immutable
+  BEFORE UPDATE ON execution_control_events
+  FOR EACH ROW EXECUTE FUNCTION reject_execution_operations_immutable_update();
+
+DROP TRIGGER IF EXISTS execution_activation_events_immutable
+  ON execution_activation_events;
+CREATE TRIGGER execution_activation_events_immutable
+  BEFORE UPDATE ON execution_activation_events
+  FOR EACH ROW EXECUTE FUNCTION reject_execution_operations_immutable_update();
+
+CREATE OR REPLACE FUNCTION guard_execution_operator_authorization_update()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.authorization_id IS DISTINCT FROM OLD.authorization_id
+    OR NEW.payload_version IS DISTINCT FROM OLD.payload_version
+    OR NEW.authorization_fingerprint IS DISTINCT FROM OLD.authorization_fingerprint
+    OR NEW.generation_id IS DISTINCT FROM OLD.generation_id
+    OR NEW.action IS DISTINCT FROM OLD.action
+    OR NEW.phase IS DISTINCT FROM OLD.phase
+    OR NEW.context_fingerprint IS DISTINCT FROM OLD.context_fingerprint
+    OR NEW.nonce_hash IS DISTINCT FROM OLD.nonce_hash
+    OR NEW.operator_id IS DISTINCT FROM OLD.operator_id
+    OR NEW.issued_at IS DISTINCT FROM OLD.issued_at
+    OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
+    OR OLD.consumed_at IS NOT NULL
+    OR NEW.consumed_at IS NULL
+  THEN
+    RAISE EXCEPTION 'execution operator authorization identity is immutable'
+      USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS execution_operator_authorizations_identity_immutable
+  ON execution_operator_authorizations;
+CREATE TRIGGER execution_operator_authorizations_identity_immutable
+  BEFORE UPDATE ON execution_operator_authorizations
+  FOR EACH ROW EXECUTE FUNCTION guard_execution_operator_authorization_update();
+
+CREATE OR REPLACE FUNCTION guard_execution_activation_armament_update()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.armament_id IS DISTINCT FROM OLD.armament_id
+    OR NEW.payload_version IS DISTINCT FROM OLD.payload_version
+    OR NEW.armament_fingerprint IS DISTINCT FROM OLD.armament_fingerprint
+    OR NEW.qualification_id IS DISTINCT FROM OLD.qualification_id
+    OR NEW.qualification_fingerprint IS DISTINCT FROM OLD.qualification_fingerprint
+    OR NEW.generation_id IS DISTINCT FROM OLD.generation_id
+    OR NEW.authorization_id IS DISTINCT FROM OLD.authorization_id
+    OR NEW.phase IS DISTINCT FROM OLD.phase
+    OR NEW.build_hash IS DISTINCT FROM OLD.build_hash
+    OR NEW.configuration_fingerprint IS DISTINCT FROM OLD.configuration_fingerprint
+    OR NEW.strategy_fingerprint IS DISTINCT FROM OLD.strategy_fingerprint
+    OR NEW.wallet_public_key IS DISTINCT FROM OLD.wallet_public_key
+    OR NEW.cluster IS DISTINCT FROM OLD.cluster
+    OR NEW.genesis_hash IS DISTINCT FROM OLD.genesis_hash
+    OR NEW.provider_id IS DISTINCT FROM OLD.provider_id
+    OR NEW.maximum_buys IS DISTINCT FROM OLD.maximum_buys
+    OR NEW.maximum_capital_lamports IS DISTINCT FROM OLD.maximum_capital_lamports
+    OR NEW.maximum_exposure_bps IS DISTINCT FROM OLD.maximum_exposure_bps
+    OR NEW.maximum_open_positions IS DISTINCT FROM OLD.maximum_open_positions
+    OR NEW.maximum_holding_ms IS DISTINCT FROM OLD.maximum_holding_ms
+    OR NEW.operator_id IS DISTINCT FROM OLD.operator_id
+    OR NEW.operator_reason IS DISTINCT FROM OLD.operator_reason
+    OR NEW.armed_at IS DISTINCT FROM OLD.armed_at
+    OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
+  THEN
+    RAISE EXCEPTION 'execution activation armament identity is immutable'
+      USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS execution_activation_armaments_identity_immutable
+  ON execution_activation_armaments;
+CREATE TRIGGER execution_activation_armaments_identity_immutable
+  BEFORE UPDATE ON execution_activation_armaments
+  FOR EACH ROW EXECUTE FUNCTION guard_execution_activation_armament_update();

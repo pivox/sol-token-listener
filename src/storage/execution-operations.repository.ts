@@ -8,6 +8,7 @@ import {
   type ExecutionOperatorAuthorizationV1,
 } from '../domain/execution-operations.js';
 import {
+  createMainnetSimulationEvidenceFingerprint,
   createSafetyQualification,
   type ExecutionSafetyQualificationV1,
 } from '../domain/execution-safety-qualification.js';
@@ -60,15 +61,16 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
   ): Promise<ExecutionSafetyQualificationV1> {
     const qualification = qualificationFrom(input);
     return this.transaction(async (client) => {
-      const existing = await client.query(`SELECT qualification_fingerprint,
-        (SELECT COUNT(*)::INTEGER FROM execution_safety_gate_evidence evidence
-          WHERE evidence.qualification_id=qualification.qualification_id) AS gate_count
-        FROM execution_safety_qualifications qualification WHERE qualification_id=$1`,
+      const existing = await client.query(`SELECT qualification_id
+        FROM execution_safety_qualifications WHERE qualification_id=$1`,
       [qualification.qualificationId]);
       if (existing.rows.length === 1) {
-        const row = exactRow(existing.rows[0], ['qualification_fingerprint', 'gate_count'] as const);
-        if (row.qualification_fingerprint !== qualification.qualificationFingerprint
-          || row.gate_count !== 11) throw failure('CONFLICT');
+        const row = exactRow(existing.rows[0], ['qualification_id'] as const);
+        const stored = await qualificationForArm(client, String(row.qualification_id));
+        if (stored.qualificationId !== qualification.qualificationId
+          || stored.qualificationFingerprint !== qualification.qualificationFingerprint) {
+          throw failure('CONFLICT');
+        }
         return qualification;
       }
       if (existing.rows.length !== 0) throw failure('INVALID_DATA');
@@ -86,6 +88,7 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
         || generation.retired_at !== null) throw failure('CONFLICT');
       if (qualification.qualifiedAtMs > databaseNowMs
         || qualification.expiresAtMs <= databaseNowMs) throw failure('PREFLIGHT_EXPIRED');
+      await verifyMainnetSimulationEvidence(client, qualification);
       const inserted = await client.query(`INSERT INTO execution_safety_qualifications (
         qualification_id,payload_version,evaluator_version,qualification_fingerprint,
         phase,build_hash,configuration_fingerprint,strategy_fingerprint,generation_id,
@@ -141,7 +144,11 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
         TIMESTAMPTZ 'epoch'+($10::BIGINT*INTERVAL '1 millisecond'),
         TIMESTAMPTZ 'epoch'+(($10::BIGINT+14400000)*INTERVAL '1 millisecond')
         FROM execution_wallet_generations
-        WHERE generation_id=$3 AND retired_at IS NULL`, [
+        WHERE generation_id=$3 AND retired_at IS NULL
+          AND TIMESTAMPTZ 'epoch'+($9::BIGINT*INTERVAL '1 millisecond')
+            <= statement_timestamp()
+          AND TIMESTAMPTZ 'epoch'+($10::BIGINT*INTERVAL '1 millisecond')
+            > statement_timestamp()`, [
         authorization.authorizationId, authorization.authorizationFingerprint,
         authorization.generationId, authorization.action, authorization.phase,
         authorization.contextFingerprint, authorization.nonceHash,
@@ -150,6 +157,14 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
       if (result.rowCount !== 1) throw failure('CONFLICT');
       return 'RECORDED';
     });
+  }
+
+  public async readQualification(qualificationId: string): Promise<ExecutionSafetyQualificationV1> {
+    const parsed = patterned(
+      qualificationId,
+      /^execution_safety_qualification_[0-9a-f]{64}$/u,
+    );
+    return this.transaction((client) => qualificationForArm(client, parsed));
   }
 
   public async setStop(
@@ -183,6 +198,7 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
       }
       await insertControlEvent(client, identity, command, state.state, decision.nextState,
         decision.reasonCode ?? 'OPERATOR_ENTRY_STOP', null, null);
+      await terminalizeActiveArmament(client, command.generationId, 'REVOKED', false);
       const updated = await client.query(`UPDATE execution_control_state SET
         state=$2,state_revision=$3::BIGINT,last_event_id=$4,
         updated_at=TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond')
@@ -244,6 +260,7 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
       }
       await insertControlEvent(client, identity, command, state.state, decision.nextState,
         'OPERATOR_RESUME', command.qualificationId, command.authorization.authorizationId);
+      await terminalizeActiveArmament(client, command.generationId, 'REVOKED', false);
       const updated = await client.query(`UPDATE execution_control_state SET
         state='RUNNING',state_revision=$2::BIGINT,last_event_id=$3,
         updated_at=TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond')
@@ -266,6 +283,7 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
         return input;
       }
       await lockGeneration(client, input.generationId);
+      await terminalizeActiveArmament(client, input.generationId, 'EXPIRED', true);
       await ensureControlState(client, input.generationId);
       const state = await lockedControlState(client, input.generationId);
       if (state.state !== 'RUNNING') throw failure('CONTROL_STOPPED');
@@ -342,6 +360,45 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
   }
 }
 
+async function verifyMainnetSimulationEvidence(
+  client: DatabaseClient,
+  qualification: ExecutionSafetyQualificationV1,
+): Promise<void> {
+  const gate = qualification.gates[10];
+  if (gate?.gateId !== 'MAINNET_PREFLIGHT_SIMULATED') {
+    throw failure('INVALID_DATA');
+  }
+  const artifact = exactRow(singleRow(await client.query(`SELECT result_fingerprint,result_kind,
+    provider_id,executor_public_key,expected_genesis_hash,observed_genesis_hash,
+    configuration_fingerprint,
+    trunc(EXTRACT(EPOCH FROM recorded_at)*1000)::TEXT AS recorded_at_ms
+    FROM execution_simulation_artifacts WHERE artifact_id=$1`, [gate.evidenceId])), [
+    'result_fingerprint', 'result_kind', 'provider_id', 'executor_public_key',
+    'expected_genesis_hash', 'observed_genesis_hash', 'configuration_fingerprint',
+    'recorded_at_ms',
+  ] as const);
+  const recordedAtMs = timestampText(artifact.recorded_at_ms);
+  const expectedFingerprint = createMainnetSimulationEvidenceFingerprint({
+    artifactId: gate.evidenceId,
+    resultFingerprint: artifact.result_fingerprint,
+    buildHash: qualification.buildHash,
+    configurationFingerprint: qualification.configurationFingerprint,
+    strategyFingerprint: qualification.strategyFingerprint,
+    walletPublicKey: qualification.walletPublicKey,
+    genesisHash: qualification.genesisHash,
+    providerId: qualification.providerId,
+  });
+  if (artifact.result_kind !== 'SUCCESS'
+    || artifact.provider_id !== qualification.providerId
+    || artifact.executor_public_key !== qualification.walletPublicKey
+    || artifact.expected_genesis_hash !== qualification.genesisHash
+    || artifact.observed_genesis_hash !== qualification.genesisHash
+    || artifact.configuration_fingerprint !== qualification.configurationFingerprint
+    || recordedAtMs !== gate.observedAtMs
+    || recordedAtMs > qualification.qualifiedAtMs
+    || gate.evidenceFingerprint !== expectedFingerprint) throw failure('CONFLICT');
+}
+
 async function readStatus(
   client: DatabaseClient,
   generationId: string,
@@ -361,7 +418,8 @@ async function readStatus(
   const armament = await client.query(`SELECT armament_id,phase,
     trunc(EXTRACT(EPOCH FROM expires_at)*1000)::TEXT AS expires_at_ms
     FROM execution_activation_armaments WHERE generation_id=$1
-      AND state IN ('ARMED','LOCKED') ORDER BY armed_at DESC LIMIT 1`, [generationId]);
+      AND state IN ('ARMED','LOCKED') AND expires_at > statement_timestamp()
+    ORDER BY armed_at DESC LIMIT 1`, [generationId]);
   const qualificationRow = qualification.rows.length === 0 ? null
     : exactRow(qualification.rows[0], ['qualification_id', 'expires_at_ms'] as const);
   const armamentRow = armament.rows.length === 0 ? null
@@ -386,6 +444,50 @@ async function readStatus(
     activeArmamentPhase: phase,
     activeArmamentExpiresAtMs: armamentRow === null ? null : timestampText(armamentRow.expires_at_ms),
   });
+}
+
+async function terminalizeActiveArmament(
+  client: DatabaseClient,
+  generationId: string,
+  nextState: 'REVOKED' | 'EXPIRED',
+  expiredOnly: boolean,
+): Promise<void> {
+  const result = await client.query(`SELECT armament_id,state,state_revision::TEXT AS revision,
+    trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms
+    FROM execution_activation_armaments WHERE generation_id=$1
+      AND state IN ('ARMED','LOCKED')
+      AND ($2::BOOLEAN=FALSE OR expires_at <= statement_timestamp())
+    FOR UPDATE`, [generationId, expiredOnly]);
+  if (result.rows.length > 1) throw failure('INVALID_DATA');
+  if (result.rows.length === 0) return;
+  const row = exactRow(result.rows[0], ['armament_id', 'state', 'revision', 'now_ms'] as const);
+  if ((row.state !== 'ARMED' && row.state !== 'LOCKED')
+    || typeof row.armament_id !== 'string') throw failure('INVALID_DATA');
+  const revision = unsignedBigint(row.revision);
+  const occurredAtMs = timestampText(row.now_ms);
+  const updated = await client.query(`UPDATE execution_activation_armaments SET
+    state=$2,state_revision=$3::BIGINT,
+    terminal_at=TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond'),
+    purge_after=TIMESTAMPTZ 'epoch'+(($4::BIGINT+14400000)*INTERVAL '1 millisecond')
+    WHERE armament_id=$1 AND state=$5 AND state_revision=$6::BIGINT`, [
+    row.armament_id, nextState, (revision + 1n).toString(), occurredAtMs,
+    row.state, revision.toString(),
+  ]);
+  if (updated.rowCount !== 1) throw failure('CONFLICT');
+  const reasonCode = nextState === 'EXPIRED' ? 'ARMAMENT_EXPIRED' : 'ARMAMENT_REVOKED';
+  const eventFingerprint = hash([
+    'execution-activation-event-v1', row.armament_id, row.state,
+    nextState, reasonCode, occurredAtMs,
+  ]);
+  const event = await client.query(`INSERT INTO execution_activation_events (
+    event_id,payload_version,event_fingerprint,armament_id,generation_id,
+    previous_state,next_state,reason_code,occurred_at
+  ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,
+    TIMESTAMPTZ 'epoch'+($8::BIGINT*INTERVAL '1 millisecond'))`, [
+    `execution_activation_event_${eventFingerprint}`, eventFingerprint,
+    row.armament_id, generationId, row.state, nextState, reasonCode, occurredAtMs,
+  ]);
+  if (event.rowCount !== 1) throw failure('INVALID_DATA');
 }
 
 async function ensureControlState(client: DatabaseClient, generationId: string): Promise<void> {
@@ -449,6 +551,7 @@ async function consumeAuthorization(
     WHERE authorization_id=$1 AND authorization_fingerprint=$2
       AND generation_id=$3 AND action=$4 AND phase IS NOT DISTINCT FROM $6
       AND context_fingerprint=$7 AND operator_id=$8 AND consumed_at IS NULL
+      AND issued_at <= TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond')
       AND expires_at >= TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond')`, [
     authorization.authorizationId, authorization.authorizationFingerprint,
     authorization.generationId, action, consumedAtMs, phase,

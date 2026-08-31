@@ -246,6 +246,7 @@ void test('three recent rate limits create a durable provider entry rejection', 
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, 'execution_risk_rate_limits', async (pool) => {
     const fixture = await createFixture(pool);
+    const rateLimitObservedAtMs = Date.now();
     for (let index = 0; index < 3; index += 1) {
       await fixture.riskRepository.recordRateLimit({
         eventId: `execution_provider_rate_limit_${String(index + 1).repeat(64)}`,
@@ -253,7 +254,7 @@ void test('three recent rate limits create a durable provider entry rejection', 
         providerId: fixture.providerSnapshot.providerId,
         billingPeriodId: fixture.providerSnapshot.billingPeriodId,
         endpointId: `endpoint-${index + 1}`,
-        observedAtMs: NOW_MS - 1,
+        observedAtMs: rateLimitObservedAtMs,
       });
     }
     const created = await fixture.intentRepository.create(intentDraft('rate-limited'));

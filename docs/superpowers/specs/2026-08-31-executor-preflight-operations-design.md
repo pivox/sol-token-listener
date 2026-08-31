@@ -1,6 +1,6 @@
 # Preflight et opérations Executor V1 — conception #51-F
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.0.2
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,11 @@
 
 ## Historique des versions
 
+- **1.0.2 — 2026-08-31 :** correction du contrat CLI documenté pour aligner
+  `live:arm` sur la phase configurée et ses trois options réellement acceptées.
+- **1.0.1 — 2026-08-31 :** liaison vérifiable de la preuve de simulation #51-D,
+  immutabilité SQL des identités, expiration/révocation transactionnelle et
+  purge bornée des payloads #51-F après quatre heures.
 - **1.0.0 — 2026-08-31 :** conception initiale du preflight compensatoire,
   des contrôles opérateur, de l'armement inerte et des rôles PostgreSQL V1.
 
@@ -200,7 +205,10 @@ Les commandes partagent un entrypoint séparé du listener et du worker :
 ```bash
 npm run live:preflight
 npm run live:status
-npm run live:arm -- --phase=canary --maximum-lamports=<u64>
+npm run live:arm -- \
+  --maximum-lamports=<u64> \
+  --holding-ms=<30000..900000> \
+  --reason='<raison opérateur>'
 npm run live:kill-switch -- --mode=entry-stop --reason=OPERATOR_ENTRY_STOP
 npm run live:kill-switch -- --mode=hard-stop --reason=OPERATOR_HARD_STOP
 npm run live:resume

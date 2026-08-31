@@ -34,6 +34,7 @@ export interface ExecutionOperationsRepository {
   persistQualification(
     qualification: ExecutionSafetyQualificationV1,
   ): Promise<ExecutionSafetyQualificationV1>;
+  readQualification(qualificationId: string): Promise<ExecutionSafetyQualificationV1>;
   recordAuthorization(
     authorization: ExecutionOperatorAuthorizationV1,
   ): Promise<'RECORDED' | 'REPLAYED'>;

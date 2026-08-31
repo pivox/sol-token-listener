@@ -8,23 +8,30 @@ import {
 } from '../src/domain/execution-operations.js';
 import {
   createSafetyQualification,
+  createMainnetSimulationEvidenceFingerprint,
   EXECUTION_SAFETY_GATE_IDS,
 } from '../src/domain/execution-safety-qualification.js';
+import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
+import { createExecutionSimulationArtifactDraft } from '../src/domain/execution-simulation.js';
 import { migrateDatabase } from '../src/storage/database.js';
+import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import {
   ExecutionOperationsRepositoryError,
   PostgresExecutionOperationsRepository,
 } from '../src/storage/execution-operations.repository.js';
 import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.repository.js';
+import { PostgresExecutionSimulationRepository } from '../src/storage/execution-simulation.repository.js';
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const publicKey = '11111111111111111111111111111111';
+const hash = '1'.repeat(64);
 
 void test('qualification, resume and inert armament replay durably without live capability', async (context) => {
   const databaseUrl = testDatabaseUrl(context);
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, async (pool) => {
     await migrateDatabase({ pool });
+    const simulation = await seedSuccessfulSimulation(pool);
     await new PostgresExecutionRiskRepository(pool).registerWalletGeneration({
       generationId,
       payloadVersion: 1,
@@ -35,7 +42,7 @@ void test('qualification, resume and inert armament replay durably without live 
     });
     const repository = new PostgresExecutionOperationsRepository(pool);
     const nowMs = Date.now();
-    const qualification = safetyQualification(nowMs);
+    const qualification = safetyQualification(nowMs, simulation);
     assert.deepEqual(await repository.persistQualification(qualification), qualification);
     assert.deepEqual(await repository.persistQualification(qualification), qualification);
 
@@ -48,6 +55,15 @@ void test('qualification, resume and inert armament replay durably without live 
     }, 'ENTRY_STOP');
     assert.equal(stopped.controlState, 'ENTRY_STOP');
     assert.equal(stopped.controlRevision, 1n);
+
+    const futureAuthorization = createOperatorAuthorization({
+      payloadVersion: 1, generationId, action: 'RESUME', phase: null,
+      contextFingerprint: qualification.qualificationFingerprint,
+      nonceHash: '9'.repeat(64), operatorId: 'operator-primary',
+      issuedAtMs: nowMs + 30_000, expiresAtMs: nowMs + 60_000,
+    });
+    await assert.rejects(repository.recordAuthorization(futureAuthorization),
+      isRepositoryError('CONFLICT'));
 
     const resumeAuthorization = createOperatorAuthorization({
       payloadVersion: 1,
@@ -109,6 +125,14 @@ void test('qualification, resume and inert armament replay durably without live 
     assert.equal(status.latestQualificationId, qualification.qualificationId);
     assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
       FROM execution_activation_events`)).rows[0]?.count, 1);
+    for (const query of [
+      `UPDATE execution_safety_qualifications SET build_hash='${'f'.repeat(64)}'`,
+      `UPDATE execution_safety_gate_evidence SET evidence_id='rewritten'`,
+      `UPDATE execution_operator_authorizations SET operator_id='rewritten'`,
+      `UPDATE execution_activation_armaments SET maximum_capital_lamports=1`,
+      `UPDATE execution_control_events SET operator_id='rewritten'`,
+      `UPDATE execution_activation_events SET occurred_at=occurred_at+INTERVAL '1 millisecond'`,
+    ]) await assert.rejects(pool.query(query), /immutable/u);
   });
 });
 
@@ -117,13 +141,14 @@ void test('armament fails closed while stopped and a hard stop cannot be downgra
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, async (pool) => {
     await migrateDatabase({ pool });
+    const simulation = await seedSuccessfulSimulation(pool);
     await new PostgresExecutionRiskRepository(pool).registerWalletGeneration({
       generationId, payloadVersion: 1, walletPublicKey: publicKey,
       cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
     });
     const repository = new PostgresExecutionOperationsRepository(pool);
     const nowMs = Date.now();
-    const qualification = safetyQualification(nowMs);
+    const qualification = safetyQualification(nowMs, simulation);
     await repository.persistQualification(qualification);
     const authorization = createOperatorAuthorization({
       payloadVersion: 1, generationId, action: 'ARM', phase: 'CANARY',
@@ -153,7 +178,101 @@ void test('armament fails closed while stopped and a hard stop cannot be downgra
   });
 });
 
-function safetyQualification(nowMs: number) {
+void test('preflight rejects absent or mismatched #51-D Mainnet simulation evidence', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    await migrateDatabase({ pool });
+    const simulation = await seedSuccessfulSimulation(pool);
+    await new PostgresExecutionRiskRepository(pool).registerWalletGeneration({
+      generationId, payloadVersion: 1, walletPublicKey: publicKey,
+      cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
+    });
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const nowMs = Date.now();
+    const valid = safetyQualification(nowMs, simulation);
+    const gates = valid.gates.map((gate) => gate.gateId === 'MAINNET_PREFLIGHT_SIMULATED'
+      ? { ...gate, evidenceFingerprint: 'f'.repeat(64) }
+      : gate);
+    const mismatched = createSafetyQualification({
+      payloadVersion: 1, evaluatorVersion: 1, phase: valid.phase,
+      buildHash: valid.buildHash,
+      configurationFingerprint: valid.configurationFingerprint,
+      strategyFingerprint: valid.strategyFingerprint, generationId: valid.generationId,
+      walletPublicKey: valid.walletPublicKey, cluster: valid.cluster,
+      genesisHash: valid.genesisHash, providerId: valid.providerId,
+      qualifiedAtMs: valid.qualifiedAtMs, expiresAtMs: valid.expiresAtMs, gates,
+    });
+    await assert.rejects(repository.persistQualification(mismatched),
+      isRepositoryError('CONFLICT'));
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_safety_qualifications`)).rows[0]?.count, 0);
+  });
+});
+
+void test('status hides stale armaments, replacement expires them and stop revokes atomically', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    await migrateDatabase({ pool });
+    const simulation = await seedSuccessfulSimulation(pool);
+    await new PostgresExecutionRiskRepository(pool).registerWalletGeneration({
+      generationId, payloadVersion: 1, walletPublicKey: publicKey,
+      cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
+    });
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const nowMs = Date.now();
+    const qualification = safetyQualification(nowMs, simulation);
+    await repository.persistQualification(qualification);
+    const resumeAuthorization = createOperatorAuthorization({
+      payloadVersion: 1, generationId, action: 'RESUME', phase: null,
+      contextFingerprint: qualification.qualificationFingerprint,
+      nonceHash: '7'.repeat(64), operatorId: 'operator-primary',
+      issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+    });
+    await repository.recordAuthorization(resumeAuthorization);
+    await repository.resume({
+      payloadVersion: 1, commandId: 'command:expiry-resume', generationId,
+      qualificationId: qualification.qualificationId,
+      authorization: resumeAuthorization, operatorId: 'operator-primary',
+      occurredAtMs: nowMs + 1,
+    });
+    const first = await armCanary(repository, qualification, Date.now(), '6', 200);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const expiredStatus = await repository.readStatus(generationId);
+    assert.equal(expiredStatus.activeArmamentId, null);
+    assert.equal((await pool.query(`SELECT state FROM execution_activation_armaments
+      WHERE armament_id=$1`, [first.armamentId])).rows[0]?.state, 'ARMED');
+
+    const replacement = await armCanary(repository, qualification, Date.now(), '5');
+    assert.deepEqual((await pool.query(`SELECT state,terminal_at IS NOT NULL AS terminal,
+      purge_after=terminal_at+INTERVAL '4 hours' AS purge_exact
+      FROM execution_activation_armaments WHERE armament_id=$1`, [first.armamentId])).rows[0], {
+      state: 'EXPIRED', terminal: true, purge_exact: true,
+    });
+    assert.equal((await repository.readStatus(generationId)).activeArmamentId,
+      replacement.armamentId);
+    const stopped = await repository.setStop({
+      payloadVersion: 1, commandId: 'command:revoke-active', generationId,
+      operatorId: 'operator-primary', occurredAtMs: Date.now(),
+    }, 'ENTRY_STOP');
+    assert.equal(stopped.activeArmamentId, null);
+    assert.equal((await pool.query(`SELECT state FROM execution_activation_armaments
+      WHERE armament_id=$1`, [replacement.armamentId])).rows[0]?.state, 'REVOKED');
+    const reasons = (await pool.query<{ readonly reason_code: string }>(
+      `SELECT reason_code FROM execution_activation_events
+      WHERE armament_id IN ($1,$2) ORDER BY occurred_at,event_id`,
+    [first.armamentId, replacement.armamentId])).rows.map((row) => row.reason_code);
+    assert.ok(reasons.includes('ARMAMENT_EXPIRED'));
+    assert.ok(reasons.includes('ARMAMENT_REVOKED'));
+  });
+});
+
+function safetyQualification(
+  nowMs: number,
+  simulation: Awaited<ReturnType<typeof seedSuccessfulSimulation>>,
+) {
   const evidenceTypes = [
     'CI_RUN', 'MIGRATION_TEST', 'ARCHITECTURE_TEST', 'DRY_RUN_TEST',
     'SIMULATION_ARTIFACT', 'FAULT_TEST', 'RECONCILIATION_STATE',
@@ -162,17 +281,108 @@ function safetyQualification(nowMs: number) {
   ] as const;
   return createSafetyQualification({
     payloadVersion: 1, evaluatorVersion: 1, phase: 'CANARY',
-    buildHash: '1'.repeat(64), configurationFingerprint: '2'.repeat(64),
+    buildHash: hash, configurationFingerprint: simulation.configurationFingerprint,
     strategyFingerprint: '3'.repeat(64), generationId, walletPublicKey: publicKey,
     cluster: 'mainnet-beta', genesisHash: publicKey, providerId: 'primary',
     qualifiedAtMs: nowMs, expiresAtMs: nowMs + 300_000,
     gates: EXECUTION_SAFETY_GATE_IDS.map((gateId, index) => ({
       payloadVersion: 1, gateId, status: 'PASSED', evidenceType: evidenceTypes[index],
-      evidenceId: `evidence:${index}`,
-      evidenceFingerprint: index.toString(16).repeat(64),
-      observedAtMs: nowMs - 1_000 + index, expiresAtMs: nowMs + 300_000,
+      evidenceId: gateId === 'MAINNET_PREFLIGHT_SIMULATED'
+        ? simulation.artifactId : `evidence:${index}`,
+      evidenceFingerprint: gateId === 'MAINNET_PREFLIGHT_SIMULATED'
+        ? createMainnetSimulationEvidenceFingerprint({
+          artifactId: simulation.artifactId,
+          resultFingerprint: simulation.resultFingerprint,
+          buildHash: hash,
+          configurationFingerprint: simulation.configurationFingerprint,
+          strategyFingerprint: '3'.repeat(64),
+          walletPublicKey: publicKey,
+          genesisHash: publicKey,
+          providerId: 'primary',
+        })
+        : index.toString(16).repeat(64),
+      observedAtMs: gateId === 'MAINNET_PREFLIGHT_SIMULATED'
+        ? simulation.recordedAtMs : nowMs - 1_000 + index,
+      expiresAtMs: nowMs + 300_000,
     })),
   });
+}
+
+async function seedSuccessfulSimulation(pool: InstanceType<typeof pg.Pool>) {
+  const nowMs = Date.now();
+  const intents = new PostgresExecutionIntentRepository(pool);
+  const created = await intents.create(createExecutionIntentDraft({
+    strategyId: 'simulation-strategy', strategyVersion: 1,
+    positionId: `position-${randomUUID()}`, logicalCommandId: `command-${randomUUID()}`,
+    mint: publicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
+    quoteMint: 'So11111111111111111111111111111111111111112',
+    quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+    quoteAmountRaw: 1_000n, baseAmountRaw: null, minimumAmountOutRaw: 850n,
+    decisionEventId: `event-${randomUUID()}`, decisionFingerprint: hash,
+    requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
+  }));
+  const claimed = await intents.claim({
+    ownerId: 'preflight-test-worker', leaseMs: 30_000, purpose: 'EXECUTE',
+  });
+  if (claimed === null) assert.fail('Expected one claimed simulation intent.');
+  const processingIntent = await intents.transition(claimed, {
+    intentId: created.intent.id, expectedStatus: 'PENDING', nextStatus: 'PROCESSING',
+    leaseToken: claimed.leaseToken, reasonCode: 'EXECUTION_STARTED',
+    humanMessage: 'Execution simulation started.', activationPhase: 'NONE',
+    evidence: Object.freeze({
+      payloadVersion: 1, attemptNumber: null, sourceEventId: null, observedAtMs: nowMs,
+    }),
+  });
+  const processing = Object.freeze({ ...claimed, intent: processingIntent });
+  const begun = await intents.beginAttempt(processing);
+  const artifact = createExecutionSimulationArtifactDraft({
+    intentId: begun.claim.intent.id, attemptNumber: begun.attempt.attemptNumber,
+    intentStateRevision: begun.claim.intent.stateRevision,
+    strategyId: begun.claim.intent.strategyId,
+    strategyVersion: begun.claim.intent.strategyVersion,
+    decisionFingerprint: begun.claim.intent.decisionFingerprint,
+    resultKind: 'SUCCESS', effectiveVenue: 'PUMP_FUN', providerId: 'primary',
+    executorPublicKey: publicKey, expectedGenesisHash: publicKey,
+    observedGenesisHash: publicKey, configurationFingerprint: hash,
+    quoteFingerprint: hash, snapshotFingerprint: hash, buildFingerprint: hash,
+    messageHash: hash, blockhash: publicKey, lastValidBlockHeight: 1_000n,
+    blockhashContextSlot: 900n, snapshotSlot: 899n, feeContextSlot: 900n,
+    simulationSlot: 901n, amountInRaw: 1_000n, expectedAmountOutRaw: 900n,
+    protectedAmountOutRaw: 850n, feesRaw: 10n, estimatedFeeLamports: 5_000n,
+    simulatedFeePayerLamportDebit: 6_000n, unitsConsumed: 200_000n,
+    simulatedBaseDeltaRaw: 900n, simulatedQuoteDeltaRaw: -1_000n,
+    rpcCallsUsed: 5, rpcCallsLimit: 8, quoteStatus: 'SUCCEEDED',
+    buildStatus: 'SUCCEEDED', simulationStatus: 'SUCCEEDED', failureStage: null,
+    failureCode: null, terminalReasonCode: 'INTENT_SUCCEEDED',
+    logsFingerprint: hash, logsLineCount: 1,
+  });
+  return new PostgresExecutionSimulationRepository(pool)
+    .complete(begun.claim, artifact, new AbortController().signal);
+}
+
+async function armCanary(
+  repository: PostgresExecutionOperationsRepository,
+  qualification: ReturnType<typeof safetyQualification>,
+  armedAtMs: number,
+  nonceSeed: string,
+  ttlMs = 60_000,
+) {
+  const authorization = createOperatorAuthorization({
+    payloadVersion: 1, generationId, action: 'ARM', phase: 'CANARY',
+    contextFingerprint: qualification.qualificationFingerprint,
+    nonceHash: nonceSeed.repeat(64), operatorId: 'operator-primary',
+    issuedAtMs: armedAtMs, expiresAtMs: armedAtMs + 60_000,
+  });
+  await repository.recordAuthorization(authorization);
+  return repository.arm(createExecutionArmament({
+    payloadVersion: 1, qualification, maximumBuys: 1,
+    maximumCapitalLamports: 500_000n, maximumExposureBps: 500n,
+    maximumOpenPositions: 1, maximumHoldingMs: 300_000,
+    armedAtMs, expiresAtMs: Math.min(armedAtMs + ttlMs, qualification.expiresAtMs),
+    operatorId: 'operator-primary', operatorReason: 'Mainnet canary manually approved.',
+    authorizationId: authorization.authorizationId,
+    authorizationFingerprint: authorization.authorizationFingerprint,
+  }));
 }
 
 function isRepositoryError(code: string): (error: unknown) => boolean {
