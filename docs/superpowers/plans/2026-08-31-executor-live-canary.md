@@ -21,7 +21,7 @@
 - Test: `tests/execution-live.test.ts`
 - Test: `tests/execution-live-migration.test.ts`
 
-- [ ] **Step 1: Write the failing domain tests**
+- [x] **Step 1: Write the failing domain tests**
 
 Tester des artefacts gelés et fermés, les états signés, les positions,
 autorisations de sortie, reason codes append-only et fingerprints
@@ -52,13 +52,13 @@ assert.equal(artifact.signedTransactionHash, sha256(bytes));
 assert.throws(() => createSignedTransactionArtifact({ ...input, signedTransactionBytes: new Uint8Array(1_233) }));
 ```
 
-- [ ] **Step 2: Run the domain test and verify RED**
+- [x] **Step 2: Run the domain test and verify RED**
 
 Run: `npx tsx --test tests/execution-live.test.ts`
 
 Expected: FAIL because `src/domain/execution-live.ts` does not exist.
 
-- [ ] **Step 3: Implement the minimal closed domain**
+- [x] **Step 3: Implement the minimal closed domain**
 
 Define exact unions:
 
@@ -74,13 +74,13 @@ export type ExitAuthorizationState = 'ACTIVE' | 'LOCKED' | 'CONSUMED' | 'REVOKED
 Valider les records par propriétés propres, sans proxy/accessor, copier les
 bytes dans un `Uint8Array`, borner u64 et dates, puis geler chaque résultat.
 
-- [ ] **Step 4: Run the domain test and verify GREEN**
+- [x] **Step 4: Run the domain test and verify GREEN**
 
 Run: `npx tsx --test tests/execution-live.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 5: Write migration tests and verify RED**
+- [x] **Step 5: Write migration tests and verify RED**
 
 Exiger les quatre tables de la spec, les enums fermés, `BYTEA` <= 1232, les
 FK vers intention/tentative/armement/génération, les triggers de garde, le
@@ -91,7 +91,7 @@ Run: `TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot np
 
 Expected: FAIL because migration 036 is absent.
 
-- [ ] **Step 6: Implement migration 036 and port repository**
+- [x] **Step 6: Implement migration 036 and port repository**
 
 Créer :
 
@@ -109,7 +109,7 @@ commandes fermées `persistSigned`, `recordSignedSimulation`,
 `beginSubmission`, `recordSubmissionOutcome`, `recordConfirmation`,
 `commitReconciliation`, `createDeadlineExitIntent`.
 
-- [ ] **Step 7: Run migration/domain tests and commit**
+- [x] **Step 7: Run migration/domain tests and commit**
 
 Run: `TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot npx tsx --test tests/execution-live.test.ts tests/execution-live-migration.test.ts`
 
@@ -533,4 +533,3 @@ protection.
 Generate the exact preflight checklist and stop before `live:resume` /
 `live:arm` unless the operator has supplied the dedicated wallet, provider,
 fresh signed evidence, maximum lamports and explicit final arm command.
-
