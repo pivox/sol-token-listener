@@ -595,7 +595,7 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
   ]);
 
   const executorEnvironment = Object.fromEntries(
-    [...environment.matchAll(/^(EXECUTOR_[A-Z_]+|LIVE_TRADING_ENABLED)=(.*)$/gmu)]
+    [...environment.matchAll(/^(EXECUTOR_[A-Z0-9_]+|LIVE_TRADING_ENABLED)=(.*)$/gmu)]
       .map((match) => [match[1] ?? '', match[2] ?? '']),
   );
   assert.deepEqual(executorEnvironment, {
@@ -613,6 +613,7 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
     EXECUTOR_ACTIVATION_PHASE: 'CANARY',
     EXECUTOR_OPERATOR_ID: '',
     EXECUTOR_PREFLIGHT_EVIDENCE_PATH: '',
+    EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: '',
     EXECUTOR_QUOTE_MAX_AGE_MS: '3000',
     EXECUTOR_SLIPPAGE_BPS: '500',
     EXECUTOR_SNAPSHOT_MAX_SLOT_LAG: '8',

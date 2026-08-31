@@ -1,6 +1,6 @@
 # Preflight et opérations Executor V1 — conception #51-F
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.0.4
 
 **Version de la spécification parente :** 1.6.4
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.0.4 — 2026-08-31 :** attestation Ed25519 des onze gates, garde SQL
+  des transitions de contrôle et armements, et replay concurrent des
+  autorisations opérateur.
 - **1.0.3 — 2026-08-31 :** sérialisation du replay preflight, liaison du
   build simulé, recontrôle atomique du risque lors de l'armement, rejet des
   replays terminaux et compatibilité effective avec le rôle opérations.
@@ -103,6 +106,14 @@ Chaque preuve contient : `gateId`, `status=PASSED`, `evidenceType`,
 preuves sont obligatoires, uniques, dans l'ordre canonique et non expirées au
 moment du commit. Aucun score ou booléen global fourni par l'appelant ne peut
 remplacer une preuve manquante.
+
+Le fichier complet est une enveloppe Ed25519 signée hors du runtime opérateur
+par le pipeline de confiance. La clé privée ne se trouve ni dans le dépôt, ni
+dans le processus #51-F. Seule sa clé publique SPKI DER encodée en base64 est
+configurée. La signature porte sur les octets JSON exacts de la qualification,
+donc sur les onze preuves et toutes les liaisons de déploiement. Un tableau de
+gates brut, un payload modifié ou une signature issue d'une autre clé est
+refusé avant toute écriture PostgreSQL.
 
 Le fingerprint de qualification couvre :
 
@@ -249,6 +260,12 @@ Les événements et qualifications sont append-only. Les agrégats courants sont
 mutés par CAS sous advisory lock de génération. Les fingerprints sont SHA-256,
 les nombres financiers sont `NUMERIC` entiers bornés, les dates sont à la
 milliseconde et les payloads libres/JSON financiers sont interdits.
+
+Des triggers gardent également la frontière SQL : `RUNNING` exige un événement
+resume cohérent, une qualification fraîche, une autorisation consommée et un
+risque connu ; un insert `ARMED` exige les mêmes liaisons, un contrôle
+`RUNNING` et aucun `UNKNOWN_HELD`. Un `UPDATE` SQL isolé ne peut donc pas
+contourner les transitions applicatives.
 
 Une qualification expirée sans armement actif, une autorisation consommée et
 un armement terminal deviennent purgeables après quatre heures. Un état de

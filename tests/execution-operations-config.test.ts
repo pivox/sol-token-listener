@@ -17,9 +17,11 @@ void test('rejects missing identities, live enablement and every keypair variabl
   for (const changed of [
     { DATABASE_URL: '' },
     { EXECUTOR_ACTIVATION_PHASE: 'canary' },
+    { EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: '' },
     { EXECUTOR_PREFLIGHT_EVIDENCE_PATH: 'relative.json' },
     { LIVE_TRADING_ENABLED: 'true' },
     { EXECUTOR_KEYPAIR_PATH: '/secret/key.json' },
+    { EXECUTOR_EVIDENCE_PRIVATE_KEY_BASE64: 'secret' },
     { SOLANA_PRIVATE_KEY: 'secret' },
   ]) assert.throws(
     () => parseExecutionOperationsConfig(environment(changed)),
@@ -42,6 +44,7 @@ function environment(overrides: Readonly<Record<string, string>> = {}) {
     EXECUTOR_ACTIVATION_PHASE: 'CANARY',
     EXECUTOR_OPERATOR_ID: 'operator-primary',
     EXECUTOR_PREFLIGHT_EVIDENCE_PATH: '/tmp/preflight-evidence.json',
+    EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: 'MCowBQYDK2VwAyEA7Q2ZB8C8QzL4vVfJdGz4g0yP5wVqgYvZx4h7gM9rGgM=',
     LIVE_TRADING_ENABLED: 'false',
     ...overrides,
   };

@@ -6,6 +6,8 @@ import type { ExecutionLivePhase } from '../domain/execution-safety-qualificatio
 const SECRET_KEYS = Object.freeze([
   'EXECUTOR_PRIVATE_KEY', 'EXECUTOR_SECRET_KEY', 'EXECUTOR_KEYPAIR',
   'EXECUTOR_KEYPAIR_PATH', 'SOLANA_PRIVATE_KEY', 'SOLANA_PRIVATE_KEY_BASE58',
+  'EXECUTOR_EVIDENCE_PRIVATE_KEY', 'EXECUTOR_EVIDENCE_PRIVATE_KEY_BASE64',
+  'EXECUTOR_EVIDENCE_SIGNING_KEY',
   'SOLANA_SECRET_KEY', 'SOLANA_KEYPAIR', 'SOLANA_KEYPAIR_PATH',
   'WALLET_PRIVATE_KEY', 'WALLET_KEYPAIR', 'WALLET_KEYPAIR_PATH', 'ANCHOR_WALLET',
 ] as const);
@@ -22,6 +24,7 @@ export interface ExecutionOperationsConfig {
   readonly phase: ExecutionLivePhase;
   readonly operatorId: string;
   readonly evidencePath: string;
+  readonly evidencePublicKeyBase64: string;
 }
 
 export class ExecutionOperationsConfigError extends Error {
@@ -76,10 +79,15 @@ export function parseExecutionOperationsConfig(
     const evidencePath = absolutePath(
       environmentValue(environment, 'EXECUTOR_PREFLIGHT_EVIDENCE_PATH'),
     );
+    const evidencePublicKeyBase64 = canonicalBase64(
+      environmentValue(environment, 'EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64'),
+      256,
+    );
     return Object.freeze({
       databaseUrl, generationId, walletPublicKey, genesisHash, providerId,
       buildHash, configurationFingerprint, strategyFingerprint, phase,
       operatorId, evidencePath,
+      evidencePublicKeyBase64,
     });
   } catch {
     throw invalid();
@@ -136,6 +144,15 @@ function phaseFrom(value: string | undefined): ExecutionLivePhase {
 function absolutePath(value: string | undefined): string {
   const parsed = boundedText(value, 4_096);
   if (!isAbsolute(parsed) || normalize(parsed) !== parsed || parsed.includes('\0')) throw invalid();
+  return parsed;
+}
+
+function canonicalBase64(value: string | undefined, maximumBytes: number): string {
+  const parsed = boundedText(value, Math.ceil(maximumBytes / 3) * 4 + 4);
+  if (!/^[A-Za-z0-9+/]+={0,2}$/u.test(parsed)) throw invalid();
+  const decoded = Buffer.from(parsed, 'base64');
+  if (decoded.length === 0 || decoded.length > maximumBytes
+    || decoded.toString('base64') !== parsed) throw invalid();
   return parsed;
 }
 

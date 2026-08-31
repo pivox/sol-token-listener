@@ -438,3 +438,152 @@ DROP TRIGGER IF EXISTS execution_activation_armaments_identity_immutable
 CREATE TRIGGER execution_activation_armaments_identity_immutable
   BEFORE UPDATE ON execution_activation_armaments
   FOR EACH ROW EXECUTE FUNCTION guard_execution_activation_armament_update();
+
+CREATE OR REPLACE FUNCTION guard_execution_control_state_write()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  prior_state TEXT;
+  transition_valid BOOLEAN;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.state = 'ENTRY_STOP' AND NEW.state_revision = 0
+      AND NEW.last_event_id IS NULL
+    THEN
+      RETURN NEW;
+    END IF;
+    prior_state := NULL;
+    IF NEW.state_revision <> 1 OR NEW.last_event_id IS NULL THEN
+      RAISE EXCEPTION 'guarded control transition required' USING ERRCODE = '55000';
+    END IF;
+  ELSE
+    prior_state := OLD.state;
+    IF NEW.generation_id IS DISTINCT FROM OLD.generation_id
+      OR NEW.payload_version IS DISTINCT FROM OLD.payload_version
+      OR NEW.state_revision <> OLD.state_revision + 1
+      OR NEW.last_event_id IS NULL
+    THEN
+      RAISE EXCEPTION 'guarded control transition required' USING ERRCODE = '55000';
+    END IF;
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1 FROM execution_control_events event
+    WHERE event.event_id = NEW.last_event_id
+      AND event.generation_id = NEW.generation_id
+      AND event.previous_state IS NOT DISTINCT FROM prior_state
+      AND event.next_state = NEW.state
+      AND event.occurred_at = NEW.updated_at
+      AND ((NEW.state = 'ENTRY_STOP' AND event.reason_code = 'OPERATOR_ENTRY_STOP')
+        OR (NEW.state = 'HARD_STOP' AND event.reason_code = 'OPERATOR_HARD_STOP')
+        OR (NEW.state = 'RUNNING' AND event.reason_code = 'OPERATOR_RESUME'))
+      AND (prior_state IS DISTINCT FROM 'HARD_STOP' OR NEW.state <> 'ENTRY_STOP')
+  ) INTO transition_valid;
+  IF NOT transition_valid THEN
+    RAISE EXCEPTION 'guarded control transition required' USING ERRCODE = '55000';
+  END IF;
+
+  IF NEW.state = 'RUNNING' THEN
+    SELECT EXISTS (
+      SELECT 1
+      FROM execution_control_events event
+      JOIN execution_safety_qualifications qualification
+        ON qualification.qualification_id = event.qualification_id
+      JOIN execution_operator_authorizations operator_auth
+        ON operator_auth.authorization_id = event.authorization_id
+      JOIN execution_wallet_risk_state risk
+        ON risk.generation_id = NEW.generation_id
+      WHERE event.event_id = NEW.last_event_id
+        AND qualification.generation_id = NEW.generation_id
+        AND qualification.qualified_at <= statement_timestamp()
+        AND qualification.expires_at > statement_timestamp()
+        AND operator_auth.generation_id = NEW.generation_id
+        AND operator_auth.action = 'RESUME'
+        AND operator_auth.phase IS NULL
+        AND operator_auth.context_fingerprint = qualification.qualification_fingerprint
+        AND operator_auth.operator_id = event.operator_id
+        AND operator_auth.consumed_at IS NOT NULL
+        AND operator_auth.consumed_at BETWEEN operator_auth.issued_at AND operator_auth.expires_at
+        AND risk.unknown_block = FALSE
+        AND NOT EXISTS (
+          SELECT 1 FROM execution_exposure_reservations reservation
+          WHERE reservation.generation_id = NEW.generation_id
+            AND reservation.state = 'UNKNOWN_HELD'
+        )
+    ) INTO transition_valid;
+    IF NOT transition_valid THEN
+      RAISE EXCEPTION 'guarded control transition required' USING ERRCODE = '55000';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS execution_control_state_guarded_write
+  ON execution_control_state;
+CREATE TRIGGER execution_control_state_guarded_write
+  BEFORE INSERT OR UPDATE ON execution_control_state
+  FOR EACH ROW EXECUTE FUNCTION guard_execution_control_state_write();
+
+CREATE OR REPLACE FUNCTION guard_execution_activation_armament_insert()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  armament_valid BOOLEAN;
+BEGIN
+  IF NEW.state <> 'ARMED' THEN
+    RETURN NEW;
+  END IF;
+  SELECT EXISTS (
+    SELECT 1
+    FROM execution_safety_qualifications qualification
+    JOIN execution_operator_authorizations operator_auth
+      ON operator_auth.authorization_id = NEW.authorization_id
+    JOIN execution_control_state control
+      ON control.generation_id = NEW.generation_id
+    JOIN execution_wallet_risk_state risk
+      ON risk.generation_id = NEW.generation_id
+    WHERE qualification.qualification_id = NEW.qualification_id
+      AND qualification.qualification_fingerprint = NEW.qualification_fingerprint
+      AND qualification.generation_id = NEW.generation_id
+      AND qualification.phase = NEW.phase
+      AND qualification.build_hash = NEW.build_hash
+      AND qualification.configuration_fingerprint = NEW.configuration_fingerprint
+      AND qualification.strategy_fingerprint = NEW.strategy_fingerprint
+      AND qualification.wallet_public_key = NEW.wallet_public_key
+      AND qualification.cluster = NEW.cluster
+      AND qualification.genesis_hash = NEW.genesis_hash
+      AND qualification.provider_id = NEW.provider_id
+      AND NEW.expires_at <= qualification.expires_at
+      AND qualification.qualified_at <= statement_timestamp()
+      AND qualification.expires_at > statement_timestamp()
+      AND operator_auth.generation_id = NEW.generation_id
+      AND operator_auth.action = 'ARM'
+      AND operator_auth.phase = NEW.phase
+      AND operator_auth.context_fingerprint = NEW.qualification_fingerprint
+      AND operator_auth.operator_id = NEW.operator_id
+      AND operator_auth.consumed_at IS NOT NULL
+      AND operator_auth.consumed_at BETWEEN operator_auth.issued_at AND operator_auth.expires_at
+      AND operator_auth.expires_at >= statement_timestamp()
+      AND control.state = 'RUNNING'
+      AND risk.unknown_block = FALSE
+      AND NEW.state_revision = 0
+      AND NEW.consumed_buys = 0
+      AND NEW.armed_at <= statement_timestamp()
+      AND NEW.expires_at > statement_timestamp()
+      AND NOT EXISTS (
+        SELECT 1 FROM execution_exposure_reservations reservation
+        WHERE reservation.generation_id = NEW.generation_id
+          AND reservation.state = 'UNKNOWN_HELD'
+      )
+  ) INTO armament_valid;
+  IF NOT armament_valid THEN
+    RAISE EXCEPTION 'guarded armament insert required' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS execution_activation_armaments_guarded_insert
+  ON execution_activation_armaments;
+CREATE TRIGGER execution_activation_armaments_guarded_insert
+  BEFORE INSERT ON execution_activation_armaments
+  FOR EACH ROW EXECUTE FUNCTION guard_execution_activation_armament_insert();

@@ -41,7 +41,8 @@ réconciliation, compteur de pannes et rétention. Aucun script ni processus
 courant ne compose ou n'appelle `admitBuy`, `recordFault`, `reconcile` ou
 `recordReconciledSuccess` : cette fondation reste inerte. #51-F livre désormais
 un preflight durable, des arrêts opérateur et un armement manuel strictement
-inerte. Ses six commandes `live:*` refusent les secrets et ne sont importées
+inerte. Les gates du preflight doivent être fournis dans une enveloppe Ed25519
+signée et liée au déploiement. Ses six commandes `live:*` refusent les secrets et ne sont importées
 par aucun worker. #51-G (signature/soumission sous gates compensatoires) reste
 obligatoire avant toute transaction réelle. Les seuls modes du listener
 restent `observe` et `paper`.

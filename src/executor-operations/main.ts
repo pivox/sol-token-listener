@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { closeDatabase, getDatabasePool } from '../storage/database.js';
-import { createSafetyQualification } from '../domain/execution-safety-qualification.js';
+import { verifySignedSafetyQualificationEvidence } from '../domain/execution-safety-attestation.js';
 import { PostgresExecutionOperationsRepository } from '../storage/execution-operations.repository.js';
 import { parseExecutionOperationsConfig } from './config.js';
 import {
@@ -45,18 +45,13 @@ export async function runExecutionOperationsCommand(
       case 'preflight': {
         requireNoOptions(command.options);
         const encoded = await dependencies.readTextFile(config.evidencePath);
-        if (Buffer.byteLength(encoded, 'utf8') > 65_536) throw invalid();
-        const gates: unknown = JSON.parse(encoded);
-        const qualification = await dependencies.service.preflight(createSafetyQualification({
-          payloadVersion: 1, evaluatorVersion: 1, phase: config.phase,
-          buildHash: config.buildHash,
-          configurationFingerprint: config.configurationFingerprint,
-          strategyFingerprint: config.strategyFingerprint,
-          generationId: config.generationId, walletPublicKey: config.walletPublicKey,
-          cluster: 'mainnet-beta', genesisHash: config.genesisHash,
-          providerId: config.providerId, qualifiedAtMs: nowMs,
-          expiresAtMs: nowMs + 300_000, gates,
-        }));
+        if (Buffer.byteLength(encoded, 'utf8') > 131_072) throw invalid();
+        const qualificationDraft = verifySignedSafetyQualificationEvidence(
+          JSON.parse(encoded) as unknown,
+          config.evidencePublicKeyBase64,
+        );
+        assertQualificationBinding(qualificationDraft, config, nowMs);
+        const qualification = await dependencies.service.preflight(qualificationDraft);
         return JSON.stringify({
           payloadVersion: 1, command: 'preflight',
           qualificationId: qualification.qualificationId,
@@ -221,6 +216,23 @@ function commandId(kind: string, identity: string, nowMs: number): string {
   return `command:${kind}:${createHash('sha256').update(JSON.stringify([
     'execution-operations-command-v1', kind, identity, nowMs,
   ])).digest('hex')}`;
+}
+
+function assertQualificationBinding(
+  qualification: ReturnType<typeof verifySignedSafetyQualificationEvidence>,
+  config: ReturnType<typeof parseExecutionOperationsConfig>,
+  nowMs: number,
+): void {
+  if (qualification.phase !== config.phase
+    || qualification.buildHash !== config.buildHash
+    || qualification.configurationFingerprint !== config.configurationFingerprint
+    || qualification.strategyFingerprint !== config.strategyFingerprint
+    || qualification.generationId !== config.generationId
+    || qualification.walletPublicKey !== config.walletPublicKey
+    || qualification.genesisHash !== config.genesisHash
+    || qualification.providerId !== config.providerId
+    || qualification.qualifiedAtMs > nowMs
+    || qualification.expiresAtMs <= nowMs) throw invalid();
 }
 
 function statusJson(command: string, status: Awaited<ReturnType<

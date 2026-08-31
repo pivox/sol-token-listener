@@ -126,6 +126,7 @@ export class PostgresExecutionOperationsRepository implements ExecutionOperation
   ): Promise<'RECORDED' | 'REPLAYED'> {
     const authorization = authorizationFrom(input);
     return this.transaction(async (client) => {
+      await lockGeneration(client, authorization.generationId);
       const existing = await client.query(`SELECT authorization_fingerprint
         FROM execution_operator_authorizations WHERE authorization_id=$1`,
       [authorization.authorizationId]);

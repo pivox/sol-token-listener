@@ -110,7 +110,7 @@ const OPERATIONS_ALLOWED_NODE_BUILTINS = new Set([
 ]);
 const OPERATIONS_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/executor-operations\/(?:config|main|service|terminal)\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/domain\/execution-(?:operations|safety-qualification)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/execution-(?:operations|safety-(?:attestation|qualification))\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/execution-operations-repository\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/storage\/(?:database|execution-operations\.repository)\.(?:js|ts)$/u,
 ];

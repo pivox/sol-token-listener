@@ -27,6 +27,8 @@ void test('migration 035 defines the seven closed preflight and operations table
   assert.match(sql, /FOREIGN KEY \(qualification_id\)\s*REFERENCES execution_safety_qualifications/u);
   assert.match(sql, /FOREIGN KEY \(generation_id\)\s*REFERENCES execution_wallet_generations/u);
   assert.match(sql, /maximum_capital_lamports < 18446744073709551616/u);
+  assert.match(sql, /guard_execution_control_state_write/u);
+  assert.match(sql, /guard_execution_activation_armament_insert/u);
   assert.doesNotMatch(sql, /NUMERIC\s*\(/iu);
   assert.doesNotMatch(sql, /\b(?:REAL|DOUBLE\s+PRECISION|JSONB?)\b/iu);
   for (const forbidden of [

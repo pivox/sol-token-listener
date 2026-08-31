@@ -1,6 +1,6 @@
 # Executor V1 — preflight et opérations inertes (#51-F)
 
-**Version :** 1.0.2 — 2026-08-31
+**Version :** 1.0.3 — 2026-08-31
 
 #51-F ne permet pas de trader. Il ne charge aucune clé, ne signe rien et
 n'envoie aucune transaction. `EXECUTOR_MODE=live` et
@@ -41,14 +41,31 @@ EXECUTOR_STRATEGY_FINGERPRINT=
 EXECUTOR_ACTIVATION_PHASE=CANARY
 EXECUTOR_OPERATOR_ID=
 EXECUTOR_PREFLIGHT_EVIDENCE_PATH=/absolute/path/preflight-evidence.json
+EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64=
 LIVE_TRADING_ENABLED=false
 ```
 
-Le fichier de preuves contient un tableau JSON strict des onze gates dans
-l'ordre canonique de la spécification
+Le fichier de preuves contient une enveloppe signée :
+
+```json
+{
+  "payloadVersion": 1,
+  "algorithm": "Ed25519",
+  "signedPayloadBase64": "<qualification JSON exacte encodée en base64>",
+  "signatureBase64": "<signature Ed25519 canonique>"
+}
+```
+
+`EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64` contient la clé publique Ed25519 SPKI DER
+de confiance, encodée en base64. La clé privée reste exclusivement dans le
+pipeline externe qui produit l'attestation ; elle ne doit jamais être fournie
+au listener, au CLI, à PostgreSQL ou au dépôt. Le payload signé contient les
+onze gates dans l'ordre canonique de la spécification
 `docs/superpowers/specs/2026-08-31-executor-preflight-operations-design.md`.
 Chaque élément a un type, un identifiant, un fingerprint et une expiration ;
-aucun score global ne remplace un élément manquant.
+aucun score global ne remplace un élément manquant. Toutes les identités
+build/configuration/stratégie/wallet/provider/cluster ainsi que le TTL exact
+sont signées et doivent correspondre à la configuration locale.
 
 La preuve finale `MAINNET_PREFLIGHT_SIMULATED` doit utiliser comme
 `evidenceId` l'identifiant exact d'un artefact #51-D réussi. Son

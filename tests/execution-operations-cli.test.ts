@@ -1,5 +1,10 @@
+import { generateKeyPairSync, sign } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {
+  createSafetyQualification,
+  EXECUTION_SAFETY_GATE_IDS,
+} from '../src/domain/execution-safety-qualification.js';
 import {
   ExecutionOperationsCliError,
   runExecutionOperationsCommand,
@@ -53,6 +58,62 @@ void test('rejects unknown commands and malformed mutation arguments with a fixe
   );
 });
 
+void test('preflight accepts only a trusted signed qualification bound to runtime config', async () => {
+  const nowMs = 1_788_134_400_000;
+  const keyPair = generateKeyPairSync('ed25519');
+  const publicKeyBase64 = keyPair.publicKey.export({ format: 'der', type: 'spki' })
+    .toString('base64');
+  const evidenceTypes = [
+    'CI_RUN', 'MIGRATION_TEST', 'ARCHITECTURE_TEST', 'DRY_RUN_TEST',
+    'SIMULATION_ARTIFACT', 'FAULT_TEST', 'RECONCILIATION_STATE',
+    'PROVIDER_SNAPSHOT', 'STOP_CONTROL_TEST', 'WALLET_SNAPSHOT',
+    'MAINNET_SIMULATION_ARTIFACT',
+  ] as const;
+  const qualificationInput = {
+    payloadVersion: 1 as const, evaluatorVersion: 1 as const, phase: 'CANARY' as const,
+    buildHash: 'b'.repeat(64), configurationFingerprint: 'c'.repeat(64),
+    strategyFingerprint: 'd'.repeat(64),
+    generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+    walletPublicKey: '11111111111111111111111111111111',
+    cluster: 'mainnet-beta' as const, genesisHash: '11111111111111111111111111111111',
+    providerId: 'primary', qualifiedAtMs: nowMs, expiresAtMs: nowMs + 300_000,
+    gates: EXECUTION_SAFETY_GATE_IDS.map((gateId, index) => ({
+      payloadVersion: 1 as const, gateId, status: 'PASSED' as const,
+      evidenceType: evidenceTypes[index], evidenceId: `evidence:${index}`,
+      evidenceFingerprint: index.toString(16).repeat(64),
+      observedAtMs: nowMs - 1_000 + index, expiresAtMs: nowMs + 300_000,
+    })),
+  };
+  const qualification = createSafetyQualification(qualificationInput);
+  const payload = Buffer.from(JSON.stringify(qualificationInput), 'utf8');
+  const signedEnvelope = JSON.stringify({
+    payloadVersion: 1, algorithm: 'Ed25519',
+    signedPayloadBase64: payload.toString('base64'),
+    signatureBase64: sign(null, payload, keyPair.privateKey).toString('base64'),
+  });
+  let persisted = false;
+  const dependencies = {
+    service: serviceStub({
+      preflight: async (value) => { persisted = true; assert.deepEqual(value, qualification); return value; },
+    }),
+    terminal: { isTTY: false, write() {}, readLine: async () => '' },
+    readTextFile: async () => signedEnvelope,
+    now: () => nowMs + 1,
+  };
+  const output = await runExecutionOperationsCommand(
+    ['preflight'],
+    environment({ EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: publicKeyBase64 }),
+    dependencies,
+  );
+  assert.equal(JSON.parse(output).qualificationId, qualification.qualificationId);
+  assert.equal(persisted, true);
+  await assert.rejects(runExecutionOperationsCommand(
+    ['preflight'],
+    environment({ EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: publicKeyBase64 }),
+    { ...dependencies, readTextFile: async () => JSON.stringify(qualificationInput.gates) },
+  ), (error) => error instanceof ExecutionOperationsCliError);
+});
+
 function serviceStub(overrides: Partial<ExecutionOperationsService>): ExecutionOperationsService {
   const unavailable = async (): Promise<never> => { throw new Error('unexpected service call'); };
   return {
@@ -65,7 +126,7 @@ function serviceStub(overrides: Partial<ExecutionOperationsService>): ExecutionO
   };
 }
 
-function environment() {
+function environment(overrides: Readonly<Record<string, string>> = {}) {
   return {
     DATABASE_URL: 'postgresql://localhost/solanabot',
     EXECUTOR_WALLET_GENERATION_ID: `execution_wallet_generation_${'a'.repeat(64)}`,
@@ -76,6 +137,8 @@ function environment() {
     EXECUTOR_STRATEGY_FINGERPRINT: 'd'.repeat(64), EXECUTOR_ACTIVATION_PHASE: 'CANARY',
     EXECUTOR_OPERATOR_ID: 'operator-primary',
     EXECUTOR_PREFLIGHT_EVIDENCE_PATH: '/tmp/preflight-evidence.json',
+    EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64: 'MCowBQYDK2VwAyEA7Q2ZB8C8QzL4vVfJdGz4g0yP5wVqgYvZx4h7gM9rGgM=',
     LIVE_TRADING_ENABLED: 'false',
+    ...overrides,
   };
 }

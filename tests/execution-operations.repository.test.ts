@@ -236,6 +236,48 @@ void test('identical concurrent preflights replay after the generation lock', as
   });
 });
 
+void test('identical concurrent operator authorizations replay exactly once', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    await migrateDatabase({ pool });
+    await new PostgresExecutionRiskRepository(pool).registerWalletGeneration({
+      generationId, payloadVersion: 1, walletPublicKey: publicKey,
+      cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
+    });
+    const repository = new PostgresExecutionOperationsRepository(pool);
+    const nowMs = Date.now();
+    const authorization = createOperatorAuthorization({
+      payloadVersion: 1, generationId, action: 'RESUME', phase: null,
+      contextFingerprint: hash, nonceHash: 'e'.repeat(64),
+      operatorId: 'operator-primary', issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+    });
+    assert.deepEqual((await Promise.all([
+      repository.recordAuthorization(authorization),
+      repository.recordAuthorization(authorization),
+    ])).sort(), ['RECORDED', 'REPLAYED']);
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_operator_authorizations`)).rows[0]?.count, 1);
+  });
+});
+
+void test('database rejects a direct transition to RUNNING without guarded evidence', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    await migrateDatabase({ pool });
+    await new PostgresExecutionRiskRepository(pool).registerWalletGeneration({
+      generationId, payloadVersion: 1, walletPublicKey: publicKey,
+      cluster: 'mainnet-beta', genesisHash: publicKey, generation: 1,
+    });
+    await pool.query(`INSERT INTO execution_control_state (generation_id)
+      VALUES ($1)`, [generationId]);
+    await assert.rejects(pool.query(`UPDATE execution_control_state SET
+      state='RUNNING',state_revision=1,updated_at=date_trunc('milliseconds',statement_timestamp())
+      WHERE generation_id=$1`, [generationId]), /guarded control transition/u);
+  });
+});
+
 void test('armament rechecks unknown risk atomically before consuming authorization', async (context) => {
   const databaseUrl = testDatabaseUrl(context);
   if (databaseUrl === null) return;
