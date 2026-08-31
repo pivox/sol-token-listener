@@ -152,6 +152,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly paperDecisionJobs: number;
   readonly paperTrades: number;
   readonly paperPositions: number;
+  readonly executionDryRunAssessments: number;
   readonly executionIntentTransitions: number;
   readonly executionAttempts: number;
   readonly executionIntents: number;
@@ -425,6 +426,11 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        WHERE intent.id = ANY($1::TEXT[])
        ORDER BY intent.id`,
       [executionIntentIds, executionIntentCutoff],
+    );
+    const executionDryRunAssessments = await client.query(
+      `DELETE FROM execution_dry_run_assessments assessment
+       WHERE assessment.intent_id = ANY($1::TEXT[])`,
+      [executionIntentIds],
     );
     const executionIntentTransitions = await client.query(
       `DELETE FROM execution_intent_transitions transition
@@ -751,6 +757,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       paperDecisionJobs: paperDecisionJobs.rowCount ?? 0,
       paperTrades: paperTrades.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
+      executionDryRunAssessments: executionDryRunAssessments.rowCount ?? 0,
       executionIntentTransitions: executionIntentTransitions.rowCount ?? 0,
       executionAttempts: executionAttempts.rowCount ?? 0,
       executionIntents: executionIntents.rowCount ?? 0,

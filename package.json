@@ -10,6 +10,8 @@
   "scripts": {
     "dev": "tsx watch src/app.ts",
     "start": "node dist/src/app.js",
+    "executor:dev": "tsx src/executor/main.ts",
+    "executor:start": "node dist/src/executor/main.js",
     "build": "npm run build:backend && npm run build --workspace frontend",
     "build:backend": "tsc -p tsconfig.json && tsx scripts/copy-migrations.ts && tsx scripts/copy-qualification-profiles.ts",
     "check": "npm run check:backend && npm run check --workspace frontend",

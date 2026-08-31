@@ -220,7 +220,7 @@ void test('execution intent migration applies and replays on an isolated schema'
 
   await withTemporarySchema(databaseUrl, 'execution_intents', async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.equal(applied.at(-1), '032_execution_dry_run_assessments.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     const schemaState = await pool.query(`SELECT current_schema() AS schema,
@@ -434,6 +434,7 @@ void test('purges only reconciled terminal execution intent ledgers after retent
       await insertTransition(pool, value.id, {
         payloadVersion: 1, attemptNumber: 1, sourceEventId: null, observedAtMs: 1_000,
       }, 1_000);
+      await insertDryRunAssessment(pool, value);
     }
 
     const retainedIds: string[] = [];
@@ -451,6 +452,7 @@ void test('purges only reconciled terminal execution intent ledgers after retent
       retainedIds.push(value.id);
       nonTerminalIds.push(value.id);
       await insertIntent(pool, intentRow(value));
+      if (status === 'PENDING') await insertDryRunAssessment(pool, value);
     }
     // Exercise the purge predicate defensively against legacy/corrupt rows whose
     // stale retention timestamps no longer satisfy the current schema checks.
@@ -468,6 +470,7 @@ void test('purges only reconciled terminal execution intent ledgers after retent
     }
 
     const purged = await purgeExpiredFoundationData(pool);
+    assert.equal(purged.executionDryRunAssessments, terminalStatuses.length);
     assert.equal(purged.executionIntentTransitions, terminalStatuses.length);
     assert.equal(purged.executionAttempts, terminalStatuses.length);
     assert.equal(purged.executionIntents, terminalStatuses.length);
@@ -485,6 +488,19 @@ void test('purges only reconciled terminal execution intent ledgers after retent
       'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_transitions WHERE intent_id = ANY($1::TEXT[])',
       [terminalIds],
     )).rows[0]?.count, 0);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_dry_run_assessments WHERE intent_id = ANY($1::TEXT[])',
+      [terminalIds],
+    )).rows[0]?.count, 0);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_dry_run_assessments WHERE intent_id = $1',
+      [nonTerminalIds[0]],
+    )).rows[0]?.count, 1);
+    const secondPass = await purgeExpiredFoundationData(pool);
+    assert.deepEqual([
+      secondPass.executionDryRunAssessments, secondPass.executionIntentTransitions,
+      secondPass.executionAttempts, secondPass.executionIntents,
+    ], [0, 0, 0, 0]);
   });
 });
 
@@ -506,6 +522,7 @@ void test('rolls back execution intent child purges when the parent delete fails
     await insertTransition(pool, value.id, {
       payloadVersion: 1, attemptNumber: 1, sourceEventId: null, observedAtMs: 1_000,
     }, 1_000);
+    await insertDryRunAssessment(pool, value);
     await pool.query(`CREATE FUNCTION reject_execution_intent_delete() RETURNS trigger
       LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced execution intent purge rollback'; END $$`);
     await pool.query(`CREATE TRIGGER reject_execution_intent_delete
@@ -527,6 +544,9 @@ void test('rolls back execution intent child purges when the parent delete fails
     assert.equal((await pool.query(
       'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_tombstones WHERE intent_id = $1', [value.id],
     )).rows[0]?.count, 0);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_dry_run_assessments WHERE intent_id = $1', [value.id],
+    )).rows[0]?.count, 1);
   });
 });
 
@@ -548,6 +568,7 @@ void test('rolls back an execution intent purge when tombstone insertion collide
     await insertTransition(pool, value.id, {
       payloadVersion: 1, attemptNumber: 1, sourceEventId: null, observedAtMs: 1_000,
     }, 1_000);
+    await insertDryRunAssessment(pool, value);
     await pool.query(`INSERT INTO execution_intent_tombstones (
       intent_id,logical_order_key,decision_fingerprint,retired_at
     ) VALUES ('different-intent',$1,$2,to_timestamp(1))`, [
@@ -588,6 +609,7 @@ void test('pins one execution intent purge cohort across all child and parent de
     await insertTransition(pool, value.id, {
       payloadVersion: 1, attemptNumber: 1, sourceEventId: null, observedAtMs: 1_000,
     }, 1_000);
+    await insertDryRunAssessment(pool, value);
     await pool.query(`CREATE FUNCTION advance_execution_intent_purge_boundary() RETURNS trigger
       LANGUAGE plpgsql AS $$ BEGIN
         UPDATE execution_intents SET
@@ -603,8 +625,9 @@ void test('pins one execution intent purge cohort across all child and parent de
 
     const first = await purgeExpiredFoundationData(pool);
     assert.deepEqual([
-      first.executionIntentTransitions, first.executionAttempts, first.executionIntents,
-    ], [0, 0, 0]);
+      first.executionDryRunAssessments, first.executionIntentTransitions,
+      first.executionAttempts, first.executionIntents,
+    ], [0, 0, 0, 0]);
     assert.equal((await pool.query(
       'SELECT COUNT(*)::INTEGER AS count FROM execution_intents WHERE id = $1', [value.id],
     )).rows[0]?.count, 1);
@@ -615,12 +638,17 @@ void test('pins one execution intent purge cohort across all child and parent de
       'SELECT COUNT(*)::INTEGER AS count FROM execution_intent_transitions WHERE intent_id = $1',
       [value.id],
     )).rows[0]?.count, 1);
+    assert.equal((await pool.query(
+      'SELECT COUNT(*)::INTEGER AS count FROM execution_dry_run_assessments WHERE intent_id = $1',
+      [value.id],
+    )).rows[0]?.count, 1);
 
     await pool.query('DROP TRIGGER advance_execution_intent_purge_boundary ON execution_intent_transitions');
     const second = await purgeExpiredFoundationData(pool);
     assert.deepEqual([
-      second.executionIntentTransitions, second.executionAttempts, second.executionIntents,
-    ], [1, 1, 1]);
+      second.executionDryRunAssessments, second.executionIntentTransitions,
+      second.executionAttempts, second.executionIntents,
+    ], [1, 1, 1, 1]);
   });
 });
 
@@ -770,6 +798,23 @@ async function insertTransition(
   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::JSONB, $9)`, [
     intentId, 'PROCESSING', 'SIMULATED', 'SIMULATION_SUCCEEDED', 'migration test', 'NONE', attemptNumber,
     typeof evidence === 'string' ? evidence : JSON.stringify(evidence), timestampParameter(occurredAtMs),
+  ]);
+}
+
+async function insertDryRunAssessment(
+  pool: InstanceType<typeof pg.Pool>, value: ReturnType<typeof draft>,
+): Promise<void> {
+  await pool.query(`INSERT INTO execution_dry_run_assessments (
+    assessment_id,payload_version,specification_version,evaluator_version,intent_id,
+    strategy_id,strategy_version,decision_fingerprint,intent_state_revision,intent_status,
+    input_fingerprint,result_fingerprint,outcome,coverage,quote_status,build_status,
+    simulation_status,signature_status,submission_status,recorded_at
+  ) VALUES (
+    $1,1,'1.4.0',1,$2,$3,$4,$5,0,'PENDING',$5,$5,'FOUNDATION_VALIDATED',
+    'INTENT_AND_LEASE_ONLY','NOT_RUN','NOT_RUN','NOT_RUN','NOT_RUN','NOT_RUN',to_timestamp(0)
+  )`, [
+    `execution_dry_run_assessment_${value.id.slice('execution_intent_'.length)}`,
+    value.id, value.strategyId, value.strategyVersion, value.decisionFingerprint,
   ]);
 }
 

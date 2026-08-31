@@ -72,7 +72,10 @@ type ExactSurfaceAssertions = AssertAll<{
   persistedRevision: Expect<Equal<ExecutionIntentV1['stateRevision'], bigint>>;
   repositoryKeys: Expect<Equal<keyof ExecutionIntentRepository, 'create' | 'claim' | 'beginAttempt' | 'finishAttempt' | 'renew' | 'release' | 'transition' | 'expirePreSubmission' | 'read'>>;
   create: Expect<Equal<ExecutionIntentRepository['create'], (draft: ExecutionIntentDraftV1) => Promise<CreateResult>>>;
-  claim: Expect<Equal<ExecutionIntentRepository['claim'], (options: ClaimOptions) => Promise<ClaimedExecutionIntent | null>>>;
+  claim: Expect<Equal<ExecutionIntentRepository['claim'], (
+    options: ClaimOptions,
+    signal?: AbortSignal,
+  ) => Promise<ClaimedExecutionIntent | null>>>;
   beginAttempt: Expect<Equal<ExecutionIntentRepository['beginAttempt'], (claim: ClaimedExecutionIntent) => Promise<AttemptResult>>>;
   finishAttempt: Expect<Equal<ExecutionIntentRepository['finishAttempt'], (claim: ClaimedExecutionIntent, input: FinishAttemptInput) => Promise<boolean>>>;
   renew: Expect<Equal<ExecutionIntentRepository['renew'], (claim: ClaimedExecutionIntent, leaseMs: number) => Promise<boolean>>>;
@@ -81,7 +84,7 @@ type ExactSurfaceAssertions = AssertAll<{
   expirePreSubmission: Expect<Equal<ExecutionIntentRepository['expirePreSubmission'], (limit: number) => Promise<number>>>;
   read: Expect<Equal<ExecutionIntentRepository['read'], (intentId: string) => Promise<ExecutionIntentV1 | null>>>;
   methodArities: Expect<Equal<Parameters<ExecutionIntentRepository['create']>['length'], 1>>
-    & Expect<Equal<Parameters<ExecutionIntentRepository['claim']>['length'], 1>>
+    & Expect<Equal<Parameters<ExecutionIntentRepository['claim']>['length'], 1 | 2>>
     & Expect<Equal<Parameters<ExecutionIntentRepository['beginAttempt']>['length'], 1>>
     & Expect<Equal<Parameters<ExecutionIntentRepository['finishAttempt']>['length'], 2>>
     & Expect<Equal<Parameters<ExecutionIntentRepository['renew']>['length'], 2>>
@@ -89,7 +92,7 @@ type ExactSurfaceAssertions = AssertAll<{
     & Expect<Equal<Parameters<ExecutionIntentRepository['transition']>['length'], 2>>
     & Expect<Equal<Parameters<ExecutionIntentRepository['expirePreSubmission']>['length'], 1>>
     & Expect<Equal<Parameters<ExecutionIntentRepository['read']>['length'], 1>>;
-  purpose: Expect<Equal<ExecutionClaimPurpose, 'EXECUTE' | 'CONFIRM' | 'RECONCILE'>>;
+  purpose: Expect<Equal<ExecutionClaimPurpose, 'EXECUTE' | 'CONFIRM' | 'RECONCILE' | 'DRY_RUN'>>;
   claimed: Expect<Equal<keyof ClaimedExecutionIntent, 'intent' | 'leaseOwner' | 'leaseToken' | 'leaseExpiresAtMs'>>
     & Expect<Equal<OptionalKeys<ClaimedExecutionIntent>, never>>
     & Expect<Equal<ReadonlyKeys<ClaimedExecutionIntent>, keyof ClaimedExecutionIntent>>
@@ -252,6 +255,8 @@ function compileTimeNegativeAssertions(): void {
   void repository.renew(claim, 1, 2);
   // @ts-expect-error claim options cannot carry a signer capability.
   void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'EXECUTE', signer: 'capability' });
+  // @ts-expect-error claim accepts at most one cancellation signal.
+  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'EXECUTE' }, new AbortController().signal, new AbortController().signal);
   // @ts-expect-error transition input cannot carry a wallet capability.
   const transition: ExecutionIntentTransitionInput = { intentId: 'id', expectedStatus: 'PENDING', nextStatus: 'PROCESSING', leaseToken: 'lease', reasonCode: 'INTENT_LEASE_LOST', humanMessage: 'message', activationPhase: 'NONE', evidence, wallet: 'capability' };
   // @ts-expect-error claimed values are readonly.
@@ -282,7 +287,10 @@ class StrictFakeExecutionIntentRepository implements ExecutionIntentRepository {
     return Object.freeze({ kind: 'CREATED', intent: this.intent });
   }
 
-  public async claim(_options: ClaimOptions): Promise<ClaimedExecutionIntent | null> {
+  public async claim(
+    _options: ClaimOptions,
+    _signal?: AbortSignal,
+  ): Promise<ClaimedExecutionIntent | null> {
     return this.intent === null ? null : Object.freeze({
       intent: this.intent, leaseOwner: 'worker', leaseToken: 'lease', leaseExpiresAtMs: 30_001,
     });

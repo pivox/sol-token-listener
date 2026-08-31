@@ -123,6 +123,8 @@ void test('claim validates a closed purpose and preserves each selected business
       'SIGNED_NOT_SUBMITTED', 'CONFIRMED', 'RECONCILING',
       'UNKNOWN_REQUIRES_RECONCILIATION',
     ]],
+    ['DRY_RUN', 'PENDING', ['PENDING', 'RETRY_READY']],
+    ['DRY_RUN', 'RETRY_READY', ['PENDING', 'RETRY_READY']],
   ];
   for (const [purpose, status, statuses] of cases) {
     const draft = executionDraft(`claim-${purpose}`);
@@ -139,18 +141,37 @@ void test('claim validates a closed purpose and preserves each selected business
     assert.ok(Object.isFrozen(claim));
     assert.ok(Object.isFrozen(claim.intent));
     const call = required(client.calls[0]);
-    assert.match(call.text, /FOR UPDATE SKIP LOCKED/u);
+    if (purpose === 'DRY_RUN') assert.match(call.text, /FOR UPDATE OF intent SKIP LOCKED/u);
+    else assert.match(call.text, /FOR UPDATE SKIP LOCKED/u);
     if (purpose === 'EXECUTE') {
       assert.match(call.text, /expires_at\s*>\s*statement_timestamp\(\)/u);
+    } else if (purpose === 'DRY_RUN') {
+      assert.match(call.text, /expires_at\s*>\s*operation\.at\s*\+\s*\(\$2::BIGINT/u);
     } else {
       assert.doesNotMatch(call.text, /expires_at\s*>\s*statement_timestamp\(\)/u);
     }
-    assert.match(call.text, /lease_expires_at\s+IS NULL\s+OR\s+.*<=\s*statement_timestamp\(\)/su);
+    if (purpose === 'DRY_RUN') {
+      assert.match(call.text, /lease_expires_at\s+IS NULL\s+OR\s+.*<=\s*operation\.at/su);
+    } else {
+      assert.match(call.text, /lease_expires_at\s+IS NULL\s+OR\s+.*<=\s*statement_timestamp\(\)/su);
+    }
     assert.match(call.text, /ORDER BY\s+(?:intent\.)?requested_at,\s*(?:intent\.)?id/u);
     assert.doesNotMatch(call.text, /gen_random_uuid|uuid_generate/u);
     for (const candidate of statuses) assert.match(call.text, new RegExp(`'${candidate}'`, 'u'));
     const setClause = required(/SET([\s\S]*?)FROM candidate/u.exec(call.text)?.[1]);
     assert.doesNotMatch(setClause, /\bstatus\b|attempt_count|last_reason_code|terminal_at/u);
+    if (purpose === 'DRY_RUN') {
+      const setColumns = [...setClause.matchAll(/^\s*([a-z_]+)\s*=/gmu)]
+        .map((match) => required(match[1]))
+        .sort();
+      assert.deepEqual(setColumns, ['lease_expires_at', 'lease_owner', 'lease_token']);
+      assert.doesNotMatch(call.text, /execution_attempts/u);
+      assert.match(call.text, /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_dry_run_assessments/u);
+      assert.match(call.text, /assessment\.intent_id\s*=\s*intent\.id/u);
+      assert.match(call.text, /assessment\.evaluator_version\s*=\s*1/u);
+      assert.match(call.text, /^WITH operation AS MATERIALIZED/mu);
+      assert.match(call.text, /FROM execution_intents AS intent CROSS JOIN operation/u);
+    }
     assert.doesNotMatch(call.text, /execution_intent_transitions/u);
     assert.equal(call.values?.[0], 'worker-1');
     assert.equal(call.values?.[1], 30_000);
@@ -161,6 +182,161 @@ void test('claim validates a closed purpose and preserves each selected business
   const repository = new PostgresExecutionIntentRepository(pool);
   await expectCode(repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'OTHER' as never }), 'INVALID_INPUT');
   assert.equal(pool.connectCount, 0);
+});
+
+void test('DRY_RUN rejects equality at the lease-expiry boundary and hostile claim rows evict the client', async () => {
+  const draft = executionDraft('dry-run-boundary');
+  const equalityClient = new ScriptedClient([(_text, values) => result([{
+    ...claimRow(draft, 'PENDING'), lease_owner: values?.[0], lease_token: values?.[2],
+    lease_expires_at_ms: String(NOW_MS + 30_000), expires_at_ms: String(NOW_MS + 30_000),
+    claim_at_ms: String(NOW_MS),
+  }], 1)]);
+  const equalityRepository = new PostgresExecutionIntentRepository(new ScriptedPool(equalityClient));
+  await expectCode(equalityRepository.claim({
+    ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+  }), 'INVALID_DATA');
+  assert.deepEqual(equalityClient.releaseErrors, [true]);
+
+  const cleanupFailureClient = new ScriptedClient([(_text, values) => result([{
+    ...claimRow(draft, 'PENDING'), lease_owner: values?.[0], lease_token: values?.[2],
+    lease_expires_at_ms: String(NOW_MS + 30_000), expires_at_ms: String(NOW_MS + 30_000),
+    claim_at_ms: String(NOW_MS),
+  }], 1)], () => { throw new Error('release cleanup secret'); });
+  await expectCode(new PostgresExecutionIntentRepository(new ScriptedPool(cleanupFailureClient)).claim({
+    ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+  }), 'DATABASE_FAILURE');
+  assert.deepEqual(cleanupFailureClient.releaseErrors, [true]);
+
+  const validClient = new ScriptedClient([(_text, values) => result([{
+    ...claimRow(draft, 'RETRY_READY'), lease_owner: values?.[0], lease_token: values?.[2],
+    lease_expires_at_ms: String(NOW_MS + 30_000), expires_at_ms: String(NOW_MS + 30_001),
+    claim_at_ms: String(NOW_MS),
+  }], 1)]);
+  const validRepository = new PostgresExecutionIntentRepository(new ScriptedPool(validClient));
+  const valid = await validRepository.claim({
+    ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+  });
+  assert.ok(valid);
+  assert.deepEqual(validClient.releaseErrors, [undefined]);
+});
+
+void test('DRY_RUN query failures evict the client without exposing database details', async () => {
+  const client = new ScriptedClient([() => { throw new Error('postgres secret query'); }]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  await expectCode(repository.claim({
+    ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+  }), 'DATABASE_FAILURE');
+  assert.deepEqual(client.releaseErrors, [true]);
+});
+
+void test('claim cancellation fences connect without dispatching SQL and preserves cleanup failures', async (context) => {
+  await context.test('pre-aborted signal does not connect', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const pool = new ScriptedPool(new ScriptedClient([]));
+    const repository = new PostgresExecutionIntentRepository(pool);
+
+    await expectCode(repository.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, controller.signal), 'OPERATION_ABORTED');
+    assert.equal(pool.connectCount, 0);
+  });
+
+  await context.test('abort while connect waits releases cleanly without a query', async () => {
+    const controller = new AbortController();
+    const connectGate = deferred<ScriptedClient>();
+    let connectCount = 0;
+    const pool: ExecutionIntentPool = {
+      connect: async () => {
+        connectCount += 1;
+        return connectGate.promise;
+      },
+    };
+    const client = new ScriptedClient([]);
+    const repository = new PostgresExecutionIntentRepository(pool);
+    const pending = repository.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, controller.signal);
+
+    await Promise.resolve();
+    assert.equal(connectCount, 1);
+    controller.abort();
+    connectGate.resolve(client);
+
+    await expectCode(pending, 'OPERATION_ABORTED');
+    assert.equal(client.calls.length, 0);
+    assert.deepEqual(client.releaseErrors, [undefined]);
+  });
+
+  await context.test('connect and abort-cleanup failures remain database failures', async () => {
+    const connectController = new AbortController();
+    const connectGate = deferred<ScriptedClient>();
+    const connectFailure = new PostgresExecutionIntentRepository({
+      connect: async () => connectGate.promise,
+    });
+    const connecting = connectFailure.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, connectController.signal);
+    await Promise.resolve();
+    connectController.abort();
+    connectGate.reject(new Error('connect secret'));
+    await expectCode(connecting, 'DATABASE_FAILURE');
+
+    const cleanupController = new AbortController();
+    const cleanupGate = deferred<ScriptedClient>();
+    const cleanupClient = new ScriptedClient([], () => { throw new Error('release secret'); });
+    const cleanupFailure = new PostgresExecutionIntentRepository({
+      connect: async () => cleanupGate.promise,
+    });
+    const cleaning = cleanupFailure.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, cleanupController.signal);
+    await Promise.resolve();
+    cleanupController.abort();
+    cleanupGate.resolve(cleanupClient);
+    await expectCode(cleaning, 'DATABASE_FAILURE');
+    assert.equal(cleanupClient.calls.length, 0);
+    assert.deepEqual(cleanupClient.releaseErrors, [undefined, true]);
+  });
+});
+
+void test('claim keeps dispatched-query semantics when cancellation races SQL', async (context) => {
+  const draft = executionDraft('claim-cancel-dispatched');
+
+  await context.test('query failure remains a database failure', async () => {
+    const controller = new AbortController();
+    const client = new ScriptedClient([() => {
+      controller.abort();
+      throw new Error('query secret');
+    }]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    await expectCode(repository.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, controller.signal), 'DATABASE_FAILURE');
+    assert.deepEqual(client.releaseErrors, [true]);
+  });
+
+  await context.test('successful dispatched query returns its claim', async () => {
+    const controller = new AbortController();
+    const client = new ScriptedClient([(_text, values) => {
+      controller.abort();
+      return result([{
+        ...claimRow(draft, 'PENDING'),
+        lease_owner: values?.[0], lease_token: values?.[2],
+        claim_at_ms: String(NOW_MS),
+      }], 1);
+    }]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    const claimed = await repository.claim({
+      ownerId: 'worker-1', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }, controller.signal);
+    assert.ok(claimed);
+    assert.equal(claimed.intent.id, draft.id);
+    assert.deepEqual(client.releaseErrors, [undefined]);
+  });
 });
 
 void test('claim SQL admits a modeled lease exactly equal to statement_timestamp', async () => {
@@ -216,6 +392,26 @@ void test('renew and release fence on id, status, UUID token, and strict databas
   assert.match(required(client.calls[12]).text, /lease_owner\s*=\s*NULL/u);
 });
 
+void test('renew remains available for expired CONFIRM and RECONCILE claims without an intent expiry fence', async () => {
+  const cases: readonly [ExecutionIntentStatus, string][] = [
+    ['SUBMITTED', 'CONFIRM'],
+    ['UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILE'],
+  ];
+  for (const [status, purpose] of cases) {
+    const draft = executionDraft(`renew-${purpose.toLowerCase()}`, { expiresAtMs: NOW_MS - 1 });
+    const claim = claimedIntent(draft, status);
+    const client = new ScriptedClient([
+      command('BEGIN'), result([claimRow(draft, status)], 1), result([], 1), command('COMMIT'),
+    ]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    assert.equal(await repository.renew(claim, 5_000), true);
+    const renew = required(client.calls.find((call) => call.text.includes('SET lease_expires_at')));
+    assert.doesNotMatch(renew.text, /intent\.expires_at/u);
+    assert.match(renew.text, /lease_expires_at\s*>\s*statement_timestamp\(\)/u);
+  }
+});
+
 void test('claim rejects a well-shaped row that contradicts the requested lease identity', async () => {
   const draft = executionDraft('claim-contradiction');
   const client = new ScriptedClient([result([{
@@ -229,6 +425,28 @@ void test('claim rejects a well-shaped row that contradicts the requested lease 
   await expectCode(repository.claim({
     ownerId: 'expected-worker', leaseMs: 30_000, purpose: 'EXECUTE',
   }), 'INVALID_DATA');
+});
+
+void test('DRY_RUN rejects returned statuses and lease identities outside its exact claim', async () => {
+  const draft = executionDraft('dry-run-contradiction');
+  const rows: readonly Readonly<Record<string, unknown>>[] = [
+    { status: 'PROCESSING' },
+    { lease_owner: 'different-worker' },
+    { lease_token: '00000000-0000-4000-8000-000000000002' },
+    { lease_expires_at_ms: String(NOW_MS + 30_001) },
+  ];
+  for (const overrides of rows) {
+    const client = new ScriptedClient([(_text, values) => result([{
+      ...claimRow(draft, 'PENDING'), lease_owner: values?.[0], lease_token: values?.[2],
+      claim_at_ms: String(NOW_MS), ...overrides,
+    }], 1)]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    await expectCode(repository.claim({
+      ownerId: 'expected-worker', leaseMs: 30_000, purpose: 'DRY_RUN',
+    }), 'INVALID_DATA');
+    assert.deepEqual(client.releaseErrors, [true]);
+  }
 });
 
 void test('claim rejects a RETRY_READY parent without durable no-effect proof', async () => {
@@ -1691,7 +1909,7 @@ class ScriptedClient {
   public readonly calls: QueryCall[] = [];
   public released = false;
   public releaseAttempts = 0;
-  public readonly releaseErrors: boolean[] = [];
+  public readonly releaseErrors: (boolean | undefined)[] = [];
 
   public constructor(
     private readonly steps: Step[],
@@ -1705,7 +1923,7 @@ class ScriptedClient {
     return typeof step === 'function' ? step(text, values) : step;
   }
 
-  public release(error = false): void {
+  public release(error?: boolean): void {
     this.releaseAttempts += 1;
     this.releaseErrors.push(error);
     this.released = true;
@@ -1722,6 +1940,20 @@ class ScriptedPool implements ExecutionIntentPool {
     this.connectCount += 1;
     return this.client;
   }
+}
+
+function deferred<TValue>(): Readonly<{
+  promise: Promise<TValue>;
+  resolve: (value: TValue) => void;
+  reject: (reason?: unknown) => void;
+}> {
+  let resolve!: (value: TValue) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<TValue>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return Object.freeze({ promise, resolve, reject });
 }
 
 function result(rows: readonly Row[], rowCount: number | null): QueryResult {

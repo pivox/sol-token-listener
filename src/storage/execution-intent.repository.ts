@@ -46,6 +46,7 @@ export type ExecutionIntentRepositoryErrorCode =
   | 'INVALID_INPUT'
   | 'INVALID_DATA'
   | 'DATABASE_FAILURE'
+  | 'OPERATION_ABORTED'
   | 'INTENT_DUPLICATE'
   | 'INTENT_LEASE_LOST'
   | 'ATTEMPT_EXHAUSTED'
@@ -171,6 +172,7 @@ const CLAIM_SQL: Readonly<Record<ExecutionClaimPurpose, string>> = Object.freeze
     'SIGNED_NOT_SUBMITTED', 'CONFIRMED', 'RECONCILING',
     'UNKNOWN_REQUIRES_RECONCILIATION'
   )`, false),
+  DRY_RUN: dryRunClaimSql(),
 });
 
 export class PostgresExecutionIntentRepository implements ExecutionIntentRepository {
@@ -241,11 +243,12 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     readonly ownerId: string;
     readonly leaseMs: number;
     readonly purpose: ExecutionClaimPurpose;
-  }>): Promise<ClaimedExecutionIntent | null> {
+  }>, signal?: AbortSignal): Promise<ClaimedExecutionIntent | null> {
     return this.safely(async () => {
       const options = claimOptions(optionsValue);
+      if (signal?.aborted === true) throw operationAbortedError();
       const leaseToken = randomUUID();
-      return this.withClient(async (client) => {
+      return this.withClaimClient(signal, options.purpose === 'DRY_RUN', async (client) => {
         const claimed = await client.query(
           CLAIM_SQL[options.purpose],
           [options.ownerId, options.leaseMs, leaseToken],
@@ -259,6 +262,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         if (!statusMatchesPurpose(claim.intent.status, options.purpose)) throw dataError();
         if (claim.leaseExpiresAtMs - claimAtMs !== options.leaseMs) throw dataError();
         if (options.purpose === 'EXECUTE' && claim.intent.expiresAtMs <= claimAtMs) throw dataError();
+        if (options.purpose === 'DRY_RUN' && claim.intent.expiresAtMs <= claim.leaseExpiresAtMs) {
+          throw dataError();
+        }
         return claim;
       });
     });
@@ -662,6 +668,41 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     throw databaseError((primaryFailure === undefined ? 0 : 1) + (releaseFailed ? 1 : 0));
   }
 
+  private async withClaimClient<TResult>(
+    signal: AbortSignal | undefined,
+    evictOnFailure: boolean,
+    run: (client: ExecutionIntentClient) => Promise<TResult>,
+  ): Promise<TResult> {
+    let client: ExecutionIntentClient;
+    try {
+      client = await this.pool.connect();
+    } catch {
+      throw databaseError(1);
+    }
+    if (signal?.aborted === true) abortBeforeClaim(client);
+    let result: TResult | undefined;
+    let primaryFailure: unknown;
+    let completed = false;
+    let releaseFailed = false;
+    try {
+      result = await run(client);
+      completed = true;
+    } catch (error) {
+      primaryFailure = error;
+    } finally {
+      try {
+        if (completed) client.release();
+        else if (evictOnFailure) client.release(true);
+        else client.release();
+      } catch {
+        releaseFailed = true;
+      }
+    }
+    if (completed && !releaseFailed) return result as TResult;
+    if (!releaseFailed && isInternalError(primaryFailure)) throw primaryFailure;
+    throw databaseError((primaryFailure === undefined ? 0 : 1) + (releaseFailed ? 1 : 0));
+  }
+
   private async safely<TResult>(run: () => Promise<TResult>): Promise<TResult> {
     try {
       return await run();
@@ -695,6 +736,37 @@ function claimSql(statusPredicate: string, requireLiveIntent: boolean): string {
         'milliseconds', statement_timestamp() + ($2::BIGINT * INTERVAL '1 millisecond')
       ),
       updated_at=operation.at
+  FROM candidate CROSS JOIN operation
+  WHERE intent.id=candidate.id
+  RETURNING ${CLAIM_PROJECTION}`;
+}
+
+function dryRunClaimSql(): string {
+  return `WITH operation AS MATERIALIZED (
+    SELECT date_trunc('milliseconds', statement_timestamp()) AS at
+  ), candidate AS MATERIALIZED (
+    SELECT intent.id
+    FROM execution_intents AS intent CROSS JOIN operation
+    WHERE intent.status IN ('PENDING', 'RETRY_READY')
+      AND intent.expires_at > operation.at + ($2::BIGINT * INTERVAL '1 millisecond')
+      AND (intent.lease_expires_at IS NULL
+        OR intent.lease_expires_at <= operation.at)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM execution_dry_run_assessments AS assessment
+        WHERE assessment.intent_id = intent.id
+          AND assessment.evaluator_version = 1
+      )
+    ORDER BY intent.requested_at,intent.id
+    FOR UPDATE OF intent SKIP LOCKED
+    LIMIT 1
+  )
+  UPDATE execution_intents AS intent
+  SET lease_owner=$1,
+      lease_token=$3::UUID,
+      lease_expires_at=date_trunc(
+        'milliseconds', operation.at + ($2::BIGINT * INTERVAL '1 millisecond')
+      )
   FROM candidate CROSS JOIN operation
   WHERE intent.id=candidate.id
   RETURNING ${CLAIM_PROJECTION}`;
@@ -1183,7 +1255,9 @@ function evidenceJson(evidence: ExecutionIntentTransitionEvidenceV1): string {
 }
 
 function claimPurpose(value: unknown): ExecutionClaimPurpose {
-  if (value !== 'EXECUTE' && value !== 'CONFIRM' && value !== 'RECONCILE') throw inputError();
+  if (value !== 'EXECUTE' && value !== 'CONFIRM' && value !== 'RECONCILE' && value !== 'DRY_RUN') {
+    throw inputError();
+  }
   return value;
 }
 
@@ -1196,6 +1270,7 @@ function statusMatchesPurpose(
       || value === 'PROCESSING' || value === 'SIMULATED';
   }
   if (purpose === 'CONFIRM') return value === 'SUBMITTED';
+  if (purpose === 'DRY_RUN') return value === 'PENDING' || value === 'RETRY_READY';
   return value === 'SIGNED_NOT_SUBMITTED' || value === 'CONFIRMED'
     || value === 'RECONCILING' || value === 'UNKNOWN_REQUIRES_RECONCILIATION';
 }
@@ -1337,6 +1412,10 @@ function leaseLostError(): ExecutionIntentRepositoryError {
   return repositoryError('INTENT_LEASE_LOST');
 }
 
+function operationAbortedError(): ExecutionIntentRepositoryError {
+  return repositoryError('OPERATION_ABORTED');
+}
+
 function inputError(): ExecutionIntentRepositoryError {
   return repositoryError('INVALID_INPUT');
 }
@@ -1368,6 +1447,16 @@ function repositoryError(
 function isInternalError(value: unknown): value is ExecutionIntentRepositoryError {
   return typeof value === 'object' && value !== null
     && INTERNAL_ERRORS.has(value as ExecutionIntentRepositoryError);
+}
+
+function abortBeforeClaim(client: ExecutionIntentClient): never {
+  try {
+    client.release();
+  } catch {
+    try { client.release(true); } catch { /* The fixed database error remains authoritative. */ }
+    throw databaseError(1);
+  }
+  throw operationAbortedError();
 }
 
 function requiredRow(rows: readonly Row[]): Row {

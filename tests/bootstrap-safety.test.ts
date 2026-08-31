@@ -56,6 +56,31 @@ void test('production qualification import graph has no signing, simulation, or 
   assert.deepEqual(violations, []);
 });
 
+void test('boundary guard permits only the vetted computed iterator and validator calls', () => {
+  const path = fileURLToPath(new URL('../src/application/production-listener-factory.ts', import.meta.url));
+  for (const source of [
+    'body[Symbol.asyncIterator]();',
+    'OBSERVED_CONDITION_VALUE_VALIDATORS[key]?.(value);',
+    'THRESHOLD_CONDITION_VALUE_VALIDATORS[key]?.(value);',
+  ]) {
+    assert.deepEqual(executionBoundaryViolations(source, path, repositoryRoot), [], source);
+  }
+});
+
+void test('boundary guard rejects optional-member and generic variants of vetted computed calls', () => {
+  const path = fileURLToPath(new URL('../src/application/production-listener-factory.ts', import.meta.url));
+  for (const source of [
+    'body?.[Symbol.asyncIterator]();',
+    'OBSERVED_CONDITION_VALUE_VALIDATORS?.[key]?.(value);',
+    'THRESHOLD_CONDITION_VALUE_VALIDATORS?.[key]?.(value);',
+    'body[Symbol.asyncIterator]<unknown>();',
+    'OBSERVED_CONDITION_VALUE_VALIDATORS[key]?.<unknown>(value);',
+    'THRESHOLD_CONDITION_VALUE_VALIDATORS[key]?.<unknown>(value);',
+  ]) {
+    assert.ok(executionBoundaryViolations(source, path, repositoryRoot).length > 0, source);
+  }
+});
+
 void test('production bootstrap activates only the acknowledged observational WebSocket graph', async () => {
   const path = '../src/application/production-listener-factory.ts';
   const source = await readFile(new URL(path, import.meta.url), 'utf8');

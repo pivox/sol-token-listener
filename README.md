@@ -31,10 +31,11 @@ Un mapper pur sait dériver un draft depuis l'événement canonique
 
 Cette fondation est entièrement inerte : le mapper et le repository ne sont
 composés ni dans le listener, ni dans l'API, ni dans le worker paper. Il
-n'existe encore aucun processus executor, wallet, chargement de clé,
-construction ou simulation de transaction, signature ou envoi. Les capacités
-#51-C à #51-G ne sont donc pas disponibles et les seuls modes exécutables
-restent `observe` et `paper`.
+n'existe aucun wallet, chargement de clé, chemin live, signature ou envoi. Le
+lot #51-C livre désormais un processus executor dry-run PostgreSQL séparé,
+sans construction ni simulation de transaction et sans consommer l'intention.
+#51-D à #51-G ne sont pas livrées et les seuls modes du listener restent
+`observe` et `paper`.
 
 Configuration minimale de la stratégie de création, toujours simulée :
 
@@ -122,6 +123,33 @@ npm run check
 npm run lint
 npm test
 ```
+
+## Exécuteur dry-run PostgreSQL (#51-C)
+
+L'exécuteur est un processus séparé, PostgreSQL-only, qui ne requiert ni RPC Solana ni wallet. Il ne charge aucune clé, ne signe rien et ne soumet aucune transaction. Le listener reste limité à `observe`|`paper`; l'exécuteur ne modifie pas ce contrat et le live est impossible dans #51-C.
+
+Après avoir configuré un `DATABASE_URL` PostgreSQL, appliquer ce runbook exact :
+
+```bash
+npm run build:backend
+npm run db:migrate
+EXECUTOR_MODE=dry-run DATABASE_URL=postgresql://... npm run executor:start
+```
+
+Les paramètres executor sont `EXECUTOR_MODE=dry-run`, `DATABASE_URL`,
+`EXECUTOR_POLL_MS=1000`, `EXECUTOR_LEASE_MS=30000`,
+`EXECUTOR_DB_STATEMENT_TIMEOUT_MS=3000`,
+`EXECUTOR_SHUTDOWN_GRACE_MS=10000` et `LIVE_TRADING_ENABLED=false`.
+La dernière valeur doit rester `false`; aucune clé, keypair, endpoint RPC ou
+réglage de signature/soumission ne doit être ajouté à l'environnement executor.
+
+Pour chaque intention `PENDING` ou `RETRY_READY` éligible, #51-C enregistre
+une assessment déterministe `FOUNDATION_VALIDATED` à couverture
+`INTENT_AND_LEASE_ONLY`. Ses gates sont `NOT_RUN` pour la quote, `NOT_RUN` pour
+la construction, `NOT_RUN` pour la simulation, `NOT_RUN` pour la signature et
+`NOT_RUN` pour la soumission. Ce rapport n'est ni une simulation Solana ni un
+`PASS` de trading : il ne consomme pas l'intention, ne crée ni tentative ni
+transition, et libère seulement son lease technique. L'intention reste donc disponible pour #51-D, qui reste requis pour quote, build et `simulateTransaction`; les étapes #51-E à #51-G ne sont pas livrées par ce processus.
 
 ## Console frontend indépendante
 

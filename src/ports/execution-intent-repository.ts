@@ -5,7 +5,7 @@ import type {
   ExecutionIntentV1,
 } from '../domain/execution-intent.js';
 
-export type ExecutionClaimPurpose = 'EXECUTE' | 'CONFIRM' | 'RECONCILE';
+export type ExecutionClaimPurpose = 'EXECUTE' | 'CONFIRM' | 'RECONCILE' | 'DRY_RUN';
 
 export interface ClaimedExecutionIntent {
   readonly intent: ExecutionIntentV1;
@@ -41,7 +41,7 @@ export interface ExecutionIntentRepository {
     readonly ownerId: string;
     readonly leaseMs: number;
     readonly purpose: ExecutionClaimPurpose;
-  }>): Promise<ClaimedExecutionIntent | null>;
+  }>, signal?: AbortSignal): Promise<ClaimedExecutionIntent | null>;
   beginAttempt(claim: ClaimedExecutionIntent): Promise<Readonly<{
     readonly intentId: string;
     readonly attemptNumber: number;

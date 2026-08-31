@@ -66,6 +66,7 @@ const canonicalMigrations = Object.freeze([
   '029_paper_finality_claim_scheduler.sql',
   '030_listener_websocket_health.sql',
   '031_execution_intents.sql',
+  '032_execution_dry_run_assessments.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
@@ -73,6 +74,7 @@ const canonicalRetentionCounters = Object.freeze([
   'creatorProfiles',
   'domainEvents',
   'executionAttempts',
+  'executionDryRunAssessments',
   'executionIntents',
   'executionIntentTransitions',
   'holderSnapshots',
