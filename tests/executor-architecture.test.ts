@@ -7,6 +7,7 @@ import ts from 'typescript';
 import {
   executorBoundaryViolations,
   literalRuntimeModuleSpecifiers,
+  riskFoundationBoundaryViolations,
   simulationOnlyExecutorBoundaryViolations,
 } from './helpers/execution-boundary.js';
 import { reportExecutorEntrypointFailure } from '../src/executor/main.js';
@@ -509,6 +510,53 @@ void test('main exposes only executor scripts, exact bounded pool options and no
   ]) assert.match(main, new RegExp(`\\b${option}\\b`, 'u'));
   assert.doesNotMatch(main, /\bmigrateDatabase\b/u);
   assert.doesNotMatch(main, /(?:SOLANA_(?:HTTP|WS)_RPC_URL|PRIVATE_KEY|SECRET_KEY|KEYPAIR)/u);
+});
+
+void test('risk foundation source and dist graphs remain inert and closed', async () => {
+  for (const relativeEntry of [
+    'src/executor-risk/admission-service.ts',
+    'src/executor-risk/reconciliation-service.ts',
+    'src/storage/execution-risk.repository.ts',
+    'dist/src/executor-risk/admission-service.js',
+    'dist/src/executor-risk/reconciliation-service.js',
+    'dist/src/storage/execution-risk.repository.js',
+  ]) {
+    const entry = resolve(repositoryRoot, relativeEntry);
+    await access(entry);
+    const violations = [...(await readGraph(entry)).entries()].flatMap(([path, source]) =>
+      riskFoundationBoundaryViolations(source, path, repositoryRoot));
+    assert.deepEqual(violations, [], relativeEntry);
+  }
+  const fixturePath = resolve(repositoryRoot, 'src/executor-risk/admission-service.ts');
+  for (const fixture of [
+    "import '../listener/service.js';",
+    "import '../api/server.js';",
+    "import '../paper/paper-trading-engine.js';",
+    "import '../markets/raydium/raydium-cpmm.adapter.js';",
+    "import { Keypair } from '@solana/web3.js'; new Keypair();",
+    'client.sendTransaction();',
+    'client.submitTransaction();',
+    'client.signTransaction();',
+    "await import('../storage/database.js');",
+    "require('../storage/database.js');",
+    'eval(source);',
+  ]) assert.ok(
+    riskFoundationBoundaryViolations(fixture, fixturePath, repositoryRoot).length > 0,
+    fixture,
+  );
+});
+
+void test('no command or environment setting activates the risk foundation', async () => {
+  const [main, packageText, environment] = await Promise.all([
+    readFile(resolve(repositoryRoot, 'src/executor/main.ts'), 'utf8'),
+    readFile(resolve(repositoryRoot, 'package.json'), 'utf8'),
+    readFile(resolve(repositoryRoot, '.env.example'), 'utf8'),
+  ]);
+  assert.doesNotMatch(main, /executor-risk|execution-risk\.repository|admitBuy|reconcile/iu);
+  const scripts = (JSON.parse(packageText) as { scripts?: Record<string, unknown> }).scripts ?? {};
+  assert.equal(Object.keys(scripts).some((name) => /risk|live/iu.test(name)), false);
+  assert.doesNotMatch(environment, /^EXECUTOR_(?:RISK|ADMISSION|RECONCILIATION|LIVE)_[A-Z_]*=/gmu);
+  assert.doesNotMatch(environment, /^EXECUTOR_MODE=(?:risk|live|armed)$/gmu);
 });
 
 void test('operator documentation describes the PostgreSQL-only, non-consuming executor dry-run', async () => {

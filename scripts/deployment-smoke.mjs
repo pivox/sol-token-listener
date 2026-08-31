@@ -68,6 +68,7 @@ const canonicalMigrations = Object.freeze([
   '031_execution_intents.sql',
   '032_execution_dry_run_assessments.sql',
   '033_execution_simulation_artifacts.sql',
+  '034_execution_risk_reconciliation.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
@@ -78,6 +79,15 @@ const canonicalRetentionCounters = Object.freeze([
   'executionDryRunAssessments',
   'executionIntents',
   'executionIntentTransitions',
+  'executionRiskAdmissionReports',
+  'executionRiskFaults',
+  'executionRiskProviderOperations',
+  'executionRiskProviderSnapshots',
+  'executionRiskRateLimitEvents',
+  'executionRiskReconciliationEvidence',
+  'executionRiskReservations',
+  'executionRiskTombstones',
+  'executionRiskWalletSnapshots',
   'executionSimulationArtifacts',
   'holderSnapshots',
   'launchTrades',

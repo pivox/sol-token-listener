@@ -220,7 +220,7 @@ void test('execution intent migration applies and replays on an isolated schema'
 
   await withTemporarySchema(databaseUrl, 'execution_intents', async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '033_execution_simulation_artifacts.sql');
+    assert.equal(applied.at(-1), '034_execution_risk_reconciliation.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     const schemaState = await pool.query(`SELECT current_schema() AS schema,
@@ -919,7 +919,11 @@ async function assertCatalogContract(pool: InstanceType<typeof pg.Pool>): Promis
   assert.deepEqual(columns.rows, [
     ...['execution_attempts'].flatMap((table_name) => [
       'intent_id', 'attempt_number', 'status', 'effective_venue', 'provider_id', 'started_at',
-      'completed_at', 'reason_code', 'purge_after',
+      'completed_at', 'reason_code', 'purge_after', 'reconciliation_signature',
+      'reconciliation_blockhash', 'reconciliation_last_valid_block_height',
+      'reconciliation_message_hash', 'reconciliation_build_fingerprint',
+      'reconciliation_snapshot_fingerprint', 'reconciliation_maximum_fee_lamports',
+      'reconciliation_maximum_fee_payer_lamport_debit',
     ].map((column_name) => ({ table_name, column_name }))),
     ...['execution_intent_tombstones'].flatMap((table_name) => [
       'intent_id', 'payload_version', 'logical_order_key', 'decision_fingerprint', 'retired_at',

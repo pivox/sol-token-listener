@@ -288,6 +288,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '030_listener_websocket_health.sql',
       '031_execution_intents.sql', '032_execution_dry_run_assessments.sql',
       '033_execution_simulation_artifacts.sql',
+      '034_execution_risk_reconciliation.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

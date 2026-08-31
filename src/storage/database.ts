@@ -157,6 +157,15 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly executionIntentTransitions: number;
   readonly executionAttempts: number;
   readonly executionIntents: number;
+  readonly executionRiskRateLimitEvents: number;
+  readonly executionRiskReconciliationEvidence: number;
+  readonly executionRiskFaults: number;
+  readonly executionRiskReservations: number;
+  readonly executionRiskAdmissionReports: number;
+  readonly executionRiskWalletSnapshots: number;
+  readonly executionRiskProviderOperations: number;
+  readonly executionRiskProviderSnapshots: number;
+  readonly executionRiskTombstones: number;
   readonly stateTransitions: number;
   readonly observedWalletPositions: number;
   readonly holderSnapshots: number;
@@ -405,6 +414,134 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       || !Number.isFinite(executionIntentCutoff.getTime())) {
       throw new Error('PostgreSQL returned an invalid execution intent purge cutoff.');
     }
+    const executionRiskRateLimitEvents = await client.query(
+      `DELETE FROM execution_provider_rate_limit_events event
+       WHERE event.event_id IN (
+         SELECT candidate.event_id FROM execution_provider_rate_limit_events candidate
+         WHERE candidate.purge_after <= $1::TIMESTAMPTZ
+         ORDER BY candidate.event_id LIMIT 1000 FOR UPDATE
+       )`,
+      [executionIntentCutoff],
+    );
+    const executionRiskWalletSnapshots = await client.query(
+      `DELETE FROM execution_wallet_snapshots snapshot
+       WHERE snapshot.snapshot_id IN (
+         SELECT candidate.snapshot_id FROM execution_wallet_snapshots candidate
+         WHERE candidate.purge_after <= $1::TIMESTAMPTZ
+         ORDER BY candidate.snapshot_id LIMIT 1000 FOR UPDATE
+       )`,
+      [executionIntentCutoff],
+    );
+    const providerSnapshotCohort = await client.query<{ readonly snapshot_id: string }>(
+      `SELECT snapshot.snapshot_id FROM execution_provider_usage_snapshots snapshot
+       WHERE snapshot.purge_after <= $1::TIMESTAMPTZ
+         AND snapshot.billing_period_ends_at <= $1::TIMESTAMPTZ
+       ORDER BY snapshot.snapshot_id LIMIT 1000 FOR UPDATE`,
+      [executionIntentCutoff],
+    );
+    const providerSnapshotIds = providerSnapshotCohort.rows.map(({ snapshot_id }) => snapshot_id);
+    const executionRiskProviderOperations = await client.query(
+      `DELETE FROM execution_provider_usage_counters counter
+       WHERE counter.snapshot_id = ANY($1::TEXT[])`,
+      [providerSnapshotIds],
+    );
+    const executionRiskProviderSnapshots = await client.query(
+      `DELETE FROM execution_provider_usage_snapshots snapshot
+       WHERE snapshot.snapshot_id = ANY($1::TEXT[])
+         AND snapshot.purge_after <= $2::TIMESTAMPTZ
+         AND snapshot.billing_period_ends_at <= $2::TIMESTAMPTZ`,
+      [providerSnapshotIds, executionIntentCutoff],
+    );
+    const reservationCohort = await client.query<{
+      readonly reservation_id: string;
+      readonly admission_report_id: string;
+    }>(
+      `SELECT reservation.reservation_id,reservation.admission_report_id
+       FROM execution_exposure_reservations reservation
+       JOIN execution_risk_admission_reports report
+         ON report.report_id=reservation.admission_report_id
+       WHERE reservation.state IN ('CONSUMED','RELEASED')
+         AND reservation.purge_after <= $1::TIMESTAMPTZ
+       ORDER BY reservation.reservation_id LIMIT 1000
+       FOR UPDATE OF reservation,report`,
+      [executionIntentCutoff],
+    );
+    const reservationIds = reservationCohort.rows.map(({ reservation_id }) => reservation_id);
+    const admittedReportIds = reservationCohort.rows.map(
+      ({ admission_report_id }) => admission_report_id,
+    );
+    const rejectedReportCohort = await client.query<{ readonly report_id: string }>(
+      `SELECT report.report_id FROM execution_risk_admission_reports report
+       WHERE report.decision='REJECTED' AND report.purge_after <= $1::TIMESTAMPTZ
+       ORDER BY report.report_id LIMIT 1000 FOR UPDATE`,
+      [executionIntentCutoff],
+    );
+    const reportIds = [...new Set([
+      ...admittedReportIds,
+      ...rejectedReportCohort.rows.map(({ report_id }) => report_id),
+    ])];
+    const reportTombstones = await client.query(
+      `INSERT INTO execution_risk_tombstones (
+         tombstone_id,payload_version,source_kind,source_id,source_fingerprint
+       ) SELECT
+         'execution_risk_tombstone_'
+           || md5('ADMISSION_REPORT:' || report.report_id)
+           || md5(report.report_id || ':ADMISSION_REPORT'),
+         1,'ADMISSION_REPORT',report.report_id,report.report_fingerprint
+       FROM execution_risk_admission_reports report
+       WHERE report.report_id = ANY($1::TEXT[])
+       ORDER BY report.report_id`,
+      [reportIds],
+    );
+    const reservationTombstones = await client.query(
+      `INSERT INTO execution_risk_tombstones (
+         tombstone_id,payload_version,source_kind,source_id,source_fingerprint
+       ) SELECT
+         'execution_risk_tombstone_'
+           || md5('EXPOSURE_RESERVATION:' || reservation.reservation_id)
+           || md5(reservation.reservation_id || ':EXPOSURE_RESERVATION'),
+         1,'EXPOSURE_RESERVATION',reservation.reservation_id,reservation.intent_fingerprint
+       FROM execution_exposure_reservations reservation
+       WHERE reservation.reservation_id = ANY($1::TEXT[])
+       ORDER BY reservation.reservation_id`,
+      [reservationIds],
+    );
+    const executionRiskReconciliationEvidence = await client.query(
+      `DELETE FROM execution_reconciliation_evidence evidence
+       WHERE evidence.reservation_id = ANY($1::TEXT[])
+         AND evidence.purge_after <= $2::TIMESTAMPTZ`,
+      [reservationIds, executionIntentCutoff],
+    );
+    const executionRiskFaults = await client.query(
+      `DELETE FROM execution_fault_ledger fault
+       WHERE fault.fault_id IN (
+         SELECT candidate.fault_id FROM execution_fault_ledger candidate
+         WHERE candidate.purge_after <= $1::TIMESTAMPTZ
+         ORDER BY candidate.fault_id LIMIT 1000 FOR UPDATE
+       )`,
+      [executionIntentCutoff],
+    );
+    const executionRiskReservations = await client.query(
+      `DELETE FROM execution_exposure_reservations reservation
+       WHERE reservation.reservation_id = ANY($1::TEXT[])
+         AND reservation.state IN ('CONSUMED','RELEASED')
+         AND reservation.purge_after <= $2::TIMESTAMPTZ`,
+      [reservationIds, executionIntentCutoff],
+    );
+    const executionRiskAdmissionReports = await client.query(
+      `DELETE FROM execution_risk_admission_reports report
+       WHERE report.report_id = ANY($1::TEXT[])
+         AND (
+           (report.decision='REJECTED' AND report.purge_after <= $2::TIMESTAMPTZ)
+           OR (report.decision='ADMITTED' AND NOT EXISTS (
+             SELECT 1 FROM execution_exposure_reservations reservation
+             WHERE reservation.admission_report_id=report.report_id
+           ))
+         )`,
+      [reportIds, executionIntentCutoff],
+    );
+    const executionRiskTombstones = (reportTombstones.rowCount ?? 0)
+      + (reservationTombstones.rowCount ?? 0);
     const executionIntentCohort = await client.query<{ readonly id: string }>(
       `SELECT intent.id
        FROM execution_intents intent
@@ -412,6 +549,22 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          AND intent.terminal_at IS NOT NULL
          AND intent.reconciliation_completed_at IS NOT NULL
          AND intent.purge_after <= $1::TIMESTAMPTZ
+         AND NOT EXISTS (
+           SELECT 1 FROM execution_risk_admission_reports report
+           WHERE report.intent_id=intent.id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM execution_exposure_reservations reservation
+           WHERE reservation.intent_id=intent.id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM execution_reconciliation_evidence evidence
+           WHERE evidence.intent_id=intent.id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM execution_fault_ledger fault
+           WHERE fault.intent_id=intent.id
+         )
        ORDER BY intent.id
        FOR UPDATE OF intent`,
       [executionIntentCutoff],
@@ -768,6 +921,16 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       executionIntentTransitions: executionIntentTransitions.rowCount ?? 0,
       executionAttempts: executionAttempts.rowCount ?? 0,
       executionIntents: executionIntents.rowCount ?? 0,
+      executionRiskRateLimitEvents: executionRiskRateLimitEvents.rowCount ?? 0,
+      executionRiskReconciliationEvidence:
+        executionRiskReconciliationEvidence.rowCount ?? 0,
+      executionRiskFaults: executionRiskFaults.rowCount ?? 0,
+      executionRiskReservations: executionRiskReservations.rowCount ?? 0,
+      executionRiskAdmissionReports: executionRiskAdmissionReports.rowCount ?? 0,
+      executionRiskWalletSnapshots: executionRiskWalletSnapshots.rowCount ?? 0,
+      executionRiskProviderOperations: executionRiskProviderOperations.rowCount ?? 0,
+      executionRiskProviderSnapshots: executionRiskProviderSnapshots.rowCount ?? 0,
+      executionRiskTombstones,
       stateTransitions: transitions.rowCount ?? 0,
       observedWalletPositions: observedWalletPositions.rowCount ?? 0,
       holderSnapshots: holderSnapshots.rowCount ?? 0,

@@ -448,8 +448,8 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
   assert.match(retention, /canonicalRetentionCounters/);
   assert.match(
     smoke,
-    /'executionAttempts',\n {2}'executionDryRunAssessments',\n {2}'executionIntents',\n {2}'executionIntentTransitions',\n {2}'executionSimulationArtifacts',/u,
-    'deployment smoke must expect the five sorted execution retention counters',
+    /'executionAttempts',\n {2}'executionDryRunAssessments',\n {2}'executionIntents',\n {2}'executionIntentTransitions',\n {2}'executionRiskAdmissionReports',\n {2}'executionRiskFaults',\n {2}'executionRiskProviderOperations',\n {2}'executionRiskProviderSnapshots',\n {2}'executionRiskRateLimitEvents',\n {2}'executionRiskReconciliationEvidence',\n {2}'executionRiskReservations',\n {2}'executionRiskTombstones',\n {2}'executionRiskWalletSnapshots',\n {2}'executionSimulationArtifacts',/u,
+    'deployment smoke must expect every sorted execution retention counter',
   );
   assert.doesNotMatch(retention, /\.split\('\n'\).*\.filter/s);
   assert.doesNotMatch(retention, /new Error\(`[^`]*\$\{(?:stdout|stderr)\}/);

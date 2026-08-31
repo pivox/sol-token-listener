@@ -7,6 +7,7 @@ import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '033_execution_simulation_artifacts.sql';
+const latestMigrationName = '034_execution_risk_reconciliation.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);
@@ -93,7 +94,7 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, 'execution_simulation_apply', async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.equal(applied.at(-1), latestMigrationName);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
   });
@@ -109,7 +110,7 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
     }
     const parent = parentDraft('upgrade');
     await insertParentAndAttempt(pool, parent);
-    assert.deepEqual(await migrateDatabase({ pool }), [migrationName]);
+    assert.deepEqual(await migrateDatabase({ pool }), [migrationName, latestMigrationName]);
     assert.equal((await pool.query('SELECT id FROM execution_intents WHERE id=$1', [parent.id])).rowCount, 1);
   });
 });

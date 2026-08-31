@@ -86,6 +86,23 @@ const SIMULATION_ONLY_FORBIDDEN_IDENTIFIERS = new Set([
   'simulateTransaction',
 ]);
 const AUDITED_SIMULATION_PROVIDER_PATH = /^(?:dist\/)?src\/executor-simulation\/provider-session\.(?:js|ts)$/u;
+const RISK_FOUNDATION_ALLOWED_BARE_MODULES = new Set(['pg']);
+const RISK_FOUNDATION_ALLOWED_NODE_BUILTINS = new Set([
+  'node:crypto', 'node:fs/promises', 'node:path', 'node:url', 'node:util/types',
+]);
+const RISK_FOUNDATION_ALLOWED_LOCAL_MODULES = [
+  /^(?:dist\/)?src\/executor-risk\/(?:admission-service|reconciliation-service)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/execution-(?:fault-policy|intent|provider-quota|reconciliation|risk-policy)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/ports\/execution-(?:reconciliation-gateway|risk-repository)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/(?:database|execution-risk\.repository)\.(?:js|ts)$/u,
+];
+const RISK_FOUNDATION_FORBIDDEN_IDENTIFIERS = new Set([
+  'Keypair', 'WalletSigner', 'Signer', 'SecretLoader',
+  'createRequire', 'getBuiltinModule', 'eval', 'Function', 'global', 'globalThis',
+  'simulateTransaction', 'sendTransaction', 'sendRawTransaction',
+  'sendAndConfirmTransaction', 'signTransaction', 'signAllTransactions', 'signMessage',
+  'submitTransaction', 'submitSignedTransaction', 'submitRawTransaction',
+]);
 
 export function executionBoundaryViolations(sourceText: string, sourcePath: string, repositoryRoot: string): readonly string[] {
   const sourceFile = ts.createSourceFile(sourcePath, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -289,6 +306,52 @@ export function simulationOnlyExecutorBoundaryViolations(
     ts.forEachChild(node, visit);
   };
   appendReflectiveExecutorCapabilityViolations(sourceFile, violations);
+  visit(sourceFile);
+  return Object.freeze(violations);
+}
+
+/** Closed, inert graph used by the #51-E risk and reconciliation foundation. */
+export function riskFoundationBoundaryViolations(
+  sourceText: string,
+  sourcePath: string,
+  repositoryRoot: string,
+): readonly string[] {
+  const sourceFile = ts.createSourceFile(
+    sourcePath,
+    sourceText,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  const violations = [...executionBoundaryViolations(sourceText, sourcePath, repositoryRoot)];
+  for (const specifier of literalRuntimeModuleSpecifiers(sourceText, sourcePath)) {
+    if (specifier.startsWith('.') || specifier.startsWith('/')) {
+      const normalized = specifier.replace(/[?#].*$/u, '');
+      const target = normalized.startsWith('/')
+        ? resolve(normalized)
+        : resolve(dirname(sourcePath), normalized);
+      const targetPath = relative(repositoryRoot, target).replaceAll('\\', '/');
+      if (!RISK_FOUNDATION_ALLOWED_LOCAL_MODULES.some((pattern) => pattern.test(targetPath))) {
+        violations.push(`Risk foundation local module is outside the allowlist: ${specifier}`);
+      }
+      continue;
+    }
+    if (!RISK_FOUNDATION_ALLOWED_BARE_MODULES.has(specifier)
+      && !RISK_FOUNDATION_ALLOWED_NODE_BUILTINS.has(specifier)) {
+      violations.push(`Risk foundation module is outside the allowlist: ${specifier}`);
+    }
+  }
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && (
+      node.expression.kind === ts.SyntaxKind.ImportKeyword
+      || (ts.isIdentifier(node.expression) && node.expression.text === 'require')
+    )) violations.push('Dynamic module loading is forbidden in the risk foundation.');
+    if (ts.isIdentifier(node) && (
+      RISK_FOUNDATION_FORBIDDEN_IDENTIFIERS.has(node.text)
+      || /(?:load.*secret|secret.*load)/iu.test(node.text)
+    )) violations.push(`Forbidden risk foundation capability: ${node.text}`);
+    ts.forEachChild(node, visit);
+  };
   visit(sourceFile);
   return Object.freeze(violations);
 }

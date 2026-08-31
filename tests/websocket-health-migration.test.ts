@@ -10,7 +10,8 @@ const migrationsDirectory = new URL('../migrations/', import.meta.url);
 const healthMigrationName = '030_listener_websocket_health.sql';
 const executionIntentMigrationName = '031_execution_intents.sql';
 const executionDryRunMigrationName = '032_execution_dry_run_assessments.sql';
-const latestMigrationName = '033_execution_simulation_artifacts.sql';
+const executionSimulationMigrationName = '033_execution_simulation_artifacts.sql';
+const latestMigrationName = '034_execution_risk_reconciliation.sql';
 const migrationUrl = new URL(`../migrations/${healthMigrationName}`, import.meta.url);
 
 void test('websocket health migration upgrades legacy state without trusting its websocket evidence', async (context) => {
@@ -43,6 +44,7 @@ void test('websocket health migration upgrades legacy state without trusting its
       healthMigrationName,
       executionIntentMigrationName,
       executionDryRunMigrationName,
+      executionSimulationMigrationName,
       latestMigrationName,
     ]);
     const beforeReplay = await canonicalRow(pool);
@@ -69,7 +71,7 @@ void test('websocket health migration upgrades legacy state without trusting its
   });
 });
 
-void test('websocket health migration applies on an empty schema and records current migration 033', async (context) => {
+void test('websocket health migration applies on an empty schema and records current migration 034', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
     context.skip('TEST_DATABASE_URL absent: websocket health migration test skipped');

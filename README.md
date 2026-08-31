@@ -35,9 +35,14 @@ n'existe aucun wallet, chargement de clé, chemin live, signature ou envoi. Le
 lot #51-C livre désormais un processus executor dry-run PostgreSQL séparé,
 sans construction ni simulation de transaction et sans consommer l'intention.
 #51-D livre un second mode executor `simulation-only`, disponible pour produire
-une preuve non signée sans soumission. Les lots #51-E, #51-F et #51-G restent
-obligatoires avant toute transaction réelle. Les seuls modes du listener
-restent `observe` et `paper`.
+une preuve non signée sans soumission. #51-E livre désormais uniquement la
+fondation domaine/PostgreSQL de sizing, quota provider, admission, réservation,
+réconciliation, compteur de pannes et rétention. Aucun script ni processus
+courant ne compose ou n'appelle `admitBuy`, `recordFault`, `reconcile` ou
+`recordReconciledSuccess` : cette fondation reste inerte. #51-F (preflight et
+armement manuel) et #51-G (signature/soumission sous gates compensatoires)
+restent obligatoires avant toute transaction réelle. Les seuls modes du
+listener restent `observe` et `paper`.
 
 Configuration minimale de la stratégie de création, toujours simulée :
 
@@ -210,10 +215,11 @@ nouvelle intention et refaire quote, build et simulation sous les gates alors
 applicables. Aucun secret n'est accepté et aucun `signTransaction`,
 `sendTransaction` ou mode live n'existe dans ce graphe.
 
-La validation terrain #49 des 50 positions Mainnet a été sautée : elle reste
-non exécutée, non validée et n'est pas un `PASS`. #51-E (quota/sizing/retry),
-#51-F (preflight et armement manuel) puis #51-G (signature/soumission sous
-gates compensatoires) demeurent obligatoires avant le moindre trade réel.
+La validation terrain #49 des 50 positions Mainnet a été sautée : son statut
+reste explicitement `NON_EXECUTED` et `NON_VALIDATED`, jamais `PASS`. La
+fondation #51-E ne change pas ce statut et n'active aucun runtime. #51-F
+(preflight et armement manuel), puis #51-G (signature/soumission sous gates
+compensatoires), demeurent obligatoires avant le moindre trade réel.
 
 ## Console frontend indépendante
 
