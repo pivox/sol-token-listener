@@ -473,20 +473,20 @@ git commit -m "feat: reserve executor exposure transactionally (#51)"
 - Create: `tests/execution-reconciliation.service.test.ts`
 - Modify: `tests/execution-risk.repository.test.ts`
 
-- [ ] **Step 1: Write failing service tests**
+- [x] **Step 1: Write failing service tests**
 
 Provide a fake closed gateway returning normalized immutable evidence. Assert
 the service performs only read methods, produces the Task 3 proof and sends one
 atomic commit input to the repository.
 
-- [ ] **Step 2: Write failing PostgreSQL reconciliation tests**
+- [x] **Step 2: Write failing PostgreSQL reconciliation tests**
 
 Cover MATCHED→CONSUMED, NO_EFFECT→RELEASED, MISMATCH/UNKNOWN→UNKNOWN_HELD,
 intent/generation/reservation fencing, exact replay and concurrent conflicting
 proofs. NO_EFFECT must transition an unknown intent only with
 `RECONCILIATION_PROVED_NO_EFFECT`.
 
-- [ ] **Step 3: Verify RED**
+- [x] **Step 3: Verify RED**
 
 Run:
 
@@ -494,7 +494,7 @@ Run:
 TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot node --import tsx --test tests/execution-reconciliation.service.test.ts tests/execution-risk.repository.test.ts
 ```
 
-- [ ] **Step 4: Implement closed gateway and service contracts**
+- [x] **Step 4: Implement closed gateway and service contracts**
 
 The gateway interface exposes exactly:
 
@@ -508,14 +508,14 @@ readFinalizedWalletDeltas(request: WalletDeltaRequestV1, signal: AbortSignal): P
 No implementation may add a method whose name starts with `send`, `submit`,
 `sign` or return a `Connection`.
 
-- [ ] **Step 5: Implement atomic fenced reconciliation**
+- [x] **Step 5: Implement atomic fenced reconciliation**
 
 Lock intent, reservation, generation and risk state; insert exact evidence;
 mutate reservation and aggregate; perform only allowed future intent
 transitions; write `reconciled_at`/`purge_after` together. Preserve UNKNOWN on
 all inconclusive reads.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
 Run the Task 7 test command. Then:
 

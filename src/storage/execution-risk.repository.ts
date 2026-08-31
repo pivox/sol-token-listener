@@ -7,6 +7,7 @@ import {
   type ProviderUsageSnapshotV1,
 } from '../domain/execution-provider-quota.js';
 import { assertExecutionIntent, type ExecutionIntentV1 } from '../domain/execution-intent.js';
+import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reconciliation.js';
 import {
   createExecutionRiskPolicy,
   evaluateBuyRisk,
@@ -123,6 +124,16 @@ const ADMISSION_REPORT_ROW_KEYS = Object.freeze([
   'report_id', 'decision', 'reason_code', 'input_fingerprint', 'policy_fingerprint',
   'wallet_snapshot_fingerprint', 'provider_snapshot_fingerprint',
   'wallet_state_revision', 'reservation_id',
+] as const);
+const RECONCILIATION_COMMIT_KEYS = Object.freeze(['payloadVersion', 'evidence'] as const);
+const RECONCILIATION_EVIDENCE_KEYS = Object.freeze([
+  'evidenceId', 'payloadVersion', 'evidenceFingerprint', 'intentId', 'attemptNumber',
+  'walletGeneration', 'providerId', 'side', 'signature', 'blockhash',
+  'lastValidBlockHeight', 'messageHash', 'buildFingerprint', 'snapshotFingerprint',
+  'signatureHistory', 'confirmationStatus', 'finalizedBlockHeight', 'observedSlot',
+  'observedTransactionFingerprint', 'feeLamports', 'walletLamportDelta', 'baseDeltaRaw',
+  'quoteDeltaRaw', 'unexpectedResidualTokenBalanceRaw', 'observedAtMs', 'finalizedAtMs',
+  'result', 'reasonCode',
 ] as const);
 
 const GENERATION_PROJECTION = `generation_id,payload_version,wallet_public_key,cluster,
@@ -511,11 +522,189 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
     });
   }
 
-  public reconcile(
-    input: ExecutionReconciliationCommitV1,
+  public async reconcile(
+    inputValue: ExecutionReconciliationCommitV1,
   ): Promise<ExecutionReconciliationCommitResultV1> {
-    void input;
-    return Promise.reject(failure('OPERATION_UNAVAILABLE'));
+    const evidence = reconciliationCommitFrom(inputValue);
+    return this.transaction(async (client) => {
+      const identity = await client.query(`SELECT generation_id FROM execution_exposure_reservations
+        WHERE intent_id=$1`, [evidence.intentId]);
+      const generationId = patternedText(
+        exactRow(singleRow(identity), ['generation_id'] as const).generation_id,
+        /^execution_wallet_generation_[0-9a-f]{64}$/u,
+      );
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
+        [generationId],
+      );
+      const locked = await client.query(`SELECT reservation.reservation_id,
+        reservation.state AS reservation_state,
+        reservation.maximum_amount_raw::TEXT AS maximum_amount_raw,
+        reservation.state_revision::TEXT AS reservation_revision,
+        reservation.wallet_snapshot_fingerprint,
+        generation.generation,
+        risk.state_revision::TEXT AS risk_revision,
+        risk.reserved_exposure_raw::TEXT AS reserved_exposure_raw,
+        risk.open_positions,risk.unknown_block,
+        intent.status AS intent_status,intent.side AS intent_side,
+        intent.state_revision::TEXT AS intent_revision,
+        attempt.provider_id,attempt.status AS attempt_status
+        FROM execution_exposure_reservations AS reservation
+        JOIN execution_wallet_generations AS generation
+          ON generation.generation_id=reservation.generation_id
+        JOIN execution_wallet_risk_state AS risk
+          ON risk.generation_id=reservation.generation_id
+        JOIN execution_intents AS intent ON intent.id=reservation.intent_id
+        JOIN execution_attempts AS attempt ON attempt.intent_id=intent.id
+          AND attempt.attempt_number=$2
+        WHERE reservation.intent_id=$1 AND reservation.generation_id=$3
+        FOR UPDATE OF reservation,generation,risk,intent,attempt`, [
+        evidence.intentId, evidence.attemptNumber, generationId,
+      ]);
+      const row = exactRow(singleRow(locked), [
+        'reservation_id', 'reservation_state', 'maximum_amount_raw', 'reservation_revision',
+        'wallet_snapshot_fingerprint', 'generation',
+        'risk_revision', 'reserved_exposure_raw', 'open_positions', 'unknown_block',
+        'intent_status', 'intent_side', 'intent_revision', 'provider_id', 'attempt_status',
+      ] as const);
+      const existing = await client.query(`SELECT evidence_id,evidence_fingerprint,result
+        FROM execution_reconciliation_evidence WHERE intent_id=$1 AND attempt_number=$2`, [
+        evidence.intentId, evidence.attemptNumber,
+      ]);
+      if (existing.rows.length > 0) {
+        if (existing.rows.length !== 1) throw failure('INVALID_DATA');
+        const prior = exactRow(existing.rows[0], [
+          'evidence_id', 'evidence_fingerprint', 'result',
+        ] as const);
+        if (prior.evidence_id !== evidence.evidenceId
+          || prior.evidence_fingerprint !== evidence.evidenceFingerprint
+          || prior.result !== evidence.result) throw failure('CONFLICT');
+        return reconciliationResult(evidence);
+      }
+      if (row.generation !== evidence.walletGeneration
+        || row.intent_side !== evidence.side
+        || row.provider_id !== evidence.providerId
+        || row.wallet_snapshot_fingerprint !== evidence.snapshotFingerprint
+        || !['RESERVED', 'UNKNOWN_HELD'].includes(String(row.reservation_state))
+        || row.attempt_status !== 'STARTED') throw failure('CONFLICT');
+      const reservationId = patternedText(
+        row.reservation_id,
+        /^execution_exposure_reservation_[0-9a-f]{64}$/u,
+      );
+      const maximumAmount = positiveBigint(parseBigint(row.maximum_amount_raw));
+      const riskRevision = unsignedBigint(parseBigint(row.risk_revision));
+      const reservationRevision = unsignedBigint(parseBigint(row.reservation_revision));
+      const intentRevision = unsignedBigint(parseBigint(row.intent_revision));
+      const reservedExposure = unsignedBigint(parseBigint(row.reserved_exposure_raw));
+      const openPositions = integer(row.open_positions, 0, 2);
+      if (typeof row.unknown_block !== 'boolean' || reservedExposure < maximumAmount) {
+        throw failure('INVALID_DATA');
+      }
+      const terminal = evidence.result === 'MATCHED' || evidence.result === 'NO_EFFECT';
+      const finalizedAtMs = evidence.finalizedAtMs;
+      if (terminal && finalizedAtMs === null) throw failure('INVALID_INPUT');
+      const inserted = await client.query(`INSERT INTO execution_reconciliation_evidence (
+        evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,
+        generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,
+        build_fingerprint,snapshot_fingerprint,signature_history,confirmation_status,
+        finalized_block_height,observed_slot,observed_transaction_fingerprint,fee_lamports,
+        wallet_lamport_delta,base_delta_raw,quote_delta_raw,
+        unexpected_residual_token_balance_raw,observed_at,finalized_at,result,reason_code,purge_after
+      ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::BIGINT,$12,$13,$14,$15,$16,
+        $17::BIGINT,$18::BIGINT,$19,$20::NUMERIC,$21::NUMERIC,$22::NUMERIC,$23::NUMERIC,
+        $24::NUMERIC,TIMESTAMPTZ 'epoch' + ($25::BIGINT * INTERVAL '1 millisecond'),
+        CASE WHEN $26::BIGINT IS NULL THEN NULL ELSE TIMESTAMPTZ 'epoch'
+          + ($26::BIGINT * INTERVAL '1 millisecond') END,$27,$28,
+        CASE WHEN $27 IN ('MATCHED','NO_EFFECT') THEN TIMESTAMPTZ 'epoch'
+          + (($26::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END)`, [
+        evidence.evidenceId, evidence.evidenceFingerprint, evidence.intentId,
+        evidence.attemptNumber, reservationId, generationId, evidence.providerId, evidence.side,
+        evidence.signature, evidence.blockhash, evidence.lastValidBlockHeight.toString(),
+        evidence.messageHash, evidence.buildFingerprint, evidence.snapshotFingerprint,
+        evidence.signatureHistory, evidence.confirmationStatus,
+        evidence.finalizedBlockHeight.toString(), evidence.observedSlot?.toString() ?? null,
+        evidence.observedTransactionFingerprint, evidence.feeLamports.toString(),
+        evidence.walletLamportDelta.toString(), evidence.baseDeltaRaw.toString(),
+        evidence.quoteDeltaRaw.toString(), evidence.unexpectedResidualTokenBalanceRaw.toString(),
+        evidence.observedAtMs, finalizedAtMs, evidence.result, evidence.reasonCode,
+      ]);
+      if (inserted.rowCount !== 1) throw failure('INVALID_DATA');
+      const reservationState = evidence.result === 'MATCHED' ? 'CONSUMED'
+        : evidence.result === 'NO_EFFECT' ? 'RELEASED' : 'UNKNOWN_HELD';
+      const reservationUpdate = await client.query(`UPDATE execution_exposure_reservations SET
+        state=$2,state_revision=$3::BIGINT,
+        reconciled_at=CASE WHEN $2 IN ('CONSUMED','RELEASED') THEN TIMESTAMPTZ 'epoch'
+          + ($4::BIGINT * INTERVAL '1 millisecond') ELSE NULL END,
+        purge_after=CASE WHEN $2 IN ('CONSUMED','RELEASED') THEN TIMESTAMPTZ 'epoch'
+          + (($4::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END
+        WHERE reservation_id=$1 AND state_revision=$5::BIGINT`, [
+        reservationId, reservationState, (reservationRevision + 1n).toString(),
+        finalizedAtMs, reservationRevision.toString(),
+      ]);
+      if (reservationUpdate.rowCount !== 1) throw failure('CONFLICT');
+      const releasesExposure = evidence.result === 'NO_EFFECT';
+      const riskUpdate = await client.query(`UPDATE execution_wallet_risk_state SET
+        state_revision=$2::BIGINT,
+        reserved_exposure_raw=$3::NUMERIC,open_positions=$4,unknown_block=$5,
+        updated_at=TIMESTAMPTZ 'epoch' + ($6::BIGINT * INTERVAL '1 millisecond')
+        WHERE generation_id=$1 AND state_revision=$7::BIGINT`, [
+        generationId, (riskRevision + 1n).toString(),
+        (releasesExposure ? reservedExposure - maximumAmount : reservedExposure).toString(),
+        releasesExposure ? openPositions - 1 : openPositions,
+        evidence.result === 'MISMATCH' || evidence.result === 'UNKNOWN',
+        evidence.finalizedAtMs ?? evidence.observedAtMs, riskRevision.toString(),
+      ]);
+      if (riskUpdate.rowCount !== 1) throw failure('CONFLICT');
+      const transitions = reconciliationTransitions(String(row.intent_status), evidence.result);
+      for (const [index, transition] of transitions.entries()) {
+        const transitionAtMs = evidence.finalizedAtMs ?? evidence.observedAtMs;
+        const transitionInsert = await client.query(`INSERT INTO execution_intent_transitions (
+          intent_id,previous_status,next_status,reason_code,human_message,activation_phase,
+          attempt_number,evidence,occurred_at
+        ) VALUES ($1,$2,$3,$4,$5,'NONE',$6,
+          jsonb_build_object('payloadVersion',1,'attemptNumber',$6::INTEGER,
+            'sourceEventId',NULL,'observedAtMs',$7::BIGINT),
+          TIMESTAMPTZ 'epoch' + (($7::BIGINT + $8::INTEGER) * INTERVAL '1 millisecond'))`, [
+          evidence.intentId, transition.previousStatus, transition.nextStatus,
+          transition.reasonCode, transition.humanMessage, evidence.attemptNumber,
+          transitionAtMs, index,
+        ]);
+        if (transitionInsert.rowCount !== 1) throw failure('INVALID_DATA');
+      }
+      const finalStatus = transitions.at(-1)?.nextStatus ?? String(row.intent_status);
+      const finalReason = transitions.at(-1)?.reasonCode ?? 'RECONCILIATION_REQUIRED';
+      const intentTerminal = finalStatus === 'SUCCEEDED' || finalStatus === 'FAILED';
+      const intentAtMs = evidence.finalizedAtMs ?? evidence.observedAtMs;
+      const intentUpdate = await client.query(`UPDATE execution_intents SET
+        status=$2,last_reason_code=$3,state_revision=$4::BIGINT,
+        lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+        terminal_at=CASE WHEN $5 THEN TIMESTAMPTZ 'epoch'
+          + ($6::BIGINT * INTERVAL '1 millisecond') ELSE NULL END,
+        reconciliation_completed_at=CASE WHEN $5 THEN TIMESTAMPTZ 'epoch'
+          + ($6::BIGINT * INTERVAL '1 millisecond') ELSE NULL END,
+        purge_after=CASE WHEN $5 THEN TIMESTAMPTZ 'epoch'
+          + (($6::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END,
+        updated_at=TIMESTAMPTZ 'epoch' + ($6::BIGINT * INTERVAL '1 millisecond')
+        WHERE id=$1 AND state_revision=$7::BIGINT`, [
+        evidence.intentId, finalStatus, finalReason,
+        (intentRevision + BigInt(transitions.length)).toString(), intentTerminal,
+        intentAtMs, intentRevision.toString(),
+      ]);
+      if (intentUpdate.rowCount !== 1) throw failure('CONFLICT');
+      if (terminal) {
+        const attemptUpdate = await client.query(`UPDATE execution_attempts SET
+          status=$3,completed_at=TIMESTAMPTZ 'epoch'
+            + ($4::BIGINT * INTERVAL '1 millisecond'),reason_code=$5
+          WHERE intent_id=$1 AND attempt_number=$2 AND status='STARTED'`, [
+          evidence.intentId, evidence.attemptNumber,
+          evidence.result === 'MATCHED' ? 'COMPLETED' : 'ABANDONED',
+          finalizedAtMs,
+          evidence.result === 'MATCHED' ? 'ATTEMPT_COMPLETED' : evidence.reasonCode,
+        ]);
+        if (attemptUpdate.rowCount !== 1) throw failure('CONFLICT');
+      }
+      return reconciliationResult(evidence);
+    });
   }
 
   private async transaction<T>(operation: (client: ExecutionRiskClient) => Promise<T>): Promise<T> {
@@ -821,6 +1010,132 @@ function admissionInputFingerprint(input: ExecutionBuyAdmissionInputV1): string 
     input.walletSnapshot.snapshotFingerprint, input.providerSnapshot.snapshotFingerprint,
     input.allEndpointsUnavailable ? 1 : 0, input.nowMs,
   ]);
+}
+
+function reconciliationCommitFrom(value: unknown): ExecutionReconciliationEvidenceV1 {
+  try {
+    const commit = exactInput(value, RECONCILIATION_COMMIT_KEYS);
+    if (commit.payloadVersion !== 1) throw new TypeError();
+    const row = exactInput(commit.evidence, RECONCILIATION_EVIDENCE_KEYS);
+    if (row.payloadVersion !== 1) throw new TypeError();
+    const result = enumValue(row.result, ['MATCHED', 'NO_EFFECT', 'MISMATCH', 'UNKNOWN'] as const);
+    const reasonCode = enumValue(row.reasonCode, [
+      'INTENT_SUCCEEDED', 'RECONCILIATION_PROVED_NO_EFFECT', 'RECONCILIATION_REQUIRED',
+      'BALANCE_MISMATCH', 'RESIDUAL_TOKEN_BALANCE', 'DOUBLE_ORDER_SUSPECTED',
+    ] as const);
+    if ((result === 'MATCHED') !== (reasonCode === 'INTENT_SUCCEEDED')
+      || (result === 'NO_EFFECT') !== (reasonCode === 'RECONCILIATION_PROVED_NO_EFFECT')
+      || (result === 'UNKNOWN') !== (reasonCode === 'RECONCILIATION_REQUIRED')
+      || (result === 'MISMATCH') !== [
+        'BALANCE_MISMATCH', 'RESIDUAL_TOKEN_BALANCE', 'DOUBLE_ORDER_SUSPECTED',
+      ].includes(reasonCode)) throw new TypeError();
+    const finalizedAtMs = nullableTimestamp(row.finalizedAtMs);
+    if ((result === 'MATCHED' || result === 'NO_EFFECT') && finalizedAtMs === null) {
+      throw new TypeError();
+    }
+    const observedAtMs = timestamp(row.observedAtMs);
+    if (finalizedAtMs !== null && finalizedAtMs < observedAtMs) throw new TypeError();
+    return Object.freeze({
+      evidenceId: patternedText(row.evidenceId, /^execution_reconciliation_[0-9a-f]{64}$/u),
+      payloadVersion: 1,
+      evidenceFingerprint: patternedText(row.evidenceFingerprint, HASH),
+      intentId: patternedText(row.intentId, /^execution_intent_[0-9a-f]{64}$/u),
+      attemptNumber: integer(row.attemptNumber, 1, 2_147_483_647),
+      walletGeneration: integer(row.walletGeneration, 1, 2_147_483_647),
+      providerId: text(row.providerId, 256),
+      side: enumValue(row.side, ['BUY', 'SELL'] as const),
+      signature: base58(row.signature, 32, 128),
+      blockhash: base58(row.blockhash, 32, 44),
+      lastValidBlockHeight: unsignedBigint(row.lastValidBlockHeight),
+      messageHash: patternedText(row.messageHash, HASH),
+      buildFingerprint: patternedText(row.buildFingerprint, HASH),
+      snapshotFingerprint: patternedText(row.snapshotFingerprint, HASH),
+      signatureHistory: enumValue(row.signatureHistory, ['PRESENT', 'ABSENT', 'UNKNOWN'] as const),
+      confirmationStatus: enumValue(
+        row.confirmationStatus,
+        ['FINALIZED', 'CONFIRMED', 'ORPHANED', 'NOT_FOUND'] as const,
+      ),
+      finalizedBlockHeight: unsignedBigint(row.finalizedBlockHeight),
+      observedSlot: row.observedSlot === null ? null : unsignedBigint(row.observedSlot),
+      observedTransactionFingerprint: row.observedTransactionFingerprint === null
+        ? null : patternedText(row.observedTransactionFingerprint, HASH),
+      feeLamports: unsignedBigint(row.feeLamports),
+      walletLamportDelta: signedBigint(row.walletLamportDelta),
+      baseDeltaRaw: signedBigint(row.baseDeltaRaw),
+      quoteDeltaRaw: signedBigint(row.quoteDeltaRaw),
+      unexpectedResidualTokenBalanceRaw: unsignedBigint(row.unexpectedResidualTokenBalanceRaw),
+      observedAtMs,
+      finalizedAtMs,
+      result,
+      reasonCode,
+    });
+  } catch (error) {
+    if (error instanceof ExecutionRiskRepositoryError && INTERNAL_ERRORS.has(error)) throw error;
+    throw failure('INVALID_INPUT');
+  }
+}
+
+function reconciliationResult(
+  evidence: ExecutionReconciliationEvidenceV1,
+): ExecutionReconciliationCommitResultV1 {
+  return Object.freeze({
+    payloadVersion: 1,
+    result: evidence.result,
+    evidenceId: evidence.evidenceId,
+  });
+}
+
+type ReconciliationTransition = Readonly<{
+  previousStatus: string;
+  nextStatus: string;
+  reasonCode: string;
+  humanMessage: string;
+}>;
+
+function reconciliationTransitions(
+  initialStatus: string,
+  result: ExecutionReconciliationEvidenceV1['result'],
+): readonly ReconciliationTransition[] {
+  if (result === 'MATCHED') {
+    if (initialStatus === 'SUBMITTED' || initialStatus === 'UNKNOWN_REQUIRES_RECONCILIATION') {
+      return Object.freeze([
+        transition(initialStatus, 'CONFIRMED', 'CONFIRMATION_OBSERVED',
+          'Finalized execution effect confirmed.'),
+        transition('CONFIRMED', 'SUCCEEDED', 'INTENT_SUCCEEDED',
+          'Finalized execution effect reconciled.'),
+      ]);
+    }
+    if (initialStatus === 'CONFIRMED' || initialStatus === 'RECONCILING') {
+      return Object.freeze([transition(
+        initialStatus, 'SUCCEEDED', 'INTENT_SUCCEEDED',
+        'Finalized execution effect reconciled.',
+      )]);
+    }
+  } else if (result === 'NO_EFFECT') {
+    if (initialStatus === 'UNKNOWN_REQUIRES_RECONCILIATION') {
+      return Object.freeze([transition(
+        initialStatus, 'FAILED', 'RECONCILIATION_PROVED_NO_EFFECT',
+        'Finalized reconciliation proved no execution effect.',
+      )]);
+    }
+  } else if (initialStatus === 'UNKNOWN_REQUIRES_RECONCILIATION') {
+    return Object.freeze([]);
+  } else if (['SIGNED_NOT_SUBMITTED', 'SUBMITTED', 'CONFIRMED', 'RECONCILING'].includes(initialStatus)) {
+    return Object.freeze([transition(
+      initialStatus, 'UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILIATION_REQUIRED',
+      'Execution effect remains unresolved.',
+    )]);
+  }
+  throw failure('CONFLICT');
+}
+
+function transition(
+  previousStatus: string,
+  nextStatus: string,
+  reasonCode: string,
+  humanMessage: string,
+): ReconciliationTransition {
+  return Object.freeze({ previousStatus, nextStatus, reasonCode, humanMessage });
 }
 
 function positionsFrom(value: unknown): WalletSnapshotV1['openPositions'] {

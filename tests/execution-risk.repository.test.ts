@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
+import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
+import { evaluateExecutionReconciliation } from '../src/domain/execution-reconciliation.js';
+import { createExecutionRiskPolicy } from '../src/domain/execution-risk-policy.js';
+import { ExecutionAdmissionService } from '../src/executor-risk/admission-service.js';
+import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import {
   ExecutionRiskRepositoryError,
   PostgresExecutionRiskRepository,
@@ -153,6 +158,173 @@ void test('a commit ambiguity is fail-closed and redacted', async () => {
     isRepositoryError('COMMIT_OUTCOME_UNKNOWN'),
   );
 });
+
+void test('reconciliation atomically consumes, releases or holds reservations and replays exactly', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk reconciliation repository test');
+  if (databaseUrl === null) return;
+  const cases = [
+    ['MATCHED', 'SUBMITTED', 'CONSUMED', 'SUCCEEDED'],
+    ['NO_EFFECT', 'UNKNOWN_REQUIRES_RECONCILIATION', 'RELEASED', 'FAILED'],
+    ['MISMATCH', 'SUBMITTED', 'UNKNOWN_HELD', 'UNKNOWN_REQUIRES_RECONCILIATION'],
+    ['UNKNOWN', 'SUBMITTED', 'UNKNOWN_HELD', 'UNKNOWN_REQUIRES_RECONCILIATION'],
+  ] as const;
+  for (const [outcome, initialStatus, reservationState, intentStatus] of cases) {
+    await withTemporarySchema(databaseUrl, `execution_risk_reconcile_${outcome.toLowerCase()}`, async (pool) => {
+      const fixture = await reconciliationFixture(pool, outcome, initialStatus);
+      const evidence = reconciliationEvidence(fixture.intentId, outcome, fixture.snapshotFingerprint);
+      const result = await fixture.repository.reconcile({ payloadVersion: 1, evidence });
+      assert.equal(result.result, outcome);
+      assert.deepEqual(await fixture.repository.reconcile({ payloadVersion: 1, evidence }), result);
+      const durable = await pool.query(`SELECT reservation.state,intent.status,
+        intent.last_reason_code,risk.reserved_exposure_raw::TEXT AS exposure,
+        risk.open_positions,risk.unknown_block,
+        (SELECT COUNT(*)::INTEGER FROM execution_reconciliation_evidence) AS evidence_count
+        FROM execution_exposure_reservations AS reservation
+        JOIN execution_intents AS intent ON intent.id=reservation.intent_id
+        JOIN execution_wallet_risk_state AS risk ON risk.generation_id=reservation.generation_id`);
+      assert.equal(durable.rows[0]?.state, reservationState);
+      assert.equal(durable.rows[0]?.status, intentStatus);
+      assert.equal(durable.rows[0]?.evidence_count, 1);
+      if (outcome === 'NO_EFFECT') {
+        assert.equal(durable.rows[0]?.last_reason_code, 'RECONCILIATION_PROVED_NO_EFFECT');
+        assert.equal(durable.rows[0]?.exposure, '0');
+        assert.equal(durable.rows[0]?.open_positions, 0);
+      } else if (outcome === 'MATCHED') {
+        assert.equal(durable.rows[0]?.last_reason_code, 'INTENT_SUCCEEDED');
+        assert.equal(durable.rows[0]?.exposure, '90000');
+        assert.equal(durable.rows[0]?.open_positions, 1);
+      } else {
+        assert.equal(durable.rows[0]?.unknown_block, true);
+      }
+      if (outcome === 'UNKNOWN') {
+        const conflicting = reconciliationEvidence(
+          fixture.intentId,
+          'MISMATCH',
+          fixture.snapshotFingerprint,
+        );
+        await assert.rejects(
+          fixture.repository.reconcile({ payloadVersion: 1, evidence: conflicting }),
+          isRepositoryError('CONFLICT'),
+        );
+      }
+    });
+  }
+});
+
+async function reconciliationFixture(
+  pool: InstanceType<typeof pg.Pool>,
+  seed: string,
+  initialStatus: 'SUBMITTED' | 'UNKNOWN_REQUIRES_RECONCILIATION',
+) {
+  const nowMs = Date.now();
+  await migrateDatabase({ pool });
+  const repository = new PostgresExecutionRiskRepository(pool);
+  const intentRepository = new PostgresExecutionIntentRepository(pool);
+  const generation = await repository.registerWalletGeneration(generationDraft('a', 1));
+  const snapshot = await repository.appendWalletSnapshot(Object.freeze({
+    ...walletSnapshotDraft(generation.generationId, 'b', 0n),
+    blockTimeMs: nowMs - 100,
+    observedAtMs: nowMs - 50,
+  }));
+  const provider = createProviderUsageSnapshot({
+    providerId: 'rpc-primary', planId: 'public-v1', billingPeriodId: 'current',
+    billingPeriodStartedAtMs: nowMs - 1_000,
+    billingPeriodEndsAtMs: nowMs + 300_000,
+    limitUnits: 10_000n, usedUnits: 10n, measuredAtMs: nowMs - 100,
+    expiresAtMs: nowMs + 60_000, provenance: 'AUTHORITATIVE_PROBE',
+  });
+  await repository.appendProviderUsage(provider);
+  const draft = createExecutionIntentDraft({
+    strategyId: 'risk-reconciliation-test', strategyVersion: 1,
+    positionId: `position:${seed}`, logicalCommandId: `command:${seed}`,
+    mint: publicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
+    quoteMint: 'So11111111111111111111111111111111111111112',
+    quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+    quoteAmountRaw: 90_000n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+    decisionEventId: `decision:${seed}`, decisionFingerprint: 'c'.repeat(64),
+    requestedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 60_000,
+  });
+  const created = await intentRepository.create(draft);
+  const policy = createExecutionRiskPolicy({
+    quoteMintAllowlist: ['So11111111111111111111111111111111111111112'],
+    initialCapitalLamports: 1_000_000n, maximumCapitalLamports: 1_000_000n,
+    positionSizeBps: 1_000n, maximumOpenPositions: 2,
+    maximumTotalExposureBps: 2_000n, drawdownPauseBps: 2_500n,
+    feeReserveLamports: 100_000n, walletSnapshotMaxAgeMs: 60_000,
+    providerUsageMaxAgeMs: 300_000, providerEntryCostUnits: 8n,
+    providerExitCostUnitsPerPosition: 4n,
+    providerConfirmationCostUnitsPerPosition: 2n,
+    providerReconciliationCostUnitsPerPosition: 3n,
+    providerSafetyMarginUnits: 5n, maximumConsecutiveTechnicalFailures: 2,
+  });
+  const admitted = await new ExecutionAdmissionService(repository).admit({
+    payloadVersion: 1, intent: created.intent, policy,
+    generationId: generation.generationId, walletSnapshot: snapshot,
+    providerSnapshot: provider, allEndpointsUnavailable: false, nowMs,
+  });
+  assert.equal(admitted.decision, 'ADMITTED');
+  const reason = initialStatus === 'SUBMITTED'
+    ? 'SUBMISSION_ACCEPTED' : 'RECONCILIATION_REQUIRED';
+  await pool.query(`UPDATE execution_intents SET status=$2,attempt_count=1,state_revision=1,
+    last_reason_code=$3,updated_at=date_trunc('milliseconds',statement_timestamp()) WHERE id=$1`,
+  [created.intent.id, initialStatus, reason]);
+  await pool.query(`INSERT INTO execution_attempts (
+    intent_id,attempt_number,status,effective_venue,provider_id
+  ) VALUES ($1,1,'STARTED','PUMP_FUN','rpc-primary')`, [created.intent.id]);
+  return Object.freeze({
+    repository,
+    intentId: created.intent.id,
+    snapshotFingerprint: snapshot.snapshotFingerprint,
+  });
+}
+
+function reconciliationEvidence(
+  intentId: string,
+  outcome: 'MATCHED' | 'NO_EFFECT' | 'MISMATCH' | 'UNKNOWN',
+  snapshotFingerprint: string,
+) {
+  const nowMs = Date.now() + 1_000;
+  const signature = '3'.repeat(88);
+  const transaction = Object.freeze({
+    signature,
+    blockhash: publicKey,
+    messageHash: 'd'.repeat(64),
+    buildFingerprint: 'e'.repeat(64),
+    snapshotFingerprint,
+  });
+  const observed = outcome === 'MATCHED' ? {
+    signatureHistory: 'PRESENT', confirmationStatus: 'FINALIZED', finalizedBlockHeight: 999n,
+    observedSlot: 500n, transaction, feeLamports: 5n, walletLamportDelta: -105n,
+    baseDeltaRaw: 500n, quoteDeltaRaw: -100n, unexpectedResidualTokenBalanceRaw: 0n,
+    observedAtMs: nowMs, finalizedAtMs: nowMs + 1,
+  } : outcome === 'NO_EFFECT' ? {
+    signatureHistory: 'ABSENT', confirmationStatus: 'NOT_FOUND', finalizedBlockHeight: 1_001n,
+    observedSlot: null, transaction: null, feeLamports: 0n, walletLamportDelta: 0n,
+    baseDeltaRaw: 0n, quoteDeltaRaw: 0n, unexpectedResidualTokenBalanceRaw: 0n,
+    observedAtMs: nowMs, finalizedAtMs: nowMs + 1,
+  } : outcome === 'MISMATCH' ? {
+    signatureHistory: 'PRESENT', confirmationStatus: 'FINALIZED', finalizedBlockHeight: 999n,
+    observedSlot: 500n, transaction: Object.freeze({
+      ...transaction, messageHash: 'f'.repeat(64),
+    }), feeLamports: 5n, walletLamportDelta: -105n,
+    baseDeltaRaw: 500n, quoteDeltaRaw: -100n, unexpectedResidualTokenBalanceRaw: 0n,
+    observedAtMs: nowMs, finalizedAtMs: nowMs + 1,
+  } : {
+    signatureHistory: 'UNKNOWN', confirmationStatus: 'NOT_FOUND', finalizedBlockHeight: 999n,
+    observedSlot: null, transaction: null, feeLamports: 0n, walletLamportDelta: 0n,
+    baseDeltaRaw: 0n, quoteDeltaRaw: 0n, unexpectedResidualTokenBalanceRaw: 0n,
+    observedAtMs: nowMs, finalizedAtMs: null,
+  };
+  return evaluateExecutionReconciliation({
+    expected: Object.freeze({
+      intentId, attemptNumber: 1, walletGeneration: 1, providerId: 'rpc-primary',
+      side: 'BUY', signature, blockhash: publicKey, lastValidBlockHeight: 1_000n,
+      messageHash: 'd'.repeat(64), buildFingerprint: 'e'.repeat(64), snapshotFingerprint,
+      maximumFeeLamports: 10n, maximumFeePayerLamportDebit: 1_000n,
+    }),
+    observed: Object.freeze(observed),
+  });
+}
 
 function generationDraft(seed: string, generation: number) {
   return Object.freeze({
