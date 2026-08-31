@@ -187,24 +187,23 @@ git commit -m "feat: load isolated executor keypair safely (#51)"
 - Create: `src/executor-live/signed-simulation-gateway.ts`
 - Create: `src/ports/execution-live-gateway.ts`
 - Modify: `src/executor-simulation/solana-simulation-gateway.ts`
-- Modify: `src/executor-simulation/attempt-evaluator.ts`
 - Test: `tests/executor-live-preparer.test.ts`
 - Test: `tests/executor-live-signed-simulation.test.ts`
 - Modify: `tests/executor-simulation-gateway.test.ts`
 
-- [ ] **Step 1: Write compiler/preparer failing tests**
+- [x] **Step 1: Write compiler/preparer failing tests**
 
 À partir d'un plan inspecté et d'un reçu opaque, exiger le même message hash,
 blockhash, limites et transaction zéro-signature que #51-D. Le candidat live
 doit être consommable une fois et rester inaccessible au gateway simulation-only.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `npx tsx --test tests/executor-live-preparer.test.ts`
 
 Expected: FAIL because the live preparer is absent.
 
-- [ ] **Step 3: Extract the pure compiler and implement the live preparer**
+- [x] **Step 3: Extract the pure compiler and implement the live preparer**
 
 Extraire sans modifier les validations #51-D :
 
@@ -221,19 +220,19 @@ Le préparateur réutilise le pipeline quote/route/build existant, obtient la
 simulation non signée et retourne uniquement un candidat opaque au worker live.
 Le gateway #51-D continue de ne retourner aucun byte.
 
-- [ ] **Step 4: Verify simulation-only compatibility**
+- [x] **Step 4: Verify simulation-only compatibility**
 
 Run: `npx tsx --test tests/executor-simulation-gateway.test.ts tests/executor-simulation-attempt-evaluator.test.ts tests/executor-live-preparer.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 5: Write signed simulation failing tests**
+- [x] **Step 5: Write signed simulation failing tests**
 
 Exiger `sigVerify=true`, `replaceRecentBlockhash=false`, bytes identiques à
 l'artefact, signature valide, deltas identiques ou plus conservateurs et zéro
 appel d'envoi.
 
-- [ ] **Step 6: Implement signed simulation and commit**
+- [x] **Step 6: Implement signed simulation and commit**
 
 Le port accepte un artefact authentifié relu, jamais un `VersionedTransaction`
 mutable. Il désérialise, recalcule hashes/signature, simule et retourne une
@@ -244,7 +243,7 @@ Run: `npx tsx --test tests/executor-live-preparer.test.ts tests/executor-live-si
 Expected: PASS.
 
 ```bash
-git add src/executor-simulation/message-compiler.ts src/executor-simulation/solana-simulation-gateway.ts src/executor-simulation/attempt-evaluator.ts src/executor-live/transaction-preparer.ts src/executor-live/signed-simulation-gateway.ts src/ports/execution-live-gateway.ts tests/executor-live-preparer.test.ts tests/executor-live-signed-simulation.test.ts tests/executor-simulation-gateway.test.ts
+git add src/executor-simulation/message-compiler.ts src/executor-simulation/solana-simulation-gateway.ts src/executor-live/transaction-preparer.ts src/executor-live/signed-simulation-gateway.ts src/ports/execution-live-gateway.ts src/ports/execution-live-repository.ts tests/executor-live-preparer.test.ts tests/executor-live-signed-simulation.test.ts
 git commit -m "feat: prepare and verify signed transactions (#51)"
 ```
 

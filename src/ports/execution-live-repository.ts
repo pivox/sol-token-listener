@@ -33,7 +33,7 @@ export interface ExecutionLivePersistSignedInputV1 {
 export interface AuthenticatedPersistedSignedTransactionV1 {
   readonly payloadVersion: 1;
   readonly artifact: SignedTransactionArtifactV1;
-  readonly state: Extract<SignedTransactionState, 'SIGNED_SIMULATED' | 'SUBMISSION_STARTED'>;
+  readonly state: Extract<SignedTransactionState, 'PERSISTED' | 'SIGNED_SIMULATED' | 'SUBMISSION_STARTED'>;
   readonly stateRevision: bigint;
 }
 

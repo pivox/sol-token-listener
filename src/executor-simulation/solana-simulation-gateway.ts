@@ -12,11 +12,8 @@ import {
 } from '@solana/spl-token';
 import {
   PublicKey,
-  TransactionInstruction,
-  TransactionMessage,
-  VersionedTransaction,
 } from '@solana/web3.js';
-import type { MessageV0 } from '@solana/web3.js';
+import { compileInspectedV0Message } from './message-compiler.js';
 import {
   inspectUnsignedBuildPlan,
   InstructionInspectionError,
@@ -183,27 +180,21 @@ export class SolanaSimulationGateway implements ExecutionSimulationGateway {
         || blockhash.contextSlot < snapshot.slot) {
         throw failure('BLOCKHASH', 'RPC_RESPONSE_INVALID', partial);
       }
-      const message = new TransactionMessage({
-        payerKey: new PublicKey(inspected.feePayer),
+      const compiled = compileInspectedV0Message(Object.freeze({
+        feePayer: inspected.feePayer,
+        instructions: inspected.instructions,
         recentBlockhash: blockhash.blockhash,
-        instructions: inspected.instructions.map(toInstruction),
-      }).compileToV0Message([]);
-      assertCompiledMessage(message, inspected.feePayer, inspected.instructions, blockhash.blockhash);
-      const messageBytes = message.serialize();
+        maximumTransactionBytes: this.limits.maxTransactionBytes,
+      }));
+      const messageBytes = Buffer.from(compiled.messageBytes);
       partial = Object.freeze({
         ...partial,
-        messageHash: sha256(Buffer.from(messageBytes)),
+        messageHash: compiled.messageHash,
         blockhash: blockhash.blockhash,
         lastValidBlockHeight: blockhash.lastValidBlockHeight,
         blockhashContextSlot: blockhash.contextSlot,
       });
-      const transaction = new VersionedTransaction(message);
-      const transactionBytes = transaction.serialize();
-      if (transactionBytes.length > this.limits.maxTransactionBytes || transaction.signatures.length !== 1
-        || transaction.signatures[0]?.length !== 64
-        || !transaction.signatures[0].every((byte) => byte === 0)) {
-        throw failure('BUILD', 'BUILD_POLICY_REJECTED', partial);
-      }
+      const transactionBytes = Buffer.from(compiled.unsignedTransactionBytes);
       stage = 'FEE';
       const fee = await this.provider.getFeeForMessage(toBase64(messageBytes), snapshot.slot, signal);
       if (fee.providerId !== snapshot.providerId || !u64(fee.contextSlot)
@@ -220,7 +211,7 @@ export class SolanaSimulationGateway implements ExecutionSimulationGateway {
       const rawSimulation = record(simulation, RESULT_KEYS);
       validateSimulationEnvelope(
         rawSimulation, requestedAccounts,
-        new Set(message.staticAccountKeys.map((key) => key.toBase58())),
+        new Set(compiled.staticAccountKeys),
         inspected.instructions.length,
         snapshot.providerId, blockhash.contextSlot,
       );
@@ -605,64 +596,6 @@ function requiredAccount(
   const account = accounts[index];
   if (account === undefined) rejectEvidence();
   return account;
-}
-
-function toInstruction(instruction: NormalizedInstructionV1): TransactionInstruction {
-  return new TransactionInstruction({
-    programId: new PublicKey(instruction.programId),
-    keys: instruction.accounts.map((account) => ({
-      pubkey: new PublicKey(account.address), isSigner: account.isSigner, isWritable: account.isWritable,
-    })),
-    data: Buffer.from(instruction.dataBase64, 'base64'),
-  });
-}
-
-function assertCompiledMessage(
-  message: MessageV0,
-  feePayer: string,
-  instructions: readonly NormalizedInstructionV1[],
-  blockhash: string,
-): void {
-  if (message.recentBlockhash !== blockhash || message.addressTableLookups.length !== 0
-    || message.header.numRequiredSignatures !== 1
-    || !message.staticAccountKeys[0]?.equals(new PublicKey(feePayer))
-    || message.compiledInstructions.length !== instructions.length) rejectEvidence();
-  const expectedKeys = new Map<string, { signer: boolean; writable: boolean }>([
-    [feePayer, { signer: true, writable: true }],
-  ]);
-  for (const instruction of instructions) {
-    expectedKeys.set(instruction.programId, expectedKeys.get(instruction.programId) ?? { signer: false, writable: false });
-    for (const account of instruction.accounts) {
-      const current = expectedKeys.get(account.address) ?? { signer: false, writable: false };
-      expectedKeys.set(account.address, {
-        signer: current.signer || account.isSigner,
-        writable: current.writable || account.isWritable,
-      });
-    }
-  }
-  if (message.staticAccountKeys.length !== expectedKeys.size
-    || message.staticAccountKeys.some((key, index) => {
-      const signer = index < message.header.numRequiredSignatures;
-      const writable = signer ? index < message.header.numRequiredSignatures - message.header.numReadonlySignedAccounts
-        : index < message.staticAccountKeys.length - message.header.numReadonlyUnsignedAccounts;
-      const expected = expectedKeys.get(key.toBase58()) ?? { signer: !signer, writable: !writable };
-      return expected.signer !== signer || expected.writable !== writable;
-    })) rejectEvidence();
-  for (let instructionIndex = 0; instructionIndex < instructions.length; instructionIndex += 1) {
-    const expected = instructions[instructionIndex];
-    const actual = message.compiledInstructions[instructionIndex];
-    if (expected === undefined || actual === undefined || actual.programIdIndex >= message.staticAccountKeys.length
-      || message.staticAccountKeys[actual.programIdIndex]?.toBase58() !== expected.programId
-      || !Buffer.from(actual.data).equals(Buffer.from(expected.dataBase64, 'base64'))
-      || actual.accountKeyIndexes.length !== expected.accounts.length) rejectEvidence();
-    for (let accountIndex = 0; accountIndex < expected.accounts.length; accountIndex += 1) {
-      const expectedAccount = expected.accounts[accountIndex];
-      const keyIndex = actual.accountKeyIndexes[accountIndex];
-      if (expectedAccount === undefined || keyIndex === undefined || keyIndex >= message.staticAccountKeys.length
-        || message.staticAccountKeys[keyIndex]?.toBase58() !== expectedAccount.address
-      ) rejectEvidence();
-    }
-  }
 }
 
 function buildFingerprint(feePayer: string, instructions: readonly NormalizedInstructionV1[]): string {
