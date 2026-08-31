@@ -52,6 +52,40 @@ const EXECUTOR_ALLOWED_DYNAMIC_ELEMENT_ACCESSES = new Set([
   'CLAIM_SQL[options.purpose]',
   'intentValues[key]',
 ]);
+const SIMULATION_ONLY_ALLOWED_BARE_MODULES = new Set([
+  'pg', 'pino', 'dotenv', 'dotenv/config',
+  '@solana/web3.js', '@solana/spl-token', '@solana/spl-token-metadata',
+  'bn.js', 'bs58',
+]);
+const AUDITED_PUMPFUN_SDK_PATH = /^(?:dist\/)?src\/launchpads\/pumpfun\/official-sdk\.(?:js|ts)$/u;
+const AUDITED_PUMPSWAP_SDK_PATH = /^(?:dist\/)?src\/markets\/pumpswap\/official-sdk\.(?:js|ts)$/u;
+const SIMULATION_ONLY_ALLOWED_NODE_BUILTINS = new Set([
+  'node:crypto', 'node:fs/promises', 'node:path', 'node:url', 'node:util/types',
+]);
+const SIMULATION_ONLY_ALLOWED_LOCAL_MODULES = [
+  /^(?:dist\/)?src\/executor\/(?:main|config|database|dry-run-worker|simulation-worker|logger|runtime)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/executor-simulation\/(?:attempt-evaluator|build-plan|build-receipt|instruction-inspector|provider-session|pumpfun-adapter|pumpfun-quote|pumpswap-adapter|solana-simulation-gateway|venue-router)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/(?:execution-(?:dry-run|intent|simulation)|market|market-errors|types)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/ports\/(?:execution-(?:dry-run-repository|intent-repository|market-gateway|simulation-gateway|simulation-repository|venue-repository)|market-rpc-reader|pumpswap-quote-provider)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/(?:database|execution-(?:dry-run\.repository|intent\.repository|simulation\.repository|venue\.repository))\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/launchpads\/pumpfun\/(?:causal-quote|constants|official-sdk|generated\/pump-idl)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/markets\/pumpswap\/(?:borsh-reader|constants|errors|official-sdk|pool-account-decoder|pumpswap-fee-state|pumpswap-quote\.provider|reserve-math|types|generated\/pumpswap-idl)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/solana\/rpc\/types\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/utils\/json\.(?:js|ts)$/u,
+];
+const SIMULATION_ONLY_FORBIDDEN_PATH_SEGMENTS = new Set([
+  'execution', 'paper', 'listener', 'raydium',
+]);
+const SIMULATION_ONLY_FORBIDDEN_IDENTIFIERS = new Set([
+  'Keypair', 'Wallet', 'WalletSigner', 'Signer', 'SecretLoader',
+  'keypair', 'wallet', 'createRequire', 'getBuiltinModule',
+  'eval', 'Function', 'globalThis',
+  'sendTransaction', 'sendRawTransaction', 'sendAndConfirmTransaction',
+  'signTransaction', 'signAllTransactions', 'signMessage',
+  'submitTransaction', 'submitSignedTransaction', 'submitRawTransaction',
+  'simulateTransaction',
+]);
+const AUDITED_SIMULATION_PROVIDER_PATH = /^(?:dist\/)?src\/executor-simulation\/provider-session\.(?:js|ts)$/u;
 
 export function executionBoundaryViolations(sourceText: string, sourcePath: string, repositoryRoot: string): readonly string[] {
   const sourceFile = ts.createSourceFile(sourcePath, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -95,6 +129,49 @@ export function literalModuleSpecifiers(sourceText: string, sourcePath: string):
   };
   visit(sourceFile);
   return Object.freeze(specifiers);
+}
+
+export function literalRuntimeModuleSpecifiers(sourceText: string, sourcePath: string): readonly string[] {
+  const sourceFile = ts.createSourceFile(sourcePath, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const specifiers: string[] = [];
+  const append = (node: ts.Expression | undefined): void => {
+    if (node !== undefined && ts.isStringLiteralLike(node)) specifiers.push(node.text);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node)) {
+      if (importDeclarationHasRuntimeValue(node)) append(node.moduleSpecifier);
+    } else if (ts.isExportDeclaration(node)) {
+      if (exportDeclarationHasRuntimeValue(node)) append(node.moduleSpecifier);
+    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+      append(node.moduleReference.expression);
+    } else if (ts.isCallExpression(node)
+      && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+        || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) {
+      append(node.arguments[0]);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return Object.freeze(specifiers);
+}
+
+function importDeclarationHasRuntimeValue(node: ts.ImportDeclaration): boolean {
+  const clause = node.importClause;
+  if (clause === undefined) return true;
+  if (clause.isTypeOnly) return false;
+  if (clause.name !== undefined) return true;
+  const bindings = clause.namedBindings;
+  return bindings === undefined
+    || ts.isNamespaceImport(bindings)
+    || bindings.elements.some((element) => !element.isTypeOnly);
+}
+
+function exportDeclarationHasRuntimeValue(node: ts.ExportDeclaration): boolean {
+  if (node.isTypeOnly || node.moduleSpecifier === undefined) return false;
+  const clause = node.exportClause;
+  return clause === undefined
+    || ts.isNamespaceExport(clause)
+    || clause.elements.some((element) => !element.isTypeOnly);
 }
 
 export function executorBoundaryViolations(
@@ -143,6 +220,263 @@ export function executorBoundaryViolations(
   return Object.freeze(violations);
 }
 
+/**
+ * Strict profile for the simulation-only executor. It permits no signing or
+ * submission capability and permits the literal RPC method
+ * `simulateTransaction` only in the reviewed provider-session boundary.
+ */
+export function simulationOnlyExecutorBoundaryViolations(
+  sourceText: string,
+  sourcePath: string,
+  repositoryRoot: string,
+): readonly string[] {
+  const sourceFile = ts.createSourceFile(sourcePath, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const violations = [...executionBoundaryViolations(sourceText, sourcePath, repositoryRoot)];
+  const normalizedSourcePath = relative(repositoryRoot, sourcePath).replaceAll('\\', '/');
+  const isAuditedProvider = AUDITED_SIMULATION_PROVIDER_PATH.test(normalizedSourcePath);
+  const isExactPumpFunSdkBridge = AUDITED_PUMPFUN_SDK_PATH.test(normalizedSourcePath)
+    && hasExactPumpFunCreateRequireBridge(sourceFile);
+  const isExactPumpSwapSdkBridge = AUDITED_PUMPSWAP_SDK_PATH.test(normalizedSourcePath)
+    && hasExactPumpSwapNamedStaticBridge(sourceFile);
+
+  for (const specifier of literalRuntimeModuleSpecifiers(sourceText, sourcePath)) {
+    if (specifier.startsWith('.') || specifier.startsWith('/')) {
+      const normalized = specifier.replace(/[?#].*$/u, '');
+      const target = normalized.startsWith('/') ? resolve(normalized) : resolve(dirname(sourcePath), normalized);
+      const targetPath = relative(repositoryRoot, target).replaceAll('\\', '/');
+      if (hasSimulationOnlyForbiddenPathSegment(targetPath)) {
+        violations.push(`Forbidden simulation-only local module: ${specifier}`);
+      } else if (!SIMULATION_ONLY_ALLOWED_LOCAL_MODULES.some((pattern) => pattern.test(targetPath))) {
+        violations.push(`Simulation-only local module is outside the allowlist: ${specifier}`);
+      }
+      continue;
+    }
+    if (specifier === '@pump-fun/pump-sdk') {
+      violations.push('Pump.fun SDK runtime import must use the exact audited createRequire bridge.');
+      continue;
+    }
+    if (specifier === '@pump-fun/pump-swap-sdk') {
+      if (!isExactPumpSwapSdkBridge) {
+        violations.push(`Simulation-only SDK import is restricted to its audited named-import bridge: ${specifier}`);
+      }
+      continue;
+    }
+    if (specifier === 'node:module' && isExactPumpFunSdkBridge) {
+      continue;
+    }
+    if (!SIMULATION_ONLY_ALLOWED_BARE_MODULES.has(specifier)
+      && !SIMULATION_ONLY_ALLOWED_NODE_BUILTINS.has(specifier)) {
+      violations.push(`Simulation-only module is outside the allowlist: ${specifier}`);
+    }
+  }
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      violations.push('Dynamic import is prohibited in simulation-only modules.');
+    }
+    if (ts.isIdentifier(node) && SIMULATION_ONLY_FORBIDDEN_IDENTIFIERS.has(node.text)
+      && (node.text !== 'simulateTransaction' || !isAuditedProvider)
+      && (node.text !== 'createRequire' || !isExactPumpFunSdkBridge)) {
+      violations.push(`Forbidden simulation-only capability: ${node.text}`);
+    }
+    if (ts.isIdentifier(node) && node.text === 'global' && isAmbientGlobalReference(node)) {
+      violations.push('Forbidden simulation-only capability: global');
+    }
+    if (ts.isStringLiteralLike(node) && node.text === 'simulateTransaction' && !isAuditedProvider) {
+      violations.push('simulateTransaction is restricted to audited provider-session.');
+    }
+    if (ts.isElementAccessExpression(node)) appendSimulationOnlyElementAccess(node, violations);
+    ts.forEachChild(node, visit);
+  };
+  appendReflectiveExecutorCapabilityViolations(sourceFile, violations);
+  visit(sourceFile);
+  return Object.freeze(violations);
+}
+
+function isAmbientGlobalReference(identifier: ts.Identifier): boolean {
+  if (!isIdentifierReference(identifier)) return false;
+  for (let scope: ts.Node | undefined = identifier.parent; scope !== undefined; scope = scope.parent) {
+    if (scopeDeclaresName(scope, identifier.text)) return false;
+  }
+  return true;
+}
+
+function hasExactPumpFunCreateRequireBridge(sourceFile: ts.SourceFile): boolean {
+  const nodeModuleImports = sourceFile.statements.filter((statement): statement is ts.ImportDeclaration =>
+    ts.isImportDeclaration(statement)
+      && ts.isStringLiteralLike(statement.moduleSpecifier)
+      && statement.moduleSpecifier.text === 'node:module');
+  const nodeModuleImport = nodeModuleImports[0];
+  if (nodeModuleImports.length !== 1
+    || nodeModuleImport === undefined
+    || !isExactCreateRequireImport(nodeModuleImport)) return false;
+
+  let createRequireIdentifiers = 0;
+  let exactSdkLoads = 0;
+  const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node) && node.text === 'createRequire') createRequireIdentifiers += 1;
+    if (ts.isCallExpression(node) && isExactPumpFunSdkLoad(node)) exactSdkLoads += 1;
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return createRequireIdentifiers === 2 && exactSdkLoads === 1;
+}
+
+function isExactCreateRequireImport(node: ts.ImportDeclaration): boolean {
+  const clause = node.importClause;
+  if (clause === undefined || clause.isTypeOnly || clause.name !== undefined) return false;
+  const bindings = clause.namedBindings;
+  if (bindings === undefined || !ts.isNamedImports(bindings) || bindings.elements.length !== 1) return false;
+  const binding = bindings.elements[0];
+  if (binding === undefined) return false;
+  return !binding.isTypeOnly && binding.propertyName === undefined && binding.name.text === 'createRequire';
+}
+
+function isExactPumpFunSdkLoad(node: ts.CallExpression): boolean {
+  if (node.questionDotToken !== undefined || node.typeArguments !== undefined || node.arguments.length !== 1) return false;
+  const sdk = node.arguments[0];
+  const factory = node.expression;
+  if (sdk === undefined || !ts.isStringLiteralLike(sdk) || sdk.text !== '@pump-fun/pump-sdk'
+    || !ts.isCallExpression(factory)
+    || factory.questionDotToken !== undefined
+    || factory.typeArguments !== undefined
+    || factory.arguments.length !== 1
+    || !ts.isIdentifier(factory.expression)
+    || factory.expression.text !== 'createRequire') return false;
+  const meta = factory.arguments[0];
+  return meta !== undefined
+    && ts.isPropertyAccessExpression(meta)
+    && meta.name.text === 'url'
+    && ts.isMetaProperty(meta.expression)
+    && meta.expression.keywordToken === ts.SyntaxKind.ImportKeyword
+    && meta.expression.name.text === 'meta';
+}
+
+function hasExactPumpSwapNamedStaticBridge(sourceFile: ts.SourceFile): boolean {
+  const sdkStatements = sourceFile.statements.filter((statement) => {
+    if (!ts.isImportDeclaration(statement) && !ts.isExportDeclaration(statement)) return false;
+    return statement.moduleSpecifier !== undefined
+      && ts.isStringLiteralLike(statement.moduleSpecifier)
+      && statement.moduleSpecifier.text === '@pump-fun/pump-swap-sdk'
+      && (ts.isImportDeclaration(statement)
+        ? importDeclarationHasRuntimeValue(statement)
+        : exportDeclarationHasRuntimeValue(statement));
+  });
+  const sdkStatement = sdkStatements[0];
+  if (sdkStatements.length !== 1 || sdkStatement === undefined) return false;
+  if (ts.isImportDeclaration(sdkStatement)) {
+    const clause = sdkStatement.importClause;
+    if (clause === undefined || clause.isTypeOnly || clause.name !== undefined) return false;
+    const bindings = clause.namedBindings;
+    return bindings !== undefined
+      && ts.isNamedImports(bindings)
+      && bindings.elements.length > 0
+      && bindings.elements.every((element) => !element.isTypeOnly && element.propertyName === undefined);
+  }
+  if (!ts.isExportDeclaration(sdkStatement)) return false;
+  const clause = sdkStatement.exportClause;
+  return !sdkStatement.isTypeOnly
+    && clause !== undefined
+    && ts.isNamedExports(clause)
+    && clause.elements.length > 0
+    && clause.elements.every((element) => !element.isTypeOnly && element.propertyName === undefined);
+}
+
+function isIdentifierReference(identifier: ts.Identifier): boolean {
+  const parent = identifier.parent;
+  if ((ts.isPropertyAccessExpression(parent) && parent.name === identifier)
+    || (ts.isQualifiedName(parent) && parent.right === identifier)
+    || (ts.isPropertyAssignment(parent) && parent.name === identifier)
+    || (ts.isPropertyDeclaration(parent) && parent.name === identifier)
+    || (ts.isPropertySignature(parent) && parent.name === identifier)
+    || (ts.isMethodDeclaration(parent) && parent.name === identifier)
+    || (ts.isMethodSignature(parent) && parent.name === identifier)
+    || (ts.isVariableDeclaration(parent) && parent.name === identifier)
+    || (ts.isParameter(parent) && parent.name === identifier)
+    || (ts.isBindingElement(parent) && (parent.name === identifier || parent.propertyName === identifier))
+    || (ts.isFunctionDeclaration(parent) && parent.name === identifier)
+    || (ts.isClassDeclaration(parent) && parent.name === identifier)
+    || (ts.isInterfaceDeclaration(parent) && parent.name === identifier)
+    || (ts.isTypeAliasDeclaration(parent) && parent.name === identifier)
+    || (ts.isImportClause(parent) && parent.name === identifier)
+    || (ts.isImportSpecifier(parent) && (parent.name === identifier || parent.propertyName === identifier))
+    || (ts.isExportSpecifier(parent) && (parent.name === identifier || parent.propertyName === identifier))) {
+    return false;
+  }
+  return true;
+}
+
+function scopeDeclaresName(scope: ts.Node, name: string): boolean {
+  if (ts.isFunctionLike(scope)) {
+    if (scope.parameters.some((parameter) => bindingNameContains(parameter.name, name))) return true;
+    if ('name' in scope && scope.name !== undefined && ts.isIdentifier(scope.name) && scope.name.text === name) return true;
+  }
+  if (ts.isCatchClause(scope)
+    && scope.variableDeclaration !== undefined
+    && bindingNameContains(scope.variableDeclaration.name, name)) return true;
+  if (ts.isForStatement(scope) || ts.isForInStatement(scope) || ts.isForOfStatement(scope)) {
+    const initializer = scope.initializer;
+    if (initializer !== undefined && ts.isVariableDeclarationList(initializer)
+      && initializer.declarations.some((declaration) => bindingNameContains(declaration.name, name))) return true;
+  }
+  if (ts.isSourceFile(scope) || ts.isBlock(scope) || ts.isModuleBlock(scope)) {
+    return scope.statements.some((statement) => statementDeclaresName(statement, name));
+  }
+  return false;
+}
+
+function statementDeclaresName(statement: ts.Statement, name: string): boolean {
+  if (ts.isVariableStatement(statement)) {
+    return statement.declarationList.declarations.some((declaration) => bindingNameContains(declaration.name, name));
+  }
+  if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement))
+    && statement.name?.text === name) return true;
+  if (ts.isImportDeclaration(statement) && statement.importClause !== undefined) {
+    const clause = statement.importClause;
+    if (clause.name?.text === name) return true;
+    const bindings = clause.namedBindings;
+    if (bindings !== undefined && ts.isNamespaceImport(bindings)) return bindings.name.text === name;
+    if (bindings !== undefined && ts.isNamedImports(bindings)) {
+      return bindings.elements.some((element) => element.name.text === name);
+    }
+  }
+  return false;
+}
+
+function bindingNameContains(binding: ts.BindingName, name: string): boolean {
+  if (ts.isIdentifier(binding)) return binding.text === name;
+  return binding.elements.some((element) =>
+    !ts.isOmittedExpression(element) && bindingNameContains(element.name, name));
+}
+
+function appendSimulationOnlyElementAccess(node: ts.ElementAccessExpression, violations: string[]): void {
+  const argument = node.argumentExpression;
+  const staticKey = staticStringValue(argument);
+  if (staticKey !== undefined) {
+    if (SIMULATION_ONLY_FORBIDDEN_IDENTIFIERS.has(staticKey)) {
+      violations.push(`Forbidden simulation-only capability: ${staticKey}`);
+    }
+    return;
+  }
+  if (!ts.isNumericLiteral(argument) && isPotentialSimulationCapabilityReceiver(node.expression)) {
+    violations.push('Computed member acquisition is prohibited in simulation-only modules.');
+  }
+}
+
+function staticStringValue(expression: ts.Expression): string | undefined {
+  if (ts.isStringLiteralLike(expression)) return expression.text;
+  if (!ts.isBinaryExpression(expression) || expression.operatorToken.kind !== ts.SyntaxKind.PlusToken) return undefined;
+  const left = staticStringValue(expression.left);
+  const right = staticStringValue(expression.right);
+  return left === undefined || right === undefined ? undefined : `${left}${right}`;
+}
+
+function isPotentialSimulationCapabilityReceiver(expression: ts.Expression): boolean {
+  if (ts.isIdentifier(expression)) return /(?:client|connection|provider|rpc|wallet|signer|transaction)/iu.test(expression.text);
+  return ts.isPropertyAccessExpression(expression)
+    && /(?:client|connection|provider|rpc|wallet|signer|transaction)/iu.test(expression.name.text);
+}
+
 function appendRequire(node: ts.CallExpression, sourcePath: string, repositoryRoot: string, violations: string[]): void {
   const argument = node.arguments[0];
   if (node.arguments.length !== 1 || argument === undefined || !ts.isStringLiteralLike(argument)) {
@@ -186,6 +520,12 @@ function isWithin(target: string, directory: string): boolean {
 
 function hasForbiddenSegment(path: string): boolean {
   return path.replaceAll('\\', '/').split('/').some((segment) => FORBIDDEN_BARE_SEGMENTS.has(segment));
+}
+
+function hasSimulationOnlyForbiddenPathSegment(path: string): boolean {
+  return path.replaceAll('\\', '/').toLocaleLowerCase('en-US').split('/').some((segment) =>
+    SIMULATION_ONLY_FORBIDDEN_PATH_SEGMENTS.has(segment)
+      || /^(?:paper|listener|raydium)(?:[._-]|$)/u.test(segment));
 }
 
 function appendDangerousCall(node: ts.CallExpression, violations: string[]): void {
