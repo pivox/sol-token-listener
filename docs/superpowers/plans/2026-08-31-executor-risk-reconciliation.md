@@ -363,13 +363,13 @@ git commit -m "feat: persist executor risk and reconciliation state (#51)"
 - Create: `src/storage/execution-risk.repository.ts`
 - Create: `tests/execution-risk.repository.test.ts`
 
-- [ ] **Step 1: Write failing repository tests**
+- [x] **Step 1: Write failing repository tests**
 
 Cover wallet generation creation/replay/conflict, append-only wallet snapshot,
 provider measurement monotonicity, idempotent operation counters, 429 window,
 strict row decoding and fixed redacted failures.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -379,7 +379,7 @@ node --import tsx --test tests/execution-risk.repository.test.ts
 
 Expected: missing port/repository modules.
 
-- [ ] **Step 3: Define the exact repository interface**
+- [x] **Step 3: Define the exact repository interface**
 
 The port must expose only bounded operations:
 
@@ -395,13 +395,13 @@ export interface ExecutionRiskRepository {
 }
 ```
 
-- [ ] **Step 4: Implement strict PostgreSQL writes**
+- [x] **Step 4: Implement strict PostgreSQL writes**
 
 Use one private transaction helper with eviction on rollback/release failure,
 fixed public error codes, canonical text NUMERIC decoding, exact row keys and
 no exposure of SQL or credentials.
 
-- [ ] **Step 5: Verify unit and real-DB repository behavior, then commit**
+- [x] **Step 5: Verify unit and real-DB repository behavior, then commit**
 
 Run the repository test with `TEST_DATABASE_URL`; expect all tests PASS. Then:
 

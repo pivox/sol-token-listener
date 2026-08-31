@@ -166,7 +166,6 @@ CREATE TABLE IF NOT EXISTS execution_provider_usage_snapshots (
   measured_at TIMESTAMPTZ NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
   provenance TEXT NOT NULL,
-  quota_state TEXT NOT NULL,
   superseded_at TIMESTAMPTZ,
   purge_after TIMESTAMPTZ,
   CONSTRAINT execution_provider_usage_snapshots_period_measure_unique
@@ -179,7 +178,6 @@ CREATE TABLE IF NOT EXISTS execution_provider_usage_snapshots (
     AND octet_length(plan_id) BETWEEN 1 AND 128
     AND octet_length(billing_period_id) BETWEEN 1 AND 128
     AND provenance IN ('AUTHORITATIVE_PROBE', 'OPERATOR_REPORT')
-    AND quota_state IN ('NORMAL', 'ENTRY_BLOCKED', 'EXIT_ONLY', 'UNKNOWN')
   ),
   CONSTRAINT execution_provider_usage_snapshots_units_check CHECK (
     limit_units <> 'NaN'::NUMERIC AND limit_units > 0
