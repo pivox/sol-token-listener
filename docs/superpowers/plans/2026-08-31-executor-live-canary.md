@@ -501,7 +501,7 @@ Avant de publier `executor:live:start`, ajouter en TDD :
 - Modify: `docs/superpowers/plans/2026-08-31-executor-live-canary.md`
 - Modify: `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` only for review clarifications with patch version bumps
 
-- [ ] **Step 1: Run all quality gates**
+- [x] **Step 1: Run all quality gates**
 
 ```bash
 npm run build
@@ -515,7 +515,7 @@ git diff --check
 
 Expected: every command exits 0; backend and frontend report zero failures.
 
-- [ ] **Step 2: Verify safety inventory**
+- [x] **Step 2: Verify safety inventory**
 
 ```bash
 rg -n "Keypair|sendRawTransaction|signed_transaction_bytes" src dist
