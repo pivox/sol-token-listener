@@ -29,6 +29,9 @@ void test('creates a deterministic immutable signed transaction capability', () 
   assert.equal(artifact.signedTransactionHash, expectedBytesHash);
   assert.equal(artifact.state, 'PERSISTED');
   assert.equal(artifact.stateRevision, 0n);
+  assert.equal(artifact.reservationId, `execution_exposure_reservation_${HASH_D}`);
+  assert.equal(artifact.quoteObservedAtMs, 900);
+  assert.equal(artifact.quoteExpiresAtMs, 2_000);
   assert.notStrictEqual(artifact.signedTransactionBytes, BYTES);
   assert.deepEqual([...artifact.signedTransactionBytes], [...BYTES]);
   assert.equal(Object.isFrozen(artifact), true);
@@ -49,6 +52,9 @@ void test('rejects oversized, malformed and non-u64 signed artifact values', () 
     { messageHash: 'A'.repeat(64) },
     { attemptNumber: 0 },
     { signedAtMs: -1 },
+    { quoteObservedAtMs: 1_001 },
+    { quoteExpiresAtMs: 1_000 },
+    { reservationId: null },
     { side: 'HOLD' },
     { state: 'ACCEPTED' },
   ]) {
@@ -142,6 +148,7 @@ void test('publishes the append-only live reason code contract', () => {
     'KEYPAIR_PERMISSIONS_INVALID',
     'SIGNED_SIMULATION_FAILED',
     'SIGNED_SIMULATION_SUCCEEDED',
+    'PRE_SUBMISSION_REVOKED_NO_SEND',
     'SUBMISSION_SIGNATURE_MISMATCH',
     'SUBMISSION_STARTED',
     'MAXIMUM_HOLDING_REACHED',
@@ -159,6 +166,7 @@ function signedArtifactInput() {
     attemptNumber: 1,
     generationId: `execution_wallet_generation_${HASH_B}`,
     armamentId: `execution_activation_armament_${HASH_C}`,
+    reservationId: `execution_exposure_reservation_${HASH_D}`,
     exitAuthorizationId: null,
     providerId: 'primary',
     walletPublicKey: WALLET,
@@ -168,6 +176,8 @@ function signedArtifactInput() {
     buildFingerprint: HASH_B,
     snapshotFingerprint: HASH_C,
     quoteFingerprint: HASH_D,
+    quoteObservedAtMs: 900,
+    quoteExpiresAtMs: 2_000,
     blockhash: BLOCKHASH,
     lastValidBlockHeight: 42n,
     signature: SIGNATURE,

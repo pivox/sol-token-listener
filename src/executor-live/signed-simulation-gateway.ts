@@ -3,6 +3,11 @@ import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
 import { PublicKey, VersionedTransaction } from '@solana/web3.js';
 import type { ExecutionSimulationEvidenceV1 } from '../ports/execution-simulation-gateway.js';
+import {
+  createExecutionLiveSignedSimulationEvidence,
+  createExecutionLiveUnsignedSimulationEvidenceIdentity,
+} from
+  '../domain/execution-live-signed-simulation.js';
 import type {
   AuthenticatedPersistedSignedTransactionV1,
   ExecutionLiveSignedSimulationEvidenceV1,
@@ -87,29 +92,22 @@ export class SignedSimulationGateway {
     try {
       validateResult(result, input, this.limits);
       const observedAtMs = timestamp(this.now());
-      const evidenceFingerprint = fingerprint([
-        'execution-live-signed-simulation-v1',
-        input.persisted.artifact.artifactId,
-        input.persisted.artifact.signedTransactionHash,
-        result.providerId,
-        result.contextSlot.toString(10),
-        result.unitsConsumed.toString(10),
-        result.feePayerLamportDebit.toString(10),
-        result.baseDeltaRaw.toString(10),
-        result.quoteDeltaRaw.toString(10),
-        result.logsFingerprint,
-        String(result.logsLineCount),
-      ]);
-      return Object.freeze({
+      const unsignedEvidence = createExecutionLiveUnsignedSimulationEvidenceIdentity(
+        input.persisted.artifact, input.unsignedSimulation,
+      );
+      return createExecutionLiveSignedSimulationEvidence({
         payloadVersion: 1,
         artifactId: input.persisted.artifact.artifactId,
+        unsignedSimulationEvidenceId: unsignedEvidence.evidenceId,
         signedTransactionHash: input.persisted.artifact.signedTransactionHash,
+        providerId: result.providerId,
         simulationSlot: result.contextSlot,
         unitsConsumed: result.unitsConsumed,
         feePayerLamportDebit: result.feePayerLamportDebit,
         baseDeltaRaw: result.baseDeltaRaw,
         quoteDeltaRaw: result.quoteDeltaRaw,
-        evidenceFingerprint,
+        logsFingerprint: result.logsFingerprint,
+        logsLineCount: result.logsLineCount,
         observedAtMs,
       });
     } catch (error) {
@@ -212,16 +210,6 @@ function canonicalPublicKey(value: unknown): PublicKey {
   const key = new PublicKey(value);
   if (key.toBase58() !== value) transactionError();
   return key;
-}
-
-function fingerprint(values: readonly string[]): string {
-  const hash = createHash('sha256');
-  for (const value of values) {
-    const bytes = Buffer.from(value, 'utf8');
-    const length = Buffer.alloc(4); length.writeUInt32BE(bytes.length);
-    hash.update(length).update(bytes);
-  }
-  return hash.digest('hex');
 }
 
 function sha256(bytes: Uint8Array): string {

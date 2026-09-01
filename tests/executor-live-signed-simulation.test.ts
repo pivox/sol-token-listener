@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import bs58 from 'bs58';
 import { Keypair, SystemProgram, VersionedTransaction } from '@solana/web3.js';
@@ -25,7 +26,7 @@ void test('verifies persisted bytes and performs one exact signed simulation wit
   }));
   const gateway = new SignedSimulationGateway(provider, Object.freeze({
     maxComputeUnits: 300_000n, maxFeePayerLamportDebit: 10_000n,
-  }));
+  }), () => 1_786_699_000_050);
 
   const evidence = await gateway.simulate(Object.freeze({
     payloadVersion: 1,
@@ -43,9 +44,14 @@ void test('verifies persisted bytes and performs one exact signed simulation wit
 
   assert.equal(evidence.artifactId, fixture.artifact.artifactId);
   assert.equal(evidence.signedTransactionHash, fixture.artifact.signedTransactionHash);
+  assert.match(evidence.unsignedSimulationEvidenceId,
+    /^execution_live_unsigned_simulation_evidence_[0-9a-f]{64}$/u);
+  assert.equal(evidence.providerId, 'primary');
   assert.equal(evidence.baseDeltaRaw, 95n);
   assert.equal(evidence.quoteDeltaRaw, -100n);
-  assert.match(evidence.evidenceFingerprint, /^[0-9a-f]{64}$/u);
+  assert.equal(evidence.logsFingerprint, 'd'.repeat(64));
+  assert.equal(evidence.logsLineCount, 2);
+  assert.equal(evidence.evidenceFingerprint, signedEvidenceFingerprint(evidence));
   assert.equal(provider.calls, 1);
   assert.deepEqual(provider.request, Object.freeze({
     payloadVersion: 1,
@@ -149,10 +155,12 @@ function signedFixture() {
     intentId: `execution_intent_${'1'.repeat(64)}`, attemptNumber: 1,
     generationId: `execution_wallet_generation_${'2'.repeat(64)}`,
     armamentId: `execution_activation_armament_${'3'.repeat(64)}`,
+    reservationId: `execution_exposure_reservation_${'7'.repeat(64)}`,
     exitAuthorizationId: null, providerId: 'primary',
     walletPublicKey: signer.publicKey.toBase58(), side: 'BUY', effectiveVenue: 'PUMP_FUN',
     messageHash: compiled.messageHash, buildFingerprint: '4'.repeat(64),
     snapshotFingerprint: '5'.repeat(64), quoteFingerprint: '6'.repeat(64),
+    quoteObservedAtMs: 1_786_698_999_900, quoteExpiresAtMs: 1_786_699_005_000,
     blockhash, lastValidBlockHeight: 500n, signature: bs58.encode(signature),
     signedTransactionBytes: bytes, signedAtMs: 1_786_699_000_000,
   });
@@ -181,4 +189,28 @@ function requiredSignature(transaction: VersionedTransaction): Uint8Array {
   const signature = transaction.signatures[0];
   assert.ok(signature);
   return signature;
+}
+
+function signedEvidenceFingerprint(value: object): string {
+  const evidence = value as Readonly<Record<string, unknown>>;
+  return fingerprint([
+    'execution-live-signed-simulation-evidence-v1',
+    String(evidence.payloadVersion), String(evidence.artifactId),
+    String(evidence.unsignedSimulationEvidenceId), String(evidence.signedTransactionHash),
+    String(evidence.providerId), String(evidence.simulationSlot),
+    String(evidence.unitsConsumed), String(evidence.feePayerLamportDebit),
+    String(evidence.baseDeltaRaw), String(evidence.quoteDeltaRaw),
+    String(evidence.logsFingerprint), String(evidence.logsLineCount),
+    String(evidence.observedAtMs),
+  ]);
+}
+
+function fingerprint(parts: readonly string[]): string {
+  const hash = createHash('sha256');
+  for (const part of parts) {
+    const bytes = Buffer.from(part, 'utf8');
+    const length = Buffer.alloc(4); length.writeUInt32BE(bytes.length);
+    hash.update(length).update(bytes);
+  }
+  return hash.digest('hex');
 }

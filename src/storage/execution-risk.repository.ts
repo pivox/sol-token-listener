@@ -337,6 +337,10 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
   ): Promise<'RECORDED' | 'REPLAYED'> {
     const operation = operationFrom(input);
     return this.transaction(async (client) => {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))',
+        [operation.providerId],
+      );
       const existing = await client.query(`SELECT operation_id,payload_version,snapshot_id,
         provider_id,billing_period_id,category,logical_operation_id,units::TEXT AS units
         FROM execution_provider_usage_counters WHERE operation_id=$1`, [operation.operationId]);
@@ -372,6 +376,10 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
   public async recordRateLimit(input: ProviderRateLimitEventV1): Promise<'RECORDED' | 'REPLAYED'> {
     const event = rateLimitFrom(input);
     return this.transaction(async (client) => {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))',
+        [event.providerId],
+      );
       const existing = await client.query(`SELECT event_id,payload_version,provider_id,
         billing_period_id,endpoint_id,
         trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms
@@ -381,6 +389,12 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         if (!sameRateLimit(decodeRateLimit(existing.rows[0]), event)) throw failure('CONFLICT');
         return 'REPLAYED';
       }
+      await client.query(`SELECT snapshot_id
+        FROM execution_provider_usage_snapshots
+        WHERE provider_id=$1 AND billing_period_id=$2
+        ORDER BY measured_at DESC,snapshot_id DESC LIMIT 1 FOR UPDATE`, [
+        event.providerId, event.billingPeriodId,
+      ]);
       try {
         const result = await client.query(`INSERT INTO execution_provider_rate_limit_events (
           event_id,payload_version,provider_id,billing_period_id,endpoint_id,observed_at,purge_after
@@ -405,6 +419,10 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       await client.query(
         'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
         [input.generationId],
+      );
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))',
+        [input.providerSnapshot.providerId],
       );
       const operationAtMs = textTimestamp(exactRow(singleRow(await client.query(
         `SELECT trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds', statement_timestamp()))
@@ -475,6 +493,13 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       const recentRateLimits = rateRows.rows.map((row) => textTimestamp(
         exactRow(row, ['observed_at_ms'] as const).observed_at_ms,
       ));
+      const providerRateLimitCount = unsignedBigint(parseBigint(exactRow(singleRow(
+        await client.query(`SELECT COUNT(*)::TEXT AS rate_limit_count
+          FROM execution_provider_rate_limit_events
+          WHERE provider_id=$1 AND billing_period_id=$2`, [
+          providerSnapshot.providerId, providerSnapshot.billingPeriodId,
+        ]),
+      ), ['rate_limit_count'] as const).rate_limit_count));
       const quota = evaluateProviderQuota({
         policy: input.policy,
         previousSnapshot: null,
@@ -524,21 +549,27 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         report_id,payload_version,report_fingerprint,intent_id,generation_id,policy_fingerprint,
         wallet_snapshot_fingerprint,provider_snapshot_fingerprint,decision,reason_code,
         quote_amount_raw,projected_capital_raw,projected_exposure_raw,projected_drawdown_raw,
-        quota_state,wallet_state_revision,input_fingerprint,recorded_at,terminal_at,purge_after
+        quota_state,wallet_state_revision,input_fingerprint,
+        risk_state_revision_baseline,conservative_drawdown_raw_baseline,
+        provider_local_usage_units_baseline,provider_rate_limit_count_baseline,
+        recorded_at,terminal_at,purge_after
       ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10::NUMERIC,$11::NUMERIC,
-        $12::NUMERIC,$13::NUMERIC,$14,$15::BIGINT,$16,
-        TIMESTAMPTZ 'epoch' + ($17::BIGINT * INTERVAL '1 millisecond'),
+        $12::NUMERIC,$13::NUMERIC,$14,$15::BIGINT,$16,$15::BIGINT,$13::NUMERIC,
+        $17::NUMERIC,$18::BIGINT,
+        TIMESTAMPTZ 'epoch' + ($19::BIGINT * INTERVAL '1 millisecond'),
         CASE WHEN $8='REJECTED' THEN TIMESTAMPTZ 'epoch'
-          + ($17::BIGINT * INTERVAL '1 millisecond') ELSE NULL END,
+          + ($19::BIGINT * INTERVAL '1 millisecond') ELSE NULL END,
         CASE WHEN $8='REJECTED' THEN TIMESTAMPTZ 'epoch'
-          + (($17::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END)`, [
+          + (($19::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END)`, [
         reportId, identity.reportFingerprint, input.intent.id, input.generationId,
         input.policy.policyFingerprint, walletSnapshot.snapshotFingerprint,
         providerSnapshot.snapshotFingerprint, decision, reasonCode,
         quoteAmountRaw.toString(), risk.reconciledCapitalLamports.toString(),
         risk.projectedExposureLamports.toString(),
         risk.conservativeUnrealizedLossLamports.toString(), quota.state,
-        targetRevision.toString(), inputFingerprint, operationAtMs,
+        targetRevision.toString(), inputFingerprint,
+        (localUsage + (decision === 'ADMITTED' ? input.policy.providerEntryCostUnits : 0n)).toString(),
+        providerRateLimitCount.toString(), operationAtMs,
       ]);
       if (reportInsert.rowCount !== 1) throw failure('INVALID_DATA');
       if (decision === 'ADMITTED' && reservationId !== null) {

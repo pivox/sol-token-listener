@@ -36,12 +36,15 @@ void test('executor risk purge exposes additive zero counters on an empty databa
       providerSnapshots: result.executionRiskProviderSnapshots,
       tombstones: result.executionRiskTombstones,
       signedTransactions: result.executionSignedTransactions,
+      signedSimulationEvidence: result.executionSignedSimulationEvidence,
+      liveUnsignedSimulationEvidence: result.executionLiveUnsignedSimulationEvidence,
       submissionEvents: result.executionSubmissionEvents,
     }, {
       exitAuthorizations: 0, livePositions: 0,
       rateLimits: 0, evidence: 0, faults: 0, reservations: 0, reports: 0,
       walletSnapshots: 0, providerOperations: 0, providerSnapshots: 0, tombstones: 0,
-      signedTransactions: 0, submissionEvents: 0,
+      signedTransactions: 0, signedSimulationEvidence: 0,
+      liveUnsignedSimulationEvidence: 0, submissionEvents: 0,
     });
   });
 });
@@ -57,6 +60,74 @@ void test('live retention is terminal-only and cannot delete ambiguous or open s
   assert.match(liveRetention, /candidate\.state IN \('CONSUMED','REVOKED'\)/u);
   assert.doesNotMatch(liveRetention, /(?:AMBIGUOUS|UNKNOWN|OPEN|EXIT_PENDING|SUBMISSION_STARTED)'?\s*(?:,|\))/u);
   assert.match(liveRetention, /purge_after <= \$1::TIMESTAMPTZ/u);
+  assert.match(liveRetention, /DELETE FROM execution_signed_simulation_evidence/u);
+  assert.match(liveRetention, /DELETE FROM execution_live_unsigned_simulation_evidence/u);
+  assert.ok(
+    liveRetention.indexOf('DELETE FROM execution_signed_simulation_evidence')
+      < liveRetention.indexOf('DELETE FROM execution_signed_transactions artifact'),
+    'signed simulation evidence must purge in the terminal artifact cohort',
+  );
+});
+
+void test('purges expired terminal SELL evidence without a reservation', async (context) => {
+  const databaseUrl = requiredDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    await migrateDatabase({ pool });
+    const nowMs = Date.now();
+    await new PostgresExecutionRiskRepository(pool).registerWalletGeneration({
+      generationId, payloadVersion: 1, walletPublicKey: wallet,
+      cluster: 'mainnet-beta', genesisHash: '3'.repeat(32), generation: 1,
+    });
+    const intent = await new PostgresExecutionIntentRepository(pool)
+      .create(intentDraft('sell-retention', nowMs));
+    await pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,effective_venue,provider_id,started_at,completed_at,reason_code
+    ) VALUES ($1,1,'COMPLETED','PUMP_FUN','rpc-primary',
+      TIMESTAMPTZ 'epoch' + ($2::BIGINT * INTERVAL '1 millisecond'),
+      TIMESTAMPTZ 'epoch' + ($3::BIGINT * INTERVAL '1 millisecond'),'ATTEMPT_COMPLETED')`, [
+      intent.intent.id, nowMs - 18_001_000, nowMs - 18_000_000,
+    ]);
+    await insertSellEvidence(pool, intent.intent.id, nowMs);
+    await insertSellResolvedUnknownEvidence(pool, intent.intent.id, nowMs);
+
+    const purged = await purgeExpiredFoundationData(pool);
+
+    assert.equal(purged.executionRiskReconciliationEvidence, 2);
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_reconciliation_evidence`)).rows[0]?.count, 0);
+  });
+});
+
+void test('retains a complete SELL evidence cohort while one member is still live', async (context) => {
+  const databaseUrl = requiredDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    await migrateDatabase({ pool });
+    const nowMs = Date.now();
+    await new PostgresExecutionRiskRepository(pool).registerWalletGeneration({
+      generationId, payloadVersion: 1, walletPublicKey: wallet,
+      cluster: 'mainnet-beta', genesisHash: '3'.repeat(32), generation: 1,
+    });
+    const intent = await new PostgresExecutionIntentRepository(pool)
+      .create(intentDraft('sell-retention-live-member', nowMs));
+    await pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,effective_venue,provider_id,started_at,completed_at,reason_code
+    ) VALUES ($1,1,'COMPLETED','PUMP_FUN','rpc-primary',
+      TIMESTAMPTZ 'epoch' + ($2::BIGINT * INTERVAL '1 millisecond'),
+      TIMESTAMPTZ 'epoch' + ($3::BIGINT * INTERVAL '1 millisecond'),'ATTEMPT_COMPLETED')`, [
+      intent.intent.id, nowMs - 18_001_000, nowMs - 18_000_000,
+    ]);
+    const liveResolutionAtMs = nowMs - 10_800_000;
+    await insertSellEvidence(pool, intent.intent.id, nowMs, liveResolutionAtMs);
+    await insertSellResolvedUnknownEvidence(pool, intent.intent.id, nowMs, liveResolutionAtMs);
+
+    const purged = await purgeExpiredFoundationData(pool);
+
+    assert.equal(purged.executionRiskReconciliationEvidence, 0);
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_reconciliation_evidence`)).rows[0]?.count, 2);
+  });
 });
 
 void test('purges only expired executor risk payloads and retains active or ambiguous state', async (context) => {
@@ -379,6 +450,59 @@ async function insertResolvedUnknownEvidence(
     '3'.repeat(88), wallet, 'd'.repeat(64), 'e'.repeat(64), 'f'.repeat(64),
     nowMs - 14_400_002, `execution_reconciliation_${'4'.repeat(64)}`,
     nowMs - 14_400_000,
+  ]);
+}
+
+async function insertSellEvidence(
+  pool: InstanceType<typeof pg.Pool>,
+  intentId: string,
+  nowMs: number,
+  finalizedAtMs = nowMs - 14_400_000,
+): Promise<void> {
+  await pool.query(`INSERT INTO execution_reconciliation_evidence (
+    evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,
+    generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,
+    build_fingerprint,snapshot_fingerprint,maximum_fee_lamports,
+    maximum_fee_payer_lamport_debit,signature_history,confirmation_status,
+    finalized_block_height,observed_slot,observed_transaction_fingerprint,fee_lamports,
+    wallet_lamport_delta,base_delta_raw,quote_delta_raw,unexpected_residual_token_balance_raw,
+    observed_at,finalized_at,result,reason_code,purge_after
+  ) VALUES ($1,1,$2,$3,1,NULL,$4,'rpc-primary','SELL',$5,$6,100,$7,$8,$9,10,1000,
+    'PRESENT','FINALIZED',101,102,$10,1,99,-10,100,0,
+    TIMESTAMPTZ 'epoch' + ($11::BIGINT * INTERVAL '1 millisecond'),
+    TIMESTAMPTZ 'epoch' + ($12::BIGINT * INTERVAL '1 millisecond'),
+    'MATCHED','INTENT_SUCCEEDED',
+    TIMESTAMPTZ 'epoch' + (($12::BIGINT + 14400000) * INTERVAL '1 millisecond'))`, [
+    `execution_reconciliation_${'7'.repeat(64)}`, '7'.repeat(64), intentId, generationId,
+    '3'.repeat(88), wallet, 'd'.repeat(64), 'e'.repeat(64), 'f'.repeat(64),
+    '1'.repeat(64), finalizedAtMs - 1, finalizedAtMs,
+  ]);
+}
+
+async function insertSellResolvedUnknownEvidence(
+  pool: InstanceType<typeof pg.Pool>,
+  intentId: string,
+  nowMs: number,
+  resolvedAtMs = nowMs - 14_400_000,
+): Promise<void> {
+  await pool.query(`INSERT INTO execution_reconciliation_evidence (
+    evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,
+    generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,
+    build_fingerprint,snapshot_fingerprint,maximum_fee_lamports,
+    maximum_fee_payer_lamport_debit,signature_history,confirmation_status,
+    finalized_block_height,observed_slot,observed_transaction_fingerprint,fee_lamports,
+    wallet_lamport_delta,base_delta_raw,quote_delta_raw,unexpected_residual_token_balance_raw,
+    observed_at,finalized_at,result,reason_code,resolved_by_evidence_id,resolved_at,purge_after
+  ) VALUES ($1,1,$2,$3,1,NULL,$4,'rpc-primary','SELL',$5,$6,100,$7,$8,$9,10,1000,
+    'UNKNOWN','NOT_FOUND',99,NULL,NULL,0,0,0,0,0,
+    TIMESTAMPTZ 'epoch' + ($10::BIGINT * INTERVAL '1 millisecond'),NULL,
+    'UNKNOWN','RECONCILIATION_REQUIRED',$11,
+    TIMESTAMPTZ 'epoch' + ($12::BIGINT * INTERVAL '1 millisecond'),
+    TIMESTAMPTZ 'epoch' + (($12::BIGINT + 14400000) * INTERVAL '1 millisecond'))`, [
+    `execution_reconciliation_${'6'.repeat(64)}`, '6'.repeat(64), intentId, generationId,
+    '3'.repeat(88), wallet, 'd'.repeat(64), 'e'.repeat(64), 'f'.repeat(64),
+    resolvedAtMs - 2, `execution_reconciliation_${'7'.repeat(64)}`,
+    resolvedAtMs,
   ]);
 }
 

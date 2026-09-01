@@ -36,6 +36,27 @@ void test('loads a 0600 owned canonical keypair, signs and closes deterministica
   await assert.rejects(signer.signMessage(message), /Live transaction signer is closed/u);
 });
 
+void test('accepts only owner-read 0400 or owner-read-write 0600 keypair modes', async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), 'executor-live-keypair-mode-'));
+  context.after(async () => { await rm(directory, { recursive: true, force: true }); });
+  const keypair = Keypair.generate();
+  const path = join(directory, 'keypair.json');
+  await writeFile(path, JSON.stringify([...keypair.secretKey]), { mode: 0o600 });
+
+  await chmod(path, 0o400);
+  const readOnlySigner = await loadLiveTransactionSigner(
+    config(path, keypair.publicKey.toBase58()),
+  );
+  await readOnlySigner.close();
+
+  await chmod(path, 0o700);
+  await assert.rejects(
+    loadLiveTransactionSigner(config(path, keypair.publicKey.toBase58())),
+    (error: unknown) => error instanceof LiveKeypairError
+      && error.code === 'KEYPAIR_PERMISSIONS_INVALID',
+  );
+});
+
 void test('rejects symlinks, permissive modes, malformed payloads and wallet mismatch without leaking', async (context) => {
   const directory = await mkdtemp(join(tmpdir(), 'executor-live-reject-'));
   context.after(async () => { await rm(directory, { recursive: true, force: true }); });

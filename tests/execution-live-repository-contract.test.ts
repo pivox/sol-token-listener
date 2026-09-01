@@ -8,8 +8,10 @@ void test('live repository port exposes only closed durable lifecycle commands',
   const source = await readFile(portUrl, 'utf8');
   for (const method of [
     'persistSigned',
+    'inspectSignedTransaction',
     'authenticatePersistedSignedTransaction',
     'recordSignedSimulation',
+    'revokeBeforeSubmission',
     'beginSubmission',
     'recordSubmissionOutcome',
     'recordConfirmation',

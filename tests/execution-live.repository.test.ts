@@ -18,6 +18,13 @@ import {
 import { createExecutionSimulationArtifactDraft } from '../src/domain/execution-simulation.js';
 import { evaluateExecutionReconciliation } from '../src/domain/execution-reconciliation.js';
 import { createSignedTransactionArtifact } from '../src/domain/execution-live.js';
+import {
+  createExecutionLiveSignedSimulationEvidence,
+  createExecutionLiveUnsignedSimulationEvidenceIdentity,
+} from
+  '../src/domain/execution-live-signed-simulation.js';
+import type { ExecutionSimulationEvidenceV1 } from
+  '../src/ports/execution-simulation-gateway.js';
 import { ExecutionAdmissionService } from '../src/executor-risk/admission-service.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
@@ -33,6 +40,51 @@ const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const walletPublicKey = '11111111111111111111111111111111';
 const quoteMint = 'So11111111111111111111111111111111111111112';
 const fingerprint = '1'.repeat(64);
+
+function submissionPreflight(artifact: ReturnType<typeof createSignedTransactionArtifact>) {
+  return Object.freeze({
+    runtime: Object.freeze({
+      payloadVersion: 1 as const, phase: 'CANARY' as const,
+      buildHash: fingerprint, configurationFingerprint: fingerprint,
+      strategyFingerprint: '3'.repeat(64), walletPublicKey,
+      cluster: 'mainnet-beta' as const, expectedGenesisHash: walletPublicKey,
+      observedGenesisHash: walletPublicKey, providerId: 'primary',
+    }),
+    blockhashValidity: Object.freeze({
+      payloadVersion: 1 as const, providerId: artifact.providerId,
+      blockhash: artifact.blockhash, valid: true as const,
+      observedBlockHeight: artifact.lastValidBlockHeight - 1n,
+      contextSlot: 127n, observedAtMs: Date.now(),
+    }),
+  });
+}
+
+function signedSimulationEvidence(
+  artifact: ReturnType<typeof createSignedTransactionArtifact>,
+  unsignedSimulation: ExecutionSimulationEvidenceV1,
+  metrics: Readonly<{
+    simulationSlot: bigint;
+    unitsConsumed: bigint;
+    feePayerLamportDebit: bigint;
+    baseDeltaRaw: bigint;
+    quoteDeltaRaw: bigint;
+    observedAtMs: number;
+  }>,
+  providerId = artifact.providerId,
+) {
+  return createExecutionLiveSignedSimulationEvidence({
+    payloadVersion: 1,
+    artifactId: artifact.artifactId,
+    unsignedSimulationEvidenceId: createExecutionLiveUnsignedSimulationEvidenceIdentity(
+      artifact, unsignedSimulation,
+    ).evidenceId,
+    signedTransactionHash: artifact.signedTransactionHash,
+    providerId,
+    ...metrics,
+    logsFingerprint: '9'.repeat(64),
+    logsLineCount: 1,
+  });
+}
 
 void test('concurrent BUY persistence locks one armament and replays exact bytes', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -79,31 +131,101 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
     assert.equal(authenticated.state, 'PERSISTED');
     assert.deepEqual(authenticated.artifact.signedTransactionBytes,
       fixture.artifact.signedTransactionBytes);
-    const signedSimulation = await repository.recordSignedSimulation(
+    const recovered = await repository.inspectSignedTransaction({ claim: fixture.claim });
+    assert.equal(recovered?.state, 'PERSISTED');
+    assert.ok(recovered !== null && 'artifact' in recovered);
+    assert.equal(recovered.artifact.artifactId, fixture.artifact.artifactId);
+    assert.deepEqual(recovered.unsignedSimulation, fixture.unsignedSimulation);
+    const signedEvidenceMetrics = Object.freeze({
+      simulationSlot: 126n, unitsConsumed: 26_000n,
+      feePayerLamportDebit: 5_500n, baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
+      observedAtMs: fixture.artifact.signedAtMs + 1,
+    });
+    await assert.rejects(repository.recordSignedSimulation(
       fixture.claim,
-      Object.freeze({
-        payloadVersion: 1,
-        artifactId: fixture.artifact.artifactId,
-        signedTransactionHash: fixture.artifact.signedTransactionHash,
-        simulationSlot: 126n,
-        unitsConsumed: 26_000n,
-        feePayerLamportDebit: 5_500n,
-        baseDeltaRaw: 95n,
-        quoteDeltaRaw: -1_000n,
-        evidenceFingerprint: '9'.repeat(64),
-        observedAtMs: fixture.artifact.signedAtMs + 1,
-      }),
+      signedSimulationEvidence(
+        fixture.artifact, fixture.unsignedSimulation, signedEvidenceMetrics, 'secondary',
+      ),
+    ), isLiveRepositoryError('CONFLICT'));
+    const rejectedEvidence = await pool.query(`SELECT
+      (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS state,
+      (SELECT COUNT(*)::INTEGER FROM execution_signed_simulation_evidence
+        WHERE artifact_id=$1) AS evidence_count`, [fixture.artifact.artifactId]);
+    assert.deepEqual(rejectedEvidence.rows, [{ state: 'PERSISTED', evidence_count: 0 }]);
+    const signedEvidence = signedSimulationEvidence(
+      fixture.artifact, fixture.unsignedSimulation, signedEvidenceMetrics,
+    );
+    const signedSimulation = await repository.recordSignedSimulation(
+      fixture.claim, signedEvidence,
     );
     assert.equal(signedSimulation.state, 'SIGNED_SIMULATED');
     assert.equal(signedSimulation.stateRevision, 1n);
+    assert.deepEqual(
+      await repository.recordSignedSimulation(fixture.claim, signedEvidence),
+      signedSimulation,
+    );
+    const durableEvidence = await pool.query(`SELECT evidence_fingerprint,
+      unsigned_simulation_evidence_id,provider_id,logs_fingerprint,logs_line_count,
+      COUNT(*) OVER ()::INTEGER AS evidence_count
+      FROM execution_signed_simulation_evidence WHERE artifact_id=$1`, [
+      fixture.artifact.artifactId,
+    ]);
+    assert.deepEqual(durableEvidence.rows, [{
+      evidence_fingerprint: signedEvidence.evidenceFingerprint,
+      unsigned_simulation_evidence_id: signedEvidence.unsignedSimulationEvidenceId,
+      provider_id: 'primary', logs_fingerprint: '9'.repeat(64), logs_line_count: 1,
+      evidence_count: 1,
+    }]);
+    for (const table of [
+      'execution_live_unsigned_simulation_evidence',
+      'execution_signed_simulation_evidence',
+    ]) {
+      await assert.rejects(
+        pool.query(`UPDATE ${table} SET evidence_fingerprint=$2 WHERE artifact_id=$1`, [
+          fixture.artifact.artifactId, 'f'.repeat(64),
+        ]),
+        (error: unknown) => typeof error === 'object' && error !== null
+          && 'code' in error && error.code === '55000',
+      );
+    }
     const submissionStarted = await repository.beginSubmission({
       claim: fixture.claim,
       artifactId: fixture.artifact.artifactId,
       expectedRevision: signedSimulation.stateRevision,
-      observedAtMs: Date.now(),
+      ...submissionPreflight(fixture.artifact),
     });
     assert.equal(submissionStarted.state, 'SUBMISSION_STARTED');
     assert.equal(submissionStarted.stateRevision, 2n);
+    const preflight = await pool.query(`SELECT artifact_id,reservation_id,phase,
+      admission_risk_revision::TEXT AS admission_risk_revision,
+      risk_revision::TEXT AS risk_revision,
+      admission_drawdown_raw::TEXT AS admission_drawdown_raw,
+      conservative_drawdown_raw::TEXT AS conservative_drawdown_raw,
+      admission_provider_local_usage_units::TEXT AS admission_provider_local_usage_units,
+      provider_local_usage_units::TEXT AS provider_local_usage_units,
+      admission_provider_rate_limit_count::TEXT AS admission_provider_rate_limit_count,
+      provider_rate_limit_count::TEXT AS provider_rate_limit_count,
+      observed_block_height::TEXT AS observed_block_height
+      FROM execution_submission_preflight_evidence WHERE artifact_id=$1`, [
+      fixture.artifact.artifactId,
+    ]);
+    assert.deepEqual(preflight.rows, [{
+      artifact_id: fixture.artifact.artifactId,
+      reservation_id: fixture.reservationId,
+      phase: 'CANARY',
+      admission_risk_revision: '1', risk_revision: '1',
+      admission_drawdown_raw: '0', conservative_drawdown_raw: '0',
+      admission_provider_local_usage_units: '8', provider_local_usage_units: '8',
+      admission_provider_rate_limit_count: '0', provider_rate_limit_count: '0',
+      observed_block_height: '999',
+    }]);
+    await assert.rejects(pool.query(`UPDATE execution_submission_preflight_evidence
+      SET authorized_at=authorized_at WHERE artifact_id=$1`, [fixture.artifact.artifactId]),
+    (error: unknown) => databaseErrorCode(error) === '55000');
+    await assert.rejects(pool.query(`UPDATE execution_risk_admission_reports
+      SET risk_state_revision_baseline=risk_state_revision_baseline+1
+      WHERE intent_id=$1`, [fixture.claim.intent.id]),
+    (error: unknown) => databaseErrorCode(error) === '55000');
     await repository.recordSubmissionOutcome(fixture.claim, Object.freeze({
       payloadVersion: 1,
       artifactId: fixture.artifact.artifactId,
@@ -203,6 +325,10 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       replayedEntry.exitAuthorization?.authorizationId,
       reconciled.exitAuthorization?.authorizationId,
     );
+    assert.equal(replayedEntry.position?.state, 'OPEN');
+    assert.equal(replayedEntry.position?.stateRevision, 0n);
+    assert.equal(replayedEntry.exitAuthorization?.state, 'ACTIVE');
+    assert.equal(replayedEntry.exitAuthorization?.stateRevision, 0n);
     const finalized = await pool.query(`SELECT
       (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS artifact_state,
       (SELECT status FROM execution_intents WHERE id=$2) AS intent_status,
@@ -276,6 +402,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       attemptNumber: exitBegun.attempt.attemptNumber,
       generationId,
       armamentId: null,
+      reservationId: null,
       exitAuthorizationId: reconciled.exitAuthorization.authorizationId,
       providerId: 'primary',
       walletPublicKey,
@@ -285,6 +412,8 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       buildFingerprint: 'b'.repeat(64),
       snapshotFingerprint: 'c'.repeat(64),
       quoteFingerprint: 'e'.repeat(64),
+      quoteObservedAtMs: exitTimelineMs,
+      quoteExpiresAtMs: exitTimelineMs + 60_000,
       blockhash: walletPublicKey,
       lastValidBlockHeight: 2_000n,
       signature: bs58.encode(new Uint8Array(64).fill(10)),
@@ -319,16 +448,12 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
     }));
     const exitSimulated = await repository.recordSignedSimulation(
       exitBegun.claim,
-      Object.freeze({
-        payloadVersion: 1,
-        artifactId: exitArtifact.artifactId,
-        signedTransactionHash: exitArtifact.signedTransactionHash,
+      signedSimulationEvidence(exitArtifact, exitUnsignedSimulation, {
         simulationSlot: 202n,
         unitsConsumed: 26_000n,
         feePayerLamportDebit: 5_000n,
         baseDeltaRaw: -95n,
         quoteDeltaRaw: 800n,
-        evidenceFingerprint: '1'.repeat(64),
         observedAtMs: exitArtifact.signedAtMs + 1,
       }),
     );
@@ -336,24 +461,16 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       claim: exitBegun.claim,
       artifactId: exitArtifact.artifactId,
       expectedRevision: exitSimulated.stateRevision,
-      observedAtMs: exitArtifact.signedAtMs + 2,
+      ...submissionPreflight(exitArtifact),
     });
     await repository.recordSubmissionOutcome(exitBegun.claim, Object.freeze({
       payloadVersion: 1,
       artifactId: exitArtifact.artifactId,
       expectedRevision: exitStarted.stateRevision,
-      outcome: 'ACCEPTED',
-      returnedSignature: exitArtifact.signature,
-      reasonCode: 'SUBMISSION_ACCEPTED',
+      outcome: 'AMBIGUOUS',
+      returnedSignature: null,
+      reasonCode: 'SUBMISSION_AMBIGUOUS',
       observedAtMs: Date.now() + 1_000,
-    }));
-    await repository.recordConfirmation(exitBegun.claim, Object.freeze({
-      payloadVersion: 1,
-      artifactId: exitArtifact.artifactId,
-      expectedRevision: 3n,
-      signature: exitArtifact.signature,
-      observedSlot: 203n,
-      observedAtMs: Date.now() + 2_000,
     }));
     const exitObservedAtMs = dueAtMs + 6;
     const exitEvidence = evaluateExecutionReconciliation({
@@ -418,6 +535,76 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       position_state: 'CLOSED', authorization_state: 'CONSUMED',
       armament_state: 'CONSUMED',
     }]);
+    const lateEntryReplay = await repository.commitReconciliation(
+      fixture.claim,
+      reconciliation,
+    );
+    assert.equal(lateEntryReplay.position?.positionId, reconciled.position.positionId);
+    assert.equal(
+      lateEntryReplay.exitAuthorization?.authorizationId,
+      reconciled.exitAuthorization.authorizationId,
+    );
+    assert.equal(lateEntryReplay.position?.state, 'CLOSED');
+    assert.equal(lateEntryReplay.position?.stateRevision, 2n);
+    assert.equal(lateEntryReplay.exitAuthorization?.state, 'CONSUMED');
+    assert.equal(lateEntryReplay.exitAuthorization?.stateRevision, 2n);
+    const inferredExitConfirmation = await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_submission_events WHERE artifact_id=$1
+        AND previous_state='AMBIGUOUS' AND next_state='CONFIRMED'`, [exitArtifact.artifactId]);
+    assert.equal(inferredExitConfirmation.rows[0]?.count, 1);
+  });
+});
+
+void test('signed simulation commit-unknown replays one durable evidence row', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live commit-unknown test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await liveFixture(pool);
+    const repository = new PostgresExecutionLiveRepository(pool);
+    await repository.persistSigned(Object.freeze({
+      payloadVersion: 1, claim: fixture.claim,
+      qualificationId: fixture.qualificationId, reservationId: fixture.reservationId,
+      artifact: fixture.artifact, unsignedSimulation: fixture.unsignedSimulation,
+    }));
+    const evidence = signedSimulationEvidence(
+      fixture.artifact, fixture.unsignedSimulation, Object.freeze({
+        simulationSlot: 126n, unitsConsumed: 26_000n,
+        feePayerLamportDebit: 5_500n, baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
+        observedAtMs: fixture.artifact.signedAtMs + 1,
+      }),
+    );
+    let failCommit = true;
+    const uncertain = new PostgresExecutionLiveRepository({
+      connect: async () => {
+        const client = await pool.connect();
+        return {
+          query: async (text: string, values?: readonly unknown[]) => {
+            const result = await client.query(text, values as unknown[] | undefined);
+            if (text === 'COMMIT' && failCommit) {
+              failCommit = false;
+              throw new Error('simulated commit acknowledgement loss');
+            }
+            return { rows: result.rows as readonly Readonly<Record<string, unknown>>[],
+              rowCount: result.rowCount };
+          },
+          release: (error?: boolean) => { client.release(error); },
+        };
+      },
+    });
+    await assert.rejects(
+      uncertain.recordSignedSimulation(fixture.claim, evidence),
+      isLiveRepositoryError('COMMIT_OUTCOME_UNKNOWN'),
+    );
+    const replay = await repository.recordSignedSimulation(fixture.claim, evidence);
+    assert.equal(replay.state, 'SIGNED_SIMULATED');
+    const count = await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_signed_simulation_evidence WHERE artifact_id=$1`, [
+      fixture.artifact.artifactId,
+    ]);
+    assert.deepEqual(count.rows, [{ count: 1 }]);
   });
 });
 
@@ -445,6 +632,101 @@ void test('fails closed when the durable control is stopped before persistence',
   });
 });
 
+for (const scenario of ['RETIRED_GENERATION', 'RUNTIME_BINDING', 'CAPITAL_LIMIT', 'EXPOSURE_LIMIT',
+  'DRAWDOWN_DRIFT', 'PROVIDER_USAGE_DRIFT', 'PROVIDER_RATE_LIMIT_DRIFT',
+  'QUOTE_EXPIRED', 'BLOCKHASH_EXPIRED'] as const) {
+  void test(`atomic submission gate rejects ${scenario} without durable authorization`,
+    async (context) => {
+      const databaseUrl = process.env.TEST_DATABASE_URL;
+      if (databaseUrl === undefined || databaseUrl.trim() === '') {
+        context.skip('TEST_DATABASE_URL absent: atomic live gate test skipped');
+        return;
+      }
+      await withTemporarySchema(databaseUrl, async (pool) => {
+        const fixture = await liveFixture(
+          pool,
+          scenario === 'QUOTE_EXPIRED' ? 15 : 60_000,
+          scenario === 'CAPITAL_LIMIT' ? 500n : 500_000n,
+        );
+        const repository = new PostgresExecutionLiveRepository(pool);
+        await repository.persistSigned(Object.freeze({
+          payloadVersion: 1, claim: fixture.claim,
+          qualificationId: fixture.qualificationId,
+          reservationId: fixture.reservationId,
+          artifact: fixture.artifact,
+          unsignedSimulation: fixture.unsignedSimulation,
+        }));
+        const simulated = await repository.recordSignedSimulation(
+          fixture.claim,
+          signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
+            simulationSlot: 126n,
+            unitsConsumed: 26_000n,
+            feePayerLamportDebit: 5_500n,
+            baseDeltaRaw: 95n,
+            quoteDeltaRaw: -1_000n,
+            observedAtMs: fixture.artifact.signedAtMs + 1,
+          }),
+        );
+        if (scenario === 'RETIRED_GENERATION') {
+          await pool.query(`UPDATE execution_wallet_generations SET
+            retired_at=date_trunc('milliseconds',statement_timestamp())
+            WHERE generation_id=$1`, [generationId]);
+        }
+        if (scenario === 'EXPOSURE_LIMIT') {
+          await pool.query(`UPDATE execution_wallet_risk_state SET
+            reserved_exposure_raw=60000,state_revision=state_revision+1
+            WHERE generation_id=$1`, [generationId]);
+        }
+        if (scenario === 'DRAWDOWN_DRIFT') {
+          await pool.query(`UPDATE execution_wallet_risk_state SET
+            conservative_drawdown_raw=999999,
+            state_revision=state_revision+1 WHERE generation_id=$1`, [generationId]);
+        }
+        if (scenario === 'PROVIDER_USAGE_DRIFT') {
+          await new PostgresExecutionRiskRepository(pool).recordProviderOperation({
+            operationId: `execution_provider_operation_${'e'.repeat(64)}`,
+            payloadVersion: 1, snapshotId: fixture.providerSnapshot.snapshotId,
+            providerId: fixture.providerSnapshot.providerId,
+            billingPeriodId: fixture.providerSnapshot.billingPeriodId,
+            category: 'TELEMETRY', logicalOperationId: 'post-admission-probe', units: 1n,
+          });
+        }
+        if (scenario === 'PROVIDER_RATE_LIMIT_DRIFT') {
+          await new PostgresExecutionRiskRepository(pool).recordRateLimit({
+            eventId: `execution_provider_rate_limit_${'e'.repeat(64)}`,
+            payloadVersion: 1, providerId: fixture.providerSnapshot.providerId,
+            billingPeriodId: fixture.providerSnapshot.billingPeriodId,
+            endpointId: 'primary', observedAtMs: Date.now(),
+          });
+        }
+        if (scenario === 'QUOTE_EXPIRED') await pool.query('SELECT pg_sleep(0.030)');
+        const baseline = submissionPreflight(fixture.artifact);
+        const preflight = scenario === 'RUNTIME_BINDING'
+          ? Object.freeze({ ...baseline, runtime: Object.freeze({
+            ...baseline.runtime, buildHash: 'f'.repeat(64),
+          }) })
+          : scenario === 'BLOCKHASH_EXPIRED'
+            ? Object.freeze({ ...baseline, blockhashValidity: Object.freeze({
+              ...baseline.blockhashValidity,
+              observedBlockHeight: fixture.artifact.lastValidBlockHeight + 1n,
+            }) })
+            : baseline;
+        await assert.rejects(repository.beginSubmission({
+          claim: fixture.claim,
+          artifactId: fixture.artifact.artifactId,
+          expectedRevision: simulated.stateRevision,
+          ...preflight,
+        }), isLiveRepositoryError('PREFLIGHT_EXPIRED'));
+        const state = await pool.query(`SELECT
+          (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1)
+            AS artifact_state,
+          (SELECT COUNT(*)::INTEGER FROM execution_submission_preflight_evidence
+            WHERE artifact_id=$1) AS preflight_count`, [fixture.artifact.artifactId]);
+        assert.deepEqual(state.rows, [{ artifact_state: 'SIGNED_SIMULATED', preflight_count: 0 }]);
+      });
+    });
+}
+
 void test('finalized no-effect evidence closes an ambiguous artifact without opening a position', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -461,23 +743,20 @@ void test('finalized no-effect evidence closes an ambiguous artifact without ope
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
     }));
-    const simulated = await repository.recordSignedSimulation(fixture.claim, Object.freeze({
-      payloadVersion: 1,
-      artifactId: fixture.artifact.artifactId,
-      signedTransactionHash: fixture.artifact.signedTransactionHash,
+    const simulated = await repository.recordSignedSimulation(fixture.claim,
+      signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
       simulationSlot: 126n,
       unitsConsumed: 26_000n,
       feePayerLamportDebit: 5_500n,
       baseDeltaRaw: 95n,
       quoteDeltaRaw: -1_000n,
-      evidenceFingerprint: '9'.repeat(64),
       observedAtMs: fixture.artifact.signedAtMs + 1,
-    }));
+      }));
     const started = await repository.beginSubmission({
       claim: fixture.claim,
       artifactId: fixture.artifact.artifactId,
       expectedRevision: simulated.stateRevision,
-      observedAtMs: Date.now(),
+      ...submissionPreflight(fixture.artifact),
     });
     await repository.recordSubmissionOutcome(fixture.claim, Object.freeze({
       payloadVersion: 1,
@@ -535,6 +814,97 @@ void test('finalized no-effect evidence closes an ambiguous artifact without ope
   });
 });
 
+void test('finalized BUY evidence reconciles an ambiguous submission without confirmation RPC', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live ambiguous BUY test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await liveFixture(pool);
+    const repository = new PostgresExecutionLiveRepository(pool);
+    await repository.persistSigned(Object.freeze({
+      payloadVersion: 1, claim: fixture.claim,
+      qualificationId: fixture.qualificationId,
+      reservationId: fixture.reservationId,
+      artifact: fixture.artifact,
+      unsignedSimulation: fixture.unsignedSimulation,
+    }));
+    const simulated = await repository.recordSignedSimulation(fixture.claim,
+      signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
+      simulationSlot: 126n,
+      unitsConsumed: 26_000n,
+      feePayerLamportDebit: 5_500n,
+      baseDeltaRaw: 95n,
+      quoteDeltaRaw: -1_000n,
+      observedAtMs: fixture.artifact.signedAtMs + 1,
+      }));
+    const started = await repository.beginSubmission({
+      claim: fixture.claim,
+      artifactId: fixture.artifact.artifactId,
+      expectedRevision: simulated.stateRevision,
+      ...submissionPreflight(fixture.artifact),
+    });
+    await repository.recordSubmissionOutcome(fixture.claim, Object.freeze({
+      payloadVersion: 1,
+      artifactId: fixture.artifact.artifactId,
+      expectedRevision: started.stateRevision,
+      outcome: 'AMBIGUOUS',
+      returnedSignature: null,
+      reasonCode: 'SUBMISSION_AMBIGUOUS',
+      observedAtMs: Date.now() + 1_000,
+    }));
+    const observedAtMs = Date.now() + 2_000;
+    const evidence = evaluateExecutionReconciliation({
+      expected: Object.freeze({
+        intentId: fixture.claim.intent.id,
+        attemptNumber: fixture.artifact.attemptNumber,
+        walletGeneration: 1,
+        providerId: fixture.artifact.providerId,
+        side: 'BUY',
+        signature: fixture.artifact.signature,
+        blockhash: fixture.artifact.blockhash,
+        lastValidBlockHeight: fixture.artifact.lastValidBlockHeight,
+        messageHash: fixture.artifact.messageHash,
+        buildFingerprint: fixture.artifact.buildFingerprint,
+        snapshotFingerprint: fixture.artifact.snapshotFingerprint,
+        maximumFeeLamports: fixture.unsignedSimulation.estimatedFeeLamports,
+        maximumFeePayerLamportDebit:
+          fixture.unsignedSimulation.simulatedFeePayerLamportDebit,
+      }),
+      observed: Object.freeze({
+        signatureHistory: 'PRESENT', confirmationStatus: 'FINALIZED',
+        finalizedBlockHeight: 1_001n, observedSlot: 128n,
+        transaction: Object.freeze({
+          signature: fixture.artifact.signature,
+          blockhash: fixture.artifact.blockhash,
+          messageHash: fixture.artifact.messageHash,
+          buildFingerprint: fixture.artifact.buildFingerprint,
+          snapshotFingerprint: fixture.artifact.snapshotFingerprint,
+        }),
+        feeLamports: 5_000n, walletLamportDelta: -5_000n,
+        baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
+        unexpectedResidualTokenBalanceRaw: 0n,
+        observedAtMs, finalizedAtMs: observedAtMs + 1_000,
+      }),
+    });
+
+    const result = await repository.commitReconciliation(fixture.claim, evidence);
+
+    assert.equal(result.result, 'MATCHED');
+    assert.equal(result.position?.baseAmountRaw, 95n);
+    const state = await pool.query(`SELECT
+      (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS artifact_state,
+      (SELECT status FROM execution_intents WHERE id=$2) AS intent_status,
+      (SELECT COUNT(*)::INTEGER FROM execution_submission_events
+        WHERE artifact_id=$1 AND previous_state='AMBIGUOUS' AND next_state='CONFIRMED')
+        AS inferred_confirmation_events`, [fixture.artifact.artifactId, fixture.claim.intent.id]);
+    assert.deepEqual(state.rows, [{
+      artifact_state: 'RECONCILED', intent_status: 'SUCCEEDED', inferred_confirmation_events: 1,
+    }]);
+  });
+});
+
 void test('rejects a lost lease and a superseded provider quota snapshot', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -579,7 +949,128 @@ void test('rejects a lost lease and a superseded provider quota snapshot', async
   });
 });
 
-async function liveFixture(pool: InstanceType<typeof pg.Pool>) {
+void test('rejects a signed artifact state update without its immutable journal event', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live journal enforcement test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await liveFixture(pool);
+    const repository = new PostgresExecutionLiveRepository(pool);
+    await repository.persistSigned(Object.freeze({
+      payloadVersion: 1, claim: fixture.claim,
+      qualificationId: fixture.qualificationId,
+      reservationId: fixture.reservationId,
+      artifact: fixture.artifact,
+      unsignedSimulation: fixture.unsignedSimulation,
+    }));
+    const signedEvidence = signedSimulationEvidence(
+      fixture.artifact, fixture.unsignedSimulation, Object.freeze({
+        simulationSlot: 126n, unitsConsumed: 26_000n,
+        feePayerLamportDebit: 5_500n, baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
+        observedAtMs: fixture.artifact.signedAtMs + 1,
+      }),
+    );
+    await pool.query(`INSERT INTO execution_signed_simulation_evidence (
+      evidence_id,payload_version,evidence_fingerprint,artifact_id,
+      unsigned_simulation_evidence_id,signed_transaction_hash,provider_id,
+      simulation_slot,units_consumed,fee_payer_lamport_debit,base_delta_raw,
+      quote_delta_raw,logs_fingerprint,logs_line_count,observed_at
+    ) VALUES ($1,1,$2,$3,$4,$5,$6,$7::BIGINT,$8::BIGINT,$9::NUMERIC,$10::NUMERIC,
+      $11::NUMERIC,$12,$13::INTEGER,
+      TIMESTAMPTZ 'epoch'+($14::BIGINT*INTERVAL '1 millisecond'))`, [
+      `execution_signed_simulation_evidence_${signedEvidence.evidenceFingerprint}`,
+      signedEvidence.evidenceFingerprint, signedEvidence.artifactId,
+      signedEvidence.unsignedSimulationEvidenceId, signedEvidence.signedTransactionHash,
+      signedEvidence.providerId, signedEvidence.simulationSlot.toString(),
+      signedEvidence.unitsConsumed.toString(), signedEvidence.feePayerLamportDebit.toString(),
+      signedEvidence.baseDeltaRaw.toString(), signedEvidence.quoteDeltaRaw.toString(),
+      signedEvidence.logsFingerprint, signedEvidence.logsLineCount, signedEvidence.observedAtMs,
+    ]);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`UPDATE execution_signed_transactions SET
+        state='SIGNED_SIMULATED',state_revision=1,
+        signed_simulated_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond')
+        WHERE artifact_id=$1`, [
+        fixture.artifact.artifactId, fixture.artifact.signedAtMs + 1,
+      ]);
+      await assert.rejects(
+        client.query('COMMIT'),
+        (error: unknown) => typeof error === 'object' && error !== null
+          && 'code' in error && error.code === '55000',
+      );
+    } finally {
+      try { await client.query('ROLLBACK'); } finally { client.release(); }
+    }
+    const state = await pool.query<{ state: string; state_revision: string }>(
+      `SELECT state,state_revision::TEXT FROM execution_signed_transactions
+       WHERE artifact_id=$1`,
+      [fixture.artifact.artifactId],
+    );
+    assert.deepEqual(state.rows, [{ state: 'PERSISTED', state_revision: '0' }]);
+
+    const capability = await pool.query<{ can_create_role: boolean }>(`
+      SELECT rolsuper OR rolcreaterole AS can_create_role
+      FROM pg_roles WHERE rolname=current_user`);
+    if (capability.rows[0]?.can_create_role !== true) return;
+    const role = `execution_live_test_${randomUUID().replaceAll('-', '')}`;
+    const schema = (await pool.query<{ schema_name: string }>(
+      'SELECT current_schema() AS schema_name',
+    )).rows[0]?.schema_name;
+    assert.ok(schema);
+    await pool.query(`CREATE ROLE ${quoteIdentifier(role)} NOLOGIN NOSUPERUSER
+      NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    try {
+      await pool.query(`GRANT USAGE ON SCHEMA ${quoteIdentifier(schema)}
+        TO ${quoteIdentifier(role)}`);
+      await pool.query(`GRANT SELECT ON TABLE execution_signed_transactions,
+        execution_live_unsigned_simulation_evidence,
+        execution_signed_simulation_evidence,execution_submission_events,
+        execution_wallet_generations
+        TO ${quoteIdentifier(role)}`);
+      await pool.query(`GRANT UPDATE ON TABLE execution_signed_transactions
+        TO ${quoteIdentifier(role)}`);
+      const restricted = await pool.connect();
+      try {
+        await restricted.query(`SET ROLE ${quoteIdentifier(role)}`);
+        await restricted.query('SELECT generation_id FROM execution_wallet_generations');
+        await assert.rejects(
+          restricted.query(`SELECT generation_id FROM execution_wallet_generations
+            FOR UPDATE`),
+          (error: unknown) => typeof error === 'object' && error !== null
+            && 'code' in error && error.code === '42501',
+        );
+        await restricted.query('BEGIN');
+        await restricted.query(`UPDATE execution_signed_transactions SET
+          state='SIGNED_SIMULATED',state_revision=1,
+          signed_simulated_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond')
+          WHERE artifact_id=$1`, [
+          fixture.artifact.artifactId, fixture.artifact.signedAtMs + 1,
+        ]);
+        await assert.rejects(
+          restricted.query('COMMIT'),
+          (error: unknown) => typeof error === 'object' && error !== null
+            && 'code' in error && error.code === '55000',
+        );
+      } finally {
+        try { await restricted.query('ROLLBACK'); } catch { /* already aborted */ }
+        try { await restricted.query('RESET ROLE'); } finally { restricted.release(); }
+      }
+    } finally {
+      await pool.query(`DROP OWNED BY ${quoteIdentifier(role)}`);
+      await pool.query(`DROP ROLE ${quoteIdentifier(role)}`);
+    }
+  });
+});
+
+async function liveFixture(
+  pool: InstanceType<typeof pg.Pool>,
+  quoteLifetimeMs = 60_000,
+  maximumCanaryCapitalLamports = 500_000n,
+) {
   await migrateDatabase({ pool });
   const simulation = await seedSuccessfulSimulation(pool);
   const risk = new PostgresExecutionRiskRepository(pool);
@@ -616,7 +1107,7 @@ async function liveFixture(pool: InstanceType<typeof pg.Pool>) {
   await operations.recordAuthorization(armAuthorization);
   const armament = createExecutionArmament({
     payloadVersion: 1, qualification, maximumBuys: 1,
-    maximumCapitalLamports: 500_000n, maximumExposureBps: 500n,
+    maximumCapitalLamports: maximumCanaryCapitalLamports, maximumExposureBps: 500n,
     maximumOpenPositions: 1, maximumHoldingMs: 30_000,
     armedAtMs: nowMs + 2, expiresAtMs: nowMs + 120_000,
     operatorId: 'operator-primary', operatorReason: 'Mainnet canary manually approved.',
@@ -688,9 +1179,12 @@ async function liveFixture(pool: InstanceType<typeof pg.Pool>) {
     payloadVersion: 1, specificationVersion: 1,
     intentId: claim.intent.id, attemptNumber: begun.attempt.attemptNumber,
     generationId, armamentId: armament.armamentId, exitAuthorizationId: null,
+    reservationId: admitted.reservationId,
     providerId: 'primary', walletPublicKey, side: 'BUY', effectiveVenue: 'PUMP_FUN',
     messageHash: '4'.repeat(64), buildFingerprint: '5'.repeat(64),
     snapshotFingerprint: 'd'.repeat(64), quoteFingerprint: '7'.repeat(64),
+    quoteObservedAtMs: nowMs,
+    quoteExpiresAtMs: nowMs + quoteLifetimeMs,
     blockhash: walletPublicKey, lastValidBlockHeight: 1_000n,
     signature: bs58.encode(new Uint8Array(64).fill(8)),
     signedTransactionBytes: bytes, signedAtMs: nowMs + 4,
@@ -825,6 +1319,13 @@ async function withTemporarySchema(
 function quoteIdentifier(value: string): string {
   if (!/^[a-z_][a-z0-9_]*$/u.test(value)) throw new Error('Unsafe SQL identifier.');
   return `"${value}"`;
+}
+
+function databaseErrorCode(error: unknown): string | null {
+  if (typeof error !== 'object' || error === null) return null;
+  const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+  return descriptor !== undefined && 'value' in descriptor
+    && typeof descriptor.value === 'string' ? descriptor.value : null;
 }
 
 function isLiveRepositoryError(code: string): (error: unknown) => boolean {

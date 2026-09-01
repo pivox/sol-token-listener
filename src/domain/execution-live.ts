@@ -8,6 +8,7 @@ export const EXECUTION_LIVE_REASON_CODES = Object.freeze([
   'KEYPAIR_PERMISSIONS_INVALID',
   'SIGNED_SIMULATION_FAILED',
   'SIGNED_SIMULATION_SUCCEEDED',
+  'PRE_SUBMISSION_REVOKED_NO_SEND',
   'SUBMISSION_SIGNATURE_MISMATCH',
   'SUBMISSION_STARTED',
   'MAXIMUM_HOLDING_REACHED',
@@ -36,6 +37,7 @@ export interface SignedTransactionArtifactV1 {
   readonly attemptNumber: number;
   readonly generationId: string;
   readonly armamentId: string | null;
+  readonly reservationId: string | null;
   readonly exitAuthorizationId: string | null;
   readonly providerId: string;
   readonly walletPublicKey: string;
@@ -45,6 +47,8 @@ export interface SignedTransactionArtifactV1 {
   readonly buildFingerprint: string;
   readonly snapshotFingerprint: string;
   readonly quoteFingerprint: string;
+  readonly quoteObservedAtMs: number;
+  readonly quoteExpiresAtMs: number;
   readonly blockhash: string;
   readonly lastValidBlockHeight: bigint;
   readonly signature: string;
@@ -72,8 +76,8 @@ export interface ExecutionLivePositionV1 {
   readonly openedAtMs: number;
   readonly exitDeadlineAtMs: number;
   readonly entryReconciliationFingerprint: string;
-  readonly state: 'OPEN';
-  readonly stateRevision: 0n;
+  readonly state: ExecutionLivePositionState;
+  readonly stateRevision: bigint;
 }
 
 export interface ExecutionExitAuthorizationV1 {
@@ -86,15 +90,15 @@ export interface ExecutionExitAuthorizationV1 {
   readonly quoteMint: string;
   readonly maximumBaseAmountRaw: bigint;
   readonly createdAtMs: number;
-  readonly state: 'ACTIVE';
-  readonly stateRevision: 0n;
+  readonly state: ExecutionExitAuthorizationState;
+  readonly stateRevision: bigint;
 }
 
 const SIGNED_INPUT_KEYS = Object.freeze([
   'payloadVersion', 'specificationVersion', 'intentId', 'attemptNumber',
-  'generationId', 'armamentId', 'exitAuthorizationId', 'providerId',
+  'generationId', 'armamentId', 'reservationId', 'exitAuthorizationId', 'providerId',
   'walletPublicKey', 'side', 'effectiveVenue', 'messageHash', 'buildFingerprint',
-  'snapshotFingerprint', 'quoteFingerprint', 'blockhash',
+  'snapshotFingerprint', 'quoteFingerprint', 'quoteObservedAtMs', 'quoteExpiresAtMs', 'blockhash',
   'lastValidBlockHeight', 'signature', 'signedTransactionBytes', 'signedAtMs',
 ] as const);
 const POSITION_INPUT_KEYS = Object.freeze([
@@ -122,13 +126,21 @@ export function createSignedTransactionArtifact(value: unknown): SignedTransacti
     const armamentId = nullablePatternedText(
       input.armamentId, /^execution_activation_armament_[0-9a-f]{64}$/u,
     );
+    const reservationId = nullablePatternedText(
+      input.reservationId, /^execution_exposure_reservation_[0-9a-f]{64}$/u,
+    );
     const exitAuthorizationId = nullablePatternedText(
       input.exitAuthorizationId, /^execution_exit_authorization_[0-9a-f]{64}$/u,
     );
     if ((side === 'BUY') !== (armamentId !== null)
+      || (side === 'BUY') !== (reservationId !== null)
       || (side === 'SELL') !== (exitAuthorizationId !== null)) rejectSigned();
     const bytes = byteArray(input.signedTransactionBytes, 1, 1_232);
     const signedTransactionHash = sha256(Buffer.from(bytes));
+    const quoteObservedAtMs = timestamp(input.quoteObservedAtMs);
+    const quoteExpiresAtMs = timestamp(input.quoteExpiresAtMs);
+    const signedAtMs = timestamp(input.signedAtMs);
+    if (quoteObservedAtMs > signedAtMs || signedAtMs >= quoteExpiresAtMs) rejectSigned();
     const normalized = {
       artifactId: '',
       payloadVersion: 1 as const,
@@ -137,6 +149,7 @@ export function createSignedTransactionArtifact(value: unknown): SignedTransacti
       attemptNumber,
       generationId,
       armamentId,
+      reservationId,
       exitAuthorizationId,
       providerId: boundedText(input.providerId, 1, 64, /^[A-Za-z0-9][A-Za-z0-9._-]*$/u),
       walletPublicKey: publicKey(input.walletPublicKey),
@@ -146,6 +159,8 @@ export function createSignedTransactionArtifact(value: unknown): SignedTransacti
       buildFingerprint: fingerprint(input.buildFingerprint),
       snapshotFingerprint: fingerprint(input.snapshotFingerprint),
       quoteFingerprint: fingerprint(input.quoteFingerprint),
+      quoteObservedAtMs,
+      quoteExpiresAtMs,
       blockhash: base58Bytes(input.blockhash, 32),
       lastValidBlockHeight: u64(input.lastValidBlockHeight),
       signature: base58Bytes(input.signature, 64),
@@ -153,7 +168,7 @@ export function createSignedTransactionArtifact(value: unknown): SignedTransacti
       signedTransactionHash,
       state: 'PERSISTED' as const,
       stateRevision: 0n as const,
-      signedAtMs: timestamp(input.signedAtMs),
+      signedAtMs,
     };
     const artifactId = createSignedTransactionArtifactId(normalized);
     return Object.freeze({ ...normalized, artifactId });
@@ -171,7 +186,12 @@ export function createSignedTransactionArtifactId(value: unknown): string {
       patternedText(input.intentId, /^execution_intent_[0-9a-f]{64}$/u),
       String(positiveInt32(input.attemptNumber)),
       patternedText(input.generationId, /^execution_wallet_generation_[0-9a-f]{64}$/u),
+      nullablePatternedText(
+        input.reservationId, /^execution_exposure_reservation_[0-9a-f]{64}$/u,
+      ) ?? 'NO_RESERVATION',
       fingerprint(input.messageHash),
+      String(timestamp(input.quoteObservedAtMs)),
+      String(timestamp(input.quoteExpiresAtMs)),
       base58Bytes(input.signature, 64),
     ];
     return `execution_signed_transaction_${sha256(lengthPrefixedUtf8(segments))}`;

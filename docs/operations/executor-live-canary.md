@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.0.0 — 2026-08-31
+**Version :** 1.1.2 — 2026-09-01
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime. Le binaire production est actuellement
@@ -25,6 +25,27 @@ ports réels, respecte l'ordre réconciliation → confirmation → SELL → dea
 Tant que ce graphe n'est pas livré et revu, les commandes opérateur restent
 inertes et aucun canary réel ne doit être tenté.
 
+Le dernier verrou PostgreSQL est atomique : avant `SUBMISSION_STARTED`, il
+revalide la génération active, les bindings runtime/déploiement, le provider,
+la quote non expirée, les plafonds BUY ou l'autorisation de sortie SELL, ainsi
+qu'une preuve fraîche de validité du blockhash. La preuve complète est écrite
+dans `execution_submission_preflight_evidence` dans la même transaction que
+la transition et ne peut pas être modifiée.
+
+Pour un BUY, l'admission conserve aussi les baselines risque, drawdown, quota
+local et compteur 429. Toute dérive défavorable avant l'envoi ferme le gate.
+Les simulations non signée et signée sont deux preuves append-only liées au
+même artefact ; une altération ou une liaison incomplète empêche
+`SIGNED_SIMULATED`.
+
+Cette livraison ne compose volontairement aucun appel RPC réel pour produire
+cette preuve. La PR de composition suivante devra appeler immédiatement avant
+le verrou les méthodes Solana officielles `isBlockhashValid` et
+`getBlockHeight`, propager le `contextSlot`, relire le genesis hash et injecter
+les timestamps causaux de la quote. Une valeur inventée, mise en cache ou
+réutilisée au-delà de cinq secondes doit être refusée; le binaire live reste
+indémarrable jusque-là.
+
 ## PostgreSQL et rétention
 
 Après les migrations, un administrateur peut appliquer
@@ -32,10 +53,30 @@ Après les migrations, un administrateur peut appliquer
 sans mot de passe ni privilège cluster. Le compte LOGIN du futur processus live
 doit recevoir seulement `sol_token_executor_live`.
 
-Ce rôle est le seul rôle applicatif autorisé à lire les octets signés et les
-détails de positions live. Listener, worker dry-run, opérations, lecteur
-opérateur et API publique n'y ont aucun accès. Aucun rôle applicatif ne reçoit
-`DELETE`.
+La rétention utilise un second compte LOGIN dédié qui doit recevoir seulement
+`sol_token_retention_worker`. Il ne doit jamais être partagé avec le listener,
+l'API, les opérations ou l'exécuteur live. Sa `DATABASE_URL` est injectée
+uniquement dans le job planifié, puis celui-ci lance
+`npm run db:purge:compiled` ou `npm run retention:start:compiled`. Le script de
+provisioning doit être rejoué par l'administrateur après toute migration qui
+ajoute une table à la purge ; le job reste arrêté si ce provisioning échoue.
+
+Le rôle `sol_token_executor_live` est le seul rôle applicatif autorisé à lire
+les octets signés et les détails de positions live. Listener, worker dry-run,
+opérations, lecteur opérateur et API publique n'y ont aucun accès. Seul le rôle
+de rétention reçoit les `DELETE` nécessaires à la purge. Il n'obtient qu'une
+lecture par colonnes
+de l'identifiant, de l'état, de l'échéance et de l'autorisation de sortie sur
+`execution_signed_transactions` : `signed_transaction_bytes` lui reste
+inaccessible, y compris via `RETURNING`.
+
+La transaction de purge prend d'abord le verrou advisory
+`foundation-retention-fence:v1`. Un seul job de rétention peut donc former des
+cohortes à la fois, sans `SELECT ... FOR UPDATE` et sans droit de mise à jour
+sur les états live/risk. Les seuls `UPDATE` accordés au rôle sont les colonnes
+que la rétention remet effectivement à zéro ou terminalise dans
+`paper_mvp_runs`, `listener_websocket_health`, `chain_transaction_inbox` et
+`api_event_stream_state`.
 
 La purge supprime après quatre heures, par cohorte et dans l'ordre enfant
 d'abord, uniquement :
@@ -54,7 +95,7 @@ Le fichier `.env.example` liste les limites publiques. Un futur déploiement
 devra épingler notamment le build, la configuration, la stratégie, le wallet,
 le provider, le genesis hash, le quote mint WSOL et le plafond brut en
 lamports. Le keypair dédié restera hors du dépôt dans un fichier régulier non
-symlink, propriétaire du processus et mode `0600`.
+symlink, propriétaire du processus et mode exact `0400` ou `0600`.
 
 Ne jamais écrire le contenu du keypair dans `.env`, PostgreSQL, un log, une
 preuve ou un ticket. Ne pas financer le wallet avant que le runtime composé et
@@ -116,6 +157,19 @@ Une soumission incertaine impose la réconciliation des mêmes octets et de la
 même signature. Elle n'autorise ni nouveau blockhash, ni nouvel ordre logique,
 ni réarmement. Le futur arrêt normal appliquera d'abord `entry-stop`, enverra
 `SIGTERM`, attendra l'arrêt borné, puis relira `live:status` et `live:report`.
+
+Après redémarrage, l'état durable décide du seul chemin autorisé. En
+particulier, `SUBMISSION_STARTED` devient `AMBIGUOUS` sans nouvel appel RPC,
+puis la signature persistée est confirmée et réconciliée. Les états
+`ACCEPTED`, `AMBIGUOUS` et `REVOKED_NO_SEND` sont rejoués sans nouvelle
+signature ni nouvelle soumission.
+
+Le worker de reprise découvre l'artefact à partir du claim durable
+intent/tentative et recharge depuis PostgreSQL les bytes exacts ainsi que la
+preuve non signée canonique. Il ne dépend pas d'un candidat opaque resté en
+mémoire avant le crash. La future composition devra reconstruire les comptes
+de simulation depuis le plan canonique inspecté, sans reconstruire la
+transaction et sans résigner.
 
 ## Critère de constat futur
 

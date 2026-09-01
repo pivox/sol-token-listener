@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js, PostgreSQL, `@solana/web3.js` 1.98.4, SDK officiels Pump.fun/PumpSwap épinglés, `node:test`, RPC local scripté.
 
-**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.6, parent version 1.7.6.
+**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.9, parent version 1.7.9.
 
 ---
 
@@ -525,6 +525,18 @@ rg -n "EXECUTOR_KEYPAIR_PATH|PRIVATE_KEY|SECRET_KEY" . --glob '!node_modules/**'
 Expected: live capability exists only in the allowlisted `executor-live`
 boundary; no secret value is tracked; listener/dry-run/simulation-only remain
 free of live imports.
+
+- [x] **Step 2b: Close review cycle 1 findings with TDD**
+
+Ajouter le dernier gate transactionnel et sa preuve immuable, fermer le graphe
+SQL et son journal, limiter les privilèges de verrouillage, rendre les
+réconciliations BUY/SELL tardives idempotentes, purger les cohortes SELL sans
+réservation et révoquer durablement avant envoi seulement sur une preuve locale
+déterministe. Persister les preuves non signée/signée, figer les baselines
+risque/provider du gate final et reprendre chaque frontière durable sans double
+envoi. Ajouter la découverte par intent/tentative et la preuve non signée
+réhydratée, puis isoler la purge dans un rôle de rétention dédié privé des
+bytes signés. Vérifier les courses, privilèges et replays sur PostgreSQL réel.
 
 - [ ] **Step 3: Open PR and run at most three review cycles**
 

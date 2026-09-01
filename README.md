@@ -29,10 +29,13 @@ afin qu'un ordre logique ne puisse pas être recréé avec des preuves fraîches
 Un mapper pur sait dériver un draft depuis l'événement canonique
 `PaperStrategySessionUpdated`, sa qualification et sa quote causale.
 
-Cette fondation est entièrement inerte : le mapper et le repository ne sont
-composés ni dans le listener, ni dans l'API, ni dans le worker paper. Il
-n'existe aucun wallet, chargement de clé, chemin live, signature ou envoi. Le
-lot #51-C livre désormais un processus executor dry-run PostgreSQL séparé,
+L'émission d'intentions est composée dans le listener mais reste strictement
+désactivée par défaut avec `EXECUTION_INTENT_EMISSION_ENABLED=false`. Son
+activation explicite exige `EXECUTION_MODE=paper` et l'allowlist initiale
+SOL/WSOL uniquement ; lorsque le flag reste à `false`, le repository paper ne
+reçoit aucun producteur d'intention. Ce chemin n'effectue lui-même aucun
+chargement de clé, signature ou envoi. Le lot #51-C livre désormais le dry-run
+executor PostgreSQL séparé,
 sans construction ni simulation de transaction et sans consommer l'intention.
 #51-D livre un second mode executor `simulation-only`, disponible pour produire
 une preuve non signée sans soumission. #51-E livre désormais uniquement la

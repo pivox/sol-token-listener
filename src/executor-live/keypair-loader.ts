@@ -61,9 +61,11 @@ export async function loadLiveTransactionSigner(
     handle = await filesystem.open(config.keypairPath, constants.O_RDONLY | noFollow);
     const stats = await handle.stat();
     const ownerUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    const permissionBits = stats.mode & 0o777;
     if (ownerUid === null || !stats.isFile() || stats.isSymbolicLink()
-      || stats.uid !== ownerUid || (stats.mode & 0o077) !== 0
-      || (stats.mode & 0o400) === 0 || stats.size < 129 || stats.size > 1_024) {
+      || stats.uid !== ownerUid
+      || (permissionBits !== 0o400 && permissionBits !== 0o600)
+      || stats.size < 129 || stats.size > 1_024) {
       throw permissions();
     }
     raw = await handle.readFile();

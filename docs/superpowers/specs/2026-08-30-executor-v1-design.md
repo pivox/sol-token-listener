@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.6
+**Version de spécification :** 1.7.9
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,20 @@
 
 ## Historique des versions
 
+- **1.7.9 — 2026-09-01 :** isole la purge complète dans un rôle PostgreSQL de
+  rétention `NOLOGIN`, privé des bytes signés et des mutations d'état métier,
+  avec sérialisation transactionnelle par verrou advisory. La reprise live
+  découvre également l'artefact par intent/tentative et réhydrate la preuve
+  non signée durable au lieu de dépendre d'un objet conservé en mémoire.
+- **1.7.8 — 2026-09-01 :** complète les garanties #51-G avec les preuves
+  append-only des simulations non signée et signée, les baselines immuables du
+  dernier gate risque/provider et une reprise par état durable qui interdit
+  tout nouvel envoi après un crash post-fence.
+- **1.7.7 — 2026-09-01 :** ferme le premier cycle de revue #51-G avec un
+  dernier préflight atomique et immuable, la révocation durable avant envoi,
+  la réconciliation BUY/SELL rejouable, un graphe SQL fermé, des privilèges
+  minimaux et une rétention terminale par cohorte. Le runtime RPC production
+  demeure un incrément séparé obligatoire avant tout canary.
 - **1.7.6 — 2026-08-31 :** acte que #51-G livre un runtime injectable et les
   capacités isolées, sans publier de binaire production avant la composition
   des ports de claim/read-model, du gateway RPC et du pipeline live complet.

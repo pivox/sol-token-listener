@@ -3,7 +3,8 @@ import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
 import { PublicKey, VersionedTransaction } from '@solana/web3.js';
 import type { ExecutionLiveGateway } from '../ports/execution-live-gateway.js';
-import type { AuthenticatedPersistedSignedTransactionV1 } from '../ports/execution-live-repository.js';
+import type { AuthenticatedSubmissionStartedTransactionV1 } from
+  '../ports/execution-live-repository.js';
 
 export type LiveSubmissionGatewayErrorCode =
   | 'PERSISTED_TRANSACTION_INVALID'
@@ -26,7 +27,7 @@ export class LiveSubmissionGateway {
   public constructor(private readonly provider: ExecutionLiveGateway) {}
 
   public async submitPersisted(
-    persisted: AuthenticatedPersistedSignedTransactionV1,
+    persisted: AuthenticatedSubmissionStartedTransactionV1,
     signal: AbortSignal,
   ): Promise<Readonly<{ readonly signature: string }>> {
     let bytes: Uint8Array;
@@ -63,7 +64,7 @@ function persistedBytes(inputValue: unknown): Uint8Array {
     || inputValue.state !== 'SUBMISSION_STARTED'
     || typeof inputValue.stateRevision !== 'bigint' || inputValue.stateRevision < 1n
     || !frozenPlainObject(inputValue.artifact)) invalid();
-  const input = inputValue as unknown as AuthenticatedPersistedSignedTransactionV1;
+  const input = inputValue as unknown as AuthenticatedSubmissionStartedTransactionV1;
   const artifact = input.artifact;
   const bytes = Uint8Array.from(artifact.signedTransactionBytes);
   if (bytes.length < 1 || bytes.length > 1_232

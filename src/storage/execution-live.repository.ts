@@ -1,14 +1,24 @@
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import type pg from 'pg';
 import {
   createExecutionExitAuthorization,
   createExecutionLivePosition,
   createSignedTransactionArtifact,
+  type ExecutionExitAuthorizationState,
   type ExecutionExitAuthorizationV1,
+  type ExecutionLivePositionState,
   type ExecutionLivePositionV1,
   type SignedTransactionArtifactV1,
 } from '../domain/execution-live.js';
+import {
+  assertExecutionLiveSignedSimulationEvidence,
+  createExecutionLiveUnsignedSimulationEvidenceIdentity,
+} from
+  '../domain/execution-live-signed-simulation.js';
 import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reconciliation.js';
+import type { ExecutionSimulationEvidenceV1 } from
+  '../ports/execution-simulation-gateway.js';
 import {
   assertExecutionIntent,
   createExecutionIntentDraft,
@@ -17,12 +27,18 @@ import {
 } from '../domain/execution-intent.js';
 import type {
   AuthenticatedPersistedSignedTransactionV1,
+  AuthenticatedSubmissionStartedTransactionV1,
+  ExecutionBlockhashValidityEvidenceV1,
   ExecutionDeadlineExitResultV1,
   ExecutionLiveConfirmationV1,
   ExecutionLivePersistSignedInputV1,
+  ExecutionPreSubmissionRevocationInputV1,
+  ExecutionPreSubmissionRevocationResultV1,
   ExecutionLiveReconciliationResultV1,
+  ExecutionLiveSignedTransactionInspectionV1,
   ExecutionLiveSignedSimulationEvidenceV1,
   ExecutionLiveSubmissionOutcomeV1,
+  ExecutionLiveRuntimeBindingV1,
 } from '../ports/execution-live-repository.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
 import { getDatabasePool } from './database.js';
@@ -68,21 +84,14 @@ export class ExecutionLiveRepositoryError extends Error {
 const INTERNAL_ERRORS = new WeakSet<ExecutionLiveRepositoryError>();
 const ARTIFACT_ID = /^execution_signed_transaction_[0-9a-f]{64}$/u;
 const HASH = /^[0-9a-f]{64}$/u;
-const LIVE_SUBMISSION_GATE_KEYS = Object.freeze([
-  'artifact_id', 'payload_version', 'specification_version', 'intent_id',
-  'attempt_number', 'generation_id', 'armament_id', 'exit_authorization_id',
-  'provider_id', 'wallet_public_key', 'side', 'effective_venue', 'message_hash',
-  'build_fingerprint', 'snapshot_fingerprint', 'quote_fingerprint', 'blockhash',
-  'last_valid_block_height', 'signature', 'signed_transaction_bytes',
-  'signed_transaction_hash', 'state', 'state_revision', 'signed_at',
-  'signed_simulated_at', 'submission_started_at', 'submitted_at', 'confirmed_at',
-  'confirmed_slot', 'reconciled_at', 'purge_after', 'intent_status', 'lease_owner', 'lease_token',
-  'lease_expires_at_ms', 'now_ms', 'signed_at_ms', 'control_state',
-  'armament_state', 'armament_expires_at_ms', 'qualification_expires_at_ms',
-  'reservation_state', 'unknown_block', 'provider_superseded_at',
-  'provider_expires_at_ms',
+const PUBLIC_KEY = /^[1-9A-HJ-NP-Za-km-z]{32,64}$/u;
+const PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const BLOCKHASH_VALIDITY_MAX_AGE_MS = 5_000;
+const RUNTIME_BINDING_KEYS = Object.freeze([
+  'payloadVersion', 'phase', 'buildHash', 'configurationFingerprint',
+  'strategyFingerprint', 'walletPublicKey', 'cluster', 'expectedGenesisHash',
+  'observedGenesisHash', 'providerId',
 ] as const);
-
 export class PostgresExecutionLiveRepository {
   readonly #source: DatabaseSource;
 
@@ -101,6 +110,7 @@ export class PostgresExecutionLiveRepository {
       const replay = await findArtifact(client, input.artifact.artifactId, true);
       if (replay !== null) {
         if (!sameArtifact(replay, input.artifact)) throw failure('CONFLICT');
+        await persistUnsignedSimulationEvidence(client, input);
         return input.artifact;
       }
       if (input.artifact.side === 'SELL') return persistSellSigned(client, input);
@@ -141,7 +151,7 @@ export class PostgresExecutionLiveRepository {
           ON provider.snapshot_fingerprint=reservation.provider_snapshot_fingerprint
           AND provider.provider_id=armament.provider_id
         WHERE intent.id=$1
-        FOR UPDATE OF intent,attempt,generation,control,qualification,armament,risk,reservation`, [
+        FOR UPDATE OF intent,attempt,armament,risk,reservation`, [
         input.artifact.intentId, input.artifact.attemptNumber,
         input.artifact.generationId, input.qualificationId, input.artifact.armamentId,
         input.reservationId,
@@ -169,6 +179,7 @@ export class PostgresExecutionLiveRepository {
       if (locked.rowCount !== 1) throw failure('CONFLICT');
       await insertActivationEvent(client, input.artifact, nowMs);
       await insertArtifact(client, input.artifact);
+      await persistUnsignedSimulationEvidence(client, input);
       const expected = await client.query(`UPDATE execution_attempts SET
         effective_venue=$3,provider_id=$4,reconciliation_signature=$5,
         reconciliation_blockhash=$6,reconciliation_last_valid_block_height=$7::BIGINT,
@@ -230,24 +241,81 @@ export class PostgresExecutionLiveRepository {
     });
   }
 
+  public async inspectSignedTransaction(input: Readonly<{
+    readonly claim: ClaimedExecutionIntent;
+    readonly artifactId?: string;
+  }>): Promise<ExecutionLiveSignedTransactionInspectionV1 | null> {
+    const claim = claimFrom(input.claim);
+    if (input.artifactId !== undefined && !ARTIFACT_ID.test(input.artifactId)) {
+      throw failure('INVALID_INPUT');
+    }
+    return this.transaction(async (client) => {
+      const row = input.artifactId === undefined
+        ? await findArtifactForClaim(client, claim.intent.id, claim.intent.attemptCount)
+        : await findArtifact(client, input.artifactId, false);
+      if (row === null) return null;
+      if (row.intent_id !== claim.intent.id
+        || integer(row.attempt_number) !== claim.intent.attemptCount) throw failure('CONFLICT');
+      const state = inspectableSignedState(row.state);
+      const stateRevision = unsignedBigint(row.state_revision);
+      const artifact = artifactFromRow(row);
+      if (input.artifactId !== undefined && artifact.artifactId !== input.artifactId) {
+        throw failure('INVALID_DATA');
+      }
+      if (state !== 'REVOKED_NO_SEND') {
+        if (row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken
+          || timestampText(row.lease_expires_at_ms) <= timestampText(row.now_ms)
+          || !inspectionIntentStatusMatches(state, row.intent_status)) {
+          throw failure('LEASE_LOST');
+        }
+      }
+      if (state === 'PERSISTED' || state === 'SIGNED_SIMULATED') {
+        const unsignedSimulation = await loadUnsignedSimulationEvidence(client, artifact);
+        return Object.freeze({
+          payloadVersion: 1, artifact, unsignedSimulation, state, stateRevision,
+        });
+      }
+      return Object.freeze({
+        payloadVersion: 1,
+        artifactId: artifact.artifactId,
+        signature: artifact.signature,
+        signedTransactionHash: artifact.signedTransactionHash,
+        state,
+        stateRevision,
+      });
+    });
+  }
+
   public async recordSignedSimulation(
     claimValue: ClaimedExecutionIntent,
     evidence: ExecutionLiveSignedSimulationEvidenceV1,
   ): Promise<AuthenticatedPersistedSignedTransactionV1> {
     const claim = claimFrom(claimValue);
-    validateSignedSimulationEvidence(evidence);
+    try { assertExecutionLiveSignedSimulationEvidence(evidence); } catch {
+      throw failure('INVALID_INPUT');
+    }
     return this.transaction(async (client) => {
       const identity = await artifactIdentity(client, evidence.artifactId);
       await lockGeneration(client, identity.generationId);
       const row = await findArtifact(client, evidence.artifactId, true);
       if (row?.intent_id !== claim.intent.id
-        || row.state !== 'PERSISTED' || unsignedBigint(row.state_revision) !== 0n
-        || row.signed_transaction_hash !== evidence.signedTransactionHash
         || row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken
         || timestampText(row.lease_expires_at_ms) <= timestampText(row.now_ms)) {
         throw failure('LEASE_LOST');
       }
       const artifact = artifactFromRow(row);
+      if (row.state === 'SIGNED_SIMULATED' && unsignedBigint(row.state_revision) === 1n) {
+        if (!await exactSignedSimulationReplay(client, evidence)) throw failure('CONFLICT');
+        return Object.freeze({
+          payloadVersion: 1, artifact, state: 'SIGNED_SIMULATED', stateRevision: 1n,
+        });
+      }
+      if (row.state !== 'PERSISTED' || unsignedBigint(row.state_revision) !== 0n
+        || row.signed_transaction_hash !== evidence.signedTransactionHash) {
+        throw failure('CONFLICT');
+      }
+      await validateSignedSimulationBinding(client, artifact, evidence);
+      await insertSignedSimulationEvidence(client, evidence);
       const updated = await client.query(`UPDATE execution_signed_transactions SET
         state='SIGNED_SIMULATED',state_revision=1,
         signed_simulated_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond')
@@ -265,53 +333,197 @@ export class PostgresExecutionLiveRepository {
     });
   }
 
+  public async revokeBeforeSubmission(
+    inputValue: ExecutionPreSubmissionRevocationInputV1,
+  ): Promise<ExecutionPreSubmissionRevocationResultV1> {
+    const input = revocationInputFrom(inputValue);
+    return this.transaction(async (client) => {
+      const identity = await artifactIdentity(client, input.artifactId);
+      await lockGeneration(client, identity.generationId);
+      const row = await findArtifact(client, input.artifactId, true);
+      if (row?.intent_id !== input.claim.intent.id) throw failure('CONFLICT');
+      if (row.state === 'REVOKED_NO_SEND') {
+        if (!await exactRevocationReplay(client, input)) throw failure('CONFLICT');
+        return Object.freeze({
+          payloadVersion: 1, kind: 'REPLAYED', artifactState: 'REVOKED_NO_SEND',
+        });
+      }
+      if (row.state !== input.expectedState
+        || unsignedBigint(row.state_revision) !== input.expectedRevision) {
+        throw failure('CONFLICT');
+      }
+      if (row.intent_status !== 'SIGNED_NOT_SUBMITTED'
+        || row.lease_owner !== input.claim.leaseOwner
+        || row.lease_token !== input.claim.leaseToken
+        || timestampText(row.lease_expires_at_ms) <= timestampText(row.now_ms)) {
+        throw failure('LEASE_LOST');
+      }
+      const artifact = artifactFromRow(row);
+      const revokedAtMs = Math.max(timestampText(row.now_ms), input.observedAtMs);
+      const proof = revocationProof(artifact, input, revokedAtMs);
+      await insertRevocationProof(client, artifact, input, proof);
+      await insertLiveStateEvent(
+        client, artifact, input.expectedState, 'REVOKED_NO_SEND',
+        'PRE_SUBMISSION_REVOKED_NO_SEND', revokedAtMs,
+      );
+      if (artifact.side === 'BUY') {
+        await revokeBuyBeforeSubmission(client, artifact, input, proof.revokedAtMs);
+      } else {
+        await revokeSellBeforeSubmission(client, artifact, input, proof.revokedAtMs);
+      }
+      const artifactUpdate = await client.query(`UPDATE execution_signed_transactions SET
+        state='REVOKED_NO_SEND',state_revision=$2::BIGINT,
+        revoked_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+        purge_after=TIMESTAMPTZ 'epoch'+(($3::BIGINT+14400000)*INTERVAL '1 millisecond')
+        WHERE artifact_id=$1 AND state=$4 AND state_revision=$5::BIGINT`, [
+        artifact.artifactId, (input.expectedRevision + 1n).toString(), proof.revokedAtMs,
+        input.expectedState, input.expectedRevision.toString(),
+      ]);
+      if (artifactUpdate.rowCount !== 1) throw failure('CONFLICT');
+      return Object.freeze({
+        payloadVersion: 1, kind: 'REVOKED', artifactState: 'REVOKED_NO_SEND',
+      });
+    });
+  }
+
   public async beginSubmission(input: Readonly<{
     readonly claim: ClaimedExecutionIntent;
     readonly artifactId: string;
     readonly expectedRevision: bigint;
-    readonly observedAtMs: number;
-  }>): Promise<AuthenticatedPersistedSignedTransactionV1> {
+    readonly runtime: ExecutionLiveRuntimeBindingV1;
+    readonly blockhashValidity: ExecutionBlockhashValidityEvidenceV1;
+  }>): Promise<AuthenticatedSubmissionStartedTransactionV1> {
     const claim = claimFrom(input.claim);
     if (!ARTIFACT_ID.test(input.artifactId) || input.expectedRevision !== 1n
-      || !validTimestamp(input.observedAtMs)) throw failure('INVALID_INPUT');
+      || !validRuntimeBinding(input.runtime)
+      || !validBlockhashEvidence(input.blockhashValidity)) throw failure('INVALID_INPUT');
     return this.transaction(async (client) => {
       const identity = await artifactIdentity(client, input.artifactId);
       await lockGeneration(client, identity.generationId);
       const current = await findArtifact(client, input.artifactId, true);
-      if (current?.side === 'SELL') {
+      if (current === null || typeof current.provider_id !== 'string') throw failure('CONFLICT');
+      await lockProvider(client, current.provider_id);
+      if (current.side === 'SELL') {
         return beginSellSubmission(client, claim, input, current);
       }
-      const gate = exactRow(singleRow(await client.query(`SELECT
+      const gate = singleRow(await client.query(`SELECT
         transaction.*,intent.status AS intent_status,intent.lease_owner,
         intent.lease_token::TEXT AS lease_token,
         trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+        trunc(EXTRACT(EPOCH FROM intent.expires_at)*1000)::TEXT AS intent_expires_at_ms,
+        intent.side AS intent_side,intent.mint AS intent_mint,
+        intent.quote_mint AS intent_quote_mint,
+        intent.quote_amount_raw::TEXT AS intent_quote_amount_raw,
+        intent.logical_order_key AS intent_logical_order_key,
+        intent.decision_fingerprint AS intent_decision_fingerprint,
+        attempt.status AS attempt_status,
         trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
         trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
+        trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
+          AS quote_observed_at_ms,
+        trunc(EXTRACT(EPOCH FROM transaction.quote_expires_at)*1000)::TEXT
+          AS quote_expires_at_ms,
+        generation.wallet_public_key AS generation_wallet_public_key,
+        generation.cluster AS generation_cluster,generation.genesis_hash AS generation_genesis_hash,
+        generation.retired_at AS generation_retired_at,
         control.state AS control_state,armament.state AS armament_state,
+        armament.state_revision::TEXT AS armament_revision,
+        armament.armament_fingerprint,armament.qualification_id AS armament_qualification_id,
+        armament.qualification_fingerprint AS armament_qualification_fingerprint,
+        armament.generation_id AS armament_generation_id,armament.phase AS armament_phase,
+        armament.build_hash AS armament_build_hash,
+        armament.configuration_fingerprint AS armament_configuration_fingerprint,
+        armament.strategy_fingerprint AS armament_strategy_fingerprint,
+        armament.wallet_public_key AS armament_wallet_public_key,
+        armament.cluster AS armament_cluster,armament.genesis_hash AS armament_genesis_hash,
+        armament.provider_id AS armament_provider_id,
+        armament.maximum_capital_lamports::TEXT AS maximum_capital_lamports,
+        armament.maximum_exposure_bps::TEXT AS maximum_exposure_bps,
+        armament.maximum_open_positions,armament.maximum_buys,armament.consumed_buys,
         trunc(EXTRACT(EPOCH FROM armament.expires_at)*1000)::TEXT AS armament_expires_at_ms,
+        qualification.qualification_id,qualification.qualification_fingerprint,
+        qualification.generation_id AS qualification_generation_id,
+        qualification.phase AS qualification_phase,
+        qualification.build_hash AS qualification_build_hash,
+        qualification.configuration_fingerprint AS qualification_configuration_fingerprint,
+        qualification.strategy_fingerprint AS qualification_strategy_fingerprint,
+        qualification.wallet_public_key AS qualification_wallet_public_key,
+        qualification.cluster AS qualification_cluster,
+        qualification.genesis_hash AS qualification_genesis_hash,
+        qualification.provider_id AS qualification_provider_id,
         trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT
           AS qualification_expires_at_ms,
-        reservation.state AS reservation_state,risk.unknown_block,
+        reservation.state AS reservation_state,
+        reservation.reservation_id,reservation.intent_id AS reservation_intent_id,
+        reservation.generation_id AS reservation_generation_id,
+        reservation.side AS reservation_side,reservation.mint AS reservation_mint,
+        reservation.quote_mint AS reservation_quote_mint,
+        reservation.maximum_amount_raw::TEXT AS reservation_amount_raw,
+        reservation.intent_fingerprint AS reservation_intent_fingerprint,
+        reservation.policy_fingerprint AS reservation_policy_fingerprint,
+        reservation.wallet_snapshot_fingerprint,
+        reservation.provider_snapshot_fingerprint,reservation.admission_report_id,
+        admission.decision AS admission_decision,
+        admission.intent_id AS admission_intent_id,
+        admission.generation_id AS admission_generation_id,
+        admission.policy_fingerprint AS admission_policy_fingerprint,
+        admission.wallet_snapshot_fingerprint AS admission_wallet_snapshot_fingerprint,
+        admission.provider_snapshot_fingerprint AS admission_provider_snapshot_fingerprint,
+        admission.quote_amount_raw::TEXT AS admission_quote_amount_raw,
+        admission.quota_state AS admission_quota_state,
+        admission.risk_state_revision_baseline::TEXT AS admission_risk_revision,
+        admission.conservative_drawdown_raw_baseline::TEXT AS admission_drawdown_raw,
+        admission.provider_local_usage_units_baseline::TEXT
+          AS admission_provider_local_usage_units,
+        admission.provider_rate_limit_count_baseline::TEXT
+          AS admission_provider_rate_limit_count,
+        risk.state_revision::TEXT AS risk_revision,
+        risk.reconciled_capital_lamports::TEXT AS reconciled_capital_raw,
+        risk.reserved_exposure_raw::TEXT AS reserved_exposure_raw,
+        risk.conservative_drawdown_raw::TEXT AS conservative_drawdown_raw,
+        risk.open_positions,risk.unknown_block,
+        EXISTS (SELECT 1 FROM execution_exposure_reservations held
+          WHERE held.generation_id=transaction.generation_id
+            AND held.state='UNKNOWN_HELD') AS unknown_reservation_held,
+        provider.provider_id AS snapshot_provider_id,
+        (SELECT COALESCE(SUM(usage.units),0)::TEXT
+          FROM execution_provider_usage_counters usage
+          WHERE usage.provider_id=provider.provider_id
+            AND usage.billing_period_id=provider.billing_period_id
+            AND usage.recorded_at >= provider.measured_at)
+          AS provider_local_usage_units,
+        (SELECT COUNT(*)::TEXT FROM execution_provider_rate_limit_events rate_limit
+          WHERE rate_limit.provider_id=provider.provider_id
+            AND rate_limit.billing_period_id=provider.billing_period_id)
+          AS provider_rate_limit_count,
         provider.superseded_at AS provider_superseded_at,
         trunc(EXTRACT(EPOCH FROM provider.expires_at)*1000)::TEXT AS provider_expires_at_ms
         FROM execution_signed_transactions transaction
         JOIN execution_intents intent ON intent.id=transaction.intent_id
+        JOIN execution_attempts attempt ON attempt.intent_id=transaction.intent_id
+          AND attempt.attempt_number=transaction.attempt_number
+        JOIN execution_wallet_generations generation
+          ON generation.generation_id=transaction.generation_id
         JOIN execution_control_state control ON control.generation_id=transaction.generation_id
         JOIN execution_activation_armaments armament ON armament.armament_id=transaction.armament_id
         JOIN execution_safety_qualifications qualification
           ON qualification.qualification_id=armament.qualification_id
         JOIN execution_exposure_reservations reservation
-          ON reservation.intent_id=transaction.intent_id
+          ON reservation.reservation_id=transaction.reservation_id
         JOIN execution_wallet_risk_state risk ON risk.generation_id=transaction.generation_id
+        JOIN execution_risk_admission_reports admission
+          ON admission.report_id=reservation.admission_report_id
         JOIN execution_provider_usage_snapshots provider
           ON provider.snapshot_fingerprint=reservation.provider_snapshot_fingerprint
           AND provider.provider_id=transaction.provider_id
         WHERE transaction.artifact_id=$1
-        FOR UPDATE OF transaction,intent,control,armament,qualification,reservation,risk,provider`, [
+        FOR UPDATE OF transaction,intent,armament,reservation,risk`, [
         input.artifactId,
-      ])), LIVE_SUBMISSION_GATE_KEYS);
-      validateSubmissionGate(gate, claim, input.expectedRevision);
+      ]));
+      validateBuySubmissionGate(gate, claim, input);
       const nowMs = timestampText(gate.now_ms);
+      const artifact = artifactFromRow(gate);
+      await insertSubmissionPreflightEvidence(client, artifact, gate, input, nowMs);
       const updated = await client.query(`UPDATE execution_signed_transactions SET
         state='SUBMISSION_STARTED',state_revision=$2::BIGINT,
         submission_started_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
@@ -320,7 +532,6 @@ export class PostgresExecutionLiveRepository {
         input.expectedRevision.toString(),
       ]);
       if (updated.rowCount !== 1) throw failure('CONFLICT');
-      const artifact = artifactFromRow(gate);
       await insertLiveStateEvent(
         client, artifact, 'SIGNED_SIMULATED', 'SUBMISSION_STARTED',
         'SUBMISSION_STARTED', nowMs,
@@ -382,13 +593,16 @@ export class PostgresExecutionLiveRepository {
         outcome.reasonCode, outcome.observedAtMs,
       );
       if (outcome.outcome === 'AMBIGUOUS') {
-        const held = await client.query(`UPDATE execution_exposure_reservations SET
-          state='UNKNOWN_HELD',state_revision=state_revision+1
-          WHERE intent_id=$1 AND state='RESERVED'`, [artifact.intentId]);
+        const held = artifact.side === 'BUY'
+          ? await client.query(`UPDATE execution_exposure_reservations SET
+              state='UNKNOWN_HELD',state_revision=state_revision+1
+              WHERE intent_id=$1 AND state='RESERVED'`, [artifact.intentId])
+          : null;
         const blocked = await client.query(`UPDATE execution_wallet_risk_state SET
           unknown_block=TRUE,state_revision=state_revision+1
           WHERE generation_id=$1 AND unknown_block=FALSE`, [artifact.generationId]);
-        if (held.rowCount !== 1 || (blocked.rowCount !== 0 && blocked.rowCount !== 1)) {
+        if ((held !== null && held.rowCount !== 1)
+          || (blocked.rowCount !== 0 && blocked.rowCount !== 1)) {
           throw failure('CONFLICT');
         }
       }
@@ -624,6 +838,7 @@ function persistInputFrom(input: ExecutionLivePersistSignedInputV1): ExecutionLi
     if (artifact.artifactId !== input.artifact.artifactId
       || artifact.signedTransactionHash !== input.artifact.signedTransactionHash
       || artifact.intentId !== claim.intent.id
+      || artifact.reservationId !== input.reservationId
       || claim.intent.status !== 'PROCESSING'
       || simulation.messageHash !== artifact.messageHash
       || simulation.buildFingerprint !== artifact.buildFingerprint
@@ -658,6 +873,288 @@ function claimFrom(claim: ClaimedExecutionIntent): ClaimedExecutionIntent {
   return Object.freeze({ ...claim, intent });
 }
 
+function revocationInputFrom(
+  input: ExecutionPreSubmissionRevocationInputV1,
+): ExecutionPreSubmissionRevocationInputV1 {
+  const claim = claimFrom(input.claim);
+  const payloadVersion: unknown = input.payloadVersion;
+  const expectedState: unknown = input.expectedState;
+  const causeReasonCode: unknown = input.causeReasonCode;
+  if (payloadVersion !== 1 || !ARTIFACT_ID.test(input.artifactId)
+    || !HASH.test(input.evidenceFingerprint)
+    || !['SIGNED_SIMULATION_FAILED', 'PRE_SUBMISSION_GATES_FAILED']
+      .includes(String(causeReasonCode))
+    || !validTimestamp(input.observedAtMs)
+    || (input.expectedState === 'PERSISTED' && input.expectedRevision !== 0n)
+    || (input.expectedState === 'SIGNED_SIMULATED' && input.expectedRevision !== 1n)
+    || (expectedState !== 'PERSISTED' && expectedState !== 'SIGNED_SIMULATED')) {
+    throw failure('INVALID_INPUT');
+  }
+  return Object.freeze({ ...input, claim });
+}
+
+interface RevocationProofIdentity {
+  readonly revocationId: string;
+  readonly revocationFingerprint: string;
+  readonly revokedAtMs: number;
+}
+
+function revocationProof(
+  artifact: SignedTransactionArtifactV1,
+  input: ExecutionPreSubmissionRevocationInputV1,
+  revokedAtMs: number,
+): RevocationProofIdentity {
+  const revocationFingerprint = hash([
+    'execution-pre-submission-revocation-v1', artifact.artifactId, artifact.intentId,
+    artifact.attemptNumber, artifact.generationId, artifact.side, input.expectedState,
+    input.expectedRevision.toString(), input.causeReasonCode, input.evidenceFingerprint,
+    input.observedAtMs, revokedAtMs,
+  ]);
+  return Object.freeze({
+    revocationId: `execution_pre_submission_revocation_${revocationFingerprint}`,
+    revocationFingerprint,
+    revokedAtMs,
+  });
+}
+
+async function exactRevocationReplay(
+  client: DatabaseClient,
+  input: ExecutionPreSubmissionRevocationInputV1,
+): Promise<boolean> {
+  const result = await client.query(`SELECT intent_id,expected_state,
+    expected_revision::TEXT AS expected_revision,cause_reason_code,evidence_fingerprint,
+    trunc(EXTRACT(EPOCH FROM observed_at)*1000)::TEXT AS observed_at_ms
+    FROM execution_pre_submission_revocations WHERE artifact_id=$1`, [input.artifactId]);
+  if (result.rows.length !== 1) return false;
+  const row = exactRow(result.rows[0] ?? {}, [
+    'intent_id', 'expected_state', 'expected_revision', 'cause_reason_code',
+    'evidence_fingerprint', 'observed_at_ms',
+  ] as const);
+  return row.intent_id === input.claim.intent.id
+    && row.expected_state === input.expectedState
+    && unsignedBigint(row.expected_revision) === input.expectedRevision
+    && row.cause_reason_code === input.causeReasonCode
+    && row.evidence_fingerprint === input.evidenceFingerprint
+    && timestampText(row.observed_at_ms) === input.observedAtMs;
+}
+
+async function insertRevocationProof(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+  input: ExecutionPreSubmissionRevocationInputV1,
+  proof: RevocationProofIdentity,
+): Promise<void> {
+  const inserted = await client.query(`INSERT INTO execution_pre_submission_revocations (
+    revocation_id,payload_version,revocation_fingerprint,artifact_id,intent_id,
+    attempt_number,generation_id,side,expected_state,expected_revision,cause_reason_code,
+    evidence_fingerprint,observed_at,revoked_at,purge_after
+  ) VALUES ($1,1,$2,$3,$4,$5::INTEGER,$6,$7,$8,$9::BIGINT,$10,$11,
+    TIMESTAMPTZ 'epoch'+($12::BIGINT*INTERVAL '1 millisecond'),
+    TIMESTAMPTZ 'epoch'+($13::BIGINT*INTERVAL '1 millisecond'),
+    TIMESTAMPTZ 'epoch'+(($13::BIGINT+14400000)*INTERVAL '1 millisecond'))`, [
+    proof.revocationId, proof.revocationFingerprint, artifact.artifactId, artifact.intentId,
+    artifact.attemptNumber, artifact.generationId, artifact.side, input.expectedState,
+    input.expectedRevision.toString(), input.causeReasonCode, input.evidenceFingerprint,
+    input.observedAtMs, proof.revokedAtMs,
+  ]);
+  if (inserted.rowCount !== 1) throw failure('CONFLICT');
+}
+
+async function revokeBuyBeforeSubmission(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+  input: ExecutionPreSubmissionRevocationInputV1,
+  revokedAtMs: number,
+): Promise<void> {
+  if (artifact.armamentId === null || artifact.reservationId === null) {
+    throw failure('INVALID_DATA');
+  }
+  const row = exactRow(singleRow(await client.query(`SELECT
+    intent.state_revision::TEXT AS intent_revision,attempt.status AS attempt_status,
+    reservation.state AS reservation_state,
+    reservation.state_revision::TEXT AS reservation_revision,
+    reservation.maximum_amount_raw::TEXT AS reservation_amount_raw,
+    risk.state_revision::TEXT AS risk_revision,
+    risk.reserved_exposure_raw::TEXT AS reserved_exposure_raw,risk.open_positions,
+    armament.state AS armament_state,armament.state_revision::TEXT AS armament_revision
+    FROM execution_signed_transactions transaction
+    JOIN execution_intents intent ON intent.id=transaction.intent_id
+    JOIN execution_attempts attempt ON attempt.intent_id=transaction.intent_id
+      AND attempt.attempt_number=transaction.attempt_number
+    JOIN execution_exposure_reservations reservation
+      ON reservation.reservation_id=transaction.reservation_id
+    JOIN execution_wallet_risk_state risk ON risk.generation_id=transaction.generation_id
+    JOIN execution_activation_armaments armament
+      ON armament.armament_id=transaction.armament_id
+    WHERE transaction.artifact_id=$1
+    FOR UPDATE OF intent,attempt,reservation,risk,armament`, [artifact.artifactId])), [
+    'intent_revision', 'attempt_status', 'reservation_state', 'reservation_revision',
+    'reservation_amount_raw', 'risk_revision', 'reserved_exposure_raw', 'open_positions',
+    'armament_state', 'armament_revision',
+  ] as const);
+  const reservationAmount = unsignedBigint(row.reservation_amount_raw);
+  const reservedExposure = unsignedBigint(row.reserved_exposure_raw);
+  const openPositions = integer(row.open_positions);
+  if (row.attempt_status !== 'STARTED' || row.reservation_state !== 'RESERVED'
+    || row.armament_state !== 'LOCKED' || reservedExposure < reservationAmount
+    || openPositions < 1) throw failure('CONFLICT');
+  const transition = await insertRevocationIntentTransition(
+    client, artifact, 'FAILED', input, revokedAtMs,
+  );
+  const intentRevision = unsignedBigint(row.intent_revision);
+  const intent = await client.query(`UPDATE execution_intents SET status='FAILED',
+    state_revision=$2::BIGINT,last_reason_code='PRE_SUBMISSION_REVOKED_NO_SEND',
+    lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+    terminal_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+    reconciliation_completed_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+    purge_after=TIMESTAMPTZ 'epoch'+(($3::BIGINT+14400000)*INTERVAL '1 millisecond'),
+    updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
+    WHERE id=$1 AND status='SIGNED_NOT_SUBMITTED' AND state_revision=$4::BIGINT`, [
+    artifact.intentId, (intentRevision + 1n).toString(), revokedAtMs, intentRevision.toString(),
+  ]);
+  const attempt = await abandonRevokedAttempt(client, artifact, revokedAtMs);
+  const reservationRevision = unsignedBigint(row.reservation_revision);
+  const reservation = await client.query(`UPDATE execution_exposure_reservations SET
+    state='RELEASED',state_revision=$2::BIGINT,
+    reconciled_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+    purge_after=TIMESTAMPTZ 'epoch'+(($3::BIGINT+14400000)*INTERVAL '1 millisecond')
+    WHERE reservation_id=$1 AND state='RESERVED' AND state_revision=$4::BIGINT`, [
+    artifact.reservationId, (reservationRevision + 1n).toString(), revokedAtMs,
+    reservationRevision.toString(),
+  ]);
+  const riskRevision = unsignedBigint(row.risk_revision);
+  const risk = await client.query(`UPDATE execution_wallet_risk_state SET
+    state_revision=$2::BIGINT,reserved_exposure_raw=$3::NUMERIC,open_positions=$4,
+    updated_at=TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond')
+    WHERE generation_id=$1 AND state_revision=$6::BIGINT`, [
+    artifact.generationId, (riskRevision + 1n).toString(),
+    (reservedExposure - reservationAmount).toString(), openPositions - 1,
+    revokedAtMs, riskRevision.toString(),
+  ]);
+  const armamentRevision = unsignedBigint(row.armament_revision);
+  const activation = await insertRevokedActivationEvent(client, artifact, revokedAtMs);
+  const armament = await client.query(`UPDATE execution_activation_armaments SET
+    state='REVOKED',state_revision=$2::BIGINT,
+    terminal_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+    purge_after=TIMESTAMPTZ 'epoch'+(($3::BIGINT+14400000)*INTERVAL '1 millisecond')
+    WHERE armament_id=$1 AND state='LOCKED' AND state_revision=$4::BIGINT`, [
+    artifact.armamentId, (armamentRevision + 1n).toString(), revokedAtMs,
+    armamentRevision.toString(),
+  ]);
+  if ([transition, intent, attempt, reservation, risk, activation, armament]
+    .some((result) => result.rowCount !== 1)) throw failure('CONFLICT');
+}
+
+async function revokeSellBeforeSubmission(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+  input: ExecutionPreSubmissionRevocationInputV1,
+  revokedAtMs: number,
+): Promise<void> {
+  if (artifact.exitAuthorizationId === null) throw failure('INVALID_DATA');
+  const row = exactRow(singleRow(await client.query(`SELECT
+    intent.state_revision::TEXT AS intent_revision,attempt.status AS attempt_status,
+    exit_auth.state AS authorization_state,
+    exit_auth.state_revision::TEXT AS authorization_revision,
+    exit_auth.locked_intent_id,exit_auth.locked_attempt_number,
+    position.state AS position_state,position.exit_intent_id,
+    armament.state AS armament_state
+    FROM execution_signed_transactions transaction
+    JOIN execution_intents intent ON intent.id=transaction.intent_id
+    JOIN execution_attempts attempt ON attempt.intent_id=transaction.intent_id
+      AND attempt.attempt_number=transaction.attempt_number
+    JOIN execution_exit_authorizations exit_auth
+      ON exit_auth.authorization_id=transaction.exit_authorization_id
+    JOIN execution_live_positions position ON position.position_id=exit_auth.position_id
+    JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
+    WHERE transaction.artifact_id=$1
+    FOR UPDATE OF intent,attempt,exit_auth,position,armament`, [artifact.artifactId])), [
+    'intent_revision', 'attempt_status', 'authorization_state', 'authorization_revision',
+    'locked_intent_id', 'locked_attempt_number', 'position_state', 'exit_intent_id',
+    'armament_state',
+  ] as const);
+  if (row.attempt_status !== 'STARTED' || row.authorization_state !== 'LOCKED'
+    || row.locked_intent_id !== artifact.intentId
+    || integer(row.locked_attempt_number) !== artifact.attemptNumber
+    || row.position_state !== 'EXIT_PENDING' || row.exit_intent_id !== artifact.intentId
+    || row.armament_state !== 'LOCKED') throw failure('CONFLICT');
+  const transition = await insertRevocationIntentTransition(
+    client, artifact, 'RETRY_READY', input, revokedAtMs,
+  );
+  const intentRevision = unsignedBigint(row.intent_revision);
+  const intent = await client.query(`UPDATE execution_intents SET status='RETRY_READY',
+    state_revision=$2::BIGINT,last_reason_code='PRE_SUBMISSION_REVOKED_NO_SEND',
+    lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+    updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
+    WHERE id=$1 AND status='SIGNED_NOT_SUBMITTED' AND state_revision=$4::BIGINT`, [
+    artifact.intentId, (intentRevision + 1n).toString(), revokedAtMs, intentRevision.toString(),
+  ]);
+  const attempt = await abandonRevokedAttempt(client, artifact, revokedAtMs);
+  const authorizationRevision = unsignedBigint(row.authorization_revision);
+  const authorization = await client.query(`UPDATE execution_exit_authorizations SET
+    state='ACTIVE',state_revision=$2::BIGINT,locked_intent_id=NULL,locked_attempt_number=NULL
+    WHERE authorization_id=$1 AND state='LOCKED' AND state_revision=$3::BIGINT`, [
+    artifact.exitAuthorizationId, (authorizationRevision + 1n).toString(),
+    authorizationRevision.toString(),
+  ]);
+  if ([transition, intent, attempt, authorization]
+    .some((result) => result.rowCount !== 1)) throw failure('CONFLICT');
+}
+
+async function insertRevocationIntentTransition(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+  nextStatus: 'FAILED' | 'RETRY_READY',
+  input: ExecutionPreSubmissionRevocationInputV1,
+  revokedAtMs: number,
+): Promise<QueryResult> {
+  return client.query(`INSERT INTO execution_intent_transitions (
+    intent_id,previous_status,next_status,reason_code,human_message,activation_phase,
+    attempt_number,evidence,occurred_at
+  ) VALUES ($1,'SIGNED_NOT_SUBMITTED',$2,'PRE_SUBMISSION_REVOKED_NO_SEND',$3,'CANARY',$4,
+    jsonb_build_object('payloadVersion',1,'attemptNumber',$4::INTEGER,
+      'sourceEventId',$5::TEXT,'observedAtMs',$6::BIGINT),
+    TIMESTAMPTZ 'epoch'+($6::BIGINT*INTERVAL '1 millisecond'))`, [
+    artifact.intentId, nextStatus,
+    nextStatus === 'FAILED'
+      ? 'Signed BUY was revoked before the submission fence; no send occurred.'
+      : 'Signed SELL was revoked before the submission fence; exit retry enabled.',
+    artifact.attemptNumber, input.artifactId, revokedAtMs,
+  ]);
+}
+
+async function abandonRevokedAttempt(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+  revokedAtMs: number,
+): Promise<QueryResult> {
+  return client.query(`UPDATE execution_attempts SET status='ABANDONED',
+    completed_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+    reason_code='PRE_SUBMISSION_REVOKED_NO_SEND'
+    WHERE intent_id=$1 AND attempt_number=$2 AND status='STARTED'`, [
+    artifact.intentId, artifact.attemptNumber, revokedAtMs,
+  ]);
+}
+
+async function insertRevokedActivationEvent(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+  revokedAtMs: number,
+): Promise<QueryResult> {
+  const eventFingerprint = hash([
+    'execution-activation-event-v1', artifact.armamentId, 'LOCKED', 'REVOKED',
+    'ARMAMENT_REVOKED', revokedAtMs,
+  ]);
+  return client.query(`INSERT INTO execution_activation_events (
+    event_id,payload_version,event_fingerprint,armament_id,generation_id,
+    previous_state,next_state,reason_code,occurred_at
+  ) VALUES ($1,1,$2,$3,$4,'LOCKED','REVOKED','ARMAMENT_REVOKED',
+    TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond'))`, [
+    `execution_activation_event_${eventFingerprint}`, eventFingerprint,
+    artifact.armamentId, artifact.generationId, revokedAtMs,
+  ]);
+}
+
 function recreateArtifact(value: SignedTransactionArtifactV1): SignedTransactionArtifactV1 {
   return createSignedTransactionArtifact({
     payloadVersion: value.payloadVersion,
@@ -666,6 +1163,7 @@ function recreateArtifact(value: SignedTransactionArtifactV1): SignedTransaction
     attemptNumber: value.attemptNumber,
     generationId: value.generationId,
     armamentId: value.armamentId,
+    reservationId: value.reservationId,
     exitAuthorizationId: value.exitAuthorizationId,
     providerId: value.providerId,
     walletPublicKey: value.walletPublicKey,
@@ -675,6 +1173,8 @@ function recreateArtifact(value: SignedTransactionArtifactV1): SignedTransaction
     buildFingerprint: value.buildFingerprint,
     snapshotFingerprint: value.snapshotFingerprint,
     quoteFingerprint: value.quoteFingerprint,
+    quoteObservedAtMs: value.quoteObservedAtMs,
+    quoteExpiresAtMs: value.quoteExpiresAtMs,
     blockhash: value.blockhash,
     lastValidBlockHeight: value.lastValidBlockHeight,
     signature: value.signature,
@@ -715,7 +1215,7 @@ async function persistSellSigned(
     JOIN execution_live_positions position ON position.position_id=exit_auth.position_id
     JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
     WHERE intent.id=$1
-    FOR UPDATE OF intent,attempt,generation,control,exit_auth,position,armament`, [
+    FOR UPDATE OF intent,attempt,exit_auth,position,armament`, [
     artifact.intentId, artifact.attemptNumber, artifact.generationId,
     artifact.exitAuthorizationId,
   ])), [
@@ -755,6 +1255,7 @@ async function persistSellSigned(
   ]);
   if (locked.rowCount !== 1) throw failure('CONFLICT');
   await insertArtifact(client, artifact);
+  await persistUnsignedSimulationEvidence(client, input);
   const expected = await client.query(`UPDATE execution_attempts SET
     effective_venue=$3,provider_id=$4,reconciliation_signature=$5,
     reconciliation_blockhash=$6,reconciliation_last_valid_block_height=$7::BIGINT,
@@ -794,10 +1295,11 @@ async function beginSellSubmission(
     readonly claim: ClaimedExecutionIntent;
     readonly artifactId: string;
     readonly expectedRevision: bigint;
-    readonly observedAtMs: number;
+    readonly runtime: ExecutionLiveRuntimeBindingV1;
+    readonly blockhashValidity: ExecutionBlockhashValidityEvidenceV1;
   }>,
   current: Row,
-): Promise<AuthenticatedPersistedSignedTransactionV1> {
+): Promise<AuthenticatedSubmissionStartedTransactionV1> {
   const artifact = artifactFromRow(current);
   if (artifact.exitAuthorizationId === null
     || current.intent_id !== claim.intent.id
@@ -809,26 +1311,74 @@ async function beginSellSubmission(
     throw failure('LEASE_LOST');
   }
   const gate = exactRow(singleRow(await client.query(`SELECT
+    trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
+    trunc(EXTRACT(EPOCH FROM intent.expires_at)*1000)::TEXT AS intent_expires_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
+      AS quote_observed_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_expires_at)*1000)::TEXT
+      AS quote_expires_at_ms,
+    attempt.status AS attempt_status,
+    generation.wallet_public_key AS generation_wallet_public_key,
+    generation.cluster AS generation_cluster,generation.genesis_hash AS generation_genesis_hash,
+    generation.retired_at AS generation_retired_at,
     control.state AS control_state,exit_auth.state AS authorization_state,
     exit_auth.locked_intent_id,exit_auth.locked_attempt_number,
     position.state AS position_state,position.remaining_base_raw::TEXT AS remaining_base_raw,
-    armament.provider_id
-    FROM execution_exit_authorizations exit_auth
+    armament.armament_id AS position_armament_id,armament.phase AS armament_phase,
+    armament.build_hash AS armament_build_hash,
+    armament.configuration_fingerprint AS armament_configuration_fingerprint,
+    armament.strategy_fingerprint AS armament_strategy_fingerprint,
+    armament.wallet_public_key AS armament_wallet_public_key,
+    armament.cluster AS armament_cluster,armament.genesis_hash AS armament_genesis_hash,
+    armament.provider_id AS armament_provider_id,
+    provider.provider_id AS snapshot_provider_id,
+    provider.superseded_at AS provider_superseded_at,
+    trunc(EXTRACT(EPOCH FROM provider.expires_at)*1000)::TEXT AS provider_expires_at_ms
+    FROM execution_signed_transactions transaction
+    JOIN execution_intents intent ON intent.id=transaction.intent_id
+    JOIN execution_attempts attempt ON attempt.intent_id=transaction.intent_id
+      AND attempt.attempt_number=transaction.attempt_number
+    JOIN execution_wallet_generations generation
+      ON generation.generation_id=transaction.generation_id
+    JOIN execution_exit_authorizations exit_auth
+      ON exit_auth.authorization_id=transaction.exit_authorization_id
     JOIN execution_live_positions position ON position.position_id=exit_auth.position_id
     JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
     JOIN execution_control_state control ON control.generation_id=exit_auth.generation_id
-    WHERE exit_auth.authorization_id=$1
-    FOR UPDATE OF exit_auth,position,armament,control`, [artifact.exitAuthorizationId])), [
-    'control_state', 'authorization_state', 'locked_intent_id', 'locked_attempt_number',
-    'position_state', 'remaining_base_raw', 'provider_id',
+    JOIN execution_provider_usage_snapshots provider
+      ON provider.provider_id=transaction.provider_id AND provider.superseded_at IS NULL
+    WHERE transaction.artifact_id=$1 AND exit_auth.authorization_id=$2
+    FOR UPDATE OF exit_auth,position,armament`, [
+    artifact.artifactId, artifact.exitAuthorizationId,
+  ])), [
+    'now_ms', 'intent_expires_at_ms', 'quote_observed_at_ms', 'quote_expires_at_ms',
+    'attempt_status', 'generation_wallet_public_key', 'generation_cluster',
+    'generation_genesis_hash', 'generation_retired_at', 'control_state',
+    'authorization_state', 'locked_intent_id', 'locked_attempt_number',
+    'position_state', 'remaining_base_raw', 'position_armament_id', 'armament_phase',
+    'armament_build_hash', 'armament_configuration_fingerprint',
+    'armament_strategy_fingerprint', 'armament_wallet_public_key', 'armament_cluster',
+    'armament_genesis_hash', 'armament_provider_id', 'snapshot_provider_id',
+    'provider_superseded_at', 'provider_expires_at_ms',
   ] as const);
+  const nowMs = timestampText(gate.now_ms);
   if (gate.control_state === 'HARD_STOP' || gate.authorization_state !== 'LOCKED'
     || gate.locked_intent_id !== artifact.intentId
     || integer(gate.locked_attempt_number) !== artifact.attemptNumber
+    || gate.attempt_status !== 'STARTED'
+    || timestampText(gate.intent_expires_at_ms) <= nowMs
+    || gate.generation_retired_at !== null
     || gate.position_state !== 'EXIT_PENDING'
     || unsignedBigint(gate.remaining_base_raw) === 0n
-    || gate.provider_id !== artifact.providerId) throw failure('PREFLIGHT_EXPIRED');
-  const nowMs = timestampText(current.now_ms);
+    || gate.armament_provider_id !== artifact.providerId
+    || gate.snapshot_provider_id !== artifact.providerId
+    || gate.provider_superseded_at !== null
+    || timestampText(gate.provider_expires_at_ms) <= nowMs
+    || !runtimeMatches(gate, input.runtime)
+    || !freshArtifactProof(artifact, gate, input.blockhashValidity, nowMs)) {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+  await insertSubmissionPreflightEvidence(client, artifact, gate, input, nowMs);
   const updated = await client.query(`UPDATE execution_signed_transactions SET
     state='SUBMISSION_STARTED',state_revision=$2::BIGINT,
     submission_started_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
@@ -882,18 +1432,21 @@ function validateBuyBinding(
 async function insertArtifact(client: DatabaseClient, artifact: SignedTransactionArtifactV1): Promise<void> {
   const result = await client.query(`INSERT INTO execution_signed_transactions (
     artifact_id,payload_version,specification_version,intent_id,attempt_number,
-    generation_id,armament_id,exit_authorization_id,provider_id,wallet_public_key,
+    generation_id,armament_id,reservation_id,exit_authorization_id,provider_id,wallet_public_key,
     side,effective_venue,message_hash,build_fingerprint,snapshot_fingerprint,
-    quote_fingerprint,blockhash,last_valid_block_height,signature,
+    quote_fingerprint,quote_observed_at,quote_expires_at,blockhash,last_valid_block_height,signature,
     signed_transaction_bytes,signed_transaction_hash,state,state_revision,signed_at
-  ) VALUES ($1,1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::BIGINT,
-    $17,$18,$19,'PERSISTED',0,
-    TIMESTAMPTZ 'epoch'+($20::BIGINT*INTERVAL '1 millisecond'))`, [
+  ) VALUES ($1,1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+    TIMESTAMPTZ 'epoch'+($16::BIGINT*INTERVAL '1 millisecond'),
+    TIMESTAMPTZ 'epoch'+($17::BIGINT*INTERVAL '1 millisecond'),$18,$19::BIGINT,
+    $20,$21,$22,'PERSISTED',0,
+    TIMESTAMPTZ 'epoch'+($23::BIGINT*INTERVAL '1 millisecond'))`, [
     artifact.artifactId, artifact.intentId, artifact.attemptNumber,
-    artifact.generationId, artifact.armamentId, artifact.exitAuthorizationId,
-    artifact.providerId, artifact.walletPublicKey, artifact.side,
+    artifact.generationId, artifact.armamentId, artifact.reservationId,
+    artifact.exitAuthorizationId, artifact.providerId, artifact.walletPublicKey, artifact.side,
     artifact.effectiveVenue, artifact.messageHash,
     artifact.buildFingerprint, artifact.snapshotFingerprint, artifact.quoteFingerprint,
+    artifact.quoteObservedAtMs, artifact.quoteExpiresAtMs,
     artifact.blockhash, artifact.lastValidBlockHeight.toString(), artifact.signature,
     Buffer.from(artifact.signedTransactionBytes), artifact.signedTransactionHash,
     artifact.signedAtMs,
@@ -971,18 +1524,98 @@ async function findArtifact(
   artifactId: string,
   lock: boolean,
 ): Promise<Row | null> {
+  return findArtifactWhere(
+    client, 'transaction.artifact_id=$1', [artifactId], lock,
+  );
+}
+
+async function findArtifactForClaim(
+  client: DatabaseClient,
+  intentId: string,
+  attemptNumber: number,
+): Promise<Row | null> {
+  return findArtifactWhere(
+    client,
+    'transaction.intent_id=$1 AND transaction.attempt_number=$2::INTEGER',
+    [intentId, attemptNumber],
+    false,
+  );
+}
+
+async function findArtifactWhere(
+  client: DatabaseClient,
+  predicate: string,
+  values: readonly unknown[],
+  lock: boolean,
+): Promise<Row | null> {
   const result = await client.query(`SELECT transaction.*,
     intent.status AS intent_status,intent.lease_owner,
     intent.lease_token::TEXT AS lease_token,
     trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
     trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
     trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
+      AS quote_observed_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_expires_at)*1000)::TEXT
+      AS quote_expires_at_ms,
     trunc(EXTRACT(EPOCH FROM transaction.confirmed_at)*1000)::TEXT AS confirmed_at_ms
     FROM execution_signed_transactions transaction
     JOIN execution_intents intent ON intent.id=transaction.intent_id
-    WHERE transaction.artifact_id=$1${lock ? ' FOR UPDATE OF transaction,intent' : ''}`, [artifactId]);
+    WHERE ${predicate}${lock ? ' FOR UPDATE OF transaction,intent' : ''}`, values);
   if (result.rows.length > 1) throw failure('INVALID_DATA');
   return result.rows[0] ?? null;
+}
+
+async function loadUnsignedSimulationEvidence(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+): Promise<ExecutionSimulationEvidenceV1> {
+  const row = exactRow(singleRow(await client.query(`SELECT
+    evidence_id,evidence_fingerprint,provider_id,snapshot_fingerprint,
+    build_fingerprint,message_hash,blockhash,
+    last_valid_block_height::TEXT AS last_valid_block_height,
+    blockhash_context_slot::TEXT AS blockhash_context_slot,
+    fee_context_slot::TEXT AS fee_context_slot,
+    estimated_fee_lamports::TEXT AS estimated_fee_lamports,
+    simulation_slot::TEXT AS simulation_slot,
+    simulated_fee_payer_lamport_debit::TEXT AS simulated_fee_payer_lamport_debit,
+    units_consumed::TEXT AS units_consumed,
+    simulated_base_delta_raw::TEXT AS simulated_base_delta_raw,
+    simulated_quote_delta_raw::TEXT AS simulated_quote_delta_raw,
+    logs_fingerprint,logs_line_count
+    FROM execution_live_unsigned_simulation_evidence WHERE artifact_id=$1`, [
+    artifact.artifactId,
+  ])), [
+    'evidence_id', 'evidence_fingerprint', 'provider_id', 'snapshot_fingerprint',
+    'build_fingerprint', 'message_hash', 'blockhash', 'last_valid_block_height',
+    'blockhash_context_slot', 'fee_context_slot', 'estimated_fee_lamports',
+    'simulation_slot', 'simulated_fee_payer_lamport_debit', 'units_consumed',
+    'simulated_base_delta_raw', 'simulated_quote_delta_raw', 'logs_fingerprint',
+    'logs_line_count',
+  ] as const);
+  const evidence: ExecutionSimulationEvidenceV1 = Object.freeze({
+    outcome: 'SUCCESS',
+    snapshotFingerprint: text(row.snapshot_fingerprint),
+    buildFingerprint: text(row.build_fingerprint),
+    messageHash: text(row.message_hash),
+    blockhash: text(row.blockhash),
+    lastValidBlockHeight: unsignedBigint(row.last_valid_block_height),
+    blockhashContextSlot: unsignedBigint(row.blockhash_context_slot),
+    feeContextSlot: unsignedBigint(row.fee_context_slot),
+    estimatedFeeLamports: unsignedBigint(row.estimated_fee_lamports),
+    simulationSlot: unsignedBigint(row.simulation_slot),
+    simulatedFeePayerLamportDebit: unsignedBigint(row.simulated_fee_payer_lamport_debit),
+    unitsConsumed: unsignedBigint(row.units_consumed),
+    simulatedBaseDeltaRaw: signedBigint(row.simulated_base_delta_raw),
+    simulatedQuoteDeltaRaw: signedBigint(row.simulated_quote_delta_raw),
+    logsFingerprint: text(row.logs_fingerprint),
+    logsLineCount: integer(row.logs_line_count),
+  });
+  const identity = createExecutionLiveUnsignedSimulationEvidenceIdentity(artifact, evidence);
+  if (row.evidence_id !== identity.evidenceId
+    || row.evidence_fingerprint !== identity.evidenceFingerprint
+    || row.provider_id !== artifact.providerId) throw failure('INVALID_DATA');
+  return evidence;
 }
 
 function artifactFromRow(row: Row): SignedTransactionArtifactV1 {
@@ -995,6 +1628,7 @@ function artifactFromRow(row: Row): SignedTransactionArtifactV1 {
     attemptNumber: integer(row.attempt_number),
     generationId: row.generation_id,
     armamentId: row.armament_id,
+    reservationId: row.reservation_id,
     exitAuthorizationId: row.exit_authorization_id,
     providerId: row.provider_id,
     walletPublicKey: row.wallet_public_key,
@@ -1004,6 +1638,8 @@ function artifactFromRow(row: Row): SignedTransactionArtifactV1 {
     buildFingerprint: row.build_fingerprint,
     snapshotFingerprint: row.snapshot_fingerprint,
     quoteFingerprint: row.quote_fingerprint,
+    quoteObservedAtMs: timestampText(row.quote_observed_at_ms),
+    quoteExpiresAtMs: timestampText(row.quote_expires_at_ms),
     blockhash: row.blockhash,
     lastValidBlockHeight: unsignedBigint(row.last_valid_block_height),
     signature: row.signature,
@@ -1020,6 +1656,7 @@ function sameArtifact(row: Row, artifact: SignedTransactionArtifactV1): boolean 
       && stored.attemptNumber === artifact.attemptNumber
       && stored.generationId === artifact.generationId
       && stored.armamentId === artifact.armamentId
+      && stored.reservationId === artifact.reservationId
       && stored.exitAuthorizationId === artifact.exitAuthorizationId
       && stored.providerId === artifact.providerId
       && stored.walletPublicKey === artifact.walletPublicKey
@@ -1029,6 +1666,8 @@ function sameArtifact(row: Row, artifact: SignedTransactionArtifactV1): boolean 
       && stored.buildFingerprint === artifact.buildFingerprint
       && stored.snapshotFingerprint === artifact.snapshotFingerprint
       && stored.quoteFingerprint === artifact.quoteFingerprint
+      && stored.quoteObservedAtMs === artifact.quoteObservedAtMs
+      && stored.quoteExpiresAtMs === artifact.quoteExpiresAtMs
       && stored.blockhash === artifact.blockhash
       && stored.lastValidBlockHeight === artifact.lastValidBlockHeight
       && stored.signature === artifact.signature
@@ -1054,37 +1693,496 @@ async function artifactIdentity(
   return Object.freeze({ generationId: row.generation_id });
 }
 
-function validateSignedSimulationEvidence(
+async function validateSignedSimulationBinding(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
   evidence: ExecutionLiveSignedSimulationEvidenceV1,
-): void {
-  if (!ARTIFACT_ID.test(evidence.artifactId)
-    || !HASH.test(evidence.signedTransactionHash)
-    || !HASH.test(evidence.evidenceFingerprint)
-    || !unsigned(evidence.simulationSlot) || !positiveUnsigned(evidence.unitsConsumed)
-    || !unsigned(evidence.feePayerLamportDebit)
-    || typeof evidence.baseDeltaRaw !== 'bigint'
-    || typeof evidence.quoteDeltaRaw !== 'bigint'
-    || !validTimestamp(evidence.observedAtMs)) throw failure('INVALID_INPUT');
+): Promise<void> {
+  const row = exactRow(singleRow(await client.query(`SELECT
+    evidence_id,artifact_id,intent_id,attempt_number,provider_id,
+    message_hash,build_fingerprint,snapshot_fingerprint,blockhash,
+    last_valid_block_height::TEXT AS last_valid_block_height,
+    simulation_slot::TEXT AS simulation_slot,units_consumed::TEXT AS units_consumed,
+    simulated_fee_payer_lamport_debit::TEXT AS fee_payer_lamport_debit,
+    simulated_base_delta_raw::TEXT AS base_delta_raw,
+    simulated_quote_delta_raw::TEXT AS quote_delta_raw
+    FROM execution_live_unsigned_simulation_evidence WHERE evidence_id=$1`, [
+    evidence.unsignedSimulationEvidenceId,
+  ])), [
+    'evidence_id', 'artifact_id', 'intent_id', 'attempt_number', 'provider_id',
+    'message_hash', 'build_fingerprint', 'snapshot_fingerprint',
+    'blockhash', 'last_valid_block_height', 'simulation_slot', 'units_consumed',
+    'fee_payer_lamport_debit', 'base_delta_raw', 'quote_delta_raw',
+  ] as const);
+  const unsignedSlot = unsignedBigint(row.simulation_slot);
+  const unsignedUnits = unsignedBigint(row.units_consumed);
+  const unsignedFee = unsignedBigint(row.fee_payer_lamport_debit);
+  const unsignedBase = signedBigint(row.base_delta_raw);
+  const unsignedQuote = signedBigint(row.quote_delta_raw);
+  const commonMismatch = row.evidence_id !== evidence.unsignedSimulationEvidenceId
+    || row.artifact_id !== artifact.artifactId
+    || row.intent_id !== artifact.intentId
+    || integer(row.attempt_number) !== artifact.attemptNumber
+    || row.provider_id !== artifact.providerId || evidence.providerId !== artifact.providerId
+    || row.message_hash !== artifact.messageHash
+    || row.build_fingerprint !== artifact.buildFingerprint
+    || row.snapshot_fingerprint !== artifact.snapshotFingerprint
+    || row.blockhash !== artifact.blockhash
+    || unsignedBigint(row.last_valid_block_height) !== artifact.lastValidBlockHeight
+    || evidence.signedTransactionHash !== artifact.signedTransactionHash
+    || evidence.simulationSlot < unsignedSlot || evidence.unitsConsumed < unsignedUnits
+    || evidence.feePayerLamportDebit < unsignedFee
+    || evidence.observedAtMs < artifact.signedAtMs;
+  const deltaMismatch = artifact.side === 'BUY'
+    ? unsignedBase <= 0n || unsignedQuote >= 0n
+      || evidence.baseDeltaRaw <= 0n || evidence.baseDeltaRaw > unsignedBase
+      || evidence.quoteDeltaRaw >= 0n || evidence.quoteDeltaRaw > unsignedQuote
+    : unsignedBase >= 0n || unsignedQuote <= 0n
+      || evidence.baseDeltaRaw >= 0n || evidence.baseDeltaRaw < unsignedBase
+      || evidence.quoteDeltaRaw <= 0n || evidence.quoteDeltaRaw > unsignedQuote;
+  if (commonMismatch || deltaMismatch) throw failure('CONFLICT');
 }
 
-function validateSubmissionGate(
+async function persistUnsignedSimulationEvidence(
+  client: DatabaseClient,
+  input: ExecutionLivePersistSignedInputV1,
+): Promise<void> {
+  const artifact = input.artifact;
+  const simulation = input.unsignedSimulation;
+  const identity = createExecutionLiveUnsignedSimulationEvidenceIdentity(artifact, simulation);
+  const existing = await client.query(`SELECT payload_version,evidence_fingerprint,artifact_id,
+    intent_id,attempt_number,provider_id,snapshot_fingerprint,build_fingerprint,message_hash,
+    blockhash,last_valid_block_height::TEXT AS last_valid_block_height,
+    blockhash_context_slot::TEXT AS blockhash_context_slot,
+    fee_context_slot::TEXT AS fee_context_slot,
+    estimated_fee_lamports::TEXT AS estimated_fee_lamports,
+    simulation_slot::TEXT AS simulation_slot,
+    simulated_fee_payer_lamport_debit::TEXT AS simulated_fee_payer_lamport_debit,
+    units_consumed::TEXT AS units_consumed,
+    simulated_base_delta_raw::TEXT AS simulated_base_delta_raw,
+    simulated_quote_delta_raw::TEXT AS simulated_quote_delta_raw,
+    logs_fingerprint,logs_line_count,
+    trunc(EXTRACT(EPOCH FROM recorded_at)*1000)::TEXT AS recorded_at_ms
+    FROM execution_live_unsigned_simulation_evidence WHERE evidence_id=$1`, [
+    identity.evidenceId,
+  ]);
+  if (existing.rows.length > 1) throw failure('INVALID_DATA');
+  if (existing.rows.length === 1) {
+    if (!sameUnsignedSimulationEvidence(existing.rows[0] ?? {}, input, identity)) {
+      throw failure('CONFLICT');
+    }
+    return;
+  }
+  const inserted = await client.query(`INSERT INTO execution_live_unsigned_simulation_evidence (
+    evidence_id,payload_version,evidence_fingerprint,artifact_id,intent_id,attempt_number,
+    provider_id,snapshot_fingerprint,build_fingerprint,message_hash,blockhash,
+    last_valid_block_height,blockhash_context_slot,fee_context_slot,estimated_fee_lamports,
+    simulation_slot,simulated_fee_payer_lamport_debit,units_consumed,
+    simulated_base_delta_raw,simulated_quote_delta_raw,logs_fingerprint,logs_line_count,
+    recorded_at
+  ) VALUES ($1,1,$2,$3,$4,$5::INTEGER,$6,$7,$8,$9,$10,$11::BIGINT,$12::BIGINT,
+    $13::BIGINT,$14::NUMERIC,$15::BIGINT,$16::NUMERIC,$17::BIGINT,$18::NUMERIC,
+    $19::NUMERIC,$20,$21::INTEGER,
+    TIMESTAMPTZ 'epoch'+($22::BIGINT*INTERVAL '1 millisecond'))`, [
+    identity.evidenceId, identity.evidenceFingerprint, artifact.artifactId,
+    artifact.intentId, artifact.attemptNumber, artifact.providerId,
+    simulation.snapshotFingerprint, simulation.buildFingerprint, simulation.messageHash,
+    simulation.blockhash, simulation.lastValidBlockHeight.toString(),
+    simulation.blockhashContextSlot.toString(), simulation.feeContextSlot.toString(),
+    simulation.estimatedFeeLamports.toString(), simulation.simulationSlot.toString(),
+    simulation.simulatedFeePayerLamportDebit.toString(), simulation.unitsConsumed.toString(),
+    simulation.simulatedBaseDeltaRaw.toString(), simulation.simulatedQuoteDeltaRaw.toString(),
+    simulation.logsFingerprint, simulation.logsLineCount, artifact.signedAtMs,
+  ]);
+  if (inserted.rowCount !== 1) throw failure('CONFLICT');
+}
+
+function sameUnsignedSimulationEvidence(
+  rowValue: Row,
+  input: ExecutionLivePersistSignedInputV1,
+  identity: Readonly<{ readonly evidenceId: string; readonly evidenceFingerprint: string }>,
+): boolean {
+  try {
+    const row = exactRow(rowValue, [
+      'payload_version', 'evidence_fingerprint', 'artifact_id', 'intent_id',
+      'attempt_number', 'provider_id', 'snapshot_fingerprint', 'build_fingerprint',
+      'message_hash', 'blockhash', 'last_valid_block_height', 'blockhash_context_slot',
+      'fee_context_slot', 'estimated_fee_lamports', 'simulation_slot',
+      'simulated_fee_payer_lamport_debit', 'units_consumed', 'simulated_base_delta_raw',
+      'simulated_quote_delta_raw', 'logs_fingerprint', 'logs_line_count', 'recorded_at_ms',
+    ] as const);
+    const artifact = input.artifact;
+    const simulation = input.unsignedSimulation;
+    return integer(row.payload_version) === 1
+      && row.evidence_fingerprint === identity.evidenceFingerprint
+      && row.artifact_id === artifact.artifactId && row.intent_id === artifact.intentId
+      && integer(row.attempt_number) === artifact.attemptNumber
+      && row.provider_id === artifact.providerId
+      && row.snapshot_fingerprint === simulation.snapshotFingerprint
+      && row.build_fingerprint === simulation.buildFingerprint
+      && row.message_hash === simulation.messageHash && row.blockhash === simulation.blockhash
+      && unsignedBigint(row.last_valid_block_height) === simulation.lastValidBlockHeight
+      && unsignedBigint(row.blockhash_context_slot) === simulation.blockhashContextSlot
+      && unsignedBigint(row.fee_context_slot) === simulation.feeContextSlot
+      && unsignedBigint(row.estimated_fee_lamports) === simulation.estimatedFeeLamports
+      && unsignedBigint(row.simulation_slot) === simulation.simulationSlot
+      && unsignedBigint(row.simulated_fee_payer_lamport_debit)
+        === simulation.simulatedFeePayerLamportDebit
+      && unsignedBigint(row.units_consumed) === simulation.unitsConsumed
+      && signedBigint(row.simulated_base_delta_raw) === simulation.simulatedBaseDeltaRaw
+      && signedBigint(row.simulated_quote_delta_raw) === simulation.simulatedQuoteDeltaRaw
+      && row.logs_fingerprint === simulation.logsFingerprint
+      && integer(row.logs_line_count) === simulation.logsLineCount
+      && timestampText(row.recorded_at_ms) === artifact.signedAtMs;
+  } catch { return false; }
+}
+
+async function insertSignedSimulationEvidence(
+  client: DatabaseClient,
+  evidence: ExecutionLiveSignedSimulationEvidenceV1,
+): Promise<void> {
+  const inserted = await client.query(`INSERT INTO execution_signed_simulation_evidence (
+    evidence_id,payload_version,evidence_fingerprint,artifact_id,
+    unsigned_simulation_evidence_id,signed_transaction_hash,provider_id,simulation_slot,
+    units_consumed,fee_payer_lamport_debit,base_delta_raw,quote_delta_raw,
+    logs_fingerprint,logs_line_count,observed_at
+  ) VALUES ($1,1,$2,$3,$4,$5,$6,$7::BIGINT,$8::BIGINT,$9::NUMERIC,$10::NUMERIC,
+    $11::NUMERIC,$12,$13::INTEGER,
+    TIMESTAMPTZ 'epoch'+($14::BIGINT*INTERVAL '1 millisecond'))`, [
+    `execution_signed_simulation_evidence_${evidence.evidenceFingerprint}`,
+    evidence.evidenceFingerprint, evidence.artifactId,
+    evidence.unsignedSimulationEvidenceId, evidence.signedTransactionHash,
+    evidence.providerId, evidence.simulationSlot.toString(), evidence.unitsConsumed.toString(),
+    evidence.feePayerLamportDebit.toString(), evidence.baseDeltaRaw.toString(),
+    evidence.quoteDeltaRaw.toString(), evidence.logsFingerprint, evidence.logsLineCount,
+    evidence.observedAtMs,
+  ]);
+  if (inserted.rowCount !== 1) throw failure('CONFLICT');
+}
+
+async function exactSignedSimulationReplay(
+  client: DatabaseClient,
+  evidence: ExecutionLiveSignedSimulationEvidenceV1,
+): Promise<boolean> {
+  const result = await client.query(`SELECT payload_version,artifact_id,
+    unsigned_simulation_evidence_id,signed_transaction_hash,provider_id,
+    simulation_slot::TEXT AS simulation_slot,units_consumed::TEXT AS units_consumed,
+    fee_payer_lamport_debit::TEXT AS fee_payer_lamport_debit,
+    base_delta_raw::TEXT AS base_delta_raw,quote_delta_raw::TEXT AS quote_delta_raw,
+    logs_fingerprint,logs_line_count,
+    trunc(EXTRACT(EPOCH FROM observed_at)*1000)::TEXT AS observed_at_ms,
+    evidence_fingerprint
+    FROM execution_signed_simulation_evidence WHERE artifact_id=$1`, [evidence.artifactId]);
+  if (result.rows.length !== 1) return false;
+  const row = exactRow(result.rows[0] ?? {}, [
+    'payload_version', 'artifact_id', 'unsigned_simulation_evidence_id',
+    'signed_transaction_hash', 'provider_id', 'simulation_slot', 'units_consumed',
+    'fee_payer_lamport_debit', 'base_delta_raw', 'quote_delta_raw',
+    'logs_fingerprint', 'logs_line_count', 'observed_at_ms', 'evidence_fingerprint',
+  ] as const);
+  return integer(row.payload_version) === evidence.payloadVersion
+    && row.artifact_id === evidence.artifactId
+    && row.unsigned_simulation_evidence_id === evidence.unsignedSimulationEvidenceId
+    && row.signed_transaction_hash === evidence.signedTransactionHash
+    && row.provider_id === evidence.providerId
+    && unsignedBigint(row.simulation_slot) === evidence.simulationSlot
+    && unsignedBigint(row.units_consumed) === evidence.unitsConsumed
+    && unsignedBigint(row.fee_payer_lamport_debit) === evidence.feePayerLamportDebit
+    && signedBigint(row.base_delta_raw) === evidence.baseDeltaRaw
+    && signedBigint(row.quote_delta_raw) === evidence.quoteDeltaRaw
+    && row.logs_fingerprint === evidence.logsFingerprint
+    && integer(row.logs_line_count) === evidence.logsLineCount
+    && timestampText(row.observed_at_ms) === evidence.observedAtMs
+    && row.evidence_fingerprint === evidence.evidenceFingerprint;
+}
+
+function validateBuySubmissionGate(
   row: Row,
   claim: ClaimedExecutionIntent,
-  expectedRevision: bigint,
+  input: Readonly<{
+    readonly expectedRevision: bigint;
+    readonly runtime: ExecutionLiveRuntimeBindingV1;
+    readonly blockhashValidity: ExecutionBlockhashValidityEvidenceV1;
+  }>,
 ): void {
   const nowMs = timestampText(row.now_ms);
   if (row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken
     || timestampText(row.lease_expires_at_ms) <= nowMs) throw failure('LEASE_LOST');
   if (row.control_state !== 'RUNNING') throw failure('CONTROL_STOPPED');
+  const artifact = artifactFromRow(row);
+  const reservationAmount = unsignedBigint(row.reservation_amount_raw);
+  const intentAmount = unsignedBigint(row.intent_quote_amount_raw);
+  const admissionAmount = unsignedBigint(row.admission_quote_amount_raw);
+  const capital = unsignedBigint(row.reconciled_capital_raw);
+  const reservedExposure = unsignedBigint(row.reserved_exposure_raw);
+  const maximumCapital = unsignedBigint(row.maximum_capital_lamports);
+  const maximumExposureBps = unsignedBigint(row.maximum_exposure_bps);
+  const openPositions = integer(row.open_positions);
+  const maximumOpenPositions = integer(row.maximum_open_positions);
+  if (typeof row.admission_risk_revision !== 'string'
+    || typeof row.admission_drawdown_raw !== 'string'
+    || typeof row.admission_provider_local_usage_units !== 'string'
+    || typeof row.admission_provider_rate_limit_count !== 'string'
+    || typeof row.conservative_drawdown_raw !== 'string'
+    || typeof row.provider_local_usage_units !== 'string'
+    || typeof row.provider_rate_limit_count !== 'string') {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+  const admissionRiskRevision = unsignedBigint(row.admission_risk_revision);
+  const admissionDrawdown = unsignedBigint(row.admission_drawdown_raw);
+  const admissionProviderUsage = unsignedBigint(row.admission_provider_local_usage_units);
+  const admissionProviderRateLimits = unsignedBigint(row.admission_provider_rate_limit_count);
+  const currentRiskRevision = unsignedBigint(row.risk_revision);
+  const currentDrawdown = unsignedBigint(row.conservative_drawdown_raw);
+  const currentProviderUsage = unsignedBigint(row.provider_local_usage_units);
+  const currentProviderRateLimits = unsignedBigint(row.provider_rate_limit_count);
   if (row.intent_status !== 'SIGNED_NOT_SUBMITTED'
+    || row.intent_side !== 'BUY' || row.attempt_status !== 'STARTED'
+    || timestampText(row.intent_expires_at_ms) <= nowMs
     || row.state !== 'SIGNED_SIMULATED'
-    || unsignedBigint(row.state_revision) !== expectedRevision
+    || unsignedBigint(row.state_revision) !== input.expectedRevision
+    || row.generation_retired_at !== null
+    || artifact.reservationId === null || row.reservation_id !== artifact.reservationId
     || row.armament_state !== 'LOCKED'
     || timestampText(row.armament_expires_at_ms) <= nowMs
     || timestampText(row.qualification_expires_at_ms) <= nowMs
-    || row.reservation_state !== 'RESERVED' || row.unknown_block !== false
+    || row.armament_qualification_id !== row.qualification_id
+    || row.armament_qualification_fingerprint !== row.qualification_fingerprint
+    || row.armament_generation_id !== artifact.generationId
+    || row.qualification_generation_id !== artifact.generationId
+    || row.reservation_state !== 'RESERVED'
+    || row.reservation_intent_id !== artifact.intentId
+    || row.reservation_generation_id !== artifact.generationId
+    || row.reservation_side !== 'BUY'
+    || row.reservation_mint !== row.intent_mint
+    || row.reservation_quote_mint !== row.intent_quote_mint
+    || row.reservation_intent_fingerprint !== riskIntentFingerprint(row, intentAmount)
+    || row.admission_report_id === null
+    || row.admission_decision !== 'ADMITTED'
+    || row.admission_quota_state !== 'NORMAL'
+    || row.admission_intent_id !== artifact.intentId
+    || row.admission_generation_id !== artifact.generationId
+    || row.admission_policy_fingerprint !== row.reservation_policy_fingerprint
+    || row.admission_wallet_snapshot_fingerprint !== row.wallet_snapshot_fingerprint
+    || row.admission_provider_snapshot_fingerprint !== row.provider_snapshot_fingerprint
+    || reservationAmount !== intentAmount || admissionAmount !== intentAmount
+    || currentRiskRevision !== admissionRiskRevision
+    || currentDrawdown > admissionDrawdown
+    || currentProviderUsage !== admissionProviderUsage
+    || currentProviderRateLimits !== admissionProviderRateLimits
+    || reservationAmount > maximumCapital
+    || reservedExposure < reservationAmount
+    || openPositions < 1 || openPositions > maximumOpenPositions
+    || reservedExposure * 10_000n > capital * maximumExposureBps
+    || integer(row.consumed_buys) < 1
+    || integer(row.consumed_buys) > integer(row.maximum_buys)
+    || row.unknown_block !== false || row.unknown_reservation_held !== false
+    || row.snapshot_provider_id !== artifact.providerId
     || row.provider_superseded_at !== null
-    || timestampText(row.provider_expires_at_ms) <= nowMs) throw failure('PREFLIGHT_EXPIRED');
+    || timestampText(row.provider_expires_at_ms) <= nowMs
+    || !runtimeMatches(row, input.runtime)
+    || !qualificationRuntimeMatches(row, input.runtime)
+    || !freshArtifactProof(artifact, row, input.blockhashValidity, nowMs)) {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+}
+
+function validRuntimeBinding(value: unknown): value is ExecutionLiveRuntimeBindingV1 {
+  if (!plainExactDataObject(value, RUNTIME_BINDING_KEYS)) return false;
+  const record = value as Readonly<Record<string, unknown>>;
+  return record.payloadVersion === 1
+    && typeof record.phase === 'string'
+    && ['CANARY', 'MICRO_LIVE', 'PILOT'].includes(record.phase)
+    && typeof record.buildHash === 'string' && HASH.test(record.buildHash)
+    && typeof record.configurationFingerprint === 'string'
+    && HASH.test(record.configurationFingerprint)
+    && typeof record.strategyFingerprint === 'string' && HASH.test(record.strategyFingerprint)
+    && typeof record.walletPublicKey === 'string' && PUBLIC_KEY.test(record.walletPublicKey)
+    && record.cluster === 'mainnet-beta'
+    && typeof record.expectedGenesisHash === 'string'
+    && PUBLIC_KEY.test(record.expectedGenesisHash)
+    && record.observedGenesisHash === record.expectedGenesisHash
+    && typeof record.providerId === 'string' && PROVIDER_ID.test(record.providerId);
+}
+
+function plainExactDataObject(value: unknown, keys: readonly string[]): value is object {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value)
+    || (Object.getPrototypeOf(value) !== Object.prototype
+      && Object.getPrototypeOf(value) !== null)) return false;
+  const actual = Reflect.ownKeys(value);
+  if (actual.length !== keys.length || actual.some((key) => typeof key !== 'string')
+    || keys.some((key) => !actual.includes(key))) return false;
+  return keys.every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && descriptor.enumerable && 'value' in descriptor;
+  });
+}
+
+function validBlockhashEvidence(value: unknown): value is ExecutionBlockhashValidityEvidenceV1 {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Readonly<Record<string, unknown>>;
+  return record.payloadVersion === 1
+    && typeof record.providerId === 'string' && PROVIDER_ID.test(record.providerId)
+    && typeof record.blockhash === 'string' && PUBLIC_KEY.test(record.blockhash)
+    && record.valid === true
+    && unsigned(record.observedBlockHeight) && unsigned(record.contextSlot)
+    && validTimestamp(record.observedAtMs);
+}
+
+function runtimeMatches(row: Row, runtime: ExecutionLiveRuntimeBindingV1): boolean {
+  return row.generation_wallet_public_key === runtime.walletPublicKey
+    && row.generation_cluster === runtime.cluster
+    && row.generation_genesis_hash === runtime.observedGenesisHash
+    && row.armament_phase === runtime.phase
+    && row.armament_build_hash === runtime.buildHash
+    && row.armament_configuration_fingerprint === runtime.configurationFingerprint
+    && row.armament_strategy_fingerprint === runtime.strategyFingerprint
+    && row.armament_wallet_public_key === runtime.walletPublicKey
+    && row.armament_cluster === runtime.cluster
+    && row.armament_genesis_hash === runtime.observedGenesisHash
+    && row.armament_provider_id === runtime.providerId;
+}
+
+function qualificationRuntimeMatches(
+  row: Row,
+  runtime: ExecutionLiveRuntimeBindingV1,
+): boolean {
+  return row.qualification_phase === runtime.phase
+    && row.qualification_build_hash === runtime.buildHash
+    && row.qualification_configuration_fingerprint === runtime.configurationFingerprint
+    && row.qualification_strategy_fingerprint === runtime.strategyFingerprint
+    && row.qualification_wallet_public_key === runtime.walletPublicKey
+    && row.qualification_cluster === runtime.cluster
+    && row.qualification_genesis_hash === runtime.observedGenesisHash
+    && row.qualification_provider_id === runtime.providerId;
+}
+
+function riskIntentFingerprint(row: Row, quoteAmountRaw: bigint): string {
+  if (typeof row.intent_id !== 'string' || typeof row.intent_logical_order_key !== 'string'
+    || typeof row.intent_decision_fingerprint !== 'string'
+    || !HASH.test(row.intent_decision_fingerprint)) throw failure('INVALID_DATA');
+  const digest = createHash('sha256');
+  for (const part of [
+    'execution-intent-risk-v1', row.intent_id, row.intent_logical_order_key,
+    row.intent_decision_fingerprint, quoteAmountRaw,
+  ] as const) {
+    const textValue = String(part);
+    digest.update(String(Buffer.byteLength(textValue)));
+    digest.update(':');
+    digest.update(textValue);
+    digest.update('|');
+  }
+  return digest.digest('hex');
+}
+
+function freshArtifactProof(
+  artifact: SignedTransactionArtifactV1,
+  row: Row,
+  blockhash: ExecutionBlockhashValidityEvidenceV1,
+  nowMs: number,
+): boolean {
+  return timestampText(row.quote_observed_at_ms) === artifact.quoteObservedAtMs
+    && timestampText(row.quote_expires_at_ms) === artifact.quoteExpiresAtMs
+    && artifact.quoteExpiresAtMs > nowMs
+    && blockhash.providerId === artifact.providerId
+    && blockhash.blockhash === artifact.blockhash
+    && blockhash.observedBlockHeight <= artifact.lastValidBlockHeight
+    && blockhash.observedAtMs <= nowMs
+    && blockhash.observedAtMs > nowMs - BLOCKHASH_VALIDITY_MAX_AGE_MS;
+}
+
+async function insertSubmissionPreflightEvidence(
+  client: DatabaseClient,
+  artifact: SignedTransactionArtifactV1,
+  row: Row,
+  input: Readonly<{
+    readonly runtime: ExecutionLiveRuntimeBindingV1;
+    readonly blockhashValidity: ExecutionBlockhashValidityEvidenceV1;
+  }>,
+  authorizedAtMs: number,
+): Promise<void> {
+  const buy = artifact.side === 'BUY';
+  const armamentRevision = buy ? unsignedBigint(row.armament_revision).toString() : null;
+  const admissionRiskRevision = buy
+    ? unsignedBigint(row.admission_risk_revision).toString() : null;
+  const riskRevision = buy ? unsignedBigint(row.risk_revision).toString() : null;
+  const admissionDrawdown = buy ? unsignedBigint(row.admission_drawdown_raw).toString() : null;
+  const currentDrawdown = buy ? unsignedBigint(row.conservative_drawdown_raw).toString() : null;
+  const admissionProviderUsage = buy
+    ? unsignedBigint(row.admission_provider_local_usage_units).toString() : null;
+  const currentProviderUsage = buy
+    ? unsignedBigint(row.provider_local_usage_units).toString() : null;
+  const admissionProviderRateLimits = buy
+    ? unsignedBigint(row.admission_provider_rate_limit_count).toString() : null;
+  const currentProviderRateLimits = buy
+    ? unsignedBigint(row.provider_rate_limit_count).toString() : null;
+  const reservationAmount = buy ? unsignedBigint(row.reservation_amount_raw).toString() : null;
+  const capital = buy ? unsignedBigint(row.reconciled_capital_raw).toString() : null;
+  const reservedExposure = buy ? unsignedBigint(row.reserved_exposure_raw).toString() : null;
+  const openPositions = buy ? integer(row.open_positions) : null;
+  const maximumCapital = buy ? unsignedBigint(row.maximum_capital_lamports).toString() : null;
+  const maximumExposureBps = buy ? unsignedBigint(row.maximum_exposure_bps).toString() : null;
+  const maximumOpenPositions = buy ? integer(row.maximum_open_positions) : null;
+  const fingerprintValue = [
+    'execution-submission-preflight-v1', artifact.artifactId, artifact.intentId,
+    artifact.attemptNumber, artifact.generationId, artifact.armamentId,
+    artifact.reservationId, artifact.providerId, input.runtime.phase,
+    input.runtime.buildHash, input.runtime.configurationFingerprint,
+    input.runtime.strategyFingerprint, input.runtime.walletPublicKey,
+    input.runtime.cluster, input.runtime.observedGenesisHash, armamentRevision,
+    admissionRiskRevision, riskRevision, admissionDrawdown, currentDrawdown,
+    admissionProviderUsage, currentProviderUsage,
+    admissionProviderRateLimits, currentProviderRateLimits,
+    reservationAmount, capital, reservedExposure, openPositions,
+    maximumCapital, maximumExposureBps, maximumOpenPositions,
+    artifact.quoteFingerprint, artifact.quoteObservedAtMs, artifact.quoteExpiresAtMs,
+    artifact.blockhash, artifact.lastValidBlockHeight.toString(),
+    input.blockhashValidity.observedBlockHeight.toString(),
+    input.blockhashValidity.contextSlot.toString(), input.blockhashValidity.observedAtMs,
+    authorizedAtMs,
+  ] as const;
+  const gateFingerprint = hash(fingerprintValue);
+  const result = await client.query(`INSERT INTO execution_submission_preflight_evidence (
+    gate_id,payload_version,gate_fingerprint,artifact_id,intent_id,attempt_number,
+    generation_id,armament_id,reservation_id,provider_id,phase,build_hash,
+    configuration_fingerprint,strategy_fingerprint,wallet_public_key,cluster,genesis_hash,
+    armament_revision,admission_risk_revision,risk_revision,
+    admission_drawdown_raw,conservative_drawdown_raw,
+    admission_provider_local_usage_units,provider_local_usage_units,
+    admission_provider_rate_limit_count,provider_rate_limit_count,
+    reservation_amount_raw,reconciled_capital_raw,
+    reserved_exposure_raw,open_positions,maximum_capital_lamports,maximum_exposure_bps,
+    maximum_open_positions,quote_fingerprint,quote_observed_at,quote_expires_at,blockhash,
+    last_valid_block_height,observed_block_height,blockhash_validity_context_slot,
+    blockhash_validated_at,authorized_at
+  ) VALUES ($1,1,$2,$3,$4,$5::INTEGER,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+    $17::BIGINT,$18::BIGINT,$19::BIGINT,$20::NUMERIC,$21::NUMERIC,
+    $22::NUMERIC,$23::NUMERIC,$24::BIGINT,$25::BIGINT,
+    $26::NUMERIC,$27::NUMERIC,$28::NUMERIC,$29::INTEGER,
+    $30::NUMERIC,$31::NUMERIC,$32::INTEGER,$33,
+    TIMESTAMPTZ 'epoch'+($34::BIGINT*INTERVAL '1 millisecond'),
+    TIMESTAMPTZ 'epoch'+($35::BIGINT*INTERVAL '1 millisecond'),$36,$37::BIGINT,
+    $38::BIGINT,$39::BIGINT,
+    TIMESTAMPTZ 'epoch'+($40::BIGINT*INTERVAL '1 millisecond'),
+    TIMESTAMPTZ 'epoch'+($41::BIGINT*INTERVAL '1 millisecond'))`, [
+    `execution_submission_preflight_${gateFingerprint}`, gateFingerprint,
+    artifact.artifactId, artifact.intentId, artifact.attemptNumber, artifact.generationId,
+    buy ? artifact.armamentId : null, buy ? artifact.reservationId : null,
+    artifact.providerId, input.runtime.phase, input.runtime.buildHash,
+    input.runtime.configurationFingerprint, input.runtime.strategyFingerprint,
+    input.runtime.walletPublicKey, input.runtime.cluster, input.runtime.observedGenesisHash,
+    armamentRevision, admissionRiskRevision, riskRevision, admissionDrawdown, currentDrawdown,
+    admissionProviderUsage, currentProviderUsage,
+    admissionProviderRateLimits, currentProviderRateLimits,
+    reservationAmount, capital, reservedExposure, openPositions,
+    maximumCapital, maximumExposureBps, maximumOpenPositions,
+    artifact.quoteFingerprint, artifact.quoteObservedAtMs, artifact.quoteExpiresAtMs,
+    artifact.blockhash, artifact.lastValidBlockHeight.toString(),
+    input.blockhashValidity.observedBlockHeight.toString(),
+    input.blockhashValidity.contextSlot.toString(), input.blockhashValidity.observedAtMs,
+    authorizedAtMs,
+  ]);
+  if (result.rowCount !== 1) throw failure('CONFLICT');
 }
 
 function validateSubmissionOutcome(outcome: ExecutionLiveSubmissionOutcomeV1): void {
@@ -1115,11 +2213,12 @@ async function insertLiveStateEvent(
   previousState: 'PERSISTED' | 'SIGNED_SIMULATED' | 'SUBMISSION_STARTED'
     | 'ACCEPTED' | 'AMBIGUOUS' | 'CONFIRMED',
   nextState: 'SIGNED_SIMULATED' | 'SUBMISSION_STARTED' | 'ACCEPTED' | 'AMBIGUOUS'
-    | 'CONFIRMED' | 'RECONCILED',
+    | 'CONFIRMED' | 'RECONCILED' | 'REVOKED_NO_SEND',
   reasonCode: 'SIGNED_SIMULATION_SUCCEEDED' | 'SUBMISSION_STARTED'
     | 'SUBMISSION_ACCEPTED' | 'SUBMISSION_AMBIGUOUS'
     | 'SUBMISSION_SIGNATURE_MISMATCH' | 'CONFIRMATION_OBSERVED'
-    | 'RECONCILIATION_REQUIRED' | 'RECONCILIATION_PROVED_NO_EFFECT' | 'INTENT_SUCCEEDED',
+    | 'RECONCILIATION_REQUIRED' | 'RECONCILIATION_PROVED_NO_EFFECT' | 'INTENT_SUCCEEDED'
+    | 'PRE_SUBMISSION_REVOKED_NO_SEND',
   occurredAtMs: number,
 ): Promise<void> {
   const eventFingerprint = hash([
@@ -1141,7 +2240,8 @@ async function insertLiveStateEvent(
 async function insertStandardIntentTransition(
   client: DatabaseClient,
   artifact: SignedTransactionArtifactV1,
-  previousStatus: 'SIGNED_NOT_SUBMITTED' | 'SUBMITTED' | 'UNKNOWN_REQUIRES_RECONCILIATION',
+  previousStatus: 'SIGNED_NOT_SUBMITTED' | 'SUBMITTED' | 'CONFIRMED'
+    | 'UNKNOWN_REQUIRES_RECONCILIATION',
   nextStatus: 'SUBMITTED' | 'UNKNOWN_REQUIRES_RECONCILIATION' | 'CONFIRMED',
   reasonCode: 'SUBMISSION_ACCEPTED' | 'RECONCILIATION_REQUIRED' | 'CONFIRMATION_OBSERVED',
   occurredAtMs: number,
@@ -1175,6 +2275,10 @@ async function applyLiveReconciliation(
 }>> {
   const row = singleRow(await client.query(`SELECT transaction.*,
     trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
+      AS quote_observed_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_expires_at)*1000)::TEXT
+      AS quote_expires_at_ms,
     intent.mint,intent.quote_mint,armament.maximum_holding_ms
     FROM execution_signed_transactions transaction
     JOIN execution_intents intent ON intent.id=transaction.intent_id
@@ -1200,24 +2304,41 @@ async function applyLiveReconciliation(
     const replayed = createEntryRecords(artifact, row, evidence);
     const existing = exactRow(singleRow(await client.query(`SELECT
       position.position_id,position.state AS position_state,
+      position.state_revision::TEXT AS position_revision,
       position.entry_reconciliation_fingerprint,
-      exit_auth.authorization_id,exit_auth.state AS authorization_state
+      exit_auth.authorization_id,exit_auth.state AS authorization_state,
+      exit_auth.state_revision::TEXT AS authorization_revision
       FROM execution_live_positions position
       JOIN execution_exit_authorizations exit_auth
         ON exit_auth.position_id=position.position_id
       WHERE position.buy_intent_id=$1`, [artifact.intentId])), [
       'position_id', 'position_state', 'entry_reconciliation_fingerprint',
-      'authorization_id', 'authorization_state',
+      'position_revision', 'authorization_id', 'authorization_state',
+      'authorization_revision',
     ] as const);
+    const positionState = livePositionState(existing.position_state);
+    const authorizationState = exitAuthorizationState(existing.authorization_state);
+    const validLifecycle = (positionState === 'OPEN' && authorizationState === 'ACTIVE')
+      || (positionState === 'EXIT_PENDING'
+        && (authorizationState === 'ACTIVE' || authorizationState === 'LOCKED'))
+      || (positionState === 'CLOSED' && authorizationState === 'CONSUMED')
+      || (positionState === 'UNKNOWN' && authorizationState === 'LOCKED');
     if (existing.position_id !== replayed.position.positionId
-      || existing.position_state !== 'OPEN'
       || existing.entry_reconciliation_fingerprint !== evidence.evidenceFingerprint
       || existing.authorization_id !== replayed.authorization.authorizationId
-      || existing.authorization_state !== 'ACTIVE') throw failure('CONFLICT');
+      || !validLifecycle) throw failure('CONFLICT');
     return Object.freeze({
       artifact,
-      position: replayed.position,
-      exitAuthorization: replayed.authorization,
+      position: Object.freeze({
+        ...replayed.position,
+        state: positionState,
+        stateRevision: unsignedBigint(existing.position_revision),
+      }),
+      exitAuthorization: Object.freeze({
+        ...replayed.authorization,
+        state: authorizationState,
+        stateRevision: unsignedBigint(existing.authorization_revision),
+      }),
     });
   }
   if (evidence.result === 'NO_EFFECT') {
@@ -1255,14 +2376,37 @@ async function applyLiveReconciliation(
   }
   const finalizedAtMs = evidence.finalizedAtMs;
   if (finalizedAtMs === null || artifact.side !== 'BUY' || artifact.armamentId === null
+    || evidence.observedSlot === null
     || evidence.baseDeltaRaw <= 0n || evidence.quoteDeltaRaw >= 0n
-    || row.state !== 'CONFIRMED') throw failure('CONFLICT');
+    || !['ACCEPTED', 'AMBIGUOUS', 'CONFIRMED'].includes(String(row.state))) {
+    throw failure('CONFLICT');
+  }
+  let confirmedRevision = revision;
+  if (row.state !== 'CONFIRMED') {
+    const confirmed = await client.query(`UPDATE execution_signed_transactions SET
+      state='CONFIRMED',state_revision=$2::BIGINT,
+      submitted_at=COALESCE(submitted_at,
+        TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')),
+      confirmed_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+      confirmed_slot=$4::BIGINT
+      WHERE artifact_id=$1 AND state=$5 AND state_revision=$6::BIGINT`, [
+      artifact.artifactId, (revision + 1n).toString(), finalizedAtMs,
+      evidence.observedSlot.toString(), row.state, revision.toString(),
+    ]);
+    if (confirmed.rowCount !== 1) throw failure('CONFLICT');
+    await insertLiveStateEvent(
+      client, artifact, row.state as 'ACCEPTED' | 'AMBIGUOUS', 'CONFIRMED',
+      'CONFIRMATION_OBSERVED', finalizedAtMs,
+    );
+    confirmedRevision += 1n;
+  }
   const updated = await client.query(`UPDATE execution_signed_transactions SET
     state='RECONCILED',state_revision=$2::BIGINT,
     reconciled_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
     purge_after=TIMESTAMPTZ 'epoch'+(($3::BIGINT+14400000)*INTERVAL '1 millisecond')
     WHERE artifact_id=$1 AND state='CONFIRMED' AND state_revision=$4::BIGINT`, [
-    artifact.artifactId, (revision + 1n).toString(), finalizedAtMs, revision.toString(),
+    artifact.artifactId, (confirmedRevision + 1n).toString(), finalizedAtMs,
+    confirmedRevision.toString(),
   ]);
   if (updated.rowCount !== 1) throw failure('CONFLICT');
   const entry = createEntryRecords(artifact, row, evidence);
@@ -1358,6 +2502,10 @@ async function commitSellReconciliation(
   await lockGeneration(client, generationId);
   const row = singleRow(await client.query(`SELECT transaction.*,
     trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
+      AS quote_observed_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_expires_at)*1000)::TEXT
+      AS quote_expires_at_ms,
     intent.status AS intent_status,intent.state_revision::TEXT AS intent_revision,
     intent.lease_owner,intent.lease_token::TEXT AS lease_token,
     trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
@@ -1393,42 +2541,61 @@ async function commitSellReconciliation(
     JOIN execution_wallet_risk_state risk ON risk.generation_id=transaction.generation_id
     JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
     WHERE transaction.intent_id=$1 AND transaction.attempt_number=$2
-    FOR UPDATE OF transaction,intent,attempt,generation,exit_auth,position,risk,armament`, [
+    FOR UPDATE OF transaction,intent,attempt,exit_auth,position,risk,armament`, [
     evidence.intentId, evidence.attemptNumber,
   ]));
   const artifact = artifactFromRow(row);
-  const prior = await client.query(`SELECT evidence_fingerprint,result,intent_id,
-    attempt_number,side FROM execution_reconciliation_evidence WHERE evidence_id=$1`, [
-    evidence.evidenceId,
-  ]);
-  if (prior.rows.length > 1) throw failure('INVALID_DATA');
-  if (prior.rows.length === 1) {
-    const replay = exactRow(singleRow(prior), [
-      'evidence_fingerprint', 'result', 'intent_id', 'attempt_number', 'side',
-    ] as const);
+  const existing = await client.query(`SELECT evidence_id,evidence_fingerprint,result,
+    intent_id,attempt_number,side,resolved_by_evidence_id,
+    trunc(EXTRACT(EPOCH FROM observed_at)*1000)::TEXT AS observed_at_ms
+    FROM execution_reconciliation_evidence
+    WHERE intent_id=$1 AND attempt_number=$2
+    ORDER BY observed_at,evidence_id FOR UPDATE`, [evidence.intentId, evidence.attemptNumber]);
+  const priorEvidence = existing.rows.map((candidate) => exactRow(candidate, [
+    'evidence_id', 'evidence_fingerprint', 'result', 'intent_id', 'attempt_number', 'side',
+    'resolved_by_evidence_id', 'observed_at_ms',
+  ] as const));
+  const replay = priorEvidence.find((candidate) => candidate.evidence_id === evidence.evidenceId);
+  if (replay !== undefined) {
     if (replay.evidence_fingerprint !== evidence.evidenceFingerprint
-      || replay.result !== 'MATCHED' || replay.intent_id !== evidence.intentId
-      || integer(replay.attempt_number) !== evidence.attemptNumber || replay.side !== 'SELL'
-      || row.state !== 'RECONCILED' || row.intent_status !== 'SUCCEEDED'
-      || row.attempt_status !== 'COMPLETED' || row.authorization_state !== 'CONSUMED'
-      || row.position_state !== 'CLOSED' || row.armament_state !== 'CONSUMED') {
+      || replay.result !== evidence.result || replay.intent_id !== evidence.intentId
+      || integer(replay.attempt_number) !== evidence.attemptNumber || replay.side !== 'SELL') {
       throw failure('CONFLICT');
     }
     return Object.freeze({
       payloadVersion: 1,
-      result: 'MATCHED',
+      result: evidence.result,
       artifact,
       position: null,
       exitAuthorization: null,
     });
   }
+  if (priorEvidence.length > 0) {
+    const latestObservedAtMs = priorEvidence.reduce(
+      (latest, prior) => Math.max(latest, timestampText(prior.observed_at_ms)),
+      0,
+    );
+    if (priorEvidence.some((prior) => prior.result !== 'UNKNOWN'
+      || prior.resolved_by_evidence_id !== null)
+      || evidence.observedAtMs <= latestObservedAtMs) throw failure('CONFLICT');
+  }
   const finalizedAtMs = evidence.finalizedAtMs;
-  if (evidence.result !== 'MATCHED' || finalizedAtMs === null
+  const initialArtifactState = String(row.state);
+  const initialIntentStatus = String(row.intent_status);
+  const terminal = evidence.result === 'MATCHED' || evidence.result === 'NO_EFFECT';
+  const matchedAmounts = evidence.result !== 'MATCHED'
+    || (evidence.observedSlot !== null && evidence.baseDeltaRaw < 0n
+      && -evidence.baseDeltaRaw === unsignedBigint(row.remaining_base_raw)
+      && evidence.quoteDeltaRaw > 0n);
+  if ((terminal && finalizedAtMs === null) || !matchedAmounts
     || artifact.side !== 'SELL' || artifact.exitAuthorizationId === null
-    || row.intent_id !== claim.intent.id || row.intent_status !== 'CONFIRMED'
+    || row.intent_id !== claim.intent.id
+    || !['SUBMITTED', 'UNKNOWN_REQUIRES_RECONCILIATION', 'CONFIRMED']
+      .includes(initialIntentStatus)
     || row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken
     || timestampText(row.lease_expires_at_ms) <= timestampText(row.now_ms)
-    || row.state !== 'CONFIRMED' || row.attempt_status !== 'STARTED'
+    || !['ACCEPTED', 'AMBIGUOUS', 'CONFIRMED'].includes(initialArtifactState)
+    || row.attempt_status !== 'STARTED'
     || row.attempt_provider_id !== evidence.providerId
     || row.generation !== evidence.walletGeneration
     || row.reconciliation_signature !== evidence.signature
@@ -1440,11 +2607,9 @@ async function commitSellReconciliation(
     || row.reconciliation_maximum_fee_lamports !== evidence.maximumFeeLamports.toString()
     || row.reconciliation_maximum_fee_payer_lamport_debit
       !== evidence.maximumFeePayerLamportDebit.toString()
-    || row.authorization_state !== 'LOCKED' || row.position_state !== 'EXIT_PENDING'
-    || row.armament_state !== 'LOCKED'
-    || evidence.baseDeltaRaw >= 0n
-    || -evidence.baseDeltaRaw !== unsignedBigint(row.remaining_base_raw)
-    || evidence.quoteDeltaRaw <= 0n) throw failure('CONFLICT');
+    || row.authorization_state !== 'LOCKED'
+    || !['EXIT_PENDING', 'UNKNOWN'].includes(String(row.position_state))
+    || row.armament_state !== 'LOCKED') throw failure('CONFLICT');
   const insertedEvidence = await client.query(`INSERT INTO execution_reconciliation_evidence (
     evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,
     generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,
@@ -1457,8 +2622,10 @@ async function commitSellReconciliation(
     $13::NUMERIC,$14::NUMERIC,$15,$16,$17::BIGINT,$18::BIGINT,$19,$20::NUMERIC,
     $21::NUMERIC,$22::NUMERIC,$23::NUMERIC,$24::NUMERIC,
     TIMESTAMPTZ 'epoch'+($25::BIGINT*INTERVAL '1 millisecond'),
-    TIMESTAMPTZ 'epoch'+($26::BIGINT*INTERVAL '1 millisecond'),$27,$28,
-    TIMESTAMPTZ 'epoch'+(($26::BIGINT+14400000)*INTERVAL '1 millisecond'))`, [
+    CASE WHEN $26::BIGINT IS NULL THEN NULL ELSE TIMESTAMPTZ 'epoch'
+      +($26::BIGINT*INTERVAL '1 millisecond') END,$27,$28,
+    CASE WHEN $27 IN ('MATCHED','NO_EFFECT') THEN TIMESTAMPTZ 'epoch'
+      +(($26::BIGINT+14400000)*INTERVAL '1 millisecond') ELSE NULL END)`, [
     evidence.evidenceId, evidence.evidenceFingerprint, evidence.intentId,
     evidence.attemptNumber, artifact.generationId, evidence.providerId,
     evidence.signature, evidence.blockhash, evidence.lastValidBlockHeight.toString(),
@@ -1472,7 +2639,177 @@ async function commitSellReconciliation(
     evidence.observedAtMs, finalizedAtMs, evidence.result, evidence.reasonCode,
   ]);
   if (insertedEvidence.rowCount !== 1) throw failure('CONFLICT');
-  const artifactRevision = unsignedBigint(row.state_revision);
+  if (terminal && priorEvidence.length > 0) {
+    const resolved = await client.query(`UPDATE execution_reconciliation_evidence SET
+      resolved_by_evidence_id=$3,resolved_at=TIMESTAMPTZ 'epoch'
+        +($4::BIGINT*INTERVAL '1 millisecond'),
+      purge_after=TIMESTAMPTZ 'epoch'+(($4::BIGINT+14400000)*INTERVAL '1 millisecond')
+      WHERE intent_id=$1 AND attempt_number=$2 AND result='UNKNOWN'
+        AND resolved_by_evidence_id IS NULL`, [
+      evidence.intentId, evidence.attemptNumber, evidence.evidenceId, finalizedAtMs,
+    ]);
+    if (resolved.rowCount !== priorEvidence.length) throw failure('CONFLICT');
+  }
+  if (!terminal) {
+    if (initialArtifactState !== 'AMBIGUOUS') {
+      const artifactRevision = unsignedBigint(row.state_revision);
+      const ambiguousArtifact = await client.query(`UPDATE execution_signed_transactions SET
+        state='AMBIGUOUS',state_revision=$2::BIGINT
+        WHERE artifact_id=$1 AND state=$3 AND state_revision=$4::BIGINT`, [
+        artifact.artifactId, (artifactRevision + 1n).toString(), initialArtifactState,
+        artifactRevision.toString(),
+      ]);
+      if (ambiguousArtifact.rowCount !== 1) throw failure('CONFLICT');
+      await insertLiveStateEvent(
+        client, artifact, initialArtifactState as 'ACCEPTED' | 'CONFIRMED', 'AMBIGUOUS',
+        'RECONCILIATION_REQUIRED', evidence.observedAtMs,
+      );
+    }
+    if (initialIntentStatus !== 'UNKNOWN_REQUIRES_RECONCILIATION') {
+      const intentRevision = unsignedBigint(row.intent_revision);
+      const unknownIntent = await client.query(`UPDATE execution_intents SET
+        status='UNKNOWN_REQUIRES_RECONCILIATION',state_revision=$2::BIGINT,
+        last_reason_code='RECONCILIATION_REQUIRED',
+        updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
+        WHERE id=$1 AND status=$4 AND state_revision=$5::BIGINT`, [
+        artifact.intentId, (intentRevision + 1n).toString(), evidence.observedAtMs,
+        initialIntentStatus, intentRevision.toString(),
+      ]);
+      if (unknownIntent.rowCount !== 1) throw failure('CONFLICT');
+      await insertStandardIntentTransition(
+        client, artifact, initialIntentStatus as 'SUBMITTED' | 'CONFIRMED',
+        'UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILIATION_REQUIRED',
+        evidence.observedAtMs,
+      );
+    }
+    if (row.position_state === 'EXIT_PENDING') {
+      const positionRevision = unsignedBigint(row.position_revision);
+      const positioned = await client.query(`UPDATE execution_live_positions SET
+        state='UNKNOWN',state_revision=$2::BIGINT
+        WHERE position_id=$1 AND state='EXIT_PENDING' AND state_revision=$3::BIGINT`, [
+        row.position_id, (positionRevision + 1n).toString(), positionRevision.toString(),
+      ]);
+      if (positioned.rowCount !== 1) throw failure('CONFLICT');
+    }
+    const blocked = await client.query(`UPDATE execution_wallet_risk_state SET
+      unknown_block=TRUE,state_revision=state_revision+1,
+      updated_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond')
+      WHERE generation_id=$1 AND unknown_block=FALSE`, [
+      artifact.generationId, evidence.observedAtMs,
+    ]);
+    if (blocked.rowCount !== 0 && blocked.rowCount !== 1) throw failure('CONFLICT');
+    return Object.freeze({
+      payloadVersion: 1,
+      result: evidence.result,
+      artifact,
+      position: null,
+      exitAuthorization: null,
+    });
+  }
+  if (evidence.result === 'NO_EFFECT') {
+    if (initialArtifactState !== 'AMBIGUOUS'
+      || initialIntentStatus !== 'UNKNOWN_REQUIRES_RECONCILIATION'
+      || finalizedAtMs === null) throw failure('CONFLICT');
+    const artifactRevision = unsignedBigint(row.state_revision);
+    const artifactUpdate = await client.query(`UPDATE execution_signed_transactions SET
+      state='RECONCILED',state_revision=$2::BIGINT,
+      reconciled_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+      purge_after=TIMESTAMPTZ 'epoch'+(($3::BIGINT+14400000)*INTERVAL '1 millisecond')
+      WHERE artifact_id=$1 AND state='AMBIGUOUS' AND state_revision=$4::BIGINT`, [
+      artifact.artifactId, (artifactRevision + 1n).toString(), finalizedAtMs,
+      artifactRevision.toString(),
+    ]);
+    const positionRevision = unsignedBigint(row.position_revision);
+    const positionUpdate = row.position_state === 'UNKNOWN'
+      ? await client.query(`UPDATE execution_live_positions SET
+          state='EXIT_PENDING',state_revision=$2::BIGINT
+          WHERE position_id=$1 AND state='UNKNOWN' AND state_revision=$3::BIGINT`, [
+        row.position_id, (positionRevision + 1n).toString(), positionRevision.toString(),
+      ]) : null;
+    const authorizationRevision = unsignedBigint(row.authorization_revision);
+    const authorizationUpdate = await client.query(`UPDATE execution_exit_authorizations SET
+      state='ACTIVE',state_revision=$2::BIGINT,locked_intent_id=NULL,locked_attempt_number=NULL
+      WHERE authorization_id=$1 AND state='LOCKED' AND state_revision=$3::BIGINT`, [
+      artifact.exitAuthorizationId, (authorizationRevision + 1n).toString(),
+      authorizationRevision.toString(),
+    ]);
+    const riskRevision = unsignedBigint(row.risk_revision);
+    const riskUpdate = await client.query(`UPDATE execution_wallet_risk_state SET
+      state_revision=$2::BIGINT,
+      unknown_block=(EXISTS (SELECT 1 FROM execution_exposure_reservations reservation
+          WHERE reservation.generation_id=$1 AND reservation.state='UNKNOWN_HELD')
+        OR EXISTS (SELECT 1 FROM execution_reconciliation_evidence unresolved
+          WHERE unresolved.generation_id=$1 AND unresolved.result IN ('UNKNOWN','MISMATCH')
+            AND unresolved.resolved_by_evidence_id IS NULL)),
+      updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
+      WHERE generation_id=$1 AND state_revision=$4::BIGINT`, [
+      artifact.generationId, (riskRevision + 1n).toString(), finalizedAtMs,
+      riskRevision.toString(),
+    ]);
+    const transition = await client.query(`INSERT INTO execution_intent_transitions (
+      intent_id,previous_status,next_status,reason_code,human_message,activation_phase,
+      attempt_number,evidence,occurred_at
+    ) VALUES ($1,'UNKNOWN_REQUIRES_RECONCILIATION','RETRY_READY',
+      'RECONCILIATION_PROVED_NO_EFFECT','Finalized canary exit had no effect; retry enabled.',
+      'CANARY',$2,jsonb_build_object('payloadVersion',1,'attemptNumber',$2::INTEGER,
+        'sourceEventId',NULL,'observedAtMs',$3::BIGINT),
+      TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'))`, [
+      artifact.intentId, artifact.attemptNumber, finalizedAtMs,
+    ]);
+    const intentRevision = unsignedBigint(row.intent_revision);
+    const intentUpdate = await client.query(`UPDATE execution_intents SET
+      status='RETRY_READY',state_revision=$2::BIGINT,
+      last_reason_code='RECONCILIATION_PROVED_NO_EFFECT',
+      lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+      updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
+      WHERE id=$1 AND status='UNKNOWN_REQUIRES_RECONCILIATION'
+        AND state_revision=$4::BIGINT`, [
+      artifact.intentId, (intentRevision + 1n).toString(), finalizedAtMs,
+      intentRevision.toString(),
+    ]);
+    const attemptUpdate = await client.query(`UPDATE execution_attempts SET
+      status='ABANDONED',completed_at=TIMESTAMPTZ 'epoch'
+        +($3::BIGINT*INTERVAL '1 millisecond'),
+      reason_code='RECONCILIATION_PROVED_NO_EFFECT'
+      WHERE intent_id=$1 AND attempt_number=$2 AND status='STARTED'`, [
+      artifact.intentId, artifact.attemptNumber, finalizedAtMs,
+    ]);
+    const updates = [artifactUpdate, authorizationUpdate, riskUpdate, transition,
+      intentUpdate, attemptUpdate];
+    if (positionUpdate !== null) updates.push(positionUpdate);
+    if (updates.some((update) => update.rowCount !== 1)) throw failure('CONFLICT');
+    await insertLiveStateEvent(
+      client, artifact, 'AMBIGUOUS', 'RECONCILED',
+      'RECONCILIATION_PROVED_NO_EFFECT', finalizedAtMs,
+    );
+    return Object.freeze({
+      payloadVersion: 1,
+      result: 'NO_EFFECT',
+      artifact,
+      position: null,
+      exitAuthorization: null,
+    });
+  }
+  if (finalizedAtMs === null || evidence.observedSlot === null) throw failure('CONFLICT');
+  let artifactRevision = unsignedBigint(row.state_revision);
+  if (initialArtifactState !== 'CONFIRMED') {
+    const confirmed = await client.query(`UPDATE execution_signed_transactions SET
+      state='CONFIRMED',state_revision=$2::BIGINT,
+      submitted_at=COALESCE(submitted_at,
+        TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')),
+      confirmed_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
+      confirmed_slot=$4::BIGINT
+      WHERE artifact_id=$1 AND state=$5 AND state_revision=$6::BIGINT`, [
+      artifact.artifactId, (artifactRevision + 1n).toString(), finalizedAtMs,
+      evidence.observedSlot.toString(), initialArtifactState, artifactRevision.toString(),
+    ]);
+    if (confirmed.rowCount !== 1) throw failure('CONFLICT');
+    await insertLiveStateEvent(
+      client, artifact, initialArtifactState as 'ACCEPTED' | 'AMBIGUOUS', 'CONFIRMED',
+      'CONFIRMATION_OBSERVED', finalizedAtMs,
+    );
+    artifactRevision += 1n;
+  }
   const artifactUpdate = await client.query(`UPDATE execution_signed_transactions SET
     state='RECONCILED',state_revision=$2::BIGINT,
     reconciled_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
@@ -1487,9 +2824,9 @@ async function commitSellReconciliation(
     exit_reconciliation_fingerprint=$3,closed_at=TIMESTAMPTZ 'epoch'
       +($4::BIGINT*INTERVAL '1 millisecond'),
     purge_after=TIMESTAMPTZ 'epoch'+(($4::BIGINT+14400000)*INTERVAL '1 millisecond')
-    WHERE position_id=$1 AND state='EXIT_PENDING' AND state_revision=$5::BIGINT`, [
+    WHERE position_id=$1 AND state=$6 AND state_revision=$5::BIGINT`, [
     row.position_id, (positionRevision + 1n).toString(), evidence.evidenceFingerprint,
-    finalizedAtMs, positionRevision.toString(),
+    finalizedAtMs, positionRevision.toString(), row.position_state,
   ]);
   const authorizationRevision = unsignedBigint(row.authorization_revision);
   const authorizationUpdate = await client.query(`UPDATE execution_exit_authorizations SET
@@ -1516,14 +2853,30 @@ async function commitSellReconciliation(
   if (reservedExposure < quoteCost || openPositions < 1) throw failure('INVALID_DATA');
   const riskUpdate = await client.query(`UPDATE execution_wallet_risk_state SET
     state_revision=$2::BIGINT,reserved_exposure_raw=$3::NUMERIC,open_positions=$4,
-    unknown_block=EXISTS (SELECT 1 FROM execution_exposure_reservations
-      WHERE generation_id=$1 AND state='UNKNOWN_HELD'),
+    unknown_block=(EXISTS (SELECT 1 FROM execution_exposure_reservations reservation
+        WHERE reservation.generation_id=$1 AND reservation.state='UNKNOWN_HELD')
+      OR EXISTS (SELECT 1 FROM execution_reconciliation_evidence unresolved
+        WHERE unresolved.generation_id=$1 AND unresolved.result IN ('UNKNOWN','MISMATCH')
+          AND unresolved.resolved_by_evidence_id IS NULL)),
     updated_at=TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond')
     WHERE generation_id=$1 AND state_revision=$6::BIGINT`, [
     artifact.generationId, (riskRevision + 1n).toString(),
     (reservedExposure - quoteCost).toString(), openPositions - 1,
     finalizedAtMs, riskRevision.toString(),
   ]);
+  let inferredIntentTransition: QueryResult | null = null;
+  if (initialIntentStatus !== 'CONFIRMED') {
+    inferredIntentTransition = await client.query(`INSERT INTO execution_intent_transitions (
+      intent_id,previous_status,next_status,reason_code,human_message,activation_phase,
+      attempt_number,evidence,occurred_at
+    ) VALUES ($1,$2,'CONFIRMED','CONFIRMATION_OBSERVED',
+      'Finalized canary exit effect confirmed.','CANARY',$3,
+      jsonb_build_object('payloadVersion',1,'attemptNumber',$3::INTEGER,
+        'sourceEventId',NULL,'observedAtMs',$4::BIGINT),
+      TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond'))`, [
+      artifact.intentId, initialIntentStatus, artifact.attemptNumber, finalizedAtMs,
+    ]);
+  }
   const transition = await client.query(`INSERT INTO execution_intent_transitions (
     intent_id,previous_status,next_status,reason_code,human_message,activation_phase,
     attempt_number,evidence,occurred_at
@@ -1535,6 +2888,7 @@ async function commitSellReconciliation(
     artifact.intentId, artifact.attemptNumber, finalizedAtMs,
   ]);
   const intentRevision = unsignedBigint(row.intent_revision);
+  const intentRevisionIncrement = inferredIntentTransition === null ? 1n : 2n;
   const intentUpdate = await client.query(`UPDATE execution_intents SET
     status='SUCCEEDED',state_revision=$2::BIGINT,last_reason_code='INTENT_SUCCEEDED',
     lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
@@ -1542,9 +2896,9 @@ async function commitSellReconciliation(
     reconciliation_completed_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond'),
     purge_after=TIMESTAMPTZ 'epoch'+(($3::BIGINT+14400000)*INTERVAL '1 millisecond'),
     updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
-    WHERE id=$1 AND status='CONFIRMED' AND state_revision=$4::BIGINT`, [
-    artifact.intentId, (intentRevision + 1n).toString(), finalizedAtMs,
-    intentRevision.toString(),
+    WHERE id=$1 AND status=$4 AND state_revision=$5::BIGINT`, [
+    artifact.intentId, (intentRevision + intentRevisionIncrement).toString(), finalizedAtMs,
+    initialIntentStatus, intentRevision.toString(),
   ]);
   const attemptUpdate = await client.query(`UPDATE execution_attempts SET
     status='COMPLETED',completed_at=TIMESTAMPTZ 'epoch'
@@ -1552,8 +2906,10 @@ async function commitSellReconciliation(
     WHERE intent_id=$1 AND attempt_number=$2 AND status='STARTED'`, [
     artifact.intentId, artifact.attemptNumber, finalizedAtMs,
   ]);
-  if ([artifactUpdate, positionUpdate, authorizationUpdate, armamentUpdate, riskUpdate,
-    transition, intentUpdate, attemptUpdate].some((result) => result.rowCount !== 1)) {
+  const requiredUpdates = [artifactUpdate, positionUpdate, authorizationUpdate, armamentUpdate,
+    riskUpdate, transition, intentUpdate, attemptUpdate];
+  if (inferredIntentTransition !== null) requiredUpdates.push(inferredIntentTransition);
+  if (requiredUpdates.some((result) => result.rowCount !== 1)) {
     throw failure('CONFLICT');
   }
   await insertLiveStateEvent(
@@ -1626,6 +2982,10 @@ async function lockGeneration(client: DatabaseClient, generationId: string): Pro
   await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))', [generationId]);
 }
 
+async function lockProvider(client: DatabaseClient, providerId: string): Promise<void> {
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))', [providerId]);
+}
+
 function exactRow<const Keys extends readonly string[]>(
   value: Row,
   keys: Keys,
@@ -1662,12 +3022,18 @@ function unsignedBigint(value: unknown): bigint {
   return BigInt(value);
 }
 
-function unsigned(value: unknown): value is bigint {
-  return typeof value === 'bigint' && value >= 0n && value <= 18_446_744_073_709_551_615n;
+function signedBigint(value: unknown): bigint {
+  if (typeof value === 'bigint') return value;
+  if (typeof value !== 'string' || !/^-?(?:0|[1-9][0-9]*)$/u.test(value)) {
+    throw failure('INVALID_DATA');
+  }
+  const parsed = BigInt(value);
+  if (parsed < -(1n << 63n) || parsed > (1n << 63n) - 1n) throw failure('INVALID_DATA');
+  return parsed;
 }
 
-function positiveUnsigned(value: unknown): value is bigint {
-  return unsigned(value) && value > 0n;
+function unsigned(value: unknown): value is bigint {
+  return typeof value === 'bigint' && value >= 0n && value <= 18_446_744_073_709_551_615n;
 }
 
 function validTimestamp(value: unknown): value is number {
@@ -1679,6 +3045,41 @@ function integer(value: unknown): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
     throw failure('INVALID_DATA');
   }
+  return value;
+}
+
+function text(value: unknown): string {
+  if (typeof value !== 'string') throw failure('INVALID_DATA');
+  return value;
+}
+
+function livePositionState(value: unknown): ExecutionLivePositionState {
+  if (value !== 'OPEN' && value !== 'EXIT_PENDING' && value !== 'CLOSED'
+    && value !== 'UNKNOWN') throw failure('INVALID_DATA');
+  return value;
+}
+
+function inspectableSignedState(value: unknown): ExecutionLiveSignedTransactionInspectionV1['state'] {
+  if (typeof value !== 'string' || ![
+    'PERSISTED', 'SIGNED_SIMULATED', 'SUBMISSION_STARTED',
+    'ACCEPTED', 'AMBIGUOUS', 'REVOKED_NO_SEND',
+  ].includes(value)) throw failure('CONFLICT');
+  return value as ExecutionLiveSignedTransactionInspectionV1['state'];
+}
+
+function inspectionIntentStatusMatches(
+  state: Exclude<ExecutionLiveSignedTransactionInspectionV1['state'], 'REVOKED_NO_SEND'>,
+  status: unknown,
+): boolean {
+  if (state === 'PERSISTED' || state === 'SIGNED_SIMULATED'
+    || state === 'SUBMISSION_STARTED') return status === 'SIGNED_NOT_SUBMITTED';
+  if (state === 'ACCEPTED') return status === 'SUBMITTED';
+  return status === 'UNKNOWN_REQUIRES_RECONCILIATION';
+}
+
+function exitAuthorizationState(value: unknown): ExecutionExitAuthorizationState {
+  if (value !== 'ACTIVE' && value !== 'LOCKED' && value !== 'CONSUMED'
+    && value !== 'REVOKED') throw failure('INVALID_DATA');
   return value;
 }
 
