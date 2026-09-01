@@ -11,6 +11,10 @@ BEGIN
     CREATE ROLE sol_token_executor_worker NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
       NOINHERIT NOREPLICATION NOBYPASSRLS;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='sol_token_executor_live') THEN
+    CREATE ROLE sol_token_executor_live NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOINHERIT NOREPLICATION NOBYPASSRLS;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='sol_token_executor_operations') THEN
     CREATE ROLE sol_token_executor_operations NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
       NOINHERIT NOREPLICATION NOBYPASSRLS;
@@ -27,7 +31,68 @@ END
 $roles$;
 
 GRANT USAGE ON SCHEMA public
-TO sol_token_executor_operations,sol_token_operator_reader;
+TO sol_token_executor_live,sol_token_executor_operations,sol_token_operator_reader;
+
+REVOKE ALL ON TABLE
+  execution_signed_transactions,
+  execution_submission_events,
+  execution_live_positions,
+  execution_exit_authorizations
+FROM PUBLIC,sol_token_listener_writer,sol_token_executor_worker,
+  sol_token_executor_operations,sol_token_operator_reader,sol_token_public_api;
+
+GRANT SELECT ON TABLE
+  execution_intents,
+  execution_intent_transitions,
+  execution_attempts,
+  execution_wallet_generations,
+  execution_wallet_risk_state,
+  execution_wallet_snapshots,
+  execution_provider_usage_snapshots,
+  execution_provider_usage_counters,
+  execution_provider_rate_limit_events,
+  execution_risk_admission_reports,
+  execution_exposure_reservations,
+  execution_reconciliation_evidence,
+  execution_fault_ledger,
+  execution_simulation_artifacts,
+  execution_safety_qualifications,
+  execution_safety_gate_evidence,
+  execution_control_state,
+  execution_activation_armaments,
+  execution_activation_events,
+  execution_signed_transactions,
+  execution_submission_events,
+  execution_live_positions,
+  execution_exit_authorizations
+TO sol_token_executor_live;
+
+GRANT SELECT,INSERT,UPDATE ON TABLE
+  execution_signed_transactions,
+  execution_live_positions,
+  execution_exit_authorizations
+TO sol_token_executor_live;
+
+GRANT SELECT,INSERT ON TABLE
+  execution_submission_events
+TO sol_token_executor_live;
+
+GRANT INSERT,UPDATE ON TABLE
+  execution_intents,
+  execution_attempts,
+  execution_wallet_risk_state,
+  execution_provider_usage_counters,
+  execution_exposure_reservations,
+  execution_activation_armaments
+TO sol_token_executor_live;
+
+GRANT INSERT ON TABLE
+  execution_intent_transitions,
+  execution_risk_admission_reports,
+  execution_reconciliation_evidence,
+  execution_fault_ledger,
+  execution_activation_events
+TO sol_token_executor_live;
 
 REVOKE ALL ON TABLE
   execution_safety_qualifications,

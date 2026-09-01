@@ -152,6 +152,10 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly paperDecisionJobs: number;
   readonly paperTrades: number;
   readonly paperPositions: number;
+  readonly executionSubmissionEvents: number;
+  readonly executionSignedTransactions: number;
+  readonly executionExitAuthorizations: number;
+  readonly executionLivePositions: number;
   readonly executionDryRunAssessments: number;
   readonly executionSimulationArtifacts: number;
   readonly executionControlEvents: number;
@@ -419,6 +423,61 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       || !Number.isFinite(executionIntentCutoff.getTime())) {
       throw new Error('PostgreSQL returned an invalid execution intent purge cutoff.');
     }
+    const executionLiveArtifactCohort = await client.query<{
+      readonly artifact_id: string;
+    }>(
+      `SELECT artifact.artifact_id
+       FROM execution_signed_transactions artifact
+       WHERE artifact.state IN ('RECONCILED','REVOKED_NO_SEND')
+         AND artifact.purge_after <= $1::TIMESTAMPTZ
+       ORDER BY artifact.artifact_id LIMIT 1000 FOR UPDATE`,
+      [executionIntentCutoff],
+    );
+    const executionLiveArtifactIds = executionLiveArtifactCohort.rows.map(
+      ({ artifact_id }) => artifact_id,
+    );
+    const executionSubmissionEvents = await client.query(
+      `DELETE FROM execution_submission_events event
+       WHERE event.artifact_id = ANY($1::TEXT[])`,
+      [executionLiveArtifactIds],
+    );
+    const executionSignedTransactions = await client.query(
+      `DELETE FROM execution_signed_transactions artifact
+       WHERE artifact.artifact_id = ANY($1::TEXT[])
+         AND artifact.state IN ('RECONCILED','REVOKED_NO_SEND')
+         AND artifact.purge_after <= $2::TIMESTAMPTZ`,
+      [executionLiveArtifactIds, executionIntentCutoff],
+    );
+    const executionExitAuthorizations = await client.query(
+      `DELETE FROM execution_exit_authorizations exit_auth
+       WHERE exit_auth.authorization_id IN (
+         SELECT candidate.authorization_id
+         FROM execution_exit_authorizations candidate
+         WHERE candidate.state IN ('CONSUMED','REVOKED')
+           AND candidate.purge_after <= $1::TIMESTAMPTZ
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_signed_transactions artifact
+             WHERE artifact.exit_authorization_id=candidate.authorization_id
+           )
+         ORDER BY candidate.authorization_id LIMIT 1000 FOR UPDATE
+       )`,
+      [executionIntentCutoff],
+    );
+    const executionLivePositions = await client.query(
+      `DELETE FROM execution_live_positions position
+       WHERE position.position_id IN (
+         SELECT candidate.position_id
+         FROM execution_live_positions candidate
+         WHERE candidate.state='CLOSED'
+           AND candidate.purge_after <= $1::TIMESTAMPTZ
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_exit_authorizations exit_auth
+             WHERE exit_auth.position_id=candidate.position_id
+           )
+         ORDER BY candidate.position_id LIMIT 1000 FOR UPDATE
+       )`,
+      [executionIntentCutoff],
+    );
     const executionControlEvents = await client.query(
       `DELETE FROM execution_control_events event
        WHERE event.event_id IN (
@@ -990,6 +1049,10 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       paperDecisionJobs: paperDecisionJobs.rowCount ?? 0,
       paperTrades: paperTrades.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
+      executionSubmissionEvents: executionSubmissionEvents.rowCount ?? 0,
+      executionSignedTransactions: executionSignedTransactions.rowCount ?? 0,
+      executionExitAuthorizations: executionExitAuthorizations.rowCount ?? 0,
+      executionLivePositions: executionLivePositions.rowCount ?? 0,
       executionDryRunAssessments: executionDryRunAssessments.rowCount ?? 0,
       executionSimulationArtifacts: executionSimulationArtifacts.rowCount ?? 0,
       executionControlEvents: executionControlEvents.rowCount ?? 0,

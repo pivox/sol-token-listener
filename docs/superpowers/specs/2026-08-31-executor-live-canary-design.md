@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.0.6
 
-**Version de la spécification parente :** 1.7.4
+**Version de la spécification parente :** 1.7.6
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,15 @@
 
 ## Historique des versions
 
+- **1.0.6 — 2026-08-31 :** acte le résultat de l'audit d'intégration : cette
+  livraison fournit un bootstrap injectable fail-closed et le runtime
+  prioritaire, mais ne publie aucun exécutable production tant que les claims
+  par côté, read-models live, scan de deadline, gateway RPC borné et pipeline
+  quote/build/admission ne sont pas composés dans une PR suivante.
+- **1.0.5 — 2026-08-31 :** ferme le volet opérateur livrable sans prétendre
+  composer le runtime : rôle PostgreSQL live seul autorisé à lire les bytes
+  signés, purge terminale quatre heures conservant tout état ouvert ou ambigu,
+  inventaire smoke 036 et runbook explicitement non démarrable.
 - **1.0.4 — 2026-08-31 :** compose la projection neutre des décisions paper
   derrière `EXECUTION_INTENT_EMISSION_ENABLED=false`. L'intention et la mise à
   jour canonique de session partagent la même transaction PostgreSQL, le
@@ -40,10 +49,16 @@
 
 ## 1. Décision
 
-#51-G introduit la première capacité de signature et de soumission du projet.
-Elle réside dans un nouvel exécutable `executor-live`, séparé du listener, de
+#51-G introduit les premières capacités de signature et de soumission du projet.
+Elles résident dans une nouvelle frontière `executor-live`, séparée du listener, de
 l'API, du paper, du dry-run, de `simulation-only` et des commandes opérateur.
 Ces graphes restent incapables de charger un secret, signer ou envoyer.
+
+La composition production de cette frontière n'est pas livrée par cette PR.
+Le bootstrap injectable valide l'ordre configuration → schéma → secret et le
+runtime prouve l'ordre des lanes, mais aucun script `executor:live:start` n'est
+publié. Le prochain incrément doit fournir les ports de claim/read-model, le
+gateway RPC borné et le pipeline live complet avant tout canary.
 
 ```text
 listener observe/paper
@@ -84,7 +99,7 @@ ni rentabilité, ni sellabilité générale, ni sécurité future.
 
 - composition optionnelle du producteur d'intentions neutres dans le listener
   paper, derrière `EXECUTION_INTENT_EMISSION_ENABLED=false` ;
-- nouvel entrypoint et nouveau graphe `src/executor-live/` ;
+- nouveau bootstrap injectable et nouveau graphe `src/executor-live/` ;
 - configuration live fermée et sans valeur permissive implicite ;
 - chargeur local de keypair à chemin absolu, fichier régulier non symlink,
   propriétaire du processus et permissions maximales `0600` ;
@@ -113,6 +128,7 @@ ni rentabilité, ni sellabilité générale, ni sécurité future.
 - retry avec un nouveau blockhash après une soumission ambiguë ;
 - promotion automatique CANARY vers MICRO_LIVE ou PILOT ;
 - exécution réelle pendant les tests, la CI ou la fusion de la PR ;
+- composition et publication du binaire production `executor:live:start` ;
 - déclaration de réussite du canary sans BUY et SELL finalisés et réconciliés.
 
 ## 4. Activation fail-closed
@@ -409,8 +425,12 @@ ne remplacent pas un reason code durable lorsqu'un effet peut être ambigu.
 
 ## 15. Gates avant canary réel
 
-Après fusion, la capacité reste inactive. Avant tout canary réel, l'opérateur
-doit fournir des preuves fraîches pour les onze gates #51-F, puis :
+Après fusion, la capacité reste inactive et non démarrable. Une PR de
+composition production doit d'abord livrer et tester les claims par côté, les
+read-models de confirmation/réconciliation, le scan atomique des deadlines,
+le gateway RPC borné, le pipeline admission/quote/build et le renouvellement
+des leases. Ensuite seulement, avant tout canary réel, l'opérateur doit fournir
+des preuves fraîches pour les onze gates #51-F, puis :
 
 1. déployer le build exact sur un hôte contrôlé ;
 2. provisionner le rôle PostgreSQL executor-only ;
@@ -438,4 +458,5 @@ enchaîne automatiquement et aucune PR ne déclenche la transaction réelle.
 - migrations, build, check, lint, docs, tests backend/frontend et smoke sont
   verts ;
 - #49 reste `NON_EXECUTED / NON_VALIDATED` ;
-- la fusion prépare le canary manuel mais ne l'arme et ne l'exécute pas.
+- la fusion prépare les fondations du canary sans publier de binaire production,
+  sans l'armer et sans l'exécuter.

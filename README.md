@@ -43,9 +43,12 @@ courant ne compose ou n'appelle `admitBuy`, `recordFault`, `reconcile` ou
 un preflight durable, des arrêts opérateur et un armement manuel strictement
 inerte. Les gates du preflight doivent être fournis dans une enveloppe Ed25519
 signée et liée au déploiement. Ses six commandes `live:*` refusent les secrets et ne sont importées
-par aucun worker. #51-G (signature/soumission sous gates compensatoires) reste
-obligatoire avant toute transaction réelle. Les seuls modes du listener
-restent `observe` et `paper`.
+par aucun worker. #51-G fournit ses briques live isolées et ses protections
+PostgreSQL, mais le binaire de production reste non composé et indémarrable :
+aucun script `executor:live:start` n'est publié. Les seuls modes du listener
+restent `observe` et `paper`. Le
+[runbook canary #51-G](docs/operations/executor-live-canary.md) décrit ce
+blocage et les preuves encore requises.
 
 Configuration minimale de la stratégie de création, toujours simulée :
 
@@ -221,8 +224,9 @@ applicables. Aucun secret n'est accepté et aucun `signTransaction`,
 La validation terrain #49 des 50 positions Mainnet a été sautée : son statut
 reste explicitement `NON_EXECUTED` et `NON_VALIDATED`, jamais `PASS`. La
 fondation #51-E et le preflight inerte #51-F ne changent pas ce statut et
-n'activent aucun runtime de soumission. #51-G (signature/soumission sous gates
-compensatoires) demeure obligatoire avant le moindre trade réel. Le
+n'activent aucun runtime de soumission. Les briques #51-G de
+signature/soumission sous gates compensatoires ne constituent pas encore un
+runtime production composé. Le
 [runbook #51-F](docs/operations/executor-preflight.md) décrit les preuves,
 arrêts et commandes locales.
 

@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.4
+**Version de spécification :** 1.7.6
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,12 @@
 
 ## Historique des versions
 
+- **1.7.6 — 2026-08-31 :** acte que #51-G livre un runtime injectable et les
+  capacités isolées, sans publier de binaire production avant la composition
+  des ports de claim/read-model, du gateway RPC et du pipeline live complet.
+- **1.7.5 — 2026-08-31 :** ferme les protections opérationnelles livrables de
+  #51-G (rôle live executor-only, rétention terminale et inventaire smoke),
+  tout en maintenant le binaire production explicitement non composé.
 - **1.7.4 — 2026-08-31 :** active uniquement la capacité de projection
   neutre #51-G, désactivée par défaut et limitée au paper WSOL. Le commit de la
   décision et la création idempotente de l'intention sont atomiques ; aucun

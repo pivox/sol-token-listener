@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
@@ -23,6 +24,8 @@ void test('executor risk purge exposes additive zero counters on an empty databa
     await migrateDatabase({ pool });
     const result = await purgeExpiredFoundationData(pool);
     assert.deepEqual({
+      exitAuthorizations: result.executionExitAuthorizations,
+      livePositions: result.executionLivePositions,
       rateLimits: result.executionRiskRateLimitEvents,
       evidence: result.executionRiskReconciliationEvidence,
       faults: result.executionRiskFaults,
@@ -32,11 +35,28 @@ void test('executor risk purge exposes additive zero counters on an empty databa
       providerOperations: result.executionRiskProviderOperations,
       providerSnapshots: result.executionRiskProviderSnapshots,
       tombstones: result.executionRiskTombstones,
+      signedTransactions: result.executionSignedTransactions,
+      submissionEvents: result.executionSubmissionEvents,
     }, {
+      exitAuthorizations: 0, livePositions: 0,
       rateLimits: 0, evidence: 0, faults: 0, reservations: 0, reports: 0,
       walletSnapshots: 0, providerOperations: 0, providerSnapshots: 0, tombstones: 0,
+      signedTransactions: 0, submissionEvents: 0,
     });
   });
+});
+
+void test('live retention is terminal-only and cannot delete ambiguous or open state', async () => {
+  const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
+  const liveStart = source.indexOf('const executionLiveArtifactCohort');
+  const liveEnd = source.indexOf('const executionControlEvents', liveStart);
+  assert.ok(liveStart >= 0 && liveEnd > liveStart, 'live retention cohort is absent');
+  const liveRetention = source.slice(liveStart, liveEnd);
+  assert.match(liveRetention, /state IN \('RECONCILED','REVOKED_NO_SEND'\)/u);
+  assert.match(liveRetention, /candidate\.state='CLOSED'/u);
+  assert.match(liveRetention, /candidate\.state IN \('CONSUMED','REVOKED'\)/u);
+  assert.doesNotMatch(liveRetention, /(?:AMBIGUOUS|UNKNOWN|OPEN|EXIT_PENDING|SUBMISSION_STARTED)'?\s*(?:,|\))/u);
+  assert.match(liveRetention, /purge_after <= \$1::TIMESTAMPTZ/u);
 });
 
 void test('purges only expired executor risk payloads and retains active or ambiguous state', async (context) => {

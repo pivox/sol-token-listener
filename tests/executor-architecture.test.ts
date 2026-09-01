@@ -605,6 +605,7 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
     EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',
     EXECUTOR_SHUTDOWN_GRACE_MS: '10000',
     EXECUTOR_PUBLIC_KEY: '',
+    EXECUTOR_KEYPAIR_PATH: '',
     EXECUTOR_RPC_PROVIDER_ID: 'primary',
     EXECUTOR_WALLET_GENERATION_ID: '',
     EXECUTOR_BUILD_HASH: '',
@@ -627,7 +628,8 @@ void test('operator documentation describes the PostgreSQL-only, non-consuming e
   });
   assert.equal((environment.match(/^DATABASE_URL=postgresql:\/\//gmu) ?? []).length, 1);
   assert.match(environment, /mode executor[^\n]*dry-run[\s\S]*?sans RPC Solana ni wallet/iu);
-  assert.doesNotMatch(environment, /EXECUTOR_(?:PRIVATE_KEY|SECRET_KEY|KEYPAIR|KEYPAIR_PATH)=/u);
+  assert.doesNotMatch(environment, /EXECUTOR_(?:PRIVATE_KEY|SECRET_KEY|KEYPAIR)=/u);
+  assert.match(environment, /^EXECUTOR_KEYPAIR_PATH=$/mu);
 
   assert.match(readme, /npm run build:backend\s+npm run db:migrate\s+EXECUTOR_MODE=dry-run DATABASE_URL=postgresql:\/\/\.\.\. npm run executor:start/u);
   assert.match(readme, /listener[^\n]*`observe`\|`paper`/iu);
@@ -669,6 +671,66 @@ void test('process integration registers each child immediately and bounds TERM 
   assert.match(integration, /child\.kill\('SIGTERM'\)/u);
   assert.match(integration, /child\.kill\('SIGKILL'\)/u);
   assert.match(integration, /Promise\.race/u);
+});
+
+void test('source and compiled live capability remains isolated in exact files', async () => {
+  const expectedLiveFiles = [
+    'confirmation-worker',
+    'deadline-exit.service',
+    'execution-worker',
+    'keypair-loader',
+    'main',
+    'reconciliation-worker',
+    'runtime',
+    'signed-simulation-gateway',
+    'submission-gateway',
+    'transaction-preparer',
+  ];
+  for (const [prefix, extension] of [['src', 'ts'], ['dist/src', 'js']] as const) {
+    for (const file of expectedLiveFiles) {
+      await access(resolve(repositoryRoot, `${prefix}/executor-live/${file}.${extension}`));
+    }
+    const sources = await Promise.all(expectedLiveFiles.map(async (file) => Object.freeze({
+      file,
+      source: await readFile(resolve(repositoryRoot, `${prefix}/executor-live/${file}.${extension}`), 'utf8'),
+    })));
+    const signingSites = sources
+      .filter(({ source }) => /\bsignMessage\s*\(/u.test(source))
+      .map(({ file }) => `${prefix}/executor-live/${file}.${extension}`)
+      .sort();
+    assert.deepEqual(signingSites, [
+      `${prefix}/executor-live/keypair-loader.${extension}`,
+      `${prefix}/executor-live/transaction-preparer.${extension}`,
+    ]);
+    const submissionSites = sources
+      .filter(({ source }) => /\.sendRawTransaction\s*\(/u.test(source))
+      .map(({ file }) => `${prefix}/executor-live/${file}.${extension}`);
+    assert.deepEqual(submissionSites, [`${prefix}/executor-live/submission-gateway.${extension}`]);
+    const mainGraph = await readGraph(resolve(repositoryRoot, `${prefix}/executor-live/main.${extension}`));
+    assert.equal(
+      [...mainGraph.keys()].some((path) => path.endsWith(`/executor-live/submission-gateway.${extension}`)),
+      false,
+      'fail-closed bootstrap must not pretend production lanes are composed',
+    );
+  }
+});
+
+void test('listener, API, dry-run and operations graphs cannot reach executor-live', async () => {
+  for (const entry of [
+    'src/app.ts',
+    'src/executor/main.ts',
+    'src/executor-operations/main.ts',
+    'dist/src/app.js',
+    'dist/src/executor/main.js',
+    'dist/src/executor-operations/main.js',
+  ]) {
+    const graph = await readGraph(resolve(repositoryRoot, entry));
+    assert.deepEqual(
+      [...graph.keys()].filter((path) => path.includes('/executor-live/')),
+      [],
+      entry,
+    );
+  }
 });
 
 async function readGraph(entry: string): Promise<ReadonlyMap<string, string>> {

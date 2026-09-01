@@ -70,6 +70,7 @@ const canonicalMigrations = Object.freeze([
   '033_execution_simulation_artifacts.sql',
   '034_execution_risk_reconciliation.sql',
   '035_execution_preflight_operations.sql',
+  '036_execution_live_canary.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
@@ -81,8 +82,10 @@ const canonicalRetentionCounters = Object.freeze([
   'executionAttempts',
   'executionControlEvents',
   'executionDryRunAssessments',
+  'executionExitAuthorizations',
   'executionIntents',
   'executionIntentTransitions',
+  'executionLivePositions',
   'executionOperatorAuthorizations',
   'executionRiskAdmissionReports',
   'executionRiskFaults',
@@ -94,7 +97,9 @@ const canonicalRetentionCounters = Object.freeze([
   'executionRiskTombstones',
   'executionRiskWalletSnapshots',
   'executionSafetyQualifications',
+  'executionSignedTransactions',
   'executionSimulationArtifacts',
+  'executionSubmissionEvents',
   'holderSnapshots',
   'launchTrades',
   'listenerCatchUpGaps',

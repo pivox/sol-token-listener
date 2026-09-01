@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js, PostgreSQL, `@solana/web3.js` 1.98.4, SDK officiels Pump.fun/PumpSwap épinglés, `node:test`, RPC local scripté.
 
-**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.4, parent version 1.7.4.
+**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.6, parent version 1.7.6.
 
 ---
 
@@ -427,14 +427,13 @@ git add src/config/env.ts src/application/production-listener-factory.ts src/app
 git commit -m "feat: project inert live execution intents (#51)"
 ```
 
-### Task 8: Intégrer le binaire, les rôles, la rétention et le runbook
+### Task 8: Intégrer le runtime injectable, les rôles, la rétention et le runbook
 
 **Files:**
 - Create: `src/executor-live/main.ts`
 - Create: `src/executor-live/runtime.ts`
-- Modify: `package.json`
 - Modify: `scripts/provision-executor-roles.sql`
-- Modify: `scripts/purge-retained-data.ts`
+- Modify: `src/storage/database.ts`
 - Modify: `scripts/deployment-smoke.mjs`
 - Create: `docs/operations/executor-live-canary.md`
 - Modify: `README.md`
@@ -444,44 +443,57 @@ git commit -m "feat: project inert live execution intents (#51)"
 - Modify: `tests/executor-roles-provisioning.test.ts`
 - Modify: `tests/execution-risk-retention.test.ts`
 
-- [ ] **Step 1: Write runtime/architecture failing tests**
+- [x] **Step 1: Write runtime/architecture failing tests**
 
 Exiger l'ordre prioritaire réconciliation -> confirmation -> SELL -> deadline
 -> BUY, shutdown borné, fermeture/effacement signer, graphe source/dist isolé,
 rôles sans accès public aux bytes et rétention ne supprimant jamais un cas
 ambigu.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `npx tsx --test tests/executor-live-main.integration.test.ts tests/executor-architecture.test.ts tests/executor-roles-provisioning.test.ts tests/execution-risk-retention.test.ts`
 
 Expected: FAIL because live entrypoint and grants are absent.
 
-- [ ] **Step 3: Implement runtime and operational wiring**
-
-Ajouter :
-
-```json
-{
-  "executor:live:start": "node dist/src/executor-live/main.js"
-}
-```
+- [x] **Step 3: Implement fail-closed runtime and operational wiring**
 
 Le bootstrap valide toute la configuration et le schéma avant de charger le
 secret. Il ne modifie jamais `ENTRY_STOP` et ne crée aucun armement. Le runbook
-documente préflight, resume, armement TTY, démarrage, status, kill switches,
-réconciliation, arrêt et constat du canary.
+documente préflight, resume, armement TTY, status, kill switches,
+réconciliation, arrêt et constat du canary. L'audit d'intégration a démontré
+que les ports actuels ne suffisent pas à composer les lanes production : aucun
+script `executor:live:start` n'est donc publié et aucun no-op trompeur n'est
+injecté.
 
-- [ ] **Step 4: Run targeted integration and commit**
+- [x] **Step 4: Run targeted integration and commit**
 
 Run: `npm run build && TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot npx tsx --test tests/executor-live-main.integration.test.ts tests/executor-architecture.test.ts tests/executor-roles-provisioning.test.ts tests/execution-risk-retention.test.ts`
 
-Expected: PASS with a local scripted RPC and no external submission.
+Expected: PASS du runtime injecté et de PostgreSQL, sans endpoint RPC ni
+soumission externe.
 
 ```bash
-git add src/executor-live package.json scripts/provision-executor-roles.sql scripts/purge-retained-data.ts scripts/deployment-smoke.mjs docs/operations/executor-live-canary.md README.md .env.example tests/executor-live-main.integration.test.ts tests/executor-architecture.test.ts tests/executor-roles-provisioning.test.ts tests/execution-risk-retention.test.ts
-git commit -m "feat: wire isolated live canary executor (#51)"
+git add src/executor-live scripts/provision-executor-roles.sql src/storage/database.ts scripts/deployment-smoke.mjs docs/operations/executor-live-canary.md README.md .env.example tests/executor-live-main.integration.test.ts tests/executor-architecture.test.ts tests/executor-roles-provisioning.test.ts tests/execution-risk-retention.test.ts
+git commit -m "feat: wire fail-closed live canary runtime (#51)"
 ```
+
+### Incrément obligatoire suivant — PR séparée de composition production
+
+Avant de publier `executor:live:start`, ajouter en TDD :
+
+- claim atomique filtré par côté pour garantir SELL avant BUY ;
+- read-models de confirmation et réconciliation depuis le ledger persistant ;
+- scan atomique des positions ouvertes dont la deadline est atteinte ;
+- gateway RPC borné pour simulation signée, soumission, confirmation et données
+  finalisées ;
+- pipeline live admission → quote → route → build → préparation → matérialisation
+  one-shot → persistance → simulation signée → soumission ;
+- validation production du schéma, des privilèges, de la génération et des
+  bindings avant chargement du secret ;
+- renouvellement explicite du lease à chaque frontière externe ou transactionnelle ;
+- intégration RPC locale complète BUY + confirmation + réconciliation + SELL,
+  sans aucun endpoint Mainnet.
 
 ### Task 9: Vérification finale et livraison PR
 
