@@ -1,3 +1,13 @@
+ALTER TABLE execution_reconciliation_evidence
+  ALTER COLUMN reservation_id DROP NOT NULL;
+ALTER TABLE execution_reconciliation_evidence
+  DROP CONSTRAINT IF EXISTS execution_reconciliation_evidence_live_side_check;
+ALTER TABLE execution_reconciliation_evidence
+  ADD CONSTRAINT execution_reconciliation_evidence_live_side_check CHECK (
+    (side='BUY' AND reservation_id IS NOT NULL)
+    OR (side='SELL' AND reservation_id IS NULL)
+  );
+
 CREATE TABLE IF NOT EXISTS execution_live_positions (
   position_id TEXT PRIMARY KEY,
   payload_version SMALLINT NOT NULL DEFAULT 1,
@@ -165,6 +175,7 @@ CREATE TABLE IF NOT EXISTS execution_signed_transactions (
   submission_started_at TIMESTAMPTZ,
   submitted_at TIMESTAMPTZ,
   confirmed_at TIMESTAMPTZ,
+  confirmed_slot BIGINT,
   reconciled_at TIMESTAMPTZ,
   purge_after TIMESTAMPTZ,
   PRIMARY KEY (intent_id, attempt_number),
@@ -215,8 +226,10 @@ CREATE TABLE IF NOT EXISTS execution_signed_transactions (
       OR signed_simulated_at IS NOT NULL)
     AND (state NOT IN ('SUBMISSION_STARTED','ACCEPTED','AMBIGUOUS','CONFIRMED','RECONCILED')
       OR submission_started_at IS NOT NULL)
-    AND (state NOT IN ('ACCEPTED','CONFIRMED','RECONCILED') OR submitted_at IS NOT NULL)
-    AND (state NOT IN ('CONFIRMED','RECONCILED') OR confirmed_at IS NOT NULL)
+    AND (state NOT IN ('ACCEPTED','CONFIRMED') OR submitted_at IS NOT NULL)
+    AND (state <> 'CONFIRMED' OR confirmed_at IS NOT NULL)
+    AND ((confirmed_at IS NULL) = (confirmed_slot IS NULL))
+    AND (confirmed_slot IS NULL OR confirmed_slot >= 0)
     AND (state <> 'RECONCILED' OR reconciled_at IS NOT NULL)
     AND ((state IN ('RECONCILED','REVOKED_NO_SEND')
       AND purge_after=COALESCE(reconciled_at,signed_simulated_at,signed_at) + INTERVAL '4 hours')
@@ -271,7 +284,8 @@ CREATE TABLE IF NOT EXISTS execution_submission_events (
     AND reason_code IN ('SIGNATURE_PERSISTED','SIGNED_SIMULATION_SUCCEEDED',
       'SIGNED_SIMULATION_FAILED','SUBMISSION_STARTED',
       'SUBMISSION_ACCEPTED','SUBMISSION_AMBIGUOUS','SUBMISSION_SIGNATURE_MISMATCH',
-      'CONFIRMATION_OBSERVED','RECONCILIATION_REQUIRED','INTENT_SUCCEEDED')
+      'CONFIRMATION_OBSERVED','RECONCILIATION_REQUIRED',
+      'RECONCILIATION_PROVED_NO_EFFECT','INTENT_SUCCEEDED')
   ),
   CONSTRAINT execution_submission_events_temporal_check CHECK (
     isfinite(occurred_at) AND date_trunc('milliseconds',occurred_at)=occurred_at

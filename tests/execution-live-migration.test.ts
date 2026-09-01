@@ -20,6 +20,8 @@ void test('migration 036 defines the four closed live execution tables', async (
   assert.match(sql, /signed_transaction_bytes BYTEA NOT NULL/u);
   assert.match(sql, /octet_length\(signed_transaction_bytes\) BETWEEN 1 AND 1232/u);
   assert.match(sql, /signed_transaction_hash ~ '\^\[0-9a-f\]\{64\}\$'/u);
+  assert.match(sql, /confirmed_slot BIGINT/u);
+  assert.match(sql, /\(confirmed_at IS NULL\) = \(confirmed_slot IS NULL\)/u);
   assert.match(sql, /PRIMARY KEY \(intent_id, attempt_number\)/u);
   assert.match(sql, /FOREIGN KEY \(intent_id, attempt_number\)[\s\S]*REFERENCES execution_attempts/u);
   assert.match(sql, /state IN \('PERSISTED','SIGNED_SIMULATED','SUBMISSION_STARTED',[\s\S]*'REVOKED_NO_SEND'\)/u);

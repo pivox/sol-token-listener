@@ -43,7 +43,7 @@ interface QueryResult {
   readonly rowCount: number | null;
 }
 
-interface ExecutionRiskClient {
+export interface ExecutionRiskClient {
   query(text: string, values?: readonly unknown[]): Promise<QueryResult>;
   release(error?: boolean): void;
 }
@@ -51,6 +51,11 @@ interface ExecutionRiskClient {
 export interface ExecutionRiskPool {
   connect(): Promise<ExecutionRiskClient>;
 }
+
+export type ExecutionRiskReconciliationHook = (
+  client: ExecutionRiskClient,
+  evidence: ExecutionReconciliationEvidenceV1,
+) => Promise<void>;
 
 export type ExecutionRiskRepositoryErrorCode =
   | 'INVALID_INPUT'
@@ -763,6 +768,13 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
   public async reconcile(
     inputValue: ExecutionReconciliationCommitV1,
   ): Promise<ExecutionReconciliationCommitResultV1> {
+    return this.reconcileWithHook(inputValue, () => Promise.resolve());
+  }
+
+  public async reconcileWithHook(
+    inputValue: ExecutionReconciliationCommitV1,
+    hook: ExecutionRiskReconciliationHook,
+  ): Promise<ExecutionReconciliationCommitResultV1> {
     const evidence = reconciliationCommitFrom(inputValue);
     return this.transaction(async (client) => {
       const identity = await client.query(`SELECT generation_id FROM execution_exposure_reservations
@@ -837,6 +849,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       if (replay !== undefined) {
         if (replay.evidence_fingerprint !== evidence.evidenceFingerprint
           || replay.result !== evidence.result) throw failure('CONFLICT');
+        await hook(client, evidence);
         return reconciliationResult(evidence);
       }
       if (priorEvidence.length > 0) {
@@ -998,6 +1011,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         ]);
         if (attemptUpdate.rowCount !== 1) throw failure('CONFLICT');
       }
+      await hook(client, evidence);
       return reconciliationResult(evidence);
     });
   }

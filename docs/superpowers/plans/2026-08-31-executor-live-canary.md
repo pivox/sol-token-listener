@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js, PostgreSQL, `@solana/web3.js` 1.98.4, SDK officiels Pump.fun/PumpSwap épinglés, `node:test`, RPC local scripté.
 
-**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.2, parent version 1.7.2.
+**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.3, parent version 1.7.3.
 
 ---
 
@@ -342,26 +342,26 @@ git commit -m "feat: submit persisted transaction bytes once (#51)"
 - Test: `tests/executor-live-reconciliation.test.ts`
 - Test: `tests/executor-live-deadline-exit.test.ts`
 
-- [ ] **Step 1: Write confirmation/reconciliation failing tests**
+- [x] **Step 1: Write confirmation/reconciliation failing tests**
 
 Tester confirmed puis finalized `MATCHED`, `NO_EFFECT` après hauteur expirée,
 reorg, absence courante, mismatch et provider indisponible. Vérifier qu'un BUY
 MATCHED crée position + autorisation de sortie, et qu'un SELL MATCHED ferme les
 deux et consomme l'armement canary.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `npx tsx --test tests/executor-live-confirmation.test.ts tests/executor-live-reconciliation.test.ts`
 
 Expected: FAIL because workers are absent.
 
-- [ ] **Step 3: Implement priority workers**
+- [x] **Step 3: Implement priority workers**
 
 Le runtime traite dans cet ordre : réconciliation, confirmation, SELL,
 deadline SELL, puis BUY. Chaque observation est provider-affine, bornée et
 committée via le repository #51-E/#51-G.
 
-- [ ] **Step 4: Write and implement deadline exit TDD**
+- [x] **Step 4: Write and implement deadline exit TDD**
 
 À `openedAtMs + maximumHoldingMs`, créer une seule intention :
 
@@ -375,7 +375,7 @@ baseAmountRaw = authorizedBaseAmountRaw;
 
 Le replay et deux workers concurrents retrouvent la même intention.
 
-- [ ] **Step 5: Run tests and commit**
+- [x] **Step 5: Run tests and commit**
 
 Run: `TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot npx tsx --test tests/executor-live-confirmation.test.ts tests/executor-live-reconciliation.test.ts tests/executor-live-deadline-exit.test.ts`
 

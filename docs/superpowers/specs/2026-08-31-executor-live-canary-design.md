@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
-**Version de la spécification parente :** 1.7.2
+**Version de la spécification parente :** 1.7.3
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,12 @@
 
 ## Historique des versions
 
+- **1.0.3 — 2026-08-31 :** rend la confirmation et la réconciliation live
+  reprenables : le slot confirmed est durable, les preuves terminales BUY et
+  SELL se rejouent sans nouvel effet, le BUY crée atomiquement position et
+  autorisation de sortie, et le SELL clôt position, autorisation, armement et
+  exposition dans une seule transaction. La deadline concurrente ne crée
+  qu'une intention SELL déterministe.
 - **1.0.2 — 2026-08-31 :** fixe la frontière de soumission exacte : simulation
   signée persistée, clôture transactionnelle `SUBMISSION_STARTED` avant RPC,
   `maxRetries=0` et passage durable en réconciliation pour tout résultat

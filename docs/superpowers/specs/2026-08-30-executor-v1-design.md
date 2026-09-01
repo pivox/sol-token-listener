@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.2
+**Version de spécification :** 1.7.3
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.7.3 — 2026-08-31 :** ferme la reprise post-soumission #51-G :
+  confirmation provider avec slot durable, réconciliation finalisée BUY/SELL
+  atomique et idempotente, position et autorisation de sortie explicites, puis
+  intention SELL unique à la deadline de détention.
 - **1.7.2 — 2026-08-31 :** ferme la soumission #51-G autour des seuls octets
   signés persistés et authentifiés, avec simulation signée préalable, fence
   PostgreSQL avant RPC, zéro retry provider et réconciliation obligatoire de
