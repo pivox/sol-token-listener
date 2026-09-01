@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.11
+**Version de spécification :** 1.0.12
 
-**Version de la spécification parente :** 1.7.11
+**Version de la spécification parente :** 1.7.12
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.12 — 2026-09-01 :** compare l'intention de sortie persistée au
+  contexte verrouillé de la position et refuse toute divergence de mint,
+  quote, montant, stratégie ou preuve. La fenêtre persistée doit commencer à
+  la deadline observée ou après et conserver exactement un TTL de 120 secondes.
 - **1.0.11 — 2026-09-01 :** impose que le rejeu d'une sortie à deadline
   reconstruise l'intention depuis tous ses champs immuables persistés. Une
   observation ultérieure ne peut donc ni renouveler `requestedAt`, ni repousser

@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.11
+**Version de spécification :** 1.7.12
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.7.12 — 2026-09-01 :** complète le rejeu des sorties à deadline par une
+  comparaison contextuelle avec la position verrouillée et par une politique
+  temporelle fermée : demande comprise entre deadline et observation, puis TTL
+  exact de 120 secondes.
 - **1.7.11 — 2026-09-01 :** ferme le rejeu des sorties à deadline sur
   l'intention immuable stockée : toutes les propriétés sont relues et validées,
   notamment les dates de demande et d'expiration, au lieu de provenir d'un

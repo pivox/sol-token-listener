@@ -375,6 +375,20 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
     });
     assert.equal(laterReplay.kind, 'REPLAYED');
     assert.deepEqual(laterReplay.intent, createdExit.intent);
+    await pool.query(`UPDATE execution_intents SET quote_decimals=quote_decimals+1
+      WHERE id=$1`, [createdExit.intent.id]);
+    await assert.rejects(repository.createDeadlineExitIntent({
+      positionId: reconciled.position.positionId,
+      observedAtMs: dueAtMs + 31_000,
+    }), isLiveRepositoryError('INVALID_DATA'));
+    await pool.query(`UPDATE execution_intents SET quote_decimals=quote_decimals-1,
+      expires_at=expires_at+INTERVAL '1 millisecond' WHERE id=$1`, [createdExit.intent.id]);
+    await assert.rejects(repository.createDeadlineExitIntent({
+      positionId: reconciled.position.positionId,
+      observedAtMs: dueAtMs + 32_000,
+    }), isLiveRepositoryError('INVALID_DATA'));
+    await pool.query(`UPDATE execution_intents SET expires_at=expires_at-INTERVAL '1 millisecond'
+      WHERE id=$1`, [createdExit.intent.id]);
     assert.ok(reconciled.exitAuthorization);
     const exitTimelineMs = Date.now();
     const exitClaimed = await new PostgresExecutionIntentRepository(pool).claim({

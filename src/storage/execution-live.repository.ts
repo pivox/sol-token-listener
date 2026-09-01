@@ -734,7 +734,8 @@ export class PostgresExecutionLiveRepository {
         'remaining_base_raw', 'exit_deadline_at_ms', 'entry_reconciliation_fingerprint',
         'quote_token_program', 'quote_decimals',
       ] as const);
-      if (input.observedAtMs < timestampText(row.exit_deadline_at_ms)) {
+      const exitDeadlineAtMs = timestampText(row.exit_deadline_at_ms);
+      if (input.observedAtMs < exitDeadlineAtMs) {
         return Object.freeze({ payloadVersion: 1, kind: 'NOT_DUE', intent: null });
       }
       const logicalCommandId = `maximum-holding:${input.positionId}`;
@@ -762,7 +763,7 @@ export class PostgresExecutionLiveRepository {
         return Object.freeze({
           payloadVersion: 1,
           kind: 'REPLAYED',
-          intent: await findDeadlineIntent(client, draft),
+          intent: await findDeadlineIntent(client, draft, exitDeadlineAtMs),
         });
       }
       if (row.state !== 'OPEN' || unsignedBigint(row.remaining_base_raw) === 0n) {
@@ -795,7 +796,7 @@ export class PostgresExecutionLiveRepository {
       return Object.freeze({
         payloadVersion: 1,
         kind: 'CREATED',
-        intent: await findDeadlineIntent(client, draft),
+        intent: await findDeadlineIntent(client, draft, exitDeadlineAtMs),
       });
     });
   }
@@ -2940,6 +2941,7 @@ async function commitSellReconciliation(
 async function findDeadlineIntent(
   client: DatabaseClient,
   draft: ExecutionIntentDraftV1,
+  exitDeadlineAtMs: number,
 ): Promise<ExecutionIntentV1> {
   const row = exactRow(singleRow(await client.query(`SELECT
     id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
@@ -3007,7 +3009,36 @@ async function findDeadlineIntent(
   } catch {
     throw failure('INVALID_DATA');
   }
+  if (!sameDeadlineIntentContext(candidate, draft)
+    || candidate.requestedAtMs < exitDeadlineAtMs
+    || candidate.requestedAtMs > draft.requestedAtMs
+    || candidate.expiresAtMs - candidate.requestedAtMs !== 120_000) {
+    throw failure('INVALID_DATA');
+  }
   return candidate;
+}
+
+function sameDeadlineIntentContext(
+  persisted: ExecutionIntentV1,
+  expected: ExecutionIntentDraftV1,
+): boolean {
+  return persisted.id === expected.id
+    && persisted.logicalOrderKey === expected.logicalOrderKey
+    && persisted.strategyId === expected.strategyId
+    && persisted.strategyVersion === expected.strategyVersion
+    && persisted.positionId === expected.positionId
+    && persisted.logicalCommandId === expected.logicalCommandId
+    && persisted.mint === expected.mint
+    && persisted.side === expected.side
+    && persisted.venuePolicy === expected.venuePolicy
+    && persisted.quoteMint === expected.quoteMint
+    && persisted.quoteTokenProgram === expected.quoteTokenProgram
+    && persisted.quoteDecimals === expected.quoteDecimals
+    && persisted.quoteAmountRaw === expected.quoteAmountRaw
+    && persisted.baseAmountRaw === expected.baseAmountRaw
+    && persisted.minimumAmountOutRaw === expected.minimumAmountOutRaw
+    && persisted.decisionEventId === expected.decisionEventId
+    && persisted.decisionFingerprint === expected.decisionFingerprint;
 }
 
 async function lockGeneration(client: DatabaseClient, generationId: string): Promise<void> {
