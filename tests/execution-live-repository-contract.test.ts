@@ -42,6 +42,7 @@ const h1ProductionModules = Object.freeze([
     allowedDependencies: new Set([
       'node:crypto',
       'node:util/types',
+      'bs58',
       'pg',
       '../domain/execution-live.js',
       '../domain/execution-live-signed-simulation.js',
