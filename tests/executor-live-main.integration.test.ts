@@ -53,19 +53,78 @@ void test('H1 remains non-live and records its exact operational boundary', asyn
   };
 
   assert.equal(packageJson.scripts?.['executor:live:start'], undefined);
-  assert.match(parentSpecification, /\*\*Version de spécification :\*\* 1\.7\.14/u);
-  assert.match(liveSpecification, /\*\*Version de spécification :\*\* 1\.0\.14/u);
-  assert.match(liveSpecification, /\*\*Version de la spécification parente :\*\* 1\.7\.14/u);
-  assert.match(orchestrationSpecification, /\*\*Version de spécification :\*\* 1\.0\.1/u);
-  assert.match(orchestrationSpecification, /\*\*Version de la spécification parente :\*\* 1\.7\.14/u);
-  assert.match(orchestrationSpecification, /\*\*Version de la fondation live :\*\* 1\.0\.14/u);
-  assert.match(runbook, /\*\*Version :\*\* 1\.1\.3 — 2026-09-01/u);
+  assertContainsExactlyOnce(
+    parentSpecification,
+    '**Version de spécification :** 1.7.14',
+    'parent specification version',
+  );
+  assertContainsExactlyOnce(
+    parentSpecification,
+    '**Périmètre livré à cette version :** #51-A à #51-G et primitives persistantes\n'
+      + '#51-H1 (claims, read-models et scan atomique des sorties à deadline)',
+    'parent delivered scope',
+  );
+  assertContainsExactlyOnce(
+    liveSpecification,
+    '**Version de spécification :** 1.0.14',
+    'live specification version',
+  );
+  assertContainsExactlyOnce(
+    liveSpecification,
+    '**Version de la spécification parente :** 1.7.14',
+    'live parent specification version',
+  );
+  assertContainsExactlyOnce(
+    orchestrationSpecification,
+    '**Version de spécification :** 1.0.1',
+    'orchestration specification version',
+  );
+  assertContainsExactlyOnce(
+    orchestrationSpecification,
+    '**Version de la spécification parente :** 1.7.14',
+    'orchestration parent specification version',
+  );
+  assertContainsExactlyOnce(
+    orchestrationSpecification,
+    '**Version de la fondation live :** 1.0.14',
+    'orchestration live foundation version',
+  );
+  assertContainsExactlyOnce(
+    runbook,
+    '**Version :** 1.1.3 — 2026-09-01',
+    'runbook version',
+  );
 
-  const operationalState = /LIVE_RUNTIME_NOT_COMPOSED[\s\S]*CANARY_NOT_STARTED[\s\S]*NON_EXECUTED \/ NON_VALIDATED/u;
-  assert.match(orchestrationSpecification, operationalState);
-  assert.match(runbook, operationalState);
-  assert.match(deploymentSmoke, /'037_execution_live_orchestration\.sql'/u);
+  assertContainsExactlyOnce(
+    orchestrationSpecification,
+    '```text\nLIVE_RUNTIME_NOT_COMPOSED\nCANARY_NOT_STARTED\nNON_EXECUTED / NON_VALIDATED\n```',
+    'orchestration operational state',
+  );
+  assertContainsExactlyOnce(
+    runbook,
+    "Pour l'instant, le constat obligatoire est : `LIVE_RUNTIME_NOT_COMPOSED`,\n"
+      + '`CANARY_NOT_STARTED`, `NON_EXECUTED / NON_VALIDATED`.',
+    'runbook operational state',
+  );
+  for (const contradictoryState of [
+    'LIVE_RUNTIME_COMPOSED',
+    'CANARY_STARTED',
+    'EXECUTED / VALIDATED',
+  ]) {
+    assert.equal(orchestrationSpecification.includes(contradictoryState), false, contradictoryState);
+    assert.equal(runbook.includes(contradictoryState), false, contradictoryState);
+  }
+  assert.equal((deploymentSmoke.match(/'037_execution_live_orchestration\.sql'/gu) ?? []).length, 1);
+  assert.equal(
+    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n\]\);/u.test(deploymentSmoke),
+    true,
+    'deployment smoke migration head',
+  );
 });
+
+function assertContainsExactlyOnce(source: string, expected: string, label: string): void {
+  assert.equal(source.split(expected).length - 1, 1, label);
+}
 
 void test('one live pass enforces reconciliation, confirmation, SELL, deadline, BUY priority', async () => {
   const calls: string[] = [];

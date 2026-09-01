@@ -8,8 +8,8 @@
 
 **Issue parente :** #51
 
-**Périmètre livré à cette version :** #51-A à #51-F et conception détaillée
-#51-G (graphe live fermé, signature, soumission et canary manuel)
+**Périmètre livré à cette version :** #51-A à #51-G et primitives persistantes
+#51-H1 (claims, read-models et scan atomique des sorties à deadline)
 
 ## Historique des versions
 
