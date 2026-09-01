@@ -16,7 +16,10 @@ import {
   createExecutionLiveUnsignedSimulationEvidenceIdentity,
 } from
   '../domain/execution-live-signed-simulation.js';
-import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reconciliation.js';
+import {
+  evaluateExecutionReconciliation,
+  type ExecutionReconciliationEvidenceV1,
+} from '../domain/execution-reconciliation.js';
 import type { ExecutionSimulationEvidenceV1 } from
   '../ports/execution-simulation-gateway.js';
 import {
@@ -31,10 +34,12 @@ import type {
   ExecutionBlockhashValidityEvidenceV1,
   ExecutionDeadlineExitResultV1,
   ExecutionLiveConfirmationV1,
+  ExecutionLiveConfirmationWorkV1,
   ExecutionLivePersistSignedInputV1,
   ExecutionPreSubmissionRevocationInputV1,
   ExecutionPreSubmissionRevocationResultV1,
   ExecutionLiveReconciliationResultV1,
+  ExecutionLiveReconciliationWorkV1,
   ExecutionLiveSignedTransactionInspectionV1,
   ExecutionLiveSignedSimulationEvidenceV1,
   ExecutionLiveSubmissionOutcomeV1,
@@ -607,6 +612,211 @@ export class PostgresExecutionLiveRepository {
         }
       }
       return artifact;
+    });
+  }
+
+  public async readConfirmationWork(
+    claimValue: ClaimedExecutionIntent,
+  ): Promise<ExecutionLiveConfirmationWorkV1> {
+    const claim = claimFrom(claimValue);
+    if (claim.intent.status !== 'SUBMITTED' || claim.intent.attemptCount < 1) {
+      throw failure('INVALID_INPUT');
+    }
+    return this.transaction(async (client) => {
+      const generationId = await workerGenerationId(client, claim);
+      await lockGeneration(client, generationId);
+      const row = exactRow(singleRow(await client.query(`SELECT
+        /* execution_live_confirmation_work */
+        intent.id AS intent_id,intent.status AS intent_status,
+        intent.state_revision::TEXT AS intent_revision,intent.attempt_count,
+        intent.lease_owner,intent.lease_token::TEXT AS lease_token,
+        trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT
+          AS lease_expires_at_ms,
+        attempt.intent_id AS attempt_intent_id,attempt.attempt_number,
+        attempt.status AS attempt_status,attempt.provider_id AS attempt_provider_id,
+        attempt.reconciliation_signature,
+        transaction.artifact_id,transaction.intent_id AS artifact_intent_id,
+        transaction.attempt_number AS artifact_attempt_number,
+        transaction.generation_id,transaction.provider_id AS artifact_provider_id,
+        transaction.signature AS artifact_signature,transaction.state AS artifact_state,
+        transaction.state_revision::TEXT AS artifact_revision
+        FROM execution_intents intent
+        JOIN execution_attempts attempt ON attempt.intent_id=intent.id
+          AND attempt.attempt_number=intent.attempt_count
+        JOIN execution_signed_transactions transaction ON transaction.intent_id=attempt.intent_id
+          AND transaction.attempt_number=attempt.attempt_number
+        WHERE intent.id=$1
+        FOR UPDATE OF intent,attempt,transaction`, [claim.intent.id])), [
+        'intent_id', 'intent_status', 'intent_revision', 'attempt_count', 'lease_owner',
+        'lease_token', 'lease_expires_at_ms', 'attempt_intent_id', 'attempt_number',
+        'attempt_status', 'attempt_provider_id', 'reconciliation_signature', 'artifact_id',
+        'artifact_intent_id', 'artifact_attempt_number', 'generation_id',
+        'artifact_provider_id', 'artifact_signature', 'artifact_state', 'artifact_revision',
+      ] as const);
+      const nowMs = await freshDatabaseNow(client);
+      assertWorkerClaim(row, claim, nowMs);
+      const attemptNumber = integer(row.attempt_number);
+      const providerId = providerIdentifier(row.artifact_provider_id);
+      const signature = reconciliationSignature(row.artifact_signature);
+      const artifactId = text(row.artifact_id);
+      if (!ARTIFACT_ID.test(artifactId)
+        || row.attempt_intent_id !== claim.intent.id
+        || row.artifact_intent_id !== claim.intent.id
+        || attemptNumber !== claim.intent.attemptCount
+        || integer(row.artifact_attempt_number) !== attemptNumber
+        || row.generation_id !== generationId
+        || row.attempt_status !== 'STARTED'
+        || row.artifact_state !== 'ACCEPTED'
+        || row.attempt_provider_id !== providerId
+        || row.reconciliation_signature !== signature) throw failure('INVALID_DATA');
+      return Object.freeze({
+        payloadVersion: 1,
+        artifactId,
+        expectedRevision: unsignedBigint(row.artifact_revision),
+        signature,
+        providerId,
+      });
+    });
+  }
+
+  public async readReconciliationWork(
+    claimValue: ClaimedExecutionIntent,
+  ): Promise<ExecutionLiveReconciliationWorkV1> {
+    const claim = claimFrom(claimValue);
+    if (!['CONFIRMED', 'RECONCILING', 'UNKNOWN_REQUIRES_RECONCILIATION']
+      .includes(claim.intent.status) || claim.intent.attemptCount < 1) {
+      throw failure('INVALID_INPUT');
+    }
+    return this.transaction(async (client) => {
+      const generationId = await workerGenerationId(client, claim);
+      await lockGeneration(client, generationId);
+      const row = exactRow(singleRow(await client.query(`SELECT
+        /* execution_live_reconciliation_work */
+        intent.id AS intent_id,intent.status AS intent_status,
+        intent.state_revision::TEXT AS intent_revision,intent.attempt_count,
+        intent.lease_owner,intent.lease_token::TEXT AS lease_token,
+        trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT
+          AS lease_expires_at_ms,
+        intent.mint,intent.quote_mint,intent.side AS intent_side,
+        attempt.intent_id AS attempt_intent_id,attempt.attempt_number,
+        attempt.status AS attempt_status,attempt.effective_venue AS attempt_effective_venue,
+        attempt.provider_id AS attempt_provider_id,attempt.reconciliation_signature,
+        attempt.reconciliation_blockhash,
+        attempt.reconciliation_last_valid_block_height::TEXT
+          AS reconciliation_last_valid_block_height,
+        attempt.reconciliation_message_hash,attempt.reconciliation_build_fingerprint,
+        attempt.reconciliation_snapshot_fingerprint,
+        attempt.reconciliation_maximum_fee_lamports::TEXT
+          AS reconciliation_maximum_fee_lamports,
+        attempt.reconciliation_maximum_fee_payer_lamport_debit::TEXT
+          AS reconciliation_maximum_fee_payer_lamport_debit,
+        transaction.artifact_id,transaction.intent_id AS artifact_intent_id,
+        transaction.attempt_number AS artifact_attempt_number,
+        transaction.generation_id AS artifact_generation_id,
+        transaction.provider_id AS artifact_provider_id,
+        transaction.wallet_public_key AS artifact_wallet_public_key,
+        transaction.side AS artifact_side,
+        transaction.effective_venue AS artifact_effective_venue,
+        transaction.signature AS artifact_signature,
+        transaction.blockhash AS artifact_blockhash,
+        transaction.last_valid_block_height::TEXT AS artifact_last_valid_block_height,
+        transaction.message_hash AS artifact_message_hash,
+        transaction.build_fingerprint AS artifact_build_fingerprint,
+        transaction.snapshot_fingerprint AS artifact_snapshot_fingerprint,
+        transaction.state AS artifact_state,
+        transaction.state_revision::TEXT AS artifact_revision,
+        generation.generation_id,generation.payload_version AS generation_payload_version,
+        generation.wallet_public_key AS generation_wallet_public_key,
+        generation.generation
+        FROM execution_intents intent
+        JOIN execution_attempts attempt ON attempt.intent_id=intent.id
+          AND attempt.attempt_number=intent.attempt_count
+        JOIN execution_signed_transactions transaction ON transaction.intent_id=attempt.intent_id
+          AND transaction.attempt_number=attempt.attempt_number
+        JOIN execution_wallet_generations generation
+          ON generation.generation_id=transaction.generation_id
+        WHERE intent.id=$1
+        FOR UPDATE OF intent,attempt,transaction`, [claim.intent.id])), [
+        'intent_id', 'intent_status', 'intent_revision', 'attempt_count', 'lease_owner',
+        'lease_token', 'lease_expires_at_ms', 'mint', 'quote_mint', 'intent_side',
+        'attempt_intent_id', 'attempt_number', 'attempt_status', 'attempt_effective_venue',
+        'attempt_provider_id', 'reconciliation_signature', 'reconciliation_blockhash',
+        'reconciliation_last_valid_block_height', 'reconciliation_message_hash',
+        'reconciliation_build_fingerprint', 'reconciliation_snapshot_fingerprint',
+        'reconciliation_maximum_fee_lamports',
+        'reconciliation_maximum_fee_payer_lamport_debit', 'artifact_id',
+        'artifact_intent_id', 'artifact_attempt_number', 'artifact_generation_id',
+        'artifact_provider_id', 'artifact_wallet_public_key', 'artifact_side',
+        'artifact_effective_venue', 'artifact_signature', 'artifact_blockhash',
+        'artifact_last_valid_block_height', 'artifact_message_hash',
+        'artifact_build_fingerprint', 'artifact_snapshot_fingerprint', 'artifact_state',
+        'artifact_revision', 'generation_id', 'generation_payload_version',
+        'generation_wallet_public_key', 'generation',
+      ] as const);
+      const nowMs = await freshDatabaseNow(client);
+      assertWorkerClaim(row, claim, nowMs);
+      const attemptNumber = integer(row.attempt_number);
+      const providerId = providerIdentifier(row.artifact_provider_id);
+      const side = executionSide(row.intent_side);
+      const signature = reconciliationSignature(row.artifact_signature);
+      const blockhash = solanaAddress(row.artifact_blockhash);
+      const walletPublicKey = solanaAddress(row.generation_wallet_public_key);
+      const mint = solanaAddress(row.mint);
+      const quoteMint = solanaAddress(row.quote_mint);
+      const expected = Object.freeze({
+        intentId: text(row.intent_id),
+        attemptNumber,
+        walletGeneration: positiveInteger(row.generation),
+        providerId,
+        side,
+        signature,
+        blockhash,
+        lastValidBlockHeight: unsignedBigint(row.artifact_last_valid_block_height),
+        messageHash: fingerprintText(row.artifact_message_hash),
+        buildFingerprint: fingerprintText(row.artifact_build_fingerprint),
+        snapshotFingerprint: fingerprintText(row.artifact_snapshot_fingerprint),
+        maximumFeeLamports: unsignedBigint(row.reconciliation_maximum_fee_lamports),
+        maximumFeePayerLamportDebit:
+          unsignedBigint(row.reconciliation_maximum_fee_payer_lamport_debit),
+      });
+      assertReconciliationExpected(expected);
+      const artifactId = text(row.artifact_id);
+      const effectiveVenue = executionVenue(row.artifact_effective_venue);
+      if (!ARTIFACT_ID.test(artifactId)
+        || row.attempt_intent_id !== claim.intent.id
+        || row.artifact_intent_id !== claim.intent.id
+        || attemptNumber !== claim.intent.attemptCount
+        || integer(row.artifact_attempt_number) !== attemptNumber
+        || row.artifact_generation_id !== generationId || row.generation_id !== generationId
+        || integer(row.generation_payload_version) !== 1
+        || row.artifact_wallet_public_key !== walletPublicKey
+        || row.artifact_side !== side
+        || row.attempt_effective_venue !== effectiveVenue
+        || row.attempt_provider_id !== providerId
+        || row.reconciliation_signature !== signature
+        || row.reconciliation_blockhash !== blockhash
+        || row.reconciliation_last_valid_block_height
+          !== expected.lastValidBlockHeight.toString()
+        || row.reconciliation_message_hash !== expected.messageHash
+        || row.reconciliation_build_fingerprint !== expected.buildFingerprint
+        || row.reconciliation_snapshot_fingerprint !== expected.snapshotFingerprint
+        || row.attempt_status !== 'STARTED'
+        || !['ACCEPTED', 'AMBIGUOUS', 'CONFIRMED'].includes(String(row.artifact_state))) {
+        throw failure('INVALID_DATA');
+      }
+      unsignedBigint(row.artifact_revision);
+      const request = Object.freeze({
+        payloadVersion: 1 as const,
+        expected,
+        walletDeltaRequest: Object.freeze({
+          signature,
+          walletPublicKey,
+          mint,
+          quoteMint,
+          side,
+        }),
+      });
+      return Object.freeze({ payloadVersion: 1, providerId, request });
     });
   }
 
@@ -3052,6 +3262,118 @@ function sameDeadlineIntentContext(
 
 async function lockGeneration(client: DatabaseClient, generationId: string): Promise<void> {
   await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))', [generationId]);
+}
+
+async function workerGenerationId(
+  client: DatabaseClient,
+  claim: ClaimedExecutionIntent,
+): Promise<string> {
+  const row = exactRow(singleRow(await client.query(`SELECT generation_id
+    FROM execution_signed_transactions
+    WHERE intent_id=$1 AND attempt_number=$2::INTEGER`, [
+    claim.intent.id, claim.intent.attemptCount,
+  ])), ['generation_id'] as const);
+  const generationId = text(row.generation_id);
+  if (!/^execution_wallet_generation_[0-9a-f]{64}$/u.test(generationId)) {
+    throw failure('INVALID_DATA');
+  }
+  return generationId;
+}
+
+async function freshDatabaseNow(client: DatabaseClient): Promise<number> {
+  const row = exactRow(singleRow(await client.query(`SELECT
+    trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms`)), [
+    'now_ms',
+  ] as const);
+  return timestampText(row.now_ms);
+}
+
+function assertWorkerClaim(
+  row: Row,
+  claim: ClaimedExecutionIntent,
+  nowMs: number,
+): void {
+  if (row.intent_id !== claim.intent.id
+    || row.intent_status !== claim.intent.status
+    || unsignedBigint(row.intent_revision) !== claim.intent.stateRevision
+    || integer(row.attempt_count) !== claim.intent.attemptCount
+    || row.lease_owner !== claim.leaseOwner
+    || row.lease_token !== claim.leaseToken
+    || row.lease_expires_at_ms === null
+    || timestampText(row.lease_expires_at_ms) <= nowMs) throw failure('LEASE_LOST');
+}
+
+function providerIdentifier(value: unknown): string {
+  const candidate = text(value);
+  if (!PROVIDER_ID.test(candidate)) throw failure('INVALID_DATA');
+  return candidate;
+}
+
+function reconciliationSignature(value: unknown): string {
+  const candidate = text(value);
+  if (candidate.length < 64 || candidate.length > 96
+    || !/^[1-9A-HJ-NP-Za-km-z]+$/u.test(candidate)) throw failure('INVALID_DATA');
+  return candidate;
+}
+
+function solanaAddress(value: unknown): string {
+  const candidate = text(value);
+  if (candidate.length < 32 || candidate.length > 44
+    || !/^[1-9A-HJ-NP-Za-km-z]+$/u.test(candidate)) throw failure('INVALID_DATA');
+  return candidate;
+}
+
+function executionSide(value: unknown): 'BUY' | 'SELL' {
+  if (value !== 'BUY' && value !== 'SELL') throw failure('INVALID_DATA');
+  return value;
+}
+
+function executionVenue(value: unknown): 'PUMP_FUN' | 'PUMP_SWAP' {
+  if (value !== 'PUMP_FUN' && value !== 'PUMP_SWAP') throw failure('INVALID_DATA');
+  return value;
+}
+
+function fingerprintText(value: unknown): string {
+  const candidate = text(value);
+  if (!HASH.test(candidate)) throw failure('INVALID_DATA');
+  return candidate;
+}
+
+function positiveInteger(value: unknown): number {
+  const candidate = integer(value);
+  if (candidate < 1) throw failure('INVALID_DATA');
+  return candidate;
+}
+
+function assertReconciliationExpected(value: Readonly<{
+  readonly intentId: string;
+  readonly attemptNumber: number;
+  readonly walletGeneration: number;
+  readonly providerId: string;
+  readonly side: 'BUY' | 'SELL';
+  readonly signature: string;
+  readonly blockhash: string;
+  readonly lastValidBlockHeight: bigint;
+  readonly messageHash: string;
+  readonly buildFingerprint: string;
+  readonly snapshotFingerprint: string;
+  readonly maximumFeeLamports: bigint;
+  readonly maximumFeePayerLamportDebit: bigint;
+}>): void {
+  try {
+    evaluateExecutionReconciliation({
+      expected: value,
+      observed: Object.freeze({
+        signatureHistory: 'UNKNOWN', confirmationStatus: 'NOT_FOUND',
+        finalizedBlockHeight: 0n, observedSlot: null, transaction: null,
+        feeLamports: 0n, walletLamportDelta: 0n, baseDeltaRaw: 0n,
+        quoteDeltaRaw: 0n, unexpectedResidualTokenBalanceRaw: 0n,
+        observedAtMs: 0, finalizedAtMs: null,
+      }),
+    });
+  } catch {
+    throw failure('INVALID_DATA');
+  }
 }
 
 async function lockProvider(client: DatabaseClient, providerId: string): Promise<void> {

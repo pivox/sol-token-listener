@@ -86,6 +86,238 @@ function signedSimulationEvidence(
   });
 }
 
+void test('worker read-models expose fenced provider-affine inputs without signed bytes',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: live worker read-model integration skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const aboveSafeInteger = 9_007_199_254_740_993n;
+      const fixture = await acceptedBuyFixture(pool, aboveSafeInteger);
+      const live = fixture.live;
+      await clearLease(pool, fixture.claim.intent.id);
+      const intents = new PostgresExecutionIntentRepository(pool);
+      const confirmationClaim = await intents.claim({
+        ownerId: 'confirmation-read-model', leaseMs: 60_000, purpose: 'CONFIRM',
+      });
+      assert.ok(confirmationClaim);
+
+      const readQueries: string[] = [];
+      const reader = new PostgresExecutionLiveRepository({
+        connect: async () => {
+          const client = await pool.connect();
+          return {
+            query: async (text: string, values?: readonly unknown[]) => {
+              readQueries.push(text);
+              const result = await client.query(text, values as unknown[] | undefined);
+              return { rows: result.rows as readonly Readonly<Record<string, unknown>>[],
+                rowCount: result.rowCount };
+            },
+            release: (error?: boolean) => { client.release(error); },
+          };
+        },
+      });
+      const confirmation = await reader.readConfirmationWork(confirmationClaim);
+      assert.deepEqual(confirmation, {
+        payloadVersion: 1,
+        artifactId: fixture.artifact.artifactId,
+        expectedRevision: 3n,
+        signature: fixture.artifact.signature,
+        providerId: 'primary',
+      });
+      await live.recordConfirmation(confirmationClaim, Object.freeze({
+        payloadVersion: 1,
+        artifactId: confirmation.artifactId,
+        expectedRevision: confirmation.expectedRevision,
+        signature: confirmation.signature,
+        observedSlot: 127n,
+        observedAtMs: Date.now() + 2_000,
+      }));
+
+      await clearLease(pool, fixture.claim.intent.id);
+      const reconciliationClaim = await intents.claim({
+        ownerId: 'reconciliation-read-model', leaseMs: 60_000, purpose: 'RECONCILE',
+      });
+      assert.ok(reconciliationClaim);
+      await pool.query(`UPDATE execution_wallet_generations SET
+        retired_at=date_trunc('milliseconds',statement_timestamp())
+        WHERE generation_id=$1`, [generationId]);
+      const reconciliation = await reader.readReconciliationWork(reconciliationClaim);
+      assert.equal(reconciliation.providerId, 'primary');
+      assert.deepEqual(reconciliation.request, {
+        payloadVersion: 1,
+        expected: {
+          intentId: fixture.claim.intent.id,
+          attemptNumber: 1,
+          walletGeneration: 1,
+          providerId: 'primary',
+          side: 'BUY',
+          signature: fixture.artifact.signature,
+          blockhash: fixture.artifact.blockhash,
+          lastValidBlockHeight: aboveSafeInteger,
+          messageHash: fixture.artifact.messageHash,
+          buildFingerprint: fixture.artifact.buildFingerprint,
+          snapshotFingerprint: fixture.artifact.snapshotFingerprint,
+          maximumFeeLamports: fixture.unsignedSimulation.estimatedFeeLamports,
+          maximumFeePayerLamportDebit:
+            fixture.unsignedSimulation.simulatedFeePayerLamportDebit,
+        },
+        walletDeltaRequest: {
+          signature: fixture.artifact.signature,
+          walletPublicKey,
+          mint: walletPublicKey,
+          quoteMint,
+          side: 'BUY',
+        },
+      });
+      const workerQueries = readQueries.filter((query) =>
+        query.includes('execution_live_confirmation_work')
+          || query.includes('execution_live_reconciliation_work'));
+      assert.equal(workerQueries.length, 2);
+      for (const query of workerQueries) {
+        assert.doesNotMatch(query, /signed_transaction_bytes|transaction\.\*/u);
+      }
+    });
+  });
+
+void test('confirmation read-model rechecks the lease after waiting on durable row locks',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: confirmation read-model lease race skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await acceptedBuyFixture(pool);
+      await clearLease(pool, fixture.claim.intent.id);
+      const claim = await new PostgresExecutionIntentRepository(pool).claim({
+        ownerId: 'confirmation-lease-race', leaseMs: 60_000, purpose: 'CONFIRM',
+      });
+      assert.ok(claim);
+      const blocker = await pool.connect();
+      const observer = await pool.connect();
+      let pending: Promise<unknown> | null = null;
+      let blockerReleased = false;
+      try {
+        await blocker.query('BEGIN');
+        const blockerPid = (await blocker.query<{ readonly pid: number }>(
+          'SELECT pg_backend_pid() AS pid',
+        )).rows[0]?.pid;
+        assert.ok(Number.isInteger(blockerPid));
+        await blocker.query('SELECT id FROM execution_intents WHERE id=$1 FOR UPDATE', [
+          claim.intent.id,
+        ]);
+        pending = fixture.live.readConfirmationWork(claim);
+        let blocked = false;
+        for (let attempt = 0; attempt < 100 && !blocked; attempt += 1) {
+          const observed = await observer.query<{ readonly blocked: boolean }>(`SELECT EXISTS (
+            SELECT 1 FROM pg_stat_activity activity
+            WHERE $1::INTEGER = ANY(pg_blocking_pids(activity.pid))
+          ) AS blocked`, [blockerPid]);
+          blocked = observed.rows[0]?.blocked === true;
+          if (!blocked) await observer.query('SELECT pg_sleep(0.01)');
+        }
+        assert.equal(blocked, true, 'confirmation read-model did not wait on the intent lock');
+        await blocker.query(`UPDATE execution_intents SET lease_expires_at=date_trunc(
+          'milliseconds',statement_timestamp()+INTERVAL '100 milliseconds') WHERE id=$1`, [
+          claim.intent.id,
+        ]);
+        await blocker.query('SELECT pg_sleep(0.2)');
+        await blocker.query('COMMIT');
+        blockerReleased = true;
+        await assert.rejects(pending, isLiveRepositoryError('LEASE_LOST'));
+      } finally {
+        if (!blockerReleased) await blocker.query('ROLLBACK');
+        blocker.release();
+        observer.release();
+        if (pending !== null) await pending.catch(() => undefined);
+      }
+      const unchanged = await pool.query(`SELECT
+        (SELECT status FROM execution_intents WHERE id=$1) AS intent_status,
+        (SELECT state FROM execution_signed_transactions WHERE artifact_id=$2) AS artifact_state,
+        (SELECT COUNT(*)::INTEGER FROM execution_submission_events WHERE artifact_id=$2)
+          AS submission_events`, [claim.intent.id, fixture.artifact.artifactId]);
+      assert.deepEqual(unchanged.rows, [{
+        intent_status: 'SUBMITTED', artifact_state: 'ACCEPTED', submission_events: 4,
+      }]);
+    });
+  });
+
+void test('worker read-models reject provider, owner and generation divergence without mutation',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: live worker divergence tests skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await acceptedBuyFixture(pool);
+      await clearLease(pool, fixture.claim.intent.id);
+      const confirmationClaim = await new PostgresExecutionIntentRepository(pool).claim({
+        ownerId: 'confirmation-divergence', leaseMs: 60_000, purpose: 'CONFIRM',
+      });
+      assert.ok(confirmationClaim);
+      await assert.rejects(fixture.live.readConfirmationWork(Object.freeze({
+        ...confirmationClaim, leaseOwner: 'forged-confirmation-owner',
+      })), isLiveRepositoryError('LEASE_LOST'));
+      await pool.query(`UPDATE execution_attempts SET provider_id='secondary'
+        WHERE intent_id=$1 AND attempt_number=1`, [confirmationClaim.intent.id]);
+      await assert.rejects(
+        fixture.live.readConfirmationWork(confirmationClaim),
+        isLiveRepositoryError('INVALID_DATA'),
+      );
+      const unchanged = await pool.query(`SELECT
+        (SELECT status FROM execution_intents WHERE id=$1) AS intent_status,
+        (SELECT state FROM execution_signed_transactions WHERE artifact_id=$2) AS artifact_state,
+        (SELECT COUNT(*)::INTEGER FROM execution_submission_events WHERE artifact_id=$2)
+          AS submission_events`, [confirmationClaim.intent.id, fixture.artifact.artifactId]);
+      assert.deepEqual(unchanged.rows, [{
+        intent_status: 'SUBMITTED', artifact_state: 'ACCEPTED', submission_events: 4,
+      }]);
+    });
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await acceptedBuyFixture(pool);
+      await clearLease(pool, fixture.claim.intent.id);
+      const intents = new PostgresExecutionIntentRepository(pool);
+      const confirmationClaim = await intents.claim({
+        ownerId: 'confirmation-before-generation-divergence',
+        leaseMs: 60_000,
+        purpose: 'CONFIRM',
+      });
+      assert.ok(confirmationClaim);
+      const confirmation = await fixture.live.readConfirmationWork(confirmationClaim);
+      await fixture.live.recordConfirmation(confirmationClaim, Object.freeze({
+        payloadVersion: 1,
+        artifactId: confirmation.artifactId,
+        expectedRevision: confirmation.expectedRevision,
+        signature: confirmation.signature,
+        observedSlot: 127n,
+        observedAtMs: Date.now() + 2_000,
+      }));
+      await clearLease(pool, fixture.claim.intent.id);
+      const reconciliationClaim = await intents.claim({
+        ownerId: 'generation-divergence', leaseMs: 60_000, purpose: 'RECONCILE',
+      });
+      assert.ok(reconciliationClaim);
+      await pool.query(`UPDATE execution_wallet_generations SET wallet_public_key=$2
+        WHERE generation_id=$1`, [generationId, quoteMint]);
+      await assert.rejects(
+        fixture.live.readReconciliationWork(reconciliationClaim),
+        isLiveRepositoryError('INVALID_DATA'),
+      );
+      const unchanged = await pool.query(`SELECT
+        (SELECT status FROM execution_intents WHERE id=$1) AS intent_status,
+        (SELECT state FROM execution_signed_transactions WHERE artifact_id=$2) AS artifact_state,
+        (SELECT COUNT(*)::INTEGER FROM execution_reconciliation_evidence WHERE intent_id=$1)
+          AS evidence_count`, [reconciliationClaim.intent.id, fixture.artifact.artifactId]);
+      assert.deepEqual(unchanged.rows, [{
+        intent_status: 'CONFIRMED', artifact_state: 'CONFIRMED', evidence_count: 0,
+      }]);
+    });
+  });
+
 void test('concurrent BUY persistence locks one armament and replays exact bytes', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -492,6 +724,17 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reasonCode: 'SUBMISSION_AMBIGUOUS',
       observedAtMs: Date.now() + 1_000,
     }));
+    await clearLease(pool, exitBegun.claim.intent.id);
+    const exitReconciliationClaim = await new PostgresExecutionIntentRepository(pool).claim({
+      ownerId: 'live-exit-reconciliation', leaseMs: 60_000, purpose: 'RECONCILE',
+    });
+    assert.ok(exitReconciliationClaim);
+    const exitWork = await repository.readReconciliationWork(exitReconciliationClaim);
+    assert.equal(exitWork.providerId, exitArtifact.providerId);
+    assert.equal(exitWork.request.expected.side, 'SELL');
+    assert.equal(exitWork.request.expected.signature, exitArtifact.signature);
+    assert.equal(exitWork.request.walletDeltaRequest.mint, exitBegun.claim.intent.mint);
+    assert.equal(exitWork.request.walletDeltaRequest.quoteMint, exitBegun.claim.intent.quoteMint);
     const exitObservedAtMs = dueAtMs + 6;
     const exitEvidence = evaluateExecutionReconciliation({
       expected: Object.freeze({
@@ -530,12 +773,12 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       }),
     });
     const exitReconciled = await repository.commitReconciliation(
-      exitBegun.claim,
+      exitReconciliationClaim,
       exitEvidence,
     );
     assert.equal(exitReconciled.result, 'MATCHED');
     const replayedExitReconciliation = await repository.commitReconciliation(
-      exitBegun.claim,
+      exitReconciliationClaim,
       exitEvidence,
     );
     assert.equal(replayedExitReconciliation.result, 'MATCHED');
@@ -1316,6 +1559,7 @@ async function liveFixture(
   pool: InstanceType<typeof pg.Pool>,
   quoteLifetimeMs = 60_000,
   maximumCanaryCapitalLamports = 500_000n,
+  lastValidBlockHeight = 1_000n,
 ) {
   await migrateDatabase({ pool });
   const simulation = await seedSuccessfulSimulation(pool);
@@ -1431,7 +1675,7 @@ async function liveFixture(
     snapshotFingerprint: 'd'.repeat(64), quoteFingerprint: '7'.repeat(64),
     quoteObservedAtMs: nowMs,
     quoteExpiresAtMs: nowMs + quoteLifetimeMs,
-    blockhash: walletPublicKey, lastValidBlockHeight: 1_000n,
+    blockhash: walletPublicKey, lastValidBlockHeight,
     signature: bs58.encode(new Uint8Array(64).fill(8)),
     signedTransactionBytes: bytes, signedAtMs: nowMs + 4,
   });
@@ -1450,6 +1694,55 @@ async function liveFixture(
     qualificationId: qualification.qualificationId,
     reservationId: admitted.reservationId,
   });
+}
+
+async function clearLease(
+  pool: InstanceType<typeof pg.Pool>,
+  intentId: string,
+): Promise<void> {
+  const result = await pool.query(`UPDATE execution_intents SET
+    lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL
+    WHERE id=$1`, [intentId]);
+  assert.equal(result.rowCount, 1);
+}
+
+async function acceptedBuyFixture(
+  pool: InstanceType<typeof pg.Pool>,
+  lastValidBlockHeight = 1_000n,
+) {
+  const fixture = await liveFixture(pool, 60_000, 500_000n, lastValidBlockHeight);
+  const live = new PostgresExecutionLiveRepository(pool);
+  await live.persistSigned(Object.freeze({
+    payloadVersion: 1, claim: fixture.claim,
+    qualificationId: fixture.qualificationId,
+    reservationId: fixture.reservationId,
+    artifact: fixture.artifact,
+    unsignedSimulation: fixture.unsignedSimulation,
+  }));
+  const signed = await live.recordSignedSimulation(
+    fixture.claim,
+    signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
+      simulationSlot: 126n, unitsConsumed: 26_000n,
+      feePayerLamportDebit: 5_500n, baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
+      observedAtMs: fixture.artifact.signedAtMs + 1,
+    }),
+  );
+  const started = await live.beginSubmission({
+    claim: fixture.claim,
+    artifactId: fixture.artifact.artifactId,
+    expectedRevision: signed.stateRevision,
+    ...submissionPreflight(fixture.artifact),
+  });
+  await live.recordSubmissionOutcome(fixture.claim, Object.freeze({
+    payloadVersion: 1,
+    artifactId: fixture.artifact.artifactId,
+    expectedRevision: started.stateRevision,
+    outcome: 'ACCEPTED',
+    returnedSignature: fixture.artifact.signature,
+    reasonCode: 'SUBMISSION_ACCEPTED',
+    observedAtMs: Date.now() + 1_000,
+  }));
+  return Object.freeze({ ...fixture, live });
 }
 
 function safetyQualification(

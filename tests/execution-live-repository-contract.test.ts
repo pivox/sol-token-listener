@@ -15,9 +15,15 @@ void test('live repository port exposes only closed durable lifecycle commands',
     'beginSubmission',
     'recordSubmissionOutcome',
     'recordConfirmation',
+    'readConfirmationWork',
     'commitReconciliation',
+    'readReconciliationWork',
     'createDeadlineExitIntent',
   ]) assert.match(source, new RegExp(`readonly ${method}:|${method}\\(`, 'u'));
+  for (const contract of [
+    'ExecutionLiveConfirmationWorkV1',
+    'ExecutionLiveReconciliationWorkV1',
+  ]) assert.match(source, new RegExp(`interface ${contract}\\b`, 'u'));
   assert.doesNotMatch(
     source,
     /Keypair|sendRawTransaction|sendTransaction|Connection|PRIVATE|SECRET/u,
