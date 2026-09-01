@@ -315,7 +315,27 @@ void test('enforces counter key, value, and entry-count boundaries before loggin
   });
   assert.deepEqual(Object.entries(counters[0] as object), [[key64, Number.MAX_SAFE_INTEGER]]);
 
-  const tooMany = Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`count${index}`, index]));
+  const productionAggregate = Object.fromEntries(
+    Array.from({ length: 66 }, (_, index) => [`count${index}`, index]),
+  );
+  await runRetention(options(), {
+    purge: async () => productionAggregate,
+    closeDatabase: async () => undefined,
+    wait: async () => undefined,
+    log: (entry) => { counters.push(entry.counters); },
+  });
+  assert.equal(Object.keys(counters[1] as object).length, 66);
+
+  const atLimit = Object.fromEntries(Array.from({ length: 128 }, (_, index) => [`count${index}`, index]));
+  await runRetention(options(), {
+    purge: async () => atLimit,
+    closeDatabase: async () => undefined,
+    wait: async () => undefined,
+    log: (entry) => { counters.push(entry.counters); },
+  });
+  assert.equal(Object.keys(counters[2] as object).length, 128);
+
+  const tooMany = Object.fromEntries(Array.from({ length: 129 }, (_, index) => [`count${index}`, index]));
   for (const invalid of [
     { [`a${'b'.repeat(64)}`]: 1 }, { tokenLaunches: -0 }, { tokenLaunches: Number.MAX_SAFE_INTEGER + 1 }, tooMany,
   ]) await assert.rejects(runRetention(options(), dependenciesFor(invalid)), RangeError);

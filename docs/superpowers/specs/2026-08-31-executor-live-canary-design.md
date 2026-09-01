@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.9
+**Version de spécification :** 1.0.10
 
-**Version de la spécification parente :** 1.7.9
+**Version de la spécification parente :** 1.7.10
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.10 — 2026-09-01 :** porte à 128 la capacité bornée du journal agrégé
+  de rétention et intègre explicitement les preuves de simulation non signée
+  et signée dans son contrat canonique. Le worker accepte ainsi les 66
+  compteurs réellement produits tout en conservant une limite stricte.
 - **1.0.9 — 2026-09-01 :** sépare la rétention dans un rôle PostgreSQL
   `NOLOGIN` dédié, limite sa lecture de l'artefact live aux colonnes de cohorte
   sans bytes signés et sérialise la purge par verrou advisory sans privilège

@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.9
+**Version de spécification :** 1.7.10
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.7.10 — 2026-09-01 :** aligne le contrat borné de rétention avec ses 66
+  compteurs effectifs après ajout des preuves live de simulation. La capacité
+  reste explicitement limitée à 128 entrées et le smoke vérifie la liste
+  canonique complète.
 - **1.7.9 — 2026-09-01 :** isole la purge complète dans un rôle PostgreSQL de
   rétention `NOLOGIN`, privé des bytes signés et des mutations d'état métier,
   avec sérialisation transactionnelle par verrou advisory. La reprise live

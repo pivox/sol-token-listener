@@ -12,6 +12,7 @@ const FAULT_PROBE_TIMEOUT_MS = 260_000;
 const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_RETENTION_OUTPUT_BYTES = 16 * 1024;
+const MAX_RETENTION_COUNTERS = 128;
 const MAX_FAILURE_SUMMARY_BYTES = 1_024;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const composeFile = resolve(root, 'deploy/compose.yaml');
@@ -86,6 +87,7 @@ const canonicalRetentionCounters = Object.freeze([
   'executionIntents',
   'executionIntentTransitions',
   'executionLivePositions',
+  'executionLiveUnsignedSimulationEvidence',
   'executionOperatorAuthorizations',
   'executionRiskAdmissionReports',
   'executionRiskFaults',
@@ -97,6 +99,7 @@ const canonicalRetentionCounters = Object.freeze([
   'executionRiskTombstones',
   'executionRiskWalletSnapshots',
   'executionSafetyQualifications',
+  'executionSignedSimulationEvidence',
   'executionSignedTransactions',
   'executionSimulationArtifacts',
   'executionSubmissionEvents',
@@ -901,7 +904,7 @@ async function assertRetentionOneShot() {
   const keys = Object.keys(counters);
   if (
     JSON.stringify(keys) !== JSON.stringify(canonicalRetentionCounters)
-    || keys.length > 64
+    || keys.length > MAX_RETENTION_COUNTERS
     || Object.values(counters).some((value) => !Number.isSafeInteger(value) || value !== 0)
   ) {
     throw new Error('Retention counters are not the expected empty-database aggregate.');

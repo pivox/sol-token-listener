@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js, PostgreSQL, `@solana/web3.js` 1.98.4, SDK officiels Pump.fun/PumpSwap épinglés, `node:test`, RPC local scripté.
 
-**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.9, parent version 1.7.9.
+**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.10, parent version 1.7.10.
 
 ---
 
