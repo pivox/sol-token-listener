@@ -96,10 +96,11 @@ void test('deadline scanner uses one PostgreSQL clock, exact deadline and oldest
     await withTemporarySchema(databaseUrl, async (pool) => {
       const fixture = await openPositionFixture(pool);
       assert.equal(await fixture.live.createNextDeadlineExitIntent(), null);
+      const dueAtMs = await makePositionDue(pool, fixture.position.positionId);
 
       const queries: string[] = [];
       const scanner = deadlineClockRepository(
-        pool, fixture.position.exitDeadlineAtMs, Object.freeze({ queries }),
+        pool, dueAtMs, Object.freeze({ queries }),
       );
       const result = await scanner.createNextDeadlineExitIntent();
       assert.equal(result?.kind, 'CREATED');
@@ -107,7 +108,7 @@ void test('deadline scanner uses one PostgreSQL clock, exact deadline and oldest
       assert.equal(result?.intent?.logicalCommandId,
         `maximum-holding:${fixture.position.positionId}`);
       assert.equal(result?.intent?.baseAmountRaw, fixture.position.baseAmountRaw);
-      assert.equal(result?.intent?.requestedAtMs, fixture.position.exitDeadlineAtMs);
+      assert.equal(result?.intent?.requestedAtMs, dueAtMs);
       assert.equal((result?.intent?.expiresAtMs ?? 0) - (result?.intent?.requestedAtMs ?? 0),
         120_000);
 
@@ -137,7 +138,8 @@ void test('two concurrent deadline scanners create one deterministic SELL intent
     }
     await withTemporarySchema(databaseUrl, async (pool) => {
       const fixture = await openPositionFixture(pool);
-      const scanner = deadlineClockRepository(pool, fixture.position.exitDeadlineAtMs);
+      const dueAtMs = await makePositionDue(pool, fixture.position.positionId);
+      const scanner = deadlineClockRepository(pool, dueAtMs);
       const results = await Promise.all([
         scanner.createNextDeadlineExitIntent(),
         scanner.createNextDeadlineExitIntent(),
@@ -163,22 +165,38 @@ void test('deadline scanner commit-unknown retries safely through durable target
     }
     await withTemporarySchema(databaseUrl, async (pool) => {
       const fixture = await openPositionFixture(pool);
-      const uncertain = deadlineClockRepository(pool, fixture.position.exitDeadlineAtMs,
+      const before = await pool.query<{ readonly state_revision: string }>(`SELECT
+        state_revision::TEXT AS state_revision FROM execution_live_positions WHERE position_id=$1`, [
+        fixture.position.positionId,
+      ]);
+      const initialRevision = BigInt(before.rows[0]?.state_revision ?? '-1');
+      const dueAtMs = await makePositionDue(pool, fixture.position.positionId);
+      const uncertain = deadlineClockRepository(pool, dueAtMs,
         Object.freeze({ failFirstCommitAfterSuccess: true }));
       await assert.rejects(
         uncertain.createNextDeadlineExitIntent(),
         isLiveRepositoryError('COMMIT_OUTCOME_UNKNOWN'),
       );
       assert.equal(
-        await deadlineClockRepository(pool, fixture.position.exitDeadlineAtMs)
+        await deadlineClockRepository(pool, dueAtMs)
           .createNextDeadlineExitIntent(),
         null,
       );
+      const committed = await pool.query<{
+        readonly state: string;
+        readonly state_revision: string;
+        readonly exit_intent_id: string | null;
+      }>(`SELECT state,state_revision::TEXT AS state_revision,exit_intent_id
+        FROM execution_live_positions WHERE position_id=$1`, [fixture.position.positionId]);
+      assert.equal(committed.rows[0]?.state, 'EXIT_PENDING');
+      assert.equal(BigInt(committed.rows[0]?.state_revision ?? '-1'), initialRevision + 1n);
+      assert.match(committed.rows[0]?.exit_intent_id ?? '', /^execution_intent_[0-9a-f]{64}$/u);
       const replay = await fixture.live.createDeadlineExitIntent({
         positionId: fixture.position.positionId,
-        observedAtMs: fixture.position.exitDeadlineAtMs + 1,
+        observedAtMs: dueAtMs,
       });
       assert.equal(replay.kind, 'REPLAYED');
+      assert.equal(replay.intent?.id, committed.rows[0]?.exit_intent_id);
       const count = await pool.query<{ readonly count: number }>(`SELECT COUNT(*)::INTEGER AS count
         FROM execution_intents WHERE logical_command_id=$1`, [
         `maximum-holding:${fixture.position.positionId}`,
@@ -196,17 +214,18 @@ void test('targeted deadline creation wins safely while a scanner waits on its g
     }
     await withTemporarySchema(databaseUrl, async (pool) => {
       const fixture = await openPositionFixture(pool);
+      const dueAtMs = await makePositionDue(pool, fixture.position.positionId);
       const blocker = await pool.connect();
       let scanner: Promise<unknown> | null = null;
       try {
         await blocker.query('BEGIN');
         await blocker.query(`SELECT pg_advisory_xact_lock(
           hashtextextended('execution-live-deadline-scan:v1', 51007))`);
-        scanner = deadlineClockRepository(pool, fixture.position.exitDeadlineAtMs)
+        scanner = deadlineClockRepository(pool, dueAtMs)
           .createNextDeadlineExitIntent();
         const targeted = await fixture.live.createDeadlineExitIntent({
           positionId: fixture.position.positionId,
-          observedAtMs: fixture.position.exitDeadlineAtMs,
+          observedAtMs: dueAtMs,
         });
         assert.equal(targeted.kind, 'CREATED');
         await blocker.query('COMMIT');
@@ -216,6 +235,189 @@ void test('targeted deadline creation wins safely while a scanner waits on its g
         blocker.release();
         if (scanner !== null) await scanner.catch(() => undefined);
       }
+    });
+  });
+
+void test('targeted deadline creation rejects a caller timestamp ahead of fresh PostgreSQL time',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: future deadline timestamp test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await openPositionFixture(pool);
+      const nowMs = await databaseNowMs(pool);
+      const futureObservedAtMs = Math.max(nowMs, fixture.position.exitDeadlineAtMs) + 60_000;
+      await assert.rejects(
+        fixture.live.createDeadlineExitIntent({
+          positionId: fixture.position.positionId,
+          observedAtMs: futureObservedAtMs,
+        }),
+        isLiveRepositoryError('INVALID_INPUT'),
+      );
+      const durable = await pool.query(`SELECT state,state_revision::TEXT AS state_revision,
+        exit_intent_id FROM execution_live_positions WHERE position_id=$1`, [
+        fixture.position.positionId,
+      ]);
+      assert.deepEqual(durable.rows, [{
+        state: 'OPEN', state_revision: '0', exit_intent_id: null,
+      }]);
+    });
+  });
+
+void test('targeted deadline replay never widens its caller-provided observation bound',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: stable deadline replay bound test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await openPositionFixture(pool);
+      const dueAtMs = await makePositionDue(pool, fixture.position.positionId);
+      const created = await fixture.live.createDeadlineExitIntent({
+        positionId: fixture.position.positionId,
+        observedAtMs: dueAtMs + 2_000,
+      });
+      assert.equal(created.kind, 'CREATED');
+      await assert.rejects(
+        fixture.live.createDeadlineExitIntent({
+          positionId: fixture.position.positionId,
+          observedAtMs: dueAtMs + 1_000,
+        }),
+        isLiveRepositoryError('INVALID_DATA'),
+      );
+      const exactReplay = await fixture.live.createDeadlineExitIntent({
+        positionId: fixture.position.positionId,
+        observedAtMs: dueAtMs + 2_000,
+      });
+      assert.equal(exactReplay.kind, 'REPLAYED');
+      assert.equal(exactReplay.intent?.id, created.intent?.id);
+    });
+  });
+
+void test('scanner queued before targeted creation yields one CREATED and one stable REPLAYED',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: scanner targeted generation race skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await openPositionFixture(pool);
+      const dueAtMs = await makePositionDue(pool, fixture.position.positionId);
+      const selected = deferred<true>();
+      const blocker = await pool.connect();
+      const observer = await pool.connect();
+      let released = false;
+      try {
+        await blocker.query('BEGIN');
+        const blockerPid = (await blocker.query<{ readonly pid: number }>(
+          'SELECT pg_backend_pid() AS pid',
+        )).rows[0]?.pid;
+        assert.ok(Number.isInteger(blockerPid));
+        await blocker.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))', [
+          generationId,
+        ]);
+        const scanner = deadlineClockRepository(pool, dueAtMs, Object.freeze({
+          onCandidateSelected: () => { selected.resolve(true); },
+        })).createNextDeadlineExitIntent();
+        await selected.promise;
+        const targeted = fixture.live.createDeadlineExitIntent({
+          positionId: fixture.position.positionId,
+          observedAtMs: dueAtMs,
+        });
+        let queuedWorkers = 0;
+        for (let attempt = 0; attempt < 100 && queuedWorkers < 2; attempt += 1) {
+          const observed = await observer.query<{ readonly queued_workers: number }>(`SELECT
+            COUNT(*)::INTEGER AS queued_workers FROM pg_stat_activity activity
+            WHERE $1::INTEGER = ANY(pg_blocking_pids(activity.pid))`, [blockerPid]);
+          queuedWorkers = observed.rows[0]?.queued_workers ?? 0;
+          if (queuedWorkers < 2) await observer.query('SELECT pg_sleep(0.01)');
+        }
+        assert.equal(queuedWorkers, 2);
+        await blocker.query('COMMIT');
+        released = true;
+        const results = await Promise.all([scanner, targeted]);
+        assert.deepEqual(results.map((result) => result?.kind).sort(), ['CREATED', 'REPLAYED']);
+        assert.equal(results[0]?.intent?.id, results[1]?.intent?.id);
+      } finally {
+        if (!released) await blocker.query('ROLLBACK');
+        blocker.release();
+        observer.release();
+      }
+    });
+  });
+
+void test('deadline scanner selects the oldest of two due PostgreSQL candidates',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: two-candidate deadline ordering test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await openPositionFixture(pool);
+      const nowMs = await databaseNowMs(pool);
+      const oldestDeadlineMs = nowMs - 60_000;
+      const newerDeadlineMs = nowMs - 30_000;
+      await setPositionDeadline(pool, fixture.position.positionId, oldestDeadlineMs);
+      const newerPositionId = `execution_live_position_${'b'.repeat(64)}`;
+      const newerGenerationId = `execution_wallet_generation_${'b'.repeat(64)}`;
+      await pool.query(`UPDATE execution_wallet_generations SET
+        retired_at=date_trunc('milliseconds',statement_timestamp()) WHERE generation_id=$1`, [
+        generationId,
+      ]);
+      await pool.query(`INSERT INTO execution_wallet_generations (
+        generation_id,payload_version,wallet_public_key,cluster,genesis_hash,generation
+      ) VALUES ($1,1,$2,'mainnet-beta',$2,1)`, [newerGenerationId, quoteMint]);
+      const newerBuy = createExecutionIntentDraft({
+        strategyId: 'deadline-ordering-fixture',
+        strategyVersion: 1,
+        positionId: 'deadline-ordering-fixture-position',
+        logicalCommandId: 'deadline-ordering-fixture-buy',
+        mint: walletPublicKey,
+        side: 'BUY',
+        venuePolicy: 'PUMP_FUN_ONLY',
+        quoteMint,
+        quoteTokenProgram: 'SPL_TOKEN',
+        quoteDecimals: 9,
+        quoteAmountRaw: 1n,
+        baseAmountRaw: null,
+        minimumAmountOutRaw: 1n,
+        decisionEventId: 'deadline-ordering-fixture-event',
+        decisionFingerprint: 'd'.repeat(64),
+        requestedAtMs: nowMs - 120_000,
+        expiresAtMs: nowMs + 120_000,
+      });
+      await new PostgresExecutionIntentRepository(pool).create(newerBuy);
+      await pool.query(`INSERT INTO execution_live_positions (
+        position_id,payload_version,buy_intent_id,generation_id,armament_id,wallet_public_key,
+        mint,quote_mint,entry_venue,quote_cost_raw,base_amount_raw,remaining_base_raw,
+        fee_lamports,maximum_holding_ms,opened_at,exit_deadline_at,
+        entry_reconciliation_fingerprint,state,state_revision
+      ) SELECT $2,1,$6,$3,armament_id,$4,mint,quote_mint,entry_venue,
+        quote_cost_raw,base_amount_raw,remaining_base_raw,fee_lamports,maximum_holding_ms,
+        TIMESTAMPTZ 'epoch'+(($5::BIGINT-maximum_holding_ms)*INTERVAL '1 millisecond'),
+        TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond'),
+        entry_reconciliation_fingerprint,'OPEN',0
+        FROM execution_live_positions WHERE position_id=$1`, [
+        fixture.position.positionId, newerPositionId, newerGenerationId, quoteMint, newerDeadlineMs,
+        newerBuy.id,
+      ]);
+
+      const result = await fixture.live.createNextDeadlineExitIntent();
+      assert.equal(result?.kind, 'CREATED');
+      assert.equal(result?.intent?.positionId, fixture.position.positionId);
+      const states = await pool.query(`SELECT position_id,state FROM execution_live_positions
+        WHERE position_id=ANY($1::TEXT[])`, [[
+        fixture.position.positionId, newerPositionId,
+      ]]);
+      assert.deepEqual(Object.fromEntries(states.rows.map((row) => [row.position_id, row.state])), {
+        [fixture.position.positionId]: 'EXIT_PENDING',
+        [newerPositionId]: 'OPEN',
+      });
     });
   });
 
@@ -395,6 +597,19 @@ void test('worker read-models reject provider, owner and generation divergence w
       await assert.rejects(fixture.live.readConfirmationWork(Object.freeze({
         ...confirmationClaim, leaseOwner: 'forged-confirmation-owner',
       })), isLiveRepositoryError('LEASE_LOST'));
+      await assert.rejects(fixture.live.readConfirmationWork(Object.freeze({
+        ...confirmationClaim, leaseToken: randomUUID(),
+      })), isLiveRepositoryError('LEASE_LOST'));
+      await pool.query('UPDATE execution_intents SET attempt_count=2 WHERE id=$1', [
+        confirmationClaim.intent.id,
+      ]);
+      await assert.rejects(
+        fixture.live.readConfirmationWork(confirmationClaim),
+        isLiveRepositoryError('CONFLICT'),
+      );
+      await pool.query('UPDATE execution_intents SET attempt_count=1 WHERE id=$1', [
+        confirmationClaim.intent.id,
+      ]);
       await pool.query(`UPDATE execution_attempts SET provider_id='secondary'
         WHERE intent_id=$1 AND attempt_number=1`, [confirmationClaim.intent.id]);
       await assert.rejects(
@@ -448,6 +663,117 @@ void test('worker read-models reject provider, owner and generation divergence w
       assert.deepEqual(unchanged.rows, [{
         intent_status: 'CONFIRMED', artifact_state: 'CONFIRMED', evidence_count: 0,
       }]);
+    });
+  });
+
+void test('confirmation read-model rejects a causally divergent artifact identity',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: artifact identity divergence test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await acceptedBuyFixture(pool);
+      await clearLease(pool, fixture.claim.intent.id);
+      const claim = await new PostgresExecutionIntentRepository(pool).claim({
+        ownerId: 'artifact-identity-divergence', leaseMs: 60_000, purpose: 'CONFIRM',
+      });
+      assert.ok(claim);
+      await disableSignedTransactionUpdateGuards(pool);
+      const divergentMessageHash = 'd'.repeat(64);
+      await pool.query(`UPDATE execution_signed_transactions SET message_hash=$2
+        WHERE artifact_id=$1`, [fixture.artifact.artifactId, divergentMessageHash]);
+      await pool.query(`UPDATE execution_attempts SET reconciliation_message_hash=$2
+        WHERE intent_id=$1 AND attempt_number=1`, [claim.intent.id, divergentMessageHash]);
+
+      await assert.rejects(
+        fixture.live.readConfirmationWork(claim),
+        isLiveRepositoryError('INVALID_DATA'),
+      );
+    });
+  });
+
+void test('confirmation read-model rejects a non-canonical 64-byte signature encoding',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: canonical signature test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await acceptedBuyFixture(pool);
+      await clearLease(pool, fixture.claim.intent.id);
+      const claim = await new PostgresExecutionIntentRepository(pool).claim({
+        ownerId: 'non-canonical-signature', leaseMs: 60_000, purpose: 'CONFIRM',
+      });
+      assert.ok(claim);
+      const nonCanonicalSignature = 'z'.repeat(64);
+      assert.notEqual(bs58.decode(nonCanonicalSignature).byteLength, 64);
+      await disableSignedTransactionUpdateGuards(pool);
+      await pool.query(`UPDATE execution_signed_transactions SET signature=$2
+        WHERE artifact_id=$1`, [fixture.artifact.artifactId, nonCanonicalSignature]);
+      await pool.query(`UPDATE execution_attempts SET reconciliation_signature=$2
+        WHERE intent_id=$1 AND attempt_number=1`, [claim.intent.id, nonCanonicalSignature]);
+
+      await assert.rejects(
+        fixture.live.readConfirmationWork(claim),
+        isLiveRepositoryError('INVALID_DATA'),
+      );
+    });
+  });
+
+void test('reconciliation read-model rejects non-canonical Solana keys and blockhashes',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: canonical Solana identity test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const { fixture, claim } = await confirmedBuyReconciliationFixture(pool);
+      const nonCanonicalPublicKey = 'z'.repeat(32);
+      assert.notEqual(bs58.decode(nonCanonicalPublicKey).byteLength, 32);
+      await pool.query('UPDATE execution_intents SET mint=$2 WHERE id=$1', [
+        claim.intent.id, nonCanonicalPublicKey,
+      ]);
+      await assert.rejects(
+        fixture.live.readReconciliationWork(claim),
+        isLiveRepositoryError('INVALID_DATA'),
+      );
+    });
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const { fixture, claim } = await confirmedBuyReconciliationFixture(pool);
+      const nonCanonicalBlockhash = 'z'.repeat(32);
+      assert.notEqual(bs58.decode(nonCanonicalBlockhash).byteLength, 32);
+      await disableSignedTransactionUpdateGuards(pool);
+      await pool.query(`UPDATE execution_signed_transactions SET blockhash=$2
+        WHERE artifact_id=$1`, [fixture.artifact.artifactId, nonCanonicalBlockhash]);
+      await pool.query(`UPDATE execution_attempts SET reconciliation_blockhash=$2
+        WHERE intent_id=$1 AND attempt_number=1`, [claim.intent.id, nonCanonicalBlockhash]);
+      await assert.rejects(
+        fixture.live.readReconciliationWork(claim),
+        isLiveRepositoryError('INVALID_DATA'),
+      );
+    });
+  });
+
+void test('reconciliation read-model enforces the durable intent and artifact state matrix',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: worker state matrix test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const { fixture, claim } = await confirmedBuyReconciliationFixture(pool);
+      await disableSignedTransactionUpdateGuards(pool);
+      await pool.query(`UPDATE execution_signed_transactions SET state='ACCEPTED'
+        WHERE artifact_id=$1`, [fixture.artifact.artifactId]);
+      await assert.rejects(
+        fixture.live.readReconciliationWork(claim),
+        isLiveRepositoryError('INVALID_DATA'),
+      );
     });
   });
 
@@ -598,7 +924,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       outcome: 'ACCEPTED',
       returnedSignature: fixture.artifact.signature,
       reasonCode: 'SUBMISSION_ACCEPTED',
-      observedAtMs: Date.now() + 1_000,
+      observedAtMs: Date.now(),
     }));
     const accepted = await pool.query(`SELECT
       (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS artifact_state,
@@ -619,7 +945,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       expectedRevision: 3n,
       signature: fixture.artifact.signature,
       observedSlot: 127n,
-      observedAtMs: Date.now() + 2_000,
+      observedAtMs: Date.now(),
     } as const);
     await repository.recordConfirmation(fixture.claim, entryConfirmation);
     await repository.recordConfirmation(fixture.claim, entryConfirmation);
@@ -636,6 +962,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       artifact_state: 'CONFIRMED', artifact_revision: '4',
       intent_status: 'CONFIRMED', submission_events: 5,
     }]);
+    const entryReconciliationAtMs = Date.now();
     const reconciliation = evaluateExecutionReconciliation({
       expected: Object.freeze({
         intentId: fixture.claim.intent.id,
@@ -670,8 +997,8 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
         baseDeltaRaw: 95n,
         quoteDeltaRaw: -1_000n,
         unexpectedResidualTokenBalanceRaw: 0n,
-        observedAtMs: Date.now() + 3_000,
-        finalizedAtMs: Date.now() + 4_000,
+        observedAtMs: entryReconciliationAtMs,
+        finalizedAtMs: entryReconciliationAtMs,
       }),
     });
     const reconciled = await repository.commitReconciliation(
@@ -708,12 +1035,12 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       position_state: 'OPEN', authorization_state: 'ACTIVE',
     }]);
     assert.ok(reconciled.position);
+    const dueAtMs = await makePositionDue(pool, reconciled.position.positionId);
     const notDue = await repository.createDeadlineExitIntent({
       positionId: reconciled.position.positionId,
-      observedAtMs: reconciled.position.exitDeadlineAtMs - 1,
+      observedAtMs: dueAtMs - 1,
     });
     assert.equal(notDue.kind, 'NOT_DUE');
-    const dueAtMs = reconciled.position.exitDeadlineAtMs;
     const concurrentExits = await Promise.all([
       repository.createDeadlineExitIntent({
         positionId: reconciled.position.positionId,
@@ -780,6 +1107,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
     const exitBegun = await new PostgresExecutionIntentRepository(pool).beginAttempt(
       Object.freeze({ ...exitClaimed, intent: exitProcessing }),
     );
+    const sellLastValidBlockHeight = 9_007_199_254_740_993n;
     const exitArtifact = createSignedTransactionArtifact({
       payloadVersion: 1,
       specificationVersion: 1,
@@ -800,7 +1128,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       quoteObservedAtMs: exitTimelineMs,
       quoteExpiresAtMs: exitTimelineMs + 60_000,
       blockhash: walletPublicKey,
-      lastValidBlockHeight: 2_000n,
+      lastValidBlockHeight: sellLastValidBlockHeight,
       signature: bs58.encode(new Uint8Array(64).fill(10)),
       signedTransactionBytes: Uint8Array.from([5, 6, 7, 8]),
       signedAtMs: exitTimelineMs + 1,
@@ -855,7 +1183,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       outcome: 'AMBIGUOUS',
       returnedSignature: null,
       reasonCode: 'SUBMISSION_AMBIGUOUS',
-      observedAtMs: Date.now() + 1_000,
+      observedAtMs: Date.now(),
     }));
     await clearLease(pool, exitBegun.claim.intent.id);
     const exitReconciliationClaim = await new PostgresExecutionIntentRepository(pool).claim({
@@ -866,9 +1194,10 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
     assert.equal(exitWork.providerId, exitArtifact.providerId);
     assert.equal(exitWork.request.expected.side, 'SELL');
     assert.equal(exitWork.request.expected.signature, exitArtifact.signature);
+    assert.equal(exitWork.request.expected.lastValidBlockHeight, sellLastValidBlockHeight);
     assert.equal(exitWork.request.walletDeltaRequest.mint, exitBegun.claim.intent.mint);
     assert.equal(exitWork.request.walletDeltaRequest.quoteMint, exitBegun.claim.intent.quoteMint);
-    const exitObservedAtMs = dueAtMs + 6;
+    const exitObservedAtMs = Date.now();
     const exitEvidence = evaluateExecutionReconciliation({
       expected: Object.freeze({
         intentId: exitArtifact.intentId,
@@ -888,7 +1217,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       }),
       observed: Object.freeze({
         signatureHistory: 'PRESENT', confirmationStatus: 'FINALIZED',
-        finalizedBlockHeight: 2_001n, observedSlot: 204n,
+        finalizedBlockHeight: sellLastValidBlockHeight + 1n, observedSlot: 204n,
         transaction: Object.freeze({
           signature: exitArtifact.signature,
           blockhash: exitArtifact.blockhash,
@@ -1878,6 +2207,42 @@ async function acceptedBuyFixture(
   return Object.freeze({ ...fixture, live });
 }
 
+async function confirmedBuyReconciliationFixture(pool: InstanceType<typeof pg.Pool>) {
+  const fixture = await acceptedBuyFixture(pool);
+  const intents = new PostgresExecutionIntentRepository(pool);
+  await clearLease(pool, fixture.claim.intent.id);
+  const confirmationClaim = await intents.claim({
+    ownerId: 'prepare-confirmed-buy', leaseMs: 60_000, purpose: 'CONFIRM',
+  });
+  assert.ok(confirmationClaim);
+  const confirmation = await fixture.live.readConfirmationWork(confirmationClaim);
+  await fixture.live.recordConfirmation(confirmationClaim, Object.freeze({
+    payloadVersion: 1,
+    artifactId: confirmation.artifactId,
+    expectedRevision: confirmation.expectedRevision,
+    signature: confirmation.signature,
+    observedSlot: 127n,
+    observedAtMs: Date.now() + 2_000,
+  }));
+  await clearLease(pool, fixture.claim.intent.id);
+  const claim = await intents.claim({
+    ownerId: 'reconcile-confirmed-buy', leaseMs: 60_000, purpose: 'RECONCILE',
+  });
+  assert.ok(claim);
+  return Object.freeze({ fixture, claim });
+}
+
+async function disableSignedTransactionUpdateGuards(
+  pool: InstanceType<typeof pg.Pool>,
+): Promise<void> {
+  await pool.query(`ALTER TABLE execution_signed_transactions
+    DISABLE TRIGGER execution_signed_transactions_guarded_update`);
+  await pool.query(`ALTER TABLE execution_signed_transactions
+    DISABLE TRIGGER execution_signed_transactions_event_required`);
+  await pool.query(`ALTER TABLE execution_attempts
+    DISABLE TRIGGER execution_attempt_expectation_immutable`);
+}
+
 async function openPositionFixture(pool: InstanceType<typeof pg.Pool>) {
   const fixture = await acceptedBuyFixture(pool);
   const intents = new PostgresExecutionIntentRepository(pool);
@@ -1933,6 +2298,7 @@ function deadlineClockRepository(
   options: Readonly<{
     readonly queries?: string[];
     readonly failFirstCommitAfterSuccess?: boolean;
+    readonly onCandidateSelected?: () => void;
   }> = {},
 ): PostgresExecutionLiveRepository {
   let failCommit = options.failFirstCommitAfterSuccess === true;
@@ -1946,6 +2312,8 @@ function deadlineClockRepository(
             return { rows: [{ deadline_clock_ms: String(deadlineClockMs) }], rowCount: 1 };
           }
           const result = await client.query(text, values as unknown[] | undefined);
+          if (text.includes('ORDER BY position.exit_deadline_at ASC,position.position_id ASC LIMIT 1')
+            && result.rows.length === 1) options.onCandidateSelected?.();
           if (text === 'COMMIT' && failCommit) {
             failCommit = false;
             throw new Error('simulated deadline commit acknowledgement loss');
@@ -1957,6 +2325,53 @@ function deadlineClockRepository(
         },
         release: (error?: boolean) => { client.release(error); },
       };
+    },
+  });
+}
+
+async function databaseNowMs(pool: InstanceType<typeof pg.Pool>): Promise<number> {
+  const result = await pool.query<{ readonly now_ms: string }>(`SELECT
+    trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
+      AS now_ms`);
+  const nowMs = Number(result.rows[0]?.now_ms);
+  assert.ok(Number.isSafeInteger(nowMs));
+  return nowMs;
+}
+
+async function makePositionDue(
+  pool: InstanceType<typeof pg.Pool>,
+  positionId: string,
+): Promise<number> {
+  const dueAtMs = (await databaseNowMs(pool)) - 60_000;
+  await setPositionDeadline(pool, positionId, dueAtMs);
+  return dueAtMs;
+}
+
+async function setPositionDeadline(
+  pool: InstanceType<typeof pg.Pool>,
+  positionId: string,
+  deadlineAtMs: number,
+): Promise<void> {
+  await pool.query(`ALTER TABLE execution_live_positions
+    DISABLE TRIGGER execution_live_positions_guarded_update`);
+  const updated = await pool.query(`UPDATE execution_live_positions SET
+    opened_at=TIMESTAMPTZ 'epoch'+(($2::BIGINT-maximum_holding_ms)*INTERVAL '1 millisecond'),
+    exit_deadline_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond')
+    WHERE position_id=$1`, [positionId, deadlineAtMs]);
+  assert.equal(updated.rowCount, 1);
+}
+
+function deferred<TValue>(): Readonly<{
+  readonly promise: Promise<TValue>;
+  readonly resolve: (value: TValue) => void;
+}> {
+  let resolvePromise: ((value: TValue) => void) | undefined;
+  const promise = new Promise<TValue>((resolve) => { resolvePromise = resolve; });
+  return Object.freeze({
+    promise,
+    resolve: (value: TValue) => {
+      assert.ok(resolvePromise !== undefined);
+      resolvePromise(value);
     },
   });
 }

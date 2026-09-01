@@ -1582,6 +1582,30 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     assert.equal(required(concurrent.find((claim) => claim !== null)).intent.id, concurrentSell.id);
     await firstPool.query('DELETE FROM execution_intents WHERE id=$1', [concurrentSell.id]);
 
+    const racedBuy = executionDraft('live-raced-buy', {
+      requestedAtMs: now - 2_000, expiresAtMs: now + 120_000,
+    });
+    const racedSell = executionDraft('live-raced-sell', {
+      ...sellShape, requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+    });
+    await first.create(racedBuy);
+    await first.create(racedSell);
+    const [racedBuyClaim, racedSellClaim] = await Promise.all([
+      first.claim({
+        ownerId: 'live-raced-buy-worker', leaseMs: 60_000,
+        purpose: 'LIVE_EXECUTE', side: 'BUY',
+      }),
+      second.claim({
+        ownerId: 'live-raced-sell-worker', leaseMs: 60_000,
+        purpose: 'LIVE_EXECUTE', side: 'SELL',
+      }),
+    ]);
+    assert.equal(racedBuyClaim, null);
+    assert.equal(racedSellClaim?.intent.id, racedSell.id);
+    await firstPool.query('DELETE FROM execution_intents WHERE id=ANY($1::TEXT[])', [[
+      racedBuy.id, racedSell.id,
+    ]]);
+
     const recoverBlockingBuy = executionDraft('live-recover-blocked-buy', {
       requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
     });

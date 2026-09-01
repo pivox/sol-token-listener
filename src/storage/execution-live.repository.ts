@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
+import bs58 from 'bs58';
 import type pg from 'pg';
 import {
   createExecutionExitAuthorization,
   createExecutionLivePosition,
   createSignedTransactionArtifact,
+  createSignedTransactionArtifactId,
   type ExecutionExitAuthorizationState,
   type ExecutionExitAuthorizationV1,
   type ExecutionLivePositionState,
@@ -638,6 +640,12 @@ export class PostgresExecutionLiveRepository {
         transaction.artifact_id,transaction.intent_id AS artifact_intent_id,
         transaction.attempt_number AS artifact_attempt_number,
         transaction.generation_id,transaction.provider_id AS artifact_provider_id,
+        transaction.reservation_id AS artifact_reservation_id,
+        transaction.message_hash AS artifact_message_hash,
+        trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
+          AS artifact_quote_observed_at_ms,
+        trunc(EXTRACT(EPOCH FROM transaction.quote_expires_at)*1000)::TEXT
+          AS artifact_quote_expires_at_ms,
         transaction.signature AS artifact_signature,transaction.state AS artifact_state,
         transaction.state_revision::TEXT AS artifact_revision
         FROM execution_intents intent
@@ -651,7 +659,9 @@ export class PostgresExecutionLiveRepository {
         'lease_token', 'lease_expires_at_ms', 'attempt_intent_id', 'attempt_number',
         'attempt_status', 'attempt_provider_id', 'reconciliation_signature', 'artifact_id',
         'artifact_intent_id', 'artifact_attempt_number', 'generation_id',
-        'artifact_provider_id', 'artifact_signature', 'artifact_state', 'artifact_revision',
+        'artifact_provider_id', 'artifact_reservation_id', 'artifact_message_hash',
+        'artifact_quote_observed_at_ms', 'artifact_quote_expires_at_ms',
+        'artifact_signature', 'artifact_state', 'artifact_revision',
       ] as const);
       const nowMs = await freshDatabaseNow(client);
       assertWorkerClaim(row, claim, nowMs);
@@ -659,6 +669,7 @@ export class PostgresExecutionLiveRepository {
       const providerId = providerIdentifier(row.artifact_provider_id);
       const signature = reconciliationSignature(row.artifact_signature);
       const artifactId = text(row.artifact_id);
+      assertCausalArtifactId(row, artifactId, claim.intent.id, attemptNumber, generationId, signature);
       if (!ARTIFACT_ID.test(artifactId)
         || row.attempt_intent_id !== claim.intent.id
         || row.artifact_intent_id !== claim.intent.id
@@ -714,6 +725,7 @@ export class PostgresExecutionLiveRepository {
         transaction.attempt_number AS artifact_attempt_number,
         transaction.generation_id AS artifact_generation_id,
         transaction.provider_id AS artifact_provider_id,
+        transaction.reservation_id AS artifact_reservation_id,
         transaction.wallet_public_key AS artifact_wallet_public_key,
         transaction.side AS artifact_side,
         transaction.effective_venue AS artifact_effective_venue,
@@ -723,6 +735,10 @@ export class PostgresExecutionLiveRepository {
         transaction.message_hash AS artifact_message_hash,
         transaction.build_fingerprint AS artifact_build_fingerprint,
         transaction.snapshot_fingerprint AS artifact_snapshot_fingerprint,
+        trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
+          AS artifact_quote_observed_at_ms,
+        trunc(EXTRACT(EPOCH FROM transaction.quote_expires_at)*1000)::TEXT
+          AS artifact_quote_expires_at_ms,
         transaction.state AS artifact_state,
         transaction.state_revision::TEXT AS artifact_revision,
         generation.generation_id,generation.payload_version AS generation_payload_version,
@@ -746,10 +762,11 @@ export class PostgresExecutionLiveRepository {
         'reconciliation_maximum_fee_lamports',
         'reconciliation_maximum_fee_payer_lamport_debit', 'artifact_id',
         'artifact_intent_id', 'artifact_attempt_number', 'artifact_generation_id',
-        'artifact_provider_id', 'artifact_wallet_public_key', 'artifact_side',
+        'artifact_provider_id', 'artifact_reservation_id', 'artifact_wallet_public_key', 'artifact_side',
         'artifact_effective_venue', 'artifact_signature', 'artifact_blockhash',
         'artifact_last_valid_block_height', 'artifact_message_hash',
-        'artifact_build_fingerprint', 'artifact_snapshot_fingerprint', 'artifact_state',
+        'artifact_build_fingerprint', 'artifact_snapshot_fingerprint',
+        'artifact_quote_observed_at_ms', 'artifact_quote_expires_at_ms', 'artifact_state',
         'artifact_revision', 'generation_id', 'generation_payload_version',
         'generation_wallet_public_key', 'generation',
       ] as const);
@@ -782,6 +799,7 @@ export class PostgresExecutionLiveRepository {
       assertReconciliationExpected(expected);
       const artifactId = text(row.artifact_id);
       const effectiveVenue = executionVenue(row.artifact_effective_venue);
+      assertCausalArtifactId(row, artifactId, claim.intent.id, attemptNumber, generationId, signature);
       if (!ARTIFACT_ID.test(artifactId)
         || row.attempt_intent_id !== claim.intent.id
         || row.artifact_intent_id !== claim.intent.id
@@ -801,7 +819,7 @@ export class PostgresExecutionLiveRepository {
         || row.reconciliation_build_fingerprint !== expected.buildFingerprint
         || row.reconciliation_snapshot_fingerprint !== expected.snapshotFingerprint
         || row.attempt_status !== 'STARTED'
-        || !['ACCEPTED', 'AMBIGUOUS', 'CONFIRMED'].includes(String(row.artifact_state))) {
+        || !reconciliationStatePair(claim.intent.status, row.artifact_state)) {
         throw failure('INVALID_DATA');
       }
       unsignedBigint(row.artifact_revision);
@@ -3151,6 +3169,8 @@ async function createDeadlineExitIntentLocked(
   if (row.position_id !== input.positionId || row.generation_id !== input.generationId) {
     throw failure('INVALID_DATA');
   }
+  const databaseNowMs = await freshDatabaseNow(client);
+  if (input.observedAtMs > databaseNowMs) throw failure('INVALID_INPUT');
   const exitDeadlineAtMs = timestampText(row.exit_deadline_at_ms);
   if (input.observedAtMs < exitDeadlineAtMs) {
     return Object.freeze({ payloadVersion: 1, kind: 'NOT_DUE', intent: null });
@@ -3177,12 +3197,11 @@ async function createDeadlineExitIntentLocked(
   });
   if (row.exit_intent_id !== null) {
     if (row.exit_intent_id !== draft.id) throw failure('CONFLICT');
-    const replayUpperBoundMs = Math.max(input.observedAtMs, await freshDatabaseNow(client));
     return Object.freeze({
       payloadVersion: 1,
       kind: 'REPLAYED',
       intent: await findDeadlineIntent(
-        client, draft, exitDeadlineAtMs, replayUpperBoundMs,
+        client, draft, exitDeadlineAtMs, input.observedAtMs,
       ),
     });
   }
@@ -3374,17 +3393,74 @@ function providerIdentifier(value: unknown): string {
 }
 
 function reconciliationSignature(value: unknown): string {
-  const candidate = text(value);
-  if (candidate.length < 64 || candidate.length > 96
-    || !/^[1-9A-HJ-NP-Za-km-z]+$/u.test(candidate)) throw failure('INVALID_DATA');
-  return candidate;
+  return canonicalBase58Bytes(value, 64, 64, 96);
 }
 
 function solanaAddress(value: unknown): string {
-  const candidate = text(value);
-  if (candidate.length < 32 || candidate.length > 44
-    || !/^[1-9A-HJ-NP-Za-km-z]+$/u.test(candidate)) throw failure('INVALID_DATA');
-  return candidate;
+  return canonicalBase58Bytes(value, 32, 32, 44);
+}
+
+function canonicalBase58Bytes(
+  value: unknown,
+  expectedByteLength: number,
+  minimumLength: number,
+  maximumLength: number,
+): string {
+  try {
+    const candidate = text(value);
+    if (candidate.length < minimumLength || candidate.length > maximumLength
+      || !/^[1-9A-HJ-NP-Za-km-z]+$/u.test(candidate)) throw new TypeError();
+    const decoded = bs58.decode(candidate);
+    if (decoded.byteLength !== expectedByteLength || bs58.encode(decoded) !== candidate) {
+      throw new TypeError();
+    }
+    return candidate;
+  } catch {
+    throw failure('INVALID_DATA');
+  }
+}
+
+function assertCausalArtifactId(
+  row: Row,
+  artifactId: string,
+  intentId: string,
+  attemptNumber: number,
+  generationId: string,
+  signature: string,
+): void {
+  try {
+    const reservationId = row.artifact_reservation_id === null
+      ? null
+      : text(row.artifact_reservation_id);
+    if (reservationId !== null
+      && !/^execution_exposure_reservation_[0-9a-f]{64}$/u.test(reservationId)) {
+      throw new TypeError();
+    }
+    const expectedArtifactId = createSignedTransactionArtifactId({
+      intentId,
+      attemptNumber,
+      generationId,
+      reservationId,
+      messageHash: fingerprintText(row.artifact_message_hash),
+      quoteObservedAtMs: timestampText(row.artifact_quote_observed_at_ms),
+      quoteExpiresAtMs: timestampText(row.artifact_quote_expires_at_ms),
+      signature,
+    });
+    if (expectedArtifactId !== artifactId) throw new TypeError();
+  } catch {
+    throw failure('INVALID_DATA');
+  }
+}
+
+function reconciliationStatePair(
+  intentStatus: string,
+  artifactState: unknown,
+): boolean {
+  if (intentStatus === 'CONFIRMED' || intentStatus === 'RECONCILING') {
+    return artifactState === 'CONFIRMED';
+  }
+  return intentStatus === 'UNKNOWN_REQUIRES_RECONCILIATION'
+    && artifactState === 'AMBIGUOUS';
 }
 
 function executionSide(value: unknown): 'BUY' | 'SELL' {
