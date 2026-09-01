@@ -14,6 +14,8 @@
 
 ### Task 1: Fermer le contrat de claim et ajouter la migration 037
 
+**Status:** completed — `a27cb56`
+
 **Files:**
 - Modify: `src/ports/execution-intent-repository.ts`
 - Create: `migrations/037_execution_live_orchestration.sql`
@@ -62,6 +64,8 @@ git commit -m "feat: define live execution claims (#51)"
 
 ### Task 2: Implémenter les claims PostgreSQL par lane
 
+**Status:** completed — `f48bd57`
+
 **Files:**
 - Modify: `src/storage/execution-intent.repository.ts`
 - Modify: `tests/execution-intent.repository.test.ts`
@@ -104,6 +108,8 @@ git commit -m "feat: claim live execution lanes atomically (#51)"
 ```
 
 ### Task 3: Construire les read-models de confirmation et réconciliation
+
+**Status:** completed — `ad58338`, hardened by `a90897b`
 
 **Files:**
 - Modify: `src/ports/execution-live-repository.ts`
@@ -159,6 +165,8 @@ git commit -m "feat: expose durable live worker inputs (#51)"
 
 ### Task 4: Ajouter le scanner atomique des sorties à échéance
 
+**Status:** completed — `c6ade64`, hardened by `a90897b`
+
 **Files:**
 - Modify: `src/ports/execution-live-repository.ts`
 - Modify: `src/storage/execution-live.repository.ts`
@@ -210,6 +218,8 @@ git commit -m "feat: scan live position deadlines atomically (#51)"
 ```
 
 ### Task 5: Versionner les contrats et prouver la frontière non-live
+
+**Status:** completed — `15f925f`, hardened by `d6561f2` and `f90b317`
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-09-01-executor-live-orchestration-design.md`
@@ -263,6 +273,8 @@ git commit -m "docs: record durable live orchestration boundary (#51)"
 ```
 
 ### Task 6: Vérification exhaustive et livraison de la PR #51-H1
+
+**Status:** in progress — local gates complete; GitHub delivery pending
 
 **Files:**
 - Verify: repository-wide source, tests, migrations and docs
