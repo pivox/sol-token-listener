@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.3
+**Version de spécification :** 1.7.4
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.7.4 — 2026-08-31 :** active uniquement la capacité de projection
+  neutre #51-G, désactivée par défaut et limitée au paper WSOL. Le commit de la
+  décision et la création idempotente de l'intention sont atomiques ; aucun
+  import de signature, secret ou transport live n'entre dans le listener.
 - **1.7.3 — 2026-08-31 :** ferme la reprise post-soumission #51-G :
   confirmation provider avec slot durable, réconciliation finalisée BUY/SELL
   atomique et idempotente, position et autorisation de sortie explicites, puis

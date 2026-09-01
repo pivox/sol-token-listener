@@ -33,13 +33,19 @@ void test('bootstrap imports no signing, submission, or live execution path', as
   assert.deepEqual(executionBoundaryViolations(source, fileURLToPath(new URL('../src/app.ts', import.meta.url)), repositoryRoot), []);
 });
 
-void test('bootstrap does not compose the inert execution intent producer or repository', async () => {
+void test('bootstrap composes only the flagged neutral intent producer and repository', async () => {
   const graph = await readLocalImportGraph(fileURLToPath(new URL('../src/app.ts', import.meta.url)));
-  const forbidden = new Set([
+  const neutral = [
     fileURLToPath(new URL('../src/application/execution-intent-producer.ts', import.meta.url)),
     fileURLToPath(new URL('../src/storage/execution-intent.repository.ts', import.meta.url)),
-  ]);
-  assert.deepEqual([...graph.keys()].filter((path) => forbidden.has(path)), []);
+  ];
+  assert.deepEqual(neutral.map((path) => graph.has(path)), [true, true]);
+  const factory = await readFile(
+    new URL('../src/application/production-listener-factory.ts', import.meta.url),
+    'utf8',
+  );
+  assert.match(factory, /config\.executionIntentEmissionEnabled/u);
+  assert.doesNotMatch(factory, /executor-live|Keypair|sendTransaction|signTransaction/u);
 });
 
 void test('production qualification import graph has no signing, simulation, or submission path', async () => {

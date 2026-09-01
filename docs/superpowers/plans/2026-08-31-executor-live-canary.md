@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js, PostgreSQL, `@solana/web3.js` 1.98.4, SDK officiels Pump.fun/PumpSwap épinglés, `node:test`, RPC local scripté.
 
-**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.3, parent version 1.7.3.
+**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.4, parent version 1.7.4.
 
 ---
 
@@ -396,27 +396,27 @@ git commit -m "feat: reconcile canary entries and exits (#51)"
 - Modify: `tests/bootstrap-safety.test.ts`
 - Create: `tests/execution-intent-emission.integration.test.ts`
 
-- [ ] **Step 1: Write disabled-default and atomic emission tests**
+- [x] **Step 1: Write disabled-default and atomic emission tests**
 
 Avec le flag absent/false, aucune table executor n'est ouverte. Avec le flag
 true en mode paper, la transition source et l'intention déterministe sont
 persistées sans doublon. `observe`, une qualification obsolète ou un événement
 orphaned refusent l'émission.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `npx tsx --test tests/bootstrap-safety.test.ts tests/execution-intent-emission.integration.test.ts`
 
 Expected: FAIL because production composition is absent.
 
-- [ ] **Step 3: Implement the neutral projection**
+- [x] **Step 3: Implement the neutral projection**
 
 Ajouter `executionIntentEmissionEnabled: boolean` avec défaut `false`. Injecter
 un sink optionnel dans le commit paper, dériver depuis l'événement canonique
 déjà verrouillé et utiliser le repository d'intention sans aucun import
 `executor-live`, signer, keypair ou transport.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot npx tsx --test tests/bootstrap-safety.test.ts tests/execution-intent-emission.integration.test.ts tests/execution-intent-producer.test.ts`
 

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { compareCursors } from '../domain/cursor.js';
+import { EXECUTION_INTENT_MAXIMUM_TTL_MS } from '../domain/execution-intent.js';
 import { createDeterministicDerivedEventId, type DomainEvent } from '../domain/events.js';
 import type { BondingCurveTradeObservedEventV1 } from '../domain/launchpad-events.js';
 import type { MarketTrade } from '../domain/market.js';
@@ -33,6 +34,7 @@ import type {
   PaperDecisionSnapshot,
 } from '../ports/paper-decision-repository.js';
 import type { CanonicalQualificationProjection } from '../ports/qualification-projection-repository.js';
+import { deriveExecutionIntent } from '../application/execution-intent-producer.js';
 import {
   canonicalStringifyJson,
   fromJsonValue,
@@ -42,17 +44,27 @@ import {
 } from '../utils/json.js';
 import { getDatabasePool } from './database.js';
 import {
+  createExecutionIntentInTransaction,
+  type ExecutionIntentTransactionClient,
+} from './execution-intent.repository.js';
+import {
   assertPaperFinalityReplayCurrent,
   MAX_PAPER_FINALITY_RAW_ROWS,
   paperFinalityRelevantRawSql,
 } from './paper-finality-barrier.js';
 
-interface Result { readonly rows: readonly unknown[]; readonly rowCount?: number | null }
-interface Client { query(text: string, values?: readonly unknown[]): Promise<Result>; release(): void }
+type Row = Readonly<Record<string, unknown>>;
+interface Result { readonly rows: readonly Row[]; readonly rowCount: number | null }
+interface Client extends ExecutionIntentTransactionClient { release(): void }
 interface Pool { connect(): Promise<Client> }
 
 type Operation = 'enqueue' | 'wake' | 'claim' | 'renew' | 'snapshot' | 'stage' | 'complete' | 'fail' | 'counts';
 const MAX_PAPER_FINALITY_PREFLIGHT_JOBS=16;
+export type ExecutionIntentEmissionConfig = Readonly<{
+  readonly quoteMintAllowlist: readonly string[];
+  readonly wsolMint: string;
+  readonly maximumQuoteAgeMs: number;
+}>;
 
 export class PaperDecisionRepositoryError extends Error {
   public constructor(public readonly operation: Operation, options?: ErrorOptions) {
@@ -73,6 +85,7 @@ export interface PaperDecisionRepositoryOptions {
   readonly baseDelayMs?: number;
   readonly retentionHours?: number;
   readonly clock?: () => number;
+  readonly executionIntentEmission?: ExecutionIntentEmissionConfig | null;
 }
 
 export class PostgresPaperDecisionRepository implements PaperDecisionRepository {
@@ -81,6 +94,7 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
   private readonly retentionMs: number;
   private readonly clock: () => number;
   private readonly qualificationProfile: QualificationProfileIdentity;
+  private readonly executionIntentEmission: ExecutionIntentEmissionConfig | null;
 
   public constructor(
     private readonly pool: Pool = getDatabasePool(),
@@ -96,6 +110,9 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
     this.retentionMs = retentionHours * 3_600_000;
     this.clock = options.clock ?? Date.now;
     this.qualificationProfile = snapshotQualificationProfile(qualificationProfile);
+    this.executionIntentEmission = options.executionIntentEmission === undefined
+      ? null
+      : snapshotExecutionIntentEmission(options.executionIntentEmission);
   }
 
   public async enqueue(input: PaperDecisionJobInput): Promise<void> {
@@ -524,7 +541,16 @@ export class PostgresPaperDecisionRepository implements PaperDecisionRepository 
       ) {
         throw new PaperDecisionLeaseLostError();
       }
-      await writeDecision(client, job, result, this.qualificationProfile, terminal);
+      const sessionWriteAccepted = await writeDecision(
+        client,
+        job,
+        result,
+        this.qualificationProfile,
+        terminal,
+      );
+      if (terminal && sessionWriteAccepted && this.executionIntentEmission !== null) {
+        await emitExecutionIntentInTransaction(client, result, this.executionIntentEmission);
+      }
       const nowMs = Math.max(result.candidate.createdAtMs, result.session?.updatedAtMs ?? 0);
       if (terminal) {
         await exact(client, `UPDATE paper_decision_jobs SET
@@ -666,7 +692,7 @@ async function writeDecision(
   result: PaperDecisionResult,
   qualificationProfile: QualificationProfileIdentity,
   synchronizeOrphanedEvidence: boolean,
-): Promise<void> {
+): Promise<boolean> {
   await assertPaperFinalityReplayCurrent(client,{
     mint:job.mint,sourceRawEventId:job.sourceRawEventId,
   });
@@ -774,6 +800,79 @@ async function writeDecision(
       evidence.payloadVersion,toJsonValue(evidence),
     ]);
   }
+  return sessionWriteAccepted;
+}
+
+function snapshotExecutionIntentEmission(
+  value: ExecutionIntentEmissionConfig | null,
+): ExecutionIntentEmissionConfig | null {
+  if (value === null) return null;
+  if (!Array.isArray(value.quoteMintAllowlist)
+    || value.quoteMintAllowlist.length !== 1
+    || typeof value.quoteMintAllowlist[0] !== 'string'
+    || value.quoteMintAllowlist[0] !== value.wsolMint
+    || typeof value.wsolMint !== 'string' || value.wsolMint.length === 0) {
+    throw new TypeError('Execution intent emission quote policy is invalid.');
+  }
+  integerInRange(value.maximumQuoteAgeMs, 0, 60_000, 'maximumQuoteAgeMs');
+  return Object.freeze({
+    quoteMintAllowlist: Object.freeze([value.wsolMint]),
+    wsolMint: value.wsolMint,
+    maximumQuoteAgeMs: value.maximumQuoteAgeMs,
+  });
+}
+
+export async function emitExecutionIntentInTransaction(
+  client: Client,
+  result: PaperDecisionResult,
+  options: ExecutionIntentEmissionConfig,
+): Promise<void> {
+  if (result.requestedAction === 'NONE') return;
+  const session = result.session;
+  const sessionEvent = result.sessionEvent;
+  if (session === null || sessionEvent === null || sessionEvent.confirmationStatus === 'orphaned'
+    || session.lastQuote === null || session.positionId === null) {
+    throw new TypeError('Execution intent source decision is invalid.');
+  }
+  const selected = await client.query(`SELECT payload FROM paper_positions
+    WHERE position_id=$1 AND mint=$2 FOR SHARE`, [session.positionId, result.candidate.mint]);
+  const positionRow = requiredRow(selected, 'Paper position for execution intent is missing.');
+  const position = decoded(
+    field(positionRow, 'payload'),
+    'Paper position payload is invalid.',
+  ) as PaperPosition;
+  const requestedAtMs = sessionEvent.observedAtMs;
+  const sourceExpiryMs = result.requestedAction === 'OPEN'
+    ? result.candidate.eligibleUntilMs
+    : session.purgeAfterMs;
+  if (sourceExpiryMs === null) throw new TypeError('Execution intent expiry is missing.');
+  const expiresAtMs = Math.min(
+    sourceExpiryMs,
+    requestedAtMs + EXECUTION_INTENT_MAXIMUM_TTL_MS,
+  );
+  const draft = deriveExecutionIntent(Object.freeze({
+    requestedAction: result.requestedAction,
+    session,
+    currentSessionId: session.id,
+    candidate: result.candidate,
+    position,
+    quote: session.lastQuote,
+    quoteMintAllowlist: options.quoteMintAllowlist,
+    wsolMint: options.wsolMint,
+    maximumQuoteAgeMs: options.maximumQuoteAgeMs,
+    qualification: Object.freeze({
+      reportId: result.candidate.qualificationReportId,
+      eventId: result.qualificationEvent.id,
+      profileFingerprint: result.candidate.qualificationProfile.fingerprint,
+      evidenceFingerprint: result.candidate.evidenceFingerprint,
+    }),
+    sessionEvent,
+    requestedAtMs,
+    expiresAtMs,
+    maximumIntentTtlMs: EXECUTION_INTENT_MAXIMUM_TTL_MS,
+  }));
+  if (draft === null) throw new TypeError('Execution intent draft is missing.');
+  await createExecutionIntentInTransaction(client, draft);
 }
 
 async function assertPersistedQualification(

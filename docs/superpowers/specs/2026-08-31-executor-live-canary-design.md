@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.0.4
 
-**Version de la spécification parente :** 1.7.3
+**Version de la spécification parente :** 1.7.4
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,11 @@
 
 ## Historique des versions
 
+- **1.0.4 — 2026-08-31 :** compose la projection neutre des décisions paper
+  derrière `EXECUTION_INTENT_EMISSION_ENABLED=false`. L'intention et la mise à
+  jour canonique de session partagent la même transaction PostgreSQL, le
+  mapper refuse observe, orphaned, qualification/quote obsolète et tout quote
+  mint autre que WSOL dans cette première allowlist.
 - **1.0.3 — 2026-08-31 :** rend la confirmation et la réconciliation live
   reprenables : le slot confirmed est durable, les preuves terminales BUY et
   SELL se rejouent sans nouvel effet, le BUY crée atomiquement position et

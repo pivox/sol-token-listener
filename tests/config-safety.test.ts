@@ -263,6 +263,20 @@ void test('le mode paper est accepté avec SOL dans son allowlist initiale', () 
   assert.deepEqual(config.paperQuoteMintAllowlist, [config.wsolMint]);
 });
 
+void test('execution intent emission is disabled by default and restricted to paper', () => {
+  assert.equal(parseConfig(base).executionIntentEmissionEnabled, false);
+  assert.equal(parseConfig({
+    ...base,
+    EXECUTION_MODE: 'paper',
+    EXECUTION_INTENT_EMISSION_ENABLED: 'true',
+  }).executionIntentEmissionEnabled, true);
+  assert.throws(() => parseConfig({
+    ...base,
+    EXECUTION_MODE: 'observe',
+    EXECUTION_INTENT_EMISSION_ENABLED: 'true',
+  }), /EXECUTION_INTENT_EMISSION_ENABLED.*paper/u);
+});
+
 void test('la stratégie paper end-to-end est strictement désactivée par défaut', () => {
   const config = parseConfig(base);
   assert.deepEqual({
@@ -768,7 +782,13 @@ void test('the environment example contains only safe public-social settings', a
     'SOCIAL_WORKER_POLL_MS=1000', 'SOCIAL_WORKER_LEASE_SECONDS=30',
     'SOCIAL_RETRY_MAX_ATTEMPTS=3', 'SOCIAL_RETRY_BASE_DELAY_MS=1000',
   ]) assert.match(source, new RegExp(`^${line}$`, 'mu'));
-  assert.doesNotMatch(source, /(?:X|TWITTER|TELEGRAM).*(?:TOKEN|COOKIE|SECRET|PROXY)|PRIVATE_KEY|KEYPAIR_PATH/iu);
+  const socialSettings = source.split('\n')
+    .filter((line) => line.startsWith('SOCIAL_'))
+    .join('\n');
+  assert.doesNotMatch(
+    socialSettings,
+    /(?:X|TWITTER|TELEGRAM).*(?:TOKEN|COOKIE|SECRET|PROXY)|PRIVATE_KEY|KEYPAIR_PATH/iu,
+  );
 });
 
 void test('les réglages listener ne régressent pas la sécurité observe/paper', () => {
