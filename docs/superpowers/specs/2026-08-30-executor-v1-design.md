@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.6.4
+**Version de spécification :** 1.7.13
 
 **Date :** 2026-08-31
 
@@ -8,13 +8,69 @@
 
 **Issue parente :** #51
 
-**Périmètre livré à cette version :** #51-A (conception), #51-B (fondation
-inerte des intentions d'exécution), #51-C (processus executor dry-run), #51-D
-(quote, build éphémère et simulation sans envoi) et conception détaillée
-#51-E (risque, quota, exposition et réconciliation sans effet on-chain)
+**Périmètre livré à cette version :** #51-A à #51-F et conception détaillée
+#51-G (graphe live fermé, signature, soumission et canary manuel)
 
 ## Historique des versions
 
+- **1.7.13 — 2026-09-01 :** rend l'admission et la réconciliation BUY
+  exécutables par le rôle live minimal sans droit d'écriture sur génération ou
+  snapshots, grâce aux verrous advisory cohérents. Tout nouveau commit de
+  réconciliation BUY est désormais clôturé par le lease actif sous row lock et
+  par une heure PostgreSQL relue après l'acquisition de tous les verrous. Avant
+  un rejeu, l'identité de la preuve est recalculée depuis tous ses champs ; une
+  preuve terminale exacte reste lisible sans réappliquer ses mutations.
+- **1.7.12 — 2026-09-01 :** complète le rejeu des sorties à deadline par une
+  comparaison contextuelle avec la position verrouillée et par une politique
+  temporelle fermée : demande comprise entre deadline et observation, puis TTL
+  exact de 120 secondes.
+- **1.7.11 — 2026-09-01 :** ferme le rejeu des sorties à deadline sur
+  l'intention immuable stockée : toutes les propriétés sont relues et validées,
+  notamment les dates de demande et d'expiration, au lieu de provenir d'un
+  nouveau brouillon.
+- **1.7.10 — 2026-09-01 :** aligne le contrat borné de rétention avec ses 66
+  compteurs effectifs après ajout des preuves live de simulation. La capacité
+  reste explicitement limitée à 128 entrées et le smoke vérifie la liste
+  canonique complète.
+- **1.7.9 — 2026-09-01 :** isole la purge complète dans un rôle PostgreSQL de
+  rétention `NOLOGIN`, privé des bytes signés et des mutations d'état métier,
+  avec sérialisation transactionnelle par verrou advisory. La reprise live
+  découvre également l'artefact par intent/tentative et réhydrate la preuve
+  non signée durable au lieu de dépendre d'un objet conservé en mémoire.
+- **1.7.8 — 2026-09-01 :** complète les garanties #51-G avec les preuves
+  append-only des simulations non signée et signée, les baselines immuables du
+  dernier gate risque/provider et une reprise par état durable qui interdit
+  tout nouvel envoi après un crash post-fence.
+- **1.7.7 — 2026-09-01 :** ferme le premier cycle de revue #51-G avec un
+  dernier préflight atomique et immuable, la révocation durable avant envoi,
+  la réconciliation BUY/SELL rejouable, un graphe SQL fermé, des privilèges
+  minimaux et une rétention terminale par cohorte. Le runtime RPC production
+  demeure un incrément séparé obligatoire avant tout canary.
+- **1.7.6 — 2026-08-31 :** acte que #51-G livre un runtime injectable et les
+  capacités isolées, sans publier de binaire production avant la composition
+  des ports de claim/read-model, du gateway RPC et du pipeline live complet.
+- **1.7.5 — 2026-08-31 :** ferme les protections opérationnelles livrables de
+  #51-G (rôle live executor-only, rétention terminale et inventaire smoke),
+  tout en maintenant le binaire production explicitement non composé.
+- **1.7.4 — 2026-08-31 :** active uniquement la capacité de projection
+  neutre #51-G, désactivée par défaut et limitée au paper WSOL. Le commit de la
+  décision et la création idempotente de l'intention sont atomiques ; aucun
+  import de signature, secret ou transport live n'entre dans le listener.
+- **1.7.3 — 2026-08-31 :** ferme la reprise post-soumission #51-G :
+  confirmation provider avec slot durable, réconciliation finalisée BUY/SELL
+  atomique et idempotente, position et autorisation de sortie explicites, puis
+  intention SELL unique à la deadline de détention.
+- **1.7.2 — 2026-08-31 :** ferme la soumission #51-G autour des seuls octets
+  signés persistés et authentifiés, avec simulation signée préalable, fence
+  PostgreSQL avant RPC, zéro retry provider et réconciliation obligatoire de
+  toute issue réseau ou de commit indéterminée.
+- **1.7.1 — 2026-08-31 :** ferme la frontière entre simulation-only et live :
+  une tentative live reste `STARTED` et son commit signé journalise
+  atomiquement `PROCESSING -> SIMULATED -> SIGNED_NOT_SUBMITTED`, sans réutiliser
+  l'artefact terminal non signable de #51-D.
+- **1.7.0 — 2026-08-31 :** spécifie #51-G : exécutable live séparé,
+  émission neutre optionnelle, secret local fermé, persistance avant envoi,
+  soumission exacte, confirmation/réconciliation et canary manuel minimal.
 - **1.6.4 — 2026-08-31 :** ferme la projection wallet #51-E à deux positions
   relationnelles explicites et confirme que l'état quota est recalculé lors de
   l'admission plutôt que persisté dans la mesure provider.
@@ -514,6 +570,10 @@ et celle de #51-D dans
 [2026-08-31-executor-quote-build-simulation-design.md](2026-08-31-executor-quote-build-simulation-design.md).
 La conception de #51-E est versionnée dans
 [2026-08-31-executor-risk-reconciliation-design.md](2026-08-31-executor-risk-reconciliation-design.md).
+La conception de #51-F est versionnée dans
+[2026-08-31-executor-preflight-operations-design.md](2026-08-31-executor-preflight-operations-design.md)
+et celle de #51-G dans
+[2026-08-31-executor-live-canary-design.md](2026-08-31-executor-live-canary-design.md).
 
 ### 7.3 Simulation sans envoi
 

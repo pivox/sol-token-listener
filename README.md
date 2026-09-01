@@ -29,10 +29,13 @@ afin qu'un ordre logique ne puisse pas être recréé avec des preuves fraîches
 Un mapper pur sait dériver un draft depuis l'événement canonique
 `PaperStrategySessionUpdated`, sa qualification et sa quote causale.
 
-Cette fondation est entièrement inerte : le mapper et le repository ne sont
-composés ni dans le listener, ni dans l'API, ni dans le worker paper. Il
-n'existe aucun wallet, chargement de clé, chemin live, signature ou envoi. Le
-lot #51-C livre désormais un processus executor dry-run PostgreSQL séparé,
+L'émission d'intentions est composée dans le listener mais reste strictement
+désactivée par défaut avec `EXECUTION_INTENT_EMISSION_ENABLED=false`. Son
+activation explicite exige `EXECUTION_MODE=paper` et l'allowlist initiale
+SOL/WSOL uniquement ; lorsque le flag reste à `false`, le repository paper ne
+reçoit aucun producteur d'intention. Ce chemin n'effectue lui-même aucun
+chargement de clé, signature ou envoi. Le lot #51-C livre désormais le dry-run
+executor PostgreSQL séparé,
 sans construction ni simulation de transaction et sans consommer l'intention.
 #51-D livre un second mode executor `simulation-only`, disponible pour produire
 une preuve non signée sans soumission. #51-E livre désormais uniquement la
@@ -43,9 +46,12 @@ courant ne compose ou n'appelle `admitBuy`, `recordFault`, `reconcile` ou
 un preflight durable, des arrêts opérateur et un armement manuel strictement
 inerte. Les gates du preflight doivent être fournis dans une enveloppe Ed25519
 signée et liée au déploiement. Ses six commandes `live:*` refusent les secrets et ne sont importées
-par aucun worker. #51-G (signature/soumission sous gates compensatoires) reste
-obligatoire avant toute transaction réelle. Les seuls modes du listener
-restent `observe` et `paper`.
+par aucun worker. #51-G fournit ses briques live isolées et ses protections
+PostgreSQL, mais le binaire de production reste non composé et indémarrable :
+aucun script `executor:live:start` n'est publié. Les seuls modes du listener
+restent `observe` et `paper`. Le
+[runbook canary #51-G](docs/operations/executor-live-canary.md) décrit ce
+blocage et les preuves encore requises.
 
 Configuration minimale de la stratégie de création, toujours simulée :
 
@@ -221,8 +227,9 @@ applicables. Aucun secret n'est accepté et aucun `signTransaction`,
 La validation terrain #49 des 50 positions Mainnet a été sautée : son statut
 reste explicitement `NON_EXECUTED` et `NON_VALIDATED`, jamais `PASS`. La
 fondation #51-E et le preflight inerte #51-F ne changent pas ce statut et
-n'activent aucun runtime de soumission. #51-G (signature/soumission sous gates
-compensatoires) demeure obligatoire avant le moindre trade réel. Le
+n'activent aucun runtime de soumission. Les briques #51-G de
+signature/soumission sous gates compensatoires ne constituent pas encore un
+runtime production composé. Le
 [runbook #51-F](docs/operations/executor-preflight.md) décrit les preuves,
 arrêts et commandes locales.
 

@@ -410,6 +410,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   assert.match(smoke, /'029_paper_finality_claim_scheduler\.sql'/);
   assert.match(smoke, /'030_listener_websocket_health\.sql'/);
   assert.match(smoke, /'031_execution_intents\.sql'/);
+  assert.match(smoke, /'036_execution_live_canary\.sql'/);
   assert.match(smoke, /'paperMvpRuns'/);
   assert.match(smoke, /'paperMvpSamples'/);
   assert.match(smoke, /'listenerCatchUpGaps'/);
@@ -448,7 +449,7 @@ void test('deployment smoke accepts only one bounded retention aggregate with si
   assert.match(retention, /canonicalRetentionCounters/);
   assert.match(
     smoke,
-    /'executionActivationArmaments',\n {2}'executionActivationEvents',\n {2}'executionAttempts',\n {2}'executionControlEvents',\n {2}'executionDryRunAssessments',\n {2}'executionIntents',\n {2}'executionIntentTransitions',\n {2}'executionOperatorAuthorizations',\n {2}'executionRiskAdmissionReports',\n {2}'executionRiskFaults',\n {2}'executionRiskProviderOperations',\n {2}'executionRiskProviderSnapshots',\n {2}'executionRiskRateLimitEvents',\n {2}'executionRiskReconciliationEvidence',\n {2}'executionRiskReservations',\n {2}'executionRiskTombstones',\n {2}'executionRiskWalletSnapshots',\n {2}'executionSafetyQualifications',\n {2}'executionSimulationArtifacts',/u,
+    /'executionActivationArmaments',\n {2}'executionActivationEvents',\n {2}'executionAttempts',\n {2}'executionControlEvents',\n {2}'executionDryRunAssessments',\n {2}'executionExitAuthorizations',\n {2}'executionIntents',\n {2}'executionIntentTransitions',\n {2}'executionLivePositions',\n {2}'executionLiveUnsignedSimulationEvidence',\n {2}'executionOperatorAuthorizations',\n {2}'executionRiskAdmissionReports',\n {2}'executionRiskFaults',\n {2}'executionRiskProviderOperations',\n {2}'executionRiskProviderSnapshots',\n {2}'executionRiskRateLimitEvents',\n {2}'executionRiskReconciliationEvidence',\n {2}'executionRiskReservations',\n {2}'executionRiskTombstones',\n {2}'executionRiskWalletSnapshots',\n {2}'executionSafetyQualifications',\n {2}'executionSignedSimulationEvidence',\n {2}'executionSignedTransactions',\n {2}'executionSimulationArtifacts',\n {2}'executionSubmissionEvents',/u,
     'deployment smoke must expect every sorted execution retention counter',
   );
   assert.doesNotMatch(retention, /\.split\('\n'\).*\.filter/s);

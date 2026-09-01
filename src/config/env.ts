@@ -24,6 +24,7 @@ export interface AppConfig {
   readonly databaseUrl: string;
   readonly autoMigrate: boolean;
   readonly executionMode: ExecutionMode;
+  readonly executionIntentEmissionEnabled: boolean;
   readonly paperQuoteMintAllowlist: readonly string[];
   readonly paperStrategyEnabled: boolean;
   readonly creationStrategyEnabled: boolean;
@@ -163,6 +164,14 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   );
 
   const executionMode = parseExecutionMode(environment.EXECUTION_MODE);
+  const executionIntentEmissionEnabled = parseBoolean(
+    environment.EXECUTION_INTENT_EMISSION_ENABLED,
+    false,
+    'EXECUTION_INTENT_EMISSION_ENABLED',
+  );
+  if (executionIntentEmissionEnabled && executionMode !== 'paper') {
+    throw new Error('EXECUTION_INTENT_EMISSION_ENABLED requires EXECUTION_MODE=paper.');
+  }
   const dashboardActionsEnabled = parseBoolean(environment.DASHBOARD_ACTIONS_ENABLED, false, 'DASHBOARD_ACTIONS_ENABLED');
   if (dashboardActionsEnabled) {
     throw new Error('Pump.fun V1 exposes a read-only dashboard; dashboard actions cannot be enabled.');
@@ -172,6 +181,10 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   const paperQuoteMintAllowlist = parseMintAllowlist(environment.PAPER_QUOTE_MINT_ALLOWLIST, wsolMint);
   if (executionMode === 'paper' && !paperQuoteMintAllowlist.includes(wsolMint)) {
     throw new Error('Pump.fun V1 paper mode requires SOL/WSOL in PAPER_QUOTE_MINT_ALLOWLIST.');
+  }
+  if (executionIntentEmissionEnabled
+    && (paperQuoteMintAllowlist.length !== 1 || paperQuoteMintAllowlist[0] !== wsolMint)) {
+    throw new Error('EXECUTION_INTENT_EMISSION_ENABLED initially requires only SOL/WSOL.');
   }
   const apiPageLimitMaximum = parseInteger(
     environment.API_PAGE_LIMIT_MAX, 200, 'API_PAGE_LIMIT_MAX', 1, MAX_API_PAGE_LIMIT,
@@ -216,6 +229,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     databaseUrl: optional(environment.DATABASE_URL, 'postgresql://solanabot:solanabot@127.0.0.1:5432/solanabot'),
     autoMigrate: parseBoolean(environment.POSTGRES_AUTO_MIGRATE, false, 'POSTGRES_AUTO_MIGRATE'),
     executionMode,
+    executionIntentEmissionEnabled,
     paperQuoteMintAllowlist,
     ...paperStrategyConfig,
     qualificationProfilePath,

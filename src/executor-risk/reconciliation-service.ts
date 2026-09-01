@@ -52,7 +52,7 @@ export class ExecutionReconciliationServiceError extends Error {
 export class ExecutionReconciliationService {
   public constructor(
     private readonly gateway: ExecutionReconciliationGateway,
-    private readonly repository: ExecutionRiskRepository,
+    private readonly repository: Pick<ExecutionRiskRepository, 'reconcile'>,
   ) {}
 
   public async reconcile(

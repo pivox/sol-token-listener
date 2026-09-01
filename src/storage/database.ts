@@ -152,6 +152,12 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   readonly paperDecisionJobs: number;
   readonly paperTrades: number;
   readonly paperPositions: number;
+  readonly executionSubmissionEvents: number;
+  readonly executionSignedSimulationEvidence: number;
+  readonly executionLiveUnsignedSimulationEvidence: number;
+  readonly executionSignedTransactions: number;
+  readonly executionExitAuthorizations: number;
+  readonly executionLivePositions: number;
   readonly executionDryRunAssessments: number;
   readonly executionSimulationArtifacts: number;
   readonly executionControlEvents: number;
@@ -196,6 +202,9 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
   let failureCleanupHandled = false;
   try {
     await client.query('BEGIN');
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended('foundation-retention-fence:v1', 0))",
+    );
     await client.query(PAPER_MVP_RETENTION_FENCE_SQL);
     const socialEvidence = await client.query(
       `DELETE FROM social_verification_evidence evidence
@@ -419,12 +428,77 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       || !Number.isFinite(executionIntentCutoff.getTime())) {
       throw new Error('PostgreSQL returned an invalid execution intent purge cutoff.');
     }
+    const executionLiveArtifactCohort = await client.query<{
+      readonly artifact_id: string;
+    }>(
+      `SELECT artifact.artifact_id
+       FROM execution_signed_transactions artifact
+       WHERE artifact.state IN ('RECONCILED','REVOKED_NO_SEND')
+         AND artifact.purge_after <= $1::TIMESTAMPTZ
+       ORDER BY artifact.artifact_id LIMIT 1000`,
+      [executionIntentCutoff],
+    );
+    const executionLiveArtifactIds = executionLiveArtifactCohort.rows.map(
+      ({ artifact_id }) => artifact_id,
+    );
+    const executionSubmissionEvents = await client.query(
+      `DELETE FROM execution_submission_events event
+       WHERE event.artifact_id = ANY($1::TEXT[])`,
+      [executionLiveArtifactIds],
+    );
+    const executionSignedSimulationEvidence = await client.query(
+      `DELETE FROM execution_signed_simulation_evidence evidence
+       WHERE evidence.artifact_id = ANY($1::TEXT[])`,
+      [executionLiveArtifactIds],
+    );
+    const executionLiveUnsignedSimulationEvidence = await client.query(
+      `DELETE FROM execution_live_unsigned_simulation_evidence evidence
+       WHERE evidence.artifact_id = ANY($1::TEXT[])`,
+      [executionLiveArtifactIds],
+    );
+    const executionSignedTransactions = await client.query(
+      `DELETE FROM execution_signed_transactions artifact
+       WHERE artifact.artifact_id = ANY($1::TEXT[])
+         AND artifact.state IN ('RECONCILED','REVOKED_NO_SEND')
+         AND artifact.purge_after <= $2::TIMESTAMPTZ`,
+      [executionLiveArtifactIds, executionIntentCutoff],
+    );
+    const executionExitAuthorizations = await client.query(
+      `DELETE FROM execution_exit_authorizations exit_auth
+       WHERE exit_auth.authorization_id IN (
+         SELECT candidate.authorization_id
+         FROM execution_exit_authorizations candidate
+         WHERE candidate.state IN ('CONSUMED','REVOKED')
+           AND candidate.purge_after <= $1::TIMESTAMPTZ
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_signed_transactions artifact
+             WHERE artifact.exit_authorization_id=candidate.authorization_id
+           )
+         ORDER BY candidate.authorization_id LIMIT 1000
+       )`,
+      [executionIntentCutoff],
+    );
+    const executionLivePositions = await client.query(
+      `DELETE FROM execution_live_positions position
+       WHERE position.position_id IN (
+         SELECT candidate.position_id
+         FROM execution_live_positions candidate
+         WHERE candidate.state='CLOSED'
+           AND candidate.purge_after <= $1::TIMESTAMPTZ
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_exit_authorizations exit_auth
+             WHERE exit_auth.position_id=candidate.position_id
+           )
+         ORDER BY candidate.position_id LIMIT 1000
+       )`,
+      [executionIntentCutoff],
+    );
     const executionControlEvents = await client.query(
       `DELETE FROM execution_control_events event
        WHERE event.event_id IN (
          SELECT candidate.event_id FROM execution_control_events candidate
          WHERE candidate.occurred_at + INTERVAL '4 hours' <= $1::TIMESTAMPTZ
-         ORDER BY candidate.event_id LIMIT 1000 FOR UPDATE
+         ORDER BY candidate.event_id LIMIT 1000
        )`,
       [executionIntentCutoff],
     );
@@ -436,7 +510,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            ON armament.armament_id=candidate.armament_id
          WHERE armament.state IN ('CONSUMED','REVOKED','EXPIRED')
            AND armament.purge_after <= $1::TIMESTAMPTZ
-         ORDER BY candidate.event_id LIMIT 1000 FOR UPDATE OF candidate
+         ORDER BY candidate.event_id LIMIT 1000
        )`,
       [executionIntentCutoff],
     );
@@ -450,7 +524,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
              SELECT 1 FROM execution_activation_events event
              WHERE event.armament_id=candidate.armament_id
            )
-         ORDER BY candidate.armament_id LIMIT 1000 FOR UPDATE
+         ORDER BY candidate.armament_id LIMIT 1000
        )`,
       [executionIntentCutoff],
     );
@@ -467,7 +541,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
              SELECT 1 FROM execution_control_events event
              WHERE event.authorization_id=candidate.authorization_id
            )
-         ORDER BY candidate.authorization_id LIMIT 1000 FOR UPDATE
+         ORDER BY candidate.authorization_id LIMIT 1000
        )`,
       [executionIntentCutoff],
     );
@@ -484,7 +558,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
              SELECT 1 FROM execution_control_events event
              WHERE event.qualification_id=candidate.qualification_id
            )
-         ORDER BY candidate.qualification_id LIMIT 1000 FOR UPDATE
+         ORDER BY candidate.qualification_id LIMIT 1000
        )`,
       [executionIntentCutoff],
     );
@@ -493,7 +567,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        WHERE event.event_id IN (
          SELECT candidate.event_id FROM execution_provider_rate_limit_events candidate
          WHERE candidate.purge_after <= $1::TIMESTAMPTZ
-         ORDER BY candidate.event_id LIMIT 1000 FOR UPDATE
+         ORDER BY candidate.event_id LIMIT 1000
        )`,
       [executionIntentCutoff],
     );
@@ -502,7 +576,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        WHERE snapshot.snapshot_id IN (
          SELECT candidate.snapshot_id FROM execution_wallet_snapshots candidate
          WHERE candidate.purge_after <= $1::TIMESTAMPTZ
-         ORDER BY candidate.snapshot_id LIMIT 1000 FOR UPDATE
+         ORDER BY candidate.snapshot_id LIMIT 1000
        )`,
       [executionIntentCutoff],
     );
@@ -510,7 +584,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       `SELECT snapshot.snapshot_id FROM execution_provider_usage_snapshots snapshot
        WHERE snapshot.purge_after <= $1::TIMESTAMPTZ
          AND snapshot.billing_period_ends_at <= $1::TIMESTAMPTZ
-       ORDER BY snapshot.snapshot_id LIMIT 1000 FOR UPDATE`,
+       ORDER BY snapshot.snapshot_id LIMIT 1000`,
       [executionIntentCutoff],
     );
     const providerSnapshotIds = providerSnapshotCohort.rows.map(({ snapshot_id }) => snapshot_id);
@@ -536,8 +610,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
          ON report.report_id=reservation.admission_report_id
        WHERE reservation.state IN ('CONSUMED','RELEASED')
          AND reservation.purge_after <= $1::TIMESTAMPTZ
-       ORDER BY reservation.reservation_id LIMIT 1000
-       FOR UPDATE OF reservation,report`,
+       ORDER BY reservation.reservation_id LIMIT 1000`,
       [executionIntentCutoff],
     );
     const reservationIds = reservationCohort.rows.map(({ reservation_id }) => reservation_id);
@@ -547,7 +620,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
     const rejectedReportCohort = await client.query<{ readonly report_id: string }>(
       `SELECT report.report_id FROM execution_risk_admission_reports report
        WHERE report.decision='REJECTED' AND report.purge_after <= $1::TIMESTAMPTZ
-       ORDER BY report.report_id LIMIT 1000 FOR UPDATE`,
+       ORDER BY report.report_id LIMIT 1000`,
       [executionIntentCutoff],
     );
     const reportIds = [...new Set([
@@ -580,18 +653,47 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
        ORDER BY reservation.reservation_id`,
       [reservationIds],
     );
-    const executionRiskReconciliationEvidence = await client.query(
+    const executionRiskBuyReconciliationEvidence = await client.query(
       `DELETE FROM execution_reconciliation_evidence evidence
        WHERE evidence.reservation_id = ANY($1::TEXT[])
          AND evidence.purge_after <= $2::TIMESTAMPTZ`,
       [reservationIds, executionIntentCutoff],
     );
+    const executionRiskSellReconciliationEvidence = await client.query(
+      `WITH terminal_sell_attempts AS MATERIALIZED (
+         SELECT terminal.intent_id,terminal.attempt_number
+         FROM execution_reconciliation_evidence terminal
+         WHERE terminal.reservation_id IS NULL AND terminal.side='SELL'
+           AND terminal.result IN ('MATCHED','NO_EFFECT')
+           AND terminal.purge_after <= $1::TIMESTAMPTZ
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_reconciliation_evidence member
+             WHERE member.intent_id=terminal.intent_id
+               AND member.attempt_number=terminal.attempt_number
+               AND member.side='SELL'
+               AND (member.purge_after IS NULL
+                 OR member.purge_after > $1::TIMESTAMPTZ)
+           )
+         ORDER BY terminal.intent_id,terminal.attempt_number
+         LIMIT 1000
+       )
+       DELETE FROM execution_reconciliation_evidence evidence
+       USING terminal_sell_attempts cohort
+       WHERE evidence.intent_id=cohort.intent_id
+         AND evidence.attempt_number=cohort.attempt_number
+         AND evidence.side='SELL' AND evidence.reservation_id IS NULL
+         AND evidence.purge_after <= $1::TIMESTAMPTZ`,
+      [executionIntentCutoff],
+    );
+    const executionRiskReconciliationEvidenceCount =
+      (executionRiskBuyReconciliationEvidence.rowCount ?? 0)
+      + (executionRiskSellReconciliationEvidence.rowCount ?? 0);
     const executionRiskFaults = await client.query(
       `DELETE FROM execution_fault_ledger fault
        WHERE fault.fault_id IN (
          SELECT candidate.fault_id FROM execution_fault_ledger candidate
          WHERE candidate.purge_after <= $1::TIMESTAMPTZ
-         ORDER BY candidate.fault_id LIMIT 1000 FOR UPDATE
+         ORDER BY candidate.fault_id LIMIT 1000
        )`,
       [executionIntentCutoff],
     );
@@ -639,8 +741,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
            SELECT 1 FROM execution_fault_ledger fault
            WHERE fault.intent_id=intent.id
          )
-       ORDER BY intent.id
-       FOR UPDATE OF intent`,
+       ORDER BY intent.id`,
       [executionIntentCutoff],
     );
     const executionIntentIds = executionIntentCohort.rows.map(({ id }) => id);
@@ -990,6 +1091,13 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       paperDecisionJobs: paperDecisionJobs.rowCount ?? 0,
       paperTrades: paperTrades.rowCount ?? 0,
       paperPositions: paperPositions.rowCount ?? 0,
+      executionSubmissionEvents: executionSubmissionEvents.rowCount ?? 0,
+      executionSignedSimulationEvidence: executionSignedSimulationEvidence.rowCount ?? 0,
+      executionLiveUnsignedSimulationEvidence:
+        executionLiveUnsignedSimulationEvidence.rowCount ?? 0,
+      executionSignedTransactions: executionSignedTransactions.rowCount ?? 0,
+      executionExitAuthorizations: executionExitAuthorizations.rowCount ?? 0,
+      executionLivePositions: executionLivePositions.rowCount ?? 0,
       executionDryRunAssessments: executionDryRunAssessments.rowCount ?? 0,
       executionSimulationArtifacts: executionSimulationArtifacts.rowCount ?? 0,
       executionControlEvents: executionControlEvents.rowCount ?? 0,
@@ -1001,8 +1109,7 @@ export async function purgeExpiredFoundationData(pool: PgPool = getDatabasePool(
       executionAttempts: executionAttempts.rowCount ?? 0,
       executionIntents: executionIntents.rowCount ?? 0,
       executionRiskRateLimitEvents: executionRiskRateLimitEvents.rowCount ?? 0,
-      executionRiskReconciliationEvidence:
-        executionRiskReconciliationEvidence.rowCount ?? 0,
+      executionRiskReconciliationEvidence: executionRiskReconciliationEvidenceCount,
       executionRiskFaults: executionRiskFaults.rowCount ?? 0,
       executionRiskReservations: executionRiskReservations.rowCount ?? 0,
       executionRiskAdmissionReports: executionRiskAdmissionReports.rowCount ?? 0,

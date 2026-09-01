@@ -34,8 +34,11 @@ interface QueryResult {
   readonly rowCount: number | null;
 }
 
-interface ExecutionIntentClient {
+export interface ExecutionIntentTransactionClient {
   query(text: string, values?: readonly unknown[]): Promise<QueryResult>;
+}
+
+interface ExecutionIntentClient extends ExecutionIntentTransactionClient {
   release(error?: boolean): void;
 }
 
@@ -176,6 +179,64 @@ const CLAIM_SQL: Readonly<Record<ExecutionClaimPurpose, string>> = Object.freeze
   DRY_RUN: dryRunClaimSql(),
 });
 
+export async function createExecutionIntentInTransaction(
+  client: ExecutionIntentTransactionClient,
+  draftValue: ExecutionIntentDraftV1,
+): Promise<Readonly<{
+  readonly kind: 'CREATED' | 'REPLAYED';
+  readonly intent: ExecutionIntentV1;
+}>> {
+  const draft = draftInput(draftValue);
+  const inserted = await client.query(
+    `INSERT INTO execution_intents AS intent (
+       id,payload_version,logical_order_key,strategy_id,strategy_version,
+       position_id,logical_command_id,mint,side,venue_policy,quote_mint,
+       quote_token_program,quote_decimals,quote_amount_raw,base_amount_raw,
+       minimum_amount_out_raw,decision_event_id,decision_fingerprint,
+       requested_at,expires_at,status
+     ) VALUES (
+       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+       TIMESTAMPTZ 'epoch' + ($19::BIGINT * INTERVAL '1 millisecond'),
+       TIMESTAMPTZ 'epoch' + ($20::BIGINT * INTERVAL '1 millisecond'),
+       'PENDING'
+     )
+     ON CONFLICT DO NOTHING
+     RETURNING ${INTENT_PROJECTION}`,
+    draftValues(draft),
+  );
+  const tombstone = await client.query(
+    `SELECT tombstone.intent_id,tombstone.logical_order_key
+     FROM execution_intent_tombstones AS tombstone
+     WHERE tombstone.intent_id = $1 OR tombstone.logical_order_key = $2
+     ORDER BY CASE WHEN tombstone.intent_id = $1 THEN 0 ELSE 1 END,
+       tombstone.intent_id
+     LIMIT 1`,
+    [draft.id, draft.logicalOrderKey],
+  );
+  if (tombstone.rowCount === 1 && tombstone.rows.length === 1) throw duplicateError();
+  if (tombstone.rowCount !== 0 || tombstone.rows.length !== 0) throw dataError();
+  if (inserted.rowCount === 1 && inserted.rows.length === 1) {
+    const intent = intentFromRow(requiredRow(inserted.rows));
+    if (intent.status !== 'PENDING' || intent.stateRevision !== 0n
+      || !sameImmutableIntent(draft, intent)) throw dataError();
+    return createResult('CREATED', intent);
+  }
+  if (inserted.rowCount !== 0 || inserted.rows.length !== 0) throw dataError();
+
+  const conflict = await client.query(
+    `SELECT ${INTENT_PROJECTION}
+     FROM execution_intents AS intent
+     WHERE intent.id = $1 OR intent.logical_order_key = $2
+     ORDER BY CASE WHEN intent.id = $1 THEN 0 ELSE 1 END, intent.id
+     FOR SHARE`,
+    [draft.id, draft.logicalOrderKey],
+  );
+  if (conflict.rowCount !== 1 || conflict.rows.length !== 1) throw duplicateError();
+  const stored = intentFromRow(requiredRow(conflict.rows));
+  if (!sameImmutableIntent(draft, stored)) throw duplicateError();
+  return createResult('REPLAYED', stored);
+}
+
 export class PostgresExecutionIntentRepository implements ExecutionIntentRepository {
   public constructor(
     private readonly pool: ExecutionIntentPool = getDatabasePool(),
@@ -186,57 +247,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     readonly intent: ExecutionIntentV1;
   }>> {
     return this.safely(async () => {
-      const draft = draftInput(draftValue);
-      return this.transaction(async (client) => {
-        const inserted = await client.query(
-          `INSERT INTO execution_intents AS intent (
-             id,payload_version,logical_order_key,strategy_id,strategy_version,
-             position_id,logical_command_id,mint,side,venue_policy,quote_mint,
-             quote_token_program,quote_decimals,quote_amount_raw,base_amount_raw,
-             minimum_amount_out_raw,decision_event_id,decision_fingerprint,
-             requested_at,expires_at,status
-           ) VALUES (
-             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-             TIMESTAMPTZ 'epoch' + ($19::BIGINT * INTERVAL '1 millisecond'),
-             TIMESTAMPTZ 'epoch' + ($20::BIGINT * INTERVAL '1 millisecond'),
-             'PENDING'
-           )
-           ON CONFLICT DO NOTHING
-           RETURNING ${INTENT_PROJECTION}`,
-          draftValues(draft),
-        );
-        const tombstone = await client.query(
-          `SELECT tombstone.intent_id,tombstone.logical_order_key
-           FROM execution_intent_tombstones AS tombstone
-           WHERE tombstone.intent_id = $1 OR tombstone.logical_order_key = $2
-           ORDER BY CASE WHEN tombstone.intent_id = $1 THEN 0 ELSE 1 END,
-             tombstone.intent_id
-           LIMIT 1`,
-          [draft.id, draft.logicalOrderKey],
-        );
-        if (tombstone.rowCount === 1 && tombstone.rows.length === 1) throw duplicateError();
-        if (tombstone.rowCount !== 0 || tombstone.rows.length !== 0) throw dataError();
-        if (inserted.rowCount === 1 && inserted.rows.length === 1) {
-          const intent = intentFromRow(requiredRow(inserted.rows));
-          if (intent.status !== 'PENDING' || intent.stateRevision !== 0n
-            || !sameImmutableIntent(draft, intent)) throw dataError();
-          return createResult('CREATED', intent);
-        }
-        if (inserted.rowCount !== 0 || inserted.rows.length !== 0) throw dataError();
-
-        const conflict = await client.query(
-          `SELECT ${INTENT_PROJECTION}
-           FROM execution_intents AS intent
-           WHERE intent.id = $1 OR intent.logical_order_key = $2
-           ORDER BY CASE WHEN intent.id = $1 THEN 0 ELSE 1 END, intent.id
-           FOR SHARE`,
-          [draft.id, draft.logicalOrderKey],
-        );
-        if (conflict.rowCount !== 1 || conflict.rows.length !== 1) throw duplicateError();
-        const stored = intentFromRow(requiredRow(conflict.rows));
-        if (!sameImmutableIntent(draft, stored)) throw duplicateError();
-        return createResult('REPLAYED', stored);
-      });
+      return this.transaction((client) => createExecutionIntentInTransaction(client, draftValue));
     });
   }
 

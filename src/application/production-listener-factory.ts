@@ -254,6 +254,11 @@ export function createProductionListenerRuntime(
     maxAttempts: config.paperDecisionRetryMaxAttempts,
     baseDelayMs: config.paperDecisionRetryBaseDelayMs,
     retentionHours: 4,
+    executionIntentEmission: config.executionIntentEmissionEnabled ? Object.freeze({
+      quoteMintAllowlist: config.paperQuoteMintAllowlist,
+      wsolMint: config.wsolMint,
+      maximumQuoteAgeMs: config.paperQuoteMaxAgeMs,
+    }) : null,
   }, qualificationProfile);
   const qualificationEngine = new QualificationEngine(qualificationProfile);
   const qualificationRebuilder = new QualificationRebuildService(qualificationEngine);

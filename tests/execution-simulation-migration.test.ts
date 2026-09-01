@@ -7,7 +7,7 @@ import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '035_execution_preflight_operations.sql';
+const latestMigrationName = '036_execution_live_canary.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);
@@ -113,6 +113,7 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
     assert.deepEqual(await migrateDatabase({ pool }), [
       migrationName,
       '034_execution_risk_reconciliation.sql',
+      '035_execution_preflight_operations.sql',
       latestMigrationName,
     ]);
     assert.equal((await pool.query('SELECT id FROM execution_intents WHERE id=$1', [parent.id])).rowCount, 1);

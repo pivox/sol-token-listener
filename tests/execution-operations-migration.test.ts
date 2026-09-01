@@ -6,6 +6,7 @@ import pg from 'pg';
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '035_execution_preflight_operations.sql';
+const latestMigrationName = '036_execution_live_canary.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const tableNames = Object.freeze([
   'execution_safety_qualifications',
@@ -47,7 +48,8 @@ void test('migration 035 applies on an empty schema and replays cleanly', async 
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.equal(applied.at(-1), latestMigrationName);
+    assert.ok(applied.includes(migrationName));
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     const tables = await pool.query<{ readonly table_name: string }>(`

@@ -2,6 +2,7 @@ import { isProxy } from 'node:util/types';
 
 export const MIN_RETENTION_PURGE_INTERVAL_MS = 60_000;
 export const MAX_RETENTION_PURGE_INTERVAL_MS = 86_400_000;
+export const MAX_RETENTION_COUNTERS = 128;
 // The native accessor is intentionally retained for its internal-slot brand check.
 // eslint-disable-next-line @typescript-eslint/unbound-method
 const abortSignalAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')?.get;
@@ -130,7 +131,7 @@ function safeCounters(value: unknown): RetentionCounters {
       || Object.is(property.value, -0)
     ) invalidCounters();
     entries.push([key, property.value]);
-    if (entries.length > 64) invalidCounters();
+    if (entries.length > MAX_RETENTION_COUNTERS) invalidCounters();
   }
   entries.sort(([left], [right]) => left.localeCompare(right));
   const counters = Object.create(null) as Record<string, number>;
