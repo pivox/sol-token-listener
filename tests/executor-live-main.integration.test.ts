@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import type { LiveExecutorConfig } from '../src/executor-live/config.js';
 import {
@@ -13,6 +14,58 @@ import {
   type LiveExecutorRuntimeScheduler,
 } from '../src/executor-live/runtime.js';
 import type { ExecutionTransactionSigner } from '../src/ports/execution-transaction-signer.js';
+
+const packageUrl = new URL('../package.json', import.meta.url);
+const parentSpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-08-30-executor-v1-design.md',
+  import.meta.url,
+);
+const liveSpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-08-31-executor-live-canary-design.md',
+  import.meta.url,
+);
+const orchestrationSpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-09-01-executor-live-orchestration-design.md',
+  import.meta.url,
+);
+const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
+const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
+
+void test('H1 remains non-live and records its exact operational boundary', async () => {
+  const [
+    packageText,
+    parentSpecification,
+    liveSpecification,
+    orchestrationSpecification,
+    runbook,
+    deploymentSmoke,
+  ] =
+    await Promise.all([
+      readFile(packageUrl, 'utf8'),
+      readFile(parentSpecificationUrl, 'utf8'),
+      readFile(liveSpecificationUrl, 'utf8'),
+      readFile(orchestrationSpecificationUrl, 'utf8'),
+      readFile(runbookUrl, 'utf8'),
+      readFile(deploymentSmokeUrl, 'utf8'),
+    ]);
+  const packageJson = JSON.parse(packageText) as {
+    readonly scripts?: Readonly<Record<string, string>>;
+  };
+
+  assert.equal(packageJson.scripts?.['executor:live:start'], undefined);
+  assert.match(parentSpecification, /\*\*Version de spécification :\*\* 1\.7\.14/u);
+  assert.match(liveSpecification, /\*\*Version de spécification :\*\* 1\.0\.14/u);
+  assert.match(liveSpecification, /\*\*Version de la spécification parente :\*\* 1\.7\.14/u);
+  assert.match(orchestrationSpecification, /\*\*Version de spécification :\*\* 1\.0\.1/u);
+  assert.match(orchestrationSpecification, /\*\*Version de la spécification parente :\*\* 1\.7\.14/u);
+  assert.match(orchestrationSpecification, /\*\*Version de la fondation live :\*\* 1\.0\.14/u);
+  assert.match(runbook, /\*\*Version :\*\* 1\.1\.3 — 2026-09-01/u);
+
+  const operationalState = /LIVE_RUNTIME_NOT_COMPOSED[\s\S]*CANARY_NOT_STARTED[\s\S]*NON_EXECUTED \/ NON_VALIDATED/u;
+  assert.match(orchestrationSpecification, operationalState);
+  assert.match(runbook, operationalState);
+  assert.match(deploymentSmoke, /'037_execution_live_orchestration\.sql'/u);
+});
 
 void test('one live pass enforces reconciliation, confirmation, SELL, deadline, BUY priority', async () => {
   const calls: string[] = [];

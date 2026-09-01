@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.1.2 — 2026-09-01
+**Version :** 1.1.3 — 2026-09-01
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime. Le binaire production est actuellement
@@ -24,6 +24,13 @@ ports réels, respecte l'ordre réconciliation → confirmation → SELL → dea
 
 Tant que ce graphe n'est pas livré et revu, les commandes opérateur restent
 inertes et aucun canary réel ne doit être tenté.
+
+La migration 037 et les repositories #51-H1 ajoutent uniquement les claims
+`LIVE_EXECUTE` SELL/BUY et `LIVE_RECOVER`, les read-models durables de
+confirmation et réconciliation, ainsi que le scan atomique des sorties à
+deadline. Ils ne composent aucun RPC, signer, appel de soumission, runtime de
+production ou entrypoint. Ces capacités restent réservées à #51-H2 ; tout
+canary restera en plus soumis à un armement manuel distinct.
 
 Le dernier verrou PostgreSQL est atomique : avant `SUBMISSION_STARTED`, il
 revalide la génération active, les bindings runtime/déploiement, le provider,

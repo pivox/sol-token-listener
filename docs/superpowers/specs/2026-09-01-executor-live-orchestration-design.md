@@ -1,10 +1,10 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.0.1
 
-**Version de la spécification parente :** 1.7.13
+**Version de la spécification parente :** 1.7.14
 
-**Version de la fondation live :** 1.0.13
+**Version de la fondation live :** 1.0.14
 
 **Date :** 2026-09-01
 
@@ -13,6 +13,12 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.1 — 2026-09-01 :** constate la livraison des seules primitives
+  persistantes H1 : claims `LIVE_EXECUTE` SELL/BUY et `LIVE_RECOVER`,
+  read-models worker-ready de confirmation et réconciliation, puis scan
+  atomique et idempotent des sorties à deadline. RPC, signer, simulation
+  signée, soumission, composition du runtime, entrypoint live et canary restent
+  explicitement différés à #51-H2 et à une opération manuelle distincte.
 - **1.0.0 — 2026-09-01 :** définit les primitives PostgreSQL qui manquent à la
   composition live : claims d'exécution par côté, reprise séparée,
   read-models worker-ready et scan atomique des sorties à deadline.

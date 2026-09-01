@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.13
+**Version de spécification :** 1.7.14
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,11 @@
 
 ## Historique des versions
 
+- **1.7.14 — 2026-09-01 :** livre #51-H1 comme une extension strictement
+  persistante : claims live séparés par côté et reprise, read-models fermés de
+  confirmation et de réconciliation, puis création atomique des sorties à
+  deadline. Aucun RPC, signer, envoi, entrypoint live ou canary n'est ajouté ;
+  leur composition reste réservée à #51-H2 et à une opération manuelle.
 - **1.7.13 — 2026-09-01 :** rend l'admission et la réconciliation BUY
   exécutables par le rôle live minimal sans droit d'écriture sur génération ou
   snapshots, grâce aux verrous advisory cohérents. Tout nouveau commit de

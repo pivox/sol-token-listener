@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.13
+**Version de spécification :** 1.0.14
 
-**Version de la spécification parente :** 1.7.13
+**Version de la spécification parente :** 1.7.14
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,11 @@
 
 ## Historique des versions
 
+- **1.0.14 — 2026-09-01 :** référence les primitives persistantes #51-H1 :
+  claims `LIVE_EXECUTE` par côté, reprise `LIVE_RECOVER`, read-models de
+  confirmation et réconciliation, et scan atomique des sorties à deadline.
+  Cette fondation ne compose ni RPC, ni signer, ni soumission, ni runtime de
+  production ; l'entrypoint et le canary manuel restent différés à #51-H2.
 - **1.0.13 — 2026-09-01 :** remplace les verrous de lignes incompatibles avec
   les tables de preuve en lecture seule par les verrous advisory génération et
   provider partagés par leurs writers. La réconciliation BUY revalide aussi le
