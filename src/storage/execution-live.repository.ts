@@ -2941,8 +2941,16 @@ async function findDeadlineIntent(
   client: DatabaseClient,
   draft: ExecutionIntentDraftV1,
 ): Promise<ExecutionIntentV1> {
-  const row = exactRow(singleRow(await client.query(`SELECT status,attempt_count,
-    state_revision::TEXT AS state_revision,last_reason_code,
+  const row = exactRow(singleRow(await client.query(`SELECT
+    id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+    logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+    quote_decimals,quote_amount_raw::TEXT AS quote_amount_raw,
+    base_amount_raw::TEXT AS base_amount_raw,
+    minimum_amount_out_raw::TEXT AS minimum_amount_out_raw,
+    decision_event_id,decision_fingerprint,
+    trunc(EXTRACT(EPOCH FROM requested_at)*1000)::TEXT AS requested_at_ms,
+    trunc(EXTRACT(EPOCH FROM expires_at)*1000)::TEXT AS expires_at_ms,
+    status,attempt_count,state_revision::TEXT AS state_revision,last_reason_code,
     CASE WHEN terminal_at IS NULL THEN NULL ELSE
       trunc(EXTRACT(EPOCH FROM terminal_at)*1000)::TEXT END AS terminal_at_ms,
     CASE WHEN reconciliation_completed_at IS NULL THEN NULL ELSE
@@ -2955,11 +2963,35 @@ async function findDeadlineIntent(
     FROM execution_intents WHERE id=$1 AND logical_order_key=$2`, [
     draft.id, draft.logicalOrderKey,
   ])), [
-    'status', 'attempt_count', 'state_revision', 'last_reason_code', 'terminal_at_ms',
+    'id', 'payload_version', 'logical_order_key', 'strategy_id', 'strategy_version',
+    'position_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
+    'quote_token_program', 'quote_decimals', 'quote_amount_raw', 'base_amount_raw',
+    'minimum_amount_out_raw', 'decision_event_id', 'decision_fingerprint',
+    'requested_at_ms', 'expires_at_ms', 'status', 'attempt_count', 'state_revision',
+    'last_reason_code', 'terminal_at_ms',
     'reconciliation_completed_at_ms', 'purge_after_ms', 'created_at_ms', 'updated_at_ms',
   ] as const);
   const candidate = Object.freeze({
-    ...draft,
+    id: text(row.id),
+    payloadVersion: integer(row.payload_version),
+    logicalOrderKey: text(row.logical_order_key),
+    strategyId: text(row.strategy_id),
+    strategyVersion: integer(row.strategy_version),
+    positionId: text(row.position_id),
+    logicalCommandId: text(row.logical_command_id),
+    mint: text(row.mint),
+    side: row.side,
+    venuePolicy: row.venue_policy,
+    quoteMint: text(row.quote_mint),
+    quoteTokenProgram: row.quote_token_program,
+    quoteDecimals: integer(row.quote_decimals),
+    quoteAmountRaw: nullableUnsignedBigint(row.quote_amount_raw),
+    baseAmountRaw: nullableUnsignedBigint(row.base_amount_raw),
+    minimumAmountOutRaw: unsignedBigint(row.minimum_amount_out_raw),
+    decisionEventId: text(row.decision_event_id),
+    decisionFingerprint: text(row.decision_fingerprint),
+    requestedAtMs: timestampText(row.requested_at_ms),
+    expiresAtMs: timestampText(row.expires_at_ms),
     status: row.status,
     attemptCount: integer(row.attempt_count),
     stateRevision: unsignedBigint(row.state_revision),
@@ -3020,6 +3052,10 @@ function unsignedBigint(value: unknown): bigint {
     throw failure('INVALID_DATA');
   }
   return BigInt(value);
+}
+
+function nullableUnsignedBigint(value: unknown): bigint | null {
+  return value === null ? null : unsignedBigint(value);
 }
 
 function signedBigint(value: unknown): bigint {

@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.10
+**Version de spécification :** 1.0.11
 
-**Version de la spécification parente :** 1.7.10
+**Version de la spécification parente :** 1.7.11
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.11 — 2026-09-01 :** impose que le rejeu d'une sortie à deadline
+  reconstruise l'intention depuis tous ses champs immuables persistés. Une
+  observation ultérieure ne peut donc ni renouveler `requestedAt`, ni repousser
+  `expiresAt`, ni modifier silencieusement le contrat de l'intention.
 - **1.0.10 — 2026-09-01 :** porte à 128 la capacité bornée du journal agrégé
   de rétention et intègre explicitement les preuves de simulation non signée
   et signée dans son contrat canonique. Le worker accepte ainsi les 66

@@ -369,6 +369,12 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
     assert.equal(replayedExit.kind, 'REPLAYED');
     assert.equal(replayedExit.intent?.id, createdExit.intent?.id);
     assert.ok(createdExit.intent);
+    const laterReplay = await repository.createDeadlineExitIntent({
+      positionId: reconciled.position.positionId,
+      observedAtMs: dueAtMs + 30_000,
+    });
+    assert.equal(laterReplay.kind, 'REPLAYED');
+    assert.deepEqual(laterReplay.intent, createdExit.intent);
     assert.ok(reconciled.exitAuthorization);
     const exitTimelineMs = Date.now();
     const exitClaimed = await new PostgresExecutionIntentRepository(pool).claim({

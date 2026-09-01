@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.10
+**Version de spécification :** 1.7.11
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.7.11 — 2026-09-01 :** ferme le rejeu des sorties à deadline sur
+  l'intention immuable stockée : toutes les propriétés sont relues et validées,
+  notamment les dates de demande et d'expiration, au lieu de provenir d'un
+  nouveau brouillon.
 - **1.7.10 — 2026-09-01 :** aligne le contrat borné de rétention avec ses 66
   compteurs effectifs après ajout des preuves live de simulation. La capacité
   reste explicitement limitée à 128 entrées et le smoke vérifie la liste
