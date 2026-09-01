@@ -834,10 +834,10 @@ void test('finalized no-effect evidence closes an ambiguous artifact without ope
   });
 });
 
-void test('finalized BUY evidence reconciles an ambiguous submission without confirmation RPC', async (context) => {
+void test('lease expiry while reconciliation waits on the intent lock fails closed', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
-    context.skip('TEST_DATABASE_URL absent: live ambiguous BUY test skipped');
+    context.skip('TEST_DATABASE_URL absent: live reconciliation lease race test skipped');
     return;
   }
   await withTemporarySchema(databaseUrl, async (pool) => {
@@ -852,12 +852,12 @@ void test('finalized BUY evidence reconciles an ambiguous submission without con
     }));
     const simulated = await repository.recordSignedSimulation(fixture.claim,
       signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
-      simulationSlot: 126n,
-      unitsConsumed: 26_000n,
-      feePayerLamportDebit: 5_500n,
-      baseDeltaRaw: 95n,
-      quoteDeltaRaw: -1_000n,
-      observedAtMs: fixture.artifact.signedAtMs + 1,
+        simulationSlot: 126n,
+        unitsConsumed: 26_000n,
+        feePayerLamportDebit: 5_500n,
+        baseDeltaRaw: 95n,
+        quoteDeltaRaw: -1_000n,
+        observedAtMs: fixture.artifact.signedAtMs + 1,
       }));
     const started = await repository.beginSubmission({
       claim: fixture.claim,
@@ -908,11 +908,237 @@ void test('finalized BUY evidence reconciles an ambiguous submission without con
         observedAtMs, finalizedAtMs: observedAtMs + 1_000,
       }),
     });
+    const stateSql = `SELECT
+      (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS artifact_state,
+      (SELECT state_revision::TEXT FROM execution_signed_transactions WHERE artifact_id=$1)
+        AS artifact_revision,
+      (SELECT state FROM execution_exposure_reservations WHERE intent_id=$2)
+        AS reservation_state,
+      (SELECT state_revision::TEXT FROM execution_exposure_reservations WHERE intent_id=$2)
+        AS reservation_revision,
+      (SELECT status FROM execution_intents WHERE id=$2) AS intent_status,
+      (SELECT state_revision::TEXT FROM execution_intents WHERE id=$2) AS intent_revision,
+      (SELECT status FROM execution_attempts WHERE intent_id=$2 AND attempt_number=1)
+        AS attempt_status,
+      (SELECT state_revision::TEXT FROM execution_wallet_risk_state WHERE generation_id=$3)
+        AS risk_revision,
+      (SELECT reserved_exposure_raw::TEXT FROM execution_wallet_risk_state
+        WHERE generation_id=$3) AS reserved_exposure_raw,
+      (SELECT open_positions FROM execution_wallet_risk_state WHERE generation_id=$3)
+        AS open_positions,
+      (SELECT unknown_block FROM execution_wallet_risk_state WHERE generation_id=$3)
+        AS unknown_block,
+      (SELECT COUNT(*)::INTEGER FROM execution_reconciliation_evidence WHERE intent_id=$2)
+        AS evidence_count,
+      (SELECT COUNT(*)::INTEGER FROM execution_live_positions) AS positions,
+      (SELECT COUNT(*)::INTEGER FROM execution_submission_events WHERE artifact_id=$1)
+        AS submission_events,
+      (SELECT COUNT(*)::INTEGER FROM execution_intent_transitions WHERE intent_id=$2)
+        AS transitions`;
+    const stateValues = [fixture.artifact.artifactId, fixture.claim.intent.id, generationId];
+    const baseline = await pool.query(stateSql, stateValues);
+    const blocker = await pool.connect();
+    const observer = await pool.connect();
+    let pending: Promise<unknown> | null = null;
+    let blockerReleased = false;
+    try {
+      await blocker.query('BEGIN');
+      const blockerIdentity = await blocker.query<{ readonly pid: number }>(
+        'SELECT pg_backend_pid() AS pid',
+      );
+      const blockerPid = blockerIdentity.rows[0]?.pid;
+      assert.ok(Number.isInteger(blockerPid));
+      await blocker.query('SELECT id FROM execution_intents WHERE id=$1 FOR UPDATE', [
+        fixture.claim.intent.id,
+      ]);
+      pending = repository.commitReconciliation(fixture.claim, evidence);
+      let blocked = false;
+      for (let attempt = 0; attempt < 100 && !blocked; attempt += 1) {
+        const observed = await observer.query<{ readonly blocked: boolean }>(`SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity activity
+          WHERE $1::INTEGER = ANY(pg_blocking_pids(activity.pid))
+        ) AS blocked`, [blockerPid]);
+        blocked = observed.rows[0]?.blocked === true;
+        if (!blocked) await observer.query('SELECT pg_sleep(0.01)');
+      }
+      assert.equal(blocked, true, 'reconciliation did not wait on the intent row lock');
+      await blocker.query(`UPDATE execution_intents SET
+        lease_expires_at=date_trunc('milliseconds',statement_timestamp()+INTERVAL '100 milliseconds')
+        WHERE id=$1`, [fixture.claim.intent.id]);
+      await blocker.query('SELECT pg_sleep(0.2)');
+      await blocker.query('COMMIT');
+      blockerReleased = true;
+      await assert.rejects(pending, isLiveRepositoryError('LEASE_LOST'));
+    } finally {
+      if (!blockerReleased) await blocker.query('ROLLBACK');
+      blocker.release();
+      observer.release();
+      if (pending !== null) await pending.catch(() => undefined);
+    }
+    const after = await pool.query(stateSql, stateValues);
+    assert.deepEqual(after.rows, baseline.rows);
+  });
+});
 
-    const result = await repository.commitReconciliation(fixture.claim, evidence);
+void test('finalized BUY evidence reconciles an ambiguous submission without confirmation RPC', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live ambiguous BUY test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await liveFixture(pool);
+    const repository = new PostgresExecutionLiveRepository(pool);
+    await repository.persistSigned(Object.freeze({
+      payloadVersion: 1, claim: fixture.claim,
+      qualificationId: fixture.qualificationId,
+      reservationId: fixture.reservationId,
+      artifact: fixture.artifact,
+      unsignedSimulation: fixture.unsignedSimulation,
+    }));
+    const simulated = await repository.recordSignedSimulation(fixture.claim,
+      signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
+      simulationSlot: 126n,
+      unitsConsumed: 26_000n,
+      feePayerLamportDebit: 5_500n,
+      baseDeltaRaw: 95n,
+      quoteDeltaRaw: -1_000n,
+      observedAtMs: fixture.artifact.signedAtMs + 1,
+      }));
+    const started = await repository.beginSubmission({
+      claim: fixture.claim,
+      artifactId: fixture.artifact.artifactId,
+      expectedRevision: simulated.stateRevision,
+      ...submissionPreflight(fixture.artifact),
+    });
+    await repository.recordSubmissionOutcome(fixture.claim, Object.freeze({
+      payloadVersion: 1,
+      artifactId: fixture.artifact.artifactId,
+      expectedRevision: started.stateRevision,
+      outcome: 'AMBIGUOUS',
+      returnedSignature: null,
+      reasonCode: 'SUBMISSION_AMBIGUOUS',
+      observedAtMs: Date.now() + 1_000,
+    }));
+    const observedAtMs = Date.now() + 2_000;
+    const expected = Object.freeze({
+      intentId: fixture.claim.intent.id,
+      attemptNumber: fixture.artifact.attemptNumber,
+      walletGeneration: 1,
+      providerId: fixture.artifact.providerId,
+      side: 'BUY' as const,
+      signature: fixture.artifact.signature,
+      blockhash: fixture.artifact.blockhash,
+      lastValidBlockHeight: fixture.artifact.lastValidBlockHeight,
+      messageHash: fixture.artifact.messageHash,
+      buildFingerprint: fixture.artifact.buildFingerprint,
+      snapshotFingerprint: fixture.artifact.snapshotFingerprint,
+      maximumFeeLamports: fixture.unsignedSimulation.estimatedFeeLamports,
+      maximumFeePayerLamportDebit:
+        fixture.unsignedSimulation.simulatedFeePayerLamportDebit,
+    });
+    const unknownEvidence = evaluateExecutionReconciliation({
+      expected,
+      observed: Object.freeze({
+        signatureHistory: 'UNKNOWN', confirmationStatus: 'NOT_FOUND',
+        finalizedBlockHeight: 999n, observedSlot: null, transaction: null,
+        feeLamports: 0n, walletLamportDelta: 0n,
+        baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
+        unexpectedResidualTokenBalanceRaw: 0n,
+        observedAtMs: observedAtMs - 1, finalizedAtMs: null,
+      }),
+    });
+    const unknown = await repository.commitReconciliation(fixture.claim, unknownEvidence);
+    assert.equal(unknown.result, 'UNKNOWN');
+    const evidence = evaluateExecutionReconciliation({
+      expected,
+      observed: Object.freeze({
+        signatureHistory: 'PRESENT', confirmationStatus: 'FINALIZED',
+        finalizedBlockHeight: 1_001n, observedSlot: 128n,
+        transaction: Object.freeze({
+          signature: fixture.artifact.signature,
+          blockhash: fixture.artifact.blockhash,
+          messageHash: fixture.artifact.messageHash,
+          buildFingerprint: fixture.artifact.buildFingerprint,
+          snapshotFingerprint: fixture.artifact.snapshotFingerprint,
+        }),
+        feeLamports: 5_000n, walletLamportDelta: -5_000n,
+        baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
+        unexpectedResidualTokenBalanceRaw: 0n,
+        observedAtMs, finalizedAtMs: observedAtMs + 1_000,
+      }),
+    });
+
+    const replacementLeaseOwner = 'live-reconciliation-replacement';
+    const rollbackSql = `SELECT
+      (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS artifact_state,
+      (SELECT state_revision::TEXT FROM execution_signed_transactions WHERE artifact_id=$1)
+        AS artifact_revision,
+      (SELECT state FROM execution_exposure_reservations WHERE intent_id=$2)
+        AS reservation_state,
+      (SELECT state_revision::TEXT FROM execution_exposure_reservations WHERE intent_id=$2)
+        AS reservation_revision,
+      (SELECT status FROM execution_intents WHERE id=$2) AS intent_status,
+      (SELECT state_revision::TEXT FROM execution_intents WHERE id=$2) AS intent_revision,
+      (SELECT lease_owner FROM execution_intents WHERE id=$2) AS lease_owner,
+      (SELECT lease_token::TEXT FROM execution_intents WHERE id=$2) AS lease_token,
+      (SELECT status FROM execution_attempts WHERE intent_id=$2 AND attempt_number=1)
+        AS attempt_status,
+      (SELECT state_revision::TEXT FROM execution_wallet_risk_state WHERE generation_id=$3)
+        AS risk_revision,
+      (SELECT reserved_exposure_raw::TEXT FROM execution_wallet_risk_state
+        WHERE generation_id=$3) AS reserved_exposure_raw,
+      (SELECT open_positions FROM execution_wallet_risk_state WHERE generation_id=$3)
+        AS open_positions,
+      (SELECT unknown_block FROM execution_wallet_risk_state WHERE generation_id=$3)
+        AS unknown_block,
+      (SELECT COUNT(*)::INTEGER FROM execution_reconciliation_evidence WHERE intent_id=$2)
+        AS evidence_count,
+      (SELECT COUNT(*)::INTEGER FROM execution_live_positions) AS positions,
+      (SELECT COUNT(*)::INTEGER FROM execution_submission_events WHERE artifact_id=$1)
+        AS submission_events,
+      (SELECT COUNT(*)::INTEGER FROM execution_intent_transitions WHERE intent_id=$2)
+        AS transitions`;
+    const rollbackValues = [
+      fixture.artifact.artifactId, fixture.claim.intent.id, generationId,
+    ];
+    const beforeRejectedReconciliation = await pool.query(rollbackSql, rollbackValues);
+    await assert.rejects(
+      repository.commitReconciliation(fixture.claim, evidence),
+      isLiveRepositoryError('LEASE_LOST'),
+    );
+    const afterRejectedReconciliation = await pool.query(rollbackSql, rollbackValues);
+    assert.deepEqual(afterRejectedReconciliation.rows, beforeRejectedReconciliation.rows);
+    const replacementClaim = await new PostgresExecutionIntentRepository(pool).claim({
+      ownerId: replacementLeaseOwner,
+      leaseMs: 60_000,
+      purpose: 'RECONCILE',
+    });
+    assert.ok(replacementClaim);
+    assert.equal(replacementClaim.intent.id, fixture.claim.intent.id);
+    const result = await repository.commitReconciliation(replacementClaim, evidence);
 
     assert.equal(result.result, 'MATCHED');
     assert.equal(result.position?.baseAmountRaw, 95n);
+    const beforeForgedReplay = await pool.query(rollbackSql, rollbackValues);
+    const forgedReplay = Object.freeze({
+      ...evidence,
+      observedAtMs: evidence.observedAtMs + 1,
+    });
+    await assert.rejects(
+      repository.commitReconciliation(fixture.claim, forgedReplay),
+      isLiveRepositoryError('CONFLICT'),
+    );
+    const afterForgedReplay = await pool.query(rollbackSql, rollbackValues);
+    assert.deepEqual(afterForgedReplay.rows, beforeForgedReplay.rows);
+    const replayed = await repository.commitReconciliation(fixture.claim, evidence);
+    assert.equal(replayed.result, 'MATCHED');
+    assert.equal(replayed.position?.positionId, result.position?.positionId);
+    const beforeUnknownReplay = await pool.query(rollbackSql, rollbackValues);
+    const replayedUnknown = await repository.commitReconciliation(fixture.claim, unknownEvidence);
+    assert.equal(replayedUnknown.result, 'UNKNOWN');
+    const afterUnknownReplay = await pool.query(rollbackSql, rollbackValues);
+    assert.deepEqual(afterUnknownReplay.rows, beforeUnknownReplay.rows);
     const state = await pool.query(`SELECT
       (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS artifact_state,
       (SELECT status FROM execution_intents WHERE id=$2) AS intent_status,

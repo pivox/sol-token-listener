@@ -74,6 +74,9 @@ export interface ExecutionReconciliationEvidenceV1 {
   readonly reasonCode: ExecutionReconciliationReasonCode;
 }
 
+type ExecutionReconciliationEvidenceFields = Omit<ExecutionReconciliationEvidenceV1,
+  'evidenceId' | 'payloadVersion' | 'evidenceFingerprint'>;
+
 interface ExpectedEvidence {
   readonly intentId: string;
   readonly attemptNumber: number;
@@ -160,17 +163,21 @@ export function evaluateExecutionReconciliation(
       result: outcome.result,
       reasonCode: outcome.reasonCode,
     } as const;
-    const evidenceFingerprint = evidenceFingerprintFor(fields);
-    const evidenceId = `execution_reconciliation_${hash([
-      'execution-reconciliation-id-v1', expected.intentId,
-      expected.attemptNumber, evidenceFingerprint,
-    ])}`;
-    return Object.freeze({
-      evidenceId,
-      payloadVersion: PAYLOAD_VERSION,
-      evidenceFingerprint,
-      ...fields,
-    });
+    return evidenceFromFields(fields);
+  } catch {
+    throw invalid();
+  }
+}
+
+export function assertExecutionReconciliationEvidenceIdentity(
+  evidence: ExecutionReconciliationEvidenceV1,
+): void {
+  try {
+    const { evidenceId, payloadVersion, evidenceFingerprint, ...fields } = evidence;
+    const canonical = evidenceFromFields(fields);
+    if (!Object.is(payloadVersion, PAYLOAD_VERSION)
+      || evidenceId !== canonical.evidenceId
+      || evidenceFingerprint !== canonical.evidenceFingerprint) throw invalid();
   } catch {
     throw invalid();
   }
@@ -310,8 +317,7 @@ function transactionFingerprint(value: NormalizedTransaction): string {
 }
 
 function evidenceFingerprintFor(
-  value: Omit<ExecutionReconciliationEvidenceV1,
-  'evidenceId' | 'payloadVersion' | 'evidenceFingerprint'>,
+  value: ExecutionReconciliationEvidenceFields,
 ): string {
   return hash([
     'execution-reconciliation-evidence-v1', value.intentId, value.attemptNumber,
@@ -326,6 +332,22 @@ function evidenceFingerprintFor(
     value.unexpectedResidualTokenBalanceRaw.toString(), value.observedAtMs,
     value.finalizedAtMs, value.result, value.reasonCode,
   ]);
+}
+
+function evidenceFromFields(
+  fields: ExecutionReconciliationEvidenceFields,
+): ExecutionReconciliationEvidenceV1 {
+  const evidenceFingerprint = evidenceFingerprintFor(fields);
+  const evidenceId = `execution_reconciliation_${hash([
+    'execution-reconciliation-id-v1', fields.intentId,
+    fields.attemptNumber, evidenceFingerprint,
+  ])}`;
+  return Object.freeze({
+    evidenceId,
+    payloadVersion: PAYLOAD_VERSION,
+    evidenceFingerprint,
+    ...fields,
+  });
 }
 
 function outcome(

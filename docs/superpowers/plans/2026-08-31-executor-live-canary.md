@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js, PostgreSQL, `@solana/web3.js` 1.98.4, SDK officiels Pump.fun/PumpSwap épinglés, `node:test`, RPC local scripté.
 
-**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.12, parent version 1.7.12.
+**Normative design:** `docs/superpowers/specs/2026-08-31-executor-live-canary-design.md` version 1.0.13, parent version 1.7.13.
 
 ---
 
@@ -509,7 +509,10 @@ npm run check
 npm run lint
 npm run docs:check
 TEST_DATABASE_URL=postgresql://haythem.mabrouk@127.0.0.1:5432/solanabot npm test
-npm run deployment:validate-images
+docker compose --env-file deploy/env.example -f deploy/compose.yaml \
+  --project-name sol-token-listener config --images migrate app retention frontend \
+  | grep -Fvx 'postgres:16.14-alpine3.23@sha256:42b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3' \
+  | npm run --silent deployment:validate-images
 git diff --check
 ```
 
@@ -538,7 +541,7 @@ envoi. Ajouter la découverte par intent/tentative et la preuve non signée
 réhydratée, puis isoler la purge dans un rôle de rétention dédié privé des
 bytes signés. Vérifier les courses, privilèges et replays sur PostgreSQL réel.
 
-- [ ] **Step 3: Open PR and run at most three review cycles**
+- [x] **Step 3: Open PR and run at most three review cycles**
 
 Push `feat/issue-51g-canary-execution`, open one PR referencing #51 and state
 explicitly that #49 is non-executed, live defaults off and no canary was sent.

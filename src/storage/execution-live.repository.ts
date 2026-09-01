@@ -685,9 +685,11 @@ export class PostgresExecutionLiveRepository {
     try {
       const committed = await new PostgresExecutionRiskRepository(this.#source)
         .reconcileWithHook(Object.freeze({ payloadVersion: 1, evidence }),
-          async (client, exactEvidence): Promise<void> => {
-            liveResults.push(await applyLiveReconciliation(client, claim, exactEvidence));
-          });
+          async (client, exactEvidence, context): Promise<void> => {
+            liveResults.push(await applyLiveReconciliation(
+              client, claim, exactEvidence, context.isReplay,
+            ));
+          }, Object.freeze({ leaseOwner: claim.leaseOwner, leaseToken: claim.leaseToken }));
       const result = liveResults[0];
       if (result === undefined || liveResults.length !== 1) throw failure('INVALID_DATA');
       return Object.freeze({
@@ -701,7 +703,10 @@ export class PostgresExecutionLiveRepository {
       if (error instanceof ExecutionLiveRepositoryError && INTERNAL_ERRORS.has(error)) throw error;
       if (error instanceof ExecutionRiskRepositoryError) {
         throw failure(error.code === 'COMMIT_OUTCOME_UNKNOWN'
-          ? 'COMMIT_OUTCOME_UNKNOWN' : 'DATABASE_FAILURE');
+          ? 'COMMIT_OUTCOME_UNKNOWN'
+          : error.code === 'LEASE_LOST'
+            ? 'LEASE_LOST'
+            : error.code === 'CONFLICT' ? 'CONFLICT' : 'DATABASE_FAILURE');
       }
       throw failure('DATABASE_FAILURE');
     }
@@ -2269,6 +2274,7 @@ async function applyLiveReconciliation(
   client: ExecutionRiskClient,
   claim: ClaimedExecutionIntent,
   evidence: ExecutionReconciliationEvidenceV1,
+  isReplay: boolean,
 ): Promise<Readonly<{
   readonly artifact: SignedTransactionArtifactV1;
   readonly position: ExecutionLivePositionV1 | null;
@@ -2294,6 +2300,9 @@ async function applyLiveReconciliation(
   const artifact = artifactFromRow(row);
   const revision = unsignedBigint(row.state_revision);
   if (row.state === 'RECONCILED') {
+    if (isReplay && (evidence.result === 'UNKNOWN' || evidence.result === 'MISMATCH')) {
+      return Object.freeze({ artifact, position: null, exitAuthorization: null });
+    }
     if (evidence.result === 'NO_EFFECT') {
       return Object.freeze({ artifact, position: null, exitAuthorization: null });
     }

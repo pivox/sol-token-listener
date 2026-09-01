@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.12
+**Version de spécification :** 1.7.13
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,13 @@
 
 ## Historique des versions
 
+- **1.7.13 — 2026-09-01 :** rend l'admission et la réconciliation BUY
+  exécutables par le rôle live minimal sans droit d'écriture sur génération ou
+  snapshots, grâce aux verrous advisory cohérents. Tout nouveau commit de
+  réconciliation BUY est désormais clôturé par le lease actif sous row lock et
+  par une heure PostgreSQL relue après l'acquisition de tous les verrous. Avant
+  un rejeu, l'identité de la preuve est recalculée depuis tous ses champs ; une
+  preuve terminale exacte reste lisible sans réappliquer ses mutations.
 - **1.7.12 — 2026-09-01 :** complète le rejeu des sorties à deadline par une
   comparaison contextuelle avec la position verrouillée et par une politique
   temporelle fermée : demande comprise entre deadline et observation, puis TTL

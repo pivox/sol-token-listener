@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.12
+**Version de spécification :** 1.0.13
 
-**Version de la spécification parente :** 1.7.12
+**Version de la spécification parente :** 1.7.13
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,15 @@
 
 ## Historique des versions
 
+- **1.0.13 — 2026-09-01 :** remplace les verrous de lignes incompatibles avec
+  les tables de preuve en lecture seule par les verrous advisory génération et
+  provider partagés par leurs writers. La réconciliation BUY revalide aussi le
+  propriétaire, le token et l'expiration du lease sous le verrou de l'intention
+  et avec une heure PostgreSQL relue après tous les verrous, avant toute nouvelle
+  preuve ou mutation. Le rejeu recalcule l'identité causale complète de la preuve
+  avant de contourner le fence et ne réapplique pas une transition déjà résolue.
+  Une intégration PostgreSQL exécute admission et réconciliation sous le rôle
+  live tout en prouvant que les tables de référence restent en lecture seule.
 - **1.0.12 — 2026-09-01 :** compare l'intention de sortie persistée au
   contexte verrouillé de la position et refuse toute divergence de mint,
   quote, montant, stratégie ou preuve. La fenêtre persistée doit commencer à

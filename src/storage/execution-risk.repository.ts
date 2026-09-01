@@ -11,7 +11,10 @@ import {
   classifyExecutionFault,
   type ExecutionRetryDecision,
 } from '../domain/execution-fault-policy.js';
-import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reconciliation.js';
+import {
+  assertExecutionReconciliationEvidenceIdentity,
+  type ExecutionReconciliationEvidenceV1,
+} from '../domain/execution-reconciliation.js';
 import {
   createExecutionRiskPolicy,
   evaluateBuyRisk,
@@ -52,10 +55,20 @@ export interface ExecutionRiskPool {
   connect(): Promise<ExecutionRiskClient>;
 }
 
+export interface ExecutionRiskReconciliationHookContext {
+  readonly isReplay: boolean;
+}
+
 export type ExecutionRiskReconciliationHook = (
   client: ExecutionRiskClient,
   evidence: ExecutionReconciliationEvidenceV1,
+  context: ExecutionRiskReconciliationHookContext,
 ) => Promise<void>;
+
+export interface ExecutionRiskReconciliationLeaseFence {
+  readonly leaseOwner: string;
+  readonly leaseToken: string;
+}
 
 export type ExecutionRiskRepositoryErrorCode =
   | 'INVALID_INPUT'
@@ -63,6 +76,7 @@ export type ExecutionRiskRepositoryErrorCode =
   | 'DATABASE_FAILURE'
   | 'COMMIT_OUTCOME_UNKNOWN'
   | 'CONFLICT'
+  | 'LEASE_LOST'
   | 'STALE_MEASUREMENT'
   | 'OPERATION_UNAVAILABLE';
 
@@ -80,6 +94,7 @@ const I128_MAX = (1n << 127n) - 1n;
 const INTERNAL_ERRORS = new WeakSet<ExecutionRiskRepositoryError>();
 const HASH = /^[0-9a-f]{64}$/u;
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]+$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const GENERATION_KEYS = Object.freeze([
   'generationId', 'payloadVersion', 'walletPublicKey', 'cluster', 'genesisHash', 'generation',
 ] as const);
@@ -138,6 +153,7 @@ const ADMISSION_REPORT_ROW_KEYS = Object.freeze([
   'wallet_state_revision', 'reservation_id',
 ] as const);
 const RECONCILIATION_COMMIT_KEYS = Object.freeze(['payloadVersion', 'evidence'] as const);
+const RECONCILIATION_LEASE_FENCE_KEYS = Object.freeze(['leaseOwner', 'leaseToken'] as const);
 const RECONCILIATION_EVIDENCE_KEYS = Object.freeze([
   'evidenceId', 'payloadVersion', 'evidenceFingerprint', 'intentId', 'attemptNumber',
   'walletGeneration', 'providerId', 'side', 'signature', 'blockhash',
@@ -197,6 +213,10 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
   public async registerWalletGeneration(input: WalletGenerationDraftV1): Promise<WalletGenerationV1> {
     const draft = generationDraftFrom(input);
     return this.transaction(async (client) => {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
+        [draft.generationId],
+      );
       const existing = await findGeneration(client, draft.generationId);
       if (existing !== null) {
         if (!sameGeneration(existing, draft)) throw failure('CONFLICT');
@@ -223,6 +243,10 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
   public async appendWalletSnapshot(input: WalletSnapshotDraftV1): Promise<WalletSnapshotV1> {
     const draft = walletSnapshotFrom(input);
     return this.transaction(async (client) => {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
+        [draft.generationId],
+      );
       const existing = await findWalletSnapshot(client, draft.snapshotId);
       if (existing !== null) {
         if (!sameWalletSnapshot(existing, draft)) throw failure('CONFLICT');
@@ -231,7 +255,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       const latest = await client.query(`SELECT snapshot_id,state_revision::TEXT AS state_revision,
         superseded_at
         FROM execution_wallet_snapshots WHERE generation_id=$1
-        ORDER BY state_revision DESC LIMIT 1 FOR UPDATE`, [draft.generationId]);
+        ORDER BY state_revision DESC LIMIT 1`, [draft.generationId]);
       if (latest.rows.length > 1) throw failure('INVALID_DATA');
       const latestRow = latest.rows.length === 0 ? null : exactRow(latest.rows[0], [
         'snapshot_id', 'state_revision', 'superseded_at',
@@ -289,7 +313,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       const latestResult = await client.query(`SELECT ${PROVIDER_PROJECTION}
         FROM execution_provider_usage_snapshots
         WHERE provider_id=$1
-        ORDER BY billing_period_started_at DESC,measured_at DESC LIMIT 1 FOR UPDATE`,
+        ORDER BY billing_period_started_at DESC,measured_at DESC LIMIT 1`,
       [snapshot.providerId]);
       if (latestResult.rows.length > 1) throw failure('INVALID_DATA');
       if (latestResult.rows.length === 1) {
@@ -351,7 +375,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       }
       const snapshotResult = await client.query(`SELECT provider_id,billing_period_id,
         superseded_at FROM execution_provider_usage_snapshots
-        WHERE snapshot_id=$1 FOR UPDATE`, [operation.snapshotId]);
+        WHERE snapshot_id=$1`, [operation.snapshotId]);
       if (snapshotResult.rows.length !== 1) throw failure('CONFLICT');
       const snapshot = exactRow(snapshotResult.rows[0], [
         'provider_id', 'billing_period_id', 'superseded_at',
@@ -392,7 +416,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       await client.query(`SELECT snapshot_id
         FROM execution_provider_usage_snapshots
         WHERE provider_id=$1 AND billing_period_id=$2
-        ORDER BY measured_at DESC,snapshot_id DESC LIMIT 1 FOR UPDATE`, [
+        ORDER BY measured_at DESC,snapshot_id DESC LIMIT 1`, [
         event.providerId, event.billingPeriodId,
       ]);
       try {
@@ -431,7 +455,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       const decisionAtMs = Math.max(operationAtMs, input.nowMs);
       const generationResult = await client.query(`SELECT generation_id,wallet_public_key,
         cluster,genesis_hash,generation FROM execution_wallet_generations
-        WHERE generation_id=$1 AND retired_at IS NULL FOR UPDATE`, [input.generationId]);
+        WHERE generation_id=$1 AND retired_at IS NULL`, [input.generationId]);
       if (generationResult.rows.length !== 1) throw failure('CONFLICT');
       exactRow(singleRow(generationResult), [
         'generation_id', 'wallet_public_key', 'cluster', 'genesis_hash', 'generation',
@@ -644,7 +668,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         FROM execution_wallet_risk_state AS risk
         JOIN execution_wallet_generations AS generation
           ON generation.generation_id=risk.generation_id
-        WHERE risk.generation_id=$1 FOR UPDATE OF risk,generation`, [input.generationId]);
+        WHERE risk.generation_id=$1 FOR UPDATE OF risk`, [input.generationId]);
       const state = exactRow(singleRow(stateResult), [
         'state_revision', 'consecutive_technical_failures', 'retired_at',
       ] as const);
@@ -726,7 +750,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
           ON risk.generation_id=evidence.generation_id
         JOIN execution_wallet_generations AS generation
           ON generation.generation_id=evidence.generation_id
-        WHERE evidence.evidence_id=$1 FOR UPDATE OF evidence,risk,generation`, [input.evidenceId]);
+        WHERE evidence.evidence_id=$1 FOR UPDATE OF evidence,risk`, [input.evidenceId]);
       const proof = exactRow(singleRow(proofResult), [
         'evidence_id', 'intent_id', 'generation_id', 'result', 'finalized_at_ms',
         'state_revision', 'consecutive_technical_failures', 'retired_at',
@@ -805,9 +829,16 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
   public async reconcileWithHook(
     inputValue: ExecutionReconciliationCommitV1,
     hook: ExecutionRiskReconciliationHook,
+    leaseFenceValue?: ExecutionRiskReconciliationLeaseFence,
   ): Promise<ExecutionReconciliationCommitResultV1> {
     const evidence = reconciliationCommitFrom(inputValue);
+    const leaseFence = reconciliationLeaseFenceFrom(leaseFenceValue);
     return this.transaction(async (client) => {
+      try {
+        assertExecutionReconciliationEvidenceIdentity(evidence);
+      } catch {
+        throw failure('CONFLICT');
+      }
       const identity = await client.query(`SELECT generation_id FROM execution_exposure_reservations
         WHERE intent_id=$1`, [evidence.intentId]);
       const generationId = patternedText(
@@ -829,6 +860,10 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         risk.open_positions,risk.unknown_block,
         intent.status AS intent_status,intent.side AS intent_side,
         intent.state_revision::TEXT AS intent_revision,
+        intent.lease_owner,intent.lease_token::TEXT AS lease_token,
+        CASE WHEN intent.lease_expires_at IS NULL THEN NULL ELSE
+          trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT END
+          AS lease_expires_at_ms,
         attempt.provider_id,attempt.status AS attempt_status,
         attempt.reconciliation_signature,
         attempt.reconciliation_blockhash,
@@ -850,14 +885,15 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         JOIN execution_attempts AS attempt ON attempt.intent_id=intent.id
           AND attempt.attempt_number=$2
         WHERE reservation.intent_id=$1 AND reservation.generation_id=$3
-        FOR UPDATE OF reservation,generation,risk,intent,attempt`, [
+        FOR UPDATE OF reservation,risk,intent,attempt`, [
         evidence.intentId, evidence.attemptNumber, generationId,
       ]);
       const row = exactRow(singleRow(locked), [
         'reservation_id', 'reservation_state', 'maximum_amount_raw', 'reservation_revision',
         'wallet_snapshot_fingerprint', 'generation',
         'risk_revision', 'reserved_exposure_raw', 'open_positions', 'unknown_block',
-        'intent_status', 'intent_side', 'intent_revision', 'provider_id', 'attempt_status',
+        'intent_status', 'intent_side', 'intent_revision', 'lease_owner', 'lease_token',
+        'lease_expires_at_ms', 'provider_id', 'attempt_status',
         'reconciliation_signature', 'reconciliation_blockhash',
         'reconciliation_last_valid_block_height', 'reconciliation_message_hash',
         'reconciliation_build_fingerprint', 'reconciliation_snapshot_fingerprint',
@@ -880,8 +916,20 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       if (replay !== undefined) {
         if (replay.evidence_fingerprint !== evidence.evidenceFingerprint
           || replay.result !== evidence.result) throw failure('CONFLICT');
-        await hook(client, evidence);
+        await hook(client, evidence, Object.freeze({ isReplay: true }));
         return reconciliationResult(evidence);
+      }
+      if (leaseFence !== null) {
+        const clock = exactRow(singleRow(await client.query(`SELECT
+          trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms`)), [
+          'now_ms',
+        ] as const);
+        if (row.lease_owner !== leaseFence.leaseOwner
+          || row.lease_token !== leaseFence.leaseToken
+          || row.lease_expires_at_ms === null
+          || textTimestamp(row.lease_expires_at_ms) <= textTimestamp(clock.now_ms)) {
+          throw failure('LEASE_LOST');
+        }
       }
       if (priorEvidence.length > 0) {
         const latestObservedAtMs = priorEvidence.reduce(
@@ -1042,7 +1090,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         ]);
         if (attemptUpdate.rowCount !== 1) throw failure('CONFLICT');
       }
-      await hook(client, evidence);
+      await hook(client, evidence, Object.freeze({ isReplay: false }));
       return reconciliationResult(evidence);
     });
   }
@@ -1417,6 +1465,21 @@ function reconciliationCommitFrom(value: unknown): ExecutionReconciliationEviden
   }
 }
 
+function reconciliationLeaseFenceFrom(
+  value: ExecutionRiskReconciliationLeaseFence | undefined,
+): ExecutionRiskReconciliationLeaseFence | null {
+  if (value === undefined) return null;
+  try {
+    const row = exactInput(value, RECONCILIATION_LEASE_FENCE_KEYS);
+    return Object.freeze({
+      leaseOwner: text(row.leaseOwner, 256),
+      leaseToken: patternedText(row.leaseToken, UUID),
+    });
+  } catch {
+    throw failure('INVALID_INPUT');
+  }
+}
+
 function reconciliationResult(
   evidence: ExecutionReconciliationEvidenceV1,
 ): ExecutionReconciliationCommitResultV1 {
@@ -1674,7 +1737,7 @@ async function findGeneration(
   generationId: string,
 ): Promise<WalletGenerationV1 | null> {
   const result = await client.query(`SELECT ${GENERATION_PROJECTION}
-    FROM execution_wallet_generations WHERE generation_id=$1 FOR UPDATE`, [generationId]);
+    FROM execution_wallet_generations WHERE generation_id=$1`, [generationId]);
   if (result.rows.length > 1) throw failure('INVALID_DATA');
   return result.rows.length === 0 ? null : decodeGeneration(result.rows[0]);
 }
@@ -1686,7 +1749,7 @@ async function findWalletSnapshot(
 ): Promise<WalletSnapshotV1 | null> {
   const result = await client.query(`SELECT ${WALLET_SNAPSHOT_PROJECTION}
     FROM execution_wallet_snapshots WHERE snapshot_id=$1
-      AND (NOT $2::BOOLEAN OR superseded_at IS NULL) FOR UPDATE`, [snapshotId, currentOnly]);
+      AND (NOT $2::BOOLEAN OR superseded_at IS NULL)`, [snapshotId, currentOnly]);
   if (result.rows.length > 1) throw failure('INVALID_DATA');
   return result.rows.length === 0 ? null : decodeWalletSnapshot(result.rows[0]);
 }
@@ -1698,7 +1761,7 @@ async function findProviderSnapshot(
 ): Promise<ProviderUsageSnapshotV1 | null> {
   const result = await client.query(`SELECT ${PROVIDER_PROJECTION}
     FROM execution_provider_usage_snapshots WHERE snapshot_id=$1
-      AND (NOT $2::BOOLEAN OR superseded_at IS NULL) FOR UPDATE`, [snapshotId, currentOnly]);
+      AND (NOT $2::BOOLEAN OR superseded_at IS NULL)`, [snapshotId, currentOnly]);
   if (result.rows.length > 1) throw failure('INVALID_DATA');
   return result.rows.length === 0 ? null : decodeProviderSnapshot(result.rows[0]);
 }
