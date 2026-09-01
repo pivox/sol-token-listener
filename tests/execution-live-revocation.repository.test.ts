@@ -400,8 +400,9 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
   );
   assert.ok(entry.position);
   assert.ok(entry.exitAuthorization);
+  const exitDeadlineAtMs = await makePositionDue(pool, entry.position.positionId);
   const exit = await live.createDeadlineExitIntent({
-    positionId: entry.position.positionId, observedAtMs: entry.position.exitDeadlineAtMs,
+    positionId: entry.position.positionId, observedAtMs: exitDeadlineAtMs,
   });
   assert.ok(exit.intent);
   const intents = new PostgresExecutionIntentRepository(pool);
@@ -416,7 +417,7 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
     humanMessage: 'Prepare a revocable canary SELL.', activationPhase: 'CANARY',
     evidence: Object.freeze({
       payloadVersion: 1, attemptNumber: null, sourceEventId: null,
-      observedAtMs: entry.position.exitDeadlineAtMs,
+      observedAtMs: exitDeadlineAtMs,
     }),
   });
   const begun = await intents.beginAttempt(Object.freeze({ ...claimed, intent: processing }));
@@ -818,6 +819,26 @@ function safetyQualification(
       expiresAtMs: nowMs + 300_000,
     })),
   });
+}
+
+async function makePositionDue(
+  pool: InstanceType<typeof pg.Pool>,
+  positionId: string,
+): Promise<number> {
+  await pool.query(`ALTER TABLE execution_live_positions
+    DISABLE TRIGGER execution_live_positions_guarded_update`);
+  const updated = await pool.query(`UPDATE execution_live_positions SET
+    exit_deadline_at=date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 second',
+    opened_at=date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 second'
+      -(maximum_holding_ms*INTERVAL '1 millisecond')
+    WHERE position_id=$1
+    RETURNING trunc(EXTRACT(EPOCH FROM exit_deadline_at)*1000)::TEXT AS deadline_ms`, [
+    positionId,
+  ]);
+  assert.equal(updated.rowCount, 1);
+  const deadlineMs = updated.rows[0]?.deadline_ms;
+  assert.equal(typeof deadlineMs, 'string');
+  return Number(deadlineMs);
 }
 
 async function seedSuccessfulSimulation(pool: InstanceType<typeof pg.Pool>) {
