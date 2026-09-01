@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.14
+**Version de spécification :** 1.7.15
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,11 @@
 
 ## Historique des versions
 
+- **1.7.15 — 2026-09-01 :** ferme la lecture des travaux H1 sur l'identité
+  causale déterministe des artefacts, le décodage Solana canonique et les
+  couples exacts entre états d'intention et d'artefact. Les sorties ciblées
+  refusent aussi toute observation future par rapport à l'heure PostgreSQL et
+  conservent une borne de rejeu stable.
 - **1.7.14 — 2026-09-01 :** livre #51-H1 comme une extension strictement
   persistante : claims live séparés par côté et reprise, read-models fermés de
   confirmation et de réconciliation, puis création atomique des sorties à

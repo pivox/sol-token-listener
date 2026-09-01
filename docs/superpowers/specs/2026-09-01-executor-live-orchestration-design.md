@@ -1,10 +1,10 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.0.2
 
-**Version de la spécification parente :** 1.7.14
+**Version de la spécification parente :** 1.7.15
 
-**Version de la fondation live :** 1.0.14
+**Version de la fondation live :** 1.0.15
 
 **Date :** 2026-09-01
 
@@ -13,6 +13,11 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.2 — 2026-09-01 :** impose aux read-models le recalcul de l'identité
+  causale de l'artefact sans lire ses bytes, le décodage base58 canonique des
+  valeurs Solana et une matrice fermée intention/artefact. L'API ciblée de
+  deadline refuse une observation postérieure à l'heure PostgreSQL fraîche et
+  rejoue avec la borne originale, sans élargissement temporel implicite.
 - **1.0.1 — 2026-09-01 :** constate la livraison des seules primitives
   persistantes H1 : claims `LIVE_EXECUTE` SELL/BUY et `LIVE_RECOVER`,
   read-models worker-ready de confirmation et réconciliation, puis scan

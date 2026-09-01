@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js, PostgreSQL, `node:test`, migrations SQL rejouables, calculs financiers en `bigint`.
 
-**Normative design:** `docs/superpowers/specs/2026-09-01-executor-live-orchestration-design.md` version 1.0.0, parent version 1.7.13, live foundation version 1.0.13.
+**Normative design:** `docs/superpowers/specs/2026-09-01-executor-live-orchestration-design.md` version 1.0.2, parent version 1.7.15, live foundation version 1.0.15.
 
 ---
 
@@ -237,8 +237,8 @@ npx tsx --test tests/executor-live-main.integration.test.ts \
 
 - [ ] **Step 3: Update versioned documentation**
 
-Bump H1 to 1.0.1, parent to 1.7.14, live foundation to 1.0.14 and the runbook
-patch version. Record only delivered H1 primitives and explicitly defer RPC,
+Bump H1 to 1.0.2, parent to 1.7.15, live foundation to 1.0.15 and the runbook
+to 1.1.4. Record only delivered H1 primitives and explicitly defer RPC,
 signer, submission, runtime composition and canary to H2/manual operation.
 
 - [ ] **Step 4: Run documentation and architecture gates**

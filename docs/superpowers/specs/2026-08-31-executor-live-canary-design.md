@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.14
+**Version de spécification :** 1.0.15
 
-**Version de la spécification parente :** 1.7.14
+**Version de la spécification parente :** 1.7.15
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.15 — 2026-09-01 :** durcit les primitives H1 sans composer de runtime :
+  identité d'artefact recalculée depuis les champs causaux, valeurs Solana
+  décodées canoniquement, matrice d'états fermée et temps de deadline borné par
+  une horloge PostgreSQL fraîche avec rejeu stable.
 - **1.0.14 — 2026-09-01 :** référence les primitives persistantes #51-H1 :
   claims `LIVE_EXECUTE` par côté, reprise `LIVE_RECOVER`, read-models de
   confirmation et réconciliation, et scan atomique des sorties à deadline.

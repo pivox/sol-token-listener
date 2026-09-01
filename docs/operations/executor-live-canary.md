@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.1.3 — 2026-09-01
+**Version :** 1.1.4 — 2026-09-01
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime. Le binaire production est actuellement
