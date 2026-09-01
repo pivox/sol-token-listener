@@ -16,6 +16,7 @@ import {
 import type {
   ClaimedExecutionIntent,
   ExecutionBeginAttemptResult,
+  ExecutionClaimOptions,
   ExecutionClaimPurpose,
   ExecutionIntentRepository,
   ExecutionIntentTransitionEvidenceV1,
@@ -45,11 +46,18 @@ type CreateResult = Readonly<{
   readonly kind: 'CREATED' | 'REPLAYED';
   readonly intent: ExecutionIntentV1;
 }>;
-type ClaimOptions = Readonly<{
-  readonly ownerId: string;
-  readonly leaseMs: number;
-  readonly purpose: ExecutionClaimPurpose;
-}>;
+type ClaimOptions =
+  | Readonly<{
+      readonly ownerId: string;
+      readonly leaseMs: number;
+      readonly purpose: 'LIVE_EXECUTE';
+      readonly side: 'BUY' | 'SELL';
+    }>
+  | Readonly<{
+      readonly ownerId: string;
+      readonly leaseMs: number;
+      readonly purpose: 'LIVE_RECOVER' | 'CONFIRM' | 'RECONCILE' | 'EXECUTE' | 'DRY_RUN';
+    }>;
 type AttemptIdentity = Readonly<{
   readonly intentId: string;
   readonly attemptNumber: number;
@@ -128,12 +136,10 @@ type ExactSurfaceAssertions = AssertAll<{
     & Expect<Equal<ExecutionIntentTransitionInput['humanMessage'], string>>
     & Expect<Equal<ExecutionIntentTransitionInput['activationPhase'], 'NONE' | 'CANARY' | 'MICRO_LIVE' | 'PILOT'>>
     & Expect<Equal<ExecutionIntentTransitionInput['evidence'], ExecutionIntentTransitionEvidenceV1>>;
-  claimOptions: Expect<Equal<keyof ActualClaimOptions, keyof ClaimOptions>>
-    & Expect<Equal<OptionalKeys<ActualClaimOptions>, never>>
-    & Expect<Equal<ReadonlyKeys<ActualClaimOptions>, keyof ActualClaimOptions>>
-    & Expect<Equal<ActualClaimOptions['ownerId'], string>>
-    & Expect<Equal<ActualClaimOptions['leaseMs'], number>>
-    & Expect<Equal<ActualClaimOptions['purpose'], ExecutionClaimPurpose>>;
+  claimOptions: Expect<Equal<ExecutionClaimOptions, ClaimOptions>>
+    & Expect<Equal<ActualClaimOptions, ClaimOptions>>
+    & Expect<Equal<Extract<ActualClaimOptions, { readonly purpose: 'LIVE_EXECUTE' }>['side'], 'BUY' | 'SELL'>>
+    & Expect<Equal<keyof Exclude<ActualClaimOptions, { readonly purpose: 'LIVE_EXECUTE' }>, 'ownerId' | 'leaseMs' | 'purpose'>>;
   finishAttemptInput: Expect<Equal<keyof ActualFinishAttemptInput, keyof FinishAttemptInput>>
     & Expect<Equal<OptionalKeys<ActualFinishAttemptInput>, never>>
     & Expect<Equal<ReadonlyKeys<ActualFinishAttemptInput>, keyof ActualFinishAttemptInput>>
@@ -163,13 +169,13 @@ void test('execution intent repository is an allowlisted domain-only persistence
   const source = await readFile(sourceUrl, 'utf8');
   const sourceFile = ts.createSourceFile(sourcePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 
-  assert.equal(sourceFile.statements.length, 8);
+  assert.equal(sourceFile.statements.length, 9);
   const [firstStatement, ...declarations] = sourceFile.statements;
   assert.ok(firstStatement !== undefined && ts.isImportDeclaration(firstStatement));
   const domainImport = firstStatement !== undefined && ts.isImportDeclaration(firstStatement)
     ? firstStatement
     : undefined;
-  assert.equal(declarations.length, 7);
+  assert.equal(declarations.length, 8);
   assert.ok(declarations.every(isExportedPortDeclaration));
   assert.ok(domainImport?.importClause?.isTypeOnly);
   assert.ok(domainImport?.moduleSpecifier !== undefined && ts.isStringLiteral(domainImport.moduleSpecifier));
@@ -195,6 +201,7 @@ void test('execution intent repository is an allowlisted domain-only persistence
       'ClaimedExecutionIntent',
       'ExecutionAttemptIdentity',
       'ExecutionBeginAttemptResult',
+      'ExecutionClaimOptions',
       'ExecutionClaimPurpose',
       'ExecutionIntentRepository',
       'ExecutionIntentTransitionEvidenceV1',
@@ -271,6 +278,14 @@ function compileTimeNegativeAssertions(): void {
   void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'EXECUTE', signer: 'capability' });
   // @ts-expect-error claim accepts at most one cancellation signal.
   void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'EXECUTE' }, new AbortController().signal, new AbortController().signal);
+  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_EXECUTE', side: 'BUY' });
+  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_RECOVER' });
+  // @ts-expect-error live execution claims require an explicit lane side.
+  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_EXECUTE' });
+  // @ts-expect-error legacy claim purposes remain side-free.
+  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'EXECUTE', side: 'SELL' });
+  // @ts-expect-error live recovery is not an execution lane.
+  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_RECOVER', side: 'BUY' });
   // @ts-expect-error transition input cannot carry a wallet capability.
   const transition: ExecutionIntentTransitionInput = { intentId: 'id', expectedStatus: 'PENDING', nextStatus: 'PROCESSING', leaseToken: 'lease', reasonCode: 'INTENT_LEASE_LOST', humanMessage: 'message', activationPhase: 'NONE', evidence, wallet: 'capability' };
   // @ts-expect-error claimed values are readonly.
