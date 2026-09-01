@@ -929,90 +929,43 @@ export class PostgresExecutionLiveRepository {
     if (!/^execution_live_position_[0-9a-f]{64}$/u.test(input.positionId)
       || !validTimestamp(input.observedAtMs)) throw failure('INVALID_INPUT');
     return this.transaction(async (client) => {
-      const identity = exactRow(singleRow(await client.query(`SELECT generation_id
-        FROM execution_live_positions WHERE position_id=$1`, [input.positionId])), [
-        'generation_id',
-      ] as const);
-      if (typeof identity.generation_id !== 'string') throw failure('INVALID_DATA');
-      await lockGeneration(client, identity.generation_id);
-      const row = exactRow(singleRow(await client.query(`SELECT
-        position.position_id,position.state,position.state_revision::TEXT AS position_revision,
-        position.exit_intent_id,position.mint,position.quote_mint,
-        position.remaining_base_raw::TEXT AS remaining_base_raw,
-        trunc(EXTRACT(EPOCH FROM position.exit_deadline_at)*1000)::TEXT AS exit_deadline_at_ms,
-        position.entry_reconciliation_fingerprint,
-        buy.quote_token_program,buy.quote_decimals
+      const generationId = await deadlinePositionGeneration(client, input.positionId);
+      await lockGeneration(client, generationId);
+      return createDeadlineExitIntentLocked(client, { ...input, generationId });
+    });
+  }
+
+  public async createNextDeadlineExitIntent(): Promise<ExecutionDeadlineExitResultV1 | null> {
+    return this.transaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(
+        hashtextextended('execution-live-deadline-scan:v1', 51007))`);
+      const clock = exactRow(singleRow(await client.query(`SELECT
+        /* execution_live_deadline_clock */
+        trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
+          AS deadline_clock_ms`)), ['deadline_clock_ms'] as const);
+      const observedAtMs = timestampText(clock.deadline_clock_ms);
+      const candidates = await client.query(`SELECT position.position_id,position.generation_id
         FROM execution_live_positions position
-        JOIN execution_intents buy ON buy.id=position.buy_intent_id
-        WHERE position.position_id=$1 FOR UPDATE OF position`, [input.positionId])), [
-        'position_id', 'state', 'position_revision', 'exit_intent_id', 'mint', 'quote_mint',
-        'remaining_base_raw', 'exit_deadline_at_ms', 'entry_reconciliation_fingerprint',
-        'quote_token_program', 'quote_decimals',
-      ] as const);
-      const exitDeadlineAtMs = timestampText(row.exit_deadline_at_ms);
-      if (input.observedAtMs < exitDeadlineAtMs) {
-        return Object.freeze({ payloadVersion: 1, kind: 'NOT_DUE', intent: null });
-      }
-      const logicalCommandId = `maximum-holding:${input.positionId}`;
-      const draft = createExecutionIntentDraft({
-        strategyId: 'maximum-holding-exit',
-        strategyVersion: 1,
-        positionId: input.positionId,
-        logicalCommandId,
-        mint: row.mint,
-        side: 'SELL',
-        venuePolicy: 'CANONICAL_EXIT',
-        quoteMint: row.quote_mint,
-        quoteTokenProgram: row.quote_token_program,
-        quoteDecimals: integer(row.quote_decimals),
-        quoteAmountRaw: null,
-        baseAmountRaw: unsignedBigint(row.remaining_base_raw),
-        minimumAmountOutRaw: 1n,
-        decisionEventId: logicalCommandId,
-        decisionFingerprint: row.entry_reconciliation_fingerprint,
-        requestedAtMs: input.observedAtMs,
-        expiresAtMs: input.observedAtMs + 120_000,
-      });
-      if (row.exit_intent_id !== null) {
-        if (row.exit_intent_id !== draft.id) throw failure('CONFLICT');
-        return Object.freeze({
-          payloadVersion: 1,
-          kind: 'REPLAYED',
-          intent: await findDeadlineIntent(client, draft, exitDeadlineAtMs),
-        });
-      }
-      if (row.state !== 'OPEN' || unsignedBigint(row.remaining_base_raw) === 0n) {
-        throw failure('CONFLICT');
-      }
-      const inserted = await client.query(`INSERT INTO execution_intents (
-        id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
-        logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
-        quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
-        decision_event_id,decision_fingerprint,requested_at,expires_at,status
-      ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,'SELL','CANONICAL_EXIT',$8,$9,$10,NULL,
-        $11::NUMERIC,$12::NUMERIC,$13,$14,
-        TIMESTAMPTZ 'epoch'+($15::BIGINT*INTERVAL '1 millisecond'),
-        TIMESTAMPTZ 'epoch'+($16::BIGINT*INTERVAL '1 millisecond'),'PENDING')`, [
-        draft.id, draft.logicalOrderKey, draft.strategyId, draft.strategyVersion,
-        draft.positionId, draft.logicalCommandId, draft.mint, draft.quoteMint,
-        draft.quoteTokenProgram, draft.quoteDecimals, draft.baseAmountRaw?.toString(),
-        draft.minimumAmountOutRaw.toString(), draft.decisionEventId,
-        draft.decisionFingerprint, draft.requestedAtMs, draft.expiresAtMs,
+        WHERE position.state='OPEN'
+          AND position.exit_deadline_at <= TIMESTAMPTZ 'epoch'
+            +($1::BIGINT*INTERVAL '1 millisecond')
+        ORDER BY position.exit_deadline_at ASC,position.position_id ASC LIMIT 1`, [
+        observedAtMs,
       ]);
-      if (inserted.rowCount !== 1) throw failure('CONFLICT');
-      const revision = unsignedBigint(row.position_revision);
-      const positioned = await client.query(`UPDATE execution_live_positions SET
-        state='EXIT_PENDING',state_revision=$2::BIGINT,exit_intent_id=$3
-        WHERE position_id=$1 AND state='OPEN' AND state_revision=$4::BIGINT
-          AND exit_intent_id IS NULL`, [
-        input.positionId, (revision + 1n).toString(), draft.id, revision.toString(),
-      ]);
-      if (positioned.rowCount !== 1) throw failure('CONFLICT');
-      return Object.freeze({
-        payloadVersion: 1,
-        kind: 'CREATED',
-        intent: await findDeadlineIntent(client, draft, exitDeadlineAtMs),
+      if (candidates.rows.length === 0) return null;
+      const candidate = exactRow(singleRow(candidates), ['position_id', 'generation_id'] as const);
+      const positionId = text(candidate.position_id);
+      const generationId = text(candidate.generation_id);
+      if (!/^execution_live_position_[0-9a-f]{64}$/u.test(positionId)
+        || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(generationId)) {
+        throw failure('INVALID_DATA');
+      }
+      await lockGeneration(client, generationId);
+      const result = await createDeadlineExitIntentLocked(client, {
+        positionId, observedAtMs, generationId,
       });
+      if (result.kind === 'NOT_DUE') throw failure('CONFLICT');
+      return result;
     });
   }
 
@@ -3157,10 +3110,121 @@ async function commitSellReconciliation(
   });
 }
 
+async function deadlinePositionGeneration(
+  client: DatabaseClient,
+  positionId: string,
+): Promise<string> {
+  const identity = exactRow(singleRow(await client.query(`SELECT generation_id
+    FROM execution_live_positions WHERE position_id=$1`, [positionId])), [
+    'generation_id',
+  ] as const);
+  const generationId = text(identity.generation_id);
+  if (!/^execution_wallet_generation_[0-9a-f]{64}$/u.test(generationId)) {
+    throw failure('INVALID_DATA');
+  }
+  return generationId;
+}
+
+async function createDeadlineExitIntentLocked(
+  client: DatabaseClient,
+  input: Readonly<{
+    readonly positionId: string;
+    readonly observedAtMs: number;
+    readonly generationId: string;
+  }>,
+): Promise<ExecutionDeadlineExitResultV1> {
+  const row = exactRow(singleRow(await client.query(`SELECT
+    position.position_id,position.generation_id,position.state,
+    position.state_revision::TEXT AS position_revision,
+    position.exit_intent_id,position.mint,position.quote_mint,
+    position.remaining_base_raw::TEXT AS remaining_base_raw,
+    trunc(EXTRACT(EPOCH FROM position.exit_deadline_at)*1000)::TEXT AS exit_deadline_at_ms,
+    position.entry_reconciliation_fingerprint,
+    buy.quote_token_program,buy.quote_decimals
+    FROM execution_live_positions position
+    JOIN execution_intents buy ON buy.id=position.buy_intent_id
+    WHERE position.position_id=$1 FOR UPDATE OF position`, [input.positionId])), [
+    'position_id', 'generation_id', 'state', 'position_revision', 'exit_intent_id', 'mint',
+    'quote_mint', 'remaining_base_raw', 'exit_deadline_at_ms',
+    'entry_reconciliation_fingerprint', 'quote_token_program', 'quote_decimals',
+  ] as const);
+  if (row.position_id !== input.positionId || row.generation_id !== input.generationId) {
+    throw failure('INVALID_DATA');
+  }
+  const exitDeadlineAtMs = timestampText(row.exit_deadline_at_ms);
+  if (input.observedAtMs < exitDeadlineAtMs) {
+    return Object.freeze({ payloadVersion: 1, kind: 'NOT_DUE', intent: null });
+  }
+  const logicalCommandId = `maximum-holding:${input.positionId}`;
+  const draft = createExecutionIntentDraft({
+    strategyId: 'maximum-holding-exit',
+    strategyVersion: 1,
+    positionId: input.positionId,
+    logicalCommandId,
+    mint: row.mint,
+    side: 'SELL',
+    venuePolicy: 'CANONICAL_EXIT',
+    quoteMint: row.quote_mint,
+    quoteTokenProgram: row.quote_token_program,
+    quoteDecimals: integer(row.quote_decimals),
+    quoteAmountRaw: null,
+    baseAmountRaw: unsignedBigint(row.remaining_base_raw),
+    minimumAmountOutRaw: 1n,
+    decisionEventId: logicalCommandId,
+    decisionFingerprint: row.entry_reconciliation_fingerprint,
+    requestedAtMs: input.observedAtMs,
+    expiresAtMs: input.observedAtMs + 120_000,
+  });
+  if (row.exit_intent_id !== null) {
+    if (row.exit_intent_id !== draft.id) throw failure('CONFLICT');
+    const replayUpperBoundMs = Math.max(input.observedAtMs, await freshDatabaseNow(client));
+    return Object.freeze({
+      payloadVersion: 1,
+      kind: 'REPLAYED',
+      intent: await findDeadlineIntent(
+        client, draft, exitDeadlineAtMs, replayUpperBoundMs,
+      ),
+    });
+  }
+  if (row.state !== 'OPEN' || unsignedBigint(row.remaining_base_raw) === 0n) {
+    throw failure('CONFLICT');
+  }
+  const inserted = await client.query(`INSERT INTO execution_intents (
+    id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+    logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+    quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+    decision_event_id,decision_fingerprint,requested_at,expires_at,status
+  ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,'SELL','CANONICAL_EXIT',$8,$9,$10,NULL,
+    $11::NUMERIC,$12::NUMERIC,$13,$14,
+    TIMESTAMPTZ 'epoch'+($15::BIGINT*INTERVAL '1 millisecond'),
+    TIMESTAMPTZ 'epoch'+($16::BIGINT*INTERVAL '1 millisecond'),'PENDING')`, [
+    draft.id, draft.logicalOrderKey, draft.strategyId, draft.strategyVersion,
+    draft.positionId, draft.logicalCommandId, draft.mint, draft.quoteMint,
+    draft.quoteTokenProgram, draft.quoteDecimals, draft.baseAmountRaw?.toString(),
+    draft.minimumAmountOutRaw.toString(), draft.decisionEventId,
+    draft.decisionFingerprint, draft.requestedAtMs, draft.expiresAtMs,
+  ]);
+  if (inserted.rowCount !== 1) throw failure('CONFLICT');
+  const revision = unsignedBigint(row.position_revision);
+  const positioned = await client.query(`UPDATE execution_live_positions SET
+    state='EXIT_PENDING',state_revision=$2::BIGINT,exit_intent_id=$3
+    WHERE position_id=$1 AND state='OPEN' AND state_revision=$4::BIGINT
+      AND exit_intent_id IS NULL`, [
+    input.positionId, (revision + 1n).toString(), draft.id, revision.toString(),
+  ]);
+  if (positioned.rowCount !== 1) throw failure('CONFLICT');
+  return Object.freeze({
+    payloadVersion: 1,
+    kind: 'CREATED',
+    intent: await findDeadlineIntent(client, draft, exitDeadlineAtMs, input.observedAtMs),
+  });
+}
+
 async function findDeadlineIntent(
   client: DatabaseClient,
   draft: ExecutionIntentDraftV1,
   exitDeadlineAtMs: number,
+  requestedAtUpperBoundMs: number,
 ): Promise<ExecutionIntentV1> {
   const row = exactRow(singleRow(await client.query(`SELECT
     id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
@@ -3230,7 +3294,7 @@ async function findDeadlineIntent(
   }
   if (!sameDeadlineIntentContext(candidate, draft)
     || candidate.requestedAtMs < exitDeadlineAtMs
-    || candidate.requestedAtMs > draft.requestedAtMs
+    || candidate.requestedAtMs > requestedAtUpperBoundMs
     || candidate.expiresAtMs - candidate.requestedAtMs !== 120_000) {
     throw failure('INVALID_DATA');
   }

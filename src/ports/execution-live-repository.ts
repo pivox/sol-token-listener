@@ -201,4 +201,5 @@ export interface ExecutionLiveRepository {
     readonly positionId: string;
     readonly observedAtMs: number;
   }>): Promise<ExecutionDeadlineExitResultV1>;
+  createNextDeadlineExitIntent(): Promise<ExecutionDeadlineExitResultV1 | null>;
 }

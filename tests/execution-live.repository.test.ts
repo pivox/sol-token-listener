@@ -86,6 +86,139 @@ function signedSimulationEvidence(
   });
 }
 
+void test('deadline scanner uses one PostgreSQL clock, exact deadline and oldest-first order',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: deadline scanner clock test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await openPositionFixture(pool);
+      assert.equal(await fixture.live.createNextDeadlineExitIntent(), null);
+
+      const queries: string[] = [];
+      const scanner = deadlineClockRepository(
+        pool, fixture.position.exitDeadlineAtMs, Object.freeze({ queries }),
+      );
+      const result = await scanner.createNextDeadlineExitIntent();
+      assert.equal(result?.kind, 'CREATED');
+      assert.equal(result?.intent?.side, 'SELL');
+      assert.equal(result?.intent?.logicalCommandId,
+        `maximum-holding:${fixture.position.positionId}`);
+      assert.equal(result?.intent?.baseAmountRaw, fixture.position.baseAmountRaw);
+      assert.equal(result?.intent?.requestedAtMs, fixture.position.exitDeadlineAtMs);
+      assert.equal((result?.intent?.expiresAtMs ?? 0) - (result?.intent?.requestedAtMs ?? 0),
+        120_000);
+
+      const normalized = queries.map((query) => query.replaceAll(/\s+/gu, ' ').trim());
+      const globalLock = normalized.findIndex((query) =>
+        query.includes("hashtextextended('execution-live-deadline-scan:v1', 51007)"));
+      const clock = normalized.findIndex((query) =>
+        query.includes('execution_live_deadline_clock'));
+      const candidate = normalized.findIndex((query) =>
+        query.includes("position.state='OPEN'") && query.includes('exit_deadline_at <='));
+      const generationLock = normalized.findIndex((query) =>
+        query.includes('hashtextextended($1, 51005)'));
+      const rowLock = normalized.findIndex((query) => query.includes('FOR UPDATE OF position'));
+      assert.ok(globalLock >= 0 && globalLock < clock);
+      assert.ok(clock < candidate && candidate < generationLock && generationLock < rowLock);
+      assert.match(normalized[candidate] ?? '',
+        /ORDER BY position\.exit_deadline_at ASC,position\.position_id ASC LIMIT 1/u);
+    });
+  });
+
+void test('two concurrent deadline scanners create one deterministic SELL intent',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: concurrent deadline scanner test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await openPositionFixture(pool);
+      const scanner = deadlineClockRepository(pool, fixture.position.exitDeadlineAtMs);
+      const results = await Promise.all([
+        scanner.createNextDeadlineExitIntent(),
+        scanner.createNextDeadlineExitIntent(),
+      ]);
+      assert.equal(results.filter((result) => result?.kind === 'CREATED').length, 1);
+      assert.equal(results.filter((result) => result === null).length, 1);
+      const durable = await pool.query(`SELECT
+        (SELECT COUNT(*)::INTEGER FROM execution_intents
+          WHERE logical_command_id=$1 AND side='SELL') AS intents,
+        (SELECT state FROM execution_live_positions WHERE position_id=$2) AS position_state`, [
+        `maximum-holding:${fixture.position.positionId}`, fixture.position.positionId,
+      ]);
+      assert.deepEqual(durable.rows, [{ intents: 1, position_state: 'EXIT_PENDING' }]);
+    });
+  });
+
+void test('deadline scanner commit-unknown retries safely through durable targeted replay',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: deadline scanner commit-unknown test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await openPositionFixture(pool);
+      const uncertain = deadlineClockRepository(pool, fixture.position.exitDeadlineAtMs,
+        Object.freeze({ failFirstCommitAfterSuccess: true }));
+      await assert.rejects(
+        uncertain.createNextDeadlineExitIntent(),
+        isLiveRepositoryError('COMMIT_OUTCOME_UNKNOWN'),
+      );
+      assert.equal(
+        await deadlineClockRepository(pool, fixture.position.exitDeadlineAtMs)
+          .createNextDeadlineExitIntent(),
+        null,
+      );
+      const replay = await fixture.live.createDeadlineExitIntent({
+        positionId: fixture.position.positionId,
+        observedAtMs: fixture.position.exitDeadlineAtMs + 1,
+      });
+      assert.equal(replay.kind, 'REPLAYED');
+      const count = await pool.query<{ readonly count: number }>(`SELECT COUNT(*)::INTEGER AS count
+        FROM execution_intents WHERE logical_command_id=$1`, [
+        `maximum-holding:${fixture.position.positionId}`,
+      ]);
+      assert.deepEqual(count.rows, [{ count: 1 }]);
+    });
+  });
+
+void test('targeted deadline creation wins safely while a scanner waits on its global lock',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: scanner versus targeted deadline test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await openPositionFixture(pool);
+      const blocker = await pool.connect();
+      let scanner: Promise<unknown> | null = null;
+      try {
+        await blocker.query('BEGIN');
+        await blocker.query(`SELECT pg_advisory_xact_lock(
+          hashtextextended('execution-live-deadline-scan:v1', 51007))`);
+        scanner = deadlineClockRepository(pool, fixture.position.exitDeadlineAtMs)
+          .createNextDeadlineExitIntent();
+        const targeted = await fixture.live.createDeadlineExitIntent({
+          positionId: fixture.position.positionId,
+          observedAtMs: fixture.position.exitDeadlineAtMs,
+        });
+        assert.equal(targeted.kind, 'CREATED');
+        await blocker.query('COMMIT');
+        assert.equal(await scanner, null);
+      } finally {
+        try { await blocker.query('ROLLBACK'); } catch { /* transaction already closed */ }
+        blocker.release();
+        if (scanner !== null) await scanner.catch(() => undefined);
+      }
+    });
+  });
+
 void test('worker read-models expose fenced provider-affine inputs without signed bytes',
   async (context) => {
     const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -1743,6 +1876,89 @@ async function acceptedBuyFixture(
     observedAtMs: Date.now() + 1_000,
   }));
   return Object.freeze({ ...fixture, live });
+}
+
+async function openPositionFixture(pool: InstanceType<typeof pg.Pool>) {
+  const fixture = await acceptedBuyFixture(pool);
+  const intents = new PostgresExecutionIntentRepository(pool);
+  const submittedIntent = await intents.read(fixture.claim.intent.id);
+  assert.ok(submittedIntent);
+  const submittedClaim = Object.freeze({ ...fixture.claim, intent: submittedIntent });
+  const confirmation = await fixture.live.readConfirmationWork(submittedClaim);
+  const confirmationObservedAtMs = Date.now() + 2_000;
+  await fixture.live.recordConfirmation(submittedClaim, Object.freeze({
+    payloadVersion: 1,
+    artifactId: confirmation.artifactId,
+    expectedRevision: confirmation.expectedRevision,
+    signature: confirmation.signature,
+    observedSlot: 127n,
+    observedAtMs: confirmationObservedAtMs,
+  }));
+  const confirmedIntent = await intents.read(fixture.claim.intent.id);
+  assert.ok(confirmedIntent);
+  const confirmedClaim = Object.freeze({ ...fixture.claim, intent: confirmedIntent });
+  const reconciliation = await fixture.live.readReconciliationWork(confirmedClaim);
+  const evidence = evaluateExecutionReconciliation({
+    expected: reconciliation.request.expected,
+    observed: Object.freeze({
+      signatureHistory: 'PRESENT',
+      confirmationStatus: 'FINALIZED',
+      finalizedBlockHeight: 1_001n,
+      observedSlot: 128n,
+      transaction: Object.freeze({
+        signature: fixture.artifact.signature,
+        blockhash: fixture.artifact.blockhash,
+        messageHash: fixture.artifact.messageHash,
+        buildFingerprint: fixture.artifact.buildFingerprint,
+        snapshotFingerprint: fixture.artifact.snapshotFingerprint,
+      }),
+      feeLamports: 5_000n,
+      walletLamportDelta: -5_000n,
+      baseDeltaRaw: 95n,
+      quoteDeltaRaw: -1_000n,
+      unexpectedResidualTokenBalanceRaw: 0n,
+      observedAtMs: confirmationObservedAtMs + 1_000,
+      finalizedAtMs: confirmationObservedAtMs + 2_000,
+    }),
+  });
+  const committed = await fixture.live.commitReconciliation(confirmedClaim, evidence);
+  assert.equal(committed.result, 'MATCHED');
+  assert.ok(committed.position);
+  return Object.freeze({ ...fixture, position: committed.position });
+}
+
+function deadlineClockRepository(
+  pool: InstanceType<typeof pg.Pool>,
+  deadlineClockMs: number,
+  options: Readonly<{
+    readonly queries?: string[];
+    readonly failFirstCommitAfterSuccess?: boolean;
+  }> = {},
+): PostgresExecutionLiveRepository {
+  let failCommit = options.failFirstCommitAfterSuccess === true;
+  return new PostgresExecutionLiveRepository({
+    connect: async () => {
+      const client = await pool.connect();
+      return {
+        query: async (text: string, values?: readonly unknown[]) => {
+          options.queries?.push(text);
+          if (text.includes('execution_live_deadline_clock')) {
+            return { rows: [{ deadline_clock_ms: String(deadlineClockMs) }], rowCount: 1 };
+          }
+          const result = await client.query(text, values as unknown[] | undefined);
+          if (text === 'COMMIT' && failCommit) {
+            failCommit = false;
+            throw new Error('simulated deadline commit acknowledgement loss');
+          }
+          return {
+            rows: result.rows as readonly Readonly<Record<string, unknown>>[],
+            rowCount: result.rowCount,
+          };
+        },
+        release: (error?: boolean) => { client.release(error); },
+      };
+    },
+  });
 }
 
 function safetyQualification(
