@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.9.0
+**Version de spécification :** 1.9.1
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,9 @@
 
 ## Historique des versions
 
+- **1.9.1 — 2026-09-04 :** ferme les memberships H2a avec les options
+  PostgreSQL 16 exactes, interdit tout rôle parent de recovery et rend
+  normative l'allowlist effective complète des ACL de relations et colonnes.
 - **1.9.0 — 2026-09-04 :** isole H2a derrière le rôle PostgreSQL dédié
   `sol_token_executor_live_recovery`, appliqué et vérifié à chaque checkout.
   Des ACL de colonnes retirent tout accès aux bytes signés et aux mutations de

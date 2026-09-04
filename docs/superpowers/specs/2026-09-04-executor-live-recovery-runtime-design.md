@@ -1,10 +1,10 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.1.0
+**Version de spécification :** 1.1.1
 
-**Version de la spécification parente :** 1.9.0
+**Version de la spécification parente :** 1.9.1
 
-**Version de l'orchestration persistante :** 1.1.0
+**Version de l'orchestration persistante :** 1.1.1
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,13 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.1 — 2026-09-04 :** ferme le graphe d'appartenance PostgreSQL 16 :
+  l'unique arête directe du login est `WITH ADMIN FALSE, INHERIT FALSE, SET
+  TRUE` vers recovery et recovery n'est membre d'aucun rôle parent. Elle rend
+  aussi normative l'allowlist effective complète des tables, colonnes et
+  séquences ; tout privilège supplémentaire, y compris reçu de `PUBLIC`, par
+  ownership ou membership, fait échouer le démarrage. La signature publique
+  reste lisible pour la finalité, seules ses mutations sont interdites.
 - **1.1.0 — 2026-09-04 :** isole l'autorité PostgreSQL de H2a dans le rôle de
   groupe dédié `sol_token_executor_live_recovery`. Un login de déploiement
   externe, sans héritage et sans privilège direct, obtient ce rôle exact ;
@@ -150,8 +157,10 @@ Le rôle de groupe `sol_token_executor_live_recovery` est `NOLOGIN`,
 `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOINHERIT`, `NOREPLICATION` et
 `NOBYPASSRLS`. Le login de déploiement est créé hors dépôt, avec `LOGIN`,
 `NOINHERIT`, les mêmes indicateurs privilégiés à faux, aucun privilège direct
-et une appartenance exacte au seul rôle recovery. Aucun mot de passe n'est
-versionné.
+et une appartenance exacte au seul rôle recovery. Sur PostgreSQL 16, cette
+arête porte exactement `WITH ADMIN FALSE, INHERIT FALSE, SET TRUE` : le login
+peut activer recovery mais n'en hérite pas et ne peut le déléguer. Recovery
+n'est lui-même membre d'aucun autre rôle. Aucun mot de passe n'est versionné.
 
 ## 3. Invariants de sécurité
 
@@ -180,7 +189,8 @@ versionné.
     `SET ROLE sol_token_executor_live_recovery` ; un échec évince le client.
 16. Le rôle recovery ne peut ni sélectionner `signed_transaction_bytes`, ni
     insérer une transaction signée, une preuve de simulation signée ou de
-    préflight, ni écrire une transition de soumission.
+    préflight, ni initier une transition `SUBMISSION_STARTED`. Les événements
+    durables de confirmation et réconciliation restent autorisés.
 17. Les façades runtime ont un prototype nul, sont gelées et possèdent
     exactement les méthodes autorisées ; elles ne fuient ni pool, ni client,
     ni repository complet.
@@ -233,14 +243,50 @@ relâché comme défectueux et n'est jamais exposé.
 
 La validation exige simultanément :
 
+- PostgreSQL 16 ou supérieur, afin que les options d'arête de membership soient
+  observables et vérifiables ;
 - `current_user = sol_token_executor_live_recovery` ;
 - un `session_user` distinct, `LOGIN`, `NOINHERIT` et sans attribut privilégié ;
 - le rôle cible `NOLOGIN`, `NOINHERIT` et sans attribut privilégié ;
-- une appartenance directe et exacte du login au seul rôle recovery ;
-- l'absence des privilèges interdits, y compris au niveau colonne.
+- une appartenance directe et exacte du login au seul rôle recovery, avec
+  `admin_option=false`, `inherit_option=false`, `set_option=true` ;
+- aucune appartenance sortante de recovery vers un rôle parent ;
+- l'allowlist effective exacte décrite ci-dessous, en tenant compte de
+  `PUBLIC`, de l'ownership et des memberships.
 
 Le nom du login de session est une donnée de déploiement privée : il est
 comparé dans PostgreSQL mais n'est jamais renvoyé dans l'évidence ni journalisé.
+
+### 5.1 Matrice normative des ACL effectives
+
+Toutes les autorisations de relations sont accordées par colonne ; aucun droit
+de table `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES` ou
+`TRIGGER` n'est admis. Le schéma `public` autorise `USAGE` et refuse `CREATE`.
+Recovery ne possède aucune relation. Une seule séquence autorise `USAGE` :
+`execution_intent_transitions_sequence_seq`; elle refuse `SELECT` et `UPDATE`.
+
+La matrice de colonnes est l'union exacte suivante :
+
+| Table | SELECT | INSERT | UPDATE |
+|---|---|---|---|
+| `migration_history` | `version` | — | — |
+| `execution_intents` | `id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,decision_event_id,decision_fingerprint,requested_at,expires_at,status,attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,purge_after` | `id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,decision_event_id,decision_fingerprint,requested_at,expires_at,status` | `status,state_revision,last_reason_code,lease_owner,lease_token,lease_expires_at,terminal_at,reconciliation_completed_at,purge_after,updated_at` |
+| `execution_signed_transactions` | toutes sauf `signed_transaction_bytes` | — | `state,state_revision,submitted_at,confirmed_at,confirmed_slot,reconciled_at,purge_after` |
+| `execution_attempts` | `intent_id,attempt_number,status,effective_venue,provider_id,reconciliation_signature,reconciliation_blockhash,reconciliation_last_valid_block_height,reconciliation_message_hash,reconciliation_build_fingerprint,reconciliation_snapshot_fingerprint,reconciliation_maximum_fee_lamports,reconciliation_maximum_fee_payer_lamport_debit` | — | `status,completed_at,reason_code` |
+| `execution_wallet_generations` | `generation_id,payload_version,wallet_public_key,generation,cluster,genesis_hash,retired_at` | — | — |
+| `execution_live_positions` | `position_id,buy_intent_id,generation_id,armament_id,wallet_public_key,mint,quote_mint,state,state_revision,exit_intent_id,remaining_base_raw,quote_cost_raw,exit_deadline_at,entry_reconciliation_fingerprint` | `position_id,payload_version,buy_intent_id,generation_id,armament_id,wallet_public_key,mint,quote_mint,entry_venue,quote_cost_raw,base_amount_raw,remaining_base_raw,fee_lamports,maximum_holding_ms,opened_at,exit_deadline_at,entry_reconciliation_fingerprint,state,state_revision` | `state,state_revision,exit_intent_id,remaining_base_raw,exit_reconciliation_fingerprint,closed_at,purge_after` |
+| `execution_activation_armaments` | `armament_id,provider_id,state,state_revision,maximum_holding_ms` | — | `state,state_revision,terminal_at,purge_after` |
+| `execution_exit_authorizations` | `authorization_id,position_id,state,state_revision` | `authorization_id,payload_version,position_id,generation_id,wallet_public_key,mint,quote_mint,maximum_base_amount_raw,state,state_revision,created_at` | `state,state_revision,locked_intent_id,locked_attempt_number,terminal_at,purge_after` |
+| `execution_wallet_risk_state` | `generation_id,state_revision,reserved_exposure_raw,open_positions,unknown_block` | — | `state_revision,reserved_exposure_raw,open_positions,unknown_block,updated_at` |
+| `execution_exposure_reservations` | `reservation_id,intent_id,generation_id,state,state_revision,maximum_amount_raw,wallet_snapshot_fingerprint` | — | `state,state_revision,reconciled_at,purge_after` |
+| `execution_reconciliation_evidence` | `evidence_id,evidence_fingerprint,intent_id,attempt_number,generation_id,side,result,observed_at,resolved_by_evidence_id` | `evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,build_fingerprint,snapshot_fingerprint,maximum_fee_lamports,maximum_fee_payer_lamport_debit,signature_history,confirmation_status,finalized_block_height,observed_slot,observed_transaction_fingerprint,fee_lamports,wallet_lamport_delta,base_delta_raw,quote_delta_raw,unexpected_residual_token_balance_raw,observed_at,finalized_at,result,reason_code,purge_after` | `resolved_by_evidence_id,resolved_at,purge_after` |
+| `execution_intent_transitions` | — | `intent_id,previous_status,next_status,reason_code,human_message,activation_phase,attempt_number,evidence,occurred_at` | — |
+| `execution_submission_events` | — | `event_id,payload_version,event_fingerprint,artifact_id,generation_id,previous_state,next_state,reason_code,occurred_at` | — |
+| `execution_activation_events` | — | `event_id,payload_version,event_fingerprint,armament_id,generation_id,previous_state,next_state,reason_code,occurred_at` | — |
+
+Ces listes sont matérialisées et testées dans le code de policy ; elles ne sont
+pas interprétées dynamiquement depuis le schéma. Toute colonne ou relation
+future est interdite jusqu'à une nouvelle version de cette spécification.
 
 Les fingerprints build, configuration et stratégie restent inclus et validés
 dans chaque read-model H1. Ils ne sont pas épinglés à la version courante de

@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.3.0 — 2026-09-04
+**Version :** 1.3.1 — 2026-09-04
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime signable. #51-H2a publie uniquement
@@ -65,11 +65,11 @@ transaction.
 Avant ce démarrage, un administrateur rejoue
 `scripts/provision-executor-roles.sql`, crée hors dépôt un login dédié
 `LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
-NOBYPASSRLS`, puis lui accorde uniquement
-`sol_token_executor_live_recovery`. Le mot de passe et le nom du login ne sont
-jamais committés. Le runtime applique et contrôle ce rôle à chaque checkout ;
-il refuse un login hérité, privilégié, sans appartenance ou membre d'un autre
-rôle.
+NOBYPASSRLS`, puis lui accorde uniquement `sol_token_executor_live_recovery`
+avec PostgreSQL 16 `WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`. Le mot de passe
+et le nom du login ne sont jamais committés. Recovery ne doit être membre
+d'aucun autre rôle. Le runtime contrôle ce graphe et l'allowlist effective
+complète à chaque démarrage ; il refuse toute autorité supplémentaire.
 
 Le runtime H2a traite, dans l'ordre, une réconciliation finalized, une
 confirmation ou une échéance par passe. Il ne réclame jamais `LIVE_RECOVER`,
@@ -140,8 +140,9 @@ ajoute une table à la purge ; le job reste arrêté si ce provisioning échoue.
 
 Le rôle signable `sol_token_executor_live` est le seul rôle applicatif autorisé
 à lire les octets signés. Le rôle H2a recovery ne reçoit que les colonnes et
-mutations de finalité nécessaires ; `signed_transaction_bytes`, signature,
-simulation signée, préflight et soumission lui sont interdits. Listener,
+mutations de finalité nécessaires ; `signed_transaction_bytes`, mutation de
+signature, simulation signée, préflight et démarrage de soumission lui sont
+interdits. Listener,
 worker dry-run, opérations, lecteur opérateur et API publique n'ont aucun accès
 aux bytes signés. Seul le rôle de rétention reçoit les `DELETE` nécessaires à
 la purge. Il n'obtient qu'une lecture par colonnes
