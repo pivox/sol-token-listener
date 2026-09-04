@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.9.1
+**Version de spécification :** 1.9.2
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,12 @@
 
 ## Historique des versions
 
+- **1.9.2 — 2026-09-04 :** complète l'autorité H2a avec les lectures de
+  colonnes exécutées transitivement par les triggers PostgreSQL de confirmation
+  et de réconciliation, fixe le `search_path` et refuse toute autorité directe
+  du login, routine `SECURITY DEFINER` accessible ou capacité à placer
+  `session_replication_role` en mode replica. L'allowlist refuse aussi tout
+  `GRANT OPTION`, sans ajouter de capacité signable ou de soumission.
 - **1.9.1 — 2026-09-04 :** ferme les memberships H2a avec les options
   PostgreSQL 16 exactes, interdit tout rôle parent de recovery et rend
   normative l'allowlist effective complète des ACL de relations et colonnes.

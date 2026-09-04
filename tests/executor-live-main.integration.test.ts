@@ -65,7 +65,7 @@ void test('H2a publishes only read-only recovery while signable live remains abs
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.9.1',
+    '**Version de spécification :** 1.9.2',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -86,12 +86,12 @@ void test('H2a publishes only read-only recovery while signable live remains abs
   );
   assertContainsExactlyOnce(
     orchestrationSpecification,
-    '**Version de spécification :** 1.1.1',
+    '**Version de spécification :** 1.1.2',
     'orchestration specification version',
   );
   assertContainsExactlyOnce(
     orchestrationSpecification,
-    '**Version de la spécification parente :** 1.9.1',
+    '**Version de la spécification parente :** 1.9.2',
     'orchestration parent specification version',
   );
   assertContainsExactlyOnce(
@@ -101,22 +101,22 @@ void test('H2a publishes only read-only recovery while signable live remains abs
   );
   assertContainsExactlyOnce(
     recoverySpecification,
-    '**Version de spécification :** 1.1.1',
+    '**Version de spécification :** 1.1.2',
     'recovery specification version',
   );
   assertContainsExactlyOnce(
     recoverySpecification,
-    '**Version de la spécification parente :** 1.9.1',
+    '**Version de la spécification parente :** 1.9.2',
     'recovery parent specification version',
   );
   assertContainsExactlyOnce(
     recoverySpecification,
-    "**Version de l'orchestration persistante :** 1.1.1",
+    "**Version de l'orchestration persistante :** 1.1.2",
     'recovery orchestration specification version',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.3.1 — 2026-09-04',
+    '**Version :** 1.3.2 — 2026-09-04',
     'runbook version',
   );
 

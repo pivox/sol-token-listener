@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import bs58 from 'bs58';
 import pg from 'pg';
@@ -35,11 +36,14 @@ import {
 import { PostgresExecutionOperationsRepository } from '../src/storage/execution-operations.repository.js';
 import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.repository.js';
 import { PostgresExecutionSimulationRepository } from '../src/storage/execution-simulation.repository.js';
+import { createLiveRecoveryBootstrapDatabase } from
+  '../src/executor-live-recovery/database.js';
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const walletPublicKey = '11111111111111111111111111111111';
 const quoteMint = 'So11111111111111111111111111111111111111112';
 const fingerprint = '1'.repeat(64);
+const roleProvisioningUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 
 function submissionPreflight(artifact: ReturnType<typeof createSignedTransactionArtifact>) {
   return Object.freeze({
@@ -2182,6 +2186,171 @@ void test('rejects a signed artifact state update without its immutable journal 
   });
 });
 
+void test('PostgreSQL 16 recovery authority commits finality and creates a deadline SELL',
+  async (context) => {
+    const configuredUrl = process.env.TEST_DATABASE_URL;
+    if (configuredUrl === undefined || configuredUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: recovery authority integration skipped');
+      return;
+    }
+    const baseUrl = new URL(configuredUrl);
+    const maintenance = new pg.Pool({ connectionString: baseUrl.href });
+    const capabilities = await maintenance.query<{
+      readonly rolsuper: boolean;
+      readonly rolcreatedb: boolean;
+      readonly server_version_number: number;
+    }>(`SELECT role.rolsuper,role.rolcreatedb,
+      current_setting('server_version_num')::INTEGER AS server_version_number
+      FROM pg_roles role WHERE role.rolname=current_user`);
+    const capability = capabilities.rows[0];
+    if (!capability?.rolsuper || !capability.rolcreatedb
+      || capability.server_version_number < 160_000) {
+      await maintenance.end();
+      context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
+      return;
+    }
+
+    const suffix = randomUUID().replaceAll('-', '');
+    const databaseName = `h2a_runtime_test_${suffix}`;
+    const loginName = `h2a_runtime_${suffix}`;
+    const password = randomUUID().replaceAll('-', '');
+    const isolatedUrl = new URL(baseUrl);
+    isolatedUrl.pathname = `/${databaseName}`;
+    let isolated: InstanceType<typeof pg.Pool> | undefined;
+    let recoveryDatabase: ReturnType<typeof createLiveRecoveryBootstrapDatabase> | undefined;
+    try {
+      await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
+      isolated = new pg.Pool({ connectionString: isolatedUrl.href });
+      const fixture = await acceptedBuyFixture(isolated);
+      await clearLease(isolated, fixture.claim.intent.id);
+      const provisioning = await readFile(roleProvisioningUrl, 'utf8');
+      await isolated.query(provisioning);
+      await isolated.query(provisioning);
+      await maintenance.query(`CREATE ROLE ${quoteIdentifier(loginName)} LOGIN NOINHERIT
+        NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+        PASSWORD ${quoteLiteral(password)}`);
+      await maintenance.query(`GRANT sol_token_executor_live_recovery
+        TO ${quoteIdentifier(loginName)} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
+
+      const loginUrl = new URL(isolatedUrl);
+      loginUrl.username = loginName;
+      loginUrl.password = password;
+      const loginPool = new pg.Pool({ connectionString: loginUrl.href, max: 2 });
+      recoveryDatabase = createLiveRecoveryBootstrapDatabase(loginPool, () => loginPool.end());
+
+      const confirmationClaim = await recoveryDatabase.intents.claimConfirmation(
+        'h2a-confirmation', 60_000,
+      );
+      assert.ok(confirmationClaim);
+      const confirmation = await recoveryDatabase.live.readConfirmationWork(confirmationClaim);
+      const confirmationObservedAtMs = Date.now() + 2_000;
+      await recoveryDatabase.live.recordConfirmation(confirmationClaim, Object.freeze({
+        payloadVersion: 1,
+        artifactId: confirmation.artifactId,
+        expectedRevision: confirmation.expectedRevision,
+        signature: confirmation.signature,
+        observedSlot: 127n,
+        observedAtMs: confirmationObservedAtMs,
+      }));
+
+      const unknownClaim = await recoveryDatabase.intents.claimReconciliation(
+        'h2a-reconciliation-unknown', 60_000,
+      );
+      assert.ok(unknownClaim);
+      const reconciliation = await recoveryDatabase.live.readReconciliationWork(unknownClaim);
+      const unknown = evaluateExecutionReconciliation({
+        expected: reconciliation.request.expected,
+        observed: Object.freeze({
+          signatureHistory: 'UNKNOWN', confirmationStatus: 'NOT_FOUND',
+          finalizedBlockHeight: 1_000n, observedSlot: null, transaction: null,
+          feeLamports: 0n, walletLamportDelta: 0n, baseDeltaRaw: 0n,
+          quoteDeltaRaw: 0n, unexpectedResidualTokenBalanceRaw: 0n,
+          observedAtMs: confirmationObservedAtMs + 1_000, finalizedAtMs: null,
+        }),
+      });
+      await recoveryDatabase.live.commitReconciliation(unknownClaim, unknown);
+      assert.equal((await isolated.query(
+        'SELECT status FROM execution_intents WHERE id=$1',
+        [fixture.claim.intent.id],
+      )).rows[0]?.status, 'UNKNOWN_REQUIRES_RECONCILIATION');
+
+      const matchedClaim = await recoveryDatabase.intents.claimReconciliation(
+        'h2a-reconciliation-matched', 60_000,
+      );
+      assert.ok(matchedClaim);
+      const matchedWork = await recoveryDatabase.live.readReconciliationWork(matchedClaim);
+      const matched = evaluateExecutionReconciliation({
+        expected: matchedWork.request.expected,
+        observed: Object.freeze({
+          signatureHistory: 'PRESENT', confirmationStatus: 'FINALIZED',
+          finalizedBlockHeight: 1_001n, observedSlot: 128n,
+          transaction: Object.freeze({
+            signature: fixture.artifact.signature,
+            blockhash: fixture.artifact.blockhash,
+            messageHash: fixture.artifact.messageHash,
+            buildFingerprint: fixture.artifact.buildFingerprint,
+            snapshotFingerprint: fixture.artifact.snapshotFingerprint,
+          }),
+          feeLamports: 5_000n, walletLamportDelta: -5_000n,
+          baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
+          unexpectedResidualTokenBalanceRaw: 0n,
+          observedAtMs: confirmationObservedAtMs + 2_000,
+          finalizedAtMs: confirmationObservedAtMs + 3_000,
+        }),
+      });
+      await recoveryDatabase.live.commitReconciliation(matchedClaim, matched);
+      const durable = await isolated.query<{
+        readonly position_id: string;
+        readonly unknown_resolved: boolean;
+        readonly artifact_state: string;
+      }>(`SELECT position.position_id,
+          EXISTS (SELECT 1 FROM execution_reconciliation_evidence evidence
+            WHERE evidence.intent_id=$1 AND evidence.result='UNKNOWN'
+              AND evidence.resolved_by_evidence_id IS NOT NULL) AS unknown_resolved,
+          transaction.state AS artifact_state
+        FROM execution_live_positions position
+        JOIN execution_signed_transactions transaction
+          ON transaction.intent_id=position.buy_intent_id
+        WHERE position.buy_intent_id=$1 AND position.state='OPEN'`,
+        [fixture.claim.intent.id],
+      );
+      assert.equal(durable.rows[0]?.unknown_resolved, true);
+      assert.equal(durable.rows[0]?.artifact_state, 'RECONCILED');
+      const positionId = durable.rows[0]?.position_id;
+      assert.ok(positionId);
+
+      try {
+        await makePositionDue(isolated, positionId);
+      } finally {
+        await isolated.query(`ALTER TABLE execution_live_positions
+          ENABLE TRIGGER execution_live_positions_guarded_update`);
+      }
+      const deadline = await recoveryDatabase.live.createNextDeadlineExitIntent();
+      assert.equal(deadline?.kind, 'CREATED');
+      assert.equal(deadline?.intent?.side, 'SELL');
+      const exit = await isolated.query(`SELECT position.state,
+        position.exit_intent_id,intent.status,intent.base_amount_raw::TEXT AS base_amount_raw
+        FROM execution_live_positions position
+        JOIN execution_intents intent ON intent.id=position.exit_intent_id
+        WHERE position.position_id=$1`, [positionId]);
+      assert.deepEqual(exit.rows, [{
+        state: 'EXIT_PENDING', exit_intent_id: deadline?.intent?.id,
+        status: 'PENDING', base_amount_raw: '95',
+      }]);
+    } finally {
+      if (recoveryDatabase !== undefined) await recoveryDatabase.close();
+      if (isolated !== undefined) await isolated.end();
+      await maintenance.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname=$1 AND pid<>pg_backend_pid()`,
+        [databaseName],
+      );
+      await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+      await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
+      await maintenance.end();
+    }
+  });
+
 async function liveFixture(
   pool: InstanceType<typeof pg.Pool>,
   quoteLifetimeMs = 60_000,
@@ -2654,6 +2823,10 @@ async function withTemporarySchema(
 function quoteIdentifier(value: string): string {
   if (!/^[a-z_][a-z0-9_]*$/u.test(value)) throw new Error('Unsafe SQL identifier.');
   return `"${value}"`;
+}
+
+function quoteLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 function databaseErrorCode(error: unknown): string | null {

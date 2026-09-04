@@ -274,13 +274,18 @@ function dependencies(
   return {
     config: config(),
     intents: {
-      claim: (options: Readonly<{ purpose: string }>) => {
-        calls.push(`claim:${options.purpose}`);
+      claimConfirmation: () => {
+        calls.push('claim:CONFIRM');
         if (original === null) return Promise.resolve(null);
-        if (options.purpose === 'CONFIRM' && original.intent.status !== 'SUBMITTED') {
+        if (original.intent.status !== 'SUBMITTED') {
           return Promise.resolve(null);
         }
-        if (options.purpose === 'RECONCILE' && original.intent.status !== 'CONFIRMED') {
+        return Promise.resolve(original);
+      },
+      claimReconciliation: () => {
+        calls.push('claim:RECONCILE');
+        if (original === null) return Promise.resolve(null);
+        if (original.intent.status !== 'CONFIRMED') {
           return Promise.resolve(null);
         }
         return Promise.resolve(original);

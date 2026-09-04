@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js 22, PostgreSQL, Solana JSON-RPC HTTP, `node:test`, `bigint`, logs Pino structurés.
 
-**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.1.1, parent version 1.9.1, H1 version 1.1.1.
+**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.1.2, parent version 1.9.2, H1 version 1.1.2.
 
 ---
 
@@ -117,13 +117,13 @@
 - Modify: `tests/executor-live-recovery-main.integration.test.ts`
 - Modify: `tests/executor-live-recovery-startup.test.ts`
 
-- [ ] Écrire RED les tests du rôle dédié, du `SET ROLE` à chaque checkout,
+- [x] Écrire RED les tests du rôle dédié, du `SET ROLE` à chaque checkout,
   de l'éviction et des façades exactes.
-- [ ] Rendre le provisioning rejouable et accorder seulement les colonnes et
+- [x] Rendre le provisioning rejouable et accorder seulement les colonnes et
   mutations indispensables aux trois lanes.
-- [ ] Injecter exclusivement le wrapper restreint et des objets gelés à
+- [x] Injecter exclusivement le wrapper restreint et des objets gelés à
   prototype nul dans le runtime.
-- [ ] Prouver sur PostgreSQL réel les opérations autorisées et les refus
+- [x] Prouver sur PostgreSQL réel les opérations autorisées et les refus
   `42501`, puis committer.
 
 ### Task 7: Vérifier et livrer H2a
@@ -133,9 +133,9 @@
 **Files:**
 - Modify: tests/documentation only as justified by verification evidence
 
-- [ ] Exécuter build, check, lint, docs, suites backend/frontend, migrations sur
+- [x] Exécuter build, check, lint, docs, suites backend/frontend, migrations sur
   base vide et replay, et smoke de déploiement.
-- [ ] Faire une revue locale de sécurité et corriger les constats.
+- [x] Faire une revue locale de sécurité et corriger les constats.
 - [ ] Pousser la branche, ouvrir une PR liée à #51 et demander au plus trois
   cycles de revue GitHub.
 - [ ] Fusionner seulement avec checks verts et aucune discussion bloquante.

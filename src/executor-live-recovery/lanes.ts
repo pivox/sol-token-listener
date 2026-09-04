@@ -5,14 +5,11 @@ import {
 import type { LiveConfirmationGateway } from '../ports/execution-confirmation-gateway.js';
 import type {
   ClaimedExecutionIntent,
-  ExecutionIntentRepository,
 } from '../ports/execution-intent-repository.js';
 import type {
-  ExecutionLiveConfirmationV1,
-  ExecutionLiveRepository,
-} from '../ports/execution-live-repository.js';
-import type { ExecutionReconciliationEvidenceV1 } from
-  '../domain/execution-reconciliation.js';
+  ExecutionLiveRecoveryIntentRepository,
+  ExecutionLiveRecoveryRepository,
+} from '../ports/execution-live-recovery-repository.js';
 import type { ExecutionReconciliationGateway } from
   '../ports/execution-reconciliation-gateway.js';
 import type { ExecutionReconciliationCommitResultV1 } from
@@ -60,20 +57,8 @@ type RecoveryGateway = ExecutionReconciliationGateway & LiveConfirmationGateway 
 
 export interface LiveRecoveryLaneDependencies {
   readonly config: LiveRecoveryConfig;
-  readonly intents: Pick<ExecutionIntentRepository, 'claim' | 'renew' | 'release'>;
-  readonly live: Readonly<{
-    readReconciliationWork: ExecutionLiveRepository['readReconciliationWork'];
-    commitReconciliation(
-      claim: ClaimedExecutionIntent,
-      evidence: ExecutionReconciliationEvidenceV1,
-    ): Promise<unknown>;
-    readConfirmationWork: ExecutionLiveRepository['readConfirmationWork'];
-    recordConfirmation(
-      claim: ClaimedExecutionIntent,
-      confirmation: ExecutionLiveConfirmationV1,
-    ): Promise<unknown>;
-    createNextDeadlineExitIntent: ExecutionLiveRepository['createNextDeadlineExitIntent'];
-  }>;
+  readonly intents: ExecutionLiveRecoveryIntentRepository;
+  readonly live: ExecutionLiveRecoveryRepository;
   readonly gateway: RecoveryGateway;
 }
 
@@ -223,11 +208,14 @@ async function claim(
   signal: AbortSignal,
 ): Promise<ClaimedExecutionIntent | null> {
   try {
-    return await dependencies.intents.claim(Object.freeze({
-      ownerId: dependencies.config.ownerId,
-      leaseMs: dependencies.config.leaseMs,
-      purpose,
-    }), signal);
+    const claimForPurpose = purpose === 'CONFIRM'
+      ? dependencies.intents.claimConfirmation
+      : dependencies.intents.claimReconciliation;
+    return await claimForPurpose(
+      dependencies.config.ownerId,
+      dependencies.config.leaseMs,
+      signal,
+    );
   } catch {
     if (signal.aborted) throw laneFailure('OPERATION_ABORTED');
     throw laneFailure('CLAIM_FAILED');

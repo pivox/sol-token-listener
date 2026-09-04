@@ -1,10 +1,10 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.1.1
+**Version de spécification :** 1.1.2
 
-**Version de la spécification parente :** 1.9.1
+**Version de la spécification parente :** 1.9.2
 
-**Version de l'orchestration persistante :** 1.1.1
+**Version de l'orchestration persistante :** 1.1.2
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,17 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.2 — 2026-09-04 :** inclut dans l'allowlist `SELECT` les colonnes que
+  les triggers `SECURITY INVOKER` de confirmation et de résolution lisent au
+  commit. Cette autorité transitive explicite permet les écritures H2a prévues
+  sans droit de table, sans bytes signés et sans capacité de soumission. Le
+  checkout fixe aussi `search_path=pg_catalog,public`, le démarrage refuse tout
+  droit ou ownership direct du login et toute routine `SECURITY DEFINER`
+  exécutable hors schémas système. Il exige enfin que les deux helpers
+  `SECURITY INVOKER` du ledger restent exécutables, refuse tout privilège
+  `SET` sur `session_replication_role` et vérifie sa valeur `origin` à chaque
+  checkout. L'allowlist distingue enfin un privilège simple de son `GRANT
+  OPTION` et refuse toute capacité de redélégation.
 - **1.1.1 — 2026-09-04 :** ferme le graphe d'appartenance PostgreSQL 16 :
   l'unique arête directe du login est `WITH ADMIN FALSE, INHERIT FALSE, SET
   TRUE` vers recovery et recovery n'est membre d'aucun rôle parent. Elle rend
@@ -186,7 +197,9 @@ n'est lui-même membre d'aucun autre rôle. Aucun mot de passe n'est versionné.
 13. Le démarrage ne modifie ni armement, ni contrôle, ni génération wallet.
 14. Aucun endpoint HTTP public n'est ajouté.
 15. Chaque client PostgreSQL est rendu au code applicatif uniquement après
-    `SET ROLE sol_token_executor_live_recovery` ; un échec évince le client.
+    `SET ROLE sol_token_executor_live_recovery`, fixation de
+    `search_path=pg_catalog,public` et vérification des deux valeurs ; un échec
+    évince le client.
 16. Le rôle recovery ne peut ni sélectionner `signed_transaction_bytes`, ni
     insérer une transaction signée, une preuve de simulation signée ou de
     préflight, ni initier une transition `SUBMISSION_STARTED`. Les événements
@@ -237,9 +250,10 @@ pas les migrations et ne provisionne pas les rôles au démarrage.
 
 La connexion n'utilise pas un callback asynchrone `pool.on('connect')`, que
 `EventEmitter` n'attend pas. Un wrapper de pool prend chaque client, exécute
-statiquement `SET ROLE sol_token_executor_live_recovery`, vérifie l'identité,
-puis seulement le transmet au repository. En cas d'échec, le client est
-relâché comme défectueux et n'est jamais exposé.
+statiquement `SET ROLE sol_token_executor_live_recovery`, fixe `search_path` à
+`pg_catalog, public`, vérifie l'identité et ce chemin, puis seulement le
+transmet au repository. En cas d'échec, le client est relâché comme défectueux
+et n'est jamais exposé.
 
 La validation exige simultanément :
 
@@ -251,8 +265,19 @@ La validation exige simultanément :
 - une appartenance directe et exacte du login au seul rôle recovery, avec
   `admin_option=false`, `inherit_option=false`, `set_option=true` ;
 - aucune appartenance sortante de recovery vers un rôle parent ;
+- aucun ACL, ownership ou privilège par défaut accordé directement au login de
+  session sur les objets de la base ;
+- aucun ACL de paramètre direct au login, ni privilège effectif `SET` sur
+  `session_replication_role` pour le login ou recovery ; sa valeur effective
+  doit rester `origin` ;
+- aucune routine `SECURITY DEFINER` exécutable par recovery ou par le login
+  hors de `pg_catalog` et `information_schema` ;
+- `execution_live_state_transition_allowed(text,text,text)` et
+  `execution_submission_event_matches_transition(text,text,text)` existent,
+  restent `SECURITY INVOKER` et sont exécutables par recovery ;
 - l'allowlist effective exacte décrite ci-dessous, en tenant compte de
-  `PUBLIC`, de l'ownership et des memberships.
+  `PUBLIC`, de l'ownership et des memberships ; aucun privilège autorisé ne
+  peut porter `WITH GRANT OPTION`.
 
 Le nom du login de session est une donnée de déploiement privée : il est
 comparé dans PostgreSQL mais n'est jamais renvoyé dans l'évidence ni journalisé.
@@ -279,9 +304,9 @@ La matrice de colonnes est l'union exacte suivante :
 | `execution_exit_authorizations` | `authorization_id,position_id,state,state_revision` | `authorization_id,payload_version,position_id,generation_id,wallet_public_key,mint,quote_mint,maximum_base_amount_raw,state,state_revision,created_at` | `state,state_revision,locked_intent_id,locked_attempt_number,terminal_at,purge_after` |
 | `execution_wallet_risk_state` | `generation_id,state_revision,reserved_exposure_raw,open_positions,unknown_block` | — | `state_revision,reserved_exposure_raw,open_positions,unknown_block,updated_at` |
 | `execution_exposure_reservations` | `reservation_id,intent_id,generation_id,state,state_revision,maximum_amount_raw,wallet_snapshot_fingerprint` | — | `state,state_revision,reconciled_at,purge_after` |
-| `execution_reconciliation_evidence` | `evidence_id,evidence_fingerprint,intent_id,attempt_number,generation_id,side,result,observed_at,resolved_by_evidence_id` | `evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,build_fingerprint,snapshot_fingerprint,maximum_fee_lamports,maximum_fee_payer_lamport_debit,signature_history,confirmation_status,finalized_block_height,observed_slot,observed_transaction_fingerprint,fee_lamports,wallet_lamport_delta,base_delta_raw,quote_delta_raw,unexpected_residual_token_balance_raw,observed_at,finalized_at,result,reason_code,purge_after` | `resolved_by_evidence_id,resolved_at,purge_after` |
+| `execution_reconciliation_evidence` | toutes les colonnes (requis par le `SELECT *` du trigger `guard_execution_reconciliation_evidence_resolution`) | `evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,reservation_id,generation_id,provider_id,side,signature,blockhash,last_valid_block_height,message_hash,build_fingerprint,snapshot_fingerprint,maximum_fee_lamports,maximum_fee_payer_lamport_debit,signature_history,confirmation_status,finalized_block_height,observed_slot,observed_transaction_fingerprint,fee_lamports,wallet_lamport_delta,base_delta_raw,quote_delta_raw,unexpected_residual_token_balance_raw,observed_at,finalized_at,result,reason_code,purge_after` | `resolved_by_evidence_id,resolved_at,purge_after` |
 | `execution_intent_transitions` | — | `intent_id,previous_status,next_status,reason_code,human_message,activation_phase,attempt_number,evidence,occurred_at` | — |
-| `execution_submission_events` | — | `event_id,payload_version,event_fingerprint,artifact_id,generation_id,previous_state,next_state,reason_code,occurred_at` | — |
+| `execution_submission_events` | `artifact_id,generation_id,previous_state,next_state,reason_code` (requis par les triggers du ledger) | `event_id,payload_version,event_fingerprint,artifact_id,generation_id,previous_state,next_state,reason_code,occurred_at` | — |
 | `execution_activation_events` | — | `event_id,payload_version,event_fingerprint,armament_id,generation_id,previous_state,next_state,reason_code,occurred_at` | — |
 
 Ces listes sont matérialisées et testées dans le code de policy ; elles ne sont

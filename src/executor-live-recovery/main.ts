@@ -1,13 +1,13 @@
 import 'dotenv/config';
 import { pathToFileURL } from 'node:url';
-import { createExecutorDatabase } from '../executor/database.js';
-import { closeDatabase, getDatabasePool } from '../storage/database.js';
-import { PostgresExecutionIntentRepository } from '../storage/execution-intent.repository.js';
-import { PostgresExecutionLiveRepository } from '../storage/execution-live.repository.js';
+import {
+  openLiveRecoveryDatabase,
+  type LiveRecoveryBootstrapDatabase,
+} from './database.js';
+export type { LiveRecoveryBootstrapDatabase } from './database.js';
 import { parseLiveRecoveryConfig, type LiveRecoveryConfig } from './config.js';
 import {
   createLiveRecoveryLanes,
-  type LiveRecoveryLaneDependencies,
   type LiveRecoveryLanes,
 } from './lanes.js';
 import { createLiveRecoveryLogger, type LiveRecoveryLogger } from './logger.js';
@@ -19,16 +19,7 @@ import {
 } from './runtime.js';
 import {
   validateLiveRecoveryStartup,
-  type LiveRecoveryStartupDatabase,
 } from './startup-validator.js';
-
-export interface LiveRecoveryBootstrapDatabase {
-  readonly startup: LiveRecoveryStartupDatabase;
-  readonly intents: LiveRecoveryLaneDependencies['intents'];
-  readonly live: LiveRecoveryLaneDependencies['live'];
-  readonly close: () => Promise<void>;
-  readonly evict: () => void | Promise<void>;
-}
 
 export interface LiveRecoveryBootstrapDependencies {
   readonly parseConfig: (environment: unknown) => LiveRecoveryConfig;
@@ -103,36 +94,17 @@ export function reportLiveRecoveryEntrypointFailure(
 function productionDependencies(logger: LiveRecoveryLogger): LiveRecoveryBootstrapDependencies {
   const dependencies: LiveRecoveryBootstrapDependencies = {
     parseConfig: parseLiveRecoveryConfig,
-    openDatabase: (config: LiveRecoveryConfig) => {
-      const pool = getDatabasePool(config.databaseUrl, {
-        connectionTimeoutMillis: config.databaseStatementTimeoutMs,
-        query_timeout: config.databaseStatementTimeoutMs,
-        statement_timeout: config.databaseStatementTimeoutMs,
-        lock_timeout: config.databaseStatementTimeoutMs,
-        idle_in_transaction_session_timeout: config.databaseStatementTimeoutMs,
-      });
-      pool.on('error', () => {
+    openDatabase: (config: LiveRecoveryConfig) => Promise.resolve(openLiveRecoveryDatabase({
+      databaseUrl: config.databaseUrl,
+      statementTimeoutMs: config.databaseStatementTimeoutMs,
+      onIdleError: () => {
         logger.error(Object.freeze({
           event: 'executor_live_recovery.database_idle_client_error',
           executionMode: 'live-recovery',
           errorCode: 'DATABASE_IDLE_CLIENT_ERROR',
         }));
-      });
-      const tracked = createExecutorDatabase(pool);
-      const startup: LiveRecoveryStartupDatabase = Object.freeze({
-        query: async (text: string, values?: readonly unknown[]) => {
-          const result = await pool.query(text, values === undefined ? [] : [...values]);
-          return Object.freeze({ rows: result.rows, rowCount: result.rowCount });
-        },
-      });
-      return Promise.resolve(Object.freeze({
-        startup,
-        intents: new PostgresExecutionIntentRepository(tracked.pool),
-        live: new PostgresExecutionLiveRepository(tracked.pool),
-        close: closeDatabase,
-        evict: tracked.evictActive,
-      }));
-    },
+      },
+    })),
     validateStartup: (
       database: LiveRecoveryBootstrapDatabase,
       config: LiveRecoveryConfig,
@@ -168,7 +140,8 @@ function rpcSession(config: LiveRecoveryConfig): SolanaFinalityRpcSession {
 
 const SAFE_FATAL_NAMES = new Set([
   'LiveRecoveryConfigError', 'LiveRecoveryStartupError', 'LiveRecoveryRpcError',
-  'LiveRecoveryLaneError', 'ExecutorDatabaseError', 'ExecutionIntentRepositoryError',
+  'LiveRecoveryLaneError', 'LiveRecoveryDatabaseError', 'ExecutorDatabaseError',
+  'ExecutionIntentRepositoryError',
   'ExecutionLiveRepositoryError', 'Error', 'TypeError', 'RangeError', 'AggregateError',
 ]);
 const SAFE_FATAL_CODES = new Set([

@@ -1,8 +1,8 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.1.1
+**Version de spécification :** 1.1.2
 
-**Version de la spécification parente :** 1.9.1
+**Version de la spécification parente :** 1.9.2
 
 **Version de la fondation live :** 1.0.17
 
@@ -13,6 +13,9 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.2 — 2026-09-04 :** explicite les lectures par colonne requises par les
+  triggers `SECURITY INVOKER` des commits H1 ; les transactions et les ports
+  restent inchangés, sans lecture des bytes signés ni soumission.
 - **1.1.1 — 2026-09-04 :** référence la fermeture des memberships PostgreSQL
   16 et la matrice effective exacte des ACL H2a ; les primitives H1 et leurs
   transactions ne changent pas.
