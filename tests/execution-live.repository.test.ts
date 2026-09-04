@@ -115,6 +115,8 @@ void test('deadline scanner uses one PostgreSQL clock, exact deadline and oldest
       const normalized = queries.map((query) => query.replaceAll(/\s+/gu, ' ').trim());
       const globalLock = normalized.findIndex((query) =>
         query.includes("hashtextextended('execution-live-deadline-scan:v1', 51007)"));
+      const sellPresenceLock = normalized.findIndex((query) =>
+        query.includes("hashtextextended('execution-live-sell-presence:v1', 51008)"));
       const clock = normalized.findIndex((query) =>
         query.includes('execution_live_deadline_clock'));
       const candidate = normalized.findIndex((query) =>
@@ -122,7 +124,8 @@ void test('deadline scanner uses one PostgreSQL clock, exact deadline and oldest
       const generationLock = normalized.findIndex((query) =>
         query.includes('hashtextextended($1, 51005)'));
       const rowLock = normalized.findIndex((query) => query.includes('FOR UPDATE OF position'));
-      assert.ok(globalLock >= 0 && globalLock < clock);
+      assert.ok(globalLock >= 0 && globalLock < sellPresenceLock);
+      assert.ok(sellPresenceLock < clock);
       assert.ok(clock < candidate && candidate < generationLock && generationLock < rowLock);
       assert.match(normalized[candidate] ?? '',
         /ORDER BY position\.exit_deadline_at ASC,position\.position_id ASC LIMIT 1/u);
@@ -329,14 +332,19 @@ void test('scanner queued before targeted creation yields one CREATED and one st
           observedAtMs: dueAtMs,
         });
         let queuedWorkers = 0;
-        for (let attempt = 0; attempt < 100 && queuedWorkers < 2; attempt += 1) {
+        for (let attempt = 0; attempt < 100 && queuedWorkers < 1; attempt += 1) {
           const observed = await observer.query<{ readonly queued_workers: number }>(`SELECT
             COUNT(*)::INTEGER AS queued_workers FROM pg_stat_activity activity
             WHERE $1::INTEGER = ANY(pg_blocking_pids(activity.pid))`, [blockerPid]);
           queuedWorkers = observed.rows[0]?.queued_workers ?? 0;
-          if (queuedWorkers < 2) await observer.query('SELECT pg_sleep(0.01)');
+          if (queuedWorkers < 1) await observer.query('SELECT pg_sleep(0.01)');
         }
-        assert.equal(queuedWorkers, 2);
+        assert.equal(queuedWorkers, 1);
+        const targetedState = await Promise.race([
+          targeted.then(() => 'SETTLED' as const),
+          observer.query('SELECT pg_sleep(0.05)').then(() => 'WAITING' as const),
+        ]);
+        assert.equal(targetedState, 'WAITING');
         await blocker.query('COMMIT');
         released = true;
         const results = await Promise.all([scanner, targeted]);

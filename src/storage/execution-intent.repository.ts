@@ -47,6 +47,9 @@ export interface ExecutionIntentPool {
   connect(): Promise<ExecutionIntentClient>;
 }
 
+const LIVE_SELL_PRESENCE_LOCK_SQL = `SELECT pg_advisory_xact_lock(
+  hashtextextended('execution-live-sell-presence:v1', 51008))`;
+
 export type ExecutionIntentRepositoryErrorCode =
   | 'INVALID_INPUT'
   | 'INVALID_DATA'
@@ -205,6 +208,7 @@ export async function createExecutionIntentInTransaction(
   readonly intent: ExecutionIntentV1;
 }>> {
   const draft = draftInput(draftValue);
+  if (draft.side === 'SELL') await lockLiveSellPresenceInTransaction(client);
   const inserted = await client.query(
     `INSERT INTO execution_intents AS intent (
        id,payload_version,logical_order_key,strategy_id,strategy_version,
@@ -255,6 +259,12 @@ export async function createExecutionIntentInTransaction(
   return createResult('REPLAYED', stored);
 }
 
+export async function lockLiveSellPresenceInTransaction(
+  client: ExecutionIntentTransactionClient,
+): Promise<void> {
+  await client.query(LIVE_SELL_PRESENCE_LOCK_SQL);
+}
+
 export class PostgresExecutionIntentRepository implements ExecutionIntentRepository {
   public constructor(
     private readonly pool: ExecutionIntentPool = getDatabasePool(),
@@ -277,7 +287,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const options = claimOptions(optionsValue);
       if (signal?.aborted === true) throw operationAbortedError();
       const leaseToken = randomUUID();
-      return this.withClaimClient(signal, options.purpose === 'DRY_RUN', async (client) => {
+      const claimFromClient = async (
+        client: ExecutionIntentClient,
+      ): Promise<ClaimedExecutionIntent | null> => {
         const claimed = await client.query(
           claimSqlFor(options),
           [options.ownerId, options.leaseMs, leaseToken],
@@ -296,7 +308,15 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
           throw dataError();
         }
         return claim;
-      });
+      };
+      if (options.purpose === 'LIVE_EXECUTE' && options.side === 'BUY') {
+        return this.transaction(async (client) => {
+          await lockLiveSellPresenceInTransaction(client);
+          if (signal?.aborted === true) throw operationAbortedError();
+          return claimFromClient(client);
+        }, signal, 'READ_COMMITTED');
+      }
+      return this.withClaimClient(signal, options.purpose === 'DRY_RUN', claimFromClient);
     });
   }
 
@@ -646,6 +666,8 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
 
   private async transaction<TResult>(
     run: (client: ExecutionIntentClient) => Promise<TResult>,
+    signal?: AbortSignal,
+    isolationLevel?: 'READ_COMMITTED',
   ): Promise<TResult> {
     let client: ExecutionIntentClient;
     try {
@@ -653,6 +675,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     } catch {
       throw databaseError(1);
     }
+    if (signal?.aborted === true) abortBeforeClaim(client);
     let transactionStarted = false;
     let primaryFailure: unknown;
     let result: TResult | undefined;
@@ -661,7 +684,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     let evict = false;
     try {
       transactionStarted = true;
-      await client.query('BEGIN');
+      await client.query(isolationLevel === 'READ_COMMITTED'
+        ? 'BEGIN ISOLATION LEVEL READ COMMITTED'
+        : 'BEGIN');
       result = await run(client);
       await client.query('COMMIT');
       transactionStarted = false;

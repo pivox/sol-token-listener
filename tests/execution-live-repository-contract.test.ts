@@ -52,6 +52,7 @@ const h1ProductionModules = Object.freeze([
       '../ports/execution-live-repository.js',
       '../ports/execution-simulation-gateway.js',
       './database.js',
+      './execution-intent.repository.js',
       './execution-risk.repository.js',
     ]),
   }),

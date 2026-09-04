@@ -211,10 +211,14 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
         side: 'SELL', venuePolicy: 'CANONICAL_EXIT',
         quoteAmountRaw: null, baseAmountRaw: 1n,
       });
-    const client = new ScriptedClient([(_text, values) => result([{
+    const claimStep: Step = (_text, values) => result([{
       ...claimRow(draft, status), lease_token: values?.[2],
       claim_at_ms: String(NOW_MS),
-    }], 1)]);
+    }], 1);
+    const liveBuy = options.purpose === 'LIVE_EXECUTE' && options.side === 'BUY';
+    const client = new ScriptedClient(liveBuy
+      ? [command('BEGIN ISOLATION LEVEL READ COMMITTED'), result([], 1), claimStep, command('COMMIT')]
+      : [claimStep]);
     const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
 
     const claim = await repository.claim(options);
@@ -222,12 +226,18 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
     assert.ok(claim);
     assert.equal(claim.intent.side, side);
     assert.equal(claim.intent.status, status);
-    const sql = required(client.calls[0]).text;
+    const claimCall = required(client.calls.find((call) => call.text.includes(
+      'UPDATE execution_intents AS intent',
+    )));
+    const sql = claimCall.text;
     if (options.purpose === 'LIVE_EXECUTE') {
       assert.match(sql, new RegExp(`intent\\.side\\s*=\\s*'${options.side}'`, 'u'));
       assert.match(sql, /intent\.status IN \('PENDING', 'RETRY_READY', 'PROCESSING'\)/u);
       assert.match(sql, /intent\.expires_at\s*>\s*statement_timestamp\(\)/u);
       if (options.side === 'BUY') {
+        assert.equal(client.calls[0]?.text, 'BEGIN ISOLATION LEVEL READ COMMITTED');
+        assert.match(client.calls[1]?.text ?? '', /execution-live-sell-presence:v1/u);
+        assert.equal(client.calls.at(-1)?.text, 'COMMIT');
         assert.match(sql, /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_intents AS blocking_sell/su);
         assert.match(sql, /blocking_sell\.side\s*=\s*'SELL'/u);
         assert.match(sql, /blocking_sell\.status\s*=\s*'SIGNED_NOT_SUBMITTED'/u);
@@ -343,6 +353,47 @@ void test('claim cancellation fences connect without dispatching SQL and preserv
     assert.equal(client.calls.length, 0);
     assert.deepEqual(client.releaseErrors, [undefined]);
   });
+
+  await context.test('LIVE_EXECUTE BUY aborts after its advisory wait without dispatching claim SQL',
+    async () => {
+      const controller = new AbortController();
+      const lockStarted = deferred<true>();
+      const lockGate = deferred<QueryResult>();
+      const calls: string[] = [];
+      const releaseErrors: (boolean | undefined)[] = [];
+      const repository = new PostgresExecutionIntentRepository({
+        connect: async () => ({
+          query: async (text: string) => {
+            calls.push(text);
+            if (text === 'BEGIN ISOLATION LEVEL READ COMMITTED' || text === 'ROLLBACK') {
+              return result([], null);
+            }
+            if (text.includes('execution-live-sell-presence:v1')) {
+              lockStarted.resolve(true);
+              return lockGate.promise;
+            }
+            assert.fail(`Claim SQL was dispatched after cancellation: ${text}`);
+          },
+          release: (error?: boolean) => { releaseErrors.push(error); },
+        }),
+      });
+      const pending = repository.claim({
+        ownerId: 'live-buy-cancelled-after-lock-wait', leaseMs: 30_000,
+        purpose: 'LIVE_EXECUTE', side: 'BUY',
+      }, controller.signal);
+      await lockStarted.promise;
+      controller.abort();
+      lockGate.resolve(result([], 1));
+
+      await expectCode(pending, 'OPERATION_ABORTED');
+      assert.deepEqual(calls, [
+        'BEGIN ISOLATION LEVEL READ COMMITTED',
+        calls[1],
+        'ROLLBACK',
+      ]);
+      assert.match(calls[1] ?? '', /execution-live-sell-presence:v1/u);
+      assert.deepEqual(releaseErrors, [false]);
+    });
 
   await context.test('connect and abort-cleanup failures remain database failures', async () => {
     const connectController = new AbortController();
@@ -1675,6 +1726,86 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
   });
 });
 
+void test('LIVE_EXECUTE BUY forces READ COMMITTED and observes an uncommitted SELL after its commit',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: live BUY versus SELL creation race skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, 'execution_live_buy_sell_creation_race', async (
+      firstPool,
+      secondPool,
+    ) => {
+      await migrateDatabase({ pool: firstPool });
+      const first = new PostgresExecutionIntentRepository(firstPool);
+      const buySession = await secondPool.connect();
+      await buySession.query(
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+      );
+      const second = new PostgresExecutionIntentRepository({
+        connect: async () => buySession,
+      });
+      const now = await databaseNowMs(firstPool);
+      const buy = executionDraft('live-buy-sell-creation-race-buy', {
+        requestedAtMs: now - 2_000, expiresAtMs: now + 120_000,
+      });
+      const sell = executionDraft('live-buy-sell-creation-race-sell', {
+        side: 'SELL', venuePolicy: 'CANONICAL_EXIT', quoteAmountRaw: null, baseAmountRaw: 1n,
+        requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+      });
+      await first.create(buy);
+
+      const triggerLockKey = 5_100_092;
+      await firstPool.query(`CREATE FUNCTION block_live_sell_intent_insert()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        BEGIN
+          IF NEW.side = 'SELL' THEN
+            PERFORM pg_advisory_lock(${triggerLockKey});
+            PERFORM pg_advisory_unlock(${triggerLockKey});
+          END IF;
+          RETURN NEW;
+        END
+        $function$`);
+      await firstPool.query(`CREATE TRIGGER block_live_sell_intent_insert_trigger
+        AFTER INSERT ON execution_intents FOR EACH ROW
+        EXECUTE FUNCTION block_live_sell_intent_insert()`);
+
+      const blocker = await secondPool.connect();
+      let blockerLocked = false;
+      let sellCreation: Promise<unknown> | undefined;
+      let buyClaim: Promise<ClaimedExecutionIntent | null> | undefined;
+      try {
+        await blocker.query('SELECT pg_advisory_lock($1)', [triggerLockKey]);
+        blockerLocked = true;
+        sellCreation = first.create(sell);
+        await waitForDatabaseQuery(firstPool, '%INSERT INTO execution_intents AS intent%');
+
+        buyClaim = second.claim({
+          ownerId: 'live-buy-sell-creation-race-worker', leaseMs: 60_000,
+          purpose: 'LIVE_EXECUTE', side: 'BUY',
+        });
+        const outcome = await Promise.race([
+          buyClaim.then(() => 'CLAIM_SETTLED' as const),
+          waitForDatabaseQuery(firstPool, '%execution-live-sell-presence:v1%')
+            .then(() => 'CLAIM_BLOCKED' as const),
+        ]);
+        assert.equal(outcome, 'CLAIM_BLOCKED');
+
+        await blocker.query('SELECT pg_advisory_unlock($1)', [triggerLockKey]);
+        blockerLocked = false;
+        assert.equal((await sellCreation as { readonly kind: string }).kind, 'CREATED');
+        assert.equal(await buyClaim, null);
+      } finally {
+        if (blockerLocked) await blocker.query('SELECT pg_advisory_unlock($1)', [triggerLockKey]);
+        blocker.release();
+        await Promise.allSettled(
+          [sellCreation, buyClaim].filter((value) => value !== undefined),
+        );
+      }
+    });
+  });
+
 void test('real PostgreSQL provides replay, concurrent claims, near-boundary reclaim, attempts, and ordered lifecycle journal', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -2294,7 +2425,9 @@ function result(rows: readonly Row[], rowCount: number | null): QueryResult {
   return { rows, rowCount };
 }
 
-function command(expected: 'BEGIN' | 'COMMIT' | 'ROLLBACK'): Step {
+function command(
+  expected: 'BEGIN' | 'BEGIN ISOLATION LEVEL READ COMMITTED' | 'COMMIT' | 'ROLLBACK',
+): Step {
   return (text) => {
     assert.equal(text, expected);
     return result([], null);

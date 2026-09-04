@@ -30,6 +30,7 @@ import {
   type ExecutionIntentDraftV1,
   type ExecutionIntentV1,
 } from '../domain/execution-intent.js';
+import { lockLiveSellPresenceInTransaction } from './execution-intent.repository.js';
 import type {
   AuthenticatedPersistedSignedTransactionV1,
   AuthenticatedSubmissionStartedTransactionV1,
@@ -947,6 +948,7 @@ export class PostgresExecutionLiveRepository {
     if (!/^execution_live_position_[0-9a-f]{64}$/u.test(input.positionId)
       || !validTimestamp(input.observedAtMs)) throw failure('INVALID_INPUT');
     return this.transaction(async (client) => {
+      await lockLiveSellPresenceInTransaction(client);
       const generationId = await deadlinePositionGeneration(client, input.positionId);
       await lockGeneration(client, generationId);
       return createDeadlineExitIntentLocked(client, { ...input, generationId });
@@ -957,6 +959,7 @@ export class PostgresExecutionLiveRepository {
     return this.transaction(async (client) => {
       await client.query(`SELECT pg_advisory_xact_lock(
         hashtextextended('execution-live-deadline-scan:v1', 51007))`);
+      await lockLiveSellPresenceInTransaction(client);
       const clock = exactRow(singleRow(await client.query(`SELECT
         /* execution_live_deadline_clock */
         trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds',statement_timestamp()))*1000)::TEXT
