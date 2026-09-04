@@ -186,10 +186,5 @@ Mainnet, n'utilisent aucun wallet réel et ne prouvent aucun comportement
 
 Publier `executor:live:start` ne vaut ni `live:resume`, ni `live:arm`. Tant que
 H2c n'a pas apporté les preuves opérateur puis explicitement armé un canary, le
-seul constat autorisé reste :
-
-```text
-LIVE_SIGNABLE_RUNTIME_COMPOSED
-CANARY_NOT_STARTED
-NON_EXECUTED / NON_VALIDATED
-```
+seul constat autorisé reste celui défini en section 1 ; aucun état plus avancé
+ne peut être déduit de la seule présence du binaire H2b.

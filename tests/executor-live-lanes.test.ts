@@ -33,6 +33,30 @@ void test('fresh lane transitions, begins one attempt and exposes authenticated 
   ]);
 });
 
+for (const outcome of [
+  'SUBMITTED', 'UNKNOWN_REQUIRES_RECONCILIATION',
+] as const) {
+  void test(`releases the authoritative ${outcome} claim returned by fresh execution`,
+    async () => {
+      const fixture = laneFixture('PROCESSING', false, outcome);
+
+      assert.equal(await createLiveSignableLanes(fixture.dependencies).sell(signal()), 'WORKED');
+
+      assert.deepEqual(fixture.released, [`${outcome}:4`]);
+    });
+
+  void test(`releases the authoritative ${outcome} claim returned by recovery`, async () => {
+    const fixture = laneFixture('SIGNED_NOT_SUBMITTED', false, outcome);
+
+    assert.equal(
+      await createLiveSignableLanes(fixture.dependencies).recoverSell(signal()),
+      'WORKED',
+    );
+
+    assert.deepEqual(fixture.released, [`${outcome}:4`]);
+  });
+}
+
 void test('an empty or already aborted claim pass is idle and has no downstream effect', async () => {
   const empty = laneFixture('PENDING', true);
   assert.equal(await createLiveSignableLanes(empty.dependencies).buy(signal()), 'IDLE');
@@ -45,11 +69,17 @@ void test('an empty or already aborted claim pass is idle and has no downstream 
   assert.deepEqual(aborted.calls, []);
 });
 
-function laneFixture(status: ExecutionIntentV1['status'], empty = false): Readonly<{
+function laneFixture(
+  status: ExecutionIntentV1['status'],
+  empty = false,
+  outcome?: 'SUBMITTED' | 'UNKNOWN_REQUIRES_RECONCILIATION',
+): Readonly<{
   calls: string[];
+  released: string[];
   dependencies: LiveSignableLaneDependencies;
 }> {
   const calls: string[] = [];
+  const released: string[] = [];
   const dependencies: LiveSignableLaneDependencies = Object.freeze({
     ownerId: 'live-signable-test',
     leaseMs: 60_000,
@@ -90,6 +120,7 @@ function laneFixture(status: ExecutionIntentV1['status'], empty = false): Readon
       },
       release: (active: Parameters<LiveSignableLaneDependencies['intents']['release']>[0]) => {
         calls.push(`release:${active.intent.side}`);
+        released.push(`${active.intent.status}:${active.intent.stateRevision}`);
         return Promise.resolve(true);
       },
     },
@@ -99,22 +130,43 @@ function laneFixture(status: ExecutionIntentV1['status'], empty = false): Readon
       renew: Parameters<LiveSignableLaneDependencies['executeFresh']>[2],
     ) => {
       calls.push(`fresh:${context.claim.intent.side}:${context.attempt.attemptNumber}`);
-      await renew();
+      const active = await renew();
+      return outcome === undefined ? active : outcomeClaim(active, outcome);
     },
     recoverPersisted: async (
       active: Parameters<LiveSignableLaneDependencies['recoverPersisted']>[0],
     ) => {
       calls.push(`recover:${active.intent.side}`);
+      return outcome === undefined ? active : outcomeClaim(active, outcome);
     },
     clock: () => 1_000,
   });
-  return Object.freeze({ calls, dependencies });
+  return Object.freeze({ calls, released, dependencies });
+}
+
+function outcomeClaim(
+  claim: ClaimedExecutionIntent,
+  status: 'SUBMITTED' | 'UNKNOWN_REQUIRES_RECONCILIATION',
+): ClaimedExecutionIntent {
+  return Object.freeze({
+    ...claim,
+    intent: Object.freeze({
+      ...claim.intent,
+      status,
+      stateRevision: claim.intent.stateRevision
+        + (claim.intent.status === 'PROCESSING' ? 3n : 1n),
+      lastReasonCode: status === 'SUBMITTED'
+        ? 'SUBMISSION_ACCEPTED' : 'RECONCILIATION_REQUIRED',
+      updatedAtMs: claim.intent.updatedAtMs + 1,
+    }),
+  });
 }
 
 function claimFor(
   side: 'BUY' | 'SELL',
   status: ExecutionIntentV1['status'],
 ): ClaimedExecutionIntent {
+  const started = status === 'PROCESSING' || status === 'SIGNED_NOT_SUBMITTED';
   return Object.freeze({
     intent: Object.freeze({
       id: `execution_intent_${'a'.repeat(64)}`,
@@ -138,9 +190,11 @@ function claimFor(
       requestedAtMs: 0,
       expiresAtMs: 2_000,
       status,
-      attemptCount: 0,
-      stateRevision: 0n,
-      lastReasonCode: null,
+      attemptCount: started ? 1 : 0,
+      stateRevision: status === 'SIGNED_NOT_SUBMITTED' ? 3n
+        : status === 'PROCESSING' ? 1n : 0n,
+      lastReasonCode: status === 'SIGNED_NOT_SUBMITTED' ? 'SIGNATURE_PERSISTED'
+        : status === 'PROCESSING' ? 'EXECUTION_STARTED' : null,
       terminalAtMs: null,
       reconciliationCompletedAtMs: null,
       purgeAfterMs: null,

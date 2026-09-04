@@ -481,6 +481,19 @@ void test('provisioned retention role runs the complete purge without reading si
   try {
     await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
     isolated = new pg.Pool({ connectionString: isolatedUrl.href });
+    const defaultDatabaseAcl = await isolated.query<{ readonly is_null: boolean }>(
+      'SELECT datacl IS NULL AS is_null FROM pg_database WHERE datname=current_database()',
+    );
+    assert.deepEqual(defaultDatabaseAcl.rows, [{ is_null: true }]);
+    const defaultAuthority = await isolated.query<{
+      readonly kind: string;
+      readonly object_name: string;
+      readonly privilege: string;
+      readonly source: string;
+    }>(LIVE_EXECUTOR_EFFECTIVE_AUTHORITY_SQL);
+    assert.equal(defaultAuthority.rows.some((row) => row.kind === 'DATABASE'
+      && row.object_name === databaseName && row.privilege === 'TEMPORARY'
+      && row.source === 'PUBLIC'), true);
     await migrateDatabase({ pool: isolated });
     const provisioningSql = await readFile(scriptUrl, 'utf8');
     await isolated.query(provisioningSql);
@@ -630,7 +643,10 @@ void test('live canary operational wiring stays explicit, inert and smoke-visibl
   const environment = await readFile(environmentUrl, 'utf8');
   const smoke = await readFile(smokeUrl, 'utf8');
   const runbook = await readFile(runbookUrl, 'utf8');
-  assert.equal(packageJson.scripts?.['executor:live:start'], undefined);
+  assert.equal(
+    packageJson.scripts?.['executor:live:start'],
+    'node dist/src/executor-live/main.js',
+  );
   assert.match(environment, /^EXECUTOR_MODE=dry-run$/mu);
   assert.match(environment, /^LIVE_TRADING_ENABLED=false$/mu);
   assert.match(environment, /^EXECUTOR_KEYPAIR_PATH=$/mu);
@@ -639,15 +655,16 @@ void test('live canary operational wiring stays explicit, inert and smoke-visibl
     'executionExitAuthorizations', 'executionLivePositions',
     'executionSignedTransactions', 'executionSubmissionEvents',
   ]) assert.match(smoke, new RegExp(`'${counter}'`, 'u'));
-  assert.match(runbook, /npm run live:preflight/u);
-  assert.match(runbook, /npm run live:resume/u);
-  assert.match(runbook, /npm run live:arm --/u);
-  assert.match(runbook, /npm run live:status/u);
+  assert.match(runbook, /npm run executor:live:start/u);
+  assert.match(runbook, /H2c[^\n]*(?:gates|armement|canary)/iu);
+  assert.match(runbook, /ne lance ni `live:resume` ni `live:arm`/iu);
+  assert.match(runbook, /`live:status`/u);
   assert.match(runbook, /npm run live:kill-switch --/u);
   assert.match(runbook, /NON_EXECUTED\s*\/\s*NON_VALIDATED/u);
   assert.match(runbook, /aucune commande[\s\S]{0,80}enchaîne\s+automatiquement/iu);
   assert.match(runbook, /(?:ne modifie|ne change|maintient|laisse)[^\n]*ENTRY_STOP/iu);
-  assert.match(runbook, /binaire[\s\S]{0,160}(?:non composé|indémarrable|pas démarrable)/iu);
+  assert.match(runbook, /LIVE_SIGNABLE_RUNTIME_COMPOSED/u);
+  assert.match(runbook, /CANARY_NOT_STARTED/u);
 });
 
 function quoteIdentifier(value: string): string {

@@ -62,12 +62,21 @@ export interface LiveExecutionResumeInputV1 {
   readonly runtime: ExecutionLiveRuntimeBindingV1;
 }
 
-export type LiveExecutionWorkerResultV1 = Readonly<{
-  readonly payloadVersion: 1;
-  readonly kind: 'ACCEPTED' | 'AMBIGUOUS' | 'REVOKED_NO_SEND';
-  readonly artifactId: string;
-  readonly signature: string;
-}>;
+export type LiveExecutionWorkerResultV1 =
+  | Readonly<{
+    readonly payloadVersion: 1;
+    readonly kind: 'ACCEPTED' | 'AMBIGUOUS';
+    readonly artifactId: string;
+    readonly signature: string;
+    readonly claim: ClaimedExecutionIntent;
+  }>
+  | Readonly<{
+    readonly payloadVersion: 1;
+    readonly kind: 'REVOKED_NO_SEND';
+    readonly artifactId: string;
+    readonly signature: string;
+    readonly claim: null;
+  }>;
 
 export async function executeLivePreparedTransaction(
   dependencies: LiveExecutionWorkerDependencies,
@@ -80,16 +89,15 @@ export async function executeLivePreparedTransaction(
     artifactId: expectedArtifact.artifactId,
   });
   if (inspected === null) {
-    await dependencies.repository.persistSigned(input.persist);
+    const persisted = await dependencies.repository.persistSigned(input.persist);
     inspected = await dependencies.repository.inspectSignedTransaction({
-      claim: input.persist.claim,
+      claim: persisted.claim,
       artifactId: expectedArtifact.artifactId,
     });
     if (inspected === null) throw new TypeError('Persisted signed transaction is missing.');
   }
   assertInspectionIdentity(inspected, expectedArtifact);
   return continueLivePersistedTransaction(dependencies, Object.freeze({
-    claim: input.persist.claim,
     inspected,
     expectedArtifact,
     signedSimulation: input.signedSimulation,
@@ -107,13 +115,12 @@ export async function resumeLivePersistedTransaction(
   const signedSimulation = inspected.state === 'PERSISTED'
     ? createSignedSimulationRecoveryContext(Object.freeze({
         payloadVersion: 1,
-        claim: input.claim,
+        claim: inspected.claim,
         artifact: inspected.artifact,
         unsignedSimulation: inspected.unsignedSimulation,
       }))
     : null;
   return continueLivePersistedTransaction(dependencies, Object.freeze({
-    claim: input.claim,
     inspected,
     expectedArtifact: null,
     signedSimulation,
@@ -122,7 +129,6 @@ export async function resumeLivePersistedTransaction(
 }
 
 interface LiveContinuationInputV1 {
-  readonly claim: ClaimedExecutionIntent;
   readonly inspected: ExecutionLiveSignedTransactionInspectionV1;
   readonly expectedArtifact: SignedTransactionArtifactV1 | null;
   readonly signedSimulation: SignedSimulationRecoveryContextV1 | null;
@@ -135,16 +141,16 @@ async function continueLivePersistedTransaction(
   signal: AbortSignal,
 ): Promise<LiveExecutionWorkerResultV1> {
   const inspected = input.inspected;
-  let activeClaim = input.claim;
   const identity = inspectionIdentity(inspected);
   if (input.expectedArtifact !== null) assertInspectionIdentity(inspected, input.expectedArtifact);
   if (inspected.state === 'REVOKED_NO_SEND') {
-    return workerResult('REVOKED_NO_SEND', identity);
+    return revokedWorkerResult(identity);
   }
-  if (inspected.state === 'ACCEPTED') return workerResult('ACCEPTED', identity);
-  if (inspected.state === 'AMBIGUOUS') return workerResult('AMBIGUOUS', identity);
+  let activeClaim = inspected.claim;
+  if (inspected.state === 'ACCEPTED') return workerResult('ACCEPTED', identity, activeClaim);
+  if (inspected.state === 'AMBIGUOUS') return workerResult('AMBIGUOUS', identity, activeClaim);
   if (inspected.state === 'SUBMISSION_STARTED') {
-    await dependencies.repository.recordSubmissionOutcome(input.claim, Object.freeze({
+    const recorded = await dependencies.repository.recordSubmissionOutcome(activeClaim, Object.freeze({
       payloadVersion: 1,
       artifactId: identity.artifactId,
       expectedRevision: inspected.stateRevision,
@@ -153,7 +159,7 @@ async function continueLivePersistedTransaction(
       reasonCode: 'SUBMISSION_AMBIGUOUS',
       observedAtMs: now(dependencies.clock),
     }));
-    return workerResult('AMBIGUOUS', identity);
+    return workerResult('AMBIGUOUS', identity, recorded.claim);
   }
   if (!('artifact' in inspected)) throw new TypeError('Invalid persisted transaction state.');
   const artifact = inspected.artifact;
@@ -175,7 +181,7 @@ async function continueLivePersistedTransaction(
         const observedAtMs = now(dependencies.clock);
         await dependencies.repository.revokeBeforeSubmission(Object.freeze({
           payloadVersion: 1,
-          claim: input.claim,
+          claim: activeClaim,
           artifactId: artifact.artifactId,
           expectedState: 'PERSISTED',
           expectedRevision: inspected.stateRevision,
@@ -194,7 +200,7 @@ async function continueLivePersistedTransaction(
       throw new TypeError('Invalid signed simulation identity.');
     }
     const recordedSimulation = await dependencies.repository.recordSignedSimulation(
-      input.claim,
+      activeClaim,
       signedEvidence,
     );
     if (recordedSimulation.state !== 'SIGNED_SIMULATED') {
@@ -245,7 +251,7 @@ async function continueLivePersistedTransaction(
       && error.code === 'SUBMISSION_SIGNATURE_MISMATCH'
       ? 'SUBMISSION_SIGNATURE_MISMATCH' as const
       : 'SUBMISSION_AMBIGUOUS' as const;
-    await dependencies.repository.recordSubmissionOutcome(activeClaim, Object.freeze({
+    const recorded = await dependencies.repository.recordSubmissionOutcome(activeClaim, Object.freeze({
       payloadVersion: 1,
       artifactId: artifact.artifactId,
       expectedRevision: started.stateRevision,
@@ -254,15 +260,10 @@ async function continueLivePersistedTransaction(
       reasonCode,
       observedAtMs: now(dependencies.clock),
     }));
-    return Object.freeze({
-      payloadVersion: 1,
-      kind: 'AMBIGUOUS',
-      artifactId: artifact.artifactId,
-      signature: artifact.signature,
-    });
+    return workerResult('AMBIGUOUS', artifact, recorded.claim);
   }
   if (submitted.signature !== artifact.signature) {
-    await dependencies.repository.recordSubmissionOutcome(activeClaim, Object.freeze({
+    const recorded = await dependencies.repository.recordSubmissionOutcome(activeClaim, Object.freeze({
       payloadVersion: 1,
       artifactId: artifact.artifactId,
       expectedRevision: started.stateRevision,
@@ -271,14 +272,9 @@ async function continueLivePersistedTransaction(
       reasonCode: 'SUBMISSION_SIGNATURE_MISMATCH',
       observedAtMs: now(dependencies.clock),
     }));
-    return Object.freeze({
-      payloadVersion: 1,
-      kind: 'AMBIGUOUS',
-      artifactId: artifact.artifactId,
-      signature: artifact.signature,
-    });
+    return workerResult('AMBIGUOUS', artifact, recorded.claim);
   }
-  await dependencies.repository.recordSubmissionOutcome(activeClaim, Object.freeze({
+  const recorded = await dependencies.repository.recordSubmissionOutcome(activeClaim, Object.freeze({
     payloadVersion: 1,
     artifactId: artifact.artifactId,
     expectedRevision: started.stateRevision,
@@ -287,12 +283,7 @@ async function continueLivePersistedTransaction(
     reasonCode: 'SUBMISSION_ACCEPTED',
     observedAtMs: now(dependencies.clock),
   }));
-  return Object.freeze({
-    payloadVersion: 1,
-    kind: 'ACCEPTED',
-    artifactId: artifact.artifactId,
-    signature: artifact.signature,
-  });
+  return workerResult('ACCEPTED', artifact, recorded.claim);
 }
 
 function assertInspectionIdentity(
@@ -322,11 +313,21 @@ function inspectionIdentity(
 }
 
 function workerResult(
-  kind: LiveExecutionWorkerResultV1['kind'],
+  kind: 'ACCEPTED' | 'AMBIGUOUS',
+  artifact: SignedArtifactIdentityV1,
+  claim: ClaimedExecutionIntent,
+): LiveExecutionWorkerResultV1 {
+  return Object.freeze({
+    payloadVersion: 1, kind, artifactId: artifact.artifactId, signature: artifact.signature, claim,
+  });
+}
+
+function revokedWorkerResult(
   artifact: SignedArtifactIdentityV1,
 ): LiveExecutionWorkerResultV1 {
   return Object.freeze({
-    payloadVersion: 1, kind, artifactId: artifact.artifactId, signature: artifact.signature,
+    payloadVersion: 1, kind: 'REVOKED_NO_SEND', artifactId: artifact.artifactId,
+    signature: artifact.signature, claim: null,
   });
 }
 

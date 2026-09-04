@@ -187,6 +187,7 @@ function freshFixture(outcome: 'SUCCESS' | 'FAILURE' = 'SUCCESS') {
         kind: 'ACCEPTED' as const,
         artifactId: input.persist.artifact.artifactId,
         signature: input.persist.artifact.signature,
+        claim,
       }));
     },
     clock: () => nowMs,

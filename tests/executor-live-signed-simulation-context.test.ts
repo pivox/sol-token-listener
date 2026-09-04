@@ -29,6 +29,7 @@ import {
 } from '../src/executor-live/execution-worker.js';
 import type { ExecutionLiveSignedTransactionInspectionV1 } from
   '../src/ports/execution-live-repository.js';
+import type { ClaimedExecutionIntent } from '../src/ports/execution-intent-repository.js';
 import { PUMP_PROGRAM_ID } from '../src/launchpads/pumpfun/official-sdk.js';
 import { userVolumeAccumulatorPda as pumpSwapUserVolumeAccumulatorPda } from
   '../src/markets/pumpswap/official-sdk.js';
@@ -300,6 +301,7 @@ void test('restart rejects a re-signed mutated economic account before any RPC o
       stateRevision: 0n,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      claim: fixture.input.claim,
     });
     const dependencies = rejectingResumeDependencies(inspection, calls);
 
@@ -310,6 +312,99 @@ void test('restart rejects a re-signed mutated economic account before any RPC o
     }), new AbortController().signal), isContextError);
 
     assert.deepEqual(calls, ['inspect']);
+  });
+
+void test('PERSISTED recovery carries its final claim without re-signing or double-sending',
+  async () => {
+    const fixture = await signedFixture('pumpfun-buy-v2-plan.json');
+    let activeClaim: ClaimedExecutionIntent = fixture.input.claim;
+    let sends = 0;
+    let signedSimulations = 0;
+    const inspection: ExecutionLiveSignedTransactionInspectionV1 = Object.freeze({
+      payloadVersion: 1,
+      state: 'PERSISTED',
+      stateRevision: 0n,
+      artifact: fixture.artifact,
+      unsignedSimulation: fixture.unsignedSimulation,
+      claim: activeClaim,
+    });
+    const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+      repository: Object.freeze({
+        persistSigned: () => { throw new Error('recovery must not persist or re-sign'); },
+        inspectSignedTransaction: () => Promise.resolve(inspection),
+        recordSignedSimulation: (claim: ClaimedExecutionIntent) => {
+          assert.equal(claim, activeClaim);
+          return Promise.resolve(Object.freeze({
+            payloadVersion: 1 as const, artifact: fixture.artifact,
+            state: 'SIGNED_SIMULATED' as const, stateRevision: 1n,
+          }));
+        },
+        revokeBeforeSubmission: () => { throw new Error('unexpected revocation'); },
+        beginSubmission: (
+          input: Parameters<LiveExecutionWorkerDependencies['repository']['beginSubmission']>[0],
+        ) => {
+          assert.equal(input.claim, activeClaim);
+          return Promise.resolve(Object.freeze({
+            payloadVersion: 1 as const, artifact: fixture.artifact,
+            state: 'SUBMISSION_STARTED' as const, stateRevision: 2n,
+          }));
+        },
+        recordSubmissionOutcome: (claim: ClaimedExecutionIntent) => {
+          assert.equal(claim, activeClaim);
+          activeClaim = Object.freeze({
+            ...activeClaim,
+            intent: Object.freeze({
+              ...activeClaim.intent,
+              status: 'SUBMITTED' as const,
+              stateRevision: activeClaim.intent.stateRevision + 1n,
+              lastReasonCode: 'SUBMISSION_ACCEPTED' as const,
+              updatedAtMs: activeClaim.intent.updatedAtMs + 1,
+            }),
+          });
+          return Promise.resolve(Object.freeze({
+            payloadVersion: 1 as const, artifact: fixture.artifact, claim: activeClaim,
+          }));
+        },
+      }),
+      signedSimulation: Object.freeze({
+        simulate: () => {
+          signedSimulations += 1;
+          return Promise.resolve(Object.freeze({
+            artifactId: fixture.artifact.artifactId,
+            signedTransactionHash: fixture.artifact.signedTransactionHash,
+          }) as never);
+        },
+      }),
+      submission: Object.freeze({
+        submitPersisted: () => {
+          sends += 1;
+          return Promise.resolve(Object.freeze({ signature: fixture.artifact.signature }));
+        },
+      }),
+      renewBeforeSubmission: (claim: ClaimedExecutionIntent) => {
+        assert.equal(claim, activeClaim);
+        return Promise.resolve(claim);
+      },
+      readBlockhashValidity: () => Promise.resolve(Object.freeze({
+        payloadVersion: 1 as const, providerId: fixture.artifact.providerId,
+        blockhash: fixture.artifact.blockhash, valid: true as const,
+        observedBlockHeight: fixture.artifact.lastValidBlockHeight - 1n,
+        contextSlot: 127n, observedAtMs: fixture.artifact.signedAtMs + 1,
+      })),
+    });
+
+    const result = await resumeLivePersistedTransaction(dependencies, Object.freeze({
+      payloadVersion: 1,
+      claim: activeClaim,
+      runtime: runtimeFor(fixture.artifact.walletPublicKey),
+    }), new AbortController().signal);
+
+    assert.equal(result.kind, 'ACCEPTED');
+    assert.equal(result.claim, activeClaim);
+    assert.equal(result.claim.intent.status, 'SUBMITTED');
+    assert.equal(result.claim.intent.stateRevision, fixture.input.claim.intent.stateRevision + 1n);
+    assert.equal(signedSimulations, 1);
+    assert.equal(sends, 1);
   });
 
 void test('rejects malformed unsigned simulation evidence at the recovery boundary', async () => {

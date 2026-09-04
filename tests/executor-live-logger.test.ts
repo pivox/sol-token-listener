@@ -42,6 +42,25 @@ void test('drops secrets, economic values and hostile error objects before seria
   ]) assert.equal(raw.includes(marker), false);
 });
 
+void test('allows only the shared reachable code vocabulary', () => {
+  const sink = memorySink();
+  const logger = createLiveExecutorLogger(sink.stream);
+  for (const errorCode of [
+    'COMMIT_OUTCOME_UNKNOWN', 'CONFLICT', 'ARTIFACT_CONFLICT',
+    'INTENT_LEASE_LOST', 'INTENT_FENCE_LOST', 'INVALID_DATA',
+    'PERSISTED_TRANSACTION_INVALID', 'SIGNED_SIMULATION_CONTEXT_INVALID',
+    'ATTEMPT_CONFLICT', 'VENUE_UNAVAILABLE', 'UNSUPPORTED_TOKEN_EXTENSION',
+  ]) logger.error(Object.freeze({ event: 'executor_live.lane_failed', errorCode }));
+  logger.error(Object.freeze({ event: 'executor_live.lane_failed', errorCode: 'HOSTILE_SECRET_CODE' }));
+  assert.equal(sink.raw().includes('HOSTILE_SECRET_CODE'), false);
+  for (const errorCode of ['COMMIT_OUTCOME_UNKNOWN', 'CONFLICT', 'ARTIFACT_CONFLICT',
+    'INTENT_LEASE_LOST', 'INTENT_FENCE_LOST', 'INVALID_DATA',
+    'PERSISTED_TRANSACTION_INVALID', 'SIGNED_SIMULATION_CONTEXT_INVALID',
+    'ATTEMPT_CONFLICT', 'VENUE_UNAVAILABLE', 'UNSUPPORTED_TOKEN_EXTENSION']) {
+    assert.equal(sink.raw().includes(errorCode), true);
+  }
+});
+
 function memorySink(): Readonly<{
   stream: { write(chunk: string): void };
   raw(): string;

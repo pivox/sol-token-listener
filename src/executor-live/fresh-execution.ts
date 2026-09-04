@@ -42,6 +42,7 @@ export type FreshLiveExecutionResultV1 = LiveExecutionWorkerResultV1 | Readonly<
   readonly kind: 'FAILED';
   readonly intentId: string;
   readonly reasonCode: string;
+  readonly claim: null;
 }>;
 
 export interface FreshLiveExecution {
@@ -103,6 +104,7 @@ async function executeFresh(
       kind: 'FAILED',
       intentId: activeClaim.intent.id,
       reasonCode: result.artifact.terminalReasonCode,
+      claim: null,
     });
   }
   const authority = requiredPreparationBinding(preparation);

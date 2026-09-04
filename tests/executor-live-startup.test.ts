@@ -221,6 +221,11 @@ void test('authority SQL scans all user schemas and exposes grant provenance', (
   assert.match(LIVE_EXECUTOR_EFFECTIVE_AUTHORITY_SQL, /pg_database/u);
   assert.match(
     LIVE_EXECUTOR_EFFECTIVE_AUTHORITY_SQL,
+    /aclexplode\(\s*COALESCE\(database\.datacl,acldefault\('d',database\.datdba\)\)\s*\)/u,
+    'a NULL datacl must expose PostgreSQL default PUBLIC TEMPORARY authority',
+  );
+  assert.match(
+    LIVE_EXECUTOR_EFFECTIVE_AUTHORITY_SQL,
     /acl\.grantee=0[\s\S]*database\.datname=current_database\(\)[\s\S]*TEMPORARY/u,
     'PUBLIC TEMPORARY on the active database must be treated as effective authority',
   );

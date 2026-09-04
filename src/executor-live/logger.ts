@@ -1,5 +1,6 @@
 import { isProxy } from 'node:util/types';
 import pino, { type DestinationStream } from 'pino';
+import { LIVE_EXECUTOR_SAFE_ERROR_CODE_SET } from './error-codes.js';
 
 export type LiveExecutorLaneName = 'RECOVER_SELL' | 'SELL' | 'RECOVER_BUY' | 'BUY';
 
@@ -63,6 +64,6 @@ function safeValue(key: typeof CONTEXT_KEYS[number], value: unknown): value is s
     case 'lane': return value === 'RECOVER_SELL' || value === 'SELL'
       || value === 'RECOVER_BUY' || value === 'BUY';
     case 'result': return value === 'IDLE' || value === 'WORKED' || value === 'FAILED';
-    case 'errorCode': return /^[A-Z][A-Z0-9_]{0,63}$/u.test(value);
+    case 'errorCode': return LIVE_EXECUTOR_SAFE_ERROR_CODE_SET.has(value);
   }
 }

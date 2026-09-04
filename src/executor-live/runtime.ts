@@ -10,6 +10,9 @@ export type LiveExecutorLane = (
   signal: AbortSignal,
 ) => Promise<LiveExecutorLaneResult>;
 
+import type { LiveExecutorLaneName, LiveExecutorLogger } from './logger.js';
+import { LIVE_EXECUTOR_SAFE_ERROR_CODE_SET } from './error-codes.js';
+
 export interface LiveExecutorLanes {
   readonly recoverSell: LiveExecutorLane;
   readonly sell: LiveExecutorLane;
@@ -29,6 +32,7 @@ export interface LiveExecutorRuntimeSignalSource {
 
 export interface LiveExecutorRuntimeDependencies {
   readonly lanes: LiveExecutorLanes;
+  readonly logger?: LiveExecutorLogger;
   readonly closeSigner: () => Promise<void>;
   readonly closeDatabase: () => Promise<void>;
   readonly evictDatabase: () => void | Promise<void>;
@@ -61,7 +65,12 @@ export async function runLiveExecutorPass(
   requireSignal(signal);
   for (const [key, result] of ORDERED_LANES) {
     if (signal.aborted) return 'IDLE';
-    const laneResult = await lanes[key](signal);
+    let laneResult: LiveExecutorLaneResult;
+    try {
+      laneResult = await lanes[key](signal);
+    } catch (error) {
+      throw new LiveExecutorPassError(result, safeErrorCode(error));
+    }
     if (laneResult === 'WORKED') return result;
   }
   return 'IDLE';
@@ -110,8 +119,17 @@ export function runLiveExecutorRuntime(
     while (!shutdownRequested()) {
       try {
         await runLiveExecutorPass(dependencies.lanes, controller.signal);
-      } catch {
+      } catch (error) {
         if (shutdownRequested()) break;
+        if (error instanceof LiveExecutorPassError) {
+          dependencies.logger?.error(Object.freeze({
+            event: 'executor_live.lane_failed', lane: error.lane, errorCode: error.errorCode,
+          }));
+        } else {
+          dependencies.logger?.error(Object.freeze({
+            event: 'executor_live.lane_failed', errorCode: 'LIVE_EXECUTOR_PASS_FAILED',
+          }));
+        }
       }
       if (shutdownRequested()) break;
       await new Promise<void>((resolve) => {
@@ -160,6 +178,25 @@ export function runLiveExecutorRuntime(
     }),
     forced.promise,
   ]);
+}
+
+class LiveExecutorPassError extends Error {
+  public constructor(public readonly lane: LiveExecutorLaneName, public readonly errorCode: string) {
+    super('Live executor pass failed.');
+    this.name = 'LiveExecutorPassError';
+  }
+}
+
+function safeErrorCode(error: unknown): string {
+  if ((typeof error !== 'object' && typeof error !== 'function') || error === null) {
+    return 'LIVE_EXECUTOR_PASS_FAILED';
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+    return descriptor !== undefined && 'value' in descriptor && typeof descriptor.value === 'string'
+      && LIVE_EXECUTOR_SAFE_ERROR_CODE_SET.has(descriptor.value)
+      ? descriptor.value : 'LIVE_EXECUTOR_PASS_FAILED';
+  } catch { return 'LIVE_EXECUTOR_PASS_FAILED'; }
 }
 
 async function forceShutdown(dependencies: LiveExecutorRuntimeDependencies): Promise<void> {

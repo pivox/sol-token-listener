@@ -892,7 +892,18 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       repository.persistSigned(input),
     ]);
 
-    assert.deepEqual(persisted, [fixture.artifact, fixture.artifact]);
+    assert.deepEqual(persisted.map((result) => result.artifact), [
+      fixture.artifact, fixture.artifact,
+    ]);
+    assert.deepEqual(persisted.map((result) => Object.freeze({
+      status: result.claim.intent.status,
+      revision: result.claim.intent.stateRevision,
+    })), [
+      { status: 'SIGNED_NOT_SUBMITTED', revision: fixture.claim.intent.stateRevision + 2n },
+      { status: 'SIGNED_NOT_SUBMITTED', revision: fixture.claim.intent.stateRevision + 2n },
+    ]);
+    const persistedClaim = persisted[0]?.claim;
+    assert.ok(persistedClaim);
     const state = await pool.query(`SELECT
       (SELECT state FROM execution_activation_armaments WHERE armament_id=$1) AS armament_state,
       (SELECT consumed_buys FROM execution_activation_armaments WHERE armament_id=$1) AS consumed_buys,
@@ -909,23 +920,45 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reconciliation_signature: fixture.artifact.signature,
     }]);
     const authenticated = await repository.authenticatePersistedSignedTransaction({
-      claim: fixture.claim, artifactId: fixture.artifact.artifactId,
+      claim: persistedClaim, artifactId: fixture.artifact.artifactId,
     });
     assert.equal(authenticated.state, 'PERSISTED');
     assert.deepEqual(authenticated.artifact.signedTransactionBytes,
       fixture.artifact.signedTransactionBytes);
+    const futureRevisionClaim = Object.freeze({
+      ...fixture.claim,
+      intent: Object.freeze({
+        ...fixture.claim.intent,
+        stateRevision: fixture.claim.intent.stateRevision + 3n,
+      }),
+    });
+    await assert.rejects(
+      repository.inspectSignedTransaction({ claim: futureRevisionClaim }),
+      isLiveRepositoryError('INVALID_DATA'),
+    );
     const recovered = await repository.inspectSignedTransaction({ claim: fixture.claim });
     assert.equal(recovered?.state, 'PERSISTED');
     assert.ok(recovered !== null && 'artifact' in recovered);
     assert.equal(recovered.artifact.artifactId, fixture.artifact.artifactId);
     assert.deepEqual(recovered.unsignedSimulation, fixture.unsignedSimulation);
+    assert.equal(recovered.claim.intent.status, 'SIGNED_NOT_SUBMITTED');
+    assert.equal(
+      recovered.claim.intent.stateRevision,
+      fixture.claim.intent.stateRevision + 2n,
+    );
+    const renewedRecoveredClaim = await new PostgresExecutionIntentRepository(pool).renew(
+      recovered.claim,
+      60_000,
+    );
+    assert.equal(renewedRecoveredClaim.intent.status, 'SIGNED_NOT_SUBMITTED');
+    assert.equal(renewedRecoveredClaim.intent.stateRevision, recovered.claim.intent.stateRevision);
     const signedEvidenceMetrics = Object.freeze({
       simulationSlot: 126n, unitsConsumed: 26_000n,
       feePayerLamportDebit: 5_500n, baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
       observedAtMs: fixture.artifact.signedAtMs + 1,
     });
     await assert.rejects(repository.recordSignedSimulation(
-      fixture.claim,
+      persistedClaim,
       signedSimulationEvidence(
         fixture.artifact, fixture.unsignedSimulation, signedEvidenceMetrics, 'secondary',
       ),
@@ -939,13 +972,31 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       fixture.artifact, fixture.unsignedSimulation, signedEvidenceMetrics,
     );
     const signedSimulation = await repository.recordSignedSimulation(
-      fixture.claim, signedEvidence,
+      persistedClaim, signedEvidence,
     );
     assert.equal(signedSimulation.state, 'SIGNED_SIMULATED');
     assert.equal(signedSimulation.stateRevision, 1n);
     assert.deepEqual(
-      await repository.recordSignedSimulation(fixture.claim, signedEvidence),
+      await repository.recordSignedSimulation(persistedClaim, signedEvidence),
       signedSimulation,
+    );
+    const recoveredSignedSimulation = await repository.inspectSignedTransaction({
+      claim: fixture.claim,
+    });
+    assert.equal(recoveredSignedSimulation?.state, 'SIGNED_SIMULATED');
+    assert.ok(recoveredSignedSimulation !== null && 'artifact' in recoveredSignedSimulation);
+    assert.equal(recoveredSignedSimulation.claim.intent.status, 'SIGNED_NOT_SUBMITTED');
+    assert.equal(
+      recoveredSignedSimulation.claim.intent.stateRevision,
+      fixture.claim.intent.stateRevision + 2n,
+    );
+    const renewedSignedSimulationClaim = await new PostgresExecutionIntentRepository(pool).renew(
+      recoveredSignedSimulation.claim,
+      60_000,
+    );
+    assert.equal(
+      renewedSignedSimulationClaim.intent.stateRevision,
+      recoveredSignedSimulation.claim.intent.stateRevision,
     );
     const durableEvidence = await pool.query(`SELECT evidence_fingerprint,
       unsigned_simulation_evidence_id,provider_id,logs_fingerprint,logs_line_count,
@@ -972,7 +1023,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       );
     }
     const submissionStarted = await repository.beginSubmission({
-      claim: fixture.claim,
+      claim: persistedClaim,
       artifactId: fixture.artifact.artifactId,
       expectedRevision: signedSimulation.stateRevision,
       ...submissionPreflight(fixture.artifact),
@@ -1009,7 +1060,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       SET risk_state_revision_baseline=risk_state_revision_baseline+1
       WHERE intent_id=$1`, [fixture.claim.intent.id]),
     (error: unknown) => databaseErrorCode(error) === '55000');
-    await repository.recordSubmissionOutcome(fixture.claim, Object.freeze({
+    const outcome = await repository.recordSubmissionOutcome(persistedClaim, Object.freeze({
       payloadVersion: 1,
       artifactId: fixture.artifact.artifactId,
       expectedRevision: submissionStarted.stateRevision,
@@ -1018,6 +1069,11 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reasonCode: 'SUBMISSION_ACCEPTED',
       observedAtMs: Date.now(),
     }));
+    assert.equal(outcome.claim.intent.status, 'SUBMITTED');
+    assert.equal(
+      outcome.claim.intent.stateRevision,
+      persistedClaim.intent.stateRevision + 1n,
+    );
     const accepted = await pool.query(`SELECT
       (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS artifact_state,
       (SELECT state_revision::TEXT FROM execution_signed_transactions
@@ -1039,8 +1095,8 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       observedSlot: 127n,
       observedAtMs: Date.now(),
     } as const);
-    await repository.recordConfirmation(fixture.claim, entryConfirmation);
-    await repository.recordConfirmation(fixture.claim, entryConfirmation);
+    await repository.recordConfirmation(outcome.claim, entryConfirmation);
+    await repository.recordConfirmation(outcome.claim, entryConfirmation);
     const reconciliationClaim = await new PostgresExecutionIntentRepository(pool).claim({
       ownerId: 'entry-reconciliation-after-confirmation',
       leaseMs: 60_000,

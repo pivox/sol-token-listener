@@ -1,12 +1,12 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.3.5 — 2026-09-04
+**Version :** 1.4.0 — 2026-09-04
 
-Ce document décrit l'état réellement livré et la procédure qui deviendra
-applicable après composition du runtime signable. #51-H2a publie uniquement
+Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
-signature ni soumission. Le script signable `executor:live:start` reste absent.
-Il est interdit de contourner ce verrou avec un script ad hoc.
+signature ni soumission. #51-H2b publie séparément
+`executor:live:dev` et `executor:live:start`, sans armer ni démarrer un canary.
+H2c conserve les gates, l'armement opérateur et la préparation du canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
 briques #51-G ne prouvent ni rentabilité, ni sellabilité générale, ni avantage
@@ -16,15 +16,31 @@ automatiquement.
 
 ## État et frontière de sécurité
 
-La migration 036, le ledger live, la signature locale, la soumission exacte,
-la confirmation, la réconciliation et la sortie à deadline disposent de
-contrats testables séparés. Il manque encore une composition production qui
-valide configuration et schéma avant de charger le secret, injecte tous les
-ports réels, respecte l'ordre réconciliation → confirmation → SELL → deadline
-→ BUY, puis ferme les ressources dans un délai borné.
+Le constat livré obligatoire est :
+`LIVE_SIGNABLE_RUNTIME_COMPOSED`, `CANARY_NOT_STARTED`,
+`NON_EXECUTED / NON_VALIDATED`.
 
-Tant que le graphe signable H2b n'est pas livré et revu, les commandes opérateur restent
-inertes et aucun canary réel ne doit être tenté.
+H2b est un processus signable isolé. Sa passe expose exactement quatre lanes,
+dans cet ordre : recover SELL, execute SELL, recover BUY, execute BUY. Le
+premier résultat `WORKED` arrête la passe. H2a reste le processus séparé de
+finalité, confirmation, réconciliation et deadline. H2c reste le seul
+propriétaire des gates, de l'armement et du canary.
+
+La configuration livrée reste désarmée : `.env.example` conserve
+`EXECUTOR_MODE=dry-run`, `LIVE_TRADING_ENABLED=false` et aucun chemin de
+keypair réel. Elle ne permet pas de démarrer H2b. La publication de H2b ne
+crée aucune intention, ne lance ni `live:resume` ni `live:arm`, et n'exécute
+aucun canary.
+
+Les commandes H2b existantes sont :
+
+```bash
+npm run executor:live:dev
+npm run executor:live:start
+```
+
+Elles ne sont pas une procédure d'armement. Aucun secret réel, armement ou
+séquence de canary n'est documenté dans le périmètre H2b.
 
 ## Démarrer uniquement la récupération de finalité H2a
 
@@ -93,12 +109,11 @@ confirmation ou une échéance par passe. Il ne réclame jamais `LIVE_RECOVER`,
 bytes signés, ni créer une signature, ni envoyer une transaction. Son
 démarrage ne vaut ni armement ni autorisation de canary.
 
-La migration 037 et les repositories #51-H1 ajoutent uniquement les claims
+La migration 037 et les repositories #51-H1 fournissent les claims
 `LIVE_EXECUTE` SELL/BUY et `LIVE_RECOVER`, les read-models durables de
 confirmation et réconciliation, ainsi que le scan atomique des sorties à
-deadline. Ils ne composent aucun RPC, signer, appel de soumission, runtime de
-production ou entrypoint. Ces capacités restent réservées à #51-H2 ; tout
-canary restera en plus soumis à un armement manuel distinct.
+deadline. H2b les compose seulement pour la reprise et l'exécution signables ;
+H2a conserve les read-models de finalité et le scan à deadline.
 
 La priorité SELL est protégée transactionnellement : chaque création SELL et
 chaque claim BUY live prennent le même verrou advisory de présence SELL. Le
@@ -130,21 +145,19 @@ Les simulations non signée et signée sont deux preuves append-only liées au
 même artefact ; une altération ou une liaison incomplète empêche
 `SIGNED_SIMULATED`.
 
-Cette livraison ne compose volontairement aucun appel RPC réel pour produire
-cette preuve. La PR de composition suivante devra appeler immédiatement avant
-le verrou les méthodes Solana officielles `isBlockhashValid` et
-`getBlockHeight`, propager le `contextSlot`, relire le genesis hash et injecter
-les timestamps causaux de la quote. Une valeur inventée, mise en cache ou
-réutilisée au-delà de cinq secondes doit être refusée; le binaire live reste
-indémarrable jusque-là.
+H2b vérifie le genesis au démarrage et obtient immédiatement avant ce verrou
+une preuve fraîche de validité du blockhash. Il persiste les mêmes octets
+signés avant simulation signée puis soumission, utilise `maxRetries=0` et
+classe toute issue incertaine comme `AMBIGUOUS`; il ne reconstruit ni ne
+resigne un artefact récupéré.
 
 ## PostgreSQL et rétention
 
 Après les migrations, un administrateur peut appliquer
 `scripts/provision-executor-roles.sql`. Il crée des rôles de groupe `NOLOGIN`,
-sans mot de passe ni privilège cluster. Le compte LOGIN du futur processus
-signable H2b doit recevoir seulement `sol_token_executor_live`. Le compte H2a
-distinct reçoit seulement `sol_token_executor_live_recovery`.
+sans mot de passe ni privilège cluster. Le compte LOGIN H2b reçoit seulement
+`sol_token_executor_live`; le compte H2a distinct reçoit seulement
+`sol_token_executor_live_recovery`.
 
 La rétention utilise un second compte LOGIN dédié qui doit recevoir seulement
 `sol_token_retention_worker`. Il ne doit jamais être partagé avec le listener,
@@ -166,6 +179,13 @@ de l'identifiant, de l'état, de l'échéance et de l'autorisation de sortie sur
 `execution_signed_transactions` : `signed_transaction_bytes` lui reste
 inaccessible, y compris via `RETURNING`.
 
+Le provisioning H2b révoque aussi `TEMPORARY` de `PUBLIC` sur la seule base de
+données provisionnée. `PUBLIC TEMP` est un prérequis de sécurité DB-scoped sur
+cette base de données :
+une table temporaire homonyme pourrait masquer une table `public`. Cette
+révocation ne s'applique ni globalement aux autres bases ni à d'autres rôles ;
+les accès explicitement nécessaires sont réaccordés par l'administrateur.
+
 La transaction de purge prend d'abord le verrou advisory
 `foundation-retention-fence:v1`. Un seul job de rétention peut donc former des
 cohortes à la fois, sans `SELECT ... FOR UPDATE` et sans droit de mise à jour
@@ -185,49 +205,25 @@ Un artefact `AMBIGUOUS`, une position `OPEN`, `EXIT_PENDING` ou `UNKNOWN`, et
 une autorisation `ACTIVE` ou `LOCKED` ne sont jamais candidats. Les tombstones
 anti-rejeu minimaux des intentions restent durables.
 
-## Préparation publique, sans secret
+## Configuration H2b désarmée
 
-Le fichier `.env.example` liste les limites publiques. Un futur déploiement
-devra épingler notamment le build, la configuration, la stratégie, le wallet,
-le provider, le genesis hash, le quote mint WSOL et le plafond brut en
-lamports. Le keypair dédié restera hors du dépôt dans un fichier régulier non
-symlink, propriétaire du processus et mode exact `0400` ou `0600`.
+Le fichier `.env.example` liste les limites publiques, mais sa configuration
+reste dry-run et désarmée. H2b valide le build, la configuration, la stratégie,
+la génération wallet, le provider et le genesis avant d'ouvrir son secret. Si
+un déploiement H2b est préparé ultérieurement dans le cadre de H2c, son keypair
+reste hors dépôt dans un fichier régulier non symlink, propriétaire du
+processus et mode exact `0400` ou `0600`.
 
 Ne jamais écrire le contenu du keypair dans `.env`, PostgreSQL, un log, une
-preuve ou un ticket. Ne pas financer le wallet avant que le runtime composé et
-ses gates complets aient passé la revue.
+preuve ou un ticket. H2b ne fournit ici ni clé réelle, ni financement, ni
+armement, ni procédure de canary.
 
-## Séquence opérateur réservée au futur runtime
+## Gates et canary : hors H2b
 
-Après livraison et revue du graphe manquant, l'ordre manuel obligatoire sera :
-
-```bash
-npm run live:preflight
-npm run live:status
-npm run live:report
-npm run live:resume
-npm run live:status
-npm run live:arm -- \
-  --maximum-lamports=500000 \
-  --holding-ms=300000 \
-  --reason='Mainnet canary manually approved.'
-npm run live:status
-```
-
-`resume` et `arm` nécessitent chacun un vrai TTY et une confirmation distincte.
-Le montant montré est un exemple technique, pas une recommandation. Le plafond
-doit être validé humainement en lamports. Avant l'armement, chacune des onze
-gates #51-F doit être fraîche et `PASSED`, sans `UNKNOWN`, `AMBIGUOUS` ou
-`UNKNOWN_HELD`.
-
-Le démarrage du futur binaire ne devra ni exécuter `resume`, ni armer, ni
-modifier l'état de contrôle. Après démarrage manuel séparé, la surveillance
-reposera sur :
-
-```bash
-npm run live:status
-npm run live:report
-```
+H2c devra vérifier les gates et décider explicitement tout armement ou canary.
+H2b ne modifie pas l'état de contrôle, n'exécute pas `live:resume` ou
+`live:arm` et n'a pas l'autorité de les remplacer. Aucun canary n'est démarré
+par cette livraison.
 
 ## Kill switches et arrêt
 
@@ -251,7 +247,7 @@ npm run live:kill-switch -- \
 
 Une soumission incertaine impose la réconciliation des mêmes octets et de la
 même signature. Elle n'autorise ni nouveau blockhash, ni nouvel ordre logique,
-ni réarmement. Le futur arrêt normal appliquera d'abord `entry-stop`, enverra
+ni réarmement. Un arrêt normal applique d'abord `entry-stop`, enverra
 `SIGTERM`, attendra l'arrêt borné, puis relira `live:status` et `live:report`.
 
 Après redémarrage, l'état durable décide du seul chemin autorisé. En
@@ -260,14 +256,13 @@ puis la signature persistée est confirmée et réconciliée. Les états
 `ACCEPTED`, `AMBIGUOUS` et `REVOKED_NO_SEND` sont rejoués sans nouvelle
 signature ni nouvelle soumission.
 
-Le worker de reprise découvre l'artefact à partir du claim durable
+La lane H2b de reprise découvre l'artefact à partir du claim durable
 intent/tentative et recharge depuis PostgreSQL les bytes exacts ainsi que la
 preuve non signée canonique. Il ne dépend pas d'un candidat opaque resté en
-mémoire avant le crash. La future composition devra reconstruire les comptes
-de simulation depuis le plan canonique inspecté, sans reconstruire la
-transaction et sans résigner.
+mémoire avant le crash. Elle reprend la simulation signée ou le dernier
+preflight depuis cet artefact, sans reconstruire la transaction ni résigner.
 
-## Critère de constat futur
+## Critère de canary H2c
 
 Un canary ne pourra être déclaré `PASS` qu'avec un BUY et un SELL finalisés et
 réconciliés, zéro double ordre, zéro résiduel inattendu, position `CLOSED`,
@@ -275,6 +270,4 @@ autorisation et armement consommés, et aucun état inconnu. Une absence
 d'opportunité, un BUY refusé ou une fermeture sans transaction ne vaut pas
 `PASS`.
 
-Pour l'instant, le constat obligatoire est :
-`LIVE_RECOVERY_RUNTIME_COMPOSED`, `LIVE_EXECUTION_RUNTIME_NOT_COMPOSED`,
-`CANARY_NOT_STARTED`, `NON_EXECUTED / NON_VALIDATED`.
+Ce critère H2c ne modifie pas le constat livré défini en tête de ce runbook.

@@ -1,8 +1,8 @@
 import type { LiveExecutorConfig } from './config.js';
 import {
-  LIVE_RECOVERY_MIGRATION_CATALOG,
-  validateLiveRecoveryMigrationFiles,
-} from '../executor-live-recovery/startup-validator.js';
+  LIVE_EXECUTION_MIGRATION_CATALOG,
+  validateLiveExecutionMigrationFiles,
+} from '../execution-migrations/live-catalog.js';
 
 export type LiveExecutorStartupErrorCode =
   | 'MIGRATION_CATALOG_INVALID'
@@ -308,7 +308,7 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
     functions: Object.freeze([]),
   });
 
-export const LIVE_EXECUTOR_MIGRATION_CATALOG = LIVE_RECOVERY_MIGRATION_CATALOG;
+export const LIVE_EXECUTOR_MIGRATION_CATALOG = LIVE_EXECUTION_MIGRATION_CATALOG;
 
 export const LIVE_EXECUTOR_EFFECTIVE_AUTHORITY_SQL = `
   /* live_executor_effective_authority */
@@ -372,7 +372,9 @@ export const LIVE_EXECUTOR_EFFECTIVE_AUTHORITY_SQL = `
       NULL::TEXT AS subobject_name,acl.privilege_type::TEXT AS privilege,
       acl.is_grantable,(CASE WHEN acl.grantee=0 THEN 'PUBLIC' ELSE 'ROLE' END)::TEXT AS source,
       FALSE AS security_definer
-    FROM pg_database database CROSS JOIN LATERAL aclexplode(database.datacl) acl
+    FROM pg_database database CROSS JOIN LATERAL aclexplode(
+      COALESCE(database.datacl,acldefault('d',database.datdba))
+    ) acl
     WHERE acl.grantee=(SELECT oid FROM target)
       OR (acl.grantee=0 AND database.datname=current_database()
         AND acl.privilege_type='TEMPORARY')
@@ -450,7 +452,7 @@ export async function validateLiveExecutorMigrationFiles(
   migrationsDirectory?: string,
 ): Promise<void> {
   try {
-    await validateLiveRecoveryMigrationFiles(migrationsDirectory);
+    await validateLiveExecutionMigrationFiles(migrationsDirectory);
   } catch {
     throw failure('MIGRATION_CATALOG_INVALID');
   }
@@ -624,9 +626,9 @@ const OPEN_WORK_SQL = `SELECT (
       WHERE position.state IN ('OPEN','EXIT_PENDING','UNKNOWN')
         AND (position.generation_id<>$1 OR position.wallet_public_key<>$2
           OR armament.provider_id<>$3))
-    + (SELECT COUNT(*) FROM execution_exit_authorizations authorization
-      WHERE authorization.state IN ('ACTIVE','LOCKED')
-        AND (authorization.generation_id<>$1 OR authorization.wallet_public_key<>$2))
+    + (SELECT COUNT(*) FROM execution_exit_authorizations exit_auth
+      WHERE exit_auth.state IN ('ACTIVE','LOCKED')
+        AND (exit_auth.generation_id<>$1 OR exit_auth.wallet_public_key<>$2))
   )::TEXT AS divergent_work_count`;
 
 function validRole(role: Readonly<Record<string, unknown>>): boolean {
@@ -718,8 +720,7 @@ async function queryAt(
   values: readonly unknown[] | undefined,
   code: LiveExecutorStartupErrorCode,
 ): ReturnType<LiveExecutorStartupDatabase['query']> {
-  try { return await database.query(text, values); } catch (error) {
-    console.error(error);
+  try { return await database.query(text, values); } catch {
     throw failure(code);
   }
 }

@@ -14,8 +14,8 @@
 ## Historique des versions
 
 - **1.10.0 — 2026-09-04 :** livre H2b comme binaire signable séparé et désarmé,
-  avec exactement quatre lanes ordonnées : recover SELL, execute SELL, recover
-  BUY, execute BUY. H2a reste seul responsable de la finalité, de la
+  avec exactement quatre lanes ordonnées : recover SELL, execute SELL, recover BUY, execute BUY.
+  H2a reste seul responsable de la finalité, de la
   confirmation, de la réconciliation et de la deadline ; H2c reste seul
   responsable de l'armement opérateur et du canary. L'état reste
   `CANARY_NOT_STARTED` et `NON_EXECUTED / NON_VALIDATED`.

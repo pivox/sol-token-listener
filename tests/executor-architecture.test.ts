@@ -209,9 +209,7 @@ void test('simulation-only guard restricts official SDKs to exact audited bridge
 void test('simulation-only graph keeps build receipt, plan builders and gateway construction at exact sites', async () => {
   const expected = Object.freeze([
     'src/executor-simulation/attempt-evaluator.ts:BuildReceiptAuthority:issue',
-    'src/executor-simulation/attempt-evaluator.ts:BuildReceiptAuthority:issue',
     'src/executor-simulation/attempt-evaluator.ts:BuildReceiptAuthority:new',
-    'src/executor-simulation/attempt-evaluator.ts:SolanaSimulationGateway:new',
     'src/executor-simulation/attempt-evaluator.ts:SolanaSimulationGateway:new',
     'src/executor-simulation/attempt-evaluator.ts:buildPumpFunPlan:call',
     'src/executor-simulation/attempt-evaluator.ts:buildPumpSwapPlan:call',
@@ -676,13 +674,21 @@ void test('process integration registers each child immediately and bounds TERM 
 void test('source and compiled live capability remains isolated in exact files', async () => {
   const expectedLiveFiles = [
     'confirmation-worker',
+    'config',
+    'database',
     'deadline-exit.service',
     'execution-worker',
+    'fresh-execution',
     'keypair-loader',
+    'lanes',
+    'logger',
     'main',
     'reconciliation-worker',
+    'rpc-gateway',
     'runtime',
+    'signed-simulation-context',
     'signed-simulation-gateway',
+    'startup-validator',
     'submission-gateway',
     'transaction-preparer',
   ];
@@ -709,8 +715,21 @@ void test('source and compiled live capability remains isolated in exact files',
     const mainGraph = await readGraph(resolve(repositoryRoot, `${prefix}/executor-live/main.${extension}`));
     assert.equal(
       [...mainGraph.keys()].some((path) => path.endsWith(`/executor-live/submission-gateway.${extension}`)),
-      false,
-      'fail-closed bootstrap must not pretend production lanes are composed',
+      true,
+      'H2b production composition must reach the live submission boundary',
+    );
+    assert.deepEqual(
+      [...mainGraph.keys()].filter((path) => path.includes('/executor-live-recovery/')),
+      [],
+      'H2b must not reach the H2a recovery graph',
+    );
+    const recoveryGraph = await readGraph(resolve(
+      repositoryRoot, `${prefix}/executor-live-recovery/main.${extension}`,
+    ));
+    assert.deepEqual(
+      [...recoveryGraph.keys()].filter((path) => path.includes('/executor-live/')),
+      [],
+      'H2a must not reach the H2b graph',
     );
   }
 });

@@ -22,12 +22,12 @@ export interface LiveSignableLaneDependencies {
     context: LiveFreshExecutionContextV1,
     signal: AbortSignal,
     renew: () => Promise<ClaimedExecutionIntent>,
-  ) => Promise<void>;
+  ) => Promise<ClaimedExecutionIntent | null>;
   readonly recoverPersisted: (
     claim: ClaimedExecutionIntent,
     signal: AbortSignal,
     renew: () => Promise<ClaimedExecutionIntent>,
-  ) => Promise<void>;
+  ) => Promise<ClaimedExecutionIntent | null>;
   readonly clock?: () => number;
 }
 
@@ -57,15 +57,18 @@ async function recoverOnce(
   }), signal);
   if (claimed === null) return 'IDLE';
   let activeClaim = claimed;
+  let leaseClosed = false;
   const renew = async (): Promise<ClaimedExecutionIntent> => {
     requireActive(signal);
     activeClaim = await dependencies.intents.renew(activeClaim, dependencies.leaseMs);
     requireActive(signal);
     return activeClaim;
   };
-  return withRelease(dependencies.intents, () => activeClaim, async () => {
+  return withRelease(dependencies.intents, () => leaseClosed ? null : activeClaim, async () => {
     requireActive(signal);
-    await dependencies.recoverPersisted(activeClaim, signal, renew);
+    const result = await dependencies.recoverPersisted(activeClaim, signal, renew);
+    if (result === null) leaseClosed = true;
+    else activeClaim = result;
     return 'WORKED';
   });
 }
@@ -84,13 +87,14 @@ async function executeOnce(
   }), signal);
   if (claimed === null) return 'IDLE';
   let activeClaim = claimed;
+  let leaseClosed = false;
   const renew = async (): Promise<ClaimedExecutionIntent> => {
     requireActive(signal);
     activeClaim = await dependencies.intents.renew(activeClaim, dependencies.leaseMs);
     requireActive(signal);
     return activeClaim;
   };
-  return withRelease(dependencies.intents, () => activeClaim, async () => {
+  return withRelease(dependencies.intents, () => leaseClosed ? null : activeClaim, async () => {
     requireActive(signal);
     if (activeClaim.intent.status === 'PENDING'
       || activeClaim.intent.status === 'RETRY_READY') {
@@ -119,32 +123,38 @@ async function executeOnce(
     const begun = await dependencies.intents.beginAttempt(activeClaim);
     activeClaim = begun.claim;
     requireActive(signal);
-    await dependencies.executeFresh(Object.freeze({
+    const result = await dependencies.executeFresh(Object.freeze({
       claim: activeClaim,
       attempt: begun.attempt,
     }), signal, renew);
+    if (result === null) leaseClosed = true;
+    else activeClaim = result;
     return 'WORKED';
   });
 }
 
 async function withRelease(
   repository: Pick<ExecutionIntentRepository, 'release'>,
-  claim: () => ClaimedExecutionIntent,
+  claim: () => ClaimedExecutionIntent | null,
   operation: () => Promise<LiveExecutorLaneResult>,
 ): Promise<LiveExecutorLaneResult> {
+  let completed = false;
   let failure: unknown;
+  let result: LiveExecutorLaneResult | undefined;
   try {
-    return await operation();
+    result = await operation();
+    completed = true;
   } catch (error) {
     failure = error;
-    throw error;
-  } finally {
-    try {
-      await repository.release(claim());
-    } catch (releaseError) {
-      if (failure === undefined) throw releaseError;
-    }
   }
+  try {
+    const activeClaim = claim();
+    if (activeClaim !== null) await repository.release(activeClaim);
+  } catch (releaseError) {
+    if (completed) throw releaseError;
+  }
+  if (!completed || result === undefined) throw failure;
+  return result;
 }
 
 function activeSignal(value: unknown): value is AbortSignal {

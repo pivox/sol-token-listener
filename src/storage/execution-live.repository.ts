@@ -40,6 +40,7 @@ import type {
   ExecutionLiveConfirmationWorkV1,
   ExecutionLiveArtifactReferenceV1,
   ExecutionLivePersistSignedInputV1,
+  ExecutionLivePersistSignedResultV1,
   ExecutionLivePreparationBindingV1,
   ExecutionPreSubmissionRevocationInputV1,
   ExecutionPreSubmissionRevocationResultV1,
@@ -48,6 +49,7 @@ import type {
   ExecutionLiveSignedTransactionInspectionV1,
   ExecutionLiveSignedSimulationEvidenceV1,
   ExecutionLiveSubmissionOutcomeV1,
+  ExecutionLiveSubmissionOutcomeResultV1,
   ExecutionLiveRuntimeBindingV1,
 } from '../ports/execution-live-repository.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
@@ -110,6 +112,12 @@ const ARTIFACT_REFERENCE_COLUMNS = `
   transaction.signed_at,transaction.signed_simulated_at,transaction.submission_started_at,
   transaction.submitted_at,transaction.confirmed_at,transaction.confirmed_slot,
   transaction.reconciled_at,transaction.revoked_at,transaction.purge_after`;
+const AUTHORITATIVE_CLAIM_PROJECTION = `
+  status AS claim_status,attempt_count AS claim_attempt_count,
+  state_revision::TEXT AS claim_state_revision,last_reason_code AS claim_last_reason_code,
+  trunc(EXTRACT(EPOCH FROM updated_at)*1000)::TEXT AS claim_updated_at_ms,
+  lease_owner AS claim_lease_owner,lease_token::TEXT AS claim_lease_token,
+  trunc(EXTRACT(EPOCH FROM lease_expires_at)*1000)::TEXT AS claim_lease_expires_at_ms`;
 const RUNTIME_BINDING_KEYS = Object.freeze([
   'payloadVersion', 'phase', 'buildHash', 'configurationFingerprint',
   'strategyFingerprint', 'walletPublicKey', 'cluster', 'expectedGenesisHash',
@@ -147,7 +155,7 @@ export class PostgresExecutionLiveRepository {
 
   public async persistSigned(
     inputValue: ExecutionLivePersistSignedInputV1,
-  ): Promise<SignedTransactionArtifactV1> {
+  ): Promise<ExecutionLivePersistSignedResultV1> {
     const input = persistInputFrom(inputValue);
     return this.transaction(async (client) => {
       if (input.artifact.side === 'SELL') {
@@ -158,7 +166,7 @@ export class PostgresExecutionLiveRepository {
       if (replay !== null) {
         if (!sameArtifact(replay, input.artifact)) throw failure('CONFLICT');
         await persistUnsignedSimulationEvidence(client, input);
-        return input.artifact;
+        return persistedResult(input.artifact, replayedPersistClaim(input.claim, replay));
       }
       if (input.artifact.side === 'SELL') return persistSellSigned(client, input);
       const binding = exactRow(singleRow(await client.query(`SELECT
@@ -251,14 +259,17 @@ export class PostgresExecutionLiveRepository {
         updated_at=date_trunc('milliseconds',statement_timestamp())
         WHERE id=$1 AND status='PROCESSING' AND state_revision=$4::BIGINT
           AND lease_owner=$2 AND lease_token=$3::UUID
-          AND lease_expires_at > statement_timestamp()`, [
+          AND lease_expires_at > statement_timestamp()
+        RETURNING ${AUTHORITATIVE_CLAIM_PROJECTION}`, [
         input.artifact.intentId, input.claim.leaseOwner, input.claim.leaseToken,
         input.claim.intent.stateRevision.toString(),
       ]);
       if (transitioned.rowCount !== 1) throw failure('LEASE_LOST');
       await insertIntentTransitions(client, input, nowMs);
       await insertSubmissionEvent(client, input.artifact, nowMs);
-      return input.artifact;
+      return persistedResult(input.artifact, transitionedClaim(
+        input.claim, transitioned, 'SIGNED_NOT_SUBMITTED', 2n, 'SIGNATURE_PERSISTED',
+      ));
     });
   }
 
@@ -320,6 +331,18 @@ export class PostgresExecutionLiveRepository {
         const unsignedSimulation = await loadUnsignedSimulationEvidence(client, artifact);
         return Object.freeze({
           payloadVersion: 1, artifact, unsignedSimulation, state, stateRevision,
+          claim: inspectionClaim(claim, row, state),
+        });
+      }
+      if (state === 'REVOKED_NO_SEND') {
+        return Object.freeze({
+          payloadVersion: 1,
+          artifactId: artifact.artifactId,
+          signature: artifact.signature,
+          signedTransactionHash: artifact.signedTransactionHash,
+          state,
+          stateRevision,
+          claim: null,
         });
       }
       return Object.freeze({
@@ -329,6 +352,7 @@ export class PostgresExecutionLiveRepository {
         signedTransactionHash: artifact.signedTransactionHash,
         state,
         stateRevision,
+        claim: inspectionClaim(claim, row, state),
       });
     });
   }
@@ -593,7 +617,7 @@ export class PostgresExecutionLiveRepository {
   public async recordSubmissionOutcome(
     claimValue: ClaimedExecutionIntent,
     outcome: ExecutionLiveSubmissionOutcomeV1,
-  ): Promise<SignedTransactionArtifactV1> {
+  ): Promise<ExecutionLiveSubmissionOutcomeResultV1> {
     const claim = claimFrom(claimValue);
     validateSubmissionOutcome(outcome);
     return this.transaction(async (client) => {
@@ -607,6 +631,9 @@ export class PostgresExecutionLiveRepository {
         throw failure('LEASE_LOST');
       }
       const artifact = artifactFromRow(row);
+      const activeClaim = currentClaim(
+        claim, row, 'SIGNED_NOT_SUBMITTED', 'SIGNATURE_PERSISTED',
+      );
       if (outcome.outcome === 'ACCEPTED'
         && outcome.returnedSignature !== artifact.signature) throw failure('CONFLICT');
       const nextState = outcome.outcome === 'ACCEPTED' ? 'ACCEPTED' : 'AMBIGUOUS';
@@ -627,7 +654,8 @@ export class PostgresExecutionLiveRepository {
         state_revision=state_revision+1,last_reason_code=$3,
         updated_at=date_trunc('milliseconds',statement_timestamp())
         WHERE id=$1 AND status='SIGNED_NOT_SUBMITTED' AND lease_owner=$4
-          AND lease_token=$5::UUID`, [
+          AND lease_token=$5::UUID
+        RETURNING ${AUTHORITATIVE_CLAIM_PROJECTION}`, [
         artifact.intentId, nextIntent, intentReason, claim.leaseOwner, claim.leaseToken,
       ]);
       if (intent.rowCount !== 1) throw failure('LEASE_LOST');
@@ -653,7 +681,11 @@ export class PostgresExecutionLiveRepository {
           throw failure('CONFLICT');
         }
       }
-      return artifact;
+      return Object.freeze({
+        payloadVersion: 1,
+        artifact,
+        claim: transitionedClaim(activeClaim, intent, nextIntent, 1n, intentReason),
+      });
     });
   }
 
@@ -1112,6 +1144,130 @@ function claimFrom(claim: ClaimedExecutionIntent): ClaimedExecutionIntent {
   return Object.freeze({ ...claim, intent });
 }
 
+function persistedResult(
+  artifact: SignedTransactionArtifactV1,
+  claim: ClaimedExecutionIntent,
+): ExecutionLivePersistSignedResultV1 {
+  return Object.freeze({ payloadVersion: 1, artifact, claim });
+}
+
+function transitionedClaim(
+  previous: ClaimedExecutionIntent,
+  result: QueryResult,
+  expectedStatus: ExecutionIntentV1['status'],
+  revisionDelta: bigint,
+  expectedReason: NonNullable<ExecutionIntentV1['lastReasonCode']>,
+): ClaimedExecutionIntent {
+  if (result.rowCount !== 1 || result.rows.length !== 1) throw failure('INVALID_DATA');
+  return authoritativeClaim(
+    previous, singleRow(result), expectedStatus, revisionDelta, expectedReason,
+  );
+}
+
+function replayedPersistClaim(
+  previous: ClaimedExecutionIntent,
+  row: Row,
+): ClaimedExecutionIntent {
+  if (row.claim_lease_owner !== previous.leaseOwner
+    || row.claim_lease_token !== previous.leaseToken) throw failure('LEASE_LOST');
+  if (row.state === 'PERSISTED' || row.state === 'SIGNED_SIMULATED'
+    || row.state === 'SUBMISSION_STARTED') {
+    return authoritativeClaim(
+      previous, row, 'SIGNED_NOT_SUBMITTED', 2n, 'SIGNATURE_PERSISTED',
+    );
+  }
+  if (row.state === 'ACCEPTED') {
+    return authoritativeClaim(previous, row, 'SUBMITTED', 3n, 'SUBMISSION_ACCEPTED');
+  }
+  if (row.state === 'AMBIGUOUS') {
+    return authoritativeClaim(
+      previous, row, 'UNKNOWN_REQUIRES_RECONCILIATION', 3n,
+      'RECONCILIATION_REQUIRED',
+    );
+  }
+  throw failure('CONFLICT');
+}
+
+function authoritativeClaim(
+  previous: ClaimedExecutionIntent,
+  row: Row,
+  expectedStatus: ExecutionIntentV1['status'],
+  revisionDelta: bigint,
+  expectedReason: NonNullable<ExecutionIntentV1['lastReasonCode']>,
+): ClaimedExecutionIntent {
+  const stateRevision = unsignedBigint(row.claim_state_revision);
+  const attemptCount = integer(row.claim_attempt_count);
+  const updatedAtMs = timestampText(row.claim_updated_at_ms);
+  const leaseExpiresAtMs = timestampText(row.claim_lease_expires_at_ms);
+  if (row.claim_status !== expectedStatus
+    || stateRevision !== previous.intent.stateRevision + revisionDelta
+    || attemptCount !== previous.intent.attemptCount
+    || row.claim_last_reason_code !== expectedReason
+    || updatedAtMs < previous.intent.updatedAtMs
+    || row.claim_lease_owner !== previous.leaseOwner
+    || row.claim_lease_token !== previous.leaseToken) throw failure('INVALID_DATA');
+  return claimFrom(Object.freeze({
+    intent: Object.freeze({
+      ...previous.intent,
+      status: expectedStatus,
+      stateRevision,
+      lastReasonCode: expectedReason,
+      updatedAtMs,
+    }),
+    leaseOwner: previous.leaseOwner,
+    leaseToken: previous.leaseToken,
+    leaseExpiresAtMs,
+  }));
+}
+
+function currentClaim(
+  previous: ClaimedExecutionIntent,
+  row: Row,
+  expectedStatus: ExecutionIntentV1['status'],
+  expectedReason: NonNullable<ExecutionIntentV1['lastReasonCode']>,
+): ClaimedExecutionIntent {
+  const stateRevision = unsignedBigint(row.claim_state_revision);
+  const attemptCount = integer(row.claim_attempt_count);
+  const updatedAtMs = timestampText(row.claim_updated_at_ms);
+  const leaseExpiresAtMs = timestampText(row.claim_lease_expires_at_ms);
+  if (row.claim_status !== expectedStatus
+    || stateRevision < previous.intent.stateRevision
+    || attemptCount !== previous.intent.attemptCount
+    || row.claim_last_reason_code !== expectedReason
+    || updatedAtMs < previous.intent.updatedAtMs
+    || row.claim_lease_owner !== previous.leaseOwner
+    || row.claim_lease_token !== previous.leaseToken) throw failure('INVALID_DATA');
+  return claimFrom(Object.freeze({
+    intent: Object.freeze({
+      ...previous.intent,
+      status: expectedStatus,
+      stateRevision,
+      lastReasonCode: expectedReason,
+      updatedAtMs,
+    }),
+    leaseOwner: previous.leaseOwner,
+    leaseToken: previous.leaseToken,
+    leaseExpiresAtMs,
+  }));
+}
+
+function inspectionClaim(
+  previous: ClaimedExecutionIntent,
+  row: Row,
+  state: Exclude<ExecutionLiveSignedTransactionInspectionV1['state'], 'REVOKED_NO_SEND'>,
+): ClaimedExecutionIntent {
+  if (state === 'PERSISTED' || state === 'SIGNED_SIMULATED'
+    || state === 'SUBMISSION_STARTED') {
+    return currentClaim(previous, row, 'SIGNED_NOT_SUBMITTED', 'SIGNATURE_PERSISTED');
+  }
+  if (state === 'ACCEPTED') {
+    return currentClaim(previous, row, 'SUBMITTED', 'SUBMISSION_ACCEPTED');
+  }
+  return currentClaim(
+    previous, row, 'UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILIATION_REQUIRED',
+  );
+}
+
 function revocationInputFrom(
   input: ExecutionPreSubmissionRevocationInputV1,
 ): ExecutionPreSubmissionRevocationInputV1 {
@@ -1488,7 +1644,7 @@ async function readBuyPreparationBinding(
     input.claim.intent.id, input.claim.intent.attemptCount, input.generationId,
   ]);
   if (result.rows.length !== 1) throw failure('PREFLIGHT_EXPIRED');
-  const row = result.rows[0] as Row;
+  const row = singleRow(result);
   const nowMs = timestampText(row.now_ms);
   validatePreparationClaim(row, input, nowMs);
   if (row.control_state !== 'RUNNING') throw failure('CONTROL_STOPPED');
@@ -1566,7 +1722,7 @@ async function readSellPreparationBinding(
     input.claim.intent.id, input.claim.intent.attemptCount, input.generationId,
   ]);
   if (result.rows.length !== 1) throw failure('PREFLIGHT_EXPIRED');
-  const row = result.rows[0] as Row;
+  const row = singleRow(result);
   const nowMs = timestampText(row.now_ms);
   validatePreparationClaim(row, input, nowMs);
   const amount = unsignedBigint(row.intent_base_amount_raw);
@@ -1637,7 +1793,7 @@ function preparationBinding(
 async function persistSellSigned(
   client: DatabaseClient,
   input: ExecutionLivePersistSignedInputV1,
-): Promise<SignedTransactionArtifactV1> {
+): Promise<ExecutionLivePersistSignedResultV1> {
   const artifact = input.artifact;
   if (artifact.exitAuthorizationId === null) throw failure('INVALID_INPUT');
   const binding = exactRow(singleRow(await client.query(`SELECT
@@ -1729,14 +1885,17 @@ async function persistSellSigned(
     last_reason_code='SIGNATURE_PERSISTED',updated_at=date_trunc('milliseconds',statement_timestamp())
     WHERE id=$1 AND status='PROCESSING' AND state_revision=$4::BIGINT
       AND lease_owner=$2 AND lease_token=$3::UUID
-      AND lease_expires_at > statement_timestamp()`, [
+      AND lease_expires_at > statement_timestamp()
+    RETURNING ${AUTHORITATIVE_CLAIM_PROJECTION}`, [
     artifact.intentId, input.claim.leaseOwner, input.claim.leaseToken,
     input.claim.intent.stateRevision.toString(),
   ]);
   if (transitioned.rowCount !== 1) throw failure('LEASE_LOST');
   await insertIntentTransitions(client, input, nowMs);
   await insertSubmissionEvent(client, artifact, nowMs);
-  return artifact;
+  return persistedResult(artifact, transitionedClaim(
+    input.claim, transitioned, 'SIGNED_NOT_SUBMITTED', 2n, 'SIGNATURE_PERSISTED',
+  ));
 }
 
 async function beginSellSubmission(
@@ -2027,6 +2186,14 @@ async function findArtifactWhere(
   const result = await client.query(`SELECT transaction.*,
     intent.status AS intent_status,intent.lease_owner,
     intent.lease_token::TEXT AS lease_token,
+    intent.status AS claim_status,intent.attempt_count AS claim_attempt_count,
+    intent.state_revision::TEXT AS claim_state_revision,
+    intent.last_reason_code AS claim_last_reason_code,
+    trunc(EXTRACT(EPOCH FROM intent.updated_at)*1000)::TEXT AS claim_updated_at_ms,
+    intent.lease_owner AS claim_lease_owner,
+    intent.lease_token::TEXT AS claim_lease_token,
+    trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT
+      AS claim_lease_expires_at_ms,
     trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
     trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
     trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
