@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.8.1
+**Version de spécification :** 1.8.2
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.8.2 — 2026-09-04 :** autorise H2a à désérialiser uniquement les bytes
+  publics d'une transaction finalized renvoyée par Solana pour vérifier le
+  hash exact du message. Les bytes privés persistés avant soumission restent
+  inaccessibles au chemin de finalité.
 - **1.8.1 — 2026-09-04 :** rend les commits de finalité réutilisables sans
   charger les bytes signés et limite l'identité transactionnelle RPC aux trois
   champs vérifiables on-chain. La lignée build/snapshot reste durable, explicite

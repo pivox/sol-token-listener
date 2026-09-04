@@ -1,8 +1,8 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
-**Version de la spécification parente :** 1.8.1
+**Version de la spécification parente :** 1.8.2
 
 **Version de l'orchestration persistante :** 1.0.6
 
@@ -13,6 +13,11 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.3 — 2026-09-04 :** précise la frontière des bytes : H2a ne lit jamais
+  les bytes privés persistés avant soumission, mais désérialise éphémèrement la
+  transaction publique retournée par `getTransaction` finalized afin de
+  vérifier exactement signature, blockhash et hash du message. Le gateway
+  impose timeout, abort, budget, taille et parsing fermés.
 - **1.0.2 — 2026-09-04 :** ferme deux frontières découvertes à l'audit : les
   commits de finalité retournent une référence d'artefact sans bytes et leurs
   requêtes ne sélectionnent jamais les bytes signés ; l'observation RPC de la
@@ -50,10 +55,10 @@ CANARY_NOT_STARTED
 NON_EXECUTED / NON_VALIDATED
 ```
 
-Le runtime H2a n'importe ni keypair loader, ni signer, ni transaction signée,
+Le runtime H2a n'importe ni keypair loader, ni signer, ni transaction signée privée,
 ni simulation signée, ni transport de soumission. Il n'appelle jamais
 `beginSubmission`, `sendRawTransaction`, `LIVE_EXECUTE` ou `LIVE_RECOVER`.
-Il ne lit jamais `signed_transaction_bytes`.
+Il ne lit jamais la colonne PostgreSQL `signed_transaction_bytes`.
 
 ## 2. Approches étudiées
 
@@ -161,7 +166,7 @@ Méthodes autorisées :
 - `getSignatureStatuses` avec historique pour la confirmation ;
 - `getBlockHeight` avec engagement `finalized` ;
 - `getSignatureStatuses` avec historique pour la présence finalized ;
-- `getTransaction` avec engagement `finalized`, encodage JSON et version 0 ;
+- `getTransaction` avec engagement `finalized`, encodage `base64` et version 0 ;
 - lectures de comptes/balances finalized strictement nécessaires aux deltas
   wallet définis par `ExecutionReconciliationGateway`.
 
@@ -179,6 +184,9 @@ finalité contiennent une référence d'artefact sans `signedTransactionBytes`.
 Chaque réponse doit être JSON-RPC 2.0, correspondre à l'identifiant de requête,
 respecter les bornes de taille et les types entiers. Les nombres Solana au-delà
 de la précision sûre sont lus depuis des chaînes décimales ou refusés.
+La transaction publique base64 est bornée à 1 232 octets, désérialisée en
+mémoire pour vérifier son message puis abandonnée ; elle n'est ni persistée,
+ni signée, ni simulée, ni envoyée.
 
 ## 7. Lanes
 
@@ -244,7 +252,7 @@ H2a est livrable uniquement si :
   avec un serveur RPC local ;
 - aucune suite de tests ou CI ne joint un endpoint Solana public ;
 - les tests d'architecture source et `dist` prouvent l'absence de keypair,
-  signer, bytes signés, simulation signée, `beginSubmission` et
+  signer, lecture des bytes signés PostgreSQL, simulation signée, `beginSubmission` et
   `sendRawTransaction` ;
 - PostgreSQL réel valide les claims, commits, concurrence et reprise ;
 - build, check, lint, tests backend/frontend, migrations vides/rejouées et
