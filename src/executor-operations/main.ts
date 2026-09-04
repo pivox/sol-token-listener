@@ -4,8 +4,10 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { closeDatabase, getDatabasePool } from '../storage/database.js';
 import { verifySignedSafetyQualificationEvidence } from '../domain/execution-safety-attestation.js';
+import { verifySignedExecutionCanaryEvidence } from '../domain/execution-canary-attestation.js';
 import { PostgresExecutionOperationsRepository } from '../storage/execution-operations.repository.js';
-import { parseExecutionOperationsConfig } from './config.js';
+import { unavailableExecutionCanaryArmamentRepository } from '../ports/execution-operations-repository.js';
+import { parseExecutionCanaryArmConfig, parseExecutionOperationsConfig } from './config.js';
 import {
   createExecutionOperationsService,
   type ExecutionOperationsService,
@@ -22,6 +24,8 @@ interface CommandDependencies {
   readonly readTextFile: (path: string) => Promise<string>;
   readonly now: () => number;
 }
+
+const MAX_CANARY_EVIDENCE_ENVELOPE_BYTES = 196_608;
 
 export class ExecutionOperationsCliError extends Error {
   public readonly code = 'INVALID_EXECUTION_OPERATIONS_COMMAND' as const;
@@ -84,32 +88,39 @@ export async function runExecutionOperationsCommand(
         return statusJson('kill-switch', status);
       }
       case 'arm': {
-        requireOnly(command.options, ['maximum-lamports', 'holding-ms', 'reason']);
-        const maximumCapitalLamports = positiveU64(
-          requiredOption(command.options, 'maximum-lamports'),
+        const arm = armOnlyCommand(command.options);
+        const armConfig = parseExecutionCanaryArmConfig(environment);
+        const encoded = await dependencies.readTextFile(armConfig.canaryEvidencePath);
+        if (Buffer.byteLength(encoded, 'utf8') > MAX_CANARY_EVIDENCE_ENVELOPE_BYTES) throw invalid();
+        const evidence = verifySignedExecutionCanaryEvidence(
+          Object.freeze(JSON.parse(encoded) as Record<string, unknown>),
+          armConfig.evidencePublicKeyBase64,
         );
-        const maximumHoldingMs = decimalInteger(
-          command.options.get('holding-ms') ?? '300000',
-          30_000,
-          900_000,
-        );
-        const operatorReason = requiredOption(command.options, 'reason');
-        const status = await dependencies.service.status(config.generationId);
-        if (status.latestQualificationId === null) throw invalid();
+        if (arm.intentId !== evidence.targetIntentId) throw invalid();
+        assertQualificationBinding(evidence.qualification, armConfig, nowMs);
         const armament = await dependencies.service.arm({
-          payloadVersion: 1,
-          qualificationId: status.latestQualificationId,
-          maximumCapitalLamports,
-          maximumHoldingMs,
-          operatorId: config.operatorId,
-          operatorReason,
+          payloadVersion: 2, evidence, intentId: arm.intentId,
+          maximumCapitalLamports: arm.maximumCapitalLamports,
+          maximumHoldingMs: arm.maximumHoldingMs,
+          runtimeQuoteMaxAgeMs: armConfig.runtimeQuoteMaxAgeMs,
+          runtimeSlippageBps: armConfig.runtimeSlippageBps,
+          runtimeSnapshotMaxSlotLag: armConfig.runtimeSnapshotMaxSlotLag,
+          runtimeMaxComputeUnits: armConfig.runtimeMaxComputeUnits,
+          runtimeMaxFeeLamports: armConfig.runtimeMaxFeeLamports,
+          runtimeMaxFeePayerLamportDebit: armConfig.runtimeMaxFeePayerLamportDebit,
+          runtimeMaxRpcCallsPerAttempt: armConfig.runtimeMaxRpcCallsPerAttempt,
+          runtimeLeaseMs: armConfig.runtimeLeaseMs,
+          operatorId: armConfig.operatorId,
+          operatorReason: arm.operatorReason,
           nowMs,
           terminal: dependencies.terminal,
         });
+        if (armament.payloadVersion !== 2) throw invalid();
         return JSON.stringify({
-          payloadVersion: 1, command: 'arm', armamentId: armament.armamentId,
-          armamentFingerprint: armament.armamentFingerprint, state: armament.state,
-          phase: armament.phase, expiresAtMs: armament.expiresAtMs,
+          payloadVersion: 2, command: 'arm', armamentId: armament.armamentId,
+          admissionReportId: armament.admissionReportId, reservationId: armament.reservationId,
+          state: armament.state, phase: 'CANARY', expiresAtMs: armament.armamentExpiresAtMs,
+          canaryStatus: 'CANARY_NOT_STARTED',
           paperMainnet49Status: 'NON_EXECUTED_NON_VALIDATED',
           liveCapabilityPresent: false,
         });
@@ -145,6 +156,7 @@ export async function main(): Promise<void> {
   });
   const service = createExecutionOperationsService({
     repository: new PostgresExecutionOperationsRepository(pool),
+    canaryRepository: unavailableExecutionCanaryArmamentRepository(),
     nonceSource: createOperatorNonce,
   });
   try {
@@ -190,6 +202,24 @@ function requiredOption(options: ReadonlyMap<string, string>, key: string): stri
   const value = options.get(key);
   if (value === undefined) throw invalid();
   return value;
+}
+
+function armOnlyCommand(options: ReadonlyMap<string, string>): Readonly<{
+  intentId: string;
+  maximumCapitalLamports: bigint;
+  maximumHoldingMs: number;
+  operatorReason: string;
+}> {
+  requireOnly(options, ['intent-id', 'maximum-lamports', 'holding-ms', 'reason']);
+  if (options.size !== 4) throw invalid();
+  const intentId = requiredOption(options, 'intent-id');
+  if (!/^execution_intent_[0-9a-f]{64}$/u.test(intentId)) throw invalid();
+  const operatorReason = requiredOption(options, 'reason');
+  if (!/^[\x20-\x7E]{1,256}$/u.test(operatorReason)) throw invalid();
+  return Object.freeze({ intentId,
+    maximumCapitalLamports: positiveU64(requiredOption(options, 'maximum-lamports')),
+    maximumHoldingMs: decimalInteger(requiredOption(options, 'holding-ms'), 30_000, 900_000),
+    operatorReason });
 }
 
 function positiveU64(value: string): bigint {
