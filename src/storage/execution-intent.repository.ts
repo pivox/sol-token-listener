@@ -514,6 +514,11 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const claim = claimedInput(claimValue);
       const input = transitionInput(inputValue, claim);
       return this.transaction(async (client) => {
+        if (claim.intent.side === 'SELL'
+          && claim.intent.status === 'UNKNOWN_REQUIRES_RECONCILIATION'
+          && input.nextStatus === 'RETRY_READY') {
+          await lockLiveSellPresenceInTransaction(client);
+        }
         const locked = await lockClaimedIntent(client, claim);
         if (locked.intent.stateRevision === INT64_MAX) throw dataError();
         if ((locked.intent.attemptCount === 0) !== (input.evidence.attemptNumber === null)

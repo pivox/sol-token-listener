@@ -1400,7 +1400,9 @@ void test('transition accepts exact no-effect proof for UNKNOWN and persists ter
 });
 
 void test('transition accepts exact no-effect proof before making UNKNOWN retryable', async () => {
-  const draft = executionDraft('proved-retry-safe');
+  const draft = executionDraft('proved-retry-safe', {
+    side: 'SELL', venuePolicy: 'CANONICAL_EXIT', quoteAmountRaw: null, baseAmountRaw: 1n,
+  });
   const claim = claimedIntent(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0);
   const retryReady = claimRow(draft, 'RETRY_READY', 0);
   Object.assign(retryReady, {
@@ -1408,7 +1410,8 @@ void test('transition accepts exact no-effect proof before making UNKNOWN retrya
     updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
-    command('BEGIN'), result([claimRow(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0)], 1),
+    command('BEGIN'), result([], 1),
+    result([claimRow(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0)], 1),
     result([ledgerRow(0)], 1), result([], 1), result([retryReady], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -1421,7 +1424,8 @@ void test('transition accepts exact no-effect proof before making UNKNOWN retrya
   assert.equal(transitioned.status, 'RETRY_READY');
   assert.equal(transitioned.lastReasonCode, 'RECONCILIATION_PROVED_NO_EFFECT');
   assert.equal(transitioned.reconciliationCompletedAtMs, null);
-  assert.equal(required(client.calls[3]).values?.[3], 'RECONCILIATION_PROVED_NO_EFFECT');
+  assert.match(required(client.calls[1]).text, /execution-live-sell-presence:v1/u);
+  assert.equal(required(client.calls[4]).values?.[3], 'RECONCILIATION_PROVED_NO_EFFECT');
 });
 
 void test('a purged logical order cannot be recreated with fresh evidence and timestamps', async (context) => {

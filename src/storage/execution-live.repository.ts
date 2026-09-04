@@ -114,6 +114,9 @@ export class PostgresExecutionLiveRepository {
   ): Promise<SignedTransactionArtifactV1> {
     const input = persistInputFrom(inputValue);
     return this.transaction(async (client) => {
+      if (input.artifact.side === 'SELL') {
+        await lockLiveSellPresenceInTransaction(client);
+      }
       await lockGeneration(client, input.artifact.generationId);
       const replay = await findArtifact(client, input.artifact.artifactId, true);
       if (replay !== null) {
@@ -908,7 +911,10 @@ export class PostgresExecutionLiveRepository {
     const claim = claimFrom(claimValue);
     if (claim.intent.id !== evidence.intentId) throw failure('INVALID_INPUT');
     if (evidence.side === 'SELL') {
-      return this.transaction((client) => commitSellReconciliation(client, claim, evidence));
+      return this.transaction(async (client) => {
+        await lockLiveSellPresenceInTransaction(client);
+        return commitSellReconciliation(client, claim, evidence);
+      });
     }
     const liveResults: Awaited<ReturnType<typeof applyLiveReconciliation>>[] = [];
     try {
