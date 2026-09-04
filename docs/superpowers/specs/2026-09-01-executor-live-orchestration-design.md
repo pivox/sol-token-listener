@@ -1,8 +1,8 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.0.5
 
-**Version de la spécification parente :** 1.7.17
+**Version de la spécification parente :** 1.8.0
 
 **Version de la fondation live :** 1.0.17
 
@@ -13,6 +13,10 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.5 — 2026-09-04 :** référence le découpage du successeur : #51-H2a
+  compose uniquement réconciliation, confirmation et échéances derrière des
+  ports read-only ; #51-H2b conservera `LIVE_RECOVER`, le signer et les lanes
+  d'exécution. Les garanties historiques H1 restent inchangées.
 - **1.0.4 — 2026-09-04 :** étend le fence de présence SELL aux transitions
   qui rendent une intention bloquante. La persistance signée SELL, la
   réconciliation SELL `NO_EFFECT` et le port générique
@@ -59,7 +63,9 @@ PostgreSQL
   └─ scan deadline -> intention SELL déterministe
 ```
 
-#51-H2 réutilisera ces primitives pour composer les gateways RPC et les lanes.
+#51-H2a réutilise les seules primitives sans envoi pour composer un runtime de
+finalité read-only. #51-H2b réutilisera ensuite `LIVE_RECOVER` et les claims
+`LIVE_EXECUTE` dans l'exécutable signable séparé.
 Un canary Mainnet reste interdit avant la fusion de #51-H2, la validation de
 tous les gates compensatoires et un armement manuel distinct.
 
@@ -310,8 +316,8 @@ structurés redacted autour des lanes.
 - publication de `executor:live:start` ;
 - armement, financement du wallet ou canary Mainnet.
 
-Ces éléments appartiennent à #51-H2. Le checksum du catalogue de migrations
-sera également traité avant publication du binaire ; H1 ne revendique que la
+Ces éléments signables appartiennent à #51-H2b. Le catalogue checksum et la
+validation read-only du démarrage appartiennent à #51-H2a ; H1 ne revendique que la
 présence et le comportement de la migration 037 dans une base vide et rejouée.
 
 ## 11. Critères de livraison

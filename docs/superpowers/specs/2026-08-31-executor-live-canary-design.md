@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.17
+**Version de spécification :** 1.0.18
 
-**Version de la spécification parente :** 1.7.17
+**Version de la spécification parente :** 1.8.0
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.0.18 — 2026-09-04 :** référence #51-H2a, runtime séparé limité à la
+  finalité read-only. La reprise signée, la soumission, les lanes SELL/BUY et
+  le canary restent hors de ce processus et différés à H2b/H2c.
 - **1.0.17 — 2026-09-04 :** étend le verrou de priorité SELL aux
   persistances signées et aux réactivations
   `UNKNOWN_REQUIRES_RECONCILIATION -> RETRY_READY`, notamment la réconciliation

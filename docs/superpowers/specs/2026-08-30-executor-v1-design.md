@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.17
+**Version de spécification :** 1.8.0
 
 **Date :** 2026-08-31
 
@@ -8,11 +8,16 @@
 
 **Issue parente :** #51
 
-**Périmètre livré à cette version :** #51-A à #51-G et primitives persistantes
-#51-H1 (claims, read-models et scan atomique des sorties à deadline)
+**Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes
+#51-H1 et runtime de finalité read-only #51-H2a
 
 ## Historique des versions
 
+- **1.8.0 — 2026-09-04 :** spécifie #51-H2a comme un processus séparé de
+  réconciliation finalized, confirmation et création de sorties à échéance.
+  Ce premier incrément de composition live est structurellement privé de
+  keypair, signer, bytes signés, simulation signée et transport de soumission.
+  La reprise `LIVE_RECOVER` et les lanes d'exécution restent réservées à H2b.
 - **1.7.17 — 2026-09-04 :** applique le fence de présence SELL non seulement
   aux créations mais aussi à la persistance signée et aux réactivations après
   preuve `NO_EFFECT`. Ces voies prennent ce verrou avant la génération et les
@@ -816,7 +821,8 @@ Les commandes restent locales au processus executor et ne sont pas exposées
 par l'API publique :
 
 ```bash
-npm run executor:start
+npm run executor:live:recovery:start
+# Réservé à #51-H2b, non publié par #51-H2a : executor:live:start
 npm run live:preflight
 npm run live:status
 npm run live:arm -- --phase=canary
@@ -949,6 +955,10 @@ réaffecté à une autre signification.
 | #51-E | Réconciliation, verrou/réservation wallet, sizing, exposition, quota provider et matrice de fautes | Aucune |
 | #51-F | Preflight, status, kill switch, armement inerte, rapports opérateur et rôles PostgreSQL séparés | Aucune |
 | #51-G | Chargement secret, signature et soumission dans l'exécutable séparé, live désactivé et non armé | Présente mais inaccessible par défaut |
+| #51-H1 | Claims live, read-models worker-ready et sorties à échéance atomiques | Aucune |
+| #51-H2a | Runtime de finalité read-only séparé : réconciliation, confirmation et échéances | Aucune |
+| #51-H2b | Composition signable, reprise exacte et lanes SELL/BUY dans un exécutable isolé | Présente mais non armée |
+| #51-H2c | Validation opérateur et préparation manuelle du canary minimal | Armement humain explicite uniquement |
 
 Chaque PR est fusionnable seule, garde le listener opérationnel et passe trois
 cycles de revue au maximum. Une PR ne peut pas anticiper l'activation de la
@@ -987,7 +997,7 @@ suivante.
 - les gates compensatoires et l'activation progressive sont testables ;
 - SOL/WSOL est l'allowlist initiale sans coupler le domaine à SOL ;
 - la rétention terminale de quatre heures est documentée ;
-- les lots #51-B à #51-G sont indépendants ;
+- les lots #51-B à #51-H2c sont indépendants et fusionnables séquentiellement ;
 - aucun code de production, comportement, secret ou mode live n'est ajouté ;
 - `npm run build`, `npm run check`, `npm run lint`, `npm test` et
   `npm run docs:check` restent verts.
