@@ -378,7 +378,7 @@ void test('deployment smoke is bounded, isolated, secret-free, and always cleans
   const ci = await readArtifact('.github/workflows/ci.yml');
 
   assert.match(smoke, /sol-listener-smoke-\$\{process\.pid\}-\$\{randomBytes\(4\)\.toString\('hex'\)\}/);
-  assert.match(smoke, /GLOBAL_TIMEOUT_MS\s*=\s*180_000/);
+  assert.match(smoke, /GLOBAL_TIMEOUT_MS\s*=\s*300_000/);
   assert.match(smoke, /REQUEST_TIMEOUT_MS\s*=\s*10_000/);
   assert.match(smoke, /postgresPassword\s*=\s*randomBytes\(24\)\.toString\('hex'\)/);
   assert.match(smoke, /POSTGRES_PASSWORD:\s*postgresPassword/);

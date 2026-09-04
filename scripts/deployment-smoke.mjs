@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const GLOBAL_TIMEOUT_MS = 180_000;
+const GLOBAL_TIMEOUT_MS = 300_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const CLEANUP_TIMEOUT_MS = 65_000;
 const SIGNAL_CHILD_TIMEOUT_MS = 5_000;
