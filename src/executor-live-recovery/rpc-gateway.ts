@@ -590,7 +590,10 @@ function httpUrl(value: unknown): boolean {
 
 function contextSlot(value: unknown): bigint {
   const context = record(value);
-  exactKeys(context, ['slot']);
+  knownKeys(context, ['slot'], ['apiVersion']);
+  if (context.apiVersion !== undefined && typeof context.apiVersion !== 'string') {
+    invalidResponse();
+  }
   return unsignedInteger(context.slot);
 }
 

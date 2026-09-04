@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.9.3
+**Version de spécification :** 1.9.4
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,9 @@
 
 ## Historique des versions
 
+- **1.9.4 — 2026-09-04 :** aligne le RPC de finalité H2a sur
+  `RpcResponseContext` en acceptant son `apiVersion` optionnel typé, sans
+  assouplir le rejet des champs inconnus.
 - **1.9.3 — 2026-09-04 :** étend la fermeture H2a à tous les schémas non
   système avec des identités qualifiées. Le provisioning révoque les grants
   recovery résiduels hors `public` et la validation refuse toute autorité

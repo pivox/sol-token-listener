@@ -33,7 +33,7 @@ void test('verifies the configured genesis through a bounded read-only call', as
 void test('observes confirmed and finalized signatures without exposing transport methods', async () => {
   const requests: RpcRequest[] = [];
   const session = sessionFor(requests, () => ({
-    context: { slot: 501 },
+    context: { slot: 501, apiVersion: '2.3.1' },
     value: [{ slot: 500, confirmations: null, err: null, confirmationStatus: 'finalized' }],
   }));
   assert.deepEqual(await session.observeSignature('1'.repeat(64), signal()), {
@@ -44,6 +44,23 @@ void test('observes confirmed and finalized signatures without exposing transpor
     params: [['1'.repeat(64)], { searchTransactionHistory: true }],
   });
   assert.equal(Object.keys(session).some((key) => /send|sign|submit/iu.test(key)), false);
+});
+
+void test('rejects malformed or unknown signature-status context fields', async () => {
+  for (const context of [
+    { slot: 501, apiVersion: 231 },
+    { slot: 501, apiVersion: '2.3.1', extra: true },
+  ]) {
+    const session = sessionFor([], () => ({
+      context,
+      value: [{ slot: 500, confirmations: null, err: null, confirmationStatus: 'finalized' }],
+    }));
+    await assert.rejects(
+      session.observeSignature('1'.repeat(64), signal()),
+      (error: unknown) => error instanceof LiveRecoveryRpcError
+        && error.code === 'RPC_RESPONSE_INVALID',
+    );
+  }
 });
 
 void test('shares one finalized transaction read and derives exact wallet deltas as bigint', async () => {

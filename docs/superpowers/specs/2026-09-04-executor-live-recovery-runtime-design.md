@@ -1,8 +1,8 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.1.3
+**Version de spécification :** 1.1.4
 
-**Version de la spécification parente :** 1.9.3
+**Version de la spécification parente :** 1.9.4
 
 **Version de l'orchestration persistante :** 1.1.3
 
@@ -13,6 +13,9 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.4 — 2026-09-04 :** accepte le champ standard optionnel `apiVersion`
+  dans `RpcResponseContext` tout en exigeant une chaîne et en refusant tout
+  autre champ inconnu. Les lectures de finalité restent strictes et bornées.
 - **1.1.3 — 2026-09-04 :** ferme l'autorité effective sur tous les schémas
   non système. Les objets sont identifiés avec leur schéma, le provisioning
   révoque les anciens grants hors `public` et le démarrage refuse tout droit,
