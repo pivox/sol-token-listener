@@ -165,7 +165,8 @@ de la précision sûre sont lus depuis des chaînes décimales ou refusés.
 La lane appelle `claim(... purpose: 'RECONCILE')`, puis
 `readReconciliationWork(claim)`. Elle refuse une divergence de `providerId`,
 renouvelle le lease, collecte les preuves finalized via le gateway, renouvelle
-à nouveau et appelle `commitReconciliation` avec le claim original.
+à nouveau et appelle `commitReconciliation` avec le claim actif retourné par
+ce dernier renouvellement.
 
 `SIGNED_NOT_SUBMITTED` n'est pas éligible. La reprise exacte de cet état reste
 réservée à H2b via `LIVE_RECOVER`.
@@ -174,8 +175,9 @@ réservée à H2b via `LIVE_RECOVER`.
 
 La lane appelle `claim(... purpose: 'CONFIRM')`, puis
 `readConfirmationWork(claim)`. Elle observe uniquement la signature fournie par
-le read-model, renouvelle le lease avant et après l'appel puis persiste avec
-`recordConfirmation`. `NOT_FOUND`, erreur ou statut non confirmé ne provoque
+le read-model, renouvelle le lease avant et après l'appel puis persiste avec le
+claim actif retourné par ce dernier renouvellement dans `recordConfirmation`.
+`NOT_FOUND`, erreur ou statut non confirmé ne provoque
 aucune transition terminale et sera rejoué.
 
 ### 7.3 Échéance
