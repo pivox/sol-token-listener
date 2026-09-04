@@ -17,7 +17,13 @@ export type ExecutionClaimOptions =
   | Readonly<{
       ownerId: string;
       leaseMs: number;
-      purpose: 'LIVE_RECOVER' | 'CONFIRM' | 'RECONCILE' | 'EXECUTE' | 'DRY_RUN';
+      purpose: 'LIVE_RECOVER';
+      side?: 'BUY' | 'SELL';
+    }>
+  | Readonly<{
+      ownerId: string;
+      leaseMs: number;
+      purpose: 'CONFIRM' | 'RECONCILE' | 'EXECUTE' | 'DRY_RUN';
     }>;
 
 export interface ClaimedExecutionIntent {

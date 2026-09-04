@@ -9,6 +9,7 @@ import {
   SignedSimulationGateway,
   SignedSimulationGatewayError,
 } from '../src/executor-live/signed-simulation-gateway.js';
+import { createLiveRpcCallBudgetExhaustedError } from '../src/executor-live/rpc-gateway.js';
 import type {
   ExecutionLiveGateway,
   ExecutionSignedSimulationRequestV1,
@@ -60,6 +61,7 @@ void test('verifies persisted bytes and performs one exact signed simulation wit
     accountAddresses: Object.freeze([
       fixture.walletPublicKey, fixture.baseAccount, fixture.quoteAccount,
     ] as const),
+    estimatedFeeLamports: 5_000n,
     commitment: 'confirmed', sigVerify: true, replaceRecentBlockhash: false,
   }));
   assert.equal(provider.sendCalls, 0);
@@ -107,6 +109,33 @@ void test('rejects tampering before RPC and a signed result that is less conserv
   assert.equal(provider.calls, 1);
   assert.equal(provider.sendCalls, 0);
 });
+
+void test('preserves durable RPC budget exhaustion instead of collapsing it into provider failure',
+  async () => {
+    const fixture = signedFixture();
+    const expected = createLiveRpcCallBudgetExhaustedError();
+    const provider: ExecutionLiveGateway = Object.freeze({
+      simulateSignedTransaction: () => Promise.reject(expected),
+      sendRawTransaction: () => Promise.reject(new Error('must not send')),
+    });
+    const gateway = new SignedSimulationGateway(provider, Object.freeze({
+      maxComputeUnits: 300_000n, maxFeePayerLamportDebit: 10_000n,
+    }));
+
+    await assert.rejects(gateway.simulate(Object.freeze({
+      payloadVersion: 1,
+      persisted: fixture.persisted,
+      snapshotSlot: 123n,
+      accountAddresses: Object.freeze([
+        fixture.walletPublicKey, fixture.baseAccount, fixture.quoteAccount,
+      ] as const),
+      amountInRaw: 100n,
+      protectedAmountOutRaw: 90n,
+      unsignedSimulation: unsignedEvidence(
+        fixture.artifact.messageHash, fixture.artifact.blockhash,
+      ),
+    }), new AbortController().signal), (error: unknown) => error === expected);
+  });
 
 class StubLiveGateway implements ExecutionLiveGateway {
   public calls = 0;

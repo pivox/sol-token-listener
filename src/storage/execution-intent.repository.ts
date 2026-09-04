@@ -92,7 +92,7 @@ const DRAFT_KEYS = Object.freeze([
 ] as const);
 
 const CLAIM_OPTION_KEYS = Object.freeze(['ownerId', 'leaseMs', 'purpose'] as const);
-const LIVE_EXECUTE_CLAIM_OPTION_KEYS = Object.freeze([
+const LIVE_SIDE_CLAIM_OPTION_KEYS = Object.freeze([
   'ownerId', 'leaseMs', 'purpose', 'side',
 ] as const);
 const CLAIM_KEYS = Object.freeze([
@@ -186,9 +186,7 @@ const CLAIM_SQL: Readonly<Record<ExecutionClaimPurpose, string>> = Object.freeze
 });
 const LIVE_EXECUTE_SELL_SQL = claimSql(`intent.side = 'SELL'
       AND intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')`, true);
-const LIVE_EXECUTE_BUY_SQL = claimSql(`intent.side = 'BUY'
-      AND intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')
-      AND NOT EXISTS (
+const LIVE_BUY_SELL_PRIORITY_PREDICATE = `NOT EXISTS (
         SELECT 1
         FROM execution_intents AS blocking_sell
         WHERE blocking_sell.side = 'SELL'
@@ -197,8 +195,16 @@ const LIVE_EXECUTE_BUY_SQL = claimSql(`intent.side = 'BUY'
               AND blocking_sell.expires_at > statement_timestamp())
             OR blocking_sell.status = 'SIGNED_NOT_SUBMITTED'
           )
-      )`, true);
+      )`;
+const LIVE_EXECUTE_BUY_SQL = claimSql(`intent.side = 'BUY'
+      AND intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')
+      AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}`, true);
 const LIVE_RECOVER_SQL = claimSql("intent.status = 'SIGNED_NOT_SUBMITTED'", false);
+const LIVE_RECOVER_SELL_SQL = claimSql(`intent.side = 'SELL'
+      AND intent.status = 'SIGNED_NOT_SUBMITTED'`, false);
+const LIVE_RECOVER_BUY_SQL = claimSql(`intent.side = 'BUY'
+      AND intent.status = 'SIGNED_NOT_SUBMITTED'
+      AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}`, false);
 
 export async function createExecutionIntentInTransaction(
   client: ExecutionIntentTransactionClient,
@@ -309,7 +315,8 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         }
         return claim;
       };
-      if (options.purpose === 'LIVE_EXECUTE' && options.side === 'BUY') {
+      if ((options.purpose === 'LIVE_EXECUTE' || options.purpose === 'LIVE_RECOVER')
+        && options.side === 'BUY') {
         return this.transaction(async (client) => {
           await lockLiveSellPresenceInTransaction(client);
           if (signal?.aborted === true) throw operationAbortedError();
@@ -825,7 +832,10 @@ function claimSqlFor(options: ExecutionClaimOptions): string {
   switch (options.purpose) {
     case 'LIVE_EXECUTE':
       return options.side === 'SELL' ? LIVE_EXECUTE_SELL_SQL : LIVE_EXECUTE_BUY_SQL;
-    case 'LIVE_RECOVER': return LIVE_RECOVER_SQL;
+    case 'LIVE_RECOVER':
+      if (options.side === 'SELL') return LIVE_RECOVER_SELL_SQL;
+      if (options.side === 'BUY') return LIVE_RECOVER_BUY_SQL;
+      return LIVE_RECOVER_SQL;
     case 'EXECUTE': return CLAIM_SQL.EXECUTE;
     case 'CONFIRM': return CLAIM_SQL.CONFIRM;
     case 'RECONCILE': return CLAIM_SQL.RECONCILE;
@@ -991,7 +1001,7 @@ function claimOptions(value: unknown): ExecutionClaimOptions {
   } catch { throw inputError(); }
   const row = exactRecord(
     value,
-    hasSide ? LIVE_EXECUTE_CLAIM_OPTION_KEYS : CLAIM_OPTION_KEYS,
+    hasSide ? LIVE_SIDE_CLAIM_OPTION_KEYS : CLAIM_OPTION_KEYS,
     'INVALID_INPUT',
   );
   const ownerId = boundedText(row.ownerId, 'INVALID_INPUT');
@@ -999,6 +1009,11 @@ function claimOptions(value: unknown): ExecutionClaimOptions {
   const purpose = claimPurpose(row.purpose);
   if (purpose === 'LIVE_EXECUTE') {
     if (!hasSide || (row.side !== 'BUY' && row.side !== 'SELL')) throw inputError();
+    return Object.freeze({ ownerId, leaseMs, purpose, side: row.side });
+  }
+  if (purpose === 'LIVE_RECOVER') {
+    if (!hasSide) return Object.freeze({ ownerId, leaseMs, purpose });
+    if (row.side !== 'BUY' && row.side !== 'SELL') throw inputError();
     return Object.freeze({ ownerId, leaseMs, purpose, side: row.side });
   }
   if (hasSide) throw inputError();
@@ -1419,7 +1434,10 @@ function intentMatchesClaimOptions(
   if (options.purpose === 'EXECUTE') {
     return status === 'PENDING' || status === 'RETRY_READY' || status === 'PROCESSING';
   }
-  if (options.purpose === 'LIVE_RECOVER') return status === 'SIGNED_NOT_SUBMITTED';
+  if (options.purpose === 'LIVE_RECOVER') {
+    return status === 'SIGNED_NOT_SUBMITTED'
+      && (options.side === undefined || intent.side === options.side);
+  }
   if (options.purpose === 'CONFIRM') return status === 'SUBMITTED';
   if (options.purpose === 'DRY_RUN') return status === 'PENDING' || status === 'RETRY_READY';
   return status === 'CONFIRMED' || status === 'RECONCILING'

@@ -40,6 +40,9 @@ const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const walletPublicKey = '11111111111111111111111111111111';
 const quoteMint = 'So11111111111111111111111111111111111111112';
 const fingerprint = '1'.repeat(64);
+const rpcBudget = Object.freeze({
+  payloadVersion: 1 as const, callsUsed: 5, callsLimit: 12,
+});
 
 void test('SELL UNKNOWN persists evidence and freezes every exit capability', async (context) => {
   const databaseUrl = requiredDatabaseUrl(context);
@@ -587,6 +590,7 @@ async function createSellFixture(
     payloadVersion: 1, claim: buy.claim, qualificationId: buy.qualificationId,
     reservationId: buy.reservationId, artifact: buy.artifact,
     unsignedSimulation: buy.unsignedSimulation,
+    rpcBudget,
   });
   const buySimulated = await live.recordSignedSimulation(buy.claim, signedSimulation(
     buy.artifact, buy.unsignedSimulation, 95n, -1_000n, buy.artifact.signedAtMs + 1,
@@ -688,7 +692,7 @@ async function createSellFixture(
   });
   const persistInput = Object.freeze({
     payloadVersion: 1, claim: begun.claim, qualificationId: buy.qualificationId,
-    reservationId: null, artifact, unsignedSimulation,
+    reservationId: null, artifact, unsignedSimulation, rpcBudget,
   });
   await beforePersistSigned?.(live, persistInput);
   await live.persistSigned(persistInput);

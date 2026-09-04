@@ -1,8 +1,8 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.1.5
+**Version de spécification :** 1.1.6
 
-**Version de la spécification parente :** 1.9.5
+**Version de la spécification parente :** 1.10.1
 
 **Version de l'orchestration persistante :** 1.1.5
 
@@ -13,6 +13,9 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.6 — 2026-09-04 :** aligne la validation du catalogue partagé sur la
+  migration 038 du budget RPC H2b, sans accorder au rôle H2a l'accès à cette
+  table ni modifier son graphe read-only.
 - **1.1.5 — 2026-09-04 :** date l'observation finalisée d'une transaction
   absente. Après expiration du blockhash, l'absence historique et des deltas
   nuls peut ainsi produire le verdict durable `NO_EFFECT` au lieu d'une
@@ -249,7 +252,7 @@ L'ordre est obligatoire :
 2. ouvrir PostgreSQL avec des timeouts bornés ;
 3. appliquer puis vérifier le rôle recovery sur le client courant ;
 4. vérifier que l'historique de migrations correspond exactement au catalogue
-   versionné jusqu'à `037_execution_live_orchestration.sql` ;
+   versionné jusqu'à `038_execution_live_rpc_budget.sql` ;
 5. vérifier la génération wallet, le provider et l'absence de travail ouvert
    lié à une autre génération, un autre wallet ou un autre provider ;
 6. créer le client RPC de lecture ;

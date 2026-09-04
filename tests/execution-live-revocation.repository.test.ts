@@ -43,6 +43,9 @@ const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const walletPublicKey = '11111111111111111111111111111111';
 const quoteMint = 'So11111111111111111111111111111111111111112';
 const fingerprint = '1'.repeat(64);
+const rpcBudget = Object.freeze({
+  payloadVersion: 1 as const, callsUsed: 5, callsLimit: 12,
+});
 
 type RevocableSignedState = 'PERSISTED' | 'SIGNED_SIMULATED';
 for (const initialState of ['PERSISTED', 'SIGNED_SIMULATED'] as const) {
@@ -96,6 +99,8 @@ void test('worker restart durably routes SUBMISSION_STARTED to ambiguity without
       let submissionCalls = 0;
 
       const result = await executeLivePreparedTransaction(Object.freeze({
+        activateRpcBudget: () => undefined,
+        reserveSubmissionRpcCall: () => Promise.resolve(),
         repository: fixture.live,
         signedSimulation: Object.freeze({
           simulate: () => {
@@ -109,6 +114,12 @@ void test('worker restart durably routes SUBMISSION_STARTED to ambiguity without
             return Promise.reject(new Error('submission must not restart'));
           },
         }),
+        renewBeforeSubmission: () => Promise.reject(
+          new Error('submission renewal must not restart'),
+        ),
+        readBlockhashValidity: () => Promise.reject(
+          new Error('blockhash validity must not restart'),
+        ),
         clock: () => Date.now(),
       }), Object.freeze({
         persist: Object.freeze({
@@ -118,6 +129,7 @@ void test('worker restart durably routes SUBMISSION_STARTED to ambiguity without
           reservationId: fixture.reservationId,
           artifact: fixture.artifact,
           unsignedSimulation: fixture.unsignedSimulation,
+          rpcBudget,
         }),
         signedSimulation: Object.freeze({
           payloadVersion: 1,
@@ -130,7 +142,6 @@ void test('worker restart durably routes SUBMISSION_STARTED to ambiguity without
           unsignedSimulation: fixture.unsignedSimulation,
         }),
         runtime: fixture.runtime,
-        blockhashValidity: blockhashValidity(fixture.artifact, Date.now()),
       }), new AbortController().signal);
 
       assert.equal(result.kind, 'AMBIGUOUS');
@@ -329,6 +340,7 @@ async function createPersistedBuyFixture(
     payloadVersion: 1, claim: fixture.claim, qualificationId: fixture.qualificationId,
     reservationId: fixture.reservationId, artifact: fixture.artifact,
     unsignedSimulation: fixture.unsignedSimulation,
+    rpcBudget,
   });
   if (state === 'SIGNED_SIMULATED') {
     await live.recordSignedSimulation(fixture.claim, signedSimulation(
@@ -371,6 +383,7 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
     payloadVersion: 1, claim: buy.claim, qualificationId: buy.qualificationId,
     reservationId: buy.reservationId, artifact: buy.artifact,
     unsignedSimulation: buy.unsignedSimulation,
+    rpcBudget,
   });
   await live.recordSignedSimulation(buy.claim, signedSimulation(
     buy.artifact, buy.unsignedSimulation,
@@ -449,7 +462,7 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
   });
   await live.persistSigned({
     payloadVersion: 1, claim: begun.claim, qualificationId: buy.qualificationId,
-    reservationId: null, artifact, unsignedSimulation,
+    reservationId: null, artifact, unsignedSimulation, rpcBudget,
   });
   return Object.freeze({
     live, claim: begun.claim, artifact, positionId: entry.position.positionId,

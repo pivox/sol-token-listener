@@ -47,11 +47,14 @@ un preflight durable, des arrêts opérateur et un armement manuel strictement
 inerte. Les gates du preflight doivent être fournis dans une enveloppe Ed25519
 signée et liée au déploiement. Ses six commandes `live:*` refusent les secrets et ne sont importées
 par aucun worker. #51-G fournit ses briques live isolées et ses protections
-PostgreSQL, mais le binaire de production reste non composé et indémarrable :
-aucun script `executor:live:start` n'est publié. Les seuls modes du listener
-restent `observe` et `paper`. Le
-[runbook canary #51-G](docs/operations/executor-live-canary.md) décrit ce
-blocage et les preuves encore requises.
+PostgreSQL. #51-H2a compose séparément la finalité read-only, et #51-H2b
+compose le runtime signable désarmé. H2b ne possède que quatre lanes, dans cet
+ordre : recover SELL, execute SELL, recover BUY, execute BUY. H2a conserve
+finalité, confirmation, réconciliation et deadline ; H2c conserve les gates,
+l'armement opérateur et le canary. Les seuls modes du listener restent
+`observe` et `paper` ; le processus H2b est un exécutable séparé. Le
+[runbook canary #51-G](docs/operations/executor-live-canary.md) décrit les
+frontières et l'état non activé.
 
 Configuration minimale de la stratégie de création, toujours simulée :
 
@@ -113,9 +116,12 @@ sans clé privée, signature, soumission ni live; elle n'appelle ni
 ## Sécurité et limites
 
 - `EXECUTION_MODE=observe` est la valeur par défaut; seules les valeurs
-  `observe` et `paper` sont admises.
-- Aucun wallet ou secret de clé privée n'est accepté, et aucune transaction
-  live n'est signée ou envoyée.
+  `observe` et `paper` sont admises pour le listener.
+- La configuration par défaut reste `EXECUTOR_MODE=dry-run` et
+  `LIVE_TRADING_ENABLED=false`. Elle ne lance aucun exécuteur signable et ne
+  contient aucune clé réelle.
+- H2b est isolé du listener, de H2a et des commandes H2c ; sa présence ne vaut
+  ni armement, ni canary, ni transaction exécutée.
 - Le paper trading est une projection simulée, initialement limitée à SOL/WSOL
   par allowlist; il ne démontre ni profit ni sellabilité.
 - Aucune promesse de première position, même slot, sortie ou profit.
@@ -180,6 +186,30 @@ sont documentées dans
 Le fichier d'environnement H2a ne doit contenir aucun nom de variable de
 keypair ou de secret wallet, même avec une valeur vide. Ce runtime ne constitue
 ni un armement, ni un canary exécuté, ni une validation du trading live.
+
+### Runtime signable désarmé (#51-H2b)
+
+Les commandes séparées `npm run executor:live:dev` et
+`npm run executor:live:start` composent le runtime H2b. Une passe ne contient
+exactement que recover SELL, execute SELL, recover BUY, execute BUY ; elle
+s'arrête après le premier résultat `WORKED`. H2b récupère ou exécute les
+artefacts durablement admissibles, mais ne confirme, ne réconcilie et ne crée
+aucune sortie à deadline : ces responsabilités restent dans H2a.
+
+La configuration exemple est volontairement désarmée (`EXECUTOR_MODE=dry-run`,
+`LIVE_TRADING_ENABLED=false` et aucun chemin de keypair réel) : elle ne permet
+pas de démarrer H2b. La publication de ces commandes n'exécute ni
+`live:resume`, ni `live:arm`, ni un canary. H2c reste le seul lot qui peut
+traiter les gates et l'armement opérateur ; aucune clé réelle ou procédure de
+canary n'est fournie ici.
+
+L'état actuellement documentable est strictement :
+
+```text
+LIVE_SIGNABLE_RUNTIME_COMPOSED
+CANARY_NOT_STARTED
+NON_EXECUTED / NON_VALIDATED
+```
 
 Pour chaque intention `PENDING` ou `RETRY_READY` éligible, #51-C enregistre
 une assessment déterministe `FOUNDATION_VALIDATED` à couverture
@@ -248,11 +278,9 @@ applicables. Aucun secret n'est accepté et aucun `signTransaction`,
 La validation terrain #49 des 50 positions Mainnet a été sautée : son statut
 reste explicitement `NON_EXECUTED` et `NON_VALIDATED`, jamais `PASS`. La
 fondation #51-E et le preflight inerte #51-F ne changent pas ce statut et
-n'activent aucun runtime de soumission. Les briques #51-G de
-signature/soumission sous gates compensatoires ne constituent pas encore un
-runtime production composé. Le
-[runbook #51-F](docs/operations/executor-preflight.md) décrit les preuves,
-arrêts et commandes locales.
+n'activent aucun canary ni validation économique. Le runtime H2b composé reste
+désarmé ; le [runbook canary](docs/operations/executor-live-canary.md) conserve
+la frontière avec H2a et H2c.
 
 ## Console frontend indépendante
 

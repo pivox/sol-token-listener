@@ -40,6 +40,10 @@ import type {
   ExecutionLiveConfirmationWorkV1,
   ExecutionLiveArtifactReferenceV1,
   ExecutionLivePersistSignedInputV1,
+  ExecutionLivePersistSignedResultV1,
+  ExecutionLiveRpcCallReservationInputV1,
+  ExecutionLiveRpcCallReservationV1,
+  ExecutionLivePreparationBindingV1,
   ExecutionPreSubmissionRevocationInputV1,
   ExecutionPreSubmissionRevocationResultV1,
   ExecutionLiveReconciliationResultV1,
@@ -47,6 +51,7 @@ import type {
   ExecutionLiveSignedTransactionInspectionV1,
   ExecutionLiveSignedSimulationEvidenceV1,
   ExecutionLiveSubmissionOutcomeV1,
+  ExecutionLiveSubmissionOutcomeResultV1,
   ExecutionLiveRuntimeBindingV1,
 } from '../ports/execution-live-repository.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
@@ -79,6 +84,7 @@ export type ExecutionLiveRepositoryErrorCode =
   | 'CONFLICT'
   | 'PREFLIGHT_EXPIRED'
   | 'CONTROL_STOPPED'
+  | 'RPC_CALL_BUDGET_EXHAUSTED'
   | 'LEASE_LOST'
   | 'DATABASE_FAILURE'
   | 'COMMIT_OUTCOME_UNKNOWN';
@@ -96,6 +102,7 @@ const HASH = /^[0-9a-f]{64}$/u;
 const PUBLIC_KEY = /^[1-9A-HJ-NP-Za-km-z]{32,64}$/u;
 const PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 const BLOCKHASH_VALIDITY_MAX_AGE_MS = 5_000;
+const LIVE_TAIL_RPC_CALLS = 6;
 const ARTIFACT_REFERENCE_COLUMNS = `
   transaction.artifact_id,transaction.payload_version,transaction.specification_version,
   transaction.intent_id,transaction.attempt_number,transaction.generation_id,
@@ -109,6 +116,12 @@ const ARTIFACT_REFERENCE_COLUMNS = `
   transaction.signed_at,transaction.signed_simulated_at,transaction.submission_started_at,
   transaction.submitted_at,transaction.confirmed_at,transaction.confirmed_slot,
   transaction.reconciled_at,transaction.revoked_at,transaction.purge_after`;
+const AUTHORITATIVE_CLAIM_PROJECTION = `
+  status AS claim_status,attempt_count AS claim_attempt_count,
+  state_revision::TEXT AS claim_state_revision,last_reason_code AS claim_last_reason_code,
+  trunc(EXTRACT(EPOCH FROM updated_at)*1000)::TEXT AS claim_updated_at_ms,
+  lease_owner AS claim_lease_owner,lease_token::TEXT AS claim_lease_token,
+  trunc(EXTRACT(EPOCH FROM lease_expires_at)*1000)::TEXT AS claim_lease_expires_at_ms`;
 const RUNTIME_BINDING_KEYS = Object.freeze([
   'payloadVersion', 'phase', 'buildHash', 'configurationFingerprint',
   'strategyFingerprint', 'walletPublicKey', 'cluster', 'expectedGenesisHash',
@@ -123,9 +136,30 @@ export class PostgresExecutionLiveRepository {
     this.#source = source;
   }
 
+  public async readPreparationBinding(inputValue: Readonly<{
+    readonly claim: ClaimedExecutionIntent;
+    readonly generationId: string;
+    readonly runtime: ExecutionLiveRuntimeBindingV1;
+  }>): Promise<ExecutionLivePreparationBindingV1> {
+    const claim = claimFrom(inputValue.claim);
+    if (!/^execution_wallet_generation_[0-9a-f]{64}$/u.test(inputValue.generationId)
+      || !validRuntimeBinding(inputValue.runtime)
+      || claim.intent.status !== 'PROCESSING' || claim.intent.attemptCount < 1) {
+      throw failure('INVALID_INPUT');
+    }
+    const input = Object.freeze({
+      claim,
+      generationId: inputValue.generationId,
+      runtime: inputValue.runtime,
+    });
+    return this.transaction((client) => input.claim.intent.side === 'BUY'
+      ? readBuyPreparationBinding(client, input)
+      : readSellPreparationBinding(client, input));
+  }
+
   public async persistSigned(
     inputValue: ExecutionLivePersistSignedInputV1,
-  ): Promise<SignedTransactionArtifactV1> {
+  ): Promise<ExecutionLivePersistSignedResultV1> {
     const input = persistInputFrom(inputValue);
     return this.transaction(async (client) => {
       if (input.artifact.side === 'SELL') {
@@ -136,7 +170,7 @@ export class PostgresExecutionLiveRepository {
       if (replay !== null) {
         if (!sameArtifact(replay, input.artifact)) throw failure('CONFLICT');
         await persistUnsignedSimulationEvidence(client, input);
-        return input.artifact;
+        return persistedResult(input.artifact, replayedPersistClaim(input.claim, replay));
       }
       if (input.artifact.side === 'SELL') return persistSellSigned(client, input);
       const binding = exactRow(singleRow(await client.query(`SELECT
@@ -229,14 +263,77 @@ export class PostgresExecutionLiveRepository {
         updated_at=date_trunc('milliseconds',statement_timestamp())
         WHERE id=$1 AND status='PROCESSING' AND state_revision=$4::BIGINT
           AND lease_owner=$2 AND lease_token=$3::UUID
-          AND lease_expires_at > statement_timestamp()`, [
+          AND lease_expires_at > statement_timestamp()
+        RETURNING ${AUTHORITATIVE_CLAIM_PROJECTION}`, [
         input.artifact.intentId, input.claim.leaseOwner, input.claim.leaseToken,
         input.claim.intent.stateRevision.toString(),
       ]);
       if (transitioned.rowCount !== 1) throw failure('LEASE_LOST');
       await insertIntentTransitions(client, input, nowMs);
       await insertSubmissionEvent(client, input.artifact, nowMs);
-      return input.artifact;
+      return persistedResult(input.artifact, transitionedClaim(
+        input.claim, transitioned, 'SIGNED_NOT_SUBMITTED', 2n, 'SIGNATURE_PERSISTED',
+      ));
+    });
+  }
+
+  public async reserveRpcCall(
+    inputValue: ExecutionLiveRpcCallReservationInputV1,
+  ): Promise<ExecutionLiveRpcCallReservationV1> {
+    const input = rpcCallReservationInputFrom(inputValue);
+    return this.transaction(async (client) => {
+      const row = exactRow(singleRow(await client.query(`SELECT
+        budget.intent_id,budget.attempt_number,budget.artifact_id,budget.provider_id,
+        budget.calls_reserved,budget.calls_limit,
+        transaction.state AS artifact_state,
+        intent.status AS intent_status,intent.attempt_count,
+        intent.state_revision::TEXT AS intent_state_revision,
+        intent.lease_owner,intent.lease_token::TEXT AS lease_token,
+        trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT
+          AS lease_expires_at_ms,
+        trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms
+        FROM execution_live_rpc_budgets budget
+        JOIN execution_signed_transactions transaction
+          ON transaction.artifact_id=budget.artifact_id
+        JOIN execution_intents intent ON intent.id=budget.intent_id
+        WHERE budget.artifact_id=$1
+        FOR UPDATE OF budget,transaction,intent`, [input.artifactId])), [
+        'intent_id', 'attempt_number', 'artifact_id', 'provider_id',
+        'calls_reserved', 'calls_limit', 'artifact_state', 'intent_status',
+        'attempt_count', 'intent_state_revision', 'lease_owner', 'lease_token',
+        'lease_expires_at_ms', 'now_ms',
+      ] as const);
+      if (row.intent_id !== input.claim.intent.id
+        || integer(row.attempt_number) !== input.claim.intent.attemptCount
+        || integer(row.attempt_count) !== input.claim.intent.attemptCount
+        || unsignedBigint(row.intent_state_revision) !== input.claim.intent.stateRevision
+        || row.intent_status !== 'SIGNED_NOT_SUBMITTED'
+        || !['PERSISTED', 'SIGNED_SIMULATED'].includes(
+          text(row.artifact_state),
+        )
+        || row.lease_owner !== input.claim.leaseOwner
+        || row.lease_token !== input.claim.leaseToken
+        || timestampText(row.lease_expires_at_ms) <= timestampText(row.now_ms)) {
+        throw failure('LEASE_LOST');
+      }
+      const callsReserved = integer(row.calls_reserved);
+      const callsLimit = integer(row.calls_limit);
+      if (callsReserved >= callsLimit) throw failure('RPC_CALL_BUDGET_EXHAUSTED');
+      const updated = await client.query(`UPDATE execution_live_rpc_budgets SET
+        calls_reserved=calls_reserved+1
+        WHERE artifact_id=$1 AND calls_reserved=$2::INTEGER
+          AND calls_reserved < calls_limit
+        RETURNING calls_reserved,calls_limit`, [input.artifactId, callsReserved]);
+      const reservation = exactRow(singleRow(updated), ['calls_reserved', 'calls_limit'] as const);
+      if (integer(reservation.calls_reserved) !== callsReserved + 1
+        || integer(reservation.calls_limit) !== callsLimit) throw failure('INVALID_DATA');
+      return Object.freeze({
+        payloadVersion: 1,
+        artifactId: input.artifactId,
+        providerId: patternedText(row.provider_id, PROVIDER_ID),
+        callsReserved: callsReserved + 1,
+        callsLimit,
+      });
     });
   }
 
@@ -298,6 +395,18 @@ export class PostgresExecutionLiveRepository {
         const unsignedSimulation = await loadUnsignedSimulationEvidence(client, artifact);
         return Object.freeze({
           payloadVersion: 1, artifact, unsignedSimulation, state, stateRevision,
+          claim: inspectionClaim(claim, row, state),
+        });
+      }
+      if (state === 'REVOKED_NO_SEND') {
+        return Object.freeze({
+          payloadVersion: 1,
+          artifactId: artifact.artifactId,
+          signature: artifact.signature,
+          signedTransactionHash: artifact.signedTransactionHash,
+          state,
+          stateRevision,
+          claim: null,
         });
       }
       return Object.freeze({
@@ -307,6 +416,7 @@ export class PostgresExecutionLiveRepository {
         signedTransactionHash: artifact.signedTransactionHash,
         state,
         stateRevision,
+        claim: inspectionClaim(claim, row, state),
       });
     });
   }
@@ -571,7 +681,7 @@ export class PostgresExecutionLiveRepository {
   public async recordSubmissionOutcome(
     claimValue: ClaimedExecutionIntent,
     outcome: ExecutionLiveSubmissionOutcomeV1,
-  ): Promise<SignedTransactionArtifactV1> {
+  ): Promise<ExecutionLiveSubmissionOutcomeResultV1> {
     const claim = claimFrom(claimValue);
     validateSubmissionOutcome(outcome);
     return this.transaction(async (client) => {
@@ -585,6 +695,9 @@ export class PostgresExecutionLiveRepository {
         throw failure('LEASE_LOST');
       }
       const artifact = artifactFromRow(row);
+      const activeClaim = currentClaim(
+        claim, row, 'SIGNED_NOT_SUBMITTED', 'SIGNATURE_PERSISTED',
+      );
       if (outcome.outcome === 'ACCEPTED'
         && outcome.returnedSignature !== artifact.signature) throw failure('CONFLICT');
       const nextState = outcome.outcome === 'ACCEPTED' ? 'ACCEPTED' : 'AMBIGUOUS';
@@ -605,7 +718,8 @@ export class PostgresExecutionLiveRepository {
         state_revision=state_revision+1,last_reason_code=$3,
         updated_at=date_trunc('milliseconds',statement_timestamp())
         WHERE id=$1 AND status='SIGNED_NOT_SUBMITTED' AND lease_owner=$4
-          AND lease_token=$5::UUID`, [
+          AND lease_token=$5::UUID
+        RETURNING ${AUTHORITATIVE_CLAIM_PROJECTION}`, [
         artifact.intentId, nextIntent, intentReason, claim.leaseOwner, claim.leaseToken,
       ]);
       if (intent.rowCount !== 1) throw failure('LEASE_LOST');
@@ -631,7 +745,11 @@ export class PostgresExecutionLiveRepository {
           throw failure('CONFLICT');
         }
       }
-      return artifact;
+      return Object.freeze({
+        payloadVersion: 1,
+        artifact,
+        claim: transitionedClaim(activeClaim, intent, nextIntent, 1n, intentReason),
+      });
     });
   }
 
@@ -1052,6 +1170,7 @@ function persistInputFrom(input: ExecutionLivePersistSignedInputV1): ExecutionLi
     const claim = claimFrom(input.claim);
     const artifact = recreateArtifact(input.artifact);
     const simulation = input.unsignedSimulation;
+    const rpcBudget = rpcBudgetFrom(input.rpcBudget);
     if (artifact.artifactId !== input.artifact.artifactId
       || artifact.signedTransactionHash !== input.artifact.signedTransactionHash
       || artifact.intentId !== claim.intent.id
@@ -1070,7 +1189,44 @@ function persistInputFrom(input: ExecutionLivePersistSignedInputV1): ExecutionLi
       || (artifact.side === 'SELL'
         && (artifact.armamentId !== null || artifact.exitAuthorizationId === null
           || input.reservationId !== null))) throw new TypeError();
-    return Object.freeze({ ...input, claim, artifact });
+    return Object.freeze({ ...input, claim, artifact, rpcBudget });
+  } catch (error) {
+    if (error instanceof ExecutionLiveRepositoryError) throw error;
+    throw failure('INVALID_INPUT');
+  }
+}
+
+function rpcBudgetFrom(
+  value: ExecutionLivePersistSignedInputV1['rpcBudget'],
+): ExecutionLivePersistSignedInputV1['rpcBudget'] {
+  const payloadVersion: unknown = value.payloadVersion;
+  if (payloadVersion !== 1
+    || !Number.isSafeInteger(value.callsUsed) || value.callsUsed < 0
+    || !Number.isSafeInteger(value.callsLimit)
+    || value.callsLimit < 12 || value.callsLimit > 16
+    || value.callsUsed > value.callsLimit - LIVE_TAIL_RPC_CALLS) {
+    throw new TypeError();
+  }
+  return Object.freeze({
+    payloadVersion: 1,
+    callsUsed: value.callsUsed,
+    callsLimit: value.callsLimit,
+  });
+}
+
+function rpcCallReservationInputFrom(
+  value: ExecutionLiveRpcCallReservationInputV1,
+): ExecutionLiveRpcCallReservationInputV1 {
+  try {
+    const payloadVersion: unknown = value.payloadVersion;
+    if (payloadVersion !== 1 || !ARTIFACT_ID.test(value.artifactId)) {
+      throw new TypeError();
+    }
+    return Object.freeze({
+      payloadVersion: 1,
+      claim: claimFrom(value.claim),
+      artifactId: value.artifactId,
+    });
   } catch (error) {
     if (error instanceof ExecutionLiveRepositoryError) throw error;
     throw failure('INVALID_INPUT');
@@ -1088,6 +1244,130 @@ function claimFrom(claim: ClaimedExecutionIntent): ClaimedExecutionIntent {
     throw failure('INVALID_INPUT');
   }
   return Object.freeze({ ...claim, intent });
+}
+
+function persistedResult(
+  artifact: SignedTransactionArtifactV1,
+  claim: ClaimedExecutionIntent,
+): ExecutionLivePersistSignedResultV1 {
+  return Object.freeze({ payloadVersion: 1, artifact, claim });
+}
+
+function transitionedClaim(
+  previous: ClaimedExecutionIntent,
+  result: QueryResult,
+  expectedStatus: ExecutionIntentV1['status'],
+  revisionDelta: bigint,
+  expectedReason: NonNullable<ExecutionIntentV1['lastReasonCode']>,
+): ClaimedExecutionIntent {
+  if (result.rowCount !== 1 || result.rows.length !== 1) throw failure('INVALID_DATA');
+  return authoritativeClaim(
+    previous, singleRow(result), expectedStatus, revisionDelta, expectedReason,
+  );
+}
+
+function replayedPersistClaim(
+  previous: ClaimedExecutionIntent,
+  row: Row,
+): ClaimedExecutionIntent {
+  if (row.claim_lease_owner !== previous.leaseOwner
+    || row.claim_lease_token !== previous.leaseToken) throw failure('LEASE_LOST');
+  if (row.state === 'PERSISTED' || row.state === 'SIGNED_SIMULATED'
+    || row.state === 'SUBMISSION_STARTED') {
+    return authoritativeClaim(
+      previous, row, 'SIGNED_NOT_SUBMITTED', 2n, 'SIGNATURE_PERSISTED',
+    );
+  }
+  if (row.state === 'ACCEPTED') {
+    return authoritativeClaim(previous, row, 'SUBMITTED', 3n, 'SUBMISSION_ACCEPTED');
+  }
+  if (row.state === 'AMBIGUOUS') {
+    return authoritativeClaim(
+      previous, row, 'UNKNOWN_REQUIRES_RECONCILIATION', 3n,
+      'RECONCILIATION_REQUIRED',
+    );
+  }
+  throw failure('CONFLICT');
+}
+
+function authoritativeClaim(
+  previous: ClaimedExecutionIntent,
+  row: Row,
+  expectedStatus: ExecutionIntentV1['status'],
+  revisionDelta: bigint,
+  expectedReason: NonNullable<ExecutionIntentV1['lastReasonCode']>,
+): ClaimedExecutionIntent {
+  const stateRevision = unsignedBigint(row.claim_state_revision);
+  const attemptCount = integer(row.claim_attempt_count);
+  const updatedAtMs = timestampText(row.claim_updated_at_ms);
+  const leaseExpiresAtMs = timestampText(row.claim_lease_expires_at_ms);
+  if (row.claim_status !== expectedStatus
+    || stateRevision !== previous.intent.stateRevision + revisionDelta
+    || attemptCount !== previous.intent.attemptCount
+    || row.claim_last_reason_code !== expectedReason
+    || updatedAtMs < previous.intent.updatedAtMs
+    || row.claim_lease_owner !== previous.leaseOwner
+    || row.claim_lease_token !== previous.leaseToken) throw failure('INVALID_DATA');
+  return claimFrom(Object.freeze({
+    intent: Object.freeze({
+      ...previous.intent,
+      status: expectedStatus,
+      stateRevision,
+      lastReasonCode: expectedReason,
+      updatedAtMs,
+    }),
+    leaseOwner: previous.leaseOwner,
+    leaseToken: previous.leaseToken,
+    leaseExpiresAtMs,
+  }));
+}
+
+function currentClaim(
+  previous: ClaimedExecutionIntent,
+  row: Row,
+  expectedStatus: ExecutionIntentV1['status'],
+  expectedReason: NonNullable<ExecutionIntentV1['lastReasonCode']>,
+): ClaimedExecutionIntent {
+  const stateRevision = unsignedBigint(row.claim_state_revision);
+  const attemptCount = integer(row.claim_attempt_count);
+  const updatedAtMs = timestampText(row.claim_updated_at_ms);
+  const leaseExpiresAtMs = timestampText(row.claim_lease_expires_at_ms);
+  if (row.claim_status !== expectedStatus
+    || stateRevision < previous.intent.stateRevision
+    || attemptCount !== previous.intent.attemptCount
+    || row.claim_last_reason_code !== expectedReason
+    || updatedAtMs < previous.intent.updatedAtMs
+    || row.claim_lease_owner !== previous.leaseOwner
+    || row.claim_lease_token !== previous.leaseToken) throw failure('INVALID_DATA');
+  return claimFrom(Object.freeze({
+    intent: Object.freeze({
+      ...previous.intent,
+      status: expectedStatus,
+      stateRevision,
+      lastReasonCode: expectedReason,
+      updatedAtMs,
+    }),
+    leaseOwner: previous.leaseOwner,
+    leaseToken: previous.leaseToken,
+    leaseExpiresAtMs,
+  }));
+}
+
+function inspectionClaim(
+  previous: ClaimedExecutionIntent,
+  row: Row,
+  state: Exclude<ExecutionLiveSignedTransactionInspectionV1['state'], 'REVOKED_NO_SEND'>,
+): ClaimedExecutionIntent {
+  if (state === 'PERSISTED' || state === 'SIGNED_SIMULATED'
+    || state === 'SUBMISSION_STARTED') {
+    return currentClaim(previous, row, 'SIGNED_NOT_SUBMITTED', 'SIGNATURE_PERSISTED');
+  }
+  if (state === 'ACCEPTED') {
+    return currentClaim(previous, row, 'SUBMITTED', 'SUBMISSION_ACCEPTED');
+  }
+  return currentClaim(
+    previous, row, 'UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILIATION_REQUIRED',
+  );
 }
 
 function revocationInputFrom(
@@ -1400,10 +1680,222 @@ function recreateArtifact(value: SignedTransactionArtifactV1): SignedTransaction
   });
 }
 
+interface PreparationBindingInput {
+  readonly claim: ClaimedExecutionIntent;
+  readonly generationId: string;
+  readonly runtime: ExecutionLiveRuntimeBindingV1;
+}
+
+async function readBuyPreparationBinding(
+  client: DatabaseClient,
+  input: PreparationBindingInput,
+): Promise<ExecutionLivePreparationBindingV1> {
+  const result = await client.query(`SELECT
+    trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
+    intent.status AS intent_status,intent.side AS intent_side,
+    intent.lease_owner,intent.lease_token::TEXT AS lease_token,
+    trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+    attempt.status AS attempt_status,generation.generation_id,
+    generation.wallet_public_key AS generation_wallet_public_key,
+    generation.cluster AS generation_cluster,generation.genesis_hash AS generation_genesis_hash,
+    generation.retired_at,control.state AS control_state,
+    qualification.qualification_id,qualification.phase AS qualification_phase,
+    qualification.build_hash AS qualification_build_hash,
+    qualification.configuration_fingerprint AS qualification_configuration_fingerprint,
+    qualification.strategy_fingerprint AS qualification_strategy_fingerprint,
+    qualification.wallet_public_key AS qualification_wallet_public_key,
+    qualification.cluster AS qualification_cluster,
+    qualification.genesis_hash AS qualification_genesis_hash,
+    qualification.provider_id AS qualification_provider_id,
+    trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT
+      AS qualification_expires_at_ms,
+    armament.armament_id,armament.state AS armament_state,
+    armament.phase AS armament_phase,armament.build_hash AS armament_build_hash,
+    armament.configuration_fingerprint AS armament_configuration_fingerprint,
+    armament.strategy_fingerprint AS armament_strategy_fingerprint,
+    armament.wallet_public_key AS armament_wallet_public_key,
+    armament.cluster AS armament_cluster,armament.genesis_hash AS armament_genesis_hash,
+    armament.provider_id AS armament_provider_id,
+    armament.consumed_buys,armament.maximum_buys,
+    trunc(EXTRACT(EPOCH FROM armament.expires_at)*1000)::TEXT AS armament_expires_at_ms,
+    reservation.reservation_id,reservation.state AS reservation_state,
+    reservation.intent_id AS reservation_intent_id,
+    reservation.generation_id AS reservation_generation_id,
+    admission.decision AS admission_decision,admission.quota_state,
+    risk.unknown_block,provider.superseded_at AS provider_superseded_at,
+    trunc(EXTRACT(EPOCH FROM provider.expires_at)*1000)::TEXT AS provider_expires_at_ms
+    FROM execution_intents intent
+    JOIN execution_attempts attempt ON attempt.intent_id=intent.id
+      AND attempt.attempt_number=$2
+    JOIN execution_wallet_generations generation ON generation.generation_id=$3
+    JOIN execution_control_state control ON control.generation_id=generation.generation_id
+    JOIN execution_activation_armaments armament
+      ON armament.generation_id=generation.generation_id AND armament.state='ARMED'
+    JOIN execution_safety_qualifications qualification
+      ON qualification.qualification_id=armament.qualification_id
+    JOIN execution_exposure_reservations reservation
+      ON reservation.intent_id=intent.id AND reservation.generation_id=generation.generation_id
+        AND reservation.state='RESERVED'
+    JOIN execution_risk_admission_reports admission
+      ON admission.report_id=reservation.admission_report_id
+    JOIN execution_wallet_risk_state risk ON risk.generation_id=generation.generation_id
+    JOIN execution_provider_usage_snapshots provider
+      ON provider.snapshot_fingerprint=reservation.provider_snapshot_fingerprint
+      AND provider.provider_id=armament.provider_id
+    WHERE intent.id=$1`, [
+    input.claim.intent.id, input.claim.intent.attemptCount, input.generationId,
+  ]);
+  if (result.rows.length !== 1) throw failure('PREFLIGHT_EXPIRED');
+  const row = singleRow(result);
+  const nowMs = timestampText(row.now_ms);
+  validatePreparationClaim(row, input, nowMs);
+  if (row.control_state !== 'RUNNING') throw failure('CONTROL_STOPPED');
+  if (row.intent_side !== 'BUY' || row.retired_at !== null
+    || !runtimeMatches(row, input.runtime)
+    || !qualificationRuntimeMatches(row, input.runtime)
+    || timestampText(row.qualification_expires_at_ms) <= nowMs
+    || row.armament_state !== 'ARMED'
+    || timestampText(row.armament_expires_at_ms) <= nowMs
+    || integer(row.consumed_buys) >= integer(row.maximum_buys)
+    || row.reservation_state !== 'RESERVED'
+    || row.reservation_intent_id !== input.claim.intent.id
+    || row.reservation_generation_id !== input.generationId
+    || row.admission_decision !== 'ADMITTED' || row.quota_state !== 'NORMAL'
+    || row.unknown_block !== false || row.provider_superseded_at !== null
+    || timestampText(row.provider_expires_at_ms) <= nowMs) {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+  return preparationBinding(row, 'BUY');
+}
+
+async function readSellPreparationBinding(
+  client: DatabaseClient,
+  input: PreparationBindingInput,
+): Promise<ExecutionLivePreparationBindingV1> {
+  const result = await client.query(`SELECT
+    trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
+    intent.status AS intent_status,intent.side AS intent_side,
+    intent.base_amount_raw::TEXT AS intent_base_amount_raw,
+    intent.mint,intent.quote_mint,intent.lease_owner,
+    intent.lease_token::TEXT AS lease_token,
+    trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+    attempt.status AS attempt_status,generation.generation_id,
+    generation.wallet_public_key AS generation_wallet_public_key,
+    generation.cluster AS generation_cluster,generation.genesis_hash AS generation_genesis_hash,
+    generation.retired_at,control.state AS control_state,
+    qualification.qualification_id,qualification.phase AS qualification_phase,
+    qualification.build_hash AS qualification_build_hash,
+    qualification.configuration_fingerprint AS qualification_configuration_fingerprint,
+    qualification.strategy_fingerprint AS qualification_strategy_fingerprint,
+    qualification.wallet_public_key AS qualification_wallet_public_key,
+    qualification.cluster AS qualification_cluster,
+    qualification.genesis_hash AS qualification_genesis_hash,
+    qualification.provider_id AS qualification_provider_id,
+    trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT
+      AS qualification_expires_at_ms,
+    armament.armament_id,armament.phase AS armament_phase,
+    armament.build_hash AS armament_build_hash,
+    armament.configuration_fingerprint AS armament_configuration_fingerprint,
+    armament.strategy_fingerprint AS armament_strategy_fingerprint,
+    armament.wallet_public_key AS armament_wallet_public_key,
+    armament.cluster AS armament_cluster,armament.genesis_hash AS armament_genesis_hash,
+    armament.provider_id AS armament_provider_id,
+    exit_auth.authorization_id AS exit_authorization_id,
+    exit_auth.state AS authorization_state,
+    exit_auth.maximum_base_amount_raw::TEXT AS maximum_base_amount_raw,
+    exit_auth.generation_id AS authorization_generation_id,
+    exit_auth.wallet_public_key AS authorization_wallet_public_key,
+    exit_auth.mint AS authorization_mint,exit_auth.quote_mint AS authorization_quote_mint,
+    position.state AS position_state,position.exit_intent_id,
+    position.remaining_base_raw::TEXT AS remaining_base_raw
+    FROM execution_intents intent
+    JOIN execution_attempts attempt ON attempt.intent_id=intent.id
+      AND attempt.attempt_number=$2
+    JOIN execution_wallet_generations generation ON generation.generation_id=$3
+    JOIN execution_control_state control ON control.generation_id=generation.generation_id
+    JOIN execution_exit_authorizations exit_auth
+      ON exit_auth.locked_intent_id IS NULL AND exit_auth.state='ACTIVE'
+    JOIN execution_live_positions position
+      ON position.position_id=exit_auth.position_id AND position.exit_intent_id=intent.id
+    JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
+    JOIN execution_safety_qualifications qualification
+      ON qualification.qualification_id=armament.qualification_id
+    WHERE intent.id=$1 AND exit_auth.generation_id=generation.generation_id`, [
+    input.claim.intent.id, input.claim.intent.attemptCount, input.generationId,
+  ]);
+  if (result.rows.length !== 1) throw failure('PREFLIGHT_EXPIRED');
+  const row = singleRow(result);
+  const nowMs = timestampText(row.now_ms);
+  validatePreparationClaim(row, input, nowMs);
+  const amount = unsignedBigint(row.intent_base_amount_raw);
+  if (row.control_state === 'HARD_STOP') throw failure('CONTROL_STOPPED');
+  if (row.intent_side !== 'SELL' || row.retired_at !== null
+    || !runtimeMatches(row, input.runtime)
+    || !qualificationRuntimeMatches(row, input.runtime)
+    || timestampText(row.qualification_expires_at_ms) <= nowMs
+    || row.authorization_state !== 'ACTIVE'
+    || row.authorization_generation_id !== input.generationId
+    || row.authorization_wallet_public_key !== input.runtime.walletPublicKey
+    || row.authorization_mint !== row.mint || row.authorization_quote_mint !== row.quote_mint
+    || row.position_state !== 'EXIT_PENDING'
+    || row.exit_intent_id !== input.claim.intent.id
+    || amount === 0n || amount > unsignedBigint(row.maximum_base_amount_raw)
+    || amount > unsignedBigint(row.remaining_base_raw)) {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+  return preparationBinding(row, 'SELL');
+}
+
+function validatePreparationClaim(
+  row: Row,
+  input: PreparationBindingInput,
+  nowMs: number,
+): void {
+  if (row.lease_owner !== input.claim.leaseOwner
+    || row.lease_token !== input.claim.leaseToken
+    || timestampText(row.lease_expires_at_ms) <= nowMs) throw failure('LEASE_LOST');
+  if (row.intent_status !== 'PROCESSING' || row.attempt_status !== 'STARTED'
+    || row.generation_id !== input.generationId
+    || row.generation_wallet_public_key !== input.runtime.walletPublicKey
+    || row.generation_cluster !== input.runtime.cluster
+    || row.generation_genesis_hash !== input.runtime.observedGenesisHash) {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+}
+
+function preparationBinding(
+  row: Row,
+  side: 'BUY' | 'SELL',
+): ExecutionLivePreparationBindingV1 {
+  const qualificationId = patternedText(
+    row.qualification_id, /^execution_safety_qualification_[0-9a-f]{64}$/u,
+  );
+  const armamentId = patternedText(
+    row.armament_id, /^execution_activation_armament_[0-9a-f]{64}$/u,
+  );
+  return Object.freeze({
+    payloadVersion: 1,
+    side,
+    generationId: patternedText(
+      row.generation_id, /^execution_wallet_generation_[0-9a-f]{64}$/u,
+    ),
+    qualificationId,
+    armamentId: side === 'BUY' ? armamentId : null,
+    reservationId: side === 'BUY'
+      ? patternedText(row.reservation_id, /^execution_exposure_reservation_[0-9a-f]{64}$/u)
+      : null,
+    exitAuthorizationId: side === 'SELL'
+      ? patternedText(row.exit_authorization_id, /^execution_exit_authorization_[0-9a-f]{64}$/u)
+      : null,
+    providerId: patternedText(row.armament_provider_id, PROVIDER_ID),
+    walletPublicKey: patternedText(row.generation_wallet_public_key, PUBLIC_KEY),
+  });
+}
+
 async function persistSellSigned(
   client: DatabaseClient,
   input: ExecutionLivePersistSignedInputV1,
-): Promise<SignedTransactionArtifactV1> {
+): Promise<ExecutionLivePersistSignedResultV1> {
   const artifact = input.artifact;
   if (artifact.exitAuthorizationId === null) throw failure('INVALID_INPUT');
   const binding = exactRow(singleRow(await client.query(`SELECT
@@ -1495,14 +1987,17 @@ async function persistSellSigned(
     last_reason_code='SIGNATURE_PERSISTED',updated_at=date_trunc('milliseconds',statement_timestamp())
     WHERE id=$1 AND status='PROCESSING' AND state_revision=$4::BIGINT
       AND lease_owner=$2 AND lease_token=$3::UUID
-      AND lease_expires_at > statement_timestamp()`, [
+      AND lease_expires_at > statement_timestamp()
+    RETURNING ${AUTHORITATIVE_CLAIM_PROJECTION}`, [
     artifact.intentId, input.claim.leaseOwner, input.claim.leaseToken,
     input.claim.intent.stateRevision.toString(),
   ]);
   if (transitioned.rowCount !== 1) throw failure('LEASE_LOST');
   await insertIntentTransitions(client, input, nowMs);
   await insertSubmissionEvent(client, artifact, nowMs);
-  return artifact;
+  return persistedResult(artifact, transitionedClaim(
+    input.claim, transitioned, 'SIGNED_NOT_SUBMITTED', 2n, 'SIGNATURE_PERSISTED',
+  ));
 }
 
 async function beginSellSubmission(
@@ -1793,6 +2288,14 @@ async function findArtifactWhere(
   const result = await client.query(`SELECT transaction.*,
     intent.status AS intent_status,intent.lease_owner,
     intent.lease_token::TEXT AS lease_token,
+    intent.status AS claim_status,intent.attempt_count AS claim_attempt_count,
+    intent.state_revision::TEXT AS claim_state_revision,
+    intent.last_reason_code AS claim_last_reason_code,
+    trunc(EXTRACT(EPOCH FROM intent.updated_at)*1000)::TEXT AS claim_updated_at_ms,
+    intent.lease_owner AS claim_lease_owner,
+    intent.lease_token::TEXT AS claim_lease_token,
+    trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT
+      AS claim_lease_expires_at_ms,
     trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
     trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
     trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
@@ -2065,6 +2568,7 @@ async function persistUnsignedSimulationEvidence(
     if (!sameUnsignedSimulationEvidence(existing.rows[0] ?? {}, input, identity)) {
       throw failure('CONFLICT');
     }
+    await persistLiveRpcBudget(client, input);
     return;
   }
   const inserted = await client.query(`INSERT INTO execution_live_unsigned_simulation_evidence (
@@ -2087,6 +2591,46 @@ async function persistUnsignedSimulationEvidence(
     simulation.simulatedFeePayerLamportDebit.toString(), simulation.unitsConsumed.toString(),
     simulation.simulatedBaseDeltaRaw.toString(), simulation.simulatedQuoteDeltaRaw.toString(),
     simulation.logsFingerprint, simulation.logsLineCount, artifact.signedAtMs,
+  ]);
+  if (inserted.rowCount !== 1) throw failure('CONFLICT');
+  await persistLiveRpcBudget(client, input);
+}
+
+async function persistLiveRpcBudget(
+  client: DatabaseClient,
+  input: ExecutionLivePersistSignedInputV1,
+): Promise<void> {
+  const artifact = input.artifact;
+  const budget = input.rpcBudget;
+  const existing = await client.query(`SELECT intent_id,attempt_number,artifact_id,
+    provider_id,initial_calls_used,calls_reserved,calls_limit
+    FROM execution_live_rpc_budgets WHERE artifact_id=$1`, [artifact.artifactId]);
+  if (existing.rows.length > 1) throw failure('INVALID_DATA');
+  if (existing.rows.length === 1) {
+    const row = exactRow(existing.rows[0] ?? {}, [
+      'intent_id', 'attempt_number', 'artifact_id', 'provider_id',
+      'initial_calls_used', 'calls_reserved', 'calls_limit',
+    ] as const);
+    if (row.intent_id !== artifact.intentId
+      || integer(row.attempt_number) !== artifact.attemptNumber
+      || row.artifact_id !== artifact.artifactId
+      || row.provider_id !== artifact.providerId
+      || integer(row.initial_calls_used) !== budget.callsUsed
+      || integer(row.calls_reserved) < budget.callsUsed
+      || integer(row.calls_limit) !== budget.callsLimit) throw failure('CONFLICT');
+    return;
+  }
+  const inserted = await client.query(`INSERT INTO execution_live_rpc_budgets (
+    intent_id,attempt_number,artifact_id,provider_id,initial_calls_used,
+    calls_reserved,calls_limit,created_at
+  ) SELECT transaction.intent_id,transaction.attempt_number,transaction.artifact_id,
+    transaction.provider_id,$2::INTEGER,$2::INTEGER,$3::INTEGER,
+    TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond')
+    FROM execution_signed_transactions transaction
+    WHERE transaction.artifact_id=$1 AND transaction.intent_id=$5
+      AND transaction.attempt_number=$6::INTEGER AND transaction.provider_id=$7`, [
+    artifact.artifactId, budget.callsUsed, budget.callsLimit, artifact.signedAtMs,
+    artifact.intentId, artifact.attemptNumber, artifact.providerId,
   ]);
   if (inserted.rowCount !== 1) throw failure('CONFLICT');
 }
@@ -3595,6 +4139,11 @@ function fingerprintText(value: unknown): string {
   const candidate = text(value);
   if (!HASH.test(candidate)) throw failure('INVALID_DATA');
   return candidate;
+}
+
+function patternedText(value: unknown, pattern: RegExp): string {
+  if (typeof value !== 'string' || !pattern.test(value)) throw failure('INVALID_DATA');
+  return value;
 }
 
 function positiveInteger(value: unknown): number {

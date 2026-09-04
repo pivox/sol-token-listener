@@ -100,7 +100,10 @@ void test('the published H2a graph and scripts contain no signer, keypair or sub
     packageJson.scripts?.['executor:live:recovery:dev'],
     'tsx src/executor-live-recovery/main.ts',
   );
-  assert.equal(packageJson.scripts?.['executor:live:start'], undefined);
+  assert.equal(
+    packageJson.scripts?.['executor:live:start'],
+    'node dist/src/executor-live/main.js',
+  );
 });
 
 void test('fatal entrypoint output exposes only allowlisted identity', () => {

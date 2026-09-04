@@ -38,6 +38,7 @@ import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.r
 import { PostgresExecutionSimulationRepository } from '../src/storage/execution-simulation.repository.js';
 import { createLiveRecoveryBootstrapDatabase } from
   '../src/executor-live-recovery/database.js';
+import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const walletPublicKey = '11111111111111111111111111111111';
@@ -885,6 +886,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     });
 
     const persisted = await Promise.all([
@@ -892,7 +894,18 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       repository.persistSigned(input),
     ]);
 
-    assert.deepEqual(persisted, [fixture.artifact, fixture.artifact]);
+    assert.deepEqual(persisted.map((result) => result.artifact), [
+      fixture.artifact, fixture.artifact,
+    ]);
+    assert.deepEqual(persisted.map((result) => Object.freeze({
+      status: result.claim.intent.status,
+      revision: result.claim.intent.stateRevision,
+    })), [
+      { status: 'SIGNED_NOT_SUBMITTED', revision: fixture.claim.intent.stateRevision + 2n },
+      { status: 'SIGNED_NOT_SUBMITTED', revision: fixture.claim.intent.stateRevision + 2n },
+    ]);
+    const persistedClaim = persisted[0]?.claim;
+    assert.ok(persistedClaim);
     const state = await pool.query(`SELECT
       (SELECT state FROM execution_activation_armaments WHERE armament_id=$1) AS armament_state,
       (SELECT consumed_buys FROM execution_activation_armaments WHERE armament_id=$1) AS consumed_buys,
@@ -909,23 +922,45 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reconciliation_signature: fixture.artifact.signature,
     }]);
     const authenticated = await repository.authenticatePersistedSignedTransaction({
-      claim: fixture.claim, artifactId: fixture.artifact.artifactId,
+      claim: persistedClaim, artifactId: fixture.artifact.artifactId,
     });
     assert.equal(authenticated.state, 'PERSISTED');
     assert.deepEqual(authenticated.artifact.signedTransactionBytes,
       fixture.artifact.signedTransactionBytes);
+    const futureRevisionClaim = Object.freeze({
+      ...fixture.claim,
+      intent: Object.freeze({
+        ...fixture.claim.intent,
+        stateRevision: fixture.claim.intent.stateRevision + 3n,
+      }),
+    });
+    await assert.rejects(
+      repository.inspectSignedTransaction({ claim: futureRevisionClaim }),
+      isLiveRepositoryError('INVALID_DATA'),
+    );
     const recovered = await repository.inspectSignedTransaction({ claim: fixture.claim });
     assert.equal(recovered?.state, 'PERSISTED');
     assert.ok(recovered !== null && 'artifact' in recovered);
     assert.equal(recovered.artifact.artifactId, fixture.artifact.artifactId);
     assert.deepEqual(recovered.unsignedSimulation, fixture.unsignedSimulation);
+    assert.equal(recovered.claim.intent.status, 'SIGNED_NOT_SUBMITTED');
+    assert.equal(
+      recovered.claim.intent.stateRevision,
+      fixture.claim.intent.stateRevision + 2n,
+    );
+    const renewedRecoveredClaim = await new PostgresExecutionIntentRepository(pool).renew(
+      recovered.claim,
+      60_000,
+    );
+    assert.equal(renewedRecoveredClaim.intent.status, 'SIGNED_NOT_SUBMITTED');
+    assert.equal(renewedRecoveredClaim.intent.stateRevision, recovered.claim.intent.stateRevision);
     const signedEvidenceMetrics = Object.freeze({
       simulationSlot: 126n, unitsConsumed: 26_000n,
       feePayerLamportDebit: 5_500n, baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
       observedAtMs: fixture.artifact.signedAtMs + 1,
     });
     await assert.rejects(repository.recordSignedSimulation(
-      fixture.claim,
+      persistedClaim,
       signedSimulationEvidence(
         fixture.artifact, fixture.unsignedSimulation, signedEvidenceMetrics, 'secondary',
       ),
@@ -939,13 +974,31 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       fixture.artifact, fixture.unsignedSimulation, signedEvidenceMetrics,
     );
     const signedSimulation = await repository.recordSignedSimulation(
-      fixture.claim, signedEvidence,
+      persistedClaim, signedEvidence,
     );
     assert.equal(signedSimulation.state, 'SIGNED_SIMULATED');
     assert.equal(signedSimulation.stateRevision, 1n);
     assert.deepEqual(
-      await repository.recordSignedSimulation(fixture.claim, signedEvidence),
+      await repository.recordSignedSimulation(persistedClaim, signedEvidence),
       signedSimulation,
+    );
+    const recoveredSignedSimulation = await repository.inspectSignedTransaction({
+      claim: fixture.claim,
+    });
+    assert.equal(recoveredSignedSimulation?.state, 'SIGNED_SIMULATED');
+    assert.ok(recoveredSignedSimulation !== null && 'artifact' in recoveredSignedSimulation);
+    assert.equal(recoveredSignedSimulation.claim.intent.status, 'SIGNED_NOT_SUBMITTED');
+    assert.equal(
+      recoveredSignedSimulation.claim.intent.stateRevision,
+      fixture.claim.intent.stateRevision + 2n,
+    );
+    const renewedSignedSimulationClaim = await new PostgresExecutionIntentRepository(pool).renew(
+      recoveredSignedSimulation.claim,
+      60_000,
+    );
+    assert.equal(
+      renewedSignedSimulationClaim.intent.stateRevision,
+      recoveredSignedSimulation.claim.intent.stateRevision,
     );
     const durableEvidence = await pool.query(`SELECT evidence_fingerprint,
       unsigned_simulation_evidence_id,provider_id,logs_fingerprint,logs_line_count,
@@ -972,7 +1025,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       );
     }
     const submissionStarted = await repository.beginSubmission({
-      claim: fixture.claim,
+      claim: persistedClaim,
       artifactId: fixture.artifact.artifactId,
       expectedRevision: signedSimulation.stateRevision,
       ...submissionPreflight(fixture.artifact),
@@ -1009,7 +1062,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       SET risk_state_revision_baseline=risk_state_revision_baseline+1
       WHERE intent_id=$1`, [fixture.claim.intent.id]),
     (error: unknown) => databaseErrorCode(error) === '55000');
-    await repository.recordSubmissionOutcome(fixture.claim, Object.freeze({
+    const outcome = await repository.recordSubmissionOutcome(persistedClaim, Object.freeze({
       payloadVersion: 1,
       artifactId: fixture.artifact.artifactId,
       expectedRevision: submissionStarted.stateRevision,
@@ -1018,6 +1071,11 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reasonCode: 'SUBMISSION_ACCEPTED',
       observedAtMs: Date.now(),
     }));
+    assert.equal(outcome.claim.intent.status, 'SUBMITTED');
+    assert.equal(
+      outcome.claim.intent.stateRevision,
+      persistedClaim.intent.stateRevision + 1n,
+    );
     const accepted = await pool.query(`SELECT
       (SELECT state FROM execution_signed_transactions WHERE artifact_id=$1) AS artifact_state,
       (SELECT state_revision::TEXT FROM execution_signed_transactions
@@ -1039,8 +1097,8 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       observedSlot: 127n,
       observedAtMs: Date.now(),
     } as const);
-    await repository.recordConfirmation(fixture.claim, entryConfirmation);
-    await repository.recordConfirmation(fixture.claim, entryConfirmation);
+    await repository.recordConfirmation(outcome.claim, entryConfirmation);
+    await repository.recordConfirmation(outcome.claim, entryConfirmation);
     const reconciliationClaim = await new PostgresExecutionIntentRepository(pool).claim({
       ownerId: 'entry-reconciliation-after-confirmation',
       leaseMs: 60_000,
@@ -1256,6 +1314,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reservationId: null,
       artifact: exitArtifact,
       unsignedSimulation: exitUnsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const exitSimulated = await repository.recordSignedSimulation(
       exitBegun.claim,
@@ -1417,6 +1476,135 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
   });
 });
 
+void test('RPC reservations remain bounded across repository instances and process recovery',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: live RPC budget integration skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await liveFixture(pool);
+      const first = new PostgresExecutionLiveRepository(pool);
+      const second = new PostgresExecutionLiveRepository(pool);
+      const persisted = await first.persistSigned(Object.freeze({
+        payloadVersion: 1,
+        claim: fixture.claim,
+        qualificationId: fixture.qualificationId,
+        reservationId: fixture.reservationId,
+        artifact: fixture.artifact,
+        unsignedSimulation: fixture.unsignedSimulation,
+        rpcBudget: Object.freeze({ payloadVersion: 1, callsUsed: 5, callsLimit: 12 }),
+      }));
+
+      const reserve = (repository: PostgresExecutionLiveRepository) =>
+        repository.reserveRpcCall(Object.freeze({
+          payloadVersion: 1,
+          claim: persisted.claim,
+          artifactId: fixture.artifact.artifactId,
+        }));
+      const reservations = await Promise.all([
+        reserve(first), reserve(second), reserve(first), reserve(second),
+        reserve(first), reserve(second), reserve(first),
+      ]);
+      assert.deepEqual(
+        reservations.map((result) => result.callsReserved).sort((left, right) => left - right),
+        [6, 7, 8, 9, 10, 11, 12],
+      );
+      await assert.rejects(reserve(second), isLiveRepositoryError('RPC_CALL_BUDGET_EXHAUSTED'));
+
+      const replay = await first.persistSigned(Object.freeze({
+        payloadVersion: 1,
+        claim: fixture.claim,
+        qualificationId: fixture.qualificationId,
+        reservationId: fixture.reservationId,
+        artifact: fixture.artifact,
+        unsignedSimulation: fixture.unsignedSimulation,
+        rpcBudget: Object.freeze({ payloadVersion: 1, callsUsed: 5, callsLimit: 12 }),
+      }));
+      assert.equal(replay.artifact.artifactId, fixture.artifact.artifactId);
+
+      const durable = await pool.query(`SELECT initial_calls_used,calls_reserved,calls_limit
+        FROM execution_live_rpc_budgets WHERE artifact_id=$1`, [fixture.artifact.artifactId]);
+      assert.deepEqual(durable.rows, [{
+        initial_calls_used: 5, calls_reserved: 12, calls_limit: 12,
+      }]);
+
+      const signed = await first.recordSignedSimulation(
+        persisted.claim,
+        signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
+          simulationSlot: 126n,
+          unitsConsumed: 26_000n,
+          feePayerLamportDebit: 5_500n,
+          baseDeltaRaw: 95n,
+          quoteDeltaRaw: -1_000n,
+          observedAtMs: fixture.artifact.signedAtMs + 1,
+        }),
+      );
+      await first.beginSubmission({
+        claim: persisted.claim,
+        artifactId: fixture.artifact.artifactId,
+        expectedRevision: signed.stateRevision,
+        ...submissionPreflight(fixture.artifact),
+      });
+      await assert.rejects(reserve(first), isLiveRepositoryError('LEASE_LOST'));
+    });
+  });
+
+void test('preparation binding resolves the exact BUY authority from the active claim',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: preparation binding integration skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await liveFixture(pool);
+      const binding = await new PostgresExecutionLiveRepository(pool).readPreparationBinding({
+        claim: fixture.claim,
+        generationId,
+        runtime: submissionPreflight(fixture.artifact).runtime,
+      });
+
+      assert.deepEqual(binding, {
+        payloadVersion: 1,
+        side: 'BUY',
+        generationId,
+        qualificationId: fixture.qualificationId,
+        armamentId: fixture.armamentId,
+        reservationId: fixture.reservationId,
+        exitAuthorizationId: null,
+        providerId: fixture.artifact.providerId,
+        walletPublicKey: fixture.artifact.walletPublicKey,
+      });
+
+      const baseline = submissionPreflight(fixture.artifact).runtime;
+      await assert.rejects(
+        new PostgresExecutionLiveRepository(pool).readPreparationBinding({
+          claim: fixture.claim,
+          generationId,
+          runtime: Object.freeze({ ...baseline, buildHash: 'f'.repeat(64) }),
+        }),
+        isLiveRepositoryError('PREFLIGHT_EXPIRED'),
+      );
+      await new PostgresExecutionOperationsRepository(pool).setStop({
+        payloadVersion: 1,
+        commandId: `command:preparation-stop:${randomUUID()}`,
+        generationId,
+        operatorId: 'operator-primary',
+        occurredAtMs: Date.now(),
+      }, 'ENTRY_STOP');
+      await assert.rejects(
+        new PostgresExecutionLiveRepository(pool).readPreparationBinding({
+          claim: fixture.claim,
+          generationId,
+          runtime: baseline,
+        }),
+        isLiveRepositoryError('PREFLIGHT_EXPIRED'),
+      );
+    });
+  });
+
 void test('signed simulation commit-unknown replays one durable evidence row', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -1430,6 +1618,7 @@ void test('signed simulation commit-unknown replays one durable evidence row', a
       payloadVersion: 1, claim: fixture.claim,
       qualificationId: fixture.qualificationId, reservationId: fixture.reservationId,
       artifact: fixture.artifact, unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const evidence = signedSimulationEvidence(
       fixture.artifact, fixture.unsignedSimulation, Object.freeze({
@@ -1487,6 +1676,7 @@ void test('fails closed when the durable control is stopped before persistence',
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId, artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     })), (error: unknown) => error instanceof ExecutionLiveRepositoryError
       && error.code === 'CONTROL_STOPPED');
     assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
@@ -1517,6 +1707,7 @@ for (const scenario of ['RETIRED_GENERATION', 'RUNTIME_BINDING', 'CAPITAL_LIMIT'
           reservationId: fixture.reservationId,
           artifact: fixture.artifact,
           unsignedSimulation: fixture.unsignedSimulation,
+          rpcBudget: fixture.rpcBudget,
         }));
         const simulated = await repository.recordSignedSimulation(
           fixture.claim,
@@ -1604,6 +1795,7 @@ void test('finalized no-effect evidence closes an ambiguous artifact without ope
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const simulated = await repository.recordSignedSimulation(fixture.claim,
       signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
@@ -1691,6 +1883,7 @@ void test('lease expiry while reconciliation waits on the intent lock fails clos
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const simulated = await repository.recordSignedSimulation(fixture.claim,
       signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
@@ -1837,6 +2030,7 @@ void test('finalized BUY evidence reconciles an ambiguous submission without con
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const simulated = await repository.recordSignedSimulation(fixture.claim,
       signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
@@ -2039,6 +2233,7 @@ void test('rejects a lost lease and a superseded provider quota snapshot', async
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId, artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     });
     await pool.query(`UPDATE execution_intents SET
       lease_expires_at=date_trunc('milliseconds',statement_timestamp()) WHERE id=$1`, [
@@ -2065,6 +2260,7 @@ void test('rejects a lost lease and a superseded provider quota snapshot', async
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId, artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     })), isLiveRepositoryError('PREFLIGHT_EXPIRED'));
   });
 });
@@ -2084,6 +2280,7 @@ void test('rejects a signed artifact state update without its immutable journal 
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const signedEvidence = signedSimulationEvidence(
       fixture.artifact, fixture.unsignedSimulation, Object.freeze({
@@ -2209,6 +2406,7 @@ void test('PostgreSQL 16 recovery authority commits finality and creates a deadl
       context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
       return;
     }
+    const releaseRoleTestLock = await acquireExecutorRoleTestLock(maintenance);
 
     const suffix = randomUUID().replaceAll('-', '');
     const databaseName = `h2a_runtime_test_${suffix}`;
@@ -2338,16 +2536,19 @@ void test('PostgreSQL 16 recovery authority commits finality and creates a deadl
         status: 'PENDING', base_amount_raw: '95',
       }]);
     } finally {
-      if (recoveryDatabase !== undefined) await recoveryDatabase.close();
-      if (isolated !== undefined) await isolated.end();
-      await maintenance.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-         WHERE datname=$1 AND pid<>pg_backend_pid()`,
-        [databaseName],
-      );
-      await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
-      await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
-      await maintenance.end();
+      try {
+        if (recoveryDatabase !== undefined) await recoveryDatabase.close();
+        if (isolated !== undefined) await isolated.end();
+        await maintenance.query(
+          `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+           WHERE datname=$1 AND pid<>pg_backend_pid()`,
+          [databaseName],
+        );
+        await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+        await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
+      } finally {
+        try { await releaseRoleTestLock(); } finally { await maintenance.end(); }
+      }
     }
   });
 
@@ -2485,8 +2686,12 @@ async function liveFixture(
     simulatedBaseDeltaRaw: 100n, simulatedQuoteDeltaRaw: -1_000n,
     logsFingerprint: '8'.repeat(64), logsLineCount: 1,
   });
+  const rpcBudget = Object.freeze({
+    payloadVersion: 1 as const, callsUsed: 5, callsLimit: 12,
+  });
   return Object.freeze({
-    claim, artifact, unsignedSimulation, providerSnapshot, armamentId: armament.armamentId,
+    claim, artifact, unsignedSimulation, rpcBudget, providerSnapshot,
+    armamentId: armament.armamentId,
     qualificationId: qualification.qualificationId,
     reservationId: admitted.reservationId,
   });
@@ -2514,6 +2719,7 @@ async function acceptedBuyFixture(
     reservationId: fixture.reservationId,
     artifact: fixture.artifact,
     unsignedSimulation: fixture.unsignedSimulation,
+    rpcBudget: fixture.rpcBudget,
   }));
   const signed = await live.recordSignedSimulation(
     fixture.claim,

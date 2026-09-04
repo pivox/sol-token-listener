@@ -18,6 +18,7 @@ import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/data
 import {
   ExecutionIntentRepositoryError,
   PostgresExecutionIntentRepository,
+  lockLiveSellPresenceInTransaction,
   type ExecutionIntentPool,
 } from '../src/storage/execution-intent.repository.js';
 
@@ -203,6 +204,18 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
       options: { ownerId: 'worker-1', leaseMs: 30_000, purpose: 'LIVE_RECOVER' },
       status: 'SIGNED_NOT_SUBMITTED', side: 'SELL',
     },
+    {
+      options: {
+        ownerId: 'worker-1', leaseMs: 30_000, purpose: 'LIVE_RECOVER', side: 'SELL',
+      },
+      status: 'SIGNED_NOT_SUBMITTED', side: 'SELL',
+    },
+    {
+      options: {
+        ownerId: 'worker-1', leaseMs: 30_000, purpose: 'LIVE_RECOVER', side: 'BUY',
+      },
+      status: 'SIGNED_NOT_SUBMITTED', side: 'BUY',
+    },
   ];
   for (const { options, status, side } of cases) {
     const draft = side === 'BUY'
@@ -215,8 +228,9 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
       ...claimRow(draft, status), lease_token: values?.[2],
       claim_at_ms: String(NOW_MS),
     }], 1);
-    const liveBuy = options.purpose === 'LIVE_EXECUTE' && options.side === 'BUY';
-    const client = new ScriptedClient(liveBuy
+    const priorityFencedBuy = (options.purpose === 'LIVE_EXECUTE'
+      || options.purpose === 'LIVE_RECOVER') && options.side === 'BUY';
+    const client = new ScriptedClient(priorityFencedBuy
       ? [command('BEGIN ISOLATION LEVEL READ COMMITTED'), result([], 1), claimStep, command('COMMIT')]
       : [claimStep]);
     const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -246,10 +260,32 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
       } else {
         assert.doesNotMatch(sql, /blocking_sell/u);
       }
-    } else {
+    } else if (options.purpose === 'LIVE_RECOVER') {
       assert.match(sql, /intent\.status\s*=\s*'SIGNED_NOT_SUBMITTED'/u);
       assert.doesNotMatch(sql, /intent\.expires_at\s*>\s*statement_timestamp\(\)/u);
-      assert.doesNotMatch(sql, /intent\.side\s*=/u);
+      if (options.side === undefined) {
+        assert.doesNotMatch(sql, /intent\.side\s*=/u);
+      } else {
+        assert.match(sql, new RegExp(`intent\\.side\\s*=\\s*'${options.side}'`, 'u'));
+      }
+      if (options.side === 'BUY') {
+        assert.equal(client.calls[0]?.text, 'BEGIN ISOLATION LEVEL READ COMMITTED');
+        assert.match(client.calls[1]?.text ?? '', /execution-live-sell-presence:v1/u);
+        assert.equal(client.calls.at(-1)?.text, 'COMMIT');
+        assert.match(sql, /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_intents AS blocking_sell/su);
+        assert.match(sql, /blocking_sell\.side\s*=\s*'SELL'/u);
+        assert.match(
+          sql,
+          /blocking_sell\.status IN \('PENDING', 'RETRY_READY', 'PROCESSING'\)[\s\S]*?blocking_sell\.expires_at\s*>\s*statement_timestamp\(\)/u,
+        );
+        assert.match(sql, /blocking_sell\.status\s*=\s*'SIGNED_NOT_SUBMITTED'/u);
+        const blockingPredicate = required(
+          /NOT EXISTS\s*\(([\s\S]*?)\)\s*AND\s*\(intent\.lease_expires_at/u.exec(sql)?.[1],
+        );
+        assert.doesNotMatch(blockingPredicate, /blocking_sell\.lease_expires_at/u);
+      } else {
+        assert.doesNotMatch(sql, /blocking_sell/u);
+      }
     }
   }
 });
@@ -258,7 +294,7 @@ void test('live claim options are closed and rejected before connecting', async 
   const invalid: readonly unknown[] = [
     { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_EXECUTE' },
     { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'OTHER' },
-    { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_RECOVER', side: 'SELL' },
+    { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_RECOVER', side: 'OTHER' },
     { ownerId: 'worker', leaseMs: 30_000, purpose: 'EXECUTE', side: 'BUY' },
   ];
   for (const options of invalid) {
@@ -354,8 +390,9 @@ void test('claim cancellation fences connect without dispatching SQL and preserv
     assert.deepEqual(client.releaseErrors, [undefined]);
   });
 
-  await context.test('LIVE_EXECUTE BUY aborts after its advisory wait without dispatching claim SQL',
-    async () => {
+  for (const purpose of ['LIVE_EXECUTE', 'LIVE_RECOVER'] as const) {
+    await context.test(`${purpose} BUY aborts after its advisory wait without dispatching claim SQL`,
+      async () => {
       const controller = new AbortController();
       const lockStarted = deferred<true>();
       const lockGate = deferred<QueryResult>();
@@ -379,7 +416,7 @@ void test('claim cancellation fences connect without dispatching SQL and preserv
       });
       const pending = repository.claim({
         ownerId: 'live-buy-cancelled-after-lock-wait', leaseMs: 30_000,
-        purpose: 'LIVE_EXECUTE', side: 'BUY',
+        purpose, side: 'BUY',
       }, controller.signal);
       await lockStarted.promise;
       controller.abort();
@@ -393,7 +430,8 @@ void test('claim cancellation fences connect without dispatching SQL and preserv
       ]);
       assert.match(calls[1] ?? '', /execution-live-sell-presence:v1/u);
       assert.deepEqual(releaseErrors, [false]);
-    });
+      });
+  }
 
   await context.test('connect and abort-cleanup failures remain database failures', async () => {
     const connectController = new AbortController();
@@ -1689,6 +1727,56 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
       recoverBlockingBuy.id, expiredRecoverSell.id,
     ]]);
 
+    const sideRecoverBuy = executionDraft('live-side-recover-buy', {
+      requestedAtMs: now - 3_000, expiresAtMs: now - 2_000,
+    });
+    const activePendingSell = executionDraft('live-side-recover-active-sell', {
+      ...sellShape, requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+    });
+    await first.create(sideRecoverBuy);
+    await first.create(activePendingSell);
+    await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
+      attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [sideRecoverBuy.id]);
+    assert.equal(await second.claim({
+      ownerId: 'live-side-recover-buy-blocked', leaseMs: 60_000,
+      purpose: 'LIVE_RECOVER', side: 'BUY',
+    }), null);
+    await firstPool.query("UPDATE execution_intents SET expires_at=date_trunc('milliseconds', statement_timestamp() - INTERVAL '1 second') WHERE id=$1", [
+      activePendingSell.id,
+    ]);
+    const recoveredBuy = required(await second.claim({
+      ownerId: 'live-side-recover-buy', leaseMs: 60_000,
+      purpose: 'LIVE_RECOVER', side: 'BUY',
+    }));
+    assert.equal(recoveredBuy.intent.id, sideRecoverBuy.id);
+    await firstPool.query('DELETE FROM execution_intents WHERE id=ANY($1::TEXT[])', [[
+      sideRecoverBuy.id, activePendingSell.id,
+    ]]);
+
+    const signedRecoverBuy = executionDraft('live-side-recover-signed-buy', {
+      requestedAtMs: now - 3_000, expiresAtMs: now - 2_000,
+    });
+    const signedRecoverSell = executionDraft('live-side-recover-signed-sell', {
+      ...sellShape, requestedAtMs: now - 2_000, expiresAtMs: now - 1_000,
+    });
+    await first.create(signedRecoverBuy);
+    await first.create(signedRecoverSell);
+    await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
+      attempt_count=1,last_reason_code='SIGNATURE_PERSISTED'
+      WHERE id=ANY($1::TEXT[])`, [[signedRecoverBuy.id, signedRecoverSell.id]]);
+    assert.equal(await second.claim({
+      ownerId: 'live-side-recover-buy-blocked-by-signed-sell', leaseMs: 60_000,
+      purpose: 'LIVE_RECOVER', side: 'BUY',
+    }), null);
+    const recoveredSell = required(await first.claim({
+      ownerId: 'live-side-recover-sell-first', leaseMs: 60_000,
+      purpose: 'LIVE_RECOVER', side: 'SELL',
+    }));
+    assert.equal(recoveredSell.intent.id, signedRecoverSell.id);
+    await firstPool.query('DELETE FROM execution_intents WHERE id=ANY($1::TEXT[])', [[
+      signedRecoverBuy.id, signedRecoverSell.id,
+    ]]);
+
     const reconciliationStatuses = [
       ['SIGNED_NOT_SUBMITTED', 'SIGNATURE_PERSISTED'],
       ['CONFIRMED', 'CONFIRMATION_OBSERVED'],
@@ -1809,6 +1897,183 @@ void test('LIVE_EXECUTE BUY forces READ COMMITTED and observes an uncommitted SE
       }
     });
   });
+
+void test('LIVE_RECOVER BUY waits for an uncommitted SELL creation and observes it after commit',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: live recovery versus SELL creation race skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, 'execution_live_recover_sell_creation_race', async (
+      firstPool,
+      secondPool,
+    ) => {
+      await migrateDatabase({ pool: firstPool });
+      const first = new PostgresExecutionIntentRepository(firstPool);
+      const second = new PostgresExecutionIntentRepository(secondPool);
+      const now = await databaseNowMs(firstPool);
+      const buy = executionDraft('live-recover-sell-creation-race-buy', {
+        requestedAtMs: now - 2_000, expiresAtMs: now - 1_000,
+      });
+      const sell = executionDraft('live-recover-sell-creation-race-sell', {
+        side: 'SELL', venuePolicy: 'CANONICAL_EXIT', quoteAmountRaw: null, baseAmountRaw: 1n,
+        requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+      });
+      await first.create(buy);
+      await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
+        attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [buy.id]);
+
+      const triggerLockKey = 5_100_093;
+      await firstPool.query(`CREATE FUNCTION block_live_recovery_sell_intent_insert()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        BEGIN
+          IF NEW.side = 'SELL' THEN
+            PERFORM pg_advisory_lock(${triggerLockKey});
+            PERFORM pg_advisory_unlock(${triggerLockKey});
+          END IF;
+          RETURN NEW;
+        END
+        $function$`);
+      await firstPool.query(`CREATE TRIGGER block_live_recovery_sell_intent_insert_trigger
+        AFTER INSERT ON execution_intents FOR EACH ROW
+        EXECUTE FUNCTION block_live_recovery_sell_intent_insert()`);
+
+      const blocker = await secondPool.connect();
+      let blockerLocked = false;
+      let sellCreation: Promise<unknown> | undefined;
+      let buyRecovery: Promise<ClaimedExecutionIntent | null> | undefined;
+      try {
+        await blocker.query('SELECT pg_advisory_lock($1)', [triggerLockKey]);
+        blockerLocked = true;
+        sellCreation = first.create(sell);
+        await waitForDatabaseQuery(firstPool, '%INSERT INTO execution_intents AS intent%');
+
+        buyRecovery = second.claim({
+          ownerId: 'live-recover-sell-creation-race-worker', leaseMs: 60_000,
+          purpose: 'LIVE_RECOVER', side: 'BUY',
+        });
+        const outcome = await Promise.race([
+          buyRecovery.then(() => 'CLAIM_SETTLED' as const),
+          waitForDatabaseQuery(firstPool, '%execution-live-sell-presence:v1%')
+            .then(() => 'CLAIM_BLOCKED' as const),
+        ]);
+        assert.equal(outcome, 'CLAIM_BLOCKED');
+
+        await blocker.query('SELECT pg_advisory_unlock($1)', [triggerLockKey]);
+        blockerLocked = false;
+        assert.equal((await sellCreation as { readonly kind: string }).kind, 'CREATED');
+        assert.equal(await buyRecovery, null);
+      } finally {
+        if (blockerLocked) await blocker.query('SELECT pg_advisory_unlock($1)', [triggerLockKey]);
+        blocker.release();
+        await Promise.allSettled(
+          [sellCreation, buyRecovery].filter((value) => value !== undefined),
+        );
+      }
+    });
+  });
+
+void test('LIVE_RECOVER BUY waits for an uncommitted signed SELL persistence boundary',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: live recovery versus signed SELL race skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, 'execution_live_recover_signed_sell_race', async (
+      firstPool,
+      secondPool,
+    ) => {
+      await migrateDatabase({ pool: firstPool });
+      const first = new PostgresExecutionIntentRepository(firstPool);
+      const second = new PostgresExecutionIntentRepository(secondPool);
+      const now = await databaseNowMs(firstPool);
+      const buy = executionDraft('live-recover-signed-sell-race-buy', {
+        requestedAtMs: now - 3_000, expiresAtMs: now - 2_000,
+      });
+      const sell = executionDraft('live-recover-signed-sell-race-sell', {
+        side: 'SELL', venuePolicy: 'CANONICAL_EXIT', quoteAmountRaw: null, baseAmountRaw: 1n,
+        requestedAtMs: now - 2_000, expiresAtMs: now - 1_000,
+      });
+      await first.create(buy);
+      await first.create(sell);
+      await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
+        attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [buy.id]);
+
+      const signingSession = await firstPool.connect();
+      let transactionOpen = false;
+      let buyRecovery: Promise<ClaimedExecutionIntent | null> | undefined;
+      try {
+        await signingSession.query('BEGIN');
+        transactionOpen = true;
+        await lockLiveSellPresenceInTransaction(signingSession);
+        const persisted = await signingSession.query(`UPDATE execution_intents
+          SET status='SIGNED_NOT_SUBMITTED',attempt_count=1,
+            last_reason_code='SIGNATURE_PERSISTED'
+          WHERE id=$1 AND side='SELL' AND status='PENDING'`, [sell.id]);
+        assert.equal(persisted.rowCount, 1);
+
+        buyRecovery = second.claim({
+          ownerId: 'live-recover-signed-sell-race-worker', leaseMs: 60_000,
+          purpose: 'LIVE_RECOVER', side: 'BUY',
+        });
+        const outcome = await Promise.race([
+          buyRecovery.then(() => 'CLAIM_SETTLED' as const),
+          waitForDatabaseQuery(firstPool, '%execution-live-sell-presence:v1%')
+            .then(() => 'CLAIM_BLOCKED' as const),
+        ]);
+        assert.equal(outcome, 'CLAIM_BLOCKED');
+
+        await signingSession.query('COMMIT');
+        transactionOpen = false;
+        assert.equal(await buyRecovery, null);
+      } finally {
+        if (transactionOpen) await signingSession.query('ROLLBACK');
+        signingSession.release();
+        await Promise.allSettled(
+          [buyRecovery].filter((value) => value !== undefined),
+        );
+      }
+    });
+  });
+
+void test('concurrent LIVE_RECOVER BUY claims elect one winner without deadlock', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: concurrent live recovery claims skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, 'execution_live_recover_buy_concurrency', async (
+    firstPool,
+    secondPool,
+  ) => {
+    await migrateDatabase({ pool: firstPool });
+    const first = new PostgresExecutionIntentRepository(firstPool);
+    const second = new PostgresExecutionIntentRepository(secondPool);
+    const now = await databaseNowMs(firstPool);
+    const buy = executionDraft('live-recover-buy-concurrent', {
+      requestedAtMs: now - 2_000, expiresAtMs: now - 1_000,
+    });
+    await first.create(buy);
+    await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
+      attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [buy.id]);
+
+    const claims = await Promise.all([
+      first.claim({
+        ownerId: 'live-recover-buy-concurrent-a', leaseMs: 60_000,
+        purpose: 'LIVE_RECOVER', side: 'BUY',
+      }),
+      second.claim({
+        ownerId: 'live-recover-buy-concurrent-b', leaseMs: 60_000,
+        purpose: 'LIVE_RECOVER', side: 'BUY',
+      }),
+    ]);
+
+    assert.equal(claims.filter((claim) => claim !== null).length, 1);
+    assert.equal(required(claims.find((claim) => claim !== null)).intent.id, buy.id);
+  });
+});
 
 void test('real PostgreSQL provides replay, concurrent claims, near-boundary reclaim, attempts, and ordered lifecycle journal', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;

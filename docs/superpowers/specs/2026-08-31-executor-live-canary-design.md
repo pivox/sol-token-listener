@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.19
+**Version de spécification :** 1.1.0
 
-**Version de la spécification parente :** 1.8.1
+**Version de la spécification parente :** 1.10.0
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.1.0 — 2026-09-04 :** constate H2b composé et désarmé avec exactement
+  quatre lanes, recover SELL, execute SELL, recover BUY, execute BUY. H2a reste
+  le binaire séparé de finalité, confirmation, réconciliation et deadline. H2c
+  reste propriétaire de l'armement opérateur et du canary, qui n'a pas démarré.
 - **1.0.19 — 2026-09-04 :** exclut les bytes signés des chemins de finalité
   H2a et distingue l'identité réellement observable on-chain des fingerprints
   build/snapshot liés durablement avant la soumission.
@@ -553,11 +557,11 @@ ne remplacent pas un reason code durable lorsqu'un effet peut être ambigu.
 
 ## 15. Gates avant canary réel
 
-Après fusion, la capacité reste inactive et non démarrable. Une PR de
-composition production doit d'abord livrer et tester les claims par côté, les
-read-models de confirmation/réconciliation, le scan atomique des deadlines,
-le gateway RPC borné, le pipeline admission/quote/build et le renouvellement
-des leases. Ensuite seulement, avant tout canary réel, l'opérateur doit fournir
+Après fusion de H2b, la capacité signable est composée mais reste inactive et
+désarmée. H2b exécute uniquement recover SELL, execute SELL, recover BUY,
+execute BUY. H2a reste le binaire distinct responsable de la finalité, de la
+confirmation, de la réconciliation et de la deadline. Ensuite seulement, dans
+H2c et avant tout canary réel, l'opérateur doit fournir
 des preuves fraîches pour les onze gates #51-F, puis :
 
 1. déployer le build exact sur un hôte contrôlé ;
@@ -586,5 +590,5 @@ enchaîne automatiquement et aucune PR ne déclenche la transaction réelle.
 - migrations, build, check, lint, docs, tests backend/frontend et smoke sont
   verts ;
 - #49 reste `NON_EXECUTED / NON_VALIDATED` ;
-- la fusion prépare les fondations du canary sans publier de binaire production,
-  sans l'armer et sans l'exécuter.
+- la fusion publie le binaire H2b sans l'armer ni l'exécuter ; H2c conserve
+  l'armement et la préparation manuelle du canary.

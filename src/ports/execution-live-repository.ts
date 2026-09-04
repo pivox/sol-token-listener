@@ -43,6 +43,34 @@ export interface ExecutionLivePersistSignedInputV1 {
   readonly reservationId: string | null;
   readonly artifact: SignedTransactionArtifactV1;
   readonly unsignedSimulation: ExecutionSimulationEvidenceV1;
+  readonly rpcBudget: Readonly<{
+    readonly payloadVersion: 1;
+    /** Calls already consumed by the unsigned, provider-affine phase. */
+    readonly callsUsed: number;
+    /** Durable upper bound for every RPC call in this execution attempt. */
+    readonly callsLimit: number;
+  }>;
+}
+
+export interface ExecutionLiveRpcCallReservationInputV1 {
+  readonly payloadVersion: 1;
+  readonly claim: ClaimedExecutionIntent;
+  readonly artifactId: string;
+}
+
+export interface ExecutionLiveRpcCallReservationV1 {
+  readonly payloadVersion: 1;
+  readonly artifactId: string;
+  readonly providerId: string;
+  readonly callsReserved: number;
+  readonly callsLimit: number;
+}
+
+/** Artifact and still-held claim committed by the same persistence transaction. */
+export interface ExecutionLivePersistSignedResultV1 {
+  readonly payloadVersion: 1;
+  readonly artifact: SignedTransactionArtifactV1;
+  readonly claim: ClaimedExecutionIntent;
 }
 
 /** Runtime identity re-read immediately before the final no-send/send boundary. */
@@ -57,6 +85,22 @@ export interface ExecutionLiveRuntimeBindingV1 {
   readonly expectedGenesisHash: string;
   readonly observedGenesisHash: string;
   readonly providerId: string;
+}
+
+/**
+ * Claim-bound durable authority resolved immediately before transaction construction/signing.
+ * It contains identifiers only: the final persistence transaction must revalidate and consume it.
+ */
+export interface ExecutionLivePreparationBindingV1 {
+  readonly payloadVersion: 1;
+  readonly side: 'BUY' | 'SELL';
+  readonly generationId: string;
+  readonly qualificationId: string;
+  readonly armamentId: string | null;
+  readonly reservationId: string | null;
+  readonly exitAuthorizationId: string | null;
+  readonly providerId: string;
+  readonly walletPublicKey: string;
 }
 
 /** Fresh provider evidence from isBlockhashValid/getBlockHeight. */
@@ -88,7 +132,8 @@ export interface AuthenticatedSubmissionStartedTransactionV1 {
 
 /**
  * Exact durable state associated with a claimed intent. Raw signed bytes are exposed only for
- * pre-submission states; durable outcomes intentionally carry identity only.
+ * pre-submission states; durable outcomes intentionally carry identity only. Every state whose
+ * lease remains open carries the authoritative claim read with that state; revocation carries null.
  */
 export type ExecutionLiveSignedTransactionInspectionV1 =
   | Readonly<{
@@ -97,14 +142,25 @@ export type ExecutionLiveSignedTransactionInspectionV1 =
     readonly unsignedSimulation: ExecutionSimulationEvidenceV1;
     readonly state: 'PERSISTED' | 'SIGNED_SIMULATED';
     readonly stateRevision: bigint;
+    readonly claim: ClaimedExecutionIntent;
   }>
   | Readonly<{
     readonly payloadVersion: 1;
     readonly artifactId: string;
     readonly signature: string;
     readonly signedTransactionHash: string;
-    readonly state: 'SUBMISSION_STARTED' | 'ACCEPTED' | 'AMBIGUOUS' | 'REVOKED_NO_SEND';
+    readonly state: 'SUBMISSION_STARTED' | 'ACCEPTED' | 'AMBIGUOUS';
     readonly stateRevision: bigint;
+    readonly claim: ClaimedExecutionIntent;
+  }>
+  | Readonly<{
+    readonly payloadVersion: 1;
+    readonly artifactId: string;
+    readonly signature: string;
+    readonly signedTransactionHash: string;
+    readonly state: 'REVOKED_NO_SEND';
+    readonly stateRevision: bigint;
+    readonly claim: null;
   }>;
 
 export interface ExecutionLiveSubmissionOutcomeV1 {
@@ -116,6 +172,13 @@ export interface ExecutionLiveSubmissionOutcomeV1 {
   readonly reasonCode: 'SUBMISSION_ACCEPTED' | 'SUBMISSION_AMBIGUOUS'
     | 'SUBMISSION_SIGNATURE_MISMATCH';
   readonly observedAtMs: number;
+}
+
+/** Durable submission outcome paired with its post-transition claim. */
+export interface ExecutionLiveSubmissionOutcomeResultV1 {
+  readonly payloadVersion: 1;
+  readonly artifact: SignedTransactionArtifactV1;
+  readonly claim: ClaimedExecutionIntent;
 }
 
 export interface ExecutionLiveConfirmationV1 {
@@ -162,7 +225,17 @@ export interface ExecutionDeadlineExitResultV1 {
 }
 
 export interface ExecutionLiveRepository {
-  persistSigned(input: ExecutionLivePersistSignedInputV1): Promise<SignedTransactionArtifactV1>;
+  readPreparationBinding(input: Readonly<{
+    readonly claim: ClaimedExecutionIntent;
+    readonly generationId: string;
+    readonly runtime: ExecutionLiveRuntimeBindingV1;
+  }>): Promise<ExecutionLivePreparationBindingV1>;
+  persistSigned(
+    input: ExecutionLivePersistSignedInputV1,
+  ): Promise<ExecutionLivePersistSignedResultV1>;
+  reserveRpcCall(
+    input: ExecutionLiveRpcCallReservationInputV1,
+  ): Promise<ExecutionLiveRpcCallReservationV1>;
   inspectSignedTransaction(input: Readonly<{
     readonly claim: ClaimedExecutionIntent;
     readonly artifactId?: string;
@@ -188,7 +261,7 @@ export interface ExecutionLiveRepository {
   recordSubmissionOutcome(
     claim: ClaimedExecutionIntent,
     outcome: ExecutionLiveSubmissionOutcomeV1,
-  ): Promise<SignedTransactionArtifactV1>;
+  ): Promise<ExecutionLiveSubmissionOutcomeResultV1>;
   recordConfirmation(
     claim: ClaimedExecutionIntent,
     confirmation: ExecutionLiveConfirmationV1,

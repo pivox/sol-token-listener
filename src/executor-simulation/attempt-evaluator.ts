@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isProxy } from 'node:util/types';
 import {
   AccountLayout,
   getAssociatedTokenAddressSync,
@@ -57,6 +58,9 @@ import type {
 } from '../ports/execution-market-gateway.js';
 import type { ReadonlyAccountSnapshot } from '../ports/market-rpc-reader.js';
 import type {
+  ExecutionSimulationEvidenceV1,
+  ExecutionSimulationGateway,
+  ExecutionSimulationGatewayRequestV1,
   ExecutionSimulationGatewayStage,
   ExecutionSimulationPartialEvidenceV1,
 } from '../ports/execution-simulation-gateway.js';
@@ -100,6 +104,10 @@ export type ExecutionAttemptRenewBoundary =
   | 'BEFORE_CANONICAL_SNAPSHOT'
   | 'BEFORE_SIMULATION';
 
+export type ExecutionLiveAttemptRenewBoundary =
+  | ExecutionAttemptRenewBoundary
+  | 'BEFORE_SIGNING';
+
 export interface ExecutionAttemptEvaluationContext {
   readonly claim: ClaimedExecutionIntent;
   readonly attempt: Readonly<{
@@ -115,6 +123,32 @@ export interface ExecutionAttemptEvaluator {
     signal: AbortSignal,
     renew: (boundary: ExecutionAttemptRenewBoundary) => Promise<void>,
   ) => Promise<ExecutionSimulationArtifactDraftV1>;
+}
+
+export interface ExecutionLiveAttemptCandidateV1 {
+  readonly payloadVersion: 1;
+}
+
+export type ExecutionLiveAttemptEvaluationResultV1 =
+  | Readonly<{
+      readonly payloadVersion: 1;
+      readonly outcome: 'SUCCESS';
+      readonly artifact: ExecutionSimulationArtifactDraftV1;
+      readonly candidate: ExecutionLiveAttemptCandidateV1;
+    }>
+  | Readonly<{
+      readonly payloadVersion: 1;
+      readonly outcome: 'FAILURE';
+      readonly artifact: ExecutionSimulationArtifactDraftV1;
+      readonly candidate: null;
+    }>;
+
+export interface LiveExecutionAttemptEvaluator {
+  readonly evaluate: (
+    context: ExecutionAttemptEvaluationContext,
+    signal: AbortSignal,
+    renew: (boundary: ExecutionLiveAttemptRenewBoundary) => Promise<void>,
+  ) => Promise<ExecutionLiveAttemptEvaluationResultV1>;
 }
 
 export type ExecutionAttemptEvaluatorErrorCode = 'OPERATION_ABORTED';
@@ -148,6 +182,43 @@ export interface ExecutionAttemptEvaluatorDependencies {
   readonly clock?: () => number;
 }
 
+type LiveQuoteWindowV1 = Readonly<{
+  readonly quoteObservedAtMs: number;
+  readonly quoteExpiresAtMs: number;
+}>;
+
+type LiveAttemptPreparer = Readonly<{
+  readonly prepare: (
+    input: ExecutionSimulationGatewayRequestV1,
+    quoteWindow: LiveQuoteWindowV1,
+    beforeSign: () => Promise<void>,
+    signal: AbortSignal,
+  ) => Promise<Readonly<{
+    readonly payloadVersion: 1;
+    readonly evidence: ExecutionSimulationEvidenceV1;
+    readonly candidate: ExecutionLiveAttemptCandidateV1;
+  }>>;
+}>;
+
+type LiveAttemptPreparerFactory = (
+  simulationGateway: ExecutionSimulationGateway,
+) => LiveAttemptPreparer;
+
+type AttemptTerminal<Candidate> = (
+  simulationGateway: ExecutionSimulationGateway,
+  input: ExecutionSimulationGatewayRequestV1,
+  quoteWindow: LiveQuoteWindowV1,
+  signal: AbortSignal,
+) => Promise<Readonly<{
+  readonly evidence: ExecutionSimulationEvidenceV1;
+  readonly candidate: Candidate;
+}>>;
+
+interface EvaluationCompletion<Candidate> {
+  readonly artifact: ExecutionSimulationArtifactDraftV1;
+  readonly candidate: Candidate | null;
+}
+
 type EvaluationStage = 'PROVIDER' | 'QUOTE' | 'ROUTE' | 'BUILD' | 'FENCE' | 'SIMULATION';
 
 interface EvaluationState {
@@ -179,18 +250,38 @@ export function createExecutionAttemptEvaluator(
       context: ExecutionAttemptEvaluationContext,
       signal: AbortSignal,
       renew: (boundary: ExecutionAttemptRenewBoundary) => Promise<void>,
-    ) => evaluateAttempt(
-      dependencies, context, signal, renew,
-    ),
+    ) => (await evaluateAttempt(
+      dependencies, context, signal, renew, simulationOnlyTerminal,
+    )).artifact,
   });
 }
 
-async function evaluateAttempt(
+export function createLiveExecutionAttemptEvaluator(
+  dependencies: ExecutionAttemptEvaluatorDependencies,
+  preparerFactory: LiveAttemptPreparerFactory,
+): LiveExecutionAttemptEvaluator {
+  return Object.freeze({
+    evaluate: async (
+      context: ExecutionAttemptEvaluationContext,
+      signal: AbortSignal,
+      renew: (boundary: ExecutionLiveAttemptRenewBoundary) => Promise<void>,
+    ) => liveEvaluationResult(await evaluateAttempt(
+      dependencies,
+      context,
+      signal,
+      renew,
+      liveTerminal(preparerFactory, renew),
+    )),
+  });
+}
+
+async function evaluateAttempt<Candidate>(
   dependencies: ExecutionAttemptEvaluatorDependencies,
   context: ExecutionAttemptEvaluationContext,
   signal: AbortSignal,
   renew: (boundary: ExecutionAttemptRenewBoundary) => Promise<void>,
-): Promise<ExecutionSimulationArtifactDraftV1> {
+  terminal: AttemptTerminal<Candidate>,
+): Promise<EvaluationCompletion<Candidate>> {
   const receiptAuthority = new BuildReceiptAuthority();
   const state: EvaluationState = {
     stage: 'PROVIDER', renewalsCompleted: 0,
@@ -199,23 +290,24 @@ async function evaluateAttempt(
   };
   try {
     return await evaluateAttemptCore(
-      dependencies, context, signal, renew, receiptAuthority, state,
+      dependencies, context, signal, renew, receiptAuthority, state, terminal,
     );
   } catch (error) {
     const draft = failureArtifactOrThrow(dependencies, context, signal, state, error);
     await completeTerminalRenewals(renew, signal, state);
-    return draft;
+    return Object.freeze({ artifact: draft, candidate: null });
   }
 }
 
-async function evaluateAttemptCore(
+async function evaluateAttemptCore<Candidate>(
   dependencies: ExecutionAttemptEvaluatorDependencies,
   context: ExecutionAttemptEvaluationContext,
   signal: AbortSignal,
   renew: (boundary: ExecutionAttemptRenewBoundary) => Promise<void>,
   receiptAuthority: BuildReceiptAuthority,
   state: EvaluationState,
-): Promise<ExecutionSimulationArtifactDraftV1> {
+  terminal: AttemptTerminal<Candidate>,
+): Promise<EvaluationCompletion<Candidate>> {
   requireActive(signal);
   const intent = context.claim.intent;
   const config = dependencies.config;
@@ -269,6 +361,7 @@ async function evaluateAttemptCore(
       route.pool,
       discovery,
       state,
+      terminal,
     );
   }
   const addresses = pumpFunFinalAddresses(intent.mint, config.executorPublicKey, discovered.baseTokenProgram);
@@ -340,30 +433,13 @@ async function evaluateAttemptCore(
   await renewAndRecord(renew, 'BEFORE_SIMULATION', signal, state);
   state.stage = 'QUOTE';
   requireFresh(quote, intent.expiresAtMs, now(dependencies.clock));
-  const gateway = new SolanaSimulationGateway(session, receiptAuthority, Object.freeze({
-    maxTransactionBytes: 1_232,
-    maxComputeUnits: config.maxComputeUnits,
-    maxFeeLamports: config.maxFeeLamports,
-    maxFeePayerLamportDebit: config.maxFeePayerLamportDebit,
-  }));
-  state.stage = 'SIMULATION';
-  const evidence = await gateway.simulate(Object.freeze({
-    plan,
-    snapshot,
-    receipt: receiptAuthority.issue(plan, snapshot),
-  }), signal);
-  requireFresh(quote, intent.expiresAtMs, now(dependencies.clock));
-  return successArtifact(
-    context,
-    config,
-    genesis,
-    quote,
-    evidence,
-    session.usage().rpcCallsUsed,
+  return completeSuccessfulEvaluation(
+    dependencies, receiptAuthority, context, signal, session, genesis,
+    quote, plan, snapshot, state, terminal,
   );
 }
 
-async function evaluatePumpSwap(
+async function evaluatePumpSwap<Candidate>(
   dependencies: ExecutionAttemptEvaluatorDependencies,
   receiptAuthority: BuildReceiptAuthority,
   context: ExecutionAttemptEvaluationContext,
@@ -375,7 +451,8 @@ async function evaluatePumpSwap(
   poolProof: ExecutionVenuePool,
   discovery: ExecutionAddressDiscovery,
   state: EvaluationState,
-): Promise<ExecutionSimulationArtifactDraftV1> {
+  terminal: AttemptTerminal<Candidate>,
+): Promise<EvaluationCompletion<Candidate>> {
   const intent = context.claim.intent;
   const config = dependencies.config;
   const addresses = pumpSwapFinalAddresses(
@@ -469,27 +546,124 @@ async function evaluatePumpSwap(
   await renewAndRecord(renew, 'BEFORE_SIMULATION', signal, state);
   state.stage = 'QUOTE';
   requireFresh(quote, intent.expiresAtMs, now(dependencies.clock));
+  return completeSuccessfulEvaluation(
+    dependencies, receiptAuthority, context, signal, session, genesis,
+    quote, plan, snapshot, state, terminal,
+  );
+}
+
+async function completeSuccessfulEvaluation<Candidate>(
+  dependencies: ExecutionAttemptEvaluatorDependencies,
+  receiptAuthority: BuildReceiptAuthority,
+  context: ExecutionAttemptEvaluationContext,
+  signal: AbortSignal,
+  session: ExecutionDiscoveryMarketGateway,
+  genesis: ExecutionGenesisEvidence,
+  quote: ExecutionQuoteV1,
+  plan: ExecutionSimulationGatewayRequestV1['plan'],
+  snapshot: ExecutionAccountSnapshot,
+  state: EvaluationState,
+  terminal: AttemptTerminal<Candidate>,
+): Promise<EvaluationCompletion<Candidate>> {
+  const config = dependencies.config;
   const gateway = new SolanaSimulationGateway(session, receiptAuthority, Object.freeze({
     maxTransactionBytes: 1_232,
     maxComputeUnits: config.maxComputeUnits,
     maxFeeLamports: config.maxFeeLamports,
     maxFeePayerLamportDebit: config.maxFeePayerLamportDebit,
   }));
-  state.stage = 'SIMULATION';
-  const evidence = await gateway.simulate(Object.freeze({
+  const request = Object.freeze({
     plan,
     snapshot,
     receipt: receiptAuthority.issue(plan, snapshot),
-  }), signal);
-  requireFresh(quote, intent.expiresAtMs, now(dependencies.clock));
-  return successArtifact(
-    context,
-    config,
-    genesis,
-    quote,
-    evidence,
-    session.usage().rpcCallsUsed,
-  );
+  });
+  const quoteWindow = Object.freeze({
+    quoteObservedAtMs: quote.observedAtMs,
+    quoteExpiresAtMs: quote.expiresAtMs,
+  });
+  state.stage = 'SIMULATION';
+  const completed = await terminal(gateway, request, quoteWindow, signal);
+  requireFresh(quote, context.claim.intent.expiresAtMs, now(dependencies.clock));
+  return Object.freeze({
+    artifact: successArtifact(
+      context,
+      config,
+      genesis,
+      quote,
+      completed.evidence,
+      session.usage().rpcCallsUsed,
+    ),
+    candidate: completed.candidate,
+  });
+}
+
+const simulationOnlyTerminal: AttemptTerminal<null> = async (
+  gateway,
+  input,
+  _quoteWindow,
+  signal,
+) => Object.freeze({
+  evidence: await gateway.simulate(input, signal),
+  candidate: null,
+});
+
+function liveTerminal(
+  preparerFactory: LiveAttemptPreparerFactory,
+  renew: (boundary: ExecutionLiveAttemptRenewBoundary) => Promise<void>,
+): AttemptTerminal<ExecutionLiveAttemptCandidateV1> {
+  return async (gateway, input, quoteWindow, signal) => {
+    const prepared = await preparerFactory(gateway).prepare(
+      input,
+      quoteWindow,
+      () => renewBoundary(renew, 'BEFORE_SIGNING', signal),
+      signal,
+    );
+    if (!opaqueLiveCandidate(prepared.candidate)) {
+      throw new TypeError('Invalid live attempt candidate.');
+    }
+    return Object.freeze({
+      evidence: prepared.evidence,
+      candidate: prepared.candidate,
+    });
+  };
+}
+
+function liveEvaluationResult(
+  completion: EvaluationCompletion<ExecutionLiveAttemptCandidateV1>,
+): ExecutionLiveAttemptEvaluationResultV1 {
+  if (completion.candidate === null) {
+    if (completion.artifact.resultKind === 'SUCCESS') {
+      throw new TypeError('Missing live attempt candidate.');
+    }
+    return Object.freeze({
+      payloadVersion: 1,
+      outcome: 'FAILURE',
+      artifact: completion.artifact,
+      candidate: null,
+    });
+  }
+  if (completion.artifact.resultKind !== 'SUCCESS') {
+    throw new TypeError('Unexpected live attempt candidate.');
+  }
+  return Object.freeze({
+    payloadVersion: 1,
+    outcome: 'SUCCESS',
+    artifact: completion.artifact,
+    candidate: completion.candidate,
+  });
+}
+
+function opaqueLiveCandidate(value: unknown): value is ExecutionLiveAttemptCandidateV1 {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)
+    || isProxy(value) || !Object.isFrozen(value) || Object.getPrototypeOf(value) !== null) {
+    return false;
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== 1 || keys[0] !== 'payloadVersion') return false;
+  const payloadVersion = Object.getOwnPropertyDescriptor(value, 'payloadVersion');
+  return payloadVersion !== undefined && 'value' in payloadVersion
+    && payloadVersion.value === 1 && payloadVersion.enumerable === true
+    && payloadVersion.configurable === false && payloadVersion.writable === false;
 }
 
 function pumpSwapFinalAddresses(
@@ -1178,9 +1352,9 @@ function now(clock: (() => number) | undefined): number {
   return value;
 }
 
-async function renewBoundary(
-  renew: (boundary: ExecutionAttemptRenewBoundary) => Promise<void>,
-  boundary: ExecutionAttemptRenewBoundary,
+async function renewBoundary<Boundary extends ExecutionLiveAttemptRenewBoundary>(
+  renew: (boundary: Boundary) => Promise<void>,
+  boundary: Boundary,
   signal: AbortSignal,
 ): Promise<void> {
   requireActive(signal);

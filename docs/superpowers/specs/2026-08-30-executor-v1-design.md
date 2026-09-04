@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.9.5
+**Version de spécification :** 1.10.1
 
 **Date :** 2026-08-31
 
@@ -9,10 +9,20 @@
 **Issue parente :** #51
 
 **Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes
-#51-H1 et runtime de finalité read-only #51-H2a
+#51-H1, runtime de finalité read-only #51-H2a et runtime signable désarmé #51-H2b
 
 ## Historique des versions
 
+- **1.10.1 — 2026-09-04 :** rend le budget RPC H2b durable par tentative.
+  Chaque appel est réservé en PostgreSQL avant le contact provider ; une
+  reprise ou un redémarrage conserve le compteur et ne peut donc pas
+  réinitialiser `EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT`.
+- **1.10.0 — 2026-09-04 :** livre H2b comme binaire signable séparé et désarmé,
+  avec exactement quatre lanes ordonnées : recover SELL, execute SELL, recover BUY, execute BUY.
+  H2a reste seul responsable de la finalité, de la
+  confirmation, de la réconciliation et de la deadline ; H2c reste seul
+  responsable de l'armement opérateur et du canary. L'état reste
+  `CANARY_NOT_STARTED` et `NON_EXECUTED / NON_VALIDATED`.
 - **1.9.5 — 2026-09-04 :** rend concluante l'absence finalisée d'une
   transaction H2a après expiration du blockhash, afin de libérer durablement
   intents et réservations avec `NO_EFFECT`.
@@ -878,7 +888,7 @@ par l'API publique :
 
 ```bash
 npm run executor:live:recovery:start
-# Réservé à #51-H2b, non publié par #51-H2a : executor:live:start
+npm run executor:live:start
 npm run live:preflight
 npm run live:status
 npm run live:arm -- --phase=canary

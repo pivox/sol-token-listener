@@ -58,7 +58,10 @@ void test('rejects every alternate secret variable and hostile environment shape
     'SOLANA_PRIVATE_KEY', 'SOLANA_PRIVATE_KEY_BASE58', 'SOLANA_SECRET_KEY',
     'SOLANA_KEYPAIR', 'SOLANA_KEYPAIR_PATH', 'WALLET_PRIVATE_KEY',
     'WALLET_KEYPAIR', 'WALLET_KEYPAIR_PATH', 'ANCHOR_WALLET',
-  ]) assertConfigFailure(environment({ [key]: 'sensitive-marker' }), ['sensitive-marker']);
+  ]) {
+    assertConfigFailure(environment({ [key]: 'sensitive-marker' }), ['sensitive-marker']);
+    assertConfigFailure(environment({ [key]: '' }));
+  }
 
   const getter = environment();
   Object.defineProperty(getter, 'DATABASE_URL', {
@@ -87,6 +90,7 @@ void test('keeps all financial and duration values canonical and bounded', () =>
     { EXECUTOR_MAX_COMPUTE_UNITS: '0' },
     { EXECUTOR_MAX_PRIORITY_FEE_LAMPORTS: '1' },
     { EXECUTOR_RPC_TIMEOUT_MS: '0' },
+    { EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '11' },
     { EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '17' },
   ]) assertConfigFailure(environment(overrides));
 });
@@ -120,7 +124,7 @@ function environment(overrides: Readonly<Record<string, string | undefined>> = {
     EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT: '2500000',
     EXECUTOR_MAX_PRIORITY_FEE_LAMPORTS: '0',
     EXECUTOR_RPC_TIMEOUT_MS: '5000',
-    EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '8',
+    EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT: '12',
     ...overrides,
   };
 }
