@@ -43,6 +43,9 @@ GRANT USAGE ON SCHEMA public
 TO sol_token_executor_live,sol_token_executor_operations,sol_token_operator_reader,
   sol_token_retention_worker;
 
+GRANT SELECT ON TABLE migration_history
+TO sol_token_executor_live;
+
 -- The scheduled retention process is a separate trust boundary. Reset every
 -- table capability on rerun, then grant only what purgeExpiredFoundationData
 -- executes. In particular it never receives table-wide SELECT on signed bytes.

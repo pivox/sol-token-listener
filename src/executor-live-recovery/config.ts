@@ -15,9 +15,6 @@ export interface LiveRecoveryConfig {
   readonly providerId: string;
   readonly httpRpcUrl: string;
   readonly expectedGenesisHash: string;
-  readonly buildHash: string;
-  readonly configurationFingerprint: string;
-  readonly strategyFingerprint: string;
   readonly rpcTimeoutMs: number;
   readonly maxRpcCallsPerPass: number;
   readonly ownerId: string;
@@ -80,11 +77,6 @@ export function parseLiveRecoveryConfig(value: unknown): LiveRecoveryConfig {
       ),
       httpRpcUrl: httpUrl(environment, 'SOLANA_HTTP_RPC_URL'),
       expectedGenesisHash: publicKey(environment, 'SOLANA_EXPECTED_GENESIS_HASH'),
-      buildHash: fingerprint(environment, 'EXECUTOR_BUILD_HASH'),
-      configurationFingerprint: fingerprint(
-        environment, 'EXECUTOR_CONFIGURATION_FINGERPRINT',
-      ),
-      strategyFingerprint: fingerprint(environment, 'EXECUTOR_STRATEGY_FINGERPRINT'),
       rpcTimeoutMs,
       maxRpcCallsPerPass: integer(
         environment, 'EXECUTOR_MAX_RPC_CALLS_PER_PASS', 6, 16,
@@ -144,13 +136,6 @@ function publicKey(
   const value = text(environment, key, 64);
   if (new PublicKey(value).toBase58() !== value) reject();
   return value;
-}
-
-function fingerprint(
-  environment: Readonly<Record<string, string | undefined>>,
-  key: string,
-): string {
-  return pattern(environment, key, /^[0-9a-f]{64}$/u, 64);
 }
 
 function httpUrl(

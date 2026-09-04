@@ -16,8 +16,7 @@ void test('parses and freezes the exact read-only finality runtime configuration
     executorPublicKey: '11111111111111111111111111111111',
     providerId: 'primary', httpRpcUrl: 'https://credential@rpc.example.test/solana',
     expectedGenesisHash: '11111111111111111111111111111111',
-    buildHash: 'b'.repeat(64), configurationFingerprint: 'c'.repeat(64),
-    strategyFingerprint: 'd'.repeat(64), rpcTimeoutMs: 5_000,
+    rpcTimeoutMs: 5_000,
     maxRpcCallsPerPass: 8, ownerId: 'live-recovery-a',
   });
   assert.equal(Object.isFrozen(config), true);
@@ -36,9 +35,6 @@ void test('fails closed unless recovery, live mode and mainnet are explicit', ()
     { EXECUTOR_RPC_PROVIDER_ID: undefined },
     { SOLANA_HTTP_RPC_URL: undefined },
     { SOLANA_EXPECTED_GENESIS_HASH: undefined },
-    { EXECUTOR_BUILD_HASH: undefined },
-    { EXECUTOR_CONFIGURATION_FINGERPRINT: undefined },
-    { EXECUTOR_STRATEGY_FINGERPRINT: undefined },
     { EXECUTOR_LIVE_RECOVERY_OWNER_ID: undefined },
   ]) assertFailure(environment(overrides));
 });
@@ -93,9 +89,6 @@ function environment(overrides: Readonly<Record<string, string | undefined>> = {
     EXECUTOR_RPC_PROVIDER_ID: 'primary',
     SOLANA_HTTP_RPC_URL: 'https://credential@rpc.example.test/solana',
     SOLANA_EXPECTED_GENESIS_HASH: '11111111111111111111111111111111',
-    EXECUTOR_BUILD_HASH: 'b'.repeat(64),
-    EXECUTOR_CONFIGURATION_FINGERPRINT: 'c'.repeat(64),
-    EXECUTOR_STRATEGY_FINGERPRINT: 'd'.repeat(64),
     EXECUTOR_POLL_MS: '1000',
     EXECUTOR_LEASE_MS: '60000',
     EXECUTOR_DB_STATEMENT_TIMEOUT_MS: '3000',

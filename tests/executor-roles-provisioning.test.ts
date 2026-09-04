@@ -77,6 +77,7 @@ void test('executor role provisioning is explicit, passwordless and least-privil
 void test('signed live capability is visible only to the dedicated executor role', async () => {
   const sql = await readFile(scriptUrl, 'utf8');
   assert.match(sql, /GRANT USAGE ON SCHEMA public[\s\S]*?sol_token_executor_live/iu);
+  assert.match(sql, /GRANT SELECT ON TABLE migration_history\s+TO sol_token_executor_live/iu);
   assert.match(sql, /REVOKE ALL ON TABLE\s+execution_signed_transactions,\s+execution_live_unsigned_simulation_evidence,\s+execution_signed_simulation_evidence,\s+execution_submission_preflight_evidence,\s+execution_pre_submission_revocations,\s+execution_submission_events,\s+execution_live_positions,\s+execution_exit_authorizations,\s+execution_reconciliation_evidence\s+FROM PUBLIC,sol_token_listener_writer,sol_token_executor_worker,\s+sol_token_executor_operations,sol_token_operator_reader,sol_token_public_api/iu);
   assert.match(sql, /REVOKE UPDATE ON TABLE\s+execution_signed_transactions,[\s\S]*?execution_reconciliation_evidence\s+FROM sol_token_executor_live/iu);
   assert.match(sql, /GRANT INSERT ON TABLE\s+execution_signed_transactions,\s+execution_live_positions,\s+execution_exit_authorizations\s+TO sol_token_executor_live/iu);

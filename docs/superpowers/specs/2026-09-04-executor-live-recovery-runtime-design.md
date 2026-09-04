@@ -1,6 +1,6 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.0.1
 
 **Version de la spécification parente :** 1.8.0
 
@@ -13,6 +13,11 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.1 — 2026-09-04 :** limite les bindings de démarrage à ceux qui
+  déterminent réellement la finalité : génération, wallet, cluster, genesis
+  et provider. Les fingerprints build/configuration/stratégie historiques
+  restent validés par les read-models durables ; les épingler au binaire H2a
+  empêcherait à tort de finaliser un ordre ancien après un déploiement.
 - **1.0.0 — 2026-09-04 :** sépare la composition live en deux capacités. H2a
   publie un runtime de finalité strictement incapable de signer ou soumettre ;
   H2b restera propriétaire de la reprise signée et des lanes d'exécution.
@@ -118,14 +123,19 @@ L'ordre est obligatoire :
 3. vérifier le rôle courant attendu ;
 4. vérifier que l'historique de migrations correspond exactement au catalogue
    versionné jusqu'à `037_execution_live_orchestration.sql` ;
-5. vérifier la génération wallet et les bindings provider, build,
-   configuration et stratégie déjà persistés pour les travaux ouverts ;
+5. vérifier la génération wallet, le provider et l'absence de travail ouvert
+   lié à une autre génération, un autre wallet ou un autre provider ;
 6. créer le client RPC de lecture ;
 7. vérifier le genesis hash ;
 8. créer les lanes puis lancer la boucle.
 
 Une divergence ferme le processus avant toute mutation métier. H2a n'applique
 pas les migrations et ne provisionne pas les rôles au démarrage.
+
+Les fingerprints build, configuration et stratégie restent inclus et validés
+dans chaque read-model H1. Ils ne sont pas épinglés à la version courante de
+H2a : une confirmation ou réconciliation historique doit rester possible
+après le déploiement d'un nouveau build.
 
 Le catalogue de migrations associe chaque nom au SHA-256 de son contenu. Cette
 preuve détecte aussi une migration historique modifiée après déploiement. Le
