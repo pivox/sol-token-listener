@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.15
+**Version de spécification :** 1.0.16
 
-**Version de la spécification parente :** 1.7.15
+**Version de la spécification parente :** 1.7.16
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,11 @@
 
 ## Historique des versions
 
+- **1.0.16 — 2026-09-04 :** sérialise la priorité SELL avec un verrou advisory
+  partagé par toutes les créations SELL et les claims BUY live. Un BUY ne peut
+  plus observer l'absence d'un SELL dont l'insertion concurrente n'est pas
+  encore commitée ; son `READ COMMITTED` explicite neutralise aussi un défaut
+  de session PostgreSQL configuré en `REPEATABLE READ`.
 - **1.0.15 — 2026-09-01 :** durcit les primitives H1 sans composer de runtime :
   identité d'artefact recalculée depuis les champs causaux, valeurs Solana
   décodées canoniquement, matrice d'états fermée et temps de deadline borné par

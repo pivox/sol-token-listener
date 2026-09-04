@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.1.4 — 2026-09-01
+**Version :** 1.1.5 — 2026-09-04
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime. Le binaire production est actuellement
@@ -31,6 +31,14 @@ confirmation et réconciliation, ainsi que le scan atomique des sorties à
 deadline. Ils ne composent aucun RPC, signer, appel de soumission, runtime de
 production ou entrypoint. Ces capacités restent réservées à #51-H2 ; tout
 canary restera en plus soumis à un armement manuel distinct.
+
+La priorité SELL est protégée transactionnellement : chaque création SELL et
+chaque claim BUY live prennent le même verrou advisory de présence SELL. Le
+claim BUY impose `READ COMMITTED`, forme ensuite un nouveau snapshot PostgreSQL
+et reste vide dès qu'un SELL exécutable existe, même lorsque le rôle configure
+une isolation par défaut plus forte. Le scanner de deadline prend ses verrous
+dans l'ordre global scan, présence SELL, génération afin d'éviter inversion et
+interblocage.
 
 Le dernier verrou PostgreSQL est atomique : avant `SUBMISSION_STARTED`, il
 revalide la génération active, les bindings runtime/déploiement, le provider,

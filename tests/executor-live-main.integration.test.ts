@@ -55,7 +55,7 @@ void test('H1 remains non-live and records its exact operational boundary', asyn
   assert.equal(packageJson.scripts?.['executor:live:start'], undefined);
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.7.15',
+    '**Version de spécification :** 1.7.16',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -66,32 +66,32 @@ void test('H1 remains non-live and records its exact operational boundary', asyn
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.0.15',
+    '**Version de spécification :** 1.0.16',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.7.15',
+    '**Version de la spécification parente :** 1.7.16',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
     orchestrationSpecification,
-    '**Version de spécification :** 1.0.2',
+    '**Version de spécification :** 1.0.3',
     'orchestration specification version',
   );
   assertContainsExactlyOnce(
     orchestrationSpecification,
-    '**Version de la spécification parente :** 1.7.15',
+    '**Version de la spécification parente :** 1.7.16',
     'orchestration parent specification version',
   );
   assertContainsExactlyOnce(
     orchestrationSpecification,
-    '**Version de la fondation live :** 1.0.15',
+    '**Version de la fondation live :** 1.0.16',
     'orchestration live foundation version',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.1.4 — 2026-09-01',
+    '**Version :** 1.1.5 — 2026-09-04',
     'runbook version',
   );
 

@@ -1,10 +1,10 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
-**Version de la spécification parente :** 1.7.15
+**Version de la spécification parente :** 1.7.16
 
-**Version de la fondation live :** 1.0.15
+**Version de la fondation live :** 1.0.16
 
 **Date :** 2026-09-01
 
@@ -13,6 +13,13 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.3 — 2026-09-04 :** sérialise toute création d'intention SELL et tout
+  claim BUY live par le verrou advisory partagé
+  `execution-live-sell-presence:v1`. Le snapshot `NOT EXISTS` du claim BUY ne
+  peut ainsi ignorer un SELL concurrent non encore commité, même si le rôle
+  PostgreSQL configure par défaut `REPEATABLE READ` : la transaction BUY
+  impose explicitement `READ COMMITTED`. Le scanner de deadline respecte
+  l'ordre global, présence SELL, horloge DB, génération.
 - **1.0.2 — 2026-09-01 :** impose aux read-models le recalcul de l'identité
   causale de l'artefact sans lire ses bytes, le décodage base58 canonique des
   valeurs Solana et une matrice fermée intention/artefact. L'API ciblée de
@@ -88,8 +95,10 @@ complète sans rendre le dépôt démarrable en live prématurément.
 6. Confirmation et réconciliation ne lisent ni ne retournent les bytes signés.
 7. Toute lecture worker-ready revalide owner, token, statut, révision et
    expiration du lease après les verrous avec une heure DB fraîche.
-8. Le scan de deadline utilise exclusivement l'heure DB et respecte l'ordre de
-   verrous : scan global, génération, puis lignes métier.
+8. Toute création SELL et tout claim BUY live prennent le verrou advisory
+   partagé `execution-live-sell-presence:v1` avant de décider de la présence
+   d'un SELL. Le scan de deadline respecte l'ordre : scan global, présence
+   SELL, horloge DB, génération, puis lignes métier.
 9. Les montants, slots, hauteurs, frais et révisions restent des `bigint`.
 10. Un commit inconnu, un crash ou un lease expiré se résout par rejeu exact ;
     jamais par création d'un second ordre.
@@ -126,7 +135,14 @@ simulation-only. Le runtime live doit utiliser exclusivement `LIVE_EXECUTE`.
 
 `LIVE_EXECUTE + BUY` sélectionne uniquement un BUY dans les mêmes statuts et
 ajoute un `NOT EXISTS` sur toute intention SELL live exécutable. La priorité ne
-dépend donc pas seulement de l'ordre des closures du runtime.
+dépend donc pas seulement de l'ordre des closures du runtime. Avant ce
+snapshot, la transaction prend
+`hashtextextended('execution-live-sell-presence:v1', 51008)`. Toute création
+SELL prend le même verrou avant son insertion ; un SELL concurrent ne peut
+donc rester invisible dans un snapshot antérieur à son commit. La transaction
+du claim BUY commence explicitement avec `BEGIN ISOLATION LEVEL READ
+COMMITTED` afin que la requête suivant l'attente forme un snapshot frais,
+indépendamment de la configuration par défaut de la session PostgreSQL.
 
 ### 4.3 Reprise
 
@@ -197,12 +213,14 @@ La transaction :
 
 1. prend le verrou advisory global
    `hashtextextended('execution-live-deadline-scan:v1', 51007)` ;
-2. capture une heure PostgreSQL tronquée à la milliseconde ;
-3. sélectionne la plus ancienne position `OPEN` dont `exit_deadline_at <= now` ;
-4. prend le verrou advisory de sa génération ;
-5. relit et verrouille la position ;
-6. factorise la mutation existante de `createDeadlineExitIntent` ;
-7. crée ou rejoue l'unique intention SELL
+2. prend le verrou de présence SELL
+   `hashtextextended('execution-live-sell-presence:v1', 51008)` ;
+3. capture une heure PostgreSQL tronquée à la milliseconde ;
+4. sélectionne la plus ancienne position `OPEN` dont `exit_deadline_at <= now` ;
+5. prend le verrou advisory de sa génération ;
+6. relit et verrouille la position ;
+7. factorise la mutation existante de `createDeadlineExitIntent` ;
+8. crée ou rejoue l'unique intention SELL
    `maximum-holding:<positionId>` et passe la position à `EXIT_PENDING`.
 
 Si aucune position n'est due, la méthode retourne `null`. Deux scanners, un

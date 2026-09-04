@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.15
+**Version de spécification :** 1.7.16
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,11 @@
 
 ## Historique des versions
 
+- **1.7.16 — 2026-09-04 :** ferme la course entre un claim BUY live et la
+  création concurrente d'un SELL avec un verrou advisory transactionnel
+  partagé. Toutes les voies de création SELL participent au même fence ; le
+  claim BUY impose `READ COMMITTED` pour former son snapshot après l'attente,
+  et le scanner conserve un ordre de verrous global déterministe.
 - **1.7.15 — 2026-09-01 :** ferme la lecture des travaux H1 sur l'identité
   causale déterministe des artefacts, le décodage Solana canonique et les
   couples exacts entre états d'intention et d'artefact. Les sorties ciblées
