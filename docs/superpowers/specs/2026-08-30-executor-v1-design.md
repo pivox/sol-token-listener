@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.9.4
+**Version de spécification :** 1.9.5
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,9 @@
 
 ## Historique des versions
 
+- **1.9.5 — 2026-09-04 :** rend concluante l'absence finalisée d'une
+  transaction H2a après expiration du blockhash, afin de libérer durablement
+  intents et réservations avec `NO_EFFECT`.
 - **1.9.4 — 2026-09-04 :** aligne le RPC de finalité H2a sur
   `RpcResponseContext` en acceptant son `apiVersion` optionnel typé, sans
   assouplir le rejet des champs inconnus.

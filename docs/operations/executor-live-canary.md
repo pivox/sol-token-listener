@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.3.4 — 2026-09-04
+**Version :** 1.3.5 — 2026-09-04
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime signable. #51-H2a publie uniquement
@@ -82,6 +82,10 @@ une vue exposant indirectement des colonnes sensibles.
 Les réponses de statut Solana acceptent `RpcResponseContext.apiVersion`
 lorsqu'il s'agit d'une chaîne ; tout autre champ de contexte inconnu reste
 rejeté afin de détecter une dérive de contrat RPC.
+
+Une lecture `getTransaction` finalisée sans transaction porte la date de cette
+preuve. Combinée à une absence historique, des deltas nuls et un blockhash
+expiré au niveau finalisé, elle clôt la réconciliation en `NO_EFFECT`.
 
 Le runtime H2a traite, dans l'ordre, une réconciliation finalized, une
 confirmation ou une échéance par passe. Il ne réclame jamais `LIVE_RECOVER`,

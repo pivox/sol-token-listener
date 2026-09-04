@@ -1,8 +1,8 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.1.4
+**Version de spécification :** 1.1.5
 
-**Version de la spécification parente :** 1.9.4
+**Version de la spécification parente :** 1.9.5
 
 **Version de la fondation live :** 1.0.17
 
@@ -13,6 +13,8 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.5 — 2026-09-04 :** référence la clôture `NO_EFFECT` de H2a pour une
+  absence finalisée après expiration ; les transactions H1 restent inchangées.
 - **1.1.4 — 2026-09-04 :** référence la compatibilité
   `RpcResponseContext.apiVersion` de H2a ; les transactions H1 restent
   inchangées.

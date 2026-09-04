@@ -258,7 +258,7 @@ void test('reports absent finalized history without inventing a transaction or d
   assert.deepEqual(await session.readFinalizedWalletDeltas(request, signal()), {
     confirmationStatus: 'NOT_FOUND', observedSlot: null, feeLamports: 0n,
     walletLamportDelta: 0n, baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
-    unexpectedResidualTokenBalanceRaw: 0n, observedAtMs: 2_000, finalizedAtMs: null,
+    unexpectedResidualTokenBalanceRaw: 0n, observedAtMs: 2_000, finalizedAtMs: 2_000,
   });
 });
 

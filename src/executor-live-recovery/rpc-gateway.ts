@@ -165,7 +165,7 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
         confirmationStatus: 'NOT_FOUND', observedSlot: null,
         feeLamports: 0n, walletLamportDelta: 0n, baseDeltaRaw: 0n,
         quoteDeltaRaw: 0n, unexpectedResidualTokenBalanceRaw: 0n,
-        observedAtMs, finalizedAtMs: null,
+        observedAtMs, finalizedAtMs: observedAtMs,
       });
     }
     const walletIndex = observed.accountKeys.indexOf(request.walletPublicKey);

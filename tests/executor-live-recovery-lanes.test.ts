@@ -42,6 +42,30 @@ void test('reconciliation renews around RPC and commits with the latest active c
   assert.equal((committedClaim as ClaimedExecutionIntent | null)?.leaseExpiresAtMs, 3_000);
 });
 
+void test('reconciliation closes finalized expired absence as NO_EFFECT', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'CONFIRMED');
+  fixture.live.readReconciliationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, providerId: 'primary', request: reconciliationRequest(),
+  }));
+  fixture.gateway.readSignatureHistory = () => Promise.resolve('ABSENT');
+  fixture.gateway.readNormalizedTransaction = () => Promise.resolve(null);
+  fixture.gateway.readFinalizedWalletDeltas = () => Promise.resolve(Object.freeze({
+    confirmationStatus: 'NOT_FOUND', observedSlot: null,
+    feeLamports: 0n, walletLamportDelta: 0n, baseDeltaRaw: 0n,
+    quoteDeltaRaw: 0n, unexpectedResidualTokenBalanceRaw: 0n,
+    observedAtMs: 2_000, finalizedAtMs: 2_000,
+  }));
+  let result: ExecutionReconciliationEvidenceV1['result'] | null = null;
+  fixture.live.commitReconciliation = (_claim, evidence) => {
+    result = evidence.result;
+    return Promise.resolve(Object.freeze({ payloadVersion: 1, result: evidence.result }));
+  };
+
+  assert.equal(await createLiveRecoveryLanes(fixture).reconciliation(signal()), 'WORKED');
+  assert.equal(result, 'NO_EFFECT');
+});
+
 void test('confirmation releases pending work and does not starve the deadline lane', async () => {
   const calls: string[] = [];
   const fixture = dependencies(calls, 'SUBMITTED', 'NOT_FOUND');
@@ -259,6 +283,10 @@ function dependencies(
     -readonly [Key in keyof LiveRecoveryLaneDependencies['live']]:
       LiveRecoveryLaneDependencies['live'][Key];
   };
+  type MutableGateway = {
+    -readonly [Key in keyof LiveRecoveryLaneDependencies['gateway']]:
+      LiveRecoveryLaneDependencies['gateway'][Key];
+  };
   const live: MutableLive = {
     readReconciliationWork: () => Promise.reject(new Error('unexpected reconciliation read')),
     commitReconciliation: (_claim: ClaimedExecutionIntent, _evidence: ExecutionReconciliationEvidenceV1) =>
@@ -269,6 +297,35 @@ function dependencies(
     createNextDeadlineExitIntent: () => {
       calls.push('deadline');
       return Promise.resolve(null);
+    },
+  };
+  const gateway: MutableGateway = {
+    providerId: 'primary',
+    readFinalizedBlockHeight: () => {
+      calls.push('rpc:height'); return Promise.resolve(1_001n);
+    },
+    readSignatureHistory: () => {
+      calls.push('rpc:history'); return Promise.resolve('PRESENT' as const);
+    },
+    readNormalizedTransaction: () => {
+      calls.push('rpc:transaction');
+      return Promise.resolve(Object.freeze({ signature, blockhash: key, messageHash: hash }));
+    },
+    readFinalizedWalletDeltas: () => {
+      calls.push('rpc:deltas');
+      return Promise.resolve(Object.freeze({
+        confirmationStatus: 'FINALIZED' as const, observedSlot: 500n,
+        feeLamports: 5n, walletLamportDelta: -105n, baseDeltaRaw: 500n,
+        quoteDeltaRaw: -100n, unexpectedResidualTokenBalanceRaw: 0n,
+        observedAtMs: 1_900, finalizedAtMs: 2_000,
+      }));
+    },
+    observeSignature: () => {
+      calls.push('rpc:confirmation');
+      return Promise.resolve(Object.freeze({
+        confirmationStatus, observedSlot: confirmationStatus === 'FINALIZED' ? 500n : null,
+        observedAtMs: 2_000,
+      }));
     },
   };
   return {
@@ -298,31 +355,7 @@ function dependencies(
       release: () => { calls.push('release'); return Promise.resolve(true); },
     },
     live,
-    gateway: {
-      providerId: 'primary',
-      readFinalizedBlockHeight: () => { calls.push('rpc:height'); return Promise.resolve(1_001n); },
-      readSignatureHistory: () => { calls.push('rpc:history'); return Promise.resolve('PRESENT' as const); },
-      readNormalizedTransaction: () => {
-        calls.push('rpc:transaction');
-        return Promise.resolve(Object.freeze({ signature, blockhash: key, messageHash: hash }));
-      },
-      readFinalizedWalletDeltas: () => {
-        calls.push('rpc:deltas');
-        return Promise.resolve(Object.freeze({
-          confirmationStatus: 'FINALIZED' as const, observedSlot: 500n,
-          feeLamports: 5n, walletLamportDelta: -105n, baseDeltaRaw: 500n,
-          quoteDeltaRaw: -100n, unexpectedResidualTokenBalanceRaw: 0n,
-          observedAtMs: 1_900, finalizedAtMs: 2_000,
-        }));
-      },
-      observeSignature: () => {
-        calls.push('rpc:confirmation');
-        return Promise.resolve(Object.freeze({
-          confirmationStatus, observedSlot: confirmationStatus === 'FINALIZED' ? 500n : null,
-          observedAtMs: 2_000,
-        }));
-      },
-    },
+    gateway,
   };
 }
 

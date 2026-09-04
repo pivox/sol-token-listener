@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js 22, PostgreSQL, Solana JSON-RPC HTTP, `node:test`, `bigint`, logs Pino structurés.
 
-**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.1.4, parent version 1.9.4, H1 version 1.1.4.
+**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.1.5, parent version 1.9.5, H1 version 1.1.5.
 
 ---
 

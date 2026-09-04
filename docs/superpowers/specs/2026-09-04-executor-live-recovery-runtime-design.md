@@ -1,10 +1,10 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.1.4
+**Version de spécification :** 1.1.5
 
-**Version de la spécification parente :** 1.9.4
+**Version de la spécification parente :** 1.9.5
 
-**Version de l'orchestration persistante :** 1.1.3
+**Version de l'orchestration persistante :** 1.1.5
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,10 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.5 — 2026-09-04 :** date l'observation finalisée d'une transaction
+  absente. Après expiration du blockhash, l'absence historique et des deltas
+  nuls peut ainsi produire le verdict durable `NO_EFFECT` au lieu d'une
+  réconciliation `UNKNOWN` infinie.
 - **1.1.4 — 2026-09-04 :** accepte le champ standard optionnel `apiVersion`
   dans `RpcResponseContext` tout en exigeant une chaîne et en refusant tout
   autre champ inconnu. Les lectures de finalité restent strictes et bornées.
