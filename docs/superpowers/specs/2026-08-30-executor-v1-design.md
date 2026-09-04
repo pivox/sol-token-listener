@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.8.8
+**Version de spécification :** 1.9.0
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,11 @@
 
 ## Historique des versions
 
+- **1.9.0 — 2026-09-04 :** isole H2a derrière le rôle PostgreSQL dédié
+  `sol_token_executor_live_recovery`, appliqué et vérifié à chaque checkout.
+  Des ACL de colonnes retirent tout accès aux bytes signés et aux mutations de
+  signature/soumission ; le runtime ne reçoit que des façades gelées à
+  prototype nul. Le rôle signable historique reste réservé à H2b.
 - **1.8.8 — 2026-09-04 :** versionne le contrat H2a de report gelé :
   `DEFERRED` associe une lane et un code RPC retryable allowlisté nullable,
   tandis que `NOT_FOUND` reste sans code et laisse l'échéance poursuivre. Les

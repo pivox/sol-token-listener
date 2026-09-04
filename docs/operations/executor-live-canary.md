@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.2.1 — 2026-09-04
+**Version :** 1.3.0 — 2026-09-04
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime signable. #51-H2a publie uniquement
@@ -36,7 +36,7 @@ publiques mais doivent être vérifiées par l'opérateur :
 EXECUTOR_LIVE_RECOVERY_ENABLED=true
 EXECUTOR_MODE=live
 SOLANA_CLUSTER=mainnet-beta
-DATABASE_URL=postgresql://sol_token_executor_live:...@127.0.0.1:5432/solanabot
+DATABASE_URL=postgresql://<login-recovery-dedie>:...@127.0.0.1:5432/solanabot
 EXECUTOR_WALLET_GENERATION_ID=execution_wallet_generation_<sha256>
 EXECUTOR_PUBLIC_KEY=<adresse-publique-base58>
 EXECUTOR_RPC_PROVIDER_ID=primary
@@ -61,6 +61,15 @@ DOTENV_CONFIG_PATH=/chemin/hors-git/live-recovery.env \
 Cette commande vérifie rôle, migrations, génération, provider et genesis avant
 la première claim. Elle ne charge aucun signer, n'arme rien et ne soumet aucune
 transaction.
+
+Avant ce démarrage, un administrateur rejoue
+`scripts/provision-executor-roles.sql`, crée hors dépôt un login dédié
+`LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+NOBYPASSRLS`, puis lui accorde uniquement
+`sol_token_executor_live_recovery`. Le mot de passe et le nom du login ne sont
+jamais committés. Le runtime applique et contrôle ce rôle à chaque checkout ;
+il refuse un login hérité, privilégié, sans appartenance ou membre d'un autre
+rôle.
 
 Le runtime H2a traite, dans l'ordre, une réconciliation finalized, une
 confirmation ou une échéance par passe. Il ne réclame jamais `LIVE_RECOVER`,
@@ -117,8 +126,9 @@ indémarrable jusque-là.
 
 Après les migrations, un administrateur peut appliquer
 `scripts/provision-executor-roles.sql`. Il crée des rôles de groupe `NOLOGIN`,
-sans mot de passe ni privilège cluster. Le compte LOGIN du futur processus live
-doit recevoir seulement `sol_token_executor_live`.
+sans mot de passe ni privilège cluster. Le compte LOGIN du futur processus
+signable H2b doit recevoir seulement `sol_token_executor_live`. Le compte H2a
+distinct reçoit seulement `sol_token_executor_live_recovery`.
 
 La rétention utilise un second compte LOGIN dédié qui doit recevoir seulement
 `sol_token_retention_worker`. Il ne doit jamais être partagé avec le listener,
@@ -128,11 +138,13 @@ uniquement dans le job planifié, puis celui-ci lance
 provisioning doit être rejoué par l'administrateur après toute migration qui
 ajoute une table à la purge ; le job reste arrêté si ce provisioning échoue.
 
-Le rôle `sol_token_executor_live` est le seul rôle applicatif autorisé à lire
-les octets signés et les détails de positions live. Listener, worker dry-run,
-opérations, lecteur opérateur et API publique n'y ont aucun accès. Seul le rôle
-de rétention reçoit les `DELETE` nécessaires à la purge. Il n'obtient qu'une
-lecture par colonnes
+Le rôle signable `sol_token_executor_live` est le seul rôle applicatif autorisé
+à lire les octets signés. Le rôle H2a recovery ne reçoit que les colonnes et
+mutations de finalité nécessaires ; `signed_transaction_bytes`, signature,
+simulation signée, préflight et soumission lui sont interdits. Listener,
+worker dry-run, opérations, lecteur opérateur et API publique n'ont aucun accès
+aux bytes signés. Seul le rôle de rétention reçoit les `DELETE` nécessaires à
+la purge. Il n'obtient qu'une lecture par colonnes
 de l'identifiant, de l'état, de l'échéance et de l'autorisation de sortie sur
 `execution_signed_transactions` : `signed_transaction_bytes` lui reste
 inaccessible, y compris via `RETURNING`.

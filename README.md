@@ -168,6 +168,12 @@ Il ne charge aucune clé privée, ne signe et ne soumet aucune transaction. Il
 utilise une session RPC bornée par passe dans l'ordre réconciliation,
 confirmation, échéance.
 
+Sa connexion PostgreSQL utilise un login de déploiement dédié et non hérité,
+membre uniquement du rôle `sol_token_executor_live_recovery`. Le runtime
+applique ce rôle à chaque checkout. Ses ACL et ses façades minimales lui
+interdisent les bytes signés ainsi que toute mutation de signature,
+simulation signée, préflight ou soumission.
+
 Sa configuration exacte et la commande avec fichier d'environnement dédié
 sont documentées dans
 [`docs/operations/executor-live-canary.md`](docs/operations/executor-live-canary.md).

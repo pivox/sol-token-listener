@@ -1,8 +1,8 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.0.10
+**Version de spécification :** 1.1.0
 
-**Version de la spécification parente :** 1.8.8
+**Version de la spécification parente :** 1.9.0
 
 **Version de la fondation live :** 1.0.17
 
@@ -13,6 +13,11 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.0 — 2026-09-04 :** réserve les primitives H1 de finalité à une façade
+  H2a exacte et au rôle PostgreSQL `sol_token_executor_live_recovery`. Les ACL
+  minimales autorisent les claims `CONFIRM`/`RECONCILE`, leurs read-models et
+  commits, ainsi que le scanner d'échéance, sans accorder la lecture des bytes
+  signés ni les mutations de signature, simulation signée ou soumission.
 - **1.0.10 — 2026-09-04 :** référence les reports H2a gelés et typés : un
   `DEFERRED` associe la lane à un code RPC retryable allowlisté nullable,
   `NOT_FOUND` n'a pas de code et n'arrête pas l'échéance. Les finalités

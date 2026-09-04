@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js 22, PostgreSQL, Solana JSON-RPC HTTP, `node:test`, `bigint`, logs Pino structurés.
 
-**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.0.9, parent version 1.8.8, H1 version 1.0.10.
+**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.1.0, parent version 1.9.0, H1 version 1.1.0.
 
 ---
 
@@ -101,7 +101,32 @@
 - [x] Tester source contre signer, secrets et soumission ; la preuve `dist`
   est exécutée dans la tâche de livraison après build.
 
-### Task 6: Vérifier et livrer H2a
+### Task 6: Isoler l'autorité PostgreSQL de récupération
+
+**Status:** pending
+
+**Files:**
+- Create: `src/executor-live-recovery/database.ts`
+- Create: `src/ports/execution-live-recovery-repository.ts`
+- Create: `tests/executor-live-recovery-database.test.ts`
+- Modify: `src/executor-live-recovery/main.ts`
+- Modify: `src/executor-live-recovery/lanes.ts`
+- Modify: `src/executor-live-recovery/startup-validator.ts`
+- Modify: `scripts/provision-executor-roles.sql`
+- Modify: `tests/executor-roles-provisioning.test.ts`
+- Modify: `tests/executor-live-recovery-main.integration.test.ts`
+- Modify: `tests/executor-live-recovery-startup.test.ts`
+
+- [ ] Écrire RED les tests du rôle dédié, du `SET ROLE` à chaque checkout,
+  de l'éviction et des façades exactes.
+- [ ] Rendre le provisioning rejouable et accorder seulement les colonnes et
+  mutations indispensables aux trois lanes.
+- [ ] Injecter exclusivement le wrapper restreint et des objets gelés à
+  prototype nul dans le runtime.
+- [ ] Prouver sur PostgreSQL réel les opérations autorisées et les refus
+  `42501`, puis committer.
+
+### Task 7: Vérifier et livrer H2a
 
 **Status:** pending
 

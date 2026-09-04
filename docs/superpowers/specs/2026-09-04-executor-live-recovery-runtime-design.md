@@ -1,10 +1,10 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.0.9
+**Version de spécification :** 1.1.0
 
-**Version de la spécification parente :** 1.8.8
+**Version de la spécification parente :** 1.9.0
 
-**Version de l'orchestration persistante :** 1.0.10
+**Version de l'orchestration persistante :** 1.1.0
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,16 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.0 — 2026-09-04 :** isole l'autorité PostgreSQL de H2a dans le rôle de
+  groupe dédié `sol_token_executor_live_recovery`. Un login de déploiement
+  externe, sans héritage et sans privilège direct, obtient ce rôle exact ;
+  chaque checkout exécute et vérifie `SET ROLE` avant d'exposer le client. Les
+  ACL de colonnes interdisent notamment `signed_transaction_bytes` et les
+  mutations de signature, simulation signée, préflight ou soumission. Le
+  runtime ne reçoit que des façades gelées à prototype nul et aux méthodes
+  exactes de finalité. Cette défense en profondeur remplace l'hypothèse
+  insuffisante selon laquelle un `Pick<>` TypeScript réduirait l'objet à
+  l'exécution.
 - **1.0.9 — 2026-09-04 :** rend le report de lane typé et gelé : un résultat
   `DEFERRED` associe toujours sa `lane` à un `errorCode` RPC retryable
   explicitement allowlisté (`RPC_RATE_LIMITED`, `RPC_TIMEOUT`,
@@ -110,16 +120,43 @@ inerte, élargit inutilement le graphe d'autorité. Une erreur d'injection ou un
 appel après `beginSubmission` créerait un état ambigu sans envoi réel. Approche
 rejetée.
 
-### 2.3 Runtime finalité à ports étroits — retenue
+### 2.3 Runtime finalité à ports étroits — retenue puis durcie
 
-H2a compose uniquement des ports RPC de lecture. Les tests d'architecture
-inspectent le graphe source et compilé. H2b ajoutera plus tard un exécutable
-séparé pour la reprise et l'exécution signables.
+H2a compose uniquement des ports RPC de lecture et des façades PostgreSQL
+minimales. Les tests d'architecture inspectent le graphe source et compilé.
+H2b ajoutera plus tard un exécutable séparé pour la reprise et l'exécution
+signables.
+
+### 2.4 Réutiliser `sol_token_executor_live` avec un simple `Pick<>` — rejetée
+
+Le rôle live possède volontairement les pouvoirs nécessaires à H2b. Un
+`Pick<>` disparaît à l'exécution et une instance complète de repository garde
+ses méthodes signables. Réutiliser ce rôle ne constitue donc pas une frontière
+d'autorité.
+
+### 2.5 Dupliquer tous les repositories de finalité — différée
+
+Réécrire immédiatement toutes les requêtes H1 fournirait une séparation
+lexicale maximale, mais dupliquerait une logique transactionnelle déjà revue
+et augmenterait le risque de divergence. H2a peut instancier ces repositories
+derrière son module de composition privé, mais seul un client SQL restreint
+leur est injecté et seules des façades exactes sont exportées. PostgreSQL reste
+la frontière d'autorité effective. Une extraction ultérieure de repositories
+dédiés pourra réduire encore le graphe sans changer le port.
+
+### 2.6 Rôle recovery dédié, `SET ROLE`, ACL et façades — retenue
+
+Le rôle de groupe `sol_token_executor_live_recovery` est `NOLOGIN`,
+`NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOINHERIT`, `NOREPLICATION` et
+`NOBYPASSRLS`. Le login de déploiement est créé hors dépôt, avec `LOGIN`,
+`NOINHERIT`, les mêmes indicateurs privilégiés à faux, aucun privilège direct
+et une appartenance exacte au seul rôle recovery. Aucun mot de passe n'est
+versionné.
 
 ## 3. Invariants de sécurité
 
-1. Aucun module accessible depuis l'entrypoint H2a ne charge un secret ou ne
-   possède de méthode de signature ou de soumission.
+1. L'entrypoint et les façades accessibles au runtime H2a ne chargent aucun
+   secret et n'exposent aucune méthode de signature ou de soumission.
 2. Aucun claim H2a n'utilise `LIVE_EXECUTE` ou `LIVE_RECOVER`.
 3. Une passe traite au plus une unité, dans l'ordre réconciliation,
    confirmation, échéance.
@@ -139,6 +176,14 @@ séparé pour la reprise et l'exécution signables.
     octets de transaction, ni secret.
 13. Le démarrage ne modifie ni armement, ni contrôle, ni génération wallet.
 14. Aucun endpoint HTTP public n'est ajouté.
+15. Chaque client PostgreSQL est rendu au code applicatif uniquement après
+    `SET ROLE sol_token_executor_live_recovery` ; un échec évince le client.
+16. Le rôle recovery ne peut ni sélectionner `signed_transaction_bytes`, ni
+    insérer une transaction signée, une preuve de simulation signée ou de
+    préflight, ni écrire une transition de soumission.
+17. Les façades runtime ont un prototype nul, sont gelées et possèdent
+    exactement les méthodes autorisées ; elles ne fuient ni pool, ni client,
+    ni repository complet.
 
 ## 4. Configuration fermée
 
@@ -168,7 +213,7 @@ L'ordre est obligatoire :
 
 1. parser la configuration ;
 2. ouvrir PostgreSQL avec des timeouts bornés ;
-3. vérifier le rôle courant attendu ;
+3. appliquer puis vérifier le rôle recovery sur le client courant ;
 4. vérifier que l'historique de migrations correspond exactement au catalogue
    versionné jusqu'à `037_execution_live_orchestration.sql` ;
 5. vérifier la génération wallet, le provider et l'absence de travail ouvert
@@ -179,6 +224,23 @@ L'ordre est obligatoire :
 
 Une divergence ferme le processus avant toute mutation métier. H2a n'applique
 pas les migrations et ne provisionne pas les rôles au démarrage.
+
+La connexion n'utilise pas un callback asynchrone `pool.on('connect')`, que
+`EventEmitter` n'attend pas. Un wrapper de pool prend chaque client, exécute
+statiquement `SET ROLE sol_token_executor_live_recovery`, vérifie l'identité,
+puis seulement le transmet au repository. En cas d'échec, le client est
+relâché comme défectueux et n'est jamais exposé.
+
+La validation exige simultanément :
+
+- `current_user = sol_token_executor_live_recovery` ;
+- un `session_user` distinct, `LOGIN`, `NOINHERIT` et sans attribut privilégié ;
+- le rôle cible `NOLOGIN`, `NOINHERIT` et sans attribut privilégié ;
+- une appartenance directe et exacte du login au seul rôle recovery ;
+- l'absence des privilèges interdits, y compris au niveau colonne.
+
+Le nom du login de session est une donnée de déploiement privée : il est
+comparé dans PostgreSQL mais n'est jamais renvoyé dans l'évidence ni journalisé.
 
 Les fingerprints build, configuration et stratégie restent inclus et validés
 dans chaque read-model H1. Ils ne sont pas épinglés à la version courante de
@@ -327,6 +389,16 @@ H2a est livrable uniquement si :
   signer, lecture des bytes signés PostgreSQL, simulation signée, `beginSubmission` et
   `sendRawTransaction` ;
 - PostgreSQL réel valide les claims, commits, concurrence et reprise ;
+- le provisioning du rôle recovery est rejouable deux fois et une connexion de
+  test sans appartenance est refusée puis évincée ;
+- deux checkouts successifs, dont un après réacquisition, observent toujours le
+  login attendu comme `session_user` et le rôle recovery comme `current_user` ;
+- PostgreSQL répond `42501` aux lectures des bytes signés ainsi qu'aux écritures
+  de signature, simulation signée, préflight et soumission ;
+- les propres clés des façades runtime sont exactement allowlistées, leurs
+  prototypes sont nuls et cette propriété est testée dans `src` puis `dist` ;
+- confirmation, réconciliation et création à échéance fonctionnent réellement
+  au travers de ces façades et de leurs ACL minimales ;
 - build, check, lint, tests backend/frontend, migrations vides/rejouées et
   documentation passent ;
 - aucun test existant ne régresse.
