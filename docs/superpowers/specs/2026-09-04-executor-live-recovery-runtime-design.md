@@ -1,8 +1,8 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.0.4
 
-**Version de la spécification parente :** 1.8.2
+**Version de la spécification parente :** 1.8.3
 
 **Version de l'orchestration persistante :** 1.0.6
 
@@ -13,6 +13,11 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.4 — 2026-09-04 :** précise la discipline des claims entre lanes :
+  chaque appel réseau est encadré par des renouvellements et utilise le claim
+  actif le plus récent ; confirmation libère son claim après commit ou report,
+  tandis que chaque résultat de réconciliation libère atomiquement sa lease.
+  Un travail différé ne peut donc pas affamer la lane d'échéance suivante.
 - **1.0.3 — 2026-09-04 :** précise la frontière des bytes : H2a ne lit jamais
   les bytes privés persistés avant soumission, mais désérialise éphémèrement la
   transaction publique retournée par `getTransaction` finalized afin de
@@ -196,7 +201,9 @@ La lane appelle `claim(... purpose: 'RECONCILE')`, puis
 `readReconciliationWork(claim)`. Elle refuse une divergence de `providerId`,
 renouvelle le lease, collecte les preuves finalized via le gateway, renouvelle
 à nouveau et appelle `commitReconciliation` avec le claim actif retourné par
-ce dernier renouvellement.
+ce dernier renouvellement. Le commit libère atomiquement la lease pour tous
+les résultats, y compris `UNKNOWN` et `MISMATCH`. Toute erreur avant commit
+libère explicitement le claim avant report ou échec fermé.
 
 `SIGNED_NOT_SUBMITTED` n'est pas éligible. La reprise exacte de cet état reste
 réservée à H2b via `LIVE_RECOVER`.
@@ -207,8 +214,10 @@ La lane appelle `claim(... purpose: 'CONFIRM')`, puis
 `readConfirmationWork(claim)`. Elle observe uniquement la signature fournie par
 le read-model, renouvelle le lease avant et après l'appel puis persiste avec le
 claim actif retourné par ce dernier renouvellement dans `recordConfirmation`.
-`NOT_FOUND`, erreur ou statut non confirmé ne provoque
-aucune transition terminale et sera rejoué.
+La lane libère ensuite explicitement le claim afin que `RECONCILE` puisse le
+réclamer sans attendre. `NOT_FOUND`, erreur ou statut non confirmé libère aussi
+le claim, ne provoque aucune transition terminale et sera rejoué. Ces reports
+produisent `DEFERRED`, pas `WORKED`, afin de ne pas affamer l'échéance.
 
 ### 7.3 Échéance
 

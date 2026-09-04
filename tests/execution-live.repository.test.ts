@@ -1763,6 +1763,11 @@ void test('finalized BUY evidence reconciles an ambiguous submission without con
     });
     const unknown = await repository.commitReconciliation(fixture.claim, unknownEvidence);
     assert.equal(unknown.result, 'UNKNOWN');
+    const releasedUnknown = await pool.query(
+      'SELECT lease_owner,lease_token FROM execution_intents WHERE id=$1',
+      [fixture.claim.intent.id],
+    );
+    assert.deepEqual(releasedUnknown.rows, [{ lease_owner: null, lease_token: null }]);
     const evidence = evaluateExecutionReconciliation({
       expected,
       observed: Object.freeze({

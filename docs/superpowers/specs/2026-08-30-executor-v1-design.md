@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.8.2
+**Version de spécification :** 1.8.3
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.8.3 — 2026-09-04 :** impose à H2a de transmettre le claim renouvelé le
+  plus récent aux commits et de libérer toute lease après confirmation,
+  report ou résultat de réconciliation non terminal. Une confirmation en
+  attente est `DEFERRED` et ne peut pas affamer la création d'une sortie due.
 - **1.8.2 — 2026-09-04 :** autorise H2a à désérialiser uniquement les bytes
   publics d'une transaction finalized renvoyée par Solana pour vérifier le
   hash exact du message. Les bytes privés persistés avant soumission restent

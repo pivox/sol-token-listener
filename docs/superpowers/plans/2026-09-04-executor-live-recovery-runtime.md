@@ -8,13 +8,13 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js 22, PostgreSQL, Solana JSON-RPC HTTP, `node:test`, `bigint`, logs Pino structurés.
 
-**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.0.3, parent version 1.8.2, H1 version 1.0.6.
+**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.0.4, parent version 1.8.3, H1 version 1.0.6.
 
 ---
 
 ### Task 1: Versionner la frontière H2a
 
-**Status:** in progress
+**Status:** completed
 
 **Files:**
 - Create: `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md`
@@ -24,16 +24,16 @@
 - Modify: `docs/superpowers/specs/2026-09-01-executor-live-orchestration-design.md`
 - Modify: `docs/operations/executor-live-canary.md`
 
-- [ ] Décrire les options étudiées, invariants, configuration, RPC autorisés,
+- [x] Décrire les options étudiées, invariants, configuration, RPC autorisés,
   lanes, arrêt et non-objectifs.
-- [ ] Versionner les spécifications parentes sans réécrire leur historique.
-- [ ] Faire échouer les tests documentaires qui attendent encore l'ancien état,
+- [x] Versionner les spécifications parentes sans réécrire leur historique.
+- [x] Faire échouer les tests documentaires qui attendent encore l'ancien état,
   puis les mettre en cohérence.
-- [ ] Committer la documentation seule.
+- [x] Committer la documentation seule.
 
 ### Task 2: Valider le démarrage sans autorité live
 
-**Status:** pending
+**Status:** completed
 
 **Files:**
 - Create: `src/executor-live-recovery/config.ts`
@@ -41,42 +41,42 @@
 - Create: `tests/executor-live-recovery-config.test.ts`
 - Create: `tests/executor-live-recovery-startup.test.ts`
 
-- [ ] Écrire les tests RED pour configuration exacte, bornes et noms de secret
+- [x] Écrire les tests RED pour configuration exacte, bornes et noms de secret
   interdits.
-- [ ] Implémenter le parser immuable et les erreurs typées.
-- [ ] Écrire les tests PostgreSQL RED pour rôle, head/catalogue migrations et
+- [x] Implémenter le parser immuable et les erreurs typées.
+- [x] Écrire les tests PostgreSQL RED pour rôle, head/catalogue migrations et
   bindings ouverts.
-- [ ] Implémenter les validations read-only dans l'ordre normatif.
-- [ ] Exécuter les tests ciblés sur PostgreSQL réel puis committer.
+- [x] Implémenter les validations read-only dans l'ordre normatif.
+- [x] Exécuter les tests ciblés sur PostgreSQL réel puis committer.
 
 ### Task 3: Implémenter le gateway RPC read-only borné
 
-**Status:** pending
+**Status:** completed
 
 **Files:**
 - Create: `src/executor-live-recovery/rpc-gateway.ts`
 - Create: `tests/executor-live-recovery-rpc.test.ts`
 
-- [ ] Écrire un faux serveur JSON-RPC local couvrant genesis, statut,
+- [x] Écrire un faux serveur JSON-RPC local couvrant genesis, statut,
   transaction finalized, hauteurs et deltas.
-- [ ] Tester timeout, abort, 429, taille, identifiant, types et réponses
+- [x] Tester timeout, abort, 429, taille, identifiant, types et réponses
   divergentes avant l'implémentation.
-- [ ] Implémenter uniquement les ports de lecture étroits et les budgets.
-- [ ] Prouver que les entiers financiers restent des `bigint` puis committer.
+- [x] Implémenter uniquement les ports de lecture étroits et les budgets.
+- [x] Prouver que les entiers financiers restent des `bigint` puis committer.
 
 ### Task 4: Composer les lanes H1
 
-**Status:** pending
+**Status:** completed
 
 **Files:**
 - Create: `src/executor-live-recovery/lanes.ts`
 - Create: `tests/executor-live-recovery-lanes.test.ts`
 
-- [ ] Tester RED claims `RECONCILE`/`CONFIRM`, read-models, provider affinity,
+- [x] Tester RED claims `RECONCILE`/`CONFIRM`, read-models, provider affinity,
   renouvellement et perte de lease.
-- [ ] Composer réconciliation et confirmation sur les workers existants.
-- [ ] Composer le scanner deadline sans réclamer le SELL créé.
-- [ ] Tester une seule unité et ordre strict puis committer.
+- [x] Composer réconciliation et confirmation sur les services existants.
+- [x] Composer le scanner deadline sans réclamer le SELL créé.
+- [x] Tester une seule unité et ordre strict puis committer.
 
 ### Task 5: Publier le runtime et l'entrypoint séparés
 

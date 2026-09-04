@@ -2961,6 +2961,7 @@ async function commitSellReconciliation(
       const unknownIntent = await client.query(`UPDATE execution_intents SET
         status='UNKNOWN_REQUIRES_RECONCILIATION',state_revision=$2::BIGINT,
         last_reason_code='RECONCILIATION_REQUIRED',
+        lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
         updated_at=TIMESTAMPTZ 'epoch'+($3::BIGINT*INTERVAL '1 millisecond')
         WHERE id=$1 AND status=$4 AND state_revision=$5::BIGINT`, [
         artifact.intentId, (intentRevision + 1n).toString(), evidence.observedAtMs,
