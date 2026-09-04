@@ -6,9 +6,11 @@ import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
 import { evaluateExecutionReconciliation } from '../src/domain/execution-reconciliation.js';
 import { createExecutionRiskPolicy } from '../src/domain/execution-risk-policy.js';
+import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
 import { ExecutionAdmissionService } from '../src/executor-risk/admission-service.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import {
+  appendWalletSnapshotInTransaction,
   ExecutionRiskRepositoryError,
   PostgresExecutionRiskRepository,
 } from '../src/storage/execution-risk.repository.js';
@@ -16,6 +18,72 @@ import { migrateDatabase } from '../src/storage/database.js';
 
 const publicKey = '11111111111111111111111111111111';
 const genesisHash = '2'.repeat(32);
+
+void test('wallet snapshots require the canonical domain identity', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk canonical wallet snapshot test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_canonical_wallet', async (pool) => {
+    await migrateDatabase({ pool });
+    const repository = new PostgresExecutionRiskRepository(pool);
+    const generation = await repository.registerWalletGeneration(generationDraft('a', 1));
+    const snapshot = createExecutionWalletSnapshot({
+      generationId: generation.generationId,
+      providerId: 'rpc-primary',
+      stateRevision: 0n,
+      slot: 123n,
+      blockTimeMs: 1_000,
+      observedAtMs: 1_001,
+      commitment: 'finalized',
+      walletLamports: 1_000_000n,
+      tokenBalanceCount: 0,
+      openPositions: [],
+      realizedNetPnlRaw: 0n,
+    });
+    await assert.rejects(repository.appendWalletSnapshot(Object.freeze({
+      ...snapshot,
+      snapshotId: id('wallet_snapshot', 'e'),
+    })), isRepositoryError('INVALID_INPUT'));
+    assert.deepEqual(await repository.appendWalletSnapshot(snapshot), snapshot);
+  });
+});
+
+void test('wallet snapshot transaction primitive delegates locks and transaction boundaries to its caller', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk transaction primitive test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_wallet_primitive', async (pool) => {
+    await migrateDatabase({ pool });
+    const repository = new PostgresExecutionRiskRepository(pool);
+    const generation = await repository.registerWalletGeneration(generationDraft('a', 1));
+    const snapshot = createExecutionWalletSnapshot({
+      generationId: generation.generationId,
+      providerId: 'rpc-primary',
+      stateRevision: 0n,
+      slot: 123n,
+      blockTimeMs: 1_000,
+      observedAtMs: 1_001,
+      commitment: 'finalized',
+      walletLamports: 1_000_000n,
+      tokenBalanceCount: 0,
+      openPositions: [],
+      realizedNetPnlRaw: 0n,
+    });
+    const rawClient = await pool.connect();
+    try {
+      await rawClient.query('BEGIN');
+      const transactionClient = {
+        async query(text: string, values?: readonly unknown[]) {
+          assert.doesNotMatch(text, /(?:^|\\s)(?:BEGIN|COMMIT|ROLLBACK)\\b|pg_advisory_xact_lock/iu);
+          return rawClient.query(text, values === undefined ? undefined : [...values]);
+        },
+        release() {},
+      };
+      assert.deepEqual(await appendWalletSnapshotInTransaction(transactionClient, snapshot), snapshot);
+    } finally {
+      await rawClient.query('ROLLBACK');
+      rawClient.release();
+    }
+  });
+});
 
 void test('wallet generation and snapshot writes replay exactly and reject conflicts', async (context) => {
   const databaseUrl = testDatabaseUrl(context, 'execution risk repository wallet test');
@@ -35,10 +103,19 @@ void test('wallet generation and snapshot writes replay exactly and reject confl
     const snapshot = walletSnapshotDraft(created.generationId, 'c', 0n);
     assert.deepEqual(await repository.appendWalletSnapshot(snapshot), snapshot);
     assert.deepEqual(await repository.appendWalletSnapshot(snapshot), snapshot);
-    await assert.rejects(
-      repository.appendWalletSnapshot({ ...snapshot, snapshotId: id('wallet_snapshot', 'd') }),
-      isRepositoryError('CONFLICT'),
-    );
+    await assert.rejects(repository.appendWalletSnapshot(createExecutionWalletSnapshot({
+      generationId: snapshot.generationId,
+      providerId: snapshot.providerId,
+      stateRevision: snapshot.stateRevision,
+      slot: snapshot.slot + 1n,
+      blockTimeMs: snapshot.blockTimeMs,
+      observedAtMs: snapshot.observedAtMs + 1,
+      commitment: snapshot.commitment,
+      walletLamports: snapshot.walletLamports,
+      tokenBalanceCount: snapshot.tokenBalanceCount,
+      openPositions: snapshot.openPositions,
+      realizedNetPnlRaw: snapshot.realizedNetPnlRaw,
+    })), isRepositoryError('CONFLICT'));
     const positioned = walletSnapshotDraft(created.generationId, 'e', 1n, [{
       positionId: 'position:test',
       costBasisLamports: 500n,
@@ -414,10 +491,9 @@ void test('resolving one reservation preserves another reservation unknown block
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, 'execution_multiple_unknown_block', async (pool) => {
     const fixture = await reconciliationFixture(pool, 'first-reservation', 'SUBMITTED');
-    const currentWallet = await fixture.repository.appendWalletSnapshot({
-      ...fixture.walletSnapshot,
-      snapshotId: id('wallet_snapshot', '8'),
-      snapshotFingerprint: '8'.repeat(64),
+    const currentWallet = await fixture.repository.appendWalletSnapshot(createExecutionWalletSnapshot({
+      generationId: fixture.walletSnapshot.generationId,
+      providerId: fixture.walletSnapshot.providerId,
       stateRevision: 1n,
       slot: fixture.walletSnapshot.slot + 1n,
       blockTimeMs: fixture.nowMs,
@@ -428,7 +504,11 @@ void test('resolving one reservation preserves another reservation unknown block
         conservativeLiquidationLamports: 90_000n,
         reconciliationStatus: 'RECONCILED' as const,
       }]),
-    });
+      commitment: fixture.walletSnapshot.commitment,
+      walletLamports: fixture.walletSnapshot.walletLamports,
+      tokenBalanceCount: fixture.walletSnapshot.tokenBalanceCount,
+      realizedNetPnlRaw: fixture.walletSnapshot.realizedNetPnlRaw,
+    }));
     const secondDraft = createExecutionIntentDraft({
       strategyId: 'risk-reconciliation-test', strategyVersion: 1,
       positionId: 'position:second-reservation', logicalCommandId: 'command:second-reservation',
@@ -495,10 +575,18 @@ async function reconciliationFixture(
   const repository = new PostgresExecutionRiskRepository(pool);
   const intentRepository = new PostgresExecutionIntentRepository(pool);
   const generation = await repository.registerWalletGeneration(generationDraft('a', 1));
-  const snapshot = await repository.appendWalletSnapshot(Object.freeze({
-    ...walletSnapshotDraft(generation.generationId, 'b', 0n),
+  const snapshot = await repository.appendWalletSnapshot(createExecutionWalletSnapshot({
+    generationId: generation.generationId,
+    providerId: 'rpc-primary',
+    stateRevision: 0n,
+    slot: 123n,
     blockTimeMs: nowMs - 100,
     observedAtMs: nowMs - 50,
+    commitment: 'finalized',
+    walletLamports: 1_000_000n,
+    tokenBalanceCount: 0,
+    openPositions: [],
+    realizedNetPnlRaw: 0n,
   }));
   const provider = createProviderUsageSnapshot({
     providerId: 'rpc-primary', planId: 'public-v1', billingPeriodId: 'current',
@@ -651,16 +739,13 @@ function walletSnapshotDraft(
     reconciliationStatus: 'RECONCILED' | 'UNKNOWN';
   }>[] = [],
 ) {
-  return Object.freeze({
-    snapshotId: id('wallet_snapshot', seed),
-    payloadVersion: 1 as const,
-    snapshotFingerprint: seed.repeat(64),
+  return createExecutionWalletSnapshot({
     generationId,
     providerId: 'rpc-primary',
     stateRevision,
-    slot: 123n,
-    blockTimeMs: 1_000 as number | null,
-    observedAtMs: 1_001,
+    slot: 123n + BigInt(seed.charCodeAt(0)),
+    blockTimeMs: 1_000 + seed.charCodeAt(0),
+    observedAtMs: 1_001 + seed.charCodeAt(0),
     commitment: 'finalized' as const,
     walletLamports: 1_000_000n,
     tokenBalanceCount: 0,

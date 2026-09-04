@@ -6,7 +6,6 @@ import { closeDatabase, getDatabasePool } from '../storage/database.js';
 import { verifySignedSafetyQualificationEvidence } from '../domain/execution-safety-attestation.js';
 import { verifySignedExecutionCanaryEvidence } from '../domain/execution-canary-attestation.js';
 import { PostgresExecutionOperationsRepository } from '../storage/execution-operations.repository.js';
-import { unavailableExecutionCanaryArmamentRepository } from '../ports/execution-operations-repository.js';
 import { parseExecutionCanaryArmConfig, parseExecutionOperationsConfig } from './config.js';
 import {
   createExecutionOperationsService,
@@ -154,9 +153,10 @@ export async function main(): Promise<void> {
     lock_timeout: 3_000,
     idle_in_transaction_session_timeout: 3_000,
   });
+  const repository = new PostgresExecutionOperationsRepository(pool);
   const service = createExecutionOperationsService({
-    repository: new PostgresExecutionOperationsRepository(pool),
-    canaryRepository: unavailableExecutionCanaryArmamentRepository(),
+    repository,
+    canaryRepository: repository,
     nonceSource: createOperatorNonce,
   });
   try {

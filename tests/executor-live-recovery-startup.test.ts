@@ -15,10 +15,10 @@ const GENERATION_ID = `execution_wallet_generation_${'a'.repeat(64)}`;
 const PUBLIC_KEY = '11111111111111111111111111111111';
 
 void test('pins every migration through 037 to a non-placeholder sha256', async () => {
-  assert.equal(LIVE_RECOVERY_MIGRATION_CATALOG.length, 38);
+  assert.equal(LIVE_RECOVERY_MIGRATION_CATALOG.length, 39);
   assert.equal(
     LIVE_RECOVERY_MIGRATION_CATALOG.at(-1)?.name,
-    '038_execution_live_rpc_budget.sql',
+    '039_execution_canary_operator_binding.sql',
   );
   for (const entry of LIVE_RECOVERY_MIGRATION_CATALOG) {
     assert.match(entry.name, /^\d{3}_[a-z0-9_-]+\.sql$/u);

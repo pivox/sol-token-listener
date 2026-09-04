@@ -5,10 +5,12 @@ import pg from 'pg';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
 import { createExecutionRiskPolicy } from '../src/domain/execution-risk-policy.js';
+import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
 import { ExecutionAdmissionService } from '../src/executor-risk/admission-service.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import {
+  admitBuyInTransaction,
   ExecutionRiskRepositoryError,
   PostgresExecutionRiskRepository,
 } from '../src/storage/execution-risk.repository.js';
@@ -17,6 +19,32 @@ const NOW_MS = Date.now();
 const WSOL = 'So11111111111111111111111111111111111111112';
 const walletKey = '11111111111111111111111111111111';
 const genesisHash = '2'.repeat(32);
+
+void test('BUY admission transaction primitive delegates locks and transaction boundaries to its caller', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk admission transaction primitive test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_admission_primitive', async (pool) => {
+    const fixture = await createFixture(pool);
+    const created = await fixture.intentRepository.create(intentDraft('primitive'));
+    const rawClient = await pool.connect();
+    try {
+      await rawClient.query('BEGIN');
+      const transactionClient = {
+        async query(text: string, values?: readonly unknown[]) {
+          assert.doesNotMatch(text, /(?:^|\\s)(?:BEGIN|COMMIT|ROLLBACK)\\b|pg_advisory_xact_lock/iu);
+          return rawClient.query(text, values === undefined ? undefined : [...values]);
+        },
+        release() {},
+      };
+      const result = await admitBuyInTransaction(transactionClient,
+        admissionInput(created.intent, fixture));
+      assert.equal(result.decision, 'ADMITTED');
+    } finally {
+      await rawClient.query('ROLLBACK');
+      rawClient.release();
+    }
+  });
+});
 
 void test('two concurrent BUY admissions serialize exposure and admit exactly one', async (context) => {
   const databaseUrl = testDatabaseUrl(context, 'execution risk concurrent admission test');
@@ -224,14 +252,18 @@ void test('admission rejects a wallet snapshot after it is superseded', async (c
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, 'execution_risk_current_wallet', async (pool) => {
     const fixture = await createFixture(pool);
-    await fixture.riskRepository.appendWalletSnapshot(Object.freeze({
-      ...fixture.walletSnapshot,
-      snapshotId: `execution_wallet_snapshot_${'d'.repeat(64)}`,
-      snapshotFingerprint: 'd'.repeat(64),
+    await fixture.riskRepository.appendWalletSnapshot(createExecutionWalletSnapshot({
+      generationId: fixture.walletSnapshot.generationId,
+      providerId: fixture.walletSnapshot.providerId,
       stateRevision: fixture.walletSnapshot.stateRevision + 1n,
       slot: fixture.walletSnapshot.slot + 1n,
       blockTimeMs: (fixture.walletSnapshot.blockTimeMs ?? NOW_MS) + 1,
       observedAtMs: fixture.walletSnapshot.observedAtMs + 1,
+      commitment: fixture.walletSnapshot.commitment,
+      walletLamports: fixture.walletSnapshot.walletLamports,
+      tokenBalanceCount: fixture.walletSnapshot.tokenBalanceCount,
+      openPositions: fixture.walletSnapshot.openPositions,
+      realizedNetPnlRaw: fixture.walletSnapshot.realizedNetPnlRaw,
     }));
     const created = await fixture.intentRepository.create(intentDraft('superseded-wallet'));
     await assert.rejects(
@@ -324,15 +356,19 @@ void test('a third durable technical failure remains readable and blocks admissi
         observedAtMs: NOW_MS + index,
       });
     }
-    const currentWallet = await fixture.riskRepository.appendWalletSnapshot({
-      ...fixture.walletSnapshot,
-      snapshotId: `execution_wallet_snapshot_${'f'.repeat(64)}`,
-      snapshotFingerprint: 'f'.repeat(64),
+    const currentWallet = await fixture.riskRepository.appendWalletSnapshot(createExecutionWalletSnapshot({
+      generationId: fixture.walletSnapshot.generationId,
+      providerId: fixture.walletSnapshot.providerId,
       stateRevision: 3n,
       slot: fixture.walletSnapshot.slot + 1n,
       observedAtMs: NOW_MS + 2,
       blockTimeMs: NOW_MS + 2,
-    });
+      commitment: fixture.walletSnapshot.commitment,
+      walletLamports: fixture.walletSnapshot.walletLamports,
+      tokenBalanceCount: fixture.walletSnapshot.tokenBalanceCount,
+      openPositions: fixture.walletSnapshot.openPositions,
+      realizedNetPnlRaw: fixture.walletSnapshot.realizedNetPnlRaw,
+    }));
     const created = await fixture.intentRepository.create(intentDraft('third-failure'));
     const result = await fixture.service.admit({
       ...admissionInput(created.intent, fixture),
@@ -358,10 +394,7 @@ async function createFixture(pool: InstanceType<typeof pg.Pool>) {
     genesisHash,
     generation: 1,
   });
-  const walletSnapshot = await riskRepository.appendWalletSnapshot({
-    snapshotId: `execution_wallet_snapshot_${'b'.repeat(64)}`,
-    payloadVersion: 1,
-    snapshotFingerprint: 'b'.repeat(64),
+  const walletSnapshot = await riskRepository.appendWalletSnapshot(createExecutionWalletSnapshot({
     generationId: generation.generationId,
     providerId: 'rpc-primary',
     stateRevision: 0n,
@@ -371,9 +404,9 @@ async function createFixture(pool: InstanceType<typeof pg.Pool>) {
     commitment: 'finalized',
     walletLamports: 1_000_000n,
     tokenBalanceCount: 0,
-    openPositions: Object.freeze([]),
+    openPositions: [],
     realizedNetPnlRaw: 0n,
-  });
+  }));
   const providerSnapshot = createProviderUsageSnapshot({
     providerId: 'rpc-primary',
     planId: 'public-v1',
