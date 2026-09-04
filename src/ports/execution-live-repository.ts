@@ -141,10 +141,16 @@ export interface ExecutionLiveReconciliationWorkV1 {
   readonly request: ExecutionReconciliationRequestV1;
 }
 
+/** Canonical signed artifact metadata safe for finality workers; raw bytes stay excluded. */
+export type ExecutionLiveArtifactReferenceV1 = Omit<
+  SignedTransactionArtifactV1,
+  'signedTransactionBytes'
+>;
+
 export interface ExecutionLiveReconciliationResultV1 {
   readonly payloadVersion: 1;
   readonly result: 'MATCHED' | 'NO_EFFECT' | 'MISMATCH' | 'UNKNOWN';
-  readonly artifact: SignedTransactionArtifactV1;
+  readonly artifact: ExecutionLiveArtifactReferenceV1;
   readonly position: ExecutionLivePositionV1 | null;
   readonly exitAuthorization: ExecutionExitAuthorizationV1 | null;
 }
@@ -186,7 +192,7 @@ export interface ExecutionLiveRepository {
   recordConfirmation(
     claim: ClaimedExecutionIntent,
     confirmation: ExecutionLiveConfirmationV1,
-  ): Promise<SignedTransactionArtifactV1>;
+  ): Promise<ExecutionLiveArtifactReferenceV1>;
   readConfirmationWork(
     claim: ClaimedExecutionIntent,
   ): Promise<ExecutionLiveConfirmationWorkV1>;

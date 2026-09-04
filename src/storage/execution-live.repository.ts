@@ -38,6 +38,7 @@ import type {
   ExecutionDeadlineExitResultV1,
   ExecutionLiveConfirmationV1,
   ExecutionLiveConfirmationWorkV1,
+  ExecutionLiveArtifactReferenceV1,
   ExecutionLivePersistSignedInputV1,
   ExecutionPreSubmissionRevocationInputV1,
   ExecutionPreSubmissionRevocationResultV1,
@@ -95,6 +96,19 @@ const HASH = /^[0-9a-f]{64}$/u;
 const PUBLIC_KEY = /^[1-9A-HJ-NP-Za-km-z]{32,64}$/u;
 const PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 const BLOCKHASH_VALIDITY_MAX_AGE_MS = 5_000;
+const ARTIFACT_REFERENCE_COLUMNS = `
+  transaction.artifact_id,transaction.payload_version,transaction.specification_version,
+  transaction.intent_id,transaction.attempt_number,transaction.generation_id,
+  transaction.armament_id,transaction.reservation_id,transaction.exit_authorization_id,
+  transaction.provider_id,transaction.wallet_public_key,transaction.side,
+  transaction.effective_venue,transaction.message_hash,transaction.build_fingerprint,
+  transaction.snapshot_fingerprint,transaction.quote_fingerprint,
+  transaction.quote_observed_at,transaction.quote_expires_at,transaction.blockhash,
+  transaction.last_valid_block_height,transaction.signature,
+  transaction.signed_transaction_hash,transaction.state,transaction.state_revision,
+  transaction.signed_at,transaction.signed_simulated_at,transaction.submission_started_at,
+  transaction.submitted_at,transaction.confirmed_at,transaction.confirmed_slot,
+  transaction.reconciled_at,transaction.revoked_at,transaction.purge_after`;
 const RUNTIME_BINDING_KEYS = Object.freeze([
   'payloadVersion', 'phase', 'buildHash', 'configurationFingerprint',
   'strategyFingerprint', 'walletPublicKey', 'cluster', 'expectedGenesisHash',
@@ -845,13 +859,13 @@ export class PostgresExecutionLiveRepository {
   public async recordConfirmation(
     claimValue: ClaimedExecutionIntent,
     confirmation: ExecutionLiveConfirmationV1,
-  ): Promise<SignedTransactionArtifactV1> {
+  ): Promise<ExecutionLiveArtifactReferenceV1> {
     const claim = claimFrom(claimValue);
     validateConfirmation(confirmation);
     return this.transaction(async (client) => {
       const identity = await artifactIdentity(client, confirmation.artifactId);
       await lockGeneration(client, identity.generationId);
-      const row = await findArtifact(client, confirmation.artifactId, true);
+      const row = await findArtifactReference(client, confirmation.artifactId, true);
       const previousState = row?.state;
       const previousStatus = row?.intent_status;
       if (row?.intent_id === claim.intent.id && previousState === 'CONFIRMED'
@@ -861,7 +875,7 @@ export class PostgresExecutionLiveRepository {
         && unsignedBigint(row.confirmed_slot) === confirmation.observedSlot
         && timestampText(row.confirmed_at_ms) === confirmation.observedAtMs
         && row.lease_owner === claim.leaseOwner && row.lease_token === claim.leaseToken) {
-        return artifactFromRow(row);
+        return artifactReferenceFromRow(row);
       }
       if (row?.intent_id !== claim.intent.id
         || (previousState !== 'ACCEPTED' && previousState !== 'AMBIGUOUS')
@@ -872,7 +886,7 @@ export class PostgresExecutionLiveRepository {
         || row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken) {
         throw failure('LEASE_LOST');
       }
-      const artifact = artifactFromRow(row);
+      const artifact = artifactReferenceFromRow(row);
       const updated = await client.query(`UPDATE execution_signed_transactions SET
         state='CONFIRMED',state_revision=$2::BIGINT,
         submitted_at=COALESCE(submitted_at,
@@ -1725,6 +1739,31 @@ async function findArtifact(
   );
 }
 
+async function findArtifactReference(
+  client: DatabaseClient,
+  artifactId: string,
+  lock: boolean,
+): Promise<Row | null> {
+  const result = await client.query(`SELECT ${ARTIFACT_REFERENCE_COLUMNS},
+    intent.status AS intent_status,intent.lease_owner,
+    intent.lease_token::TEXT AS lease_token,
+    trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+    trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
+      AS quote_observed_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.quote_expires_at)*1000)::TEXT
+      AS quote_expires_at_ms,
+    trunc(EXTRACT(EPOCH FROM transaction.confirmed_at)*1000)::TEXT AS confirmed_at_ms
+    FROM execution_signed_transactions transaction
+    JOIN execution_intents intent ON intent.id=transaction.intent_id
+    WHERE transaction.artifact_id=$1${lock ? ' FOR UPDATE OF transaction,intent' : ''}`, [
+    artifactId,
+  ]);
+  if (result.rows.length > 1) throw failure('INVALID_DATA');
+  return result.rows[0] ?? null;
+}
+
 async function findArtifactForClaim(
   client: DatabaseClient,
   intentId: string,
@@ -1842,6 +1881,58 @@ function artifactFromRow(row: Row): SignedTransactionArtifactV1 {
     signedTransactionBytes: bytes,
     signedAtMs: timestampText(row.signed_at_ms),
   });
+}
+
+function artifactReferenceFromRow(row: Row): ExecutionLiveArtifactReferenceV1 {
+  const reference: ExecutionLiveArtifactReferenceV1 = Object.freeze({
+    artifactId: text(row.artifact_id),
+    payloadVersion: 1,
+    specificationVersion: 1,
+    intentId: text(row.intent_id),
+    attemptNumber: positiveInteger(row.attempt_number),
+    generationId: text(row.generation_id),
+    armamentId: nullablePatternedId(
+      row.armament_id, /^execution_activation_armament_[0-9a-f]{64}$/u,
+    ),
+    reservationId: nullablePatternedId(
+      row.reservation_id, /^execution_exposure_reservation_[0-9a-f]{64}$/u,
+    ),
+    exitAuthorizationId: nullablePatternedId(
+      row.exit_authorization_id, /^execution_exit_authorization_[0-9a-f]{64}$/u,
+    ),
+    providerId: providerIdentifier(row.provider_id),
+    walletPublicKey: solanaAddress(row.wallet_public_key),
+    side: executionSide(row.side),
+    effectiveVenue: executionVenue(row.effective_venue),
+    messageHash: fingerprintText(row.message_hash),
+    buildFingerprint: fingerprintText(row.build_fingerprint),
+    snapshotFingerprint: fingerprintText(row.snapshot_fingerprint),
+    quoteFingerprint: fingerprintText(row.quote_fingerprint),
+    quoteObservedAtMs: timestampText(row.quote_observed_at_ms),
+    quoteExpiresAtMs: timestampText(row.quote_expires_at_ms),
+    blockhash: solanaAddress(row.blockhash),
+    lastValidBlockHeight: unsignedBigint(row.last_valid_block_height),
+    signature: reconciliationSignature(row.signature),
+    signedTransactionHash: fingerprintText(row.signed_transaction_hash),
+    state: 'PERSISTED',
+    stateRevision: 0n,
+    signedAtMs: timestampText(row.signed_at_ms),
+  });
+  if (integer(row.payload_version) !== 1 || integer(row.specification_version) !== 1
+    || !ARTIFACT_ID.test(reference.artifactId)
+    || !/^execution_intent_[0-9a-f]{64}$/u.test(reference.intentId)
+    || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(reference.generationId)
+    || createSignedTransactionArtifactId(reference) !== reference.artifactId
+    || reference.quoteObservedAtMs > reference.signedAtMs
+    || reference.signedAtMs >= reference.quoteExpiresAtMs) throw failure('INVALID_DATA');
+  return reference;
+}
+
+function nullablePatternedId(value: unknown, pattern: RegExp): string | null {
+  if (value === null) return null;
+  const candidate = text(value);
+  if (!pattern.test(candidate)) throw failure('INVALID_DATA');
+  return candidate;
 }
 
 function sameArtifact(row: Row, artifact: SignedTransactionArtifactV1): boolean {
@@ -2405,7 +2496,7 @@ function validateConfirmation(confirmation: ExecutionLiveConfirmationV1): void {
 
 async function insertLiveStateEvent(
   client: DatabaseClient,
-  artifact: SignedTransactionArtifactV1,
+  artifact: ExecutionLiveArtifactReferenceV1,
   previousState: 'PERSISTED' | 'SIGNED_SIMULATED' | 'SUBMISSION_STARTED'
     | 'ACCEPTED' | 'AMBIGUOUS' | 'CONFIRMED',
   nextState: 'SIGNED_SIMULATED' | 'SUBMISSION_STARTED' | 'ACCEPTED' | 'AMBIGUOUS'
@@ -2435,7 +2526,7 @@ async function insertLiveStateEvent(
 
 async function insertStandardIntentTransition(
   client: DatabaseClient,
-  artifact: SignedTransactionArtifactV1,
+  artifact: ExecutionLiveArtifactReferenceV1,
   previousStatus: 'SIGNED_NOT_SUBMITTED' | 'SUBMITTED' | 'CONFIRMED'
     | 'UNKNOWN_REQUIRES_RECONCILIATION',
   nextStatus: 'SUBMITTED' | 'UNKNOWN_REQUIRES_RECONCILIATION' | 'CONFIRMED',
@@ -2466,11 +2557,11 @@ async function applyLiveReconciliation(
   evidence: ExecutionReconciliationEvidenceV1,
   isReplay: boolean,
 ): Promise<Readonly<{
-  readonly artifact: SignedTransactionArtifactV1;
+  readonly artifact: ExecutionLiveArtifactReferenceV1;
   readonly position: ExecutionLivePositionV1 | null;
   readonly exitAuthorization: ExecutionExitAuthorizationV1 | null;
 }>> {
-  const row = singleRow(await client.query(`SELECT transaction.*,
+  const row = singleRow(await client.query(`SELECT ${ARTIFACT_REFERENCE_COLUMNS},
     trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
     trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
       AS quote_observed_at_ms,
@@ -2487,7 +2578,7 @@ async function applyLiveReconciliation(
     || row.blockhash !== evidence.blockhash || row.message_hash !== evidence.messageHash
     || row.build_fingerprint !== evidence.buildFingerprint
     || row.snapshot_fingerprint !== evidence.snapshotFingerprint) throw failure('CONFLICT');
-  const artifact = artifactFromRow(row);
+  const artifact = artifactReferenceFromRow(row);
   const revision = unsignedBigint(row.state_revision);
   if (row.state === 'RECONCILED') {
     if (isReplay && (evidence.result === 'UNKNOWN' || evidence.result === 'MISMATCH')) {
@@ -2644,7 +2735,7 @@ async function applyLiveReconciliation(
 }
 
 function createEntryRecords(
-  artifact: SignedTransactionArtifactV1,
+  artifact: ExecutionLiveArtifactReferenceV1,
   row: Row,
   evidence: ExecutionReconciliationEvidenceV1,
 ): Readonly<{
@@ -2700,7 +2791,7 @@ async function commitSellReconciliation(
   const generationId = exactRow(singleRow(identity), ['generation_id'] as const).generation_id;
   if (typeof generationId !== 'string') throw failure('INVALID_DATA');
   await lockGeneration(client, generationId);
-  const row = singleRow(await client.query(`SELECT transaction.*,
+  const row = singleRow(await client.query(`SELECT ${ARTIFACT_REFERENCE_COLUMNS},
     trunc(EXTRACT(EPOCH FROM transaction.signed_at)*1000)::TEXT AS signed_at_ms,
     trunc(EXTRACT(EPOCH FROM transaction.quote_observed_at)*1000)::TEXT
       AS quote_observed_at_ms,
@@ -2744,7 +2835,7 @@ async function commitSellReconciliation(
     FOR UPDATE OF transaction,intent,attempt,exit_auth,position,risk,armament`, [
     evidence.intentId, evidence.attemptNumber,
   ]));
-  const artifact = artifactFromRow(row);
+  const artifact = artifactReferenceFromRow(row);
   const existing = await client.query(`SELECT evidence_id,evidence_fingerprint,result,
     intent_id,attempt_number,side,resolved_by_evidence_id,
     trunc(EXTRACT(EPOCH FROM observed_at)*1000)::TEXT AS observed_at_ms
