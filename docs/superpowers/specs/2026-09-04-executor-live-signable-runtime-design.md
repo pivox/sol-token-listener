@@ -1,6 +1,6 @@
 # Runtime signable de l'exécuteur live — conception #51-H2b
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
 **Version de la spécification parente :** 1.10.1
 
@@ -18,6 +18,12 @@
 
 ## Historique des versions
 
+- **1.0.3 — 2026-09-04 :** réserve durablement le dernier appel
+  `sendTransaction` pendant l'état `SIGNED_SIMULATED`, avant le fence
+  `SUBMISSION_STARTED`. Ce prépaiement mono-usage ne peut être consommé que
+  par le fetch `sendTransaction`; un crash avant envoi le laisse consommé de
+  manière conservatrice et une soumission sans prépaiement ne contacte pas le
+  provider.
 - **1.0.2 — 2026-09-04 :** rend terminal l'épuisement du budget RPC durable
   avant le verrou de soumission. Le code `RPC_CALL_BUDGET_EXHAUSTED` reste
   typé jusqu'au worker, qui persiste `REVOKED_NO_SEND`; une reprise de cet
@@ -190,6 +196,15 @@ tail signable, `reserveRpcCall` incrémente ce compteur sous verrou PostgreSQL.
 Le redémarrage d'un processus, une nouvelle passe ou une lane recover ne
 réinitialise jamais ce budget.
 
+Après la preuve de blockhash et le dernier renouvellement de claim, H2b réserve
+explicitement le slot de l'unique `sendTransaction` tant que l'artefact est
+encore `SIGNED_SIMULATED`. Seulement après ce commit durable peut-il persister
+`SUBMISSION_STARTED`. Le transport ne peut consommer ce prépaiement mono-usage
+que pour l'enveloppe JSON-RPC `sendTransaction`; le genesis, la simulation et
+les lectures de blockhash continuent chacun à effectuer leur propre
+réservation. Une soumission sans ce prépaiement échoue avant le réseau et reste
+`AMBIGUOUS`, puisque le fence durable a déjà été franchi.
+
 La réservation précède le contact provider. Un crash entre ces deux opérations
 consomme donc conservativement un appel, sans remboursement ; cette perte
 bornée est préférée à un dépassement silencieux. Lorsque la limite est atteinte
@@ -200,6 +215,9 @@ sans nouvel appel provider. Si la limite est rencontrée après le verrou
 `SUBMISSION_STARTED`, le résultat demeure `AMBIGUOUS` : l'émission peut avoir
 eu lieu et aucune révocation n'est permise. Le plafond local de six appels du
 tail reste une défense secondaire et ne remplace pas le compteur durable.
+Un crash entre la réservation du slot d'envoi et son utilisation ne rembourse
+jamais ce slot : la reprise réserve conservativement un nouveau slot ou devient
+`REVOKED_NO_SEND` si le plafond est atteint.
 
 Le genesis hash est vérifié avant le secret et avant toute opération signable.
 La soumission utilise exactement les octets persistés, `skipPreflight=true` et

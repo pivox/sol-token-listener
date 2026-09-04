@@ -26,6 +26,7 @@ import { resumeLivePersistedTransaction } from '../src/executor-live/execution-w
 import { ProviderAffineSession } from '../src/executor-simulation/provider-session.js';
 import { LiveRpcError, SolanaLiveRpcSession } from '../src/executor-live/rpc-gateway.js';
 import { ExecutionLiveRepositoryError } from '../src/storage/execution-live.repository.js';
+import { LiveSubmissionGatewayError } from '../src/executor-live/submission-gateway.js';
 import {
   runLiveExecutorPass,
   runLiveExecutorRuntime,
@@ -145,7 +146,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     signableSpecification,
-    '**Version de spécification :** 1.0.2',
+    '**Version de spécification :** 1.0.3',
     'signable specification version',
   );
   assertContainsExactlyOnce(
@@ -165,7 +166,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.4.2 — 2026-09-04',
+    '**Version :** 1.4.3 — 2026-09-04',
     'runbook version',
   );
 
@@ -675,47 +676,175 @@ void test('recovery workers share the durable per-attempt RPC budget across fres
   assert.equal(providerCalls, 3, 'the rejected reservation must not reach the provider');
 });
 
+void test('a prepaid send slot remains consumed after a worker crash before submission', async () => {
+  const config = liveConfig(12);
+  const artifactId = `execution_signed_transaction_${'d'.repeat(64)}`;
+  const claim = Object.freeze({
+    intent: Object.freeze({ id: `execution_intent_${'c'.repeat(64)}` }),
+    leaseOwner: 'owner',
+    leaseToken: '00000000-0000-4000-8000-000000000000',
+  }) as never;
+  let callsReserved = 11;
+  let reservationAttempts = 0;
+  let tailSessions = 0;
+  const database = Object.freeze({
+    intents: { renew: async () => { throw new Error('unexpected renew'); } },
+    live: {
+      reserveRpcCall: async () => {
+        reservationAttempts += 1;
+        if (callsReserved >= 12) {
+          throw new ExecutionLiveRepositoryError('RPC_CALL_BUDGET_EXHAUSTED');
+        }
+        callsReserved += 1;
+        return Object.freeze({
+          payloadVersion: 1 as const, artifactId, providerId: config.providerId,
+          callsReserved, callsLimit: 12,
+        });
+      },
+    },
+  }) as never;
+  const sessionFactory = Object.freeze({
+    createTail: () => {
+      tailSessions += 1;
+      throw new Error('pre-reservation must not construct a provider session');
+    },
+  });
+  const first = createLiveExecutionWorkerForWork(config, database, sessionFactory);
+  const recovered = createLiveExecutionWorkerForWork(config, database, sessionFactory);
+  first.activateRpcBudget(claim, artifactId);
+  recovered.activateRpcBudget(claim, artifactId);
+
+  await first.reserveSubmissionRpcCall(claim, artifactId);
+  await assert.rejects(
+    recovered.reserveSubmissionRpcCall(claim, artifactId),
+    (error: unknown) => error instanceof LiveRpcError
+      && error.code === 'RPC_CALL_BUDGET_EXHAUSTED',
+  );
+
+  assert.equal(callsReserved, 12);
+  assert.equal(reservationAttempts, 2);
+  assert.equal(tailSessions, 0);
+});
+
+void test('sendTransaction cannot reserve after the fence or reach the provider without prepayment',
+  async () => {
+    const fixture = completeTailFixture();
+    const config = liveConfig(12);
+    const methods: string[] = [];
+    let reservationAttempts = 0;
+    const worker = createLiveExecutionWorkerForWork(config, Object.freeze({
+      intents: { renew: async () => { throw new Error('unexpected renew'); } },
+      live: {
+        reserveRpcCall: async () => {
+          reservationAttempts += 1;
+          return Object.freeze({
+            payloadVersion: 1 as const,
+            artifactId: fixture.artifact.artifactId,
+            providerId: config.providerId,
+            callsReserved: reservationAttempts,
+            callsLimit: 12,
+          });
+        },
+      },
+    }) as never, Object.freeze({
+      createTail: (sessionConfig, fetchImplementation) =>
+        new SolanaLiveRpcSession(sessionConfig, fetchImplementation),
+    }), async (_url, init) => {
+      const request = JSON.parse(init?.body as string) as {
+        readonly id: number;
+        readonly method: string;
+      };
+      methods.push(request.method);
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0', id: request.id, result: config.expectedGenesisHash,
+      }));
+    });
+    const claim = Object.freeze({
+      intent: Object.freeze({ id: fixture.artifact.intentId }),
+      leaseToken: '00000000-0000-4000-8000-000000000000',
+    }) as never;
+    worker.activateRpcBudget(claim, fixture.artifact.artifactId);
+
+    await assert.rejects(
+      worker.submission.submitPersisted(
+        fixture.submissionStarted, new AbortController().signal,
+      ),
+      (error: unknown) => error instanceof LiveSubmissionGatewayError
+        && error.code === 'SUBMISSION_AMBIGUOUS'
+        && error.dispatchMayHaveOccurred,
+    );
+
+    assert.deepEqual(methods, ['getGenesisHash']);
+    assert.equal(reservationAttempts, 1);
+  });
+
 void test('one tail worker verifies genesis once before its complete five-call RPC path', async () => {
   const fixture = completeTailFixture();
   const methods: string[] = [];
   const sessions: GenesisObservedLiveRpcSession[] = [];
+  let callsReserved = 6;
+  let reservationAttempts = 0;
   const config = Object.freeze({
     ...liveConfig(), maxComputeUnits: 300_000n, maxFeePayerLamportDebit: 10_000n,
   });
   const worker = createLiveExecutionWorkerForWork(config, Object.freeze({
-    intents: { renew: async () => { throw new Error('unexpected renew'); } }, live: {},
+    intents: { renew: async () => { throw new Error('unexpected renew'); } },
+    live: {
+      reserveRpcCall: async () => {
+        reservationAttempts += 1;
+        if (callsReserved >= 12) {
+          throw new ExecutionLiveRepositoryError('RPC_CALL_BUDGET_EXHAUSTED');
+        }
+        callsReserved += 1;
+        return Object.freeze({
+          payloadVersion: 1 as const,
+          artifactId: fixture.artifact.artifactId,
+          providerId: config.providerId,
+          callsReserved,
+          callsLimit: 12,
+        });
+      },
+    },
   }) as never, Object.freeze({
-    createTail: (sessionConfig: ConstructorParameters<typeof SolanaLiveRpcSession>[0]) => {
-      const session = new GenesisObservedLiveRpcSession(sessionConfig, async (_url, init) => {
-        const request = JSON.parse(init?.body as string) as {
-          readonly method: string;
-          readonly id: number;
-        };
-        methods.push(request.method);
-        let result: unknown;
-        if (request.method === 'getGenesisHash') result = config.expectedGenesisHash;
-        else if (request.method === 'getMultipleAccounts') {
-          result = { context: { slot: 124 }, value: fixture.pre };
-        } else if (request.method === 'simulateTransaction') {
-          result = {
-            context: { slot: 125 },
-            value: {
-              err: null, logs: ['Program log: signed'], unitsConsumed: 26_000,
-              accounts: fixture.post,
-            },
-          };
-        } else if (request.method === 'isBlockhashValid') {
-          result = { context: { slot: 126 }, value: true };
-        } else if (request.method === 'getBlockHeight') result = 499;
-        else if (request.method === 'sendTransaction') result = fixture.artifact.signature;
-        else throw new Error(`unexpected RPC method ${request.method}`);
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));
-      });
+    createTail: (
+      sessionConfig: ConstructorParameters<typeof SolanaLiveRpcSession>[0],
+      fetchImplementation: typeof fetch,
+    ) => {
+      const session = new GenesisObservedLiveRpcSession(sessionConfig, fetchImplementation);
       sessions.push(session);
       return session;
     },
-  }));
+  }), async (_url, init) => {
+    const request = JSON.parse(init?.body as string) as {
+      readonly method: string;
+      readonly id: number;
+    };
+    methods.push(request.method);
+    let result: unknown;
+    if (request.method === 'getGenesisHash') result = config.expectedGenesisHash;
+    else if (request.method === 'getMultipleAccounts') {
+      result = { context: { slot: 124 }, value: fixture.pre };
+    } else if (request.method === 'simulateTransaction') {
+      result = {
+        context: { slot: 125 },
+        value: {
+          err: null, logs: ['Program log: signed'], unitsConsumed: 26_000,
+          accounts: fixture.post,
+        },
+      };
+    } else if (request.method === 'isBlockhashValid') {
+      result = { context: { slot: 126 }, value: true };
+    } else if (request.method === 'getBlockHeight') result = 499;
+    else if (request.method === 'sendTransaction') result = fixture.artifact.signature;
+    else throw new Error(`unexpected RPC method ${request.method}`);
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));
+  });
   const signal = new AbortController().signal;
+  const claim = Object.freeze({
+    intent: Object.freeze({ id: fixture.artifact.intentId }),
+    leaseToken: '00000000-0000-4000-8000-000000000000',
+  }) as never;
+  worker.activateRpcBudget(claim, fixture.artifact.artifactId);
 
   await worker.signedSimulation.simulate(fixture.signedSimulation, signal);
   await worker.readBlockhashValidity(
@@ -723,6 +852,7 @@ void test('one tail worker verifies genesis once before its complete five-call R
     fixture.signedSimulation.unsignedSimulation.blockhashContextSlot,
     signal,
   );
+  await worker.reserveSubmissionRpcCall(claim, fixture.artifact.artifactId);
   await worker.submission.submitPersisted(fixture.submissionStarted, signal);
 
   assert.equal(sessions.length, 1);
@@ -730,6 +860,8 @@ void test('one tail worker verifies genesis once before its complete five-call R
   assert.deepEqual(sessions[0]?.usage(), Object.freeze({
     providerId: 'primary', rpcCallsUsed: 6, rpcCallsLimit: 6,
   }));
+  assert.equal(callsReserved, 12);
+  assert.equal(reservationAttempts, 6, 'sendTransaction must consume only its prepaid slot');
   assert.deepEqual(methods, [
     'getGenesisHash',
     'getMultipleAccounts', 'simulateTransaction',

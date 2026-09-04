@@ -214,21 +214,18 @@ export function createLiveExecutionWorkerForWork(
     readonly claim: Parameters<LiveExecutorBootstrapDatabase['live']['reserveRpcCall']>[0]['claim'];
     readonly artifactId: string;
   }> | null = null;
+  let submissionRpcCallState: 'UNRESERVED' | 'RESERVING' | 'RESERVED' | 'CONSUMED' =
+    'UNRESERVED';
   const budgetedFetch: typeof fetch = async (resource, init) => {
     const authority = rpcAuthority;
     if (authority === null) throw new TypeError('Live RPC budget authority is missing.');
-    try {
-      await database.live.reserveRpcCall(Object.freeze({
-        payloadVersion: 1,
-        claim: authority.claim,
-        artifactId: authority.artifactId,
-      }));
-    } catch (error) {
-      if (error instanceof ExecutionLiveRepositoryError
-        && error.code === 'RPC_CALL_BUDGET_EXHAUSTED') {
-        throw createLiveRpcCallBudgetExhaustedError();
+    if (isSendTransactionFetch(init)) {
+      if (submissionRpcCallState !== 'RESERVED') {
+        throw new TypeError('Live submission RPC call was not reserved before its fence.');
       }
-      throw error;
+      submissionRpcCallState = 'CONSUMED';
+    } else {
+      await reserveDurableRpcCall(database, authority);
     }
     return networkFetch(resource, init);
   };
@@ -267,6 +264,22 @@ export function createLiveExecutionWorkerForWork(
       ).submitPersisted(persisted, signal),
     }),
     renewBeforeSubmission: (claim) => database.intents.renew(claim, config.leaseMs),
+    reserveSubmissionRpcCall: async (claim, artifactId) => {
+      if (rpcAuthority?.claim.intent.id !== claim.intent.id
+        || rpcAuthority.claim.leaseToken !== claim.leaseToken
+        || rpcAuthority.artifactId !== artifactId
+        || submissionRpcCallState !== 'UNRESERVED') {
+        throw new TypeError('Invalid live submission RPC reservation authority.');
+      }
+      submissionRpcCallState = 'RESERVING';
+      try {
+        await reserveDurableRpcCall(database, Object.freeze({ claim, artifactId }));
+        submissionRpcCallState = 'RESERVED';
+      } catch (error) {
+        submissionRpcCallState = 'CONSUMED';
+        throw error;
+      }
+    },
     readBlockhashValidity: async (
       artifact: SignedTransactionArtifactV1,
       minimumContextSlot: bigint,
@@ -281,6 +294,39 @@ export function createLiveExecutionWorkerForWork(
     },
   };
   return Object.freeze(dependencies);
+}
+
+async function reserveDurableRpcCall(
+  database: LiveExecutorBootstrapDatabase,
+  authority: Readonly<{
+    readonly claim: Parameters<LiveExecutorBootstrapDatabase['live']['reserveRpcCall']>[0]['claim'];
+    readonly artifactId: string;
+  }>,
+): Promise<void> {
+  try {
+    await database.live.reserveRpcCall(Object.freeze({
+      payloadVersion: 1,
+      claim: authority.claim,
+      artifactId: authority.artifactId,
+    }));
+  } catch (error) {
+    if (error instanceof ExecutionLiveRepositoryError
+      && error.code === 'RPC_CALL_BUDGET_EXHAUSTED') {
+      throw createLiveRpcCallBudgetExhaustedError();
+    }
+    throw error;
+  }
+}
+
+function isSendTransactionFetch(init: RequestInit | undefined): boolean {
+  if (typeof init?.body !== 'string') return false;
+  try {
+    const decoded = JSON.parse(init.body) as unknown;
+    return typeof decoded === 'object' && decoded !== null && !Array.isArray(decoded)
+      && (decoded as Readonly<Record<string, unknown>>).method === 'sendTransaction';
+  } catch {
+    return false;
+  }
 }
 
 function simulationConfig(

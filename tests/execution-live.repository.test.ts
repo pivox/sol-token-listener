@@ -38,6 +38,7 @@ import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.r
 import { PostgresExecutionSimulationRepository } from '../src/storage/execution-simulation.repository.js';
 import { createLiveRecoveryBootstrapDatabase } from
   '../src/executor-live-recovery/database.js';
+import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const walletPublicKey = '11111111111111111111111111111111';
@@ -1528,6 +1529,25 @@ void test('RPC reservations remain bounded across repository instances and proce
       assert.deepEqual(durable.rows, [{
         initial_calls_used: 5, calls_reserved: 12, calls_limit: 12,
       }]);
+
+      const signed = await first.recordSignedSimulation(
+        persisted.claim,
+        signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
+          simulationSlot: 126n,
+          unitsConsumed: 26_000n,
+          feePayerLamportDebit: 5_500n,
+          baseDeltaRaw: 95n,
+          quoteDeltaRaw: -1_000n,
+          observedAtMs: fixture.artifact.signedAtMs + 1,
+        }),
+      );
+      await first.beginSubmission({
+        claim: persisted.claim,
+        artifactId: fixture.artifact.artifactId,
+        expectedRevision: signed.stateRevision,
+        ...submissionPreflight(fixture.artifact),
+      });
+      await assert.rejects(reserve(first), isLiveRepositoryError('LEASE_LOST'));
     });
   });
 
@@ -2386,6 +2406,7 @@ void test('PostgreSQL 16 recovery authority commits finality and creates a deadl
       context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
       return;
     }
+    const releaseRoleTestLock = await acquireExecutorRoleTestLock(maintenance);
 
     const suffix = randomUUID().replaceAll('-', '');
     const databaseName = `h2a_runtime_test_${suffix}`;
@@ -2515,16 +2536,19 @@ void test('PostgreSQL 16 recovery authority commits finality and creates a deadl
         status: 'PENDING', base_amount_raw: '95',
       }]);
     } finally {
-      if (recoveryDatabase !== undefined) await recoveryDatabase.close();
-      if (isolated !== undefined) await isolated.end();
-      await maintenance.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-         WHERE datname=$1 AND pid<>pg_backend_pid()`,
-        [databaseName],
-      );
-      await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
-      await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
-      await maintenance.end();
+      try {
+        if (recoveryDatabase !== undefined) await recoveryDatabase.close();
+        if (isolated !== undefined) await isolated.end();
+        await maintenance.query(
+          `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+           WHERE datname=$1 AND pid<>pg_backend_pid()`,
+          [databaseName],
+        );
+        await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+        await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
+      } finally {
+        try { await releaseRoleTestLock(); } finally { await maintenance.end(); }
+      }
     }
   });
 

@@ -115,6 +115,7 @@ void test('simulation artifact migration applies on empty/032 upgrade and replay
       '034_execution_risk_reconciliation.sql',
       '035_execution_preflight_operations.sql',
       '036_execution_live_canary.sql',
+      '037_execution_live_orchestration.sql',
       latestMigrationName,
     ]);
     assert.equal((await pool.query('SELECT id FROM execution_intents WHERE id=$1', [parent.id])).rowCount, 1);

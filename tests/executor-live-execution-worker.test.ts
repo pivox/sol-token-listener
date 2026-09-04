@@ -65,6 +65,7 @@ for (const outcome of ['ACCEPTED', 'AMBIGUOUS'] as const) {
     };
     const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
       activateRpcBudget: () => undefined,
+      reserveSubmissionRpcCall: () => Promise.resolve(),
       repository: {
         inspectSignedTransaction: (
           input: Parameters<ExecutionLiveRepository['inspectSignedTransaction']>[0],
@@ -191,6 +192,7 @@ void test('recovers SIGNED_SIMULATED without re-signing or double-sending', asyn
     };
     const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
       activateRpcBudget: () => undefined,
+      reserveSubmissionRpcCall: () => Promise.resolve(),
       repository: {
         inspectSignedTransaction: (
           input: Parameters<ExecutionLiveRepository['inspectSignedTransaction']>[0],
@@ -335,6 +337,79 @@ void test('passes the claim from the post-blockhash renewal to the submission fe
   );
 
   assert.equal(renewCount, 2);
+});
+
+void test('durably reserves the send RPC call with the final renewed claim before the fence',
+  async () => {
+    const fixture = workerFixture();
+    const calls: string[] = [];
+    const baseline = dependenciesFor(fixture, calls, false);
+    let finalClaim: ClaimedExecutionIntent | null = null;
+    let renewCount = 0;
+    const dependencies = Object.freeze({
+      ...baseline,
+      renewBeforeSubmission: (claim: ClaimedExecutionIntent) => {
+        calls.push('renew-before-submission');
+        renewCount += 1;
+        finalClaim = Object.freeze({
+          ...claim,
+          leaseToken: `${renewCount + 1}1111111-1111-4111-8111-111111111111`,
+        });
+        return Promise.resolve(finalClaim);
+      },
+      reserveSubmissionRpcCall: (claim: ClaimedExecutionIntent, artifactId: string) => {
+        calls.push('reserve-submission-rpc-call');
+        assert.equal(claim, finalClaim);
+        assert.equal(artifactId, fixture.artifact.artifactId);
+        return Promise.resolve();
+      },
+    });
+
+    await executeLivePreparedTransaction(
+      dependencies, fixture.input, new AbortController().signal,
+    );
+
+    assert.ok(calls.indexOf('reserve-submission-rpc-call') > calls.lastIndexOf(
+      'renew-before-submission',
+    ));
+    assert.ok(calls.indexOf('reserve-submission-rpc-call') < calls.indexOf('begin-submission'));
+  });
+
+void test('revokes SIGNED_SIMULATED when the durable send reservation is exhausted', async () => {
+  const fixture = workerFixture();
+  const calls: string[] = [];
+  const baseline = dependenciesFor(fixture, calls, false);
+  const error = createLiveRpcCallBudgetExhaustedError();
+  const dependencies = Object.freeze({
+    ...baseline,
+    reserveSubmissionRpcCall: () => {
+      calls.push('reserve-submission-rpc-call');
+      return Promise.reject(error);
+    },
+    repository: Object.freeze({
+      ...baseline.repository,
+      revokeBeforeSubmission: (input: ExecutionPreSubmissionRevocationInputV1) => {
+        calls.push('revoke-before-submission');
+        assert.equal(input.expectedState, 'SIGNED_SIMULATED');
+        assert.equal(input.expectedRevision, 1n);
+        return Promise.resolve(Object.freeze({
+          payloadVersion: 1 as const,
+          kind: 'REVOKED' as const,
+          artifactState: 'REVOKED_NO_SEND' as const,
+        }));
+      },
+    }),
+  });
+
+  await assert.rejects(
+    executeLivePreparedTransaction(
+      dependencies, fixture.input, new AbortController().signal,
+    ),
+    (caught: unknown) => caught === error,
+  );
+  assert.equal(calls.includes('revoke-before-submission'), true);
+  assert.equal(calls.includes('begin-submission'), false);
+  assert.equal(calls.includes('rpc-submit'), false);
 });
 
 void test('uses the persisted unsigned blockhash context as the fresh signed-simulation causal floor',
@@ -1039,6 +1114,7 @@ function dependenciesFor(
   let inspectionCount = 0;
   return Object.freeze({
     activateRpcBudget: () => undefined,
+    reserveSubmissionRpcCall: () => Promise.resolve(),
     repository: {
       persistSigned: () => {
         calls.push('persist');

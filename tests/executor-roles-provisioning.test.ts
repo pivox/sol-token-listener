@@ -21,6 +21,7 @@ import { validateLiveRecoveryStartup } from
 import { createLiveRecoveryBootstrapDatabase } from
   '../src/executor-live-recovery/database.js';
 import type { LiveRecoveryConfig } from '../src/executor-live-recovery/config.js';
+import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 const repositoryUrl = new URL('../src/storage/execution-operations.repository.ts', import.meta.url);
@@ -259,6 +260,7 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
       context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
       return;
     }
+    const releaseRoleTestLock = await acquireExecutorRoleTestLock(maintenance);
 
     const suffix = randomUUID().replaceAll('-', '');
     const databaseName = `h2a_role_test_${suffix}`;
@@ -439,20 +441,23 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
       await replica.close();
       deniedPool = undefined;
     } finally {
-      if (loginPool !== undefined) await loginPool.end();
-      if (deniedPool !== undefined) await deniedPool.end();
-      if (liveLoginPool !== undefined) await liveLoginPool.end();
-      if (isolated !== undefined) await isolated.end();
-      await maintenance.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-         WHERE datname=$1 AND pid<>pg_backend_pid()`,
-        [databaseName],
-      );
-      await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
-      await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
-      await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(deniedLoginName)}`);
-      await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(liveLoginName)}`);
-      await maintenance.end();
+      try {
+        if (loginPool !== undefined) await loginPool.end();
+        if (deniedPool !== undefined) await deniedPool.end();
+        if (liveLoginPool !== undefined) await liveLoginPool.end();
+        if (isolated !== undefined) await isolated.end();
+        await maintenance.query(
+          `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+           WHERE datname=$1 AND pid<>pg_backend_pid()`,
+          [databaseName],
+        );
+        await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+        await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
+        await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(deniedLoginName)}`);
+        await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(liveLoginName)}`);
+      } finally {
+        try { await releaseRoleTestLock(); } finally { await maintenance.end(); }
+      }
     }
   });
 
@@ -473,6 +478,7 @@ void test('provisioned retention role runs the complete purge without reading si
     context.skip('A PostgreSQL superuser with CREATEDB is required for isolated role testing.');
     return;
   }
+  const releaseRoleTestLock = await acquireExecutorRoleTestLock(maintenance);
 
   const databaseName = `retention_role_test_${randomUUID().replaceAll('-', '')}`;
   const isolatedUrl = new URL(baseUrl);
@@ -625,14 +631,17 @@ void test('provisioned retention role runs the complete purge without reading si
       try { await byteProbe.query('RESET ROLE'); } finally { byteProbe.release(); }
     }
   } finally {
-    if (isolated !== undefined) await isolated.end();
-    await maintenance.query(
-      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-       WHERE datname=$1 AND pid<>pg_backend_pid()`,
-      [databaseName],
-    );
-    await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
-    await maintenance.end();
+    try {
+      if (isolated !== undefined) await isolated.end();
+      await maintenance.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname=$1 AND pid<>pg_backend_pid()`,
+        [databaseName],
+      );
+      await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+    } finally {
+      try { await releaseRoleTestLock(); } finally { await maintenance.end(); }
+    }
   }
 });
 

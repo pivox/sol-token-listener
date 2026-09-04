@@ -308,7 +308,7 @@ export class PostgresExecutionLiveRepository {
         || integer(row.attempt_count) !== input.claim.intent.attemptCount
         || unsignedBigint(row.intent_state_revision) !== input.claim.intent.stateRevision
         || row.intent_status !== 'SIGNED_NOT_SUBMITTED'
-        || !['PERSISTED', 'SIGNED_SIMULATED', 'SUBMISSION_STARTED'].includes(
+        || !['PERSISTED', 'SIGNED_SIMULATED'].includes(
           text(row.artifact_state),
         )
         || row.lease_owner !== input.claim.leaseOwner

@@ -100,6 +100,7 @@ void test('worker restart durably routes SUBMISSION_STARTED to ambiguity without
 
       const result = await executeLivePreparedTransaction(Object.freeze({
         activateRpcBudget: () => undefined,
+        reserveSubmissionRpcCall: () => Promise.resolve(),
         repository: fixture.live,
         signedSimulation: Object.freeze({
           simulate: () => {

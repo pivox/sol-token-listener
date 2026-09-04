@@ -48,6 +48,7 @@ void test('websocket health migration upgrades legacy state without trusting its
       '034_execution_risk_reconciliation.sql',
       '035_execution_preflight_operations.sql',
       '036_execution_live_canary.sql',
+      '037_execution_live_orchestration.sql',
       latestMigrationName,
     ]);
     const beforeReplay = await canonicalRow(pool);

@@ -46,6 +46,10 @@ export interface LiveExecutionWorkerDependencies {
   readonly renewBeforeSubmission: (
     claim: ClaimedExecutionIntent,
   ) => Promise<ClaimedExecutionIntent>;
+  readonly reserveSubmissionRpcCall: (
+    claim: ClaimedExecutionIntent,
+    artifactId: string,
+  ) => Promise<void>;
   readonly readBlockhashValidity: (
     artifact: SignedTransactionArtifactV1,
     minimumContextSlot: bigint,
@@ -246,6 +250,27 @@ async function continueLivePersistedTransaction(
     throw error;
   }
   activeClaim = await dependencies.renewBeforeSubmission(activeClaim);
+  try {
+    await dependencies.reserveSubmissionRpcCall(activeClaim, artifact.artifactId);
+  } catch (error) {
+    if (!signal.aborted && isLiveRpcCallBudgetExhaustedError(error)) {
+      const observedAtMs = now(dependencies.clock);
+      await dependencies.repository.revokeBeforeSubmission(Object.freeze({
+        payloadVersion: 1,
+        claim: activeClaim,
+        artifactId: artifact.artifactId,
+        expectedState: 'SIGNED_SIMULATED',
+        expectedRevision: simulatedRevision,
+        causeReasonCode: 'PRE_SUBMISSION_GATES_FAILED',
+        evidenceFingerprint: preSubmissionGateFailureFingerprint(
+          artifact.artifactId, artifact.signedTransactionHash,
+          error.code, observedAtMs,
+        ),
+        observedAtMs,
+      }));
+    }
+    throw error;
+  }
   let started: Awaited<ReturnType<ExecutionLiveRepository['beginSubmission']>>;
   try {
     started = await dependencies.repository.beginSubmission({

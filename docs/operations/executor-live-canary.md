@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.4.2 — 2026-09-04
+**Version :** 1.4.3 — 2026-09-04
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -124,6 +124,10 @@ la tentative avant tout nouvel appel réseau. Avant `SUBMISSION_STARTED`, cet
 épuisement est persisté en `REVOKED_NO_SEND` et sa reprise ne contacte plus le
 provider. Après `SUBMISSION_STARTED`, il reste `AMBIGUOUS`, car une émission
 ne peut plus être exclue ; il n'est jamais reclassé en révocation.
+Le slot du seul `sendTransaction` est réservé séparément après la preuve de
+blockhash et avant `SUBMISSION_STARTED`. Seul le fetch `sendTransaction` peut
+consommer ce prépaiement. Un crash dans cet intervalle conserve le slot comme
+consommé ; la reprise ne le rembourse pas et doit en réserver un nouveau.
 
 La priorité SELL est protégée transactionnellement : chaque création SELL et
 chaque claim BUY live prennent le même verrou advisory de présence SELL. Le
