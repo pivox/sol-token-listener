@@ -66,25 +66,30 @@ chaque tour des quatre lanes existantes.
 
 **Steps:**
 
-1. Ajouter les tests rouges des nouvelles variables publiques : sidecar absolu,
-   lease, quote age, slippage, lag, compute, fee, débit fee payer et budget RPC.
-   Réutiliser exactement les bornes du config H2b et interdire toute variable
-   secret dans le graphe opérations.
-   Pour CANARY, refuser un lease supérieur à 120 000 ms dans les configs
-   opérations et H2b.
+1. Conserver le parser opérations commun pour les commandes existantes et
+   ajouter un parser arm-only. Tester les nouvelles variables publiques :
+   sidecar absolu, lease, quote age, slippage, lag, compute, fee, débit fee
+   payer et budget RPC. Réutiliser exactement les bornes H2b et interdire toute
+   variable secret. Pour CANARY, refuser un lease supérieur à 120 000 ms dans
+   les configs opérations et H2b.
 2. Tester la commande `live:arm --intent-id --maximum-lamports --holding-ms
    --reason`, sans valeur permissive et sans option de bypass.
-3. Tester une phrase TTY complète contenant version, wallet non tronqué, target,
+3. Tester une autorisation opérateur V2 et sa phrase TTY complète contenant
+   version, wallet non tronqué, target,
    mint, quote mint, montants, expiry, request fingerprint et nonce ; le détail
    préalable contient policy/snapshots et limites runtime.
 4. Faire vérifier le sidecar par le CLI, relire qualification et intent via le
    service, contrôler la correspondance des gates snapshot et exiger au moins
-   `2 * leaseMs` de durée restante.
-5. Produire l'autorisation V2 avec
+   `2 * leaseMs` sur l'expiry effective. Celle-ci est le minimum des expirations
+   qualification/intent/sidecar/provider, de `providerMeasuredAt +
+   providerUsageMaxAgeMs` et de `walletObservedAt + walletSnapshotMaxAgeMs`.
+5. Produire l'autorisation V2 (`payloadVersion=2`, domaine de hash V2) avec
    `contextFingerprint=armamentRequestFingerprint`, puis transmettre une
    commande atomique au repository. Afficher après commit armament, admission et
    reservation IDs sans annoncer de capacité live validée.
 6. Exécuter les quatre fichiers de test ciblés.
+   Le cap du fichier enveloppe et celui du payload décodé sont distincts et
+   testés afin d'accepter l'encodage base64 sans dépasser les bornes.
 
 ## Task 3: Migration 039 et admission/armement atomiques
 
@@ -110,6 +115,8 @@ chaque tour des quatre lanes existantes.
    système fermé et rétention quatre heures. Créer aussi
    `execution_pre_signature_locks` avec bytes non signés executor-only, machine
    `AUTHORIZED|SIGNED_PERSISTED|REVOKED` et unicités causales.
+   Étendre les autorisations avec une branche V2 et les événements de contrôle
+   avec `actor_type`, acteur/source causale et CHECK système strictement borné.
 3. Extraire les primitives transactionnelles d'append wallet/provider et
    `admitBuyInTransaction(client,input)` du repository risque ; garder les
    méthodes publiques comme wrappers transactionnels. Le repository opérations

@@ -2,7 +2,7 @@
 
 **Version de spécification :** 1.0.1
 
-**Version de la spécification parente :** 1.10.0
+**Version de la spécification parente :** 1.10.1
 
 **Date :** 2026-09-04
 
@@ -153,6 +153,7 @@ armement ; le canary n'autorise pas une réinterprétation implicite de la cible
 contract version, qualification id/fingerprint, phase,
 build/configuration/strategy fingerprints,
 generation id, wallet public key complet, cluster, genesis, provider,
+canary evidence id/fingerprint/captured at/expires at,
 target intent id/state revision/strategy id+version/decision fingerprint,
 target mint/quote mint/quote amount raw,
 maximum buys/capital lamports/exposure bps/open positions/holding ms,
@@ -162,8 +163,11 @@ fee limit/fee-payer debit limit/RPC call limit/lease duration,
 armed at, expires at, operator id, operator reason
 ```
 
-Pour V2, `execution_operator_authorizations.context_fingerprint` est exactement
-ce fingerprint. L'autorisation reste mono-usage et expire après 60 secondes.
+Pour V2, l'autorisation opérateur utilise `payload_version=2`, le domaine de
+hash `execution-operator-authorization-v2` et
+`execution_operator_authorizations.context_fingerprint` est exactement ce
+fingerprint. Les autorisations V1 terminales restent lisibles ; aucune V1 ne
+peut armer un armement V2. L'autorisation reste mono-usage et expire après 60 secondes.
 L'armement et sa cible ne sont insérés qu'après relecture transactionnelle de
 l'autorisation, de la qualification, du contrôle `RUNNING`, du risque connu et
 de l'intention exacte.
@@ -244,6 +248,9 @@ Le catalogue de migrations, les rôles opérations/live/rétention et leurs list
 de colonnes sont mis à jour. Aucun rôle listener, API ou H2a ne reçoit les bytes
 signés ou une nouvelle capacité de mutation. La rétention conserve quatre
 heures les lignes terminales et ne supprime jamais un verrou actif ou ambigu.
+Son rôle peut supprimer une ligne de lock terminale sans `SELECT` sur les
+colonnes BYTEA, après la cohorte artefact associée ; il ne peut ni lire les
+bytes ni supprimer un lock `AUTHORIZED`.
 
 Pour garantir l'atomicité sans dupliquer la politique, H2c extrait du repository
 risque les primitives transactionnelles d'append wallet/provider et
@@ -290,11 +297,14 @@ réservation et la qualification restent frais pendant au moins
 soient simplement non expirés.
 
 L'armement impose déjà une marge d'au moins deux fois `runtime_lease_ms` sur la
-qualification, l'intention, les snapshots provider/wallet et le sidecar. Le
-premier lease couvre démarrage/claim/préparation ; le second laisse au lock une
-fenêtre complète. Un opérateur qui attend et consomme cette marge obtient un
-refus fail-closed et doit produire une nouvelle qualification, jamais une
-extension implicite.
+qualification, l'intention, le snapshot provider et le sidecar. Pour le wallet,
+qui n'a pas d'`expiresAt`, la condition exacte est
+`observedAtMs + walletSnapshotMaxAgeMs >= databaseNowMs + 2 * runtimeLeaseMs` à
+l'armement, puis `>= databaseNowMs + runtimeLeaseMs` au lock. Le premier lease
+couvre démarrage/claim/préparation ; le second laisse au lock une fenêtre
+complète. Un opérateur qui attend et consomme cette marge obtient un refus
+fail-closed et doit produire une nouvelle qualification, jamais une extension
+implicite.
 
 Pour CANARY, les configs opérations et H2b refusent `runtime_lease_ms` supérieur
 à 120 000 ms ; la qualification fixe de cinq minutes conserve ainsi la marge de
@@ -326,6 +336,14 @@ aussi appliqués dans les transactions H2b qui rendent une soumission ambiguë o
 une réconciliation inconnue. Le helper ne peut jamais reprendre `RUNNING`,
 abaisser `HARD_STOP`, armer, signer ou soumettre.
 
+Les événements de contrôle ajoutent `actor_type=OPERATOR|SYSTEM`, un
+`actor_id` obligatoire uniquement pour l'opérateur et des références causales
+optionnelles vers intent, tentative, lock et artefact. Leur identité système est
+déterministe sur génération, état précédent/suivant, reason code, source et
+heure PostgreSQL. Les CHECK et le trigger refusent un acteur système pour
+`RESUME`, `ARM`, `HARD_STOP` ou toute transition autre que l'arrêt d'entrée
+décrit ci-dessus.
+
 Cette conclusion `NO_SEND` est valide parce que le gateway de soumission ne
 peut recevoir que des bytes relus depuis `execution_signed_transactions`, et
 qu'aucun artefact n'existe. Dès qu'un artefact existe, les règles H2b normales
@@ -335,8 +353,7 @@ prévalent ; après `SUBMISSION_STARTED`, toute incertitude reste `AMBIGUOUS`.
 
 La claim BUY live reçoit la `generationId` du runtime et ne sélectionne que le
 `target_intent_id` de l'armement V2 `ARMED` actif, avec admission et réservation
-exactes. Elle conserve le verrou
-de présence SELL et `READ COMMITTED`.
+exactes. Elle conserve le verrou de présence SELL et `READ COMMITTED`.
 Sans armement exact, aucune intention BUY n'est louée ni altérée.
 
 Avant d'ouvrir le keypair, H2b exécute un pre-pass PostgreSQL sans signer sur
