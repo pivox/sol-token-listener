@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import bs58 from 'bs58';
-import { createSignedTransactionArtifact } from '../src/domain/execution-live.js';
+import {
+  createSignedTransactionArtifact,
+  type SignedTransactionArtifactV1,
+} from '../src/domain/execution-live.js';
 import { createExecutionIntentDraft, type ExecutionIntentV1 } from '../src/domain/execution-intent.js';
 import {
   executeLivePreparedTransaction,
@@ -13,6 +16,9 @@ import {
   type SignedSimulationGatewayInputV1,
 } from '../src/executor-live/signed-simulation-gateway.js';
 import { LiveSubmissionGatewayError } from '../src/executor-live/submission-gateway.js';
+import {
+  createLiveRpcCallBudgetExhaustedError,
+} from '../src/executor-live/rpc-gateway.js';
 import {
   ExecutionLiveRepositoryError,
   type ExecutionLiveRepositoryErrorCode,
@@ -58,6 +64,7 @@ for (const outcome of ['ACCEPTED', 'AMBIGUOUS'] as const) {
       assert.equal(claim.intent.stateRevision, activeClaim.intent.stateRevision);
     };
     const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+      activateRpcBudget: () => undefined,
       repository: {
         inspectSignedTransaction: (
           input: Parameters<ExecutionLiveRepository['inspectSignedTransaction']>[0],
@@ -128,8 +135,15 @@ for (const outcome of ['ACCEPTED', 'AMBIGUOUS'] as const) {
         requireClaim(claim);
         return Promise.resolve(activeClaim);
       },
-      readBlockhashValidity: () => {
+      readBlockhashValidity: (
+        _artifact: SignedTransactionArtifactV1,
+        minimumContextSlot: bigint,
+      ) => {
         calls.push('read-blockhash-validity');
+        assert.equal(
+          minimumContextSlot,
+          fixture.input.persist.unsignedSimulation.blockhashContextSlot,
+        );
         return Promise.resolve(fixture.blockhashValidity);
       },
       submission: {
@@ -176,6 +190,7 @@ void test('recovers SIGNED_SIMULATED without re-signing or double-sending', asyn
       assert.equal(claim.intent.stateRevision, activeClaim.intent.stateRevision);
     };
     const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+      activateRpcBudget: () => undefined,
       repository: {
         inspectSignedTransaction: (
           input: Parameters<ExecutionLiveRepository['inspectSignedTransaction']>[0],
@@ -360,6 +375,33 @@ void test('records ambiguity after the durable submission fence and never retrie
   assert.equal(calls.filter((call) => call === 'rpc-submit').length, 1);
 });
 
+void test('keeps RPC budget exhaustion ambiguous after the durable submission fence', async () => {
+  const fixture = workerFixture();
+  const calls: string[] = [];
+  const baseline = dependenciesFor(fixture, calls, false);
+  const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+    ...baseline,
+    submission: Object.freeze({
+      submitPersisted: () => {
+        calls.push('rpc-submit');
+        return Promise.reject(createLiveRpcCallBudgetExhaustedError());
+      },
+    }),
+  });
+
+  const result = await executeLivePreparedTransaction(
+    dependencies, fixture.input, new AbortController().signal,
+  );
+
+  assert.equal(result.kind, 'AMBIGUOUS');
+  assert.deepEqual(calls, [
+    'inspect', 'persist', 'inspect', 'signed-simulate', 'record-signed-simulation',
+    'renew-before-submission', 'read-blockhash-validity',
+    'renew-before-submission', 'begin-submission', 'rpc-submit', 'record-ambiguous',
+  ]);
+  assert.equal(calls.includes('revoke-before-submission'), false);
+});
+
 void test('does not rewrite an accepted outcome as ambiguous when its commit is unknown', async () => {
   const fixture = workerFixture();
   const calls: string[] = [];
@@ -409,6 +451,77 @@ void test('does not classify an unavailable signed simulation provider as determ
   );
   assert.deepEqual(calls, ['inspect', 'persist', 'inspect', 'signed-simulate']);
 });
+
+void test('durably revokes persisted bytes when the RPC budget is exhausted during signed simulation',
+  async () => {
+    const fixture = workerFixture();
+    const calls: string[] = [];
+    const baseline = dependenciesFor(fixture, calls, false);
+    const error = createLiveRpcCallBudgetExhaustedError();
+    const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+      ...baseline,
+      signedSimulation: Object.freeze({
+        simulate: () => {
+          calls.push('signed-simulate');
+          return Promise.reject(error);
+        },
+      }),
+    });
+
+    await assert.rejects(
+      executeLivePreparedTransaction(
+        dependencies, fixture.input, new AbortController().signal,
+      ),
+      (caught: unknown) => caught === error,
+    );
+
+    assert.deepEqual(calls, [
+      'inspect', 'persist', 'inspect', 'signed-simulate', 'revoke-before-submission',
+    ]);
+  });
+
+void test('durably revokes signed-simulated bytes when the RPC budget is exhausted before the fence',
+  async () => {
+    const fixture = workerFixture();
+    const calls: string[] = [];
+    const baseline = dependenciesFor(fixture, calls, false);
+    const error = createLiveRpcCallBudgetExhaustedError();
+    const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+      ...baseline,
+      readBlockhashValidity: () => {
+        calls.push('read-blockhash-validity');
+        return Promise.reject(error);
+      },
+      repository: Object.freeze({
+        ...baseline.repository,
+        revokeBeforeSubmission: (input: ExecutionPreSubmissionRevocationInputV1) => {
+          calls.push('revoke-before-submission');
+          assert.equal(input.expectedState, 'SIGNED_SIMULATED');
+          assert.equal(input.expectedRevision, 1n);
+          assert.equal(input.causeReasonCode, 'PRE_SUBMISSION_GATES_FAILED');
+          return Promise.resolve(Object.freeze({
+            payloadVersion: 1 as const,
+            kind: 'REVOKED' as const,
+            artifactState: 'REVOKED_NO_SEND' as const,
+          }));
+        },
+      }),
+    });
+
+    await assert.rejects(
+      executeLivePreparedTransaction(
+        dependencies, fixture.input, new AbortController().signal,
+      ),
+      (caught: unknown) => caught === error,
+    );
+
+    assert.deepEqual(calls, [
+      'inspect', 'persist', 'inspect', 'signed-simulate', 'record-signed-simulation',
+      'renew-before-submission', 'read-blockhash-validity', 'revoke-before-submission',
+    ]);
+    assert.equal(calls.includes('begin-submission'), false);
+    assert.equal(calls.includes('rpc-submit'), false);
+  });
 
 void test('does not irreversibly revoke when cancellation caused signed validation to stop',
   async () => {
@@ -690,6 +803,66 @@ void test('restart from REVOKED_NO_SEND returns a stable terminal result', async
   assert.deepEqual(calls, ['inspect']);
 });
 
+void test('recovery after RPC budget exhaustion is terminal and performs no new provider call',
+  async () => {
+    const fixture = workerFixture();
+    const calls: string[] = [];
+    const baseline = dependenciesFor(fixture, calls, false);
+    const error = createLiveRpcCallBudgetExhaustedError();
+    let state: 'ABSENT' | 'PERSISTED' | 'REVOKED_NO_SEND' = 'ABSENT';
+    let providerCalls = 0;
+    const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+      ...baseline,
+      repository: Object.freeze({
+        ...baseline.repository,
+        persistSigned: (input: Parameters<ExecutionLiveRepository['persistSigned']>[0]) => {
+          state = 'PERSISTED';
+          return baseline.repository.persistSigned(input);
+        },
+        inspectSignedTransaction: () => {
+          calls.push('inspect');
+          if (state === 'ABSENT') return Promise.resolve(null);
+          return Promise.resolve(inspectionFor(
+            fixture, state, state === 'PERSISTED' ? 0n : 1n,
+          ));
+        },
+        revokeBeforeSubmission: () => {
+          calls.push('revoke-before-submission');
+          state = 'REVOKED_NO_SEND';
+          return Promise.resolve(Object.freeze({
+            payloadVersion: 1 as const,
+            kind: 'REVOKED' as const,
+            artifactState: 'REVOKED_NO_SEND' as const,
+          }));
+        },
+      }),
+      signedSimulation: Object.freeze({
+        simulate: () => {
+          calls.push('signed-simulate');
+          providerCalls += 1;
+          return Promise.reject(error);
+        },
+      }),
+    });
+    await assert.rejects(
+      executeLivePreparedTransaction(
+        dependencies, fixture.input, new AbortController().signal,
+      ),
+      (caught: unknown) => caught === error,
+    );
+    const providerCallsBeforeRecovery = providerCalls;
+    const recovered = await executeLivePreparedTransaction(
+      dependencies, fixture.input, new AbortController().signal,
+    );
+
+    assert.equal(recovered.kind, 'REVOKED_NO_SEND');
+    assert.equal(providerCalls, providerCallsBeforeRecovery);
+    assert.deepEqual(calls, [
+      'inspect', 'persist', 'inspect', 'signed-simulate',
+      'revoke-before-submission', 'inspect',
+    ]);
+  });
+
 void test('restart recovers an unknown revocation commit without depending on a new clock value',
   async () => {
     const fixture = workerFixture();
@@ -865,6 +1038,7 @@ function dependenciesFor(
   });
   let inspectionCount = 0;
   return Object.freeze({
+    activateRpcBudget: () => undefined,
     repository: {
       persistSigned: () => {
         calls.push('persist');
@@ -1037,6 +1211,9 @@ function workerFixture() {
         qualificationId: `execution_safety_qualification_${'a'.repeat(64)}`,
         reservationId: `execution_exposure_reservation_${'b'.repeat(64)}`,
         artifact, unsignedSimulation,
+        rpcBudget: Object.freeze({
+          payloadVersion: 1 as const, callsUsed: 5, callsLimit: 12,
+        }),
       }),
       signedSimulation: Object.freeze({
         payloadVersion: 1 as const, snapshotSlot: 123n,

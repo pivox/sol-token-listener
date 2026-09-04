@@ -43,6 +43,27 @@ export interface ExecutionLivePersistSignedInputV1 {
   readonly reservationId: string | null;
   readonly artifact: SignedTransactionArtifactV1;
   readonly unsignedSimulation: ExecutionSimulationEvidenceV1;
+  readonly rpcBudget: Readonly<{
+    readonly payloadVersion: 1;
+    /** Calls already consumed by the unsigned, provider-affine phase. */
+    readonly callsUsed: number;
+    /** Durable upper bound for every RPC call in this execution attempt. */
+    readonly callsLimit: number;
+  }>;
+}
+
+export interface ExecutionLiveRpcCallReservationInputV1 {
+  readonly payloadVersion: 1;
+  readonly claim: ClaimedExecutionIntent;
+  readonly artifactId: string;
+}
+
+export interface ExecutionLiveRpcCallReservationV1 {
+  readonly payloadVersion: 1;
+  readonly artifactId: string;
+  readonly providerId: string;
+  readonly callsReserved: number;
+  readonly callsLimit: number;
 }
 
 /** Artifact and still-held claim committed by the same persistence transaction. */
@@ -212,6 +233,9 @@ export interface ExecutionLiveRepository {
   persistSigned(
     input: ExecutionLivePersistSignedInputV1,
   ): Promise<ExecutionLivePersistSignedResultV1>;
+  reserveRpcCall(
+    input: ExecutionLiveRpcCallReservationInputV1,
+  ): Promise<ExecutionLiveRpcCallReservationV1>;
   inspectSignedTransaction(input: Readonly<{
     readonly claim: ClaimedExecutionIntent;
     readonly artifactId?: string;

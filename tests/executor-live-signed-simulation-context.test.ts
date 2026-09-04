@@ -329,6 +329,7 @@ void test('PERSISTED recovery carries its final claim without re-signing or doub
       claim: activeClaim,
     });
     const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+      activateRpcBudget: () => undefined,
       repository: Object.freeze({
         persistSigned: () => { throw new Error('recovery must not persist or re-sign'); },
         inspectSignedTransaction: () => Promise.resolve(inspection),
@@ -675,6 +676,7 @@ function rejectingResumeDependencies(
     return new Error(`unexpected ${label}`);
   };
   return Object.freeze({
+    activateRpcBudget: () => undefined,
     repository: Object.freeze({
       persistSigned: () => Promise.reject(unexpected('persist')),
       inspectSignedTransaction: () => {

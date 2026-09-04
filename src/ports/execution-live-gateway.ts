@@ -2,6 +2,7 @@ export interface ExecutionSignedSimulationRequestV1 {
   readonly payloadVersion: 1;
   readonly transactionBase64: string;
   readonly snapshotSlot: bigint;
+  readonly estimatedFeeLamports: bigint;
   readonly accountAddresses: readonly [string, string, string];
   readonly commitment: 'confirmed';
   readonly sigVerify: true;

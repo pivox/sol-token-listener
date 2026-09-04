@@ -16,6 +16,7 @@ import type {
   ExecutionLiveGateway,
   ExecutionSignedSimulationResultV1,
 } from '../ports/execution-live-gateway.js';
+import { isLiveRpcCallBudgetExhaustedError } from './rpc-gateway.js';
 
 export type SignedSimulationGatewayErrorCode =
   | 'SIGNED_TRANSACTION_INVALID'
@@ -81,12 +82,14 @@ export class SignedSimulationGateway {
         payloadVersion: 1,
         transactionBase64: Buffer.from(validated.bytes).toString('base64'),
         snapshotSlot: input.snapshotSlot,
+        estimatedFeeLamports: input.unsignedSimulation.estimatedFeeLamports,
         accountAddresses: input.accountAddresses,
         commitment: 'confirmed',
         sigVerify: true,
         replaceRecentBlockhash: false,
       }), signal);
-    } catch {
+    } catch (error) {
+      if (isLiveRpcCallBudgetExhaustedError(error)) throw error;
       throw new SignedSimulationGatewayError('SIGNED_SIMULATION_FAILED');
     }
     try {

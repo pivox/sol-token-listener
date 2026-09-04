@@ -18,14 +18,14 @@ const PUBLIC_KEY = '11111111111111111111111111111111';
 const FINGERPRINT = 'b'.repeat(64);
 
 void test('pins the existing migration catalogue and rejects a changed migration hash', async () => {
-  assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.length, 37);
+  assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.length, 38);
   assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.at(-1)?.name,
-    '037_execution_live_orchestration.sql');
+    '038_execution_live_rpc_budget.sql');
   await validateLiveExecutorMigrationFiles();
 
   const directory = await mkdtemp(join(tmpdir(), 'executor-live-migrations-'));
   await cp(new URL('../migrations/', import.meta.url), directory, { recursive: true });
-  const changed = join(directory, '037_execution_live_orchestration.sql');
+  const changed = join(directory, '038_execution_live_rpc_budget.sql');
   await writeFile(changed, `${await readFile(changed, 'utf8')}\n-- drift\n`);
   await assert.rejects(
     validateLiveExecutorMigrationFiles(directory),
@@ -50,7 +50,7 @@ void test('validates role, exact authority, migrations and live bindings without
     assert.deepEqual(evidence, {
       payloadVersion: 1,
       role: 'sol_token_executor_live',
-      migrationHead: '037_execution_live_orchestration.sql',
+      migrationHead: '038_execution_live_rpc_budget.sql',
       generationId: GENERATION_ID,
       providerId: 'primary',
       phase: 'CANARY',
@@ -271,6 +271,7 @@ void test('authority allowlist is restricted to H2b signing and submission primi
     'execution_intent_transitions',
     'execution_intents',
     'execution_live_positions',
+    'execution_live_rpc_budgets',
     'execution_live_unsigned_simulation_evidence',
     'execution_pre_submission_revocations',
     'execution_provider_rate_limit_events',
@@ -415,7 +416,7 @@ function databaseFor(calls: string[], overrides: Overrides = {}, valuesLog: unkn
       }
       if (text.includes('divergent_work_count')) {
         calls.push('work');
-        assert.deepEqual(values, [GENERATION_ID, PUBLIC_KEY, 'primary']);
+        assert.deepEqual(values, [GENERATION_ID, PUBLIC_KEY, 'primary', 12]);
         return result({ divergent_work_count: overrides.divergentWork ?? '0' });
       }
       throw new Error('Unexpected query.');

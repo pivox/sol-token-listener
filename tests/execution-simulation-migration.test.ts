@@ -7,7 +7,7 @@ import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '037_execution_live_orchestration.sql';
+const latestMigrationName = '038_execution_live_rpc_budget.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);

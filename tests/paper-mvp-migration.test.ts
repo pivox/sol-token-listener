@@ -178,7 +178,7 @@ void test('applies migrations 001-037 on an empty schema and replays cleanly', a
   try {
     await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), '037_execution_live_orchestration.sql');
+    assert.equal(applied.at(-1), '038_execution_live_rpc_budget.sql');
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query('SET enable_seqscan=off');
     const launchPlan = await pool.query<Readonly<{ 'QUERY PLAN': string }>>(`EXPLAIN (COSTS OFF)

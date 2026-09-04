@@ -450,6 +450,7 @@ ON TABLE api_event_stream_state TO sol_token_retention_worker;
 REVOKE ALL ON TABLE
   execution_signed_transactions,
   execution_live_unsigned_simulation_evidence,
+  execution_live_rpc_budgets,
   execution_signed_simulation_evidence,
   execution_submission_preflight_evidence,
   execution_pre_submission_revocations,
@@ -840,6 +841,15 @@ GRANT SELECT (
   logs_fingerprint,logs_line_count,recorded_at
 )
 ON TABLE execution_live_unsigned_simulation_evidence TO sol_token_executor_live;
+
+GRANT SELECT (
+  intent_id,attempt_number,artifact_id,provider_id,initial_calls_used,
+  calls_reserved,calls_limit,created_at
+), INSERT (
+  intent_id,attempt_number,artifact_id,provider_id,initial_calls_used,
+  calls_reserved,calls_limit,created_at
+), UPDATE (calls_reserved)
+ON TABLE execution_live_rpc_budgets TO sol_token_executor_live;
 
 GRANT SELECT (
   payload_version,evidence_fingerprint,artifact_id,unsigned_simulation_evidence_id,

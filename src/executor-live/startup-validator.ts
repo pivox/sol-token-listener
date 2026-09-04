@@ -31,7 +31,7 @@ export interface LiveExecutorStartupDatabase {
 export interface LiveExecutorStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live';
-  readonly migrationHead: '037_execution_live_orchestration.sql';
+  readonly migrationHead: '038_execution_live_rpc_budget.sql';
   readonly generationId: string;
   readonly providerId: string;
   readonly phase: LiveExecutorConfig['phase'];
@@ -248,6 +248,13 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'simulated_fee_payer_lamport_debit', 'units_consumed', 'simulated_base_delta_raw',
         'simulated_quote_delta_raw', 'logs_fingerprint', 'logs_line_count', 'recorded_at',
       )),
+      table('execution_live_rpc_budgets', names(
+        'intent_id', 'attempt_number', 'artifact_id', 'provider_id',
+        'initial_calls_used', 'calls_reserved', 'calls_limit', 'created_at',
+      ), names(
+        'intent_id', 'attempt_number', 'artifact_id', 'provider_id',
+        'initial_calls_used', 'calls_reserved', 'calls_limit', 'created_at',
+      ), names('calls_reserved')),
       table('execution_signed_simulation_evidence', names(
         'payload_version', 'evidence_fingerprint', 'artifact_id',
         'unsigned_simulation_evidence_id', 'signed_transaction_hash', 'provider_id',
@@ -518,6 +525,7 @@ export async function validateLiveExecutorStartup(
 
   const work = oneRow(await queryAt(database, OPEN_WORK_SQL, [
     config.generationId, config.executorPublicKey, config.providerId,
+    config.maxRpcCallsPerAttempt,
   ], 'OPEN_WORK_BINDING_INVALID'), 'OPEN_WORK_BINDING_INVALID');
   if (!exactKeys(work, ['divergent_work_count'])
     || work.divergent_work_count !== '0') throw failure('OPEN_WORK_BINDING_INVALID');
@@ -525,7 +533,7 @@ export async function validateLiveExecutorStartup(
   return Object.freeze({
     payloadVersion: 1,
     role: 'sol_token_executor_live',
-    migrationHead: '037_execution_live_orchestration.sql',
+    migrationHead: '038_execution_live_rpc_budget.sql',
     generationId: config.generationId,
     providerId: config.providerId,
     phase: config.phase,
@@ -621,6 +629,13 @@ const OPEN_WORK_SQL = `SELECT (
         'ACCEPTED','AMBIGUOUS','CONFIRMED')
         AND (transaction.generation_id<>$1 OR transaction.wallet_public_key<>$2
           OR transaction.provider_id<>$3))
+    + (SELECT COUNT(*) FROM execution_signed_transactions transaction
+      LEFT JOIN execution_live_rpc_budgets budget
+        ON budget.artifact_id=transaction.artifact_id
+      WHERE transaction.state IN ('PERSISTED','SIGNED_SIMULATED','SUBMISSION_STARTED')
+        AND (budget.artifact_id IS NULL OR budget.intent_id<>transaction.intent_id
+          OR budget.attempt_number<>transaction.attempt_number
+          OR budget.provider_id<>transaction.provider_id OR budget.calls_limit<>$4))
     + (SELECT COUNT(*) FROM execution_live_positions position
       JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
       WHERE position.state IN ('OPEN','EXIT_PENDING','UNKNOWN')

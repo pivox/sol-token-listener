@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.4.0 — 2026-09-04
+**Version :** 1.4.2 — 2026-09-04
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -114,6 +114,16 @@ La migration 037 et les repositories #51-H1 fournissent les claims
 confirmation et réconciliation, ainsi que le scan atomique des sorties à
 deadline. H2b les compose seulement pour la reprise et l'exécution signables ;
 H2a conserve les read-models de finalité et le scan à deadline.
+
+La migration 038 persiste le budget RPC total H2b par tentative. Les appels
+déjà utilisés par la préparation non signée initialisent ce budget ; chaque
+appel du tail signable est ensuite réservé avant le contact provider. Une
+reprise, une nouvelle passe ou un redémarrage ne remet donc jamais le compteur
+à zéro. Une réservation perdue par crash reste consommée et l'épuisement ferme
+la tentative avant tout nouvel appel réseau. Avant `SUBMISSION_STARTED`, cet
+épuisement est persisté en `REVOKED_NO_SEND` et sa reprise ne contacte plus le
+provider. Après `SUBMISSION_STARTED`, il reste `AMBIGUOUS`, car une émission
+ne peut plus être exclue ; il n'est jamais reclassé en révocation.
 
 La priorité SELL est protégée transactionnellement : chaque création SELL et
 chaque claim BUY live prennent le même verrou advisory de présence SELL. Le

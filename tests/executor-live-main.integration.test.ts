@@ -3,7 +3,11 @@ import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import bs58 from 'bs58';
-import { NATIVE_MINT, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import {
+  getAssociatedTokenAddressSync,
+  NATIVE_MINT,
+  TOKEN_PROGRAM_ID,
+} from '@solana/spl-token';
 import { Keypair, SystemProgram, VersionedTransaction } from '@solana/web3.js';
 import type { PublicKey } from '@solana/web3.js';
 import { createSignedTransactionArtifact } from '../src/domain/execution-live.js';
@@ -20,7 +24,8 @@ import {
 } from '../src/executor-live/main.js';
 import { resumeLivePersistedTransaction } from '../src/executor-live/execution-worker.js';
 import { ProviderAffineSession } from '../src/executor-simulation/provider-session.js';
-import { SolanaLiveRpcSession } from '../src/executor-live/rpc-gateway.js';
+import { LiveRpcError, SolanaLiveRpcSession } from '../src/executor-live/rpc-gateway.js';
+import { ExecutionLiveRepositoryError } from '../src/storage/execution-live.repository.js';
 import {
   runLiveExecutorPass,
   runLiveExecutorRuntime,
@@ -89,7 +94,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.10.0',
+    '**Version de spécification :** 1.10.1',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -125,12 +130,12 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     recoverySpecification,
-    '**Version de spécification :** 1.1.5',
+    '**Version de spécification :** 1.1.6',
     'recovery specification version',
   );
   assertContainsExactlyOnce(
     recoverySpecification,
-    '**Version de la spécification parente :** 1.9.5',
+    '**Version de la spécification parente :** 1.10.1',
     'recovery parent specification version',
   );
   assertContainsExactlyOnce(
@@ -140,12 +145,12 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     signableSpecification,
-    '**Version de spécification :** 1.0.0',
+    '**Version de spécification :** 1.0.2',
     'signable specification version',
   );
   assertContainsExactlyOnce(
     signableSpecification,
-    '**Version de la spécification parente :** 1.10.0',
+    '**Version de la spécification parente :** 1.10.1',
     'signable parent specification version',
   );
   assertContainsExactlyOnce(
@@ -160,7 +165,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.4.0 — 2026-09-04',
+    '**Version :** 1.4.2 — 2026-09-04',
     'runbook version',
   );
 
@@ -205,8 +210,9 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
     /PostgreSQL 16[\s\S]*PUBLIC[\s\S]*TEMP[\s\S]*(?:base de données|DATABASE)/iu);
   assert.equal(runbook.includes('CANARY_STARTED'), false);
   assert.equal((deploymentSmoke.match(/'037_execution_live_orchestration\.sql'/gu) ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'038_execution_live_rpc_budget\.sql'/gu) ?? []).length, 1);
   assert.equal(
-    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n\]\);/u.test(deploymentSmoke),
+    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n\]\);/u.test(deploymentSmoke),
     true,
     'deployment smoke migration head',
   );
@@ -574,17 +580,99 @@ void test('tail workers use a distinct max-six session and consume genesis befor
   const database = Object.freeze({ intents: { renew: async () => { throw new Error(); } }, live: {} }) as never;
   const first = createLiveExecutionWorkerForWork(config, database, factory);
   const second = createLiveExecutionWorkerForWork(config, database, factory);
-  await first.readBlockhashValidity({ blockhash: config.expectedGenesisHash } as never, new AbortController().signal);
+  await first.readBlockhashValidity(
+    { blockhash: config.expectedGenesisHash } as never,
+    6n,
+    new AbortController().signal,
+  );
   await assert.rejects(first.readBlockhashValidity(
-    { blockhash: config.expectedGenesisHash } as never, new AbortController().signal,
+    { blockhash: config.expectedGenesisHash } as never,
+    6n,
+    new AbortController().signal,
   ));
-  await second.readBlockhashValidity({ blockhash: config.expectedGenesisHash } as never, new AbortController().signal);
+  await second.readBlockhashValidity(
+    { blockhash: config.expectedGenesisHash } as never,
+    6n,
+    new AbortController().signal,
+  );
   assert.equal(configs.length, 2);
   assert.deepEqual(configs.map((value) => value.maxCalls), [6, 6]);
   assert.deepEqual(methods, [
     'getGenesisHash', 'isBlockhashValid', 'getBlockHeight',
     'getGenesisHash', 'isBlockhashValid', 'getBlockHeight',
   ]);
+});
+
+void test('recovery workers share the durable per-attempt RPC budget across fresh sessions', async () => {
+  const config = liveConfig(12);
+  const artifactId = `execution_signed_transaction_${'e'.repeat(64)}`;
+  const claim = Object.freeze({
+    intent: Object.freeze({ id: `execution_intent_${'a'.repeat(64)}` }),
+    leaseOwner: 'owner',
+    leaseToken: '00000000-0000-4000-8000-000000000000',
+  }) as never;
+  let callsReserved = 9;
+  let reservationAttempts = 0;
+  let providerCalls = 0;
+  const database = Object.freeze({
+    intents: { renew: async () => { throw new Error('unexpected renew'); } },
+    live: {
+      reserveRpcCall: async () => {
+        reservationAttempts += 1;
+        if (callsReserved >= 12) {
+          throw new ExecutionLiveRepositoryError('RPC_CALL_BUDGET_EXHAUSTED');
+        }
+        callsReserved += 1;
+        return Object.freeze({
+          payloadVersion: 1 as const,
+          artifactId,
+          providerId: config.providerId,
+          callsReserved,
+          callsLimit: 12,
+        });
+      },
+    },
+  }) as never;
+  const factory = Object.freeze({
+    createTail: (
+      sessionConfig: ConstructorParameters<typeof SolanaLiveRpcSession>[0],
+      fetchImplementation: typeof fetch,
+    ) => new SolanaLiveRpcSession(sessionConfig, fetchImplementation),
+  });
+  const providerFetch: typeof fetch = async (_url, init) => {
+    providerCalls += 1;
+    const request = JSON.parse(init?.body as string) as {
+      readonly id: number;
+      readonly method: string;
+    };
+    const result = request.method === 'getGenesisHash' ? config.expectedGenesisHash
+      : request.method === 'isBlockhashValid' ? { context: { slot: 7 }, value: true }
+        : 9;
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));
+  };
+  const first = createLiveExecutionWorkerForWork(config, database, factory, providerFetch);
+  const second = createLiveExecutionWorkerForWork(config, database, factory, providerFetch);
+  first.activateRpcBudget(claim, artifactId);
+  second.activateRpcBudget(claim, artifactId);
+
+  await first.readBlockhashValidity(
+    { blockhash: config.expectedGenesisHash } as never,
+    6n,
+    new AbortController().signal,
+  );
+  await assert.rejects(
+    second.readBlockhashValidity(
+      { blockhash: config.expectedGenesisHash } as never,
+      6n,
+      new AbortController().signal,
+    ),
+    (error: unknown) => error instanceof LiveRpcError
+      && (error as Readonly<{ readonly code: unknown }>).code === 'RPC_CALL_BUDGET_EXHAUSTED',
+  );
+
+  assert.equal(callsReserved, 12);
+  assert.equal(reservationAttempts, 4);
+  assert.equal(providerCalls, 3, 'the rejected reservation must not reach the provider');
 });
 
 void test('one tail worker verifies genesis once before its complete five-call RPC path', async () => {
@@ -630,7 +718,11 @@ void test('one tail worker verifies genesis once before its complete five-call R
   const signal = new AbortController().signal;
 
   await worker.signedSimulation.simulate(fixture.signedSimulation, signal);
-  await worker.readBlockhashValidity(fixture.artifact, signal);
+  await worker.readBlockhashValidity(
+    fixture.artifact,
+    fixture.signedSimulation.unsignedSimulation.blockhashContextSlot,
+    signal,
+  );
   await worker.submission.submitPersisted(fixture.submissionStarted, signal);
 
   assert.equal(sessions.length, 1);
@@ -747,7 +839,7 @@ interface CompleteTailRpcAccount {
 function completeTailFixture() {
   const signer = Keypair.generate();
   const baseAccount = Keypair.generate().publicKey;
-  const quoteAccount = Keypair.generate().publicKey;
+  const quoteAccount = getAssociatedTokenAddressSync(NATIVE_MINT, signer.publicKey);
   const baseMint = Keypair.generate().publicKey;
   const instruction = SystemProgram.transfer({
     fromPubkey: signer.publicKey, toPubkey: quoteAccount, lamports: 1,
@@ -791,12 +883,12 @@ function completeTailFixture() {
     payloadVersion: 1 as const, artifact, state: 'PERSISTED' as const, stateRevision: 0n,
   });
   const pre = Object.freeze([
-    completeTailSystemAccount(1_000_000),
+    completeTailSystemAccount(10_000_000),
     completeTailTokenAccount(baseMint, signer.publicKey, 10n),
     completeTailTokenAccount(NATIVE_MINT, signer.publicKey, 200n),
   ] as const);
   const post = Object.freeze([
-    completeTailSystemAccount(994_000),
+    completeTailSystemAccount(9_995_000),
     completeTailTokenAccount(baseMint, signer.publicKey, 105n),
     completeTailTokenAccount(NATIVE_MINT, signer.publicKey, 100n),
   ] as const);
@@ -848,7 +940,8 @@ function completeTailTokenAccount(
   data.writeBigUInt64LE(amount, 64);
   data[108] = 1;
   return Object.freeze({
-    lamports: 2_039_280, owner: TOKEN_PROGRAM_ID.toBase58(), executable: false,
+    lamports: Number(2_039_280n + (mint.equals(NATIVE_MINT) ? amount : 0n)),
+    owner: TOKEN_PROGRAM_ID.toBase58(), executable: false,
     rentEpoch: 0, space: data.byteLength,
     data: Object.freeze([data.toString('base64'), 'base64'] as const),
   });

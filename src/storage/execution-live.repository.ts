@@ -41,6 +41,8 @@ import type {
   ExecutionLiveArtifactReferenceV1,
   ExecutionLivePersistSignedInputV1,
   ExecutionLivePersistSignedResultV1,
+  ExecutionLiveRpcCallReservationInputV1,
+  ExecutionLiveRpcCallReservationV1,
   ExecutionLivePreparationBindingV1,
   ExecutionPreSubmissionRevocationInputV1,
   ExecutionPreSubmissionRevocationResultV1,
@@ -82,6 +84,7 @@ export type ExecutionLiveRepositoryErrorCode =
   | 'CONFLICT'
   | 'PREFLIGHT_EXPIRED'
   | 'CONTROL_STOPPED'
+  | 'RPC_CALL_BUDGET_EXHAUSTED'
   | 'LEASE_LOST'
   | 'DATABASE_FAILURE'
   | 'COMMIT_OUTCOME_UNKNOWN';
@@ -99,6 +102,7 @@ const HASH = /^[0-9a-f]{64}$/u;
 const PUBLIC_KEY = /^[1-9A-HJ-NP-Za-km-z]{32,64}$/u;
 const PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 const BLOCKHASH_VALIDITY_MAX_AGE_MS = 5_000;
+const LIVE_TAIL_RPC_CALLS = 6;
 const ARTIFACT_REFERENCE_COLUMNS = `
   transaction.artifact_id,transaction.payload_version,transaction.specification_version,
   transaction.intent_id,transaction.attempt_number,transaction.generation_id,
@@ -270,6 +274,66 @@ export class PostgresExecutionLiveRepository {
       return persistedResult(input.artifact, transitionedClaim(
         input.claim, transitioned, 'SIGNED_NOT_SUBMITTED', 2n, 'SIGNATURE_PERSISTED',
       ));
+    });
+  }
+
+  public async reserveRpcCall(
+    inputValue: ExecutionLiveRpcCallReservationInputV1,
+  ): Promise<ExecutionLiveRpcCallReservationV1> {
+    const input = rpcCallReservationInputFrom(inputValue);
+    return this.transaction(async (client) => {
+      const row = exactRow(singleRow(await client.query(`SELECT
+        budget.intent_id,budget.attempt_number,budget.artifact_id,budget.provider_id,
+        budget.calls_reserved,budget.calls_limit,
+        transaction.state AS artifact_state,
+        intent.status AS intent_status,intent.attempt_count,
+        intent.state_revision::TEXT AS intent_state_revision,
+        intent.lease_owner,intent.lease_token::TEXT AS lease_token,
+        trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT
+          AS lease_expires_at_ms,
+        trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms
+        FROM execution_live_rpc_budgets budget
+        JOIN execution_signed_transactions transaction
+          ON transaction.artifact_id=budget.artifact_id
+        JOIN execution_intents intent ON intent.id=budget.intent_id
+        WHERE budget.artifact_id=$1
+        FOR UPDATE OF budget,transaction,intent`, [input.artifactId])), [
+        'intent_id', 'attempt_number', 'artifact_id', 'provider_id',
+        'calls_reserved', 'calls_limit', 'artifact_state', 'intent_status',
+        'attempt_count', 'intent_state_revision', 'lease_owner', 'lease_token',
+        'lease_expires_at_ms', 'now_ms',
+      ] as const);
+      if (row.intent_id !== input.claim.intent.id
+        || integer(row.attempt_number) !== input.claim.intent.attemptCount
+        || integer(row.attempt_count) !== input.claim.intent.attemptCount
+        || unsignedBigint(row.intent_state_revision) !== input.claim.intent.stateRevision
+        || row.intent_status !== 'SIGNED_NOT_SUBMITTED'
+        || !['PERSISTED', 'SIGNED_SIMULATED', 'SUBMISSION_STARTED'].includes(
+          text(row.artifact_state),
+        )
+        || row.lease_owner !== input.claim.leaseOwner
+        || row.lease_token !== input.claim.leaseToken
+        || timestampText(row.lease_expires_at_ms) <= timestampText(row.now_ms)) {
+        throw failure('LEASE_LOST');
+      }
+      const callsReserved = integer(row.calls_reserved);
+      const callsLimit = integer(row.calls_limit);
+      if (callsReserved >= callsLimit) throw failure('RPC_CALL_BUDGET_EXHAUSTED');
+      const updated = await client.query(`UPDATE execution_live_rpc_budgets SET
+        calls_reserved=calls_reserved+1
+        WHERE artifact_id=$1 AND calls_reserved=$2::INTEGER
+          AND calls_reserved < calls_limit
+        RETURNING calls_reserved,calls_limit`, [input.artifactId, callsReserved]);
+      const reservation = exactRow(singleRow(updated), ['calls_reserved', 'calls_limit'] as const);
+      if (integer(reservation.calls_reserved) !== callsReserved + 1
+        || integer(reservation.calls_limit) !== callsLimit) throw failure('INVALID_DATA');
+      return Object.freeze({
+        payloadVersion: 1,
+        artifactId: input.artifactId,
+        providerId: patternedText(row.provider_id, PROVIDER_ID),
+        callsReserved: callsReserved + 1,
+        callsLimit,
+      });
     });
   }
 
@@ -1106,6 +1170,7 @@ function persistInputFrom(input: ExecutionLivePersistSignedInputV1): ExecutionLi
     const claim = claimFrom(input.claim);
     const artifact = recreateArtifact(input.artifact);
     const simulation = input.unsignedSimulation;
+    const rpcBudget = rpcBudgetFrom(input.rpcBudget);
     if (artifact.artifactId !== input.artifact.artifactId
       || artifact.signedTransactionHash !== input.artifact.signedTransactionHash
       || artifact.intentId !== claim.intent.id
@@ -1124,7 +1189,44 @@ function persistInputFrom(input: ExecutionLivePersistSignedInputV1): ExecutionLi
       || (artifact.side === 'SELL'
         && (artifact.armamentId !== null || artifact.exitAuthorizationId === null
           || input.reservationId !== null))) throw new TypeError();
-    return Object.freeze({ ...input, claim, artifact });
+    return Object.freeze({ ...input, claim, artifact, rpcBudget });
+  } catch (error) {
+    if (error instanceof ExecutionLiveRepositoryError) throw error;
+    throw failure('INVALID_INPUT');
+  }
+}
+
+function rpcBudgetFrom(
+  value: ExecutionLivePersistSignedInputV1['rpcBudget'],
+): ExecutionLivePersistSignedInputV1['rpcBudget'] {
+  const payloadVersion: unknown = value.payloadVersion;
+  if (payloadVersion !== 1
+    || !Number.isSafeInteger(value.callsUsed) || value.callsUsed < 0
+    || !Number.isSafeInteger(value.callsLimit)
+    || value.callsLimit < 12 || value.callsLimit > 16
+    || value.callsUsed > value.callsLimit - LIVE_TAIL_RPC_CALLS) {
+    throw new TypeError();
+  }
+  return Object.freeze({
+    payloadVersion: 1,
+    callsUsed: value.callsUsed,
+    callsLimit: value.callsLimit,
+  });
+}
+
+function rpcCallReservationInputFrom(
+  value: ExecutionLiveRpcCallReservationInputV1,
+): ExecutionLiveRpcCallReservationInputV1 {
+  try {
+    const payloadVersion: unknown = value.payloadVersion;
+    if (payloadVersion !== 1 || !ARTIFACT_ID.test(value.artifactId)) {
+      throw new TypeError();
+    }
+    return Object.freeze({
+      payloadVersion: 1,
+      claim: claimFrom(value.claim),
+      artifactId: value.artifactId,
+    });
   } catch (error) {
     if (error instanceof ExecutionLiveRepositoryError) throw error;
     throw failure('INVALID_INPUT');
@@ -2466,6 +2568,7 @@ async function persistUnsignedSimulationEvidence(
     if (!sameUnsignedSimulationEvidence(existing.rows[0] ?? {}, input, identity)) {
       throw failure('CONFLICT');
     }
+    await persistLiveRpcBudget(client, input);
     return;
   }
   const inserted = await client.query(`INSERT INTO execution_live_unsigned_simulation_evidence (
@@ -2488,6 +2591,46 @@ async function persistUnsignedSimulationEvidence(
     simulation.simulatedFeePayerLamportDebit.toString(), simulation.unitsConsumed.toString(),
     simulation.simulatedBaseDeltaRaw.toString(), simulation.simulatedQuoteDeltaRaw.toString(),
     simulation.logsFingerprint, simulation.logsLineCount, artifact.signedAtMs,
+  ]);
+  if (inserted.rowCount !== 1) throw failure('CONFLICT');
+  await persistLiveRpcBudget(client, input);
+}
+
+async function persistLiveRpcBudget(
+  client: DatabaseClient,
+  input: ExecutionLivePersistSignedInputV1,
+): Promise<void> {
+  const artifact = input.artifact;
+  const budget = input.rpcBudget;
+  const existing = await client.query(`SELECT intent_id,attempt_number,artifact_id,
+    provider_id,initial_calls_used,calls_reserved,calls_limit
+    FROM execution_live_rpc_budgets WHERE artifact_id=$1`, [artifact.artifactId]);
+  if (existing.rows.length > 1) throw failure('INVALID_DATA');
+  if (existing.rows.length === 1) {
+    const row = exactRow(existing.rows[0] ?? {}, [
+      'intent_id', 'attempt_number', 'artifact_id', 'provider_id',
+      'initial_calls_used', 'calls_reserved', 'calls_limit',
+    ] as const);
+    if (row.intent_id !== artifact.intentId
+      || integer(row.attempt_number) !== artifact.attemptNumber
+      || row.artifact_id !== artifact.artifactId
+      || row.provider_id !== artifact.providerId
+      || integer(row.initial_calls_used) !== budget.callsUsed
+      || integer(row.calls_reserved) < budget.callsUsed
+      || integer(row.calls_limit) !== budget.callsLimit) throw failure('CONFLICT');
+    return;
+  }
+  const inserted = await client.query(`INSERT INTO execution_live_rpc_budgets (
+    intent_id,attempt_number,artifact_id,provider_id,initial_calls_used,
+    calls_reserved,calls_limit,created_at
+  ) SELECT transaction.intent_id,transaction.attempt_number,transaction.artifact_id,
+    transaction.provider_id,$2::INTEGER,$2::INTEGER,$3::INTEGER,
+    TIMESTAMPTZ 'epoch'+($4::BIGINT*INTERVAL '1 millisecond')
+    FROM execution_signed_transactions transaction
+    WHERE transaction.artifact_id=$1 AND transaction.intent_id=$5
+      AND transaction.attempt_number=$6::INTEGER AND transaction.provider_id=$7`, [
+    artifact.artifactId, budget.callsUsed, budget.callsLimit, artifact.signedAtMs,
+    artifact.intentId, artifact.attemptNumber, artifact.providerId,
   ]);
   if (inserted.rowCount !== 1) throw failure('CONFLICT');
 }

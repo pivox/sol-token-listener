@@ -154,6 +154,11 @@ async function executeFresh(
       reservationId: authority.reservationId,
       artifact,
       unsignedSimulation: material.unsignedSimulation,
+      rpcBudget: Object.freeze({
+        payloadVersion: 1,
+        callsUsed: result.artifact.rpcCallsUsed,
+        callsLimit: result.artifact.rpcCallsLimit + 6,
+      }),
     }),
     signedSimulation: Object.freeze({
       payloadVersion: 1,

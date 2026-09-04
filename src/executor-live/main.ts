@@ -12,7 +12,11 @@ import { loadLiveTransactionSigner } from './keypair-loader.js';
 import { createLiveSignableLanes } from './lanes.js';
 import type { LiveSignableLaneDependencies } from './lanes.js';
 import { createLiveExecutorLogger, type LiveExecutorLogger } from './logger.js';
-import { SolanaLiveRpcSession, type LiveRpcGenesisEvidenceV1 } from './rpc-gateway.js';
+import {
+  createLiveRpcCallBudgetExhaustedError,
+  SolanaLiveRpcSession,
+  type LiveRpcGenesisEvidenceV1,
+} from './rpc-gateway.js';
 import {
   runLiveExecutorRuntime,
   type LiveExecutorLanes,
@@ -34,6 +38,7 @@ import {
 import type { ExecutionLiveRuntimeBindingV1 } from '../ports/execution-live-repository.js';
 import type { SignedTransactionArtifactV1 } from '../domain/execution-live.js';
 import { LIVE_EXECUTOR_SAFE_ERROR_CODE_SET } from './error-codes.js';
+import { ExecutionLiveRepositoryError } from '../storage/execution-live.repository.js';
 
 export interface LiveExecutorBootstrapDependencies {
   readonly parseConfig: (environment: unknown) => LiveExecutorConfig;
@@ -59,14 +64,19 @@ export interface LiveExecutorBootstrapDependencies {
 
 export interface LiveExecutorSessionFactory {
   readonly createUnsigned: (config: ConstructorParameters<typeof ProviderAffineSession>[0]) => ProviderAffineSession;
-  readonly createTail: (config: ConstructorParameters<typeof SolanaLiveRpcSession>[0]) => SolanaLiveRpcSession;
+  readonly createTail: (
+    config: ConstructorParameters<typeof SolanaLiveRpcSession>[0],
+    fetchImplementation: typeof fetch,
+  ) => SolanaLiveRpcSession;
 }
 
 const productionSessionFactory: LiveExecutorSessionFactory = Object.freeze({
   createUnsigned: (config: ConstructorParameters<typeof ProviderAffineSession>[0]) =>
     new ProviderAffineSession(config),
-  createTail: (config: ConstructorParameters<typeof SolanaLiveRpcSession>[0]) =>
-    new SolanaLiveRpcSession(config),
+  createTail: (
+    config: ConstructorParameters<typeof SolanaLiveRpcSession>[0],
+    fetchImplementation: typeof fetch,
+  ) => new SolanaLiveRpcSession(config, fetchImplementation),
 });
 
 export async function startLiveExecutor(
@@ -196,9 +206,32 @@ export function createLiveExecutionWorkerForWork(
   config: LiveExecutorConfig,
   database: LiveExecutorBootstrapDatabase,
   sessions: Pick<LiveExecutorSessionFactory, 'createTail'> = productionSessionFactory,
+  networkFetch: typeof fetch = fetch,
 ): LiveExecutionWorkerDependencies {
   let tail: SolanaLiveRpcSession | null = null;
   let genesisVerification: Promise<LiveRpcGenesisEvidenceV1> | null = null;
+  let rpcAuthority: Readonly<{
+    readonly claim: Parameters<LiveExecutorBootstrapDatabase['live']['reserveRpcCall']>[0]['claim'];
+    readonly artifactId: string;
+  }> | null = null;
+  const budgetedFetch: typeof fetch = async (resource, init) => {
+    const authority = rpcAuthority;
+    if (authority === null) throw new TypeError('Live RPC budget authority is missing.');
+    try {
+      await database.live.reserveRpcCall(Object.freeze({
+        payloadVersion: 1,
+        claim: authority.claim,
+        artifactId: authority.artifactId,
+      }));
+    } catch (error) {
+      if (error instanceof ExecutionLiveRepositoryError
+        && error.code === 'RPC_CALL_BUDGET_EXHAUSTED') {
+        throw createLiveRpcCallBudgetExhaustedError();
+      }
+      throw error;
+    }
+    return networkFetch(resource, init);
+  };
   const session = async (signal: AbortSignal): Promise<SolanaLiveRpcSession> => {
     tail ??= sessions.createTail(Object.freeze({
       providerId: config.providerId,
@@ -206,13 +239,22 @@ export function createLiveExecutionWorkerForWork(
       expectedGenesisHash: config.expectedGenesisHash,
       timeoutMs: config.rpcTimeoutMs,
       maxCalls: 6,
-    }));
+    }), budgetedFetch);
     genesisVerification ??= tail.verifyGenesis(signal);
     await genesisVerification;
     return tail;
   };
   const dependencies: LiveExecutionWorkerDependencies = {
     repository: database.live,
+    activateRpcBudget: (claim, artifactId) => {
+      if (rpcAuthority !== null
+        && (rpcAuthority.claim.intent.id !== claim.intent.id
+          || rpcAuthority.claim.leaseToken !== claim.leaseToken
+          || rpcAuthority.artifactId !== artifactId)) {
+        throw new TypeError('Live RPC budget authority changed within one work item.');
+      }
+      rpcAuthority = Object.freeze({ claim, artifactId });
+    },
     signedSimulation: Object.freeze({
       simulate: async (input, signal) => new SignedSimulationGateway(await session(signal), Object.freeze({
         maxComputeUnits: config.maxComputeUnits,
@@ -225,8 +267,16 @@ export function createLiveExecutionWorkerForWork(
       ).submitPersisted(persisted, signal),
     }),
     renewBeforeSubmission: (claim) => database.intents.renew(claim, config.leaseMs),
-    readBlockhashValidity: async (artifact: SignedTransactionArtifactV1, signal: AbortSignal) => {
-      const evidence = await (await session(signal)).blockhashValidity(artifact.blockhash, signal);
+    readBlockhashValidity: async (
+      artifact: SignedTransactionArtifactV1,
+      minimumContextSlot: bigint,
+      signal: AbortSignal,
+    ) => {
+      const evidence = await (await session(signal)).blockhashValidity(
+        artifact.blockhash,
+        minimumContextSlot,
+        signal,
+      );
       return Object.freeze({ ...evidence, observedAtMs: Date.now() });
     },
   };

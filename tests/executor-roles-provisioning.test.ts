@@ -171,7 +171,7 @@ void test('signed live capability is visible only to the dedicated executor role
   assert.match(sql, /REVOKE SELECT \(%1\$s\), INSERT \(%1\$s\), UPDATE \(%1\$s\), REFERENCES \(%1\$s\)[\s\S]*?sol_token_executor_live/iu);
   assert.match(sql, /GRANT USAGE ON SCHEMA public[\s\S]*?sol_token_executor_live/iu);
   assert.match(sql, /GRANT SELECT \(version\)\s+ON TABLE migration_history TO sol_token_executor_live/iu);
-  assert.match(sql, /REVOKE ALL ON TABLE\s+execution_signed_transactions,\s+execution_live_unsigned_simulation_evidence,\s+execution_signed_simulation_evidence,\s+execution_submission_preflight_evidence,\s+execution_pre_submission_revocations,\s+execution_submission_events,\s+execution_live_positions,\s+execution_exit_authorizations,\s+execution_reconciliation_evidence\s+FROM PUBLIC,sol_token_listener_writer,sol_token_executor_worker,\s+sol_token_executor_operations,sol_token_operator_reader,sol_token_public_api/iu);
+  assert.match(sql, /REVOKE ALL ON TABLE\s+execution_signed_transactions,\s+execution_live_unsigned_simulation_evidence,\s+execution_live_rpc_budgets,\s+execution_signed_simulation_evidence,\s+execution_submission_preflight_evidence,\s+execution_pre_submission_revocations,\s+execution_submission_events,\s+execution_live_positions,\s+execution_exit_authorizations,\s+execution_reconciliation_evidence\s+FROM PUBLIC,sol_token_listener_writer,sol_token_executor_worker,\s+sol_token_executor_operations,sol_token_operator_reader,sol_token_public_api/iu);
   assert.doesNotMatch(executable,
     /GRANT\s+(?:SELECT|INSERT|UPDATE)\s+ON\s+TABLE[^;]*TO\s+sol_token_executor_live(?!_)/iu);
   assert.match(signedGrant, /SELECT \([\s\S]*signed_transaction_bytes/iu);

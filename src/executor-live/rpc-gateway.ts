@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import {
+  getAssociatedTokenAddressSync,
   NATIVE_MINT,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -27,6 +28,7 @@ export type LiveRpcErrorCode =
   | 'RPC_RESPONSE_INVALID'
   | 'GENESIS_MISMATCH'
   | 'CALL_BUDGET_EXCEEDED'
+  | 'RPC_CALL_BUDGET_EXHAUSTED'
   | 'SESSION_FAILED';
 
 export class LiveRpcError extends Error {
@@ -110,7 +112,7 @@ const CONFIG_KEYS = Object.freeze([
   'providerId', 'httpRpcUrl', 'expectedGenesisHash', 'timeoutMs', 'maxCalls',
 ] as const);
 const SIGNED_SIMULATION_KEYS = Object.freeze([
-  'payloadVersion', 'transactionBase64', 'snapshotSlot', 'accountAddresses',
+  'payloadVersion', 'transactionBase64', 'snapshotSlot', 'estimatedFeeLamports', 'accountAddresses',
   'commitment', 'sigVerify', 'replaceRecentBlockhash',
 ] as const);
 const SUBMISSION_KEYS = Object.freeze([
@@ -132,6 +134,7 @@ const SPL_TOKEN_PROGRAMS = new Set([
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const I64_MIN = -(1n << 63n);
 const I64_MAX = (1n << 63n) - 1n;
+const U64_MAX = (1n << 64n) - 1n;
 const MAX_TRANSACTION_BYTES = 1_232;
 const MAX_ACCOUNT_DATA_BYTES = 65_536;
 const MAX_LOG_LINES = 256;
@@ -253,14 +256,17 @@ export class SolanaLiveRpcSession implements ExecutionLiveGateway {
       const unitsConsumed = positiveSafeIntegerBigint(value.unitsConsumed);
       const failureKind = simulationFailure(value.err);
       const baseDeltaRaw = tokenDelta(pre.base, post.base);
-      const quoteDeltaRaw = tokenDelta(pre.quote, post.quote);
       const baseIdentity = pre.base ?? post.base;
       const quoteIdentity = pre.quote ?? post.quote;
-      if (baseIdentity === null || quoteIdentity === null
-        || baseIdentity.mint === quoteIdentity.mint
-        || quoteIdentity.mint !== NATIVE_MINT.toBase58()) {
+      if (baseIdentity === null
+        || baseIdentity.mint === NATIVE_MINT.toBase58()
+        || (quoteIdentity !== null && quoteIdentity.mint !== NATIVE_MINT.toBase58())) {
         throw new TypeError();
       }
+      if (quoteIdentity !== null) void tokenDelta(pre.quote, post.quote);
+      const quoteDeltaRaw = signedI64(
+        liquidLamports(post) - liquidLamports(pre) + request.estimatedFeeLamports,
+      );
       const feePayerLamportDebit = pre.payer.lamports > post.payer.lamports
         ? pre.payer.lamports - post.payer.lamports : 0n;
       return Object.freeze({
@@ -285,25 +291,33 @@ export class SolanaLiveRpcSession implements ExecutionLiveGateway {
 
   public async blockhashValidity(
     blockhashValue: string,
+    minimumContextSlotValue: bigint,
     signal: AbortSignal,
   ): Promise<LiveRpcBlockhashValidityV1> {
     this.requireReady(signal);
     if (this.#blockhashReserved) throw this.fail('INVALID_INPUT');
     let blockhash: string;
+    let minimumContextSlot: bigint;
     try {
       blockhash = publicKey(blockhashValue);
+      minimumContextSlot = safeRpcSlot(minimumContextSlotValue);
     } catch {
       throw this.fail('INVALID_INPUT');
     }
     this.#blockhashReserved = true;
     const validityRaw = await this.dispatch('isBlockhashValid', Object.freeze([
       blockhash,
-      Object.freeze({ commitment: 'confirmed' as const }),
+      Object.freeze({
+        commitment: 'confirmed' as const,
+        minContextSlot: Number(minimumContextSlot),
+      }),
     ]), signal);
     let contextSlot: bigint;
     try {
       const validity = contextValue(validityRaw);
-      if (validity.value !== true) throw new TypeError();
+      if (validity.value !== true || validity.contextSlot < minimumContextSlot) {
+        throw new TypeError();
+      }
       contextSlot = validity.contextSlot;
     } catch {
       throw this.fail('RPC_RESPONSE_INVALID');
@@ -577,21 +591,49 @@ function signedSimulationRequest(value: unknown): ExecutionSignedSimulationReque
   if (record.payloadVersion !== 1 || record.commitment !== 'confirmed'
     || record.sigVerify !== true || record.replaceRecentBlockhash !== false
     || typeof record.snapshotSlot !== 'bigint'
-    || record.snapshotSlot < 0n || record.snapshotSlot > MAX_SAFE_BIGINT) {
+    || record.snapshotSlot < 0n || record.snapshotSlot > MAX_SAFE_BIGINT
+    || typeof record.estimatedFeeLamports !== 'bigint'
+    || record.estimatedFeeLamports < 0n || record.estimatedFeeLamports > U64_MAX) {
     throw new TypeError();
   }
   const addresses = publicKeyTuple(record.accountAddresses);
+  const expectedQuoteAddress = getAssociatedTokenAddressSync(
+    NATIVE_MINT,
+    new PublicKey(addresses[0]),
+    false,
+    TOKEN_PROGRAM_ID,
+  ).toBase58();
+  if (addresses[2] !== expectedQuoteAddress) throw new TypeError();
   return Object.freeze({
     payloadVersion: 1,
     transactionBase64: canonicalBase64(
       record.transactionBase64, MAX_TRANSACTION_BYTES, false,
     ),
     snapshotSlot: record.snapshotSlot,
+    estimatedFeeLamports: record.estimatedFeeLamports,
     accountAddresses: addresses,
     commitment: 'confirmed',
     sigVerify: true,
     replaceRecentBlockhash: false,
   });
+}
+
+function liquidLamports(accounts: SimulationAccounts): bigint {
+  return accounts.payer.lamports
+    + (accounts.base?.lamports ?? 0n)
+    + (accounts.quote?.lamports ?? 0n);
+}
+
+function signedI64(value: bigint): bigint {
+  if (value < I64_MIN || value > I64_MAX) throw new TypeError();
+  return value;
+}
+
+function safeRpcSlot(value: unknown): bigint {
+  if (typeof value !== 'bigint' || value < 0n || value > MAX_SAFE_BIGINT) {
+    throw new TypeError();
+  }
+  return value;
 }
 
 function submissionRequest(value: unknown): ExecutionRawSubmissionRequestV1 {
@@ -919,4 +961,18 @@ function rpcError(code: LiveRpcErrorCode): LiveRpcError {
 
 function isInternalError(value: unknown): value is LiveRpcError {
   return value instanceof LiveRpcError && INTERNAL_ERRORS.has(value);
+}
+
+export function createLiveRpcCallBudgetExhaustedError(): LiveRpcError & Readonly<{
+  readonly code: 'RPC_CALL_BUDGET_EXHAUSTED';
+}> {
+  return rpcError('RPC_CALL_BUDGET_EXHAUSTED') as LiveRpcError & Readonly<{
+    readonly code: 'RPC_CALL_BUDGET_EXHAUSTED';
+  }>;
+}
+
+export function isLiveRpcCallBudgetExhaustedError(
+  value: unknown,
+): value is LiveRpcError & Readonly<{ readonly code: 'RPC_CALL_BUDGET_EXHAUSTED' }> {
+  return isInternalError(value) && value.code === 'RPC_CALL_BUDGET_EXHAUSTED';
 }

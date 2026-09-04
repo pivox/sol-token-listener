@@ -22,6 +22,10 @@ import {
   createSignedSimulationRecoveryContext,
   type SignedSimulationRecoveryContextV1,
 } from './signed-simulation-context.js';
+import {
+  isLiveRpcCallBudgetExhaustedError,
+  type LiveRpcError,
+} from './rpc-gateway.js';
 
 type LiveWorkerRepository = Pick<ExecutionLiveRepository,
   | 'persistSigned'
@@ -33,6 +37,10 @@ type LiveWorkerRepository = Pick<ExecutionLiveRepository,
 
 export interface LiveExecutionWorkerDependencies {
   readonly repository: LiveWorkerRepository;
+  readonly activateRpcBudget: (
+    claim: ClaimedExecutionIntent,
+    artifactId: string,
+  ) => void;
   readonly signedSimulation: Pick<SignedSimulationGateway, 'simulate'>;
   readonly submission: Pick<LiveSubmissionGateway, 'submitPersisted'>;
   readonly renewBeforeSubmission: (
@@ -40,6 +48,7 @@ export interface LiveExecutionWorkerDependencies {
   ) => Promise<ClaimedExecutionIntent>;
   readonly readBlockhashValidity: (
     artifact: SignedTransactionArtifactV1,
+    minimumContextSlot: bigint,
     signal: AbortSignal,
   ) => Promise<ExecutionBlockhashValidityEvidenceV1>;
   readonly clock?: () => number;
@@ -163,6 +172,7 @@ async function continueLivePersistedTransaction(
   }
   if (!('artifact' in inspected)) throw new TypeError('Invalid persisted transaction state.');
   const artifact = inspected.artifact;
+  dependencies.activateRpcBudget(activeClaim, artifact.artifactId);
   let simulatedRevision = inspected.stateRevision;
   if (inspected.state === 'PERSISTED') {
     if (input.signedSimulation === null) {
@@ -209,7 +219,32 @@ async function continueLivePersistedTransaction(
     simulatedRevision = recordedSimulation.stateRevision;
   }
   activeClaim = await dependencies.renewBeforeSubmission(activeClaim);
-  const blockhashValidity = await dependencies.readBlockhashValidity(artifact, signal);
+  let blockhashValidity: ExecutionBlockhashValidityEvidenceV1;
+  try {
+    blockhashValidity = await dependencies.readBlockhashValidity(
+      artifact,
+      inspected.unsignedSimulation.blockhashContextSlot,
+      signal,
+    );
+  } catch (error) {
+    if (!signal.aborted && isLiveRpcCallBudgetExhaustedError(error)) {
+      const observedAtMs = now(dependencies.clock);
+      await dependencies.repository.revokeBeforeSubmission(Object.freeze({
+        payloadVersion: 1,
+        claim: activeClaim,
+        artifactId: artifact.artifactId,
+        expectedState: 'SIGNED_SIMULATED',
+        expectedRevision: simulatedRevision,
+        causeReasonCode: 'PRE_SUBMISSION_GATES_FAILED',
+        evidenceFingerprint: preSubmissionGateFailureFingerprint(
+          artifact.artifactId, artifact.signedTransactionHash,
+          error.code, observedAtMs,
+        ),
+        observedAtMs,
+      }));
+    }
+    throw error;
+  }
   activeClaim = await dependencies.renewBeforeSubmission(activeClaim);
   let started: Awaited<ReturnType<ExecutionLiveRepository['beginSubmission']>>;
   try {
@@ -339,18 +374,20 @@ function now(clock: (() => number) | undefined): number {
 
 function isDeterministicSignedSimulationFailure(
   error: unknown,
-): error is SignedSimulationGatewayError & Readonly<{
+): error is (SignedSimulationGatewayError & Readonly<{
   readonly code: 'SIGNED_TRANSACTION_INVALID' | 'SIGNED_SIMULATION_INCONSISTENT';
-}> {
-  return error instanceof SignedSimulationGatewayError
-    && (error.code === 'SIGNED_TRANSACTION_INVALID'
-      || error.code === 'SIGNED_SIMULATION_INCONSISTENT');
+}>) | (LiveRpcError & Readonly<{ readonly code: 'RPC_CALL_BUDGET_EXHAUSTED' }>) {
+  return isLiveRpcCallBudgetExhaustedError(error)
+    || (error instanceof SignedSimulationGatewayError
+      && (error.code === 'SIGNED_TRANSACTION_INVALID'
+        || error.code === 'SIGNED_SIMULATION_INCONSISTENT'));
 }
 
 function signedSimulationFailureFingerprint(
   artifactId: string,
   signedTransactionHash: string,
-  code: 'SIGNED_TRANSACTION_INVALID' | 'SIGNED_SIMULATION_INCONSISTENT',
+  code: 'SIGNED_TRANSACTION_INVALID' | 'SIGNED_SIMULATION_INCONSISTENT'
+    | 'RPC_CALL_BUDGET_EXHAUSTED',
   observedAtMs: number,
 ): string {
   return createHash('sha256').update([
@@ -371,7 +408,7 @@ function isDeterministicPreSubmissionGateFailure(
 function preSubmissionGateFailureFingerprint(
   artifactId: string,
   signedTransactionHash: string,
-  code: 'PREFLIGHT_EXPIRED' | 'CONTROL_STOPPED',
+  code: 'PREFLIGHT_EXPIRED' | 'CONTROL_STOPPED' | 'RPC_CALL_BUDGET_EXHAUSTED',
   observedAtMs: number,
 ): string {
   return createHash('sha256').update([

@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.10.0
+**Version de spécification :** 1.10.1
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.10.1 — 2026-09-04 :** rend le budget RPC H2b durable par tentative.
+  Chaque appel est réservé en PostgreSQL avant le contact provider ; une
+  reprise ou un redémarrage conserve le compteur et ne peut donc pas
+  réinitialiser `EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT`.
 - **1.10.0 — 2026-09-04 :** livre H2b comme binaire signable séparé et désarmé,
   avec exactement quatre lanes ordonnées : recover SELL, execute SELL, recover BUY, execute BUY.
   H2a reste seul responsable de la finalité, de la

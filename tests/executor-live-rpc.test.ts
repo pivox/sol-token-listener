@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
+  getAssociatedTokenAddressSync,
   NATIVE_MINT,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
@@ -66,7 +67,7 @@ void test('reads blockhash validity and then block height sequentially', async (
   const session = new SolanaLiveRpcSession(config(), transport.fetch);
   await session.verifyGenesis(signal());
 
-  assert.deepEqual(await session.blockhashValidity(BLOCKHASH, signal()), Object.freeze({
+  assert.deepEqual(await session.blockhashValidity(BLOCKHASH, 123n, signal()), Object.freeze({
     payloadVersion: 1,
     providerId: 'primary',
     blockhash: BLOCKHASH,
@@ -78,9 +79,25 @@ void test('reads blockhash validity and then block height sequentially', async (
     'getGenesisHash', 'isBlockhashValid', 'getBlockHeight',
   ]);
   assert.deepEqual(transport.requests[1]?.params, [
-    BLOCKHASH, { commitment: 'confirmed' },
+    BLOCKHASH, { commitment: 'confirmed', minContextSlot: 123 },
   ]);
   assert.deepEqual(transport.requests[2]?.params, [{ commitment: 'confirmed' }]);
+});
+
+void test('rejects blockhash validity returned below the persisted causal floor', async () => {
+  const transport = rpcTransport(({ method }) => method === 'getGenesisHash'
+    ? GENESIS : { context: { slot: 122 }, value: true });
+  const session = new SolanaLiveRpcSession(config(), transport.fetch);
+  await session.verifyGenesis(signal());
+
+  await rejectsCode(
+    session.blockhashValidity(BLOCKHASH, 123n, signal()),
+    'RPC_RESPONSE_INVALID',
+  );
+  assert.deepEqual(transport.requests[1]?.params, [
+    BLOCKHASH, { commitment: 'confirmed', minContextSlot: 123 },
+  ]);
+  assert.equal(transport.requests.length, 2);
 });
 
 void test('simulates signed bytes and derives payer, SPL base and SPL quote deltas', async () => {
@@ -153,7 +170,9 @@ void test('supports an absent pre base account and classifies program failures',
         err: { InstructionError: [1, 'Custom'] },
         logs: ['Program failed'],
         unitsConsumed: 10,
-        accounts: fixture.post,
+        accounts: [
+          systemAccount(7_954_720), fixture.post[1], fixture.post[2],
+        ],
       },
     };
   });
@@ -165,6 +184,97 @@ void test('supports an absent pre base account and classifies program failures',
   assert.equal(result.failureKind, 'PROGRAM_ERROR');
   assert.equal(result.baseDeltaRaw, 105n);
   assert.equal(result.quoteDeltaRaw, -100n);
+});
+
+void test('rejects a signed simulation whose quote address is not the payer WSOL ATA', async () => {
+  const fixture = simulationFixture();
+  const transport = rpcTransport(() => GENESIS);
+  const session = new SolanaLiveRpcSession(config(), transport.fetch);
+  await session.verifyGenesis(signal());
+
+  await rejectsCode(session.simulateSignedTransaction(Object.freeze({
+    ...fixture.request,
+    accountAddresses: Object.freeze([
+      fixture.request.accountAddresses[0],
+      fixture.request.accountAddresses[1],
+      Keypair.generate().publicKey.toBase58(),
+    ] as const),
+  }), signal()), 'INVALID_INPUT');
+  assert.equal(transport.requests.length, 1);
+});
+
+void test('derives PumpSwap SELL quote proceeds when the WSOL ATA is absent then closed', async () => {
+  const fixture = simulationFixture();
+  const transport = rpcTransport(({ method }) => {
+    if (method === 'getGenesisHash') return GENESIS;
+    if (method === 'getMultipleAccounts') {
+      return {
+        context: { slot: 123 },
+        value: [systemAccount(10_000_000), fixture.pre[1], null],
+      };
+    }
+    return {
+      context: { slot: 125 },
+      value: {
+        err: null,
+        logs: ['Program success'],
+        unitsConsumed: 20_000,
+        accounts: [
+          systemAccount(10_095_000),
+          withTokenAmount(fixture.pre[1], 0n),
+          null,
+        ],
+      },
+    };
+  });
+  const session = new SolanaLiveRpcSession(config(), transport.fetch);
+  await session.verifyGenesis(signal());
+
+  const result = await session.simulateSignedTransaction(Object.freeze({
+    ...fixture.request,
+    estimatedFeeLamports: 5_000n,
+  }), signal());
+
+  assert.equal(result.baseDeltaRaw, -10n);
+  assert.equal(result.quoteDeltaRaw, 100_000n);
+  assert.equal(result.feePayerLamportDebit, 0n);
+});
+
+void test('includes pre-existing WSOL ATA lamports when PumpSwap SELL closes it', async () => {
+  const fixture = simulationFixture();
+  const preQuote = tokenAccount(NATIVE_MINT, fixture.payer, 50n);
+  const transport = rpcTransport(({ method }) => {
+    if (method === 'getGenesisHash') return GENESIS;
+    if (method === 'getMultipleAccounts') {
+      return {
+        context: { slot: 123 },
+        value: [systemAccount(10_000_000), fixture.pre[1], preQuote],
+      };
+    }
+    return {
+      context: { slot: 125 },
+      value: {
+        err: null,
+        logs: ['Program success'],
+        unitsConsumed: 20_000,
+        accounts: [
+          systemAccount(10_000_000 + preQuote.lamports + 95_000),
+          withTokenAmount(fixture.pre[1], 0n),
+          null,
+        ],
+      },
+    };
+  });
+  const session = new SolanaLiveRpcSession(config(), transport.fetch);
+  await session.verifyGenesis(signal());
+
+  const result = await session.simulateSignedTransaction(Object.freeze({
+    ...fixture.request,
+    estimatedFeeLamports: 5_000n,
+  }), signal());
+
+  assert.equal(result.baseDeltaRaw, -10n);
+  assert.equal(result.quoteDeltaRaw, 100_000n);
 });
 
 void test('submits through official sendTransaction wire with exact closed options', async () => {
@@ -362,7 +472,7 @@ void test('enforces one shared call budget and permanently fails the session', a
     session.simulateSignedTransaction(fixture.request, signal()),
     'CALL_BUDGET_EXCEEDED',
   );
-  await rejectsCode(session.blockhashValidity(BLOCKHASH, signal()), 'SESSION_FAILED');
+  await rejectsCode(session.blockhashValidity(BLOCKHASH, 123n, signal()), 'SESSION_FAILED');
   assert.equal(transport.requests.length, 1);
 });
 
@@ -448,17 +558,19 @@ function submissionRequest(): ExecutionRawSubmissionRequestV1 {
 
 function simulationFixture(): Readonly<{
   request: ExecutionSignedSimulationRequestV1;
+  payer: PublicKey;
   pre: readonly [RpcAccount, RpcAccount, RpcAccount];
   post: readonly [RpcAccount, RpcAccount, RpcAccount];
 }> {
   const payer = Keypair.generate().publicKey;
   const baseAddress = Keypair.generate().publicKey;
-  const quoteAddress = Keypair.generate().publicKey;
+  const quoteAddress = getAssociatedTokenAddressSync(NATIVE_MINT, payer);
   const baseMint = Keypair.generate().publicKey;
   const request: ExecutionSignedSimulationRequestV1 = Object.freeze({
     payloadVersion: 1,
     transactionBase64: 'AQ==',
     snapshotSlot: 123n,
+    estimatedFeeLamports: 6_000n,
     accountAddresses: Object.freeze([
       payer.toBase58(), baseAddress.toBase58(), quoteAddress.toBase58(),
     ] as const),
@@ -468,13 +580,14 @@ function simulationFixture(): Readonly<{
   });
   return Object.freeze({
     request,
+    payer,
     pre: Object.freeze([
-      systemAccount(1_000_000),
+      systemAccount(10_000_000),
       tokenAccount(baseMint, payer, 10n),
       tokenAccount(NATIVE_MINT, payer, 200n),
     ] as const),
     post: Object.freeze([
-      systemAccount(994_000),
+      systemAccount(9_994_000),
       tokenAccount(baseMint, payer, 105n),
       tokenAccount(NATIVE_MINT, payer, 100n),
     ] as const),
@@ -508,7 +621,7 @@ function tokenAccount(mint: PublicKey, holder: PublicKey, amount: bigint): RpcAc
   data.writeBigUInt64LE(amount, 64);
   data[108] = 1;
   return Object.freeze({
-    lamports: 2_039_280,
+    lamports: Number(2_039_280n + (mint.equals(NATIVE_MINT) ? amount : 0n)),
     owner: TOKEN_PROGRAM_ID.toBase58(),
     executable: false,
     rentEpoch: 0,

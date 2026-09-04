@@ -1,12 +1,12 @@
 # Runtime signable de l'exécuteur live — conception #51-H2b
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.0.2
 
-**Version de la spécification parente :** 1.10.0
+**Version de la spécification parente :** 1.10.1
 
 **Version de l'orchestration persistante H1 :** 1.2.0
 
-**Version du runtime de finalité H2a :** 1.1.5
+**Version du runtime de finalité H2a :** 1.1.6
 
 **Version de la fondation live :** 1.1.0
 
@@ -15,6 +15,20 @@
 **Statut :** LIVRÉE — runtime signable désarmé, aucun canary démarré
 
 **Issue parente :** #51
+
+## Historique des versions
+
+- **1.0.2 — 2026-09-04 :** rend terminal l'épuisement du budget RPC durable
+  avant le verrou de soumission. Le code `RPC_CALL_BUDGET_EXHAUSTED` reste
+  typé jusqu'au worker, qui persiste `REVOKED_NO_SEND`; une reprise de cet
+  état ne contacte plus le provider. Après `SUBMISSION_STARTED`, toute
+  incertitude reste `AMBIGUOUS` et ne peut pas être reclassée en révocation.
+- **1.0.1 — 2026-09-04 :** persiste le budget RPC total de chaque tentative
+  dans la migration 038 et réserve chaque appel avant son émission. Les lanes
+  de reprise partagent ainsi le compteur déjà consommé au lieu de recréer un
+  budget en mémoire.
+- **1.0.0 — 2026-09-04 :** livre le runtime signable H2b désarmé et ses quatre
+  lanes ordonnées.
 
 ## 1. Décision et état livré
 
@@ -51,7 +65,8 @@ H2a reste un binaire séparé, sous son login PostgreSQL read-only distinct. Il
 reste seul responsable de la finalité, de la confirmation, de la
 réconciliation et de la deadline. H2b n'importe ni les lanes ni les façades
 applicatives H2a et n'obtient aucune méthode permettant d'exécuter ces tâches.
-La spécification H2a 1.1.5 reste inchangée.
+Le contrat métier H2a reste inchangé ; sa spécification 1.1.6 aligne seulement
+le head du catalogue partagé sur la migration 038, sans nouvelle autorité.
 
 H2c reste seul responsable de la validation opérateur, de l'armement manuel et
 de la préparation ou du démarrage d'un canary. H2b ne peut appeler ni `arm`, ni
@@ -99,7 +114,7 @@ Le runtime ne reçoit que des façades gelées, à prototype nul :
   `release` ;
 - venue : `findFinalizedCanonicalPumpSwapPool` ;
 - simulation : `complete` ;
-- live : `readPreparationBinding`, `persistSigned`,
+- live : `readPreparationBinding`, `persistSigned`, `reserveRpcCall`,
   `inspectSignedTransaction`, `recordSignedSimulation`,
   `revokeBeforeSubmission`, `beginSubmission`, `recordSubmissionOutcome`.
 
@@ -167,9 +182,27 @@ Le format est un tableau JSON canonique de 64 octets et la clé dérivée doit
 fermeture. Aucun secret, chemin, octet signé, URL, message d'erreur brut ou
 signature n'entre dans les logs.
 
-Chaque tentative utilise une session RPC provider-affine et bornée. Le genesis
-hash est vérifié avant le secret et avant toute opération signable. La
-soumission utilise exactement les octets persistés, `skipPreflight=true` et
+Chaque tentative utilise une session RPC provider-affine et bornée. Le budget
+total `EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT`, compris entre 12 et 16, est créé
+atomiquement avec l'artefact signé par la migration 038. Il est initialisé avec
+les appels de préparation non signée déjà consommés. Avant chaque appel RPC du
+tail signable, `reserveRpcCall` incrémente ce compteur sous verrou PostgreSQL.
+Le redémarrage d'un processus, une nouvelle passe ou une lane recover ne
+réinitialise jamais ce budget.
+
+La réservation précède le contact provider. Un crash entre ces deux opérations
+consomme donc conservativement un appel, sans remboursement ; cette perte
+bornée est préférée à un dépassement silencieux. Lorsque la limite est atteinte
+avant `SUBMISSION_STARTED`, l'appel provider n'est pas exécuté, le code typé
+`RPC_CALL_BUDGET_EXHAUSTED` atteint le worker et l'artefact devient
+`REVOKED_NO_SEND`. Toute reprise de ce terminal relit seulement PostgreSQL,
+sans nouvel appel provider. Si la limite est rencontrée après le verrou
+`SUBMISSION_STARTED`, le résultat demeure `AMBIGUOUS` : l'émission peut avoir
+eu lieu et aucune révocation n'est permise. Le plafond local de six appels du
+tail reste une défense secondaire et ne remplace pas le compteur durable.
+
+Le genesis hash est vérifié avant le secret et avant toute opération signable.
+La soumission utilise exactement les octets persistés, `skipPreflight=true` et
 `maxRetries=0`. Une réponse incertaine devient `AMBIGUOUS`, jamais un retry.
 
 `SIGINT` ou `SIGTERM` interdit une nouvelle lane, annule le travail courant et

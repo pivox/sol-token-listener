@@ -885,6 +885,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     });
 
     const persisted = await Promise.all([
@@ -1312,6 +1313,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reservationId: null,
       artifact: exitArtifact,
       unsignedSimulation: exitUnsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const exitSimulated = await repository.recordSignedSimulation(
       exitBegun.claim,
@@ -1473,6 +1475,62 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
   });
 });
 
+void test('RPC reservations remain bounded across repository instances and process recovery',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: live RPC budget integration skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await liveFixture(pool);
+      const first = new PostgresExecutionLiveRepository(pool);
+      const second = new PostgresExecutionLiveRepository(pool);
+      const persisted = await first.persistSigned(Object.freeze({
+        payloadVersion: 1,
+        claim: fixture.claim,
+        qualificationId: fixture.qualificationId,
+        reservationId: fixture.reservationId,
+        artifact: fixture.artifact,
+        unsignedSimulation: fixture.unsignedSimulation,
+        rpcBudget: Object.freeze({ payloadVersion: 1, callsUsed: 5, callsLimit: 12 }),
+      }));
+
+      const reserve = (repository: PostgresExecutionLiveRepository) =>
+        repository.reserveRpcCall(Object.freeze({
+          payloadVersion: 1,
+          claim: persisted.claim,
+          artifactId: fixture.artifact.artifactId,
+        }));
+      const reservations = await Promise.all([
+        reserve(first), reserve(second), reserve(first), reserve(second),
+        reserve(first), reserve(second), reserve(first),
+      ]);
+      assert.deepEqual(
+        reservations.map((result) => result.callsReserved).sort((left, right) => left - right),
+        [6, 7, 8, 9, 10, 11, 12],
+      );
+      await assert.rejects(reserve(second), isLiveRepositoryError('RPC_CALL_BUDGET_EXHAUSTED'));
+
+      const replay = await first.persistSigned(Object.freeze({
+        payloadVersion: 1,
+        claim: fixture.claim,
+        qualificationId: fixture.qualificationId,
+        reservationId: fixture.reservationId,
+        artifact: fixture.artifact,
+        unsignedSimulation: fixture.unsignedSimulation,
+        rpcBudget: Object.freeze({ payloadVersion: 1, callsUsed: 5, callsLimit: 12 }),
+      }));
+      assert.equal(replay.artifact.artifactId, fixture.artifact.artifactId);
+
+      const durable = await pool.query(`SELECT initial_calls_used,calls_reserved,calls_limit
+        FROM execution_live_rpc_budgets WHERE artifact_id=$1`, [fixture.artifact.artifactId]);
+      assert.deepEqual(durable.rows, [{
+        initial_calls_used: 5, calls_reserved: 12, calls_limit: 12,
+      }]);
+    });
+  });
+
 void test('preparation binding resolves the exact BUY authority from the active claim',
   async (context) => {
     const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -1540,6 +1598,7 @@ void test('signed simulation commit-unknown replays one durable evidence row', a
       payloadVersion: 1, claim: fixture.claim,
       qualificationId: fixture.qualificationId, reservationId: fixture.reservationId,
       artifact: fixture.artifact, unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const evidence = signedSimulationEvidence(
       fixture.artifact, fixture.unsignedSimulation, Object.freeze({
@@ -1597,6 +1656,7 @@ void test('fails closed when the durable control is stopped before persistence',
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId, artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     })), (error: unknown) => error instanceof ExecutionLiveRepositoryError
       && error.code === 'CONTROL_STOPPED');
     assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
@@ -1627,6 +1687,7 @@ for (const scenario of ['RETIRED_GENERATION', 'RUNTIME_BINDING', 'CAPITAL_LIMIT'
           reservationId: fixture.reservationId,
           artifact: fixture.artifact,
           unsignedSimulation: fixture.unsignedSimulation,
+          rpcBudget: fixture.rpcBudget,
         }));
         const simulated = await repository.recordSignedSimulation(
           fixture.claim,
@@ -1714,6 +1775,7 @@ void test('finalized no-effect evidence closes an ambiguous artifact without ope
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const simulated = await repository.recordSignedSimulation(fixture.claim,
       signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
@@ -1801,6 +1863,7 @@ void test('lease expiry while reconciliation waits on the intent lock fails clos
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const simulated = await repository.recordSignedSimulation(fixture.claim,
       signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
@@ -1947,6 +2010,7 @@ void test('finalized BUY evidence reconciles an ambiguous submission without con
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const simulated = await repository.recordSignedSimulation(fixture.claim,
       signedSimulationEvidence(fixture.artifact, fixture.unsignedSimulation, {
@@ -2149,6 +2213,7 @@ void test('rejects a lost lease and a superseded provider quota snapshot', async
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId, artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     });
     await pool.query(`UPDATE execution_intents SET
       lease_expires_at=date_trunc('milliseconds',statement_timestamp()) WHERE id=$1`, [
@@ -2175,6 +2240,7 @@ void test('rejects a lost lease and a superseded provider quota snapshot', async
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId, artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     })), isLiveRepositoryError('PREFLIGHT_EXPIRED'));
   });
 });
@@ -2194,6 +2260,7 @@ void test('rejects a signed artifact state update without its immutable journal 
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
+      rpcBudget: fixture.rpcBudget,
     }));
     const signedEvidence = signedSimulationEvidence(
       fixture.artifact, fixture.unsignedSimulation, Object.freeze({
@@ -2595,8 +2662,12 @@ async function liveFixture(
     simulatedBaseDeltaRaw: 100n, simulatedQuoteDeltaRaw: -1_000n,
     logsFingerprint: '8'.repeat(64), logsLineCount: 1,
   });
+  const rpcBudget = Object.freeze({
+    payloadVersion: 1 as const, callsUsed: 5, callsLimit: 12,
+  });
   return Object.freeze({
-    claim, artifact, unsignedSimulation, providerSnapshot, armamentId: armament.armamentId,
+    claim, artifact, unsignedSimulation, rpcBudget, providerSnapshot,
+    armamentId: armament.armamentId,
     qualificationId: qualification.qualificationId,
     reservationId: admitted.reservationId,
   });
@@ -2624,6 +2695,7 @@ async function acceptedBuyFixture(
     reservationId: fixture.reservationId,
     artifact: fixture.artifact,
     unsignedSimulation: fixture.unsignedSimulation,
+    rpcBudget: fixture.rpcBudget,
   }));
   const signed = await live.recordSignedSimulation(
     fixture.claim,

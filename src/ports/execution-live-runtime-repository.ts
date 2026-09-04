@@ -20,6 +20,7 @@ export interface ExecutionLiveRuntimeVenueRepository {
 export interface ExecutionLiveRuntimeRepository {
   readonly readPreparationBinding: ExecutionLiveRepository['readPreparationBinding'];
   readonly persistSigned: ExecutionLiveRepository['persistSigned'];
+  readonly reserveRpcCall: ExecutionLiveRepository['reserveRpcCall'];
   readonly inspectSignedTransaction: ExecutionLiveRepository['inspectSignedTransaction'];
   readonly recordSignedSimulation: ExecutionLiveRepository['recordSignedSimulation'];
   readonly revokeBeforeSubmission: ExecutionLiveRepository['revokeBeforeSubmission'];
@@ -58,6 +59,7 @@ export function createExecutionLiveRuntimeRepository(
   source: Pick<ExecutionLiveRepository,
     | 'readPreparationBinding'
     | 'persistSigned'
+    | 'reserveRpcCall'
     | 'inspectSignedTransaction'
     | 'recordSignedSimulation'
     | 'revokeBeforeSubmission'
@@ -67,6 +69,7 @@ export function createExecutionLiveRuntimeRepository(
   return exactFacade({
     readPreparationBinding: source.readPreparationBinding.bind(source),
     persistSigned: source.persistSigned.bind(source),
+    reserveRpcCall: source.reserveRpcCall.bind(source),
     inspectSignedTransaction: source.inspectSignedTransaction.bind(source),
     recordSignedSimulation: source.recordSignedSimulation.bind(source),
     revokeBeforeSubmission: source.revokeBeforeSubmission.bind(source),
