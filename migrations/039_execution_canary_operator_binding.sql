@@ -298,6 +298,51 @@ CREATE INDEX IF NOT EXISTS execution_pre_signature_locks_purge_idx
   ON execution_pre_signature_locks(purge_after,lock_id)
   WHERE state IN ('SIGNED_PERSISTED','REVOKED');
 
+CREATE OR REPLACE FUNCTION guard_execution_pre_signature_lock_insert()
+RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+DECLARE lock_valid BOOLEAN;
+BEGIN
+  IF NEW.state<>'AUTHORIZED' THEN
+    RAISE EXCEPTION 'only AUTHORIZED pre-signature lock insert is permitted' USING ERRCODE='55000';
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(NEW.generation_id, 51005));
+  SELECT EXISTS(SELECT 1 FROM execution_activation_armaments armament
+    JOIN execution_intents intent ON intent.id=NEW.intent_id
+    JOIN execution_attempts attempt ON attempt.intent_id=NEW.intent_id
+      AND attempt.attempt_number=NEW.attempt_number
+    JOIN execution_exposure_reservations reservation ON reservation.reservation_id=NEW.reservation_id
+    WHERE armament.armament_id=NEW.armament_id AND armament.payload_version=2
+      AND armament.state='ARMED' AND armament.state_revision=0 AND armament.consumed_buys=0
+      AND armament.generation_id=NEW.generation_id AND armament.target_intent_id=NEW.intent_id
+      AND NEW.intent_state_revision=armament.target_intent_state_revision+1
+      AND armament.target_reservation_id=NEW.reservation_id
+      AND armament.wallet_public_key=NEW.wallet_public_key AND armament.provider_id=NEW.provider_id
+      AND armament.build_hash=NEW.build_hash AND armament.configuration_fingerprint=NEW.configuration_fingerprint
+      AND armament.strategy_fingerprint=NEW.strategy_fingerprint
+      AND armament.target_decision_fingerprint=NEW.decision_fingerprint
+      AND armament.target_policy_fingerprint=NEW.policy_fingerprint
+      AND armament.target_wallet_snapshot_fingerprint=NEW.wallet_snapshot_fingerprint
+      AND armament.target_provider_snapshot_fingerprint=NEW.provider_snapshot_fingerprint
+      AND intent.status='PROCESSING' AND intent.state_revision=NEW.intent_state_revision
+      AND intent.attempt_count=NEW.attempt_number AND intent.lease_token=NEW.lease_token
+      AND attempt.status='STARTED' AND attempt.provider_id=NEW.provider_id
+      AND reservation.intent_id=NEW.intent_id AND reservation.generation_id=NEW.generation_id
+      AND reservation.state='RESERVED' AND reservation.side='BUY'
+      AND reservation.policy_fingerprint=NEW.policy_fingerprint
+      AND reservation.wallet_snapshot_fingerprint=NEW.wallet_snapshot_fingerprint
+      AND reservation.provider_snapshot_fingerprint=NEW.provider_snapshot_fingerprint) INTO lock_valid;
+  IF NOT lock_valid THEN
+    RAISE EXCEPTION 'guarded pre-signature lock insert required' USING ERRCODE='55000';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+DROP TRIGGER IF EXISTS execution_pre_signature_locks_guarded_insert
+  ON execution_pre_signature_locks;
+CREATE TRIGGER execution_pre_signature_locks_guarded_insert
+  BEFORE INSERT ON execution_pre_signature_locks
+  FOR EACH ROW EXECUTE FUNCTION guard_execution_pre_signature_lock_insert();
+
 CREATE OR REPLACE FUNCTION guard_execution_pre_signature_lock_update()
 RETURNS TRIGGER LANGUAGE plpgsql AS $function$
 BEGIN
@@ -328,6 +373,37 @@ DROP TRIGGER IF EXISTS execution_pre_signature_locks_immutable
 CREATE TRIGGER execution_pre_signature_locks_immutable
   BEFORE UPDATE ON execution_pre_signature_locks
   FOR EACH ROW EXECUTE FUNCTION guard_execution_pre_signature_lock_update();
+
+CREATE OR REPLACE FUNCTION guard_execution_pre_signature_lock_commit()
+RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+BEGIN
+  IF NEW.state='AUTHORIZED' AND NOT EXISTS (
+    SELECT 1 FROM execution_activation_armaments armament
+    WHERE armament.armament_id=NEW.armament_id AND armament.payload_version=2
+      AND armament.state='LOCKED' AND armament.state_revision=1 AND armament.consumed_buys=1
+      AND armament.generation_id=NEW.generation_id AND armament.target_intent_id=NEW.intent_id
+      AND NEW.intent_state_revision=armament.target_intent_state_revision+1
+      AND armament.target_reservation_id=NEW.reservation_id
+      AND armament.locked_intent_id=NEW.intent_id AND armament.locked_attempt_number=NEW.attempt_number
+      AND armament.locked_reservation_id=NEW.reservation_id AND armament.locked_lease_token=NEW.lease_token
+      AND armament.wallet_public_key=NEW.wallet_public_key AND armament.provider_id=NEW.provider_id
+      AND armament.build_hash=NEW.build_hash AND armament.configuration_fingerprint=NEW.configuration_fingerprint
+      AND armament.strategy_fingerprint=NEW.strategy_fingerprint
+      AND armament.target_decision_fingerprint=NEW.decision_fingerprint
+      AND armament.target_policy_fingerprint=NEW.policy_fingerprint
+      AND armament.target_wallet_snapshot_fingerprint=NEW.wallet_snapshot_fingerprint
+      AND armament.target_provider_snapshot_fingerprint=NEW.provider_snapshot_fingerprint
+  ) THEN
+    RAISE EXCEPTION 'pre-signature lock requires exact locked V2 armament' USING ERRCODE='55000';
+  END IF;
+  RETURN NULL;
+END
+$function$;
+DROP TRIGGER IF EXISTS execution_pre_signature_locks_locked_armament_commit
+  ON execution_pre_signature_locks;
+CREATE CONSTRAINT TRIGGER execution_pre_signature_locks_locked_armament_commit
+  AFTER INSERT ON execution_pre_signature_locks DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION guard_execution_pre_signature_lock_commit();
 
 CREATE OR REPLACE FUNCTION guard_execution_pre_signature_lock_delete()
 RETURNS TRIGGER LANGUAGE plpgsql AS $function$
@@ -459,6 +535,7 @@ BEGIN
     END IF;
     RETURN NEW;
   END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(OLD.generation_id, 51005));
   IF NEW.payload_version IS DISTINCT FROM OLD.payload_version
     OR NEW.armament_id IS DISTINCT FROM OLD.armament_id OR NEW.armament_fingerprint IS DISTINCT FROM OLD.armament_fingerprint
     OR NEW.qualification_id IS DISTINCT FROM OLD.qualification_id OR NEW.qualification_fingerprint IS DISTINCT FROM OLD.qualification_fingerprint
@@ -494,6 +571,20 @@ BEGIN
       OR NEW.locked_reservation_id IS DISTINCT FROM NEW.target_reservation_id
       OR NEW.locked_lease_token IS NULL OR NEW.locked_at IS NULL
     THEN RAISE EXCEPTION 'armament lock transition requires exact lock binding' USING ERRCODE='55000'; END IF;
+    IF NOT EXISTS (SELECT 1 FROM execution_pre_signature_locks lock
+      WHERE lock.armament_id=NEW.armament_id AND lock.state='AUTHORIZED' AND lock.state_revision=0
+        AND lock.generation_id=NEW.generation_id AND lock.intent_id=NEW.target_intent_id
+        AND lock.intent_state_revision=NEW.target_intent_state_revision+1
+        AND lock.attempt_number=NEW.locked_attempt_number AND lock.reservation_id=NEW.target_reservation_id
+        AND lock.lease_token=NEW.locked_lease_token AND lock.wallet_public_key=NEW.wallet_public_key
+        AND lock.provider_id=NEW.provider_id AND lock.build_hash=NEW.build_hash
+        AND lock.configuration_fingerprint=NEW.configuration_fingerprint
+        AND lock.strategy_fingerprint=NEW.strategy_fingerprint
+        AND lock.decision_fingerprint=NEW.target_decision_fingerprint
+        AND lock.policy_fingerprint=NEW.target_policy_fingerprint
+        AND lock.wallet_snapshot_fingerprint=NEW.target_wallet_snapshot_fingerprint
+        AND lock.provider_snapshot_fingerprint=NEW.target_provider_snapshot_fingerprint)
+    THEN RAISE EXCEPTION 'armament lock transition requires exact authorized pre-signature lock' USING ERRCODE='55000'; END IF;
   ELSIF OLD.state='ARMED' AND NEW.state IN ('REVOKED','EXPIRED') THEN
     IF NEW.consumed_buys<>0
       OR ROW(NEW.locked_intent_id,NEW.locked_attempt_number,NEW.locked_reservation_id,

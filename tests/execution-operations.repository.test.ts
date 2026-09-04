@@ -366,11 +366,16 @@ void test('does not terminalize a V2 LOCKED armament from an operations stop', a
     });
     const processing = Object.freeze({ ...claimed, intent: processingIntent });
     await fixture.intents.beginAttempt(processing);
-    await pool.query(`UPDATE execution_activation_armaments SET
-      state='LOCKED',state_revision=1,consumed_buys=1,locked_intent_id=target_intent_id,
-      locked_attempt_number=1,locked_reservation_id=target_reservation_id,
-      locked_lease_token=$2::UUID,locked_at=date_trunc('milliseconds',statement_timestamp())
-      WHERE armament_id=$1`, [armament.armamentId, processing.leaseToken]);
+    await pool.query('SET session_replication_role = replica');
+    try {
+      await pool.query(`UPDATE execution_activation_armaments SET
+        state='LOCKED',state_revision=1,consumed_buys=1,locked_intent_id=target_intent_id,
+        locked_attempt_number=1,locked_reservation_id=target_reservation_id,
+        locked_lease_token=$2::UUID,locked_at=date_trunc('milliseconds',statement_timestamp())
+        WHERE armament_id=$1`, [armament.armamentId, processing.leaseToken]);
+    } finally {
+      await pool.query('SET session_replication_role = origin');
+    }
     await fixture.repository.setStop({
       payloadVersion: 1, commandId: 'command:stop-locked-v2-canary', generationId,
       operatorId: 'operator-primary', occurredAtMs: Date.now(),

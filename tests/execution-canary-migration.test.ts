@@ -231,6 +231,120 @@ void test('pre-signature lock deletion waits for terminal retention and its sign
   }
 });
 
+void test('pre-signature lock INSERT rejects a causally divergent raw row', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const scenario = await prepareAuthorizedLockScenario(pool);
+    await assert.rejects(
+      insertAuthorizedLock(pool, scenario, '1', '0'.repeat(64)),
+      /guarded pre-signature lock insert required/u,
+    );
+  });
+});
+
+void test('an AUTHORIZED pre-signature lock cannot commit without its exact V2 LOCKED armament', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const scenario = await prepareAuthorizedLockScenario(pool);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await insertAuthorizedLock(client, scenario, '2', 'b'.repeat(64));
+      await assert.rejects(client.query('COMMIT'), /pre-signature lock requires exact locked V2 armament/u);
+    } finally {
+      try { await client.query('ROLLBACK'); } catch { /* transaction may already be closed */ }
+      client.release();
+    }
+  });
+});
+
+void test('an AUTHORIZED pre-signature lock commits only with its exact V2 lock CAS', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const scenario = await prepareAuthorizedLockScenario(pool);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await insertAuthorizedLock(client, scenario, '3', 'b'.repeat(64));
+      const updated = await client.query(`UPDATE execution_activation_armaments SET
+        state='LOCKED',state_revision=1,consumed_buys=1,
+        locked_intent_id=target_intent_id,locked_attempt_number=1,
+        locked_reservation_id=target_reservation_id,locked_lease_token=$2::UUID,
+        locked_at=date_trunc('milliseconds',statement_timestamp())
+        WHERE armament_id=$1`, [scenario.armamentId, scenario.leaseToken]);
+      assert.equal(updated.rowCount, 1);
+      await client.query('COMMIT');
+    } finally {
+      try { await client.query('ROLLBACK'); } catch { /* transaction may already be closed */ }
+      client.release();
+    }
+  });
+});
+
+interface AuthorizedLockScenario {
+  readonly armamentId: string;
+  readonly intentId: string;
+  readonly reservationId: string;
+  readonly generationId: string;
+  readonly leaseToken: string;
+}
+
+async function prepareAuthorizedLockScenario(
+  pool: InstanceType<typeof pg.Pool>,
+): Promise<AuthorizedLockScenario> {
+  await migrateDatabase({ pool });
+  await seedV2ArmamentPrerequisites(pool, 'valid');
+  await insertV2Armament(pool, '4 minutes', 'So11111111111111111111111111111111111111112');
+  const intentId = `execution_intent_${'d'.repeat(64)}`;
+  const leaseToken = '00000000-0000-0000-0000-000000000001';
+  // This helper seeds the upstream claim/attempt state so the assertions exercise
+  // the new pre-signature-lock triggers, not the intent transition machinery.
+  await pool.query('SET session_replication_role = replica');
+  try {
+    await pool.query(`UPDATE execution_intents SET status='PROCESSING',attempt_count=1,
+      state_revision=1,lease_owner='pre-signature-lock-test',lease_token=$2::UUID,
+      lease_expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '30 seconds'
+      WHERE id=$1`, [intentId, leaseToken]);
+    await pool.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,provider_id,started_at
+    ) VALUES ($1,1,'STARTED','provider',date_trunc('milliseconds',statement_timestamp()))`, [intentId]);
+  } finally {
+    await pool.query('SET session_replication_role = origin');
+  }
+  return Object.freeze({
+    armamentId: `execution_activation_armament_${'0'.repeat(64)}`,
+    intentId,
+    reservationId: `execution_exposure_reservation_${'f'.repeat(64)}`,
+    generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+    leaseToken,
+  });
+}
+
+async function insertAuthorizedLock(
+  client: Pick<InstanceType<typeof pg.Pool>, 'query'>,
+  scenario: AuthorizedLockScenario,
+  seed: string,
+  policyFingerprint: string,
+): Promise<unknown> {
+  return client.query(`INSERT INTO execution_pre_signature_locks (
+    lock_id,lock_fingerprint,intent_id,attempt_number,intent_state_revision,armament_id,reservation_id,
+    generation_id,wallet_public_key,provider_id,lease_token,message_hash,unsigned_message_bytes,
+    unsigned_transaction_hash,unsigned_transaction_bytes,build_hash,configuration_fingerprint,
+    strategy_fingerprint,decision_fingerprint,policy_fingerprint,wallet_snapshot_fingerprint,
+    provider_snapshot_fingerprint,quote_fingerprint,blockhash,last_valid_block_height,state,state_revision
+  ) VALUES (
+    'execution_pre_signature_lock_${seed.repeat(64)}','${seed.repeat(64)}',$1,1,1,$2,$3,$4,
+    '11111111111111111111111111111111','provider',$5::UUID,'${'7'.repeat(64)}',decode('aa','hex'),
+    '${'8'.repeat(64)}',decode('bb','hex'),'${'2'.repeat(64)}','${'3'.repeat(64)}',
+    '${'4'.repeat(64)}','${'8'.repeat(64)}',$6,'${'c'.repeat(64)}','${'d'.repeat(64)}',
+    '${'0'.repeat(64)}','11111111111111111111111111111111',1,'AUTHORIZED',0
+  )`, [scenario.intentId, scenario.armamentId, scenario.reservationId,
+    scenario.generationId, scenario.leaseToken, policyFingerprint]);
+}
+
 async function seedV2ArmamentPrerequisites(
   pool: InstanceType<typeof pg.Pool>,
   variant: V2ArmamentPrerequisiteVariant,
