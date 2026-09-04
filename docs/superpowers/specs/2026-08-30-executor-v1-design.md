@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.8.3
+**Version de spécification :** 1.8.8
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,26 @@
 
 ## Historique des versions
 
+- **1.8.8 — 2026-09-04 :** versionne le contrat H2a de report gelé :
+  `DEFERRED` associe une lane et un code RPC retryable allowlisté nullable,
+  tandis que `NOT_FOUND` reste sans code et laisse l'échéance poursuivre. Les
+  finalités inconnues ou incohérentes échouent fermées ; `CONFIRMED` et
+  `FINALIZED` imposent un slot `bigint` non négatif. Les logs redacted ne
+  contiennent ni message, ni URL, ni signature.
+- **1.8.7 — 2026-09-04 :** versionne le durcissement H2a du gateway RPC
+  read-only : schéma `getTransaction`/Token-2022, ordre et cardinalités LUT
+  v0, index u8 et identité pré/post, corps HTTP borné et annulé, UTF-8 fatal.
+  Cette frontière reste sans signer, soumission ou lecture de secret.
+- **1.8.6 — 2026-09-04 :** la transition `recordConfirmation` libère
+  atomiquement la lease ; son replay exact accepte une lease nulle ou identique
+  et la lane H2a ne tente aucun `release` après un commit réussi.
+- **1.8.5 — 2026-09-04 :** rend toute preuve de réconciliation SELL non
+  terminale immédiatement récupérable en libérant sa lease, y compris après
+  plusieurs résultats `UNKNOWN` ou `MISMATCH` consécutifs.
+- **1.8.4 — 2026-09-04 :** fixe pour H2a une session RPC unique par passe,
+  partagée entre réconciliation et confirmation, afin que le budget d'appels
+  ne puisse pas être réinitialisé par lane. Les noms de configuration restent
+  ceux de l'executor public existant.
 - **1.8.3 — 2026-09-04 :** impose à H2a de transmettre le claim renouvelé le
   plus récent aux commits et de libérer toute lease après confirmation,
   report ou résultat de réconciliation non terminal. Une confirmation en

@@ -2,7 +2,7 @@ import {
   ExecutionReconciliationService,
   ExecutionReconciliationServiceError,
 } from '../executor-risk/reconciliation-service.js';
-import type { LiveConfirmationGateway } from '../executor-live/confirmation-worker.js';
+import type { LiveConfirmationGateway } from '../ports/execution-confirmation-gateway.js';
 import type {
   ClaimedExecutionIntent,
   ExecutionIntentRepository,
@@ -19,7 +19,21 @@ import type { ExecutionReconciliationCommitResultV1 } from
   '../ports/execution-risk-repository.js';
 import type { LiveRecoveryConfig } from './config.js';
 
-export type LiveRecoveryLaneResult = 'IDLE' | 'DEFERRED' | 'WORKED';
+export type LiveRecoveryRetryableRpcErrorCode =
+  | 'RPC_RATE_LIMITED'
+  | 'RPC_TIMEOUT'
+  | 'RPC_UNAVAILABLE'
+  | 'RPC_RESPONSE_TOO_LARGE'
+  | 'RPC_RESPONSE_INVALID'
+  | 'CALL_BUDGET_EXCEEDED'
+  | 'SESSION_FAILED';
+
+export interface LiveRecoveryDeferredResult {
+  readonly result: 'DEFERRED';
+  readonly errorCode: LiveRecoveryRetryableRpcErrorCode | null;
+}
+
+export type LiveRecoveryLaneResult = 'IDLE' | LiveRecoveryDeferredResult | 'WORKED';
 
 export type LiveRecoveryLaneErrorCode =
   | 'OPERATION_ABORTED'
@@ -60,7 +74,7 @@ export interface LiveRecoveryLaneDependencies {
     ): Promise<unknown>;
     createNextDeadlineExitIntent: ExecutionLiveRepository['createNextDeadlineExitIntent'];
   }>;
-  readonly createGateway: () => RecoveryGateway;
+  readonly gateway: RecoveryGateway;
 }
 
 export interface LiveRecoveryLanes {
@@ -110,13 +124,16 @@ async function reconciliationLane(
     await service.reconcile(work.request, signal);
     return 'WORKED';
   } catch (error) {
-    const deferred = error instanceof ExecutionReconciliationServiceError
-      && error.code === 'READ_FAILED';
+    const deferredCode = error instanceof ExecutionReconciliationServiceError
+      && error.code === 'READ_FAILED'
+      ? retryableRpcErrorCode(error.sourceCode)
+      : null;
     await release(dependencies, activeClaim);
     if (signal.aborted) throw laneFailure('OPERATION_ABORTED');
-    if (deferred) return 'DEFERRED';
+    if (deferredCode !== null) return deferredResult(deferredCode);
     if (error instanceof LiveRecoveryLaneError) throw error;
     if (error instanceof ExecutionReconciliationServiceError) {
+      if (error.code === 'READ_FAILED') throw laneFailure('GATEWAY_FAILED');
       throw laneFailure('INVALID_EVIDENCE');
     }
     if (stage === 'READ') throw laneFailure('READ_MODEL_FAILED');
@@ -142,17 +159,27 @@ async function confirmationLane(
     let observation;
     try {
       observation = await gateway.observeSignature(work.signature, signal);
-    } catch {
+    } catch (error) {
       await release(dependencies, activeClaim);
       if (signal.aborted) {
         throw new ClaimReleaseHandledError(laneFailure('OPERATION_ABORTED'));
       }
-      return 'DEFERRED';
+      const deferredCode = retryableRpcErrorCode(ownStringDataProperty(error, 'code'));
+      if (deferredCode !== null) return deferredResult(deferredCode);
+      throw new ClaimReleaseHandledError(laneFailure('GATEWAY_FAILED'));
     }
-    if (observation.confirmationStatus === 'NOT_FOUND' || observation.observedSlot === null) {
+    const confirmationStatus: unknown = observation.confirmationStatus;
+    const observedSlot: unknown = observation.observedSlot;
+    if (confirmationStatus === 'NOT_FOUND') {
+      if (observedSlot !== null) throw laneFailure('GATEWAY_FAILED');
       await release(dependencies, activeClaim);
-      return 'DEFERRED';
+      return deferredResult(null);
     }
+    if ((confirmationStatus !== 'CONFIRMED' && confirmationStatus !== 'FINALIZED')
+      || typeof observedSlot !== 'bigint' || observedSlot < 0n) {
+      throw laneFailure('GATEWAY_FAILED');
+    }
+    const confirmedObservedSlot = observedSlot;
     activeClaim = await renew(dependencies, activeClaim, signal);
     stage = 'COMMIT';
     await dependencies.live.recordConfirmation(activeClaim, Object.freeze({
@@ -160,17 +187,9 @@ async function confirmationLane(
       artifactId: work.artifactId,
       expectedRevision: work.expectedRevision,
       signature: work.signature,
-      observedSlot: observation.observedSlot,
+      observedSlot: confirmedObservedSlot,
       observedAtMs: observation.observedAtMs,
     }));
-    try {
-      await release(dependencies, activeClaim);
-    } catch (error) {
-      if (error instanceof LiveRecoveryLaneError) {
-        throw new ClaimReleaseHandledError(error);
-      }
-      throw error;
-    }
     return 'WORKED';
   } catch (error) {
     if (error instanceof ClaimReleaseHandledError) throw error.cause;
@@ -233,7 +252,7 @@ function providerGateway(
   dependencies: LiveRecoveryLaneDependencies,
   durableProviderId: string,
 ): RecoveryGateway {
-  const gateway = dependencies.createGateway();
+  const gateway = dependencies.gateway;
   if (durableProviderId !== dependencies.config.providerId
     || gateway.providerId !== dependencies.config.providerId) {
     throw laneFailure('PROVIDER_MISMATCH');
@@ -267,4 +286,35 @@ function assertActive(signal: AbortSignal): void {
 
 function laneFailure(code: LiveRecoveryLaneErrorCode): LiveRecoveryLaneError {
   return new LiveRecoveryLaneError(code);
+}
+
+function deferredResult(errorCode: LiveRecoveryRetryableRpcErrorCode | null): LiveRecoveryDeferredResult {
+  return Object.freeze({ result: 'DEFERRED', errorCode });
+}
+
+function retryableRpcErrorCode(value: string | null): LiveRecoveryRetryableRpcErrorCode | null {
+  switch (value) {
+    case 'RPC_RATE_LIMITED':
+    case 'RPC_TIMEOUT':
+    case 'RPC_UNAVAILABLE':
+    case 'RPC_RESPONSE_TOO_LARGE':
+    case 'RPC_RESPONSE_INVALID':
+    case 'CALL_BUDGET_EXCEEDED':
+    case 'SESSION_FAILED':
+      return value;
+    default:
+      return null;
+  }
+}
+
+function ownStringDataProperty(value: unknown, key: string): string | null {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return null;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && 'value' in descriptor && typeof descriptor.value === 'string'
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
 }

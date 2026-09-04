@@ -160,6 +160,21 @@ La dernière valeur doit rester `false`; aucune clé, keypair, endpoint RPC ou
 réglage de signature/soumission ne doit être ajouté à l'environnement de ce
 mode PostgreSQL-only.
 
+### Récupération de finalité live read-only (#51-H2a)
+
+Le processus séparé `executor:live:recovery:start` confirme et réconcilie les
+soumissions déjà persistées, puis crée les intentions SELL arrivées à échéance.
+Il ne charge aucune clé privée, ne signe et ne soumet aucune transaction. Il
+utilise une session RPC bornée par passe dans l'ordre réconciliation,
+confirmation, échéance.
+
+Sa configuration exacte et la commande avec fichier d'environnement dédié
+sont documentées dans
+[`docs/operations/executor-live-canary.md`](docs/operations/executor-live-canary.md).
+Le fichier d'environnement H2a ne doit contenir aucun nom de variable de
+keypair ou de secret wallet, même avec une valeur vide. Ce runtime ne constitue
+ni un armement, ni un canary exécuté, ni une validation du trading live.
+
 Pour chaque intention `PENDING` ou `RETRY_READY` éligible, #51-C enregistre
 une assessment déterministe `FOUNDATION_VALIDATED` à couverture
 `INTENT_AND_LEASE_ONLY`. Ses gates sont `NOT_RUN` pour la quote, `NOT_RUN` pour

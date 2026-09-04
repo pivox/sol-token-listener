@@ -394,8 +394,12 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
     signature: buy.artifact.signature, observedSlot: 126n,
     observedAtMs: confirmedAtMs,
   });
+  const reconciliationClaim = await new PostgresExecutionIntentRepository(pool).claim({
+    ownerId: 'revocation-entry-reconciliation', leaseMs: 60_000, purpose: 'RECONCILE',
+  });
+  assert.ok(reconciliationClaim);
   const entry = await live.commitReconciliation(
-    buy.claim,
+    reconciliationClaim,
     buyReconciliation(buy, confirmedAtMs + 1_000),
   );
   assert.ok(entry.position);

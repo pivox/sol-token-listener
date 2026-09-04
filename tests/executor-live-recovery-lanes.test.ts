@@ -4,6 +4,7 @@ import { createExecutionIntentDraft, type ExecutionIntentV1 } from '../src/domai
 import {
   createLiveRecoveryLanes,
   LiveRecoveryLaneError,
+  type LiveRecoveryDeferredResult,
   type LiveRecoveryLaneDependencies,
 } from '../src/executor-live-recovery/lanes.js';
 import type { LiveRecoveryConfig } from '../src/executor-live-recovery/config.js';
@@ -57,12 +58,144 @@ void test('confirmation releases pending work and does not starve the deadline l
   };
   const lanes = createLiveRecoveryLanes(fixture);
 
-  assert.equal(await lanes.confirmation(signal()), 'DEFERRED');
+  assertDeferred(await lanes.confirmation(signal()), null);
   assert.equal(await lanes.deadline(signal()), 'WORKED');
   assert.deepEqual(calls, [
     'claim:CONFIRM', 'read-confirmation', 'renew:1', 'rpc:confirmation',
     'release', 'deadline',
   ]);
+});
+
+void test('reconciliation releases typed retryable RPC failures with their safe code', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'CONFIRMED');
+  fixture.live.readReconciliationWork = () => {
+    calls.push('read-reconciliation');
+    return Promise.resolve(Object.freeze({
+      payloadVersion: 1, providerId: 'primary', request: reconciliationRequest(),
+    }));
+  };
+  fixture.gateway.readFinalizedBlockHeight = async () => {
+    calls.push('rpc:height');
+    throw rpcFailure('RPC_TIMEOUT');
+  };
+
+  const result = await createLiveRecoveryLanes(fixture).reconciliation(signal());
+
+  assertDeferred(result, 'RPC_TIMEOUT');
+  assert.deepEqual(calls, [
+    'claim:RECONCILE', 'read-reconciliation', 'renew:1', 'rpc:height',
+    'rpc:history', 'rpc:transaction', 'rpc:deltas', 'release',
+  ]);
+});
+
+void test('confirmation releases typed retryable RPC failures with their safe code', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'SUBMITTED');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary',
+  }));
+  fixture.gateway.observeSignature = () => {
+    calls.push('rpc:confirmation');
+    throw rpcFailure('RPC_RATE_LIMITED');
+  };
+
+  const result = await createLiveRecoveryLanes(fixture).confirmation(signal());
+
+  assertDeferred(result, 'RPC_RATE_LIMITED');
+  assert.deepEqual(calls, [
+    'claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'release',
+  ]);
+});
+
+void test('confirmation fails closed for an arbitrary gateway error and does not leak it', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'SUBMITTED');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary',
+  }));
+  fixture.gateway.observeSignature = () => {
+    calls.push('rpc:confirmation');
+    throw new Error('https://credential@rpc.private.test');
+  };
+
+  await assert.rejects(
+    createLiveRecoveryLanes(fixture).confirmation(signal()),
+    (error: unknown) => error instanceof LiveRecoveryLaneError && error.code === 'GATEWAY_FAILED'
+      && !error.message.includes('credential'),
+  );
+  assert.deepEqual(calls, ['claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'release']);
+});
+
+void test('reconciliation fails closed for a non-retryable gateway code', async () => {
+  const calls: string[] = [];
+  const fixture = dependencies(calls, 'CONFIRMED');
+  fixture.live.readReconciliationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, providerId: 'primary', request: reconciliationRequest(),
+  }));
+  fixture.gateway.readFinalizedBlockHeight = async () => { throw rpcFailure('NOT_FOUND'); };
+
+  await assert.rejects(
+    createLiveRecoveryLanes(fixture).reconciliation(signal()),
+    (error: unknown) => error instanceof LiveRecoveryLaneError && error.code === 'GATEWAY_FAILED',
+  );
+  assert.equal(calls.includes('release'), true);
+});
+
+void test('a cancelled confirmation is not deferred', async () => {
+  const fixture = dependencies([], 'SUBMITTED');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary',
+  }));
+  const controller = new AbortController();
+  fixture.gateway.observeSignature = async () => {
+    controller.abort();
+    throw rpcFailure('RPC_TIMEOUT');
+  };
+
+  await assert.rejects(
+    createLiveRecoveryLanes(fixture).confirmation(controller.signal),
+    (error: unknown) => error instanceof LiveRecoveryLaneError && error.code === 'OPERATION_ABORTED',
+  );
+});
+
+void test('confirmation treats not found as a deferred result without an error code', async () => {
+  const fixture = dependencies([], 'SUBMITTED', 'NOT_FOUND');
+  fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+    payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+    expectedRevision: 3n, signature, providerId: 'primary',
+  }));
+  assertDeferred(await createLiveRecoveryLanes(fixture).confirmation(signal()), null);
+});
+
+void test('confirmation releases and fails closed for inconsistent finality observations', async () => {
+  for (const observation of [
+    { confirmationStatus: 'FINALIZED' as const, observedSlot: null },
+    { confirmationStatus: 'NOT_FOUND' as const, observedSlot: 500n },
+    { confirmationStatus: 'FINALIZED' as const, observedSlot: -1n },
+  ] as const) {
+    const calls: string[] = [];
+    const fixture = dependencies(calls, 'SUBMITTED');
+    fixture.live.readConfirmationWork = () => Promise.resolve(Object.freeze({
+      payloadVersion: 1, artifactId: `execution_signed_transaction_${hash}`,
+      expectedRevision: 3n, signature, providerId: 'primary',
+    }));
+    fixture.gateway.observeSignature = () => {
+      calls.push('rpc:confirmation');
+      return Promise.resolve(Object.freeze({ ...observation, observedAtMs: 2_000 }) as never);
+    };
+
+    await assert.rejects(
+      createLiveRecoveryLanes(fixture).confirmation(signal()),
+      (error: unknown) => error instanceof LiveRecoveryLaneError
+        && error.code === 'GATEWAY_FAILED'
+        && !error.message.includes('credential'),
+    );
+    assert.deepEqual(calls, ['claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'release']);
+  }
 });
 
 void test('confirmation commits with a post-RPC renewal and never uses the stale claim', async () => {
@@ -83,7 +216,7 @@ void test('confirmation commits with a post-RPC renewal and never uses the stale
   assert.equal(await lanes.confirmation(signal()), 'WORKED');
   assert.equal((committedClaim as ClaimedExecutionIntent | null)?.leaseExpiresAtMs, 3_000);
   assert.deepEqual(calls, [
-    'claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'renew:2', 'confirm:500', 'release',
+    'claim:CONFIRM', 'renew:1', 'rpc:confirmation', 'renew:2', 'confirm:500',
   ]);
 });
 
@@ -160,7 +293,7 @@ function dependencies(
       release: () => { calls.push('release'); return Promise.resolve(true); },
     },
     live,
-    createGateway: () => ({
+    gateway: {
       providerId: 'primary',
       readFinalizedBlockHeight: () => { calls.push('rpc:height'); return Promise.resolve(1_001n); },
       readSignatureHistory: () => { calls.push('rpc:history'); return Promise.resolve('PRESENT' as const); },
@@ -184,7 +317,7 @@ function dependencies(
           observedAtMs: 2_000,
         }));
       },
-    }),
+    },
   };
 }
 
@@ -243,3 +376,17 @@ function config(): LiveRecoveryConfig {
 }
 
 function signal(): AbortSignal { return new AbortController().signal; }
+
+function rpcFailure(code: string): Error {
+  const error = new Error('https://credential@rpc.private.test');
+  Object.defineProperty(error, 'code', { value: code, enumerable: true });
+  return error;
+}
+
+function assertDeferred(
+  result: Awaited<ReturnType<ReturnType<typeof createLiveRecoveryLanes>['confirmation']>>,
+  errorCode: string | null,
+): asserts result is LiveRecoveryDeferredResult {
+  assert.deepEqual(result, { result: 'DEFERRED', errorCode });
+  assert.equal(Object.isFrozen(result), true);
+}

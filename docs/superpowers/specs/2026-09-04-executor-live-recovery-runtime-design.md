@@ -1,10 +1,10 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.0.9
 
-**Version de la spécification parente :** 1.8.3
+**Version de la spécification parente :** 1.8.8
 
-**Version de l'orchestration persistante :** 1.0.6
+**Version de l'orchestration persistante :** 1.0.10
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,36 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.9 — 2026-09-04 :** rend le report de lane typé et gelé : un résultat
+  `DEFERRED` associe toujours sa `lane` à un `errorCode` RPC retryable
+  explicitement allowlisté (`RPC_RATE_LIMITED`, `RPC_TIMEOUT`,
+  `RPC_UNAVAILABLE`, `RPC_RESPONSE_TOO_LARGE`, `RPC_RESPONSE_INVALID`,
+  `CALL_BUDGET_EXCEEDED` ou `SESSION_FAILED`), ou à `null`. `NOT_FOUND` reste sans code et
+  laisse l'échéance continuer. Les finalités `UNKNOWN` ou incohérentes restent
+  fermées, tandis que `CONFIRMED` et `FINALIZED` exigent un slot `bigint` non négatif ; toute violation produit `GATEWAY_FAILED`. Les logs n'exposent ni message, ni URL, ni signature.
+- **1.0.8 — 2026-09-04 :** durcit le contrat `getTransaction` base64
+  finalized : la réponse reconnaît les champs officiels `version` et `meta`,
+  dont les balances Token-2022 avec `programId`, sans accepter de forme
+  inconnue. Pour une transaction v0, les clés de compte sont les clés statiques
+  suivies des adresses chargées writable puis readonly ; les cardinalités
+  déclarées doivent correspondre aux index des LUT du message, les index de
+  balance token restent des u8 et une identité owner/mint ne peut pas changer
+  entre pré- et post-balance au même index. Le timeout et l'abort couvrent la
+  lecture complète du corps et le parsing ; les sorties HTTP avant corps
+  annulent le corps au mieux. Le flux reste borné à 16 MiB sans rétention de
+  chunks et son UTF-8 est décodé fatalement. Ces contrôles refusent une réponse
+  invalide ; ils ne constituent ni une lecture de compte supplémentaire ni une
+  capacité de signature ou de soumission.
+- **1.0.7 — 2026-09-04 :** `recordConfirmation` libère atomiquement la lease
+  dans sa transition durable ; la lane ne fait donc aucun `release` après un
+  commit réussi. Un replay exact accepte la lease déjà nulle ou la même lease.
+- **1.0.6 — 2026-09-04 :** ferme la récupération de plusieurs preuves SELL
+  non terminales consécutives : le commit libère la lease même lorsque l'état
+  était déjà `UNKNOWN_REQUIRES_RECONCILIATION`.
+- **1.0.5 — 2026-09-04 :** aligne les noms de configuration sur les contrats
+  executor déjà publiés et impose une seule session RPC neuve par passe,
+  partagée par toutes les lanes. Le budget d'appels et la mémoïsation de la
+  transaction finalized sont ainsi réellement communs à la passe.
 - **1.0.4 — 2026-09-04 :** précise la discipline des claims entre lanes :
   chaque appel réseau est encadré par des renouvellements et utilise le claim
   actif le plus récent ; confirmation libère son claim après commit ou report,
@@ -116,12 +146,14 @@ La configuration H2a est distincte de `LiveExecutorConfig`. Elle accepte
 exactement les paramètres publics nécessaires :
 
 - `EXECUTOR_LIVE_RECOVERY_ENABLED=true` ;
-- `EXECUTION_MODE=live` ;
+- `EXECUTOR_MODE=live` ;
 - `SOLANA_CLUSTER=mainnet-beta` ;
 - `DATABASE_URL` ;
-- `EXECUTOR_LIVE_PROVIDER_ID` ;
-- `EXECUTOR_LIVE_HTTP_RPC_URL` ;
-- `EXECUTOR_LIVE_EXPECTED_GENESIS_HASH` ;
+- `EXECUTOR_RPC_PROVIDER_ID` ;
+- `SOLANA_HTTP_RPC_URL` ;
+- `SOLANA_EXPECTED_GENESIS_HASH` ;
+- `EXECUTOR_WALLET_GENERATION_ID` ;
+- `EXECUTOR_PUBLIC_KEY` ;
 - `EXECUTOR_LIVE_RECOVERY_OWNER_ID` ;
 - intervalles, timeouts, lease et budget d'appels bornés.
 
@@ -163,7 +195,9 @@ migration séparée et n'est pas simulé implicitement.
 ## 6. Gateway RPC de lecture
 
 Le gateway concret utilise JSON-RPC HTTP avec `AbortSignal`, timeout par appel,
-taille maximale de réponse, budget par passe et parsing fermé.
+taille maximale de réponse, budget par passe et parsing fermé. Le runtime crée
+une session neuve au début de chaque passe et la partage entre les trois lanes ;
+aucune lane ne peut réinitialiser isolément le compteur ou la mémoïsation.
 
 Méthodes autorisées :
 
@@ -172,8 +206,8 @@ Méthodes autorisées :
 - `getBlockHeight` avec engagement `finalized` ;
 - `getSignatureStatuses` avec historique pour la présence finalized ;
 - `getTransaction` avec engagement `finalized`, encodage `base64` et version 0 ;
-- lectures de comptes/balances finalized strictement nécessaires aux deltas
-  wallet définis par `ExecutionReconciliationGateway`.
+  ses balances finalized servent aux deltas wallet définis par
+  `ExecutionReconciliationGateway`.
 
 Les quatre lectures de réconciliation doivent représenter une observation
 cohérente. Si la transaction ou les deltas ne peuvent pas être prouvés au
@@ -192,6 +226,25 @@ de la précision sûre sont lus depuis des chaînes décimales ou refusés.
 La transaction publique base64 est bornée à 1 232 octets, désérialisée en
 mémoire pour vérifier son message puis abandonnée ; elle n'est ni persistée,
 ni signée, ni simulée, ni envoyée.
+
+Pour `getTransaction`, la racine contient exactement `slot`, `blockTime`,
+`meta`, `transaction` et `version`; `version` vaut `legacy` ou `0` et doit
+correspondre au message désérialisé. Les champs consommés de `meta` et des
+balances token sont validés, tandis que les champs optionnels officiels connus
+sont seulement contrôlés de forme. Pour v0, l'ordre RPC des comptes est clés
+statiques, `loadedAddresses.writable`, puis `loadedAddresses.readonly`; les
+deux longueurs chargées doivent égaler séparément les sommes d'index LUT du
+message, les pré/post-balances couvrent exactement ces comptes et chaque
+`accountIndex` token est un u8 dans cette plage. Une même position token ne
+peut pas changer d'owner ou de mint entre les deux tableaux.
+
+Le délai et l'abort restent actifs jusqu'à la fin de la lecture et du parsing.
+Les réponses 429, non-OK ou à `content-length` invalide/trop grand arrêtent le
+contrôleur et initient l'annulation du corps sans attendre cette annulation. Le
+corps est copié dans un buffer contigu borné à 16 MiB, puis décodé en UTF-8
+fatal : une séquence invalide, comme toute structure refusée, produit une erreur
+RPC redacted. Ces règles bornent le transport ; elles ne garantissent pas une
+preuve métier lorsque les données finalized manquent ou divergent.
 
 ## 7. Lanes
 
@@ -214,10 +267,18 @@ La lane appelle `claim(... purpose: 'CONFIRM')`, puis
 `readConfirmationWork(claim)`. Elle observe uniquement la signature fournie par
 le read-model, renouvelle le lease avant et après l'appel puis persiste avec le
 claim actif retourné par ce dernier renouvellement dans `recordConfirmation`.
-La lane libère ensuite explicitement le claim afin que `RECONCILE` puisse le
-réclamer sans attendre. `NOT_FOUND`, erreur ou statut non confirmé libère aussi
-le claim, ne provoque aucune transition terminale et sera rejoué. Ces reports
-produisent `DEFERRED`, pas `WORKED`, afin de ne pas affamer l'échéance.
+`recordConfirmation` libère atomiquement `lease_owner`, `lease_token` et
+`lease_expires_at` dans cette même transition ; la lane ne fait aucun `release`
+post-commit et `RECONCILE` peut donc réclamer immédiatement l'intention. Un
+replay exact de confirmation accepte une lease déjà nulle ou la même lease.
+`NOT_FOUND` libère explicitement le claim, reste sans code d'erreur, ne
+provoque aucune transition terminale et sera rejoué. Une erreur RPC retryable
+produit aussi un report, mais son `DEFERRED` gelé associe la `lane` et le seul
+`errorCode` RPC retryable allowlisté correspondant, ou `null` lorsqu'aucun code
+allowlisté n'est disponible. Ces reports ne sont pas `WORKED` et la boucle
+continue vers l'échéance, afin de ne pas l'affamer. Un statut `UNKNOWN`, une
+finalité incohérente, ou un `CONFIRMED`/`FINALIZED` sans slot `bigint` non
+négatif échoue fermé : aucune finalité synthétique n'est persistée.
 
 ### 7.3 Échéance
 
@@ -227,7 +288,8 @@ présence SELL protège toujours les BUY concurrents.
 
 ## 8. Boucle, logs et arrêt
 
-La boucle appelle les lanes dans l'ordre strict et attend l'intervalle de poll
+La boucle crée une factory de lanes liée à une session RPC unique, appelle les
+lanes dans l'ordre strict et attend l'intervalle de poll
 après une passe. Une erreur est journalisée sous un code typé puis la boucle
 continue, sauf erreur de démarrage ou signal d'arrêt.
 
@@ -241,7 +303,8 @@ continue, sauf erreur de démarrage ou signal d'arrêt.
 
 Les champs autorisés sont `lane`, `result`, `errorCode`, `providerPosition`,
 `executionMode` et durées bornées. Les identifiants métier sensibles ne sont
-pas journalisés.
+pas journalisés ; aucun log ne contient de message d'erreur, URL RPC ou
+signature.
 
 `SIGINT` et `SIGTERM` interrompent les appels RPC, empêchent une nouvelle
 passe, ferment PostgreSQL et terminent dans un délai borné. Au dépassement, la

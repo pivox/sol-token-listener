@@ -3,8 +3,10 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import bs58 from 'bs58';
 import {
+  AddressLookupTableAccount,
   Keypair,
   SystemProgram,
+  TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
@@ -93,6 +95,136 @@ void test('shares one finalized transaction read and derives exact wallet deltas
   );
 });
 
+void test('accepts the complete v0 getTransaction response and resolves loaded token accounts', async () => {
+  const fixture = fullV0TransactionFixture();
+  const session = sessionFor([], ({ method }) => {
+    if (method === 'getTransaction') return fixture.rpcTransaction;
+    throw new Error('unexpected method');
+  });
+  const request = Object.freeze({
+    signature: fixture.signature,
+    walletPublicKey: fixture.wallet,
+    mint: fixture.mint,
+    quoteMint: WSOL,
+    side: 'BUY' as const,
+  });
+
+  assert.deepEqual(await session.readNormalizedTransaction(fixture.signature, signal()), {
+    signature: fixture.signature,
+    blockhash: GENESIS,
+    messageHash: fixture.messageHash,
+  });
+  assert.deepEqual(await session.readFinalizedWalletDeltas(request, signal()), {
+    confirmationStatus: 'FINALIZED', observedSlot: 501n,
+    feeLamports: 5_000n, walletLamportDelta: -105_000n,
+    baseDeltaRaw: 500n, quoteDeltaRaw: -100_000n,
+    unexpectedResidualTokenBalanceRaw: 0n,
+    observedAtMs: 2_000, finalizedAtMs: 2_000,
+  });
+});
+
+void test('rejects invalid v0 versions, loaded addresses, and token account indexes', async () => {
+  const fixture = fullV0TransactionFixture();
+  const malformed = [
+    { ...fixture.rpcTransaction, version: 1 },
+    {
+      ...fixture.rpcTransaction,
+      meta: {
+        ...fixture.rpcTransaction.meta,
+        loadedAddresses: { writable: ['not-a-public-key'], readonly: [] },
+      },
+    },
+    {
+      ...fixture.rpcTransaction,
+      meta: {
+        ...fixture.rpcTransaction.meta,
+        postTokenBalances: [{
+          ...fixture.rpcTransaction.meta.postTokenBalances[0], accountIndex: 99,
+        }],
+      },
+    },
+  ];
+  for (const response of malformed) {
+    const session = sessionFor([], ({ method }) => {
+      if (method === 'getTransaction') return response;
+      throw new Error('unexpected method');
+    });
+    await assert.rejects(
+      session.readNormalizedTransaction(fixture.signature, signal()),
+      (error: unknown) => error instanceof LiveRecoveryRpcError
+        && error.code === 'RPC_RESPONSE_INVALID',
+    );
+  }
+});
+
+void test('rejects v0 loaded-address shifts and token balance indexes above u8', async () => {
+  const fixture = fullV0TransactionFixture();
+  const malformed = [
+    {
+      ...fixture.rpcTransaction,
+      meta: {
+        ...fixture.rpcTransaction.meta,
+        loadedAddresses: {
+          writable: [fixture.loadedWritable, fixture.loadedReadonly], readonly: [],
+        },
+      },
+    },
+    {
+      ...fixture.rpcTransaction,
+      meta: {
+        ...fixture.rpcTransaction.meta,
+        loadedAddresses: {
+          writable: [], readonly: [fixture.loadedWritable, fixture.loadedReadonly],
+        },
+      },
+    },
+    {
+      ...fixture.rpcTransaction,
+      meta: {
+        ...fixture.rpcTransaction.meta,
+        postTokenBalances: [{
+          ...fixture.rpcTransaction.meta.postTokenBalances[0], accountIndex: 256,
+        }],
+      },
+    },
+  ];
+  for (const response of malformed) {
+    const session = sessionFor([], ({ method }) => {
+      if (method === 'getTransaction') return response;
+      throw new Error('unexpected method');
+    });
+    await assert.rejects(
+      session.readNormalizedTransaction(fixture.signature, signal()),
+      (error: unknown) => error instanceof LiveRecoveryRpcError
+        && error.code === 'RPC_RESPONSE_INVALID',
+    );
+  }
+});
+
+void test('rejects a token-balance identity change at one account index', async () => {
+  const fixture = fullV0TransactionFixture();
+  const session = sessionFor([], ({ method }) => {
+    if (method !== 'getTransaction') throw new Error('unexpected method');
+    return {
+      ...fixture.rpcTransaction,
+      meta: {
+        ...fixture.rpcTransaction.meta,
+        postTokenBalances: [{
+          ...fixture.rpcTransaction.meta.postTokenBalances[0], owner: fixture.loadedReadonly,
+        }],
+      },
+    };
+  });
+  await assert.rejects(
+    session.readFinalizedWalletDeltas({
+      signature: fixture.signature, walletPublicKey: fixture.wallet, mint: fixture.mint,
+      quoteMint: WSOL, side: 'BUY',
+    }, signal()),
+    (error: unknown) => error instanceof LiveRecoveryRpcError
+      && error.code === 'RPC_RESPONSE_INVALID',
+  );
+});
+
 void test('reports absent finalized history without inventing a transaction or deltas', async () => {
   const session = sessionFor([], ({ method }) => {
     if (method === 'getBlockHeight') return 1_001;
@@ -145,6 +277,124 @@ void test('classifies 429, timeout, abort, oversized and malformed responses wit
     (error: unknown) => error instanceof LiveRecoveryRpcError
       && error.code === 'OPERATION_ABORTED',
   );
+});
+
+void test('abandons never-ending response bodies before every pre-read dispatch exit', async () => {
+  const scenarios: readonly [number, Readonly<Record<string, string>> | undefined, string][] = [
+    [429, undefined, 'RPC_RATE_LIMITED'],
+    [500, undefined, 'RPC_UNAVAILABLE'],
+    [200, { 'content-length': 'not-a-length' }, 'RPC_RESPONSE_TOO_LARGE'],
+    [200, { 'content-length': '16777217' }, 'RPC_RESPONSE_TOO_LARGE'],
+  ];
+  for (const [status, headers, code] of scenarios) {
+    let cancelled = false;
+    const fetchState: { signal: AbortSignal | null } = { signal: null };
+    const session = new SolanaFinalityRpcSession({
+      providerId: 'primary', httpRpcUrl: 'https://rpc.example.test',
+      expectedGenesisHash: GENESIS, timeoutMs: 1_000, maxCalls: 8,
+    }, async (_input, init) => {
+      fetchState.signal = init?.signal instanceof AbortSignal ? init.signal : null;
+      return new Response(new ReadableStream<Uint8Array>({
+        pull() { /* never ends */ },
+        cancel() { cancelled = true; },
+      }), headers === undefined ? { status } : { status, headers });
+    }, () => 2_000);
+    await assert.rejects(
+      session.verifyGenesis(signal()),
+      (error: unknown) => error instanceof LiveRecoveryRpcError && error.code === code,
+    );
+    assert.equal(fetchState.signal?.aborted, true);
+    assert.equal(cancelled, true);
+  }
+});
+
+void test('decodes many one-byte response chunks without retaining chunk objects', async () => {
+  const payload = Buffer.concat([
+    Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 1, result: GENESIS })),
+    Buffer.alloc(32 * 1024, 0x20),
+  ]);
+  const session = new SolanaFinalityRpcSession({
+    providerId: 'primary', httpRpcUrl: 'https://rpc.example.test',
+    expectedGenesisHash: GENESIS, timeoutMs: 1_000, maxCalls: 8,
+  }, async () => new Response(oneByteStream(payload)), () => 2_000);
+  assert.deepEqual(await session.verifyGenesis(signal()), {
+    providerId: 'primary', expectedGenesisHash: GENESIS, observedGenesisHash: GENESIS,
+  });
+});
+
+void test('rejects malformed UTF-8 even when it is in an unused JSON string', async () => {
+  const bytes = Buffer.concat([
+    Buffer.from('{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":[{"slot":1,"confirmations":null,"err":"'),
+    Buffer.from([0xc3]),
+    Buffer.from('","confirmationStatus":"finalized"}]}}'),
+  ]);
+  const session = new SolanaFinalityRpcSession({
+    providerId: 'primary', httpRpcUrl: 'https://rpc.example.test',
+    expectedGenesisHash: GENESIS, timeoutMs: 1_000, maxCalls: 8,
+  }, async () => new Response(bytes), () => 2_000);
+  await assert.rejects(
+    session.observeSignature('1'.repeat(64), signal()),
+    (error: unknown) => error instanceof LiveRecoveryRpcError
+      && error.code === 'RPC_RESPONSE_INVALID',
+  );
+});
+
+void test('keeps timeout and abort handling active while reading an RPC response body', async () => {
+  const timeout = new SolanaFinalityRpcSession({
+    providerId: 'primary', httpRpcUrl: 'https://rpc.example.test',
+    expectedGenesisHash: GENESIS, timeoutMs: 5, maxCalls: 8,
+  }, streamingFetch((stream, fetchSignal) => {
+    fetchSignal.addEventListener('abort', () => {
+      stream.error(new DOMException('secret', 'AbortError'));
+    });
+  }), () => 2_000);
+  await assert.rejects(
+    timeout.verifyGenesis(signal()),
+    (error: unknown) => error instanceof LiveRecoveryRpcError
+      && error.code === 'RPC_TIMEOUT' && !error.message.includes('secret'),
+  );
+
+  const controller = new AbortController();
+  const aborted = new SolanaFinalityRpcSession({
+    providerId: 'primary', httpRpcUrl: 'https://rpc.example.test',
+    expectedGenesisHash: GENESIS, timeoutMs: 1_000, maxCalls: 8,
+  }, streamingFetch((stream, fetchSignal) => {
+    fetchSignal.addEventListener('abort', () => {
+      stream.error(new DOMException('secret', 'AbortError'));
+    });
+    setTimeout(() => { controller.abort(); }, 5);
+  }), () => 2_000);
+  await assert.rejects(
+    aborted.verifyGenesis(controller.signal),
+    (error: unknown) => error instanceof LiveRecoveryRpcError
+      && error.code === 'OPERATION_ABORTED' && !error.message.includes('secret'),
+  );
+});
+
+void test('stops reading and cancels a chunked RPC body once it exceeds 16 MiB', async () => {
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(new Uint8Array(8 * 1024 * 1024));
+      if (cancelled) return;
+      if ((this as { chunks?: number }).chunks === undefined) {
+        (this as { chunks?: number }).chunks = 1;
+        return;
+      }
+      controller.enqueue(new Uint8Array(1));
+    },
+    cancel() { cancelled = true; },
+  });
+  const session = new SolanaFinalityRpcSession({
+    providerId: 'primary', httpRpcUrl: 'https://rpc.example.test',
+    expectedGenesisHash: GENESIS, timeoutMs: 1_000, maxCalls: 8,
+  }, async () => new Response(body), () => 2_000);
+  await assert.rejects(
+    session.verifyGenesis(signal()),
+    (error: unknown) => error instanceof LiveRecoveryRpcError
+      && error.code === 'RPC_RESPONSE_TOO_LARGE',
+  );
+  assert.equal(cancelled, true);
 });
 
 void test('fails the session permanently on genesis mismatch and call-budget exhaustion', async () => {
@@ -227,6 +477,7 @@ function transactionFixture() {
     rpcTransaction: {
       slot: 500,
       blockTime: 2,
+      version: 0,
       transaction: [Buffer.from(transaction.serialize()).toString('base64'), 'base64'],
       meta: {
         err: null,
@@ -241,9 +492,110 @@ function transactionFixture() {
           accountIndex: 1, mint, owner: payer.publicKey.toBase58(),
           uiTokenAmount: { amount: '500', decimals: 6, uiAmount: 0.0005, uiAmountString: '0.0005' },
         }],
+        loadedAddresses: { writable: [], readonly: [] },
       },
     },
   };
+}
+
+function fullV0TransactionFixture() {
+  const payer = Keypair.fromSeed(Uint8Array.from({ length: 32 }, () => 10));
+  const tokenAccount = Keypair.fromSeed(Uint8Array.from({ length: 32 }, () => 11)).publicKey;
+  const readonlyAccount = Keypair.fromSeed(Uint8Array.from({ length: 32 }, () => 14)).publicKey;
+  const mint = Keypair.fromSeed(Uint8Array.from({ length: 32 }, () => 12)).publicKey.toBase58();
+  const lookup = new AddressLookupTableAccount({
+    key: Keypair.fromSeed(Uint8Array.from({ length: 32 }, () => 13)).publicKey,
+    state: {
+      deactivationSlot: BigInt('18446744073709551615'),
+      lastExtendedSlot: 0,
+      lastExtendedSlotStartIndex: 0,
+      addresses: [tokenAccount, readonlyAccount],
+    },
+  });
+  const message = new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: GENESIS,
+    instructions: [new TransactionInstruction({
+      programId: SystemProgram.programId,
+      keys: [
+        { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+        { pubkey: tokenAccount, isSigner: false, isWritable: true },
+        { pubkey: readonlyAccount, isSigner: false, isWritable: false },
+      ],
+      data: Buffer.alloc(0),
+    })],
+  }).compileToV0Message([lookup]);
+  const transaction = new VersionedTransaction(message);
+  transaction.sign([payer]);
+  const signature = bs58.encode(transaction.signatures[0] ?? new Uint8Array());
+  const messageHash = createHash('sha256').update(message.serialize()).digest('hex');
+  const accountIndex = message.staticAccountKeys.length;
+  return {
+    signature,
+    wallet: payer.publicKey.toBase58(),
+    mint,
+    messageHash,
+    loadedWritable: tokenAccount.toBase58(),
+    loadedReadonly: readonlyAccount.toBase58(),
+    rpcTransaction: {
+      slot: 501,
+      blockTime: 2,
+      version: 0,
+      transaction: [Buffer.from(transaction.serialize()).toString('base64'), 'base64'],
+      meta: {
+        err: null,
+        fee: 5_000,
+        preBalances: [1_000_000, 1, 0, 0],
+        postBalances: [895_000, 1, 100_000, 0],
+        preTokenBalances: [{
+          accountIndex, mint, owner: payer.publicKey.toBase58(),
+          programId: 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+          uiTokenAmount: { amount: '0', decimals: 6, uiAmount: 0, uiAmountString: '0' },
+        }],
+        postTokenBalances: [{
+          accountIndex, mint, owner: payer.publicKey.toBase58(),
+          programId: 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+          uiTokenAmount: { amount: '500', decimals: 6, uiAmount: 0.0005, uiAmountString: '0.0005' },
+        }],
+        innerInstructions: [],
+        logMessages: [],
+        rewards: null,
+        status: { Ok: null },
+        loadedAddresses: {
+          writable: [tokenAccount.toBase58()], readonly: [readonlyAccount.toBase58()],
+        },
+        returnData: null,
+        computeUnitsConsumed: 123,
+        costUnits: 456,
+      },
+    },
+  };
+}
+
+function streamingFetch(
+  onStart: (stream: ReadableStreamDefaultController<Uint8Array>, signal: AbortSignal) => void,
+): typeof fetch {
+  return async (_input, init) => {
+    const fetchSignal = init?.signal;
+    if (!(fetchSignal instanceof AbortSignal)) throw new TypeError('Expected abort signal.');
+    return new Response(new ReadableStream<Uint8Array>({
+      start(stream) { onStart(stream, fetchSignal); },
+    }));
+  };
+}
+
+function oneByteStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset === bytes.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(bytes.subarray(offset, offset + 1));
+      offset += 1;
+    },
+  });
 }
 
 function signal(): AbortSignal { return new AbortController().signal; }

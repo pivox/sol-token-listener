@@ -1,8 +1,8 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.0.6
+**Version de spécification :** 1.0.10
 
-**Version de la spécification parente :** 1.8.1
+**Version de la spécification parente :** 1.8.8
 
 **Version de la fondation live :** 1.0.17
 
@@ -13,6 +13,23 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.10 — 2026-09-04 :** référence les reports H2a gelés et typés : un
+  `DEFERRED` associe la lane à un code RPC retryable allowlisté nullable,
+  `NOT_FOUND` n'a pas de code et n'arrête pas l'échéance. Les finalités
+  inconnues ou incohérentes échouent fermées ; `CONFIRMED` et `FINALIZED`
+  portent un slot `bigint` non négatif et les logs restent sans message, URL ni
+  signature. Les primitives et transitions persistantes H1 restent inchangées.
+- **1.0.9 — 2026-09-04 :** référence le durcissement du seul gateway read-only
+  H2a : contrat `getTransaction` v0 et Token-2022, cardinalités LUT, index u8,
+  identité pré/post, transport borné et UTF-8 fatal. Les contrats persistants
+  H1, leurs claims et leurs transitions restent inchangés.
+- **1.0.8 — 2026-09-04 :** la confirmation libère désormais atomiquement sa
+  lease dans `recordConfirmation`; un replay exact accepte une lease nulle ou
+  identique et la lane H2a ne relâche rien après ce commit.
+- **1.0.7 — 2026-09-04 :** libère atomiquement la lease après chaque preuve
+  SELL non terminale, y compris lorsqu'une intention est déjà dans l'état
+  `UNKNOWN_REQUIRES_RECONCILIATION`. Plusieurs observations `UNKNOWN` ou
+  `MISMATCH` consécutives restent ainsi immédiatement récupérables.
 - **1.0.6 — 2026-09-04 :** rétrécit les retours des commits confirmation et
   réconciliation à une référence d'artefact sans bytes. Leurs projections SQL
   ne chargent plus `signed_transaction_bytes`, ce qui rend leur réutilisation

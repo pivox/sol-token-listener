@@ -12,6 +12,8 @@
     "start": "node dist/src/app.js",
     "executor:dev": "tsx src/executor/main.ts",
     "executor:start": "node dist/src/executor/main.js",
+    "executor:live:recovery:dev": "tsx src/executor-live-recovery/main.ts",
+    "executor:live:recovery:start": "node dist/src/executor-live-recovery/main.js",
     "live:preflight": "node dist/src/executor-operations/main.js preflight",
     "live:status": "node dist/src/executor-operations/main.js status",
     "live:arm": "node dist/src/executor-operations/main.js arm",

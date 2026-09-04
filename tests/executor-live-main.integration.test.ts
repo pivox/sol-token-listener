@@ -28,15 +28,20 @@ const orchestrationSpecificationUrl = new URL(
   '../docs/superpowers/specs/2026-09-01-executor-live-orchestration-design.md',
   import.meta.url,
 );
+const recoverySpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md',
+  import.meta.url,
+);
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 
-void test('H1 remains non-live and records its exact operational boundary', async () => {
+void test('H2a publishes only read-only recovery while signable live remains absent', async () => {
   const [
     packageText,
     parentSpecification,
     liveSpecification,
     orchestrationSpecification,
+    recoverySpecification,
     runbook,
     deploymentSmoke,
   ] =
@@ -45,6 +50,7 @@ void test('H1 remains non-live and records its exact operational boundary', asyn
       readFile(parentSpecificationUrl, 'utf8'),
       readFile(liveSpecificationUrl, 'utf8'),
       readFile(orchestrationSpecificationUrl, 'utf8'),
+      readFile(recoverySpecificationUrl, 'utf8'),
       readFile(runbookUrl, 'utf8'),
       readFile(deploymentSmokeUrl, 'utf8'),
     ]);
@@ -53,35 +59,39 @@ void test('H1 remains non-live and records its exact operational boundary', asyn
   };
 
   assert.equal(packageJson.scripts?.['executor:live:start'], undefined);
+  assert.equal(
+    packageJson.scripts?.['executor:live:recovery:start'],
+    'node dist/src/executor-live-recovery/main.js',
+  );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.7.17',
+    '**Version de spécification :** 1.8.8',
     'parent specification version',
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Périmètre livré à cette version :** #51-A à #51-G et primitives persistantes\n'
-      + '#51-H1 (claims, read-models et scan atomique des sorties à deadline)',
+    '**Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes\n'
+      + '#51-H1 et runtime de finalité read-only #51-H2a',
     'parent delivered scope',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.0.17',
+    '**Version de spécification :** 1.0.19',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.7.17',
+    '**Version de la spécification parente :** 1.8.1',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
     orchestrationSpecification,
-    '**Version de spécification :** 1.0.4',
+    '**Version de spécification :** 1.0.10',
     'orchestration specification version',
   );
   assertContainsExactlyOnce(
     orchestrationSpecification,
-    '**Version de la spécification parente :** 1.7.17',
+    '**Version de la spécification parente :** 1.8.8',
     'orchestration parent specification version',
   );
   assertContainsExactlyOnce(
@@ -90,8 +100,23 @@ void test('H1 remains non-live and records its exact operational boundary', asyn
     'orchestration live foundation version',
   );
   assertContainsExactlyOnce(
+    recoverySpecification,
+    '**Version de spécification :** 1.0.9',
+    'recovery specification version',
+  );
+  assertContainsExactlyOnce(
+    recoverySpecification,
+    '**Version de la spécification parente :** 1.8.8',
+    'recovery parent specification version',
+  );
+  assertContainsExactlyOnce(
+    recoverySpecification,
+    "**Version de l'orchestration persistante :** 1.0.10",
+    'recovery orchestration specification version',
+  );
+  assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.1.6 — 2026-09-04',
+    '**Version :** 1.2.1 — 2026-09-04',
     'runbook version',
   );
 
@@ -100,20 +125,30 @@ void test('H1 remains non-live and records its exact operational boundary', asyn
     '```text\nLIVE_RUNTIME_NOT_COMPOSED\nCANARY_NOT_STARTED\nNON_EXECUTED / NON_VALIDATED\n```',
     'orchestration operational state',
   );
+  assert.match(
+    recoverySpecification,
+    /`DEFERRED`.*`lane`.*`errorCode`[\s\S]*RPC_RATE_LIMITED[\s\S]*SESSION_FAILED/iu,
+  );
+  assert.match(
+    recoverySpecification,
+    /`NOT_FOUND`.*sans code[\s\S]*échéance/iu,
+  );
+  assert.match(
+    recoverySpecification,
+    /CONFIRMED.*FINALIZED[\s\S]*`bigint` non négatif[\s\S]*GATEWAY_FAILED/iu,
+  );
+  assert.match(
+    recoverySpecification,
+    /ni message, ni URL, ni signature/iu,
+  );
   assertContainsExactlyOnce(
     runbook,
-    "Pour l'instant, le constat obligatoire est : `LIVE_RUNTIME_NOT_COMPOSED`,\n"
+    "Pour l'instant, le constat obligatoire est :\n"
+      + '`LIVE_RECOVERY_RUNTIME_COMPOSED`, `LIVE_EXECUTION_RUNTIME_NOT_COMPOSED`,\n'
       + '`CANARY_NOT_STARTED`, `NON_EXECUTED / NON_VALIDATED`.',
     'runbook operational state',
   );
-  for (const contradictoryState of [
-    'LIVE_RUNTIME_COMPOSED',
-    'CANARY_STARTED',
-    'EXECUTED / VALIDATED',
-  ]) {
-    assert.equal(orchestrationSpecification.includes(contradictoryState), false, contradictoryState);
-    assert.equal(runbook.includes(contradictoryState), false, contradictoryState);
-  }
+  assert.equal(runbook.includes('CANARY_STARTED'), false);
   assert.equal((deploymentSmoke.match(/'037_execution_live_orchestration\.sql'/gu) ?? []).length, 1);
   assert.equal(
     /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n\]\);/u.test(deploymentSmoke),

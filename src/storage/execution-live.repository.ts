@@ -874,16 +874,21 @@ export class PostgresExecutionLiveRepository {
         && row.signature === confirmation.signature
         && unsignedBigint(row.confirmed_slot) === confirmation.observedSlot
         && timestampText(row.confirmed_at_ms) === confirmation.observedAtMs
-        && row.lease_owner === claim.leaseOwner && row.lease_token === claim.leaseToken) {
+        && ((row.lease_owner === null && row.lease_token === null
+          && row.lease_expires_at_ms === null)
+          || (row.lease_owner === claim.leaseOwner && row.lease_token === claim.leaseToken))) {
         return artifactReferenceFromRow(row);
       }
+      const databaseNowMs = await freshDatabaseNow(client);
       if (row?.intent_id !== claim.intent.id
         || (previousState !== 'ACCEPTED' && previousState !== 'AMBIGUOUS')
         || (previousStatus !== 'SUBMITTED'
           && previousStatus !== 'UNKNOWN_REQUIRES_RECONCILIATION')
         || unsignedBigint(row.state_revision) !== confirmation.expectedRevision
         || row.signature !== confirmation.signature
-        || row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken) {
+        || row.lease_owner !== claim.leaseOwner || row.lease_token !== claim.leaseToken
+        || row.lease_expires_at_ms === null
+        || timestampText(row.lease_expires_at_ms) <= databaseNowMs) {
         throw failure('LEASE_LOST');
       }
       const artifact = artifactReferenceFromRow(row);
@@ -901,8 +906,10 @@ export class PostgresExecutionLiveRepository {
       if (updated.rowCount !== 1) throw failure('CONFLICT');
       const intent = await client.query(`UPDATE execution_intents SET status='CONFIRMED',
         state_revision=state_revision+1,last_reason_code='CONFIRMATION_OBSERVED',
+        lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
         updated_at=date_trunc('milliseconds',statement_timestamp())
-        WHERE id=$1 AND status=$2 AND lease_owner=$3 AND lease_token=$4::UUID`, [
+        WHERE id=$1 AND status=$2 AND lease_owner=$3 AND lease_token=$4::UUID
+          AND lease_expires_at > statement_timestamp()`, [
         artifact.intentId, previousStatus, claim.leaseOwner, claim.leaseToken,
       ]);
       if (intent.rowCount !== 1) throw failure('LEASE_LOST');
@@ -2973,6 +2980,16 @@ async function commitSellReconciliation(
         'UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILIATION_REQUIRED',
         evidence.observedAtMs,
       );
+    } else {
+      const releasedIntent = await client.query(`UPDATE execution_intents SET
+        lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+        updated_at=TIMESTAMPTZ 'epoch'+($2::BIGINT*INTERVAL '1 millisecond')
+        WHERE id=$1 AND status='UNKNOWN_REQUIRES_RECONCILIATION'
+          AND state_revision=$3::BIGINT AND lease_owner=$4 AND lease_token=$5::UUID`, [
+        artifact.intentId, evidence.observedAtMs, row.intent_revision,
+        claim.leaseOwner, claim.leaseToken,
+      ]);
+      if (releasedIntent.rowCount !== 1) throw failure('LEASE_LOST');
     }
     if (row.position_state === 'EXIT_PENDING') {
       const positionRevision = unsignedBigint(row.position_revision);

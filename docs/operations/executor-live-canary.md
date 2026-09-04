@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.2.0 — 2026-09-04
+**Version :** 1.2.1 — 2026-09-04
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime signable. #51-H2a publie uniquement
@@ -25,6 +25,42 @@ ports réels, respecte l'ordre réconciliation → confirmation → SELL → dea
 
 Tant que le graphe signable H2b n'est pas livré et revu, les commandes opérateur restent
 inertes et aucun canary réel ne doit être tenté.
+
+## Démarrer uniquement la récupération de finalité H2a
+
+Utiliser un environnement dédié qui ne contient aucun nom de variable de
+keypair, clé privée ou secret wallet, même vide. Les valeurs suivantes sont
+publiques mais doivent être vérifiées par l'opérateur :
+
+```dotenv
+EXECUTOR_LIVE_RECOVERY_ENABLED=true
+EXECUTOR_MODE=live
+SOLANA_CLUSTER=mainnet-beta
+DATABASE_URL=postgresql://sol_token_executor_live:...@127.0.0.1:5432/solanabot
+EXECUTOR_WALLET_GENERATION_ID=execution_wallet_generation_<sha256>
+EXECUTOR_PUBLIC_KEY=<adresse-publique-base58>
+EXECUTOR_RPC_PROVIDER_ID=primary
+SOLANA_HTTP_RPC_URL=https://<endpoint-qualifie>
+SOLANA_EXPECTED_GENESIS_HASH=<hash-genesis-mainnet-verifie>
+EXECUTOR_POLL_MS=1000
+EXECUTOR_LEASE_MS=60000
+EXECUTOR_DB_STATEMENT_TIMEOUT_MS=3000
+EXECUTOR_SHUTDOWN_GRACE_MS=10000
+EXECUTOR_RPC_TIMEOUT_MS=5000
+EXECUTOR_MAX_RPC_CALLS_PER_PASS=8
+EXECUTOR_LIVE_RECOVERY_OWNER_ID=<instance-unique>
+```
+
+Après build, lancer seulement :
+
+```bash
+DOTENV_CONFIG_PATH=/chemin/hors-git/live-recovery.env \
+  npm run executor:live:recovery:start
+```
+
+Cette commande vérifie rôle, migrations, génération, provider et genesis avant
+la première claim. Elle ne charge aucun signer, n'arme rien et ne soumet aucune
+transaction.
 
 Le runtime H2a traite, dans l'ordre, une réconciliation finalized, une
 confirmation ou une échéance par passe. Il ne réclame jamais `LIVE_RECOVER`,

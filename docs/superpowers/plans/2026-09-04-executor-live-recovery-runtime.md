@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript strict ESM, Node.js 22, PostgreSQL, Solana JSON-RPC HTTP, `node:test`, `bigint`, logs Pino structurés.
 
-**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.0.4, parent version 1.8.3, H1 version 1.0.6.
+**Normative design:** `docs/superpowers/specs/2026-09-04-executor-live-recovery-runtime-design.md` version 1.0.9, parent version 1.8.8, H1 version 1.0.10.
 
 ---
 
@@ -61,6 +61,9 @@
   transaction finalized, hauteurs et deltas.
 - [x] Tester timeout, abort, 429, taille, identifiant, types et réponses
   divergentes avant l'implémentation.
+- [x] Fermer le contrat `getTransaction` v0/Token-2022, les cardinalités LUT,
+  les index u8 et l'identité pré/post ; borner et décoder fatalement le corps
+  RPC, y compris aux sorties HTTP avant lecture.
 - [x] Implémenter uniquement les ports de lecture étroits et les budgets.
 - [x] Prouver que les entiers financiers restent des `bigint` puis committer.
 
@@ -80,7 +83,7 @@
 
 ### Task 5: Publier le runtime et l'entrypoint séparés
 
-**Status:** pending
+**Status:** completed
 
 **Files:**
 - Create: `src/executor-live-recovery/runtime.ts`
@@ -90,12 +93,13 @@
 - Create: `tests/executor-live-recovery-main.integration.test.ts`
 - Modify: `package.json`
 
-- [ ] Tester RED ordre de bootstrap, logs redacted, SIGINT/SIGTERM et timeout
+- [x] Tester RED ordre de bootstrap, logs redacted, SIGINT/SIGTERM et timeout
   d'arrêt.
-- [ ] Implémenter la boucle et la composition réelle sans importer le graphe
+- [x] Implémenter la boucle et la composition réelle sans importer le graphe
   signable.
-- [ ] Publier `executor:live:recovery:start` et son équivalent de développement.
-- [ ] Tester source et `dist` contre signer, secrets et soumission puis committer.
+- [x] Publier `executor:live:recovery:start` et son équivalent de développement.
+- [x] Tester source contre signer, secrets et soumission ; la preuve `dist`
+  est exécutée dans la tâche de livraison après build.
 
 ### Task 6: Vérifier et livrer H2a
 

@@ -81,7 +81,8 @@ void test('SELL UNKNOWN from ACCEPTED journals ambiguity then allows finalized N
       assert.equal(unknownEntryReplay.position?.stateRevision, 2n);
       assert.equal(unknownEntryReplay.exitAuthorization?.state, 'LOCKED');
       assert.equal(unknownEntryReplay.exitAuthorization?.stateRevision, 1n);
-      assert.equal((await fixture.live.commitReconciliation(fixture.claim, noEffect)).result,
+      const terminalClaim = await claimSellReconciliation(pool, 'sell-no-effect-after-accepted');
+      assert.equal((await fixture.live.commitReconciliation(terminalClaim, noEffect)).result,
         'NO_EFFECT');
       const retryableEntryReplay = await fixture.live.commitReconciliation(
         fixture.buyClaim, fixture.buyEvidence,
@@ -111,7 +112,8 @@ void test('SELL UNKNOWN from CONFIRMED journals ambiguity then allows finalized 
       });
       assert.deepEqual(await durableState(pool, fixture),
         expectedUnknownState(fixture.claim.intent.id, 1));
-      assert.equal((await fixture.live.commitReconciliation(fixture.claim, matched)).result,
+      const terminalClaim = await claimSellReconciliation(pool, 'sell-matched-after-confirmed');
+      assert.equal((await fixture.live.commitReconciliation(terminalClaim, matched)).result,
         'MATCHED');
       assert.deepEqual(await terminalIntentTransitions(pool, fixture), [
         {
@@ -165,8 +167,9 @@ void test('SELL UNKNOWN then NO_EFFECT restores a retryable exit without releasi
       const unknown = sellEvidence(fixture, 'UNKNOWN', fixture.observedAtMs);
       const noEffect = sellEvidence(fixture, 'NO_EFFECT', fixture.observedAtMs + 2_000);
       await fixture.live.commitReconciliation(fixture.claim, unknown);
+      const terminalClaim = await claimSellReconciliation(pool, 'sell-no-effect-after-unknown');
 
-      const result = await fixture.live.commitReconciliation(fixture.claim, noEffect);
+      const result = await fixture.live.commitReconciliation(terminalClaim, noEffect);
 
       assert.equal(result.result, 'NO_EFFECT');
       assert.deepEqual(await durableState(pool, fixture), {
@@ -195,6 +198,7 @@ void test('SELL NO_EFFECT activation fences a concurrent live BUY claim before g
       const unknown = sellEvidence(fixture, 'UNKNOWN', fixture.observedAtMs);
       const noEffect = sellEvidence(fixture, 'NO_EFFECT', fixture.observedAtMs + 2_000);
       await fixture.live.commitReconciliation(fixture.claim, unknown);
+      const terminalClaim = await claimSellReconciliation(pool, 'sell-no-effect-race');
 
       const intents = new PostgresExecutionIntentRepository(pool);
       const nowMs = Date.now();
@@ -218,7 +222,7 @@ void test('SELL NO_EFFECT activation fences a concurrent live BUY claim before g
         await blocker.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))', [
           generationId,
         ]);
-        reconciliation = fixture.live.commitReconciliation(fixture.claim, noEffect);
+        reconciliation = fixture.live.commitReconciliation(terminalClaim, noEffect);
         await waitForDatabaseQuery(pool, '%hashtextextended($1, 51005)%');
 
         buyClaim = intents.claim({
@@ -324,8 +328,9 @@ void test('SELL UNKNOWN then MATCHED closes the only position and consumes capab
       const unknown = sellEvidence(fixture, 'UNKNOWN', fixture.observedAtMs);
       const matched = sellEvidence(fixture, 'MATCHED', fixture.observedAtMs + 2_000);
       await fixture.live.commitReconciliation(fixture.claim, unknown);
+      const terminalClaim = await claimSellReconciliation(pool, 'sell-matched-after-unknown');
 
-      const result = await fixture.live.commitReconciliation(fixture.claim, matched);
+      const result = await fixture.live.commitReconciliation(terminalClaim, matched);
 
       assert.equal(result.result, 'MATCHED');
       assert.deepEqual(await durableState(pool, fixture), {
@@ -375,7 +380,8 @@ void test('late exact SELL replays cannot create a second exit or a second concu
       const unknown = sellEvidence(fixture, 'UNKNOWN', fixture.observedAtMs);
       const noEffect = sellEvidence(fixture, 'NO_EFFECT', fixture.observedAtMs + 2_000);
       await fixture.live.commitReconciliation(fixture.claim, unknown);
-      await fixture.live.commitReconciliation(fixture.claim, noEffect);
+      const terminalClaim = await claimSellReconciliation(pool, 'sell-late-replay');
+      await fixture.live.commitReconciliation(terminalClaim, noEffect);
       const intents = new PostgresExecutionIntentRepository(pool);
       const claims = await Promise.all([
         intents.claim({ ownerId: 'retry-a', leaseMs: 60_000, purpose: 'EXECUTE' }),
@@ -602,6 +608,10 @@ async function createSellFixture(
     signature: buy.artifact.signature, observedSlot: 126n,
     observedAtMs: Date.now(),
   });
+  const buyReconciliationClaim = await new PostgresExecutionIntentRepository(pool).claim({
+    ownerId: 'sell-fixture-entry-reconciliation', leaseMs: 60_000, purpose: 'RECONCILE',
+  });
+  assert.ok(buyReconciliationClaim);
   const buyReconciliationAtMs = Date.now();
   const buyEvidence = evaluateExecutionReconciliation({
     expected: Object.freeze({
@@ -629,7 +639,7 @@ async function createSellFixture(
       finalizedAtMs: buyReconciliationAtMs,
     }),
   });
-  const entry = await live.commitReconciliation(buy.claim, buyEvidence);
+  const entry = await live.commitReconciliation(buyReconciliationClaim, buyEvidence);
   assert.ok(entry.position);
   assert.ok(entry.exitAuthorization);
   const exitDeadlineAtMs = await makePositionDue(pool, entry.position.positionId);
@@ -707,10 +717,19 @@ async function createSellFixture(
       expectedRevision: started.stateRevision + 1n, signature: artifact.signature,
       observedSlot: 778n, observedAtMs: sellOutcomeAtMs + 1,
     });
+    const reconciliationClaim = await new PostgresExecutionIntentRepository(pool).claim({
+      ownerId: 'sell-fixture-confirmed-reconciliation', leaseMs: 60_000, purpose: 'RECONCILE',
+    });
+    assert.ok(reconciliationClaim);
+    return Object.freeze({
+      live, claim: reconciliationClaim, artifact, unsignedSimulation,
+      buyClaim: buyReconciliationClaim, buyEvidence,
+      observedAtMs: Date.now(),
+    });
   }
   return Object.freeze({
     live, claim: begun.claim, artifact, unsignedSimulation,
-    buyClaim: buy.claim, buyEvidence,
+    buyClaim: buyReconciliationClaim, buyEvidence,
     observedAtMs: Date.now(),
   });
 }
@@ -989,6 +1008,19 @@ function requiredDatabaseUrl(context: TestContext): string | null {
     return null;
   }
   return databaseUrl;
+}
+
+async function claimSellReconciliation(
+  pool: InstanceType<typeof pg.Pool>,
+  ownerId: string,
+) {
+  const claim = await new PostgresExecutionIntentRepository(pool).claim({
+    ownerId,
+    leaseMs: 60_000,
+    purpose: 'RECONCILE',
+  });
+  assert.ok(claim);
+  return claim;
 }
 
 async function waitForDatabaseQuery(

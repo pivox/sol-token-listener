@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import bs58 from 'bs58';
 import { PublicKey, VersionedTransaction } from '@solana/web3.js';
 import type { ExecutionReconciliationGateway, FinalizedWalletDeltasV1, ObservedExecutionTransactionV1, WalletDeltaRequestV1 } from '../ports/execution-reconciliation-gateway.js';
-import type { LiveConfirmationGateway, LiveSignatureObservationV1 } from '../executor-live/confirmation-worker.js';
+import type { LiveConfirmationGateway, LiveSignatureObservationV1 } from '../ports/execution-confirmation-gateway.js';
 
 export type LiveRecoveryRpcErrorCode =
   | 'INVALID_INPUT'
@@ -248,8 +248,9 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
     if (raw === null) return null;
     try {
       const root = record(raw);
-      exactKeys(root, ['slot', 'blockTime', 'transaction', 'meta']);
+      exactKeys(root, ['slot', 'blockTime', 'transaction', 'meta', 'version']);
       const slot = unsignedInteger(root.slot);
+      blockTime(root.blockTime);
       const tuple = root.transaction;
       if (!Array.isArray(tuple) || tuple.length !== 2 || tuple[1] !== 'base64'
         || typeof tuple[0] !== 'string') invalidResponse();
@@ -260,14 +261,27 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
       const observedSignature = bs58.encode(transaction.signatures[0] ?? new Uint8Array());
       if (observedSignature !== signature) invalidResponse();
       const meta = record(root.meta);
-      exactKeys(meta, [
+      knownKeys(meta, [
         'err', 'fee', 'preBalances', 'postBalances',
         'preTokenBalances', 'postTokenBalances',
+      ], [
+        'innerInstructions', 'logMessages', 'rewards', 'status', 'loadedAddresses',
+        'returnData', 'computeUnitsConsumed', 'costUnits',
       ]);
-      const accountKeys = transaction.message.staticAccountKeys.map((key) => key.toBase58());
+      validateTransactionMetaOptionals(meta);
+      const version = transactionVersion(root.version);
+      if (transaction.message.version !== version) invalidResponse();
+      const loadedAddresses = transactionLoadedAddresses(
+        meta.loadedAddresses, version, transactionLoadedAddressCounts(transaction),
+      );
+      const accountKeys = [
+        ...transaction.message.staticAccountKeys.map((key) => publicKeyValue(key.toBase58())),
+        ...loadedAddresses.writable,
+        ...loadedAddresses.readonly,
+      ];
       const preBalances = balanceArray(meta.preBalances);
       const postBalances = balanceArray(meta.postBalances);
-      if (preBalances.length !== postBalances.length || preBalances.length < accountKeys.length) {
+      if (preBalances.length !== postBalances.length || preBalances.length !== accountKeys.length) {
         invalidResponse();
       }
       return Object.freeze({
@@ -280,8 +294,8 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
         feeLamports: unsignedInteger(meta.fee),
         preBalances,
         postBalances,
-        preTokenBalances: tokenBalanceMap(meta.preTokenBalances),
-        postTokenBalances: tokenBalanceMap(meta.postTokenBalances),
+        preTokenBalances: tokenBalanceMap(meta.preTokenBalances, accountKeys.length),
+        postTokenBalances: tokenBalanceMap(meta.postTokenBalances, accountKeys.length),
       });
     } catch (error) {
       if (isInternal(error)) throw error;
@@ -303,46 +317,50 @@ implements ExecutionReconciliationGateway, LiveConfirmationGateway {
     const abort = (): void => { controller.abort(); };
     signal.addEventListener('abort', abort, { once: true });
     const timeout = setTimeout(() => { controller.abort(); }, this.#config.timeoutMs);
-    let response: Response;
     try {
-      response = await this.#fetch(this.#config.httpRpcUrl, {
-        method: 'POST',
-        headers: Object.freeze({ 'content-type': 'application/json' }),
-        body: JSON.stringify(Object.freeze({ jsonrpc: '2.0', id, method, params })),
-        signal: controller.signal,
-      });
-    } catch {
-      if (signal.aborted) throw rpcError('OPERATION_ABORTED');
-      if (controller.signal.aborted) throw rpcError('RPC_TIMEOUT');
-      throw rpcError('RPC_UNAVAILABLE');
+      let response: Response;
+      try {
+        response = await this.#fetch(this.#config.httpRpcUrl, {
+          method: 'POST',
+          headers: Object.freeze({ 'content-type': 'application/json' }),
+          body: JSON.stringify(Object.freeze({ jsonrpc: '2.0', id, method, params })),
+          signal: controller.signal,
+        });
+      } catch {
+        transportFailure(signal, controller);
+      }
+      if (response.status === 429) responseFailure(response, controller, 'RPC_RATE_LIMITED');
+      if (!response.ok) responseFailure(response, controller, 'RPC_UNAVAILABLE');
+      const length = response.headers.get('content-length');
+      if (length !== null && (!/^(?:0|[1-9][0-9]*)$/u.test(length)
+        || BigInt(length) > BigInt(MAX_RESPONSE_BYTES))) {
+        responseFailure(response, controller, 'RPC_RESPONSE_TOO_LARGE');
+      }
+      let text: string;
+      try {
+        text = await responseText(response.body);
+      } catch (error) {
+        if (isInternal(error)) throw error;
+        transportFailure(signal, controller);
+      }
+      try {
+        const envelope = record(JSON.parse(text) as unknown);
+        if (Object.hasOwn(envelope, 'error')) {
+          const rpcFailure = record(envelope.error);
+          const code = rpcFailure.code;
+          if (code === 429 || code === -32_005) throw rpcError('RPC_RATE_LIMITED');
+          throw rpcError('RPC_UNAVAILABLE');
+        }
+        exactKeys(envelope, ['jsonrpc', 'id', 'result']);
+        if (envelope.jsonrpc !== '2.0' || envelope.id !== id) invalidResponse();
+        return envelope.result;
+      } catch (error) {
+        if (isInternal(error)) throw error;
+        return invalidResponse();
+      }
     } finally {
       clearTimeout(timeout);
       signal.removeEventListener('abort', abort);
-    }
-    if (response.status === 429) throw rpcError('RPC_RATE_LIMITED');
-    if (!response.ok) throw rpcError('RPC_UNAVAILABLE');
-    const length = response.headers.get('content-length');
-    if (length !== null && (!/^(?:0|[1-9][0-9]*)$/u.test(length)
-      || BigInt(length) > BigInt(MAX_RESPONSE_BYTES))) throw rpcError('RPC_RESPONSE_TOO_LARGE');
-    let text: string;
-    try { text = await response.text(); } catch { throw rpcError('RPC_UNAVAILABLE'); }
-    if (Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES) {
-      throw rpcError('RPC_RESPONSE_TOO_LARGE');
-    }
-    try {
-      const envelope = record(JSON.parse(text) as unknown);
-      if (Object.hasOwn(envelope, 'error')) {
-        const rpcFailure = record(envelope.error);
-        const code = rpcFailure.code;
-        if (code === 429 || code === -32_005) throw rpcError('RPC_RATE_LIMITED');
-        throw rpcError('RPC_UNAVAILABLE');
-      }
-      exactKeys(envelope, ['jsonrpc', 'id', 'result']);
-      if (envelope.jsonrpc !== '2.0' || envelope.id !== id) invalidResponse();
-      return envelope.result;
-    } catch (error) {
-      if (isInternal(error)) throw error;
-      return invalidResponse();
     }
   }
 
@@ -366,6 +384,8 @@ function tokenAmounts(
   for (const index of indexes) {
     const before = observed.preTokenBalances.get(index);
     const after = observed.postTokenBalances.get(index);
+    if (before !== undefined && after !== undefined
+      && (before.owner !== after.owner || before.mint !== after.mint)) invalidResponse();
     const identity = after ?? before;
     if (identity?.owner !== wallet || identity.mint !== mint) continue;
     if (before !== undefined && (before.owner !== wallet || before.mint !== mint)) invalidResponse();
@@ -376,19 +396,26 @@ function tokenAmounts(
   return Object.freeze({ pre, post, delta: post - pre });
 }
 
-function tokenBalanceMap(value: unknown): ReadonlyMap<number, TokenBalance> {
+function tokenBalanceMap(value: unknown, accountKeyCount: number): ReadonlyMap<number, TokenBalance> {
   if (!Array.isArray(value) || value.length > 256) invalidResponse();
   const result = new Map<number, TokenBalance>();
   for (const item of value) {
     const row = record(item);
-    exactKeys(row, ['accountIndex', 'mint', 'owner', 'uiTokenAmount']);
+    knownKeys(row, ['accountIndex', 'mint', 'uiTokenAmount'], ['owner', 'programId']);
     const index = safeInteger(row.accountIndex);
+    if (index > 255 || index >= accountKeyCount) invalidResponse();
     const amount = record(row.uiTokenAmount);
-    if (!Object.hasOwn(amount, 'amount')) invalidResponse();
+    exactKeys(amount, ['amount', 'decimals', 'uiAmount', 'uiAmountString']);
+    if (safeInteger(amount.decimals) > 255
+      || (amount.uiAmount !== null && (typeof amount.uiAmount !== 'number'
+        || !Number.isFinite(amount.uiAmount))) || typeof amount.uiAmountString !== 'string') {
+      invalidResponse();
+    }
+    if (Object.hasOwn(row, 'programId')) publicKeyValue(row.programId);
     if (result.has(index)) invalidResponse();
     result.set(index, Object.freeze({
       mint: publicKeyValue(row.mint),
-      owner: row.owner === undefined || row.owner === null ? null : publicKeyValue(row.owner),
+      owner: row.owner === undefined ? null : publicKeyValue(row.owner),
       amountRaw: decimalBigint(amount.amount),
     }));
   }
@@ -398,6 +425,132 @@ function tokenBalanceMap(value: unknown): ReadonlyMap<number, TokenBalance> {
 function balanceArray(value: unknown): readonly bigint[] {
   if (!Array.isArray(value) || value.length > 512) invalidResponse();
   return Object.freeze(value.map(unsignedInteger));
+}
+
+function transactionVersion(value: unknown): 'legacy' | 0 {
+  if (value === 'legacy' || value === 0) return value;
+  return invalidResponse();
+}
+
+function transactionLoadedAddresses(
+  value: unknown,
+  version: 'legacy' | 0,
+  expected: Readonly<{ readonly writable: number; readonly readonly: number }>,
+): Readonly<{ readonly writable: readonly string[]; readonly readonly: readonly string[] }> {
+  if (value === undefined) {
+    if (version !== 'legacy') invalidResponse();
+    return Object.freeze({ writable: Object.freeze([]), readonly: Object.freeze([]) });
+  }
+  const addresses = record(value);
+  exactKeys(addresses, ['writable', 'readonly']);
+  if (!Array.isArray(addresses.writable) || !Array.isArray(addresses.readonly)
+    || addresses.writable.length + addresses.readonly.length > 256) invalidResponse();
+  const writable = Object.freeze(addresses.writable.map(publicKeyValue));
+  const readonly = Object.freeze(addresses.readonly.map(publicKeyValue));
+  if (writable.length !== expected.writable || readonly.length !== expected.readonly) {
+    invalidResponse();
+  }
+  return Object.freeze({ writable, readonly });
+}
+
+function transactionLoadedAddressCounts(
+  transaction: VersionedTransaction,
+): Readonly<{ readonly writable: number; readonly readonly: number }> {
+  if (transaction.message.version === 'legacy') {
+    return Object.freeze({ writable: 0, readonly: 0 });
+  }
+  let writable = 0;
+  let readonly = 0;
+  for (const lookup of transaction.message.addressTableLookups) {
+    writable += lookup.writableIndexes.length;
+    readonly += lookup.readonlyIndexes.length;
+  }
+  return Object.freeze({ writable, readonly });
+}
+
+function validateTransactionMetaOptionals(meta: Record<string, unknown>): void {
+  if ((meta.err !== null && typeof meta.err !== 'string' && !Array.isArray(meta.err)
+    && typeof meta.err !== 'object')
+    || (Object.hasOwn(meta, 'innerInstructions') && meta.innerInstructions !== null
+      && !Array.isArray(meta.innerInstructions))
+    || (Object.hasOwn(meta, 'logMessages') && meta.logMessages !== null
+      && (!Array.isArray(meta.logMessages) || meta.logMessages.some((item) => typeof item !== 'string')))
+    || (Object.hasOwn(meta, 'rewards') && meta.rewards !== null && !Array.isArray(meta.rewards))
+    || (Object.hasOwn(meta, 'status') && !isTransactionStatus(meta.status))
+  ) {
+    invalidResponse();
+  }
+  if (Object.hasOwn(meta, 'computeUnitsConsumed')) unsignedInteger(meta.computeUnitsConsumed);
+  if (Object.hasOwn(meta, 'costUnits')) unsignedInteger(meta.costUnits);
+  if (Object.hasOwn(meta, 'returnData')) validateReturnData(meta.returnData);
+}
+
+function isTransactionStatus(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const keys = Object.keys(value);
+  return keys.length === 1 && (keys[0] === 'Ok' || keys[0] === 'Err');
+}
+
+function validateReturnData(value: unknown): void {
+  if (value === null) return;
+  const data = record(value);
+  exactKeys(data, ['programId', 'data']);
+  publicKeyValue(data.programId);
+  if (!Array.isArray(data.data) || data.data.length !== 2 || typeof data.data[0] !== 'string'
+    || data.data[1] !== 'base64') invalidResponse();
+}
+
+async function responseText(body: ReadableStream<Uint8Array> | null): Promise<string> {
+  if (body === null) invalidResponse();
+  const reader = body.getReader();
+  let bytes = Buffer.allocUnsafe(1_024);
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array) || value.byteLength > MAX_RESPONSE_BYTES - total) {
+        void reader.cancel().catch(() => undefined);
+        throw rpcError('RPC_RESPONSE_TOO_LARGE');
+      }
+      const required = total + value.byteLength;
+      if (required > bytes.length) {
+        let capacity = bytes.length;
+        while (capacity < required) capacity = Math.min(MAX_RESPONSE_BYTES, capacity * 2);
+        const expanded = Buffer.allocUnsafe(capacity);
+        bytes.copy(expanded, 0, 0, total);
+        bytes = expanded;
+      }
+      bytes.set(value, total);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, total));
+  } catch {
+    return invalidResponse();
+  }
+}
+
+function transportFailure(signal: AbortSignal, controller: AbortController): never {
+  if (signal.aborted) throw rpcError('OPERATION_ABORTED');
+  if (controller.signal.aborted) throw rpcError('RPC_TIMEOUT');
+  throw rpcError('RPC_UNAVAILABLE');
+}
+
+function responseFailure(
+  response: Response,
+  controller: AbortController,
+  code: 'RPC_RATE_LIMITED' | 'RPC_UNAVAILABLE' | 'RPC_RESPONSE_TOO_LARGE',
+): never {
+  controller.abort();
+  try {
+    if (response.body !== null) void response.body.cancel().catch(() => undefined);
+  } catch { /* Cancellation is best effort. */ }
+  throw rpcError(code);
 }
 
 function validateWalletRequest(value: WalletDeltaRequestV1): void {
@@ -464,6 +617,12 @@ function timestamp(value: unknown): number {
   return value;
 }
 
+function blockTime(value: unknown): void {
+  if (value !== null && (typeof value !== 'number' || !Number.isSafeInteger(value))) {
+    invalidResponse();
+  }
+}
+
 function record(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)
     || Object.getPrototypeOf(value) !== Object.prototype) invalidResponse();
@@ -475,6 +634,17 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): voi
   if (actual.length !== keys.length || actual.some((key) => !keys.includes(key))) {
     invalidResponse();
   }
+}
+
+function knownKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+): void {
+  const allowed = new Set([...required, ...optional]);
+  const actual = Object.keys(value);
+  if (required.some((key) => !Object.hasOwn(value, key))
+    || actual.some((key) => !allowed.has(key))) invalidResponse();
 }
 
 function invalid(): never { throw rpcError('INVALID_INPUT'); }

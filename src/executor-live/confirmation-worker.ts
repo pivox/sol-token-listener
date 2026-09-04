@@ -2,19 +2,14 @@ import type { ClaimedExecutionIntent } from '../ports/execution-intent-repositor
 import type {
   ExecutionLiveConfirmationV1,
 } from '../ports/execution-live-repository.js';
-
-export interface LiveSignatureObservationV1 {
-  readonly confirmationStatus: 'CONFIRMED' | 'FINALIZED' | 'NOT_FOUND';
-  readonly observedSlot: bigint | null;
-  readonly observedAtMs: number;
-}
-
-export interface LiveConfirmationGateway {
-  observeSignature(
-    signature: string,
-    signal: AbortSignal,
-  ): Promise<LiveSignatureObservationV1>;
-}
+import type {
+  LiveConfirmationGateway,
+  LiveSignatureObservationV1,
+} from '../ports/execution-confirmation-gateway.js';
+export type {
+  LiveConfirmationGateway,
+  LiveSignatureObservationV1,
+} from '../ports/execution-confirmation-gateway.js';
 
 export interface LiveConfirmationWorkerDependencies {
   readonly gateway: LiveConfirmationGateway;

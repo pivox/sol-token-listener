@@ -43,7 +43,10 @@ export type ExecutionReconciliationServiceErrorCode =
   | 'INVALID_EVIDENCE';
 
 export class ExecutionReconciliationServiceError extends Error {
-  public constructor(public readonly code: ExecutionReconciliationServiceErrorCode) {
+  public constructor(
+    public readonly code: ExecutionReconciliationServiceErrorCode,
+    public readonly sourceCode: string | null = null,
+  ) {
     super('Execution reconciliation service operation failed.');
     this.name = 'ExecutionReconciliationServiceError';
   }
@@ -74,8 +77,8 @@ export class ExecutionReconciliationService {
         this.gateway.readNormalizedTransaction(input.expected.signature, signal),
         this.gateway.readFinalizedWalletDeltas(input.walletDeltaRequest, signal),
       ]);
-    } catch {
-      throw serviceFailure('READ_FAILED');
+    } catch (error) {
+      throw serviceFailure('READ_FAILED', ownStringDataProperty(error, 'code'));
     }
     const transaction = bindDurableLineage(transactionObservation, input.expected);
     let evidence;
@@ -183,6 +186,21 @@ function exactRecord<const Keys extends readonly string[]>(
   return result;
 }
 
-function serviceFailure(code: ExecutionReconciliationServiceErrorCode): ExecutionReconciliationServiceError {
-  return new ExecutionReconciliationServiceError(code);
+function serviceFailure(
+  code: ExecutionReconciliationServiceErrorCode,
+  sourceCode: string | null = null,
+): ExecutionReconciliationServiceError {
+  return new ExecutionReconciliationServiceError(code, sourceCode);
+}
+
+function ownStringDataProperty(value: unknown, key: string): string | null {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return null;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && 'value' in descriptor && typeof descriptor.value === 'string'
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
 }
