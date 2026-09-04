@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.18
+**Version de spécification :** 1.0.19
 
-**Version de la spécification parente :** 1.8.0
+**Version de la spécification parente :** 1.8.1
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.0.19 — 2026-09-04 :** exclut les bytes signés des chemins de finalité
+  H2a et distingue l'identité réellement observable on-chain des fingerprints
+  build/snapshot liés durablement avant la soumission.
 - **1.0.18 — 2026-09-04 :** référence #51-H2a, runtime séparé limité à la
   finalité read-only. La reprise signée, la soumission, les lanes SELL/BUY et
   le canary restent hors de ce processus et différés à H2b/H2c.

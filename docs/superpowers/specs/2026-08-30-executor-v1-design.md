@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.8.0
+**Version de spécification :** 1.8.1
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.8.1 — 2026-09-04 :** rend les commits de finalité réutilisables sans
+  charger les bytes signés et limite l'identité transactionnelle RPC aux trois
+  champs vérifiables on-chain. La lignée build/snapshot reste durable, explicite
+  et incluse dans la preuve, sans être attribuée au provider.
 - **1.8.0 — 2026-09-04 :** spécifie #51-H2a comme un processus séparé de
   réconciliation finalized, confirmation et création de sorties à échéance.
   Ce premier incrément de composition live est structurellement privé de

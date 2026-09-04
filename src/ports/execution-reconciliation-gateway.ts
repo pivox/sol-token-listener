@@ -1,9 +1,8 @@
-export interface NormalizedExecutionTransactionV1 {
+/** Identity that can be derived from the finalized Solana transaction itself. */
+export interface ObservedExecutionTransactionV1 {
   readonly signature: string;
   readonly blockhash: string;
   readonly messageHash: string;
-  readonly buildFingerprint: string;
-  readonly snapshotFingerprint: string;
 }
 
 export interface WalletDeltaRequestV1 {
@@ -35,7 +34,7 @@ export interface ExecutionReconciliationGateway {
   readNormalizedTransaction(
     signature: string,
     signal: AbortSignal,
-  ): Promise<NormalizedExecutionTransactionV1 | null>;
+  ): Promise<ObservedExecutionTransactionV1 | null>;
   readFinalizedWalletDeltas(
     request: WalletDeltaRequestV1,
     signal: AbortSignal,

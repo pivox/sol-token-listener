@@ -33,6 +33,28 @@ void test('finality repository paths never select or materialize signed transact
   assert.match(sell, /artifactReferenceFromRow\(/u);
 });
 
+void test('the RPC transaction observation contains only on-chain-verifiable identity', async () => {
+  const port = await readFile(
+    new URL('../src/ports/execution-reconciliation-gateway.ts', import.meta.url),
+    'utf8',
+  );
+  const observed = section(
+    port,
+    'export interface ObservedExecutionTransactionV1',
+    'export interface WalletDeltaRequestV1',
+  );
+  assert.match(observed, /signature/u);
+  assert.match(observed, /blockhash/u);
+  assert.match(observed, /messageHash/u);
+  assert.doesNotMatch(observed, /buildFingerprint|snapshotFingerprint/u);
+
+  const service = await readFile(
+    new URL('../src/executor-risk/reconciliation-service.ts', import.meta.url),
+    'utf8',
+  );
+  assert.match(service, /bindDurableLineage\(/u);
+});
+
 function section(source: string, start: string, end: string): string {
   const from = source.indexOf(start);
   const to = source.indexOf(end, from + start.length);

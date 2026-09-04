@@ -1,10 +1,10 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.0.2
 
-**Version de la spécification parente :** 1.8.0
+**Version de la spécification parente :** 1.8.1
 
-**Version de l'orchestration persistante :** 1.0.5
+**Version de l'orchestration persistante :** 1.0.6
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,12 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.2 — 2026-09-04 :** ferme deux frontières découvertes à l'audit : les
+  commits de finalité retournent une référence d'artefact sans bytes et leurs
+  requêtes ne sélectionnent jamais les bytes signés ; l'observation RPC de la
+  transaction contient seulement signature, blockhash et hash du message.
+  Les fingerprints build/snapshot sont rattachés explicitement depuis la
+  lignée durable, sans être présentés comme observables on-chain.
 - **1.0.1 — 2026-09-04 :** limite les bindings de démarrage à ceux qui
   déterminent réellement la finalité : génération, wallet, cluster, genesis
   et provider. Les fingerprints build/configuration/stratégie historiques
@@ -163,6 +169,12 @@ Les quatre lectures de réconciliation doivent représenter une observation
 cohérente. Si la transaction ou les deltas ne peuvent pas être prouvés au
 niveau attendu, le résultat reste `UNKNOWN` ou la lane est rejouée. Aucune
 lecture `processed` ne produit une preuve durable.
+
+L'identité RPC normalisée contient uniquement `signature`, `blockhash` et
+`messageHash`. `buildFingerprint` et `snapshotFingerprint` ne sont pas
+reconstructibles depuis la chaîne : le service les rattache depuis le
+read-model durable avant le calcul de la preuve. Les résultats des commits de
+finalité contiennent une référence d'artefact sans `signedTransactionBytes`.
 
 Chaque réponse doit être JSON-RPC 2.0, correspondre à l'identifiant de requête,
 respecter les bornes de taille et les types entiers. Les nombres Solana au-delà

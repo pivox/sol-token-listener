@@ -23,8 +23,7 @@ void test('reconciliation service performs four read-only observations and one a
     async readNormalizedTransaction(received) {
       calls.push(`transaction:${received}`);
       return Object.freeze({
-        signature, blockhash, messageHash: hash, buildFingerprint: hash,
-        snapshotFingerprint: hash,
+        signature, blockhash, messageHash: hash,
       });
     },
     async readFinalizedWalletDeltas(request) {

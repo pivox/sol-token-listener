@@ -1,8 +1,8 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.0.5
+**Version de spécification :** 1.0.6
 
-**Version de la spécification parente :** 1.8.0
+**Version de la spécification parente :** 1.8.1
 
 **Version de la fondation live :** 1.0.17
 
@@ -13,6 +13,10 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.6 — 2026-09-04 :** rétrécit les retours des commits confirmation et
+  réconciliation à une référence d'artefact sans bytes. Leurs projections SQL
+  ne chargent plus `signed_transaction_bytes`, ce qui rend leur réutilisation
+  par H2a conforme à la frontière read-only sans secret transactionnel.
 - **1.0.5 — 2026-09-04 :** référence le découpage du successeur : #51-H2a
   compose uniquement réconciliation, confirmation et échéances derrière des
   ports read-only ; #51-H2b conservera `LIVE_RECOVER`, le signer et les lanes
