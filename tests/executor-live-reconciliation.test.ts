@@ -46,7 +46,6 @@ function matchedGateway(): ExecutionReconciliationGateway {
     readSignatureHistory: () => Promise.resolve('PRESENT' as const),
     readNormalizedTransaction: () => Promise.resolve(Object.freeze({
       signature, blockhash, messageHash: hash,
-      buildFingerprint: hash, snapshotFingerprint: hash,
     })),
     readFinalizedWalletDeltas: () => Promise.resolve(Object.freeze({
       confirmationStatus: 'FINALIZED' as const,

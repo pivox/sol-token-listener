@@ -15,6 +15,12 @@ BEGIN
     CREATE ROLE sol_token_executor_live NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
       NOINHERIT NOREPLICATION NOBYPASSRLS;
   END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname='sol_token_executor_live_recovery'
+  ) THEN
+    CREATE ROLE sol_token_executor_live_recovery NOLOGIN NOSUPERUSER
+      NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='sol_token_executor_operations') THEN
     CREATE ROLE sol_token_executor_operations NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
       NOINHERIT NOREPLICATION NOBYPASSRLS;
@@ -34,6 +40,239 @@ BEGIN
 END
 $roles$;
 
+ALTER ROLE sol_token_executor_live_recovery NOLOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+
+-- PostgreSQL 15+ supports per-parameter SET grants. Keep the recovery role
+-- unable to disable ordinary and constraint triggers through replica mode,
+-- while retaining PostgreSQL 14 compatibility for local migration tests.
+DO $recovery_parameter_acl$
+BEGIN
+  IF current_setting('server_version_num')::INTEGER >= 150000 THEN
+    EXECUTE 'REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM sol_token_executor_live_recovery';
+  END IF;
+END
+$recovery_parameter_acl$;
+
+-- Recovery must never inherit or SET ROLE into the signable role (or any
+-- other parent). Deployment LOGIN membership is managed separately.
+DO $recovery_parents$
+DECLARE
+  parent_role NAME;
+BEGIN
+  FOR parent_role IN
+    SELECT parent.rolname
+    FROM pg_auth_members membership
+    JOIN pg_roles member ON member.oid=membership.member
+    JOIN pg_roles parent ON parent.oid=membership.roleid
+    WHERE member.rolname='sol_token_executor_live_recovery'
+  LOOP
+    EXECUTE format(
+      'REVOKE %I FROM sol_token_executor_live_recovery',
+      parent_role
+    );
+  END LOOP;
+END
+$recovery_parents$;
+
+-- Remove stale direct authority from every user schema before rebuilding the
+-- closed public-schema allowlist. System and per-session temporary schemas are
+-- intentionally excluded.
+DO $recovery_schema_acl$
+DECLARE
+  target_schema NAME;
+BEGIN
+  FOR target_schema IN
+    SELECT namespace.nspname
+    FROM pg_namespace namespace
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON SCHEMA %I FROM sol_token_executor_live_recovery',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_live_recovery',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_executor_live_recovery',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_executor_live_recovery',
+      target_schema
+    );
+  END LOOP;
+END
+$recovery_schema_acl$;
+
+-- Table-level REVOKE does not remove grants made directly at column scope.
+DO $recovery_columns$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,class.relname,
+      string_agg(format('%I',attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class class
+    JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=class.oid
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND class.relkind IN ('r','p','v','m','f')
+    GROUP BY namespace.nspname,class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM sol_token_executor_live_recovery',
+      relation.columns, relation.nspname, relation.relname
+    );
+  END LOOP;
+END
+$recovery_columns$;
+
+GRANT USAGE ON SCHEMA public TO sol_token_executor_live_recovery;
+
+GRANT SELECT (version)
+ON TABLE migration_history TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status,
+  attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
+  last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
+  purge_after
+), INSERT (
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status
+), UPDATE (
+  status,state_revision,last_reason_code,lease_owner,lease_token,
+  lease_expires_at,terminal_at,reconciliation_completed_at,purge_after,updated_at
+)
+ON TABLE execution_intents TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  artifact_id,payload_version,specification_version,intent_id,attempt_number,
+  generation_id,armament_id,reservation_id,exit_authorization_id,provider_id,
+  wallet_public_key,side,effective_venue,message_hash,build_fingerprint,
+  snapshot_fingerprint,quote_fingerprint,quote_observed_at,quote_expires_at,
+  blockhash,last_valid_block_height,signature,signed_transaction_hash,state,
+  state_revision,signed_at,signed_simulated_at,submission_started_at,submitted_at,
+  confirmed_at,confirmed_slot,reconciled_at,revoked_at,purge_after
+), UPDATE (
+  state,state_revision,submitted_at,confirmed_at,confirmed_slot,reconciled_at,purge_after
+)
+ON TABLE execution_signed_transactions TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  intent_id,attempt_number,status,effective_venue,provider_id,
+  reconciliation_signature,reconciliation_blockhash,
+  reconciliation_last_valid_block_height,reconciliation_message_hash,
+  reconciliation_build_fingerprint,reconciliation_snapshot_fingerprint,
+  reconciliation_maximum_fee_lamports,
+  reconciliation_maximum_fee_payer_lamport_debit
+), UPDATE (status,completed_at,reason_code)
+ON TABLE execution_attempts TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  generation_id,payload_version,wallet_public_key,generation,cluster,
+  genesis_hash,retired_at
+)
+ON TABLE execution_wallet_generations TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  position_id,buy_intent_id,generation_id,armament_id,wallet_public_key,mint,
+  quote_mint,state,state_revision,exit_intent_id,remaining_base_raw,
+  quote_cost_raw,exit_deadline_at,entry_reconciliation_fingerprint
+), INSERT (
+  position_id,payload_version,buy_intent_id,generation_id,armament_id,
+  wallet_public_key,mint,quote_mint,entry_venue,quote_cost_raw,base_amount_raw,
+  remaining_base_raw,fee_lamports,maximum_holding_ms,opened_at,exit_deadline_at,
+  entry_reconciliation_fingerprint,state,state_revision
+), UPDATE (
+  state,state_revision,exit_intent_id,remaining_base_raw,
+  exit_reconciliation_fingerprint,closed_at,purge_after
+)
+ON TABLE execution_live_positions TO sol_token_executor_live_recovery;
+
+GRANT SELECT (armament_id,provider_id,state,state_revision,maximum_holding_ms),
+  UPDATE (state,state_revision,terminal_at,purge_after)
+ON TABLE execution_activation_armaments TO sol_token_executor_live_recovery;
+
+GRANT SELECT (authorization_id,position_id,state,state_revision), INSERT (
+  authorization_id,payload_version,position_id,generation_id,wallet_public_key,
+  mint,quote_mint,maximum_base_amount_raw,state,state_revision,created_at
+), UPDATE (
+  state,state_revision,locked_intent_id,locked_attempt_number,terminal_at,purge_after
+)
+ON TABLE execution_exit_authorizations TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  generation_id,state_revision,reserved_exposure_raw,open_positions,unknown_block
+), UPDATE (
+  state_revision,reserved_exposure_raw,open_positions,unknown_block,updated_at
+)
+ON TABLE execution_wallet_risk_state TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  reservation_id,intent_id,generation_id,state,state_revision,
+  maximum_amount_raw,wallet_snapshot_fingerprint
+), UPDATE (state,state_revision,reconciled_at,purge_after)
+ON TABLE execution_exposure_reservations TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,
+  reservation_id,generation_id,provider_id,side,signature,blockhash,
+  last_valid_block_height,message_hash,build_fingerprint,snapshot_fingerprint,
+  maximum_fee_lamports,maximum_fee_payer_lamport_debit,signature_history,
+  confirmation_status,finalized_block_height,observed_slot,
+  observed_transaction_fingerprint,fee_lamports,wallet_lamport_delta,
+  base_delta_raw,quote_delta_raw,unexpected_residual_token_balance_raw,
+  observed_at,finalized_at,result,reason_code,resolved_by_evidence_id,
+  resolved_at,purge_after
+), INSERT (
+  evidence_id,payload_version,evidence_fingerprint,intent_id,attempt_number,
+  reservation_id,generation_id,provider_id,side,signature,blockhash,
+  last_valid_block_height,message_hash,build_fingerprint,snapshot_fingerprint,
+  maximum_fee_lamports,maximum_fee_payer_lamport_debit,signature_history,
+  confirmation_status,finalized_block_height,observed_slot,
+  observed_transaction_fingerprint,fee_lamports,wallet_lamport_delta,
+  base_delta_raw,quote_delta_raw,unexpected_residual_token_balance_raw,
+  observed_at,finalized_at,result,reason_code,purge_after
+), UPDATE (resolved_by_evidence_id,resolved_at,purge_after)
+ON TABLE execution_reconciliation_evidence TO sol_token_executor_live_recovery;
+
+GRANT INSERT (
+  intent_id,previous_status,next_status,reason_code,human_message,
+  activation_phase,attempt_number,evidence,occurred_at
+)
+ON TABLE execution_intent_transitions TO sol_token_executor_live_recovery;
+GRANT USAGE ON SEQUENCE execution_intent_transitions_sequence_seq
+TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  artifact_id,generation_id,previous_state,next_state,reason_code
+), INSERT (
+  event_id,payload_version,event_fingerprint,artifact_id,generation_id,
+  previous_state,next_state,reason_code,occurred_at
+)
+ON TABLE execution_submission_events TO sol_token_executor_live_recovery;
+
+GRANT INSERT (
+  event_id,payload_version,event_fingerprint,armament_id,generation_id,
+  previous_state,next_state,reason_code,occurred_at
+)
+ON TABLE execution_activation_events TO sol_token_executor_live_recovery;
+
 REVOKE ALL PRIVILEGES ON SCHEMA public
 FROM sol_token_retention_worker;
 REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public
@@ -42,6 +281,9 @@ FROM sol_token_retention_worker;
 GRANT USAGE ON SCHEMA public
 TO sol_token_executor_live,sol_token_executor_operations,sol_token_operator_reader,
   sol_token_retention_worker;
+
+GRANT SELECT ON TABLE migration_history
+TO sol_token_executor_live;
 
 -- The scheduled retention process is a separate trust boundary. Reset every
 -- table capability on rerun, then grant only what purgeExpiredFoundationData

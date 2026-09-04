@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.17
+**Version de spécification :** 1.9.5
 
 **Date :** 2026-08-31
 
@@ -8,11 +8,72 @@
 
 **Issue parente :** #51
 
-**Périmètre livré à cette version :** #51-A à #51-G et primitives persistantes
-#51-H1 (claims, read-models et scan atomique des sorties à deadline)
+**Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes
+#51-H1 et runtime de finalité read-only #51-H2a
 
 ## Historique des versions
 
+- **1.9.5 — 2026-09-04 :** rend concluante l'absence finalisée d'une
+  transaction H2a après expiration du blockhash, afin de libérer durablement
+  intents et réservations avec `NO_EFFECT`.
+- **1.9.4 — 2026-09-04 :** aligne le RPC de finalité H2a sur
+  `RpcResponseContext` en acceptant son `apiVersion` optionnel typé, sans
+  assouplir le rejet des champs inconnus.
+- **1.9.3 — 2026-09-04 :** étend la fermeture H2a à tous les schémas non
+  système avec des identités qualifiées. Le provisioning révoque les grants
+  recovery résiduels hors `public` et la validation refuse toute autorité
+  effective supplémentaire, notamment via une vue inter-schémas.
+- **1.9.2 — 2026-09-04 :** complète l'autorité H2a avec les lectures de
+  colonnes exécutées transitivement par les triggers PostgreSQL de confirmation
+  et de réconciliation, fixe le `search_path` et refuse toute autorité directe
+  du login, routine `SECURITY DEFINER` accessible ou capacité à placer
+  `session_replication_role` en mode replica. L'allowlist refuse aussi tout
+  `GRANT OPTION`, sans ajouter de capacité signable ou de soumission.
+- **1.9.1 — 2026-09-04 :** ferme les memberships H2a avec les options
+  PostgreSQL 16 exactes, interdit tout rôle parent de recovery et rend
+  normative l'allowlist effective complète des ACL de relations et colonnes.
+- **1.9.0 — 2026-09-04 :** isole H2a derrière le rôle PostgreSQL dédié
+  `sol_token_executor_live_recovery`, appliqué et vérifié à chaque checkout.
+  Des ACL de colonnes retirent tout accès aux bytes signés et aux mutations de
+  signature/soumission ; le runtime ne reçoit que des façades gelées à
+  prototype nul. Le rôle signable historique reste réservé à H2b.
+- **1.8.8 — 2026-09-04 :** versionne le contrat H2a de report gelé :
+  `DEFERRED` associe une lane et un code RPC retryable allowlisté nullable,
+  tandis que `NOT_FOUND` reste sans code et laisse l'échéance poursuivre. Les
+  finalités inconnues ou incohérentes échouent fermées ; `CONFIRMED` et
+  `FINALIZED` imposent un slot `bigint` non négatif. Les logs redacted ne
+  contiennent ni message, ni URL, ni signature.
+- **1.8.7 — 2026-09-04 :** versionne le durcissement H2a du gateway RPC
+  read-only : schéma `getTransaction`/Token-2022, ordre et cardinalités LUT
+  v0, index u8 et identité pré/post, corps HTTP borné et annulé, UTF-8 fatal.
+  Cette frontière reste sans signer, soumission ou lecture de secret.
+- **1.8.6 — 2026-09-04 :** la transition `recordConfirmation` libère
+  atomiquement la lease ; son replay exact accepte une lease nulle ou identique
+  et la lane H2a ne tente aucun `release` après un commit réussi.
+- **1.8.5 — 2026-09-04 :** rend toute preuve de réconciliation SELL non
+  terminale immédiatement récupérable en libérant sa lease, y compris après
+  plusieurs résultats `UNKNOWN` ou `MISMATCH` consécutifs.
+- **1.8.4 — 2026-09-04 :** fixe pour H2a une session RPC unique par passe,
+  partagée entre réconciliation et confirmation, afin que le budget d'appels
+  ne puisse pas être réinitialisé par lane. Les noms de configuration restent
+  ceux de l'executor public existant.
+- **1.8.3 — 2026-09-04 :** impose à H2a de transmettre le claim renouvelé le
+  plus récent aux commits et de libérer toute lease après confirmation,
+  report ou résultat de réconciliation non terminal. Une confirmation en
+  attente est `DEFERRED` et ne peut pas affamer la création d'une sortie due.
+- **1.8.2 — 2026-09-04 :** autorise H2a à désérialiser uniquement les bytes
+  publics d'une transaction finalized renvoyée par Solana pour vérifier le
+  hash exact du message. Les bytes privés persistés avant soumission restent
+  inaccessibles au chemin de finalité.
+- **1.8.1 — 2026-09-04 :** rend les commits de finalité réutilisables sans
+  charger les bytes signés et limite l'identité transactionnelle RPC aux trois
+  champs vérifiables on-chain. La lignée build/snapshot reste durable, explicite
+  et incluse dans la preuve, sans être attribuée au provider.
+- **1.8.0 — 2026-09-04 :** spécifie #51-H2a comme un processus séparé de
+  réconciliation finalized, confirmation et création de sorties à échéance.
+  Ce premier incrément de composition live est structurellement privé de
+  keypair, signer, bytes signés, simulation signée et transport de soumission.
+  La reprise `LIVE_RECOVER` et les lanes d'exécution restent réservées à H2b.
 - **1.7.17 — 2026-09-04 :** applique le fence de présence SELL non seulement
   aux créations mais aussi à la persistance signée et aux réactivations après
   preuve `NO_EFFECT`. Ces voies prennent ce verrou avant la génération et les
@@ -816,7 +877,8 @@ Les commandes restent locales au processus executor et ne sont pas exposées
 par l'API publique :
 
 ```bash
-npm run executor:start
+npm run executor:live:recovery:start
+# Réservé à #51-H2b, non publié par #51-H2a : executor:live:start
 npm run live:preflight
 npm run live:status
 npm run live:arm -- --phase=canary
@@ -949,6 +1011,10 @@ réaffecté à une autre signification.
 | #51-E | Réconciliation, verrou/réservation wallet, sizing, exposition, quota provider et matrice de fautes | Aucune |
 | #51-F | Preflight, status, kill switch, armement inerte, rapports opérateur et rôles PostgreSQL séparés | Aucune |
 | #51-G | Chargement secret, signature et soumission dans l'exécutable séparé, live désactivé et non armé | Présente mais inaccessible par défaut |
+| #51-H1 | Claims live, read-models worker-ready et sorties à échéance atomiques | Aucune |
+| #51-H2a | Runtime de finalité read-only séparé : réconciliation, confirmation et échéances | Aucune |
+| #51-H2b | Composition signable, reprise exacte et lanes SELL/BUY dans un exécutable isolé | Présente mais non armée |
+| #51-H2c | Validation opérateur et préparation manuelle du canary minimal | Armement humain explicite uniquement |
 
 Chaque PR est fusionnable seule, garde le listener opérationnel et passe trois
 cycles de revue au maximum. Une PR ne peut pas anticiper l'activation de la
@@ -987,7 +1053,7 @@ suivante.
 - les gates compensatoires et l'activation progressive sont testables ;
 - SOL/WSOL est l'allowlist initiale sans coupler le domaine à SOL ;
 - la rétention terminale de quatre heures est documentée ;
-- les lots #51-B à #51-G sont indépendants ;
+- les lots #51-B à #51-H2c sont indépendants et fusionnables séquentiellement ;
 - aucun code de production, comportement, secret ou mode live n'est ajouté ;
 - `npm run build`, `npm run check`, `npm run lint`, `npm test` et
   `npm run docs:check` restent verts.

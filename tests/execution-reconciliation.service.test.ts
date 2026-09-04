@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ExecutionReconciliationService } from '../src/executor-risk/reconciliation-service.js';
+import {
+  ExecutionReconciliationService,
+  ExecutionReconciliationServiceError,
+} from '../src/executor-risk/reconciliation-service.js';
 import type { ExecutionReconciliationGateway } from '../src/ports/execution-reconciliation-gateway.js';
 import type {
   ExecutionReconciliationCommitV1,
@@ -23,8 +26,7 @@ void test('reconciliation service performs four read-only observations and one a
     async readNormalizedTransaction(received) {
       calls.push(`transaction:${received}`);
       return Object.freeze({
-        signature, blockhash, messageHash: hash, buildFingerprint: hash,
-        snapshotFingerprint: hash,
+        signature, blockhash, messageHash: hash,
       });
     },
     async readFinalizedWalletDeltas(request) {
@@ -77,6 +79,65 @@ void test('reconciliation service converts gateway and evidence failures to fixe
     (error) => error instanceof Error
       && error.message === 'Execution reconciliation service operation failed.'
       && !String(error).includes('secret'),
+  );
+});
+
+void test('reconciliation service retains only a typed RPC read error code', async () => {
+  const repository = repositoryStub(async () => { throw new Error('must not commit'); });
+  for (const code of ['RPC_RATE_LIMITED', 'RPC_TIMEOUT', 'CALL_BUDGET_EXCEEDED'] as const) {
+    const gateway: ExecutionReconciliationGateway = {
+      async readFinalizedBlockHeight() {
+        const error = new Error('https://credential@rpc.private.test');
+        Object.defineProperty(error, 'code', { value: code, enumerable: true });
+        throw error;
+      },
+      async readSignatureHistory() { return 'UNKNOWN'; },
+      async readNormalizedTransaction() { return null; },
+      async readFinalizedWalletDeltas() {
+        return Object.freeze({
+          confirmationStatus: 'NOT_FOUND' as const, observedSlot: null, feeLamports: 0n,
+          walletLamportDelta: 0n, baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
+          unexpectedResidualTokenBalanceRaw: 0n, observedAtMs: 1_900, finalizedAtMs: null,
+        });
+      },
+    };
+    await assert.rejects(
+      new ExecutionReconciliationService(gateway, repository)
+        .reconcile(request(), new AbortController().signal),
+      (error: unknown) => error instanceof ExecutionReconciliationServiceError
+        && error.code === 'READ_FAILED'
+        && error.sourceCode === code
+        && !error.message.includes('credential'),
+    );
+  }
+});
+
+void test('reconciliation service does not retain a hostile gateway code accessor', async () => {
+  const repository = repositoryStub(async () => { throw new Error('must not commit'); });
+  const gateway: ExecutionReconciliationGateway = {
+    async readFinalizedBlockHeight() {
+      const error = new Error('secret getter') as Error & { readonly code?: string };
+      Object.defineProperty(error, 'code', {
+        enumerable: true,
+        get: () => { throw new Error('secret getter'); },
+      });
+      throw error;
+    },
+    async readSignatureHistory() { return 'UNKNOWN'; },
+    async readNormalizedTransaction() { return null; },
+    async readFinalizedWalletDeltas() {
+      return Object.freeze({
+        confirmationStatus: 'NOT_FOUND' as const, observedSlot: null, feeLamports: 0n,
+        walletLamportDelta: 0n, baseDeltaRaw: 0n, quoteDeltaRaw: 0n,
+        unexpectedResidualTokenBalanceRaw: 0n, observedAtMs: 1_900, finalizedAtMs: null,
+      });
+    },
+  };
+  await assert.rejects(
+    new ExecutionReconciliationService(gateway, repository)
+      .reconcile(request(), new AbortController().signal),
+    (error: unknown) => error instanceof ExecutionReconciliationServiceError
+      && error.code === 'READ_FAILED' && error.sourceCode === null,
   );
 });
 

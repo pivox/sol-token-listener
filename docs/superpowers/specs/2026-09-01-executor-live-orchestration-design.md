@@ -1,8 +1,8 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.1.5
 
-**Version de la spécification parente :** 1.7.17
+**Version de la spécification parente :** 1.9.5
 
 **Version de la fondation live :** 1.0.17
 
@@ -13,6 +13,49 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.5 — 2026-09-04 :** référence la clôture `NO_EFFECT` de H2a pour une
+  absence finalisée après expiration ; les transactions H1 restent inchangées.
+- **1.1.4 — 2026-09-04 :** référence la compatibilité
+  `RpcResponseContext.apiVersion` de H2a ; les transactions H1 restent
+  inchangées.
+- **1.1.3 — 2026-09-04 :** référence la fermeture multi-schémas de l'autorité
+  H2a ; les transactions H1 restent inchangées.
+- **1.1.2 — 2026-09-04 :** explicite les lectures par colonne requises par les
+  triggers `SECURITY INVOKER` des commits H1 ; les transactions et les ports
+  restent inchangés, sans lecture des bytes signés ni soumission.
+- **1.1.1 — 2026-09-04 :** référence la fermeture des memberships PostgreSQL
+  16 et la matrice effective exacte des ACL H2a ; les primitives H1 et leurs
+  transactions ne changent pas.
+- **1.1.0 — 2026-09-04 :** réserve les primitives H1 de finalité à une façade
+  H2a exacte et au rôle PostgreSQL `sol_token_executor_live_recovery`. Les ACL
+  minimales autorisent les claims `CONFIRM`/`RECONCILE`, leurs read-models et
+  commits, ainsi que le scanner d'échéance, sans accorder la lecture des bytes
+  signés ni les mutations de signature, simulation signée ou soumission.
+- **1.0.10 — 2026-09-04 :** référence les reports H2a gelés et typés : un
+  `DEFERRED` associe la lane à un code RPC retryable allowlisté nullable,
+  `NOT_FOUND` n'a pas de code et n'arrête pas l'échéance. Les finalités
+  inconnues ou incohérentes échouent fermées ; `CONFIRMED` et `FINALIZED`
+  portent un slot `bigint` non négatif et les logs restent sans message, URL ni
+  signature. Les primitives et transitions persistantes H1 restent inchangées.
+- **1.0.9 — 2026-09-04 :** référence le durcissement du seul gateway read-only
+  H2a : contrat `getTransaction` v0 et Token-2022, cardinalités LUT, index u8,
+  identité pré/post, transport borné et UTF-8 fatal. Les contrats persistants
+  H1, leurs claims et leurs transitions restent inchangés.
+- **1.0.8 — 2026-09-04 :** la confirmation libère désormais atomiquement sa
+  lease dans `recordConfirmation`; un replay exact accepte une lease nulle ou
+  identique et la lane H2a ne relâche rien après ce commit.
+- **1.0.7 — 2026-09-04 :** libère atomiquement la lease après chaque preuve
+  SELL non terminale, y compris lorsqu'une intention est déjà dans l'état
+  `UNKNOWN_REQUIRES_RECONCILIATION`. Plusieurs observations `UNKNOWN` ou
+  `MISMATCH` consécutives restent ainsi immédiatement récupérables.
+- **1.0.6 — 2026-09-04 :** rétrécit les retours des commits confirmation et
+  réconciliation à une référence d'artefact sans bytes. Leurs projections SQL
+  ne chargent plus `signed_transaction_bytes`, ce qui rend leur réutilisation
+  par H2a conforme à la frontière read-only sans secret transactionnel.
+- **1.0.5 — 2026-09-04 :** référence le découpage du successeur : #51-H2a
+  compose uniquement réconciliation, confirmation et échéances derrière des
+  ports read-only ; #51-H2b conservera `LIVE_RECOVER`, le signer et les lanes
+  d'exécution. Les garanties historiques H1 restent inchangées.
 - **1.0.4 — 2026-09-04 :** étend le fence de présence SELL aux transitions
   qui rendent une intention bloquante. La persistance signée SELL, la
   réconciliation SELL `NO_EFFECT` et le port générique
@@ -59,7 +102,9 @@ PostgreSQL
   └─ scan deadline -> intention SELL déterministe
 ```
 
-#51-H2 réutilisera ces primitives pour composer les gateways RPC et les lanes.
+#51-H2a réutilise les seules primitives sans envoi pour composer un runtime de
+finalité read-only. #51-H2b réutilisera ensuite `LIVE_RECOVER` et les claims
+`LIVE_EXECUTE` dans l'exécutable signable séparé.
 Un canary Mainnet reste interdit avant la fusion de #51-H2, la validation de
 tous les gates compensatoires et un armement manuel distinct.
 
@@ -310,8 +355,8 @@ structurés redacted autour des lanes.
 - publication de `executor:live:start` ;
 - armement, financement du wallet ou canary Mainnet.
 
-Ces éléments appartiennent à #51-H2. Le checksum du catalogue de migrations
-sera également traité avant publication du binaire ; H1 ne revendique que la
+Ces éléments signables appartiennent à #51-H2b. Le catalogue checksum et la
+validation read-only du démarrage appartiennent à #51-H2a ; H1 ne revendique que la
 présence et le comportement de la migration 037 dans une base vide et rejouée.
 
 ## 11. Critères de livraison

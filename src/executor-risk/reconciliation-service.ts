@@ -43,7 +43,10 @@ export type ExecutionReconciliationServiceErrorCode =
   | 'INVALID_EVIDENCE';
 
 export class ExecutionReconciliationServiceError extends Error {
-  public constructor(public readonly code: ExecutionReconciliationServiceErrorCode) {
+  public constructor(
+    public readonly code: ExecutionReconciliationServiceErrorCode,
+    public readonly sourceCode: string | null = null,
+  ) {
     super('Execution reconciliation service operation failed.');
     this.name = 'ExecutionReconciliationServiceError';
   }
@@ -63,18 +66,21 @@ export class ExecutionReconciliationService {
     if (!(signal instanceof AbortSignal) || signal.aborted) throw serviceFailure('INVALID_INPUT');
     let finalizedBlockHeight: bigint;
     let signatureHistory: 'PRESENT' | 'ABSENT' | 'UNKNOWN';
-    let transaction: Awaited<ReturnType<ExecutionReconciliationGateway['readNormalizedTransaction']>>;
+    let transactionObservation: Awaited<ReturnType<
+      ExecutionReconciliationGateway['readNormalizedTransaction']
+    >>;
     let deltas: Awaited<ReturnType<ExecutionReconciliationGateway['readFinalizedWalletDeltas']>>;
     try {
-      [finalizedBlockHeight, signatureHistory, transaction, deltas] = await Promise.all([
+      [finalizedBlockHeight, signatureHistory, transactionObservation, deltas] = await Promise.all([
         this.gateway.readFinalizedBlockHeight(signal),
         this.gateway.readSignatureHistory(input.expected.signature, signal),
         this.gateway.readNormalizedTransaction(input.expected.signature, signal),
         this.gateway.readFinalizedWalletDeltas(input.walletDeltaRequest, signal),
       ]);
-    } catch {
-      throw serviceFailure('READ_FAILED');
+    } catch (error) {
+      throw serviceFailure('READ_FAILED', ownStringDataProperty(error, 'code'));
     }
+    const transaction = bindDurableLineage(transactionObservation, input.expected);
     let evidence;
     try {
       evidence = evaluateExecutionReconciliation({
@@ -99,6 +105,27 @@ export class ExecutionReconciliationService {
     }
     return this.repository.reconcile(Object.freeze({ payloadVersion: 1, evidence }));
   }
+}
+
+function bindDurableLineage(
+  observation: Awaited<ReturnType<ExecutionReconciliationGateway['readNormalizedTransaction']>>,
+  expected: ExecutionReconciliationRequestV1['expected'],
+): Readonly<{
+  readonly signature: string;
+  readonly blockhash: string;
+  readonly messageHash: string;
+  readonly buildFingerprint: string;
+  readonly snapshotFingerprint: string;
+}> | null {
+  if (observation === null) return null;
+  return Object.freeze({
+    signature: observation.signature,
+    blockhash: observation.blockhash,
+    messageHash: observation.messageHash,
+    // These two values are durable pre-submission lineage, not RPC observations.
+    buildFingerprint: expected.buildFingerprint,
+    snapshotFingerprint: expected.snapshotFingerprint,
+  });
 }
 
 function requestFrom(value: unknown): ExecutionReconciliationRequestV1 {
@@ -159,6 +186,21 @@ function exactRecord<const Keys extends readonly string[]>(
   return result;
 }
 
-function serviceFailure(code: ExecutionReconciliationServiceErrorCode): ExecutionReconciliationServiceError {
-  return new ExecutionReconciliationServiceError(code);
+function serviceFailure(
+  code: ExecutionReconciliationServiceErrorCode,
+  sourceCode: string | null = null,
+): ExecutionReconciliationServiceError {
+  return new ExecutionReconciliationServiceError(code, sourceCode);
+}
+
+function ownStringDataProperty(value: unknown, key: string): string | null {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return null;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && 'value' in descriptor && typeof descriptor.value === 'string'
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
 }

@@ -1,11 +1,12 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.1.6 — 2026-09-04
+**Version :** 1.3.5 — 2026-09-04
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
-applicable après composition du runtime. Le binaire production est actuellement
-non composé et donc indémarrable : aucun script `executor:live:start` n'est
-publié. Il est interdit de contourner ce verrou avec un script ad hoc.
+applicable après composition du runtime signable. #51-H2a publie uniquement
+`executor:live:recovery:start`, un processus de finalité read-only sans keypair,
+signature ni soumission. Le script signable `executor:live:start` reste absent.
+Il est interdit de contourner ce verrou avec un script ad hoc.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
 briques #51-G ne prouvent ni rentabilité, ni sellabilité générale, ni avantage
@@ -22,8 +23,75 @@ valide configuration et schéma avant de charger le secret, injecte tous les
 ports réels, respecte l'ordre réconciliation → confirmation → SELL → deadline
 → BUY, puis ferme les ressources dans un délai borné.
 
-Tant que ce graphe n'est pas livré et revu, les commandes opérateur restent
+Tant que le graphe signable H2b n'est pas livré et revu, les commandes opérateur restent
 inertes et aucun canary réel ne doit être tenté.
+
+## Démarrer uniquement la récupération de finalité H2a
+
+Utiliser un environnement dédié qui ne contient aucun nom de variable de
+keypair, clé privée ou secret wallet, même vide. Les valeurs suivantes sont
+publiques mais doivent être vérifiées par l'opérateur :
+
+```dotenv
+EXECUTOR_LIVE_RECOVERY_ENABLED=true
+EXECUTOR_MODE=live
+SOLANA_CLUSTER=mainnet-beta
+DATABASE_URL=postgresql://<login-recovery-dedie>:...@127.0.0.1:5432/solanabot
+EXECUTOR_WALLET_GENERATION_ID=execution_wallet_generation_<sha256>
+EXECUTOR_PUBLIC_KEY=<adresse-publique-base58>
+EXECUTOR_RPC_PROVIDER_ID=primary
+SOLANA_HTTP_RPC_URL=https://<endpoint-qualifie>
+SOLANA_EXPECTED_GENESIS_HASH=<hash-genesis-mainnet-verifie>
+EXECUTOR_POLL_MS=1000
+EXECUTOR_LEASE_MS=60000
+EXECUTOR_DB_STATEMENT_TIMEOUT_MS=3000
+EXECUTOR_SHUTDOWN_GRACE_MS=10000
+EXECUTOR_RPC_TIMEOUT_MS=5000
+EXECUTOR_MAX_RPC_CALLS_PER_PASS=8
+EXECUTOR_LIVE_RECOVERY_OWNER_ID=<instance-unique>
+```
+
+Après build, lancer seulement :
+
+```bash
+DOTENV_CONFIG_PATH=/chemin/hors-git/live-recovery.env \
+  npm run executor:live:recovery:start
+```
+
+Cette commande vérifie rôle, migrations, génération, provider et genesis avant
+la première claim. Elle ne charge aucun signer, n'arme rien et ne soumet aucune
+transaction.
+
+Avant ce démarrage, un administrateur rejoue
+`scripts/provision-executor-roles.sql`, crée hors dépôt un login dédié
+`LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+NOBYPASSRLS`, puis lui accorde uniquement `sol_token_executor_live_recovery`
+avec PostgreSQL 16 `WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`. Le mot de passe
+et le nom du login ne sont jamais committés. Recovery ne doit être membre
+d'aucun autre rôle. Le runtime contrôle ce graphe et l'allowlist effective
+complète à chaque démarrage ; il refuse toute autorité supplémentaire, tout
+droit ou ownership direct du login et toute routine `SECURITY DEFINER`
+accessible hors schémas système. Chaque checkout force également
+`search_path=pg_catalog,public`. Le démarrage vérifie aussi l'exécutabilité des
+deux helpers `SECURITY INVOKER` du ledger, refuse le privilège `SET` sur
+`session_replication_role`, interdit tout `GRANT OPTION` sur l'autorité recovery
+et exige la valeur `origin` avant toute claim. L'allowlist couvre tous les
+schémas non système et refuse tout droit résiduel hors `public`, y compris via
+une vue exposant indirectement des colonnes sensibles.
+
+Les réponses de statut Solana acceptent `RpcResponseContext.apiVersion`
+lorsqu'il s'agit d'une chaîne ; tout autre champ de contexte inconnu reste
+rejeté afin de détecter une dérive de contrat RPC.
+
+Une lecture `getTransaction` finalisée sans transaction porte la date de cette
+preuve. Combinée à une absence historique, des deltas nuls et un blockhash
+expiré au niveau finalisé, elle clôt la réconciliation en `NO_EFFECT`.
+
+Le runtime H2a traite, dans l'ordre, une réconciliation finalized, une
+confirmation ou une échéance par passe. Il ne réclame jamais `LIVE_RECOVER`,
+`LIVE_EXECUTE/SELL` ou `LIVE_EXECUTE/BUY`; il ne peut donc ni reprendre des
+bytes signés, ni créer une signature, ni envoyer une transaction. Son
+démarrage ne vaut ni armement ni autorisation de canary.
 
 La migration 037 et les repositories #51-H1 ajoutent uniquement les claims
 `LIVE_EXECUTE` SELL/BUY et `LIVE_RECOVER`, les read-models durables de
@@ -74,8 +142,9 @@ indémarrable jusque-là.
 
 Après les migrations, un administrateur peut appliquer
 `scripts/provision-executor-roles.sql`. Il crée des rôles de groupe `NOLOGIN`,
-sans mot de passe ni privilège cluster. Le compte LOGIN du futur processus live
-doit recevoir seulement `sol_token_executor_live`.
+sans mot de passe ni privilège cluster. Le compte LOGIN du futur processus
+signable H2b doit recevoir seulement `sol_token_executor_live`. Le compte H2a
+distinct reçoit seulement `sol_token_executor_live_recovery`.
 
 La rétention utilise un second compte LOGIN dédié qui doit recevoir seulement
 `sol_token_retention_worker`. Il ne doit jamais être partagé avec le listener,
@@ -85,11 +154,14 @@ uniquement dans le job planifié, puis celui-ci lance
 provisioning doit être rejoué par l'administrateur après toute migration qui
 ajoute une table à la purge ; le job reste arrêté si ce provisioning échoue.
 
-Le rôle `sol_token_executor_live` est le seul rôle applicatif autorisé à lire
-les octets signés et les détails de positions live. Listener, worker dry-run,
-opérations, lecteur opérateur et API publique n'y ont aucun accès. Seul le rôle
-de rétention reçoit les `DELETE` nécessaires à la purge. Il n'obtient qu'une
-lecture par colonnes
+Le rôle signable `sol_token_executor_live` est le seul rôle applicatif autorisé
+à lire les octets signés. Le rôle H2a recovery ne reçoit que les colonnes et
+mutations de finalité nécessaires ; `signed_transaction_bytes`, mutation de
+signature, simulation signée, préflight et démarrage de soumission lui sont
+interdits. Listener,
+worker dry-run, opérations, lecteur opérateur et API publique n'ont aucun accès
+aux bytes signés. Seul le rôle de rétention reçoit les `DELETE` nécessaires à
+la purge. Il n'obtient qu'une lecture par colonnes
 de l'identifiant, de l'état, de l'échéance et de l'autorisation de sortie sur
 `execution_signed_transactions` : `signed_transaction_bytes` lui reste
 inaccessible, y compris via `RETURNING`.
@@ -203,5 +275,6 @@ autorisation et armement consommés, et aucun état inconnu. Une absence
 d'opportunité, un BUY refusé ou une fermeture sans transaction ne vaut pas
 `PASS`.
 
-Pour l'instant, le constat obligatoire est : `LIVE_RUNTIME_NOT_COMPOSED`,
+Pour l'instant, le constat obligatoire est :
+`LIVE_RECOVERY_RUNTIME_COMPOSED`, `LIVE_EXECUTION_RUNTIME_NOT_COMPOSED`,
 `CANARY_NOT_STARTED`, `NON_EXECUTED / NON_VALIDATED`.
