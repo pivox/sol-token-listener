@@ -92,9 +92,11 @@ void test('read-only recovery provisioning matches its closed authority policy',
   assert.equal(Object.isFrozen(authority), true);
   assert.equal(Object.isFrozen(authority.tables), true);
   assert.match(sql, /ALTER ROLE sol_token_executor_live_recovery NOLOGIN NOSUPERUSER NOCREATEDB\s+NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS/iu);
-  assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public\s+FROM sol_token_executor_live_recovery/iu);
-  assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public\s+FROM sol_token_executor_live_recovery/iu);
-  assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public\s+FROM sol_token_executor_live_recovery/iu);
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_live_recovery/u);
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_executor_live_recovery/u);
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_executor_live_recovery/u);
+  assert.match(sql, /namespace\.nspname NOT IN \('pg_catalog','information_schema','pg_toast'\)/u);
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON SCHEMA %I FROM sol_token_executor_live_recovery/u);
   assert.match(sql, /GRANT USAGE ON SCHEMA public TO sol_token_executor_live_recovery/iu);
   assert.match(sql, /GRANT USAGE ON SEQUENCE execution_intent_transitions_sequence_seq\s+TO sol_token_executor_live_recovery/iu);
   assert.doesNotMatch(executable, /GRANT\s+(?:ALL(?:\s+PRIVILEGES)?|DELETE|TRUNCATE|TRIGGER|REFERENCES)\b[^;]*TO\s+sol_token_executor_live_recovery/iu);
@@ -300,6 +302,26 @@ void test('PostgreSQL 16 recovery login is exact, reacquired and fails without m
       );
       await isolated.query(`REVOKE GRANT OPTION FOR SELECT (version) ON migration_history
         FROM sol_token_executor_live_recovery`);
+      await isolated.query(`CREATE SCHEMA ${quoteIdentifier(`h2a_private_${suffix}`)}`);
+      await isolated.query(`CREATE TABLE ${quoteIdentifier(`h2a_private_${suffix}`)}.secrets (
+        signed_transaction_bytes BYTEA NOT NULL
+      )`);
+      await isolated.query(`GRANT USAGE ON SCHEMA ${quoteIdentifier(`h2a_private_${suffix}`)}
+        TO sol_token_executor_live_recovery`);
+      await isolated.query(`GRANT SELECT ON TABLE
+        ${quoteIdentifier(`h2a_private_${suffix}`)}.secrets
+        TO sol_token_executor_live_recovery WITH GRANT OPTION`);
+      await assert.rejects(
+        validateLiveRecoveryStartup(database.startup, expectedConfig, { validateFiles: false }),
+        (error: unknown) => error instanceof Error
+          && 'code' in error && error.code === 'DATABASE_ROLE_INVALID',
+      );
+      await isolated.query(provisioningSql);
+      await validateLiveRecoveryStartup(
+        database.startup,
+        expectedConfig,
+        { validateFiles: false },
+      );
       await isolated.query(`ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES
         TO ${quoteIdentifier(loginName)}`);
       await assert.rejects(
@@ -404,7 +426,31 @@ void test('provisioned retention role runs the complete purge without reading si
     await migrateDatabase({ pool: isolated });
     const provisioningSql = await readFile(scriptUrl, 'utf8');
     await isolated.query(provisioningSql);
+    await isolated.query('CREATE SCHEMA h2a_private');
+    await isolated.query(`CREATE TABLE h2a_private.secrets (
+      signed_transaction_bytes BYTEA NOT NULL
+    )`);
+    await isolated.query(`GRANT USAGE ON SCHEMA h2a_private
+      TO sol_token_executor_live_recovery`);
+    await isolated.query(`GRANT SELECT ON TABLE h2a_private.secrets
+      TO sol_token_executor_live_recovery WITH GRANT OPTION`);
     await isolated.query(provisioningSql);
+    const staleRecoveryAuthority = await isolated.query<{
+      readonly schema_usage: boolean;
+      readonly table_select: boolean;
+      readonly table_grant: boolean;
+    }>(`SELECT
+      has_schema_privilege('sol_token_executor_live_recovery',
+        'h2a_private','USAGE') AS schema_usage,
+      has_table_privilege('sol_token_executor_live_recovery',
+        'h2a_private.secrets','SELECT') AS table_select,
+      has_table_privilege('sol_token_executor_live_recovery',
+        'h2a_private.secrets','SELECT WITH GRANT OPTION') AS table_grant`);
+    assert.deepEqual(staleRecoveryAuthority.rows, [{
+      schema_usage: false,
+      table_select: false,
+      table_grant: false,
+    }]);
     await assertRecoveryRoleAcl(isolated);
 
     const publicKey = '11111111111111111111111111111111';
@@ -681,13 +727,15 @@ function recoveryPrivilegeKeys(): string[] {
       ['SELECT', table.select], ['INSERT', table.insert], ['UPDATE', table.update],
     ] as const) {
       for (const column of columns) {
-        keys.push(privilegeKey('COLUMN', table.name, column, privilege, false));
+        keys.push(privilegeKey('COLUMN', `public.${table.name}`, column, privilege, false));
       }
     }
   }
   for (const sequence of LIVE_RECOVERY_DATABASE_AUTHORITY.sequences) {
     for (const privilege of sequence.privileges) {
-      keys.push(privilegeKey('SEQUENCE', sequence.name, null, privilege, false));
+      keys.push(privilegeKey(
+        'SEQUENCE', `public.${sequence.name}`, null, privilege, false,
+      ));
     }
   }
   return keys;

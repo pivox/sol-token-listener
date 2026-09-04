@@ -1,10 +1,10 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.1.2
+**Version de spécification :** 1.1.3
 
-**Version de la spécification parente :** 1.9.2
+**Version de la spécification parente :** 1.9.3
 
-**Version de l'orchestration persistante :** 1.1.2
+**Version de l'orchestration persistante :** 1.1.3
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,10 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.3 — 2026-09-04 :** ferme l'autorité effective sur tous les schémas
+  non système. Les objets sont identifiés avec leur schéma, le provisioning
+  révoque les anciens grants hors `public` et le démarrage refuse tout droit,
+  ownership ou `GRANT OPTION` résiduel hors de l'allowlist qualifiée.
 - **1.1.2 — 2026-09-04 :** inclut dans l'allowlist `SELECT` les colonnes que
   les triggers `SECURITY INVOKER` de confirmation et de résolution lisent au
   commit. Cette autorité transitive explicite permet les écritures H2a prévues
@@ -277,7 +281,9 @@ La validation exige simultanément :
   restent `SECURITY INVOKER` et sont exécutables par recovery ;
 - l'allowlist effective exacte décrite ci-dessous, en tenant compte de
   `PUBLIC`, de l'ownership et des memberships ; aucun privilège autorisé ne
-  peut porter `WITH GRANT OPTION`.
+  peut porter `WITH GRANT OPTION`. Le scan couvre tous les schémas non système,
+  avec des identités de relation qualifiées ; seul `public` peut contenir les
+  droits listés ci-dessous.
 
 Le nom du login de session est une donnée de déploiement privée : il est
 comparé dans PostgreSQL mais n'est jamais renvoyé dans l'évidence ni journalisé.

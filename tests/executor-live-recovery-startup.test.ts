@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL,
   LIVE_RECOVERY_MIGRATION_CATALOG,
   LiveRecoveryStartupError,
   validateLiveRecoveryStartup,
@@ -122,6 +123,23 @@ void test('rejects an otherwise allowed privilege when it is grantable', async (
     (error: unknown) => error instanceof LiveRecoveryStartupError
       && error.code === 'DATABASE_ROLE_INVALID',
   );
+});
+
+void test('scans effective authority across every non-system schema', () => {
+  assert.doesNotMatch(
+    LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL,
+    /namespace\.nspname='public'/u,
+  );
+  assert.match(
+    LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL,
+    /relation\.schema_name \|\| '\.' \|\| relation\.relname/u,
+  );
+  assert.match(
+    LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL,
+    /namespace\.nspname NOT IN \('pg_catalog','information_schema','pg_toast'\)/u,
+  );
+  assert.match(LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL, /NOT LIKE 'pg_temp_%'/u);
+  assert.match(LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL, /NOT LIKE 'pg_toast_temp_%'/u);
 });
 
 interface Overrides {
@@ -251,14 +269,16 @@ function privilegeRows(): readonly Readonly<Record<string, unknown>>[] {
       ['SELECT', table.select], ['INSERT', table.insert], ['UPDATE', table.update],
     ] as const) {
       for (const column of columns) rows.push({
-        kind: 'COLUMN', object_name: table.name, subobject_name: column, privilege,
+        kind: 'COLUMN', object_name: `public.${table.name}`,
+        subobject_name: column, privilege,
         is_grantable: false,
       });
     }
   }
   for (const sequence of LIVE_RECOVERY_DATABASE_AUTHORITY.sequences) {
     for (const privilege of sequence.privileges) rows.push({
-      kind: 'SEQUENCE', object_name: sequence.name, subobject_name: null, privilege,
+      kind: 'SEQUENCE', object_name: `public.${sequence.name}`,
+      subobject_name: null, privilege,
       is_grantable: false,
     });
   }

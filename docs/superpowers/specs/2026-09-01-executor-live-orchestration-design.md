@@ -1,8 +1,8 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.1.2
+**Version de spécification :** 1.1.3
 
-**Version de la spécification parente :** 1.9.2
+**Version de la spécification parente :** 1.9.3
 
 **Version de la fondation live :** 1.0.17
 
@@ -13,6 +13,8 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.1.3 — 2026-09-04 :** référence la fermeture multi-schémas de l'autorité
+  H2a ; les transactions H1 restent inchangées.
 - **1.1.2 — 2026-09-04 :** explicite les lectures par colonne requises par les
   triggers `SECURITY INVOKER` des commits H1 ; les transactions et les ports
   restent inchangés, sans lecture des bytes signés ni soumission.

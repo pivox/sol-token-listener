@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.9.2
+**Version de spécification :** 1.9.3
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 
 ## Historique des versions
 
+- **1.9.3 — 2026-09-04 :** étend la fermeture H2a à tous les schémas non
+  système avec des identités qualifiées. Le provisioning révoque les grants
+  recovery résiduels hors `public` et la validation refuse toute autorité
+  effective supplémentaire, notamment via une vue inter-schémas.
 - **1.9.2 — 2026-09-04 :** complète l'autorité H2a avec les lectures de
   colonnes exécutées transitivement par les triggers PostgreSQL de confirmation
   et de réconciliation, fixe le `search_path` et refuse toute autorité directe

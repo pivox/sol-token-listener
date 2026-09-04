@@ -93,9 +93,12 @@ export const LIVE_RECOVERY_MIGRATION_CATALOG: readonly LiveRecoveryMigrationCata
 export const LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL = `
   /* live_recovery_effective_privileges */
   WITH relations AS (
-    SELECT class.oid,class.relname,class.relowner,class.relkind
+    SELECT class.oid,namespace.nspname AS schema_name,class.relname,
+      class.relowner,class.relkind
     FROM pg_class class JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
-    WHERE namespace.nspname='public'
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
   ), column_privilege(privilege) AS (
     VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')
   ), table_privilege(privilege) AS (
@@ -106,7 +109,8 @@ export const LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL = `
   ), schema_privilege(privilege) AS (
     VALUES ('USAGE'),('CREATE')
   )
-  SELECT 'COLUMN'::TEXT AS kind,relation.relname::TEXT AS object_name,
+  SELECT 'COLUMN'::TEXT AS kind,
+    (relation.schema_name || '.' || relation.relname)::TEXT AS object_name,
     attribute.attname::TEXT AS subobject_name,permission.privilege::TEXT AS privilege,
     has_column_privilege(current_user,relation.oid,attribute.attnum,
       permission.privilege || ' WITH GRANT OPTION') AS is_grantable
@@ -118,18 +122,21 @@ export const LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL = `
     AND has_column_privilege(current_user,relation.oid,attribute.attnum,
       permission.privilege)
   UNION ALL
-  SELECT 'TABLE',relation.relname,NULL,permission.privilege,
+  SELECT 'TABLE',relation.schema_name || '.' || relation.relname,
+    NULL,permission.privilege,
     has_table_privilege(current_user,relation.oid,
       permission.privilege || ' WITH GRANT OPTION')
   FROM relations relation CROSS JOIN table_privilege permission
   WHERE relation.relkind IN ('r','p','v','m','f')
     AND has_table_privilege(current_user,relation.oid,permission.privilege)
   UNION ALL
-  SELECT 'OWNER',relation.relname,NULL,'OWNER',TRUE
+  SELECT 'OWNER',relation.schema_name || '.' || relation.relname,
+    NULL,'OWNER',TRUE
   FROM relations relation
   WHERE relation.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user)
   UNION ALL
-  SELECT 'SEQUENCE',relation.relname,NULL,permission.privilege,
+  SELECT 'SEQUENCE',relation.schema_name || '.' || relation.relname,
+    NULL,permission.privilege,
     has_sequence_privilege(current_user,relation.oid,
       permission.privilege || ' WITH GRANT OPTION')
   FROM relations relation CROSS JOIN sequence_privilege permission
@@ -140,7 +147,9 @@ export const LIVE_RECOVERY_EFFECTIVE_PRIVILEGES_SQL = `
     has_schema_privilege(current_user,namespace.oid,
       permission.privilege || ' WITH GRANT OPTION')
   FROM pg_namespace namespace CROSS JOIN schema_privilege permission
-  WHERE namespace.nspname='public'
+  WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+    AND namespace.nspname NOT LIKE 'pg_temp_%'
+    AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
     AND has_schema_privilege(current_user,namespace.oid,permission.privilege)
   ORDER BY kind,object_name,subobject_name NULLS FIRST,privilege`;
 
@@ -369,13 +378,25 @@ function expectedPrivilegeKeys(): string[] {
       ['UPDATE', table.update],
     ] as const) {
       for (const column of columns) {
-        expected.push(privilegeKeyFrom('COLUMN', table.name, column, privilege, false));
+        expected.push(privilegeKeyFrom(
+          'COLUMN',
+          `${LIVE_RECOVERY_DATABASE_AUTHORITY.schema}.${table.name}`,
+          column,
+          privilege,
+          false,
+        ));
       }
     }
   }
   for (const sequence of LIVE_RECOVERY_DATABASE_AUTHORITY.sequences) {
     for (const privilege of sequence.privileges) {
-      expected.push(privilegeKeyFrom('SEQUENCE', sequence.name, null, privilege, false));
+      expected.push(privilegeKeyFrom(
+        'SEQUENCE',
+        `${LIVE_RECOVERY_DATABASE_AUTHORITY.schema}.${sequence.name}`,
+        null,
+        privilege,
+        false,
+      ));
     }
   }
   return expected.sort();

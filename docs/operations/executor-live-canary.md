@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.3.2 — 2026-09-04
+**Version :** 1.3.3 — 2026-09-04
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime signable. #51-H2a publie uniquement
@@ -75,7 +75,9 @@ accessible hors schémas système. Chaque checkout force également
 `search_path=pg_catalog,public`. Le démarrage vérifie aussi l'exécutabilité des
 deux helpers `SECURITY INVOKER` du ledger, refuse le privilège `SET` sur
 `session_replication_role`, interdit tout `GRANT OPTION` sur l'autorité recovery
-et exige la valeur `origin` avant toute claim.
+et exige la valeur `origin` avant toute claim. L'allowlist couvre tous les
+schémas non système et refuse tout droit résiduel hors `public`, y compris via
+une vue exposant indirectement des colonnes sensibles.
 
 Le runtime H2a traite, dans l'ordre, une réconciliation finalized, une
 confirmation ou une échéance par passe. Il ne réclame jamais `LIVE_RECOVER`,

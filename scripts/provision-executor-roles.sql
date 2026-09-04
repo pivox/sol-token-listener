@@ -75,14 +75,39 @@ BEGIN
 END
 $recovery_parents$;
 
-REVOKE ALL PRIVILEGES ON SCHEMA public
-FROM sol_token_executor_live_recovery;
-REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public
-FROM sol_token_executor_live_recovery;
-REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public
-FROM sol_token_executor_live_recovery;
-REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public
-FROM sol_token_executor_live_recovery;
+-- Remove stale direct authority from every user schema before rebuilding the
+-- closed public-schema allowlist. System and per-session temporary schemas are
+-- intentionally excluded.
+DO $recovery_schema_acl$
+DECLARE
+  target_schema NAME;
+BEGIN
+  FOR target_schema IN
+    SELECT namespace.nspname
+    FROM pg_namespace namespace
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON SCHEMA %I FROM sol_token_executor_live_recovery',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_live_recovery',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_executor_live_recovery',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_executor_live_recovery',
+      target_schema
+    );
+  END LOOP;
+END
+$recovery_schema_acl$;
 
 -- Table-level REVOKE does not remove grants made directly at column scope.
 DO $recovery_columns$
@@ -96,7 +121,10 @@ BEGIN
     JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
     JOIN pg_attribute attribute ON attribute.attrelid=class.oid
       AND attribute.attnum>0 AND NOT attribute.attisdropped
-    WHERE namespace.nspname='public' AND class.relkind IN ('r','p','v','m','f')
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND class.relkind IN ('r','p','v','m','f')
     GROUP BY namespace.nspname,class.relname
   LOOP
     EXECUTE format(
