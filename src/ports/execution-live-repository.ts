@@ -6,6 +6,8 @@ import type {
 } from '../domain/execution-live.js';
 import type { ExecutionIntentV1 } from '../domain/execution-intent.js';
 import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reconciliation.js';
+import type { ExecutionReconciliationRequestV1 } from
+  '../executor-risk/reconciliation-service.js';
 import type { ClaimedExecutionIntent } from './execution-intent-repository.js';
 import type { ExecutionSimulationEvidenceV1 } from './execution-simulation-gateway.js';
 import type { ExecutionLiveSignedSimulationEvidenceV1 } from
@@ -125,6 +127,20 @@ export interface ExecutionLiveConfirmationV1 {
   readonly observedAtMs: number;
 }
 
+export interface ExecutionLiveConfirmationWorkV1 {
+  readonly payloadVersion: 1;
+  readonly artifactId: string;
+  readonly expectedRevision: bigint;
+  readonly signature: string;
+  readonly providerId: string;
+}
+
+export interface ExecutionLiveReconciliationWorkV1 {
+  readonly payloadVersion: 1;
+  readonly providerId: string;
+  readonly request: ExecutionReconciliationRequestV1;
+}
+
 export interface ExecutionLiveReconciliationResultV1 {
   readonly payloadVersion: 1;
   readonly result: 'MATCHED' | 'NO_EFFECT' | 'MISMATCH' | 'UNKNOWN';
@@ -171,6 +187,12 @@ export interface ExecutionLiveRepository {
     claim: ClaimedExecutionIntent,
     confirmation: ExecutionLiveConfirmationV1,
   ): Promise<SignedTransactionArtifactV1>;
+  readConfirmationWork(
+    claim: ClaimedExecutionIntent,
+  ): Promise<ExecutionLiveConfirmationWorkV1>;
+  readReconciliationWork(
+    claim: ClaimedExecutionIntent,
+  ): Promise<ExecutionLiveReconciliationWorkV1>;
   commitReconciliation(
     claim: ClaimedExecutionIntent,
     evidence: ExecutionReconciliationEvidenceV1,
@@ -179,4 +201,5 @@ export interface ExecutionLiveRepository {
     readonly positionId: string;
     readonly observedAtMs: number;
   }>): Promise<ExecutionDeadlineExitResultV1>;
+  createNextDeadlineExitIntent(): Promise<ExecutionDeadlineExitResultV1 | null>;
 }

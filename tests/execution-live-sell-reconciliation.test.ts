@@ -186,6 +186,135 @@ void test('SELL UNKNOWN then NO_EFFECT restores a retryable exit without releasi
     });
   });
 
+void test('SELL NO_EFFECT activation fences a concurrent live BUY claim before generation locks',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await createAmbiguousSellFixture(pool);
+      const unknown = sellEvidence(fixture, 'UNKNOWN', fixture.observedAtMs);
+      const noEffect = sellEvidence(fixture, 'NO_EFFECT', fixture.observedAtMs + 2_000);
+      await fixture.live.commitReconciliation(fixture.claim, unknown);
+
+      const intents = new PostgresExecutionIntentRepository(pool);
+      const nowMs = Date.now();
+      await intents.create(createExecutionIntentDraft({
+        strategyId: 'sell-activation-race-test', strategyVersion: 1,
+        positionId: `position:${randomUUID()}`, logicalCommandId: `command:${randomUUID()}`,
+        mint: walletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
+        quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1n,
+        baseAmountRaw: null, minimumAmountOutRaw: 1n,
+        decisionEventId: `decision:${randomUUID()}`, decisionFingerprint: fingerprint,
+        requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
+      }));
+
+      const blocker = await pool.connect();
+      let blockerOpen = false;
+      let reconciliation: Promise<unknown> | undefined;
+      let buyClaim: Promise<unknown> | undefined;
+      try {
+        await blocker.query('BEGIN');
+        blockerOpen = true;
+        await blocker.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))', [
+          generationId,
+        ]);
+        reconciliation = fixture.live.commitReconciliation(fixture.claim, noEffect);
+        await waitForDatabaseQuery(pool, '%hashtextextended($1, 51005)%');
+
+        buyClaim = intents.claim({
+          ownerId: 'live-buy-during-sell-activation', leaseMs: 60_000,
+          purpose: 'LIVE_EXECUTE', side: 'BUY',
+        });
+        const outcome = await Promise.race([
+          buyClaim.then(() => 'CLAIM_SETTLED' as const),
+          waitForDatabaseQuery(pool, '%execution-live-sell-presence:v1%')
+            .then(() => 'CLAIM_BLOCKED' as const),
+        ]);
+        assert.equal(outcome, 'CLAIM_BLOCKED');
+
+        await blocker.query('COMMIT');
+        blockerOpen = false;
+        assert.equal((await reconciliation as { readonly result: string }).result, 'NO_EFFECT');
+        assert.equal(await buyClaim, null);
+      } finally {
+        if (blockerOpen) await blocker.query('ROLLBACK');
+        blocker.release();
+        await Promise.allSettled(
+          [reconciliation, buyClaim].filter((value) => value !== undefined),
+        );
+      }
+    });
+  });
+
+void test('SELL signed persistence fences a live BUY when PROCESSING expired during its lease',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      let raceExercised = false;
+      await createSellFixture(pool, 'AMBIGUOUS', async (live, input) => {
+        const expired = await pool.query(`UPDATE execution_intents SET
+          expires_at=date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 millisecond'
+          WHERE id=$1 AND status='PROCESSING'
+          RETURNING expires_at < statement_timestamp() AS expired`, [input.artifact.intentId]);
+        assert.deepEqual(expired.rows, [{ expired: true }]);
+
+        const intents = new PostgresExecutionIntentRepository(pool);
+        const nowMs = Date.now();
+        await intents.create(createExecutionIntentDraft({
+          strategyId: 'sell-persist-race-test', strategyVersion: 1,
+          positionId: `position:${randomUUID()}`, logicalCommandId: `command:${randomUUID()}`,
+          mint: walletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
+          quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1n,
+          baseAmountRaw: null, minimumAmountOutRaw: 1n,
+          decisionEventId: `decision:${randomUUID()}`, decisionFingerprint: fingerprint,
+          requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
+        }));
+
+        const blocker = await pool.connect();
+        let blockerOpen = false;
+        let persistence: Promise<unknown> | undefined;
+        let buyClaim: Promise<unknown> | undefined;
+        try {
+          await blocker.query('BEGIN');
+          blockerOpen = true;
+          await blocker.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))', [
+            generationId,
+          ]);
+          persistence = live.persistSigned(input);
+          await waitForDatabaseQuery(pool, '%hashtextextended($1, 51005)%');
+
+          buyClaim = intents.claim({
+            ownerId: 'live-buy-during-sell-persist', leaseMs: 60_000,
+            purpose: 'LIVE_EXECUTE', side: 'BUY',
+          });
+          const outcome = await Promise.race([
+            buyClaim.then(() => 'CLAIM_SETTLED' as const),
+            waitForDatabaseQuery(pool, '%execution-live-sell-presence:v1%')
+              .then(() => 'CLAIM_BLOCKED' as const),
+          ]);
+          assert.equal(outcome, 'CLAIM_BLOCKED');
+
+          await blocker.query('COMMIT');
+          blockerOpen = false;
+          await persistence;
+          assert.equal(await buyClaim, null);
+          raceExercised = true;
+        } finally {
+          if (blockerOpen) await blocker.query('ROLLBACK');
+          blocker.release();
+          await Promise.allSettled(
+            [persistence, buyClaim].filter((value) => value !== undefined),
+          );
+          await pool.query(`UPDATE execution_intents SET
+            expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '60 seconds'
+            WHERE id=$1`, [input.artifact.intentId]);
+        }
+      });
+      assert.equal(raceExercised, true);
+    });
+  });
+
 void test('SELL UNKNOWN then MATCHED closes the only position and consumes capabilities',
   async (context) => {
     const databaseUrl = requiredDatabaseUrl(context);
@@ -440,6 +569,10 @@ async function createAmbiguousSellFixture(pool: InstanceType<typeof pg.Pool>) {
 async function createSellFixture(
   pool: InstanceType<typeof pg.Pool>,
   submissionState: 'AMBIGUOUS' | 'ACCEPTED' | 'CONFIRMED',
+  beforePersistSigned?: (
+    live: PostgresExecutionLiveRepository,
+    input: Parameters<PostgresExecutionLiveRepository['persistSigned']>[0],
+  ) => Promise<void>,
 ) {
   await migrateDatabase({ pool });
   const buy = await createBuyFixture(pool);
@@ -457,7 +590,7 @@ async function createSellFixture(
     expectedRevision: buySimulated.stateRevision, runtime: buy.runtime,
     blockhashValidity: blockhashValidity(buy.artifact, Date.now()),
   });
-  const buyOutcomeAtMs = Date.now() + 1_000;
+  const buyOutcomeAtMs = Date.now();
   await live.recordSubmissionOutcome(buy.claim, {
     payloadVersion: 1, artifactId: buy.artifact.artifactId,
     expectedRevision: buyStarted.stateRevision, outcome: 'ACCEPTED',
@@ -467,8 +600,9 @@ async function createSellFixture(
   await live.recordConfirmation(buy.claim, {
     payloadVersion: 1, artifactId: buy.artifact.artifactId, expectedRevision: 3n,
     signature: buy.artifact.signature, observedSlot: 126n,
-    observedAtMs: buyOutcomeAtMs + 1_000,
+    observedAtMs: Date.now(),
   });
+  const buyReconciliationAtMs = Date.now();
   const buyEvidence = evaluateExecutionReconciliation({
     expected: Object.freeze({
       intentId: buy.artifact.intentId, attemptNumber: 1, walletGeneration: 1,
@@ -491,15 +625,16 @@ async function createSellFixture(
       }),
       feeLamports: 5_000n, walletLamportDelta: -5_000n,
       baseDeltaRaw: 95n, quoteDeltaRaw: -1_000n,
-      unexpectedResidualTokenBalanceRaw: 0n, observedAtMs: buyOutcomeAtMs + 2_000,
-      finalizedAtMs: buyOutcomeAtMs + 3_000,
+      unexpectedResidualTokenBalanceRaw: 0n, observedAtMs: buyReconciliationAtMs,
+      finalizedAtMs: buyReconciliationAtMs,
     }),
   });
   const entry = await live.commitReconciliation(buy.claim, buyEvidence);
   assert.ok(entry.position);
   assert.ok(entry.exitAuthorization);
+  const exitDeadlineAtMs = await makePositionDue(pool, entry.position.positionId);
   const exit = await live.createDeadlineExitIntent({
-    positionId: entry.position.positionId, observedAtMs: entry.position.exitDeadlineAtMs,
+    positionId: entry.position.positionId, observedAtMs: exitDeadlineAtMs,
   });
   assert.ok(exit.intent);
   const intents = new PostgresExecutionIntentRepository(pool);
@@ -514,7 +649,7 @@ async function createSellFixture(
     humanMessage: 'Prepare the canary SELL.', activationPhase: 'CANARY',
     evidence: Object.freeze({
       payloadVersion: 1, attemptNumber: null, sourceEventId: null,
-      observedAtMs: entry.position.exitDeadlineAtMs,
+      observedAtMs: exitDeadlineAtMs,
     }),
   });
   const begun = await intents.beginAttempt(Object.freeze({ ...exitClaim, intent: processing }));
@@ -541,10 +676,12 @@ async function createSellFixture(
     simulatedBaseDeltaRaw: -95n, simulatedQuoteDeltaRaw: 800n,
     logsFingerprint: 'f'.repeat(64), logsLineCount: 1,
   });
-  await live.persistSigned({
+  const persistInput = Object.freeze({
     payloadVersion: 1, claim: begun.claim, qualificationId: buy.qualificationId,
     reservationId: null, artifact, unsignedSimulation,
   });
+  await beforePersistSigned?.(live, persistInput);
+  await live.persistSigned(persistInput);
   const simulated = await live.recordSignedSimulation(
     begun.claim,
     signedSimulation(artifact, unsignedSimulation, -95n, 800n, artifact.signedAtMs + 1),
@@ -554,7 +691,7 @@ async function createSellFixture(
     expectedRevision: simulated.stateRevision, runtime: buy.runtime,
     blockhashValidity: blockhashValidity(artifact, Date.now()),
   });
-  const sellOutcomeAtMs = Date.now() + 1_000;
+  const sellOutcomeAtMs = Date.now();
   await live.recordSubmissionOutcome(begun.claim, {
     payloadVersion: 1, artifactId: artifact.artifactId,
     expectedRevision: started.stateRevision,
@@ -574,8 +711,28 @@ async function createSellFixture(
   return Object.freeze({
     live, claim: begun.claim, artifact, unsignedSimulation,
     buyClaim: buy.claim, buyEvidence,
-    observedAtMs: entry.position.exitDeadlineAtMs + 1_000,
+    observedAtMs: Date.now(),
   });
+}
+
+async function makePositionDue(
+  pool: InstanceType<typeof pg.Pool>,
+  positionId: string,
+): Promise<number> {
+  await pool.query(`ALTER TABLE execution_live_positions
+    DISABLE TRIGGER execution_live_positions_guarded_update`);
+  const updated = await pool.query(`UPDATE execution_live_positions SET
+    exit_deadline_at=date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 second',
+    opened_at=date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 second'
+      -(maximum_holding_ms*INTERVAL '1 millisecond')
+    WHERE position_id=$1
+    RETURNING trunc(EXTRACT(EPOCH FROM exit_deadline_at)*1000)::TEXT AS deadline_ms`, [
+    positionId,
+  ]);
+  assert.equal(updated.rowCount, 1);
+  const deadlineMs = updated.rows[0]?.deadline_ms;
+  assert.equal(typeof deadlineMs, 'string');
+  return Number(deadlineMs);
 }
 
 function blockhashValidity(
@@ -832,6 +989,20 @@ function requiredDatabaseUrl(context: TestContext): string | null {
     return null;
   }
   return databaseUrl;
+}
+
+async function waitForDatabaseQuery(
+  pool: InstanceType<typeof pg.Pool>,
+  pattern: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const result = await pool.query(`SELECT 1 FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid() AND state='active' AND wait_event IS NOT NULL
+        AND query ILIKE $1 LIMIT 1`, [pattern]);
+    if (result.rowCount === 1) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`Timed out waiting for blocked PostgreSQL query matching ${pattern}.`);
 }
 
 async function withTemporarySchema(

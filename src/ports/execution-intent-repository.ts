@@ -7,6 +7,19 @@ import type {
 
 export type ExecutionClaimPurpose = 'EXECUTE' | 'CONFIRM' | 'RECONCILE' | 'DRY_RUN';
 
+export type ExecutionClaimOptions =
+  | Readonly<{
+      ownerId: string;
+      leaseMs: number;
+      purpose: 'LIVE_EXECUTE';
+      side: 'BUY' | 'SELL';
+    }>
+  | Readonly<{
+      ownerId: string;
+      leaseMs: number;
+      purpose: 'LIVE_RECOVER' | 'CONFIRM' | 'RECONCILE' | 'EXECUTE' | 'DRY_RUN';
+    }>;
+
 export interface ClaimedExecutionIntent {
   readonly intent: ExecutionIntentV1;
   readonly leaseOwner: string;
@@ -49,11 +62,7 @@ export interface ExecutionIntentRepository {
     readonly kind: 'CREATED' | 'REPLAYED';
     readonly intent: ExecutionIntentV1;
   }>>;
-  claim(options: Readonly<{
-    readonly ownerId: string;
-    readonly leaseMs: number;
-    readonly purpose: ExecutionClaimPurpose;
-  }>, signal?: AbortSignal): Promise<ClaimedExecutionIntent | null>;
+  claim(options: ExecutionClaimOptions, signal?: AbortSignal): Promise<ClaimedExecutionIntent | null>;
   beginAttempt(claim: ClaimedExecutionIntent): Promise<ExecutionBeginAttemptResult>;
   finishAttempt(claim: ClaimedExecutionIntent, input: Readonly<{
     readonly attemptNumber: number;

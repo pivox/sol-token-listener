@@ -14,6 +14,7 @@ import {
 import type {
   ClaimedExecutionIntent,
   ExecutionBeginAttemptResult,
+  ExecutionClaimOptions,
   ExecutionClaimPurpose,
   ExecutionIntentRepository,
   ExecutionIntentTransitionEvidenceV1,
@@ -45,6 +46,9 @@ interface ExecutionIntentClient extends ExecutionIntentTransactionClient {
 export interface ExecutionIntentPool {
   connect(): Promise<ExecutionIntentClient>;
 }
+
+const LIVE_SELL_PRESENCE_LOCK_SQL = `SELECT pg_advisory_xact_lock(
+  hashtextextended('execution-live-sell-presence:v1', 51008))`;
 
 export type ExecutionIntentRepositoryErrorCode =
   | 'INVALID_INPUT'
@@ -88,6 +92,9 @@ const DRAFT_KEYS = Object.freeze([
 ] as const);
 
 const CLAIM_OPTION_KEYS = Object.freeze(['ownerId', 'leaseMs', 'purpose'] as const);
+const LIVE_EXECUTE_CLAIM_OPTION_KEYS = Object.freeze([
+  'ownerId', 'leaseMs', 'purpose', 'side',
+] as const);
 const CLAIM_KEYS = Object.freeze([
   'intent', 'leaseOwner', 'leaseToken', 'leaseExpiresAtMs',
 ] as const);
@@ -173,11 +180,25 @@ const CLAIM_SQL: Readonly<Record<ExecutionClaimPurpose, string>> = Object.freeze
   ),
   CONFIRM: claimSql("intent.status IN ('SUBMITTED')", false),
   RECONCILE: claimSql(`intent.status IN (
-    'SIGNED_NOT_SUBMITTED', 'CONFIRMED', 'RECONCILING',
-    'UNKNOWN_REQUIRES_RECONCILIATION'
+    'CONFIRMED', 'RECONCILING', 'UNKNOWN_REQUIRES_RECONCILIATION'
   )`, false),
   DRY_RUN: dryRunClaimSql(),
 });
+const LIVE_EXECUTE_SELL_SQL = claimSql(`intent.side = 'SELL'
+      AND intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')`, true);
+const LIVE_EXECUTE_BUY_SQL = claimSql(`intent.side = 'BUY'
+      AND intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM execution_intents AS blocking_sell
+        WHERE blocking_sell.side = 'SELL'
+          AND (
+            (blocking_sell.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')
+              AND blocking_sell.expires_at > statement_timestamp())
+            OR blocking_sell.status = 'SIGNED_NOT_SUBMITTED'
+          )
+      )`, true);
+const LIVE_RECOVER_SQL = claimSql("intent.status = 'SIGNED_NOT_SUBMITTED'", false);
 
 export async function createExecutionIntentInTransaction(
   client: ExecutionIntentTransactionClient,
@@ -187,6 +208,7 @@ export async function createExecutionIntentInTransaction(
   readonly intent: ExecutionIntentV1;
 }>> {
   const draft = draftInput(draftValue);
+  if (draft.side === 'SELL') await lockLiveSellPresenceInTransaction(client);
   const inserted = await client.query(
     `INSERT INTO execution_intents AS intent (
        id,payload_version,logical_order_key,strategy_id,strategy_version,
@@ -237,6 +259,12 @@ export async function createExecutionIntentInTransaction(
   return createResult('REPLAYED', stored);
 }
 
+export async function lockLiveSellPresenceInTransaction(
+  client: ExecutionIntentTransactionClient,
+): Promise<void> {
+  await client.query(LIVE_SELL_PRESENCE_LOCK_SQL);
+}
+
 export class PostgresExecutionIntentRepository implements ExecutionIntentRepository {
   public constructor(
     private readonly pool: ExecutionIntentPool = getDatabasePool(),
@@ -251,18 +279,19 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     });
   }
 
-  public async claim(optionsValue: Readonly<{
-    readonly ownerId: string;
-    readonly leaseMs: number;
-    readonly purpose: ExecutionClaimPurpose;
-  }>, signal?: AbortSignal): Promise<ClaimedExecutionIntent | null> {
+  public async claim(
+    optionsValue: ExecutionClaimOptions,
+    signal?: AbortSignal,
+  ): Promise<ClaimedExecutionIntent | null> {
     return this.safely(async () => {
       const options = claimOptions(optionsValue);
       if (signal?.aborted === true) throw operationAbortedError();
       const leaseToken = randomUUID();
-      return this.withClaimClient(signal, options.purpose === 'DRY_RUN', async (client) => {
+      const claimFromClient = async (
+        client: ExecutionIntentClient,
+      ): Promise<ClaimedExecutionIntent | null> => {
         const claimed = await client.query(
-          CLAIM_SQL[options.purpose],
+          claimSqlFor(options),
           [options.ownerId, options.leaseMs, leaseToken],
         );
         if (claimed.rowCount === 0 && claimed.rows.length === 0) return null;
@@ -271,14 +300,23 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         if (claim.leaseOwner !== options.ownerId || claim.leaseToken !== leaseToken) {
           throw dataError();
         }
-        if (!statusMatchesPurpose(claim.intent.status, options.purpose)) throw dataError();
+        if (!intentMatchesClaimOptions(claim.intent, options)) throw dataError();
         if (claim.leaseExpiresAtMs - claimAtMs !== options.leaseMs) throw dataError();
-        if (options.purpose === 'EXECUTE' && claim.intent.expiresAtMs <= claimAtMs) throw dataError();
+        if ((options.purpose === 'EXECUTE' || options.purpose === 'LIVE_EXECUTE')
+          && claim.intent.expiresAtMs <= claimAtMs) throw dataError();
         if (options.purpose === 'DRY_RUN' && claim.intent.expiresAtMs <= claim.leaseExpiresAtMs) {
           throw dataError();
         }
         return claim;
-      });
+      };
+      if (options.purpose === 'LIVE_EXECUTE' && options.side === 'BUY') {
+        return this.transaction(async (client) => {
+          await lockLiveSellPresenceInTransaction(client);
+          if (signal?.aborted === true) throw operationAbortedError();
+          return claimFromClient(client);
+        }, signal, 'READ_COMMITTED');
+      }
+      return this.withClaimClient(signal, options.purpose === 'DRY_RUN', claimFromClient);
     });
   }
 
@@ -476,6 +514,11 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const claim = claimedInput(claimValue);
       const input = transitionInput(inputValue, claim);
       return this.transaction(async (client) => {
+        if (claim.intent.side === 'SELL'
+          && claim.intent.status === 'UNKNOWN_REQUIRES_RECONCILIATION'
+          && input.nextStatus === 'RETRY_READY') {
+          await lockLiveSellPresenceInTransaction(client);
+        }
         const locked = await lockClaimedIntent(client, claim);
         if (locked.intent.stateRevision === INT64_MAX) throw dataError();
         if ((locked.intent.attemptCount === 0) !== (input.evidence.attemptNumber === null)
@@ -628,6 +671,8 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
 
   private async transaction<TResult>(
     run: (client: ExecutionIntentClient) => Promise<TResult>,
+    signal?: AbortSignal,
+    isolationLevel?: 'READ_COMMITTED',
   ): Promise<TResult> {
     let client: ExecutionIntentClient;
     try {
@@ -635,6 +680,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     } catch {
       throw databaseError(1);
     }
+    if (signal?.aborted === true) abortBeforeClaim(client);
     let transactionStarted = false;
     let primaryFailure: unknown;
     let result: TResult | undefined;
@@ -643,7 +689,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
     let evict = false;
     try {
       transactionStarted = true;
-      await client.query('BEGIN');
+      await client.query(isolationLevel === 'READ_COMMITTED'
+        ? 'BEGIN ISOLATION LEVEL READ COMMITTED'
+        : 'BEGIN');
       result = await run(client);
       await client.query('COMMIT');
       transactionStarted = false;
@@ -771,6 +819,18 @@ function claimSql(statusPredicate: string, requireLiveIntent: boolean): string {
   FROM candidate CROSS JOIN operation
   WHERE intent.id=candidate.id
   RETURNING ${CLAIM_PROJECTION}`;
+}
+
+function claimSqlFor(options: ExecutionClaimOptions): string {
+  switch (options.purpose) {
+    case 'LIVE_EXECUTE':
+      return options.side === 'SELL' ? LIVE_EXECUTE_SELL_SQL : LIVE_EXECUTE_BUY_SQL;
+    case 'LIVE_RECOVER': return LIVE_RECOVER_SQL;
+    case 'EXECUTE': return CLAIM_SQL.EXECUTE;
+    case 'CONFIRM': return CLAIM_SQL.CONFIRM;
+    case 'RECONCILE': return CLAIM_SQL.RECONCILE;
+    case 'DRY_RUN': return CLAIM_SQL.DRY_RUN;
+  }
 }
 
 function dryRunClaimSql(): string {
@@ -921,15 +981,27 @@ function draftInput(value: unknown): ExecutionIntentDraftV1 {
   return draft as ExecutionIntentDraftV1;
 }
 
-function claimOptions(value: unknown): Readonly<{
-  readonly ownerId: string;
-  readonly leaseMs: number;
-  readonly purpose: ExecutionClaimPurpose;
-}> {
-  const row = exactRecord(value, CLAIM_OPTION_KEYS, 'INVALID_INPUT');
+function claimOptions(value: unknown): ExecutionClaimOptions {
+  let hasSide: boolean;
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value)) {
+      throw new Error();
+    }
+    hasSide = Reflect.ownKeys(value).includes('side');
+  } catch { throw inputError(); }
+  const row = exactRecord(
+    value,
+    hasSide ? LIVE_EXECUTE_CLAIM_OPTION_KEYS : CLAIM_OPTION_KEYS,
+    'INVALID_INPUT',
+  );
   const ownerId = boundedText(row.ownerId, 'INVALID_INPUT');
   const leaseMs = positiveInteger(row.leaseMs, MAX_LEASE_MS, 'INVALID_INPUT');
   const purpose = claimPurpose(row.purpose);
+  if (purpose === 'LIVE_EXECUTE') {
+    if (!hasSide || (row.side !== 'BUY' && row.side !== 'SELL')) throw inputError();
+    return Object.freeze({ ownerId, leaseMs, purpose, side: row.side });
+  }
+  if (hasSide) throw inputError();
   return Object.freeze({ ownerId, leaseMs, purpose });
 }
 
@@ -1326,24 +1398,32 @@ function evidenceJson(evidence: ExecutionIntentTransitionEvidenceV1): string {
   });
 }
 
-function claimPurpose(value: unknown): ExecutionClaimPurpose {
-  if (value !== 'EXECUTE' && value !== 'CONFIRM' && value !== 'RECONCILE' && value !== 'DRY_RUN') {
+function claimPurpose(value: unknown): ExecutionClaimOptions['purpose'] {
+  if (value !== 'LIVE_EXECUTE' && value !== 'LIVE_RECOVER'
+    && value !== 'EXECUTE' && value !== 'CONFIRM'
+    && value !== 'RECONCILE' && value !== 'DRY_RUN') {
     throw inputError();
   }
   return value;
 }
 
-function statusMatchesPurpose(
-  value: ExecutionIntentStatus,
-  purpose: ExecutionClaimPurpose,
+function intentMatchesClaimOptions(
+  intent: ExecutionIntentV1,
+  options: ExecutionClaimOptions,
 ): boolean {
-  if (purpose === 'EXECUTE') {
-    return value === 'PENDING' || value === 'RETRY_READY' || value === 'PROCESSING';
+  const status = intent.status;
+  if (options.purpose === 'LIVE_EXECUTE') {
+    return intent.side === options.side
+      && (status === 'PENDING' || status === 'RETRY_READY' || status === 'PROCESSING');
   }
-  if (purpose === 'CONFIRM') return value === 'SUBMITTED';
-  if (purpose === 'DRY_RUN') return value === 'PENDING' || value === 'RETRY_READY';
-  return value === 'SIGNED_NOT_SUBMITTED' || value === 'CONFIRMED'
-    || value === 'RECONCILING' || value === 'UNKNOWN_REQUIRES_RECONCILIATION';
+  if (options.purpose === 'EXECUTE') {
+    return status === 'PENDING' || status === 'RETRY_READY' || status === 'PROCESSING';
+  }
+  if (options.purpose === 'LIVE_RECOVER') return status === 'SIGNED_NOT_SUBMITTED';
+  if (options.purpose === 'CONFIRM') return status === 'SUBMITTED';
+  if (options.purpose === 'DRY_RUN') return status === 'PENDING' || status === 'RETRY_READY';
+  return status === 'CONFIRMED' || status === 'RECONCILING'
+    || status === 'UNKNOWN_REQUIRES_RECONCILIATION';
 }
 
 function status(

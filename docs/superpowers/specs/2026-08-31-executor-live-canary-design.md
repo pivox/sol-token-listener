@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.13
+**Version de spécification :** 1.0.17
 
-**Version de la spécification parente :** 1.7.13
+**Version de la spécification parente :** 1.7.17
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,24 @@
 
 ## Historique des versions
 
+- **1.0.17 — 2026-09-04 :** étend le verrou de priorité SELL aux
+  persistances signées et aux réactivations
+  `UNKNOWN_REQUIRES_RECONCILIATION -> RETRY_READY`, notamment la réconciliation
+  SELL `NO_EFFECT`, avant tout verrou génération ou métier.
+- **1.0.16 — 2026-09-04 :** sérialise la priorité SELL avec un verrou advisory
+  partagé par toutes les créations SELL et les claims BUY live. Un BUY ne peut
+  plus observer l'absence d'un SELL dont l'insertion concurrente n'est pas
+  encore commitée ; son `READ COMMITTED` explicite neutralise aussi un défaut
+  de session PostgreSQL configuré en `REPEATABLE READ`.
+- **1.0.15 — 2026-09-01 :** durcit les primitives H1 sans composer de runtime :
+  identité d'artefact recalculée depuis les champs causaux, valeurs Solana
+  décodées canoniquement, matrice d'états fermée et temps de deadline borné par
+  une horloge PostgreSQL fraîche avec rejeu stable.
+- **1.0.14 — 2026-09-01 :** référence les primitives persistantes #51-H1 :
+  claims `LIVE_EXECUTE` par côté, reprise `LIVE_RECOVER`, read-models de
+  confirmation et réconciliation, et scan atomique des sorties à deadline.
+  Cette fondation ne compose ni RPC, ni signer, ni soumission, ni runtime de
+  production ; l'entrypoint et le canary manuel restent différés à #51-H2.
 - **1.0.13 — 2026-09-01 :** remplace les verrous de lignes incompatibles avec
   les tables de preuve en lecture seule par les verrous advisory génération et
   provider partagés par leurs writers. La réconciliation BUY revalide aussi le

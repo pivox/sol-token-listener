@@ -10,6 +10,7 @@ import {
 } from '../src/domain/execution-intent.js';
 import type {
   ClaimedExecutionIntent,
+  ExecutionClaimOptions,
   ExecutionClaimPurpose,
   ExecutionIntentTransitionInput,
 } from '../src/ports/execution-intent-repository.js';
@@ -120,8 +121,7 @@ void test('claim validates a closed purpose and preserves each selected business
     ['EXECUTE', 'PROCESSING', ['PENDING', 'RETRY_READY', 'PROCESSING']],
     ['CONFIRM', 'SUBMITTED', ['SUBMITTED']],
     ['RECONCILE', 'UNKNOWN_REQUIRES_RECONCILIATION', [
-      'SIGNED_NOT_SUBMITTED', 'CONFIRMED', 'RECONCILING',
-      'UNKNOWN_REQUIRES_RECONCILIATION',
+      'CONFIRMED', 'RECONCILING', 'UNKNOWN_REQUIRES_RECONCILIATION',
     ]],
     ['DRY_RUN', 'PENDING', ['PENDING', 'RETRY_READY']],
     ['DRY_RUN', 'RETRY_READY', ['PENDING', 'RETRY_READY']],
@@ -183,6 +183,90 @@ void test('claim validates a closed purpose and preserves each selected business
   const repository = new PostgresExecutionIntentRepository(pool);
   await expectCode(repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'OTHER' as never }), 'INVALID_INPUT');
   assert.equal(pool.connectCount, 0);
+});
+
+void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', async () => {
+  const cases: readonly Readonly<{
+    options: ExecutionClaimOptions;
+    status: ExecutionIntentStatus;
+    side: 'BUY' | 'SELL';
+  }>[] = [
+    {
+      options: { ownerId: 'worker-1', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'SELL' },
+      status: 'PROCESSING', side: 'SELL',
+    },
+    {
+      options: { ownerId: 'worker-1', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'BUY' },
+      status: 'PENDING', side: 'BUY',
+    },
+    {
+      options: { ownerId: 'worker-1', leaseMs: 30_000, purpose: 'LIVE_RECOVER' },
+      status: 'SIGNED_NOT_SUBMITTED', side: 'SELL',
+    },
+  ];
+  for (const { options, status, side } of cases) {
+    const draft = side === 'BUY'
+      ? executionDraft(`live-${options.purpose}-${side}`)
+      : executionDraft(`live-${options.purpose}-${side}`, {
+        side: 'SELL', venuePolicy: 'CANONICAL_EXIT',
+        quoteAmountRaw: null, baseAmountRaw: 1n,
+      });
+    const claimStep: Step = (_text, values) => result([{
+      ...claimRow(draft, status), lease_token: values?.[2],
+      claim_at_ms: String(NOW_MS),
+    }], 1);
+    const liveBuy = options.purpose === 'LIVE_EXECUTE' && options.side === 'BUY';
+    const client = new ScriptedClient(liveBuy
+      ? [command('BEGIN ISOLATION LEVEL READ COMMITTED'), result([], 1), claimStep, command('COMMIT')]
+      : [claimStep]);
+    const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+    const claim = await repository.claim(options);
+
+    assert.ok(claim);
+    assert.equal(claim.intent.side, side);
+    assert.equal(claim.intent.status, status);
+    const claimCall = required(client.calls.find((call) => call.text.includes(
+      'UPDATE execution_intents AS intent',
+    )));
+    const sql = claimCall.text;
+    if (options.purpose === 'LIVE_EXECUTE') {
+      assert.match(sql, new RegExp(`intent\\.side\\s*=\\s*'${options.side}'`, 'u'));
+      assert.match(sql, /intent\.status IN \('PENDING', 'RETRY_READY', 'PROCESSING'\)/u);
+      assert.match(sql, /intent\.expires_at\s*>\s*statement_timestamp\(\)/u);
+      if (options.side === 'BUY') {
+        assert.equal(client.calls[0]?.text, 'BEGIN ISOLATION LEVEL READ COMMITTED');
+        assert.match(client.calls[1]?.text ?? '', /execution-live-sell-presence:v1/u);
+        assert.equal(client.calls.at(-1)?.text, 'COMMIT');
+        assert.match(sql, /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_intents AS blocking_sell/su);
+        assert.match(sql, /blocking_sell\.side\s*=\s*'SELL'/u);
+        assert.match(sql, /blocking_sell\.status\s*=\s*'SIGNED_NOT_SUBMITTED'/u);
+        const blockingPredicate = required(/NOT EXISTS\s*\(([\s\S]*?)\)\s*AND\s*\(intent\.lease_expires_at/u.exec(sql)?.[1]);
+        assert.doesNotMatch(blockingPredicate, /blocking_sell\.lease_expires_at/u);
+      } else {
+        assert.doesNotMatch(sql, /blocking_sell/u);
+      }
+    } else {
+      assert.match(sql, /intent\.status\s*=\s*'SIGNED_NOT_SUBMITTED'/u);
+      assert.doesNotMatch(sql, /intent\.expires_at\s*>\s*statement_timestamp\(\)/u);
+      assert.doesNotMatch(sql, /intent\.side\s*=/u);
+    }
+  }
+});
+
+void test('live claim options are closed and rejected before connecting', async () => {
+  const invalid: readonly unknown[] = [
+    { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_EXECUTE' },
+    { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'OTHER' },
+    { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_RECOVER', side: 'SELL' },
+    { ownerId: 'worker', leaseMs: 30_000, purpose: 'EXECUTE', side: 'BUY' },
+  ];
+  for (const options of invalid) {
+    const pool = new ScriptedPool(new ScriptedClient([]));
+    const repository = new PostgresExecutionIntentRepository(pool);
+    await expectCode(repository.claim(options as never), 'INVALID_INPUT');
+    assert.equal(pool.connectCount, 0);
+  }
 });
 
 void test('DRY_RUN rejects equality at the lease-expiry boundary and hostile claim rows evict the client', async () => {
@@ -269,6 +353,47 @@ void test('claim cancellation fences connect without dispatching SQL and preserv
     assert.equal(client.calls.length, 0);
     assert.deepEqual(client.releaseErrors, [undefined]);
   });
+
+  await context.test('LIVE_EXECUTE BUY aborts after its advisory wait without dispatching claim SQL',
+    async () => {
+      const controller = new AbortController();
+      const lockStarted = deferred<true>();
+      const lockGate = deferred<QueryResult>();
+      const calls: string[] = [];
+      const releaseErrors: (boolean | undefined)[] = [];
+      const repository = new PostgresExecutionIntentRepository({
+        connect: async () => ({
+          query: async (text: string) => {
+            calls.push(text);
+            if (text === 'BEGIN ISOLATION LEVEL READ COMMITTED' || text === 'ROLLBACK') {
+              return result([], null);
+            }
+            if (text.includes('execution-live-sell-presence:v1')) {
+              lockStarted.resolve(true);
+              return lockGate.promise;
+            }
+            assert.fail(`Claim SQL was dispatched after cancellation: ${text}`);
+          },
+          release: (error?: boolean) => { releaseErrors.push(error); },
+        }),
+      });
+      const pending = repository.claim({
+        ownerId: 'live-buy-cancelled-after-lock-wait', leaseMs: 30_000,
+        purpose: 'LIVE_EXECUTE', side: 'BUY',
+      }, controller.signal);
+      await lockStarted.promise;
+      controller.abort();
+      lockGate.resolve(result([], 1));
+
+      await expectCode(pending, 'OPERATION_ABORTED');
+      assert.deepEqual(calls, [
+        'BEGIN ISOLATION LEVEL READ COMMITTED',
+        calls[1],
+        'ROLLBACK',
+      ]);
+      assert.match(calls[1] ?? '', /execution-live-sell-presence:v1/u);
+      assert.deepEqual(releaseErrors, [false]);
+    });
 
   await context.test('connect and abort-cleanup failures remain database failures', async () => {
     const connectController = new AbortController();
@@ -1275,7 +1400,9 @@ void test('transition accepts exact no-effect proof for UNKNOWN and persists ter
 });
 
 void test('transition accepts exact no-effect proof before making UNKNOWN retryable', async () => {
-  const draft = executionDraft('proved-retry-safe');
+  const draft = executionDraft('proved-retry-safe', {
+    side: 'SELL', venuePolicy: 'CANONICAL_EXIT', quoteAmountRaw: null, baseAmountRaw: 1n,
+  });
   const claim = claimedIntent(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0);
   const retryReady = claimRow(draft, 'RETRY_READY', 0);
   Object.assign(retryReady, {
@@ -1283,7 +1410,8 @@ void test('transition accepts exact no-effect proof before making UNKNOWN retrya
     updated_at_ms: String(NOW_MS + 1),
   });
   const client = new ScriptedClient([
-    command('BEGIN'), result([claimRow(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0)], 1),
+    command('BEGIN'), result([], 1),
+    result([claimRow(draft, 'UNKNOWN_REQUIRES_RECONCILIATION', 0)], 1),
     result([ledgerRow(0)], 1), result([], 1), result([retryReady], 1), command('COMMIT'),
   ]);
   const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
@@ -1296,7 +1424,8 @@ void test('transition accepts exact no-effect proof before making UNKNOWN retrya
   assert.equal(transitioned.status, 'RETRY_READY');
   assert.equal(transitioned.lastReasonCode, 'RECONCILIATION_PROVED_NO_EFFECT');
   assert.equal(transitioned.reconciliationCompletedAtMs, null);
-  assert.equal(required(client.calls[3]).values?.[3], 'RECONCILIATION_PROVED_NO_EFFECT');
+  assert.match(required(client.calls[1]).text, /execution-live-sell-presence:v1/u);
+  assert.equal(required(client.calls[4]).values?.[3], 'RECONCILIATION_PROVED_NO_EFFECT');
 });
 
 void test('a purged logical order cannot be recreated with fresh evidence and timestamps', async (context) => {
@@ -1430,6 +1559,256 @@ void test('create racing a locked purge fails closed on the committed tombstone'
     )).rows[0]?.count, 1);
   });
 });
+
+void test('real PostgreSQL enforces live SELL priority, recovery, and reconciliation claims', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: live lane claim integration skipped');
+    return;
+  }
+
+  await withTemporarySchema(databaseUrl, 'execution_live_lane_claims', async (
+    firstPool,
+    secondPool,
+  ) => {
+    await migrateDatabase({ pool: firstPool });
+    const first = new PostgresExecutionIntentRepository(firstPool);
+    const second = new PostgresExecutionIntentRepository(secondPool);
+    const now = await databaseNowMs(firstPool);
+    const sellShape = Object.freeze({
+      side: 'SELL' as const,
+      venuePolicy: 'CANONICAL_EXIT' as const,
+      quoteAmountRaw: null,
+      baseAmountRaw: 1n,
+    });
+
+    const oldestBuy = executionDraft('live-priority-buy', {
+      requestedAtMs: now - 3_000, expiresAtMs: now + 120_000,
+    });
+    const oldestSell = executionDraft('live-priority-sell-oldest', {
+      ...sellShape, requestedAtMs: now - 2_000, expiresAtMs: now + 120_000,
+    });
+    const newestSell = executionDraft('live-priority-sell-newest', {
+      ...sellShape, requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+    });
+    await first.create(oldestBuy);
+    await first.create(newestSell);
+    await first.create(oldestSell);
+
+    const firstSellClaim = required(await first.claim({
+      ownerId: 'live-sell-a', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'SELL',
+    }));
+    assert.equal(firstSellClaim.intent.id, oldestSell.id);
+    assert.equal(await second.claim({
+      ownerId: 'live-buy-blocked-a', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+    }), null);
+    assert.equal(await first.release(firstSellClaim), true);
+    await firstPool.query('DELETE FROM execution_intents WHERE id=$1', [oldestSell.id]);
+
+    const secondSellClaim = required(await second.claim({
+      ownerId: 'live-sell-b', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'SELL',
+    }));
+    assert.equal(secondSellClaim.intent.id, newestSell.id);
+    assert.equal(await first.claim({
+      ownerId: 'live-buy-blocked-b', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+    }), null);
+    await firstPool.query('DELETE FROM execution_intents WHERE id=$1', [newestSell.id]);
+    const buyClaim = required(await first.claim({
+      ownerId: 'live-buy', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+    }));
+    assert.equal(buyClaim.intent.id, oldestBuy.id);
+    await firstPool.query('DELETE FROM execution_intents WHERE id=$1', [oldestBuy.id]);
+
+    const concurrentSell = executionDraft('live-concurrent-sell', {
+      ...sellShape, requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+    });
+    await first.create(concurrentSell);
+    const concurrent = await Promise.all([
+      first.claim({
+        ownerId: 'live-concurrent-a', leaseMs: 60_000,
+        purpose: 'LIVE_EXECUTE', side: 'SELL',
+      }),
+      second.claim({
+        ownerId: 'live-concurrent-b', leaseMs: 60_000,
+        purpose: 'LIVE_EXECUTE', side: 'SELL',
+      }),
+    ]);
+    assert.equal(concurrent.filter((claim) => claim !== null).length, 1);
+    assert.equal(required(concurrent.find((claim) => claim !== null)).intent.id, concurrentSell.id);
+    await firstPool.query('DELETE FROM execution_intents WHERE id=$1', [concurrentSell.id]);
+
+    const racedBuy = executionDraft('live-raced-buy', {
+      requestedAtMs: now - 2_000, expiresAtMs: now + 120_000,
+    });
+    const racedSell = executionDraft('live-raced-sell', {
+      ...sellShape, requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+    });
+    await first.create(racedBuy);
+    await first.create(racedSell);
+    const [racedBuyClaim, racedSellClaim] = await Promise.all([
+      first.claim({
+        ownerId: 'live-raced-buy-worker', leaseMs: 60_000,
+        purpose: 'LIVE_EXECUTE', side: 'BUY',
+      }),
+      second.claim({
+        ownerId: 'live-raced-sell-worker', leaseMs: 60_000,
+        purpose: 'LIVE_EXECUTE', side: 'SELL',
+      }),
+    ]);
+    assert.equal(racedBuyClaim, null);
+    assert.equal(racedSellClaim?.intent.id, racedSell.id);
+    await firstPool.query('DELETE FROM execution_intents WHERE id=ANY($1::TEXT[])', [[
+      racedBuy.id, racedSell.id,
+    ]]);
+
+    const recoverBlockingBuy = executionDraft('live-recover-blocked-buy', {
+      requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+    });
+    const expiredRecoverSell = executionDraft('live-recover-expired-sell', {
+      ...sellShape, requestedAtMs: now - 120_000, expiresAtMs: now - 60_000,
+    });
+    await first.create(recoverBlockingBuy);
+    await first.create(expiredRecoverSell);
+    await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
+      attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [
+      expiredRecoverSell.id,
+    ]);
+    const recoverClaim = required(await first.claim({
+      ownerId: 'live-recover', leaseMs: 60_000, purpose: 'LIVE_RECOVER',
+    }));
+    assert.equal(recoverClaim.intent.id, expiredRecoverSell.id);
+    assert.equal(recoverClaim.intent.status, 'SIGNED_NOT_SUBMITTED');
+    assert.equal(await second.claim({
+      ownerId: 'live-buy-blocked-recovery', leaseMs: 60_000,
+      purpose: 'LIVE_EXECUTE', side: 'BUY',
+    }), null);
+    assert.equal(await second.claim({
+      ownerId: 'reconcile-must-not-recover', leaseMs: 60_000, purpose: 'RECONCILE',
+    }), null);
+    await firstPool.query('DELETE FROM execution_intents WHERE id=ANY($1::TEXT[])', [[
+      recoverBlockingBuy.id, expiredRecoverSell.id,
+    ]]);
+
+    const reconciliationStatuses = [
+      ['SIGNED_NOT_SUBMITTED', 'SIGNATURE_PERSISTED'],
+      ['CONFIRMED', 'CONFIRMATION_OBSERVED'],
+      ['RECONCILING', 'RECONCILIATION_STARTED'],
+      ['UNKNOWN_REQUIRES_RECONCILIATION', 'RECONCILIATION_REQUIRED'],
+    ] as const;
+    const reconciliationDrafts: ExecutionIntentDraftV1[] = [];
+    for (const [index, [status, reason]] of reconciliationStatuses.entries()) {
+      const requestedAtMs = now - 240_000 + index * 1_000;
+      const draft = executionDraft(`live-reconcile-${status.toLowerCase()}`, {
+        requestedAtMs, expiresAtMs: requestedAtMs + 60_000,
+      });
+      reconciliationDrafts.push(draft);
+      await first.create(draft);
+      await firstPool.query(`UPDATE execution_intents SET status=$2,
+        attempt_count=1,last_reason_code=$3 WHERE id=$1`, [draft.id, status, reason]);
+    }
+
+    for (const expectedStatus of [
+      'CONFIRMED', 'RECONCILING', 'UNKNOWN_REQUIRES_RECONCILIATION',
+    ] as const) {
+      const claim = required(await first.claim({
+        ownerId: `reconcile-${expectedStatus.toLowerCase()}`,
+        leaseMs: 60_000,
+        purpose: 'RECONCILE',
+      }));
+      assert.equal(claim.intent.status, expectedStatus);
+    }
+    assert.equal(await first.claim({
+      ownerId: 'reconcile-empty', leaseMs: 60_000, purpose: 'RECONCILE',
+    }), null);
+    const signedRecovery = required(await second.claim({
+      ownerId: 'signed-recovery-only', leaseMs: 60_000, purpose: 'LIVE_RECOVER',
+    }));
+    assert.equal(signedRecovery.intent.status, 'SIGNED_NOT_SUBMITTED');
+    await firstPool.query('DELETE FROM execution_intents WHERE id=ANY($1::TEXT[])', [
+      reconciliationDrafts.map((draft) => draft.id),
+    ]);
+  });
+});
+
+void test('LIVE_EXECUTE BUY forces READ COMMITTED and observes an uncommitted SELL after its commit',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: live BUY versus SELL creation race skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, 'execution_live_buy_sell_creation_race', async (
+      firstPool,
+      secondPool,
+    ) => {
+      await migrateDatabase({ pool: firstPool });
+      const first = new PostgresExecutionIntentRepository(firstPool);
+      const buySession = await secondPool.connect();
+      await buySession.query(
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+      );
+      const second = new PostgresExecutionIntentRepository({
+        connect: async () => buySession,
+      });
+      const now = await databaseNowMs(firstPool);
+      const buy = executionDraft('live-buy-sell-creation-race-buy', {
+        requestedAtMs: now - 2_000, expiresAtMs: now + 120_000,
+      });
+      const sell = executionDraft('live-buy-sell-creation-race-sell', {
+        side: 'SELL', venuePolicy: 'CANONICAL_EXIT', quoteAmountRaw: null, baseAmountRaw: 1n,
+        requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
+      });
+      await first.create(buy);
+
+      const triggerLockKey = 5_100_092;
+      await firstPool.query(`CREATE FUNCTION block_live_sell_intent_insert()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        BEGIN
+          IF NEW.side = 'SELL' THEN
+            PERFORM pg_advisory_lock(${triggerLockKey});
+            PERFORM pg_advisory_unlock(${triggerLockKey});
+          END IF;
+          RETURN NEW;
+        END
+        $function$`);
+      await firstPool.query(`CREATE TRIGGER block_live_sell_intent_insert_trigger
+        AFTER INSERT ON execution_intents FOR EACH ROW
+        EXECUTE FUNCTION block_live_sell_intent_insert()`);
+
+      const blocker = await secondPool.connect();
+      let blockerLocked = false;
+      let sellCreation: Promise<unknown> | undefined;
+      let buyClaim: Promise<ClaimedExecutionIntent | null> | undefined;
+      try {
+        await blocker.query('SELECT pg_advisory_lock($1)', [triggerLockKey]);
+        blockerLocked = true;
+        sellCreation = first.create(sell);
+        await waitForDatabaseQuery(firstPool, '%INSERT INTO execution_intents AS intent%');
+
+        buyClaim = second.claim({
+          ownerId: 'live-buy-sell-creation-race-worker', leaseMs: 60_000,
+          purpose: 'LIVE_EXECUTE', side: 'BUY',
+        });
+        const outcome = await Promise.race([
+          buyClaim.then(() => 'CLAIM_SETTLED' as const),
+          waitForDatabaseQuery(firstPool, '%execution-live-sell-presence:v1%')
+            .then(() => 'CLAIM_BLOCKED' as const),
+        ]);
+        assert.equal(outcome, 'CLAIM_BLOCKED');
+
+        await blocker.query('SELECT pg_advisory_unlock($1)', [triggerLockKey]);
+        blockerLocked = false;
+        assert.equal((await sellCreation as { readonly kind: string }).kind, 'CREATED');
+        assert.equal(await buyClaim, null);
+      } finally {
+        if (blockerLocked) await blocker.query('SELECT pg_advisory_unlock($1)', [triggerLockKey]);
+        blocker.release();
+        await Promise.allSettled(
+          [sellCreation, buyClaim].filter((value) => value !== undefined),
+        );
+      }
+    });
+  });
 
 void test('real PostgreSQL provides replay, concurrent claims, near-boundary reclaim, attempts, and ordered lifecycle journal', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -2050,7 +2429,9 @@ function result(rows: readonly Row[], rowCount: number | null): QueryResult {
   return { rows, rowCount };
 }
 
-function command(expected: 'BEGIN' | 'COMMIT' | 'ROLLBACK'): Step {
+function command(
+  expected: 'BEGIN' | 'BEGIN ISOLATION LEVEL READ COMMITTED' | 'COMMIT' | 'ROLLBACK',
+): Step {
   return (text) => {
     assert.equal(text, expected);
     return result([], null);

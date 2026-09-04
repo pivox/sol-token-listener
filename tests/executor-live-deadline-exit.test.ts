@@ -4,6 +4,29 @@ import {
   createDeadlineExit,
   type DeadlineExitServiceDependencies,
 } from '../src/executor-live/deadline-exit.service.js';
+import type {
+  ExecutionDeadlineExitResultV1,
+  ExecutionLiveRepository,
+} from '../src/ports/execution-live-repository.js';
+
+/* eslint-disable @typescript-eslint/no-unnecessary-type-parameters */
+type Equal<Left, Right> = (
+  <Value>() => Value extends Left ? 1 : 2
+) extends (<Value>() => Value extends Right ? 1 : 2) ? true : false;
+/* eslint-enable @typescript-eslint/no-unnecessary-type-parameters */
+type Expect<Value extends true> = Value;
+type DeadlineScannerContract = Expect<Equal<
+  ExecutionLiveRepository['createNextDeadlineExitIntent'],
+  () => Promise<ExecutionDeadlineExitResultV1 | null>
+>>;
+void (null as never as DeadlineScannerContract);
+
+function compileTimeDeadlineScannerAssertions(repository: ExecutionLiveRepository): void {
+  void repository.createNextDeadlineExitIntent();
+  // @ts-expect-error the durable scanner accepts no caller-controlled clock or position.
+  void repository.createNextDeadlineExitIntent({ observedAtMs: 1, positionId: 'position' });
+}
+void compileTimeDeadlineScannerAssertions;
 
 void test('delegates one deterministic deadline exit request to durable storage', async () => {
   const calls: unknown[] = [];
