@@ -1,10 +1,10 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.1.5
+**Version de spécification :** 1.2.0
 
-**Version de la spécification parente :** 1.9.5
+**Version de la spécification parente :** 1.10.0
 
-**Version de la fondation live :** 1.0.17
+**Version de la fondation live :** 1.1.0
 
 **Date :** 2026-09-01
 
@@ -13,6 +13,11 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.2.0 — 2026-09-04 :** constate la composition H2b avec les quatre seules
+  lanes signables, dans l'ordre recover SELL, execute SELL, recover BUY,
+  execute BUY. Les primitives de finalité, confirmation, réconciliation et
+  deadline demeurent exécutées exclusivement par le binaire H2a séparé ;
+  l'armement opérateur et le canary demeurent réservés à H2c.
 - **1.1.5 — 2026-09-04 :** référence la clôture `NO_EFFECT` de H2a pour une
   absence finalisée après expiration ; les transactions H1 restent inchangées.
 - **1.1.4 — 2026-09-04 :** référence la compatibilité
@@ -103,10 +108,11 @@ PostgreSQL
 ```
 
 #51-H2a réutilise les seules primitives sans envoi pour composer un runtime de
-finalité read-only. #51-H2b réutilisera ensuite `LIVE_RECOVER` et les claims
-`LIVE_EXECUTE` dans l'exécutable signable séparé.
-Un canary Mainnet reste interdit avant la fusion de #51-H2, la validation de
-tous les gates compensatoires et un armement manuel distinct.
+finalité read-only. #51-H2b réutilise `LIVE_RECOVER` et les claims
+`LIVE_EXECUTE` dans l'exécutable signable séparé, sans importer les lanes H2a.
+Sa passe contient exactement recover SELL, execute SELL, recover BUY, execute
+BUY. #51-H2c reste propriétaire de la validation opérateur, de l'armement et de
+la préparation du canary Mainnet.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`.
 
@@ -363,10 +369,10 @@ présence et le comportement de la migration 037 dans une base vide et rejouée.
 
 #51-H1 est livrable uniquement si les quatre primitives persistantes sont
 testées sur PostgreSQL réel, les contrats antérieurs restent compatibles, la
-CI est verte et la documentation affirme encore :
+  CI est verte et la documentation affirme désormais :
 
 ```text
-LIVE_RUNTIME_NOT_COMPOSED
+LIVE_SIGNABLE_RUNTIME_COMPOSED
 CANARY_NOT_STARTED
 NON_EXECUTED / NON_VALIDATED
 ```

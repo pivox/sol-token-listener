@@ -1417,6 +1417,60 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
   });
 });
 
+void test('preparation binding resolves the exact BUY authority from the active claim',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: preparation binding integration skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await liveFixture(pool);
+      const binding = await new PostgresExecutionLiveRepository(pool).readPreparationBinding({
+        claim: fixture.claim,
+        generationId,
+        runtime: submissionPreflight(fixture.artifact).runtime,
+      });
+
+      assert.deepEqual(binding, {
+        payloadVersion: 1,
+        side: 'BUY',
+        generationId,
+        qualificationId: fixture.qualificationId,
+        armamentId: fixture.armamentId,
+        reservationId: fixture.reservationId,
+        exitAuthorizationId: null,
+        providerId: fixture.artifact.providerId,
+        walletPublicKey: fixture.artifact.walletPublicKey,
+      });
+
+      const baseline = submissionPreflight(fixture.artifact).runtime;
+      await assert.rejects(
+        new PostgresExecutionLiveRepository(pool).readPreparationBinding({
+          claim: fixture.claim,
+          generationId,
+          runtime: Object.freeze({ ...baseline, buildHash: 'f'.repeat(64) }),
+        }),
+        isLiveRepositoryError('PREFLIGHT_EXPIRED'),
+      );
+      await new PostgresExecutionOperationsRepository(pool).setStop({
+        payloadVersion: 1,
+        commandId: `command:preparation-stop:${randomUUID()}`,
+        generationId,
+        operatorId: 'operator-primary',
+        occurredAtMs: Date.now(),
+      }, 'ENTRY_STOP');
+      await assert.rejects(
+        new PostgresExecutionLiveRepository(pool).readPreparationBinding({
+          claim: fixture.claim,
+          generationId,
+          runtime: baseline,
+        }),
+        isLiveRepositoryError('PREFLIGHT_EXPIRED'),
+      );
+    });
+  });
+
 void test('signed simulation commit-unknown replays one durable evidence row', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl.trim() === '') {

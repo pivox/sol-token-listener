@@ -54,8 +54,7 @@ export function parseLiveExecutorConfig(value: unknown): LiveExecutorConfig {
   try {
     const environment = environmentFrom(value);
     for (const key of SECRET_KEYS) {
-      const candidate = environmentValue(environment, key);
-      if (candidate !== undefined && candidate.length > 0) reject();
+      if (Object.getOwnPropertyDescriptor(environment, key) !== undefined) reject();
     }
     if (environmentValue(environment, 'EXECUTOR_MODE') !== 'live'
       || environmentValue(environment, 'LIVE_TRADING_ENABLED') !== 'true'
@@ -119,7 +118,7 @@ export function parseLiveExecutorConfig(value: unknown): LiveExecutorConfig {
       maxPriorityFeeLamports: 0n,
       rpcTimeoutMs,
       maxRpcCallsPerAttempt: integer(
-        environment, 'EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT', 6, 16,
+        environment, 'EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT', 12, 16,
       ),
       quoteMintAllowlist: Object.freeze([WSOL] as const),
     });

@@ -56,7 +56,13 @@ type ClaimOptions =
   | Readonly<{
       readonly ownerId: string;
       readonly leaseMs: number;
-      readonly purpose: 'LIVE_RECOVER' | 'CONFIRM' | 'RECONCILE' | 'EXECUTE' | 'DRY_RUN';
+      readonly purpose: 'LIVE_RECOVER';
+      readonly side?: 'BUY' | 'SELL';
+    }>
+  | Readonly<{
+      readonly ownerId: string;
+      readonly leaseMs: number;
+      readonly purpose: 'CONFIRM' | 'RECONCILE' | 'EXECUTE' | 'DRY_RUN';
     }>;
 type AttemptIdentity = Readonly<{
   readonly intentId: string;
@@ -139,7 +145,9 @@ type ExactSurfaceAssertions = AssertAll<{
   claimOptions: Expect<Equal<ExecutionClaimOptions, ClaimOptions>>
     & Expect<Equal<ActualClaimOptions, ClaimOptions>>
     & Expect<Equal<Extract<ActualClaimOptions, { readonly purpose: 'LIVE_EXECUTE' }>['side'], 'BUY' | 'SELL'>>
-    & Expect<Equal<keyof Exclude<ActualClaimOptions, { readonly purpose: 'LIVE_EXECUTE' }>, 'ownerId' | 'leaseMs' | 'purpose'>>;
+    & Expect<Equal<Extract<ActualClaimOptions, { readonly purpose: 'LIVE_RECOVER' }>['side'], 'BUY' | 'SELL' | undefined>>
+    & Expect<Equal<OptionalKeys<Extract<ActualClaimOptions, { readonly purpose: 'LIVE_RECOVER' }>>, 'side'>>
+    & Expect<Equal<keyof Exclude<ActualClaimOptions, { readonly purpose: 'LIVE_EXECUTE' | 'LIVE_RECOVER' }>, 'ownerId' | 'leaseMs' | 'purpose'>>;
   finishAttemptInput: Expect<Equal<keyof ActualFinishAttemptInput, keyof FinishAttemptInput>>
     & Expect<Equal<OptionalKeys<ActualFinishAttemptInput>, never>>
     & Expect<Equal<ReadonlyKeys<ActualFinishAttemptInput>, keyof ActualFinishAttemptInput>>
@@ -280,12 +288,14 @@ function compileTimeNegativeAssertions(): void {
   void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'EXECUTE' }, new AbortController().signal, new AbortController().signal);
   void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_EXECUTE', side: 'BUY' });
   void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_RECOVER' });
+  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_RECOVER', side: 'BUY' });
+  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_RECOVER', side: 'SELL' });
   // @ts-expect-error live execution claims require an explicit lane side.
   void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_EXECUTE' });
   // @ts-expect-error legacy claim purposes remain side-free.
   void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'EXECUTE', side: 'SELL' });
-  // @ts-expect-error live recovery is not an execution lane.
-  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_RECOVER', side: 'BUY' });
+  // @ts-expect-error live recovery sides are closed.
+  void repository.claim({ ownerId: 'worker', leaseMs: 1, purpose: 'LIVE_RECOVER', side: 'OTHER' });
   // @ts-expect-error transition input cannot carry a wallet capability.
   const transition: ExecutionIntentTransitionInput = { intentId: 'id', expectedStatus: 'PENDING', nextStatus: 'PROCESSING', leaseToken: 'lease', reasonCode: 'INTENT_LEASE_LOST', humanMessage: 'message', activationPhase: 'NONE', evidence, wallet: 'capability' };
   // @ts-expect-error claimed values are readonly.

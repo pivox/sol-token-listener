@@ -20,6 +20,7 @@ export interface LiveExecutorDatabase {
 export interface LiveExecutorBootstrapDependencies {
   readonly parseConfig: (environment: unknown) => LiveExecutorConfig;
   readonly openDatabase: (config: LiveExecutorConfig) => Promise<LiveExecutorDatabase>;
+  readonly verifyGenesis: (config: LiveExecutorConfig) => Promise<void>;
   readonly loadSigner: (config: LiveExecutorConfig) => Promise<ExecutionTransactionSigner>;
   readonly createLanes: (input: Readonly<{
     readonly config: LiveExecutorConfig;
@@ -43,6 +44,7 @@ export async function startLiveExecutor(
   let runtimeOwnsResources = false;
   try {
     await database.validateSchema();
+    await dependencies.verifyGenesis(config);
     signer = await dependencies.loadSigner(config);
     const lanes = dependencies.createLanes(Object.freeze({ config, database, signer }));
     runtimeOwnsResources = true;

@@ -1,10 +1,9 @@
 export type LiveExecutorLaneResult = 'IDLE' | 'WORKED';
 export type LiveExecutorPassResult =
   | 'IDLE'
-  | 'RECONCILIATION'
-  | 'CONFIRMATION'
+  | 'RECOVER_SELL'
   | 'SELL'
-  | 'DEADLINE_SELL'
+  | 'RECOVER_BUY'
   | 'BUY';
 
 export type LiveExecutorLane = (
@@ -12,10 +11,9 @@ export type LiveExecutorLane = (
 ) => Promise<LiveExecutorLaneResult>;
 
 export interface LiveExecutorLanes {
-  readonly reconciliation: LiveExecutorLane;
-  readonly confirmation: LiveExecutorLane;
+  readonly recoverSell: LiveExecutorLane;
   readonly sell: LiveExecutorLane;
-  readonly deadlineSell: LiveExecutorLane;
+  readonly recoverBuy: LiveExecutorLane;
   readonly buy: LiveExecutorLane;
 }
 
@@ -50,10 +48,9 @@ const productionScheduler: LiveExecutorRuntimeScheduler = Object.freeze({
 });
 
 const ORDERED_LANES = Object.freeze([
-  ['reconciliation', 'RECONCILIATION'],
-  ['confirmation', 'CONFIRMATION'],
+  ['recoverSell', 'RECOVER_SELL'],
   ['sell', 'SELL'],
-  ['deadlineSell', 'DEADLINE_SELL'],
+  ['recoverBuy', 'RECOVER_BUY'],
   ['buy', 'BUY'],
 ] as const);
 

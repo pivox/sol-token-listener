@@ -8,7 +8,10 @@ import {
   resumeLivePersistedTransaction,
   type LiveExecutionWorkerDependencies,
 } from '../src/executor-live/execution-worker.js';
-import { SignedSimulationGatewayError } from '../src/executor-live/signed-simulation-gateway.js';
+import {
+  SignedSimulationGatewayError,
+  type SignedSimulationGatewayInputV1,
+} from '../src/executor-live/signed-simulation-gateway.js';
 import { LiveSubmissionGatewayError } from '../src/executor-live/submission-gateway.js';
 import {
   ExecutionLiveRepositoryError,
@@ -19,6 +22,7 @@ import type {
   ExecutionLiveSignedSimulationEvidenceV1,
   ExecutionLiveSubmissionOutcomeV1,
   ExecutionPreSubmissionRevocationInputV1,
+  ExecutionLiveRepository,
 } from '../src/ports/execution-live-repository.js';
 import type { ClaimedExecutionIntent } from '../src/ports/execution-intent-repository.js';
 
@@ -34,9 +38,108 @@ void test('orders persistence, signed simulation, submission fence and RPC exact
   assert.equal(result.kind, 'ACCEPTED');
   assert.deepEqual(calls, [
     'inspect', 'persist', 'inspect', 'signed-simulate', 'record-signed-simulation',
+    'renew-before-submission', 'read-blockhash-validity',
+    'renew-before-submission',
     'begin-submission', 'rpc-submit', 'record-accepted',
   ]);
 });
+
+void test('never opens the submission fence when either final renewal or blockhash proof fails',
+  async () => {
+    for (const boundary of ['PRE_BLOCKHASH_RENEW', 'BLOCKHASH', 'POST_BLOCKHASH_RENEW'] as const) {
+      const fixture = workerFixture();
+      const calls: string[] = [];
+      const baseline = dependenciesFor(fixture, calls, false);
+      const expected = new Error(`failed ${boundary}`);
+      let renewCount = 0;
+      const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+        ...baseline,
+        renewBeforeSubmission: boundary === 'PRE_BLOCKHASH_RENEW'
+          || boundary === 'POST_BLOCKHASH_RENEW'
+          ? (claim: ClaimedExecutionIntent) => {
+              renewCount += 1;
+              calls.push('renew-before-submission');
+              if ((boundary === 'PRE_BLOCKHASH_RENEW' && renewCount === 1)
+                || (boundary === 'POST_BLOCKHASH_RENEW' && renewCount === 2)) {
+                return Promise.reject(expected);
+              }
+              return Promise.resolve(claim);
+            }
+          : baseline.renewBeforeSubmission,
+        readBlockhashValidity: boundary === 'BLOCKHASH'
+          ? () => {
+              calls.push('read-blockhash-validity');
+              return Promise.reject(expected);
+            }
+          : baseline.readBlockhashValidity,
+      });
+
+      await assert.rejects(executeLivePreparedTransaction(
+        dependencies, fixture.input, new AbortController().signal,
+      ), expected);
+      assert.equal(calls.includes('begin-submission'), false);
+      assert.equal(calls.includes('rpc-submit'), false);
+    }
+  });
+
+void test('passes the claim from the post-blockhash renewal to the submission fence', async () => {
+  const fixture = workerFixture();
+  const calls: string[] = [];
+  const baseline = dependenciesFor(fixture, calls, false);
+  const claims: ClaimedExecutionIntent[] = [];
+  let renewCount = 0;
+  const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+    ...baseline,
+    renewBeforeSubmission: (claim: ClaimedExecutionIntent) => {
+      calls.push('renew-before-submission');
+      renewCount += 1;
+      const renewed = Object.freeze({
+        ...claim,
+        leaseToken: `${renewCount + 1}1111111-1111-4111-8111-111111111111`,
+        leaseExpiresAtMs: claim.leaseExpiresAtMs + renewCount,
+      });
+      claims.push(renewed);
+      return Promise.resolve(renewed);
+    },
+    repository: Object.freeze({
+      ...baseline.repository,
+      beginSubmission: (
+        input: Parameters<ExecutionLiveRepository['beginSubmission']>[0],
+      ) => {
+        calls.push('begin-submission');
+        assert.equal(input.claim, claims[1]);
+        return Promise.resolve(submissionStartedFor(fixture, 2n));
+      },
+    }),
+  });
+
+  await executeLivePreparedTransaction(
+    dependencies, fixture.input, new AbortController().signal,
+  );
+
+  assert.equal(renewCount, 2);
+});
+
+void test('uses the persisted unsigned blockhash context as the fresh signed-simulation causal floor',
+  async () => {
+    const fixture = workerFixture();
+    const calls: string[] = [];
+    const baseline = dependenciesFor(fixture, calls, false);
+    const dependencies: LiveExecutionWorkerDependencies = Object.freeze({
+      ...baseline,
+      signedSimulation: Object.freeze({
+        simulate: (input: SignedSimulationGatewayInputV1) => {
+          calls.push('signed-simulate');
+          assert.equal(input.snapshotSlot, fixture.input.persist.unsignedSimulation.blockhashContextSlot);
+          return Promise.resolve(fixture.signedEvidence);
+        },
+      }),
+    });
+
+    await executeLivePreparedTransaction(
+      dependencies, fixture.input, new AbortController().signal,
+    );
+  });
 
 void test('records ambiguity after the durable submission fence and never retries', async () => {
   const fixture = workerFixture();
@@ -48,6 +151,8 @@ void test('records ambiguity after the durable submission fence and never retrie
   assert.equal(result.kind, 'AMBIGUOUS');
   assert.deepEqual(calls, [
     'inspect', 'persist', 'inspect', 'signed-simulate', 'record-signed-simulation',
+    'renew-before-submission', 'read-blockhash-validity',
+    'renew-before-submission',
     'begin-submission', 'rpc-submit', 'record-ambiguous',
   ]);
   assert.equal(calls.filter((call) => call === 'rpc-submit').length, 1);
@@ -62,6 +167,8 @@ void test('does not rewrite an accepted outcome as ambiguous when its commit is 
   ), /accepted outcome commit unknown/u);
   assert.deepEqual(calls, [
     'inspect', 'persist', 'inspect', 'signed-simulate', 'record-signed-simulation',
+    'renew-before-submission', 'read-blockhash-validity',
+    'renew-before-submission',
     'begin-submission', 'rpc-submit', 'record-accepted',
   ]);
 });
@@ -136,6 +243,8 @@ for (const code of ['PREFLIGHT_EXPIRED', 'CONTROL_STOPPED'] as const) {
 
     assert.deepEqual(calls, [
       'inspect', 'persist', 'inspect', 'signed-simulate', 'record-signed-simulation',
+      'renew-before-submission', 'read-blockhash-validity',
+      'renew-before-submission',
       'begin-submission', 'revoke-before-submission',
     ]);
   });
@@ -161,6 +270,8 @@ for (const code of [
 
     assert.deepEqual(calls, [
       'inspect', 'persist', 'inspect', 'signed-simulate', 'record-signed-simulation',
+      'renew-before-submission', 'read-blockhash-validity',
+      'renew-before-submission',
       'begin-submission',
     ]);
   });
@@ -184,6 +295,8 @@ void test('fails closed when an untyped error spoofs a deterministic gate code',
 
   assert.deepEqual(calls, [
     'inspect', 'persist', 'inspect', 'signed-simulate', 'record-signed-simulation',
+    'renew-before-submission', 'read-blockhash-validity',
+    'renew-before-submission',
     'begin-submission',
   ]);
 });
@@ -207,6 +320,8 @@ void test('does not revoke a deterministic gate refusal once cancellation is obs
 
   assert.deepEqual(calls, [
     'inspect', 'persist', 'inspect', 'signed-simulate', 'record-signed-simulation',
+    'renew-before-submission', 'read-blockhash-validity',
+    'renew-before-submission',
     'begin-submission',
   ]);
 });
@@ -227,46 +342,42 @@ void test('restart from PERSISTED reuses exact bytes without persisting them aga
   assert.equal(result.kind, 'ACCEPTED');
   assert.deepEqual(calls, [
     'inspect', 'signed-simulate', 'record-signed-simulation',
+    'renew-before-submission', 'read-blockhash-validity',
+    'renew-before-submission',
     'begin-submission', 'rpc-submit', 'record-accepted',
   ]);
 });
 
-void test('process restart discovers the durable artifact and unsigned proof from its claim',
-  async () => {
-    const fixture = workerFixture();
-    const calls: string[] = [];
-    const dependencies = dependenciesFor(fixture, calls, false);
-    dependencies.repository.inspectSignedTransaction = (input) => {
-      calls.push(input.artifactId === undefined ? 'discover' : 'inspect-by-id');
-      return Promise.resolve(inspectionFor(fixture, 'PERSISTED', 0n));
-    };
-    dependencies.signedSimulation.simulate = (input) => {
-      calls.push('signed-simulate');
-      assert.equal(input.persisted.artifact.artifactId, fixture.artifact.artifactId);
-      assert.deepEqual(input.unsignedSimulation, fixture.input.persist.unsignedSimulation);
-      return Promise.resolve(fixture.signedEvidence);
-    };
-
-    const result = await resumeLivePersistedTransaction(dependencies, Object.freeze({
-      payloadVersion: 1,
-      claim: fixture.input.persist.claim,
-      signedSimulation: Object.freeze({
+for (const state of [
+  'SIGNED_SIMULATED', 'SUBMISSION_STARTED', 'ACCEPTED', 'AMBIGUOUS', 'REVOKED_NO_SEND',
+] as const) {
+  void test(`resume inspects ${state} without creating signed-simulation recovery context`,
+    async () => {
+      const fixture = workerFixture();
+      const calls: string[] = [];
+      const dependencies = dependenciesFor(fixture, calls, false);
+      dependencies.repository.inspectSignedTransaction = () => {
+        calls.push('inspect');
+        return Promise.resolve(inspectionFor(
+          fixture,
+          state,
+          state === 'SIGNED_SIMULATED' ? 1n : state === 'SUBMISSION_STARTED' ? 2n : 3n,
+        ));
+      };
+      await resumeLivePersistedTransaction(dependencies, Object.freeze({
         payloadVersion: 1,
-        snapshotSlot: fixture.input.signedSimulation.snapshotSlot,
-        accountAddresses: fixture.input.signedSimulation.accountAddresses,
-        amountInRaw: fixture.input.signedSimulation.amountInRaw,
-        protectedAmountOutRaw: fixture.input.signedSimulation.protectedAmountOutRaw,
-      }),
-      runtime: fixture.input.runtime,
-      blockhashValidity: fixture.input.blockhashValidity,
-    }), new AbortController().signal);
+        claim: fixture.input.persist.claim,
+        runtime: fixture.input.runtime,
+      }), new AbortController().signal);
 
-    assert.equal(result.kind, 'ACCEPTED');
-    assert.deepEqual(calls, [
-      'discover', 'signed-simulate', 'record-signed-simulation',
-      'begin-submission', 'rpc-submit', 'record-accepted',
-    ]);
-  });
+      assert.equal(calls.filter((call) => call === 'inspect').length, 1);
+      assert.equal(calls.includes('signed-simulate'), false);
+      const continuesFromSignedSimulation = state === 'SIGNED_SIMULATED';
+      assert.equal(calls.includes('read-blockhash-validity'), continuesFromSignedSimulation);
+      assert.equal(calls.includes('begin-submission'), continuesFromSignedSimulation);
+      assert.equal(calls.includes('rpc-submit'), continuesFromSignedSimulation);
+    });
+}
 
 void test('restart from SIGNED_SIMULATED skips signed simulation and continues at the final gate',
   async () => {
@@ -284,7 +395,9 @@ void test('restart from SIGNED_SIMULATED skips signed simulation and continues a
 
     assert.equal(result.kind, 'ACCEPTED');
     assert.deepEqual(calls, [
-      'inspect', 'begin-submission', 'rpc-submit', 'record-accepted',
+      'inspect', 'renew-before-submission', 'read-blockhash-validity',
+      'renew-before-submission',
+      'begin-submission', 'rpc-submit', 'record-accepted',
     ]);
   });
 
@@ -409,6 +522,18 @@ function inspectionFor(
   });
 }
 
+function submissionStartedFor(
+  fixture: ReturnType<typeof workerFixture>,
+  stateRevision: bigint,
+): Awaited<ReturnType<ExecutionLiveRepository['beginSubmission']>> {
+  return Object.freeze({
+    payloadVersion: 1,
+    state: 'SUBMISSION_STARTED',
+    stateRevision,
+    artifact: fixture.artifact,
+  });
+}
+
 function dependenciesWithBeginSubmissionFailure(
   fixture: ReturnType<typeof workerFixture>,
   calls: string[],
@@ -507,6 +632,14 @@ function dependenciesFor(
           : Promise.reject(new SignedSimulationGatewayError(signedSimulationFailure));
       },
     },
+    renewBeforeSubmission: (claim: ClaimedExecutionIntent) => {
+      calls.push('renew-before-submission');
+      return Promise.resolve(claim);
+    },
+    readBlockhashValidity: () => {
+      calls.push('read-blockhash-validity');
+      return Promise.resolve(fixture.blockhashValidity);
+    },
     submission: {
       submitPersisted: () => {
         calls.push('rpc-submit');
@@ -596,11 +729,11 @@ function workerFixture() {
         cluster: 'mainnet-beta' as const, expectedGenesisHash: intent.mint,
         observedGenesisHash: intent.mint, providerId: 'primary',
       }),
-      blockhashValidity: Object.freeze({
-        payloadVersion: 1 as const, providerId: 'primary', blockhash: artifact.blockhash,
-        valid: true as const, observedBlockHeight: 499n, contextSlot: 127n,
-        observedAtMs: nowMs + 75,
-      }),
+    }),
+    blockhashValidity: Object.freeze({
+      payloadVersion: 1 as const, providerId: 'primary', blockhash: artifact.blockhash,
+      valid: true as const, observedBlockHeight: 499n, contextSlot: 127n,
+      observedAtMs: nowMs + 75,
     }),
   });
 }

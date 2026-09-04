@@ -40,6 +40,7 @@ import type {
   ExecutionLiveConfirmationWorkV1,
   ExecutionLiveArtifactReferenceV1,
   ExecutionLivePersistSignedInputV1,
+  ExecutionLivePreparationBindingV1,
   ExecutionPreSubmissionRevocationInputV1,
   ExecutionPreSubmissionRevocationResultV1,
   ExecutionLiveReconciliationResultV1,
@@ -121,6 +122,27 @@ export class PostgresExecutionLiveRepository {
     source: DatabaseSource | Pick<InstanceType<typeof pg.Pool>, 'connect'> = getDatabasePool(),
   ) {
     this.#source = source;
+  }
+
+  public async readPreparationBinding(inputValue: Readonly<{
+    readonly claim: ClaimedExecutionIntent;
+    readonly generationId: string;
+    readonly runtime: ExecutionLiveRuntimeBindingV1;
+  }>): Promise<ExecutionLivePreparationBindingV1> {
+    const claim = claimFrom(inputValue.claim);
+    if (!/^execution_wallet_generation_[0-9a-f]{64}$/u.test(inputValue.generationId)
+      || !validRuntimeBinding(inputValue.runtime)
+      || claim.intent.status !== 'PROCESSING' || claim.intent.attemptCount < 1) {
+      throw failure('INVALID_INPUT');
+    }
+    const input = Object.freeze({
+      claim,
+      generationId: inputValue.generationId,
+      runtime: inputValue.runtime,
+    });
+    return this.transaction((client) => input.claim.intent.side === 'BUY'
+      ? readBuyPreparationBinding(client, input)
+      : readSellPreparationBinding(client, input));
   }
 
   public async persistSigned(
@@ -1397,6 +1419,218 @@ function recreateArtifact(value: SignedTransactionArtifactV1): SignedTransaction
     signature: value.signature,
     signedTransactionBytes: Uint8Array.from(value.signedTransactionBytes),
     signedAtMs: value.signedAtMs,
+  });
+}
+
+interface PreparationBindingInput {
+  readonly claim: ClaimedExecutionIntent;
+  readonly generationId: string;
+  readonly runtime: ExecutionLiveRuntimeBindingV1;
+}
+
+async function readBuyPreparationBinding(
+  client: DatabaseClient,
+  input: PreparationBindingInput,
+): Promise<ExecutionLivePreparationBindingV1> {
+  const result = await client.query(`SELECT
+    trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
+    intent.status AS intent_status,intent.side AS intent_side,
+    intent.lease_owner,intent.lease_token::TEXT AS lease_token,
+    trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+    attempt.status AS attempt_status,generation.generation_id,
+    generation.wallet_public_key AS generation_wallet_public_key,
+    generation.cluster AS generation_cluster,generation.genesis_hash AS generation_genesis_hash,
+    generation.retired_at,control.state AS control_state,
+    qualification.qualification_id,qualification.phase AS qualification_phase,
+    qualification.build_hash AS qualification_build_hash,
+    qualification.configuration_fingerprint AS qualification_configuration_fingerprint,
+    qualification.strategy_fingerprint AS qualification_strategy_fingerprint,
+    qualification.wallet_public_key AS qualification_wallet_public_key,
+    qualification.cluster AS qualification_cluster,
+    qualification.genesis_hash AS qualification_genesis_hash,
+    qualification.provider_id AS qualification_provider_id,
+    trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT
+      AS qualification_expires_at_ms,
+    armament.armament_id,armament.state AS armament_state,
+    armament.phase AS armament_phase,armament.build_hash AS armament_build_hash,
+    armament.configuration_fingerprint AS armament_configuration_fingerprint,
+    armament.strategy_fingerprint AS armament_strategy_fingerprint,
+    armament.wallet_public_key AS armament_wallet_public_key,
+    armament.cluster AS armament_cluster,armament.genesis_hash AS armament_genesis_hash,
+    armament.provider_id AS armament_provider_id,
+    armament.consumed_buys,armament.maximum_buys,
+    trunc(EXTRACT(EPOCH FROM armament.expires_at)*1000)::TEXT AS armament_expires_at_ms,
+    reservation.reservation_id,reservation.state AS reservation_state,
+    reservation.intent_id AS reservation_intent_id,
+    reservation.generation_id AS reservation_generation_id,
+    admission.decision AS admission_decision,admission.quota_state,
+    risk.unknown_block,provider.superseded_at AS provider_superseded_at,
+    trunc(EXTRACT(EPOCH FROM provider.expires_at)*1000)::TEXT AS provider_expires_at_ms
+    FROM execution_intents intent
+    JOIN execution_attempts attempt ON attempt.intent_id=intent.id
+      AND attempt.attempt_number=$2
+    JOIN execution_wallet_generations generation ON generation.generation_id=$3
+    JOIN execution_control_state control ON control.generation_id=generation.generation_id
+    JOIN execution_activation_armaments armament
+      ON armament.generation_id=generation.generation_id AND armament.state='ARMED'
+    JOIN execution_safety_qualifications qualification
+      ON qualification.qualification_id=armament.qualification_id
+    JOIN execution_exposure_reservations reservation
+      ON reservation.intent_id=intent.id AND reservation.generation_id=generation.generation_id
+        AND reservation.state='RESERVED'
+    JOIN execution_risk_admission_reports admission
+      ON admission.report_id=reservation.admission_report_id
+    JOIN execution_wallet_risk_state risk ON risk.generation_id=generation.generation_id
+    JOIN execution_provider_usage_snapshots provider
+      ON provider.snapshot_fingerprint=reservation.provider_snapshot_fingerprint
+      AND provider.provider_id=armament.provider_id
+    WHERE intent.id=$1`, [
+    input.claim.intent.id, input.claim.intent.attemptCount, input.generationId,
+  ]);
+  if (result.rows.length !== 1) throw failure('PREFLIGHT_EXPIRED');
+  const row = result.rows[0] as Row;
+  const nowMs = timestampText(row.now_ms);
+  validatePreparationClaim(row, input, nowMs);
+  if (row.control_state !== 'RUNNING') throw failure('CONTROL_STOPPED');
+  if (row.intent_side !== 'BUY' || row.retired_at !== null
+    || !runtimeMatches(row, input.runtime)
+    || !qualificationRuntimeMatches(row, input.runtime)
+    || timestampText(row.qualification_expires_at_ms) <= nowMs
+    || row.armament_state !== 'ARMED'
+    || timestampText(row.armament_expires_at_ms) <= nowMs
+    || integer(row.consumed_buys) >= integer(row.maximum_buys)
+    || row.reservation_state !== 'RESERVED'
+    || row.reservation_intent_id !== input.claim.intent.id
+    || row.reservation_generation_id !== input.generationId
+    || row.admission_decision !== 'ADMITTED' || row.quota_state !== 'NORMAL'
+    || row.unknown_block !== false || row.provider_superseded_at !== null
+    || timestampText(row.provider_expires_at_ms) <= nowMs) {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+  return preparationBinding(row, 'BUY');
+}
+
+async function readSellPreparationBinding(
+  client: DatabaseClient,
+  input: PreparationBindingInput,
+): Promise<ExecutionLivePreparationBindingV1> {
+  const result = await client.query(`SELECT
+    trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
+    intent.status AS intent_status,intent.side AS intent_side,
+    intent.base_amount_raw::TEXT AS intent_base_amount_raw,
+    intent.mint,intent.quote_mint,intent.lease_owner,
+    intent.lease_token::TEXT AS lease_token,
+    trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+    attempt.status AS attempt_status,generation.generation_id,
+    generation.wallet_public_key AS generation_wallet_public_key,
+    generation.cluster AS generation_cluster,generation.genesis_hash AS generation_genesis_hash,
+    generation.retired_at,control.state AS control_state,
+    qualification.qualification_id,qualification.phase AS qualification_phase,
+    qualification.build_hash AS qualification_build_hash,
+    qualification.configuration_fingerprint AS qualification_configuration_fingerprint,
+    qualification.strategy_fingerprint AS qualification_strategy_fingerprint,
+    qualification.wallet_public_key AS qualification_wallet_public_key,
+    qualification.cluster AS qualification_cluster,
+    qualification.genesis_hash AS qualification_genesis_hash,
+    qualification.provider_id AS qualification_provider_id,
+    trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT
+      AS qualification_expires_at_ms,
+    armament.armament_id,armament.phase AS armament_phase,
+    armament.build_hash AS armament_build_hash,
+    armament.configuration_fingerprint AS armament_configuration_fingerprint,
+    armament.strategy_fingerprint AS armament_strategy_fingerprint,
+    armament.wallet_public_key AS armament_wallet_public_key,
+    armament.cluster AS armament_cluster,armament.genesis_hash AS armament_genesis_hash,
+    armament.provider_id AS armament_provider_id,
+    exit_auth.authorization_id AS exit_authorization_id,
+    exit_auth.state AS authorization_state,
+    exit_auth.maximum_base_amount_raw::TEXT AS maximum_base_amount_raw,
+    exit_auth.generation_id AS authorization_generation_id,
+    exit_auth.wallet_public_key AS authorization_wallet_public_key,
+    exit_auth.mint AS authorization_mint,exit_auth.quote_mint AS authorization_quote_mint,
+    position.state AS position_state,position.exit_intent_id,
+    position.remaining_base_raw::TEXT AS remaining_base_raw
+    FROM execution_intents intent
+    JOIN execution_attempts attempt ON attempt.intent_id=intent.id
+      AND attempt.attempt_number=$2
+    JOIN execution_wallet_generations generation ON generation.generation_id=$3
+    JOIN execution_control_state control ON control.generation_id=generation.generation_id
+    JOIN execution_exit_authorizations exit_auth
+      ON exit_auth.locked_intent_id IS NULL AND exit_auth.state='ACTIVE'
+    JOIN execution_live_positions position
+      ON position.position_id=exit_auth.position_id AND position.exit_intent_id=intent.id
+    JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
+    JOIN execution_safety_qualifications qualification
+      ON qualification.qualification_id=armament.qualification_id
+    WHERE intent.id=$1 AND exit_auth.generation_id=generation.generation_id`, [
+    input.claim.intent.id, input.claim.intent.attemptCount, input.generationId,
+  ]);
+  if (result.rows.length !== 1) throw failure('PREFLIGHT_EXPIRED');
+  const row = result.rows[0] as Row;
+  const nowMs = timestampText(row.now_ms);
+  validatePreparationClaim(row, input, nowMs);
+  const amount = unsignedBigint(row.intent_base_amount_raw);
+  if (row.control_state === 'HARD_STOP') throw failure('CONTROL_STOPPED');
+  if (row.intent_side !== 'SELL' || row.retired_at !== null
+    || !runtimeMatches(row, input.runtime)
+    || !qualificationRuntimeMatches(row, input.runtime)
+    || timestampText(row.qualification_expires_at_ms) <= nowMs
+    || row.authorization_state !== 'ACTIVE'
+    || row.authorization_generation_id !== input.generationId
+    || row.authorization_wallet_public_key !== input.runtime.walletPublicKey
+    || row.authorization_mint !== row.mint || row.authorization_quote_mint !== row.quote_mint
+    || row.position_state !== 'EXIT_PENDING'
+    || row.exit_intent_id !== input.claim.intent.id
+    || amount === 0n || amount > unsignedBigint(row.maximum_base_amount_raw)
+    || amount > unsignedBigint(row.remaining_base_raw)) {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+  return preparationBinding(row, 'SELL');
+}
+
+function validatePreparationClaim(
+  row: Row,
+  input: PreparationBindingInput,
+  nowMs: number,
+): void {
+  if (row.lease_owner !== input.claim.leaseOwner
+    || row.lease_token !== input.claim.leaseToken
+    || timestampText(row.lease_expires_at_ms) <= nowMs) throw failure('LEASE_LOST');
+  if (row.intent_status !== 'PROCESSING' || row.attempt_status !== 'STARTED'
+    || row.generation_id !== input.generationId
+    || row.generation_wallet_public_key !== input.runtime.walletPublicKey
+    || row.generation_cluster !== input.runtime.cluster
+    || row.generation_genesis_hash !== input.runtime.observedGenesisHash) {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+}
+
+function preparationBinding(
+  row: Row,
+  side: 'BUY' | 'SELL',
+): ExecutionLivePreparationBindingV1 {
+  const qualificationId = patternedText(
+    row.qualification_id, /^execution_safety_qualification_[0-9a-f]{64}$/u,
+  );
+  const armamentId = patternedText(
+    row.armament_id, /^execution_activation_armament_[0-9a-f]{64}$/u,
+  );
+  return Object.freeze({
+    payloadVersion: 1,
+    side,
+    generationId: patternedText(
+      row.generation_id, /^execution_wallet_generation_[0-9a-f]{64}$/u,
+    ),
+    qualificationId,
+    armamentId: side === 'BUY' ? armamentId : null,
+    reservationId: side === 'BUY'
+      ? patternedText(row.reservation_id, /^execution_exposure_reservation_[0-9a-f]{64}$/u)
+      : null,
+    exitAuthorizationId: side === 'SELL'
+      ? patternedText(row.exit_authorization_id, /^execution_exit_authorization_[0-9a-f]{64}$/u)
+      : null,
+    providerId: patternedText(row.armament_provider_id, PROVIDER_ID),
+    walletPublicKey: patternedText(row.generation_wallet_public_key, PUBLIC_KEY),
   });
 }
 
@@ -3595,6 +3829,11 @@ function fingerprintText(value: unknown): string {
   const candidate = text(value);
   if (!HASH.test(candidate)) throw failure('INVALID_DATA');
   return candidate;
+}
+
+function patternedText(value: unknown, pattern: RegExp): string {
+  if (typeof value !== 'string' || !pattern.test(value)) throw failure('INVALID_DATA');
+  return value;
 }
 
 function positiveInteger(value: unknown): number {

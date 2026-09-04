@@ -16,8 +16,13 @@ import BN from 'bn.js';
 import { createExecutionIntentDraft, type ExecutionIntentV1 } from '../src/domain/execution-intent.js';
 import {
   createExecutionAttemptEvaluator,
+  createLiveExecutionAttemptEvaluator,
   isInternalExecutionAttemptEvaluatorError,
 } from '../src/executor-simulation/attempt-evaluator.js';
+import {
+  LiveTransactionCandidateAuthority,
+  LiveTransactionPreparer,
+} from '../src/executor-live/transaction-preparer.js';
 import { ProviderAffineSession } from '../src/executor-simulation/provider-session.js';
 import type { ClaimedExecutionIntent } from '../src/ports/execution-intent-repository.js';
 import {
@@ -50,6 +55,7 @@ import type {
   ExecutionRpcAccount,
   ExecutionUnsignedSimulationResult,
 } from '../src/ports/execution-market-gateway.js';
+import type { ExecutionTransactionSigner } from '../src/ports/execution-transaction-signer.js';
 import type { ExecutionVenuePool } from '../src/ports/execution-venue-repository.js';
 
 const PUBLIC_KEY = '11111111111111111111111111111111';
@@ -128,6 +134,159 @@ void test('derives a Pump.fun BUY quote and official build only from the final p
     getAssociatedTokenAddressSync(new PublicKey(MINT), new PublicKey(PAYER), true).toBase58(),
     getAssociatedTokenAddressSync(NATIVE_MINT, new PublicKey(PAYER), true).toBase58(),
   ]);
+});
+
+void test('returns one opaque live candidate from the exact request simulated by the preparer', async () => {
+  const fixture = pumpFunSnapshots(false);
+  const order: string[] = [];
+  const session = new FakeSession(
+    fixture.discovery, fixture.final, 'BUY', null, () => { order.push('simulate'); },
+  );
+  const authority = new LiveTransactionCandidateAuthority();
+  let preparerFactoryCalls = 0;
+  let signerCalls = 0;
+  const signer: ExecutionTransactionSigner = Object.freeze({
+    publicKey: PAYER,
+    signMessage: () => {
+      signerCalls += 1;
+      order.push('sign');
+      return Promise.resolve(Object.freeze({ signature: new Uint8Array(64) }));
+    },
+    close: () => Promise.resolve(),
+  });
+  const evaluator = createLiveExecutionAttemptEvaluator(Object.freeze({
+    config: simulationConfig(),
+    venues: Object.freeze({ findFinalizedCanonicalPumpSwapPool: async () => null }),
+    sessionFactory: () => session,
+    clock: () => NOW,
+  }), (simulationGateway) => {
+    preparerFactoryCalls += 1;
+    return new LiveTransactionPreparer(simulationGateway, signer, authority, 1_232);
+  });
+
+  const result = await evaluator.evaluate(context(), activeSignal(), async (boundary) => {
+    order.push(boundary);
+  });
+
+  assert.equal(result.outcome, 'SUCCESS');
+  assert.equal(result.artifact.resultKind, 'SUCCESS');
+  assert.deepEqual(Object.keys(result).sort(), ['artifact', 'candidate', 'outcome', 'payloadVersion']);
+  assert.deepEqual(Object.keys(result.candidate), ['payloadVersion']);
+  assert.equal(Object.getPrototypeOf(result.candidate), null);
+  assert.equal(preparerFactoryCalls, 1);
+  assert.equal(signerCalls, 1);
+  const material = authority.consume(result.candidate);
+  assert.ok(material);
+  assert.equal(authority.consume(result.candidate), null);
+  assert.equal(material.quoteObservedAtMs, NOW);
+  assert.equal(material.quoteExpiresAtMs, NOW + 3_000);
+  assert.deepEqual(material.signedSimulationAccountAddresses, [
+    PAYER,
+    getAssociatedTokenAddressSync(
+      new PublicKey(MINT), new PublicKey(PAYER), true, TOKEN_PROGRAM_ID,
+    ).toBase58(),
+    getAssociatedTokenAddressSync(
+      NATIVE_MINT, new PublicKey(PAYER), true, TOKEN_PROGRAM_ID,
+    ).toBase58(),
+  ]);
+  assert.equal(Object.isFrozen(material.signedSimulationAccountAddresses), true);
+  assert.deepEqual(session.calls, [
+    'genesis', 'discovery', 'snapshot', 'blockhash', 'fee', 'simulate',
+  ]);
+  assert.deepEqual(order, [
+    'BEFORE_CANONICAL_SNAPSHOT', 'BEFORE_SIMULATION', 'simulate', 'BEFORE_SIGNING', 'sign',
+  ]);
+});
+
+void test('returns live failures without a candidate and never signs failed simulation', async () => {
+  const fixture = pumpFunSnapshots(false);
+  const session = new FakeSession(fixture.discovery, fixture.final, 'BUY', 'PROGRAM_ERROR');
+  let signerCalls = 0;
+  const signer: ExecutionTransactionSigner = Object.freeze({
+    publicKey: PAYER,
+    signMessage: () => {
+      signerCalls += 1;
+      return Promise.resolve(Object.freeze({ signature: new Uint8Array(64) }));
+    },
+    close: () => Promise.resolve(),
+  });
+  const renewals: string[] = [];
+  const result = await createLiveExecutionAttemptEvaluator(Object.freeze({
+    config: simulationConfig(),
+    venues: Object.freeze({ findFinalizedCanonicalPumpSwapPool: async () => null }),
+    sessionFactory: () => session,
+    clock: () => NOW,
+  }), (simulationGateway) => new LiveTransactionPreparer(
+    simulationGateway, signer, new LiveTransactionCandidateAuthority(), 1_232,
+  )).evaluate(context(), activeSignal(), async (boundary) => { renewals.push(boundary); });
+
+  assert.equal(result.outcome, 'FAILURE');
+  assert.equal(result.artifact.resultKind, 'SIMULATION_FAILED');
+  assert.equal(result.candidate, null);
+  assert.equal(signerCalls, 0);
+  assert.deepEqual(renewals, ['BEFORE_CANONICAL_SNAPSHOT', 'BEFORE_SIMULATION']);
+});
+
+void test('propagates a live pre-signing renewal failure without signing or issuing a candidate', async () => {
+  const fixture = pumpFunSnapshots(false);
+  const authority = new CountingCandidateAuthority();
+  const renewalFailure = new Error('renewal fence marker');
+  const renewals: string[] = [];
+  let signerCalls = 0;
+  const signer: ExecutionTransactionSigner = Object.freeze({
+    publicKey: PAYER,
+    signMessage: () => {
+      signerCalls += 1;
+      return Promise.resolve(Object.freeze({ signature: new Uint8Array(64) }));
+    },
+    close: () => Promise.resolve(),
+  });
+  const evaluator = createLiveExecutionAttemptEvaluator(Object.freeze({
+    config: simulationConfig(),
+    venues: Object.freeze({ findFinalizedCanonicalPumpSwapPool: async () => null }),
+    sessionFactory: () => new FakeSession(fixture.discovery, fixture.final, 'BUY'),
+    clock: () => NOW,
+  }), (simulationGateway) => new LiveTransactionPreparer(
+    simulationGateway, signer, authority, 1_232,
+  ));
+
+  await assert.rejects(evaluator.evaluate(
+    context(),
+    activeSignal(),
+    async (boundary) => {
+      renewals.push(boundary);
+      if (boundary === 'BEFORE_SIGNING') throw renewalFailure;
+    },
+  ), (error: unknown) => error === renewalFailure);
+
+  assert.deepEqual(renewals, [
+    'BEFORE_CANONICAL_SNAPSHOT', 'BEFORE_SIMULATION', 'BEFORE_SIGNING',
+  ]);
+  assert.equal(signerCalls, 0);
+  assert.equal(authority.issueCalls, 0);
+});
+
+void test('does not construct a live preparer for a pre-terminal evaluation failure', async () => {
+  const fixture = pumpFunSnapshots(false);
+  let preparerFactoryCalls = 0;
+  const result = await createLiveExecutionAttemptEvaluator(Object.freeze({
+    config: simulationConfig(),
+    venues: Object.freeze({ findFinalizedCanonicalPumpSwapPool: async () => null }),
+    sessionFactory: () => new FakeSession(fixture.discovery, fixture.final, 'BUY'),
+    clock: () => NOW,
+  }), () => {
+    preparerFactoryCalls += 1;
+    throw new Error('must not construct');
+  }).evaluate(
+    context(intentValue({ minimumAmountOutRaw: 1_000_000_000n })),
+    activeSignal(),
+    async () => undefined,
+  );
+
+  assert.equal(result.outcome, 'FAILURE');
+  assert.equal(result.artifact.resultKind, 'QUOTE_FAILED');
+  assert.equal(result.candidate, null);
+  assert.equal(preparerFactoryCalls, 0);
 });
 
 void test('derives and simulates a Pump.fun SELL from the same active final snapshot', async () => {
@@ -653,6 +812,17 @@ class FakeSession implements ExecutionDiscoveryMarketGateway {
   }
   public usage() {
     return Object.freeze({ providerId: this.providerId, rpcCallsUsed: this.calls.length, rpcCallsLimit: 8 });
+  }
+}
+
+class CountingCandidateAuthority extends LiveTransactionCandidateAuthority {
+  public issueCalls = 0;
+
+  public override issue(
+    material: Parameters<LiveTransactionCandidateAuthority['issue']>[0],
+  ): ReturnType<LiveTransactionCandidateAuthority['issue']> {
+    this.issueCalls += 1;
+    return super.issue(material);
   }
 }
 

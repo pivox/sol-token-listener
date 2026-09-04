@@ -109,6 +109,12 @@ void test('worker restart durably routes SUBMISSION_STARTED to ambiguity without
             return Promise.reject(new Error('submission must not restart'));
           },
         }),
+        renewBeforeSubmission: () => Promise.reject(
+          new Error('submission renewal must not restart'),
+        ),
+        readBlockhashValidity: () => Promise.reject(
+          new Error('blockhash validity must not restart'),
+        ),
         clock: () => Date.now(),
       }), Object.freeze({
         persist: Object.freeze({
@@ -130,7 +136,6 @@ void test('worker restart durably routes SUBMISSION_STARTED to ambiguity without
           unsignedSimulation: fixture.unsignedSimulation,
         }),
         runtime: fixture.runtime,
-        blockhashValidity: blockhashValidity(fixture.artifact, Date.now()),
       }), new AbortController().signal);
 
       assert.equal(result.kind, 'AMBIGUOUS');

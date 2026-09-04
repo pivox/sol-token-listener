@@ -24,11 +24,13 @@ void test('signs the exact successfully simulated message behind a one-shot opaq
     maximumTransactionBytes: 1_232,
   }));
   const evidence = simulationEvidence(compiled.messageHash, blockhash, plan.identity.snapshotFingerprint);
-  const simulation = new StubSimulationGateway(evidence);
+  const order: string[] = [];
+  const simulation = new StubSimulationGateway(evidence, () => { order.push('simulate'); });
   const signatureBytes = Uint8Array.from({ length: 64 }, (_, index) => index + 1);
   const signer: ExecutionTransactionSigner = Object.freeze({
     publicKey: plan.feePayer,
     signMessage(messageBytes: Uint8Array) {
+      order.push('sign');
       assert.deepEqual([...messageBytes], compiled.messageBytes);
       return Promise.resolve(Object.freeze({ signature: signatureBytes }));
     },
@@ -44,8 +46,17 @@ void test('signs the exact successfully simulated message behind a one-shot opaq
     }),
     receipt: Object.freeze({ payloadVersion: 1 as const }),
   });
+  const quoteWindow = Object.freeze({
+    quoteObservedAtMs: 1_800_000_000_000,
+    quoteExpiresAtMs: 1_800_000_003_000,
+  });
 
-  const prepared = await preparer.prepare(request, new AbortController().signal);
+  const prepared = await preparer.prepare(
+    request,
+    quoteWindow,
+    async () => { order.push('renew-before-sign'); },
+    new AbortController().signal,
+  );
 
   assert.equal(prepared.evidence, evidence);
   assert.deepEqual(Object.keys(prepared).sort(), ['candidate', 'evidence', 'payloadVersion']);
@@ -58,12 +69,29 @@ void test('signs the exact successfully simulated message behind a one-shot opaq
   assert.equal(material.signature, bs58.encode(signatureBytes));
   assert.equal(material.blockhash, blockhash);
   assert.equal(material.lastValidBlockHeight, evidence.lastValidBlockHeight);
+  assert.equal(material.quoteObservedAtMs, quoteWindow.quoteObservedAtMs);
+  assert.equal(material.quoteExpiresAtMs, quoteWindow.quoteExpiresAtMs);
+  const userBaseAta = inspected.expectedAccounts.filter(
+    (account) => account.role === 'USER_BASE_ATA',
+  );
+  const userQuoteAta = inspected.expectedAccounts.filter(
+    (account) => account.role === 'USER_QUOTE_ATA',
+  );
+  assert.equal(userBaseAta.length, 1);
+  assert.equal(userQuoteAta.length, 1);
+  assert.deepEqual(material.signedSimulationAccountAddresses, [
+    inspected.feePayer,
+    userBaseAta[0]?.address,
+    userQuoteAta[0]?.address,
+  ]);
+  assert.equal(Object.isFrozen(material.signedSimulationAccountAddresses), true);
   const transaction = VersionedTransaction.deserialize(
     Uint8Array.from(material.signedTransactionBytes),
   );
   assert.deepEqual([...transaction.message.serialize()], compiled.messageBytes);
   assert.deepEqual([...requiredSignature(transaction)], [...signatureBytes]);
   assert.equal(simulation.calls, 1);
+  assert.deepEqual(order, ['simulate', 'renew-before-sign', 'sign']);
 });
 
 void test('rejects a signer mismatch and a forged simulation message before signing', async () => {
@@ -82,16 +110,60 @@ void test('rejects a signer mismatch and a forged simulation message before sign
     new LiveTransactionPreparer(
       new StubSimulationGateway(mismatch), signer,
       new LiveTransactionCandidateAuthority(), 1_232,
-    ).prepare(request, new AbortController().signal),
+    ).prepare(request, Object.freeze({
+      quoteObservedAtMs: 1_800_000_000_000,
+      quoteExpiresAtMs: 1_800_000_003_000,
+    }), async () => undefined, new AbortController().signal),
     /Live transaction preparation failed/u,
   );
 });
 
+void test('rejects invalid quote windows before simulation or signing', async () => {
+  const plan = await loadPumpSwapSellGoldenPlan();
+  const simulation = new StubSimulationGateway(simulationEvidence(
+    'a'.repeat(64),
+    new PublicKey(new Uint8Array(32).fill(8)).toBase58(),
+    plan.identity.snapshotFingerprint,
+  ));
+  let signerCalls = 0;
+  const signer: ExecutionTransactionSigner = Object.freeze({
+    publicKey: plan.feePayer,
+    signMessage: () => {
+      signerCalls += 1;
+      return Promise.resolve(Object.freeze({ signature: new Uint8Array(64) }));
+    },
+    close: () => Promise.resolve(),
+  });
+  const preparer = new LiveTransactionPreparer(
+    simulation, signer, new LiveTransactionCandidateAuthority(), 1_232,
+  );
+  const request = Object.freeze({
+    plan,
+    snapshot: Object.freeze({
+      providerId: 'primary', slot: plan.identity.snapshotSlot,
+      addresses: Object.freeze([]), accounts: Object.freeze([]),
+    }),
+    receipt: Object.freeze({ payloadVersion: 1 as const }),
+  });
+
+  await assert.rejects(preparer.prepare(request, Object.freeze({
+    quoteObservedAtMs: 1_800_000_003_000,
+    quoteExpiresAtMs: 1_800_000_003_000,
+  }), async () => undefined, new AbortController().signal), /Live transaction preparation failed/u);
+
+  assert.equal(simulation.calls, 0);
+  assert.equal(signerCalls, 0);
+});
+
 class StubSimulationGateway implements ExecutionSimulationGateway {
   public calls = 0;
-  public constructor(private readonly result: ExecutionSimulationEvidenceV1) {}
+  public constructor(
+    private readonly result: ExecutionSimulationEvidenceV1,
+    private readonly onSimulate?: () => void,
+  ) {}
   public simulate(): Promise<ExecutionSimulationEvidenceV1> {
     this.calls += 1;
+    this.onSimulate?.();
     return Promise.resolve(this.result);
   }
 }

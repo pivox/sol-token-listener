@@ -59,6 +59,22 @@ export interface ExecutionLiveRuntimeBindingV1 {
   readonly providerId: string;
 }
 
+/**
+ * Claim-bound durable authority resolved immediately before transaction construction/signing.
+ * It contains identifiers only: the final persistence transaction must revalidate and consume it.
+ */
+export interface ExecutionLivePreparationBindingV1 {
+  readonly payloadVersion: 1;
+  readonly side: 'BUY' | 'SELL';
+  readonly generationId: string;
+  readonly qualificationId: string;
+  readonly armamentId: string | null;
+  readonly reservationId: string | null;
+  readonly exitAuthorizationId: string | null;
+  readonly providerId: string;
+  readonly walletPublicKey: string;
+}
+
 /** Fresh provider evidence from isBlockhashValid/getBlockHeight. */
 export interface ExecutionBlockhashValidityEvidenceV1 {
   readonly payloadVersion: 1;
@@ -162,6 +178,11 @@ export interface ExecutionDeadlineExitResultV1 {
 }
 
 export interface ExecutionLiveRepository {
+  readPreparationBinding(input: Readonly<{
+    readonly claim: ClaimedExecutionIntent;
+    readonly generationId: string;
+    readonly runtime: ExecutionLiveRuntimeBindingV1;
+  }>): Promise<ExecutionLivePreparationBindingV1>;
   persistSigned(input: ExecutionLivePersistSignedInputV1): Promise<SignedTransactionArtifactV1>;
   inspectSignedTransaction(input: Readonly<{
     readonly claim: ClaimedExecutionIntent;

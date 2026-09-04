@@ -282,9 +282,6 @@ GRANT USAGE ON SCHEMA public
 TO sol_token_executor_live,sol_token_executor_operations,sol_token_operator_reader,
   sol_token_retention_worker;
 
-GRANT SELECT ON TABLE migration_history
-TO sol_token_executor_live;
-
 -- The scheduled retention process is a separate trust boundary. Reset every
 -- table capability on rerun, then grant only what purgeExpiredFoundationData
 -- executes. In particular it never receives table-wide SELECT on signed bytes.
@@ -463,117 +460,444 @@ REVOKE ALL ON TABLE
 FROM PUBLIC,sol_token_listener_writer,sol_token_executor_worker,
   sol_token_executor_operations,sol_token_operator_reader,sol_token_public_api;
 
--- Remove legacy table-wide mutation capabilities before granting the exact
--- columns required by the live executor. This keeps reruns least-privilege.
-REVOKE UPDATE ON TABLE
-  execution_signed_transactions,
-  execution_live_unsigned_simulation_evidence,
-  execution_signed_simulation_evidence,
-  execution_live_positions,
-  execution_exit_authorizations,
-  execution_intents,
-  execution_attempts,
-  execution_wallet_generations,
-  execution_wallet_risk_state,
-  execution_wallet_snapshots,
-  execution_provider_usage_snapshots,
-  execution_provider_usage_counters,
-  execution_exposure_reservations,
-  execution_activation_armaments,
-  execution_reconciliation_evidence
-FROM sol_token_executor_live;
+ALTER ROLE sol_token_executor_live NOLOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
 
-GRANT SELECT ON TABLE
-  execution_intents,
-  execution_intent_transitions,
-  execution_attempts,
-  execution_wallet_generations,
-  execution_wallet_risk_state,
-  execution_wallet_snapshots,
-  execution_provider_usage_snapshots,
-  execution_provider_usage_counters,
-  execution_provider_rate_limit_events,
-  execution_risk_admission_reports,
-  execution_exposure_reservations,
-  execution_reconciliation_evidence,
-  execution_fault_ledger,
-  execution_simulation_artifacts,
-  execution_safety_qualifications,
-  execution_safety_gate_evidence,
-  execution_control_state,
-  execution_activation_armaments,
-  execution_activation_events,
-  execution_signed_transactions,
-  execution_live_unsigned_simulation_evidence,
-  execution_signed_simulation_evidence,
-  execution_submission_preflight_evidence,
-  execution_pre_submission_revocations,
-  execution_submission_events,
-  execution_live_positions,
-  execution_exit_authorizations
-TO sol_token_executor_live;
+DO $live_parameter_acl$
+BEGIN
+  IF current_setting('server_version_num')::INTEGER >= 150000 THEN
+    EXECUTE 'REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM sol_token_executor_live';
+  END IF;
+END
+$live_parameter_acl$;
 
-GRANT INSERT ON TABLE
-  execution_signed_transactions,
-  execution_live_positions,
-  execution_exit_authorizations
-TO sol_token_executor_live;
+-- A compromised signable worker must not inherit another capability group.
+-- Deployment LOGIN membership in this group is managed separately.
+DO $live_parents$
+DECLARE
+  parent_role NAME;
+BEGIN
+  FOR parent_role IN
+    SELECT parent.rolname
+    FROM pg_auth_members membership
+    JOIN pg_roles member ON member.oid=membership.member
+    JOIN pg_roles parent ON parent.oid=membership.roleid
+    WHERE member.rolname='sol_token_executor_live'
+  LOOP
+    EXECUTE format('REVOKE %I FROM sol_token_executor_live', parent_role);
+  END LOOP;
+END
+$live_parents$;
 
-GRANT UPDATE (state,state_revision,signed_simulated_at,submission_started_at,
-  submitted_at,confirmed_at,confirmed_slot,reconciled_at,revoked_at,purge_after)
-ON TABLE execution_signed_transactions TO sol_token_executor_live;
-GRANT UPDATE (state,state_revision,exit_intent_id,remaining_base_raw,
-  exit_reconciliation_fingerprint,closed_at,purge_after)
-ON TABLE execution_live_positions TO sol_token_executor_live;
-GRANT UPDATE (state,state_revision,locked_intent_id,locked_attempt_number,
-  terminal_at,purge_after)
-ON TABLE execution_exit_authorizations TO sol_token_executor_live;
+-- Reset every direct capability, including stale objects in non-public user
+-- schemas, before rebuilding the closed H2b allowlist.
+DO $live_schema_acl$
+DECLARE
+  target_schema NAME;
+BEGIN
+  FOR target_schema IN
+    SELECT namespace.nspname
+    FROM pg_namespace namespace
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON SCHEMA %I FROM sol_token_executor_live',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_live',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_executor_live',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_executor_live',
+      target_schema
+    );
+  END LOOP;
+END
+$live_schema_acl$;
 
-GRANT SELECT,INSERT ON TABLE
-  execution_submission_events,
-  execution_live_unsigned_simulation_evidence,
-  execution_signed_simulation_evidence,
-  execution_submission_preflight_evidence,
-  execution_pre_submission_revocations
-TO sol_token_executor_live;
+DO $live_type_acl$
+DECLARE
+  target_type RECORD;
+BEGIN
+  FOR target_type IN
+    SELECT namespace.nspname,type.typname
+    FROM pg_type type
+    JOIN pg_namespace namespace ON namespace.oid=type.typnamespace
+    CROSS JOIN LATERAL aclexplode(type.typacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_executor_live'
+    )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TYPE %I.%I FROM sol_token_executor_live',
+      target_type.nspname,target_type.typname
+    );
+  END LOOP;
+END
+$live_type_acl$;
 
-GRANT INSERT ON TABLE
-  execution_intents,
-  execution_attempts,
-  execution_wallet_risk_state,
-  execution_provider_usage_counters,
-  execution_exposure_reservations,
-  execution_activation_armaments
-TO sol_token_executor_live;
+DO $live_database_acl$
+DECLARE
+  target_database NAME;
+BEGIN
+  FOR target_database IN SELECT datname FROM pg_database
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON DATABASE %I FROM sol_token_executor_live',
+      target_database
+    );
+  END LOOP;
+END
+$live_database_acl$;
 
-GRANT UPDATE (status,state_revision,attempt_count,last_reason_code,lease_owner,
-  lease_token,lease_expires_at,terminal_at,reconciliation_completed_at,purge_after,updated_at)
+-- PostgreSQL grants TEMPORARY on every database to PUBLIC by default. The live
+-- process pins an untrusted signing boundary, so remove only that capability on
+-- the database being provisioned; CONNECT and other databases remain untouched.
+DO $live_public_temp_acl$
+DECLARE
+  target_database NAME := current_database();
+BEGIN
+  EXECUTE format(
+    'REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC',
+    target_database
+  );
+END
+$live_public_temp_acl$;
+
+DO $live_language_acl$
+DECLARE
+  target_language NAME;
+BEGIN
+  FOR target_language IN
+    SELECT language.lanname
+    FROM pg_language language
+    CROSS JOIN LATERAL aclexplode(language.lanacl) acl
+    WHERE language.lanpltrusted
+      AND acl.grantee=(
+        SELECT oid FROM pg_roles WHERE rolname='sol_token_executor_live'
+      )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON LANGUAGE %I FROM sol_token_executor_live',
+      target_language
+    );
+  END LOOP;
+END
+$live_language_acl$;
+
+-- Remove default privileges granted to the signable group by any object
+-- creator. A default-ACL object owned by this NOLOGIN group is rejected by the
+-- startup inventory as non-remediable ownership drift.
+DO $live_default_acl$
+DECLARE
+  default_acl RECORD;
+  object_kind TEXT;
+  schema_clause TEXT;
+BEGIN
+  FOR default_acl IN
+    SELECT DISTINCT grantor.rolname AS grantor_name,
+      namespace.nspname AS schema_name,defaults.defaclobjtype
+    FROM pg_default_acl defaults
+    JOIN pg_roles grantor ON grantor.oid=defaults.defaclrole
+    LEFT JOIN pg_namespace namespace ON namespace.oid=defaults.defaclnamespace
+    CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+    WHERE acl.grantee=(SELECT oid FROM pg_roles WHERE rolname='sol_token_executor_live')
+  LOOP
+    object_kind := CASE default_acl.defaclobjtype
+      WHEN 'r' THEN 'TABLES'
+      WHEN 'S' THEN 'SEQUENCES'
+      WHEN 'f' THEN 'FUNCTIONS'
+      WHEN 'T' THEN 'TYPES'
+      WHEN 'n' THEN 'SCHEMAS'
+      ELSE NULL
+    END;
+    IF object_kind IS NULL THEN
+      RAISE EXCEPTION 'Unsupported default ACL object kind';
+    END IF;
+    schema_clause := CASE WHEN default_acl.schema_name IS NULL THEN ''
+      ELSE format(' IN SCHEMA %I', default_acl.schema_name) END;
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL PRIVILEGES ON %s FROM sol_token_executor_live',
+      default_acl.grantor_name,schema_clause,object_kind
+    );
+  END LOOP;
+END
+$live_default_acl$;
+
+DO $live_columns$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,class.relname,
+      string_agg(format('%I',attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class class
+    JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=class.oid
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND class.relkind IN ('r','p','v','m','f')
+    GROUP BY namespace.nspname,class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM sol_token_executor_live',
+      relation.columns, relation.nspname, relation.relname
+    );
+  END LOOP;
+END
+$live_columns$;
+
+GRANT USAGE ON SCHEMA public TO sol_token_executor_live;
+
+GRANT SELECT (version)
+ON TABLE migration_history TO sol_token_executor_live;
+
+GRANT SELECT (
+  migration_id,mint,announced_pool,instruction_kind,quote_mint,quote_decimals,
+  base_token_program,quote_token_program,confirmation_status
+)
+ON TABLE migrations TO sol_token_executor_live;
+
+GRANT SELECT (
+  pool_address,market,program_id,pool_index,creator,base_mint,quote_mint,
+  quote_decimals,base_token_program,quote_token_program,base_vault,quote_vault,
+  lp_mint,migration_id,pool_state,confirmation_status,slot,transaction_index,
+  instruction_index,inner_instruction_index
+)
+ON TABLE market_pools TO sol_token_executor_live;
+
+GRANT SELECT (
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status,
+  attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
+  last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
+  purge_after
+), UPDATE (
+  status,state_revision,attempt_count,last_reason_code,lease_owner,lease_token,
+  lease_expires_at,terminal_at,reconciliation_completed_at,purge_after,updated_at
+)
 ON TABLE execution_intents TO sol_token_executor_live;
-GRANT UPDATE (status,effective_venue,provider_id,completed_at,reason_code,
+
+GRANT SELECT (intent_id), INSERT (
+  intent_id,previous_status,next_status,reason_code,human_message,
+  activation_phase,attempt_number,evidence,occurred_at
+)
+ON TABLE execution_intent_transitions TO sol_token_executor_live;
+
+GRANT SELECT (
+  intent_id,attempt_number,status,effective_venue,provider_id,started_at,
+  completed_at,reason_code,reconciliation_signature,reconciliation_blockhash,
+  reconciliation_last_valid_block_height,reconciliation_message_hash,
+  reconciliation_build_fingerprint,reconciliation_snapshot_fingerprint,
+  reconciliation_maximum_fee_lamports,reconciliation_maximum_fee_payer_lamport_debit,
+  purge_after
+), INSERT (
+  intent_id,attempt_number,status,started_at
+), UPDATE (
+  status,effective_venue,provider_id,completed_at,reason_code,
   reconciliation_signature,reconciliation_blockhash,reconciliation_last_valid_block_height,
   reconciliation_message_hash,reconciliation_build_fingerprint,
   reconciliation_snapshot_fingerprint,reconciliation_maximum_fee_lamports,
-  reconciliation_maximum_fee_payer_lamport_debit)
+  reconciliation_maximum_fee_payer_lamport_debit
+)
 ON TABLE execution_attempts TO sol_token_executor_live;
-GRANT UPDATE (state_revision,reconciled_capital_lamports,reserved_exposure_raw,
-  open_positions,conservative_drawdown_raw,consecutive_technical_failures,
-  last_technical_failure_reason_code,unknown_block,updated_at)
+
+GRANT SELECT (generation_id,wallet_public_key,cluster,genesis_hash,retired_at)
+ON TABLE execution_wallet_generations TO sol_token_executor_live;
+
+GRANT SELECT (
+  generation_id,state_revision,reconciled_capital_lamports,reserved_exposure_raw,
+  open_positions,conservative_drawdown_raw,unknown_block
+), UPDATE (
+  state_revision,reserved_exposure_raw,open_positions,unknown_block,updated_at
+)
 ON TABLE execution_wallet_risk_state TO sol_token_executor_live;
-GRANT UPDATE (state,state_revision,reconciled_at,purge_after)
+
+GRANT SELECT (
+  provider_id,billing_period_id,snapshot_fingerprint,measured_at,expires_at,superseded_at
+)
+ON TABLE execution_provider_usage_snapshots TO sol_token_executor_live;
+
+GRANT SELECT (provider_id,billing_period_id,units,recorded_at)
+ON TABLE execution_provider_usage_counters TO sol_token_executor_live;
+
+GRANT SELECT (provider_id,billing_period_id)
+ON TABLE execution_provider_rate_limit_events TO sol_token_executor_live;
+
+GRANT SELECT (
+  report_id,intent_id,generation_id,decision,quota_state,policy_fingerprint,
+  wallet_snapshot_fingerprint,provider_snapshot_fingerprint,quote_amount_raw,
+  risk_state_revision_baseline,conservative_drawdown_raw_baseline,
+  provider_local_usage_units_baseline,provider_rate_limit_count_baseline
+)
+ON TABLE execution_risk_admission_reports TO sol_token_executor_live;
+
+GRANT SELECT (
+  reservation_id,intent_id,generation_id,side,mint,quote_mint,maximum_amount_raw,
+  intent_fingerprint,policy_fingerprint,wallet_snapshot_fingerprint,
+  provider_snapshot_fingerprint,admission_report_id,state,state_revision
+), UPDATE (state,state_revision,reconciled_at,purge_after)
 ON TABLE execution_exposure_reservations TO sol_token_executor_live;
-GRANT UPDATE (state,state_revision,consumed_buys,terminal_at,purge_after)
+
+GRANT SELECT (
+  artifact_id,payload_version,specification_version,evaluator_version,intent_id,
+  attempt_number,intent_state_revision,strategy_id,strategy_version,decision_fingerprint,
+  result_kind,effective_venue,provider_id,executor_public_key,expected_genesis_hash,
+  observed_genesis_hash,configuration_fingerprint,quote_fingerprint,snapshot_fingerprint,
+  build_fingerprint,message_hash,blockhash,last_valid_block_height,blockhash_context_slot,
+  snapshot_slot,fee_context_slot,simulation_slot,amount_in_raw,expected_amount_out_raw,
+  protected_amount_out_raw,fees_raw,estimated_fee_lamports,
+  simulated_fee_payer_lamport_debit,units_consumed,simulated_base_delta_raw,
+  simulated_quote_delta_raw,rpc_calls_used,rpc_calls_limit,quote_status,build_status,
+  simulation_status,failure_stage,failure_code,terminal_reason_code,logs_fingerprint,
+  logs_line_count,result_fingerprint,recorded_at
+), INSERT (
+  artifact_id,payload_version,specification_version,evaluator_version,intent_id,
+  attempt_number,intent_state_revision,strategy_id,strategy_version,decision_fingerprint,
+  result_kind,effective_venue,provider_id,executor_public_key,expected_genesis_hash,
+  observed_genesis_hash,configuration_fingerprint,quote_fingerprint,snapshot_fingerprint,
+  build_fingerprint,message_hash,blockhash,last_valid_block_height,blockhash_context_slot,
+  snapshot_slot,fee_context_slot,simulation_slot,amount_in_raw,expected_amount_out_raw,
+  protected_amount_out_raw,fees_raw,estimated_fee_lamports,
+  simulated_fee_payer_lamport_debit,units_consumed,simulated_base_delta_raw,
+  simulated_quote_delta_raw,rpc_calls_used,rpc_calls_limit,quote_status,build_status,
+  simulation_status,failure_stage,failure_code,terminal_reason_code,logs_fingerprint,
+  logs_line_count,result_fingerprint,recorded_at
+)
+ON TABLE execution_simulation_artifacts TO sol_token_executor_live;
+
+GRANT SELECT (
+  qualification_id,qualification_fingerprint,generation_id,phase,build_hash,
+  configuration_fingerprint,strategy_fingerprint,wallet_public_key,cluster,
+  genesis_hash,provider_id,expires_at
+)
+ON TABLE execution_safety_qualifications TO sol_token_executor_live;
+
+GRANT SELECT (generation_id,state)
+ON TABLE execution_control_state TO sol_token_executor_live;
+
+GRANT SELECT (
+  armament_id,generation_id,qualification_id,qualification_fingerprint,phase,
+  build_hash,configuration_fingerprint,strategy_fingerprint,wallet_public_key,
+  cluster,genesis_hash,provider_id,state,state_revision,maximum_capital_lamports,
+  maximum_exposure_bps,maximum_open_positions,maximum_buys,consumed_buys,expires_at
+), UPDATE (state,state_revision,consumed_buys,terminal_at,purge_after)
 ON TABLE execution_activation_armaments TO sol_token_executor_live;
 
-GRANT INSERT ON TABLE
-  execution_intent_transitions,
-  execution_risk_admission_reports,
-  execution_reconciliation_evidence,
-  execution_fault_ledger,
-  execution_activation_events
-TO sol_token_executor_live;
+GRANT INSERT (
+  event_id,payload_version,event_fingerprint,armament_id,generation_id,
+  previous_state,next_state,reason_code,occurred_at
+)
+ON TABLE execution_activation_events TO sol_token_executor_live;
 
-GRANT UPDATE (resolved_by_evidence_id,resolved_at,purge_after)
-ON TABLE execution_reconciliation_evidence
+GRANT SELECT (
+  artifact_id,payload_version,specification_version,intent_id,attempt_number,
+  generation_id,armament_id,reservation_id,exit_authorization_id,provider_id,
+  wallet_public_key,side,effective_venue,message_hash,build_fingerprint,
+  snapshot_fingerprint,quote_fingerprint,quote_observed_at,quote_expires_at,
+  blockhash,last_valid_block_height,signature,signed_transaction_bytes,
+  signed_transaction_hash,state,state_revision,signed_at,signed_simulated_at,
+  submission_started_at,submitted_at,confirmed_at,confirmed_slot,reconciled_at,
+  revoked_at,purge_after
+), INSERT (
+  artifact_id,payload_version,specification_version,intent_id,attempt_number,
+  generation_id,armament_id,reservation_id,exit_authorization_id,provider_id,
+  wallet_public_key,side,effective_venue,message_hash,build_fingerprint,
+  snapshot_fingerprint,quote_fingerprint,quote_observed_at,quote_expires_at,
+  blockhash,last_valid_block_height,signature,signed_transaction_bytes,
+  signed_transaction_hash,state,state_revision,signed_at
+), UPDATE (
+  state,state_revision,signed_simulated_at,submission_started_at,submitted_at,
+  revoked_at,purge_after
+)
+ON TABLE execution_signed_transactions TO sol_token_executor_live;
+
+GRANT SELECT (
+  evidence_id,payload_version,evidence_fingerprint,artifact_id,intent_id,
+  attempt_number,provider_id,snapshot_fingerprint,build_fingerprint,message_hash,
+  blockhash,last_valid_block_height,blockhash_context_slot,fee_context_slot,
+  estimated_fee_lamports,simulation_slot,simulated_fee_payer_lamport_debit,
+  units_consumed,simulated_base_delta_raw,simulated_quote_delta_raw,
+  logs_fingerprint,logs_line_count,recorded_at
+), INSERT (
+  evidence_id,payload_version,evidence_fingerprint,artifact_id,intent_id,
+  attempt_number,provider_id,snapshot_fingerprint,build_fingerprint,message_hash,
+  blockhash,last_valid_block_height,blockhash_context_slot,fee_context_slot,
+  estimated_fee_lamports,simulation_slot,simulated_fee_payer_lamport_debit,
+  units_consumed,simulated_base_delta_raw,simulated_quote_delta_raw,
+  logs_fingerprint,logs_line_count,recorded_at
+)
+ON TABLE execution_live_unsigned_simulation_evidence TO sol_token_executor_live;
+
+GRANT SELECT (
+  payload_version,evidence_fingerprint,artifact_id,unsigned_simulation_evidence_id,
+  signed_transaction_hash,provider_id,simulation_slot,units_consumed,
+  fee_payer_lamport_debit,base_delta_raw,quote_delta_raw,logs_fingerprint,
+  logs_line_count,observed_at
+), INSERT (
+  evidence_id,payload_version,evidence_fingerprint,artifact_id,
+  unsigned_simulation_evidence_id,signed_transaction_hash,provider_id,simulation_slot,
+  units_consumed,fee_payer_lamport_debit,base_delta_raw,quote_delta_raw,
+  logs_fingerprint,logs_line_count,observed_at
+)
+ON TABLE execution_signed_simulation_evidence TO sol_token_executor_live;
+
+GRANT INSERT (
+  gate_id,payload_version,gate_fingerprint,artifact_id,intent_id,attempt_number,
+  generation_id,armament_id,reservation_id,provider_id,phase,build_hash,
+  configuration_fingerprint,strategy_fingerprint,wallet_public_key,cluster,genesis_hash,
+  armament_revision,admission_risk_revision,risk_revision,admission_drawdown_raw,
+  conservative_drawdown_raw,admission_provider_local_usage_units,
+  provider_local_usage_units,admission_provider_rate_limit_count,
+  provider_rate_limit_count,reservation_amount_raw,reconciled_capital_raw,
+  reserved_exposure_raw,open_positions,maximum_capital_lamports,maximum_exposure_bps,
+  maximum_open_positions,quote_fingerprint,quote_observed_at,quote_expires_at,blockhash,
+  last_valid_block_height,observed_block_height,blockhash_validity_context_slot,
+  blockhash_validated_at,authorized_at
+)
+ON TABLE execution_submission_preflight_evidence TO sol_token_executor_live;
+
+GRANT SELECT (
+  artifact_id,intent_id,expected_state,expected_revision,cause_reason_code,
+  evidence_fingerprint,observed_at
+), INSERT (
+  revocation_id,payload_version,revocation_fingerprint,artifact_id,intent_id,
+  attempt_number,generation_id,side,expected_state,expected_revision,cause_reason_code,
+  evidence_fingerprint,observed_at,revoked_at,purge_after
+)
+ON TABLE execution_pre_submission_revocations TO sol_token_executor_live;
+
+GRANT INSERT (
+  event_id,payload_version,event_fingerprint,artifact_id,generation_id,
+  previous_state,next_state,reason_code,occurred_at
+)
+ON TABLE execution_submission_events TO sol_token_executor_live;
+
+GRANT SELECT (
+  position_id,generation_id,armament_id,wallet_public_key,mint,quote_mint,
+  state,state_revision,exit_intent_id,remaining_base_raw
+), UPDATE (state,state_revision,exit_intent_id)
+ON TABLE execution_live_positions TO sol_token_executor_live;
+
+GRANT SELECT (
+  authorization_id,position_id,generation_id,wallet_public_key,mint,quote_mint,
+  maximum_base_amount_raw,state,state_revision,locked_intent_id,locked_attempt_number
+), UPDATE (state,state_revision,locked_intent_id,locked_attempt_number)
+ON TABLE execution_exit_authorizations TO sol_token_executor_live;
+
+GRANT USAGE ON SEQUENCE execution_intent_transitions_sequence_seq
 TO sol_token_executor_live;
 
 REVOKE ALL ON TABLE
