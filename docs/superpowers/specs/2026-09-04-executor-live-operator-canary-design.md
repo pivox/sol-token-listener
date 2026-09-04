@@ -1,6 +1,6 @@
 # Armement opérateur exact et préparation du canary — conception #51-H2c
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.0.1
 
 **Version de la spécification parente :** 1.10.0
 
@@ -14,6 +14,11 @@
 
 ## Historique des versions
 
+- **1.0.1 — 2026-09-04 :** ferme la faisabilité de l'admission BUY avec un
+  sidecar canonique signé, lie la requête aux limites financières du runtime,
+  réserve l'exposition dans la même transaction que l'armement, précise la
+  révision cible, la reprise périodique des locks abandonnés et le passage
+  système borné à `ENTRY_STOP`.
 - **1.0.0 — 2026-09-04 :** lie l'autorisation TTY à la requête d'armement
   complète et à une intention BUY exacte, déplace le verrou durable du canary
   avant la première signature BUY, ferme la reprise d'un verrou abandonné et
@@ -57,6 +62,8 @@ NON_EXECUTED / NON_VALIDATED
 ### 3.1 Inclus
 
 - requête d'armement CANARY V2 déterministe et immuable ;
+- sidecar CANARY V1 signé contenant politique, snapshots wallet/provider et
+  cible exacte, sans accès RPC ni keypair depuis le processus opérations ;
 - cible BUY exacte : intention, révision, décision, mint, quote mint et montant
   quote brut ;
 - fingerprint couvrant toutes les valeurs réellement autorisées ;
@@ -65,11 +72,13 @@ NON_EXECUTED / NON_VALIDATED
 - persistance PostgreSQL compatible avec l'historique V1 terminal ;
 - refus de toute armement V1 encore actif lors de l'upgrade ;
 - claim BUY limité à la cible de l'unique armement CANARY V2 actif ;
+- admission BUY et réservation d'exposition créées atomiquement avec
+  l'armement, jamais supposées préexistantes ;
 - CAS durable `ARMED -> LOCKED` avant l'appel au signer ;
 - liaison du verrou à l'intention, la tentative, la réservation et le lease ;
 - révocation transactionnelle fail-closed d'un verrou abandonné sans artefact ;
-- validation H2b avant ouverture du keypair : travail signable ou sortie à
-  protéger obligatoire ;
+- validation H2b avant ouverture du keypair : reprise pré-signature périodique,
+  puis travail signable ou sortie à protéger obligatoire ;
 - runbook H2c manuel, dossier de preuves et critères PASS/non-PASS ;
 - tests unitaires, PostgreSQL, concurrence, crash boundaries, architecture et
   documentation.
@@ -86,6 +95,12 @@ NON_EXECUTED / NON_VALIDATED
 - modification de l'ordre des lanes H2b ou des responsabilités H2a ;
 - déclaration de réussite de #49 ou du canary.
 
+H2c ne crée pas de collecteur de quota provider ou de wallet Mainnet. Le
+gateway H2b ne possède pas ces preuves : une simulation `confirmed` ne remplace
+pas un snapshot wallet `finalized`, et un RPC Solana ne révèle pas le quota du
+fournisseur. Ces preuves proviennent donc du producteur de preflight externe et
+restent authentifiées par la même clé Ed25519 de confiance.
+
 ## 4. Requête d'armement CANARY V2
 
 La commande devient explicitement ciblée :
@@ -98,13 +113,39 @@ npm run live:arm -- \
   --reason='<raison opérateur>'
 ```
 
-Le repository relit l'intention sous le verrou advisory de génération. Elle
-doit être un BUY non expiré, encore `PENDING` ou `RETRY_READY`, utiliser le quote
-mint WSOL autorisé et avoir un `quote_amount_raw` strictement positif et
-inférieur ou égal au plafond manuel. Son identité de stratégie et sa décision
-immuable sont capturées par la requête ; la réservation et le gate pré-signature
-établissent ensuite la liaison effective à la génération qualifiée. Une
-intention déjà louée, terminale, signée ou divergente est refusée.
+La commande lit aussi `EXECUTOR_CANARY_EVIDENCE_PATH`, chemin absolu hors Git
+vers une enveloppe Ed25519 canonique CANARY V1. Son payload contient exactement
+la qualification, l'identifiant cible, la politique de risque canonique, un
+snapshot wallet `finalized`, un snapshot provider `OPERATOR_REPORT` ou
+`AUTHORITATIVE_PROBE`, `allEndpointsUnavailable=false`, sa date de capture et
+son expiration. Les fingerprints et identifiants des snapshots doivent être
+ceux des gates `WALLET_CHAIN_LIMITS_VERIFIED` et
+`PROVIDER_EXIT_CAPACITY_VERIFIED` de la qualification signée. Le sidecar est
+borné à 131 072 octets, rejette toute clé inconnue et utilise la même clé
+publique de confiance que le preflight.
+
+Le snapshot wallet acquiert un constructeur canonique de domaine qui recalcule
+son ID et son fingerprint sur tous ses champs, comme le snapshot provider. Le
+décodage du sidecar et le repository utilisent ce même constructeur. Un ID ou
+fingerprint simplement bien formé n'est jamais accepté. Les deux gates de la
+qualification doivent égaler exactement l'ID et le fingerprint recalculés.
+
+Le repository relit l'intention sous le verrou de présence SELL puis le verrou
+advisory de génération. Elle doit être un BUY non expiré, encore `PENDING`, non
+loué, utiliser le quote mint WSOL autorisé et avoir un `quote_amount_raw`
+strictement positif et inférieur ou égal au plafond manuel. Son identité de
+stratégie et sa décision immuable sont capturées par la requête. La politique,
+les deux snapshots, l'admission `ADMITTED`, la réservation d'exposition et
+l'armement sont persistés dans une transaction unique. Une admission rejetée
+annule toute la transaction ; aucun armement ni exposition orpheline n'est
+laissé. Une intention déjà louée, terminale, signée ou divergente est refusée.
+
+La révision cible persistée est la révision `PENDING` observée lors de
+l'armement. Le claim n'incrémente pas cette révision ; la transition unique
+`PENDING -> PROCESSING` l'incrémente exactement de un. Le lock pré-signature
+exige donc cette révision cible plus un, la même décision et la tentative 1.
+Un retry ou une deuxième tentative exige un nouvel intent et un nouvel
+armement ; le canary n'autorise pas une réinterprétation implicite de la cible.
 
 `armamentRequestFingerprint` est le SHA-256 canonique et length-prefixed de :
 
@@ -115,6 +156,9 @@ generation id, wallet public key complet, cluster, genesis, provider,
 target intent id/state revision/strategy id+version/decision fingerprint,
 target mint/quote mint/quote amount raw,
 maximum buys/capital lamports/exposure bps/open positions/holding ms,
+policy/wallet snapshot/provider snapshot fingerprints,
+quote max age/slippage/snapshot max slot lag/compute unit limit,
+fee limit/fee-payer debit limit/RPC call limit/lease duration,
 armed at, expires at, operator id, operator reason
 ```
 
@@ -124,15 +168,21 @@ L'armement et sa cible ne sont insérés qu'après relecture transactionnelle de
 l'autorisation, de la qualification, du contrôle `RUNNING`, du risque connu et
 de l'intention exacte.
 
-La phrase TTY contient sans troncature : action, phase, wallet, intent id, mint,
-montant brut en lamports, durée, expiration, fingerprint et nonce. Une variation
-d'un seul champ produit une phrase et une autorisation différentes. Il n'existe
-ni flag `--yes`, ni stdin pipe accepté, ni valeur permissive implicite.
+La phrase TTY contient sans troncature : action, version, phase, wallet, intent
+id, mint, quote mint, montant brut en lamports, plafond en lamports, durée,
+expiration, fingerprint et nonce. L'écran précédant la saisie expose aussi les
+fingerprints policy/snapshots et toutes les limites runtime liées. Les
+identifiants d'admission et de réservation sont des résultats transactionnels :
+ils sont liés à l'armement et affichés après commit, mais ne sont pas faussement
+présentés comme connus avant la confirmation. Une variation d'un seul champ
+d'entrée produit une phrase et une autorisation différentes. Il n'existe ni
+flag `--yes`, ni stdin pipe accepté, ni valeur permissive implicite.
 
 Le libellé `EXECUTOR_OPERATOR_ID` reste un identifiant d'audit public, pas une
 preuve d'identité humaine. La séparation entre le signataire Ed25519 du
 preflight et le compte PostgreSQL/terminal opérateur est un gate de déploiement
-documenté ; H2c ne prétend pas résoudre la compromission simultanée des deux.
+documenté, non un dual-control techniquement imposé. H2c ne prétend pas
+résoudre la compromission simultanée des deux.
 
 ## 5. Compatibilité PostgreSQL
 
@@ -141,6 +191,7 @@ La migration `039_execution_canary_operator_binding.sql` ajoute à
 
 ```text
 armament_request_fingerprint
+canary_evidence_fingerprint
 target_intent_id
 target_intent_state_revision
 target_strategy_id
@@ -149,6 +200,19 @@ target_decision_fingerprint
 target_mint
 target_quote_mint
 target_quote_amount_raw
+target_admission_report_id
+target_reservation_id
+target_policy_fingerprint
+target_wallet_snapshot_fingerprint
+target_provider_snapshot_fingerprint
+runtime_quote_max_age_ms
+runtime_slippage_bps
+runtime_snapshot_max_slot_lag
+runtime_max_compute_units
+runtime_max_fee_lamports
+runtime_max_fee_payer_lamport_debit
+runtime_max_rpc_calls_per_attempt
+runtime_lease_ms
 locked_intent_id
 locked_attempt_number
 locked_reservation_id
@@ -156,10 +220,22 @@ locked_lease_token
 locked_at
 ```
 
-Les lignes historiques V1 terminales restent lisibles et purgeables. La
-migration échoue volontairement si une ligne V1 est encore `ARMED` ou `LOCKED` :
-l'opérateur doit d'abord appliquer `ENTRY_STOP`/`HARD_STOP` et obtenir un état
-terminal. Après migration, toute nouvelle insertion doit être V2 avec l'ensemble
+La migration crée aussi `execution_pre_signature_locks`. Chaque ligne V1 lie
+de façon déterministe intention, tentative, révision, armement, réservation,
+génération, wallet, provider, message hash, bytes du message non signé, hash et
+bytes de la transaction non signée, build/snapshot/quote fingerprints,
+blockhash et dernière hauteur valide. Sa machine d'état fermée est
+`AUTHORIZED -> SIGNED_PERSISTED | REVOKED`, avec unicité par
+`(intent_id, attempt_number)` et par armement. Les bytes ne sont lisibles que
+par le rôle H2b live ; opérations, H2a, listener, API et rétention n'y accèdent
+pas.
+
+Les lignes historiques V1 terminales restent lisibles et purgeables grâce au
+discriminateur `payload_version=1`. La migration échoue volontairement si une
+ligne V1 est encore `ARMED` ou `LOCKED` : l'opérateur doit d'abord appliquer
+`ENTRY_STOP`/`HARD_STOP`, puis réconcilier tout artefact signé ou ambigu et
+obtenir un état terminal prouvé. Après migration, toute nouvelle insertion doit
+être `payload_version=2`, utiliser les domaines de hash `*-v2` et renseigner l'ensemble
 des bindings non nuls et canoniques. Les triggers rendent ces identités
 immuables ; seules les transitions d'état, le compteur et les colonnes de lock
 peuvent évoluer selon la matrice fermée.
@@ -169,6 +245,16 @@ de colonnes sont mis à jour. Aucun rôle listener, API ou H2a ne reçoit les by
 signés ou une nouvelle capacité de mutation. La rétention conserve quatre
 heures les lignes terminales et ne supprime jamais un verrou actif ou ambigu.
 
+Pour garantir l'atomicité sans dupliquer la politique, H2c extrait du repository
+risque les primitives transactionnelles d'append wallet/provider et
+`admitBuyInTransaction`, qui reçoivent le client PostgreSQL déjà verrouillé.
+Les méthodes publiques continuent à ouvrir leur propre transaction puis
+délèguent. Le repository opérations V2 utilise un adaptateur transaction-bound
+et appelle réellement `ExecutionAdmissionService` avant l'insertion de
+l'armement ; toute exception rollback snapshots, rapport, réservation,
+compteur provider, exposition et armement ensemble. L'ordre global des verrous
+reste présence SELL, génération, puis provider.
+
 ## 6. Verrou avant signature
 
 Le callback `BEFORE_SIGNING` ne fait plus une lecture simple. Pour un BUY il
@@ -177,15 +263,42 @@ appelle une opération transactionnelle unique qui :
 1. prend le verrou de présence SELL puis le verrou génération ;
 2. revalide claim, tentative, intention cible, qualification, contrôle,
    armement V2, risque, réservation, quota, provider et expiration ;
-3. effectue le CAS `ARMED -> LOCKED`, incrémente `consumed_buys` et lie
-   intention, tentative, réservation et lease ;
-4. journalise `ARMAMENT_LOCKED` ;
-5. retourne le binding opaque nécessaire au signer.
+3. persiste les bytes non signés exacts et leurs identités dans un lock
+   `AUTHORIZED` ;
+4. effectue le CAS `ARMED -> LOCKED`, incrémente `consumed_buys` et lie
+   intention, tentative, réservation, lock et lease ;
+5. journalise `ARMAMENT_LOCKED` ;
+6. retourne une capability opaque portant uniquement les bytes persistés et
+   l'identité du lock nécessaire au signer.
 
 L'appel au signer n'arrive qu'après commit de cette transaction. Une seconde
 instance ou une autre intention ne peut donc pas signer sous le même armement.
-`persistSigned` exige ensuite `LOCKED` et la liaison exacte ; il ne déplace plus
-l'armement et n'incrémente plus son compteur.
+Le signer signe les bytes retournés par la capability, jamais une copie mémoire
+non autorisée. `persistSigned` exige ensuite armement `LOCKED`, lock
+`AUTHORIZED`, mêmes bytes/message/fingerprints et liaison exacte ; il passe le
+lock à `SIGNED_PERSISTED`, mais ne déplace plus l'armement et n'incrémente plus
+son compteur.
+
+Deux fingerprints de snapshot restent distincts : la réservation compare son
+snapshot wallet risque au `target_wallet_snapshot_fingerprint` de l'armement ;
+l'artefact compare son snapshot de marché causal à la simulation non signée.
+Ils ne sont jamais comparés entre eux.
+
+Le lock exige que l'intention, l'armement, les snapshots, l'admission, la
+réservation et la qualification restent frais pendant au moins
+`runtime_lease_ms` après l'heure PostgreSQL du lock. Il ne suffit pas qu'ils
+soient simplement non expirés.
+
+L'armement impose déjà une marge d'au moins deux fois `runtime_lease_ms` sur la
+qualification, l'intention, les snapshots provider/wallet et le sidecar. Le
+premier lease couvre démarrage/claim/préparation ; le second laisse au lock une
+fenêtre complète. Un opérateur qui attend et consomme cette marge obtient un
+refus fail-closed et doit produire une nouvelle qualification, jamais une
+extension implicite.
+
+Pour CANARY, les configs opérations et H2b refusent `runtime_lease_ms` supérieur
+à 120 000 ms ; la qualification fixe de cinq minutes conserve ainsi la marge de
+deux leases. Les autres phases ne sont pas promues par H2c.
 
 Si le même lease rejoue la demande avant persistance, la même autorité est
 retournée. Si un nouveau lease rencontre un lock antérieur sans artefact signé,
@@ -196,8 +309,22 @@ défense dans le gate utilisent une transaction PostgreSQL unique qui :
 - abandonne la tentative ;
 - termine le BUY avec `PRE_SUBMISSION_REVOKED_NO_SEND` ;
 - libère la réservation et l'exposition ;
-- journalise les transitions et la preuve `SIGNING_LOCK_ABANDONED` ;
+- passe le lock à `REVOKED` ;
+- journalise les transitions et la preuve
+  `SYSTEM_PRE_SIGNATURE_LOCK_STRANDED` ;
 - laisse le contrôle au moins en `ENTRY_STOP`.
+
+Ces mutations forment une seule transaction. Toute voie qui terminalise un
+armement `LOCKED` sans artefact doit aussi abandonner la tentative, terminer le
+BUY, libérer réservation et exposition et journaliser le stop ; il n'existe pas
+de branche d'expiration ou de révocation partielle. La migration ajoute les
+reason codes stables `SYSTEM_PRE_SIGNATURE_LOCK_STRANDED`,
+`SYSTEM_SUBMISSION_AMBIGUOUS` et `SYSTEM_RECONCILIATION_UNKNOWN` aux événements
+de contrôle et un chemin SQL système strictement borné à
+`RUNNING -> ENTRY_STOP` ou au maintien de `ENTRY_STOP`. Les deux derniers sont
+aussi appliqués dans les transactions H2b qui rendent une soumission ambiguë ou
+une réconciliation inconnue. Le helper ne peut jamais reprendre `RUNNING`,
+abaisser `HARD_STOP`, armer, signer ou soumettre.
 
 Cette conclusion `NO_SEND` est valide parce que le gateway de soumission ne
 peut recevoir que des bytes relus depuis `execution_signed_transactions`, et
@@ -206,15 +333,20 @@ prévalent ; après `SUBMISSION_STARTED`, toute incertitude reste `AMBIGUOUS`.
 
 ## 7. Claim et démarrage fail-closed
 
-La claim BUY live ne sélectionne que `target_intent_id` de l'armement V2
-`ARMED` actif. Elle conserve le verrou de présence SELL et `READ COMMITTED`.
+La claim BUY live reçoit la `generationId` du runtime et ne sélectionne que le
+`target_intent_id` de l'armement V2 `ARMED` actif, avec admission et réservation
+exactes. Elle conserve le verrou
+de présence SELL et `READ COMMITTED`.
 Sans armement exact, aucune intention BUY n'est louée ni altérée.
 
-Avant d'ouvrir le keypair, H2b réconcilie d'abord sans signer l'éventuel lock BUY
-dont le lease est expiré et qui ne possède aucun artefact. Il applique alors la
+Avant d'ouvrir le keypair, H2b exécute un pre-pass PostgreSQL sans signer sur
+l'éventuel lock BUY dont le lease est expiré ou absent et qui ne possède aucun
+artefact. Le même pre-pass est exécuté avant chaque tour des quatre lanes H2b ;
+ce n'est ni une cinquième lane ni une responsabilité H2a. Il applique alors la
 révocation `NO_SEND` décrite en section 6. Un lock dont le lease appartient
-encore à une autre instance fait échouer ce démarrage concurrent avant ouverture
-du secret.
+encore à une autre instance fait échouer le démarrage concurrent avant ouverture
+du secret. H2a reste incapable de lire les bytes et ne reçoit aucune capacité
+pour effacer un lock pré-signature.
 
 Après cette reprise, le startup H2b exige au moins un des états suivants, lié
 exactement au runtime :
@@ -224,14 +356,17 @@ exactement au runtime :
 - artefact persisté à reprendre.
 
 Sinon il échoue avec un code redacted stable et ferme PostgreSQL sans charger le
-signer. Le démarrage ne consomme pas l'armement et ne remplace jamais la
-confirmation TTY.
+signer. Ce comportement fait volontairement de H2b un exécuteur à la demande,
+pas un daemon idle attendant une future entrée. Le démarrage ne consomme pas
+l'armement et ne remplace jamais la confirmation TTY.
 
 ## 8. Limites financières et « 10 USDT »
 
 « 10 USDT » est uniquement une enveloppe de risque décidée hors chaîne. H2c ne
 convertit jamais ce montant. L'opérateur fournit un plafond entier en lamports
-au moment exact de l'armement. Ce plafond couvre le BUY ; le gate signé
+au moment exact de l'armement. Ce plafond couvre le principal du BUY. Les
+plafonds `maxFeeLamports` et `maxFeePayerLamportDebit` sont liés séparément à
+la requête et revalidés par H2b ; le gate signé
 `WALLET_CHAIN_LIMITS_VERIFIED` doit aussi attester hors runtime que le wallet
 reste faiblement financé tout en conservant les frais, le débit maximal SELL et
 le rent buffer nécessaires à une sortie.
@@ -251,10 +386,18 @@ La procédure ne contient aucune commande englobante. Chaque étape impose une
 inspection humaine et un point d'arrêt :
 
 ```text
-build exact -> onze preuves fraîches -> live:preflight -> live:status
--> live:resume (TTY) -> live:arm exact-target (TTY) -> live:status/report
+listener observe/paper sans keypair + émission temporaire d'intentions
+-> sélection et gel de l'intention exacte -> arrêt du listener ou désactivation
+   vérifiée de l'émission -> build exact -> sidecar + onze preuves fraîches
+-> live:preflight -> live:status -> live:resume (TTY)
+-> live:arm exact-target + admission atomique (TTY) -> live:status/report
 -> démarrage H2a -> démarrage H2b -> monitoring continu
 ```
+
+L'émission utilise le producteur neutre existant, uniquement avec
+`EXECUTION_MODE=paper` et `EXECUTION_INTENT_EMISSION_ENABLED=true`. Le listener
+ne reçoit aucun keypair. Elle doit être remise à `false`, ou le listener arrêté,
+avant l'armement. La cible n'est jamais fabriquée par `INSERT`/`UPDATE` manuel.
 
 `ENTRY_STOP` bloque toute nouvelle entrée mais préserve SELL et réconciliation.
 `HARD_STOP` est réservé au cas où continuer à signer/envoyer est plus dangereux
@@ -280,17 +423,21 @@ H2c elle-même produit seulement `READY_FOR_EXTERNAL_PREFLIGHT`, jamais `PASS`.
 ## 11. Tests obligatoires
 
 - fingerprint de requête déterministe, exact et sensible à chaque champ ;
+- enveloppe sidecar signée, canonique, bornée, reliée aux deux gates de
+  snapshot et refusant toute divergence ;
 - phrase TTY complète et refus non-TTY/bypass ;
 - cible absente, SELL, expirée, louée, mauvais mint/quote/décision/révision ou
   montant supérieur au plafond refusée avant armement ;
+- admission rejetée, snapshot obsolète/supplanté, policy divergente ou
+  réservation non atomique : zéro armement et zéro exposition résiduelle ;
 - replay exact et concurrence de deux armements ;
 - migration vide, replay, upgrade 038 -> 039 et refus d'un V1 actif ;
 - claims BUY limitées à la cible, sans altérer les autres intentions ;
 - deux workers concurrents : un seul lock et un seul appel au signer ;
 - crash avant lock, après lock/avant signature, après signature/avant
   persistance, après persistance et après `SUBMISSION_STARTED` ;
-- reprise d'un lock abandonné : révocation et libération atomiques, aucun signer
-  ni provider contacté ;
+- reprise bootstrap et périodique d'un lock abandonné : révocation, stop et
+  libération atomiques, aucun signer ni provider contacté ;
 - races expiration/révocation/`ENTRY_STOP` au lock, à la persistance et au gate
   final ;
 - startup sans travail échoue avant `loadSigner` ;
