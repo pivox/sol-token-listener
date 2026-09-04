@@ -1,10 +1,10 @@
 # Orchestration persistante de l'exécuteur live — conception #51-H1
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.0.4
 
-**Version de la spécification parente :** 1.7.16
+**Version de la spécification parente :** 1.7.17
 
-**Version de la fondation live :** 1.0.16
+**Version de la fondation live :** 1.0.17
 
 **Date :** 2026-09-01
 
@@ -13,6 +13,12 @@ opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
 
+- **1.0.4 — 2026-09-04 :** étend le fence de présence SELL aux transitions
+  qui rendent une intention bloquante. La persistance signée SELL, la
+  réconciliation SELL `NO_EFFECT` et le port générique
+  `UNKNOWN_REQUIRES_RECONCILIATION -> RETRY_READY` prennent le verrou avant
+  tout verrou génération ou métier ; un claim BUY concurrent observe donc le
+  SELL activé après son commit, y compris si son état `PROCESSING` a expiré.
 - **1.0.3 — 2026-09-04 :** sérialise toute création d'intention SELL et tout
   claim BUY live par le verrou advisory partagé
   `execution-live-sell-presence:v1`. Le snapshot `NOT EXISTS` du claim BUY ne
@@ -95,10 +101,12 @@ complète sans rendre le dépôt démarrable en live prématurément.
 6. Confirmation et réconciliation ne lisent ni ne retournent les bytes signés.
 7. Toute lecture worker-ready revalide owner, token, statut, révision et
    expiration du lease après les verrous avec une heure DB fraîche.
-8. Toute création SELL et tout claim BUY live prennent le verrou advisory
-   partagé `execution-live-sell-presence:v1` avant de décider de la présence
-   d'un SELL. Le scan de deadline respecte l'ordre : scan global, présence
-   SELL, horloge DB, génération, puis lignes métier.
+8. Toute création ou activation d'un statut SELL bloquant et tout claim BUY live prennent le
+   verrou advisory partagé `execution-live-sell-presence:v1` avant de décider
+   de la présence d'un SELL. La persistance signée et une réactivation
+   `NO_EFFECT` le prennent avant le verrou génération. Le scan de deadline
+   respecte l'ordre : scan global, présence SELL, horloge DB, génération, puis
+   lignes métier.
 9. Les montants, slots, hauteurs, frais et révisions restent des `bigint`.
 10. Un commit inconnu, un crash ou un lease expiré se résout par rejeu exact ;
     jamais par création d'un second ordre.
@@ -143,6 +151,18 @@ donc rester invisible dans un snapshot antérieur à son commit. La transaction
 du claim BUY commence explicitement avec `BEGIN ISOLATION LEVEL READ
 COMMITTED` afin que la requête suivant l'attente forme un snapshot frais,
 indépendamment de la configuration par défaut de la session PostgreSQL.
+
+Le même fence précède toute transition d'un SELL depuis
+`UNKNOWN_REQUIRES_RECONCILIATION` vers `RETRY_READY`, qu'elle passe par la
+réconciliation live atomique ou le port de transition générique. Le verrou est
+pris avant le verrou génération puis avant les row locks ; aucune voie de
+réactivation ne peut ainsi commiter derrière le snapshot d'un claim BUY
+concurrent qui attend déjà le fence.
+
+La persistance d'un artefact signé SELL prend également ce fence avant le
+verrou génération. Cette règle est nécessaire lorsqu'un `PROCESSING` expire
+pendant son lease : il cesse alors de bloquer les BUY, tandis que sa transition
+vers `SIGNED_NOT_SUBMITTED` redevient bloquante sans condition d'expiration.
 
 ### 4.3 Reprise
 

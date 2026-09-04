@@ -1,6 +1,6 @@
 # Executor live — préparation du canary Mainnet (#51-G)
 
-**Version :** 1.1.5 — 2026-09-04
+**Version :** 1.1.6 — 2026-09-04
 
 Ce document décrit l'état réellement livré et la procédure qui deviendra
 applicable après composition du runtime. Le binaire production est actuellement
@@ -39,6 +39,15 @@ et reste vide dès qu'un SELL exécutable existe, même lorsque le rôle configu
 une isolation par défaut plus forte. Le scanner de deadline prend ses verrous
 dans l'ordre global scan, présence SELL, génération afin d'éviter inversion et
 interblocage.
+
+Une réconciliation SELL qui prouve `NO_EFFECT` ne rend pas l'intention
+`RETRY_READY` hors de ce fence. Elle prend d'abord le verrou de présence SELL,
+puis le verrou génération et les lignes métier. La transition générique
+équivalente applique le même ordre avant son row lock.
+
+La persistance signée d'un SELL prend elle aussi le verrou de présence avant la
+génération. Un SELL `PROCESSING` expiré pendant son lease ne peut donc devenir
+`SIGNED_NOT_SUBMITTED` en concurrence invisible avec un claim BUY.
 
 Le dernier verrou PostgreSQL est atomique : avant `SUBMISSION_STARTED`, il
 revalide la génération active, les bindings runtime/déploiement, le provider,

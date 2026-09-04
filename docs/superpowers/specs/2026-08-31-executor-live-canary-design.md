@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.0.16
+**Version de spécification :** 1.0.17
 
-**Version de la spécification parente :** 1.7.16
+**Version de la spécification parente :** 1.7.17
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.17 — 2026-09-04 :** étend le verrou de priorité SELL aux
+  persistances signées et aux réactivations
+  `UNKNOWN_REQUIRES_RECONCILIATION -> RETRY_READY`, notamment la réconciliation
+  SELL `NO_EFFECT`, avant tout verrou génération ou métier.
 - **1.0.16 — 2026-09-04 :** sérialise la priorité SELL avec un verrou advisory
   partagé par toutes les créations SELL et les claims BUY live. Un BUY ne peut
   plus observer l'absence d'un SELL dont l'insertion concurrente n'est pas

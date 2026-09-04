@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.7.16
+**Version de spécification :** 1.7.17
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,11 @@
 
 ## Historique des versions
 
+- **1.7.17 — 2026-09-04 :** applique le fence de présence SELL non seulement
+  aux créations mais aussi à la persistance signée et aux réactivations après
+  preuve `NO_EFFECT`. Ces voies prennent ce verrou avant la génération et les
+  lignes métier, fermant les courses avec un claim BUY, y compris après
+  expiration de l'état `PROCESSING`.
 - **1.7.16 — 2026-09-04 :** ferme la course entre un claim BUY live et la
   création concurrente d'un SELL avec un verrou advisory transactionnel
   partagé. Toutes les voies de création SELL participent au même fence ; le
