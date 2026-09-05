@@ -1,8 +1,8 @@
 # Autorité PostgreSQL du worker de simulation — conception #51-H2j
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.0.2
 
-**Version de la spécification parente visée :** 1.11.17
+**Version de la spécification parente visée :** 1.11.18
 
 **Date :** 2026-09-05
 
@@ -14,6 +14,10 @@
 
 ## Historique des versions
 
+- **1.0.2 — 2026-09-05 :** lie les policies au rôle worker par OID lors du
+  provisioning, remplace la détection de session par des guards
+  `SECURITY INVOKER` sous RLS et ferme les dérives de forme, `REVOKE` et
+  renommage observées pendant les revues P1/P2/P3.
 - **1.0.1 — 2026-09-05 :** ajoute une partition de lignes monotone entre le
   worker non signant et les intentions réservées au live, avec RLS restrictive,
   promotion transactionnelle et verrouillage des écritures enfants.
@@ -96,32 +100,47 @@ avec `live_reserved=true`; son rejeu exige la même valeur. La promotion du
 parent rend atomiquement inaccessibles au worker ses lignes enfants déjà
 présentes, sans les réécrire.
 
-La migration 040 backfill `true` pour toute intention déjà reliée à une
-racine live : cible ou lock d'un armement, lock pré-signature, transaction
-signée, BUY ou sortie d'une position live, ou autorisation de sortie lockée.
-Elle n'ajoute ni backfill ni colonne aux quatre tables enfants.
+Avant `ADD COLUMN IF NOT EXISTS`, la migration 040 valide la forme d'une
+éventuelle colonne `live_reserved` préexistante : type `BOOLEAN`, contrainte
+`NOT NULL` et `DEFAULT FALSE`. Toute forme divergente échoue avant le backfill.
+Celui-ci pose `true` pour toute intention déjà reliée à une racine live : cible ou lock d'un
+armement, lock pré-signature, transaction signée, BUY ou sortie d'une position
+live, ou autorisation de sortie lockée. La migration n'ajoute ni backfill ni
+colonne aux quatre tables enfants.
 
-Les cinq tables ont `ENABLE ROW LEVEL SECURITY` sans `FORCE ROW LEVEL SECURITY` :
-le propriétaire administratif conserve ainsi le bypass nécessaire aux
-migrations suivantes. Une policy permissive conserve le filtrage par ACL pour
-les autres rôles ; une policy `AS RESTRICTIVE` limite toute session membre de
-`sol_token_executor_worker` à l'intention `live_reserved=false`, directement
-sur le parent et via un `EXISTS` corrélé par `intent_id` sur chaque enfant, en
-lecture comme en `WITH CHECK`. La détection porte sur `session_user`, pas
-seulement sur `current_user`, afin de couvrir le login mono-membre qui exécute
-`SET ROLE`.
-Elle résout d'abord l'OID dans `pg_roles`, puis appelle `pg_has_role` seulement
-si le groupe existe : une base vide peut donc appliquer la migration 040 avant
-le provisioning des rôles.
+Les cinq tables ont `ENABLE ROW LEVEL SECURITY` sans `FORCE ROW LEVEL SECURITY`.
+Une policy permissive conserve le filtrage par ACL pour les autres rôles ; une
+policy `AS RESTRICTIVE` limite le worker à l'intention
+`live_reserved=false`, directement sur le parent et via un `EXISTS` corrélé par
+`intent_id` sur chaque enfant, en lecture comme en `WITH CHECK`.
+
+PostgreSQL stocke les cibles de policy comme des OID de rôles. La migration 040
+installe donc les policies directement si `sol_token_executor_worker` existe
+déjà. Si le rôle est absent sur une base vide, elle installe à la place un
+placeholder restrictif `TO PUBLIC USING (TRUE) WITH CHECK (TRUE)`, neutre pour
+le comportement mais visible dans l'inventaire. Le provisioning, exécuté après
+la création du groupe `NOLOGIN`, remplace toujours ces cinq policies par leurs
+versions `TO sol_token_executor_worker`, désormais liées à son OID.
+
+Cette liaison ne dépend ni de `session_user`, ni d'un test dynamique de
+membership. Une session déjà en `SET ROLE` reste couverte après un `REVOKE` de
+membership, car son `current_user` conserve l'OID actif jusqu'à sa fin. Un
+renommage conserve également l'OID et ne détache pas les policies. Le `REVOKE`
+empêche en parallèle les nouvelles sessions d'activer le groupe.
 
 Les quatre tables enfants ont en plus un guard `BEFORE INSERT OR UPDATE`
-`SECURITY DEFINER`, avec `search_path` fermé et privilège `EXECUTE` révoqué à
-`PUBLIC`. Pour une session worker, le guard ne verrouille et ne retourne que le
-parent portant `live_reserved=false`. Il ne révèle ni ne rend modifiable un
-parent live. Pour les rôles administratifs/live autorisés, il verrouille le
-parent sans dupliquer son état. Le verrou parent sérialise avec une promotion
-concurrente : une écriture enfant finit avant la promotion, ou observe `true`
-et devient inaccessible au worker.
+`SECURITY INVOKER`, avec `search_path` fermé et privilège `EXECUTE` révoqué à
+`PUBLIC` et au worker. Une fonction de trigger n'exige pas ce grant direct. Sa
+lecture du parent s'exécute sous le rôle appelant et reste donc soumise à RLS :
+le worker ne peut verrouiller qu'un parent non live visible. Le `WITH CHECK` de
+la policy enfant refuse ensuite toute écriture dont le parent est masqué. Le
+verrou parent sérialise avec une promotion concurrente : une écriture enfant
+finit avant la promotion, ou observe le parent réservé et échoue fermée.
+
+Le worker reçoit `SELECT(live_reserved)` parce que les requêtes de claim
+explicites et la policy du parent en ont techniquement besoin. Cette lecture ne
+révèle jamais une ligne `true`, déjà masquée par RLS, et le marqueur n'est exposé
+par aucun contrat domaine ou API.
 
 Les claims constituent une seconde défense explicite. `DRY_RUN` et `EXECUTE`
 exigent `live_reserved=false`; `LIVE_EXECUTE`, `LIVE_RECOVER`, `CONFIRM` et
@@ -139,6 +158,12 @@ réconciliation. Il n'obtient aucun droit de DDL, aucune autre séquence et aucu
 une ligne après sa promotion. Cette isolation de lignes n'ajoute aucun import de
 signer et aucune capacité de signature ou de soumission.
 
+Le `owner`, un superuser ou un rôle doté de `BYPASSRLS` contourne RLS par
+définition PostgreSQL. Cette limite est une frontière de confiance
+intentionnelle : le migrateur administratif reste propriétaire, tandis que les
+logins de service et leurs groupes sont validés non propriétaires,
+`NOSUPERUSER` et `NOBYPASSRLS` à chaque checkout.
+
 ## 5. Connexion
 
 Le login de déploiement est mono-membre, `NOINHERIT`, sans privilège direct.
@@ -154,8 +179,15 @@ passe ou URL n'est accepté par le script de provisioning.
   paramètre et propriété, puis vérifie leur suppression ou leur rejet fermé ;
 - inventaire dynamique de toutes les relations et séquences `execution_*` ;
 - test de migration et de backfill des racines live existantes ;
+- rejet d'une colonne `live_reserved` préexistante dont le type, la nullabilité
+  ou le défaut diffère de `BOOLEAN NOT NULL DEFAULT FALSE` ;
 - test RLS sous le login dédié sur les cinq tables, incluant lecture, mutation,
   insertion enfant et course avec la promotion ;
+- application de migration sans rôle via placeholder, puis remplacement des
+  policies par le provisioning et vérification de leurs OID cibles ;
+- conservation de la partition pour une session active après `REVOKE` du
+  membership et après renommage du groupe ;
+- vérification des guards enfants `SECURITY INVOKER` réellement soumis à RLS ;
 - test des claims non signants sur `false` et live sur `true` ;
 - test de rollback atomique de la promotion BUY et de création SELL live ;
 - exécution réelle du flux `dry-run` sous le login dédié ;

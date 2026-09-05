@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.15
+**Version de spécification :** 1.2.16
 
-**Version de la spécification parente :** 1.11.17
+**Version de la spécification parente :** 1.11.18
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.16 — 2026-09-05 :** finalise la partition H2j avec policies liées à
+  l'OID du worker, guards `SECURITY INVOKER` et validation fermée du schéma.
 
 - **1.2.15 — 2026-09-05 :** sépare par RLS les intentions non signantes des
   intentions réservées au live et rend leur promotion monotone et atomique.
@@ -578,10 +581,16 @@ intention `live_reserved=true` ou ses enfants, qui sont filtrés par
 `live_reserved=false`; les claims `LIVE_EXECUTE`, `LIVE_RECOVER`, `CONFIRM` et
 `RECONCILE` exigent `live_reserved=true`. Le propriétaire administratif et
 migrateur conserve son bypass avec RLS sans `FORCE ROW LEVEL SECURITY`. Le
-worker reçoit `SELECT(live_reserved)` uniquement si PostgreSQL le démontre
-techniquement nécessaire à la policy ; le marqueur ne rejoint aucun contrat
-domaine ou API. Le déni de service pré-promotion reste le risque résiduel, sans
-capacité de signature ni de soumission.
+worker reçoit `SELECT(live_reserved)`, exigé techniquement par PostgreSQL pour
+les predicates de claim et la policy ; le marqueur ne rejoint aucun contrat
+domaine ou API. La migration refuse une forme différente de `BOOLEAN NOT NULL DEFAULT
+FALSE` et laisse un placeholder neutre lorsque le rôle est absent. Le
+provisioning remplace ce placeholder par des policies liées à l'OID du worker ;
+les guards enfants `SECURITY INVOKER` s'exécutent sous RLS. La partition résiste
+au `REVOKE` d'une session déjà active et au renommage du rôle. Le `owner`, les
+superusers et rôles `BYPASSRLS` forment une limite de confiance intentionnelle.
+Le déni de service pré-promotion reste le risque résiduel, sans capacité de
+signature ni de soumission.
 
 ## 13. Reason codes append-only
 

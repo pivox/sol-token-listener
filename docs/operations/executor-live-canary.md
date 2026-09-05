@@ -1,9 +1,10 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.13.0 — 2026-09-05
+**Version :** 1.14.0 — 2026-09-05
 
-La version 1.13.0 ajoute la partition RLS des intentions réservées au live,
-porte le head de migration à 040 et maintient le canary non démarré.
+La version 1.14.0 finalise les corrections P1/P2/P3 de la partition RLS H2j.
+La version 1.13.0 avait ajouté cette partition et porté le head de migration à
+040. Le canary reste non démarré.
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -183,10 +184,19 @@ ni altérer une intention `live_reserved=true` ou ses enfants. Les claims
 `DRY_RUN` et `EXECUTE` exigent `live_reserved=false`; `LIVE_EXECUTE`,
 `LIVE_RECOVER`, `CONFIRM` et `RECONCILE` exigent `live_reserved=true`. Le
 propriétaire administratif et migrateur conserve son bypass avec RLS sans
-`FORCE ROW LEVEL SECURITY`. Le worker ne reçoit `SELECT(live_reserved)` que si
-PostgreSQL le démontre techniquement exigé pour la policy ; cette colonne ne
-devient jamais un contrat domaine ou API. Le déni de service pré-promotion
-reste possible, sans capacité de signature ni de soumission.
+`FORCE ROW LEVEL SECURITY`. `SELECT(live_reserved)` est exigé techniquement par
+PostgreSQL pour les predicates de claim et la policy, mais RLS masque toute
+ligne `true` et la colonne ne devient jamais un contrat domaine ou API. La
+migration refuse une
+forme préexistante différente de `BOOLEAN NOT NULL DEFAULT FALSE`. Lorsque le
+rôle worker est absent, elle installe un placeholder restrictif neutre ; le
+provisioning le remplace par cinq policies liées à l'OID du groupe. Les guards
+enfants sont `SECURITY INVOKER` et restent soumis à RLS. Un `REVOKE` bloque les
+nouvelles activations sans libérer une session déjà en `SET ROLE`; un renommage
+conserve le même OID et la même policy. Le `owner`, les superusers et rôles
+`BYPASSRLS` constituent une limite de confiance intentionnelle réservée à
+l'administration. Le déni de service pré-promotion reste possible, sans
+capacité de signature ni de soumission.
 
 ## Produire la preuve Helius H2e
 

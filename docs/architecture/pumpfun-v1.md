@@ -559,11 +559,18 @@ tables ; les enfants restent liés par `intent_id` sans recopier le marqueur.
 Les claims non signants `DRY_RUN`/`EXECUTE` ciblent `false`, tandis que les
 claims live `LIVE_EXECUTE`/`LIVE_RECOVER`/`CONFIRM`/`RECONCILE` exigent `true`.
 RLS n'est pas forcée : le propriétaire administratif chargé des migrations
-conserve son bypass. `SELECT(live_reserved)` n'est accordé au worker que si le
-moteur PostgreSQL le requiert techniquement pour appliquer la policy, sans
-exposition au domaine ou à l'API. Avant promotion, un worker compromis peut
-encore provoquer un déni de service sur une candidate ; il n'obtient pour
-autant aucune capacité de signer ou soumettre une transaction.
+conserve son bypass. La migration vérifie que toute colonne préexistante a la
+forme exacte `BOOLEAN NOT NULL DEFAULT FALSE`. Si le rôle worker est absent,
+elle pose un placeholder neutre ; le provisioning le remplace par des policies
+liées à l'OID du groupe. Les guards enfants `SECURITY INVOKER` lisent et
+verrouillent le parent sous RLS. La protection persiste pour une session active
+après `REVOKE` du membership et après renommage, puisque l'OID ne change pas.
+`SELECT(live_reserved)` est exigé techniquement par PostgreSQL pour les
+predicates de claim et la policy, sans exposition au domaine ou à l'API. Les
+owners, superusers et rôles `BYPASSRLS` restent une limite administrative
+intentionnelle. Avant promotion, un worker compromis peut encore provoquer un
+déni de service sur une candidate ; il n'obtient pour autant aucune capacité
+de signer ou soumettre une transaction.
 
 ## Persistance, reprise et rétention
 

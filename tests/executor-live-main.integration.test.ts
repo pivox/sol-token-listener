@@ -153,7 +153,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.17',
+    '**Version de spécification :** 1.11.18',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -169,22 +169,22 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     simulationDatabaseAuthoritySpecification,
-    '**Version de spécification :** 1.0.1',
+    '**Version de spécification :** 1.0.2',
     'simulation database authority specification version',
   );
   assertContainsExactlyOnce(
     simulationDatabaseAuthoritySpecification,
-    '**Version de la spécification parente visée :** 1.11.17',
+    '**Version de la spécification parente visée :** 1.11.18',
     'simulation database authority parent specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.15',
+    '**Version de spécification :** 1.2.16',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.17',
+    '**Version de la spécification parente :** 1.11.18',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -249,7 +249,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.13.0 — 2026-09-05',
+    '**Version :** 1.14.0 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
@@ -323,6 +323,18 @@ void test('documents H2d-H2j external evidence without starting a canary',
     assert.match(document,
       /DRY_RUN[\s\S]*EXECUTE[\s\S]*live_reserved=false[\s\S]*LIVE_EXECUTE[\s\S]*LIVE_RECOVER[\s\S]*CONFIRM[\s\S]*RECONCILE[\s\S]*live_reserved=true/iu);
   }
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /polic(?:y|ies)[\s\S]*OID[\s\S]*provisioning/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /rôle[\s\S]*absent[\s\S]*placeholder/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /SECURITY INVOKER[\s\S]*RLS/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /REVOKE[\s\S]*(?:rename|renommage)[\s\S]*OID/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /forme[\s\S]*live_reserved[\s\S]*BOOLEAN[\s\S]*NOT NULL[\s\S]*DEFAULT FALSE/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /owner[\s\S]*BYPASSRLS[\s\S]*(?:limite|frontière)[\s\S]*intentionnelle/iu);
   assert.match(
     runbook,
     /paramètres de simulation non signants[\s\S]*URL RPC potentiellement\s+confidentielle[\s\S]*fichier externe `0600`[\s\S]*jamais\s+journalisée/iu,

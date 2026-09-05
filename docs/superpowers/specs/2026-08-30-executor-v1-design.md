@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.17
+**Version de spécification :** 1.11.18
 
 **Date :** 2026-08-31
 
@@ -17,6 +17,10 @@ read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i
 et autorité PostgreSQL fermée du worker non signant #51-H2j
 
 ## Historique des versions
+
+- **1.11.18 — 2026-09-05 :** finalise H2j après P1/P2/P3 avec policies liées
+  à l'OID du worker, guards enfants `SECURITY INVOKER` sous RLS et résistance
+  aux dérives de schéma, `REVOKE` et renommage.
 
 - **1.11.17 — 2026-09-05 :** réserve les intentions live par un marqueur
   monotone et isole leurs lignes des workers non signants avec RLS, sans
@@ -452,10 +456,18 @@ enfants sont filtrés par leur `intent_id`, sans booléen dupliqué. `DRY_RUN` e
 `LIVE_RECOVER`, `CONFIRM` et `RECONCILE` réclament seulement
 `live_reserved=true`. Le propriétaire administratif et migrateur conserve son
 bypass grâce à RLS sans `FORCE ROW LEVEL SECURITY`. Un
-`SELECT(live_reserved)` n'est accordé au worker que s'il est techniquement
-exigé par PostgreSQL pour appliquer la policy, jamais pour exposer le marqueur
-au domaine ou à l'API. Le risque résiduel est un déni de service pré-promotion ;
-il ne donne aucune capacité de signature ou de soumission.
+`SELECT(live_reserved)` est exigé techniquement par PostgreSQL pour les
+predicates de claim et la policy, mais ne révèle aucune ligne `true` et
+n'expose pas le marqueur au domaine ou à l'API. La migration valide la forme
+exacte `BOOLEAN NOT NULL
+DEFAULT FALSE`. Si le rôle est absent, elle crée un placeholder neutre ; le
+provisioning le remplace par des policies liées à l'OID du worker. Les guards
+enfants `SECURITY INVOKER` restent soumis à RLS. Un `REVOKE` empêche les
+nouvelles sessions et un renommage conserve l'OID ; une session worker déjà
+active reste filtrée. Le `owner`, les superusers et rôles `BYPASSRLS` restent
+une frontière de confiance intentionnelle. Le risque résiduel est un DoS
+pré-promotion ; il ne donne aucune capacité de signature ou de
+soumission.
 
 ### 4.3 Secrets
 
