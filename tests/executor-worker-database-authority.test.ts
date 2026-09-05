@@ -399,9 +399,13 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       await assertDynamicExecutionInventory(isolated);
       await assertClosedObjectAuthority(worker, privateSchema, isolated);
       await assertWorkerLivePartition(worker, isolated);
+      const activeWorkerPool = worker;
+      const partitionAdmin = isolated;
       await context.test(
         'an active worker SET ROLE session stays partitioned after membership revocation',
-        async () => assertRevokedWorkerSessionPartition(worker, isolated, loginName),
+        async () => assertRevokedWorkerSessionPartition(
+          activeWorkerPool, partitionAdmin, loginName,
+        ),
       );
 
       const publicParameterProbe = await isolated.connect();
