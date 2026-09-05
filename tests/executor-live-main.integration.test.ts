@@ -80,6 +80,10 @@ const preflightSourceSpecificationUrl = new URL(
   '../docs/superpowers/specs/2026-09-05-executor-preflight-source-design.md',
   import.meta.url,
 );
+const simulationDatabaseAuthoritySpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-09-05-executor-simulation-database-authority-design.md',
+  import.meta.url,
+);
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 
@@ -98,6 +102,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
     preflightBundleSpecification,
     preflightDraftSpecification,
     preflightSourceSpecification,
+    simulationDatabaseAuthoritySpecification,
     runbook,
     deploymentSmoke,
   ] =
@@ -114,6 +119,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
       readFile(preflightBundleSpecificationUrl, 'utf8'),
       readFile(preflightDraftSpecificationUrl, 'utf8'),
       readFile(preflightSourceSpecificationUrl, 'utf8'),
+      readFile(simulationDatabaseAuthoritySpecificationUrl, 'utf8'),
       readFile(runbookUrl, 'utf8'),
       readFile(deploymentSmokeUrl, 'utf8'),
     ]);
@@ -160,6 +166,16 @@ void test('documents H2d-H2j external evidence without starting a canary',
       + 'read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i\n'
       + 'et autorité PostgreSQL fermée du worker non signant #51-H2j',
     'parent delivered scope',
+  );
+  assertContainsExactlyOnce(
+    simulationDatabaseAuthoritySpecification,
+    '**Version de spécification :** 1.0.1',
+    'simulation database authority specification version',
+  );
+  assertContainsExactlyOnce(
+    simulationDatabaseAuthoritySpecification,
+    '**Version de la spécification parente visée :** 1.11.17',
+    'simulation database authority parent specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,

@@ -2,7 +2,7 @@
 
 **Version de spécification :** 1.0.1
 
-**Version de la spécification parente visée :** 1.11.16
+**Version de la spécification parente visée :** 1.11.17
 
 **Date :** 2026-09-05
 
