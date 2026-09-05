@@ -10,6 +10,7 @@ import {
   EXECUTION_READINESS_COLUMN_PRIVILEGES,
   ExecutionReadinessDatabaseError,
 } from '../src/executor-readiness/database.js';
+import { migrateDatabase } from '../src/storage/database.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 void test('pins and validates the readiness role on every checkout', async () => {
@@ -76,30 +77,49 @@ void test('PostgreSQL 16 login has exact readiness authority and no live authori
     context.skip('TEST_DATABASE_URL absent: readiness role integration skipped');
     return;
   }
-  const admin = new pg.Pool({ connectionString: databaseUrl });
+  const maintenance = new pg.Pool({ connectionString: databaseUrl });
   const suffix = randomUUID().replaceAll('-', '');
+  const databaseName = `readiness_role_${suffix}`;
   const login = `readiness_${suffix}`;
   const password = randomUUID().replaceAll('-', '');
+  const isolatedUrl = new URL(databaseUrl);
+  isolatedUrl.pathname = `/${databaseName}`;
+  let isolated: InstanceType<typeof pg.Pool> | undefined;
   let loginPool: InstanceType<typeof pg.Pool> | undefined;
-  const releaseRoleLock = await acquireExecutorRoleTestLock(admin);
+  let databaseCreated = false;
+  let loginCreated = false;
+  const releaseRoleLock = await acquireExecutorRoleTestLock(maintenance);
   try {
-    const server = await admin.query<{ server_version_number: number }>(
-      "SELECT current_setting('server_version_num')::INTEGER AS server_version_number",
+    const server = await maintenance.query<{
+      server_version_number: number;
+      rolsuper: boolean;
+      rolcreatedb: boolean;
+    }>(
+      `SELECT current_setting('server_version_num')::INTEGER AS server_version_number,
+        role.rolsuper,role.rolcreatedb FROM pg_roles role WHERE role.rolname=current_user`,
     );
-    const serverVersion = server.rows[0]?.server_version_number ?? 0;
-    if (serverVersion < 160_000 || serverVersion >= 170_000) {
-      context.skip('PostgreSQL 16 is required for readiness role integration');
+    const capability = server.rows[0];
+    if (capability === undefined || capability.server_version_number < 160_000
+      || capability.server_version_number >= 170_000
+      || !capability.rolsuper || !capability.rolcreatedb) {
+      context.skip('PostgreSQL 16 superuser with CREATEDB is required for readiness role integration');
       return;
     }
+    await maintenance.query(`CREATE DATABASE "${databaseName}" TEMPLATE template0`);
+    databaseCreated = true;
+    const isolatedPool = new pg.Pool({ connectionString: isolatedUrl.href });
+    isolated = isolatedPool;
+    await migrateDatabase({ pool: isolatedPool });
     const sql = await readFile(new URL('../scripts/provision-executor-roles.sql', import.meta.url),
       'utf8');
-    await admin.query(sql);
-    await admin.query(sql);
-    await admin.query(`CREATE ROLE "${login}" LOGIN NOINHERIT NOSUPERUSER NOCREATEDB
+    await isolatedPool.query(sql);
+    await isolatedPool.query(sql);
+    await maintenance.query(`CREATE ROLE "${login}" LOGIN NOINHERIT NOSUPERUSER NOCREATEDB
       NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${password}'`);
-    await admin.query(`GRANT sol_token_executor_readiness TO "${login}"
+    loginCreated = true;
+    await maintenance.query(`GRANT sol_token_executor_readiness TO "${login}"
       WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
-    const url = new URL(databaseUrl);
+    const url = new URL(isolatedUrl);
     url.username = login;
     url.password = password;
     const activePool = new pg.Pool({ connectionString: url.href, max: 1 });
@@ -118,12 +138,22 @@ void test('PostgreSQL 16 login has exact readiness authority and no live authori
     } finally {
       client.release();
     }
+    await isolatedPool.query(`GRANT SELECT (signed_transaction_bytes)
+      ON TABLE execution_signed_transactions TO PUBLIC`);
+    try {
+      await assert.rejects(database.pool.connect(), ExecutionReadinessDatabaseError);
+    } finally {
+      await isolatedPool.query(`REVOKE SELECT (signed_transaction_bytes)
+        ON TABLE execution_signed_transactions FROM PUBLIC`);
+    }
   } finally {
     try {
       if (loginPool !== undefined) await loginPool.end();
-      await admin.query(`DROP ROLE IF EXISTS "${login}"`);
+      if (isolated !== undefined) await isolated.end();
+      if (loginCreated) await maintenance.query(`DROP ROLE IF EXISTS "${login}"`);
+      if (databaseCreated) await maintenance.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
     } finally {
-      try { await releaseRoleLock(); } finally { await admin.end(); }
+      try { await releaseRoleLock(); } finally { await maintenance.end(); }
     }
   }
 });
