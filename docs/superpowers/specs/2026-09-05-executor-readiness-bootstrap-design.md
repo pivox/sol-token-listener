@@ -1,6 +1,6 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
 **Version de la spécification parente :** 1.11.6
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.3 — 2026-09-05 :** ferme les quatre constats du premier cycle de
+  revue : ACL exactes par tuple, expiration revérifiée après la collecte,
+  corps RPC borné pendant le streaming et block time attaché au slot retenu.
 
 - **1.0.2 — 2026-09-05 :** précise la fermeture des enveloppes JSON-RPC et
   des trois preuves imbriquées avant toute connexion PostgreSQL.
@@ -121,7 +125,9 @@ Le transport RPC H2d possède uniquement :
 - `getBalance` du wallet au même commitment ;
 - `getTokenAccountsByOwner` pour SPL Token puis Token-2022.
 
-Chaque appel possède un timeout, une réponse maximale et un schéma fermé.
+Chaque appel possède un timeout, une réponse maximale et un schéma fermé. La
+limite est appliquée pendant la lecture du flux HTTP, même sans
+`Content-Length`, et non après sa matérialisation en mémoire.
 L'enveloppe de réponse contient exactement `jsonrpc`, l'identifiant numérique
 égal à celui de la requête, et `result` ; tout champ supplémentaire, erreur ou
 identifiant divergent est refusé. Le genesis renvoyé doit égaler
@@ -141,6 +147,10 @@ autorisation de dépense.
 La collecte ne télécharge pas l'historique du wallet et ne déduit pas qu'un
 wallet est sûr de son seul solde.
 
+Le slot persisté est le plus haut slot cohérent des lectures financières et
+`blockTime` est demandé pour ce même slot. Il n'est jamais repris du slot de
+départ lorsque les réponses ont avancé dans la tolérance autorisée.
+
 ## 6. Preuve de quota fournisseur
 
 Le quota contractuel ne peut pas être appris de Solana. H2d lit donc
@@ -158,7 +168,9 @@ La durée de validité ne dépasse pas cinq minutes pour
 `OPERATOR_REPORT` et quinze minutes pour `AUTHORITATIVE_PROBE`. Le provider doit
 égaler `EXECUTOR_RPC_PROVIDER_ID`, la mesure ne peut être future et les unités
 sont des `bigint` décimaux non négatifs. La signature est vérifiée avant toute
-écriture. H2d ne contient aucun générateur de cette enveloppe et n'accepte pas
+écriture. L'horloge est relue après les appels réseau et avant cette
+vérification ; une preuve expirée pendant la collecte est refusée. H2d ne
+contient aucun générateur de cette enveloppe et n'accepte pas
 un JSON non signé.
 
 Le repository refuse également tout champ supplémentaire dans la génération,
@@ -227,6 +239,10 @@ Chaque checkout force `SET ROLE sol_token_executor_readiness`,
 `search_path=pg_catalog,public` et `session_replication_role=origin`, puis
 revalide PostgreSQL 16, le membership exact, la migration 039 et l'allowlist
 effective complète.
+
+L'allowlist de colonnes est comparée tuple par tuple (`table`, `colonne`,
+`privilège`) dans un ordre canonique. Une dérive qui révoque un droit autorisé
+et ajoute un droit sensible avec la même cardinalité est donc refusée.
 
 ## 9. Atomicité, reprise et rétention
 

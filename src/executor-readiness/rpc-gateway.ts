@@ -84,8 +84,6 @@ export class SolanaReadinessRpcGateway {
       const baseSlot = unsignedSafeInteger(await this.dispatch('getSlot', Object.freeze([
         Object.freeze({ commitment: 'finalized' as const }),
       ]), signal));
-      const blockTimeRaw = await this.dispatch('getBlockTime', Object.freeze([baseSlot]), signal);
-      const blockTimeMs = blockTimeRaw === null ? null : timestampSeconds(blockTimeRaw) * 1_000;
       const balance = contextValue(await this.dispatch('getBalance', Object.freeze([
         walletPublicKey,
         Object.freeze({ commitment: 'finalized' as const, minContextSlot: baseSlot }),
@@ -98,6 +96,9 @@ export class SolanaReadinessRpcGateway {
       const lowest = slots.reduce((left, right) => left < right ? left : right);
       const highest = slots.reduce((left, right) => left > right ? left : right);
       if (highest - lowest > BigInt(maximumSlotLag)) throw failure('SLOT_LAG_EXCEEDED');
+      const snapshotSlot = Number(highest);
+      const blockTimeRaw = await this.dispatch('getBlockTime', Object.freeze([snapshotSlot]), signal);
+      const blockTimeMs = blockTimeRaw === null ? null : timestampSeconds(blockTimeRaw) * 1_000;
       const observedAtMs = timestampMilliseconds(now());
       return Object.freeze({ slot: highest, blockTimeMs, observedAtMs,
         walletLamports: unsignedBigint(balance.value),
@@ -157,9 +158,13 @@ export class SolanaReadinessRpcGateway {
     if (declaredLength !== null && Number(declaredLength) > MAX_RESPONSE_BYTES) {
       throw failure('RPC_RESPONSE_TOO_LARGE');
     }
-    const text = await response.text();
-    if (Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES) {
-      throw failure('RPC_RESPONSE_TOO_LARGE');
+    let text: string;
+    try {
+      text = await readBoundedResponse(response, signal);
+    } catch (error) {
+      if (error instanceof ResponseTooLargeError) throw failure('RPC_RESPONSE_TOO_LARGE');
+      if (signal.aborted) throw failure('OPERATION_ABORTED');
+      throw failure('RPC_UNAVAILABLE');
     }
     try {
       const envelope = JSON.parse(text) as unknown;
@@ -179,6 +184,40 @@ export class SolanaReadinessRpcGateway {
     if (!(signal instanceof AbortSignal)) throw failure('INVALID_INPUT');
     if (signal.aborted) throw failure('OPERATION_ABORTED');
   }
+}
+
+class ResponseTooLargeError extends Error {}
+
+async function readBoundedResponse(response: Response, signal: AbortSignal): Promise<string> {
+  if (response.body === null) throw new TypeError();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const abort = (): void => { void reader.cancel().catch(() => undefined); };
+  signal.addEventListener('abort', abort, { once: true });
+  try {
+    for (;;) {
+      const item = await reader.read();
+      if (item.done) break;
+      if (!(item.value instanceof Uint8Array)) throw new TypeError();
+      total += item.value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        try { await reader.cancel(); } catch { /* Preserve the size error. */ }
+        throw new ResponseTooLargeError();
+      }
+      chunks.push(item.value);
+    }
+  } finally {
+    signal.removeEventListener('abort', abort);
+    reader.releaseLock();
+  }
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder('utf-8', { fatal: true }).decode(combined);
 }
 
 function contextValue(value: unknown): Readonly<{ slot: bigint; value: unknown }> {

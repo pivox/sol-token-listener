@@ -9,7 +9,60 @@ import { PostgresExecutionReadinessRepository } from
   '../storage/execution-readiness.repository.js';
 
 export const EXECUTION_READINESS_ROLE = 'sol_token_executor_readiness';
-export const EXECUTION_READINESS_COLUMN_PRIVILEGE_COUNT = 105;
+type ColumnPrivilege = readonly [table: string, column: string, privilege: string];
+
+export const EXECUTION_READINESS_COLUMN_PRIVILEGES: readonly ColumnPrivilege[] = Object.freeze([
+  ...columnPrivileges('migration_history', 'SELECT', ['version']),
+  ...columnPrivileges('execution_wallet_generations', 'SELECT', [
+    'generation_id', 'payload_version', 'wallet_public_key', 'cluster', 'genesis_hash',
+    'generation', 'retired_at',
+  ]),
+  ...columnPrivileges('execution_wallet_generations', 'INSERT', [
+    'generation_id', 'payload_version', 'wallet_public_key', 'cluster', 'genesis_hash',
+    'generation',
+  ]),
+  ...columnPrivileges('execution_wallet_risk_state', 'SELECT', [
+    'generation_id', 'state_revision', 'reconciled_capital_lamports',
+    'reserved_exposure_raw', 'open_positions', 'conservative_drawdown_raw',
+    'consecutive_technical_failures', 'last_technical_failure_reason_code', 'unknown_block',
+  ]),
+  ...columnPrivileges('execution_wallet_risk_state', 'INSERT', [
+    'generation_id', 'reconciled_capital_lamports', 'reserved_exposure_raw',
+    'conservative_drawdown_raw',
+  ]),
+  ...columnPrivileges('execution_wallet_snapshots', 'SELECT', [
+    'snapshot_id', 'payload_version', 'snapshot_fingerprint', 'generation_id', 'provider_id',
+    'state_revision', 'slot', 'block_time', 'observed_at', 'commitment', 'wallet_lamports',
+    'token_balance_count', 'open_positions', 'position_1_id', 'position_1_cost_basis_lamports',
+    'position_1_conservative_liquidation_lamports', 'position_1_reconciliation_status',
+    'position_2_id', 'position_2_cost_basis_lamports',
+    'position_2_conservative_liquidation_lamports', 'position_2_reconciliation_status',
+    'realized_net_pnl_raw', 'superseded_at', 'purge_after',
+  ]),
+  ...columnPrivileges('execution_wallet_snapshots', 'INSERT', [
+    'snapshot_id', 'payload_version', 'snapshot_fingerprint', 'generation_id', 'provider_id',
+    'state_revision', 'slot', 'block_time', 'observed_at', 'commitment', 'wallet_lamports',
+    'token_balance_count', 'open_positions', 'position_1_id', 'position_1_cost_basis_lamports',
+    'position_1_conservative_liquidation_lamports', 'position_1_reconciliation_status',
+    'position_2_id', 'position_2_cost_basis_lamports',
+    'position_2_conservative_liquidation_lamports', 'position_2_reconciliation_status',
+    'realized_net_pnl_raw',
+  ]),
+  ...columnPrivileges('execution_wallet_snapshots', 'UPDATE', ['superseded_at', 'purge_after']),
+  ...columnPrivileges('execution_provider_usage_snapshots', 'SELECT', [
+    'snapshot_id', 'payload_version', 'snapshot_fingerprint', 'provider_id', 'plan_id',
+    'billing_period_id', 'billing_period_started_at', 'billing_period_ends_at', 'limit_units',
+    'used_units', 'measured_at', 'expires_at', 'provenance', 'superseded_at', 'purge_after',
+  ]),
+  ...columnPrivileges('execution_provider_usage_snapshots', 'INSERT', [
+    'snapshot_id', 'payload_version', 'snapshot_fingerprint', 'provider_id', 'plan_id',
+    'billing_period_id', 'billing_period_started_at', 'billing_period_ends_at', 'limit_units',
+    'used_units', 'measured_at', 'expires_at', 'provenance',
+  ]),
+  ...columnPrivileges('execution_provider_usage_snapshots', 'UPDATE', [
+    'superseded_at', 'purge_after',
+  ]),
+].sort(compareColumnPrivileges));
 
 export const EXECUTION_READINESS_AUTHORITY_SQL = `SELECT
   current_setting('server_version_num')::INTEGER AS server_version_number,
@@ -32,9 +85,13 @@ export const EXECUTION_READINESS_AUTHORITY_SQL = `SELECT
     AS readiness_membership,
   (SELECT COUNT(*)::TEXT FROM pg_auth_members parent WHERE parent.member=target.oid)
     AS role_parent_count,
-  (SELECT COUNT(*)::TEXT FROM information_schema.column_privileges privilege
+  (SELECT COALESCE(jsonb_agg(jsonb_build_array(privilege.table_name,
+      privilege.column_name,privilege.privilege_type)
+      ORDER BY privilege.table_name,privilege.column_name,privilege.privilege_type),
+      '[]'::jsonb)::TEXT
+    FROM information_schema.column_privileges privilege
     WHERE privilege.grantee=current_user AND privilege.table_schema='public')
-    AS column_privilege_count,
+    AS column_privileges,
   has_schema_privilege(current_user,'public','USAGE') AS schema_usage,
   has_schema_privilege(current_user,'public','CREATE') AS schema_create,
   EXISTS(SELECT 1 FROM migration_history WHERE version='039_execution_canary_operator_binding.sql')
@@ -142,11 +199,40 @@ function validAuthority(row: Readonly<Record<string, unknown>> | undefined): boo
     && row.membership_count === '1' && row.membership_admin === false
     && row.membership_inherit === false && row.membership_set === true
     && row.readiness_membership === true && row.role_parent_count === '0'
-    && row.column_privilege_count === String(EXECUTION_READINESS_COLUMN_PRIVILEGE_COUNT)
+    && validColumnPrivileges(row.column_privileges)
     && row.schema_usage === true && row.schema_create === false
     && row.migration_039_present === true
     && row.executable_security_definer_count === '0'
     && row.role_can_set_replication === false && row.session_can_set_replication === false;
+}
+
+function columnPrivileges(
+  table: string,
+  privilege: string,
+  columns: readonly string[],
+): ColumnPrivilege[] {
+  return columns.map((column) => Object.freeze([table, column, privilege] as const));
+}
+
+function compareColumnPrivileges(left: ColumnPrivilege, right: ColumnPrivilege): number {
+  return left[0].localeCompare(right[0]) || left[1].localeCompare(right[1])
+    || left[2].localeCompare(right[2]);
+}
+
+function validColumnPrivileges(value: unknown): boolean {
+  if (typeof value !== 'string' || value.length > 65_536) return false;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)
+      || parsed.length !== EXECUTION_READINESS_COLUMN_PRIVILEGES.length) return false;
+    return parsed.every((entry, index) => {
+      const expected = EXECUTION_READINESS_COLUMN_PRIVILEGES[index];
+      return Array.isArray(entry) && entry.length === 3 && expected !== undefined
+        && entry[0] === expected[0] && entry[1] === expected[1] && entry[2] === expected[2];
+    });
+  } catch {
+    return false;
+  }
 }
 
 function invalid(): ExecutionReadinessDatabaseError {

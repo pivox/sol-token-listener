@@ -55,7 +55,7 @@ export function createExecutionReadinessService(
     collect: async (signal: AbortSignal): Promise<ExecutionReadinessManifestV1> => {
       try {
         if (!(signal instanceof AbortSignal) || signal.aborted) throw new TypeError();
-        const nowMs = timestamp(dependencies.now());
+        const collectionStartedAtMs = timestamp(dependencies.now());
         const generation = createExecutionWalletGeneration(Object.freeze({
           walletPublicKey: dependencies.config.walletPublicKey,
           cluster: dependencies.config.cluster,
@@ -67,17 +67,19 @@ export function createExecutionReadinessService(
           dependencies.config.walletPublicKey,
           dependencies.config.maximumSlotLag,
           signal,
-          () => nowMs,
+          () => collectionStartedAtMs,
         );
         const encodedEvidence = await dependencies.readEvidence(
           dependencies.config.providerEvidencePath,
         );
         if (Buffer.byteLength(encodedEvidence, 'utf8') > 131_072) throw new TypeError();
+        const evidenceVerifiedAtMs = timestamp(dependencies.now());
+        if (evidenceVerifiedAtMs < collectionStartedAtMs) throw new TypeError();
         const providerSnapshot = verifySignedProviderUsageEvidence(
           deepFreeze(parseJson(encodedEvidence)),
           dependencies.config.evidencePublicKeyBase64,
           dependencies.config.providerId,
-          nowMs,
+          evidenceVerifiedAtMs,
         );
         const walletSnapshot = createExecutionWalletSnapshot(Object.freeze({
           generationId: generation.generationId,

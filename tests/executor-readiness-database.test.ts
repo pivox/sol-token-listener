@@ -7,6 +7,7 @@ import {
   createExecutionReadinessBootstrapDatabase,
   createExecutionReadinessDatabase,
   EXECUTION_READINESS_AUTHORITY_SQL,
+  EXECUTION_READINESS_COLUMN_PRIVILEGES,
   ExecutionReadinessDatabaseError,
 } from '../src/executor-readiness/database.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
@@ -36,7 +37,7 @@ void test('pins and validates the readiness role on every checkout', async () =>
 
 void test('evicts every authority drift with a redacted error', async () => {
   for (const changed of [
-    { column_privilege_count: '106' }, { schema_create: true },
+    { column_privileges: driftedPrivileges() }, { schema_create: true },
     { migration_039_present: false }, { readiness_membership: false },
     { membership_count: '2' }, { session_inherit: true },
     { server_version_number: 170_000 },
@@ -137,10 +138,18 @@ function validAuthority(): Readonly<Record<string, unknown>> {
     session_createdb: false, session_createrole: false, session_bypass_rls: false,
     session_replication: false, membership_count: '1', membership_admin: false,
     membership_inherit: false, membership_set: true, readiness_membership: true,
-    role_parent_count: '0', column_privilege_count: '105', schema_usage: true,
+    role_parent_count: '0',
+    column_privileges: JSON.stringify(EXECUTION_READINESS_COLUMN_PRIVILEGES),
+    schema_usage: true,
     schema_create: false, migration_039_present: true,
     executable_security_definer_count: '0', role_can_set_replication: false,
     session_can_set_replication: false });
+}
+
+function driftedPrivileges(): string {
+  const privileges = EXECUTION_READINESS_COLUMN_PRIVILEGES.map((entry) => [...entry]);
+  privileges[0] = ['execution_signed_transactions', 'signed_transaction_bytes', 'SELECT'];
+  return JSON.stringify(privileges);
 }
 
 function result(row: Readonly<Record<string, unknown>>) {

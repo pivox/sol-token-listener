@@ -50,6 +50,22 @@ void test('never calls the repository when evidence verification fails', async (
   assert.equal(commits, 0);
 });
 
+void test('rechecks provider evidence expiry after RPC collection', async () => {
+  let commits = 0;
+  const times = [NOW, NOW + 300_001];
+  const service = createExecutionReadinessService({
+    config: config(),
+    rpc: { verifyGenesis: async () => undefined,
+      observeWallet: async () => Object.freeze({ slot: 1n, blockTimeMs: null,
+        observedAtMs: NOW, walletLamports: 0n, tokenBalanceCount: 0 }) },
+    repository: { commit: async (input) => { commits += 1; return input; } },
+    readEvidence: async () => signedEvidence(),
+    now: () => times.shift() ?? NOW + 300_001,
+  });
+  await assert.rejects(service.collect(new AbortController().signal));
+  assert.equal(commits, 0);
+});
+
 function config() {
   return Object.freeze({ databaseUrl: 'postgresql://unused', cluster: 'mainnet-beta' as const,
     httpRpcUrl: 'https://unused.invalid', expectedGenesisHash: GENESIS,
@@ -69,4 +85,3 @@ function signedEvidence(): string {
     signedPayloadBase64: encoded.toString('base64'),
     signatureBase64: sign(null, encoded, keys.privateKey).toString('base64') });
 }
-

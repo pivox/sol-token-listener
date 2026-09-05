@@ -20,10 +20,10 @@ void test('collects balance and both token programs at finalized commitment only
   const results = [
     GENESIS,
     401_000_000,
-    1_788_000_000,
     { context: { slot: 401_000_001 }, value: 465_847_782 },
     { context: { slot: 401_000_002 }, value: [{ pubkey: WALLET }] },
     { context: { slot: 401_000_003 }, value: [{ pubkey: WALLET }, { pubkey: WALLET }] },
+    1_788_000_000,
   ];
   const fetchMock: typeof fetch = async (_url, init) => {
     const body = init?.body;
@@ -45,9 +45,10 @@ void test('collects balance and both token programs at finalized commitment only
     tokenBalanceCount: 3,
   });
   assert.deepEqual(requests.map((request) => request.method), [
-    'getGenesisHash', 'getSlot', 'getBlockTime', 'getBalance',
-    'getTokenAccountsByOwner', 'getTokenAccountsByOwner',
+    'getGenesisHash', 'getSlot', 'getBalance', 'getTokenAccountsByOwner',
+    'getTokenAccountsByOwner', 'getBlockTime',
   ]);
+  assert.deepEqual(requests.at(-1)?.params, [401_000_003]);
   assert.match(JSON.stringify(requests), /finalized/u);
   assert.match(JSON.stringify(requests), new RegExp(TOKEN_PROGRAM_ID.toBase58(), 'u'));
   assert.match(JSON.stringify(requests), new RegExp(TOKEN_2022_PROGRAM_ID.toBase58(), 'u'));
@@ -74,8 +75,7 @@ void test('fails closed on genesis mismatch, rate limit, oversized body and slot
     (error: unknown) => error instanceof ReadinessRpcError
       && error.code === 'RPC_RESPONSE_TOO_LARGE');
 
-  const results = [GENESIS, 100, 1_788_000_000,
-    { context: { slot: 100 }, value: 1 },
+  const results = [GENESIS, 100, { context: { slot: 100 }, value: 1 },
     { context: { slot: 100 }, value: [] },
     { context: { slot: 109 }, value: [] }];
   const lagged = new SolanaReadinessRpcGateway({ providerId: 'primary',
@@ -89,6 +89,24 @@ void test('fails closed on genesis mismatch, rate limit, oversized body and slot
   await lagged.verifyGenesis(signal);
   await assert.rejects(lagged.observeWallet(WALLET, 8, signal),
     (error: unknown) => error instanceof ReadinessRpcError && error.code === 'SLOT_LAG_EXCEEDED');
+});
+
+void test('cancels a chunked response as soon as its body exceeds the byte limit', async () => {
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(700_000));
+      controller.enqueue(new Uint8Array(700_000));
+    },
+    cancel() { cancelled = true; },
+  });
+  const gateway = new SolanaReadinessRpcGateway({ providerId: 'primary',
+    httpRpcUrl: 'https://mainnet.example.invalid', expectedGenesisHash: GENESIS,
+    timeoutMs: 100 }, async () => new Response(body));
+  await assert.rejects(gateway.verifyGenesis(new AbortController().signal),
+    (error: unknown) => error instanceof ReadinessRpcError
+      && error.code === 'RPC_RESPONSE_TOO_LARGE');
+  assert.equal(cancelled, true);
 });
 
 void test('rejects non-canonical JSON-RPC envelopes and mismatched response ids', async () => {
