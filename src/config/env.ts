@@ -25,6 +25,7 @@ export interface AppConfig {
   readonly autoMigrate: boolean;
   readonly executionMode: ExecutionMode;
   readonly executionIntentEmissionEnabled: boolean;
+  readonly executionPreflightPairEmissionEnabled: boolean;
   readonly paperQuoteMintAllowlist: readonly string[];
   readonly paperStrategyEnabled: boolean;
   readonly creationStrategyEnabled: boolean;
@@ -172,6 +173,11 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
   if (executionIntentEmissionEnabled && executionMode !== 'paper') {
     throw new Error('EXECUTION_INTENT_EMISSION_ENABLED requires EXECUTION_MODE=paper.');
   }
+  const executionPreflightPairEmissionEnabled = parseBoolean(
+    environment.EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED,
+    false,
+    'EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED',
+  );
   const dashboardActionsEnabled = parseBoolean(environment.DASHBOARD_ACTIONS_ENABLED, false, 'DASHBOARD_ACTIONS_ENABLED');
   if (dashboardActionsEnabled) {
     throw new Error('Pump.fun V1 exposes a read-only dashboard; dashboard actions cannot be enabled.');
@@ -206,6 +212,15 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     executionMode,
     qualificationProfilePath,
   );
+  if (executionPreflightPairEmissionEnabled
+    && (!executionIntentEmissionEnabled
+      || executionMode !== 'paper'
+      || wsolMint !== DEFAULT_WSOL_MINT
+      || paperStrategyConfig.paperMinimumConfirmation !== 'finalized')) {
+    throw new Error(
+      'EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED requires finalized paper intent emission.',
+    );
+  }
   const httpRpcUrl = requiredUrl(environment.SOLANA_HTTP_RPC_URL, 'SOLANA_HTTP_RPC_URL', ['http:', 'https:']);
   const httpRpcFallbackUrls = parseHttpRpcFallbackUrls(
     environment.SOLANA_HTTP_RPC_FALLBACK_URLS,
@@ -230,6 +245,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv | Record<string, stri
     autoMigrate: parseBoolean(environment.POSTGRES_AUTO_MIGRATE, false, 'POSTGRES_AUTO_MIGRATE'),
     executionMode,
     executionIntentEmissionEnabled,
+    executionPreflightPairEmissionEnabled,
     paperQuoteMintAllowlist,
     ...paperStrategyConfig,
     qualificationProfilePath,

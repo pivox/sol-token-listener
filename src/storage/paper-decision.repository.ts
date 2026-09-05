@@ -48,6 +48,10 @@ import {
   type ExecutionIntentTransactionClient,
 } from './execution-intent.repository.js';
 import {
+  createExecutionPreflightIntentPairInTransaction,
+  replayExecutionPreflightIntentPairInTransaction,
+} from './execution-preflight-intent-pair.repository.js';
+import {
   assertPaperFinalityReplayCurrent,
   MAX_PAPER_FINALITY_RAW_ROWS,
   paperFinalityRelevantRawSql,
@@ -64,6 +68,7 @@ export type ExecutionIntentEmissionConfig = Readonly<{
   readonly quoteMintAllowlist: readonly string[];
   readonly wsolMint: string;
   readonly maximumQuoteAgeMs: number;
+  readonly preflightPairEmissionEnabled: boolean;
 }>;
 
 export class PaperDecisionRepositoryError extends Error {
@@ -815,10 +820,14 @@ function snapshotExecutionIntentEmission(
     throw new TypeError('Execution intent emission quote policy is invalid.');
   }
   integerInRange(value.maximumQuoteAgeMs, 0, 60_000, 'maximumQuoteAgeMs');
+  if (typeof value.preflightPairEmissionEnabled !== 'boolean') {
+    throw new TypeError('Execution preflight pair emission policy is invalid.');
+  }
   return Object.freeze({
     quoteMintAllowlist: Object.freeze([value.wsolMint]),
     wsolMint: value.wsolMint,
     maximumQuoteAgeMs: value.maximumQuoteAgeMs,
+    preflightPairEmissionEnabled: value.preflightPairEmissionEnabled,
   });
 }
 
@@ -833,6 +842,11 @@ export async function emitExecutionIntentInTransaction(
   if (session === null || sessionEvent === null || sessionEvent.confirmationStatus === 'orphaned'
     || session.lastQuote === null || session.positionId === null) {
     throw new TypeError('Execution intent source decision is invalid.');
+  }
+  if (options.preflightPairEmissionEnabled
+    && result.requestedAction === 'OPEN'
+    && sessionEvent.confirmationStatus !== 'finalized') {
+    throw new TypeError('Execution preflight pair emission requires finalized evidence.');
   }
   const selected = await client.query(`SELECT payload FROM paper_positions
     WHERE position_id=$1 AND mint=$2 FOR SHARE`, [session.positionId, result.candidate.mint]);
@@ -872,7 +886,14 @@ export async function emitExecutionIntentInTransaction(
     maximumIntentTtlMs: EXECUTION_INTENT_MAXIMUM_TTL_MS,
   }));
   if (draft === null) throw new TypeError('Execution intent draft is missing.');
-  await createExecutionIntentInTransaction(client, draft);
+  const target = await createExecutionIntentInTransaction(client, draft);
+  if (options.preflightPairEmissionEnabled && result.requestedAction === 'OPEN') {
+    if (target.kind === 'CREATED') {
+      await createExecutionPreflightIntentPairInTransaction(client, draft);
+    } else {
+      await replayExecutionPreflightIntentPairInTransaction(client, draft);
+    }
+  }
 }
 
 async function assertPersistedQualification(
