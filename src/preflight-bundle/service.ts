@@ -132,7 +132,11 @@ function assertFreshForPackaging(
     || bundle.canary.providerSnapshot.measuredAtMs > nowMs
     || bundle.qualification.expiresAtMs < nowMs + marginMs
     || bundle.canary.expiresAtMs < nowMs + marginMs
-    || bundle.canary.providerSnapshot.expiresAtMs < nowMs + marginMs) throw invalid();
+    || bundle.canary.providerSnapshot.expiresAtMs < nowMs + marginMs
+    || bundle.canary.walletSnapshot.observedAtMs
+      + bundle.canary.policy.walletSnapshotMaxAgeMs < nowMs + marginMs
+    || bundle.canary.providerSnapshot.measuredAtMs
+      + bundle.canary.policy.providerUsageMaxAgeMs < nowMs + marginMs) throw invalid();
 }
 
 function signedEnvelope(value: unknown, privateKey: ReturnType<typeof createPrivateKey>): string {

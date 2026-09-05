@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.8.0 — 2026-09-05
+**Version :** 1.8.1 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -172,7 +172,8 @@ et l'identifiant d'intention. Les entiers `bigint` utilisent le marqueur JSON
 versionné du projet. H2f ne génère ni ne déclare une preuve `PASSED` à la place
 de l'opérateur.
 
-Créer un environnement séparé qui ne contient aucun accès RPC, base ou live :
+Créer un environnement séparé qui ne contient aucun accès RPC, base, Helius
+ou live :
 
 ```dotenv
 EXECUTOR_PREFLIGHT_DRAFT_PATH=/chemin/hors-git/draft.json
@@ -192,6 +193,8 @@ DOTENV_CONFIG_PATH=/chemin/hors-git/preflight-bundle.env \
 Le répertoire est publié atomiquement en `0700` avec
 `qualification.json`, `canary.json` et `manifest.json` en `0600`. La commande
 auto-vérifie les deux signatures et affiche uniquement le manifeste redacted.
+Elle refuse aussi les délais de fraîcheur dérivés de la policy déjà consommés
+et retire le répertoire final si son fence de durabilité parent échoue.
 Son succès signifie `PREFLIGHT_EVIDENCE_PACKAGED / CANARY_NOT_STARTED`, jamais
 un armement ou un verdict de sécurité économique.
 

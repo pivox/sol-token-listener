@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { lstat, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -41,3 +41,17 @@ void test('reads only owner-protected regular input files', async (context) => {
   await assert.rejects(() => readPreflightProtectedFile(directory, 16));
 });
 
+void test('removes the published directory when the parent durability fence fails', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'preflight-fsync-'));
+  context.after(async () => { await import('node:fs/promises').then(({ rm }) => rm(root, { recursive: true, force: true })); });
+  const output = join(root, 'bundle');
+  let calls = 0;
+  await assert.rejects(() => writeAtomicPreflightBundle(output, Object.freeze({
+    qualificationEnvelope: '{}', canaryEnvelope: '{}', manifestJson: '{}',
+  }), async () => {
+    calls += 1;
+    if (calls === 2) throw new Error('durability failure');
+  }));
+  assert.equal(calls, 2);
+  await assert.rejects(() => stat(output), { code: 'ENOENT' });
+});

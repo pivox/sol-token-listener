@@ -16,8 +16,8 @@ function omit(value: object, keys: readonly string[]): Readonly<Record<string, u
   ));
 }
 
-function encodedDraft(): string {
-  const source = canaryEvidenceInput();
+function encodedDraft(overrides: Readonly<Record<string, unknown>> = {}): string {
+  const source = canaryEvidenceInput(overrides);
   if (typeof source.targetIntentId !== 'string') throw new TypeError();
   const qualification = source.qualification;
   const wallet = source.walletSnapshot;
@@ -91,6 +91,23 @@ void test('rejects a non-Ed25519 key and a non-canonical draft', () => {
   assert.throws(() => createExecutionPreflightBundlePackage(
     encodedDraft(), edText, PACKAGE_NOW_MS + 300_000,
   ));
+});
+
+void test('rejects snapshots whose policy-derived freshness lacks the packaging margin', () => {
+  const ed = generateKeyPairSync('ed25519');
+  const edText = ed.privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+  assert.throws(() => createExecutionPreflightBundlePackage(encodedDraft({
+    walletSnapshot: {
+      observedAtMs: PACKAGE_NOW_MS - 60_000,
+      blockTimeMs: PACKAGE_NOW_MS - 61_000,
+    },
+  }), edText, PACKAGE_NOW_MS));
+  assert.throws(() => createExecutionPreflightBundlePackage(encodedDraft({
+    providerSnapshot: {
+      billingPeriodStartedAtMs: PACKAGE_NOW_MS - 400_000,
+      measuredAtMs: PACKAGE_NOW_MS - 300_000,
+    },
+  }), edText, PACKAGE_NOW_MS));
 });
 
 function deepFreeze(value: unknown): unknown {

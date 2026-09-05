@@ -1,7 +1,7 @@
 import { isAbsolute, normalize, relative, resolve, sep } from 'node:path';
 import { isProxy } from 'node:util/types';
 
-const FORBIDDEN_KEY = /(?:DATABASE_URL|SOLANA_(?:HTTP|WS)_RPC_URL|PRIVATE_KEY|SECRET_KEY|KEYPAIR|MNEMONIC|RECOVERY_PHRASE|WALLET|LIVE_TRADING_ENABLED|EXECUTOR_MODE)/u;
+const FORBIDDEN_KEY = /(?:DATABASE_URL|SOLANA_(?:HTTP|WS)_RPC_URL|HELIUS_(?:API_KEY|PROJECT_ID)|PRIVATE_KEY|SECRET_KEY|KEYPAIR|MNEMONIC|RECOVERY_PHRASE|WALLET|LIVE_TRADING_ENABLED|EXECUTOR_MODE)/u;
 
 export interface ExecutionPreflightBundleConfig {
   readonly draftPath: string;
@@ -72,4 +72,3 @@ function absolutePath(value: string): string {
 function invalid(): ExecutionPreflightBundleConfigError {
   return new ExecutionPreflightBundleConfigError();
 }
-

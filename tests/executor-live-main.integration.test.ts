@@ -211,7 +211,7 @@ void test('documents H2d-H2f external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.8.0 — 2026-09-05',
+    '**Version :** 1.8.1 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
@@ -236,7 +236,7 @@ void test('documents H2d-H2f external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     preflightBundleSpecification,
-    '**Version de spécification :** 1.0.1',
+    '**Version de spécification :** 1.0.2',
     'preflight bundle specification version',
   );
   assertContainsExactlyOnce(

@@ -24,10 +24,10 @@ void test('rejects checkout paths, duplicate paths and runtime authority', () =>
     ...ENV, EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH: ENV.EXECUTOR_PREFLIGHT_DRAFT_PATH,
   }), '/app'));
   for (const extra of ['DATABASE_URL', 'SOLANA_HTTP_RPC_URL', 'EXECUTOR_KEYPAIR_PATH',
-    'LIVE_TRADING_ENABLED', 'EXECUTOR_MODE']) {
+    'LIVE_TRADING_ENABLED', 'EXECUTOR_MODE', 'HELIUS_API_KEY', 'HELIUS_API_KEY_PATH',
+    'HELIUS_PROJECT_ID']) {
     assert.throws(() => parseExecutionPreflightBundleConfig(Object.freeze({
       ...ENV, [extra]: 'forbidden',
     }), '/app'));
   }
 });
-

@@ -1,6 +1,6 @@
 # Paquet d'attestations du préflight canary — conception #51-H2f
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.0.2
 
 **Version de la spécification parente :** 1.11.12
 
@@ -13,6 +13,10 @@
 **Dépendances :** #51-H2c, #51-H2d et #51-H2e
 
 ## Historique des versions
+
+- **1.0.2 — 2026-09-05 :** ferme les trois constats du dernier cycle de revue :
+  fraîcheur dérivée de la policy, rollback après échec du `fsync` parent et
+  refus explicite des credentials Helius dans l'environnement H2f.
 
 - **1.0.1 — 2026-09-05 :** exige au packaging que qualification, sidecar et
   snapshots ne soient ni futurs ni à moins de cinq secondes de leur expiration.

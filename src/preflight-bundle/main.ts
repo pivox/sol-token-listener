@@ -53,24 +53,30 @@ export async function readPreflightProtectedFile(
 export async function writeAtomicPreflightBundle(
   outputDirectory: string,
   files: AtomicBundleFiles,
+  synchronize: (path: string) => Promise<void> = syncDirectory,
 ): Promise<void> {
   validateOutput(outputDirectory, files);
   await assertMissing(outputDirectory);
   const parent = dirname(outputDirectory);
   const temporaryDirectory = await mkdtemp(join(parent, `.preflight-bundle-${randomUUID()}-`));
   let published = false;
+  let renamed = false;
   try {
     await import('node:fs/promises').then(({ chmod }) => chmod(temporaryDirectory, 0o700));
     await writeProtected(join(temporaryDirectory, 'qualification.json'), files.qualificationEnvelope);
     await writeProtected(join(temporaryDirectory, 'canary.json'), files.canaryEnvelope);
     await writeProtected(join(temporaryDirectory, 'manifest.json'), files.manifestJson);
-    await syncDirectory(temporaryDirectory);
+    await synchronize(temporaryDirectory);
     await assertMissing(outputDirectory);
     await rename(temporaryDirectory, outputDirectory);
+    renamed = true;
+    await synchronize(parent);
     published = true;
-    await syncDirectory(parent);
   } finally {
-    if (!published) await rm(temporaryDirectory, { recursive: true, force: true });
+    if (!published) await rm(renamed ? outputDirectory : temporaryDirectory, {
+      recursive: true,
+      force: true,
+    });
   }
 }
 
