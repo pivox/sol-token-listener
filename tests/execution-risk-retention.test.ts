@@ -5,6 +5,7 @@ import test from 'node:test';
 import pg from 'pg';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
+import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.repository.js';
@@ -141,12 +142,13 @@ void test('purges only expired executor risk payloads and retains active or ambi
       generationId, payloadVersion: 1, walletPublicKey: wallet,
       cluster: 'mainnet-beta', genesisHash: '3'.repeat(32), generation: 1,
     });
-    await repository.appendWalletSnapshot(walletSnapshot('b', 0n, nowMs - 21_600_000));
-    await repository.appendWalletSnapshot(walletSnapshot('c', 1n, nowMs - 1_000));
+    const expiredWalletSnapshot = walletSnapshot(0n, nowMs - 21_600_000);
+    await repository.appendWalletSnapshot(expiredWalletSnapshot);
+    await repository.appendWalletSnapshot(walletSnapshot(1n, nowMs - 1_000));
     await pool.query(`UPDATE execution_wallet_snapshots SET
       superseded_at=TIMESTAMPTZ 'epoch' + ($2::BIGINT * INTERVAL '1 millisecond'),
       purge_after=TIMESTAMPTZ 'epoch' + (($2::BIGINT + 14400000) * INTERVAL '1 millisecond')
-      WHERE snapshot_id=$1`, [`execution_wallet_snapshot_${'b'.repeat(64)}`, nowMs - 14_400_000]);
+      WHERE snapshot_id=$1`, [expiredWalletSnapshot.snapshotId, nowMs - 14_400_000]);
 
     const oldProvider = providerSnapshot('old', nowMs - 172_800_000, nowMs - 86_400_000,
       nowMs - 129_600_000, nowMs - 129_540_000);
@@ -276,11 +278,8 @@ void test('tombstones precede child-first deletion while UNKNOWN_HELD survives',
   });
 });
 
-function walletSnapshot(seed: string, stateRevision: bigint, observedAtMs: number) {
-  return Object.freeze({
-    snapshotId: `execution_wallet_snapshot_${seed.repeat(64)}`,
-    payloadVersion: 1 as const,
-    snapshotFingerprint: seed.repeat(64),
+function walletSnapshot(stateRevision: bigint, observedAtMs: number) {
+  return createExecutionWalletSnapshot({
     generationId,
     providerId: 'rpc-primary',
     stateRevision,
