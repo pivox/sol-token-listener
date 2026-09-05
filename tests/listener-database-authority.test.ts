@@ -53,6 +53,9 @@ void test('listener provisioning rebuilds one closed non-live database authority
   assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_listener_writer/u);
   assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_listener_writer/u);
   assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_listener_writer/u);
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON TYPE %I\.%I FROM sol_token_listener_writer/u);
+  assert.match(sql, /ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL PRIVILEGES ON %s FROM sol_token_listener_writer/u);
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON TABLE %I\.%I FROM PUBLIC/u);
   assert.match(sql, /GRANT USAGE ON SCHEMA public TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT SELECT ON TABLE migration_history TO sol_token_listener_writer/iu);
   for (const table of BUSINESS_TABLES) {
@@ -113,6 +116,13 @@ void test('PostgreSQL 16 listener login can write business projections but no li
         TO sol_token_listener_writer`);
       await isolated.query(`GRANT SELECT ON TABLE ${quoteIdentifier(privateSchema)}.secrets
         TO sol_token_listener_writer WITH GRANT OPTION`);
+      await isolated.query(`GRANT SELECT ON TABLE execution_wallet_generations TO PUBLIC`);
+      await isolated.query(`CREATE TYPE ${quoteIdentifier(privateSchema)}.private_state
+        AS ENUM ('PRIVATE')`);
+      await isolated.query(`GRANT USAGE ON TYPE
+        ${quoteIdentifier(privateSchema)}.private_state TO sol_token_listener_writer`);
+      await isolated.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public
+        GRANT SELECT ON TABLES TO sol_token_listener_writer`);
       await isolated.query(provisioningSql);
       await maintenance.query(`CREATE ROLE ${quoteIdentifier(loginName)} LOGIN NOINHERIT
         NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
@@ -151,11 +161,33 @@ void test('PostgreSQL 16 listener login can write business projections but no li
           select_ok: true, insert_ok: true, update_ok: true, delete_ok: true,
         }, table);
       }
-      for (const table of FORBIDDEN_EXECUTION_TABLES) {
-        assert.equal((await listener.query<{ readonly allowed: boolean }>(
-          `SELECT has_table_privilege(current_user,$1,'SELECT,INSERT,UPDATE,DELETE') AS allowed`,
-          [table],
-        )).rows[0]?.allowed, false, table);
+      const executionRelations = await listener.query<{
+        readonly relation_name: string;
+        readonly table_allowed: boolean;
+        readonly column_allowed: boolean;
+      }>(`SELECT class.relname AS relation_name,
+          has_table_privilege(current_user,class.oid,
+            'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS table_allowed,
+          has_any_column_privilege(current_user,class.oid,
+            'SELECT,INSERT,UPDATE,REFERENCES') AS column_allowed
+        FROM pg_class class JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
+        WHERE namespace.nspname='public' AND class.relkind IN ('r','p','v','m','f')
+          AND class.relname LIKE 'execution\\_%' ESCAPE '\\'
+        ORDER BY class.relname`);
+      assert.ok(executionRelations.rowCount !== null
+        && executionRelations.rowCount >= FORBIDDEN_EXECUTION_TABLES.length + 2);
+      for (const row of executionRelations.rows) {
+        if (row.relation_name === 'execution_intents'
+          || row.relation_name === 'execution_intent_tombstones') {
+          assert.equal(row.table_allowed, false, row.relation_name);
+          assert.equal(row.column_allowed, true, row.relation_name);
+        } else {
+          assert.deepEqual(row, {
+            relation_name: row.relation_name,
+            table_allowed: false,
+            column_allowed: false,
+          }, row.relation_name);
+        }
       }
       assert.equal((await listener.query<{ readonly allowed: boolean }>(
         `SELECT has_schema_privilege(current_user,$1,'USAGE') AS allowed`, [privateSchema],
@@ -176,6 +208,31 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       assert.equal((await listener.query<{ readonly allowed: boolean }>(
         `SELECT has_column_privilege(current_user,'execution_intents','status','UPDATE') AS allowed`,
       )).rows[0]?.allowed, false);
+      const privateTypeOid = (await isolated.query<{ readonly oid: string }>(
+        `SELECT format('%s',type.oid) AS oid FROM pg_type type
+          JOIN pg_namespace namespace ON namespace.oid=type.typnamespace
+          WHERE namespace.nspname=$1 AND type.typname='private_state'`, [privateSchema],
+      )).rows[0]?.oid;
+      assert.ok(privateTypeOid);
+      assert.equal((await isolated.query<{ readonly count: string }>(
+        `SELECT COUNT(*)::TEXT AS count FROM pg_type type
+          CROSS JOIN LATERAL aclexplode(type.typacl) acl
+          WHERE type.oid=$1::OID AND acl.grantee=(SELECT oid FROM pg_roles
+            WHERE rolname='sol_token_listener_writer')`, [privateTypeOid],
+      )).rows[0]?.count, '0');
+      assert.equal((await isolated.query<{ readonly count: string }>(
+        `SELECT COUNT(*)::TEXT AS count FROM pg_default_acl defaults
+          CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+          WHERE acl.grantee=(SELECT oid FROM pg_roles
+            WHERE rolname='sol_token_listener_writer')`,
+      )).rows[0]?.count, '0');
+      await isolated.query(`CREATE TABLE listener_owned_drift (id INTEGER PRIMARY KEY)`);
+      await isolated.query(`ALTER TABLE listener_owned_drift
+        OWNER TO sol_token_listener_writer`);
+      await assert.rejects(
+        isolated.query(provisioningSql),
+        /Listener role owns database objects/u,
+      );
     } finally {
       if (listener !== undefined) await listener.end();
       if (isolated !== undefined) await isolated.end();

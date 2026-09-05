@@ -102,6 +102,167 @@ BEGIN
 END
 $listener_schemas$;
 
+DO $listener_type_acl$
+DECLARE
+  target_type RECORD;
+BEGIN
+  FOR target_type IN
+    SELECT namespace.nspname,type.typname
+    FROM pg_type type
+    JOIN pg_namespace namespace ON namespace.oid=type.typnamespace
+    CROSS JOIN LATERAL aclexplode(type.typacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_listener_writer'
+    )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TYPE %I.%I FROM sol_token_listener_writer',
+      target_type.nspname,target_type.typname
+    );
+  END LOOP;
+END
+$listener_type_acl$;
+
+DO $listener_database_acl$
+DECLARE
+  database_name NAME;
+BEGIN
+  FOR database_name IN SELECT datname FROM pg_database
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON DATABASE %I FROM sol_token_listener_writer',
+      database_name
+    );
+  END LOOP;
+END
+$listener_database_acl$;
+
+DO $listener_language_acl$
+DECLARE
+  language_name NAME;
+BEGIN
+  FOR language_name IN
+    SELECT language.lanname
+    FROM pg_language language
+    CROSS JOIN LATERAL aclexplode(language.lanacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_listener_writer'
+    )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON LANGUAGE %I FROM sol_token_listener_writer',
+      language_name
+    );
+  END LOOP;
+END
+$listener_language_acl$;
+
+DO $listener_default_acl$
+DECLARE
+  default_acl RECORD;
+  object_kind TEXT;
+  schema_clause TEXT;
+BEGIN
+  FOR default_acl IN
+    SELECT DISTINCT grantor.rolname AS grantor_name,
+      namespace.nspname AS schema_name,defaults.defaclobjtype
+    FROM pg_default_acl defaults
+    JOIN pg_roles grantor ON grantor.oid=defaults.defaclrole
+    LEFT JOIN pg_namespace namespace ON namespace.oid=defaults.defaclnamespace
+    CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_listener_writer'
+    )
+  LOOP
+    object_kind := CASE default_acl.defaclobjtype
+      WHEN 'r' THEN 'TABLES'
+      WHEN 'S' THEN 'SEQUENCES'
+      WHEN 'f' THEN 'FUNCTIONS'
+      WHEN 'T' THEN 'TYPES'
+      WHEN 'n' THEN 'SCHEMAS'
+      ELSE NULL
+    END;
+    IF object_kind IS NULL THEN
+      RAISE EXCEPTION 'Unsupported listener default ACL object kind';
+    END IF;
+    schema_clause := CASE WHEN default_acl.schema_name IS NULL THEN ''
+      ELSE format(' IN SCHEMA %I',default_acl.schema_name) END;
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL PRIVILEGES ON %s FROM sol_token_listener_writer',
+      default_acl.grantor_name,schema_clause,object_kind
+    );
+  END LOOP;
+END
+$listener_default_acl$;
+
+-- PUBLIC authority is inherited by every role and cannot be removed by a
+-- role-specific REVOKE. Keep every current live relation private; replay this
+-- provisioning after each migration so newly added execution tables are also
+-- covered before a listener starts.
+DO $listener_public_execution_acl$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,table_class.relname,
+      string_agg(quote_ident(attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class table_class
+    JOIN pg_namespace namespace ON namespace.oid=table_class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=table_class.oid
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND table_class.relkind IN ('r','p','v','m','f')
+      AND table_class.relname LIKE 'execution\_%' ESCAPE '\'
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    GROUP BY namespace.nspname,table_class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM PUBLIC',
+      relation.nspname,relation.relname
+    );
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM PUBLIC',
+      relation.columns,relation.nspname,relation.relname
+    );
+  END LOOP;
+END
+$listener_public_execution_acl$;
+
+-- Object ownership bypasses ACL revocation. It cannot be remediated safely by
+-- this role-focused script, so fail closed and require an administrator to
+-- reassign the unexpected object before provisioning can continue.
+DO $listener_ownership_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_database object
+      WHERE object.datdba=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_namespace object
+      WHERE object.nspowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_class object
+      WHERE object.relowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_proc object
+      WHERE object.proowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_type object
+      WHERE object.typowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_language object
+      WHERE object.lanowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_default_acl object
+      WHERE object.defaclrole=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+  ) THEN
+    RAISE EXCEPTION 'Listener role owns database objects';
+  END IF;
+END
+$listener_ownership_guard$;
+
 DO $listener_columns$
 DECLARE
   relation RECORD;

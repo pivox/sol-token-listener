@@ -40,6 +40,14 @@ Toutes les autres tables `execution_*` restent sans droit, notamment celles de
 génération wallet, risque, qualification live, contrôle, armement, locks,
 transactions signées, simulation live, soumission et réconciliation.
 
+Comme tout rôle hérite des ACL de `PUBLIC`, le provisioning révoque aussi
+dynamiquement les privilèges de table et de colonne de `PUBLIC` sur chaque
+relation `execution_*` existante. Il supprime les ACL directes de type,
+langage, base et les default ACL accordées au groupe listener. Une propriété
+d'objet contournerait les ACL : elle provoque donc un échec fermé et doit être
+réassignée par l'administrateur. Le script est rejoué après chaque migration
+avant tout démarrage du listener.
+
 ## 3. Connexion et exploitation
 
 Le login de déploiement reste `NOINHERIT`, mono-membre du groupe et sans
@@ -56,8 +64,10 @@ désactivée avec ce rôle.
 ## 4. Validation
 
 - test statique de l'allowlist et des exclusions live ;
-- test PostgreSQL 16 optionnel qui injecte des dérives, rejoue le script et
-  vérifie les droits effectifs ;
+- test PostgreSQL 16 optionnel qui injecte des dérives directes, `PUBLIC`, de
+  type, de default ACL et de propriété, puis vérifie leur suppression ou leur
+  rejet fermé ainsi que les droits effectifs de toutes les tables
+  `execution_*` découvertes dans le catalogue ;
 - dry-run paper Mainnet borné sous le login dédié ;
 - build, check, lint, tests et documentation verts ;
 - aucun wallet chargé, aucun armement et aucune transaction envoyée.
