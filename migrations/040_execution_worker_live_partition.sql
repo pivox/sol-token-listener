@@ -1,3 +1,48 @@
+-- A raw replay must never detach policies from a worker role whose OID was
+-- preserved by a rename. Only the current canonical role OID and the neutral
+-- PUBLIC placeholder are safe policy targets to replace.
+DO $worker_partition_replay_role_guard$
+DECLARE
+  canonical_worker_oid OID;
+  invalid_policy_count INTEGER;
+BEGIN
+  SELECT role.oid
+  INTO canonical_worker_oid
+  FROM pg_catalog.pg_roles role
+  WHERE role.rolname='sol_token_executor_worker';
+
+  WITH expected_policy(relation_name,policy_name) AS (
+    VALUES
+      ('execution_intents','execution_intents_worker_partition'),
+      ('execution_dry_run_assessments','execution_dry_run_assessments_worker_partition'),
+      ('execution_attempts','execution_attempts_worker_partition'),
+      ('execution_intent_transitions','execution_intent_transitions_worker_partition'),
+      ('execution_simulation_artifacts','execution_simulation_artifacts_worker_partition')
+  )
+  SELECT COUNT(*)::INTEGER
+  INTO invalid_policy_count
+  FROM expected_policy expected
+  JOIN pg_catalog.pg_namespace namespace
+    ON namespace.nspname=pg_catalog.current_schema()
+  JOIN pg_catalog.pg_class relation
+    ON relation.relnamespace=namespace.oid
+      AND relation.relname=expected.relation_name
+  JOIN pg_catalog.pg_policy policy
+    ON policy.polrelid=relation.oid
+      AND policy.polname=expected.policy_name
+  WHERE policy.polroles<>ARRAY[0::OID]
+    AND (
+      canonical_worker_oid IS NULL
+      OR policy.polroles<>ARRAY[canonical_worker_oid]
+    );
+
+  IF invalid_policy_count<>0 THEN
+    RAISE EXCEPTION 'stale worker policy role prevents migration 040 replay'
+      USING ERRCODE='55000';
+  END IF;
+END
+$worker_partition_replay_role_guard$;
+
 DO $live_reserved_shape$
 DECLARE
   column_type OID;

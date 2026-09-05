@@ -19,6 +19,16 @@ const childTables = partitionedTables.slice(1);
 void test('migration 040 declares the monotone worker/live row partition', async () => {
   const migration = withoutSqlComments(await readFile(migrationUrl, 'utf8'));
 
+  assert.equal(
+    migration.trimStart().startsWith('DO $worker_partition_replay_role_guard$'),
+    true,
+    'the stale-role replay guard must be the first executable migration statement',
+  );
+  assert.ok(
+    migration.indexOf('$worker_partition_replay_role_guard$;', 1)
+      < migration.indexOf('ALTER TABLE execution_intents'),
+    'the stale-role replay guard must finish before the first schema mutation',
+  );
   assert.match(migration,
     /ALTER TABLE execution_intents[\s\S]*ADD COLUMN(?: IF NOT EXISTS)? live_reserved BOOLEAN NOT NULL DEFAULT FALSE/iu);
   for (const table of partitionedTables) {
@@ -283,6 +293,139 @@ void test('PostgreSQL 16 migration 040 rejects a malformed pre-existing live_res
     if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, 'Cleanup failed.');
   });
 
+void test('PostgreSQL 16 migration 040 rejects a stale worker OID before policy or ACL mutation',
+  async (context) => {
+    const configuredUrl = process.env.TEST_EXECUTOR_ROLE_DATABASE_URL;
+    if (configuredUrl === undefined || configuredUrl.trim() === '') {
+      context.skip('TEST_EXECUTOR_ROLE_DATABASE_URL is required for the disposable role cluster.');
+      return;
+    }
+    const baseUrl = new URL(configuredUrl);
+    const maintenance = new pg.Pool({ connectionString: baseUrl.href });
+    const suffix = randomUUID().replaceAll('-', '');
+    const databaseName = `h2j_partition_replay_${suffix}`;
+    const canonicalRoleName = `h2j_partition_worker_${suffix.slice(0, 20)}`;
+    const staleRoleName = `h2j_partition_stale_${suffix.slice(0, 20)}`;
+    const isolatedUrl = new URL(baseUrl);
+    isolatedUrl.pathname = `/${databaseName}`;
+    let isolated: InstanceType<typeof pg.Pool> | undefined;
+    let databaseCreated = false;
+    let canonicalRoleCreated = false;
+    let staleRolePresent = false;
+    let release: (() => Promise<void>) | undefined;
+    let bodyFailure: unknown;
+    try {
+      const capability = await postgres16Capability(maintenance);
+      if (!capability) {
+        context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
+      } else {
+        release = await acquireExecutorRoleTestLock(maintenance);
+        await maintenance.query(`CREATE ROLE ${quoteIdentifier(canonicalRoleName)} NOLOGIN
+          NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+        canonicalRoleCreated = true;
+        await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
+        databaseCreated = true;
+        isolated = new pg.Pool({ connectionString: isolatedUrl.href, max: 3 });
+        await applyMigrationsBefore040(isolated);
+        const migrationSql = (await readFile(migrationUrl, 'utf8'))
+          .replaceAll('sol_token_executor_worker', canonicalRoleName);
+
+        await isolated.query(migrationSql);
+        await isolated.query(`GRANT SELECT ON TABLE
+          ${partitionedTables.map(quoteIdentifier).join(',')}
+          TO ${quoteIdentifier(canonicalRoleName)}`);
+        const canonicalOid = (await maintenance.query<{ readonly oid: string }>(
+          'SELECT oid::TEXT AS oid FROM pg_roles WHERE rolname=$1', [canonicalRoleName],
+        )).rows[0]?.oid;
+        assert.ok(canonicalOid !== undefined);
+        const canonicalState = await readWorkerPartitionState(isolated);
+        assert.equal(canonicalState.length, partitionedTables.length);
+        assert.equal(canonicalState.every((row) => row.role_oids === `{${canonicalOid}}`), true);
+        assert.equal(
+          canonicalState.every((row) => row.relation_acl?.includes(canonicalRoleName) === true),
+          true,
+        );
+
+        await isolated.query(migrationSql);
+        assert.deepEqual(await readWorkerPartitionState(isolated), canonicalState,
+          'an exact canonical worker OID must remain replayable');
+
+        await maintenance.query(`ALTER ROLE ${quoteIdentifier(canonicalRoleName)}
+          RENAME TO ${quoteIdentifier(staleRoleName)}`);
+        staleRolePresent = true;
+        const staleStateBeforeReplay = await readWorkerPartitionState(isolated);
+        assert.equal(staleStateBeforeReplay.length, partitionedTables.length);
+        assert.equal(
+          staleStateBeforeReplay.every((row) => row.role_oids === `{${canonicalOid}}`),
+          true,
+        );
+        assert.equal(
+          staleStateBeforeReplay.every(
+            (row) => row.relation_acl?.includes(staleRoleName) === true,
+          ),
+          true,
+        );
+
+        await assert.rejects(
+          isolated.query(migrationSql),
+          (error: unknown) => {
+            assert.equal(error instanceof Error, true);
+            assert.equal(Reflect.get(error as object, 'code'), '55000');
+            assert.match((error as Error).message, /stale worker policy role/iu);
+            return true;
+          },
+        );
+        assert.deepEqual(await readWorkerPartitionState(isolated), staleStateBeforeReplay,
+          'a rejected stale-OID replay must preserve every policy and table ACL exactly');
+
+        for (const tableName of partitionedTables) {
+          await isolated.query(`DROP POLICY ${quoteIdentifier(`${tableName}_worker_partition`)}
+            ON ${quoteIdentifier(tableName)}`);
+        }
+        await isolated.query(migrationSql);
+        const publicPlaceholderState = await readWorkerPartitionState(isolated);
+        assert.equal(
+          publicPlaceholderState.every((row) => row.role_oids === '{0}'),
+          true,
+        );
+        await isolated.query(migrationSql);
+        assert.deepEqual(await readWorkerPartitionState(isolated), publicPlaceholderState,
+          'the exact PUBLIC OID zero placeholder must remain replayable');
+      }
+    } catch (error) {
+      bodyFailure = error;
+    }
+    const cleanupFailures = await collectCleanupFailures([
+      async () => { if (isolated !== undefined) await isolated.end(); },
+      async () => {
+        if (databaseCreated) {
+          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+            WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+          await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+        }
+      },
+      async () => {
+        if (staleRolePresent) {
+          await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(staleRoleName)}`);
+        } else if (canonicalRoleCreated) {
+          await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(canonicalRoleName)}`);
+        }
+      },
+      async () => { if (release !== undefined) await release(); },
+      async () => maintenance.end(),
+    ]);
+    if (bodyFailure !== undefined) {
+      throw new AggregateError(
+        [bodyFailure, ...cleanupFailures],
+        'Migration 040 stale-role replay test failed.',
+        { cause: bodyFailure },
+      );
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(cleanupFailures, 'Migration 040 replay cleanup failed.');
+    }
+  });
+
 async function applyMigrationsBefore040(pool: InstanceType<typeof pg.Pool>): Promise<void> {
   const directory = new URL('../migrations/', import.meta.url);
   const names = (await readdir(directory))
@@ -292,6 +435,42 @@ async function applyMigrationsBefore040(pool: InstanceType<typeof pg.Pool>): Pro
   for (const name of names) {
     await pool.query(await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
   }
+}
+
+interface WorkerPartitionStateRow {
+  readonly relation_name: string;
+  readonly relation_acl: string | null;
+  readonly row_security: boolean;
+  readonly force_row_security: boolean;
+  readonly policy_name: string;
+  readonly permissive: boolean;
+  readonly command: string;
+  readonly role_oids: string;
+  readonly using_expression: string | null;
+  readonly check_expression: string | null;
+}
+
+async function readWorkerPartitionState(
+  pool: InstanceType<typeof pg.Pool>,
+): Promise<readonly WorkerPartitionStateRow[]> {
+  return (await pool.query<WorkerPartitionStateRow>(`SELECT
+      relation.relname AS relation_name,
+      relation.relacl::TEXT AS relation_acl,
+      relation.relrowsecurity AS row_security,
+      relation.relforcerowsecurity AS force_row_security,
+      policy.polname AS policy_name,
+      policy.polpermissive AS permissive,
+      policy.polcmd AS command,
+      policy.polroles::TEXT AS role_oids,
+      pg_get_expr(policy.polqual,policy.polrelid) AS using_expression,
+      pg_get_expr(policy.polwithcheck,policy.polrelid) AS check_expression
+    FROM pg_class relation
+    JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+    JOIN pg_policy policy ON policy.polrelid=relation.oid
+      AND policy.polname=relation.relname || '_worker_partition'
+    WHERE namespace.nspname=current_schema()
+      AND relation.relname=ANY($1::TEXT[])
+    ORDER BY relation.relname`, [partitionedTables])).rows;
 }
 
 interface HistoricalLiveRoots {
