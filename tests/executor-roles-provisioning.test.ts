@@ -147,6 +147,11 @@ void test('read-only recovery provisioning matches its closed authority policy',
   assert.equal(signed.select.includes('pre_signature_lock_id'), true);
   assert.equal(signed.select.includes('signed_transaction_bytes'), false);
   assert.equal(signed.update.includes('submission_started_at'), false);
+  const intents = authority.tables.find((table) => table.name === 'execution_intents');
+  assert.ok(intents !== undefined);
+  assert.equal(intents.select.includes('live_reserved'), true);
+  assert.equal(intents.insert.includes('live_reserved'), true);
+  assert.equal(intents.update.includes('live_reserved'), false);
 
   const reconciliation = authority.tables.find((table) => (
     table.name === 'execution_reconciliation_evidence'

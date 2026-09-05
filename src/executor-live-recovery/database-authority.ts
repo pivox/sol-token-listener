@@ -78,6 +78,7 @@ export const LIVE_RECOVERY_DATABASE_AUTHORITY: LiveRecoveryDatabaseAuthority = O
         'created_at',
         'updated_at',
         'purge_after',
+        'live_reserved',
       ),
       columns(
         'id',
@@ -101,6 +102,7 @@ export const LIVE_RECOVERY_DATABASE_AUTHORITY: LiveRecoveryDatabaseAuthority = O
         'requested_at',
         'expires_at',
         'status',
+        'live_reserved',
       ),
       columns(
         'status',

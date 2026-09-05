@@ -316,6 +316,9 @@ void test('authority allowlist is restricted to H2b signing and submission primi
   assert.equal(byName.get('execution_signed_transactions')?.update.includes('confirmed_at'), false);
   assert.equal(byName.get('execution_signed_transactions')?.update.includes('confirmed_slot'), false);
   assert.equal(byName.get('execution_signed_transactions')?.update.includes('reconciled_at'), false);
+  assert.equal(byName.get('execution_intents')?.select.includes('live_reserved'), true);
+  assert.equal(byName.get('execution_intents')?.insert.includes('live_reserved'), false);
+  assert.equal(byName.get('execution_intents')?.update.includes('live_reserved'), false);
   assert.equal(byName.get('execution_intents')?.update.includes(
     'reconciliation_completed_at'), true,
     'pre-submission evaluator failures and revocations terminally close the intent',

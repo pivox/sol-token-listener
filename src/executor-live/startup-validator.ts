@@ -103,6 +103,7 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'requested_at', 'expires_at', 'status', 'attempt_count', 'state_revision',
         'lease_owner', 'lease_token', 'lease_expires_at', 'last_reason_code', 'terminal_at',
         'reconciliation_completed_at', 'created_at', 'updated_at', 'purge_after',
+        'live_reserved',
       ), names(), names(
         'status', 'state_revision', 'attempt_count', 'last_reason_code', 'lease_owner',
         'lease_token', 'lease_expires_at', 'terminal_at', 'reconciliation_completed_at',
