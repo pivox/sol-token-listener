@@ -11,7 +11,7 @@ BEGIN
   LEFT JOIN pg_catalog.pg_attrdef default_value
     ON default_value.adrelid=attribute.attrelid
       AND default_value.adnum=attribute.attnum
-  WHERE attribute.attrelid='public.execution_intents'::pg_catalog.regclass
+  WHERE attribute.attrelid='execution_intents'::pg_catalog.regclass
     AND attribute.attname='live_reserved'
     AND attribute.attnum>0
     AND NOT attribute.attisdropped;
