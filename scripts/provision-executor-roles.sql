@@ -685,6 +685,96 @@ $worker_ownership_guard$;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO sol_token_executor_worker;
 
+-- Rebuild the worker/live row partition after the NOLOGIN worker role exists.
+-- PostgreSQL stores policy targets as role OIDs, so an already active SET ROLE
+-- session remains covered after membership revocation and a role rename cannot
+-- detach the policy from the protected principal.
+ALTER TABLE execution_intents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE execution_dry_run_assessments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE execution_attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE execution_intent_transitions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE execution_simulation_artifacts ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS execution_intents_normal_access ON execution_intents;
+CREATE POLICY execution_intents_normal_access ON execution_intents
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_intents_worker_partition ON execution_intents;
+CREATE POLICY execution_intents_worker_partition ON execution_intents
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (NOT live_reserved) WITH CHECK (NOT live_reserved);
+
+DROP POLICY IF EXISTS execution_dry_run_assessments_normal_access
+  ON execution_dry_run_assessments;
+CREATE POLICY execution_dry_run_assessments_normal_access
+ON execution_dry_run_assessments
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_dry_run_assessments_worker_partition
+  ON execution_dry_run_assessments;
+CREATE POLICY execution_dry_run_assessments_worker_partition
+ON execution_dry_run_assessments
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_dry_run_assessments.intent_id
+))
+WITH CHECK (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_dry_run_assessments.intent_id
+));
+
+DROP POLICY IF EXISTS execution_attempts_normal_access ON execution_attempts;
+CREATE POLICY execution_attempts_normal_access ON execution_attempts
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_attempts_worker_partition ON execution_attempts;
+CREATE POLICY execution_attempts_worker_partition ON execution_attempts
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_attempts.intent_id
+))
+WITH CHECK (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_attempts.intent_id
+));
+
+DROP POLICY IF EXISTS execution_intent_transitions_normal_access
+  ON execution_intent_transitions;
+CREATE POLICY execution_intent_transitions_normal_access
+ON execution_intent_transitions
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_intent_transitions_worker_partition
+  ON execution_intent_transitions;
+CREATE POLICY execution_intent_transitions_worker_partition
+ON execution_intent_transitions
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_intent_transitions.intent_id
+))
+WITH CHECK (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_intent_transitions.intent_id
+));
+
+DROP POLICY IF EXISTS execution_simulation_artifacts_normal_access
+  ON execution_simulation_artifacts;
+CREATE POLICY execution_simulation_artifacts_normal_access
+ON execution_simulation_artifacts
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_simulation_artifacts_worker_partition
+  ON execution_simulation_artifacts;
+CREATE POLICY execution_simulation_artifacts_worker_partition
+ON execution_simulation_artifacts
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_simulation_artifacts.intent_id
+))
+WITH CHECK (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_simulation_artifacts.intent_id
+));
+
 -- Trigger functions fire without direct EXECUTE authority. Reset both the
 -- inherited PUBLIC capability and any stale worker-specific grant.
 REVOKE ALL PRIVILEGES ON FUNCTION
