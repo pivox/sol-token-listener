@@ -50,6 +50,7 @@ void test('websocket health migration upgrades legacy state without trusting its
       '036_execution_live_canary.sql',
       '037_execution_live_orchestration.sql',
       '038_execution_live_rpc_budget.sql',
+      '039_execution_canary_operator_binding.sql',
       latestMigrationName,
     ]);
     const beforeReplay = await canonicalRow(pool);
