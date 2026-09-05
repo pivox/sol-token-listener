@@ -181,31 +181,33 @@ const CLAIM_SQL: Readonly<Record<ExecutionClaimPurpose, string>> = Object.freeze
   EXECUTE: claimSql(
     "intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')",
     true,
+    false,
   ),
-  CONFIRM: claimSql("intent.status IN ('SUBMITTED')", false),
+  CONFIRM: claimSql("intent.status IN ('SUBMITTED')", false, true),
   RECONCILE: claimSql(`intent.status IN (
     'CONFIRMED', 'RECONCILING', 'UNKNOWN_REQUIRES_RECONCILIATION'
-  )`, false),
+  )`, false, true),
   DRY_RUN: dryRunClaimSql(),
 });
 const LIVE_EXECUTE_SELL_SQL = claimSql(`intent.side = 'SELL'
-      AND intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')`, true);
+      AND intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')`, true, true);
 const LIVE_BUY_SELL_PRIORITY_PREDICATE = `NOT EXISTS (
         SELECT 1
         FROM execution_intents AS blocking_sell
         WHERE blocking_sell.side = 'SELL'
+          AND blocking_sell.live_reserved = TRUE
           AND (
             (blocking_sell.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')
               AND blocking_sell.expires_at > statement_timestamp())
             OR blocking_sell.status = 'SIGNED_NOT_SUBMITTED'
           )
       )`;
-const LIVE_RECOVER_SQL = claimSql("intent.status = 'SIGNED_NOT_SUBMITTED'", false);
+const LIVE_RECOVER_SQL = claimSql("intent.status = 'SIGNED_NOT_SUBMITTED'", false, true);
 const LIVE_RECOVER_SELL_SQL = claimSql(`intent.side = 'SELL'
-      AND intent.status = 'SIGNED_NOT_SUBMITTED'`, false);
+      AND intent.status = 'SIGNED_NOT_SUBMITTED'`, false, true);
 const LIVE_RECOVER_BUY_SQL = claimSql(`intent.side = 'BUY'
       AND intent.status = 'SIGNED_NOT_SUBMITTED'
-      AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}`, false);
+      AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}`, false, true);
 
 export async function createExecutionIntentInTransaction(
   client: ExecutionIntentTransactionClient,
@@ -797,14 +799,19 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
   }
 }
 
-function claimSql(statusPredicate: string, requireLiveIntent: boolean): string {
-  const expirationPredicate = requireLiveIntent
+function claimSql(
+  statusPredicate: string,
+  requireUnexpiredIntent: boolean,
+  liveReserved: boolean,
+): string {
+  const expirationPredicate = requireUnexpiredIntent
     ? '\n      AND intent.expires_at > statement_timestamp()'
     : '';
   return `WITH candidate AS MATERIALIZED (
     SELECT intent.id
     FROM execution_intents AS intent
-    WHERE ${statusPredicate}${expirationPredicate}
+    WHERE intent.live_reserved = ${liveReserved ? 'TRUE' : 'FALSE'}
+      AND ${statusPredicate}${expirationPredicate}
       AND (intent.lease_expires_at IS NULL
         OR intent.lease_expires_at <= statement_timestamp())
     ORDER BY intent.requested_at,intent.id
@@ -875,6 +882,7 @@ function liveExecuteBuyClaimSql(): string {
       AND reservation.wallet_snapshot_fingerprint=armament.target_wallet_snapshot_fingerprint
       AND reservation.provider_snapshot_fingerprint=armament.target_provider_snapshot_fingerprint
     WHERE intent.side='BUY'
+      AND intent.live_reserved = TRUE
       AND intent.status='PENDING'
       AND intent.expires_at>operation.at+($2::BIGINT*INTERVAL '1 millisecond')
       AND (intent.lease_expires_at IS NULL OR intent.lease_expires_at<=operation.at)
@@ -926,6 +934,7 @@ function dryRunClaimSql(): string {
     SELECT intent.id
     FROM execution_intents AS intent CROSS JOIN operation
     WHERE intent.status IN ('PENDING', 'RETRY_READY')
+      AND intent.live_reserved = FALSE
       AND intent.expires_at > operation.at + ($2::BIGINT * INTERVAL '1 millisecond')
       AND (intent.lease_expires_at IS NULL
         OR intent.lease_expires_at <= operation.at)

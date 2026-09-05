@@ -434,6 +434,7 @@ export class PostgresExecutionOperationsRepository implements
       }
       const target = await lockedCanaryTarget(client, request.target.intentId);
       assertCanaryRequestTarget(request, target, nowMs);
+      await promoteCanaryTarget(client, target.intent.id);
       await ensureControlState(client, request.qualification.generationId);
       const control = await lockedControlState(client, request.qualification.generationId);
       if (control.state !== 'RUNNING') throw failure('CONTROL_STOPPED');
@@ -671,7 +672,8 @@ async function lockedCanaryTarget(
     trunc(EXTRACT(EPOCH FROM updated_at)*1000)::TEXT AS updated_at_ms,
     lease_owner,lease_token::TEXT AS lease_token,
     CASE WHEN lease_expires_at IS NULL THEN NULL
-      ELSE trunc(EXTRACT(EPOCH FROM lease_expires_at)*1000)::TEXT END AS lease_expires_at_ms
+      ELSE trunc(EXTRACT(EPOCH FROM lease_expires_at)*1000)::TEXT END AS lease_expires_at_ms,
+    live_reserved
     FROM execution_intents WHERE id=$1 FOR UPDATE`, [intentId])), [
     'id', 'payload_version', 'logical_order_key', 'strategy_id', 'strategy_version',
     'position_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
@@ -680,7 +682,7 @@ async function lockedCanaryTarget(
     'requested_at_ms', 'expires_at_ms', 'status', 'attempt_count', 'state_revision',
     'last_reason_code', 'terminal_at_ms', 'reconciliation_completed_at_ms',
     'purge_after_ms', 'created_at_ms', 'updated_at_ms', 'lease_owner', 'lease_token',
-    'lease_expires_at_ms',
+    'lease_expires_at_ms', 'live_reserved',
   ] as const);
   try {
     const draft = createExecutionIntentDraft({
@@ -707,7 +709,7 @@ async function lockedCanaryTarget(
       || row.attempt_count !== 0 || row.last_reason_code !== null
       || row.terminal_at_ms !== null || row.reconciliation_completed_at_ms !== null
       || row.purge_after_ms !== null || row.lease_owner !== null || row.lease_token !== null
-      || row.lease_expires_at_ms !== null) throw new TypeError();
+      || row.lease_expires_at_ms !== null || row.live_reserved !== false) throw new TypeError();
     const intent = Object.freeze({
       ...draft,
       status: 'PENDING' as const,
@@ -724,6 +726,16 @@ async function lockedCanaryTarget(
   } catch {
     throw failure('CONFLICT');
   }
+}
+
+async function promoteCanaryTarget(
+  client: DatabaseClient,
+  intentId: string,
+): Promise<void> {
+  const promoted = await client.query(`UPDATE execution_intents
+    SET live_reserved=TRUE
+    WHERE id=$1 AND live_reserved=FALSE`, [intentId]);
+  if (promoted.rowCount !== 1 || promoted.rows.length !== 0) throw failure('CONFLICT');
 }
 
 function assertCanaryRequestTarget(

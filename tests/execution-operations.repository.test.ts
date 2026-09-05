@@ -152,13 +152,13 @@ void test('arms one V2 canary atomically with admission and an exact replay', as
     assert.deepEqual(await repository.armCanary(input), first);
     assert.equal(first.state, 'ARMED');
     const targetLockIndex = firstArmQueries.findIndex((query) =>
-      /FROM execution_intents WHERE id=\$1 FOR UPDATE/u.test(query));
+      query.includes('FROM execution_intents WHERE id=$1 FOR UPDATE'));
     const promotionIndex = firstArmQueries.findIndex((query) =>
       /UPDATE execution_intents(?: AS intent)?\s+SET\s+live_reserved\s*=\s*TRUE/iu.test(query));
     const admissionIndex = firstArmQueries.findIndex((query) =>
-      /INSERT INTO execution_risk_admission_reports/u.test(query));
+      query.includes('INSERT INTO execution_risk_admission_reports'));
     const publicationIndex = firstArmQueries.findIndex((query) =>
-      /INSERT INTO execution_activation_armaments/u.test(query));
+      query.includes('INSERT INTO execution_activation_armaments'));
     assert.ok(targetLockIndex >= 0);
     assert.match(firstArmQueries[targetLockIndex] ?? '', /\blive_reserved\b/u);
     assert.ok(targetLockIndex < promotionIndex);
