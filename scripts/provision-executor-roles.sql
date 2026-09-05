@@ -573,8 +573,9 @@ END
 $worker_default_acl$;
 
 -- PUBLIC authority is inherited and cannot be narrowed with a role-specific
--- revoke. Remove it from every execution relation and column, and from every
--- user sequence so the worker's single positive sequence grant remains exact.
+-- revoke. Remove it from every execution relation and the two venue-proof
+-- relations, including column grants, and from every user sequence so the
+-- worker's positive allowlist remains exact.
 DO $worker_public_execution_acl$
 DECLARE
   relation RECORD;
@@ -589,7 +590,10 @@ BEGIN
       AND namespace.nspname NOT LIKE 'pg_temp_%'
       AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
       AND table_class.relkind IN ('r','p','v','m','f')
-      AND table_class.relname LIKE 'execution\_%' ESCAPE '\'
+      AND (
+        table_class.relname LIKE 'execution\_%' ESCAPE '\'
+        OR table_class.relname IN ('migrations','market_pools')
+      )
       AND attribute.attnum>0 AND NOT attribute.attisdropped
     GROUP BY namespace.nspname,table_class.relname
   LOOP
