@@ -58,10 +58,16 @@ void test('executor role provisioning is explicit, passwordless and least-privil
   assert.match(sql, /TO sol_token_operator_reader/u);
   assert.match(sql, /FROM sol_token_public_api,sol_token_listener_writer,sol_token_executor_worker/u);
   assert.match(sql, /GRANT USAGE ON SCHEMA public\s+TO sol_token_executor_live,sol_token_executor_operations,sol_token_operator_reader/iu);
-  assert.doesNotMatch(
-    executable,
-    /GRANT\s+[^;]*\bDELETE\b[^;]*\bTO\s+(?!sol_token_retention_worker\b)/iu,
-  );
+  for (const grant of executable.matchAll(/GRANT\s+[^;]*\bDELETE\b[^;]*\bTO\s+(sol_token_[a-z_]+)/giu)) {
+    assert.ok(
+      grant[1] === 'sol_token_retention_worker'
+        || grant[1] === 'sol_token_listener_writer',
+      `unexpected DELETE authority for ${grant[1] ?? 'unknown role'}`,
+    );
+    if (grant[1] === 'sol_token_listener_writer') {
+      assert.doesNotMatch(grant[0], /\bexecution_/iu);
+    }
+  }
   assert.match(sql, /ALTER ROLE sol_token_executor_operations NOLOGIN NOSUPERUSER NOCREATEDB\s+NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS/iu);
   assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_operations/u);
   assert.match(sql, /REVOKE SELECT \(%1\$s\), INSERT \(%1\$s\), UPDATE \(%1\$s\), REFERENCES \(%1\$s\)[\s\S]*?sol_token_executor_operations/iu);
@@ -226,10 +232,17 @@ void test('signed live capability is visible only to the dedicated executor role
   assert.doesNotMatch(executable, /execution_reconciliation_evidence[^;]*TO\s+sol_token_executor_live(?!_)/iu);
   assert.doesNotMatch(executable, /execution_fault_ledger[^;]*TO\s+sol_token_executor_live(?!_)/iu);
   assert.doesNotMatch(sql, /GRANT[^;]*execution_signed_transactions[^;]*TO\s+(?:sol_token_listener_writer|sol_token_executor_worker|sol_token_executor_operations|sol_token_operator_reader|sol_token_public_api)/iu);
-  assert.doesNotMatch(
-    sql.replace(/--[^\r\n]*/gu, ' '),
-    /GRANT\s+[^;]*\bDELETE\b[^;]*\bTO\s+(?!sol_token_retention_worker\b)/iu,
-  );
+  for (const grant of sql.replace(/--[^\r\n]*/gu, ' ')
+    .matchAll(/GRANT\s+[^;]*\bDELETE\b[^;]*\bTO\s+(sol_token_[a-z_]+)/giu)) {
+    assert.ok(
+      grant[1] === 'sol_token_retention_worker'
+        || grant[1] === 'sol_token_listener_writer',
+      `unexpected DELETE authority for ${grant[1] ?? 'unknown role'}`,
+    );
+    if (grant[1] === 'sol_token_listener_writer') {
+      assert.doesNotMatch(grant[0], /\bexecution_/iu);
+    }
+  }
 });
 
 void test('foundation retention has an isolated executable role without signed-byte access', async () => {

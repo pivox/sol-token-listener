@@ -44,6 +44,364 @@ BEGIN
 END
 $roles$;
 
+-- The listener owns only observational and paper projections. Rebuild its
+-- authority from zero on every replay so an old grant cannot cross into live
+-- execution state.
+ALTER ROLE sol_token_listener_writer NOLOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+
+DO $listener_parameter_acl$
+DECLARE
+  parameter_name TEXT;
+BEGIN
+  IF current_setting('server_version_num')::INTEGER >= 150000 THEN
+    -- A parameter grant to PUBLIC is inherited by the listener and survives a
+    -- role-specific revoke. Keep trigger bypass unavailable cluster-wide.
+    REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM PUBLIC;
+    FOR parameter_name IN SELECT parname FROM pg_parameter_acl
+    LOOP
+      EXECUTE format(
+        'REVOKE SET, ALTER SYSTEM ON PARAMETER %I FROM sol_token_listener_writer',
+        parameter_name
+      );
+    END LOOP;
+  END IF;
+END
+$listener_parameter_acl$;
+
+DO $listener_parents$
+DECLARE
+  parent_role NAME;
+BEGIN
+  FOR parent_role IN
+    SELECT parent.rolname FROM pg_auth_members membership
+    JOIN pg_roles member ON member.oid=membership.member
+    JOIN pg_roles parent ON parent.oid=membership.roleid
+    WHERE member.rolname='sol_token_listener_writer'
+  LOOP
+    EXECUTE format('REVOKE %I FROM sol_token_listener_writer', parent_role);
+  END LOOP;
+END
+$listener_parents$;
+
+DO $listener_schemas$
+DECLARE
+  schema_name NAME;
+BEGIN
+  FOR schema_name IN
+    SELECT nspname FROM pg_namespace
+    WHERE nspname NOT IN ('pg_catalog','information_schema')
+      AND nspname NOT LIKE 'pg_temp_%' AND nspname NOT LIKE 'pg_toast%'
+  LOOP
+    EXECUTE format('REVOKE ALL PRIVILEGES ON SCHEMA %I FROM sol_token_listener_writer',
+      schema_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_listener_writer',
+      schema_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_listener_writer',
+      schema_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_listener_writer',
+      schema_name);
+  END LOOP;
+END
+$listener_schemas$;
+
+DO $listener_type_acl$
+DECLARE
+  target_type RECORD;
+BEGIN
+  FOR target_type IN
+    SELECT namespace.nspname,type.typname
+    FROM pg_type type
+    JOIN pg_namespace namespace ON namespace.oid=type.typnamespace
+    CROSS JOIN LATERAL aclexplode(type.typacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_listener_writer'
+    )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TYPE %I.%I FROM sol_token_listener_writer',
+      target_type.nspname,target_type.typname
+    );
+  END LOOP;
+END
+$listener_type_acl$;
+
+DO $listener_database_acl$
+DECLARE
+  database_name NAME;
+BEGIN
+  FOR database_name IN SELECT datname FROM pg_database
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON DATABASE %I FROM sol_token_listener_writer',
+      database_name
+    );
+  END LOOP;
+END
+$listener_database_acl$;
+
+DO $listener_public_database_acl$
+BEGIN
+  EXECUTE format(
+    'REVOKE CREATE ON DATABASE %I FROM PUBLIC',
+    current_database()
+  );
+END
+$listener_public_database_acl$;
+
+DO $listener_language_acl$
+DECLARE
+  language_name NAME;
+BEGIN
+  FOR language_name IN
+    SELECT language.lanname
+    FROM pg_language language
+    CROSS JOIN LATERAL aclexplode(language.lanacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_listener_writer'
+    )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON LANGUAGE %I FROM sol_token_listener_writer',
+      language_name
+    );
+  END LOOP;
+END
+$listener_language_acl$;
+
+DO $listener_default_acl$
+DECLARE
+  default_acl RECORD;
+  object_kind TEXT;
+  schema_clause TEXT;
+BEGIN
+  FOR default_acl IN
+    SELECT DISTINCT grantor.rolname AS grantor_name,
+      namespace.nspname AS schema_name,defaults.defaclobjtype
+    FROM pg_default_acl defaults
+    JOIN pg_roles grantor ON grantor.oid=defaults.defaclrole
+    LEFT JOIN pg_namespace namespace ON namespace.oid=defaults.defaclnamespace
+    CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_listener_writer'
+    )
+  LOOP
+    object_kind := CASE default_acl.defaclobjtype
+      WHEN 'r' THEN 'TABLES'
+      WHEN 'S' THEN 'SEQUENCES'
+      WHEN 'f' THEN 'FUNCTIONS'
+      WHEN 'T' THEN 'TYPES'
+      WHEN 'n' THEN 'SCHEMAS'
+      ELSE NULL
+    END;
+    IF object_kind IS NULL THEN
+      RAISE EXCEPTION 'Unsupported listener default ACL object kind';
+    END IF;
+    schema_clause := CASE WHEN default_acl.schema_name IS NULL THEN ''
+      ELSE format(' IN SCHEMA %I',default_acl.schema_name) END;
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL PRIVILEGES ON %s FROM sol_token_listener_writer',
+      default_acl.grantor_name,schema_clause,object_kind
+    );
+  END LOOP;
+END
+$listener_default_acl$;
+
+-- PUBLIC authority is inherited by every role and cannot be removed by a
+-- role-specific REVOKE. Keep every current live relation private; replay this
+-- provisioning after each migration so newly added execution tables are also
+-- covered before a listener starts.
+DO $listener_public_execution_acl$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,table_class.relname,
+      string_agg(quote_ident(attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class table_class
+    JOIN pg_namespace namespace ON namespace.oid=table_class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=table_class.oid
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND table_class.relkind IN ('r','p','v','m','f')
+      AND table_class.relname LIKE 'execution\_%' ESCAPE '\'
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    GROUP BY namespace.nspname,table_class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM PUBLIC',
+      relation.nspname,relation.relname
+    );
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM PUBLIC',
+      relation.columns,relation.nspname,relation.relname
+    );
+  END LOOP;
+  FOR relation IN
+    SELECT namespace.nspname,sequence_class.relname
+    FROM pg_class sequence_class
+    JOIN pg_namespace namespace ON namespace.oid=sequence_class.relnamespace
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND sequence_class.relkind='S'
+      AND sequence_class.relname LIKE 'execution\_%' ESCAPE '\'
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON SEQUENCE %I.%I FROM PUBLIC',
+      relation.nspname,relation.relname
+    );
+  END LOOP;
+END
+$listener_public_execution_acl$;
+
+-- Object ownership bypasses ACL revocation. It cannot be remediated safely by
+-- this role-focused script, so fail closed and require an administrator to
+-- reassign the unexpected object before provisioning can continue.
+DO $listener_ownership_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_database object
+      WHERE object.datdba=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_namespace object
+      WHERE object.nspowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_class object
+      WHERE object.relowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_proc object
+      WHERE object.proowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_type object
+      WHERE object.typowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_language object
+      WHERE object.lanowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+    UNION ALL SELECT 1 FROM pg_default_acl object
+      WHERE object.defaclrole=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_listener_writer')
+  ) THEN
+    RAISE EXCEPTION 'Listener role owns database objects';
+  END IF;
+END
+$listener_ownership_guard$;
+
+DO $listener_columns$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,table_class.relname,
+      string_agg(quote_ident(attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class table_class
+    JOIN pg_namespace namespace ON namespace.oid=table_class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=table_class.oid
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema')
+      AND namespace.nspname NOT LIKE 'pg_temp_%' AND namespace.nspname NOT LIKE 'pg_toast%'
+      AND table_class.relkind IN ('r','p','v','m','f')
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    GROUP BY namespace.nspname,table_class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM sol_token_listener_writer',
+      relation.columns,relation.nspname,relation.relname
+    );
+  END LOOP;
+END
+$listener_columns$;
+
+-- PostgreSQL grants CREATE on public to PUBLIC on some installations. The
+-- listener must never be able to manufacture owner-controlled objects there.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO sol_token_listener_writer;
+
+GRANT SELECT ON TABLE migration_history TO sol_token_listener_writer;
+
+GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE
+  api_event_stream,
+  api_event_stream_state,
+  bonding_curve_snapshots,
+  chain_transaction_finality_replay_receipts,
+  chain_transaction_inbox,
+  creator_profiles,
+  discovered_pools,
+  domain_events,
+  ignored_assets,
+  launch_trades,
+  listener_catch_up_gaps,
+  listener_checkpoints,
+  listener_heartbeats,
+  listener_strict_catch_up_failures,
+  listener_websocket_health,
+  market_pools,
+  market_reserve_snapshots,
+  market_trades,
+  migrations,
+  observed_wallet_positions,
+  paper_decision_jobs,
+  paper_external_buy_events,
+  paper_mvp_position_samples,
+  paper_mvp_runs,
+  paper_positions,
+  paper_strategy_sessions,
+  paper_trades,
+  processing_checkpoints,
+  qualification_reports,
+  raw_chain_events,
+  risk_settings,
+  social_enrichment_jobs,
+  social_evidence_collections,
+  social_http_observations,
+  social_links,
+  social_verification_evidence,
+  state_transitions,
+  swap_events,
+  token_holders_snapshots,
+  token_launches,
+  token_metadata_snapshots,
+  token_risk_reports,
+  token_sessions,
+  trades,
+  trading_candidates,
+  transaction_inbox_recoveries,
+  wallet_cluster_members,
+  wallet_clusters,
+  wallet_funding_evidence,
+  wallet_funding_observations,
+  wallet_graph_profiles,
+  wallet_graph_snapshots,
+  wallet_relationships
+TO sol_token_listener_writer;
+
+GRANT USAGE ON SEQUENCE
+  api_event_stream_sequence_seq,
+  paper_decision_claim_scan_generation_seq
+TO sol_token_listener_writer;
+
+GRANT SELECT (
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status,
+  attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
+  last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
+  purge_after
+), INSERT (
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status
+)
+ON TABLE execution_intents TO sol_token_listener_writer;
+
+GRANT SELECT (intent_id,logical_order_key,decision_fingerprint)
+ON TABLE execution_intent_tombstones TO sol_token_listener_writer;
+
 ALTER ROLE sol_token_executor_live_recovery NOLOGIN NOSUPERUSER NOCREATEDB
   NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
 

@@ -55,9 +55,11 @@ void test('create uses database timestamps and replays only an exactly matching 
   const insertedColumns = required(/execution_intents AS intent \(([\s\S]*?)\) VALUES/u.exec(insert.text)?.[1]);
   assert.doesNotMatch(insertedColumns, /created_at|updated_at/u);
   assert.equal(insert.values?.some((value) => value instanceof Date), false);
-  const conflictRead = client.calls.find((call) => call.text.includes('FOR SHARE'));
+  const conflictRead = client.calls.find((call) =>
+    call.text.includes('WHERE intent.id = $1 OR intent.logical_order_key = $2'));
   assert.ok(conflictRead);
   assert.match(conflictRead.text, /intent\.id\s*=\s*\$1\s+OR\s+intent\.logical_order_key\s*=\s*\$2/u);
+  assert.doesNotMatch(conflictRead.text, /FOR\s+(?:NO\s+KEY\s+)?(?:UPDATE|SHARE)/iu);
 });
 
 void test('create rejects logical-key and id collisions with fixed redacted typed errors', async () => {

@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.12
+**Version de spécification :** 1.2.13
 
-**Version de la spécification parente :** 1.11.13
+**Version de la spécification parente :** 1.11.15
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.13 — 2026-09-05 :** borne H2i, autorité PostgreSQL du listener paper
+  nécessaire à l'émission normale d'une intention sans accès live.
 
 - **1.2.12 — 2026-09-05 :** livre H2g, assemblage offline du draft H2f lié
   aux identités persistées exportées, tout en conservant le canary désarmé.

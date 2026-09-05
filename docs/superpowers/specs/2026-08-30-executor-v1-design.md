@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.14
+**Version de spécification :** 1.11.15
 
 **Date :** 2026-08-31
 
@@ -13,9 +13,12 @@
 préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
 #51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations
 hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL
-read-only de sa source #51-H2h
+read-only de sa source #51-H2h et autorité PostgreSQL fermée du listener #51-H2i
 
 ## Historique des versions
+
+- **1.11.15 — 2026-09-05 :** ajoute H2i, provisioning fermé du listener
+  paper capable d'émettre une intention canary sans accès aux autorités live.
 
 - **1.11.14 — 2026-09-05 :** ajoute H2h, export causal PostgreSQL de la source
   H2g sous rôle opérateur fermé, sans RPC, clé, signature, armement ni mutation.

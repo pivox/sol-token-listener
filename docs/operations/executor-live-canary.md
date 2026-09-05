@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.10.0 — 2026-09-05
+**Version :** 1.11.0 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -12,8 +12,9 @@ snapshots wallet/provider. #51-H2e produit l'attestation de quota Helius
 consommée par H2d. #51-H2f valide et signe hors ligne les deux enveloppes H2c
 dans un paquet atomique. #51-H2g assemble son draft depuis deux artefacts
 canoniques protégés, sans accès DB ou réseau. #51-H2h exporte sa source depuis
-une photographie PostgreSQL read-only. Ces livraisons préparent un preflight externe sans
-armer ni démarrer un canary.
+une photographie PostgreSQL read-only. #51-H2i ferme l'autorité PostgreSQL du
+listener paper qui produit l'intention canary normale. Ces livraisons préparent
+un preflight externe sans armer ni démarrer un canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
 briques #51-G ne prouvent ni rentabilité, ni sellabilité générale, ni avantage
@@ -93,9 +94,14 @@ npm run executor:live:start
 Elles ne sont pas une procédure d'armement. La procédure H2c ci-dessous reste
 séquentielle, interactive et sans commande englobante.
 
-## Frontières des cinq environnements PostgreSQL
+## Frontières des six environnements PostgreSQL
 
-Créer quatre fichiers hors Git, lisibles seulement par leur compte de service :
+Créer six fichiers hors Git, lisibles seulement par leur compte de service :
+
+- listener H2i : login `NOINHERIT` membre uniquement de
+  `sol_token_listener_writer`, connexion avec
+  `options=-c role=sol_token_listener_writer`,
+  `POSTGRES_AUTO_MIGRATE=false` et aucun keypair ;
 
 - readiness H2d : login membre uniquement de
   `sol_token_executor_readiness`, endpoint HTTP Mainnet qualifié, adresse
@@ -117,6 +123,13 @@ et ne posséder aucun objet. Les processus forcent `SET ROLE`,
 checkout. Le rôle opérations ne peut ni lire les bytes signés ou non signés,
 ni armer des champs runtime arbitraires, ni modifier les intents ; H2a,
 listener et API ne gagnent aucune autorité H2c.
+
+Le listener H2i utilise le paramètre de connexion PostgreSQL pour fixer son
+rôle sur chaque connexion du pool. Il peut écrire ses projections métier et
+insérer une intention, mais ne peut ni modifier une intention existante, ni
+lire ou écrire génération wallet, risque live, contrôle, armement, lock,
+transaction signée, soumission ou réconciliation. Arrêter le listener, ou
+remettre `EXECUTION_INTENT_EMISSION_ENABLED=false`, avant le preflight H2c.
 
 ## Produire la preuve Helius H2e
 
