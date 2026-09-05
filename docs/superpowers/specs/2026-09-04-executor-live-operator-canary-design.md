@@ -1,8 +1,8 @@
 # Armement opérateur exact et préparation du canary — conception #51-H2c
 
-**Version de spécification :** 1.1.5
+**Version de spécification :** 1.1.6
 
-**Version de la spécification parente :** 1.11.12
+**Version de la spécification parente :** 1.11.13
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-H2b fusionnée par la PR #78 (`bcc983b`)
 
 ## Historique des versions
+
+- **1.1.6 — 2026-09-05 :** référence H2g comme producteur offline du draft
+  strict consommé par H2f, sans modifier l'armement V2.
 
 - **1.1.5 — 2026-09-05 :** référence H2f comme producteur hors ligne des
   enveloppes qualification/sidecar, sans lui déléguer la collecte des onze

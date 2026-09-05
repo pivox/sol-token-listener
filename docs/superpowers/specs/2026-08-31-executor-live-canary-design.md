@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.11
+**Version de spécification :** 1.2.12
 
-**Version de la spécification parente :** 1.11.12
+**Version de la spécification parente :** 1.11.13
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.12 — 2026-09-05 :** livre H2g, assemblage offline du draft H2f lié
+  aux identités persistées exportées, tout en conservant le canary désarmé.
 
 - **1.2.11 — 2026-09-05 :** livre H2f, packaging hors ligne canonique et
   atomique des deux attestations H2c, sans preuve synthétique, clé Solana,

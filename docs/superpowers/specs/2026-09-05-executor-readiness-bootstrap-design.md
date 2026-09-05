@@ -1,8 +1,8 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.10
+**Version de spécification :** 1.0.11
 
-**Version de la spécification parente :** 1.11.12
+**Version de la spécification parente :** 1.11.13
 
 **Date :** 2026-09-05
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.11 — 2026-09-05 :** référence H2g comme consommateur offline des
+  identités H2d via l'export canonique H2h à venir.
 
 - **1.0.10 — 2026-09-05 :** référence H2f comme consommateur strict du
   manifeste redacted et des snapshots H2d, sans élargir l'autorité readiness.

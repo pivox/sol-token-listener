@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.8.1 — 2026-09-05
+**Version :** 1.9.0 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -10,7 +10,8 @@ armement V2 lié à une intention BUY exacte, le lock durable avant signature et
 sa récupération fail-closed. #51-H2d ajoute le bootstrap non signant des
 snapshots wallet/provider. #51-H2e produit l'attestation de quota Helius
 consommée par H2d. #51-H2f valide et signe hors ligne les deux enveloppes H2c
-dans un paquet atomique. Ces livraisons préparent un préflight externe sans
+dans un paquet atomique. #51-H2g assemble son draft depuis deux artefacts
+canoniques protégés, sans accès DB ou réseau. Ces livraisons préparent un préflight externe sans
 armer ni démarrer un canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
@@ -18,6 +19,20 @@ briques #51-G ne prouvent ni rentabilité, ni sellabilité générale, ni avanta
 de position. Leur présence ne crée aucun armement, ne change pas `ENTRY_STOP`
 et n'autorise aucune dépense. Aucune commande ci-dessous ne les enchaîne
 automatiquement.
+
+## Assemblage offline H2g
+
+Après production de la source persistée par H2h, placer la source et le
+catalogue de gates hors du checkout, en fichiers owner-only `0600`, puis lancer
+`npm run executor:preflight-draft:start`. La commande exige les trois chemins
+absolus `EXECUTOR_PREFLIGHT_SOURCE_PATH`,
+`EXECUTOR_PREFLIGHT_GATE_CATALOG_PATH` et `EXECUTOR_PREFLIGHT_DRAFT_PATH`.
+Elle refuse DB, RPC, credentials Helius, wallet et configuration live, ne
+remplace jamais un draft existant et affiche seulement un manifeste redacted.
+
+Le draft produit reste non signé et n'autorise aucune dépense. Il est ensuite
+fourni séparément à H2f. Une source saisie manuellement avant H2h ne constitue
+pas une preuve opératoire.
 
 ## État et frontière de sécurité
 
