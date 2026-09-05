@@ -5,7 +5,11 @@ import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonicalStringifyJson } from '../utils/json.js';
 import { parseExecutionPreflightSourceConfig } from './config.js';
-import { openExecutionPreflightSourceDatabase } from './database.js';
+import {
+  openExecutionPreflightSourceDatabase,
+} from './database.js';
+import type { ExecutionPreflightDraftSourceV1 } from '../domain/execution-preflight-draft.js';
+import type { ExecutionPreflightSourceRequestV1 } from './repository.js';
 import { createExecutionPreflightSourceExport } from './service.js';
 
 export async function writeAtomicPreflightSource(
@@ -51,6 +55,32 @@ export async function assertExternalPreflightSourcePath(
     && !isAbsolute(relation))) throw new TypeError();
 }
 
+export async function runExecutionPreflightSourceCommand(
+  database: Readonly<{
+    repository: Readonly<{
+      export: (request: ExecutionPreflightSourceRequestV1) =>
+      Promise<ExecutionPreflightDraftSourceV1>;
+    }>;
+    evict: () => void;
+    close: () => Promise<void>;
+  }>,
+  request: ExecutionPreflightSourceRequestV1,
+  outputPath: string,
+  publish: (path: string, content: string) => Promise<void> = writeAtomicPreflightSource,
+  assertReadyToPublish: () => void = () => undefined,
+): Promise<string> {
+  let source;
+  try {
+    source = await database.repository.export(request);
+  } finally {
+    try { database.evict(); } finally { await database.close(); }
+  }
+  assertReadyToPublish();
+  const exported = createExecutionPreflightSourceExport(source);
+  await publish(outputPath, exported.sourceJson);
+  return canonicalStringifyJson(exported.manifest);
+}
+
 export async function main(): Promise<void> {
   const applicationRoot = await findApplicationRoot(fileURLToPath(import.meta.url));
   const config = parseExecutionPreflightSourceConfig(process.env, applicationRoot);
@@ -58,18 +88,11 @@ export async function main(): Promise<void> {
   const idleState = { failed: false };
   const database = openExecutionPreflightSourceDatabase({ databaseUrl: config.databaseUrl,
     statementTimeoutMs: 10_000, onIdleError: () => { idleState.failed = true; } });
-  try {
-    const source = await database.repository.export({ generationId: config.generationId,
-      targetIntentId: config.targetIntentId,
-      simulationArtifactId: config.simulationArtifactId });
-    if (idleState.failed) throw new TypeError();
-    const exported = createExecutionPreflightSourceExport(source);
-    await writeAtomicPreflightSource(config.outputPath, exported.sourceJson);
-    process.stdout.write(`${canonicalStringifyJson(exported.manifest)}\n`);
-  } finally {
-    database.evict();
-    await database.close();
-  }
+  const manifest = await runExecutionPreflightSourceCommand(database,
+    { generationId: config.generationId, targetIntentId: config.targetIntentId,
+      simulationArtifactId: config.simulationArtifactId }, config.outputPath,
+    writeAtomicPreflightSource, () => { if (idleState.failed) throw new TypeError(); });
+  process.stdout.write(`${manifest}\n`);
 }
 
 async function syncDirectory(path: string): Promise<void> {
