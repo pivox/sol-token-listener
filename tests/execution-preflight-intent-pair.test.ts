@@ -26,20 +26,20 @@ void test('derives one frozen deterministic canary target and simulation sibling
   assert.equal(first.expiresAtMs, target.expiresAtMs);
   assert.equal(
     first.simulationIntent.logicalCommandId,
-    'execution_preflight_probe_8b50057329896914b851427fed4afb3f84d0e22d6fa18b84c4860d3bf5dbca37',
+    'execution_preflight_probe_c9c9d32390a50882f9837b420619b9d46002b16b8db535a4b9796b772f57d2de',
   );
   assert.equal(first.simulationIntent.logicalOrderKey, first.simulationIntent.logicalCommandId);
   assert.equal(
     first.simulationIntent.id,
-    'execution_intent_a11a752f6151dbeaf45102dfba5c660cf606d7325021d30f4467bee9bc607126',
+    'execution_intent_41f7194bac3e068072963946d0e49197e87a10c25e33f8ab6d9c6ff92fe75d0c',
   );
   assert.equal(
     first.pairId,
-    'execution_preflight_intent_pair_aa6dd2878101aca4d6fb4aed8fd149205af23a6fa0d6299361f05fa5268ccb61',
+    'execution_preflight_intent_pair_11e7a75d6ff9928fabbc28a711b9f329ae0305e6c27deb8bfe6ec3cfcf5f9e87',
   );
   assert.equal(
     first.pairFingerprint,
-    '02ff686beecbe6ce152458dc278558e394db06cebbeba001128a6eb309208935',
+    '6ba224265eb167c992da08e7b95c1a0e3ea44a069b66cf3a2e0ecb5e87bb5c00',
   );
   assert.notEqual(first.simulationIntent.id, target.id);
   assert.notEqual(first.simulationIntent.logicalCommandId, target.logicalCommandId);
@@ -59,6 +59,13 @@ void test('derives one frozen deterministic canary target and simulation sibling
 
 void test('accepts only BUY WSOL SPL Token 9-decimal Pump.fun targets', () => {
   const invalidTargets = [
+    createExecutionIntentDraft({ ...targetInput(), strategyId: 'another-strategy' }),
+    createExecutionIntentDraft({ ...targetInput(), strategyVersion: 2 }),
+    createExecutionIntentDraft({ ...targetInput(), logicalCommandId: `paper_sell_${'1'.repeat(64)}` }),
+    createExecutionIntentDraft({
+      ...targetInput(),
+      logicalCommandId: `execution_preflight_probe_${'1'.repeat(64)}`,
+    }),
     createExecutionIntentDraft({
       ...targetInput(),
       side: 'SELL',
@@ -113,7 +120,7 @@ function targetInput(): Readonly<Record<string, unknown>> {
     strategyId: 'creation-entry-v1',
     strategyVersion: 1,
     positionId: 'paper-position-1',
-    logicalCommandId: 'paper_open_abc',
+    logicalCommandId: `paper_open_${'1'.repeat(64)}`,
     mint: '11111111111111111111111111111111',
     side: 'BUY',
     venuePolicy: 'PUMP_FUN_ONLY',

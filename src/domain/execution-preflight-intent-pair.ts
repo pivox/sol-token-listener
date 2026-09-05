@@ -81,6 +81,11 @@ export function createExecutionPreflightIntentPairDraft(
       requestedAtMs: target.requestedAtMs,
       expiresAtMs: target.expiresAtMs,
     }));
+    if (
+      simulationIntent.id === target.id
+      || simulationIntent.logicalCommandId === target.logicalCommandId
+      || simulationIntent.logicalOrderKey === target.logicalOrderKey
+    ) throw invalid();
     const pairId = `execution_preflight_intent_pair_${hashLengthPrefixed([
       'execution-preflight-intent-pair-v1',
       target.id,
@@ -129,7 +134,11 @@ function targetDraftFrom(value: unknown): ExecutionIntentDraftV1 {
 
 function assertSupportedTarget(target: ExecutionIntentDraftV1): void {
   if (
-    target.side !== 'BUY'
+    target.strategyId !== 'creation-entry-v1'
+    || target.strategyVersion !== 1
+    || !/^paper_open_[a-f0-9]{64}$/u.test(target.logicalCommandId)
+    || target.logicalOrderKey !== target.logicalCommandId
+    || target.side !== 'BUY'
     || target.venuePolicy !== 'PUMP_FUN_ONLY'
     || target.quoteMint !== WSOL_MINT
     || target.quoteTokenProgram !== 'SPL_TOKEN'
