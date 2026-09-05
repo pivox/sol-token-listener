@@ -57,6 +57,12 @@ les gates, l'armement exact et le lock durable pré-signature dans l'état
 [runbook canary #51-G](docs/operations/executor-live-canary.md) décrit les
 frontières et l'état non activé.
 
+#51-H2h exporte désormais, dans une transaction PostgreSQL
+`REPEATABLE READ READ ONLY`, la source persistée exacte requise par H2g. La
+commande séparée `executor:preflight-source:start` exige les identités
+génération/intention/simulation explicites, écrit un fichier owner-only hors
+Git et ne possède ni RPC, clé, signature, armement ou soumission.
+
 ### Bootstrap de readiness non signant (#51-H2d)
 
 `npm run executor:readiness:start` est un processus Mainnet one-shot séparé.

@@ -521,6 +521,13 @@ quota/sizing/retry, #51-F pour le preflight et l'armement manuel, puis #51-G
 pour une éventuelle signature/soumission sous gates compensatoires sont tous
 obligatoires avant une transaction réelle. #51-D n'ajoute aucun mode live.
 
+#51-H2h relie désormais ces preuves au draft sans coupler le listener au live :
+un processus one-shot séparé lit les identités persistées explicites sous le
+rôle `sol_token_operator_reader`, dans une transaction `REPEATABLE READ READ
+ONLY`, puis produit hors Git la source canonique de H2g. Cette frontière ne
+charge aucun secret Solana et ne peut ni louer une intention, ni armer, signer
+ou soumettre.
+
 ## Persistance, reprise et rétention
 
 `raw_chain_events` garde l’entrée technique ; `domain_events`,

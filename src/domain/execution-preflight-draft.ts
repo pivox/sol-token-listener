@@ -10,6 +10,7 @@ import {
 import type { ProviderUsageSnapshotV1 } from './execution-provider-quota.js';
 import { createProviderUsageSnapshot } from './execution-provider-quota.js';
 import {
+  createExecutionReadinessManifest,
   createExecutionWalletGeneration,
   type ExecutionReadinessManifestV1,
 } from './execution-readiness.js';
@@ -32,6 +33,12 @@ const SOURCE_KEYS = Object.freeze([
 ] as const);
 const CATALOG_KEYS = Object.freeze([
   'schemaVersion', 'strategyFingerprint', 'policy', 'gates',
+] as const);
+const READINESS_KEYS = Object.freeze([
+  'schemaVersion', 'state', 'generationId', 'walletPublicKey', 'cluster', 'providerId',
+  'walletSnapshotId', 'walletSnapshotFingerprint', 'providerSnapshotId',
+  'providerSnapshotFingerprint', 'walletLamports', 'tokenBalanceCount', 'observedAtMs',
+  'expiresAtMs', 'canaryStatus', 'paperMainnet49Status',
 ] as const);
 const GENERATION_KEYS = Object.freeze([
   'generationId', 'walletPublicKey', 'cluster', 'genesisHash', 'generation',
@@ -109,21 +116,61 @@ export class ExecutionPreflightDraftValidationError extends TypeError {
   }
 }
 
+export function createExecutionPreflightDraftSource(
+  sourceInput: unknown,
+): ExecutionPreflightDraftSourceV1 {
+  try {
+    const source = exactRecord(sourceInput, SOURCE_KEYS);
+    if (source.schemaVersion !== 'execution-preflight-draft-source.v1') throw invalid();
+    const generation = exactRecord(source.generation, GENERATION_KEYS);
+    const targetIntent = targetFrom(source.target);
+    const simulation = simulationFrom(source.simulation);
+    const walletSnapshot = walletFrom(source.walletSnapshot);
+    const providerSnapshot = providerFrom(source.providerSnapshot);
+    const databaseNowMs = timestamp(source.databaseNowMs);
+    const readiness = readinessFrom(source.readiness);
+    const reconstructedGeneration = createExecutionWalletGeneration(Object.freeze({
+      walletPublicKey: generation.walletPublicKey,
+      cluster: generation.cluster,
+      genesisHash: generation.genesisHash,
+      generation: generation.generation,
+    }));
+    if (reconstructedGeneration.generationId !== generation.generationId) throw invalid();
+    assertSourceBindings(reconstructedGeneration, targetIntent, simulation, walletSnapshot,
+      providerSnapshot, readiness, databaseNowMs);
+    return Object.freeze({
+      schemaVersion: 'execution-preflight-draft-source.v1', readiness,
+      generation: Object.freeze({
+        generationId: reconstructedGeneration.generationId,
+        walletPublicKey: reconstructedGeneration.walletPublicKey,
+        cluster: 'mainnet-beta',
+        genesisHash: reconstructedGeneration.genesisHash,
+        generation: reconstructedGeneration.generation,
+      }),
+      walletSnapshot,
+      providerSnapshot,
+      target: Object.freeze({ intent: targetIntent, leaseOwner: null,
+        leaseToken: null, leaseExpiresAtMs: null }),
+      simulation,
+      databaseNowMs,
+    });
+  } catch { throw invalid(); }
+}
+
 export function createExecutionPreflightDraft(
   sourceInput: unknown,
   catalogInput: unknown,
 ): ExecutionPreflightBundleDraftV1 {
   try {
-    const source = exactRecord(sourceInput, SOURCE_KEYS);
+    const source = createExecutionPreflightDraftSource(sourceInput);
     const catalog = exactRecord(catalogInput, CATALOG_KEYS);
-    if (source.schemaVersion !== 'execution-preflight-draft-source.v1'
-      || catalog.schemaVersion !== 'execution-preflight-gate-catalog.v1') throw invalid();
-    const generation = exactRecord(source.generation, GENERATION_KEYS);
-    const target = targetFrom(source.target);
+    if (catalog.schemaVersion !== 'execution-preflight-gate-catalog.v1') throw invalid();
+    const generation = source.generation;
+    const target = source.target.intent;
     const simulation = simulationFrom(source.simulation);
-    const walletSnapshot = walletFrom(source.walletSnapshot);
-    const providerSnapshot = providerFrom(source.providerSnapshot);
-    const databaseNowMs = timestamp(source.databaseNowMs);
+    const walletSnapshot = source.walletSnapshot;
+    const providerSnapshot = source.providerSnapshot;
+    const databaseNowMs = source.databaseNowMs;
     const policy = createExecutionRiskPolicy(catalog.policy);
     const strategyFingerprint = fingerprint(catalog.strategyFingerprint);
     const qualificationExpiresAtMs = databaseNowMs + QUALIFICATION_TTL_MS;
@@ -132,16 +179,8 @@ export function createExecutionPreflightDraft(
       databaseNowMs,
       qualificationExpiresAtMs,
     );
-    assertSourceBindings(
-      generation,
-      target,
-      simulation,
-      walletSnapshot,
-      providerSnapshot,
-      databaseNowMs,
-      policy.walletSnapshotMaxAgeMs,
-      policy.providerUsageMaxAgeMs,
-    );
+    assertPolicyFreshness(walletSnapshot, providerSnapshot, databaseNowMs,
+      policy.walletSnapshotMaxAgeMs, policy.providerUsageMaxAgeMs);
     const mainnetSimulationFingerprint = createMainnetSimulationEvidenceFingerprint({
       artifactId: simulation.artifactId,
       resultFingerprint: simulation.resultFingerprint,
@@ -191,7 +230,7 @@ export function createExecutionPreflightDraft(
     if (expiresAtMs < databaseNowMs + MINIMUM_MARGIN_MS) throw invalid();
     const draft = Object.freeze({
       schemaVersion: 'execution-preflight-bundle-draft.v1' as const,
-      readiness: source.readiness as ExecutionReadinessManifestV1,
+      readiness: source.readiness,
       qualification: without(qualification, ['qualificationId', 'qualificationFingerprint']),
       canary: Object.freeze({
         payloadVersion: 1 as const,
@@ -225,6 +264,26 @@ function targetFrom(value: unknown): ExecutionIntentV1 {
     || intent.quoteDecimals !== 9 || intent.baseAmountRaw !== null
     || intent.quoteAmountRaw === null || intent.quoteAmountRaw === 0n) throw invalid();
   return intent;
+}
+
+function readinessFrom(value: unknown): ExecutionReadinessManifestV1 {
+  const row = exactRecord(value, READINESS_KEYS);
+  if (row.schemaVersion !== 'execution-readiness-bootstrap.v1'
+    || row.state !== 'READINESS_EVIDENCE_COLLECTED'
+    || row.canaryStatus !== 'CANARY_NOT_STARTED'
+    || row.paperMainnet49Status !== 'NON_EXECUTED_NON_VALIDATED'
+    || typeof row.walletLamports !== 'string'
+    || !/^(?:0|[1-9][0-9]*)$/u.test(row.walletLamports)) throw invalid();
+  return createExecutionReadinessManifest(Object.freeze({
+    generationId: row.generationId, walletPublicKey: row.walletPublicKey,
+    cluster: row.cluster, providerId: row.providerId,
+    walletSnapshotId: row.walletSnapshotId,
+    walletSnapshotFingerprint: row.walletSnapshotFingerprint,
+    providerSnapshotId: row.providerSnapshotId,
+    providerSnapshotFingerprint: row.providerSnapshotFingerprint,
+    walletLamports: BigInt(row.walletLamports), tokenBalanceCount: row.tokenBalanceCount,
+    observedAtMs: row.observedAtMs, expiresAtMs: row.expiresAtMs,
+  }));
 }
 
 type SuccessfulExecutionSimulationArtifactV1 = ExecutionSimulationArtifactV1 & Readonly<{
@@ -269,9 +328,8 @@ function assertSourceBindings(
   simulation: SuccessfulExecutionSimulationArtifactV1,
   wallet: ExecutionWalletSnapshotV1,
   provider: ProviderUsageSnapshotV1,
+  readiness: ExecutionReadinessManifestV1,
   nowMs: number,
-  walletMaxAgeMs: number,
-  providerMaxAgeMs: number,
 ): void {
   if (generation.cluster !== 'mainnet-beta'
     || createExecutionWalletGeneration(Object.freeze({
@@ -286,13 +344,33 @@ function assertSourceBindings(
     || generation.genesisHash !== simulation.observedGenesisHash
     || provider.providerId !== wallet.providerId
     || provider.providerId !== simulation.providerId
+    || readiness.generationId !== generation.generationId
+    || readiness.walletPublicKey !== generation.walletPublicKey
+    || readiness.providerId !== provider.providerId
+    || readiness.walletSnapshotId !== wallet.snapshotId
+    || readiness.walletSnapshotFingerprint !== wallet.snapshotFingerprint
+    || readiness.providerSnapshotId !== provider.snapshotId
+    || readiness.providerSnapshotFingerprint !== provider.snapshotFingerprint
+    || readiness.walletLamports !== wallet.walletLamports.toString()
+    || readiness.tokenBalanceCount !== wallet.tokenBalanceCount
+    || readiness.observedAtMs !== wallet.observedAtMs
+    || readiness.expiresAtMs !== provider.expiresAtMs
     || target.requestedAtMs > nowMs || target.expiresAtMs < nowMs + MINIMUM_MARGIN_MS
     || simulation.recordedAtMs > nowMs
     || simulation.recordedAtMs < nowMs - MAXIMUM_SIMULATION_AGE_MS
     || wallet.observedAtMs > nowMs || provider.measuredAtMs > nowMs
-    || wallet.observedAtMs + walletMaxAgeMs < nowMs + MINIMUM_MARGIN_MS
-    || provider.measuredAtMs + providerMaxAgeMs < nowMs + MINIMUM_MARGIN_MS
     || provider.expiresAtMs < nowMs + MINIMUM_MARGIN_MS) throw invalid();
+}
+
+function assertPolicyFreshness(
+  wallet: ExecutionWalletSnapshotV1,
+  provider: ProviderUsageSnapshotV1,
+  nowMs: number,
+  walletMaxAgeMs: number,
+  providerMaxAgeMs: number,
+): void {
+  if (wallet.observedAtMs + walletMaxAgeMs < nowMs + MINIMUM_MARGIN_MS
+    || provider.measuredAtMs + providerMaxAgeMs < nowMs + MINIMUM_MARGIN_MS) throw invalid();
 }
 
 function walletFrom(value: unknown): ExecutionWalletSnapshotV1 {

@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.13
+**Version de spécification :** 1.11.14
 
 **Date :** 2026-08-31
 
@@ -12,9 +12,13 @@
 #51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b,
 préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
 #51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations
-hors ligne #51-H2f et assemblage offline du draft #51-H2g
+hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL
+read-only de sa source #51-H2h
 
 ## Historique des versions
+
+- **1.11.14 — 2026-09-05 :** ajoute H2h, export causal PostgreSQL de la source
+  H2g sous rôle opérateur fermé, sans RPC, clé, signature, armement ni mutation.
 
 - **1.11.13 — 2026-09-05 :** ajoute H2g, assembleur offline strict du draft
   H2f depuis un export canonique et huit preuves statiques, sans DB, RPC,
@@ -1084,6 +1088,9 @@ réaffecté à une autre signification.
 | #51-H2c | Validation opérateur et préparation manuelle du canary minimal | Armement humain explicite uniquement |
 | #51-H2d | Bootstrap public wallet/provider sous rôle PostgreSQL dédié | Aucune |
 | #51-H2e | Producteur externe de preuve de quota Helius signée | Aucune capacité Solana |
+| #51-H2f | Paquet signé hors ligne des preuves H2c | Aucune capacité Solana |
+| #51-H2g | Assemblage offline du draft H2f | Aucune capacité Solana |
+| #51-H2h | Export causal PostgreSQL de la source H2g | Aucune capacité Solana |
 
 Chaque PR est fusionnable seule, garde le listener opérationnel et passe trois
 cycles de revue au maximum. Une PR ne peut pas anticiper l'activation de la
@@ -1122,7 +1129,7 @@ suivante.
 - les gates compensatoires et l'activation progressive sont testables ;
 - SOL/WSOL est l'allowlist initiale sans coupler le domaine à SOL ;
 - la rétention terminale de quatre heures est documentée ;
-- les lots #51-B à #51-H2e sont indépendants et fusionnables séquentiellement ;
+- les lots #51-B à #51-H2h sont indépendants et fusionnables séquentiellement ;
 - aucun code de production, comportement, secret ou mode live n'est ajouté ;
 - `npm run build`, `npm run check`, `npm run lint`, `npm test` et
   `npm run docs:check` restent verts.
