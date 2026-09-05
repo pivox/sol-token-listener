@@ -450,6 +450,7 @@ async function prepareAuthorizedLockScenario(
     pool, '4 minutes', 'So11111111111111111111111111111111111111112', target,
   );
   const intentId = target.id;
+  await pool.query('UPDATE execution_intents SET live_reserved=TRUE WHERE id=$1', [intentId]);
   const intents = new PostgresExecutionIntentRepository(pool);
   const claimed = await intents.claim({
     ownerId: 'pre-signature-lock-test', leaseMs: 30_000,

@@ -940,6 +940,7 @@ async function assertCatalogContract(pool: InstanceType<typeof pg.Pool>): Promis
       'state_revision',
       'lease_owner', 'lease_token', 'lease_expires_at', 'last_reason_code', 'terminal_at',
       'reconciliation_completed_at', 'created_at', 'updated_at', 'purge_after',
+      'live_reserved',
     ].map((column_name) => ({ table_name, column_name }))),
   ]);
   const foreignKeys = await pool.query(`SELECT source_table.relname AS source, target_table.relname AS target,
