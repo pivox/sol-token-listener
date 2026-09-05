@@ -51,6 +51,101 @@ const rpcBudget = Object.freeze({
   payloadVersion: 1 as const, callsUsed: 5, callsLimit: 12,
 });
 
+void test('expired pre-signature lock is atomically revoked and stops new entries',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      const fixture = await createBuyFixture(pool);
+      const live = new PostgresExecutionLiveRepository(pool);
+      const authorization = await live.authorizeExactSigning(Object.freeze({
+        claim: fixture.claim, attempt: fixture.attempt, generationId,
+        runtime: fixture.runtime, material: fixture.material,
+      }));
+      await assert.rejects(
+        live.recoverStrandedPreSignatureLock(generationId),
+        isLiveRepositoryError('LIVE_EXECUTOR_FOREIGN_LEASE_ACTIVE'),
+      );
+      await pool.query(`UPDATE execution_intents SET
+        lease_expires_at=date_trunc('milliseconds',statement_timestamp()-INTERVAL '1 second')
+        WHERE id=$1`, [fixture.claim.intent.id]);
+
+      assert.deepEqual(await live.recoverStrandedPreSignatureLock(generationId), {
+        payloadVersion: 1, kind: 'REVOKED',
+      });
+      assert.deepEqual(await live.recoverStrandedPreSignatureLock(generationId), {
+        payloadVersion: 1, kind: 'IDLE',
+      });
+      const state = await pool.query(`SELECT
+        lock.state AS lock_state,lock.state_revision::TEXT AS lock_revision,
+        intent.status AS intent_status,intent.last_reason_code AS intent_reason,
+        intent.lease_owner,attempt.status AS attempt_status,attempt.reason_code AS attempt_reason,
+        reservation.state AS reservation_state,armament.state AS armament_state,
+        risk.reserved_exposure_raw::TEXT AS reserved_exposure_raw,risk.open_positions,
+        control.state AS control_state,event.actor_type,event.reason_code,event.source,
+        event.intent_id,event.attempt_number,event.lock_id,event.artifact_id,
+        (lock.purge_after=lock.terminal_at+INTERVAL '4 hours') AS lock_retention
+        FROM execution_pre_signature_locks lock
+        JOIN execution_intents intent ON intent.id=lock.intent_id
+        JOIN execution_attempts attempt ON attempt.intent_id=lock.intent_id
+          AND attempt.attempt_number=lock.attempt_number
+        JOIN execution_exposure_reservations reservation
+          ON reservation.reservation_id=lock.reservation_id
+        JOIN execution_activation_armaments armament ON armament.armament_id=lock.armament_id
+        JOIN execution_wallet_risk_state risk ON risk.generation_id=lock.generation_id
+        JOIN execution_control_state control ON control.generation_id=lock.generation_id
+        JOIN execution_control_events event ON event.event_id=control.last_event_id
+        WHERE lock.lock_id=$1`, [authorization.preSignatureLockId]);
+      assert.deepEqual(state.rows[0], {
+        lock_state: 'REVOKED', lock_revision: '1', intent_status: 'FAILED',
+        intent_reason: 'PRE_SUBMISSION_REVOKED_NO_SEND', lease_owner: null,
+        attempt_status: 'ABANDONED', attempt_reason: 'PRE_SUBMISSION_REVOKED_NO_SEND',
+        reservation_state: 'RELEASED', armament_state: 'REVOKED',
+        reserved_exposure_raw: '0', open_positions: 0, control_state: 'ENTRY_STOP',
+        actor_type: 'SYSTEM', reason_code: 'SYSTEM_PRE_SIGNATURE_LOCK_STRANDED',
+        source: 'executor-live.pre-signature-recovery', intent_id: fixture.claim.intent.id,
+        attempt_number: fixture.attempt.attemptNumber,
+        lock_id: authorization.preSignatureLockId, artifact_id: null, lock_retention: true,
+      });
+      await assert.rejects(
+        live.assertRunnableWork(runnableBinding(fixture.runtime)),
+        isLiveRepositoryError('LIVE_EXECUTOR_NO_WORK'),
+      );
+    });
+  });
+
+void test('stranded lock recovery never lowers an operator HARD_STOP', async (context) => {
+  const databaseUrl = requiredDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    await migrateDatabase({ pool });
+    const fixture = await createBuyFixture(pool);
+    const live = new PostgresExecutionLiveRepository(pool);
+    await live.authorizeExactSigning(Object.freeze({
+      claim: fixture.claim, attempt: fixture.attempt, generationId,
+      runtime: fixture.runtime, material: fixture.material,
+    }));
+    const operations = new PostgresExecutionOperationsRepository(pool);
+    await operations.setStop({
+      payloadVersion: 1, commandId: `command:hard-stop:${randomUUID()}`, generationId,
+      operatorId: 'operator-primary', occurredAtMs: Date.now(),
+    }, 'HARD_STOP');
+    const before = await pool.query(`SELECT state,state_revision::TEXT AS revision
+      FROM execution_control_state WHERE generation_id=$1`, [generationId]);
+    await pool.query(`UPDATE execution_intents SET
+      lease_expires_at=date_trunc('milliseconds',statement_timestamp()-INTERVAL '1 second')
+      WHERE id=$1`, [
+      fixture.claim.intent.id,
+    ]);
+
+    assert.equal((await live.recoverStrandedPreSignatureLock(generationId)).kind, 'REVOKED');
+    const control = await pool.query(`SELECT state,state_revision::TEXT AS revision
+      FROM execution_control_state WHERE generation_id=$1`, [generationId]);
+    assert.deepEqual(control.rows[0], before.rows[0]);
+  });
+});
+
 type RevocableSignedState = 'PERSISTED' | 'SIGNED_SIMULATED';
 for (const initialState of ['PERSISTED', 'SIGNED_SIMULATED'] as const) {
   void test(`BUY ${initialState} is atomically revoked without send and releases every capability`,
@@ -59,6 +154,7 @@ for (const initialState of ['PERSISTED', 'SIGNED_SIMULATED'] as const) {
       if (databaseUrl === null) return;
       await withTemporarySchema(databaseUrl, async (pool) => {
         const fixture = await createPersistedBuyFixture(pool, initialState);
+        await fixture.live.assertRunnableWork(runnableBinding(fixture.runtime));
         const beforeRevocation = await fixture.live.inspectSignedTransaction({
           claim: fixture.claim, artifactId: fixture.artifact.artifactId,
         });
@@ -170,6 +266,18 @@ void test('worker restart durably routes SUBMISSION_STARTED to ambiguity without
         intent_status: 'UNKNOWN_REQUIRES_RECONCILIATION',
         unknown_block: true,
         unknown_reservation_state: 'UNKNOWN_HELD',
+      }]);
+      const control = await pool.query<{
+        state: string;
+        actor_type: string;
+        reason_code: string;
+      }>(`SELECT control.state,event.actor_type,event.reason_code
+        FROM execution_control_state control
+        JOIN execution_control_events event ON event.event_id=control.last_event_id
+        WHERE control.generation_id=$1`, [generationId]);
+      assert.deepEqual(control.rows, [{
+        state: 'ENTRY_STOP', actor_type: 'SYSTEM',
+        reason_code: 'SYSTEM_SUBMISSION_AMBIGUOUS',
       }]);
       const inspected = await fixture.live.inspectSignedTransaction({
         claim: fixture.claim, artifactId: fixture.artifact.artifactId,
@@ -514,6 +622,22 @@ function blockhashValidity(
     blockhash: artifact.blockhash, valid: true as const,
     observedBlockHeight: artifact.lastValidBlockHeight - 1n,
     contextSlot: 203n, observedAtMs,
+  });
+}
+
+function runnableBinding(runtime: Awaited<ReturnType<typeof createBuyFixture>>['runtime']) {
+  return Object.freeze({
+    payloadVersion: 1 as const,
+    generationId,
+    phase: runtime.phase,
+    buildHash: runtime.buildHash,
+    configurationFingerprint: runtime.configurationFingerprint,
+    strategyFingerprint: runtime.strategyFingerprint,
+    walletPublicKey: runtime.walletPublicKey,
+    cluster: runtime.cluster,
+    genesisHash: runtime.expectedGenesisHash,
+    providerId: runtime.providerId,
+    maxRpcCallsPerAttempt: runtime.maxRpcCallsPerAttempt,
   });
 }
 

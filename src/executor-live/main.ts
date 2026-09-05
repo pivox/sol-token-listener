@@ -35,7 +35,10 @@ import {
   resumeLivePersistedTransaction,
   type LiveExecutionWorkerDependencies,
 } from './execution-worker.js';
-import type { ExecutionLiveRuntimeBindingV1 } from '../ports/execution-live-repository.js';
+import type {
+  ExecutionLiveRunnableWorkBindingV1,
+  ExecutionLiveRuntimeBindingV1,
+} from '../ports/execution-live-repository.js';
 import type { SignedTransactionArtifactV1 } from '../domain/execution-live.js';
 import { LIVE_EXECUTOR_SAFE_ERROR_CODE_SET } from './error-codes.js';
 import { ExecutionLiveRepositoryError } from '../storage/execution-live.repository.js';
@@ -89,6 +92,8 @@ export async function startLiveExecutor(
   let runtimeOwnsResources = false;
   try {
     await database.validateStartup(config);
+    await database.live.recoverStrandedPreSignatureLock(config.generationId);
+    await database.live.assertRunnableWork(startupWorkBinding(config));
     const genesis = await dependencies.verifyGenesis(config, new AbortController().signal);
     signer = await dependencies.loadSigner(config);
     if (signer.publicKey !== config.executorPublicKey) {
@@ -98,6 +103,10 @@ export async function startLiveExecutor(
     const lanes = dependencies.createLanes(Object.freeze({ config, database, signer, runtime }));
     const running = dependencies.runtime(Object.freeze({
       lanes,
+      prePass: async (signal: AbortSignal) => {
+        if (signal.aborted) return;
+        await database.live.recoverStrandedPreSignatureLock(config.generationId);
+      },
       logger: dependencies.logger,
       closeSigner: () => signer?.close() ?? Promise.resolve(),
       closeDatabase: database.close,
@@ -114,6 +123,22 @@ export async function startLiveExecutor(
       try { await signer?.close(); } finally { await database.close(); }
     }
   }
+}
+
+function startupWorkBinding(config: LiveExecutorConfig): ExecutionLiveRunnableWorkBindingV1 {
+  return Object.freeze({
+    payloadVersion: 1 as const,
+    generationId: config.generationId,
+    phase: config.phase,
+    buildHash: config.buildHash,
+    configurationFingerprint: config.configurationFingerprint,
+    strategyFingerprint: config.strategyFingerprint,
+    walletPublicKey: config.executorPublicKey,
+    cluster: config.cluster,
+    genesisHash: config.expectedGenesisHash,
+    providerId: config.providerId,
+    maxRpcCallsPerAttempt: config.maxRpcCallsPerAttempt,
+  });
 }
 
 export async function main(): Promise<void> {

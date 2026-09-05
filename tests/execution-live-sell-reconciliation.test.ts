@@ -60,6 +60,18 @@ void test('SELL UNKNOWN persists evidence and freezes every exit capability', as
     assert.equal(result.result, 'UNKNOWN');
     assert.deepEqual(await durableState(pool, fixture),
       expectedUnknownState(fixture.claim.intent.id, 1));
+    const control = await pool.query<{
+      state: string;
+      actor_type: string;
+      reason_code: string;
+    }>(`SELECT control.state,event.actor_type,event.reason_code
+      FROM execution_control_state control
+      JOIN execution_control_events event ON event.event_id=control.last_event_id
+      WHERE control.generation_id=$1`, [generationId]);
+    assert.deepEqual(control.rows, [{
+      state: 'ENTRY_STOP', actor_type: 'SYSTEM',
+      reason_code: 'SYSTEM_RECONCILIATION_UNKNOWN',
+    }]);
   });
 });
 

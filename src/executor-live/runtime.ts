@@ -32,6 +32,7 @@ export interface LiveExecutorRuntimeSignalSource {
 
 export interface LiveExecutorRuntimeDependencies {
   readonly lanes: LiveExecutorLanes;
+  readonly prePass: (signal: AbortSignal) => Promise<void>;
   readonly logger?: LiveExecutorLogger;
   readonly closeSigner: () => Promise<void>;
   readonly closeDatabase: () => Promise<void>;
@@ -61,8 +62,14 @@ const ORDERED_LANES = Object.freeze([
 export async function runLiveExecutorPass(
   lanes: LiveExecutorLanes,
   signal: AbortSignal,
+  prePass: (signal: AbortSignal) => Promise<void>,
 ): Promise<LiveExecutorPassResult> {
   requireSignal(signal);
+  try {
+    await prePass(signal);
+  } catch (error) {
+    throw new LiveExecutorPrePassError(safeErrorCode(error));
+  }
   for (const [key, result] of ORDERED_LANES) {
     if (signal.aborted) return 'IDLE';
     let laneResult: LiveExecutorLaneResult;
@@ -118,12 +125,16 @@ export function runLiveExecutorRuntime(
   const loop = async (): Promise<void> => {
     while (!shutdownRequested()) {
       try {
-        await runLiveExecutorPass(dependencies.lanes, controller.signal);
+        await runLiveExecutorPass(dependencies.lanes, controller.signal, dependencies.prePass);
       } catch (error) {
         if (shutdownRequested()) break;
         if (error instanceof LiveExecutorPassError) {
           dependencies.logger?.error(Object.freeze({
             event: 'executor_live.lane_failed', lane: error.lane, errorCode: error.errorCode,
+          }));
+        } else if (error instanceof LiveExecutorPrePassError) {
+          dependencies.logger?.error(Object.freeze({
+            event: 'executor_live.prepass_failed', errorCode: error.errorCode,
           }));
         } else {
           dependencies.logger?.error(Object.freeze({
@@ -184,6 +195,13 @@ class LiveExecutorPassError extends Error {
   public constructor(public readonly lane: LiveExecutorLaneName, public readonly errorCode: string) {
     super('Live executor pass failed.');
     this.name = 'LiveExecutorPassError';
+  }
+}
+
+class LiveExecutorPrePassError extends Error {
+  public constructor(public readonly errorCode: string) {
+    super('Live executor pre-pass failed.');
+    this.name = 'LiveExecutorPrePassError';
   }
 }
 

@@ -179,11 +179,14 @@ void test('exposes exact frozen null-prototype runtime facades', async () => {
 
   const liveCalls: string[] = [];
   const liveMethods = methodSource([
+    'recoverStrandedPreSignatureLock', 'assertRunnableWork',
     'readPreparationBinding', 'authorizeExactSigning', 'persistSigned', 'reserveRpcCall', 'inspectSignedTransaction',
     'recordSignedSimulation', 'revokeBeforeSubmission', 'beginSubmission',
     'recordSubmissionOutcome',
   ], liveCalls);
   const liveSource = liveMethods as unknown as Pick<ExecutionLiveRepository,
+    | 'recoverStrandedPreSignatureLock'
+    | 'assertRunnableWork'
     | 'readPreparationBinding'
     | 'authorizeExactSigning'
     | 'persistSigned'
@@ -196,6 +199,7 @@ void test('exposes exact frozen null-prototype runtime facades', async () => {
   const live = createExecutionLiveRuntimeRepository(liveSource);
 
   assertExactFacade(live, [
+    'recoverStrandedPreSignatureLock', 'assertRunnableWork',
     'readPreparationBinding', 'authorizeExactSigning', 'persistSigned', 'reserveRpcCall', 'inspectSignedTransaction',
     'recordSignedSimulation', 'revokeBeforeSubmission', 'beginSubmission',
     'recordSubmissionOutcome',
@@ -206,6 +210,8 @@ void test('exposes exact frozen null-prototype runtime facades', async () => {
     'createDeadlineExitIntent', 'createNextDeadlineExitIntent', 'arm', 'admit',
   ]) assert.equal(Object.hasOwn(live, absent), false);
 
+  await live.recoverStrandedPreSignatureLock(undefined as never);
+  await live.assertRunnableWork(undefined as never);
   await live.readPreparationBinding(undefined as never);
   await live.authorizeExactSigning(undefined as never);
   await live.persistSigned(undefined as never);
@@ -216,6 +222,7 @@ void test('exposes exact frozen null-prototype runtime facades', async () => {
   await live.beginSubmission(undefined as never);
   await live.recordSubmissionOutcome(undefined as never, undefined as never);
   assert.deepEqual(liveCalls, [
+    'recoverStrandedPreSignatureLock', 'assertRunnableWork',
     'readPreparationBinding', 'authorizeExactSigning', 'persistSigned', 'reserveRpcCall', 'inspectSignedTransaction',
     'recordSignedSimulation', 'revokeBeforeSubmission', 'beginSubmission',
     'recordSubmissionOutcome',
@@ -269,6 +276,7 @@ void test('composes an exact bootstrap with a one-shot validator and closes once
   ]);
   assertExactFacade(database.venues, ['findFinalizedCanonicalPumpSwapPool']);
   assertExactFacade(database.live, [
+    'recoverStrandedPreSignatureLock', 'assertRunnableWork',
     'readPreparationBinding', 'authorizeExactSigning', 'persistSigned', 'reserveRpcCall', 'inspectSignedTransaction',
     'recordSignedSimulation', 'revokeBeforeSubmission', 'beginSubmission',
     'recordSubmissionOutcome',

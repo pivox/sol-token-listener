@@ -273,7 +273,30 @@ export interface ExecutionDeadlineExitResultV1 {
   readonly intent: ExecutionIntentV1 | null;
 }
 
+export interface ExecutionPreSignatureRecoveryResultV1 {
+  readonly payloadVersion: 1;
+  readonly kind: 'IDLE' | 'REVOKED';
+}
+
+export interface ExecutionLiveRunnableWorkBindingV1 {
+  readonly payloadVersion: 1;
+  readonly generationId: string;
+  readonly phase: 'CANARY' | 'MICRO_LIVE' | 'PILOT';
+  readonly buildHash: string;
+  readonly configurationFingerprint: string;
+  readonly strategyFingerprint: string;
+  readonly walletPublicKey: string;
+  readonly cluster: 'mainnet-beta';
+  readonly genesisHash: string;
+  readonly providerId: string;
+  readonly maxRpcCallsPerAttempt: number;
+}
+
 export interface ExecutionLiveRepository {
+  recoverStrandedPreSignatureLock(
+    generationId: string,
+  ): Promise<ExecutionPreSignatureRecoveryResultV1>;
+  assertRunnableWork(binding: ExecutionLiveRunnableWorkBindingV1): Promise<void>;
   readPreparationBinding(input: Readonly<{
     readonly claim: ClaimedExecutionIntent;
     readonly generationId: string;
