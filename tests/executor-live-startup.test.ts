@@ -276,6 +276,7 @@ void test('authority allowlist is restricted to H2b signing and submission primi
     'execution_live_unsigned_simulation_evidence',
     'execution_pre_signature_locks',
     'execution_pre_submission_revocations',
+    'execution_preflight_intent_pair_memberships',
     'execution_provider_rate_limit_events',
     'execution_provider_usage_counters',
     'execution_provider_usage_snapshots',

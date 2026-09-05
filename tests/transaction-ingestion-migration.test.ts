@@ -313,6 +313,9 @@ void test('purges only expired resolved strict failures and exposes their count'
       if (text.includes('WITH deleted AS')) {
         return { rows: [{ deleted_count: '0' }], rowCount: 1 };
       }
+      if (text.includes('AS expired_count FROM updated')) {
+        return { rows: [{ expired_count: 0 }], rowCount: 1 };
+      }
       return { rows: [], rowCount: 0 };
     },
     release: () => undefined,

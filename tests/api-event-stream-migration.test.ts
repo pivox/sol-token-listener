@@ -134,6 +134,9 @@ void test('la purge retourne le compteur agrégé de l’outbox, pas le rowCount
       if (text.includes('WITH deleted AS')) {
         return { rows: [{ deleted_count: '7' }], rowCount: 1 };
       }
+      if (text.includes('AS expired_count FROM updated')) {
+        return { rows: [{ expired_count: 0 }], rowCount: 1 };
+      }
       return { rows: [], rowCount: 0 };
     },
     release: () => undefined,
@@ -160,6 +163,9 @@ void test('la purge retire les projections participants expirées avant leurs é
       }
       if (text.includes('WITH deleted AS')) {
         return { rows: [{ deleted_count: '0' }], rowCount: 1 };
+      }
+      if (text.includes('AS expired_count FROM updated')) {
+        return { rows: [{ expired_count: 0 }], rowCount: 1 };
       }
       if (text.includes('DELETE FROM creator_profiles')) return { rows: [], rowCount: 1 };
       if (text.includes('DELETE FROM observed_wallet_positions')) return { rows: [], rowCount: 2 };

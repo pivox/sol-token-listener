@@ -30,7 +30,7 @@ const EXECUTOR_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/executor\/(?:main|config|database|logger|dry-run-worker|runtime)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/domain\/execution-(?:dry-run|intent)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/execution-(?:dry-run-repository|intent-repository)\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/storage\/(?:database|execution-dry-run\.repository|execution-intent\.repository)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/(?:database|execution-dry-run\.repository|execution-intent(?:-expiration|\.repository))\.(?:js|ts)$/u,
 ];
 const EXECUTOR_FORBIDDEN_IDENTIFIERS = new Set([
   'Keypair', 'Wallet', 'WalletSigner', 'Signer', 'SecretLoader',
@@ -67,7 +67,7 @@ const SIMULATION_ONLY_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/executor-simulation\/(?:attempt-evaluator|build-plan|build-receipt|instruction-inspector|message-compiler|provider-session|pumpfun-adapter|pumpfun-quote|pumpswap-adapter|solana-simulation-gateway|venue-router)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/domain\/(?:execution-(?:dry-run|intent|simulation)|market|market-errors|types)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/(?:execution-(?:dry-run-repository|intent-repository|market-gateway|simulation-gateway|simulation-repository|venue-repository)|market-rpc-reader|pumpswap-quote-provider)\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/storage\/(?:database|execution-(?:dry-run\.repository|intent\.repository|simulation\.repository|venue\.repository))\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/(?:database|execution-(?:dry-run\.repository|intent(?:-expiration|\.repository)|simulation\.repository|venue\.repository))\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/launchpads\/pumpfun\/(?:causal-quote|constants|official-sdk|generated\/pump-idl)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/markets\/pumpswap\/(?:borsh-reader|constants|errors|official-sdk|pool-account-decoder|pumpswap-fee-state|pumpswap-quote\.provider|reserve-math|types|generated\/pumpswap-idl)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/solana\/rpc\/types\.(?:js|ts)$/u,
@@ -94,7 +94,7 @@ const RISK_FOUNDATION_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/executor-risk\/(?:admission-service|reconciliation-service)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/domain\/execution-(?:fault-policy|intent|provider-quota|reconciliation|risk-policy|wallet-snapshot)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/execution-(?:reconciliation-gateway|risk-repository)\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/storage\/(?:database|execution-risk\.repository)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/(?:database|execution-intent-expiration|execution-risk\.repository)\.(?:js|ts)$/u,
 ];
 const RISK_FOUNDATION_FORBIDDEN_IDENTIFIERS = new Set([
   'Keypair', 'WalletSigner', 'Signer', 'SecretLoader',
@@ -114,7 +114,7 @@ const OPERATIONS_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/domain\/execution-(?:canary|canary-attestation|fault-policy|intent|operations|provider-quota|reconciliation|risk-policy|safety-(?:attestation|qualification)|wallet-snapshot)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/executor-risk\/admission-service\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/execution-operations-repository\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/storage\/(?:database|execution-operations\.repository|execution-risk\.repository)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/(?:database|execution-intent-expiration|execution-operations\.repository|execution-risk\.repository)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/utils\/json\.(?:js|ts)$/u,
 ];
 const OPERATIONS_FORBIDDEN_IDENTIFIERS = new Set([
