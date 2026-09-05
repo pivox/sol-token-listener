@@ -884,10 +884,12 @@ async function assertRevokedWorkerSessionPartition(
 ): Promise<void> {
   const nonLiveId = `execution_intent_${'5'.repeat(64)}`;
   const liveId = `execution_intent_${'6'.repeat(64)}`;
+  const renamedWorkerRole = `h2j_worker_${loginName.slice(-24)}`;
   await insertPartitionIntent(admin, nonLiveId, 'revoked-non-live', false);
   await insertPartitionIntent(admin, liveId, 'revoked-live', true);
 
   const activeWorker = await workerPool.connect();
+  let workerRenamed = false;
   try {
     assert.deepEqual((await activeWorker.query<{
       readonly session_user: string;
@@ -935,7 +937,40 @@ async function assertRevokedWorkerSessionPartition(
       String(childWriteFailure),
       /row-level security|live_reserved|reserved/iu,
     );
+
+    const workerOid = (await admin.query<{ readonly oid: string }>(
+      'SELECT oid::TEXT AS oid FROM pg_roles WHERE rolname=$1', [WORKER_ROLE],
+    )).rows[0]?.oid;
+    assert.ok(workerOid !== undefined);
+    await admin.query(
+      `ALTER ROLE ${WORKER_ROLE} RENAME TO ${quoteIdentifier(renamedWorkerRole)}`,
+    );
+    workerRenamed = true;
+
+    assert.deepEqual((await activeWorker.query<{ readonly current_user: string }>(
+      'SELECT current_user',
+    )).rows, [{ current_user: renamedWorkerRole }]);
+    const policyTargets = await admin.query<{
+      readonly policy_name: string;
+      readonly target_oid: string;
+    }>(`SELECT policy.polname AS policy_name,target.oid::TEXT AS target_oid
+      FROM pg_policy policy
+      CROSS JOIN LATERAL unnest(policy.polroles) target_oid
+      JOIN pg_roles target ON target.oid=target_oid
+      WHERE policy.polname LIKE 'execution%worker_partition'
+      ORDER BY policy.polname`);
+    assert.equal(policyTargets.rows.length, WORKER_EXECUTION_TABLES.length);
+    assert.equal(policyTargets.rows.every((row) => row.target_oid === workerOid), true);
+    assert.deepEqual((await activeWorker.query<{ readonly id: string }>(
+      'SELECT id FROM execution_intents WHERE id=ANY($1::TEXT[]) ORDER BY id',
+      [[nonLiveId, liveId]],
+    )).rows, [{ id: nonLiveId }]);
   } finally {
+    if (workerRenamed) {
+      await admin.query(
+        `ALTER ROLE ${quoteIdentifier(renamedWorkerRole)} RENAME TO ${WORKER_ROLE}`,
+      );
+    }
     activeWorker.release();
   }
 }
