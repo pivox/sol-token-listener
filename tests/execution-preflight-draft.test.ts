@@ -15,6 +15,7 @@ void test('builds an H2f draft from exact persisted identities and eight static 
   assert.equal(bundle.qualification.gates[9]?.evidenceId, input.source.walletSnapshot.snapshotId);
   assert.equal(bundle.qualification.gates[10]?.evidenceId, input.source.simulation.artifactId);
   assert.equal(bundle.canary.expiresAtMs, NOW_MS + 60_000);
+  assert.notEqual(input.source.simulation.intentId, input.source.target.intent.id);
 });
 
 void test('rejects stale simulation and target state drift', () => {

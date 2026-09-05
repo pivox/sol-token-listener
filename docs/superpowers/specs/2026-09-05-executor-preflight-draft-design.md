@@ -72,8 +72,9 @@ existants. Il exige :
 
 - génération, wallet, provider, genesis et manifeste H2d exacts ;
 - intention `BUY/PENDING`, WSOL/SPL/9, tentative zéro, non louée et fraîche ;
-- artefact `SUCCESS` lié à la même intention/révision/décision/stratégie,
-  au même wallet/provider/genesis, âgé d'au plus 30 secondes ;
+- artefact `SUCCESS` #51-D lié au même wallet/provider/genesis/build/configuration,
+  âgé d'au plus 30 secondes ; son intention de simulation est distincte de la
+  cible canary `PENDING`, conformément au cycle durable existant ;
 - huit gates externes dans l'ordre et couvrant les cinq minutes de qualification ;
 - snapshots dans les deadlines dérivées de la policy avec cinq secondes de marge.
 

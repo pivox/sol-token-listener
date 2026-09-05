@@ -59,9 +59,9 @@ export function preflightDraftInputs(): Readonly<{
       target: Object.freeze({ intent, leaseOwner: null, leaseToken: null, leaseExpiresAtMs: null }),
       simulation: Object.freeze({
         artifactId: `execution_simulation_artifact_${'f'.repeat(64)}`,
-        resultFingerprint: 'e'.repeat(64), resultKind: 'SUCCESS', intentId: intent.id,
-        intentStateRevision: 0n, strategyId: 'creation-entry-v1', strategyVersion: 1,
-        decisionFingerprint: 'd'.repeat(64), providerId: q.providerId,
+        resultFingerprint: 'e'.repeat(64), resultKind: 'SUCCESS', intentId: base.targetIntentId,
+        intentStateRevision: 2n, strategyId: 'mainnet-preflight-v1', strategyVersion: 1,
+        decisionFingerprint: 'e'.repeat(64), providerId: q.providerId,
         executorPublicKey: q.walletPublicKey, expectedGenesisHash: q.genesisHash,
         observedGenesisHash: q.genesisHash, buildFingerprint: q.buildHash,
         configurationFingerprint: q.configurationFingerprint, recordedAtMs: NOW_MS - 1_000,

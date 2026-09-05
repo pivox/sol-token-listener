@@ -316,11 +316,6 @@ function assertSourceBindings(
     || generation.genesisHash !== simulation.observedGenesisHash
     || provider.providerId !== wallet.providerId
     || provider.providerId !== simulation.providerId
-    || target.id !== simulation.intentId
-    || target.stateRevision !== simulation.intentStateRevision
-    || target.strategyId !== simulation.strategyId
-    || target.strategyVersion !== simulation.strategyVersion
-    || target.decisionFingerprint !== simulation.decisionFingerprint
     || target.requestedAtMs > nowMs || target.expiresAtMs < nowMs + MINIMUM_MARGIN_MS
     || simulation.recordedAtMs > nowMs
     || simulation.recordedAtMs < nowMs - MAXIMUM_SIMULATION_AGE_MS
