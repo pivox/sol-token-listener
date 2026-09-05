@@ -1,6 +1,12 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.11.0 — 2026-09-05
+**Version :** 1.15.1 — 2026-09-05
+
+La version 1.15.1 fixe la commande canonique du provisioning H2j et son contrôle
+post-exécution. La version 1.15.0 fermait le replay après renommage du rôle
+worker. La version 1.14.0 finalisait les corrections P1/P2/P3 de la partition RLS.
+La version 1.13.0 avait ajouté cette partition et porté le head de migration à
+040. Le canary reste non démarré.
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -13,8 +19,9 @@ consommée par H2d. #51-H2f valide et signe hors ligne les deux enveloppes H2c
 dans un paquet atomique. #51-H2g assemble son draft depuis deux artefacts
 canoniques protégés, sans accès DB ou réseau. #51-H2h exporte sa source depuis
 une photographie PostgreSQL read-only. #51-H2i ferme l'autorité PostgreSQL du
-listener paper qui produit l'intention canary normale. Ces livraisons préparent
-un preflight externe sans armer ni démarrer un canary.
+listener paper qui produit l'intention canary normale. #51-H2j ferme celle du
+worker commun aux modes `dry-run` et `simulation-only`. Ces livraisons
+préparent un preflight externe sans armer ni démarrer un canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
 briques #51-G ne prouvent ni rentabilité, ni sellabilité générale, ni avantage
@@ -94,14 +101,19 @@ npm run executor:live:start
 Elles ne sont pas une procédure d'armement. La procédure H2c ci-dessous reste
 séquentielle, interactive et sans commande englobante.
 
-## Frontières des six environnements PostgreSQL
+## Frontières des sept environnements PostgreSQL
 
-Créer six fichiers hors Git, lisibles seulement par leur compte de service :
+Créer sept fichiers hors Git, lisibles seulement par leur compte de service :
 
 - listener H2i : login `NOINHERIT` membre uniquement de
   `sol_token_listener_writer`, connexion avec
   `options=-c role=sol_token_listener_writer`,
   `POSTGRES_AUTO_MIGRATE=false` et aucun keypair ;
+
+- worker H2j : login `NOINHERIT` membre uniquement de
+  `sol_token_executor_worker`, connexion avec
+  `options=-c role=sol_token_executor_worker`, `POSTGRES_AUTO_MIGRATE=false`,
+  `LIVE_TRADING_ENABLED=false` et aucun keypair ;
 
 - readiness H2d : login membre uniquement de
   `sol_token_executor_readiness`, endpoint HTTP Mainnet qualifié, adresse
@@ -115,7 +127,7 @@ Créer six fichiers hors Git, lisibles seulement par leur compte de service :
 - H2b : login membre uniquement de `sol_token_executor_live`, keypair externe
   `0400` ou `0600`, `EXECUTOR_MODE=live` et activation explicite.
 
-Après la migration 039, l'administrateur rejoue
+Après la migration 040, l'administrateur rejoue
 `scripts/provision-executor-roles.sql`. Chaque login doit être `NOINHERIT`, ne
 recevoir qu'un seul rôle de groupe avec `ADMIN FALSE, INHERIT FALSE, SET TRUE`,
 et ne posséder aucun objet. Les processus forcent `SET ROLE`,
@@ -124,12 +136,125 @@ checkout. Le rôle opérations ne peut ni lire les bytes signés ou non signés,
 ni armer des champs runtime arbitraires, ni modifier les intents ; H2a,
 listener et API ne gagnent aucune autorité H2c.
 
+Depuis la racine du dépôt, utiliser cette commande canonique :
+
+```bash
+psql -X -v ON_ERROR_STOP=1 -f scripts/provision-executor-roles.sql
+```
+
+`-X` ignore tout `psqlrc` local et `ON_ERROR_STOP` interrompt l'exécution à la
+première erreur. La connexion administrative doit être injectée par le mécanisme
+libpq de l'environnement opérateur, par exemple `PGSERVICE` et un `PGPASSFILE`
+externe en mode `0600`, ou par le gestionnaire de secrets du déploiement. Ne
+jamais placer une URL, un login ou un mot de passe dans la commande, le dépôt ou
+l'historique du shell.
+
+Après succès, exécuter avec la même connexion le contrôle d'inventaire read-only
+suivant :
+
+```sql
+WITH expected(policy_name, relation_name) AS (VALUES
+  ('execution_intents_worker_partition', 'execution_intents'),
+  ('execution_dry_run_assessments_worker_partition', 'execution_dry_run_assessments'),
+  ('execution_attempts_worker_partition', 'execution_attempts'),
+  ('execution_intent_transitions_worker_partition', 'execution_intent_transitions'),
+  ('execution_simulation_artifacts_worker_partition', 'execution_simulation_artifacts')
+), targets AS (
+  SELECT target.role_oid
+  FROM expected
+  JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = 'public'
+  JOIN pg_catalog.pg_class relation
+    ON relation.relnamespace = namespace.oid
+    AND relation.relname = expected.relation_name
+  JOIN pg_catalog.pg_policy policy
+    ON policy.polrelid = relation.oid
+    AND policy.polname = expected.policy_name
+    AND NOT policy.polpermissive
+    AND policy.polcmd = '*'
+  CROSS JOIN LATERAL pg_catalog.unnest(policy.polroles) AS target(role_oid)
+)
+SELECT COUNT(*) AS policy_count,
+  COUNT(DISTINCT role_oid) AS target_oid_count,
+  BOOL_AND(role_oid = 'sol_token_executor_worker'::regrole::oid) AS canonical_only
+FROM targets;
+```
+
+Le résultat exigé est exactement :
+
+```text
+policy_count | target_oid_count | canonical_only
+5            | 1                | t
+```
+
+Toute autre valeur interdit de démarrer le worker et impose une investigation
+administrative ; ne pas corriger manuellement les policies.
+
 Le listener H2i utilise le paramètre de connexion PostgreSQL pour fixer son
 rôle sur chaque connexion du pool. Il peut écrire ses projections métier et
 insérer une intention, mais ne peut ni modifier une intention existante, ni
 lire ou écrire génération wallet, risque live, contrôle, armement, lock,
 transaction signée, soumission ou réconciliation. Arrêter le listener, ou
 remettre `EXECUTION_INTENT_EMISSION_ENABLED=false`, avant le preflight H2c.
+
+## Exécuter H2j sans autorité live
+
+L'administrateur rejoue d'abord `scripts/provision-executor-roles.sql`, puis
+crée un login de service mono-membre sans privilège direct. Le fichier
+d'environnement reste hors Git, appartient au compte du worker et porte un
+mode exact `0600`. La `DATABASE_URL` est propre à ce worker ; son paramètre
+`options` active le groupe et fixe aussi le `search_path` :
+
+```dotenv
+DATABASE_URL=postgresql://<login-worker-dedie>:<secret>@<postgres16>/<database>?options=-c%20role%3Dsol_token_executor_worker%20-c%20search_path%3Dpg_catalog%2Cpublic
+POSTGRES_AUTO_MIGRATE=false
+LIVE_TRADING_ENABLED=false
+```
+
+```bash
+chmod 0600 /chemin/hors-git/executor-worker.env
+npm run build:backend
+DOTENV_CONFIG_PATH=/chemin/hors-git/executor-worker.env \
+  EXECUTOR_MODE=dry-run npm run executor:start
+DOTENV_CONFIG_PATH=/chemin/hors-git/executor-worker.env \
+  EXECUTOR_MODE=simulation-only npm run executor:start
+```
+
+Le second mode exige en plus les paramètres de simulation non signants déjà
+documentés : adresse `EXECUTOR_PUBLIC_KEY`, provider positionnel, URL RPC,
+genesis attendu, limites et allowlist quote. Cette URL RPC potentiellement
+confidentielle doit rester dans un fichier externe `0600` et n'est jamais
+journalisée. Ces paramètres peuvent résider dans un second fichier de ce type,
+avec la même `DATABASE_URL` dédiée. Aucun des deux fichiers ne contient de
+keypair, seed, armement ou configuration live.
+
+Le rôle peut louer puis restituer une intention, écrire l'assessment dry-run ou
+la tentative, la transition et l'artefact de simulation non signé attendus. Il
+ne peut ni migrer le schéma, ni accéder aux tables de wallet, risque, contrôle,
+armement, lock, bytes signés, budget RPC live, soumission, position live ou
+réconciliation. Le résultat opérationnel reste `CANARY_NOT_STARTED`.
+
+La migration 040 porte `live_reserved` uniquement sur `execution_intents` et
+filtre les quatre tables enfants par `intent_id`. Le worker ne peut jamais lire
+ni altérer une intention `live_reserved=true` ou ses enfants. Les claims
+`DRY_RUN` et `EXECUTE` exigent `live_reserved=false`; `LIVE_EXECUTE`,
+`LIVE_RECOVER`, `CONFIRM` et `RECONCILE` exigent `live_reserved=true`. Le
+propriétaire administratif et migrateur conserve son bypass avec RLS sans
+`FORCE ROW LEVEL SECURITY`. `SELECT(live_reserved)` est exigé techniquement par
+PostgreSQL pour les predicates de claim et la policy, mais RLS masque toute
+ligne `true` et la colonne ne devient jamais un contrat domaine ou API. La
+migration refuse une
+forme préexistante différente de `BOOLEAN NOT NULL DEFAULT FALSE`. Lorsque le
+rôle worker est absent, elle installe un placeholder restrictif neutre ; le
+provisioning le remplace par cinq policies liées à l'OID du groupe. Au replay,
+l'inventaire doit être exactement 5/5 et viser un OID unique. Un ancien OID
+renommé est démoté ; ses memberships, réglages et droits sont révoqués
+atomiquement avant `DROP OWNED` et rebind. Un ownership ou une dépendance dans
+une autre base fait échouer fermé. Une session active stale perd toute autorité
+et le rôle canonique reçoit les cinq policies finales. Les guards enfants sont
+`SECURITY INVOKER` et restent soumis à RLS. Le `owner`, les superusers et rôles
+`BYPASSRLS` constituent une limite de confiance intentionnelle réservée à
+l'administration. Le déni de service pré-promotion reste possible, sans
+capacité de signature ni de soumission.
 
 ## Produire la preuve Helius H2e
 
@@ -206,7 +331,7 @@ EXECUTOR_RPC_TIMEOUT_MS=5000
 
 Le fichier ne doit contenir aucun nom `EXECUTOR_MODE`,
 `LIVE_TRADING_ENABLED`, keypair, clé privée, mnemonic ou recovery phrase,
-même avec une valeur vide. Après migrations 001–039, rejouer deux fois le
+même avec une valeur vide. Après migrations 001–040, rejouer deux fois le
 provisioning, créer un login `NOINHERIT` sans autorité directe et lui accorder
 uniquement `sol_token_executor_readiness` avec
 `ADMIN FALSE, INHERIT FALSE, SET TRUE`. Lancer ensuite :
@@ -310,7 +435,7 @@ un armement ou un verdict de sécurité économique.
    atomiques ; tout écart laisse zéro capacité live.
 10. Seulement après inspection humaine de l'armement, démarrer H2a avec son
    environnement dédié, puis H2b avec le sien. Le démarrage H2b valide rôle,
-   migration 039, génération, genesis, les huit limites runtime exactes et
+   migration 040, génération, genesis, les huit limites runtime exactes et
    absence d'état incohérent avant de charger le signer. Il ne doit traiter
    que la cible armée, y compris après redémarrage sur un artefact persisté.
 11. Surveiller continuellement les sorties structurées H2a/H2b et les commandes
@@ -462,7 +587,9 @@ Après les migrations, un administrateur peut appliquer
 sans mot de passe ni privilège cluster. Le compte LOGIN H2b reçoit seulement
 `sol_token_executor_live`; le compte H2a distinct reçoit seulement
 `sol_token_executor_live_recovery`; les commandes opérateur utilisent un
-troisième compte recevant seulement `sol_token_executor_operations`.
+troisième compte recevant seulement `sol_token_executor_operations`. Le worker
+H2j possède encore un login distinct, membre uniquement de
+`sol_token_executor_worker`, pour `dry-run` et `simulation-only`.
 
 La rétention utilise un second compte LOGIN dédié qui doit recevoir seulement
 `sol_token_retention_worker`. Il ne doit jamais être partagé avec le listener,
@@ -476,10 +603,10 @@ Le rôle signable `sol_token_executor_live` est le seul rôle applicatif autoris
 à lire les octets signés. Le rôle H2a recovery ne reçoit que les colonnes et
 mutations de finalité nécessaires ; `signed_transaction_bytes`, mutation de
 signature, simulation signée, préflight et démarrage de soumission lui sont
-interdits. Listener,
-worker dry-run, opérations, lecteur opérateur et API publique n'ont aucun accès
-aux bytes signés. Seul le rôle de rétention reçoit les `DELETE` nécessaires à
-la purge. Il n'obtient qu'une lecture par colonnes
+interdits. Listener, worker `dry-run`/`simulation-only`, opérations, lecteur
+opérateur et API publique n'ont aucun accès aux bytes signés. Seul le rôle de
+rétention reçoit les `DELETE` nécessaires à la purge. Il n'obtient qu'une
+lecture par colonnes
 de l'identifiant, de l'état, de l'échéance, de l'autorisation de sortie, de
 l'identifiant de lock et de la réservation sur `execution_signed_transactions` :
 `signed_transaction_bytes` lui reste

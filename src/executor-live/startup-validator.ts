@@ -31,7 +31,7 @@ export interface LiveExecutorStartupDatabase {
 export interface LiveExecutorStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live';
-  readonly migrationHead: '039_execution_canary_operator_binding.sql';
+  readonly migrationHead: '040_execution_worker_live_partition.sql';
   readonly generationId: string;
   readonly providerId: string;
   readonly phase: LiveExecutorConfig['phase'];
@@ -103,6 +103,7 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'requested_at', 'expires_at', 'status', 'attempt_count', 'state_revision',
         'lease_owner', 'lease_token', 'lease_expires_at', 'last_reason_code', 'terminal_at',
         'reconciliation_completed_at', 'created_at', 'updated_at', 'purge_after',
+        'live_reserved',
       ), names(), names(
         'status', 'state_revision', 'attempt_count', 'last_reason_code', 'lease_owner',
         'lease_token', 'lease_expires_at', 'terminal_at', 'reconciliation_completed_at',
@@ -585,7 +586,7 @@ export async function validateLiveExecutorStartup(
   return Object.freeze({
     payloadVersion: 1,
     role: 'sol_token_executor_live',
-    migrationHead: '039_execution_canary_operator_binding.sql',
+    migrationHead: '040_execution_worker_live_partition.sql',
     generationId: config.generationId,
     providerId: config.providerId,
     phase: config.phase,

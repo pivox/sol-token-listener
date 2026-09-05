@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.13
+**Version de spécification :** 1.2.18
 
-**Version de la spécification parente :** 1.11.15
+**Version de la spécification parente :** 1.11.20
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,20 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.18 — 2026-09-05 :** rend canonique l'exécution hermétique du
+  provisioning H2j et son contrôle post-exécution 5/5 mono-OID.
+- **1.2.17 — 2026-09-05 :** ferme le replay H2j d'un rôle renommé par
+  inventaire 5/5 mono-OID, quarantaine atomique de l'ancien rôle et rebind des
+  policies vers le rôle canonique.
+- **1.2.16 — 2026-09-05 :** finalise la partition H2j avec policies liées à
+  l'OID du worker, guards `SECURITY INVOKER` et validation fermée du schéma.
+
+- **1.2.15 — 2026-09-05 :** sépare par RLS les intentions non signantes des
+  intentions réservées au live et rend leur promotion monotone et atomique.
+
+- **1.2.14 — 2026-09-05 :** borne H2j, autorité PostgreSQL minimale commune
+  aux modes `dry-run` et `simulation-only`, sans aucune capacité live.
 
 - **1.2.13 — 2026-09-05 :** borne H2i, autorité PostgreSQL du listener paper
   nécessaire à l'émission normale d'une intention sans accès live.
@@ -554,6 +568,39 @@ bytes signés restent inaccessibles. Un verrou advisory transactionnel global
 sérialise les cohortes et remplace les verrous de ligne qui auraient exigé un
 droit de mutation sur les états métier.
 
+#51-H2j ajoute un groupe distinct `sol_token_executor_worker`, `NOLOGIN` et
+`NOINHERIT`, utilisé uniquement par les processus `dry-run` et
+`simulation-only`. Son login de service est mono-membre, sans privilège direct,
+et active le groupe par l'option PostgreSQL de sa `DATABASE_URL`. Ses ACL par
+colonne permettent les assessments, tentatives, transitions et artefacts non
+signés nécessaires à ces deux flux. Elles excluent explicitement les
+générations et snapshots wallet, l'admission risque, le contrôle, l'armement,
+les locks pré-signature, les bytes signés, le budget RPC live, la soumission,
+les positions live et la réconciliation. Le provisioning reste administratif,
+rejouable et séparé du démarrage applicatif.
+
+La migration 040 conserve une seule source de vérité : `live_reserved` existe
+uniquement sur `execution_intents`. Le worker ne peut jamais lire ni altérer une
+intention `live_reserved=true` ou ses enfants, qui sont filtrés par
+`intent_id`. Les claims `DRY_RUN` et `EXECUTE` exigent
+`live_reserved=false`; les claims `LIVE_EXECUTE`, `LIVE_RECOVER`, `CONFIRM` et
+`RECONCILE` exigent `live_reserved=true`. Le propriétaire administratif et
+migrateur conserve son bypass avec RLS sans `FORCE ROW LEVEL SECURITY`. Le
+worker reçoit `SELECT(live_reserved)`, exigé techniquement par PostgreSQL pour
+les predicates de claim et la policy ; le marqueur ne rejoint aucun contrat
+domaine ou API. La migration refuse une forme différente de `BOOLEAN NOT NULL DEFAULT
+FALSE` et laisse un placeholder neutre lorsque le rôle est absent. Le
+provisioning remplace ce placeholder par des policies liées à l'OID du worker.
+Chaque replay exige l'inventaire exact 5/5 sur un OID unique. Si la cible est un
+ancien rôle renommé, celui-ci est démoté et ses memberships, réglages et droits
+sont révoqués atomiquement avant `DROP OWNED` et rebind. Tout ownership ou toute
+dépendance dans une autre base échoue fermé ; une session active stale perd
+toute autorité, puis le rôle canonique reçoit les cinq policies finales. Les
+guards enfants `SECURITY INVOKER` s'exécutent sous RLS. Le `owner`, les
+superusers et rôles `BYPASSRLS` forment une limite de confiance intentionnelle.
+Le déni de service pré-promotion reste le risque résiduel, sans capacité de
+signature ni de soumission.
+
 ## 13. Reason codes append-only
 
 Les codes parent existants restent inchangés. #51-G ajoute :
@@ -625,6 +672,10 @@ des preuves fraîches pour les onze gates #51-F, puis :
 7. exécuter `live:resume`, puis `live:arm` depuis un TTY ;
 8. démarrer `executor-live` et surveiller état, kill switches et réconciliation ;
 9. constater un BUY et un SELL finalisés/réconciliés avant toute conclusion.
+
+H2j permet d'exécuter auparavant le `dry-run` et la simulation Mainnet sans
+envoi sous leur propre identité PostgreSQL. Il ne satisfait aucun gate
+d'armement et maintient obligatoirement `CANARY_NOT_STARTED`.
 
 Le code et les tests peuvent préparer ces étapes, mais aucune commande ne les
 enchaîne automatiquement et aucune PR ne déclenche la transaction réelle.

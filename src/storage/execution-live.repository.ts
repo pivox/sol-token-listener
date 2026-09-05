@@ -5009,11 +5009,11 @@ async function createDeadlineExitIntentLocked(
     id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
     logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
     quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
-    decision_event_id,decision_fingerprint,requested_at,expires_at,status
+    decision_event_id,decision_fingerprint,requested_at,expires_at,status,live_reserved
   ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,'SELL','CANONICAL_EXIT',$8,$9,$10,NULL,
     $11::NUMERIC,$12::NUMERIC,$13,$14,
     TIMESTAMPTZ 'epoch'+($15::BIGINT*INTERVAL '1 millisecond'),
-    TIMESTAMPTZ 'epoch'+($16::BIGINT*INTERVAL '1 millisecond'),'PENDING')`, [
+    TIMESTAMPTZ 'epoch'+($16::BIGINT*INTERVAL '1 millisecond'),'PENDING',TRUE)`, [
     draft.id, draft.logicalOrderKey, draft.strategyId, draft.strategyVersion,
     draft.positionId, draft.logicalCommandId, draft.mint, draft.quoteMint,
     draft.quoteTokenProgram, draft.quoteDecimals, draft.baseAmountRaw?.toString(),
@@ -5060,7 +5060,8 @@ async function findDeadlineIntent(
     CASE WHEN purge_after IS NULL THEN NULL ELSE
       trunc(EXTRACT(EPOCH FROM purge_after)*1000)::TEXT END AS purge_after_ms,
     trunc(EXTRACT(EPOCH FROM created_at)*1000)::TEXT AS created_at_ms,
-    trunc(EXTRACT(EPOCH FROM updated_at)*1000)::TEXT AS updated_at_ms
+    trunc(EXTRACT(EPOCH FROM updated_at)*1000)::TEXT AS updated_at_ms,
+    live_reserved
     FROM execution_intents WHERE id=$1 AND logical_order_key=$2`, [
     draft.id, draft.logicalOrderKey,
   ])), [
@@ -5071,6 +5072,7 @@ async function findDeadlineIntent(
     'requested_at_ms', 'expires_at_ms', 'status', 'attempt_count', 'state_revision',
     'last_reason_code', 'terminal_at_ms',
     'reconciliation_completed_at_ms', 'purge_after_ms', 'created_at_ms', 'updated_at_ms',
+    'live_reserved',
   ] as const);
   const candidate = Object.freeze({
     id: text(row.id),
@@ -5109,6 +5111,7 @@ async function findDeadlineIntent(
     throw failure('INVALID_DATA');
   }
   if (!sameDeadlineIntentContext(candidate, draft)
+    || row.live_reserved !== true
     || candidate.requestedAtMs < exitDeadlineAtMs
     || candidate.requestedAtMs > requestedAtUpperBoundMs
     || candidate.expiresAtMs - candidate.requestedAtMs !== 120_000) {

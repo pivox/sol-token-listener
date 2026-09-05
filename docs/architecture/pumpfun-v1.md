@@ -539,6 +539,42 @@ hérités de `PUBLIC` permettant la création d'objets, la mutation des séquenc
 d'exécution ou la désactivation des triggers sont retirés, et la relecture
 idempotente d'une intention reste possible sans lui accorder `UPDATE`.
 
+#51-H2j ferme à son tour l'autorité PostgreSQL de l'exécuteur non signant. Les
+modes `dry-run` et `simulation-only` partagent le groupe
+`sol_token_executor_worker`, activé explicitement par un login `NOINHERIT`
+dédié. Les grants par colonne couvrent uniquement le claim et la restitution
+des intentions, les assessments dry-run, les tentatives et artefacts non
+signés de simulation, leurs transitions et les colonnes de marché nécessaires
+à la preuve de venue canonique. Cette frontière ne peut lire ni écrire une
+génération wallet, une admission de risque, un armement, un lock
+pré-signature, une transaction signée, une soumission, une position live ou
+une preuve de réconciliation. Les migrations et le provisioning restent
+administratifs ; le processus reçoit une `DATABASE_URL` de service distincte
+et ne charge aucune clé privée.
+
+La migration 040 ajoute le marqueur monotone `live_reserved` uniquement à
+`execution_intents`. Une intention promue à `true` et ses enfants deviennent
+invisibles et non modifiables par le worker grâce aux policies RLS des cinq
+tables ; les enfants restent liés par `intent_id` sans recopier le marqueur.
+Les claims non signants `DRY_RUN`/`EXECUTE` ciblent `false`, tandis que les
+claims live `LIVE_EXECUTE`/`LIVE_RECOVER`/`CONFIRM`/`RECONCILE` exigent `true`.
+RLS n'est pas forcée : le propriétaire administratif chargé des migrations
+conserve son bypass. La migration vérifie que toute colonne préexistante a la
+forme exacte `BOOLEAN NOT NULL DEFAULT FALSE`. Si le rôle worker est absent,
+elle pose un placeholder neutre ; le provisioning le remplace par des policies
+liées à l'OID du groupe. Chaque replay exige un inventaire exact 5/5 sur un OID
+unique. Un ancien OID renommé est démoté ; memberships, réglages et droits sont
+révoqués atomiquement avant `DROP OWNED` et rebind. Un ownership ou une
+dépendance dans une autre base échoue fermé. Toute session active stale perd
+alors son autorité, et le rôle canonique reçoit les cinq policies finales. Les
+guards enfants `SECURITY INVOKER` lisent et verrouillent le parent sous RLS.
+`SELECT(live_reserved)` est exigé techniquement par PostgreSQL pour les
+predicates de claim et la policy, sans exposition au domaine ou à l'API. Les
+owners, superusers et rôles `BYPASSRLS` restent une limite administrative
+intentionnelle. Avant promotion, un worker compromis peut encore provoquer un
+déni de service sur une candidate ; il n'obtient pour autant aucune capacité
+de signer ou soumettre une transaction.
+
 ## Persistance, reprise et rétention
 
 `raw_chain_events` garde l’entrée technique ; `domain_events`,

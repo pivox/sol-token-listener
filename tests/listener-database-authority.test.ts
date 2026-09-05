@@ -116,11 +116,11 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       const provisioningSql = await readFile(scriptUrl, 'utf8');
       const publicParameterProbe = await isolated.connect();
       try {
-        await publicParameterProbe.query('BEGIN');
         await publicParameterProbe.query(
           `GRANT SET ON PARAMETER session_replication_role TO PUBLIC`,
         );
         await publicParameterProbe.query(provisioningSql);
+        await publicParameterProbe.query('BEGIN');
         await publicParameterProbe.query('SET LOCAL ROLE sol_token_listener_writer');
         assert.equal((await publicParameterProbe.query<{ readonly allowed: boolean }>(
           `SELECT has_parameter_privilege(

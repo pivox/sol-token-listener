@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.15
+**Version de spécification :** 1.11.20
 
 **Date :** 2026-08-31
 
@@ -13,9 +13,27 @@
 préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
 #51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations
 hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL
-read-only de sa source #51-H2h et autorité PostgreSQL fermée du listener #51-H2i
+read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i
+et autorité PostgreSQL fermée du worker non signant #51-H2j
 
 ## Historique des versions
+
+- **1.11.20 — 2026-09-05 :** fixe pour H2j la commande `psql` hermétique de
+  provisioning et le contrôle post-exécution 5/5 mono-OID.
+- **1.11.19 — 2026-09-05 :** ferme le replay H2j après renommage : inventaire
+  exact 5/5 sur un OID unique, quarantaine atomique de l'ancien rôle et
+  reliaison exclusive des policies au rôle worker canonique.
+- **1.11.18 — 2026-09-05 :** finalise H2j après P1/P2/P3 avec policies liées
+  à l'OID du worker, guards enfants `SECURITY INVOKER` sous RLS et résistance
+  aux dérives de schéma, `REVOKE` et renommage.
+
+- **1.11.17 — 2026-09-05 :** réserve les intentions live par un marqueur
+  monotone et isole leurs lignes des workers non signants avec RLS, sans
+  étendre leurs capacités de signature ou de soumission.
+
+- **1.11.16 — 2026-09-05 :** ajoute H2j, autorité PostgreSQL minimale du
+  worker `dry-run` et `simulation-only`, sans wallet, armement, signature ni
+  soumission.
 
 - **1.11.15 — 2026-09-05 :** ajoute H2i, provisioning fermé du listener
   paper capable d'émettre une intention canary sans accès aux autorités live.
@@ -425,6 +443,40 @@ hash du build, fingerprint de stratégie/configuration, provider, nombre maximal
 de BUY, plafond absolu en lamports, exposition, date d'expiration, identité et
 raison opérateur. L'exécuteur applique ces bornes ; elles ne sont pas de simples
 champs de rapport.
+
+#51-H2j isole les deux modes non signants derrière le groupe PostgreSQL
+`sol_token_executor_worker`. Un login externe `NOINHERIT`, membre de ce seul
+groupe, active le rôle dans sa connexion dédiée. L'allowlist par colonne couvre
+uniquement le claim et la restitution d'une intention, l'assessment `dry-run`,
+la tentative et l'artefact non signé `simulation-only`, les transitions
+associées et la preuve read-only du marché canonique. Ce rôle n'accède ni au
+wallet, ni au risque ou contrôle live, ni à l'armement, ni aux bytes signés, ni
+à la soumission ou à la réconciliation.
+
+La migration 040 ajoute `live_reserved` uniquement à `execution_intents` et
+active RLS sur cette table et ses quatre tables enfants. Le worker ne peut
+jamais lire ni altérer une intention `live_reserved=true`, ni ses enfants ; les
+enfants sont filtrés par leur `intent_id`, sans booléen dupliqué. `DRY_RUN` et
+`EXECUTE` réclament seulement `live_reserved=false`; `LIVE_EXECUTE`,
+`LIVE_RECOVER`, `CONFIRM` et `RECONCILE` réclament seulement
+`live_reserved=true`. Le propriétaire administratif et migrateur conserve son
+bypass grâce à RLS sans `FORCE ROW LEVEL SECURITY`. Un
+`SELECT(live_reserved)` est exigé techniquement par PostgreSQL pour les
+predicates de claim et la policy, mais ne révèle aucune ligne `true` et
+n'expose pas le marqueur au domaine ou à l'API. La migration valide la forme
+exacte `BOOLEAN NOT NULL
+DEFAULT FALSE`. Si le rôle est absent, elle crée un placeholder neutre ; le
+provisioning le remplace par des policies liées à l'OID du worker. À chaque
+replay, il exige l'inventaire exact 5/5 des policies sur un OID unique. Si cet
+OID appartient à un ancien rôle renommé, celui-ci est démoté et ses memberships,
+réglages et droits sont révoqués atomiquement avant `DROP OWNED` et rebind ; un
+ownership ou une dépendance dans une autre base fait échouer fermé. La session
+active stale perd alors toute autorité et le rôle canonique reçoit seul les
+cinq policies finales. Les guards enfants `SECURITY INVOKER` restent soumis à
+RLS. Un `REVOKE` empêche les nouvelles sessions. Le `owner`, les superusers et rôles `BYPASSRLS` restent
+une frontière de confiance intentionnelle. Le risque résiduel est un DoS
+pré-promotion ; il ne donne aucune capacité de signature ou de
+soumission.
 
 ### 4.3 Secrets
 
@@ -1094,6 +1146,8 @@ réaffecté à une autre signification.
 | #51-H2f | Paquet signé hors ligne des preuves H2c | Aucune capacité Solana |
 | #51-H2g | Assemblage offline du draft H2f | Aucune capacité Solana |
 | #51-H2h | Export causal PostgreSQL de la source H2g | Aucune capacité Solana |
+| #51-H2i | Autorité PostgreSQL fermée du listener paper | Aucune |
+| #51-H2j | Autorité PostgreSQL fermée du worker dry-run/simulation | Aucune |
 
 Chaque PR est fusionnable seule, garde le listener opérationnel et passe trois
 cycles de revue au maximum. Une PR ne peut pas anticiper l'activation de la
@@ -1132,7 +1186,7 @@ suivante.
 - les gates compensatoires et l'activation progressive sont testables ;
 - SOL/WSOL est l'allowlist initiale sans coupler le domaine à SOL ;
 - la rétention terminale de quatre heures est documentée ;
-- les lots #51-B à #51-H2h sont indépendants et fusionnables séquentiellement ;
+- les lots #51-B à #51-H2j sont indépendants et fusionnables séquentiellement ;
 - aucun code de production, comportement, secret ou mode live n'est ajouté ;
 - `npm run build`, `npm run check`, `npm run lint`, `npm test` et
   `npm run docs:check` restent verts.

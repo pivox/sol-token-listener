@@ -1,6 +1,9 @@
 -- Run as a PostgreSQL administrator after migrations. These are NOLOGIN group
 -- roles; attach deployment-specific LOGIN roles separately. No password is
 -- created or accepted by this script.
+BEGIN;
+SET LOCAL search_path=pg_catalog,public,pg_temp;
+
 DO $roles$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='sol_token_listener_writer') THEN
@@ -402,6 +405,622 @@ ON TABLE execution_intents TO sol_token_listener_writer;
 GRANT SELECT (intent_id,logical_order_key,decision_fingerprint)
 ON TABLE execution_intent_tombstones TO sol_token_listener_writer;
 
+-- Dry-run and simulation-only share this non-signing authority boundary.
+-- Rebuild it from zero on every replay so stale grants cannot expose wallet,
+-- signing, submission, or reconciliation state.
+ALTER ROLE sol_token_executor_worker NOLOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+
+DO $worker_parameter_acl$
+DECLARE
+  parameter_name TEXT;
+BEGIN
+  IF current_setting('server_version_num')::INTEGER >= 150000 THEN
+    REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM PUBLIC;
+    FOR parameter_name IN SELECT parname FROM pg_parameter_acl
+    LOOP
+      EXECUTE format(
+        'REVOKE SET, ALTER SYSTEM ON PARAMETER %I FROM sol_token_executor_worker',
+        parameter_name
+      );
+    END LOOP;
+  END IF;
+END
+$worker_parameter_acl$;
+
+DO $worker_parents$
+DECLARE
+  parent_role NAME;
+BEGIN
+  FOR parent_role IN
+    SELECT parent.rolname FROM pg_auth_members membership
+    JOIN pg_roles member ON member.oid=membership.member
+    JOIN pg_roles parent ON parent.oid=membership.roleid
+    WHERE member.rolname='sol_token_executor_worker'
+  LOOP
+    EXECUTE format('REVOKE %I FROM sol_token_executor_worker', parent_role);
+  END LOOP;
+END
+$worker_parents$;
+
+DO $worker_schemas$
+DECLARE
+  schema_name NAME;
+BEGIN
+  FOR schema_name IN
+    SELECT nspname FROM pg_namespace
+    WHERE nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND nspname NOT LIKE 'pg_temp_%'
+      AND nspname NOT LIKE 'pg_toast_temp_%'
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON SCHEMA %I FROM sol_token_executor_worker',
+      schema_name
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_worker',
+      schema_name
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_executor_worker',
+      schema_name
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_executor_worker',
+      schema_name
+    );
+  END LOOP;
+END
+$worker_schemas$;
+
+DO $worker_type_acl$
+DECLARE
+  target_type RECORD;
+BEGIN
+  FOR target_type IN
+    SELECT namespace.nspname,type.typname
+    FROM pg_type type
+    JOIN pg_namespace namespace ON namespace.oid=type.typnamespace
+    CROSS JOIN LATERAL aclexplode(type.typacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_executor_worker'
+    )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TYPE %I.%I FROM sol_token_executor_worker',
+      target_type.nspname,target_type.typname
+    );
+  END LOOP;
+END
+$worker_type_acl$;
+
+DO $worker_database_acl$
+DECLARE
+  database_name NAME;
+BEGIN
+  FOR database_name IN SELECT datname FROM pg_database
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON DATABASE %I FROM sol_token_executor_worker',
+      database_name
+    );
+  END LOOP;
+END
+$worker_database_acl$;
+
+DO $worker_public_database_acl$
+BEGIN
+  EXECUTE format(
+    'REVOKE CREATE, TEMPORARY ON DATABASE %I FROM PUBLIC',
+    current_database()
+  );
+END
+$worker_public_database_acl$;
+
+DO $worker_language_acl$
+DECLARE
+  language_name NAME;
+BEGIN
+  FOR language_name IN
+    SELECT language.lanname
+    FROM pg_language language
+    CROSS JOIN LATERAL aclexplode(language.lanacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_executor_worker'
+    )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON LANGUAGE %I FROM sol_token_executor_worker',
+      language_name
+    );
+  END LOOP;
+END
+$worker_language_acl$;
+
+DO $worker_default_acl$
+DECLARE
+  default_acl RECORD;
+  object_kind TEXT;
+  schema_clause TEXT;
+BEGIN
+  FOR default_acl IN
+    SELECT DISTINCT grantor.rolname AS grantor_name,
+      namespace.nspname AS schema_name,defaults.defaclobjtype
+    FROM pg_default_acl defaults
+    JOIN pg_roles grantor ON grantor.oid=defaults.defaclrole
+    LEFT JOIN pg_namespace namespace ON namespace.oid=defaults.defaclnamespace
+    CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
+    WHERE acl.grantee=(
+      SELECT oid FROM pg_roles WHERE rolname='sol_token_executor_worker'
+    )
+  LOOP
+    object_kind := CASE default_acl.defaclobjtype
+      WHEN 'r' THEN 'TABLES'
+      WHEN 'S' THEN 'SEQUENCES'
+      WHEN 'f' THEN 'FUNCTIONS'
+      WHEN 'T' THEN 'TYPES'
+      WHEN 'n' THEN 'SCHEMAS'
+      ELSE NULL
+    END;
+    IF object_kind IS NULL THEN
+      RAISE EXCEPTION 'Unsupported worker default ACL object kind';
+    END IF;
+    schema_clause := CASE WHEN default_acl.schema_name IS NULL THEN ''
+      ELSE format(' IN SCHEMA %I',default_acl.schema_name) END;
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL PRIVILEGES ON %s FROM sol_token_executor_worker',
+      default_acl.grantor_name,schema_clause,object_kind
+    );
+  END LOOP;
+END
+$worker_default_acl$;
+
+-- PUBLIC authority is inherited and cannot be narrowed with a role-specific
+-- revoke. Remove it from every execution relation and the two venue-proof
+-- relations, including column grants, and from every user sequence so the
+-- worker's positive allowlist remains exact.
+DO $worker_public_execution_acl$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,table_class.relname,
+      string_agg(quote_ident(attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class table_class
+    JOIN pg_namespace namespace ON namespace.oid=table_class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=table_class.oid
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND table_class.relkind IN ('r','p','v','m','f')
+      AND (
+        table_class.relname LIKE 'execution\_%' ESCAPE '\'
+        OR table_class.relname IN ('migrations','market_pools')
+      )
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    GROUP BY namespace.nspname,table_class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM PUBLIC',
+      relation.nspname,relation.relname
+    );
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM PUBLIC',
+      relation.columns,relation.nspname,relation.relname
+    );
+  END LOOP;
+  FOR relation IN
+    SELECT namespace.nspname,sequence_class.relname
+    FROM pg_class sequence_class
+    JOIN pg_namespace namespace ON namespace.oid=sequence_class.relnamespace
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND sequence_class.relkind='S'
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON SEQUENCE %I.%I FROM PUBLIC',
+      relation.nspname,relation.relname
+    );
+  END LOOP;
+END
+$worker_public_execution_acl$;
+
+DO $worker_columns$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,table_class.relname,
+      string_agg(quote_ident(attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class table_class
+    JOIN pg_namespace namespace ON namespace.oid=table_class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=table_class.oid
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND table_class.relkind IN ('r','p','v','m','f')
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    GROUP BY namespace.nspname,table_class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM sol_token_executor_worker',
+      relation.columns,relation.nspname,relation.relname
+    );
+  END LOOP;
+END
+$worker_columns$;
+
+-- Ownership bypasses ACL checks, so unexpected worker-owned objects must be
+-- reassigned by an administrator before provisioning can continue.
+DO $worker_ownership_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_database object
+      WHERE object.datdba=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_executor_worker')
+    UNION ALL SELECT 1 FROM pg_namespace object
+      WHERE object.nspowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_executor_worker')
+    UNION ALL SELECT 1 FROM pg_class object
+      WHERE object.relowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_executor_worker')
+    UNION ALL SELECT 1 FROM pg_proc object
+      WHERE object.proowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_executor_worker')
+    UNION ALL SELECT 1 FROM pg_type object
+      WHERE object.typowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_executor_worker')
+    UNION ALL SELECT 1 FROM pg_language object
+      WHERE object.lanowner=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_executor_worker')
+    UNION ALL SELECT 1 FROM pg_default_acl object
+      WHERE object.defaclrole=(SELECT oid FROM pg_roles
+        WHERE rolname='sol_token_executor_worker')
+  ) THEN
+    RAISE EXCEPTION 'Worker role owns database objects';
+  END IF;
+END
+$worker_ownership_guard$;
+
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO sol_token_executor_worker;
+
+-- A role keeps its OID, grants and active SET ROLE sessions when renamed.
+-- Quarantine any non-canonical OID still targeted by all five worker policies
+-- before those policies are rebound. DROP OWNED and the dependency checks run
+-- in this single DO transaction, so a failed cleanup leaves the old policies
+-- in place and fails closed.
+DO $worker_rebind_guard$
+DECLARE
+  canonical_oid OID;
+  target_oids OID[];
+  policy_target_count INTEGER;
+  stale_oid OID;
+  stale_name NAME;
+  stale_role RECORD;
+  membership RECORD;
+  database_setting RECORD;
+BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('sol-token-listener:worker-policy-rebind:v1',0)
+  );
+
+  SELECT role.oid INTO STRICT canonical_oid
+  FROM pg_catalog.pg_roles role
+  WHERE role.rolname='sol_token_executor_worker';
+
+  WITH expected(policy_name,relation_name) AS (VALUES
+    ('execution_intents_worker_partition','execution_intents'),
+    ('execution_dry_run_assessments_worker_partition','execution_dry_run_assessments'),
+    ('execution_attempts_worker_partition','execution_attempts'),
+    ('execution_intent_transitions_worker_partition','execution_intent_transitions'),
+    ('execution_simulation_artifacts_worker_partition','execution_simulation_artifacts')
+  ), inventory AS (
+    SELECT policy.polroles
+    FROM expected
+    JOIN pg_catalog.pg_class relation
+      ON relation.relname=expected.relation_name
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid=relation.relnamespace AND namespace.nspname='public'
+    JOIN pg_catalog.pg_policy policy
+      ON policy.polrelid=relation.oid AND policy.polname=expected.policy_name
+    WHERE NOT policy.polpermissive AND policy.polcmd='*'
+  )
+  SELECT COUNT(*)::INTEGER,
+    pg_catalog.array_agg(DISTINCT target.role_oid ORDER BY target.role_oid)
+  INTO policy_target_count,target_oids
+  FROM inventory
+  CROSS JOIN LATERAL pg_catalog.unnest(inventory.polroles) target(role_oid);
+
+  IF policy_target_count<>5 OR pg_catalog.cardinality(target_oids)<>1 THEN
+    RAISE EXCEPTION 'ambiguous worker partition policy inventory'
+      USING ERRCODE='55000';
+  END IF;
+
+  stale_oid:=target_oids[1];
+  IF stale_oid<>0 AND stale_oid<>canonical_oid THEN
+    SELECT role.* INTO STRICT stale_role
+    FROM pg_catalog.pg_roles role
+    WHERE role.oid=stale_oid;
+    stale_name:=stale_role.rolname;
+
+    IF stale_name LIKE 'pg\_%' ESCAPE '\'
+      OR stale_name IN (session_user,current_user)
+      OR stale_role.rolsuper OR stale_role.rolcreatedb
+      OR stale_role.rolcreaterole OR stale_role.rolcanlogin
+      OR stale_role.rolreplication OR stale_role.rolbypassrls
+    THEN
+      RAISE EXCEPTION 'unsafe stale worker policy target'
+        USING ERRCODE='55000';
+    END IF;
+
+    EXECUTE pg_catalog.format(
+      'ALTER ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS',
+      stale_name
+    );
+    EXECUTE pg_catalog.format('ALTER ROLE %I RESET ALL',stale_name);
+
+    FOR database_setting IN
+      SELECT database.datname
+      FROM pg_catalog.pg_db_role_setting setting
+      JOIN pg_catalog.pg_database database ON database.oid=setting.setdatabase
+      WHERE setting.setrole=stale_oid
+    LOOP
+      EXECUTE pg_catalog.format(
+        'ALTER ROLE %I IN DATABASE %I RESET ALL',
+        stale_name,database_setting.datname
+      );
+    END LOOP;
+
+    FOR membership IN
+      SELECT parent.rolname
+      FROM pg_catalog.pg_auth_members edge
+      JOIN pg_catalog.pg_roles parent ON parent.oid=edge.roleid
+      WHERE edge.member=stale_oid
+    LOOP
+      EXECUTE pg_catalog.format(
+        'REVOKE %I FROM %I CASCADE',membership.rolname,stale_name
+      );
+    END LOOP;
+    FOR membership IN
+      SELECT member.rolname
+      FROM pg_catalog.pg_auth_members edge
+      JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+      WHERE edge.roleid=stale_oid
+    LOOP
+      EXECUTE pg_catalog.format(
+        'REVOKE %I FROM %I CASCADE',stale_name,membership.rolname
+      );
+    END LOOP;
+
+    IF EXISTS (
+      SELECT 1 FROM pg_catalog.pg_shdepend dependency
+      WHERE dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+        AND dependency.refobjid=stale_oid
+        AND dependency.deptype='o'
+    ) THEN
+      RAISE EXCEPTION 'stale worker policy role owns database objects'
+        USING ERRCODE='55000';
+    END IF;
+
+    EXECUTE pg_catalog.format('DROP OWNED BY %I CASCADE',stale_name);
+
+    DROP POLICY IF EXISTS execution_intents_worker_partition
+      ON execution_intents;
+    DROP POLICY IF EXISTS execution_dry_run_assessments_worker_partition
+      ON execution_dry_run_assessments;
+    DROP POLICY IF EXISTS execution_attempts_worker_partition
+      ON execution_attempts;
+    DROP POLICY IF EXISTS execution_intent_transitions_worker_partition
+      ON execution_intent_transitions;
+    DROP POLICY IF EXISTS execution_simulation_artifacts_worker_partition
+      ON execution_simulation_artifacts;
+
+    IF EXISTS (
+      SELECT 1 FROM pg_catalog.pg_auth_members edge
+      WHERE edge.roleid=stale_oid OR edge.member=stale_oid
+    ) OR EXISTS (
+      SELECT 1 FROM pg_catalog.pg_db_role_setting setting
+      WHERE setting.setrole=stale_oid
+    ) OR EXISTS (
+      SELECT 1 FROM pg_catalog.pg_shdepend dependency
+      WHERE dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+        AND dependency.refobjid=stale_oid
+    ) THEN
+      RAISE EXCEPTION 'stale worker policy role retains authority outside the current database'
+        USING ERRCODE='55000';
+    END IF;
+  END IF;
+END
+$worker_rebind_guard$;
+
+-- Rebuild the worker/live row partition after the NOLOGIN worker role exists.
+-- PostgreSQL stores policy targets as role OIDs, so an already active SET ROLE
+-- session remains covered after membership revocation and a role rename cannot
+-- detach the policy from the protected principal.
+ALTER TABLE execution_intents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE execution_dry_run_assessments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE execution_attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE execution_intent_transitions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE execution_simulation_artifacts ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS execution_intents_normal_access ON execution_intents;
+CREATE POLICY execution_intents_normal_access ON execution_intents
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_intents_worker_partition ON execution_intents;
+CREATE POLICY execution_intents_worker_partition ON execution_intents
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (NOT live_reserved) WITH CHECK (NOT live_reserved);
+
+DROP POLICY IF EXISTS execution_dry_run_assessments_normal_access
+  ON execution_dry_run_assessments;
+CREATE POLICY execution_dry_run_assessments_normal_access
+ON execution_dry_run_assessments
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_dry_run_assessments_worker_partition
+  ON execution_dry_run_assessments;
+CREATE POLICY execution_dry_run_assessments_worker_partition
+ON execution_dry_run_assessments
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_dry_run_assessments.intent_id
+))
+WITH CHECK (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_dry_run_assessments.intent_id
+));
+
+DROP POLICY IF EXISTS execution_attempts_normal_access ON execution_attempts;
+CREATE POLICY execution_attempts_normal_access ON execution_attempts
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_attempts_worker_partition ON execution_attempts;
+CREATE POLICY execution_attempts_worker_partition ON execution_attempts
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_attempts.intent_id
+))
+WITH CHECK (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_attempts.intent_id
+));
+
+DROP POLICY IF EXISTS execution_intent_transitions_normal_access
+  ON execution_intent_transitions;
+CREATE POLICY execution_intent_transitions_normal_access
+ON execution_intent_transitions
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_intent_transitions_worker_partition
+  ON execution_intent_transitions;
+CREATE POLICY execution_intent_transitions_worker_partition
+ON execution_intent_transitions
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_intent_transitions.intent_id
+))
+WITH CHECK (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_intent_transitions.intent_id
+));
+
+DROP POLICY IF EXISTS execution_simulation_artifacts_normal_access
+  ON execution_simulation_artifacts;
+CREATE POLICY execution_simulation_artifacts_normal_access
+ON execution_simulation_artifacts
+AS PERMISSIVE FOR ALL TO PUBLIC USING (TRUE) WITH CHECK (TRUE);
+DROP POLICY IF EXISTS execution_simulation_artifacts_worker_partition
+  ON execution_simulation_artifacts;
+CREATE POLICY execution_simulation_artifacts_worker_partition
+ON execution_simulation_artifacts
+AS RESTRICTIVE FOR ALL TO sol_token_executor_worker
+USING (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_simulation_artifacts.intent_id
+))
+WITH CHECK (EXISTS (
+  SELECT 1 FROM public.execution_intents parent
+  WHERE parent.id=execution_simulation_artifacts.intent_id
+));
+
+-- Trigger functions fire without direct EXECUTE authority. Reset both the
+-- inherited PUBLIC capability and any stale worker-specific grant.
+REVOKE ALL PRIVILEGES ON FUNCTION
+  execution_intents_live_reserved_monotone_guard(),
+  execution_worker_child_parent_guard()
+FROM PUBLIC,sol_token_executor_worker;
+
+GRANT SELECT (
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status,
+  attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
+  last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
+  purge_after,live_reserved
+), UPDATE (
+  status,attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
+  last_reason_code,terminal_at,reconciliation_completed_at,updated_at,purge_after
+)
+ON TABLE execution_intents TO sol_token_executor_worker;
+
+GRANT SELECT (
+  assessment_id,payload_version,specification_version,evaluator_version,intent_id,
+  strategy_id,strategy_version,decision_fingerprint,intent_state_revision,
+  intent_status,input_fingerprint,result_fingerprint,outcome,coverage,quote_status,
+  build_status,simulation_status,signature_status,submission_status,recorded_at
+), INSERT (
+  assessment_id,payload_version,specification_version,evaluator_version,intent_id,
+  strategy_id,strategy_version,decision_fingerprint,intent_state_revision,
+  intent_status,input_fingerprint,result_fingerprint,outcome,coverage,quote_status,
+  build_status,simulation_status,signature_status,submission_status,recorded_at
+)
+ON TABLE execution_dry_run_assessments TO sol_token_executor_worker;
+
+GRANT SELECT (
+  intent_id,attempt_number,status,effective_venue,provider_id,started_at,
+  completed_at,reason_code,purge_after
+), INSERT (
+  intent_id,attempt_number,status,started_at
+), UPDATE (
+  status,effective_venue,provider_id,completed_at,reason_code
+)
+ON TABLE execution_attempts TO sol_token_executor_worker;
+
+GRANT SELECT (intent_id), INSERT (
+  intent_id,previous_status,next_status,reason_code,human_message,
+  activation_phase,attempt_number,evidence,occurred_at
+)
+ON TABLE execution_intent_transitions TO sol_token_executor_worker;
+
+GRANT SELECT (
+  artifact_id,payload_version,specification_version,evaluator_version,intent_id,
+  attempt_number,intent_state_revision,strategy_id,strategy_version,decision_fingerprint,
+  result_kind,effective_venue,provider_id,executor_public_key,expected_genesis_hash,
+  observed_genesis_hash,configuration_fingerprint,quote_fingerprint,snapshot_fingerprint,
+  build_fingerprint,message_hash,blockhash,last_valid_block_height,blockhash_context_slot,
+  snapshot_slot,fee_context_slot,simulation_slot,amount_in_raw,expected_amount_out_raw,
+  protected_amount_out_raw,fees_raw,estimated_fee_lamports,
+  simulated_fee_payer_lamport_debit,units_consumed,simulated_base_delta_raw,
+  simulated_quote_delta_raw,rpc_calls_used,rpc_calls_limit,quote_status,build_status,
+  simulation_status,failure_stage,failure_code,terminal_reason_code,logs_fingerprint,
+  logs_line_count,result_fingerprint,recorded_at
+), INSERT (
+  artifact_id,payload_version,specification_version,evaluator_version,intent_id,
+  attempt_number,intent_state_revision,strategy_id,strategy_version,decision_fingerprint,
+  result_kind,effective_venue,provider_id,executor_public_key,expected_genesis_hash,
+  observed_genesis_hash,configuration_fingerprint,quote_fingerprint,snapshot_fingerprint,
+  build_fingerprint,message_hash,blockhash,last_valid_block_height,blockhash_context_slot,
+  snapshot_slot,fee_context_slot,simulation_slot,amount_in_raw,expected_amount_out_raw,
+  protected_amount_out_raw,fees_raw,estimated_fee_lamports,
+  simulated_fee_payer_lamport_debit,units_consumed,simulated_base_delta_raw,
+  simulated_quote_delta_raw,rpc_calls_used,rpc_calls_limit,quote_status,build_status,
+  simulation_status,failure_stage,failure_code,terminal_reason_code,logs_fingerprint,
+  logs_line_count,result_fingerprint,recorded_at
+)
+ON TABLE execution_simulation_artifacts TO sol_token_executor_worker;
+
+GRANT SELECT (
+  migration_id,mint,announced_pool,instruction_kind,quote_mint,quote_decimals,
+  base_token_program,quote_token_program,confirmation_status
+)
+ON TABLE migrations TO sol_token_executor_worker;
+
+GRANT SELECT (
+  pool_address,market,program_id,pool_index,creator,base_mint,quote_mint,
+  quote_decimals,base_token_program,quote_token_program,base_vault,quote_vault,
+  lp_mint,migration_id,pool_state,confirmation_status,slot,transaction_index,
+  instruction_index,inner_instruction_index
+)
+ON TABLE market_pools TO sol_token_executor_worker;
+
+GRANT USAGE ON SEQUENCE execution_intent_transitions_sequence_seq
+TO sol_token_executor_worker;
+
 ALTER ROLE sol_token_executor_live_recovery NOLOGIN NOSUPERUSER NOCREATEDB
   NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
 
@@ -510,12 +1129,12 @@ GRANT SELECT (
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
   last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
-  purge_after
+  purge_after,live_reserved
 ), INSERT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
   logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
-  decision_event_id,decision_fingerprint,requested_at,expires_at,status
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status,live_reserved
 ), UPDATE (
   status,state_revision,last_reason_code,lease_owner,lease_token,
   lease_expires_at,terminal_at,reconciliation_completed_at,purge_after,updated_at
@@ -1070,7 +1689,7 @@ GRANT SELECT (
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
   last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
-  purge_after
+  purge_after,live_reserved
 ), UPDATE (
   status,state_revision,attempt_count,last_reason_code,lease_owner,lease_token,
   lease_expires_at,terminal_at,reconciliation_completed_at,purge_after,updated_at
@@ -1445,7 +2064,9 @@ GRANT SELECT (
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,attempt_count,
   state_revision,last_reason_code,terminal_at,reconciliation_completed_at,purge_after,
-  created_at,updated_at,lease_owner,lease_token,lease_expires_at
+  created_at,updated_at,lease_owner,lease_token,lease_expires_at,live_reserved
+), UPDATE (
+  live_reserved
 )
 ON TABLE execution_intents TO sol_token_executor_operations;
 
@@ -1868,3 +2489,5 @@ REVOKE ALL ON TABLE
   execution_activation_armaments,
   execution_activation_events
 FROM sol_token_public_api,sol_token_listener_writer,sol_token_executor_worker;
+
+COMMIT;

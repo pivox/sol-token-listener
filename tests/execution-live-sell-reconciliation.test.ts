@@ -403,8 +403,12 @@ void test('late exact SELL replays cannot create a second exit or a second concu
       await fixture.live.commitReconciliation(terminalClaim, noEffect);
       const intents = new PostgresExecutionIntentRepository(pool);
       const claims = await Promise.all([
-        intents.claim({ ownerId: 'retry-a', leaseMs: 60_000, purpose: 'EXECUTE' }),
-        intents.claim({ ownerId: 'retry-b', leaseMs: 60_000, purpose: 'EXECUTE' }),
+        intents.claim({
+          ownerId: 'retry-a', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'SELL',
+        }),
+        intents.claim({
+          ownerId: 'retry-b', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'SELL',
+        }),
       ]);
       const retryClaim = claims.find((candidate) => candidate !== null);
       assert.ok(retryClaim);
@@ -660,9 +664,11 @@ async function createSellFixture(
     positionId: entry.position.positionId, observedAtMs: exitDeadlineAtMs,
   });
   assert.ok(exit.intent);
+  await pool.query('UPDATE execution_intents SET live_reserved=TRUE WHERE id=$1', [exit.intent.id]);
   const intents = new PostgresExecutionIntentRepository(pool);
   const exitClaim = await intents.claim({
-    ownerId: 'sell-reconciliation-test', leaseMs: 60_000, purpose: 'EXECUTE',
+    ownerId: 'sell-reconciliation-test', leaseMs: 60_000,
+    purpose: 'LIVE_EXECUTE', side: 'SELL',
   });
   assert.ok(exitClaim);
   assert.equal(exitClaim.intent.id, exit.intent.id);

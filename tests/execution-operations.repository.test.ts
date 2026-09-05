@@ -89,7 +89,10 @@ void test('arms one V2 canary atomically with admission and an exact replay', as
     const nowMs = Date.now();
     const template = safetyQualification(nowMs, simulation);
     const qualification = qualificationWithCanarySnapshots(template, walletSnapshot, providerSnapshot);
-    const repository = new PostgresExecutionOperationsRepository(pool);
+    const armQueries: string[] = [];
+    const repository = new PostgresExecutionOperationsRepository(
+      recordingDatabaseSource(pool, armQueries),
+    );
     await repository.persistQualification(qualification);
     const resumeAuthorization = createOperatorAuthorization({
       payloadVersion: 1, generationId, action: 'RESUME', phase: null,
@@ -143,15 +146,35 @@ void test('arms one V2 canary atomically with admission and an exact replay', as
       operatorId: 'operator-primary', issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
     });
     const input = Object.freeze({ request, authorization });
+    armQueries.length = 0;
     const first = await repository.armCanary(input);
+    const firstArmQueries = [...armQueries];
     assert.deepEqual(await repository.armCanary(input), first);
     assert.equal(first.state, 'ARMED');
+    const targetLockIndex = firstArmQueries.findIndex((query) =>
+      query.includes('FROM execution_intents WHERE id=$1 FOR UPDATE'));
+    const promotionIndex = firstArmQueries.findIndex((query) =>
+      /UPDATE execution_intents(?: AS intent)?\s+SET\s+live_reserved\s*=\s*TRUE/iu.test(query));
+    const admissionIndex = firstArmQueries.findIndex((query) =>
+      query.includes('INSERT INTO execution_risk_admission_reports'));
+    const publicationIndex = firstArmQueries.findIndex((query) =>
+      query.includes('INSERT INTO execution_activation_armaments'));
+    assert.ok(targetLockIndex >= 0);
+    assert.match(firstArmQueries[targetLockIndex] ?? '', /\blive_reserved\b/u);
+    assert.ok(targetLockIndex < promotionIndex);
+    assert.ok(promotionIndex < admissionIndex);
+    assert.ok(admissionIndex < publicationIndex);
     const counts = await pool.query(`SELECT
       (SELECT COUNT(*) FROM execution_risk_admission_reports)::INTEGER AS reports,
       (SELECT COUNT(*) FROM execution_exposure_reservations)::INTEGER AS reservations,
       (SELECT COUNT(*) FROM execution_provider_usage_counters)::INTEGER AS counters,
-      (SELECT COUNT(*) FROM execution_activation_armaments WHERE payload_version=2)::INTEGER AS armaments`);
-    assert.deepEqual(counts.rows, [{ reports: 1, reservations: 1, counters: 1, armaments: 1 }]);
+      (SELECT COUNT(*) FROM execution_activation_armaments WHERE payload_version=2)::INTEGER AS armaments,
+      (SELECT live_reserved FROM execution_intents WHERE id=$1) AS target_live_reserved`, [
+      target.intent.id,
+    ]);
+    assert.deepEqual(counts.rows, [{
+      reports: 1, reservations: 1, counters: 1, armaments: 1, target_live_reserved: true,
+    }]);
     await repository.setStop({
       payloadVersion: 1, commandId: 'command:revoke-v2-canary', generationId,
       operatorId: 'operator-primary', occurredAtMs: Date.now(),
@@ -226,12 +249,38 @@ void test('rolls every arm side effect back when admission rejects unknown walle
       (SELECT COUNT(*) FROM execution_provider_usage_counters)::INTEGER AS counters,
       (SELECT COUNT(*) FROM execution_operator_authorizations WHERE payload_version=2)::INTEGER AS authorizations,
       (SELECT COUNT(*) FROM execution_activation_armaments WHERE payload_version=2)::INTEGER AS armaments,
+      (SELECT live_reserved FROM execution_intents WHERE id=$2) AS target_live_reserved,
       (SELECT reserved_exposure_raw::TEXT FROM execution_wallet_risk_state WHERE generation_id=$1)
-        AS reserved_exposure_raw`, [generationId]);
+        AS reserved_exposure_raw`, [generationId, fixture.target.id]);
     assert.deepEqual(counts.rows, [{
       wallet_snapshots: 0, provider_snapshots: 0, reports: 0, reservations: 0,
-      counters: 0, authorizations: 0, armaments: 0, reserved_exposure_raw: '0',
+      counters: 0, authorizations: 0, armaments: 0, target_live_reserved: false,
+      reserved_exposure_raw: '0',
     }]);
+  });
+});
+
+void test('rolls the live promotion back when canary publication fails', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    await migrateDatabase({ pool });
+    const fixture = await prepareCanaryArmament(pool);
+    await pool.query(`CREATE FUNCTION reject_canary_publication() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected publication failure'; END $$`);
+    await pool.query(`CREATE TRIGGER reject_canary_publication
+      BEFORE INSERT ON execution_activation_armaments
+      FOR EACH ROW EXECUTE FUNCTION reject_canary_publication()`);
+
+    await assert.rejects(fixture.repository.armCanary(Object.freeze({
+      request: fixture.request, authorization: fixture.authorization,
+    })), isRepositoryError('DATABASE_FAILURE'));
+
+    await assertNoCanaryArmSideEffects(pool);
+    const target = await pool.query(`SELECT live_reserved FROM execution_intents WHERE id=$1`, [
+      fixture.target.id,
+    ]);
+    assert.deepEqual(target.rows, [{ live_reserved: false }]);
   });
 });
 
@@ -258,6 +307,27 @@ void test('rejects a divergent or leased canary target before side effects', asy
       ownerId: 'canary-lease-holder', leaseMs: 30_000, purpose: 'EXECUTE',
     });
     assert.notEqual(claim, null);
+    await assert.rejects(fixture.repository.armCanary(Object.freeze({
+      request: fixture.request, authorization: fixture.authorization,
+    })), isRepositoryError('CONFLICT'));
+    await assertNoCanaryArmSideEffects(pool);
+    const target = await pool.query(`SELECT live_reserved FROM execution_intents WHERE id=$1`, [
+      fixture.target.id,
+    ]);
+    assert.deepEqual(target.rows, [{ live_reserved: false }]);
+  });
+});
+
+void test('rejects an already live-reserved canary target before admission', async (context) => {
+  const databaseUrl = testDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    await migrateDatabase({ pool });
+    const fixture = await prepareCanaryArmament(pool);
+    await pool.query(`UPDATE execution_intents SET live_reserved=TRUE WHERE id=$1`, [
+      fixture.target.id,
+    ]);
+
     await assert.rejects(fixture.repository.armCanary(Object.freeze({
       request: fixture.request, authorization: fixture.authorization,
     })), isRepositoryError('CONFLICT'));
@@ -353,7 +423,8 @@ void test('does not terminalize a V2 LOCKED armament from an operations stop', a
       request: fixture.request, authorization: fixture.authorization,
     }));
     const claimed = await fixture.intents.claim({
-      ownerId: 'canary-lock-holder', leaseMs: 30_000, purpose: 'EXECUTE',
+      ownerId: 'canary-lock-holder', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+      generationId,
     });
     if (claimed === null) assert.fail('Expected the canary target to be claimed.');
     const processingIntent = await fixture.intents.transition(claimed, {
@@ -982,6 +1053,34 @@ function testDatabaseUrl(context: Readonly<{ skip(message?: string): void }>): s
   if (databaseUrl !== undefined && databaseUrl.trim() !== '') return databaseUrl;
   context.skip('TEST_DATABASE_URL absent: execution operations repository test skipped');
   return null;
+}
+
+function recordingDatabaseSource(
+  pool: InstanceType<typeof pg.Pool>,
+  queries: string[],
+): Readonly<{ connect(): Promise<Readonly<{
+  query(text: string, values?: readonly unknown[]): Promise<Readonly<{
+    rows: readonly Readonly<Record<string, unknown>>[];
+    rowCount: number | null;
+  }>>;
+  release(error?: boolean): void;
+}>> }> {
+  return Object.freeze({
+    connect: async () => {
+      const client = await pool.connect();
+      return Object.freeze({
+        query: async (text: string, values?: readonly unknown[]) => {
+          queries.push(text);
+          const result = await client.query(text, values as unknown[] | undefined);
+          return Object.freeze({
+            rows: result.rows as readonly Readonly<Record<string, unknown>>[],
+            rowCount: result.rowCount,
+          });
+        },
+        release: (error?: boolean) => { client.release(error); },
+      });
+    },
+  });
 }
 
 async function withTemporarySchema(

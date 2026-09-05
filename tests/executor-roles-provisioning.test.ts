@@ -39,6 +39,15 @@ const smokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const databaseUrl = new URL('../src/storage/database.ts', import.meta.url);
 
+void test('executor role provisioning is one explicit transaction', async () => {
+  const sql = await readFile(scriptUrl, 'utf8');
+  const executable = sql.replace(/--[^\r\n]*/gu, ' ').trim();
+
+  assert.match(executable,
+    /^BEGIN\s*;\s*SET LOCAL search_path\s*=\s*pg_catalog\s*,\s*public\s*,\s*pg_temp\s*;/iu);
+  assert.match(executable, /COMMIT\s*;$/iu);
+});
+
 void test('executor role provisioning is explicit, passwordless and least-privilege', async () => {
   const sql = await readFile(scriptUrl, 'utf8');
   const repository = await readFile(repositoryUrl, 'utf8');
@@ -147,6 +156,11 @@ void test('read-only recovery provisioning matches its closed authority policy',
   assert.equal(signed.select.includes('pre_signature_lock_id'), true);
   assert.equal(signed.select.includes('signed_transaction_bytes'), false);
   assert.equal(signed.update.includes('submission_started_at'), false);
+  const intents = authority.tables.find((table) => table.name === 'execution_intents');
+  assert.ok(intents !== undefined);
+  assert.equal(intents.select.includes('live_reserved'), true);
+  assert.equal(intents.insert.includes('live_reserved'), true);
+  assert.equal(intents.update.includes('live_reserved'), false);
 
   const reconciliation = authority.tables.find((table) => (
     table.name === 'execution_reconciliation_evidence'

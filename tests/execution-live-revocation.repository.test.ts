@@ -624,9 +624,10 @@ async function createPersistedSellFixture(pool: InstanceType<typeof pg.Pool>) {
     positionId: entry.position.positionId, observedAtMs: exitDeadlineAtMs,
   });
   assert.ok(exit.intent);
+  await pool.query('UPDATE execution_intents SET live_reserved=TRUE WHERE id=$1', [exit.intent.id]);
   const intents = new PostgresExecutionIntentRepository(pool);
   const claimed = await intents.claim({
-    ownerId: 'revocation-sell-test', leaseMs: 60_000, purpose: 'EXECUTE',
+    ownerId: 'revocation-sell-test', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'SELL',
   });
   assert.ok(claimed);
   assert.equal(claimed.intent.id, exit.intent.id);
