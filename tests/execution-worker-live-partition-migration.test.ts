@@ -64,7 +64,7 @@ void test('PostgreSQL 16 migration 040 backfills only live parents and enables n
         databaseCreated = true;
         isolated = new pg.Pool({ connectionString: isolatedUrl.href, max: 3 });
         await applyMigrationsBefore040(isolated);
-        const expected = await seedHistoricalLiveRoots(isolated);
+        const historical = await seedHistoricalLiveRoots(isolated);
 
         const absentRole = `h2j_absent_${suffix.slice(0, 24)}`;
         assert.equal((await maintenance.query<{ readonly present: boolean }>(
@@ -80,7 +80,13 @@ void test('PostgreSQL 16 migration 040 backfills only live parents and enables n
         }>('SELECT id,live_reserved FROM execution_intents ORDER BY id');
         assert.deepEqual(
           Object.fromEntries(reservation.rows.map((row) => [row.id, row.live_reserved])),
-          Object.fromEntries(expected.map((id) => [id, id !== intentId('0')])),
+          Object.fromEntries(historical.ids.map((id) => [id, id !== intentId('0')])),
+        );
+        assert.notEqual(historical.lockTargetIntentId, historical.lockedOnlyIntentId);
+        assert.equal(
+          reservation.rows.find((row) => row.id === historical.lockedOnlyIntentId)?.live_reserved,
+          true,
+          'an intent referenced only by locked_intent_id must be backfilled as live',
         );
         const columns = await isolated.query<{ readonly table_name: string }>(
           `SELECT table_name FROM information_schema.columns
@@ -164,6 +170,119 @@ void test('PostgreSQL 16 migration 040 backfills only live parents and enables n
     if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, 'Cleanup failed.');
   });
 
+void test('PostgreSQL 16 migration 040 rejects a malformed pre-existing live_reserved column before backfill',
+  async (context) => {
+    const configuredUrl = process.env.TEST_EXECUTOR_ROLE_DATABASE_URL;
+    if (configuredUrl === undefined || configuredUrl.trim() === '') {
+      context.skip('TEST_EXECUTOR_ROLE_DATABASE_URL is required for the disposable role cluster.');
+      return;
+    }
+    const baseUrl = new URL(configuredUrl);
+    const maintenance = new pg.Pool({ connectionString: baseUrl.href });
+    const suffix = randomUUID().replaceAll('-', '');
+    const databaseName = `h2j_malformed_${suffix}`;
+    const isolatedUrl = new URL(baseUrl);
+    isolatedUrl.pathname = `/${databaseName}`;
+    let isolated: InstanceType<typeof pg.Pool> | undefined;
+    let databaseCreated = false;
+    let release: (() => Promise<void>) | undefined;
+    let bodyFailure: unknown;
+    try {
+      const capability = await postgres16Capability(maintenance);
+      if (!capability) {
+        context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
+      } else {
+        release = await acquireExecutorRoleTestLock(maintenance);
+        await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
+        databaseCreated = true;
+        isolated = new pg.Pool({ connectionString: isolatedUrl.href, max: 3 });
+        await applyMigrationsBefore040(isolated);
+        const historical = await seedHistoricalLiveRoots(isolated);
+        await isolated.query(
+          'ALTER TABLE execution_intents ADD COLUMN live_reserved BOOLEAN DEFAULT FALSE',
+        );
+        await isolated.query('UPDATE execution_intents SET live_reserved=FALSE');
+        await isolated.query('UPDATE execution_intents SET live_reserved=NULL WHERE id=$1', [
+          historical.lockedOnlyIntentId,
+        ]);
+
+        const absentRole = `h2j_absent_${suffix.slice(0, 24)}`;
+        const migrationSql = (await readFile(migrationUrl, 'utf8'))
+          .replaceAll('sol_token_executor_worker', absentRole);
+        const isolatedPool = isolated;
+        const assertMalformedMigrationRejected = async (): Promise<void> => {
+          await assert.rejects(
+            isolatedPool.query(migrationSql),
+            (error: unknown) => {
+              assert.equal(error instanceof Error, true);
+              assert.match((error as Error).message,
+                /execution_intents\.live_reserved[\s\S]*(?:canonical|NOT NULL|DEFAULT FALSE|malformed)/iu);
+              return true;
+            },
+          );
+        };
+        await assertMalformedMigrationRejected();
+
+        const afterFailure = await isolated.query<{
+          readonly id: string;
+          readonly live_reserved: boolean | null;
+        }>('SELECT id,live_reserved FROM execution_intents ORDER BY id');
+        assert.equal(
+          afterFailure.rows.find((row) => row.id === historical.lockedOnlyIntentId)?.live_reserved,
+          null,
+          'schema rejection must occur before any historical live backfill is committed',
+        );
+        assert.equal(
+          afterFailure.rows.filter((row) => row.id !== historical.lockedOnlyIntentId)
+            .every((row) => row.live_reserved === false),
+          true,
+          'schema rejection must not partially backfill other intents',
+        );
+
+        await isolated.query('UPDATE execution_intents SET live_reserved=FALSE');
+        await isolated.query(`ALTER TABLE execution_intents
+          ALTER COLUMN live_reserved SET NOT NULL,
+          ALTER COLUMN live_reserved SET DEFAULT TRUE`);
+        await assertMalformedMigrationRejected();
+        const wrongDefaultAfterFailure = await isolated.query<{
+          readonly column_default: string | null;
+          readonly is_nullable: 'YES' | 'NO';
+        }>(`SELECT column_default,is_nullable FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='execution_intents'
+            AND column_name='live_reserved'`);
+        assert.deepEqual(wrongDefaultAfterFailure.rows, [{
+          column_default: 'true', is_nullable: 'NO',
+        }]);
+        assert.equal(
+          (await isolated.query<{ readonly live_reserved: boolean }>(
+            'SELECT live_reserved FROM execution_intents',
+          )).rows.every((row) => !row.live_reserved),
+          true,
+          'a wrong default must be rejected before the historical live backfill is committed',
+        );
+      }
+    } catch (error) {
+      bodyFailure = error;
+    }
+    const cleanupFailures = await collectCleanupFailures([
+      async () => { if (isolated !== undefined) await isolated.end(); },
+      async () => {
+        if (databaseCreated) {
+          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+            WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+          await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+        }
+      },
+      async () => { if (release !== undefined) await release(); },
+      async () => maintenance.end(),
+    ]);
+    if (bodyFailure !== undefined) {
+      throw new AggregateError([bodyFailure, ...cleanupFailures],
+        'Migration 040 malformed-schema test failed.', { cause: bodyFailure });
+    }
+    if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, 'Cleanup failed.');
+  });
+
 async function applyMigrationsBefore040(pool: InstanceType<typeof pg.Pool>): Promise<void> {
   const directory = new URL('../migrations/', import.meta.url);
   const names = (await readdir(directory))
@@ -175,13 +294,26 @@ async function applyMigrationsBefore040(pool: InstanceType<typeof pg.Pool>): Pro
   }
 }
 
-async function seedHistoricalLiveRoots(pool: InstanceType<typeof pg.Pool>): Promise<readonly string[]> {
-  const ids = '01234567'.split('').map(intentId);
+interface HistoricalLiveRoots {
+  readonly ids: readonly string[];
+  readonly lockTargetIntentId: string;
+  readonly lockedOnlyIntentId: string;
+}
+
+async function seedHistoricalLiveRoots(
+  pool: InstanceType<typeof pg.Pool>,
+): Promise<HistoricalLiveRoots> {
+  const ids = '012345678'.split('').map(intentId);
   for (const [index, id] of ids.entries()) await insertIntent(pool, id, index);
+  // Model independently sourced historical references so deleting either UNION branch is detected.
+  // Migration 039 constrains a newly locked armament to one intent, while migration 040 still
+  // promises to classify both columns conservatively when recovering pre-existing evidence.
+  await pool.query(`ALTER TABLE execution_activation_armaments
+    DROP CONSTRAINT execution_activation_armaments_state_check`);
   await pool.query('SET session_replication_role=replica');
   try {
-    await insertArmament(pool, ids[1] ?? '', 'ARMED', '1');
-    await insertArmament(pool, ids[2] ?? '', 'LOCKED', '2');
+    await insertArmament(pool, ids[1] ?? '', 'ARMED', '1', null);
+    await insertArmament(pool, ids[2] ?? '', 'LOCKED', '2', ids[3] ?? '');
     await pool.query(`INSERT INTO execution_pre_signature_locks (
       lock_id,lock_fingerprint,intent_id,attempt_number,intent_state_revision,armament_id,
       reservation_id,generation_id,wallet_public_key,provider_id,lease_token,message_hash,
@@ -193,10 +325,10 @@ async function seedHistoricalLiveRoots(pool: InstanceType<typeof pg.Pool>): Prom
     ) VALUES ($1,$2,$3,1,1,$4,$5,$6,$7,'provider',$8,$9,decode('aa','hex'),$10,
       decode('bb','hex'),$11,$12,$13,$14,$15,$16,$17,'PUMP_FUN',1,$18,$19,$20,$21,$22,$7,1,
       'AUTHORIZED',0,$20)`, [
-      entityId('execution_pre_signature_lock', '3'), hex('3'), ids[3],
-      entityId('execution_activation_armament', '3'),
-      entityId('execution_exposure_reservation', '3'),
-      entityId('execution_wallet_generation', '3'), base58('3'), randomUUID(), hex('4'),
+      entityId('execution_pre_signature_lock', '4'), hex('4'), ids[4],
+      entityId('execution_activation_armament', '4'),
+      entityId('execution_exposure_reservation', '4'),
+      entityId('execution_wallet_generation', '4'), base58('4'), randomUUID(), hex('5'),
       hex('5'), hex('6'), hex('7'), hex('8'), hex('9'), hex('a'), hex('b'), hex('c'),
       hex('d'), hex('e'), timestamp(-2), timestamp(2), hex('f'),
     ]);
@@ -208,9 +340,9 @@ async function seedHistoricalLiveRoots(pool: InstanceType<typeof pg.Pool>): Prom
       state,signed_at
     ) VALUES ($1,1,$2,1,$3,$4,'provider',$5,'SELL','PUMP_SWAP',$6,$7,$8,$9,$10,$11,
       $5,1,$12,decode('aa','hex'),$13,'PERSISTED',$10)`, [
-      entityId('execution_signed_transaction', '4'), ids[4],
-      entityId('execution_wallet_generation', '4'),
-      entityId('execution_exit_authorization', '4'), base58('4'), hex('4'), hex('5'),
+      entityId('execution_signed_transaction', '5'), ids[5],
+      entityId('execution_wallet_generation', '5'),
+      entityId('execution_exit_authorization', '5'), base58('5'), hex('5'), hex('6'),
       hex('6'), hex('7'), timestamp(-2), timestamp(2), base58('5', 64), hex('8'),
     ]);
     await pool.query(`INSERT INTO execution_live_positions (
@@ -221,22 +353,26 @@ async function seedHistoricalLiveRoots(pool: InstanceType<typeof pg.Pool>): Prom
     ) VALUES ($1,$2,$3,$4,$5,$5,$5,'PUMP_FUN',1,1,1,0,30000,$6::TIMESTAMPTZ,
       $6::TIMESTAMPTZ+INTERVAL '30 seconds',
       $7,'EXIT_PENDING',$8)`, [
-      entityId('execution_live_position', '5'), ids[5],
-      entityId('execution_wallet_generation', '5'),
-      entityId('execution_activation_armament', '5'), base58('6'), timestamp(-1), hex('9'), ids[6],
+      entityId('execution_live_position', '6'), ids[6],
+      entityId('execution_wallet_generation', '6'),
+      entityId('execution_activation_armament', '6'), base58('6'), timestamp(-1), hex('9'), ids[7],
     ]);
     await pool.query(`INSERT INTO execution_exit_authorizations (
       authorization_id,position_id,generation_id,wallet_public_key,mint,quote_mint,
       maximum_base_amount_raw,state,state_revision,locked_intent_id,locked_attempt_number,created_at
     ) VALUES ($1,$2,$3,$4,$4,$4,1,'LOCKED',1,$5,1,$6)`, [
-      entityId('execution_exit_authorization', '7'),
-      entityId('execution_live_position', '7'),
-      entityId('execution_wallet_generation', '7'), base58('7'), ids[7], timestamp(-1),
+      entityId('execution_exit_authorization', '8'),
+      entityId('execution_live_position', '8'),
+      entityId('execution_wallet_generation', '8'), base58('8'), ids[8], timestamp(-1),
     ]);
   } finally {
     await pool.query('SET session_replication_role=origin');
   }
-  return ids;
+  return {
+    ids,
+    lockTargetIntentId: ids[2] ?? '',
+    lockedOnlyIntentId: ids[3] ?? '',
+  };
 }
 
 async function insertIntent(
@@ -254,9 +390,10 @@ async function insertIntent(
 
 async function insertArmament(
   pool: InstanceType<typeof pg.Pool>, targetIntentId: string,
-  state: 'ARMED' | 'LOCKED', marker: string,
+  state: 'ARMED' | 'LOCKED', marker: string, lockedIntentId: string | null,
 ): Promise<void> {
   const locked = state === 'LOCKED';
+  assert.equal(lockedIntentId !== null, locked);
   await pool.query(`INSERT INTO execution_activation_armaments (
     armament_id,payload_version,armament_fingerprint,qualification_id,qualification_fingerprint,
     generation_id,authorization_id,state,state_revision,phase,build_hash,configuration_fingerprint,
@@ -283,7 +420,7 @@ async function insertArmament(
     timestamp(-1), timestamp(3), hex('e'), hex('f'), targetIntentId, hex(marker),
     entityId('execution_risk_admission', marker),
     entityId('execution_exposure_reservation', marker), hex('a'), hex('b'), hex('c'),
-    locked ? targetIntentId : null, locked ? 1 : null,
+    lockedIntentId, locked ? 1 : null,
     locked ? entityId('execution_exposure_reservation', marker) : null,
     locked ? randomUUID() : null, locked ? timestamp(0) : null,
   ]);
