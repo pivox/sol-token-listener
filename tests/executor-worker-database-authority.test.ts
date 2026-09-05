@@ -397,6 +397,7 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       await assertExactColumnAuthority(isolated);
       await assertDynamicExecutionInventory(isolated);
       await assertClosedObjectAuthority(worker, privateSchema, isolated);
+      await assertWorkerLivePartition(worker, isolated);
 
       const publicParameterProbe = await isolated.connect();
       let parameterProbeFailed = false;
@@ -756,6 +757,122 @@ async function assertClosedObjectAuthority(
         AND namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')`,
     [WORKER_ROLE],
   )).rows[0]?.count, '0');
+}
+
+async function assertWorkerLivePartition(
+  worker: InstanceType<typeof pg.Pool>,
+  admin: InstanceType<typeof pg.Pool>,
+): Promise<void> {
+  const nonLiveId = `execution_intent_${'1'.repeat(64)}`;
+  const liveId = `execution_intent_${'2'.repeat(64)}`;
+  const raceId = `execution_intent_${'3'.repeat(64)}`;
+  await insertPartitionIntent(admin, nonLiveId, 'non-live', false);
+  await insertPartitionIntent(admin, liveId, 'live', true);
+  await insertPartitionIntent(admin, raceId, 'race', false);
+  await admin.query(`INSERT INTO execution_attempts (
+    intent_id,attempt_number,status,started_at
+  ) VALUES ($1,1,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [liveId]);
+
+  assert.deepEqual((await worker.query<{ readonly id: string }>(
+    'SELECT id FROM execution_intents WHERE id=ANY($1::TEXT[]) ORDER BY id',
+    [[nonLiveId, liveId]],
+  )).rows, [{ id: nonLiveId }]);
+  assert.deepEqual((await worker.query<{ readonly intent_id: string }>(
+    'SELECT intent_id FROM execution_attempts WHERE intent_id=$1', [liveId],
+  )).rows, []);
+  assert.equal((await worker.query(`UPDATE execution_intents SET
+      status='PROCESSING',attempt_count=1,state_revision=1,lease_owner='worker',
+      lease_token=$2,lease_expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 minute',
+      last_reason_code='EXECUTION_STARTED',updated_at=date_trunc('milliseconds',statement_timestamp())
+    WHERE id=$1`, [liveId, randomUUID()])).rowCount, 0);
+  assert.equal((await worker.query(`UPDATE execution_intents SET
+      status='FAILED',state_revision=1,last_reason_code='BUY_SIMULATION_FAILED',
+      terminal_at=date_trunc('milliseconds',statement_timestamp()),
+      updated_at=date_trunc('milliseconds',statement_timestamp()) WHERE id=$1`, [liveId])).rowCount, 0);
+  await assert.rejects(worker.query(`INSERT INTO execution_attempts (
+    intent_id,attempt_number,status,started_at
+  ) VALUES ($1,2,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [liveId]),
+  /row-level security|live_reserved|reserved/iu);
+  await worker.query(`INSERT INTO execution_attempts (
+    intent_id,attempt_number,status,started_at
+  ) VALUES ($1,1,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [nonLiveId]);
+  assert.deepEqual((await worker.query<{ readonly intent_id: string }>(
+    'SELECT intent_id FROM execution_attempts WHERE intent_id=$1', [nonLiveId],
+  )).rows, [{ intent_id: nonLiveId }]);
+
+  await worker.query('SET row_security=off');
+  try {
+    await assert.rejects(
+      worker.query('SELECT id FROM execution_intents WHERE id=ANY($1::TEXT[])', [
+        [nonLiveId, liveId],
+      ]),
+      /row-level security/iu,
+    );
+  } finally {
+    await worker.query('RESET row_security');
+  }
+
+  const childWriter = await worker.connect();
+  const promoter = await admin.connect();
+  let writerCommitted = false;
+  try {
+    await childWriter.query('BEGIN');
+    await childWriter.query(`INSERT INTO execution_attempts (
+      intent_id,attempt_number,status,started_at
+    ) VALUES ($1,1,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [raceId]);
+    const promoterPid = (await promoter.query<{ readonly pid: number }>(
+      'SELECT pg_backend_pid() AS pid',
+    )).rows[0]?.pid;
+    assert.ok(promoterPid !== undefined);
+    const promotion = promoter.query(
+      'UPDATE execution_intents SET live_reserved=TRUE WHERE id=$1', [raceId],
+    );
+    await waitForLock(admin, promoterPid);
+    await childWriter.query('COMMIT');
+    writerCommitted = true;
+    assert.equal((await promotion).rowCount, 1);
+  } finally {
+    if (!writerCommitted) await childWriter.query('ROLLBACK');
+    childWriter.release();
+    promoter.release();
+  }
+  assert.deepEqual((await worker.query(
+    'SELECT intent_id FROM execution_attempts WHERE intent_id=$1', [raceId],
+  )).rows, []);
+  await assert.rejects(worker.query(`INSERT INTO execution_attempts (
+    intent_id,attempt_number,status,started_at
+  ) VALUES ($1,2,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [raceId]),
+  /row-level security|live_reserved|reserved/iu);
+}
+
+async function insertPartitionIntent(
+  admin: InstanceType<typeof pg.Pool>, id: string, suffix: string, liveReserved: boolean,
+): Promise<void> {
+  await admin.query(`INSERT INTO execution_intents (
+    id,logical_order_key,strategy_id,strategy_version,position_id,logical_command_id,mint,side,
+    venue_policy,quote_mint,quote_token_program,quote_decimals,quote_amount_raw,
+    minimum_amount_out_raw,decision_event_id,decision_fingerprint,requested_at,expires_at,status,
+    live_reserved
+  ) VALUES ($1,$2,'worker-partition',1,$3,$4,$5,'BUY','PUMP_FUN_ONLY',$5,'SPL_TOKEN',9,
+    1,1,$6,$7,date_trunc('milliseconds',statement_timestamp()),
+    date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 minute','PENDING',$8)`, [
+    id, `worker-partition-${suffix}`, `position-${suffix}`, `command-${suffix}`,
+    '11111111111111111111111111111111', `decision-${suffix}`, 'a'.repeat(64), liveReserved,
+  ]);
+}
+
+async function waitForLock(
+  admin: InstanceType<typeof pg.Pool>, processId: number,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const row = (await admin.query<{ readonly wait_event_type: string | null }>(
+      'SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [processId],
+    )).rows[0];
+    if (row?.wait_event_type === 'Lock') return;
+    await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+  }
+  assert.fail('Concurrent live promotion did not wait for the child writer parent lock.');
 }
 
 function quoteIdentifier(value: string): string {
