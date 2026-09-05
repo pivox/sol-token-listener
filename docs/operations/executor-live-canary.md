@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.6.0 — 2026-09-05
+**Version :** 1.7.0 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -8,8 +8,9 @@ signature ni soumission. #51-H2b publie séparément
 `executor:live:dev` et `executor:live:start`. #51-H2c ajoute les gates, un
 armement V2 lié à une intention BUY exacte, le lock durable avant signature et
 sa récupération fail-closed. #51-H2d ajoute le bootstrap non signant des
-snapshots wallet/provider. Cette livraison prépare un préflight externe sans
-armer ni démarrer un canary.
+snapshots wallet/provider. #51-H2e produit l'attestation de quota Helius
+consommée par H2d. Cette livraison prépare un préflight externe sans armer ni
+démarrer un canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
 briques #51-G ne prouvent ni rentabilité, ni sellabilité générale, ni avantage
@@ -68,6 +69,50 @@ checkout. Le rôle opérations ne peut ni lire les bytes signés ou non signés,
 ni armer des champs runtime arbitraires, ni modifier les intents ; H2a,
 listener et API ne gagnent aucune autorité H2c.
 
+## Produire la preuve Helius H2e
+
+Créer trois fichiers hors Git dans un répertoire privé : la clé API Helius, une
+clé d'attestation Ed25519 dédiée et la future enveloppe. La clé d'attestation
+n'est pas une clé Solana. Les deux entrées doivent appartenir au compte courant
+et avoir un mode exact `0400` ou `0600`.
+
+La clé Ed25519 peut être créée hors dépôt avec OpenSSL :
+
+```bash
+umask 077
+openssl genpkey -algorithm ED25519 \
+  -out /chemin/hors-git/provider-attestation-key.pem
+chmod 0600 /chemin/hors-git/provider-attestation-key.pem
+chmod 0600 /chemin/hors-git/helius-api-key
+```
+
+Créer un environnement H2e séparé :
+
+```dotenv
+HELIUS_PROJECT_ID=<uuid-visible-dans-le-dashboard-helius>
+HELIUS_API_KEY_PATH=/chemin/hors-git/helius-api-key
+EXECUTOR_RPC_PROVIDER_ID=helius-primary
+EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH=/chemin/hors-git/provider-attestation-key.pem
+EXECUTOR_PROVIDER_EVIDENCE_PATH=/chemin/hors-git/provider-evidence.json
+EXECUTOR_PROVIDER_EVIDENCE_TTL_MS=300000
+EXECUTOR_PROVIDER_EVIDENCE_TIMEOUT_MS=5000
+```
+
+Ce fichier ne doit contenir aucun nom de variable wallet, live, RPC Solana ou
+PostgreSQL, même vide. Exécuter immédiatement avant H2d :
+
+```bash
+npm run build:backend
+DOTENV_CONFIG_PATH=/chemin/hors-git/provider-evidence.env \
+  npm run executor:provider-evidence:start
+```
+
+Auditer le manifeste redacted puis recopier uniquement sa
+`evidencePublicKeyBase64` et le chemin de sortie dans l'environnement H2d. La
+commande fait exactement une lecture Helius Admin API, sans retry, et n'expose
+ni clé API, ni projet UUID, ni quota détaillé. Son succès signifie seulement
+`PROVIDER_EVIDENCE_COLLECTED / CANARY_NOT_STARTED`.
+
 ## Collecter les preuves publiques H2d
 
 Créer un environnement dédié hors Git contenant exactement les variables
@@ -78,7 +123,7 @@ DATABASE_URL=postgresql://<login-readiness-dedie>:...@<postgres16>/<database>
 SOLANA_CLUSTER=mainnet-beta
 SOLANA_HTTP_RPC_URL=https://<endpoint-mainnet-qualifie>
 SOLANA_EXPECTED_GENESIS_HASH=<genesis-mainnet-verifie-independamment>
-EXECUTOR_RPC_PROVIDER_ID=primary
+EXECUTOR_RPC_PROVIDER_ID=helius-primary
 EXECUTOR_PUBLIC_KEY=<adresse-publique-base58>
 EXECUTOR_WALLET_GENERATION_NUMBER=1
 EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64=<cle-publique-ed25519-spki-der-base64>

@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.6
+**Version de spécification :** 1.2.8
 
-**Version de la spécification parente :** 1.11.6
+**Version de la spécification parente :** 1.11.9
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,12 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.8 — 2026-09-05 :** exige que H2e reste frais après sa signature et
+  son écriture avant tout handoff vers H2d.
+
+- **1.2.7 — 2026-09-05 :** livre H2e, producteur externe Helius borné qui
+  génère l'attestation provider H2d sans accès wallet, DB ou live.
 
 - **1.2.6 — 2026-09-05 :** livre le producteur H2d non signant des identités
   wallet/provider, atomique et sous rôle PostgreSQL dédié, tout en maintenant
