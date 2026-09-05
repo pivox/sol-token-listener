@@ -9,7 +9,12 @@ import { PostgresExecutionReadinessRepository } from
   '../storage/execution-readiness.repository.js';
 
 export const EXECUTION_READINESS_ROLE = 'sol_token_executor_readiness';
-type ColumnPrivilege = readonly [table: string, column: string, privilege: string];
+type ColumnPrivilege = readonly [
+  grantee: string,
+  table: string,
+  column: string,
+  privilege: string,
+];
 
 export const EXECUTION_READINESS_COLUMN_PRIVILEGES: readonly ColumnPrivilege[] = Object.freeze([
   ...columnPrivileges('migration_history', 'SELECT', ['version']),
@@ -62,6 +67,7 @@ export const EXECUTION_READINESS_COLUMN_PRIVILEGES: readonly ColumnPrivilege[] =
   ...columnPrivileges('execution_provider_usage_snapshots', 'UPDATE', [
     'superseded_at', 'purge_after',
   ]),
+  ...columnPrivileges('execution_live_positions', 'SELECT', ['wallet_public_key', 'state']),
 ].sort(compareColumnPrivileges));
 
 export const EXECUTION_READINESS_AUTHORITY_SQL = `SELECT
@@ -85,12 +91,14 @@ export const EXECUTION_READINESS_AUTHORITY_SQL = `SELECT
     AS readiness_membership,
   (SELECT COUNT(*)::TEXT FROM pg_auth_members parent WHERE parent.member=target.oid)
     AS role_parent_count,
-  (SELECT COALESCE(jsonb_agg(jsonb_build_array(privilege.table_name,
-      privilege.column_name,privilege.privilege_type)
-      ORDER BY privilege.table_name,privilege.column_name,privilege.privilege_type),
+  (SELECT COALESCE(jsonb_agg(jsonb_build_array(privilege.grantee,
+      privilege.table_name,privilege.column_name,privilege.privilege_type)
+      ORDER BY privilege.grantee,privilege.table_name,privilege.column_name,
+        privilege.privilege_type),
       '[]'::jsonb)::TEXT
     FROM information_schema.column_privileges privilege
-    WHERE privilege.grantee=current_user AND privilege.table_schema='public')
+    WHERE privilege.grantee IN (current_user,'PUBLIC')
+      AND privilege.table_schema='public')
     AS column_privileges,
   has_schema_privilege(current_user,'public','USAGE') AS schema_usage,
   has_schema_privilege(current_user,'public','CREATE') AS schema_create,
@@ -211,12 +219,14 @@ function columnPrivileges(
   privilege: string,
   columns: readonly string[],
 ): ColumnPrivilege[] {
-  return columns.map((column) => Object.freeze([table, column, privilege] as const));
+  return columns.map((column) => Object.freeze([
+    EXECUTION_READINESS_ROLE, table, column, privilege,
+  ] as const));
 }
 
 function compareColumnPrivileges(left: ColumnPrivilege, right: ColumnPrivilege): number {
   return left[0].localeCompare(right[0]) || left[1].localeCompare(right[1])
-    || left[2].localeCompare(right[2]);
+    || left[2].localeCompare(right[2]) || left[3].localeCompare(right[3]);
 }
 
 function validColumnPrivileges(value: unknown): boolean {
@@ -227,8 +237,9 @@ function validColumnPrivileges(value: unknown): boolean {
       || parsed.length !== EXECUTION_READINESS_COLUMN_PRIVILEGES.length) return false;
     return parsed.every((entry, index) => {
       const expected = EXECUTION_READINESS_COLUMN_PRIVILEGES[index];
-      return Array.isArray(entry) && entry.length === 3 && expected !== undefined
-        && entry[0] === expected[0] && entry[1] === expected[1] && entry[2] === expected[2];
+      return Array.isArray(entry) && entry.length === 4 && expected !== undefined
+        && entry[0] === expected[0] && entry[1] === expected[1]
+        && entry[2] === expected[2] && entry[3] === expected[3];
     });
   } catch {
     return false;

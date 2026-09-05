@@ -148,7 +148,8 @@ function validAuthority(): Readonly<Record<string, unknown>> {
 
 function driftedPrivileges(): string {
   const privileges = EXECUTION_READINESS_COLUMN_PRIVILEGES.map((entry) => [...entry]);
-  privileges[0] = ['execution_signed_transactions', 'signed_transaction_bytes', 'SELECT'];
+  privileges[0] = ['PUBLIC', 'execution_signed_transactions',
+    'signed_transaction_bytes', 'SELECT'];
   return JSON.stringify(privileges);
 }
 

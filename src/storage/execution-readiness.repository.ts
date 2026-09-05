@@ -22,6 +22,8 @@ const PROVIDER_SNAPSHOT_KEYS = Object.freeze([
   'billingPeriodId', 'billingPeriodStartedAtMs', 'billingPeriodEndsAtMs',
   'limitUnits', 'usedUnits', 'measuredAtMs', 'expiresAtMs', 'provenance',
 ] as const);
+const COMMIT_FRESHNESS_MARGIN_MS = 5_000;
+const INTERNAL_ERRORS = new WeakSet<ExecutionReadinessRepositoryError>();
 
 export type ExecutionReadinessRepositoryErrorCode =
   | 'INVALID_INPUT'
@@ -62,14 +64,16 @@ export class PostgresExecutionReadinessRepository implements ExecutionReadinessR
         [input.generation.generationId]);
       await persistGeneration(client, input.generation);
       await validateInitialRiskState(client, input.generation.generationId);
+      await validateNoActiveWalletPositions(client, input.generation.walletPublicKey);
       await appendWalletSnapshotInTransaction(client, input.walletSnapshot);
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))',
         [input.providerSnapshot.providerId]);
       await appendProviderUsageInTransaction(client, input.providerSnapshot);
+      await validateProviderEvidenceFreshness(client, input.providerSnapshot.expiresAtMs);
       commitStarted = true;
       await client.query('COMMIT');
       return input;
-    } catch {
+    } catch (error) {
       if (transactionStarted && !commitStarted) {
         try { await client.query('ROLLBACK'); } catch {
           client.release(true);
@@ -79,10 +83,37 @@ export class PostgresExecutionReadinessRepository implements ExecutionReadinessR
       }
       client.release(true);
       released = true;
+      if (error instanceof ExecutionReadinessRepositoryError && INTERNAL_ERRORS.has(error)) {
+        throw error;
+      }
       throw failure(commitStarted ? 'COMMIT_OUTCOME_UNKNOWN' : 'DATABASE_FAILURE');
     } finally {
       if (!released) client.release();
     }
+  }
+}
+
+async function validateNoActiveWalletPositions(
+  client: ExecutionRiskClient,
+  walletPublicKey: string,
+): Promise<void> {
+  const result = await client.query(`SELECT COUNT(*)::TEXT AS active_position_count
+    FROM execution_live_positions
+    WHERE wallet_public_key=$1 AND state IN ('OPEN','EXIT_PENDING','UNKNOWN')`, [walletPublicKey]);
+  if (result.rows.length !== 1 || result.rows[0]?.active_position_count !== '0') {
+    throw failure('CONFLICT');
+  }
+}
+
+async function validateProviderEvidenceFreshness(
+  client: ExecutionRiskClient,
+  expiresAtMs: number,
+): Promise<void> {
+  const result = await client.query(`SELECT ($1::NUMERIC >=
+    trunc(EXTRACT(EPOCH FROM clock_timestamp())*1000)::NUMERIC+$2::NUMERIC)
+    AS evidence_fresh`, [expiresAtMs, COMMIT_FRESHNESS_MARGIN_MS]);
+  if (result.rows.length !== 1 || result.rows[0]?.evidence_fresh !== true) {
+    throw failure('CONFLICT');
   }
 }
 
@@ -197,5 +228,7 @@ function exactFrozenRecord<const Keys extends readonly string[]>(
 }
 
 function failure(code: ExecutionReadinessRepositoryErrorCode): ExecutionReadinessRepositoryError {
-  return new ExecutionReadinessRepositoryError(code);
+  const error = new ExecutionReadinessRepositoryError(code);
+  INTERNAL_ERRORS.add(error);
+  return error;
 }

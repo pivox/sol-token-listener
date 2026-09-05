@@ -1388,6 +1388,9 @@ GRANT SELECT (
 ), UPDATE (superseded_at,purge_after)
 ON TABLE execution_provider_usage_snapshots TO sol_token_executor_readiness;
 
+GRANT SELECT (wallet_public_key,state)
+ON TABLE execution_live_positions TO sol_token_executor_readiness;
+
 GRANT SELECT ON TABLE
   execution_wallet_generations,
   execution_wallet_risk_state,

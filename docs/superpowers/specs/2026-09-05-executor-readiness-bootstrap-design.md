@@ -1,6 +1,6 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.0.4
 
 **Version de la spécification parente :** 1.11.6
 
@@ -13,6 +13,11 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.4 — 2026-09-05 :** ferme les trois constats du deuxième cycle de
+  revue : privilèges effectifs hérités de `PUBLIC`, fraîcheur au commit selon
+  l'horloge PostgreSQL et positions actives recherchées sur toutes les
+  générations du wallet.
 
 - **1.0.3 — 2026-09-05 :** ferme les quatre constats du premier cycle de
   revue : ACL exactes par tuple, expiration revérifiée après la collecte,
@@ -179,6 +184,10 @@ conserve le comportement existant : rejeu exact idempotent,
 supersession du snapshot précédent sous verrou provider et conflit sur toute
 divergence.
 
+Juste avant le commit, le repository relit l'horloge PostgreSQL et exige encore
+au moins cinq secondes de validité sur la preuve provider. Une attente de pool,
+de verrou ou de transaction qui consomme cette marge annule tout le commit.
+
 ## 7. Manifeste de sortie
 
 Après commit atomique de la génération et des deux snapshots, stdout contient
@@ -240,9 +249,11 @@ Chaque checkout force `SET ROLE sol_token_executor_readiness`,
 revalide PostgreSQL 16, le membership exact, la migration 039 et l'allowlist
 effective complète.
 
-L'allowlist de colonnes est comparée tuple par tuple (`table`, `colonne`,
-`privilège`) dans un ordre canonique. Une dérive qui révoque un droit autorisé
-et ajoute un droit sensible avec la même cardinalité est donc refusée.
+L'allowlist de colonnes est comparée tuple par tuple (`grantee`, `table`,
+`colonne`, `privilège`) dans un ordre canonique. Les droits accordés à
+`PUBLIC` sont inclus dans l'observation effective. Une dérive qui révoque un
+droit autorisé et ajoute un droit sensible avec la même cardinalité est donc
+refusée.
 
 ## 9. Atomicité, reprise et rétention
 
@@ -250,11 +261,14 @@ Une exécution utilise une transaction unique après la collecte réseau :
 
 1. verrou génération ;
 2. validation ou insertion de la génération ;
-3. validation ou insertion du snapshot wallet ;
-4. verrou provider ;
-5. validation/supersession puis insertion du snapshot provider ;
-6. commit ;
-7. rendu du manifeste depuis les objets commités.
+3. vérification qu'aucune génération du même wallet ne porte une position
+   `OPEN`, `EXIT_PENDING` ou `UNKNOWN` ;
+4. validation ou insertion du snapshot wallet ;
+5. verrou provider ;
+6. validation/supersession puis insertion du snapshot provider ;
+7. contrôle de fraîcheur sur l'horloge PostgreSQL ;
+8. commit ;
+9. rendu du manifeste depuis les objets commités.
 
 Un crash avant commit ne laisse aucune projection partielle. Un replay exact
 retourne les mêmes identifiants. Une collecte différente crée de nouveaux
