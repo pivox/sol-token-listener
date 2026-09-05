@@ -230,7 +230,7 @@ void test('SELL NO_EFFECT activation fences a concurrent live BUY claim before g
 
         buyClaim = intents.claim({
           ownerId: 'live-buy-during-sell-activation', leaseMs: 60_000,
-          purpose: 'LIVE_EXECUTE', side: 'BUY',
+          purpose: 'LIVE_EXECUTE', side: 'BUY', generationId,
         });
         const outcome = await Promise.race([
           buyClaim.then(() => 'CLAIM_SETTLED' as const),
@@ -293,7 +293,7 @@ void test('SELL signed persistence fences a live BUY when PROCESSING expired dur
 
           buyClaim = intents.claim({
             ownerId: 'live-buy-during-sell-persist', leaseMs: 60_000,
-            purpose: 'LIVE_EXECUTE', side: 'BUY',
+            purpose: 'LIVE_EXECUTE', side: 'BUY', generationId,
           });
           const outcome = await Promise.race([
             buyClaim.then(() => 'CLAIM_SETTLED' as const),

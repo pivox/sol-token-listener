@@ -132,6 +132,7 @@ export function createProductionLiveExecutorLanes(input: Readonly<{
     ownerId,
     leaseMs: input.config.leaseMs,
     phase: input.config.phase,
+    generationId: input.config.generationId,
     intents: input.database.intents,
     executeFresh: async (context, signal, renew) => {
       const authority = new LiveTransactionCandidateAuthority();

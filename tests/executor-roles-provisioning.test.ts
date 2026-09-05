@@ -560,7 +560,7 @@ void test('provisioned retention role runs the complete purge without reading si
       const liveIntents = new PostgresExecutionIntentRepository(livePool);
       const claim = await liveIntents.claim({
         ownerId: 'h2b-role-test', leaseMs: 30_000,
-        purpose: 'LIVE_EXECUTE', side: 'BUY',
+        purpose: 'EXECUTE',
       });
       assert.ok(claim);
       assert.equal(claim.intent.id, created.intent.id);

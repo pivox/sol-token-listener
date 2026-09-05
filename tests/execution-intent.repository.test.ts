@@ -197,7 +197,10 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
       status: 'PROCESSING', side: 'SELL',
     },
     {
-      options: { ownerId: 'worker-1', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'BUY' },
+      options: {
+        ownerId: 'worker-1', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+        generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+      },
       status: 'PENDING', side: 'BUY',
     },
     {
@@ -246,8 +249,24 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
     const sql = claimCall.text;
     if (options.purpose === 'LIVE_EXECUTE') {
       assert.match(sql, new RegExp(`intent\\.side\\s*=\\s*'${options.side}'`, 'u'));
-      assert.match(sql, /intent\.status IN \('PENDING', 'RETRY_READY', 'PROCESSING'\)/u);
-      assert.match(sql, /intent\.expires_at\s*>\s*statement_timestamp\(\)/u);
+      if (options.side === 'SELL') {
+        assert.match(sql, /intent\.status IN \('PENDING', 'RETRY_READY', 'PROCESSING'\)/u);
+      } else {
+        assert.match(sql, /intent\.status\s*=\s*'PENDING'/u);
+        assert.doesNotMatch(sql, /intent\.status IN \('PENDING', 'RETRY_READY', 'PROCESSING'\)/u);
+        assert.match(sql, /execution_activation_armaments AS armament/u);
+        assert.match(sql, /armament\.generation_id\s*=\s*\$4/u);
+        assert.match(sql, /armament\.payload_version\s*=\s*2/u);
+        assert.match(sql, /armament\.state\s*=\s*'ARMED'/u);
+        assert.match(sql, /armament\.state_revision\s*=\s*0/u);
+        assert.match(sql, /armament\.consumed_buys\s*=\s*0/u);
+        assert.equal(claimCall.values?.[3], options.generationId);
+      }
+      if (options.side === 'SELL') {
+        assert.match(sql, /intent\.expires_at\s*>\s*statement_timestamp\(\)/u);
+      } else {
+        assert.match(sql, /intent\.expires_at>operation\.at\+\(\$2::BIGINT\*INTERVAL '1 millisecond'\)/u);
+      }
       if (options.side === 'BUY') {
         assert.equal(client.calls[0]?.text, 'BEGIN ISOLATION LEVEL READ COMMITTED');
         assert.match(client.calls[1]?.text ?? '', /execution-live-sell-presence:v1/u);
@@ -255,7 +274,11 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
         assert.match(sql, /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_intents AS blocking_sell/su);
         assert.match(sql, /blocking_sell\.side\s*=\s*'SELL'/u);
         assert.match(sql, /blocking_sell\.status\s*=\s*'SIGNED_NOT_SUBMITTED'/u);
-        const blockingPredicate = required(/NOT EXISTS\s*\(([\s\S]*?)\)\s*AND\s*\(intent\.lease_expires_at/u.exec(sql)?.[1]);
+        const blockingStart = sql.indexOf('NOT EXISTS');
+        const blockingEnd = sql.indexOf('ORDER BY', blockingStart);
+        const blockingPredicate = blockingStart < 0 || blockingEnd < 0
+          ? undefined : sql.slice(blockingStart, blockingEnd);
+        assert.ok(blockingPredicate);
         assert.doesNotMatch(blockingPredicate, /blocking_sell\.lease_expires_at/u);
       } else {
         assert.doesNotMatch(sql, /blocking_sell/u);
@@ -294,6 +317,12 @@ void test('live claim options are closed and rejected before connecting', async 
   const invalid: readonly unknown[] = [
     { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_EXECUTE' },
     { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'OTHER' },
+    { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'BUY' },
+    { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'BUY', generationId: 'other' },
+    {
+      ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'SELL',
+      generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+    },
     { ownerId: 'worker', leaseMs: 30_000, purpose: 'LIVE_RECOVER', side: 'OTHER' },
     { ownerId: 'worker', leaseMs: 30_000, purpose: 'EXECUTE', side: 'BUY' },
   ];
@@ -414,10 +443,15 @@ void test('claim cancellation fences connect without dispatching SQL and preserv
           release: (error?: boolean) => { releaseErrors.push(error); },
         }),
       });
-      const pending = repository.claim({
-        ownerId: 'live-buy-cancelled-after-lock-wait', leaseMs: 30_000,
-        purpose, side: 'BUY',
-      }, controller.signal);
+      const pending = repository.claim(purpose === 'LIVE_EXECUTE'
+        ? {
+          ownerId: 'live-buy-cancelled-after-lock-wait', leaseMs: 30_000,
+          purpose, side: 'BUY', generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+        }
+        : {
+          ownerId: 'live-buy-cancelled-after-lock-wait', leaseMs: 30_000,
+          purpose, side: 'BUY',
+        }, controller.signal);
       await lockStarted.promise;
       controller.abort();
       lockGate.resolve(result([], 1));
@@ -1639,6 +1673,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     assert.equal(firstSellClaim.intent.id, oldestSell.id);
     assert.equal(await second.claim({
       ownerId: 'live-buy-blocked-a', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+      generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
     }), null);
     assert.equal(await first.release(firstSellClaim), true);
     await firstPool.query('DELETE FROM execution_intents WHERE id=$1', [oldestSell.id]);
@@ -1649,12 +1684,35 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     assert.equal(secondSellClaim.intent.id, newestSell.id);
     assert.equal(await first.claim({
       ownerId: 'live-buy-blocked-b', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+      generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
     }), null);
     await firstPool.query('DELETE FROM execution_intents WHERE id=$1', [newestSell.id]);
+    assert.equal(await first.claim({
+      ownerId: 'live-buy-unarmed', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+      generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+    }), null);
+    await seedLiveExecuteBuyTarget(firstPool, oldestBuy);
     const buyClaim = required(await first.claim({
       ownerId: 'live-buy', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+      generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
     }));
     assert.equal(buyClaim.intent.id, oldestBuy.id);
+    assert.equal(await first.release(buyClaim), true);
+    const concurrentTargetBuy = await Promise.all([
+      first.claim({
+        ownerId: 'live-target-buy-a', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+        generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+      }),
+      second.claim({
+        ownerId: 'live-target-buy-b', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+        generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+      }),
+    ]);
+    assert.equal(concurrentTargetBuy.filter((claim) => claim !== null).length, 1);
+    assert.equal(required(concurrentTargetBuy.find((claim) => claim !== null)).intent.id, oldestBuy.id);
+    await firstPool.query('DELETE FROM execution_activation_armaments WHERE target_intent_id=$1', [oldestBuy.id]);
+    await firstPool.query('DELETE FROM execution_exposure_reservations WHERE intent_id=$1', [oldestBuy.id]);
+    await firstPool.query('DELETE FROM execution_risk_admission_reports WHERE intent_id=$1', [oldestBuy.id]);
     await firstPool.query('DELETE FROM execution_intents WHERE id=$1', [oldestBuy.id]);
 
     const concurrentSell = executionDraft('live-concurrent-sell', {
@@ -1687,6 +1745,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
       first.claim({
         ownerId: 'live-raced-buy-worker', leaseMs: 60_000,
         purpose: 'LIVE_EXECUTE', side: 'BUY',
+        generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
       }),
       second.claim({
         ownerId: 'live-raced-sell-worker', leaseMs: 60_000,
@@ -1719,6 +1778,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     assert.equal(await second.claim({
       ownerId: 'live-buy-blocked-recovery', leaseMs: 60_000,
       purpose: 'LIVE_EXECUTE', side: 'BUY',
+      generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
     }), null);
     assert.equal(await second.claim({
       ownerId: 'reconcile-must-not-recover', leaseMs: 60_000, purpose: 'RECONCILE',
@@ -1876,6 +1936,7 @@ void test('LIVE_EXECUTE BUY forces READ COMMITTED and observes an uncommitted SE
         buyClaim = second.claim({
           ownerId: 'live-buy-sell-creation-race-worker', leaseMs: 60_000,
           purpose: 'LIVE_EXECUTE', side: 'BUY',
+          generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
         });
         const outcome = await Promise.race([
           buyClaim.then(() => 'CLAIM_SETTLED' as const),
@@ -2492,6 +2553,88 @@ function executionDraft(
     requestedAtMs: NOW_MS - 1_000, expiresAtMs: NOW_MS + 60_000,
     ...overrides,
   });
+}
+
+async function seedLiveExecuteBuyTarget(
+  pool: InstanceType<typeof pg.Pool>,
+  intent: ExecutionIntentDraftV1,
+): Promise<void> {
+  const client = await pool.connect();
+  const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
+  const qualificationId = `execution_safety_qualification_${'b'.repeat(64)}`;
+  const reportId = `execution_risk_admission_${'e'.repeat(64)}`;
+  const reservationId = `execution_exposure_reservation_${'f'.repeat(64)}`;
+  const now = "date_trunc('milliseconds',statement_timestamp())";
+  try {
+    // The armament itself is tested by its own guarded write suite. This fixture
+    // isolates the repository claim predicate from that upstream construction path.
+    await client.query('SET session_replication_role=replica');
+    await client.query(`INSERT INTO execution_wallet_generations (
+      generation_id,wallet_public_key,cluster,genesis_hash,generation
+    ) VALUES ($1,'11111111111111111111111111111111','mainnet-beta',
+      '11111111111111111111111111111111',1)`, [generationId]);
+    await client.query(`INSERT INTO execution_safety_qualifications (
+      qualification_id,evaluator_version,qualification_fingerprint,phase,build_hash,
+      configuration_fingerprint,strategy_fingerprint,generation_id,wallet_public_key,cluster,
+      genesis_hash,provider_id,qualified_at,expires_at,purge_after
+    ) VALUES ($1,1,'${'1'.repeat(64)}','CANARY','${'2'.repeat(64)}','${'3'.repeat(64)}',
+      '${'4'.repeat(64)}',$2,'11111111111111111111111111111111','mainnet-beta',
+      '11111111111111111111111111111111','provider',${now},${now}+INTERVAL '5 minutes',
+      ${now}+INTERVAL '4 hours 5 minutes')`, [qualificationId, generationId]);
+    await client.query(`INSERT INTO execution_provider_usage_snapshots (
+      snapshot_id,snapshot_fingerprint,provider_id,plan_id,billing_period_id,
+      billing_period_started_at,billing_period_ends_at,limit_units,used_units,measured_at,
+      expires_at,provenance
+    ) VALUES ('execution_provider_usage_${'b'.repeat(64)}','${'d'.repeat(64)}','provider',
+      'plan','period',${now}-INTERVAL '1 minute',${now}+INTERVAL '10 minutes',100,0,
+      ${now}-INTERVAL '1 second',${now}+INTERVAL '5 minutes','OPERATOR_REPORT')`);
+    await client.query(`INSERT INTO execution_risk_admission_reports (
+      report_id,report_fingerprint,input_fingerprint,intent_id,generation_id,policy_fingerprint,
+      wallet_snapshot_fingerprint,provider_snapshot_fingerprint,decision,quote_amount_raw,
+      projected_capital_raw,projected_exposure_raw,projected_drawdown_raw,quota_state,
+      wallet_state_revision
+    ) VALUES ($1,'${'9'.repeat(64)}','${'a'.repeat(64)}',$2,$3,'${'b'.repeat(64)}',
+      '${'c'.repeat(64)}','${'d'.repeat(64)}','ADMITTED',$4,1,1,0,'NORMAL',0)`, [
+      reportId, intent.id, generationId, intent.quoteAmountRaw?.toString(),
+    ]);
+    await client.query(`INSERT INTO execution_exposure_reservations (
+      reservation_id,intent_id,generation_id,admission_report_id,position_id,side,mint,quote_mint,
+      maximum_amount_raw,intent_fingerprint,policy_fingerprint,wallet_snapshot_fingerprint,
+      provider_snapshot_fingerprint,state
+    ) VALUES ($1,$2,$3,$4,$5,'BUY',$6,$7,$8,'${'e'.repeat(64)}','${'b'.repeat(64)}',
+      '${'c'.repeat(64)}','${'d'.repeat(64)}','RESERVED')`, [
+      reservationId, intent.id, generationId, reportId, intent.positionId, intent.mint,
+      intent.quoteMint, intent.quoteAmountRaw?.toString(),
+    ]);
+    await client.query(`INSERT INTO execution_activation_armaments (
+      armament_id,payload_version,armament_fingerprint,qualification_id,qualification_fingerprint,
+      generation_id,authorization_id,state,phase,build_hash,configuration_fingerprint,
+      strategy_fingerprint,wallet_public_key,cluster,genesis_hash,provider_id,maximum_buys,
+      maximum_capital_lamports,maximum_exposure_bps,maximum_open_positions,maximum_holding_ms,
+      operator_id,operator_reason,armed_at,expires_at,armament_request_fingerprint,
+      canary_evidence_fingerprint,target_intent_id,target_intent_state_revision,target_strategy_id,
+      target_strategy_version,target_decision_fingerprint,target_mint,target_quote_mint,
+      target_quote_amount_raw,target_admission_report_id,target_reservation_id,target_policy_fingerprint,
+      target_wallet_snapshot_fingerprint,target_provider_snapshot_fingerprint,runtime_quote_max_age_ms,
+      runtime_slippage_bps,runtime_snapshot_max_slot_lag,runtime_max_compute_units,
+      runtime_max_fee_lamports,runtime_max_fee_payer_lamport_debit,runtime_max_rpc_calls_per_attempt,
+      runtime_lease_ms
+    ) VALUES (
+      'execution_activation_armament_${'0'.repeat(64)}',2,'${'1'.repeat(64)}',$1,'${'1'.repeat(64)}',
+      $2,'execution_operator_authorization_${'c'.repeat(64)}','ARMED','CANARY','${'2'.repeat(64)}',
+      '${'3'.repeat(64)}','${'4'.repeat(64)}','11111111111111111111111111111111','mainnet-beta',
+      '11111111111111111111111111111111','provider',1,$7,500,1,30000,'operator','reason',${now},
+      ${now}+INTERVAL '4 minutes','${'6'.repeat(64)}','${'7'.repeat(64)}',$3,0,$4,$5,$6,$8,$9,$7,
+      $10,$11,'${'b'.repeat(64)}','${'c'.repeat(64)}','${'d'.repeat(64)}',60000,0,128,1400000,
+      10000000,10000000000,12,3000
+    )`, [
+      qualificationId, generationId, intent.id, intent.strategyId, intent.strategyVersion,
+      intent.decisionFingerprint, intent.quoteAmountRaw?.toString(), intent.mint, intent.quoteMint,
+      reportId, reservationId,
+    ]);
+  } finally {
+    try { await client.query('SET session_replication_role=origin'); } finally { client.release(); }
+  }
 }
 
 type Row = Record<string, unknown>;

@@ -78,6 +78,7 @@ const MAX_LEASE_MS = 86_400_000;
 const MAX_EXPIRE_BATCH = 1_000;
 const RETENTION_MS = 14_400_000;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const EXECUTION_WALLET_GENERATION_ID = /^execution_wallet_generation_[0-9a-f]{64}$/u;
 const TERMINAL_STATUSES = new Set<ExecutionIntentStatus>([
   'SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELLED',
 ]);
@@ -94,6 +95,9 @@ const DRAFT_KEYS = Object.freeze([
 const CLAIM_OPTION_KEYS = Object.freeze(['ownerId', 'leaseMs', 'purpose'] as const);
 const LIVE_SIDE_CLAIM_OPTION_KEYS = Object.freeze([
   'ownerId', 'leaseMs', 'purpose', 'side',
+] as const);
+const LIVE_BUY_CLAIM_OPTION_KEYS = Object.freeze([
+  'ownerId', 'leaseMs', 'purpose', 'side', 'generationId',
 ] as const);
 const CLAIM_KEYS = Object.freeze([
   'intent', 'leaseOwner', 'leaseToken', 'leaseExpiresAtMs',
@@ -196,9 +200,6 @@ const LIVE_BUY_SELL_PRIORITY_PREDICATE = `NOT EXISTS (
             OR blocking_sell.status = 'SIGNED_NOT_SUBMITTED'
           )
       )`;
-const LIVE_EXECUTE_BUY_SQL = claimSql(`intent.side = 'BUY'
-      AND intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')
-      AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}`, true);
 const LIVE_RECOVER_SQL = claimSql("intent.status = 'SIGNED_NOT_SUBMITTED'", false);
 const LIVE_RECOVER_SELL_SQL = claimSql(`intent.side = 'SELL'
       AND intent.status = 'SIGNED_NOT_SUBMITTED'`, false);
@@ -296,10 +297,7 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
       const claimFromClient = async (
         client: ExecutionIntentClient,
       ): Promise<ClaimedExecutionIntent | null> => {
-        const claimed = await client.query(
-          claimSqlFor(options),
-          [options.ownerId, options.leaseMs, leaseToken],
-        );
+        const claimed = await client.query(claimSqlFor(options), claimValues(options, leaseToken));
         if (claimed.rowCount === 0 && claimed.rows.length === 0) return null;
         if (claimed.rowCount !== 1 || claimed.rows.length !== 1) throw dataError();
         const { claim, claimAtMs } = claimFromRow(requiredRow(claimed.rows));
@@ -828,10 +826,82 @@ function claimSql(statusPredicate: string, requireLiveIntent: boolean): string {
   RETURNING ${CLAIM_PROJECTION}`;
 }
 
+function liveExecuteBuyClaimSql(): string {
+  return `WITH operation AS MATERIALIZED (
+    SELECT date_trunc('milliseconds', statement_timestamp()) AS at
+  ), candidate AS MATERIALIZED (
+    SELECT intent.id
+    FROM execution_intents AS intent
+    CROSS JOIN operation
+    JOIN execution_activation_armaments AS armament
+      ON armament.generation_id=$4
+      AND armament.payload_version=2
+      AND armament.state='ARMED'
+      AND armament.state_revision=0
+      AND armament.consumed_buys=0
+      AND armament.target_intent_id=intent.id
+      AND armament.target_intent_state_revision=intent.state_revision
+    JOIN execution_safety_qualifications AS qualification
+      ON qualification.qualification_id=armament.qualification_id
+      AND qualification.qualification_fingerprint=armament.qualification_fingerprint
+      AND qualification.generation_id=armament.generation_id
+      AND qualification.provider_id=armament.provider_id
+      AND qualification.expires_at>operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+    JOIN execution_provider_usage_snapshots AS provider_snapshot
+      ON provider_snapshot.snapshot_fingerprint=armament.target_provider_snapshot_fingerprint
+      AND provider_snapshot.provider_id=armament.provider_id
+      AND provider_snapshot.superseded_at IS NULL
+      AND provider_snapshot.expires_at>operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+    JOIN execution_risk_admission_reports AS report
+      ON report.report_id=armament.target_admission_report_id
+      AND report.intent_id=intent.id
+      AND report.generation_id=armament.generation_id
+      AND report.decision='ADMITTED'
+      AND report.quota_state='NORMAL'
+      AND report.quote_amount_raw=armament.target_quote_amount_raw
+      AND report.policy_fingerprint=armament.target_policy_fingerprint
+      AND report.wallet_snapshot_fingerprint=armament.target_wallet_snapshot_fingerprint
+      AND report.provider_snapshot_fingerprint=armament.target_provider_snapshot_fingerprint
+    JOIN execution_exposure_reservations AS reservation
+      ON reservation.reservation_id=armament.target_reservation_id
+      AND reservation.admission_report_id=report.report_id
+      AND reservation.intent_id=intent.id
+      AND reservation.generation_id=armament.generation_id
+      AND reservation.state='RESERVED'
+      AND reservation.side='BUY'
+      AND reservation.mint=armament.target_mint
+      AND reservation.quote_mint=armament.target_quote_mint
+      AND reservation.maximum_amount_raw=armament.target_quote_amount_raw
+      AND reservation.policy_fingerprint=armament.target_policy_fingerprint
+      AND reservation.wallet_snapshot_fingerprint=armament.target_wallet_snapshot_fingerprint
+      AND reservation.provider_snapshot_fingerprint=armament.target_provider_snapshot_fingerprint
+    WHERE intent.side='BUY'
+      AND intent.status='PENDING'
+      AND intent.expires_at>operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+      AND (intent.lease_expires_at IS NULL OR intent.lease_expires_at<=operation.at)
+      AND armament.armed_at<=operation.at
+      AND armament.expires_at>operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+      AND ${LIVE_BUY_SELL_PRIORITY_PREDICATE}
+    ORDER BY intent.requested_at,intent.id
+    FOR UPDATE OF intent SKIP LOCKED
+    LIMIT 1
+  )
+  UPDATE execution_intents AS intent
+  SET lease_owner=$1,
+      lease_token=$3::UUID,
+      lease_expires_at=date_trunc(
+        'milliseconds', operation.at+($2::BIGINT*INTERVAL '1 millisecond')
+      ),
+      updated_at=operation.at
+  FROM candidate CROSS JOIN operation
+  WHERE intent.id=candidate.id
+  RETURNING ${CLAIM_PROJECTION}`;
+}
+
 function claimSqlFor(options: ExecutionClaimOptions): string {
   switch (options.purpose) {
     case 'LIVE_EXECUTE':
-      return options.side === 'SELL' ? LIVE_EXECUTE_SELL_SQL : LIVE_EXECUTE_BUY_SQL;
+      return options.side === 'SELL' ? LIVE_EXECUTE_SELL_SQL : liveExecuteBuyClaimSql();
     case 'LIVE_RECOVER':
       if (options.side === 'SELL') return LIVE_RECOVER_SELL_SQL;
       if (options.side === 'BUY') return LIVE_RECOVER_BUY_SQL;
@@ -841,6 +911,13 @@ function claimSqlFor(options: ExecutionClaimOptions): string {
     case 'RECONCILE': return CLAIM_SQL.RECONCILE;
     case 'DRY_RUN': return CLAIM_SQL.DRY_RUN;
   }
+}
+
+function claimValues(options: ExecutionClaimOptions, leaseToken: string): readonly unknown[] {
+  if (options.purpose === 'LIVE_EXECUTE' && options.side === 'BUY') {
+    return [options.ownerId, options.leaseMs, leaseToken, options.generationId];
+  }
+  return [options.ownerId, options.leaseMs, leaseToken];
 }
 
 function dryRunClaimSql(): string {
@@ -993,15 +1070,18 @@ function draftInput(value: unknown): ExecutionIntentDraftV1 {
 
 function claimOptions(value: unknown): ExecutionClaimOptions {
   let hasSide: boolean;
+  let hasGenerationId: boolean;
   try {
     if (typeof value !== 'object' || value === null || Array.isArray(value) || isProxy(value)) {
       throw new Error();
     }
     hasSide = Reflect.ownKeys(value).includes('side');
+    hasGenerationId = Reflect.ownKeys(value).includes('generationId');
   } catch { throw inputError(); }
   const row = exactRecord(
     value,
-    hasSide ? LIVE_SIDE_CLAIM_OPTION_KEYS : CLAIM_OPTION_KEYS,
+    hasGenerationId ? LIVE_BUY_CLAIM_OPTION_KEYS
+      : hasSide ? LIVE_SIDE_CLAIM_OPTION_KEYS : CLAIM_OPTION_KEYS,
     'INVALID_INPUT',
   );
   const ownerId = boundedText(row.ownerId, 'INVALID_INPUT');
@@ -1009,6 +1089,12 @@ function claimOptions(value: unknown): ExecutionClaimOptions {
   const purpose = claimPurpose(row.purpose);
   if (purpose === 'LIVE_EXECUTE') {
     if (!hasSide || (row.side !== 'BUY' && row.side !== 'SELL')) throw inputError();
+    if (row.side === 'BUY') {
+      if (!hasGenerationId || typeof row.generationId !== 'string'
+        || !EXECUTION_WALLET_GENERATION_ID.test(row.generationId)) throw inputError();
+      return Object.freeze({ ownerId, leaseMs, purpose, side: 'BUY', generationId: row.generationId });
+    }
+    if (hasGenerationId) throw inputError();
     return Object.freeze({ ownerId, leaseMs, purpose, side: row.side });
   }
   if (purpose === 'LIVE_RECOVER') {
@@ -1428,8 +1514,10 @@ function intentMatchesClaimOptions(
 ): boolean {
   const status = intent.status;
   if (options.purpose === 'LIVE_EXECUTE') {
-    return intent.side === options.side
-      && (status === 'PENDING' || status === 'RETRY_READY' || status === 'PROCESSING');
+    if (intent.side !== options.side) return false;
+    return options.side === 'BUY'
+      ? status === 'PENDING'
+      : status === 'PENDING' || status === 'RETRY_READY' || status === 'PROCESSING';
   }
   if (options.purpose === 'EXECUTE') {
     return status === 'PENDING' || status === 'RETRY_READY' || status === 'PROCESSING';
