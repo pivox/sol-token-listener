@@ -90,11 +90,20 @@ LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path=pg_catalog, public
 AS $function$
+DECLARE
+  parent_id TEXT;
 BEGIN
-  PERFORM intent.id
-  FROM public.execution_intents intent
-  WHERE intent.id=NEW.intent_id
-  FOR UPDATE;
+  EXECUTE pg_catalog.format(
+    'SELECT intent.id FROM %I.execution_intents intent WHERE intent.id=$1 FOR UPDATE',
+    TG_TABLE_SCHEMA
+  )
+  INTO parent_id
+  USING NEW.intent_id;
+
+  IF parent_id IS NULL THEN
+    RAISE EXCEPTION 'worker child write violates the live_reserved partition'
+      USING ERRCODE='42501';
+  END IF;
 
   RETURN NEW;
 END
@@ -188,30 +197,30 @@ BEGIN
     EXECUTE 'CREATE POLICY execution_dry_run_assessments_worker_partition '
       'ON execution_dry_run_assessments AS RESTRICTIVE FOR ALL '
       'TO sol_token_executor_worker USING (EXISTS (SELECT 1 '
-      'FROM public.execution_intents parent '
+      'FROM execution_intents parent '
       'WHERE parent.id=execution_dry_run_assessments.intent_id)) '
-      'WITH CHECK (EXISTS (SELECT 1 FROM public.execution_intents parent '
+      'WITH CHECK (EXISTS (SELECT 1 FROM execution_intents parent '
       'WHERE parent.id=execution_dry_run_assessments.intent_id))';
     EXECUTE 'CREATE POLICY execution_attempts_worker_partition '
       'ON execution_attempts AS RESTRICTIVE FOR ALL '
       'TO sol_token_executor_worker USING (EXISTS (SELECT 1 '
-      'FROM public.execution_intents parent '
+      'FROM execution_intents parent '
       'WHERE parent.id=execution_attempts.intent_id)) '
-      'WITH CHECK (EXISTS (SELECT 1 FROM public.execution_intents parent '
+      'WITH CHECK (EXISTS (SELECT 1 FROM execution_intents parent '
       'WHERE parent.id=execution_attempts.intent_id))';
     EXECUTE 'CREATE POLICY execution_intent_transitions_worker_partition '
       'ON execution_intent_transitions AS RESTRICTIVE FOR ALL '
       'TO sol_token_executor_worker USING (EXISTS (SELECT 1 '
-      'FROM public.execution_intents parent '
+      'FROM execution_intents parent '
       'WHERE parent.id=execution_intent_transitions.intent_id)) '
-      'WITH CHECK (EXISTS (SELECT 1 FROM public.execution_intents parent '
+      'WITH CHECK (EXISTS (SELECT 1 FROM execution_intents parent '
       'WHERE parent.id=execution_intent_transitions.intent_id))';
     EXECUTE 'CREATE POLICY execution_simulation_artifacts_worker_partition '
       'ON execution_simulation_artifacts AS RESTRICTIVE FOR ALL '
       'TO sol_token_executor_worker USING (EXISTS (SELECT 1 '
-      'FROM public.execution_intents parent '
+      'FROM execution_intents parent '
       'WHERE parent.id=execution_simulation_artifacts.intent_id)) '
-      'WITH CHECK (EXISTS (SELECT 1 FROM public.execution_intents parent '
+      'WITH CHECK (EXISTS (SELECT 1 FROM execution_intents parent '
       'WHERE parent.id=execution_simulation_artifacts.intent_id))';
   ELSE
     -- Keep a restrictive, behavior-neutral placeholder so the migration is
