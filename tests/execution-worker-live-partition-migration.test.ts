@@ -66,7 +66,13 @@ void test('PostgreSQL 16 migration 040 backfills only live parents and enables n
         await applyMigrationsBefore040(isolated);
         const expected = await seedHistoricalLiveRoots(isolated);
 
-        await isolated.query(await readFile(migrationUrl, 'utf8'));
+        const absentRole = `h2j_absent_${suffix.slice(0, 24)}`;
+        assert.equal((await maintenance.query<{ readonly present: boolean }>(
+          'SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1) AS present', [absentRole],
+        )).rows[0]?.present, false);
+        const migrationSql = (await readFile(migrationUrl, 'utf8'))
+          .replaceAll('sol_token_executor_worker', absentRole);
+        await isolated.query(migrationSql);
 
         const reservation = await isolated.query<{
           readonly id: string;

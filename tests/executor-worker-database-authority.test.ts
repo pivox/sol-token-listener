@@ -767,12 +767,20 @@ async function assertWorkerLivePartition(
   const nonLiveId = `execution_intent_${'1'.repeat(64)}`;
   const liveId = `execution_intent_${'2'.repeat(64)}`;
   const raceId = `execution_intent_${'3'.repeat(64)}`;
+  const liveEvidenceId = `execution_intent_${'4'.repeat(64)}`;
   await insertPartitionIntent(admin, nonLiveId, 'non-live', false);
   await insertPartitionIntent(admin, liveId, 'live', true);
   await insertPartitionIntent(admin, raceId, 'race', false);
+  await insertPartitionIntent(admin, liveEvidenceId, 'live-evidence', true);
   await admin.query(`INSERT INTO execution_attempts (
     intent_id,attempt_number,status,started_at
   ) VALUES ($1,1,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [liveId]);
+  await admin.query(`INSERT INTO execution_attempts (
+    intent_id,attempt_number,status,started_at
+  ) VALUES ($1,1,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [liveEvidenceId]);
+  await insertPartitionDryRunAssessment(admin, liveEvidenceId, '4');
+  await insertPartitionTransition(admin, liveEvidenceId);
+  await insertPartitionProviderFailure(admin, liveEvidenceId, '4');
 
   assert.deepEqual((await worker.query<{ readonly id: string }>(
     'SELECT id FROM execution_intents WHERE id=ANY($1::TEXT[]) ORDER BY id',
@@ -781,6 +789,15 @@ async function assertWorkerLivePartition(
   assert.deepEqual((await worker.query<{ readonly intent_id: string }>(
     'SELECT intent_id FROM execution_attempts WHERE intent_id=$1', [liveId],
   )).rows, []);
+  for (const childTable of [
+    'execution_dry_run_assessments',
+    'execution_intent_transitions',
+    'execution_simulation_artifacts',
+  ]) {
+    assert.deepEqual((await worker.query(
+      `SELECT intent_id FROM ${childTable} WHERE intent_id=$1`, [liveEvidenceId],
+    )).rows, [], childTable);
+  }
   assert.equal((await worker.query(`UPDATE execution_intents SET
       status='PROCESSING',attempt_count=1,state_revision=1,lease_owner='worker',
       lease_token=$2,lease_expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 minute',
@@ -794,6 +811,12 @@ async function assertWorkerLivePartition(
     intent_id,attempt_number,status,started_at
   ) VALUES ($1,2,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [liveId]),
   /row-level security|live_reserved|reserved/iu);
+  await assert.rejects(insertPartitionDryRunAssessment(worker, liveId, '2'),
+    /row-level security|live_reserved|reserved/iu);
+  await assert.rejects(insertPartitionTransition(worker, liveId),
+    /row-level security|live_reserved|reserved/iu);
+  await assert.rejects(insertPartitionProviderFailure(worker, liveId, '2'),
+    /row-level security|live_reserved|reserved/iu);
   await worker.query(`INSERT INTO execution_attempts (
     intent_id,attempt_number,status,started_at
   ) VALUES ($1,1,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [nonLiveId]);
@@ -859,6 +882,46 @@ async function insertPartitionIntent(
     date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 minute','PENDING',$8)`, [
     id, `worker-partition-${suffix}`, `position-${suffix}`, `command-${suffix}`,
     '11111111111111111111111111111111', `decision-${suffix}`, 'a'.repeat(64), liveReserved,
+  ]);
+}
+
+async function insertPartitionDryRunAssessment(
+  database: InstanceType<typeof pg.Pool>, intentId: string, marker: string,
+): Promise<void> {
+  await database.query(`INSERT INTO execution_dry_run_assessments (
+    assessment_id,intent_id,strategy_id,strategy_version,decision_fingerprint,
+    intent_state_revision,intent_status,input_fingerprint,result_fingerprint
+  ) VALUES ($1,$2,'worker-partition',1,$3,0,'PENDING',$4,$5)`, [
+    `execution_dry_run_assessment_${marker.repeat(64)}`, intentId,
+    'a'.repeat(64), 'b'.repeat(64), 'c'.repeat(64),
+  ]);
+}
+
+async function insertPartitionTransition(
+  database: InstanceType<typeof pg.Pool>, intentId: string,
+): Promise<void> {
+  await database.query(`INSERT INTO execution_intent_transitions (
+    intent_id,previous_status,next_status,reason_code,human_message,activation_phase,
+    attempt_number,evidence
+  ) VALUES ($1,'PENDING','PROCESSING','EXECUTION_STARTED','partition test','NONE',1,
+    '{"payloadVersion":1,"attemptNumber":1,"sourceEventId":null,"observedAtMs":1}'::JSONB)`, [
+    intentId,
+  ]);
+}
+
+async function insertPartitionProviderFailure(
+  database: InstanceType<typeof pg.Pool>, intentId: string, marker: string,
+): Promise<void> {
+  await database.query(`INSERT INTO execution_simulation_artifacts (
+    artifact_id,intent_id,attempt_number,intent_state_revision,strategy_id,strategy_version,
+    decision_fingerprint,result_kind,provider_id,executor_public_key,expected_genesis_hash,
+    configuration_fingerprint,rpc_calls_used,rpc_calls_limit,quote_status,build_status,
+    simulation_status,failure_stage,failure_code,terminal_reason_code,result_fingerprint
+  ) VALUES ($1,$2,1,0,'worker-partition',1,$3,'PROVIDER_FAILED','provider',$4,$4,$5,
+    1,1,'FAILED','NOT_RUN','NOT_RUN','PROVIDER','RPC_UNAVAILABLE',
+    'EXECUTION_PROVIDER_FAILED',$6)`, [
+    `execution_simulation_artifact_${marker.repeat(64)}`, intentId, 'a'.repeat(64),
+    '11111111111111111111111111111111', 'b'.repeat(64), 'c'.repeat(64),
   ]);
 }
 
