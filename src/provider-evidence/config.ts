@@ -1,4 +1,4 @@
-import { isAbsolute, normalize } from 'node:path';
+import { isAbsolute, normalize, relative, resolve, sep } from 'node:path';
 import { isProxy } from 'node:util/types';
 
 const FORBIDDEN_KEY = /(?:HELIUS_API_KEY$|PRIVATE_KEY|SECRET_KEY|KEYPAIR|MNEMONIC|RECOVERY_PHRASE|WALLET|LIVE_TRADING_ENABLED|EXECUTOR_MODE|SOLANA_(?:HTTP|WS)_RPC_URL|DATABASE_URL)/u;
@@ -21,7 +21,10 @@ export class HeliusProviderEvidenceConfigError extends TypeError {
   }
 }
 
-export function parseHeliusProviderEvidenceConfig(input: unknown): HeliusProviderEvidenceConfig {
+export function parseHeliusProviderEvidenceConfig(
+  input: unknown,
+  applicationRoot = process.cwd(),
+): HeliusProviderEvidenceConfig {
   try {
     if (!isEnvironment(input)) throw invalid();
     for (const key of Object.keys(input)) {
@@ -40,11 +43,20 @@ export function parseHeliusProviderEvidenceConfig(input: unknown): HeliusProvide
     const timeoutMs = decimalInteger(value(input, 'EXECUTOR_PROVIDER_EVIDENCE_TIMEOUT_MS'),
       100, 30_000);
     if (new Set([apiKeyPath, privateKeyPath, outputPath]).size !== 3) throw invalid();
+    for (const path of [apiKeyPath, privateKeyPath, outputPath]) {
+      if (isWithin(resolve(applicationRoot), path)) throw invalid();
+    }
     return Object.freeze({ projectId, apiKeyPath, providerId, privateKeyPath,
       outputPath, ttlMs, timeoutMs });
   } catch {
     throw invalid();
   }
+}
+
+function isWithin(parent: string, candidate: string): boolean {
+  const relation = relative(parent, candidate);
+  return relation === '' || (!relation.startsWith(`..${sep}`)
+    && relation !== '..' && !isAbsolute(relation));
 }
 
 function isEnvironment(value: unknown): value is Record<string, string | undefined> {

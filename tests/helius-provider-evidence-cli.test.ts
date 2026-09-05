@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { chmod, lstat, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
+  assertExternalEvidencePaths,
   readProtectedFile,
   runHeliusProviderEvidenceCommand,
   writeAtomicEvidence,
@@ -32,6 +33,24 @@ void test('reads only owner-protected regular files and writes atomic mode 0600 
       'x'.repeat(131_073)));
     await chmod(protectedPath, 0o400);
     assert.equal(await readProtectedFile(protectedPath), 'secret\n');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+void test('resolves parent symlinks before accepting external evidence paths', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'helius-path-policy-'));
+  try {
+    const checkout = join(directory, 'checkout');
+    const external = join(directory, 'external');
+    const checkoutAlias = join(external, 'checkout-alias');
+    await mkdir(checkout);
+    await mkdir(external);
+    await symlink(checkout, checkoutAlias);
+    await assert.rejects(assertExternalEvidencePaths(checkout,
+      [join(checkoutAlias, 'provider-evidence.json')]));
+    await assert.doesNotReject(assertExternalEvidencePaths(checkout,
+      [join(external, 'provider-evidence.json')]));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

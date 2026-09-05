@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.7.1 — 2026-09-05
+**Version :** 1.7.2 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -107,7 +107,9 @@ EXECUTOR_PROVIDER_EVIDENCE_TIMEOUT_MS=5000
 ```
 
 Ce fichier ne doit contenir aucun nom de variable wallet, live, RPC Solana ou
-PostgreSQL, même vide. Exécuter immédiatement avant H2d :
+PostgreSQL, même vide. Les trois chemins sont refusés s'ils se trouvent dans le
+checkout, directement ou via un parent symlink. Exécuter immédiatement avant
+H2d :
 
 ```bash
 npm run build:backend

@@ -117,7 +117,7 @@ void test('documents H2d readiness and H2e provider evidence without starting a 
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.10',
+    '**Version de spécification :** 1.11.11',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -130,12 +130,12 @@ void test('documents H2d readiness and H2e provider evidence without starting a 
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.9',
+    '**Version de spécification :** 1.2.10',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.10',
+    '**Version de la spécification parente :** 1.11.11',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -200,27 +200,27 @@ void test('documents H2d readiness and H2e provider evidence without starting a 
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.7.1 — 2026-09-05',
+    '**Version :** 1.7.2 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
     readinessSpecification,
-    '**Version de spécification :** 1.0.8',
+    '**Version de spécification :** 1.0.9',
     'readiness specification version',
   );
   assertContainsExactlyOnce(
     readinessSpecification,
-    '**Version de la spécification parente :** 1.11.10',
+    '**Version de la spécification parente :** 1.11.11',
     'readiness parent specification version',
   );
   assertContainsExactlyOnce(
     providerEvidenceSpecification,
-    '**Version de spécification :** 1.0.3',
+    '**Version de spécification :** 1.0.4',
     'provider evidence specification version',
   );
   assertContainsExactlyOnce(
     providerEvidenceSpecification,
-    '**Version de la spécification parente :** 1.11.10',
+    '**Version de la spécification parente :** 1.11.11',
     'provider evidence parent specification version',
   );
   assert.match(runbook, /generateKeyPairSync\('ed25519'\)[\s\S]*flag: 'wx'[\s\S]*mode: 0o600/u);

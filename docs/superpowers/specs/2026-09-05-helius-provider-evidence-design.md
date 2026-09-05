@@ -1,8 +1,8 @@
 # Preuve de quota Helius pour le préflight externe — conception #51-H2e
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.0.4
 
-**Version de la spécification parente :** 1.11.10
+**Version de la spécification parente :** 1.11.11
 
 **Date :** 2026-09-05
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-H2d fusionnée par la PR #80 (`e854c26`)
 
 ## Historique des versions
+
+- **1.0.4 — 2026-09-05 :** applique la marge H2d de cinq secondes jusqu'à
+  l'écriture et refuse les chemins internes au checkout après résolution de
+  leurs parents.
 
 - **1.0.3 — 2026-09-05 :** remplace la génération OpenSSL non portable sur
   macOS par l'API Ed25519 de Node.js 22 avec création exclusive `0600`.

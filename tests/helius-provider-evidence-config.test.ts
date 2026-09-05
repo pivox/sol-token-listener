@@ -41,3 +41,12 @@ void test('rejects bounds, relative paths, aliases and every wallet/live variabl
   ]) assert.throws(() => parseHeliusProviderEvidenceConfig(environment),
     HeliusProviderEvidenceConfigError);
 });
+
+void test('rejects every secret or output path inside the application checkout', () => {
+  for (const replacement of [
+    { HELIUS_API_KEY_PATH: `${process.cwd()}/secrets/api-key` },
+    { EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH: `${process.cwd()}/secrets/evidence.pem` },
+    { EXECUTOR_PROVIDER_EVIDENCE_PATH: `${process.cwd()}/evidence/provider.json` },
+  ]) assert.throws(() => parseHeliusProviderEvidenceConfig({ ...valid, ...replacement }),
+    HeliusProviderEvidenceConfigError);
+});

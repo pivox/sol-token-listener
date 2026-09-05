@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.9
+**Version de spécification :** 1.2.10
 
-**Version de la spécification parente :** 1.11.10
+**Version de la spécification parente :** 1.11.11
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.10 — 2026-09-05 :** ferme le handoff H2e/H2d par une marge de cinq
+  secondes et des chemins externes au checkout résolus canoniquement.
 
 - **1.2.9 — 2026-09-05 :** aligne la génération de clé H2e sur Node.js 22 et
   une création exclusive owner-only portable sur l'hôte cible.

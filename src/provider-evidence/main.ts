@@ -1,9 +1,9 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, open, rename, unlink } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { lstat, open, realpath, rename, unlink } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseHeliusProviderEvidenceConfig } from './config.js';
 import { HeliusAdminUsageClient } from './helius-admin-client.js';
 import {
@@ -67,8 +67,26 @@ export async function runHeliusProviderEvidenceCommand(
   return JSON.stringify(await service.collect(signal));
 }
 
+export async function assertExternalEvidencePaths(
+  applicationRoot: string,
+  paths: readonly string[],
+): Promise<void> {
+  const canonicalRoot = await realpath(applicationRoot);
+  for (const path of paths) {
+    const canonicalParent = await realpath(dirname(path));
+    const candidate = join(canonicalParent, basename(path));
+    const relation = relative(canonicalRoot, candidate);
+    if (relation === '' || (relation !== '..' && !relation.startsWith(`..${sep}`)
+      && !isAbsolute(relation))) throw new TypeError();
+  }
+}
+
 export async function main(): Promise<void> {
-  const config = parseHeliusProviderEvidenceConfig(process.env);
+  const applicationRoot = await findApplicationRoot(fileURLToPath(import.meta.url));
+  const config = parseHeliusProviderEvidenceConfig(process.env, applicationRoot);
+  await assertExternalEvidencePaths(applicationRoot, [
+    config.apiKeyPath, config.privateKeyPath, config.outputPath,
+  ]);
   const abort = new AbortController();
   const stop = (): void => { abort.abort(); };
   process.once('SIGINT', stop);
@@ -85,6 +103,20 @@ export async function main(): Promise<void> {
   } finally {
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
+  }
+}
+
+async function findApplicationRoot(modulePath: string): Promise<string> {
+  let candidate = dirname(modulePath);
+  for (;;) {
+    try {
+      if ((await lstat(join(candidate, 'package.json'))).isFile()) return candidate;
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+    const parent = dirname(candidate);
+    if (parent === candidate) throw new TypeError();
+    candidate = parent;
   }
 }
 

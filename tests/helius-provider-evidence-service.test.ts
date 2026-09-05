@@ -60,6 +60,24 @@ void test('does not write or report evidence that expires while it is being sign
   assert.equal(written, false);
 });
 
+void test('requires the five-second H2d commit margin after output persistence', async () => {
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const times = [NOW_MS, NOW_MS + 1_000, NOW_MS + 295_001];
+  const service = createHeliusProviderEvidenceService({
+    config: Object.freeze({
+      projectId: PROJECT_ID, apiKeyPath: '/secret/api-key', providerId: 'helius-primary',
+      privateKeyPath: '/secret/evidence.pem', outputPath: '/evidence/provider.json',
+      ttlMs: 300_000, timeoutMs: 5_000,
+    }),
+    client: { getProjectUsage: async () => validResponse() },
+    readProtectedFile: async (path) => path.endsWith('api-key')
+      ? 'secret-api-key' : privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
+    writeEvidence: async () => undefined,
+    now: () => times.shift() ?? NOW_MS + 295_001,
+  });
+  await assert.rejects(service.collect(new AbortController().signal));
+});
+
 function validResponse(): Readonly<Record<string, unknown>> {
   return Object.freeze({
     creditsRemaining: 487_500, creditsUsed: 12_500,

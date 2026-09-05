@@ -13,6 +13,8 @@ import {
 import { canonicalStringifyJson, parseJson } from '../utils/json.js';
 import type { HeliusProviderEvidenceConfig } from './config.js';
 
+const H2D_COMMIT_FRESHNESS_MARGIN_MS = 5_000;
+
 export interface HeliusProviderEvidenceClient {
   readonly getProjectUsage: (
     projectId: string,
@@ -89,7 +91,8 @@ export function createHeliusProviderEvidenceService(
         });
         const encodedEnvelope = canonicalStringifyJson(envelope);
         const verifiedAtMs = timestamp(dependencies.now());
-        if (verifiedAtMs < measuredAtMs || verifiedAtMs >= snapshot.expiresAtMs) {
+        if (verifiedAtMs < measuredAtMs
+          || verifiedAtMs > snapshot.expiresAtMs - H2D_COMMIT_FRESHNESS_MARGIN_MS) {
           throw new TypeError();
         }
         const verified = verifySignedProviderUsageEvidence(
@@ -100,7 +103,8 @@ export function createHeliusProviderEvidenceService(
           || verified.snapshotFingerprint !== snapshot.snapshotFingerprint) throw new TypeError();
         await dependencies.writeEvidence(dependencies.config.outputPath, encodedEnvelope);
         const completedAtMs = timestamp(dependencies.now());
-        if (completedAtMs < verifiedAtMs || completedAtMs >= snapshot.expiresAtMs) {
+        if (completedAtMs < verifiedAtMs
+          || completedAtMs > snapshot.expiresAtMs - H2D_COMMIT_FRESHNESS_MARGIN_MS) {
           throw new TypeError();
         }
         return createHeliusProviderEvidenceManifest(usage, publicKeyBase64);
