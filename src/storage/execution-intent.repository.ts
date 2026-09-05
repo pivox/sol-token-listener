@@ -256,8 +256,7 @@ export async function createExecutionIntentInTransaction(
     `SELECT ${INTENT_PROJECTION}
      FROM execution_intents AS intent
      WHERE intent.id = $1 OR intent.logical_order_key = $2
-     ORDER BY CASE WHEN intent.id = $1 THEN 0 ELSE 1 END, intent.id
-     FOR SHARE`,
+     ORDER BY CASE WHEN intent.id = $1 THEN 0 ELSE 1 END, intent.id`,
     [draft.id, draft.logicalOrderKey],
   );
   if (conflict.rowCount !== 1 || conflict.rows.length !== 1) throw duplicateError();

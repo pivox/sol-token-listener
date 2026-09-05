@@ -3,7 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import pg from 'pg';
+import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase } from '../src/storage/database.js';
+import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
@@ -56,6 +58,9 @@ void test('listener provisioning rebuilds one closed non-live database authority
   assert.match(sql, /REVOKE ALL PRIVILEGES ON TYPE %I\.%I FROM sol_token_listener_writer/u);
   assert.match(sql, /ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL PRIVILEGES ON %s FROM sol_token_listener_writer/u);
   assert.match(sql, /REVOKE ALL PRIVILEGES ON TABLE %I\.%I FROM PUBLIC/u);
+  assert.match(sql, /REVOKE CREATE ON SCHEMA public FROM PUBLIC/iu);
+  assert.match(sql,
+    /REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM PUBLIC/iu);
   assert.match(sql, /GRANT USAGE ON SCHEMA public TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT SELECT ON TABLE migration_history TO sol_token_listener_writer/iu);
   for (const table of BUSINESS_TABLES) {
@@ -107,6 +112,23 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       isolated = new pg.Pool({ connectionString: isolatedUrl.href });
       await migrateDatabase({ pool: isolated });
       const provisioningSql = await readFile(scriptUrl, 'utf8');
+      const publicParameterProbe = await isolated.connect();
+      try {
+        await publicParameterProbe.query('BEGIN');
+        await publicParameterProbe.query(
+          `GRANT SET ON PARAMETER session_replication_role TO PUBLIC`,
+        );
+        await publicParameterProbe.query(provisioningSql);
+        await publicParameterProbe.query('SET LOCAL ROLE sol_token_listener_writer');
+        assert.equal((await publicParameterProbe.query<{ readonly allowed: boolean }>(
+          `SELECT has_parameter_privilege(
+            current_user,'session_replication_role','SET'
+          ) AS allowed`,
+        )).rows[0]?.allowed, false);
+      } finally {
+        await publicParameterProbe.query('ROLLBACK');
+        publicParameterProbe.release();
+      }
       await isolated.query(provisioningSql);
       await isolated.query(`CREATE SCHEMA ${quoteIdentifier(privateSchema)}`);
       await isolated.query(`CREATE TABLE ${quoteIdentifier(privateSchema)}.secrets (
@@ -117,6 +139,7 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       await isolated.query(`GRANT SELECT ON TABLE ${quoteIdentifier(privateSchema)}.secrets
         TO sol_token_listener_writer WITH GRANT OPTION`);
       await isolated.query(`GRANT SELECT ON TABLE execution_wallet_generations TO PUBLIC`);
+      await isolated.query(`GRANT CREATE ON SCHEMA public TO PUBLIC`);
       await isolated.query(`CREATE TYPE ${quoteIdentifier(privateSchema)}.private_state
         AS ENUM ('PRIVATE')`);
       await isolated.query(`GRANT USAGE ON TYPE
@@ -141,6 +164,9 @@ void test('PostgreSQL 16 listener login can write business projections but no li
         current_user: 'sol_token_listener_writer',
         search_path: '"$user", public',
       }]);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(
+        `SELECT has_schema_privilege(current_user,'public','CREATE') AS allowed`,
+      )).rows[0]?.allowed, false);
       for (const table of BUSINESS_TABLES) {
         const row: {
           readonly select_ok: boolean;
@@ -161,6 +187,21 @@ void test('PostgreSQL 16 listener login can write business projections but no li
           select_ok: true, insert_ok: true, update_ok: true, delete_ok: true,
         }, table);
       }
+      const nowMs = Date.now();
+      const intentRepository = new PostgresExecutionIntentRepository(listener);
+      const intentDraft = createExecutionIntentDraft(Object.freeze({
+        strategyId: 'listener-role-test', strategyVersion: 1,
+        positionId: `position-${suffix}`, logicalCommandId: `command-${suffix}`,
+        mint: '11111111111111111111111111111111', side: 'BUY',
+        venuePolicy: 'PUMP_FUN_ONLY',
+        quoteMint: 'So11111111111111111111111111111111111111112',
+        quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+        quoteAmountRaw: 1n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+        decisionEventId: `decision-${suffix}`, decisionFingerprint: 'd'.repeat(64),
+        requestedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+      }));
+      assert.equal((await intentRepository.create(intentDraft)).kind, 'CREATED');
+      assert.equal((await intentRepository.create(intentDraft)).kind, 'REPLAYED');
       const executionRelations = await listener.query<{
         readonly relation_name: string;
         readonly table_allowed: boolean;

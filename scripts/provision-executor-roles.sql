@@ -55,6 +55,9 @@ DECLARE
   parameter_name TEXT;
 BEGIN
   IF current_setting('server_version_num')::INTEGER >= 150000 THEN
+    -- A parameter grant to PUBLIC is inherited by the listener and survives a
+    -- role-specific revoke. Keep trigger bypass unavailable cluster-wide.
+    REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM PUBLIC;
     FOR parameter_name IN SELECT parname FROM pg_parameter_acl
     LOOP
       EXECUTE format(
@@ -288,6 +291,9 @@ BEGIN
 END
 $listener_columns$;
 
+-- PostgreSQL grants CREATE on public to PUBLIC on some installations. The
+-- listener must never be able to manufacture owner-controlled objects there.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO sol_token_listener_writer;
 
 GRANT SELECT ON TABLE migration_history TO sol_token_listener_writer;

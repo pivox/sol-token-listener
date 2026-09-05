@@ -42,11 +42,18 @@ transactions signées, simulation live, soumission et réconciliation.
 
 Comme tout rôle hérite des ACL de `PUBLIC`, le provisioning révoque aussi
 dynamiquement les privilèges de table et de colonne de `PUBLIC` sur chaque
-relation `execution_*` existante. Il supprime les ACL directes de type,
-langage, base et les default ACL accordées au groupe listener. Une propriété
-d'objet contournerait les ACL : elle provoque donc un échec fermé et doit être
-réassignée par l'administrateur. Le script est rejoué après chaque migration
-avant tout démarrage du listener.
+relation `execution_*` existante, le droit `CREATE` de `PUBLIC` sur `public`
+et le droit de modifier `session_replication_role`. Il supprime les ACL
+directes de type, langage, base et les default ACL accordées au groupe
+listener. Une propriété d'objet contournerait les ACL : elle provoque donc un
+échec fermé et doit être réassignée par l'administrateur. Le script est rejoué
+après chaque migration avant tout démarrage du listener.
+
+La relecture idempotente d'une intention n'acquiert aucun verrou de ligne :
+`INSERT ... ON CONFLICT DO NOTHING` sérialise déjà le conflit, puis la lecture
+dans le snapshot `READ COMMITTED` courant vérifie l'identité immuable exacte.
+Le listener conserve ainsi uniquement `SELECT` et `INSERT`, sans droit
+`UPDATE` implicite requis par `FOR SHARE`.
 
 ## 3. Connexion et exploitation
 
@@ -65,9 +72,9 @@ désactivée avec ce rôle.
 
 - test statique de l'allowlist et des exclusions live ;
 - test PostgreSQL 16 optionnel qui injecte des dérives directes, `PUBLIC`, de
-  type, de default ACL et de propriété, puis vérifie leur suppression ou leur
-  rejet fermé ainsi que les droits effectifs de toutes les tables
-  `execution_*` découvertes dans le catalogue ;
+  schéma, de paramètre, de type, de default ACL et de propriété, puis vérifie
+  leur suppression ou leur rejet fermé, la relecture idempotente et les droits
+  effectifs de toutes les tables `execution_*` découvertes dans le catalogue ;
 - dry-run paper Mainnet borné sous le login dédié ;
 - build, check, lint, tests et documentation verts ;
 - aucun wallet chargé, aucun armement et aucune transaction envoyée.

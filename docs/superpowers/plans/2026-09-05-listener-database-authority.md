@@ -92,7 +92,7 @@ Run: `npm run build && npm run check && npm run lint && npm test && npm run docs
 
 Expected: tous les contrôles passent.
 
-- [ ] **Step 3: Commit, push, open PR, request review**
+- [x] **Step 3: Commit, push, open PR, request review**
 
 Limiter la PR à H2i et demander une revue Codex. Corriger au plus trois cycles,
 puis fusionner uniquement si la CI et les fils bloquants sont verts.
