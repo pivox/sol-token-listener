@@ -30,6 +30,7 @@ const WORKER_TABLE_AUTHORITY: Readonly<Record<string, TableAuthority>> = Object.
       'requested_at', 'expires_at', 'status', 'attempt_count', 'state_revision',
       'lease_owner', 'lease_token', 'lease_expires_at', 'last_reason_code', 'terminal_at',
       'reconciliation_completed_at', 'created_at', 'updated_at', 'purge_after',
+      'live_reserved',
     ],
     UPDATE: [
       'status', 'attempt_count', 'state_revision', 'lease_owner', 'lease_token',
