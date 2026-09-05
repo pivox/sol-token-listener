@@ -48,7 +48,8 @@ void test('executor role provisioning is explicit, passwordless and least-privil
     'sol_token_listener_writer', 'sol_token_executor_worker',
     'sol_token_executor_live',
     'sol_token_executor_live_recovery',
-    'sol_token_executor_operations', 'sol_token_operator_reader', 'sol_token_public_api',
+    'sol_token_executor_operations', 'sol_token_executor_readiness',
+    'sol_token_operator_reader', 'sol_token_public_api',
     'sol_token_retention_worker',
   ]) assert.match(sql, new RegExp(`CREATE ROLE ${role} NOLOGIN`, 'u'));
   assert.doesNotMatch(executable, /\b(?:PASSWORD|SUPERUSER|CREATEDB|CREATEROLE|BYPASSRLS)\b/iu);
@@ -73,6 +74,11 @@ void test('executor role provisioning is explicit, passwordless and least-privil
     /execution_pre_signature_locks TO sol_token_executor_operations/iu);
   assert.doesNotMatch(sql,
     /execution_signed_transactions TO sol_token_executor_operations/iu);
+  assert.match(sql, /ALTER ROLE sol_token_executor_readiness NOLOGIN NOSUPERUSER NOCREATEDB\s+NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS/iu);
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_readiness/u);
+  assert.match(sql, /ON TABLE execution_wallet_snapshots TO sol_token_executor_readiness/iu);
+  assert.match(sql, /ON TABLE execution_provider_usage_snapshots TO sol_token_executor_readiness/iu);
+  assert.doesNotMatch(sql, /execution_(?:intents|activation_armaments|signed_transactions) TO sol_token_executor_readiness/iu);
   assert.doesNotMatch(sql, /(?:private_key|secret_key|seed_phrase|signed_bytes|rpc_url)/iu);
   for (const readOnlyTable of [
     'execution_wallet_generations',

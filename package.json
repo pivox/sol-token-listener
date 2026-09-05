@@ -12,6 +12,8 @@
     "start": "node dist/src/app.js",
     "executor:dev": "tsx src/executor/main.ts",
     "executor:start": "node dist/src/executor/main.js",
+    "executor:readiness:dev": "tsx src/executor-readiness/main.ts",
+    "executor:readiness:start": "node dist/src/executor-readiness/main.js",
     "executor:live:recovery:dev": "tsx src/executor-live-recovery/main.ts",
     "executor:live:recovery:start": "node dist/src/executor-live-recovery/main.js",
     "executor:live:dev": "tsx src/executor-live/main.ts",

@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.4
+**Version de spécification :** 1.11.6
 
 **Date :** 2026-08-31
 
@@ -9,10 +9,19 @@
 **Issue parente :** #51
 
 **Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes
-#51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b
-et préparation opérateur exacte #51-H2c
+#51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b,
+préparation opérateur exacte #51-H2c et bootstrap de readiness non signable
+#51-H2d
 
 ## Historique des versions
+
+- **1.11.6 — 2026-09-05 :** implémente H2d avec transport finalisé borné,
+  attestation provider Ed25519, commit atomique et rôle PostgreSQL 16 dédié ;
+  aucun wallet, signer, armement ou envoi n'est accessible.
+
+- **1.11.5 — 2026-09-05 :** introduit H2d, processus one-shot sans keypair,
+  signature ni soumission qui crée les projections publiques wallet/provider
+  manquantes et exporte leurs identités canoniques pour le préflight H2c.
 
 - **1.11.4 — 2026-09-05 :** exige une lease strictement active lors de
   l'autorisation de signature, sans exiger artificiellement une nouvelle

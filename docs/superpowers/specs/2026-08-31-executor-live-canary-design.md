@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.4
+**Version de spécification :** 1.2.6
 
-**Version de la spécification parente :** 1.11.4
+**Version de la spécification parente :** 1.11.6
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,14 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.6 — 2026-09-05 :** livre le producteur H2d non signant des identités
+  wallet/provider, atomique et sous rôle PostgreSQL dédié, tout en maintenant
+  le canary désarmé.
+
+- **1.2.5 — 2026-09-05 :** référence H2d comme producteur non signable des
+  projections publiques wallet/provider requises par le préflight externe,
+  sans élargir H2a, H2b ou les commandes opérateur.
 
 - **1.2.4 — 2026-09-05 :** remplace le fence irréalisable d'une lease encore
   entière par le fence causal voulu d'une lease strictement active au moment
