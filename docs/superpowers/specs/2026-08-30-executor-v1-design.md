@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.20
+**Version de spécification :** 1.12.0
 
 **Date :** 2026-08-31
 
@@ -14,10 +14,14 @@ préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
 #51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations
 hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL
 read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i
-et autorité PostgreSQL fermée du worker non signant #51-H2j
+et autorité PostgreSQL fermée du worker non signant #51-H2j, puis contrat de
+paire d'intentions canary non signante #51-H2k
 
 ## Historique des versions
 
+- **1.12.0 — 2026-09-05 :** spécifie H2k en deux PR : paire atomique entre la
+  cible canary et son sibling de simulation, puis préparation one-shot exacte,
+  toujours sans wallet, armement, signature ou soumission.
 - **1.11.20 — 2026-09-05 :** fixe pour H2j la commande `psql` hermétique de
   provisioning et le contrôle post-exécution 5/5 mono-OID.
 - **1.11.19 — 2026-09-05 :** ferme le replay H2j après renommage : inventaire
@@ -1148,10 +1152,12 @@ réaffecté à une autre signification.
 | #51-H2h | Export causal PostgreSQL de la source H2g | Aucune capacité Solana |
 | #51-H2i | Autorité PostgreSQL fermée du listener paper | Aucune |
 | #51-H2j | Autorité PostgreSQL fermée du worker dry-run/simulation | Aucune |
+| #51-H2k-a | Paire durable cible canary / sibling de simulation | Aucune |
+| #51-H2k-b | Préparation one-shot exacte et manifeste H2h | Aucune |
 
-Chaque PR est fusionnable seule, garde le listener opérationnel et passe trois
-cycles de revue au maximum. Une PR ne peut pas anticiper l'activation de la
-suivante.
+Chaque PR est fusionnable seule et garde le listener opérationnel. À partir de
+H2k, chaque PR passe deux cycles de revue au maximum. Une PR ne peut pas
+anticiper l'activation de la suivante.
 
 ## 17. Tests obligatoires cumulés
 
@@ -1186,7 +1192,7 @@ suivante.
 - les gates compensatoires et l'activation progressive sont testables ;
 - SOL/WSOL est l'allowlist initiale sans coupler le domaine à SOL ;
 - la rétention terminale de quatre heures est documentée ;
-- les lots #51-B à #51-H2j sont indépendants et fusionnables séquentiellement ;
+- les lots #51-B à #51-H2k sont indépendants et fusionnables séquentiellement ;
 - aucun code de production, comportement, secret ou mode live n'est ajouté ;
 - `npm run build`, `npm run check`, `npm run lint`, `npm test` et
   `npm run docs:check` restent verts.
