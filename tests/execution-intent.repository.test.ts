@@ -1673,6 +1673,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     await first.create(oldestBuy);
     await first.create(newestSell);
     await first.create(oldestSell);
+    await reserveLiveIntents(firstPool, [oldestSell.id, newestSell.id]);
 
     const firstSellClaim = required(await first.claim({
       ownerId: 'live-sell-a', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'SELL',
@@ -1726,6 +1727,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
       ...sellShape, requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
     });
     await first.create(concurrentSell);
+    await reserveLiveIntents(firstPool, [concurrentSell.id]);
     const concurrent = await Promise.all([
       first.claim({
         ownerId: 'live-concurrent-a', leaseMs: 60_000,
@@ -1748,6 +1750,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     });
     await first.create(racedBuy);
     await first.create(racedSell);
+    await reserveLiveIntents(firstPool, [racedSell.id]);
     const [racedBuyClaim, racedSellClaim] = await Promise.all([
       first.claim({
         ownerId: 'live-raced-buy-worker', leaseMs: 60_000,
@@ -1773,6 +1776,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     });
     await first.create(recoverBlockingBuy);
     await first.create(expiredRecoverSell);
+    await reserveLiveIntents(firstPool, [recoverBlockingBuy.id, expiredRecoverSell.id]);
     await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
       attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [
       expiredRecoverSell.id,
@@ -1802,6 +1806,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     });
     await first.create(sideRecoverBuy);
     await first.create(activePendingSell);
+    await reserveLiveIntents(firstPool, [sideRecoverBuy.id, activePendingSell.id]);
     await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
       attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [sideRecoverBuy.id]);
     assert.equal(await second.claim({
@@ -1828,6 +1833,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
     });
     await first.create(signedRecoverBuy);
     await first.create(signedRecoverSell);
+    await reserveLiveIntents(firstPool, [signedRecoverBuy.id, signedRecoverSell.id]);
     await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
       attempt_count=1,last_reason_code='SIGNATURE_PERSISTED'
       WHERE id=ANY($1::TEXT[])`, [[signedRecoverBuy.id, signedRecoverSell.id]]);
@@ -1858,7 +1864,7 @@ void test('real PostgreSQL enforces live SELL priority, recovery, and reconcilia
       });
       reconciliationDrafts.push(draft);
       await first.create(draft);
-      await firstPool.query(`UPDATE execution_intents SET status=$2,
+      await firstPool.query(`UPDATE execution_intents SET live_reserved=TRUE,status=$2,
         attempt_count=1,last_reason_code=$3 WHERE id=$1`, [draft.id, status, reason]);
     }
 
@@ -1914,12 +1920,14 @@ void test('LIVE_EXECUTE BUY forces READ COMMITTED and observes an uncommitted SE
         requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
       });
       await first.create(buy);
+      await seedLiveExecuteBuyTarget(firstPool, buy);
 
       const triggerLockKey = 5_100_092;
       await firstPool.query(`CREATE FUNCTION block_live_sell_intent_insert()
         RETURNS trigger LANGUAGE plpgsql AS $function$
         BEGIN
           IF NEW.side = 'SELL' THEN
+            NEW.live_reserved := TRUE;
             PERFORM pg_advisory_lock(${triggerLockKey});
             PERFORM pg_advisory_unlock(${triggerLockKey});
           END IF;
@@ -1927,7 +1935,7 @@ void test('LIVE_EXECUTE BUY forces READ COMMITTED and observes an uncommitted SE
         END
         $function$`);
       await firstPool.query(`CREATE TRIGGER block_live_sell_intent_insert_trigger
-        AFTER INSERT ON execution_intents FOR EACH ROW
+        BEFORE INSERT ON execution_intents FOR EACH ROW
         EXECUTE FUNCTION block_live_sell_intent_insert()`);
 
       const blocker = await secondPool.connect();
@@ -1989,7 +1997,8 @@ void test('LIVE_RECOVER BUY waits for an uncommitted SELL creation and observes 
         requestedAtMs: now - 1_000, expiresAtMs: now + 120_000,
       });
       await first.create(buy);
-      await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
+      await firstPool.query(`UPDATE execution_intents SET live_reserved=TRUE,
+        status='SIGNED_NOT_SUBMITTED',
         attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [buy.id]);
 
       const triggerLockKey = 5_100_093;
@@ -1997,6 +2006,7 @@ void test('LIVE_RECOVER BUY waits for an uncommitted SELL creation and observes 
         RETURNS trigger LANGUAGE plpgsql AS $function$
         BEGIN
           IF NEW.side = 'SELL' THEN
+            NEW.live_reserved := TRUE;
             PERFORM pg_advisory_lock(${triggerLockKey});
             PERFORM pg_advisory_unlock(${triggerLockKey});
           END IF;
@@ -2004,7 +2014,7 @@ void test('LIVE_RECOVER BUY waits for an uncommitted SELL creation and observes 
         END
         $function$`);
       await firstPool.query(`CREATE TRIGGER block_live_recovery_sell_intent_insert_trigger
-        AFTER INSERT ON execution_intents FOR EACH ROW
+        BEFORE INSERT ON execution_intents FOR EACH ROW
         EXECUTE FUNCTION block_live_recovery_sell_intent_insert()`);
 
       const blocker = await secondPool.connect();
@@ -2066,6 +2076,7 @@ void test('LIVE_RECOVER BUY waits for an uncommitted signed SELL persistence bou
       });
       await first.create(buy);
       await first.create(sell);
+      await reserveLiveIntents(firstPool, [buy.id, sell.id]);
       await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
         attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [buy.id]);
 
@@ -2124,7 +2135,8 @@ void test('concurrent LIVE_RECOVER BUY claims elect one winner without deadlock'
       requestedAtMs: now - 2_000, expiresAtMs: now - 1_000,
     });
     await first.create(buy);
-    await firstPool.query(`UPDATE execution_intents SET status='SIGNED_NOT_SUBMITTED',
+    await firstPool.query(`UPDATE execution_intents SET live_reserved=TRUE,
+      status='SIGNED_NOT_SUBMITTED',
       attempt_count=1,last_reason_code='SIGNATURE_PERSISTED' WHERE id=$1`, [buy.id]);
 
     const claims = await Promise.all([
@@ -2241,7 +2253,7 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
     });
     await first.create(submittedAfterDeadline);
     await firstPool.query(`UPDATE execution_intents
-      SET status='SUBMITTED',last_reason_code='SUBMISSION_ACCEPTED' WHERE id=$1`, [
+      SET live_reserved=TRUE,status='SUBMITTED',last_reason_code='SUBMISSION_ACCEPTED' WHERE id=$1`, [
       submittedAfterDeadline.id,
     ]);
     const confirmationClaim = await second.claim({
@@ -2324,7 +2336,7 @@ void test('real PostgreSQL rejects ABA replay, immutable drift, and parent-attem
     });
     await repository.create(abaDraft);
     await pool.query(`UPDATE execution_intents
-      SET status='UNKNOWN_REQUIRES_RECONCILIATION',
+      SET live_reserved=TRUE,status='UNKNOWN_REQUIRES_RECONCILIATION',
         last_reason_code='RECONCILIATION_REQUIRED' WHERE id=$1`, [abaDraft.id]);
     const original = required(await repository.claim({
       ownerId: 'aba-worker', leaseMs: 60_000, purpose: 'RECONCILE',
@@ -2576,6 +2588,7 @@ async function seedLiveExecuteBuyTarget(
     // The armament itself is tested by its own guarded write suite. This fixture
     // isolates the repository claim predicate from that upstream construction path.
     await client.query('SET session_replication_role=replica');
+    await client.query('UPDATE execution_intents SET live_reserved=TRUE WHERE id=$1', [intent.id]);
     await client.query(`INSERT INTO execution_wallet_generations (
       generation_id,wallet_public_key,cluster,genesis_hash,generation
     ) VALUES ($1,'11111111111111111111111111111111','mainnet-beta',
@@ -2642,6 +2655,15 @@ async function seedLiveExecuteBuyTarget(
   } finally {
     try { await client.query('SET session_replication_role=origin'); } finally { client.release(); }
   }
+}
+
+async function reserveLiveIntents(
+  pool: InstanceType<typeof pg.Pool>,
+  intentIds: readonly string[],
+): Promise<void> {
+  const reserved = await pool.query(`UPDATE execution_intents SET live_reserved=TRUE
+    WHERE id=ANY($1::TEXT[]) AND live_reserved=FALSE`, [intentIds]);
+  assert.equal(reserved.rowCount, intentIds.length);
 }
 
 type Row = Record<string, unknown>;

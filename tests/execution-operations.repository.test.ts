@@ -423,7 +423,8 @@ void test('does not terminalize a V2 LOCKED armament from an operations stop', a
       request: fixture.request, authorization: fixture.authorization,
     }));
     const claimed = await fixture.intents.claim({
-      ownerId: 'canary-lock-holder', leaseMs: 30_000, purpose: 'EXECUTE',
+      ownerId: 'canary-lock-holder', leaseMs: 30_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+      generationId,
     });
     if (claimed === null) assert.fail('Expected the canary target to be claimed.');
     const processingIntent = await fixture.intents.transition(claimed, {
