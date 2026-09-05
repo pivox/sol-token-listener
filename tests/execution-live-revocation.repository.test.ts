@@ -189,6 +189,32 @@ for (const initialState of ['PERSISTED', 'SIGNED_SIMULATED'] as const) {
     });
 }
 
+void test('persisted BUY startup binds every operator-authorized runtime limit', async (context) => {
+  const databaseUrl = requiredDatabaseUrl(context);
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await createPersistedBuyFixture(pool, 'PERSISTED');
+    const binding = runnableBinding(fixture.runtime);
+    await fixture.live.assertRunnableWork(binding);
+    const divergentBindings = [
+      { ...binding, quoteMaxAgeMs: binding.quoteMaxAgeMs - 1 },
+      { ...binding, slippageBps: binding.slippageBps + 1n },
+      { ...binding, snapshotMaxSlotLag: binding.snapshotMaxSlotLag + 1 },
+      { ...binding, maxComputeUnits: binding.maxComputeUnits + 1n },
+      { ...binding, maxFeeLamports: binding.maxFeeLamports + 1n },
+      { ...binding, maxFeePayerLamportDebit: binding.maxFeePayerLamportDebit + 1n },
+      { ...binding, maxRpcCallsPerAttempt: binding.maxRpcCallsPerAttempt + 1 },
+      { ...binding, leaseMs: binding.leaseMs + 1 },
+    ];
+    for (const divergent of divergentBindings) {
+      await assert.rejects(
+        fixture.live.assertRunnableWork(Object.freeze(divergent)),
+        isLiveRepositoryError('LIVE_EXECUTOR_NO_WORK'),
+      );
+    }
+  });
+});
+
 void test('worker restart durably routes SUBMISSION_STARTED to ambiguity without RPC send',
   async (context) => {
     const databaseUrl = requiredDatabaseUrl(context);
@@ -637,7 +663,14 @@ function runnableBinding(runtime: Awaited<ReturnType<typeof createBuyFixture>>['
     cluster: runtime.cluster,
     genesisHash: runtime.expectedGenesisHash,
     providerId: runtime.providerId,
+    quoteMaxAgeMs: runtime.quoteMaxAgeMs,
+    slippageBps: runtime.slippageBps,
+    snapshotMaxSlotLag: runtime.snapshotMaxSlotLag,
+    maxComputeUnits: runtime.maxComputeUnits,
+    maxFeeLamports: runtime.maxFeeLamports,
+    maxFeePayerLamportDebit: runtime.maxFeePayerLamportDebit,
     maxRpcCallsPerAttempt: runtime.maxRpcCallsPerAttempt,
+    leaseMs: runtime.leaseMs,
   });
 }
 

@@ -137,7 +137,14 @@ function startupWorkBinding(config: LiveExecutorConfig): ExecutionLiveRunnableWo
     cluster: config.cluster,
     genesisHash: config.expectedGenesisHash,
     providerId: config.providerId,
+    quoteMaxAgeMs: config.quoteMaxAgeMs,
+    slippageBps: config.slippageBps,
+    snapshotMaxSlotLag: config.snapshotMaxSlotLag,
+    maxComputeUnits: config.maxComputeUnits,
+    maxFeeLamports: config.maxFeeLamports,
+    maxFeePayerLamportDebit: config.maxFeePayerLamportDebit,
     maxRpcCallsPerAttempt: config.maxRpcCallsPerAttempt,
+    leaseMs: config.leaseMs,
   });
 }
 

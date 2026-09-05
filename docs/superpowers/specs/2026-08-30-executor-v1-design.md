@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.0
+**Version de spécification :** 1.11.1
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 et préparation opérateur exacte #51-H2c
 
 ## Historique des versions
+
+- **1.11.1 — 2026-09-05 :** impose au démarrage H2b la correspondance des
+  huit limites runtime avec l'armement V2, y compris pour une reprise BUY
+  persistée ou une sortie ouverte, avant tout chargement du signer.
 
 - **1.11.0 — 2026-09-05 :** livre H2c en état
   `READY_FOR_EXTERNAL_PREFLIGHT` : sidecar canary signé, armement lié à une

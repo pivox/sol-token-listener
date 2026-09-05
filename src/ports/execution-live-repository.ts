@@ -289,7 +289,14 @@ export interface ExecutionLiveRunnableWorkBindingV1 {
   readonly cluster: 'mainnet-beta';
   readonly genesisHash: string;
   readonly providerId: string;
+  readonly quoteMaxAgeMs: number;
+  readonly slippageBps: bigint;
+  readonly snapshotMaxSlotLag: number;
+  readonly maxComputeUnits: bigint;
+  readonly maxFeeLamports: bigint;
+  readonly maxFeePayerLamportDebit: bigint;
   readonly maxRpcCallsPerAttempt: number;
+  readonly leaseMs: number;
 }
 
 export interface ExecutionLiveRepository {

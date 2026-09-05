@@ -142,7 +142,8 @@ const RUNTIME_BINDING_KEYS = Object.freeze([
 const RUNNABLE_WORK_BINDING_KEYS = Object.freeze([
   'payloadVersion', 'generationId', 'phase', 'buildHash', 'configurationFingerprint',
   'strategyFingerprint', 'walletPublicKey', 'cluster', 'genesisHash', 'providerId',
-  'maxRpcCallsPerAttempt',
+  'quoteMaxAgeMs', 'slippageBps', 'snapshotMaxSlotLag', 'maxComputeUnits',
+  'maxFeeLamports', 'maxFeePayerLamportDebit', 'maxRpcCallsPerAttempt', 'leaseMs',
 ] as const);
 const RUNNABLE_WORK_SQL = `SELECT (
   EXISTS (SELECT 1 FROM execution_activation_armaments armament
@@ -156,6 +157,14 @@ const RUNNABLE_WORK_SQL = `SELECT (
       AND armament.configuration_fingerprint=$4 AND armament.strategy_fingerprint=$5
       AND armament.wallet_public_key=$6 AND armament.cluster=$7
       AND armament.genesis_hash=$8 AND armament.provider_id=$9
+      AND armament.runtime_quote_max_age_ms=$10
+      AND armament.runtime_slippage_bps=$11::NUMERIC
+      AND armament.runtime_snapshot_max_slot_lag=$12
+      AND armament.runtime_max_compute_units=$13::NUMERIC
+      AND armament.runtime_max_fee_lamports=$14::NUMERIC
+      AND armament.runtime_max_fee_payer_lamport_debit=$15::NUMERIC
+      AND armament.runtime_max_rpc_calls_per_attempt=$16
+      AND armament.runtime_lease_ms=$17
       AND armament.state='ARMED' AND armament.state_revision=0
       AND armament.consumed_buys=0 AND armament.expires_at>statement_timestamp()
       AND intent.id=armament.target_intent_id AND intent.side='BUY'
@@ -177,9 +186,17 @@ const RUNNABLE_WORK_SQL = `SELECT (
       AND armament.build_hash=$3 AND armament.configuration_fingerprint=$4
       AND armament.strategy_fingerprint=$5 AND armament.wallet_public_key=$6
       AND armament.cluster=$7 AND armament.genesis_hash=$8 AND armament.provider_id=$9
+      AND armament.runtime_quote_max_age_ms=$10
+      AND armament.runtime_slippage_bps=$11::NUMERIC
+      AND armament.runtime_snapshot_max_slot_lag=$12
+      AND armament.runtime_max_compute_units=$13::NUMERIC
+      AND armament.runtime_max_fee_lamports=$14::NUMERIC
+      AND armament.runtime_max_fee_payer_lamport_debit=$15::NUMERIC
+      AND armament.runtime_max_rpc_calls_per_attempt=$16
+      AND armament.runtime_lease_ms=$17
       AND budget.intent_id=transaction.intent_id
       AND budget.attempt_number=transaction.attempt_number
-      AND budget.provider_id=$9 AND budget.calls_limit=$10)
+      AND budget.provider_id=$9 AND budget.calls_limit=$16)
   OR EXISTS (SELECT 1 FROM execution_live_positions position
     JOIN execution_exit_authorizations exit_auth ON exit_auth.position_id=position.position_id
     JOIN execution_activation_armaments armament ON armament.armament_id=position.armament_id
@@ -190,7 +207,15 @@ const RUNNABLE_WORK_SQL = `SELECT (
       AND armament.generation_id=$1 AND armament.phase=$2 AND armament.build_hash=$3
       AND armament.configuration_fingerprint=$4 AND armament.strategy_fingerprint=$5
       AND armament.wallet_public_key=$6 AND armament.cluster=$7
-      AND armament.genesis_hash=$8 AND armament.provider_id=$9)
+      AND armament.genesis_hash=$8 AND armament.provider_id=$9
+      AND armament.runtime_quote_max_age_ms=$10
+      AND armament.runtime_slippage_bps=$11::NUMERIC
+      AND armament.runtime_snapshot_max_slot_lag=$12
+      AND armament.runtime_max_compute_units=$13::NUMERIC
+      AND armament.runtime_max_fee_lamports=$14::NUMERIC
+      AND armament.runtime_max_fee_payer_lamport_debit=$15::NUMERIC
+      AND armament.runtime_max_rpc_calls_per_attempt=$16
+      AND armament.runtime_lease_ms=$17)
 ) AS runnable_work`;
 export class PostgresExecutionLiveRepository {
   readonly #source: DatabaseSource;
@@ -219,7 +244,10 @@ export class PostgresExecutionLiveRepository {
         binding.generationId, binding.phase, binding.buildHash,
         binding.configurationFingerprint, binding.strategyFingerprint,
         binding.walletPublicKey, binding.cluster, binding.genesisHash,
-        binding.providerId, binding.maxRpcCallsPerAttempt,
+        binding.providerId, binding.quoteMaxAgeMs, binding.slippageBps.toString(),
+        binding.snapshotMaxSlotLag, binding.maxComputeUnits.toString(),
+        binding.maxFeeLamports.toString(), binding.maxFeePayerLamportDebit.toString(),
+        binding.maxRpcCallsPerAttempt, binding.leaseMs,
       ])), ['runnable_work'] as const);
       if (row.runnable_work !== true) throw failure('LIVE_EXECUTOR_NO_WORK');
     });
@@ -3883,9 +3911,25 @@ function runnableWorkBindingFrom(
     || record.cluster !== 'mainnet-beta'
     || typeof record.genesisHash !== 'string' || !PUBLIC_KEY.test(record.genesisHash)
     || typeof record.providerId !== 'string' || !PROVIDER_ID.test(record.providerId)
+    || typeof record.quoteMaxAgeMs !== 'number' || !Number.isSafeInteger(record.quoteMaxAgeMs)
+    || record.quoteMaxAgeMs < 1 || record.quoteMaxAgeMs > 60_000
+    || typeof record.slippageBps !== 'bigint'
+    || record.slippageBps < 0n || record.slippageBps > 10_000n
+    || typeof record.snapshotMaxSlotLag !== 'number'
+    || !Number.isSafeInteger(record.snapshotMaxSlotLag)
+    || record.snapshotMaxSlotLag < 0 || record.snapshotMaxSlotLag > 128
+    || typeof record.maxComputeUnits !== 'bigint'
+    || record.maxComputeUnits < 1n || record.maxComputeUnits > 1_400_000n
+    || typeof record.maxFeeLamports !== 'bigint'
+    || record.maxFeeLamports < 0n || record.maxFeeLamports > 10_000_000n
+    || typeof record.maxFeePayerLamportDebit !== 'bigint'
+    || record.maxFeePayerLamportDebit < 0n
+    || record.maxFeePayerLamportDebit > 10_000_000_000n
     || typeof record.maxRpcCallsPerAttempt !== 'number'
     || !Number.isSafeInteger(record.maxRpcCallsPerAttempt)
-    || record.maxRpcCallsPerAttempt < 12 || record.maxRpcCallsPerAttempt > 16) {
+    || record.maxRpcCallsPerAttempt < 12 || record.maxRpcCallsPerAttempt > 16
+    || typeof record.leaseMs !== 'number' || !Number.isSafeInteger(record.leaseMs)
+    || record.leaseMs < 3_000 || record.leaseMs > 120_000) {
     throw failure('INVALID_INPUT');
   }
   return Object.freeze({ ...value });

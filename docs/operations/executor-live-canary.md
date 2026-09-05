@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.5.0 — 2026-09-05
+**Version :** 1.5.1 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -107,8 +107,9 @@ listener et API ne gagnent aucune autorité H2c.
    atomiques ; tout écart laisse zéro capacité live.
 7. Seulement après inspection humaine de l'armement, démarrer H2a avec son
    environnement dédié, puis H2b avec le sien. Le démarrage H2b valide rôle,
-   migration 039, génération, bindings, genesis et absence d'état incohérent
-   avant de charger le signer. Il ne doit traiter que la cible armée.
+   migration 039, génération, genesis, les huit limites runtime exactes et
+   absence d'état incohérent avant de charger le signer. Il ne doit traiter
+   que la cible armée, y compris après redémarrage sur un artefact persisté.
 8. Surveiller continuellement les sorties structurées H2a/H2b et les commandes
    `live:status`/`live:report`. Toute dérive, lock pré-signature abandonné,
    expiration, échec de gate ou ambiguïté impose au minimum `ENTRY_STOP`.

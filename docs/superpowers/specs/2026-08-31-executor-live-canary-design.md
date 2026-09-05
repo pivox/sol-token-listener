@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.0
+**Version de spécification :** 1.2.1
 
-**Version de la spécification parente :** 1.11.0
+**Version de la spécification parente :** 1.11.1
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.1 — 2026-09-05 :** refuse avant ouverture du signer toute reprise
+  dont une limite runtime diffère de l'armement exact autorisé.
 
 - **1.2.0 — 2026-09-05 :** constate H2c prêt pour un préflight externe,
   avec armement exact V2, réservation d'exposition atomique, lock

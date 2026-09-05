@@ -1,8 +1,8 @@
 # Armement opérateur exact et préparation du canary — conception #51-H2c
 
-**Version de spécification :** 1.1.0
+**Version de spécification :** 1.1.1
 
-**Version de la spécification parente :** 1.11.0
+**Version de la spécification parente :** 1.11.1
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-H2b fusionnée par la PR #78 (`bcc983b`)
 
 ## Historique des versions
+
+- **1.1.1 — 2026-09-05 :** étend le gate de démarrage aux huit limites
+  runtime de l'armement V2 pour les cibles fraîches, artefacts persistés et
+  sorties ouvertes ; aucune configuration plus permissive ne charge le signer.
 
 - **1.1.0 — 2026-09-05 :** livre les contrats H2c, la migration 039,
   l'armement V2 exact, le lock durable avant signature, sa récupération
@@ -377,6 +381,11 @@ exactement au runtime :
 - armement CANARY V2 frais et cible BUY encore éligible ;
 - position/autorisation de sortie ouverte nécessitant la capacité SELL ;
 - artefact persisté à reprendre.
+
+Dans chacun de ces états, le démarrage compare `quoteMaxAgeMs`, `slippageBps`,
+`snapshotMaxSlotLag`, `maxComputeUnits`, `maxFeeLamports`,
+`maxFeePayerLamportDebit`, `maxRpcCallsPerAttempt` et `leaseMs` aux colonnes
+`runtime_*` de l'armement V2. Toute divergence échoue avant le keypair.
 
 Sinon il échoue avec un code redacted stable et ferme PostgreSQL sans charger le
 signer. Ce comportement fait volontairement de H2b un exécuteur à la demande,

@@ -1,8 +1,8 @@
 # Runtime signable de l'exécuteur live — conception #51-H2b
 
-**Version de spécification :** 1.1.0
+**Version de spécification :** 1.1.1
 
-**Version de la spécification parente :** 1.11.0
+**Version de la spécification parente :** 1.11.1
 
 **Version de l'orchestration persistante H1 :** 1.2.0
 
@@ -17,6 +17,10 @@
 **Issue parente :** #51
 
 ## Historique des versions
+
+- **1.1.1 — 2026-09-05 :** lie au startup toutes les limites runtime de
+  l'armement V2, notamment lors de la reprise d'un BUY déjà persisté, avant
+  tout chargement du signer.
 
 - **1.1.0 — 2026-09-05 :** intègre la frontière H2c sans élargir le rôle du
   runtime : un BUY canary exige désormais un armement V2 ciblé, sa réservation
