@@ -3,6 +3,10 @@ import {
   createExecutionWalletGeneration,
 } from '../../src/domain/execution-readiness.js';
 import { createExecutionIntentDraft } from '../../src/domain/execution-intent.js';
+import {
+  createExecutionSimulationArtifact,
+  createExecutionSimulationArtifactDraft,
+} from '../../src/domain/execution-simulation.js';
 import type {
   ExecutionPreflightDraftSourceV1,
   ExecutionPreflightGateCatalogV1,
@@ -49,6 +53,27 @@ export function preflightDraftInputs(): Readonly<{
     attemptCount: 0, stateRevision: 0n, lastReasonCode: null, terminalAtMs: null,
     reconciliationCompletedAtMs: null, purgeAfterMs: null,
     createdAtMs: NOW_MS - 2_000, updatedAtMs: NOW_MS - 2_000 });
+  const simulation = createExecutionSimulationArtifact(
+    createExecutionSimulationArtifactDraft(Object.freeze({
+      intentId: base.targetIntentId, attemptNumber: 1, intentStateRevision: 2n,
+      strategyId: 'mainnet-preflight-v1', strategyVersion: 1,
+      decisionFingerprint: 'e'.repeat(64), resultKind: 'SUCCESS', effectiveVenue: 'PUMP_FUN',
+      providerId: q.providerId, executorPublicKey: q.walletPublicKey,
+      expectedGenesisHash: q.genesisHash, observedGenesisHash: q.genesisHash,
+      configurationFingerprint: q.configurationFingerprint, quoteFingerprint: '1'.repeat(64),
+      snapshotFingerprint: '2'.repeat(64), buildFingerprint: q.buildHash,
+      messageHash: '3'.repeat(64), blockhash: q.genesisHash, lastValidBlockHeight: 1_000n,
+      blockhashContextSlot: 900n, snapshotSlot: 899n, feeContextSlot: 900n,
+      simulationSlot: 901n, amountInRaw: 10_000n, expectedAmountOutRaw: 9_000n,
+      protectedAmountOutRaw: 8_500n, feesRaw: 100n, estimatedFeeLamports: 5_000n,
+      simulatedFeePayerLamportDebit: 5_100n, unitsConsumed: 200_000n,
+      simulatedBaseDeltaRaw: 9_000n, simulatedQuoteDeltaRaw: -10_000n,
+      rpcCallsUsed: 5, rpcCallsLimit: 8, quoteStatus: 'SUCCEEDED', buildStatus: 'SUCCEEDED',
+      simulationStatus: 'SUCCEEDED', failureStage: null, failureCode: null,
+      terminalReasonCode: 'INTENT_SUCCEEDED', logsFingerprint: '4'.repeat(64), logsLineCount: 1,
+    })),
+    NOW_MS - 1_000,
+  );
   return Object.freeze({
     source: Object.freeze({
       schemaVersion: 'execution-preflight-draft-source.v1', readiness,
@@ -57,15 +82,7 @@ export function preflightDraftInputs(): Readonly<{
         genesisHash: generation.genesisHash, generation: 1 }),
       walletSnapshot: wallet, providerSnapshot: provider,
       target: Object.freeze({ intent, leaseOwner: null, leaseToken: null, leaseExpiresAtMs: null }),
-      simulation: Object.freeze({
-        artifactId: `execution_simulation_artifact_${'f'.repeat(64)}`,
-        resultFingerprint: 'e'.repeat(64), resultKind: 'SUCCESS', intentId: base.targetIntentId,
-        intentStateRevision: 2n, strategyId: 'mainnet-preflight-v1', strategyVersion: 1,
-        decisionFingerprint: 'e'.repeat(64), providerId: q.providerId,
-        executorPublicKey: q.walletPublicKey, expectedGenesisHash: q.genesisHash,
-        observedGenesisHash: q.genesisHash, buildFingerprint: q.buildHash,
-        configurationFingerprint: q.configurationFingerprint, recordedAtMs: NOW_MS - 1_000,
-      }),
+      simulation,
       databaseNowMs: NOW_MS,
     }),
     catalog: Object.freeze({

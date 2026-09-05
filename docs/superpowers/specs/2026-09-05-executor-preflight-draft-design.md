@@ -53,7 +53,7 @@ EXECUTOR_PREFLIGHT_DRAFT_PATH=/chemin/hors-git/draft.json
 `execution-preflight-draft-source.v1` contient le manifeste H2d, la génération
 complète avec son numéro permettant de recalculer son ID déterministe,
 les snapshots complets, l'intention BUY complète avec son identité recalculable
-et son absence exacte de lease, et l'artefact de simulation déjà lus
+et son absence exacte de lease, et l'artefact de simulation complet déjà lus
 à une même photographie PostgreSQL, plus l'horloge de cette photographie.
 H2h produira cet export ; avant H2h, une saisie manuelle ne vaut pas preuve.
 
@@ -74,7 +74,8 @@ existants. Il exige :
 - intention `BUY/PENDING`, WSOL/SPL/9, tentative zéro, non louée et fraîche ;
 - artefact `SUCCESS` #51-D lié au même wallet/provider/genesis/build/configuration,
   âgé d'au plus 30 secondes ; son intention de simulation est distincte de la
-  cible canary `PENDING`, conformément au cycle durable existant ;
+  cible canary `PENDING`, conformément au cycle durable existant ; son ID et
+  son result fingerprint sont recalculés par le domaine avant utilisation ;
 - huit gates externes dans l'ordre et couvrant les cinq minutes de qualification ;
 - snapshots dans les deadlines dérivées de la policy avec cinq secondes de marge.
 

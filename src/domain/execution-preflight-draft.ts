@@ -3,6 +3,10 @@ import {
   assertExecutionIntent,
   type ExecutionIntentV1,
 } from './execution-intent.js';
+import {
+  assertExecutionSimulationArtifact,
+  type ExecutionSimulationArtifactV1,
+} from './execution-simulation.js';
 import type { ProviderUsageSnapshotV1 } from './execution-provider-quota.js';
 import { createProviderUsageSnapshot } from './execution-provider-quota.js';
 import {
@@ -34,13 +38,6 @@ const GENERATION_KEYS = Object.freeze([
 ] as const);
 const TARGET_KEYS = Object.freeze([
   'intent', 'leaseOwner', 'leaseToken', 'leaseExpiresAtMs',
-] as const);
-const SIMULATION_KEYS = Object.freeze([
-  'artifactId', 'resultFingerprint', 'resultKind', 'intentId',
-  'intentStateRevision', 'strategyId', 'strategyVersion', 'decisionFingerprint',
-  'providerId', 'executorPublicKey', 'expectedGenesisHash',
-  'observedGenesisHash', 'buildFingerprint', 'configurationFingerprint',
-  'recordedAtMs',
 ] as const);
 const GATE_KEYS = Object.freeze([
   'payloadVersion', 'gateId', 'status', 'evidenceType', 'evidenceId',
@@ -80,24 +77,6 @@ export interface ExecutionPreflightTargetV1 {
   readonly leaseExpiresAtMs: null;
 }
 
-export interface ExecutionPreflightSimulationV1 {
-  readonly artifactId: string;
-  readonly resultFingerprint: string;
-  readonly resultKind: 'SUCCESS';
-  readonly intentId: string;
-  readonly intentStateRevision: bigint;
-  readonly strategyId: string;
-  readonly strategyVersion: number;
-  readonly decisionFingerprint: string;
-  readonly providerId: string;
-  readonly executorPublicKey: string;
-  readonly expectedGenesisHash: string;
-  readonly observedGenesisHash: string;
-  readonly buildFingerprint: string;
-  readonly configurationFingerprint: string;
-  readonly recordedAtMs: number;
-}
-
 export interface ExecutionPreflightDraftSourceV1 {
   readonly schemaVersion: 'execution-preflight-draft-source.v1';
   readonly readiness: ExecutionReadinessManifestV1;
@@ -111,7 +90,7 @@ export interface ExecutionPreflightDraftSourceV1 {
   readonly walletSnapshot: ExecutionWalletSnapshotV1;
   readonly providerSnapshot: ProviderUsageSnapshotV1;
   readonly target: ExecutionPreflightTargetV1;
-  readonly simulation: ExecutionPreflightSimulationV1;
+  readonly simulation: ExecutionSimulationArtifactV1;
   readonly databaseNowMs: number;
 }
 
@@ -248,26 +227,17 @@ function targetFrom(value: unknown): ExecutionIntentV1 {
   return intent;
 }
 
-function simulationFrom(value: unknown): ExecutionPreflightSimulationV1 {
-  const row = exactRecord(value, SIMULATION_KEYS);
-  if (row.resultKind !== 'SUCCESS') throw invalid();
-  return Object.freeze({
-    artifactId: patterned(row.artifactId,
-      /^execution_simulation_artifact_[0-9a-f]{64}$/u, 94),
-    resultFingerprint: fingerprint(row.resultFingerprint), resultKind: 'SUCCESS',
-    intentId: patterned(row.intentId, /^execution_intent_[0-9a-f]{64}$/u, 81),
-    intentStateRevision: unsignedBigint(row.intentStateRevision),
-    strategyId: text(row.strategyId, 256),
-    strategyVersion: integer(row.strategyVersion, 1, 2_147_483_647),
-    decisionFingerprint: fingerprint(row.decisionFingerprint),
-    providerId: identifier(row.providerId),
-    executorPublicKey: publicKeyText(row.executorPublicKey),
-    expectedGenesisHash: publicKeyText(row.expectedGenesisHash),
-    observedGenesisHash: publicKeyText(row.observedGenesisHash),
-    buildFingerprint: fingerprint(row.buildFingerprint),
-    configurationFingerprint: fingerprint(row.configurationFingerprint),
-    recordedAtMs: timestamp(row.recordedAtMs),
-  });
+type SuccessfulExecutionSimulationArtifactV1 = ExecutionSimulationArtifactV1 & Readonly<{
+  resultKind: 'SUCCESS';
+  observedGenesisHash: string;
+  buildFingerprint: string;
+}>;
+
+function simulationFrom(value: unknown): SuccessfulExecutionSimulationArtifactV1 {
+  assertExecutionSimulationArtifact(value);
+  if (value.resultKind !== 'SUCCESS' || value.observedGenesisHash === null
+    || value.buildFingerprint === null) throw invalid();
+  return value as SuccessfulExecutionSimulationArtifactV1;
 }
 
 function staticGatesFrom(
@@ -296,7 +266,7 @@ function staticGatesFrom(
 function assertSourceBindings(
   generation: Readonly<Record<(typeof GENERATION_KEYS)[number], unknown>>,
   target: ExecutionIntentV1,
-  simulation: ExecutionPreflightSimulationV1,
+  simulation: SuccessfulExecutionSimulationArtifactV1,
   wallet: ExecutionWalletSnapshotV1,
   provider: ProviderUsageSnapshotV1,
   nowMs: number,
@@ -390,16 +360,10 @@ function patterned(value: unknown, pattern: RegExp, max: number): string {
   return value;
 }
 function text(value: unknown, max: number): string { return patterned(value, /^[\x20-\x7E]{1,}$/u, max); }
-function identifier(value: unknown): string { return patterned(value, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u, 64); }
-function publicKeyText(value: unknown): string { return patterned(value, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/u, 44); }
 function fingerprint(value: unknown): string { return patterned(value, /^[0-9a-f]{64}$/u, 64); }
 function integer(value: unknown, min: number, max: number): number {
   if (!Number.isSafeInteger(value) || (value as number) < min || (value as number) > max) throw invalid();
   return value as number;
 }
 function timestamp(value: unknown): number { return integer(value, 0, 8_640_000_000_000_000); }
-function unsignedBigint(value: unknown): bigint {
-  if (typeof value !== 'bigint' || value < 0n || value > 18_446_744_073_709_551_615n) throw invalid();
-  return value;
-}
 function invalid(): ExecutionPreflightDraftValidationError { return new ExecutionPreflightDraftValidationError(); }

@@ -35,6 +35,13 @@ void test('recomputes and rejects a forged wallet generation identity', () => {
   }), input.catalog), /Invalid execution preflight draft/u);
 });
 
+void test('reconstructs and rejects a forged simulation artifact fingerprint', () => {
+  const input = preflightDraftInputs();
+  assert.throws(() => createExecutionPreflightDraft(Object.freeze({ ...input.source,
+    simulation: Object.freeze({ ...input.source.simulation, resultFingerprint: 'f'.repeat(64) }),
+  }), input.catalog), /Invalid execution preflight draft/u);
+});
+
 void test('rejects missing or reordered static gates', () => {
   const input = preflightDraftInputs();
   assert.throws(() => createExecutionPreflightDraft(input.source, Object.freeze({
