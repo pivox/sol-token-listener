@@ -3,6 +3,7 @@ import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
 import type pg from 'pg';
 import {
+  assertCanonicalUnsignedV0Transaction,
   createExecutionExitAuthorization,
   createExecutionLivePosition,
   createSignedTransactionArtifact,
@@ -53,6 +54,9 @@ import type {
   ExecutionLiveSubmissionOutcomeV1,
   ExecutionLiveSubmissionOutcomeResultV1,
   ExecutionLiveRuntimeBindingV1,
+  ExecutionExactSigningAuthorizationV1,
+  ExecutionExactSigningInputV1,
+  ExecutionUnsignedSigningMaterialV1,
 } from '../ports/execution-live-repository.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
 import { getDatabasePool } from './database.js';
@@ -125,7 +129,9 @@ const AUTHORITATIVE_CLAIM_PROJECTION = `
 const RUNTIME_BINDING_KEYS = Object.freeze([
   'payloadVersion', 'phase', 'buildHash', 'configurationFingerprint',
   'strategyFingerprint', 'walletPublicKey', 'cluster', 'expectedGenesisHash',
-  'observedGenesisHash', 'providerId',
+  'observedGenesisHash', 'providerId', 'quoteMaxAgeMs', 'slippageBps',
+  'snapshotMaxSlotLag', 'maxComputeUnits', 'maxFeeLamports',
+  'maxFeePayerLamportDebit', 'maxRpcCallsPerAttempt', 'leaseMs',
 ] as const);
 export class PostgresExecutionLiveRepository {
   readonly #source: DatabaseSource;
@@ -155,6 +161,267 @@ export class PostgresExecutionLiveRepository {
     return this.transaction((client) => input.claim.intent.side === 'BUY'
       ? readBuyPreparationBinding(client, input)
       : readSellPreparationBinding(client, input));
+  }
+
+  public async authorizeExactSigning(
+    inputValue: ExecutionExactSigningInputV1,
+  ): Promise<ExecutionExactSigningAuthorizationV1> {
+    const input = exactSigningInputFrom(inputValue);
+    return this.transaction(async (client) => {
+      await lockLiveSellPresenceInTransaction(client);
+      await lockGeneration(client, input.generationId);
+      await lockProvider(client, input.runtime.providerId);
+      const existing = await client.query(`SELECT lock.*,
+        trunc(EXTRACT(EPOCH FROM lock.quote_observed_at)*1000)::TEXT AS quote_observed_at_ms,
+        trunc(EXTRACT(EPOCH FROM lock.quote_expires_at)*1000)::TEXT AS quote_expires_at_ms,
+        armament.state AS armament_state,
+        armament.payload_version AS armament_payload_version,
+        armament.state_revision::TEXT AS armament_state_revision,
+        armament.consumed_buys,armament.locked_intent_id,
+        armament.locked_attempt_number,armament.locked_reservation_id,
+        armament.locked_lease_token::TEXT AS armament_locked_lease_token,
+        armament.qualification_id,armament.phase AS armament_phase,
+        armament.build_hash AS armament_build_hash,
+        armament.configuration_fingerprint AS armament_configuration_fingerprint,
+        armament.strategy_fingerprint AS armament_strategy_fingerprint,
+        armament.wallet_public_key AS armament_wallet_public_key,
+        armament.cluster AS armament_cluster,armament.genesis_hash AS armament_genesis_hash,
+        armament.provider_id AS armament_provider_id,
+        armament.runtime_quote_max_age_ms,armament.runtime_slippage_bps::TEXT,
+        armament.runtime_snapshot_max_slot_lag,armament.runtime_max_compute_units::TEXT,
+        armament.runtime_max_fee_lamports::TEXT,armament.runtime_max_fee_payer_lamport_debit::TEXT,
+        armament.runtime_max_rpc_calls_per_attempt,armament.runtime_lease_ms,
+        trunc(EXTRACT(EPOCH FROM armament.expires_at)*1000)::TEXT AS armament_expires_at_ms,
+        qualification.phase AS qualification_phase,
+        qualification.build_hash AS qualification_build_hash,
+        qualification.configuration_fingerprint AS qualification_configuration_fingerprint,
+        qualification.strategy_fingerprint AS qualification_strategy_fingerprint,
+        qualification.wallet_public_key AS qualification_wallet_public_key,
+        qualification.cluster AS qualification_cluster,
+        qualification.genesis_hash AS qualification_genesis_hash,
+        qualification.provider_id AS qualification_provider_id,
+        trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT AS qualification_expires_at_ms,
+        control.state AS control_state,risk.unknown_block,
+        wallet.superseded_at AS wallet_superseded_at,
+        provider.superseded_at AS provider_superseded_at,
+        trunc(EXTRACT(EPOCH FROM provider.expires_at)*1000)::TEXT AS provider_expires_at_ms,
+        wallet_gate.status AS wallet_gate_status,
+        wallet_gate.evidence_fingerprint AS wallet_gate_fingerprint,
+        trunc(EXTRACT(EPOCH FROM wallet_gate.expires_at)*1000)::TEXT AS wallet_gate_expires_at_ms,
+        provider_gate.status AS provider_gate_status,
+        provider_gate.evidence_fingerprint AS provider_gate_fingerprint,
+        trunc(EXTRACT(EPOCH FROM provider_gate.expires_at)*1000)::TEXT AS provider_gate_expires_at_ms,
+        intent.status AS intent_status,
+        intent.state_revision::TEXT AS current_intent_state_revision,
+        intent.lease_owner,intent.lease_token::TEXT AS current_lease_token,
+        trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+        trunc(EXTRACT(EPOCH FROM intent.expires_at)*1000)::TEXT AS intent_expires_at_ms,
+        attempt.status AS attempt_status,attempt.provider_id AS attempt_provider_id,
+        trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms
+        FROM execution_pre_signature_locks lock
+        JOIN execution_activation_armaments armament ON armament.armament_id=lock.armament_id
+        JOIN execution_intents intent ON intent.id=lock.intent_id
+        JOIN execution_attempts attempt ON attempt.intent_id=lock.intent_id
+          AND attempt.attempt_number=lock.attempt_number
+        JOIN execution_safety_qualifications qualification
+          ON qualification.qualification_id=armament.qualification_id
+        JOIN execution_control_state control ON control.generation_id=lock.generation_id
+        JOIN execution_wallet_risk_state risk ON risk.generation_id=lock.generation_id
+        JOIN execution_wallet_snapshots wallet
+          ON wallet.snapshot_fingerprint=lock.wallet_snapshot_fingerprint
+        JOIN execution_provider_usage_snapshots provider
+          ON provider.snapshot_fingerprint=lock.provider_snapshot_fingerprint
+            AND provider.provider_id=lock.provider_id
+        JOIN execution_safety_gate_evidence provider_gate
+          ON provider_gate.qualification_id=qualification.qualification_id
+            AND provider_gate.gate_index=7 AND provider_gate.gate_id='PROVIDER_EXIT_CAPACITY_VERIFIED'
+        JOIN execution_safety_gate_evidence wallet_gate
+          ON wallet_gate.qualification_id=qualification.qualification_id
+            AND wallet_gate.gate_index=9 AND wallet_gate.gate_id='WALLET_CHAIN_LIMITS_VERIFIED'
+        WHERE lock.intent_id=$1 AND lock.attempt_number=$2::INTEGER
+        FOR UPDATE OF lock,armament,intent`, [input.claim.intent.id, input.attempt.attemptNumber]);
+      if (existing.rows.length > 1) throw failure('INVALID_DATA');
+      if (existing.rows.length === 1) {
+        return exactSigningReplay(singleRow(existing), input);
+      }
+      const row = singleRow(await client.query(`SELECT
+        trunc(EXTRACT(EPOCH FROM statement_timestamp())*1000)::TEXT AS now_ms,
+        intent.status AS intent_status,intent.side AS intent_side,
+        intent.state_revision::TEXT AS intent_state_revision,intent.attempt_count,
+        intent.lease_owner,intent.lease_token::TEXT AS lease_token,
+        trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+        trunc(EXTRACT(EPOCH FROM intent.expires_at)*1000)::TEXT AS intent_expires_at_ms,
+        intent.strategy_id,intent.strategy_version,intent.decision_fingerprint,
+        intent.mint,intent.quote_mint,intent.quote_amount_raw::TEXT AS intent_quote_amount_raw,
+        attempt.status AS attempt_status,attempt.provider_id AS attempt_provider_id,
+        trunc(EXTRACT(EPOCH FROM attempt.started_at)*1000)::TEXT AS attempt_started_at_ms,
+        generation.generation_id,generation.wallet_public_key AS generation_wallet_public_key,
+        generation.cluster AS generation_cluster,generation.genesis_hash AS generation_genesis_hash,
+        generation.retired_at,control.state AS control_state,
+        qualification.qualification_id,qualification.qualification_fingerprint,
+        qualification.phase AS qualification_phase,qualification.build_hash AS qualification_build_hash,
+        qualification.configuration_fingerprint AS qualification_configuration_fingerprint,
+        qualification.strategy_fingerprint AS qualification_strategy_fingerprint,
+        qualification.wallet_public_key AS qualification_wallet_public_key,
+        qualification.cluster AS qualification_cluster,
+        qualification.genesis_hash AS qualification_genesis_hash,
+        qualification.provider_id AS qualification_provider_id,
+        trunc(EXTRACT(EPOCH FROM qualification.expires_at)*1000)::TEXT AS qualification_expires_at_ms,
+        armament.armament_id,armament.payload_version AS armament_payload_version,
+        armament.state AS armament_state,armament.state_revision::TEXT AS armament_state_revision,
+        armament.phase AS armament_phase,armament.build_hash AS armament_build_hash,
+        armament.configuration_fingerprint AS armament_configuration_fingerprint,
+        armament.strategy_fingerprint AS armament_strategy_fingerprint,
+        armament.wallet_public_key AS armament_wallet_public_key,
+        armament.cluster AS armament_cluster,armament.genesis_hash AS armament_genesis_hash,
+        armament.provider_id AS armament_provider_id,armament.consumed_buys,armament.maximum_buys,
+        trunc(EXTRACT(EPOCH FROM armament.expires_at)*1000)::TEXT AS armament_expires_at_ms,
+        armament.target_intent_id,armament.target_intent_state_revision::TEXT,
+        armament.target_strategy_id,armament.target_strategy_version,
+        armament.target_decision_fingerprint,armament.target_mint,armament.target_quote_mint,
+        armament.target_quote_amount_raw::TEXT,armament.target_admission_report_id,
+        armament.target_reservation_id,armament.target_policy_fingerprint,
+        armament.target_wallet_snapshot_fingerprint,armament.target_provider_snapshot_fingerprint,
+        armament.runtime_quote_max_age_ms,armament.runtime_slippage_bps::TEXT,
+        armament.runtime_snapshot_max_slot_lag,armament.runtime_max_compute_units::TEXT,
+        armament.runtime_max_fee_lamports::TEXT,armament.runtime_max_fee_payer_lamport_debit::TEXT,
+        armament.runtime_max_rpc_calls_per_attempt,armament.runtime_lease_ms,
+        reservation.reservation_id,reservation.intent_id AS reservation_intent_id,
+        reservation.generation_id AS reservation_generation_id,
+        reservation.admission_report_id,reservation.state AS reservation_state,
+        reservation.side AS reservation_side,reservation.mint AS reservation_mint,
+        reservation.quote_mint AS reservation_quote_mint,
+        reservation.maximum_amount_raw::TEXT AS reservation_maximum_amount_raw,
+        reservation.policy_fingerprint AS reservation_policy_fingerprint,
+        reservation.wallet_snapshot_fingerprint AS reservation_wallet_snapshot_fingerprint,
+        reservation.provider_snapshot_fingerprint AS reservation_provider_snapshot_fingerprint,
+        admission.intent_id AS admission_intent_id,
+        admission.generation_id AS admission_generation_id,
+        admission.policy_fingerprint AS admission_policy_fingerprint,
+        admission.wallet_snapshot_fingerprint AS admission_wallet_snapshot_fingerprint,
+        admission.provider_snapshot_fingerprint AS admission_provider_snapshot_fingerprint,
+        admission.decision AS admission_decision,admission.quota_state,
+        admission.quote_amount_raw::TEXT AS admission_quote_amount_raw,
+        risk.unknown_block,wallet.superseded_at AS wallet_superseded_at,
+        trunc(EXTRACT(EPOCH FROM wallet.observed_at)*1000)::TEXT AS wallet_observed_at_ms,
+        provider.superseded_at AS provider_superseded_at,
+        trunc(EXTRACT(EPOCH FROM provider.expires_at)*1000)::TEXT AS provider_expires_at_ms,
+        provider_gate.status AS provider_gate_status,
+        provider_gate.evidence_fingerprint AS provider_gate_fingerprint,
+        trunc(EXTRACT(EPOCH FROM provider_gate.expires_at)*1000)::TEXT AS provider_gate_expires_at_ms,
+        wallet_gate.status AS wallet_gate_status,
+        wallet_gate.evidence_fingerprint AS wallet_gate_fingerprint,
+        trunc(EXTRACT(EPOCH FROM wallet_gate.expires_at)*1000)::TEXT AS wallet_gate_expires_at_ms
+        FROM execution_intents intent
+        JOIN execution_attempts attempt ON attempt.intent_id=intent.id
+          AND attempt.attempt_number=$2::INTEGER
+        JOIN execution_wallet_generations generation ON generation.generation_id=$3
+        JOIN execution_control_state control ON control.generation_id=generation.generation_id
+        JOIN execution_activation_armaments armament
+          ON armament.target_intent_id=intent.id AND armament.generation_id=generation.generation_id
+        JOIN execution_safety_qualifications qualification
+          ON qualification.qualification_id=armament.qualification_id
+        JOIN execution_exposure_reservations reservation
+          ON reservation.reservation_id=armament.target_reservation_id
+        JOIN execution_risk_admission_reports admission
+          ON admission.report_id=armament.target_admission_report_id
+        JOIN execution_wallet_risk_state risk ON risk.generation_id=generation.generation_id
+        JOIN execution_wallet_snapshots wallet
+          ON wallet.snapshot_fingerprint=armament.target_wallet_snapshot_fingerprint
+        JOIN execution_provider_usage_snapshots provider
+          ON provider.snapshot_fingerprint=armament.target_provider_snapshot_fingerprint
+            AND provider.provider_id=armament.provider_id
+        JOIN execution_safety_gate_evidence provider_gate
+          ON provider_gate.qualification_id=qualification.qualification_id
+            AND provider_gate.gate_index=7 AND provider_gate.gate_id='PROVIDER_EXIT_CAPACITY_VERIFIED'
+        JOIN execution_safety_gate_evidence wallet_gate
+          ON wallet_gate.qualification_id=qualification.qualification_id
+            AND wallet_gate.gate_index=9 AND wallet_gate.gate_id='WALLET_CHAIN_LIMITS_VERIFIED'
+        WHERE intent.id=$1
+        FOR UPDATE OF intent,attempt,armament,reservation,risk`, [
+        input.claim.intent.id, input.attempt.attemptNumber, input.generationId,
+      ]));
+      const nowMs = timestampText(row.now_ms);
+      validateExactSigningBinding(row, input, nowMs);
+      const providerBound = await client.query(`UPDATE execution_attempts SET provider_id=$3
+        WHERE intent_id=$1 AND attempt_number=$2::INTEGER AND status='STARTED'
+          AND (provider_id IS NULL OR provider_id=$3)`, [
+        input.claim.intent.id, input.attempt.attemptNumber, input.runtime.providerId,
+      ]);
+      if (providerBound.rowCount !== 1) throw failure('CONFLICT');
+      const binding = preparationBinding(row, 'BUY');
+      const simulationFingerprint = unsignedSimulationFingerprint(input.material.unsignedSimulation);
+      const lockFingerprint = hash([
+        'execution-pre-signature-lock-v1', input.claim.intent.id, input.attempt.attemptNumber,
+        input.claim.intent.stateRevision.toString(), binding.armamentId, binding.reservationId,
+        input.generationId, input.claim.leaseToken, input.material.messageHash,
+        input.material.unsignedTransactionHash, input.runtime.buildHash,
+        input.runtime.configurationFingerprint, input.runtime.strategyFingerprint,
+        input.claim.intent.decisionFingerprint, row.target_policy_fingerprint,
+        row.target_wallet_snapshot_fingerprint, row.target_provider_snapshot_fingerprint,
+        input.material.effectiveVenue, input.material.snapshotSlot.toString(),
+        input.material.snapshotFingerprint, input.material.quoteFingerprint,
+        input.material.quoteObservedAtMs, input.material.quoteExpiresAtMs,
+        simulationFingerprint, input.material.blockhash,
+        input.material.lastValidBlockHeight.toString(),
+      ]);
+      const lockId = `execution_pre_signature_lock_${lockFingerprint}`;
+      const inserted = await client.query(`INSERT INTO execution_pre_signature_locks (
+        lock_id,lock_fingerprint,intent_id,attempt_number,intent_state_revision,
+        armament_id,reservation_id,generation_id,wallet_public_key,provider_id,lease_token,
+        message_hash,unsigned_message_bytes,unsigned_transaction_hash,unsigned_transaction_bytes,
+        build_hash,configuration_fingerprint,strategy_fingerprint,decision_fingerprint,
+        policy_fingerprint,wallet_snapshot_fingerprint,provider_snapshot_fingerprint,
+        effective_venue,market_snapshot_slot,market_snapshot_fingerprint,quote_fingerprint,
+        quote_observed_at,quote_expires_at,unsigned_simulation_fingerprint,
+        blockhash,last_valid_block_height,state,state_revision
+      ) VALUES ($1,$2,$3,$4,$5::BIGINT,$6,$7,$8,$9,$10,$11::UUID,$12,$13,$14,$15,
+        $16,$17,$18,$19,$20,$21,$22,$23,$24::BIGINT,$25,$26,
+        TIMESTAMPTZ 'epoch'+($27::BIGINT*INTERVAL '1 millisecond'),
+        TIMESTAMPTZ 'epoch'+($28::BIGINT*INTERVAL '1 millisecond'),$29,$30,$31::BIGINT,
+        'AUTHORIZED',0)`, [
+        lockId, lockFingerprint, input.claim.intent.id, input.attempt.attemptNumber,
+        input.claim.intent.stateRevision.toString(), binding.armamentId, binding.reservationId,
+        input.generationId, input.runtime.walletPublicKey, input.runtime.providerId,
+        input.claim.leaseToken, input.material.messageHash, Buffer.from(input.material.messageBytes),
+        input.material.unsignedTransactionHash, Buffer.from(input.material.unsignedTransactionBytes),
+        input.runtime.buildHash, input.runtime.configurationFingerprint,
+        input.runtime.strategyFingerprint, input.claim.intent.decisionFingerprint,
+        row.target_policy_fingerprint, row.target_wallet_snapshot_fingerprint,
+        row.target_provider_snapshot_fingerprint, input.material.effectiveVenue,
+        input.material.snapshotSlot.toString(), input.material.snapshotFingerprint,
+        input.material.quoteFingerprint, input.material.quoteObservedAtMs,
+        input.material.quoteExpiresAtMs, simulationFingerprint, input.material.blockhash,
+        input.material.lastValidBlockHeight.toString(),
+      ]);
+      if (inserted.rowCount !== 1) throw failure('CONFLICT');
+      const locked = await client.query(`UPDATE execution_activation_armaments SET
+        state='LOCKED',state_revision=1,consumed_buys=1,locked_intent_id=$2,
+        locked_attempt_number=$3::INTEGER,locked_reservation_id=$4,
+        locked_lease_token=$5::UUID,locked_at=date_trunc('milliseconds',statement_timestamp())
+        WHERE armament_id=$1 AND payload_version=2 AND state='ARMED'
+          AND state_revision=0 AND consumed_buys=0`, [
+        binding.armamentId, input.claim.intent.id, input.attempt.attemptNumber,
+        binding.reservationId, input.claim.leaseToken,
+      ]);
+      if (locked.rowCount !== 1) throw failure('CONFLICT');
+      await insertExactSigningActivationEvent(client, binding, nowMs);
+      const persistedBytes = exactRow(singleRow(await client.query(`SELECT
+        unsigned_message_bytes,unsigned_transaction_bytes
+        FROM execution_pre_signature_locks WHERE lock_id=$1 AND state='AUTHORIZED'
+        FOR SHARE`, [lockId])), [
+        'unsigned_message_bytes', 'unsigned_transaction_bytes',
+      ] as const);
+      const messageBytes = bytesFromDatabase(persistedBytes.unsigned_message_bytes);
+      const transactionBytes = bytesFromDatabase(persistedBytes.unsigned_transaction_bytes);
+      if (!Buffer.from(messageBytes).equals(Buffer.from(input.material.messageBytes))
+        || !Buffer.from(transactionBytes).equals(
+          Buffer.from(input.material.unsignedTransactionBytes),
+        )) throw failure('INVALID_DATA');
+      return exactSigningAuthorization(binding, lockId, Object.freeze({
+        ...input.material, messageBytes, unsignedTransactionBytes: transactionBytes,
+      }));
+    });
   }
 
   public async persistSigned(
@@ -1680,6 +1947,347 @@ function recreateArtifact(value: SignedTransactionArtifactV1): SignedTransaction
   });
 }
 
+const EXACT_SIGNING_INPUT_KEYS = Object.freeze([
+  'claim', 'attempt', 'generationId', 'runtime', 'material',
+] as const);
+const ATTEMPT_IDENTITY_KEYS = Object.freeze([
+  'intentId', 'attemptNumber', 'startedAtMs',
+] as const);
+const UNSIGNED_MATERIAL_KEYS = Object.freeze([
+  'payloadVersion', 'walletPublicKey', 'providerId', 'side', 'effectiveVenue',
+  'snapshotSlot', 'quoteFingerprint', 'quoteObservedAtMs', 'quoteExpiresAtMs',
+  'buildFingerprint', 'snapshotFingerprint', 'messageHash', 'messageBytes',
+  'unsignedTransactionHash', 'unsignedTransactionBytes', 'blockhash',
+  'lastValidBlockHeight', 'unsignedSimulation',
+] as const);
+const UNSIGNED_SIMULATION_KEYS = Object.freeze([
+  'outcome', 'snapshotFingerprint', 'buildFingerprint', 'messageHash', 'blockhash',
+  'lastValidBlockHeight', 'blockhashContextSlot', 'feeContextSlot',
+  'estimatedFeeLamports', 'simulationSlot', 'simulatedFeePayerLamportDebit',
+  'unitsConsumed', 'simulatedBaseDeltaRaw', 'simulatedQuoteDeltaRaw',
+  'logsFingerprint', 'logsLineCount',
+] as const);
+
+function exactSigningInputFrom(value: ExecutionExactSigningInputV1): ExecutionExactSigningInputV1 {
+  try {
+    if (!Object.isFrozen(value) || !plainExactDataObject(value, EXACT_SIGNING_INPUT_KEYS)) {
+      throw new TypeError();
+    }
+    const claim = claimFrom(value.claim);
+    if (!Object.isFrozen(value.attempt)
+      || !plainExactDataObject(value.attempt, ATTEMPT_IDENTITY_KEYS)
+      || value.attempt.intentId !== claim.intent.id
+      || value.attempt.attemptNumber !== 1
+      || value.attempt.attemptNumber !== claim.intent.attemptCount
+      || !validTimestamp(value.attempt.startedAtMs)
+      || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(value.generationId)
+      || !validRuntimeBinding(value.runtime)
+      || claim.intent.side !== 'BUY' || claim.intent.status !== 'PROCESSING'
+      || claim.intent.stateRevision < 1n || claim.intent.quoteAmountRaw === null) {
+      throw new TypeError();
+    }
+    const material = unsignedSigningMaterialFrom(value.material);
+    if (material.walletPublicKey !== value.runtime.walletPublicKey
+      || material.providerId !== value.runtime.providerId
+      || material.buildFingerprint !== value.runtime.buildHash) throw new TypeError();
+    return Object.freeze({
+      claim, attempt: Object.freeze({ ...value.attempt }), generationId: value.generationId,
+      runtime: Object.freeze({ ...value.runtime }), material,
+    });
+  } catch (error) {
+    if (error instanceof ExecutionLiveRepositoryError) throw error;
+    throw failure('INVALID_INPUT');
+  }
+}
+
+function unsignedSigningMaterialFrom(
+  value: ExecutionUnsignedSigningMaterialV1,
+): ExecutionUnsignedSigningMaterialV1 {
+  const record = value as unknown as Readonly<Record<string, unknown>>;
+  if (!Object.isFrozen(value) || !plainExactDataObject(value, UNSIGNED_MATERIAL_KEYS)
+    || record.payloadVersion !== 1 || value.side !== 'BUY'
+    || value.effectiveVenue !== 'PUMP_FUN'
+    || !PUBLIC_KEY.test(value.walletPublicKey) || !PROVIDER_ID.test(value.providerId)
+    || !unsigned(value.snapshotSlot) || !HASH.test(value.quoteFingerprint)
+    || !validTimestamp(value.quoteObservedAtMs) || !validTimestamp(value.quoteExpiresAtMs)
+    || value.quoteObservedAtMs >= value.quoteExpiresAtMs
+    || !HASH.test(value.buildFingerprint) || !HASH.test(value.snapshotFingerprint)
+    || !HASH.test(value.messageHash) || !HASH.test(value.unsignedTransactionHash)
+    || !PUBLIC_KEY.test(value.blockhash) || !unsigned(value.lastValidBlockHeight)
+    || !validFrozenBytes(value.messageBytes) || !validFrozenBytes(value.unsignedTransactionBytes)) {
+    throw new TypeError();
+  }
+  const simulation = unsignedSimulationFrom(value.unsignedSimulation);
+  const messageBytes = Object.freeze([...value.messageBytes]);
+  const unsignedTransactionBytes = Object.freeze([...value.unsignedTransactionBytes]);
+  assertCanonicalUnsignedV0Transaction({
+    walletPublicKey: value.walletPublicKey,
+    blockhash: value.blockhash,
+    messageBytes: Uint8Array.from(messageBytes),
+    transactionBytes: Uint8Array.from(unsignedTransactionBytes),
+  });
+  if (digestBytes(messageBytes) !== value.messageHash
+    || digestBytes(unsignedTransactionBytes) !== value.unsignedTransactionHash
+    || simulation.snapshotFingerprint !== value.snapshotFingerprint
+    || simulation.buildFingerprint !== value.buildFingerprint
+    || simulation.messageHash !== value.messageHash
+    || simulation.blockhash !== value.blockhash
+    || simulation.lastValidBlockHeight !== value.lastValidBlockHeight) throw new TypeError();
+  return Object.freeze({
+    ...value, messageBytes, unsignedTransactionBytes, unsignedSimulation: simulation,
+  });
+}
+
+function unsignedSimulationFrom(value: ExecutionSimulationEvidenceV1): ExecutionSimulationEvidenceV1 {
+  const record = value as unknown as Readonly<Record<string, unknown>>;
+  if (!Object.isFrozen(value) || !plainExactDataObject(value, UNSIGNED_SIMULATION_KEYS)
+    || record.outcome !== 'SUCCESS' || !HASH.test(value.snapshotFingerprint)
+    || !HASH.test(value.buildFingerprint) || !HASH.test(value.messageHash)
+    || !PUBLIC_KEY.test(value.blockhash) || !unsigned(value.lastValidBlockHeight)
+    || !unsigned(value.blockhashContextSlot) || !unsigned(value.feeContextSlot)
+    || !unsigned(value.estimatedFeeLamports) || !unsigned(value.simulationSlot)
+    || !unsigned(value.simulatedFeePayerLamportDebit) || !unsigned(value.unitsConsumed)
+    || typeof value.simulatedBaseDeltaRaw !== 'bigint'
+    || typeof value.simulatedQuoteDeltaRaw !== 'bigint'
+    || !HASH.test(value.logsFingerprint) || !Number.isSafeInteger(value.logsLineCount)
+    || value.logsLineCount < 0) throw new TypeError();
+  return Object.freeze({ ...value });
+}
+
+function validFrozenBytes(value: readonly number[]): boolean {
+  return Array.isArray(value) && Object.isFrozen(value) && value.length >= 1 && value.length <= 1_232
+    && value.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255);
+}
+
+function digestBytes(value: readonly number[]): string {
+  return createHash('sha256').update(Uint8Array.from(value)).digest('hex');
+}
+
+function unsignedSimulationFingerprint(value: ExecutionSimulationEvidenceV1): string {
+  return hash([
+    'execution-live-unsigned-simulation-v1', value.outcome, value.snapshotFingerprint,
+    value.buildFingerprint, value.messageHash, value.blockhash,
+    value.lastValidBlockHeight.toString(), value.blockhashContextSlot.toString(),
+    value.feeContextSlot.toString(), value.estimatedFeeLamports.toString(),
+    value.simulationSlot.toString(), value.simulatedFeePayerLamportDebit.toString(),
+    value.unitsConsumed.toString(), value.simulatedBaseDeltaRaw.toString(),
+    value.simulatedQuoteDeltaRaw.toString(), value.logsFingerprint, value.logsLineCount,
+  ]);
+}
+
+function validateExactSigningBinding(
+  row: Row,
+  input: ExecutionExactSigningInputV1,
+  nowMs: number,
+): void {
+  const deadlineMs = nowMs + input.runtime.leaseMs;
+  const material = input.material;
+  const simulation = material.unsignedSimulation;
+  if (!Number.isSafeInteger(deadlineMs)
+    || row.intent_status !== 'PROCESSING' || row.intent_side !== 'BUY'
+    || unsignedBigint(row.intent_state_revision) !== input.claim.intent.stateRevision
+    || integer(row.attempt_count) !== 1 || row.lease_owner !== input.claim.leaseOwner
+    || row.lease_token !== input.claim.leaseToken
+    || timestampText(row.lease_expires_at_ms) !== input.claim.leaseExpiresAtMs
+    || timestampText(row.lease_expires_at_ms) < deadlineMs
+    || timestampText(row.intent_expires_at_ms) < deadlineMs
+    || row.strategy_id !== input.claim.intent.strategyId
+    || integer(row.strategy_version) !== input.claim.intent.strategyVersion
+    || row.decision_fingerprint !== input.claim.intent.decisionFingerprint
+    || row.mint !== input.claim.intent.mint || row.quote_mint !== input.claim.intent.quoteMint
+    || unsignedBigint(row.intent_quote_amount_raw) !== input.claim.intent.quoteAmountRaw
+    || row.attempt_status !== 'STARTED'
+    || (row.attempt_provider_id !== null && row.attempt_provider_id !== input.runtime.providerId)
+    || timestampText(row.attempt_started_at_ms) !== input.attempt.startedAtMs
+    || row.generation_id !== input.generationId || row.retired_at !== null
+    || row.control_state !== 'RUNNING'
+    || row.armament_payload_version !== 2 || row.armament_state !== 'ARMED'
+    || unsignedBigint(row.armament_state_revision) !== 0n
+    || integer(row.consumed_buys) !== 0 || integer(row.maximum_buys) !== 1
+    || timestampText(row.armament_expires_at_ms) < deadlineMs
+    || row.target_intent_id !== input.claim.intent.id
+    || unsignedBigint(row.target_intent_state_revision) + 1n !== input.claim.intent.stateRevision
+    || row.target_strategy_id !== input.claim.intent.strategyId
+    || integer(row.target_strategy_version) !== input.claim.intent.strategyVersion
+    || row.target_decision_fingerprint !== input.claim.intent.decisionFingerprint
+    || row.target_mint !== input.claim.intent.mint
+    || row.target_quote_mint !== input.claim.intent.quoteMint
+    || unsignedBigint(row.target_quote_amount_raw) !== input.claim.intent.quoteAmountRaw
+    || !runtimeMatches(row, input.runtime) || !canaryRuntimeLimitsMatch(row, input.runtime)
+    || !qualificationRuntimeMatches(row, input.runtime)
+    || timestampText(row.qualification_expires_at_ms) < deadlineMs
+    || row.reservation_id !== row.target_reservation_id
+    || row.reservation_id === null || row.reservation_state !== 'RESERVED'
+    || row.reservation_side !== 'BUY' || row.reservation_intent_id !== input.claim.intent.id
+    || row.reservation_generation_id !== input.generationId
+    || row.reservation_mint !== input.claim.intent.mint
+    || row.reservation_quote_mint !== input.claim.intent.quoteMint
+    || unsignedBigint(row.reservation_maximum_amount_raw) !== input.claim.intent.quoteAmountRaw
+    || row.admission_report_id !== row.target_admission_report_id
+    || row.admission_intent_id !== input.claim.intent.id
+    || row.admission_generation_id !== input.generationId
+    || row.admission_decision !== 'ADMITTED' || row.quota_state !== 'NORMAL'
+    || unsignedBigint(row.admission_quote_amount_raw) !== input.claim.intent.quoteAmountRaw
+    || row.reservation_policy_fingerprint !== row.target_policy_fingerprint
+    || row.admission_policy_fingerprint !== row.target_policy_fingerprint
+    || row.reservation_wallet_snapshot_fingerprint !== row.target_wallet_snapshot_fingerprint
+    || row.admission_wallet_snapshot_fingerprint !== row.target_wallet_snapshot_fingerprint
+    || row.reservation_provider_snapshot_fingerprint !== row.target_provider_snapshot_fingerprint
+    || row.admission_provider_snapshot_fingerprint !== row.target_provider_snapshot_fingerprint
+    || row.unknown_block !== false || row.wallet_superseded_at !== null
+    || row.provider_superseded_at !== null
+    || row.wallet_gate_status !== 'PASSED'
+    || row.wallet_gate_fingerprint !== row.target_wallet_snapshot_fingerprint
+    || timestampText(row.wallet_gate_expires_at_ms) < deadlineMs
+    || row.provider_gate_status !== 'PASSED'
+    || row.provider_gate_fingerprint !== row.target_provider_snapshot_fingerprint
+    || timestampText(row.provider_gate_expires_at_ms) < deadlineMs
+    || timestampText(row.provider_expires_at_ms) < deadlineMs
+    || material.quoteObservedAtMs > nowMs
+    || nowMs - material.quoteObservedAtMs > input.runtime.quoteMaxAgeMs
+    || material.quoteExpiresAtMs < deadlineMs
+    || simulation.simulationSlot < material.snapshotSlot
+    || simulation.simulationSlot - material.snapshotSlot > BigInt(input.runtime.snapshotMaxSlotLag)
+    || simulation.unitsConsumed > input.runtime.maxComputeUnits
+    || simulation.estimatedFeeLamports > input.runtime.maxFeeLamports
+    || simulation.simulatedFeePayerLamportDebit > input.runtime.maxFeePayerLamportDebit) {
+    throw failure('PREFLIGHT_EXPIRED');
+  }
+}
+
+function exactSigningReplay(
+  row: Row,
+  input: ExecutionExactSigningInputV1,
+): ExecutionExactSigningAuthorizationV1 {
+  const messageBytes = bytesFromDatabase(row.unsigned_message_bytes);
+  const transactionBytes = bytesFromDatabase(row.unsigned_transaction_bytes);
+  const material = input.material;
+  const nowMs = timestampText(row.now_ms);
+  const deadlineMs = nowMs + input.runtime.leaseMs;
+  if (row.state !== 'AUTHORIZED' || unsignedBigint(row.state_revision) !== 0n
+    || row.armament_payload_version !== 2 || row.armament_state !== 'LOCKED'
+    || unsignedBigint(row.armament_state_revision) !== 1n || integer(row.consumed_buys) !== 1
+    || row.intent_status !== 'PROCESSING' || row.attempt_status !== 'STARTED'
+    || row.attempt_provider_id !== input.runtime.providerId
+    || unsignedBigint(row.current_intent_state_revision) !== input.claim.intent.stateRevision
+    || row.lease_owner !== input.claim.leaseOwner || row.current_lease_token !== input.claim.leaseToken
+    || timestampText(row.lease_expires_at_ms) < deadlineMs
+    || timestampText(row.intent_expires_at_ms) < deadlineMs
+    || timestampText(row.armament_expires_at_ms) < deadlineMs
+    || timestampText(row.qualification_expires_at_ms) < deadlineMs
+    || row.control_state !== 'RUNNING' || row.unknown_block !== false
+    || row.wallet_superseded_at !== null || row.provider_superseded_at !== null
+    || row.wallet_gate_status !== 'PASSED'
+    || row.wallet_gate_fingerprint !== row.wallet_snapshot_fingerprint
+    || timestampText(row.wallet_gate_expires_at_ms) < deadlineMs
+    || row.provider_gate_status !== 'PASSED'
+    || row.provider_gate_fingerprint !== row.provider_snapshot_fingerprint
+    || timestampText(row.provider_gate_expires_at_ms) < deadlineMs
+    || timestampText(row.provider_expires_at_ms) < deadlineMs
+    || row.armament_phase !== input.runtime.phase
+    || row.armament_build_hash !== input.runtime.buildHash
+    || row.armament_configuration_fingerprint !== input.runtime.configurationFingerprint
+    || row.armament_strategy_fingerprint !== input.runtime.strategyFingerprint
+    || row.armament_wallet_public_key !== input.runtime.walletPublicKey
+    || row.armament_cluster !== input.runtime.cluster
+    || row.armament_genesis_hash !== input.runtime.observedGenesisHash
+    || row.armament_provider_id !== input.runtime.providerId
+    || !canaryRuntimeLimitsMatch(row, input.runtime)
+    || !qualificationRuntimeMatches(row, input.runtime)
+    || row.intent_id !== input.claim.intent.id || integer(row.attempt_number) !== 1
+    || unsignedBigint(row.intent_state_revision) !== input.claim.intent.stateRevision
+    || row.generation_id !== input.generationId
+    || row.wallet_public_key !== input.runtime.walletPublicKey
+    || row.provider_id !== input.runtime.providerId || row.lease_token !== input.claim.leaseToken
+    || row.locked_intent_id !== input.claim.intent.id || integer(row.locked_attempt_number) !== 1
+    || row.locked_reservation_id !== row.reservation_id
+    || row.armament_locked_lease_token !== input.claim.leaseToken
+    || row.message_hash !== material.messageHash
+    || row.unsigned_transaction_hash !== material.unsignedTransactionHash
+    || !Buffer.from(messageBytes).equals(Buffer.from(material.messageBytes))
+    || !Buffer.from(transactionBytes).equals(Buffer.from(material.unsignedTransactionBytes))
+    || row.build_hash !== input.runtime.buildHash
+    || row.configuration_fingerprint !== input.runtime.configurationFingerprint
+    || row.strategy_fingerprint !== input.runtime.strategyFingerprint
+    || row.decision_fingerprint !== input.claim.intent.decisionFingerprint
+    || row.effective_venue !== material.effectiveVenue
+    || unsignedBigint(row.market_snapshot_slot) !== material.snapshotSlot
+    || row.market_snapshot_fingerprint !== material.snapshotFingerprint
+    || row.quote_fingerprint !== material.quoteFingerprint
+    || timestampText(row.quote_observed_at_ms) !== material.quoteObservedAtMs
+    || timestampText(row.quote_expires_at_ms) !== material.quoteExpiresAtMs
+    || row.unsigned_simulation_fingerprint !== unsignedSimulationFingerprint(material.unsignedSimulation)
+    || row.blockhash !== material.blockhash
+    || unsignedBigint(row.last_valid_block_height) !== material.lastValidBlockHeight
+    || material.quoteObservedAtMs > nowMs
+    || nowMs - material.quoteObservedAtMs > input.runtime.quoteMaxAgeMs
+    || material.quoteExpiresAtMs < deadlineMs
+    || material.unsignedSimulation.simulationSlot < material.snapshotSlot
+    || material.unsignedSimulation.simulationSlot - material.snapshotSlot
+      > BigInt(input.runtime.snapshotMaxSlotLag)
+    || material.unsignedSimulation.unitsConsumed > input.runtime.maxComputeUnits
+    || material.unsignedSimulation.estimatedFeeLamports > input.runtime.maxFeeLamports
+    || material.unsignedSimulation.simulatedFeePayerLamportDebit
+      > input.runtime.maxFeePayerLamportDebit) {
+    throw failure('CONFLICT');
+  }
+  const binding = Object.freeze({
+    payloadVersion: 1 as const, side: 'BUY' as const,
+    generationId: patternedText(row.generation_id, /^execution_wallet_generation_[0-9a-f]{64}$/u),
+    qualificationId: patternedText(
+      row.qualification_id, /^execution_safety_qualification_[0-9a-f]{64}$/u,
+    ),
+    armamentId: patternedText(
+      row.armament_id, /^execution_activation_armament_[0-9a-f]{64}$/u,
+    ),
+    reservationId: patternedText(
+      row.reservation_id, /^execution_exposure_reservation_[0-9a-f]{64}$/u,
+    ),
+    exitAuthorizationId: null,
+    providerId: patternedText(row.provider_id, PROVIDER_ID),
+    walletPublicKey: patternedText(row.wallet_public_key, PUBLIC_KEY),
+  });
+  return exactSigningAuthorization(binding, patternedText(
+    row.lock_id, /^execution_pre_signature_lock_[0-9a-f]{64}$/u,
+  ), Object.freeze({ ...material, messageBytes, unsignedTransactionBytes: transactionBytes }));
+}
+
+function bytesFromDatabase(value: unknown): readonly number[] {
+  if (!Buffer.isBuffer(value) || value.length < 1 || value.length > 1_232) {
+    throw failure('INVALID_DATA');
+  }
+  return Object.freeze([...value]);
+}
+
+function exactSigningAuthorization(
+  binding: ExecutionLivePreparationBindingV1,
+  lockId: string,
+  material: ExecutionUnsignedSigningMaterialV1,
+): ExecutionExactSigningAuthorizationV1 {
+  return Object.freeze({ payloadVersion: 1, binding, preSignatureLockId: lockId, material });
+}
+
+async function insertExactSigningActivationEvent(
+  client: DatabaseClient,
+  binding: ExecutionLivePreparationBindingV1,
+  occurredAtMs: number,
+): Promise<void> {
+  if (binding.armamentId === null) throw failure('INVALID_DATA');
+  const eventFingerprint = hash([
+    'execution-activation-event-v1', binding.armamentId, 'ARMED', 'LOCKED',
+    'ARMAMENT_LOCKED', occurredAtMs,
+  ]);
+  const result = await client.query(`INSERT INTO execution_activation_events (
+    event_id,payload_version,event_fingerprint,armament_id,generation_id,
+    previous_state,next_state,reason_code,occurred_at
+  ) VALUES ($1,1,$2,$3,$4,'ARMED','LOCKED','ARMAMENT_LOCKED',
+    TIMESTAMPTZ 'epoch'+($5::BIGINT*INTERVAL '1 millisecond'))`, [
+    `execution_activation_event_${eventFingerprint}`, eventFingerprint,
+    binding.armamentId, binding.generationId, occurredAtMs,
+  ]);
+  if (result.rowCount !== 1) throw failure('CONFLICT');
+}
+
 interface PreparationBindingInput {
   readonly claim: ClaimedExecutionIntent;
   readonly generationId: string;
@@ -2840,7 +3448,26 @@ function validRuntimeBinding(value: unknown): value is ExecutionLiveRuntimeBindi
     && typeof record.expectedGenesisHash === 'string'
     && PUBLIC_KEY.test(record.expectedGenesisHash)
     && record.observedGenesisHash === record.expectedGenesisHash
-    && typeof record.providerId === 'string' && PROVIDER_ID.test(record.providerId);
+    && typeof record.providerId === 'string' && PROVIDER_ID.test(record.providerId)
+    && typeof record.quoteMaxAgeMs === 'number' && Number.isSafeInteger(record.quoteMaxAgeMs)
+    && record.quoteMaxAgeMs >= 1 && record.quoteMaxAgeMs <= 60_000
+    && typeof record.slippageBps === 'bigint'
+    && record.slippageBps >= 0n && record.slippageBps <= 10_000n
+    && typeof record.snapshotMaxSlotLag === 'number'
+    && Number.isSafeInteger(record.snapshotMaxSlotLag)
+    && record.snapshotMaxSlotLag >= 0 && record.snapshotMaxSlotLag <= 128
+    && typeof record.maxComputeUnits === 'bigint'
+    && record.maxComputeUnits >= 1n && record.maxComputeUnits <= 1_400_000n
+    && typeof record.maxFeeLamports === 'bigint'
+    && record.maxFeeLamports >= 0n && record.maxFeeLamports <= 10_000_000n
+    && typeof record.maxFeePayerLamportDebit === 'bigint'
+    && record.maxFeePayerLamportDebit >= 0n
+    && record.maxFeePayerLamportDebit <= 10_000_000_000n
+    && typeof record.maxRpcCallsPerAttempt === 'number'
+    && Number.isSafeInteger(record.maxRpcCallsPerAttempt)
+    && record.maxRpcCallsPerAttempt >= 12 && record.maxRpcCallsPerAttempt <= 16
+    && typeof record.leaseMs === 'number' && Number.isSafeInteger(record.leaseMs)
+    && record.leaseMs >= 3_000 && record.leaseMs <= 120_000;
 }
 
 function plainExactDataObject(value: unknown, keys: readonly string[]): value is object {
@@ -2879,6 +3506,18 @@ function runtimeMatches(row: Row, runtime: ExecutionLiveRuntimeBindingV1): boole
     && row.armament_cluster === runtime.cluster
     && row.armament_genesis_hash === runtime.observedGenesisHash
     && row.armament_provider_id === runtime.providerId;
+}
+
+function canaryRuntimeLimitsMatch(row: Row, runtime: ExecutionLiveRuntimeBindingV1): boolean {
+  return integer(row.runtime_quote_max_age_ms) === runtime.quoteMaxAgeMs
+    && unsignedBigint(row.runtime_slippage_bps) === runtime.slippageBps
+    && unsignedBigint(row.runtime_snapshot_max_slot_lag) === BigInt(runtime.snapshotMaxSlotLag)
+    && unsignedBigint(row.runtime_max_compute_units) === runtime.maxComputeUnits
+    && unsignedBigint(row.runtime_max_fee_lamports) === runtime.maxFeeLamports
+    && unsignedBigint(row.runtime_max_fee_payer_lamport_debit)
+      === runtime.maxFeePayerLamportDebit
+    && integer(row.runtime_max_rpc_calls_per_attempt) === runtime.maxRpcCallsPerAttempt
+    && integer(row.runtime_lease_ms) === runtime.leaseMs;
 }
 
 function qualificationRuntimeMatches(

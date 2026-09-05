@@ -1,9 +1,16 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
+import { PublicKey, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import pg from 'pg';
+import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { migrateDatabase } from '../src/storage/database.js';
+import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
+import {
+  ExecutionLiveRepositoryError,
+  PostgresExecutionLiveRepository,
+} from '../src/storage/execution-live.repository.js';
 
 const migrationName = '039_execution_canary_operator_binding.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
@@ -25,6 +32,10 @@ void test('migration 039 defines V2 armament bindings and pre-signature locks', 
   assert.match(sql, /CREATE TABLE IF NOT EXISTS execution_pre_signature_locks/u);
   assert.match(sql, /octet_length\(unsigned_message_bytes\) BETWEEN 1 AND 1232/u);
   assert.match(sql, /octet_length\(unsigned_transaction_bytes\) BETWEEN 1 AND 1232/u);
+  for (const binding of [
+    'effective_venue', 'market_snapshot_slot', 'market_snapshot_fingerprint',
+    'quote_observed_at', 'quote_expires_at', 'unsigned_simulation_fingerprint',
+  ]) assert.match(sql, new RegExp(`${binding} [A-Z]+ NOT NULL`, 'u'));
   assert.match(sql, /state IN \('AUTHORIZED','SIGNED_PERSISTED','REVOKED'\)/u);
   assert.match(sql, /UNIQUE \(intent_id,attempt_number\)/u);
   assert.match(sql, /UNIQUE \(armament_id\)/u);
@@ -260,6 +271,113 @@ void test('an AUTHORIZED pre-signature lock cannot commit without its exact V2 L
   });
 });
 
+void test('BUY exact-signing authorization durably locks one V2 armament and replays exact bytes',
+  async (context) => {
+    const databaseUrl = testDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const scenario = await prepareAuthorizedLockScenario(pool);
+      const intent = await new PostgresExecutionIntentRepository(pool).read(scenario.intentId);
+      assert.ok(intent);
+      const timing = await pool.query<{
+        readonly lease_expires_at_ms: string;
+        readonly started_at_ms: string;
+      }>(`SELECT trunc(EXTRACT(EPOCH FROM intent.lease_expires_at)*1000)::TEXT AS lease_expires_at_ms,
+          trunc(EXTRACT(EPOCH FROM attempt.started_at)*1000)::TEXT AS started_at_ms
+        FROM execution_intents intent JOIN execution_attempts attempt
+          ON attempt.intent_id=intent.id AND attempt.attempt_number=1 WHERE intent.id=$1`,
+      [scenario.intentId]);
+      const timingRow = timing.rows[0];
+      assert.ok(timingRow);
+      const nowMs = Date.now();
+      const transaction = new VersionedTransaction(new TransactionMessage({
+        payerKey: new PublicKey('11111111111111111111111111111111'),
+        recentBlockhash: '11111111111111111111111111111111',
+        instructions: [],
+      }).compileToV0Message());
+      const messageBytes = Object.freeze([...transaction.message.serialize()]);
+      const transactionBytes = Object.freeze([...transaction.serialize()]);
+      const messageHash = digest(messageBytes);
+      const unsignedTransactionHash = digest(transactionBytes);
+      const material = Object.freeze({
+        payloadVersion: 1 as const, walletPublicKey: '11111111111111111111111111111111',
+        providerId: 'provider', side: 'BUY' as const, effectiveVenue: 'PUMP_FUN' as const,
+        snapshotSlot: 1n, quoteFingerprint: '0'.repeat(64), quoteObservedAtMs: nowMs,
+        quoteExpiresAtMs: nowMs + 60_000, buildFingerprint: '2'.repeat(64),
+        snapshotFingerprint: '1'.repeat(64), messageHash, messageBytes,
+        unsignedTransactionHash, unsignedTransactionBytes: transactionBytes,
+        blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 1n,
+        unsignedSimulation: Object.freeze({
+          outcome: 'SUCCESS' as const, snapshotFingerprint: '1'.repeat(64),
+          buildFingerprint: '2'.repeat(64), messageHash,
+          blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 1n,
+          blockhashContextSlot: 1n, feeContextSlot: 1n, estimatedFeeLamports: 1n,
+          simulationSlot: 1n, simulatedFeePayerLamportDebit: 1n, unitsConsumed: 1n,
+          simulatedBaseDeltaRaw: 1n, simulatedQuoteDeltaRaw: -1n,
+          logsFingerprint: '9'.repeat(64), logsLineCount: 1,
+        }),
+      });
+      const input = Object.freeze({
+        claim: Object.freeze({
+          intent, leaseOwner: 'pre-signature-lock-test', leaseToken: scenario.leaseToken,
+          leaseExpiresAtMs: Number(timingRow.lease_expires_at_ms),
+        }),
+        attempt: Object.freeze({
+          intentId: scenario.intentId, attemptNumber: 1,
+          startedAtMs: Number(timingRow.started_at_ms),
+        }),
+        generationId: scenario.generationId,
+        runtime: Object.freeze({
+          payloadVersion: 1 as const, phase: 'CANARY' as const, buildHash: '2'.repeat(64),
+          configurationFingerprint: '3'.repeat(64), strategyFingerprint: '4'.repeat(64),
+          walletPublicKey: '11111111111111111111111111111111', cluster: 'mainnet-beta' as const,
+          expectedGenesisHash: '11111111111111111111111111111111',
+          observedGenesisHash: '11111111111111111111111111111111', providerId: 'provider',
+          quoteMaxAgeMs: 60_000, slippageBps: 0n, snapshotMaxSlotLag: 128,
+          maxComputeUnits: 1_400_000n, maxFeeLamports: 10_000_000n,
+          maxFeePayerLamportDebit: 10_000_000_000n, maxRpcCallsPerAttempt: 12, leaseMs: 3_000,
+        }),
+        material,
+      });
+      const live = new PostgresExecutionLiveRepository(pool) as unknown as Readonly<{
+        readonly authorizeExactSigning: (value: typeof input) => Promise<unknown>;
+      }>;
+
+      const first = await live.authorizeExactSigning(input);
+      const replay = await live.authorizeExactSigning(input);
+
+      assert.deepEqual(replay, first);
+      await assert.rejects(live.authorizeExactSigning(Object.freeze({
+        ...input,
+        material: Object.freeze({ ...material, quoteFingerprint: 'f'.repeat(64) }),
+      })), isLiveRepositoryError('CONFLICT'));
+      await assert.rejects(live.authorizeExactSigning(Object.freeze({
+        ...input,
+        claim: Object.freeze({
+          ...input.claim, leaseToken: '00000000-0000-4000-8000-000000000099',
+        }),
+      })), isLiveRepositoryError('CONFLICT'));
+      const durable = await pool.query(`SELECT lock.state,lock.state_revision,
+        octet_length(lock.unsigned_message_bytes) AS message_bytes,
+        octet_length(lock.unsigned_transaction_bytes) AS transaction_bytes,
+        armament.state AS armament_state,armament.state_revision AS armament_revision,
+        armament.consumed_buys,COUNT(event.event_id)::INTEGER AS lock_events
+        FROM execution_pre_signature_locks lock
+        JOIN execution_activation_armaments armament ON armament.armament_id=lock.armament_id
+        LEFT JOIN execution_activation_events event ON event.armament_id=armament.armament_id
+          AND event.reason_code='ARMAMENT_LOCKED'
+        WHERE lock.armament_id=$1
+        GROUP BY lock.state,lock.state_revision,lock.unsigned_message_bytes,
+          lock.unsigned_transaction_bytes,armament.state,armament.state_revision,armament.consumed_buys`,
+      [scenario.armamentId]);
+      assert.deepEqual(durable.rows, [{
+        state: 'AUTHORIZED', state_revision: '0', message_bytes: messageBytes.length,
+        transaction_bytes: transactionBytes.length,
+        armament_state: 'LOCKED', armament_revision: '1', consumed_buys: 1, lock_events: 1,
+      }]);
+    });
+  });
+
 void test('an AUTHORIZED pre-signature lock commits only with its exact V2 lock CAS', async (context) => {
   const databaseUrl = testDatabaseUrl(context);
   if (databaseUrl === null) return;
@@ -296,30 +414,44 @@ async function prepareAuthorizedLockScenario(
   pool: InstanceType<typeof pg.Pool>,
 ): Promise<AuthorizedLockScenario> {
   await migrateDatabase({ pool });
-  await seedV2ArmamentPrerequisites(pool, 'valid');
-  await insertV2Armament(pool, '4 minutes', 'So11111111111111111111111111111111111111112');
-  const intentId = `execution_intent_${'d'.repeat(64)}`;
-  const leaseToken = '00000000-0000-0000-0000-000000000001';
-  // This helper seeds the upstream claim/attempt state so the assertions exercise
-  // the new pre-signature-lock triggers, not the intent transition machinery.
-  await pool.query('SET session_replication_role = replica');
-  try {
-    await pool.query(`UPDATE execution_intents SET status='PROCESSING',attempt_count=1,
-      state_revision=1,lease_owner='pre-signature-lock-test',lease_token=$2::UUID,
-      lease_expires_at=date_trunc('milliseconds',statement_timestamp())+INTERVAL '30 seconds'
-      WHERE id=$1`, [intentId, leaseToken]);
-    await pool.query(`INSERT INTO execution_attempts (
-      intent_id,attempt_number,status,provider_id,started_at
-    ) VALUES ($1,1,'STARTED','provider',date_trunc('milliseconds',statement_timestamp()))`, [intentId]);
-  } finally {
-    await pool.query('SET session_replication_role = origin');
-  }
+  const nowMs = Date.now();
+  const target = createExecutionIntentDraft({
+    strategyId: 'strategy', strategyVersion: 1, positionId: 'position',
+    logicalCommandId: 'command', mint: '11111111111111111111111111111111',
+    side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
+    quoteMint: 'So11111111111111111111111111111111111111112',
+    quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1n,
+    baseAmountRaw: null, minimumAmountOutRaw: 1n, decisionEventId: 'decision',
+    decisionFingerprint: '8'.repeat(64), requestedAtMs: nowMs - 1_000,
+    expiresAtMs: nowMs + 600_000,
+  });
+  await seedV2ArmamentPrerequisites(pool, 'valid', target);
+  await insertV2Armament(
+    pool, '4 minutes', 'So11111111111111111111111111111111111111112', target,
+  );
+  const intentId = target.id;
+  const intents = new PostgresExecutionIntentRepository(pool);
+  const claimed = await intents.claim({
+    ownerId: 'pre-signature-lock-test', leaseMs: 30_000,
+    purpose: 'LIVE_EXECUTE', side: 'BUY',
+    generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+  });
+  assert.ok(claimed);
+  const processingIntent = await intents.transition(claimed, {
+    intentId, expectedStatus: 'PENDING', nextStatus: 'PROCESSING',
+    leaseToken: claimed.leaseToken, reasonCode: 'EXECUTION_STARTED',
+    humanMessage: 'Exact signing authorization test started.', activationPhase: 'CANARY',
+    evidence: Object.freeze({
+      payloadVersion: 1, attemptNumber: null, sourceEventId: null, observedAtMs: Date.now(),
+    }),
+  });
+  const begun = await intents.beginAttempt(Object.freeze({ ...claimed, intent: processingIntent }));
   return Object.freeze({
     armamentId: `execution_activation_armament_${'0'.repeat(64)}`,
     intentId,
     reservationId: `execution_exposure_reservation_${'f'.repeat(64)}`,
     generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
-    leaseToken,
+    leaseToken: begun.claim.leaseToken,
   });
 }
 
@@ -329,18 +461,25 @@ async function insertAuthorizedLock(
   seed: string,
   policyFingerprint: string,
 ): Promise<unknown> {
+  await client.query(`UPDATE execution_attempts SET provider_id='provider'
+    WHERE intent_id=$1 AND attempt_number=1 AND provider_id IS NULL`, [scenario.intentId]);
   return client.query(`INSERT INTO execution_pre_signature_locks (
     lock_id,lock_fingerprint,intent_id,attempt_number,intent_state_revision,armament_id,reservation_id,
     generation_id,wallet_public_key,provider_id,lease_token,message_hash,unsigned_message_bytes,
     unsigned_transaction_hash,unsigned_transaction_bytes,build_hash,configuration_fingerprint,
     strategy_fingerprint,decision_fingerprint,policy_fingerprint,wallet_snapshot_fingerprint,
-    provider_snapshot_fingerprint,quote_fingerprint,blockhash,last_valid_block_height,state,state_revision
+    provider_snapshot_fingerprint,effective_venue,market_snapshot_slot,market_snapshot_fingerprint,
+    quote_fingerprint,quote_observed_at,quote_expires_at,unsigned_simulation_fingerprint,
+    blockhash,last_valid_block_height,state,state_revision
   ) VALUES (
     'execution_pre_signature_lock_${seed.repeat(64)}','${seed.repeat(64)}',$1,1,1,$2,$3,$4,
     '11111111111111111111111111111111','provider',$5::UUID,'${'7'.repeat(64)}',decode('aa','hex'),
     '${'8'.repeat(64)}',decode('bb','hex'),'${'2'.repeat(64)}','${'3'.repeat(64)}',
     '${'4'.repeat(64)}','${'8'.repeat(64)}',$6,'${'c'.repeat(64)}','${'d'.repeat(64)}',
-    '${'0'.repeat(64)}','11111111111111111111111111111111',1,'AUTHORIZED',0
+    'PUMP_FUN',1,'${'1'.repeat(64)}','${'0'.repeat(64)}',
+    date_trunc('milliseconds',statement_timestamp())-INTERVAL '1 second',
+    date_trunc('milliseconds',statement_timestamp())+INTERVAL '1 minute','${'9'.repeat(64)}',
+    '11111111111111111111111111111111',1,'AUTHORIZED',0
   )`, [scenario.intentId, scenario.armamentId, scenario.reservationId,
     scenario.generationId, scenario.leaseToken, policyFingerprint]);
 }
@@ -348,18 +487,18 @@ async function insertAuthorizedLock(
 async function seedV2ArmamentPrerequisites(
   pool: InstanceType<typeof pg.Pool>,
   variant: V2ArmamentPrerequisiteVariant,
+  target: CanaryTargetSeed = defaultCanaryTargetSeed(),
 ): Promise<void> {
   const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
   const qualificationId = `execution_safety_qualification_${'b'.repeat(64)}`;
   const authorizationId = `execution_operator_authorization_${'c'.repeat(64)}`;
-  const intentId = `execution_intent_${'d'.repeat(64)}`;
+  const intentId = target.id;
+  const targetAmount = target.quoteAmountRaw;
+  if (targetAmount === null) throw new TypeError('Expected a BUY canary target.');
   const reportId = `execution_risk_admission_${'e'.repeat(64)}`;
   const reservationId = `execution_exposure_reservation_${'f'.repeat(64)}`;
   const now = `date_trunc('milliseconds',statement_timestamp())`;
   const qualificationExpiry = `${now} + INTERVAL '5 minutes'`;
-  const intentExpiry = variant === 'intent'
-    ? `${now} + INTERVAL '30 seconds'`
-    : `${now} + INTERVAL '10 minutes'`;
   const authorizationExpiry = `${now} + INTERVAL '60 seconds'`;
   const quoteMint = variant === 'non_wsol'
     ? '11111111111111111111111111111111'
@@ -399,9 +538,15 @@ async function seedV2ArmamentPrerequisites(
       id,logical_order_key,strategy_id,strategy_version,position_id,logical_command_id,mint,side,
       venue_policy,quote_mint,quote_token_program,quote_decimals,quote_amount_raw,
       minimum_amount_out_raw,decision_event_id,decision_fingerprint,requested_at,expires_at,status
-    ) VALUES ($1,'order','strategy',1,'position','command','11111111111111111111111111111111','BUY',
-      'PUMP_FUN_ONLY',$2,'SPL_TOKEN',9,1,1,'decision','${'8'.repeat(64)}',
-      ${now},${intentExpiry},'PENDING')`, [intentId, quoteMint]);
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,'BUY','PUMP_FUN_ONLY',$8,'SPL_TOKEN',$9,$10::NUMERIC,
+      $11::NUMERIC,$12,$13,TIMESTAMPTZ 'epoch'+($14::BIGINT*INTERVAL '1 millisecond'),
+      TIMESTAMPTZ 'epoch'+($15::BIGINT*INTERVAL '1 millisecond'),'PENDING')`, [
+      intentId, target.logicalOrderKey, target.strategyId, target.strategyVersion,
+      target.positionId, target.logicalCommandId, target.mint, quoteMint,
+      target.quoteDecimals, targetAmount.toString(), target.minimumAmountOutRaw.toString(),
+      target.decisionEventId, target.decisionFingerprint, target.requestedAtMs,
+      variant === 'intent' ? Date.now() + 30_000 : target.expiresAtMs,
+    ]);
     await pool.query(`INSERT INTO execution_wallet_snapshots (
       snapshot_id,snapshot_fingerprint,generation_id,provider_id,state_revision,slot,observed_at,
       commitment,wallet_lamports,token_balance_count,open_positions,realized_net_pnl_raw,
@@ -436,7 +581,8 @@ async function seedV2ArmamentPrerequisites(
       projected_capital_raw,projected_exposure_raw,projected_drawdown_raw,quota_state,wallet_state_revision
     ) VALUES ($1,'${'9'.repeat(64)}','${'a'.repeat(64)}',$2,$3,'${'b'.repeat(64)}','${'c'.repeat(64)}',
       '${'d'.repeat(64)}','ADMITTED',$4,1,1,0,$5,0)`, [
-      reportId, intentId, generationId, variant === 'report_quote' ? 2 : 1,
+      reportId, intentId, generationId,
+      variant === 'report_quote' ? (targetAmount + 1n).toString() : targetAmount.toString(),
       variant === 'report_quota' ? 'ENTRY_BLOCKED' : 'NORMAL',
     ]);
     await pool.query(`INSERT INTO execution_exposure_reservations (
@@ -447,9 +593,9 @@ async function seedV2ArmamentPrerequisites(
       '${'d'.repeat(64)}','RESERVED')`, [
       reservationId, intentId, generationId, reportId,
       variant === 'reservation_side' ? 'SELL' : 'BUY',
-      variant === 'reservation_mint' ? 'So11111111111111111111111111111111111111112' : '11111111111111111111111111111111',
+      variant === 'reservation_mint' ? 'So11111111111111111111111111111111111111112' : target.mint,
       variant === 'reservation_quote' ? '11111111111111111111111111111111' : quoteMint,
-      variant === 'reservation_amount' ? 2 : 1,
+      variant === 'reservation_amount' ? (targetAmount + 1n).toString() : targetAmount.toString(),
     ]);
   } finally {
     await pool.query('SET session_replication_role = origin');
@@ -460,7 +606,10 @@ async function insertV2Armament(
   pool: InstanceType<typeof pg.Pool>,
   expiresIn = '6 minutes',
   quoteMint = '11111111111111111111111111111111',
+  target: CanaryTargetSeed = defaultCanaryTargetSeed(),
 ): Promise<unknown> {
+  const targetAmount = target.quoteAmountRaw;
+  if (targetAmount === null) throw new TypeError('Expected a BUY canary target.');
   return pool.query(`INSERT INTO execution_activation_armaments (
     armament_id,payload_version,armament_fingerprint,qualification_id,qualification_fingerprint,
     generation_id,authorization_id,state,phase,build_hash,configuration_fingerprint,
@@ -481,12 +630,30 @@ async function insertV2Armament(
     '11111111111111111111111111111111','mainnet-beta','11111111111111111111111111111111',
     'provider',1,1,500,1,30000,'operator','reason',date_trunc('milliseconds',statement_timestamp()),
     date_trunc('milliseconds',statement_timestamp())+INTERVAL '${expiresIn}','${'6'.repeat(64)}',
-    '${'7'.repeat(64)}','execution_intent_${'d'.repeat(64)}',0,'strategy',1,'${'8'.repeat(64)}',
-    '11111111111111111111111111111111',$1,1,
+    '${'7'.repeat(64)}',$2,0,$3,$4,$5,$6,$1,$7::NUMERIC,
     'execution_risk_admission_${'e'.repeat(64)}','execution_exposure_reservation_${'f'.repeat(64)}',
     '${'b'.repeat(64)}','${'c'.repeat(64)}','${'d'.repeat(64)}',60000,0,128,1400000,10000000,
     10000000000,12,3000
-  )`, [quoteMint]);
+  )`, [quoteMint, target.id, target.strategyId, target.strategyVersion,
+    target.decisionFingerprint, target.mint, targetAmount.toString()]);
+}
+
+type CanaryTargetSeed = ReturnType<typeof createExecutionIntentDraft>;
+
+function defaultCanaryTargetSeed(): CanaryTargetSeed {
+  const nowMs = Date.now();
+  return Object.freeze({
+    id: `execution_intent_${'d'.repeat(64)}`, payloadVersion: 1 as const,
+    logicalOrderKey: 'order', strategyId: 'strategy', strategyVersion: 1,
+    positionId: 'position', logicalCommandId: 'command',
+    mint: '11111111111111111111111111111111', side: 'BUY' as const,
+    venuePolicy: 'PUMP_FUN_ONLY' as const,
+    quoteMint: 'So11111111111111111111111111111111111111112',
+    quoteTokenProgram: 'SPL_TOKEN' as const, quoteDecimals: 9, quoteAmountRaw: 1n,
+    baseAmountRaw: null, minimumAmountOutRaw: 1n, decisionEventId: 'decision',
+    decisionFingerprint: '8'.repeat(64), requestedAtMs: nowMs,
+    expiresAtMs: nowMs + 600_000,
+  });
 }
 
 type V2ArmamentPrerequisiteVariant = 'qualification' | 'intent' | 'non_wsol' | 'valid'
@@ -526,7 +693,9 @@ async function insertPreSignatureLockFixture(
       generation_id,wallet_public_key,provider_id,lease_token,message_hash,unsigned_message_bytes,
       unsigned_transaction_hash,unsigned_transaction_bytes,build_hash,configuration_fingerprint,
       strategy_fingerprint,decision_fingerprint,policy_fingerprint,wallet_snapshot_fingerprint,
-      provider_snapshot_fingerprint,quote_fingerprint,blockhash,last_valid_block_height,state,state_revision,
+      provider_snapshot_fingerprint,effective_venue,market_snapshot_slot,market_snapshot_fingerprint,
+      quote_fingerprint,quote_observed_at,quote_expires_at,unsigned_simulation_fingerprint,
+      blockhash,last_valid_block_height,state,state_revision,
       authorized_at,terminal_at,purge_after
     ) VALUES ('execution_pre_signature_lock_${'1'.repeat(64)}','${'2'.repeat(64)}',
       'execution_intent_${'3'.repeat(64)}',1,1,'execution_activation_armament_${'4'.repeat(64)}',
@@ -534,7 +703,10 @@ async function insertPreSignatureLockFixture(
       '11111111111111111111111111111111','provider','00000000-0000-0000-0000-000000000001',
       '${'7'.repeat(64)}',decode('aa','hex'),'${'8'.repeat(64)}',decode('bb','hex'),'${'9'.repeat(64)}',
       '${'a'.repeat(64)}','${'b'.repeat(64)}','${'c'.repeat(64)}','${'d'.repeat(64)}','${'e'.repeat(64)}',
-      '${'f'.repeat(64)}','${'0'.repeat(64)}','11111111111111111111111111111111',1,
+      '${'f'.repeat(64)}','PUMP_FUN',1,'${'1'.repeat(64)}','${'0'.repeat(64)}',
+      date_trunc('milliseconds',statement_timestamp())-INTERVAL '7 hours',
+      date_trunc('milliseconds',statement_timestamp())-INTERVAL '5 hours','${'2'.repeat(64)}',
+      '11111111111111111111111111111111',1,
       $1,$2,date_trunc('milliseconds',statement_timestamp())-INTERVAL '6 hours',${terminal},${purgeAfter})`, [
       mode === 'authorized' ? 'AUTHORIZED' : 'SIGNED_PERSISTED', mode === 'authorized' ? 0 : 1,
     ]);
@@ -603,6 +775,15 @@ function testDatabaseUrl(context: Readonly<{ skip(message?: string): void }>): s
   if (databaseUrl !== undefined && databaseUrl.trim() !== '') return databaseUrl;
   context.skip('TEST_DATABASE_URL absent: execution canary migration test skipped');
   return null;
+}
+
+function digest(bytes: readonly number[]): string {
+  return createHash('sha256').update(Uint8Array.from(bytes)).digest('hex');
+}
+
+function isLiveRepositoryError(code: string): (error: unknown) => boolean {
+  return (error: unknown): boolean => error instanceof ExecutionLiveRepositoryError
+    && error.code === code;
 }
 
 async function withTemporarySchema(

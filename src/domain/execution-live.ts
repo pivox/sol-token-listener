@@ -1,7 +1,26 @@
 import { createHash } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, VersionedTransaction } from '@solana/web3.js';
+
+/** Validates the exact unsigned Solana V0 envelope without exposing a signer capability. */
+export function assertCanonicalUnsignedV0Transaction(input: Readonly<{
+  readonly walletPublicKey: string;
+  readonly blockhash: string;
+  readonly messageBytes: Uint8Array;
+  readonly transactionBytes: Uint8Array;
+}>): void {
+  const transaction = VersionedTransaction.deserialize(input.transactionBytes);
+  if (transaction.message.version !== 0
+    || transaction.signatures.length !== transaction.message.header.numRequiredSignatures
+    || transaction.signatures.some((signature) => signature.some((byte) => byte !== 0))
+    || transaction.message.staticAccountKeys[0]?.toBase58() !== input.walletPublicKey
+    || transaction.message.recentBlockhash !== input.blockhash
+    || !Buffer.from(transaction.serialize()).equals(Buffer.from(input.transactionBytes))
+    || !Buffer.from(transaction.message.serialize()).equals(Buffer.from(input.messageBytes))) {
+    throw new TypeError('Invalid unsigned Solana V0 transaction.');
+  }
+}
 
 export const EXECUTION_LIVE_REASON_CODES = Object.freeze([
   'KEYPAIR_UNAVAILABLE',

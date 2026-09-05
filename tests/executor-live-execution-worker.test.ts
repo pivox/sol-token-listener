@@ -1302,6 +1302,9 @@ function workerFixture() {
         strategyFingerprint: 'c'.repeat(64), walletPublicKey: intent.mint,
         cluster: 'mainnet-beta' as const, expectedGenesisHash: intent.mint,
         observedGenesisHash: intent.mint, providerId: 'primary',
+        quoteMaxAgeMs: 60_000, slippageBps: 0n, snapshotMaxSlotLag: 128,
+        maxComputeUnits: 1_400_000n, maxFeeLamports: 10_000_000n,
+        maxFeePayerLamportDebit: 10_000_000_000n, maxRpcCallsPerAttempt: 12, leaseMs: 3_000,
       }),
     }),
     blockhashValidity: Object.freeze({

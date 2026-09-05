@@ -241,7 +241,13 @@ CREATE TABLE IF NOT EXISTS execution_pre_signature_locks (
   policy_fingerprint TEXT NOT NULL,
   wallet_snapshot_fingerprint TEXT NOT NULL,
   provider_snapshot_fingerprint TEXT NOT NULL,
+  effective_venue TEXT NOT NULL,
+  market_snapshot_slot BIGINT NOT NULL,
+  market_snapshot_fingerprint TEXT NOT NULL,
   quote_fingerprint TEXT NOT NULL,
+  quote_observed_at TIMESTAMPTZ NOT NULL,
+  quote_expires_at TIMESTAMPTZ NOT NULL,
+  unsigned_simulation_fingerprint TEXT NOT NULL,
   blockhash TEXT NOT NULL,
   last_valid_block_height BIGINT NOT NULL,
   state TEXT NOT NULL,
@@ -277,7 +283,11 @@ CREATE TABLE IF NOT EXISTS execution_pre_signature_locks (
     AND build_hash ~ '^[0-9a-f]{64}$' AND configuration_fingerprint ~ '^[0-9a-f]{64}$'
     AND strategy_fingerprint ~ '^[0-9a-f]{64}$' AND decision_fingerprint ~ '^[0-9a-f]{64}$'
     AND policy_fingerprint ~ '^[0-9a-f]{64}$' AND wallet_snapshot_fingerprint ~ '^[0-9a-f]{64}$'
-    AND provider_snapshot_fingerprint ~ '^[0-9a-f]{64}$' AND quote_fingerprint ~ '^[0-9a-f]{64}$'
+    AND provider_snapshot_fingerprint ~ '^[0-9a-f]{64}$'
+    AND effective_venue='PUMP_FUN' AND market_snapshot_slot >= 0
+    AND market_snapshot_fingerprint ~ '^[0-9a-f]{64}$'
+    AND quote_fingerprint ~ '^[0-9a-f]{64}$'
+    AND unsigned_simulation_fingerprint ~ '^[0-9a-f]{64}$'
     AND blockhash ~ '^[1-9A-HJ-NP-Za-km-z]{32,44}$' AND last_valid_block_height >= 0
   ),
   CONSTRAINT execution_pre_signature_locks_state_check CHECK (
@@ -288,6 +298,10 @@ CREATE TABLE IF NOT EXISTS execution_pre_signature_locks (
   ),
   CONSTRAINT execution_pre_signature_locks_temporal_check CHECK (
     isfinite(authorized_at) AND date_trunc('milliseconds',authorized_at)=authorized_at
+    AND isfinite(quote_observed_at) AND isfinite(quote_expires_at)
+    AND date_trunc('milliseconds',quote_observed_at)=quote_observed_at
+    AND date_trunc('milliseconds',quote_expires_at)=quote_expires_at
+    AND quote_observed_at < quote_expires_at AND authorized_at < quote_expires_at
     AND (terminal_at IS NULL OR (isfinite(terminal_at) AND terminal_at >= authorized_at
       AND date_trunc('milliseconds',terminal_at)=terminal_at))
   )
@@ -352,14 +366,18 @@ BEGIN
     NEW.unsigned_message_bytes,NEW.unsigned_transaction_hash,NEW.unsigned_transaction_bytes,
     NEW.build_hash,NEW.configuration_fingerprint,NEW.strategy_fingerprint,
     NEW.decision_fingerprint,NEW.policy_fingerprint,NEW.wallet_snapshot_fingerprint,
-    NEW.provider_snapshot_fingerprint,NEW.quote_fingerprint,NEW.blockhash,NEW.last_valid_block_height,
+    NEW.provider_snapshot_fingerprint,NEW.effective_venue,NEW.market_snapshot_slot,
+    NEW.market_snapshot_fingerprint,NEW.quote_fingerprint,NEW.quote_observed_at,
+    NEW.quote_expires_at,NEW.unsigned_simulation_fingerprint,NEW.blockhash,NEW.last_valid_block_height,
     NEW.authorized_at) IS DISTINCT FROM ROW(OLD.lock_id,OLD.payload_version,OLD.lock_fingerprint,
     OLD.intent_id,OLD.attempt_number,OLD.intent_state_revision,OLD.armament_id,OLD.reservation_id,
     OLD.generation_id,OLD.wallet_public_key,OLD.provider_id,OLD.lease_token,OLD.message_hash,
     OLD.unsigned_message_bytes,OLD.unsigned_transaction_hash,OLD.unsigned_transaction_bytes,
     OLD.build_hash,OLD.configuration_fingerprint,OLD.strategy_fingerprint,OLD.decision_fingerprint,
     OLD.policy_fingerprint,OLD.wallet_snapshot_fingerprint,OLD.provider_snapshot_fingerprint,
-    OLD.quote_fingerprint,OLD.blockhash,OLD.last_valid_block_height,OLD.authorized_at)
+    OLD.effective_venue,OLD.market_snapshot_slot,OLD.market_snapshot_fingerprint,
+    OLD.quote_fingerprint,OLD.quote_observed_at,OLD.quote_expires_at,
+    OLD.unsigned_simulation_fingerprint,OLD.blockhash,OLD.last_valid_block_height,OLD.authorized_at)
     OR NEW.state_revision<>OLD.state_revision+1
     OR NOT ((OLD.state='AUTHORIZED' AND NEW.state IN ('SIGNED_PERSISTED','REVOKED')))
   THEN

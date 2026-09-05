@@ -369,6 +369,14 @@ function runtimeBinding(
     expectedGenesisHash: genesis.expectedGenesisHash,
     observedGenesisHash: genesis.observedGenesisHash,
     providerId: genesis.providerId,
+    quoteMaxAgeMs: config.quoteMaxAgeMs,
+    slippageBps: config.slippageBps,
+    snapshotMaxSlotLag: config.snapshotMaxSlotLag,
+    maxComputeUnits: config.maxComputeUnits,
+    maxFeeLamports: config.maxFeeLamports,
+    maxFeePayerLamportDebit: config.maxFeePayerLamportDebit,
+    maxRpcCallsPerAttempt: config.maxRpcCallsPerAttempt,
+    leaseMs: config.leaseMs,
   });
 }
 

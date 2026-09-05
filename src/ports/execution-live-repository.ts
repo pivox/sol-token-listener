@@ -9,6 +9,7 @@ import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reco
 import type { ExecutionReconciliationRequestV1 } from
   '../executor-risk/reconciliation-service.js';
 import type { ClaimedExecutionIntent } from './execution-intent-repository.js';
+import type { ExecutionAttemptIdentity } from './execution-intent-repository.js';
 import type { ExecutionSimulationEvidenceV1 } from './execution-simulation-gateway.js';
 import type { ExecutionLiveSignedSimulationEvidenceV1 } from
   '../domain/execution-live-signed-simulation.js';
@@ -87,6 +88,14 @@ export interface ExecutionLiveRuntimeBindingV1 {
   readonly expectedGenesisHash: string;
   readonly observedGenesisHash: string;
   readonly providerId: string;
+  readonly quoteMaxAgeMs: number;
+  readonly slippageBps: bigint;
+  readonly snapshotMaxSlotLag: number;
+  readonly maxComputeUnits: bigint;
+  readonly maxFeeLamports: bigint;
+  readonly maxFeePayerLamportDebit: bigint;
+  readonly maxRpcCallsPerAttempt: number;
+  readonly leaseMs: number;
 }
 
 /**
@@ -132,6 +141,14 @@ export interface ExecutionExactSigningAuthorizationV1 {
   readonly payloadVersion: 1;
   readonly binding: ExecutionLivePreparationBindingV1;
   readonly preSignatureLockId: string | null;
+  readonly material: ExecutionUnsignedSigningMaterialV1;
+}
+
+export interface ExecutionExactSigningInputV1 {
+  readonly claim: ClaimedExecutionIntent;
+  readonly attempt: ExecutionAttemptIdentity;
+  readonly generationId: string;
+  readonly runtime: ExecutionLiveRuntimeBindingV1;
   readonly material: ExecutionUnsignedSigningMaterialV1;
 }
 
@@ -262,6 +279,9 @@ export interface ExecutionLiveRepository {
     readonly generationId: string;
     readonly runtime: ExecutionLiveRuntimeBindingV1;
   }>): Promise<ExecutionLivePreparationBindingV1>;
+  authorizeExactSigning(
+    input: ExecutionExactSigningInputV1,
+  ): Promise<ExecutionExactSigningAuthorizationV1>;
   persistSigned(
     input: ExecutionLivePersistSignedInputV1,
   ): Promise<ExecutionLivePersistSignedResultV1>;

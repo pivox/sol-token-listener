@@ -23,15 +23,8 @@ import {
 } from './transaction-preparer.js';
 import type { LiveFreshExecutionContextV1 } from './lanes.js';
 
-type FreshLiveRepository = Pick<ExecutionLiveRepository, 'readPreparationBinding'> & Readonly<{
-  readonly authorizeExactSigning?: (input: Readonly<{
-    readonly claim: ClaimedExecutionIntent;
-    readonly attempt: LiveFreshExecutionContextV1['attempt'];
-    readonly generationId: string;
-    readonly runtime: ExecutionLiveRuntimeBindingV1;
-    readonly material: ExecutionUnsignedSigningMaterialV1;
-  }>) => Promise<ExecutionExactSigningAuthorizationV1>;
-}>;
+type FreshLiveRepository = Pick<ExecutionLiveRepository,
+  'readPreparationBinding' | 'authorizeExactSigning'>;
 
 export interface FreshLiveExecutionDependencies {
   readonly generationId: string;
@@ -94,9 +87,6 @@ async function executeFresh(
     if (boundary === 'BEFORE_SIGNING') {
       if (material === undefined) return undefined;
       if (activeClaim.intent.side === 'BUY') {
-        if (dependencies.live.authorizeExactSigning === undefined) {
-          throw new TypeError('BUY exact signing authorization is unavailable.');
-        }
         const authorization = await dependencies.live.authorizeExactSigning(Object.freeze({
           claim: activeClaim, attempt: context.attempt, generationId: dependencies.generationId,
           runtime: dependencies.runtime, material,
@@ -235,6 +225,7 @@ function validateSuccess(
 function validateDependencies(value: FreshLiveExecutionDependencies): void {
   if (!/^execution_wallet_generation_[0-9a-f]{64}$/u.test(value.generationId)
     || typeof value.live.readPreparationBinding !== 'function'
+    || typeof value.live.authorizeExactSigning !== 'function'
     || typeof value.failures.complete !== 'function'
     || typeof value.evaluator.evaluate !== 'function'
     || !(value.candidateAuthority instanceof LiveTransactionCandidateAuthority)

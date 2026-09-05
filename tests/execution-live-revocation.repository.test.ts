@@ -797,6 +797,9 @@ async function createBuyFixture(pool: InstanceType<typeof pg.Pool>) {
     strategyFingerprint: '3'.repeat(64), walletPublicKey,
     cluster: 'mainnet-beta' as const, expectedGenesisHash: walletPublicKey,
     observedGenesisHash: walletPublicKey, providerId: 'primary',
+    quoteMaxAgeMs: 60_000, slippageBps: 0n, snapshotMaxSlotLag: 128,
+    maxComputeUnits: 1_400_000n, maxFeeLamports: 10_000_000n,
+    maxFeePayerLamportDebit: 10_000_000_000n, maxRpcCallsPerAttempt: 12, leaseMs: 3_000,
   });
   return Object.freeze({
     claim: begun.claim, artifact, unsignedSimulation, runtime,
