@@ -102,6 +102,34 @@ void test('source and compiled H2g draft graphs remain offline, non-signing and 
   }
 });
 
+void test('source and compiled H2h graphs remain read-only and non-signing', async () => {
+  for (const entry of [
+    resolve(repositoryRoot, 'src/preflight-source/main.ts'),
+    resolve(repositoryRoot, 'dist/src/preflight-source/main.js'),
+  ]) {
+    await access(entry);
+    const graph = await readGraph(entry);
+    assert.ok(graph.size >= 9,
+      `preflight source graph unexpectedly small: ${relative(repositoryRoot, entry)}`);
+    assert.deepEqual(
+      [...graph.keys()].filter((path) => /\/(?:executor-live|executor-operations|executor-simulation|infrastructure)\//u.test(path)),
+      [],
+    );
+    for (const [path, source] of graph) {
+      assert.doesNotMatch(source,
+        /\b(?:Keypair|Connection|sendRawTransaction|sendTransaction|simulateTransaction|signMessage)\b/u,
+        `transactional capability in ${relative(repositoryRoot, path)}`);
+    }
+  }
+  const repository = await readFile(
+    resolve(repositoryRoot, 'src/preflight-source/repository.ts'),
+    'utf8',
+  );
+  assert.doesNotMatch(repository,
+    /\b(?:INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP|GRANT|REVOKE)\b/u);
+  assert.match(repository, /BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY/u);
+});
+
 void test('source and compiled dry-run worker graphs stay inside the strict dry-run allowlist', async () => {
   const entries = [
     resolve(repositoryRoot, 'src/executor/dry-run-worker.ts'),

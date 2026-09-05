@@ -1391,9 +1391,93 @@ ON TABLE execution_provider_usage_snapshots TO sol_token_executor_readiness;
 GRANT SELECT (wallet_public_key,state)
 ON TABLE execution_live_positions TO sol_token_executor_readiness;
 
+-- Rebuild the operator reader as a closed read-only role on every replay.
+ALTER ROLE sol_token_operator_reader NOLOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+
+DO $operator_reader_parameter_acl$
+DECLARE
+  parameter_name TEXT;
+BEGIN
+  IF current_setting('server_version_num')::INTEGER >= 150000 THEN
+    FOR parameter_name IN SELECT parname FROM pg_parameter_acl
+    LOOP
+      EXECUTE format(
+        'REVOKE SET, ALTER SYSTEM ON PARAMETER %I FROM sol_token_operator_reader',
+        parameter_name
+      );
+    END LOOP;
+  END IF;
+END
+$operator_reader_parameter_acl$;
+
+DO $operator_reader_parents$
+DECLARE
+  parent_role NAME;
+BEGIN
+  FOR parent_role IN
+    SELECT parent.rolname FROM pg_auth_members membership
+    JOIN pg_roles member ON member.oid=membership.member
+    JOIN pg_roles parent ON parent.oid=membership.roleid
+    WHERE member.rolname='sol_token_operator_reader'
+  LOOP
+    EXECUTE format('REVOKE %I FROM sol_token_operator_reader', parent_role);
+  END LOOP;
+END
+$operator_reader_parents$;
+
+DO $operator_reader_schemas$
+DECLARE
+  schema_name NAME;
+BEGIN
+  FOR schema_name IN
+    SELECT nspname FROM pg_namespace
+    WHERE nspname NOT IN ('pg_catalog','information_schema')
+      AND nspname NOT LIKE 'pg_temp_%' AND nspname NOT LIKE 'pg_toast%'
+  LOOP
+    EXECUTE format('REVOKE ALL PRIVILEGES ON SCHEMA %I FROM sol_token_operator_reader',
+      schema_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_operator_reader',
+      schema_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_operator_reader',
+      schema_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_operator_reader',
+      schema_name);
+  END LOOP;
+END
+$operator_reader_schemas$;
+
+DO $operator_reader_columns$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,table_class.relname,
+      string_agg(quote_ident(attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class table_class
+    JOIN pg_namespace namespace ON namespace.oid=table_class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=table_class.oid
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema')
+      AND namespace.nspname NOT LIKE 'pg_temp_%' AND namespace.nspname NOT LIKE 'pg_toast%'
+      AND table_class.relkind IN ('r','p','v','m','f')
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    GROUP BY namespace.nspname,table_class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM sol_token_operator_reader',
+      relation.columns,relation.nspname,relation.relname
+    );
+  END LOOP;
+END
+$operator_reader_columns$;
+
+GRANT USAGE ON SCHEMA public TO sol_token_operator_reader;
+
 GRANT SELECT ON TABLE
   execution_wallet_generations,
   execution_wallet_risk_state,
+  execution_wallet_snapshots,
   execution_provider_usage_snapshots,
   execution_exposure_reservations,
   execution_reconciliation_evidence,
@@ -1402,8 +1486,20 @@ GRANT SELECT ON TABLE
   execution_control_state,
   execution_control_events,
   execution_activation_armaments,
-  execution_activation_events
+  execution_activation_events,
+  execution_simulation_artifacts,
+  migration_history
 TO sol_token_operator_reader;
+
+GRANT SELECT (
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status,attempt_count,
+  state_revision,lease_owner,lease_expires_at,last_reason_code,terminal_at,
+  reconciliation_completed_at,created_at,updated_at,purge_after
+)
+ON TABLE execution_intents TO sol_token_operator_reader;
 
 REVOKE ALL ON TABLE
   execution_safety_qualifications,

@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createExecutionPreflightBundle } from '../src/domain/execution-preflight-bundle.js';
-import { createExecutionPreflightDraft } from '../src/domain/execution-preflight-draft.js';
+import {
+  createExecutionPreflightDraft,
+  createExecutionPreflightDraftSource,
+} from '../src/domain/execution-preflight-draft.js';
 import { NOW_MS } from './helpers/execution-canary-fixture.js';
 import { preflightDraftInputs } from './helpers/execution-preflight-draft-fixture.js';
 
@@ -16,6 +19,14 @@ void test('builds an H2f draft from exact persisted identities and eight static 
   assert.equal(bundle.qualification.gates[10]?.evidenceId, input.source.simulation.artifactId);
   assert.equal(bundle.canary.expiresAtMs, NOW_MS + 60_000);
   assert.notEqual(input.source.simulation.intentId, input.source.target.intent.id);
+});
+
+void test('reconstructs the standalone H2h source before a gate catalog exists', () => {
+  const input = preflightDraftInputs();
+  assert.deepEqual(createExecutionPreflightDraftSource(input.source), input.source);
+  assert.throws(() => createExecutionPreflightDraftSource(Object.freeze({ ...input.source,
+    readiness: Object.freeze({ ...input.source.readiness, walletLamports: '999' }),
+  })), /Invalid execution preflight draft/u);
 });
 
 void test('rejects stale simulation and target state drift', () => {
