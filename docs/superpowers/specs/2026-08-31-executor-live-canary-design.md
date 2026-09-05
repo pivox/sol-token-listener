@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.10
+**Version de spécification :** 1.2.11
 
-**Version de la spécification parente :** 1.11.11
+**Version de la spécification parente :** 1.11.12
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.11 — 2026-09-05 :** livre H2f, packaging hors ligne canonique et
+  atomique des deux attestations H2c, sans preuve synthétique, clé Solana,
+  armement ou soumission.
 
 - **1.2.10 — 2026-09-05 :** ferme le handoff H2e/H2d par une marge de cinq
   secondes et des chemins externes au checkout résolus canoniquement.

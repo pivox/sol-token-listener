@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.7.2 — 2026-09-05
+**Version :** 1.8.1 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -9,8 +9,9 @@ signature ni soumission. #51-H2b publie séparément
 armement V2 lié à une intention BUY exacte, le lock durable avant signature et
 sa récupération fail-closed. #51-H2d ajoute le bootstrap non signant des
 snapshots wallet/provider. #51-H2e produit l'attestation de quota Helius
-consommée par H2d. Cette livraison prépare un préflight externe sans armer ni
-démarrer un canary.
+consommée par H2d. #51-H2f valide et signe hors ligne les deux enveloppes H2c
+dans un paquet atomique. Ces livraisons préparent un préflight externe sans
+armer ni démarrer un canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
 briques #51-G ne prouvent ni rentabilité, ni sellabilité générale, ni avantage
@@ -161,6 +162,42 @@ wallet secret ni signer et ne lance jamais `live:preflight`, `live:resume`,
 `live:arm`, H2a ou H2b. Les snapshots remplacés deviennent purgeables après
 quatre heures ; la génération active et les preuves référencées sont gardées.
 
+## Produire le paquet d'attestations H2f
+
+Après sélection de l'intention BUY et production réelle des onze preuves,
+créer hors Git un draft canonique conforme à
+`execution-preflight-bundle-draft.v1`. Il contient le manifeste H2d exact, les
+champs d'entrée de qualification, la policy, les snapshots complets persistés
+et l'identifiant d'intention. Les entiers `bigint` utilisent le marqueur JSON
+versionné du projet. H2f ne génère ni ne déclare une preuve `PASSED` à la place
+de l'opérateur.
+
+Créer un environnement séparé qui ne contient aucun accès RPC, base, Helius
+ou live :
+
+```dotenv
+EXECUTOR_PREFLIGHT_DRAFT_PATH=/chemin/hors-git/draft.json
+EXECUTOR_EVIDENCE_PRIVATE_KEY_PATH=/chemin/hors-git/provider-attestation-key.pem
+EXECUTOR_PREFLIGHT_BUNDLE_OUTPUT_DIRECTORY=/chemin/hors-git/bundle-unique
+```
+
+Le draft et la clé sont owner-only `0400` ou `0600`. Le répertoire final doit
+être absent et extérieur au checkout. Exécuter :
+
+```bash
+npm run build:backend
+DOTENV_CONFIG_PATH=/chemin/hors-git/preflight-bundle.env \
+  npm run executor:preflight-bundle:start
+```
+
+Le répertoire est publié atomiquement en `0700` avec
+`qualification.json`, `canary.json` et `manifest.json` en `0600`. La commande
+auto-vérifie les deux signatures et affiche uniquement le manifeste redacted.
+Elle refuse aussi les délais de fraîcheur dérivés de la policy déjà consommés
+et retire le répertoire final si son fence de durabilité parent échoue.
+Son succès signifie `PREFLIGHT_EVIDENCE_PACKAGED / CANARY_NOT_STARTED`, jamais
+un armement ou un verdict de sécurité économique.
+
 ## Procédure H2c manuelle, avec arrêt après chaque étape
 
 1. Exécuter H2d, auditer son manifeste et transmettre ses identités exactes au
@@ -172,11 +209,11 @@ quatre heures ; la génération active et les preuves référencées sont gardé
    décision et la révision sont connues. Noter son `intentId`, son mint et son
    montant entier. Arrêter le listener ou remettre l'émission à `false`, puis
    vérifier qu'aucune nouvelle intention n'apparaît.
-4. Construire et auditer le build exact. Produire hors dépôt une qualification
-   Ed25519 fraîche puis un sidecar canary V1 signé qui lie l'intention, les onze
-   gates, les snapshots wallet/provider, le genesis, le build, la stratégie,
-   la configuration et les limites runtime. H2c ne fournit pas la clé de
-   signature de preuve.
+4. Construire et auditer le build exact. Produire le draft H2f à partir des
+   preuves réelles, puis générer le paquet Ed25519 frais qui lie l'intention,
+   les onze gates, les snapshots wallet/provider, le genesis, le build, la
+   stratégie et la configuration. Recopier les deux chemins du paquet vers
+   l'environnement opérations ; H2f ne fournit pas la clé de preuve.
 5. Depuis l'environnement opérations, exécuter séparément :
 
    ```bash

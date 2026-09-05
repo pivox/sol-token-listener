@@ -16,6 +16,8 @@
     "executor:readiness:start": "node dist/src/executor-readiness/main.js",
     "executor:provider-evidence:dev": "tsx src/provider-evidence/main.ts",
     "executor:provider-evidence:start": "node dist/src/provider-evidence/main.js",
+    "executor:preflight-bundle:dev": "tsx src/preflight-bundle/main.ts",
+    "executor:preflight-bundle:start": "node dist/src/preflight-bundle/main.js",
     "executor:live:recovery:dev": "tsx src/executor-live-recovery/main.ts",
     "executor:live:recovery:start": "node dist/src/executor-live-recovery/main.js",
     "executor:live:dev": "tsx src/executor-live/main.ts",
