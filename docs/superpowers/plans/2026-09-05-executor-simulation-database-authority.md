@@ -14,9 +14,10 @@
 
 **Files:**
 - Create: `tests/executor-worker-database-authority.test.ts`
-- Modify: `tests/executor-roles-provisioning.test.ts`
+- Modify: `tests/executor-main.integration.test.ts`
+- Modify: `.github/workflows/ci.yml`
 
-- [ ] **Step 1: Ajouter le test statique de l'allowlist**
+- [x] **Step 1: Ajouter le test statique de l'allowlist**
 
 Lire `scripts/provision-executor-roles.sql` et exiger : remise à zéro du rôle,
 ACL de colonnes sur les cinq tables d'exécution autorisées, lectures bornées de
@@ -30,7 +31,7 @@ assert.doesNotMatch(executable,
   /GRANT\s+(?:ALL|DELETE|TRUNCATE|REFERENCES|TRIGGER)\b[^;]*TO\s+sol_token_executor_worker/iu);
 ```
 
-- [ ] **Step 2: Ajouter le test PostgreSQL 16 réel**
+- [x] **Step 2: Ajouter le test PostgreSQL 16 réel**
 
 Créer une base isolée, appliquer les migrations, injecter des droits directs,
 `PUBLIC`, default ACL, parent et propriété, rejouer le provisioning puis créer
@@ -47,7 +48,7 @@ assert.equal((await worker.query('SELECT current_user AS role')).rows[0]?.role,
   'sol_token_executor_worker');
 ```
 
-- [ ] **Step 3: Étendre les processus d'intégration au login dédié**
+- [x] **Step 3: Étendre les processus d'intégration au login dédié**
 
 Dans le test réel, produire une intention via la connexion administrative,
 lancer d'abord le processus compilé `dry-run`, puis une seconde intention et
@@ -61,11 +62,11 @@ assert.equal(rpc.methods.includes('sendRawTransaction'), false);
 assert.equal(rpc.simulatedTransactionWasUnsigned(), true);
 ```
 
-- [ ] **Step 4: Exécuter les tests et constater l'échec attendu**
+- [x] **Step 4: Exécuter les tests et constater l'échec attendu**
 
 Run:
 ```bash
-TEST_DATABASE_URL="$TEST_DATABASE_URL" node --import tsx --test \
+TEST_EXECUTOR_ROLE_DATABASE_URL="$TEST_EXECUTOR_ROLE_DATABASE_URL" node --import tsx --test \
   tests/executor-worker-database-authority.test.ts \
   tests/executor-roles-provisioning.test.ts
 ```
@@ -77,9 +78,10 @@ privilège positif.
 
 **Files:**
 - Modify: `scripts/provision-executor-roles.sql`
+- Modify: `src/storage/execution-intent.repository.ts`
 - Test: `tests/executor-worker-database-authority.test.ts`
 
-- [ ] **Step 1: Reconstruire le rôle depuis zéro**
+- [x] **Step 1: Reconstruire le rôle depuis zéro**
 
 Ajouter les blocs `worker_parameter_acl`, `worker_parents`, `worker_schemas`,
 `worker_types`, `worker_database_acl`, `worker_language_acl`,
@@ -93,7 +95,7 @@ ALTER ROLE sol_token_executor_worker NOLOGIN NOSUPERUSER NOCREATEDB
 GRANT USAGE ON SCHEMA public TO sol_token_executor_worker;
 ```
 
-- [ ] **Step 2: Accorder uniquement les colonnes nécessaires**
+- [x] **Step 2: Accorder uniquement les colonnes nécessaires**
 
 Émettre des `GRANT SELECT (...)`, `INSERT (...)` et `UPDATE (...)` séparés
 pour `execution_intents`, `execution_dry_run_assessments`,
@@ -106,11 +108,11 @@ GRANT USAGE ON SEQUENCE execution_intent_transitions_sequence_seq
 TO sol_token_executor_worker;
 ```
 
-- [ ] **Step 3: Vérifier les tests ciblés verts**
+- [x] **Step 3: Vérifier les tests ciblés verts**
 
 Run:
 ```bash
-TEST_DATABASE_URL="$TEST_DATABASE_URL" node --import tsx --test \
+TEST_EXECUTOR_ROLE_DATABASE_URL="$TEST_EXECUTOR_ROLE_DATABASE_URL" node --import tsx --test \
   tests/executor-worker-database-authority.test.ts \
   tests/executor-main.integration.test.ts \
   tests/execution-intent.repository.test.ts \
@@ -132,13 +134,13 @@ compilés.
 - Modify: `docs/system-overview.html`
 - Modify: `tests/executor-live-main.integration.test.ts`
 
-- [ ] **Step 1: Monter les versions normatives**
+- [x] **Step 1: Monter les versions normatives**
 
 Passer la spécification parent à `1.11.16`, la spécification canary à
 `1.2.14`, ajouter leur historique et faire vérifier ces chaînes exactes par le
 test d'intégration documentaire.
 
-- [ ] **Step 2: Documenter l'exploitation**
+- [x] **Step 2: Documenter l'exploitation**
 
 Décrire le login externe `0600`, l'option
 `role=sol_token_executor_worker`, l'absence de migration automatique et les
