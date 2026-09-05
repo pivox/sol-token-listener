@@ -1,8 +1,8 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.5
+**Version de spécification :** 1.0.9
 
-**Version de la spécification parente :** 1.11.6
+**Version de la spécification parente :** 1.11.11
 
 **Date :** 2026-09-05
 
@@ -13,6 +13,18 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.9 — 2026-09-05 :** aligne H2e sur la marge transactionnelle H2d de
+  cinq secondes avant le commit readiness.
+
+- **1.0.8 — 2026-09-05 :** référence la procédure portable Node.js 22 de
+  génération de la clé d'attestation externe H2e.
+
+- **1.0.7 — 2026-09-05 :** exige une preuve H2e encore fraîche après écriture
+  avant de démarrer la collecte H2d.
+
+- **1.0.6 — 2026-09-05 :** référence le producteur Helius H2e comme source
+  externe de l'enveloppe Ed25519, sans élargir le processus H2d.
 
 - **1.0.5 — 2026-09-05 :** ferme les deux constats du troisième cycle de
   revue : zéro autorité directe du login et zéro privilège de table effectif,

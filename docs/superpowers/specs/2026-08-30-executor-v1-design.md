@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.6
+**Version de spécification :** 1.11.11
 
 **Date :** 2026-08-31
 
@@ -10,10 +10,26 @@
 
 **Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes
 #51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b,
-préparation opérateur exacte #51-H2c et bootstrap de readiness non signable
-#51-H2d
+préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
+#51-H2d et producteur externe de quota Helius #51-H2e
 
 ## Historique des versions
+
+- **1.11.11 — 2026-09-05 :** aligne H2e sur la marge de commit H2d et impose
+  des secrets/preuves physiquement extérieurs au checkout.
+
+- **1.11.10 — 2026-09-05 :** rend la génération de clé d'attestation H2e
+  exécutable avec le runtime Node.js 22 supporté, sans écrasement possible.
+
+- **1.11.9 — 2026-09-05 :** revérifie la fraîcheur H2e aux frontières de
+  signature et d'écriture avant de publier le manifeste de succès.
+
+- **1.11.8 — 2026-09-05 :** durcit H2e contre les symlinks et secrets directs,
+  avec sortie bornée et permissions exactes.
+
+- **1.11.7 — 2026-09-05 :** ajoute H2e, producteur Helius one-shot de la
+  preuve Ed25519 consommée par H2d, isolé de tout wallet, PostgreSQL, armement,
+  signature Solana ou soumission.
 
 - **1.11.6 — 2026-09-05 :** implémente H2d avec transport finalisé borné,
   attestation provider Ed25519, commit atomique et rôle PostgreSQL 16 dédié ;
@@ -1057,6 +1073,8 @@ réaffecté à une autre signification.
 | #51-H2a | Runtime de finalité read-only séparé : réconciliation, confirmation et échéances | Aucune |
 | #51-H2b | Composition signable, reprise exacte et lanes SELL/BUY dans un exécutable isolé | Présente mais non armée |
 | #51-H2c | Validation opérateur et préparation manuelle du canary minimal | Armement humain explicite uniquement |
+| #51-H2d | Bootstrap public wallet/provider sous rôle PostgreSQL dédié | Aucune |
+| #51-H2e | Producteur externe de preuve de quota Helius signée | Aucune capacité Solana |
 
 Chaque PR est fusionnable seule, garde le listener opérationnel et passe trois
 cycles de revue au maximum. Une PR ne peut pas anticiper l'activation de la
@@ -1095,7 +1113,7 @@ suivante.
 - les gates compensatoires et l'activation progressive sont testables ;
 - SOL/WSOL est l'allowlist initiale sans coupler le domaine à SOL ;
 - la rétention terminale de quatre heures est documentée ;
-- les lots #51-B à #51-H2c sont indépendants et fusionnables séquentiellement ;
+- les lots #51-B à #51-H2e sont indépendants et fusionnables séquentiellement ;
 - aucun code de production, comportement, secret ou mode live n'est ajouté ;
 - `npm run build`, `npm run check`, `npm run lint`, `npm test` et
   `npm run docs:check` restent verts.

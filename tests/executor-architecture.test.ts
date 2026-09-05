@@ -60,6 +60,27 @@ void test('source and compiled readiness graphs stay read-only and outside live 
   }
 });
 
+void test('source and compiled Helius evidence graphs cannot reach a Solana wallet or live runtime', async () => {
+  for (const entry of [
+    resolve(repositoryRoot, 'src/provider-evidence/main.ts'),
+    resolve(repositoryRoot, 'dist/src/provider-evidence/main.js'),
+  ]) {
+    await access(entry);
+    const graph = await readGraph(entry);
+    assert.ok(graph.size >= 6,
+      `provider evidence graph unexpectedly small: ${relative(repositoryRoot, entry)}`);
+    assert.deepEqual(
+      [...graph.keys()].filter((path) => /\/executor-(?:live|operations|simulation|readiness)\//u.test(path)),
+      [],
+    );
+    for (const [path, source] of graph) {
+      assert.doesNotMatch(source,
+        /@solana\/web3\.js|\b(?:Keypair|VersionedTransaction|sendRawTransaction|sendTransaction|simulateTransaction)\b|\b(?:pg|postgresql):/u,
+        `transactional capability in ${relative(repositoryRoot, path)}`);
+    }
+  }
+});
+
 void test('source and compiled dry-run worker graphs stay inside the strict dry-run allowlist', async () => {
   const entries = [
     resolve(repositoryRoot, 'src/executor/dry-run-worker.ts'),
