@@ -206,7 +206,7 @@ void test('documents H2d-H2k external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     canaryIntentPairSpecification,
-    '**Version de spécification :** 1.1.0',
+    '**Version de spécification :** 1.1.1',
     'canary intent pair specification version',
   );
   assertContainsExactlyOnce(
