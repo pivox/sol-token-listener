@@ -399,6 +399,10 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       await assertDynamicExecutionInventory(isolated);
       await assertClosedObjectAuthority(worker, privateSchema, isolated);
       await assertWorkerLivePartition(worker, isolated);
+      await context.test(
+        'an active worker SET ROLE session stays partitioned after membership revocation',
+        async () => assertRevokedWorkerSessionPartition(worker, isolated, loginName),
+      );
 
       const publicParameterProbe = await isolated.connect();
       let parameterProbeFailed = false;
@@ -867,6 +871,69 @@ async function assertWorkerLivePartition(
     intent_id,attempt_number,status,started_at
   ) VALUES ($1,2,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [raceId]),
   /row-level security|live_reserved|reserved/iu);
+}
+
+async function assertRevokedWorkerSessionPartition(
+  workerPool: InstanceType<typeof pg.Pool>,
+  admin: InstanceType<typeof pg.Pool>,
+  loginName: string,
+): Promise<void> {
+  const nonLiveId = `execution_intent_${'5'.repeat(64)}`;
+  const liveId = `execution_intent_${'6'.repeat(64)}`;
+  await insertPartitionIntent(admin, nonLiveId, 'revoked-non-live', false);
+  await insertPartitionIntent(admin, liveId, 'revoked-live', true);
+
+  const activeWorker = await workerPool.connect();
+  try {
+    assert.deepEqual((await activeWorker.query<{
+      readonly session_user: string;
+      readonly current_user: string;
+      readonly configured_role: string;
+      readonly worker_member: boolean;
+    }>(`SELECT session_user,current_user,current_setting('role') AS configured_role,
+        pg_has_role(session_user,$1,'MEMBER') AS worker_member`, [WORKER_ROLE])).rows, [{
+      session_user: loginName,
+      current_user: WORKER_ROLE,
+      configured_role: WORKER_ROLE,
+      worker_member: true,
+    }]);
+
+    await admin.query(`REVOKE ${WORKER_ROLE} FROM ${quoteIdentifier(loginName)}`);
+
+    assert.deepEqual((await activeWorker.query<{
+      readonly session_user: string;
+      readonly current_user: string;
+      readonly configured_role: string;
+      readonly worker_member: boolean;
+    }>(`SELECT session_user,current_user,current_setting('role') AS configured_role,
+        pg_has_role(session_user,$1,'MEMBER') AS worker_member`, [WORKER_ROLE])).rows, [{
+      session_user: loginName,
+      current_user: WORKER_ROLE,
+      configured_role: WORKER_ROLE,
+      worker_member: false,
+    }]);
+
+    const visible = await activeWorker.query<{ readonly id: string }>(
+      'SELECT id FROM execution_intents WHERE id=ANY($1::TEXT[]) ORDER BY id',
+      [[nonLiveId, liveId]],
+    );
+    let childWriteFailure: unknown;
+    try {
+      await activeWorker.query(`INSERT INTO execution_attempts (
+        intent_id,attempt_number,status,started_at
+      ) VALUES ($1,1,'STARTED',date_trunc('milliseconds',statement_timestamp()))`, [liveId]);
+    } catch (error) {
+      childWriteFailure = error;
+    }
+
+    assert.deepEqual(visible.rows, [{ id: nonLiveId }]);
+    assert.match(
+      String(childWriteFailure),
+      /row-level security|live_reserved|reserved/iu,
+    );
+  } finally {
+    activeWorker.release();
+  }
 }
 
 async function insertPartitionIntent(
