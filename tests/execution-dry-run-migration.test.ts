@@ -8,7 +8,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '032_execution_dry_run_assessments.sql';
 const simulationMigrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '039_execution_canary_operator_binding.sql';
+const latestMigrationName = '040_execution_worker_live_partition.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);

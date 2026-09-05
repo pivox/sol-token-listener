@@ -147,7 +147,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.16',
+    '**Version de spécification :** 1.11.17',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -163,12 +163,12 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.14',
+    '**Version de spécification :** 1.2.15',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.16',
+    '**Version de la spécification parente :** 1.11.17',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -233,7 +233,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.12.0 — 2026-09-05',
+    '**Version :** 1.13.0 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
@@ -295,6 +295,18 @@ void test('documents H2d-H2j external evidence without starting a canary',
     runbook,
     /sol_token_executor_worker[\s\S]*options=-c role=sol_token_executor_worker[\s\S]*POSTGRES_AUTO_MIGRATE=false/iu,
   );
+  for (const document of [parentSpecification, liveSpecification, runbook]) {
+    assert.match(document,
+      /live_reserved[\s\S]*(?:jamais|aucun)[\s\S]*(?:voir|lire|altérer|modifier)[\s\S]*live/iu);
+    assert.match(document, /propriétaire administratif[\s\S]*migrateur/iu);
+    assert.match(document, /bypass[\s\S]*sans[\s\S]*FORCE ROW LEVEL SECURITY/iu);
+    assert.match(document,
+      /SELECT\s*\(?`?live_reserved`?\)?[\s\S]*(?:exigé|nécessaire)[\s\S]*(?:technique|PostgreSQL)/iu);
+    assert.match(document,
+      /(?:déni de service|DoS)[\s\S]*pré-promotion[\s\S]*(?:aucune|sans)[\s\S]*(?:signature|signer)[\s\S]*(?:soumission|envoi)/iu);
+    assert.match(document,
+      /DRY_RUN[\s\S]*EXECUTE[\s\S]*live_reserved=false[\s\S]*LIVE_EXECUTE[\s\S]*LIVE_RECOVER[\s\S]*CONFIRM[\s\S]*RECONCILE[\s\S]*live_reserved=true/iu);
+  }
   assert.match(
     runbook,
     /paramètres de simulation non signants[\s\S]*URL RPC potentiellement\s+confidentielle[\s\S]*fichier externe `0600`[\s\S]*jamais\s+journalisée/iu,
@@ -344,8 +356,9 @@ void test('documents H2d-H2j external evidence without starting a canary',
   assert.equal((deploymentSmoke.match(/'037_execution_live_orchestration\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'038_execution_live_rpc_budget\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'039_execution_canary_operator_binding\.sql'/gu) ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'040_execution_worker_live_partition\.sql'/gu) ?? []).length, 1);
   assert.equal(
-    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n\]\);/u.test(deploymentSmoke),
+    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n {2}'040_execution_worker_live_partition\.sql',\n\]\);/u.test(deploymentSmoke),
     true,
     'deployment smoke migration head',
   );

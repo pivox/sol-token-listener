@@ -183,7 +183,7 @@ valides et fusionner uniquement avec les trois jobs CI verts.
 - Modify: `docs/system-overview.html`
 - Modify: `tests/executor-live-main.integration.test.ts`
 
-- [ ] **Step 1: Écrire les preuves rouges de partition et de migration**
+- [x] **Step 1: Écrire les preuves rouges de partition et de migration**
 
 Ajouter une migration-test PostgreSQL 16 qui applique 001–039, peuple chacune
 des racines live historiques (armement cible/lock, lock pré-signature,
@@ -211,7 +211,7 @@ TEST_EXECUTOR_ROLE_DATABASE_URL="$TEST_EXECUTOR_ROLE_DATABASE_URL" \
 Expected: FAIL parce que la migration 040, les policies et les guards
 n'existent pas encore.
 
-- [ ] **Step 2: Écrire les preuves rouges des transactions métier**
+- [x] **Step 2: Écrire les preuves rouges des transactions métier**
 
 Dans les tests repositories, exiger que `armCanary()` verrouille et revalide le
 BUY pristine, le promeuve avant l'admission et annule toute la promotion si
@@ -231,7 +231,7 @@ node --import tsx --test \
 
 Expected: FAIL sur les nouveaux invariants `live_reserved`.
 
-- [ ] **Step 3: Implémenter la migration 040 et fermer le provisioning**
+- [x] **Step 3: Implémenter la migration 040 et fermer le provisioning**
 
 Ajouter `live_reserved BOOLEAN NOT NULL DEFAULT FALSE` uniquement à
 `execution_intents`. Backfiller les intentions racines live avant d'activer RLS
@@ -260,7 +260,7 @@ TEST_EXECUTOR_ROLE_DATABASE_URL="$TEST_EXECUTOR_ROLE_DATABASE_URL" \
 
 Expected: PASS, sans skip pour les tests PostgreSQL dédiés.
 
-- [ ] **Step 4: Rendre promotion, SELL et claims transactionnels**
+- [x] **Step 4: Rendre promotion, SELL et claims transactionnels**
 
 Ajouter `live_reserved` seulement à la projection interne de l'intention si la
 vérification repository l'exige ; ne modifier aucun contrat domaine ou API.
@@ -283,7 +283,7 @@ node --import tsx --test \
 
 Expected: PASS, incluant les rollbacks atomiques et les claims par purpose.
 
-- [ ] **Step 5: Versionner les contrats et documenter le risque résiduel**
+- [x] **Step 5: Versionner les contrats et documenter le risque résiduel**
 
 Monter d'un patch les spécifications parent et canary, consigner l'historique
 H2j P1, puis aligner architecture, runbook, vue système et assertions de

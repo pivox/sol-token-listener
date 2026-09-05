@@ -552,6 +552,19 @@ une preuve de réconciliation. Les migrations et le provisioning restent
 administratifs ; le processus reçoit une `DATABASE_URL` de service distincte
 et ne charge aucune clé privée.
 
+La migration 040 ajoute le marqueur monotone `live_reserved` uniquement à
+`execution_intents`. Une intention promue à `true` et ses enfants deviennent
+invisibles et non modifiables par le worker grâce aux policies RLS des cinq
+tables ; les enfants restent liés par `intent_id` sans recopier le marqueur.
+Les claims non signants `DRY_RUN`/`EXECUTE` ciblent `false`, tandis que les
+claims live `LIVE_EXECUTE`/`LIVE_RECOVER`/`CONFIRM`/`RECONCILE` exigent `true`.
+RLS n'est pas forcée : le propriétaire administratif chargé des migrations
+conserve son bypass. `SELECT(live_reserved)` n'est accordé au worker que si le
+moteur PostgreSQL le requiert techniquement pour appliquer la policy, sans
+exposition au domaine ou à l'API. Avant promotion, un worker compromis peut
+encore provoquer un déni de service sur une candidate ; il n'obtient pour
+autant aucune capacité de signer ou soumettre une transaction.
+
 ## Persistance, reprise et rétention
 
 `raw_chain_events` garde l’entrée technique ; `domain_events`,

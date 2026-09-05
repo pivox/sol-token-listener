@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.14
+**Version de spécification :** 1.2.15
 
-**Version de la spécification parente :** 1.11.16
+**Version de la spécification parente :** 1.11.17
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.15 — 2026-09-05 :** sépare par RLS les intentions non signantes des
+  intentions réservées au live et rend leur promotion monotone et atomique.
 
 - **1.2.14 — 2026-09-05 :** borne H2j, autorité PostgreSQL minimale commune
   aux modes `dry-run` et `simulation-only`, sans aucune capacité live.
@@ -567,6 +570,18 @@ générations et snapshots wallet, l'admission risque, le contrôle, l'armement,
 les locks pré-signature, les bytes signés, le budget RPC live, la soumission,
 les positions live et la réconciliation. Le provisioning reste administratif,
 rejouable et séparé du démarrage applicatif.
+
+La migration 040 conserve une seule source de vérité : `live_reserved` existe
+uniquement sur `execution_intents`. Le worker ne peut jamais lire ni altérer une
+intention `live_reserved=true` ou ses enfants, qui sont filtrés par
+`intent_id`. Les claims `DRY_RUN` et `EXECUTE` exigent
+`live_reserved=false`; les claims `LIVE_EXECUTE`, `LIVE_RECOVER`, `CONFIRM` et
+`RECONCILE` exigent `live_reserved=true`. Le propriétaire administratif et
+migrateur conserve son bypass avec RLS sans `FORCE ROW LEVEL SECURITY`. Le
+worker reçoit `SELECT(live_reserved)` uniquement si PostgreSQL le démontre
+techniquement nécessaire à la policy ; le marqueur ne rejoint aucun contrat
+domaine ou API. Le déni de service pré-promotion reste le risque résiduel, sans
+capacité de signature ni de soumission.
 
 ## 13. Reason codes append-only
 

@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.16
+**Version de spécification :** 1.11.17
 
 **Date :** 2026-08-31
 
@@ -17,6 +17,10 @@ read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i
 et autorité PostgreSQL fermée du worker non signant #51-H2j
 
 ## Historique des versions
+
+- **1.11.17 — 2026-09-05 :** réserve les intentions live par un marqueur
+  monotone et isole leurs lignes des workers non signants avec RLS, sans
+  étendre leurs capacités de signature ou de soumission.
 
 - **1.11.16 — 2026-09-05 :** ajoute H2j, autorité PostgreSQL minimale du
   worker `dry-run` et `simulation-only`, sans wallet, armement, signature ni
@@ -439,6 +443,19 @@ la tentative et l'artefact non signé `simulation-only`, les transitions
 associées et la preuve read-only du marché canonique. Ce rôle n'accède ni au
 wallet, ni au risque ou contrôle live, ni à l'armement, ni aux bytes signés, ni
 à la soumission ou à la réconciliation.
+
+La migration 040 ajoute `live_reserved` uniquement à `execution_intents` et
+active RLS sur cette table et ses quatre tables enfants. Le worker ne peut
+jamais lire ni altérer une intention `live_reserved=true`, ni ses enfants ; les
+enfants sont filtrés par leur `intent_id`, sans booléen dupliqué. `DRY_RUN` et
+`EXECUTE` réclament seulement `live_reserved=false`; `LIVE_EXECUTE`,
+`LIVE_RECOVER`, `CONFIRM` et `RECONCILE` réclament seulement
+`live_reserved=true`. Le propriétaire administratif et migrateur conserve son
+bypass grâce à RLS sans `FORCE ROW LEVEL SECURITY`. Un
+`SELECT(live_reserved)` n'est accordé au worker que s'il est techniquement
+exigé par PostgreSQL pour appliquer la policy, jamais pour exposer le marqueur
+au domaine ou à l'API. Le risque résiduel est un déni de service pré-promotion ;
+il ne donne aucune capacité de signature ou de soumission.
 
 ### 4.3 Secrets
 

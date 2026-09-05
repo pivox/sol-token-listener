@@ -1,6 +1,9 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.12.0 — 2026-09-05
+**Version :** 1.13.0 — 2026-09-05
+
+La version 1.13.0 ajoute la partition RLS des intentions réservées au live,
+porte le head de migration à 040 et maintient le canary non démarré.
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -121,7 +124,7 @@ Créer sept fichiers hors Git, lisibles seulement par leur compte de service :
 - H2b : login membre uniquement de `sol_token_executor_live`, keypair externe
   `0400` ou `0600`, `EXECUTOR_MODE=live` et activation explicite.
 
-Après la migration 039, l'administrateur rejoue
+Après la migration 040, l'administrateur rejoue
 `scripts/provision-executor-roles.sql`. Chaque login doit être `NOINHERIT`, ne
 recevoir qu'un seul rôle de groupe avec `ADMIN FALSE, INHERIT FALSE, SET TRUE`,
 et ne posséder aucun objet. Les processus forcent `SET ROLE`,
@@ -173,6 +176,17 @@ la tentative, la transition et l'artefact de simulation non signé attendus. Il
 ne peut ni migrer le schéma, ni accéder aux tables de wallet, risque, contrôle,
 armement, lock, bytes signés, budget RPC live, soumission, position live ou
 réconciliation. Le résultat opérationnel reste `CANARY_NOT_STARTED`.
+
+La migration 040 porte `live_reserved` uniquement sur `execution_intents` et
+filtre les quatre tables enfants par `intent_id`. Le worker ne peut jamais lire
+ni altérer une intention `live_reserved=true` ou ses enfants. Les claims
+`DRY_RUN` et `EXECUTE` exigent `live_reserved=false`; `LIVE_EXECUTE`,
+`LIVE_RECOVER`, `CONFIRM` et `RECONCILE` exigent `live_reserved=true`. Le
+propriétaire administratif et migrateur conserve son bypass avec RLS sans
+`FORCE ROW LEVEL SECURITY`. Le worker ne reçoit `SELECT(live_reserved)` que si
+PostgreSQL le démontre techniquement exigé pour la policy ; cette colonne ne
+devient jamais un contrat domaine ou API. Le déni de service pré-promotion
+reste possible, sans capacité de signature ni de soumission.
 
 ## Produire la preuve Helius H2e
 
@@ -249,7 +263,7 @@ EXECUTOR_RPC_TIMEOUT_MS=5000
 
 Le fichier ne doit contenir aucun nom `EXECUTOR_MODE`,
 `LIVE_TRADING_ENABLED`, keypair, clé privée, mnemonic ou recovery phrase,
-même avec une valeur vide. Après migrations 001–039, rejouer deux fois le
+même avec une valeur vide. Après migrations 001–040, rejouer deux fois le
 provisioning, créer un login `NOINHERIT` sans autorité directe et lui accorder
 uniquement `sol_token_executor_readiness` avec
 `ADMIN FALSE, INHERIT FALSE, SET TRUE`. Lancer ensuite :
@@ -353,7 +367,7 @@ un armement ou un verdict de sécurité économique.
    atomiques ; tout écart laisse zéro capacité live.
 10. Seulement après inspection humaine de l'armement, démarrer H2a avec son
    environnement dédié, puis H2b avec le sien. Le démarrage H2b valide rôle,
-   migration 039, génération, genesis, les huit limites runtime exactes et
+   migration 040, génération, genesis, les huit limites runtime exactes et
    absence d'état incohérent avant de charger le signer. Il ne doit traiter
    que la cible armée, y compris après redémarrage sur un artefact persisté.
 11. Surveiller continuellement les sorties structurées H2a/H2b et les commandes
