@@ -81,7 +81,9 @@ void test('fails closed on genesis mismatch, rate limit, oversized body and slot
   const lagged = new SolanaReadinessRpcGateway({ providerId: 'primary',
     httpRpcUrl: 'https://mainnet.example.invalid', expectedGenesisHash: GENESIS,
     timeoutMs: 100 }, async (_url, init) => {
-      const request = JSON.parse(String(init?.body)) as Readonly<Record<string, unknown>>;
+      const body = init?.body;
+      if (typeof body !== 'string') throw new TypeError('Expected string request body.');
+      const request = JSON.parse(body) as Readonly<Record<string, unknown>>;
       return response(results.shift(), 200, request.id as number);
     });
   await lagged.verifyGenesis(signal);
