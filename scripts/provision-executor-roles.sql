@@ -685,6 +685,155 @@ $worker_ownership_guard$;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO sol_token_executor_worker;
 
+-- A role keeps its OID, grants and active SET ROLE sessions when renamed.
+-- Quarantine any non-canonical OID still targeted by all five worker policies
+-- before those policies are rebound. DROP OWNED and the dependency checks run
+-- in this single DO transaction, so a failed cleanup leaves the old policies
+-- in place and fails closed.
+DO $worker_rebind_guard$
+DECLARE
+  canonical_oid OID;
+  target_oids OID[];
+  policy_target_count INTEGER;
+  stale_oid OID;
+  stale_name NAME;
+  stale_role RECORD;
+  membership RECORD;
+  database_setting RECORD;
+BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('sol-token-listener:worker-policy-rebind:v1',0)
+  );
+
+  SELECT role.oid INTO STRICT canonical_oid
+  FROM pg_catalog.pg_roles role
+  WHERE role.rolname='sol_token_executor_worker';
+
+  WITH expected(policy_name,relation_name) AS (VALUES
+    ('execution_intents_worker_partition','execution_intents'),
+    ('execution_dry_run_assessments_worker_partition','execution_dry_run_assessments'),
+    ('execution_attempts_worker_partition','execution_attempts'),
+    ('execution_intent_transitions_worker_partition','execution_intent_transitions'),
+    ('execution_simulation_artifacts_worker_partition','execution_simulation_artifacts')
+  ), inventory AS (
+    SELECT policy.polroles
+    FROM expected
+    JOIN pg_catalog.pg_class relation
+      ON relation.relname=expected.relation_name
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid=relation.relnamespace AND namespace.nspname='public'
+    JOIN pg_catalog.pg_policy policy
+      ON policy.polrelid=relation.oid AND policy.polname=expected.policy_name
+    WHERE NOT policy.polpermissive AND policy.polcmd='*'
+  )
+  SELECT COUNT(*)::INTEGER,
+    pg_catalog.array_agg(DISTINCT target.role_oid ORDER BY target.role_oid)
+  INTO policy_target_count,target_oids
+  FROM inventory
+  CROSS JOIN LATERAL pg_catalog.unnest(inventory.polroles) target(role_oid);
+
+  IF policy_target_count<>5 OR pg_catalog.cardinality(target_oids)<>1 THEN
+    RAISE EXCEPTION 'ambiguous worker partition policy inventory'
+      USING ERRCODE='55000';
+  END IF;
+
+  stale_oid:=target_oids[1];
+  IF stale_oid<>0 AND stale_oid<>canonical_oid THEN
+    SELECT role.* INTO STRICT stale_role
+    FROM pg_catalog.pg_roles role
+    WHERE role.oid=stale_oid;
+    stale_name:=stale_role.rolname;
+
+    IF stale_name LIKE 'pg\_%' ESCAPE '\'
+      OR stale_name IN (session_user,current_user)
+      OR stale_role.rolsuper OR stale_role.rolcreatedb
+      OR stale_role.rolcreaterole OR stale_role.rolcanlogin
+      OR stale_role.rolreplication OR stale_role.rolbypassrls
+    THEN
+      RAISE EXCEPTION 'unsafe stale worker policy target'
+        USING ERRCODE='55000';
+    END IF;
+
+    EXECUTE pg_catalog.format(
+      'ALTER ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS',
+      stale_name
+    );
+    EXECUTE pg_catalog.format('ALTER ROLE %I RESET ALL',stale_name);
+
+    FOR database_setting IN
+      SELECT database.datname
+      FROM pg_catalog.pg_db_role_setting setting
+      JOIN pg_catalog.pg_database database ON database.oid=setting.setdatabase
+      WHERE setting.setrole=stale_oid
+    LOOP
+      EXECUTE pg_catalog.format(
+        'ALTER ROLE %I IN DATABASE %I RESET ALL',
+        stale_name,database_setting.datname
+      );
+    END LOOP;
+
+    FOR membership IN
+      SELECT parent.rolname
+      FROM pg_catalog.pg_auth_members edge
+      JOIN pg_catalog.pg_roles parent ON parent.oid=edge.roleid
+      WHERE edge.member=stale_oid
+    LOOP
+      EXECUTE pg_catalog.format(
+        'REVOKE %I FROM %I CASCADE',membership.rolname,stale_name
+      );
+    END LOOP;
+    FOR membership IN
+      SELECT member.rolname
+      FROM pg_catalog.pg_auth_members edge
+      JOIN pg_catalog.pg_roles member ON member.oid=edge.member
+      WHERE edge.roleid=stale_oid
+    LOOP
+      EXECUTE pg_catalog.format(
+        'REVOKE %I FROM %I CASCADE',stale_name,membership.rolname
+      );
+    END LOOP;
+
+    IF EXISTS (
+      SELECT 1 FROM pg_catalog.pg_shdepend dependency
+      WHERE dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+        AND dependency.refobjid=stale_oid
+        AND dependency.deptype='o'
+    ) THEN
+      RAISE EXCEPTION 'stale worker policy role owns database objects'
+        USING ERRCODE='55000';
+    END IF;
+
+    EXECUTE pg_catalog.format('DROP OWNED BY %I CASCADE',stale_name);
+
+    DROP POLICY IF EXISTS execution_intents_worker_partition
+      ON execution_intents;
+    DROP POLICY IF EXISTS execution_dry_run_assessments_worker_partition
+      ON execution_dry_run_assessments;
+    DROP POLICY IF EXISTS execution_attempts_worker_partition
+      ON execution_attempts;
+    DROP POLICY IF EXISTS execution_intent_transitions_worker_partition
+      ON execution_intent_transitions;
+    DROP POLICY IF EXISTS execution_simulation_artifacts_worker_partition
+      ON execution_simulation_artifacts;
+
+    IF EXISTS (
+      SELECT 1 FROM pg_catalog.pg_auth_members edge
+      WHERE edge.roleid=stale_oid OR edge.member=stale_oid
+    ) OR EXISTS (
+      SELECT 1 FROM pg_catalog.pg_db_role_setting setting
+      WHERE setting.setrole=stale_oid
+    ) OR EXISTS (
+      SELECT 1 FROM pg_catalog.pg_shdepend dependency
+      WHERE dependency.refclassid='pg_catalog.pg_authid'::pg_catalog.regclass
+        AND dependency.refobjid=stale_oid
+    ) THEN
+      RAISE EXCEPTION 'stale worker policy role retains authority outside the current database'
+        USING ERRCODE='55000';
+    END IF;
+  END IF;
+END
+$worker_rebind_guard$;
+
 -- Rebuild the worker/live row partition after the NOLOGIN worker role exists.
 -- PostgreSQL stores policy targets as role OIDs, so an already active SET ROLE
 -- session remains covered after membership revocation and a role rename cannot
