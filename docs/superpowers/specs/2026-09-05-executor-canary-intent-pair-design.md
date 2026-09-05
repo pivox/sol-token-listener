@@ -1,6 +1,6 @@
 # Paire d'intentions canary non signante — conception #51-H2k
 
-**Version de spécification :** 1.1.0
+**Version de spécification :** 1.1.1
 
 **Version de la spécification parente :** 1.12.1
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.1.1 — 2026-09-06 :** précise la garantie de replay : la migration
+  audite la forme persistée des tables et contraintes, puis recrée les
+  triggers H2k nommés ; elle ne prétend pas inventorier les triggers étrangers.
 - **1.1.0 — 2026-09-06 :** constate H2k-a disponible après merge avec la
   migration 041, l'émission atomique target/probe, les fences de claim et de
   promotion, ainsi que l'expiration et la purge coordonnée après quatre
@@ -129,9 +132,11 @@ La migration 041 crée `execution_preflight_intent_pairs` avec au minimum :
 - `created_at`, `expires_at`, `purge_after`.
 
 Après chaque `CREATE TABLE IF NOT EXISTS`, la migration audite la forme
-effective des colonnes, clés, uniques, FK `RESTRICT`, checks et triggers. Un
-objet homonyme préexistant incomplet fait échouer le replay ; il n'est jamais
-accepté comme équivalent.
+effective des colonnes, clés, uniques, FK `RESTRICT` et checks, puis recrée les
+triggers H2k sous leurs noms canoniques. Elle ne garantit pas l'absence de
+triggers étrangers ajoutés par un rôle disposant déjà de droits DDL. Un objet
+homonyme préexistant incomplet fait échouer le replay ; il n'est jamais accepté
+comme équivalent.
 
 Les deux références pointent vers `execution_intents` avec `ON DELETE
 RESTRICT`. Une table de membership normalisée porte `UNIQUE(intent_id)` et une
