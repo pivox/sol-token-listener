@@ -125,6 +125,9 @@ void test('deadline scanner uses one PostgreSQL clock, exact deadline and oldest
       assert.equal(result?.intent?.requestedAtMs, dueAtMs);
       assert.equal((result?.intent?.expiresAtMs ?? 0) - (result?.intent?.requestedAtMs ?? 0),
         120_000);
+      const reservation = await pool.query(`SELECT live_reserved FROM execution_intents
+        WHERE id=$1`, [result?.intent?.id]);
+      assert.deepEqual(reservation.rows, [{ live_reserved: true }]);
 
       const normalized = queries.map((query) => query.replaceAll(/\s+/gu, ' ').trim());
       const globalLock = normalized.findIndex((query) =>
@@ -138,9 +141,14 @@ void test('deadline scanner uses one PostgreSQL clock, exact deadline and oldest
       const generationLock = normalized.findIndex((query) =>
         query.includes('hashtextextended($1, 51005)'));
       const rowLock = normalized.findIndex((query) => query.includes('FOR UPDATE OF position'));
+      const intentInsert = normalized.find((query) =>
+        query.includes('INSERT INTO execution_intents ('));
       assert.ok(globalLock >= 0 && globalLock < sellPresenceLock);
       assert.ok(sellPresenceLock < clock);
       assert.ok(clock < candidate && candidate < generationLock && generationLock < rowLock);
+      assert.ok(intentInsert);
+      assert.match(intentInsert, /\blive_reserved\b/u);
+      assert.match(intentInsert, /\bTRUE\b/u);
       assert.match(normalized[candidate] ?? '',
         /ORDER BY position\.exit_deadline_at ASC,position\.position_id ASC LIMIT 1/u);
     });
@@ -313,6 +321,39 @@ void test('targeted deadline replay never widens its caller-provided observation
       assert.equal(exactReplay.intent?.id, created.intent?.id);
     });
   });
+
+void test('targeted deadline replay rejects a non-live durable SELL marker', async (context) => {
+  const databaseUrl = process.env.TEST_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl.trim() === '') {
+    context.skip('TEST_DATABASE_URL absent: deadline live-marker replay test skipped');
+    return;
+  }
+  await withTemporarySchema(databaseUrl, async (pool) => {
+    const fixture = await openPositionFixture(pool);
+    const dueAtMs = await makePositionDue(pool, fixture.position.positionId);
+    const created = await fixture.live.createDeadlineExitIntent({
+      positionId: fixture.position.positionId,
+      observedAtMs: dueAtMs,
+    });
+    assert.equal(created.kind, 'CREATED');
+    const corruptor = await pool.connect();
+    try {
+      await corruptor.query('SET session_replication_role = replica');
+      await corruptor.query(`UPDATE execution_intents SET live_reserved=FALSE WHERE id=$1`, [
+        created.intent?.id,
+      ]);
+    } finally {
+      try { await corruptor.query('SET session_replication_role = origin'); } finally {
+        corruptor.release();
+      }
+    }
+
+    await assert.rejects(fixture.live.createDeadlineExitIntent({
+      positionId: fixture.position.positionId,
+      observedAtMs: dueAtMs,
+    }), isLiveRepositoryError('INVALID_DATA'));
+  });
+});
 
 void test('scanner queued before targeted creation yields one CREATED and one stable REPLAYED',
   async (context) => {

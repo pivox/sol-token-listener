@@ -144,6 +144,10 @@ void test('claim validates a closed purpose and preserves each selected business
     assert.ok(Object.isFrozen(claim));
     assert.ok(Object.isFrozen(claim.intent));
     const call = required(client.calls[0]);
+    assertLiveReservationClaimPredicate(
+      call.text,
+      purpose === 'DRY_RUN' || purpose === 'EXECUTE' ? false : true,
+    );
     if (purpose === 'DRY_RUN') assert.match(call.text, /FOR UPDATE OF intent SKIP LOCKED/u);
     else assert.match(call.text, /FOR UPDATE SKIP LOCKED/u);
     if (purpose === 'EXECUTE') {
@@ -249,6 +253,7 @@ void test('live claims separate BUY, SELL, recovery, and reconciliation SQL', as
       'UPDATE execution_intents AS intent',
     )));
     const sql = claimCall.text;
+    assertLiveReservationClaimPredicate(sql, true);
     if (options.purpose === 'LIVE_EXECUTE') {
       assert.match(sql, new RegExp(`intent\\.side\\s*=\\s*'${options.side}'`, 'u'));
       if (options.side === 'SELL') {
@@ -2886,6 +2891,12 @@ function errorTree(error: unknown): string {
 function required<TValue>(value: TValue | null | undefined): TValue {
   if (value === null || value === undefined) assert.fail('Expected a value.');
   return value;
+}
+
+function assertLiveReservationClaimPredicate(sql: string, expected: boolean): void {
+  assert.match(sql, expected
+    ? /intent\.live_reserved\s*(?:=\s*TRUE|IS\s+TRUE)/iu
+    : /intent\.live_reserved\s*(?:=\s*FALSE|IS\s+FALSE)/iu);
 }
 
 async function databaseNowMs(pool: InstanceType<typeof pg.Pool>): Promise<number> {
