@@ -562,9 +562,12 @@ RLS n'est pas forcée : le propriétaire administratif chargé des migrations
 conserve son bypass. La migration vérifie que toute colonne préexistante a la
 forme exacte `BOOLEAN NOT NULL DEFAULT FALSE`. Si le rôle worker est absent,
 elle pose un placeholder neutre ; le provisioning le remplace par des policies
-liées à l'OID du groupe. Les guards enfants `SECURITY INVOKER` lisent et
-verrouillent le parent sous RLS. La protection persiste pour une session active
-après `REVOKE` du membership et après renommage, puisque l'OID ne change pas.
+liées à l'OID du groupe. Chaque replay exige un inventaire exact 5/5 sur un OID
+unique. Un ancien OID renommé est démoté ; memberships, réglages et droits sont
+révoqués atomiquement avant `DROP OWNED` et rebind. Un ownership ou une
+dépendance dans une autre base échoue fermé. Toute session active stale perd
+alors son autorité, et le rôle canonique reçoit les cinq policies finales. Les
+guards enfants `SECURITY INVOKER` lisent et verrouillent le parent sous RLS.
 `SELECT(live_reserved)` est exigé techniquement par PostgreSQL pour les
 predicates de claim et la policy, sans exposition au domaine ou à l'API. Les
 owners, superusers et rôles `BYPASSRLS` restent une limite administrative

@@ -1,8 +1,9 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.14.0 — 2026-09-05
+**Version :** 1.15.0 — 2026-09-05
 
-La version 1.14.0 finalise les corrections P1/P2/P3 de la partition RLS H2j.
+La version 1.15.0 ferme le replay H2j après renommage du rôle worker. La version
+1.14.0 finalisait les corrections P1/P2/P3 de la partition RLS.
 La version 1.13.0 avait ajouté cette partition et porté le head de migration à
 040. Le canary reste non démarré.
 
@@ -190,10 +191,13 @@ ligne `true` et la colonne ne devient jamais un contrat domaine ou API. La
 migration refuse une
 forme préexistante différente de `BOOLEAN NOT NULL DEFAULT FALSE`. Lorsque le
 rôle worker est absent, elle installe un placeholder restrictif neutre ; le
-provisioning le remplace par cinq policies liées à l'OID du groupe. Les guards
-enfants sont `SECURITY INVOKER` et restent soumis à RLS. Un `REVOKE` bloque les
-nouvelles activations sans libérer une session déjà en `SET ROLE`; un renommage
-conserve le même OID et la même policy. Le `owner`, les superusers et rôles
+provisioning le remplace par cinq policies liées à l'OID du groupe. Au replay,
+l'inventaire doit être exactement 5/5 et viser un OID unique. Un ancien OID
+renommé est démoté ; ses memberships, réglages et droits sont révoqués
+atomiquement avant `DROP OWNED` et rebind. Un ownership ou une dépendance dans
+une autre base fait échouer fermé. Une session active stale perd toute autorité
+et le rôle canonique reçoit les cinq policies finales. Les guards enfants sont
+`SECURITY INVOKER` et restent soumis à RLS. Le `owner`, les superusers et rôles
 `BYPASSRLS` constituent une limite de confiance intentionnelle réservée à
 l'administration. Le déni de service pré-promotion reste possible, sans
 capacité de signature ni de soumission.

@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.18
+**Version de spécification :** 1.11.19
 
 **Date :** 2026-08-31
 
@@ -18,6 +18,9 @@ et autorité PostgreSQL fermée du worker non signant #51-H2j
 
 ## Historique des versions
 
+- **1.11.19 — 2026-09-05 :** ferme le replay H2j après renommage : inventaire
+  exact 5/5 sur un OID unique, quarantaine atomique de l'ancien rôle et
+  reliaison exclusive des policies au rôle worker canonique.
 - **1.11.18 — 2026-09-05 :** finalise H2j après P1/P2/P3 avec policies liées
   à l'OID du worker, guards enfants `SECURITY INVOKER` sous RLS et résistance
   aux dérives de schéma, `REVOKE` et renommage.
@@ -461,10 +464,14 @@ predicates de claim et la policy, mais ne révèle aucune ligne `true` et
 n'expose pas le marqueur au domaine ou à l'API. La migration valide la forme
 exacte `BOOLEAN NOT NULL
 DEFAULT FALSE`. Si le rôle est absent, elle crée un placeholder neutre ; le
-provisioning le remplace par des policies liées à l'OID du worker. Les guards
-enfants `SECURITY INVOKER` restent soumis à RLS. Un `REVOKE` empêche les
-nouvelles sessions et un renommage conserve l'OID ; une session worker déjà
-active reste filtrée. Le `owner`, les superusers et rôles `BYPASSRLS` restent
+provisioning le remplace par des policies liées à l'OID du worker. À chaque
+replay, il exige l'inventaire exact 5/5 des policies sur un OID unique. Si cet
+OID appartient à un ancien rôle renommé, celui-ci est démoté et ses memberships,
+réglages et droits sont révoqués atomiquement avant `DROP OWNED` et rebind ; un
+ownership ou une dépendance dans une autre base fait échouer fermé. La session
+active stale perd alors toute autorité et le rôle canonique reçoit seul les
+cinq policies finales. Les guards enfants `SECURITY INVOKER` restent soumis à
+RLS. Un `REVOKE` empêche les nouvelles sessions. Le `owner`, les superusers et rôles `BYPASSRLS` restent
 une frontière de confiance intentionnelle. Le risque résiduel est un DoS
 pré-promotion ; il ne donne aucune capacité de signature ou de
 soumission.

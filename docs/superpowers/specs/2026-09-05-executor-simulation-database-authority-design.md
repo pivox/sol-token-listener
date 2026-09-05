@@ -1,8 +1,8 @@
 # Autorité PostgreSQL du worker de simulation — conception #51-H2j
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
-**Version de la spécification parente visée :** 1.11.18
+**Version de la spécification parente visée :** 1.11.19
 
 **Date :** 2026-09-05
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.0.3 — 2026-09-05 :** ferme le replay après renommage du rôle worker :
+  inventaire non ambigu des cinq policies, quarantaine atomique de l'ancien
+  OID et reliaison exclusive au rôle canonique.
 - **1.0.2 — 2026-09-05 :** lie les policies au rôle worker par OID lors du
   provisioning, remplace la détection de session par des guards
   `SECURITY INVOKER` sous RLS et ferme les dérives de forme, `REVOKE` et
@@ -122,11 +125,31 @@ le comportement mais visible dans l'inventaire. Le provisioning, exécuté aprè
 la création du groupe `NOLOGIN`, remplace toujours ces cinq policies par leurs
 versions `TO sol_token_executor_worker`, désormais liées à son OID.
 
-Cette liaison ne dépend ni de `session_user`, ni d'un test dynamique de
-membership. Une session déjà en `SET ROLE` reste couverte après un `REVOKE` de
-membership, car son `current_user` conserve l'OID actif jusqu'à sa fin. Un
-renommage conserve également l'OID et ne détache pas les policies. Le `REVOKE`
-empêche en parallèle les nouvelles sessions d'activer le groupe.
+Avant toute reliaison, chaque replay du provisioning prend un verrou advisory
+transactionnel puis exige un inventaire exact **5/5** : les cinq policies
+restrictives nommées sur les cinq relations attendues doivent viser un **OID
+unique**. Un inventaire incomplet, dupliqué ou multi-OID échoue fermé. La cible
+`PUBLIC` du placeholder vaut l'OID spécial `0` ; elle est remplacée directement
+par la cible canonique.
+
+Si cet OID unique désigne un ancien rôle renommé plutôt que le rôle canonique,
+le provisioning met l'ancien OID en quarantaine avant le `DROP OWNED` et le
+rebind. Il le démote en `NOLOGIN`, `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`,
+`NOINHERIT`, `NOREPLICATION` et `NOBYPASSRLS`, réinitialise ses réglages globaux
+et par base, révoque avec `CASCADE` ses memberships entrants et sortants, puis
+retire ses droits dans la base courante. La démotion, ces révocations et les
+contrôles de dépendances forment le bloc atomique exécuté avant la suppression
+des anciennes policies et leur reliaison ; toute erreur de quarantaine annule
+ce bloc et fait échouer fermé le replay.
+
+Un ancien rôle système, actif comme `session_user`/`current_user`, privilégié
+ou propriétaire d'un objet est refusé. Un ownership ou une dépendance résiduelle
+dans une autre base, de même qu'un membership ou réglage non supprimable, fait
+échouer fermé le provisioning. Une session active stale conserve techniquement
+son ancien `current_user`, mais perd toute autorité après la quarantaine : ses
+memberships, réglages, droits et policies ont disparu. Le rôle canonique reçoit
+seul les cinq policies finales liées à son OID. Un nouveau renommage sera traité
+de la même manière au replay suivant.
 
 Les quatre tables enfants ont en plus un guard `BEFORE INSERT OR UPDATE`
 `SECURITY INVOKER`, avec `search_path` fermé et privilège `EXECUTE` révoqué à
@@ -185,8 +208,14 @@ passe ou URL n'est accepté par le script de provisioning.
   insertion enfant et course avec la promotion ;
 - application de migration sans rôle via placeholder, puis remplacement des
   policies par le provisioning et vérification de leurs OID cibles ;
-- conservation de la partition pour une session active après `REVOKE` du
-  membership et après renommage du groupe ;
+- inventaire exact 5/5 visant un OID unique avant reliaison ;
+- replay après renommage : ancien OID démoté, memberships, réglages et droits
+  révoqués atomiquement avant `DROP OWNED` et rebind vers le rôle canonique ;
+- échec fermé sur ownership ou dépendance résiduelle dans une autre base ;
+- perte de toute autorité par une session active stale et vérification que le
+  rôle canonique reçoit seul les cinq policies finales ;
+- avant replay, conservation de la partition pour une session active après
+  `REVOKE` du membership ou renommage ; au replay, quarantaine de l'OID stale ;
 - vérification des guards enfants `SECURITY INVOKER` réellement soumis à RLS ;
 - test des claims non signants sur `false` et live sur `true` ;
 - test de rollback atomique de la promotion BUY et de création SELL live ;

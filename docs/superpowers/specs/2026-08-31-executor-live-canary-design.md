@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.16
+**Version de spécification :** 1.2.17
 
-**Version de la spécification parente :** 1.11.18
+**Version de la spécification parente :** 1.11.19
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.2.17 — 2026-09-05 :** ferme le replay H2j d'un rôle renommé par
+  inventaire 5/5 mono-OID, quarantaine atomique de l'ancien rôle et rebind des
+  policies vers le rôle canonique.
 - **1.2.16 — 2026-09-05 :** finalise la partition H2j avec policies liées à
   l'OID du worker, guards `SECURITY INVOKER` et validation fermée du schéma.
 
@@ -585,9 +588,13 @@ worker reçoit `SELECT(live_reserved)`, exigé techniquement par PostgreSQL pour
 les predicates de claim et la policy ; le marqueur ne rejoint aucun contrat
 domaine ou API. La migration refuse une forme différente de `BOOLEAN NOT NULL DEFAULT
 FALSE` et laisse un placeholder neutre lorsque le rôle est absent. Le
-provisioning remplace ce placeholder par des policies liées à l'OID du worker ;
-les guards enfants `SECURITY INVOKER` s'exécutent sous RLS. La partition résiste
-au `REVOKE` d'une session déjà active et au renommage du rôle. Le `owner`, les
+provisioning remplace ce placeholder par des policies liées à l'OID du worker.
+Chaque replay exige l'inventaire exact 5/5 sur un OID unique. Si la cible est un
+ancien rôle renommé, celui-ci est démoté et ses memberships, réglages et droits
+sont révoqués atomiquement avant `DROP OWNED` et rebind. Tout ownership ou toute
+dépendance dans une autre base échoue fermé ; une session active stale perd
+toute autorité, puis le rôle canonique reçoit les cinq policies finales. Les
+guards enfants `SECURITY INVOKER` s'exécutent sous RLS. Le `owner`, les
 superusers et rôles `BYPASSRLS` forment une limite de confiance intentionnelle.
 Le déni de service pré-promotion reste le risque résiduel, sans capacité de
 signature ni de soumission.

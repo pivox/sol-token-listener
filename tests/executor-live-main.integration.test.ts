@@ -153,7 +153,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.18',
+    '**Version de spécification :** 1.11.19',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -169,22 +169,22 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     simulationDatabaseAuthoritySpecification,
-    '**Version de spécification :** 1.0.2',
+    '**Version de spécification :** 1.0.3',
     'simulation database authority specification version',
   );
   assertContainsExactlyOnce(
     simulationDatabaseAuthoritySpecification,
-    '**Version de la spécification parente visée :** 1.11.18',
+    '**Version de la spécification parente visée :** 1.11.19',
     'simulation database authority parent specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.16',
+    '**Version de spécification :** 1.2.17',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.18',
+    '**Version de la spécification parente :** 1.11.19',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -249,7 +249,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.14.0 — 2026-09-05',
+    '**Version :** 1.15.0 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
@@ -335,6 +335,16 @@ void test('documents H2d-H2j external evidence without starting a canary',
     /forme[\s\S]*live_reserved[\s\S]*BOOLEAN[\s\S]*NOT NULL[\s\S]*DEFAULT FALSE/iu);
   assert.match(simulationDatabaseAuthoritySpecification,
     /owner[\s\S]*BYPASSRLS[\s\S]*(?:limite|frontière)[\s\S]*intentionnelle/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /inventaire[\s\S]*5\s*\/\s*5[\s\S]*OID unique/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /ancien OID[\s\S]*démoté[\s\S]*memberships[\s\S]*réglages[\s\S]*droits[\s\S]*atomique[\s\S]*DROP[\s\S]*(?:rebind|reliaison)/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /ownership[\s\S]*dépendance[\s\S]*autre base[\s\S]*échoue fermée/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /session active[\s\S]*stale[\s\S]*perd[\s\S]*toute autorité/iu);
+  assert.match(simulationDatabaseAuthoritySpecification,
+    /rôle canonique[\s\S]*(?:reçoit|porte)[\s\S]*cinq policies finales/iu);
   assert.match(
     runbook,
     /paramètres de simulation non signants[\s\S]*URL RPC potentiellement\s+confidentielle[\s\S]*fichier externe `0600`[\s\S]*jamais\s+journalisée/iu,
