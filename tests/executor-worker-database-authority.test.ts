@@ -141,6 +141,10 @@ void test('worker provisioning declares the exact non-signing column allowlist',
     /REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_executor_worker/u);
   assert.match(sql, /REVOKE ALL PRIVILEGES ON TYPE %I\.%I FROM sol_token_executor_worker/u);
   assert.match(sql,
+    /REVOKE ALL PRIVILEGES ON DATABASE %I FROM sol_token_executor_worker/u);
+  assert.match(sql,
+    /REVOKE ALL PRIVILEGES ON LANGUAGE %I FROM sol_token_executor_worker/u);
+  assert.match(sql,
     /ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL PRIVILEGES ON %s FROM sol_token_executor_worker/u);
   assert.match(sql, /REVOKE %I FROM sol_token_executor_worker/u);
   assert.match(sql, /REVOKE ALL PRIVILEGES ON TABLE %I\.%I FROM PUBLIC/u);
@@ -158,6 +162,20 @@ void test('worker provisioning declares the exact non-signing column allowlist',
     /GRANT\s+(?:ALL(?:\s+PRIVILEGES)?|DELETE|TRUNCATE|REFERENCES|TRIGGER)\b[^;]*TO\s+sol_token_executor_worker/iu);
   assert.doesNotMatch(executable,
     /GRANT\s+(?:SELECT|INSERT|UPDATE)\s+ON\s+TABLE[^;]*TO\s+sol_token_executor_worker/iu);
+  assert.doesNotMatch(executable,
+    /GRANT[^;]*TO\s+sol_token_executor_worker[^;]*WITH\s+GRANT\s+OPTION/iu);
+  const ownershipGuard = /DO \$worker_ownership_guard\$([\s\S]*?)\$worker_ownership_guard\$/u
+    .exec(sql)?.[1];
+  assert.ok(ownershipGuard);
+  for (const ownershipCatalog of [
+    /pg_database[\s\S]*datdba/u,
+    /pg_namespace[\s\S]*nspowner/u,
+    /pg_class[\s\S]*relowner/u,
+    /pg_proc[\s\S]*proowner/u,
+    /pg_type[\s\S]*typowner/u,
+    /pg_language[\s\S]*lanowner/u,
+    /pg_default_acl[\s\S]*defaclrole/u,
+  ]) assert.match(ownershipGuard, ownershipCatalog);
 });
 
 void test('PostgreSQL 16 worker login has only the effective simulation authority',
@@ -205,6 +223,47 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       const provisioningSql = await readFile(scriptUrl, 'utf8');
       await isolated.query(provisioningSql);
 
+      const clusterDrift = await isolated.connect();
+      try {
+        await clusterDrift.query('BEGIN');
+        await clusterDrift.query(`GRANT ${quoteIdentifier(parentName)} TO ${WORKER_ROLE}
+          WITH ADMIN FALSE, INHERIT TRUE, SET TRUE`);
+        await clusterDrift.query(
+          `GRANT SET ON PARAMETER statement_timeout TO ${WORKER_ROLE}`,
+        );
+        await clusterDrift.query(
+          'GRANT SET ON PARAMETER session_replication_role TO PUBLIC',
+        );
+        await clusterDrift.query(provisioningSql);
+        assert.deepEqual((await clusterDrift.query<{
+          readonly parent_count: string;
+          readonly parameter_acl_count: string;
+        }>(`SELECT
+            (SELECT COUNT(*)::TEXT FROM pg_auth_members membership
+              JOIN pg_roles member ON member.oid=membership.member
+              WHERE member.rolname=$1) AS parent_count,
+            (SELECT COUNT(*)::TEXT FROM pg_parameter_acl parameter_acl
+              CROSS JOIN LATERAL aclexplode(parameter_acl.paracl) acl
+              WHERE acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=$1))
+              AS parameter_acl_count`, [WORKER_ROLE])).rows, [{
+          parent_count: '0', parameter_acl_count: '0',
+        }]);
+        await clusterDrift.query(`SET LOCAL ROLE ${WORKER_ROLE}`);
+        assert.deepEqual((await clusterDrift.query<{
+          readonly statement_timeout: boolean;
+          readonly replication_role: boolean;
+        }>(`SELECT
+            has_parameter_privilege(current_user,'statement_timeout','SET')
+              AS statement_timeout,
+            has_parameter_privilege(current_user,'session_replication_role','SET')
+              AS replication_role`)).rows, [{
+          statement_timeout: false, replication_role: false,
+        }]);
+      } finally {
+        await clusterDrift.query('ROLLBACK');
+        clusterDrift.release();
+      }
+
       await isolated.query(`CREATE SCHEMA ${quoteIdentifier(privateSchema)}`);
       await isolated.query(`CREATE TABLE ${quoteIdentifier(privateSchema)}.secrets (
         signed_transaction_bytes BYTEA NOT NULL
@@ -228,13 +287,17 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
         ${quoteIdentifier(privateSchema)}.private_function() TO ${WORKER_ROLE}`);
       await isolated.query(`GRANT USAGE ON TYPE
         ${quoteIdentifier(privateSchema)}.private_state TO ${WORKER_ROLE}`);
+      await isolated.query(`GRANT CREATE,TEMPORARY ON DATABASE
+        ${quoteIdentifier(databaseName)} TO ${WORKER_ROLE}`);
+      await isolated.query('REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC');
+      await isolated.query(`GRANT USAGE ON LANGUAGE plpgsql TO ${WORKER_ROLE}`);
       await isolated.query(`GRANT USAGE ON SCHEMA ${quoteIdentifier(privateSchema)}
         TO ${quoteIdentifier(parentName)}`);
       await isolated.query(`GRANT SELECT ON TABLE ${quoteIdentifier(privateSchema)}.secrets
         TO ${quoteIdentifier(parentName)} WITH GRANT OPTION`);
-      await maintenance.query(`GRANT ${quoteIdentifier(parentName)} TO ${WORKER_ROLE}
-        WITH ADMIN FALSE, INHERIT TRUE, SET TRUE`);
       await isolated.query('GRANT SELECT ON TABLE execution_wallet_generations TO PUBLIC');
+      await isolated.query(`GRANT SELECT (signed_transaction_bytes)
+        ON TABLE execution_signed_transactions TO PUBLIC`);
       await isolated.query(`GRANT USAGE,UPDATE ON SEQUENCE
         execution_intent_transitions_sequence_seq TO PUBLIC`);
       await isolated.query(`GRANT USAGE,SELECT,UPDATE ON SEQUENCE
@@ -244,6 +307,14 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
         ${quoteIdentifier(databaseName)} TO PUBLIC`);
       await isolated.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public
         GRANT SELECT ON TABLES TO ${WORKER_ROLE}`);
+      await isolated.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public
+        GRANT USAGE ON SEQUENCES TO ${WORKER_ROLE}`);
+      await isolated.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public
+        GRANT EXECUTE ON FUNCTIONS TO ${WORKER_ROLE}`);
+      await isolated.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public
+        GRANT USAGE ON TYPES TO ${WORKER_ROLE}`);
+      await isolated.query(`ALTER DEFAULT PRIVILEGES
+        GRANT USAGE ON SCHEMAS TO ${WORKER_ROLE}`);
       await isolated.query(provisioningSql);
 
       await maintenance.query(`CREATE ROLE ${quoteIdentifier(loginName)} LOGIN NOINHERIT
@@ -489,19 +560,38 @@ async function assertClosedObjectAuthority(
 ): Promise<void> {
   assert.deepEqual((await worker.query<{
     readonly public_usage: boolean;
+    readonly public_usage_grant: boolean;
     readonly public_create: boolean;
     readonly database_create: boolean;
     readonly database_temporary: boolean;
+    readonly language_usage: boolean;
+    readonly sequence_usage_grant: boolean;
   }>(`SELECT
       has_schema_privilege(current_user,'public','USAGE') AS public_usage,
+      COALESCE((SELECT bool_or(acl.is_grantable) FROM pg_namespace namespace
+        CROSS JOIN LATERAL aclexplode(namespace.nspacl) acl
+        WHERE namespace.nspname='public'
+          AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+          AND acl.privilege_type='USAGE'),false) AS public_usage_grant,
       has_schema_privilege(current_user,'public','CREATE') AS public_create,
       has_database_privilege(current_user,current_database(),'CREATE') AS database_create,
-      has_database_privilege(current_user,current_database(),'TEMPORARY') AS database_temporary`,
+      has_database_privilege(current_user,current_database(),'TEMPORARY') AS database_temporary,
+      has_language_privilege(current_user,'plpgsql','USAGE') AS language_usage,
+      COALESCE((SELECT bool_or(acl.is_grantable) FROM pg_class class
+        JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
+        CROSS JOIN LATERAL aclexplode(class.relacl) acl
+        WHERE namespace.nspname='public'
+          AND class.relname='execution_intent_transitions_sequence_seq'
+          AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+          AND acl.privilege_type='USAGE'),false) AS sequence_usage_grant`,
   )).rows, [{
     public_usage: true,
+    public_usage_grant: false,
     public_create: false,
     database_create: false,
     database_temporary: false,
+    language_usage: false,
+    sequence_usage_grant: false,
   }]);
   assert.equal((await worker.query<{ readonly allowed: boolean }>(
     `SELECT has_schema_privilege(current_user,$1,'USAGE') AS allowed`, [privateSchema],
@@ -513,6 +603,11 @@ async function assertClosedObjectAuthority(
   assert.equal((await worker.query<{ readonly allowed: boolean }>(
     `SELECT has_column_privilege(
       current_user,'execution_wallet_generations','wallet_public_key','SELECT'
+    ) AS allowed`,
+  )).rows[0]?.allowed, false);
+  assert.equal((await worker.query<{ readonly allowed: boolean }>(
+    `SELECT has_column_privilege(
+      current_user,'execution_signed_transactions','signed_transaction_bytes','SELECT'
     ) AS allowed`,
   )).rows[0]?.allowed, false);
   const privateObjects = (await isolated.query<{

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -14,8 +15,10 @@ import {
   EXECUTOR_INTEGRATION_PAYER,
   startScriptedPumpFunBuyRpc,
 } from './helpers/executor-simulation-rpc.js';
+import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+const provisioningScriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const CHILD_TERM_TIMEOUT_MS = 2_500;
 const CHILD_KILL_TIMEOUT_MS = 1_000;
@@ -189,6 +192,124 @@ void test('compiled simulation-only executor records one unsigned Pump.fun BUY w
     childOutput(child), executorUrl, databaseUrl, schema, rpc.url, rpc.privateMarker,
     created.intent.id,
   );
+});
+
+void test('compiled non-signing executors run under the isolated worker login', async (context) => {
+  if (databaseUrl === undefined) {
+    context.skip('TEST_DATABASE_URL absent: worker login integration skipped');
+    return;
+  }
+  const maintenance = new pg.Pool({ connectionString: databaseUrl });
+  const capability = (await maintenance.query<{
+    readonly rolsuper: boolean;
+    readonly rolcreatedb: boolean;
+    readonly server_version_number: number;
+  }>(`SELECT rolsuper,rolcreatedb,
+      current_setting('server_version_num')::INTEGER AS server_version_number
+    FROM pg_roles WHERE rolname=current_user`)).rows[0];
+  if (!capability?.rolsuper || !capability.rolcreatedb
+    || capability.server_version_number < 160_000
+    || capability.server_version_number >= 170_000) {
+    await maintenance.end();
+    context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
+    return;
+  }
+  const releaseRoleLock = await acquireExecutorRoleTestLock(maintenance);
+  const suffix = randomUUID().replaceAll('-', '');
+  const databaseName = `executor_worker_main_${suffix}`;
+  const loginName = `executor_worker_login_${suffix}`;
+  const password = randomUUID().replaceAll('-', '');
+  const isolatedUrl = new URL(databaseUrl);
+  isolatedUrl.pathname = `/${databaseName}`;
+  isolatedUrl.searchParams.delete('options');
+  const children = new Set<TrackedChild>();
+  let isolated: InstanceType<typeof pg.Pool> | undefined;
+  let loginPool: InstanceType<typeof pg.Pool> | undefined;
+  let databaseCreated = false;
+  let loginCreated = false;
+  try {
+    await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
+    databaseCreated = true;
+    isolated = new pg.Pool({ connectionString: isolatedUrl.href });
+    await migrateDatabase({ pool: isolated });
+    assert.equal((await isolated.query<{ readonly schema_name: string }>(
+      'SELECT current_schema() AS schema_name',
+    )).rows[0]?.schema_name, 'public');
+    const provisioningSql = await readFile(provisioningScriptUrl, 'utf8');
+    await isolated.query(provisioningSql);
+    await maintenance.query(`CREATE ROLE ${quoteIdentifier(loginName)} LOGIN NOINHERIT
+      NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+      PASSWORD ${quoteLiteral(password)}`);
+    loginCreated = true;
+    await maintenance.query(`GRANT sol_token_executor_worker TO ${quoteIdentifier(loginName)}
+      WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
+    assert.deepEqual((await maintenance.query<{
+      readonly membership_count: string;
+      readonly login_inherit: boolean;
+    }>(`SELECT
+        (SELECT COUNT(*)::TEXT FROM pg_auth_members membership
+          JOIN pg_roles member ON member.oid=membership.member
+          WHERE member.rolname=$1) AS membership_count,
+        (SELECT rolinherit FROM pg_roles WHERE rolname=$1) AS login_inherit`,
+    [loginName])).rows, [{ membership_count: '1', login_inherit: false }]);
+    const workerUrl = new URL(isolatedUrl);
+    workerUrl.username = loginName;
+    workerUrl.password = password;
+    workerUrl.searchParams.set(
+      'options',
+      '-c role=sol_token_executor_worker -c search_path=pg_catalog,public',
+    );
+    loginPool = new pg.Pool({ connectionString: workerUrl.href, max: 1 });
+    assert.deepEqual((await loginPool.query(
+      `SELECT session_user,current_user,current_setting('search_path') AS search_path`,
+    )).rows, [{
+      session_user: loginName,
+      current_user: 'sol_token_executor_worker',
+      search_path: 'pg_catalog,public',
+    }]);
+
+    const repository = new PostgresExecutionIntentRepository(isolated);
+    const dryRunIntent = await createIntent(repository, `worker-${suffix}`);
+    const dryRun = startExecutor(context, children, workerUrl.href);
+    await waitForAssessment(isolated, dryRunIntent.intent.id, 1, dryRun);
+    assert.deepEqual(
+      await stopExecutorChild(dryRun),
+      { code: 0, signal: null },
+      childOutput(dryRun),
+    );
+
+    const rpc = await startScriptedPumpFunBuyRpc();
+    try {
+      const simulationIntent = await createSimulationIntent(repository);
+      const simulation = startSimulationExecutor(
+        context, children, workerUrl.href, rpc.url,
+      );
+      await waitForSimulationArtifact(isolated, simulationIntent.intent.id, simulation);
+      assert.deepEqual(
+        await stopExecutorChild(simulation),
+        { code: 0, signal: null },
+        childOutput(simulation),
+      );
+      assert.equal(await simulationArtifactCount(isolated, simulationIntent.intent.id), 1);
+      assert.deepEqual(rpc.requestErrors, []);
+      assert.equal(rpc.methods.includes('sendTransaction'), false);
+      assert.equal(rpc.methods.includes('sendRawTransaction'), false);
+      assert.equal(rpc.simulatedTransactionWasUnsigned(), true);
+    } finally {
+      await rpc.close();
+    }
+  } finally {
+    await Promise.all([...children].map(stopExecutorChild));
+    if (loginPool !== undefined) await loginPool.end();
+    if (isolated !== undefined) await isolated.end();
+    if (databaseCreated) {
+      await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+        WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+      await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+    }
+    if (loginCreated) await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
+    try { await releaseRoleLock(); } finally { await maintenance.end(); }
+  }
 });
 
 function startExecutor(
@@ -458,6 +579,10 @@ function databaseUrlForSchema(
 
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
+}
+
+function quoteLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 async function delay(durationMs: number): Promise<void> {
