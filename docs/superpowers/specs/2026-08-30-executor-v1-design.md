@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.2
+**Version de spécification :** 1.11.3
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 et préparation opérateur exacte #51-H2c
 
 ## Historique des versions
+
+- **1.11.3 — 2026-09-05 :** récupère un lock pré-signature après libération
+  explicite de la lease du worker et refuse un login opérations privilégié,
+  multi-membre, propriétaire ou détenteur d'une autorité directe.
 
 - **1.11.2 — 2026-09-05 :** aligne les ACL PostgreSQL 16 H2a, H2b et opérations
   sur les contrôles H2c réellement exécutés : lecture de l'identifiant du lock

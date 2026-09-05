@@ -1,8 +1,8 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.1.8
+**Version de spécification :** 1.1.9
 
-**Version de la spécification parente :** 1.11.2
+**Version de la spécification parente :** 1.11.3
 
 **Version de l'orchestration persistante :** 1.1.5
 
@@ -12,6 +12,10 @@
 opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
+
+- **1.1.9 — 2026-09-05 :** accepte comme état récupérable une lease
+  intégralement libérée après l'autorisation pré-signature, tout en refusant
+  les triplets partiels et toute lease étrangère encore active.
 
 - **1.1.8 — 2026-09-05 :** ajoute uniquement les ACL colonnes nécessaires à
   la projection H2c et à la transition système `ENTRY_STOP` lors d'une

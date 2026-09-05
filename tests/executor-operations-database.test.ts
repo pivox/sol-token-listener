@@ -3,15 +3,14 @@ import test from 'node:test';
 import {
   createExecutionOperationsBootstrapDatabase,
   createExecutionOperationsDatabase,
+  EXECUTION_OPERATIONS_AUTHORITY_SQL,
   ExecutionOperationsDatabaseError,
 } from '../src/executor-operations/database.js';
 
 const ROLE_QUERIES = Object.freeze([
   'SET ROLE sol_token_executor_operations',
   'SET search_path = pg_catalog, public',
-  'SELECT current_user AS current_user, session_user AS session_user, '
-    + "current_setting('search_path') AS search_path, "
-    + "current_setting('session_replication_role') AS session_replication_role",
+  EXECUTION_OPERATIONS_AUTHORITY_SQL,
 ]);
 
 void test('operations database pins and verifies its role for every checkout', async () => {
@@ -41,11 +40,24 @@ void test('operations database pins and verifies its role for every checkout', a
 
 void test('operations database rejects authority drift and evicts the checkout', async () => {
   for (const authority of [
-    { ...validAuthority(), current_user: 'postgres' },
-    { ...validAuthority(), session_user: 'sol_token_executor_operations' },
-    { ...validAuthority(), session_user: '' },
+    { ...validAuthority(), current_role: 'postgres' },
+    { ...validAuthority(), session_role: 'sol_token_executor_operations' },
+    { ...validAuthority(), session_role: '' },
     { ...validAuthority(), search_path: 'public, pg_catalog' },
     { ...validAuthority(), session_replication_role: 'replica' },
+    { ...validAuthority(), session_super: true },
+    { ...validAuthority(), session_inherit: true },
+    { ...validAuthority(), session_createdb: true },
+    { ...validAuthority(), membership_count: '2' },
+    { ...validAuthority(), membership_admin: true },
+    { ...validAuthority(), membership_inherit: true },
+    { ...validAuthority(), membership_set: false },
+    { ...validAuthority(), operations_membership: false },
+    { ...validAuthority(), role_parent_count: '1' },
+    { ...validAuthority(), session_direct_authority_count: '1' },
+    { ...validAuthority(), executable_security_definer_count: '1' },
+    { ...validAuthority(), role_can_set_replication: true },
+    { ...validAuthority(), session_can_set_replication: true },
   ]) {
     const releases: boolean[] = [];
     const database = createExecutionOperationsDatabase({
@@ -85,10 +97,20 @@ void test('operations bootstrap exposes only the repository and bounded lifecycl
 
 function validAuthority(): Readonly<Record<string, unknown>> {
   return Object.freeze({
-    current_user: 'sol_token_executor_operations',
-    session_user: 'deployer',
+    server_version_number: 160_000,
+    current_role: 'sol_token_executor_operations', session_role: 'deployer',
     search_path: 'pg_catalog, public',
     session_replication_role: 'origin',
+    role_super: false, role_login: false, role_inherit: false,
+    role_createdb: false, role_createrole: false, role_bypass_rls: false,
+    role_replication: false,
+    session_super: false, session_login: true, session_inherit: false,
+    session_createdb: false, session_createrole: false, session_bypass_rls: false,
+    session_replication: false,
+    membership_count: '1', membership_admin: false, membership_inherit: false,
+    membership_set: true, operations_membership: true, role_parent_count: '0',
+    session_direct_authority_count: '0', executable_security_definer_count: '0',
+    role_can_set_replication: false, session_can_set_replication: false,
   });
 }
 

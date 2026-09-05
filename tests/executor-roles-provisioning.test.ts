@@ -23,6 +23,10 @@ import { validateLiveRecoveryStartup } from
 import { createLiveRecoveryBootstrapDatabase } from
   '../src/executor-live-recovery/database.js';
 import type { LiveRecoveryConfig } from '../src/executor-live-recovery/config.js';
+import {
+  createExecutionOperationsDatabase,
+  ExecutionOperationsDatabaseError,
+} from '../src/executor-operations/database.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
@@ -253,7 +257,7 @@ void test('foundation retention has an isolated executable role without signed-b
   assert.doesNotMatch(purge, /FOR UPDATE/iu);
 });
 
-void test('PostgreSQL 16 recovery and live logins are exact through their wrappers',
+void test('PostgreSQL 16 recovery, live and operations logins are exact through their wrappers',
   async (context) => {
     const configuredUrl = process.env.TEST_DATABASE_URL;
     if (configuredUrl === undefined || configuredUrl.trim() === '') {
@@ -283,6 +287,7 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
     const loginName = `h2a_recovery_${suffix}`;
     const deniedLoginName = `h2a_denied_${suffix}`;
     const liveLoginName = `h2b_live_${suffix}`;
+    const operationsLoginName = `h2c_operations_${suffix}`;
     const password = randomUUID().replaceAll('-', '');
     const isolatedUrl = new URL(baseUrl);
     isolatedUrl.pathname = `/${databaseName}`;
@@ -290,6 +295,7 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
     let loginPool: InstanceType<typeof pg.Pool> | undefined;
     let deniedPool: InstanceType<typeof pg.Pool> | undefined;
     let liveLoginPool: InstanceType<typeof pg.Pool> | undefined;
+    let operationsLoginPool: InstanceType<typeof pg.Pool> | undefined;
     try {
       await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
       isolated = new pg.Pool({ connectionString: isolatedUrl.href });
@@ -306,10 +312,16 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
       await maintenance.query(`CREATE ROLE ${quoteIdentifier(liveLoginName)} LOGIN NOINHERIT
         NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
         PASSWORD ${quoteLiteral(password)}`);
+      await maintenance.query(`CREATE ROLE ${quoteIdentifier(operationsLoginName)} LOGIN NOINHERIT
+        NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+        PASSWORD ${quoteLiteral(password)}`);
       await maintenance.query(`GRANT sol_token_executor_live_recovery
         TO ${quoteIdentifier(loginName)} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
       await maintenance.query(`GRANT sol_token_executor_live
         TO ${quoteIdentifier(liveLoginName)} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
+      await maintenance.query(`GRANT sol_token_executor_operations
+        TO ${quoteIdentifier(operationsLoginName)}
+        WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
 
       const publicKey = '11111111111111111111111111111111';
       const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
@@ -332,6 +344,29 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
       assert.equal(liveEvidence.role, 'sol_token_executor_live');
       await liveDatabase.close();
       liveLoginPool = undefined;
+
+      const operationsLoginUrl = new URL(isolatedUrl);
+      operationsLoginUrl.username = operationsLoginName;
+      operationsLoginUrl.password = password;
+      const activeOperationsLoginPool = new pg.Pool({
+        connectionString: operationsLoginUrl.href, max: 1,
+      });
+      operationsLoginPool = activeOperationsLoginPool;
+      const operationsDatabase = createExecutionOperationsDatabase(
+        activeOperationsLoginPool,
+      );
+      const operationsClient = await operationsDatabase.pool.connect();
+      operationsClient.release();
+      await isolated.query(`GRANT SELECT (version) ON TABLE migration_history
+        TO ${quoteIdentifier(operationsLoginName)}`);
+      await assert.rejects(
+        operationsDatabase.pool.connect(),
+        (error: unknown) => error instanceof ExecutionOperationsDatabaseError,
+      );
+      await isolated.query(`REVOKE SELECT (version) ON TABLE migration_history
+        FROM ${quoteIdentifier(operationsLoginName)}`);
+      await activeOperationsLoginPool.end();
+      operationsLoginPool = undefined;
 
       const loginUrl = new URL(isolatedUrl);
       loginUrl.username = loginName;
@@ -461,6 +496,12 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
         if (loginPool !== undefined) await loginPool.end();
         if (deniedPool !== undefined) await deniedPool.end();
         if (liveLoginPool !== undefined) await liveLoginPool.end();
+        if (operationsLoginPool !== undefined) await operationsLoginPool.end();
+        if (isolated !== undefined) {
+          try {
+            await isolated.query(`DROP OWNED BY ${quoteIdentifier(operationsLoginName)}`);
+          } catch { /* the role may not have been created before setup failed */ }
+        }
         if (isolated !== undefined) await isolated.end();
         await maintenance.query(
           `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
@@ -471,6 +512,7 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(deniedLoginName)}`);
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(liveLoginName)}`);
+        await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(operationsLoginName)}`);
       } finally {
         try { await releaseRoleTestLock(); } finally { await maintenance.end(); }
       }

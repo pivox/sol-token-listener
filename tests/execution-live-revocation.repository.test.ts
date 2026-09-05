@@ -146,6 +146,43 @@ void test('stranded lock recovery never lowers an operator HARD_STOP', async (co
   });
 });
 
+void test('released worker lease does not strand an authorized pre-signature lock',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      const fixture = await createBuyFixture(pool);
+      const live = new PostgresExecutionLiveRepository(pool);
+      await live.authorizeExactSigning(Object.freeze({
+        claim: fixture.claim, attempt: fixture.attempt, generationId,
+        runtime: fixture.runtime, material: fixture.material,
+      }));
+      assert.equal(
+        await new PostgresExecutionIntentRepository(pool).release(fixture.claim),
+        true,
+      );
+
+      assert.deepEqual(await live.recoverStrandedPreSignatureLock(generationId), {
+        payloadVersion: 1, kind: 'REVOKED',
+      });
+      const state = await pool.query(`SELECT lock.state AS lock_state,
+        intent.status AS intent_status,armament.state AS armament_state,
+        reservation.state AS reservation_state,control.state AS control_state
+        FROM execution_pre_signature_locks lock
+        JOIN execution_intents intent ON intent.id=lock.intent_id
+        JOIN execution_activation_armaments armament ON armament.armament_id=lock.armament_id
+        JOIN execution_exposure_reservations reservation
+          ON reservation.reservation_id=lock.reservation_id
+        JOIN execution_control_state control ON control.generation_id=lock.generation_id
+        WHERE lock.intent_id=$1`, [fixture.claim.intent.id]);
+      assert.deepEqual(state.rows, [{
+        lock_state: 'REVOKED', intent_status: 'FAILED', armament_state: 'REVOKED',
+        reservation_state: 'RELEASED', control_state: 'ENTRY_STOP',
+      }]);
+    });
+  });
+
 type RevocableSignedState = 'PERSISTED' | 'SIGNED_SIMULATED';
 for (const initialState of ['PERSISTED', 'SIGNED_SIMULATED'] as const) {
   void test(`BUY ${initialState} is atomically revoked without send and releases every capability`,

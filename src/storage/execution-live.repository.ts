@@ -1856,6 +1856,13 @@ async function recoverStrandedPreSignatureLock(
   const reservationAmount = unsignedBigint(row.reservation_amount_raw);
   const reservedExposure = unsignedBigint(row.reserved_exposure_raw);
   const openPositions = integer(row.open_positions);
+  const releasedLease = row.lease_owner === null
+    && row.intent_lease_token === null
+    && leaseExpiresAtMs === null;
+  const retainedLease = typeof row.lease_owner === 'string'
+    && row.lease_owner.length > 0
+    && row.intent_lease_token === row.lock_lease_token
+    && leaseExpiresAtMs !== null;
   if (row.lock_state !== 'AUTHORIZED' || unsignedBigint(row.lock_revision) !== 0n
     || row.generation_id !== generationId || attemptNumber !== 1
     || row.intent_status !== 'PROCESSING'
@@ -1866,13 +1873,13 @@ async function recoverStrandedPreSignatureLock(
     || integer(row.locked_attempt_number) !== attemptNumber
     || row.locked_reservation_id !== row.reservation_id
     || row.armament_lease_token !== row.lock_lease_token
-    || row.intent_lease_token !== row.lock_lease_token
+    || (!releasedLease && !retainedLease)
     || row.reservation_state !== 'RESERVED' || reservedExposure < reservationAmount
     || openPositions < 1 || row.artifact_exists !== false
     || !['RUNNING', 'ENTRY_STOP', 'HARD_STOP'].includes(String(row.control_state))) {
     throw failure('INVALID_DATA');
   }
-  if (leaseExpiresAtMs !== null && leaseExpiresAtMs > nowMs) {
+  if (retainedLease && leaseExpiresAtMs > nowMs) {
     throw failure('LIVE_EXECUTOR_FOREIGN_LEASE_ACTIVE');
   }
   const intentId = text(row.intent_id);

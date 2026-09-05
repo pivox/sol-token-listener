@@ -1,12 +1,12 @@
 # Runtime signable de l'exécuteur live — conception #51-H2b
 
-**Version de spécification :** 1.1.2
+**Version de spécification :** 1.1.3
 
-**Version de la spécification parente :** 1.11.2
+**Version de la spécification parente :** 1.11.3
 
 **Version de l'orchestration persistante H1 :** 1.2.0
 
-**Version du runtime de finalité H2a :** 1.1.8
+**Version du runtime de finalité H2a :** 1.1.9
 
 **Version de la fondation live :** 1.1.0
 
@@ -17,6 +17,9 @@
 **Issue parente :** #51
 
 ## Historique des versions
+
+- **1.1.3 — 2026-09-05 :** garantit qu'une erreur après lock suivie de la
+  release normale du worker reste récupérable sans signature ni envoi.
 
 - **1.1.2 — 2026-09-05 :** accorde à H2a et H2b les seules lectures
   transitives exigées par les guards `SECURITY INVOKER` H2c afin que leur
@@ -86,7 +89,7 @@ H2a reste un binaire séparé, sous son login PostgreSQL read-only distinct. Il
 reste seul responsable de la finalité, de la confirmation, de la
 réconciliation et de la deadline. H2b n'importe ni les lanes ni les façades
 applicatives H2a et n'obtient aucune méthode permettant d'exécuter ces tâches.
-Le contrat métier H2a reste inchangé ; sa spécification 1.1.8 explicite les
+Le contrat métier H2a reste inchangé ; sa spécification 1.1.9 explicite les
 ACL colonnes transitives minimales nécessaires à la migration 039, sans accès
 aux bytes signés ni capacité de soumission.
 

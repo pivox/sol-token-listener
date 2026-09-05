@@ -1,8 +1,8 @@
 # Armement opérateur exact et préparation du canary — conception #51-H2c
 
-**Version de spécification :** 1.1.2
+**Version de spécification :** 1.1.3
 
-**Version de la spécification parente :** 1.11.2
+**Version de la spécification parente :** 1.11.3
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-H2b fusionnée par la PR #78 (`bcc983b`)
 
 ## Historique des versions
+
+- **1.1.3 — 2026-09-05 :** récupère le lock après release de lease et vérifie
+  à chaque checkout que le login opérations est PostgreSQL 16, non privilégié,
+  mono-membre, sans ownership ni autorité directe.
 
 - **1.1.2 — 2026-09-05 :** ferme l'écart PostgreSQL 16 des ACL transitives
   nécessaires aux guards H2c de H2a, H2b et opérations, sans élargir l'accès
