@@ -535,9 +535,9 @@ paper normal, mais ne peut accéder à aucune génération wallet, qualification
 live, armement, lock, transaction signée, soumission ou réconciliation. Le
 login reste `NOINHERIT` et active ce rôle dès chaque connexion PostgreSQL ; les
 migrations restent une responsabilité administrative distincte. Les droits
-hérités de `PUBLIC` permettant la création d'objets ou la désactivation des
-triggers sont retirés, et la relecture idempotente d'une intention reste
-possible sans lui accorder `UPDATE`.
+hérités de `PUBLIC` permettant la création d'objets, la mutation des séquences
+d'exécution ou la désactivation des triggers sont retirés, et la relecture
+idempotente d'une intention reste possible sans lui accorder `UPDATE`.
 
 ## Persistance, reprise et rétention
 

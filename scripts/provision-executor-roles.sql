@@ -140,6 +140,15 @@ BEGIN
 END
 $listener_database_acl$;
 
+DO $listener_public_database_acl$
+BEGIN
+  EXECUTE format(
+    'REVOKE CREATE ON DATABASE %I FROM PUBLIC',
+    current_database()
+  );
+END
+$listener_public_database_acl$;
+
 DO $listener_language_acl$
 DECLARE
   language_name NAME;
@@ -228,6 +237,21 @@ BEGIN
       'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
       'ON TABLE %2$I.%3$I FROM PUBLIC',
       relation.columns,relation.nspname,relation.relname
+    );
+  END LOOP;
+  FOR relation IN
+    SELECT namespace.nspname,sequence_class.relname
+    FROM pg_class sequence_class
+    JOIN pg_namespace namespace ON namespace.oid=sequence_class.relnamespace
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND sequence_class.relkind='S'
+      AND sequence_class.relname LIKE 'execution\_%' ESCAPE '\'
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON SEQUENCE %I.%I FROM PUBLIC',
+      relation.nspname,relation.relname
     );
   END LOOP;
 END

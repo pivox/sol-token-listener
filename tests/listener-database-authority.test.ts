@@ -58,7 +58,9 @@ void test('listener provisioning rebuilds one closed non-live database authority
   assert.match(sql, /REVOKE ALL PRIVILEGES ON TYPE %I\.%I FROM sol_token_listener_writer/u);
   assert.match(sql, /ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL PRIVILEGES ON %s FROM sol_token_listener_writer/u);
   assert.match(sql, /REVOKE ALL PRIVILEGES ON TABLE %I\.%I FROM PUBLIC/u);
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON SEQUENCE %I\.%I FROM PUBLIC/u);
   assert.match(sql, /REVOKE CREATE ON SCHEMA public FROM PUBLIC/iu);
+  assert.match(sql, /REVOKE CREATE ON DATABASE %I FROM PUBLIC/iu);
   assert.match(sql,
     /REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM PUBLIC/iu);
   assert.match(sql, /GRANT USAGE ON SCHEMA public TO sol_token_listener_writer/iu);
@@ -139,7 +141,10 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       await isolated.query(`GRANT SELECT ON TABLE ${quoteIdentifier(privateSchema)}.secrets
         TO sol_token_listener_writer WITH GRANT OPTION`);
       await isolated.query(`GRANT SELECT ON TABLE execution_wallet_generations TO PUBLIC`);
+      await isolated.query(`GRANT USAGE,UPDATE ON SEQUENCE
+        execution_intent_transitions_sequence_seq TO PUBLIC`);
       await isolated.query(`GRANT CREATE ON SCHEMA public TO PUBLIC`);
+      await isolated.query(`GRANT CREATE ON DATABASE ${quoteIdentifier(databaseName)} TO PUBLIC`);
       await isolated.query(`CREATE TYPE ${quoteIdentifier(privateSchema)}.private_state
         AS ENUM ('PRIVATE')`);
       await isolated.query(`GRANT USAGE ON TYPE
@@ -167,6 +172,20 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       assert.equal((await listener.query<{ readonly allowed: boolean }>(
         `SELECT has_schema_privilege(current_user,'public','CREATE') AS allowed`,
       )).rows[0]?.allowed, false);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(
+        `SELECT has_database_privilege(
+          current_user,current_database(),'CREATE'
+        ) AS allowed`,
+      )).rows[0]?.allowed, false);
+      assert.deepEqual((await listener.query<{
+        readonly usage_allowed: boolean;
+        readonly update_allowed: boolean;
+      }>(`SELECT
+          has_sequence_privilege(current_user,
+            'execution_intent_transitions_sequence_seq','USAGE') AS usage_allowed,
+          has_sequence_privilege(current_user,
+            'execution_intent_transitions_sequence_seq','UPDATE') AS update_allowed`,
+      )).rows[0], { usage_allowed: false, update_allowed: false });
       for (const table of BUSINESS_TABLES) {
         const row: {
           readonly select_ok: boolean;
