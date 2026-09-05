@@ -44,6 +44,173 @@ BEGIN
 END
 $roles$;
 
+-- The listener owns only observational and paper projections. Rebuild its
+-- authority from zero on every replay so an old grant cannot cross into live
+-- execution state.
+ALTER ROLE sol_token_listener_writer NOLOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+
+DO $listener_parameter_acl$
+DECLARE
+  parameter_name TEXT;
+BEGIN
+  IF current_setting('server_version_num')::INTEGER >= 150000 THEN
+    FOR parameter_name IN SELECT parname FROM pg_parameter_acl
+    LOOP
+      EXECUTE format(
+        'REVOKE SET, ALTER SYSTEM ON PARAMETER %I FROM sol_token_listener_writer',
+        parameter_name
+      );
+    END LOOP;
+  END IF;
+END
+$listener_parameter_acl$;
+
+DO $listener_parents$
+DECLARE
+  parent_role NAME;
+BEGIN
+  FOR parent_role IN
+    SELECT parent.rolname FROM pg_auth_members membership
+    JOIN pg_roles member ON member.oid=membership.member
+    JOIN pg_roles parent ON parent.oid=membership.roleid
+    WHERE member.rolname='sol_token_listener_writer'
+  LOOP
+    EXECUTE format('REVOKE %I FROM sol_token_listener_writer', parent_role);
+  END LOOP;
+END
+$listener_parents$;
+
+DO $listener_schemas$
+DECLARE
+  schema_name NAME;
+BEGIN
+  FOR schema_name IN
+    SELECT nspname FROM pg_namespace
+    WHERE nspname NOT IN ('pg_catalog','information_schema')
+      AND nspname NOT LIKE 'pg_temp_%' AND nspname NOT LIKE 'pg_toast%'
+  LOOP
+    EXECUTE format('REVOKE ALL PRIVILEGES ON SCHEMA %I FROM sol_token_listener_writer',
+      schema_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_listener_writer',
+      schema_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_listener_writer',
+      schema_name);
+    EXECUTE format('REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_listener_writer',
+      schema_name);
+  END LOOP;
+END
+$listener_schemas$;
+
+DO $listener_columns$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,table_class.relname,
+      string_agg(quote_ident(attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class table_class
+    JOIN pg_namespace namespace ON namespace.oid=table_class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=table_class.oid
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema')
+      AND namespace.nspname NOT LIKE 'pg_temp_%' AND namespace.nspname NOT LIKE 'pg_toast%'
+      AND table_class.relkind IN ('r','p','v','m','f')
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    GROUP BY namespace.nspname,table_class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM sol_token_listener_writer',
+      relation.columns,relation.nspname,relation.relname
+    );
+  END LOOP;
+END
+$listener_columns$;
+
+GRANT USAGE ON SCHEMA public TO sol_token_listener_writer;
+
+GRANT SELECT ON TABLE migration_history TO sol_token_listener_writer;
+
+GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE
+  api_event_stream,
+  api_event_stream_state,
+  bonding_curve_snapshots,
+  chain_transaction_finality_replay_receipts,
+  chain_transaction_inbox,
+  creator_profiles,
+  discovered_pools,
+  domain_events,
+  ignored_assets,
+  launch_trades,
+  listener_catch_up_gaps,
+  listener_checkpoints,
+  listener_heartbeats,
+  listener_strict_catch_up_failures,
+  listener_websocket_health,
+  market_pools,
+  market_reserve_snapshots,
+  market_trades,
+  migrations,
+  observed_wallet_positions,
+  paper_decision_jobs,
+  paper_external_buy_events,
+  paper_mvp_position_samples,
+  paper_mvp_runs,
+  paper_positions,
+  paper_strategy_sessions,
+  paper_trades,
+  processing_checkpoints,
+  qualification_reports,
+  raw_chain_events,
+  risk_settings,
+  social_enrichment_jobs,
+  social_evidence_collections,
+  social_http_observations,
+  social_links,
+  social_verification_evidence,
+  state_transitions,
+  swap_events,
+  token_holders_snapshots,
+  token_launches,
+  token_metadata_snapshots,
+  token_risk_reports,
+  token_sessions,
+  trades,
+  trading_candidates,
+  transaction_inbox_recoveries,
+  wallet_cluster_members,
+  wallet_clusters,
+  wallet_funding_evidence,
+  wallet_funding_observations,
+  wallet_graph_profiles,
+  wallet_graph_snapshots,
+  wallet_relationships
+TO sol_token_listener_writer;
+
+GRANT USAGE ON SEQUENCE
+  api_event_stream_sequence_seq,
+  paper_decision_claim_scan_generation_seq
+TO sol_token_listener_writer;
+
+GRANT SELECT (
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status,
+  attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
+  last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
+  purge_after
+), INSERT (
+  id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+  logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+  quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status
+)
+ON TABLE execution_intents TO sol_token_listener_writer;
+
+GRANT SELECT (intent_id,logical_order_key,decision_fingerprint)
+ON TABLE execution_intent_tombstones TO sol_token_listener_writer;
+
 ALTER ROLE sol_token_executor_live_recovery NOLOGIN NOSUPERUSER NOCREATEDB
   NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
 

@@ -528,6 +528,14 @@ ONLY`, puis produit hors Git la source canonique de H2g. Cette frontière ne
 charge aucun secret Solana et ne peut ni louer une intention, ni armer, signer
 ou soumettre.
 
+#51-H2i ferme séparément l'autorité PostgreSQL du listener paper. Son rôle
+`sol_token_listener_writer` est reconstruit à chaque provisioning depuis une
+allowlist de projections métier. Il peut émettre une intention BUY par le flux
+paper normal, mais ne peut accéder à aucune génération wallet, qualification
+live, armement, lock, transaction signée, soumission ou réconciliation. Le
+login reste `NOINHERIT` et active ce rôle dès chaque connexion PostgreSQL ; les
+migrations restent une responsabilité administrative distincte.
+
 ## Persistance, reprise et rétention
 
 `raw_chain_events` garde l’entrée technique ; `domain_events`,

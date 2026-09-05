@@ -83,7 +83,7 @@ const preflightSourceSpecificationUrl = new URL(
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 
-void test('documents H2d-H2h external evidence without starting a canary',
+void test('documents H2d-H2i external evidence without starting a canary',
   async () => {
   const [
     packageText,
@@ -147,7 +147,7 @@ void test('documents H2d-H2h external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.14',
+    '**Version de spécification :** 1.11.15',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -157,17 +157,17 @@ void test('documents H2d-H2h external evidence without starting a canary',
       + 'préparation opérateur exacte #51-H2c, bootstrap de readiness non signable\n'
       + "#51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations\n"
       + 'hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL\n'
-      + 'read-only de sa source #51-H2h',
+      + 'read-only de sa source #51-H2h et autorité PostgreSQL fermée du listener #51-H2i',
     'parent delivered scope',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.12',
+    '**Version de spécification :** 1.2.13',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.13',
+    '**Version de la spécification parente :** 1.11.15',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -232,7 +232,7 @@ void test('documents H2d-H2h external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.10.0 — 2026-09-05',
+    '**Version :** 1.11.0 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
@@ -286,6 +286,10 @@ void test('documents H2d-H2h external evidence without starting a canary',
     'preflight source parent specification version',
   );
   assert.match(runbook, /generateKeyPairSync\('ed25519'\)[\s\S]*flag: 'wx'[\s\S]*mode: 0o600/u);
+  assert.match(
+    runbook,
+    /sol_token_listener_writer[\s\S]*options=-c role=sol_token_listener_writer[\s\S]*POSTGRES_AUTO_MIGRATE=false/iu,
+  );
   assert.doesNotMatch(runbook, /openssl genpkey/iu);
 
   assertContainsExactlyOnce(
