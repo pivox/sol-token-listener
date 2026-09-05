@@ -11,6 +11,7 @@ import {
 } from '../src/executor-live/transaction-preparer.js';
 import type { ExecutionSimulationEvidenceV1, ExecutionSimulationGateway } from '../src/ports/execution-simulation-gateway.js';
 import type { ExecutionTransactionSigner } from '../src/ports/execution-transaction-signer.js';
+import type { ExecutionUnsignedSigningMaterialV1 } from '../src/ports/execution-live-repository.js';
 import { loadPumpSwapSellGoldenPlan } from './helpers/executor-simulation-golden.js';
 
 void test('signs the exact successfully simulated message behind a one-shot opaque candidate', async () => {
@@ -54,7 +55,7 @@ void test('signs the exact successfully simulated message behind a one-shot opaq
   const prepared = await preparer.prepare(
     request,
     quoteWindow,
-    async () => { order.push('renew-before-sign'); },
+    async (material) => { order.push('renew-before-sign'); return authorization(material); },
     new AbortController().signal,
   );
 
@@ -113,7 +114,7 @@ void test('rejects a signer mismatch and a forged simulation message before sign
     ).prepare(request, Object.freeze({
       quoteObservedAtMs: 1_800_000_000_000,
       quoteExpiresAtMs: 1_800_000_003_000,
-    }), async () => undefined, new AbortController().signal),
+    }), async (material) => authorization(material), new AbortController().signal),
     /Live transaction preparation failed/u,
   );
 });
@@ -149,11 +150,75 @@ void test('rejects invalid quote windows before simulation or signing', async ()
   await assert.rejects(preparer.prepare(request, Object.freeze({
     quoteObservedAtMs: 1_800_000_003_000,
     quoteExpiresAtMs: 1_800_000_003_000,
-  }), async () => undefined, new AbortController().signal), /Live transaction preparation failed/u);
+  }), async (material) => authorization(material), new AbortController().signal), /Live transaction preparation failed/u);
 
   assert.equal(simulation.calls, 0);
   assert.equal(signerCalls, 0);
 });
+
+void test('rejects hostile exact-authorizations before signing', async () => {
+  const plan = await loadPumpSwapSellGoldenPlan();
+  const inspected = inspectUnsignedBuildPlan(plan);
+  const blockhash = new PublicKey(new Uint8Array(32).fill(9)).toBase58();
+  const compiled = compileInspectedV0Message(Object.freeze({
+    feePayer: inspected.feePayer, instructions: inspected.instructions, recentBlockhash: blockhash,
+    maximumTransactionBytes: 1_232,
+  }));
+  for (const variant of ['getter', 'proxy', 'mutable-bytes', 'extra'] as const) {
+    let signerCalls = 0;
+    const preparer = new LiveTransactionPreparer(
+      new StubSimulationGateway(simulationEvidence(
+        compiled.messageHash, blockhash, plan.identity.snapshotFingerprint,
+      )),
+      Object.freeze({
+        publicKey: plan.feePayer,
+        signMessage: () => { signerCalls += 1; return Promise.resolve(Object.freeze({ signature: new Uint8Array(64) })); },
+        close: () => Promise.resolve(),
+      }), new LiveTransactionCandidateAuthority(), 1_232,
+    );
+    await assert.rejects(preparer.prepare(Object.freeze({
+      plan, snapshot: Object.freeze({ providerId: 'primary', slot: plan.identity.snapshotSlot,
+        addresses: Object.freeze([]), accounts: Object.freeze([]) }),
+      receipt: Object.freeze({ payloadVersion: 1 as const }),
+    }), Object.freeze({ quoteObservedAtMs: 1_800_000_000_000, quoteExpiresAtMs: 1_800_000_003_000 }),
+    async (material) => hostileAuthorization(material, variant) as never, new AbortController().signal));
+    assert.equal(signerCalls, 0, variant);
+  }
+});
+
+function authorization(material: ExecutionUnsignedSigningMaterialV1) {
+  return Object.freeze({
+    payloadVersion: 1 as const,
+    binding: Object.freeze({
+      payloadVersion: 1 as const, side: material.side,
+      generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+      qualificationId: `execution_safety_qualification_${'b'.repeat(64)}`,
+      armamentId: null, reservationId: null,
+      exitAuthorizationId: `execution_exit_authorization_${'c'.repeat(64)}`,
+      providerId: material.providerId, walletPublicKey: material.walletPublicKey,
+    }),
+    preSignatureLockId: null,
+    material,
+  });
+}
+
+function hostileAuthorization(
+  material: ExecutionUnsignedSigningMaterialV1,
+  variant: 'getter' | 'proxy' | 'mutable-bytes' | 'extra',
+): unknown {
+  const valid = authorization(material);
+  if (variant === 'proxy') return new Proxy(valid, {});
+  if (variant === 'extra') return Object.freeze({ ...valid, unexpected: true });
+  if (variant === 'getter') {
+    const value = { ...valid };
+    Object.defineProperty(value, 'material', { enumerable: true, get: () => material });
+    return Object.freeze(value);
+  }
+  return Object.freeze({
+    ...valid,
+    material: Object.freeze({ ...material, messageBytes: [...material.messageBytes] }),
+  });
+}
 
 class StubSimulationGateway implements ExecutionSimulationGateway {
   public calls = 0;

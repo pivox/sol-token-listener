@@ -25,6 +25,7 @@ import {
 } from '../src/executor-live/transaction-preparer.js';
 import { ProviderAffineSession } from '../src/executor-simulation/provider-session.js';
 import type { ClaimedExecutionIntent } from '../src/ports/execution-intent-repository.js';
+import type { ExecutionUnsignedSigningMaterialV1 } from '../src/ports/execution-live-repository.js';
 import {
   bondingCurvePda,
   GLOBAL_PDA,
@@ -164,8 +165,9 @@ void test('returns one opaque live candidate from the exact request simulated by
     return new LiveTransactionPreparer(simulationGateway, signer, authority, 1_232);
   });
 
-  const result = await evaluator.evaluate(context(), activeSignal(), async (boundary) => {
+  const result = await evaluator.evaluate(context(), activeSignal(), async (boundary, material) => {
     order.push(boundary);
+    if (boundary === 'BEFORE_SIGNING' && material !== undefined) return authorization(material);
   });
 
   assert.equal(result.outcome, 'SUCCESS');
@@ -218,7 +220,10 @@ void test('returns live failures without a candidate and never signs failed simu
     clock: () => NOW,
   }), (simulationGateway) => new LiveTransactionPreparer(
     simulationGateway, signer, new LiveTransactionCandidateAuthority(), 1_232,
-  )).evaluate(context(), activeSignal(), async (boundary) => { renewals.push(boundary); });
+  )).evaluate(context(), activeSignal(), async (boundary) => {
+    renewals.push(boundary);
+    return undefined;
+  });
 
   assert.equal(result.outcome, 'FAILURE');
   assert.equal(result.artifact.resultKind, 'SIMULATION_FAILED');
@@ -256,6 +261,7 @@ void test('propagates a live pre-signing renewal failure without signing or issu
     async (boundary) => {
       renewals.push(boundary);
       if (boundary === 'BEFORE_SIGNING') throw renewalFailure;
+      return undefined;
     },
   ), (error: unknown) => error === renewalFailure);
 
@@ -265,6 +271,23 @@ void test('propagates a live pre-signing renewal failure without signing or issu
   assert.equal(signerCalls, 0);
   assert.equal(authority.issueCalls, 0);
 });
+
+function authorization(material: ExecutionUnsignedSigningMaterialV1) {
+  return Object.freeze({
+    payloadVersion: 1 as const,
+    binding: Object.freeze({
+      payloadVersion: 1 as const, side: material.side,
+      generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+      qualificationId: `execution_safety_qualification_${'b'.repeat(64)}`,
+      armamentId: `execution_activation_armament_${'c'.repeat(64)}`,
+      reservationId: `execution_exposure_reservation_${'d'.repeat(64)}`,
+      exitAuthorizationId: null, providerId: material.providerId,
+      walletPublicKey: material.walletPublicKey,
+    }),
+    preSignatureLockId: `execution_pre_signature_lock_${'e'.repeat(64)}`,
+    material,
+  });
+}
 
 void test('does not construct a live preparer for a pre-terminal evaluation failure', async () => {
   const fixture = pumpFunSnapshots(false);

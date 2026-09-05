@@ -12,6 +12,10 @@ import type {
   ExecutionSimulationGatewayRequestV1,
 } from '../ports/execution-simulation-gateway.js';
 import type { ExecutionTransactionSigner } from '../ports/execution-transaction-signer.js';
+import type {
+  ExecutionExactSigningAuthorizationV1,
+  ExecutionUnsignedSigningMaterialV1,
+} from '../ports/execution-live-repository.js';
 
 export interface LiveTransactionCandidateV1 {
   readonly payloadVersion: 1;
@@ -20,6 +24,7 @@ export interface LiveTransactionCandidateV1 {
 export interface LivePreparedTransactionMaterialV1 {
   readonly payloadVersion: 1;
   readonly walletPublicKey: string;
+  readonly providerId: string;
   readonly side: 'BUY' | 'SELL';
   readonly effectiveVenue: 'PUMP_FUN' | 'PUMP_SWAP';
   readonly snapshotSlot: bigint;
@@ -40,6 +45,11 @@ export interface LivePreparedTransactionMaterialV1 {
   readonly signedTransactionBytes: readonly number[];
   readonly signedTransactionHash: string;
   readonly unsignedSimulation: ExecutionSimulationEvidenceV1;
+  readonly binding: ExecutionExactSigningAuthorizationV1['binding'];
+  readonly preSignatureLockId: string | null;
+  readonly messageBytes: readonly number[];
+  readonly unsignedTransactionBytes: readonly number[];
+  readonly unsignedTransactionHash: string;
 }
 
 export interface LiveTransactionQuoteWindowV1 {
@@ -102,7 +112,9 @@ export class LiveTransactionPreparer {
   public async prepare(
     input: ExecutionSimulationGatewayRequestV1,
     quoteWindowValue: LiveTransactionQuoteWindowV1,
-    beforeSign: () => Promise<void>,
+    beforeSign: (
+      material: ExecutionUnsignedSigningMaterialV1,
+    ) => Promise<ExecutionExactSigningAuthorizationV1>,
     signal: AbortSignal,
   ): Promise<LiveTransactionPreparationResultV1> {
     let quoteWindow: LiveTransactionQuoteWindowV1;
@@ -131,15 +143,41 @@ export class LiveTransactionPreparer {
       rethrowPreparationError(error);
     }
 
-    await beforeSign();
+    const unsignedMaterial: ExecutionUnsignedSigningMaterialV1 = Object.freeze({
+      payloadVersion: 1,
+      walletPublicKey: inspected.feePayer,
+      providerId: input.snapshot.providerId,
+      side: inspected.side,
+      effectiveVenue: inspected.venue,
+      snapshotSlot: inspected.identity.snapshotSlot,
+      quoteFingerprint: inspected.identity.quoteFingerprint,
+      quoteObservedAtMs: quoteWindow.quoteObservedAtMs,
+      quoteExpiresAtMs: quoteWindow.quoteExpiresAtMs,
+      buildFingerprint: evidence.buildFingerprint,
+      snapshotFingerprint: evidence.snapshotFingerprint,
+      messageHash: evidence.messageHash,
+      messageBytes: Object.freeze([...compiled.messageBytes]),
+      unsignedTransactionHash: sha256(Uint8Array.from(compiled.unsignedTransactionBytes)),
+      unsignedTransactionBytes: Object.freeze([...compiled.unsignedTransactionBytes]),
+      blockhash: evidence.blockhash,
+      lastValidBlockHeight: evidence.lastValidBlockHeight,
+      unsignedSimulation: evidence,
+    });
+    const authorizationValue = await beforeSign(unsignedMaterial);
+    let authorization: ExecutionExactSigningAuthorizationV1;
+    try {
+      authorization = exactAuthorization(authorizationValue, unsignedMaterial);
+    } catch (error) {
+      rethrowPreparationError(error);
+    }
 
     try {
-      const signed = await this.signer.signMessage(Uint8Array.from(compiled.messageBytes));
+      const signed = await this.signer.signMessage(Uint8Array.from(authorization.material.messageBytes));
       if (!frozenPlainObject(signed) || !(signed.signature instanceof Uint8Array)
         || isProxy(signed.signature) || signed.signature.length !== 64) fail();
       const signature = Uint8Array.from(signed.signature);
       const transaction = VersionedTransaction.deserialize(
-        Uint8Array.from(compiled.unsignedTransactionBytes),
+        Uint8Array.from(authorization.material.unsignedTransactionBytes),
       );
       if (transaction.signatures.length !== 1) fail();
       transaction.signatures[0] = signature;
@@ -148,6 +186,7 @@ export class LiveTransactionPreparer {
       const material: LivePreparedTransactionMaterialV1 = Object.freeze({
         payloadVersion: 1,
         walletPublicKey: inspected.feePayer,
+        providerId: authorization.material.providerId,
         side: inspected.side,
         effectiveVenue: inspected.venue,
         snapshotSlot: inspected.identity.snapshotSlot,
@@ -164,6 +203,11 @@ export class LiveTransactionPreparer {
         signedTransactionBytes: Object.freeze([...signedBytes]),
         signedTransactionHash: sha256(signedBytes),
         unsignedSimulation: evidence,
+        binding: authorization.binding,
+        preSignatureLockId: authorization.preSignatureLockId,
+        messageBytes: authorization.material.messageBytes,
+        unsignedTransactionBytes: authorization.material.unsignedTransactionBytes,
+        unsignedTransactionHash: authorization.material.unsignedTransactionHash,
       });
       return Object.freeze({
         payloadVersion: 1,
@@ -214,6 +258,83 @@ function quoteWindowFrom(value: unknown): LiveTransactionQuoteWindowV1 {
     || !timestamp(observed.value) || !timestamp(expires.value)
     || observed.value >= expires.value) fail();
   return value as LiveTransactionQuoteWindowV1;
+}
+
+function exactAuthorization(
+  value: unknown,
+  expected: ExecutionUnsignedSigningMaterialV1,
+): ExecutionExactSigningAuthorizationV1 {
+  const row = exactDataRecord(value, ['payloadVersion', 'binding', 'preSignatureLockId', 'material']);
+  if (row.payloadVersion !== 1 || !sameBinding(row.binding, expected)
+    || !sameUnsignedMaterial(row.material, expected)) fail();
+  const binding = row.binding as ExecutionExactSigningAuthorizationV1['binding'];
+  const lockId = row.preSignatureLockId;
+  if (binding.side !== expected.side || binding.providerId !== expected.providerId
+    || binding.walletPublicKey !== expected.walletPublicKey
+    || (expected.side === 'BUY') !== (typeof lockId === 'string'
+      && /^execution_pre_signature_lock_[0-9a-f]{64}$/u.test(lockId))) fail();
+  if (expected.side === 'SELL' && lockId !== null) fail();
+  return value as ExecutionExactSigningAuthorizationV1;
+}
+
+function sameBinding(value: unknown, expected: ExecutionUnsignedSigningMaterialV1): boolean {
+  const row = exactDataRecord(value, [
+    'payloadVersion', 'side', 'generationId', 'qualificationId', 'armamentId', 'reservationId',
+    'exitAuthorizationId', 'providerId', 'walletPublicKey',
+  ]);
+  if (row.payloadVersion !== 1 || row.side !== expected.side || row.providerId !== expected.providerId
+    || row.walletPublicKey !== expected.walletPublicKey
+    || typeof row.generationId !== 'string' || typeof row.qualificationId !== 'string') return false;
+  if (expected.side === 'BUY') {
+    return typeof row.armamentId === 'string' && typeof row.reservationId === 'string'
+      && row.exitAuthorizationId === null;
+  }
+  return row.armamentId === null && row.reservationId === null
+    && typeof row.exitAuthorizationId === 'string';
+}
+
+function sameUnsignedMaterial(value: unknown, expected: ExecutionUnsignedSigningMaterialV1): boolean {
+  const candidate = exactDataRecord(value, [
+    'payloadVersion', 'walletPublicKey', 'providerId', 'side', 'effectiveVenue', 'snapshotSlot',
+    'quoteFingerprint', 'quoteObservedAtMs', 'quoteExpiresAtMs', 'buildFingerprint',
+    'snapshotFingerprint', 'messageHash', 'messageBytes', 'unsignedTransactionHash',
+    'unsignedTransactionBytes', 'blockhash', 'lastValidBlockHeight', 'unsignedSimulation',
+  ]);
+  return candidate.payloadVersion === expected.payloadVersion
+    && candidate.walletPublicKey === expected.walletPublicKey
+    && candidate.providerId === expected.providerId
+    && candidate.side === expected.side && candidate.effectiveVenue === expected.effectiveVenue
+    && candidate.snapshotSlot === expected.snapshotSlot
+    && candidate.quoteFingerprint === expected.quoteFingerprint
+    && candidate.quoteObservedAtMs === expected.quoteObservedAtMs
+    && candidate.quoteExpiresAtMs === expected.quoteExpiresAtMs
+    && candidate.buildFingerprint === expected.buildFingerprint
+    && candidate.snapshotFingerprint === expected.snapshotFingerprint
+    && candidate.messageHash === expected.messageHash
+    && candidate.unsignedTransactionHash === expected.unsignedTransactionHash
+    && candidate.blockhash === expected.blockhash
+    && candidate.lastValidBlockHeight === expected.lastValidBlockHeight
+    && candidate.unsignedSimulation === expected.unsignedSimulation
+    && sameBytes(candidate.messageBytes, expected.messageBytes)
+    && sameBytes(candidate.unsignedTransactionBytes, expected.unsignedTransactionBytes);
+}
+
+function sameBytes(value: unknown, expected: readonly number[]): boolean {
+  return Array.isArray(value) && Object.isFrozen(value) && !isProxy(value)
+    && value.length === expected.length
+    && value.every((byte, index) => byte === expected[index]);
+}
+
+function exactDataRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  if (!frozenPlainObject(value) || Reflect.ownKeys(value).length !== keys.length) fail();
+  const row = Object.create(null) as Record<string, unknown>;
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !('value' in descriptor) || !descriptor.enumerable
+      || descriptor.configurable || descriptor.writable) fail();
+    row[key] = descriptor.value;
+  }
+  return row;
 }
 
 function timestamp(value: unknown): value is number {

@@ -39,6 +39,8 @@ export interface ExecutionPreSubmissionRevocationResultV1 {
 export interface ExecutionLivePersistSignedInputV1 {
   readonly payloadVersion: 1;
   readonly claim: ClaimedExecutionIntent;
+  /** Exact pre-signature authorization; null for a SELL exit. */
+  readonly preSignatureLockId?: string | null;
   readonly qualificationId: string;
   readonly reservationId: string | null;
   readonly artifact: SignedTransactionArtifactV1;
@@ -101,6 +103,36 @@ export interface ExecutionLivePreparationBindingV1 {
   readonly exitAuthorizationId: string | null;
   readonly providerId: string;
   readonly walletPublicKey: string;
+}
+
+/** Exact unsigned V0 material which may cross the durable before-signing boundary. */
+export interface ExecutionUnsignedSigningMaterialV1 {
+  readonly payloadVersion: 1;
+  readonly walletPublicKey: string;
+  readonly providerId: string;
+  readonly side: 'BUY' | 'SELL';
+  readonly effectiveVenue: 'PUMP_FUN' | 'PUMP_SWAP';
+  readonly snapshotSlot: bigint;
+  readonly quoteFingerprint: string;
+  readonly quoteObservedAtMs: number;
+  readonly quoteExpiresAtMs: number;
+  readonly buildFingerprint: string;
+  readonly snapshotFingerprint: string;
+  readonly messageHash: string;
+  readonly messageBytes: readonly number[];
+  readonly unsignedTransactionHash: string;
+  readonly unsignedTransactionBytes: readonly number[];
+  readonly blockhash: string;
+  readonly lastValidBlockHeight: bigint;
+  readonly unsignedSimulation: ExecutionSimulationEvidenceV1;
+}
+
+/** Durable authorization, returned only after the exact unsigned material is re-read. */
+export interface ExecutionExactSigningAuthorizationV1 {
+  readonly payloadVersion: 1;
+  readonly binding: ExecutionLivePreparationBindingV1;
+  readonly preSignatureLockId: string | null;
+  readonly material: ExecutionUnsignedSigningMaterialV1;
 }
 
 /** Fresh provider evidence from isBlockhashValid/getBlockHeight. */

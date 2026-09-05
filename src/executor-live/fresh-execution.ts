@@ -5,6 +5,8 @@ import type {
   ExecutionLivePreparationBindingV1,
   ExecutionLiveRepository,
   ExecutionLiveRuntimeBindingV1,
+  ExecutionExactSigningAuthorizationV1,
+  ExecutionUnsignedSigningMaterialV1,
 } from '../ports/execution-live-repository.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
 import type {
@@ -21,7 +23,15 @@ import {
 } from './transaction-preparer.js';
 import type { LiveFreshExecutionContextV1 } from './lanes.js';
 
-type FreshLiveRepository = Pick<ExecutionLiveRepository, 'readPreparationBinding'>;
+type FreshLiveRepository = Pick<ExecutionLiveRepository, 'readPreparationBinding'> & Readonly<{
+  readonly authorizeExactSigning?: (input: Readonly<{
+    readonly claim: ClaimedExecutionIntent;
+    readonly attempt: LiveFreshExecutionContextV1['attempt'];
+    readonly generationId: string;
+    readonly runtime: ExecutionLiveRuntimeBindingV1;
+    readonly material: ExecutionUnsignedSigningMaterialV1;
+  }>) => Promise<ExecutionExactSigningAuthorizationV1>;
+}>;
 
 export interface FreshLiveExecutionDependencies {
   readonly generationId: string;
@@ -74,23 +84,38 @@ async function executeFresh(
 ): Promise<FreshLiveExecutionResultV1> {
   requireActive(signal);
   let activeClaim = context.claim;
-  const preparation: { binding: ExecutionLivePreparationBindingV1 | null } = {
-    binding: null,
-  };
   const renewForEvaluation = async (
     boundary: ExecutionLiveAttemptRenewBoundary,
-  ): Promise<void> => {
+    material?: ExecutionUnsignedSigningMaterialV1,
+  ): Promise<ExecutionExactSigningAuthorizationV1 | undefined> => {
     requireActive(signal);
     activeClaim = await renew();
     requireActive(signal);
     if (boundary === 'BEFORE_SIGNING') {
-      preparation.binding = await dependencies.live.readPreparationBinding({
-        claim: activeClaim,
-        generationId: dependencies.generationId,
-        runtime: dependencies.runtime,
+      if (material === undefined) return undefined;
+      if (activeClaim.intent.side === 'BUY') {
+        if (dependencies.live.authorizeExactSigning === undefined) {
+          throw new TypeError('BUY exact signing authorization is unavailable.');
+        }
+        const authorization = await dependencies.live.authorizeExactSigning(Object.freeze({
+          claim: activeClaim, attempt: context.attempt, generationId: dependencies.generationId,
+          runtime: dependencies.runtime, material,
+        }));
+        requireActive(signal);
+        return authorization;
+      }
+      const binding = await dependencies.live.readPreparationBinding({
+        claim: activeClaim, generationId: dependencies.generationId, runtime: dependencies.runtime,
       });
       requireActive(signal);
+      return Object.freeze({
+          payloadVersion: 1,
+          binding,
+          preSignatureLockId: null,
+          material,
+      });
     }
+    return undefined;
   };
   const result = await dependencies.evaluator.evaluate(
     Object.freeze({ claim: activeClaim, attempt: context.attempt }),
@@ -107,22 +132,22 @@ async function executeFresh(
       claim: null,
     });
   }
-  const authority = requiredPreparationBinding(preparation);
   const material = dependencies.candidateAuthority.consume(result.candidate);
   if (material === null) throw new TypeError('Invalid live transaction candidate.');
-  validateSuccess(activeClaim, context, result.artifact, material, authority, dependencies);
+  const binding = material.binding;
+  validateSuccess(activeClaim, context, result.artifact, material, binding, dependencies);
   const signedAtMs = now(dependencies.clock);
   const artifact = createSignedTransactionArtifact({
     payloadVersion: 1,
     specificationVersion: 1,
     intentId: activeClaim.intent.id,
     attemptNumber: context.attempt.attemptNumber,
-    generationId: authority.generationId,
-    armamentId: authority.armamentId,
-    reservationId: authority.reservationId,
-    exitAuthorizationId: authority.exitAuthorizationId,
-    providerId: authority.providerId,
-    walletPublicKey: authority.walletPublicKey,
+    generationId: binding.generationId,
+    armamentId: binding.armamentId,
+    reservationId: binding.reservationId,
+    exitAuthorizationId: binding.exitAuthorizationId,
+    providerId: binding.providerId,
+    walletPublicKey: binding.walletPublicKey,
     side: material.side,
     effectiveVenue: material.effectiveVenue,
     messageHash: material.messageHash,
@@ -150,8 +175,9 @@ async function executeFresh(
     persist: Object.freeze({
       payloadVersion: 1,
       claim: activeClaim,
-      qualificationId: authority.qualificationId,
-      reservationId: authority.reservationId,
+      preSignatureLockId: material.preSignatureLockId,
+      qualificationId: binding.qualificationId,
+      reservationId: binding.reservationId,
       artifact,
       unsignedSimulation: material.unsignedSimulation,
       rpcBudget: Object.freeze({
@@ -216,13 +242,6 @@ function validateDependencies(value: FreshLiveExecutionDependencies): void {
     || (value.clock !== undefined && typeof value.clock !== 'function')) {
     throw new TypeError('Invalid fresh live execution dependencies.');
   }
-}
-
-function requiredPreparationBinding(
-  value: Readonly<{ binding: ExecutionLivePreparationBindingV1 | null }>,
-): ExecutionLivePreparationBindingV1 {
-  if (value.binding === null) throw new TypeError('Missing live preparation authority.');
-  return value.binding;
 }
 
 function requireActive(signal: AbortSignal): void {
