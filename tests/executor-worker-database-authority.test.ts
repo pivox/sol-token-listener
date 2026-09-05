@@ -122,40 +122,43 @@ const WORKER_TABLE_AUTHORITY: Readonly<Record<string, TableAuthority>> = Object.
 
 void test('worker provisioning declares the exact non-signing column allowlist', async () => {
   const sql = await readFile(scriptUrl, 'utf8');
-  const executable = sql.replace(/--[^\r\n]*/gu, ' ');
+  const executable = withoutSqlComments(sql);
 
   for (const [tableName, expected] of Object.entries(WORKER_TABLE_AUTHORITY)) {
     assert.deepEqual(
-      workerColumnAuthority(sql, tableName),
+      workerColumnAuthority(executable, tableName),
       expected,
       `missing or overbroad worker positive column ACL for ${tableName}`,
     );
   }
-  assert.match(sql,
+  assert.match(executable,
     /ALTER ROLE sol_token_executor_worker NOLOGIN NOSUPERUSER NOCREATEDB\s+NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS/iu);
-  assert.match(sql,
+  assert.match(executable,
     /REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_worker/u);
-  assert.match(sql,
+  assert.match(executable,
     /REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_executor_worker/u);
-  assert.match(sql,
+  assert.match(executable,
     /REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_executor_worker/u);
-  assert.match(sql, /REVOKE ALL PRIVILEGES ON TYPE %I\.%I FROM sol_token_executor_worker/u);
-  assert.match(sql,
+  assert.match(executable,
+    /REVOKE ALL PRIVILEGES ON TYPE %I\.%I FROM sol_token_executor_worker/u);
+  assert.match(executable,
     /REVOKE ALL PRIVILEGES ON DATABASE %I FROM sol_token_executor_worker/u);
-  assert.match(sql,
+  assert.match(executable,
     /REVOKE ALL PRIVILEGES ON LANGUAGE %I FROM sol_token_executor_worker/u);
-  assert.match(sql,
+  assert.match(executable,
     /ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL PRIVILEGES ON %s FROM sol_token_executor_worker/u);
-  assert.match(sql, /REVOKE %I FROM sol_token_executor_worker/u);
-  assert.match(sql, /REVOKE ALL PRIVILEGES ON TABLE %I\.%I FROM PUBLIC/u);
-  assert.match(sql, /REVOKE ALL PRIVILEGES ON SEQUENCE %I\.%I FROM PUBLIC/u);
-  assert.match(sql, /REVOKE CREATE ON SCHEMA public FROM PUBLIC/iu);
-  assert.match(sql, /REVOKE CREATE, TEMPORARY ON DATABASE %I FROM PUBLIC/iu);
-  assert.match(sql,
+  assert.match(executable, /REVOKE %I FROM sol_token_executor_worker/u);
+  assert.match(executable, /REVOKE ALL PRIVILEGES ON TABLE %I\.%I FROM PUBLIC/u);
+  assert.match(executable, /REVOKE ALL PRIVILEGES ON SEQUENCE %I\.%I FROM PUBLIC/u);
+  assert.match(executable, /REVOKE CREATE ON SCHEMA public FROM PUBLIC/iu);
+  assert.match(executable, /REVOKE CREATE, TEMPORARY ON DATABASE %I FROM PUBLIC/iu);
+  assert.match(executable,
     /REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM PUBLIC/iu);
-  assert.match(sql, /GRANT USAGE ON SCHEMA public TO sol_token_executor_worker/iu);
-  assert.deepEqual(workerTableGrantNames(sql), Object.keys(WORKER_TABLE_AUTHORITY).sort());
-  assert.deepEqual(workerSequenceAuthority(sql), [{
+  assert.match(executable, /GRANT USAGE ON SCHEMA public TO sol_token_executor_worker/iu);
+  assert.deepEqual(
+    workerTableGrantNames(executable), Object.keys(WORKER_TABLE_AUTHORITY).sort(),
+  );
+  assert.deepEqual(workerSequenceAuthority(executable), [{
     privilege: 'USAGE', sequence: 'execution_intent_transitions_sequence_seq',
   }]);
   assert.doesNotMatch(executable,
@@ -165,7 +168,7 @@ void test('worker provisioning declares the exact non-signing column allowlist',
   assert.doesNotMatch(executable,
     /GRANT[^;]*TO\s+sol_token_executor_worker[^;]*WITH\s+GRANT\s+OPTION/iu);
   const ownershipGuard = /DO \$worker_ownership_guard\$([\s\S]*?)\$worker_ownership_guard\$/u
-    .exec(sql)?.[1];
+    .exec(executable)?.[1];
   assert.ok(ownershipGuard);
   for (const ownershipCatalog of [
     /pg_database[\s\S]*datdba/u,
@@ -180,9 +183,9 @@ void test('worker provisioning declares the exact non-signing column allowlist',
 
 void test('PostgreSQL 16 worker login has only the effective simulation authority',
   async (context) => {
-    const configuredUrl = process.env.TEST_DATABASE_URL;
+    const configuredUrl = process.env.TEST_EXECUTOR_ROLE_DATABASE_URL;
     if (configuredUrl === undefined || configuredUrl.trim() === '') {
-      context.skip('TEST_DATABASE_URL is not configured.');
+      context.skip('TEST_EXECUTOR_ROLE_DATABASE_URL is required for the disposable role cluster.');
       return;
     }
     const baseUrl = new URL(configuredUrl);
@@ -213,17 +216,26 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
     isolatedUrl.pathname = `/${databaseName}`;
     let isolated: InstanceType<typeof pg.Pool> | undefined;
     let worker: InstanceType<typeof pg.Pool> | undefined;
+    let parentCreated = false;
+    let databaseCreated = false;
+    let loginCreated = false;
     let ownedDriftCreated = false;
+    let bodyFailed = false;
+    let bodyFailure: unknown;
     try {
       await maintenance.query(`CREATE ROLE ${quoteIdentifier(parentName)} NOLOGIN NOINHERIT
         NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`);
+      parentCreated = true;
       await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
+      databaseCreated = true;
       isolated = new pg.Pool({ connectionString: isolatedUrl.href });
       await migrateDatabase({ pool: isolated });
       const provisioningSql = await readFile(scriptUrl, 'utf8');
       await isolated.query(provisioningSql);
 
       const clusterDrift = await isolated.connect();
+      let clusterDriftFailed = false;
+      let clusterDriftFailure: unknown;
       try {
         await clusterDrift.query('BEGIN');
         await clusterDrift.query(`GRANT ${quoteIdentifier(parentName)} TO ${WORKER_ROLE}
@@ -259,10 +271,18 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
               AS replication_role`)).rows, [{
           statement_timeout: false, replication_role: false,
         }]);
-      } finally {
-        await clusterDrift.query('ROLLBACK');
-        clusterDrift.release();
+      } catch (error) {
+        clusterDriftFailed = true;
+        clusterDriftFailure = error;
       }
+      throwWithCleanupFailures(
+        clusterDriftFailed,
+        clusterDriftFailure,
+        await collectCleanupFailures([
+          async () => clusterDrift.query('ROLLBACK'),
+          () => { clusterDrift.release(); },
+        ]),
+      );
 
       await isolated.query(`CREATE SCHEMA ${quoteIdentifier(privateSchema)}`);
       await isolated.query(`CREATE TABLE ${quoteIdentifier(privateSchema)}.secrets (
@@ -320,6 +340,7 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       await maintenance.query(`CREATE ROLE ${quoteIdentifier(loginName)} LOGIN NOINHERIT
         NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
         PASSWORD ${quoteLiteral(password)}`);
+      loginCreated = true;
       await maintenance.query(`GRANT ${WORKER_ROLE} TO ${quoteIdentifier(loginName)}
         WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
       const workerUrl = new URL(isolatedUrl);
@@ -354,11 +375,13 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
         parent_count: '0', login_membership_count: '1', login_inherit: false,
       }]);
 
-      await assertExactColumnAuthority(worker);
-      await assertDynamicExecutionInventory(worker);
+      await assertExactColumnAuthority(isolated);
+      await assertDynamicExecutionInventory(isolated);
       await assertClosedObjectAuthority(worker, privateSchema, isolated);
 
       const publicParameterProbe = await isolated.connect();
+      let parameterProbeFailed = false;
+      let parameterProbeFailure: unknown;
       try {
         await publicParameterProbe.query('BEGIN');
         await publicParameterProbe.query(
@@ -371,10 +394,18 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
             current_user,'session_replication_role','SET'
           ) AS allowed`,
         )).rows[0]?.allowed, false);
-      } finally {
-        await publicParameterProbe.query('ROLLBACK');
-        publicParameterProbe.release();
+      } catch (error) {
+        parameterProbeFailed = true;
+        parameterProbeFailure = error;
       }
+      throwWithCleanupFailures(
+        parameterProbeFailed,
+        parameterProbeFailure,
+        await collectCleanupFailures([
+          async () => publicParameterProbe.query('ROLLBACK'),
+          () => { publicParameterProbe.release(); },
+        ]),
+      );
 
       await isolated.query(`CREATE TABLE ${quoteIdentifier(ownedTable)} (id INTEGER PRIMARY KEY)`);
       await isolated.query(`ALTER TABLE ${quoteIdentifier(ownedTable)} OWNER TO ${WORKER_ROLE}`);
@@ -383,20 +414,50 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
         isolated.query(provisioningSql),
         /Worker role owns database objects/u,
       );
-    } finally {
-      if (worker !== undefined) await worker.end();
-      if (isolated !== undefined && ownedDriftCreated) {
-        await isolated.query(`ALTER TABLE ${quoteIdentifier(ownedTable)} OWNER TO CURRENT_USER`);
-      }
-      if (isolated !== undefined) await isolated.end();
-      await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-        WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
-      await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
-      await maintenance.query(`REVOKE ${quoteIdentifier(parentName)} FROM ${WORKER_ROLE}`);
-      await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
-      await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(parentName)}`);
-      try { await release(); } finally { await maintenance.end(); }
+    } catch (error) {
+      bodyFailed = true;
+      bodyFailure = error;
     }
+    const cleanupFailures = await collectCleanupFailures([
+      async () => { if (worker !== undefined) await worker.end(); },
+      async () => {
+        if (isolated !== undefined && ownedDriftCreated) {
+          await isolated.query(
+            `ALTER TABLE ${quoteIdentifier(ownedTable)} OWNER TO CURRENT_USER`,
+          );
+        }
+      },
+      async () => { if (isolated !== undefined) await isolated.end(); },
+      async () => {
+        if (databaseCreated) {
+          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+            WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+        }
+      },
+      async () => {
+        if (databaseCreated) {
+          await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+        }
+      },
+      async () => {
+        if (parentCreated) {
+          await maintenance.query(`REVOKE ${quoteIdentifier(parentName)} FROM ${WORKER_ROLE}`);
+        }
+      },
+      async () => {
+        if (loginCreated) {
+          await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
+        }
+      },
+      async () => {
+        if (parentCreated) {
+          await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(parentName)}`);
+        }
+      },
+      release,
+      async () => maintenance.end(),
+    ]);
+    throwWithCleanupFailures(bodyFailed, bodyFailure, cleanupFailures);
   });
 
 function authority(value: Partial<TableAuthority>): TableAuthority {
@@ -405,6 +466,12 @@ function authority(value: Partial<TableAuthority>): TableAuthority {
     INSERT: Object.freeze(value.INSERT ?? NONE),
     UPDATE: Object.freeze(value.UPDATE ?? NONE),
   });
+}
+
+function withoutSqlComments(sql: string): string {
+  return sql
+    .replace(/--[^\r\n]*/gu, ' ')
+    .replace(/\/\*[\s\S]*?\*\//gu, ' ');
 }
 
 function workerColumnAuthority(sql: string, tableName: string): TableAuthority {
@@ -459,10 +526,10 @@ function workerSequenceAuthority(sql: string): readonly Readonly<{
 }
 
 async function assertExactColumnAuthority(
-  worker: InstanceType<typeof pg.Pool>,
+  admin: InstanceType<typeof pg.Pool>,
 ): Promise<void> {
-  for (const [tableName, expected] of Object.entries(WORKER_TABLE_AUTHORITY)) {
-    const result = await worker.query<{
+  const result = await admin.query<{
+      readonly table_name: string;
       readonly column_name: string;
       readonly select_allowed: boolean;
       readonly insert_allowed: boolean;
@@ -471,20 +538,31 @@ async function assertExactColumnAuthority(
       readonly select_grant: boolean;
       readonly insert_grant: boolean;
       readonly update_grant: boolean;
-    }>(`SELECT column_name,
-        has_column_privilege(current_user,$1,column_name,'SELECT') AS select_allowed,
-        has_column_privilege(current_user,$1,column_name,'INSERT') AS insert_allowed,
-        has_column_privilege(current_user,$1,column_name,'UPDATE') AS update_allowed,
-        has_column_privilege(current_user,$1,column_name,'REFERENCES') AS references_allowed,
-        has_column_privilege(current_user,$1,column_name,'SELECT WITH GRANT OPTION') AS select_grant,
-        has_column_privilege(current_user,$1,column_name,'INSERT WITH GRANT OPTION') AS insert_grant,
-        has_column_privilege(current_user,$1,column_name,'UPDATE WITH GRANT OPTION') AS update_grant
-      FROM information_schema.columns
-      WHERE table_schema='public' AND table_name=$2
-      ORDER BY ordinal_position`, [`public.${tableName}`, tableName]);
-    assert.ok(result.rowCount !== null && result.rowCount > 0, tableName);
-    for (const row of result.rows) {
+    }>(`SELECT class.relname AS table_name,attribute.attname AS column_name,
+        has_column_privilege($1,class.oid,attribute.attnum,'SELECT') AS select_allowed,
+        has_column_privilege($1,class.oid,attribute.attnum,'INSERT') AS insert_allowed,
+        has_column_privilege($1,class.oid,attribute.attnum,'UPDATE') AS update_allowed,
+        has_column_privilege($1,class.oid,attribute.attnum,'REFERENCES') AS references_allowed,
+        has_column_privilege($1,class.oid,attribute.attnum,
+          'SELECT WITH GRANT OPTION') AS select_grant,
+        has_column_privilege($1,class.oid,attribute.attnum,
+          'INSERT WITH GRANT OPTION') AS insert_grant,
+        has_column_privilege($1,class.oid,attribute.attnum,
+          'UPDATE WITH GRANT OPTION') AS update_grant
+      FROM pg_class class
+      JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
+      JOIN pg_attribute attribute ON attribute.attrelid=class.oid
+      WHERE namespace.nspname='public' AND class.relname=ANY($2::TEXT[])
+        AND class.relkind IN ('r','p','v','m','f')
+        AND attribute.attnum>0 AND NOT attribute.attisdropped
+      ORDER BY class.relname,attribute.attnum`,
+  [WORKER_ROLE, Object.keys(WORKER_TABLE_AUTHORITY)]);
+  for (const [tableName, expected] of Object.entries(WORKER_TABLE_AUTHORITY)) {
+    const tableRows = result.rows.filter((row) => row.table_name === tableName);
+    assert.ok(tableRows.length > 0, tableName);
+    for (const row of tableRows) {
       assert.deepEqual(row, {
+        table_name: tableName,
         column_name: row.column_name,
         select_allowed: expected.SELECT.includes(row.column_name),
         insert_allowed: expected.INSERT.includes(row.column_name),
@@ -499,21 +577,21 @@ async function assertExactColumnAuthority(
 }
 
 async function assertDynamicExecutionInventory(
-  worker: InstanceType<typeof pg.Pool>,
+  admin: InstanceType<typeof pg.Pool>,
 ): Promise<void> {
-  const relations = await worker.query<{
+  const relations = await admin.query<{
     readonly relation_name: string;
     readonly table_allowed: boolean;
     readonly column_allowed: boolean;
   }>(`SELECT class.relname AS relation_name,
-      has_table_privilege(current_user,class.oid,
+      has_table_privilege($1,class.oid,
         'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS table_allowed,
-      has_any_column_privilege(current_user,class.oid,
+      has_any_column_privilege($1,class.oid,
         'SELECT,INSERT,UPDATE,REFERENCES') AS column_allowed
     FROM pg_class class JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
     WHERE namespace.nspname='public' AND class.relkind IN ('r','p','v','m','f')
       AND class.relname LIKE 'execution\\_%' ESCAPE '\\'
-    ORDER BY class.relname`);
+    ORDER BY class.relname`, [WORKER_ROLE]);
   assert.ok(relations.rowCount !== null && relations.rowCount > 5);
   for (const row of relations.rows) {
     assert.equal(row.table_allowed, false, row.relation_name);
@@ -529,18 +607,18 @@ async function assertDynamicExecutionInventory(
     relations.rows.filter((row) => row.column_allowed).map((row) => row.relation_name),
     [...WORKER_EXECUTION_TABLES].sort(),
   );
-  const sequences = await worker.query<{
+  const sequences = await admin.query<{
     readonly sequence_name: string;
     readonly usage_allowed: boolean;
     readonly select_allowed: boolean;
     readonly update_allowed: boolean;
   }>(`SELECT class.relname AS sequence_name,
-      has_sequence_privilege(current_user,class.oid,'USAGE') AS usage_allowed,
-      has_sequence_privilege(current_user,class.oid,'SELECT') AS select_allowed,
-      has_sequence_privilege(current_user,class.oid,'UPDATE') AS update_allowed
+      has_sequence_privilege($1,class.oid,'USAGE') AS usage_allowed,
+      has_sequence_privilege($1,class.oid,'SELECT') AS select_allowed,
+      has_sequence_privilege($1,class.oid,'UPDATE') AS update_allowed
     FROM pg_class class JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
     WHERE namespace.nspname='public' AND class.relkind='S'
-    ORDER BY class.relname`);
+    ORDER BY class.relname`, [WORKER_ROLE]);
   assert.ok(sequences.rowCount !== null && sequences.rowCount > 1);
   for (const row of sequences.rows) {
     const expected = row.sequence_name === 'execution_intent_transitions_sequence_seq';
@@ -670,4 +748,36 @@ function quoteIdentifier(value: string): string {
 
 function quoteLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
+}
+
+type Cleanup = () => unknown;
+
+async function collectCleanupFailures(cleanups: readonly Cleanup[]): Promise<Error[]> {
+  const failures: Error[] = [];
+  for (const [index, cleanup] of cleanups.entries()) {
+    try {
+      await cleanup();
+    } catch {
+      failures.push(new Error(`Cleanup operation ${index + 1} failed.`));
+    }
+  }
+  return failures;
+}
+
+function throwWithCleanupFailures(
+  bodyFailed: boolean,
+  bodyFailure: unknown,
+  cleanupFailures: readonly Error[],
+): void {
+  if (bodyFailed) {
+    if (cleanupFailures.length === 0) throw bodyFailure;
+    throw new AggregateError(
+      [bodyFailure, ...cleanupFailures],
+      'Test failed and cleanup also failed.',
+      { cause: bodyFailure },
+    );
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'Test cleanup failed.');
+  }
 }

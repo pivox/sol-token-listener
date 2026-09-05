@@ -20,6 +20,7 @@ import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
 const provisioningScriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 const databaseUrl = process.env.TEST_DATABASE_URL;
+const executorRoleDatabaseUrl = process.env.TEST_EXECUTOR_ROLE_DATABASE_URL;
 const CHILD_TERM_TIMEOUT_MS = 2_500;
 const CHILD_KILL_TIMEOUT_MS = 1_000;
 
@@ -195,11 +196,13 @@ void test('compiled simulation-only executor records one unsigned Pump.fun BUY w
 });
 
 void test('compiled non-signing executors run under the isolated worker login', async (context) => {
-  if (databaseUrl === undefined) {
-    context.skip('TEST_DATABASE_URL absent: worker login integration skipped');
+  if (executorRoleDatabaseUrl === undefined || executorRoleDatabaseUrl.trim() === '') {
+    context.skip(
+      'TEST_EXECUTOR_ROLE_DATABASE_URL absent: disposable global-role integration skipped',
+    );
     return;
   }
-  const maintenance = new pg.Pool({ connectionString: databaseUrl });
+  const maintenance = new pg.Pool({ connectionString: executorRoleDatabaseUrl });
   const capability = (await maintenance.query<{
     readonly rolsuper: boolean;
     readonly rolcreatedb: boolean;
@@ -219,14 +222,17 @@ void test('compiled non-signing executors run under the isolated worker login', 
   const databaseName = `executor_worker_main_${suffix}`;
   const loginName = `executor_worker_login_${suffix}`;
   const password = randomUUID().replaceAll('-', '');
-  const isolatedUrl = new URL(databaseUrl);
+  const isolatedUrl = new URL(executorRoleDatabaseUrl);
   isolatedUrl.pathname = `/${databaseName}`;
   isolatedUrl.searchParams.delete('options');
   const children = new Set<TrackedChild>();
   let isolated: InstanceType<typeof pg.Pool> | undefined;
   let loginPool: InstanceType<typeof pg.Pool> | undefined;
+  let rpc: Awaited<ReturnType<typeof startScriptedPumpFunBuyRpc>> | undefined;
   let databaseCreated = false;
   let loginCreated = false;
+  let bodyFailed = false;
+  let bodyFailure: unknown;
   try {
     await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
     databaseCreated = true;
@@ -270,7 +276,7 @@ void test('compiled non-signing executors run under the isolated worker login', 
 
     const repository = new PostgresExecutionIntentRepository(isolated);
     const dryRunIntent = await createIntent(repository, `worker-${suffix}`);
-    const dryRun = startExecutor(context, children, workerUrl.href);
+    const dryRun = startExecutor(context, children, workerUrl.href, false);
     await waitForAssessment(isolated, dryRunIntent.intent.id, 1, dryRun);
     assert.deepEqual(
       await stopExecutorChild(dryRun),
@@ -278,44 +284,58 @@ void test('compiled non-signing executors run under the isolated worker login', 
       childOutput(dryRun),
     );
 
-    const rpc = await startScriptedPumpFunBuyRpc();
-    try {
-      const simulationIntent = await createSimulationIntent(repository);
-      const simulation = startSimulationExecutor(
-        context, children, workerUrl.href, rpc.url,
-      );
-      await waitForSimulationArtifact(isolated, simulationIntent.intent.id, simulation);
-      assert.deepEqual(
-        await stopExecutorChild(simulation),
-        { code: 0, signal: null },
-        childOutput(simulation),
-      );
-      assert.equal(await simulationArtifactCount(isolated, simulationIntent.intent.id), 1);
-      assert.deepEqual(rpc.requestErrors, []);
-      assert.equal(rpc.methods.includes('sendTransaction'), false);
-      assert.equal(rpc.methods.includes('sendRawTransaction'), false);
-      assert.equal(rpc.simulatedTransactionWasUnsigned(), true);
-    } finally {
-      await rpc.close();
-    }
-  } finally {
-    await Promise.all([...children].map(stopExecutorChild));
-    if (loginPool !== undefined) await loginPool.end();
-    if (isolated !== undefined) await isolated.end();
-    if (databaseCreated) {
-      await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-        WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
-      await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
-    }
-    if (loginCreated) await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
-    try { await releaseRoleLock(); } finally { await maintenance.end(); }
+    rpc = await startScriptedPumpFunBuyRpc();
+    const simulationIntent = await createSimulationIntent(repository);
+    const simulation = startSimulationExecutor(
+      context, children, workerUrl.href, rpc.url, false,
+    );
+    await waitForSimulationArtifact(isolated, simulationIntent.intent.id, simulation);
+    assert.deepEqual(
+      await stopExecutorChild(simulation),
+      { code: 0, signal: null },
+      childOutput(simulation),
+    );
+    assert.equal(await simulationArtifactCount(isolated, simulationIntent.intent.id), 1);
+    assert.deepEqual(rpc.requestErrors, []);
+    assert.equal(rpc.methods.includes('sendTransaction'), false);
+    assert.equal(rpc.methods.includes('sendRawTransaction'), false);
+    assert.equal(rpc.simulatedTransactionWasUnsigned(), true);
+  } catch (error) {
+    bodyFailed = true;
+    bodyFailure = error;
   }
+  const cleanupFailures = await collectCleanupFailures([
+    ...[...children].map((child) => async () => stopExecutorChild(child)),
+    async () => { if (rpc !== undefined) await rpc.close(); },
+    async () => { if (loginPool !== undefined) await loginPool.end(); },
+    async () => { if (isolated !== undefined) await isolated.end(); },
+    async () => {
+      if (databaseCreated) {
+        await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+      }
+    },
+    async () => {
+      if (databaseCreated) {
+        await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+      }
+    },
+    async () => {
+      if (loginCreated) {
+        await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
+      }
+    },
+    releaseRoleLock,
+    async () => maintenance.end(),
+  ]);
+  throwWithCleanupFailures(bodyFailed, bodyFailure, cleanupFailures);
 });
 
 function startExecutor(
   context: TestContext,
   children: Set<TrackedChild>,
   url: string,
+  registerContextCleanup = true,
 ): TrackedChild {
   const child = Object.assign(
     spawn(process.execPath, [resolve(repositoryRoot, 'dist/src/executor/main.js')], {
@@ -334,7 +354,7 @@ function startExecutor(
     { captured: [] as string[] },
   );
   children.add(child);
-  context.after(() => stopExecutorChild(child));
+  if (registerContextCleanup) context.after(() => stopExecutorChild(child));
   const { captured } = child;
   child.stdout?.on('data', (chunk: Buffer) => { captured.push(chunk.toString('utf8')); });
   child.stderr?.on('data', (chunk: Buffer) => { captured.push(chunk.toString('utf8')); });
@@ -346,6 +366,7 @@ function startSimulationExecutor(
   children: Set<TrackedChild>,
   database: string,
   rpcUrl: string,
+  registerContextCleanup = true,
 ): TrackedChild {
   const child = Object.assign(
     spawn(process.execPath, [resolve(repositoryRoot, 'dist/src/executor/main.js')], {
@@ -378,7 +399,7 @@ function startSimulationExecutor(
     { captured: [] as string[] },
   );
   children.add(child);
-  context.after(() => stopExecutorChild(child));
+  if (registerContextCleanup) context.after(() => stopExecutorChild(child));
   child.stdout?.on('data', (chunk: Buffer) => { child.captured.push(chunk.toString('utf8')); });
   child.stderr?.on('data', (chunk: Buffer) => { child.captured.push(chunk.toString('utf8')); });
   return child;
@@ -583,6 +604,38 @@ function quoteIdentifier(value: string): string {
 
 function quoteLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
+}
+
+type Cleanup = () => unknown;
+
+async function collectCleanupFailures(cleanups: readonly Cleanup[]): Promise<Error[]> {
+  const failures: Error[] = [];
+  for (const [index, cleanup] of cleanups.entries()) {
+    try {
+      await cleanup();
+    } catch {
+      failures.push(new Error(`Cleanup operation ${index + 1} failed.`));
+    }
+  }
+  return failures;
+}
+
+function throwWithCleanupFailures(
+  bodyFailed: boolean,
+  bodyFailure: unknown,
+  cleanupFailures: readonly Error[],
+): void {
+  if (bodyFailed) {
+    if (cleanupFailures.length === 0) throw bodyFailure;
+    throw new AggregateError(
+      [bodyFailure, ...cleanupFailures],
+      'Test failed and cleanup also failed.',
+      { cause: bodyFailure },
+    );
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(cleanupFailures, 'Test cleanup failed.');
+  }
 }
 
 async function delay(durationMs: number): Promise<void> {
