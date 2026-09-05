@@ -33,8 +33,8 @@ void test('migration 040 declares the monotone worker/live row partition', async
   }
   assert.doesNotMatch(migration, /'sol_token_executor_worker'::regrole/iu);
   assert.match(migration, /pg_roles/iu);
-  assert.match(migration, /pg_has_role/iu);
-  assert.match(migration, /session_user/iu);
+  assert.doesNotMatch(migration, /pg_has_role|session_user|current_setting\s*\(\s*'role'/iu);
+  assert.match(migration, /TO sol_token_executor_worker/iu);
 });
 
 void test('PostgreSQL 16 migration 040 backfills only live parents and enables non-forced RLS',
@@ -133,7 +133,7 @@ void test('PostgreSQL 16 migration 040 backfills only live parents and enables n
             AND (trigger.tgtype & 2)=2 AND (trigger.tgtype & 4)=4 AND (trigger.tgtype & 16)=16
           GROUP BY class.relname ORDER BY class.relname`, [childTables]);
         assert.deepEqual(guards.rows, [...childTables].sort().map((relationName) => ({
-          relation_name: relationName, guard_count: '1', all_security_definer: true,
+          relation_name: relationName, guard_count: '1', all_security_definer: false,
           all_search_path_closed: true, public_execute_count: '0',
         })));
 
