@@ -236,17 +236,21 @@ Expected: FAIL sur les nouveaux invariants `live_reserved`.
 Ajouter `live_reserved BOOLEAN NOT NULL DEFAULT FALSE` uniquement à
 `execution_intents`. Backfiller les intentions racines live avant d'activer RLS
 sur les cinq tables, sans ajouter de colonne aux enfants. Installer une policy
-permissive pour les rôles ordinaires et une policy restrictive qui filtre le
-parent directement et chaque enfant via un `EXISTS` sur son `intent_id`. La
-détection de membership utilise `session_user`, l'OID optionnel de
-`sol_token_executor_worker` et `pg_has_role`. Ne pas activer FORCE RLS.
+permissive pour les rôles ordinaires et une policy restrictive ciblée
+directement `TO sol_token_executor_worker`, donc liée à l'OID PostgreSQL du
+rôle. La migration reste rejouable avant la création du rôle avec une policy
+restrictive neutre ; le provisioning administratif la remplace
+systématiquement par la policy OID-durable. Le parent est filtré directement et
+chaque enfant via un `EXISTS` sur son `intent_id`. Ne pas activer FORCE RLS.
 
-Créer les guards enfants `SECURITY DEFINER` avec `search_path` fermé, révoquer
-leur exécution à `PUBLIC`, et ne laisser le chemin worker verrouiller qu'un
-parent `NOT live_reserved`. Étendre le provisioning rejouable afin de révoquer
-toute autorité sur les nouvelles fonctions et sur la colonne parente. Ne pas
-accorder `SELECT(live_reserved)` au worker, sauf si un test PostgreSQL démontre
-que le moteur l'exige pour évaluer la policy ; ne jamais accorder sa mutation.
+Créer les guards enfants `SECURITY INVOKER` avec `search_path` fermé et laisser
+la RLS du parent déterminer sa visibilité avant de le verrouiller. Révoquer
+leur exécution directe à `PUBLIC` et au worker. Étendre le provisioning
+rejouable afin de révoquer toute autorité sur les nouvelles fonctions et sur la
+colonne parente. Accorder au worker la lecture de `live_reserved`, requise par
+ses claims SQL explicites, mais jamais son insertion ni sa mutation. Valider
+avant tout backfill qu'une colonne préexistante possède exactement la forme
+`BOOLEAN NOT NULL DEFAULT FALSE` et refuser toute forme ambiguë.
 
 Run:
 ```bash
