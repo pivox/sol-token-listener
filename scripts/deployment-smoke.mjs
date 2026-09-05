@@ -74,6 +74,7 @@ const canonicalMigrations = Object.freeze([
   '036_execution_live_canary.sql',
   '037_execution_live_orchestration.sql',
   '038_execution_live_rpc_budget.sql',
+  '039_execution_canary_operator_binding.sql',
 ]);
 const canonicalRetentionCounters = Object.freeze([
   'apiEventStream',
@@ -91,6 +92,7 @@ const canonicalRetentionCounters = Object.freeze([
   'executionLivePositions',
   'executionLiveUnsignedSimulationEvidence',
   'executionOperatorAuthorizations',
+  'executionPreSignatureLocks',
   'executionRiskAdmissionReports',
   'executionRiskFaults',
   'executionRiskProviderOperations',

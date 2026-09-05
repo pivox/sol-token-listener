@@ -56,10 +56,14 @@ const signableSpecificationUrl = new URL(
   '../docs/superpowers/specs/2026-09-04-executor-live-signable-runtime-design.md',
   import.meta.url,
 );
+const operatorCanarySpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-09-04-executor-live-operator-canary-design.md',
+  import.meta.url,
+);
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 
-void test('documents the delivered H2b four-lane boundary without changing H2a or starting H2c',
+void test('documents H2c as ready for external preflight without starting a canary',
   async () => {
   const [
     packageText,
@@ -68,6 +72,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
     orchestrationSpecification,
     recoverySpecification,
     signableSpecification,
+    operatorCanarySpecification,
     runbook,
     deploymentSmoke,
   ] =
@@ -78,6 +83,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
       readFile(orchestrationSpecificationUrl, 'utf8'),
       readFile(recoverySpecificationUrl, 'utf8'),
       readFile(signableSpecificationUrl, 'utf8'),
+      readFile(operatorCanarySpecificationUrl, 'utf8'),
       readFile(runbookUrl, 'utf8'),
       readFile(deploymentSmokeUrl, 'utf8'),
     ]);
@@ -95,23 +101,24 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.10.1',
+    '**Version de spécification :** 1.11.0',
     'parent specification version',
   );
   assertContainsExactlyOnce(
     parentSpecification,
     '**Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes\n'
-      + '#51-H1, runtime de finalité read-only #51-H2a et runtime signable désarmé #51-H2b',
+      + '#51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b\n'
+      + 'et préparation opérateur exacte #51-H2c',
     'parent delivered scope',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.1.0',
+    '**Version de spécification :** 1.2.0',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.10.0',
+    '**Version de la spécification parente :** 1.11.0',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -131,12 +138,12 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     recoverySpecification,
-    '**Version de spécification :** 1.1.6',
+    '**Version de spécification :** 1.1.7',
     'recovery specification version',
   );
   assertContainsExactlyOnce(
     recoverySpecification,
-    '**Version de la spécification parente :** 1.10.1',
+    '**Version de la spécification parente :** 1.11.0',
     'recovery parent specification version',
   );
   assertContainsExactlyOnce(
@@ -146,12 +153,12 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     signableSpecification,
-    '**Version de spécification :** 1.0.3',
+    '**Version de spécification :** 1.1.0',
     'signable specification version',
   );
   assertContainsExactlyOnce(
     signableSpecification,
-    '**Version de la spécification parente :** 1.10.1',
+    '**Version de la spécification parente :** 1.11.0',
     'signable parent specification version',
   );
   assertContainsExactlyOnce(
@@ -165,8 +172,18 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
     'signable live foundation version',
   );
   assertContainsExactlyOnce(
+    operatorCanarySpecification,
+    '**Version de spécification :** 1.1.0',
+    'operator canary specification version',
+  );
+  assertContainsExactlyOnce(
+    operatorCanarySpecification,
+    '**Statut :** LIVRÉE — `READY_FOR_EXTERNAL_PREFLIGHT`, canary non démarré',
+    'operator canary status',
+  );
+  assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.4.3 — 2026-09-04',
+    '**Version :** 1.5.0 — 2026-09-05',
     'runbook version',
   );
 
@@ -194,7 +211,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   assertContainsExactlyOnce(
     runbook,
     'Le constat livré obligatoire est :\n'
-      + '`LIVE_SIGNABLE_RUNTIME_COMPOSED`, `CANARY_NOT_STARTED`,\n'
+      + '`LIVE_SIGNABLE_RUNTIME_COMPOSED`, `READY_FOR_EXTERNAL_PREFLIGHT`, `CANARY_NOT_STARTED`,\n'
       + '`NON_EXECUTED / NON_VALIDATED`.',
     'runbook operational state',
   );
@@ -212,8 +229,9 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   assert.equal(runbook.includes('CANARY_STARTED'), false);
   assert.equal((deploymentSmoke.match(/'037_execution_live_orchestration\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'038_execution_live_rpc_budget\.sql'/gu) ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'039_execution_canary_operator_binding\.sql'/gu) ?? []).length, 1);
   assert.equal(
-    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n\]\);/u.test(deploymentSmoke),
+    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n\]\);/u.test(deploymentSmoke),
     true,
     'deployment smoke migration head',
   );

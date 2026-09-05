@@ -1,8 +1,8 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.1.6
+**Version de spécification :** 1.1.7
 
-**Version de la spécification parente :** 1.10.1
+**Version de la spécification parente :** 1.11.0
 
 **Version de l'orchestration persistante :** 1.1.5
 
@@ -12,6 +12,10 @@
 opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
+
+- **1.1.7 — 2026-09-05 :** aligne le bootstrap H2a sur la migration 039 sans
+  élargir son autorité. Recovery reste read-only pour les bytes et continue de
+  ne signer, armer ou soumettre aucune transaction.
 
 - **1.1.6 — 2026-09-04 :** aligne la validation du catalogue partagé sur la
   migration 038 du budget RPC H2b, sans accorder au rôle H2a l'accès à cette
@@ -252,7 +256,7 @@ L'ordre est obligatoire :
 2. ouvrir PostgreSQL avec des timeouts bornés ;
 3. appliquer puis vérifier le rôle recovery sur le client courant ;
 4. vérifier que l'historique de migrations correspond exactement au catalogue
-   versionné jusqu'à `038_execution_live_rpc_budget.sql` ;
+   versionné jusqu'à `039_execution_canary_operator_binding.sql` ;
 5. vérifier la génération wallet, le provider et l'absence de travail ouvert
    lié à une autre génération, un autre wallet ou un autre provider ;
 6. créer le client RPC de lecture ;
@@ -496,7 +500,7 @@ H2a ne signe, ne simule signé, ne soumet, ne reprend
 `SIGNED_NOT_SUBMITTED`, ne réclame BUY/SELL, n'arme pas et ne démarre aucun
 canary. Il ne change pas l'API publique, la stratégie ou les plafonds.
 
-#51-H2b composera dans un autre exécutable les lanes de reprise signée, SELL,
+#51-H2b compose dans un autre exécutable les lanes de reprise signée, SELL,
 deadline SELL et BUY, avec gateway de soumission isolé, leases renouvelés,
-gates transactionnels, exact bytes et `maxRetries=0`. #51-H2c restera la
-validation opérateur puis la préparation manuelle du canary minimal.
+gates transactionnels, exact bytes et `maxRetries=0`. #51-H2c fournit la
+validation opérateur et prépare manuellement le canary minimal sans le démarrer.

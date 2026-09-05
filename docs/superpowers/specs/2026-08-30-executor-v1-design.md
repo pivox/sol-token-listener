@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.10.1
+**Version de spécification :** 1.11.0
 
 **Date :** 2026-08-31
 
@@ -9,9 +9,16 @@
 **Issue parente :** #51
 
 **Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes
-#51-H1, runtime de finalité read-only #51-H2a et runtime signable désarmé #51-H2b
+#51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b
+et préparation opérateur exacte #51-H2c
 
 ## Historique des versions
+
+- **1.11.0 — 2026-09-05 :** livre H2c en état
+  `READY_FOR_EXTERNAL_PREFLIGHT` : sidecar canary signé, armement lié à une
+  intention BUY exacte, réservation atomique, lock durable avant signature,
+  récupération fail-closed et rôles PostgreSQL séparés. Aucun canary n'est
+  démarré et #49 reste `NON_EXECUTED / NON_VALIDATED`.
 
 - **1.10.1 — 2026-09-04 :** rend le budget RPC H2b durable par tentative.
   Chaque appel est réservé en PostgreSQL avant le contact provider ; une

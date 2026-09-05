@@ -1,18 +1,24 @@
 # Armement opérateur exact et préparation du canary — conception #51-H2c
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.1.0
 
-**Version de la spécification parente :** 1.10.1
+**Version de la spécification parente :** 1.11.0
 
 **Date :** 2026-09-04
 
-**Statut :** APPROUVÉE
+**Statut :** LIVRÉE — `READY_FOR_EXTERNAL_PREFLIGHT`, canary non démarré
 
 **Issue parente :** #51
 
 **Dépendance :** #51-H2b fusionnée par la PR #78 (`bcc983b`)
 
 ## Historique des versions
+
+- **1.1.0 — 2026-09-05 :** livre les contrats H2c, la migration 039,
+  l'armement V2 exact, le lock durable avant signature, sa récupération
+  périodique fail-closed et les frontières de rôles. Cette livraison autorise
+  uniquement la préparation manuelle d'un préflight externe ; elle ne vaut ni
+  exécution, ni validation économique, ni verdict `PASS`.
 
 - **1.0.1 — 2026-09-04 :** ferme la faisabilité de l'admission BUY avec un
   sidecar canonique signé, lie la requête aux limites financières du runtime,

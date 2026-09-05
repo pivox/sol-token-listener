@@ -113,8 +113,12 @@ void test('a stale wallet snapshot rejects without reserving exposure', async (c
   await withTemporarySchema(databaseUrl, 'execution_risk_admission_stale', async (pool) => {
     const fixture = await createFixture(pool);
     const created = await fixture.intentRepository.create(intentDraft('stale'));
+    const staleWalletPolicy = createExecutionRiskPolicy({
+      ...policyInput(), walletSnapshotMaxAgeMs: 60_000,
+    });
     const result = await fixture.service.admit({
       ...admissionInput(created.intent, fixture),
+      policy: staleWalletPolicy,
       nowMs: NOW_MS + 59_960,
     });
     assert.equal(result.decision, 'REJECTED');
@@ -133,10 +137,10 @@ void test('stale provider evidence rejects while a retired generation fences ABA
     const fixture = await createFixture(pool);
     const staleIntent = await fixture.intentRepository.create(intentDraft(
       'provider-stale',
-      NOW_MS + 120_000,
+      NOW_MS + 900_000,
     ));
     const longWalletPolicy = createExecutionRiskPolicy({
-      ...policyInput(), walletSnapshotMaxAgeMs: 120_000,
+      ...policyInput(), walletSnapshotMaxAgeMs: 120_000, providerUsageMaxAgeMs: 60_000,
     });
     const staleResult = await fixture.service.admit({
       ...admissionInput(staleIntent.intent, fixture),
@@ -340,6 +344,7 @@ void test('a third durable technical failure remains readable and blocks admissi
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, 'execution_risk_third_failure', async (pool) => {
     const fixture = await createFixture(pool);
+    const admissionAtMs = Date.now();
     for (let index = 0; index < 3; index += 1) {
       await fixture.riskRepository.recordFault({
         faultId: `execution_fault_${String(index + 4).repeat(64)}`,
@@ -353,7 +358,7 @@ void test('a third durable technical failure remains readable and blocks admissi
         classification: 'TRANSIENT',
         exactSignedBytesAvailable: false,
         reasonCode: 'EXECUTION_PROVIDER_FAILED',
-        observedAtMs: NOW_MS + index,
+        observedAtMs: admissionAtMs + index,
       });
     }
     const currentWallet = await fixture.riskRepository.appendWalletSnapshot(createExecutionWalletSnapshot({
@@ -361,19 +366,21 @@ void test('a third durable technical failure remains readable and blocks admissi
       providerId: fixture.walletSnapshot.providerId,
       stateRevision: 3n,
       slot: fixture.walletSnapshot.slot + 1n,
-      observedAtMs: NOW_MS + 2,
-      blockTimeMs: NOW_MS + 2,
+      observedAtMs: admissionAtMs + 2,
+      blockTimeMs: admissionAtMs + 2,
       commitment: fixture.walletSnapshot.commitment,
       walletLamports: fixture.walletSnapshot.walletLamports,
       tokenBalanceCount: fixture.walletSnapshot.tokenBalanceCount,
       openPositions: fixture.walletSnapshot.openPositions,
       realizedNetPnlRaw: fixture.walletSnapshot.realizedNetPnlRaw,
     }));
-    const created = await fixture.intentRepository.create(intentDraft('third-failure'));
+    const created = await fixture.intentRepository.create(
+      intentDraft('third-failure', admissionAtMs + 60_000),
+    );
     const result = await fixture.service.admit({
       ...admissionInput(created.intent, fixture),
       walletSnapshot: currentWallet,
-      nowMs: NOW_MS + 2,
+      nowMs: admissionAtMs + 2,
     });
     assert.equal(result.decision, 'REJECTED');
     assert.equal(result.reasonCode, 'EXECUTION_PROVIDER_FAILED');
@@ -412,11 +419,11 @@ async function createFixture(pool: InstanceType<typeof pg.Pool>) {
     planId: 'public-v1',
     billingPeriodId: 'period-current',
     billingPeriodStartedAtMs: NOW_MS - 1_000,
-    billingPeriodEndsAtMs: NOW_MS + 300_000,
+    billingPeriodEndsAtMs: NOW_MS + 900_000,
     limitUnits: 10_000n,
     usedUnits: 10n,
     measuredAtMs: NOW_MS - 100,
-    expiresAtMs: NOW_MS + 60_000,
+    expiresAtMs: NOW_MS + 899_000,
     provenance: 'AUTHORITATIVE_PROBE',
   });
   await riskRepository.appendProviderUsage(providerSnapshot);
@@ -446,7 +453,7 @@ function admissionInput(intent: Awaited<ReturnType<
   });
 }
 
-function intentDraft(seed: string, expiresAtMs = NOW_MS + 60_000) {
+function intentDraft(seed: string, expiresAtMs = NOW_MS + 900_000) {
   return createExecutionIntentDraft({ ...intentDraftInput(seed), expiresAtMs });
 }
 
@@ -468,7 +475,7 @@ function intentDraftInput(seed: string) {
     decisionEventId: `decision:${seed}`,
     decisionFingerprint: 'c'.repeat(64),
     requestedAtMs: NOW_MS - 1_000,
-    expiresAtMs: NOW_MS + 60_000,
+    expiresAtMs: NOW_MS + 900_000,
   } as const;
 }
 
@@ -482,8 +489,8 @@ function policyInput() {
     maximumTotalExposureBps: 1_000n,
     drawdownPauseBps: 2_500n,
     feeReserveLamports: 100_000n,
-    walletSnapshotMaxAgeMs: 60_000,
-    providerUsageMaxAgeMs: 300_000,
+    walletSnapshotMaxAgeMs: 900_000,
+    providerUsageMaxAgeMs: 900_000,
     providerEntryCostUnits: 8n,
     providerExitCostUnitsPerPosition: 4n,
     providerConfirmationCostUnitsPerPosition: 2n,

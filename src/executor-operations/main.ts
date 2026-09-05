@@ -2,11 +2,10 @@ import 'dotenv/config';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
-import { closeDatabase, getDatabasePool } from '../storage/database.js';
 import { verifySignedSafetyQualificationEvidence } from '../domain/execution-safety-attestation.js';
 import { verifySignedExecutionCanaryEvidence } from '../domain/execution-canary-attestation.js';
-import { PostgresExecutionOperationsRepository } from '../storage/execution-operations.repository.js';
 import { parseExecutionCanaryArmConfig, parseExecutionOperationsConfig } from './config.js';
+import { openExecutionOperationsDatabase } from './database.js';
 import {
   createExecutionOperationsService,
   type ExecutionOperationsService,
@@ -146,17 +145,14 @@ export async function runExecutionOperationsCommand(
 
 export async function main(): Promise<void> {
   const config = parseExecutionOperationsConfig(process.env);
-  const pool = getDatabasePool(config.databaseUrl, {
-    connectionTimeoutMillis: 3_000,
-    query_timeout: 3_000,
-    statement_timeout: 3_000,
-    lock_timeout: 3_000,
-    idle_in_transaction_session_timeout: 3_000,
+  const database = openExecutionOperationsDatabase({
+    databaseUrl: config.databaseUrl,
+    statementTimeoutMs: 3_000,
+    onIdleError: () => { database.evict(); },
   });
-  const repository = new PostgresExecutionOperationsRepository(pool);
   const service = createExecutionOperationsService({
-    repository,
-    canaryRepository: repository,
+    repository: database.repository,
+    canaryRepository: database.repository,
     nonceSource: createOperatorNonce,
   });
   try {
@@ -168,7 +164,7 @@ export async function main(): Promise<void> {
     });
     process.stdout.write(`${output}\n`);
   } finally {
-    await closeDatabase();
+    await database.close();
   }
 }
 

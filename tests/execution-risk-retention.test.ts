@@ -37,6 +37,7 @@ void test('executor risk purge exposes additive zero counters on an empty databa
       providerSnapshots: result.executionRiskProviderSnapshots,
       tombstones: result.executionRiskTombstones,
       signedTransactions: result.executionSignedTransactions,
+      preSignatureLocks: result.executionPreSignatureLocks,
       signedSimulationEvidence: result.executionSignedSimulationEvidence,
       liveUnsignedSimulationEvidence: result.executionLiveUnsignedSimulationEvidence,
       submissionEvents: result.executionSubmissionEvents,
@@ -44,7 +45,7 @@ void test('executor risk purge exposes additive zero counters on an empty databa
       exitAuthorizations: 0, livePositions: 0,
       rateLimits: 0, evidence: 0, faults: 0, reservations: 0, reports: 0,
       walletSnapshots: 0, providerOperations: 0, providerSnapshots: 0, tombstones: 0,
-      signedTransactions: 0, signedSimulationEvidence: 0,
+      signedTransactions: 0, preSignatureLocks: 0, signedSimulationEvidence: 0,
       liveUnsignedSimulationEvidence: 0, submissionEvents: 0,
     });
   });
@@ -53,7 +54,7 @@ void test('executor risk purge exposes additive zero counters on an empty databa
 void test('live retention is terminal-only and cannot delete ambiguous or open state', async () => {
   const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
   const liveStart = source.indexOf('const executionLiveArtifactCohort');
-  const liveEnd = source.indexOf('const executionControlEvents', liveStart);
+  const liveEnd = source.indexOf('const executionActivationEvents', liveStart);
   assert.ok(liveStart >= 0 && liveEnd > liveStart, 'live retention cohort is absent');
   const liveRetention = source.slice(liveStart, liveEnd);
   assert.match(liveRetention, /state IN \('RECONCILED','REVOKED_NO_SEND'\)/u);
@@ -63,11 +64,29 @@ void test('live retention is terminal-only and cannot delete ambiguous or open s
   assert.match(liveRetention, /purge_after <= \$1::TIMESTAMPTZ/u);
   assert.match(liveRetention, /DELETE FROM execution_signed_simulation_evidence/u);
   assert.match(liveRetention, /DELETE FROM execution_live_unsigned_simulation_evidence/u);
+  assert.match(liveRetention, /DELETE FROM execution_pre_signature_locks/u);
+  assert.match(liveRetention, /state IN \('SIGNED_PERSISTED','REVOKED'\)/u);
   assert.ok(
     liveRetention.indexOf('DELETE FROM execution_signed_simulation_evidence')
       < liveRetention.indexOf('DELETE FROM execution_signed_transactions artifact'),
     'signed simulation evidence must purge in the terminal artifact cohort',
   );
+  assert.ok(
+    liveRetention.indexOf('DELETE FROM execution_signed_transactions artifact')
+      < liveRetention.indexOf('DELETE FROM execution_pre_signature_locks'),
+    'signed artifacts must purge before their terminal pre-signature locks',
+  );
+});
+
+void test('risk retention cannot retire a reservation still bound to live canary state', async () => {
+  const source = await readFile(new URL('../src/storage/database.ts', import.meta.url), 'utf8');
+  const cohortStart = source.indexOf('const reservationCohort');
+  const cohortEnd = source.indexOf('const reservationIds', cohortStart);
+  assert.ok(cohortStart >= 0 && cohortEnd > cohortStart, 'reservation retention cohort is absent');
+  const cohort = source.slice(cohortStart, cohortEnd);
+  assert.match(cohort, /execution_signed_transactions artifact[\s\S]*artifact\.reservation_id=reservation\.reservation_id/u);
+  assert.match(cohort, /execution_pre_signature_locks lock[\s\S]*lock\.reservation_id=reservation\.reservation_id/u);
+  assert.match(cohort, /execution_activation_armaments armament[\s\S]*armament\.target_reservation_id=reservation\.reservation_id/u);
 });
 
 void test('purges expired terminal SELL evidence without a reservation', async (context) => {

@@ -14,7 +14,7 @@ import type { LiveRecoveryConfig } from '../src/executor-live-recovery/config.js
 const GENERATION_ID = `execution_wallet_generation_${'a'.repeat(64)}`;
 const PUBLIC_KEY = '11111111111111111111111111111111';
 
-void test('pins every migration through 037 to a non-placeholder sha256', async () => {
+void test('pins every migration through 039 to a non-placeholder sha256', async () => {
   assert.equal(LIVE_RECOVERY_MIGRATION_CATALOG.length, 39);
   assert.equal(
     LIVE_RECOVERY_MIGRATION_CATALOG.at(-1)?.name,
@@ -38,7 +38,7 @@ void test('validates role, exact migration history, generation and open-work aff
   assert.deepEqual(evidence, {
     payloadVersion: 1,
     role: 'sol_token_executor_live_recovery',
-    migrationHead: '038_execution_live_rpc_budget.sql',
+    migrationHead: '039_execution_canary_operator_binding.sql',
     generationId: GENERATION_ID,
     providerId: 'primary',
   });

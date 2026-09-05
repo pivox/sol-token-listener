@@ -46,6 +46,7 @@ void test('backfills and constrains provider-affine finality evidence replay-saf
       '036_execution_live_canary.sql',
       '037_execution_live_orchestration.sql',
       '038_execution_live_rpc_budget.sql',
+      '039_execution_canary_operator_binding.sql',
     ]);
     assert.match(
       await finalityIndexDefinition(pool),

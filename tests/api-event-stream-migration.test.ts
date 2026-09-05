@@ -293,6 +293,7 @@ void test('la migration fonctionne en base réelle si TEST_DATABASE_URL est conf
       '036_execution_live_canary.sql',
       '037_execution_live_orchestration.sql',
       '038_execution_live_rpc_budget.sql',
+      '039_execution_canary_operator_binding.sql',
     ]);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     assert.equal((await pool.query(

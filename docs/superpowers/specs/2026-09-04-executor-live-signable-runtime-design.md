@@ -1,12 +1,12 @@
 # Runtime signable de l'exécuteur live — conception #51-H2b
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.1.0
 
-**Version de la spécification parente :** 1.10.1
+**Version de la spécification parente :** 1.11.0
 
 **Version de l'orchestration persistante H1 :** 1.2.0
 
-**Version du runtime de finalité H2a :** 1.1.6
+**Version du runtime de finalité H2a :** 1.1.7
 
 **Version de la fondation live :** 1.1.0
 
@@ -17,6 +17,12 @@
 **Issue parente :** #51
 
 ## Historique des versions
+
+- **1.1.0 — 2026-09-05 :** intègre la frontière H2c sans élargir le rôle du
+  runtime : un BUY canary exige désormais un armement V2 ciblé, sa réservation
+  et son lock pré-signature exact avant l'appel au signer. Un lock abandonné
+  déclenche `ENTRY_STOP` et une récupération sans signature ni RPC. L'état
+  livré reste `CANARY_NOT_STARTED`.
 
 - **1.0.3 — 2026-09-04 :** réserve durablement le dernier appel
   `sendTransaction` pendant l'état `SIGNED_SIMULATED`, avant le fence
@@ -71,8 +77,8 @@ H2a reste un binaire séparé, sous son login PostgreSQL read-only distinct. Il
 reste seul responsable de la finalité, de la confirmation, de la
 réconciliation et de la deadline. H2b n'importe ni les lanes ni les façades
 applicatives H2a et n'obtient aucune méthode permettant d'exécuter ces tâches.
-Le contrat métier H2a reste inchangé ; sa spécification 1.1.6 aligne seulement
-le head du catalogue partagé sur la migration 038, sans nouvelle autorité.
+Le contrat métier H2a reste inchangé ; sa spécification 1.1.7 aligne seulement
+le head du catalogue partagé sur la migration 039, sans nouvelle autorité.
 
 H2c reste seul responsable de la validation opérateur, de l'armement manuel et
 de la préparation ou du démarrage d'un canary. H2b ne peut appeler ni `arm`, ni

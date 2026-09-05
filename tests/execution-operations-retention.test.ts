@@ -24,7 +24,7 @@ void test('retention purges terminal #51-F payloads after four hours and preserv
 
     const purged = await purgeExpiredFoundationData(pool);
 
-    assert.equal(purged.executionControlEvents, 1);
+    assert.equal(purged.executionControlEvents, 0);
     assert.equal(purged.executionActivationEvents, 1);
     assert.equal(purged.executionActivationArmaments, 1);
     assert.equal(purged.executionOperatorAuthorizations, 1);
@@ -32,11 +32,13 @@ void test('retention purges terminal #51-F payloads after four hours and preserv
     assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
       FROM execution_control_state`)).rows[0]?.count, 1);
     for (const table of [
-      'execution_control_events', 'execution_activation_events',
-      'execution_activation_armaments', 'execution_operator_authorizations',
+      'execution_activation_events', 'execution_activation_armaments',
+      'execution_operator_authorizations',
       'execution_safety_gate_evidence', 'execution_safety_qualifications',
     ]) assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count FROM ${table}`))
       .rows[0]?.count, 0);
+    assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+      FROM execution_control_events`)).rows[0]?.count, 1);
   });
 });
 
@@ -80,6 +82,8 @@ async function insertExpiredFixture(pool: InstanceType<typeof pg.Pool>): Promise
       `evidence:${index}`, index.toString(16).repeat(64),
     ]);
   }
+  await pool.query(`ALTER TABLE execution_operator_authorizations
+    DISABLE TRIGGER execution_operator_authorizations_v2_insert`);
   await pool.query(`INSERT INTO execution_operator_authorizations (
     authorization_id,payload_version,authorization_fingerprint,generation_id,
     action,phase,context_fingerprint,nonce_hash,operator_id,issued_at,expires_at,
@@ -90,6 +94,8 @@ async function insertExpiredFixture(pool: InstanceType<typeof pg.Pool>): Promise
     authorizationId, '6'.repeat(64), generationId,
     qualificationFingerprint, '7'.repeat(64),
   ]);
+  await pool.query(`ALTER TABLE execution_operator_authorizations
+    ENABLE TRIGGER execution_operator_authorizations_v2_insert`);
   await pool.query(`ALTER TABLE execution_activation_armaments
     DISABLE TRIGGER execution_activation_armaments_guarded_insert`);
   await pool.query(`INSERT INTO execution_activation_armaments (
@@ -118,9 +124,9 @@ async function insertExpiredFixture(pool: InstanceType<typeof pg.Pool>): Promise
   ]);
   await pool.query(`INSERT INTO execution_control_events (
     event_id,payload_version,event_fingerprint,generation_id,previous_state,next_state,
-    reason_code,qualification_id,authorization_id,operator_id,occurred_at
+    reason_code,qualification_id,authorization_id,operator_id,occurred_at,actor_type,actor_id
   ) VALUES ($1,1,$2,$3,NULL,'ENTRY_STOP','OPERATOR_ENTRY_STOP',NULL,NULL,
-    'operator-primary',TIMESTAMPTZ '2020-01-01T00:00:00.000Z')`, [
+    'operator-primary',TIMESTAMPTZ '2020-01-01T00:00:00.000Z','OPERATOR','operator-primary')`, [
     controlEventId, 'a'.repeat(64), generationId,
   ]);
   await pool.query(`INSERT INTO execution_control_state (

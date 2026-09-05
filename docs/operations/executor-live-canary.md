@@ -1,12 +1,14 @@
-# Executor live — préparation du canary Mainnet (#51-G)
+# Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.4.3 — 2026-09-04
+**Version :** 1.5.0 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
 signature ni soumission. #51-H2b publie séparément
-`executor:live:dev` et `executor:live:start`, sans armer ni démarrer un canary.
-H2c conserve les gates, l'armement opérateur et la préparation du canary.
+`executor:live:dev` et `executor:live:start`. #51-H2c ajoute les gates, un
+armement V2 lié à une intention BUY exacte, le lock durable avant signature et
+sa récupération fail-closed. Cette livraison prépare un préflight externe sans
+armer ni démarrer un canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
 briques #51-G ne prouvent ni rentabilité, ni sellabilité générale, ni avantage
@@ -17,14 +19,14 @@ automatiquement.
 ## État et frontière de sécurité
 
 Le constat livré obligatoire est :
-`LIVE_SIGNABLE_RUNTIME_COMPOSED`, `CANARY_NOT_STARTED`,
+`LIVE_SIGNABLE_RUNTIME_COMPOSED`, `READY_FOR_EXTERNAL_PREFLIGHT`, `CANARY_NOT_STARTED`,
 `NON_EXECUTED / NON_VALIDATED`.
 
 H2b est un processus signable isolé. Sa passe expose exactement quatre lanes,
 dans cet ordre : recover SELL, execute SELL, recover BUY, execute BUY. Le
 premier résultat `WORKED` arrête la passe. H2a reste le processus séparé de
-finalité, confirmation, réconciliation et deadline. H2c reste le seul
-propriétaire des gates, de l'armement et du canary.
+finalité, confirmation, réconciliation et deadline. H2c fournit la préparation
+opérateur, mais seul un opérateur externe peut autoriser le canary.
 
 La configuration livrée reste désarmée : `.env.example` conserve
 `EXECUTOR_MODE=dry-run`, `LIVE_TRADING_ENABLED=false` et aucun chemin de
@@ -32,15 +34,91 @@ keypair réel. Elle ne permet pas de démarrer H2b. La publication de H2b ne
 crée aucune intention, ne lance ni `live:resume` ni `live:arm`, et n'exécute
 aucun canary.
 
-Les commandes H2b existantes sont :
+Les commandes du runtime signable existantes sont :
 
 ```bash
 npm run executor:live:dev
 npm run executor:live:start
 ```
 
-Elles ne sont pas une procédure d'armement. Aucun secret réel, armement ou
-séquence de canary n'est documenté dans le périmètre H2b.
+Elles ne sont pas une procédure d'armement. La procédure H2c ci-dessous reste
+séquentielle, interactive et sans commande englobante.
+
+## Frontières des trois environnements
+
+Créer trois fichiers hors Git, lisibles seulement par leur compte de service :
+
+- opérations : login membre uniquement de `sol_token_executor_operations`,
+  `LIVE_TRADING_ENABLED=false`, aucun nom de variable keypair et aucun RPC ;
+- H2a : login membre uniquement de `sol_token_executor_live_recovery`, aucun
+  nom de variable keypair ;
+- H2b : login membre uniquement de `sol_token_executor_live`, keypair externe
+  `0400` ou `0600`, `EXECUTOR_MODE=live` et activation explicite.
+
+Après la migration 039, l'administrateur rejoue
+`scripts/provision-executor-roles.sql`. Chaque login doit être `NOINHERIT`, ne
+recevoir qu'un seul rôle de groupe avec `ADMIN FALSE, INHERIT FALSE, SET TRUE`,
+et ne posséder aucun objet. Les processus forcent `SET ROLE`,
+`search_path=pg_catalog,public` et `session_replication_role=origin` à chaque
+checkout. Le rôle opérations ne peut ni lire les bytes signés ou non signés,
+ni armer des champs runtime arbitraires, ni modifier les intents ; H2a,
+listener et API ne gagnent aucune autorité H2c.
+
+## Procédure H2c manuelle, avec arrêt après chaque étape
+
+1. Démarrer le listener sans keypair en `EXECUTION_MODE=paper` avec
+   `EXECUTION_INTENT_EMISSION_ENABLED=true`. Cette émission temporaire utilise
+   le producteur normal ; ne jamais fabriquer une cible par SQL.
+2. Sélectionner une seule intention BUY `PENDING`, WSOL, non louée, dont la
+   décision et la révision sont connues. Noter son `intentId`, son mint et son
+   montant entier. Arrêter le listener ou remettre l'émission à `false`, puis
+   vérifier qu'aucune nouvelle intention n'apparaît.
+3. Construire et auditer le build exact. Produire hors dépôt une qualification
+   Ed25519 fraîche puis un sidecar canary V1 signé qui lie l'intention, les onze
+   gates, les snapshots wallet/provider, le genesis, le build, la stratégie,
+   la configuration et les limites runtime. H2c ne fournit pas la clé de
+   signature de preuve.
+4. Depuis l'environnement opérations, exécuter séparément :
+
+   ```bash
+   DOTENV_CONFIG_PATH=/chemin/hors-git/operations.env npm run live:preflight
+   DOTENV_CONFIG_PATH=/chemin/hors-git/operations.env npm run live:status
+   ```
+
+   Le résultat attendu à ce point reste `ENTRY_STOP`, sans armement actif.
+   Vérifier manuellement tous les fingerprints et les expirations.
+5. Exécuter `live:resume` dans un vrai TTY, recopier exactement la phrase
+   affichée, puis relire `live:status`. Cette étape n'arme aucune intention.
+6. Renseigner temporairement `EXECUTOR_CANARY_EVIDENCE_PATH` dans
+   `operations.env`, puis armer la seule cible avec des entiers audités :
+
+   ```bash
+   DOTENV_CONFIG_PATH=/chemin/hors-git/operations.env npm run live:arm -- \
+     --intent-id=execution_intent_<sha256> \
+     --maximum-lamports=<plafond-entier-valide-hors-chaine> \
+     --holding-ms=<30000-a-900000> \
+     --reason=<motif-operateur-sans-secret>
+   DOTENV_CONFIG_PATH=/chemin/hors-git/operations.env npm run live:status
+   DOTENV_CONFIG_PATH=/chemin/hors-git/operations.env npm run live:report
+   ```
+
+   `live:arm` exige un TTY et fait afficher la cible complète, les limites, les
+   fingerprints et un nonce. La réservation d'exposition et l'armement V2 sont
+   atomiques ; tout écart laisse zéro capacité live.
+7. Seulement après inspection humaine de l'armement, démarrer H2a avec son
+   environnement dédié, puis H2b avec le sien. Le démarrage H2b valide rôle,
+   migration 039, génération, bindings, genesis et absence d'état incohérent
+   avant de charger le signer. Il ne doit traiter que la cible armée.
+8. Surveiller continuellement les sorties structurées H2a/H2b et les commandes
+   `live:status`/`live:report`. Toute dérive, lock pré-signature abandonné,
+   expiration, échec de gate ou ambiguïté impose au minimum `ENTRY_STOP`.
+9. Après fermeture ou incident, appliquer `ENTRY_STOP`, arrêter H2b, laisser
+   H2a finaliser/réconcilier, puis collecter les preuves et relire les états.
+   Un état inconnu n'autorise jamais un nouvel armement.
+
+Cette procédure ne démarre rien par elle-même. Les placeholders doivent être
+remplacés et validés hors dépôt ; aucune valeur fiat n'est convertie par le
+programme et tous les montants financiers restent des entiers.
 
 ## Démarrer uniquement la récupération de finalité H2a
 
@@ -129,6 +207,14 @@ blockhash et avant `SUBMISSION_STARTED`. Seul le fetch `sendTransaction` peut
 consommer ce prépaiement. Un crash dans cet intervalle conserve le slot comme
 consommé ; la reprise ne le rembourse pas et doit en réserver un nouveau.
 
+La migration 039 lie l'armement canary V2 à une intention BUY et à sa révision
+exacte, aux snapshots signés, à la politique et aux limites runtime. Elle
+ajoute le lock pré-signature qui persiste les octets non signés avant l'appel
+au signer et relie ensuite l'artefact signé au même lock. La récupération au
+bootstrap puis périodique révoque atomiquement tout lock échoué ou abandonné,
+libère sa réservation et place le contrôle en `ENTRY_STOP`, sans signer ni
+contacter le provider. Un événement système conserve la justification.
+
 La priorité SELL est protégée transactionnellement : chaque création SELL et
 chaque claim BUY live prennent le même verrou advisory de présence SELL. Le
 claim BUY impose `READ COMMITTED`, forme ensuite un nouveau snapshot PostgreSQL
@@ -171,7 +257,8 @@ Après les migrations, un administrateur peut appliquer
 `scripts/provision-executor-roles.sql`. Il crée des rôles de groupe `NOLOGIN`,
 sans mot de passe ni privilège cluster. Le compte LOGIN H2b reçoit seulement
 `sol_token_executor_live`; le compte H2a distinct reçoit seulement
-`sol_token_executor_live_recovery`.
+`sol_token_executor_live_recovery`; les commandes opérateur utilisent un
+troisième compte recevant seulement `sol_token_executor_operations`.
 
 La rétention utilise un second compte LOGIN dédié qui doit recevoir seulement
 `sol_token_retention_worker`. Il ne doit jamais être partagé avec le listener,
@@ -189,8 +276,9 @@ interdits. Listener,
 worker dry-run, opérations, lecteur opérateur et API publique n'ont aucun accès
 aux bytes signés. Seul le rôle de rétention reçoit les `DELETE` nécessaires à
 la purge. Il n'obtient qu'une lecture par colonnes
-de l'identifiant, de l'état, de l'échéance et de l'autorisation de sortie sur
-`execution_signed_transactions` : `signed_transaction_bytes` lui reste
+de l'identifiant, de l'état, de l'échéance, de l'autorisation de sortie, de
+l'identifiant de lock et de la réservation sur `execution_signed_transactions` :
+`signed_transaction_bytes` lui reste
 inaccessible, y compris via `RETURNING`.
 
 Le provisioning H2b révoque aussi `TEMPORARY` de `PUBLIC` sur la seule base de
@@ -212,11 +300,14 @@ La purge supprime après quatre heures, par cohorte et dans l'ordre enfant
 d'abord, uniquement :
 
 - les artefacts `RECONCILED` ou `REVOKED_NO_SEND` et leurs événements ;
+- les locks pré-signature `SIGNED_PERSISTED` ou `REVOKED`, uniquement lorsque
+  plus aucun artefact ou événement de contrôle ne les référence ;
 - les autorisations `CONSUMED` ou `REVOKED` sans artefact restant ;
 - les positions `CLOSED` sans autorisation restante.
 
-Un artefact `AMBIGUOUS`, une position `OPEN`, `EXIT_PENDING` ou `UNKNOWN`, et
-une autorisation `ACTIVE` ou `LOCKED` ne sont jamais candidats. Les tombstones
+Un artefact `AMBIGUOUS`, un lock `LOCKED`, une position `OPEN`, `EXIT_PENDING`
+ou `UNKNOWN`, et une autorisation `ACTIVE` ou `LOCKED` ne sont jamais
+candidats. Les tombstones
 anti-rejeu minimaux des intentions restent durables.
 
 ## Configuration H2b désarmée
@@ -232,12 +323,12 @@ Ne jamais écrire le contenu du keypair dans `.env`, PostgreSQL, un log, une
 preuve ou un ticket. H2b ne fournit ici ni clé réelle, ni financement, ni
 armement, ni procédure de canary.
 
-## Gates et canary : hors H2b
+## Gates H2c et canary non démarré
 
-H2c devra vérifier les gates et décider explicitement tout armement ou canary.
-H2b ne modifie pas l'état de contrôle, n'exécute pas `live:resume` ou
-`live:arm` et n'a pas l'autorité de les remplacer. Aucun canary n'est démarré
-par cette livraison.
+H2c vérifie les preuves et lie l'armement exact, mais H2b ne modifie jamais
+l'état de contrôle et n'exécute pas `live:resume` ou `live:arm`. Le dépôt ne
+contient ni secret, ni endpoint réel, ni armement actif. L'état livré est
+`READY_FOR_EXTERNAL_PREFLIGHT`, jamais `PASS`.
 
 ## Kill switches et arrêt
 

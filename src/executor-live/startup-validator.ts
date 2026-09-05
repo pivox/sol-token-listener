@@ -31,7 +31,7 @@ export interface LiveExecutorStartupDatabase {
 export interface LiveExecutorStartupEvidenceV1 {
   readonly payloadVersion: 1;
   readonly role: 'sol_token_executor_live';
-  readonly migrationHead: '038_execution_live_rpc_budget.sql';
+  readonly migrationHead: '039_execution_canary_operator_binding.sql';
   readonly generationId: string;
   readonly providerId: string;
   readonly phase: LiveExecutorConfig['phase'];
@@ -197,15 +197,36 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'build_hash', 'configuration_fingerprint', 'strategy_fingerprint',
         'wallet_public_key', 'cluster', 'genesis_hash', 'provider_id', 'expires_at',
       )),
-      table('execution_control_state', names('generation_id', 'state')),
+      table('execution_control_state', names(
+        'generation_id', 'state', 'state_revision', 'last_event_id',
+      ), names(), names('state', 'state_revision', 'last_event_id', 'updated_at')),
+      table('execution_control_events', names(), names(
+        'event_id', 'payload_version', 'event_fingerprint', 'generation_id',
+        'previous_state', 'next_state', 'reason_code', 'qualification_id',
+        'authorization_id', 'operator_id', 'actor_type', 'actor_id', 'source',
+        'intent_id', 'attempt_number', 'lock_id', 'artifact_id', 'occurred_at',
+      )),
       table('execution_activation_armaments', names(
         'armament_id', 'generation_id', 'qualification_id', 'qualification_fingerprint',
         'phase', 'build_hash', 'configuration_fingerprint', 'strategy_fingerprint',
         'wallet_public_key', 'cluster', 'genesis_hash', 'provider_id', 'state',
         'state_revision', 'maximum_capital_lamports', 'maximum_exposure_bps',
         'maximum_open_positions', 'maximum_buys', 'consumed_buys', 'expires_at',
+        'payload_version', 'armament_request_fingerprint', 'canary_evidence_fingerprint',
+        'target_intent_id', 'target_intent_state_revision', 'target_strategy_id',
+        'target_strategy_version', 'target_decision_fingerprint', 'target_mint',
+        'target_quote_mint', 'target_quote_amount_raw', 'target_admission_report_id',
+        'target_reservation_id', 'target_policy_fingerprint',
+        'target_wallet_snapshot_fingerprint', 'target_provider_snapshot_fingerprint',
+        'runtime_quote_max_age_ms', 'runtime_slippage_bps',
+        'runtime_snapshot_max_slot_lag', 'runtime_max_compute_units',
+        'runtime_max_fee_lamports', 'runtime_max_fee_payer_lamport_debit',
+        'runtime_max_rpc_calls_per_attempt', 'runtime_lease_ms', 'locked_intent_id',
+        'locked_attempt_number', 'locked_reservation_id', 'locked_lease_token', 'locked_at',
       ), names(), names(
         'state', 'state_revision', 'consumed_buys', 'terminal_at', 'purge_after',
+        'locked_intent_id', 'locked_attempt_number', 'locked_reservation_id',
+        'locked_lease_token', 'locked_at',
       )),
       table('execution_activation_events', names(), names(
         'event_id', 'payload_version', 'event_fingerprint', 'armament_id', 'generation_id',
@@ -214,6 +235,7 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
       table('execution_signed_transactions', names(
         'artifact_id', 'payload_version', 'specification_version', 'intent_id',
         'attempt_number', 'generation_id', 'armament_id', 'reservation_id',
+        'pre_signature_lock_id',
         'exit_authorization_id', 'provider_id', 'wallet_public_key', 'side',
         'effective_venue', 'message_hash', 'build_fingerprint', 'snapshot_fingerprint',
         'quote_fingerprint', 'quote_observed_at', 'quote_expires_at', 'blockhash',
@@ -224,6 +246,7 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
       ), names(
         'artifact_id', 'payload_version', 'specification_version', 'intent_id',
         'attempt_number', 'generation_id', 'armament_id', 'reservation_id',
+        'pre_signature_lock_id',
         'exit_authorization_id', 'provider_id', 'wallet_public_key', 'side',
         'effective_venue', 'message_hash', 'build_fingerprint', 'snapshot_fingerprint',
         'quote_fingerprint', 'quote_observed_at', 'quote_expires_at', 'blockhash',
@@ -233,6 +256,32 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'state', 'state_revision', 'signed_simulated_at', 'submission_started_at',
         'submitted_at', 'revoked_at', 'purge_after',
       )),
+      table('execution_pre_signature_locks', names(
+        'lock_id', 'payload_version', 'lock_fingerprint', 'intent_id', 'attempt_number',
+        'intent_state_revision',
+        'armament_id', 'reservation_id', 'generation_id', 'wallet_public_key',
+        'provider_id', 'lease_token', 'message_hash', 'unsigned_message_bytes',
+        'unsigned_transaction_hash', 'unsigned_transaction_bytes', 'build_hash',
+        'configuration_fingerprint', 'strategy_fingerprint', 'decision_fingerprint',
+        'policy_fingerprint', 'wallet_snapshot_fingerprint',
+        'provider_snapshot_fingerprint', 'effective_venue', 'market_snapshot_slot',
+        'market_snapshot_fingerprint', 'quote_fingerprint', 'quote_observed_at',
+        'quote_expires_at', 'unsigned_simulation_fingerprint', 'blockhash',
+        'last_valid_block_height', 'state', 'state_revision', 'authorized_at',
+        'terminal_at', 'purge_after',
+      ), names(
+        'lock_id', 'payload_version', 'lock_fingerprint', 'intent_id', 'attempt_number',
+        'intent_state_revision', 'armament_id', 'reservation_id', 'generation_id',
+        'wallet_public_key', 'provider_id', 'lease_token', 'message_hash',
+        'unsigned_message_bytes', 'unsigned_transaction_hash',
+        'unsigned_transaction_bytes', 'build_hash', 'configuration_fingerprint',
+        'strategy_fingerprint', 'decision_fingerprint', 'policy_fingerprint',
+        'wallet_snapshot_fingerprint', 'provider_snapshot_fingerprint',
+        'effective_venue', 'market_snapshot_slot', 'market_snapshot_fingerprint',
+        'quote_fingerprint', 'quote_observed_at', 'quote_expires_at',
+        'unsigned_simulation_fingerprint', 'blockhash', 'last_valid_block_height',
+        'state', 'state_revision', 'authorized_at',
+      ), names('state', 'state_revision', 'terminal_at', 'purge_after')),
       table('execution_live_unsigned_simulation_evidence', names(
         'evidence_id', 'payload_version', 'evidence_fingerprint', 'artifact_id', 'intent_id',
         'attempt_number', 'provider_id', 'snapshot_fingerprint', 'build_fingerprint',
@@ -533,7 +582,7 @@ export async function validateLiveExecutorStartup(
   return Object.freeze({
     payloadVersion: 1,
     role: 'sol_token_executor_live',
-    migrationHead: '038_execution_live_rpc_budget.sql',
+    migrationHead: '039_execution_canary_operator_binding.sql',
     generationId: config.generationId,
     providerId: config.providerId,
     phase: config.phase,
