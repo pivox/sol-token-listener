@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.12.0
+**Version de spécification :** 1.12.1
 
 **Date :** 2026-08-31
 
@@ -14,11 +14,18 @@ préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
 #51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations
 hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL
 read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i
-et autorité PostgreSQL fermée du worker non signant #51-H2j, puis contrat de
-paire d'intentions canary non signante #51-H2k
+et autorité PostgreSQL fermée du worker non signant #51-H2j, puis paire
+d'intentions canary non signante #51-H2k-a ; la préparation one-shot
+#51-H2k-b reste à livrer
 
 ## Historique des versions
 
+- **1.12.1 — 2026-09-06 :** H2k-a est livrée derrière
+  `EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED=false` : la migration 041 lie
+  atomiquement la cible target et son probe de simulation, interdit au worker
+  générique de consommer la cible et au probe de devenir live, puis coordonne
+  expiration et purge après quatre heures. H2k-b reste la prochaine PR et le
+  canary reste `CANARY_NOT_STARTED`.
 - **1.12.0 — 2026-09-05 :** spécifie H2k en deux PR : paire atomique entre la
   cible canary et son sibling de simulation, puis préparation one-shot exacte,
   toujours sans wallet, armement, signature ou soumission.

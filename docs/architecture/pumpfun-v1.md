@@ -1,5 +1,7 @@
 # Architecture Pump.fun V1
 
+**Version :** 1.0.0 — 2026-09-06
+
 ## Périmètre produit
 
 Le flux principal cible :
@@ -574,6 +576,39 @@ owners, superusers et rôles `BYPASSRLS` restent une limite administrative
 intentionnelle. Avant promotion, un worker compromis peut encore provoquer un
 déni de service sur une candidate ; il n'obtient pour autant aucune capacité
 de signer ou soumettre une transaction.
+
+### Paire canary non signante (#51-H2k-a)
+
+H2k-a est disponible après merge, mais reste inerte par défaut avec
+`EXECUTION_PREFLIGHT_PAIR_EMISSION_ENABLED=false`. Lorsqu'un opérateur active
+explicitement le flag, la configuration exige simultanément le mode `paper`,
+`EXECUTION_INTENT_EMISSION_ENABLED=true`, une allowlist limitée à WSOL/SPL
+Token 9 décimales et `PAPER_MINIMUM_CONFIRMATION=finalized`. Cette activation
+ne démarre aucun executor et n'ajoute aucun appel RPC.
+
+La migration 041 porte le head canonique et ajoute une paire append-only entre
+la cible `TARGET` BUY `paper_open_…`, issue du flux paper normal, et un probe
+`SIMULATION` BUY `execution_preflight_probe_…`. Les deux intentions sont
+créées dans la même transaction, partagent exactement leur décision et leur
+tuple économique, mais gardent des identités distinctes. La cible reste
+`PENDING`, tentative zéro, sans lease et `live_reserved=false` ; seul le probe
+reste consommable par le claim générique `EXECUTE` de `simulation-only`.
+Le `dry-run` reste non consommant.
+
+La base interdit au probe de passer `live_reserved=true`, et le repository
+opérations refuse aussi de l'utiliser comme cible H2c. Les intentions
+historiques non appairées restent compatibles. À expiration, le cycle de
+rétention terminalise par lot les deux intentions encore pré-signature et
+journalise la transition. La purge de la paire attend à la fois
+`expires_at + 4 hours` et le `purge_after` de chaque parent terminal et
+réconcilié, soit quatre heures après sa terminalisation, avant de supprimer
+enfants, memberships, paire et parents dans l'ordre des FK.
+
+H2k-a ne sélectionne pas encore une paire exacte, ne lance pas le dry-run ou
+la simulation, et ne produit aucun manifeste H2h. Cette orchestration one-shot
+est la prochaine PR H2k-b. Aucun wallet, keypair, signer, armement, byte signé
+ou transport de soumission n'est ajouté ; l'état reste
+`CANARY_NOT_STARTED`.
 
 ## Persistance, reprise et rétention
 

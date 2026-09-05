@@ -1,16 +1,24 @@
 # Paire d'intentions canary non signante — conception #51-H2k
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.1.0
 
-**Version de la spécification parente :** 1.12.0
+**Version de la spécification parente :** 1.12.1
 
-**Version de la spécification canary :** 1.3.0
+**Version de la spécification canary :** 1.3.1
 
-**Date :** 2026-09-05
+**Date :** 2026-09-06
 
-**Statut :** APPROUVÉE
+**Statut :** H2k-a LIVRÉE — H2k-b À LIVRER
 
 **Issue parente :** #51
+
+## Historique des versions
+
+- **1.1.0 — 2026-09-06 :** constate H2k-a disponible après merge avec la
+  migration 041, l'émission atomique target/probe, les fences de claim et de
+  promotion, ainsi que l'expiration et la purge coordonnée après quatre
+  heures. Le flag reste faux et H2k-b reste à livrer.
+- **1.0.0 — 2026-09-05 :** approuve la conception H2k en deux PR.
 
 ## 1. But
 
@@ -22,8 +30,8 @@ simulation Mainnet non signée utilise une seconde intention, liée durablement
 Le lot est divisé en deux PR séquentielles, chacune fusionnable et sûre avec
 son flag désactivé :
 
-- **H2k-a** crée le contrat de paire, son émission atomique et les fences de
-  persistance ;
+- **H2k-a**, désormais disponible, crée le contrat de paire, son émission
+  atomique et les fences de persistance ;
 - **H2k-b** ajoute la commande one-shot qui évalue la cible et simule seulement
   le sibling avant de produire le handoff H2h.
 
@@ -102,10 +110,12 @@ Les identifiants sont respectivement préfixés
 de `statement_timestamp()` PostgreSQL, `expires_at` est strictement celui de
 la cible et `purge_after = expires_at + interval '4 hours'`.
 
-Un rejeu exact commence par relire la paire sous verrou et valide seulement
-son identité immutable, même si le probe a depuis été simulé. Le chemin de
-création, et lui seul, réexige les deux parents pristine. Une collision
-divergente échoue fermée.
+Un rejeu exact relit la paire immutable et valide seulement son identité, même
+si le probe a depuis été simulé. Il ne demande pas de verrou d'écriture : la
+paire ne peut être modifiée et son guard de purge interdit sa disparition tant
+que la cible n'est pas terminale et réconciliée. Une disparition concurrente
+est donc un rejet fermé. Le chemin de création, et lui seul, réexige les deux
+parents pristine. Une collision divergente échoue fermée.
 
 ## 5. Persistance H2k-a
 
@@ -117,6 +127,11 @@ La migration 041 crée `execution_preflight_intent_pairs` avec au minimum :
 - `target_intent_id` et `simulation_intent_id` distincts ;
 - `decision_event_id` et `decision_fingerprint` ;
 - `created_at`, `expires_at`, `purge_after`.
+
+Après chaque `CREATE TABLE IF NOT EXISTS`, la migration audite la forme
+effective des colonnes, clés, uniques, FK `RESTRICT`, checks et triggers. Un
+objet homonyme préexistant incomplet fait échouer le replay ; il n'est jamais
+accepté comme équivalent.
 
 Les deux références pointent vers `execution_intents` avec `ON DELETE
 RESTRICT`. Une table de membership normalisée porte `UNIQUE(intent_id)` et une
@@ -165,9 +180,11 @@ Le cycle productif de rétention expire d'abord, par lots bornés et transitions
 journalisées existantes, toute cible ou probe dont `expires_at` est dépassé et
 dont la lease est absente ou échue. Une paire jamais préparée, une préparation
 échouée ou un crash ne peut donc laisser deux `PENDING` immortels. La purge
-attend ensuite quatre heures après le terminal le plus récent des deux parents,
-supprime leurs enfants, memberships et paire dans l'ordre compatible avec les
-FK, écrit les tombstones d'intentions puis supprime les parents.
+attend que la paire ait dépassé `expires_at + 4 hours` et que chaque parent
+terminal et réconcilié ait dépassé son propre `purge_after`, soit quatre heures
+après sa terminalisation. Elle supprime ensuite leurs enfants, memberships et
+paire dans l'ordre compatible avec les FK, écrit les tombstones d'intentions,
+puis supprime les parents.
 
 Le rôle H2j est considéré compromis possible : ses droits SQL non-live peuvent
 encore provoquer un déni de service en terminalisant directement une cible.
@@ -289,7 +306,7 @@ Les erreurs publiques restent typées et redacted.
 
 ## 12. Tests d'acceptation
 
-H2k-a doit prouver :
+H2k-a prouve :
 
 - migration vide, upgrade 040 vers 041, rejeu et hash catalogue ;
 - identité déterministe, collision divergente et unicité 1:1 ;
