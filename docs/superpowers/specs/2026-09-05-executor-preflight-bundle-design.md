@@ -1,8 +1,8 @@
 # Paquet d'attestations du préflight canary — conception #51-H2f
 
-**Version de spécification :** 1.0.2
+**Version de spécification :** 1.0.3
 
-**Version de la spécification parente :** 1.11.12
+**Version de la spécification parente :** 1.11.13
 
 **Date :** 2026-09-05
 
@@ -13,6 +13,9 @@
 **Dépendances :** #51-H2c, #51-H2d et #51-H2e
 
 ## Historique des versions
+
+- **1.0.3 — 2026-09-05 :** désigne H2g comme producteur offline strict du
+  draft d'entrée et maintient H2f limité à sa validation et sa signature.
 
 - **1.0.2 — 2026-09-05 :** ferme les trois constats du dernier cycle de revue :
   fraîcheur dérivée de la policy, rollback après échec du `fsync` parent et

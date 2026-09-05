@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.12
+**Version de spécification :** 1.11.13
 
 **Date :** 2026-08-31
 
@@ -11,10 +11,14 @@
 **Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes
 #51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b,
 préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
-#51-H2d, producteur externe de quota Helius #51-H2e et paquet d'attestations
-hors ligne #51-H2f
+#51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations
+hors ligne #51-H2f et assemblage offline du draft #51-H2g
 
 ## Historique des versions
+
+- **1.11.13 — 2026-09-05 :** ajoute H2g, assembleur offline strict du draft
+  H2f depuis un export canonique et huit preuves statiques, sans DB, RPC,
+  clé, armement ni soumission.
 
 - **1.11.12 — 2026-09-05 :** ajoute H2f, producteur hors ligne des deux
   enveloppes H2c lié au manifeste H2d et publié atomiquement, sans collecte de

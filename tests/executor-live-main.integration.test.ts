@@ -72,10 +72,14 @@ const preflightBundleSpecificationUrl = new URL(
   '../docs/superpowers/specs/2026-09-05-executor-preflight-bundle-design.md',
   import.meta.url,
 );
+const preflightDraftSpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-09-05-executor-preflight-draft-design.md',
+  import.meta.url,
+);
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 
-void test('documents H2d-H2f external evidence without starting a canary',
+void test('documents H2d-H2g external evidence without starting a canary',
   async () => {
   const [
     packageText,
@@ -88,6 +92,7 @@ void test('documents H2d-H2f external evidence without starting a canary',
     readinessSpecification,
     providerEvidenceSpecification,
     preflightBundleSpecification,
+    preflightDraftSpecification,
     runbook,
     deploymentSmoke,
   ] =
@@ -102,6 +107,7 @@ void test('documents H2d-H2f external evidence without starting a canary',
       readFile(readinessSpecificationUrl, 'utf8'),
       readFile(providerEvidenceSpecificationUrl, 'utf8'),
       readFile(preflightBundleSpecificationUrl, 'utf8'),
+      readFile(preflightDraftSpecificationUrl, 'utf8'),
       readFile(runbookUrl, 'utf8'),
       readFile(deploymentSmokeUrl, 'utf8'),
     ]);
@@ -125,9 +131,13 @@ void test('documents H2d-H2f external evidence without starting a canary',
     packageJson.scripts?.['executor:preflight-bundle:start'],
     'node dist/src/preflight-bundle/main.js',
   );
+  assert.equal(
+    packageJson.scripts?.['executor:preflight-draft:start'],
+    'node dist/src/preflight-draft/main.js',
+  );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.12',
+    '**Version de spécification :** 1.11.13',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -135,18 +145,18 @@ void test('documents H2d-H2f external evidence without starting a canary',
     '**Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes\n'
       + '#51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b,\n'
       + 'préparation opérateur exacte #51-H2c, bootstrap de readiness non signable\n'
-      + "#51-H2d, producteur externe de quota Helius #51-H2e et paquet d'attestations\n"
-      + 'hors ligne #51-H2f',
+      + "#51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations\n"
+      + 'hors ligne #51-H2f et assemblage offline du draft #51-H2g',
     'parent delivered scope',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.11',
+    '**Version de spécification :** 1.2.12',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.12',
+    '**Version de la spécification parente :** 1.11.13',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -201,7 +211,7 @@ void test('documents H2d-H2f external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     operatorCanarySpecification,
-    '**Version de spécification :** 1.1.5',
+    '**Version de spécification :** 1.1.6',
     'operator canary specification version',
   );
   assertContainsExactlyOnce(
@@ -211,38 +221,48 @@ void test('documents H2d-H2f external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.8.1 — 2026-09-05',
+    '**Version :** 1.9.0 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
     readinessSpecification,
-    '**Version de spécification :** 1.0.10',
+    '**Version de spécification :** 1.0.11',
     'readiness specification version',
   );
   assertContainsExactlyOnce(
     readinessSpecification,
-    '**Version de la spécification parente :** 1.11.12',
+    '**Version de la spécification parente :** 1.11.13',
     'readiness parent specification version',
   );
   assertContainsExactlyOnce(
     providerEvidenceSpecification,
-    '**Version de spécification :** 1.0.5',
+    '**Version de spécification :** 1.0.6',
     'provider evidence specification version',
   );
   assertContainsExactlyOnce(
     providerEvidenceSpecification,
-    '**Version de la spécification parente :** 1.11.12',
+    '**Version de la spécification parente :** 1.11.13',
     'provider evidence parent specification version',
   );
   assertContainsExactlyOnce(
     preflightBundleSpecification,
-    '**Version de spécification :** 1.0.2',
+    '**Version de spécification :** 1.0.3',
     'preflight bundle specification version',
   );
   assertContainsExactlyOnce(
     preflightBundleSpecification,
-    '**Version de la spécification parente :** 1.11.12',
+    '**Version de la spécification parente :** 1.11.13',
     'preflight bundle parent specification version',
+  );
+  assertContainsExactlyOnce(
+    preflightDraftSpecification,
+    '**Version de spécification :** 1.0.0',
+    'preflight draft specification version',
+  );
+  assertContainsExactlyOnce(
+    preflightDraftSpecification,
+    '**Version de la spécification parente :** 1.11.13',
+    'preflight draft parent specification version',
   );
   assert.match(runbook, /generateKeyPairSync\('ed25519'\)[\s\S]*flag: 'wx'[\s\S]*mode: 0o600/u);
   assert.doesNotMatch(runbook, /openssl genpkey/iu);

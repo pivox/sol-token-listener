@@ -81,6 +81,27 @@ void test('source and compiled Helius evidence graphs cannot reach a Solana wall
   }
 });
 
+void test('source and compiled H2g draft graphs remain offline, non-signing and non-persistent', async () => {
+  for (const entry of [
+    resolve(repositoryRoot, 'src/preflight-draft/main.ts'),
+    resolve(repositoryRoot, 'dist/src/preflight-draft/main.js'),
+  ]) {
+    await access(entry);
+    const graph = await readGraph(entry);
+    assert.ok(graph.size >= 6,
+      `preflight draft graph unexpectedly small: ${relative(repositoryRoot, entry)}`);
+    assert.deepEqual(
+      [...graph.keys()].filter((path) => /\/(?:executor-live|executor-operations|executor-simulation|infrastructure)\//u.test(path)),
+      [],
+    );
+    for (const [path, source] of graph) {
+      assert.doesNotMatch(source,
+        /\b(?:Keypair|sendRawTransaction|sendTransaction|simulateTransaction|signMessage)\b|\b(?:pg|postgresql):/u,
+        `transactional capability in ${relative(repositoryRoot, path)}`);
+    }
+  }
+});
+
 void test('source and compiled dry-run worker graphs stay inside the strict dry-run allowlist', async () => {
   const entries = [
     resolve(repositoryRoot, 'src/executor/dry-run-worker.ts'),
