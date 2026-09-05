@@ -117,7 +117,7 @@ void test('documents H2d readiness and H2e provider evidence without starting a 
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.9',
+    '**Version de spécification :** 1.11.10',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -130,12 +130,12 @@ void test('documents H2d readiness and H2e provider evidence without starting a 
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.8',
+    '**Version de spécification :** 1.2.9',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.9',
+    '**Version de la spécification parente :** 1.11.10',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -200,29 +200,31 @@ void test('documents H2d readiness and H2e provider evidence without starting a 
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.7.0 — 2026-09-05',
+    '**Version :** 1.7.1 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
     readinessSpecification,
-    '**Version de spécification :** 1.0.7',
+    '**Version de spécification :** 1.0.8',
     'readiness specification version',
   );
   assertContainsExactlyOnce(
     readinessSpecification,
-    '**Version de la spécification parente :** 1.11.9',
+    '**Version de la spécification parente :** 1.11.10',
     'readiness parent specification version',
   );
   assertContainsExactlyOnce(
     providerEvidenceSpecification,
-    '**Version de spécification :** 1.0.2',
+    '**Version de spécification :** 1.0.3',
     'provider evidence specification version',
   );
   assertContainsExactlyOnce(
     providerEvidenceSpecification,
-    '**Version de la spécification parente :** 1.11.9',
+    '**Version de la spécification parente :** 1.11.10',
     'provider evidence parent specification version',
   );
+  assert.match(runbook, /generateKeyPairSync\('ed25519'\)[\s\S]*flag: 'wx'[\s\S]*mode: 0o600/u);
+  assert.doesNotMatch(runbook, /openssl genpkey/iu);
 
   assertContainsExactlyOnce(
     signableSpecification,

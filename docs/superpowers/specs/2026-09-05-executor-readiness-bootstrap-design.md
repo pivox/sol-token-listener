@@ -1,8 +1,8 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.7
+**Version de spécification :** 1.0.8
 
-**Version de la spécification parente :** 1.11.9
+**Version de la spécification parente :** 1.11.10
 
 **Date :** 2026-09-05
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.8 — 2026-09-05 :** référence la procédure portable Node.js 22 de
+  génération de la clé d'attestation externe H2e.
 
 - **1.0.7 — 2026-09-05 :** exige une preuve H2e encore fraîche après écriture
   avant de démarrer la collecte H2d.

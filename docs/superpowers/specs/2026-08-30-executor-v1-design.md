@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.9
+**Version de spécification :** 1.11.10
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,9 @@ préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
 #51-H2d et producteur externe de quota Helius #51-H2e
 
 ## Historique des versions
+
+- **1.11.10 — 2026-09-05 :** rend la génération de clé d'attestation H2e
+  exécutable avec le runtime Node.js 22 supporté, sans écrasement possible.
 
 - **1.11.9 — 2026-09-05 :** revérifie la fraîcheur H2e aux frontières de
   signature et d'écriture avant de publier le manifeste de succès.

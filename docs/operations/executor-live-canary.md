@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.7.0 — 2026-09-05
+**Version :** 1.7.1 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -76,12 +76,20 @@ clé d'attestation Ed25519 dédiée et la future enveloppe. La clé d'attestatio
 n'est pas une clé Solana. Les deux entrées doivent appartenir au compte courant
 et avoir un mode exact `0400` ou `0600`.
 
-La clé Ed25519 peut être créée hors dépôt avec OpenSSL :
+La clé Ed25519 peut être créée hors dépôt avec Node.js 22, déjà requis par le
+projet. La création exclusive refuse d'écraser une clé existante :
 
 ```bash
-umask 077
-openssl genpkey -algorithm ED25519 \
-  -out /chemin/hors-git/provider-attestation-key.pem
+node --input-type=module -e "
+  import { generateKeyPairSync } from 'node:crypto';
+  import { writeFileSync } from 'node:fs';
+  const { privateKey } = generateKeyPairSync('ed25519');
+  writeFileSync(
+    '/chemin/hors-git/provider-attestation-key.pem',
+    privateKey.export({ format: 'pem', type: 'pkcs8' }),
+    { flag: 'wx', mode: 0o600 },
+  );
+"
 chmod 0600 /chemin/hors-git/provider-attestation-key.pem
 chmod 0600 /chemin/hors-git/helius-api-key
 ```
