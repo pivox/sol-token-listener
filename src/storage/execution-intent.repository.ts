@@ -1348,7 +1348,9 @@ async function lockAttemptLedger(
          AND intent.lease_expires_at > statement_timestamp()
        FOR UPDATE
      ), locked_attempts AS MATERIALIZED (
-       SELECT attempt.*
+       SELECT attempt.intent_id,attempt.attempt_number,attempt.status,
+         attempt.effective_venue,attempt.provider_id,attempt.started_at,
+         attempt.completed_at,attempt.reason_code,attempt.purge_after
        FROM execution_attempts AS attempt
        JOIN fenced_intent ON fenced_intent.id=attempt.intent_id
        FOR UPDATE OF attempt
