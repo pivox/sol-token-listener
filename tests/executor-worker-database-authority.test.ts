@@ -182,6 +182,204 @@ void test('worker provisioning declares the exact non-signing column allowlist',
   ]) assert.match(ownershipGuard, ownershipCatalog);
 });
 
+void test('PostgreSQL 16 provisioning replay revokes a renamed stale worker authority',
+  async (context) => {
+    const configuredUrl = process.env.TEST_EXECUTOR_ROLE_DATABASE_URL;
+    if (configuredUrl === undefined || configuredUrl.trim() === '') {
+      context.skip('TEST_EXECUTOR_ROLE_DATABASE_URL is required for the disposable role cluster.');
+      return;
+    }
+    const baseUrl = new URL(configuredUrl);
+    const maintenance = new pg.Pool({ connectionString: baseUrl.href });
+    const suffix = randomUUID().replaceAll('-', '');
+    const databaseName = `h2j_stale_${suffix}`;
+    const loginName = `h2j_stale_login_${suffix}`;
+    const staleRoleName = `h2j_stale_worker_${suffix}`;
+    const password = randomUUID().replaceAll('-', '');
+    const isolatedUrl = new URL(baseUrl);
+    isolatedUrl.pathname = `/${databaseName}`;
+    let isolated: InstanceType<typeof pg.Pool> | undefined;
+    let workerPool: InstanceType<typeof pg.Pool> | undefined;
+    let activeWorker: pg.PoolClient | undefined;
+    let databaseCreated = false;
+    let loginCreated = false;
+    let workerRenamed = false;
+    let release: (() => Promise<void>) | undefined;
+    let bodyFailure: unknown;
+    try {
+      const capability = (await maintenance.query<{
+        readonly rolsuper: boolean;
+        readonly rolcreatedb: boolean;
+        readonly server_version_number: number;
+      }>(`SELECT rolsuper,rolcreatedb,
+        current_setting('server_version_num')::INTEGER AS server_version_number
+        FROM pg_roles WHERE rolname=current_user`)).rows[0];
+      if (!capability?.rolsuper || !capability.rolcreatedb
+        || capability.server_version_number < 160_000
+        || capability.server_version_number >= 170_000) {
+        context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
+      } else {
+        release = await acquireExecutorRoleTestLock(maintenance);
+        await maintenance.query(
+          `CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`,
+        );
+        databaseCreated = true;
+        isolated = new pg.Pool({ connectionString: isolatedUrl.href, max: 3 });
+        await migrateDatabase({ pool: isolated });
+        const provisioningSql = await readFile(scriptUrl, 'utf8');
+        await isolated.query(provisioningSql);
+
+        await maintenance.query(`CREATE ROLE ${quoteIdentifier(loginName)} LOGIN NOINHERIT
+          NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+          PASSWORD ${quoteLiteral(password)}`);
+        loginCreated = true;
+        await maintenance.query(`GRANT ${WORKER_ROLE} TO ${quoteIdentifier(loginName)}
+          WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
+        const workerUrl = new URL(isolatedUrl);
+        workerUrl.username = loginName;
+        workerUrl.password = password;
+        workerUrl.searchParams.set(
+          'options',
+          `-c role=${WORKER_ROLE} -c search_path=pg_catalog,public`,
+        );
+        workerPool = new pg.Pool({ connectionString: workerUrl.href, max: 1 });
+        activeWorker = await workerPool.connect();
+
+        const nonLiveId = `execution_intent_${'7'.repeat(64)}`;
+        const liveId = `execution_intent_${'8'.repeat(64)}`;
+        await insertPartitionIntent(isolated, nonLiveId, 'stale-non-live', false);
+        await insertPartitionIntent(isolated, liveId, 'stale-live', true);
+        const staleOid = (await isolated.query<{ readonly oid: string }>(
+          'SELECT oid::TEXT AS oid FROM pg_roles WHERE rolname=$1', [WORKER_ROLE],
+        )).rows[0]?.oid;
+        assert.ok(staleOid !== undefined);
+        assert.deepEqual((await activeWorker.query<{
+          readonly session_user: string;
+          readonly current_user: string;
+        }>('SELECT session_user,current_user')).rows, [{
+          session_user: loginName, current_user: WORKER_ROLE,
+        }]);
+        assert.equal((await isolated.query<{ readonly count: string }>(
+          `SELECT COUNT(*)::TEXT AS count FROM pg_policy policy
+            WHERE $1::OID=ANY(policy.polroles)
+              AND policy.polname LIKE 'execution%worker_partition'`, [staleOid],
+        )).rows[0]?.count, String(WORKER_EXECUTION_TABLES.length));
+
+        await maintenance.query(
+          `ALTER ROLE ${WORKER_ROLE} RENAME TO ${quoteIdentifier(staleRoleName)}`,
+        );
+        workerRenamed = true;
+        assert.deepEqual((await activeWorker.query<{
+          readonly current_user: string;
+          readonly configured_role: string;
+        }>(`SELECT current_user,current_setting('role') AS configured_role`)).rows, [{
+          current_user: staleRoleName, configured_role: WORKER_ROLE,
+        }]);
+
+        await isolated.query(provisioningSql);
+        const replacementOid = (await isolated.query<{ readonly oid: string }>(
+          'SELECT oid::TEXT AS oid FROM pg_roles WHERE rolname=$1', [WORKER_ROLE],
+        )).rows[0]?.oid;
+        assert.ok(replacementOid !== undefined);
+        assert.notEqual(replacementOid, staleOid);
+
+        let liveReadFailure: unknown;
+        let liveWriteFailure: unknown;
+        try {
+          await activeWorker.query('SELECT id FROM execution_intents WHERE id=$1', [liveId]);
+        } catch (error) {
+          liveReadFailure = error;
+        }
+        try {
+          await activeWorker.query(`UPDATE execution_intents SET
+            status='FAILED',state_revision=1,last_reason_code='BUY_SIMULATION_FAILED',
+            terminal_at=date_trunc('milliseconds',statement_timestamp()),
+            updated_at=date_trunc('milliseconds',statement_timestamp()) WHERE id=$1`, [liveId]);
+        } catch (error) {
+          liveWriteFailure = error;
+        }
+        assert.match(String(liveReadFailure), /permission denied/iu,
+          'the active stale SET ROLE session must lose live read authority on replay');
+        assert.match(String(liveWriteFailure), /permission denied/iu,
+          'the active stale SET ROLE session must lose live write authority on replay');
+
+        const staleAuthority = (await isolated.query<{
+          readonly membership_count: string;
+          readonly column_acl_count: string;
+          readonly policy_count: string;
+        }>(`SELECT
+            (SELECT COUNT(*)::TEXT FROM pg_auth_members
+              WHERE roleid=$1::OID OR member=$1::OID) AS membership_count,
+            (SELECT COUNT(*)::TEXT FROM pg_attribute attribute
+              CROSS JOIN LATERAL aclexplode(attribute.attacl) acl
+              WHERE acl.grantee=$1::OID) AS column_acl_count,
+            (SELECT COUNT(*)::TEXT FROM pg_policy policy
+              WHERE $1::OID=ANY(policy.polroles)) AS policy_count`, [staleOid])).rows[0];
+        assert.deepEqual(staleAuthority, {
+          membership_count: '0', column_acl_count: '0', policy_count: '0',
+        });
+        assert.equal((await isolated.query<{ readonly count: string }>(
+          `SELECT COUNT(*)::TEXT AS count FROM pg_policy policy
+            WHERE $1::OID=ANY(policy.polroles)
+              AND policy.polname LIKE 'execution%worker_partition'`, [replacementOid],
+        )).rows[0]?.count, String(WORKER_EXECUTION_TABLES.length));
+      }
+    } catch (error) {
+      bodyFailure = error;
+    }
+    const cleanupFailures = await collectCleanupFailures([
+      () => { if (activeWorker !== undefined) activeWorker.release(); },
+      async () => { if (workerPool !== undefined) await workerPool.end(); },
+      async () => { if (isolated !== undefined) await isolated.end(); },
+      async () => {
+        if (databaseCreated) {
+          await maintenance.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+            WHERE datname=$1 AND pid<>pg_backend_pid()`, [databaseName]);
+          await maintenance.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)}`);
+        }
+      },
+      async () => {
+        if (loginCreated && workerRenamed) {
+          await maintenance.query(
+            `REVOKE ${quoteIdentifier(staleRoleName)} FROM ${quoteIdentifier(loginName)}`,
+          );
+        }
+      },
+      async () => {
+        if (loginCreated) {
+          await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
+        }
+      },
+      async () => {
+        if (workerRenamed) {
+          const replacementExists = (await maintenance.query<{ readonly present: boolean }>(
+            'SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1) AS present', [WORKER_ROLE],
+          )).rows[0]?.present;
+          if (replacementExists) await maintenance.query(`DROP ROLE ${WORKER_ROLE}`);
+        }
+      },
+      async () => {
+        if (workerRenamed) {
+          await maintenance.query(
+            `ALTER ROLE ${quoteIdentifier(staleRoleName)} RENAME TO ${WORKER_ROLE}`,
+          );
+        }
+      },
+      async () => { if (release !== undefined) await release(); },
+      async () => maintenance.end(),
+    ]);
+    if (bodyFailure !== undefined) {
+      throw new AggregateError(
+        [bodyFailure, ...cleanupFailures],
+        'Stale worker replay test failed.',
+        { cause: bodyFailure },
+      );
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(cleanupFailures, 'Stale worker replay cleanup failed.');
+    }
+  });
+
 void test('PostgreSQL 16 worker login has only the effective simulation authority',
   async (context) => {
     const configuredUrl = process.env.TEST_EXECUTOR_ROLE_DATABASE_URL;
