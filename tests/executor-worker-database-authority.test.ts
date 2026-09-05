@@ -317,6 +317,7 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       await isolated.query('GRANT SELECT ON TABLE execution_wallet_generations TO PUBLIC');
       await isolated.query(`GRANT SELECT (signed_transaction_bytes)
         ON TABLE execution_signed_transactions TO PUBLIC`);
+      await isolated.query('GRANT SELECT ON TABLE migrations,market_pools TO PUBLIC');
       await isolated.query(`GRANT USAGE,UPDATE ON SEQUENCE
         execution_intent_transitions_sequence_seq TO PUBLIC`);
       await isolated.query(`GRANT USAGE,SELECT,UPDATE ON SEQUENCE
@@ -374,6 +375,25 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
         parent_count: '0', login_membership_count: '1', login_inherit: false,
       }]);
 
+      assert.deepEqual((await worker.query<{
+        readonly migration_event_id: boolean;
+        readonly migration_payload: boolean;
+        readonly pool_activation_event_id: boolean;
+        readonly pool_payload: boolean;
+      }>(`SELECT
+          has_column_privilege(current_user,'migrations','event_id','SELECT')
+            AS migration_event_id,
+          has_column_privilege(current_user,'migrations','payload','SELECT')
+            AS migration_payload,
+          has_column_privilege(current_user,'market_pools','activation_event_id','SELECT')
+            AS pool_activation_event_id,
+          has_column_privilege(current_user,'market_pools','payload','SELECT') AS pool_payload`,
+      )).rows, [{
+        migration_event_id: false,
+        migration_payload: false,
+        pool_activation_event_id: false,
+        pool_payload: false,
+      }]);
       await assertExactColumnAuthority(isolated);
       await assertDynamicExecutionInventory(isolated);
       await assertClosedObjectAuthority(worker, privateSchema, isolated);
