@@ -60,10 +60,14 @@ const operatorCanarySpecificationUrl = new URL(
   '../docs/superpowers/specs/2026-09-04-executor-live-operator-canary-design.md',
   import.meta.url,
 );
+const readinessSpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-09-05-executor-readiness-bootstrap-design.md',
+  import.meta.url,
+);
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 
-void test('documents H2c as ready for external preflight without starting a canary',
+void test('documents H2d readiness evidence without starting a canary',
   async () => {
   const [
     packageText,
@@ -73,6 +77,7 @@ void test('documents H2c as ready for external preflight without starting a cana
     recoverySpecification,
     signableSpecification,
     operatorCanarySpecification,
+    readinessSpecification,
     runbook,
     deploymentSmoke,
   ] =
@@ -84,6 +89,7 @@ void test('documents H2c as ready for external preflight without starting a cana
       readFile(recoverySpecificationUrl, 'utf8'),
       readFile(signableSpecificationUrl, 'utf8'),
       readFile(operatorCanarySpecificationUrl, 'utf8'),
+      readFile(readinessSpecificationUrl, 'utf8'),
       readFile(runbookUrl, 'utf8'),
       readFile(deploymentSmokeUrl, 'utf8'),
     ]);
@@ -101,24 +107,25 @@ void test('documents H2c as ready for external preflight without starting a cana
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.4',
+    '**Version de spécification :** 1.11.6',
     'parent specification version',
   );
   assertContainsExactlyOnce(
     parentSpecification,
     '**Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes\n'
-      + '#51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b\n'
-      + 'et préparation opérateur exacte #51-H2c',
+      + '#51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b,\n'
+      + 'préparation opérateur exacte #51-H2c et bootstrap de readiness non signable\n'
+      + '#51-H2d',
     'parent delivered scope',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.4',
+    '**Version de spécification :** 1.2.6',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.4',
+    '**Version de la spécification parente :** 1.11.6',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -183,8 +190,18 @@ void test('documents H2c as ready for external preflight without starting a cana
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.5.4 — 2026-09-05',
+    '**Version :** 1.6.0 — 2026-09-05',
     'runbook version',
+  );
+  assertContainsExactlyOnce(
+    readinessSpecification,
+    '**Version de spécification :** 1.0.2',
+    'readiness specification version',
+  );
+  assertContainsExactlyOnce(
+    readinessSpecification,
+    '**Version de la spécification parente :** 1.11.6',
+    'readiness parent specification version',
   );
 
   assertContainsExactlyOnce(

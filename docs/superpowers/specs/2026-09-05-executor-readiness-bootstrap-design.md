@@ -1,6 +1,6 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.1
+**Version de spécification :** 1.0.2
 
 **Version de la spécification parente :** 1.11.6
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.2 — 2026-09-05 :** précise la fermeture des enveloppes JSON-RPC et
+  des trois preuves imbriquées avant toute connexion PostgreSQL.
 
 - **1.0.1 — 2026-09-05 :** aligne la supersession sur la contrainte de
   rétention existante : `superseded_at` et son `purge_after` exact à quatre
@@ -118,8 +121,11 @@ Le transport RPC H2d possède uniquement :
 - `getBalance` du wallet au même commitment ;
 - `getTokenAccountsByOwner` pour SPL Token puis Token-2022.
 
-Chaque appel possède un timeout, une réponse maximale et un schéma fermé. Le
-genesis renvoyé doit égaler `SOLANA_EXPECTED_GENESIS_HASH`, préalablement
+Chaque appel possède un timeout, une réponse maximale et un schéma fermé.
+L'enveloppe de réponse contient exactement `jsonrpc`, l'identifiant numérique
+égal à celui de la requête, et `result` ; tout champ supplémentaire, erreur ou
+identifiant divergent est refusé. Le genesis renvoyé doit égaler
+`SOLANA_EXPECTED_GENESIS_HASH`, préalablement
 approuvé par l'opérateur. Le snapshot est rejeté si les slots de contexte des
 lectures financières divergent de plus de
 `EXECUTOR_READINESS_MAX_SLOT_LAG`, entier borné à 0–8.
@@ -155,7 +161,9 @@ sont des `bigint` décimaux non négatifs. La signature est vérifiée avant tou
 écriture. H2d ne contient aucun générateur de cette enveloppe et n'accepte pas
 un JSON non signé.
 
-Le repository conserve le comportement existant : rejeu exact idempotent,
+Le repository refuse également tout champ supplémentaire dans la génération,
+le snapshot wallet ou le snapshot provider avant d'ouvrir une connexion. Il
+conserve le comportement existant : rejeu exact idempotent,
 supersession du snapshot précédent sous verrou provider et conflit sur toute
 divergence.
 

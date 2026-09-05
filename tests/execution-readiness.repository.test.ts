@@ -61,6 +61,31 @@ void test('rolls back every readiness projection when the provider insert fails'
   });
 });
 
+void test('rejects additional nested readiness evidence fields before connecting', async () => {
+  let connectionAttempted = false;
+  const pool: ExecutionRiskPool = {
+    async connect() {
+      connectionAttempted = true;
+      throw new Error('must not connect');
+    },
+  };
+  const repository = new PostgresExecutionReadinessRepository(pool);
+  const input = commitInput();
+  const generationWithExtra = Object.freeze({ ...input.generation, unexpected: true });
+  await assert.rejects(
+    repository.commit(Object.freeze({ ...input, generation: generationWithExtra }) as never),
+    (error: unknown) => error instanceof ExecutionReadinessRepositoryError
+      && error.code === 'INVALID_INPUT',
+  );
+  const providerWithExtra = Object.freeze({ ...input.providerSnapshot, unexpected: true });
+  await assert.rejects(
+    repository.commit(Object.freeze({ ...input, providerSnapshot: providerWithExtra }) as never),
+    (error: unknown) => error instanceof ExecutionReadinessRepositoryError
+      && error.code === 'INVALID_INPUT',
+  );
+  assert.equal(connectionAttempted, false);
+});
+
 function commitInput() {
   const generation = createExecutionWalletGeneration(Object.freeze({
     walletPublicKey: WALLET, cluster: 'mainnet-beta' as const,

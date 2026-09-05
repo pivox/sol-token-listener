@@ -9,8 +9,8 @@ import {
 const GENESIS = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
 const WALLET = '2LvenbX1TdhX8EbxGBmcZYiXuZFN4utA8QZY1UgGXwmZ';
 
-function response(result: unknown, status = 200): Response {
-  return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), {
+function response(result: unknown, status = 200, id = 1): Response {
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id, result }), {
     status, headers: { 'content-type': 'application/json' },
   });
 }
@@ -28,8 +28,9 @@ void test('collects balance and both token programs at finalized commitment only
   const fetchMock: typeof fetch = async (_url, init) => {
     const body = init?.body;
     if (typeof body !== 'string') throw new TypeError('Expected string request body.');
-    requests.push(JSON.parse(body) as Readonly<Record<string, unknown>>);
-    return response(results.shift());
+    const request = JSON.parse(body) as Readonly<Record<string, unknown>>;
+    requests.push(request);
+    return response(results.shift(), 200, request.id as number);
   };
   const gateway = new SolanaReadinessRpcGateway({
     providerId: 'primary', httpRpcUrl: 'https://mainnet.example.invalid/rpc',
@@ -79,8 +80,29 @@ void test('fails closed on genesis mismatch, rate limit, oversized body and slot
     { context: { slot: 109 }, value: [] }];
   const lagged = new SolanaReadinessRpcGateway({ providerId: 'primary',
     httpRpcUrl: 'https://mainnet.example.invalid', expectedGenesisHash: GENESIS,
-    timeoutMs: 100 }, async () => response(results.shift()));
+    timeoutMs: 100 }, async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as Readonly<Record<string, unknown>>;
+      return response(results.shift(), 200, request.id as number);
+    });
   await lagged.verifyGenesis(signal);
   await assert.rejects(lagged.observeWallet(WALLET, 8, signal),
     (error: unknown) => error instanceof ReadinessRpcError && error.code === 'SLOT_LAG_EXCEEDED');
+});
+
+void test('rejects non-canonical JSON-RPC envelopes and mismatched response ids', async () => {
+  const config = { providerId: 'primary', httpRpcUrl: 'https://mainnet.example.invalid',
+    expectedGenesisHash: GENESIS, timeoutMs: 100 } as const;
+  const signal = new AbortController().signal;
+  const unexpectedField = new SolanaReadinessRpcGateway(config,
+    async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: GENESIS,
+      unexpected: true })));
+  await assert.rejects(unexpectedField.verifyGenesis(signal),
+    (error: unknown) => error instanceof ReadinessRpcError
+      && error.code === 'RPC_RESPONSE_INVALID');
+
+  const mismatchedId = new SolanaReadinessRpcGateway(config,
+    async () => response(GENESIS, 200, 2));
+  await assert.rejects(mismatchedId.verifyGenesis(signal),
+    (error: unknown) => error instanceof ReadinessRpcError
+      && error.code === 'RPC_RESPONSE_INVALID');
 });

@@ -14,6 +14,14 @@ import {
 } from './execution-risk.repository.js';
 
 const COMMIT_KEYS = Object.freeze(['generation', 'walletSnapshot', 'providerSnapshot'] as const);
+const GENERATION_KEYS = Object.freeze([
+  'generationId', 'payloadVersion', 'walletPublicKey', 'cluster', 'genesisHash', 'generation',
+] as const);
+const PROVIDER_SNAPSHOT_KEYS = Object.freeze([
+  'snapshotId', 'payloadVersion', 'snapshotFingerprint', 'providerId', 'planId',
+  'billingPeriodId', 'billingPeriodStartedAtMs', 'billingPeriodEndsAtMs',
+  'limitUnits', 'usedUnits', 'measuredAtMs', 'expiresAtMs', 'provenance',
+] as const);
 
 export type ExecutionReadinessRepositoryErrorCode =
   | 'INVALID_INPUT'
@@ -132,14 +140,15 @@ function validatedCommit(input: unknown): ExecutionReadinessCommitV1 {
   const row = exactFrozenRecord(input, COMMIT_KEYS);
   if (!Object.isFrozen(row.generation) || !Object.isFrozen(row.walletSnapshot)
     || !Object.isFrozen(row.providerSnapshot)) throw failure('INVALID_INPUT');
-  const generationRaw = row.generation as ExecutionReadinessCommitV1['generation'];
+  const generationRecord = exactFrozenRecord(row.generation, GENERATION_KEYS);
+  const generationRaw = generationRecord as unknown as ExecutionReadinessCommitV1['generation'];
   const generation = createExecutionWalletGeneration(Object.freeze({
     walletPublicKey: generationRaw.walletPublicKey,
     cluster: generationRaw.cluster,
     genesisHash: generationRaw.genesisHash,
     generation: generationRaw.generation,
   }));
-  if (!hasPayloadVersionOne(row.generation)
+  if (generationRecord.payloadVersion !== 1
     || generationRaw.generationId !== generation.generationId) {
     throw failure('INVALID_INPUT');
   }
@@ -148,7 +157,8 @@ function validatedCommit(input: unknown): ExecutionReadinessCommitV1 {
   if (walletSnapshot.generationId !== generation.generationId
     || walletSnapshot.stateRevision !== 0n || walletSnapshot.openPositions.length !== 0
     || walletSnapshot.realizedNetPnlRaw !== 0n) throw failure('INVALID_INPUT');
-  const providerRaw = row.providerSnapshot as ExecutionReadinessCommitV1['providerSnapshot'];
+  const providerRecord = exactFrozenRecord(row.providerSnapshot, PROVIDER_SNAPSHOT_KEYS);
+  const providerRaw = providerRecord as unknown as ExecutionReadinessCommitV1['providerSnapshot'];
   const providerSnapshot = createProviderUsageSnapshot(Object.freeze({
     providerId: providerRaw.providerId, planId: providerRaw.planId,
     billingPeriodId: providerRaw.billingPeriodId,
@@ -170,6 +180,8 @@ function exactFrozenRecord<const Keys extends readonly string[]>(
 ): Readonly<Record<Keys[number], unknown>> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)
     || isProxy(value) || !Object.isFrozen(value)) throw failure('INVALID_INPUT');
+  const prototype = Reflect.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw failure('INVALID_INPUT');
   const own = Reflect.ownKeys(value);
   if (own.length !== keys.length
     || own.some((key) => typeof key !== 'string' || !keys.includes(key))) {
@@ -182,11 +194,6 @@ function exactFrozenRecord<const Keys extends readonly string[]>(
     result[key] = descriptor.value;
   }
   return result as Readonly<Record<Keys[number], unknown>>;
-}
-
-function hasPayloadVersionOne(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null) return false;
-  return Object.getOwnPropertyDescriptor(value, 'payloadVersion')?.value === 1;
 }
 
 function failure(code: ExecutionReadinessRepositoryErrorCode): ExecutionReadinessRepositoryError {

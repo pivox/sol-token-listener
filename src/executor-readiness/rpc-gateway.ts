@@ -46,7 +46,7 @@ export class SolanaReadinessRpcGateway {
 
   public constructor(config: SolanaReadinessRpcConfig, fetchImplementation: typeof fetch = fetch) {
     try {
-      if (!Object.isFrozen(config) && isProxy(config)) throw new TypeError();
+      if (isProxy(config)) throw new TypeError();
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u.test(config.providerId)) throw new TypeError();
       const url = new URL(config.httpRpcUrl);
       if (url.protocol !== 'https:' || url.username.length > 0 || url.password.length > 0) {
@@ -165,7 +165,10 @@ export class SolanaReadinessRpcGateway {
       const envelope = JSON.parse(text) as unknown;
       if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) throw new Error();
       const record = envelope as Record<string, unknown>;
-      if (record.jsonrpc !== '2.0' || 'error' in record || !('result' in record)) throw new Error();
+      const keys = Reflect.ownKeys(record);
+      if (keys.length !== 3 || keys.some((key) => typeof key !== 'string'
+        || !['jsonrpc', 'id', 'result'].includes(key))
+        || record.jsonrpc !== '2.0' || record.id !== requestId) throw new Error();
       return record.result;
     } catch {
       throw failure('RPC_RESPONSE_INVALID');
@@ -231,4 +234,3 @@ function timestampMilliseconds(value: unknown): number {
 function failure(code: ReadinessRpcErrorCode): ReadinessRpcError {
   return new ReadinessRpcError(code);
 }
-
