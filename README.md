@@ -57,6 +57,24 @@ les gates, l'armement exact et le lock durable pré-signature dans l'état
 [runbook canary #51-G](docs/operations/executor-live-canary.md) décrit les
 frontières et l'état non activé.
 
+### Bootstrap de readiness non signant (#51-H2d)
+
+`npm run executor:readiness:start` est un processus Mainnet one-shot séparé.
+Il vérifie le genesis, lit au commitment `finalized` le solde public du wallet
+et le nombre de comptes SPL Token/Token-2022, vérifie une preuve de quota
+fournisseur Ed25519 produite hors dépôt, puis commit atomiquement la génération
+wallet et les deux snapshots. Il affiche un manifeste
+`execution-readiness-bootstrap.v1` redacted avec l'état
+`READINESS_EVIDENCE_COLLECTED` et `CANARY_NOT_STARTED`.
+
+Cette commande exige un environnement minimal distinct et un login PostgreSQL
+16 membre uniquement de `sol_token_executor_readiness`. Elle refuse tout nom
+de variable de keypair, clé privée, phrase de récupération ou activation live,
+même vide. Elle ne lit pas le wallet, ne construit, ne simule et ne soumet
+aucune transaction ; son manifeste n'est ni une qualification H2c ni un
+armement. La procédure exacte est dans le
+[runbook du canary](docs/operations/executor-live-canary.md).
+
 Configuration minimale de la stratégie de création, toujours simulée :
 
 ```dotenv

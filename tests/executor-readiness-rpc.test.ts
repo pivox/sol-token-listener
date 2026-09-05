@@ -16,7 +16,7 @@ function response(result: unknown, status = 200): Response {
 }
 
 void test('collects balance and both token programs at finalized commitment only', async () => {
-  const requests: Array<Readonly<Record<string, unknown>>> = [];
+  const requests: Readonly<Record<string, unknown>>[] = [];
   const results = [
     GENESIS,
     401_000_000,
@@ -26,7 +26,9 @@ void test('collects balance and both token programs at finalized commitment only
     { context: { slot: 401_000_003 }, value: [{ pubkey: WALLET }, { pubkey: WALLET }] },
   ];
   const fetchMock: typeof fetch = async (_url, init) => {
-    requests.push(JSON.parse(String(init?.body)) as Readonly<Record<string, unknown>>);
+    const body = init?.body;
+    if (typeof body !== 'string') throw new TypeError('Expected string request body.');
+    requests.push(JSON.parse(body) as Readonly<Record<string, unknown>>);
     return response(results.shift());
   };
   const gateway = new SolanaReadinessRpcGateway({
@@ -82,4 +84,3 @@ void test('fails closed on genesis mismatch, rate limit, oversized body and slot
   await assert.rejects(lagged.observeWallet(WALLET, 8, signal),
     (error: unknown) => error instanceof ReadinessRpcError && error.code === 'SLOT_LAG_EXCEEDED');
 });
-

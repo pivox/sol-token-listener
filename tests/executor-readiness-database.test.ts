@@ -9,6 +9,7 @@ import {
   EXECUTION_READINESS_AUTHORITY_SQL,
   ExecutionReadinessDatabaseError,
 } from '../src/executor-readiness/database.js';
+import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 void test('pins and validates the readiness role on every checkout', async () => {
   const queries: string[] = [];
@@ -79,6 +80,7 @@ void test('PostgreSQL 16 login has exact readiness authority and no live authori
   const login = `readiness_${suffix}`;
   const password = randomUUID().replaceAll('-', '');
   let loginPool: InstanceType<typeof pg.Pool> | undefined;
+  const releaseRoleLock = await acquireExecutorRoleTestLock(admin);
   try {
     const server = await admin.query<{ server_version_number: number }>(
       "SELECT current_setting('server_version_num')::INTEGER AS server_version_number",
@@ -116,9 +118,12 @@ void test('PostgreSQL 16 login has exact readiness authority and no live authori
       client.release();
     }
   } finally {
-    if (loginPool !== undefined) await loginPool.end();
-    await admin.query(`DROP ROLE IF EXISTS "${login}"`);
-    await admin.end();
+    try {
+      if (loginPool !== undefined) await loginPool.end();
+      await admin.query(`DROP ROLE IF EXISTS "${login}"`);
+    } finally {
+      try { await releaseRoleLock(); } finally { await admin.end(); }
+    }
   }
 });
 

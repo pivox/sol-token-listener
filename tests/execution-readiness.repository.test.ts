@@ -11,6 +11,7 @@ import {
 } from '../src/storage/execution-readiness.repository.js';
 import type { ExecutionRiskPool } from '../src/storage/execution-risk.repository.js';
 import { migrateDatabase } from '../src/storage/database.js';
+import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const WALLET = '2LvenbX1TdhX8EbxGBmcZYiXuZFN4utA8QZY1UgGXwmZ';
 const GENESIS = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
@@ -42,12 +43,12 @@ void test('rolls back every readiness projection when the provider insert fails'
         const client = await pool.connect();
         return {
           query: async (text, values) => {
-            if (/INSERT INTO execution_provider_usage_snapshots/u.test(text)) {
+            if (text.includes('INSERT INTO execution_provider_usage_snapshots')) {
               throw new Error('injected');
             }
             return client.query(text, values === undefined ? undefined : [...values]);
           },
-          release: (error) => client.release(error),
+          release: (error) => { client.release(error); },
         };
       },
     };
@@ -98,14 +99,17 @@ async function withSchema(
   const admin = new pg.Pool({ connectionString: databaseUrlValue });
   const pool = new pg.Pool({ connectionString: databaseUrlValue,
     options: `-c search_path=${schema}` });
+  const releaseRoleLock = await acquireExecutorRoleTestLock(admin);
   try {
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await migrateDatabase({ pool });
     await callback(pool);
   } finally {
-    await pool.end();
-    await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
-    await admin.end();
+    try {
+      await pool.end();
+      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } finally {
+      try { await releaseRoleLock(); } finally { await admin.end(); }
+    }
   }
 }
-

@@ -88,7 +88,7 @@ async function persistGeneration(
   if (result.rows.length > 1) throw failure('CONFLICT');
   if (result.rows.length === 1) {
     const row = result.rows[0];
-    if (row === undefined || row.generation_id !== generation.generationId
+    if (row?.generation_id !== generation.generationId
       || row.payload_version !== 1 || row.wallet_public_key !== generation.walletPublicKey
       || row.cluster !== generation.cluster || row.genesis_hash !== generation.genesisHash
       || row.generation !== generation.generation || row.retired_at !== null) {
@@ -119,7 +119,7 @@ async function validateInitialRiskState(
     consecutive_technical_failures,last_technical_failure_reason_code,unknown_block
     FROM execution_wallet_risk_state WHERE generation_id=$1 FOR UPDATE`, [generationId]);
   const row = result.rows.length === 1 ? result.rows[0] : undefined;
-  if (row === undefined || row.state_revision !== '0'
+  if (row?.state_revision !== '0'
     || row.reconciled_capital_lamports !== '0' || row.reserved_exposure_raw !== '0'
     || row.open_positions !== 0 || row.conservative_drawdown_raw !== '0'
     || row.consecutive_technical_failures !== 0
@@ -139,7 +139,8 @@ function validatedCommit(input: unknown): ExecutionReadinessCommitV1 {
     genesisHash: generationRaw.genesisHash,
     generation: generationRaw.generation,
   }));
-  if (generationRaw.payloadVersion !== 1 || generationRaw.generationId !== generation.generationId) {
+  if (!hasPayloadVersionOne(row.generation)
+    || generationRaw.generationId !== generation.generationId) {
     throw failure('INVALID_INPUT');
   }
   assertExecutionWalletSnapshot(row.walletSnapshot);
@@ -181,6 +182,11 @@ function exactFrozenRecord<const Keys extends readonly string[]>(
     result[key] = descriptor.value;
   }
   return result as Readonly<Record<Keys[number], unknown>>;
+}
+
+function hasPayloadVersionOne(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  return Object.getOwnPropertyDescriptor(value, 'payloadVersion')?.value === 1;
 }
 
 function failure(code: ExecutionReadinessRepositoryErrorCode): ExecutionReadinessRepositoryError {

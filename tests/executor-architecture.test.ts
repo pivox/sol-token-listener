@@ -39,6 +39,27 @@ void test('source and compiled operations graphs remain inert and non-signing', 
   }
 });
 
+void test('source and compiled readiness graphs stay read-only and outside live paths', async () => {
+  for (const entry of [
+    resolve(repositoryRoot, 'src/executor-readiness/main.ts'),
+    resolve(repositoryRoot, 'dist/src/executor-readiness/main.js'),
+  ]) {
+    await access(entry);
+    const graph = await readGraph(entry);
+    assert.ok(graph.size >= 8,
+      `readiness graph unexpectedly small: ${relative(repositoryRoot, entry)}`);
+    assert.deepEqual(
+      [...graph.keys()].filter((path) => /\/executor-(?:live|operations|simulation)\//u.test(path)),
+      [],
+    );
+    for (const [path, source] of graph) {
+      assert.doesNotMatch(source,
+        /\b(?:Keypair|sendRawTransaction|sendTransaction|simulateTransaction|signMessage)\b/u,
+        `signable capability in ${relative(repositoryRoot, path)}`);
+    }
+  }
+});
+
 void test('source and compiled dry-run worker graphs stay inside the strict dry-run allowlist', async () => {
   const entries = [
     resolve(repositoryRoot, 'src/executor/dry-run-worker.ts'),

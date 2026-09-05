@@ -1,8 +1,8 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.0
+**Version de spécification :** 1.0.1
 
-**Version de la spécification parente :** 1.11.5
+**Version de la spécification parente :** 1.11.6
 
 **Date :** 2026-09-05
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.1 — 2026-09-05 :** aligne la supersession sur la contrainte de
+  rétention existante : `superseded_at` et son `purge_after` exact à quatre
+  heures sont les deux seules colonnes mutables des snapshots.
 
 - **1.0.0 — 2026-09-05 :** définit le processus one-shot non signable qui
   enregistre la génération wallet, collecte un snapshot wallet finalisé,
@@ -204,8 +208,8 @@ NOBYPASSRLS`. Un login de déploiement PostgreSQL 16 :
   risque courant, les positions ouvertes et les snapshots publics ciblés ;
 - insère uniquement génération, état risque initial, snapshots wallet et
   provider ;
-- met uniquement `superseded_at` sur l'ancien snapshot provider sous le verrou
-  existant.
+- met uniquement `superseded_at` et le `purge_after` exact à quatre heures sur
+  l'ancien snapshot wallet/provider sous les verrous existants.
 
 Il ne peut lire ou modifier aucune intention, qualification, autorisation,
 armement, lock pré-signature, bytes signés, preuve de soumission ou contrôle
@@ -286,4 +290,3 @@ manifeste. Le producteur d'attestation externe lie ensuite ces identités aux
 onze gates H2c et au sidecar de l'unique intention BUY paper. Le dernier
 checkpoint humain reste obligatoire avant toute conversion temporaire du
 wallet au format H2b, chargement du signer, `live:resume` ou armement.
-

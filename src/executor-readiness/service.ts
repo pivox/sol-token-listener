@@ -47,11 +47,7 @@ export function createExecutionReadinessService(
   dependencies: ExecutionReadinessServiceDependencies,
 ): ExecutionReadinessService {
   try {
-    if (typeof dependencies !== 'object' || dependencies === null || isProxy(dependencies)
-      || typeof dependencies.readEvidence !== 'function' || typeof dependencies.now !== 'function'
-      || typeof dependencies.rpc?.verifyGenesis !== 'function'
-      || typeof dependencies.rpc.observeWallet !== 'function'
-      || typeof dependencies.repository?.commit !== 'function') throw new TypeError();
+    if (isProxy(dependencies)) throw new TypeError();
   } catch {
     throw invalid();
   }
@@ -137,4 +133,3 @@ function timestamp(value: unknown): number {
 function invalid(): ExecutionReadinessServiceError {
   return new ExecutionReadinessServiceError();
 }
-

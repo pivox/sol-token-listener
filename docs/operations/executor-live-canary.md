@@ -1,13 +1,14 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.5.4 — 2026-09-05
+**Version :** 1.6.0 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
 signature ni soumission. #51-H2b publie séparément
 `executor:live:dev` et `executor:live:start`. #51-H2c ajoute les gates, un
 armement V2 lié à une intention BUY exacte, le lock durable avant signature et
-sa récupération fail-closed. Cette livraison prépare un préflight externe sans
+sa récupération fail-closed. #51-H2d ajoute le bootstrap non signant des
+snapshots wallet/provider. Cette livraison prépare un préflight externe sans
 armer ni démarrer un canary.
 
 La validation paper Mainnet #49 reste `NON_EXECUTED / NON_VALIDATED`. Les
@@ -44,10 +45,13 @@ npm run executor:live:start
 Elles ne sont pas une procédure d'armement. La procédure H2c ci-dessous reste
 séquentielle, interactive et sans commande englobante.
 
-## Frontières des trois environnements
+## Frontières des quatre environnements
 
-Créer trois fichiers hors Git, lisibles seulement par leur compte de service :
+Créer quatre fichiers hors Git, lisibles seulement par leur compte de service :
 
+- readiness H2d : login membre uniquement de
+  `sol_token_executor_readiness`, endpoint HTTP Mainnet qualifié, adresse
+  publique et preuve provider signée ; aucun nom de variable live ou secret ;
 - opérations : login membre uniquement de `sol_token_executor_operations`,
   `LIVE_TRADING_ENABLED=false`, aucun nom de variable keypair et aucun RPC ;
 - H2a : login membre uniquement de `sol_token_executor_live_recovery`, aucun
@@ -64,21 +68,61 @@ checkout. Le rôle opérations ne peut ni lire les bytes signés ou non signés,
 ni armer des champs runtime arbitraires, ni modifier les intents ; H2a,
 listener et API ne gagnent aucune autorité H2c.
 
+## Collecter les preuves publiques H2d
+
+Créer un environnement dédié hors Git contenant exactement les variables
+publiques et credentials d'infrastructure nécessaires :
+
+```dotenv
+DATABASE_URL=postgresql://<login-readiness-dedie>:...@<postgres16>/<database>
+SOLANA_CLUSTER=mainnet-beta
+SOLANA_HTTP_RPC_URL=https://<endpoint-mainnet-qualifie>
+SOLANA_EXPECTED_GENESIS_HASH=<genesis-mainnet-verifie-independamment>
+EXECUTOR_RPC_PROVIDER_ID=primary
+EXECUTOR_PUBLIC_KEY=<adresse-publique-base58>
+EXECUTOR_WALLET_GENERATION_NUMBER=1
+EXECUTOR_EVIDENCE_PUBLIC_KEY_BASE64=<cle-publique-ed25519-spki-der-base64>
+EXECUTOR_PROVIDER_EVIDENCE_PATH=/chemin/absolu/hors-git/provider-evidence.json
+EXECUTOR_READINESS_MAX_SLOT_LAG=8
+EXECUTOR_RPC_TIMEOUT_MS=5000
+```
+
+Le fichier ne doit contenir aucun nom `EXECUTOR_MODE`,
+`LIVE_TRADING_ENABLED`, keypair, clé privée, mnemonic ou recovery phrase,
+même avec une valeur vide. Après migrations 001–039, rejouer deux fois le
+provisioning, créer un login `NOINHERIT` sans autorité directe et lui accorder
+uniquement `sol_token_executor_readiness` avec
+`ADMIN FALSE, INHERIT FALSE, SET TRUE`. Lancer ensuite :
+
+```bash
+npm run build:backend
+DOTENV_CONFIG_PATH=/chemin/hors-git/readiness.env \
+  npm run executor:readiness:start
+```
+
+Conserver le manifeste redacted. Le succès signifie uniquement
+`READINESS_EVIDENCE_COLLECTED / CANARY_NOT_STARTED`. La commande n'accepte ni
+wallet secret ni signer et ne lance jamais `live:preflight`, `live:resume`,
+`live:arm`, H2a ou H2b. Les snapshots remplacés deviennent purgeables après
+quatre heures ; la génération active et les preuves référencées sont gardées.
+
 ## Procédure H2c manuelle, avec arrêt après chaque étape
 
-1. Démarrer le listener sans keypair en `EXECUTION_MODE=paper` avec
+1. Exécuter H2d, auditer son manifeste et transmettre ses identités exactes au
+   producteur externe de qualification et de sidecar H2c.
+2. Démarrer le listener sans keypair en `EXECUTION_MODE=paper` avec
    `EXECUTION_INTENT_EMISSION_ENABLED=true`. Cette émission temporaire utilise
    le producteur normal ; ne jamais fabriquer une cible par SQL.
-2. Sélectionner une seule intention BUY `PENDING`, WSOL, non louée, dont la
+3. Sélectionner une seule intention BUY `PENDING`, WSOL, non louée, dont la
    décision et la révision sont connues. Noter son `intentId`, son mint et son
    montant entier. Arrêter le listener ou remettre l'émission à `false`, puis
    vérifier qu'aucune nouvelle intention n'apparaît.
-3. Construire et auditer le build exact. Produire hors dépôt une qualification
+4. Construire et auditer le build exact. Produire hors dépôt une qualification
    Ed25519 fraîche puis un sidecar canary V1 signé qui lie l'intention, les onze
    gates, les snapshots wallet/provider, le genesis, le build, la stratégie,
    la configuration et les limites runtime. H2c ne fournit pas la clé de
    signature de preuve.
-4. Depuis l'environnement opérations, exécuter séparément :
+5. Depuis l'environnement opérations, exécuter séparément :
 
    ```bash
    DOTENV_CONFIG_PATH=/chemin/hors-git/operations.env npm run live:preflight
@@ -87,9 +131,9 @@ listener et API ne gagnent aucune autorité H2c.
 
    Le résultat attendu à ce point reste `ENTRY_STOP`, sans armement actif.
    Vérifier manuellement tous les fingerprints et les expirations.
-5. Exécuter `live:resume` dans un vrai TTY, recopier exactement la phrase
+6. Exécuter `live:resume` dans un vrai TTY, recopier exactement la phrase
    affichée, puis relire `live:status`. Cette étape n'arme aucune intention.
-6. Renseigner temporairement `EXECUTOR_CANARY_EVIDENCE_PATH` dans
+7. Renseigner temporairement `EXECUTOR_CANARY_EVIDENCE_PATH` dans
    `operations.env`, puis armer la seule cible avec des entiers audités :
 
    ```bash
@@ -105,15 +149,15 @@ listener et API ne gagnent aucune autorité H2c.
    `live:arm` exige un TTY et fait afficher la cible complète, les limites, les
    fingerprints et un nonce. La réservation d'exposition et l'armement V2 sont
    atomiques ; tout écart laisse zéro capacité live.
-7. Seulement après inspection humaine de l'armement, démarrer H2a avec son
+8. Seulement après inspection humaine de l'armement, démarrer H2a avec son
    environnement dédié, puis H2b avec le sien. Le démarrage H2b valide rôle,
    migration 039, génération, genesis, les huit limites runtime exactes et
    absence d'état incohérent avant de charger le signer. Il ne doit traiter
    que la cible armée, y compris après redémarrage sur un artefact persisté.
-8. Surveiller continuellement les sorties structurées H2a/H2b et les commandes
+9. Surveiller continuellement les sorties structurées H2a/H2b et les commandes
    `live:status`/`live:report`. Toute dérive, lock pré-signature abandonné,
    expiration, échec de gate ou ambiguïté impose au minimum `ENTRY_STOP`.
-9. Après fermeture ou incident, appliquer `ENTRY_STOP`, arrêter H2b, laisser
+10. Après fermeture ou incident, appliquer `ENTRY_STOP`, arrêter H2b, laisser
    H2a finaliser/réconcilier, puis collecter les preuves et relire les états.
    Un état inconnu n'autorise jamais un nouvel armement.
 
