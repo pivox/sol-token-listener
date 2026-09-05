@@ -13,6 +13,7 @@ import {
 } from '../src/storage/execution-live.repository.js';
 
 const migrationName = '039_execution_canary_operator_binding.sql';
+const latestMigrationName = '040_execution_worker_live_partition.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 
 void test('migration 039 defines V2 armament bindings and pre-signature locks', async () => {
@@ -73,7 +74,7 @@ void test('migration 039 applies to an empty schema and replays cleanly', async 
   if (databaseUrl === null) return;
   await withTemporarySchema(databaseUrl, async (pool) => {
     const applied = await migrateDatabase({ pool });
-    assert.equal(applied.at(-1), migrationName);
+    assert.equal(applied.at(-1), latestMigrationName);
     assert.deepEqual(await migrateDatabase({ pool }), []);
     await pool.query(await readFile(migrationUrl, 'utf8'));
     const tables = await pool.query<{ readonly table_name: string }>(`
