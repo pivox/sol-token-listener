@@ -685,6 +685,13 @@ $worker_ownership_guard$;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO sol_token_executor_worker;
 
+-- Trigger functions fire without direct EXECUTE authority. Reset both the
+-- inherited PUBLIC capability and any stale worker-specific grant.
+REVOKE ALL PRIVILEGES ON FUNCTION
+  execution_intents_live_reserved_monotone_guard(),
+  execution_worker_child_parent_guard()
+FROM PUBLIC,sol_token_executor_worker;
+
 GRANT SELECT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
   logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
@@ -692,7 +699,7 @@ GRANT SELECT (
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
   last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
-  purge_after
+  purge_after,live_reserved
 ), UPDATE (
   status,attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
   last_reason_code,terminal_at,reconciliation_completed_at,updated_at,purge_after
@@ -880,12 +887,12 @@ GRANT SELECT (
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
   last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
-  purge_after
+  purge_after,live_reserved
 ), INSERT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
   logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
-  decision_event_id,decision_fingerprint,requested_at,expires_at,status
+  decision_event_id,decision_fingerprint,requested_at,expires_at,status,live_reserved
 ), UPDATE (
   status,state_revision,last_reason_code,lease_owner,lease_token,
   lease_expires_at,terminal_at,reconciliation_completed_at,purge_after,updated_at
@@ -1440,7 +1447,7 @@ GRANT SELECT (
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
   last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
-  purge_after
+  purge_after,live_reserved
 ), UPDATE (
   status,state_revision,attempt_count,last_reason_code,lease_owner,lease_token,
   lease_expires_at,terminal_at,reconciliation_completed_at,purge_after,updated_at
@@ -1815,7 +1822,9 @@ GRANT SELECT (
   quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,attempt_count,
   state_revision,last_reason_code,terminal_at,reconciliation_completed_at,purge_after,
-  created_at,updated_at,lease_owner,lease_token,lease_expires_at
+  created_at,updated_at,lease_owner,lease_token,lease_expires_at,live_reserved
+), UPDATE (
+  live_reserved
 )
 ON TABLE execution_intents TO sol_token_executor_operations;
 
