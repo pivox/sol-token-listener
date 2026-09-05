@@ -45,7 +45,7 @@ void test('creates an immutable pair through the caller transaction client', asy
   ]);
 });
 
-void test('replays only the exact durable pair identity', async () => {
+void test('refuses to pair a newly created target with any pre-existing sibling', async () => {
   const target = targetDraft();
   const pair = createExecutionPreflightIntentPairDraft(target);
   const client = new ScriptedClient([
@@ -56,20 +56,12 @@ void test('replays only the exact durable pair identity', async () => {
     result([pairRow(pair)], 1),
   ]);
 
-  const outcome = await createExecutionPreflightIntentPairInTransaction(client, target);
-
-  assert.equal(outcome.kind, 'REPLAYED');
-  assert.deepEqual(outcome.pair, pair);
-  assert.equal(client.calls.length, 5);
-  const replay = required(client.calls[4]);
-  assert.match(replay.text, /pair\.pair_id\s*=\s*\$1/u);
-  assert.match(replay.text, /pair\.target_intent_id\s*=\s*\$2/u);
-  assert.match(replay.text, /pair\.simulation_intent_id\s*=\s*\$3/u);
-  assert.deepEqual(replay.values, [
-    pair.pairId,
-    pair.targetIntentId,
-    pair.simulationIntent.id,
-  ]);
+  await assert.rejects(
+    createExecutionPreflightIntentPairInTransaction(client, target),
+    (error: unknown) => error instanceof ExecutionPreflightIntentPairRepositoryError
+      && error.code === 'PAIR_DUPLICATE',
+  );
+  assert.equal(client.calls.length, 3);
 });
 
 void test('rejects collisions and contradictory database results with a fixed typed error', async () => {

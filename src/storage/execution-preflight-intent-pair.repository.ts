@@ -52,7 +52,8 @@ export async function createExecutionPreflightIntentPairInTransaction(
 }>> {
   const draft = createExecutionPreflightIntentPairDraft(targetDraft);
   try {
-    await createExecutionIntentInTransaction(client, draft.simulationIntent);
+    const sibling = await createExecutionIntentInTransaction(client, draft.simulationIntent);
+    if (sibling.kind !== 'CREATED') throw duplicateError();
     const inserted = await client.query(
       `INSERT INTO execution_preflight_intent_pairs AS pair (
          pair_id,payload_version,pair_fingerprint,target_intent_id,
