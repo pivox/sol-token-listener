@@ -203,21 +203,6 @@ void test('compiled non-signing executors run under the isolated worker login', 
     return;
   }
   const maintenance = new pg.Pool({ connectionString: executorRoleDatabaseUrl });
-  const capability = (await maintenance.query<{
-    readonly rolsuper: boolean;
-    readonly rolcreatedb: boolean;
-    readonly server_version_number: number;
-  }>(`SELECT rolsuper,rolcreatedb,
-      current_setting('server_version_num')::INTEGER AS server_version_number
-    FROM pg_roles WHERE rolname=current_user`)).rows[0];
-  if (!capability?.rolsuper || !capability.rolcreatedb
-    || capability.server_version_number < 160_000
-    || capability.server_version_number >= 170_000) {
-    await maintenance.end();
-    context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
-    return;
-  }
-  const releaseRoleLock = await acquireExecutorRoleTestLock(maintenance);
   const suffix = randomUUID().replaceAll('-', '');
   const databaseName = `executor_worker_main_${suffix}`;
   const loginName = `executor_worker_login_${suffix}`;
@@ -231,9 +216,23 @@ void test('compiled non-signing executors run under the isolated worker login', 
   let rpc: Awaited<ReturnType<typeof startScriptedPumpFunBuyRpc>> | undefined;
   let databaseCreated = false;
   let loginCreated = false;
+  let releaseRoleLock: (() => Promise<void>) | undefined;
   let bodyFailed = false;
   let bodyFailure: unknown;
   try {
+    const capability = (await maintenance.query<{
+      readonly rolsuper: boolean;
+      readonly rolcreatedb: boolean;
+      readonly server_version_number: number;
+    }>(`SELECT rolsuper,rolcreatedb,
+        current_setting('server_version_num')::INTEGER AS server_version_number
+      FROM pg_roles WHERE rolname=current_user`)).rows[0];
+    if (!capability?.rolsuper || !capability.rolcreatedb
+      || capability.server_version_number < 160_000
+      || capability.server_version_number >= 170_000) {
+      context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
+    } else {
+      releaseRoleLock = await acquireExecutorRoleTestLock(maintenance);
     await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
     databaseCreated = true;
     isolated = new pg.Pool({ connectionString: isolatedUrl.href });
@@ -300,6 +299,7 @@ void test('compiled non-signing executors run under the isolated worker login', 
     assert.equal(rpc.methods.includes('sendTransaction'), false);
     assert.equal(rpc.methods.includes('sendRawTransaction'), false);
     assert.equal(rpc.simulatedTransactionWasUnsigned(), true);
+    }
   } catch (error) {
     bodyFailed = true;
     bodyFailure = error;
@@ -325,7 +325,7 @@ void test('compiled non-signing executors run under the isolated worker login', 
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
       }
     },
-    releaseRoleLock,
+    async () => { if (releaseRoleLock !== undefined) await releaseRoleLock(); },
     async () => maintenance.end(),
   ]);
   throwWithCleanupFailures(bodyFailed, bodyFailure, cleanupFailures);

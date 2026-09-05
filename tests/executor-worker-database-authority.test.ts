@@ -190,21 +190,6 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
     }
     const baseUrl = new URL(configuredUrl);
     const maintenance = new pg.Pool({ connectionString: baseUrl.href });
-    const capability = (await maintenance.query<{
-      readonly rolsuper: boolean;
-      readonly rolcreatedb: boolean;
-      readonly server_version_number: number;
-    }>(`SELECT rolsuper,rolcreatedb,
-      current_setting('server_version_num')::INTEGER AS server_version_number
-      FROM pg_roles WHERE rolname=current_user`)).rows[0];
-    if (!capability?.rolsuper || !capability.rolcreatedb
-      || capability.server_version_number < 160_000
-      || capability.server_version_number >= 170_000) {
-      await maintenance.end();
-      context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
-      return;
-    }
-    const release = await acquireExecutorRoleTestLock(maintenance);
     const suffix = randomUUID().replaceAll('-', '');
     const databaseName = `h2j_worker_${suffix}`;
     const loginName = `h2j_login_${suffix}`;
@@ -220,9 +205,23 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
     let databaseCreated = false;
     let loginCreated = false;
     let ownedDriftCreated = false;
+    let release: (() => Promise<void>) | undefined;
     let bodyFailed = false;
     let bodyFailure: unknown;
     try {
+      const capability = (await maintenance.query<{
+        readonly rolsuper: boolean;
+        readonly rolcreatedb: boolean;
+        readonly server_version_number: number;
+      }>(`SELECT rolsuper,rolcreatedb,
+        current_setting('server_version_num')::INTEGER AS server_version_number
+        FROM pg_roles WHERE rolname=current_user`)).rows[0];
+      if (!capability?.rolsuper || !capability.rolcreatedb
+        || capability.server_version_number < 160_000
+        || capability.server_version_number >= 170_000) {
+        context.skip('PostgreSQL 16 superuser with CREATEDB is required.');
+      } else {
+        release = await acquireExecutorRoleTestLock(maintenance);
       await maintenance.query(`CREATE ROLE ${quoteIdentifier(parentName)} NOLOGIN NOINHERIT
         NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`);
       parentCreated = true;
@@ -414,6 +413,7 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
         isolated.query(provisioningSql),
         /Worker role owns database objects/u,
       );
+      }
     } catch (error) {
       bodyFailed = true;
       bodyFailure = error;
@@ -454,7 +454,7 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
           await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(parentName)}`);
         }
       },
-      release,
+      async () => { if (release !== undefined) await release(); },
       async () => maintenance.end(),
     ]);
     throwWithCleanupFailures(bodyFailed, bodyFailure, cleanupFailures);
