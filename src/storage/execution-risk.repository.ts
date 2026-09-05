@@ -649,7 +649,6 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       if (row.generation !== evidence.walletGeneration
         || row.intent_side !== evidence.side
         || row.provider_id !== evidence.providerId
-        || row.wallet_snapshot_fingerprint !== evidence.snapshotFingerprint
         || row.reconciliation_signature !== evidence.signature
         || row.reconciliation_blockhash !== evidence.blockhash
         || row.reconciliation_last_valid_block_height

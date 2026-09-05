@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createPublicKey, verify } from 'node:crypto';
 import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
 import { PublicKey, VersionedTransaction } from '@solana/web3.js';
@@ -20,6 +20,53 @@ export function assertCanonicalUnsignedV0Transaction(input: Readonly<{
     || !Buffer.from(transaction.message.serialize()).equals(Buffer.from(input.messageBytes))) {
     throw new TypeError('Invalid unsigned Solana V0 transaction.');
   }
+}
+
+export interface CanonicalUnsignedV0TransactionV1 {
+  readonly messageBytes: readonly number[];
+  readonly transactionBytes: readonly number[];
+  readonly transactionHash: string;
+}
+
+/**
+ * Verifies one canonical wallet-signed V0 envelope and reconstructs the exact
+ * zero-signature envelope that had to be authorized before signing.
+ */
+export function reconstructCanonicalUnsignedV0Transaction(
+  artifact: SignedTransactionArtifactV1,
+): CanonicalUnsignedV0TransactionV1 {
+  const signedBytes = Uint8Array.from(artifact.signedTransactionBytes);
+  const transaction = VersionedTransaction.deserialize(signedBytes);
+  const messageBytes = transaction.message.serialize();
+  const signature = transaction.signatures[0];
+  const wallet = new PublicKey(artifact.walletPublicKey);
+  const verificationKey = createPublicKey({
+    key: Buffer.concat([
+      Buffer.from('302a300506032b6570032100', 'hex'),
+      wallet.toBytes(),
+    ]),
+    format: 'der',
+    type: 'spki',
+  });
+  if (transaction.version !== 0
+    || transaction.signatures.length !== 1
+    || transaction.message.header.numRequiredSignatures !== 1
+    || transaction.message.addressTableLookups.length !== 0
+    || transaction.message.staticAccountKeys[0]?.toBase58() !== artifact.walletPublicKey
+    || transaction.message.recentBlockhash !== artifact.blockhash
+    || !Buffer.from(transaction.serialize()).equals(Buffer.from(signedBytes))
+    || createHash('sha256').update(messageBytes).digest('hex') !== artifact.messageHash
+    || signature?.length !== 64
+    || bs58.encode(signature) !== artifact.signature
+    || !verify(null, messageBytes, verificationKey, signature)) {
+    throw new TypeError('Invalid signed Solana V0 transaction.');
+  }
+  const unsigned = new VersionedTransaction(transaction.message).serialize();
+  return Object.freeze({
+    messageBytes: Object.freeze([...messageBytes]),
+    transactionBytes: Object.freeze([...unsigned]),
+    transactionHash: createHash('sha256').update(unsigned).digest('hex'),
+  });
 }
 
 export const EXECUTION_LIVE_REASON_CODES = Object.freeze([

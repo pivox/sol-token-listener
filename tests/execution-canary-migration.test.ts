@@ -50,6 +50,10 @@ void test('migration 039 defines V2 armament bindings and pre-signature locks', 
   assert.match(sql, /runtime_lease_ms BETWEEN 3000 AND 120000/u);
   assert.match(sql, /execution_pre_signature_locks_recovery_idx/u);
   assert.match(sql, /execution_pre_signature_locks_purge_idx/u);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS pre_signature_lock_id TEXT/u);
+  assert.match(sql, /execution_signed_transactions_pre_signature_lock_fkey/u);
+  assert.match(sql, /BUY signed transaction requires exact authorized pre-signature lock/u);
+  assert.match(sql, /signed pre-signature lock requires exact persisted BUY artifact/u);
   assert.match(sql, /state='AUTHORIZED' AND state_revision=0/u);
   assert.match(sql, /state IN \('SIGNED_PERSISTED','REVOKED'\) AND state_revision=1/u);
   assert.match(sql, /payload_version=2/u);
@@ -92,6 +96,17 @@ void test('migration 039 applies to an empty schema and replays cleanly', async 
         AND conname='execution_pre_signature_locks_state_check'`);
     assert.match(lockConstraint.rows[0]?.definition ?? '', /state_revision = 0/u);
     assert.match(lockConstraint.rows[0]?.definition ?? '', /state_revision = 1/u);
+    const artifactLockColumn = await pool.query<{ readonly is_nullable: string }>(`
+      SELECT is_nullable FROM information_schema.columns
+      WHERE table_schema=current_schema() AND table_name='execution_signed_transactions'
+        AND column_name='pre_signature_lock_id'`);
+    assert.equal(artifactLockColumn.rows[0]?.is_nullable, 'YES');
+    const artifactLockForeignKey = await pool.query<{ readonly definition: string }>(`
+      SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+      WHERE conrelid='execution_signed_transactions'::regclass
+        AND conname='execution_signed_transactions_pre_signature_lock_fkey'`);
+    assert.match(artifactLockForeignKey.rows[0]?.definition ?? '',
+      /FOREIGN KEY \(pre_signature_lock_id\).*execution_pre_signature_locks\(lock_id\)/u);
   });
 });
 

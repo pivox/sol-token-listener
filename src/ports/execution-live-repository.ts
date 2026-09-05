@@ -41,7 +41,7 @@ export interface ExecutionLivePersistSignedInputV1 {
   readonly payloadVersion: 1;
   readonly claim: ClaimedExecutionIntent;
   /** Exact pre-signature authorization; null for a SELL exit. */
-  readonly preSignatureLockId?: string | null;
+  readonly preSignatureLockId: string | null;
   readonly qualificationId: string;
   readonly reservationId: string | null;
   readonly artifact: SignedTransactionArtifactV1;

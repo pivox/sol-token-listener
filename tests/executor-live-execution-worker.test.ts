@@ -1284,6 +1284,7 @@ function workerFixture() {
     input: Object.freeze({
       persist: Object.freeze({
         payloadVersion: 1 as const, claim,
+        preSignatureLockId: `execution_pre_signature_lock_${'e'.repeat(64)}`,
         qualificationId: `execution_safety_qualification_${'a'.repeat(64)}`,
         reservationId: `execution_exposure_reservation_${'b'.repeat(64)}`,
         artifact, unsignedSimulation,
