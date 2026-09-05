@@ -1,8 +1,8 @@
 # Runtime live de finalité en lecture seule — conception #51-H2a
 
-**Version de spécification :** 1.1.7
+**Version de spécification :** 1.1.8
 
-**Version de la spécification parente :** 1.11.0
+**Version de la spécification parente :** 1.11.2
 
 **Version de l'orchestration persistante :** 1.1.5
 
@@ -12,6 +12,11 @@
 opérateur de poursuivre les choix recommandés sans pause intermédiaire.
 
 ## Historique des versions
+
+- **1.1.8 — 2026-09-05 :** ajoute uniquement les ACL colonnes nécessaires à
+  la projection H2c et à la transition système `ENTRY_STOP` lors d'une
+  réconciliation inconnue. H2a ne lit toujours aucun byte signé et ne peut ni
+  signer, ni armer, ni soumettre.
 
 - **1.1.7 — 2026-09-05 :** aligne le bootstrap H2a sur la migration 039 sans
   élargir son autorité. Recovery reste read-only pour les bytes et continue de

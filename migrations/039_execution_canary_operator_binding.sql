@@ -616,6 +616,28 @@ ALTER TABLE execution_control_events ADD CONSTRAINT execution_control_events_ide
         OR (previous_state='ENTRY_STOP' AND next_state='ENTRY_STOP'))))
 );
 
+CREATE OR REPLACE FUNCTION guard_execution_control_event_actor()
+RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+BEGIN
+  IF current_user IN ('sol_token_executor_live','sol_token_executor_live_recovery')
+    AND NEW.actor_type<>'SYSTEM'
+  THEN
+    RAISE EXCEPTION 'live runtime may persist only system control evidence'
+      USING ERRCODE='42501';
+  END IF;
+  IF current_user='sol_token_executor_operations' AND NEW.actor_type<>'OPERATOR' THEN
+    RAISE EXCEPTION 'operations may persist only operator control evidence'
+      USING ERRCODE='42501';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+DROP TRIGGER IF EXISTS execution_control_events_actor_guard
+  ON execution_control_events;
+CREATE TRIGGER execution_control_events_actor_guard
+  BEFORE INSERT ON execution_control_events
+  FOR EACH ROW EXECUTE FUNCTION guard_execution_control_event_actor();
+
 CREATE OR REPLACE FUNCTION guard_execution_control_state_write()
 RETURNS TRIGGER LANGUAGE plpgsql AS $function$
 DECLARE prior_state TEXT; transition_valid BOOLEAN;

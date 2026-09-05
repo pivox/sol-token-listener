@@ -1,12 +1,12 @@
 # Runtime signable de l'exécuteur live — conception #51-H2b
 
-**Version de spécification :** 1.1.1
+**Version de spécification :** 1.1.2
 
-**Version de la spécification parente :** 1.11.1
+**Version de la spécification parente :** 1.11.2
 
 **Version de l'orchestration persistante H1 :** 1.2.0
 
-**Version du runtime de finalité H2a :** 1.1.7
+**Version du runtime de finalité H2a :** 1.1.8
 
 **Version de la fondation live :** 1.1.0
 
@@ -17,6 +17,11 @@
 **Issue parente :** #51
 
 ## Historique des versions
+
+- **1.1.2 — 2026-09-05 :** accorde à H2a et H2b les seules lectures
+  transitives exigées par les guards `SECURITY INVOKER` H2c afin que leur
+  transition système fail-closed vers `ENTRY_STOP` fonctionne sous
+  PostgreSQL 16, sans exposer les bytes signés à H2a.
 
 - **1.1.1 — 2026-09-05 :** lie au startup toutes les limites runtime de
   l'armement V2, notamment lors de la reprise d'un BUY déjà persisté, avant
@@ -81,8 +86,9 @@ H2a reste un binaire séparé, sous son login PostgreSQL read-only distinct. Il
 reste seul responsable de la finalité, de la confirmation, de la
 réconciliation et de la deadline. H2b n'importe ni les lanes ni les façades
 applicatives H2a et n'obtient aucune méthode permettant d'exécuter ces tâches.
-Le contrat métier H2a reste inchangé ; sa spécification 1.1.7 aligne seulement
-le head du catalogue partagé sur la migration 039, sans nouvelle autorité.
+Le contrat métier H2a reste inchangé ; sa spécification 1.1.8 explicite les
+ACL colonnes transitives minimales nécessaires à la migration 039, sans accès
+aux bytes signés ni capacité de soumission.
 
 H2c reste seul responsable de la validation opérateur, de l'armement manuel et
 de la préparation ou du démarrage d'un canary. H2b ne peut appeler ni `arm`, ni

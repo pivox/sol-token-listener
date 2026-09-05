@@ -1,8 +1,8 @@
 # Armement opérateur exact et préparation du canary — conception #51-H2c
 
-**Version de spécification :** 1.1.1
+**Version de spécification :** 1.1.2
 
-**Version de la spécification parente :** 1.11.1
+**Version de la spécification parente :** 1.11.2
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-H2b fusionnée par la PR #78 (`bcc983b`)
 
 ## Historique des versions
+
+- **1.1.2 — 2026-09-05 :** ferme l'écart PostgreSQL 16 des ACL transitives
+  nécessaires aux guards H2c de H2a, H2b et opérations, sans élargir l'accès
+  recovery aux bytes signés ni démarrer le canary.
 
 - **1.1.1 — 2026-09-05 :** étend le gate de démarrage aux huit limites
   runtime de l'armement V2 pour les cibles fraîches, artefacts persistés et

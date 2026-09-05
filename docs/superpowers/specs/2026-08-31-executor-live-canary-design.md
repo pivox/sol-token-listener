@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.1
+**Version de spécification :** 1.2.2
 
-**Version de la spécification parente :** 1.11.1
+**Version de la spécification parente :** 1.11.2
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.2 — 2026-09-05 :** rend exécutables sous PostgreSQL 16 les fences H2c
+  transitifs de H2a, H2b et opérations, avec une allowlist colonne exacte et
+  toujours aucun accès recovery aux bytes signés.
 
 - **1.2.1 — 2026-09-05 :** refuse avant ouverture du signer toute reprise
   dont une limite runtime diffère de l'armement exact autorisé.

@@ -61,6 +61,10 @@ void test('migration 039 defines V2 armament bindings and pre-signature locks', 
   assert.match(sql, /SYSTEM_PRE_SIGNATURE_LOCK_STRANDED/u);
   assert.match(sql, /SYSTEM_SUBMISSION_AMBIGUOUS/u);
   assert.match(sql, /SYSTEM_RECONCILIATION_UNKNOWN/u);
+  assert.match(sql,
+    /current_user IN \('sol_token_executor_live','sol_token_executor_live_recovery'\)[\s\S]*NEW\.actor_type<>'SYSTEM'/u);
+  assert.match(sql,
+    /current_user='sol_token_executor_operations'[\s\S]*NEW\.actor_type<>'OPERATOR'/u);
   assert.doesNotMatch(sql, /private[_ ]?key|keypair|send[_ ]?transaction/iu);
 });
 

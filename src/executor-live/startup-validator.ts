@@ -200,7 +200,10 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
       table('execution_control_state', names(
         'generation_id', 'state', 'state_revision', 'last_event_id',
       ), names(), names('state', 'state_revision', 'last_event_id', 'updated_at')),
-      table('execution_control_events', names(), names(
+      table('execution_control_events', names(
+        'event_id', 'generation_id', 'previous_state', 'next_state', 'reason_code',
+        'actor_type', 'occurred_at',
+      ), names(
         'event_id', 'payload_version', 'event_fingerprint', 'generation_id',
         'previous_state', 'next_state', 'reason_code', 'qualification_id',
         'authorization_id', 'operator_id', 'actor_type', 'actor_id', 'source',

@@ -2609,6 +2609,15 @@ void test('PostgreSQL 16 recovery authority commits finality and creates a deadl
         'SELECT status FROM execution_intents WHERE id=$1',
         [fixture.claim.intent.id],
       )).rows[0]?.status, 'UNKNOWN_REQUIRES_RECONCILIATION');
+      await assert.rejects(recoveryDatabase.startup.query(`INSERT INTO execution_control_events (
+        event_id,payload_version,event_fingerprint,generation_id,previous_state,next_state,
+        reason_code,qualification_id,authorization_id,operator_id,actor_type,actor_id,occurred_at
+      ) VALUES ($1,1,$2,$3,'ENTRY_STOP','HARD_STOP','OPERATOR_HARD_STOP',NULL,NULL,
+        'forged-operator','OPERATOR','forged-operator',statement_timestamp())`, [
+        `execution_control_event_${'e'.repeat(64)}`, 'e'.repeat(64),
+        fixture.artifact.generationId,
+      ]), (error: unknown) => typeof error === 'object' && error !== null
+        && 'code' in error && error.code === '42501');
 
       const matchedClaim = await recoveryDatabase.intents.claimReconciliation(
         'h2a-reconciliation-matched', 60_000,

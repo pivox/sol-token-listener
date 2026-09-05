@@ -162,7 +162,8 @@ ON TABLE execution_intents TO sol_token_executor_live_recovery;
 
 GRANT SELECT (
   artifact_id,payload_version,specification_version,intent_id,attempt_number,
-  generation_id,armament_id,reservation_id,exit_authorization_id,provider_id,
+  generation_id,armament_id,reservation_id,exit_authorization_id,pre_signature_lock_id,
+  provider_id,
   wallet_public_key,side,effective_venue,message_hash,build_fingerprint,
   snapshot_fingerprint,quote_fingerprint,quote_observed_at,quote_expires_at,
   blockhash,last_valid_block_height,signature,signed_transaction_hash,state,
@@ -272,6 +273,19 @@ GRANT INSERT (
   previous_state,next_state,reason_code,occurred_at
 )
 ON TABLE execution_activation_events TO sol_token_executor_live_recovery;
+
+GRANT SELECT (generation_id,state,state_revision,last_event_id),
+  UPDATE (state,state_revision,last_event_id,updated_at)
+ON TABLE execution_control_state TO sol_token_executor_live_recovery;
+
+GRANT SELECT (
+  event_id,generation_id,previous_state,next_state,reason_code,actor_type,occurred_at
+), INSERT (
+  event_id,payload_version,event_fingerprint,generation_id,previous_state,next_state,
+  reason_code,qualification_id,authorization_id,operator_id,actor_type,actor_id,
+  source,intent_id,attempt_number,lock_id,artifact_id,occurred_at
+)
+ON TABLE execution_control_events TO sol_token_executor_live_recovery;
 
 REVOKE ALL PRIVILEGES ON SCHEMA public
 FROM sol_token_retention_worker;
@@ -800,7 +814,9 @@ GRANT SELECT (generation_id,state,state_revision,last_event_id),
   UPDATE (state,state_revision,last_event_id,updated_at)
 ON TABLE execution_control_state TO sol_token_executor_live;
 
-GRANT INSERT (
+GRANT SELECT (
+  event_id,generation_id,previous_state,next_state,reason_code,actor_type,occurred_at
+), INSERT (
   event_id,payload_version,event_fingerprint,generation_id,previous_state,next_state,
   reason_code,qualification_id,authorization_id,operator_id,actor_type,actor_id,
   source,intent_id,attempt_number,lock_id,artifact_id,occurred_at
@@ -1176,7 +1192,10 @@ GRANT SELECT (generation_id,state,state_revision,last_event_id),
   INSERT (generation_id), UPDATE (state,state_revision,last_event_id,updated_at)
 ON TABLE execution_control_state TO sol_token_executor_operations;
 
-GRANT SELECT (event_id,event_fingerprint), INSERT (
+GRANT SELECT (
+  event_id,event_fingerprint,generation_id,previous_state,next_state,reason_code,
+  actor_type,occurred_at
+), INSERT (
   event_id,payload_version,event_fingerprint,generation_id,previous_state,next_state,
   reason_code,qualification_id,authorization_id,operator_id,actor_type,actor_id,occurred_at
 )

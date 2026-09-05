@@ -128,6 +128,7 @@ void test('read-only recovery provisioning matches its closed authority policy',
   ));
   assert.ok(signed !== undefined);
   assert.equal(signed.select.includes('signature'), true);
+  assert.equal(signed.select.includes('pre_signature_lock_id'), true);
   assert.equal(signed.select.includes('signed_transaction_bytes'), false);
   assert.equal(signed.update.includes('submission_started_at'), false);
 
@@ -646,6 +647,14 @@ void test('provisioned retention role runs the complete purge without reading si
       });
       const status = await operationsRepository.readStatus(operationsGenerationId);
       assert.equal(status.controlState, 'ENTRY_STOP');
+      const stopped = await operationsRepository.setStop({
+        payloadVersion: 1,
+        commandId: 'command:postgresql-16-operator-hard-stop',
+        generationId: operationsGenerationId,
+        operatorId: 'operator-role-test',
+        occurredAtMs: Date.now(),
+      }, 'HARD_STOP');
+      assert.equal(stopped.controlState, 'HARD_STOP');
       for (const forbidden of [
         'SELECT signed_transaction_bytes FROM execution_signed_transactions',
         'SELECT unsigned_transaction_bytes FROM execution_pre_signature_locks',

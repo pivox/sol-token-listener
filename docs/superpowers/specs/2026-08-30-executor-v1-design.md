@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.1
+**Version de spécification :** 1.11.2
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 et préparation opérateur exacte #51-H2c
 
 ## Historique des versions
+
+- **1.11.2 — 2026-09-05 :** aligne les ACL PostgreSQL 16 H2a, H2b et opérations
+  sur les contrôles H2c réellement exécutés : lecture de l'identifiant du lock
+  et transitions contrôlées durables, sans accès H2a aux bytes signés.
 
 - **1.11.1 — 2026-09-05 :** impose au démarrage H2b la correspondance des
   huit limites runtime avec l'armement V2, y compris pour une reprise BUY
