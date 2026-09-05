@@ -195,7 +195,7 @@ void test('documents H2d readiness evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     readinessSpecification,
-    '**Version de spécification :** 1.0.4',
+    '**Version de spécification :** 1.0.5',
     'readiness specification version',
   );
   assertContainsExactlyOnce(

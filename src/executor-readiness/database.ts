@@ -91,6 +91,37 @@ export const EXECUTION_READINESS_AUTHORITY_SQL = `SELECT
     AS readiness_membership,
   (SELECT COUNT(*)::TEXT FROM pg_auth_members parent WHERE parent.member=target.oid)
     AS role_parent_count,
+  (SELECT COUNT(*)::TEXT FROM (
+    SELECT 1 FROM pg_database object CROSS JOIN LATERAL aclexplode(object.datacl) acl
+      WHERE object.datname=current_database() AND acl.grantee=login.oid
+    UNION ALL SELECT 1 FROM pg_database object
+      WHERE object.datname=current_database() AND object.datdba=login.oid
+    UNION ALL SELECT 1 FROM pg_namespace object
+      CROSS JOIN LATERAL aclexplode(object.nspacl) acl WHERE acl.grantee=login.oid
+    UNION ALL SELECT 1 FROM pg_namespace object WHERE object.nspowner=login.oid
+    UNION ALL SELECT 1 FROM pg_class object
+      CROSS JOIN LATERAL aclexplode(object.relacl) acl WHERE acl.grantee=login.oid
+    UNION ALL SELECT 1 FROM pg_class object WHERE object.relowner=login.oid
+    UNION ALL SELECT 1 FROM pg_attribute object
+      CROSS JOIN LATERAL aclexplode(object.attacl) acl WHERE acl.grantee=login.oid
+    UNION ALL SELECT 1 FROM pg_proc object
+      CROSS JOIN LATERAL aclexplode(object.proacl) acl WHERE acl.grantee=login.oid
+    UNION ALL SELECT 1 FROM pg_proc object WHERE object.proowner=login.oid
+    UNION ALL SELECT 1 FROM pg_type object
+      CROSS JOIN LATERAL aclexplode(object.typacl) acl WHERE acl.grantee=login.oid
+    UNION ALL SELECT 1 FROM pg_type object WHERE object.typowner=login.oid
+    UNION ALL SELECT 1 FROM pg_language object
+      CROSS JOIN LATERAL aclexplode(object.lanacl) acl WHERE acl.grantee=login.oid
+    UNION ALL SELECT 1 FROM pg_language object WHERE object.lanowner=login.oid
+    UNION ALL SELECT 1 FROM pg_default_acl object
+      CROSS JOIN LATERAL aclexplode(object.defaclacl) acl WHERE acl.grantee=login.oid
+    UNION ALL SELECT 1 FROM pg_default_acl object WHERE object.defaclrole=login.oid
+    UNION ALL SELECT 1 FROM pg_parameter_acl object
+      CROSS JOIN LATERAL aclexplode(object.paracl) acl WHERE acl.grantee=login.oid
+  ) direct_authority) AS session_direct_authority_count,
+  (SELECT COUNT(*)::TEXT FROM information_schema.table_privileges privilege
+    WHERE privilege.grantee IN (current_user,'PUBLIC')
+      AND privilege.table_schema='public') AS effective_table_privilege_count,
   (SELECT COALESCE(jsonb_agg(jsonb_build_array(privilege.grantee,
       privilege.table_name,privilege.column_name,privilege.privilege_type)
       ORDER BY privilege.grantee,privilege.table_name,privilege.column_name,
@@ -191,6 +222,18 @@ export function createExecutionReadinessDatabase(source: ExecutorDatabaseSource)
 
 function validAuthority(row: Readonly<Record<string, unknown>> | undefined): boolean {
   return row !== undefined
+    && sameKeys(row, [
+      'column_privileges', 'current_role', 'effective_table_privilege_count',
+      'executable_security_definer_count', 'membership_admin', 'membership_count',
+      'membership_inherit', 'membership_set', 'migration_039_present',
+      'readiness_membership', 'role_bypass_rls', 'role_can_set_replication',
+      'role_createdb', 'role_createrole', 'role_inherit', 'role_login',
+      'role_parent_count', 'role_replication', 'role_super', 'schema_create',
+      'schema_usage', 'search_path', 'server_version_number', 'session_bypass_rls',
+      'session_can_set_replication', 'session_createdb', 'session_createrole',
+      'session_direct_authority_count', 'session_inherit', 'session_login',
+      'session_replication', 'session_replication_role', 'session_role', 'session_super',
+    ])
     && typeof row.server_version_number === 'number'
     && row.server_version_number >= 160_000 && row.server_version_number < 170_000
     && row.current_role === EXECUTION_READINESS_ROLE
@@ -207,11 +250,23 @@ function validAuthority(row: Readonly<Record<string, unknown>> | undefined): boo
     && row.membership_count === '1' && row.membership_admin === false
     && row.membership_inherit === false && row.membership_set === true
     && row.readiness_membership === true && row.role_parent_count === '0'
+    && row.session_direct_authority_count === '0'
+    && row.effective_table_privilege_count === '0'
     && validColumnPrivileges(row.column_privileges)
     && row.schema_usage === true && row.schema_create === false
     && row.migration_039_present === true
     && row.executable_security_definer_count === '0'
     && row.role_can_set_replication === false && row.session_can_set_replication === false;
+}
+
+function sameKeys(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): boolean {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length
+    && actual.every((key, index) => key === sortedExpected[index]);
 }
 
 function columnPrivileges(

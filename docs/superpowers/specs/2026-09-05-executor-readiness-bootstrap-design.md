@@ -1,6 +1,6 @@
 # Bootstrap de readiness externe — conception #51-H2d
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.0.5
 
 **Version de la spécification parente :** 1.11.6
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-H2c fusionnée par la PR #79 (`d966c267`)
 
 ## Historique des versions
+
+- **1.0.5 — 2026-09-05 :** ferme les deux constats du troisième cycle de
+  revue : zéro autorité directe du login et zéro privilège de table effectif,
+  y compris via `PUBLIC`.
 
 - **1.0.4 — 2026-09-05 :** ferme les trois constats du deuxième cycle de
   revue : privilèges effectifs hérités de `PUBLIC`, fraîcheur au commit selon
@@ -254,6 +258,11 @@ L'allowlist de colonnes est comparée tuple par tuple (`grantee`, `table`,
 `PUBLIC` sont inclus dans l'observation effective. Une dérive qui révoque un
 droit autorisé et ajoute un droit sensible avec la même cardinalité est donc
 refusée.
+
+Le login de déploiement ne doit posséder aucun objet, ACL direct, default ACL
+ou privilège de paramètre. Après `SET ROLE`, aucun privilège de table complet
+(`DELETE`, `TRUNCATE`, etc.) n'est accepté pour le rôle ou `PUBLIC` : tous les
+droits utiles H2d restent exclusivement des grants de colonnes énumérés.
 
 ## 9. Atomicité, reprise et rétention
 

@@ -39,6 +39,7 @@ void test('pins and validates the readiness role on every checkout', async () =>
 void test('evicts every authority drift with a redacted error', async () => {
   for (const changed of [
     { column_privileges: driftedPrivileges() }, { schema_create: true },
+    { session_direct_authority_count: '1' }, { effective_table_privilege_count: '1' },
     { migration_039_present: false }, { readiness_membership: false },
     { membership_count: '2' }, { session_inherit: true },
     { server_version_number: 170_000 },
@@ -146,6 +147,18 @@ void test('PostgreSQL 16 login has exact readiness authority and no live authori
       await isolatedPool.query(`REVOKE SELECT (signed_transaction_bytes)
         ON TABLE execution_signed_transactions FROM PUBLIC`);
     }
+    await isolatedPool.query(`GRANT DELETE ON TABLE execution_signed_transactions TO PUBLIC`);
+    try {
+      await assert.rejects(database.pool.connect(), ExecutionReadinessDatabaseError);
+    } finally {
+      await isolatedPool.query(`REVOKE DELETE ON TABLE execution_signed_transactions FROM PUBLIC`);
+    }
+    await isolatedPool.query(`GRANT SELECT (version) ON TABLE migration_history TO "${login}"`);
+    try {
+      await assert.rejects(database.pool.connect(), ExecutionReadinessDatabaseError);
+    } finally {
+      await isolatedPool.query(`REVOKE SELECT (version) ON TABLE migration_history FROM "${login}"`);
+    }
   } finally {
     try {
       if (loginPool !== undefined) await loginPool.end();
@@ -169,6 +182,7 @@ function validAuthority(): Readonly<Record<string, unknown>> {
     session_replication: false, membership_count: '1', membership_admin: false,
     membership_inherit: false, membership_set: true, readiness_membership: true,
     role_parent_count: '0',
+    session_direct_authority_count: '0', effective_table_privilege_count: '0',
     column_privileges: JSON.stringify(EXECUTION_READINESS_COLUMN_PRIVILEGES),
     schema_usage: true,
     schema_create: false, migration_039_present: true,
