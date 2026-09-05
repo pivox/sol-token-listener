@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.15
+**Version de spécification :** 1.11.16
 
 **Date :** 2026-08-31
 
@@ -13,9 +13,14 @@
 préparation opérateur exacte #51-H2c, bootstrap de readiness non signable
 #51-H2d, producteur externe de quota Helius #51-H2e, paquet d'attestations
 hors ligne #51-H2f, assemblage offline du draft #51-H2g et export PostgreSQL
-read-only de sa source #51-H2h et autorité PostgreSQL fermée du listener #51-H2i
+read-only de sa source #51-H2h, autorité PostgreSQL fermée du listener #51-H2i
+et autorité PostgreSQL fermée du worker non signant #51-H2j
 
 ## Historique des versions
+
+- **1.11.16 — 2026-09-05 :** ajoute H2j, autorité PostgreSQL minimale du
+  worker `dry-run` et `simulation-only`, sans wallet, armement, signature ni
+  soumission.
 
 - **1.11.15 — 2026-09-05 :** ajoute H2i, provisioning fermé du listener
   paper capable d'émettre une intention canary sans accès aux autorités live.
@@ -425,6 +430,15 @@ hash du build, fingerprint de stratégie/configuration, provider, nombre maximal
 de BUY, plafond absolu en lamports, exposition, date d'expiration, identité et
 raison opérateur. L'exécuteur applique ces bornes ; elles ne sont pas de simples
 champs de rapport.
+
+#51-H2j isole les deux modes non signants derrière le groupe PostgreSQL
+`sol_token_executor_worker`. Un login externe `NOINHERIT`, membre de ce seul
+groupe, active le rôle dans sa connexion dédiée. L'allowlist par colonne couvre
+uniquement le claim et la restitution d'une intention, l'assessment `dry-run`,
+la tentative et l'artefact non signé `simulation-only`, les transitions
+associées et la preuve read-only du marché canonique. Ce rôle n'accède ni au
+wallet, ni au risque ou contrôle live, ni à l'armement, ni aux bytes signés, ni
+à la soumission ou à la réconciliation.
 
 ### 4.3 Secrets
 
@@ -1094,6 +1108,8 @@ réaffecté à une autre signification.
 | #51-H2f | Paquet signé hors ligne des preuves H2c | Aucune capacité Solana |
 | #51-H2g | Assemblage offline du draft H2f | Aucune capacité Solana |
 | #51-H2h | Export causal PostgreSQL de la source H2g | Aucune capacité Solana |
+| #51-H2i | Autorité PostgreSQL fermée du listener paper | Aucune |
+| #51-H2j | Autorité PostgreSQL fermée du worker dry-run/simulation | Aucune |
 
 Chaque PR est fusionnable seule, garde le listener opérationnel et passe trois
 cycles de revue au maximum. Une PR ne peut pas anticiper l'activation de la
@@ -1132,7 +1148,7 @@ suivante.
 - les gates compensatoires et l'activation progressive sont testables ;
 - SOL/WSOL est l'allowlist initiale sans coupler le domaine à SOL ;
 - la rétention terminale de quatre heures est documentée ;
-- les lots #51-B à #51-H2h sont indépendants et fusionnables séquentiellement ;
+- les lots #51-B à #51-H2j sont indépendants et fusionnables séquentiellement ;
 - aucun code de production, comportement, secret ou mode live n'est ajouté ;
 - `npm run build`, `npm run check`, `npm run lint`, `npm test` et
   `npm run docs:check` restent verts.

@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/sol_token_listener_test
+      TEST_EXECUTOR_ROLE_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/sol_token_listener_test
     services:
       postgres:
         image: postgres:16

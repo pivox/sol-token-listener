@@ -539,6 +539,19 @@ hérités de `PUBLIC` permettant la création d'objets, la mutation des séquenc
 d'exécution ou la désactivation des triggers sont retirés, et la relecture
 idempotente d'une intention reste possible sans lui accorder `UPDATE`.
 
+#51-H2j ferme à son tour l'autorité PostgreSQL de l'exécuteur non signant. Les
+modes `dry-run` et `simulation-only` partagent le groupe
+`sol_token_executor_worker`, activé explicitement par un login `NOINHERIT`
+dédié. Les grants par colonne couvrent uniquement le claim et la restitution
+des intentions, les assessments dry-run, les tentatives et artefacts non
+signés de simulation, leurs transitions et les colonnes de marché nécessaires
+à la preuve de venue canonique. Cette frontière ne peut lire ni écrire une
+génération wallet, une admission de risque, un armement, un lock
+pré-signature, une transaction signée, une soumission, une position live ou
+une preuve de réconciliation. Les migrations et le provisioning restent
+administratifs ; le processus reçoit une `DATABASE_URL` de service distincte
+et ne charge aucune clé privée.
+
 ## Persistance, reprise et rétention
 
 `raw_chain_events` garde l’entrée technique ; `domain_events`,
