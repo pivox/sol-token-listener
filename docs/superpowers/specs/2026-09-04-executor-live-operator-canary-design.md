@@ -1,8 +1,8 @@
 # Armement opérateur exact et préparation du canary — conception #51-H2c
 
-**Version de spécification :** 1.1.4
+**Version de spécification :** 1.1.5
 
-**Version de la spécification parente :** 1.11.4
+**Version de la spécification parente :** 1.11.12
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-H2b fusionnée par la PR #78 (`bcc983b`)
 
 ## Historique des versions
+
+- **1.1.5 — 2026-09-05 :** référence H2f comme producteur hors ligne des
+  enveloppes qualification/sidecar, sans lui déléguer la collecte des onze
+  preuves ni aucun armement.
 
 - **1.1.4 — 2026-09-05 :** rend franchissable le fence pré-signature avec une
   lease renouvelée et strictement active, sans affaiblir les expirations de

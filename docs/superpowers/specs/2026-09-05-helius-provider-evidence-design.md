@@ -1,8 +1,8 @@
 # Preuve de quota Helius pour le préflight externe — conception #51-H2e
 
-**Version de spécification :** 1.0.4
+**Version de spécification :** 1.0.5
 
-**Version de la spécification parente :** 1.11.11
+**Version de la spécification parente :** 1.11.12
 
 **Date :** 2026-09-05
 
@@ -13,6 +13,9 @@
 **Dépendance :** #51-H2d fusionnée par la PR #80 (`e854c26`)
 
 ## Historique des versions
+
+- **1.0.5 — 2026-09-05 :** référence le packaging H2f en aval du commit H2d ;
+  H2e reste limité à la seule preuve de quota Helius.
 
 - **1.0.4 — 2026-09-05 :** applique la marge H2d de cinq secondes jusqu'à
   l'écriture et refuse les chemins internes au checkout après résolution de
