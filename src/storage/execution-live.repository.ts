@@ -2380,7 +2380,7 @@ function validateExactSigningBinding(
     || integer(row.attempt_count) !== 1 || row.lease_owner !== input.claim.leaseOwner
     || row.lease_token !== input.claim.leaseToken
     || timestampText(row.lease_expires_at_ms) !== input.claim.leaseExpiresAtMs
-    || timestampText(row.lease_expires_at_ms) < deadlineMs
+    || timestampText(row.lease_expires_at_ms) <= nowMs
     || timestampText(row.intent_expires_at_ms) < deadlineMs
     || row.strategy_id !== input.claim.intent.strategyId
     || integer(row.strategy_version) !== input.claim.intent.strategyVersion

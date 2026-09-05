@@ -1,8 +1,8 @@
 # Armement opérateur exact et préparation du canary — conception #51-H2c
 
-**Version de spécification :** 1.1.3
+**Version de spécification :** 1.1.4
 
-**Version de la spécification parente :** 1.11.3
+**Version de la spécification parente :** 1.11.4
 
 **Date :** 2026-09-04
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-H2b fusionnée par la PR #78 (`bcc983b`)
 
 ## Historique des versions
+
+- **1.1.4 — 2026-09-05 :** rend franchissable le fence pré-signature avec une
+  lease renouvelée et strictement active, sans affaiblir les expirations de
+  qualification, d'armement ou d'intention.
 
 - **1.1.3 — 2026-09-05 :** récupère le lock après release de lease et vérifie
   à chaque checkout que le login opérations est PostgreSQL 16, non privilégié,

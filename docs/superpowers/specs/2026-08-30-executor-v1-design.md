@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.3
+**Version de spécification :** 1.11.4
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 et préparation opérateur exacte #51-H2c
 
 ## Historique des versions
+
+- **1.11.4 — 2026-09-05 :** exige une lease strictement active lors de
+  l'autorisation de signature, sans exiger artificiellement une nouvelle
+  durée complète entre deux transactions PostgreSQL successives.
 
 - **1.11.3 — 2026-09-05 :** récupère un lock pré-signature après libération
   explicite de la lease du worker et refuse un login opérations privilégié,

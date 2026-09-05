@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.3
+**Version de spécification :** 1.2.4
 
-**Version de la spécification parente :** 1.11.3
+**Version de la spécification parente :** 1.11.4
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,10 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.4 — 2026-09-05 :** remplace le fence irréalisable d'une lease encore
+  entière par le fence causal voulu d'une lease strictement active au moment
+  du lock pré-signature.
 
 - **1.2.3 — 2026-09-05 :** ferme la reprise d'un lock autorisé après release
   de lease et valide l'absence de privilèges propres du login opérations à

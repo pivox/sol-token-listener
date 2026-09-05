@@ -1,8 +1,8 @@
 # Runtime signable de l'exécuteur live — conception #51-H2b
 
-**Version de spécification :** 1.1.3
+**Version de spécification :** 1.1.4
 
-**Version de la spécification parente :** 1.11.3
+**Version de la spécification parente :** 1.11.4
 
 **Version de l'orchestration persistante H1 :** 1.2.0
 
@@ -17,6 +17,10 @@
 **Issue parente :** #51
 
 ## Historique des versions
+
+- **1.1.4 — 2026-09-05 :** autorise le lock pré-signature après un
+  renouvellement exact séparé dès lors que la lease est encore strictement
+  active ; les autres deadlines restent bornées par `runtimeLeaseMs`.
 
 - **1.1.3 — 2026-09-05 :** garantit qu'une erreur après lock suivie de la
   release normale du worker reste récupérable sans signature ni envoi.

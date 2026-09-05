@@ -183,6 +183,28 @@ void test('released worker lease does not strand an authorized pre-signature loc
     });
   });
 
+void test('exact runtime lease renewal remains signable across database statements',
+  async (context) => {
+    const databaseUrl = requiredDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      const fixture = await createBuyFixture(pool, 3_000);
+      const renewed = await new PostgresExecutionIntentRepository(pool).renew(
+        fixture.claim,
+        fixture.runtime.leaseMs,
+      );
+      await pool.query('SELECT pg_sleep(0.01)');
+
+      const authorization = await new PostgresExecutionLiveRepository(pool)
+        .authorizeExactSigning(Object.freeze({
+          claim: renewed, attempt: fixture.attempt, generationId,
+          runtime: fixture.runtime, material: fixture.material,
+        }));
+      assert.ok(authorization.preSignatureLockId);
+    });
+  });
+
 type RevocableSignedState = 'PERSISTED' | 'SIGNED_SIMULATED';
 for (const initialState of ['PERSISTED', 'SIGNED_SIMULATED'] as const) {
   void test(`BUY ${initialState} is atomically revoked without send and releases every capability`,
@@ -866,7 +888,10 @@ interface CompactBuySnapshot {
   readonly event_count: number;
 }
 
-async function createBuyFixture(pool: InstanceType<typeof pg.Pool>) {
+async function createBuyFixture(
+  pool: InstanceType<typeof pg.Pool>,
+  claimLeaseMs = 60_000,
+) {
   const simulation = await seedSuccessfulSimulation(pool);
   const risk = new PostgresExecutionRiskRepository(pool);
   await risk.registerWalletGeneration({
@@ -953,7 +978,7 @@ async function createBuyFixture(pool: InstanceType<typeof pg.Pool>) {
   });
   await operations.armCanary(Object.freeze({ request, authorization }));
   const claimed = await intents.claim({
-    ownerId: 'revocation-buy-test', leaseMs: 60_000, purpose: 'LIVE_EXECUTE',
+    ownerId: 'revocation-buy-test', leaseMs: claimLeaseMs, purpose: 'LIVE_EXECUTE',
     side: 'BUY', generationId,
   });
   assert.ok(claimed);

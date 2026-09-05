@@ -101,7 +101,7 @@ void test('documents H2c as ready for external preflight without starting a cana
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.3',
+    '**Version de spécification :** 1.11.4',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -113,12 +113,12 @@ void test('documents H2c as ready for external preflight without starting a cana
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.3',
+    '**Version de spécification :** 1.2.4',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.3',
+    '**Version de la spécification parente :** 1.11.4',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -153,12 +153,12 @@ void test('documents H2c as ready for external preflight without starting a cana
   );
   assertContainsExactlyOnce(
     signableSpecification,
-    '**Version de spécification :** 1.1.3',
+    '**Version de spécification :** 1.1.4',
     'signable specification version',
   );
   assertContainsExactlyOnce(
     signableSpecification,
-    '**Version de la spécification parente :** 1.11.3',
+    '**Version de la spécification parente :** 1.11.4',
     'signable parent specification version',
   );
   assertContainsExactlyOnce(
@@ -173,7 +173,7 @@ void test('documents H2c as ready for external preflight without starting a cana
   );
   assertContainsExactlyOnce(
     operatorCanarySpecification,
-    '**Version de spécification :** 1.1.3',
+    '**Version de spécification :** 1.1.4',
     'operator canary specification version',
   );
   assertContainsExactlyOnce(
@@ -183,7 +183,7 @@ void test('documents H2c as ready for external preflight without starting a cana
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.5.3 — 2026-09-05',
+    '**Version :** 1.5.4 — 2026-09-05',
     'runbook version',
   );
 
