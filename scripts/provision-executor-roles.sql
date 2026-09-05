@@ -25,6 +25,10 @@ BEGIN
     CREATE ROLE sol_token_executor_operations NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
       NOINHERIT NOREPLICATION NOBYPASSRLS;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='sol_token_executor_readiness') THEN
+    CREATE ROLE sol_token_executor_readiness NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOINHERIT NOREPLICATION NOBYPASSRLS;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='sol_token_operator_reader') THEN
     CREATE ROLE sol_token_operator_reader NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
       NOINHERIT NOREPLICATION NOBYPASSRLS;
@@ -1248,6 +1252,141 @@ GRANT INSERT (
   previous_state,next_state,reason_code,occurred_at
 )
 ON TABLE execution_activation_events TO sol_token_executor_operations;
+
+-- H2d is a one-shot, non-signable collector. Rebuild its complete authority
+-- on every replay so stale grants cannot silently survive provisioning.
+ALTER ROLE sol_token_executor_readiness NOLOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+
+DO $readiness_parameter_acl$
+BEGIN
+  IF current_setting('server_version_num')::INTEGER >= 150000 THEN
+    EXECUTE 'REVOKE SET, ALTER SYSTEM ON PARAMETER session_replication_role FROM sol_token_executor_readiness';
+  END IF;
+END
+$readiness_parameter_acl$;
+
+DO $readiness_parents$
+DECLARE
+  parent_role NAME;
+BEGIN
+  FOR parent_role IN
+    SELECT parent.rolname FROM pg_auth_members membership
+    JOIN pg_roles member ON member.oid=membership.member
+    JOIN pg_roles parent ON parent.oid=membership.roleid
+    WHERE member.rolname='sol_token_executor_readiness'
+  LOOP
+    EXECUTE format('REVOKE %I FROM sol_token_executor_readiness', parent_role);
+  END LOOP;
+END
+$readiness_parents$;
+
+DO $readiness_schema_acl$
+DECLARE
+  target_schema NAME;
+BEGIN
+  FOR target_schema IN
+    SELECT namespace.nspname FROM pg_namespace namespace
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON SCHEMA %I FROM sol_token_executor_readiness',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_readiness',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM sol_token_executor_readiness',
+      target_schema
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM sol_token_executor_readiness',
+      target_schema
+    );
+  END LOOP;
+END
+$readiness_schema_acl$;
+
+DO $readiness_columns$
+DECLARE
+  relation RECORD;
+BEGIN
+  FOR relation IN
+    SELECT namespace.nspname,class.relname,
+      string_agg(format('%I',attribute.attname),',' ORDER BY attribute.attnum) AS columns
+    FROM pg_class class
+    JOIN pg_namespace namespace ON namespace.oid=class.relnamespace
+    JOIN pg_attribute attribute ON attribute.attrelid=class.oid
+      AND attribute.attnum>0 AND NOT attribute.attisdropped
+    WHERE namespace.nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+      AND namespace.nspname NOT LIKE 'pg_temp_%'
+      AND namespace.nspname NOT LIKE 'pg_toast_temp_%'
+      AND class.relkind IN ('r','p','v','m','f')
+    GROUP BY namespace.nspname,class.relname
+  LOOP
+    EXECUTE format(
+      'REVOKE SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s), REFERENCES (%1$s) '
+      'ON TABLE %2$I.%3$I FROM sol_token_executor_readiness',
+      relation.columns, relation.nspname, relation.relname
+    );
+  END LOOP;
+END
+$readiness_columns$;
+
+GRANT USAGE ON SCHEMA public TO sol_token_executor_readiness;
+
+GRANT SELECT (version)
+ON TABLE migration_history TO sol_token_executor_readiness;
+
+GRANT SELECT (
+  generation_id,payload_version,wallet_public_key,cluster,genesis_hash,generation,retired_at
+), INSERT (
+  generation_id,payload_version,wallet_public_key,cluster,genesis_hash,generation
+)
+ON TABLE execution_wallet_generations TO sol_token_executor_readiness;
+
+GRANT SELECT (
+  generation_id,state_revision,reconciled_capital_lamports,reserved_exposure_raw,
+  open_positions,conservative_drawdown_raw,consecutive_technical_failures,
+  last_technical_failure_reason_code,unknown_block
+), INSERT (
+  generation_id,reconciled_capital_lamports,reserved_exposure_raw,conservative_drawdown_raw
+)
+ON TABLE execution_wallet_risk_state TO sol_token_executor_readiness;
+
+GRANT SELECT (
+  snapshot_id,payload_version,snapshot_fingerprint,generation_id,provider_id,
+  state_revision,slot,block_time,observed_at,commitment,wallet_lamports,
+  token_balance_count,open_positions,position_1_id,position_1_cost_basis_lamports,
+  position_1_conservative_liquidation_lamports,position_1_reconciliation_status,
+  position_2_id,position_2_cost_basis_lamports,
+  position_2_conservative_liquidation_lamports,position_2_reconciliation_status,
+  realized_net_pnl_raw,superseded_at,purge_after
+), INSERT (
+  snapshot_id,payload_version,snapshot_fingerprint,generation_id,provider_id,
+  state_revision,slot,block_time,observed_at,commitment,wallet_lamports,
+  token_balance_count,open_positions,position_1_id,position_1_cost_basis_lamports,
+  position_1_conservative_liquidation_lamports,position_1_reconciliation_status,
+  position_2_id,position_2_cost_basis_lamports,
+  position_2_conservative_liquidation_lamports,position_2_reconciliation_status,
+  realized_net_pnl_raw
+), UPDATE (superseded_at,purge_after)
+ON TABLE execution_wallet_snapshots TO sol_token_executor_readiness;
+
+GRANT SELECT (
+  snapshot_id,payload_version,snapshot_fingerprint,provider_id,plan_id,billing_period_id,
+  billing_period_started_at,billing_period_ends_at,limit_units,used_units,measured_at,
+  expires_at,provenance,superseded_at,purge_after
+), INSERT (
+  snapshot_id,payload_version,snapshot_fingerprint,provider_id,plan_id,billing_period_id,
+  billing_period_started_at,billing_period_ends_at,limit_units,used_units,measured_at,
+  expires_at,provenance
+), UPDATE (superseded_at,purge_after)
+ON TABLE execution_provider_usage_snapshots TO sol_token_executor_readiness;
 
 GRANT SELECT ON TABLE
   execution_wallet_generations,
