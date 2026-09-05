@@ -188,15 +188,17 @@ valides et fusionner uniquement avec les trois jobs CI verts.
 Ajouter une migration-test PostgreSQL 16 qui applique 001–039, peuple chacune
 des racines live historiques (armement cible/lock, lock pré-signature,
 transaction signée, BUY/SELL de position live et autorisation de sortie), puis
-applique 040. Exiger le backfill `live_reserved=true` du parent et des quatre
-tables enfants, `false` pour les lignes non live, la monotonie `false -> true`,
-les cinq tables avec RLS activée sans FORCE, et une application réussie avant
-la création de `sol_token_executor_worker`.
+applique 040. Exiger le backfill `live_reserved=true` des seules intentions
+parentes live, `false` pour les autres intentions, l'absence de marqueur dupliqué
+sur les quatre tables enfants, la monotonie `false -> true`, les cinq tables
+avec RLS activée sans FORCE, et une application réussie avant la création de
+`sol_token_executor_worker`.
 
 Étendre le test du login dédié pour prouver qu'un membre worker sous `SET ROLE`
 ne peut ni lire, louer, terminaliser, insérer un enfant, ni modifier une ligne
 live. Couvrir aussi une course réelle entre insertion enfant et promotion : le
-résultat doit être sérialisé, sans enfant `false` rattaché à un parent `true`.
+résultat doit être sérialisé et l'enfant doit devenir invisible dès que son
+parent est réservé, sans copie locale de l'état.
 
 Run:
 ```bash
@@ -212,8 +214,8 @@ n'existent pas encore.
 - [ ] **Step 2: Écrire les preuves rouges des transactions métier**
 
 Dans les tests repositories, exiger que `armCanary()` verrouille et revalide le
-BUY pristine, le promeuve avant l'admission, propage le marqueur aux enfants et
-annule toute la promotion si l'admission ou la publication échoue. Exiger que
+BUY pristine, le promeuve avant l'admission et annule toute la promotion si
+l'admission ou la publication échoue. Exiger que
 `createDeadlineExitIntentLocked()` crée et rejoue le SELL avec
 `live_reserved=true`. Enfin, prouver que `DRY_RUN` et `EXECUTE` ne claim que
 `false`, tandis que `LIVE_EXECUTE`, `LIVE_RECOVER`, `CONFIRM` et `RECONCILE` ne
@@ -231,18 +233,20 @@ Expected: FAIL sur les nouveaux invariants `live_reserved`.
 
 - [ ] **Step 3: Implémenter la migration 040 et fermer le provisioning**
 
-Ajouter `live_reserved BOOLEAN NOT NULL DEFAULT FALSE` aux cinq tables. Faire
-le backfill des racines live et de leurs enfants avant d'activer RLS. Installer
-une policy permissive pour les rôles ordinaires et une policy restrictive dont
-la détection de membership utilise `session_user`, l'OID optionnel de
+Ajouter `live_reserved BOOLEAN NOT NULL DEFAULT FALSE` uniquement à
+`execution_intents`. Backfiller les intentions racines live avant d'activer RLS
+sur les cinq tables, sans ajouter de colonne aux enfants. Installer une policy
+permissive pour les rôles ordinaires et une policy restrictive qui filtre le
+parent directement et chaque enfant via un `EXISTS` sur son `intent_id`. La
+détection de membership utilise `session_user`, l'OID optionnel de
 `sol_token_executor_worker` et `pg_has_role`. Ne pas activer FORCE RLS.
 
 Créer les guards enfants `SECURITY DEFINER` avec `search_path` fermé, révoquer
 leur exécution à `PUBLIC`, et ne laisser le chemin worker verrouiller qu'un
 parent `NOT live_reserved`. Étendre le provisioning rejouable afin de révoquer
-toute autorité sur les nouvelles fonctions/colonnes puis n'accorder au worker
-que la lecture de `live_reserved` nécessaire à ses projections ; ne jamais lui
-accorder sa mutation.
+toute autorité sur les nouvelles fonctions et sur la colonne parente. Ne pas
+accorder `SELECT(live_reserved)` au worker, sauf si un test PostgreSQL démontre
+que le moteur l'exige pour évaluer la policy ; ne jamais accorder sa mutation.
 
 Run:
 ```bash
@@ -258,10 +262,12 @@ Expected: PASS, sans skip pour les tests PostgreSQL dédiés.
 
 - [ ] **Step 4: Rendre promotion, SELL et claims transactionnels**
 
-Ajouter `live_reserved` aux projections strictes et aux requêtes de claim.
+Ajouter `live_reserved` seulement à la projection interne de l'intention si la
+vérification repository l'exige ; ne modifier aucun contrat domaine ou API.
 Filtrer les claims non signants sur `false` et tous les claims live/recovery sur
-`true`. Dans `armCanary()`, promouvoir le BUY après son lock et sa revalidation
-pristine, avant l'admission ; l'opération reste dans la transaction existante.
+`true`, sans exposer le marqueur. Dans `armCanary()`, promouvoir le BUY après son
+lock et sa revalidation pristine, avant l'admission ; l'opération reste dans la
+transaction existante.
 Dans `createDeadlineExitIntentLocked()`, insérer le SELL directement réservé et
 refuser un rejeu dont le marqueur diverge.
 

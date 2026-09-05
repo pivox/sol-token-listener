@@ -77,12 +77,12 @@ création sur la base courante avant d'accorder l'allowlist.
 
 ### 3.4 Partition de lignes non signant/live
 
-Les cinq tables accessibles en écriture au worker portent le marqueur
-`live_reserved BOOLEAN NOT NULL DEFAULT FALSE` : `execution_intents`,
+Seule la table parente `execution_intents` porte le marqueur
+`live_reserved BOOLEAN NOT NULL DEFAULT FALSE`. Les quatre tables enfants
 `execution_dry_run_assessments`, `execution_attempts`,
-`execution_intent_transitions` et `execution_simulation_artifacts`. Le marqueur
-de l'intention est autoritatif ; les quatre marqueurs enfants sont maintenus
-par la base et ne constituent pas une nouvelle entrée métier.
+`execution_intent_transitions` et `execution_simulation_artifacts` restent liées
+par `intent_id` et ne dupliquent pas ce booléen. Le marqueur de l'intention est
+l'unique source de vérité.
 
 Une transition `false -> true` est permise, mais aucune voie ne peut revenir à
 `false`. La transaction `armCanary()` du rôle opérations verrouille et revalide
@@ -93,21 +93,23 @@ même transaction que ses autres preuves. Un échec d'admission ou de publicatio
 annule donc aussi la promotion. La création d'une intention SELL par
 `createDeadlineExitIntentLocked()` dans le repository live l'insère directement
 avec `live_reserved=true`; son rejeu exige la même valeur. La promotion du
-parent propage atomiquement `true` aux lignes enfants déjà présentes.
+parent rend atomiquement inaccessibles au worker ses lignes enfants déjà
+présentes, sans les réécrire.
 
 La migration 040 backfill `true` pour toute intention déjà reliée à une
 racine live : cible ou lock d'un armement, lock pré-signature, transaction
 signée, BUY ou sortie d'une position live, ou autorisation de sortie lockée.
-Elle recopie ensuite cette valeur sur les quatre tables enfants avant d'activer
-les politiques.
+Elle n'ajoute ni backfill ni colonne aux quatre tables enfants.
 
 Les cinq tables ont `ENABLE ROW LEVEL SECURITY` sans `FORCE ROW LEVEL SECURITY` :
 le propriétaire administratif conserve ainsi le bypass nécessaire aux
 migrations suivantes. Une policy permissive conserve le filtrage par ACL pour
 les autres rôles ; une policy `AS RESTRICTIVE` limite toute session membre de
-`sol_token_executor_worker` aux seules lignes `live_reserved=false`, en lecture
-comme en `WITH CHECK`. La détection porte sur `session_user`, pas seulement sur
-`current_user`, afin de couvrir le login mono-membre qui exécute `SET ROLE`.
+`sol_token_executor_worker` à l'intention `live_reserved=false`, directement
+sur le parent et via un `EXISTS` corrélé par `intent_id` sur chaque enfant, en
+lecture comme en `WITH CHECK`. La détection porte sur `session_user`, pas
+seulement sur `current_user`, afin de couvrir le login mono-membre qui exécute
+`SET ROLE`.
 Elle résout d'abord l'OID dans `pg_roles`, puis appelle `pg_has_role` seulement
 si le groupe existe : une base vide peut donc appliquer la migration 040 avant
 le provisioning des rôles.
@@ -115,11 +117,11 @@ le provisioning des rôles.
 Les quatre tables enfants ont en plus un guard `BEFORE INSERT OR UPDATE`
 `SECURITY DEFINER`, avec `search_path` fermé et privilège `EXECUTE` révoqué à
 `PUBLIC`. Pour une session worker, le guard ne verrouille et ne retourne que le
-parent portant `live_reserved=false`, recopie cette valeur et refuse une
-discordance. Il ne révèle ni ne rend modifiable un parent live. Pour les rôles
-administratifs/live autorisés, il maintient la copie autoritative du parent.
-Le verrou parent sérialise avec une promotion concurrente : une écriture enfant
-finit avant la promotion, ou observe `true` et devient inaccessible au worker.
+parent portant `live_reserved=false`. Il ne révèle ni ne rend modifiable un
+parent live. Pour les rôles administratifs/live autorisés, il verrouille le
+parent sans dupliquer son état. Le verrou parent sérialise avec une promotion
+concurrente : une écriture enfant finit avant la promotion, ou observe `true`
+et devient inaccessible au worker.
 
 Les claims constituent une seconde défense explicite. `DRY_RUN` et `EXECUTE`
 exigent `live_reserved=false`; `LIVE_EXECUTE`, `LIVE_RECOVER`, `CONFIRM` et
