@@ -1,9 +1,10 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.15.0 — 2026-09-05
+**Version :** 1.15.1 — 2026-09-05
 
-La version 1.15.0 ferme le replay H2j après renommage du rôle worker. La version
-1.14.0 finalisait les corrections P1/P2/P3 de la partition RLS.
+La version 1.15.1 fixe la commande canonique du provisioning H2j et son contrôle
+post-exécution. La version 1.15.0 fermait le replay après renommage du rôle
+worker. La version 1.14.0 finalisait les corrections P1/P2/P3 de la partition RLS.
 La version 1.13.0 avait ajouté cette partition et porté le head de migration à
 040. Le canary reste non démarré.
 
@@ -134,6 +135,59 @@ et ne posséder aucun objet. Les processus forcent `SET ROLE`,
 checkout. Le rôle opérations ne peut ni lire les bytes signés ou non signés,
 ni armer des champs runtime arbitraires, ni modifier les intents ; H2a,
 listener et API ne gagnent aucune autorité H2c.
+
+Depuis la racine du dépôt, utiliser cette commande canonique :
+
+```bash
+psql -X -v ON_ERROR_STOP=1 -f scripts/provision-executor-roles.sql
+```
+
+`-X` ignore tout `psqlrc` local et `ON_ERROR_STOP` interrompt l'exécution à la
+première erreur. La connexion administrative doit être injectée par le mécanisme
+libpq de l'environnement opérateur, par exemple `PGSERVICE` et un `PGPASSFILE`
+externe en mode `0600`, ou par le gestionnaire de secrets du déploiement. Ne
+jamais placer une URL, un login ou un mot de passe dans la commande, le dépôt ou
+l'historique du shell.
+
+Après succès, exécuter avec la même connexion le contrôle d'inventaire read-only
+suivant :
+
+```sql
+WITH expected(policy_name, relation_name) AS (VALUES
+  ('execution_intents_worker_partition', 'execution_intents'),
+  ('execution_dry_run_assessments_worker_partition', 'execution_dry_run_assessments'),
+  ('execution_attempts_worker_partition', 'execution_attempts'),
+  ('execution_intent_transitions_worker_partition', 'execution_intent_transitions'),
+  ('execution_simulation_artifacts_worker_partition', 'execution_simulation_artifacts')
+), targets AS (
+  SELECT target.role_oid
+  FROM expected
+  JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = 'public'
+  JOIN pg_catalog.pg_class relation
+    ON relation.relnamespace = namespace.oid
+    AND relation.relname = expected.relation_name
+  JOIN pg_catalog.pg_policy policy
+    ON policy.polrelid = relation.oid
+    AND policy.polname = expected.policy_name
+    AND NOT policy.polpermissive
+    AND policy.polcmd = '*'
+  CROSS JOIN LATERAL pg_catalog.unnest(policy.polroles) AS target(role_oid)
+)
+SELECT COUNT(*) AS policy_count,
+  COUNT(DISTINCT role_oid) AS target_oid_count,
+  BOOL_AND(role_oid = 'sol_token_executor_worker'::regrole::oid) AS canonical_only
+FROM targets;
+```
+
+Le résultat exigé est exactement :
+
+```text
+policy_count | target_oid_count | canonical_only
+5            | 1                | t
+```
+
+Toute autre valeur interdit de démarrer le worker et impose une investigation
+administrative ; ne pas corriger manuellement les policies.
 
 Le listener H2i utilise le paramètre de connexion PostgreSQL pour fixer son
 rôle sur chaque connexion du pool. Il peut écrire ses projections métier et

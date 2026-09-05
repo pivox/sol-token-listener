@@ -153,7 +153,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.11.19',
+    '**Version de spécification :** 1.11.20',
     'parent specification version',
   );
   assertContainsExactlyOnce(
@@ -169,22 +169,22 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     simulationDatabaseAuthoritySpecification,
-    '**Version de spécification :** 1.0.3',
+    '**Version de spécification :** 1.0.4',
     'simulation database authority specification version',
   );
   assertContainsExactlyOnce(
     simulationDatabaseAuthoritySpecification,
-    '**Version de la spécification parente visée :** 1.11.19',
+    '**Version de la spécification parente visée :** 1.11.20',
     'simulation database authority parent specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.2.17',
+    '**Version de spécification :** 1.2.18',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.11.19',
+    '**Version de la spécification parente :** 1.11.20',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -249,7 +249,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.15.0 — 2026-09-05',
+    '**Version :** 1.15.1 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
@@ -345,6 +345,15 @@ void test('documents H2d-H2j external evidence without starting a canary',
     /session active[\s\S]*stale[\s\S]*perd[\s\S]*toute autorité/iu);
   assert.match(simulationDatabaseAuthoritySpecification,
     /rôle canonique[\s\S]*(?:reçoit|porte)[\s\S]*cinq policies finales/iu);
+  assertContainsExactlyOnce(
+    runbook,
+    'psql -X -v ON_ERROR_STOP=1 -f scripts/provision-executor-roles.sql',
+    'canonical provisioning command',
+  );
+  assert.match(runbook,
+    /contrôle d'inventaire[\s\S]*pg_policy[\s\S]*unnest\s*\(\s*policy\.polroles\s*\)[\s\S]*5\s*\|\s*1\s*\|\s*t/iu);
+  assert.doesNotMatch(runbook,
+    /psql[^\r\n]*(?:DATABASE_URL|postgresql:\/\/|mot de passe|password)/iu);
   assert.match(
     runbook,
     /paramètres de simulation non signants[\s\S]*URL RPC potentiellement\s+confidentielle[\s\S]*fichier externe `0600`[\s\S]*jamais\s+journalisée/iu,

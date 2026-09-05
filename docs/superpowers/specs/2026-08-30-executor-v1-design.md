@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.11.19
+**Version de spécification :** 1.11.20
 
 **Date :** 2026-08-31
 
@@ -18,6 +18,8 @@ et autorité PostgreSQL fermée du worker non signant #51-H2j
 
 ## Historique des versions
 
+- **1.11.20 — 2026-09-05 :** fixe pour H2j la commande `psql` hermétique de
+  provisioning et le contrôle post-exécution 5/5 mono-OID.
 - **1.11.19 — 2026-09-05 :** ferme le replay H2j après renommage : inventaire
   exact 5/5 sur un OID unique, quarantaine atomique de l'ancien rôle et
   reliaison exclusive des policies au rôle worker canonique.

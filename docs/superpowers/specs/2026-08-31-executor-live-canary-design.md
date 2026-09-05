@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.2.17
+**Version de spécification :** 1.2.18
 
-**Version de la spécification parente :** 1.11.19
+**Version de la spécification parente :** 1.11.20
 
 **Date :** 2026-08-31
 
@@ -14,6 +14,8 @@
 
 ## Historique des versions
 
+- **1.2.18 — 2026-09-05 :** rend canonique l'exécution hermétique du
+  provisioning H2j et son contrôle post-exécution 5/5 mono-OID.
 - **1.2.17 — 2026-09-05 :** ferme le replay H2j d'un rôle renommé par
   inventaire 5/5 mono-OID, quarantaine atomique de l'ancien rôle et rebind des
   policies vers le rôle canonique.

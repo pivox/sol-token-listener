@@ -1,8 +1,8 @@
 # Autorité PostgreSQL du worker de simulation — conception #51-H2j
 
-**Version de spécification :** 1.0.3
+**Version de spécification :** 1.0.4
 
-**Version de la spécification parente visée :** 1.11.19
+**Version de la spécification parente visée :** 1.11.20
 
 **Date :** 2026-09-05
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.0.4 — 2026-09-05 :** fixe la commande opérateur canonique de
+  provisioning et son contrôle d'inventaire 5/5 mono-OID, sans secret en ligne
+  de commande.
 - **1.0.3 — 2026-09-05 :** ferme le replay après renommage du rôle worker :
   inventaire non ambigu des cinq policies, quarantaine atomique de l'ancien
   OID et reliaison exclusive au rôle canonique.
@@ -193,7 +196,11 @@ Le login de déploiement est mono-membre, `NOINHERIT`, sans privilège direct.
 Chaque connexion active le groupe avec l'option PostgreSQL
 `-c role=sol_token_executor_worker`. La migration automatique reste désactivée
 et appartient à un processus administratif distinct. Aucun login, mot de
-passe ou URL n'est accepté par le script de provisioning.
+passe ou URL n'est accepté par le script de provisioning. Depuis la racine du
+dépôt, l'administrateur l'exécute avec `psql -X -v ON_ERROR_STOP=1 -f
+scripts/provision-executor-roles.sql`; les paramètres libpq et leur secret sont
+injectés hors commande. Le runbook impose ensuite un contrôle read-only des
+cinq policies, de leur OID unique et de leur liaison au rôle canonique.
 
 ## 6. Validation
 
