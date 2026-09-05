@@ -8,7 +8,7 @@ import { migrateDatabase } from '../src/storage/database.js';
 
 const migrationName = '032_execution_dry_run_assessments.sql';
 const simulationMigrationName = '033_execution_simulation_artifacts.sql';
-const latestMigrationName = '038_execution_live_rpc_budget.sql';
+const latestMigrationName = '039_execution_canary_operator_binding.sql';
 const migrationUrl = new URL(`../migrations/${migrationName}`, import.meta.url);
 const migrationsUrl = new URL('../migrations/', import.meta.url);
 const hash = 'a'.repeat(64);
@@ -92,6 +92,7 @@ void test('execution dry-run migration applies, upgrades 031, and replays safely
         '035_execution_preflight_operations.sql',
         '036_execution_live_canary.sql',
         '037_execution_live_orchestration.sql',
+        '038_execution_live_rpc_budget.sql',
         latestMigrationName,
       ]);
       assert.equal((await upgradePool.query('SELECT id FROM execution_intents WHERE id = $1', [parent.id])).rowCount, 1);

@@ -56,6 +56,7 @@ void test('compiled executor records once, remains non-consuming and exits clean
   }
   const children = new Set<TrackedChild>();
   const admin = new pg.Pool({ connectionString: databaseUrl });
+  const databaseRole = await currentDatabaseRole(admin);
   const schema = `executor_main_${randomUUID().replaceAll('-', '')}`;
   await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
   context.after(async () => {
@@ -77,7 +78,7 @@ void test('compiled executor records once, remains non-consuming and exits clean
   const created = await createIntent(repository, 'first');
   const before = await parentState(schemaPool, created.intent.id);
   const applicationName = `executor-idle-${randomUUID()}`;
-  const executorUrl = databaseUrlForSchema(databaseUrl, schema, applicationName);
+  const executorUrl = databaseUrlForSchema(databaseUrl, schema, applicationName, databaseRole);
 
   const first = startExecutor(context, children, executorUrl);
   await waitForAssessment(schemaPool, created.intent.id, 1, first);
@@ -127,6 +128,7 @@ void test('compiled simulation-only executor records one unsigned Pump.fun BUY w
   }
   const children = new Set<TrackedChild>();
   const admin = new pg.Pool({ connectionString: databaseUrl });
+  const databaseRole = await currentDatabaseRole(admin);
   const schema = `executor_simulation_main_${randomUUID().replaceAll('-', '')}`;
   await admin.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
   const schemaPool = new pg.Pool({
@@ -149,6 +151,7 @@ void test('compiled simulation-only executor records one unsigned Pump.fun BUY w
     databaseUrl,
     schema,
     `executor-simulation-${randomUUID()}`,
+    databaseRole,
   );
   const child = startSimulationExecutor(context, children, executorUrl, rpc.url);
   await waitForSimulationArtifact(schemaPool, created.intent.id, child);
@@ -274,7 +277,7 @@ async function waitForAssessment(
     }
     await delay(25);
   }
-  assert.fail(`executor assessment deadline exceeded for ${intentId}`);
+  assert.fail(`executor assessment deadline exceeded for ${intentId}: ${childOutput(child)}`);
 }
 
 async function assessmentCount(pool: InstanceType<typeof pg.Pool>, intentId: string): Promise<number> {
@@ -430,8 +433,24 @@ function childOutput(child: ChildProcess & Partial<{ captured: string[] }>): str
   return child.captured?.join('') ?? '';
 }
 
-function databaseUrlForSchema(value: string, schema: string, applicationName: string): string {
+async function currentDatabaseRole(pool: InstanceType<typeof pg.Pool>): Promise<string> {
+  const result = await pool.query<{ readonly current_user: string }>('SELECT current_user');
+  const role = result.rows[0]?.current_user;
+  if (typeof role !== 'string') assert.fail('PostgreSQL did not expose one current role.');
+  assert.match(role, /^[A-Za-z_][A-Za-z0-9_.-]{0,62}$/u);
+  return role;
+}
+
+function databaseUrlForSchema(
+  value: string,
+  schema: string,
+  applicationName: string,
+  databaseRole: string,
+): string {
   const url = new URL(value);
+  if (url.username === '' && url.searchParams.get('user') === null) {
+    url.searchParams.set('user', databaseRole);
+  }
   url.searchParams.set('options', `-c search_path=${quoteIdentifier(schema)}`);
   url.searchParams.set('application_name', applicationName);
   return url.toString();

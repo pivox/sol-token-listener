@@ -50,6 +50,10 @@ import {
 } from '../markets/pumpswap/official-sdk.js';
 import type { ClaimedExecutionIntent } from '../ports/execution-intent-repository.js';
 import type {
+  ExecutionExactSigningAuthorizationV1,
+  ExecutionUnsignedSigningMaterialV1,
+} from '../ports/execution-live-repository.js';
+import type {
   ExecutionAccountSnapshot,
   ExecutionAddressDiscovery,
   ExecutionDiscoveryMarketGateway,
@@ -147,7 +151,10 @@ export interface LiveExecutionAttemptEvaluator {
   readonly evaluate: (
     context: ExecutionAttemptEvaluationContext,
     signal: AbortSignal,
-    renew: (boundary: ExecutionLiveAttemptRenewBoundary) => Promise<void>,
+    renew: (
+      boundary: ExecutionLiveAttemptRenewBoundary,
+      material?: ExecutionUnsignedSigningMaterialV1,
+    ) => Promise<undefined | ExecutionExactSigningAuthorizationV1>,
   ) => Promise<ExecutionLiveAttemptEvaluationResultV1>;
 }
 
@@ -191,7 +198,9 @@ type LiveAttemptPreparer = Readonly<{
   readonly prepare: (
     input: ExecutionSimulationGatewayRequestV1,
     quoteWindow: LiveQuoteWindowV1,
-    beforeSign: () => Promise<void>,
+    beforeSign: (
+      material: ExecutionUnsignedSigningMaterialV1,
+    ) => Promise<ExecutionExactSigningAuthorizationV1>,
     signal: AbortSignal,
   ) => Promise<Readonly<{
     readonly payloadVersion: 1;
@@ -264,12 +273,15 @@ export function createLiveExecutionAttemptEvaluator(
     evaluate: async (
       context: ExecutionAttemptEvaluationContext,
       signal: AbortSignal,
-      renew: (boundary: ExecutionLiveAttemptRenewBoundary) => Promise<void>,
+      renew: (
+        boundary: ExecutionLiveAttemptRenewBoundary,
+        material?: ExecutionUnsignedSigningMaterialV1,
+      ) => Promise<undefined | ExecutionExactSigningAuthorizationV1>,
     ) => liveEvaluationResult(await evaluateAttempt(
       dependencies,
       context,
       signal,
-      renew,
+      async (boundary) => { await renew(boundary); return undefined; },
       liveTerminal(preparerFactory, renew),
     )),
   });
@@ -609,13 +621,21 @@ const simulationOnlyTerminal: AttemptTerminal<null> = async (
 
 function liveTerminal(
   preparerFactory: LiveAttemptPreparerFactory,
-  renew: (boundary: ExecutionLiveAttemptRenewBoundary) => Promise<void>,
+  renew: (
+    boundary: ExecutionLiveAttemptRenewBoundary,
+    material?: ExecutionUnsignedSigningMaterialV1,
+  ) => Promise<undefined | ExecutionExactSigningAuthorizationV1>,
 ): AttemptTerminal<ExecutionLiveAttemptCandidateV1> {
   return async (gateway, input, quoteWindow, signal) => {
     const prepared = await preparerFactory(gateway).prepare(
       input,
       quoteWindow,
-      () => renewBoundary(renew, 'BEFORE_SIGNING', signal),
+      async (material) => {
+        if (signal.aborted) throw aborted();
+        const authorization = await renew('BEFORE_SIGNING', material);
+        requireActive(signal);
+        return requiredExactSigningAuthorization(authorization);
+      },
       signal,
     );
     if (!opaqueLiveCandidate(prepared.candidate)) {
@@ -1395,4 +1415,11 @@ function aborted(): ExecutionAttemptEvaluatorError {
   const error = new ExecutionAttemptEvaluatorError('OPERATION_ABORTED');
   INTERNAL_ERRORS.add(error);
   return error;
+}
+
+function requiredExactSigningAuthorization(
+  value: ExecutionExactSigningAuthorizationV1 | undefined,
+): ExecutionExactSigningAuthorizationV1 {
+  if (value === undefined) throw aborted();
+  return value;
 }

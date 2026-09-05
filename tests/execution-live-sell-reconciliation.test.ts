@@ -1,11 +1,13 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import bs58 from 'bs58';
 import pg from 'pg';
+import { Keypair, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import {
-  createExecutionArmament,
   createOperatorAuthorization,
+  createExecutionArmamentRequestV2,
+  createOperatorAuthorizationV2,
 } from '../src/domain/execution-operations.js';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { createSignedTransactionArtifact } from '../src/domain/execution-live.js';
@@ -23,9 +25,9 @@ import {
   createExecutionLiveUnsignedSimulationEvidenceIdentity,
 } from
   '../src/domain/execution-live-signed-simulation.js';
+import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
 import type { ExecutionSimulationEvidenceV1 } from
   '../src/ports/execution-simulation-gateway.js';
-import { ExecutionAdmissionService } from '../src/executor-risk/admission-service.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import {
@@ -40,6 +42,8 @@ const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const walletPublicKey = '11111111111111111111111111111111';
 const quoteMint = 'So11111111111111111111111111111111111111112';
 const fingerprint = '1'.repeat(64);
+const exactBuyWallet = Keypair.fromSeed(Uint8Array.from({ length: 32 }, () => 17));
+const exactBuyWalletPublicKey = exactBuyWallet.publicKey.toBase58();
 const rpcBudget = Object.freeze({
   payloadVersion: 1 as const, callsUsed: 5, callsLimit: 12,
 });
@@ -56,6 +60,18 @@ void test('SELL UNKNOWN persists evidence and freezes every exit capability', as
     assert.equal(result.result, 'UNKNOWN');
     assert.deepEqual(await durableState(pool, fixture),
       expectedUnknownState(fixture.claim.intent.id, 1));
+    const control = await pool.query<{
+      state: string;
+      actor_type: string;
+      reason_code: string;
+    }>(`SELECT control.state,event.actor_type,event.reason_code
+      FROM execution_control_state control
+      JOIN execution_control_events event ON event.event_id=control.last_event_id
+      WHERE control.generation_id=$1`, [generationId]);
+    assert.deepEqual(control.rows, [{
+      state: 'ENTRY_STOP', actor_type: 'SYSTEM',
+      reason_code: 'SYSTEM_RECONCILIATION_UNKNOWN',
+    }]);
   });
 });
 
@@ -230,7 +246,7 @@ void test('SELL NO_EFFECT activation fences a concurrent live BUY claim before g
 
         buyClaim = intents.claim({
           ownerId: 'live-buy-during-sell-activation', leaseMs: 60_000,
-          purpose: 'LIVE_EXECUTE', side: 'BUY',
+          purpose: 'LIVE_EXECUTE', side: 'BUY', generationId,
         });
         const outcome = await Promise.race([
           buyClaim.then(() => 'CLAIM_SETTLED' as const),
@@ -293,7 +309,7 @@ void test('SELL signed persistence fences a live BUY when PROCESSING expired dur
 
           buyClaim = intents.claim({
             ownerId: 'live-buy-during-sell-persist', leaseMs: 60_000,
-            purpose: 'LIVE_EXECUTE', side: 'BUY',
+            purpose: 'LIVE_EXECUTE', side: 'BUY', generationId,
           });
           const outcome = await Promise.race([
             buyClaim.then(() => 'CLAIM_SETTLED' as const),
@@ -588,6 +604,7 @@ async function createSellFixture(
   const live = new PostgresExecutionLiveRepository(pool);
   await live.persistSigned({
     payloadVersion: 1, claim: buy.claim, qualificationId: buy.qualificationId,
+    preSignatureLockId: buy.preSignatureLockId,
     reservationId: buy.reservationId, artifact: buy.artifact,
     unsignedSimulation: buy.unsignedSimulation,
     rpcBudget,
@@ -616,18 +633,10 @@ async function createSellFixture(
     ownerId: 'sell-fixture-entry-reconciliation', leaseMs: 60_000, purpose: 'RECONCILE',
   });
   assert.ok(buyReconciliationClaim);
+  const buyReconciliation = await live.readReconciliationWork(buyReconciliationClaim);
   const buyReconciliationAtMs = Date.now();
   const buyEvidence = evaluateExecutionReconciliation({
-    expected: Object.freeze({
-      intentId: buy.artifact.intentId, attemptNumber: 1, walletGeneration: 1,
-      providerId: buy.artifact.providerId, side: 'BUY' as const,
-      signature: buy.artifact.signature, blockhash: buy.artifact.blockhash,
-      lastValidBlockHeight: buy.artifact.lastValidBlockHeight,
-      messageHash: buy.artifact.messageHash, buildFingerprint: buy.artifact.buildFingerprint,
-      snapshotFingerprint: buy.artifact.snapshotFingerprint,
-      maximumFeeLamports: buy.unsignedSimulation.estimatedFeeLamports,
-      maximumFeePayerLamportDebit: buy.unsignedSimulation.simulatedFeePayerLamportDebit,
-    }),
+    expected: buyReconciliation.request.expected,
     observed: Object.freeze({
       signatureHistory: 'PRESENT' as const, confirmationStatus: 'FINALIZED' as const,
       finalizedBlockHeight: 1_001n, observedSlot: 127n,
@@ -673,11 +682,12 @@ async function createSellFixture(
     attemptNumber: begun.attempt.attemptNumber, generationId, armamentId: null,
     reservationId: null, exitAuthorizationId: entry.exitAuthorization.authorizationId,
     providerId: 'primary',
-    walletPublicKey, side: 'SELL', effectiveVenue: 'PUMP_FUN', messageHash: 'a'.repeat(64),
-    buildFingerprint: 'b'.repeat(64), snapshotFingerprint: 'c'.repeat(64),
+    walletPublicKey: buy.artifact.walletPublicKey,
+    side: 'SELL', effectiveVenue: 'PUMP_FUN', messageHash: 'a'.repeat(64),
+    buildFingerprint: buy.artifact.buildFingerprint, snapshotFingerprint: 'c'.repeat(64),
     quoteFingerprint: 'e'.repeat(64), quoteObservedAtMs: sellTimelineMs,
     quoteExpiresAtMs: sellTimelineMs + 60_000,
-    blockhash: walletPublicKey,
+    blockhash: buy.artifact.walletPublicKey,
     lastValidBlockHeight: 2_000n, signature: bs58.encode(new Uint8Array(64).fill(10)),
     signedTransactionBytes: Uint8Array.from([5, 6, 7, 8]), signedAtMs: sellTimelineMs + 1,
   });
@@ -692,7 +702,7 @@ async function createSellFixture(
   });
   const persistInput = Object.freeze({
     payloadVersion: 1, claim: begun.claim, qualificationId: buy.qualificationId,
-    reservationId: null, artifact, unsignedSimulation, rpcBudget,
+    preSignatureLockId: null, reservationId: null, artifact, unsignedSimulation, rpcBudget,
   });
   await beforePersistSigned?.(live, persistInput);
   await live.persistSigned(persistInput);
@@ -791,75 +801,167 @@ function signedSimulation(
 }
 
 async function createBuyFixture(pool: InstanceType<typeof pg.Pool>) {
-  const simulation = await seedSuccessfulSimulation(pool);
   const risk = new PostgresExecutionRiskRepository(pool);
   await risk.registerWalletGeneration({
-    generationId, payloadVersion: 1, walletPublicKey, cluster: 'mainnet-beta',
-    genesisHash: walletPublicKey, generation: 1,
+    generationId, payloadVersion: 1, walletPublicKey: exactBuyWalletPublicKey,
+    cluster: 'mainnet-beta', genesisHash: exactBuyWalletPublicKey, generation: 1,
   });
+  const snapshotNowMs = Date.now();
+  const walletSnapshot = createExecutionWalletSnapshot({
+    generationId, providerId: 'primary', stateRevision: 0n, slot: 123n,
+    blockTimeMs: snapshotNowMs - 100, observedAtMs: snapshotNowMs - 50,
+    commitment: 'finalized', walletLamports: 1_000_000n, tokenBalanceCount: 0,
+    openPositions: [], realizedNetPnlRaw: 0n,
+  });
+  const providerSnapshot = createProviderUsageSnapshot({
+    providerId: 'primary', planId: 'canary-v1', billingPeriodId: `period-${snapshotNowMs}`,
+    billingPeriodStartedAtMs: snapshotNowMs - 60_000,
+    billingPeriodEndsAtMs: snapshotNowMs + 600_000, limitUnits: 1_000n, usedUnits: 1n,
+    measuredAtMs: snapshotNowMs - 50, expiresAtMs: snapshotNowMs + 300_000,
+    provenance: 'OPERATOR_REPORT',
+  });
+  const simulation = await seedSuccessfulSimulation(pool, exactBuyWalletPublicKey);
   const nowMs = Date.now();
+  const qualification = qualificationWithCanarySnapshots(
+    safetyQualification(nowMs, simulation, exactBuyWalletPublicKey), walletSnapshot, providerSnapshot,
+  );
   const operations = new PostgresExecutionOperationsRepository(pool);
-  const qualification = safetyQualification(nowMs, simulation);
   await operations.persistQualification(qualification);
-  await operations.setStop({
-    payloadVersion: 1, commandId: `command:stop:${randomUUID()}`, generationId,
-    operatorId: 'operator-primary', occurredAtMs: nowMs,
-  }, 'ENTRY_STOP');
   const resume = createOperatorAuthorization({
     payloadVersion: 1, generationId, action: 'RESUME', phase: null,
     contextFingerprint: qualification.qualificationFingerprint,
-    nonceHash: 'b'.repeat(64), operatorId: 'operator-primary',
-    issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+    nonceHash: '9'.repeat(64), operatorId: 'operator-primary', issuedAtMs: nowMs,
+    expiresAtMs: nowMs + 60_000,
   });
   await operations.recordAuthorization(resume);
   await operations.resume({
-    payloadVersion: 1, commandId: `command:resume:${randomUUID()}`, generationId,
+    payloadVersion: 1, commandId: `command:exact-buy-resume:${randomUUID()}`, generationId,
     qualificationId: qualification.qualificationId, authorization: resume,
-    operatorId: 'operator-primary', occurredAtMs: nowMs + 1,
+    operatorId: 'operator-primary', occurredAtMs: nowMs,
   });
-  const armAuthorization = createOperatorAuthorization({
-    payloadVersion: 1, generationId, action: 'ARM', phase: 'CANARY',
-    contextFingerprint: qualification.qualificationFingerprint,
-    nonceHash: 'c'.repeat(64), operatorId: 'operator-primary',
-    issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
-  });
-  await operations.recordAuthorization(armAuthorization);
-  const armament = createExecutionArmament({
-    payloadVersion: 1, qualification, maximumBuys: 1,
-    maximumCapitalLamports: 500_000n, maximumExposureBps: 500n,
-    maximumOpenPositions: 1, maximumHoldingMs: 30_000,
-    armedAtMs: nowMs + 2, expiresAtMs: nowMs + 120_000,
-    operatorId: 'operator-primary', operatorReason: 'Mainnet canary manually approved.',
-    authorizationId: armAuthorization.authorizationId,
-    authorizationFingerprint: armAuthorization.authorizationFingerprint,
-  });
-  await operations.arm(armament);
-  const walletSnapshot = await risk.appendWalletSnapshot(Object.freeze({
-    snapshotId: `execution_wallet_snapshot_${'d'.repeat(64)}`,
-    payloadVersion: 1 as const, snapshotFingerprint: 'd'.repeat(64), generationId,
-    providerId: 'primary', stateRevision: 0n, slot: 123n, blockTimeMs: nowMs - 100,
-    observedAtMs: nowMs - 50, commitment: 'finalized' as const,
-    walletLamports: 1_000_000n, tokenBalanceCount: 0,
-    openPositions: Object.freeze([]), realizedNetPnlRaw: 0n,
-  }));
-  const providerSnapshot = createProviderUsageSnapshot({
-    providerId: 'primary', planId: 'public-v1', billingPeriodId: `period-${nowMs}`,
-    billingPeriodStartedAtMs: nowMs - 1_000, billingPeriodEndsAtMs: nowMs + 300_000,
-    limitUnits: 10_000n, usedUnits: 10n, measuredAtMs: nowMs - 100,
-    expiresAtMs: nowMs + 60_000, provenance: 'AUTHORITATIVE_PROBE',
-  });
-  await risk.appendProviderUsage(providerSnapshot);
   const intents = new PostgresExecutionIntentRepository(pool);
-  const created = await intents.create(createExecutionIntentDraft({
-    strategyId: 'sell-reconciliation-test', strategyVersion: 1,
-    positionId: `position:${randomUUID()}`, logicalCommandId: `command:${randomUUID()}`,
-    mint: walletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
+  const target = await intents.create(createExecutionIntentDraft({
+    strategyId: 'exact-buy-target', strategyVersion: 1,
+    positionId: `position:exact-buy:${randomUUID()}`,
+    logicalCommandId: `command:exact-buy:${randomUUID()}`,
+    mint: exactBuyWalletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1_000n,
-    baseAmountRaw: null, minimumAmountOutRaw: 90n,
-    decisionEventId: `decision:${randomUUID()}`, decisionFingerprint: fingerprint,
-    requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
+    baseAmountRaw: null, minimumAmountOutRaw: 1n,
+    decisionEventId: `decision:exact-buy:${randomUUID()}`,
+    decisionFingerprint: 'd'.repeat(64), requestedAtMs: nowMs - 1_000,
+    expiresAtMs: nowMs + 120_000,
   }));
-  const policy = createExecutionRiskPolicy({
+  const request = createExecutionArmamentRequestV2({
+    payloadVersion: 2, qualification, targetIntentId: target.intent.id,
+    policy: exactBuyCanaryPolicy(), walletSnapshot, providerSnapshot,
+    allEndpointsUnavailable: false, capturedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
+    target: {
+      intentId: target.intent.id, stateRevision: target.intent.stateRevision,
+      strategyId: target.intent.strategyId, strategyVersion: target.intent.strategyVersion,
+      decisionFingerprint: target.intent.decisionFingerprint, mint: target.intent.mint,
+      quoteMint: target.intent.quoteMint, quoteAmountRaw: target.intent.quoteAmountRaw,
+    },
+    maximumBuys: 1, maximumCapitalLamports: 1_000n, maximumExposureBps: 500n,
+    maximumOpenPositions: 1, maximumHoldingMs: 30_000, runtimeQuoteMaxAgeMs: 60_000,
+    runtimeSlippageBps: 100n, runtimeSnapshotMaxSlotLag: 8,
+    runtimeMaxComputeUnits: 200_000n, runtimeMaxFeeLamports: 5_000n,
+    runtimeMaxFeePayerLamportDebit: 100_000n, runtimeMaxRpcCallsPerAttempt: 12,
+    runtimeLeaseMs: 3_000, armedAtMs: nowMs, armamentExpiresAtMs: nowMs + 120_000,
+    operatorId: 'operator-primary', operatorReason: 'Mainnet canary manually approved.',
+  });
+  const armamentAuthorization = createOperatorAuthorizationV2({
+    payloadVersion: 2, generationId, action: 'ARM', phase: 'CANARY',
+    contextFingerprint: request.armamentRequestFingerprint, nonceHash: 'e'.repeat(64),
+    operatorId: 'operator-primary', issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+  });
+  await operations.armCanary(Object.freeze({ request, authorization: armamentAuthorization }));
+  const claimed = await intents.claim({
+    ownerId: 'exact-buy-lock-holder', leaseMs: 30_000,
+    purpose: 'LIVE_EXECUTE', side: 'BUY', generationId,
+  });
+  assert.ok(claimed);
+  const processing = await intents.transition(claimed, {
+    intentId: claimed.intent.id, expectedStatus: 'PENDING', nextStatus: 'PROCESSING',
+    leaseToken: claimed.leaseToken, reasonCode: 'EXECUTION_STARTED',
+    humanMessage: 'Exact BUY signing test started.', activationPhase: 'CANARY',
+    evidence: Object.freeze({
+      payloadVersion: 1, attemptNumber: null, sourceEventId: null, observedAtMs: nowMs,
+    }),
+  });
+  const begun = await intents.beginAttempt(Object.freeze({ ...claimed, intent: processing }));
+  const unsigned = new VersionedTransaction(new TransactionMessage({
+    payerKey: exactBuyWallet.publicKey, recentBlockhash: exactBuyWalletPublicKey, instructions: [],
+  }).compileToV0Message());
+  const messageBytes = Object.freeze([...unsigned.message.serialize()]);
+  const unsignedTransactionBytes = Object.freeze([...unsigned.serialize()]);
+  const quoteObservedAtMs = Date.now();
+  const material = Object.freeze({
+    payloadVersion: 1 as const, walletPublicKey: exactBuyWalletPublicKey, providerId: 'primary',
+    side: 'BUY' as const, effectiveVenue: 'PUMP_FUN' as const, snapshotSlot: 125n,
+    quoteFingerprint: '7'.repeat(64), quoteObservedAtMs, quoteExpiresAtMs: quoteObservedAtMs + 60_000,
+    buildFingerprint: qualification.buildHash, snapshotFingerprint: '6'.repeat(64),
+    messageHash: sha256(messageBytes), messageBytes,
+    unsignedTransactionHash: sha256(unsignedTransactionBytes), unsignedTransactionBytes,
+    blockhash: exactBuyWalletPublicKey, lastValidBlockHeight: 1_000n,
+    unsignedSimulation: Object.freeze({
+      outcome: 'SUCCESS' as const, snapshotFingerprint: '6'.repeat(64),
+      buildFingerprint: qualification.buildHash, messageHash: sha256(messageBytes),
+      blockhash: exactBuyWalletPublicKey, lastValidBlockHeight: 1_000n,
+      blockhashContextSlot: 125n, feeContextSlot: 125n, estimatedFeeLamports: 5_000n,
+      simulationSlot: 125n, simulatedFeePayerLamportDebit: 5_000n, unitsConsumed: 25_000n,
+      simulatedBaseDeltaRaw: 100n, simulatedQuoteDeltaRaw: -1_000n,
+      logsFingerprint: '8'.repeat(64), logsLineCount: 1,
+    }),
+  });
+  const runtime = Object.freeze({
+    payloadVersion: 1 as const, phase: 'CANARY' as const, buildHash: qualification.buildHash,
+    configurationFingerprint: qualification.configurationFingerprint,
+    strategyFingerprint: qualification.strategyFingerprint, walletPublicKey: exactBuyWalletPublicKey,
+    cluster: 'mainnet-beta' as const, expectedGenesisHash: exactBuyWalletPublicKey,
+    observedGenesisHash: exactBuyWalletPublicKey, providerId: 'primary', quoteMaxAgeMs: 60_000,
+    slippageBps: 100n, snapshotMaxSlotLag: 8, maxComputeUnits: 200_000n,
+    maxFeeLamports: 5_000n, maxFeePayerLamportDebit: 100_000n,
+    maxRpcCallsPerAttempt: 12, leaseMs: 3_000,
+  });
+  const live = new PostgresExecutionLiveRepository(pool);
+  const authorization = await live.authorizeExactSigning(Object.freeze({
+    claim: begun.claim, attempt: begun.attempt, generationId, runtime, material,
+  }));
+  assert.ok(authorization.binding.armamentId !== null);
+  assert.ok(authorization.binding.reservationId !== null);
+  assert.ok(authorization.preSignatureLockId !== null);
+  const signed = VersionedTransaction.deserialize(
+    Uint8Array.from(authorization.material.unsignedTransactionBytes),
+  );
+  signed.sign([exactBuyWallet]);
+  const artifact = createSignedTransactionArtifact({
+    payloadVersion: 1, specificationVersion: 1, intentId: begun.claim.intent.id,
+    attemptNumber: begun.attempt.attemptNumber, generationId,
+    armamentId: authorization.binding.armamentId,
+    reservationId: authorization.binding.reservationId, exitAuthorizationId: null,
+    providerId: authorization.binding.providerId, walletPublicKey: exactBuyWalletPublicKey,
+    side: 'BUY', effectiveVenue: authorization.material.effectiveVenue,
+    messageHash: authorization.material.messageHash,
+    buildFingerprint: authorization.material.buildFingerprint,
+    snapshotFingerprint: authorization.material.snapshotFingerprint,
+    quoteFingerprint: authorization.material.quoteFingerprint,
+    quoteObservedAtMs: authorization.material.quoteObservedAtMs,
+    quoteExpiresAtMs: authorization.material.quoteExpiresAtMs,
+    blockhash: authorization.material.blockhash,
+    lastValidBlockHeight: authorization.material.lastValidBlockHeight,
+    signature: bs58.encode(signed.signatures[0] ?? new Uint8Array(64)),
+    signedTransactionBytes: signed.serialize(), signedAtMs: Date.now(),
+  });
+  return {
+    claim: begun.claim, artifact, unsignedSimulation: authorization.material.unsignedSimulation, runtime,
+    qualificationId: authorization.binding.qualificationId,
+    reservationId: authorization.binding.reservationId,
+    preSignatureLockId: authorization.preSignatureLockId,
+  };
+}
+
+function exactBuyCanaryPolicy() {
+  return createExecutionRiskPolicy({
     quoteMintAllowlist: [quoteMint], initialCapitalLamports: 1_000_000n,
     maximumCapitalLamports: 1_000_000n, positionSizeBps: 1_000n,
     maximumOpenPositions: 1, maximumTotalExposureBps: 500n, drawdownPauseBps: 2_500n,
@@ -869,62 +971,16 @@ async function createBuyFixture(pool: InstanceType<typeof pg.Pool>) {
     providerReconciliationCostUnitsPerPosition: 3n, providerSafetyMarginUnits: 5n,
     maximumConsecutiveTechnicalFailures: 2,
   });
-  const admitted = await new ExecutionAdmissionService(risk).admit({
-    payloadVersion: 1, intent: created.intent, policy, generationId,
-    walletSnapshot, providerSnapshot, allEndpointsUnavailable: false, nowMs,
-  });
-  assert.equal(admitted.decision, 'ADMITTED');
-  assert.ok(admitted.reservationId);
-  const claimed = await intents.claim({
-    ownerId: 'buy-reconciliation-test', leaseMs: 60_000, purpose: 'EXECUTE',
-  });
-  assert.ok(claimed);
-  const processing = await intents.transition(claimed, {
-    intentId: claimed.intent.id, expectedStatus: 'PENDING', nextStatus: 'PROCESSING',
-    leaseToken: claimed.leaseToken, reasonCode: 'EXECUTION_STARTED',
-    humanMessage: 'Prepare the canary BUY.', activationPhase: 'CANARY',
-    evidence: Object.freeze({
-      payloadVersion: 1, attemptNumber: null, sourceEventId: null, observedAtMs: nowMs,
-    }),
-  });
-  const begun = await intents.beginAttempt(Object.freeze({ ...claimed, intent: processing }));
-  const artifact = createSignedTransactionArtifact({
-    payloadVersion: 1, specificationVersion: 1, intentId: begun.claim.intent.id,
-    attemptNumber: begun.attempt.attemptNumber, generationId,
-    armamentId: armament.armamentId, reservationId: admitted.reservationId,
-    exitAuthorizationId: null, providerId: 'primary',
-    walletPublicKey, side: 'BUY', effectiveVenue: 'PUMP_FUN', messageHash: '4'.repeat(64),
-    buildFingerprint: '5'.repeat(64), snapshotFingerprint: 'd'.repeat(64),
-    quoteFingerprint: '7'.repeat(64), quoteObservedAtMs: nowMs,
-    quoteExpiresAtMs: nowMs + 60_000, blockhash: walletPublicKey,
-    lastValidBlockHeight: 1_000n, signature: bs58.encode(new Uint8Array(64).fill(8)),
-    signedTransactionBytes: Uint8Array.from([1, 2, 3, 4]), signedAtMs: nowMs + 4,
-  });
-  const unsignedSimulation = Object.freeze({
-    outcome: 'SUCCESS' as const, snapshotFingerprint: artifact.snapshotFingerprint,
-    buildFingerprint: artifact.buildFingerprint, messageHash: artifact.messageHash,
-    blockhash: artifact.blockhash, lastValidBlockHeight: artifact.lastValidBlockHeight,
-    blockhashContextSlot: 124n, feeContextSlot: 124n, estimatedFeeLamports: 5_000n,
-    simulationSlot: 125n, simulatedFeePayerLamportDebit: 5_000n, unitsConsumed: 25_000n,
-    simulatedBaseDeltaRaw: 100n, simulatedQuoteDeltaRaw: -1_000n,
-    logsFingerprint: '8'.repeat(64), logsLineCount: 1,
-  });
-  const runtime = Object.freeze({
-    payloadVersion: 1 as const, phase: 'CANARY' as const, buildHash: fingerprint,
-    configurationFingerprint: simulation.configurationFingerprint,
-    strategyFingerprint: '3'.repeat(64), walletPublicKey,
-    cluster: 'mainnet-beta' as const, expectedGenesisHash: walletPublicKey,
-    observedGenesisHash: walletPublicKey, providerId: 'primary',
-  });
-  return {
-    claim: begun.claim, artifact, unsignedSimulation, runtime,
-    qualificationId: qualification.qualificationId, reservationId: admitted.reservationId,
-  };
+}
+
+function sha256(bytes: readonly number[]): string {
+  return createHash('sha256').update(Uint8Array.from(bytes)).digest('hex');
 }
 
 function safetyQualification(
   nowMs: number,
   simulation: Awaited<ReturnType<typeof seedSuccessfulSimulation>>,
+  qualificationWalletPublicKey = walletPublicKey,
 ) {
   const evidenceTypes = [
     'CI_RUN', 'MIGRATION_TEST', 'ARCHITECTURE_TEST', 'DRY_RUN_TEST',
@@ -935,8 +991,9 @@ function safetyQualification(
   return createSafetyQualification({
     payloadVersion: 1, evaluatorVersion: 1, phase: 'CANARY', buildHash: fingerprint,
     configurationFingerprint: simulation.configurationFingerprint,
-    strategyFingerprint: '3'.repeat(64), generationId, walletPublicKey,
-    cluster: 'mainnet-beta', genesisHash: walletPublicKey, providerId: 'primary',
+    strategyFingerprint: '3'.repeat(64), generationId,
+    walletPublicKey: qualificationWalletPublicKey,
+    cluster: 'mainnet-beta', genesisHash: qualificationWalletPublicKey, providerId: 'primary',
     qualifiedAtMs: nowMs, expiresAtMs: nowMs + 300_000,
     gates: EXECUTION_SAFETY_GATE_IDS.map((gateId, index) => ({
       payloadVersion: 1, gateId, status: 'PASSED', evidenceType: evidenceTypes[index],
@@ -946,8 +1003,8 @@ function safetyQualification(
         ? createMainnetSimulationEvidenceFingerprint({
           artifactId: simulation.artifactId, resultFingerprint: simulation.resultFingerprint,
           buildHash: fingerprint, configurationFingerprint: simulation.configurationFingerprint,
-          strategyFingerprint: '3'.repeat(64), walletPublicKey,
-          genesisHash: walletPublicKey, providerId: 'primary',
+          strategyFingerprint: '3'.repeat(64), walletPublicKey: qualificationWalletPublicKey,
+          genesisHash: qualificationWalletPublicKey, providerId: 'primary',
         }) : index.toString(16).repeat(64),
       observedAtMs: gateId === 'MAINNET_PREFLIGHT_SIMULATED'
         ? simulation.recordedAtMs : nowMs - 1_000 + index,
@@ -956,13 +1013,43 @@ function safetyQualification(
   });
 }
 
-async function seedSuccessfulSimulation(pool: InstanceType<typeof pg.Pool>) {
+function qualificationWithCanarySnapshots(
+  template: ReturnType<typeof safetyQualification>,
+  walletSnapshot: ReturnType<typeof createExecutionWalletSnapshot>,
+  providerSnapshot: ReturnType<typeof createProviderUsageSnapshot>,
+) {
+  return createSafetyQualification({
+    payloadVersion: template.payloadVersion, evaluatorVersion: template.evaluatorVersion,
+    phase: template.phase, buildHash: template.buildHash,
+    configurationFingerprint: template.configurationFingerprint,
+    strategyFingerprint: template.strategyFingerprint, generationId: template.generationId,
+    walletPublicKey: template.walletPublicKey, cluster: template.cluster,
+    genesisHash: template.genesisHash, providerId: template.providerId,
+    qualifiedAtMs: template.qualifiedAtMs, expiresAtMs: template.expiresAtMs,
+    gates: template.gates.map((gate) => gate.gateId === 'WALLET_CHAIN_LIMITS_VERIFIED'
+      ? {
+        ...gate, evidenceId: walletSnapshot.snapshotId,
+        evidenceFingerprint: walletSnapshot.snapshotFingerprint,
+      }
+      : gate.gateId === 'PROVIDER_EXIT_CAPACITY_VERIFIED'
+        ? {
+          ...gate, evidenceId: providerSnapshot.snapshotId,
+          evidenceFingerprint: providerSnapshot.snapshotFingerprint,
+        }
+        : gate),
+  });
+}
+
+async function seedSuccessfulSimulation(
+  pool: InstanceType<typeof pg.Pool>,
+  simulationWalletPublicKey = walletPublicKey,
+) {
   const nowMs = Date.now();
   const intents = new PostgresExecutionIntentRepository(pool);
   const created = await intents.create(createExecutionIntentDraft({
     strategyId: 'simulation-strategy', strategyVersion: 1,
     positionId: `position-${randomUUID()}`, logicalCommandId: `command-${randomUUID()}`,
-    mint: walletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
+    mint: simulationWalletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1_000n,
     baseAmountRaw: null, minimumAmountOutRaw: 850n,
     decisionEventId: `event-${randomUUID()}`, decisionFingerprint: fingerprint,
@@ -987,8 +1074,9 @@ async function seedSuccessfulSimulation(pool: InstanceType<typeof pg.Pool>) {
     strategyId: begun.claim.intent.strategyId, strategyVersion: begun.claim.intent.strategyVersion,
     decisionFingerprint: begun.claim.intent.decisionFingerprint,
     resultKind: 'SUCCESS', effectiveVenue: 'PUMP_FUN', providerId: 'primary',
-    executorPublicKey: walletPublicKey, expectedGenesisHash: walletPublicKey,
-    observedGenesisHash: walletPublicKey, configurationFingerprint: fingerprint,
+    executorPublicKey: simulationWalletPublicKey,
+    expectedGenesisHash: simulationWalletPublicKey,
+    observedGenesisHash: simulationWalletPublicKey, configurationFingerprint: fingerprint,
     quoteFingerprint: fingerprint, snapshotFingerprint: fingerprint,
     buildFingerprint: fingerprint, messageHash: fingerprint, blockhash: walletPublicKey,
     lastValidBlockHeight: 1_000n, blockhashContextSlot: 900n, snapshotSlot: 899n,

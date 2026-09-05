@@ -3,7 +3,6 @@ import { assertExecutionIntent } from '../domain/execution-intent.js';
 import type {
   ExecutionBuyAdmissionInputV1,
   ExecutionBuyAdmissionResultV1,
-  ExecutionRiskRepository,
 } from '../ports/execution-risk-repository.js';
 
 const INPUT_KEYS = Object.freeze([
@@ -19,8 +18,12 @@ export class ExecutionAdmissionValidationError extends TypeError {
   }
 }
 
+export interface ExecutionBuyAdmissionGateway {
+  admitBuy(input: ExecutionBuyAdmissionInputV1): Promise<ExecutionBuyAdmissionResultV1>;
+}
+
 export class ExecutionAdmissionService {
-  public constructor(private readonly repository: ExecutionRiskRepository) {}
+  public constructor(private readonly repository: ExecutionBuyAdmissionGateway) {}
 
   public admit(input: unknown): Promise<ExecutionBuyAdmissionResultV1> {
     try {

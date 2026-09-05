@@ -1,12 +1,16 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import bs58 from 'bs58';
 import pg from 'pg';
 import {
-  createExecutionArmament,
+  Keypair, SystemProgram, TransactionMessage, VersionedTransaction,
+} from '@solana/web3.js';
+import {
   createOperatorAuthorization,
+  createExecutionArmamentRequestV2,
+  createOperatorAuthorizationV2,
 } from '../src/domain/execution-operations.js';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { createProviderUsageSnapshot } from '../src/domain/execution-provider-quota.js';
@@ -17,6 +21,7 @@ import {
   EXECUTION_SAFETY_GATE_IDS,
 } from '../src/domain/execution-safety-qualification.js';
 import { createExecutionSimulationArtifactDraft } from '../src/domain/execution-simulation.js';
+import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
 import { evaluateExecutionReconciliation } from '../src/domain/execution-reconciliation.js';
 import { createSignedTransactionArtifact } from '../src/domain/execution-live.js';
 import {
@@ -26,7 +31,6 @@ import {
   '../src/domain/execution-live-signed-simulation.js';
 import type { ExecutionSimulationEvidenceV1 } from
   '../src/ports/execution-simulation-gateway.js';
-import { ExecutionAdmissionService } from '../src/executor-risk/admission-service.js';
 import { migrateDatabase } from '../src/storage/database.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
 import {
@@ -44,22 +48,27 @@ const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const walletPublicKey = '11111111111111111111111111111111';
 const quoteMint = 'So11111111111111111111111111111111111111112';
 const fingerprint = '1'.repeat(64);
+const exactBuyWallet = Keypair.fromSeed(Uint8Array.from({ length: 32 }, () => 17));
+const exactBuyWalletPublicKey = exactBuyWallet.publicKey.toBase58();
 const roleProvisioningUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
 
 function submissionPreflight(artifact: ReturnType<typeof createSignedTransactionArtifact>) {
   return Object.freeze({
     runtime: Object.freeze({
       payloadVersion: 1 as const, phase: 'CANARY' as const,
-      buildHash: fingerprint, configurationFingerprint: fingerprint,
-      strategyFingerprint: '3'.repeat(64), walletPublicKey,
-      cluster: 'mainnet-beta' as const, expectedGenesisHash: walletPublicKey,
-      observedGenesisHash: walletPublicKey, providerId: 'primary',
+      buildHash: artifact.buildFingerprint, configurationFingerprint: fingerprint,
+      strategyFingerprint: '3'.repeat(64), walletPublicKey: artifact.walletPublicKey,
+      cluster: 'mainnet-beta' as const, expectedGenesisHash: artifact.walletPublicKey,
+      observedGenesisHash: artifact.walletPublicKey, providerId: artifact.providerId,
+      quoteMaxAgeMs: 60_000, slippageBps: 100n, snapshotMaxSlotLag: 8,
+      maxComputeUnits: 200_000n, maxFeeLamports: 5_000n,
+      maxFeePayerLamportDebit: 100_000n, maxRpcCallsPerAttempt: 12, leaseMs: 3_000,
     }),
     blockhashValidity: Object.freeze({
       payloadVersion: 1 as const, providerId: artifact.providerId,
       blockhash: artifact.blockhash, valid: true as const,
       observedBlockHeight: artifact.lastValidBlockHeight - 1n,
-      contextSlot: 127n, observedAtMs: Date.now(),
+      contextSlot: 127n, observedAtMs: Date.now() - 1_000,
     }),
   });
 }
@@ -519,8 +528,8 @@ void test('worker read-models expose fenced provider-affine inputs without signe
         },
         walletDeltaRequest: {
           signature: fixture.artifact.signature,
-          walletPublicKey,
-          mint: walletPublicKey,
+          walletPublicKey: fixture.artifact.walletPublicKey,
+          mint: fixture.artifact.walletPublicKey,
           quoteMint,
           side: 'BUY',
         },
@@ -882,6 +891,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
     const input = Object.freeze({
       payloadVersion: 1 as const,
       claim: fixture.claim,
+      preSignatureLockId: fixture.preSignatureLockId,
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
@@ -1274,16 +1284,16 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
       reservationId: null,
       exitAuthorizationId: reconciled.exitAuthorization.authorizationId,
       providerId: 'primary',
-      walletPublicKey,
+      walletPublicKey: fixture.artifact.walletPublicKey,
       side: 'SELL',
       effectiveVenue: 'PUMP_FUN',
       messageHash: 'a'.repeat(64),
-      buildFingerprint: 'b'.repeat(64),
+      buildFingerprint: fixture.artifact.buildFingerprint,
       snapshotFingerprint: 'c'.repeat(64),
       quoteFingerprint: 'e'.repeat(64),
       quoteObservedAtMs: exitTimelineMs,
       quoteExpiresAtMs: exitTimelineMs + 60_000,
-      blockhash: walletPublicKey,
+      blockhash: fixture.artifact.walletPublicKey,
       lastValidBlockHeight: sellLastValidBlockHeight,
       signature: bs58.encode(new Uint8Array(64).fill(10)),
       signedTransactionBytes: Uint8Array.from([5, 6, 7, 8]),
@@ -1310,6 +1320,7 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
     await repository.persistSigned(Object.freeze({
       payloadVersion: 1,
       claim: exitBegun.claim,
+      preSignatureLockId: null,
       qualificationId: fixture.qualificationId,
       reservationId: null,
       artifact: exitArtifact,
@@ -1476,6 +1487,133 @@ void test('concurrent BUY persistence locks one armament and replays exact bytes
   });
 });
 
+void test('BUY persistence commits only the exact authorized V2 pre-signature lock',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: exact BUY persistence test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await exactBuyPersistenceFixture(pool);
+      const unsigned = VersionedTransaction.deserialize(
+        Uint8Array.from(fixture.authorization.material.unsignedTransactionBytes),
+      );
+      const signed = VersionedTransaction.deserialize(
+        Uint8Array.from(fixture.input.artifact.signedTransactionBytes),
+      );
+      assert.deepEqual(signed.message.serialize(), unsigned.message.serialize());
+      assert.deepEqual(
+        signed.message.serialize(),
+        Uint8Array.from(fixture.authorization.material.messageBytes),
+      );
+
+      const authorized = await exactBuyLockState(pool, fixture);
+      assert.deepEqual(authorized, {
+        lockState: 'AUTHORIZED', lockRevision: '0', armamentState: 'LOCKED',
+        armamentRevision: '1', consumedBuys: 1, artifacts: 0,
+      });
+
+      const persisted = await fixture.live.persistSigned(fixture.input);
+      assert.deepEqual(persisted.artifact, fixture.input.artifact);
+      assert.deepEqual(await fixture.live.persistSigned(fixture.input), persisted);
+      assert.deepEqual(await exactBuyLockState(pool, fixture), {
+        lockState: 'SIGNED_PERSISTED', lockRevision: '1', armamentState: 'LOCKED',
+        armamentRevision: '1', consumedBuys: 1, artifacts: 1,
+      });
+    });
+  });
+
+void test('BUY persistence rejects a missing or mismatched exact pre-signature lock without side effects',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: exact BUY persistence test skipped');
+      return;
+    }
+    for (const preSignatureLockId of [
+      null,
+      `execution_pre_signature_lock_${'f'.repeat(64)}`,
+    ]) {
+      await withTemporarySchema(databaseUrl, async (pool) => {
+        const fixture = await exactBuyPersistenceFixture(pool);
+        await assert.rejects(fixture.live.persistSigned(Object.freeze({
+          ...fixture.input,
+          preSignatureLockId,
+        })));
+        assert.deepEqual(await exactBuyLockState(pool, fixture), {
+          lockState: 'AUTHORIZED', lockRevision: '0', armamentState: 'LOCKED',
+          armamentRevision: '1', consumedBuys: 1, artifacts: 0,
+        });
+      });
+    }
+  });
+
+void test('BUY persistence rejects signed V0 bytes whose reconstructed unsigned envelope differs',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: exact BUY persistence test skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      const fixture = await exactBuyPersistenceFixture(pool);
+      const substituted = new VersionedTransaction(new TransactionMessage({
+        payerKey: exactBuyWallet.publicKey,
+        recentBlockhash: exactBuyWalletPublicKey,
+        instructions: [SystemProgram.transfer({
+          fromPubkey: exactBuyWallet.publicKey,
+          toPubkey: exactBuyWallet.publicKey,
+          lamports: 1,
+        })],
+      }).compileToV0Message());
+      substituted.sign([exactBuyWallet]);
+      const substitutedMessageHash = sha256([...substituted.message.serialize()]);
+      const mismatchedArtifact = createSignedTransactionArtifact({
+        payloadVersion: fixture.input.artifact.payloadVersion,
+        specificationVersion: fixture.input.artifact.specificationVersion,
+        intentId: fixture.input.artifact.intentId,
+        attemptNumber: fixture.input.artifact.attemptNumber,
+        generationId: fixture.input.artifact.generationId,
+        armamentId: fixture.input.artifact.armamentId,
+        reservationId: fixture.input.artifact.reservationId,
+        exitAuthorizationId: fixture.input.artifact.exitAuthorizationId,
+        providerId: fixture.input.artifact.providerId,
+        walletPublicKey: fixture.input.artifact.walletPublicKey,
+        side: fixture.input.artifact.side,
+        effectiveVenue: fixture.input.artifact.effectiveVenue,
+        messageHash: substitutedMessageHash,
+        buildFingerprint: fixture.input.artifact.buildFingerprint,
+        snapshotFingerprint: fixture.input.artifact.snapshotFingerprint,
+        quoteFingerprint: fixture.input.artifact.quoteFingerprint,
+        quoteObservedAtMs: fixture.input.artifact.quoteObservedAtMs,
+        quoteExpiresAtMs: fixture.input.artifact.quoteExpiresAtMs,
+        blockhash: fixture.input.artifact.blockhash,
+        lastValidBlockHeight: fixture.input.artifact.lastValidBlockHeight,
+        signature: bs58.encode(substituted.signatures[0] ?? new Uint8Array(64)),
+        signedTransactionBytes: substituted.serialize(),
+        signedAtMs: fixture.input.artifact.signedAtMs,
+      });
+      assert.notDeepEqual(
+        VersionedTransaction.deserialize(Uint8Array.from(mismatchedArtifact.signedTransactionBytes))
+          .message.serialize(),
+        Uint8Array.from(fixture.authorization.material.messageBytes),
+      );
+      await assert.rejects(fixture.live.persistSigned(Object.freeze({
+        ...fixture.input,
+        artifact: mismatchedArtifact,
+        unsignedSimulation: Object.freeze({
+          ...fixture.input.unsignedSimulation,
+          messageHash: substitutedMessageHash,
+        }),
+      })));
+      assert.deepEqual(await exactBuyLockState(pool, fixture), {
+        lockState: 'AUTHORIZED', lockRevision: '0', armamentState: 'LOCKED',
+        armamentRevision: '1', consumedBuys: 1, artifacts: 0,
+      });
+    });
+  });
+
 void test('RPC reservations remain bounded across repository instances and process recovery',
   async (context) => {
     const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -1490,6 +1628,7 @@ void test('RPC reservations remain bounded across repository instances and proce
       const persisted = await first.persistSigned(Object.freeze({
         payloadVersion: 1,
         claim: fixture.claim,
+        preSignatureLockId: fixture.preSignatureLockId,
         qualificationId: fixture.qualificationId,
         reservationId: fixture.reservationId,
         artifact: fixture.artifact,
@@ -1516,6 +1655,7 @@ void test('RPC reservations remain bounded across repository instances and proce
       const replay = await first.persistSigned(Object.freeze({
         payloadVersion: 1,
         claim: fixture.claim,
+        preSignatureLockId: fixture.preSignatureLockId,
         qualificationId: fixture.qualificationId,
         reservationId: fixture.reservationId,
         artifact: fixture.artifact,
@@ -1551,7 +1691,7 @@ void test('RPC reservations remain bounded across repository instances and proce
     });
   });
 
-void test('preparation binding resolves the exact BUY authority from the active claim',
+void test('exact signing authorization resolves and consumes the BUY preparation authority',
   async (context) => {
     const databaseUrl = process.env.TEST_DATABASE_URL;
     if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -1560,11 +1700,7 @@ void test('preparation binding resolves the exact BUY authority from the active 
     }
     await withTemporarySchema(databaseUrl, async (pool) => {
       const fixture = await liveFixture(pool);
-      const binding = await new PostgresExecutionLiveRepository(pool).readPreparationBinding({
-        claim: fixture.claim,
-        generationId,
-        runtime: submissionPreflight(fixture.artifact).runtime,
-      });
+      const binding = fixture.authorization.binding;
 
       assert.deepEqual(binding, {
         payloadVersion: 1,
@@ -1581,9 +1717,7 @@ void test('preparation binding resolves the exact BUY authority from the active 
       const baseline = submissionPreflight(fixture.artifact).runtime;
       await assert.rejects(
         new PostgresExecutionLiveRepository(pool).readPreparationBinding({
-          claim: fixture.claim,
-          generationId,
-          runtime: Object.freeze({ ...baseline, buildHash: 'f'.repeat(64) }),
+          claim: fixture.claim, generationId, runtime: baseline,
         }),
         isLiveRepositoryError('PREFLIGHT_EXPIRED'),
       );
@@ -1616,6 +1750,7 @@ void test('signed simulation commit-unknown replays one durable evidence row', a
     const repository = new PostgresExecutionLiveRepository(pool);
     await repository.persistSigned(Object.freeze({
       payloadVersion: 1, claim: fixture.claim,
+      preSignatureLockId: fixture.preSignatureLockId,
       qualificationId: fixture.qualificationId, reservationId: fixture.reservationId,
       artifact: fixture.artifact, unsignedSimulation: fixture.unsignedSimulation,
       rpcBudget: fixture.rpcBudget,
@@ -1673,6 +1808,7 @@ void test('fails closed when the durable control is stopped before persistence',
     }, 'ENTRY_STOP');
     await assert.rejects(new PostgresExecutionLiveRepository(pool).persistSigned(Object.freeze({
       payloadVersion: 1, claim: fixture.claim,
+      preSignatureLockId: fixture.preSignatureLockId,
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId, artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
@@ -1684,9 +1820,9 @@ void test('fails closed when the durable control is stopped before persistence',
   });
 });
 
-for (const scenario of ['RETIRED_GENERATION', 'RUNTIME_BINDING', 'CAPITAL_LIMIT', 'EXPOSURE_LIMIT',
+for (const scenario of ['RETIRED_GENERATION', 'RUNTIME_BINDING', 'EXPOSURE_LIMIT',
   'DRAWDOWN_DRIFT', 'PROVIDER_USAGE_DRIFT', 'PROVIDER_RATE_LIMIT_DRIFT',
-  'QUOTE_EXPIRED', 'BLOCKHASH_EXPIRED'] as const) {
+  'BLOCKHASH_EXPIRED'] as const) {
   void test(`atomic submission gate rejects ${scenario} without durable authorization`,
     async (context) => {
       const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -1695,14 +1831,11 @@ for (const scenario of ['RETIRED_GENERATION', 'RUNTIME_BINDING', 'CAPITAL_LIMIT'
         return;
       }
       await withTemporarySchema(databaseUrl, async (pool) => {
-        const fixture = await liveFixture(
-          pool,
-          scenario === 'QUOTE_EXPIRED' ? 15 : 60_000,
-          scenario === 'CAPITAL_LIMIT' ? 500n : 500_000n,
-        );
+        const fixture = await liveFixture(pool);
         const repository = new PostgresExecutionLiveRepository(pool);
         await repository.persistSigned(Object.freeze({
           payloadVersion: 1, claim: fixture.claim,
+          preSignatureLockId: fixture.preSignatureLockId,
           qualificationId: fixture.qualificationId,
           reservationId: fixture.reservationId,
           artifact: fixture.artifact,
@@ -1752,7 +1885,6 @@ for (const scenario of ['RETIRED_GENERATION', 'RUNTIME_BINDING', 'CAPITAL_LIMIT'
             endpointId: 'primary', observedAtMs: Date.now(),
           });
         }
-        if (scenario === 'QUOTE_EXPIRED') await pool.query('SELECT pg_sleep(0.030)');
         const baseline = submissionPreflight(fixture.artifact);
         const preflight = scenario === 'RUNTIME_BINDING'
           ? Object.freeze({ ...baseline, runtime: Object.freeze({
@@ -1791,6 +1923,7 @@ void test('finalized no-effect evidence closes an ambiguous artifact without ope
     const repository = new PostgresExecutionLiveRepository(pool);
     await repository.persistSigned(Object.freeze({
       payloadVersion: 1, claim: fixture.claim,
+      preSignatureLockId: fixture.preSignatureLockId,
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
@@ -1879,6 +2012,7 @@ void test('lease expiry while reconciliation waits on the intent lock fails clos
     const repository = new PostgresExecutionLiveRepository(pool);
     await repository.persistSigned(Object.freeze({
       payloadVersion: 1, claim: fixture.claim,
+      preSignatureLockId: fixture.preSignatureLockId,
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
@@ -2026,6 +2160,7 @@ void test('finalized BUY evidence reconciles an ambiguous submission without con
     const repository = new PostgresExecutionLiveRepository(pool);
     await repository.persistSigned(Object.freeze({
       payloadVersion: 1, claim: fixture.claim,
+      preSignatureLockId: fixture.preSignatureLockId,
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
@@ -2230,6 +2365,7 @@ void test('rejects a lost lease and a superseded provider quota snapshot', async
     const repository = new PostgresExecutionLiveRepository(pool);
     const input = Object.freeze({
       payloadVersion: 1 as const, claim: fixture.claim,
+      preSignatureLockId: fixture.preSignatureLockId,
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId, artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
@@ -2257,6 +2393,7 @@ void test('rejects a lost lease and a superseded provider quota snapshot', async
     await new PostgresExecutionRiskRepository(pool).appendProviderUsage(newer);
     await assert.rejects(new PostgresExecutionLiveRepository(pool).persistSigned(Object.freeze({
       payloadVersion: 1, claim: fixture.claim,
+      preSignatureLockId: fixture.preSignatureLockId,
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId, artifact: fixture.artifact,
       unsignedSimulation: fixture.unsignedSimulation,
@@ -2276,6 +2413,7 @@ void test('rejects a signed artifact state update without its immutable journal 
     const repository = new PostgresExecutionLiveRepository(pool);
     await repository.persistSigned(Object.freeze({
       payloadVersion: 1, claim: fixture.claim,
+      preSignatureLockId: fixture.preSignatureLockId,
       qualificationId: fixture.qualificationId,
       reservationId: fixture.reservationId,
       artifact: fixture.artifact,
@@ -2471,6 +2609,15 @@ void test('PostgreSQL 16 recovery authority commits finality and creates a deadl
         'SELECT status FROM execution_intents WHERE id=$1',
         [fixture.claim.intent.id],
       )).rows[0]?.status, 'UNKNOWN_REQUIRES_RECONCILIATION');
+      await assert.rejects(recoveryDatabase.startup.query(`INSERT INTO execution_control_events (
+        event_id,payload_version,event_fingerprint,generation_id,previous_state,next_state,
+        reason_code,qualification_id,authorization_id,operator_id,actor_type,actor_id,occurred_at
+      ) VALUES ($1,1,$2,$3,'ENTRY_STOP','HARD_STOP','OPERATOR_HARD_STOP',NULL,NULL,
+        'forged-operator','OPERATOR','forged-operator',statement_timestamp())`, [
+        `execution_control_event_${'e'.repeat(64)}`, 'e'.repeat(64),
+        fixture.artifact.generationId,
+      ]), (error: unknown) => typeof error === 'object' && error !== null
+        && 'code' in error && error.code === '42501');
 
       const matchedClaim = await recoveryDatabase.intents.claimReconciliation(
         'h2a-reconciliation-matched', 60_000,
@@ -2558,143 +2705,233 @@ async function liveFixture(
   maximumCanaryCapitalLamports = 500_000n,
   lastValidBlockHeight = 1_000n,
 ) {
-  await migrateDatabase({ pool });
-  const simulation = await seedSuccessfulSimulation(pool);
-  const risk = new PostgresExecutionRiskRepository(pool);
-  await risk.registerWalletGeneration({
-    generationId, payloadVersion: 1, walletPublicKey,
-    cluster: 'mainnet-beta', genesisHash: walletPublicKey, generation: 1,
-  });
-  const nowMs = Date.now();
-  const operations = new PostgresExecutionOperationsRepository(pool);
-  const qualification = safetyQualification(nowMs, simulation);
-  await operations.persistQualification(qualification);
-  await operations.setStop({
-    payloadVersion: 1, commandId: `command:stop:${randomUUID()}`, generationId,
-    operatorId: 'operator-primary', occurredAtMs: nowMs,
-  }, 'ENTRY_STOP');
-  const resume = createOperatorAuthorization({
-    payloadVersion: 1, generationId, action: 'RESUME', phase: null,
-    contextFingerprint: qualification.qualificationFingerprint,
-    nonceHash: 'b'.repeat(64), operatorId: 'operator-primary',
-    issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
-  });
-  await operations.recordAuthorization(resume);
-  await operations.resume({
-    payloadVersion: 1, commandId: `command:resume:${randomUUID()}`, generationId,
-    qualificationId: qualification.qualificationId, authorization: resume,
-    operatorId: 'operator-primary', occurredAtMs: nowMs + 1,
-  });
-  const armAuthorization = createOperatorAuthorization({
-    payloadVersion: 1, generationId, action: 'ARM', phase: 'CANARY',
-    contextFingerprint: qualification.qualificationFingerprint,
-    nonceHash: 'c'.repeat(64), operatorId: 'operator-primary',
-    issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
-  });
-  await operations.recordAuthorization(armAuthorization);
-  const armament = createExecutionArmament({
-    payloadVersion: 1, qualification, maximumBuys: 1,
-    maximumCapitalLamports: maximumCanaryCapitalLamports, maximumExposureBps: 500n,
-    maximumOpenPositions: 1, maximumHoldingMs: 30_000,
-    armedAtMs: nowMs + 2, expiresAtMs: nowMs + 120_000,
-    operatorId: 'operator-primary', operatorReason: 'Mainnet canary manually approved.',
-    authorizationId: armAuthorization.authorizationId,
-    authorizationFingerprint: armAuthorization.authorizationFingerprint,
-  });
-  await operations.arm(armament);
+  return exactBuyPersistenceFixture(pool, Object.freeze({
+    quoteLifetimeMs, maximumCanaryCapitalLamports, lastValidBlockHeight,
+  }));
+}
 
-  const walletSnapshot = await risk.appendWalletSnapshot(Object.freeze({
-    snapshotId: `execution_wallet_snapshot_${'d'.repeat(64)}`,
-    payloadVersion: 1 as const, snapshotFingerprint: 'd'.repeat(64), generationId,
-    providerId: 'primary', stateRevision: 0n, slot: 123n,
-    blockTimeMs: nowMs - 100, observedAtMs: nowMs - 50,
-    commitment: 'finalized' as const, walletLamports: 1_000_000n,
-    tokenBalanceCount: 0, openPositions: Object.freeze([]), realizedNetPnlRaw: 0n,
-  }));
-  const providerSnapshot = createProviderUsageSnapshot({
-    providerId: 'primary', planId: 'public-v1', billingPeriodId: `period-${nowMs}`,
-    billingPeriodStartedAtMs: nowMs - 1_000,
-    billingPeriodEndsAtMs: nowMs + 300_000,
-    limitUnits: 10_000n, usedUnits: 10n, measuredAtMs: nowMs - 100,
-    expiresAtMs: nowMs + 60_000, provenance: 'AUTHORITATIVE_PROBE',
-  });
-  await risk.appendProviderUsage(providerSnapshot);
+async function exactBuyPersistenceFixture(
+  pool: InstanceType<typeof pg.Pool>,
+  options: Readonly<{
+    readonly quoteLifetimeMs?: number;
+    readonly maximumCanaryCapitalLamports?: bigint;
+    readonly lastValidBlockHeight?: bigint;
+  }> = {},
+) {
+  const quoteLifetimeMs = options.quoteLifetimeMs ?? 60_000;
+  const maximumCanaryCapitalLamports = options.maximumCanaryCapitalLamports ?? 500_000n;
+  const lastValidBlockHeight = options.lastValidBlockHeight ?? 1_000n;
+  await migrateDatabase({ pool });
+  const risk = new PostgresExecutionRiskRepository(pool);
   const intents = new PostgresExecutionIntentRepository(pool);
-  const created = await intents.create(createExecutionIntentDraft({
-    strategyId: 'live-canary-test', strategyVersion: 1,
-    positionId: `position:${randomUUID()}`, logicalCommandId: `command:${randomUUID()}`,
-    mint: walletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
-    quoteMint, quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
-    quoteAmountRaw: 1_000n, baseAmountRaw: null, minimumAmountOutRaw: 90n,
-    decisionEventId: `decision:${randomUUID()}`, decisionFingerprint: fingerprint,
-    requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
-  }));
-  const policy = createExecutionRiskPolicy({
-    quoteMintAllowlist: [quoteMint], initialCapitalLamports: 1_000_000n,
-    maximumCapitalLamports: 1_000_000n, positionSizeBps: 1_000n,
-    maximumOpenPositions: 1, maximumTotalExposureBps: 500n,
-    drawdownPauseBps: 2_500n, feeReserveLamports: 100_000n,
-    walletSnapshotMaxAgeMs: 60_000, providerUsageMaxAgeMs: 300_000,
-    providerEntryCostUnits: 8n, providerExitCostUnitsPerPosition: 4n,
-    providerConfirmationCostUnitsPerPosition: 2n,
-    providerReconciliationCostUnitsPerPosition: 3n,
-    providerSafetyMarginUnits: 5n, maximumConsecutiveTechnicalFailures: 2,
+  await risk.registerWalletGeneration({
+    generationId, payloadVersion: 1, walletPublicKey: exactBuyWalletPublicKey,
+    cluster: 'mainnet-beta', genesisHash: exactBuyWalletPublicKey, generation: 1,
   });
-  const admitted = await new ExecutionAdmissionService(risk).admit(Object.freeze({
-    payloadVersion: 1, intent: created.intent, policy, generationId,
-    walletSnapshot, providerSnapshot, allEndpointsUnavailable: false, nowMs,
+  const snapshotNowMs = Date.now();
+  const walletSnapshot = createExecutionWalletSnapshot({
+    generationId, providerId: 'primary', stateRevision: 0n, slot: 123n,
+    blockTimeMs: snapshotNowMs - 100, observedAtMs: snapshotNowMs - 50,
+    commitment: 'finalized', walletLamports: 1_000_000n, tokenBalanceCount: 0,
+    openPositions: [], realizedNetPnlRaw: 0n,
+  });
+  const providerSnapshot = createProviderUsageSnapshot({
+    providerId: 'primary', planId: 'canary-v1', billingPeriodId: `period-${snapshotNowMs}`,
+    billingPeriodStartedAtMs: snapshotNowMs - 60_000,
+    billingPeriodEndsAtMs: snapshotNowMs + 600_000, limitUnits: 1_000n, usedUnits: 1n,
+    measuredAtMs: snapshotNowMs - 50, expiresAtMs: snapshotNowMs + 300_000,
+    provenance: 'OPERATOR_REPORT',
+  });
+  const simulation = await seedSuccessfulSimulation(pool, exactBuyWalletPublicKey);
+  const nowMs = Date.now();
+  const qualification = qualificationWithCanarySnapshots(
+    safetyQualification(nowMs, simulation, exactBuyWalletPublicKey),
+    walletSnapshot,
+    providerSnapshot,
+  );
+  const operations = new PostgresExecutionOperationsRepository(pool);
+  await operations.persistQualification(qualification);
+  const resumeAuthorization = createOperatorAuthorization({
+    payloadVersion: 1, generationId, action: 'RESUME', phase: null,
+    contextFingerprint: qualification.qualificationFingerprint, nonceHash: '9'.repeat(64),
+    operatorId: 'operator-primary', issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+  });
+  await operations.recordAuthorization(resumeAuthorization);
+  await operations.resume({
+    payloadVersion: 1, commandId: `command:exact-buy-resume:${randomUUID()}`, generationId,
+    qualificationId: qualification.qualificationId, authorization: resumeAuthorization,
+    operatorId: 'operator-primary', occurredAtMs: nowMs,
+  });
+  const target = await intents.create(createExecutionIntentDraft({
+    strategyId: 'exact-buy-target', strategyVersion: 1,
+    positionId: `position:exact-buy:${randomUUID()}`,
+    logicalCommandId: `command:exact-buy:${randomUUID()}`,
+    mint: exactBuyWalletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
+    quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1_000n,
+    baseAmountRaw: null, minimumAmountOutRaw: 1n,
+    decisionEventId: `decision:exact-buy:${randomUUID()}`,
+    decisionFingerprint: 'd'.repeat(64), requestedAtMs: nowMs - 1_000,
+    expiresAtMs: nowMs + 120_000,
   }));
-  assert.equal(admitted.decision, 'ADMITTED');
-  assert.ok(admitted.reservationId);
+  const request = createExecutionArmamentRequestV2({
+    payloadVersion: 2, qualification, targetIntentId: target.intent.id,
+    policy: exactBuyCanaryPolicy(), walletSnapshot, providerSnapshot,
+    allEndpointsUnavailable: false, capturedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
+    target: {
+      intentId: target.intent.id, stateRevision: target.intent.stateRevision,
+      strategyId: target.intent.strategyId, strategyVersion: target.intent.strategyVersion,
+      decisionFingerprint: target.intent.decisionFingerprint, mint: target.intent.mint,
+      quoteMint: target.intent.quoteMint, quoteAmountRaw: target.intent.quoteAmountRaw,
+    },
+    maximumBuys: 1, maximumCapitalLamports: maximumCanaryCapitalLamports,
+    maximumExposureBps: 500n,
+    maximumOpenPositions: 1, maximumHoldingMs: 30_000, runtimeQuoteMaxAgeMs: 60_000,
+    runtimeSlippageBps: 100n, runtimeSnapshotMaxSlotLag: 8,
+    runtimeMaxComputeUnits: 200_000n, runtimeMaxFeeLamports: 5_000n,
+    runtimeMaxFeePayerLamportDebit: 100_000n, runtimeMaxRpcCallsPerAttempt: 12,
+    runtimeLeaseMs: 3_000, armedAtMs: nowMs, armamentExpiresAtMs: nowMs + 120_000,
+    operatorId: 'operator-primary', operatorReason: 'Mainnet canary manually approved.',
+  });
+  const armamentAuthorization = createOperatorAuthorizationV2({
+    payloadVersion: 2, generationId, action: 'ARM', phase: 'CANARY',
+    contextFingerprint: request.armamentRequestFingerprint, nonceHash: 'e'.repeat(64),
+    operatorId: 'operator-primary', issuedAtMs: nowMs, expiresAtMs: nowMs + 60_000,
+  });
+  await operations.armCanary(Object.freeze({ request, authorization: armamentAuthorization }));
   const claimed = await intents.claim({
-    ownerId: 'live-executor-test', leaseMs: 60_000, purpose: 'EXECUTE',
+    ownerId: 'exact-buy-lock-holder', leaseMs: 30_000,
+    purpose: 'LIVE_EXECUTE', side: 'BUY', generationId,
   });
   assert.ok(claimed);
-  assert.equal(claimed.intent.id, created.intent.id);
   const processingIntent = await intents.transition(claimed, {
     intentId: claimed.intent.id, expectedStatus: 'PENDING', nextStatus: 'PROCESSING',
     leaseToken: claimed.leaseToken, reasonCode: 'EXECUTION_STARTED',
-    humanMessage: 'Live canary preparation started.', activationPhase: 'CANARY',
+    humanMessage: 'Exact BUY signing test started.', activationPhase: 'CANARY',
     evidence: Object.freeze({
       payloadVersion: 1, attemptNumber: null, sourceEventId: null, observedAtMs: nowMs,
     }),
   });
   const begun = await intents.beginAttempt(Object.freeze({ ...claimed, intent: processingIntent }));
-  const claim = begun.claim;
-  const bytes = Uint8Array.from([1, 2, 3, 4]);
+  const unsigned = new VersionedTransaction(new TransactionMessage({
+    payerKey: exactBuyWallet.publicKey, recentBlockhash: exactBuyWalletPublicKey, instructions: [],
+  }).compileToV0Message());
+  const messageBytes = Object.freeze([...unsigned.message.serialize()]);
+  const unsignedTransactionBytes = Object.freeze([...unsigned.serialize()]);
+  const quoteObservedAtMs = Date.now();
+  const material = Object.freeze({
+    payloadVersion: 1 as const, walletPublicKey: exactBuyWalletPublicKey, providerId: 'primary',
+    side: 'BUY' as const, effectiveVenue: 'PUMP_FUN' as const, snapshotSlot: 125n,
+    quoteFingerprint: '7'.repeat(64), quoteObservedAtMs,
+    quoteExpiresAtMs: quoteObservedAtMs + quoteLifetimeMs,
+    buildFingerprint: qualification.buildHash,
+    snapshotFingerprint: walletSnapshot.snapshotFingerprint,
+    messageHash: sha256(messageBytes), messageBytes,
+    unsignedTransactionHash: sha256(unsignedTransactionBytes), unsignedTransactionBytes,
+    blockhash: exactBuyWalletPublicKey, lastValidBlockHeight,
+    unsignedSimulation: Object.freeze({
+      outcome: 'SUCCESS' as const, snapshotFingerprint: walletSnapshot.snapshotFingerprint,
+      buildFingerprint: qualification.buildHash, messageHash: sha256(messageBytes),
+      blockhash: exactBuyWalletPublicKey, lastValidBlockHeight,
+      blockhashContextSlot: 125n, feeContextSlot: 125n, estimatedFeeLamports: 5_000n,
+      simulationSlot: 125n, simulatedFeePayerLamportDebit: 5_000n, unitsConsumed: 25_000n,
+      simulatedBaseDeltaRaw: 100n, simulatedQuoteDeltaRaw: -1_000n,
+      logsFingerprint: '8'.repeat(64), logsLineCount: 1,
+    }),
+  });
+  const runtime = Object.freeze({
+    payloadVersion: 1 as const, phase: 'CANARY' as const, buildHash: qualification.buildHash,
+    configurationFingerprint: qualification.configurationFingerprint,
+    strategyFingerprint: qualification.strategyFingerprint, walletPublicKey: exactBuyWalletPublicKey,
+    cluster: 'mainnet-beta' as const, expectedGenesisHash: exactBuyWalletPublicKey,
+    observedGenesisHash: exactBuyWalletPublicKey, providerId: 'primary', quoteMaxAgeMs: 60_000,
+    slippageBps: 100n, snapshotMaxSlotLag: 8, maxComputeUnits: 200_000n,
+    maxFeeLamports: 5_000n, maxFeePayerLamportDebit: 100_000n,
+    maxRpcCallsPerAttempt: 12, leaseMs: 3_000,
+  });
+  const live = new PostgresExecutionLiveRepository(pool);
+  const authorization = await live.authorizeExactSigning(Object.freeze({
+    claim: begun.claim, attempt: begun.attempt, generationId, runtime, material,
+  }));
+  assert.ok(authorization.binding.armamentId !== null);
+  assert.ok(authorization.binding.reservationId !== null);
+  assert.ok(authorization.preSignatureLockId !== null);
+  const signed = VersionedTransaction.deserialize(
+    Uint8Array.from(authorization.material.unsignedTransactionBytes),
+  );
+  signed.sign([exactBuyWallet]);
   const artifact = createSignedTransactionArtifact({
-    payloadVersion: 1, specificationVersion: 1,
-    intentId: claim.intent.id, attemptNumber: begun.attempt.attemptNumber,
-    generationId, armamentId: armament.armamentId, exitAuthorizationId: null,
-    reservationId: admitted.reservationId,
-    providerId: 'primary', walletPublicKey, side: 'BUY', effectiveVenue: 'PUMP_FUN',
-    messageHash: '4'.repeat(64), buildFingerprint: '5'.repeat(64),
-    snapshotFingerprint: 'd'.repeat(64), quoteFingerprint: '7'.repeat(64),
-    quoteObservedAtMs: nowMs,
-    quoteExpiresAtMs: nowMs + quoteLifetimeMs,
-    blockhash: walletPublicKey, lastValidBlockHeight,
-    signature: bs58.encode(new Uint8Array(64).fill(8)),
-    signedTransactionBytes: bytes, signedAtMs: nowMs + 4,
+    payloadVersion: 1, specificationVersion: 1, intentId: begun.claim.intent.id,
+    attemptNumber: begun.attempt.attemptNumber, generationId,
+    armamentId: authorization.binding.armamentId,
+    reservationId: authorization.binding.reservationId, exitAuthorizationId: null,
+    providerId: authorization.binding.providerId, walletPublicKey: exactBuyWalletPublicKey,
+    side: 'BUY', effectiveVenue: authorization.material.effectiveVenue,
+    messageHash: authorization.material.messageHash,
+    buildFingerprint: authorization.material.buildFingerprint,
+    snapshotFingerprint: authorization.material.snapshotFingerprint,
+    quoteFingerprint: authorization.material.quoteFingerprint,
+    quoteObservedAtMs: authorization.material.quoteObservedAtMs,
+    quoteExpiresAtMs: authorization.material.quoteExpiresAtMs,
+    blockhash: authorization.material.blockhash,
+    lastValidBlockHeight: authorization.material.lastValidBlockHeight,
+    signature: bs58.encode(signed.signatures[0] ?? new Uint8Array(64)),
+    signedTransactionBytes: signed.serialize(), signedAtMs: Date.now(),
   });
-  const unsignedSimulation = Object.freeze({
-    outcome: 'SUCCESS' as const, snapshotFingerprint: artifact.snapshotFingerprint,
-    buildFingerprint: artifact.buildFingerprint, messageHash: artifact.messageHash,
-    blockhash: artifact.blockhash, lastValidBlockHeight: artifact.lastValidBlockHeight,
-    blockhashContextSlot: 124n, feeContextSlot: 124n,
-    estimatedFeeLamports: 5_000n, simulationSlot: 125n,
-    simulatedFeePayerLamportDebit: 5_000n, unitsConsumed: 25_000n,
-    simulatedBaseDeltaRaw: 100n, simulatedQuoteDeltaRaw: -1_000n,
-    logsFingerprint: '8'.repeat(64), logsLineCount: 1,
-  });
-  const rpcBudget = Object.freeze({
-    payloadVersion: 1 as const, callsUsed: 5, callsLimit: 12,
+  const input = Object.freeze({
+    payloadVersion: 1 as const, claim: begun.claim,
+    preSignatureLockId: authorization.preSignatureLockId,
+    qualificationId: authorization.binding.qualificationId,
+    reservationId: authorization.binding.reservationId, artifact,
+    unsignedSimulation: authorization.material.unsignedSimulation,
+    rpcBudget: Object.freeze({ payloadVersion: 1 as const, callsUsed: 5, callsLimit: 12 }),
   });
   return Object.freeze({
-    claim, artifact, unsignedSimulation, rpcBudget, providerSnapshot,
-    armamentId: armament.armamentId,
-    qualificationId: qualification.qualificationId,
-    reservationId: admitted.reservationId,
+    live, input, authorization, claim: begun.claim, artifact,
+    unsignedSimulation: authorization.material.unsignedSimulation,
+    rpcBudget: input.rpcBudget, providerSnapshot,
+    armamentId: authorization.binding.armamentId,
+    qualificationId: authorization.binding.qualificationId,
+    reservationId: authorization.binding.reservationId,
+    preSignatureLockId: authorization.preSignatureLockId,
   });
+}
+
+function exactBuyCanaryPolicy() {
+  return createExecutionRiskPolicy({
+    quoteMintAllowlist: [quoteMint], initialCapitalLamports: 1_000_000n,
+    maximumCapitalLamports: 1_000_000n, positionSizeBps: 1_000n,
+    maximumOpenPositions: 1, maximumTotalExposureBps: 500n, drawdownPauseBps: 2_500n,
+    feeReserveLamports: 100_000n, walletSnapshotMaxAgeMs: 60_000,
+    providerUsageMaxAgeMs: 300_000, providerEntryCostUnits: 8n,
+    providerExitCostUnitsPerPosition: 4n, providerConfirmationCostUnitsPerPosition: 2n,
+    providerReconciliationCostUnitsPerPosition: 3n, providerSafetyMarginUnits: 5n,
+    maximumConsecutiveTechnicalFailures: 2,
+  });
+}
+
+async function exactBuyLockState(
+  pool: InstanceType<typeof pg.Pool>,
+  fixture: Awaited<ReturnType<typeof exactBuyPersistenceFixture>>,
+) {
+  const state = await pool.query(`SELECT lock.state AS lock_state,
+    lock.state_revision::TEXT AS lock_revision,armament.state AS armament_state,
+    armament.state_revision::TEXT AS armament_revision,armament.consumed_buys,
+    (SELECT COUNT(*)::INTEGER FROM execution_signed_transactions) AS artifacts
+    FROM execution_pre_signature_locks lock
+    JOIN execution_activation_armaments armament ON armament.armament_id=lock.armament_id
+    WHERE lock.lock_id=$1`, [fixture.authorization.preSignatureLockId]);
+  assert.equal(state.rowCount, 1);
+  const row = state.rows[0];
+  assert.ok(row);
+  return Object.freeze({
+    lockState: row.lock_state, lockRevision: row.lock_revision,
+    armamentState: row.armament_state, armamentRevision: row.armament_revision,
+    consumedBuys: row.consumed_buys, artifacts: row.artifacts,
+  });
+}
+
+function sha256(bytes: readonly number[]): string {
+  return createHash('sha256').update(Uint8Array.from(bytes)).digest('hex');
 }
 
 async function clearLease(
@@ -2715,6 +2952,7 @@ async function acceptedBuyFixture(
   const live = new PostgresExecutionLiveRepository(pool);
   await live.persistSigned(Object.freeze({
     payloadVersion: 1, claim: fixture.claim,
+    preSignatureLockId: fixture.preSignatureLockId,
     qualificationId: fixture.qualificationId,
     reservationId: fixture.reservationId,
     artifact: fixture.artifact,
@@ -2919,6 +3157,7 @@ function deferred<TValue>(): Readonly<{
 function safetyQualification(
   nowMs: number,
   simulation: Awaited<ReturnType<typeof seedSuccessfulSimulation>>,
+  qualifiedWalletPublicKey = walletPublicKey,
 ) {
   const evidenceTypes = [
     'CI_RUN', 'MIGRATION_TEST', 'ARCHITECTURE_TEST', 'DRY_RUN_TEST',
@@ -2929,8 +3168,8 @@ function safetyQualification(
   return createSafetyQualification({
     payloadVersion: 1, evaluatorVersion: 1, phase: 'CANARY', buildHash: fingerprint,
     configurationFingerprint: simulation.configurationFingerprint,
-    strategyFingerprint: '3'.repeat(64), generationId, walletPublicKey,
-    cluster: 'mainnet-beta', genesisHash: walletPublicKey, providerId: 'primary',
+    strategyFingerprint: '3'.repeat(64), generationId, walletPublicKey: qualifiedWalletPublicKey,
+    cluster: 'mainnet-beta', genesisHash: qualifiedWalletPublicKey, providerId: 'primary',
     qualifiedAtMs: nowMs, expiresAtMs: nowMs + 300_000,
     gates: EXECUTION_SAFETY_GATE_IDS.map((gateId, index) => ({
       payloadVersion: 1, gateId, status: 'PASSED', evidenceType: evidenceTypes[index],
@@ -2942,8 +3181,8 @@ function safetyQualification(
           resultFingerprint: simulation.resultFingerprint,
           buildHash: fingerprint,
           configurationFingerprint: simulation.configurationFingerprint,
-          strategyFingerprint: '3'.repeat(64), walletPublicKey,
-          genesisHash: walletPublicKey, providerId: 'primary',
+          strategyFingerprint: '3'.repeat(64), walletPublicKey: qualifiedWalletPublicKey,
+          genesisHash: qualifiedWalletPublicKey, providerId: 'primary',
         }) : index.toString(16).repeat(64),
       observedAtMs: gateId === 'MAINNET_PREFLIGHT_SIMULATED'
         ? simulation.recordedAtMs : nowMs - 1_000 + index,
@@ -2952,13 +3191,43 @@ function safetyQualification(
   });
 }
 
-async function seedSuccessfulSimulation(pool: InstanceType<typeof pg.Pool>) {
+function qualificationWithCanarySnapshots(
+  template: ReturnType<typeof safetyQualification>,
+  walletSnapshot: ReturnType<typeof createExecutionWalletSnapshot>,
+  providerSnapshot: ReturnType<typeof createProviderUsageSnapshot>,
+) {
+  return createSafetyQualification({
+    payloadVersion: template.payloadVersion, evaluatorVersion: template.evaluatorVersion,
+    phase: template.phase, buildHash: template.buildHash,
+    configurationFingerprint: template.configurationFingerprint,
+    strategyFingerprint: template.strategyFingerprint, generationId: template.generationId,
+    walletPublicKey: template.walletPublicKey, cluster: template.cluster,
+    genesisHash: template.genesisHash, providerId: template.providerId,
+    qualifiedAtMs: template.qualifiedAtMs, expiresAtMs: template.expiresAtMs,
+    gates: template.gates.map((gate) => gate.gateId === 'WALLET_CHAIN_LIMITS_VERIFIED'
+      ? {
+        ...gate, evidenceId: walletSnapshot.snapshotId,
+        evidenceFingerprint: walletSnapshot.snapshotFingerprint,
+      }
+      : gate.gateId === 'PROVIDER_EXIT_CAPACITY_VERIFIED'
+        ? {
+          ...gate, evidenceId: providerSnapshot.snapshotId,
+          evidenceFingerprint: providerSnapshot.snapshotFingerprint,
+        }
+        : gate),
+  });
+}
+
+async function seedSuccessfulSimulation(
+  pool: InstanceType<typeof pg.Pool>,
+  simulationWalletPublicKey = walletPublicKey,
+) {
   const nowMs = Date.now();
   const intents = new PostgresExecutionIntentRepository(pool);
   const created = await intents.create(createExecutionIntentDraft({
     strategyId: 'simulation-strategy', strategyVersion: 1,
     positionId: `position-${randomUUID()}`, logicalCommandId: `command-${randomUUID()}`,
-    mint: walletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
+    mint: simulationWalletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1_000n,
     baseAmountRaw: null, minimumAmountOutRaw: 850n,
     decisionEventId: `event-${randomUUID()}`, decisionFingerprint: fingerprint,
@@ -2983,10 +3252,10 @@ async function seedSuccessfulSimulation(pool: InstanceType<typeof pg.Pool>) {
     strategyId: begun.claim.intent.strategyId, strategyVersion: begun.claim.intent.strategyVersion,
     decisionFingerprint: begun.claim.intent.decisionFingerprint,
     resultKind: 'SUCCESS', effectiveVenue: 'PUMP_FUN', providerId: 'primary',
-    executorPublicKey: walletPublicKey, expectedGenesisHash: walletPublicKey,
-    observedGenesisHash: walletPublicKey, configurationFingerprint: fingerprint,
+    executorPublicKey: simulationWalletPublicKey, expectedGenesisHash: simulationWalletPublicKey,
+    observedGenesisHash: simulationWalletPublicKey, configurationFingerprint: fingerprint,
     quoteFingerprint: fingerprint, snapshotFingerprint: fingerprint,
-    buildFingerprint: fingerprint, messageHash: fingerprint, blockhash: walletPublicKey,
+    buildFingerprint: fingerprint, messageHash: fingerprint, blockhash: simulationWalletPublicKey,
     lastValidBlockHeight: 1_000n, blockhashContextSlot: 900n, snapshotSlot: 899n,
     feeContextSlot: 900n, simulationSlot: 901n, amountInRaw: 1_000n,
     expectedAmountOutRaw: 900n, protectedAmountOutRaw: 850n, feesRaw: 10n,

@@ -18,7 +18,11 @@ export interface ExecutionLiveRuntimeVenueRepository {
 }
 
 export interface ExecutionLiveRuntimeRepository {
+  readonly recoverStrandedPreSignatureLock:
+    ExecutionLiveRepository['recoverStrandedPreSignatureLock'];
+  readonly assertRunnableWork: ExecutionLiveRepository['assertRunnableWork'];
   readonly readPreparationBinding: ExecutionLiveRepository['readPreparationBinding'];
+  readonly authorizeExactSigning: ExecutionLiveRepository['authorizeExactSigning'];
   readonly persistSigned: ExecutionLiveRepository['persistSigned'];
   readonly reserveRpcCall: ExecutionLiveRepository['reserveRpcCall'];
   readonly inspectSignedTransaction: ExecutionLiveRepository['inspectSignedTransaction'];
@@ -57,7 +61,10 @@ export function createExecutionLiveRuntimeVenueRepository(
 
 export function createExecutionLiveRuntimeRepository(
   source: Pick<ExecutionLiveRepository,
+    | 'recoverStrandedPreSignatureLock'
+    | 'assertRunnableWork'
     | 'readPreparationBinding'
+    | 'authorizeExactSigning'
     | 'persistSigned'
     | 'reserveRpcCall'
     | 'inspectSignedTransaction'
@@ -67,7 +74,10 @@ export function createExecutionLiveRuntimeRepository(
     | 'recordSubmissionOutcome'>,
 ): ExecutionLiveRuntimeRepository {
   return exactFacade({
+    recoverStrandedPreSignatureLock: source.recoverStrandedPreSignatureLock.bind(source),
+    assertRunnableWork: source.assertRunnableWork.bind(source),
     readPreparationBinding: source.readPreparationBinding.bind(source),
+    authorizeExactSigning: source.authorizeExactSigning.bind(source),
     persistSigned: source.persistSigned.bind(source),
     reserveRpcCall: source.reserveRpcCall.bind(source),
     inspectSignedTransaction: source.inspectSignedTransaction.bind(source),

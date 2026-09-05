@@ -92,7 +92,7 @@ const RISK_FOUNDATION_ALLOWED_NODE_BUILTINS = new Set([
 ]);
 const RISK_FOUNDATION_ALLOWED_LOCAL_MODULES = [
   /^(?:dist\/)?src\/executor-risk\/(?:admission-service|reconciliation-service)\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/domain\/execution-(?:fault-policy|intent|provider-quota|reconciliation|risk-policy)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/execution-(?:fault-policy|intent|provider-quota|reconciliation|risk-policy|wallet-snapshot)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/execution-(?:reconciliation-gateway|risk-repository)\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/storage\/(?:database|execution-risk\.repository)\.(?:js|ts)$/u,
 ];
@@ -109,10 +109,13 @@ const OPERATIONS_ALLOWED_NODE_BUILTINS = new Set([
   'node:readline/promises', 'node:url', 'node:util/types',
 ]);
 const OPERATIONS_ALLOWED_LOCAL_MODULES = [
-  /^(?:dist\/)?src\/executor-operations\/(?:config|main|service|terminal)\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/domain\/execution-(?:operations|safety-(?:attestation|qualification))\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/executor-operations\/(?:config|database|main|service|terminal)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/executor\/database\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/domain\/execution-(?:canary|canary-attestation|fault-policy|intent|operations|provider-quota|reconciliation|risk-policy|safety-(?:attestation|qualification)|wallet-snapshot)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/executor-risk\/admission-service\.(?:js|ts)$/u,
   /^(?:dist\/)?src\/ports\/execution-operations-repository\.(?:js|ts)$/u,
-  /^(?:dist\/)?src\/storage\/(?:database|execution-operations\.repository)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/storage\/(?:database|execution-operations\.repository|execution-risk\.repository)\.(?:js|ts)$/u,
+  /^(?:dist\/)?src\/utils\/json\.(?:js|ts)$/u,
 ];
 const OPERATIONS_FORBIDDEN_IDENTIFIERS = new Set([
   'Keypair', 'WalletSigner', 'Signer', 'SecretLoader', 'createRequire',

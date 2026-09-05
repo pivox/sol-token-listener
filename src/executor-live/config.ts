@@ -74,6 +74,8 @@ export function parseLiveExecutorConfig(value: unknown): LiveExecutorConfig {
     void decimalBigint(environment, 'EXECUTOR_MAX_PRIORITY_FEE_LAMPORTS', 0n, 0n);
     const allowlist = text(environment, 'LIVE_QUOTE_MINT_ALLOWLIST', 64);
     if (allowlist !== WSOL) reject();
+    const activationPhase = phase(environmentValue(environment, 'EXECUTOR_ACTIVATION_PHASE'));
+    if (activationPhase === 'CANARY' && leaseMs > 120_000) reject();
     return Object.freeze({
       mode: 'live',
       liveTradingEnabled: true,
@@ -100,7 +102,7 @@ export function parseLiveExecutorConfig(value: unknown): LiveExecutorConfig {
         environment, 'EXECUTOR_CONFIGURATION_FINGERPRINT',
       ),
       strategyFingerprint: fingerprint(environment, 'EXECUTOR_STRATEGY_FINGERPRINT'),
-      phase: phase(environmentValue(environment, 'EXECUTOR_ACTIVATION_PHASE')),
+      phase: activationPhase,
       quoteMaxAgeMs: integer(environment, 'EXECUTOR_QUOTE_MAX_AGE_MS', 1, 60_000),
       slippageBps: decimalBigint(environment, 'EXECUTOR_SLIPPAGE_BPS', 0n, 10_000n),
       snapshotMaxSlotLag: integer(

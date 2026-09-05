@@ -35,7 +35,10 @@ import {
   resumeLivePersistedTransaction,
   type LiveExecutionWorkerDependencies,
 } from './execution-worker.js';
-import type { ExecutionLiveRuntimeBindingV1 } from '../ports/execution-live-repository.js';
+import type {
+  ExecutionLiveRunnableWorkBindingV1,
+  ExecutionLiveRuntimeBindingV1,
+} from '../ports/execution-live-repository.js';
 import type { SignedTransactionArtifactV1 } from '../domain/execution-live.js';
 import { LIVE_EXECUTOR_SAFE_ERROR_CODE_SET } from './error-codes.js';
 import { ExecutionLiveRepositoryError } from '../storage/execution-live.repository.js';
@@ -89,6 +92,8 @@ export async function startLiveExecutor(
   let runtimeOwnsResources = false;
   try {
     await database.validateStartup(config);
+    await database.live.recoverStrandedPreSignatureLock(config.generationId);
+    await database.live.assertRunnableWork(startupWorkBinding(config));
     const genesis = await dependencies.verifyGenesis(config, new AbortController().signal);
     signer = await dependencies.loadSigner(config);
     if (signer.publicKey !== config.executorPublicKey) {
@@ -98,6 +103,10 @@ export async function startLiveExecutor(
     const lanes = dependencies.createLanes(Object.freeze({ config, database, signer, runtime }));
     const running = dependencies.runtime(Object.freeze({
       lanes,
+      prePass: async (signal: AbortSignal) => {
+        if (signal.aborted) return;
+        await database.live.recoverStrandedPreSignatureLock(config.generationId);
+      },
       logger: dependencies.logger,
       closeSigner: () => signer?.close() ?? Promise.resolve(),
       closeDatabase: database.close,
@@ -116,6 +125,29 @@ export async function startLiveExecutor(
   }
 }
 
+function startupWorkBinding(config: LiveExecutorConfig): ExecutionLiveRunnableWorkBindingV1 {
+  return Object.freeze({
+    payloadVersion: 1 as const,
+    generationId: config.generationId,
+    phase: config.phase,
+    buildHash: config.buildHash,
+    configurationFingerprint: config.configurationFingerprint,
+    strategyFingerprint: config.strategyFingerprint,
+    walletPublicKey: config.executorPublicKey,
+    cluster: config.cluster,
+    genesisHash: config.expectedGenesisHash,
+    providerId: config.providerId,
+    quoteMaxAgeMs: config.quoteMaxAgeMs,
+    slippageBps: config.slippageBps,
+    snapshotMaxSlotLag: config.snapshotMaxSlotLag,
+    maxComputeUnits: config.maxComputeUnits,
+    maxFeeLamports: config.maxFeeLamports,
+    maxFeePayerLamportDebit: config.maxFeePayerLamportDebit,
+    maxRpcCallsPerAttempt: config.maxRpcCallsPerAttempt,
+    leaseMs: config.leaseMs,
+  });
+}
+
 export async function main(): Promise<void> {
   const logger = createLiveExecutorLogger();
   await startLiveExecutor(process.env, productionDependencies(logger));
@@ -132,6 +164,7 @@ export function createProductionLiveExecutorLanes(input: Readonly<{
     ownerId,
     leaseMs: input.config.leaseMs,
     phase: input.config.phase,
+    generationId: input.config.generationId,
     intents: input.database.intents,
     executeFresh: async (context, signal, renew) => {
       const authority = new LiveTransactionCandidateAuthority();
@@ -368,6 +401,14 @@ function runtimeBinding(
     expectedGenesisHash: genesis.expectedGenesisHash,
     observedGenesisHash: genesis.observedGenesisHash,
     providerId: genesis.providerId,
+    quoteMaxAgeMs: config.quoteMaxAgeMs,
+    slippageBps: config.slippageBps,
+    snapshotMaxSlotLag: config.snapshotMaxSlotLag,
+    maxComputeUnits: config.maxComputeUnits,
+    maxFeeLamports: config.maxFeeLamports,
+    maxFeePayerLamportDebit: config.maxFeePayerLamportDebit,
+    maxRpcCallsPerAttempt: config.maxRpcCallsPerAttempt,
+    leaseMs: config.leaseMs,
   });
 }
 

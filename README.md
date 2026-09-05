@@ -50,8 +50,9 @@ par aucun worker. #51-G fournit ses briques live isolées et ses protections
 PostgreSQL. #51-H2a compose séparément la finalité read-only, et #51-H2b
 compose le runtime signable désarmé. H2b ne possède que quatre lanes, dans cet
 ordre : recover SELL, execute SELL, recover BUY, execute BUY. H2a conserve
-finalité, confirmation, réconciliation et deadline ; H2c conserve les gates,
-l'armement opérateur et le canary. Les seuls modes du listener restent
+finalité, confirmation, réconciliation et deadline. #51-H2c livre maintenant
+les gates, l'armement exact et le lock durable pré-signature dans l'état
+`READY_FOR_EXTERNAL_PREFLIGHT`; aucun canary n'a démarré. Les seuls modes du listener restent
 `observe` et `paper` ; le processus H2b est un exécutable séparé. Le
 [runbook canary #51-G](docs/operations/executor-live-canary.md) décrit les
 frontières et l'état non activé.
@@ -120,7 +121,7 @@ sans clé privée, signature, soumission ni live; elle n'appelle ni
 - La configuration par défaut reste `EXECUTOR_MODE=dry-run` et
   `LIVE_TRADING_ENABLED=false`. Elle ne lance aucun exécuteur signable et ne
   contient aucune clé réelle.
-- H2b est isolé du listener, de H2a et des commandes H2c ; sa présence ne vaut
+- H2b est isolé du listener, de H2a et des commandes H2c ; H2c est préparé mais sa présence ne vaut
   ni armement, ni canary, ni transaction exécutée.
 - Le paper trading est une projection simulée, initialement limitée à SOL/WSOL
   par allowlist; il ne démontre ni profit ni sellabilité.
@@ -199,17 +200,33 @@ aucune sortie à deadline : ces responsabilités restent dans H2a.
 La configuration exemple est volontairement désarmée (`EXECUTOR_MODE=dry-run`,
 `LIVE_TRADING_ENABLED=false` et aucun chemin de keypair réel) : elle ne permet
 pas de démarrer H2b. La publication de ces commandes n'exécute ni
-`live:resume`, ni `live:arm`, ni un canary. H2c reste le seul lot qui peut
-traiter les gates et l'armement opérateur ; aucune clé réelle ou procédure de
-canary n'est fournie ici.
+`live:resume`, ni `live:arm`, ni un canary. H2c fournit séparément la procédure
+manuelle, les gates et l'armement opérateur exact ; aucune clé réelle n'est
+fournie dans le dépôt.
 
 L'état actuellement documentable est strictement :
 
 ```text
 LIVE_SIGNABLE_RUNTIME_COMPOSED
+READY_FOR_EXTERNAL_PREFLIGHT
 CANARY_NOT_STARTED
 NON_EXECUTED / NON_VALIDATED
 ```
+
+### Préparation opérateur exacte (#51-H2c)
+
+H2c lie un sidecar Ed25519 frais, une intention BUY exacte, les snapshots
+wallet/provider, les limites du runtime et une réservation d'exposition dans
+un armement V2 atomique. Avant la première signature BUY, H2b persiste un lock
+contenant les octets non signés exacts. Un lock abandonné ou toute ambiguïté
+déclenche `ENTRY_STOP` sans contacter le signer ni le RPC.
+
+Les commandes `live:*` utilisent un login PostgreSQL dédié, membre uniquement
+de `sol_token_executor_operations`; chaque checkout impose ce rôle et un
+`search_path` fermé. Le listener, l'API, H2a et ce rôle opérations ne peuvent
+pas lire les bytes signés ni accéder au keypair. La séquence complète, les
+points d'arrêt humains et les preuves à conserver sont dans le
+[runbook canary](docs/operations/executor-live-canary.md).
 
 Pour chaque intention `PENDING` ou `RETRY_READY` éligible, #51-C enregistre
 une assessment déterministe `FOUNDATION_VALIDATED` à couverture

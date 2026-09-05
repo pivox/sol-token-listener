@@ -9,6 +9,7 @@ import type { ExecutionReconciliationEvidenceV1 } from '../domain/execution-reco
 import type { ExecutionReconciliationRequestV1 } from
   '../executor-risk/reconciliation-service.js';
 import type { ClaimedExecutionIntent } from './execution-intent-repository.js';
+import type { ExecutionAttemptIdentity } from './execution-intent-repository.js';
 import type { ExecutionSimulationEvidenceV1 } from './execution-simulation-gateway.js';
 import type { ExecutionLiveSignedSimulationEvidenceV1 } from
   '../domain/execution-live-signed-simulation.js';
@@ -39,6 +40,8 @@ export interface ExecutionPreSubmissionRevocationResultV1 {
 export interface ExecutionLivePersistSignedInputV1 {
   readonly payloadVersion: 1;
   readonly claim: ClaimedExecutionIntent;
+  /** Exact pre-signature authorization; null for a SELL exit. */
+  readonly preSignatureLockId: string | null;
   readonly qualificationId: string;
   readonly reservationId: string | null;
   readonly artifact: SignedTransactionArtifactV1;
@@ -85,6 +88,14 @@ export interface ExecutionLiveRuntimeBindingV1 {
   readonly expectedGenesisHash: string;
   readonly observedGenesisHash: string;
   readonly providerId: string;
+  readonly quoteMaxAgeMs: number;
+  readonly slippageBps: bigint;
+  readonly snapshotMaxSlotLag: number;
+  readonly maxComputeUnits: bigint;
+  readonly maxFeeLamports: bigint;
+  readonly maxFeePayerLamportDebit: bigint;
+  readonly maxRpcCallsPerAttempt: number;
+  readonly leaseMs: number;
 }
 
 /**
@@ -101,6 +112,44 @@ export interface ExecutionLivePreparationBindingV1 {
   readonly exitAuthorizationId: string | null;
   readonly providerId: string;
   readonly walletPublicKey: string;
+}
+
+/** Exact unsigned V0 material which may cross the durable before-signing boundary. */
+export interface ExecutionUnsignedSigningMaterialV1 {
+  readonly payloadVersion: 1;
+  readonly walletPublicKey: string;
+  readonly providerId: string;
+  readonly side: 'BUY' | 'SELL';
+  readonly effectiveVenue: 'PUMP_FUN' | 'PUMP_SWAP';
+  readonly snapshotSlot: bigint;
+  readonly quoteFingerprint: string;
+  readonly quoteObservedAtMs: number;
+  readonly quoteExpiresAtMs: number;
+  readonly buildFingerprint: string;
+  readonly snapshotFingerprint: string;
+  readonly messageHash: string;
+  readonly messageBytes: readonly number[];
+  readonly unsignedTransactionHash: string;
+  readonly unsignedTransactionBytes: readonly number[];
+  readonly blockhash: string;
+  readonly lastValidBlockHeight: bigint;
+  readonly unsignedSimulation: ExecutionSimulationEvidenceV1;
+}
+
+/** Durable authorization, returned only after the exact unsigned material is re-read. */
+export interface ExecutionExactSigningAuthorizationV1 {
+  readonly payloadVersion: 1;
+  readonly binding: ExecutionLivePreparationBindingV1;
+  readonly preSignatureLockId: string | null;
+  readonly material: ExecutionUnsignedSigningMaterialV1;
+}
+
+export interface ExecutionExactSigningInputV1 {
+  readonly claim: ClaimedExecutionIntent;
+  readonly attempt: ExecutionAttemptIdentity;
+  readonly generationId: string;
+  readonly runtime: ExecutionLiveRuntimeBindingV1;
+  readonly material: ExecutionUnsignedSigningMaterialV1;
 }
 
 /** Fresh provider evidence from isBlockhashValid/getBlockHeight. */
@@ -224,12 +273,45 @@ export interface ExecutionDeadlineExitResultV1 {
   readonly intent: ExecutionIntentV1 | null;
 }
 
+export interface ExecutionPreSignatureRecoveryResultV1 {
+  readonly payloadVersion: 1;
+  readonly kind: 'IDLE' | 'REVOKED';
+}
+
+export interface ExecutionLiveRunnableWorkBindingV1 {
+  readonly payloadVersion: 1;
+  readonly generationId: string;
+  readonly phase: 'CANARY' | 'MICRO_LIVE' | 'PILOT';
+  readonly buildHash: string;
+  readonly configurationFingerprint: string;
+  readonly strategyFingerprint: string;
+  readonly walletPublicKey: string;
+  readonly cluster: 'mainnet-beta';
+  readonly genesisHash: string;
+  readonly providerId: string;
+  readonly quoteMaxAgeMs: number;
+  readonly slippageBps: bigint;
+  readonly snapshotMaxSlotLag: number;
+  readonly maxComputeUnits: bigint;
+  readonly maxFeeLamports: bigint;
+  readonly maxFeePayerLamportDebit: bigint;
+  readonly maxRpcCallsPerAttempt: number;
+  readonly leaseMs: number;
+}
+
 export interface ExecutionLiveRepository {
+  recoverStrandedPreSignatureLock(
+    generationId: string,
+  ): Promise<ExecutionPreSignatureRecoveryResultV1>;
+  assertRunnableWork(binding: ExecutionLiveRunnableWorkBindingV1): Promise<void>;
   readPreparationBinding(input: Readonly<{
     readonly claim: ClaimedExecutionIntent;
     readonly generationId: string;
     readonly runtime: ExecutionLiveRuntimeBindingV1;
   }>): Promise<ExecutionLivePreparationBindingV1>;
+  authorizeExactSigning(
+    input: ExecutionExactSigningInputV1,
+  ): Promise<ExecutionExactSigningAuthorizationV1>;
   persistSigned(
     input: ExecutionLivePersistSignedInputV1,
   ): Promise<ExecutionLivePersistSignedResultV1>;

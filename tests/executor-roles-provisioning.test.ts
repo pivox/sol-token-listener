@@ -5,6 +5,8 @@ import test from 'node:test';
 import pg from 'pg';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
+import { PostgresExecutionOperationsRepository } from
+  '../src/storage/execution-operations.repository.js';
 import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/database.js';
 import {
   LIVE_EXECUTOR_DATABASE_AUTHORITY_V1,
@@ -21,6 +23,10 @@ import { validateLiveRecoveryStartup } from
 import { createLiveRecoveryBootstrapDatabase } from
   '../src/executor-live-recovery/database.js';
 import type { LiveRecoveryConfig } from '../src/executor-live-recovery/config.js';
+import {
+  createExecutionOperationsDatabase,
+  ExecutionOperationsDatabaseError,
+} from '../src/executor-operations/database.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const scriptUrl = new URL('../scripts/provision-executor-roles.sql', import.meta.url);
@@ -55,11 +61,18 @@ void test('executor role provisioning is explicit, passwordless and least-privil
     executable,
     /GRANT\s+[^;]*\bDELETE\b[^;]*\bTO\s+(?!sol_token_retention_worker\b)/iu,
   );
-  assert.match(sql, /GRANT INSERT ON TABLE\s+execution_safety_qualifications,\s+execution_safety_gate_evidence/iu);
-  assert.match(sql, /GRANT INSERT,UPDATE ON TABLE\s+execution_control_state/iu);
-  assert.match(sql, /GRANT INSERT ON TABLE\s+execution_control_events/iu);
-  assert.match(sql, /GRANT INSERT,UPDATE ON TABLE\s+execution_operator_authorizations,\s+execution_activation_armaments/iu);
-  assert.match(sql, /GRANT INSERT ON TABLE\s+execution_activation_events/iu);
+  assert.match(sql, /ALTER ROLE sol_token_executor_operations NOLOGIN NOSUPERUSER NOCREATEDB\s+NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS/iu);
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM sol_token_executor_operations/u);
+  assert.match(sql, /REVOKE SELECT \(%1\$s\), INSERT \(%1\$s\), UPDATE \(%1\$s\), REFERENCES \(%1\$s\)[\s\S]*?sol_token_executor_operations/iu);
+  assert.doesNotMatch(executable,
+    /GRANT\s+(?:SELECT|INSERT|UPDATE)\s+ON\s+TABLE[^;]*TO\s+sol_token_executor_operations/iu);
+  assert.match(sql, /GRANT SELECT \([\s\S]*?\), INSERT \([\s\S]*?\)\s+ON TABLE execution_safety_qualifications TO sol_token_executor_operations/iu);
+  assert.match(sql, /INSERT \(generation_id\), UPDATE \(state,state_revision,last_event_id,updated_at\)\s+ON TABLE execution_control_state TO sol_token_executor_operations/iu);
+  assert.match(sql, /ON TABLE execution_activation_armaments TO sol_token_executor_operations/iu);
+  assert.doesNotMatch(sql,
+    /execution_pre_signature_locks TO sol_token_executor_operations/iu);
+  assert.doesNotMatch(sql,
+    /execution_signed_transactions TO sol_token_executor_operations/iu);
   assert.doesNotMatch(sql, /(?:private_key|secret_key|seed_phrase|signed_bytes|rpc_url)/iu);
   for (const readOnlyTable of [
     'execution_wallet_generations',
@@ -119,6 +132,7 @@ void test('read-only recovery provisioning matches its closed authority policy',
   ));
   assert.ok(signed !== undefined);
   assert.equal(signed.select.includes('signature'), true);
+  assert.equal(signed.select.includes('pre_signature_lock_id'), true);
   assert.equal(signed.select.includes('signed_transaction_bytes'), false);
   assert.equal(signed.update.includes('submission_started_at'), false);
 
@@ -151,6 +165,7 @@ void test('signed live capability is visible only to the dedicated executor role
   const startup = await readFile(liveStartupUrl, 'utf8');
   const executable = sql.replace(/--[^\r\n]*/gu, ' ');
   const signedGrant = columnGrantForLiveTable(sql, 'execution_signed_transactions');
+  const lockGrant = columnGrantForLiveTable(sql, 'execution_pre_signature_locks');
   const positionGrant = columnGrantForLiveTable(sql, 'execution_live_positions');
   const exitGrant = columnGrantForLiveTable(sql, 'execution_exit_authorizations');
   assert.match(sql, /ALTER ROLE sol_token_executor_live NOLOGIN NOSUPERUSER NOCREATEDB\s+NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS/iu);
@@ -172,11 +187,15 @@ void test('signed live capability is visible only to the dedicated executor role
   assert.match(sql, /REVOKE SELECT \(%1\$s\), INSERT \(%1\$s\), UPDATE \(%1\$s\), REFERENCES \(%1\$s\)[\s\S]*?sol_token_executor_live/iu);
   assert.match(sql, /GRANT USAGE ON SCHEMA public[\s\S]*?sol_token_executor_live/iu);
   assert.match(sql, /GRANT SELECT \(version\)\s+ON TABLE migration_history TO sol_token_executor_live/iu);
-  assert.match(sql, /REVOKE ALL ON TABLE\s+execution_signed_transactions,\s+execution_live_unsigned_simulation_evidence,\s+execution_live_rpc_budgets,\s+execution_signed_simulation_evidence,\s+execution_submission_preflight_evidence,\s+execution_pre_submission_revocations,\s+execution_submission_events,\s+execution_live_positions,\s+execution_exit_authorizations,\s+execution_reconciliation_evidence\s+FROM PUBLIC,sol_token_listener_writer,sol_token_executor_worker,\s+sol_token_executor_operations,sol_token_operator_reader,sol_token_public_api/iu);
+  assert.match(sql, /REVOKE ALL ON TABLE\s+execution_signed_transactions,\s+execution_pre_signature_locks,\s+execution_live_unsigned_simulation_evidence,\s+execution_live_rpc_budgets,\s+execution_signed_simulation_evidence,\s+execution_submission_preflight_evidence,\s+execution_pre_submission_revocations,\s+execution_submission_events,\s+execution_live_positions,\s+execution_exit_authorizations,\s+execution_reconciliation_evidence\s+FROM PUBLIC,sol_token_listener_writer,sol_token_executor_worker,\s+sol_token_executor_operations,sol_token_operator_reader,sol_token_public_api/iu);
   assert.doesNotMatch(executable,
     /GRANT\s+(?:SELECT|INSERT|UPDATE)\s+ON\s+TABLE[^;]*TO\s+sol_token_executor_live(?!_)/iu);
   assert.match(signedGrant, /SELECT \([\s\S]*signed_transaction_bytes/iu);
   assert.match(signedGrant, /INSERT \([\s\S]*signed_transaction_bytes/iu);
+  assert.match(signedGrant, /pre_signature_lock_id/iu);
+  assert.match(lockGrant, /SELECT \([\s\S]*unsigned_message_bytes[\s\S]*unsigned_transaction_bytes/iu);
+  assert.match(lockGrant, /INSERT \([\s\S]*unsigned_message_bytes[\s\S]*unsigned_transaction_bytes/iu);
+  assert.match(lockGrant, /UPDATE \(state,state_revision,terminal_at,purge_after\)/iu);
   const signedUpdate = /UPDATE \(([^)]*)\)/iu.exec(signedGrant)?.[1] ?? '';
   assert.match(signedUpdate, /revoked_at,purge_after/iu);
   assert.doesNotMatch(signedUpdate, /confirmed_at|confirmed_slot|reconciled_at/iu);
@@ -223,7 +242,8 @@ void test('foundation retention has an isolated executable role without signed-b
   assert.match(sql, /GRANT DELETE ON TABLE[\s\S]*?execution_signed_transactions[\s\S]*?TO sol_token_retention_worker/iu);
   assert.match(sql, /GRANT INSERT ON TABLE\s+execution_risk_tombstones,\s+execution_intent_tombstones\s+TO sol_token_retention_worker/iu);
   assert.match(sql, /GRANT UPDATE \([^)]+\)\s+ON TABLE paper_mvp_runs TO sol_token_retention_worker/iu);
-  assert.match(sql, /GRANT SELECT \(artifact_id,state,purge_after,exit_authorization_id\)\s+ON TABLE execution_signed_transactions TO sol_token_retention_worker/iu);
+  assert.match(sql, /GRANT SELECT \(\s*artifact_id,state,purge_after,exit_authorization_id,pre_signature_lock_id,reservation_id\s*\)\s+ON TABLE execution_signed_transactions TO sol_token_retention_worker/iu);
+  assert.match(sql, /GRANT SELECT \(lock_id,state,purge_after,armament_id,reservation_id\)\s+ON TABLE execution_pre_signature_locks TO sol_token_retention_worker/iu);
   assert.doesNotMatch(
     executable,
     /GRANT\s+SELECT\s+ON\s+TABLE\s+execution_signed_transactions[^;]*TO\s+sol_token_retention_worker/iu,
@@ -237,7 +257,7 @@ void test('foundation retention has an isolated executable role without signed-b
   assert.doesNotMatch(purge, /FOR UPDATE/iu);
 });
 
-void test('PostgreSQL 16 recovery and live logins are exact through their wrappers',
+void test('PostgreSQL 16 recovery, live and operations logins are exact through their wrappers',
   async (context) => {
     const configuredUrl = process.env.TEST_DATABASE_URL;
     if (configuredUrl === undefined || configuredUrl.trim() === '') {
@@ -267,6 +287,7 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
     const loginName = `h2a_recovery_${suffix}`;
     const deniedLoginName = `h2a_denied_${suffix}`;
     const liveLoginName = `h2b_live_${suffix}`;
+    const operationsLoginName = `h2c_operations_${suffix}`;
     const password = randomUUID().replaceAll('-', '');
     const isolatedUrl = new URL(baseUrl);
     isolatedUrl.pathname = `/${databaseName}`;
@@ -274,6 +295,7 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
     let loginPool: InstanceType<typeof pg.Pool> | undefined;
     let deniedPool: InstanceType<typeof pg.Pool> | undefined;
     let liveLoginPool: InstanceType<typeof pg.Pool> | undefined;
+    let operationsLoginPool: InstanceType<typeof pg.Pool> | undefined;
     try {
       await maintenance.query(`CREATE DATABASE ${quoteIdentifier(databaseName)} TEMPLATE template0`);
       isolated = new pg.Pool({ connectionString: isolatedUrl.href });
@@ -290,10 +312,16 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
       await maintenance.query(`CREATE ROLE ${quoteIdentifier(liveLoginName)} LOGIN NOINHERIT
         NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
         PASSWORD ${quoteLiteral(password)}`);
+      await maintenance.query(`CREATE ROLE ${quoteIdentifier(operationsLoginName)} LOGIN NOINHERIT
+        NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+        PASSWORD ${quoteLiteral(password)}`);
       await maintenance.query(`GRANT sol_token_executor_live_recovery
         TO ${quoteIdentifier(loginName)} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
       await maintenance.query(`GRANT sol_token_executor_live
         TO ${quoteIdentifier(liveLoginName)} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
+      await maintenance.query(`GRANT sol_token_executor_operations
+        TO ${quoteIdentifier(operationsLoginName)}
+        WITH ADMIN FALSE, INHERIT FALSE, SET TRUE`);
 
       const publicKey = '11111111111111111111111111111111';
       const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
@@ -316,6 +344,29 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
       assert.equal(liveEvidence.role, 'sol_token_executor_live');
       await liveDatabase.close();
       liveLoginPool = undefined;
+
+      const operationsLoginUrl = new URL(isolatedUrl);
+      operationsLoginUrl.username = operationsLoginName;
+      operationsLoginUrl.password = password;
+      const activeOperationsLoginPool = new pg.Pool({
+        connectionString: operationsLoginUrl.href, max: 1,
+      });
+      operationsLoginPool = activeOperationsLoginPool;
+      const operationsDatabase = createExecutionOperationsDatabase(
+        activeOperationsLoginPool,
+      );
+      const operationsClient = await operationsDatabase.pool.connect();
+      operationsClient.release();
+      await isolated.query(`GRANT SELECT (version) ON TABLE migration_history
+        TO ${quoteIdentifier(operationsLoginName)}`);
+      await assert.rejects(
+        operationsDatabase.pool.connect(),
+        (error: unknown) => error instanceof ExecutionOperationsDatabaseError,
+      );
+      await isolated.query(`REVOKE SELECT (version) ON TABLE migration_history
+        FROM ${quoteIdentifier(operationsLoginName)}`);
+      await activeOperationsLoginPool.end();
+      operationsLoginPool = undefined;
 
       const loginUrl = new URL(isolatedUrl);
       loginUrl.username = loginName;
@@ -445,6 +496,12 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
         if (loginPool !== undefined) await loginPool.end();
         if (deniedPool !== undefined) await deniedPool.end();
         if (liveLoginPool !== undefined) await liveLoginPool.end();
+        if (operationsLoginPool !== undefined) await operationsLoginPool.end();
+        if (isolated !== undefined) {
+          try {
+            await isolated.query(`DROP OWNED BY ${quoteIdentifier(operationsLoginName)}`);
+          } catch { /* the role may not have been created before setup failed */ }
+        }
         if (isolated !== undefined) await isolated.end();
         await maintenance.query(
           `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
@@ -455,6 +512,7 @@ void test('PostgreSQL 16 recovery and live logins are exact through their wrappe
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(loginName)}`);
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(deniedLoginName)}`);
         await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(liveLoginName)}`);
+        await maintenance.query(`DROP ROLE IF EXISTS ${quoteIdentifier(operationsLoginName)}`);
       } finally {
         try { await releaseRoleTestLock(); } finally { await maintenance.end(); }
       }
@@ -532,7 +590,11 @@ void test('provisioned retention role runs the complete purge without reading si
 
     const publicKey = '11111111111111111111111111111111';
     const quoteMint = 'So11111111111111111111111111111111111111112';
+    const operationsGenerationId = `execution_wallet_generation_${'d'.repeat(64)}`;
     const nowMs = Date.now();
+    await isolated.query(`INSERT INTO execution_wallet_generations (
+      generation_id,payload_version,wallet_public_key,cluster,genesis_hash,generation
+    ) VALUES ($1,1,$2,'mainnet-beta',$2,1)`, [operationsGenerationId, publicKey]);
     const created = await new PostgresExecutionIntentRepository(isolated).create(
       createExecutionIntentDraft({
         strategyId: 'live-role-test', strategyVersion: 1,
@@ -560,7 +622,7 @@ void test('provisioned retention role runs the complete purge without reading si
       const liveIntents = new PostgresExecutionIntentRepository(livePool);
       const claim = await liveIntents.claim({
         ownerId: 'h2b-role-test', leaseMs: 30_000,
-        purpose: 'LIVE_EXECUTE', side: 'BUY',
+        purpose: 'EXECUTE',
       });
       assert.ok(claim);
       assert.equal(claim.intent.id, created.intent.id);
@@ -612,6 +674,39 @@ void test('provisioned retention role runs the complete purge without reading si
       }
     } finally {
       try { await liveClient.query('RESET ROLE'); } finally { liveClient.release(); }
+    }
+
+    const operationsClient = await isolated.connect();
+    try {
+      await operationsClient.query('SET ROLE sol_token_executor_operations');
+      const operationsRepository = new PostgresExecutionOperationsRepository({
+        connect: async () => ({
+          query: async (text: string, values?: readonly unknown[]) => values === undefined
+            ? operationsClient.query(text)
+            : operationsClient.query(text, [...values]),
+          release() {},
+        }),
+      });
+      const status = await operationsRepository.readStatus(operationsGenerationId);
+      assert.equal(status.controlState, 'ENTRY_STOP');
+      const stopped = await operationsRepository.setStop({
+        payloadVersion: 1,
+        commandId: 'command:postgresql-16-operator-hard-stop',
+        generationId: operationsGenerationId,
+        operatorId: 'operator-role-test',
+        occurredAtMs: Date.now(),
+      }, 'HARD_STOP');
+      assert.equal(stopped.controlState, 'HARD_STOP');
+      for (const forbidden of [
+        'SELECT signed_transaction_bytes FROM execution_signed_transactions',
+        'SELECT unsigned_transaction_bytes FROM execution_pre_signature_locks',
+        'UPDATE execution_intents SET status=status WHERE FALSE',
+        `UPDATE execution_activation_armaments
+          SET locked_intent_id=locked_intent_id WHERE FALSE`,
+        'DELETE FROM execution_activation_armaments WHERE FALSE',
+      ]) await assert.rejects(operationsClient.query(forbidden), permissionDenied);
+    } finally {
+      try { await operationsClient.query('RESET ROLE'); } finally { operationsClient.release(); }
     }
 
     const restrictedClient = await isolated.connect();

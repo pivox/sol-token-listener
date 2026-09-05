@@ -35,13 +35,41 @@ void test('binds durable authority at BEFORE_SIGNING and executes one consumed c
       'renew',
       'renew',
       'renew',
-      'read-preparation-binding',
+      'authorize-exact-signing',
       'consume-worker',
     ]);
     assert.equal(fixture.authority.consume(fixture.candidate), null);
     assert.equal(fixture.persisted?.persist.artifact.armamentId, fixture.binding.armamentId);
     assert.equal(fixture.persisted?.persist.artifact.reservationId, fixture.binding.reservationId);
     assert.equal(fixture.persisted?.persist.qualificationId, fixture.binding.qualificationId);
+    assert.equal(fixture.persisted?.persist.preSignatureLockId, materialLockId(fixture.material));
+  });
+
+void test('SELL renews three times, reads one binding, and persists the candidate null lock',
+  async () => {
+    const fixture = freshFixture('SUCCESS', 'SELL');
+    const result = await createFreshLiveExecution(fixture.dependencies).execute(
+      Object.freeze({ claim: fixture.claim, attempt: fixture.attempt }),
+      new AbortController().signal,
+      fixture.renew,
+    );
+
+    assert.equal(result.kind, 'ACCEPTED');
+    assert.deepEqual(fixture.calls, [
+      'renew',
+      'renew',
+      'renew',
+      'read-preparation-binding',
+      'consume-worker',
+    ]);
+    assert.equal(fixture.calls.filter((call) => call === 'read-preparation-binding').length, 1);
+    assert.equal(fixture.calls.filter((call) => call === 'authorize-exact-signing').length, 0);
+    assert.equal(fixture.persisted?.persist.preSignatureLockId, null);
+    assert.equal(fixture.persisted?.persist.qualificationId, fixture.binding.qualificationId);
+    assert.equal(
+      fixture.persisted?.persist.artifact.exitAuthorizationId,
+      fixture.binding.exitAuthorizationId,
+    );
   });
 
 void test('persists evaluator failure without consuming or invoking the live worker', async () => {
@@ -57,26 +85,38 @@ void test('persists evaluator failure without consuming or invoking the live wor
   assert.equal(fixture.authority.consume(fixture.candidate), fixture.material);
 });
 
-function freshFixture(outcome: 'SUCCESS' | 'FAILURE' = 'SUCCESS') {
+function freshFixture(
+  outcome: 'SUCCESS' | 'FAILURE' = 'SUCCESS',
+  side: 'BUY' | 'SELL' = 'BUY',
+) {
   const calls: string[] = [];
   const nowMs = 1_800_000_000_000;
-  const claim = claimValue(nowMs);
+  const claim = claimValue(nowMs, side);
   const attempt = Object.freeze({ intentId: claim.intent.id, attemptNumber: 1, startedAtMs: nowMs });
   const binding: ExecutionLivePreparationBindingV1 = Object.freeze({
     payloadVersion: 1,
-    side: 'BUY',
+    side,
     generationId,
     qualificationId: `execution_safety_qualification_${'3'.repeat(64)}`,
-    armamentId: `execution_activation_armament_${'4'.repeat(64)}`,
-    reservationId: `execution_exposure_reservation_${'5'.repeat(64)}`,
-    exitAuthorizationId: null,
+    armamentId: side === 'BUY' ? `execution_activation_armament_${'4'.repeat(64)}` : null,
+    reservationId: side === 'BUY' ? `execution_exposure_reservation_${'5'.repeat(64)}` : null,
+    exitAuthorizationId: side === 'SELL'
+      ? `execution_exit_authorization_${'6'.repeat(64)}` : null,
     providerId: 'primary',
     walletPublicKey: wallet,
+  });
+  const preparationBinding: ExecutionLivePreparationBindingV1 = Object.freeze({
+    ...binding,
+    qualificationId: side === 'SELL'
+      ? `execution_safety_qualification_${'7'.repeat(64)}` : binding.qualificationId,
+    exitAuthorizationId: side === 'SELL'
+      ? `execution_exit_authorization_${'8'.repeat(64)}` : binding.exitAuthorizationId,
   });
   const material: LivePreparedTransactionMaterialV1 = Object.freeze({
     payloadVersion: 1,
     walletPublicKey: wallet,
-    side: 'BUY',
+    providerId: 'primary',
+    side,
     effectiveVenue: 'PUMP_FUN',
     snapshotSlot: 10n,
     quoteFingerprint: '6'.repeat(64),
@@ -100,6 +140,12 @@ function freshFixture(outcome: 'SUCCESS' | 'FAILURE' = 'SUCCESS') {
       simulatedBaseDeltaRaw: 95n, simulatedQuoteDeltaRaw: -100n,
       logsFingerprint: 'b'.repeat(64), logsLineCount: 1,
     }),
+    binding,
+    preSignatureLockId: side === 'BUY'
+      ? `execution_pre_signature_lock_${'a'.repeat(64)}` : null,
+    messageBytes: Object.freeze([1, 2, 3]),
+    unsignedTransactionBytes: Object.freeze([1, 2, 3]),
+    unsignedTransactionHash: createHash('sha256').update(Uint8Array.from([1, 2, 3])).digest('hex'),
   });
   const authority = new LiveTransactionCandidateAuthority();
   const candidate = authority.issue(material);
@@ -135,14 +181,30 @@ function freshFixture(outcome: 'SUCCESS' | 'FAILURE' = 'SUCCESS') {
     expectedGenesisHash: wallet,
     observedGenesisHash: wallet,
     providerId: 'primary',
+    quoteMaxAgeMs: 60_000,
+    slippageBps: 0n,
+    snapshotMaxSlotLag: 128,
+    maxComputeUnits: 1_400_000n,
+    maxFeeLamports: 10_000_000n,
+    maxFeePayerLamportDebit: 10_000_000_000n,
+    maxRpcCallsPerAttempt: 12,
+    leaseMs: 3_000,
   });
   const dependencies: FreshLiveExecutionDependencies = Object.freeze({
     generationId,
     runtime,
     live: Object.freeze({
+      authorizeExactSigning: (input: { readonly material: unknown }) => {
+        calls.push('authorize-exact-signing');
+        return Promise.resolve(Object.freeze({
+          payloadVersion: 1 as const, binding,
+          preSignatureLockId: material.preSignatureLockId,
+          material: input.material,
+        }) as never);
+      },
       readPreparationBinding: () => {
         calls.push('read-preparation-binding');
-        return Promise.resolve(binding);
+        return Promise.resolve(preparationBinding);
       },
     }),
     failures: Object.freeze({
@@ -167,7 +229,7 @@ function freshFixture(outcome: 'SUCCESS' | 'FAILURE' = 'SUCCESS') {
         }
         await renew('BEFORE_CANONICAL_SNAPSHOT');
         await renew('BEFORE_SIMULATION');
-        await renew('BEFORE_SIGNING');
+        await renew('BEFORE_SIGNING', material as never);
         return Object.freeze({
           payloadVersion: 1 as const,
           outcome: 'SUCCESS' as const,
@@ -200,7 +262,11 @@ function freshFixture(outcome: 'SUCCESS' | 'FAILURE' = 'SUCCESS') {
     get persisted() { return persisted; } };
 }
 
-function claimValue(nowMs: number): ClaimedExecutionIntent {
+function materialLockId(material: LivePreparedTransactionMaterialV1): string | null {
+  return material.preSignatureLockId;
+}
+
+function claimValue(nowMs: number, side: 'BUY' | 'SELL'): ClaimedExecutionIntent {
   return Object.freeze({
     intent: Object.freeze({
       id: `execution_intent_${'1'.repeat(64)}`,
@@ -211,7 +277,7 @@ function claimValue(nowMs: number): ClaimedExecutionIntent {
       positionId: 'position',
       logicalCommandId: 'command',
       mint: wallet,
-      side: 'BUY',
+      side,
       venuePolicy: 'PUMP_FUN_ONLY',
       quoteMint: 'So11111111111111111111111111111111111111112',
       quoteTokenProgram: 'SPL_TOKEN',

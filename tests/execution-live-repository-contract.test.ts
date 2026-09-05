@@ -32,6 +32,7 @@ const h1ProductionModules = Object.freeze([
     allowedDependencies: new Set([
       'node:crypto',
       'node:util/types',
+      '@solana/web3.js',
       '../domain/execution-intent.js',
       '../ports/execution-intent-repository.js',
       './database.js',

@@ -56,10 +56,14 @@ const signableSpecificationUrl = new URL(
   '../docs/superpowers/specs/2026-09-04-executor-live-signable-runtime-design.md',
   import.meta.url,
 );
+const operatorCanarySpecificationUrl = new URL(
+  '../docs/superpowers/specs/2026-09-04-executor-live-operator-canary-design.md',
+  import.meta.url,
+);
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const deploymentSmokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 
-void test('documents the delivered H2b four-lane boundary without changing H2a or starting H2c',
+void test('documents H2c as ready for external preflight without starting a canary',
   async () => {
   const [
     packageText,
@@ -68,6 +72,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
     orchestrationSpecification,
     recoverySpecification,
     signableSpecification,
+    operatorCanarySpecification,
     runbook,
     deploymentSmoke,
   ] =
@@ -78,6 +83,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
       readFile(orchestrationSpecificationUrl, 'utf8'),
       readFile(recoverySpecificationUrl, 'utf8'),
       readFile(signableSpecificationUrl, 'utf8'),
+      readFile(operatorCanarySpecificationUrl, 'utf8'),
       readFile(runbookUrl, 'utf8'),
       readFile(deploymentSmokeUrl, 'utf8'),
     ]);
@@ -95,23 +101,24 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     parentSpecification,
-    '**Version de spécification :** 1.10.1',
+    '**Version de spécification :** 1.11.4',
     'parent specification version',
   );
   assertContainsExactlyOnce(
     parentSpecification,
     '**Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes\n'
-      + '#51-H1, runtime de finalité read-only #51-H2a et runtime signable désarmé #51-H2b',
+      + '#51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b\n'
+      + 'et préparation opérateur exacte #51-H2c',
     'parent delivered scope',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de spécification :** 1.1.0',
+    '**Version de spécification :** 1.2.4',
     'live specification version',
   );
   assertContainsExactlyOnce(
     liveSpecification,
-    '**Version de la spécification parente :** 1.10.0',
+    '**Version de la spécification parente :** 1.11.4',
     'live parent specification version',
   );
   assertContainsExactlyOnce(
@@ -131,12 +138,12 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     recoverySpecification,
-    '**Version de spécification :** 1.1.6',
+    '**Version de spécification :** 1.1.9',
     'recovery specification version',
   );
   assertContainsExactlyOnce(
     recoverySpecification,
-    '**Version de la spécification parente :** 1.10.1',
+    '**Version de la spécification parente :** 1.11.3',
     'recovery parent specification version',
   );
   assertContainsExactlyOnce(
@@ -146,12 +153,12 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   );
   assertContainsExactlyOnce(
     signableSpecification,
-    '**Version de spécification :** 1.0.3',
+    '**Version de spécification :** 1.1.4',
     'signable specification version',
   );
   assertContainsExactlyOnce(
     signableSpecification,
-    '**Version de la spécification parente :** 1.10.1',
+    '**Version de la spécification parente :** 1.11.4',
     'signable parent specification version',
   );
   assertContainsExactlyOnce(
@@ -165,8 +172,18 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
     'signable live foundation version',
   );
   assertContainsExactlyOnce(
+    operatorCanarySpecification,
+    '**Version de spécification :** 1.1.4',
+    'operator canary specification version',
+  );
+  assertContainsExactlyOnce(
+    operatorCanarySpecification,
+    '**Statut :** LIVRÉE — `READY_FOR_EXTERNAL_PREFLIGHT`, canary non démarré',
+    'operator canary status',
+  );
+  assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.4.3 — 2026-09-04',
+    '**Version :** 1.5.4 — 2026-09-05',
     'runbook version',
   );
 
@@ -194,7 +211,7 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   assertContainsExactlyOnce(
     runbook,
     'Le constat livré obligatoire est :\n'
-      + '`LIVE_SIGNABLE_RUNTIME_COMPOSED`, `CANARY_NOT_STARTED`,\n'
+      + '`LIVE_SIGNABLE_RUNTIME_COMPOSED`, `READY_FOR_EXTERNAL_PREFLIGHT`, `CANARY_NOT_STARTED`,\n'
       + '`NON_EXECUTED / NON_VALIDATED`.',
     'runbook operational state',
   );
@@ -212,8 +229,9 @@ void test('documents the delivered H2b four-lane boundary without changing H2a o
   assert.equal(runbook.includes('CANARY_STARTED'), false);
   assert.equal((deploymentSmoke.match(/'037_execution_live_orchestration\.sql'/gu) ?? []).length, 1);
   assert.equal((deploymentSmoke.match(/'038_execution_live_rpc_budget\.sql'/gu) ?? []).length, 1);
+  assert.equal((deploymentSmoke.match(/'039_execution_canary_operator_binding\.sql'/gu) ?? []).length, 1);
   assert.equal(
-    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n\]\);/u.test(deploymentSmoke),
+    /const canonicalMigrations = Object\.freeze\(\[[\s\S]*?\n {2}'036_execution_live_canary\.sql',\n {2}'037_execution_live_orchestration\.sql',\n {2}'038_execution_live_rpc_budget\.sql',\n {2}'039_execution_canary_operator_binding\.sql',\n\]\);/u.test(deploymentSmoke),
     true,
     'deployment smoke migration head',
   );
@@ -231,10 +249,12 @@ void test('one signable live pass prioritizes recovered SELL, fresh SELL, recove
   });
 
   assert.equal(
-    await runLiveExecutorPass(configuredLanes, new AbortController().signal),
+    await runLiveExecutorPass(configuredLanes, new AbortController().signal, async () => {
+      calls.push('prePass');
+    }),
     'RECOVER_BUY',
   );
-  assert.deepEqual(calls, ['recoverSell', 'sell', 'recoverBuy']);
+  assert.deepEqual(calls, ['prePass', 'recoverSell', 'sell', 'recoverBuy']);
 });
 
 void test('bootstrap validates startup then genesis before opening the signer and binds exact evidence', async () => {
@@ -244,7 +264,7 @@ void test('bootstrap validates startup then genesis before opening the signer an
   const scheduler = manualScheduler();
   const environment = Object.freeze({ marker: 'environment' });
   const config = Object.freeze({
-    pollMs: 100, shutdownGraceMs: 1_000, executorPublicKey: signer.publicKey,
+    ...liveConfig(), pollMs: 100, shutdownGraceMs: 1_000, executorPublicKey: signer.publicKey,
     phase: 'CANARY', buildHash: 'b'.repeat(64), configurationFingerprint: 'c'.repeat(64),
     strategyFingerprint: 'd'.repeat(64),
     providerId: 'primary', expectedGenesisHash: '11111111111111111111111111111111',
@@ -267,7 +287,7 @@ void test('bootstrap validates startup then genesis before opening the signer an
         validateStartup: async () => { calls.push('startup'); return Object.freeze({}) as never; },
         intents: {} as LiveExecutorBootstrapDatabase['intents'],
         venues: {} as LiveExecutorBootstrapDatabase['venues'],
-        live: {} as LiveExecutorBootstrapDatabase['live'],
+        live: startupLiveFacade(calls),
         simulations: {} as LiveExecutorBootstrapDatabase['simulations'],
         close: async () => { calls.push('database.close'); },
         evict: () => { calls.push('database.evict'); },
@@ -280,18 +300,7 @@ void test('bootstrap validates startup then genesis before opening the signer an
     },
     createLanes: (input) => {
       calls.push('lanes');
-      assert.deepEqual(input.runtime, Object.freeze({
-        payloadVersion: 1,
-        phase: config.phase,
-        buildHash: config.buildHash,
-        configurationFingerprint: config.configurationFingerprint,
-        strategyFingerprint: config.strategyFingerprint,
-        walletPublicKey: signer.publicKey,
-        cluster: 'mainnet-beta',
-        expectedGenesisHash: genesis.expectedGenesisHash,
-        observedGenesisHash: genesis.observedGenesisHash,
-        providerId: genesis.providerId,
-      }));
+      assert.deepEqual(input.runtime, liveRuntime(config, genesis));
       return buildLanes(() => async () => 'IDLE');
     },
     logger: testLogger,
@@ -305,8 +314,8 @@ void test('bootstrap validates startup then genesis before opening the signer an
   const started = startLiveExecutor(environment, dependencies);
   await nextTurn();
   assert.deepEqual(
-    calls.slice(0, 6),
-    ['config', 'database', 'startup', 'genesis', 'secret', 'lanes'],
+    calls.slice(0, 8),
+    ['config', 'database', 'startup', 'prepass', 'work', 'genesis', 'secret', 'lanes'],
   );
   assert.equal(calls.includes('arm'), false);
   assert.equal(calls.includes('resume'), false);
@@ -325,7 +334,7 @@ void test('startup validation rejection closes the database without ever opening
       validateStartup: async () => { calls.push('startup'); throw expected; },
       intents: {} as LiveExecutorBootstrapDatabase['intents'],
       venues: {} as LiveExecutorBootstrapDatabase['venues'],
-      live: {} as LiveExecutorBootstrapDatabase['live'],
+      live: startupLiveFacade(calls),
       simulations: {} as LiveExecutorBootstrapDatabase['simulations'],
       close: async () => { calls.push('database.close'); },
       evict: () => undefined,
@@ -340,6 +349,37 @@ void test('startup validation rejection closes the database without ever opening
   assert.deepEqual(calls, ['startup', 'database.close']);
 });
 
+void test('startup without runnable work closes PostgreSQL before RPC or signer access', async () => {
+  const calls: string[] = [];
+  const noWork = Object.assign(new Error('redacted'), { code: 'LIVE_EXECUTOR_NO_WORK' });
+  const config = liveConfig();
+  await assert.rejects(startLiveExecutor(Object.freeze({}), {
+    parseConfig: () => config,
+    openDatabase: async () => Object.freeze({
+      validateStartup: async () => { calls.push('startup'); return Object.freeze({}) as never; },
+      intents: {} as LiveExecutorBootstrapDatabase['intents'],
+      venues: {} as LiveExecutorBootstrapDatabase['venues'],
+      live: Object.freeze({
+        recoverStrandedPreSignatureLock: async () => {
+          calls.push('prepass');
+          return Object.freeze({ payloadVersion: 1 as const, kind: 'IDLE' as const });
+        },
+        assertRunnableWork: async () => { calls.push('work'); throw noWork; },
+      }) as unknown as LiveExecutorBootstrapDatabase['live'],
+      simulations: {} as LiveExecutorBootstrapDatabase['simulations'],
+      close: async () => { calls.push('database.close'); },
+      evict: () => undefined,
+    }),
+    verifyGenesis: async () => { calls.push('genesis'); return Object.freeze({}) as never; },
+    loadSigner: async () => { calls.push('secret'); return fakeSigner(calls); },
+    createLanes: () => buildLanes(() => async () => 'IDLE'),
+    runtime: async () => undefined,
+    forceExit: () => undefined,
+    logger: testLogger,
+  }), (error: unknown) => error === noWork);
+  assert.deepEqual(calls, ['startup', 'prepass', 'work', 'database.close']);
+});
+
 void test('genesis rejection closes the database before opening the secret', async () => {
   const calls: string[] = [];
   const expected = new Error('wrong genesis');
@@ -350,7 +390,7 @@ void test('genesis rejection closes the database before opening the secret', asy
       validateStartup: async () => { calls.push('startup'); return Object.freeze({}) as never; },
       intents: {} as LiveExecutorBootstrapDatabase['intents'],
       venues: {} as LiveExecutorBootstrapDatabase['venues'],
-      live: {} as LiveExecutorBootstrapDatabase['live'],
+      live: startupLiveFacade(calls),
       simulations: {} as LiveExecutorBootstrapDatabase['simulations'],
       close: async () => { calls.push('database.close'); },
       evict: () => undefined,
@@ -362,7 +402,7 @@ void test('genesis rejection closes the database before opening the secret', asy
     forceExit: () => undefined,
     logger: testLogger,
   }), expected);
-  assert.deepEqual(calls, ['startup', 'genesis', 'database.close']);
+  assert.deepEqual(calls, ['startup', 'prepass', 'work', 'genesis', 'database.close']);
 });
 
 void test('a synchronous runtime bootstrap failure closes signer then database', async () => {
@@ -375,7 +415,7 @@ void test('a synchronous runtime bootstrap failure closes signer then database',
       validateStartup: async () => Object.freeze({}) as never,
       intents: {} as LiveExecutorBootstrapDatabase['intents'],
       venues: {} as LiveExecutorBootstrapDatabase['venues'],
-      live: {} as LiveExecutorBootstrapDatabase['live'],
+      live: startupLiveFacade(),
       simulations: {} as LiveExecutorBootstrapDatabase['simulations'],
       close: async () => { calls.push('database.close'); },
       evict: () => undefined,
@@ -407,6 +447,7 @@ void test('shutdown aborts work, closes the signer first and forces a bounded ex
         return new Promise<'IDLE'>(() => undefined);
       }
       : async () => 'IDLE'),
+    prePass: async () => undefined,
     closeSigner: async () => { calls.push('signer.close'); },
     closeDatabase: async () => { calls.push('database.close'); },
     evictDatabase: () => { calls.push('database.evict'); },
@@ -435,6 +476,7 @@ void test('clean shutdown attempts database close even when signer close fails',
   const failure = new Error('signer close failed');
   const runtime = runLiveExecutorRuntime({
     lanes: buildLanes(() => async () => 'IDLE'),
+    prePass: async () => undefined,
     closeSigner: async () => { calls.push('signer.close'); throw failure; },
     closeDatabase: async () => { calls.push('database.close'); },
     evictDatabase: () => undefined,
@@ -457,6 +499,7 @@ void test('runtime logs a closed lane failure and keeps polling', async () => {
         throw Object.assign(new Error('hostile'), { code: 'DATABASE_FAILURE', url: 'https://secret' });
       }
       : async () => 'IDLE'),
+    prePass: async () => undefined,
     logger: Object.freeze({
       info: (context: unknown) => { events.push(context); },
       warn: (context: unknown) => { events.push(context); },
@@ -473,6 +516,51 @@ void test('runtime logs a closed lane failure and keeps polling', async () => {
     event: 'executor_live.lane_failed', lane: 'RECOVER_SELL', errorCode: 'DATABASE_FAILURE',
   })]);
   scheduler.fire(100);
+  signals.emit('SIGTERM');
+  await runtime;
+});
+
+void test('runtime runs the recovery pre-pass every cycle and redacts its failure', async () => {
+  const events: unknown[] = [];
+  const calls: string[] = [];
+  const signals = new EventEmitter();
+  const scheduler = manualScheduler();
+  let prePassCount = 0;
+  const runtime = runLiveExecutorRuntime({
+    lanes: buildLanes((name) => async () => { calls.push(name); return 'IDLE'; }),
+    prePass: async () => {
+      prePassCount += 1;
+      calls.push(`prePass:${prePassCount}`);
+      if (prePassCount === 2) {
+        throw Object.assign(new Error('hostile secret'), {
+          code: 'LIVE_EXECUTOR_FOREIGN_LEASE_ACTIVE', url: 'https://secret.invalid',
+        });
+      }
+    },
+    logger: Object.freeze({
+      info: (context: unknown) => { events.push(context); },
+      warn: (context: unknown) => { events.push(context); },
+      error: (context: unknown) => { events.push(context); },
+    }),
+    closeSigner: async () => undefined,
+    closeDatabase: async () => undefined,
+    evictDatabase: () => undefined,
+    forceExit: () => undefined,
+  }, { pollMs: 100, shutdownGraceMs: 1_000, scheduler, signalSource: signals });
+
+  await nextTurn();
+  assert.deepEqual(calls, ['prePass:1', 'recoverSell', 'sell', 'recoverBuy', 'buy']);
+  scheduler.fire(100);
+  await nextTurn();
+  assert.deepEqual(calls.slice(-1), ['prePass:2']);
+  assert.deepEqual(events, [Object.freeze({
+    event: 'executor_live.prepass_failed',
+    errorCode: 'LIVE_EXECUTOR_FOREIGN_LEASE_ACTIVE',
+  })]);
+  assert.equal(JSON.stringify(events).includes('secret'), false);
+  scheduler.fire(100);
+  await nextTurn();
+  assert.deepEqual(calls.slice(-5), ['prePass:3', 'recoverSell', 'sell', 'recoverBuy', 'buy']);
   signals.emit('SIGTERM');
   await runtime;
 });
@@ -544,7 +632,11 @@ void test('fresh production claims create one unsigned provider session per work
   const lanes = createProductionLiveExecutorLanes(Object.freeze({
     config,
     signer: fakeSigner([]),
-    runtime: {} as never,
+    runtime: liveRuntime(config, Object.freeze({
+      payloadVersion: 1, providerId: config.providerId,
+      expectedGenesisHash: config.expectedGenesisHash,
+      observedGenesisHash: config.expectedGenesisHash,
+    })),
     database: freshDatabase(),
   }), Object.freeze({
     createUnsigned: (sessionConfig: ConstructorParameters<typeof ProviderAffineSession>[0]) => {
@@ -890,6 +982,32 @@ function buildLanes(
   });
 }
 
+function startupLiveFacade(calls?: string[]): LiveExecutorBootstrapDatabase['live'] {
+  return Object.freeze({
+    recoverStrandedPreSignatureLock: async () => {
+      calls?.push('prepass');
+      return Object.freeze({ payloadVersion: 1 as const, kind: 'IDLE' as const });
+    },
+    assertRunnableWork: async () => { calls?.push('work'); },
+  }) as unknown as LiveExecutorBootstrapDatabase['live'];
+}
+
+function liveRuntime(config: LiveExecutorConfig, genesis: LiveRpcGenesisEvidenceV1) {
+  return Object.freeze({
+    payloadVersion: 1 as const, phase: config.phase, buildHash: config.buildHash,
+    configurationFingerprint: config.configurationFingerprint,
+    strategyFingerprint: config.strategyFingerprint,
+    walletPublicKey: config.executorPublicKey, cluster: config.cluster,
+    expectedGenesisHash: genesis.expectedGenesisHash,
+    observedGenesisHash: genesis.observedGenesisHash, providerId: genesis.providerId,
+    quoteMaxAgeMs: config.quoteMaxAgeMs, slippageBps: config.slippageBps,
+    snapshotMaxSlotLag: config.snapshotMaxSlotLag, maxComputeUnits: config.maxComputeUnits,
+    maxFeeLamports: config.maxFeeLamports,
+    maxFeePayerLamportDebit: config.maxFeePayerLamportDebit,
+    maxRpcCallsPerAttempt: config.maxRpcCallsPerAttempt, leaseMs: config.leaseMs,
+  });
+}
+
 function fakeSigner(calls: string[]): ExecutionTransactionSigner {
   return Object.freeze({
     publicKey: '11111111111111111111111111111111',
@@ -947,7 +1065,10 @@ function freshDatabase(): LiveExecutorBootstrapDatabase {
       renew: async (active: unknown) => active,
       release: async () => true,
     },
-    venues: {}, live: { readPreparationBinding: async () => { throw new Error('unexpected binding'); } },
+    venues: {}, live: {
+      readPreparationBinding: async () => { throw new Error('unexpected binding'); },
+      authorizeExactSigning: async () => { throw new Error('unexpected authorization'); },
+    },
     simulations: { complete: async () => undefined }, close: async () => undefined, evict: () => undefined,
     validateStartup: async () => Object.freeze({}) as never,
   }) as unknown as LiveExecutorBootstrapDatabase;

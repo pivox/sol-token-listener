@@ -1,9 +1,13 @@
 import type {
   ExecutionActivationArmamentV1,
+  ExecutionActivationArmamentV2,
+  ExecutionArmamentRequestV2,
   ExecutionControlState,
   ExecutionOperatorAuthorizationV1,
+  ExecutionOperatorAuthorizationV2,
 } from '../domain/execution-operations.js';
 import type { ExecutionSafetyQualificationV1 } from '../domain/execution-safety-qualification.js';
+import type { ExecutionIntentSide, ExecutionIntentStatus } from '../domain/execution-intent.js';
 
 export interface ExecutionControlCommandV1 {
   readonly payloadVersion: 1;
@@ -45,4 +49,35 @@ export interface ExecutionOperationsRepository {
   resume(command: ExecutionResumeCommandV1): Promise<ExecutionOperationsStatusV1>;
   arm(armament: ExecutionActivationArmamentV1): Promise<ExecutionActivationArmamentV1>;
   readStatus(generationId: string): Promise<ExecutionOperationsStatusV1>;
+}
+
+export interface ExecutionCanaryTargetIntentV1 {
+  readonly intentId: string;
+  readonly side: ExecutionIntentSide;
+  readonly status: ExecutionIntentStatus;
+  readonly leaseOwner: string | null;
+  readonly leaseExpiresAtMs: number | null;
+  readonly stateRevision: bigint;
+  readonly strategyId: string;
+  readonly strategyVersion: number;
+  readonly decisionFingerprint: string;
+  readonly mint: string;
+  readonly quoteMint: string;
+  readonly quoteAmountRaw: bigint;
+  readonly expiresAtMs: number;
+}
+
+export interface ExecutionCanaryArmamentRepository {
+  readTargetIntent(intentId: string): Promise<ExecutionCanaryTargetIntentV1>;
+  armCanary(input: Readonly<{
+    request: ExecutionArmamentRequestV2;
+    authorization: ExecutionOperatorAuthorizationV2;
+  }>): Promise<ExecutionActivationArmamentV2>;
+}
+
+export function unavailableExecutionCanaryArmamentRepository(): ExecutionCanaryArmamentRepository {
+  const unavailable = (): Promise<never> => Promise.reject(
+    new Error('CANARY_ARMAMENT_REPOSITORY_UNAVAILABLE'),
+  );
+  return Object.freeze({ readTargetIntent: unavailable, armCanary: unavailable });
 }

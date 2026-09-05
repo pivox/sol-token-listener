@@ -27,6 +27,18 @@ export interface ExecutionOperationsConfig {
   readonly evidencePublicKeyBase64: string;
 }
 
+export interface ExecutionCanaryArmConfig extends ExecutionOperationsConfig {
+  readonly canaryEvidencePath: string;
+  readonly runtimeQuoteMaxAgeMs: number;
+  readonly runtimeSlippageBps: bigint;
+  readonly runtimeSnapshotMaxSlotLag: number;
+  readonly runtimeMaxComputeUnits: bigint;
+  readonly runtimeMaxFeeLamports: bigint;
+  readonly runtimeMaxFeePayerLamportDebit: bigint;
+  readonly runtimeMaxRpcCallsPerAttempt: number;
+  readonly runtimeLeaseMs: number;
+}
+
 export class ExecutionOperationsConfigError extends Error {
   public readonly code = 'INVALID_EXECUTION_OPERATIONS_CONFIG' as const;
 
@@ -43,8 +55,7 @@ export function parseExecutionOperationsConfig(
     if (!isEnvironment(input)) throw invalid();
     const environment = input;
     for (const key of SECRET_KEYS) {
-      const value = environmentValue(environment, key);
-      if (value !== undefined && value.length > 0) throw invalid();
+      if (Object.getOwnPropertyDescriptor(environment, key) !== undefined) throw invalid();
     }
     const liveEnabled = environmentValue(environment, 'LIVE_TRADING_ENABLED');
     if (liveEnabled !== undefined && liveEnabled !== 'false') throw invalid();
@@ -85,10 +96,49 @@ export function parseExecutionOperationsConfig(
     );
     return Object.freeze({
       databaseUrl, generationId, walletPublicKey, genesisHash, providerId,
-      buildHash, configurationFingerprint, strategyFingerprint, phase,
-      operatorId, evidencePath,
-      evidencePublicKeyBase64,
+      buildHash, configurationFingerprint, strategyFingerprint, phase, operatorId,
+      evidencePath, evidencePublicKeyBase64,
     });
+  } catch {
+    throw invalid();
+  }
+}
+
+export function parseExecutionCanaryArmConfig(input: unknown): ExecutionCanaryArmConfig {
+  try {
+    const base = parseExecutionOperationsConfig(input);
+    if (base.phase !== 'CANARY' || !isEnvironment(input)) throw invalid();
+    const canaryEvidencePath = absolutePath(
+      environmentValue(input, 'EXECUTOR_CANARY_EVIDENCE_PATH'),
+    );
+    const runtimeQuoteMaxAgeMs = decimalInteger(
+      environmentValue(input, 'EXECUTOR_QUOTE_MAX_AGE_MS'), 1, 60_000,
+    );
+    const runtimeSlippageBps = decimalBigint(
+      environmentValue(input, 'EXECUTOR_SLIPPAGE_BPS'), 0n, 10_000n,
+    );
+    const runtimeSnapshotMaxSlotLag = decimalInteger(
+      environmentValue(input, 'EXECUTOR_SNAPSHOT_MAX_SLOT_LAG'), 0, 128,
+    );
+    const runtimeMaxComputeUnits = decimalBigint(
+      environmentValue(input, 'EXECUTOR_MAX_COMPUTE_UNITS'), 1n, 1_400_000n,
+    );
+    const runtimeMaxFeeLamports = decimalBigint(
+      environmentValue(input, 'EXECUTOR_MAX_FEE_LAMPORTS'), 0n, 10_000_000n,
+    );
+    const runtimeMaxFeePayerLamportDebit = decimalBigint(
+      environmentValue(input, 'EXECUTOR_MAX_FEE_PAYER_LAMPORT_DEBIT'), 0n, 10_000_000_000n,
+    );
+    const runtimeMaxRpcCallsPerAttempt = decimalInteger(
+      environmentValue(input, 'EXECUTOR_MAX_RPC_CALLS_PER_ATTEMPT'), 12, 16,
+    );
+    const runtimeLeaseMs = decimalInteger(
+      environmentValue(input, 'EXECUTOR_LEASE_MS'), 3_000, 120_000,
+    );
+    return Object.freeze({ ...base, canaryEvidencePath, runtimeQuoteMaxAgeMs,
+      runtimeSlippageBps, runtimeSnapshotMaxSlotLag, runtimeMaxComputeUnits,
+      runtimeMaxFeeLamports, runtimeMaxFeePayerLamportDebit,
+      runtimeMaxRpcCallsPerAttempt, runtimeLeaseMs });
   } catch {
     throw invalid();
   }
@@ -154,6 +204,22 @@ function canonicalBase64(value: string | undefined, maximumBytes: number): strin
   if (decoded.length === 0 || decoded.length > maximumBytes
     || decoded.toString('base64') !== parsed) throw invalid();
   return parsed;
+}
+
+function decimalInteger(value: string | undefined, minimum: number, maximum: number): number {
+  const parsed = boundedText(value, 32);
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(parsed)) throw invalid();
+  const number = Number(parsed);
+  if (!Number.isSafeInteger(number) || number < minimum || number > maximum) throw invalid();
+  return number;
+}
+
+function decimalBigint(value: string | undefined, minimum: bigint, maximum: bigint): bigint {
+  const parsed = boundedText(value, 32);
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(parsed)) throw invalid();
+  const number = BigInt(parsed);
+  if (number < minimum || number > maximum) throw invalid();
+  return number;
 }
 
 function invalid(): ExecutionOperationsConfigError {

@@ -17,6 +17,7 @@ export interface LiveSignableLaneDependencies {
   readonly ownerId: string;
   readonly leaseMs: number;
   readonly phase: 'CANARY' | 'MICRO_LIVE' | 'PILOT';
+  readonly generationId: string;
   readonly intents: LiveLaneIntentRepository;
   readonly executeFresh: (
     context: LiveFreshExecutionContextV1,
@@ -79,12 +80,15 @@ async function executeOnce(
   signal: AbortSignal,
 ): Promise<LiveExecutorLaneResult> {
   if (!activeSignal(signal)) return 'IDLE';
-  const claimed = await dependencies.intents.claim(Object.freeze({
-    ownerId: dependencies.ownerId,
-    leaseMs: dependencies.leaseMs,
-    purpose: 'LIVE_EXECUTE',
-    side,
-  }), signal);
+  const claimed = await dependencies.intents.claim(side === 'BUY'
+    ? Object.freeze({
+      ownerId: dependencies.ownerId, leaseMs: dependencies.leaseMs,
+      purpose: 'LIVE_EXECUTE' as const, side, generationId: dependencies.generationId,
+    })
+    : Object.freeze({
+      ownerId: dependencies.ownerId, leaseMs: dependencies.leaseMs,
+      purpose: 'LIVE_EXECUTE' as const, side,
+    }), signal);
   if (claimed === null) return 'IDLE';
   let activeClaim = claimed;
   let leaseClosed = false;
@@ -169,6 +173,7 @@ function validateDependencies(value: LiveSignableLaneDependencies): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value.ownerId)
     || !Number.isSafeInteger(value.leaseMs) || value.leaseMs < 1
     || !['CANARY', 'MICRO_LIVE', 'PILOT'].includes(value.phase)
+    || !/^execution_wallet_generation_[0-9a-f]{64}$/u.test(value.generationId)
     || (value.clock !== undefined && typeof value.clock !== 'function')) {
     throw new TypeError('Invalid signable live lane dependencies.');
   }

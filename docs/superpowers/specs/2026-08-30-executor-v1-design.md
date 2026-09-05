@@ -1,6 +1,6 @@
 # Exécuteur Solana V1 — conception
 
-**Version de spécification :** 1.10.1
+**Version de spécification :** 1.11.4
 
 **Date :** 2026-08-31
 
@@ -9,9 +9,32 @@
 **Issue parente :** #51
 
 **Périmètre livré à cette version :** #51-A à #51-G, primitives persistantes
-#51-H1, runtime de finalité read-only #51-H2a et runtime signable désarmé #51-H2b
+#51-H1, runtime de finalité read-only #51-H2a, runtime signable désarmé #51-H2b
+et préparation opérateur exacte #51-H2c
 
 ## Historique des versions
+
+- **1.11.4 — 2026-09-05 :** exige une lease strictement active lors de
+  l'autorisation de signature, sans exiger artificiellement une nouvelle
+  durée complète entre deux transactions PostgreSQL successives.
+
+- **1.11.3 — 2026-09-05 :** récupère un lock pré-signature après libération
+  explicite de la lease du worker et refuse un login opérations privilégié,
+  multi-membre, propriétaire ou détenteur d'une autorité directe.
+
+- **1.11.2 — 2026-09-05 :** aligne les ACL PostgreSQL 16 H2a, H2b et opérations
+  sur les contrôles H2c réellement exécutés : lecture de l'identifiant du lock
+  et transitions contrôlées durables, sans accès H2a aux bytes signés.
+
+- **1.11.1 — 2026-09-05 :** impose au démarrage H2b la correspondance des
+  huit limites runtime avec l'armement V2, y compris pour une reprise BUY
+  persistée ou une sortie ouverte, avant tout chargement du signer.
+
+- **1.11.0 — 2026-09-05 :** livre H2c en état
+  `READY_FOR_EXTERNAL_PREFLIGHT` : sidecar canary signé, armement lié à une
+  intention BUY exacte, réservation atomique, lock durable avant signature,
+  récupération fail-closed et rôles PostgreSQL séparés. Aucun canary n'est
+  démarré et #49 reste `NON_EXECUTED / NON_VALIDATED`.
 
 - **1.10.1 — 2026-09-04 :** rend le budget RPC H2b durable par tentative.
   Chaque appel est réservé en PostgreSQL avant le contact provider ; une

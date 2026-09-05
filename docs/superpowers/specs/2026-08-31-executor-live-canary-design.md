@@ -1,8 +1,8 @@
 # Exécution live et canary Executor V1 — conception #51-G
 
-**Version de spécification :** 1.1.0
+**Version de spécification :** 1.2.4
 
-**Version de la spécification parente :** 1.10.0
+**Version de la spécification parente :** 1.11.4
 
 **Date :** 2026-08-31
 
@@ -13,6 +13,27 @@
 **Dépendance :** #51-F fusionnée par la PR #74
 
 ## Historique des versions
+
+- **1.2.4 — 2026-09-05 :** remplace le fence irréalisable d'une lease encore
+  entière par le fence causal voulu d'une lease strictement active au moment
+  du lock pré-signature.
+
+- **1.2.3 — 2026-09-05 :** ferme la reprise d'un lock autorisé après release
+  de lease et valide l'absence de privilèges propres du login opérations à
+  chaque checkout PostgreSQL 16.
+
+- **1.2.2 — 2026-09-05 :** rend exécutables sous PostgreSQL 16 les fences H2c
+  transitifs de H2a, H2b et opérations, avec une allowlist colonne exacte et
+  toujours aucun accès recovery aux bytes signés.
+
+- **1.2.1 — 2026-09-05 :** refuse avant ouverture du signer toute reprise
+  dont une limite runtime diffère de l'armement exact autorisé.
+
+- **1.2.0 — 2026-09-05 :** constate H2c prêt pour un préflight externe,
+  avec armement exact V2, réservation d'exposition atomique, lock
+  pré-signature durable, récupération fail-closed et procédure opérateur
+  manuelle. L'état reste `CANARY_NOT_STARTED` et aucun verdict `PASS` n'est
+  produit par le code ou la PR.
 
 - **1.1.0 — 2026-09-04 :** constate H2b composé et désarmé avec exactement
   quatre lanes, recover SELL, execute SELL, recover BUY, execute BUY. H2a reste

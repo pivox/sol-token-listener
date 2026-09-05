@@ -18,9 +18,9 @@ const PUBLIC_KEY = '11111111111111111111111111111111';
 const FINGERPRINT = 'b'.repeat(64);
 
 void test('pins the existing migration catalogue and rejects a changed migration hash', async () => {
-  assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.length, 38);
+  assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.length, 39);
   assert.equal(LIVE_EXECUTOR_MIGRATION_CATALOG.at(-1)?.name,
-    '038_execution_live_rpc_budget.sql');
+    '039_execution_canary_operator_binding.sql');
   await validateLiveExecutorMigrationFiles();
 
   const directory = await mkdtemp(join(tmpdir(), 'executor-live-migrations-'));
@@ -50,7 +50,7 @@ void test('validates role, exact authority, migrations and live bindings without
     assert.deepEqual(evidence, {
       payloadVersion: 1,
       role: 'sol_token_executor_live',
-      migrationHead: '038_execution_live_rpc_budget.sql',
+      migrationHead: '039_execution_canary_operator_binding.sql',
       generationId: GENERATION_ID,
       providerId: 'primary',
       phase: 'CANARY',
@@ -265,6 +265,7 @@ void test('authority allowlist is restricted to H2b signing and submission primi
     'execution_activation_armaments',
     'execution_activation_events',
     'execution_attempts',
+    'execution_control_events',
     'execution_control_state',
     'execution_exit_authorizations',
     'execution_exposure_reservations',
@@ -273,6 +274,7 @@ void test('authority allowlist is restricted to H2b signing and submission primi
     'execution_live_positions',
     'execution_live_rpc_budgets',
     'execution_live_unsigned_simulation_evidence',
+    'execution_pre_signature_locks',
     'execution_pre_submission_revocations',
     'execution_provider_rate_limit_events',
     'execution_provider_usage_counters',

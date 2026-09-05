@@ -12,7 +12,14 @@ export type ExecutionClaimOptions =
       ownerId: string;
       leaseMs: number;
       purpose: 'LIVE_EXECUTE';
-      side: 'BUY' | 'SELL';
+      side: 'BUY';
+      generationId: string;
+    }>
+  | Readonly<{
+      ownerId: string;
+      leaseMs: number;
+      purpose: 'LIVE_EXECUTE';
+      side: 'SELL';
     }>
   | Readonly<{
       ownerId: string;

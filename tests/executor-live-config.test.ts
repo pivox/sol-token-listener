@@ -95,6 +95,13 @@ void test('keeps all financial and duration values canonical and bounded', () =>
   ]) assertConfigFailure(environment(overrides));
 });
 
+void test('caps the CANARY live lease at 120 seconds without narrowing later phases', () => {
+  assertConfigFailure(environment({ EXECUTOR_LEASE_MS: '120001' }));
+  assert.doesNotThrow(() => parseLiveExecutorConfig(environment({
+    EXECUTOR_ACTIVATION_PHASE: 'MICRO_LIVE', EXECUTOR_LEASE_MS: '120001',
+  })));
+});
+
 function environment(overrides: Readonly<Record<string, string | undefined>> = {}) {
   return {
     DATABASE_URL: 'postgresql://executor@127.0.0.1:5432/solanabot',

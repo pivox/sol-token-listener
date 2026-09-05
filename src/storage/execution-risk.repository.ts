@@ -21,6 +21,7 @@ import {
   type ExecutionRiskPolicyV1,
   type ExecutionTechnicalFailureReasonCode,
 } from '../domain/execution-risk-policy.js';
+import { createExecutionWalletSnapshot } from '../domain/execution-wallet-snapshot.js';
 import type {
   ExecutionBuyAdmissionInputV1,
   ExecutionBuyAdmissionResultV1,
@@ -247,54 +248,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
         [draft.generationId],
       );
-      const existing = await findWalletSnapshot(client, draft.snapshotId);
-      if (existing !== null) {
-        if (!sameWalletSnapshot(existing, draft)) throw failure('CONFLICT');
-        return existing;
-      }
-      const latest = await client.query(`SELECT snapshot_id,state_revision::TEXT AS state_revision,
-        superseded_at
-        FROM execution_wallet_snapshots WHERE generation_id=$1
-        ORDER BY state_revision DESC LIMIT 1`, [draft.generationId]);
-      if (latest.rows.length > 1) throw failure('INVALID_DATA');
-      const latestRow = latest.rows.length === 0 ? null : exactRow(latest.rows[0], [
-        'snapshot_id', 'state_revision', 'superseded_at',
-      ] as const);
-      const latestRevision = latestRow === null
-        ? null : unsignedBigint(parseBigint(latestRow.state_revision));
-      if (latestRow !== null && latestRow.superseded_at !== null) throw failure('INVALID_DATA');
-      if (latestRevision !== null && draft.stateRevision <= latestRevision) throw failure('CONFLICT');
-      try {
-        const result = await client.query(`INSERT INTO execution_wallet_snapshots (
-          snapshot_id,payload_version,snapshot_fingerprint,generation_id,provider_id,
-          state_revision,slot,block_time,observed_at,commitment,wallet_lamports,
-          token_balance_count,open_positions,
-          position_1_id,position_1_cost_basis_lamports,
-          position_1_conservative_liquidation_lamports,position_1_reconciliation_status,
-          position_2_id,position_2_cost_basis_lamports,
-          position_2_conservative_liquidation_lamports,position_2_reconciliation_status,
-          realized_net_pnl_raw
-        ) VALUES ($1,$2,$3,$4,$5,$6::BIGINT,$7::BIGINT,
-          CASE WHEN $8::BIGINT IS NULL THEN NULL ELSE TIMESTAMPTZ 'epoch'
-            + ($8::BIGINT * INTERVAL '1 millisecond') END,
-          TIMESTAMPTZ 'epoch' + ($9::BIGINT * INTERVAL '1 millisecond'),
-          $10,$11::NUMERIC,$12,$13,
-          $14,$15::NUMERIC,$16::NUMERIC,$17,
-          $18,$19::NUMERIC,$20::NUMERIC,$21,$22::NUMERIC)
-        RETURNING ${WALLET_SNAPSHOT_PROJECTION}`, walletSnapshotValues(draft));
-        const inserted = decodeWalletSnapshot(singleRow(result));
-        if (latestRow !== null) {
-          const superseded = await client.query(`UPDATE execution_wallet_snapshots SET
-            superseded_at=date_trunc('milliseconds',statement_timestamp()),
-            purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
-            WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latestRow.snapshot_id]);
-          if (superseded.rowCount !== 1) throw failure('CONFLICT');
-        }
-        return inserted;
-      } catch (error) {
-        if (['23503', '23505'].includes(databaseCode(error) ?? '')) throw failure('CONFLICT');
-        throw error;
-      }
+      return appendWalletSnapshotInTransaction(client, draft);
     });
   }
 
@@ -305,54 +259,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         'SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))',
         [snapshot.providerId],
       );
-      const existing = await findProviderSnapshot(client, snapshot.snapshotId);
-      if (existing !== null) {
-        if (!sameProviderSnapshot(existing, snapshot)) throw failure('CONFLICT');
-        return existing;
-      }
-      const latestResult = await client.query(`SELECT ${PROVIDER_PROJECTION}
-        FROM execution_provider_usage_snapshots
-        WHERE provider_id=$1
-        ORDER BY billing_period_started_at DESC,measured_at DESC LIMIT 1`,
-      [snapshot.providerId]);
-      if (latestResult.rows.length > 1) throw failure('INVALID_DATA');
-      if (latestResult.rows.length === 1) {
-        const latest = decodeProviderSnapshot(latestResult.rows[0]);
-        const samePeriod = snapshot.billingPeriodId === latest.billingPeriodId;
-        const coherent = snapshot.planId === latest.planId && (samePeriod
-          ? snapshot.billingPeriodStartedAtMs === latest.billingPeriodStartedAtMs
-            && snapshot.billingPeriodEndsAtMs === latest.billingPeriodEndsAtMs
-            && snapshot.limitUnits === latest.limitUnits
-            && snapshot.measuredAtMs > latest.measuredAtMs
-            && snapshot.usedUnits >= latest.usedUnits
-          : snapshot.billingPeriodStartedAtMs >= latest.billingPeriodEndsAtMs);
-        if (!coherent) throw failure('STALE_MEASUREMENT');
-      }
-      try {
-        if (latestResult.rows.length === 1) {
-          const latest = decodeProviderSnapshot(latestResult.rows[0]);
-          const superseded = await client.query(`UPDATE execution_provider_usage_snapshots SET
-            superseded_at=date_trunc('milliseconds',statement_timestamp()),
-            purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
-            WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latest.snapshotId]);
-          if (superseded.rowCount !== 1) throw failure('CONFLICT');
-        }
-        const result = await client.query(`INSERT INTO execution_provider_usage_snapshots (
-          snapshot_id,payload_version,snapshot_fingerprint,provider_id,plan_id,billing_period_id,
-          billing_period_started_at,billing_period_ends_at,limit_units,used_units,measured_at,
-          expires_at,provenance
-        ) VALUES ($1,$2,$3,$4,$5,$6,
-          TIMESTAMPTZ 'epoch' + ($7::BIGINT * INTERVAL '1 millisecond'),
-          TIMESTAMPTZ 'epoch' + ($8::BIGINT * INTERVAL '1 millisecond'),$9::NUMERIC,$10::NUMERIC,
-          TIMESTAMPTZ 'epoch' + ($11::BIGINT * INTERVAL '1 millisecond'),
-          TIMESTAMPTZ 'epoch' + ($12::BIGINT * INTERVAL '1 millisecond'),$13)
-        RETURNING ${PROVIDER_PROJECTION}`, providerSnapshotValues(snapshot));
-        const inserted = decodeProviderSnapshot(singleRow(result));
-        return inserted;
-      } catch (error) {
-        if (databaseCode(error) === '23505') throw failure('CONFLICT');
-        throw error;
-      }
+      return appendProviderUsageInTransaction(client, snapshot);
     });
   }
 
@@ -437,8 +344,6 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
 
   public async admitBuy(inputValue: ExecutionBuyAdmissionInputV1): Promise<ExecutionBuyAdmissionResultV1> {
     const input = admissionFrom(inputValue);
-    const quoteAmountRaw = input.intent.quoteAmountRaw;
-    if (quoteAmountRaw === null) throw failure('INVALID_INPUT');
     return this.transaction(async (client) => {
       await client.query(
         'SELECT pg_advisory_xact_lock(hashtextextended($1, 51005))',
@@ -448,206 +353,7 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
         'SELECT pg_advisory_xact_lock(hashtextextended($1, 51006))',
         [input.providerSnapshot.providerId],
       );
-      const operationAtMs = textTimestamp(exactRow(singleRow(await client.query(
-        `SELECT trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds', statement_timestamp()))
-          * 1000)::TEXT AS operation_at_ms`,
-      )), ['operation_at_ms'] as const).operation_at_ms);
-      const decisionAtMs = Math.max(operationAtMs, input.nowMs);
-      const generationResult = await client.query(`SELECT generation_id,wallet_public_key,
-        cluster,genesis_hash,generation FROM execution_wallet_generations
-        WHERE generation_id=$1 AND retired_at IS NULL`, [input.generationId]);
-      if (generationResult.rows.length !== 1) throw failure('CONFLICT');
-      exactRow(singleRow(generationResult), [
-        'generation_id', 'wallet_public_key', 'cluster', 'genesis_hash', 'generation',
-      ] as const);
-      const stateResult = await client.query(`SELECT state_revision::TEXT AS state_revision,
-        reserved_exposure_raw::TEXT AS reserved_exposure_raw,open_positions,
-        consecutive_technical_failures,last_technical_failure_reason_code,unknown_block
-        FROM execution_wallet_risk_state WHERE generation_id=$1 FOR UPDATE`, [input.generationId]);
-      const state = decodeRiskState(singleRow(stateResult));
-      const intentResult = await client.query(`SELECT id,payload_version,position_id,mint,side,
-        quote_mint,quote_amount_raw::TEXT AS quote_amount_raw,decision_fingerprint,
-        status,trunc(EXTRACT(EPOCH FROM requested_at) * 1000)::TEXT AS requested_at_ms,
-        trunc(EXTRACT(EPOCH FROM expires_at) * 1000)::TEXT AS expires_at_ms
-        FROM execution_intents WHERE id=$1 FOR UPDATE`, [input.intent.id]);
-      assertAdmissionIntentRow(singleRow(intentResult), input.intent);
-
-      const inputFingerprint = admissionInputFingerprint(input);
-      const existing = await findAdmissionResult(client, input.intent.id);
-      if (existing !== null) {
-        if (existing.inputFingerprint !== inputFingerprint
-          || existing.policyFingerprint !== input.policy.policyFingerprint
-          || existing.walletSnapshotFingerprint !== input.walletSnapshot.snapshotFingerprint
-          || existing.providerSnapshotFingerprint !== input.providerSnapshot.snapshotFingerprint) {
-          throw failure('CONFLICT');
-        }
-        return existing.result;
-      }
-
-      const walletSnapshot = await findWalletSnapshot(
-        client,
-        input.walletSnapshot.snapshotId,
-        true,
-      );
-      if (walletSnapshot === null || !sameWalletSnapshot(walletSnapshot, input.walletSnapshot)
-        || walletSnapshot.generationId !== input.generationId) throw failure('CONFLICT');
-      const providerSnapshot = await findProviderSnapshot(
-        client,
-        input.providerSnapshot.snapshotId,
-        true,
-      );
-      if (providerSnapshot === null
-        || !sameProviderSnapshot(providerSnapshot, input.providerSnapshot)) throw failure('CONFLICT');
-
-      const localUsage = unsignedBigint(parseBigint(exactRow(singleRow(await client.query(
-        `SELECT COALESCE(SUM(units),0)::TEXT AS local_units
-         FROM execution_provider_usage_counters
-         WHERE provider_id=$1 AND billing_period_id=$2
-           AND recorded_at >= TIMESTAMPTZ 'epoch'
-             + ($3::BIGINT * INTERVAL '1 millisecond')`,
-        [providerSnapshot.providerId, providerSnapshot.billingPeriodId,
-          providerSnapshot.measuredAtMs],
-      )), ['local_units'] as const).local_units));
-      const rateRows = await client.query(`SELECT
-        trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms
-        FROM execution_provider_rate_limit_events
-        WHERE provider_id=$1 AND observed_at >= TIMESTAMPTZ 'epoch'
-          + (($2::BIGINT - 30000) * INTERVAL '1 millisecond')
-        ORDER BY observed_at ASC,event_id ASC LIMIT 1000`, [providerSnapshot.providerId, decisionAtMs]);
-      const recentRateLimits = rateRows.rows.map((row) => textTimestamp(
-        exactRow(row, ['observed_at_ms'] as const).observed_at_ms,
-      ));
-      const providerRateLimitCount = unsignedBigint(parseBigint(exactRow(singleRow(
-        await client.query(`SELECT COUNT(*)::TEXT AS rate_limit_count
-          FROM execution_provider_rate_limit_events
-          WHERE provider_id=$1 AND billing_period_id=$2`, [
-          providerSnapshot.providerId, providerSnapshot.billingPeriodId,
-        ]),
-      ), ['rate_limit_count'] as const).rate_limit_count));
-      const quota = evaluateProviderQuota({
-        policy: input.policy,
-        previousSnapshot: null,
-        snapshot: providerSnapshot,
-        localUsedSinceMeasurement: localUsage,
-        openPositions: walletSnapshot.openPositions.length,
-        consecutiveRateLimits: recentRateLimits,
-        allEndpointsUnavailable: input.allEndpointsUnavailable,
-        nowMs: decisionAtMs,
-      });
-      const risk = evaluateBuyRisk({
-        policy: input.policy,
-        quoteMint: input.intent.quoteMint,
-        requestedQuoteAmountRaw: input.intent.quoteAmountRaw,
-        realizedNetPnlLamports: walletSnapshot.realizedNetPnlRaw,
-        reservedExposureLamports: state.reservedExposureRaw,
-        openPositions: walletSnapshot.openPositions,
-        consecutiveTechnicalFailures: state.consecutiveTechnicalFailures,
-        lastTechnicalFailureReasonCode: state.lastTechnicalFailureReasonCode,
-      });
-      const staleWallet = walletSnapshot.stateRevision !== state.stateRevision
-        || walletSnapshot.openPositions.length !== state.openPositions
-        || decisionAtMs > walletSnapshot.observedAtMs + input.policy.walletSnapshotMaxAgeMs;
-      const staleDecision = decisionAtMs >= input.intent.expiresAtMs;
-      const reasonCode = state.unknownBlock ? 'RECONCILIATION_REQUIRED'
-        : staleDecision ? 'DECISION_STALE'
-          : staleWallet ? 'WALLET_MISMATCH'
-          : risk.kind === 'REJECTED' ? risk.reasonCode
-            : quota.state !== 'NORMAL' ? quota.reasonCode : null;
-      if (reasonCode === null && (risk.kind !== 'ADMISSIBLE' || quota.state !== 'NORMAL')) {
-        throw failure('INVALID_DATA');
-      }
-      const decision = reasonCode === null ? 'ADMITTED' : 'REJECTED';
-      const targetRevision = decision === 'ADMITTED' ? state.stateRevision + 1n : state.stateRevision;
-      const identity = admissionIdentity(
-        input,
-        inputFingerprint,
-        risk,
-        quota.state,
-        decision,
-        reasonCode,
-      );
-      const reportId = `execution_risk_admission_${identity.reportFingerprint}`;
-      const reservationId = decision === 'ADMITTED'
-        ? `execution_exposure_reservation_${hash(['reservation-v1', reportId])}` : null;
-      const reportInsert = await client.query(`INSERT INTO execution_risk_admission_reports (
-        report_id,payload_version,report_fingerprint,intent_id,generation_id,policy_fingerprint,
-        wallet_snapshot_fingerprint,provider_snapshot_fingerprint,decision,reason_code,
-        quote_amount_raw,projected_capital_raw,projected_exposure_raw,projected_drawdown_raw,
-        quota_state,wallet_state_revision,input_fingerprint,
-        risk_state_revision_baseline,conservative_drawdown_raw_baseline,
-        provider_local_usage_units_baseline,provider_rate_limit_count_baseline,
-        recorded_at,terminal_at,purge_after
-      ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10::NUMERIC,$11::NUMERIC,
-        $12::NUMERIC,$13::NUMERIC,$14,$15::BIGINT,$16,$15::BIGINT,$13::NUMERIC,
-        $17::NUMERIC,$18::BIGINT,
-        TIMESTAMPTZ 'epoch' + ($19::BIGINT * INTERVAL '1 millisecond'),
-        CASE WHEN $8='REJECTED' THEN TIMESTAMPTZ 'epoch'
-          + ($19::BIGINT * INTERVAL '1 millisecond') ELSE NULL END,
-        CASE WHEN $8='REJECTED' THEN TIMESTAMPTZ 'epoch'
-          + (($19::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END)`, [
-        reportId, identity.reportFingerprint, input.intent.id, input.generationId,
-        input.policy.policyFingerprint, walletSnapshot.snapshotFingerprint,
-        providerSnapshot.snapshotFingerprint, decision, reasonCode,
-        quoteAmountRaw.toString(), risk.reconciledCapitalLamports.toString(),
-        risk.projectedExposureLamports.toString(),
-        risk.conservativeUnrealizedLossLamports.toString(), quota.state,
-        targetRevision.toString(), inputFingerprint,
-        (localUsage + (decision === 'ADMITTED' ? input.policy.providerEntryCostUnits : 0n)).toString(),
-        providerRateLimitCount.toString(), operationAtMs,
-      ]);
-      if (reportInsert.rowCount !== 1) throw failure('INVALID_DATA');
-      if (decision === 'ADMITTED' && reservationId !== null) {
-        const reservationInsert = await client.query(`INSERT INTO execution_exposure_reservations (
-          reservation_id,payload_version,intent_id,generation_id,admission_report_id,position_id,
-          side,mint,quote_mint,maximum_amount_raw,intent_fingerprint,policy_fingerprint,
-          wallet_snapshot_fingerprint,provider_snapshot_fingerprint,state,state_revision,created_at
-        ) VALUES ($1,1,$2,$3,$4,$5,'BUY',$6,$7,$8::NUMERIC,$9,$10,$11,$12,
-          'RESERVED',$13::BIGINT,
-          TIMESTAMPTZ 'epoch' + ($14::BIGINT * INTERVAL '1 millisecond'))`, [
-          reservationId, input.intent.id, input.generationId, reportId, input.intent.positionId,
-          input.intent.mint, input.intent.quoteMint, quoteAmountRaw.toString(),
-          identity.intentFingerprint, input.policy.policyFingerprint,
-          walletSnapshot.snapshotFingerprint, providerSnapshot.snapshotFingerprint,
-          targetRevision.toString(), operationAtMs,
-        ]);
-        if (reservationInsert.rowCount !== 1) throw failure('INVALID_DATA');
-        const operationId = createProviderUsageOperationId({
-          providerId: providerSnapshot.providerId,
-          billingPeriodId: providerSnapshot.billingPeriodId,
-          category: 'ENTRY',
-          logicalOperationId: input.intent.id,
-        });
-        const counterInsert = await client.query(`INSERT INTO execution_provider_usage_counters (
-          operation_id,payload_version,snapshot_id,provider_id,billing_period_id,category,
-          logical_operation_id,units,recorded_at
-        ) VALUES ($1,1,$2,$3,$4,'ENTRY',$5,$6::NUMERIC,
-          TIMESTAMPTZ 'epoch' + ($7::BIGINT * INTERVAL '1 millisecond'))`, [
-          operationId, providerSnapshot.snapshotId, providerSnapshot.providerId,
-          providerSnapshot.billingPeriodId, input.intent.id,
-          input.policy.providerEntryCostUnits.toString(), operationAtMs,
-        ]);
-        if (counterInsert.rowCount !== 1) throw failure('INVALID_DATA');
-        const update = await client.query(`UPDATE execution_wallet_risk_state SET
-          state_revision=$2::BIGINT,reconciled_capital_lamports=$3::NUMERIC,
-          reserved_exposure_raw=$4::NUMERIC,open_positions=$5,
-          conservative_drawdown_raw=$6::NUMERIC,
-          updated_at=TIMESTAMPTZ 'epoch' + ($7::BIGINT * INTERVAL '1 millisecond')
-          WHERE generation_id=$1 AND state_revision=$8::BIGINT`, [
-          input.generationId, targetRevision.toString(), risk.reconciledCapitalLamports.toString(),
-          risk.projectedExposureLamports.toString(), risk.openPositionCount + 1,
-          risk.conservativeUnrealizedLossLamports.toString(), operationAtMs,
-          state.stateRevision.toString(),
-        ]);
-        if (update.rowCount !== 1) throw failure('CONFLICT');
-      }
-      return Object.freeze({
-        payloadVersion: 1,
-        decision,
-        reasonCode,
-        reportId,
-        reservationId,
-        stateRevision: targetRevision,
-      });
+      return admitBuyInTransaction(client, input);
     });
   }
 
@@ -943,7 +649,6 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
       if (row.generation !== evidence.walletGeneration
         || row.intent_side !== evidence.side
         || row.provider_id !== evidence.providerId
-        || row.wallet_snapshot_fingerprint !== evidence.snapshotFingerprint
         || row.reconciliation_signature !== evidence.signature
         || row.reconciliation_blockhash !== evidence.blockhash
         || row.reconciliation_last_valid_block_height
@@ -1134,6 +839,324 @@ export class PostgresExecutionRiskRepository implements ExecutionRiskRepository 
   }
 }
 
+export async function admitBuyInTransaction(
+  client: ExecutionRiskClient,
+  inputValue: ExecutionBuyAdmissionInputV1,
+): Promise<ExecutionBuyAdmissionResultV1> {
+  const input = admissionFrom(inputValue);
+  const quoteAmountRaw = input.intent.quoteAmountRaw;
+  if (quoteAmountRaw === null) throw failure('INVALID_INPUT');
+  const operationAtMs = textTimestamp(exactRow(singleRow(await client.query(
+    `SELECT trunc(EXTRACT(EPOCH FROM date_trunc('milliseconds', statement_timestamp()))
+      * 1000)::TEXT AS operation_at_ms`,
+  )), ['operation_at_ms'] as const).operation_at_ms);
+  const decisionAtMs = Math.max(operationAtMs, input.nowMs);
+  const generationResult = await client.query(`SELECT generation_id,wallet_public_key,
+    cluster,genesis_hash,generation FROM execution_wallet_generations
+    WHERE generation_id=$1 AND retired_at IS NULL`, [input.generationId]);
+  if (generationResult.rows.length !== 1) throw failure('CONFLICT');
+  exactRow(singleRow(generationResult), [
+    'generation_id', 'wallet_public_key', 'cluster', 'genesis_hash', 'generation',
+  ] as const);
+  const stateResult = await client.query(`SELECT state_revision::TEXT AS state_revision,
+    reserved_exposure_raw::TEXT AS reserved_exposure_raw,open_positions,
+    consecutive_technical_failures,last_technical_failure_reason_code,unknown_block
+    FROM execution_wallet_risk_state WHERE generation_id=$1 FOR UPDATE`, [input.generationId]);
+  const state = decodeRiskState(singleRow(stateResult));
+  const intentResult = await client.query(`SELECT id,payload_version,position_id,mint,side,
+    quote_mint,quote_amount_raw::TEXT AS quote_amount_raw,decision_fingerprint,
+    status,trunc(EXTRACT(EPOCH FROM requested_at) * 1000)::TEXT AS requested_at_ms,
+    trunc(EXTRACT(EPOCH FROM expires_at) * 1000)::TEXT AS expires_at_ms
+    FROM execution_intents WHERE id=$1 FOR UPDATE`, [input.intent.id]);
+  assertAdmissionIntentRow(singleRow(intentResult), input.intent);
+
+  const inputFingerprint = admissionInputFingerprint(input);
+  const existing = await findAdmissionResult(client, input.intent.id);
+  if (existing !== null) {
+    if (existing.inputFingerprint !== inputFingerprint
+      || existing.policyFingerprint !== input.policy.policyFingerprint
+      || existing.walletSnapshotFingerprint !== input.walletSnapshot.snapshotFingerprint
+      || existing.providerSnapshotFingerprint !== input.providerSnapshot.snapshotFingerprint) {
+      throw failure('CONFLICT');
+    }
+    return existing.result;
+  }
+
+  const walletSnapshot = await findWalletSnapshot(
+    client,
+    input.walletSnapshot.snapshotId,
+    true,
+  );
+  if (walletSnapshot === null || !sameWalletSnapshot(walletSnapshot, input.walletSnapshot)
+    || walletSnapshot.generationId !== input.generationId) throw failure('CONFLICT');
+  const providerSnapshot = await findProviderSnapshot(
+    client,
+    input.providerSnapshot.snapshotId,
+    true,
+  );
+  if (providerSnapshot === null
+    || !sameProviderSnapshot(providerSnapshot, input.providerSnapshot)) throw failure('CONFLICT');
+
+  const localUsage = unsignedBigint(parseBigint(exactRow(singleRow(await client.query(
+    `SELECT COALESCE(SUM(units),0)::TEXT AS local_units
+     FROM execution_provider_usage_counters
+     WHERE provider_id=$1 AND billing_period_id=$2
+       AND recorded_at >= TIMESTAMPTZ 'epoch'
+         + ($3::BIGINT * INTERVAL '1 millisecond')`,
+    [providerSnapshot.providerId, providerSnapshot.billingPeriodId,
+      providerSnapshot.measuredAtMs],
+  )), ['local_units'] as const).local_units));
+  const rateRows = await client.query(`SELECT
+    trunc(EXTRACT(EPOCH FROM observed_at) * 1000)::TEXT AS observed_at_ms
+    FROM execution_provider_rate_limit_events
+    WHERE provider_id=$1 AND observed_at >= TIMESTAMPTZ 'epoch'
+      + (($2::BIGINT - 30000) * INTERVAL '1 millisecond')
+    ORDER BY observed_at ASC,event_id ASC LIMIT 1000`, [providerSnapshot.providerId, decisionAtMs]);
+  const recentRateLimits = rateRows.rows.map((row) => textTimestamp(
+    exactRow(row, ['observed_at_ms'] as const).observed_at_ms,
+  ));
+  const providerRateLimitCount = unsignedBigint(parseBigint(exactRow(singleRow(
+    await client.query(`SELECT COUNT(*)::TEXT AS rate_limit_count
+      FROM execution_provider_rate_limit_events
+      WHERE provider_id=$1 AND billing_period_id=$2`, [
+      providerSnapshot.providerId, providerSnapshot.billingPeriodId,
+    ]),
+  ), ['rate_limit_count'] as const).rate_limit_count));
+  const quota = evaluateProviderQuota({
+    policy: input.policy,
+    previousSnapshot: null,
+    snapshot: providerSnapshot,
+    localUsedSinceMeasurement: localUsage,
+    openPositions: walletSnapshot.openPositions.length,
+    consecutiveRateLimits: recentRateLimits,
+    allEndpointsUnavailable: input.allEndpointsUnavailable,
+    nowMs: decisionAtMs,
+  });
+  const risk = evaluateBuyRisk({
+    policy: input.policy,
+    quoteMint: input.intent.quoteMint,
+    requestedQuoteAmountRaw: input.intent.quoteAmountRaw,
+    realizedNetPnlLamports: walletSnapshot.realizedNetPnlRaw,
+    reservedExposureLamports: state.reservedExposureRaw,
+    openPositions: walletSnapshot.openPositions,
+    consecutiveTechnicalFailures: state.consecutiveTechnicalFailures,
+    lastTechnicalFailureReasonCode: state.lastTechnicalFailureReasonCode,
+  });
+  const staleWallet = walletSnapshot.stateRevision !== state.stateRevision
+    || walletSnapshot.openPositions.length !== state.openPositions
+    || decisionAtMs > walletSnapshot.observedAtMs + input.policy.walletSnapshotMaxAgeMs;
+  const staleDecision = decisionAtMs >= input.intent.expiresAtMs;
+  const reasonCode = state.unknownBlock ? 'RECONCILIATION_REQUIRED'
+    : staleDecision ? 'DECISION_STALE'
+      : staleWallet ? 'WALLET_MISMATCH'
+      : risk.kind === 'REJECTED' ? risk.reasonCode
+        : quota.state !== 'NORMAL' ? quota.reasonCode : null;
+  if (reasonCode === null && (risk.kind !== 'ADMISSIBLE' || quota.state !== 'NORMAL')) {
+    throw failure('INVALID_DATA');
+  }
+  const decision = reasonCode === null ? 'ADMITTED' : 'REJECTED';
+  const targetRevision = decision === 'ADMITTED' ? state.stateRevision + 1n : state.stateRevision;
+  const identity = admissionIdentity(
+    input,
+    inputFingerprint,
+    risk,
+    quota.state,
+    decision,
+    reasonCode,
+  );
+  const reportId = `execution_risk_admission_${identity.reportFingerprint}`;
+  const reservationId = decision === 'ADMITTED'
+    ? `execution_exposure_reservation_${hash(['reservation-v1', reportId])}` : null;
+  const reportInsert = await client.query(`INSERT INTO execution_risk_admission_reports (
+    report_id,payload_version,report_fingerprint,intent_id,generation_id,policy_fingerprint,
+    wallet_snapshot_fingerprint,provider_snapshot_fingerprint,decision,reason_code,
+    quote_amount_raw,projected_capital_raw,projected_exposure_raw,projected_drawdown_raw,
+    quota_state,wallet_state_revision,input_fingerprint,
+    risk_state_revision_baseline,conservative_drawdown_raw_baseline,
+    provider_local_usage_units_baseline,provider_rate_limit_count_baseline,
+    recorded_at,terminal_at,purge_after
+  ) VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10::NUMERIC,$11::NUMERIC,
+    $12::NUMERIC,$13::NUMERIC,$14,$15::BIGINT,$16,$15::BIGINT,$13::NUMERIC,
+    $17::NUMERIC,$18::BIGINT,
+    TIMESTAMPTZ 'epoch' + ($19::BIGINT * INTERVAL '1 millisecond'),
+    CASE WHEN $8='REJECTED' THEN TIMESTAMPTZ 'epoch'
+      + ($19::BIGINT * INTERVAL '1 millisecond') ELSE NULL END,
+    CASE WHEN $8='REJECTED' THEN TIMESTAMPTZ 'epoch'
+      + (($19::BIGINT + 14400000) * INTERVAL '1 millisecond') ELSE NULL END)`, [
+    reportId, identity.reportFingerprint, input.intent.id, input.generationId,
+    input.policy.policyFingerprint, walletSnapshot.snapshotFingerprint,
+    providerSnapshot.snapshotFingerprint, decision, reasonCode,
+    quoteAmountRaw.toString(), risk.reconciledCapitalLamports.toString(),
+    risk.projectedExposureLamports.toString(),
+    risk.conservativeUnrealizedLossLamports.toString(), quota.state,
+    targetRevision.toString(), inputFingerprint,
+    (localUsage + (decision === 'ADMITTED' ? input.policy.providerEntryCostUnits : 0n)).toString(),
+    providerRateLimitCount.toString(), operationAtMs,
+  ]);
+  if (reportInsert.rowCount !== 1) throw failure('INVALID_DATA');
+  if (decision === 'ADMITTED' && reservationId !== null) {
+    const reservationInsert = await client.query(`INSERT INTO execution_exposure_reservations (
+      reservation_id,payload_version,intent_id,generation_id,admission_report_id,position_id,
+      side,mint,quote_mint,maximum_amount_raw,intent_fingerprint,policy_fingerprint,
+      wallet_snapshot_fingerprint,provider_snapshot_fingerprint,state,state_revision,created_at
+    ) VALUES ($1,1,$2,$3,$4,$5,'BUY',$6,$7,$8::NUMERIC,$9,$10,$11,$12,
+      'RESERVED',$13::BIGINT,
+      TIMESTAMPTZ 'epoch' + ($14::BIGINT * INTERVAL '1 millisecond'))`, [
+      reservationId, input.intent.id, input.generationId, reportId, input.intent.positionId,
+      input.intent.mint, input.intent.quoteMint, quoteAmountRaw.toString(),
+      identity.intentFingerprint, input.policy.policyFingerprint,
+      walletSnapshot.snapshotFingerprint, providerSnapshot.snapshotFingerprint,
+      targetRevision.toString(), operationAtMs,
+    ]);
+    if (reservationInsert.rowCount !== 1) throw failure('INVALID_DATA');
+    const operationId = createProviderUsageOperationId({
+      providerId: providerSnapshot.providerId,
+      billingPeriodId: providerSnapshot.billingPeriodId,
+      category: 'ENTRY',
+      logicalOperationId: input.intent.id,
+    });
+    const counterInsert = await client.query(`INSERT INTO execution_provider_usage_counters (
+      operation_id,payload_version,snapshot_id,provider_id,billing_period_id,category,
+      logical_operation_id,units,recorded_at
+    ) VALUES ($1,1,$2,$3,$4,'ENTRY',$5,$6::NUMERIC,
+      TIMESTAMPTZ 'epoch' + ($7::BIGINT * INTERVAL '1 millisecond'))`, [
+      operationId, providerSnapshot.snapshotId, providerSnapshot.providerId,
+      providerSnapshot.billingPeriodId, input.intent.id,
+      input.policy.providerEntryCostUnits.toString(), operationAtMs,
+    ]);
+    if (counterInsert.rowCount !== 1) throw failure('INVALID_DATA');
+    const update = await client.query(`UPDATE execution_wallet_risk_state SET
+      state_revision=$2::BIGINT,reconciled_capital_lamports=$3::NUMERIC,
+      reserved_exposure_raw=$4::NUMERIC,open_positions=$5,
+      conservative_drawdown_raw=$6::NUMERIC,
+      updated_at=TIMESTAMPTZ 'epoch' + ($7::BIGINT * INTERVAL '1 millisecond')
+      WHERE generation_id=$1 AND state_revision=$8::BIGINT`, [
+      input.generationId, targetRevision.toString(), risk.reconciledCapitalLamports.toString(),
+      risk.projectedExposureLamports.toString(), risk.openPositionCount + 1,
+      risk.conservativeUnrealizedLossLamports.toString(), operationAtMs,
+      state.stateRevision.toString(),
+    ]);
+    if (update.rowCount !== 1) throw failure('CONFLICT');
+  }
+  return Object.freeze({
+    payloadVersion: 1,
+    decision,
+    reasonCode,
+    reportId,
+    reservationId,
+    stateRevision: targetRevision,
+  });
+}
+
+export async function appendWalletSnapshotInTransaction(
+  client: ExecutionRiskClient,
+  input: WalletSnapshotDraftV1,
+): Promise<WalletSnapshotV1> {
+  const draft = walletSnapshotFrom(input);
+  const existing = await findWalletSnapshot(client, draft.snapshotId);
+  if (existing !== null) {
+    if (!sameWalletSnapshot(existing, draft)) throw failure('CONFLICT');
+    return existing;
+  }
+  const latest = await client.query(`SELECT snapshot_id,state_revision::TEXT AS state_revision,
+    superseded_at
+    FROM execution_wallet_snapshots WHERE generation_id=$1
+    ORDER BY state_revision DESC LIMIT 1`, [draft.generationId]);
+  if (latest.rows.length > 1) throw failure('INVALID_DATA');
+  const latestRow = latest.rows.length === 0 ? null : exactRow(latest.rows[0], [
+    'snapshot_id', 'state_revision', 'superseded_at',
+  ] as const);
+  const latestRevision = latestRow === null
+    ? null : unsignedBigint(parseBigint(latestRow.state_revision));
+  if (latestRow !== null && latestRow.superseded_at !== null) throw failure('INVALID_DATA');
+  if (latestRevision !== null && draft.stateRevision <= latestRevision) throw failure('CONFLICT');
+  try {
+    const result = await client.query(`INSERT INTO execution_wallet_snapshots (
+      snapshot_id,payload_version,snapshot_fingerprint,generation_id,provider_id,
+      state_revision,slot,block_time,observed_at,commitment,wallet_lamports,
+      token_balance_count,open_positions,
+      position_1_id,position_1_cost_basis_lamports,
+      position_1_conservative_liquidation_lamports,position_1_reconciliation_status,
+      position_2_id,position_2_cost_basis_lamports,
+      position_2_conservative_liquidation_lamports,position_2_reconciliation_status,
+      realized_net_pnl_raw
+    ) VALUES ($1,$2,$3,$4,$5,$6::BIGINT,$7::BIGINT,
+      CASE WHEN $8::BIGINT IS NULL THEN NULL ELSE TIMESTAMPTZ 'epoch'
+        + ($8::BIGINT * INTERVAL '1 millisecond') END,
+      TIMESTAMPTZ 'epoch' + ($9::BIGINT * INTERVAL '1 millisecond'),
+      $10,$11::NUMERIC,$12,$13,
+      $14,$15::NUMERIC,$16::NUMERIC,$17,
+      $18,$19::NUMERIC,$20::NUMERIC,$21,$22::NUMERIC)
+    RETURNING ${WALLET_SNAPSHOT_PROJECTION}`, walletSnapshotValues(draft));
+    const inserted = decodeWalletSnapshot(singleRow(result));
+    if (latestRow !== null) {
+      const superseded = await client.query(`UPDATE execution_wallet_snapshots SET
+        superseded_at=date_trunc('milliseconds',statement_timestamp()),
+        purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
+        WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latestRow.snapshot_id]);
+      if (superseded.rowCount !== 1) throw failure('CONFLICT');
+    }
+    return inserted;
+  } catch (error) {
+    if (['23503', '23505'].includes(databaseCode(error) ?? '')) throw failure('CONFLICT');
+    throw error;
+  }
+}
+
+export async function appendProviderUsageInTransaction(
+  client: ExecutionRiskClient,
+  input: ProviderUsageSnapshotV1,
+): Promise<ProviderUsageSnapshotV1> {
+  const snapshot = providerSnapshotFrom(input);
+  const existing = await findProviderSnapshot(client, snapshot.snapshotId);
+  if (existing !== null) {
+    if (!sameProviderSnapshot(existing, snapshot)) throw failure('CONFLICT');
+    return existing;
+  }
+  const latestResult = await client.query(`SELECT ${PROVIDER_PROJECTION}
+    FROM execution_provider_usage_snapshots
+    WHERE provider_id=$1
+    ORDER BY billing_period_started_at DESC,measured_at DESC LIMIT 1`,
+  [snapshot.providerId]);
+  if (latestResult.rows.length > 1) throw failure('INVALID_DATA');
+  if (latestResult.rows.length === 1) {
+    const latest = decodeProviderSnapshot(latestResult.rows[0]);
+    const samePeriod = snapshot.billingPeriodId === latest.billingPeriodId;
+    const coherent = snapshot.planId === latest.planId && (samePeriod
+      ? snapshot.billingPeriodStartedAtMs === latest.billingPeriodStartedAtMs
+        && snapshot.billingPeriodEndsAtMs === latest.billingPeriodEndsAtMs
+        && snapshot.limitUnits === latest.limitUnits
+        && snapshot.measuredAtMs > latest.measuredAtMs
+        && snapshot.usedUnits >= latest.usedUnits
+      : snapshot.billingPeriodStartedAtMs >= latest.billingPeriodEndsAtMs);
+    if (!coherent) throw failure('STALE_MEASUREMENT');
+  }
+  try {
+    if (latestResult.rows.length === 1) {
+      const latest = decodeProviderSnapshot(latestResult.rows[0]);
+      const superseded = await client.query(`UPDATE execution_provider_usage_snapshots SET
+        superseded_at=date_trunc('milliseconds',statement_timestamp()),
+        purge_after=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '4 hours'
+        WHERE snapshot_id=$1 AND superseded_at IS NULL`, [latest.snapshotId]);
+      if (superseded.rowCount !== 1) throw failure('CONFLICT');
+    }
+    const result = await client.query(`INSERT INTO execution_provider_usage_snapshots (
+      snapshot_id,payload_version,snapshot_fingerprint,provider_id,plan_id,billing_period_id,
+      billing_period_started_at,billing_period_ends_at,limit_units,used_units,measured_at,
+      expires_at,provenance
+    ) VALUES ($1,$2,$3,$4,$5,$6,
+      TIMESTAMPTZ 'epoch' + ($7::BIGINT * INTERVAL '1 millisecond'),
+      TIMESTAMPTZ 'epoch' + ($8::BIGINT * INTERVAL '1 millisecond'),$9::NUMERIC,$10::NUMERIC,
+      TIMESTAMPTZ 'epoch' + ($11::BIGINT * INTERVAL '1 millisecond'),
+      TIMESTAMPTZ 'epoch' + ($12::BIGINT * INTERVAL '1 millisecond'),$13)
+    RETURNING ${PROVIDER_PROJECTION}`, providerSnapshotValues(snapshot));
+    return decodeProviderSnapshot(singleRow(result));
+  } catch (error) {
+    if (databaseCode(error) === '23505') throw failure('CONFLICT');
+    throw error;
+  }
+}
+
 function generationDraftFrom(value: unknown): WalletGenerationDraftV1 {
   try {
     const row = exactInput(value, GENERATION_KEYS);
@@ -1153,10 +1176,7 @@ function generationDraftFrom(value: unknown): WalletGenerationDraftV1 {
 function walletSnapshotFrom(value: unknown): WalletSnapshotV1 {
   try {
     const row = exactInput(value, WALLET_SNAPSHOT_KEYS);
-    return Object.freeze({
-      snapshotId: patternedText(row.snapshotId, /^execution_wallet_snapshot_[0-9a-f]{64}$/u),
-      payloadVersion: one(row.payloadVersion),
-      snapshotFingerprint: patternedText(row.snapshotFingerprint, HASH),
+    const snapshot = createExecutionWalletSnapshot(Object.freeze({
       generationId: patternedText(row.generationId, /^execution_wallet_generation_[0-9a-f]{64}$/u),
       providerId: text(row.providerId, 256),
       stateRevision: unsignedBigint(row.stateRevision),
@@ -1168,7 +1188,11 @@ function walletSnapshotFrom(value: unknown): WalletSnapshotV1 {
       tokenBalanceCount: integer(row.tokenBalanceCount, 0, 2_147_483_647),
       openPositions: positionsFrom(row.openPositions),
       realizedNetPnlRaw: signedBigint(row.realizedNetPnlRaw),
-    });
+    }));
+    if (row.payloadVersion !== snapshot.payloadVersion
+      || row.snapshotId !== snapshot.snapshotId
+      || row.snapshotFingerprint !== snapshot.snapshotFingerprint) throw new TypeError();
+    return snapshot;
   } catch (error) {
     if (error instanceof ExecutionRiskRepositoryError && INTERNAL_ERRORS.has(error)) throw error;
     throw failure('INVALID_INPUT');

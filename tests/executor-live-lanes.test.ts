@@ -33,6 +33,23 @@ void test('fresh lane transitions, begins one attempt and exposes authenticated 
   ]);
 });
 
+void test('the BUY lane carries its canonical generation while the SELL lane does not', async () => {
+  const fixture = laneFixture('PENDING');
+  const lanes = createLiveSignableLanes(fixture.dependencies);
+
+  assert.equal(await lanes.buy(signal()), 'WORKED');
+  assert.equal(await lanes.sell(signal()), 'WORKED');
+  assert.deepEqual(fixture.claimOptions, [
+    Object.freeze({
+      ownerId: 'live-signable-test', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'BUY',
+      generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
+    }),
+    Object.freeze({
+      ownerId: 'live-signable-test', leaseMs: 60_000, purpose: 'LIVE_EXECUTE', side: 'SELL',
+    }),
+  ]);
+});
+
 for (const outcome of [
   'SUBMITTED', 'UNKNOWN_REQUIRES_RECONCILIATION',
 ] as const) {
@@ -76,16 +93,20 @@ function laneFixture(
 ): Readonly<{
   calls: string[];
   released: string[];
+  claimOptions: unknown[];
   dependencies: LiveSignableLaneDependencies;
 }> {
   const calls: string[] = [];
   const released: string[] = [];
+  const claimOptions: unknown[] = [];
   const dependencies: LiveSignableLaneDependencies = Object.freeze({
     ownerId: 'live-signable-test',
     leaseMs: 60_000,
     phase: 'CANARY',
+    generationId: `execution_wallet_generation_${'a'.repeat(64)}`,
     intents: {
       claim: (options: Parameters<LiveSignableLaneDependencies['intents']['claim']>[0]) => {
+        claimOptions.push(options);
         const side = 'side' in options ? options.side : undefined;
         calls.push(`claim:${options.purpose}:${side ?? 'NONE'}`);
         return Promise.resolve(empty ? null : claimFor(side ?? 'SELL', status));
@@ -141,7 +162,7 @@ function laneFixture(
     },
     clock: () => 1_000,
   });
-  return Object.freeze({ calls, released, dependencies });
+  return Object.freeze({ calls, released, claimOptions, dependencies });
 }
 
 function outcomeClaim(
