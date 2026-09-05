@@ -233,7 +233,7 @@ void test('documents H2d-H2j external evidence without starting a canary',
   );
   assertContainsExactlyOnce(
     runbook,
-    '**Version :** 1.11.0 — 2026-09-05',
+    '**Version :** 1.12.0 — 2026-09-05',
     'runbook version',
   );
   assertContainsExactlyOnce(
@@ -294,6 +294,10 @@ void test('documents H2d-H2j external evidence without starting a canary',
   assert.match(
     runbook,
     /sol_token_executor_worker[\s\S]*options=-c role=sol_token_executor_worker[\s\S]*POSTGRES_AUTO_MIGRATE=false/iu,
+  );
+  assert.match(
+    runbook,
+    /paramètres de simulation non signants[\s\S]*URL RPC potentiellement\s+confidentielle[\s\S]*fichier externe `0600`[\s\S]*jamais\s+journalisée/iu,
   );
   assert.doesNotMatch(runbook, /openssl genpkey/iu);
 

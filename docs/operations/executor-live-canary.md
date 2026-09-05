@@ -1,6 +1,6 @@
 # Executor live — préparation opérateur du canary Mainnet (#51-H2c)
 
-**Version :** 1.11.0 — 2026-09-05
+**Version :** 1.12.0 — 2026-09-05
 
 Ce document décrit l'état réellement livré. #51-H2a publie
 `executor:live:recovery:start`, un processus de finalité read-only sans keypair,
@@ -160,11 +160,13 @@ DOTENV_CONFIG_PATH=/chemin/hors-git/executor-worker.env \
   EXECUTOR_MODE=simulation-only npm run executor:start
 ```
 
-Le second mode exige en plus les variables publiques de simulation déjà
-documentées : adresse `EXECUTOR_PUBLIC_KEY`, provider positionnel, endpoint
-RPC, genesis attendu, limites et allowlist quote. Elles peuvent résider dans
-un second fichier `0600` avec la même `DATABASE_URL` dédiée. Aucun des deux
-fichiers ne contient de keypair, seed, armement ou configuration live.
+Le second mode exige en plus les paramètres de simulation non signants déjà
+documentés : adresse `EXECUTOR_PUBLIC_KEY`, provider positionnel, URL RPC,
+genesis attendu, limites et allowlist quote. Cette URL RPC potentiellement
+confidentielle doit rester dans un fichier externe `0600` et n'est jamais
+journalisée. Ces paramètres peuvent résider dans un second fichier de ce type,
+avec la même `DATABASE_URL` dédiée. Aucun des deux fichiers ne contient de
+keypair, seed, armement ou configuration live.
 
 Le rôle peut louer puis restituer une intention, écrire l'assessment dry-run ou
 la tentative, la transition et l'artefact de simulation non signé attendus. Il
