@@ -69,6 +69,9 @@ const WORKER_TABLE_AUTHORITY: Readonly<Record<string, TableAuthority>> = Object.
       'activation_phase', 'attempt_number', 'evidence', 'occurred_at',
     ],
   }),
+  execution_preflight_intent_pair_memberships: authority({
+    SELECT: ['intent_id', 'lane'],
+  }),
   execution_simulation_artifacts: authority({
     SELECT: [
       'artifact_id', 'payload_version', 'specification_version', 'evaluator_version',
@@ -909,6 +912,8 @@ async function assertExactColumnAuthority(
 async function assertDynamicExecutionInventory(
   admin: InstanceType<typeof pg.Pool>,
 ): Promise<void> {
+  const authorityTables = Object.keys(WORKER_TABLE_AUTHORITY)
+    .filter((tableName) => tableName.startsWith('execution_'));
   const relations = await admin.query<{
     readonly relation_name: string;
     readonly table_allowed: boolean;
@@ -927,15 +932,13 @@ async function assertDynamicExecutionInventory(
     assert.equal(row.table_allowed, false, row.relation_name);
     assert.equal(
       row.column_allowed,
-      WORKER_EXECUTION_TABLES.includes(
-        row.relation_name as typeof WORKER_EXECUTION_TABLES[number],
-      ),
+      authorityTables.includes(row.relation_name),
       row.relation_name,
     );
   }
   assert.deepEqual(
     relations.rows.filter((row) => row.column_allowed).map((row) => row.relation_name),
-    [...WORKER_EXECUTION_TABLES].sort(),
+    authorityTables.sort(),
   );
   const sequences = await admin.query<{
     readonly sequence_name: string;

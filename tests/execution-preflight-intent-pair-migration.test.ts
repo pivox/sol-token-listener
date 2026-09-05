@@ -41,9 +41,42 @@ void test('PostgreSQL 16 migration 041 creates and guards pristine intent pairs'
     await pool.query(`SET search_path TO ${quoteIdentifier(await currentSchema(pool))}, pg_temp, public`);
     await pool.query(await readFile(migrationUrl, 'utf8'));
 
-    await insertIntent(pool, 'target');
-    await insertIntent(pool, 'probe', { lane: 'SIMULATION' });
-    await insertPair(pool, 'pair', 'target', 'probe');
+    await inTransaction(pool, async (client) => {
+      await insertIntent(client, 'target');
+      await insertIntent(client, 'probe', { lane: 'SIMULATION' });
+      await insertPair(client, 'pair', 'target', 'probe');
+    });
+
+    await inTransaction(pool, async (client) => {
+      await insertIntent(client, 'forged-time-target');
+      await insertIntent(client, 'forged-time-probe', { lane: 'SIMULATION' });
+      await client.query(`INSERT INTO execution_preflight_intent_pairs (
+        pair_id,payload_version,pair_fingerprint,target_intent_id,simulation_intent_id,
+        decision_event_id,decision_fingerprint,created_at,expires_at
+      ) VALUES ('forged-time-pair',1,$1,'forged-time-target','forged-time-probe',
+        'decision-event',$2,$3::TIMESTAMPTZ,$4::TIMESTAMPTZ)`, [
+        createHash('sha256').update('forged-time-pair').digest('hex'),
+        fingerprint,
+        requestedAt,
+        expiresAt,
+      ]);
+    });
+    assert.deepEqual((await pool.query(`SELECT created_at > TIMESTAMPTZ '2025-01-01' AS db_owned
+      FROM execution_preflight_intent_pairs WHERE pair_id='forged-time-pair'`)).rows,
+    [{ db_owned: true }]);
+
+    await assert.rejects(
+      pool.query(`UPDATE execution_intents SET live_reserved=TRUE WHERE id='probe'`),
+      /simulation intent cannot be live reserved/u,
+    );
+    assert.deepEqual((await pool.query(`SELECT live_reserved FROM execution_intents
+      WHERE id='probe'`)).rows, [{ live_reserved: false }]);
+
+    await pool.query(await readFile(migrationUrl, 'utf8'));
+    await assert.rejects(
+      pool.query(`UPDATE execution_intents SET live_reserved=TRUE WHERE id='probe'`),
+      /simulation intent cannot be live reserved/u,
+    );
 
     const pair = await pool.query(`SELECT payload_version,pair_id,target_intent_id,
       simulation_intent_id,decision_event_id,decision_fingerprint,
@@ -65,49 +98,80 @@ void test('PostgreSQL 16 migration 041 creates and guards pristine intent pairs'
       { intent_id: 'target', lane: 'TARGET' },
     ]);
 
-    await assert.rejects(insertPair(pool, 'missing-parent', 'target', 'absent'));
-    await assert.rejects(insertPair(pool, 'same-parent', 'target', 'target'));
-
-    await insertIntent(pool, 'different-target');
-    await insertIntent(pool, 'different-probe', { quoteAmountRaw: '2', lane: 'SIMULATION' });
+    await insertIntent(pool, 'retro-target');
+    await insertIntent(pool, 'retro-probe', { lane: 'SIMULATION' });
     await assert.rejects(
-      insertPair(pool, 'different-economics', 'different-target', 'different-probe'),
+      insertPair(pool, 'retro-pair', 'retro-target', 'retro-probe'),
+      /created in the current transaction/u,
+    );
+
+    await assert.rejects(inTransaction(pool, async (client) => {
+      await insertIntent(client, 'missing-parent-target');
+      await insertPair(client, 'missing-parent', 'missing-parent-target', 'absent');
+    }));
+    await assert.rejects(inTransaction(pool, async (client) => {
+      await insertIntent(client, 'same-parent-target');
+      await insertPair(client, 'same-parent', 'same-parent-target', 'same-parent-target');
+    }));
+
+    await assert.rejects(
+      inTransaction(pool, async (client) => {
+        await insertIntent(client, 'different-target');
+        await insertIntent(client, 'different-probe', {
+          quoteAmountRaw: '2', lane: 'SIMULATION',
+        });
+        await insertPair(client, 'different-economics', 'different-target', 'different-probe');
+      }),
       /economic or causal tuple/u,
     );
 
-    await insertIntent(pool, 'wrong-strategy-target', { strategyId: 'another-strategy' });
-    await insertIntent(pool, 'probe-for-wrong-strategy', { lane: 'SIMULATION' });
     await assert.rejects(
-      insertPair(pool, 'wrong-strategy-pair', 'wrong-strategy-target', 'probe-for-wrong-strategy'),
+      inTransaction(pool, async (client) => {
+        await insertIntent(client, 'wrong-strategy-target', { strategyId: 'another-strategy' });
+        await insertIntent(client, 'probe-for-wrong-strategy', { lane: 'SIMULATION' });
+        await insertPair(client, 'wrong-strategy-pair', 'wrong-strategy-target',
+          'probe-for-wrong-strategy');
+      }),
       /canonical target and probe lanes/u,
     );
 
-    await insertIntent(pool, 'wrong-command-target', { logicalCommandId: `paper_sell_${'c'.repeat(64)}` });
-    await insertIntent(pool, 'probe-for-wrong-command', { lane: 'SIMULATION' });
     await assert.rejects(
-      insertPair(pool, 'wrong-command-pair', 'wrong-command-target', 'probe-for-wrong-command'),
+      inTransaction(pool, async (client) => {
+        await insertIntent(client, 'wrong-command-target', {
+          logicalCommandId: `paper_sell_${'c'.repeat(64)}`,
+        });
+        await insertIntent(client, 'probe-for-wrong-command', { lane: 'SIMULATION' });
+        await insertPair(client, 'wrong-command-pair', 'wrong-command-target',
+          'probe-for-wrong-command');
+      }),
       /canonical target and probe lanes/u,
     );
 
-    await insertIntent(pool, 'dirty-target', { status: 'PROCESSING', attemptCount: 1,
-      stateRevision: 1, lastReasonCode: 'EXECUTION_STARTED' });
-    await insertIntent(pool, 'clean-probe-for-dirty', { lane: 'SIMULATION' });
     await assert.rejects(
-      insertPair(pool, 'dirty-target-pair', 'dirty-target', 'clean-probe-for-dirty'),
+      inTransaction(pool, async (client) => {
+        await insertIntent(client, 'dirty-target', { status: 'PROCESSING', attemptCount: 1,
+          stateRevision: 1, lastReasonCode: 'EXECUTION_STARTED' });
+        await insertIntent(client, 'clean-probe-for-dirty', { lane: 'SIMULATION' });
+        await insertPair(client, 'dirty-target-pair', 'dirty-target', 'clean-probe-for-dirty');
+      }),
       /pristine/u,
     );
 
-    await insertIntent(pool, 'live-target', { liveReserved: true });
-    await insertIntent(pool, 'clean-probe-for-live', { lane: 'SIMULATION' });
     await assert.rejects(
-      insertPair(pool, 'live-target-pair', 'live-target', 'clean-probe-for-live'),
+      inTransaction(pool, async (client) => {
+        await insertIntent(client, 'live-target', { liveReserved: true });
+        await insertIntent(client, 'clean-probe-for-live', { lane: 'SIMULATION' });
+        await insertPair(client, 'live-target-pair', 'live-target', 'clean-probe-for-live');
+      }),
       /pristine/u,
     );
 
-    await insertIntent(pool, 'clean-target-for-live-probe');
-    await insertIntent(pool, 'live-probe', { liveReserved: true, lane: 'SIMULATION' });
     await assert.rejects(
-      insertPair(pool, 'live-probe-pair', 'clean-target-for-live-probe', 'live-probe'),
+      inTransaction(pool, async (client) => {
+        await insertIntent(client, 'clean-target-for-live-probe');
+        await insertIntent(client, 'live-probe', { liveReserved: true, lane: 'SIMULATION' });
+        await insertPair(client, 'live-probe-pair', 'clean-target-for-live-probe', 'live-probe');
+      }),
       /pristine/u,
     );
 
@@ -115,7 +179,7 @@ void test('PostgreSQL 16 migration 041 creates and guards pristine intent pairs'
     await insertIntent(pool, 'cross-lane-probe', { lane: 'SIMULATION' });
     await assert.rejects(
       insertPair(pool, 'cross-lane-pair', 'cross-lane-target', 'target'),
-      /canonical target and probe lanes|execution_preflight_intent_pair_memberships_intent_id_key/u,
+      /canonical target and probe lanes|created in the current transaction|execution_preflight_intent_pair_memberships_intent_id_key/u,
     );
     assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
       FROM execution_preflight_intent_pairs WHERE pair_id='cross-lane-pair'`)).rows[0]?.count, 0);
@@ -161,6 +225,13 @@ void test('PostgreSQL 16 migration 041 creates and guards pristine intent pairs'
     }
     assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
       FROM execution_preflight_intent_pairs WHERE pair_id='pair'`)).rows[0]?.count, 0);
+
+    await pool.query(`ALTER TABLE execution_preflight_intent_pairs
+      ALTER COLUMN payload_version DROP NOT NULL`);
+    await assert.rejects(
+      pool.query(await readFile(migrationUrl, 'utf8')),
+      /execution_preflight_intent_pairs has a malformed schema/u,
+    );
   });
 });
 
@@ -176,8 +247,15 @@ interface IntentOverrides {
   readonly lane?: 'TARGET' | 'SIMULATION';
 }
 
+interface Queryable {
+  query(text: string, values?: readonly unknown[]): Promise<Readonly<{
+    readonly rows: readonly Readonly<Record<string, unknown>>[];
+    readonly rowCount: number | null;
+  }>>;
+}
+
 async function insertIntent(
-  pool: InstanceType<typeof pg.Pool>,
+  pool: Queryable,
   id: string,
   overrides: IntentOverrides = {},
 ): Promise<void> {
@@ -212,7 +290,7 @@ async function insertIntent(
 }
 
 async function insertPair(
-  pool: InstanceType<typeof pg.Pool>,
+  pool: Queryable,
   pairId: string,
   targetIntentId: string,
   simulationIntentId: string,
@@ -226,6 +304,25 @@ async function insertPair(
   ) VALUES ($1,1,$2,$3,$4,'decision-event',$6,$5::TIMESTAMPTZ)`, [
     pairId, pairFingerprint, targetIntentId, simulationIntentId, expiresAt, fingerprint,
   ]);
+}
+
+async function inTransaction(
+  pool: InstanceType<typeof pg.Pool>,
+  run: (client: Queryable) => Promise<void>,
+): Promise<void> {
+  const client = await pool.connect();
+  let committed = false;
+  try {
+    await client.query('BEGIN');
+    await run(client);
+    await client.query('COMMIT');
+    committed = true;
+  } finally {
+    if (!committed) {
+      try { await client.query('ROLLBACK'); } catch { /* retain the primary failure */ }
+    }
+    client.release();
+  }
 }
 
 async function currentSchema(pool: InstanceType<typeof pg.Pool>): Promise<string> {

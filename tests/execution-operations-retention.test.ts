@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import pg from 'pg';
@@ -10,6 +10,100 @@ import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.r
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
 const publicKey = '11111111111111111111111111111111';
+const wsolMint = 'So11111111111111111111111111111111111111112';
+const pairDecisionFingerprint = 'f'.repeat(64);
+
+void test('retention expires a bounded pre-submission batch before selecting its purge cohort',
+  async (context) => {
+    const databaseUrl = testDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      await insertExpiredPreflightPair(pool, 'expire-before-purge');
+
+      const purged = await purgeExpiredFoundationData(pool);
+
+      assert.equal(purged.executionIntentsExpiredPreSubmission, 2);
+      assert.equal(purged.executionPreflightIntentPairMemberships, 0);
+      assert.equal(purged.executionPreflightIntentPairs, 0);
+      assert.deepEqual((await pool.query(`SELECT status,last_reason_code,
+        reconciliation_completed_at IS NOT NULL AS reconciled,
+        purge_after = terminal_at + INTERVAL '4 hours' AS retention_exact
+        FROM execution_intents ORDER BY id`)).rows, [
+        { status: 'EXPIRED', last_reason_code: 'INTENT_EXPIRED', reconciled: true,
+          retention_exact: true },
+        { status: 'EXPIRED', last_reason_code: 'INTENT_EXPIRED', reconciled: true,
+          retention_exact: true },
+      ]);
+      assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+        FROM execution_preflight_intent_pairs`)).rows[0]?.count, 1);
+      assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+        FROM execution_preflight_intent_pair_memberships`)).rows[0]?.count, 2);
+    });
+  });
+
+void test('retention purges a complete terminal pair before its parent intentions',
+  async (context) => {
+    const databaseUrl = testDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      await insertExpiredPreflightPair(pool, 'complete-terminal-pair');
+      await pool.query(`UPDATE execution_intents SET
+        status='EXPIRED',state_revision=1,last_reason_code='INTENT_EXPIRED',
+        terminal_at=TIMESTAMPTZ '2020-01-01T00:01:00.000Z',
+        reconciliation_completed_at=TIMESTAMPTZ '2020-01-01T00:01:00.000Z',
+        purge_after=TIMESTAMPTZ '2020-01-01T04:01:00.000Z',
+        updated_at=TIMESTAMPTZ '2020-01-01T00:01:00.000Z'`);
+
+      const purged = await purgeExpiredFoundationData(pool);
+
+      assert.equal(purged.executionIntentsExpiredPreSubmission, 0);
+      assert.equal(purged.executionPreflightIntentPairMemberships, 2);
+      assert.equal(purged.executionPreflightIntentPairs, 1);
+      assert.equal(purged.executionIntents, 2);
+      for (const table of [
+        'execution_preflight_intent_pair_memberships',
+        'execution_preflight_intent_pairs',
+        'execution_intents',
+      ]) assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count FROM ${table}`))
+        .rows[0]?.count, 0, table);
+      assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+        FROM execution_intent_tombstones`)).rows[0]?.count, 2);
+    });
+  });
+
+void test('retention keeps both parents when one expired pair lane is still leased',
+  async (context) => {
+    const databaseUrl = testDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      await insertExpiredPreflightPair(pool, 'leased-target-pair');
+      await pool.query(`UPDATE execution_intents SET
+        lease_owner='active-worker',lease_token=$2,
+        lease_expires_at=date_trunc('milliseconds',statement_timestamp()) + INTERVAL '1 hour'
+        WHERE id=$1`, ['leased-target-pair-target', randomUUID()]);
+      await pool.query(`UPDATE execution_intents SET
+        status='EXPIRED',state_revision=1,last_reason_code='INTENT_EXPIRED',
+        terminal_at=TIMESTAMPTZ '2020-01-01T00:01:00.000Z',
+        reconciliation_completed_at=TIMESTAMPTZ '2020-01-01T00:01:00.000Z',
+        purge_after=TIMESTAMPTZ '2020-01-01T04:01:00.000Z',
+        updated_at=TIMESTAMPTZ '2020-01-01T00:01:00.000Z'
+        WHERE id='leased-target-pair-simulation'`);
+
+      const purged = await purgeExpiredFoundationData(pool);
+
+      assert.equal(purged.executionIntentsExpiredPreSubmission, 0);
+      assert.equal(purged.executionPreflightIntentPairMemberships, 0);
+      assert.equal(purged.executionPreflightIntentPairs, 0);
+      assert.equal(purged.executionIntents, 0);
+      assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+        FROM execution_intents`)).rows[0]?.count, 2);
+      assert.equal((await pool.query(`SELECT COUNT(*)::INTEGER AS count
+        FROM execution_preflight_intent_pairs`)).rows[0]?.count, 1);
+    });
+  });
 
 void test('retention purges terminal #51-F payloads after four hours and preserves control state', async (context) => {
   const databaseUrl = testDatabaseUrl(context);
@@ -134,6 +228,53 @@ async function insertExpiredFixture(pool: InstanceType<typeof pg.Pool>): Promise
   ) VALUES ($1,1,'ENTRY_STOP',1,$2,TIMESTAMPTZ '2020-01-01T00:00:00.000Z')`, [
     generationId, controlEventId,
   ]);
+}
+
+async function insertExpiredPreflightPair(
+  pool: InstanceType<typeof pg.Pool>,
+  marker: string,
+): Promise<void> {
+  const client = await pool.connect();
+  let committed = false;
+  const ids = [`${marker}-target`, `${marker}-simulation`] as const;
+  try {
+    await client.query('BEGIN');
+    for (const [index, id] of ids.entries()) {
+      const commandHash = createHash('sha256').update(id).digest('hex');
+      const logicalCommandId = index === 0
+        ? `paper_open_${commandHash}`
+        : `execution_preflight_probe_${commandHash}`;
+      await client.query(`INSERT INTO execution_intents (
+        id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+        logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
+        quote_decimals,quote_amount_raw,base_amount_raw,minimum_amount_out_raw,
+        decision_event_id,decision_fingerprint,requested_at,expires_at,status,
+        created_at,updated_at
+      ) VALUES ($1,1,$2,'creation-entry-v1',1,$3,$2,$4,'BUY','PUMP_FUN_ONLY',$5,
+        'SPL_TOKEN',9,1,NULL,1,$6,$7,TIMESTAMPTZ '2020-01-01T00:00:00.000Z',
+        TIMESTAMPTZ '2020-01-01T00:01:00.000Z','PENDING',
+        TIMESTAMPTZ '2020-01-01T00:00:00.000Z',
+        TIMESTAMPTZ '2020-01-01T00:00:00.000Z')`, [
+        id, logicalCommandId, `position:${marker}`, publicKey, wsolMint,
+        `decision:${marker}`, pairDecisionFingerprint,
+      ]);
+    }
+    await client.query(`INSERT INTO execution_preflight_intent_pairs (
+      pair_id,payload_version,pair_fingerprint,target_intent_id,simulation_intent_id,
+      decision_event_id,decision_fingerprint,expires_at
+    ) VALUES ($1,1,$2,$3,$4,$5,$6,TIMESTAMPTZ '2020-01-01T00:01:00.000Z')`, [
+      `pair:${marker}`,
+      createHash('sha256').update(`pair:${marker}`).digest('hex'),
+      ids[0], ids[1], `decision:${marker}`, pairDecisionFingerprint,
+    ]);
+    await client.query('COMMIT');
+    committed = true;
+  } finally {
+    if (!committed) {
+      try { await client.query('ROLLBACK'); } catch { /* retain the primary failure */ }
+    }
+    client.release();
+  }
 }
 
 function testDatabaseUrl(context: Readonly<{ skip(message?: string): void }>): string | null {

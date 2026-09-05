@@ -131,6 +131,8 @@ void test('PostgreSQL 16 login has exact readiness authority and no live authori
       await client.query('SELECT version FROM migration_history LIMIT 1');
       for (const statement of [
         'SELECT id FROM execution_intents LIMIT 1',
+        'SELECT pair_id FROM execution_preflight_intent_pairs LIMIT 1',
+        'SELECT intent_id FROM execution_preflight_intent_pair_memberships LIMIT 1',
         'SELECT armament_id FROM execution_activation_armaments LIMIT 1',
         'SELECT signed_transaction_bytes FROM execution_signed_transactions LIMIT 1',
         'INSERT INTO execution_control_state DEFAULT VALUES',

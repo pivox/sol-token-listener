@@ -109,6 +109,9 @@ export const LIVE_EXECUTOR_DATABASE_AUTHORITY_V1: LiveExecutorDatabaseAuthorityV
         'lease_token', 'lease_expires_at', 'terminal_at', 'reconciliation_completed_at',
         'purge_after', 'updated_at',
       )),
+      table('execution_preflight_intent_pair_memberships', names(
+        'intent_id', 'lane',
+      )),
       table('execution_intent_transitions', names('intent_id'), names(
         'intent_id', 'previous_status', 'next_status', 'reason_code', 'human_message',
         'activation_phase', 'attempt_number', 'evidence', 'occurred_at',

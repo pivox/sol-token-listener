@@ -21,6 +21,7 @@ import type {
   ExecutionIntentTransitionInput,
 } from '../ports/execution-intent-repository.js';
 import { getDatabasePool } from './database.js';
+import { expireExecutionIntentsPreSubmissionInTransaction } from './execution-intent-expiration.js';
 
 type Row = Readonly<Record<string, unknown>>;
 
@@ -179,7 +180,13 @@ const CLAIM_PROJECTION = `${INTENT_PROJECTION},
 
 const CLAIM_SQL: Readonly<Record<ExecutionClaimPurpose, string>> = Object.freeze({
   EXECUTE: claimSql(
-    "intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')",
+    `intent.status IN ('PENDING', 'RETRY_READY', 'PROCESSING')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM execution_preflight_intent_pair_memberships AS pair_member
+        WHERE pair_member.intent_id = intent.id
+          AND pair_member.lane = 'TARGET'
+      )`,
     true,
     false,
   ),
@@ -586,74 +593,9 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
   public async expirePreSubmission(limitValue: number): Promise<number> {
     return this.safely(async () => {
       const limit = positiveInteger(limitValue, MAX_EXPIRE_BATCH, 'INVALID_INPUT');
-      return this.transaction(async (client) => {
-        const expired = await client.query(
-          `WITH operation AS MATERIALIZED (
-             SELECT date_trunc('milliseconds', statement_timestamp()) AS at
-           ), candidates AS MATERIALIZED (
-             SELECT intent.id,intent.status,intent.attempt_count,intent.state_revision
-             FROM execution_intents AS intent CROSS JOIN operation
-             WHERE intent.status IN ('PENDING','RETRY_READY','PROCESSING','SIMULATED')
-               AND intent.expires_at <= statement_timestamp()
-               AND (intent.lease_expires_at IS NULL
-                 OR intent.lease_expires_at <= statement_timestamp())
-               AND intent.state_revision < 9223372036854775807
-               AND (SELECT COUNT(*) FROM execution_attempts AS attempt
-                 WHERE attempt.intent_id=intent.id) = intent.attempt_count
-               AND COALESCE((SELECT MAX(attempt.attempt_number)
-                 FROM execution_attempts AS attempt WHERE attempt.intent_id=intent.id),0)
-                 = intent.attempt_count
-               AND (SELECT COUNT(*) FROM execution_attempts AS attempt
-                 WHERE attempt.intent_id=intent.id AND attempt.status='STARTED') <= 1
-               AND NOT EXISTS (SELECT 1 FROM execution_attempts AS attempt
-                 WHERE attempt.intent_id=intent.id AND attempt.status='STARTED'
-                   AND attempt.attempt_number<>intent.attempt_count)
-             ORDER BY intent.requested_at,intent.id
-             FOR UPDATE OF intent SKIP LOCKED
-             LIMIT $1
-           ), abandoned AS (
-             UPDATE execution_attempts AS attempt
-             SET status='ABANDONED',completed_at=operation.at,
-               reason_code='INTENT_EXPIRED'
-             FROM candidates AS candidate CROSS JOIN operation
-             WHERE attempt.intent_id=candidate.id AND attempt.status='STARTED'
-             RETURNING attempt.intent_id
-           ), journal AS (
-             INSERT INTO execution_intent_transitions (
-               intent_id,previous_status,next_status,reason_code,human_message,
-               activation_phase,attempt_number,evidence,occurred_at
-             )
-             SELECT candidate.id,candidate.status,'EXPIRED','INTENT_EXPIRED',
-               'Execution intent expired before signature.','NONE',
-               CASE WHEN candidate.attempt_count=0 THEN NULL ELSE candidate.attempt_count END,
-               jsonb_build_object(
-                 'payloadVersion',1,
-                 'attemptNumber',CASE WHEN candidate.attempt_count=0
-                   THEN NULL ELSE candidate.attempt_count END,
-                 'sourceEventId',NULL,
-                 'observedAtMs',(EXTRACT(EPOCH FROM operation.at) * 1000)::BIGINT
-               ),operation.at
-             FROM candidates AS candidate CROSS JOIN operation
-             RETURNING intent_id
-           ), updated AS (
-             UPDATE execution_intents AS intent
-             SET status='EXPIRED',last_reason_code='INTENT_EXPIRED',
-               terminal_at=operation.at,reconciliation_completed_at=operation.at,
-               purge_after=operation.at + INTERVAL '4 hours',
-               lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
-               updated_at=operation.at,state_revision=candidate.state_revision + 1
-             FROM candidates AS candidate CROSS JOIN operation
-             WHERE intent.id=candidate.id
-               AND EXISTS (SELECT 1 FROM journal WHERE journal.intent_id=intent.id)
-             RETURNING intent.id
-           )
-           SELECT COUNT(*)::INTEGER AS expired_count FROM updated`,
-          [limit],
-        );
-        if (expired.rowCount !== 1 || expired.rows.length !== 1) throw dataError();
-        const row = exactRecord(requiredRow(expired.rows), ['expired_count'], 'INVALID_DATA');
-        return nonNegativeInteger(row.expired_count, 'INVALID_DATA');
-      });
+      return this.transaction((client) => (
+        expireExecutionIntentsPreSubmissionInTransaction(client, limit)
+      ));
     });
   }
 

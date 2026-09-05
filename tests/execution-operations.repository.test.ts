@@ -17,9 +17,14 @@ import {
 } from '../src/domain/execution-safety-qualification.js';
 import { createExecutionWalletSnapshot } from '../src/domain/execution-wallet-snapshot.js';
 import { createExecutionIntentDraft } from '../src/domain/execution-intent.js';
+import { createExecutionPreflightIntentPairDraft } from '../src/domain/execution-preflight-intent-pair.js';
 import { createExecutionSimulationArtifactDraft } from '../src/domain/execution-simulation.js';
 import { migrateDatabase } from '../src/storage/database.js';
-import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
+import {
+  PostgresExecutionIntentRepository,
+  createExecutionIntentInTransaction,
+} from '../src/storage/execution-intent.repository.js';
+import { createExecutionPreflightIntentPairInTransaction } from '../src/storage/execution-preflight-intent-pair.repository.js';
 import {
   ExecutionOperationsRepositoryError,
   PostgresExecutionOperationsRepository,
@@ -334,6 +339,70 @@ void test('rejects an already live-reserved canary target before admission', asy
     await assertNoCanaryArmSideEffects(pool);
   });
 });
+
+void test('H2c refuses the SIMULATION lane while legacy unpaired targets remain supported',
+  async (context) => {
+    const databaseUrl = testDatabaseUrl(context);
+    if (databaseUrl === null) return;
+    await withTemporarySchema(databaseUrl, async (pool) => {
+      await migrateDatabase({ pool });
+      const fixture = await prepareCanaryArmament(pool);
+      const commandHash = '7'.repeat(64);
+      const canonicalTarget = createExecutionIntentDraft({
+        strategyId: 'creation-entry-v1', strategyVersion: 1,
+        positionId: 'position:paired-canary-target',
+        logicalCommandId: `paper_open_${commandHash}`,
+        mint: publicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
+        quoteMint: 'So11111111111111111111111111111111111111112',
+        quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+        quoteAmountRaw: 40_000n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+        decisionEventId: 'decision:paired-canary-target',
+        decisionFingerprint: 'd'.repeat(64),
+        requestedAtMs: fixture.nowMs - 1_000, expiresAtMs: fixture.nowMs + 120_000,
+      });
+      const pair = createExecutionPreflightIntentPairDraft(canonicalTarget);
+      const pairClient = await pool.connect();
+      try {
+        await pairClient.query('BEGIN');
+        await createExecutionIntentInTransaction(pairClient, canonicalTarget);
+        await createExecutionPreflightIntentPairInTransaction(pairClient, canonicalTarget);
+        await pairClient.query('COMMIT');
+      } catch (error) {
+        await pairClient.query('ROLLBACK');
+        throw error;
+      } finally {
+        pairClient.release();
+      }
+      const simulationTarget = Object.freeze({
+        ...pair.simulationIntent,
+        stateRevision: 0n,
+      });
+      const request = createCanaryRequest({
+        qualification: fixture.qualification,
+        target: simulationTarget,
+        walletSnapshot: fixture.walletSnapshot,
+        providerSnapshot: fixture.providerSnapshot,
+        nowMs: fixture.nowMs,
+      });
+      const authorization = createOperatorAuthorizationV2({
+        payloadVersion: 2, generationId, action: 'ARM', phase: 'CANARY',
+        contextFingerprint: request.armamentRequestFingerprint,
+        nonceHash: '8'.repeat(64), operatorId: 'operator-primary',
+        issuedAtMs: fixture.nowMs, expiresAtMs: fixture.nowMs + 60_000,
+      });
+      const queries: string[] = [];
+      const guardedRepository = new PostgresExecutionOperationsRepository(
+        recordingDatabaseSource(pool, queries),
+      );
+
+      await assert.rejects(guardedRepository.armCanary(Object.freeze({ request, authorization })),
+        isRepositoryError('CONFLICT'));
+      assert.equal(queries.some((query) => /UPDATE execution_intents(?: AS intent)?\s+SET\s+live_reserved\s*=\s*TRUE/iu.test(query)), false);
+      await assertNoCanaryArmSideEffects(pool);
+      assert.deepEqual((await pool.query(`SELECT live_reserved FROM execution_intents
+        WHERE id=$1`, [pair.simulationIntent.id])).rows, [{ live_reserved: false }]);
+    });
+  });
 
 void test('refuses canary evidence whose wallet and provider snapshots were superseded', async (context) => {
   const databaseUrl = testDatabaseUrl(context);

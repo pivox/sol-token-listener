@@ -40,6 +40,97 @@ CREATE TABLE IF NOT EXISTS execution_preflight_intent_pairs (
   )
 );
 
+DO $execution_preflight_intent_pairs_shape$
+DECLARE
+  relation_oid OID;
+  malformed_count INTEGER;
+  constraint_count INTEGER;
+BEGIN
+  SELECT relation.oid INTO relation_oid
+  FROM pg_catalog.pg_class relation
+  JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+  WHERE namespace.nspname=pg_catalog.current_schema()
+    AND relation.relname='execution_preflight_intent_pairs'
+    AND relation.relkind='r';
+
+  IF relation_oid IS NULL THEN
+    RAISE EXCEPTION 'execution_preflight_intent_pairs has a malformed schema'
+      USING ERRCODE='55000';
+  END IF;
+
+  WITH expected(column_name,type_oid,not_null,has_default) AS (
+    VALUES
+      ('pair_id','pg_catalog.text'::pg_catalog.regtype::OID,TRUE,FALSE),
+      ('payload_version','pg_catalog.int2'::pg_catalog.regtype::OID,TRUE,TRUE),
+      ('pair_fingerprint','pg_catalog.text'::pg_catalog.regtype::OID,TRUE,FALSE),
+      ('target_intent_id','pg_catalog.text'::pg_catalog.regtype::OID,TRUE,FALSE),
+      ('simulation_intent_id','pg_catalog.text'::pg_catalog.regtype::OID,TRUE,FALSE),
+      ('decision_event_id','pg_catalog.text'::pg_catalog.regtype::OID,TRUE,FALSE),
+      ('decision_fingerprint','pg_catalog.text'::pg_catalog.regtype::OID,TRUE,FALSE),
+      ('created_at','pg_catalog.timestamptz'::pg_catalog.regtype::OID,TRUE,TRUE),
+      ('expires_at','pg_catalog.timestamptz'::pg_catalog.regtype::OID,TRUE,FALSE),
+      ('purge_after','pg_catalog.timestamptz'::pg_catalog.regtype::OID,TRUE,FALSE)
+  )
+  SELECT COUNT(*)::INTEGER INTO malformed_count
+  FROM expected
+  LEFT JOIN pg_catalog.pg_attribute attribute
+    ON attribute.attrelid=relation_oid
+      AND attribute.attname=expected.column_name
+      AND attribute.attnum>0
+      AND NOT attribute.attisdropped
+  LEFT JOIN pg_catalog.pg_attrdef default_value
+    ON default_value.adrelid=attribute.attrelid
+      AND default_value.adnum=attribute.attnum
+  WHERE attribute.attname IS NULL
+    OR attribute.atttypid<>expected.type_oid
+    OR attribute.attnotnull IS DISTINCT FROM expected.not_null
+    OR (default_value.oid IS NOT NULL) IS DISTINCT FROM expected.has_default;
+
+  SELECT malformed_count + CASE WHEN COUNT(*)=10 THEN 0 ELSE 1 END
+  INTO malformed_count
+  FROM pg_catalog.pg_attribute attribute
+  WHERE attribute.attrelid=relation_oid
+    AND attribute.attnum>0
+    AND NOT attribute.attisdropped;
+
+  SELECT COUNT(*)::INTEGER INTO constraint_count
+  FROM pg_catalog.pg_constraint constraint_value
+  WHERE constraint_value.conrelid=relation_oid
+    AND constraint_value.convalidated
+    AND (
+      (constraint_value.conname='execution_preflight_intent_pairs_pkey'
+        AND constraint_value.contype='p')
+      OR (constraint_value.conname='execution_preflight_intent_pairs_pair_fingerprint_key'
+        AND constraint_value.contype='u')
+      OR (constraint_value.conname IN (
+          'execution_preflight_intent_pairs_target_intent_id_fkey',
+          'execution_preflight_intent_pairs_simulation_intent_id_fkey'
+        ) AND constraint_value.contype='f' AND constraint_value.confdeltype='r'
+        AND constraint_value.confrelid='execution_intents'::pg_catalog.regclass)
+      OR (constraint_value.conname='execution_preflight_intent_pairs_payload_version_check'
+        AND constraint_value.contype='c'
+        AND pg_catalog.pg_get_constraintdef(constraint_value.oid) LIKE '%payload_version = 1%')
+      OR (constraint_value.conname='execution_preflight_intent_pairs_distinct_parents_check'
+        AND constraint_value.contype='c'
+        AND pg_catalog.pg_get_constraintdef(constraint_value.oid) LIKE '%target_intent_id <> simulation_intent_id%')
+      OR (constraint_value.conname='execution_preflight_intent_pairs_text_check'
+        AND constraint_value.contype='c'
+        AND pg_catalog.pg_get_constraintdef(constraint_value.oid) LIKE '%octet_length(pair_id)%')
+      OR (constraint_value.conname='execution_preflight_intent_pairs_fingerprint_check'
+        AND constraint_value.contype='c'
+        AND pg_catalog.pg_get_constraintdef(constraint_value.oid) LIKE '%pair_fingerprint%')
+      OR (constraint_value.conname='execution_preflight_intent_pairs_temporal_check'
+        AND constraint_value.contype='c'
+        AND pg_catalog.pg_get_constraintdef(constraint_value.oid) LIKE '%date_trunc%')
+    );
+
+  IF malformed_count<>0 OR constraint_count<>9 THEN
+    RAISE EXCEPTION 'execution_preflight_intent_pairs has a malformed schema'
+      USING ERRCODE='55000';
+  END IF;
+END
+$execution_preflight_intent_pairs_shape$;
+
 CREATE TABLE IF NOT EXISTS execution_preflight_intent_pair_memberships (
   pair_id TEXT NOT NULL REFERENCES execution_preflight_intent_pairs(pair_id)
     ON DELETE RESTRICT,
@@ -52,35 +143,121 @@ CREATE TABLE IF NOT EXISTS execution_preflight_intent_pair_memberships (
     CHECK (lane IN ('TARGET', 'SIMULATION'))
 );
 
+DO $execution_preflight_intent_pair_memberships_shape$
+DECLARE
+  relation_oid OID;
+  malformed_count INTEGER;
+  constraint_count INTEGER;
+BEGIN
+  SELECT relation.oid INTO relation_oid
+  FROM pg_catalog.pg_class relation
+  JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
+  WHERE namespace.nspname=pg_catalog.current_schema()
+    AND relation.relname='execution_preflight_intent_pair_memberships'
+    AND relation.relkind='r';
+
+  WITH expected(column_name,type_oid) AS (
+    VALUES
+      ('pair_id','pg_catalog.text'::pg_catalog.regtype::OID),
+      ('intent_id','pg_catalog.text'::pg_catalog.regtype::OID),
+      ('lane','pg_catalog.text'::pg_catalog.regtype::OID)
+  )
+  SELECT COUNT(*)::INTEGER INTO malformed_count
+  FROM expected
+  LEFT JOIN pg_catalog.pg_attribute attribute
+    ON attribute.attrelid=relation_oid
+      AND attribute.attname=expected.column_name
+      AND attribute.attnum>0
+      AND NOT attribute.attisdropped
+  WHERE attribute.attname IS NULL
+    OR attribute.atttypid<>expected.type_oid
+    OR NOT attribute.attnotnull;
+
+  SELECT malformed_count + CASE WHEN COUNT(*)=3 THEN 0 ELSE 1 END
+  INTO malformed_count
+  FROM pg_catalog.pg_attribute attribute
+  WHERE attribute.attrelid=relation_oid
+    AND attribute.attnum>0
+    AND NOT attribute.attisdropped;
+
+  SELECT COUNT(*)::INTEGER INTO constraint_count
+  FROM pg_catalog.pg_constraint constraint_value
+  WHERE constraint_value.conrelid=relation_oid
+    AND constraint_value.convalidated
+    AND (
+      (constraint_value.conname='execution_preflight_intent_pair_memberships_pkey'
+        AND constraint_value.contype='p')
+      OR (constraint_value.conname='execution_preflight_intent_pair_memberships_intent_id_key'
+        AND constraint_value.contype='u')
+      OR (constraint_value.conname='execution_preflight_intent_pair_membershi_pair_id_intent_id_key'
+        AND constraint_value.contype='u')
+      OR (constraint_value.conname='execution_preflight_intent_pair_memberships_pair_id_fkey'
+        AND constraint_value.contype='f' AND constraint_value.confdeltype='r'
+        AND constraint_value.confrelid='execution_preflight_intent_pairs'::pg_catalog.regclass)
+      OR (constraint_value.conname='execution_preflight_intent_pair_memberships_intent_id_fkey'
+        AND constraint_value.contype='f' AND constraint_value.confdeltype='r'
+        AND constraint_value.confrelid='execution_intents'::pg_catalog.regclass)
+      OR (constraint_value.conname='execution_preflight_intent_pair_memberships_lane_check'
+        AND constraint_value.contype='c'
+        AND pg_catalog.pg_get_constraintdef(constraint_value.oid) LIKE '%TARGET%SIMULATION%')
+    );
+
+  IF relation_oid IS NULL OR malformed_count<>0 OR constraint_count<>6 THEN
+    RAISE EXCEPTION 'execution_preflight_intent_pair_memberships has a malformed schema'
+      USING ERRCODE='55000';
+  END IF;
+END
+$execution_preflight_intent_pair_memberships_shape$;
+
 CREATE OR REPLACE FUNCTION guard_execution_preflight_intent_pair_insert()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SECURITY INVOKER
+SECURITY DEFINER
 SET search_path=pg_catalog
 AS $function$
 DECLARE
   parent_count INTEGER;
+  parents_created_in_current_transaction BOOLEAN;
   target_parent RECORD;
   simulation_parent RECORD;
 BEGIN
+  NEW.created_at := pg_catalog.date_trunc('milliseconds', pg_catalog.statement_timestamp());
   NEW.purge_after := NEW.expires_at + INTERVAL '4 hours';
 
   EXECUTE pg_catalog.format(
-    'SELECT count(*)::INTEGER FROM (SELECT id FROM %I.execution_intents '
-      'WHERE id = ANY($1::TEXT[]) ORDER BY id FOR UPDATE) locked_parents',
+    'SELECT count(*)::INTEGER,COALESCE(bool_and('
+      'xmin=pg_current_xact_id()::TEXT::XID),FALSE) '
+      'FROM %I.execution_intents WHERE id = ANY($1::TEXT[])',
     TG_TABLE_SCHEMA
-  ) INTO parent_count USING ARRAY[NEW.target_intent_id, NEW.simulation_intent_id];
+  ) INTO parent_count,parents_created_in_current_transaction
+    USING ARRAY[NEW.target_intent_id, NEW.simulation_intent_id];
 
   IF parent_count <> 2 THEN
     RAISE EXCEPTION 'execution preflight intent pair requires two distinct parents'
       USING ERRCODE='23503';
   END IF;
+  IF parents_created_in_current_transaction IS DISTINCT FROM TRUE THEN
+    RAISE EXCEPTION 'execution preflight intent pair parents must be created in the current transaction'
+      USING ERRCODE='55000';
+  END IF;
 
   EXECUTE pg_catalog.format(
-    'SELECT * FROM %I.execution_intents WHERE id=$1', TG_TABLE_SCHEMA
+    'SELECT status,attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,'
+      'last_reason_code,terminal_at,reconciliation_completed_at,purge_after,live_reserved,'
+      'side,strategy_id,strategy_version,logical_command_id,logical_order_key,venue_policy,'
+      'quote_mint,quote_token_program,quote_decimals,position_id,mint,quote_amount_raw,'
+      'base_amount_raw,minimum_amount_out_raw,decision_event_id,decision_fingerprint,'
+      'requested_at,expires_at FROM %I.execution_intents WHERE id=$1',
+    TG_TABLE_SCHEMA
   ) INTO target_parent USING NEW.target_intent_id;
   EXECUTE pg_catalog.format(
-    'SELECT * FROM %I.execution_intents WHERE id=$1', TG_TABLE_SCHEMA
+    'SELECT status,attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,'
+      'last_reason_code,terminal_at,reconciliation_completed_at,purge_after,live_reserved,'
+      'side,strategy_id,strategy_version,logical_command_id,logical_order_key,venue_policy,'
+      'quote_mint,quote_token_program,quote_decimals,position_id,mint,quote_amount_raw,'
+      'base_amount_raw,minimum_amount_out_raw,decision_event_id,decision_fingerprint,'
+      'requested_at,expires_at FROM %I.execution_intents WHERE id=$1',
+    TG_TABLE_SCHEMA
   ) INTO simulation_parent USING NEW.simulation_intent_id;
 
   IF target_parent.status <> 'PENDING'
@@ -248,7 +425,7 @@ BEGIN
       'FROM %I.execution_preflight_intent_pairs pair '
       'JOIN %I.execution_intents target ON target.id=pair.target_intent_id '
       'JOIN %I.execution_intents simulation ON simulation.id=pair.simulation_intent_id '
-      'WHERE pair.pair_id=$1 FOR UPDATE OF target,simulation',
+      'WHERE pair.pair_id=$1',
     TG_TABLE_SCHEMA, TG_TABLE_SCHEMA, TG_TABLE_SCHEMA
   ) INTO purgeable USING OLD.pair_id;
 
@@ -289,7 +466,7 @@ BEGIN
       'FROM %I.execution_preflight_intent_pairs pair '
       'JOIN %I.execution_intents target ON target.id=pair.target_intent_id '
       'JOIN %I.execution_intents simulation ON simulation.id=pair.simulation_intent_id '
-      'WHERE pair.pair_id=$1 FOR UPDATE OF target,simulation',
+      'WHERE pair.pair_id=$1',
     TG_TABLE_SCHEMA, TG_TABLE_SCHEMA, TG_TABLE_SCHEMA, TG_TABLE_SCHEMA
   ) INTO purgeable USING OLD.pair_id;
 
@@ -329,6 +506,32 @@ $function$;
 
 REVOKE ALL PRIVILEGES ON FUNCTION
   require_execution_preflight_intent_pair_membership_completeness() FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION guard_execution_preflight_simulation_live_reservation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path=pg_catalog
+AS $function$
+DECLARE
+  simulation_member BOOLEAN;
+BEGIN
+  EXECUTE pg_catalog.format(
+    'SELECT EXISTS (SELECT 1 FROM %I.execution_preflight_intent_pair_memberships '
+      'WHERE intent_id=$1 AND lane=''SIMULATION'')',
+    TG_TABLE_SCHEMA
+  ) INTO simulation_member USING NEW.id;
+
+  IF simulation_member THEN
+    RAISE EXCEPTION 'execution preflight simulation intent cannot be live reserved'
+      USING ERRCODE='55000';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+REVOKE ALL PRIVILEGES ON FUNCTION
+  guard_execution_preflight_simulation_live_reservation() FROM PUBLIC;
 
 DROP TRIGGER IF EXISTS execution_preflight_intent_pairs_insert_guard
   ON execution_preflight_intent_pairs;
@@ -379,3 +582,11 @@ AFTER DELETE ON execution_preflight_intent_pair_memberships
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION
   require_execution_preflight_intent_pair_membership_completeness();
+
+DROP TRIGGER IF EXISTS execution_preflight_simulation_live_reservation_guard
+  ON execution_intents;
+CREATE TRIGGER execution_preflight_simulation_live_reservation_guard
+BEFORE UPDATE OF live_reserved ON execution_intents
+FOR EACH ROW
+WHEN (OLD.live_reserved IS FALSE AND NEW.live_reserved IS TRUE)
+EXECUTE FUNCTION guard_execution_preflight_simulation_live_reservation();

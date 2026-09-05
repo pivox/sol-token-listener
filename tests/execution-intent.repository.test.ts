@@ -8,6 +8,7 @@ import {
   type ExecutionIntentStatus,
   type ExecutionIntentV1,
 } from '../src/domain/execution-intent.js';
+import { createExecutionPreflightIntentPairDraft } from '../src/domain/execution-preflight-intent-pair.js';
 import type {
   ClaimedExecutionIntent,
   ExecutionClaimOptions,
@@ -18,9 +19,11 @@ import { migrateDatabase, purgeExpiredFoundationData } from '../src/storage/data
 import {
   ExecutionIntentRepositoryError,
   PostgresExecutionIntentRepository,
+  createExecutionIntentInTransaction,
   lockLiveSellPresenceInTransaction,
   type ExecutionIntentPool,
 } from '../src/storage/execution-intent.repository.js';
+import { createExecutionPreflightIntentPairInTransaction } from '../src/storage/execution-preflight-intent-pair.repository.js';
 
 const UUID = '00000000-0000-4000-8000-000000000001';
 const NOW_MS = 1_788_000_000_000;
@@ -152,12 +155,15 @@ void test('claim validates a closed purpose and preserves each selected business
     else assert.match(call.text, /FOR UPDATE SKIP LOCKED/u);
     if (purpose === 'EXECUTE') {
       assert.match(call.text, /expires_at\s*>\s*statement_timestamp\(\)/u);
+      assert.match(call.text,
+        /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_preflight_intent_pair_memberships AS pair_member[\s\S]*?pair_member\.intent_id\s*=\s*intent\.id[\s\S]*?pair_member\.lane\s*=\s*'TARGET'/u);
     } else if (purpose === 'DRY_RUN') {
       assert.match(call.text, /expires_at\s*>\s*operation\.at\s*\+\s*\(\$2::BIGINT/u);
     } else {
       assert.doesNotMatch(call.text, /expires_at\s*>\s*statement_timestamp\(\)/u);
     }
     if (purpose === 'DRY_RUN') {
+      assert.doesNotMatch(call.text, /execution_preflight_intent_pair_memberships/u);
       assert.match(call.text, /lease_expires_at\s+IS NULL\s+OR\s+.*<=\s*operation\.at/su);
     } else {
       assert.match(call.text, /lease_expires_at\s+IS NULL\s+OR\s+.*<=\s*statement_timestamp\(\)/su);
@@ -2318,6 +2324,64 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
     }]);
   });
 });
+
+void test('concurrent non-live EXECUTE claims skip an older paired target and retain its pristine lease',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: paired target claim integration skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, 'execution_paired_target_claim',
+      async (firstPool, secondPool) => {
+        await migrateDatabase({ pool: firstPool });
+        const first = new PostgresExecutionIntentRepository(firstPool);
+        const second = new PostgresExecutionIntentRepository(secondPool);
+        const nowMs = await databaseNowMs(firstPool);
+        const target = createExecutionIntentDraft({
+          strategyId: 'creation-entry-v1', strategyVersion: 1,
+          positionId: 'position:paired-claim-target',
+          logicalCommandId: `paper_open_${'4'.repeat(64)}`,
+          mint: '11111111111111111111111111111111', side: 'BUY',
+          venuePolicy: 'PUMP_FUN_ONLY',
+          quoteMint: 'So11111111111111111111111111111111111111112',
+          quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+          quoteAmountRaw: 1n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+          decisionEventId: 'decision:paired-claim-target',
+          decisionFingerprint: 'a'.repeat(64),
+          requestedAtMs: nowMs - 60_000, expiresAtMs: nowMs + 120_000,
+        });
+        const pair = createExecutionPreflightIntentPairDraft(target);
+        const pairClient = await firstPool.connect();
+        try {
+          await pairClient.query('BEGIN');
+          await createExecutionIntentInTransaction(pairClient, target);
+          await createExecutionPreflightIntentPairInTransaction(pairClient, target);
+          await pairClient.query('COMMIT');
+        } catch (error) {
+          await pairClient.query('ROLLBACK');
+          throw error;
+        } finally {
+          pairClient.release();
+        }
+        const backlog = executionDraft('paired-target-newer-backlog', {
+          requestedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 120_000,
+        });
+        await first.create(backlog);
+
+        const claims = await Promise.all([
+          first.claim({ ownerId: 'paired-worker-a', leaseMs: 60_000, purpose: 'EXECUTE' }),
+          second.claim({ ownerId: 'paired-worker-b', leaseMs: 60_000, purpose: 'EXECUTE' }),
+        ]);
+        assert.deepEqual(new Set(claims.map((claim) => required(claim).intent.id)),
+          new Set([pair.simulationIntent.id, backlog.id]));
+        const targetLease = await firstPool.query(`SELECT lease_owner,lease_token,lease_expires_at
+          FROM execution_intents WHERE id=$1`, [target.id]);
+        assert.deepEqual(targetLease.rows, [{
+          lease_owner: null, lease_token: null, lease_expires_at: null,
+        }]);
+      });
+  });
 
 void test('real PostgreSQL rejects ABA replay, immutable drift, and parent-attempt gaps', async (context) => {
   const databaseUrl = process.env.TEST_DATABASE_URL;
