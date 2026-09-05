@@ -39,6 +39,15 @@ const smokeUrl = new URL('../scripts/deployment-smoke.mjs', import.meta.url);
 const runbookUrl = new URL('../docs/operations/executor-live-canary.md', import.meta.url);
 const databaseUrl = new URL('../src/storage/database.ts', import.meta.url);
 
+void test('executor role provisioning is one explicit transaction', async () => {
+  const sql = await readFile(scriptUrl, 'utf8');
+  const executable = sql.replace(/--[^\r\n]*/gu, ' ').trim();
+
+  assert.match(executable,
+    /^BEGIN\s*;\s*SET LOCAL search_path\s*=\s*pg_catalog\s*,\s*public\s*,\s*pg_temp\s*;/iu);
+  assert.match(executable, /COMMIT\s*;$/iu);
+});
+
 void test('executor role provisioning is explicit, passwordless and least-privilege', async () => {
   const sql = await readFile(scriptUrl, 'utf8');
   const repository = await readFile(repositoryUrl, 'utf8');

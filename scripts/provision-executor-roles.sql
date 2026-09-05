@@ -1,6 +1,9 @@
 -- Run as a PostgreSQL administrator after migrations. These are NOLOGIN group
 -- roles; attach deployment-specific LOGIN roles separately. No password is
 -- created or accepted by this script.
+BEGIN;
+SET LOCAL search_path=pg_catalog,public,pg_temp;
+
 DO $roles$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='sol_token_listener_writer') THEN
@@ -2486,3 +2489,5 @@ REVOKE ALL ON TABLE
   execution_activation_armaments,
   execution_activation_events
 FROM sol_token_public_api,sol_token_listener_writer,sol_token_executor_worker;
+
+COMMIT;

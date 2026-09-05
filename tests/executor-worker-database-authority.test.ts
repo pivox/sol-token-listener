@@ -195,6 +195,7 @@ void test('PostgreSQL 16 provisioning replay revokes a stale worker policy targe
     const databaseName = `h2j_stale_${suffix}`;
     const loginName = `h2j_stale_login_${suffix}`;
     const staleRoleName = `h2j_stale_worker_${suffix}`;
+    const hostileSchema = `h2j_hostile_${suffix}`;
     const password = randomUUID().replaceAll('-', '');
     const isolatedUrl = new URL(baseUrl);
     isolatedUrl.pathname = `/${databaseName}`;
@@ -231,6 +232,43 @@ void test('PostgreSQL 16 provisioning replay revokes a stale worker policy targe
         await migrateDatabase({ pool: isolated });
         const provisioningSql = await readFile(scriptUrl, 'utf8');
         await isolated.query(provisioningSql);
+        await isolated.query(`CREATE SCHEMA ${quoteIdentifier(hostileSchema)}`);
+        await isolated.query(`CREATE TABLE ${quoteIdentifier(hostileSchema)}.execution_intents (
+          id TEXT PRIMARY KEY
+        )`);
+        await isolated.query(`CREATE TABLE ${quoteIdentifier(hostileSchema)}.execution_attempts (
+          intent_id TEXT PRIMARY KEY
+        )`);
+        await isolated.query(`GRANT SELECT ON TABLE
+          ${quoteIdentifier(hostileSchema)}.execution_intents TO ${WORKER_ROLE}`);
+        const hostileReplay = await isolated.connect();
+        try {
+          await hostileReplay.query(
+            `SET search_path=${quoteIdentifier(hostileSchema)},public`,
+          );
+          await hostileReplay.query('CREATE TEMP TABLE execution_intents (id TEXT PRIMARY KEY)');
+          await hostileReplay.query(provisioningSql);
+          assert.match(
+            (await hostileReplay.query<{ readonly search_path: string }>(
+              `SELECT current_setting('search_path') AS search_path`,
+            )).rows[0]?.search_path ?? '',
+            new RegExp(`^${hostileSchema}, public$`, 'u'),
+          );
+        } finally {
+          await hostileReplay.query('ROLLBACK');
+          await hostileReplay.query('DROP TABLE IF EXISTS pg_temp.execution_intents');
+          await hostileReplay.query('RESET search_path');
+          hostileReplay.release();
+        }
+        assert.deepEqual((await isolated.query<{
+          readonly public_select: boolean;
+          readonly hostile_select: boolean;
+        }>(`SELECT
+            has_column_privilege($1,'public.execution_intents','id','SELECT')
+              AS public_select,
+            has_column_privilege($1,$2,'id','SELECT') AS hostile_select`, [
+          WORKER_ROLE, `${hostileSchema}.execution_intents`,
+        ])).rows, [{ public_select: true, hostile_select: false }]);
 
         await isolated.query(
           `GRANT USAGE ON SCHEMA public TO ${quoteIdentifier(staleRoleName)}`,
@@ -305,7 +343,54 @@ void test('PostgreSQL 16 provisioning replay revokes a stale worker policy targe
           updated_at=date_trunc('milliseconds',statement_timestamp()) WHERE id=$1`,
         [liveId])).rowCount, 0);
 
-        await isolated.query(provisioningSql);
+        await isolated.query(`ALTER TABLE ${quoteIdentifier(hostileSchema)}.execution_attempts
+          OWNER TO ${quoteIdentifier(staleRoleName)}`);
+        await isolated.query(`GRANT SELECT ON TABLE
+          ${quoteIdentifier(hostileSchema)}.execution_intents TO ${WORKER_ROLE}`);
+        const failingReplay = await isolated.connect();
+        try {
+          await failingReplay.query(
+            `SET search_path=${quoteIdentifier(hostileSchema)},public`,
+          );
+          await assert.rejects(
+            failingReplay.query(provisioningSql),
+            /stale worker policy role owns database objects/iu,
+          );
+        } finally {
+          await failingReplay.query('ROLLBACK');
+          await failingReplay.query('RESET search_path');
+          failingReplay.release();
+        }
+        assert.deepEqual((await isolated.query<{
+          readonly marker_select: boolean;
+          readonly stale_policy_count: string;
+          readonly stale_membership_count: string;
+        }>(`SELECT
+            has_table_privilege($1,$2,'SELECT') AS marker_select,
+            (SELECT COUNT(*)::TEXT FROM pg_policy policy
+              WHERE $3::OID=ANY(policy.polroles)) AS stale_policy_count,
+            (SELECT COUNT(*)::TEXT FROM pg_auth_members edge
+              WHERE edge.roleid=$3::OID OR edge.member=$3::OID)
+              AS stale_membership_count`, [
+          WORKER_ROLE, `${hostileSchema}.execution_intents`, staleOid,
+        ])).rows, [{
+          marker_select: true,
+          stale_policy_count: String(WORKER_EXECUTION_TABLES.length),
+          stale_membership_count: '1',
+        }]);
+        await isolated.query(`ALTER TABLE ${quoteIdentifier(hostileSchema)}.execution_attempts
+          OWNER TO CURRENT_USER`);
+        const successfulReplay = await isolated.connect();
+        try {
+          await successfulReplay.query(
+            `SET search_path=${quoteIdentifier(hostileSchema)},public`,
+          );
+          await successfulReplay.query(provisioningSql);
+        } finally {
+          await successfulReplay.query('ROLLBACK');
+          await successfulReplay.query('RESET search_path');
+          successfulReplay.release();
+        }
 
         let liveReadFailure: unknown;
         let liveWriteFailure: unknown;
@@ -342,6 +427,11 @@ void test('PostgreSQL 16 provisioning replay revokes a stale worker policy targe
         assert.deepEqual(staleAuthority, {
           membership_count: '0', column_acl_count: '0', policy_count: '0',
         });
+        assert.equal((await isolated.query<{ readonly allowed: boolean }>(
+          `SELECT has_table_privilege($1,$2,'SELECT') AS allowed`, [
+            WORKER_ROLE, `${hostileSchema}.execution_intents`,
+          ],
+        )).rows[0]?.allowed, false);
         assert.equal((await isolated.query<{ readonly count: string }>(
           `SELECT COUNT(*)::TEXT AS count FROM pg_policy policy
             WHERE $1::OID=ANY(policy.polroles)
@@ -449,7 +539,6 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       let clusterDriftFailed = false;
       let clusterDriftFailure: unknown;
       try {
-        await clusterDrift.query('BEGIN');
         await clusterDrift.query(`GRANT ${quoteIdentifier(parentName)} TO ${WORKER_ROLE}
           WITH ADMIN FALSE, INHERIT TRUE, SET TRUE`);
         await clusterDrift.query(
@@ -472,7 +561,7 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
               AS parameter_acl_count`, [WORKER_ROLE])).rows, [{
           parent_count: '0', parameter_acl_count: '0',
         }]);
-        await clusterDrift.query(`SET LOCAL ROLE ${WORKER_ROLE}`);
+        await clusterDrift.query(`SET ROLE ${WORKER_ROLE}`);
         assert.deepEqual((await clusterDrift.query<{
           readonly statement_timeout: boolean;
           readonly replication_role: boolean;
@@ -491,7 +580,7 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
         clusterDriftFailed,
         clusterDriftFailure,
         await collectCleanupFailures([
-          async () => clusterDrift.query('ROLLBACK'),
+          async () => clusterDrift.query('RESET ROLE'),
           () => { clusterDrift.release(); },
         ]),
       );
@@ -624,12 +713,11 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
       let parameterProbeFailed = false;
       let parameterProbeFailure: unknown;
       try {
-        await publicParameterProbe.query('BEGIN');
         await publicParameterProbe.query(
           'GRANT SET ON PARAMETER session_replication_role TO PUBLIC',
         );
         await publicParameterProbe.query(provisioningSql);
-        await publicParameterProbe.query(`SET LOCAL ROLE ${WORKER_ROLE}`);
+        await publicParameterProbe.query(`SET ROLE ${WORKER_ROLE}`);
         assert.equal((await publicParameterProbe.query<{ readonly allowed: boolean }>(
           `SELECT has_parameter_privilege(
             current_user,'session_replication_role','SET'
@@ -643,7 +731,7 @@ void test('PostgreSQL 16 worker login has only the effective simulation authorit
         parameterProbeFailed,
         parameterProbeFailure,
         await collectCleanupFailures([
-          async () => publicParameterProbe.query('ROLLBACK'),
+          async () => publicParameterProbe.query('RESET ROLE'),
           () => { publicParameterProbe.release(); },
         ]),
       );
