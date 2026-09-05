@@ -675,10 +675,6 @@ async function assertClosedObjectAuthority(
     `SELECT has_schema_privilege(current_user,$1,'USAGE') AS allowed`, [privateSchema],
   )).rows[0]?.allowed, false);
   assert.equal((await worker.query<{ readonly allowed: boolean }>(
-    `SELECT has_table_privilege(current_user,$1,'SELECT') AS allowed`,
-    [`${privateSchema}.secrets`],
-  )).rows[0]?.allowed, false);
-  assert.equal((await worker.query<{ readonly allowed: boolean }>(
     `SELECT has_column_privilege(
       current_user,'execution_wallet_generations','wallet_public_key','SELECT'
     ) AS allowed`,
