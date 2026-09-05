@@ -147,7 +147,7 @@ Décrire le login externe `0600`, l'option
 deux commandes non signantes. Maintenir explicitement
 `CANARY_NOT_STARTED`.
 
-- [ ] **Step 3: Lancer tous les critères de qualité**
+- [x] **Step 3: Lancer tous les critères de qualité**
 
 Run:
 ```bash
