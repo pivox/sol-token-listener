@@ -89,6 +89,19 @@ void test('rejects unsafe current-contract product counters without reconciling 
   assert.doesNotThrow(() => createUsage(current));
 });
 
+void test('rejects an unsafe value in every current-contract breakdown counter', () => {
+  const current = validCurrentResponse();
+  for (const breakdown of ['credits', 'requests', 'dataTransfer'] as const) {
+    const counters = current[breakdown] as Readonly<Record<string, unknown>>;
+    for (const key of Object.keys(counters)) {
+      assert.throws(() => createUsage(Object.freeze({
+        ...current,
+        [breakdown]: Object.freeze({ ...counters, [key]: Number.MAX_SAFE_INTEGER + 1 }),
+      })), HeliusProviderUsageValidationError, `${breakdown}.${key}`);
+    }
+  }
+});
+
 void test('rejects invalid authoritative and informational current cycles', () => {
   const current = validCurrentResponse();
   const subscription = current.subscriptionDetails as Readonly<Record<string, unknown>>;
