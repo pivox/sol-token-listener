@@ -16,6 +16,7 @@ import type {
   ExecutionBeginAttemptResult,
   ExecutionClaimOptions,
   ExecutionClaimPurpose,
+  ExecutionPreflightExactClaimOptions,
   ExecutionIntentRepository,
   ExecutionIntentTransitionEvidenceV1,
   ExecutionIntentTransitionInput,
@@ -99,6 +100,10 @@ const LIVE_SIDE_CLAIM_OPTION_KEYS = Object.freeze([
 ] as const);
 const LIVE_BUY_CLAIM_OPTION_KEYS = Object.freeze([
   'ownerId', 'leaseMs', 'purpose', 'side', 'generationId',
+] as const);
+const PREFLIGHT_EXACT_CLAIM_OPTION_KEYS = Object.freeze([
+  'runId', 'preparationLeaseOwner', 'preparationLeaseToken', 'pairId',
+  'intentId', 'lane', 'purpose', 'ownerId', 'leaseMs',
 ] as const);
 const CLAIM_KEYS = Object.freeze([
   'intent', 'leaseOwner', 'leaseToken', 'leaseExpiresAtMs',
@@ -185,7 +190,6 @@ const CLAIM_SQL: Readonly<Record<ExecutionClaimPurpose, string>> = Object.freeze
         SELECT 1
         FROM execution_preflight_intent_pair_memberships AS pair_member
         WHERE pair_member.intent_id = intent.id
-          AND pair_member.lane = 'TARGET'
       )`,
     true,
     false,
@@ -330,6 +334,39 @@ export class PostgresExecutionIntentRepository implements ExecutionIntentReposit
         }, signal, 'READ_COMMITTED');
       }
       return this.withClaimClient(signal, options.purpose === 'DRY_RUN', claimFromClient);
+    });
+  }
+
+  public async claimExactPreflightIntent(
+    optionsValue: ExecutionPreflightExactClaimOptions,
+    signal?: AbortSignal,
+  ): Promise<ClaimedExecutionIntent | null> {
+    return this.safely(async () => {
+      const options = preflightExactClaimOptions(optionsValue);
+      if (signal?.aborted === true) throw operationAbortedError();
+      const leaseToken = randomUUID();
+      return this.withClaimClient(signal, options.purpose === 'DRY_RUN', async (client) => {
+        const claimed = await client.query(
+          exactPreflightIntentClaimSql(),
+          exactPreflightClaimValues(options, leaseToken),
+        );
+        if (claimed.rowCount === 0 && claimed.rows.length === 0) return null;
+        if (claimed.rowCount !== 1 || claimed.rows.length !== 1) throw dataError();
+        const { claim, claimAtMs } = claimFromRow(requiredRow(claimed.rows));
+        if (claim.intent.id !== options.intentId
+          || claim.intent.status !== 'PENDING'
+          || claim.intent.attemptCount !== 0
+          || claim.intent.stateRevision !== 0n
+          || claim.intent.lastReasonCode !== null
+          || claim.intent.terminalAtMs !== null
+          || claim.intent.reconciliationCompletedAtMs !== null
+          || claim.intent.purgeAfterMs !== null
+          || claim.leaseOwner !== options.ownerId
+          || claim.leaseToken !== leaseToken
+          || claim.leaseExpiresAtMs - claimAtMs !== options.leaseMs
+          || claim.intent.expiresAtMs <= claim.leaseExpiresAtMs) throw dataError();
+        return claim;
+      });
     });
   }
 
@@ -774,6 +811,69 @@ function claimSql(
   RETURNING ${CLAIM_PROJECTION}`;
 }
 
+function exactPreflightIntentClaimSql(): string {
+  return `WITH operation AS MATERIALIZED (
+    SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+  ), preparation AS MATERIALIZED (
+    SELECT preparation.run_id,preparation.pair_id
+    FROM execution_preflight_intent_preparation_runs AS preparation
+    CROSS JOIN operation
+    WHERE preparation.run_id=$1
+      AND preparation.state='PREPARING'
+      AND preparation.lease_owner=$2
+      AND preparation.lease_token=$3::UUID
+      AND preparation.pair_id=$4
+      AND preparation.lease_expires_at>operation.at
+      AND preparation.lease_expires_at>=operation.at
+        +($8::BIGINT*INTERVAL '1 millisecond')
+      AND preparation.deadline_at>operation.at+INTERVAL '5 seconds'
+      AND preparation.deadline_at>=operation.at
+        +(($8::BIGINT+5000)*INTERVAL '1 millisecond')
+  ), candidate AS MATERIALIZED (
+    SELECT intent.id
+    FROM preparation
+    JOIN execution_preflight_intent_pairs AS pair
+      ON pair.pair_id=preparation.pair_id AND pair.pair_id=$4
+    JOIN execution_preflight_intent_pair_memberships AS membership
+      ON membership.pair_id=pair.pair_id AND membership.intent_id=$6
+        AND membership.lane=$5
+    JOIN execution_intents AS intent
+      ON intent.id=membership.intent_id AND intent.id=$6
+    CROSS JOIN operation
+    WHERE (($5='TARGET' AND $10='DRY_RUN' AND pair.target_intent_id=intent.id)
+        OR ($5='SIMULATION' AND $10='EXECUTE'
+          AND pair.simulation_intent_id=intent.id))
+      AND intent.status='PENDING'
+      AND intent.attempt_count=0 AND intent.state_revision=0
+      AND intent.lease_owner IS NULL AND intent.lease_token IS NULL
+      AND intent.lease_expires_at IS NULL AND intent.last_reason_code IS NULL
+      AND intent.terminal_at IS NULL
+      AND intent.reconciliation_completed_at IS NULL
+      AND intent.purge_after IS NULL AND intent.live_reserved=FALSE
+      AND intent.expires_at>operation.at
+        +($8::BIGINT*INTERVAL '1 millisecond')
+      AND NOT EXISTS (
+        SELECT 1 FROM execution_attempts AS attempt
+        WHERE attempt.intent_id=intent.id
+      )
+      AND (($5='TARGET' AND NOT EXISTS (
+          SELECT 1 FROM execution_dry_run_assessments AS assessment
+          WHERE assessment.intent_id=intent.id AND assessment.evaluator_version=1
+        )) OR ($5='SIMULATION' AND NOT EXISTS (
+          SELECT 1 FROM execution_simulation_artifacts AS artifact
+          WHERE artifact.intent_id=intent.id
+        )))
+    FOR UPDATE OF intent
+  )
+  UPDATE execution_intents AS intent
+  SET lease_owner=$7,lease_token=$9::UUID,
+      lease_expires_at=operation.at+($8::BIGINT*INTERVAL '1 millisecond'),
+      updated_at=operation.at
+  FROM candidate CROSS JOIN operation
+  WHERE intent.id=candidate.id AND intent.id=$6
+  RETURNING ${CLAIM_PROJECTION}`;
+}
+
 function liveExecuteBuyClaimSql(): string {
   return `WITH operation AS MATERIALIZED (
     SELECT date_trunc('milliseconds', statement_timestamp()) AS at
@@ -880,6 +980,11 @@ function dryRunClaimSql(): string {
       AND intent.expires_at > operation.at + ($2::BIGINT * INTERVAL '1 millisecond')
       AND (intent.lease_expires_at IS NULL
         OR intent.lease_expires_at <= operation.at)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM execution_preflight_intent_pair_memberships AS pair_member
+        WHERE pair_member.intent_id = intent.id
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM execution_dry_run_assessments AS assessment
@@ -1054,6 +1159,54 @@ function claimOptions(value: unknown): ExecutionClaimOptions {
   }
   if (hasSide) throw inputError();
   return Object.freeze({ ownerId, leaseMs, purpose });
+}
+
+function preflightExactClaimOptions(value: unknown): ExecutionPreflightExactClaimOptions {
+  const row = exactRecord(value, PREFLIGHT_EXACT_CLAIM_OPTION_KEYS, 'INVALID_INPUT');
+  const runId = patternedText(
+    row.runId,
+    /^execution_preflight_preparation_[0-9a-f]{64}$/u,
+  );
+  const preparationLeaseOwner = boundedText(row.preparationLeaseOwner, 'INVALID_INPUT');
+  const preparationLeaseToken = uuid(row.preparationLeaseToken, 'INVALID_INPUT');
+  const pairId = patternedText(
+    row.pairId,
+    /^execution_preflight_intent_pair_[0-9a-f]{64}$/u,
+  );
+  const intentId = patternedText(row.intentId, /^execution_intent_[0-9a-f]{64}$/u);
+  const ownerId = boundedText(row.ownerId, 'INVALID_INPUT');
+  const leaseMs = positiveInteger(row.leaseMs, MAX_LEASE_MS, 'INVALID_INPUT');
+  if (row.lane === 'TARGET' && row.purpose === 'DRY_RUN') {
+    return Object.freeze({
+      runId, preparationLeaseOwner, preparationLeaseToken, pairId, intentId,
+      lane: 'TARGET', purpose: 'DRY_RUN', ownerId, leaseMs,
+    });
+  }
+  if (row.lane === 'SIMULATION' && row.purpose === 'EXECUTE') {
+    return Object.freeze({
+      runId, preparationLeaseOwner, preparationLeaseToken, pairId, intentId,
+      lane: 'SIMULATION', purpose: 'EXECUTE', ownerId, leaseMs,
+    });
+  }
+  throw inputError();
+}
+
+function exactPreflightClaimValues(
+  options: ExecutionPreflightExactClaimOptions,
+  leaseToken: string,
+): readonly unknown[] {
+  return [
+    options.runId,
+    options.preparationLeaseOwner,
+    options.preparationLeaseToken,
+    options.pairId,
+    options.lane,
+    options.intentId,
+    options.ownerId,
+    options.leaseMs,
+    leaseToken,
+    options.purpose,
+  ];
 }
 
 function claimedInput(value: unknown): ClaimedExecutionIntent {
@@ -1535,6 +1688,12 @@ function boundedText(
     throw repositoryError(code);
   }
   return value;
+}
+
+function patternedText(value: unknown, pattern: RegExp): string {
+  const parsed = boundedText(value, 'INVALID_INPUT');
+  if (!pattern.test(parsed)) throw inputError();
+  return parsed;
 }
 
 function uuid(

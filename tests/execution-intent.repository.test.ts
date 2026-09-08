@@ -156,14 +156,17 @@ void test('claim validates a closed purpose and preserves each selected business
     if (purpose === 'EXECUTE') {
       assert.match(call.text, /expires_at\s*>\s*statement_timestamp\(\)/u);
       assert.match(call.text,
-        /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_preflight_intent_pair_memberships AS pair_member[\s\S]*?pair_member\.intent_id\s*=\s*intent\.id[\s\S]*?pair_member\.lane\s*=\s*'TARGET'/u);
+        /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_preflight_intent_pair_memberships AS pair_member[\s\S]*?pair_member\.intent_id\s*=\s*intent\.id/u);
+      assert.doesNotMatch(call.text, /pair_member\.lane/u);
     } else if (purpose === 'DRY_RUN') {
       assert.match(call.text, /expires_at\s*>\s*operation\.at\s*\+\s*\(\$2::BIGINT/u);
     } else {
       assert.doesNotMatch(call.text, /expires_at\s*>\s*statement_timestamp\(\)/u);
     }
     if (purpose === 'DRY_RUN') {
-      assert.doesNotMatch(call.text, /execution_preflight_intent_pair_memberships/u);
+      assert.match(call.text,
+        /NOT EXISTS\s*\(\s*SELECT 1\s+FROM execution_preflight_intent_pair_memberships AS pair_member[\s\S]*?pair_member\.intent_id\s*=\s*intent\.id/u);
+      assert.doesNotMatch(call.text, /pair_member\.lane/u);
       assert.match(call.text, /lease_expires_at\s+IS NULL\s+OR\s+.*<=\s*operation\.at/su);
     } else {
       assert.match(call.text, /lease_expires_at\s+IS NULL\s+OR\s+.*<=\s*statement_timestamp\(\)/su);
@@ -734,6 +737,80 @@ void test('claim validates its database claim instant and EXECUTE expiry postcon
     await expectCode(repository.claim({
       ownerId: 'worker-1', leaseMs: 30_000, purpose: 'EXECUTE',
     }), 'INVALID_DATA');
+  }
+});
+
+void test('claims only the exact TARGET dry-run intent under its preparation fence', async () => {
+  const draft = executionDraft('exact-preflight-target');
+  const client = new ScriptedClient([(text, values) => {
+    assert.match(text, /execution_preflight_intent_preparation_runs AS preparation/u);
+    assert.match(text, /preparation\.state='PREPARING'/u);
+    assert.match(text, /preparation\.run_id=\$1/u);
+    assert.match(text, /preparation\.lease_owner=\$2/u);
+    assert.match(text, /preparation\.lease_token=\$3::UUID/u);
+    assert.match(text, /preparation\.deadline_at>operation\.at\+INTERVAL '5 seconds'/u);
+    assert.match(text, /membership\.lane=\$5/u);
+    assert.match(text, /pair\.target_intent_id=intent\.id/u);
+    assert.match(text, /NOT EXISTS \([\s\S]*execution_dry_run_assessments/u);
+    assert.match(text, /NOT EXISTS \([\s\S]*execution_attempts/u);
+    assert.match(text, /intent\.status='PENDING'/u);
+    assert.match(text, /intent\.state_revision=0/u);
+    assert.match(text, /intent\.live_reserved=FALSE/u);
+    assert.match(text, /intent\.id=\$6/u);
+    assert.match(text, /lease_expires_at=operation\.at\+\(\$8::BIGINT\*INTERVAL '1 millisecond'\)/u);
+    return result([{
+      ...claimRow(draft, 'PENDING'),
+      lease_owner: values?.[6],
+      lease_token: values?.[8],
+      claim_at_ms: String(NOW_MS),
+    }], 1);
+  }]);
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(client));
+
+  const claimed = await repository.claimExactPreflightIntent(Object.freeze({
+    runId: `execution_preflight_preparation_${'1'.repeat(64)}`,
+    preparationLeaseOwner: 'preparation-worker',
+    preparationLeaseToken: '00000000-0000-4000-8000-000000000003',
+    pairId: `execution_preflight_intent_pair_${'2'.repeat(64)}`,
+    lane: 'TARGET',
+    purpose: 'DRY_RUN',
+    intentId: draft.id,
+    ownerId: 'dry-run-worker',
+    leaseMs: 30_000,
+  }));
+
+  assert.equal(claimed?.intent.id, draft.id);
+  assert.equal(claimed?.leaseOwner, 'dry-run-worker');
+  assert.deepEqual(required(client.calls[0]).values?.slice(0, 9), [
+    `execution_preflight_preparation_${'1'.repeat(64)}`,
+    'preparation-worker',
+    '00000000-0000-4000-8000-000000000003',
+    `execution_preflight_intent_pair_${'2'.repeat(64)}`,
+    'TARGET',
+    draft.id,
+    'dry-run-worker',
+    30_000,
+    claimed?.leaseToken,
+  ]);
+});
+
+void test('exact preflight claim rejects cross-lane purposes before touching PostgreSQL', async () => {
+  const repository = new PostgresExecutionIntentRepository(new ScriptedPool(new ScriptedClient([])));
+  const base = {
+    runId: `execution_preflight_preparation_${'1'.repeat(64)}`,
+    preparationLeaseOwner: 'preparation-worker',
+    preparationLeaseToken: '00000000-0000-4000-8000-000000000003',
+    pairId: `execution_preflight_intent_pair_${'2'.repeat(64)}`,
+    intentId: `execution_intent_${'3'.repeat(64)}`,
+    ownerId: 'exact-worker',
+    leaseMs: 30_000,
+  } as const;
+  for (const hostile of [
+    Object.freeze({ ...base, lane: 'TARGET', purpose: 'EXECUTE' }),
+    Object.freeze({ ...base, lane: 'SIMULATION', purpose: 'DRY_RUN' }),
+    Object.freeze({ ...base, lane: 'TARGET', purpose: 'DRY_RUN', extra: true }),
+  ]) {
+    await expectCode(repository.claimExactPreflightIntent(hostile as never), 'INVALID_INPUT');
   }
 });
 
@@ -2325,7 +2402,7 @@ void test('real PostgreSQL provides replay, concurrent claims, near-boundary rec
   });
 });
 
-void test('concurrent non-live EXECUTE claims skip an older paired target and retain its pristine lease',
+void test('generic EXECUTE and DRY_RUN claims skip both lanes of an older preflight pair',
   async (context) => {
     const databaseUrl = process.env.TEST_DATABASE_URL;
     if (databaseUrl === undefined || databaseUrl.trim() === '') {
@@ -2369,17 +2446,111 @@ void test('concurrent non-live EXECUTE claims skip an older paired target and re
         });
         await first.create(backlog);
 
-        const claims = await Promise.all([
+        const executeClaims = await Promise.all([
           first.claim({ ownerId: 'paired-worker-a', leaseMs: 60_000, purpose: 'EXECUTE' }),
           second.claim({ ownerId: 'paired-worker-b', leaseMs: 60_000, purpose: 'EXECUTE' }),
         ]);
-        assert.deepEqual(new Set(claims.map((claim) => required(claim).intent.id)),
-          new Set([pair.simulationIntent.id, backlog.id]));
-        const targetLease = await firstPool.query(`SELECT lease_owner,lease_token,lease_expires_at
-          FROM execution_intents WHERE id=$1`, [target.id]);
-        assert.deepEqual(targetLease.rows, [{
-          lease_owner: null, lease_token: null, lease_expires_at: null,
-        }]);
+        assert.deepEqual(executeClaims.map((claim) => claim?.intent.id ?? null).sort(),
+          [backlog.id, null].sort());
+
+        const dryRunBacklog = executionDraft('paired-target-dry-run-backlog', {
+          requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
+        });
+        await first.create(dryRunBacklog);
+        const dryRunClaims = await Promise.all([
+          first.claim({ ownerId: 'paired-dry-worker-a', leaseMs: 60_000, purpose: 'DRY_RUN' }),
+          second.claim({ ownerId: 'paired-dry-worker-b', leaseMs: 60_000, purpose: 'DRY_RUN' }),
+        ]);
+        assert.deepEqual(dryRunClaims.map((claim) => claim?.intent.id ?? null).sort(),
+          [dryRunBacklog.id, null].sort());
+
+        const pairLeases = await firstPool.query(`SELECT id,lease_owner,lease_token,lease_expires_at
+          FROM execution_intents WHERE id IN ($1,$2) ORDER BY id`, [
+          target.id, pair.simulationIntent.id,
+        ]);
+        assert.deepEqual(pairLeases.rows, [target.id, pair.simulationIntent.id].sort().map((id) => ({
+          id, lease_owner: null, lease_token: null, lease_expires_at: null,
+        })));
+      });
+  });
+
+void test('PostgreSQL exact preparation claims lease only their bound TARGET and SIMULATION lanes',
+  async (context) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (databaseUrl === undefined || databaseUrl.trim() === '') {
+      context.skip('TEST_DATABASE_URL absent: exact preparation claim integration skipped');
+      return;
+    }
+    await withTemporarySchema(databaseUrl, 'execution_exact_preflight_claim',
+      async (firstPool, secondPool) => {
+        await migrateDatabase({ pool: firstPool });
+        const first = new PostgresExecutionIntentRepository(firstPool);
+        const second = new PostgresExecutionIntentRepository(secondPool);
+        const nowMs = await databaseNowMs(firstPool);
+        const target = createExecutionIntentDraft({
+          strategyId: 'creation-entry-v1', strategyVersion: 1,
+          positionId: 'position:exact-preflight-claim',
+          logicalCommandId: `paper_open_${'5'.repeat(64)}`,
+          mint: '11111111111111111111111111111111', side: 'BUY',
+          venuePolicy: 'PUMP_FUN_ONLY',
+          quoteMint: 'So11111111111111111111111111111111111111112',
+          quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9,
+          quoteAmountRaw: 1n, baseAmountRaw: null, minimumAmountOutRaw: 1n,
+          decisionEventId: 'decision:exact-preflight-claim',
+          decisionFingerprint: 'a'.repeat(64),
+          requestedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 180_000,
+        });
+        const pair = createExecutionPreflightIntentPairDraft(target);
+        const client = await firstPool.connect();
+        try {
+          await client.query('BEGIN');
+          await createExecutionIntentInTransaction(client, target);
+          await createExecutionPreflightIntentPairInTransaction(client, target);
+          await client.query('COMMIT');
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+        const runId = `execution_preflight_preparation_${'6'.repeat(64)}`;
+        const preparationLeaseToken = '00000000-0000-4000-8000-000000000004';
+        await firstPool.query(`WITH operation AS MATERIALIZED (
+          SELECT date_trunc('milliseconds',statement_timestamp()) AS at
+        ) INSERT INTO execution_preflight_intent_preparation_runs (
+          run_id,run_fingerprint,deadline_at,lease_owner,lease_token,lease_expires_at
+        ) SELECT $1,$2,operation.at+INTERVAL '2 minutes',$3,$4::UUID,
+          operation.at+INTERVAL '90 seconds' FROM operation`, [
+          runId, 'b'.repeat(64), 'preparation-worker', preparationLeaseToken,
+        ]);
+        await firstPool.query(`UPDATE execution_preflight_intent_preparation_runs
+          SET state='PREPARING',pair_id=$2,state_revision=1 WHERE run_id=$1`, [
+          runId, pair.pairId,
+        ]);
+        const common = {
+          runId, preparationLeaseOwner: 'preparation-worker', preparationLeaseToken,
+          pairId: pair.pairId, leaseMs: 30_000,
+        } as const;
+
+        const targetClaim = await first.claimExactPreflightIntent(Object.freeze({
+          ...common, intentId: target.id, lane: 'TARGET', purpose: 'DRY_RUN',
+          ownerId: 'exact-target-worker',
+        }));
+        assert.equal(targetClaim?.intent.id, target.id);
+        assert.deepEqual((await firstPool.query(`SELECT lease_owner FROM execution_intents
+          WHERE id=$1`, [pair.simulationIntent.id])).rows, [{ lease_owner: null }]);
+
+        const simulationClaim = await second.claimExactPreflightIntent(Object.freeze({
+          ...common, intentId: pair.simulationIntent.id, lane: 'SIMULATION', purpose: 'EXECUTE',
+          ownerId: 'exact-simulation-worker',
+        }));
+        assert.equal(simulationClaim?.intent.id, pair.simulationIntent.id);
+        assert.notEqual(targetClaim?.leaseToken, simulationClaim?.leaseToken);
+
+        assert.equal(await first.claimExactPreflightIntent(Object.freeze({
+          ...common, intentId: pair.simulationIntent.id, lane: 'SIMULATION', purpose: 'EXECUTE',
+          ownerId: 'losing-worker',
+        })), null);
       });
   });
 

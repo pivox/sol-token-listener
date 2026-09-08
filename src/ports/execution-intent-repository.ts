@@ -33,6 +33,30 @@ export type ExecutionClaimOptions =
       purpose: 'CONFIRM' | 'RECONCILE' | 'EXECUTE' | 'DRY_RUN';
     }>;
 
+export type ExecutionPreflightExactClaimOptions =
+  | Readonly<{
+      readonly runId: string;
+      readonly preparationLeaseOwner: string;
+      readonly preparationLeaseToken: string;
+      readonly pairId: string;
+      readonly intentId: string;
+      readonly ownerId: string;
+      readonly leaseMs: number;
+      readonly lane: 'TARGET';
+      readonly purpose: 'DRY_RUN';
+    }>
+  | Readonly<{
+      readonly runId: string;
+      readonly preparationLeaseOwner: string;
+      readonly preparationLeaseToken: string;
+      readonly pairId: string;
+      readonly intentId: string;
+      readonly ownerId: string;
+      readonly leaseMs: number;
+      readonly lane: 'SIMULATION';
+      readonly purpose: 'EXECUTE';
+    }>;
+
 export interface ClaimedExecutionIntent {
   readonly intent: ExecutionIntentV1;
   readonly leaseOwner: string;
@@ -76,6 +100,10 @@ export interface ExecutionIntentRepository {
     readonly intent: ExecutionIntentV1;
   }>>;
   claim(options: ExecutionClaimOptions, signal?: AbortSignal): Promise<ClaimedExecutionIntent | null>;
+  claimExactPreflightIntent(
+    options: ExecutionPreflightExactClaimOptions,
+    signal?: AbortSignal,
+  ): Promise<ClaimedExecutionIntent | null>;
   beginAttempt(claim: ClaimedExecutionIntent): Promise<ExecutionBeginAttemptResult>;
   finishAttempt(claim: ClaimedExecutionIntent, input: Readonly<{
     readonly attemptNumber: number;
