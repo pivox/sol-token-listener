@@ -1063,8 +1063,7 @@ export async function appendWalletSnapshotInTransaction(
     superseded_at IS NULL AS current
     FROM execution_wallet_snapshots
     WHERE generation_id=$1
-    ORDER BY state_revision DESC,observed_at DESC,snapshot_id DESC
-    FOR UPDATE`, [draft.generationId]);
+    ORDER BY state_revision DESC,observed_at DESC,snapshot_id DESC`, [draft.generationId]);
   const snapshotRows = snapshots.rows.map((row) => exactRow(row, [
     'snapshot_id', 'state_revision', 'observed_at_ms', 'current',
   ] as const));
