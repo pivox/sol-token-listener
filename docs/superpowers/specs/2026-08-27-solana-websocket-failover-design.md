@@ -3,8 +3,13 @@
 Date: 2026-08-27
 Umbrella issue: #57
 Delivery issues: #59, #60, #61, #62, #63
-Version: 1.4.1
+Version: 1.4.2
 Status: approved through the standing instruction to use the recommended option
+
+Revision 1.4.2 accepte le frame texte d'un `MessageEvent` WebSocket natif Node
+22 lorsque `data` est exposé par le getter intégré hérité. La frontière appelle
+directement ce getter natif capturé, sans invoquer un accesseur arbitraire, et
+conserve le rejet des proxies, frames non textuels, JSON invalides ou surdimensionnés.
 
 Revision 1.4.1 aligns issue #63 with dedicated activation design version
 1.0.1 and provider-affine finality design version 1.0.9. Delayed observable
@@ -165,6 +170,12 @@ WS failover supervisor --------------------------+
 The acknowledged program-log session uses Node 22's native `WebSocket` behind
 a small injectable port. No private web3.js property or transitive
 `rpc-websockets` API becomes an application dependency.
+
+Le `MessageEvent` natif expose `data` par un getter enumerable sur son
+prototype plutôt que par une propriété propre. La session accepte ce shape en
+appelant directement le getter intégré capturé sur l'instance reçue. Elle
+n'exécute jamais un getter fourni par le frame, rejette les proxies et conserve
+la voie historique à propriété propre pour le port de test injectable.
 
 ## Paired provider configuration
 

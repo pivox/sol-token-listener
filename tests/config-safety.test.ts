@@ -953,7 +953,7 @@ void test('durable WebSocket health documentation is versioned and exposes the e
   ]);
 
   assert.match(design, /^Version: 1\.0\.5$/mu);
-  assert.match(umbrella, /^Version: 1\.4\.1$/mu);
+  assert.match(umbrella, /^Version: 1\.4\.2$/mu);
   assert.match(umbrella, /durable-websocket-health-design\.md` version\s+1\.0\.5/isu);
   assert.match(plan, /design v1\.0\.5/iu);
 

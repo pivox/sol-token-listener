@@ -1,5 +1,6 @@
 import { PUMP_PROGRAM_ID } from '../../launchpads/pumpfun/constants.js';
 import { PUMPSWAP_PROGRAM_ID } from '../../markets/pumpswap/constants.js';
+import { isProxy } from 'node:util/types';
 import bs58 from 'bs58';
 import type { RpcProviderId } from './rpc-provider-catalog.js';
 
@@ -98,6 +99,8 @@ const PROGRAMS: readonly ProgramDefinition[] = Object.freeze([
     family: 'pumpswap', address: PUMPSWAP_PROGRAM_ID, subscribeRequestId: 2, unsubscribeRequestId: 4,
   }),
 ]);
+
+const nativeMessageEventDataGetter = captureNativeMessageEventDataGetter();
 
 const defaultScheduler: WsProgramSessionScheduler = Object.freeze({
   schedule(callback: () => void, delayMs: number): ReturnType<typeof setTimeout> {
@@ -486,7 +489,7 @@ export function openWsProgramSession(
 }
 
 function parsePayload(event: unknown): unknown {
-  const data = ownData(event, 'data');
+  const data = frameData(event);
   if (typeof data !== 'string'
     || Buffer.byteLength(data, 'utf8') > MAX_WS_PROGRAM_SESSION_FRAME_BYTES) return null;
   try {
@@ -494,6 +497,29 @@ function parsePayload(event: unknown): unknown {
   } catch {
     return null;
   }
+}
+
+function frameData(event: unknown): unknown {
+  if (typeof event !== 'object' || event === null || isProxy(event) || Array.isArray(event)) {
+    return undefined;
+  }
+  const own = ownField(event, 'data');
+  if (own.found) return own.value;
+  if (nativeMessageEventDataGetter === null) return undefined;
+  try {
+    return nativeMessageEventDataGetter(event);
+  } catch {
+    return undefined;
+  }
+}
+
+function captureNativeMessageEventDataGetter(): ((event: unknown) => unknown) | null {
+  if (typeof MessageEvent !== 'function') return null;
+  const descriptor = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data');
+  const getter: unknown = descriptor === undefined ? undefined : Reflect.get(descriptor, 'get');
+  return typeof getter === 'function'
+    ? (event: unknown): unknown => Reflect.apply(getter, event, [])
+    : null;
 }
 
 function ownData(value: unknown, key: string): unknown {
