@@ -18,6 +18,7 @@ import {
   type ExecutionDryRunPool,
 } from '../src/storage/execution-dry-run.repository.js';
 import { PostgresExecutionIntentRepository } from '../src/storage/execution-intent.repository.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 type Row = Readonly<Record<string, unknown>>;
 type QueryResult = Readonly<{ rows: readonly Row[]; rowCount: number | null }>;
@@ -461,7 +462,7 @@ void test('real PostgreSQL atomically records, releases only the lease, and leav
     await migrateDatabase({ pool });
     const intents = new PostgresExecutionIntentRepository(pool);
     const assessments = new PostgresExecutionDryRunRepository(pool);
-    const created = await intents.create(freshDraft('atomic'));
+    const created = await intents.create(await freshDraft(pool, 'atomic'));
     const claimed = required(await intents.claim({ ownerId: 'worker-atomic', leaseMs: 30_000, purpose: 'DRY_RUN' }));
     const assessment = createExecutionDryRunAssessment(claimed.intent);
     const before = await parentSnapshot(pool, created.intent.id);
@@ -498,7 +499,7 @@ void test('real PostgreSQL fails closed on fence drift, ABA, lease loss, and bus
       "expires_at=date_trunc('milliseconds',statement_timestamp())",
     ];
     for (const [index, mutation] of mutations.entries()) {
-      const created = await intents.create(freshDraft(`fence-${index}`));
+      const created = await intents.create(await freshDraft(pool, `fence-${index}`));
       const claimed = required(await intents.claim({ ownerId: `worker-${index}`, leaseMs: 30_000, purpose: 'DRY_RUN' }));
       const assessment = createExecutionDryRunAssessment(claimed.intent);
       await pool.query(`UPDATE execution_intents SET ${mutation} WHERE id=$1`, [created.intent.id]);
@@ -522,7 +523,7 @@ void test('real PostgreSQL keeps a conflicting assessment and its lease fail-clo
     await migrateDatabase({ pool });
     const intents = new PostgresExecutionIntentRepository(pool);
     const repository = new PostgresExecutionDryRunRepository(pool);
-    const created = await intents.create(freshDraft('conflict'));
+    const created = await intents.create(await freshDraft(pool, 'conflict'));
     const claimed = required(await intents.claim({ ownerId: 'conflict-worker', leaseMs: 30_000, purpose: 'DRY_RUN' }));
     const assessment = createExecutionDryRunAssessment(claimed.intent);
     await insertAssessment(pool, assessment, { inputFingerprint: 'f'.repeat(64) });
@@ -548,10 +549,10 @@ void test('real PostgreSQL exposes deterministic and logical identity contradict
     const intents = new PostgresExecutionIntentRepository(pool);
     const repository = new PostgresExecutionDryRunRepository(pool);
     const expected = createExecutionDryRunAssessment(
-      (await intents.create(freshDraft('exact-conflict-expected'))).intent,
+      (await intents.create(await freshDraft(pool, 'exact-conflict-expected'))).intent,
     );
     const other = createExecutionDryRunAssessment(
-      (await intents.create(freshDraft('exact-conflict-other'))).intent,
+      (await intents.create(await freshDraft(pool, 'exact-conflict-other'))).intent,
     );
     const logicalConflict = Object.freeze({ ...expected, assessmentId: other.assessmentId });
     const idConflict = Object.freeze({ ...other, assessmentId: expected.assessmentId });
@@ -577,7 +578,7 @@ void test('real PostgreSQL rolls back insert when release fails and findExact pr
     await migrateDatabase({ pool });
     const intents = new PostgresExecutionIntentRepository(pool);
     const repository = new PostgresExecutionDryRunRepository(pool);
-    const rollbackCreated = await intents.create(freshDraft('rollback'));
+    const rollbackCreated = await intents.create(await freshDraft(pool, 'rollback'));
     const rollbackClaim = required(await intents.claim({ ownerId: 'rollback-worker', leaseMs: 30_000, purpose: 'DRY_RUN' }));
     const rollbackAssessment = createExecutionDryRunAssessment(rollbackClaim.intent);
     await pool.query(`CREATE FUNCTION reject_dry_run_release() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -599,7 +600,7 @@ void test('real PostgreSQL rolls back insert when release fails and findExact pr
     )).rows[0]?.lease_token, rollbackClaim.leaseToken);
     await pool.query('DROP TRIGGER reject_dry_run_release_trigger ON execution_intents');
 
-    const ackCreated = await intents.create(freshDraft('ack-lost'));
+    const ackCreated = await intents.create(await freshDraft(pool, 'ack-lost'));
     const ackClaim = required(await intents.claim({ ownerId: 'ack-worker', leaseMs: 30_000, purpose: 'DRY_RUN' }));
     const ackAssessment = createExecutionDryRunAssessment(ackClaim.intent);
     const ambiguous = new PostgresExecutionDryRunRepository(new AckLostPool(pool));
@@ -619,7 +620,7 @@ void test('real PostgreSQL allows only one concurrent completion for the same fe
     await migrateDatabase({ pool });
     const intents = new PostgresExecutionIntentRepository(pool);
     const repository = new PostgresExecutionDryRunRepository(pool);
-    const created = await intents.create(freshDraft('concurrent'));
+    const created = await intents.create(await freshDraft(pool, 'concurrent'));
     const claimed = required(await intents.claim({ ownerId: 'concurrent-worker', leaseMs: 30_000, purpose: 'DRY_RUN' }));
     const assessment = createExecutionDryRunAssessment(claimed.intent);
     const settled = await Promise.allSettled([
@@ -726,9 +727,12 @@ function intent(suffix: string): ExecutionIntentV1 {
   });
 }
 
-function freshDraft(suffix: string): ReturnType<typeof createExecutionIntentDraft> {
+async function freshDraft(
+  pool: InstanceType<typeof pg.Pool>,
+  suffix: string,
+): Promise<ReturnType<typeof createExecutionIntentDraft>> {
   const now = Date.now();
-  return createExecutionIntentDraft({
+  const draft = createExecutionIntentDraft({
     strategyId: 'dry-run-integration', strategyVersion: 1,
     positionId: `position-${suffix}`, logicalCommandId: `command-${suffix}-${randomUUID()}`,
     mint: '11111111111111111111111111111111', side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
@@ -738,6 +742,8 @@ function freshDraft(suffix: string): ReturnType<typeof createExecutionIntentDraf
     decisionEventId: `event-${suffix}`, decisionFingerprint: 'a'.repeat(64),
     requestedAtMs: now, expiresAtMs: now + 120_000,
   });
+  await insertExecutionDecisionEvent(pool, draft.decisionEventId, draft.mint);
+  return draft;
 }
 
 function assessmentRow(

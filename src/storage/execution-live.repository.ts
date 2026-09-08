@@ -5043,7 +5043,7 @@ async function findDeadlineIntent(
   requestedAtUpperBoundMs: number,
 ): Promise<ExecutionIntentV1> {
   const row = exactRow(singleRow(await client.query(`SELECT
-    id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
+    id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,candidate_id,
     logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,
     quote_decimals,quote_amount_raw::TEXT AS quote_amount_raw,
     base_amount_raw::TEXT AS base_amount_raw,
@@ -5066,7 +5066,7 @@ async function findDeadlineIntent(
     draft.id, draft.logicalOrderKey,
   ])), [
     'id', 'payload_version', 'logical_order_key', 'strategy_id', 'strategy_version',
-    'position_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
+    'position_id', 'candidate_id', 'logical_command_id', 'mint', 'side', 'venue_policy', 'quote_mint',
     'quote_token_program', 'quote_decimals', 'quote_amount_raw', 'base_amount_raw',
     'minimum_amount_out_raw', 'decision_event_id', 'decision_fingerprint',
     'requested_at_ms', 'expires_at_ms', 'status', 'attempt_count', 'state_revision',
@@ -5081,6 +5081,7 @@ async function findDeadlineIntent(
     strategyId: text(row.strategy_id),
     strategyVersion: integer(row.strategy_version),
     positionId: text(row.position_id),
+    candidateId: row.candidate_id === null ? null : text(row.candidate_id),
     logicalCommandId: text(row.logical_command_id),
     mint: text(row.mint),
     side: row.side,
@@ -5129,6 +5130,7 @@ function sameDeadlineIntentContext(
     && persisted.strategyId === expected.strategyId
     && persisted.strategyVersion === expected.strategyVersion
     && persisted.positionId === expected.positionId
+    && persisted.candidateId === expected.candidateId
     && persisted.logicalCommandId === expected.logicalCommandId
     && persisted.mint === expected.mint
     && persisted.side === expected.side

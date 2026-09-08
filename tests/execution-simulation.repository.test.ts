@@ -18,6 +18,7 @@ import {
   PostgresExecutionSimulationRepository,
   type ExecutionSimulationPool,
 } from '../src/storage/execution-simulation.repository.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 
 type Row = Readonly<Record<string, unknown>>;
 type QueryResult = Readonly<{ rows: readonly Row[]; rowCount: number | null }>;
@@ -205,7 +206,7 @@ void test('real PostgreSQL completes success atomically and terminalizes without
     const intents = new PostgresExecutionIntentRepository(pool);
     const repository = new PostgresExecutionSimulationRepository(pool);
     const now = Date.now();
-    const created = await intents.create(createExecutionIntentDraft({
+    const draft = createExecutionIntentDraft({
       strategyId: 'simulation-strategy', strategyVersion: 1,
       positionId: `position-${randomUUID()}`, logicalCommandId: `command-${randomUUID()}`,
       mint: PUBLIC_KEY, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY',
@@ -214,7 +215,9 @@ void test('real PostgreSQL completes success atomically and terminalizes without
       quoteAmountRaw: 1_000n, baseAmountRaw: null, minimumAmountOutRaw: 850n,
       decisionEventId: `event-${randomUUID()}`, decisionFingerprint: HASH,
       requestedAtMs: now, expiresAtMs: now + 120_000,
-    }));
+    });
+    await insertExecutionDecisionEvent(pool, draft.decisionEventId, draft.mint);
+    const created = await intents.create(draft);
     const pending = required(await intents.claim({
       ownerId: 'simulation-worker', leaseMs: 30_000, purpose: 'EXECUTE',
     }));

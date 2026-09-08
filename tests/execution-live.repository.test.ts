@@ -42,6 +42,7 @@ import { PostgresExecutionRiskRepository } from '../src/storage/execution-risk.r
 import { PostgresExecutionSimulationRepository } from '../src/storage/execution-simulation.repository.js';
 import { createLiveRecoveryBootstrapDatabase } from
   '../src/executor-live-recovery/database.js';
+import { insertExecutionDecisionEvent } from './helpers/execution-decision-event.js';
 import { acquireExecutorRoleTestLock } from './postgres-role-test-lock.js';
 
 const generationId = `execution_wallet_generation_${'a'.repeat(64)}`;
@@ -426,6 +427,11 @@ void test('deadline scanner selects the oldest of two due PostgreSQL candidates'
       const oldestDeadlineMs = nowMs - 60_000;
       const newerDeadlineMs = nowMs - 30_000;
       await setPositionDeadline(pool, fixture.position.positionId, oldestDeadlineMs);
+      await insertExecutionDecisionEvent(
+        pool,
+        `maximum-holding:${fixture.position.positionId}`,
+        fixture.position.mint,
+      );
       const newerPositionId = `execution_live_position_${'b'.repeat(64)}`;
       const newerGenerationId = `execution_wallet_generation_${'b'.repeat(64)}`;
       await pool.query(`UPDATE execution_wallet_generations SET
@@ -454,6 +460,11 @@ void test('deadline scanner selects the oldest of two due PostgreSQL candidates'
         requestedAtMs: nowMs - 120_000,
         expiresAtMs: nowMs + 120_000,
       });
+      await insertExecutionDecisionEvent(
+        pool,
+        newerBuy.decisionEventId,
+        newerBuy.mint,
+      );
       await new PostgresExecutionIntentRepository(pool).create(newerBuy);
       await pool.query(`INSERT INTO execution_live_positions (
         position_id,payload_version,buy_intent_id,generation_id,armament_id,wallet_public_key,
@@ -2803,6 +2814,8 @@ async function exactBuyPersistenceFixture(
     qualificationId: qualification.qualificationId, authorization: resumeAuthorization,
     operatorId: 'operator-primary', occurredAtMs: nowMs,
   });
+  const targetDecisionEventId = `decision:exact-buy:${randomUUID()}`;
+  await insertExecutionDecisionEvent(pool, targetDecisionEventId, exactBuyWalletPublicKey);
   const target = await intents.create(createExecutionIntentDraft({
     strategyId: 'exact-buy-target', strategyVersion: 1,
     positionId: `position:exact-buy:${randomUUID()}`,
@@ -2810,7 +2823,7 @@ async function exactBuyPersistenceFixture(
     mint: exactBuyWalletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1_000n,
     baseAmountRaw: null, minimumAmountOutRaw: 1n,
-    decisionEventId: `decision:exact-buy:${randomUUID()}`,
+    decisionEventId: targetDecisionEventId,
     decisionFingerprint: 'd'.repeat(64), requestedAtMs: nowMs - 1_000,
     expiresAtMs: nowMs + 120_000,
   }));
@@ -3161,6 +3174,13 @@ async function makePositionDue(
   pool: InstanceType<typeof pg.Pool>,
   positionId: string,
 ): Promise<number> {
+  const position = await pool.query<{ readonly mint: string }>(
+    'SELECT mint FROM execution_live_positions WHERE position_id=$1',
+    [positionId],
+  );
+  const mint = position.rows[0]?.mint;
+  assert.equal(typeof mint, 'string');
+  await insertExecutionDecisionEvent(pool, `maximum-holding:${positionId}`, mint ?? '');
   const dueAtMs = (await databaseNowMs(pool)) - 60_000;
   await setPositionDeadline(pool, positionId, dueAtMs);
   return dueAtMs;
@@ -3265,13 +3285,15 @@ async function seedSuccessfulSimulation(
 ) {
   const nowMs = Date.now();
   const intents = new PostgresExecutionIntentRepository(pool);
+  const simulationDecisionEventId = `event-${randomUUID()}`;
+  await insertExecutionDecisionEvent(pool, simulationDecisionEventId, simulationWalletPublicKey);
   const created = await intents.create(createExecutionIntentDraft({
     strategyId: 'simulation-strategy', strategyVersion: 1,
     positionId: `position-${randomUUID()}`, logicalCommandId: `command-${randomUUID()}`,
     mint: simulationWalletPublicKey, side: 'BUY', venuePolicy: 'PUMP_FUN_ONLY', quoteMint,
     quoteTokenProgram: 'SPL_TOKEN', quoteDecimals: 9, quoteAmountRaw: 1_000n,
     baseAmountRaw: null, minimumAmountOutRaw: 850n,
-    decisionEventId: `event-${randomUUID()}`, decisionFingerprint: fingerprint,
+    decisionEventId: simulationDecisionEventId, decisionFingerprint: fingerprint,
     requestedAtMs: nowMs, expiresAtMs: nowMs + 120_000,
   }));
   const claimed = await intents.claim({

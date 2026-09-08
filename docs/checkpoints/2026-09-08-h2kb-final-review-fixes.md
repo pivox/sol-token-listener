@@ -1,10 +1,10 @@
 # Checkpoint H2k-b — corrections de revue finale
 
-**Date UTC :** 2026-09-08T12:01:55Z  
+**Date UTC :** 2026-09-08T13:17:51Z
 **Worktree :** `/Users/haythem.mabrouk/workspace/perso/sol-token-listener/.worktrees/issue-51h2k-preparation`  
 **Branche :** `feat/issue-51h2k-preparation`  
 **Base :** `origin/main` à `bc4c470`  
-**État Git :** 14 commits d'avance, corrections finales non commitées  
+**État Git :** 16 commits d'avance, corrections CI finales prêtes au commit
 **Canary :** `CANARY_NOT_STARTED`
 
 ## Invariants de sécurité
@@ -62,6 +62,26 @@ Il ne peut toujours pas lire `signed_transaction_bytes`.
   les SDK Solana/Pump. Les corrections proposées imposent des downgrades
   cassants ; elles restent une dette de sécurité séparée, sans `--force` dans
   H2k-b.
+
+## Corrections après la première exécution CI de la PR #88
+
+- La migration 043 impose correctement les FK `decision_event_id` et
+  `candidate_id`. Les anciennes fixtures d'exécution créent désormais leur
+  événement de décision exact avant l'intention ; la contrainte produit n'a pas
+  été affaiblie.
+- La relecture d'une intention SELL de deadline inclut explicitement la clé
+  nullable `candidateId` introduite dans le contrat de domaine. Le contexte
+  relu est comparé au draft avant toute poursuite.
+- La fixture d'autorité listener utilise une lineage canonique complète pour la
+  paire H2c, tout en démontrant que le rôle reste privé de tout état live.
+- Groupe initialement fautif en CI : 136/136 tests PostgreSQL réussis en
+  séquentiel.
+- `execution-live.repository` : 38/38 réussis ; préparation transactionnelle :
+  15/15 réussis ; autorité listener : 2/2 réussis.
+- Une passe exhaustive locale parallèle a saturé PostgreSQL et fait expirer des
+  fixtures temporaires ainsi qu'un délai d'observation de verrou. Tous ces
+  scénarios passent isolément ; le verdict final est confié à la CI propre après
+  push.
 
 ## Reprise recommandée
 
