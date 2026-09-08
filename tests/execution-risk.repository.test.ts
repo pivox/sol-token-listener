@@ -113,7 +113,7 @@ void test('wallet generation and snapshot writes replay exactly and reject confl
       stateRevision: snapshot.stateRevision,
       slot: snapshot.slot + 1n,
       blockTimeMs: snapshot.blockTimeMs,
-      observedAtMs: snapshot.observedAtMs + 1,
+      observedAtMs: snapshot.observedAtMs,
       commitment: snapshot.commitment,
       walletLamports: snapshot.walletLamports,
       tokenBalanceCount: snapshot.tokenBalanceCount,
@@ -135,6 +135,58 @@ void test('wallet generation and snapshot writes replay exactly and reject confl
     assert.equal(retention.rows[0]?.retention_seconds, 14_400);
     assert.equal(retention.rows[1]?.superseded_at, null);
     assert.equal(retention.rows[1]?.purge_after, null);
+  });
+});
+
+void test('a fresher wallet snapshot at the same risk revision supersedes its predecessor', async (context) => {
+  const databaseUrl = testDatabaseUrl(context, 'execution risk wallet snapshot refresh test');
+  if (databaseUrl === null) return;
+  await withTemporarySchema(databaseUrl, 'execution_risk_wallet_refresh', async (pool) => {
+    await migrateDatabase({ pool });
+    const repository = new PostgresExecutionRiskRepository(pool);
+    const generation = await repository.registerWalletGeneration(generationDraft('f', 1));
+    const first = walletSnapshotDraft(generation.generationId, 'f', 0n);
+    const refreshed = createExecutionWalletSnapshot({
+      generationId: first.generationId,
+      providerId: first.providerId,
+      stateRevision: first.stateRevision,
+      slot: first.slot + 1n,
+      blockTimeMs: first.blockTimeMs === null ? null : first.blockTimeMs + 1,
+      observedAtMs: first.observedAtMs + 1,
+      commitment: first.commitment,
+      walletLamports: first.walletLamports,
+      tokenBalanceCount: first.tokenBalanceCount,
+      openPositions: first.openPositions,
+      realizedNetPnlRaw: first.realizedNetPnlRaw,
+    });
+    assert.deepEqual(await repository.appendWalletSnapshot(first), first);
+    assert.deepEqual(await repository.appendWalletSnapshot(refreshed), refreshed);
+    await assert.rejects(repository.appendWalletSnapshot(createExecutionWalletSnapshot({
+      generationId: first.generationId,
+      providerId: first.providerId,
+      stateRevision: first.stateRevision,
+      slot: refreshed.slot + 1n,
+      blockTimeMs: refreshed.blockTimeMs === null ? null : refreshed.blockTimeMs + 1,
+      observedAtMs: refreshed.observedAtMs,
+      commitment: first.commitment,
+      walletLamports: first.walletLamports,
+      tokenBalanceCount: first.tokenBalanceCount,
+      openPositions: first.openPositions,
+      realizedNetPnlRaw: first.realizedNetPnlRaw,
+    })), isRepositoryError('CONFLICT'));
+    const snapshots = await pool.query(`SELECT snapshot_id,superseded_at,purge_after,
+      EXTRACT(EPOCH FROM (purge_after-superseded_at))::INTEGER AS retention_seconds
+      FROM execution_wallet_snapshots ORDER BY observed_at`);
+    assert.equal(snapshots.rows.length, 2);
+    assert.equal(snapshots.rows[0]?.snapshot_id, first.snapshotId);
+    assert.ok(snapshots.rows[0]?.superseded_at instanceof Date);
+    assert.equal(snapshots.rows[0]?.retention_seconds, 14_400);
+    assert.equal(snapshots.rows[1]?.snapshot_id, refreshed.snapshotId);
+    assert.equal(snapshots.rows[1]?.superseded_at, null);
+    assert.equal(snapshots.rows[1]?.purge_after, null);
+    const active = await pool.query(`SELECT snapshot_id FROM execution_wallet_snapshots
+      WHERE generation_id=$1 AND superseded_at IS NULL`, [generation.generationId]);
+    assert.deepEqual(active.rows, [{ snapshot_id: refreshed.snapshotId }]);
   });
 });
 
