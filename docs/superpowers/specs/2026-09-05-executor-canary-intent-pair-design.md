@@ -1,6 +1,6 @@
 # Paire d'intentions canary non signante — conception #51-H2k
 
-**Version de spécification :** 1.1.1
+**Version de spécification :** 1.1.2
 
 **Version de la spécification parente :** 1.12.1
 
@@ -14,6 +14,9 @@
 
 ## Historique des versions
 
+- **1.1.2 — 2026-09-08 :** retire au listener la lecture inutile de
+  `execution_intents.live_reserved`; le trigger H2k effectue seul cette lecture
+  sous son autorité SQL dédiée.
 - **1.1.1 — 2026-09-06 :** précise la garantie de replay : la migration
   audite la forme persistée des tables et contraintes, puis recrée les
   triggers H2k nommés ; elle ne prétend pas inventorier les triggers étrangers.

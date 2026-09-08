@@ -393,7 +393,7 @@ GRANT SELECT (
   decision_event_id,decision_fingerprint,requested_at,expires_at,status,
   attempt_count,state_revision,lease_owner,lease_token,lease_expires_at,
   last_reason_code,terminal_at,reconciliation_completed_at,created_at,updated_at,
-  purge_after,live_reserved
+  purge_after
 ), INSERT (
   id,payload_version,logical_order_key,strategy_id,strategy_version,position_id,
   logical_command_id,mint,side,venue_policy,quote_mint,quote_token_program,

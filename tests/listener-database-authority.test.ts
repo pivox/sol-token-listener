@@ -75,7 +75,9 @@ void test('listener provisioning rebuilds one closed non-live database authority
   }
   assert.match(sql, /GRANT USAGE ON SEQUENCE\s+api_event_stream_sequence_seq,\s+paper_decision_claim_scan_generation_seq\s+TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT SELECT \([^)]+\), INSERT \([^)]+\)\s+ON TABLE execution_intents TO sol_token_listener_writer/iu);
-  assert.match(sql, /GRANT SELECT \([^)]+live_reserved[^)]+\), INSERT \([^)]+\)\s+ON TABLE execution_intents TO sol_token_listener_writer/iu);
+  const intentGrant = /GRANT SELECT \(([^)]+)\), INSERT \([^)]+\)\s+ON TABLE execution_intents TO sol_token_listener_writer/iu
+    .exec(sql)?.[1] ?? '';
+  assert.doesNotMatch(intentGrant, /\blive_reserved\b/iu);
   assert.match(sql, /GRANT SELECT \([^)]+\)\s+ON TABLE execution_intent_tombstones TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT SELECT \([^)]+\), INSERT \([^)]+\)\s+ON TABLE execution_preflight_intent_pairs TO sol_token_listener_writer/iu);
   assert.match(sql, /GRANT INSERT \(pair_id,intent_id,lane\)\s+ON TABLE execution_preflight_intent_pair_memberships TO sol_token_listener_writer/iu);
@@ -313,6 +315,9 @@ void test('PostgreSQL 16 listener login can write business projections but no li
       )).rows[0]?.allowed, true);
       assert.equal((await listener.query<{ readonly allowed: boolean }>(
         `SELECT has_column_privilege(current_user,'execution_intents','status','UPDATE') AS allowed`,
+      )).rows[0]?.allowed, false);
+      assert.equal((await listener.query<{ readonly allowed: boolean }>(
+        `SELECT has_column_privilege(current_user,'execution_intents','live_reserved','SELECT') AS allowed`,
       )).rows[0]?.allowed, false);
       const privateTypeOid = (await isolated.query<{ readonly oid: string }>(
         `SELECT format('%s',type.oid) AS oid FROM pg_type type
