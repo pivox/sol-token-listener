@@ -52,6 +52,66 @@ void test('opens only after both confirmed subscriptions acknowledge and forward
   assert.equal(scheduler.pendingCount, 0);
 });
 
+void test('accepts native Node MessageEvent frames with inherited data accessors', async () => {
+  const socket = new FakeWebSocket();
+  const scheduler = new ManualScheduler();
+  const opening = openWsProgramSession(
+    { id: 'primary', url: 'wss://rpc.invalid/private' },
+    async () => undefined,
+    new AbortController().signal,
+    { createWebSocket: () => socket, scheduler },
+  );
+
+  socket.open();
+  socket.nativeMessage({ jsonrpc: '2.0', id: 1, result: 101 });
+  socket.nativeMessage({ jsonrpc: '2.0', id: 2, result: 102 });
+  const session = await opening;
+  const closing = session.close(new AbortController().signal);
+  socket.nativeMessage({ jsonrpc: '2.0', id: 3, result: true });
+  socket.nativeMessage({ jsonrpc: '2.0', id: 4, result: true });
+  await closing;
+
+  assert.equal(socket.closeCalls, 1);
+  assert.equal(socket.listenerCount, 0);
+  assert.equal(scheduler.pendingCount, 0);
+});
+
+void test('rejects proxied native frames and inherited application getters without invoking them',
+  async () => {
+    let inheritedGetterCalls = 0;
+    const inherited = Object.create(Object.defineProperty({}, 'data', {
+      enumerable: true,
+      get: () => {
+        inheritedGetterCalls += 1;
+        return JSON.stringify({ jsonrpc: '2.0', id: 1, result: 101 });
+      },
+    })) as object;
+    const native = new MessageEvent('message', {
+      data: JSON.stringify({ jsonrpc: '2.0', id: 1, result: 101 }),
+    });
+
+    for (const frame of [inherited, new Proxy(native, {})]) {
+      const socket = new FakeWebSocket();
+      const scheduler = new ManualScheduler();
+      const opening = openWsProgramSession(
+        { id: 'primary', url: 'wss://rpc.invalid/private' },
+        async () => undefined,
+        new AbortController().signal,
+        { createWebSocket: () => socket, scheduler },
+      );
+      socket.open();
+      socket.messageEvent(frame);
+      await assert.rejects(opening, (error: unknown) => {
+        assertStableError(error, 'PROTOCOL_INVALID');
+        return true;
+      });
+      assert.equal(socket.closeCalls, 1);
+      assert.equal(socket.listenerCount, 0);
+      assert.equal(scheduler.pendingCount, 0);
+    }
+    assert.equal(inheritedGetterCalls, 0);
+  });
+
 void test('rejects a partial acknowledgement at the fixed setup deadline and drains resources', async () => {
   const socket = new FakeWebSocket();
   const scheduler = new ManualScheduler();
@@ -737,6 +797,14 @@ class FakeWebSocket implements WsProgramSessionWebSocket {
 
   public message(value: unknown): void {
     this.emit('message', { data: JSON.stringify(value) });
+  }
+
+  public nativeMessage(value: unknown): void {
+    this.messageEvent(new MessageEvent('message', { data: JSON.stringify(value) }));
+  }
+
+  public messageEvent(event: unknown): void {
+    this.emit('message', event);
   }
 
   public rawMessage(data: string): void {
