@@ -1,6 +1,6 @@
 # Plan d'implémentation H2k-b — préparation d'intention de préflight
 
-Spec : `docs/superpowers/specs/2026-09-08-executor-preflight-intent-preparation-design.md` v1.0.1
+Spec : `docs/superpowers/specs/2026-09-08-executor-preflight-intent-preparation-design.md` v1.1.0
 
 ## Contraintes permanentes
 

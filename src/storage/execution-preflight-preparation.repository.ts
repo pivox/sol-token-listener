@@ -61,13 +61,15 @@ const CLAIM_KEYS = Object.freeze([
 const PREPARATION_KEYS = Object.freeze([
   'payloadVersion', 'runId', 'runFingerprint', 'state', 'stateRevision',
   'watermarkAtMs', 'deadlineAtMs', 'pairId', 'assessmentId', 'assessmentFingerprint',
-  'artifactId', 'artifactFingerprint', 'failureCode', 'createdAtMs', 'updatedAtMs',
+  'artifactId', 'artifactFingerprint', 'manifestFingerprint', 'failureCode',
+  'createdAtMs', 'updatedAtMs',
   'selectedAtMs', 'completedAtMs', 'purgeAfterMs',
 ] as const);
 const PREPARATION_ROW_KEYS = Object.freeze([
   'run_id', 'payload_version', 'run_fingerprint', 'state', 'state_revision',
   'watermark_at_ms', 'deadline_at_ms', 'pair_id', 'assessment_id',
-  'assessment_fingerprint', 'artifact_id', 'artifact_fingerprint', 'failure_code',
+  'assessment_fingerprint', 'artifact_id', 'artifact_fingerprint', 'manifest_fingerprint',
+  'failure_code',
   'created_at_ms', 'updated_at_ms', 'selected_at_ms', 'completed_at_ms', 'purge_after_ms',
 ] as const);
 const CLAIM_ROW_KEYS = Object.freeze([
@@ -91,6 +93,7 @@ const PREPARATION_PROJECTION = `
   preparation.assessment_fingerprint,
   preparation.artifact_id,
   preparation.artifact_fingerprint,
+  preparation.manifest_fingerprint,
   preparation.failure_code,
   trunc(EXTRACT(EPOCH FROM preparation.created_at)*1000)::TEXT AS created_at_ms,
   trunc(EXTRACT(EPOCH FROM preparation.updated_at)*1000)::TEXT AS updated_at_ms,
@@ -475,6 +478,7 @@ function preparationFromDomain(row: Row): ExecutionPreflightPreparationV1 {
     assessment_fingerprint: row.assessmentFingerprint,
     artifact_id: row.artifactId,
     artifact_fingerprint: row.artifactFingerprint,
+    manifest_fingerprint: row.manifestFingerprint,
     failure_code: row.failureCode,
     created_at_ms: row.createdAtMs,
     updated_at_ms: row.updatedAtMs,
@@ -501,6 +505,7 @@ function preparationFromRow(value: unknown): ExecutionPreflightPreparationV1 {
     assessmentFingerprint: nullableFingerprint(row.assessment_fingerprint),
     artifactId: nullableText(row.artifact_id),
     artifactFingerprint: nullableFingerprint(row.artifact_fingerprint),
+    manifestFingerprint: nullableFingerprint(row.manifest_fingerprint),
     failureCode: nullableFailureCode(row.failure_code),
     createdAtMs: timestamp(row.created_at_ms),
     updatedAtMs: timestamp(row.updated_at_ms),
@@ -631,7 +636,10 @@ function nullableFailureCode(value: unknown): ExecutionPreflightPreparationError
     'PREFLIGHT_PAIR_NOT_FOUND', 'PREFLIGHT_PAIR_CONFLICT',
     'PREFLIGHT_PAIR_LINEAGE_INVALID', 'PREFLIGHT_TARGET_NOT_PRISTINE',
     'PREFLIGHT_PROBE_NOT_PRISTINE', 'PREFLIGHT_TARGET_FENCE_LOST',
+    'PREFLIGHT_PREPARATION_LEASE_LOST',
     'PREFLIGHT_PREPARATION_DEADLINE_EXCEEDED', 'PREFLIGHT_RPC_CAPACITY_UNVERIFIED',
+    'PREFLIGHT_ASSESSMENT_INVALID', 'PREFLIGHT_SIMULATION_FAILED',
+    'PREFLIGHT_RECOVERY_CONFLICT',
     'PREFLIGHT_PREPARATION_EXPORT_FAILED',
   ];
   if (typeof value !== 'string' || !allowed.includes(value as ExecutionPreflightPreparationErrorCode)) {

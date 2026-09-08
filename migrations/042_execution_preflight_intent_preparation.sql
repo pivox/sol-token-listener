@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS execution_preflight_intent_preparation_runs (
   artifact_id TEXT REFERENCES execution_simulation_artifacts(artifact_id)
     ON DELETE RESTRICT,
   artifact_fingerprint TEXT,
+  manifest_fingerprint TEXT,
   failure_code TEXT,
   created_at TIMESTAMPTZ NOT NULL
     DEFAULT date_trunc('milliseconds', statement_timestamp()),
@@ -45,7 +46,11 @@ CREATE TABLE IF NOT EXISTS execution_preflight_intent_preparation_runs (
       'PREFLIGHT_TARGET_NOT_PRISTINE',
       'PREFLIGHT_PROBE_NOT_PRISTINE',
       'PREFLIGHT_TARGET_FENCE_LOST',
+      'PREFLIGHT_PREPARATION_LEASE_LOST',
       'PREFLIGHT_PREPARATION_DEADLINE_EXCEEDED',
+      'PREFLIGHT_ASSESSMENT_INVALID',
+      'PREFLIGHT_SIMULATION_FAILED',
+      'PREFLIGHT_RECOVERY_CONFLICT',
       'PREFLIGHT_RPC_CAPACITY_UNVERIFIED',
       'PREFLIGHT_PREPARATION_EXPORT_FAILED'
     ))
@@ -53,6 +58,7 @@ CREATE TABLE IF NOT EXISTS execution_preflight_intent_preparation_runs (
   CONSTRAINT execution_preflight_intent_preparation_runs_fingerprint_check CHECK (
     (assessment_fingerprint IS NULL OR assessment_fingerprint ~ '^[0-9a-f]{64}$')
     AND (artifact_fingerprint IS NULL OR artifact_fingerprint ~ '^[0-9a-f]{64}$')
+    AND (manifest_fingerprint IS NULL OR manifest_fingerprint ~ '^[0-9a-f]{64}$')
   ),
   CONSTRAINT execution_preflight_intent_preparation_runs_temporal_check CHECK (
     isfinite(watermark_at)
@@ -97,6 +103,7 @@ CREATE TABLE IF NOT EXISTS execution_preflight_intent_preparation_runs (
       AND lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL
       AND assessment_id IS NULL AND assessment_fingerprint IS NULL
       AND artifact_id IS NULL AND artifact_fingerprint IS NULL
+      AND manifest_fingerprint IS NULL
       AND failure_code IS NULL AND selected_at IS NULL
       AND completed_at IS NULL AND purge_after IS NULL)
     OR (state = 'PREPARING'
@@ -105,18 +112,21 @@ CREATE TABLE IF NOT EXISTS execution_preflight_intent_preparation_runs (
       AND failure_code IS NULL AND selected_at IS NOT NULL
       AND completed_at IS NULL AND purge_after IS NULL
       AND (assessment_id IS NULL) = (assessment_fingerprint IS NULL)
-      AND (artifact_id IS NULL) = (artifact_fingerprint IS NULL))
+      AND (artifact_id IS NULL) = (artifact_fingerprint IS NULL)
+      AND manifest_fingerprint IS NULL)
     OR (state = 'PREPARED'
       AND pair_id IS NOT NULL
       AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL
       AND assessment_id IS NOT NULL AND assessment_fingerprint IS NOT NULL
       AND artifact_id IS NOT NULL AND artifact_fingerprint IS NOT NULL
+      AND manifest_fingerprint IS NOT NULL
       AND failure_code IS NULL AND selected_at IS NOT NULL
       AND completed_at IS NOT NULL AND completed_at <= deadline_at - INTERVAL '5 seconds'
       AND purge_after IS NOT NULL)
     OR (state = 'FAILED'
       AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL
       AND failure_code IS NOT NULL
+      AND manifest_fingerprint IS NULL
       AND completed_at IS NOT NULL AND purge_after IS NOT NULL)
   )
 );
@@ -159,6 +169,7 @@ BEGIN
       ('assessment_fingerprint','pg_catalog.text'::pg_catalog.regtype::OID,FALSE,FALSE),
       ('artifact_id','pg_catalog.text'::pg_catalog.regtype::OID,FALSE,FALSE),
       ('artifact_fingerprint','pg_catalog.text'::pg_catalog.regtype::OID,FALSE,FALSE),
+      ('manifest_fingerprint','pg_catalog.text'::pg_catalog.regtype::OID,FALSE,FALSE),
       ('failure_code','pg_catalog.text'::pg_catalog.regtype::OID,FALSE,FALSE),
       ('created_at','pg_catalog.timestamptz'::pg_catalog.regtype::OID,TRUE,TRUE),
       ('updated_at','pg_catalog.timestamptz'::pg_catalog.regtype::OID,TRUE,TRUE),
@@ -181,7 +192,7 @@ BEGIN
     OR attribute.attnotnull IS DISTINCT FROM expected.not_null
     OR (default_value.oid IS NOT NULL) IS DISTINCT FROM expected.has_default;
 
-  SELECT malformed_count + CASE WHEN COUNT(*)=21 THEN 0 ELSE 1 END
+  SELECT malformed_count + CASE WHEN COUNT(*)=22 THEN 0 ELSE 1 END
   INTO malformed_count
   FROM pg_catalog.pg_attribute attribute
   WHERE attribute.attrelid=relation_oid
@@ -253,7 +264,9 @@ BEGIN
       AND NEW.assessment_fingerprint IS DISTINCT FROM OLD.assessment_fingerprint)
     OR (OLD.artifact_id IS NOT NULL AND NEW.artifact_id IS DISTINCT FROM OLD.artifact_id)
     OR (OLD.artifact_fingerprint IS NOT NULL
-      AND NEW.artifact_fingerprint IS DISTINCT FROM OLD.artifact_fingerprint) THEN
+      AND NEW.artifact_fingerprint IS DISTINCT FROM OLD.artifact_fingerprint)
+    OR (OLD.manifest_fingerprint IS NOT NULL
+      AND NEW.manifest_fingerprint IS DISTINCT FROM OLD.manifest_fingerprint) THEN
     RAISE EXCEPTION 'execution preflight preparation identity is immutable'
       USING ERRCODE='55000';
   END IF;

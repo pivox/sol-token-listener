@@ -15,7 +15,11 @@ export type ExecutionPreflightPreparationErrorCode =
   | 'PREFLIGHT_TARGET_NOT_PRISTINE'
   | 'PREFLIGHT_PROBE_NOT_PRISTINE'
   | 'PREFLIGHT_TARGET_FENCE_LOST'
+  | 'PREFLIGHT_PREPARATION_LEASE_LOST'
   | 'PREFLIGHT_PREPARATION_DEADLINE_EXCEEDED'
+  | 'PREFLIGHT_ASSESSMENT_INVALID'
+  | 'PREFLIGHT_SIMULATION_FAILED'
+  | 'PREFLIGHT_RECOVERY_CONFLICT'
   | 'PREFLIGHT_RPC_CAPACITY_UNVERIFIED'
   | 'PREFLIGHT_PREPARATION_EXPORT_FAILED';
 
@@ -35,6 +39,7 @@ export interface ExecutionPreflightPreparationV1 extends ExecutionPreflightPrepa
   readonly assessmentFingerprint: string | null;
   readonly artifactId: string | null;
   readonly artifactFingerprint: string | null;
+  readonly manifestFingerprint: string | null;
   readonly failureCode: ExecutionPreflightPreparationErrorCode | null;
   readonly createdAtMs: number;
   readonly updatedAtMs: number;

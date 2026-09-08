@@ -1,6 +1,6 @@
 # Préparation déterministe d'une intention de préflight — H2k-b
 
-Version : 1.0.1  
+Version : 1.1.0
 Statut : validé pour implémentation  
 Date : 2026-09-08
 
@@ -86,7 +86,11 @@ uniquement les codes stables :
 - `PREFLIGHT_TARGET_NOT_PRISTINE`
 - `PREFLIGHT_PROBE_NOT_PRISTINE`
 - `PREFLIGHT_TARGET_FENCE_LOST`
+- `PREFLIGHT_PREPARATION_LEASE_LOST`
 - `PREFLIGHT_PREPARATION_DEADLINE_EXCEEDED`
+- `PREFLIGHT_ASSESSMENT_INVALID`
+- `PREFLIGHT_SIMULATION_FAILED`
+- `PREFLIGHT_RECOVERY_CONFLICT`
 - `PREFLIGHT_RPC_CAPACITY_UNVERIFIED`
 - `PREFLIGHT_PREPARATION_EXPORT_FAILED`
 
@@ -182,6 +186,8 @@ Deux cycles de revue maximum sont autorisés pour cette PR.
 
 ## Historique
 
+- 1.1.0 — ferme les résultats de reprise, lease, assessment et simulation par
+  des reason codes de préparation distincts.
 - 1.0.1 — précise l'unicité du run actif, la lease dès le watermark et la
   révision monotone nécessaire aux reprises CAS.
 - 1.0.0 — conception H2k-b initiale.
